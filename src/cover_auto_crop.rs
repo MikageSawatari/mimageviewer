@@ -7,6 +7,7 @@ use crate::settings::ReadingDirection;
 use image::{DynamicImage, RgbImage};
 use std::borrow::Cow;
 
+mod layout;
 pub(crate) mod photo;
 
 const CONTENT_MARGIN_CAP: f64 = 0.05;
@@ -51,10 +52,10 @@ impl AutoCropIdentity {
             self.folders && key.starts_with(crate::thumb_loader::CACHE_KEY_FOLDER),
             self.binding,
         ) {
-            (true, ReadingDirection::Rtl) => "v2f:rtl",
-            (true, ReadingDirection::Ltr) => "v2f:ltr",
-            (false, ReadingDirection::Rtl) => "v2:rtl",
-            (false, ReadingDirection::Ltr) => "v2:ltr",
+            (true, ReadingDirection::Rtl) => "v3f:rtl",
+            (true, ReadingDirection::Ltr) => "v3f:ltr",
+            (false, ReadingDirection::Rtl) => "v3:rtl",
+            (false, ReadingDirection::Ltr) => "v3:ltr",
         }
     }
 }
@@ -67,6 +68,7 @@ pub(crate) enum AutoCropDecline {
         reason: photo::PhotoLikeReason,
     },
     NotWide,
+    CameraPageAspect,
     NoJacketEvidence,
     NoStructure,
     NoLocalEvidence,
@@ -130,6 +132,7 @@ impl AutoCropDecline {
             Self::PageAspectMissing => "no-page-aspect",
             Self::PhotoLike { reason } => return format!("photo-like/{}", reason.as_str()).into(),
             Self::NotWide => "not-wide",
+            Self::CameraPageAspect => "camera-page-aspect",
             Self::NoJacketEvidence => "no-jacket-evidence",
             Self::NoStructure => "no-structure",
             Self::NoLocalEvidence => "no-local-evidence",
@@ -159,6 +162,82 @@ impl AutoCropDecline {
             Self::TwoPanel { v5, .. } => v5.decline(),
             other => other,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutoCropLayout {
+    T1,
+    T2,
+    T3,
+    T4,
+}
+
+impl AutoCropLayout {
+    fn from_index(index: usize) -> Self {
+        match index {
+            0 => Self::T1,
+            1 => Self::T2,
+            2 => Self::T3,
+            3 => Self::T4,
+            _ => unreachable!("layout prediction has exactly four types"),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::T1 => "T1",
+            Self::T2 => "T2",
+            Self::T3 => "T3",
+            Self::T4 => "T4",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutoCropMethod {
+    Current,
+    LayoutFallback(AutoCropLayout),
+    LayoutReplaced(AutoCropLayout),
+}
+
+impl AutoCropMethod {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::LayoutFallback(_) => "layout-fallback",
+            Self::LayoutReplaced(_) => "layout-replaced",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AutoCropSuccess {
+    /// Final crop in the EXIF-upright source coordinates, before saved rotation.
+    pub crop: CoverCrop,
+    pub method: AutoCropMethod,
+}
+
+impl AutoCropSuccess {
+    pub(crate) fn layout(self) -> Option<AutoCropLayout> {
+        match self.method {
+            AutoCropMethod::Current => None,
+            AutoCropMethod::LayoutFallback(layout) | AutoCropMethod::LayoutReplaced(layout) => {
+                Some(layout)
+            }
+        }
+    }
+
+    pub(crate) fn as_str(self) -> Cow<'static, str> {
+        match self.layout() {
+            None => "crop".into(),
+            Some(layout) => format!("{}/{}", self.method.as_str(), layout.as_str()).into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(crop: CoverCrop, method: AutoCropMethod) -> Self {
+        Self { crop, method }
     }
 }
 
@@ -213,6 +292,25 @@ fn detect_cover_crops_with_photo(
     shot_exif: bool,
     mut report: impl FnMut(Rotation, Result<CoverCrop, AutoCropDecline>),
 ) -> AutoCropResults {
+    detect_cover_crops_with_photo_detailed_report(
+        image,
+        original_dims,
+        page_aspect,
+        shot_exif,
+        binding,
+        |rotation, result| report(rotation, result.map(|success| success.crop)),
+    )
+}
+
+/// All production entry points share this decision and its typed explanation.
+pub(crate) fn detect_cover_crops_with_photo_detailed_report(
+    image: &DynamicImage,
+    original_dims: (u32, u32),
+    page_aspect: Option<f64>,
+    shot_exif: bool,
+    binding: ReadingDirection,
+    mut report: impl FnMut(Rotation, Result<AutoCropSuccess, AutoCropDecline>),
+) -> AutoCropResults {
     AutoCropResults::new(
         [
             Rotation::None,
@@ -230,7 +328,7 @@ fn detect_cover_crops_with_photo(
                 shot_exif,
             );
             report(rotation, result);
-            result.ok()
+            result.ok().map(|success| success.crop)
         }),
     )
 }
@@ -251,6 +349,7 @@ fn detect_cover_crop_at_rotation(
         rotation,
         false,
     )
+    .map(|success| success.crop)
 }
 
 fn detect_cover_crop_at_rotation_with_photo(
@@ -260,7 +359,7 @@ fn detect_cover_crop_at_rotation_with_photo(
     binding: ReadingDirection,
     rotation: Rotation,
     shot_exif: bool,
-) -> Result<CoverCrop, AutoCropDecline> {
+) -> Result<AutoCropSuccess, AutoCropDecline> {
     let dimensions = match rotation {
         Rotation::Cw90 | Rotation::Cw270 => (original_dims.1, original_dims.0),
         Rotation::None | Rotation::Cw180 => original_dims,
@@ -290,7 +389,13 @@ fn detect_cover_crop_at_rotation_with_photo(
             &rotated
         }
     };
-    let crop = cover_auto_crop(&analysis_raster(image), dimensions, page_aspect, binding)?;
+    let raster = analysis_raster(image);
+    let mut success = production_crop(&raster, dimensions, page_aspect, binding)?;
+    success.crop = inverse_rotated_crop(success.crop, rotation);
+    Ok(success)
+}
+
+fn inverse_rotated_crop(crop: CoverCrop, rotation: Rotation) -> CoverCrop {
     let [x0, y0, x1, y1] = crop.values();
     let inverse = match rotation {
         Rotation::None => [x0, y0, x1, y1],
@@ -305,9 +410,9 @@ fn detect_cover_crop_at_rotation_with_photo(
     };
     // Quarter turns preserve CoverCrop's bounds, minimum edges and non-full
     // invariant. Failure here is a programming error, never a detector decline.
-    Ok(CoverCrop::new(inverse)
+    CoverCrop::new(inverse)
         .expect("inverse rotation preserves valid crop bounds")
-        .expect("inverse rotation preserves a non-full crop"))
+        .expect("inverse rotation preserves a non-full crop")
 }
 
 /// Use one deterministic analysis height, including when the decoder supplied
@@ -613,6 +718,102 @@ fn raw_aspect_gate(original_dims: (u32, u32)) -> Result<(), AutoCropDecline> {
     }
 }
 
+/// The existing structural detector remains the first choice. Layout changes
+/// only structural declines and the specifically approved conflicting T2 case.
+fn production_crop(
+    image: &RgbImage,
+    original_dims: (u32, u32),
+    page_aspect: Option<f64>,
+    binding: ReadingDirection,
+) -> Result<AutoCropSuccess, AutoCropDecline> {
+    let current = cover_auto_crop(image, original_dims, page_aspect, binding);
+    apply_layout_policy(image, original_dims, page_aspect, binding, current)
+}
+
+fn structural_decline(reason: AutoCropDecline) -> bool {
+    matches!(
+        reason,
+        AutoCropDecline::NoJacketEvidence
+            | AutoCropDecline::NoStructure
+            | AutoCropDecline::NoLocalEvidence
+            | AutoCropDecline::NoSpine
+            | AutoCropDecline::WeakFront
+            | AutoCropDecline::RicherElsewhere
+            | AutoCropDecline::TwoPanel { .. }
+    )
+}
+
+fn camera_page_aspect(aspect: f64) -> bool {
+    [2.0 / 3.0, 3.0 / 4.0, 9.0 / 16.0, 4.0 / 5.0]
+        .into_iter()
+        .any(|camera| (aspect - camera).abs() < 0.002)
+}
+
+fn horizontal_iou(first: [f64; 2], second: [f64; 2]) -> f64 {
+    let overlap = (first[1].min(second[1]) - first[0].max(second[0])).max(0.0);
+    overlap / (first[1] - first[0] + second[1] - second[0] - overlap)
+}
+
+fn full_height(crop: CoverCrop) -> CoverCrop {
+    let [x0, _, x1, _] = crop.values();
+    CoverCrop::new([x0, 0, x1, 1_000_000])
+        .expect("full height preserves valid horizontal crop bounds")
+        .expect("an automatic portrait panel does not span the source width")
+}
+
+fn apply_layout_policy(
+    image: &RgbImage,
+    original_dims: (u32, u32),
+    page_aspect: Option<f64>,
+    binding: ReadingDirection,
+    current: Result<CoverCrop, AutoCropDecline>,
+) -> Result<AutoCropSuccess, AutoCropDecline> {
+    if let Err(reason) = current {
+        if !structural_decline(reason) {
+            return Err(reason);
+        }
+    }
+    let aspect = page_aspect
+        .filter(|aspect| aspect.is_finite() && *aspect > 0.0)
+        .ok_or(AutoCropDecline::PageAspectMissing)?;
+    let width = f64::from(original_dims.0);
+    let prediction = layout::predict(width, aspect * f64::from(original_dims.1), binding);
+    let kind = prediction.map(|(kind, _, _)| AutoCropLayout::from_index(kind));
+    let previous = current.map(full_height);
+    let method = match previous {
+        Ok(crop) => {
+            let [x0, _, x1, _] = crop.values();
+            let current_x = [x0, x1].map(|x| f64::from(x) * width / 1_000_000.0);
+            let replace = prediction.is_some_and(|(kind, _, predicted)| {
+                kind == 1 && horizontal_iou(current_x, predicted) < 0.6
+            });
+            if !replace {
+                return Ok(AutoCropSuccess {
+                    crop,
+                    method: AutoCropMethod::Current,
+                });
+            }
+            AutoCropMethod::LayoutReplaced(kind.expect("T2 prediction has a layout type"))
+        }
+        Err(reason) => {
+            // This guard applies only to a layout fallback; existing successes,
+            // including T2 replacements, remain eligible at camera page ratios.
+            if prediction.is_none() {
+                return Err(reason);
+            }
+            if camera_page_aspect(aspect) {
+                return Err(AutoCropDecline::CameraPageAspect);
+            }
+            AutoCropMethod::LayoutFallback(kind.expect("fallback prediction has a layout type"))
+        }
+    };
+    let (crop, _) = layout::crop(image, original_dims, aspect, binding, true)
+        .expect("an eligible layout prediction always produces a valid portrait crop");
+    Ok(AutoCropSuccess { crop, method })
+}
+
+/// Original structural candidate calculation. Production applies full height
+/// and the shared layout policy once, at the saved-angle ownership boundary.
 pub(crate) fn cover_auto_crop(
     image: &RgbImage,
     original_dims: (u32, u32),

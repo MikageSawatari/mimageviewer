@@ -912,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn cover_auto_rating_folder_switch_uses_v2f_from_settings_snapshot() {
+    fn cover_auto_rating_folder_switch_uses_v3f_from_settings_snapshot() {
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let folder = temp.path().join("book");
@@ -949,7 +949,7 @@ mod tests {
                         .unwrap();
                 let expected = format!(
                     "|autocrop:{}:{}",
-                    if folders { "v2f" } else { "v2" },
+                    if folders { "v3f" } else { "v3" },
                     if binding == crate::settings::ReadingDirection::Rtl {
                         "rtl"
                     } else {
@@ -967,9 +967,9 @@ mod tests {
                     "{keys:?} expected {expected}"
                 );
                 assert!(!keys.iter().any(|key| key.contains(if folders {
-                    "|autocrop:v2:"
+                    "|autocrop:v3:"
                 } else {
-                    "|autocrop:v2f:"
+                    "|autocrop:v3f:"
                 })));
             }
         }

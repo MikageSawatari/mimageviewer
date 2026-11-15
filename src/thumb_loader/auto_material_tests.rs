@@ -77,7 +77,7 @@ fn auto_material_kinds_preserve_save_reopen_k2_copy_and_send() {
         for (index, material) in materials.iter().copied().enumerate() {
             catalog
                 .save_with_layout_dims(
-                    &format!("zipthumb:book{index}.zip|autocrop:v2:rtl"),
+                    &format!("zipthumb:book{index}.zip|autocrop:v3:rtl"),
                     7,
                     9,
                     8,
@@ -92,7 +92,7 @@ fn auto_material_kinds_preserve_save_reopen_k2_copy_and_send() {
         }
     }
     for (index, material) in materials.into_iter().enumerate() {
-        let key = format!("zipthumb:book{index}.zip|autocrop:v2:rtl");
+        let key = format!("zipthumb:book{index}.zip|autocrop:v3:rtl");
         let reopened = crate::catalog::CatalogDb::open_existing_read_only(&cache, &child)
             .unwrap()
             .unwrap();
@@ -103,7 +103,7 @@ fn auto_material_kinds_preserve_save_reopen_k2_copy_and_send() {
         let selected = auto_material_candidate(&cache, &child, &key).unwrap();
         assert_eq!(selected.auto_material, material);
         assert_eq!(selected.webp_data, bytes);
-        let parent_key = format!("folderthumb:auto-v3:parent{index}|autocrop:v2:rtl");
+        let parent_key = format!("folderthumb:auto-v3:parent{index}|autocrop:v3:rtl");
         {
             let writer = crate::catalog::CatalogDb::open(&cache, &parent).unwrap();
             assert!(
@@ -157,20 +157,20 @@ fn auto_material_kinds_preserve_save_reopen_k2_copy_and_send() {
 }
 
 #[test]
-fn auto_material_k2_prefers_v2_and_legacy_fallback_requires_missing_exact_v2() {
+fn auto_material_k2_prefers_v3_and_legacy_fallback_requires_missing_exact_v3() {
     use crate::cover_auto_material::AutoMaterial;
     let temp = TempDir::new().unwrap();
     let cache = temp.path().join("cache");
     let directory = temp.path().join("books");
     std::fs::create_dir_all(&directory).unwrap();
     let writer = crate::catalog::CatalogDb::open(&cache, &directory).unwrap();
-    let key = "zipthumb:book.zip|autocrop:v2:rtl#pin:cover";
+    let key = "zipthumb:book.zip|autocrop:v3:rtl#pin:cover";
     let old = "zipthumb:book.zip|autocrop:v1:rtl#pin:cover";
     let opposite = "zipthumb:book.zip|autocrop:v1:ltr#pin:cover";
     let bytes = fixture_webp();
     writer
         .save(
-            "zipthumb:book.zip|autocrop:v2:ltr#pin:cover",
+            "zipthumb:book.zip|autocrop:v3:ltr#pin:cover",
             7,
             9,
             8,
@@ -195,6 +195,28 @@ fn auto_material_k2_prefers_v2_and_legacy_fallback_requires_missing_exact_v2() {
         )
         .unwrap();
     assert!(auto_material_candidate(&cache, &directory, key).is_none());
+    for old_v2 in [
+        "zipthumb:book.zip|autocrop:v2:rtl#pin:cover",
+        "zipthumb:book.zip|autocrop:v2:ltr#pin:cover",
+    ] {
+        writer
+            .save(
+                old_v2,
+                7,
+                9,
+                8,
+                8,
+                None,
+                &bytes,
+                &CoverIdentity::Page("unreleased-v2".into()),
+                auto_material_sample(),
+            )
+            .unwrap();
+    }
+    assert!(
+        auto_material_candidate(&cache, &directory, key).is_none(),
+        "unreleased v2 rows must not be migrated into current v3 material"
+    );
     writer.save(opposite, 7, 9, 8, 8, None, &bytes,
         &CoverIdentity::Page("old-ltr".into()), AutoMaterial::NotAutomatic).unwrap();
     let legacy = auto_material_candidate(&cache, &directory, key).unwrap();
@@ -250,10 +272,10 @@ fn auto_material_k2_prefers_v2_and_legacy_fallback_requires_missing_exact_v2() {
     .unwrap();
     assert!(
         auto_material_candidate(&cache, &directory, key).is_none(),
-        "an existing v2 row with missing material must not resurrect v1"
+        "an existing v3 row with missing material must not resurrect v1"
     );
-    // Existing v2 with a stale stamp or invalid raster is a miss; it must not
-    // resurrect old v1 material merely because the v2 row cannot be used.
+    // Existing v3 with a stale stamp or invalid raster is a miss; it must not
+    // resurrect old v1 material merely because the v3 row cannot be used.
     writer
         .save(
             key,
@@ -428,7 +450,7 @@ fn auto_material_generated_and_cached_roi_use_distinct_display_and_storage_targe
     assert_eq!(selected.auto_material, material);
     auto_material_assert_roi(selected.auto_material, selected.image.size, 64);
     let parent = crate::catalog::CatalogDb::open(&cache, temp.path()).unwrap();
-    let parent_key = "folderthumb:auto-v3:books|autocrop:v2:rtl";
+    let parent_key = "folderthumb:auto-v3:books|autocrop:v3:rtl";
     assert!(
         parent
             .save_auto_folder_bytes(

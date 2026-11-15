@@ -28,7 +28,7 @@ fn cover_auto_folder_direct_selection_reuses_listing_and_excludes_descendants_an
     req.set_auto_cover_crop(Some(identity));
     assert_eq!(
         req.cache_key_override.as_deref(),
-        Some("folderthumb:book|autocrop:v2f:rtl")
+        Some("folderthumb:book|autocrop:v3f:rtl")
     );
     let resolved = resolve_read_after_cache_miss(&req, None, None);
     let auto = resolved
@@ -63,7 +63,7 @@ fn cover_auto_folder_direct_selection_reuses_listing_and_excludes_descendants_an
     );
     req.folder_thumb_provenance = None;
     req.path = temp.path().to_owned();
-    req.cache_key_override = Some("folderthumb:parent|autocrop:v2f:rtl".into());
+    req.cache_key_override = Some("folderthumb:parent|autocrop:v3f:rtl".into());
     assert!(
         resolve_read_after_cache_miss(&req, None, None)
             .auto_cover_crop
@@ -83,12 +83,15 @@ fn cover_auto_folder_direct_selection_reuses_listing_and_excludes_descendants_an
 }
 
 #[test]
-fn cover_auto_folder_v2f_identity_roundtrips_and_never_uses_v1_migration() {
+fn cover_auto_folder_v3f_identity_roundtrips_and_never_uses_v1_migration() {
     let visible = Default::default();
     for literal in [
         "zipdir:book|autocrop:v2f:rtl",
         "zipdir:book|autocrop:v2f:ltr#pin:001",
         "zipthumb:book|autocrop:v2f:rtl",
+        "zipdir:book|autocrop:v3f:rtl",
+        "zipdir:book|autocrop:v3f:ltr#pin:001",
+        "zipthumb:book|autocrop:v3f:rtl",
     ] {
         assert_eq!(
             representative_cache_key_for_policy(literal, &visible),
@@ -113,7 +116,7 @@ fn cover_auto_folder_v2f_identity_roundtrips_and_never_uses_v1_migration() {
         ] {
             let enabled = representative_cache_key_for_policy_with_auto(key, &visible, Some(auto));
             assert_eq!(
-                enabled.contains("|autocrop:v2f:"),
+                enabled.contains("|autocrop:v3f:"),
                 key.starts_with(CACHE_KEY_FOLDER)
             );
             assert_eq!(

@@ -10,8 +10,9 @@
 //! saved rotation is truth.saved_rotation minus IMAGE_ROTATION (default 0).
 //! REENCODE_INPUT=1 also reencodes the zero-degree ZIP cover, providing a
 //! numerical control for JPEG recompression in the physical-rotation matrix.
-//! FALLBACK=edge/edge18/density/density18/layout/layout-snap enables evaluation-only
-//! crops after structural declines. FALLBACK_RICHER=1 also permits richer-elsewhere.
+//! The default is production v3, including full height and layout-snap policy.
+//! FALLBACK=edge/edge18/density/density18/layout/layout-snap enables additional
+//! experiments after remaining structural declines; metadata guards stay final.
 //! All angles are evaluated; directory counts use the selected saved angle.
 use super::*;
 use image::Rgb;
@@ -526,6 +527,8 @@ fn evaluate_directory(
             "saved_rotation":saved.degrees(),"image_rotation":mode.image_rotation.degrees(),
             "all_crops":outcomes.map(|outcome|outcome.final_result.ok().map(CoverCrop::values)),
             "original_decline":selected.original.err().map(|reason|reason.as_str().into_owned()),
+            "production_method":selected.original.ok().map(|success|success.method.as_str()),
+            "production_layout":selected.original.ok().and_then(|success|success.layout()).map(AutoCropLayout::as_str),
             "fallback":selected.fallback.map(|diagnostic|diagnostic.json(fallback_config)),
             "all_fallbacks":outcomes.map(|outcome|outcome.fallback.map(|diagnostic|diagnostic.json(fallback_config))),
             "dct_scale_num":worker.as_ref().and_then(|decoded|decoded.dct_scale_num),"orientation":worker.as_ref().map(|decoded|decoded.orientation)}));
@@ -561,7 +564,7 @@ fn evaluate_directory(
         }
     }
     sheet.save(output.join("sheet.png"))?;
-    let summary = json!({"algorithm":"autocrop:v2","decode_mode":mode.name(),"display_px":mode.display_px,"thumb_px":mode.thumb_px,
+    let summary = json!({"algorithm":"autocrop:v3","decode_mode":mode.name(),"display_px":mode.display_px,"thumb_px":mode.thumb_px,
         "analysis_decode_height":1024,"image_rotation":mode.image_rotation.degrees(),
         "physical_jpeg_reencode_quality":(!mode.image_rotation.is_none() || mode.reencode_input).then_some(95),
         "reencode_input_control":mode.reencode_input,
@@ -692,7 +695,7 @@ fn evaluation_truth_rotation_uses_source_edges_without_pixel_center_drift() {
 }
 
 #[test]
-fn folder_evaluation_fallback_synthetic_counts_keep_guard_and_emit_no_images_or_identities()
+fn folder_evaluation_production_v3_counts_keep_guard_and_emit_no_images_or_identities()
 -> Result<(), Box<dyn std::error::Error>> {
     let target = std::env::current_dir()?.join("target");
     std::fs::create_dir_all(&target)?;
@@ -700,22 +703,21 @@ fn folder_evaluation_fallback_synthetic_counts_keep_guard_and_emit_no_images_or_
         .prefix("cover-auto-fallback-eval-")
         .tempdir_in(&target)?;
     let mut folders = Vec::new();
-    // Both covers transpose the body dimensions. Only real shooting EXIF may
-    // guard them now; the otherwise identical plain cover reaches fallback.
+    // Identical flat covers: shooting EXIF guards the first, production v3
+    // handles the second as T2 even when no comparison fallback is selected.
     for index in 0..2 {
-        let width = 150;
         let folder = temp.path().join(format!("private-folder-{index}"));
         std::fs::create_dir(&folder)?;
         if index == 0 {
             std::fs::write(
                 folder.join("000-private-cover.jpg"),
-                synthetic_shot_jpeg(width, 100)?,
+                synthetic_shot_jpeg(150, 100)?,
             )?;
         } else {
-            DynamicImage::new_rgb8(width, 100).save(folder.join("000-private-cover.png"))?;
+            DynamicImage::new_rgb8(150, 100).save(folder.join("000-private-cover.png"))?;
         }
         for page in 1..=8 {
-            DynamicImage::new_rgb8(100, 150)
+            DynamicImage::new_rgb8(105, 150)
                 .save(folder.join(format!("{page:03}-private-body.png")))?;
         }
         folders.push(folder);
@@ -731,8 +733,6 @@ fn folder_evaluation_fallback_synthetic_counts_keep_guard_and_emit_no_images_or_
         Some("layout"),
         Some("layout-snap"),
     ] {
-        // No process environment mutation: production defaults and each
-        // experiment can run concurrently with unrelated test processes.
         let config = FallbackConfig::parse(mode, false)?;
         let output = temp.path().join(mode.unwrap_or("baseline"));
         evaluate_folder_list(&list, &output, config)?;
@@ -744,51 +744,38 @@ fn folder_evaluation_fallback_synthetic_counts_keep_guard_and_emit_no_images_or_
         assert!(!text.contains("private-"));
         assert!(!text.contains(&temp.path().to_string_lossy().into_owned()));
         let summary: serde_json::Value = serde_json::from_str(&text)?;
-        let count = u32::from(mode.is_some());
+        assert_eq!(summary["algorithm"], "autocrop:v3f");
         assert_eq!(summary["total"], 2);
-        assert_eq!(summary["cropped"], count);
-        assert_eq!(summary["declined"], 2 - count);
-        assert_eq!(summary["fallback_cropped"], count);
+        assert_eq!(summary["cropped"], 1);
+        assert_eq!(summary["declined"], 1);
+        assert_eq!(summary["fallback_cropped"], 0);
         assert!(summary["fallback_good"].is_null());
         assert!(summary["fallback_wrong"].is_null());
         assert_eq!(
             summary["rows"][0]["original_decline"],
             "photo-like/shot-exif"
         );
-        assert!(summary["rows"][0]["fallback"].is_null());
         assert!(summary["rows"][0]["crop"].is_null());
         assert_eq!(summary["ratio_distribution"]["count"], 2);
         assert_eq!(
             summary["ratio_distribution"]["bins"],
-            json!([{"lower":2.2,"upper":2.4,"count":2}])
+            json!([{"lower":2.0,"upper":2.2,"count":2}])
         );
-        assert_eq!(summary["rows"][1]["fallback"].is_object(), mode.is_some());
-        assert_eq!(summary["rows"][1]["crop"].is_array(), mode.is_some());
-        assert_eq!(
-            summary["fallback_inward_fraction_distribution"]["count"],
-            count
+        let row = &summary["rows"][1];
+        assert!(row["crop"].is_array());
+        assert!(row["current_crop"].is_array());
+        assert!(row["fallback_crop"].is_null());
+        assert!(row["fallback"].is_null());
+        assert_eq!(row["production_method"], "layout-fallback");
+        assert_eq!(row["production_layout"], "T2");
+        assert!(
+            row["all_fallbacks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(serde_json::Value::is_null)
         );
-        if mode.is_some() {
-            let reason = summary["rows"][1]["original_decline"].as_str().unwrap();
-            assert_eq!(summary["fallback_original_declines"][reason], 1);
-            assert_eq!(summary["rows"][1]["all_crops"].as_array().unwrap().len(), 4);
-            assert_eq!(
-                summary["rows"][1]["all_fallbacks"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter(|value| value.is_object())
-                    .count(),
-                2
-            );
-            if mode.is_some_and(|mode| mode.starts_with("layout")) {
-                assert_eq!(summary["fallback_by_layout"]["T2"]["cropped"], 1);
-                assert!(summary["fallback_by_layout"]["T2"]["good"].is_null());
-                assert!(summary["fallback_by_layout"]["T2"]["wrong"].is_null());
-                assert_eq!(summary["fallback_layout_ratio_distribution"]["count"], 1);
-                assert_eq!(summary["rows"][1]["fallback"]["layout"]["kind"], "T2");
-            }
-        }
+        assert_eq!(summary["fallback_inward_fraction_distribution"]["count"], 0);
     }
     Ok(())
 }
@@ -905,7 +892,7 @@ fn evaluation_null_page_aspect_samples_zip_and_declines_missing_png_without_earl
         assert_eq!(summary["wrong"], 0);
         assert_eq!(summary["negative_cropped"], 0);
         assert_eq!(summary["negative_declined"], 2);
-        assert_eq!(summary["fallback_by_layout"]["T2"]["good"], 1);
+        assert_eq!(summary["fallback_cropped"], 0);
         for row in summary["rows"].as_array().unwrap() {
             match row["name"].as_str().unwrap() {
                 "null-sampled-zip" => {
@@ -950,34 +937,28 @@ fn evaluation_layout_directory_summary_counts_each_type_and_keeps_positions_and_
         }
     }
     std::fs::write(temp.path().join("truth.json"), serde_json::to_vec(&truth)?)?;
-    for mode in ["layout", "layout-snap"] {
-        let output = temp.path().join(mode);
+    for mode in [None, Some("layout"), Some("layout-snap")] {
+        let output = temp.path().join(mode.unwrap_or("baseline"));
         evaluate_directory(
             temp.path(),
             &output,
             &synthetic_decode_mode(true),
-            FallbackConfig::parse(Some(mode), false)?,
+            FallbackConfig::parse(mode, false)?,
         )?;
         let summary: serde_json::Value =
             serde_json::from_slice(&std::fs::read(output.join("summary.json"))?)?;
         assert_eq!(summary["good"], 8);
         assert_eq!(summary["wrong"], 0);
-        assert_eq!(summary["fallback_cropped"], 8);
+        assert_eq!(summary["fallback_cropped"], 0);
+        assert_eq!(summary["algorithm"], "autocrop:v3");
         assert_eq!(summary["ratio_distribution"]["count"], 8);
-        for kind in ["T1", "T2", "T3", "T4"] {
-            assert_eq!(
-                summary["fallback_by_layout"][kind],
-                json!({"cropped":2,"good":2,"wrong":0})
-            );
-        }
         for row in summary["rows"].as_array().unwrap() {
-            let layout = &row["fallback"]["layout"];
+            assert_eq!(row["production_method"], "layout-fallback");
             assert_eq!(
-                layout["kind"].as_str().unwrap(),
+                row["production_layout"].as_str().unwrap(),
                 &row["name"].as_str().unwrap()[..2]
             );
-            assert_eq!(layout["predicted"], layout["final_position"]);
-            assert_eq!(layout["snap_applied"], false);
+            assert!(row["fallback"].is_null());
             assert!(row["iou"].as_f64().unwrap() > 0.999);
         }
     }

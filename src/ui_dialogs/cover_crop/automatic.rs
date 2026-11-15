@@ -1,5 +1,5 @@
 //! Worker-produced automatic results; the UI only selects the saved angle.
-use crate::cover_auto_crop::{AutoCropDecline, TwoPanelDecline};
+use crate::cover_auto_crop::{AutoCropDecline, AutoCropMethod, AutoCropSuccess, TwoPanelDecline};
 #[cfg(test)]
 use crate::cover_auto_material::AutoCropResults;
 use crate::cover_auto_sample::PageAspectDecline;
@@ -45,7 +45,7 @@ pub(super) enum AutoDetection {
     Stopped(AutoStop),
     Analyzed {
         binding: ReadingDirection,
-        reports: [Result<CoverCrop, AutoCropDecline>; 4],
+        reports: [Result<AutoCropSuccess, AutoCropDecline>; 4],
     },
 }
 
@@ -58,7 +58,7 @@ impl AutoDetection {
         binding: ReadingDirection,
     ) -> Self {
         let mut reports = [Err(AutoCropDecline::NoStructure); 4];
-        crate::cover_auto_crop::detect_cover_crops_with_photo_report(
+        crate::cover_auto_crop::detect_cover_crops_with_photo_detailed_report(
             image,
             dimensions,
             page_aspect,
@@ -78,7 +78,9 @@ impl AutoDetection {
 
     pub(super) fn crop_for(self, rotation: Rotation) -> Option<CoverCrop> {
         match self {
-            Self::Analyzed { reports, .. } => reports[rotation.degrees() as usize / 90].ok(),
+            Self::Analyzed { reports, .. } => reports[rotation.degrees() as usize / 90]
+                .ok()
+                .map(|success| success.crop),
             Self::Stopped(_) => None,
         }
     }
@@ -86,7 +88,9 @@ impl AutoDetection {
     #[cfg(test)]
     pub(super) fn crops(self) -> Option<AutoCropResults> {
         match self {
-            Self::Analyzed { reports, .. } => Some(AutoCropResults::new(reports.map(Result::ok))),
+            Self::Analyzed { reports, .. } => Some(AutoCropResults::new(
+                reports.map(|result| result.ok().map(|success| success.crop)),
+            )),
             Self::Stopped(_) => None,
         }
     }
@@ -95,9 +99,10 @@ impl AutoDetection {
     pub(super) fn from_crops(crops: AutoCropResults) -> Self {
         Self::Analyzed {
             binding: ReadingDirection::Rtl,
-            reports: crops
-                .crops()
-                .map(|crop| crop.ok_or(AutoCropDecline::NoJacketEvidence)),
+            reports: crops.crops().map(|crop| {
+                crop.map(|crop| AutoCropSuccess::for_test(crop, AutoCropMethod::Current))
+                    .ok_or(AutoCropDecline::NoJacketEvidence)
+            }),
         }
     }
 
@@ -106,21 +111,31 @@ impl AutoDetection {
             Self::Stopped(stop) => stop_text(stop),
             Self::Analyzed { binding, reports } => {
                 match reports[rotation.degrees() as usize / 90] {
-                    Ok(_) => {
-                        return format!(
-                            "自動の判定: 表表紙を切り出しました (綴じ方向: {})",
-                            match binding {
-                                ReadingDirection::Rtl => "右綴じ",
-                                ReadingDirection::Ltr => "左綴じ",
-                            }
-                        );
-                    }
+                    Ok(success) => return success_text(success, binding),
                     Err(reason) => decline_text(reason),
                 }
             }
         };
         format!("自動の判定: 切り出していません。{reason}")
     }
+}
+
+fn success_text(success: AutoCropSuccess, binding: ReadingDirection) -> String {
+    let binding = match binding {
+        ReadingDirection::Rtl => "右綴じ",
+        ReadingDirection::Ltr => "左綴じ",
+    };
+    let (action, layout) = match success.method {
+        AutoCropMethod::Current => {
+            return format!("自動の判定: 表表紙を切り出しました (綴じ方向: {binding})");
+        }
+        AutoCropMethod::LayoutFallback(layout) => ("寸法の型から表表紙を切り出しました", layout),
+        AutoCropMethod::LayoutReplaced(layout) => {
+            ("寸法の型に合わせて切り出す位置を変更しました", layout)
+        }
+    };
+    let layout = layout.as_str();
+    format!("自動の判定: {action} (型: {layout}、綴じ方向: {binding})")
 }
 
 fn stop_text(stop: AutoStop) -> &'static str {
@@ -162,6 +177,9 @@ fn decline_text(reason: AutoCropDecline) -> &'static str {
         // The dialog normally stops before analysis with the sampler's exact
         // typed cause. Keep a diagnostic for a detector-only missing aspect.
         PageAspectMissing => stop_text(AutoStop::PageAspect(PageAspectDecline::TooFew)),
+        CameraPageAspect => {
+            "本文ページの形が写真の比率に近いため、寸法の型による切り出しは使いません"
+        }
         NoJacketEvidence | NoStructure | NoLocalEvidence | NoSpine => {
             "表表紙と背・袖の境目が見つかりません"
         }
@@ -196,7 +214,7 @@ mod tests {
             let detection = AutoDetection::Analyzed {
                 binding,
                 reports: [
-                    Ok(crop),
+                    Ok(AutoCropSuccess::for_test(crop, AutoCropMethod::Current)),
                     Err(AutoCropDecline::RawAspectGate),
                     Err(AutoCropDecline::NoSpine),
                     Err(AutoCropDecline::WeakFront),
@@ -226,6 +244,10 @@ mod tests {
             (
                 PageAspectMissing,
                 "本文ページの形が決まりません (ページが少ない)",
+            ),
+            (
+                CameraPageAspect,
+                "本文ページの形が写真の比率に近いため、寸法の型による切り出しは使いません",
             ),
             (NoJacketEvidence, boundary),
             (NoStructure, boundary),

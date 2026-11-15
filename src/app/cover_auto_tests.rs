@@ -737,7 +737,7 @@ fn cover_auto_folder_switch_keeps_list_survival_rating_and_dialog_identity_consi
                     .unwrap()
                     .into_owned();
                 assert_eq!(
-                    key.contains("|autocrop:v2f:"),
+                    key.contains("|autocrop:v3f:"),
                     folders && matches!(item, GridItem::Folder(_))
                 );
                 let survival = folder_thumb_existing_keys_for_with_auto_crop(

@@ -199,7 +199,9 @@ fn evaluate_one(
             .position(|&angle| angle == saved)
             .unwrap()]
     });
-    let current = selected.and_then(|outcome| outcome.original.ok());
+    let current = selected
+        .and_then(|outcome| outcome.original.ok())
+        .map(|success| success.crop);
     let fallback = selected
         .filter(|outcome| outcome.fallback.is_some())
         .and_then(|outcome| outcome.final_result.ok());
@@ -239,6 +241,8 @@ fn evaluate_one(
             value.pointer("/layout/kind").or_else(|| value.get("mode"))),
         "image_filename": filename,
         "original_decline": selected.and_then(|outcome| outcome.original.err()).map(|reason| reason.as_str().into_owned()),
+        "production_method": selected.and_then(|outcome| outcome.original.ok()).map(|success| success.method.as_str()),
+        "production_layout": selected.and_then(|outcome| outcome.original.ok()).and_then(|success| success.layout()).map(AutoCropLayout::as_str),
         "iou": null,
     });
     if folders_only {
@@ -389,7 +393,7 @@ pub(super) fn evaluate(
         }
         rows.push(row.json);
     }
-    let summary = json!({"algorithm": "autocrop:v2f", "source": if folders_only {"folder-list"} else {"book-list"},
+    let summary = json!({"algorithm": "autocrop:v3f", "source": if folders_only {"folder-list"} else {"book-list"},
         "binding": if options.binding == ReadingDirection::Rtl { "rtl" } else { "ltr" },
         "total": paths.len(), "cropped": cropped, "declined": declined, "failed": failed,
         "decline_reasons": reasons, "fallback_mode": config.name(), "fallback_richer": config.includes_richer(),

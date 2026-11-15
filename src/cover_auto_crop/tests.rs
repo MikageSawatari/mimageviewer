@@ -2,6 +2,277 @@ use super::*;
 use image::Rgb;
 
 #[test]
+fn production_layout_fallback_accepts_every_structural_decline_and_preserves_guards() {
+    let image = RgbImage::new(392, 200);
+    let apply = |reason| {
+        apply_layout_policy(
+            &image,
+            (392, 200),
+            Some(0.7),
+            ReadingDirection::Rtl,
+            Err(reason),
+        )
+    };
+    let mut structural = vec![
+        AutoCropDecline::NoJacketEvidence,
+        AutoCropDecline::NoStructure,
+        AutoCropDecline::NoLocalEvidence,
+        AutoCropDecline::NoSpine,
+        AutoCropDecline::WeakFront,
+        AutoCropDecline::RicherElsewhere,
+    ];
+    for v5 in [
+        TwoPanelTrigger::NoJacketEvidence,
+        TwoPanelTrigger::NoLocalEvidence,
+        TwoPanelTrigger::NoSpine,
+        TwoPanelTrigger::WeakFront,
+    ] {
+        for reason in [
+            TwoPanelDecline::Shape,
+            TwoPanelDecline::NoRange,
+            TwoPanelDecline::WeakBoundary,
+            TwoPanelDecline::OuterWide,
+            TwoPanelDecline::NotPaper,
+            TwoPanelDecline::WeakFront,
+            TwoPanelDecline::RicherElsewhere,
+        ] {
+            structural.push(AutoCropDecline::TwoPanel { v5, reason });
+        }
+    }
+    for reason in structural {
+        let success = apply(reason).unwrap();
+        assert_eq!(
+            success.method,
+            AutoCropMethod::LayoutFallback(AutoCropLayout::T3)
+        );
+        assert_eq!(success.layout(), Some(AutoCropLayout::T3));
+        assert_eq!(success.as_str(), "layout-fallback/T3");
+        assert_eq!(success.crop.values(), [225_000, 0, 589_286, 1_000_000]);
+    }
+    for reason in [
+        AutoCropDecline::RawAspectGate,
+        AutoCropDecline::PageAspectMissing,
+        AutoCropDecline::NotWide,
+        AutoCropDecline::CameraPageAspect,
+        AutoCropDecline::PhotoLike {
+            reason: photo::PhotoLikeReason::ShotExif,
+        },
+    ] {
+        assert_eq!(apply(reason), Err(reason));
+    }
+}
+
+#[test]
+fn production_camera_page_ratios_guard_only_layout_fallback_with_strict_tolerance() {
+    let image = RgbImage::new(300, 200);
+    for camera in [2.0 / 3.0, 3.0 / 4.0, 9.0 / 16.0, 4.0 / 5.0] {
+        for offset in [-0.001999, 0.0, 0.001999, -0.002001, 0.002001] {
+            let aspect = camera + offset;
+            let result = apply_layout_policy(
+                &image,
+                (300, 200),
+                Some(aspect),
+                ReadingDirection::Rtl,
+                Err(AutoCropDecline::RicherElsewhere),
+            );
+            if offset.abs() < 0.002 {
+                assert_eq!(result, Err(AutoCropDecline::CameraPageAspect));
+            } else {
+                assert!(matches!(
+                    result.unwrap().method,
+                    AutoCropMethod::LayoutFallback(_)
+                ));
+            }
+        }
+        let current = CoverCrop::new([0, 30_000, 500_000, 970_000])
+            .unwrap()
+            .unwrap();
+        assert!(
+            apply_layout_policy(
+                &image,
+                (300, 200),
+                Some(camera),
+                ReadingDirection::Rtl,
+                Ok(current),
+            )
+            .is_ok(),
+            "camera ratio must not veto an existing success"
+        );
+    }
+    assert_eq!(
+        AutoCropDecline::CameraPageAspect.as_str(),
+        "camera-page-aspect"
+    );
+}
+
+#[test]
+fn production_t2_replacement_uses_unsnapped_horizontal_iou_and_strict_point_six() {
+    let image = RgbImage::new(200, 100);
+    for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+        // T2's unrounded prediction is 0..102 (mirrored for LTR). A wider
+        // current interval ending at 170 has IoU exactly 102/170 = 0.6.
+        for (end, method) in [
+            (849_999, AutoCropMethod::Current),
+            (850_000, AutoCropMethod::Current),
+            (850_001, AutoCropMethod::LayoutReplaced(AutoCropLayout::T2)),
+        ] {
+            let crop = CoverCrop::new(match binding {
+                ReadingDirection::Rtl => [0, 25_000, end, 975_000],
+                ReadingDirection::Ltr => [1_000_000 - end, 25_000, 1_000_000, 975_000],
+            })
+            .unwrap()
+            .unwrap();
+            let success =
+                apply_layout_policy(&image, (200, 100), Some(1.0), binding, Ok(crop)).unwrap();
+            assert_eq!(success.method, method, "{binding:?} {end}");
+            assert_eq!(
+                success.layout(),
+                if method == AutoCropMethod::Current {
+                    None
+                } else {
+                    Some(AutoCropLayout::T2)
+                }
+            );
+            let expected = if method == AutoCropMethod::Current {
+                full_height(crop)
+            } else {
+                layout::crop(&image, (200, 100), 1.0, binding, true)
+                    .unwrap()
+                    .0
+            };
+            assert_eq!(success.crop, expected);
+        }
+        let disjoint = CoverCrop::new([500_000, 0, 1_000_000, 1_000_000])
+            .unwrap()
+            .unwrap();
+        for width in [184, 240, 270, 350, 400] {
+            let success =
+                apply_layout_policy(&image, (width, 100), Some(1.0), binding, Ok(disjoint))
+                    .unwrap();
+            assert_eq!(
+                success.method,
+                AutoCropMethod::Current,
+                "outside T2: {width}"
+            );
+            assert_eq!(success.crop, disjoint);
+        }
+        // Camera page ratios also keep the T2 replacement rule active.
+        let success = apply_layout_policy(
+            &image,
+            (200, 150),
+            Some(2.0 / 3.0),
+            binding,
+            Ok(match binding {
+                ReadingDirection::Rtl => disjoint,
+                ReadingDirection::Ltr => {
+                    CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap().unwrap()
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            success.method,
+            AutoCropMethod::LayoutReplaced(AutoCropLayout::T2)
+        );
+        assert_eq!(success.as_str(), "layout-replaced/T2");
+    }
+}
+
+#[test]
+fn production_full_height_preserves_horizontal_structural_crop_at_every_rotation() {
+    for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+        let (pixels, _) = jacket(binding, true, true, true, true);
+        let image = DynamicImage::ImageRgb8(pixels);
+        let dims = (image.width(), image.height());
+        let legacy = cover_auto_crop(&analysis_raster(&image), dims, Some(0.7), binding).unwrap();
+        assert!(legacy.values()[1] > 0 && legacy.values()[3] < 1_000_000);
+        let expected = full_height(legacy);
+        for physical in [
+            Rotation::None,
+            Rotation::Cw90,
+            Rotation::Cw180,
+            Rotation::Cw270,
+        ] {
+            let source = rotate_image(&image, physical);
+            let saved = Rotation::from_degrees(-physical.degrees());
+            let mut selected = None;
+            let results = detect_cover_crops_with_photo_detailed_report(
+                &source,
+                (source.width(), source.height()),
+                Some(0.7),
+                false,
+                binding,
+                |rotation, result| {
+                    if rotation == saved {
+                        selected = Some(result);
+                    }
+                },
+            );
+            let success = selected.unwrap().unwrap();
+            assert_eq!(success.crop, rotate_crop(expected, physical));
+            assert_eq!(success.method, AutoCropMethod::Current);
+            assert_eq!(success.as_str(), "crop");
+            assert_eq!(results.crop_for(saved), Some(success.crop));
+        }
+    }
+}
+
+#[test]
+fn production_layout_ratio_boundaries_and_all_saved_rotations_share_the_prediction() {
+    for (width, kind) in [
+        (945, AutoCropLayout::T1),
+        (1295, AutoCropLayout::T2),
+        (1680, AutoCropLayout::T3),
+        (2170, AutoCropLayout::T4),
+    ] {
+        let image = DynamicImage::new_rgb8(width, 1000);
+        for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+            let raster = analysis_raster(&image);
+            let expected = layout::crop(&raster, (width, 1000), 0.7, binding, true)
+                .unwrap()
+                .0;
+            for physical in [
+                Rotation::None,
+                Rotation::Cw90,
+                Rotation::Cw180,
+                Rotation::Cw270,
+            ] {
+                let source = rotate_image(&image, physical);
+                let saved = Rotation::from_degrees(-physical.degrees());
+                let mut selected = None;
+                detect_cover_crops_with_photo_detailed_report(
+                    &source,
+                    (source.width(), source.height()),
+                    Some(0.7),
+                    false,
+                    binding,
+                    |rotation, result| {
+                        if rotation == saved {
+                            selected = Some(result);
+                        }
+                    },
+                );
+                let success = selected.unwrap().unwrap();
+                assert_eq!(success.method, AutoCropMethod::LayoutFallback(kind));
+                assert_eq!(success.layout(), Some(kind));
+                assert_eq!(success.crop, rotate_crop(expected, physical));
+            }
+        }
+    }
+    for width in [944, 2730, 2731] {
+        assert!(
+            production_crop(
+                &RgbImage::new(width, 1000),
+                (width, 1000),
+                Some(0.7),
+                ReadingDirection::Rtl
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn native_analysis_raster_preserves_pixels_without_smoothing_either_axis() {
     let image = RgbImage::from_fn(8, 256, |x, y| {
         Rgb([
@@ -425,11 +696,11 @@ fn gates_and_identity_are_explicit() {
     }
     assert_eq!(
         AutoCropIdentity::new(ReadingDirection::Rtl).suffix(),
-        "v2:rtl"
+        "v3:rtl"
     );
     assert_eq!(
         AutoCropIdentity::new(ReadingDirection::Ltr).suffix(),
-        "v2:ltr"
+        "v3:ltr"
     );
 }
 
@@ -517,8 +788,8 @@ fn raw_aspect_gate_before_pixel_work_preserves_decline_reason_for_each_rotation(
                 _ => original_dims,
             };
             for aspect in [None, Some(f64::NAN), Some(0.7)] {
-                // The old order is the oracle: rotation/raster, then raw gate.
-                let expected = cover_auto_crop(
+                // Equivalent order: build the raster, then apply the production gates.
+                let expected = production_crop(
                     &analysis_raster(&rotated),
                     dimensions,
                     aspect,
@@ -576,13 +847,14 @@ fn saved_quarter_turn_reduces_only_after_restoring_the_upright_analysis_height()
     // a different analysis height after rotating; it cannot be reused here.
     let wrong_order = image::imageops::rotate270(&analysis_raster(&portrait));
     assert_ne!(correct.dimensions(), wrong_order.dimensions());
-    let expected = cover_auto_crop(
+    let expected = production_crop(
         &correct,
         (upright.width(), upright.height()),
         Some(0.7),
         ReadingDirection::Rtl,
     )
-    .unwrap();
+    .unwrap()
+    .crop;
     let result = detect_cover_crops(
         &portrait,
         (portrait.width(), portrait.height()),

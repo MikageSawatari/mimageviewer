@@ -415,6 +415,10 @@ pub(crate) fn representative_auto_crop_key_parts(key: &str) -> Option<(&str, &st
     let split = key.find(CACHE_KEY_PIN_SUFFIX).unwrap_or(key.len());
     let (base, pin) = key.split_at(split);
     for token in [
+        "|autocrop:v3:rtl",
+        "|autocrop:v3:ltr",
+        "|autocrop:v3f:rtl",
+        "|autocrop:v3f:ltr",
         "|autocrop:v2:rtl",
         "|autocrop:v2:ltr",
         "|autocrop:v2f:rtl",
@@ -422,9 +426,11 @@ pub(crate) fn representative_auto_crop_key_parts(key: &str) -> Option<(&str, &st
         "|autocrop:v1:rtl",
         "|autocrop:v1:ltr",
     ] {
-        // v2f is emitted only for folder representatives. On another kind it
+        // Folder-only versions are emitted only for folder representatives. On another kind they
         // remains literal source text, just like any unknown derived token.
-        if token.starts_with("|autocrop:v2f:") && !key.starts_with(CACHE_KEY_FOLDER) {
+        if (token.starts_with("|autocrop:v3f:") || token.starts_with("|autocrop:v2f:"))
+            && !key.starts_with(CACHE_KEY_FOLDER)
+        {
             continue;
         }
         if let Some(base) = base.strip_suffix(token) {
@@ -438,7 +444,7 @@ pub(crate) fn representative_auto_crop_key_parts(key: &str) -> Option<(&str, &st
 /// unambiguous suffix position as the builder, including pinned EPUB tails.
 fn legacy_auto_child_keys(key: &str) -> Option<[String; 2]> {
     let (base, token, tail) = representative_auto_crop_key_parts(key)?;
-    let binding = token.strip_prefix("|autocrop:v2:")?;
+    let binding = token.strip_prefix("|autocrop:v3:")?;
     let other = if binding == "rtl" { "ltr" } else { "rtl" };
     Some([
         format!("{base}|autocrop:v1:{binding}{tail}"),
@@ -7195,22 +7201,25 @@ pub(crate) fn load_one_cached(
             };
             match analysis {
                 Ok(analysis) => {
-                    let results = crate::cover_auto_crop::detect_cover_crops_with_photo_report(
-                        &analysis.image,
-                        analysis.native_dims,
-                        sample.ok(),
-                        analysis.shot_exif,
-                        auto.identity.binding,
-                        |rotation, result| {
-                            let reason =
-                                result.map_or_else(|decline| decline.as_str(), |_| "crop".into());
-                            crate::logger::log(format!(
-                                "auto cover: rotation={rotation:?} {reason} page-aspect={} book={} leaf={display_name}",
-                                aspect_result.map_or_else(|reason| reason.as_str(), |_| "ok"),
-                                book_display
-                            ));
-                        },
-                    );
+                    let results =
+                        crate::cover_auto_crop::detect_cover_crops_with_photo_detailed_report(
+                            &analysis.image,
+                            analysis.native_dims,
+                            sample.ok(),
+                            analysis.shot_exif,
+                            auto.identity.binding,
+                            |rotation, result| {
+                                let reason = result.map_or_else(
+                                    |decline| decline.as_str(),
+                                    |success| success.as_str(),
+                                );
+                                crate::logger::log(format!(
+                                    "auto cover: rotation={rotation:?} {reason} page-aspect={} book={} leaf={display_name}",
+                                    aspect_result.map_or_else(|reason| reason.as_str(), |_| "ok"),
+                                    book_display
+                                ));
+                            },
+                        );
                     auto_material = crate::cover_auto_material::AutoMaterial::Automatic(results);
                     reason = if results.crops().iter().any(Option::is_some) {
                         "cropped-at-draw"
@@ -10743,8 +10752,8 @@ mod tests {
             folders: false,
         };
         let policy = crate::file_type_visibility::FileTypeVisibility::default();
-        let key = "zipthumb:book.zip|autocrop:v2:ltr#pin:entry|generation:10:20";
-        let expected = "zipthumb:book.zip|autocrop:v2:rtl#pin:entry|generation:10:20";
+        let key = "zipthumb:book.zip|autocrop:v3:ltr#pin:entry|generation:10:20";
+        let expected = "zipthumb:book.zip|autocrop:v3:rtl#pin:entry|generation:10:20";
         assert_eq!(
             representative_cache_key_for_policy_with_auto(key, &policy, Some(rtl)),
             expected
@@ -10781,7 +10790,7 @@ mod tests {
         assert_eq!(request.auto_cover_crop, Some(identity));
         assert_eq!(
             cache_key_for_request(&request).unwrap(),
-            "zipthumb:book.zip|autocrop:v2:rtl#pin:entry"
+            "zipthumb:book.zip|autocrop:v3:rtl#pin:entry"
         );
         request.cover_crop = Some(manual_cover_crop([0, 0, 500_000, 1_000_000]));
         request.set_auto_cover_crop(Some(identity));
@@ -10865,7 +10874,7 @@ mod tests {
             "zipdir:chapter/|autocrop:v1:rtl|suffix/",
             "zipdir:chapter/|autocrop:v1:ltr|suffix/",
             "zipdir:chapter/|types:0000000000000001|suffix/",
-            "zipthumb:a.zip|autocrop:v3:ltr",
+            "zipthumb:a.zip|autocrop:v4:ltr",
             "zipdir:chapter/|types:not-a-fingerprint/",
         ] {
             assert_eq!(representative_cache_key_for_policy(key, &visible), key);

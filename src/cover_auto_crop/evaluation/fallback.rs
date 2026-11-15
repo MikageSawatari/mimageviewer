@@ -1,4 +1,4 @@
-//! Experimental evaluation policy only; never linked into production detection.
+//! Production v3 outcomes, with optional additional evaluation experiments.
 use super::*;
 
 mod layout;
@@ -79,6 +79,7 @@ impl FallbackConfig {
                 AutoCropDecline::RawAspectGate
                 | AutoCropDecline::PageAspectMissing
                 | AutoCropDecline::PhotoLike { .. }
+                | AutoCropDecline::CameraPageAspect
                 | AutoCropDecline::NotWide => false,
             }
     }
@@ -105,7 +106,7 @@ impl FallbackDiagnostic {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct AngleOutcome {
-    pub(super) original: Result<CoverCrop, AutoCropDecline>,
+    pub(super) original: Result<AutoCropSuccess, AutoCropDecline>,
     pub(super) final_result: Result<CoverCrop, AutoCropDecline>,
     pub(super) fallback: Option<FallbackDiagnostic>,
 }
@@ -125,9 +126,17 @@ impl AngleOutcome {
             .filter(|&reason| config.permits(reason))
             .and_then(|_| fallback_crop(image, native_dims, aspect, binding, rotation, config));
         Self {
-            original,
+            original: original.map(|crop| AutoCropSuccess::for_test(crop, AutoCropMethod::Current)),
             final_result: applied.map_or(original, |(crop, _)| Ok(crop)),
             fallback: applied.map(|(_, diagnostic)| diagnostic),
+        }
+    }
+
+    fn from_production(success: AutoCropSuccess) -> Self {
+        Self {
+            original: Ok(success),
+            final_result: Ok(success.crop),
+            fallback: None,
         }
     }
 }
@@ -167,7 +176,7 @@ pub(super) fn evaluate_angles(
         fallback: None,
     };
     let mut outcomes = [initial; 4];
-    detect_cover_crops_with_photo_report(
+    detect_cover_crops_with_photo_detailed_report(
         image,
         native_dims,
         page_aspect,
@@ -178,15 +187,18 @@ pub(super) fn evaluate_angles(
                 .iter()
                 .position(|&angle| angle == rotation)
                 .unwrap();
-            outcomes[index] = AngleOutcome::new(
-                result,
-                image,
-                native_dims,
-                page_aspect,
-                binding,
-                rotation,
-                config,
-            );
+            outcomes[index] = match result {
+                Ok(success) => AngleOutcome::from_production(success),
+                Err(reason) => AngleOutcome::new(
+                    Err(reason),
+                    image,
+                    native_dims,
+                    page_aspect,
+                    binding,
+                    rotation,
+                    config,
+                ),
+            };
         },
     );
     outcomes
@@ -385,10 +397,12 @@ impl FallbackStats {
                     self.wrong += 1;
                 }
             }
-            *self
-                .reasons
-                .entry(outcome.original.unwrap_err().as_str().into_owned())
-                .or_default() += 1;
+            if let Err(reason) = outcome.original {
+                *self
+                    .reasons
+                    .entry(reason.as_str().into_owned())
+                    .or_default() += 1;
+            }
             self.inward_fractions
                 .push(f64::from(diagnostic.inward) / f64::from(diagnostic.width));
             if let Some(layout) = diagnostic.layout {
@@ -480,6 +494,7 @@ mod tests {
                     AutoCropDecline::RawAspectGate,
                     AutoCropDecline::PageAspectMissing,
                     AutoCropDecline::NotWide,
+                    AutoCropDecline::CameraPageAspect,
                     AutoCropDecline::PhotoLike {
                         reason: photo::PhotoLikeReason::ShotExif,
                     },
@@ -753,7 +768,7 @@ mod tests {
             |_, result| original.push(result),
         );
         for (outcome, result) in outcomes.into_iter().zip(original) {
-            assert_eq!(outcome.original, result);
+            assert_eq!(outcome.original.map(|success| success.crop), result);
             assert_eq!(outcome.final_result, result);
             assert!(outcome.fallback.is_none());
         }

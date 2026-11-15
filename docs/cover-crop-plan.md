@@ -1742,3 +1742,85 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local
 UTF-8 BOM、開けない本と壊れた画像の後の継続を含む。`cargo fmt`・`git diff --check` 成功。
 テストのTEMP/TMPはworktree内のG:に置き、少数の合成入力だけを使用した。本番・UI・設定・snapshotは変更せず、
 製品起動・利用者データの評価・画像の閲覧・lib全件・build-dev・コミットは行っていない。
+
+## 28. 全高・寸法の型を本番へ反映 (利用者決定、2026-11-15)
+
+### 28.1 今回実装する変更1・3・4
+
+- 自動の範囲は、保存回転ごとの向きで横の範囲だけを採り、上下は画像全体を残す。
+  判定内部の余白・R等の計算は従来どおり。手動範囲は変更しない。
+- 証拠不足の見送り（NoJacketEvidence/NoLocalEvidence/NoSpine/WeakFront/NoStructure/TwoPanelと
+  RicherElsewhere）に、評価器のlayout-snapを同じ式・重み・閾値で適用する。
+  RawAspectGate/PageAspectMissing/PhotoLike/NotWideは越えない。Rは `[1.35,3.9)` に限る。
+  本文比率が2/3・3/4・9/16・4/5のどれかから0.002未満の差なら、この補完だけを
+  `CameraPageAspect` (`camera-page-aspect`) で見送る。従来の成功と次のT2置換には掛けない。
+- 従来の判定が成功したT2 (`R ∈ [1.85,2.4)`) だけ、合わせる前のlayout位置との横方向IoUを比べる。
+  0.6未満ならlayout-snapへ置き換える。0.6以上とT1/T3/T4では従来の横位置を保つ。左綴じは左右反転する。
+- `cover_auto_crop/layout.rs` が予測・境目・snapの単一実装。評価器側はadapterから共用する。
+  256行・中央90%の輝度列差・3列平均・中央値の下限1・背側重み2・強度/scoreとも3以上・
+  予測より1e-9を超える改善、という既存の式と基準を変えない。
+- 成功は `AutoCropSuccess {crop, method}` にまとめ、methodはCurrent・LayoutFallback(T1〜T4)・
+  LayoutReplaced(T1〜T4)のenumにする。方法と型が食い違う状態を作らない。
+  workerの `auto cover:` ログと範囲画面で方法と型を区別する。キャッシュの素材は従来の4方向の範囲を保持する。
+
+### 28.2 キーと評価器
+
+- 自動の印を `|autocrop:v3:{rtl|ltr}`、画像フォルダを `v3f` に更新する。
+  **v2は未リリースなので移行不要**。v2/v2fとv1は正規化で旧印として識別し、現在の行はv3/v3fで再生成する。
+  K2の出荷済みv1の流用は従来どおり残し、未出荷v2からの移行は追加しない。
+- 評価器の未指定baselineは、全高化・型の補完・T2置換を含む本番の詳細report関数をそのまま使う。
+  `MIV_COVER_AUTO_EVAL_FALLBACK` は比較用として残す。本番で成功済みなら追加の後押しはしない。
+  写真比率の見送りも比較用の後押しでは越えない。赤枠/current_cropは本番v3、青枠/fallback_cropは追加の比較だけ。
+  JSONの `production_method` / `production_layout` で本番の方法と型も記録する。
+
+### 28.3 変更2は失効の設計待ち（未実装）
+
+本文の保存回転を標本の比率へ適用する決定は受領したが、再読込まで一貫する既存経路は見つからなかった。
+指示の例外に従い、この変更だけは実装せず設計を返す。本文の比率・サンプルの向きは今回まだ従来のまま。
+
+確認した既存経路:
+
+- `App::rotation_page_owner_changed` → `evict_legacy_cover_thumbnails` →
+  `legacy_book_cover_needs_reload` は、在メモリの回転ownerに合う旧Legacy代表だけを退避する。
+  `viewer_context_registry.rs` は保持中の各contextにも同じ述語を適用するが、Automatic素材は対象外。
+- workerのcache bypassも `refresh_legacy_cover && entry.cover == Legacy` だけ。
+  `CacheEntry` はファイルのmtime/size、代表ページ、4方向の範囲等を持つが、本文標本のキーと保存回転の証明は持たない。
+  読取時の一致判定に本文回転は含まれず、述語だけを広げても同じ永続行が再採用される。
+- 手動pinの再読込はpin変更によるキー変更を使う。本文回転にはそのキー変更がない。
+  行だけを消しても、回転前の判定workerによる遅い書き戻しと、保持中の別context/一覧の復元を解決できない。
+
+次段の設計案: workerが実際に採った最大8標本のページキーと保存角度を、判定素材の依存証明として所有し、
+request・catalog・K2・結果採用・保持した一覧まで一組で運ぶ。workerのキャッシュ読取ではその証明を読取専用の
+回転DBと照合し、UIの採用/復元では在メモリownerと照合する。表紙のキーは標本から外すので表紙回転では再生成せず、
+本文の依存キーが変わった本だけ既存の退避・request取消経路に通す。遅い旧結果も同じ証明で拒否する。
+変換書庫は読取先と論理ページキーを分け、PDFは `page_key_for_pdf`、ZIPは `zip_entry_key`、
+画像フォルダは `normalize_path` の既存viewerキーを使う。比率計算は既存EXIF/WICの向きの適用後に保存回転を一度だけ掛ける。
+
+これは新しい依存証明の所有・永続化・採用境界を要するため、設計確認前に追加していない。
+全回転のglobal revisionや全contextの一括消去は使わない。`cover_auto_sample.rs` とdetachedの述語・viewport経路は変更していない。
+失敗時はログと回転なしの扱いとし、再試行機構は追加しない。
+
+### 28.4 実装・検証記録
+
+- 変更1・3・4とv3/v3fのキー更新を実装。worker・範囲画面・評価器は詳細reportの共通入口を使う。
+  変更2は§28.3のとおり未実装で、既存の回転変更・detached・本文標本の経路は触っていない。
+- 新規の判定回帰は `production_layout_fallback_accepts_every_structural_decline_and_preserves_guards`、
+  `production_camera_page_ratios_guard_only_layout_fallback_with_strict_tolerance`、
+  `production_t2_replacement_uses_unsnapped_horizontal_iou_and_strict_point_six`、
+  `production_full_height_preserves_horizontal_structural_crop_at_every_rotation`、
+  `production_layout_ratio_boundaries_and_all_saved_rotations_share_the_prediction`。
+- 範囲画面は `cover_crop_auto_method_layout_binding_messages_keep_one_typed_result` と
+  `cover_crop_auto_from_crops_preserves_each_angle`、
+  `cover_crop_layout_reasons_keep_small_viewport_actions_reachable` で、方法・型・綴じ・角度、
+  1093×614の100%/200%での操作とクリックを固定した。
+- catalogの `auto_material_legacy_v1_v2_null_rows_are_hits_in_all_readers` と
+  `auto_material_v3_null_and_malformed_are_misses_in_all_readers`、K2・存続キー・master互換のgoldenを含む焦点nextest
+  `test(/cover_auto|cover_crop|representative_cache_key|auto_material|color_filter|catalog|folder_thumb/)` は
+  **551件成功・失敗0**。
+- `cargo check -p mimageviewer --bin mimageviewer-core` 成功。
+  `cargo test -p mimageviewer --test ui_snapshot cover_` は **5件成功**（範囲画面4件と環境設定1件）、PNG更新なし。
+  `cargo fmt`・`git diff --check`・`python scripts/check_ui_glyphs.py`（危険な字形0件）成功。
+- cargoは共有runner `773 rc5` から直列実行。既存native生成物の保護ACLによるLNK1114（error5）が出たため、
+  既存物を変更せず `target/773-rc5-build` にビルド先を分け、FFmpegのDLL参照を既存vendor/binから補って完走した。
+  TEMP/TMPもG:のworktree内、コンパイル並列数は2。利用者データ・外部評価画像・sheetは使わず開いていない。
+  lib全件・製品起動・build-dev・独立レビュー・コミットは行っていない。

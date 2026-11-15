@@ -234,7 +234,7 @@ fn evaluation_book_list_mixed_real_sources_saved_rotations_and_failures_continue
 }
 
 #[test]
-fn evaluation_book_list_binding_fallback_blue_and_folder_thumbnail_opt_in() {
+fn evaluation_book_list_production_layout_red_comparison_blue_and_thumbnail_opt_in() {
     let temp = temporary();
     let folder = temp.path().join("folder");
     folder_book(&folder, &DynamicImage::new_rgb8(150, 100));
@@ -256,18 +256,44 @@ fn evaluation_book_list_binding_fallback_blue_and_folder_thumbnail_opt_in() {
         .unwrap();
         let data = summary(&output);
         let row = &data["rows"][0];
-        assert_eq!(row["fallback_type"], "T2");
-        assert_eq!(data["fallback_cropped"], 1);
-        assert!(row["current_crop"].is_null());
+        assert_eq!(row["production_layout"], "T2");
+        assert_eq!(row["production_method"], "layout-fallback");
+        assert_eq!(data["fallback_cropped"], 0);
+        assert!(row["fallback_crop"].is_null());
         assert_eq!(row["path"], json!(folder));
-        assert_frame(&output, row, "fallback_crop", true);
-        let x0 = row["fallback_crop"][0].as_f64().unwrap();
+        assert_frame(&output, row, "current_crop", false);
+        let x0 = row["current_crop"][0].as_f64().unwrap();
         if binding == ReadingDirection::Rtl {
             assert_eq!(x0, 0.0);
         } else {
             assert!(x0 > 0.5);
         }
     }
+    // Outside the production layout range, an explicitly selected experiment
+    // can still draw its additional crop in blue.
+    let comparison = temp.path().join("comparison");
+    folder_book(&comparison, &DynamicImage::new_rgb8(300, 100));
+    let comparison_input = temp.path().join("comparison.json");
+    list(&comparison_input, &[comparison]);
+    let comparison_output = temp.path().join("comparison-output");
+    evaluate(
+        &comparison_input,
+        &comparison_output,
+        true,
+        FallbackConfig::parse(Some("edge"), false).unwrap(),
+        &Options {
+            thumbs: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let comparison_data = summary(&comparison_output);
+    let comparison_row = &comparison_data["rows"][0];
+    assert!(comparison_row["current_crop"].is_null());
+    assert_eq!(comparison_data["fallback_cropped"], 1);
+    assert_eq!(comparison_row["fallback_type"], "edge");
+    assert_frame(&comparison_output, comparison_row, "fallback_crop", true);
+
     for folders_only in [false, true] {
         let output = temp.path().join(format!("no-thumbs-{folders_only}"));
         evaluate(

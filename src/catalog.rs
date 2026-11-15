@@ -984,13 +984,13 @@ impl ThumbnailColumns {
     }
 }
 
-/// NULL is legacy absence only; a v2 identity requires an explicitly stored kind.
+/// NULL is legacy absence only; a v3 identity requires an explicitly stored kind.
 fn decode_auto_material(filename: &str, value: Option<&str>) -> Option<AutoMaterial> {
     match value {
         Some(value) => AutoMaterial::decode(value),
         None => (!crate::thumb_loader::representative_auto_crop_key_parts(filename).is_some_and(
             |(_, token, _)| {
-                token.starts_with("|autocrop:v2:") || token.starts_with("|autocrop:v2f:")
+                token.starts_with("|autocrop:v3:") || token.starts_with("|autocrop:v3f:")
             },
         ))
         .then_some(AutoMaterial::NotAutomatic),
@@ -3138,7 +3138,13 @@ mod tests {
         let pixels = encode_thumb_webp(&image::DynamicImage::new_rgb8(2, 3), 3, 80.0)
             .unwrap()
             .0;
-        for key in ["cover|autocrop:v2:rtl#pin:001.jpg", "cover|autocrop:v2:ltr"] {
+        for key in [
+            "cover|autocrop:v2:rtl#pin:001.jpg",
+            "cover|autocrop:v2:ltr",
+            "cover|autocrop:v3:rtl#pin:001.jpg",
+            "cover|autocrop:v3:ltr",
+            "cover|autocrop:v3f:rtl",
+        ] {
             let request = crate::thumb_loader::LoadRequest {
                 path: PathBuf::from("book.zip"),
                 zip_entry: Some(key.into()),
@@ -3254,7 +3260,7 @@ mod tests {
         let db = CatalogDb::open(temp.path(), &folder).unwrap();
         for (index, material) in materials.iter().copied().enumerate() {
             db.save_thumb_bytes_with_layout_dims(
-                &format!("zipthumb:child{index}|autocrop:v2:rtl"),
+                &format!("zipthumb:child{index}|autocrop:v3:rtl"),
                 1,
                 2,
                 Some((2000, 1200)),
@@ -3272,7 +3278,7 @@ mod tests {
         let parent = CatalogDb::open(temp.path(), &temp.path().join("parent")).unwrap();
         let all = reader.load_all().unwrap();
         for (index, material) in materials.iter().copied().enumerate() {
-            let key = format!("zipthumb:child{index}|autocrop:v2:rtl");
+            let key = format!("zipthumb:child{index}|autocrop:v3:rtl");
             assert_eq!(all[&key].auto_material, material);
             let entry = reader.load_one(&key).unwrap().unwrap();
             assert_eq!(entry.auto_material, material);
@@ -3285,7 +3291,7 @@ mod tests {
                     .auto_material,
                 material
             );
-            let parent_key = format!("folderthumb:auto-v3:{index}|autocrop:v2:rtl");
+            let parent_key = format!("folderthumb:auto-v3:{index}|autocrop:v3:rtl");
             assert!(
                 parent
                     .save_auto_folder_bytes(
@@ -3310,17 +3316,18 @@ mod tests {
     }
 
     #[test]
-    fn auto_material_v2_null_and_malformed_are_misses_in_all_readers() {
+    fn auto_material_v3_null_and_malformed_are_misses_in_all_readers() {
         let db = open_in_memory();
         for (key, value) in [
-            ("zipthumb:null|autocrop:v2:rtl", None),
-            ("folderthumb:null|autocrop:v2f:rtl", None),
+            ("zipthumb:null|autocrop:v3:rtl", None),
+            ("folderthumb:null|autocrop:v3f:rtl", None),
             (
-                "folderthumb:bad|autocrop:v2f:ltr",
+                "folderthumb:bad|autocrop:v3f:ltr",
                 Some("automatic-v1:-;-;-"),
             ),
-            ("zipthumb:bad|autocrop:v2:ltr", Some("automatic-v1:-;-;-")),
-            ("zipthumb:pinned|autocrop:v2:rtl#pin:page", None),
+            ("zipthumb:bad|autocrop:v3:ltr", Some("automatic-v1:-;-;-")),
+            ("zipthumb:pinned|autocrop:v3:rtl#pin:page", None),
+            ("zipthumb:legacy-bad|autocrop:v2:ltr", Some("broken")),
             ("ordinary-malformed", Some("broken")),
         ] {
             db.save(
@@ -3346,30 +3353,53 @@ mod tests {
             assert!(!db.load_all().unwrap().contains_key(key));
             assert!(db.load_latest_with_prefix(key).unwrap().is_none());
         }
-        let key = "zipthumb:old|autocrop:v1:rtl";
-        db.save(
-            key,
-            1,
-            2,
-            2,
-            3,
-            None,
-            b"legacy",
-            &CoverIdentity::Unknown,
-            AutoMaterial::NotAutomatic,
-        )
-        .unwrap();
-        db.phase()
-            .unwrap()
-            .execute(
-                "UPDATE thumbnails SET auto_crops=NULL WHERE filename=?1",
-                [key],
+    }
+
+    #[test]
+    fn auto_material_legacy_v1_v2_null_rows_are_hits_in_all_readers() {
+        let db = open_in_memory();
+        for key in [
+            "zipthumb:old|autocrop:v1:rtl",
+            "zipthumb:old|autocrop:v2:rtl",
+            "folderthumb:old|autocrop:v2f:ltr",
+            "zipthumb:pinned|autocrop:v2:rtl#pin:page",
+        ] {
+            db.save(
+                key,
+                1,
+                2,
+                2,
+                3,
+                None,
+                b"legacy",
+                &CoverIdentity::Unknown,
+                AutoMaterial::NotAutomatic,
             )
             .unwrap();
-        assert_eq!(
-            db.load_one(key).unwrap().unwrap().auto_material,
-            AutoMaterial::NotAutomatic
-        );
+            db.phase()
+                .unwrap()
+                .execute(
+                    "UPDATE thumbnails SET auto_crops=NULL WHERE filename=?1",
+                    [key],
+                )
+                .unwrap();
+            assert_eq!(
+                db.load_one(key).unwrap().unwrap().auto_material,
+                AutoMaterial::NotAutomatic
+            );
+            assert_eq!(
+                db.load_all().unwrap()[key].auto_material,
+                AutoMaterial::NotAutomatic
+            );
+            assert_eq!(
+                db.load_latest_with_prefix(key)
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .auto_material,
+                AutoMaterial::NotAutomatic
+            );
+        }
     }
 
     #[test]
@@ -3401,7 +3431,7 @@ mod tests {
         );
         let writer = CatalogDb::open(temp.path(), &folder).unwrap();
         let material = AutoMaterial::Automatic(AutoCropResults::new([None; 4]));
-        let key = "zipthumb:book|autocrop:v2:rtl";
+        let key = "zipthumb:book|autocrop:v3:rtl";
         writer
             .save(
                 key,

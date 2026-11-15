@@ -3,6 +3,93 @@ use std::io::{Cursor, Write};
 use std::sync::{Mutex, RwLock, atomic::AtomicUsize};
 
 #[test]
+fn cover_crop_auto_method_layout_binding_messages_keep_one_typed_result() {
+    use crate::cover_auto_crop::{
+        AutoCropDecline, AutoCropLayout, AutoCropMethod, AutoCropSuccess,
+    };
+    let crop = CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap().unwrap();
+    for (binding, binding_label) in [
+        (crate::settings::ReadingDirection::Rtl, "右綴じ"),
+        (crate::settings::ReadingDirection::Ltr, "左綴じ"),
+    ] {
+        let mut cases = vec![(
+            AutoCropMethod::Current,
+            format!("自動の判定: 表表紙を切り出しました (綴じ方向: {binding_label})"),
+        )];
+        for (layout, layout_label) in [
+            (AutoCropLayout::T1, "T1"),
+            (AutoCropLayout::T2, "T2"),
+            (AutoCropLayout::T3, "T3"),
+            (AutoCropLayout::T4, "T4"),
+        ] {
+            for (method, action) in [
+                (
+                    AutoCropMethod::LayoutFallback(layout),
+                    "寸法の型から表表紙を切り出しました",
+                ),
+                (
+                    AutoCropMethod::LayoutReplaced(layout),
+                    "寸法の型に合わせて切り出す位置を変更しました",
+                ),
+            ] {
+                cases.push((
+                    method,
+                    format!("自動の判定: {action} (型: {layout_label}、綴じ方向: {binding_label})"),
+                ));
+            }
+        }
+        assert_eq!(cases.len(), 9);
+        for (method, expected_message) in cases {
+            let success = AutoCropSuccess::for_test(crop, method);
+            for angle in [
+                Rotation::None,
+                Rotation::Cw90,
+                Rotation::Cw180,
+                Rotation::Cw270,
+            ] {
+                let mut reports = [Err(AutoCropDecline::CameraPageAspect); 4];
+                reports[angle.degrees() as usize / 90] = Ok(success);
+                let detection = AutoDetection::Analyzed { binding, reports };
+                assert_eq!(detection.message(angle), expected_message);
+                assert_eq!(detection.crop_for(angle), Some(crop));
+                for other in [
+                    Rotation::None,
+                    Rotation::Cw90,
+                    Rotation::Cw180,
+                    Rotation::Cw270,
+                ] {
+                    let expected = (other == angle).then_some(crop);
+                    assert_eq!(detection.crop_for(other), expected);
+                    assert_eq!(detection.crops().unwrap().crop_for(other), expected);
+                    if other != angle {
+                        assert_eq!(
+                            detection.message(other),
+                            "自動の判定: 切り出していません。本文ページの形が写真の比率に近いため、寸法の型による切り出しは使いません"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cover_crop_auto_from_crops_preserves_each_angle() {
+    let first = CoverCrop::new([0, 0, 400_000, 1_000_000]).unwrap().unwrap();
+    let last = CoverCrop::new([600_000, 0, 1_000_000, 1_000_000])
+        .unwrap()
+        .unwrap();
+    let crops =
+        crate::cover_auto_material::AutoCropResults::new([Some(first), None, Some(last), None]);
+    let detection = AutoDetection::from_crops(crops);
+    assert_eq!(detection.crops(), Some(crops));
+    assert_eq!(detection.crop_for(Rotation::None), Some(first));
+    assert_eq!(detection.crop_for(Rotation::Cw90), None);
+    assert_eq!(detection.crop_for(Rotation::Cw180), Some(last));
+    assert_eq!(detection.crop_for(Rotation::Cw270), None);
+}
+
+#[test]
 fn cover_crop_worker_and_dialog_match_all_four_angles_for_png_jpeg_and_binding() {
     for photo in [false, true] {
         for folder in [false, true] {

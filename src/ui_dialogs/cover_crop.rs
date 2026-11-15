@@ -1360,6 +1360,71 @@ mod tests {
     }
 
     #[test]
+    fn cover_crop_layout_reasons_keep_small_viewport_actions_reachable() {
+        use crate::cover_auto_crop::{
+            AutoCropDecline, AutoCropLayout, AutoCropMethod, AutoCropSuccess,
+        };
+        let crop = CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap().unwrap();
+        for scale in [1.0, 2.0] {
+            for report in [
+                Ok(AutoCropSuccess::for_test(
+                    crop,
+                    AutoCropMethod::LayoutFallback(AutoCropLayout::T2),
+                )),
+                Ok(AutoCropSuccess::for_test(
+                    crop,
+                    AutoCropMethod::LayoutReplaced(AutoCropLayout::T2),
+                )),
+                Err(AutoCropDecline::CameraPageAspect),
+            ] {
+                let (app, tx, _, _) = fake_loading_app();
+                let mut prepared = fake_prepared(Some(crop));
+                prepared.auto_detection = AutoDetection::Analyzed {
+                    binding: crate::settings::ReadingDirection::Rtl,
+                    reports: [report; 4],
+                };
+                let message = prepared.auto_detection.message(Rotation::None);
+                tx.send((7, Ok(prepared))).ok().unwrap();
+                let mut h = app_harness(app);
+                crate::settings::apply_ui_scale_factor(&h.ctx, scale);
+                h.run_steps(4);
+                h.get_by_label(&message);
+                for label in [
+                    OK_LABEL,
+                    "キャンセル",
+                    "手動の範囲を解除",
+                    AUTO_RESET_LABEL,
+                    "Close window",
+                ] {
+                    assert!(
+                        h.ctx
+                            .content_rect()
+                            .contains_rect(h.get_by_label(label).rect()),
+                        "{scale}: {message}: {label}"
+                    );
+                }
+                assert_eq!(
+                    h.get_by_label(AUTO_RESET_LABEL)
+                        .accesskit_node()
+                        .is_disabled(),
+                    report.is_err()
+                );
+                if report.is_ok() {
+                    h.get_by_label(AUTO_RESET_LABEL).click();
+                    h.run_steps(2);
+                    let Phase::Ready(draft) = &h.state().cover_crop_dialog.as_ref().unwrap().phase
+                    else {
+                        panic!("reset keeps range editor open");
+                    };
+                    let expected = crop_rect(Some(crop));
+                    assert_eq!(draft.crop.min_x, expected.min_x);
+                    assert_eq!(draft.crop.max_x, expected.max_x);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cover_crop_auto_reset_is_visible_in_small_viewport_and_only_ok_saves() {
         for scale in [1.0, 2.0] {
             for rotation in [
