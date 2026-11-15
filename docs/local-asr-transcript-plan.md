@@ -317,7 +317,8 @@ transcript_removed(item_key TEXT, rev INTEGER, PRIMARY KEY (item_key, rev))
     `fix-video-timeline-origin`) が「文字起こしもメディア時刻だけを見る」「原点の変換は `MediaTimeline` だけ」を契約にしたので、
     master を取り込むときに `container_start_secs − timeline_origin_secs` で合わせる案 (11-14 に記録) をやめ、時刻の意味を 1 つにした。
     合わせる案では、文字起こしだけが別の原点を持ち続け、変換の型・原点が未知の間の状態 (行を押しても移動しない) が残るため。
-  - T1 は未出荷なので、保存済みの行の移行はしない (開発・確認で作った行のうち、時刻が変わるのはコンテナの開始が 0 でない MKV・MP4 だけ。作り直せば直る)。
+  - T1 は未出荷なので、保存済みの行の移行はしない。開発・確認で作った行のうち時刻が変わるのは、MPEG-TS/PS 以外で
+    コンテナの開始が 0 でないもの (開始が正の MKV・MP4、encoder delay のある MP3 など。旧抽出は形式によらずコンテナの開始を引いていた)。作り直せば直る。
 
 ### 8.4 右パネル
 
