@@ -150,7 +150,7 @@ fn collection_starting_maps_to_not_ready() {
 }
 
 #[test]
-fn permission_is_live_and_handshake_is_strict() {
+fn permission_is_live_and_handshake_negotiates_before_business_requests() {
     let f = Fixture::new();
     let c = Connection::new(f.handlers.clone());
     assert_eq!(
@@ -169,9 +169,10 @@ fn permission_is_live_and_handshake_is_strict() {
             }
         )
         .result
-        .unwrap_err()
-        .code,
-        ErrorCode::VersionMismatch
+        .unwrap(),
+        Payload::Hello {
+            version: AGENT_PROTOCOL_VERSION
+        }
     );
     let c = f.connection();
     let Payload::Status(status) = f.call(&c, 3, Command::Status).result.unwrap() else {

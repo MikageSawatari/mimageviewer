@@ -170,10 +170,23 @@ list_changed通知・listChanged広告は削除する。再試行・push・別�
   **Remote の `PROTOCOL_VERSION` (現在 72) とは独立した `AGENT_PROTOCOL_VERSION`** を持つ。
   Remote 側の版上げ (他 branch と頻繁に衝突し、max+1 で合わせる運用、web-remote-plan §13.5) に
   巻き込まない。T1文字起こしの追加でagentの版は3から4へ上げる。
-- 照合は Remote と同じ厳密一致。MCP exe と core は同じビルドで作り同じフォルダに置くので、
-  ずれるのは古い exe を指す設定が残った時だけ。ずれたら tool の結果を
-  「mIV と AI 連携の版が違います。設定の案内に従って登録し直してください」の error にする。
-- pipe 名は `\\.\pipe\mimageviewer-agent-v1-<user SID>-<data dir hash>`。data dir hash は
+  [next-release-backlog.md §1.789](next-release-backlog.md) の A-2 に従い、
+  `MIN_ADAPTER_PROTOCOL_VERSION = 3` から現在の版までの adapter を core が受け付ける。
+- 接続の最初の frame は業務用 `Request` を deserialize する前に、固定 envelope の
+  `id`・`command.type == "hello"`・`command.version` だけを読む。範囲内ならその版の残りの
+  Hello を読み、adapter が送った版をそのまま返す。範囲外なら残りを業務型で読まず
+  Hello に core の現在の版を返し、その接続の業務要求を `VersionMismatch` で拒否する。
+  Hello 前の業務 frame は切断する。2 回目の Hello は拒否し、版と名乗りを変更しない。
+  取り決めた版は要求ごとの `ReadContext.adapter_protocol_version` に渡す。
+- adapter は自分の版と同じ Hello の応答だけで業務要求へ進む。古い core の版不一致 error や
+  読めない応答も agent-ipc の `VERSION_MISMATCH_MESSAGE` に置き換える:
+  「mIV と AI 連携の版が違います。mIV を終了して起動し直し、AI アプリを再起動 (Claude Code は MCP の再接続) してください。直らない時は、AI アプリを終了してから mIV のファイルを置き換え直してください」。
+  切断と利用者の取消は従来の扱いを維持する。
+- 握手の形は 4 byte LE 本文長 + UTF-8 JSON、上限 `MAX_FRAME_BYTES`、要求
+  `{"id":…,"command":{"type":"hello","version":N,…}}`、応答
+  `{"id":…,"result":{"Ok":{"type":"hello","data":{"version":N}}}}` を固定する。
+- pipe 名は `\\.\pipe\mimageviewer-agent-v3-<user SID>-<data dir hash>` に固定する。
+  `AGENT_PIPE_NAMESPACE` の `v3` は業務 IPC の版とは無関係な名前空間の識別子で、変えない。data dir hash は
   **解決済み絶対 data dir を常に hash 化**する (既定 dir でも省略しない)。二重起動用の
   `single_instance::data_dir_namespace_suffix` は各 flavor の既定 dir で suffix を省略し、通常版と
   portable 版を基底名で分けているため、そのままは流用しない (独立レビュー P2-6)。名前の導出は
@@ -6083,9 +6096,19 @@ v5.1.0 の範囲 (利用者決定 2026-11-08):
 ### G. 版と互換
 
 - 本体と MCP の exe は同梱で、組で更新される。行の形 (`outputSchema` の `additionalProperties: false`) が変わるので、
-  `AGENT_PROTOCOL_VERSION` を 2 → 3 に上げる。版は pipe 名にも入るので、古い組み合わせ (v5.0.0 の MCP の exe が動いたまま本体だけ更新した等) は
-  握手まで届かず「mIV が起動していない」扱い (`not_ready`、tools/list は `miv_status` だけ) になる。AI アプリを再起動すると新しい MCP の exe が起動して直る。
+  当時 `AGENT_PROTOCOL_VERSION` を 2 → 3 に上げた。その後の互換は
+  [next-release-backlog.md §1.789](next-release-backlog.md) の A-2 と §4.2 を正本とする。
+  pipe 名は業務 IPC の版によらず `mimageviewer-agent-v3-…` のままで、Hello で版を取り決める。
+  core は版 3〜4 の adapter を受け付け、adapter は自分と同じ版の Hello だけを受け付ける。
   AI アプリへの登録の形 (launcher の `--mcp`) は変えない。launcher が内包する MCP の exe は通常のリリースビルドで新しくなる。
+- wire の変更は追加だけとする。古い要求の省略時 default と、古い adapter が未知の応答項目を
+  無視することを分け、古い adapter が受け取り得る enum 値を増やす場合は接続の版で読み替える。
+  frame・画像・行・ページの上限も維持し、adapter は自分の型から structuredContent を作る。
+  互換の契約は agent-ipc の先頭コメント、出荷済み版の型・握手・出力処理は tests/v3_wire に凍結する。
+  MIN の引き上げは計画した仕様変更として設計で決める。
+- 新しい core の起動後は古い adapter で従来の tool を使い続けられ、AI アプリの再起動は不要。
+  増えた tool は AI アプリの再起動または MCP の再接続後に使える。更新中の要求の再送、adapter の交換、
+  initialize の流し直しは作らない。cursor が失効したら一覧を取り直す。
 - 永続データ (DB の schema・保存内容) は変えない。読むだけ。
 - ツールの説明 (AI アプリが読む文) を更新する。`list_folder` の「★などの絞り込みを除く」は「一覧画面の検索・ファセット・色・しおり・履歴の絞り込みは除く。
   ★の範囲と種類では絞れる。行に★とタグを付ける」の趣旨に改める。`list_library` は `max_stars` を説明する。説明の変更は AI アプリの再読み込み後に効く。
@@ -6105,7 +6128,7 @@ v5.1.0 の範囲 (利用者決定 2026-11-08):
   ★順 (昇順・降順) の並びで★を変えると「一覧が変わりました」になること。条件を変えた cursor・旧版の cursor の拒否。
   まばらに一致する行・末尾の不一致の行・`too_long` の行・`MAX_PAGE_CHARS` で行を落とした後の続き。
 - タグ: 物理の行のタグ、subresource の行の null、タグの多い行の `too_long`。
-- MCP 側: 新しい引数の転送、省略・null が v5.0.0 と同じ wire になること。版の不一致で `not_ready` になること (既存の検査の版の値を更新)。
+- MCP 側: 新しい引数の転送、省略・null が v5.0.0 と同じ wire になること。版の不一致で中立の案内の `version_mismatch` になり、業務要求を送らないこと (§1.789)。
 - `list_library` rated: `max_stars` の範囲、他の kind での拒否、範囲の逆転の拒否、cursor の継続。
 - schema: tools/list の `inputSchema` / `outputSchema` と実際の応答の一致 (既存の schema の検査に足す)。
 

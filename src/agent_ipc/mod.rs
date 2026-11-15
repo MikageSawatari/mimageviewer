@@ -32,6 +32,8 @@ mod work;
 use work::*;
 
 #[cfg(test)]
+mod compatibility_tests;
+#[cfg(test)]
 mod logging_tests;
 #[cfg(test)]
 mod media_read_tests;
@@ -237,13 +239,20 @@ impl Reply {
 struct Connection {
     handlers: Arc<Handlers>,
     running: Mutex<Option<Running>>,
-    client: Mutex<Option<ClientRequest>>,
+    handshake: Mutex<HandshakeState>,
+}
+
+enum HandshakeState {
+    Awaiting,
+    Accepted(ClientRequest),
+    Rejected,
 }
 
 #[derive(Clone)]
 struct ClientRequest {
     identity: ClientIdentity,
     kind: RequestKind,
+    adapter_protocol_version: u32,
 }
 
 struct Permit {
@@ -330,8 +339,57 @@ impl Connection {
         Arc::new(Self {
             handlers,
             running: Mutex::new(None),
-            client: Mutex::new(None),
+            handshake: Mutex::new(HandshakeState::Awaiting),
         })
+    }
+
+    /// The first frame is a stable envelope, not a business Request. In
+    /// particular, unsupported versions may have completely different fields.
+    fn read_handshake(
+        self: &Arc<Self>,
+        reader: &mut impl std::io::Read,
+        replies: crossbeam_channel::Sender<Reply>,
+    ) -> std::io::Result<()> {
+        let invalid =
+            || std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid agent hello");
+        let frame: serde_json::Value = read_frame(reader)?.ok_or_else(invalid)?;
+        let id = frame["id"].as_u64().ok_or_else(invalid)?;
+        if frame["command"]["type"].as_str() != Some("hello") {
+            return Err(invalid());
+        }
+        let version = frame["command"]["version"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(invalid)?;
+        if !supports_adapter_version(version) {
+            *self.handshake.lock().unwrap() = HandshakeState::Rejected;
+            self.reply_hello(
+                id,
+                Ok(Payload::Hello {
+                    version: AGENT_PROTOCOL_VERSION,
+                }),
+                replies,
+            );
+            return Ok(());
+        }
+        // Versions 3 and 4 share the remaining Hello fields. Only decode them
+        // after recognizing a supported version; future versions need not do so.
+        let request: Request = serde_json::from_value(frame).map_err(std::io::Error::other)?;
+        let _ = self.request(request, replies); // Hello never creates a business worker.
+        Ok(())
+    }
+
+    fn reply_hello(
+        &self,
+        id: u64,
+        result: Result<Payload, AgentError>,
+        replies: crossbeam_channel::Sender<Reply>,
+    ) {
+        self.record(None, "hello", Instant::now(), &result);
+        let _ = replies.send(Reply {
+            response: Response { id, result },
+            policy: ReplyPolicy::Rejected,
+        });
     }
 
     fn disconnect(&self) {
@@ -385,26 +443,39 @@ impl Connection {
             request_kind,
         } = &request.command
         {
-            let result = check_version(*version).map(|()| {
-                *self.client.lock().unwrap() = Some(ClientRequest {
+            let mut handshake = self.handshake.lock().unwrap();
+            // One Hello per connection. Repeated Hellos never renegotiate the
+            // version or relabel the client, including while a job is running.
+            let result = if !matches!(*handshake, HandshakeState::Awaiting) {
+                Err(error(ErrorCode::BadRequest, "接続の版は確認済みです"))
+            } else if supports_adapter_version(*version) {
+                *handshake = HandshakeState::Accepted(ClientRequest {
                     identity: ClientIdentity::new(client_name, client_version),
                     kind: *request_kind,
+                    adapter_protocol_version: *version,
                 });
-                Payload::Hello { version: *version }
-            });
-            self.record(None, tool, started, &result);
-            let _ = replies.send(Reply {
-                response: Response {
-                    id: request.id,
-                    result,
-                },
-                policy: ReplyPolicy::Rejected,
-            });
+                Ok(Payload::Hello { version: *version })
+            } else {
+                *handshake = HandshakeState::Rejected;
+                Ok(Payload::Hello {
+                    version: AGENT_PROTOCOL_VERSION,
+                })
+            };
+            drop(handshake);
+            self.reply_hello(request.id, result, replies);
             return None;
         }
-        // Capture attribution at request admission. A later Hello on the same
-        // pipe cannot relabel an in-flight result.
-        let client = self.client.lock().unwrap().clone();
+        let (client, handshake_error) = match &*self.handshake.lock().unwrap() {
+            HandshakeState::Accepted(client) => (Some(client.clone()), None),
+            HandshakeState::Awaiting => (
+                None,
+                Some(error(
+                    ErrorCode::BadRequest,
+                    "先に接続の版を確認してください",
+                )),
+            ),
+            HandshakeState::Rejected => (None, Some(version_mismatch())),
+        };
         let reject = |err| {
             let result = Err(err);
             self.record(client.as_ref(), tool, started, &result);
@@ -416,6 +487,12 @@ impl Connection {
                 policy: ReplyPolicy::Rejected,
             });
         };
+        // Gate every business request, including Cancel, before permissions,
+        // admission slots, or handlers can observe an unnegotiated connection.
+        if let Some(err) = handshake_error {
+            reject(err);
+            return None;
+        }
         let observed = load_permission();
         self.handlers.lane_log.lock().unwrap().permission(&observed);
         let granted = match observed.and_then(enabled_permission) {
@@ -446,13 +523,6 @@ impl Connection {
             });
             return None;
         }
-        if client.is_none() {
-            reject(error(
-                ErrorCode::BadRequest,
-                "先に接続の版を確認してください",
-            ));
-            return None;
-        }
         if let Err(err) = check_tool_permission(granted.0, &request.command) {
             reject(err);
             return None;
@@ -467,7 +537,12 @@ impl Connection {
         let connection = self.clone();
         let fallback = replies.clone();
         let id = request.id;
-        let context = ReadContext::new(&self.handlers, granted, cancel);
+        let context = ReadContext::for_adapter(
+            &self.handlers,
+            granted,
+            cancel,
+            client.as_ref().unwrap().adapter_protocol_version,
+        );
         let record_client = client.clone();
         match std::thread::Builder::new()
             .name("agent-read".into())
@@ -711,8 +786,9 @@ impl Handlers {
             return self.search(query, kind, limit, cursor, ctx);
         }
         let result = (|| match command {
-            Command::Hello { version, .. } => {
-                check_version(version).map(|_| Payload::Hello { version })
+            // Handshake belongs to Connection, never to a business handler.
+            Command::Hello { .. } => {
+                Err(error(ErrorCode::BadRequest, "接続の確認は受付で行います"))
             }
             Command::Status => Ok(Payload::Status(StatusPayload {
                 app_version: env!("CARGO_PKG_VERSION").into(),
