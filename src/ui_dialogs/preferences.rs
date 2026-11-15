@@ -252,7 +252,7 @@ pub fn draw_favorite_view_state_settings_snapshot_fixture(ui: &mut egui::Ui) {
     );
     state.favorite_view_state_entry_count = 3;
     state.favorite_view_state_active = true;
-    pages::page_thumbnail(ui, &mut state);
+    pages::draw_favorite_view_state_section(ui, &mut state);
 }
 
 fn pref_panel_scroll_style() -> egui::style::ScrollStyle {

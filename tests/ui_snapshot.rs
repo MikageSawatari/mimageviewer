@@ -3519,7 +3519,7 @@ fn preferences_favorite_view_state_dark() {
     snapshot_with_theme_at_size(
         "preferences_favorite_view_state_dark",
         mimageviewer::os_theme::ResolvedTheme::Dark,
-        egui::vec2(620.0, 260.0),
+        egui::vec2(620.0, 180.0),
         None,
         |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
