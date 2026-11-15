@@ -18,11 +18,9 @@ pub(crate) struct FsInitialPlacementRequest {
 }
 
 /// Pure automatic placement, retained after the placement request completes.
+/// It follows the view transform, not the items namespace or its current index.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FsAutomaticInitialView {
-    items_generation: u64,
-    anchor_idx: usize,
-    slice: crate::page_split::PageSlice,
     zoom: f32,
     pan: egui::Vec2,
 }
@@ -48,7 +46,7 @@ fn reading_start_pan(
 }
 
 impl App {
-    /// Whether the user has moved this display unit away from its initial view.
+    /// Whether the user has moved the view away from its last automatic placement.
     ///
     /// The 2026-08-15 rule deliberately excluded pan: counting a nudge would
     /// stop click navigation without a marked way back. On 2026-11-15 the
@@ -59,13 +57,9 @@ impl App {
         zoom_differs_from_fit(zoom)
             || free_rotation.abs() > TRANSFORM_EPSILON
             || (pan.length_sq() > PAN_EPSILON_SQ
-                && !self.fs_automatic_initial_view.is_some_and(|initial| {
-                    initial.items_generation == self.items_generation
-                        && self.fullscreen_idx == Some(initial.anchor_idx)
-                        && initial.slice == self.fullscreen_page_slice
-                        && initial.zoom == zoom
-                        && initial.pan == pan
-                }))
+                && !self
+                    .fs_automatic_initial_view
+                    .is_some_and(|initial| initial.zoom == zoom && initial.pan == pan))
     }
 
     pub(crate) fn clear_fs_initial_placement_request(&mut self) {
@@ -73,7 +67,6 @@ impl App {
     }
 
     pub(crate) fn request_fs_initial_placement(&mut self, anchor_idx: usize) {
-        self.fs_automatic_initial_view = None;
         self.fs_initial_placement_request =
             (self.settings.fullscreen_page_start_position.normalized()
                 == crate::settings::FullscreenPageStartPosition::ReadingStart)
@@ -89,7 +82,6 @@ impl App {
 
     /// Accepted composition changes use the zoom selected by the existing path.
     pub(crate) fn request_fs_initial_placement_after_composition_change(&mut self) {
-        self.fs_automatic_initial_view = None;
         if !self.reading_flow.is_paged()
             || self.settings.fullscreen_page_start_position.normalized()
                 != crate::settings::FullscreenPageStartPosition::ReadingStart
@@ -98,6 +90,7 @@ impl App {
         }
         if let Some(anchor_idx) = self.fullscreen_idx {
             self.fs_pan = egui::Vec2::ZERO;
+            self.fs_automatic_initial_view = None;
             self.request_fs_initial_placement(anchor_idx);
         }
     }
@@ -176,9 +169,6 @@ impl App {
             .expect("validated placement request");
         self.fs_pan = pan;
         self.fs_automatic_initial_view = Some(FsAutomaticInitialView {
-            items_generation: self.items_generation,
-            anchor_idx,
-            slice: self.fullscreen_page_slice,
             zoom: self.fs_zoom,
             // Half navigation preserves manual pan on non-overflowing axes.
             // Only the placement computed from zero is an automatic baseline.

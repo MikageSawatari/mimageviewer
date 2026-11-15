@@ -2082,6 +2082,7 @@ pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) image_dims: Option<(u32, u32)>,
     pub(crate) rotation: crate::rotation_db::Rotation,
     pub(crate) zoom_pan: Option<(f32, egui::Vec2)>,
+    pub(crate) automatic_initial_view: Option<crate::ui_fullscreen::FsAutomaticInitialView>,
     pub(crate) free_rotation: f32,
     pub(crate) image_rect_norm: egui::Rect,
     pub(crate) image_content_bbox: Option<egui::Rect>,
@@ -2356,6 +2357,20 @@ impl DeferredDetachedImageWindowShared {
 }
 
 #[cfg(windows)]
+impl DetachedImageWindowSnapshot {
+    /// Restore the saved transform and its automatic-placement provenance together.
+    fn restore_view_transform(&self, app: &mut App) {
+        if let Some((zoom, pan)) = self.zoom_pan {
+            app.fs_zoom = zoom;
+            app.fs_pan = pan;
+            app.clear_fs_initial_placement_request();
+        }
+        app.fs_free_rotation = self.free_rotation;
+        app.fs_automatic_initial_view = self.automatic_initial_view;
+    }
+}
+
+#[cfg(windows)]
 impl Clone for DetachedImageWindowSnapshot {
     fn clone(&self) -> Self {
         Self {
@@ -2366,6 +2381,7 @@ impl Clone for DetachedImageWindowSnapshot {
             image_dims: self.image_dims,
             rotation: self.rotation,
             zoom_pan: self.zoom_pan,
+            automatic_initial_view: self.automatic_initial_view,
             free_rotation: self.free_rotation,
             image_rect_norm: self.image_rect_norm,
             image_content_bbox: self.image_content_bbox,
@@ -45632,7 +45648,6 @@ impl App {
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
             self.clear_fs_initial_placement_request();
-            self.fs_automatic_initial_view = None;
             self.close_page_overview();
             self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
             self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
@@ -69321,15 +69336,8 @@ impl App {
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
             }
-            let zoom_pan = snapshot.zoom_pan;
-            let free_rotation = snapshot.free_rotation;
             self.with_window_viewer_context(snapshot.id, |app| {
-                if let Some((zoom, pan)) = zoom_pan {
-                    app.fs_zoom = zoom;
-                    app.fs_pan = pan;
-                    app.clear_fs_initial_placement_request();
-                }
-                app.fs_free_rotation = free_rotation;
+                snapshot.restore_view_transform(app);
             })
             .expect("resumed collection root context must remain bound");
             return true;
@@ -69373,8 +69381,6 @@ impl App {
                 activate_window_id,
                 "resume_still_snapshot",
             );
-            let activate_zoom_pan = snapshot.zoom_pan;
-            let activate_free_rotation = snapshot.free_rotation;
             if !self.park_and_close_current_active_detached_viewer(ctx) {
                 self.log_detached_image_window_debug(format!(
                     "passive_activate_still_aborted id={} reason=park_current_failed",
@@ -69395,12 +69401,7 @@ impl App {
             self.fs_open_intent_from_grid = false;
             self.adopt_active_detached_viewport_runtime_from_passive("resume_still_snapshot");
             self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
-            if let Some((zoom, pan)) = activate_zoom_pan {
-                self.fs_zoom = zoom;
-                self.fs_pan = pan;
-                self.clear_fs_initial_placement_request();
-            }
-            self.fs_free_rotation = activate_free_rotation;
+            snapshot.restore_view_transform(self);
             self.log_detached_image_window_debug(format!(
                 "passive_activate_still_committed id={} active_context={} fs_idx={:?} \
                  independent={} session={:?}",
@@ -69826,6 +69827,23 @@ impl App {
         shrank_hard && previous_was_substantial
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn capture_detached_image_window_snapshot_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        window_id: u64,
+    ) -> Option<DetachedImageWindowSnapshot> {
+        self.set_detached_window_binding_for_test(Some(window_id));
+        let snapshot = self.build_active_detached_image_window_snapshot(Some(ctx));
+        self.set_detached_window_binding_for_test(None);
+        self.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::Parked,
+            "test_capture_saved_view",
+        );
+        snapshot
+    }
+
     #[cfg(windows)]
     fn build_active_detached_image_window_snapshot(
         &mut self,
@@ -69917,6 +69935,7 @@ impl App {
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 image_content_bbox: None,
@@ -70000,6 +70019,7 @@ impl App {
             .flatten();
         let texture_size = base_texture.full_source_size_vec2();
         let zoom_pan = self.fs_zoom_pan();
+        let automatic_initial_view = self.fs_automatic_initial_view;
         let free_rotation = self.fs_free_rotation;
         let id = self.ensure_detached_viewer_window_id();
         let _ = self.capture_detached_window_placement_at_decision(id, "build_active_snapshot");
@@ -70134,6 +70154,7 @@ impl App {
             image_dims: Some((texture_size.x as u32, texture_size.y as u32)),
             rotation,
             zoom_pan,
+            automatic_initial_view,
             free_rotation,
             image_rect_norm,
             image_content_bbox,
@@ -70182,6 +70203,7 @@ impl App {
             image_dims: None,
             rotation: crate::rotation_db::Rotation::None,
             zoom_pan: None,
+            automatic_initial_view: None,
             free_rotation: 0.0,
             image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             image_content_bbox: None,
@@ -72925,6 +72947,7 @@ impl App {
         self.analysis_sv_cache = None;
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
+        self.fs_automatic_initial_view = None;
         self.request_fs_initial_placement(idx);
         self.fs_pan_drag_start = None;
         self.fs_vertical_scroll = 0.0;

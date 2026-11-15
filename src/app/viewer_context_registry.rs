@@ -6132,6 +6132,7 @@ impl App {
             image_dims: None,
             rotation: crate::rotation_db::Rotation::None,
             zoom_pan: None,
+            automatic_initial_view: None,
             free_rotation: 0.0,
             image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             image_content_bbox: None,

@@ -1458,12 +1458,15 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 ### 2026-11-15: 通常画像のクリック判定に自動初期配置の owner を持たせる (§1.745)
 
 `FsAutomaticInitialView` は通常画像の表示単位の自動配置結果で、配置要求の完了後も比較用に保持する。
-利用者の変形と区別するため、generation・anchor・slice・倍率・pan を `fs_zoom` / `fs_pan` と同じ
-`ViewerContextBundle` に持たせ、既存の初期化・swap・移譲・破棄へ登録する。保存状態からの再 open は基準を破棄し、
-復元した利用者の zoom / pan を自動配置とみなさない。共有設定による既存の parked context の pan リセットでは基準も破棄する。
+利用者の変形と区別するため、倍率・純粋な自動 pan の基準を `fs_zoom` / `fs_pan` と同じ
+`ViewerContextBundle` に持たせ、既存の初期化・swap・移譲・破棄へ登録する。共有設定による既存の parked context の pan リセットでは基準も破棄する。
+2026-11-16 追補: 初版の世代・anchor・slice 照合と snapshot 保存漏れは、外部独立レビューで P2 と判定され、設計担当も確認した。
+基準を一覧の identity から分離し、変形を保つ世代変更・index の詰め直し・片側移動では基準も保つ。
+snapshot の共通 capture と Clone は zoom/pan・自由回転・基準を一緒に保存し、通常画像と collection-root の再開は同じ owner で復元する。
+AtRest の live bundle 再開は bundle の状態を保つ。overview / ParkedLive media の snapshot は従来の既定変形に合わせ基準も持たない。
 設計指示の context 分離を実現する共有表示状態の所有変更であり、detached 固有の guard は追加しない。
-detached 述語・viewport routing・HWND・focus・timer は変更しない。独立 Sol/xhigh 設計レビューも、
-症状パッチではなく、この所有境界に沿った構造的変更であることを確認した。
+detached 述語・viewport routing・HWND・focus・timer は変更しない。設計担当と外部独立レビュアーは、
+bundle の所有自体が症状パッチではなく構造的変更であることに合意している。この合意を初版全体の検収成功とは扱わない。
 配置結果と寿命は [fullscreen-page-start-position-plan.md](fullscreen-page-start-position-plan.md) に記録する。
 
 ### 2026-11-14: フォルダツリーのポインター入力を ROOT の pass に所有させる (§1.769)

@@ -467,40 +467,23 @@ fn canvas_move_745_half_step_retains_manual_pan_on_the_axis_not_automatically_pl
 }
 
 #[test]
-fn canvas_move_745_automatic_baseline_cannot_cross_slice_generation_or_zoom() {
-    for transition in 0..3 {
-        let ctx = egui::Context::default();
-        let mut app = reading_app(&ctx, SpreadMode::SplitLtr);
-        app.fullscreen_page_slice = crate::page_split::PageSlice::Left;
-        if transition == 2 {
-            app.fs_zoom = 1.5;
-        }
-        app.request_fs_initial_placement(0);
-        assert!(app.resolve_fs_initial_placement(
-            0,
-            true,
-            viewport(),
-            Some(overflowing_unit()),
-            FullscreenPageMaterialKind::Complete
-        ));
-        match transition {
-            0 => {
-                app.items_generation += 1;
-            }
-            1 => {
-                app.settings.fullscreen_page_start_position = FullscreenPageStartPosition::Center;
-                app.accept_fullscreen_page_slice_navigation(0, crate::page_split::PageSlice::Right);
-            }
-            _ => app.fs_zoom = 1.0,
-        }
-        assert!(
-            matches!(
-                planned_click(&mut app, false, false),
-                FsCanvasClickAction::None
-            ),
-            "transition={transition}"
-        );
-    }
+fn canvas_move_745_revision_baseline_keeps_zoom_discriminator() {
+    let ctx = egui::Context::default();
+    let mut app = reading_app(&ctx, SpreadMode::Single);
+    app.fs_zoom = 1.5;
+    app.request_fs_initial_placement(0);
+    assert!(app.resolve_fs_initial_placement(
+        0,
+        true,
+        viewport(),
+        Some(overflowing_unit()),
+        FullscreenPageMaterialKind::Complete
+    ));
+    app.fs_zoom = 1.0;
+    assert!(matches!(
+        planned_click(&mut app, false, false),
+        FsCanvasClickAction::None
+    ));
 }
 
 #[test]
@@ -587,28 +570,180 @@ fn canvas_move_745_fit_and_reading_direction_reset_retire_old_automatic_baseline
     }
 }
 
-#[test]
-fn canvas_move_745_saved_transform_restored_after_open_counts_as_moved() {
-    let ctx = egui::Context::default();
-    let mut app = reading_app(&ctx, SpreadMode::Single);
-    app.request_fs_initial_placement(0);
-    assert!(app.resolve_fs_initial_placement(
-        0,
-        true,
-        viewport(),
-        Some(overflowing_unit()),
-        FullscreenPageMaterialKind::Complete
+fn placed_page_one() -> (egui::Context, crate::app::AppTestEnvForTest) {
+    let (ctx, mut app) = prepared(true);
+    app.open_fullscreen(1, HistoryTrigger::UserChosen);
+    paint_frame(&mut app, &ctx, vec![]);
+    assert!(app.fs_pan.length_sq() > PAN_EPSILON_SQ);
+    assert!(matches!(
+        planned_click(&mut app, false, false),
+        FsCanvasClickAction::PageSide(1)
     ));
-    let saved_pan = app.fs_pan;
+    (ctx, app)
+}
+
+#[test]
+fn canvas_move_745_revision_remove_other_item_keeps_automatic_clicks() {
+    let _serial = crate::key_input::lock_test_input();
+    let _cleanup = TestKeyboardFrameCleanup;
+    for removed in [3, 0] {
+        let (_ctx, mut app) = placed_page_one();
+        let item = app.items[1].clone();
+        let generation = app.items_generation;
+        let transform = (app.fs_zoom, app.fs_pan, app.fs_free_rotation);
+        app.remove_items_batch(&[removed]);
+        assert_ne!(app.items_generation, generation);
+        let idx = app.fullscreen_idx.expect("the viewed page survives");
+        assert_eq!(app.items[idx], item);
+        assert_eq!((app.fs_zoom, app.fs_pan, app.fs_free_rotation), transform);
+        assert!(
+            matches!(
+                planned_click(&mut app, false, false),
+                FsCanvasClickAction::PageSide(1)
+            ),
+            "removed={removed}"
+        );
+    }
+}
+
+#[test]
+fn canvas_move_745_revision_remove_current_item_keeps_automatic_clicks() {
+    let _serial = crate::key_input::lock_test_input();
+    let _cleanup = TestKeyboardFrameCleanup;
+    let (_ctx, mut app) = placed_page_one();
+    let neighbour = app.items[2].clone();
+    let transform = (app.fs_zoom, app.fs_pan, app.fs_free_rotation);
+    app.remove_items_batch(&[1]);
+    assert_eq!(app.items[app.fullscreen_idx.unwrap()], neighbour);
+    assert_eq!((app.fs_zoom, app.fs_pan, app.fs_free_rotation), transform);
+    assert!(matches!(
+        planned_click(&mut app, false, false),
+        FsCanvasClickAction::PageSide(1)
+    ));
+}
+
+#[test]
+fn canvas_move_745_revision_remove_other_item_keeps_user_move() {
+    let _serial = crate::key_input::lock_test_input();
+    let _cleanup = TestKeyboardFrameCleanup;
+    let (_ctx, mut app) = placed_page_one();
+    let pan = app.fs_pan + egui::vec2(40.0, -20.0);
+    app.set_fs_pan_from_input(1.0, pan);
+    let transform = (app.fs_zoom, app.fs_pan, app.fs_free_rotation);
+    app.remove_items_batch(&[3]);
+    assert_eq!((app.fs_zoom, app.fs_pan, app.fs_free_rotation), transform);
+    assert!(matches!(
+        planned_click(&mut app, false, false),
+        FsCanvasClickAction::None
+    ));
+}
+
+#[test]
+fn canvas_move_745_revision_retained_half_and_composition_keep_automatic_clicks() {
+    for half in [true, false] {
+        let ctx = egui::Context::default();
+        let mut app = composition_switch_app(
+            &ctx,
+            if half {
+                SpreadMode::SplitLtr
+            } else {
+                SpreadMode::Single
+            },
+            true,
+            ReadingDirection::Ltr,
+        );
+        app.request_fs_initial_placement(0);
+        assert!(app.resolve_fs_initial_placement(
+            0,
+            true,
+            viewport(),
+            Some(overflowing_unit()),
+            FullscreenPageMaterialKind::Complete
+        ));
+        let transform = (app.fs_zoom, app.fs_pan, app.fs_free_rotation);
+        app.settings.fullscreen_page_start_position = FullscreenPageStartPosition::Center;
+        if half {
+            app.accept_fullscreen_page_slice_navigation(0, crate::page_split::PageSlice::Right);
+        } else {
+            app.apply_fullscreen_view_mode(&ctx, 0, FullscreenViewMode::LandscapeSplit);
+        }
+        assert_eq!((app.fs_zoom, app.fs_pan, app.fs_free_rotation), transform);
+        assert!(
+            matches!(
+                planned_click(&mut app, false, false),
+                FsCanvasClickAction::PageSide(1)
+            ),
+            "half={half}"
+        );
+    }
+}
+
+#[test]
+fn canvas_move_745_revision_new_page_entry_discards_previous_baseline() {
+    let _serial = crate::key_input::lock_test_input();
+    let _cleanup = TestKeyboardFrameCleanup;
+    let (_ctx, mut app) = prepared(true);
+    let previous_pan = app.fs_pan;
+    app.settings.fullscreen_page_start_position = FullscreenPageStartPosition::Center;
+    app.open_fullscreen(1, HistoryTrigger::UserChosen);
+    app.set_fs_pan_from_input(1.0, previous_pan);
+    assert_eq!(app.fs_pan, previous_pan);
+    assert!(matches!(
+        planned_click(&mut app, false, false),
+        FsCanvasClickAction::None
+    ));
+}
+
+fn resume_captured_view(user_moved: bool) -> (egui::Context, crate::app::AppTestEnvForTest) {
+    let (ctx, mut app) = prepared(true);
+    if user_moved {
+        let pan = app.fs_pan + egui::vec2(40.0, -20.0);
+        app.set_fs_pan_from_input(1.0, pan);
+    }
+    let transform = (app.fs_zoom, app.fs_pan, app.fs_free_rotation);
+    app.settings.detached_viewer_enabled = true;
+    app.native_video_in_window_active = false;
+    app.viewer_presentation = crate::app::ViewerPresentation::DetachedWindow;
+    app.settings.detached_viewer_window_physical_placement =
+        Some(crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 0,
+                top: 0,
+                right: 600,
+                bottom: 400,
+            },
+            maximized: false,
+        });
+    let snapshot = app
+        .capture_detached_image_window_snapshot_for_test(&ctx, 8748)
+        .expect("capture the real automatically placed or moved still view");
+    assert!(snapshot.reopen_sync_stamp.is_some());
+    assert_eq!(snapshot.zoom_pan, Some((transform.0, transform.1)));
     app.close_fullscreen();
-    app.open_fullscreen_with_materialization(
-        0,
-        HistoryTrigger::UserChosen,
-        crate::app::FsOpenMaterialization::DeferredPageTurn,
-    );
-    app.fs_zoom = 1.0;
-    app.fs_pan = saved_pan;
-    app.clear_fs_initial_placement_request();
+    // Clone is also a saved-view transfer boundary.
+    app.detached_image_windows.push(snapshot.clone());
+    assert!(app.activate_detached_image_window_snapshot(&ctx, 8748));
+    assert_eq!((app.fs_zoom, app.fs_pan, app.fs_free_rotation), transform);
+    assert!(app.fs_initial_placement_request.is_none());
+    (ctx, app)
+}
+
+#[test]
+fn canvas_move_745_revision_snapshot_automatic_view_resumes_clicks() {
+    let _serial = crate::key_input::lock_test_input();
+    let _cleanup = TestKeyboardFrameCleanup;
+    let (_ctx, mut app) = resume_captured_view(false);
+    assert!(matches!(
+        planned_click(&mut app, false, false),
+        FsCanvasClickAction::PageSide(1)
+    ));
+}
+
+#[test]
+fn canvas_move_745_revision_snapshot_user_move_stays_moved() {
+    let _serial = crate::key_input::lock_test_input();
+    let _cleanup = TestKeyboardFrameCleanup;
+    let (_ctx, mut app) = resume_captured_view(true);
     assert!(matches!(
         planned_click(&mut app, false, false),
         FsCanvasClickAction::None
