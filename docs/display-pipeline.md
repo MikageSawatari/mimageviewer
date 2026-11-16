@@ -2322,6 +2322,8 @@ Anime4K / pixel-AA は event 名を共用し、`scale_branch`
 
 §1.776 案 A は、layout 2 個だけを `Lanczos3Resampler::new` に残し、縮小・可視範囲拡大・NIS・ピクセルアートの独立した `OnceCell` を各 prepare の初回に完成させる。shader、entry point、format、uniform、texture、cache key は変更しない。初期化は従来と同じ UI スレッド上の prepare 呼出し中で、非同期化・新しい prewarm・worker 移動（案 B）は採らない。待機や supersession を管理する新しい状態も不要である。Anime4K は従来のまま。
 
+Lanczos3 / Anime4K の resampler は cache 内の `Option<Box<...>>` で所有し、作成内訳や枝の保持領域を App にインラインで積まない。Box は各 resampler の初回作成区間内で一度だけ確保し、再利用フレームでは確保しない。
+
 通常の `resolve → resolve_key → generate` と、既存 `execute_prewarm → execute_prewarm_with_policy`（Ordinary / NoRemoval）は `generate_with_source` に合流する。`query_prewarm`・cache hit・admission/claim 拒否では枝を作らず、clear/retain・context 退避/交換も既存の cache 所有を維持する。4 枝の prepare は作成済み pipeline ハンドルを非 optional な job フィールドへ保持し、encode は job だけを受け取る。したがって cache の `Option` / 未作成の枝を encode 時に調べる経路はなく、resampler がなくても job のハンドルで encode できる。製品（release）での効果は未計測。
 
 静止画の最終フィット矩形は `fullscreen_media_rect_with_geometry` が所有する。

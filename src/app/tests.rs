@@ -3622,7 +3622,7 @@ fn mutation_refresh_zip_pin_keeps_level_cursor_scroll_filter_and_checks() {
 fn history_transition_storage_keeps_app_stack_footprint_bounded() {
     use std::mem::size_of;
     println!(
-        "sizes App={} FolderNavHistoryTarget={} OpenRequestOwner={} DirectPdfAdoption={} EpubOpenRestore={} PdfPasswordRequestOwner={} PdfPasswordRequest={} PdfEnumeratePending={}",
+        "sizes App={} FolderNavHistoryTarget={} OpenRequestOwner={} DirectPdfAdoption={} EpubOpenRestore={} PdfPasswordRequestOwner={} PdfPasswordRequest={} PdfEnumeratePending={} GpuLanczosCache={}",
         size_of::<App>(),
         size_of::<FolderNavHistoryTarget>(),
         size_of::<OpenRequestOwner>(),
@@ -3631,6 +3631,7 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         size_of::<PdfPasswordRequestOwner>(),
         size_of::<PdfPasswordRequest>(),
         size_of::<PdfEnumeratePending>(),
+        size_of::<crate::gpu_lanczos::GpuLanczosCache>(),
     );
     // A staged history request is rarely active and must not be stored inline in every App.
     // The capture/fullscreen input test creates several App values on a default test stack.

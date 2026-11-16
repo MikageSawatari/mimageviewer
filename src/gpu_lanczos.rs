@@ -1984,7 +1984,7 @@ pub(crate) fn measure_resampler_cpu_ms<T>(elapsed_ms: &mut f64, run: impl FnOnce
 }
 
 fn get_or_create_resampler<'a, T>(
-    slot: &'a mut Option<T>,
+    slot: &'a mut Option<Box<T>>,
     timings: &mut LanczosGenerationTimings,
     create: impl FnOnce() -> (T, ResamplerCreationTimings),
 ) -> &'a mut T {
@@ -1992,9 +1992,10 @@ fn get_or_create_resampler<'a, T>(
         measure_resampler_cpu_ms(&mut timings.resampler_create_ms, || {
             let (resampler, creation) = create();
             timings.creation = Some(creation);
-            resampler
+            Box::new(resampler)
         })
     })
+    .as_mut()
 }
 
 impl LanczosGenerationStats {
@@ -2094,8 +2095,9 @@ enum LanczosTargetDecision {
 
 #[derive(Default)]
 pub(crate) struct GpuLanczosCache {
-    resampler: Option<Lanczos3Resampler>,
-    anime_resampler: Option<Anime4kResampler>,
+    // Keep creation telemetry and lazy pipelines off the App stack.
+    resampler: Option<Box<Lanczos3Resampler>>,
+    anime_resampler: Option<Box<Anime4kResampler>>,
     entries: HashMap<LanczosCacheKey, LanczosCacheEntry>,
     use_clock: u64,
     regeneration_count: u64,
