@@ -2,6 +2,18 @@
 use super::*;
 use crate::{book_scope::BookScopeKey, spread_shift::*};
 
+/// A non-persistent exact pairing origin, owned by one items generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SpreadStep {
+    pub(crate) start_idx: usize,
+}
+
+/// Only accepted changes to pairing meaning retire the exact origin.
+/// Readers, preparation, refusals and failed adoptions never call this boundary.
+pub(crate) fn retire_spread_step(step: &mut Option<SpreadStep>) {
+    *step = None;
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ViewerShift {
     #[default]
@@ -418,6 +430,7 @@ impl App {
                 return;
             }
         };
+        retire_spread_step(&mut self.spread_step);
         self.spread_shift.scope = Some(scope);
         self.spread_shift.availability = PairingEditAvailability::Automatic;
         self.spread_shift.projection = None;
@@ -650,6 +663,7 @@ impl App {
                 read,
                 epoch,
             )?;
+            retire_spread_step(&mut self.spread_step);
             self.spread_shift.scope = Some(current.scope.clone());
             self.spread_shift.availability = availability;
             self.spread_shift.projection = None;
@@ -831,6 +845,8 @@ impl App {
             return false;
         }
         let previous_anchor = self.spread_shift.anchor_idx();
+        let had_step = self.spread_step.is_some();
+        retire_spread_step(&mut self.spread_step);
         self.spread_shift.projection = None;
         self.spread_shift.scope = scope;
         if let Some(anchor_ref) = reference {
@@ -848,7 +864,7 @@ impl App {
             self.spread_shift.state = ViewerShift::Ordinary(anchor_idx);
             self.show_feedback_toast("見開きを1ページずらしました（この閲覧中のみ）".into());
         }
-        if previous_anchor != Some(anchor_idx) {
+        if had_step || previous_anchor != Some(anchor_idx) {
             self.similar_panel.reset_info_target();
         }
         self.invalidate_fullscreen_display_unit_owners();
@@ -873,9 +889,11 @@ impl App {
         if (had_shift || persists_clear) && !self.admit_book_append_followup_mutation() {
             return false;
         }
+        let had_step = self.spread_step.is_some();
+        retire_spread_step(&mut self.spread_step);
         self.spread_shift.state = ViewerShift::None;
         self.spread_shift.projection = None;
-        if had_shift {
+        if had_shift || had_step {
             self.similar_panel.reset_info_target();
         }
         if persists_clear {
@@ -884,7 +902,7 @@ impl App {
             self.show_feedback_toast("見開き調整を解除しました".into());
         }
         self.invalidate_fullscreen_display_unit_owners();
-        had_shift
+        had_shift || had_step
     }
 
     pub(crate) fn spread_shift_memory_setting_changed(&mut self, enabled: bool) {

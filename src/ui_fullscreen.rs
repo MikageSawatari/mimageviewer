@@ -20,6 +20,8 @@
 
 pub(crate) mod canonical_demand;
 mod compare_original;
+mod spread_step;
+use crate::app::spread_shift_owner::retire_spread_step;
 mod initial_placement;
 pub(crate) use initial_placement::{FsAutomaticInitialView, FsInitialPlacementRequest};
 #[cfg(test)]
@@ -17538,6 +17540,7 @@ struct SpreadDisplayUnitsToken {
     items_generation: u64,
     spread_mode: SpreadMode,
     shift_anchor_idx: Option<usize>,
+    exact_start: Option<usize>,
     landscape_epoch: u64,
     page_alone: crate::settings::PageAloneSettings,
     nav: Arc<Vec<usize>>,
@@ -17564,12 +17567,14 @@ impl SpreadDisplayUnitsToken {
         items_generation: u64,
         spread_mode: SpreadMode,
         shift_anchor_idx: Option<usize>,
+        exact_start: Option<usize>,
         landscape_epoch: u64,
         page_alone: crate::settings::PageAloneSettings,
     ) -> bool {
         self.items_generation == items_generation
             && self.spread_mode == spread_mode
             && self.shift_anchor_idx == shift_anchor_idx
+            && self.exact_start == exact_start
             && self.landscape_epoch == landscape_epoch
             && self.page_alone == page_alone
             && self.matches_nav(nav)
@@ -17668,6 +17673,7 @@ impl FinalDemandTopologies {
             && self.visible.items_generation == token.items_generation
             && self.visible.spread_mode == token.spread_mode
             && self.visible.shift_anchor_idx == token.shift_anchor_idx
+            && self.visible.exact_start == token.exact_start
             && self.visible.landscape_epoch == token.landscape_epoch
             && self.visible.page_alone == token.page_alone
             && self.visible.composed == token.composed
@@ -17678,6 +17684,7 @@ fn build_display_unit_topology(
     nav: &[usize],
     mode: SpreadMode,
     shift: Option<usize>,
+    exact_start: Option<usize>,
     page_alone: crate::settings::PageAloneSettings,
     overrides: &HashMap<usize, crate::book_composition::PageOverride>,
     landscape: impl Fn(usize, usize) -> bool,
@@ -17687,7 +17694,14 @@ fn build_display_unit_topology(
     SPREAD_DISPLAY_UNITS_BUILD_COUNT.set(SPREAD_DISPLAY_UNITS_BUILD_COUNT.get() + 1);
     if mode.is_spread() {
         build_spread_display_units_with_overrides(
-            nav, mode, shift, page_alone, overrides, landscape, pairable,
+            nav,
+            mode,
+            shift,
+            exact_start,
+            page_alone,
+            overrides,
+            landscape,
+            pairable,
         )
     } else {
         nav.iter()
@@ -17851,6 +17865,7 @@ impl SpreadDisplayUnitsCache {
         generation: u64,
         mode: SpreadMode,
         shift_anchor: Option<usize>,
+        exact_start: Option<usize>,
         page_alone: crate::settings::PageAloneSettings,
     ) -> Option<Arc<Vec<SpreadDisplayUnit>>> {
         self.token
@@ -17859,6 +17874,7 @@ impl SpreadDisplayUnitsCache {
                 token.identifies_nav(nav, generation)
                     && token.spread_mode == mode
                     && token.shift_anchor_idx == shift_anchor
+                    && token.exact_start == exact_start
                     && token.page_alone == page_alone
             })
             .map(|_| Arc::clone(&self.units))
@@ -17870,6 +17886,7 @@ impl SpreadDisplayUnitsCache {
         items_generation: u64,
         spread_mode: SpreadMode,
         shift_anchor_idx: Option<usize>,
+        exact_start: Option<usize>,
         page_alone: crate::settings::PageAloneSettings,
     ) -> Option<Arc<Vec<SpreadDisplayUnit>>> {
         self.get_with_source(
@@ -17877,6 +17894,7 @@ impl SpreadDisplayUnitsCache {
             items_generation,
             spread_mode,
             shift_anchor_idx,
+            exact_start,
             page_alone,
             None,
         )
@@ -17888,6 +17906,7 @@ impl SpreadDisplayUnitsCache {
         items_generation: u64,
         spread_mode: SpreadMode,
         shift_anchor_idx: Option<usize>,
+        exact_start: Option<usize>,
         page_alone: crate::settings::PageAloneSettings,
         composed: Option<(
             crate::book_scope::BookScopeKey,
@@ -17904,6 +17923,7 @@ impl SpreadDisplayUnitsCache {
                         items_generation,
                         spread_mode,
                         shift_anchor_idx,
+                        exact_start,
                         self.landscape_epoch,
                         page_alone,
                     )
@@ -17917,6 +17937,7 @@ impl SpreadDisplayUnitsCache {
         items_generation: u64,
         spread_mode: SpreadMode,
         shift_anchor_idx: Option<usize>,
+        exact_start: Option<usize>,
         page_alone: crate::settings::PageAloneSettings,
         landscape_flags: &[bool],
         image_flags: &[bool],
@@ -17935,6 +17956,7 @@ impl SpreadDisplayUnitsCache {
             items_generation,
             spread_mode,
             shift_anchor_idx,
+            exact_start,
             landscape_epoch: self.landscape_epoch,
             page_alone,
             nav: Arc::clone(&nav),
@@ -18232,6 +18254,7 @@ fn build_spread_display_units_with_page_alone(
         nav,
         spread_mode,
         shift_anchor_idx,
+        None,
         page_alone,
         &HashMap::new(),
         is_landscape_idx,
@@ -18263,6 +18286,7 @@ fn build_spread_display_units_with_overrides(
     nav: &[usize],
     spread_mode: SpreadMode,
     shift_anchor_idx: Option<usize>,
+    exact_start: Option<usize>,
     page_alone: crate::settings::PageAloneSettings,
     overrides: &HashMap<usize, crate::book_composition::PageOverride>,
     mut is_landscape_idx: impl FnMut(usize, usize) -> bool,
@@ -18270,7 +18294,18 @@ fn build_spread_display_units_with_overrides(
 ) -> Vec<SpreadDisplayUnit> {
     let mut units = Vec::new();
     let mut pos = 0usize;
-    let shift_anchor_pos = shift_anchor_idx.and_then(|idx| nav.iter().position(|&n| n == idx));
+    // Exact origins restart at their own nav position; they never use the
+    // live shift's parity projection. A cover remains a singleton at zero.
+    let exact_pos = exact_start.and_then(|idx| nav.iter().position(|&n| n == idx));
+    let shift_anchor_pos = exact_pos
+        .map(|at| {
+            if at == 0 && spread_mode.has_cover() {
+                1
+            } else {
+                at
+            }
+        })
+        .or_else(|| shift_anchor_idx.and_then(|idx| nav.iter().position(|&n| n == idx)));
     let forced =
         spread_mode.has_cover() && nav.len() > 1 && (page_alone.after_cover || page_alone.last);
     if forced {
@@ -18667,6 +18702,7 @@ pub(crate) fn build_remote_spread_page_groups_with_overrides(
         &nav,
         spread_mode,
         shift_anchor_idx,
+        None,
         if complete_book_eligible {
             page_alone
         } else {
@@ -18964,13 +19000,15 @@ pub(crate) struct FsPageTurnDecision {
     passthrough_rendition_ready: bool,
 }
 
-const FS_PAGE_TURN_COALESCE_ACTIONS: [KeyAction; 6] = [
+const FS_PAGE_TURN_COALESCE_ACTIONS: [KeyAction; 8] = [
     KeyAction::FsPagePrev,
     KeyAction::FsPageNext,
     KeyAction::FsSpreadShiftLeft,
     KeyAction::FsSpreadShiftRight,
     KeyAction::FsSpreadShiftPrev,
     KeyAction::FsSpreadShiftNext,
+    KeyAction::FsSpreadStepPrev,
+    KeyAction::FsSpreadStepNext,
 ];
 
 const FS_FIXED_PAGE_TURN_CHORDS: [Chord; 4] = [
@@ -20727,6 +20765,7 @@ impl App {
             self.items_generation,
             self.spread_mode,
             self.spread_shift_anchor_idx(),
+            self.spread_step_start_idx(),
             page_alone,
             composed.clone(),
         ) {
@@ -20771,6 +20810,7 @@ impl App {
             nav,
             self.spread_mode,
             self.spread_shift_anchor_idx(),
+            self.spread_step_start_idx(),
             page_alone,
             overrides,
             |nav_pos, _| landscape_flags.get(nav_pos).copied().unwrap_or(false),
@@ -20782,6 +20822,7 @@ impl App {
             self.items_generation,
             self.spread_mode,
             self.spread_shift_anchor_idx(),
+            self.spread_step_start_idx(),
             page_alone,
             &landscape_flags,
             &image_flags,
@@ -20802,6 +20843,7 @@ impl App {
                 self.items_generation,
                 self.spread_mode,
                 self.spread_shift_anchor_idx(),
+                self.spread_step_start_idx(),
                 page_alone,
                 composed.clone(),
             )
@@ -20962,6 +21004,7 @@ impl App {
             &[idx],
             self.spread_mode,
             None,
+            self.spread_step_start_idx(),
             crate::settings::PageAloneSettings::default(),
             &overrides,
             |_, page| {
@@ -21154,6 +21197,7 @@ impl App {
         token.items_generation == self.items_generation
             && token.spread_mode == self.spread_mode
             && token.shift_anchor_idx == self.spread_shift_anchor_idx()
+            && token.exact_start == self.spread_step_start_idx()
             && token.landscape_epoch == cache.landscape_epoch
             && token.composed == composed
             && !cache.rotation_recheck_all
@@ -21301,6 +21345,7 @@ impl App {
             nav,
             self.spread_mode,
             token.shift_anchor_idx,
+            token.exact_start,
             page_alone,
             overrides,
             |_, idx| {
@@ -21459,6 +21504,7 @@ impl App {
             || token.spread_mode != self.spread_mode
             || token.landscape_epoch != cache.landscape_epoch
             || token.shift_anchor_idx != self.spread_shift_anchor_idx()
+            || token.exact_start != self.spread_step_start_idx()
             || cache.rotation_recheck_all
             || !cache.rotation_recheck_indices.is_empty()
             || self.viewer_navigation_caches.source
@@ -21815,10 +21861,13 @@ impl App {
         nav: &[usize],
     ) -> Vec<Vec<usize>> {
         let rotations = self.get_rotations_for_indices(nav);
-        build_spread_display_units_with_predicates(
+        build_spread_display_units_with_overrides(
             nav,
             self.spread_mode,
             self.spread_shift_anchor_idx(),
+            self.spread_step_start_idx(),
+            crate::settings::PageAloneSettings::default(),
+            &HashMap::new(),
             |nav_pos, idx| {
                 self.page_is_landscape(
                     idx,
@@ -25997,6 +26046,7 @@ impl App {
                     self.items_generation,
                     self.spread_mode,
                     self.spread_shift_anchor_idx(),
+                    self.spread_step_start_idx(),
                     if self.spread_complete_book_context_eligible() {
                         self.page_alone_enabled_for_current_book()
                     } else {
@@ -33496,21 +33546,25 @@ impl App {
         };
         self.spread_shift.resolve(&self.page_identity_index, &nav);
         let rotations = self.get_rotations_for_indices(&nav);
-        let units = build_spread_display_units_with_predicates(
-            &nav,
-            self.spread_mode,
-            self.spread_shift_anchor_idx(),
-            |nav_pos, idx| {
-                self.page_is_landscape(
-                    idx,
-                    rotations
-                        .get(nav_pos)
-                        .copied()
-                        .unwrap_or(crate::rotation_db::Rotation::None),
-                )
-            },
-            |idx| is_spread_pairable_item(self.items.get(idx)),
-        );
+        let units = if self.spread_step.is_some() {
+            self.build_spread_display_units_for_nav(&nav)
+        } else {
+            Arc::new(build_spread_display_units_with_predicates(
+                &nav,
+                self.spread_mode,
+                self.spread_shift_anchor_idx(),
+                |nav_pos, idx| {
+                    self.page_is_landscape(
+                        idx,
+                        rotations
+                            .get(nav_pos)
+                            .copied()
+                            .unwrap_or(crate::rotation_db::Rotation::None),
+                    )
+                },
+                |idx| is_spread_pairable_item(self.items.get(idx)),
+            ))
+        };
         let landscape_flags = nav
             .iter()
             .enumerate()
@@ -33658,11 +33712,13 @@ impl App {
         } else {
             crate::settings::PageAloneSettings::default()
         };
-        let units = build_spread_display_units_with_page_alone(
+        let units = build_spread_display_units_with_overrides(
             nav,
             initial_spread_mode,
             self.spread_shift_anchor_idx(),
+            self.spread_step_start_idx(),
             page_alone,
+            &HashMap::new(),
             |_, idx| {
                 self.page_is_landscape(
                     idx,
@@ -35879,6 +35935,24 @@ impl App {
                     KeyAction::FsSpreadShiftNext,
                 )
                 .should_navigate();
+        let spread_step_prev_input = if !is_video_fs && !fs_music_view_active {
+            self.keymap.consume_page_turn_action(
+                ctx,
+                input_permits.current_level,
+                KeyAction::FsSpreadStepPrev,
+            )
+        } else {
+            crate::keymap::PageTurnConsumeResult::NoMatch
+        };
+        let spread_step_next_input = if !is_video_fs && !fs_music_view_active {
+            self.keymap.consume_page_turn_action(
+                ctx,
+                input_permits.current_level,
+                KeyAction::FsSpreadStepNext,
+            )
+        } else {
+            crate::keymap::PageTurnConsumeResult::NoMatch
+        };
         if !is_video_fs && !fs_music_view_active {
             if self
                 .keymap
@@ -37490,6 +37564,29 @@ impl App {
                 self.page_turn_navigation_key_operation(ctx, KeyAction::FsJumpLast);
             // End もフォルダ内移動なのでスライドショーは止めない。
             action.jump_to = self.fullscreen_boundary_jump_target(fs_idx, true);
+        }
+
+        // Resolve the new step after existing navigation priorities. A second
+        // key in this frame must not change pairing behind another accepted target.
+        if !action.close
+            && !action.close_to_page_list
+            && action.ctrl_nav.is_none()
+            && action.list_order_nav.is_none()
+            && action.sibling_nav.is_none()
+            && action.mouse_nav.is_none()
+            && action.jump_to.is_none()
+            && action.page_nav.is_none()
+            && (spread_step_prev_input.should_navigate()
+                || spread_step_next_input.should_navigate())
+        {
+            let (dir, input) = if spread_step_next_input.should_navigate() {
+                (1, spread_step_next_input)
+            } else {
+                (-1, spread_step_prev_input)
+            };
+            let operation = self.page_turn_consumed_key_operation(input);
+            self.queue_spread_step_action_for_frame(ctx, fs_idx, dir, &mut action, operation);
+            *navigation_operation = operation;
         }
 
         action
@@ -45657,6 +45754,7 @@ impl App {
             ));
             return;
         }
+        retire_spread_step(&mut self.spread_step);
         self.page_alone_preferences = preferences;
         self.record_current_container_content_identity(
             crate::content_identity::ContentIdentityTrigger::Edit,
@@ -46279,6 +46377,7 @@ impl App {
             crate::logger::log(format!("spread: failed to save view mode: {error}"));
             return;
         }
+        retire_spread_step(&mut self.spread_step);
         self.invalidate_similar_preview();
         self.spread_mode = mode;
         self.reading_direction = direction;
@@ -46320,6 +46419,7 @@ impl App {
             crate::logger::log(format!("spread: failed to save reading flow: {error}"));
             return;
         }
+        retire_spread_step(&mut self.spread_step);
         self.invalidate_similar_preview();
         self.reading_flow = flow;
         if self.extracted_result_surface().is_none() && !composed {
@@ -60425,6 +60525,7 @@ mod music_full_width_hud_tests {
 
 #[cfg(test)]
 mod tests {
+    include!("ui_fullscreen/spread_step_tests.rs");
     include!("ui_fullscreen/compare_original_tests.rs");
     #[test]
     fn chrome_suppression_right_close_hit_keeps_raw_lock_in_still_and_music() {

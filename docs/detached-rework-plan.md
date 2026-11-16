@@ -1455,6 +1455,19 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-17: 見開きのまま 1 ページ送りの context 所有（§1.796）
+
+- 確定設計 [one-page-step-plan.md r5 §3–4](one-page-step-plan.md) の設計担当・独立レビューの合意に沿い、
+  `ViewerContextBundle` の `spread_shift` 隣へ保存しない `spread_step` を追加する。
+  Codex の実装前提確認でも、既存 bundle の移送境界へ載せる構造変更であり症状パッチではないと確認した。
+- empty・網羅的 destructuring・swap・park/mount で既存所有を保つ。
+  新 context の fork は起点を引き継がず、fork 先の表示単位 cache も一時の列を残さない。
+  F12 の同 context 表示先切替は起点を保持する。detached 固有の guard・述語・viewport 経路は追加しない。
+- 退役は受理済みの組の意味の切替だけで行い、兄弟 context の列や cache は失効させない。
+  context 回帰は swap/park/mount・兄弟分離・両世代 setter・fork・parked 単独ページ設定・collection 受付を対象とする。
+  - `viewer_context_audit` の bundle public API fingerprint を、このフィールド追加分だけ更新する。
+    bundle を直接生成する2テストは registry 本体の test module に置き、監査の例外は増やさない。
+
 ### 2026-11-16: 本文の保存回転による本自身の自動代表cache失効 (§1.773、表紙計画§29)
 
 設計担当と独立レビュー担当は、P案を撤回した後の単純な保存側失効について改めて設計合意した。

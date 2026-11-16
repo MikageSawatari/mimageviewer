@@ -676,7 +676,7 @@ pub(crate) mod spread_shift_owner;
 #[cfg(test)]
 mod spread_shift_owner_tests;
 pub(crate) use sidecar_restore::SidecarRestorePresentation;
-use spread_shift_owner::ViewerSpreadShift;
+use spread_shift_owner::{ViewerSpreadShift, retire_spread_step};
 pub(crate) mod collection_grid;
 pub(crate) mod collection_navigation;
 pub(crate) mod raw_page_store;
@@ -13293,6 +13293,7 @@ impl App {
 
     /// 単ページ表示へ倒す。見開きを解除し、対象ページへ寄せ、ズーム / パンを戻す。
     pub(crate) fn enter_page_edit_single_view(&mut self, target_idx: usize) {
+        retire_spread_step(&mut self.spread_step);
         self.cancel_superseded_fs_navigation_display_target(target_idx);
         self.similar_panel.reset_info_target();
         self.spread_mode = crate::settings::SpreadMode::Single;
@@ -18250,6 +18251,7 @@ pub struct App {
     /// この viewer の見開き調整と、保存・復元に対する受付済み依存。
     /// 描画用 index は identity/nav 投影から取得し、durable rows は共有 service が所有する。
     pub(crate) spread_shift: ViewerSpreadShift,
+    pub(crate) spread_step: Option<spread_shift_owner::SpreadStep>,
     pub(crate) book_composition: book_composition_runtime::ViewerBookComposition,
     pub(crate) composition_editor: book_composition_editor::CompositionEditorState,
     pub(crate) book_composition_permission:
@@ -21767,6 +21769,7 @@ impl App {
                 crate::settings::SingletonSpreadEndpointPreferences::default(),
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
             spread_shift: Default::default(),
+            spread_step: None,
             book_composition: Default::default(),
             composition_editor: Default::default(),
             book_composition_permission: Default::default(),
@@ -29568,6 +29571,7 @@ impl App {
             // Legacy Vertical is a flow encoding and overrides a retained flow column,
             // exactly as in the normal restore below. Other synthetic pairing settings
             // must not configure the result session.
+            retire_spread_step(&mut self.spread_step);
             self.reading_flow = stored.flow.unwrap_or(defaults.reading_flow);
             if stored.mode.unwrap_or(defaults.spread_mode) == crate::settings::SpreadMode::Vertical
             {
@@ -29584,6 +29588,7 @@ impl App {
         let page_alone_preferences = db
             .get_page_alone_preferences_with_fallback(key, fallback)
             .map_err(|error| error.to_string())?;
+        retire_spread_step(&mut self.spread_step);
         self.final_cover_spread_preference = final_cover_preference;
         self.singleton_spread_endpoint_preferences = endpoint_preferences;
         self.page_alone_preferences = page_alone_preferences;
@@ -45652,6 +45657,7 @@ impl App {
 
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            retire_spread_step(&mut self.spread_step);
             self.clear_fs_initial_placement_request();
             self.close_page_overview();
             self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
@@ -50776,6 +50782,7 @@ impl App {
                     );
                     (mode, direction, self.settings.default_reading_flow)
                 };
+            retire_spread_step(&mut self.spread_step);
             self.reading_flow = container.spread.flow.unwrap_or(default_flow);
             self.reading_direction = preferred_direction;
             if stored_spread == crate::settings::SpreadMode::Vertical {
@@ -76297,8 +76304,12 @@ impl App {
     }
 
     pub(crate) fn current_grid_order(&self) -> &[usize] {
+        self.grid_order_for_view_mode(self.settings.grid_view_mode)
+    }
+
+    fn grid_order_for_view_mode(&self, mode: crate::settings::GridViewMode) -> &[usize] {
         if !self.items_are_reading_history_view
-            && self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+            && mode == crate::settings::GridViewMode::Details
             && self.details_order.len() == self.visible_indices.len()
         {
             &self.details_order
@@ -76321,6 +76332,10 @@ impl App {
     }
 
     pub(crate) fn current_reader_order(&self) -> &[usize] {
+        self.reader_order_for_view_mode(self.settings.grid_view_mode)
+    }
+
+    fn reader_order_for_view_mode(&self, mode: crate::settings::GridViewMode) -> &[usize] {
         if let Some(order) =
             self.snapshot
                 .as_ref()
@@ -76350,7 +76365,7 @@ impl App {
         if collection_root_installed {
             &self.visible_indices
         } else {
-            self.current_grid_order()
+            self.grid_order_for_view_mode(mode)
         }
     }
 
@@ -76358,12 +76373,20 @@ impl App {
         if self.settings.grid_view_mode == mode {
             return;
         }
+        let previous_mode = self.settings.grid_view_mode;
         self.settings.grid_view_mode = mode;
-        self.apply_grid_view_mode_runtime(mode);
+        self.apply_grid_view_mode_runtime(previous_mode, mode);
         self.settings.save();
     }
 
-    fn apply_grid_view_mode_runtime(&mut self, mode: crate::settings::GridViewMode) {
+    fn apply_grid_view_mode_runtime(
+        &mut self,
+        previous_mode: crate::settings::GridViewMode,
+        mode: crate::settings::GridViewMode,
+    ) {
+        let previous_reader_order = self
+            .spread_step
+            .map(|_| self.reader_order_for_view_mode(previous_mode).to_vec());
         self.grid_scroll.renew_session();
         self.details_thumb_suppression_applied = false;
         // A bounded thumbnail request cannot complete the full details request.
@@ -76381,6 +76404,7 @@ impl App {
                 self.viewer_navigation_caches.invalidate();
             }
         }
+        self.retire_spread_step_after_reader_order_adoption(previous_reader_order);
         self.grid_scroll.set_reveal_requested(true);
     }
 
@@ -76581,6 +76605,9 @@ impl App {
     }
 
     pub(crate) fn rebuild_details_order(&mut self) {
+        let previous_reader_order = self
+            .spread_step
+            .map(|_| self.current_reader_order().to_vec());
         self.details_order_revision = self.details_order_revision.wrapping_add(1);
         self.viewer_navigation_caches.invalidate();
         if !self.details_sort_key_visible(self.settings.details_sort_key) {
@@ -76595,6 +76622,7 @@ impl App {
             // PageCount へ切り替えた直後は全件取得が終わるまで toolbar 順を維持する。
             // Finished で Ready になった時点で poll_details_meta_load が再構築する。
             self.details_order = self.visible_indices.clone();
+            self.retire_spread_step_after_reader_order_adoption(previous_reader_order);
             self.close_page_overview_if_reader_order_changed();
             return;
         }
@@ -76603,6 +76631,7 @@ impl App {
         // `details_header_sort_active` が唯一の所有者で、UI の無効化もそこから導く。
         if !self.details_header_sort_active() {
             self.details_order = self.visible_indices.clone();
+            self.retire_spread_step_after_reader_order_adoption(previous_reader_order);
             self.close_page_overview_if_reader_order_changed();
             return;
         }
@@ -76613,7 +76642,17 @@ impl App {
             .collect();
         rows.sort_by(|a, b| Self::compare_details_sort_rows(a, b, key, ascending));
         self.details_order = rows.into_iter().map(|row| row.idx).collect();
+        self.retire_spread_step_after_reader_order_adoption(previous_reader_order);
         self.close_page_overview_if_reader_order_changed();
+    }
+
+    fn retire_spread_step_after_reader_order_adoption(&mut self, previous: Option<Vec<usize>>) {
+        if previous
+            .as_deref()
+            .is_some_and(|order| order != self.current_reader_order())
+        {
+            retire_spread_step(&mut self.spread_step);
+        }
     }
 
     fn details_sort_row(
@@ -82980,6 +83019,7 @@ impl App {
         boundary: FsMetadataBoundary,
         destination: FullscreenCloseDestination,
     ) {
+        retire_spread_step(&mut self.spread_step);
         self.clear_fs_initial_placement_request();
         self.fs_automatic_initial_view = None;
         self.cancel_original_material_entry_intents(None);
@@ -94880,7 +94920,7 @@ impl App {
         let current = crate::settings::FavoriteViewState::from_settings(&self.settings);
 
         if previous.grid_view_mode != current.grid_view_mode {
-            self.apply_grid_view_mode_runtime(current.grid_view_mode);
+            self.apply_grid_view_mode_runtime(previous.grid_view_mode, current.grid_view_mode);
         }
 
         // 列数はセルの大きさそのもので、グリッドは毎フレーム `settings.grid_cols` から

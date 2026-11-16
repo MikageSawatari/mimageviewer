@@ -112340,7 +112340,10 @@ fn media_duration_mode_switch_discards_queued_thumbnail_completion_and_plans_all
         .unwrap();
     let revision = app.details_lazy_visible_revision;
     app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
-    app.apply_grid_view_mode_runtime(crate::settings::GridViewMode::Details);
+    app.apply_grid_view_mode_runtime(
+        crate::settings::GridViewMode::Thumbnail,
+        crate::settings::GridViewMode::Details,
+    );
     assert!(cancel.load(Ordering::Relaxed));
     assert!(app.details_meta_pending.is_none());
     assert_ne!(revision, app.details_lazy_visible_revision);
@@ -112377,7 +112380,10 @@ fn media_duration_mode_switch_discards_queued_thumbnail_completion_and_plans_all
 
     let details_cancel = Arc::clone(&pending.cancel);
     app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
-    app.apply_grid_view_mode_runtime(crate::settings::GridViewMode::Thumbnail);
+    app.apply_grid_view_mode_runtime(
+        crate::settings::GridViewMode::Details,
+        crate::settings::GridViewMode::Thumbnail,
+    );
     assert!(details_cancel.load(Ordering::Relaxed));
     assert!(app.details_meta_pending.is_none());
     assert_eq!(app.details_image_dims_state, LazyColumnState::NotRequested);
@@ -112662,7 +112668,10 @@ fn selection_info_lazy_mode_switch_preserves_dedicated_duration_with_page_count_
         })
         .unwrap();
     app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
-    app.apply_grid_view_mode_runtime(crate::settings::GridViewMode::Details);
+    app.apply_grid_view_mode_runtime(
+        crate::settings::GridViewMode::Thumbnail,
+        crate::settings::GridViewMode::Details,
+    );
     assert!(cancel.load(Ordering::Relaxed));
     assert!(!app.selection_info_only_lazy_load());
     assert!(

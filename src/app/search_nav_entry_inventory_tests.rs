@@ -360,6 +360,8 @@ fn key_entry(action: KeyAction) -> Entry {
         | FsSpreadShiftRight
         | FsSpreadShiftPrev
         | FsSpreadShiftNext
+        | FsSpreadStepPrev
+        | FsSpreadStepNext
         | FsTogglePageAfterCoverAlone
         | FsToggleLastPageAlone
         | FsSlideshow

@@ -1,5 +1,10 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.796: `FsSpreadStepPrev` / `FsSpreadStepNext` は FsImage / Press、既定なし。
+`ImageSpreadStepPrev/Next` と双方向対応し、リング・ボタン・ジェスチャ・パッドは
+共通 handler を使う。既存見開き調整とは別操作で、読み順固定・保存/通知なし。
+ページ送りの per-frame coalescing と operation attribution は既存契約を保つ。
+
 §1.690: `GridSearchNameEverything` / `GridSearchNameMetadata` / `GridSearchNameLocal` は
 Grid / Press、既定キーなし。メイン窓の一覧のカーソル位置の名前を既存の検索欄へ入れ、
 フォーカス・全選択だけを要求する。検索は実行せず Enter で確定する。

@@ -797,6 +797,9 @@ impl App {
             logical_root.display()
         ));
         if let Ok(scope) = BookScopeKey::archive(logical_root, &[]) {
+            if self.retained_composed_projection().is_some() {
+                super::spread_shift_owner::retire_spread_step(&mut self.spread_step);
+            }
             let token = self
                 .book_composition_service
                 .as_ref()
@@ -1237,6 +1240,15 @@ impl App {
                 self.show_feedback_warning(
                     crate::book_composition::UNSUPPORTED_COMPOSITION_NOTICE.into(),
                 );
+                if matches!(
+                    &origin,
+                    ProjectionOrigin::Refresh {
+                        previous: Some(_),
+                        ..
+                    }
+                ) {
+                    super::spread_shift_owner::retire_spread_step(&mut self.spread_step);
+                }
                 // The existing source rows, selection and cache remain untouched.
                 self.book_composition = ViewerBookComposition::Accepted {
                     scope,
@@ -1287,6 +1299,7 @@ impl App {
             self.spread_shift.availability = self.pairing_edit_availability();
             return;
         }
+        super::spread_shift_owner::retire_spread_step(&mut self.spread_step);
         if reply.saved_trim.is_some() {
             self.record_current_container_content_identity(
                 crate::content_identity::ContentIdentityTrigger::Edit,
@@ -1841,3 +1854,6 @@ fn prepare_book_projection(
         saved_trim,
     })
 }
+#[cfg(test)]
+#[path = "spread_step_projection_tests.rs"]
+mod spread_step_projection_tests;

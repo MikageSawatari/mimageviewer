@@ -2798,7 +2798,24 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 `Video` / `Audio` はナビゲーション列に含まれる場合も必ず単独表示ユニットにし、静止画との混在でもペア化しない。
 
 組んだ `Vec<SpreadDisplayUnit>` は viewer context ごとの `SpreadDisplayUnitsCache` で再利用する。
-token は `items_generation`、`spread_mode`、`spread_shift_anchor_idx()`で得るlive解決済みanchor、`landscape_epoch` と、
+
+§1.796 の「見開きのまま 1 ページ戻る / 進む」は `spread_shift` と別の
+`spread_step: Option<SpreadStep { start_idx }>` を同じ viewer bundle に所有する。
+保存・通知・HUD は持たず、live shift の投影 `spread_shift_anchor_idx()` も変えない。
+builder の `exact_start` は item index を nav 位置へ変換し、存在するときは live shift より優先して
+その位置から組み直す。表紙の単独、本文区間に限る強制単独、横長/媒体/構成のペア可否は保つ。
+手前に余ったページは単独。通常送りもこの 1 本の列を使い、起点を維持する。
+
+token・逆引き・`FinalDemandTopologies::same_visible`・最終要求の入力照合と導出・
+回転 reload 中の再利用・静止画だけの slideshow nav にも同じ `exact_start` を渡す。
+その nav に起点がなければその導出だけ起点なしとし、読む側では状態を退役させない。
+退役は `retire_spread_step` に集約し、既存調整の受理済み設定/解除、両 items 世代 setter、
+編集単ページ化、構成の出どころの採用、close/fork、同世代の本設定/方向/連結/単独ページ/
+調整再採用と読む順の受理済み変更から呼ぶ。拒否・失敗・準備・権限確認・通常移動・cache 参照では呼ばない。
+mount/swap/park と F12 の同 context 表示先切替では保持し、新 context の fork では起点と派生 cache を持ち越さない。
+正本と受理点の一覧は [1 ページ送り設計 §3.2–3.5](one-page-step-plan.md)。
+
+token は `items_generation`、`spread_mode`、`spread_shift_anchor_idx()`で得るlive解決済みanchor、`exact_start`、`landscape_epoch` と、
 **nav index 列そのもの**である。nav の完全一致を使うため、同じ items 世代でも絞り込み・並べ替え・
 ページ読みと連結読みの列切替を混同しない。
 

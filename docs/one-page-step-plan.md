@@ -1,11 +1,11 @@
 # 見開きのまま 1 ページ単位で送る (§1.796) 設計 r5
 
-状態: 設計確定 (2026-11-16、独立設計レビュー 4 回目 ACCEPT)。実装前。r1 は独立設計レビュー (Sol xhigh) で REVISE (P1 2 件・P2 3 件)。r2 はその指摘を反映し、
+状態: 設計確定 (2026-11-16、独立設計レビュー 4 回目 ACCEPT)。実装と focused 自動検証完了（2026-11-17、以下 §8）。独立実装レビュー・designer の全件 gate・実機確認は未実施。r1 は独立設計レビュー (Sol xhigh) で REVISE (P1 2 件・P2 3 件)。r2 はその指摘を反映し、
 Q1 の推奨を見直した。r3 は 2 回目のレビュー (REVISE、P2 3 件) を反映し、退役を受理済みの切替からの 1 関数に、
 見開き以外の解決を普段の次 / 前に揃えた。r4 は 3 回目のレビュー (ACCEPT with changes) の条件 (退役を呼ぶ受理点の追加・テスト節の訂正) を反映した。
 r5 は利用者の回答 (2026-11-16: Q1 = A、Q2・Q4 = 推奨どおり、Q3 = 構成ありの本も対象・コレクションの最上位は対象外) を反映した (§2・§3.5)。
 出典: `docs/next-release-backlog.md` §1.796 (5ch >>788・>>791・>>796、方針は 2026-11-16 決定)。
-コードの参照は master `e3de9b547` 時点のコード読み。実行時の観測は無い。
+§1–7 のコード参照は設計時の master `e3de9b547`。実機での観測は無い。実装後の自動検証は §8。
 
 ## 1. 決まっていること (バックログ §1.796)
 
@@ -224,3 +224,189 @@ spread_step: Option<SpreadStep {
 
 - 既存の「1 ページずらし」もコレクションの最上位では `Target` がコレクション専用の送りに乗り換わるため、
   ずらした意味どおりに着地しない可能性がある (r1 レビュー P1 と同じ経路)。実機での観測は無い。
+
+## 8. 実装・検証記録（2026-11-17）
+
+### 所有・読み手
+
+- `ViewerContextBundle` と App に `spread_step` を追加。empty・destructuring・swap・park/mount は同じ owner に保持する。
+  fork 先では退役し、元 context は保持する。一時起点がある fork の複製表示単位 cache は空にする。F12 の同 context 切替は保持する。
+  保存対象には追加していない。detached 固有の guard/predicate/viewport 分岐は追加せず、§11 に構造変更を記録した。
+- `build_spread_display_units_with_overrides` と `build_display_unit_topology` は live shift と別の `exact_start` を受ける。
+  nav にあれば優先し、表紙単独と強制単独の本文境界、構成上書きの既存ペア判定を保つ。nav に無ければその導出だけ起点なしにする。
+- 表示 cache の get/install/token、逆引き index、`FinalDemandTopologies::same_visible`、
+  `final_demand_visible_inputs_are_current` と snapshot の入力照合、`derive_final_demand_topology`、
+  回転 reload 再利用、静止画 slideshow nav、facet 外の単独ページ、構成作成時の現行列取得へ同じ起点を渡す。
+  Remote の独立した列と PC viewer-local 状態を持たない既存 pure helper は `None` を渡す。
+- step resolver は現行 unit の `nav_start` から ±1 を解決する。非見開き/連結の通常送り代替、mounted collection Root の拒否、
+  step 専用の構成受付、抽出表示面の no-op の順を維持する。`admit_pairing_action` の条件・既存調整の受付は変更しない。
+- 即時着地は `stage1_spread_step` で curl を除外する。barrier 中は `ResolvedNavigationIntent::SpreadStep { anchor, topology }` を
+  既存の 1 件予算へ積み、enqueue では起点を変更しない。従来の binding/generation/index 検査に加え topology Arc 一致で一度だけ適用する。
+- `FsSpreadStepPrev/Next` と `ImageSpreadStepPrev/Next` は既定割当なし。キーの frame coalescing と操作 ID を維持し、
+  ring/マウスボタン/ジェスチャ/ゲームパッドは同じ image action dispatcher から step handler を使う。
+
+| 読み手 | `exact_start` の渡し方 |
+| --- | --- |
+| 通常の unit builder / cache | `spread_step_start_idx()` を builder と get/install の別引数にし、token へ記録 |
+| unit 逆引き | cache install が exact 適用済みの同じ units から位置 index を作る |
+| `FinalDemandTopologies::same_visible` | 保存した visible token と現 token の exact 値も比較 |
+| 最終要求の入力照合 / snapshot 読み出し | token の exact と現在の getter を比較し、古い証明を使わない |
+| `derive_final_demand_topology` | 保存した visible token の exact を通常/静止画の各 nav の builder へ渡す |
+| 回転 reload 再利用 | getter を再利用判定の別引数に渡し、token の exact と一致を確認 |
+| 静止画だけの slideshow | 同じ builder / final-demand 導出を使い、起点が nav に無い場合だけその導出で無視。状態は保持 |
+| facet 外の単独ページ / 構成作成時の現行列 / uncached test helper | 同じ getter を overrides builder へ渡す |
+| 既存 nudge | step があれば現行の有効列を参照し、無ければ従来の計算を保持。受理済み live setter で退役 |
+| Remote / PC viewer-local 状態を持たない pure helper | `None` を渡す |
+
+### 実際の退役点
+
+free function `retire_spread_step` の実呼び出しは次の表。
+Details の比較 helper は同じ順序なら呼ばず、`rebuild_details_order` の各成功出口と grid view runtime の採用後から使う。
+PDF の文書方向の採用も `apply_spread_for_key_with_document_direction` を通る。
+
+| ファイル:行 | 受理点 |
+| --- | --- |
+| `src/app/spread_shift_owner.rs:433` | `adopt_imported_shift_read` |
+| `src/app/spread_shift_owner.rs:666` | `poll_book_shift_restore` |
+| `src/app/spread_shift_owner.rs:849` | `set_live_spread_shift` |
+| `src/app/spread_shift_owner.rs:893` | `reset_live_spread_shift` |
+| `src/app.rs:13296` | `enter_page_edit_single_view` |
+| `src/app.rs:29574` | `apply_spread_for_key_with_document_direction` |
+| `src/app.rs:29591` | `apply_spread_for_key_with_document_direction` |
+| `src/app.rs:45660` | `set_items_generation` |
+| `src/app.rs:50785` | `apply_current_metadata_import_terminal_result` |
+| `src/app.rs:76654` | `retire_spread_step_after_reader_order_adoption` |
+| `src/app.rs:83022` | `close_fullscreen_now_for_destination` |
+| `src/app/viewer_context_registry.rs:3078` | `set_items_generation` |
+| `src/app/viewer_context_registry.rs:4654` | `split_current_context_preserving_main_grid` |
+| `src/app/viewer_context_registry.rs:5623` | `invalidate_page_alone_in_parked_contexts` |
+| `src/app/book_composition_runtime.rs:801` | `accept_unsupported_archive_composition` |
+| `src/app/book_composition_runtime.rs:1250` | `adopt_book_projection` |
+| `src/app/book_composition_runtime.rs:1302` | `adopt_book_projection` |
+| `src/ui_fullscreen.rs:45757` | `set_page_alone_preferences_for_fullscreen` |
+| `src/ui_fullscreen.rs:46380` | `apply_fullscreen_view_mode` |
+| `src/ui_fullscreen.rs:46422` | `set_reading_flow_for_fullscreen` |
+| `src/ui_dialogs/preferences.rs:3074` | `apply_preferences_dialog` |
+
+Details の順序比較 helper を呼ぶ採用点:
+
+| ファイル:行 | 採用点 |
+| --- | --- |
+| `src/app.rs:76407` | `apply_grid_view_mode_runtime` |
+| `src/app.rs:76625` | `rebuild_details_order` |
+| `src/app.rs:76634` | `rebuild_details_order` |
+| `src/app.rs:76645` | `rebuild_details_order` |
+
+追加で確認した受理点は、(1) 詳細表示↔サムネイルの切替（お気に入り設定の採用経路も含む）で実際の読む順が変わる場合、
+(2) 同世代の構成 refresh が Composed から Unsupported を採用して組の出どころを切り替える場合。
+後者は projection の採用と書庫の Unsupported 採用 helper の両入口を接続した。
+通常送り、同じ本のシーク/開き直し、同順序の Details 再構築、準備/確認待ち/拒否/失敗、cache 参照からは退役しない。
+
+### Tests first と検証結果
+
+- 新規テストを先に追加し、未実装 API の 107 コンパイルエラーを確認した（`target/step-red-api.log`）。
+- 最小 no-op API のみを追加してから実行し、40 件中 36 失敗・4 成功を確認した（`target/step-red-behavior.log`）。
+  4 成功は端の no-op・入力候補の metadata・fork・F12 の保持で、機能実装前でも満たせる部分。
+- 初回 test discovery の `0xc0000135` は新 worktree の FFmpeg DLL 不在。指示どおり vendor の 6 DLL を `target/debug/deps` へコピーした。
+  turbojpeg の初回 CMake 構築は single-job で成功し、以後の heavy job も共有 runner 下で `CARGO_BUILD_JOBS=1` とした。
+- 実装後の新規 40 件はすべて成功。途中の 38 成功・2 失敗は、演出 OFF の fixture と保存先に一致しない構成 token を訂正して解消した。
+  関連 focused は新規を含む 742 件すべて成功（4 slow、166.762 秒）。既定 keymap は専用テストの
+  `UPDATE_KEYMAP_DEFAULT=1` で再生成し、通常の一致検査も成功した（`target/step-validation-3.log`）。
+- 最初の context 監査は A3 2 件・A4 2 件を検出した。bundle 生成を含む 2 テストを registry 本体の test module へ移し、
+  r5 が承認したフィールド分だけ exact fingerprint を更新した。監査ルール・例外は追加していない。
+  監査ツール focused 9 件と実際の `cargo run --locked -p viewer_context_audit` が成功した。
+- その後、新 handler の構成受付を通常の移動待ち guard より先へ揃え、移動待ち中の拒否も補強した。
+  最新ソースで新規 40 件すべてを再確認した（17.292 秒、`target/step-validation-4.log`）。
+  既存経路の 742 件の成功結果を引き継ぎ、最終 follow-up はこの受付順・監査・テスト配置の影響範囲を確認した。
+- `cargo fmt`（引数なし）、`cargo fmt --check`、`python scripts/check_ui_glyphs.py`（危険な文字 0）、`git diff --check` は成功した。
+  確認用 `build-dev.ps1 -PreserveRuntime` も成功した（共有 runner 記録 `exit=0`）。
+  `target/dev-runtime` に normal feature set の core・remote service・EPUB worker・MCP adapter・music-video editor と DLL を配置済み。
+  ログは `target/step-validation-4.log`。core の初回 cold build は 28 分 01 秒で、成果物は起動していない。
+  外側の PowerShell stderr 捕捉は cargo の出力を `NativeCommandError` にして tool 終了値 1 を返すが、
+  内側 runner は `exit=0`、全 Cargo stage は成功、`[build-dev] DONE` と 5 exe の存在・更新時刻を確認した。
+  exit 0 の stderr 出力だけでも同じ外側終了値になることを `target/stderr-capture-probe.log` で確認した。
+- full lib/test-full は担当範囲外として実行していない。製品バイナリの起動・コミットはしていない。
+
+新規 40 件の名前と最小 API 時点→実装後の結果:
+最小 API の列は最初の実行時点の結果。実装途中で演出有効化と構成 token の fixture を訂正し、
+末尾ペアの境界、live shift と異なる exact 起点、書庫の Unsupported 別入口、移動待ち中の受付順を同じテスト内へ補強した。
+
+| テスト | 最小 API | 実装後 |
+| --- | --- | --- |
+| [`spread_step_persists_through_ordinary_navigation_and_repeated_steps`](../src/ui_fullscreen/spread_step_tests.rs#L37) | 失敗 | 成功 |
+| [`spread_step_ends_do_not_wrap_or_change_state`](../src/ui_fullscreen/spread_step_tests.rs#L63) | 成功 | 成功 |
+| [`spread_step_uses_nav_positions_and_effective_unit_start`](../src/ui_fullscreen/spread_step_tests.rs#L81) | 失敗 | 成功 |
+| [`spread_step_exact_start_preserves_cover_and_forced_body_boundaries`](../src/ui_fullscreen/spread_step_tests.rs#L95) | 失敗 | 成功 |
+| [`spread_step_landscape_and_media_boundaries_keep_singletons`](../src/ui_fullscreen/spread_step_tests.rs#L116) | 失敗 | 成功 |
+| [`spread_step_does_not_write_live_shift_or_notify_with_memory_on`](../src/ui_fullscreen/spread_step_tests.rs#L128) | 失敗 | 成功 |
+| [`spread_step_nonspread_and_continuous_use_ordinary_page_resolution`](../src/ui_fullscreen/spread_step_tests.rs#L150) | 失敗 | 成功 |
+| [`spread_step_refused_sources_leave_state_and_topology_unchanged`](../src/ui_fullscreen/spread_step_tests.rs#L177) | 失敗 | 成功 |
+| [`spread_step_retirement_mode_flow_direction_and_shift_roundtrips`](../src/ui_fullscreen/spread_step_tests.rs#L233) | 失敗 | 成功 |
+| [`spread_step_rotation_reuse_and_final_demand_validate_exact_start`](../src/ui_fullscreen/spread_step_tests.rs#L273) | 失敗 | 成功 |
+| [`spread_step_still_only_nav_does_not_retire_missing_media_start`](../src/ui_fullscreen/spread_step_tests.rs#L309) | 失敗 | 成功 |
+| [`spread_step_keymap_no_defaults_and_coalescing_inventory`](../src/ui_fullscreen/spread_step_tests.rs#L327) | 失敗 | 成功 |
+| [`spread_step_composed_directives_direction_cover_and_final_companions`](../src/ui_fullscreen/spread_step_tests.rs#L336) | 失敗 | 成功 |
+| [`spread_step_composed_permission_wait_keeps_origin_and_edit_retires`](../src/ui_fullscreen/spread_step_tests.rs#L390) | 失敗 | 成功 |
+| [`spread_step_composed_mode_only_and_flow_roundtrips_retire`](../src/ui_fullscreen/spread_step_tests.rs#L468) | 失敗 | 成功 |
+| [`spread_step_page_alone_accepted_change_retires_but_failed_change_keeps`](../src/ui_fullscreen/spread_step_tests.rs#L506) | 失敗 | 成功 |
+| [`spread_step_details_reorder_retires_only_when_reader_order_changes`](../src/ui_fullscreen/spread_step_tests.rs#L528) | 失敗 | 成功 |
+| [`spread_step_details_view_exit_retires_only_when_reader_order_changes`](../src/ui_fullscreen/spread_step_tests.rs#L543) | 失敗 | 成功 |
+| [`spread_step_real_key_handler_uses_reading_order_and_coalesces_a_frame`](../src/ui_fullscreen/spread_step_tests.rs#L557) | 失敗 | 成功 |
+| [`spread_step_same_book_seek_and_reopen_keep_the_origin`](../src/ui_fullscreen/spread_step_tests.rs#L593) | 失敗 | 成功 |
+| [`spread_step_slideshow_final_demand_derives_still_units_without_replacing_visible_proof`](../src/ui_fullscreen/spread_step_tests.rs#L618) | 失敗 | 成功 |
+| [`spread_step_context_materialized_fork_omits_step_and_effective_projection`](../src/app/spread_step_context_tests.rs#L20) | 成功 | 成功 |
+| [`spread_step_context_parked_page_alone_change_retires_only_inheriting_context`](../src/app/spread_step_context_tests.rs#L44) | 失敗 | 成功 |
+| [`spread_step_context_collection_root_refused_but_opened_book_accepted_on_both_surfaces`](../src/app/spread_step_context_tests.rs#L69) | 失敗 | 成功 |
+| [`spread_step_context_edit_and_close_retire_without_touching_sibling`](../src/app/spread_step_context_tests.rs#L120) | 失敗 | 成功 |
+| [`spread_step_context_same_generation_book_and_pdf_rule_adoption_retires_after_success`](../src/app/spread_step_context_tests.rs#L144) | 失敗 | 成功 |
+| [`spread_step_context_f12_real_presentation_switch_keeps_origin`](../src/app/spread_step_context_tests.rs#L173) | 成功 | 成功 |
+| [`spread_step_context_imported_container_rules_retire_after_current_generation_adoption_only`](../src/app/spread_step_context_tests.rs#L192) | 失敗 | 成功 |
+| [`spread_step_context_swap_park_mount_sibling_and_presentation_ownership`](../src/app/viewer_context_registry.rs#L6380) | 失敗 | 成功 |
+| [`spread_step_context_both_generation_setters_retire_only_changed_owner`](../src/app/viewer_context_registry.rs#L6413) | 失敗 | 成功 |
+| [`spread_step_ring_ids_roundtrip_and_assignable_only_to_images`](../src/app/spread_step_input_tests.rs#L5) | 成功 | 成功 |
+| [`spread_step_ring_and_assigned_mouse_use_the_same_execution`](../src/app/spread_step_input_tests.rs#L32) | 失敗 | 成功 |
+| [`spread_step_projection_automatic_reacceptance_keeps_but_source_replacement_retires`](../src/app/spread_step_projection_tests.rs#L70) | 失敗 | 成功 |
+| [`spread_step_projection_source_change_during_real_permission_wait_cannot_revive_step`](../src/app/spread_step_projection_tests.rs#L127) | 失敗 | 成功 |
+| [`spread_step_memory_on_never_admits_a_shift_write_or_toast`](../src/app/spread_shift_composition_tests.rs#L11) | 失敗 | 成功 |
+| [`spread_step_retained_and_import_adoption_retire_after_success_only`](../src/app/spread_shift_composition_tests.rs#L37) | 失敗 | 成功 |
+| [`spread_step_global_page_alone_apply_retires_mounted_and_inheriting_parked_only`](../src/ui_dialogs/preferences/spread_step_tests.rs#L27) | 失敗 | 成功 |
+| [`spread_step_key_rows_map_both_directions_to_image_assignments`](../src/ui_dialogs/preferences/pages.rs#L13239) | 失敗 | 成功 |
+| [`spread_step_barrier_defers_without_mutation_and_commits_once`](../src/ui_fullscreen/page_turn/layout_epoch_tests.rs#L882) | 失敗 | 成功 |
+| [`spread_step_immediate_landing_has_its_own_curl_exclusion`](../src/ui_fullscreen/page_turn/layout_epoch_tests.rs#L916) | 失敗 | 成功 |
+
+### 変更ファイル
+
+- `docs/README.md`
+- `docs/detached-rework-plan.md`
+- `docs/display-pipeline.md`
+- `docs/key-customization-impl-plan.md`
+- `docs/keymap-spec.md`
+- `docs/keymap.ini.default`
+- `docs/one-page-step-plan.md`
+- `docs/ring-keyaction-parity.md`
+- `htdocs/mimageviewer/manual/fullscreen.html`
+- `htdocs/mimageviewer/manual/shortcuts.html`
+- `src/app.rs`
+- `src/app/book_composition_runtime.rs`
+- `src/app/gamepad_input.rs`
+- `src/app/search_nav_entry_inventory_tests.rs`
+- `src/app/spread_shift_composition_tests.rs`
+- `src/app/spread_shift_owner.rs`
+- `src/app/spread_step_context_tests.rs`
+- `src/app/spread_step_input_tests.rs`
+- `src/app/spread_step_projection_tests.rs`
+- `src/app/tests.rs`
+- `src/app/viewer_context_registry.rs`
+- `src/keymap.rs`
+- `src/ring_shortcut.rs`
+- `src/ui_dialogs/preferences.rs`
+- `src/ui_dialogs/preferences/pages.rs`
+- `src/ui_dialogs/preferences/spread_step_tests.rs`
+- `src/ui_fullscreen.rs`
+- `src/ui_fullscreen/book_composition_tests.rs`
+- `src/ui_fullscreen/next_final_demand_tests.rs`
+- `src/ui_fullscreen/page_turn/barrier.rs`
+- `src/ui_fullscreen/page_turn/layout_epoch_tests.rs`
+- `src/ui_fullscreen/spread_step.rs`
+- `src/ui_fullscreen/spread_step_tests.rs`
+- `tools/viewer_context_audit/src/lib.rs`

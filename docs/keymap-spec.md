@@ -140,6 +140,23 @@ Ctrl／sibling navigation → Confirm → その他の一覧操作／固定 curs
 toggle を Enter に割り当てると Confirm との競合を表示し、実行時は toggle だけで一回取消す。
 潜在的な競合は一時的な modal／nav lock によって消さず、一覧の全許可集合で検査する。
 
+## 見開きのまま 1 ページ送り（§1.796）
+
+| Action | Context | Trigger | 既定 |
+| --- | --- | --- | --- |
+| `FsSpreadStepPrev` | FsImage | Press | なし |
+| `FsSpreadStepNext` | FsImage | Press | なし |
+
+「見開きのまま 1 ページ戻る / 進む」は読み順固定。ページ単位の見開きでは表示単位の
+先頭を nav 上で 1 つ移し、その起点で以降の組を作る。端では巡回せず何もしない。
+単ページ・横長分割・連結読みでは `FsPagePrev/Next` と同じ解決を使う。
+構成ありの本も対象とし、単独指定・白紙対向・表紙の境界を保つ。コレクション最上位は対象外。
+既存の見開き調整と保存値は変更せず、通知・HUD は出さない。既定割当なしで
+リング・マウスボタン・ジェスチャ・ゲームパッドの候補にも追加する。
+通常送りでも起点を保ち、組の意味の受理済み変更と本の切替・編集への単ページ化・閉じる操作で退役する。
+押下は既存の frame 単位 coalescing と operation attribution を使う。着地の演出は行わず、
+演出中は解決済みの意図を既存の 1 件予算で持ち越す。正本は [設計 §3–5](one-page-step-plan.md)。
+
 ## 手動の前後移動ループ（§1.400）
 
 `fullscreen_manual_nav_wrap`（既定OFF）がONなら、既存の手動前後移動Actionは現在の閲覧順・

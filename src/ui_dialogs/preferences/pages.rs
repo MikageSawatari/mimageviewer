@@ -2929,6 +2929,8 @@ fn ring_bindings_for_key_action(action: KeyAction) -> Vec<(RingShortcutContext, 
         KeyAction::FsSpreadShiftRight => RingActionId::ImageSpreadShiftRight,
         KeyAction::FsSpreadShiftPrev => RingActionId::ImageSpreadShiftPrev,
         KeyAction::FsSpreadShiftNext => RingActionId::ImageSpreadShiftNext,
+        KeyAction::FsSpreadStepPrev => RingActionId::ImageSpreadStepPrev,
+        KeyAction::FsSpreadStepNext => RingActionId::ImageSpreadStepNext,
         KeyAction::FsRotateCw => RingActionId::ImageRotateRight,
         KeyAction::FsRotateCcw => RingActionId::ImageRotateLeft,
         KeyAction::FsCapture => RingActionId::ImageCapture,
@@ -13226,6 +13228,41 @@ mod tests {
                 matches!(row.get(1), Some(KeyboardPickerCell::Key(key, _)) if *key == first_key),
                 "{label} row should place {first_key:?} directly after the indent"
             );
+        }
+    }
+}
+#[cfg(test)]
+mod spread_step_assignment_tests {
+    use super::*;
+
+    #[test]
+    fn spread_step_key_rows_map_both_directions_to_image_assignments() {
+        for (key, ring) in [
+            (
+                KeyAction::FsSpreadStepPrev,
+                RingActionId::ImageSpreadStepPrev,
+            ),
+            (
+                KeyAction::FsSpreadStepNext,
+                RingActionId::ImageSpreadStepNext,
+            ),
+        ] {
+            assert_eq!(
+                ring_bindings_for_key_action(key),
+                vec![(RingShortcutContext::ImageFullscreen, ring.clone())]
+            );
+            assert!(ring_action_has_key_action(
+                RingShortcutContext::ImageFullscreen,
+                &ring
+            ));
+            assert!(!ring_action_has_key_action(
+                RingShortcutContext::Grid,
+                &ring
+            ));
+            assert!(!ring_action_has_key_action(
+                RingShortcutContext::VideoFullscreen,
+                &ring
+            ));
         }
     }
 }
