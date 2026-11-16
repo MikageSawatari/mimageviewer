@@ -759,6 +759,7 @@ fn real_model_serve_matches_v1_0_on_all_26_images_when_configured() {
     let [Some(model), Some(mmproj), Some(images)] = configured else {
         return;
     };
+    crate::test_gpu_group::assert_gpu_test_group();
     let executable = std::env::var_os("MIV_VLM_WORKER")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

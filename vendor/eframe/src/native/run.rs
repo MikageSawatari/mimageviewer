@@ -832,6 +832,7 @@ mod tests {
         }
 
         fn run_child() {
+            crate::test_gpu_group::assert_gpu_test_group();
             let title = std::env::var(TITLE_ENV).expect("child title");
             let native_options = crate::NativeOptions {
                 renderer: crate::Renderer::Wgpu,
@@ -881,6 +882,7 @@ mod tests {
         #[test]
         #[ignore = "live Windows test: opens a real window; use scripts/test-live-windows.ps1 after explicit approval"]
         fn synchronous_damage_returns_before_outer_paint_gate() {
+            crate::test_gpu_group::assert_gpu_test_group();
             if std::env::var(CHILD_ROLE_ENV).as_deref() == Ok("1") {
                 run_child();
                 return;

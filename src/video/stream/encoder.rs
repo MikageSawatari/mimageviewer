@@ -760,6 +760,7 @@ mod tests {
     #[test]
     #[ignore = "requires local FFmpeg DLLs and encoder hardware"]
     fn probe_local_h264_encoder_open_results() {
+        crate::test_gpu_group::assert_gpu_test_group();
         ffmpeg::init().expect("FFmpeg init");
         let output = QualityPreset::Standard
             .output_parameters(1_280, 720)

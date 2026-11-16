@@ -3226,6 +3226,7 @@ mod viewport_retirement_tests {
 
     #[test]
     fn retirement_texture_delivery_wgpu_startup_before_full_and_free_only() {
+        crate::test_gpu_group::assert_gpu_test_group();
         use super::super::viewport_lifecycle::{
             ChildCloseBackend, append_texture_delta, finish_retirement_texture_delta,
         };

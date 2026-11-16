@@ -51,6 +51,9 @@ mod run_native_failure;
 mod ui_previous_run_notice;
 pub use run_native_failure::PreparedRunExit;
 #[cfg(test)]
+#[path = "../tests/support/gpu_test_group.rs"]
+pub(crate) mod test_gpu_group;
+#[cfg(test)]
 mod test_native_focus;
 #[cfg(test)]
 #[path = "../tests/support/ui_harness.rs"]

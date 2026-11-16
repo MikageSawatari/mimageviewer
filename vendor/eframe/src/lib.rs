@@ -163,6 +163,10 @@ pub use {egui_wgpu, egui_wgpu::SurfaceConfig, egui_wgpu::WgpuConfiguration, egui
 
 mod epi;
 
+#[cfg(test)]
+#[path = "../../../tests/support/gpu_test_group.rs"]
+mod test_gpu_group;
+
 // Re-export everything in `epi` so `eframe` users don't have to care about what `epi` is:
 pub use epi::*;
 

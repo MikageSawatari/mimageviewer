@@ -4652,6 +4652,7 @@ mod tests {
 
     #[test]
     fn finite_fixture_flushes_final_fragment_and_endlist() {
+        crate::test_gpu_group::assert_gpu_test_group();
         let temp = tempfile::tempdir().unwrap();
         let generated_path = temp.path().join("finite-av.avi");
         let external_path = std::env::var_os("MIV_CLOCKLESS_EOF_FIXTURE").map(PathBuf::from);
@@ -4722,6 +4723,7 @@ mod tests {
 
     #[test]
     fn finite_source_reaches_end_after_filling_the_live_window_without_a_next_fetch() {
+        crate::test_gpu_group::assert_gpu_test_group();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("full-window-finite-av.avi");
         // 2 fps for 4.5 seconds: two complete 2-second fragments plus a finite tail. With a

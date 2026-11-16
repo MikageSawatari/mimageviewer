@@ -2064,6 +2064,7 @@ fn run_stage3_harness() -> Result<(), HarnessFailure> {
 #[test]
 #[ignore = "Stage 3 hardware/driver gate; run explicitly with --ignored --exact --nocapture"]
 fn cross_thread_dcomp_present_remains_pump_independent_when_render_stalls() {
+    crate::test_gpu_group::assert_gpu_test_group();
     let result = if std::env::var(CHILD_ENV).as_deref() == Ok(CHILD_ENV_VALUE) {
         run_stage3_harness()
     } else {
