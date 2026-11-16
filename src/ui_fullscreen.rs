@@ -21,7 +21,7 @@
 pub(crate) mod canonical_demand;
 mod compare_original;
 mod initial_placement;
-pub(crate) use initial_placement::FsInitialPlacementRequest;
+pub(crate) use initial_placement::{FsAutomaticInitialView, FsInitialPlacementRequest};
 #[cfg(test)]
 mod continuous_quality_tests;
 #[cfg(all(test, windows))]
@@ -8396,17 +8396,6 @@ fn fullscreen_click_nav_base_delta(pos_x: f32, center_x: f32, rtl: bool) -> i32 
 
 fn should_zoom_fullscreen_wheel(ctrl_held: bool, overlay_edit_mode: bool) -> bool {
     ctrl_held || overlay_edit_mode
-}
-
-/// Whether a click on the canvas belongs to the view rather than to turning the page.
-///
-/// **Pan is deliberately not part of this.** A page that fits the window can be dragged too, so
-/// counting pan here would mean that nudging the image even slightly stops clicks from turning
-/// pages - with the way back (double-click to reset) unmarked, which is a worse dead end than the
-/// one that made panning always available in the first place. A drag is kept from being read as a
-/// click at the call site.
-fn fullscreen_click_belongs_to_view(zoom: f32, free_rotation: f32) -> bool {
-    zoom > ZOOM_NEAR_ONE || free_rotation.abs() > TRANSFORM_EPSILON
 }
 
 fn should_suppress_egui_wheel_for_native_detached_video(
@@ -21668,8 +21657,10 @@ impl App {
 
     /// 表示中のページと分割モードから、左右の記憶を辻褄の合う値へ寄せる。
     ///
-    /// ページを開く入口 (一覧・しおり・検索・シークバー・履歴・Ctrl+↑↓) は多く、その
-    /// すべてに「左右を戻す」を足すと必ずどれか漏れる。**表示側で 1 か所そろえる。**
+    /// ページを開く入口 (一覧・しおり・検索・シークバー・履歴・Ctrl+↑↓) は多いので、
+    /// 新規入場・別ページの slice は共通 open の受理境界で `Full` に戻す。
+    /// ここでは寸法と分割方向を **表示側で 1 か所そろえる。** 明示 slice と、
+    /// 同一ページの refresh・方向切替で見ている半分は保つ。
     /// 分割していないページや分割 OFF では `Full` に戻すので、記憶が居残らない。
     fn reconcile_fullscreen_page_slice(&mut self, fs_idx: usize) {
         let Some(direction) = self.split_direction_now() else {
@@ -22312,7 +22303,10 @@ impl App {
         self.fullscreen_navigator_interaction.invalidate();
     }
 
-    fn set_fullscreen_page_slice_for_display_unit(&mut self, slice: crate::page_split::PageSlice) {
+    pub(crate) fn set_fullscreen_page_slice_for_display_unit(
+        &mut self,
+        slice: crate::page_split::PageSlice,
+    ) {
         if self.fullscreen_page_slice == slice {
             return;
         }
@@ -41506,6 +41500,7 @@ impl App {
             FsCanvasClickAction::None | FsCanvasClickAction::DepthFocusAt(_) => {}
             FsCanvasClickAction::ResetTransform => {
                 self.clear_fs_initial_placement_request();
+                self.fs_automatic_initial_view = None;
                 self.fs_zoom = 1.0;
                 self.fs_pan = egui::Vec2::ZERO;
                 self.fs_free_rotation = 0.0;
@@ -41642,10 +41637,32 @@ impl App {
         let has_transform = zoom_differs_from_fit(zoom)
             || rotation.abs() > TRANSFORM_EPSILON
             || pan.length_sq() > PAN_EPSILON_SQ;
-        if self.fs_front_pointer.backing_double_clicked(response) && has_transform {
+        // Dedicated media, continuous, zoom-mode and editing surfaces retain
+        // their released click/reset policy.
+        let ordinary_still = !is_video
+            && !continuous_active
+            && self.reading_flow.is_paged()
+            && self.fs_zoom_owner() == FsZoomOwner::Image
+            && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
+            && !self.view_trim_mode
+            && self
+                .fullscreen_idx
+                .and_then(|idx| self.items.get(idx))
+                .is_some_and(GridItem::has_page_data);
+        let belongs_to_view = if ordinary_still {
+            self.fs_view_has_moved(zoom, pan, rotation)
+        } else {
+            zoom > ZOOM_NEAR_ONE || rotation.abs() > TRANSFORM_EPSILON
+        };
+        let can_reset = if ordinary_still {
+            belongs_to_view
+        } else {
+            has_transform
+        };
+        if self.fs_front_pointer.backing_double_clicked(response) && can_reset {
             return FsCanvasClickAction::ResetTransform;
         }
-        if fullscreen_click_belongs_to_view(zoom, rotation)
+        if belongs_to_view
             || self.fs_context_menu_idx.is_some()
             || (response.dragged() && response.drag_delta().length() > 3.0)
             || !response.clicked()
@@ -45652,6 +45669,7 @@ impl App {
 
     pub(crate) fn reset_continuous_reading_transform(&mut self) {
         self.clear_fs_initial_placement_request();
+        self.fs_automatic_initial_view = None;
         self.spread_display_units_cache
             .retire_continuous_admission();
         self.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Legacy;
@@ -45680,6 +45698,7 @@ impl App {
 
     fn reset_fullscreen_fit_transform(&mut self, fs_idx: usize) {
         self.clear_fs_initial_placement_request();
+        self.fs_automatic_initial_view = None;
         self.fs_continuous_fit_reference = ContinuousSpecifiedFitReference::Legacy;
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
@@ -67610,29 +67629,19 @@ mod tests {
         );
     }
 
-    /// Dragging a page that fits the window must not cost the reader their click-to-turn.
-    ///
-    /// Panning used to be limited to views that overflow. Reported 2026-08-15: on a page that
-    /// fits, dragging did nothing and read as a hang. Now every page can be dragged - which means
-    /// the pan is no longer evidence that the reader wants clicks to stop turning pages.
+    /// The 2026-11-15 decision gives moved views their clicks until reset.
     #[test]
-    fn a_dragged_page_still_turns_on_click_but_a_zoomed_one_does_not() {
-        // Fit or shrunk, wherever it has been dragged to: clicks still turn pages.
-        assert!(!fullscreen_click_belongs_to_view(1.0, 0.0));
-        assert!(!fullscreen_click_belongs_to_view(0.4, 0.0));
-
-        // Zoomed in or rotated: the click is for the view, as before.
-        assert!(fullscreen_click_belongs_to_view(2.5, 0.0));
-        assert!(fullscreen_click_belongs_to_view(1.0, 0.35));
-
-        // The reset offered on double-click is the wider condition, so a page dragged off centre
-        // can still be recentred even though its clicks kept turning pages.
-        let panned = egui::vec2(120.0, -40.0);
-        assert!(panned.length_sq() > PAN_EPSILON_SQ);
+    fn a_dragged_or_zoomed_page_claims_canvas_clicks() {
+        let app = crate::app::setup_app_for_test();
+        assert!(!app.fs_view_has_moved(1.0, egui::Vec2::ZERO, 0.0));
+        assert!(app.fs_view_has_moved(1.0, egui::vec2(120.0, -40.0), 0.0));
+        assert!(app.fs_view_has_moved(0.4, egui::Vec2::ZERO, 0.0));
+        assert!(app.fs_view_has_moved(2.5, egui::Vec2::ZERO, 0.0));
+        assert!(app.fs_view_has_moved(1.0, egui::Vec2::ZERO, 0.35));
     }
 
     #[test]
-    fn canvas_double_click_resets_shrunk_zoom_without_changing_single_click_ownership() {
+    fn canvas_double_click_resets_moved_zoom_and_suppresses_single_click() {
         for zoom in [
             0.8,
             1.25,
@@ -67644,6 +67653,8 @@ mod tests {
         ] {
             let ctx = egui::Context::default();
             let mut app = crate::app::setup_app_for_test();
+            app.items = vec![GridItem::Image(PathBuf::from("c:/canvas/zoom.png"))];
+            app.fullscreen_idx = Some(0);
             app.fs_zoom = zoom;
             app.fs_pan = egui::Vec2::ZERO;
             app.fs_free_rotation = 0.0;
@@ -67693,7 +67704,7 @@ mod tests {
                         );
                         if frame == 2 {
                             assert!(response.clicked(), "zoom={zoom}");
-                            if zoom > ZOOM_NEAR_ONE {
+                            if zoom_differs_from_fit(zoom) {
                                 assert!(matches!(action, FsCanvasClickAction::None));
                             } else {
                                 assert!(

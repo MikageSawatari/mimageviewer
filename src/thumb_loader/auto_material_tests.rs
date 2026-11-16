@@ -12,6 +12,95 @@ fn auto_material_sample() -> crate::cover_auto_material::AutoMaterial {
     )
 }
 
+#[test]
+fn cover_rotation_k2_keeps_parent_until_normal_reread_and_child_save() {
+    use std::io::Write;
+    use crate::cover_rotation_cache::{BookCoverId, CatalogScope, InvalidationRequest, SourceHint};
+    let _data = crate::data_dir::TestDataDirGuard::new();
+    let temp = TempDir::new().unwrap();
+    let cache = temp.path().join("cache");
+    let pin_db = crate::folder_thumb_pins::FolderThumbPinDb::open_at(&temp.path().join("pins.db")).unwrap();
+    let folder = temp.path().join("books");
+    std::fs::create_dir(&folder).unwrap();
+    let a = folder.join("a.zip");
+    let b = folder.join("b.zip");
+    let mut cover_bytes = std::io::Cursor::new(Vec::new());
+    auto_cover_jacket().write_to(&mut cover_bytes, image::ImageFormat::Png).unwrap();
+    let mut body_bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(70, 100).write_to(&mut body_bytes, image::ImageFormat::Png).unwrap();
+    let mut archive = zip::ZipWriter::new(std::fs::File::create(&a).unwrap());
+    for index in 0..9 {
+        archive.start_file(format!("{index:03}.png"), zip::write::SimpleFileOptions::default()).unwrap();
+        archive.write_all(if index == 0 { cover_bytes.get_ref() } else { body_bytes.get_ref() }).unwrap();
+    }
+    archive.finish().unwrap();
+    // B is intentionally not decodable: K2 may consume its finished row only.
+    std::fs::write(&b, b"cached B source").unwrap();
+    let catalog = Arc::new(crate::catalog::CatalogDb::open(&cache, &folder).unwrap());
+    let pixels = fixture_webp();
+    for path in [&a, &b] {
+        let meta = std::fs::metadata(path).unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        catalog.save(&format!("zipthumb:{name}|autocrop:v4:rtl"), crate::ui_helpers::mtime_secs(&meta), meta.len() as i64,
+            8, 8, None, &pixels, &CoverIdentity::Page(crate::adjustment_db::zip_entry_key(path, "000.png")), auto_material_sample()).unwrap();
+    }
+    let auto = Some(crate::cover_auto_crop::AutoCropIdentity::new(crate::settings::ReadingDirection::Rtl));
+    let select = || select_folder_thumb_image_with_policy_and_auto(&folder, crate::settings::SortOrder::Numeric, 3,
+        Some(&pin_db), &cache, None, &Default::default(), auto);
+    let (first, proof) = select();
+    let Some(FolderThumbResolution::CachedPinned(first)) = first else { panic!("A must be the initial cached child") };
+    assert_eq!(first.source_path, a);
+    let parent = crate::catalog::CatalogDb::open(&cache, temp.path()).unwrap();
+    let parent_key = representative_cache_key_for_policy_with_auto(
+        &folder_thumb_auto_cache_key_for_path(&folder, false, crate::settings::SortOrder::Numeric, 3).unwrap(),
+        &Default::default(), auto,
+    );
+    parent.save_auto_folder_bytes(&parent_key, 1, 0, first.source_dims, first.layout_dims,
+        &first.webp_data, proof.as_ref(), &first.cover, first.auto_material).unwrap();
+    let parent_request = LoadRequest { path: folder.clone(), cache_key_override: Some(parent_key.clone()),
+        folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected), ..Default::default() };
+    let previous_parent = parent.load_one(&parent_key).unwrap().unwrap();
+    let usable = |row| folder_cached_row_usable_in_cache_dir_with_pins(&parent_request, row, &cache, Some(&pin_db));
+    assert!(usable(&previous_parent));
+    let mut parent_hint = SourceHint::new(BookCoverId::Folder(folder.clone()));
+    parent_hint.representative_page_keys.push(crate::adjustment_db::zip_entry_key(&a, "000.png"));
+    let completion = crate::cover_rotation_cache::run_invalidation(InvalidationRequest {
+        changed_keys: vec![crate::adjustment_db::zip_entry_key(&a, "001.png")],
+        source_hints: vec![SourceHint::new(BookCoverId::Zip { path: a.clone(), prefix: None }), parent_hint],
+        scopes: vec![CatalogScope { folder: temp.path().to_owned(), memory: vec![] }],
+        work: crate::catalog::CatalogWork::capture(&cache), archive_cache: None,
+    });
+    assert!(completion.errors.is_empty(), "{:?}", completion.errors);
+    assert_eq!(completion.affected_slots.len(), 1);
+    assert!(catalog.load_one("zipthumb:a.zip|autocrop:v4:rtl").unwrap().is_none());
+    assert!(parent.load_one(&parent_key).unwrap().is_some(), "write-side deletion never removes K2 parent rows");
+    assert!(!usable(&previous_parent));
+    let (replacement, replacement_proof) = select();
+    let Some(FolderThumbResolution::CachedPinned(replacement)) = replacement else { panic!("cold A must be skipped in favor of cached B") };
+    assert_eq!(replacement.source_path, b);
+    parent.save_auto_folder_bytes(&parent_key, 1, 0, replacement.source_dims, replacement.layout_dims,
+        &replacement.webp_data, replacement_proof.as_ref(), &replacement.cover, replacement.auto_material).unwrap();
+    let b_parent = parent.load_one(&parent_key).unwrap().unwrap();
+    assert!(usable(&b_parent));
+    // A normal restart or a policy which has not saved A leaves the same cold
+    // fact. Merely selecting the parent never starts a source job or saves A.
+    drop(crate::catalog::CatalogDb::open_existing_read_only(&cache, &folder).unwrap().unwrap());
+    let (again, _) = select();
+    assert!(matches!(again, Some(FolderThumbResolution::CachedPinned(ref selected)) if selected.source_path == b));
+    assert!(catalog.load_one("zipthumb:a.zip|autocrop:v4:rtl").unwrap().is_none());
+    let meta = std::fs::metadata(&a).unwrap();
+    let mut normal = LoadRequest { path: a.clone(), zip_entry: Some("000.png".into()),
+        cache_key_override: Some("zipthumb:a.zip".into()), source_policy: LoadSourcePolicy::SourceOnly,
+        mtime: crate::ui_helpers::mtime_secs(&meta), file_size: meta.len() as i64, ..Default::default() };
+    normal.set_auto_cover_crop(auto);
+    let generated = run_cover_crop_request(&mut normal, &catalog, None);
+    assert!(generated.iter().any(|message| message.pixels().is_some()));
+    assert!(catalog.load_one("zipthumb:a.zip|autocrop:v4:rtl").unwrap().is_some());
+    assert!(!usable(&b_parent), "ordinary child save invalidates the existing selection proof");
+    let (restored, _) = select();
+    assert!(matches!(restored, Some(FolderThumbResolution::CachedPinned(ref selected)) if selected.source_path == a));
+}
+
 fn auto_material_candidate(
     cache: &Path,
     directory: &Path,
@@ -77,7 +166,7 @@ fn auto_material_kinds_preserve_save_reopen_k2_copy_and_send() {
         for (index, material) in materials.iter().copied().enumerate() {
             catalog
                 .save_with_layout_dims(
-                    &format!("zipthumb:book{index}.zip|autocrop:v3:rtl"),
+                    &format!("zipthumb:book{index}.zip|autocrop:v4:rtl"),
                     7,
                     9,
                     8,
@@ -92,7 +181,7 @@ fn auto_material_kinds_preserve_save_reopen_k2_copy_and_send() {
         }
     }
     for (index, material) in materials.into_iter().enumerate() {
-        let key = format!("zipthumb:book{index}.zip|autocrop:v3:rtl");
+        let key = format!("zipthumb:book{index}.zip|autocrop:v4:rtl");
         let reopened = crate::catalog::CatalogDb::open_existing_read_only(&cache, &child)
             .unwrap()
             .unwrap();
@@ -103,7 +192,7 @@ fn auto_material_kinds_preserve_save_reopen_k2_copy_and_send() {
         let selected = auto_material_candidate(&cache, &child, &key).unwrap();
         assert_eq!(selected.auto_material, material);
         assert_eq!(selected.webp_data, bytes);
-        let parent_key = format!("folderthumb:auto-v3:parent{index}|autocrop:v3:rtl");
+        let parent_key = format!("folderthumb:auto-v3:parent{index}|autocrop:v4:rtl");
         {
             let writer = crate::catalog::CatalogDb::open(&cache, &parent).unwrap();
             assert!(
@@ -157,20 +246,20 @@ fn auto_material_kinds_preserve_save_reopen_k2_copy_and_send() {
 }
 
 #[test]
-fn auto_material_k2_prefers_v3_and_legacy_fallback_requires_missing_exact_v3() {
+fn auto_material_k2_prefers_v4_and_legacy_fallback_requires_missing_exact_v4() {
     use crate::cover_auto_material::AutoMaterial;
     let temp = TempDir::new().unwrap();
     let cache = temp.path().join("cache");
     let directory = temp.path().join("books");
     std::fs::create_dir_all(&directory).unwrap();
     let writer = crate::catalog::CatalogDb::open(&cache, &directory).unwrap();
-    let key = "zipthumb:book.zip|autocrop:v3:rtl#pin:cover";
+    let key = "zipthumb:book.zip|autocrop:v4:rtl#pin:cover";
     let old = "zipthumb:book.zip|autocrop:v1:rtl#pin:cover";
     let opposite = "zipthumb:book.zip|autocrop:v1:ltr#pin:cover";
     let bytes = fixture_webp();
     writer
         .save(
-            "zipthumb:book.zip|autocrop:v3:ltr#pin:cover",
+            "zipthumb:book.zip|autocrop:v4:ltr#pin:cover",
             7,
             9,
             8,
@@ -195,27 +284,29 @@ fn auto_material_k2_prefers_v3_and_legacy_fallback_requires_missing_exact_v3() {
         )
         .unwrap();
     assert!(auto_material_candidate(&cache, &directory, key).is_none());
-    for old_v2 in [
+    for old_key in [
         "zipthumb:book.zip|autocrop:v2:rtl#pin:cover",
         "zipthumb:book.zip|autocrop:v2:ltr#pin:cover",
+        "zipthumb:book.zip|autocrop:v3:rtl#pin:cover",
+        "zipthumb:book.zip|autocrop:v3:ltr#pin:cover",
     ] {
         writer
             .save(
-                old_v2,
+                old_key,
                 7,
                 9,
                 8,
                 8,
                 None,
                 &bytes,
-                &CoverIdentity::Page("unreleased-v2".into()),
+                &CoverIdentity::Page("previous-version".into()),
                 auto_material_sample(),
             )
             .unwrap();
     }
     assert!(
         auto_material_candidate(&cache, &directory, key).is_none(),
-        "unreleased v2 rows must not be migrated into current v3 material"
+        "v2 and v3 rows must not be migrated into current v4 material"
     );
     writer.save(opposite, 7, 9, 8, 8, None, &bytes,
         &CoverIdentity::Page("old-ltr".into()), AutoMaterial::NotAutomatic).unwrap();
@@ -272,10 +363,10 @@ fn auto_material_k2_prefers_v3_and_legacy_fallback_requires_missing_exact_v3() {
     .unwrap();
     assert!(
         auto_material_candidate(&cache, &directory, key).is_none(),
-        "an existing v3 row with missing material must not resurrect v1"
+        "an existing v4 row with missing material must not resurrect v1"
     );
-    // Existing v3 with a stale stamp or invalid raster is a miss; it must not
-    // resurrect old v1 material merely because the v3 row cannot be used.
+    // Existing v4 with a stale stamp or invalid raster is a miss; it must not
+    // resurrect old v1 material merely because the v4 row cannot be used.
     writer
         .save(
             key,
@@ -304,6 +395,94 @@ fn auto_material_k2_prefers_v3_and_legacy_fallback_requires_missing_exact_v3() {
         )
         .unwrap();
     assert!(auto_material_candidate(&cache, &directory, key).is_none());
+}
+
+#[test]
+fn auto_material_v4_source_rebuilds_v3_with_preexisting_saved_body_rotation() {
+    use crate::cover_auto_material::AutoMaterial;
+    use crate::rotation_db::{Rotation, RotationDb};
+    use std::io::{Cursor, Write};
+    let data = crate::data_dir::TestDataDirGuard::new();
+    let folder = data.path().join("folder");
+    folder_auto_fixture(&folder);
+    let zip_path = data.path().join("book.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    for page in 0..=8 {
+        let mut bytes = Cursor::new(Vec::new());
+        let image = if page == 0 {
+            auto_cover_jacket()
+        } else {
+            image::DynamicImage::new_rgb8(70, 100)
+        };
+        image.write_to(&mut bytes, image::ImageFormat::Png).unwrap();
+        zip.start_file(format!("{page:03}.png"), zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(bytes.get_ref()).unwrap();
+    }
+    zip.finish().unwrap();
+    let rotations = RotationDb::open().unwrap();
+    // These rotations already exist before the first v4 request: no rotation
+    // change notification or write-side invalidation can repair the old rows.
+    for page in 1..=8 {
+        rotations.set_key(
+            &crate::adjustment_db::normalize_path(&folder.join(format!("{page:03}.png"))),
+            Rotation::Cw90,
+        ).unwrap();
+        rotations.set_key(
+            &crate::adjustment_db::zip_entry_key(&zip_path, &format!("{page:03}.png")),
+            Rotation::Cw90,
+        ).unwrap();
+    }
+    for is_folder in [false, true] {
+        let catalog = Arc::new(crate::catalog::CatalogDb::open(
+            &data.path().join(if is_folder { "cache-folder" } else { "cache-zip" }),
+            data.path(),
+        ).unwrap());
+        let base = if is_folder { "folderthumb:folder" } else { "zipthumb:book.zip" };
+        let old_key = format!("{base}|autocrop:{}:rtl", if is_folder { "v3f" } else { "v3" });
+        catalog.save(&old_key, 7, 9, 8, 8, None, &fixture_webp(),
+            &CoverIdentity::Legacy, auto_material_sample()).unwrap();
+        let old = catalog.load_one(&old_key).unwrap().unwrap();
+        let mut request = LoadRequest {
+            path: if is_folder { folder.clone() } else { zip_path.clone() },
+            zip_entry: (!is_folder).then(|| "000.png".into()),
+            cache_key_override: Some(base.into()),
+            source_policy: LoadSourcePolicy::CacheOnly,
+            force_cache: true,
+            mtime: 7,
+            file_size: 9,
+            ..Default::default()
+        };
+        request.set_auto_cover_crop(Some(crate::cover_auto_crop::AutoCropIdentity {
+            binding: crate::settings::ReadingDirection::Rtl,
+            folders: is_folder,
+        }));
+        let key = cache_key_for_request(&request).unwrap().into_owned();
+        assert_eq!(key, format!("{base}|autocrop:{}:rtl", if is_folder { "v4f" } else { "v4" }));
+        assert!(run_cover_crop_request(&mut request, &catalog, None)
+            .iter().all(|message| message.pixels().is_none()));
+        request.source_policy = LoadSourcePolicy::CacheOrSource;
+        let map = std::sync::RwLock::new(catalog.load_all().unwrap());
+        let (tx, rx) = mpsc::channel();
+        let done = Arc::new(AtomicUsize::new(0));
+        process_load_request(
+            &mut request, &map, &tx, Some(&catalog), 64, 75, 64,
+            make_decision(CachePolicy::Always, 0, 0), &done,
+            &Arc::new(Mutex::new(crate::stats::ThumbStats::default())), None,
+            &Arc::new(AtomicUsize::new(0)), &Arc::new(AtomicUsize::new(1)),
+            None, None, None, None, None,
+        );
+        assert_eq!(done.load(Ordering::Relaxed), 1);
+        let pixels = rx.try_iter().find_map(ThumbMsg::into_pixels).unwrap();
+        let AutoMaterial::Automatic(results) = pixels.auto_material else {
+            panic!("expected regenerated automatic material");
+        };
+        assert!(results.crops().iter().all(Option::is_none), "landscape body must decline");
+        assert_eq!(catalog.load_one(&key).unwrap().unwrap().auto_material, pixels.auto_material);
+        let retained = catalog.load_one(&old_key).unwrap().unwrap();
+        assert_eq!(retained.jpeg_data, old.jpeg_data);
+        assert_eq!(retained.auto_material, old.auto_material);
+    }
 }
 
 #[test]
@@ -450,7 +629,7 @@ fn auto_material_generated_and_cached_roi_use_distinct_display_and_storage_targe
     assert_eq!(selected.auto_material, material);
     auto_material_assert_roi(selected.auto_material, selected.image.size, 64);
     let parent = crate::catalog::CatalogDb::open(&cache, temp.path()).unwrap();
-    let parent_key = "folderthumb:auto-v3:books|autocrop:v3:rtl";
+    let parent_key = "folderthumb:auto-v3:books|autocrop:v4:rtl";
     assert!(
         parent
             .save_auto_folder_bytes(

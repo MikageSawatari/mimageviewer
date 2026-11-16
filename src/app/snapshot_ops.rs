@@ -3340,6 +3340,63 @@ mod tests {
     }
 
     #[test]
+    fn cover_cache_snapshot_saved_and_list_view_restore_evict_old_material_and_samples() {
+        use crate::cover_auto_material::{AutoCropResults, AutoMaterial};
+        use crate::cover_rotation_cache::{AutoCoverSlot, BookCoverId, InvalidationCompletion};
+        use crate::cover_source_scope::LoadedCoverIdentity;
+        for list_view in [false, true] {
+            let mut app = setup_app_for_test();
+            let ctx = egui::Context::default();
+            let (_, book, key) = snapshot_cover_rotation_zip(&app);
+            let slot = AutoCoverSlot {
+                logical_book: BookCoverId::from_grid_item(&GridItem::ZipFile(book.clone()))
+                    .unwrap(),
+                representative_page_key: key.clone(),
+            };
+            app.current_folder = Some(app.tmp.path().to_owned());
+            app.items = vec![GridItem::ZipFile(book.clone())];
+            app.thumbnails = vec![snapshot_loaded_cover(&ctx, LoadedCoverIdentity::Page(key))];
+            let old_stamp = app.cover_rotation_cache.stamp(slot.clone());
+            if let ThumbnailState::Loaded {
+                auto_material,
+                cover_cache_stamp,
+                ..
+            } = &mut app.thumbnails[0]
+            {
+                *auto_material = AutoMaterial::Automatic(AutoCropResults::new([None; 4]));
+                *cover_cache_stamp = old_stamp;
+            }
+            app.image_metas = vec![Some((1, std::fs::metadata(&book).unwrap().len() as i64))];
+            app.visible_indices = vec![0];
+            app.activate_snapshot(SnapshotSourceLabel::Mixed);
+            drain_snapshot_identity_preparation(&mut app);
+            assert!(app.snapshot_open_entry(0, false, crate::app::HistoryTrigger::UserChosen));
+            drain_snapshot_archive_adoption(&mut app);
+            assert_eq!(app.current_folder.as_deref(), Some(book.as_path()));
+            // A real deletion completion arrives while both retained lists are
+            // offscreen; it must not restamp either saved clone as new material.
+            app.cover_rotation_cache
+                .complete_for_test(InvalidationCompletion {
+                    affected_slots: vec![slot],
+                    ..Default::default()
+                });
+            app.poll_cover_rotation_cache(&ctx);
+            // Leaving a child book returns to the fixed list first. Unfixing
+            // while still inside it intentionally keeps that child's list.
+            assert!(app.snapshot_return_to_list_view());
+            drain_snapshot_identity_preparation(&mut app);
+            if !list_view {
+                assert!(app.snapshot.as_ref().unwrap().saved_thumbnails[0].has_pixels());
+                app.deactivate_snapshot();
+                drain_snapshot_identity_preparation(&mut app);
+            }
+            assert_eq!(app.items, vec![GridItem::ZipFile(book)]);
+            assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+            assert!(!app.auto_aspect.samples.contains_key(&0));
+        }
+    }
+
+    #[test]
     fn cover_rotation_snapshot_deactivation_reconciles_saved_rows_outside_fixed_subset() {
         use crate::cover_source_scope::{CoverSourceScope, LoadedCoverIdentity};
         let mut app = setup_app_for_test();

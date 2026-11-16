@@ -121,6 +121,12 @@ Split(crate::page_split::PresentationStep),
 - 現在位置は `(fullscreen_idx, fullscreen_page_slice)` でステップ列を引く。見つからない
   (寸法が届いてステップ列が変わった直後など) 場合は `landing_step` で最初の半分へ倒す。
 
+§1.747: 新規入場（閉じる前と同じ index も含む）と別ページの open は、受理済みの
+`open_fullscreen_with_metadata_boundary` で、その viewer context の slice を setter 経由で
+`Full` に戻し、既存の reconcile で現在の分割方向の最初の半分へそろえる。同一 index の
+内部 refresh と、ページ上での分割方向・読書方向の変更は今見ている半分を保つ。
+明示 slice を持つ移動は着地後にその slice を適用する。入口ごとの reset は増やさない。
+
 `handle_fs_navigation` 側:
 
 - `Split(step)` で `step.source_idx == fullscreen_idx` なら `fullscreen_page_slice` を

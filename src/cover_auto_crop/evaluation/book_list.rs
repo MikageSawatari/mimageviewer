@@ -393,7 +393,7 @@ pub(super) fn evaluate(
         }
         rows.push(row.json);
     }
-    let summary = json!({"algorithm": "autocrop:v3f", "source": if folders_only {"folder-list"} else {"book-list"},
+    let summary = json!({"algorithm": "autocrop:v4f", "source": if folders_only {"folder-list"} else {"book-list"},
         "binding": if options.binding == ReadingDirection::Rtl { "rtl" } else { "ltr" },
         "total": paths.len(), "cropped": cropped, "declined": declined, "failed": failed,
         "decline_reasons": reasons, "fallback_mode": config.name(), "fallback_richer": config.includes_richer(),

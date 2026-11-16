@@ -161,6 +161,8 @@ fn cover_crop_drive_catalog_prefix_skips_newer_cropped_and_auto_rows() {
         ("40|23|autocrop:v1:rtl", 40),
         ("50|23|autocrop:v2:rtl", 50),
         ("60|23|autocrop:v3:rtl", 60),
+        ("60|23|autocrop:v4:rtl", 60),
+        ("60|23|autocrop:v4f:rtl", 60),
     ] {
         db.save_thumb_bytes(
             &format!("{prefix}{suffix}"),

@@ -15,13 +15,23 @@ impl App {
             .zip(&self.thumbnails)
             .enumerate()
             .filter_map(|(idx, (item, thumbnail))| {
-                legacy_book_cover_needs_reload(item, thumbnail, &self.rotation_page_keys)
-                    .then_some(idx)
+                (legacy_book_cover_needs_reload(item, thumbnail, &self.rotation_page_keys)
+                    || matches!(thumbnail, ThumbnailState::Loaded {
+                        auto_material: crate::cover_auto_material::AutoMaterial::Automatic(_),
+                        cover_cache_stamp, ..
+                    } if !self.cover_rotation_cache.is_current(cover_cache_stamp)))
+                .then_some(idx)
             })
             .collect::<Vec<_>>();
         let changed = !matching.is_empty();
+        self.remove_stale_automatic_cover_memory(&matching);
         for idx in matching {
             self.evict_thumbnail_for_reload(idx);
+        }
+        if changed {
+            self.rebuild_auto_aspect_samples_from_loaded();
+            self.auto_aspect.streak = None;
+            self.auto_aspect.cached_sample_gate = None;
         }
         changed
     }
