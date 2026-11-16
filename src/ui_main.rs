@@ -24995,7 +24995,7 @@ mod book_reorder_drag_tests {
     #[test]
     fn realmachine55_book_reorder_handler_known_end_then_fresh_drag_same_batch() {
         let mut app = crate::app::setup_app_for_test();
-        app.book_reorder = Some(reorder_state(&["A", "B", "C", "D", "E"], &["A"]));
+        app.book_reorder = Some(Box::new(reorder_state(&["A", "B", "C", "D", "E"], &["A"])));
         let ctx = egui::Context::default();
         let frame = |app: &mut crate::app::App, events| {
             ctx.run_pass(
