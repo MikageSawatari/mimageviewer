@@ -88,7 +88,9 @@ allow-list で検査する (正確な一覧は `mcp-integration-plan.md` §15.8)
 環境変数・利用者の Cargo 設定による出力変更も、この実際の生成物の照合で検出する。
 launcher/MCP は image path がその build の出力 exe と一致するものだけを停止・拒否する。
 インストール先で AI アプリが使っている launcher/MCP と、path 不明のこの2名は対象外。
-更新/アンインストールは core の終了要求後に MCP marker を検査し、利用中/確認不能なら中止する。
+更新は core の終了要求後に launcher を退避して置き換え、AI アプリと使用中の launcher は閉じない。
+アンインストールは従来どおり core の終了要求後に MCP marker を検査し、利用中/確認不能なら中止する
+([次のリリースの課題](next-release-backlog.md) §1.789 A-1)。
 単体 exe / portable を手で置き換える時も、AI アプリを先に終了する。
 
 ---
@@ -200,8 +202,12 @@ python -I .\scripts\mcp_stdio_check.py --call miv_status -- .\target\portable-sm
 ```
 
 通常の `%APPDATA%\mimageviewer\runtime` が検証前後で変わらないこと、並行する2本の launcher の
-片方を終えても MCP marker が残り、最後の終了で消えること、AI アプリ利用中の更新/解除が
-installer から拒否されることも担当者が確認する。Codex CLI は検証 client に使わない。
+片方を終えても MCP marker が残り、最後の終了で消えることも担当者が確認する。
+AI アプリ利用中の更新は AI アプリと launcher を閉じずに成功すること、アンインストールは従来どおり
+拒否されることを分けて確認する (§1.789 A-1)。製品ではない exe による隔離試験は
+`scripts/test-installer-launcher-swap.ps1` を使う。RM 除外の確認はセッション開始・照会成功のログと、
+除外なしの対照での launcher の正規 path の登録を必須とし、RM が動かない環境では成功扱いにしない。
+Codex CLI は検証 client に使わない。
 
 ---
 

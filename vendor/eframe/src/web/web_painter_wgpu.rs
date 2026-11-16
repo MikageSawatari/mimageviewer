@@ -96,6 +96,8 @@ impl WebPainterWgpu {
 
         let depth_stencil_format = egui_wgpu::depth_format_from_bits(options.depth_buffer, 0);
 
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         let render_state = RenderState::create(
             &wgpu_options,
             &instance,

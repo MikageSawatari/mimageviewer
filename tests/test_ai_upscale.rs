@@ -12,6 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+#[path = "support/gpu_test_group.rs"]
+mod test_gpu_group;
+
 /// テスト用画像のパスを返す。
 /// 環境変数 TEST_IMAGE_PATH があればそれを使い、なければデフォルトのテスト画像を生成。
 fn get_test_image() -> image::DynamicImage {
@@ -65,6 +68,7 @@ fn test_runtime_and_model_loading() {
     let models_dir = find_models_dir();
     println!("Models directory: {}", models_dir.display());
 
+    test_gpu_group::assert_gpu_test_group();
     let runtime = mimageviewer::ai::runtime::AiRuntime::new().expect("Failed to create AiRuntime");
 
     // 全推論モデルのロードテスト
@@ -135,6 +139,7 @@ fn test_upscale_all_models() {
     let small = img.resize_exact(64, 64, image::imageops::FilterType::Triangle);
     println!("Test image: {}x{}", small.width(), small.height());
 
+    test_gpu_group::assert_gpu_test_group();
     let runtime = mimageviewer::ai::runtime::AiRuntime::new().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
 
@@ -215,6 +220,7 @@ fn test_upscale_full_size() {
         return;
     }
 
+    test_gpu_group::assert_gpu_test_group();
     let runtime = mimageviewer::ai::runtime::AiRuntime::new().unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
 

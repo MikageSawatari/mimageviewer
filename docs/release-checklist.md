@@ -479,7 +479,8 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
     - release 出力は `<repo>\target\release` に固定。build-release は追加 Cargo 引数を停止/build 前に allow-list で検査する。
       各 build の Cargo artifact も固定出力と照合し、不一致なら署名/launcher build/内包へ進めない (環境変数/Cargo 設定も対象)。
       インストール先の launcher/MCP は停止せず、出力 exe と image path が一致するものだけを対象にする。
-      installer は core 終了後に MCP marker を確認し、利用中または確認不能なら更新/解除を中止する。
+      installer の更新は core 終了後に launcher を退避して置き換え、AI アプリと使用中の launcher を閉じずに成功することを確認する。
+      アンインストールは従来どおり MCP marker を確認し、利用中または確認不能なら中止する (§1.789 A-1)。
       単体 exe / portable の手動交換前も AI アプリを終了する。
     - **コード署名は build-dist.ps1 が既定で ON** (Certum Open Source Code Signing 証明書、SimplySign Desktop
       のクラウド鍵)。配布する全 PE に Authenticode 署名 + RFC3161 タイムスタンプを付ける: 単体exe (launcher) /

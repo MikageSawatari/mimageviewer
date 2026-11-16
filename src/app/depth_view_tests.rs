@@ -187,6 +187,7 @@ fn depth_wait_clock_survives_readback_estimation_and_resets_only_after_terminal(
 
 #[cfg(windows)]
 fn renderer() -> egui_wgpu::RenderState {
+    crate::test_gpu_group::assert_gpu_test_group();
     static RENDERER: std::sync::OnceLock<egui_wgpu::RenderState> = std::sync::OnceLock::new();
     RENDERER
         .get_or_init(|| {

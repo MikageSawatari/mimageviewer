@@ -3151,6 +3151,8 @@ struct Lanczos3Resampler {
 
 impl Lanczos3Resampler {
     fn new(device: &wgpu::Device) -> Self {
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -5668,6 +5670,7 @@ mod tests {
 
     #[test]
     fn ordinary_prepare_output_limit_fallback_captures_actual_managed_allocation() {
+        crate::test_gpu_group::assert_gpu_test_group();
         // A real headless state gets past the ordinary renderer-availability gate.
         // No surface/window, texture upload, resampler or presentation is created.
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
@@ -6170,6 +6173,7 @@ mod tests {
 
     #[test]
     fn back_native_execution_rechecks_no_removal_before_backing_claim_or_mutation() {
+        crate::test_gpu_group::assert_gpu_test_group();
         let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
         descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
         let instance = wgpu::Instance::new(descriptor);

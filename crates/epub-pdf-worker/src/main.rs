@@ -15,6 +15,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(test)]
+#[path = "../../../tests/support/gpu_test_group.rs"]
+mod test_gpu_group;
+
 const USAGE: &str = "usage:\n  mimageviewer-epub-pdf inspect <in.epub>\n  mimageviewer-epub-pdf convert <in.epub> <out> --work-dir <dir> [--user-data-dir <dir>] [--source-stem <original-stem>] [--progress-json] [--report <file.json>] [--timeout-secs N] [--force-iframe]\n  mimageviewer-epub-pdf batch <dir-with-epubs> <out-dir> [--timeout-secs N]";
 struct Options {
     timeout_secs: u64,
@@ -419,6 +423,8 @@ impl Engine {
         if self.host.is_none() {
             let t = Instant::now();
             self.progress(Phase::Init, 0, 1);
+            #[cfg(test)]
+            crate::test_gpu_group::assert_gpu_test_group();
             match Host::new(&self.user_data, deadline) {
                 Ok(host) => self.host = Some(host),
                 Err(error) => {
