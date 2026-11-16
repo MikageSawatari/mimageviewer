@@ -524,17 +524,16 @@ impl TileThumbnailDecoder {
         use ffmpeg_the_third as ffmpeg;
 
         let target_pts = self.timeline.media_to_av_time_base(target_secs);
-        let seek_ok = unsafe {
-            use ffmpeg::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
-            av_seek_frame(
-                self.input.as_mut_ptr(),
-                -1,
-                target_pts,
-                AVSEEK_FLAG_BACKWARD as i32,
-            ) >= 0
-        };
-        if !seek_ok {
-            return Ok(None);
+        let mut reader = crate::video::keyframe_seek::PacketReader::default();
+        match reader.seek(
+            &mut self.input,
+            -1,
+            target_pts,
+            Some(self.stream_idx),
+            || cancel.load(Ordering::Acquire),
+        ) {
+            Ok(crate::video::keyframe_seek::SeekOutcome::Aborted) | Err(_) => return Ok(None),
+            Ok(_) => {}
         }
         self.decoder.decoder_mut().flush();
 
@@ -546,25 +545,41 @@ impl TileThumbnailDecoder {
         // 動画あり) でも必ず target のフレームを採用するため。上限を置くと GOP 長に
         // よってサムネが実位置からずれる。worker は cancel フラグを 1 パケットごとに
         // 確認するので、別 interval / 動画への切替時は自然終了する。
-        for item in self.input.packets() {
+        loop {
             if cancel.load(Ordering::Acquire) {
                 return Ok(None);
             }
-            let (stream, packet) = match item {
-                Ok(sp) => sp,
-                Err(_) => break,
-            };
-            if stream.index() != self.stream_idx {
-                continue;
+            let item = reader.next(&mut self.input);
+            if cancel.load(Ordering::Acquire) {
+                return Ok(None);
             }
-            if let Err(e) = self.decoder.decoder_mut().send_packet(&packet) {
-                if hw_decode_active {
-                    return Err(format!("HW send_packet failed: {e}"));
+            let draining = match item {
+                Some(Ok((stream_idx, packet))) => {
+                    if stream_idx != self.stream_idx {
+                        continue;
+                    }
+                    if let Err(e) = self.decoder.decoder_mut().send_packet(&packet) {
+                        if hw_decode_active {
+                            return Err(format!("HW send_packet failed: {e}"));
+                        }
+                        continue;
+                    }
+                    false
                 }
-                continue;
-            }
+                Some(Err(_)) => break,
+                None => {
+                    self.decoder
+                        .decoder_mut()
+                        .send_eof()
+                        .map_err(|e| format!("tile decoder drain failed: {e}"))?;
+                    true
+                }
+            };
             let mut frame = Video::empty();
             while self.decoder.decoder_mut().receive_frame(&mut frame).is_ok() {
+                if cancel.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
                 // 再生デコーダと同じ best-effort timestamp を使う。PTS 欠落系の
                 // AVI/ASF/古い DivX で `frame.pts()` が None になり、判定が壊れて
                 // 全タイルが EOF まで走るのを防ぐ。timestamp が全く取れない壊れた
@@ -589,7 +604,7 @@ impl TileThumbnailDecoder {
                 last_frame = Some(frame);
                 frame = Video::empty();
             }
-            if got_frame.is_some() {
+            if got_frame.is_some() || draining {
                 break;
             }
         }
@@ -663,6 +678,54 @@ impl TileThumbnailDecoder {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mpeg_keyframe_seek_tile_matches_frame_oracle_and_drains_eof() {
+        use crate::video::keyframe_seek_test_support::{Fixture, WORKER_FIXTURES, assert_frame_id};
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        for name in WORKER_FIXTURES {
+            let fixture = Fixture::load(name);
+            let mut decoder =
+                super::TileThumbnailDecoder::open(&fixture.path, 320, 180, false, "test").unwrap();
+            for target in fixture.targets() {
+                let expected = fixture.first_at_or_after(target);
+                let image = decoder
+                    .decode_thumbnail(target, &cancel, "test")
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{name}: missing tile for {target}"));
+                assert_frame_id(
+                    &image.rgba,
+                    image.width,
+                    image.height,
+                    expected.frame_id,
+                    &format!("{name} tile target={target}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mpeg_keyframe_seek_tile_cancelled_request_can_be_replaced() {
+        use crate::video::screenshot::timeline_test_support::fixture;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut decoder =
+            super::TileThumbnailDecoder::open(&fixture("small-origin.ts"), 320, 180, false, "test")
+                .unwrap();
+        let cancel = AtomicBool::new(true);
+        assert!(
+            decoder
+                .decode_thumbnail(4.5, &cancel, "test")
+                .unwrap()
+                .is_none()
+        );
+        cancel.store(false, Ordering::Release);
+        assert!(
+            decoder
+                .decode_thumbnail(8.5, &cancel, "test")
+                .unwrap()
+                .is_some()
+        );
+    }
+
     #[test]
     fn timeline_origin_tile_thumbnail_returns_requested_colour() {
         use crate::video::screenshot::timeline_test_support::{

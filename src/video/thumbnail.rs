@@ -505,53 +505,68 @@ impl SeekThumbnailDecoder {
 
         let target_secs = request.target_secs;
         let target_pts = self.timeline.media_to_av_time_base(target_secs);
-        let seek_ok = unsafe {
-            use ffmpeg::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
-            av_seek_frame(
-                self.input.as_mut_ptr(),
-                -1,
-                target_pts,
-                AVSEEK_FLAG_BACKWARD as i32,
-            ) >= 0
-        };
-        if !seek_ok {
-            return Ok(DecodeOutcome::NoFrame);
+        let is_cancelled =
+            || cancel.load(Ordering::Acquire) || requests.lock().unwrap().supersedes(request);
+        // Request-local ownership drops held packets on every completion/cancel/error path.
+        let mut reader = crate::video::keyframe_seek::PacketReader::default();
+        match reader.seek(
+            &mut self.input,
+            -1,
+            target_pts,
+            Some(self.stream_idx),
+            is_cancelled,
+        ) {
+            Ok(crate::video::keyframe_seek::SeekOutcome::Aborted) => {
+                return Ok(DecodeOutcome::Superseded);
+            }
+            Err(_) => return Ok(DecodeOutcome::NoFrame),
+            Ok(_) => {}
         }
         self.decoder.decoder_mut().flush();
 
         let mut got_frame: Option<Video> = None;
         let mut last_frame: Option<Video> = None;
-        let mut superseded = false;
         let mut landed_frame_checked = false;
         let hw_decode_active = self.hw_decode_active();
 
         // backward seek 後の keyframe から target_secs に到達する frame まで decode
         // し続ける。長い GOP でも正しい時刻に近いサムネを返すため decode 数に
         // 固定上限は置かず、cancel と新 request による supersede で止める。
-        for item in self.input.packets() {
-            if cancel.load(Ordering::Acquire) {
+        loop {
+            if is_cancelled() {
                 return Ok(DecodeOutcome::Superseded);
             }
-            if requests.lock().unwrap().supersedes(request) {
-                superseded = true;
-                break;
+            let item = reader.next(&mut self.input);
+            if is_cancelled() {
+                return Ok(DecodeOutcome::Superseded);
             }
-
-            let (stream, packet) = match item {
-                Ok(sp) => sp,
-                Err(_) => break,
-            };
-            if stream.index() != self.stream_idx {
-                continue;
-            }
-            if let Err(e) = self.decoder.decoder_mut().send_packet(&packet) {
-                if hw_decode_active {
-                    return Err(format!("HW send_packet failed: {e}"));
+            let draining = match item {
+                Some(Ok((stream_idx, packet))) => {
+                    if stream_idx != self.stream_idx {
+                        continue;
+                    }
+                    if let Err(e) = self.decoder.decoder_mut().send_packet(&packet) {
+                        if hw_decode_active {
+                            return Err(format!("HW send_packet failed: {e}"));
+                        }
+                        continue;
+                    }
+                    false
                 }
-                continue;
-            }
+                Some(Err(_)) => break,
+                None => {
+                    self.decoder
+                        .decoder_mut()
+                        .send_eof()
+                        .map_err(|e| format!("thumbnail decoder drain failed: {e}"))?;
+                    true
+                }
+            };
             let mut frame = Video::empty();
             while self.decoder.decoder_mut().receive_frame(&mut frame).is_ok() {
+                if is_cancelled() {
+                    return Ok(DecodeOutcome::Superseded);
+                }
                 let Some(ts) = crate::video::decoder::video_frame_timestamp(&frame) else {
                     got_frame = Some(frame);
                     break;
@@ -573,11 +588,11 @@ impl SeekThumbnailDecoder {
                 last_frame = Some(frame);
                 frame = Video::empty();
             }
-            if got_frame.is_some() {
+            if got_frame.is_some() || draining {
                 break;
             }
         }
-        if superseded {
+        if is_cancelled() {
             return Ok(DecodeOutcome::Superseded);
         }
 
@@ -804,6 +819,59 @@ fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mpeg_keyframe_seek_thumbnail_matches_frame_oracle_and_drains_eof() {
+        use crate::video::keyframe_seek_test_support::{Fixture, WORKER_FIXTURES, assert_frame_id};
+        let cancel = AtomicBool::new(false);
+        let requests = Mutex::new(ThumbnailRequestState::default());
+        for name in WORKER_FIXTURES {
+            let fixture = Fixture::load(name);
+            let mut decoder = SeekThumbnailDecoder::open(&fixture.path, false).unwrap();
+            for target in fixture.targets() {
+                // Zero landing tolerance retains the existing first-at/after
+                // rule. Lookup tolerance also permits the final frame at EOF.
+                let request = ThumbnailRequest::new(target, 0.0, 0.08).unwrap();
+                let expected = fixture.first_at_or_after(target);
+                let DecodeOutcome::Ready(image) = decoder
+                    .decode_thumbnail(request, &requests, &cancel)
+                    .unwrap()
+                else {
+                    panic!("{name}: missing thumbnail for {target}");
+                };
+                assert_frame_id(
+                    &image.rgba,
+                    image.width,
+                    image.height,
+                    expected.frame_id,
+                    &format!("{name} thumbnail target={target}"),
+                );
+                assert!((image.target_secs - expected.media_secs).abs() < 1.0e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn mpeg_keyframe_seek_thumbnail_superseded_request_is_not_adopted() {
+        use crate::video::screenshot::timeline_test_support::fixture;
+        let mut decoder = SeekThumbnailDecoder::open(&fixture("small-origin.ts"), false).unwrap();
+        let cancel = AtomicBool::new(false);
+        let old = request(4.5, 0.08);
+        let requests = Mutex::new(ThumbnailRequestState::default());
+        requests.lock().unwrap().enqueue_latest(request(8.5, 0.08));
+        assert!(matches!(
+            decoder.decode_thumbnail(old, &requests, &cancel).unwrap(),
+            DecodeOutcome::Superseded
+        ));
+        // The aborted request must not leave a packet prefix for the next seek.
+        requests.lock().unwrap().take_pending();
+        assert!(matches!(
+            decoder
+                .decode_thumbnail(request(8.5, 0.08), &requests, &cancel)
+                .unwrap(),
+            DecodeOutcome::Ready(_)
+        ));
+    }
 
     #[test]
     fn timeline_origin_seek_thumbnail_returns_requested_colour() {
