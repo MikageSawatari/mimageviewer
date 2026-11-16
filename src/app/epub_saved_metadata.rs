@@ -301,7 +301,7 @@ mod tests {
             [crate::path_key::normalize_keep_drive(&source)],
         ).unwrap();
         app.caption_display.seed_for_test(&root);
-        let epoch = app.caption_epoch_for_test(&data);
+        let epoch = app.derived_text_epoch_for_test(&data);
         let before = epoch.load(std::sync::atomic::Ordering::Acquire);
         let saved =
             crate::epub_convert::copy_saved_pdf_metadata(&data, &source, destination, false);
@@ -344,7 +344,7 @@ mod tests {
         assert_eq!(app.get_rotation(0), Rotation::None);
         app.comic_docs.insert(destination_key.clone(), Vec::new());
         app.caption_display.seed_for_test(&destination_key);
-        let epoch = app.caption_epoch_for_test(&data);
+        let epoch = app.derived_text_epoch_for_test(&data);
         let before = epoch.load(std::sync::atomic::Ordering::Acquire);
         let saved =
             crate::epub_convert::copy_saved_pdf_metadata(&data, &source, destination, false);
@@ -353,7 +353,7 @@ mod tests {
             "{:?}",
             saved.user_data_errors
         );
-        assert!(saved.metadata.store_mutations.ai_captions_changed());
+        assert!(saved.metadata.store_mutations.derived_text_changed());
         assert!(saved.metadata.store_mutations.caption_display_stale());
         let reads = crate::rotation_db::read_operations_for_test();
         app.apply_epub_saved_metadata(saved.metadata);
