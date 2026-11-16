@@ -109,7 +109,7 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
   含めた bounded な cold seek 設計が必要。decoder、hover・tile・strip・screenshot、Remote の独立 Input を
   同じ不変条件で扱う。固定秒数の preroll や全ファイル走査を無断で追加しない。
 
-### 1.795 upscale の分割で key の packet 順と表示順の frame 番号を区別する (2026-11-15)
+### 1.797 upscale の分割で key の packet 順と表示順の frame 番号を区別する (2026-11-15)
 
 - 状態: **未着手・コード上の問題候補**。`KeyframePoint.frame` は key の packet 順の番号だが、
   `src/video/upscale/job.rs` の分割復号は表示順の frame 番号として扱っている。

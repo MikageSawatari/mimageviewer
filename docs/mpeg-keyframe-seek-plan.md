@@ -172,7 +172,7 @@ B = 映像の codec が MPEG-1 / MPEG-2 video であり、かつ J の key が�
 - **upscale は今回は対象外** (`src/video/upscale/job.rs` は今の seek のまま)。upscale の分割は、key の packet 順の番号
   (`KeyframePoint.frame`) と復号後の表示順の番号を同じものとして扱っていて、open GOP の stream では境界の frame が
   ずれ得る (レビュー担当の probe で MPEG-2 TS の 2 個目の key が packet 順 13 番・表示順 15 番)。これは seek の着地とは
-  別の upscale の番号付けの問題で、seek だけを差し替えても直らないので、バックログ §1.795 に分けて扱う。今回の変更で
+  別の upscale の番号付けの問題で、seek だけを差し替えても直らないので、バックログ §1.797 に分けて扱う。今回の変更で
   upscale の動きは変わらない。
 - `src/video/seek_strip.rs` の warmup (索引を作るための捨てシーク) は置き換えない (§4)。
 - `src/audio_decode.rs` (音声の範囲 decode) は音声 stream の seek で、音声 packet はすべて key なので対象外。
@@ -247,7 +247,7 @@ TS / PS の `AVIndexEntry` は `mpegts_get_dts` などが探索中に登録し�
 ## 7. 文書
 
 - `docs/video-architecture.md` に「TS / PS の seek」の節を足す (§2 の契約、§3 の所有と読み口、対象 demuxer、割り切り)。
-- `docs/next-release-backlog.md` §1.785 の状態を更新し、upscale の分割の番号付けを §1.795 として起票する。
+- `docs/next-release-backlog.md` §1.785 の状態を更新し、upscale の分割の番号付けを §1.797 として起票する。
   公開文書 (マニュアル・製品ページ) は、seek が正しくなるだけなので変えない。更新履歴は公開作業で書く。
 
 ## 8. 実装前レビューの記録
@@ -265,7 +265,7 @@ TS / PS の `AVIndexEntry` は `mpegts_get_dts` などが探索中に登録し�
 
 - P1 pts の無い key の reorder 推定は表示時刻の上限にならない → 推定をやめ、「pts の分かる key が target 以下」か
   「窓に key が 2 つ以上」で判定 (§2)。recovery point・intra refresh は設計担当の判断で範囲外と明記。
-- P1 upscale は packet 順と表示順の番号の問題が残る → seek の着地とは別の問題として今回の対象から外し、§1.795 へ (§3.2)。
+- P1 upscale は packet 順と表示順の番号の問題が残る → seek の着地とは別の問題として今回の対象から外し、§1.797 へ (§3.2)。
 - P1 映像の非 key packet を捨てるのは安全でない → 窓の packet は全部保持して渡す (§2)。
 - P2 保持列の音声が映像を塞ぐ → 保持列は Input の packet と同じ配送に乗せる (§2)。backpressure の回帰を §6 へ。
 - P2 予算が FFmpeg 内部の読み取りを制限しない → 保持と読み取り (`bytes_read`) の予算に分け、1 回の呼び出しの中は
