@@ -68,6 +68,7 @@ pub mod adjustment_db;
 pub mod ai;
 pub mod ai_caption_db;
 mod app;
+pub mod asr_addon;
 pub(crate) mod caption_display_cache;
 pub(crate) mod cover_auto_crop;
 pub(crate) mod cover_auto_material;
@@ -78,8 +79,13 @@ pub mod cover_source_scope;
 pub mod depth_addon;
 pub(crate) mod depth_estimation;
 pub(crate) mod depth_preprocess;
+pub mod derived_text;
 pub mod detached_window_geometry;
 pub(crate) mod feedback;
+pub mod transcript_db;
+pub(crate) mod transcript_display;
+pub(crate) mod transcript_display_cache;
+pub(crate) mod transcript_panel;
 #[doc(hidden)]
 pub use feedback::draw_ai_failure_feedback_snapshot_fixture;
 #[cfg(windows)]

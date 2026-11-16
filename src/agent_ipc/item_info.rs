@@ -91,6 +91,11 @@ pub(super) fn read(
             CaptionField::NotPermitted
         },
         container_ai_caption: None,
+        transcript: if permission.transcripts {
+            TranscriptField::None
+        } else {
+            TranscriptField::NotPermitted
+        },
     };
 
     let mut legacy_rating_key = None;
@@ -266,9 +271,89 @@ pub(super) fn read(
     check_cancel(cancel)?;
     enrich(&mut output, &grid_item, path, legacy_rating_key.as_deref())?;
     enrich_caption(&mut output, path, metadata.as_ref(), permission.ai_captions)?;
+    enrich_transcript(&mut output, path, metadata.as_ref(), permission.transcripts)?;
     trim_descriptions(&mut output)?;
     check_cancel(cancel)?;
     Ok(output)
+}
+
+fn enrich_transcript(
+    output: &mut ItemInfo,
+    path: &Path,
+    metadata: Option<&std::fs::Metadata>,
+    permitted: bool,
+) -> Result<(), AgentError> {
+    // Non-media, containers and their subresources never query this store.
+    if output.item.subresource.is_some()
+        || !matches!(output.kind, ItemKind::Video | ItemKind::Audio)
+        || !metadata.is_some_and(std::fs::Metadata::is_file)
+    {
+        return Ok(());
+    }
+    output.transcript = read_transcript_summary(
+        &crate::transcript_db::TranscriptDb::db_path(),
+        path,
+        metadata.and_then(crate::transcript_db::FileSignature::from_metadata),
+        permitted,
+    )?;
+    Ok(())
+}
+
+/// Runs on the metadata response worker. Permission precedes opening the store;
+/// segment text is counted here but never included in the item-info response.
+fn read_transcript_summary(
+    db_path: &Path,
+    path: &Path,
+    current_signature: Option<crate::transcript_db::FileSignature>,
+    permitted: bool,
+) -> Result<TranscriptField, AgentError> {
+    use crate::transcript_db::{TranscriptDb, TranscriptStatus};
+    if !permitted {
+        return Ok(TranscriptField::NotPermitted);
+    }
+    let result = (|| {
+        let Some(db) = TranscriptDb::open_read_only(db_path)? else {
+            return Ok(TranscriptField::None);
+        };
+        let Some(row) = db.get(&TranscriptDb::normalize_path(path))? else {
+            return Ok(TranscriptField::None);
+        };
+        if row.status == TranscriptStatus::Failed {
+            return Ok(TranscriptField::Failed);
+        }
+        Ok(TranscriptField::Present(transcript_info(
+            &row,
+            current_signature,
+        )))
+    })();
+    result.map_err(|error: rusqlite::Error| {
+        log::error!("agent_ipc: transcript summary read failed: {error}");
+        super::internal()
+    })
+}
+
+/// Metadata shared by item-info summaries and paginated transcript responses.
+pub(super) fn transcript_info(
+    row: &crate::transcript_db::TranscriptRow,
+    current_signature: Option<crate::transcript_db::FileSignature>,
+) -> TranscriptInfo {
+    TranscriptInfo {
+        model: row.model_id.clone(),
+        created_at: row.created_at,
+        audio_stream: row.audio_stream,
+        duration_secs: row.duration_ms as f64 / 1000.0,
+        segment_count: row.segments.len() as u64,
+        char_count: row
+            .segments
+            .iter()
+            .map(|(_, _, text)| text.chars().count() as u64)
+            .sum(),
+        stale: crate::transcript_display_cache::transcript_is_stale(
+            row.signature,
+            current_signature,
+            row.config_version,
+        ),
+    }
 }
 
 fn enrich_caption(

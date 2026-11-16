@@ -37,6 +37,8 @@ mod first_setup;
 #[doc(hidden)]
 pub use first_setup::draw_first_setup_dialog;
 #[cfg(windows)]
+pub(crate) mod asr_addon;
+#[cfg(windows)]
 pub(crate) mod caption_delete;
 #[cfg(windows)]
 pub(crate) mod caption_job;
@@ -46,6 +48,10 @@ pub mod network_data_dir_notice;
 pub(crate) mod new_folder;
 mod omitted_entries;
 mod open_folder;
+#[cfg(windows)]
+pub(crate) mod transcript_delete;
+#[cfg(windows)]
+pub(crate) mod transcript_job;
 #[doc(hidden)]
 pub use omitted_entries::draw_omitted_entries_snapshot_fixture;
 mod pdf_password;

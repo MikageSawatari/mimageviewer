@@ -81,8 +81,8 @@ pub(crate) struct Runtime {
 
 #[derive(Clone)]
 pub(crate) struct Stores {
-    pub caption_epoch: Arc<std::sync::atomic::AtomicU64>,
-    pub caption_db_path: PathBuf,
+    pub derived_text_epoch: Arc<std::sync::atomic::AtomicU64>,
+    pub derived_text_paths: crate::derived_text::DerivedTextPaths,
     pub meta: Arc<crate::fts_meta::FtsMetaDb>,
     pub fts: Arc<crate::fts_index::FtsIndex>,
     pub writer: Arc<crate::fts_writer_dispatcher::FtsWriterDispatcher>,
@@ -394,26 +394,33 @@ pub(crate) fn startup_cleanup(
     Ok(roots)
 }
 
-fn cleanup_caption_removed(path: &std::path::Path, config: &Configuration) {
-    if !path.exists() {
-        return;
-    }
-    let result = crate::ai_caption_db::CaptionDb::open_existing_for_write(path).and_then(|db| {
-        let ranges: Vec<_> = config
-            .favorites
-            .iter()
-            .flat_map(|favorite| {
-                crate::metadata_ownership::OwnedRange {
-                    root: root_key(&favorite.path),
-                    exclusions: Vec::new(),
-                }
-                .sql_ranges()
-            })
-            .collect();
-        db.cleanup_removed_outside_ranges(&ranges)
-    });
-    if let Err(error) = result {
-        crate::logger::log(format!("caption removed cleanup failed: {error}"));
+fn cleanup_derived_text_removed(
+    paths: &crate::derived_text::DerivedTextPaths,
+    config: &Configuration,
+) {
+    for (kind, path) in paths.iter() {
+        if !path.exists() {
+            continue;
+        }
+        let result = crate::derived_text::PendingStore::open(kind, path).and_then(|db| {
+            let ranges: Vec<_> = config
+                .favorites
+                .iter()
+                .flat_map(|favorite| {
+                    crate::metadata_ownership::OwnedRange {
+                        root: root_key(&favorite.path),
+                        exclusions: Vec::new(),
+                    }
+                    .sql_ranges()
+                })
+                .collect();
+            db.cleanup_removed(&ranges)
+        });
+        if let Err(error) = result {
+            crate::logger::log(format!(
+                "derived text {kind:?} removed cleanup failed: {error}"
+            ));
+        }
     }
 }
 
@@ -667,8 +674,8 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
             }
             let h = indexer_supervisor::spawn(
                 SupervisorParams {
-                    caption_epoch: Arc::clone(&stores.caption_epoch),
-                    caption_db_path: stores.caption_db_path.clone(),
+                    derived_text_epoch: Arc::clone(&stores.derived_text_epoch),
+                    derived_text_paths: stores.derived_text_paths.clone(),
                     favorite_id: favorite.id,
                     favorite_root: favorite.path.clone(),
                     excluded_roots: owned.excluded_roots.clone(),
@@ -691,7 +698,7 @@ fn run(stores: Stores, shared: Arc<Shared>, startup_skip_offline_change_scan: bo
         }
         // Keep tombstones under all favorite roots, including metadata-disabled favorites.
         if initial_configuration {
-            cleanup_caption_removed(&stores.caption_db_path, &next);
+            cleanup_derived_text_removed(&stores.derived_text_paths, &next);
         }
         old = next;
         let mut view = shared.state.lock().unwrap();
@@ -763,8 +770,10 @@ mod tests {
             Arc::clone(&reporter),
         );
         Stores {
-            caption_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            caption_db_path: tmp.join("ai_caption.db"),
+            derived_text_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                tmp.join("ai_caption.db"),
+            ),
             meta,
             fts,
             writer,
@@ -2057,8 +2066,18 @@ mod tests {
     fn caption_removed_cleanup_runs_once_after_initial_configuration() {
         let temp = tempfile::tempdir().unwrap();
         let stores = stores(temp.path());
-        crate::ai_caption_db::CaptionDb::open_at(&stores.caption_db_path).unwrap();
-        let conn = rusqlite::Connection::open(&stores.caption_db_path).unwrap();
+        crate::ai_caption_db::CaptionDb::open_at(
+            &stores
+                .derived_text_paths
+                .path(crate::derived_text::DerivedTextKind::Caption),
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open(
+            &stores
+                .derived_text_paths
+                .path(crate::derived_text::DerivedTextKind::Caption),
+        )
+        .unwrap();
         let root = temp.path().join("disabled");
         let inside = format!("{}/removed.jpg", root_key(&root));
         conn.execute("INSERT INTO caption_removed VALUES (?1, 1)", [&inside])

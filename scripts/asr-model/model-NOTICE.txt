@@ -1,0 +1,19 @@
+mImageViewer local transcription model (asr-model-v1)
+
+This package contains a file derived from the Whisper large-v3-turbo model
+(https://github.com/openai/whisper), Copyright (c) 2022 OpenAI, licensed under
+the MIT License. A copy of the license is included in the LICENSE file.
+
+Changes made by Mikage Sawatari for mImageViewer:
+
+- The original PyTorch checkpoint large-v3-turbo.pt (SHA-256
+  aff26ae408abcba5fbf8813c21e62b0941638c5f6eebfb145be0c9839262a19a) was
+  converted to the ggml format with whisper.cpp v1.9.5
+  (models/convert-pt-to-ggml.py), using the tokenizer and mel filter assets of
+  openai/whisper v20250625.
+- The converted model was quantized to Q5_0 with whisper.cpp v1.9.5
+  (whisper-quantize).
+- No fine-tuning or retraining was performed.
+
+These files are provided "AS IS", WITHOUT WARRANTY OF ANY KIND, express or
+implied.

@@ -2156,7 +2156,7 @@ fn enumerate_audio_tracks(input: &ffmpeg_the_third::format::context::Input) -> V
     enumerate_audio_tracks_with_timeline(input, MediaTimeline::from_input(input))
 }
 
-fn enumerate_audio_tracks_with_timeline(
+pub(crate) fn enumerate_audio_tracks_with_timeline(
     input: &ffmpeg_the_third::format::context::Input,
     timeline: MediaTimeline,
 ) -> Vec<AudioTrackInfo> {
@@ -9980,7 +9980,7 @@ mod audio_tail_seek_fixture_tests {
 }
 
 #[cfg(test)]
-mod audio_track_fixture_tests {
+pub(in crate::video) mod audio_track_fixture_tests {
     use super::{
         AudioTrackInfo, DecodeHandles, VideoInfo, enumerate_audio_tracks,
         enumerate_audio_tracks_with_decoder, spawn, spawn_with_initial_audio_track,
@@ -10175,7 +10175,9 @@ mod audio_track_fixture_tests {
             has_audio: info.has_audio,
             has_video: info.has_video,
         });
-        let video = wait_video_frame(&handles.video_rx, 0, 0.0);
+        let video = info
+            .has_video
+            .then(|| wait_video_frame(&handles.video_rx, 0, 0.0));
         let audio = handles
             .audio_rx
             .recv_timeout(Duration::from_secs(10))
@@ -10185,15 +10187,18 @@ mod audio_track_fixture_tests {
             pts: audio.pts_secs.max(0.0),
             wall_now: std::time::Instant::now(),
         });
-        actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
-            epoch: 0,
-            pts: video.pts_secs,
-        });
+        if let Some(video) = video {
+            actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+                epoch: 0,
+                pts: video.pts_secs,
+            });
+        }
         assert_eq!(actor.published_state_code(), state_code::PLAYING);
     }
 
     struct SwitchSession {
         handles: DecodeHandles,
+        info: VideoInfo,
         selection: Arc<AudioTrackSelection>,
         clock: Arc<AvClock>,
         actor: EngineActor,
@@ -10207,18 +10212,29 @@ mod audio_track_fixture_tests {
         }
 
         fn new_for(name: &str, initial_stream: usize) -> Self {
+            Self::new_at(fixture_path(name), initial_stream)
+        }
+
+        fn new_at(path: PathBuf, initial_stream: usize) -> Self {
             let cancel = Arc::new(AtomicBool::new(false));
             let serial = Arc::new(AtomicU64::new(0));
             let clock = Arc::new(AvClock::new(1.0, Arc::clone(&serial)));
             let mut actor = EngineActor::new(OpenOptions::default(), serial, Arc::clone(&clock));
             actor.begin_loading();
             let (event_tx, event_rx) = bounded(64);
-            let handles = spawn_headless(
-                name,
+            let handles = spawn(
+                path,
                 Arc::clone(&clock),
                 Arc::clone(&cancel),
+                48_000,
+                false,
+                crate::settings::VideoDeinterlaceMode::Off,
+                #[cfg(windows)]
+                None,
                 actor.published_state_handle(),
-                event_tx,
+                EngineEventSender::new(event_tx, Arc::new(VideoUiWake::default())),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(super::VideoDynamicState::default()),
             );
             let info = handles
                 .info_rx
@@ -10233,6 +10249,7 @@ mod audio_track_fixture_tests {
             start_actor_playing(&mut actor, &info, &handles);
             Self {
                 handles,
+                info,
                 selection,
                 clock,
                 actor,
@@ -10446,7 +10463,7 @@ mod audio_track_fixture_tests {
         }
     }
 
-    fn open_fixture_info_path(path: PathBuf) -> VideoInfo {
+    pub(in crate::video) fn open_fixture_info_path(path: PathBuf) -> VideoInfo {
         let input = ffmpeg_the_third::format::input(&path).expect("open committed fixture");
         let tracks = enumerate_audio_tracks(&input);
         let default_index = input.streams().best(MediaType::Audio).map(|s| s.index());
@@ -10482,6 +10499,31 @@ mod audio_track_fixture_tests {
         assert_eq!(info.audio_tracks, tracks);
         assert_eq!(info.default_audio_stream_index, default_index);
         info
+    }
+
+    #[test]
+    fn transcript_media_time_is_unchanged_across_real_audio_track_switches() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ai/transcript_audio/offset_tracks.mka");
+        let session = SwitchSession::new_at(path, 0);
+        assert_eq!(session.info.timeline_origin_secs, 0.0);
+        let delayed = session
+            .info
+            .audio_tracks
+            .iter()
+            .find(|track| track.stream_index == 1)
+            .unwrap();
+        assert_eq!(delayed.start_secs, Some(13.0));
+        let saved_start_secs = 13_000_u64 as f64 / 1000.0;
+        session.request(1, saved_start_secs);
+        session.wait_display_state(Display::Applied);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 1);
+        assert_eq!(session.info.timeline_origin_secs, 0.0);
+        session.request(0, 10.0);
+        session.wait_display_state(Display::Applied);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 0);
+        assert_eq!(saved_start_secs, 13.0);
     }
 
     #[test]

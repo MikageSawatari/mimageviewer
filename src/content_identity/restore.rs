@@ -1669,6 +1669,7 @@ mod tests {
         }
         drop(crate::rating_db::RatingDb::open_at(data_dir.join("rating.db")).unwrap());
         drop(crate::ai_caption_db::CaptionDb::open_at(data_dir.join("ai_caption.db")).unwrap());
+        drop(crate::transcript_db::TranscriptDb::open_at(data_dir.join("transcript.db")).unwrap());
         drop(ContentIdentityDb::open_at(&data_dir.join("content_identity.db")).unwrap());
         drop(crate::adjustment_db::AdjustmentDb::open_at(&data_dir.join("adjustment.db")).unwrap());
         drop(crate::mask_db::MaskDb::open_at(&data_dir.join("mask.db")).unwrap());
@@ -2156,8 +2157,8 @@ mod tests {
         let hundred = measure_batch_database_opens(100);
 
         assert_eq!(
-            one, 37,
-            "28 store copy + 1 origin batch + 8 runtime reads, including captions, endpoint, page-alone and shift placement"
+            one, 38,
+            "29 store copy + 1 origin batch + 8 runtime reads, including captions, endpoint, page-alone and shift placement"
         );
         assert_eq!(hundred, one, "DB open 回数を候補数に比例させない");
     }

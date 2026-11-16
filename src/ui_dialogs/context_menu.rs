@@ -1579,6 +1579,12 @@ impl crate::app::App {
             } else {
                 None
             },
+            transcript_creation_disabled_reason: self
+                .transcript_creation_disabled_reason(target.is_folder_context)
+                .map(str::to_owned),
+            transcript_deletion_disabled_reason: self
+                .transcript_deletion_disabled_reason(target.is_folder_context)
+                .map(str::to_owned),
             can_paste_edit_bundle: self.has_page_edit_bundle_clipboard(),
             has_explorer_folder: target.explorer_folder.is_some(),
             collection_reference: match &target.collection_root_delete {
@@ -1831,6 +1837,8 @@ impl crate::app::App {
                     MenuCommand::NewFolder
                         | MenuCommand::CreateAiCaptions
                         | MenuCommand::DeleteAiCaptions
+                        | MenuCommand::CreateTranscripts
+                        | MenuCommand::DeleteTranscripts
                         | MenuCommand::EditBookComposition
                         | MenuCommand::ConvertImageFolderToZip
                         | MenuCommand::Paste
@@ -1885,6 +1893,18 @@ impl crate::app::App {
             }
             MenuCommand::ConvertEpubToPdf => {
                 self.start_batch_convert_to_pdf_at(target.item_index);
+                None
+            }
+            MenuCommand::CreateTranscripts => {
+                if target.surface == ContextMenuSurface::Grid {
+                    self.request_create_transcripts(ctx, target.is_folder_context);
+                }
+                None
+            }
+            MenuCommand::DeleteTranscripts => {
+                if target.surface == ContextMenuSurface::Grid {
+                    self.request_delete_transcripts(ctx, target.is_folder_context);
+                }
                 None
             }
             MenuCommand::CreateAiCaptions => {

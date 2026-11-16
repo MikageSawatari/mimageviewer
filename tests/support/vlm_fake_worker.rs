@@ -77,6 +77,9 @@ fn stall() -> ! {
 
 fn main() {
     let args: Vec<_> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--asr-serve") {
+        return asr(&args);
+    }
     if args.iter().any(|arg| arg == "--list-devices") {
         let executable = PathBuf::from(&args[0]);
         let name = executable.file_stem().unwrap().to_string_lossy();
@@ -263,6 +266,66 @@ fn main() {
             return;
         } else {
             panic!("unexpected request type");
+        }
+    }
+}
+
+// ASR も同じ依存なし peer を使い、テスト中の compiler 起動を共用する。
+fn asr(args: &[String]) {
+    let mode = args.windows(2).find(|p| p[0] == "--fake-mode").map(|p| p[1].as_str()).unwrap_or("ok");
+    let mut input = io::stdin().lock();
+    let mut output = io::stdout().lock();
+    let mut total = 0usize;
+    while let Ok((json, bytes)) = frame(&mut input) {
+        let kind = field(&json, "type");
+        if kind.starts_with("\"hello\"") {
+            send(&mut output, &format!("{{\"type\":\"hello\",\"role\":\"asr\",\"protocol_version\":1,\"settings_version\":1,\"source_identity\":\"{}\"}}", "a".repeat(64)), &[]);
+        } else if kind.starts_with("\"load\"") {
+            assert!(field(&json,"device_luid").starts_with("\"00000000:00000001\""));
+            assert!(!json.contains("\"device_index\""));
+            let luid = if mode == "wrong-loaded-luid" { "00000000:00000002" } else { "00000000:00000001" };
+            let index = if mode == "load-reordered-gpu" { 7 } else { 0 };
+            send(&mut output, &format!(r#"{{"type":"load","status":"ok","model_load_s":0.1,"cpu_threads":8,"device":{{"luid":"{luid}","name":"fake","physical_index":{index},"dxgi":{{"name":"fake","luid":"{luid}","dedicated_bytes":0,"software":false}}}}}}"#), &[]);
+            if mode == "stall-write" { stall(); }
+        } else if kind.starts_with("\"begin\"") {
+            total = 0;
+            let id = integer(&json, "request_id") + u64::from(mode == "wrong-begin-id");
+            send(&mut output, &format!("{{\"type\":\"begin\",\"request_id\":{id},\"status\":\"ok\"}}"), &[]);
+            if mode == "stall-read" { stall(); }
+        } else if kind.starts_with("\"pcm\"") {
+            assert!(!bytes.is_empty() && bytes.len() % 2 == 0);
+            total += bytes.len();
+        } else if kind.starts_with("\"end\"") {
+            let id = integer(&json, "request_id");
+            let duration = total / 32;
+            if mode == "legacy-item-failure" {
+                send(&mut output, &format!("{{\"type\":\"end\",\"request_id\":{id},\"status\":\"item_failure\",\"code\":\"invalid_utf8\",\"error\":\"old protocol\",\"duration_ms\":{duration}}}"), &[]);
+                continue;
+            }
+            if mode == "fatal-exit" {
+                send(&mut output, &format!("{{\"type\":\"error\",\"request_id\":{id},\"status\":\"fatal\",\"code\":\"inference\",\"error\":\"synthetic failure\"}}"), &[]);
+                return;
+            }
+            if mode == "invalid-utf8" || mode == "invalid-utf8-exit" {
+                let mut body = format!("{{\"type\":\"window\",\"request_id\":{id},\"text\":\"").into_bytes();
+                body.push(0xff);
+                body.extend_from_slice(b"\"}");
+                output.write_all(&((4 + body.len()) as u32).to_le_bytes()).unwrap();
+                output.write_all(&(body.len() as u32).to_le_bytes()).unwrap();
+                output.write_all(&body).unwrap();
+                output.flush().unwrap();
+                if mode == "invalid-utf8-exit" { return; }
+                stall();
+            }
+            let end = if mode == "backwards" { 0 } else { duration };
+            let repaired = matches!(mode,"repair-counts" | "wrong-total" | "invalid-counts");
+            let discarded_bytes = if repaired {2} else {0};
+            let discarded_fragments = if mode == "invalid-counts" {3} else if repaired {1} else {0};
+            send(&mut output, &format!("{{\"type\":\"progress\",\"request_id\":{id},\"processed_ms\":{duration}}}"), &[]);
+            send(&mut output, &format!("{{\"type\":\"window\",\"request_id\":{id},\"start_ms\":0,\"read_end_ms\":{duration},\"join_ms\":{duration},\"final\":true,\"utf8_discarded_bytes\":{discarded_bytes},\"utf8_discarded_fragments\":{discarded_fragments},\"segments\":[{{\"start_ms\":1,\"end_ms\":{end},\"text\":\"日本語\"}}]}}"), &[]);
+            let total_bytes = discarded_bytes + usize::from(mode == "wrong-total");
+            let duration = duration + usize::from(mode == "wrong-end-duration");
+            send(&mut output, &format!("{{\"type\":\"end\",\"request_id\":{id},\"status\":\"ok\",\"duration_ms\":{duration},\"utf8_discarded_bytes\":{total_bytes},\"utf8_discarded_fragments\":{discarded_fragments}}}"), &[]);
         }
     }
 }

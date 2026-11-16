@@ -9,3 +9,5 @@ struct DeviceSelection {
 };
 nlohmann::json list_devices();
 DeviceSelection select_device(const std::string & luid);
+// ASRは選択済みLUIDを最新の共通一覧へ直接照合し、内蔵GPUも候補にする。
+DeviceSelection select_asr_device(const std::string & luid);

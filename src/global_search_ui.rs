@@ -335,6 +335,7 @@ impl TargetChoice {
             TargetChoice::Only(SourceKind::Tags) => "タグ",
             TargetChoice::Only(SourceKind::Sidecar) => "サイドカー",
             TargetChoice::Only(SourceKind::AiCaption) => "AI 説明",
+            TargetChoice::Only(SourceKind::Transcript) => "文字起こし",
         }
     }
 
@@ -367,7 +368,22 @@ pub const TARGET_CHOICES: &[TargetChoice] = &[
     TargetChoice::Only(SourceKind::VideoMeta),
     TargetChoice::Only(SourceKind::Sidecar),
     TargetChoice::Only(SourceKind::AiCaption),
+    TargetChoice::Only(SourceKind::Transcript),
 ];
+
+/// 実際の対象選択widgetをheadlessのhandler/PNG検査でも使う。
+fn draw_target_combo(ui: &mut egui::Ui, choice: &mut TargetChoice, height: f32) {
+    let combo = egui::ComboBox::from_id_salt("global_search_target")
+        .selected_text(choice.label())
+        .width(160.0)
+        .height(height)
+        .show_ui(ui, |ui| {
+            for &next in TARGET_CHOICES {
+                ui.selectable_value(choice, next, next.label());
+            }
+        });
+    crate::ui_helpers::set_accessibility_label(&combo.response, "検索対象");
+}
 
 // Zip represents captioned archive/folder books together (local-vlm-caption-plan §21.15.3).
 pub const KIND_CHOICES: &[Option<IndexKind>] = &[
@@ -4893,16 +4909,7 @@ impl App {
                 {
                     let current = TargetChoice::from_target(&self.global_search.filters.target);
                     let mut next = current;
-                    let named_combo = egui::ComboBox::from_id_salt("global_search_target")
-                        .selected_text(current.label())
-                        .width(160.0)
-                        .height(combo_popup_height)
-                        .show_ui(ui, |ui| {
-                            for &choice in TARGET_CHOICES {
-                                ui.selectable_value(&mut next, choice, choice.label());
-                            }
-                        });
-                    crate::ui_helpers::set_accessibility_label(&named_combo.response, "検索対象");
+                    draw_target_combo(ui, &mut next, combo_popup_height);
                     if next != current {
                         self.global_search.filters.target = next.to_target();
                         filter_changed = true;
@@ -8916,5 +8923,53 @@ pub(crate) mod tests {
         let result = App::compute_search_video_candidates(&items, &thumbs, &pins, false);
         let indices: Vec<usize> = result.iter().map(|(i, _, _)| *i).collect();
         assert_eq!(indices, vec![1, 3], "Video の元 idx (1, 3) が保持される");
+    }
+}
+
+#[cfg(test)]
+mod transcript_target_ui_tests {
+    use super::*;
+    use egui_kittest::kittest::Queryable;
+    #[test]
+    fn transcript_search_target_combo_handler_and_dark_light_snapshots() {
+        let mut snapshots = egui_kittest::SnapshotResults::default();
+        for dark in [true, false] {
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(320.0, 420.0))
+                .build_ui_state(
+                    move |ui, choice| {
+                        crate::os_theme::apply_resolved(
+                            ui.ctx(),
+                            if dark {
+                                crate::os_theme::ResolvedTheme::Dark
+                            } else {
+                                crate::os_theme::ResolvedTheme::Light
+                            },
+                        );
+                        draw_target_combo(ui, choice, 360.0);
+                    },
+                    TargetChoice::All,
+                );
+            harness.run_steps(4);
+            harness.get_by_label("検索対象").click();
+            harness.run_steps(3);
+            harness.get_by_label("文字起こし").click();
+            harness.run_steps(3);
+            assert_eq!(*harness.state(), TargetChoice::Only(SourceKind::Transcript));
+            assert_eq!(
+                harness.state().to_target(),
+                SearchTarget::Only(vec![SourceKind::Transcript])
+            );
+            harness.get_by_label("検索対象").click();
+            harness.run_steps(3);
+            harness.snapshot(if dark {
+                "transcript_search_target_dark"
+            } else {
+                "transcript_search_target_light"
+            });
+            snapshots.extend(harness.take_snapshot_results());
+        }
+        snapshots.unwrap();
     }
 }

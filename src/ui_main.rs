@@ -9332,6 +9332,8 @@ impl App {
                                         && self.epub_batch_convert.is_none(),
                                     caption_disabled_reason: self.caption_creation_disabled_reason(false),
                                     caption_progress_available: self.caption_job.is_some(),
+                                    transcript_disabled_reason: self.transcript_creation_disabled_reason(false),
+                                    transcript_progress_available: self.transcript_job.is_some(),
                                     video_selected: self.grid_item_input_allowed() && selected_video_path.is_some(),
                                 };
                                 crate::ui_tools_menu::draw(ui, &resolved_top_menu.commands, &self.keymap, state)
@@ -9341,6 +9343,8 @@ impl App {
                                     MenuCommandId::ConvertToZip => self.start_batch_convert_to_zip(),
                                     MenuCommandId::ToolsCreateAiCaptions => self.request_create_ai_captions(ctx, false),
                                     MenuCommandId::ToolsShowCaptionProgress => self.show_caption_progress = true,
+                                    MenuCommandId::ToolsCreateTranscripts => self.request_create_transcripts(ctx, false),
+                                    MenuCommandId::ToolsShowTranscriptProgress => self.show_transcript_progress = true,
                                     MenuCommandId::VideoRegisterUpscale => {
                                         if let Some(path) = selected_video_path.clone() {
                                             self.request_video_upscale(path);

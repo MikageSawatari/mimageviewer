@@ -503,6 +503,22 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+文字起こし表示（T1区切り3）のDB SELECTと署名取得は単一readerで行い、UI/presenterは不変のsnapshotとArc本文だけを使う。
+再生原点は既存decoderから取得し、描画で再probeしない。nativeとmusicは可変高一覧rendererを共有する。
+Fenwick索引で可視行を探し、その行だけ全文をlayoutする。高さの変更はpass末尾にまとめて採用し、
+幅/fontの変更でもmanual anchorとpauseを維持する。source/tab/panel閉鎖では一時状態を破棄する。
+job状態・appliedの変化だけでDBを再読込せず、本文Arcも保持する。nativeの同値snapshotは再送しない。
+`transcript/display_render` のms・全行数・layout行数と、明示実行用の5,000行perf testで描画を計測できる。
+
+文字起こし（T1区切り2）の受付は保持済み一覧からパスを捕捉するだけ。GPU列挙、モデル検査/取得、
+FFmpeg probe/変換、文字起こしDB参照・署名再確認・保存、
+削除件数の集計とtransactionは背景workerで行う。取得/削除/作成のroot pollはtry_recvだけを使い、
+UIではjoin・pipe待ち・ファイル存在確認をしない。音声トラックの選択は再生と共通のメモリ値を受付時に捕捉し、
+workerのprobe後に共通resolverへ渡す。変換と推論は別threadのpipe背圧で接続する。
+中止はcancelとkillを通知し、commit済み保存と終了の通知を残してownerを終える。
+作成の小窓は閉じても継続するmodeless。窓/1本の推論・抽出・保存にはperf eventを置く。
+抽出だけのdevbinでの測定は、実機UIの応答性を測った証拠とは区別する。
+
 表紙の手動範囲（§1.764）の準備は、論理コンテナ・明示ページ・設定値と既存 handle だけを UI で捕捉する。
 ピン解決・stat・書庫列挙・既定本棚パスの解決・画像 decode/縮小を一つの `cover-crop-prepare` worker で行う。
 準備全体を perf event で計測し、完了時に repaint、UI は非blocking poll と世代照合だけを行う。

@@ -432,7 +432,7 @@ impl App {
                     ) {
                         // These outcomes alone carry SaveOutcome::Written.
                         if let Some(manager) = self.indexer_init.as_ref() {
-                            manager.notify_caption_changed();
+                            manager.notify_derived_text_changed();
                         }
                     }
                     if let Err(error) = job.item_done(outcome, &mut self.caption_display) {
@@ -806,8 +806,8 @@ mod tests {
         ] {
             let mut app = crate::app::setup_app_for_test();
             let index_data = app.tmp.path().join("caption-index");
-            let caption_epoch = app.caption_epoch_for_test(&index_data);
-            let before = caption_epoch.load(Ordering::Acquire);
+            let derived_text_epoch = app.derived_text_epoch_for_test(&index_data);
+            let before = derived_text_epoch.load(Ordering::Acquire);
             let (mut job, commands, events) = job();
             job.append(vec!["C:/images/a.png".into(), "C:/images/b.png".into()].into());
             job.advance().unwrap();
@@ -832,7 +832,7 @@ mod tests {
                 CaptionItemOutcome::Created | CaptionItemOutcome::FailedWritten
             );
             assert_eq!(
-                caption_epoch.load(Ordering::Acquire),
+                derived_text_epoch.load(Ordering::Acquire),
                 before + u64::from(committed),
                 "{outcome:?}"
             );
