@@ -2040,6 +2040,7 @@ pub(in crate::app) struct ViewerContextBundle {
     fs_zoom: f32,
     fs_pan: egui::Vec2,
     fs_initial_placement_request: Option<crate::ui_fullscreen::FsInitialPlacementRequest>,
+    fs_automatic_initial_view: Option<crate::ui_fullscreen::FsAutomaticInitialView>,
     fs_zoom_active: bool,
     fs_zoom_aiming: bool,
     fs_zoom_factor: f32,
@@ -3303,6 +3304,7 @@ impl ViewerContextBundle {
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
             fs_initial_placement_request: None,
+            fs_automatic_initial_view: None,
             fs_zoom_active: false,
             fs_zoom_aiming: false,
             fs_zoom_factor: 1.0,
@@ -3736,6 +3738,7 @@ impl App {
             fs_zoom,
             fs_pan,
             fs_initial_placement_request,
+            fs_automatic_initial_view,
             fs_zoom_active,
             fs_zoom_aiming,
             fs_zoom_factor,
@@ -4071,6 +4074,7 @@ impl App {
         swap_field!(fs_zoom);
         swap_field!(fs_pan);
         swap_field!(fs_initial_placement_request);
+        swap_field!(fs_automatic_initial_view);
         swap_field!(fs_zoom_active);
         swap_field!(fs_zoom_aiming);
         swap_field!(fs_zoom_factor);
@@ -4462,6 +4466,7 @@ impl App {
             fs_zoom,
             fs_pan,
             fs_initial_placement_request,
+            fs_automatic_initial_view,
             fs_zoom_active,
             fs_zoom_aiming,
             fs_zoom_factor,
@@ -4693,6 +4698,7 @@ impl App {
             fs_zoom,
             fs_pan,
             fs_initial_placement_request,
+            fs_automatic_initial_view,
             fs_zoom_active,
             fs_zoom_aiming,
             fs_zoom_factor,
@@ -5531,6 +5537,7 @@ impl App {
             bundle.fs_vertical_scroll = 0.0;
             bundle.fs_pan = egui::Vec2::ZERO;
             bundle.fs_initial_placement_request = None;
+            bundle.fs_automatic_initial_view = None;
             bundle.fs_free_rotation = 0.0;
             bundle.fs_vertical_cache_keep_set.clear();
             bundle.continuous_page_transitions.clear();
@@ -5572,6 +5579,7 @@ impl App {
             bundle.fs_vertical_scroll = 0.0;
             bundle.fs_pan = egui::Vec2::ZERO;
             bundle.fs_initial_placement_request = None;
+            bundle.fs_automatic_initial_view = None;
             bundle.fs_free_rotation = 0.0;
             bundle.fs_vertical_cache_keep_set.clear();
             bundle.continuous_page_transitions.clear();
@@ -5615,6 +5623,7 @@ impl App {
             bundle.fs_vertical_scroll = 0.0;
             bundle.fs_pan = egui::Vec2::ZERO;
             bundle.fs_initial_placement_request = None;
+            bundle.fs_automatic_initial_view = None;
             bundle.fs_free_rotation = 0.0;
             bundle.fs_vertical_cache_keep_set.clear();
             bundle.continuous_page_transitions.clear();
@@ -6274,6 +6283,7 @@ impl App {
             image_dims: None,
             rotation: crate::rotation_db::Rotation::None,
             zoom_pan: None,
+            automatic_initial_view: None,
             free_rotation: 0.0,
             image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             image_content_bbox: None,

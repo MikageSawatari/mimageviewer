@@ -1472,6 +1472,23 @@ viewport生成/破棄、HWND、geometry、入力述語、promote/retire遷移、
 
 再レビューではZipDirの実効prefix照合を撤回し、同じ外側書庫のAutomaticを保守的に失効させる。runtime stampは外側書庫＋代表ページで共有する。削除通知はslot・catalog・keyを一組とし、registryでは既存ownerのpoolを共有照合へ渡す。別カタログの同名キーで兄弟要求を取消さないための所有境界の修正であり、新たなviewport／状態遷移／常駐ownerは追加しない。
 
+### 2026-11-15: 通常画像のクリック判定に自動初期配置の owner を持たせる (§1.745)
+
+`FsAutomaticInitialView` は通常画像の表示単位の自動配置結果で、配置要求の完了後も比較用に保持する。
+利用者の変形と区別するため、倍率・純粋な自動 pan の基準を `fs_zoom` / `fs_pan` と同じ
+`ViewerContextBundle` に持たせ、既存の初期化・swap・移譲・破棄へ登録する。共有設定による既存の parked context の pan リセットでは基準も破棄する。
+2026-11-16 追補: 初版の世代・anchor・slice 照合と snapshot 保存漏れは、外部独立レビューで P2 と判定され、設計担当も確認した。
+基準を一覧の identity から分離し、変形を保つ世代変更・index の詰め直し・片側移動では基準も保つ。
+snapshot の共通 capture と Clone は zoom/pan・自由回転・基準を一緒に保存し、通常画像と collection-root の再開は同じ owner で復元する。
+AtRest の live bundle 再開は bundle の状態を保つ。overview / ParkedLive media の snapshot は従来の既定変形に合わせ基準も持たない。
+設計指示の context 分離を実現する共有表示状態の所有変更であり、detached 固有の guard は追加しない。
+detached 述語・viewport routing・HWND・focus・timer は変更しない。設計担当と外部独立レビュアーは、
+bundle の所有自体が症状パッチではなく構造的変更であることに合意している。この合意を初版全体の検収成功とは扱わない。
+独立レビュー round 2 の追補: 完成後の resize と片側移動で保持する自動 pan の由来は、配置要求の作成時に固定する。
+未操作の origin からは適用後の pan 全体を基準にし、手動 origin の非配置軸は従来どおり基準との差に残す。
+要求内の情報だけを追加し、bundle / snapshot の所有・detached 述語・viewport routing は変更しない。
+配置結果と寿命は [fullscreen-page-start-position-plan.md](fullscreen-page-start-position-plan.md) に記録する。
+
 ### 2026-11-14: フォルダツリーのポインター入力を ROOT の pass に所有させる (§1.769)
 
 `begin_folder_pane_label_input` は ROOT だけで、前の ROOT pass のツリー描画表を使う。メインの枠を描かない表示形態では表・ジェスチャ・結果を失効させるため、既存の native backdrop / embedded still / deferred reopen / viewport enter holdover の判定を読み取る。これらの述語、detached の状態・遷移・HWND・viewport identity・context bundle は変更しない。ROOT 以外からはツリーの新しい入力所有へ触れず、表示を飛ばした pass の結果も持ち越さない。
