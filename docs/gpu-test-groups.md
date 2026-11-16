@@ -249,3 +249,76 @@ priority 100を先行、同順位は過去の開始順とし、GPU満杯でも�
 1枠の見込みは指定最新記録で約0.27分延びる。
 build・integration・vendor・競合減少によるtestcase時間の変化を含まない予測であり、
 全件の実所要・停止原因・2枠での停止予防効果は未確認。上限を増やす負荷実験はしない。
+
+## §1.767 ブランチの推移的caller登録（2026-11-16）
+
+`feat-767-stage2` のmaster取り込み `5975008e4`／`82b883c40` 後、設計担当の本体lib全件
+`20261116T112427019Z-6a76bc41` で21件が所属検査により失敗した。
+テスト本体・製品・検査入口を変えず、既存gpu inventoryへ完全名に固定したregex／equalityを追加する。
+混在module全体や `realmachine50_` 全体は選ばない。`gpu.max-threads = 2`、global並列数、
+retry／timeout／priority、既存overrideの継承とignoreは維持する。
+
+| callerのまとまり | 追加件数 | device生成へ至るhelper／理由 |
+| --- | ---: | --- |
+| `book_composition_permission::tests::realmachine50_composition_*` の対象3件 | 3 | `realmachine50_composition_open_recheck` → `depth_view_tests::install_pages`。継続／hidden判定前に生成 |
+| `depth_view_tests` の独立close／park・main handoff・readonly entry・snapshot activation | 6 | `install_pages`／`renderer`。状態検査だけに見える場合もWindowsでdeviceを作る |
+| `multiwindow_depth_accepted_(folder\|pdf\|zip)_transition_*` | 3 | `depth_accepted_transition_case` → `install_pages` |
+| `multiwindow_depth_independent_*` の対象3件 | 3 | `independent_depth_dialog_scenario` → `RootDepthViewer::new` → `install_pages` |
+| `multiwindow_depth_paused_last_active_resume_close_does_not_register_passive_again` | 1 | `install_pages` の直接呼出し |
+| `startup_ops::tests::realmachine50_*` のbookmark対象3件 | 3 | `install_pages`直接／`realmachine50_live_depth_owner_fixture`経由。取消・staleでも先にfixtureを作る |
+| smart-folderのforeign ZIP／startup restoreのwarm PDF | 2 | 両方の旧owner fixtureで `install_pages` |
+
+既存inventoryと同じ形式の9行で21件を追加した。名前実行のfilterは設定のregexから作らず、
+要求21件を完全名の `test(=...)` ORとして別に固定する。
+
+追加漏れの監査では、`depth_view_tests::{renderer,install_pages}`、`isolate_depth_renderer`、
+`RootDepthViewer::{new,linked}`、`DepthWaitViewerFixture::new` からhelper呼出し元を追った。
+12のソース範囲の通常test 118件と、`depth_dialog_owner_scenario!` の展開名12件を照合した。
+既存分も含む計130件で、修正前の未登録は要求21件だけ、修正後は0件。
+`install_ready_depth_for_export`／`record_ready_display` の他module callerも確認した。
+全件で失敗しなかったcallerも含め、`depth_setup_entry_tests`、`depth_export::main_window_tests`、
+`depth_main_window_tests` の追加／既存testは既存module prefixで所属し、dialog macro12件も登録済みだった。
+master側merge parentとの差分のdevice生成・実renderer／snapshot呼出しも調べ、
+このブランチから追加された別のGPU到達テストの漏れは見つからなかった。
+監査集合とcall-siteは `target/gpu-767-caller-audit.json`／`target/gpu-767-call-sites.txt`。
+
+対照として、Parked clickの3D状態fixtureは `DepthViewState` のみで実rendererを持たず、
+`SourceDragHarness` はNoDisplayのegui-winit State／Context／CPU headless paintだけを使う。
+native入力のfake allocation／disconnected playerや、PDF epoch等の `snapshot()` も実device生成ではない。
+これらを名前の類似だけでGPU所属にしない。未知のAPIを含む網羅保証や、group外の全実行を行った
+という意味ではない。取り込み後の全件gateは設計担当が実施する。
+
+### 検証結果
+
+対象は `82b883c40` ＋今回の設定差分。すべて共有 `run-heavy.ps1` 経由、
+Owner `codex/767-gpu-group`、WorkDir `G:/home/mimageviewer-767s2`、直列実行。
+共有全件ロックが続いたため待機し、取得済みの変更前／全一覧は再利用して、残りを
+`target/gpu-767-remaining.ps1` の1wrapperへまとめた。テストの再試行はしていない。
+lock／G: TEMPに書けない警告後はrunner既定のBelowNormal／6 build jobs／既定TEMPで継続した。
+
+| コマンド | 件数／確認 | exit |
+| --- | --- | ---: |
+| `cargo nextest list -p mimageviewer --lib --config-file target/gpu-767-before.toml --run-ignored all -E 'group(gpu)' --message-format json` | 変更前gpu 318件 | 0 |
+| `cargo nextest list -p mimageviewer --lib --run-ignored all --message-format json` | 一覧18,208件（実行しない） | 0 |
+| `cargo nextest list -p mimageviewer --lib --run-ignored all -E 'group(gpu)' --message-format json` | 変更後gpu 339件 | 0 |
+| `cargo nextest show-config test-groups -p mimageviewer --lib --groups gpu --no-pager` | 指定21件の所属・max threads = 2 | 0 |
+| `cargo nextest run -p mimageviewer --lib -E $requestedFilter --no-fail-fast --test-threads 4` | 指定21件全成功、19.126秒 | 0 |
+| `cargo fmt` | 最後のCargo操作、引数なしで成功 | 0 |
+
+`$requestedFilter` は `Get-Content -Raw -Encoding UTF8 target/gpu-767-exact-filter.txt` で読む、
+固定21完全名の `test(=...)` OR。名前リストは `target/gpu-767-requested.txt`。
+設定の追加regexをそのまま実行filterに流用していない。
+
+binary ID＋完全名で前後集合と実一覧を照合し、追加は指定21件だけ、削除0、余分なCPU追加0。
+21件のignoredは0、監査した130 callerも全件gpu所属。gpu件数318／339はignoredを含む一覧の件数。
+`target/gpu-767-verification.json` に集計を保存した。
+JUnitは実行21件と指定名の集合が一致し、failure／errorは0。
+`report-skipped = all` による非実行18,187件のmetadataは、実行件数へ含めない。
+区間の素の集計はミリ秒丸めにより最大1msの3重なりが出るが、その精度以内を除く最大は2。
+実行時の設定表示も2枠であり、制限値の変更や負荷を増やす試験はしていない。
+
+証跡は `target/gpu-767-{before,all,group}-list.json`、各同名log、
+`gpu-767-show-group.log`、`gpu-767-requested-run.log`、`gpu-767-requested-junit.xml`、
+`gpu-767-fmt.log`、`gpu-767-remaining-wrapper.log`（いずれもtarget配下）。
+変更ファイルは本書と `.config/nextest.toml` の2件だけ。
+テスト本体・製品・vendorは変更せず、全件テスト・製品起動・build-dev・commit／pushは実施していない。

@@ -46,6 +46,8 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 # a gpu_tests module, or must extend this inventory (including transitive callers).
 # Test-only device/session entry points must call assert_gpu_test_group; see
 # tests/support/gpu_test_group.rs and docs/gpu-test-groups.md.
+# Stage 767 callers also cover install_pages/renderer through composition,
+# startup, handoff and dialog helpers; keep mixed CPU modules out of this group.
 # Package/binary predicates reject absent names in standalone vendor graphs.
 # A shared binary regex is valid in workspace and every standalone vendor graph;
 # kind(test) restricts its assignments to the integration targets. Vendor lib
@@ -72,6 +74,15 @@ filter = '''
     | test(/^ui_fullscreen::depth_main_window_tests::/)
     | test(/^video::native_window_thread_spike::/)
     | test(=ai::vlm_worker::tests::real_model_serve_matches_v1_0_on_all_26_images_when_configured)
+    | test(/^app::book_composition_permission::tests::realmachine50_composition_(context_continuation_recheck_keeps_its_window_owner|hidden_main_target_does_not_handoff_previous_owner|main_open_recheck_parks_previous_owner)$/)
+    | test(/^app::depth_view_tests::(depth_independent_live_media_park_retires_request_and_slot_and_releases_entry|depth_independent_os_close_retires_request_and_slot_and_releases_entry|depth_main_live_pass_handoff_new_loading_owner_commits_but_aborted_build_keeps_depth|depth_main_live_pass_handoff_retires_only_fullscreen_on_actual_still_and_media_activation|depth_other_window_entry_is_readonly_in_both_directions_and_scoped_mount_keeps_owner)$/)
+    | test(=app::depth_view_tests::detached_snapshot_activation_handoff_switches_a_b_and_keeps_rejected_destination)
+    | test(/^app::multiwindow_scenario_tests::multiwindow_depth_accepted_(folder|pdf|zip)_transition_rejects_entry_and_export_then_reopens_same_context$/)
+    | test(/^app::multiwindow_scenario_tests::multiwindow_depth_independent_(addon_dialog_is_drawn_only_in_owner_live_pass|export_dialog_is_drawn_only_in_owner_live_pass|running_addon_returns_to_actual_root_after_os_close)$/)
+    | test(=app::multiwindow_scenario_tests::multiwindow_depth_paused_last_active_resume_close_does_not_register_passive_again)
+    | test(/^app::startup_ops::tests::realmachine50_(bookmark_preparing_context_leaf_open_keeps_its_owner_and_sibling|cancelled_bookmark_resolve_does_not_handoff_live_owner|stale_bookmark_resolve_does_not_handoff_live_owner)$/)
+    | test(=app::tests::smart_folder_transition_tests::realmachine50_foreign_zip_offer_transfers_main_origin_and_cancel_does_not_handoff)
+    | test(=app::tests::startup_restore_tests::realmachine50_forwarded_warm_pdf_keeps_main_origin_without_delaying_cached_rows)
     | test(/^app::depth_view_tests::(depth_actual_f12_both_directions_end_depth_and_offer_reentry|depth_actual_forks_retire_before_new_identity_and_keep_sibling_request_or_slot|depth_actual_independent_activation_retires_own_request_or_slot_and_keeps_sibling|depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms|depth_actual_still_window_toggle_retires_before_the_next_presentation)$/)
     | test(/^app::depth_view_tests::(depth_actual_touch_page_navigation_ignores_suspended_committed_z_zoom|depth_actual_viewer_pass_retires_video_spread_continuous_and_late_animation|depth_actual_z_d_keys_preserve_committed_zoom_through_idle_and_blocked_input|depth_background_change_preserves_panorama_key_suppression_and_existing_ring_behavior|depth_background_cycle_actual_viewer_updates_underlay_and_retires_replaced_material)$/)
     | test(/^app::depth_view_tests::(depth_background_cycle_key_and_ring_preserve_owner_and_alpha_rules|depth_close_and_foreground_park_remove_the_context_owner|depth_collapsed_preference_survives_d_exit_and_reentry|depth_continuation_ends_for_animation_continuous_reading_and_closed_viewer|depth_continues_between_stills_but_video_cannot_resurrect_it)$/)
