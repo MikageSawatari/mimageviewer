@@ -165,7 +165,7 @@ pub(crate) struct DepthEntryInput {
     pub is_animation: bool,
     pub spread_double: bool,
     pub continuous_reading: bool,
-    pub main_viewer_presentation: bool,
+    pub other_window_depth: bool,
     pub wgpu_available: bool,
     pub editing: bool,
     pub page_turning: bool,
@@ -177,7 +177,7 @@ pub(crate) enum DepthEntryBlock {
     Animation,
     Spread,
     ContinuousReading,
-    Detached,
+    OtherWindow,
     NoWgpu,
     Editing,
     PageTurning,
@@ -190,7 +190,9 @@ impl DepthEntryBlock {
             Self::Animation => "アニメーション画像は 3D 写真に対応していません",
             Self::Spread => "3D 写真は 1 ページ表示で使えます",
             Self::ContinuousReading => "3D 写真はページ表示で使えます",
-            Self::Detached => "3D 写真は、メインの画像表示と F12 の別ウィンドウで使えます",
+            Self::OtherWindow => {
+                "3D 写真は別のウィンドウで表示中です。そちらを終了してから使ってください"
+            }
             Self::NoWgpu => "3D 写真には GPU 描画が必要です",
             Self::Editing => "編集モードを終了してから 3D 写真を使ってください",
             Self::PageTurning => "ページめくりの完了後に 3D 写真を使ってください",
@@ -208,8 +210,8 @@ pub(crate) fn entry_allowed(i: DepthEntryInput) -> Result<(), DepthEntryBlock> {
         Some(DepthEntryBlock::Spread)
     } else if i.continuous_reading {
         Some(DepthEntryBlock::ContinuousReading)
-    } else if !i.main_viewer_presentation {
-        Some(DepthEntryBlock::Detached)
+    } else if i.other_window_depth {
+        Some(DepthEntryBlock::OtherWindow)
     } else if !i.wgpu_available {
         Some(DepthEntryBlock::NoWgpu)
     } else if i.editing {
@@ -553,7 +555,7 @@ mod tests {
     fn entry_rejects_each_incompatible_state() {
         let good = DepthEntryInput {
             image_viewer: true,
-            main_viewer_presentation: true,
+            other_window_depth: false,
             wgpu_available: true,
             ..Default::default()
         };
@@ -596,10 +598,10 @@ mod tests {
             ),
             (
                 DepthEntryInput {
-                    main_viewer_presentation: false,
+                    other_window_depth: true,
                     ..good
                 },
-                DepthEntryBlock::Detached,
+                DepthEntryBlock::OtherWindow,
             ),
             (
                 DepthEntryInput {

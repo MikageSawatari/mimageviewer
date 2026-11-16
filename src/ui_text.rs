@@ -40,6 +40,14 @@ use comic_core::{
 };
 use std::collections::{HashMap, HashSet};
 
+#[derive(Clone, Copy)]
+enum TextCanvasPointerInput {
+    Press(egui::Pos2),
+    Held(Option<egui::Pos2>),
+    Release(Option<egui::Pos2>),
+    Hover(Option<egui::Pos2>),
+}
+
 /// パネル幅 (編集コントロールが入るので conceal より少し広い)。
 // 0.37 の塗り色 + 不透明度の行は 268.21875pt。整数 pt の本文予算を
 // 269pt に切り上げ、描画のはみ出しを許容誤差で隠さない。
@@ -2436,10 +2444,48 @@ impl App {
         transform: &DisplayedImageTransform,
         overflow_pointer_input: crate::ui_fullscreen::FsFrontPointerFrameInput,
     ) {
+        let events = ctx.input(|input| input.pointer.button_events().collect::<Vec<_>>());
+        for event in events {
+            let sample = match event {
+                egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Primary,
+                    pos,
+                } if !overflow_pointer_input.owns(egui::PointerButton::Primary) => {
+                    TextCanvasPointerInput::Press(pos)
+                }
+                egui::PointerButtonEvent::Released {
+                    button: egui::PointerButton::Primary,
+                    pos,
+                } if !overflow_pointer_input.owns(egui::PointerButton::Primary)
+                    && !overflow_pointer_input.owns_release(egui::PointerButton::Primary) =>
+                {
+                    TextCanvasPointerInput::Release(pos)
+                }
+                _ => continue,
+            };
+            self.handle_text_canvas_pointer_sample(ctx, transform, sample);
+        }
+        let sample = ctx.input(|input| {
+            if !overflow_pointer_input.owns(egui::PointerButton::Primary)
+                && input.pointer.primary_down()
+            {
+                TextCanvasPointerInput::Held(input.pointer.interact_pos())
+            } else {
+                TextCanvasPointerInput::Hover(input.pointer.hover_pos())
+            }
+        });
+        self.handle_text_canvas_pointer_sample(ctx, transform, sample);
+    }
+
+    fn handle_text_canvas_pointer_sample(
+        &mut self,
+        ctx: &egui::Context,
+        transform: &DisplayedImageTransform,
+        sample: TextCanvasPointerInput,
+    ) {
         if self.book_structural_op.is_some() {
             return;
         }
-        let primary_allowed = !overflow_pointer_input.owns(egui::PointerButton::Primary);
         if self.book_append_undo_in_progress() {
             return;
         }
@@ -2455,16 +2501,16 @@ impl App {
         let fonts = self.ensure_comic_fonts();
         let level_permit = crate::keyboard_input::focused_key_state_permit(ctx);
 
-        let (pressed, down, released, pos) = ctx.input(|i| {
-            (
-                primary_allowed && i.pointer.primary_pressed(),
-                primary_allowed && i.pointer.primary_down(),
-                primary_allowed
-                    && !overflow_pointer_input.owns_release(egui::PointerButton::Primary)
-                    && i.pointer.primary_released(),
-                i.pointer.interact_pos(),
-            )
-        });
+        let (pressed, down, released, pos) = match sample {
+            TextCanvasPointerInput::Press(pos) => (true, true, false, Some(pos)),
+            TextCanvasPointerInput::Held(pos) => (false, true, false, pos),
+            TextCanvasPointerInput::Release(pos) => (false, false, true, pos),
+            TextCanvasPointerInput::Hover(pos) => (false, false, false, pos),
+        };
+        let release_pos = match sample {
+            TextCanvasPointerInput::Release(pos) => pos,
+            _ => None,
+        };
         let pointer_over_floating_ui = text_floating_ui_blocks_canvas_input(ctx, pos);
         let space_pan_held = level_permit.is_some_and(|permit| {
             self.keymap
@@ -2696,7 +2742,8 @@ impl App {
                     let objs = self.comic_docs.get(&key).cloned().unwrap_or_default();
                     self.save_comic_objects(fs_idx, &key, &objs);
                     self.text_dirty_at = None;
-                } else if matches!(drag.kind, TextDragKind::Move)
+                } else if release_pos.is_some()
+                    && matches!(drag.kind, TextDragKind::Move)
                     && !level_permit
                         .is_some_and(|permit| modifier_held_via_os(permit, ModKind::Ctrl))
                     && !level_permit
@@ -2712,8 +2759,11 @@ impl App {
                     );
                 }
             }
-            if let Some(marquee) = self.text_marquee.take() {
-                let moved = pos.is_some_and(|p| (p - marquee.start_screen).length() >= 4.0);
+            if let Some(mut marquee) = self.text_marquee.take()
+                && let Some(release_pos) = release_pos
+            {
+                marquee.current_screen = release_pos;
+                let moved = (release_pos - marquee.start_screen).length() >= 4.0;
                 if moved {
                     let screen_rect =
                         egui::Rect::from_two_pos(marquee.start_screen, marquee.current_screen);
@@ -11370,6 +11420,79 @@ mod tests {
             sh,
             scale: transform.screen_px_per_source_px(egui::vec2(sw, sh)),
         }
+    }
+
+    #[test]
+    fn realmachine55_positionless_release_retires_text_drag_without_click_selection() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.items = vec![crate::grid_item::GridItem::Image(
+            app.tmp.path().join("text.png"),
+        )];
+        app.image_metas = vec![Some((400, 300))];
+        let generation = app.items_generation;
+        app.page_dims_cache.record(
+            generation,
+            0,
+            crate::page_dims::PagePixelDimensions::Canonical(
+                crate::page_dims::CanonicalPageDimensions::new(400, 300),
+            ),
+        );
+        app.fullscreen_idx = Some(0);
+        let key = app.page_path_key(0).unwrap();
+        app.comic_docs.insert(
+            key,
+            vec![
+                AnnotationObject::new_text(1, (10.0, 10.0), Default::default()),
+                AnnotationObject::new_text(2, (30.0, 30.0), Default::default()),
+            ],
+        );
+        app.text_selected_ids = vec![1, 2];
+        app.text_selected = Some(2);
+        let view = make_view(Rotation::None, 0.0);
+        assert!(app.text_img_view(0, &view.transform).is_some());
+        let pos = egui::pos2(700.0, 600.0);
+        ctx.run_pass(
+            egui::RawInput {
+                events: vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .drop_without_applying_deltas();
+        app.text_drag = Some(TextDrag {
+            id: 1,
+            kind: TextDragKind::Move,
+            start: pos,
+            start_pivot: (10.0, 10.0),
+            start_img: (350.0, 250.0),
+            start_half_extents: None,
+            start_rotation_rad: 0.0,
+            last_img: (350.0, 250.0),
+            armed: false,
+            moved: false,
+        });
+        ctx.run_pass(
+            egui::RawInput {
+                events: vec![egui::Event::PointerButtonReleased {
+                    button: egui::PointerButton::Primary,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                app.handle_text_canvas_input(ctx, &view.transform, Default::default());
+            },
+        )
+        .drop_without_applying_deltas();
+        assert!(app.text_drag.is_none());
+        assert_eq!(app.text_selected_ids, vec![1, 2]);
+        assert_eq!(app.text_selected, Some(2));
     }
 
     #[test]

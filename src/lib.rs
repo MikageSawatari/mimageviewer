@@ -922,6 +922,17 @@ unsafe extern "system" fn mouse_nav_hook_proc(
             let msg_ptr = lparam.0 as *const MSG;
             if !msg_ptr.is_null() {
                 let msg = &*msg_ptr;
+                // The existing UI-thread transport also observes messages consumed by
+                // DefWindowProc's native move/resize loop. Never sample button levels.
+                if wparam.0 == 1 {
+                    // PM_REMOVE, not PM_NOREMOVE
+                    crate::key_input::observe_native_detached_message(
+                        msg.hwnd.0 as usize as u64,
+                        msg.message,
+                        msg.wParam.0,
+                        msg.lParam.0,
+                    );
+                }
                 if let Some(candidate) = crate::mouse_seek_debug::classify_hook_candidate(
                     msg.message,
                     msg.wParam.0,
@@ -2013,6 +2024,20 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
             #[cfg(windows)]
             cc.egui_ctx
                 .options_mut(|options| options.quit_shortcuts.clear());
+            #[cfg(windows)]
+            let native_input_listener_result =
+                eframe::native_window_input::set_native_window_input_listener(
+                    &cc.egui_ctx,
+                    Arc::new(key_input::NativeKeyInputListener),
+                );
+            #[cfg(windows)]
+            if let Err(error) = native_input_listener_result {
+                crate::logger::log(format!(
+                    "key-input: backend listener installation failed: {error}"
+                ));
+            }
+            #[cfg(windows)]
+            key_input::install_normalized_pointer_input_observer(&cc.egui_ctx);
             key_input::install_synthetic_input_plugin(&cc.egui_ctx);
             modifier_probe::install(&cc.egui_ctx);
             ime_focus::install_ime_input_policy(&cc.egui_ctx);
@@ -2053,6 +2078,10 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
                 )
             });
             app.depth_export_workers = Some(depth_export_workers);
+            #[cfg(windows)]
+            if native_input_listener_result.is_err() {
+                app.show_feedback_toast("ウィンドウの入力を開始できませんでした".to_owned());
+            }
             app.install_previous_run_notice(previous_run_report, &cc.egui_ctx);
             app.install_diagnostic_checkpoint(diagnostic_checkpoint, cc.wgpu_render_state.as_ref());
             match collection_install.clone() {

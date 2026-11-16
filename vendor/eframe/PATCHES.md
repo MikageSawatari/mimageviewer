@@ -316,3 +316,72 @@ The earlier Review A regression description applies only after atlas publication
 its former fixture missed this startup state. Both baseline real-GPU startup
 regressions reproduced InvalidDimension(Zero(X)); details are in
 `docs/egui-0.37-stage7-startup-atlas-verification.md`.
+
+## 実機50 C: native allocation と入力登録の所有（2026-11-14）
+
+全child版の承認範囲で `native_window_input` を追加。`Context` に属する共有registryから、
+`NativeWindowAllocation { viewport_id, registration, window_id, windows_hwnd }` を参照する。
+`window_id` は実native eventのsourceであり、logical `ViewportRegistration` やresizeで変わる
+surface generationをnative allocation寿命の代用にしない。HWND/WindowId再利用はあり得る。
+
+`native_window_allocation_witness` は同descriptorのHWND再利用や旧window Arcの残存を区別する。
+unique backend leaseだけが持つ `Arc<()>` の `Weak` をquery/cacheへ渡し、明示retireの最初に
+strong ownerを破棄して同期失効する。witnessのCloneは入力/native ownerを延命せず、
+Eqはweak pointer identityで判定する。既存Copy descriptor queryは互換維持する。
+
+- `register_native_window_allocation` が返す非Cloneのbackend owned leaseが登録の唯一のowner。
+  listenerはallocationごとの入力leaseを返す。後継公開前に明示retireし、その責任を消費するため、
+  終了済みownerの遅いDropは同じHWND/WindowIdの後継を消さない。
+- listener接続時は既存ROOTを一度だけreplayし、以後はallocation生成時に一度だけ導入する。
+  Appへcallbackせず、backend thread上でnative input ownerだけを操作する。
+  install/retireはregistry/egui data lockの外。導入失敗はerrorログとconsumerの通知で終端し、
+  物理HWNDのqueryは維持する。rect再探索、再導入retry、入力方式のfallbackは追加しない。
+- Wgpu rootは `init_run_state` のAppCreator前、Glow rootは
+  `GlutinWindowContext::new` → `initialize_window` から公開する。
+  両backendのdeferred/immediate childも同じfactory/leaseを使う。
+- builder recreateは旧Stateの論理RawInput/IMEを既存
+  `retain_viewport_input_before_state_replacement` で保持した後、native input leaseを終了し、
+  旧 `viewport_from_window` sourceを同期撤去する。Glowは `window_from_viewport` も撤去。
+  その後だけ旧window/State/surfaceを解放し、通常初期化から後継を公開する。
+  以前は旧WindowId mapが残り、同じlogical viewportの後継Stateへ旧sourceを配送し得た。
+- output GC・明示child Close・stale registration置換は既存child-first資源退役を共用。
+  Viewport ownerのDropはnative windowのArc保持とは独立に入力leaseを明示終了する。
+  backend shutdownも入力とsource mapsを明示退役し、初期化失敗等のDropは同じ冪等終了を使う。
+  Android suspendも同じnative退役へ接続し、Glowの論理入力はState置換前に保持する。
+  上流移植時の注意: Wgpu suspendでのROOT論理入力保持は未対応（WindowsではwinitがSuspendedを送らず、2026-11-14独立レビューP2-2は設計担当判断で対象外）。
+- producer factory/owned leaseはheadless backendにも同じregistry経路を提供する。
+  test-script window witnessやgeometryを製品の入力登録正本として使わない。
+
+headless回帰は共通ROOT replay・同HWND/WindowId再利用時の旧owner Drop・導入失敗時のquery保持と、
+Wgpu/Glowの実recreate helperを通る旧source撤去・後継Stateへの未配送・兄弟source維持・IME保持。
+既存の両backend retirement driverにも同じfactoryのleaseとsynthetic WindowIdを持たせ、
+ROOT/deferred childの実GC・terminal Close dispatcher、および既存immediate callbackの
+外側退役を検査する。消えたchild/descendantのinput retire/query/source map撤去、
+兄弟とROOTの保持、その後の実shutdown入力helperによる全allocationの一度だけの終了を照合する。
+immediateは両backendの実prepareからallocation準備helperを共有し、headless側もUI callback前に
+同helperと正規factoryでlease/sourceを確立する。既存deferred ownerの再利用と新規immediate生成を
+両方通し、callback開始時のImmediate class・query/source一致・生存、outer退役での失効を検査する。
+保持済みwitnessもGC/Close/shutdownで失効すること、同descriptor再利用時に旧witnessが
+後継と区別されること、listener input retireに入る前に失効済みであることを検査する。
+Glow shutdownの入力ループはGL ownerから小helperへ抽出し、製品とheadlessで同じ処理を呼ぶ。
+これらはnative windowやGPUを作らず、実OSのfocus/DPI/IME/入力動作の確認は代替しない。
+Cargo実行・独立レビュー・受入結果は
+[実機50調査書](../../docs/depth-parallax-realmachine50-investigation.md) の後続記録を正本とする。
+
+## 依頼55 独立レビュー: 診断の製品sink（2026-11-15）
+
+native allocation入力診断のInfo targetを`eframe::native_window_input::diagnostic`へ固定する。
+製品のlog facadeは正確なこのtargetとegui-winitのpointer診断だけを通常sinkへ通す。
+vendor全体のInfo、近似target、毎frameログは許可しない。上流へ戻す際は製品側の
+max level／target filterとの接続と、実非同期sinkまでの回帰を併せて移すこと。
+位置なしの物理releaseはegui-winit／eguiのraw終端として配送し、backendで位置を推定しない。
+caption buttonはAppの既存native ownerが解放hitとOS選択を消費し、native call返却まで所有する。
+allocation leaseや配送対応の寿命をこの判定で変更しない。根拠と検証範囲は依頼50調査書§5.8を参照。
+
+## 依頼55: 反復するmain fullscreen退役のheadless対照（2026-11-15）
+
+既存Wgpu／Glow lifecycle adapterでchildのImmediate／Deferred切替と、別main viewerの
+Immediate生成・明示退役を3往復し、生存child／兄弟のnative leaseとWindowId配送対応が
+保たれることを検査する。backend製品lifecycleは変更していない。実配送mapにないprimary押下だけは
+共通の型付き `UnmappedWindowId` 診断を出し、State以前の欠落を区別する（配送先は推定しない）。App層の反復試験と
+State変換の試験を分け、実OSイベント到達の証明とは扱わない。

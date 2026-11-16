@@ -190,6 +190,9 @@ impl FsFrontPointerFrameInput {
                         egui::Event::PointerButton {
                             button, pressed, ..
                         } => self.owns(*button) || (!pressed && self.owns_release(*button)),
+                        egui::Event::PointerButtonReleased { button, .. } => {
+                            self.owns(*button) || self.owns_release(*button)
+                        }
                         egui::Event::PointerMoved(_) | egui::Event::PointerGone => {
                             self.owns(egui::PointerButton::Primary)
                         }
@@ -350,6 +353,20 @@ impl FsFrontPointerOwnership {
                                 self.clicks = FsBackingClickBoundary::default();
                             }
                         } else {
+                            event_owned = self.buttons[index];
+                            release_owned[index] = self.buttons[index];
+                            owned[index] |= self.buttons[index];
+                            self.buttons[index] = false;
+                        }
+                    }
+                    egui::Event::PointerButtonReleased { button, .. } => {
+                        let index = match button {
+                            egui::PointerButton::Primary => Some(0),
+                            egui::PointerButton::Secondary => Some(1),
+                            egui::PointerButton::Middle => Some(2),
+                            _ => None,
+                        };
+                        if let Some(index) = index {
                             event_owned = self.buttons[index];
                             release_owned[index] = self.buttons[index];
                             owned[index] |= self.buttons[index];
@@ -3080,6 +3097,9 @@ enum FsNavigatorInputEvent {
         pressed: bool,
         adjudicated_click: Option<(egui::Pos2, u32)>,
     },
+    PointerButtonReleased {
+        button: egui::PointerButton,
+    },
     MouseWheel {
         delta_y: f32,
     },
@@ -3115,6 +3135,7 @@ fn fs_navigator_tracks_event(event: &egui::Event) -> bool {
         event,
         egui::Event::PointerMoved(_)
             | egui::Event::PointerButton { .. }
+            | egui::Event::PointerButtonReleased { .. }
             | egui::Event::MouseWheel { .. }
             | egui::Event::PointerGone
             | egui::Event::WindowFocused(_)
@@ -3132,11 +3153,12 @@ impl FsNavigatorFrameInput {
                 .events
                 .into_iter()
                 .zip(ownership.iter())
-                .map(|(event, owned)| match (event, owned) {
+                .filter_map(|(event, owned)| match (event, owned) {
                     (FsNavigatorInputEvent::PointerButton { pos, .. }, true) => {
-                        FsNavigatorInputEvent::PointerMoved(pos)
+                        Some(FsNavigatorInputEvent::PointerMoved(pos))
                     }
-                    (event, _) => event,
+                    (FsNavigatorInputEvent::PointerButtonReleased { .. }, true) => None,
+                    (event, _) => Some(event),
                 })
                 .collect();
         }
@@ -3203,6 +3225,14 @@ impl FsNavigatorFrameInput {
                             adjudicated_click,
                         })
                     }
+                    egui::Event::PointerButtonReleased { button, .. } => {
+                        let (adjudicated_button, click) = adjudicated_releases
+                            .next()
+                            .expect("each raw release must have one adjudicated egui release");
+                        debug_assert_eq!(adjudicated_button, *button);
+                        debug_assert!(click.is_none());
+                        Some(FsNavigatorInputEvent::PointerButtonReleased { button: *button })
+                    }
                     egui::Event::MouseWheel { delta, .. } => {
                         Some(FsNavigatorInputEvent::MouseWheel { delta_y: delta.y })
                     }
@@ -3243,7 +3273,8 @@ impl FsNavigatorFrameInput {
                     FsNavigatorInputEvent::PointerMoved(pos)
                     | FsNavigatorInputEvent::PointerButton { pos, .. } => Some(*pos),
                     FsNavigatorInputEvent::PointerGone => None,
-                    FsNavigatorInputEvent::MouseWheel { .. }
+                    FsNavigatorInputEvent::PointerButtonReleased { .. }
+                    | FsNavigatorInputEvent::MouseWheel { .. }
                     | FsNavigatorInputEvent::WindowFocused(_) => pointer_pos,
                 });
         let input = Self {
@@ -3290,14 +3321,16 @@ impl FsNavigatorFrameInput {
             _ => false,
         };
         for event in self.events.iter().rev() {
-            if let FsNavigatorInputEvent::PointerButton {
-                button: event_button,
-                pressed,
-                ..
-            } = event
-                && *event_button == button
-            {
-                down = !pressed;
+            match event {
+                FsNavigatorInputEvent::PointerButton {
+                    button: event_button,
+                    pressed,
+                    ..
+                } if *event_button == button => down = !pressed,
+                FsNavigatorInputEvent::PointerButtonReleased {
+                    button: event_button,
+                } if *event_button == button => down = true,
+                _ => {}
             }
         }
         down
@@ -3310,7 +3343,8 @@ impl FsNavigatorFrameInput {
                 FsNavigatorInputEvent::PointerMoved(pos)
                 | FsNavigatorInputEvent::PointerButton { pos, .. } => Some(*pos),
                 FsNavigatorInputEvent::PointerGone => None,
-                FsNavigatorInputEvent::MouseWheel { .. }
+                FsNavigatorInputEvent::PointerButtonReleased { .. }
+                | FsNavigatorInputEvent::MouseWheel { .. }
                 | FsNavigatorInputEvent::WindowFocused(_) => current,
             })
     }
@@ -3348,6 +3382,7 @@ impl FsNavigatorFrameInput {
                 }
                 FsNavigatorInputEvent::PointerGone => pointer_pos = None,
                 FsNavigatorInputEvent::WindowFocused(next) => focused = *next,
+                FsNavigatorInputEvent::PointerButtonReleased { .. } => {}
             }
         }
         if saw_wheel_event {
@@ -5579,6 +5614,38 @@ impl StillSeekGesture {
 ///
 /// Keeping the response ordering here lets handler-level tests drive the same state transition
 /// code as production instead of testing `SeekRowGesture` in isolation.
+fn still_seek_response_pointer(response: &egui::Response) -> Option<egui::Pos2> {
+    if response.clicked_by(egui::PointerButton::Primary) {
+        let pos = response.ctx.input(|input| {
+            input
+                .pointer
+                .button_click_position(egui::PointerButton::Primary)
+        })?;
+        Some(
+            response
+                .ctx
+                .layer_transform_from_global(response.layer_id)
+                .map_or(pos, |transform| transform * pos),
+        )
+    } else if response.clicked_with_keyboard_or_accessibility() {
+        response.interact_pointer_pos()
+    } else if response.drag_stopped() {
+        response.drag_stopped_pos()
+    } else {
+        response
+            .interact_pointer_pos()
+            .or_else(|| response.hover_pos())
+    }
+}
+
+fn still_seek_preview_pointer(response: &egui::Response) -> Option<egui::Pos2> {
+    if response.dragged() || response.is_pointer_button_down_on() {
+        response.interact_pointer_pos()
+    } else {
+        response.hover_pos()
+    }
+}
+
 fn handle_still_seek_track_response(
     response: &egui::Response,
     gesture: &mut StillSeekGesture,
@@ -5594,11 +5661,16 @@ fn handle_still_seek_track_response(
         *gesture = StillSeekGesture::Track(crate::video::seek_strip::SeekRowGesture::new(origin));
     }
 
-    let note_seek_activity = response.dragged() && response.interact_pointer_pos().is_some();
+    let drag_pointer = if response.dragged() {
+        response.interact_pointer_pos()
+    } else {
+        response.drag_stopped_pos()
+    };
+    let note_seek_activity = response.dragged() && drag_pointer.is_some();
     let mut action = if response.clicked() {
         StillSeekTrackAction::Seek
     } else if (response.dragged() || response.drag_stopped())
-        && let Some(pointer_pos) = response.interact_pointer_pos()
+        && let Some(pointer_pos) = drag_pointer
     {
         let decision = match gesture {
             StillSeekGesture::Track(gesture) => Some(gesture.update(pointer_pos)),
@@ -5620,10 +5692,12 @@ fn handle_still_seek_track_response(
     };
 
     if response.drag_stopped() {
-        if matches!(
-            gesture,
-            StillSeekGesture::Track(crate::video::seek_strip::SeekRowGesture::Undecided { .. })
-        ) {
+        if response.drag_stopped_pos().is_some()
+            && matches!(
+                gesture,
+                StillSeekGesture::Track(crate::video::seek_strip::SeekRowGesture::Undecided { .. })
+            )
+        {
             action = StillSeekTrackAction::Seek;
         }
         if matches!(gesture, StillSeekGesture::Track(_)) {
@@ -5683,7 +5757,14 @@ fn handle_still_seek_strip_response(
         }
     }
 
-    let pointer = response.interact_pointer_pos();
+    // A new completed click may share this Response with the old drag stop.
+    // The old gesture may only use its own terminal, while the caller uses
+    // the new click's point to choose a page.
+    let pointer = if response.dragged() {
+        response.interact_pointer_pos()
+    } else {
+        response.drag_stopped_pos()
+    };
     let closed_by_drag = (response.dragged() || response.drag_stopped())
         && pointer.is_some_and(|pointer| match *gesture {
             StillSeekGesture::Strip { origin_pointer, .. } => {
@@ -5742,17 +5823,10 @@ fn handle_still_seek_strip_response(
                 drag_step_width,
             };
         }
-    } else if response.drag_stopped()
-        && let StillSeekGesture::Strip {
-            layout_center_pos, ..
-        } = *gesture
-    {
-        // A release normally retains `interact_pointer_pos`, but if the platform drops that
-        // final coordinate, commit the last center shown instead of leaving a dead drag owner.
-        *gesture = StillSeekGesture::StripCommitted {
-            layout_center_pos,
-            page_pos_at_commit: current_page_pos,
-        };
+    } else if response.drag_stopped() && matches!(gesture, StillSeekGesture::Strip { .. }) {
+        // An unpositioned end only retires the preview owner. It does not
+        // choose the last previewed page or a later hover as a drop target.
+        *gesture = StillSeekGesture::Idle;
     }
 
     StillSeekStripInteraction {
@@ -6355,6 +6429,9 @@ impl MusicOverflowPointerStream {
                     } else {
                         *buttons &= !mask;
                     }
+                }
+                egui::Event::PointerButtonReleased { button, .. } => {
+                    *buttons &= !(1 << (*button as u8));
                 }
                 egui::Event::Touch {
                     device_id,
@@ -8977,6 +9054,7 @@ pub(crate) fn detached_image_window_bar_close_button_rect(full_rect: egui::Rect)
 #[cfg(windows)]
 #[derive(Default)]
 struct DetachedImageWindowEventBatch {
+    activation_requests: Vec<crate::app::DetachedActivationRequest>,
     close_ids: Vec<u64>,
     activate_ids: Vec<u64>,
     focus_updates: Vec<(u64, bool)>,
@@ -9018,22 +9096,25 @@ fn filter_sidecar_restore_target_from_passive_events(
 fn parked_live_egui_right_drag_event_kind(
     egui_owns_right_drag: bool,
     right_drag_live: bool,
-    primary_pressed: bool,
     focused_last_frame: bool,
     focused_now: bool,
-    secondary_pressed: bool,
+    button_events: Vec<egui::PointerButtonEvent>,
     secondary_down: bool,
-    secondary_released: bool,
     pointer_pos: Option<egui::Pos2>,
 ) -> Option<crate::app::DetachedRightDragEventKind> {
     if !egui_owns_right_drag {
         return None;
     }
-    if right_drag_live && primary_pressed {
-        Some(crate::app::DetachedRightDragEventKind::Cancel {
-            reason: crate::app::DetachedRightDragCancelReason::PrimaryButtonPressed,
-        })
-    } else if right_drag_live && focused_last_frame && !focused_now {
+    let secondary_released = button_events.iter().any(|event| {
+        matches!(
+            event,
+            egui::PointerButtonEvent::Released {
+                button: egui::PointerButton::Secondary,
+                ..
+            }
+        )
+    });
+    if right_drag_live && focused_last_frame && !focused_now {
         Some(crate::app::DetachedRightDragEventKind::Cancel {
             reason: crate::app::DetachedRightDragCancelReason::FocusLost,
         })
@@ -9041,11 +9122,33 @@ fn parked_live_egui_right_drag_event_kind(
         Some(crate::app::DetachedRightDragEventKind::Cancel {
             reason: crate::app::DetachedRightDragCancelReason::ButtonStateLost,
         })
-    } else if secondary_pressed || secondary_down || secondary_released {
+    } else if secondary_down
+        || button_events.iter().any(|event| {
+            matches!(
+                event,
+                egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Secondary,
+                    ..
+                } | egui::PointerButtonEvent::Released {
+                    button: egui::PointerButton::Secondary,
+                    ..
+                }
+            )
+        })
+        || (right_drag_live
+            && button_events.iter().any(|event| {
+                matches!(
+                    event,
+                    egui::PointerButtonEvent::Pressed {
+                        button: egui::PointerButton::Primary,
+                        ..
+                    }
+                )
+            }))
+    {
         Some(crate::app::DetachedRightDragEventKind::Input {
-            secondary_pressed,
+            button_events,
             secondary_down,
-            secondary_released,
             pointer_pos,
         })
     } else {
@@ -12152,46 +12255,7 @@ impl App {
                         "lanczos_regenerate",
                         key.as_deref(),
                         self.input_seq,
-                        &[
-                            ("source_w", stats.source_size[0].into()),
-                            ("source_h", stats.source_size[1].into()),
-                            ("target_w", stats.target_size[0].into()),
-                            ("target_h", stats.target_size[1].into()),
-                            ("scale_branch", stats.scale_branch.as_str().into()),
-                            (
-                                "visible_source_x",
-                                stats
-                                    .visible_source_region
-                                    .map(|region| region[0].into())
-                                    .unwrap_or(serde_json::Value::Null),
-                            ),
-                            (
-                                "visible_source_y",
-                                stats
-                                    .visible_source_region
-                                    .map(|region| region[1].into())
-                                    .unwrap_or(serde_json::Value::Null),
-                            ),
-                            (
-                                "visible_source_w",
-                                stats
-                                    .visible_source_region
-                                    .map(|region| region[2].into())
-                                    .unwrap_or(serde_json::Value::Null),
-                            ),
-                            (
-                                "visible_source_h",
-                                stats
-                                    .visible_source_region
-                                    .map(|region| region[3].into())
-                                    .unwrap_or(serde_json::Value::Null),
-                            ),
-                            ("smoothing_percent", stats.smoothing_percent.into()),
-                            ("blur_factor", f64::from(stats.blur_factor).into()),
-                            ("texture_fetches", stats.texture_fetches.into()),
-                            ("encode_submit_cpu_ms", stats.encode_submit_cpu_ms.into()),
-                            ("regeneration_count", stats.regeneration_count.into()),
-                        ],
+                        &stats.perf_fields(),
                     );
                 }
                 crate::gpu_lanczos::LanczosPerfEvent::UpscaleLimitFallback(stats) => {
@@ -23617,15 +23681,6 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(crate) fn parked_live_music_close_slot_rect(
-        full_rect: egui::Rect,
-        edge_trigger: f32,
-    ) -> Option<egui::Rect> {
-        Self::parked_live_music_window_layout(full_rect, edge_trigger)
-            .map(|layout| Self::music_chrome_close_slot_rect(layout.top_rect))
-    }
-
-    #[cfg(windows)]
     fn music_chrome_title_clip_rect(
         top_rect: egui::Rect,
         first_right_control_left: f32,
@@ -23782,6 +23837,7 @@ impl App {
         ui: &mut egui::Ui,
         full_rect: egui::Rect,
         id: &'static str,
+        pointer_close_owned_by_gesture: bool,
         close_requested: &mut bool,
     ) -> egui::Rect {
         let close_rect = detached_image_window_bar_close_button_rect(full_rect);
@@ -23801,7 +23857,13 @@ impl App {
             |p, c, r| draw_close_icon(p, c, r),
         )
         .hover_tip_dark("閉じる");
-        if close_resp.clicked() {
+        // The callback's canonical gesture owner consumes pointer close. Keep
+        // the existing keyboard/accessibility fact independent of pointer input.
+        if if pointer_close_owned_by_gesture {
+            close_resp.clicked_with_keyboard_or_accessibility()
+        } else {
+            close_resp.clicked()
+        } {
             *close_requested = true;
         }
         close_rect
@@ -23813,6 +23875,7 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         window: &crate::app::DeferredDetachedImageWindowView,
+        pointer_close_owned_by_gesture: bool,
         close_requested: &mut bool,
     ) {
         let hover_in_top = ctx.input(|i| {
@@ -23847,6 +23910,7 @@ impl App {
             ui,
             full_rect,
             "detached_image_close_btn",
+            pointer_close_owned_by_gesture,
             close_requested,
         );
         let mut next_x = close_rect.left();
@@ -23881,6 +23945,9 @@ impl App {
         batch: &mut DetachedImageWindowEventBatch,
     ) {
         match event {
+            crate::app::DeferredDetachedImageWindowEvent::Activation { request } => {
+                batch.activation_requests.push(request);
+            }
             crate::app::DeferredDetachedImageWindowEvent::PageOverview {
                 id,
                 command,
@@ -24008,7 +24075,7 @@ impl App {
         }
 
         let crate::app::DetachedRightDragEvent { sequence, kind } = event;
-        let (secondary_pressed, secondary_down, secondary_released, pointer_pos) = match kind {
+        let (button_events, secondary_down, pointer_pos) = match kind {
             crate::app::DetachedRightDragEventKind::Cancel { reason } => {
                 self.cancel_detached_right_drag_owner(window_id, reason.as_str());
                 self.log_detached_image_window_debug(format!(
@@ -24018,22 +24085,11 @@ impl App {
                 return;
             }
             crate::app::DetachedRightDragEventKind::Input {
-                secondary_pressed,
+                button_events,
                 secondary_down,
-                secondary_released,
                 pointer_pos,
-            } => (
-                secondary_pressed,
-                secondary_down,
-                secondary_released,
-                pointer_pos,
-            ),
+            } => (button_events, secondary_down, pointer_pos),
         };
-
-        if secondary_pressed && pointer_pos.is_some_and(|pos| pos.y <= TOP_BAR_HEIGHT) {
-            self.cancel_detached_right_drag_owner(window_id, "right_drag_passive_chrome");
-            return;
-        }
 
         let mode = self
             .settings
@@ -24046,71 +24102,135 @@ impl App {
             return;
         }
 
-        let fallback_pos = self.right_drag_pointer_pos(owner);
-        let Some(pos) = pointer_pos.or(fallback_pos) else {
-            if secondary_released {
-                self.cancel_detached_right_drag_owner(window_id, "right_drag_position_missing");
-            }
-            return;
-        };
-
-        let recognition = match mode {
-            RightDragMode::RingShortcut => {
-                let Some(ring_context) = right_drag_context.ring_context() else {
-                    self.cancel_detached_right_drag_owner(window_id, "right_drag_context_invalid");
-                    return;
-                };
-                if secondary_pressed {
-                    self.start_mouse_ring_flick(ctx, owner, ring_context, pos, None);
+        let mut outcome = MouseFlickOutcome::None;
+        for event in button_events {
+            let (pos, pressed, released) = match event {
+                egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Primary,
+                    ..
+                } => {
+                    self.cancel_detached_right_drag_owner(window_id, "right_drag_primary_press");
+                    continue;
                 }
-                self.recognize_mouse_ring_flick_with_pos(
-                    ctx,
-                    owner,
-                    ring_context,
-                    pos,
-                    secondary_down,
-                    secondary_released,
-                )
-            }
-            RightDragMode::MouseGesture => {
-                if secondary_pressed {
-                    self.start_mouse_gesture(ctx, owner, right_drag_context, pos, None);
+                egui::PointerButtonEvent::Released {
+                    button: egui::PointerButton::Secondary,
+                    pos: None,
+                } => {
+                    // This terminal owns only the current hold, not a command
+                    // already accepted from an earlier completed operation.
+                    self.cancel_right_drag_for_owner(owner);
+                    continue;
                 }
-                self.recognize_mouse_gesture_with_pos(
-                    ctx,
-                    owner,
-                    right_drag_context,
+                egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Secondary,
                     pos,
-                    secondary_down,
-                    secondary_released,
-                )
+                } => {
+                    if pos.y <= TOP_BAR_HEIGHT {
+                        self.cancel_detached_right_drag_owner(
+                            window_id,
+                            "right_drag_passive_chrome",
+                        );
+                        continue;
+                    }
+                    (pos, true, false)
+                }
+                egui::PointerButtonEvent::Released {
+                    button: egui::PointerButton::Secondary,
+                    pos: Some(pos),
+                } => (pos, false, true),
+                _ => continue,
+            };
+            let recognition = match mode {
+                RightDragMode::RingShortcut => {
+                    let Some(ring_context) = right_drag_context.ring_context() else {
+                        self.cancel_detached_right_drag_owner(
+                            window_id,
+                            "right_drag_context_invalid",
+                        );
+                        return;
+                    };
+                    if pressed {
+                        self.start_mouse_ring_flick(ctx, owner, ring_context, pos, None);
+                        continue;
+                    }
+                    self.recognize_mouse_ring_flick_with_pos(
+                        ctx,
+                        owner,
+                        ring_context,
+                        pos,
+                        !released,
+                        released,
+                    )
+                }
+                RightDragMode::MouseGesture => {
+                    if pressed {
+                        self.start_mouse_gesture(ctx, owner, right_drag_context, pos, None);
+                        continue;
+                    }
+                    self.recognize_mouse_gesture_with_pos(
+                        ctx,
+                        owner,
+                        right_drag_context,
+                        pos,
+                        !released,
+                        released,
+                    )
+                }
+                RightDragMode::Disabled | RightDragMode::Unknown(_) => unreachable!(),
+            };
+            outcome = recognition.outcome;
+            if let Some(command) = recognition.command {
+                self.queue_recognized_detached_right_drag_command(
+                    window_id,
+                    command,
+                    "passive_right_drag_recognized",
+                );
+                ctx.request_repaint();
+            } else if outcome == MouseFlickOutcome::ShortTap {
+                // Enabled ring/gesture modes preserve the existing configurable short-click
+                // behavior, but only after activation and an owning-context mount.
+                self.queue_recognized_detached_right_drag_command(
+                    window_id,
+                    RightDragCommand::ViewerShortRightClick {
+                        context: right_drag_context,
+                        pos,
+                    },
+                    "passive_right_drag_short_tap",
+                );
+                ctx.request_repaint();
             }
-            RightDragMode::Disabled | RightDragMode::Unknown(_) => unreachable!(),
-        };
-        let outcome = recognition.outcome;
-        if let Some(command) = recognition.command {
-            self.queue_recognized_detached_right_drag_command(
-                window_id,
-                command,
-                "passive_right_drag_recognized",
-            );
-            ctx.request_repaint();
-        } else if outcome == MouseFlickOutcome::ShortTap {
-            // Enabled ring/gesture modes preserve the existing configurable short-click
-            // behavior, but only after activation and an owning-context mount.
-            self.queue_recognized_detached_right_drag_command(
-                window_id,
-                RightDragCommand::ViewerShortRightClick {
-                    context: right_drag_context,
-                    pos,
-                },
-                "passive_right_drag_short_tap",
-            );
-            ctx.request_repaint();
+        }
+        if let Some(fallback_pos) = self.right_drag_pointer_pos(owner) {
+            let pos = pointer_pos.unwrap_or(fallback_pos);
+            match mode {
+                RightDragMode::RingShortcut => {
+                    if let Some(context) = right_drag_context.ring_context() {
+                        self.recognize_mouse_ring_flick_with_pos(
+                            ctx,
+                            owner,
+                            context,
+                            pos,
+                            secondary_down,
+                            false,
+                        );
+                    }
+                }
+                RightDragMode::MouseGesture => {
+                    self.recognize_mouse_gesture_with_pos(
+                        ctx,
+                        owner,
+                        right_drag_context,
+                        pos,
+                        secondary_down,
+                        false,
+                    );
+                }
+                RightDragMode::Disabled | RightDragMode::Unknown(_) => unreachable!(),
+            }
         }
         self.log_detached_image_window_debug(format!(
             "passive_right_drag_sample id={window_id} sequence={sequence} \
-             pressed={secondary_pressed} down={secondary_down} released={secondary_released} \
+             down={secondary_down} \
              outcome={outcome:?} mode={mode:?}"
         ));
     }
@@ -24120,7 +24240,6 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         mut batch: DetachedImageWindowEventBatch,
-        defer_activations: bool,
     ) {
         if let Some(target_window_id) = self.sidecar_restore_target_window_id() {
             // Only the restore target owns the modal. Sibling passive/native windows keep their
@@ -24191,33 +24310,36 @@ impl App {
                 window.activation_armed = activation_armed;
             }
         }
+        for request in batch.activation_requests.drain(..) {
+            if batch.close_ids.contains(&request.window_id) {
+                request.log(
+                    "discard",
+                    crate::app::DetachedActivationDecision::CloseOwned,
+                );
+            } else {
+                self.accept_discrete_detached_activation(ctx, request);
+            }
+        }
         batch.activate_ids.sort_unstable();
         batch.activate_ids.dedup();
         for id in batch.activate_ids {
-            if batch.close_ids.contains(&id) {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_skipped id={id} close=true",
-                ));
-                continue;
-            }
-            if defer_activations {
-                self.queue_deferred_detached_window_activation(id, "deferred_passive_activate");
-                ctx.request_repaint();
-                break;
-            }
-            if self.activate_detached_image_window_snapshot(ctx, id) {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_committed id={id} passive_windows={} active_context={}",
-                    self.detached_image_windows.len(),
-                    self.active_detached_context_is_at_rest()
-                ));
-                break;
+            let source = if self.detached_window_state_is_parked_live(id) {
+                crate::app::DetachedActivationSource::NativeMedia
             } else {
-                self.log_detached_image_window_debug(format!(
-                    "passive_activate_failed id={id} passive_windows={} active_context={}",
-                    self.detached_image_windows.len(),
-                    self.active_detached_context_is_at_rest()
-                ));
+                crate::app::DetachedActivationSource::ClientClick
+            };
+            let request = self.detached_activation_request(ctx, id, source);
+            if batch.close_ids.contains(&id) {
+                request.log(
+                    "discard",
+                    crate::app::DetachedActivationDecision::CloseOwned,
+                );
+            } else {
+                if self.accept_discrete_detached_activation(ctx, request)
+                    == crate::app::DetachedActivationDecision::Accepted
+                {
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
             }
         }
         self.prune_deferred_detached_image_window_views();
@@ -24319,7 +24441,7 @@ impl App {
                 self.queue_deferred_detached_image_window_event(ctx, event, &mut deferred_batch);
             }
         }
-        self.apply_detached_image_window_event_batch(ctx, deferred_batch, true);
+        self.apply_detached_image_window_event_batch(ctx, deferred_batch);
     }
 
     #[cfg(all(windows, test))]
@@ -24341,7 +24463,7 @@ impl App {
             right_drag_events: events,
             ..Default::default()
         };
-        self.apply_detached_image_window_event_batch(ctx, batch, true);
+        self.apply_detached_image_window_event_batch(ctx, batch);
     }
 
     #[cfg(windows)]
@@ -24398,6 +24520,7 @@ impl App {
 
         if self.detached_image_windows.is_empty() {
             self.prune_deferred_detached_image_window_views();
+            self.sync_detached_native_input_targets(ctx);
             return;
         }
 
@@ -24438,6 +24561,7 @@ impl App {
 
         if self.detached_image_windows.is_empty() {
             self.prune_deferred_detached_image_window_views();
+            self.sync_detached_native_input_targets(ctx);
             return;
         }
         #[cfg(feature = "test-script")]
@@ -24456,7 +24580,6 @@ impl App {
             }
         }
         let mut render_batch = DetachedImageWindowEventBatch::default();
-        let mut unconfirmed_deferred_registered = false;
         for window in &deferred_windows {
             let sidecar_restore_presentation = self
                 .sidecar_restore_blocks_window(window.id)
@@ -24484,18 +24607,6 @@ impl App {
                 ));
             }
             let right_drag_owner = crate::ring_shortcut::RightDragOwner::DetachedWindow(window.id);
-            if !self.deferred_detached_window_registration_allowed(
-                window.id,
-                &mut unconfirmed_deferred_registered,
-            ) {
-                self.log_detached_image_window_debug(format!(
-                    "deferred_registration_delayed id={} reason=unconfirmed_hwnd_serialized \
-                     passive_windows={}",
-                    window.id,
-                    self.detached_image_windows.len()
-                ));
-                continue;
-            }
             self.request_detached_right_drag_guide_repaint(ctx, right_drag_owner, viewport_id);
             let apply_initial_placement = self
                 .detached_window_hwnd_alive_for_window_id(window.id)
@@ -24527,6 +24638,19 @@ impl App {
                 apply_initial_placement,
             );
             let shared = self.deferred_detached_image_window_shared(view);
+            let activation_template = self.detached_activation_request(
+                ctx,
+                window.id,
+                crate::app::DetachedActivationSource::ClientClick,
+            );
+            let activation_blocked = self.common_modal_dialog_open()
+                || self.document_open_modal_admission_blocked()
+                || sidecar_restore_presentation.is_some();
+            shared.set_activation_availability(if activation_blocked {
+                crate::app::detached_activation_gesture::ClientActivationAvailability::Blocked
+            } else {
+                crate::app::detached_activation_gesture::ClientActivationAvailability::Available
+            });
             ctx.show_viewport_deferred(viewport_id, builder, move |vp_ctx_ui, _class| {
                 let vp_ctx = &vp_ctx_ui.ctx().clone();
                 #[cfg(feature = "test-script")]
@@ -24559,10 +24683,12 @@ impl App {
                     .then(|| shared.capture_right_drag_event(vp_ctx, focused))
                     .flatten();
                 let mut bar_close_requested = false;
+                let mut activation_surface = egui::Rect::NOTHING;
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(view.margin_color))
                     .show(vp_ctx_ui, |ui| {
                         let full_rect = ui.max_rect();
+                        activation_surface = full_rect;
                         if first_callback {
                             Self::log_detached_frozen_page_restore_debug(
                                 &view,
@@ -24610,14 +24736,16 @@ impl App {
                             crate::test_script::discard_drawn_paint(vp_ctx.viewport_id());
                         }
                         if view.display.overview().is_some() {
-                            bar_close_requested |=
-                                Self::draw_page_overview_window_close(ui, full_rect);
+                            // Pointer close has the same canonical owner as the
+                            // ordinary bar, including an initial coalesced tap.
+                            Self::draw_page_overview_window_close(ui, full_rect);
                         } else {
                             Self::draw_detached_image_window_bar(
                                 ui,
                                 vp_ctx,
                                 full_rect,
                                 &view,
+                                true,
                                 &mut bar_close_requested,
                             );
                         }
@@ -24633,6 +24761,119 @@ impl App {
                         vp_ctx,
                         presentation,
                     );
+                }
+                use crate::app::detached_activation_gesture::{
+                    ClientActivationAvailability, ClientActivationSource,
+                };
+                let command_owned = bar_close_requested
+                    || view.display.overview().is_some()
+                    || right_drag.is_some()
+                    || vp_ctx.input(|input| {
+                        input.pointer.secondary_down()
+                            || input.events.iter().any(|event| {
+                                matches!(
+                                    event,
+                                    egui::Event::PointerButton {
+                                        button: egui::PointerButton::Secondary,
+                                        ..
+                                    }
+                                )
+                            })
+                    });
+                let availability = if activation_blocked {
+                    ClientActivationAvailability::Blocked
+                } else if command_owned {
+                    ClientActivationAvailability::CommandOwned
+                } else {
+                    ClientActivationAvailability::Available
+                };
+                let geometry = crate::touch_input::TapZoneGeometry {
+                    surface: activation_surface,
+                    excluded: Vec::new(),
+                    behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                        accepts_pinch: true,
+                        tap_zones: true,
+                    },
+                };
+                let mut client_scope = activation_template.clone();
+                client_scope.registration = vp_ctx.viewport_registration(viewport_id);
+                client_scope.allocation = client_scope
+                    .registration
+                    .and_then(crate::key_input::native_input_allocation_witness);
+                let close_rect = if view.display.overview().is_some() {
+                    Self::page_overview_window_close_rect(activation_surface)
+                } else {
+                    detached_image_window_bar_close_button_rect(activation_surface)
+                };
+                let source = shared.capture_client_activation(
+                    vp_ctx,
+                    geometry,
+                    availability,
+                    client_scope.clone(),
+                    close_rect,
+                );
+                if let Some(source) = source {
+                    let mut request = client_scope.clone();
+                    request.source = match source {
+                        ClientActivationSource::MouseClick => {
+                            crate::app::DetachedActivationSource::ClientClick
+                        }
+                        ClientActivationSource::TouchTap => {
+                            crate::app::DetachedActivationSource::TouchTap
+                        }
+                    };
+                    request.log("callback", crate::app::DetachedActivationDecision::Accepted);
+                    shared.push_event(crate::app::DeferredDetachedImageWindowEvent::Activation {
+                        request,
+                    });
+                    vp_ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+                use crate::app::detached_activation_gesture::{
+                    ClientActivationCancelReason, ClientActivationDecision,
+                };
+                let log_client_decision = |origin: Option<crate::app::DetachedActivationRequest>,
+                                           source: ClientActivationSource,
+                                           boundary: &str,
+                                           decision: crate::app::DetachedActivationDecision,
+                                           reason: Option<ClientActivationCancelReason>| {
+                    let source = match source {
+                        ClientActivationSource::MouseClick => crate::app::DetachedActivationSource::ClientClick,
+                        ClientActivationSource::TouchTap => crate::app::DetachedActivationSource::TouchTap,
+                    };
+                    if let Some(mut request) = origin {
+                        request.source = source;
+                        if let Some(reason) = reason {
+                            request.log_client_cancelled(boundary, decision, reason);
+                        } else {
+                            request.log(boundary, decision);
+                        }
+                    } else {
+                        // No generation-time proof exists for this input. Record
+                        // that absence without attributing it to a successor.
+                        let reason = reason.map(|reason| format!(" reason={reason:?}")).unwrap_or_default();
+                        crate::logger::log(format!(
+                            "[detached-activation] boundary={boundary} source={source:?} decision={decision:?}{reason} window=unknown registration=None context=None viewport={viewport_id:?}"
+                        ));
+                    }
+                };
+                for scoped in shared.drain_client_activation_decisions() {
+                    match scoped.decision {
+                        ClientActivationDecision::CompletedClose(source) => {
+                            bar_close_requested = true;
+                            log_client_decision(scoped.scope, source, "callback", crate::app::DetachedActivationDecision::CloseOwned, None);
+                        }
+                        ClientActivationDecision::Cancelled { source, reason } => {
+                            let decision = match reason {
+                                ClientActivationCancelReason::NotParked => crate::app::DetachedActivationDecision::NotParked,
+                                ClientActivationCancelReason::ModalOwned => crate::app::DetachedActivationDecision::ModalOwned,
+                                ClientActivationCancelReason::CommandOwned => crate::app::DetachedActivationDecision::CommandOwned,
+                                ClientActivationCancelReason::Native(crate::key_input::NativeInputCancelReason::RetiredRegistration) => crate::app::DetachedActivationDecision::RetiredRegistration,
+                                _ => crate::app::DetachedActivationDecision::GestureCancelled,
+                            };
+                            log_client_decision(scoped.scope, source, "callback_discard", decision, Some(reason));
+                        }
+                        ClientActivationDecision::Completed(_) => {}
+                    }
                 }
                 // Passive deferred still windows carry only pointer samples back to the root;
                 // they contain no text input, so IME state remains owned by the root App pass.
@@ -24729,14 +24970,11 @@ impl App {
             let mut secondary_pressed = false;
             let mut secondary_down = false;
             let mut secondary_released = false;
+            let mut right_drag_button_events = Vec::new();
             let mut pointer_pos = None;
             let mut scroll_activation_candidate = false;
             let mut key_activation_candidate = false;
             let mut wheel_activation_candidate = false;
-
-            #[cfg(windows)]
-            let hwnd_before =
-                self.detached_window_hwnd_snapshot_before_show(window.id, "passive", viewport_id);
             let view = crate::app::DeferredDetachedImageWindowView::from_snapshot(
                 &window,
                 window_placement,
@@ -24744,6 +24982,9 @@ impl App {
                 None,
                 egui::Color32::BLACK,
             );
+            // Keep the existing native input observer registered for this live
+            // parked viewport; its non-client producer uses the shared queue.
+            let _native_transport = self.deferred_detached_image_window_shared(view.clone());
             #[cfg(feature = "test-script")]
             let mut test_script_passive_frame = None;
             let right_drag_guide = egui_owns_right_drag
@@ -24780,13 +25021,25 @@ impl App {
                     secondary_pressed,
                     secondary_down,
                     secondary_released,
+                    right_drag_button_events,
                     pointer_pos,
                     scroll_activation_candidate,
                     key_activation_candidate,
                     wheel_activation_candidate,
                 ) = vp_ctx.input(|i| {
                     if sidecar_restore_presentation.is_some() {
-                        return (false, false, false, false, false, None, false, false, false);
+                        return (
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            Vec::new(),
+                            None,
+                            false,
+                            false,
+                            false,
+                        );
                     }
                     let primary_pressed = i.pointer.primary_pressed();
                     let primary_released = i.pointer.primary_released();
@@ -24807,6 +25060,7 @@ impl App {
                         i.pointer.secondary_pressed(),
                         i.pointer.secondary_down(),
                         i.pointer.secondary_released(),
+                        i.pointer.button_events().collect(),
                         i.pointer.interact_pos().or_else(|| i.pointer.latest_pos()),
                         scroll,
                         key,
@@ -24854,6 +25108,7 @@ impl App {
                                 vp_ctx,
                                 full_rect,
                                 &view,
+                                false,
                                 &mut bar_close_requested,
                             );
                         }
@@ -24873,13 +25128,7 @@ impl App {
                 }
             });
             #[cfg(windows)]
-            self.register_detached_window_hwnd_after_show(
-                ctx,
-                window.id,
-                "passive",
-                viewport_id,
-                hwnd_before.as_deref(),
-            );
+            self.register_detached_window_hwnd_after_show(ctx, window.id, "passive", viewport_id);
             if apply_initial_placement && self.window_visible {
                 self.request_detached_window_visibility(
                     ctx,
@@ -24901,12 +25150,10 @@ impl App {
             let right_drag_kind = parked_live_egui_right_drag_event_kind(
                 egui_owns_right_drag,
                 right_drag_live,
-                primary_pressed,
                 window.focused_last_frame,
                 focused_now,
-                secondary_pressed,
+                right_drag_button_events,
                 secondary_down,
-                secondary_released,
                 pointer_pos,
             );
             if let Some(kind) = right_drag_kind {
@@ -25017,51 +25264,12 @@ impl App {
             }
             render_batch.focus_updates.push((window.id, focused_now));
         }
-        for id in self.take_parked_live_activation_requests_after_passive_render() {
-            if self.detached_window_state_is_parked_live(id) {
-                self.log_detached_image_window_debug(format!(
-                    "parked_live_native_activate_request_after_passive_render id={id}"
-                ));
-                render_batch.activate_ids.push(id);
-            } else {
-                self.log_detached_image_window_debug(format!(
-                    "parked_live_native_activate_request_dropped id={id} state={:?}",
-                    self.detached_window_state(id)
-                ));
-            }
-        }
-        self.apply_detached_image_window_event_batch(ctx, render_batch, false);
-    }
-
-    #[cfg(windows)]
-    fn install_key_input_subclass_for_viewport_rect(
-        &self,
-        viewport: egui::ViewportId,
-        outer_rect: egui::Rect,
-        pixels_per_point: f32,
-    ) {
-        use windows::Win32::Foundation::{HWND, RECT};
-
-        let Some(main_hwnd) = self.main_hwnd else {
-            return;
-        };
-        let scale = pixels_per_point.max(0.5);
-        let expected = RECT {
-            left: (outer_rect.min.x * scale).round() as i32,
-            top: (outer_rect.min.y * scale).round() as i32,
-            right: (outer_rect.max.x * scale).round() as i32,
-            bottom: (outer_rect.max.y * scale).round() as i32,
-        };
-        let Some(hwnd) = crate::dwm_transitions::find_visible_thread_window_matching_rect(
-            HWND(main_hwnd as *mut _),
-            expected,
-        ) else {
-            return;
-        };
-        let hwnd_raw = hwnd.0 as usize as u64;
-        if hwnd_raw != 0 {
-            crate::key_input::install_viewport_window_subclass(hwnd_raw, viewport);
-        }
+        // Native media has already submitted an identity-bearing intent at its
+        // input owner. These legacy transport IDs are acknowledgements only;
+        // discarded/committed requests must never be reconstructed from them.
+        self.take_parked_live_activation_requests_after_passive_render();
+        self.apply_detached_image_window_event_batch(ctx, render_batch);
+        self.sync_detached_native_input_targets(ctx);
     }
 
     pub(crate) fn fullscreen_seek_overlay_allowed(&self, fs_idx: usize, is_video: bool) -> bool {
@@ -26145,9 +26353,7 @@ impl App {
             // `interact_pointer_pos` はボタンを押している間しか返らない。ホバーだけで
             // プレビューを出すので `hover_pos` も見る (2026-09-05 利用者報告:
             // 「ホバーでプレビューが出ない」)。
-            let pointer = strip_response
-                .interact_pointer_pos()
-                .or_else(|| strip_response.hover_pos());
+            let pointer = still_seek_preview_pointer(&strip_response);
             // The response handler owns the immutable press origin, live center, and release
             // commit. The page-position sync above is the only non-close path that discards a
             // committed center.
@@ -26224,7 +26430,14 @@ impl App {
             if !strip_closed_by_drag
                 && primary_allowed
                 && strip_response.clicked()
-                && let Some(source_pos) = pointed_source_pos
+                && let Some(click_pointer) = still_seek_response_pointer(&strip_response)
+                && still_seek_strip_body_accepts_pointer(
+                    strip_lock_rect,
+                    strip_toggle_rect,
+                    click_pointer,
+                )
+                && let Some(source_pos) =
+                    still_seek_source_position_at_pointer(&layout, click_pointer)
                 && let Some(resolved) = resolve_still_seek_target(
                     &info.image_indices,
                     spread_units,
@@ -26414,10 +26627,7 @@ impl App {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
 
-                let pointer_pos = response
-                    .interact_pointer_pos()
-                    .or_else(|| response.hover_pos());
-                let resolved_at_pointer = pointer_pos.and_then(|pointer_pos| {
+                let resolve_at_pointer = |pointer_pos: egui::Pos2| {
                     let fraction =
                         fullscreen_seek_fraction_from_x(track_rect, pointer_pos.x, bar_is_rtl);
                     resolve_still_seek_target(
@@ -26426,20 +26636,26 @@ impl App {
                         preview_units,
                         StillSeekPosition::TrackFraction(fraction),
                     )
-                });
+                };
+                let pointer_pos = still_seek_response_pointer(&response);
+                let resolved_at_pointer = pointer_pos.and_then(&resolve_at_pointer);
 
                 // ここも同じ。ドラッグ中は `interact_pointer_pos`、ホバー中は `hover_pos`。
                 if (response.hovered() || response.dragged())
-                    && let (Some(pointer_pos), Some(resolved)) =
-                        (pointer_pos, resolved_at_pointer.as_ref())
-                {
-                    if self
+                    && self
                         .settings
                         .still_seek_hover_preview_mode
                         .is_visible(strip_visible)
-                    {
-                        preview = Some(resolved.clone());
-                        preview_pointer_x = Some(pointer_pos.x);
+                    && let Some(preview_pointer) = still_seek_preview_pointer(&response)
+                {
+                    let resolved = if Some(preview_pointer) == pointer_pos {
+                        resolved_at_pointer.clone()
+                    } else {
+                        resolve_at_pointer(preview_pointer)
+                    };
+                    if let Some(resolved) = resolved {
+                        preview = Some(resolved);
+                        preview_pointer_x = Some(preview_pointer.x);
                     }
                 }
 
@@ -26704,11 +26920,6 @@ impl App {
                 builder_placement,
                 "detached_loading_shell",
             );
-            let hwnd_before = self.detached_window_hwnd_snapshot_before_show(
-                window_id,
-                "detached_loading_shell",
-                fs_id,
-            );
             let loading_location = self.address.clone();
             let mut cancel = false;
             ctx.show_viewport_immediate(fs_id, builder, |vp_ctx_ui, _class| {
@@ -26740,7 +26951,6 @@ impl App {
                 window_id,
                 "detached_loading_shell",
                 fs_id,
-                hwnd_before.as_deref(),
             );
             self.fs_viewport_shown = true;
             self.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
@@ -26833,14 +27043,6 @@ impl App {
             }
             #[cfg(windows)]
             let keep_alive_window_id = self.active_detached_hwnd_window_id();
-            #[cfg(windows)]
-            let hwnd_before = keep_alive_window_id.and_then(|window_id| {
-                self.detached_window_hwnd_snapshot_before_show(
-                    window_id,
-                    "keep_alive_holdover",
-                    fs_id,
-                )
-            });
             ctx.show_viewport_immediate(fs_id, fs_builder, |ctx_ui, _class| {
                 let ctx = &ctx_ui.ctx().clone();
                 #[cfg(windows)]
@@ -26877,7 +27079,6 @@ impl App {
                     window_id,
                     "keep_alive_holdover",
                     fs_id,
-                    hwnd_before.as_deref(),
                 );
             }
             #[cfg(windows)]
@@ -27183,13 +27384,6 @@ impl App {
         } else {
             egui::Color32::BLACK
         };
-        let hwnd_before = backstop_window_id.and_then(|window_id| {
-            self.detached_window_hwnd_snapshot_before_show(
-                window_id,
-                "keepalive_backstop",
-                viewport_id,
-            )
-        });
         // Separate our drawing from what eframe does around it (render + present of
         // the child viewport), because only one of the two can be made cheaper.
         let show_t0 = std::time::Instant::now();
@@ -27278,7 +27472,6 @@ impl App {
                 window_id,
                 "keepalive_backstop",
                 viewport_id,
-                hwnd_before.as_deref(),
             );
         }
         if detached_host_needs_create
@@ -27810,10 +28003,6 @@ impl App {
             None
         };
         #[cfg(windows)]
-        let active_render_hwnd_before = active_render_window_id.and_then(|window_id| {
-            self.detached_window_hwnd_snapshot_before_show(window_id, "active_render", fs_id)
-        });
-        #[cfg(windows)]
         if detached && !embedded && need_show && Self::detached_image_window_debug_enabled() {
             self.log_detached_image_window_debug(format!(
                 "open_visibility_probe stage=before_show label=active_render fs_idx={fs_idx} \
@@ -27981,24 +28170,6 @@ impl App {
                 } = presentation;
                 let mut presentation_trace_allowed = display_permission_allowed && !continuous;
                 frame_snapshot = Some((fs_idx, state.is_video));
-                #[cfg(windows)]
-                if !embedded {
-                    let (outer_rect, pixels_per_point, minimized) = ctx.input(|i| {
-                        let vp = i.viewport();
-                        (
-                            vp.outer_rect,
-                            i.pixels_per_point,
-                            vp.minimized.unwrap_or(false),
-                        )
-                    });
-                    if !minimized && let Some(rect) = outer_rect {
-                        self.install_key_input_subclass_for_viewport_rect(
-                            fs_id,
-                            rect,
-                            pixels_per_point,
-                        );
-                    }
-                }
                 #[cfg(windows)]
                 if detached {
                     let (outer_rect, _inner_rect, pixels_per_point, minimized, _maximized) = ctx
@@ -30229,7 +30400,7 @@ impl App {
                 // 「DL ボタンを押しても何も起きない」状態になる (実機 FB 2026-06-06)。
                 // メイン update 側は fullscreen 中スキップするので二重描画にはならない。
                 self.show_editing_addon_dialog(ctx);
-                if self.mounted_viewer_owns_depth_dialogs() {
+                if self.depth_addon_dialog_in_mounted_viewer() {
                     self.show_depth_addon_dialog(ctx);
                 }
 
@@ -30343,13 +30514,7 @@ impl App {
         };
         #[cfg(windows)]
         if let Some(window_id) = active_render_window_id {
-            self.register_detached_window_hwnd_after_show(
-                ctx,
-                window_id,
-                "active_render",
-                fs_id,
-                active_render_hwnd_before.as_deref(),
-            );
+            self.register_detached_window_hwnd_after_show(ctx, window_id, "active_render", fs_id);
             if need_show && Self::detached_image_window_debug_enabled() {
                 self.log_detached_image_window_debug(format!(
                     "open_visibility_probe stage=after_show label=active_render window_id={} \
@@ -37634,6 +37799,7 @@ impl App {
                 None
             }
             FsNavigatorInputEvent::MouseWheel { .. } => None,
+            FsNavigatorInputEvent::PointerButtonReleased { .. } => None,
         })?;
         Some(target)
     }
@@ -38768,6 +38934,31 @@ impl App {
                         }
                     }
                 }
+                FsNavigatorInputEvent::PointerButtonReleased { button } => {
+                    let owns_gesture = match button {
+                        egui::PointerButton::Primary => {
+                            primary_down = false;
+                            matches!(
+                                interaction,
+                                Some(
+                                    PanoramaNavigatorInteraction::Header(_)
+                                        | PanoramaNavigatorInteraction::Pan { .. }
+                                )
+                            )
+                        }
+                        egui::PointerButton::Secondary => {
+                            secondary_down = false;
+                            matches!(
+                                interaction,
+                                Some(PanoramaNavigatorInteraction::Select { .. })
+                            )
+                        }
+                        _ => false,
+                    };
+                    if owns_gesture {
+                        interaction = None;
+                    }
+                }
                 FsNavigatorInputEvent::PointerButton { pos, .. } => {
                     event_pointer_pos = Some(*pos);
                 }
@@ -39148,6 +39339,30 @@ impl App {
                             // pointer gesture that requested a following pan.
                             interaction.gesture = FsNavigatorPointerGesture::Idle;
                         }
+                    }
+                }
+                FsNavigatorInputEvent::PointerButtonReleased { button } => {
+                    let owns_gesture = match button {
+                        egui::PointerButton::Primary => {
+                            primary_down = false;
+                            matches!(
+                                interaction.gesture,
+                                FsNavigatorPointerGesture::Header(_)
+                                    | FsNavigatorPointerGesture::AwaitingPan { .. }
+                                    | FsNavigatorPointerGesture::Pan { .. }
+                            )
+                        }
+                        egui::PointerButton::Secondary => {
+                            secondary_down = false;
+                            matches!(
+                                interaction.gesture,
+                                FsNavigatorPointerGesture::Select { .. }
+                            )
+                        }
+                        _ => false,
+                    };
+                    if owns_gesture {
+                        interaction.gesture = FsNavigatorPointerGesture::Idle;
                     }
                 }
                 FsNavigatorInputEvent::PointerButton { pos, .. } => {
@@ -40147,10 +40362,8 @@ impl App {
             && ctx
                 .input(|input| input.pointer.hover_pos())
                 .is_some_and(|point| {
-                    ctx.data(|data| {
-                        data.get_temp::<egui::Rect>(egui::Id::unique("depth_panel_rect"))
-                    })
-                    .is_some_and(|rect| rect.contains(point))
+                    ctx.data(|data| data.get_temp::<egui::Rect>(self.depth_panel_rect_id()))
+                        .is_some_and(|rect| rect.contains(point))
                 });
         let cursor_in_panel = cursor_in_depth_panel
             || passive_hover_enabled
@@ -41712,7 +41925,10 @@ impl App {
                             pressed: false,
                             modifiers,
                             ..
-                        } => Some((*button, *modifiers)),
+                        }
+                        | egui::Event::PointerButtonReleased { button, modifiers } => {
+                            Some((*button, *modifiers))
+                        }
                         _ => None,
                     })
                     .zip(input.pointer.released_buttons_with_click_counts())
@@ -41766,7 +41982,7 @@ impl App {
     fn visible_depth_panel_rect(&self, ctx: &egui::Context) -> Option<egui::Rect> {
         match &self.fs_exclusive_view {
             crate::fs_exclusive_view::FsExclusiveView::Depth(state) if state.panel_visible => {
-                ctx.data(|data| data.get_temp(egui::Id::unique("depth_panel_rect")))
+                ctx.data(|data| data.get_temp(self.depth_panel_rect_id()))
             }
             _ => None,
         }
@@ -43626,8 +43842,13 @@ impl App {
         fs_render_perf: &mut Option<FsRenderPerfRecorder>,
     ) {
         // Own manual navigation and slideshow timers at their common boundary.
-        // OS close still reaches teardown and cancels only the owning export.
-        if self.depth_export_dialog_open() && !close_fs {
+        // Accepted OS close reaches teardown; the independent modal owner is
+        // protected earlier by accept_active_detached_window_close.
+        if (self.depth_export_dialog_open()
+            || self.depth_independent_addon_modal_owner()
+                == Some(self.edit_request_owner_context()))
+            && !close_fs
+        {
             return;
         }
         if self.viewer_mutation_modal_active() {
@@ -54772,7 +54993,7 @@ impl App {
         available.max.y = available.max.y.min(full_rect.bottom() - 48.0);
         if state.panel_visible
             && let Some(panel) =
-                ctx.data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("depth_panel_rect")))
+                ctx.data(|data| data.get_temp::<egui::Rect>(self.depth_panel_rect_id()))
             && panel.intersects(available)
         {
             available.max.x = available.max.x.min(panel.left() - 12.0);
@@ -55864,6 +56085,18 @@ impl App {
                             Err(err) => self.show_feedback_error(err),
                         }
                     }
+                }
+                egui::Event::PointerButtonReleased {
+                    button: egui::PointerButton::Primary,
+                    ..
+                } => {
+                    primary_down = false;
+                    if selection.wait_for_release {
+                        selection.wait_for_release = false;
+                        continue;
+                    }
+                    self.capture_region_selection = None;
+                    return Some(CaptureRegionTerminalEffect::Cancel);
                 }
                 egui::Event::PointerButton {
                     pos,
@@ -57192,7 +57425,7 @@ impl App {
         if sns_split_export {
             self.complete_sns_split_mode();
         }
-        self.export_dialog = Some(crate::export_dialog::ExportDialogState {
+        self.export_dialog = Some(Box::new(crate::export_dialog::ExportDialogState {
             source: target.source,
             source_label: target.source_label,
             original_format: target.original_format.clone(),
@@ -57225,7 +57458,7 @@ impl App {
             original_include_metadata,
             initial_focus_done: false,
             error: None,
-        });
+        }));
         ctx.request_repaint();
         true
     }
@@ -57913,7 +58146,7 @@ impl App {
     fn start_export_from_dialog(
         &mut self,
         ctx: &egui::Context,
-        state_slot: &mut Option<crate::export_dialog::ExportDialogState>,
+        state_slot: &mut Option<Box<crate::export_dialog::ExportDialogState>>,
     ) -> Result<(), String> {
         let state = state_slot
             .as_ref()
@@ -58001,7 +58234,7 @@ impl App {
         // (AllDone) の単一トリガで refresh する。中間 Completed イベントでの
         // note_exported_file_for_folder_refresh は呼ばない (Codex review CONFIRMED)。
         let effective_include_metadata = state.include_metadata && metadata_possible;
-        let state = state_slot
+        let state = *state_slot
             .take()
             .expect("validated export dialog state must still exist");
         let request = crate::export_dialog::ExportRequest {
@@ -59327,6 +59560,7 @@ impl App {
                             event,
                             egui::Event::PointerMoved(_)
                                 | egui::Event::PointerButton { .. }
+                                | egui::Event::PointerButtonReleased { .. }
                                 | egui::Event::PointerGone
                                 | egui::Event::Touch { .. }
                         )
@@ -59338,6 +59572,7 @@ impl App {
                         event,
                         egui::Event::PointerMoved(_)
                             | egui::Event::PointerButton { .. }
+                            | egui::Event::PointerButtonReleased { .. }
                             | egui::Event::PointerGone
                             | egui::Event::Touch { .. }
                     )
@@ -60426,6 +60661,195 @@ mod music_full_width_hud_tests {
 #[cfg(test)]
 mod tests {
     include!("ui_fullscreen/compare_original_tests.rs");
+
+    #[test]
+    fn realmachine55_front_positionless_release_keeps_backing_navigator_edges() {
+        let ctx = egui::Context::default();
+        install_fs_navigator_input_tracking(&ctx);
+        let mut owner = FsFrontPointerOwnership::default();
+        let front = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(100.0, 80.0));
+        let backing = egui::pos2(240.0, 160.0);
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![navigator_button_event(
+                        front.center(),
+                        egui::PointerButton::Primary,
+                        true,
+                    )],
+                    0.0,
+                ),
+                |ctx| {
+                    owner.capture(ctx, false, &[front]);
+                },
+            )
+            .drop_without_applying_deltas();
+        assert!(owner.is_active());
+        let _ = ctx
+            .run_pass(
+                navigator_ordered_input(
+                    vec![
+                        egui::Event::PointerButtonReleased {
+                            button: egui::PointerButton::Primary,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                        navigator_button_event(backing, egui::PointerButton::Primary, true),
+                        navigator_button_event(backing, egui::PointerButton::Primary, false),
+                    ],
+                    0.1,
+                ),
+                |ctx| {
+                    let front_input = owner.capture(ctx, false, &[front]);
+                    let events = front_input.canvas_events(ctx);
+                    assert_eq!(
+                        events.iter().map(|(_, owned)| *owned).collect::<Vec<_>>(),
+                        [true, false, false]
+                    );
+                    let navigator = FsNavigatorFrameInput::for_current_pass(ctx)
+                        .without_front_buttons(&front_input);
+                    assert_eq!(navigator.events.len(), 2);
+                    assert!(
+                        matches!(navigator.events[1], FsNavigatorInputEvent::PointerButton {
+                    pressed: false, adjudicated_click: Some((pos, 1)), ..
+                } if pos == backing)
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
+        assert!(!owner.is_active());
+    }
+
+    #[test]
+    fn realmachine55_navigator_positionless_release_cancels_without_header_action() {
+        for panorama in [false, true] {
+            let ctx = egui::Context::default();
+            let (mut app, image_rect, fs_idx) = if panorama {
+                setup_panorama_navigator_input_test(&ctx)
+            } else {
+                setup_flat_navigator_input_test()
+            };
+            let header_rect = if panorama {
+                app.panorama_navigator_layout(image_rect, fs_idx)
+                    .unwrap()
+                    .header_rect
+            } else {
+                app.fs_navigator_layout(image_rect).unwrap().header_rect
+            };
+            let corner = fs_navigator_corner_button_rect(header_rect, 0).center();
+            let initial_corner = app.settings.fullscreen_navigator_corner;
+            assert!(run_flat_navigator_input_frame(
+                &mut app,
+                &ctx,
+                image_rect,
+                navigator_ordered_input(
+                    vec![navigator_button_event(
+                        corner,
+                        egui::PointerButton::Primary,
+                        true,
+                    )],
+                    0.0
+                )
+            ));
+            assert!(app.fullscreen_navigator_interaction.is_active());
+            assert!(run_flat_navigator_input_frame(
+                &mut app,
+                &ctx,
+                image_rect,
+                navigator_ordered_input(
+                    vec![egui::Event::PointerButtonReleased {
+                        button: egui::PointerButton::Primary,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    0.1
+                )
+            ));
+            assert!(!app.fullscreen_navigator_interaction.is_active());
+            assert_eq!(app.settings.fullscreen_navigator_corner, initial_corner);
+            assert!(run_flat_navigator_input_frame(
+                &mut app,
+                &ctx,
+                image_rect,
+                navigator_ordered_input(
+                    vec![
+                        navigator_button_event(corner, egui::PointerButton::Primary, true),
+                        navigator_button_event(corner, egui::PointerButton::Primary, false),
+                    ],
+                    0.2
+                )
+            ));
+            assert_eq!(
+                app.settings.fullscreen_navigator_corner.normalized(),
+                FullscreenNavigatorCorner::TopLeft
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine55_navigator_positionless_release_retires_only_its_selection() {
+        for panorama in [false, true] {
+            let ctx = egui::Context::default();
+            let (mut app, image_rect, fs_idx) = if panorama {
+                setup_panorama_navigator_input_test(&ctx)
+            } else {
+                setup_flat_navigator_input_test()
+            };
+            let canvas = if panorama {
+                app.panorama_navigator_layout(image_rect, fs_idx)
+                    .unwrap()
+                    .canvas_rect
+            } else {
+                app.fs_navigator_layout(image_rect).unwrap().canvas_rect
+            };
+            let zoom = app.fs_zoom;
+            let fov = app.panorama_state().map(|state| state.fov_y);
+            assert!(run_flat_navigator_input_frame(
+                &mut app,
+                &ctx,
+                image_rect,
+                navigator_ordered_input(
+                    vec![
+                        navigator_button_event(
+                            canvas.left_top() + egui::vec2(8.0, 8.0),
+                            egui::PointerButton::Secondary,
+                            true
+                        ),
+                        egui::Event::PointerMoved(canvas.center()),
+                    ],
+                    0.0
+                )
+            ));
+            assert!(app.fullscreen_navigator_interaction.is_active());
+            assert!(run_flat_navigator_input_frame(
+                &mut app,
+                &ctx,
+                image_rect,
+                navigator_ordered_input(
+                    vec![egui::Event::PointerButtonReleased {
+                        button: egui::PointerButton::Primary,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    0.1
+                )
+            ));
+            assert!(app.fullscreen_navigator_interaction.is_active());
+            assert!(run_flat_navigator_input_frame(
+                &mut app,
+                &ctx,
+                image_rect,
+                navigator_ordered_input(
+                    vec![egui::Event::PointerButtonReleased {
+                        button: egui::PointerButton::Secondary,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    0.2
+                )
+            ));
+            assert!(!app.fullscreen_navigator_interaction.is_active());
+            assert_eq!(app.fs_zoom, zoom);
+            assert_eq!(app.panorama_state().map(|state| state.fov_y), fov);
+        }
+    }
+
     #[test]
     fn chrome_suppression_right_close_hit_keeps_raw_lock_in_still_and_music() {
         use crate::ui_helpers::MetadataPanelOpenState;
@@ -61601,6 +62025,90 @@ mod tests {
     mod still_seek_menu;
     mod still_seek_rotation;
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn independent_media_exchange_first_builder_inherits_placement_and_f11_intent() {
+        use crate::app::detached_media_exchange_tests as fixture;
+        for maximized in [false, true] {
+            // 0 normal, 1 settled borderless, 2 entering, 3 leaving, 4 return Settle.
+            for phase in 0..5 {
+                let mut app = crate::app::setup_app_for_test();
+                let ctx = egui::Context::default();
+                let root = app.tmp.path().to_path_buf();
+                fixture::install_items(&mut app, &ctx, &root, false);
+                let (a, _) = fixture::activate_independent_media(&mut app, &ctx);
+                app.with_active_viewer_context(|owner| {
+                    let p = fixture::placement(maximized);
+                    fixture::prepare_f11_exchange(owner, &ctx, a, p, phase);
+                    owner.open_fullscreen_from_fs_navigation(
+                        &ctx,
+                        2,
+                        crate::app::HistoryTrigger::UserChosen,
+                    );
+                    let b = owner.detached_viewer_window_id().unwrap();
+                    assert_ne!(a, b);
+                    assert_eq!(owner.detached_window_runtime_placement(b), Some(p));
+                    let borderless = phase == 1 || phase == 2;
+                    assert_eq!(owner.detached_viewer_borderless_fullscreen, borderless);
+                    assert!(owner.detached_viewer_borderless_transition.is_none());
+                    assert_eq!(
+                        owner.detached_viewer_restore_placement,
+                        borderless.then_some(p)
+                    );
+                    let builder = owner.build_detached_viewer_viewport_builder(
+                        2,
+                        Some(true),
+                        DetachedViewportBuilderVisibility::Preserve,
+                        true,
+                        None,
+                        "exchange_first_builder",
+                    );
+                    assert_eq!(builder.decorations, Some(!borderless));
+                    let target = if borderless {
+                        crate::detached_window_geometry::PhysicalWindowPlacement {
+                            outer: owner.detached_viewer_borderless_target_rect(),
+                            maximized: false,
+                        }
+                    } else {
+                        p
+                    };
+                    let (position, size) =
+                        crate::detached_window_geometry::provisional_builder_geometry(
+                            target,
+                            !borderless,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        builder.position,
+                        Some(window_geometry_pos_to_viewport(
+                            position,
+                            owner.settings.ui_scale_factor
+                        ))
+                    );
+                    assert_eq!(
+                        builder.inner_size,
+                        Some(window_geometry_size_to_viewport(
+                            size,
+                            owner.settings.ui_scale_factor
+                        ))
+                    );
+                    assert_eq!(
+                        owner.active_detached_viewport_maximized_on_visible_commit(),
+                        !borderless && maximized
+                    );
+                    if borderless {
+                        owner.toggle_detached_viewer_borderless_fullscreen(&ctx);
+                        let leaving = owner.detached_viewer_borderless_transition.unwrap();
+                        assert!(!leaving.target_borderless);
+                        assert_eq!(leaving.target_outer, p.outer);
+                        assert_eq!(owner.detached_viewer_restore_placement, Some(p));
+                    }
+                })
+                .unwrap();
+            }
+        }
+    }
 
     #[cfg(windows)]
     #[test]
@@ -64050,20 +64558,36 @@ mod tests {
     fn parked_live_visible_presenter_emits_no_egui_right_drag_events() {
         let potential_events = [
             parked_live_egui_right_drag_event_kind(
-                false, true, true, true, false, false, false, false, None,
+                false,
+                true,
+                true,
+                false,
+                vec![egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Primary,
+                    pos: egui::pos2(120.0, 80.0),
+                }],
+                false,
+                None,
             ),
             parked_live_egui_right_drag_event_kind(
-                false, true, false, true, true, false, false, false, None,
+                false,
+                true,
+                true,
+                true,
+                Vec::new(),
+                false,
+                None,
             ),
             parked_live_egui_right_drag_event_kind(
                 false,
                 false,
-                false,
                 true,
                 true,
+                vec![egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Secondary,
+                    pos: egui::pos2(120.0, 80.0),
+                }],
                 true,
-                true,
-                false,
                 Some(egui::pos2(120.0, 80.0)),
             ),
         ];
@@ -64082,25 +64606,26 @@ mod tests {
             parked_live_egui_right_drag_event_kind(
                 true,
                 false,
-                false,
                 true,
                 true,
+                vec![egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Secondary,
+                    pos
+                }],
                 true,
-                true,
-                false,
                 Some(pos),
             ),
             Some(crate::app::DetachedRightDragEventKind::Input {
-                secondary_pressed: true,
+                button_events: vec![egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Secondary,
+                    pos
+                }],
                 secondary_down: true,
-                secondary_released: false,
                 pointer_pos: Some(pos),
             })
         );
         assert_eq!(
-            parked_live_egui_right_drag_event_kind(
-                true, true, false, true, true, false, false, false, None,
-            ),
+            parked_live_egui_right_drag_event_kind(true, true, true, true, Vec::new(), false, None,),
             Some(crate::app::DetachedRightDragEventKind::Cancel {
                 reason: crate::app::DetachedRightDragCancelReason::ButtonStateLost,
             })
@@ -64109,13 +64634,28 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn parked_live_primary_press_reports_typed_right_drag_cancel() {
+    fn parked_live_primary_press_preserves_typed_order_for_right_drag_cancel() {
+        let pos = egui::pos2(120.0, 80.0);
         assert_eq!(
             parked_live_egui_right_drag_event_kind(
-                true, true, true, true, true, false, true, false, None,
+                true,
+                true,
+                true,
+                true,
+                vec![egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Primary,
+                    pos
+                }],
+                true,
+                Some(pos),
             ),
-            Some(crate::app::DetachedRightDragEventKind::Cancel {
-                reason: crate::app::DetachedRightDragCancelReason::PrimaryButtonPressed,
+            Some(crate::app::DetachedRightDragEventKind::Input {
+                button_events: vec![egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Primary,
+                    pos
+                }],
+                secondary_down: true,
+                pointer_pos: Some(pos),
             })
         );
     }
@@ -83588,6 +84128,7 @@ mod tests {
         dragged: bool,
         drag_stopped: bool,
         clicked: bool,
+        preview_pointer: Option<egui::Pos2>,
         interaction: StillSeekStripInteraction,
         gesture: StillSeekGesture,
     }
@@ -83638,7 +84179,7 @@ mod tests {
                         &mut state.gesture,
                     );
                     if response.clicked()
-                        && let Some(pointer) = response.interact_pointer_pos()
+                        && let Some(pointer) = still_seek_response_pointer(&response)
                     {
                         state.page = (((pointer.x - row.left()) / row.width()) * 9.0)
                             .round()
@@ -83649,6 +84190,7 @@ mod tests {
                         dragged: response.dragged(),
                         drag_stopped: response.drag_stopped(),
                         clicked: response.clicked(),
+                        preview_pointer: still_seek_preview_pointer(&response),
                         interaction,
                         gesture: state.gesture,
                     });
@@ -84021,6 +84563,7 @@ mod tests {
         drag_stopped: bool,
         clicked: bool,
         pointer: Option<egui::Pos2>,
+        preview_pointer: Option<egui::Pos2>,
         action: StillSeekTrackAction,
     }
 
@@ -84031,6 +84574,328 @@ mod tests {
         strip_open: bool,
         seek_activity_frames: usize,
         observations: Vec<StillSeekTrackResponseObservation>,
+    }
+
+    fn seek_native_state(ctx: &egui::Context) -> egui_winit::State {
+        struct NoDisplay;
+        impl winit::raw_window_handle::HasDisplayHandle for NoDisplay {
+            fn display_handle(
+                &self,
+            ) -> Result<
+                winit::raw_window_handle::DisplayHandle<'_>,
+                winit::raw_window_handle::HandleError,
+            > {
+                Err(winit::raw_window_handle::HandleError::Unavailable)
+            }
+        }
+        egui_winit::State::new(
+            ctx.clone(),
+            egui::ViewportId::ROOT,
+            &NoDisplay,
+            Some(1.0),
+            None,
+            None,
+        )
+    }
+    fn seek_native_batch(state: &mut egui_winit::State, phase: usize) -> Vec<egui::Event> {
+        use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+        let moved = |x| WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: winit::dpi::PhysicalPosition::new(x, 96.0),
+        };
+        let button = |state| WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state,
+            button: MouseButton::Left,
+        };
+        let events = match phase {
+            0 => vec![moved(200.0), button(ElementState::Pressed)],
+            1 => vec![moved(220.0)],
+            _ => vec![
+                WindowEvent::CursorLeft {
+                    device_id: DeviceId::dummy(),
+                },
+                button(ElementState::Released),
+                moved(350.0),
+            ],
+        };
+        for event in events {
+            let _ = state.on_pointer_event(&event, 1.0);
+        }
+        state.egui_input_mut().take().events
+    }
+
+    fn seek_native_unknown_end_then_click(
+        state: &mut egui_winit::State,
+        click: egui::Pos2,
+        later: egui::Pos2,
+    ) -> Vec<egui::Event> {
+        use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+        let moved = |pos: egui::Pos2| WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: winit::dpi::PhysicalPosition::new(f64::from(pos.x), f64::from(pos.y)),
+        };
+        let button = |state| WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state,
+            button: MouseButton::Left,
+        };
+        for event in [
+            WindowEvent::CursorLeft {
+                device_id: DeviceId::dummy(),
+            },
+            button(ElementState::Released),
+            moved(click),
+            button(ElementState::Pressed),
+            button(ElementState::Released),
+            moved(later),
+        ] {
+            let _ = state
+                .on_pointer_event(&event, 1.0)
+                .expect("native pointer event");
+        }
+        let events = state.egui_input_mut().take().events;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            egui::Event::PointerButtonReleased {
+                button: egui::PointerButton::Primary,
+                ..
+            }
+        )));
+        events
+    }
+
+    fn seek_native_click_then_pending_press(state: &mut egui_winit::State) -> Vec<egui::Event> {
+        use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+        let moved = |x| WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: winit::dpi::PhysicalPosition::new(x, 96.0),
+        };
+        let button = |state| WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state,
+            button: MouseButton::Left,
+        };
+        for event in [
+            moved(320.0),
+            button(ElementState::Pressed),
+            button(ElementState::Released),
+            moved(180.0),
+            button(ElementState::Pressed),
+            moved(200.0),
+        ] {
+            let _ = state
+                .on_pointer_event(&event, 1.0)
+                .expect("native pointer event");
+        }
+        state.egui_input_mut().take().events
+    }
+
+    fn diagnose_native_seek_frame<T: std::fmt::Debug>(
+        stage: &str,
+        ctx: &egui::Context,
+        observations: &[T],
+    ) {
+        eprintln!(
+            "native seek {stage}: raw={:#?}, completed_passes={}, observations={observations:#?}",
+            ctx.input(|input| input.raw.events.clone()),
+            ctx.cumulative_pass_nr(),
+        );
+    }
+
+    #[test]
+    fn realmachine55_seek_track_click_target_and_new_drag_origin_stay_separate() {
+        use winit::event::{DeviceId, WindowEvent};
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let mut native = seek_native_state(&harness.ctx);
+        // Harness::event queues one frame per event. State's normalized batch
+        // must instead enter RawInput intact so its edges share one egui pass.
+        harness.input_mut().events = seek_native_click_then_pending_press(&mut native);
+        harness.step();
+        diagnose_native_seek_frame(
+            "track click/new pending",
+            &harness.ctx,
+            &harness.state().observations,
+        );
+        let last = harness.state().observations.last().unwrap();
+        assert!(last.clicked && last.primary_down && !last.drag_started);
+        assert_eq!(last.pointer, Some(egui::pos2(320.0, 96.0)));
+        assert_eq!(last.preview_pointer, Some(egui::pos2(200.0, 96.0)));
+        assert_eq!(
+            harness.ctx.pointer_interact_pos(),
+            Some(egui::pos2(200.0, 96.0))
+        );
+        assert_eq!(harness.state().page, 7);
+        let _ = native
+            .on_pointer_event(
+                &WindowEvent::CursorMoved {
+                    device_id: DeviceId::dummy(),
+                    position: winit::dpi::PhysicalPosition::new(180.0, 60.0),
+                },
+                1.0,
+            )
+            .unwrap();
+        harness.input_mut().events = native.egui_input_mut().take().events;
+        harness.step();
+        diagnose_native_seek_frame(
+            "track new drag",
+            &harness.ctx,
+            &harness.state().observations,
+        );
+        assert!(harness.state().observations.last().unwrap().drag_started);
+        assert_eq!(
+            harness.state().gesture,
+            StillSeekGesture::Track(crate::video::seek_strip::SeekRowGesture::OpenStrip {
+                origin: egui::pos2(180.0, 96.0),
+            }),
+        );
+        assert!(harness.state().strip_open);
+    }
+
+    #[test]
+    fn realmachine55_seek_strip_click_target_and_new_drag_origin_stay_separate() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let mut native = seek_native_state(&harness.ctx);
+        harness.input_mut().events = seek_native_click_then_pending_press(&mut native);
+        harness.step();
+        diagnose_native_seek_frame(
+            "strip click/new pending",
+            &harness.ctx,
+            &harness.state().observations,
+        );
+        let last = harness.state().observations.last().unwrap();
+        assert!(last.clicked && !last.drag_started);
+        assert_eq!(last.preview_pointer, Some(egui::pos2(200.0, 96.0)));
+        assert_eq!(harness.state().page, 7);
+        harness.step();
+        diagnose_native_seek_frame(
+            "strip new drag",
+            &harness.ctx,
+            &harness.state().observations,
+        );
+        assert!(harness.state().observations.last().unwrap().drag_started);
+        assert!(matches!(
+            harness.state().gesture,
+            StillSeekGesture::Strip { origin_pointer, .. } if origin_pointer == egui::pos2(180.0, 96.0)
+        ));
+    }
+
+    #[test]
+    fn realmachine55_unknown_seek_track_end_preserves_a_fresh_completed_click() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let mut native = seek_native_state(&harness.ctx);
+        for phase in 0..2 {
+            harness.input_mut().events = seek_native_batch(&mut native, phase);
+            harness.step();
+        }
+        diagnose_native_seek_frame(
+            "track old drag",
+            &harness.ctx,
+            &harness.state().observations,
+        );
+        assert!(harness.state().observations.last().unwrap().dragged);
+        let click = egui::pos2(320.0, 96.0);
+        let later = egui::pos2(280.0, 96.0);
+        harness.input_mut().events = seek_native_unknown_end_then_click(&mut native, click, later);
+        harness.step();
+        diagnose_native_seek_frame(
+            "track unknown end/new click",
+            &harness.ctx,
+            &harness.state().observations,
+        );
+        let last = harness.state().observations.last().unwrap();
+        assert!(last.clicked && last.drag_stopped);
+        assert!(!last.primary_down && !last.dragged);
+        assert_eq!(last.pointer, Some(click));
+        assert_eq!(last.preview_pointer, Some(later));
+        assert_eq!(last.action, StillSeekTrackAction::Seek);
+        assert_eq!(
+            harness.state().page,
+            7,
+            "use the fresh Up, not the later hover"
+        );
+        assert_eq!(harness.state().gesture, StillSeekGesture::Idle);
+    }
+
+    #[test]
+    fn realmachine55_unknown_seek_strip_end_preserves_click_without_committing_old_drag() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let mut native = seek_native_state(&harness.ctx);
+        for phase in 0..2 {
+            harness.input_mut().events = seek_native_batch(&mut native, phase);
+            harness.step();
+        }
+        diagnose_native_seek_frame(
+            "strip old drag",
+            &harness.ctx,
+            &harness.state().observations,
+        );
+        assert!(harness.state().observations.last().unwrap().dragged);
+        harness.input_mut().events = seek_native_unknown_end_then_click(
+            &mut native,
+            egui::pos2(320.0, 96.0),
+            egui::pos2(280.0, 96.0),
+        );
+        harness.step();
+        diagnose_native_seek_frame(
+            "strip unknown end/new click",
+            &harness.ctx,
+            &harness.state().observations,
+        );
+        let last = harness.state().observations.last().unwrap();
+        assert!(last.clicked && last.drag_stopped);
+        assert!(!last.interaction.closed_by_drag);
+        assert_eq!(last.preview_pointer, Some(egui::pos2(280.0, 96.0)));
+        assert_eq!(
+            harness.state().page,
+            7,
+            "the new click keeps its own release point"
+        );
+        assert_eq!(harness.state().gesture, StillSeekGesture::Idle);
+    }
+
+    #[test]
+    fn realmachine55_positionless_seek_track_terminal_does_not_seek_at_later_move() {
+        let mut harness = still_seek_track_handler_harness();
+        harness.run();
+        let mut native = seek_native_state(&harness.ctx);
+        for phase in 0..3 {
+            harness.input_mut().events = seek_native_batch(&mut native, phase);
+            harness.step();
+        }
+        diagnose_native_seek_frame(
+            "track unknown end",
+            &harness.ctx,
+            &harness.state().observations,
+        );
+        let last = harness.state().observations.last().unwrap();
+        assert!(last.drag_stopped);
+        assert!(!last.primary_down);
+        assert_eq!(last.action, StillSeekTrackAction::None);
+        assert_eq!(harness.state().gesture, StillSeekGesture::Idle);
+    }
+    #[test]
+    fn realmachine55_positionless_seek_strip_terminal_does_not_commit_or_close() {
+        let mut harness = still_seek_strip_handler_harness();
+        harness.run();
+        let mut native = seek_native_state(&harness.ctx);
+        for phase in 0..3 {
+            harness.input_mut().events = seek_native_batch(&mut native, phase);
+            harness.step();
+        }
+        diagnose_native_seek_frame(
+            "strip unknown end",
+            &harness.ctx,
+            &harness.state().observations,
+        );
+        let last = harness.state().observations.last().unwrap();
+        assert!(last.drag_stopped);
+        assert!(!last.interaction.closed_by_drag);
+        assert_eq!(harness.state().gesture, StillSeekGesture::Idle);
     }
 
     fn still_seek_track_handler_harness()
@@ -84046,9 +84911,7 @@ mod tests {
                         ui.make_persistent_id(0x5EE4_u64),
                         egui::Sense::click_and_drag(),
                     );
-                    let pointer = response
-                        .interact_pointer_pos()
-                        .or_else(|| response.hover_pos());
+                    let pointer = still_seek_response_pointer(&response);
                     let interaction =
                         handle_still_seek_track_response(&response, &mut state.gesture);
                     if interaction.note_seek_activity {
@@ -84073,6 +84936,7 @@ mod tests {
                         drag_stopped: response.drag_stopped(),
                         clicked: response.clicked(),
                         pointer,
+                        preview_pointer: still_seek_preview_pointer(&response),
                         action: interaction.action,
                     });
                 },
@@ -89508,6 +90372,71 @@ mod tests {
     }
 
     #[test]
+    fn realmachine55_native_unknown_capture_release_cancels_without_copy_or_stale_owner() {
+        use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+        let ctx = egui::Context::default();
+        let (mut app, full_rect, image_rect, idx) = setup_capture_region_input_test(&ctx);
+        arm_capture_region_for_test(
+            &mut app,
+            &ctx,
+            idx,
+            navigator_ordered_input(Vec::new(), 0.0),
+        );
+        let mut state = seek_native_state(&ctx);
+        let start = image_rect.min + egui::vec2(80.0, 70.0);
+        let mouse = |phase| WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state: phase,
+            button: MouseButton::Left,
+        };
+        let moved = |pos: egui::Pos2| WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: winit::dpi::PhysicalPosition::new(pos.x as f64, pos.y as f64),
+        };
+        for event in [
+            moved(start),
+            mouse(ElementState::Pressed),
+            moved(image_rect.center()),
+        ] {
+            let _ = state.on_pointer_event(&event, 1.0);
+        }
+        let (effect, _) = run_capture_region_input_frame(
+            &mut app,
+            &ctx,
+            full_rect,
+            idx,
+            navigator_ordered_input(state.egui_input_mut().take().events, 0.1),
+        );
+        assert!(effect.is_none());
+        assert!(
+            app.capture_region_selection
+                .as_ref()
+                .unwrap()
+                .target
+                .is_some()
+        );
+        for event in [
+            WindowEvent::CursorLeft {
+                device_id: DeviceId::dummy(),
+            },
+            mouse(ElementState::Released),
+            moved(image_rect.center()),
+        ] {
+            let _ = state.on_pointer_event(&event, 1.0);
+        }
+        let (effect, _) = run_capture_region_input_frame(
+            &mut app,
+            &ctx,
+            full_rect,
+            idx,
+            navigator_ordered_input(state.egui_input_mut().take().events, 0.2),
+        );
+        assert_eq!(effect, Some(CaptureRegionTerminalEffect::Cancel));
+        assert!(app.capture_region_selection.is_none());
+        assert!(!ctx.input(|input| input.pointer.primary_down()));
+    }
+
+    #[test]
     fn capture_region_canvas_drag_releases_at_panel_with_clamped_copy_after_pointer_gone() {
         let ctx = egui::Context::default();
         let (mut app, full_rect, image_rect, fs_idx) = setup_capture_region_input_test(&ctx);
@@ -92317,9 +93246,11 @@ mod tests {
             DetachedRightDragEvent {
                 sequence,
                 kind: DetachedRightDragEventKind::Input {
-                    secondary_pressed: true,
+                    button_events: vec![egui::PointerButtonEvent::Pressed {
+                        button: egui::PointerButton::Secondary,
+                        pos: egui::pos2(1.0, 2.0),
+                    }],
                     secondary_down: true,
-                    secondary_released: false,
                     pointer_pos: Some(egui::pos2(1.0, 2.0)),
                 },
             }
@@ -97796,6 +98727,43 @@ pub(crate) mod page_turn_submission_tests {
 
 #[cfg(all(test, windows))]
 mod music_overflow_tests {
+    #[test]
+    fn realmachine55_music_positionless_release_retires_only_its_button_stream() {
+        let owner = crate::app::ViewerContextId::for_test(55);
+        let mut stream = MusicOverflowPointerStream::default();
+        let press = |button| egui::Event::PointerButton {
+            pos: egui::pos2(20.0, 30.0),
+            button,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let release = |button| egui::Event::PointerButtonReleased {
+            button,
+            modifiers: egui::Modifiers::NONE,
+        };
+        for button in [
+            egui::PointerButton::Primary,
+            egui::PointerButton::Secondary,
+            egui::PointerButton::Middle,
+            egui::PointerButton::Extra1,
+            egui::PointerButton::Extra2,
+        ] {
+            stream.update(&press(button), owner, true);
+            stream.update(&release(button), owner, false);
+            assert!(matches!(stream, MusicOverflowPointerStream::Idle));
+        }
+        stream.update(&press(egui::PointerButton::Primary), owner, true);
+        stream.update(&press(egui::PointerButton::Secondary), owner, false);
+        stream.update(&release(egui::PointerButton::Primary), owner, false);
+        assert!(
+            matches!(stream, MusicOverflowPointerStream::Captured { buttons, .. }
+            if buttons == 1 << (egui::PointerButton::Secondary as u8))
+        );
+        stream.update(&release(egui::PointerButton::Secondary), owner, false);
+        stream.update(&press(egui::PointerButton::Primary), owner, false);
+        assert!(matches!(stream, MusicOverflowPointerStream::Idle));
+    }
+
     use super::*;
     use crate::music_note_color::MusicNoteColorScheme;
 

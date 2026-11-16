@@ -186,7 +186,17 @@ impl Response {
     /// You can use [`Self::interact`] to sense more things *after* adding a widget.
     #[inline(always)]
     pub fn clicked(&self) -> bool {
-        self.flags.contains(Flags::FAKE_PRIMARY_CLICKED) || self.clicked_by(PointerButton::Primary)
+        self.clicked_with_keyboard_or_accessibility() || self.clicked_by(PointerButton::Primary)
+    }
+
+    /// Whether an existing keyboard or accessibility action activated this widget.
+    ///
+    /// Unlike [`Self::clicked`], this excludes pointer input, even when pointer
+    /// and keyboard actions arrive in the same frame. This lets an application
+    /// route pointer gestures through their own owner without losing other input.
+    #[inline(always)]
+    pub fn clicked_with_keyboard_or_accessibility(&self) -> bool {
+        self.flags.contains(Flags::FAKE_PRIMARY_CLICKED)
     }
 
     /// Returns true if this widget was clicked this frame by the given mouse button.
@@ -507,6 +517,26 @@ impl Response {
         self.drag_stopped() && self.ctx.input(|i| i.pointer.button_released(button))
     }
 
+    /// Actual position that ended the previous drag, in this response's layer.
+    /// A positionless terminal or non-pointer cancellation returns `None`.
+    /// This is distinct from `interact_pointer_pos`: a fresh held press can
+    /// coexist with an old stopped drag on the same widget in one input batch.
+    pub fn drag_stopped_pos(&self) -> Option<Pos2> {
+        if !self.drag_stopped() {
+            return None;
+        }
+        let pos = self.ctx.interaction_snapshot(|snapshot| {
+            (snapshot.drag_stopped == Some(self.id))
+                .then_some(snapshot.drag_stopped_pos)
+                .flatten()
+        })?;
+        Some(
+            self.ctx
+                .layer_transform_from_global(self.layer_id)
+                .map_or(pos, |transform| transform * pos),
+        )
+    }
+
     /// If dragged, how many points were we dragged in since last frame?
     #[inline]
     pub fn drag_delta(&self) -> Vec2 {
@@ -581,15 +611,19 @@ impl Response {
 
     /// Drag-and-Drop: Return what is being dropped onto this widget, if any.
     ///
-    /// Only returns something if [`Self::contains_pointer`] is true,
-    /// the user is drag-dropping something of this type,
-    /// and they released it this frame.
+    /// Only returns something if the payload's actual release position hits
+    /// this widget, with the normal layer/widget occlusion rules. A later hover
+    /// or a positionless terminal cannot authorize a drop.
     #[doc(alias = "drag and drop")]
     pub fn dnd_release_payload<Payload: Any + Send + Sync>(&self) -> Option<Arc<Payload>> {
         // NOTE: we use `response.contains_pointer` here instead of `hovered`, because
         // `hovered` is always false when another widget is being dragged.
-        if self.contains_pointer() && self.ctx.input(|i| i.pointer.any_released()) {
-            crate::DragAndDrop::take_payload::<Payload>(&self.ctx)
+        let pos = crate::DragAndDrop::release_position(&self.ctx)?;
+        if self
+            .ctx
+            .widget_contains_pointer_at(self.id, self.layer_id, pos)
+        {
+            crate::DragAndDrop::take_released_payload::<Payload>(&self.ctx)
         } else {
             None
         }
@@ -1291,5 +1325,84 @@ impl<R> InnerResponse<R> {
     #[inline]
     pub fn new(inner: R, response: Response) -> Self {
         Self { inner, response }
+    }
+}
+
+#[cfg(test)]
+mod non_pointer_click_tests {
+    use super::*;
+
+    fn response_for_input(keyboard: bool, pointer: bool) -> Response {
+        let ctx = Context::default();
+        let mut response = None;
+        let screen = Rect::from_min_size(Pos2::ZERO, crate::vec2(400.0, 300.0));
+        ctx.run_ui(
+            crate::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            },
+            |ui| {
+                response = Some(ui.button("close"));
+            },
+        )
+        .drop_without_applying_deltas();
+        let previous = response.take().unwrap();
+        ctx.memory_mut(|memory| memory.request_focus(previous.id));
+        let mut events = Vec::new();
+        if keyboard {
+            events.push(crate::Event::Key {
+                key: crate::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: crate::Modifiers::NONE,
+            });
+        }
+        if pointer {
+            let pos = previous.rect.center();
+            events.push(crate::Event::PointerMoved(pos));
+            for pressed in [true, false] {
+                events.push(crate::Event::PointerButton {
+                    pos,
+                    pressed,
+                    button: PointerButton::Primary,
+                    modifiers: crate::Modifiers::NONE,
+                });
+            }
+        }
+        ctx.run_ui(
+            crate::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                response = Some(ui.button("close"));
+            },
+        )
+        .drop_without_applying_deltas();
+        response.unwrap()
+    }
+
+    #[test]
+    fn non_pointer_click_excludes_pointer_only_input() {
+        let response = response_for_input(false, true);
+        assert!(response.clicked_by(PointerButton::Primary));
+        assert!(!response.clicked_with_keyboard_or_accessibility());
+    }
+
+    #[test]
+    fn non_pointer_click_keeps_keyboard_input() {
+        let response = response_for_input(true, false);
+        assert!(response.clicked_with_keyboard_or_accessibility());
+        assert!(!response.clicked_by(PointerButton::Primary));
+    }
+
+    #[test]
+    fn non_pointer_click_keeps_keyboard_with_simultaneous_pointer() {
+        let response = response_for_input(true, true);
+        assert!(response.clicked_by(PointerButton::Primary));
+        assert!(response.interact_pointer_pos().is_some());
+        assert!(response.clicked_with_keyboard_or_accessibility());
     }
 }

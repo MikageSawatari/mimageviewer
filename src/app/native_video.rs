@@ -2719,6 +2719,42 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(super) fn request_native_video_f12_presentation(
+        &mut self,
+        target: ViewerPresentation,
+    ) -> Option<u64> {
+        if target == self.viewer_presentation
+            && !self.video_presentation_transition.is_transitioning()
+        {
+            // A same-host F12 change still explicitly changes the reader's independence.
+            let independent = self.explicit_presentation_is_independent(target);
+            self.commit_viewer_session(target, independent, "native_f12_same_host");
+            if let Some(id) = self.detached_viewer_window_id() {
+                self.update_detached_window_runtime_flags(id, !independent, "native_f12_same_host");
+            }
+            None
+        } else {
+            let request = self.request_native_video_viewer_presentation(target, true)?;
+            let independent = self.explicit_presentation_is_independent(target);
+            self.video_presentation_transition
+                .set_target_independent(request, independent);
+            if target == self.viewer_presentation {
+                // A reversal can cancel its native work and go straight to Stable.
+                // Its unchanged host already exists, so F12 can commit this part now.
+                self.commit_viewer_session(target, independent, "native_f12_reversed_to_current");
+                if let Some(id) = self.detached_viewer_window_id() {
+                    self.update_detached_window_runtime_flags(
+                        id,
+                        !independent,
+                        "native_f12_reversed_to_current",
+                    );
+                }
+            }
+            Some(request)
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn request_native_video_viewer_presentation(
         &mut self,
         target_presentation: ViewerPresentation,
@@ -3096,7 +3132,10 @@ impl App {
                 if let Some(idx) = source_idx {
                     self.bump_native_video_committed_generation(idx, candidate_generation);
                 }
-                self.apply_video_presentation_switched(request.target);
+                let independent = request
+                    .target_independent
+                    .unwrap_or(self.detached_viewer_independent_active);
+                self.apply_video_session_switched(request.target, independent);
                 if let Some(idx) = source_idx {
                     self.emit_audio_output_binding(idx, "placement_switched", request.target);
                 }
@@ -4228,6 +4267,7 @@ impl App {
         if let Some(window_id) = parked_live_window_id {
             self.video_continuous_last_eof = None;
             self.refresh_fullscreen_video_marker_cache(target_idx);
+            self.record_reading_history(target_idx, history_trigger);
             crate::logger::log(format!(
                 "[native-video] parked deferred source swap committed without open_fullscreen: \
                  window_id={window_id} target_idx={target_idx}"
@@ -5252,17 +5292,42 @@ impl App {
     /// 「ユーザーが見ていない未確定モード」が次回起動時に持ち越される。
     #[cfg(windows)]
     pub(crate) fn apply_video_presentation_switched(&mut self, presentation: ViewerPresentation) {
+        let independent = if presentation == self.viewer_presentation {
+            self.detached_viewer_independent_active
+        } else {
+            self.explicit_presentation_is_independent(presentation)
+        };
+        self.apply_video_session_switched(presentation, independent);
+    }
+
+    #[cfg(windows)]
+    fn apply_video_session_switched(
+        &mut self,
+        presentation: ViewerPresentation,
+        independent: bool,
+    ) {
+        // A same-host maintenance request can complete after its reader was parked.
+        // Commit that reader's session without publishing it as the active window.
+        let parked_same_host = presentation == ViewerPresentation::DetachedWindow
+            && self.viewer_presentation == ViewerPresentation::DetachedWindow
+            && self.detached_viewer_window_id().is_some_and(|id| {
+                self.detached_window_state_is_parked_live(id)
+                    && self.active_detached_window_id() != Some(id)
+            });
         if self.viewer_presentation != presentation {
             self.fs_front_pointer = Default::default();
         }
         let in_window = matches!(presentation, ViewerPresentation::MainWindow);
         self.native_video_in_window_active = in_window;
-        self.commit_viewer_presentation(presentation, "video_presentation");
+        self.commit_viewer_session(presentation, independent, "video_presentation");
         self.publish_effetune_auto_fullscreen();
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
             let id = self.ensure_detached_viewer_window_id();
             self.ensure_mounted_detached_session_binding(id);
-            self.begin_active_detached_session(id, super::DetachedSource::Video);
+            if !parked_same_host {
+                self.begin_active_detached_session(id, super::DetachedSource::Video);
+            }
+            self.update_detached_window_runtime_flags(id, !independent, "video_presentation");
         }
         self.last_viewer_sync_stamp = if matches!(presentation, ViewerPresentation::DetachedWindow)
         {
@@ -5271,6 +5336,12 @@ impl App {
         } else {
             None
         };
+        if parked_same_host {
+            crate::logger::log(
+                "[native-video] parked same-host presentation committed in owning context",
+            );
+            return;
+        }
         if !matches!(presentation, ViewerPresentation::DetachedWindow)
             && self.settings.video_in_window_mode != in_window
         {
@@ -5294,6 +5365,26 @@ impl App {
         crate::logger::log(format!(
             "[native-video] presentation switch applied -> {presentation:?}"
         ));
+    }
+
+    /// Item departure for a host exchange. Keep the reader's still caches and queues.
+    #[cfg(windows)]
+    pub(super) fn retire_media_item_for_detached_host_exchange(&mut self, fs_idx: usize) {
+        self.save_all_video_resume_positions();
+        self.cleanup_normalize_state_for_fs_idx(fs_idx);
+        self.close_video_seek_strip(crate::video::seek_strip::SeekStripCloseCause::VideoChanged);
+        self.clear_mounted_native_video_pending();
+        self.video_audio_mode = None;
+        self.video_audio_vst = None;
+        self.video_audio_mode_runtime = None;
+        self.music_vst_shell = None;
+        self.clear_music_view_state();
+        self.teardown_video_audio_vst_gui();
+        self.fs_cache.remove(&fs_idx);
+        self.video_presentation_transition
+            .retire_media_output(self.viewer_presentation);
+        self.fs_margin_bbox_cache.remove(&fs_idx);
+        self.last_loop_pos.remove(&fs_idx);
     }
 
     /// close イベントの世代トークンが現在の committed 世代以上かを判定する pure ロジック。
@@ -5603,6 +5694,12 @@ impl App {
             .native_video_parked_live_activation_requests
             .contains(&window_id)
         {
+            let request = self.detached_activation_request(
+                ctx,
+                window_id,
+                super::DetachedActivationSource::NativeMedia,
+            );
+            self.accept_discrete_detached_activation(ctx, request);
             self.native_video_parked_live_activation_requests
                 .push(window_id);
             ctx.request_repaint();
@@ -15783,6 +15880,17 @@ impl App {
             self.cancel_stale_video_tile_reopen(from_idx, "wheel-open");
         }
 
+        if self.native_video_parked_live_input_window_id.is_some() && self.viewer_item_is_media(idx)
+        {
+            self.open_parked_live_media_from_navigation(
+                ctx,
+                idx,
+                history_trigger,
+                autoplay_override,
+                ignore_resume,
+            );
+            return;
+        }
         self.fs_video_open_autoplay_override = autoplay_override;
         self.fs_video_open_ignore_resume_once = ignore_resume;
         let cursor_state = self.fullscreen_cursor_state();

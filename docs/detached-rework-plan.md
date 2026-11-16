@@ -284,6 +284,9 @@ R2b 完了条件 (純粋 reducer / 合法遷移 / typed state 集約) を満た�
 `DetachedWindowRuntime` と watcher の型・worker 実装も同モジュールへ移し、`App` は設定への
 placement 永続化、メディア presenter、ログなど複数領域をまたぐオーケストレーションだけを担う。
 
+2026-11-14の依頼50 Aで、このwatcherは撤去し、callback／native input ownerの離散入力から
+Managerの同じintentへ配送する構造へ置き換えた（§11）。以下は構造分離当時の記録。
+
 - runtime の生成、state / linked / placement / trim bbox / builder latch / HWND / deferred activation
   の変更は Manager の意味付き API を経由する。runtime map への直接変更は残さない。
 - gamepad の固定入力は Manager が保持する最後の入力面を fallback に使う。通常は OS 前面 HWND
@@ -1455,6 +1458,202 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-15: §1.767 サブPC依頼57 — caption buttonの確定点を一致SCに統一
+
+タッチ・最小化の独立レビュー（基点9c69805bd、Sol / xhigh、REJECT）は構造修正に合意。
+P2-2は昇格mouseのbutton開始をDown／DBLCLKへそろえ、既存の一致SCと本人call返却を共用する（BA-7）。
+P2-1は設計担当の判断でraw／昇格の相関pendingを作らない。利用者touch.logの4tapの
+開始座標／hit一致と、仮定の交差hitによる二重outcomeのApp受理境界の検査を、調査書§5.11末尾へ記録する。
+App field／caption／resize／×／clientの経路は変更しない。
+2026-11-16のPC reset後は中断前logを根拠にせず、4並列で焦点28件・回帰679件・probe単体7件を再実行し全成功。
+仮定の二重outcomeはParked／ParkedLiveとも同batchではCommandOwned、commit後はNotParkedで、
+実commitは1回・ページ不変を確認した。probe build／core check／最後の引数なしfmtもexit 0。
+コマンド・証跡・実測4tapの行番号と未確認の限界は調査書§5.11末尾を参照。
+
+依頼58の利用者決定で最小化は再開しない例外へ変更。HTMINBUTTON＋一致SC_MINIMIZEの
+結果を既存native確定相の閉じたpayloadへ保持し、同call返却でMinimizeOwnedを出す。
+Appのnormalized decisionもMinimizeOwnedとし、既存のAccepted限定輸送へ入れないため
+再開／復元／focus要求を作らない（BA-7）。既存focus boolのclearや新App fieldは追加しない。
+設計担当と独立Sol / xhighが構造修正に合意。タッチの昇格mouse所有を維持し、rawとの相関は作らない。
+Parked／ParkedLiveの実handler対照とsource経路を調査書§5.11の依頼58記録へ追記。
+タスクバー復元§1.790は対象外。
+
+利用者のメインPC touch.logでP2-2の実列を採取。buttonだけraw NC pointerをownerにせず、
+OSが動作を選ぶ昇格mouse NCLBUTTONDOWNへ既存Mouse owner／一致SC／同call返却を統一した。
+既存call tokenにcaptured originを保持し、dispatch／finishを同じ所有判定へそろえる（BA-7）。
+rawとの相関pendingやApp fieldは作らず、caption／resize／×／clientは維持する。
+設計担当と独立Sol / xhighが構造修正として合意。ペンの昇格と修正後実機は未確認。
+詳細・テストは調査書§5.11末尾のタッチ実測記録へ追記する。
+
+独立レビュー（e81ac0d94基準、Sol / xhigh、REJECT）のP2-1／P2-4を反映。
+既存native scopeがsubclass invocation tokenを所有し、開始したDown／claimしたUp・ExitSizeMoveの
+返却だけを終端にする（button／caption／resizeの再入を同じ所有で解決、BA-7）。
+probe autoは送信直前のforeground／前面thread capture／全mouse button未押下も要求する。
+初回独立レビュー対応時点ではpointer列の未採取とkeyboard最大化の入口不足を設計担当決定で未対応とした。
+touch列は上記の利用者記録で採取済みとなり、buttonの所有を更新した。keyboard入口は未対応のまま。
+
+依頼57の実OS列で、release位置のWM_NCHITTESTがOSのbutton選択と一致しないことを確認した
+（観測者: サブPC担当）。MIN／MAX／HELPは同じ押下native call内の一致WM_SYSCOMMANDだけで確定し、
+押下call返却だけで終端する。buttonの位置照合とrelease待ちを撤去し、block／retireと
+CloseOwned／caption／resize／clientの所有は維持する。BA-7の確定点の構造修正として
+設計担当と独立Sol / xhighが合意。probeのautoも事前hit推測を外し、実押下のhitを確認する。
+詳細・検証・初回時点のpointer未確認と後続のタッチ実測は[調査 §5.11](depth-parallax-realmachine50-investigation.md#511-依頼57-caption-buttonの確定をosの一致コマンドへ統一2026-11-15)へ記録する。
+
+### 2026-11-15: §1.767 サブPC依頼56 — 最大化buttonの理由付き診断と独立probe
+
+BA-7のnative操作終端を調査。通常最大化／復元の取消理由を一つに確定できないため、
+認識規則は変えず、NonClient／NativeMediaTouchのnormalizedへ既存のtyped reasonを追加した。
+dev-tools限定probeは自分で作ったWin32 HWNDへ製品のsubclass／PM_REMOVE観測／dispatch／finishと
+allocation leaseを共有し、App／GPU／実設定を初期化しない。rectによるHWND同定、時間窓、retry、
+App pendingは追加しない。独立review（Sol / xhigh）は、同じownerの診断を用いる構造であり
+症状パッチではないと合意、sourceはACCEPT。根拠・候補表・使用手順・検証／未確認は
+[依頼56記録 §5.10](depth-parallax-realmachine50-investigation.md#510-依頼56-最大化復元ボタンの取消理由と実os順序の採取2026-11-15)へ記録する。
+
+### 2026-11-15: §1.767 サブPC依頼55 — caption／長押し／ParkedLiveと入力入口の診断
+
+再レビューの位置なし終端の認可分離を反映（BA-7）。eguiのcanonical release位置を正本にし、
+独自recognizer／deferred transport／page-turn deliveryも同じ順序と所有へ揃える。
+保持の終了通知と通常dragは維持し、位置なしでの操作確定はParked復帰だけに限定する。
+新App field・時間窓・座標推定は追加せず、構造修正の合意とconsumer全件監査を
+[再レビュー対応 §5.9](depth-parallax-realmachine50-investigation.md#59-位置なし終端を操作の認可から分離する2026-11-15再レビュー対応)へ記録する。
+
+独立実装レビューのP1 / P2と設計担当のcaption指摘を受け、同Stateがforwardした物理押下の位置なしreleaseを
+typed raw終端へ接続し、egui保持・observer・callbackと既存command ownerのrelease順序を揃えた（BA-7）。
+caption buttonは途中のmotionではなく解放対象とOSの選択確定で判定する。
+診断Infoは正確な2targetだけ通常sinkへ通す。独立 Sol / xhigh と構造適合を確認し、
+新App field・時間窓・座標推定は追加しない。[レビュー対応 §5.8](depth-parallax-realmachine50-investigation.md#58-依頼55の独立レビュー指摘の修正2026-11-15)に根拠と検証を記録する。
+
+同日の追加決定「案1」を反映し、通常canvasのprimary／単指touchとcaption／resizeのdragは
+操作終端で復帰し、その入力でページ／パンを動かさない。移動量の取消・不要なrect捕捉と閾値を撤去し、
+caption buttonのhit対象外取消とCloseOwnedは維持する。Aはwinitとのcursor位置寿命不一致を
+ソース・赤テストで確認し、Windows全viewportのStateがCursorMovedの物理位置を保持してEnteredで復元する。
+touch／State再生成の寿命もwinit／native allocationへ揃え、前回の診断を残す。
+独立設計レビュー（Sol / xhigh）は根本の入力owner／終端の修正として合意した（BA-7主・BA-1関連）。
+実機のイベント列との対応／part3の座標差は未確認。[追加実装記録 §5.7](depth-parallax-realmachine50-investigation.md#57-利用者決定案1とaの追加修正2026-11-15)を参照。
+
+初回の記録（追加決定前）: 設計担当の指定と独立設計レビュー（Sol / xhigh）の構造合意に従い、captionの同期native操作終端、
+復帰専用の時間に依存しないclick／単指完了、ParkedLiveのNonClient transportと生成時のtyped期待状態を
+既存ownerへ揃える（BA-7主、BA-1関連）。drag取消は今回維持する。Aの反復停止後の入力消失は
+headlessで再現した原因とはせず、App／両backend／Stateの反復対照と押下時の型付き破棄診断を追加し、
+推測によるlease／routing変更は行わない。[依頼50調査書 §5](depth-parallax-realmachine50-investigation.md#5-依頼55の対応2026-11-15)に根拠・検証・未確認を記録する。
+
+### 2026-11-14: §1.767 サブPC依頼50 B — 外部openの採用をgrid handoffへ接続
+
+設計担当と独立設計レビュー（Sol / xhigh、2026-11-14）が構造的な変更に合意した範囲で、startupのtyped ownerが新規main採用／既存C継続を確定し、既存navigation・hydration・composition／sidecar／列挙reopenへ保持する。採用可能な最終rowの境界で新規mainだけが既存gridのpark／closeを一度通し、旧Depthを終えてから新sessionを公開する（BA-7主・BA-5関連）。Bookmark／Collectionは自己parkせず、mainの一覧、DirectMedia／mediaの所有モデル、PDF cached即時採用、A／Cの入力契約は維持する。記録・経路表・検証は[依頼50調査書 §3.5](depth-parallax-realmachine50-investigation.md#35-b-実装記録2026-11-14ba-7主ba-5関連)。
+
+DirectMedia静止画の既存の独立reader／main basis分離に到達して露見した、forkのpending中owner getterも修正。TableOpと禁止assertは維持し、local復帰情報を使って`finish_fork`直後にsourceの世代・観測・選択を確定する。split直呼びの既存testに加え、本番両fork・旧兄弟なし／ありの外部openで所有を検査する。これも独立レビューが構造修正としてACCEPTした（main reader固定という実装時の誤った前提は調査書で訂正）。
+
+### 2026-11-14: §1.767 サブPC依頼50 A 独立レビュー P2 / P3 対応
+
+設計担当と独立設計レビュー（Sol / xhigh、2026-11-14）が構造的な修正に合意した範囲で、同native ownerのcaption button押下対象・motion / Upによるdrag終端、診断touch無効時の入力相関とcommand抑制の分離、取消decisionの元scope保持へ揃えた（BA-7）。Sharedの重複scopeを撤去し、退役proofは認可せず元identityだけを診断に保持する。Cのbackend hook・B・新しいApp field・待ち・retryは変更／追加しない。変更と検証は[依頼50調査書 §2.4](depth-parallax-realmachine50-investigation.md#24-a-実装記録2026-11-14ba-7)に記録する。
+
+### 2026-11-14: §1.767 サブPC依頼50 C 独立レビュー P2 対応
+
+設計担当と独立レビュー（Sol / xhigh）が構造修正に合意した範囲で、synthetic keyの終端権限をphysical takeoverで同registration／keyから移譲し、旧repeat／Upが再取得・解除しない所有境界へ集約した（BA-1／BA-7）。App field・待ち・retryは追加せず、Aの復帰・backend hookは変更しない。Wgpu suspendのROOT論理入力保持はWindows対象外として設計担当判断で見送り。根拠・回帰・検証は[依頼50調査書 §4.5](depth-parallax-realmachine50-investigation.md#45-c-独立実装レビュー指摘の対応2026-11-14)。
+
+### 2026-11-14: §1.767 サブPC依頼50 A — Parked静止画の復帰を離散入力へ集約
+
+設計担当と独立設計レビュー（Sol / xhigh、2026-11-14）が、BA-7の入力所有・確定点を直す構造的な変更であることに合意した。
+managerのactivation polling watcher、Appのwatch step／target／drain、watcherのHWND repairを撤去した。
+clientはdeferred callbackのgesture owner、non-clientはCの確定HWNDのnative owner、mediaは既存native入力から、
+生成時window／registration／context／allocationを持つ同じintentとroot commitへ配送する。
+client closeも同gestureの排他的destinationとして既存Frame closeへ渡し、keyboard／accessibilityとnative closeは既存ownerを保つ。
+overview／right-drag優先・modal／capture lost／touch Cancelの終端・
+discard再passでの一回消費を同ownerで扱う。focusだけ・keyboardだけの復帰は追加しない。
+Cのeframe/backend hook、Bの外部open、placement／focus基盤は変更しない。
+Active時の保留raw inputが新callbackへ届く前提を確認し、Aの所有証跡をegui-winitの実正規化点で発行しeguiの非操作markerと共に運ぶ。
+旧State入力のappendや先頭spliceでproofが別操作へ移らず、RawInput／IME終端は保持する。
+新しいApp field・時間窓・retry・追加repaintはない。
+過去の§9.3／§9.4等のwatcher記載は当時の履歴で、現在の所有は本項とarchitecture-overviewを正本とする。
+変更範囲、旧テストとの対応、診断ログ、検証結果と実機未確認は
+[依頼50調査書 §2.4](depth-parallax-realmachine50-investigation.md#24-a-実装記録2026-11-14ba-7)に記録する。
+
+### 2026-11-14: §1.767 サブPC依頼50 C — native allocation に入力 HWND の正本を集約
+
+設計担当は全 child 版を採用し、**構造的な変更であることに独立設計レビュー (Sol xhigh、2026-11-14) が合意**した（BA-1）。
+Wgpu / Glow の root・immediate / deferred child・再生成・GC・終了を backend 所有 lease へそろえる。
+旧 key subclass・入力 registry・当該 allocation の未配送 native edge / gesture と旧 WindowId 配送対応の撤去後に後継を公開する。
+logical viewport の保持済み RawInput / IME は別の寿命として維持する。App の detached host 採用も backend 正本を参照し、
+rect・窓列挙差分・唯一の未登録窓からの推定と、そのための deferred 生成の直列化を撤去する。
+backend の失効可能な Weak owner を既存 host cache に持たせ、同 HWND 再利用と旧 Window Arc 残存でも寿命を取り違えない。
+既配送 synthetic Primary の終端は egui の対象 button / widget だけを取り消す正規 API へ接続し、通常 click / drag commit や layout 再passへの再配送を作らない。
+仮想デスクトップ同期など入力以外の rect 利用、配置・focus / z-order の計算は対象外。新しい App 状態・待機・retry は足さない。
+A（再 activation）と B（外部 open の前景 owner 移動）は次回で、今回の修正に含めない。
+実装・検証の記録は [依頼50調査書 §4](depth-parallax-realmachine50-investigation.md#4-c--rectによるキーsubclassの誤同定)。
+実装後の独立レビュー (Sol xhigh、2026-11-14) はCスコープ受入可・追加P1/P2なし。同条件回帰2,257件成功と最終fmtを確認した。A/Bの赤4件と製品実機未確認は別の残件として保持する。
+
+### 2026-11-14: §1.767 サブPC依頼50の原因調査と赤テスト（製品未変更）
+
+正本は [依頼50の調査と修正設計](depth-parallax-realmachine50-investigation.md)。
+停止静止画のprimary click配送（BA-7、実機Aの原因は未確定）、外部openの旧owner handoff迂回（BA-7 / BA-5）、
+キーsubclassだけに残るrect HWND同定（BA-1）を分離して調査する。製品・viewport・registry・vendorは変えず失敗回帰を追加する段階。
+修正案は既存intent／採用handoffと生成・破棄の正本へそろえ、guard / delay / retry / 追加repaint / Appの新しいpendingは使わない。
+全childの正確なHWNDを渡す正規backend hookは今回のvendor変更禁止を越えて実装せず、次段の範囲を設計担当と独立レビューで確定する。
+
+### 2026-11-14: 3D 写真第 2 段の課題 1 — 独立したメディアウィンドウから静止画の窓への交換と、独立性の確定 (§1.767)
+
+正本は [depth-parallax-plan §6.4.5](depth-parallax-plan.md)。利用者の決定 (2026-11-14): 独立したメディアウィンドウから同じ閲覧の送りで画像へ進んだら、
+メディアウィンドウを閉じて同じ独立の閲覧 (同じ context) のまま静止画の窓を新しい window id で開き直し、元の窓の位置と大きさ (F11 の枠なし全画面を含む) を引き継ぐ。
+連動したメディアウィンドウ、一覧からの open、静止画 → 動画・音声、複数ウィンドウモードの種類変更は変えない。
+
+変える範囲: 独立性を `prepare_viewer_presentation_open` で設定 (`detached_still_open_is_independent`) から決め直すのをやめ、
+binding を予約・公開する時点 (新規 open・再開・descriptor 再構築・複数ウィンドウモードの新規メディア) で (presentation, 独立性) を初期確定し、
+以後の同じ閲覧の open は引き継ぐ。session の確定点 (`commit_viewer_session`、F12 の egui / native の確定) は (presentation, 独立性) を一緒に書く。
+F12 は「今が独立」を理由に DetachedWindow を優先しない。独立メディア → 静止画は 1 つの helper で、A の placement と F11 の状態 (遷移中なら target) を捕捉 →
+旧メディア資源の退役 → A の session と binding の退役 → B の生成・binding・runtime (placement と枠なしを最初の builder から) → 静止画 session。
+
+変えない範囲: HWND の同定、placement の計算・保存形式、focus / z-order の基盤、bundle swap、backstop、decoder・presenter。
+App に detached 用の bool / Option / pending を足さない。guard / delay / retry / 追加 repaint / silent fallback を足さない。close + open の組み合わせを使わない。
+
+判断理由: 表示先と独立性を 2 か所で別々に決めていた BA-7 の二重決定を、binding の初期確定と 1 つの session commit に集約し、
+同じ context の表示ホストの交換として旧窓と新窓の寿命を分ける。BA-4 (同種の送りは安定した id、種類変更だけ明示的に新しい id)・BA-6 (runtime の placement を
+次の窓の seed に渡す)・BA-5 (旧窓の描画要求を残さない) に関連する。
+
+設計担当 ClaudeCode Opus と独立 GPT-6.1 Sol / xhigh の設計レビュー r1 (指摘修正後に実装開始可、P1 1・P2 2・P3 1 を設計に反映) で、
+「症状パッチではなく構造的な変更」であることに合意した。
+
+実装追補: `src/app/depth_view.rs` の session commit を同時書込みにし、native の遅延確定は既存
+`PresentationRequest.target_independent` へ解決済みの値を保持する。F12 の同表示先への反転要求は
+採用後に独立性を確定する。旧 media output の drop とともにその transition request/effects を終端し、
+request id の単調増加は維持する。新しい App の状態・待ち・viewport の救済処理は追加しない。
+F11 の戻り Settle は restore を既に消費しているので runtime の通常 placement を引き継ぐ。
+遅延した DetachedImage scan は初期 session を上書きしない。実装・検証記録は正本 §17.18。
+
+設計担当の追加決定 (2026-11-14): 交換を要する Manual の遅着結果は owner が inactive なら採用前にログ付きで捨て、同種メディアの背景採用は維持する。
+通常 resolver と Collection の採用境界から共通判定を呼び、背景media採用は旧EOF部品と共有、same-host native確定は所有contextに閉じる。新pending・背景B・描画guardは追加しない。決定と検証は正本 §6.4.5 / §17.18。
+独立実装レビュー r1 の P2（2026-11-14、BA-7）: 既存 request の独立性を明示 F12 だけが持つ `Some` と保守の `None` に分け、保守完了は現在の所有 context の確定値を継承する。App の状態や待ちは増やさず、実 fork / 再 activation / 旧 native 完了 / B 交換の回帰と検証を正本 §17.18 に追記する。
+独立実装レビュー r2 (2026-11-14、Sol / xhigh、対象 `01c9b2195`) は受入可・指摘なし。課題 1 の実装 (`9044445e6` + `01c9b2195`) について、設計担当 (ClaudeCode) と独立レビューの双方が**症状パッチではなく構造的な変更であることに合意**した。
+全件 gate の prepared 内部本の退行修正（2026-11-14、BA-7）: 内容 close が Building の private binding の初期 pair を公開まで保持し、loading shell / Collection root は予約時に runtime も同期する。独立 reviewer は所有境界の構造修正と確認し、同型入口の監査・検証結果を正本 §17.18 に記録する。
+独立実装レビュー r3 (2026-11-14、Sol / xhigh、対象 `178a3ece2`) は受入可・指摘なし。設計担当 (ClaudeCode) と独立レビューの双方が**症状パッチではなく構造的な変更であることに合意**した。
+
+### 2026-11-13: 3D 写真第 2 段の実機課題の修正 (再開の所有の移動、メインが表示を失う確定点での 3D 終了)
+
+対象は [depth-parallax-plan §6.4.4](depth-parallax-plan.md) の課題 2・3（P2-2 を含む）・4。
+設計レビュー r1 の構造合意を前提に、実装担当が主要な前提をコードで確認して実装した。
+BA 分類は **BA-7 主、BA-5 関連**。実装 `53d224a5c` の独立レビュー (2026-11-14、Sol / xhigh) は受入可・指摘なしで、
+設計担当 (ClaudeCode) と独立レビューの双方が**症状パッチではなく構造的な変更であることに合意**した。
+
+変える範囲:
+
+- passive / ParkedLive の再開を、取り出す前に確定した移動元と移動先 id を渡す共通 helper にそろえる。
+  移動元を park してから移動先を id で取り直して消費する。park の pause / live-media / close は明示された context を使い、
+  移動先の remove を根拠に移動元を推定し直さない。ParkedLive の linked still 保持と方式固有の再開処理は維持する。
+- 独立 context の activation / 新規 build 成功 / materialized fork 後の open 成功の確定点から、
+  共通 helper で main の全画面の Depth と Checking / Confirm の ModeEntry を終える。
+  main を mount して既存の Depth 終了（要求取消・slot 除去）を使い、モデル確認の処理と Preferences の案内は残す。
+- マニュアルに表示切替での 3D 終了と、外部 open の最後の 1 件を画面を閉じた後に開く既存動作を書く。
+
+変えない範囲:
+
+- 課題 1 の行き先・独立性の規則、360°、メインの閲覧位置・全画面の保持、埋め込み main の Depth / ModeEntry。
+- viewport の生成・id・builder、HWND、placement、focus、z-order、bundle swap、backstop、通常更新・scoped mount。
+- App の detached 用状態、D の入場判定（兄弟は読むだけ）、毎フレームの描画振り分け。
+  guard / delay / retry / 追加 repaint / 一括 reset / silent fallback は加えない。
+
+判断理由: remove で移動元の見え方が変わる前に所有者を固定し、live pass を失う確定でその表示に属する 3D の寿命を閉じる。
+描画側の孤児除外や兄弟の 3D を無視する条件を加える症状パッチではない。
+全画面の閲覧そのものを閉じる案は既存の閲覧保持を変えるので採らず、Depth と未完了入場の寿命だけを終端する。
+検証結果と未確認は [depth-parallax-plan §17.17](depth-parallax-plan.md) に集約する。
 ### 2026-11-16: 本文の保存回転による本自身の自動代表cache失効 (§1.773、表紙計画§29)
 
 設計担当と独立レビュー担当は、P案を撤回した後の単純な保存側失効について改めて設計合意した。
@@ -1516,6 +1715,43 @@ bundle 境界の変更なので、リワーク側の別項目とする。
 設計担当 ClaudeCode と独立 Sol / xhigh 設計レビュー (r1 REVISE P2/P3 → r2 ACCEPT) は、移動先の変更を移譲境界より前に適用していた
 順序の誤りを正す構造修正であり、症状パッチではないと合意した。正本は
 [検索結果からの移動 §12.3](search-result-navigation-682-688-plan.md)。
+
+### 2026-11-11: 3D 写真の独立した窓への対応 (§1.767 第 2 段)
+
+基点 `cc0264f3a`、正本は [3D 写真設計 §6.4.3](depth-parallax-plan.md#643-独立した窓での-3d-1767-第-2-段2026-11-11設計)。
+第 2 段を進める利用者決定の後、設計担当 ClaudeCode Opus と独立 GPT-6.1 Sol / xhigh の設計レビュー r5 で
+「症状パッチではなく構造的な変更」であることに合意済み。r5 P1 の受付済み遷移と modal の排他を含む。
+作業は `feat-767-stage2`、`G:\home\mimageviewer-767s2` で継続し、中断時の実装差分は WIP `196dec7fc` から引き継いだ。
+
+変える範囲:
+
+- main / presentation / session 独立性による入場制限を、既存 registry の読み取りだけによる「ほかの context が Depth を持たない」条件に置き換える。
+  後から入った窓のために兄弟の Depth を終えない。実 session 切替での終了は既存確定点に残す。
+- `park_active_detached_context_as_live_media` は所有 context を mount した既存 closure 内で、snapshot 作成前に Depth だけを終了する。
+  360° の意図や park の搬送手順は変更しない。
+- `depth_dialog_owner_surface` / `viewer_context_live` が既存 operation と追加モデル案内の入口から表示先を導く。
+  生きている独立所有者は自窓、main 所有・環境設定由来・退場後の案内は既存 main の表示経路で描く。
+- 独立した所有者の modal の間だけ、追加モデル Checking / Confirm の document admission、所有窓 OS close、自動送りを止める。
+  modal の 2 入口では既存 `active_detached_transition_outstanding()` で先に拒否し、受付済みの reopen を modal が拒む組合せを作らない。
+  main 所有と環境設定由来には新しい制限を広げず、非所有窓の close も維持する。
+- ROOT poll の確認完了を独立した要求 context へ scoped mount で配送し、live / items / page identity を照合する。
+  パネル矩形と書き出し snapshot の一時 id は context で分ける。
+
+変えない範囲: viewport 生成・id・builder、HWND 同定、placement、focus、z-order、bundle swap、fork / park の搬送手順、
+`reset_detached_pause_foreground_modes`、`render_fs_body` の root / child 分岐、backstop、F11 / F12 のキー経路。
+App に detached 用 bool / Option を足さず、時間窓・待ち・再試行・追加 repaint を作らない。
+
+判断理由: 1 context だけの所有と独立所有窓の modal 受付を既存所有境界で揃え、複数の 3D・at-rest の 3D・通常操作で所有窓を失う modal の
+組合せを減らす変更である。表示先は既存の事実から導き、frame フラグや完了移管は作らない。
+まれな失敗は既定のログと通知で割り切る。
+
+検証の要点: OtherWindow の双方向 readonly 拒否、park / close の取消と slot 除去、所有表示先、modal 各段階の保護と
+非所有窓・main・環境設定由来の非退行、受付済み folder / PDF / ZIP 遷移の正常完了、ROOT poll の再開配送、一時 id の分離。
+完成レビューとコマンド・件数・exit code は [実装記録 §17.15](depth-parallax-plan.md#1715-実装記録-643-第-2-段) に集約する。
+
+完成差分の正式な独立実装レビュー (GPT-6.1 Sol / xhigh、read-only、実装者とは別のセッション、対象 `08cc9da88`): P1 / P2 / P3 なし、
+判定「受入可」。「症状パッチではなく構造的な変更」であることに設計担当 ClaudeCode Opus と合意。触れないとした範囲 (viewport 生成・HWND・placement・
+focus・bundle swap・fork / park の搬送・backstop) への変更なしも確認された。
 
 ### 2026-11-11: 3D 写真の F12 の別ウィンドウ対応 (§1.767 第 1 段)
 

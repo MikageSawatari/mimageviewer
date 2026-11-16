@@ -355,6 +355,7 @@ fn section1674_grid_double_click_direct_open_and_scroll_share_display_loading() 
                         // Source enumeration is a fixture; its actual direct-open
                         // continuation and fullscreen admission remain production code.
                         app.complete_deferred_book_composition_open(crate::app::DeferredFsReopen {
+                            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                             history_trigger: crate::app::HistoryTrigger::UserChosen,
                             resume_slideshow: false,
                             target: crate::app::DeferredFsTarget::None,

@@ -2138,6 +2138,7 @@ impl App {
         // ジャンプ・スライドショー復帰が対象ページに到達しなかった)。
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
             self.fs_nav_after_pdf_enumerate = Some(crate::app::DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger,
                 resume_slideshow,
                 target: target.map_or(
@@ -2319,6 +2320,7 @@ impl App {
                 owner_context,
                 restore_video_tile,
                 reopen: crate::app::DeferredFsReopen {
+                    viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                     history_trigger,
                     resume_slideshow,
                     target: crate::app::DeferredFsTarget::None,
@@ -2357,8 +2359,22 @@ impl App {
         target: crate::snapshot::SnapshotTarget,
         history_trigger: crate::app::HistoryTrigger,
     ) {
+        self.finish_required_fullscreen_load_with_adoption(
+            target,
+            history_trigger,
+            super::ViewerOpenAdoption::ContextContinuation,
+        );
+    }
+
+    pub(super) fn finish_required_fullscreen_load_with_adoption(
+        &mut self,
+        target: crate::snapshot::SnapshotTarget,
+        history_trigger: crate::app::HistoryTrigger,
+        viewer_adoption: super::ViewerOpenAdoption,
+    ) {
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
             self.fs_nav_after_pdf_enumerate = Some(crate::app::DeferredFsReopen {
+                viewer_adoption,
                 history_trigger,
                 resume_slideshow: false,
                 target: crate::app::DeferredFsTarget::Required(target),
@@ -2369,6 +2385,7 @@ impl App {
             return;
         }
         self.complete_deferred_book_composition_open(crate::app::DeferredFsReopen {
+            viewer_adoption,
             history_trigger,
             resume_slideshow: false,
             target: crate::app::DeferredFsTarget::Required(target),

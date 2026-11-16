@@ -603,6 +603,14 @@ GitHub が archive を作り直して hash が変わった場合は、取得を�
 同じ staging・安全な展開・検証後の no-overwrite 公開を使い、既存の `vendor/whisper.cpp` を置換しない。
 現 identity の worker exe があれば、両方のソースと SDK は再利用に不要。
 
+**worker のソース (`crates/vlm-worker`) を変えたブランチを master へ取り込んだら、そのブランチで作った
+`mimageviewer-vlm.exe` を、master の `vendor\vlm-worker\` とバックアップ
+(`C:\home\mimageviewer_vendor_backup\vlm-worker\`) の両方へ実ファイルでコピーし直す。**
+コピーの後に `.\scripts\vlm-worker-identity.ps1 -ValidateRepo .` が通ることを確かめる。
+これを忘れると、master の build-dev・リリースビルドが identity の検査で止まり、バックアップからの復旧でも
+直らない (2026-11-17、文字起こし T1 の取り込みの後に §1.767 の作業ツリーで発生)。
+バックアップには署名なしの原本を置く。配布物の署名は `build-release.ps1 -Sign` が内包の前に行う。
+
 実際に C++ の変更で再ビルドする場合だけ Vulkan SDK `C:\VulkanSDK\1.4.363.0` と
 Visual Studio 18 2026 の C++ build tools / CMake が必要。リポジトリルートで実行する。
 

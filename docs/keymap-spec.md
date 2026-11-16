@@ -14,15 +14,29 @@
 
 `FsDepthParallax` は画像閲覧 (`FsImage`) の `Press` 操作、既定は
 <kbd>D</kbd>。再度押すか右パネルの×で終了する。操作カスタマイズで変更・解除できる。
-main context の MainWindow / Fullscreen / 一覧と連動する F12 の DetachedWindow
-（枠なし全画面を含む）の単ページ静止画を対象とする。複数ウィンドウモードの窓と
-メディアウィンドウなどの独立 context、動画・アニメーション・見開き・連結読み・
+MainWindow / Fullscreen / DetachedWindow（枠なし全画面を含む）の単ページ静止画を対象とする。
+複数ウィンドウモードの窓や独立した静止画 context でも使えるが、
+プロセス全体で 1 context だけが 3D を所有できる。ほかの context が所有中なら入口で拒否し、
+その context の状態は変更しない。動画・アニメーション・見開き・連結読み・
 編集・紙めくり中では受け付けない。360度表示からは3Dへ切り替える。
 3D中の360度切替は受け付けない。
 F12 の ON / OFF による表示先切替と、main の F11 による MainWindow / Fullscreen 切替では
 3Dを終了し、`FsDepthParallax` の実効キー（既定D）での再開を通知する。
-linked F12 の窓内で F11 により通常表示 / 枠なし全画面を切り替えた場合は3Dを継続する。
+別ウィンドウの窓内で F11 により通常表示 / 枠なし全画面を切り替えた場合は3Dを継続する。
 F11 / F12 も既存の `FsToggleWindowMode` / `ToggleDetachedViewerMode` の実効キーを使う。
+フル機能 + メディア別窓の独立 Video / Audio から静止画へ進むと、同じ context のまま
+メディア窓 A を退役して静止画窓 B に交換する。B の画像送りでは3Dを継続する。
+F12 は現在の独立性を継承せず、設定に従う表示先・独立性を一緒に確定する。
+遅延 reopen 中に現在項目が無い場合も、残る binding の session に適用する。
+独立 context が pause / park / fork / close などで live pass を失うときは3Dを終了し、
+一時的な context mount では終了しない。
+main 以外の独立 context から開いたモデル確認の Checking / Confirm と、書き出しの全 phase は、
+共通 modal に加え、所有窓の OS close・他窓の activation・外部 open・自動送りを拒否する。
+所有窓以外の OS close、main owner のモデル確認、環境設定由来のモデル案内には、この追加制限を広げない。
+main 以外の独立 context に `active_detached_transition_outstanding()` がある間は、モデル確認・書き出しの modal を
+開始する入口だけを通知付きで拒否する。導入済みモデルを使う通常の3D入場は、この条件では拒否しない。
+モデル案内の Running / Done / Cancelled / Error は非 modal のまま。詳細は
+[3D 写真設計](depth-parallax-plan.md) §6.4.3 を参照。
 3D中も `FsBgCycle`（既定Shift+B）とリングの背景色サイクルを受け付ける。
 透過画像だけで黒→白→市松（AIアップスケール中は黒/白）を循環し、3Dは終了しない。
 書き出しダイアログを開いている間はモーダルのため受け付けない。

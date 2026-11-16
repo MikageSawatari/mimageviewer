@@ -785,17 +785,22 @@ impl ModelAddon {
     #[cfg(test)]
     pub(crate) fn with_test_operation(root: PathBuf, operation: AddonOperation) -> Self {
         let mut addon = Self::with_test_status(root, AddonStatus::Missing);
+        addon.set_operation_for_test(operation);
+        addon
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_operation_for_test(&mut self, operation: AddonOperation) {
         let running = Running {
             rx: std::sync::mpsc::sync_channel(1).1,
             cancel: Arc::new(AtomicBool::new(false)),
         };
-        addon.state = match operation {
+        self.state = match operation {
             AddonOperation::None => WorkerState::Idle,
             AddonOperation::Installing => WorkerState::Installing(running),
             AddonOperation::Cancelling => WorkerState::Cancelling(running),
             AddonOperation::Removing => WorkerState::Removing(running),
         };
-        addon
     }
 
     #[cfg(test)]

@@ -1,6 +1,6 @@
 //! How mouse and touch interzcts with widgets.
 
-use crate::{Id, InputState, Key, WidgetRects, hit_test, id, input_state, memory};
+use crate::{Id, InputState, Key, Pos2, WidgetRects, hit_test, id, input_state, memory};
 
 use self::{hit_test::WidgetHits, id::IdSet, input_state::PointerEvent, memory::InteractionState};
 
@@ -39,6 +39,10 @@ pub struct InteractionSnapshot {
     /// The widget will not be found in [`Self::dragged`] this frame.
     pub drag_stopped: Option<Id>,
 
+    /// The actual pointer terminal that stopped `drag_stopped`, in global points.
+    /// Unknown-position and non-pointer cancellation have no operation point.
+    pub drag_stopped_pos: Option<Pos2>,
+
     /// A small set of widgets (usually 0-1) that the pointer is hovering over.
     ///
     /// Show these widgets as highlighted, if they are interactive.
@@ -64,6 +68,7 @@ impl InteractionSnapshot {
             drag_started,
             dragged,
             drag_stopped,
+            drag_stopped_pos: _,
             hovered,
             contains_pointer,
         } = self;
@@ -132,6 +137,7 @@ pub(crate) fn interact(
 
     let mut clicked = None;
     let mut dragged = prev_snapshot.dragged;
+    let mut released_drag = None;
     let mut long_touched = None;
 
     if input.key_pressed(Key::Escape) {
@@ -171,7 +177,9 @@ pub(crate) fn interact(
                 }
             }
 
-            PointerEvent::Released { click, button: _ } => {
+            PointerEvent::Released {
+                click, position, ..
+            } => {
                 if click.is_some()
                     && !input.pointer.is_decidedly_dragging()
                     && let Some(widget) = interaction
@@ -183,6 +191,12 @@ pub(crate) fn interact(
 
                 interaction.potential_drag_id = None;
                 interaction.potential_click_id = None;
+                if let Some(owner) = dragged {
+                    // Only the terminal that actually retires this live owner
+                    // supplies its stop point. A later click cannot supply one
+                    // after Escape, an unknown Up, or another cancellation.
+                    released_drag = Some((owner, *position));
+                }
                 dragged = None;
             }
         }
@@ -239,7 +253,14 @@ pub(crate) fn interact(
 
     let drag_changed = dragged != prev_snapshot.dragged;
     let drag_stopped = drag_changed.then_some(prev_snapshot.dragged).flatten();
-    let drag_started = drag_changed.then_some(dragged).flatten();
+    let drag_stopped_pos = released_drag
+        .filter(|(owner, _)| Some(*owner) == drag_stopped)
+        .and_then(|(_, pos)| pos);
+    // A terminal followed by a fresh press is a new operation, even on the
+    // same widget. Its final Response owns the new hold, not the old stop.
+    let drag_started = (drag_changed || released_drag.is_some())
+        .then_some(dragged)
+        .flatten();
 
     // if let Some(drag_started) = drag_started {
     //     eprintln!(
@@ -306,6 +327,7 @@ pub(crate) fn interact(
         drag_started,
         dragged,
         drag_stopped,
+        drag_stopped_pos,
         hovered,
         contains_pointer,
     }
