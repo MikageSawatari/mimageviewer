@@ -551,7 +551,7 @@ ON/OFF と有効中の既定綴じ方向変更は、種類の表示設定と同�
 範囲指定の準備も既存の一つの worker 内で4方向を判定し、UIで現在の角度を選び、手動・自動・全体の順に初期枠を選ぶ。
 描画・寸法・ホバー・当たり判定・画素品質は純粋関数 `auto_crop_view` の同じ範囲を使い、一覧の比率サンプルだけは従来どおり0°で固定する。
 
-本文の保存回転が変わると、本自身のAutomatic行と同じmemory行を短命workerで厳密キー削除する。
+本文の保存回転が変わると、本自身のAutomatic行と同じmemory行を短命workerで厳密キー削除する。ZIP・変換書庫は外側書庫の全ZipDirも対象にし、保存キーのprefixは変えず、runtime stampを外側書庫＋代表ページで共有する。
 削除完了後だけ、mounted / AtRest / Retiringの対象要求・CPU画像・textureを退避し、次の通常demandで作り直す。
 代表自身だけの回転は4方向の結果の選択にとどめる。全方向見送りのAutomaticも本文変更では失効する。
 Loadedに付けた本・代表ページ別のセッション番号はcloneで保持し、snapshot / Smart / direct-sourceの全状態復元後に照合する。

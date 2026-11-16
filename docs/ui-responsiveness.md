@@ -518,7 +518,7 @@ workerは4方向の範囲と全体画素を一度作って運び、UIは在メ�
 本文の保存回転変更（§1.773、表紙計画§29）ではUIは変更keys・typed source・設定値・既存handleだけを捕捉する。
 本/代表の照合、catalogヘッダ読取、厳密キー削除、workerのmemory除去は短命workerに置き、全cache再帰scan・画像decode・親のための子生成を足さない。
 SQL中はmap/queue lockを持たない。新しい要求抑止やmodalを作らず、処理中は既存textureを保つ。
-Appが完了通知を非blockingで受けた後、対象のmemoryとowner別の要求・CPU待ち・textureだけを退避する。
+Appが完了通知を非blockingで受けた後、対象のmemoryとowner別の要求・CPU待ち・textureだけを退避する。通知のslot・catalog・keyは同じ行の一組で照合し、UIで保存先を問い合わせない。ZIP・変換書庫の失効単位は外側書庫とし、pinの実効prefixで絞らない。
 通知は元contextの移動/parkで捨てず、本・代表別のUIセッション番号を進める。新しい常駐actor・retry timer・終了待合せは設けない。
 保持Loadedは採用時の番号をcloneし、snapshot / Smart / direct-sourceの状態を全て戻してから在メモリ照合する。
 Smartはsaved aspect samples代入後に照合し、最終Loadedにsamplesを整える。復元時のDB読取・decode・全context clearはしない。

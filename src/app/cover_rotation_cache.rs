@@ -85,23 +85,31 @@ impl CoverCacheInputs {
             .map(ThumbnailRequests::automatic_cover_requests)
             .unwrap_or_default();
         for (idx, item) in items.iter().enumerate() {
-            let book = thumbnails
-                .get(idx)
-                .and_then(|state| match state {
-                    ThumbnailState::Loaded {
-                        cover_cache_stamp: CoverCacheStamp::Tracked { slot, .. },
-                        ..
-                    } if is_book_tile(item) => Some(slot.logical_book.clone()),
-                    _ => None,
-                })
-                .or_else(|| cover_book_for_item(item, original));
-            let Some(book) = book else { continue };
-            let mut hint = SourceHint::new(book);
-            if let Some(original) = original {
-                if let Some(physical) = BookCoverId::from_grid_item(item) {
-                    if !crate::path_key::eq_keep_drive(physical.path(), original) {
-                        hint.aliases.push(physical.path().to_owned());
+            let Some(mut book) = cover_book_for_item(item, original) else {
+                continue;
+            };
+            // A retained converted-ZIP grid can outlive its mounted override.
+            // The stamp remembers the logical archive, while the item retains
+            // the writer kind/prefix and physical read alias.
+            if let Some(ThumbnailState::Loaded {
+                cover_cache_stamp, ..
+            }) = thumbnails.get(idx)
+            {
+                if let Some(slot) = cover_cache_stamp.slot() {
+                    if let BookCoverId::Archive(logical) = &slot.logical_book {
+                        match &mut book {
+                            BookCoverId::Zip { path, .. } | BookCoverId::Archive(path) => {
+                                *path = logical.clone()
+                            }
+                            _ => {}
+                        }
                     }
+                }
+            }
+            let mut hint = SourceHint::new(book);
+            if let Some(physical) = BookCoverId::from_grid_item(item) {
+                if !crate::path_key::eq_keep_drive(physical.path(), hint.book.path()) {
+                    hint.aliases.push(physical.path().to_owned());
                 }
             }
             if let Some(state) =
@@ -180,6 +188,7 @@ pub(super) fn affected_cover_indices(
     thumbnails: &[ThumbnailState],
     requested: &ThumbnailRequests,
     original: Option<&Path>,
+    pool: &ThumbnailPoolCatalog,
     completed: &[InvalidationCompletion],
 ) -> HashSet<usize> {
     let mut result = HashSet::new();
@@ -200,12 +209,8 @@ pub(super) fn affected_cover_indices(
         {
             let slot = match cover_cache_stamp {
                 CoverCacheStamp::Tracked { slot, .. } => Some(slot.as_ref().clone()),
-                CoverCacheStamp::Untracked => {
-                    cover_book_for_item(item, original).map(|logical_book| AutoCoverSlot {
-                        logical_book,
-                        representative_page_key: page.clone(),
-                    })
-                }
+                CoverCacheStamp::Untracked => cover_book_for_item(item, original)
+                    .map(|book| AutoCoverSlot::new(book, page.clone())),
             };
             if slot.as_ref().is_some_and(|slot| affected.contains(slot)) {
                 result.insert(idx);
@@ -228,7 +233,7 @@ pub(super) fn affected_cover_indices(
                     .map(|page| crate::edit_source::page_key_for_pdf(&req.path, page))
             });
         let matches_slot = |slot: &AutoCoverSlot| {
-            slot.logical_book == book
+            slot.logical_book == book.invalidation_owner()
                 && explicit
                     .as_ref()
                     .is_none_or(|page| page == &slot.representative_page_key)
@@ -237,16 +242,34 @@ pub(super) fn affected_cover_indices(
         // Existing rows identify that request even without a captured pending
         // selection. An unresolved request must match its exact deleted key;
         // an unrelated historical pin must not cancel a cover-only request.
-        let request_key = crate::thumb_loader::cache_key_for_request(&req);
+        let request_key = match &req.catalog_target {
+            crate::thumb_loader::RequestCatalog::Parent { row, .. } => {
+                Some(std::borrow::Cow::Borrowed(row.row_key.as_str()))
+            }
+            _ => crate::thumb_loader::cache_key_for_request(&req),
+        };
+        let catalog = match &req.catalog_target {
+            crate::thumb_loader::RequestCatalog::Parent { row, .. } => Some(&row.folder),
+            crate::thumb_loader::RequestCatalog::CollectionSourceParent { identity, .. } => {
+                Some(identity)
+            }
+            crate::thumb_loader::RequestCatalog::Fixed { .. } => match pool {
+                ThumbnailPoolCatalog::Folder(path) | ThumbnailPoolCatalog::View(path) => Some(path),
+                _ => None,
+            },
+        };
         let affected_request = completed.iter().any(|done| {
             done.pending_slots.iter().any(matches_slot)
-                || (done.affected_slots.iter().any(matches_slot)
-                    && (explicit.is_some()
-                        || request_key.as_ref().is_some_and(|key| {
-                            done.deleted_keys
-                                .iter()
-                                .any(|(_, keys)| keys.iter().any(|deleted| deleted == key.as_ref()))
-                        })))
+                || (explicit.is_some() && done.affected_slots.iter().any(matches_slot))
+                || done.deleted_rows.iter().any(|row| {
+                    matches_slot(&row.slot)
+                        && (explicit.is_some()
+                            || (catalog.is_some_and(|scope| {
+                                crate::path_key::eq_keep_drive(scope, &row.catalog)
+                            }) && request_key
+                                .as_ref()
+                                .is_some_and(|key| row.key == key.as_ref())))
+                })
         });
         if affected_request {
             result.insert(req.idx);
@@ -262,31 +285,21 @@ pub(super) fn clear_deleted_cover_memory(
 ) {
     let Some(memory) = memory else { return };
     let Ok(mut map) = memory.write() else { return };
-    for (scope, keys) in completed.iter().flat_map(|done| &done.deleted_keys) {
+    for row in completed.iter().flat_map(|done| &done.deleted_rows) {
         let same_scope = match pool {
             ThumbnailPoolCatalog::Folder(folder) | ThumbnailPoolCatalog::View(folder) => {
-                crate::path_key::eq_keep_drive(scope, folder)
+                crate::path_key::eq_keep_drive(&row.catalog, folder)
             }
             _ => false,
         };
-        for key in keys {
-            let same_representative = map.get(key).is_some_and(|entry| {
-                let crate::cover_identity::CoverIdentity::Page(page) = &entry.cover else {
-                    return false;
-                };
-                completed
-                    .iter()
-                    .flat_map(|done| &done.affected_slots)
-                    .any(|slot| slot.representative_page_key == *page)
-            });
-            // Only Collection maps contain full-path keys from several source
-            // catalogs. Another folder's basename map may share both this key
-            // text and a pinned Page identity without being the same book.
-            if same_scope
-                || (matches!(pool, ThumbnailPoolCatalog::Collection) && same_representative)
-            {
-                map.remove(key);
-            }
+        let same_representative = map.get(&row.key).is_some_and(|entry| {
+            entry.cover
+                == crate::cover_identity::CoverIdentity::Page(
+                    row.slot.representative_page_key.clone(),
+                )
+        });
+        if same_scope || (matches!(pool, ThumbnailPoolCatalog::Collection) && same_representative) {
+            map.remove(&row.key);
         }
     }
 }
@@ -360,10 +373,8 @@ impl App {
         let crate::cover_identity::CoverIdentity::Page(page) = cover else {
             return Default::default();
         };
-        self.cover_rotation_cache.stamp(AutoCoverSlot {
-            logical_book,
-            representative_page_key: page.clone(),
-        })
+        self.cover_rotation_cache
+            .stamp(AutoCoverSlot::new(logical_book, page.clone()))
     }
 
     pub(super) fn invalidate_automatic_covers_after_rotation(&mut self, changed: &[String]) {
@@ -470,6 +481,7 @@ impl App {
             &self.thumbnails,
             &self.requested,
             self.archive_source_override.as_deref(),
+            &self.thumbnail_pool_catalog,
             &completed,
         );
         let changed = !matching.is_empty();

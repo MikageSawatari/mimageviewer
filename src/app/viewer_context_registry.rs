@@ -116,6 +116,7 @@ impl App {
                     &state.thumbnails,
                     &state.requested,
                     state.archive_source_override.as_deref(),
+                    &state.thumbnail_pool_catalog,
                     completed,
                 );
                 if matching.is_empty() {

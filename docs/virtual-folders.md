@@ -1134,8 +1134,8 @@ PDF/変換済み EPUB は代表描画と同じ password・`ReadTarget` lease の
 ネスト ZIP・直接読む RAR は先読みしない。画像フォルダは代表選択時の一覧を名前順で再利用し、同じ最大8枚・256KiBの規則で寸法を読む。
 標本寸法へ既存のEXIF/WICの向きと保存回転を一度ずつ反映する。撮影情報による写真の見送りは保ち、本文の写真比率による見送りはしない。
 本文の同名上書きでは判定し直さない。本文の保存回転が変わった場合は、本自身のAutomatic（全方向見送りも含む）の実在する厳密キーとmemoryをworkerで削除する。
-PDF/EPUBの論理ページキー、ZIP/ZipDirの外側ZIPとprefix、変換元と読取先の区別、画像フォルダの代表選択は既存typed helperで解決する。
-代表自身だけの回転、手動範囲、通常ページ、別の本、K2で選ぶ親自身の行はこの削除の対象にしない。
+PDF/EPUBの論理ページキー、変換元と読取先の区別、画像フォルダの代表選択は既存typed helperで解決する。ZIP/ZipDirの保存キーは従来のprefixを保つが、失効は同じ外側ZIP・変換元書庫の全自動代表へ広げる。未保持の別prefixへの固定も対象にし、runtime stampは外側書庫＋代表ページで共有する。
+代表自身だけの回転、手動範囲、通常ページ、別の外側書庫・PDF・画像フォルダ、K2で選ぶ親自身の行はこの削除の対象にしない。
 元親/Collection元親、現在・保持poolと既存synthetic scopeの到達可能catalogは既存保存先規則とadmissionでworkerが調べる。
 ヘッダと実在キーを検査し、`WHERE filename = ?` の削除を使う。ページ名中の `::` / `#pin:` 等をderived keyと誤認せず、LIKE/prefix削除や全cache再帰scanをしない。
 完了後のowner別退避と保持素材のセッション番号照合は[表紙計画§29](cover-crop-plan.md)に従う。本文proof、K2内の子生成、親の専用削除/退避は追加しない。

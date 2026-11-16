@@ -14,10 +14,10 @@ fn automatic_material() -> AutoMaterial {
 
 fn slot(path: &str) -> AutoCoverSlot {
     let path = PathBuf::from(path);
-    AutoCoverSlot {
-        logical_book: BookCoverId::from_grid_item(&GridItem::ZipFile(path.clone())).unwrap(),
-        representative_page_key: crate::adjustment_db::zip_entry_key(&path, "cover.png"),
-    }
+    AutoCoverSlot::new(
+        BookCoverId::from_grid_item(&GridItem::ZipFile(path.clone())).unwrap(),
+        crate::adjustment_db::zip_entry_key(&path, "cover.png"),
+    )
 }
 
 fn loaded(ctx: &egui::Context, slot: &AutoCoverSlot, stamp: CoverCacheStamp) -> ThumbnailState {
@@ -389,12 +389,13 @@ fn cover_cache_real_row_completion_cancels_requests_admitted_during_deletion() {
                     BookCoverId::from_grid_item(&GridItem::ZipFile(book.clone())).unwrap(),
                 )],
                 scopes: vec![CatalogScope {
-                    folder: parent,
+                    folder: parent.clone(),
                     memory: vec![],
                 }],
                 work: crate::catalog::CatalogWork::capture(&cache),
                 archive_cache: None,
             };
+            app.thumbnail_pool_catalog = ThumbnailPoolCatalog::Folder(parent);
             // Opening the parent during deletion admits an old-cache request after
             // capture. Exercise both CPU upload backlog and still-in-flight pixels.
             app.items = vec![GridItem::ZipFile(book.clone())];
@@ -487,14 +488,14 @@ fn cover_cache_zipdir_external_pin_invalidates_writer_rows_and_retained_loaded()
                     is_archive: false,
                 })
                 .to_vec();
-            let target = AutoCoverSlot {
-                logical_book: BookCoverId::from_grid_item(&app.items[0]).unwrap(),
-                representative_page_key: crate::adjustment_db::zip_entry_key(&path, "B/0.png"),
-            };
-            let sibling = AutoCoverSlot {
-                logical_book: BookCoverId::from_grid_item(&app.items[1]).unwrap(),
-                representative_page_key: crate::adjustment_db::zip_entry_key(&path, "C/0.png"),
-            };
+            let target = AutoCoverSlot::new(
+                BookCoverId::from_grid_item(&app.items[0]).unwrap(),
+                crate::adjustment_db::zip_entry_key(&path, "B/0.png"),
+            );
+            let sibling = AutoCoverSlot::new(
+                BookCoverId::from_grid_item(&app.items[1]).unwrap(),
+                crate::adjustment_db::zip_entry_key(&path, "C/0.png"),
+            );
             let retained = loaded(
                 &ctx,
                 &target,
@@ -584,9 +585,9 @@ fn cover_cache_zipdir_external_pin_invalidates_writer_rows_and_retained_loaded()
                     archive_cache: None,
                 })
             };
-            // The source's cover-only change and the writer's original (now
-            // unused) body scope must not advance this material's stamp.
-            for changed in ["B/0.png", "A/1.png"] {
+            // Cover-only changes still preserve the row representing that page.
+            // Other prefixes now intentionally share the archive's invalidation.
+            for changed in ["B/0.png"] {
                 let completion = invalidate(changed);
                 assert!(completion.errors.is_empty(), "{:?}", completion.errors);
                 assert!(!completion.affected_slots.contains(&target));
@@ -597,22 +598,22 @@ fn cover_cache_zipdir_external_pin_invalidates_writer_rows_and_retained_loaded()
             let completion = invalidate("B/1.png");
             assert!(completion.errors.is_empty(), "{:?}", completion.errors);
             assert!(completion.affected_slots.contains(&target));
-            assert!(!completion.affected_slots.contains(&sibling));
+            assert!(completion.affected_slots.contains(&sibling));
             assert!(db.load_one(&key).unwrap().is_none());
             if persisted {
-                assert!(db.load_one(sibling_key).unwrap().is_some());
+                assert!(db.load_one(sibling_key).unwrap().is_none());
             }
             app.cover_rotation_cache.complete_for_test(completion);
             app.poll_cover_rotation_cache(&ctx);
             assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
-            assert!(app.thumbnails[1].has_pixels());
+            assert!(matches!(app.thumbnails[1], ThumbnailState::Evicted));
             assert!(!app.cover_rotation_cache.is_current(stamp(&retained)));
             app.thumbnails[0] = retained;
             app.auto_aspect.samples.insert(0, 0.5);
             assert!(app.reconcile_restored_cover_thumbnails());
             assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
             assert!(!app.auto_aspect.samples.contains_key(&0));
-            assert!(app.thumbnails[1].has_pixels());
+            assert!(matches!(app.thumbnails[1], ThumbnailState::Evicted));
         }
     }
 }
@@ -643,16 +644,144 @@ fn cover_cache_historical_pin_completion_preserves_unresolved_cover_only_request
     historical.representative_page_key = "c:/book.zip::old-pin.png".into();
     app.cover_rotation_cache
         .complete_for_test(InvalidationCompletion {
-            affected_slots: vec![historical],
-            deleted_keys: vec![(
-                PathBuf::from("c:/"),
-                vec!["zipthumb:book.zip|autocrop:v4:rtl#pin:old-pin.png".into()],
-            )],
+            affected_slots: vec![historical.clone()],
+            deleted_rows: vec![crate::cover_rotation_cache::InvalidatedRow {
+                slot: historical,
+                catalog: PathBuf::from("c:/"),
+                key: "zipthumb:book.zip|autocrop:v4:rtl#pin:old-pin.png".into(),
+            }],
             ..Default::default()
         });
     app.poll_cover_rotation_cache(&ctx);
     assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
     assert_eq!(app.requested.id(0), Some(id));
+}
+
+#[test]
+fn cover_cache_correlated_deleted_rows_preserve_same_name_cover_only_request_in_other_catalog() {
+    use crate::cover_rotation_cache::{CatalogScope, InvalidationRequest, SourceHint};
+    use crate::thumb_loader::{ParentRow, RequestCatalog};
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let cache = app.tmp.path().join("catalog");
+    let parents = [app.tmp.path().join("A"), app.tmp.path().join("B")];
+    let books = parents.each_ref().map(|parent| parent.join("book.zip"));
+    let key = "zipthumb:book.zip|autocrop:v4:rtl";
+    let old_pin = "zipthumb:book.zip|autocrop:v4:rtl#pin:old.png";
+    let covers = books
+        .each_ref()
+        .map(|book| crate::adjustment_db::zip_entry_key(book, "cover.png"));
+    let dbs = parents
+        .each_ref()
+        .map(|parent| crate::catalog::CatalogDb::open(&cache, parent).unwrap());
+    for (db, cover) in dbs.iter().zip(&covers) {
+        db.save(
+            key,
+            1,
+            2,
+            2,
+            1,
+            None,
+            b"header",
+            &CoverIdentity::Page(cover.clone()),
+            automatic_material(),
+        )
+        .unwrap();
+    }
+    dbs[0]
+        .save(
+            old_pin,
+            1,
+            2,
+            2,
+            1,
+            None,
+            b"header",
+            &CoverIdentity::Page(crate::adjustment_db::zip_entry_key(&books[0], "old.png")),
+            automatic_material(),
+        )
+        .unwrap();
+    // Capture before either unresolved request is admitted. A resets only its
+    // current cover; B resets its body. A's historical pin is also invalidated.
+    let captured = InvalidationRequest {
+        changed_keys: vec![
+            covers[0].clone(),
+            crate::adjustment_db::zip_entry_key(&books[1], "body.png"),
+        ],
+        source_hints: books
+            .iter()
+            .map(|book| {
+                SourceHint::new(
+                    BookCoverId::from_grid_item(&GridItem::ZipFile(book.clone())).unwrap(),
+                )
+            })
+            .collect(),
+        scopes: parents
+            .iter()
+            .map(|parent| CatalogScope {
+                folder: parent.clone(),
+                memory: vec![],
+            })
+            .collect(),
+        work: crate::catalog::CatalogWork::capture(&cache),
+        archive_cache: None,
+    };
+    app.items = books.iter().cloned().map(GridItem::ZipFile).collect();
+    app.thumbnails = vec![ThumbnailState::Pending; 2];
+    let mut ids = Vec::new();
+    for idx in 0..2 {
+        let mut req = LoadRequest {
+            idx,
+            items_gen: app.items_generation,
+            path: books[idx].clone(),
+            cache_key_override: Some("zipthumb:book.zip".into()),
+            auto_cover_crop: Some(crate::cover_auto_crop::AutoCropIdentity::new(
+                crate::settings::ReadingDirection::Rtl,
+            )),
+            catalog_target: RequestCatalog::Parent {
+                row: ParentRow {
+                    source: books[idx].clone(),
+                    folder: parents[idx].clone(),
+                    row_key: key.into(),
+                },
+                work: crate::catalog::CatalogWork::capture(&cache),
+            },
+            ..Default::default()
+        };
+        req.request_id = app
+            .requested
+            .begin_for_request(&req, ThumbnailRequestKind::Normal, None)
+            .unwrap();
+        ids.push(req.request_id);
+        app.requested.receive(pixels(&req));
+    }
+    let completion = crate::cover_rotation_cache::run_invalidation(captured);
+    assert!(completion.errors.is_empty(), "{:?}", completion.errors);
+    assert!(completion.pending_slots.is_empty());
+    assert!(dbs[0].load_one(key).unwrap().is_some());
+    assert!(dbs[0].load_one(old_pin).unwrap().is_none());
+    assert!(dbs[1].load_one(key).unwrap().is_none());
+    assert!(
+        completion
+            .deleted_rows
+            .iter()
+            .any(|row| row.key == old_pin
+                && crate::path_key::eq_keep_drive(&row.catalog, &parents[0]))
+    );
+    assert!(
+        completion
+            .deleted_rows
+            .iter()
+            .any(|row| row.key == key && crate::path_key::eq_keep_drive(&row.catalog, &parents[1]))
+    );
+    app.cover_rotation_cache.complete_for_test(completion);
+    app.poll_cover_rotation_cache(&ctx);
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
+    assert_eq!(app.requested.id(0), Some(ids[0]));
+    assert!(matches!(app.thumbnails[1], ThumbnailState::Evicted));
+    assert!(!app.requested.contains_key(&1));
+    assert_eq!(app.requested.next_image().unwrap().idx, 0);
+    assert!(app.requested.next_image().is_none());
 }
 
 #[test]
@@ -674,8 +803,12 @@ fn cover_cache_completion_keeps_foreign_basename_map_even_with_same_pinned_page(
         },
     )])));
     let completion = InvalidationCompletion {
-        affected_slots: vec![target],
-        deleted_keys: vec![(PathBuf::from("c:/a"), vec![key.clone()])],
+        affected_slots: vec![target.clone()],
+        deleted_rows: vec![crate::cover_rotation_cache::InvalidatedRow {
+            slot: target,
+            catalog: PathBuf::from("c:/a"),
+            key: key.clone(),
+        }],
         ..Default::default()
     };
     super::cover_rotation_cache::clear_deleted_cover_memory(
@@ -743,10 +876,10 @@ fn cover_cache_unsaved_retained_archive_uses_mounted_reader_alias_before_source_
         path: source.clone(),
         format: crate::archive_converter::ArchiveFormat::Rar,
     };
-    let target = AutoCoverSlot {
-        logical_book: BookCoverId::from_grid_item(&book_item).unwrap(),
-        representative_page_key: crate::adjustment_db::zip_entry_key(&cached, "cover.png"),
-    };
+    let target = AutoCoverSlot::new(
+        BookCoverId::from_grid_item(&book_item).unwrap(),
+        crate::adjustment_db::zip_entry_key(&cached, "cover.png"),
+    );
     app.items = vec![GridItem::ZipImage {
         zip_path: cached,
         entry_name: "body.png".into(),
@@ -801,10 +934,10 @@ fn cover_cache_direct_reader_split_restores_stale_saved_basis_without_pixels_or_
         let book = root.join("book.zip");
         let basis = GridItem::ZipFile(book.clone());
         let direct = GridItem::Image(root.join("direct.png"));
-        let target = AutoCoverSlot {
-            logical_book: BookCoverId::from_grid_item(&basis).unwrap(),
-            representative_page_key: crate::adjustment_db::zip_entry_key(&book, "cover.png"),
-        };
+        let target = AutoCoverSlot::new(
+            BookCoverId::from_grid_item(&basis).unwrap(),
+            crate::adjustment_db::zip_entry_key(&book, "cover.png"),
+        );
         let retained = loaded(
             &ctx,
             &target,

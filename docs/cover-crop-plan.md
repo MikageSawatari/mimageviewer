@@ -1998,7 +1998,7 @@ Pのproof/codec変更・読取照合・K2内生成・子の世代の引継ぎは
   `AutoMaterial`、`auto_crops`、4方向の結果、schema/codecは変更せず、本文proofも追加しない。v4はキーの世代であり、新しい素材形式を意味しない。
   K2の出荷済みv1互換は保つが、v3/v3fへのfallbackは追加しない。現行行が無い場合の既存v1互換だけを維持し、現行行の不正・署名不一致時に旧行へ戻らない。
 - 新しい本文proof、読取の5入口での照合、採用直前の本文角度照合、K2内の子生成、子の世代/素材の新しい運搬は作らない。
-- 対象は回転の変わったページを本文として持つ**本自身のAutomatic**。全方向が見送りのAutomaticも含む。
+- 対象は回転の変わったページを本文として持つ**本自身のAutomatic**。ZIP・変換書庫は同じ外側書庫の全ZipDirも保守的に対象とする（2026-11-16、設計担当判断）。全方向が見送りのAutomaticも含む。
   手動範囲・edit preview・NotAutomatic・LegacyV1・通常のページ行・RAW/動画/Remoteの対象範囲を変えない。
 - 代表自身の回転だけなら削除/再生成しない。既存4方向の結果を在メモリの角度で選び直す。
 - 本文標本8枚を再現して対象を絞る処理は足さない。代表以外のページ変更は、その本の自動結果を保守的に失効する。
@@ -2017,7 +2017,7 @@ reset/import等のkeysだけの通知では同じtyped source helperにworkerで
 | --- | --- |
 | PDF / EPUB | `GridItem::PdfPage` と既存の論理PDF/EPUB path、0始まりpage番号を使う。EPUBの生成PDFを別の本としない。 |
 | ZIP | 外側の物理ZIPとentryの組を既存helperで扱う。entry中の `::` / `|generation:` / `#pin:` 等をderived keyと混同しない。 |
-| ZipDir | ZIPとdirectory prefixの組を論理本とする。同じentryが標本になり得るZIP全体/包含するZipDirはそれぞれ照合し、別prefixの本には広げない。 |
+| ZipDir | 保存キーの論理prefixは維持するが、失効は外側のZIP・変換元書庫の単位とする。変更ページを含むprefixに限定せず、未保持の別prefixやその外へ固定した行も同じ書庫なら対象にする。 |
 | 変換書庫 | viewerの保存回転キーは既存どおり変換後ZIP。`archive_source_override` / 既存の変換元対応で論理書庫へ結び、変換元tileのwriterキーを求める。対応のworker lookupも既存cache DBで行い、UIで新たに開かない。 |
 | 画像フォルダ | 画像の直上folderを本の候補とする。`FolderImageOrigin::Direct` に相当する代表だけが対象。祖先folderがK2で継承した素材は、その祖先自身の対象行としては消さない。 |
 
@@ -2025,7 +2025,9 @@ reset/import等のkeysだけの通知では同じtyped source helperにworkerで
 表紙の判定はUIでscanせず、workerが格納行の `CoverIdentity::Page` を復元して変更ページと比較する。
 **変更ページ==その行の代表ページならその行を残す**。pin/代表順が違う過去の行は、行ごとの代表で判定する。
 画像フォルダでは既存selection proofのwinnerとcoverから、直下画像と子由来の代表を区別する。
-同じleafを持つことだけで、上のfolderや別の論理本の行まで削除しない。
+同じleafを持つことだけで、上のfolderや別の外側書庫の行まで削除しない。
+
+ZIP・変換書庫ではpinの実効prefixで失効範囲を絞る方式を撤回する。本文回転はまれで、同じ書庫内の再生成の費用より、未保持の固定元を取りこぼす分岐を減らすことを優先する。既存derived-key parserで現行印を確認し、外側書庫とcatalog scopeを厳密に比べて全ZipDir行を列挙する。変更keysにその行の代表以外のページが一つも無い場合だけ、その行を残す。同じ書庫の別代表にとって本文変更なら、その別代表は作り直され得る。PDF・画像フォルダの範囲は従来どおり。
 
 初回生成中で行が無い場合は、捕捉した通常要求のpin/代表選択をworkerの既存解決helperで確認して同じ除外を行う。
 PDFの既定page、ZIPの先頭選択、folderの既存sortを共有し、**decode/自動判定/子の生成は起こさない**。
@@ -2061,7 +2063,7 @@ PDFの既定page、ZIPの先頭選択、folderの既存sortを共有し、**deco
    `CatalogDb::delete_one` または同等の `WHERE filename = ?` のbatch削除に渡す。
    LIKE/SQL prefix削除にしない。OFF/uncroppedのキーの綴り、行、pin設定は変更しない。
 5. workerが参照する `cache_map` の同じ行も除去する。SQL中はmap/queueのlockを持たない。
-   完了通知にcatalog scopeと厳密な削除キーを返し、捕捉後に作られた現在/保持先のmemoryにも、UI側で同じkeyの除去だけを適用する。
+   完了通知は `InvalidatedRow { slot, catalog, key }` の行単位で返し、捕捉後に作られた現在/保持先のmemoryにも同じ行の除去だけを適用する。未解決の要求は同じ行のslot・保存先・キーを一組として照合し、別の行の一致を組み合わせない。保存先はRequestCatalogのParent row.folder／Collection identity、Fixedはowner poolを使い、Parentのキーにはrow.row_keyを使う。
    その処理はmemoryの短い操作に限り、UIでDBへ問い合わせない。
 
 これは本のcacheの失効であり、親folderのDELETE、親のepoch更新、K2への特別な生成要求を発行しない。
@@ -2118,7 +2120,7 @@ enum CoverCacheStamp {
 
 本ごとの番号を代表ページ別のslotに分けるのは、過去pin/sortの異なる行を一緒に消す場合にも、
 「その行にとって表紙だけの回転」を誤って失効させないためである。bindingだけが違い代表が同じなら同じslotを使う。
-slotの本は**tileの論理コンテナ自身**であり、K2の子の番号を親へコピーしない。
+slotの本はPDF・画像フォルダではtile自身、ZIP・変換書庫では**外側書庫**に正規化する。同じ書庫・代表ページならprefixをまたいで同じ番号を使い、未保持のZipDir行からも捕捉後の保持素材へ失効が届く。writerキーとcatalogの行の形は変えない。K2の子の番号を親へコピーしない。
 親が子のAutomaticを持っていても、その親のslotは更新しない。
 
 1. 削除完了時、削除/失効対象のslotだけ `serial += 1`。代表だけの変更で除外したslotは進めない。
@@ -2195,7 +2197,7 @@ P案の本文proof/codec変更やK2内生成を承認したものではなく、
 全て合成入力と隔離DBを使う。以下は実装後の回帰条件であり、設計段階の実行結果ではない。
 
 1. **対象/key**: PDF・EPUB・ZIP/ZipDir・変換書庫・画像folder、binding両方、pin/types/generation/drive/Collection等の別名を検査。
-   任意の区切り文字を含む通常ページ、別の本、手動/NotAutomatic、K2の親自身の行は削除しない。
+   任意の区切り文字を含む通常ページ、別の外側書庫/PDF/画像フォルダ、手動/NotAutomatic、K2の親自身の行は削除しない。同じ書庫の別prefixは対象にする。
    未表示のaliasから次回起動後に古い同じ本の行を再採用しないことを検査する。
 2. **表紙除外**: 代表ページをR/Lしても行・memory・Loadedのstamp/textureを維持し、描画角度だけが変わる。
    別代表を持つ過去pinの行は行単位で判定し、cold/初回生成中でも同じ代表選択規則を通す。
@@ -2204,7 +2206,7 @@ P案の本文proof/codec変更やK2内生成を承認したものではなく、
 4. **順序**: barrierで削除workerを止め、削除前はLoadedを保ち、完了後だけ退避する。
    完了前に出た新request、Pending、Upgrade、CPU upload待ちも除き、旧IDの画像/Finalizedが新要求を壊さない。
    最後のDB書戻しとの競合は復旧保証のテストを増やさず、割切りの境界をログで検査する。
-5. **context**: mounted/AtRest/Retiringの同じ本だけが退避し、兄弟の別本/通常ページのrequest ID・queue・pixels・generationは不変。
+5. **context**: mounted/AtRest/Retiringの該当する本（ZIP・変換書庫はその中の全ZipDir）が退避し、兄弟の別書庫/PDF/画像フォルダ/通常ページのrequest ID・queue・pixels・generationは不変。
    元contextを離れてから削除完了しても通知を捨てず、新しい表示先と共有memoryへ反映する。全体poolの再起動はしない。
 6. **保持一覧**: 一覧→本→本文回転→Esc、snapshot saved/list-view、Smart、direct-sourceで、古い素材のserialが保持され、
    復元完了後に対象Loadedと旧samplesが無いことを検査。古いLoadedを新しくsnapshot保存してもserialを更新しない。
@@ -2258,3 +2260,7 @@ P案の本文proof/codec変更やK2内生成を承認したものではなく、
 - ZipDirの保存先の論理identityと実効の読取scopeを分離した。workerでpinを解決してから変更ページ／代表ページの所属を照合し、`A/`から`B/`への固定でも保存キーとstampは`A/`のまま失効させる。`cover_cache_zipdir_external_pin_invalidates_writer_rows_and_retained_loaded` は実App requestのprefix、保存行あり／なし、受付済み要求あり／なし、保持Loadedの復元、表紙だけ／元のprefix／兄弟の不変を検査する。codec・schema・公開文書・viewport経路は変更しない。
 - レビュー修正の検証（`c482014b6`＋作業ツリー）: `run-heavy.ps1 -Owner "773b r1"` 経由で直列実行。追加の主要2件は2成功、その後 `test(/cover_cache|cover_rotation|thumbnail_requests/) --test-threads 1` は **72成功・0失敗**（run ID `26d00105-4e1f-4e60-95d9-31c99d18cb01`）。`cover_cache_historical_pin_completion_preserves_unresolved_cover_only_request` と、affectedだけの通知に強めたAtRest／Retiringの既存テストも含む。`cargo check -p mimageviewer --bin mimageviewer-core`、`cargo fmt`（引数なし）、`git diff --check` は成功。UIの見た目・文字列・snapshotの変更はない。
 - 同じ直列検証で `cargo run -p viewer_context_audit` も成功した（exit 0）。detached記録は§11の既存項目に追記し、owner／viewportの範囲を拡張していない。
+
+- 再レビュー対応（2026-11-16）: P2-aは書庫単位の保守的失効へ簡素化し、前回のread_book・実効prefixによる所属判定と、変更ページから包含prefixだけを作る処理を削除した。writerのキーは不変、runtime slotを外側書庫＋代表ページへそろえる。`cover_rotation_archive_inventory_deletes_unheld_external_zipdir_pins_after_restart` はpin DB・対象tileのhint無しでZIP／変換書庫の外部prefix固定、両binding、区切り文字を含む名前、手動の保持と受動stampを検査する。
+- P2-bは通知を `InvalidatedRow { slot, catalog, key }` にまとめた。`cover_cache_correlated_deleted_rows_preserve_same_name_cover_only_request_in_other_catalog` は実workerの複数catalog batchで、表紙だけのAの未解決要求／CPU待ちを保ち、本文のBだけを取消す。既存ZipDirの別prefix不変テストは、今回受け入れた同書庫内の失効へ期待値を変更する。無関係な別書庫/contextは引き続き不変。
+- 再レビュー修正の検証（`1bdf4736d`＋作業ツリー）: run-heavy経由、子TEMP/TMPはtarget/tmp、build jobs 2／test threads 1で直列実行した。初回の3失敗は、明示leafのaffected-only通知の取消、slotのパス正規化、新しい書庫単位方針の期待値を補修した。最終の `test(/cover_cache|cover_rotation|thumbnail_requests/)` は **74成功・0失敗**（run ID `65380bb3-3cfb-4555-b908-994b5ec6f154`）。`cargo check -p mimageviewer --bin mimageviewer-core`、`cargo run -p viewer_context_audit`、`cargo fmt`（引数なし）、`git diff --check` も成功。UI文字列・見た目・snapshotは変更していない。マニュアルには同じ書庫内の本も判定し直すことを追記した。

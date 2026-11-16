@@ -71,6 +71,14 @@ impl BookCoverId {
         }
     }
 
+    /// Automatic material in every ZipDir shares its outer archive's invalidation.
+    pub(crate) fn invalidation_owner(&self) -> Self {
+        match self {
+            Self::Zip { path, .. } | Self::Archive(path) => Self::Archive(path.clone()),
+            other => other.clone(),
+        }
+    }
+
     /// Uses a known typed container; delimiters inside ZIP entries stay literal.
     pub(crate) fn contains_page_key(&self, key: &str) -> bool {
         match self {
@@ -103,6 +111,15 @@ pub struct AutoCoverSlot {
     pub(crate) representative_page_key: String,
 }
 
+impl AutoCoverSlot {
+    pub(crate) fn new(book: BookCoverId, representative_page_key: String) -> Self {
+        Self {
+            logical_book: book.normalized().invalidation_owner(),
+            representative_page_key,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum CoverCacheStamp {
     #[default]
@@ -126,8 +143,6 @@ impl CoverCacheStamp {
 #[derive(Clone)]
 pub(crate) struct SourceHint {
     pub(crate) book: BookCoverId,
-    // Writer identity stays in `book`; a ZipDir pin can read another prefix.
-    read_book: BookCoverId,
     pub(crate) aliases: Vec<PathBuf>,
     pub(crate) representative_page_keys: Vec<String>,
     pub(crate) selection: Option<SelectionHint>,
@@ -143,7 +158,6 @@ impl SourceHint {
     pub(crate) fn new(book: BookCoverId) -> Self {
         let book = book.normalized();
         Self {
-            read_book: book.clone(),
             book,
             aliases: Vec::new(),
             representative_page_keys: Vec::new(),
@@ -151,46 +165,20 @@ impl SourceHint {
         }
     }
     pub(crate) fn contains_page_key(&self, key: &str) -> bool {
-        self.read_book.contains_page_key(key)
-            || self.aliases.iter().any(|p| {
-                let id = match &self.read_book {
-                    BookCoverId::Zip { prefix, .. } => BookCoverId::Zip {
-                        path: p.clone(),
-                        prefix: prefix.clone(),
-                    },
-                    BookCoverId::Pdf(_) => BookCoverId::Pdf(p.clone()),
-                    _ => BookCoverId::Archive(p.clone()),
-                };
-                id.contains_page_key(key)
-            })
-    }
-
-    /// Worker-only pin resolution, before filtering by a changed body page.
-    fn resolve_selection(&mut self) {
-        self.read_book = self.book.clone();
-        if self.selection.is_none() {
-            return;
+        let contains =
+            |path: &Path| key.starts_with(&crate::adjustment_db::zip_entry_key(path, ""));
+        match &self.book {
+            BookCoverId::Zip { path, .. } | BookCoverId::Archive(path) => {
+                contains(path) || self.aliases.iter().any(|p| contains(p))
+            }
+            _ => {
+                self.book.contains_page_key(key)
+                    || self
+                        .aliases
+                        .iter()
+                        .any(|p| BookCoverId::Pdf(p.clone()).contains_page_key(key))
+            }
         }
-        let Some(request) = resolved_selection_request(self) else {
-            self.selection = None;
-            return;
-        };
-        if let BookCoverId::Zip {
-            path,
-            prefix: Some(prefix),
-        } = &self.book
-        {
-            self.read_book = BookCoverId::Zip {
-                path: path.clone(),
-                prefix: Some(
-                    request
-                        .zip_dir_prefix
-                        .clone()
-                        .unwrap_or_else(|| prefix.clone()),
-                ),
-            };
-        }
-        self.selection.as_mut().unwrap().request = request;
     }
 }
 
@@ -214,8 +202,17 @@ pub(crate) struct InvalidationCompletion {
     /// Current request selection only; historical pinned/sorted rows must not
     /// cause a cover-only pending request to be canceled.
     pub(crate) pending_slots: Vec<AutoCoverSlot>,
-    pub(crate) deleted_keys: Vec<(PathBuf, Vec<String>)>,
+    pub(crate) deleted_rows: Vec<InvalidatedRow>,
     pub(crate) errors: Vec<String>,
+}
+
+/// These facts must stay correlated: never join a slot from one row with a
+/// same-named key deleted from a different catalog.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct InvalidatedRow {
+    pub(crate) slot: AutoCoverSlot,
+    pub(crate) catalog: PathBuf,
+    pub(crate) key: String,
 }
 
 pub(crate) struct CoverRotationCache {
@@ -241,6 +238,7 @@ impl CoverRotationCache {
         self.sender.send(completion).unwrap();
     }
     pub(crate) fn stamp(&self, slot: AutoCoverSlot) -> CoverCacheStamp {
+        let slot = AutoCoverSlot::new(slot.logical_book, slot.representative_page_key);
         let serial = self.serials.get(&slot).copied().unwrap_or(0);
         CoverCacheStamp::Tracked {
             slot: Arc::new(slot),
@@ -274,8 +272,18 @@ impl CoverRotationCache {
         }
     }
     pub(crate) fn poll(&mut self) -> Vec<InvalidationCompletion> {
-        let completions: Vec<_> = self.receiver.try_iter().collect();
-        for completion in &completions {
+        let mut completions: Vec<_> = self.receiver.try_iter().collect();
+        for completion in &mut completions {
+            for slot in completion
+                .affected_slots
+                .iter_mut()
+                .chain(&mut completion.pending_slots)
+            {
+                *slot = AutoCoverSlot::new(
+                    slot.logical_book.clone(),
+                    slot.representative_page_key.clone(),
+                );
+            }
             for slot in &completion.affected_slots {
                 *self.serials.entry(slot.clone()).or_default() += 1;
             }
@@ -460,16 +468,16 @@ fn row_belongs_to_with_slot(
                 .is_some_and(|expected| base == expected.to_lowercase().replace('\\', "/"))
         });
     }
-    if let BookCoverId::Zip {
-        prefix: Some(prefix),
-        ..
-    } = &hint.book
+    if matches!(
+        &hint.book,
+        BookCoverId::Zip { .. } | BookCoverId::Archive(_)
+    ) && base
+        .strip_prefix("zipdir:")
+        .is_some_and(|prefix| !prefix.is_empty())
     {
-        return (source_paths(hint).any(|path| same_path(path, scope))
+        return source_paths(hint).any(|path| same_path(path, scope))
             || (known_slot
-                && representative
-                    .starts_with(&crate::adjustment_db::zip_entry_key(scope, prefix))))
-            && matches_derived_source(&base, pin, &crate::grid_item::zipdir_cache_key(prefix));
+                && representative.starts_with(&crate::adjustment_db::zip_entry_key(scope, "")));
     }
     let prefix = match &hint.book {
         BookCoverId::Pdf(_) => crate::thumb_loader::CACHE_KEY_PDF,
@@ -479,7 +487,18 @@ fn row_belongs_to_with_slot(
     };
     source_paths(hint).any(|path| {
         let full = crate::adjustment_db::normalize_path(path);
-        if matches_base_or_generation(&base, &format!("{prefix}{full}")) {
+        let prefixes: &[&str] = if known_slot && matches!(&hint.book, BookCoverId::Archive(_)) {
+            &[
+                crate::thumb_loader::CACHE_KEY_ARCHIVE,
+                crate::thumb_loader::CACHE_KEY_ZIP,
+            ]
+        } else {
+            &[prefix]
+        };
+        if prefixes
+            .iter()
+            .any(|prefix| matches_base_or_generation(&base, &format!("{prefix}{full}")))
+        {
             return true;
         }
         if basename_scope(scope, path)
@@ -487,7 +506,12 @@ fn row_belongs_to_with_slot(
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| {
-                    matches_base_or_generation(&base, &format!("{prefix}{}", name.to_lowercase()))
+                    prefixes.iter().any(|prefix| {
+                        matches_base_or_generation(
+                            &base,
+                            &format!("{prefix}{}", name.to_lowercase()),
+                        )
+                    })
                 })
         {
             return true;
@@ -538,13 +562,10 @@ fn affected_slot(
     changed
         .iter()
         .any(|key| key != representative && hint.contains_page_key(key))
-        .then(|| AutoCoverSlot {
-            logical_book: hint.book.clone(),
-            representative_page_key: representative.to_owned(),
-        })
+        .then(|| AutoCoverSlot::new(hint.book.clone(), representative.to_owned()))
 }
 
-fn resolved_selection_request(hint: &SourceHint) -> Option<crate::thumb_loader::LoadRequest> {
+fn selected_representative(hint: &SourceHint) -> Option<String> {
     let selection = hint.selection.as_ref()?;
     let mut resolved_request = selection.request.clone();
     if resolved_request.zip_entry.is_none() && resolved_request.pdf_page.is_none() {
@@ -622,11 +643,7 @@ fn resolved_selection_request(hint: &SourceHint) -> Option<crate::thumb_loader::
             resolved_request.path = hint.aliases.first()?.clone();
         }
     }
-    Some(resolved_request)
-}
-
-fn selected_representative(hint: &SourceHint) -> Option<String> {
-    let req = &hint.selection.as_ref()?.request;
+    let req = &resolved_request;
     // These are admitted request facts, including the effective pin, not a new
     // parse of the derived cache key. Manual/pinned-folder material is excluded.
     if req.auto_cover_crop.is_none() || req.cover_crop.is_some() {
@@ -758,7 +775,7 @@ pub(crate) fn remove_invalidated_memory_rows(
             let fallback = SourceHint::new(slot.logical_book.clone());
             let matching: Vec<_> = hints
                 .iter()
-                .filter(|hint| hint.book == slot.logical_book)
+                .filter(|hint| hint.book.invalidation_owner() == slot.logical_book)
                 .collect();
             if matching.is_empty() {
                 row_belongs_to_with_slot(&fallback, scope, &header, true)
@@ -831,7 +848,6 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
                 } else {
                     BookCoverId::Archive(path.clone())
                 };
-                root.read_book = root.book.clone();
                 root.representative_page_keys.clear();
                 root.selection = None;
                 Some(root)
@@ -861,7 +877,6 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
                     } => BookCoverId::Archive(path.clone()),
                     _ => owner.book.clone(),
                 };
-                hint.read_book = hint.book.clone();
                 hint.aliases = owner.aliases.clone();
             }
             if !request
@@ -939,7 +954,6 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
                         &snapshot.source_path,
                     ))),
                 };
-                hint.read_book = hint.book.clone();
             }
         }
     }
@@ -966,15 +980,6 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
             .get(&alias_owner(&hint.book))
             .cloned()
             .unwrap_or_default();
-        if matches!(
-            &hint.book,
-            BookCoverId::Zip {
-                prefix: Some(_),
-                ..
-            }
-        ) {
-            hint.resolve_selection();
-        }
     }
     request.source_hints.retain(|hint| {
         request
@@ -982,54 +987,6 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
             .iter()
             .any(|key| hint.contains_page_key(key))
     });
-    // A body page belongs to the whole ZIP and every containing ZipDir. These
-    // are logical books, not ancestor physical folders. Derive only prefixes of
-    // entries inside a known typed outer container, never by splitting a raw
-    // page key at its first delimiter.
-    let mut dirs = Vec::new();
-    for hint in &request.source_hints {
-        if !matches!(
-            &hint.book,
-            BookCoverId::Zip { prefix: None, .. } | BookCoverId::Archive(_)
-        ) {
-            continue;
-        }
-        for path in source_paths(hint) {
-            let base = crate::adjustment_db::zip_entry_key(path, "");
-            for changed in &request.changed_keys {
-                if let Some(entry) = changed.strip_prefix(&base) {
-                    for (offset, _) in entry.match_indices('/') {
-                        let prefix = entry[..=offset].to_owned();
-                        let mut derived = hint.clone();
-                        derived.book = BookCoverId::Zip {
-                            path: hint.book.path().to_owned(),
-                            prefix: Some(prefix.clone()),
-                        };
-                        derived.read_book = derived.book.clone();
-                        derived.representative_page_keys.clear();
-                        if let Some(selection) = &mut derived.selection {
-                            selection.request.zip_entry = None;
-                            selection.request.pdf_page = None;
-                            selection.request.zip_dir_prefix = Some(prefix);
-                            selection.request.path = path.to_owned();
-                        }
-                        derived.resolve_selection();
-                        if !request
-                            .source_hints
-                            .iter()
-                            .any(|existing| existing.book == derived.book)
-                            && !dirs
-                                .iter()
-                                .any(|existing: &SourceHint| existing.book == derived.book)
-                        {
-                            dirs.push(derived);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    request.source_hints.extend(dirs);
     let mut inferred_scopes = Vec::new();
     for hint in &request.source_hints {
         for path in source_paths(hint) {
@@ -1058,19 +1015,6 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
                 folder,
                 memory: Vec::new(),
             });
-        }
-    }
-    // Other books retain the existing order: filter by source before resolving
-    // their pin. Only ZipDir needs pin scope to decide source membership itself.
-    for hint in &mut request.source_hints {
-        if !matches!(
-            &hint.book,
-            BookCoverId::Zip {
-                prefix: Some(_),
-                ..
-            }
-        ) {
-            hint.resolve_selection();
         }
     }
     let hints: Vec<_> = request
@@ -1160,7 +1104,12 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
             for hint in &hints {
                 if row_belongs_to(hint, &scope.folder, header) {
                     if let Some(slot) = affected_slot(hint, &request.changed_keys, representative) {
-                        affected.insert(slot);
+                        affected.insert(slot.clone());
+                        completion.deleted_rows.push(InvalidatedRow {
+                            slot,
+                            catalog: scope.folder.clone(),
+                            key: header.filename.clone(),
+                        });
                         deletes.insert(header.filename.clone());
                     }
                 }
@@ -1180,11 +1129,12 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
                     map.remove(key);
                 }
             }
-            completion
-                .deleted_keys
-                .push((scope.folder.clone(), deletes));
         }
     }
+    let mut unique_rows = HashSet::new();
+    completion
+        .deleted_rows
+        .retain(|row| unique_rows.insert(row.clone()));
     completion.affected_slots = affected.into_iter().collect();
     completion.pending_slots = pending.into_iter().collect();
     for error in &completion.errors {
@@ -1196,7 +1146,12 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
     crate::logger::log(format!(
         "cover rotation cache: complete slots={} catalogs={} errors={}; last writer races require manual cache rebuild",
         completion.affected_slots.len(),
-        completion.deleted_keys.len(),
+        completion
+            .deleted_rows
+            .iter()
+            .map(|row| &row.catalog)
+            .collect::<HashSet<_>>()
+            .len(),
         completion.errors.len()
     ));
     crate::perf::event(
@@ -1208,16 +1163,17 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
             ("ms", (started.elapsed().as_secs_f64() * 1000.0).into()),
             ("changed_keys", request.changed_keys.len().into()),
             ("targeted_slots", completion.affected_slots.len().into()),
+            ("deleted_keys", completion.deleted_rows.len().into()),
             (
-                "deleted_keys",
+                "catalogs",
                 completion
-                    .deleted_keys
+                    .deleted_rows
                     .iter()
-                    .map(|(_, keys)| keys.len())
-                    .sum::<usize>()
+                    .map(|row| &row.catalog)
+                    .collect::<HashSet<_>>()
+                    .len()
                     .into(),
             ),
-            ("catalogs", completion.deleted_keys.len().into()),
             ("errors", completion.errors.len().into()),
         ],
     );
@@ -1336,7 +1292,7 @@ mod tests {
             prefix: Some("chapter/".into()),
         });
         assert!(dir.contains_page_key(changed));
-        assert!(!dir.contains_page_key("c:/books/weird::name.zip::chapters/body.jpg"));
+        assert!(dir.contains_page_key("c:/books/weird::name.zip::chapters/body.jpg"));
         let dir_cover = "c:/books/weird::name.zip::chapter/cover.jpg";
         assert!(row_belongs_to(
             &dir,
@@ -1367,7 +1323,8 @@ mod tests {
             &header(&key, &cover)
         ));
         let other = key.replace("#pin:literal", "#pin:other");
-        assert!(!row_belongs_to(
+        // Another ZipDir in this exact archive is intentionally included.
+        assert!(row_belongs_to(
             &unusual,
             Path::new("c:/books/weird::name.zip"),
             &header(&other, &cover)
@@ -1481,8 +1438,12 @@ mod tests {
         ));
         assert!(completion.errors.is_empty(), "{:?}", completion.errors);
         assert_eq!(
-            completion.deleted_keys,
-            vec![(parent, vec![deleted.to_owned()])]
+            completion.deleted_rows,
+            vec![InvalidatedRow {
+                catalog: parent,
+                key: deleted.to_owned(),
+                slot: AutoCoverSlot::new(zip_hint(&path).book, cover.clone())
+            }]
         );
         assert_eq!(completion.affected_slots.len(), 1);
         assert_eq!(completion.affected_slots[0].representative_page_key, cover);
@@ -1562,7 +1523,7 @@ mod tests {
             vec![],
         ));
         assert!(completion.errors.is_empty(), "{:?}", completion.errors);
-        assert_eq!(completion.affected_slots.len(), 2);
+        assert_eq!(completion.affected_slots.len(), 3);
         assert!(
             db.load_one("zipdir:chapter/|autocrop:v4:rtl")
                 .unwrap()
@@ -1576,8 +1537,135 @@ mod tests {
         assert!(
             db.load_one("zipdir:other/|autocrop:v4:rtl")
                 .unwrap()
-                .is_some()
+                .is_none()
         );
+    }
+
+    #[test]
+    fn cover_rotation_archive_inventory_deletes_unheld_external_zipdir_pins_after_restart() {
+        use crate::folder_thumb_pins::{FolderPin, FolderPinSource, PinKeyMode};
+        use std::io::Write;
+        for converted in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let cache = temp.path().join("cache");
+            let zip = temp.path().join("books.zip");
+            let mut writer = zip::ZipWriter::new(std::fs::File::create(&zip).unwrap());
+            for name in ["A/0.jpg", "B/0.jpg", "B/1.jpg", "C/0.jpg"] {
+                writer
+                    .start_file(name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(b"entry metadata only").unwrap();
+            }
+            writer.finish().unwrap();
+            let source = if converted {
+                temp.path().join("books.rar")
+            } else {
+                zip.clone()
+            };
+            if converted {
+                std::fs::write(&source, b"logical archive").unwrap();
+            }
+            let cover = crate::adjustment_db::zip_entry_key(&zip, "B/0.jpg");
+            let db = crate::catalog::CatalogDb::open(&cache, &zip).unwrap();
+            let container = crate::app::book_container_key(&zip, "A/");
+            let pin = FolderPin::from(FolderPinSource::ZipDir {
+                zip_rel: String::new(),
+                dir_prefix: "B/".into(),
+            });
+            let target = crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+                &container,
+                &pin,
+                |_| None,
+                3,
+            )
+            .unwrap();
+            let mut keys = Vec::new();
+            for prefix in ["A/", "A/#pin:literal/"] {
+                let base = target.pinned_cache_key(
+                    &crate::grid_item::zipdir_cache_key(prefix),
+                    PinKeyMode::Exact,
+                    None,
+                );
+                for direction in [
+                    crate::settings::ReadingDirection::Rtl,
+                    crate::settings::ReadingDirection::Ltr,
+                ] {
+                    let key = crate::thumb_loader::representative_cache_key_for_policy_with_auto(
+                        &base,
+                        &Default::default(),
+                        Some(crate::cover_auto_crop::AutoCropIdentity::new(direction)),
+                    );
+                    db.save(
+                        &key,
+                        1,
+                        2,
+                        3,
+                        4,
+                        None,
+                        b"no decode",
+                        &CoverIdentity::Page(cover.clone()),
+                        automatic(),
+                    )
+                    .unwrap();
+                    keys.push(key);
+                }
+            }
+            let manual = "zipdir:A/|autocrop:v4:rtl#pin:manual";
+            db.save(
+                manual,
+                1,
+                2,
+                3,
+                4,
+                None,
+                b"no decode",
+                &CoverIdentity::Page(cover.clone()),
+                AutoMaterial::NotAutomatic,
+            )
+            .unwrap();
+            // No A/ tile, request, pin DB or Loaded hint survives this restart.
+            let source_hints = || {
+                if converted {
+                    let mut hint = SourceHint::new(BookCoverId::Archive(source.clone()));
+                    hint.aliases.push(zip.clone());
+                    vec![hint]
+                } else {
+                    vec![]
+                }
+            };
+            let before = AutoCoverSlot::new(
+                BookCoverId::Zip {
+                    path: source.clone(),
+                    prefix: Some("A/".into()),
+                },
+                cover.clone(),
+            );
+            let mut service = CoverRotationCache::default();
+            let retained = service.stamp(before.clone());
+            let cover_only = run_invalidation(request(&cache, &cover, source_hints(), vec![]));
+            assert!(!cover_only.affected_slots.contains(&before));
+            for key in &keys {
+                assert!(db.load_one(key).unwrap().is_some());
+            }
+            let completion = run_invalidation(request(
+                &cache,
+                &crate::adjustment_db::zip_entry_key(&zip, "B/1.jpg"),
+                source_hints(),
+                vec![],
+            ));
+            assert!(completion.errors.is_empty(), "{:?}", completion.errors);
+            assert!(completion.affected_slots.contains(&before));
+            for key in &keys {
+                assert!(db.load_one(key).unwrap().is_none(), "{key}");
+            }
+            assert!(db.load_one(manual).unwrap().is_some());
+            service.complete_for_test(completion);
+            service.poll();
+            assert!(
+                !service.is_current(&retained),
+                "archive-scoped stamp reaches an unheld prefix"
+            );
+        }
     }
 
     #[test]
@@ -1608,7 +1696,6 @@ mod tests {
             },
             pin_db: Some(pins),
         });
-        hint.resolve_selection();
         assert_eq!(
             selected_representative(&hint),
             Some(crate::edit_source::page_key_for_pdf(&pdf, 3))
@@ -1733,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn cover_rotation_zipdir_shares_outer_source_alias_without_invalidating_sibling_prefix() {
+    fn cover_rotation_zipdirs_share_outer_source_alias_and_invalidate_all_prefixes() {
         let temp = tempfile::tempdir().unwrap();
         let source = temp.path().join("book.rar");
         let physical = temp.path().join("converted.zip");
@@ -1770,15 +1857,17 @@ mod tests {
             vec![],
         ));
         assert!(done.errors.is_empty());
-        assert_eq!(
-            done.affected_slots,
-            vec![AutoCoverSlot {
-                logical_book: target,
-                representative_page_key: cover
-            }]
+        assert_eq!(done.affected_slots.len(), 2);
+        assert!(
+            done.affected_slots
+                .contains(&AutoCoverSlot::new(target.clone(), cover))
         );
+        assert!(done.affected_slots.contains(&AutoCoverSlot::new(
+            target,
+            crate::adjustment_db::zip_entry_key(&physical, "other/cover.png")
+        )));
         assert!(done.pending_slots.is_empty());
-        assert!(done.deleted_keys.is_empty());
+        assert!(done.deleted_rows.is_empty());
     }
 
     #[test]
