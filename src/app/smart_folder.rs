@@ -557,6 +557,33 @@ impl SmartFolderOpenOrigin {
 }
 
 impl SmartFolderSession {
+    pub(super) fn append_cover_cache_inputs(
+        &self,
+        inputs: &mut super::cover_rotation_cache::CoverCacheInputs,
+        settings: &crate::settings::Settings,
+        pin_db: Option<&Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
+    ) {
+        if let SmartFolderOpenPhase::Child {
+            parked_root: SmartFolderRootPayload::Visible(grid),
+            ..
+        } = &self.phase
+        {
+            let pool =
+                super::ThumbnailPoolCatalog::View(smart_folder_synthetic_path(self.definition_id));
+            inputs.grid(
+                &grid.items,
+                &grid.thumbnails,
+                None,
+                None,
+                &grid.converted_archive_cache_paths,
+                &pool,
+                grid.color_cache_map.as_ref(),
+                settings,
+                pin_db,
+            );
+        }
+    }
+
     pub(in crate::app) fn invalidate_cached_sources(&mut self) {
         if let Some(grid) = self.phase.parked_root_mut() {
             ConvertedArchiveSourceState::invalidate_cached_paths(
@@ -8621,7 +8648,6 @@ impl App {
         self.image_metas = image_metas;
         self.bump_items_generation();
         self.invalidate_idx_state_and_queues();
-        self.reconcile_restored_cover_thumbnails();
         // The restored samples still describe these moved items, but their installed App
         // generation is new so stale child work cannot publish into the root.
         auto_aspect.items_generation = self.items_generation;
@@ -8662,6 +8688,9 @@ impl App {
         self.current_color_cache_map = color_cache_map;
         self.current_color_catalog = color_catalog;
         self.thumbnail_pool_catalog = super::ThumbnailPoolCatalog::View(synthetic);
+        // Restore every source, memory map and aspect owner before freshness
+        // reconciliation; no later assignment may resurrect a removed sample.
+        self.reconcile_restored_cover_thumbnails();
 
         let (tx, rx) = mpsc::channel();
         self.tx = tx.clone();
@@ -12094,6 +12123,87 @@ mod tests {
         assert_eq!(app.grid_tile_rotation(1), Rotation::Cw90);
         assert_eq!(app.grid_tile_rotation(2), Rotation::None);
         assert_eq!(app.grid_tile_rotation(3), Rotation::None);
+    }
+
+    #[test]
+    fn smart_folder_cover_cache_restore_does_not_resurrect_stale_auto_aspect() {
+        use crate::cover_auto_material::{AutoCropResults, AutoMaterial};
+        use crate::cover_rotation_cache::{AutoCoverSlot, BookCoverId, InvalidationCompletion};
+        use crate::cover_source_scope::LoadedCoverIdentity;
+
+        let mut app = crate::app::setup_app_for_test();
+        let definition_id = install_smart_identity_test_root(&mut app, Default::default());
+        let ctx = egui::Context::default();
+        let book = PathBuf::from("c:/smart/book.zip");
+        let slot = AutoCoverSlot {
+            logical_book: BookCoverId::from_grid_item(&GridItem::ZipFile(book.clone())).unwrap(),
+            representative_page_key: crate::adjustment_db::zip_entry_key(&book, "cover.png"),
+        };
+        let old_stamp = app.cover_rotation_cache.stamp(slot.clone());
+        let tex = ctx.load_texture(
+            "smart-cover-cache-restore",
+            egui::ColorImage::filled([2, 1], egui::Color32::WHITE),
+            Default::default(),
+        );
+        let mut automatic = ThumbnailState::loaded_raster(
+            tex.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            false,
+            2,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 1)),
+            None,
+        );
+        if let ThumbnailState::Loaded {
+            cover,
+            auto_material,
+            cover_cache_stamp,
+            ..
+        } = &mut automatic
+        {
+            *cover = LoadedCoverIdentity::Page(slot.representative_page_key.clone());
+            *auto_material = AutoMaterial::Automatic(AutoCropResults::new([None; 4]));
+            *cover_cache_stamp = old_stamp.clone();
+        }
+        let unchanged = ThumbnailState::loaded_raster(
+            tex.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            false,
+            2,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((2, 1)),
+            None,
+        );
+        app.items = vec![
+            GridItem::ZipFile(book),
+            GridItem::Image(PathBuf::from("c:/smart/unchanged.png")),
+        ];
+        app.thumbnails = vec![automatic, unchanged];
+        app.rebuild_auto_aspect_samples_from_loaded();
+        assert_eq!(app.auto_aspect.samples.get(&0), Some(&0.5));
+        assert_eq!(app.auto_aspect.samples.get(&1), Some(&0.5));
+        let grid = app.take_visible_smart_folder_grid();
+        assert_eq!(grid.layout.auto_aspect.samples.get(&0), Some(&0.5));
+        park_smart_identity_test_root(&mut app, grid);
+
+        // Invalidation completes while the root's pixels and samples are retained.
+        app.cover_rotation_cache
+            .complete_for_test(InvalidationCompletion {
+                affected_slots: vec![slot],
+                ..Default::default()
+            });
+        app.poll_cover_rotation_cache(&ctx);
+        assert!(!app.cover_rotation_cache.is_current(&old_stamp));
+
+        assert!(app.restore_prepared_smart_folder_session(definition_id, None));
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+        assert!(!app.auto_aspect.samples.contains_key(&0));
+        assert_eq!(app.auto_aspect.samples.get(&1), Some(&0.5));
+        assert_eq!(app.auto_aspect.samples.len(), 1);
+        assert!(matches!(
+            &app.thumbnails[1],
+            ThumbnailState::Loaded { tex: restored, .. } if restored.id() == tex.id()
+        ));
     }
 
     #[test]

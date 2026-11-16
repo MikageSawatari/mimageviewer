@@ -415,6 +415,10 @@ pub(crate) fn representative_auto_crop_key_parts(key: &str) -> Option<(&str, &st
     let split = key.find(CACHE_KEY_PIN_SUFFIX).unwrap_or(key.len());
     let (base, pin) = key.split_at(split);
     for token in [
+        "|autocrop:v4:rtl",
+        "|autocrop:v4:ltr",
+        "|autocrop:v4f:rtl",
+        "|autocrop:v4f:ltr",
         "|autocrop:v3:rtl",
         "|autocrop:v3:ltr",
         "|autocrop:v3f:rtl",
@@ -428,7 +432,9 @@ pub(crate) fn representative_auto_crop_key_parts(key: &str) -> Option<(&str, &st
     ] {
         // Folder-only versions are emitted only for folder representatives. On another kind they
         // remains literal source text, just like any unknown derived token.
-        if (token.starts_with("|autocrop:v3f:") || token.starts_with("|autocrop:v2f:"))
+        if (token.starts_with("|autocrop:v4f:")
+            || token.starts_with("|autocrop:v3f:")
+            || token.starts_with("|autocrop:v2f:"))
             && !key.starts_with(CACHE_KEY_FOLDER)
         {
             continue;
@@ -444,7 +450,7 @@ pub(crate) fn representative_auto_crop_key_parts(key: &str) -> Option<(&str, &st
 /// unambiguous suffix position as the builder, including pinned EPUB tails.
 fn legacy_auto_child_keys(key: &str) -> Option<[String; 2]> {
     let (base, token, tail) = representative_auto_crop_key_parts(key)?;
-    let binding = token.strip_prefix("|autocrop:v3:")?;
+    let binding = token.strip_prefix("|autocrop:v4:")?;
     let other = if binding == "rtl" { "ltr" } else { "rtl" };
     Some([
         format!("{base}|autocrop:v1:{binding}{tail}"),
@@ -1418,7 +1424,7 @@ fn automatic_container_location(location: &ReadLocation) -> Result<(), AutoCover
 }
 
 // Shared by source resolution and the decoder's last eligibility check.
-fn automatic_container_source(
+pub(crate) fn automatic_container_source(
     path: &Path,
     entry: Option<&str>,
     page: Option<u32>,
@@ -5834,6 +5840,29 @@ fn select_folder_thumb_image_with_policy_and_auto(
         })
     });
     (result, proof)
+}
+
+/// Write-side invalidation needs only the direct representative identity. Depth
+/// zero shares the normal sort/visibility selection while never reaching a K2
+/// cached child (and therefore never decoding its raster or generating a child).
+pub(crate) fn direct_folder_representative_key(
+    folder: &Path,
+    sort: crate::settings::SortOrder,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+) -> Option<String> {
+    let (selected, _) = select_folder_thumb_image_with_policy_and_auto(
+        folder, sort, 0, None, folder, None, policy, None,
+    );
+    match selected {
+        Some(FolderThumbResolution::Image(
+            path,
+            None,
+            FolderImageOrigin::Direct { directory, .. },
+        )) if crate::path_key::eq_keep_drive(&directory, folder) => {
+            Some(crate::adjustment_db::normalize_path(&path))
+        }
+        _ => None,
+    }
 }
 
 struct FolderCandidate {
@@ -10764,8 +10793,8 @@ mod tests {
             folders: false,
         };
         let policy = crate::file_type_visibility::FileTypeVisibility::default();
-        let key = "zipthumb:book.zip|autocrop:v3:ltr#pin:entry|generation:10:20";
-        let expected = "zipthumb:book.zip|autocrop:v3:rtl#pin:entry|generation:10:20";
+        let key = "zipthumb:book.zip|autocrop:v4:ltr#pin:entry|generation:10:20";
+        let expected = "zipthumb:book.zip|autocrop:v4:rtl#pin:entry|generation:10:20";
         assert_eq!(
             representative_cache_key_for_policy_with_auto(key, &policy, Some(rtl)),
             expected
@@ -10802,7 +10831,7 @@ mod tests {
         assert_eq!(request.auto_cover_crop, Some(identity));
         assert_eq!(
             cache_key_for_request(&request).unwrap(),
-            "zipthumb:book.zip|autocrop:v3:rtl#pin:entry"
+            "zipthumb:book.zip|autocrop:v4:rtl#pin:entry"
         );
         request.cover_crop = Some(manual_cover_crop([0, 0, 500_000, 1_000_000]));
         request.set_auto_cover_crop(Some(identity));
@@ -10815,6 +10844,56 @@ mod tests {
         request.cache_key_override = Some("page.png".into());
         request.set_auto_cover_crop(Some(identity));
         assert_eq!(request.auto_cover_crop, None);
+    }
+
+    #[test]
+    fn auto_cover_crop_version_upgrade_normalizes_old_tokens_without_legacy_v3_fallback() {
+        let policy = crate::file_type_visibility::FileTypeVisibility::default();
+        let identity =
+            crate::cover_auto_crop::AutoCropIdentity::new(crate::settings::ReadingDirection::Rtl);
+        let tail = "#pin:page|generation:17:4096";
+        for version in ["v1", "v2", "v3", "v4"] {
+            let key = format!("zipthumb:book.zip|autocrop:{version}:ltr{tail}");
+            assert_eq!(
+                representative_cache_key_for_policy_with_auto(&key, &policy, Some(identity)),
+                format!("zipthumb:book.zip|autocrop:v4:rtl{tail}")
+            );
+            assert_eq!(
+                representative_cache_key_for_policy(&key, &policy),
+                format!("zipthumb:book.zip{tail}")
+            );
+            assert_eq!(legacy_auto_child_keys(&key).is_some(), version == "v4");
+        }
+        let folders = crate::cover_auto_crop::AutoCropIdentity {
+            folders: true,
+            ..identity
+        };
+        for version in ["v2f", "v3", "v3f", "v4", "v4f"] {
+            let key = format!("folderthumb:book|autocrop:{version}:ltr{tail}");
+            assert_eq!(
+                representative_cache_key_for_policy_with_auto(&key, &policy, Some(folders)),
+                format!("folderthumb:book|autocrop:v4f:rtl{tail}")
+            );
+            assert_eq!(
+                representative_cache_key_for_policy(&key, &policy),
+                format!("folderthumb:book{tail}")
+            );
+        }
+        for version in ["v3f", "v4f"] {
+            let literal = format!("zipthumb:book.zip|autocrop:{version}:rtl");
+            assert!(representative_auto_crop_key_parts(&literal).is_none());
+            assert_eq!(
+                representative_cache_key_for_policy(&literal, &policy),
+                literal
+            );
+        }
+        assert_eq!(
+            legacy_auto_child_keys(&format!("zipthumb:book.zip|autocrop:v4:rtl{tail}")),
+            Some([
+                format!("zipthumb:book.zip|autocrop:v1:rtl{tail}"),
+                format!("zipthumb:book.zip|autocrop:v1:ltr{tail}"),
+            ])
+        );
     }
 
     #[test]
@@ -10886,7 +10965,7 @@ mod tests {
             "zipdir:chapter/|autocrop:v1:rtl|suffix/",
             "zipdir:chapter/|autocrop:v1:ltr|suffix/",
             "zipdir:chapter/|types:0000000000000001|suffix/",
-            "zipthumb:a.zip|autocrop:v4:ltr",
+            "zipthumb:a.zip|autocrop:v5:ltr",
             "zipdir:chapter/|types:not-a-fingerprint/",
         ] {
             assert_eq!(representative_cache_key_for_policy(key, &visible), key);

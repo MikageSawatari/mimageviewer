@@ -86,6 +86,16 @@ pub struct CacheEntry {
     pub selection_proof: Option<FolderSelectionProof>,
 }
 
+/// Worker-only inventory: representative invalidation must not fetch raster blobs.
+#[derive(Clone)]
+pub(crate) struct ThumbnailHeader {
+    pub(crate) filename: String,
+    pub(crate) cover: CoverIdentity,
+    pub(crate) auto_material: AutoMaterial,
+    pub(crate) folder_provenance: Option<FolderThumbProvenance>,
+    pub(crate) selection_proof: Option<FolderSelectionProof>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FolderThumbProvenance {
     AutoSelected,
@@ -315,6 +325,31 @@ impl CatalogWork {
 
     pub(crate) fn open_existing(&self, folder: &Path) -> rusqlite::Result<Option<CatalogDb>> {
         CatalogDb::open_existing_read_only_admitted(&self.cache_dir, folder, self.admission)
+    }
+
+    /// Existing-file update only. Retain this job's admission; maintenance must
+    /// never let a delayed deletion recreate an old catalog or its directories.
+    pub(crate) fn open_existing_for_update(
+        &self,
+        folder: &Path,
+    ) -> rusqlite::Result<Option<CatalogDb>> {
+        let access = self.access();
+        let _lease = access.lease(self.admission)?;
+        let path = db_path_for(&self.cache_dir, folder);
+        if !catalog_file_exists(&path)? {
+            return Ok(None);
+        }
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+        let generation = THUMBNAIL_SCHEMA_GENERATION.load(Ordering::Acquire);
+        let columns = ThumbnailColumns::detect(&conn)?;
+        Ok(Some(CatalogDb::from_connection(
+            conn,
+            access.clone(),
+            self.admission,
+            generation,
+            columns,
+            cover_drive_for(folder),
+        )))
     }
 
     /// Lazy Collection and ordinary-parent lookups require the current columns.
@@ -984,13 +1019,16 @@ impl ThumbnailColumns {
     }
 }
 
-/// NULL is legacy absence only; a v3 identity requires an explicitly stored kind.
+/// NULL is legacy absence only; modern automatic keys require a stored kind.
 fn decode_auto_material(filename: &str, value: Option<&str>) -> Option<AutoMaterial> {
     match value {
         Some(value) => AutoMaterial::decode(value),
         None => (!crate::thumb_loader::representative_auto_crop_key_parts(filename).is_some_and(
             |(_, token, _)| {
-                token.starts_with("|autocrop:v3:") || token.starts_with("|autocrop:v3f:")
+                token.starts_with("|autocrop:v3:")
+                    || token.starts_with("|autocrop:v3f:")
+                    || token.starts_with("|autocrop:v4:")
+                    || token.starts_with("|autocrop:v4f:")
             },
         ))
         .then_some(AutoMaterial::NotAutomatic),
@@ -1486,6 +1524,50 @@ impl CatalogDb {
             ],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn thumbnail_headers(&self) -> rusqlite::Result<Vec<ThumbnailHeader>> {
+        let conn = self.phase()?;
+        let columns = self.thumbnail_columns(&conn)?;
+        let cover = if columns.cover { "cover_key" } else { "NULL" };
+        let material = if columns.auto_material {
+            "auto_crops"
+        } else {
+            "NULL"
+        };
+        let proof = if columns.proof {
+            "folder_provenance, selection_proof"
+        } else {
+            "NULL, NULL"
+        };
+        let sql = format!(
+            "SELECT filename, {cover}, {material}, {proof} FROM thumbnails WHERE substr(filename,1,9) <> 'audioart:'"
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        let mut headers = Vec::new();
+        for row in rows {
+            let (filename, cover, material, provenance, proof) = row?;
+            let Some(auto_material) = decode_auto_material(&filename, material.as_deref()) else {
+                continue;
+            };
+            headers.push(ThumbnailHeader {
+                filename,
+                cover: CoverIdentity::from_sql(cover.as_deref(), self.cover_drive),
+                auto_material,
+                folder_provenance: provenance.and_then(|value| serde_json::from_str(&value).ok()),
+                selection_proof: proof.and_then(|value| serde_json::from_str(&value).ok()),
+            });
+        }
+        Ok(headers)
     }
 
     /// DB 内の全エントリを HashMap<filename, CacheEntry> として返す（一括 SELECT）。
@@ -2029,6 +2111,18 @@ impl CatalogDb {
             params![filename],
         )?;
         Ok(())
+    }
+
+    pub(crate) fn delete_exact_keys(&self, filenames: &[String]) -> rusqlite::Result<()> {
+        let conn = self.phase()?;
+        let tx = conn.unchecked_transaction()?;
+        {
+            let mut statement = tx.prepare("DELETE FROM thumbnails WHERE filename = ?1")?;
+            for filename in filenames {
+                statement.execute(params![filename])?;
+            }
+        }
+        tx.commit()
     }
 
     /// Worker-owned pin refresh publication. Check cancellation inside the catalog write
@@ -3327,6 +3421,14 @@ mod tests {
             ),
             ("zipthumb:bad|autocrop:v3:ltr", Some("automatic-v1:-;-;-")),
             ("zipthumb:pinned|autocrop:v3:rtl#pin:page", None),
+            ("zipthumb:null|autocrop:v4:rtl", None),
+            ("folderthumb:null|autocrop:v4f:rtl", None),
+            ("zipthumb:bad|autocrop:v4:ltr", Some("automatic-v1:-;-;-")),
+            ("folderthumb:bad|autocrop:v4f:ltr", Some("broken")),
+            (
+                "pdfthumb:pinned|autocrop:v4:rtl#pin:pdf|page|1|generation:17:4096",
+                None,
+            ),
             ("zipthumb:legacy-bad|autocrop:v2:ltr", Some("broken")),
             ("ordinary-malformed", Some("broken")),
         ] {
@@ -3352,7 +3454,66 @@ mod tests {
             assert!(db.load_one(key).unwrap().is_none());
             assert!(!db.load_all().unwrap().contains_key(key));
             assert!(db.load_latest_with_prefix(key).unwrap().is_none());
+            assert!(
+                !db.thumbnail_headers()
+                    .unwrap()
+                    .iter()
+                    .any(|header| header.filename == key)
+            );
         }
+    }
+
+    #[test]
+    fn cover_rotation_header_inventory_uses_legacy_columns_without_fetching_blobs() {
+        let db = open_in_memory();
+        db.phase()
+            .unwrap()
+            .execute_batch(
+                "DROP TABLE thumbnails;
+            CREATE TABLE thumbnails(filename TEXT PRIMARY KEY, thumb_data TEXT);
+            INSERT INTO thumbnails VALUES('ordinary.jpg', 'not a raster blob');",
+            )
+            .unwrap();
+        let legacy = ThumbnailColumns::detect(&db.phase().unwrap()).unwrap();
+        *db.thumbnail_columns.lock().unwrap() =
+            (THUMBNAIL_SCHEMA_GENERATION.load(Ordering::Acquire), legacy);
+        let headers = db.thumbnail_headers().unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].filename, "ordinary.jpg");
+        assert_eq!(headers[0].cover, CoverIdentity::Legacy);
+        assert_eq!(headers[0].auto_material, AutoMaterial::NotAutomatic);
+        db.delete_exact_keys(&["ordinary.jpg-more".into()]).unwrap();
+        assert_eq!(db.thumbnail_headers().unwrap().len(), 1);
+        db.delete_exact_keys(&["ordinary.jpg".into()]).unwrap();
+        assert!(db.thumbnail_headers().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cover_rotation_existing_update_never_creates_or_reacquires_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("absent-cache");
+        let folder = temp.path().join("book-parent");
+        let work = CatalogWork::capture(&cache);
+        assert!(work.open_existing_for_update(&folder).unwrap().is_none());
+        assert!(!cache.exists());
+        let db = work.open(&folder).unwrap();
+        db.save(
+            "keep",
+            1,
+            2,
+            3,
+            4,
+            None,
+            b"not decoded",
+            &CoverIdentity::Unknown,
+            AutoMaterial::NotAutomatic,
+        )
+        .unwrap();
+        let update = work.open_existing_for_update(&folder).unwrap().unwrap();
+        assert_eq!(update.thumbnail_headers().unwrap().len(), 1);
+        assert_eq!(delete_all_cache(&cache), 1);
+        assert!(work.open_existing_for_update(&folder).is_err());
+        assert!(!db_path_for(&cache, &folder).exists());
     }
 
     #[test]

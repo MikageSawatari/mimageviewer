@@ -1455,6 +1455,23 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-16: 本文の保存回転による本自身の自動代表cache失効 (§1.773、表紙計画§29)
+
+設計担当と独立レビュー担当は、P案を撤回した後の単純な保存側失効について改めて設計合意した。
+変更対象は `viewer_context_registry.rs` の既存mounted / AtRest / Retiring owner別退避、Loadedのruntime stampの保持/clone、
+snapshot / Smart / direct-sourceの復元後照合と最終aspect samplesである。Smartではsaved samples代入後に照合する。
+本自身のAutomatic行と同じmemoryの厳密キー削除を短命workerで行い、Appが削除完了を受けた後に対象要求・CPU待ち・textureだけを退避する。
+元contextの移動/parkで通知を捨てず、同じ本・代表のUIセッション番号で古い保持素材を識別する。無変更の兄弟contextや通常ページは退避しない。
+
+自動keyだけをv4/v4fへ更新し、出荷済みv3/v3fを移行しない。素材codec/schemaとK2のv1互換は保ち、本文proof、K2内生成、v3 fallback、親の専用退避は追加しない。
+viewport生成/破棄、HWND、geometry、入力述語、promote/retire遷移、PDF epoch所有は変更しない。
+新しいdetached用bool/Option、時間窓、viewport推測、worker完了の同期待ちを足さず、共有cache変更の事実を既存context所有境界へ届ける構造修正として§2に適合すると合意した。
+以前のP案への合意の流用ではない。実装・独立completion review・自動検証の結果は[表紙計画§29.12](cover-crop-plan.md)へ集約し、本記録だけで完了とはしない。
+
+独立実装レビュー修正では、同じowner別退避の照合対象へ実在行由来のslotを加え、削除中の新要求とCPU待ちの遅着を拒否する。ZipDirのwriter identityと固定先の読取scopeの区別はworkerのsource facts内で行う。合意済みの構造的修正の範囲内であり、registryの所有・viewport・PDF epoch・入力述語には新しい経路や状態を追加しない。
+
+再レビューではZipDirの実効prefix照合を撤回し、同じ外側書庫のAutomaticを保守的に失効させる。runtime stampは外側書庫＋代表ページで共有する。削除通知はslot・catalog・keyを一組とし、registryでは既存ownerのpoolを共有照合へ渡す。別カタログの同名キーで兄弟要求を取消さないための所有境界の修正であり、新たなviewport／状態遷移／常駐ownerは追加しない。
+
 ### 2026-11-15: 通常画像のクリック判定に自動初期配置の owner を持たせる (§1.745)
 
 `FsAutomaticInitialView` は通常画像の表示単位の自動配置結果で、配置要求の完了後も比較用に保持する。
