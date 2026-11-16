@@ -218,6 +218,7 @@ fn prewarm_exact_hit_does_not_touch_recency_or_require_source_backing() {
 }
 
 fn headless_render_state() -> egui_wgpu::RenderState {
+    crate::test_gpu_group::assert_gpu_test_group();
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
     let instance = wgpu::Instance::new(descriptor);

@@ -548,6 +548,10 @@ fn open_ffmpeg_encoder(
         }
         H264EncoderKind::MediaFoundation => {}
     }
+    #[cfg(test)]
+    if encoder != H264EncoderKind::OpenH264 {
+        crate::test_gpu_group::assert_gpu_test_group();
+    }
     context.open_as_with(codec, options)
 }
 
@@ -760,6 +764,7 @@ mod tests {
     #[test]
     #[ignore = "requires local FFmpeg DLLs and encoder hardware"]
     fn probe_local_h264_encoder_open_results() {
+        crate::test_gpu_group::assert_gpu_test_group();
         ffmpeg::init().expect("FFmpeg init");
         let output = QualityPreset::Standard
             .output_parameters(1_280, 720)

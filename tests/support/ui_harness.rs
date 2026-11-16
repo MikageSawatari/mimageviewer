@@ -62,6 +62,7 @@ pub(crate) fn builder<State>() -> egui_kittest::HarnessBuilder<State> {
     egui_kittest::HarnessBuilder::default()
         .with_render_cursor(false)
         .renderer(egui_kittest::LazyRenderer::new(|| {
+            crate::test_gpu_group::assert_gpu_test_group();
             egui_kittest::wgpu::WgpuTestRenderer::from_setup(wgpu_setup())
         }))
 }
@@ -132,6 +133,7 @@ mod tests {
             let image = harness.render().expect("fixture GPU render");
 
             let ctx = egui::Context::default();
+            crate::test_gpu_group::assert_gpu_test_group();
             let mut renderer =
                 egui_kittest::wgpu::WgpuTestRenderer::from_setup(super::wgpu_setup());
             let mut expected = (egui::Rect::NOTHING, egui::Rect::NOTHING, false);
@@ -199,6 +201,7 @@ mod tests {
 
     #[test]
     fn render_state_enumerates_only_product_backends() {
+        crate::test_gpu_group::assert_gpu_test_group();
         let state = egui_kittest::wgpu::create_render_state(
             super::wgpu_setup(),
             egui_wgpu::RendererOptions::PREDICTABLE,

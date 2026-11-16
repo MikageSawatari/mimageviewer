@@ -118,6 +118,8 @@ fn init_glow_context_from_canvas(
 }
 
 fn init_webgl1(canvas: &HtmlCanvasElement) -> Option<(glow::Context, &'static str)> {
+    #[cfg(test)]
+    crate::test_gpu_group::assert_gpu_test_group();
     let gl1_ctx = canvas
         .get_context("webgl")
         .expect("Failed to query about WebGL2 context");
@@ -142,6 +144,8 @@ fn init_webgl1(canvas: &HtmlCanvasElement) -> Option<(glow::Context, &'static st
 }
 
 fn init_webgl2(canvas: &HtmlCanvasElement) -> Option<(glow::Context, &'static str)> {
+    #[cfg(test)]
+    crate::test_gpu_group::assert_gpu_test_group();
     let gl2_ctx = canvas
         .get_context("webgl2")
         .expect("Failed to query about WebGL2 context");

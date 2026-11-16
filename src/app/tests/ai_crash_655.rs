@@ -149,6 +149,7 @@ fn enter(app: &mut App, ctx: &egui::Context, idx: usize) -> Option<FinalAiKey> {
 #[test]
 #[ignore = "opt-in GPU investigation; fresh process and isolated data_dir required"]
 fn ai_crash_655_headless_zip_navigation() {
+    crate::test_gpu_group::assert_gpu_test_group();
     let case = std::env::var("MIV_655_CASE").unwrap_or_else(|_| "rapid".into());
     assert!(["rapid", "wait", "off", "cached"].contains(&case.as_str()));
     let width: u32 = std::env::var("MIV_655_SIZE")

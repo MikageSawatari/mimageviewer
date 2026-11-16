@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(windows)]
 #[test]
 fn surface_size_limit_constrains_initial_safe_unsafe_resize_and_recreate() {
+    crate::test_gpu_group::assert_gpu_test_group();
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetClientRect, GetWindowRect, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSENDCHANGING, SWP_NOZORDER,
         SetWindowPos,
@@ -140,6 +141,7 @@ fn surface_size_limit_constrains_initial_safe_unsafe_resize_and_recreate() {
 #[cfg(windows)]
 #[test]
 fn zero_client_surface_skips_configure_and_acquire_then_resumes_rendering() {
+    crate::test_gpu_group::assert_gpu_test_group();
     use crate::StartupDiagnosticEvent;
     use std::{sync::Mutex, time::Duration};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -329,6 +331,7 @@ fn zero_client_surface_skips_configure_and_acquire_then_resumes_rendering() {
 }
 
 fn headless_painter() -> Option<Painter> {
+    crate::test_gpu_group::assert_gpu_test_group();
     let mut config = WgpuConfiguration::default();
     let WgpuSetup::CreateNew(setup) = &mut config.wgpu_setup else {
         unreachable!()
