@@ -1,6 +1,6 @@
 # §1.800 本を Enter で開き Esc で一覧へ戻るときのもたつき — 調査と設計
 
-- 状態: 調査・設計 (2026-11-17)。実装前。設計の独立レビュー r1〜r3 = REVISE を反映済み (§8)。§3.5 の比較で案 S1 (一括で読まない) へ切り替える方向、S1 の設計とレビューはこれから。
+- 状態: 調査・設計 (2026-11-17)。実装前。設計の独立レビュー r1〜r3 = REVISE を反映済み (§8)。§3.5 の比較で案 S1 (一括で読まない) へ切り替えた。S1 の設計は §4S、r5 でレビュー。
 - ブランチ: `perf-800-book-close` (worktree `G:\home\mimageviewer-perf-800`)。
 - 目標版: v5.3.0。
 
@@ -131,6 +131,62 @@ v5.3.0 の自動切り抜き v4 で鍵が変わると、片付けるまでの間
 **判断**: S1 を採る方向で設計し直す。§4 の段階 A (並列の先読み) より状態が少なく、効果も大きい。ただし `cache_map` の意味を
 変えるので、上の「行が無い = DB に無い」とみなす読み手を漏れなく列挙するのが前提で、独立レビューでその列挙を確かめる。
 S1 が成り立たないと分かった場合だけ §4 の段階 A に戻る。
+
+## 4S. 案 S1 の設計 (採用方向、r5 でレビュー)
+
+r4 (r3 までの案へのレビュー、§8) は「片付けを区切っても UI の writeback の待ちは上限にならず、writeback 自体を worker へ移す必要がある」と
+して REVISE だった。r3 までの案は直すたびに仕組みが増えるので、§3.5 の案 S1 に切り替える。
+
+### 4S.1 変えること
+
+1. **一覧の読み込みで `load_all` を呼ばない。** `resume_loading_items_after_sidecar` の catalog 節で、通常の一覧 (合成ビュー以外。
+   通常フォルダ、PDF/EPUB の仮想フォルダ、ZIP・変換書庫の物理一覧) の `cache_map` を空で作る。catalog の open
+   (`get_or_open_catalog`)・`delete_missing`・各 seed の呼び出し位置は今のまま。合成ビューは今の `prepared_aggregate` のまま
+   (worker が作った全行の写し)。
+2. **`cache_map` の意味を「控え」にする。** 「この一覧で worker が読んだ・書いた行」の控えで、無いことは「DB に無い」を意味しない。
+   合成ビューの写しも、控えとして扱って困らない (控えに無い鍵を DB で引き直すだけ)。型や mode の印は足さない。
+3. **サムネイル worker: 控えに無ければ DB を鍵で引く。** `thumb_loader.rs` の要求処理で、`RequestCatalog::Fixed` も、今の
+   `lazy_scope` の要求と同じく、控えの未ヒットで解決済みの catalog に `load_one(lookup_key)` し、stamp (mtime・大きさ) が合えば
+   控えに入れて使う。保存した行を控えに入れる今の処理はそのまま。retired な catalog・CacheOnly・旧表紙 (`refresh_legacy_cover`) の
+   扱いは今の分岐のまま。色フィルタの worker は同じ helper を通るので同じく効く。
+4. **「控えに無い = DB に無い」とみなしている読み手を、DB を引く形に直す。** コードで見つけたもの (r5 で漏れを確認してもらう):
+
+   | 読み手 | 場所 | 今の前提 | 直し方 |
+   | --- | --- | --- | --- |
+   | 動画ピンの seed の `purge_stale`・`already_seeded` | `seed_folder_video_pin_thumbs` (app.rs、UI) | 控えに無ければ古いピンの行は無い | catalog を鍵で引いて判定する (対象はピン留めした項目だけ) |
+   | ドライブ一覧の seed の `already_cached` | `seed_drive_list_pin_thumbs_from_catalog` (app.rs、UI) | 同上 | 同上 |
+   | 仮想フォルダの seed の `already_in_virtual` | `setup_virtual_folder_seed_and_writeback` (app.rs、UI) | 控えにあれば seed 済み | 仮想 catalog を鍵で引く (1 件) |
+   | ピンだけの要求の前方一致の探索 | `send_pinned_only_cached` (thumb_loader.rs、worker) | 控えを前方一致で走査 | 今の `resumed` の経路と同じ `load_latest_uncropped_with_prefix_matching` で DB を引く |
+   | 自動縦横比の seed | `reset_and_seed_auto_aspect_with_seed` (app.rs、UI) | 控えの `source_dims` から見本 | 見本の鍵 (最大 `min_samples_for` の 2 倍 = 48 件) だけ DB を鍵で引く。件数の上限があるので UI に残す (perf で時間を出す) |
+   | 仮想フォルダの writeback | `virtual_writeback` (app.rs、UI) | worker が控えに入れた WebP を取り出す | worker が DB から引いた行も控えに入れるので今のまま (要確認) |
+
+### 4S.2 変えないこと・状態
+
+- 新しい非同期の状態・合流・取り消しは無い。catalog を引く時点は worker の要求の時点だけになる。
+- 表紙の失効: worker が DB を引くのは要求の時点なので、失効で消えた行は引かない。控えに入った行は今の
+  `poll_cover_rotation_cache` が消す。r1 の P2-1 の窓は生じない。
+- 片付け (`delete_missing`) は今のまま UI で (全種類表示のときだけ)。行名の取得は 1〜2 ms。古い行が大量にある回の削除は今と同じ
+  (退行ではない)。表示を絞っている利用者の古い行は段階 C。
+- 永続データの形は変えない。
+
+### 4S.3 通常の使い方への影響 (見込み)
+
+- 閉じて一覧へ戻るとき、UI の 134〜221 ms の停止が無くなる。サムネイルはサイドカーの待ちの後すぐ worker が引き始める。
+- worker の 1 件あたりの読み込みは鍵 1 件の SELECT (温まった状態で 0.03 ms) が増える。デコード (数 ms) に比べて小さい。
+  worker は共有の接続を 1 件ずつ短く使う (今の保存と同じ種類の短い待ち)。
+- 起動時・フォルダ移動など、本以外の一覧の読み込みも同じく軽くなり、メモリは一覧で使った行の分だけになる。
+- 自動縦横比: 見本を DB から引くので、今と同じ見本が得られる。
+
+### 4S.4 検証
+
+- worker: 控えが空でも、DB にある行 (stamp 一致) を使い、作り直さない。stamp 不一致は使わない。EPUB の世代付きの鍵・ピンの鍵・
+  自動切り抜きの鍵でも同じ。色フィルタの worker も同じ。
+- 4S.1 の表の各読み手: 控えが空で DB に古いピンの行があると消す (Codex Phase C P3 の再発防止)、seed 済みなら書き直さない。
+- 表紙の失効: 失効の完了後に worker が引かない・控えから消える。
+- perf: `sli_catalog_load_all` は「開く + 控えの用意 + seed」の区間として残し (entries は 0 になる)、worker の DB 引きを
+  `thumb.load_phases` に区間 (例: `catalog_lookup_ms`) として出す。自動縦横比の見本の読み込み時間を出す。
+- 利用者の実機確認 (`build-dev.ps1`): 1,000 冊級のフォルダで本を開いて閉じ、閉じた直後の大きなフレーム間隔が消えたことと、
+  サムネイルが作り直されず (PDF の描き直しが走らず) に出ることを perf ログで見る。
 
 ## 4. (r3 までの案) 直し方 (段階 A を v5.3.0 で必須、段階 B は条件付き、段階 C は後段)
 
@@ -375,3 +431,12 @@ Q4 は DirectMedia を作る入口が 1 か所で足りる (activation・Agent �
 | P3-3 初めての DB で「読み込みは空」を判断する時点が曖昧 | §4 段階 A: 書き手の準備 → 読み取り専用で読む → 片付け の一本道。初回も分岐しない |
 
 §6 に、初めての DB・移行前の DB・保守の受付の前後、DirectMedia 4 通りの行の再利用、片付け中の writeback の待ちの検証を足した。
+
+### r4 (同じセッションの resume、2026-11-17、71aac1a34 に対して) — REVISE、P1 なし
+
+r3 の P2-1 (空の一覧の DirectMedia) と P3-3 (一本道) は解消。P2-1: 片付けを区切っても `phase()` の Mutex は UI へ順番を渡さず、
+UI の待ちの上限にならない。UI の writeback と seed の親 `load_one` を worker へ移す設計が要る。P3-2: 区切った片付けの契約
+(取り消し・保守で止める境界、部分的な完了の許容)。P3-3: §6 に空の一覧の旧条件が残っている。
+
+対応: r3 までの案は直すたびに仕組みが増える (今回は writeback の worker 化) ので、§3.5 の比較に基づき案 S1 (§4S) へ切り替えた。
+r4 の指摘は §4 の案に対するもので、S1 では片付けを worker へ移さないので該当しない。
