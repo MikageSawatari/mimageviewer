@@ -226,6 +226,7 @@ impl Request {
             seeds.push((
                 key,
                 CacheEntry {
+                    auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     mtime: resolved.mtime,
                     file_size: resolved.file_size,
                     jpeg_data: webp,

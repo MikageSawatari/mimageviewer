@@ -137,6 +137,8 @@ const WORKER_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_
 impl WorkerHandle {
     /// 親プロセス側でワーカー子プロセスを起動し、ハンドシェイクを待つ。
     fn spawn(exe: &std::path::Path) -> Result<Self, WorkerStartError> {
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         let mut child = Command::new(exe)
             .arg(TRT_INFER_WORKER_ARG)
             .stdin(Stdio::piped())

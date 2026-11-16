@@ -61,6 +61,12 @@ fn pane_enter_with_input(
             Some(kind) => App::navigation_search_fixture_for_test(kind),
             None => setup_app_for_test(),
         };
+        // Exercise the ordinary main pane after the startup overlay. The
+        // headless constructor intentionally does not start the indexer worker.
+        if matches!(app.indexer_init, IndexerInit::NotStarted) {
+            app.indexer_init = IndexerInit::Unavailable;
+        }
+        assert!(!app.indexer_init.overlay_active());
         let root = app.tmp.path().join("pane-tree");
         let origin = app.tmp.path().join("pre-search");
         let target = root.join("pane-target");
@@ -146,7 +152,15 @@ fn pane_enter_with_input(
                     app.folder_pane.visible_rows(),
                 )
             });
-        let label = ctx.read_response(label_id).unwrap().rect;
+        assert!(ctx.read_response(label_id).is_some());
+        let label: egui::Rect = ctx
+            .data(|data| {
+                data.get_temp(egui::Id::unique((
+                    "folder_pane_test_label_rect",
+                    root.as_path(),
+                )))
+            })
+            .expect("the actual root label rectangle was drawn");
         let arrow = egui::pos2(label.left() - 14.0, label.center().y);
         for pressed in [true, false] {
             main_frame(
@@ -250,6 +264,7 @@ fn main_frame(app: &mut App, ctx: &egui::Context, frame: &mut u64, events: Vec<e
             ..Default::default()
         },
         |ui| {
+            app.input_update_begin(ctx);
             app.update_ime_state(ctx);
             // App::update_frame runs root keyboard before toolbar and main bars;
             // main bars render all search editors before the tree, then grid.

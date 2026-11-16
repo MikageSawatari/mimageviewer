@@ -329,11 +329,45 @@ fn cover_auto_folder_seeded_pin_stays_outside_automatic_namespace() {
 }
 
 #[test]
+fn cover_auto_binding_is_shared_by_list_and_dialog_independent_of_reading_direction() {
+    let mut app = super::tests::phase_c_support::setup_app();
+    let item = GridItem::ZipFile(app.tmp.path().join("book.zip"));
+    app.settings.thumb_cover_auto_crop = true;
+    for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+        app.settings.thumb_cover_auto_crop_binding = binding;
+        let expected = Some(AutoCropIdentity::new(binding));
+        let mut previous = None;
+        for reading in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+            app.settings.default_reading_direction = reading;
+            assert_eq!(app.thumbnail_auto_crop_identity(), expected);
+            let dialog = app.book_cover_env();
+            assert_eq!(dialog.auto_cover_crop, expected);
+            let req = request(&item, &HashMap::new(), app.thumbnail_auto_crop_identity());
+            let key = crate::thumb_loader::cache_key_for_request(&req)
+                .unwrap()
+                .into_owned();
+            assert_eq!(req.auto_cover_crop, expected);
+            assert_eq!(
+                key,
+                format!("zipthumb:book.zip|autocrop:{}", expected.unwrap().suffix())
+            );
+            if let Some(previous) = previous {
+                assert_eq!(key, previous);
+            }
+            previous = Some(key);
+        }
+    }
+    app.settings.thumb_cover_auto_crop = false;
+    assert!(app.thumbnail_auto_crop_identity().is_none());
+    assert!(app.book_cover_env().auto_cover_crop.is_none());
+}
+
+#[test]
 fn cover_auto_drive_guard_does_not_leak_into_incoming_list_settings() {
     let mut app = super::tests::phase_c_support::setup_app();
     assert!(app.thumbnail_auto_crop_identity().is_none());
     app.settings.thumb_cover_auto_crop = true;
-    app.settings.default_reading_direction = ReadingDirection::Ltr;
+    app.settings.thumb_cover_auto_crop_binding = ReadingDirection::Ltr;
     let expected = Some(AutoCropIdentity::new(ReadingDirection::Ltr));
     assert_eq!(app.thumbnail_auto_crop_identity(), expected);
     app.items_are_drive_list = true;
@@ -448,6 +482,7 @@ fn cover_auto_existing_file_keys_match_writer_and_retire_previous_binding() {
                         Some((4, 10)),
                         &saved_bytes(),
                         &crate::cover_identity::CoverIdentity::Unknown,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     )
                     .unwrap();
                 }
@@ -476,7 +511,7 @@ fn cover_auto_zipdir_pinned_and_unpinned_rows_survive_current_binding_only() {
     for crop in [None, CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap()] {
         pin_db.set_with_cover_crop(&owner, &source, crop).unwrap();
         for direction in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
-            app.settings.default_reading_direction = direction;
+            app.settings.thumb_cover_auto_crop_binding = direction;
             let enumeration = crate::zip_loader::PreparedZipEnumeration::prepare(
                 zip.clone(),
                 crate::zip_loader::ZipEnumeration {
@@ -532,6 +567,7 @@ fn cover_auto_zipdir_pinned_and_unpinned_rows_survive_current_binding_only() {
                     Some((4, 10)),
                     &saved_bytes(),
                     &crate::cover_identity::CoverIdentity::Unknown,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
                 db.delete_missing(&prepared.existing_keys).unwrap();
@@ -598,6 +634,7 @@ fn cover_auto_epub_completed_generation_retains_documented_1742_boundary() {
             Some((4, 10)),
             &saved_bytes(),
             &crate::cover_identity::CoverIdentity::Unknown,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
         db.delete_missing(&keep).unwrap();
@@ -640,6 +677,21 @@ fn cover_auto_collection_source_digest_and_reuse_follow_enabled_binding() {
         let current = identity(delivery);
         assert_ne!(off, current);
         identities.push(current);
+        let folders = identity(
+            super::collection_grid::prepare_collection_grid_thumbnail_sources(
+                CollectionGridThumbnailSources {
+                    auto_cover_crop: Some(AutoCropIdentity {
+                        binding: direction,
+                        folders: true,
+                    }),
+                    ..Default::default()
+                },
+                &AtomicBool::new(false),
+            )
+            .unwrap(),
+        );
+        assert_ne!(folders, current);
+        assert_ne!(folders, off);
     }
     assert_ne!(identities[0], identities[1]);
     let id = crate::collection_store::CollectionId::new();
@@ -650,11 +702,84 @@ fn cover_auto_collection_source_digest_and_reuse_follow_enabled_binding() {
         )
     };
     let off = reuse(&settings);
-    settings.default_reading_direction = ReadingDirection::Ltr;
+    settings.thumb_cover_auto_crop_binding = ReadingDirection::Ltr;
     assert_eq!(reuse(&settings), off);
     settings.thumb_cover_auto_crop = true;
     let ltr = reuse(&settings);
     assert_ne!(ltr, off);
     settings.default_reading_direction = ReadingDirection::Rtl;
+    assert_eq!(reuse(&settings), ltr);
+    settings.thumb_cover_auto_crop_binding = ReadingDirection::Rtl;
     assert_ne!(reuse(&settings), ltr);
+    let rtl = reuse(&settings);
+    settings.thumb_cover_auto_crop_folders = true;
+    assert_ne!(reuse(&settings), rtl);
+    settings.thumb_cover_auto_crop = false;
+    assert_eq!(reuse(&settings), off);
+}
+
+#[test]
+fn cover_auto_folder_switch_keeps_list_survival_rating_and_dialog_identity_consistent() {
+    let mut app = super::tests::phase_c_support::setup_app();
+    app.settings.thumb_cover_auto_crop = true;
+    for binding in [ReadingDirection::Rtl, ReadingDirection::Ltr] {
+        app.settings.thumb_cover_auto_crop_binding = binding;
+        for folders in [false, true] {
+            app.settings.thumb_cover_auto_crop_folders = folders;
+            let auto = app.thumbnail_auto_crop_identity();
+            assert_eq!(app.book_cover_env().auto_cover_crop, auto);
+            for item in [
+                GridItem::Folder(app.tmp.path().join("book")),
+                GridItem::ZipFile(app.tmp.path().join("book.zip")),
+            ] {
+                let req = request(&item, &HashMap::new(), auto);
+                let key = crate::thumb_loader::cache_key_for_request(&req)
+                    .unwrap()
+                    .into_owned();
+                assert_eq!(
+                    key.contains("|autocrop:v3f:"),
+                    folders && matches!(item, GridItem::Folder(_))
+                );
+                let survival = folder_thumb_existing_keys_for_with_auto_crop(
+                    &item,
+                    Some((17, 23)),
+                    &HashMap::new(),
+                    None,
+                    None,
+                    3,
+                    false,
+                    &Default::default(),
+                    auto,
+                );
+                assert!(survival.contains(&key));
+                if matches!(item, GridItem::Folder(_)) {
+                    let opposite = crate::cover_auto_crop::AutoCropIdentity {
+                        binding,
+                        folders: !folders,
+                    };
+                    let retired =
+                        crate::thumb_loader::representative_cache_key_for_policy_with_auto(
+                            &key,
+                            &Default::default(),
+                            Some(opposite),
+                        );
+                    assert!(!survival.contains(&retired));
+                }
+                // Rating and the list both use this canonical setting capture
+                // and representative normalizer, never a reading direction.
+                assert_eq!(
+                    crate::app::configured_thumbnail_auto_crop(&app.settings),
+                    auto
+                );
+                assert_eq!(
+                    crate::thumb_loader::representative_cache_key_for_policy_with_auto(
+                        &key,
+                        &Default::default(),
+                        auto
+                    ),
+                    key
+                );
+            }
+        }
+    }
 }

@@ -1,5 +1,9 @@
 # UI スナップショットテスト運用方針
 
+入力履歴 popup の表示面テーマ追従（2026-11-14、v5.2.0 の退行修正）は、既存の Dark と同じ純粋 fixture に
+`ResolvedTheme::Light` を渡す `search_history_popup_light` を追加する。明るい popup 背景・文字・選択行と
+欠け・重なりがないことを目視した。既存 PNG (`search_history_popup_dark` を含む) は変わらない。
+
 §1.764の自動切り出しは `cover_auto_crop_small_100_light` / `cover_auto_crop_small_200_dark` の2枚を追加する。
 1093×614、UI倍率100%/200%で、製品と同じ純粋rendererに自動設定ON・手動範囲ありを渡す。
 「手動の範囲を解除すると、自動の判定に戻ります。」の全文、固定操作行、画像全体とhandleを実装担当が目視した。

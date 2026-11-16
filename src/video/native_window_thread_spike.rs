@@ -931,6 +931,8 @@ impl RenderBackend {
         let mut context = None;
         let mut feature_level = D3D_FEATURE_LEVEL::default();
         let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         unsafe {
             D3D11CreateDevice(
                 None,
@@ -1019,6 +1021,8 @@ impl RenderBackend {
                 error,
             )
         })?;
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         let dcomp: IDCompositionDevice = unsafe { DCompositionCreateDevice(&dxgi_device) }
             .map_err(|error| {
                 HarnessFailure::backend(
@@ -2064,6 +2068,7 @@ fn run_stage3_harness() -> Result<(), HarnessFailure> {
 #[test]
 #[ignore = "Stage 3 hardware/driver gate; run explicitly with --ignored --exact --nocapture"]
 fn cross_thread_dcomp_present_remains_pump_independent_when_render_stalls() {
+    crate::test_gpu_group::assert_gpu_test_group();
     let result = if std::env::var(CHILD_ENV).as_deref() == Ok(CHILD_ENV_VALUE) {
         run_stage3_harness()
     } else {

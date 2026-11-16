@@ -56,7 +56,17 @@ pub(crate) fn read_rexif_from_path(path: &Path) -> RexifPathRead {
             bytes_read: 0,
         };
     };
-    let mut reader = CountingReader::new(file);
+    read_rexif_from_reader(file)
+}
+
+/// Analysis may already own the source bytes. Match the file reader's magic,
+/// JPEG prefix bound and damaged-marker handling without reopening the file.
+pub(crate) fn read_rexif_from_path_bytes(bytes: &[u8]) -> Option<rexif::ExifData> {
+    read_rexif_from_reader(std::io::Cursor::new(bytes)).exif
+}
+
+fn read_rexif_from_reader(reader: impl Read + Seek) -> RexifPathRead {
+    let mut reader = CountingReader::new(reader);
     let bytes = (|| -> std::io::Result<Option<Vec<u8>>> {
         let mut magic = [0_u8; 4];
         reader.read_exact(&mut magic)?;

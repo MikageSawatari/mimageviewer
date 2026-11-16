@@ -63,6 +63,7 @@ impl App {
     }
 
     pub(super) fn input_update_begin(&mut self, ctx: &egui::Context) {
+        self.begin_folder_pane_label_input(ctx);
         self.consume_input_during_sidecar_restore(ctx);
         // Select and cache the root viewport owner before any shortcut path.
         // This also ages a root PendingFocus claim on every pass, including

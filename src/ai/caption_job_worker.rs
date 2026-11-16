@@ -760,7 +760,6 @@ fn stage_event(stage: &str, started: Instant, success: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::OnceLock;
     use std::time::Duration;
 
     fn config(root: &Path) -> CaptionWorkerConfig {
@@ -814,44 +813,7 @@ mod tests {
     }
 
     fn fake_worker() -> &'static Path {
-        use sha2::{Digest as _, Sha256};
-
-        static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
-        FIXTURE.get_or_init(|| {
-            let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-            let source = manifest.join("tests/support/vlm_fake_worker.rs");
-            let hash = Sha256::digest(include_bytes!("../../tests/support/vlm_fake_worker.rs"));
-            // Reuse the transport tests' content-addressed standalone fake.
-            let root = manifest.join("target/vlm-fake-worker");
-            let directory = root.join(format!("{hash:x}"));
-            let executable = directory.join("vlm-fake-worker.exe");
-            if executable.is_file() {
-                return executable;
-            }
-            std::fs::create_dir_all(&root).unwrap();
-            let staging = tempfile::Builder::new()
-                .prefix(".build-")
-                .tempdir_in(&root)
-                .unwrap();
-            let output = std::process::Command::new("rustc")
-                .env("TEMP", staging.path())
-                .env("TMP", staging.path())
-                .args(["--edition=2024", "--crate-name=vlm_fake_worker"])
-                .arg(source)
-                .arg("-o")
-                .arg(staging.path().join("vlm-fake-worker.exe"))
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            if let Err(error) = std::fs::rename(staging.path(), &directory) {
-                assert!(executable.is_file(), "fake worker publish: {error}");
-            }
-            executable
-        })
+        vlm_worker::fake_worker_for_test()
     }
 
     fn next(worker: &CaptionWorker) -> CaptionWorkerEvent {
@@ -1359,6 +1321,7 @@ mod tests {
             cover_crop: None,
             edit_preview_key: None,
             zip_dir_prefix: None,
+            auto_cover_crop: Err(crate::thumb_loader::AutoCoverSkip::Off),
         })
     }
 

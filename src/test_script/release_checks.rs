@@ -948,6 +948,7 @@ mod tests {
                 None,
                 &[1, 2, 3],
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         observation.catalog = Some(Arc::new(synthetic));
@@ -968,6 +969,7 @@ mod tests {
                 None,
                 &[4, 5, 6],
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let entry = parent.load_one("cover.png").unwrap().unwrap();

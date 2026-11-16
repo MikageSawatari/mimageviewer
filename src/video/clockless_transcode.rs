@@ -73,7 +73,7 @@ pub struct ClocklessTranscodeOptions {
     /// Run one extra swscale operation per video frame for stage attribution. This intentionally
     /// reduces throughput and must be false for the headline real-time multiple.
     pub profile_swscale: bool,
-    /// Requested source-timeline origin for this generation.
+    /// Requested source media-time origin for this generation (not raw container PTS).
     pub source_origin_secs: f64,
     /// Runtime generation identifier used only for lifecycle diagnostics.
     pub(crate) diagnostic_generation: Option<u64>,
@@ -1201,6 +1201,7 @@ fn timed_packet(
 }
 
 struct AudioPath {
+    timeline: super::media_timeline::MediaTimeline,
     decoder: ffmpeg::decoder::Audio,
     resampler: ffmpeg::software::resampling::Context,
     time_base_secs: f64,
@@ -1211,7 +1212,11 @@ struct AudioPath {
 }
 
 impl AudioPath {
-    fn open(stream: ffmpeg::Stream<'_>, output_rate: u32) -> Result<Self, String> {
+    fn open(
+        stream: ffmpeg::Stream<'_>,
+        output_rate: u32,
+        timeline: super::media_timeline::MediaTimeline,
+    ) -> Result<Self, String> {
         let time_base = stream.time_base();
         let context = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
             .map_err(|error| format!("audio decoder context: {error}"))?;
@@ -1233,6 +1238,7 @@ impl AudioPath {
         )
         .map_err(|error| format!("audio resampler open: {error}"))?;
         Ok(Self {
+            timeline,
             decoder,
             resampler,
             time_base_secs: f64::from(time_base.numerator()) / f64::from(time_base.denominator()),
@@ -1247,7 +1253,10 @@ impl AudioPath {
         let pts = self.next_pts_secs.unwrap_or_else(|| {
             frame
                 .pts()
-                .map(|pts| pts as f64 * self.time_base_secs)
+                .map(|pts| {
+                    self.timeline
+                        .raw_to_media_secs(pts as f64 * self.time_base_secs)
+                })
                 .unwrap_or(0.0)
         });
         let delay = self
@@ -2174,6 +2183,7 @@ fn run_clockless_stream_inner(
     let open_started = Instant::now();
     let mut input = ffmpeg::format::input(&options.path)
         .map_err(|error| format!("open input {}: {error}", options.path.display()))?;
+    let media_timeline = super::media_timeline::MediaTimeline::from_input(&input);
     let times = ClocklessStageTimes {
         demux_secs: open_started.elapsed().as_secs_f64(),
         ..ClocklessStageTimes::default()
@@ -2186,7 +2196,9 @@ fn run_clockless_stream_inner(
     });
     let video_stream_index = video_stream.as_ref().map(|stream| stream.index());
     let video_time_base = video_stream.as_ref().map(|stream| stream.time_base());
-    let video_start_secs = video_stream.as_ref().map(stream_start_secs);
+    let video_start_secs = video_stream
+        .as_ref()
+        .map(|stream| stream_start_secs(stream, media_timeline));
     let frame_rate = video_stream
         .as_ref()
         .map(|stream| selected_frame_rate(stream.avg_frame_rate(), stream.rate()))
@@ -2226,7 +2238,9 @@ fn run_clockless_stream_inner(
         .flatten()
         .filter(|stream| stream.parameters().medium() == MediaType::Audio);
     let audio_stream_index = audio_stream.as_ref().map(|stream| stream.index());
-    let audio_start_secs = audio_stream.as_ref().map(stream_start_secs);
+    let audio_start_secs = audio_stream
+        .as_ref()
+        .map(|stream| stream_start_secs(stream, media_timeline));
     let source_start_secs = audio_start_secs
         .into_iter()
         .chain(video_start_secs)
@@ -2243,7 +2257,7 @@ fn run_clockless_stream_inner(
     // convert that rate as needed.
     let processing_sample_rate = audio_processing.processing_sample_rate();
     let mut audio_path = audio_stream
-        .map(|stream| AudioPath::open(stream, processing_sample_rate))
+        .map(|stream| AudioPath::open(stream, processing_sample_rate, media_timeline))
         .transpose()?;
     if options.include_audio && audio_path.is_none() {
         return Err("include_audio was requested but the input has no audio stream".to_owned());
@@ -2355,7 +2369,8 @@ fn run_clockless_stream_inner(
     });
     let mut next_video_pts = source_origin_secs;
     if source_origin_secs > source_start_secs + f64::EPSILON {
-        let target = (source_origin_secs * 1_000_000.0).round() as i64;
+        let target =
+            (media_timeline.media_to_raw_secs(source_origin_secs) * 1_000_000.0).round() as i64;
         let seek_result = unsafe {
             ffmpeg::ffi::av_seek_frame(
                 input.as_mut_ptr(),
@@ -2408,7 +2423,7 @@ fn run_clockless_stream_inner(
                 match received {
                     Ok(()) => {
                         let pts = super::decoder::video_frame_timestamp(&frame)
-                            .map(|pts| pts as f64 * video_tb_secs)
+                            .map(|pts| media_timeline.raw_to_media_secs(pts as f64 * video_tb_secs))
                             .unwrap_or(next_video_pts);
                         next_video_pts = pts
                             + f64::from(
@@ -2506,7 +2521,7 @@ fn run_clockless_stream_inner(
                 match decoder.decoder_mut().receive_frame(&mut frame) {
                     Ok(()) => {
                         let pts = super::decoder::video_frame_timestamp(&frame)
-                            .map(|pts| pts as f64 * video_tb_secs)
+                            .map(|pts| media_timeline.raw_to_media_secs(pts as f64 * video_tb_secs))
                             .unwrap_or(next_video_pts);
                         let rate = frame_rate.expect("video frames require a frame rate");
                         next_video_pts =
@@ -2704,13 +2719,18 @@ fn retained_segment_capacity(segment_capacity: usize) -> Result<usize, String> {
         })
 }
 
-fn stream_start_secs(stream: &ffmpeg::Stream<'_>) -> f64 {
+fn stream_start_secs(
+    stream: &ffmpeg::Stream<'_>,
+    timeline: super::media_timeline::MediaTimeline,
+) -> f64 {
     let start = stream.start_time();
     if start == i64::MIN {
         return 0.0;
     }
     let time_base = stream.time_base();
-    start as f64 * f64::from(time_base.numerator()) / f64::from(time_base.denominator())
+    timeline.raw_to_media_secs(
+        start as f64 * f64::from(time_base.numerator()) / f64::from(time_base.denominator()),
+    )
 }
 
 fn selected_frame_rate(
@@ -4341,6 +4361,141 @@ mod tests {
         );
     }
 
+    fn assert_remote_timeline_origin(fixture_name: &str, requested: f64, expected_origin: f64) {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata/timeline-origin")
+            .join(fixture_name);
+        let mut options = ClocklessTranscodeOptions::benchmark(fixture, 1);
+        options.hw_decode = false;
+        options.encoder =
+            EncoderPreference::Encoder(super::super::stream::encoder::H264EncoderKind::OpenH264);
+        options.quality = ClocklessQuality::Minimum;
+        options.source_origin_secs = requested;
+        options.max_source_secs = Some(2.5);
+        options.segment_capacity = 4;
+        let control = ClocklessTranscodeControl::auto_releasing(options.segment_capacity).unwrap();
+        let output = ClocklessStreamOutput::new(options.segment_capacity, requested).unwrap();
+        let report = run_clockless_stream(
+            &options,
+            &control,
+            output.clone(),
+            ClocklessAudioProcessing::default(),
+            |_| {},
+        )
+        .unwrap();
+        assert!(report.video_frames > 25, "{fixture_name}");
+        assert!(report.audio_frames > 0, "{fixture_name}");
+        let metrics = output.metrics();
+        assert_eq!(
+            metrics.source_origin_secs, expected_origin,
+            "{fixture_name}"
+        );
+        assert_eq!(
+            metrics.generated_start_secs, expected_origin,
+            "{fixture_name}"
+        );
+        assert!(
+            metrics.generated_end_secs > expected_origin + 2.0,
+            "{fixture_name}"
+        );
+
+        // Read the actual fMP4 output with the same avformat as the application;
+        // an origin reported correctly while raw PTS leak into the mux must fail.
+        let mut bytes = output.init_segment().expect("encoded init segment");
+        for sequence in 0..=metrics.latest_sequence.expect("encoded media segment") {
+            match output.segment(sequence) {
+                ClocklessSegmentBytes::Found(segment) => bytes.extend(segment),
+                other => panic!("missing encoded segment {sequence}: {other:?}"),
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("timeline-origin.mp4");
+        std::fs::write(&path, bytes).unwrap();
+        let mut input = ffmpeg::format::input(&path).unwrap();
+        let stream = input.streams().best(MediaType::Video).unwrap();
+        let video_index = stream.index();
+        let context =
+            ffmpeg::codec::context::Context::from_parameters(stream.parameters()).unwrap();
+        let mut decoder = context.decoder().video().unwrap();
+        let mut first_video_pts = None;
+        let mut first_audio_pts = None;
+        let mut first_frame = None;
+        for item in input.packets() {
+            let (stream, packet) = item.unwrap();
+            let time_base = stream.time_base();
+            let pts = packet.pts().map(|pts| {
+                pts as f64 * f64::from(time_base.numerator()) / f64::from(time_base.denominator())
+            });
+            if stream.index() == video_index {
+                first_video_pts = first_video_pts.or(pts);
+                if first_frame.is_none() {
+                    decoder.send_packet(&packet).unwrap();
+                    let mut frame = Video::empty();
+                    if decoder.receive_frame(&mut frame).is_ok() {
+                        first_frame = Some(frame);
+                    }
+                }
+            } else if stream.parameters().medium() == MediaType::Audio {
+                first_audio_pts = first_audio_pts.or(pts);
+            }
+        }
+        let relative = first_video_pts.expect("encoded video PTS");
+        assert!(
+            relative.abs() < 0.08,
+            "{fixture_name}: first video PTS {relative}"
+        );
+        let audio_relative = first_audio_pts.expect("encoded audio PTS");
+        assert!(
+            audio_relative.abs() < 0.08,
+            "{fixture_name}: first audio PTS {audio_relative}"
+        );
+        let client_position = metrics.source_origin_secs + relative;
+        assert!(
+            (client_position - expected_origin).abs() < 0.08,
+            "{fixture_name}: client position {client_position}"
+        );
+
+        // All requests address the fifth one-second colour (magenta). The
+        // negative-origin case also rejects a missing input seek conversion:
+        // seeking raw +4s would skip the requested content around raw -0.6s.
+        let frame = first_frame.expect("decoded first output video frame");
+        let mut scaler = ScaleContext::get(
+            frame.format(),
+            frame.width(),
+            frame.height(),
+            Pixel::RGB24,
+            frame.width(),
+            frame.height(),
+            ScaleFlags::BILINEAR,
+        )
+        .unwrap();
+        let mut rgb = Video::empty();
+        scaler.run(&frame, &mut rgb).unwrap();
+        let offset = rgb.stride(0) * (rgb.height() as usize / 2) + 3 * (rgb.width() as usize / 2);
+        let pixel = &rgb.data(0)[offset..offset + 3];
+        for (actual, expected) in pixel.iter().zip([255_i16, 0, 255]) {
+            assert!(
+                (i16::from(*actual) - expected).abs() <= 12,
+                "{fixture_name}: first pixel {pixel:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_timeline_origin_large_ts_seeks_media_time_and_encodes_relative_segments() {
+        assert_remote_timeline_origin("large-origin.ts", 4.0, 4.0);
+    }
+
+    #[test]
+    fn remote_timeline_origin_wrap_ts_seeks_negative_raw_locator_and_relative_segments() {
+        assert_remote_timeline_origin("wrap-origin.ts", 4.0, 4.0);
+    }
+
+    #[test]
+    fn remote_timeline_origin_positive_mkv_keeps_container_time() {
+        assert_remote_timeline_origin("positive-origin.mkv", 14.0, 14.0);
+    }
+
     #[test]
     fn finite_audio_only_fixture_uses_the_shared_clockless_hls_pipeline() {
         let temp = tempfile::tempdir().unwrap();
@@ -4497,6 +4652,7 @@ mod tests {
 
     #[test]
     fn finite_fixture_flushes_final_fragment_and_endlist() {
+        crate::test_gpu_group::assert_gpu_test_group();
         let temp = tempfile::tempdir().unwrap();
         let generated_path = temp.path().join("finite-av.avi");
         let external_path = std::env::var_os("MIV_CLOCKLESS_EOF_FIXTURE").map(PathBuf::from);
@@ -4567,6 +4723,7 @@ mod tests {
 
     #[test]
     fn finite_source_reaches_end_after_filling_the_live_window_without_a_next_fetch() {
+        crate::test_gpu_group::assert_gpu_test_group();
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("full-window-finite-av.avi");
         // 2 fps for 4.5 seconds: two complete 2-second fragments plus a finite tail. With a

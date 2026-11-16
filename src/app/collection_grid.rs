@@ -240,7 +240,11 @@ pub(in crate::app) fn prepare_collection_grid_thumbnail_sources(
     digest.update(b"miv.collection-thumbnail-sources.v2\0");
     if let Some(auto) = sources.auto_cover_crop {
         digest.update(b"auto-cover-crop\0");
-        hash_collection_thumbnail_identity_part(&mut digest, auto.suffix().as_bytes());
+        hash_collection_thumbnail_identity_part(
+            &mut digest,
+            auto.suffix_for_key(crate::thumb_loader::CACHE_KEY_FOLDER)
+                .as_bytes(),
+        );
     }
 
     let mut sidecars = sources.video_sidecars.iter().collect::<Vec<_>>();
@@ -376,6 +380,7 @@ pub(in crate::app) fn prepare_collection_grid_live_thumbnail_sources(
         folder_pin_cache.insert(
             seed.cache_key.clone(),
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Page(
                     crate::adjustment_db::normalize_path(&seed.video_path),
                 ),
@@ -6374,6 +6379,7 @@ mod tests {
                     .unwrap()
                     .into_owned(),
                 crate::catalog::CacheEntry {
+                    auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     cover: crate::cover_identity::CoverIdentity::Legacy,
                     mtime: 1,
                     file_size: 5,
@@ -11452,6 +11458,7 @@ mod tests {
                     None,
                     b"thumb",
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
         }
@@ -11465,6 +11472,7 @@ mod tests {
                 None,
                 b"removed",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         open(&mut app, normal_first);
@@ -11559,6 +11567,7 @@ mod tests {
                     None,
                     b"thumb",
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
         }
@@ -11573,6 +11582,7 @@ mod tests {
                 None,
                 b"legacy",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let snapshot =

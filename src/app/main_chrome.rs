@@ -336,6 +336,10 @@ mod tests {
     #[test]
     fn main_chrome_folder_tree_clicks_follow_common_modal_ownership() {
         let mut env = crate::app::setup_app_for_test();
+        if matches!(env.indexer_init, crate::app::IndexerInit::NotStarted) {
+            env.indexer_init = crate::app::IndexerInit::Unavailable;
+        }
+        assert!(!env.indexer_init.overlay_active());
         let destination = env.tmp.path().join("modal-tree");
         std::fs::create_dir_all(&destination).unwrap();
         env.current_folder = None;
@@ -354,8 +358,10 @@ mod tests {
             .with_size(egui::vec2(800.0, 480.0))
             .build_ui(move |root_ui| {
                 let mut app = render.borrow_mut();
+                app.input_update_begin(root_ui.ctx());
                 app.note_main_chrome_pointer_block_transition(root_ui.ctx());
                 let (path, rect) = app.render_folder_pane(root_ui);
+                app.finish_folder_pane_presentation(root_ui.ctx(), true);
                 rendered_rect.set(rect);
                 if let Some(path) = path {
                     rendered_nav.borrow_mut().push(path);
@@ -467,5 +473,477 @@ mod tests {
             });
         });
         harness.run();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum R6Menu {
+        Grid,
+        Bookmark,
+        ReadingHistory,
+    }
+
+    fn r6_menu_fixture(
+        kind: R6Menu,
+    ) -> (
+        crate::app::AppTestEnvForTest,
+        egui::Context,
+        u64,
+        std::path::PathBuf,
+    ) {
+        let mut app = crate::app::setup_app_for_test();
+        if matches!(app.indexer_init, crate::app::IndexerInit::NotStarted) {
+            app.indexer_init = crate::app::IndexerInit::Unavailable;
+        }
+        assert!(!app.indexer_init.overlay_active());
+        assert!(
+            app.main_hwnd.is_none(),
+            "the real grid-menu route must fall back before any native call"
+        );
+        let root = app.tmp.path().join("r6-menu-tree");
+        let origin = root.join("a");
+        let target = root.join("b");
+        let child = target.join("child");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        let media = origin.join("menu-source.mp4");
+        std::fs::write(&media, b"menu fixture").unwrap();
+        app.current_folder = Some(origin.clone());
+        app.install_new_items(
+            vec![crate::grid_item::GridItem::Video(media.clone())],
+            vec![None],
+        );
+        app.visible_indices = vec![0];
+        app.selected = Some(0);
+        match kind {
+            R6Menu::Grid => {}
+            R6Menu::Bookmark => {
+                app.items_are_bookmark_view = true;
+                app.current_folder = Some(crate::app::bookmark_view_synthetic_path());
+                app.top_level_grid_view.replace_surface(
+                    crate::app::top_level_grid_view::TopLevelGridSurface::Bookmarks,
+                );
+                app.bookmark_browser_rows = vec![crate::bookmark_browser::BookmarkBrowserRow {
+                    source: crate::bookmark_browser::BookmarkRowSource::Media {
+                        id: 1,
+                        path: media.clone(),
+                        pts_secs: 1.0,
+                        title: None,
+                        is_audio: false,
+                    },
+                    item: crate::grid_item::GridItem::Video(media),
+                    relative_page_provenance: None,
+                    image_meta: None,
+                    marker_thumbnail: None,
+                    created_at_ms: 0,
+                    missing: false,
+                }];
+            }
+            R6Menu::ReadingHistory => {
+                app.items_are_reading_history_view = true;
+                app.current_folder = Some(crate::app::reading_history_synthetic_path());
+                app.top_level_grid_view.replace_surface(
+                    crate::app::top_level_grid_view::TopLevelGridSurface::ReadingHistory(
+                        crate::app::top_level_grid_view::ReadingHistoryRootRestore::unavailable(),
+                    ),
+                );
+            }
+        }
+        app.settings.folder_tree_pane_visible = true;
+        app.folder_pane =
+            crate::folder_pane::FolderPaneState::test_tree(&root, vec![origin, target.clone()]);
+        app.folder_pane
+            .test_seed_listing(&target, vec![child], false);
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        crate::ime_focus::install_ime_input_policy(&ctx);
+        ctx.options_mut(|options| options.max_passes = std::num::NonZeroUsize::new(1).unwrap());
+        let mut frame = 0;
+        for _ in 0..3 {
+            assert!(r6_menu_frame(&mut app, &ctx, &mut frame, vec![]).is_none());
+        }
+        (app, ctx, frame, target)
+    }
+
+    fn r6_primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn r6_menu_layer(kind: R6Menu) -> egui::LayerId {
+        match kind {
+            R6Menu::Bookmark => egui::LayerId::new(
+                egui::Order::Middle,
+                egui::Id::unique("bookmark_grid_context_menu"),
+            ),
+            _ => egui::LayerId::new(egui::Order::Tooltip, egui::Id::unique("grid_ctx_menu")),
+        }
+    }
+
+    fn r6_tree_pos(ctx: &egui::Context, path: &std::path::Path, arrow: bool) -> egui::Pos2 {
+        let rect: egui::Rect = ctx
+            .data(|data| data.get_temp(egui::Id::unique(("folder_pane_test_label_rect", path))))
+            .unwrap();
+        if arrow {
+            egui::pos2(rect.left() - 14.0, rect.center().y)
+        } else {
+            rect.center()
+        }
+    }
+
+    fn r6_menu_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        frame: &mut u64,
+        events: Vec<egui::Event>,
+    ) -> Option<std::path::PathBuf> {
+        *frame += 1;
+        let mut nav = None;
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1600.0, 700.0),
+                )),
+                time: Some(*frame as f64 / 60.0),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.input_update_begin(ctx);
+                app.update_ime_state(ctx);
+                let (keyboard_nav, _, _) = app.input_root_keyboard(ctx);
+                assert!(keyboard_nav.is_none());
+                app.note_main_chrome_pointer_block_transition(ctx);
+                if let Some(owner) = app.context_menu_idx {
+                    assert!(
+                        app.grid_context_menu_owner_is_current(owner),
+                        "this is a live menu owner, not a stale flag"
+                    );
+                }
+                // The actual menu's outside-click retirement precedes toolbar/pane,
+                // but follows root recognition, exactly as in App::update_frame.
+                assert!(
+                    app.show_context_menu(ctx).is_none(),
+                    "the test never invokes a menu command"
+                );
+                let (toolbar_nav, address_nav) = app.render_toolbar(ui);
+                assert!(toolbar_nav.is_none() && address_nav.is_none());
+                nav = app.render_main_bars(ui, &mut None).0;
+                app.finish_folder_pane_presentation(ctx, true);
+            },
+        )
+        .drop_without_applying_deltas();
+        nav
+    }
+
+    fn r6_open_menu(
+        app: &mut App,
+        ctx: &egui::Context,
+        frame: &mut u64,
+        kind: R6Menu,
+        pos: egui::Pos2,
+    ) {
+        app.context_menu_pos = pos;
+        let owner = app.capture_grid_context_menu_owner(0);
+        assert!(app.grid_context_menu_owner_is_current(owner));
+        app.context_menu_idx = Some(owner);
+        for _ in 0..2 {
+            assert!(r6_menu_frame(app, ctx, frame, vec![]).is_none());
+        }
+        assert!(app.context_menu_idx.is_some());
+        let area = egui::AreaState::load(ctx, r6_menu_layer(kind).id)
+            .expect("the production menu Window must be painted");
+        assert!(area.interactable && area.rect().is_positive());
+    }
+
+    fn r6_outside_menu_click(kind: R6Menu, arrow: bool) {
+        let (mut app, ctx, mut frame, target) = r6_menu_fixture(kind);
+        let pos = r6_tree_pos(&ctx, &target, arrow);
+        r6_open_menu(&mut app, &ctx, &mut frame, kind, egui::pos2(800.0, 100.0));
+        let area = egui::AreaState::load(&ctx, r6_menu_layer(kind).id).unwrap();
+        assert!(!area.rect().contains(pos));
+        assert!(
+            app.folder_pane
+                .label_display
+                .as_ref()
+                .unwrap()
+                .rect
+                .contains(pos)
+        );
+        assert!(
+            r6_menu_frame(
+                &mut app,
+                &ctx,
+                &mut frame,
+                vec![egui::Event::PointerMoved(pos), r6_primary(pos, true)]
+            )
+            .is_none()
+        );
+        assert!(
+            app.context_menu_idx.is_some(),
+            "the menu is still open at the press checkpoint"
+        );
+        let nav = r6_menu_frame(&mut app, &ctx, &mut frame, vec![r6_primary(pos, false)]);
+        assert!(
+            app.context_menu_idx.is_none(),
+            "the real menu retired on this outside release"
+        );
+        if arrow {
+            assert!(nav.is_none());
+            assert!(
+                app.folder_pane
+                    .visible_rows()
+                    .iter()
+                    .any(|row| row.path == target && row.expanded),
+                "{kind:?}: outside arrow click must expand"
+            );
+        } else {
+            assert_eq!(
+                nav.as_ref(),
+                Some(&target),
+                "{kind:?}: the same outside label click must navigate"
+            );
+            assert!(
+                !app.folder_pane
+                    .visible_rows()
+                    .iter()
+                    .find(|row| row.path == target)
+                    .unwrap()
+                    .expanded
+            );
+        }
+    }
+
+    #[test]
+    fn main_chrome_r6_grid_menu_outside_label_follows_input_order() {
+        r6_outside_menu_click(R6Menu::Grid, false);
+    }
+    #[test]
+    fn main_chrome_r6_grid_menu_outside_arrow_follows_input_order() {
+        r6_outside_menu_click(R6Menu::Grid, true);
+    }
+    #[test]
+    fn main_chrome_r6_bookmark_menu_outside_label_follows_input_order() {
+        r6_outside_menu_click(R6Menu::Bookmark, false);
+    }
+    #[test]
+    fn main_chrome_r6_bookmark_menu_outside_arrow_follows_input_order() {
+        r6_outside_menu_click(R6Menu::Bookmark, true);
+    }
+    #[test]
+    fn main_chrome_r6_reading_history_menu_outside_label_follows_input_order() {
+        r6_outside_menu_click(R6Menu::ReadingHistory, false);
+    }
+    #[test]
+    fn main_chrome_r6_reading_history_menu_outside_arrow_follows_input_order() {
+        r6_outside_menu_click(R6Menu::ReadingHistory, true);
+    }
+
+    #[test]
+    fn main_chrome_r6_menu_outside_second_press_continues_name_gesture() {
+        for kind in [R6Menu::Grid, R6Menu::Bookmark, R6Menu::ReadingHistory] {
+            let (mut app, ctx, mut frame, target) = r6_menu_fixture(kind);
+            let pos = r6_tree_pos(&ctx, &target, false);
+            assert!(
+                r6_menu_frame(
+                    &mut app,
+                    &ctx,
+                    &mut frame,
+                    vec![egui::Event::PointerMoved(pos), r6_primary(pos, true)]
+                )
+                .is_none()
+            );
+            assert_eq!(
+                r6_menu_frame(&mut app, &ctx, &mut frame, vec![r6_primary(pos, false)]),
+                Some(target.clone())
+            );
+            let first_release = frame;
+            r6_open_menu(&mut app, &ctx, &mut frame, kind, egui::pos2(800.0, 100.0));
+            assert!(
+                r6_menu_frame(
+                    &mut app,
+                    &ctx,
+                    &mut frame,
+                    vec![egui::Event::PointerMoved(pos), r6_primary(pos, true)]
+                )
+                .is_none()
+            );
+            assert!(
+                (frame - first_release) as f64 / 60.0
+                    < ctx.options(|options| options.input_options.max_double_click_delay)
+            );
+            assert!(
+                app.context_menu_idx.is_some(),
+                "the menu still exists when the outside continuation is applied"
+            );
+            assert!(
+                app.folder_pane
+                    .visible_rows()
+                    .iter()
+                    .any(|row| row.path == target && row.expanded),
+                "{kind:?}: the outside second press toggles the first row"
+            );
+            assert!(
+                r6_menu_frame(&mut app, &ctx, &mut frame, vec![r6_primary(pos, false)]).is_none()
+            );
+            assert!(app.context_menu_idx.is_none());
+            assert!(
+                app.folder_pane
+                    .visible_rows()
+                    .iter()
+                    .any(|row| row.path == target && row.expanded)
+            );
+        }
+    }
+
+    #[test]
+    fn main_chrome_r6_menu_overlap_rejects_new_click_and_name_continuation() {
+        for kind in [R6Menu::Grid, R6Menu::Bookmark, R6Menu::ReadingHistory] {
+            for continuation in [false, true] {
+                for arrow in [false, true] {
+                    if continuation && arrow {
+                        continue;
+                    }
+                    let (mut app, ctx, mut frame, target) = r6_menu_fixture(kind);
+                    let pos = r6_tree_pos(&ctx, &target, arrow);
+                    if continuation {
+                        assert!(
+                            r6_menu_frame(
+                                &mut app,
+                                &ctx,
+                                &mut frame,
+                                vec![egui::Event::PointerMoved(pos), r6_primary(pos, true)]
+                            )
+                            .is_none()
+                        );
+                        assert_eq!(
+                            r6_menu_frame(&mut app, &ctx, &mut frame, vec![r6_primary(pos, false)]),
+                            Some(target.clone())
+                        );
+                    }
+                    // Aim at the Window frame, then prove the actual capture
+                    // is non-command before delivering a release. Geometry or
+                    // sharing the menu layer alone is not a safety guarantee.
+                    r6_open_menu(&mut app, &ctx, &mut frame, kind, pos - egui::vec2(2.0, 2.0));
+                    let layer = r6_menu_layer(kind);
+                    assert_eq!(ctx.layer_id_at(pos), Some(layer));
+                    assert!(
+                        r6_menu_frame(
+                            &mut app,
+                            &ctx,
+                            &mut frame,
+                            vec![egui::Event::PointerMoved(pos), r6_primary(pos, true)]
+                        )
+                        .is_none()
+                    );
+                    let witnesses = ctx.pointer_button_targets();
+                    assert_eq!(witnesses.len(), 1);
+                    assert!(
+                        witnesses[0].3.is_none_or(|widget| ctx
+                            .read_response(widget)
+                            .is_some_and(|response| response.layer_id == layer)),
+                        "capture belongs to the real menu, never the tree"
+                    );
+                    if let Some(widget) = witnesses[0].3 {
+                        let response = ctx
+                            .read_response(widget)
+                            .expect("captured widget must still have a response");
+                        // Area::begin registers its background/move widget as
+                        // layer_id.id.with("move"). That widget only moves or
+                        // raises the Area; it is not a menu-command button.
+                        // A non-CLICK widget is also incapable of dispatching a
+                        // button command. Refuse the release for every other id.
+                        let safe_background = widget == layer.id.with("move");
+                        assert!(
+                            safe_background || !response.sense.senses_click(),
+                            "refuse release on a possible command: widget={widget:?} layer={:?} sense={:?}",
+                            response.layer_id,
+                            response.sense
+                        );
+                    }
+                    assert!(
+                        !app.folder_pane
+                            .visible_rows()
+                            .iter()
+                            .find(|row| row.path == target)
+                            .unwrap()
+                            .expanded
+                    );
+                    assert!(!app.folder_pane.label_gesture_requires_tree_focus());
+                    assert!(
+                        r6_menu_frame(&mut app, &ctx, &mut frame, vec![r6_primary(pos, false)])
+                            .is_none()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn main_chrome_r6_menu_owner_started_after_input_does_not_block_tree_results() {
+        for result in ["single", "arrow", "toggle"] {
+            let (mut app, ctx, mut frame, target) = r6_menu_fixture(R6Menu::Grid);
+            let pos = r6_tree_pos(&ctx, &target, result == "arrow");
+            assert!(
+                r6_menu_frame(
+                    &mut app,
+                    &ctx,
+                    &mut frame,
+                    vec![egui::Event::PointerMoved(pos), r6_primary(pos, true)]
+                )
+                .is_none()
+            );
+            if result == "toggle" {
+                assert_eq!(
+                    r6_menu_frame(&mut app, &ctx, &mut frame, vec![r6_primary(pos, false)]),
+                    Some(target.clone())
+                );
+            }
+            frame += 1;
+            let mut nav = None;
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1600.0, 700.0),
+                    )),
+                    time: Some(frame as f64 / 60.0),
+                    events: vec![r6_primary(pos, result == "toggle")],
+                    ..Default::default()
+                },
+                |ui| {
+                    app.input_update_begin(&ctx);
+                    app.update_ime_state(&ctx);
+                    let _ = app.input_root_keyboard(&ctx);
+                    assert!(app.show_context_menu(&ctx).is_none());
+                    let _ = app.render_toolbar(ui);
+                    // A later producer can reserve a menu after the menu-drawing
+                    // checkpoint. Its existence must not reject accepted chrome input.
+                    app.context_menu_pos = egui::pos2(800.0, 100.0);
+                    let owner = app.capture_grid_context_menu_owner(0);
+                    assert!(app.grid_context_menu_owner_is_current(owner));
+                    app.context_menu_idx = Some(owner);
+                    nav = app.render_main_bars(ui, &mut None).0;
+                    app.finish_folder_pane_presentation(&ctx, true);
+                },
+            )
+            .drop_without_applying_deltas();
+            if result == "single" {
+                assert_eq!(nav, Some(target.clone()));
+            } else {
+                assert!(nav.is_none());
+                assert!(
+                    app.folder_pane
+                        .visible_rows()
+                        .iter()
+                        .any(|row| row.path == target && row.expanded),
+                    "menu existence must not block {result} application"
+                );
+            }
+        }
     }
 }

@@ -37,7 +37,20 @@ pub(crate) const SNS_SPLIT_EXPORT_BUTTON_GUIDANCE: &str =
     "SNS 分割の書き出しはパネルの「分割して書き出す」から実行してください";
 const SNS_SPLIT_TOO_SMALL_REASON: &str =
     "画像が小さすぎるため、選択した枚数を配置できません。書き出しには進めません。";
-const SNS_SPLIT_INSTAGRAM_RATIO_REASON: &str = "Instagram はこの比率を切り取ります。枠の比率を 3:4 〜 1.91:1 に収めるか、投稿先を X にしてください";
+const SNS_SPLIT_INSTAGRAM_RATIO_REASON: &str = "Instagram はこの比率を切り取ります。枚数を減らすか、枠の比率を 3:4 〜 1.91:1 に収めるか、投稿先を X にしてください";
+
+/// `label_width_at_max` is the measured width at 22pt. Reserve room for
+/// the frame stroke and the 1pt shadow on both sides of the centered label.
+fn sns_split_number_font_size(frame_width: f32, label_width_at_max: f32) -> Option<f32> {
+    if !frame_width.is_finite()
+        || !label_width_at_max.is_finite()
+        || label_width_at_max <= 0.0
+        || frame_width < 8.0 + label_width_at_max * 9.0 / 22.0
+    {
+        return None;
+    }
+    Some((22.0 * (frame_width - 8.0) / label_width_at_max).clamp(9.0, 22.0))
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SnsSplitEntryError {
@@ -79,10 +92,12 @@ fn sns_split_instagram_ratio_is_out_of_range(
     if layout.target != SnsTarget::Instagram {
         return false;
     }
-    let (_, _, width, height) = layout.frames()[0].pixel_bounds(image_size[0], image_size[1]);
-    let width = width as u128;
-    let height = height as u128;
-    width * 4 < height * 3 || width * 100 > height * 191
+    layout.frames().iter().any(|frame| {
+        let (_, _, width, height) = frame.pixel_bounds(image_size[0], image_size[1]);
+        let width = width as u128;
+        let height = height as u128;
+        width * 4 < height * 3 || width * 100 > height * 191
+    })
 }
 
 fn sns_split_export_disabled_reason(
@@ -228,7 +243,7 @@ enum SnsSplitVerticalAnchor {
     Max,
 }
 
-/// 理論上の group aspect を整数化したあと、先頭の実枠がプリセット比率へ最も
+/// 理論上の group aspect を整数化したあと、いちばん細い実枠がプリセット比率へ最も
 /// 近くなる整数高さへ揃える。割り切れない横幅でも 3:4 プリセット自身が
 /// Instagram の 0.75 下限を丸め誤差だけで外れないよう、判定と同じ実枠を正にする。
 fn snap_fixed_frame_height(
@@ -240,13 +255,18 @@ fn snap_fixed_frame_height(
     let Some((ratio_width, ratio_height)) = frame_ratio.frame_ratio_parts() else {
         return layout;
     };
-    let first_frame_width = layout.frames()[0].width().round().max(1.0) as usize;
+    let narrowest_frame_width = layout
+        .frames()
+        .iter()
+        .map(|frame| frame.pixel_bounds(image_size[0], image_size[1]).2)
+        .min()
+        .unwrap_or(1);
     // 固定プリセットはすべて 3:4 以上だが、最近傍への整数丸めだけで実枠が
     // 0.75 未満になる場合がある (3k+2 px の 3:4 や極小の 4:5)。幅は保ち、
     // Instagram 下限を満たす最大整数高さへ内側から制限する。
-    let height_numerator = first_frame_width as u128 * ratio_height;
+    let height_numerator = narrowest_frame_width as u128 * ratio_height;
     let nearest_height = (height_numerator + ratio_width / 2) / ratio_width;
-    let instagram_safe_height = first_frame_width as u128 * 4 / 3;
+    let instagram_safe_height = narrowest_frame_width as u128 * 4 / 3;
     let desired_height = nearest_height
         .min(instagram_safe_height)
         .max(1)
@@ -825,7 +845,18 @@ impl App {
             self.show_context_shortcuts_help = true;
             return action;
         }
-        if ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        if self
+            .keyboard_owner_for_pass(ctx)
+            .fullscreen_raw_key_permit()
+            .is_some_and(|permit| {
+                crate::keyboard_input::consume_fullscreen_raw_key(
+                    ctx,
+                    permit,
+                    egui::Modifiers::NONE,
+                    egui::Key::Escape,
+                )
+            })
+        {
             if !self.finish_sns_split_drag(crate::ui_crop::OverlayDragEnd::Escape) {
                 self.reset_sns_split_mode();
             }
@@ -1041,13 +1072,34 @@ impl App {
         );
 
         ui.add_space(6.0);
-        ui.label("枚数");
+        let count_label = ui.label("枚数");
         let mut count = layout.count;
-        ui.horizontal(|ui| {
-            for option in MIN_COUNT..=MAX_COUNT {
-                ui.selectable_value(&mut count, option, option.to_string());
-            }
-        });
+        let count_response = ui
+            .horizontal(|ui| {
+                let value_width = egui::WidgetText::from(format!("{MAX_COUNT} 枚"))
+                    .into_galley(
+                        ui,
+                        Some(egui::TextWrapMode::Extend),
+                        f32::INFINITY,
+                        egui::FontSelection::Default,
+                    )
+                    .size()
+                    .x;
+                ui.spacing_mut().slider_width =
+                    (ui.available_width() - value_width - ui.spacing().item_spacing.x).max(0.0);
+                let response = ui
+                    .add(
+                        egui::Slider::new(&mut count, MIN_COUNT..=MAX_COUNT)
+                            .step_by(1.0)
+                            .show_value(false),
+                    )
+                    .labelled_by(count_label.id);
+                ui.add(
+                    egui::Label::new(format!("{count} 枚")).wrap_mode(egui::TextWrapMode::Extend),
+                );
+                response
+            })
+            .inner;
 
         let target_changed = target != layout.target;
         let count_changed = count != layout.count;
@@ -1056,7 +1108,9 @@ impl App {
         } else {
             layout.seam_permille
         };
-        let mut persist_settings = target_changed || count_changed;
+        let mut persist_settings = target_changed
+            || count_response.drag_stopped()
+            || (count_response.changed() && !count_response.dragged());
         let seam_choice_id = ui.make_persistent_id("sns_split_seam_choice");
         let mut seam_choice = if target_changed {
             SnsSplitSeamChoice::from_permille(seam_permille)
@@ -1107,6 +1161,7 @@ impl App {
                         .suffix("%"),
                 )
                 .labelled_by(seam_label.id);
+            crate::ime_focus::track_drag_value_focus(&response);
             if response.changed() {
                 seam_permille = (seam_percent * 10.0)
                     .round()
@@ -1243,20 +1298,32 @@ impl App {
                 corners.iter().map(|point| point.x).sum::<f32>() * 0.25,
                 corners.iter().map(|point| point.y).sum::<f32>() * 0.25,
             );
-            painter.text(
-                center + egui::vec2(1.0, 1.0),
-                egui::Align2::CENTER_CENTER,
-                (index + 1).to_string(),
-                egui::FontId::proportional(22.0),
-                egui::Color32::BLACK,
-            );
-            painter.text(
-                center,
-                egui::Align2::CENTER_CENTER,
-                (index + 1).to_string(),
-                egui::FontId::proportional(22.0),
-                egui::Color32::WHITE,
-            );
+            let label = (index + 1).to_string();
+            let label_width = painter
+                .layout_no_wrap(
+                    label.clone(),
+                    egui::FontId::proportional(22.0),
+                    egui::Color32::WHITE,
+                )
+                .size()
+                .x;
+            let frame_width = corners[0].distance(corners[1]);
+            if let Some(font_size) = sns_split_number_font_size(frame_width, label_width) {
+                painter.text(
+                    center + egui::vec2(1.0, 1.0),
+                    egui::Align2::CENTER_CENTER,
+                    &label,
+                    egui::FontId::proportional(font_size),
+                    egui::Color32::BLACK,
+                );
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    &label,
+                    egui::FontId::proportional(font_size),
+                    egui::Color32::WHITE,
+                );
+            }
         }
 
         let handle_bounds = transform.viewport_rect.shrink(14.0);
@@ -1555,7 +1622,15 @@ mod tests {
                                 ..Default::default()
                             },
                             |ctx| {
-                                app.handle_sns_split_keys(ctx, 0);
+                                let action = app.handle_fs_key_input(ctx, 0, false);
+                                assert!(!action.close);
+                                app.draw_sns_split_panel(
+                                    ctx,
+                                    0,
+                                    ctx.content_rect(),
+                                    Some(size),
+                                    None,
+                                );
                             },
                         )
                         .drop_without_applying_deltas();
@@ -1878,6 +1953,44 @@ mod tests {
     }
 
     #[test]
+    fn sns_split_number_size_fits_one_and_two_digit_labels() {
+        // Representative measured widths for "1" and "20" at 22pt.
+        for label_width in [12.0, 25.0] {
+            assert_eq!(sns_split_number_font_size(100.0, label_width), Some(22.0));
+            let narrow_width = 8.0 + label_width * 12.0 / 22.0;
+            let size = sns_split_number_font_size(narrow_width, label_width).unwrap();
+            assert!((size - 12.0).abs() < 0.001);
+            assert!(size * label_width / 22.0 <= narrow_width - 8.0 + 0.001);
+            assert_eq!(
+                sns_split_number_font_size(8.0 + label_width * 9.0 / 22.0, label_width),
+                Some(9.0)
+            );
+            assert_eq!(
+                sns_split_number_font_size(8.0 + label_width * 8.9 / 22.0, label_width),
+                None
+            );
+        }
+        assert_eq!(sns_split_number_font_size(0.0, 25.0), None);
+    }
+
+    #[test]
+    fn sns_split_twenty_frame_preview_stays_inside_bounds_with_one_pixel_seams() {
+        let layout = SnsSplitLayout::centered_max(SnsTarget::X, 20, [1536, 1024]);
+        assert_eq!(layout.seam_permille, 17);
+        let bounds =
+            egui::Rect::from_min_size(egui::pos2(11.0, 17.0), egui::vec2(216.0, PREVIEW_H));
+        let rects = sns_split_preview_rects(bounds, &layout.frames(), layout.seam_ratio());
+        assert_eq!(rects.len(), 20);
+        for rect in &rects {
+            assert!(rect.width() > 0.0 && rect.height() > 0.0);
+            assert!(bounds.expand(0.001).contains_rect(*rect));
+        }
+        for pair in rects.windows(2) {
+            assert!((pair[1].left() - pair[0].right() - MIN_PREVIEW_SEAM).abs() < 0.001);
+        }
+    }
+
+    #[test]
     fn preview_rects_match_count_size_minimum_seam_and_bounds() {
         let layout = SnsSplitLayout::centered_max(SnsTarget::X, 4, [2400, 1800]);
         let frames = layout.frames();
@@ -2011,17 +2124,69 @@ mod tests {
                     return;
                 }
                 egui::CentralPanel::default().show(root_ui, |ui| {
-                    ui.set_max_width(320.0);
-                    let _ = app_for_ui
-                        .borrow_mut()
-                        .draw_sns_split_controls(ui, image_size, None);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(PANEL_W - 24.0, ui.available_height()),
+                        egui::Layout::top_down(egui::Align::LEFT),
+                        |ui| {
+                            ui.set_max_width(PANEL_W - 24.0);
+                            assert!(ui.available_width() <= PANEL_W - 24.0 + 0.5);
+                            let _ = app_for_ui
+                                .borrow_mut()
+                                .draw_sns_split_controls(ui, image_size, None);
+                        },
+                    );
                 });
             });
         harness.run();
 
+        let count_slider = harness
+            .get_by_role_and_label(egui::accesskit::Role::Slider, "枚数")
+            .rect();
+        assert!(count_slider.right() <= PANEL_W);
+        assert!(count_slider.width() >= (PANEL_W - 24.0) * 0.7);
         assert!(
             harness
-                .query_by_role(egui::accesskit::Role::SpinButton)
+                .query_by_role_and_label(egui::accesskit::Role::SpinButton, "枚数")
+                .is_none()
+        );
+        assert!(harness.query_by_label("3 枚").is_some());
+        let original_group = app.borrow().sns_split.unwrap().group;
+        harness.hover_at(count_slider.center());
+        harness.drag_at(count_slider.center());
+        harness.run();
+        harness.hover_at(count_slider.right_center());
+        harness.run();
+        assert_eq!(app.borrow().sns_split.unwrap().count, 20);
+        assert_eq!(app.borrow().settings.sns_split_count, 20);
+        assert_eq!(app.borrow().sns_split.unwrap().group, original_group);
+        let count_value = harness.get_by_label("20 枚").rect();
+        assert!(count_value.left() >= count_slider.right());
+        assert!(count_value.right() <= PANEL_W);
+        assert!(count_value.right() <= count_slider.left() + PANEL_W - 24.0 + 0.5);
+        assert!((count_value.center().y - count_slider.center().y).abs() < 1.0);
+        harness.drop_at(count_slider.right_center());
+        harness.run();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Slider, "枚数")
+            .focus();
+        harness.run();
+        for expected in (3..20).rev() {
+            harness.key_press(egui::Key::ArrowLeft);
+            harness.run();
+            assert_eq!(app.borrow().sns_split.unwrap().count, expected);
+            assert_eq!(app.borrow().settings.sns_split_count, expected);
+            assert!(harness.query_by_label(&format!("{expected} 枚")).is_some());
+            assert!(
+                harness
+                    .query_by_role_and_label(egui::accesskit::Role::SpinButton, "枚数")
+                    .is_none()
+            );
+        }
+        assert_eq!(app.borrow().settings.sns_split_count, 3);
+
+        assert!(
+            harness
+                .query_by_role_and_label(egui::accesskit::Role::SpinButton, "継ぎ目")
                 .is_none(),
             "preset seams must not show the custom numeric editor"
         );
@@ -2031,13 +2196,13 @@ mod tests {
         assert_eq!(app.borrow().settings.sns_split_seam_permille, 10);
         assert!(
             harness
-                .query_by_role(egui::accesskit::Role::SpinButton)
+                .query_by_role_and_label(egui::accesskit::Role::SpinButton, "継ぎ目")
                 .is_some(),
             "custom seam must show the numeric editor"
         );
 
         let spin_center = harness
-            .get_by_role(egui::accesskit::Role::SpinButton)
+            .get_by_role_and_label(egui::accesskit::Role::SpinButton, "継ぎ目")
             .rect()
             .center();
         harness.hover_at(spin_center);
@@ -2049,7 +2214,7 @@ mod tests {
         assert_eq!(app.borrow().sns_split.unwrap().seam_permille, 17);
         assert!(
             harness
-                .query_by_role(egui::accesskit::Role::SpinButton)
+                .query_by_role_and_label(egui::accesskit::Role::SpinButton, "継ぎ目")
                 .is_some(),
             "custom editor must stay mounted while its drag crosses 1.7%"
         );
@@ -2075,11 +2240,15 @@ mod tests {
         assert_eq!(app.borrow().settings.sns_split_seam_permille, 0);
         assert!(
             harness
-                .query_by_role(egui::accesskit::Role::SpinButton)
+                .query_by_role_and_label(egui::accesskit::Role::SpinButton, "継ぎ目")
                 .is_none()
         );
 
-        harness.get_by_label("4").click();
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Slider, "枚数")
+            .focus();
+        harness.run();
+        harness.key_press(egui::Key::ArrowRight);
         harness.run();
         harness.get_by_label("1:1").click();
         harness.run();
@@ -2297,9 +2466,19 @@ mod tests {
         let two = transition_count(initial, 2);
         let baseline = transition_count(two, 4);
         assert_eq!(center_cell(baseline), center_cell(initial));
+        // The narrowest actual frame is 205px; its nearest 4:5 height is
+        // 256px. Keep the full round-trip invariants below after this snap.
+        assert_eq!(
+            baseline
+                .frames()
+                .iter()
+                .map(|frame| frame.width())
+                .fold(f32::INFINITY, f32::min),
+            205.0
+        );
         assert_eq!(
             [baseline.group.width(), baseline.group.height()],
-            [877.0, 257.0]
+            [877.0, 256.0]
         );
 
         let mut repeated = baseline;
@@ -2342,6 +2521,7 @@ mod tests {
     fn fixed_presets_stay_inside_instagram_limit_after_integer_rounding() {
         let cases = [
             ([834, 1000], 3, SnsFrameRatio::Ratio3x4, [278, 370]),
+            ([836, 1000], 3, SnsFrameRatio::Ratio3x4, [279, 370]),
             ([4, 3], 2, SnsFrameRatio::Ratio4x5, [2, 2]),
             (
                 [12_582_916, 8_388_611],
@@ -2363,6 +2543,36 @@ mod tests {
             assert_eq!([frame_width, frame_height], expected_frame_size);
             assert!(frame_width as u128 * 4 >= frame_height as u128 * 3);
             assert_eq!(sns_split_export_disabled_reason(layout, image_size), None);
+        }
+    }
+
+    #[test]
+    fn fixed_presets_pass_all_instagram_frames_for_every_count() {
+        for count in crate::sns_split::MIN_COUNT..=crate::sns_split::MAX_COUNT {
+            for ratio in [
+                SnsFrameRatio::Ratio3x4,
+                SnsFrameRatio::Ratio4x5,
+                SnsFrameRatio::Ratio1x1,
+            ] {
+                for image_size in [
+                    [836, 1000],
+                    [832, 1216],
+                    [1921, 1081],
+                    [41, 100],
+                    [1001, 37],
+                ] {
+                    let layout = fit_sns_split_to_full_image(
+                        SnsSplitLayout::centered_max(SnsTarget::Instagram, count, image_size),
+                        ratio,
+                        image_size,
+                    );
+                    assert_eq!(
+                        sns_split_export_disabled_reason(layout, image_size),
+                        None,
+                        "{image_size:?}, count={count}, {ratio:?}: {layout:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -2535,7 +2745,7 @@ mod tests {
     }
 
     #[test]
-    fn instagram_ratio_check_uses_the_first_actual_frame_when_widths_differ() {
+    fn instagram_ratio_check_rejects_a_wider_middle_frame() {
         let image_size = [574, 100];
         let layout = SnsSplitLayout::centered_max(SnsTarget::Instagram, 3, image_size);
         let frames = layout.frames();
@@ -2547,7 +2757,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![191, 192, 191]
         );
-        assert_eq!(sns_split_export_disabled_reason(layout, image_size), None);
+        assert_eq!(
+            sns_split_export_disabled_reason(layout, image_size),
+            Some(SNS_SPLIT_INSTAGRAM_RATIO_REASON)
+        );
+    }
+
+    #[test]
+    fn instagram_ratio_check_rejects_a_narrower_middle_frame() {
+        let image_size = [836, 372];
+        let layout = SnsSplitLayout::centered_max(SnsTarget::Instagram, 3, image_size);
+        let widths: Vec<_> = layout
+            .frames()
+            .iter()
+            .map(|frame| frame.pixel_bounds(image_size[0], image_size[1]).2)
+            .collect();
+        assert_eq!(widths, [279, 278, 279]);
+        assert_eq!(
+            sns_split_export_disabled_reason(layout, image_size),
+            Some(SNS_SPLIT_INSTAGRAM_RATIO_REASON)
+        );
     }
 
     #[test]
@@ -2581,6 +2810,41 @@ mod tests {
         let summary = SnsSplitPanelSummary::from_layout(layout, image_size);
 
         assert_eq!(summary.warning, Some(SNS_SPLIT_INSTAGRAM_RATIO_REASON));
+    }
+
+    #[test]
+    fn minimum_group_width_rejection_uses_the_shared_too_small_reason() {
+        for target in SnsTarget::ALL {
+            for width in [14, 15] {
+                let image_size = [width, 1];
+                let layout = SnsSplitLayout {
+                    target,
+                    count: 13,
+                    seam_permille: 100,
+                    group: CropRect::full(width, 1),
+                }
+                .clamped(image_size);
+                let fits = width == 15;
+                assert_eq!(layout.fits(image_size), fits);
+                // Width 15 can place every frame, but some are 2x1: the
+                // all-frame Instagram check must reject those wide frames.
+                let expected_reason = if !fits {
+                    Some(SNS_SPLIT_TOO_SMALL_REASON)
+                } else if target == SnsTarget::Instagram {
+                    Some(SNS_SPLIT_INSTAGRAM_RATIO_REASON)
+                } else {
+                    None
+                };
+                assert_eq!(
+                    sns_split_export_disabled_reason(layout, image_size),
+                    expected_reason
+                );
+                assert_eq!(
+                    SnsSplitPanelSummary::from_layout(layout, image_size).warning,
+                    expected_reason
+                );
+            }
+        }
     }
 
     #[test]

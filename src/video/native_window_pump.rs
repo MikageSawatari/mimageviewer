@@ -3535,6 +3535,7 @@ mod tests {
     #[test]
     #[ignore = "requires Windows DComp hardware; runs in a watchdog subprocess"]
     fn production_parent_destroy_remains_bounded_during_render_stall() {
+        crate::test_gpu_group::assert_gpu_test_group();
         if std::env::var_os(STALL_CHILD_ENV).is_some() {
             run_production_parent_destroy_child();
             return;

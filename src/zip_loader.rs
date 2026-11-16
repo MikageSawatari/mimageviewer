@@ -2974,7 +2974,7 @@ pub(crate) fn read_cover_auto_page_prefixes(
     zip_path: &Path,
     leaf_entry: &str,
     prefix: Option<&str>,
-) -> std::io::Result<Vec<(String, Vec<u8>)>> {
+) -> std::io::Result<Vec<(String, Option<Vec<u8>>)>> {
     if crate::rar_loader::is_rar_path(zip_path) || split_nested_zip_path(leaf_entry).len() > 1 {
         return Ok(Vec::new());
     }
@@ -3015,15 +3015,15 @@ pub(crate) fn read_cover_auto_page_prefixes(
     let mut prefixes = Vec::new();
     for index in crate::cover_auto_sample::sample_indices(names.len(), leaf_index) {
         let name = &names[index].1;
-        if let Ok(bytes) = read_prefix_by_name(
+        let bytes = read_prefix_by_name(
             &mut archive,
             name,
             None,
             crate::cover_auto_sample::MAX_SAMPLE_PREFIX_BYTES,
             None,
-        ) {
-            prefixes.push((name.clone(), bytes));
-        }
+        )
+        .ok();
+        prefixes.push((name.clone(), bytes));
     }
     Ok(prefixes)
 }

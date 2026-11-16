@@ -383,6 +383,7 @@ fn section1741_prepare_loads_search_catalog_instead_of_origin_catalog() {
             None,
             &[1, 2, 3],
             &crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let origin = request
@@ -399,6 +400,7 @@ fn section1741_prepare_loads_search_catalog_instead_of_origin_catalog() {
             None,
             &[4, 5, 6],
             &crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let owner = SearchThumbnailOwner::Prepare {

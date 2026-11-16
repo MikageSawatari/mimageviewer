@@ -2321,7 +2321,11 @@ impl App {
         path: &std::path::Path,
     ) -> Option<crate::video::native_presenter::NativeOverlayTileThumbnail> {
         let key = crate::adjustment_db::normalize_path(path);
-        let pts = *self.settings.video_resume_positions.get(&key)?;
+        let pts = *self
+            .settings
+            .video_resume_positions
+            .get(&key)?
+            .stored_secs();
         if !pts.is_finite() || pts < super::VIDEO_RESUME_MIN_POSITION_SECS {
             return None;
         }
@@ -17020,9 +17024,10 @@ mod configurable_video_seek_dispatch_tests {
             .recv_timeout(Duration::from_secs(10))
             .unwrap()
             .unwrap();
-        app.settings
-            .video_resume_positions
-            .insert("keep-media".into(), 42.0);
+        app.settings.video_resume_positions.insert(
+            "keep-media".into(),
+            crate::settings::VideoResumePosition::Media(42.0),
+        );
         let mut repeat = native_key(0x7f, false, false);
         repeat.repeat = true;
         assert!(!matches!(
@@ -17030,7 +17035,10 @@ mod configurable_video_seek_dispatch_tests {
             NativeVideoKeyOutcome::Action(KeyAction::ClearVideoMediaMemory)
         ));
         assert_eq!(
-            app.settings.video_resume_positions.get("keep-media"),
+            app.settings
+                .video_resume_positions
+                .get("keep-media")
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&42.0)
         );
         assert!(matches!(
@@ -17047,7 +17055,10 @@ mod configurable_video_seek_dispatch_tests {
         app.poll_book_resume_meters(&ctx);
         assert_eq!(app.book_resume_db.as_ref().unwrap().count(), 0);
         assert_eq!(
-            app.settings.video_resume_positions.get("keep-media"),
+            app.settings
+                .video_resume_positions
+                .get("keep-media")
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&42.0)
         );
         // Reading again after clearing remains enabled; media clear must leave it alone.

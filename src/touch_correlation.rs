@@ -1257,6 +1257,48 @@ impl DiagnosticDriveKind {
     }
 }
 
+#[derive(Clone)]
+struct PrimaryPointerObservation {
+    pass: u64,
+    state: TouchCorrelationState,
+    frame: TouchFrame,
+}
+
+/// Observe pointer provenance without claiming a grid scope or its first commands.
+/// This private transport uses the same backend-signature correlation as the grid,
+/// but never consumes input or publishes gesture commands to a viewer.
+pub(crate) fn observe_primary_pointer_provenance(ctx: &egui::Context) -> TouchFrame {
+    let pass = ctx.cumulative_pass_nr();
+    let viewport = ctx.viewport_id();
+    let (events, now_ms) = input_events_and_time(ctx);
+    ctx.data_mut(|data| {
+        let id = egui::Id::unique(("folder_pane_pointer_provenance", viewport));
+        let previous = data.get_temp::<PrimaryPointerObservation>(id);
+        if let Some(previous) = &previous
+            && previous.pass == pass
+        {
+            return previous.frame.clone();
+        }
+        let mut state = previous.map(|previous| previous.state).unwrap_or_default();
+        let geometry = TapZoneGeometry {
+            surface: egui::Rect::NOTHING,
+            excluded: Vec::new(),
+            behavior: crate::touch_input::TouchSurfaceBehavior::Grid,
+        };
+        let (frame, _) =
+            state.process_frame_with_diagnostics(&geometry, &events, now_ms, false, false);
+        data.insert_temp(
+            id,
+            PrimaryPointerObservation {
+                pass,
+                state,
+                frame: frame.clone(),
+            },
+        );
+        frame
+    })
+}
+
 /// Drive correlation once for the active surface and app frame.
 ///
 /// `MainGrid` is called only from the grid `CentralPanel`; `StillFullscreen`
@@ -1835,6 +1877,103 @@ mod tests {
     use super::*;
     use crate::touch_input::TouchOwner;
     use egui::{Modifiers, Rect, TouchDeviceId, pos2};
+
+    #[test]
+    fn folder_pane_provenance_does_not_claim_grid_scope_or_first_commands() {
+        let ctx = egui::Context::default();
+        let scope = egui::Id::unique("provenance-grid-scope");
+        let pos = pos2(500.0, 400.0);
+        let moved = pos2(500.0, 330.0);
+        let mut events = grid_start(1, pos);
+        events.extend([
+            touch(1, egui::TouchPhase::Move, moved),
+            Event::PointerMoved(moved),
+        ]);
+        ctx.run_pass(
+            egui::RawInput {
+                events: events.clone(),
+                time: Some(0.1),
+                ..Default::default()
+            },
+            |ctx| {
+                let witnesses = ctx.pointer_button_targets();
+                let observed = observe_primary_pointer_provenance(ctx);
+                assert!(observed.grid_primary_edge(0, true).touch_derived);
+                assert!(observed.commands().is_empty());
+                assert_eq!(observe_primary_pointer_provenance(ctx), observed);
+                assert_eq!(ctx.pointer_button_targets(), witnesses);
+                assert_eq!(ctx.input(|input| input.events.clone()), events);
+                let grid = drive_egui_grid_touch_input(ctx, grid_geometry(), scope, true);
+                assert!(
+                    !grid.grid_commands(scope).is_empty(),
+                    "the first grid commands must remain available"
+                );
+                let state = ctx
+                    .data(|data| {
+                        data.get_temp::<TouchCorrelationState>(state_id(
+                            egui::ViewportId::ROOT,
+                            TouchSurface::MainGrid,
+                        ))
+                    })
+                    .unwrap();
+                assert_eq!(state.recognition.scope(), CommandScope::MainGrid(scope));
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn folder_pane_provenance_correlates_touch_release_across_passes() {
+        let ctx = egui::Context::default();
+        let pos = pos2(500.0, 400.0);
+        ctx.run_pass(
+            egui::RawInput {
+                events: grid_start(1, pos),
+                time: Some(0.1),
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(
+                    observe_primary_pointer_provenance(ctx)
+                        .grid_primary_edge(0, true)
+                        .touch_derived
+                );
+            },
+        )
+        .drop_without_applying_deltas();
+        ctx.run_pass(
+            egui::RawInput {
+                events: vec![
+                    touch(1, egui::TouchPhase::End, pos),
+                    primary(pos, false),
+                    Event::PointerGone,
+                ],
+                time: Some(0.2),
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(
+                    observe_primary_pointer_provenance(ctx)
+                        .grid_primary_edge(0, false)
+                        .touch_derived
+                );
+            },
+        )
+        .drop_without_applying_deltas();
+        ctx.run_pass(
+            egui::RawInput {
+                events: mouse_click(pos),
+                time: Some(0.3),
+                ..Default::default()
+            },
+            |ctx| {
+                let observed = observe_primary_pointer_provenance(ctx);
+                assert!(observed.grid_primary_edge(0, true).ordinary_mouse);
+                assert!(observed.grid_primary_edge(0, false).ordinary_mouse);
+            },
+        )
+        .drop_without_applying_deltas();
+    }
 
     fn geometry() -> TapZoneGeometry {
         TapZoneGeometry {

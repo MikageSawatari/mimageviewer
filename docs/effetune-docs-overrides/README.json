@@ -82,5 +82,11 @@
     "anchor": "バックアップを共有する前に、選択内容を確認してください。プリセット名やコメント、元のインパルス応答ファイル、測定の詳細が含まれることがあります。音楽ファイル、Music Libraryのデータ、アプリの設定、デバイスの選択、URLルール、認証情報、保存していない現在のパイプラインは含まれません。",
     "replacement": "バックアップを共有する前に、選択内容を確認してください。プリセット名やコメント、元のインパルス応答ファイル、測定の詳細が含まれることがあります。音楽ファイル、アプリの設定、保存していない現在のパイプラインは含まれません。",
     "reason": "Retain privacy guidance without unavailable standalone storage categories."
+  },
+  {
+    "operation": "replace_inline",
+    "anchor": "選び方、入力レベルの調整、処理済みファイルの書き出しは[マスタリングプリセット](mastering-presets.md)をご覧ください。",
+    "replacement": "選び方や入力レベルの調整は[マスタリングプリセット](mastering-presets.md)をご覧ください。",
+    "reason": "Retain the new mastering guide link without advertising standalone offline export."
   }
 ]

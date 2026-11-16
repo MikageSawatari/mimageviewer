@@ -561,7 +561,7 @@ pub(crate) fn decide_strip_axis(keyframes: &[f64], duration_secs: f64) -> StripA
     }
 }
 
-/// コンテナ索引からキーフレーム seek timestamp を秒単位で列挙する。
+/// コンテナ索引からキーフレーム seek timestamp をメディア秒で列挙する。
 ///
 /// `AVIndexEntry.timestamp` は presentation PTS とは限らない。thumbnail worker は要求窓の
 /// key packet を復号するときに packet DTS と PTS を対応付け、frame PTS との照合はそちらで行う。
@@ -573,7 +573,8 @@ pub(crate) fn enumerate_index_keyframes(
     stream_index: usize,
     time_base: ffmpeg::Rational,
 ) -> Option<EnumeratedIndexKeyframes> {
-    let cold = read_index_keyframes(input, stream_index, time_base);
+    let timeline = crate::video::media_timeline::MediaTimeline::from_input(input);
+    let cold = read_index_keyframes(input, stream_index, time_base, timeline);
     if cold
         .as_ref()
         .is_some_and(|entries| entries.keyframes.len() >= 2)
@@ -587,7 +588,8 @@ pub(crate) fn enumerate_index_keyframes(
         return cold;
     }
     let duration = input.duration();
-    let warmup_target = if duration > 0 { duration / 2 } else { 0 };
+    let warmup_media_timestamp = if duration > 0 { duration / 2 } else { 0 };
+    let warmup_target = timeline.media_av_time_base_to_raw(warmup_media_timestamp);
 
     // SAFETY: `format_context` は上で null でないことを確認した有効な Input の所有ポインタ。
     // stream_index=-1 の timestamp は AV_TIME_BASE 単位であり、Input::duration() も同じ単位。
@@ -601,13 +603,14 @@ pub(crate) fn enumerate_index_keyframes(
         )
     };
 
-    read_index_keyframes(input, stream_index, time_base).or(cold)
+    read_index_keyframes(input, stream_index, time_base, timeline).or(cold)
 }
 
 fn read_index_keyframes(
     input: &mut ffmpeg::format::context::Input,
     stream_index: usize,
     time_base: ffmpeg::Rational,
+    timeline: crate::video::media_timeline::MediaTimeline,
 ) -> Option<EnumeratedIndexKeyframes> {
     use ffmpeg::ffi::{AV_NOPTS_VALUE, avformat_index_get_entries_count, avformat_index_get_entry};
 
@@ -650,7 +653,8 @@ fn read_index_keyframes(
             if timestamp == AV_NOPTS_VALUE {
                 continue;
             }
-            let pts_secs = timestamp as f64 * seconds_per_tick;
+            // Keep AVIndexEntry's locator raw; the published strip axis uses media seconds.
+            let pts_secs = timeline.raw_to_media_secs(timestamp as f64 * seconds_per_tick);
             if pts_secs.is_finite() {
                 keyframes.push(pts_secs);
             }
@@ -1506,6 +1510,44 @@ mod tests {
     use super::*;
 
     const EPSILON: f64 = 1.0e-9;
+
+    #[test]
+    fn timeline_origin_index_enumeration_publishes_media_axis() {
+        use crate::video::screenshot::timeline_test_support::{VIDEO_FIXTURES, fixture};
+        for &(name, content_start) in VIDEO_FIXTURES {
+            let mut input = ffmpeg::format::input(&fixture(name)).unwrap();
+            let timeline = crate::video::media_timeline::MediaTimeline::from_input(&input);
+            let (stream_index, time_base) = {
+                let stream = input.streams().best(ffmpeg::media::Type::Video).unwrap();
+                (stream.index(), stream.time_base())
+            };
+            // Give formats without a complete persistent index two known raw
+            // locators. Only the published axis may be rebased, not these entries.
+            for media_secs in [content_start + 2.5, content_start + 8.5] {
+                let timestamp = timeline.media_to_stream_ticks(media_secs, time_base);
+                let result = unsafe {
+                    let stream = *(*input.as_mut_ptr()).streams.add(stream_index);
+                    ffmpeg::ffi::av_add_index_entry(stream, 0, timestamp, 0, 0, 1)
+                };
+                assert!(result >= 0);
+            }
+            let index = enumerate_index_keyframes(&mut input, stream_index, time_base).unwrap();
+            for media_secs in [content_start + 2.5, content_start + 8.5] {
+                assert!(
+                    index
+                        .keyframes
+                        .iter()
+                        .any(|t| (*t - media_secs).abs() < 0.001),
+                    "{name}: missing {media_secs} in {:?}",
+                    index.keyframes
+                );
+            }
+            assert!(
+                index.keyframes.iter().all(|t| *t < 23.0),
+                "{name}: raw origin leaked into the strip axis"
+            );
+        }
+    }
 
     fn assert_close(actual: Option<f64>, expected: f64) {
         let close = actual.is_some_and(|value| (value - expected).abs() < EPSILON);

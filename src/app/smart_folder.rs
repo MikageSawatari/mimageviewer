@@ -7075,6 +7075,7 @@ fn prepare_smart_folder(
                                     None,
                                     &webp,
                                     &cover,
+                                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                                 ),
                                 Ok(true)
                             )
@@ -13735,6 +13736,7 @@ mod tests {
                 None,
                 &webp,
                 &CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let before = catalog.revision_state();

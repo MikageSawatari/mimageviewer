@@ -445,7 +445,18 @@ impl App {
             self.show_context_shortcuts_help = true;
             return action;
         }
-        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        if self
+            .keyboard_owner_for_pass(ctx)
+            .fullscreen_raw_key_permit()
+            .is_some_and(|permit| {
+                crate::keyboard_input::consume_fullscreen_raw_key(
+                    ctx,
+                    permit,
+                    egui::Modifiers::NONE,
+                    egui::Key::Escape,
+                )
+            })
+        {
             if !self.finish_export_crop_drag(OverlayDragEnd::Escape) {
                 self.reset_export_crop_mode();
             }
@@ -640,19 +651,27 @@ impl App {
         let before = (x, y, w, h);
         ui.horizontal(|ui| {
             let label = ui.label("X");
-            ui.add(egui::DragValue::new(&mut x).range(0..=image_size[0].saturating_sub(1) as i32))
+            let response = ui
+                .add(egui::DragValue::new(&mut x).range(0..=image_size[0].saturating_sub(1) as i32))
                 .labelled_by(label.id);
+            crate::ime_focus::track_drag_value_focus(&response);
             let label = ui.label("Y");
-            ui.add(egui::DragValue::new(&mut y).range(0..=image_size[1].saturating_sub(1) as i32))
+            let response = ui
+                .add(egui::DragValue::new(&mut y).range(0..=image_size[1].saturating_sub(1) as i32))
                 .labelled_by(label.id);
+            crate::ime_focus::track_drag_value_focus(&response);
         });
         ui.horizontal(|ui| {
             let label = ui.label("W");
-            ui.add(egui::DragValue::new(&mut w).range(1..=image_size[0].max(1) as i32))
+            let response = ui
+                .add(egui::DragValue::new(&mut w).range(1..=image_size[0].max(1) as i32))
                 .labelled_by(label.id);
+            crate::ime_focus::track_drag_value_focus(&response);
             let label = ui.label("H");
-            ui.add(egui::DragValue::new(&mut h).range(1..=image_size[1].max(1) as i32))
+            let response = ui
+                .add(egui::DragValue::new(&mut h).range(1..=image_size[1].max(1) as i32))
                 .labelled_by(label.id);
+            crate::ime_focus::track_drag_value_focus(&response);
         });
         if (x, y, w, h) != before {
             let rect = crate::export_crop::crop_from_xywh_inputs(
@@ -1051,6 +1070,149 @@ mod tests {
     use super::*;
 
     #[test]
+    fn export_crop_and_sns_split_numeric_escape_runs_fullscreen_handler_before_panels() {
+        let _input_guard = crate::key_input::lock_test_input();
+        use crate::keyboard_input::{KeyboardOwner, TextInputPhase};
+        use egui_kittest::kittest::Queryable;
+        use std::{cell::RefCell, rc::Rc};
+
+        for label in ["継ぎ目", "X", "Y", "W", "H"] {
+            let sns = label == "継ぎ目";
+            let image_size = [836, 1000];
+            let mut app = crate::app::setup_app_for_test();
+            let path = app.tmp.path().join("numeric-escape.png");
+            std::fs::write(&path, b"test").unwrap();
+            app.items.push(crate::grid_item::GridItem::Image(path));
+            app.fullscreen_idx = Some(0);
+            app.export_crop_mode = !sns;
+            let crop = crate::export_crop::CropSettings::authored(
+                CropRect {
+                    min_x: 20.0,
+                    min_y: 30.0,
+                    max_x: 620.0,
+                    max_y: 830.0,
+                },
+                crate::export_crop::CropAspectMode::Free,
+                image_size,
+            );
+            app.set_export_crop_for_idx(0, Some(crop), image_size);
+            if sns {
+                app.sns_split = Some(
+                    crate::sns_split::SnsSplitLayout::centered_max(
+                        crate::sns_split::SnsTarget::X,
+                        3,
+                        image_size,
+                    )
+                    .with_seam_permille(10, image_size),
+                );
+            }
+            let original_layout = app.sns_split;
+            let app = Rc::new(RefCell::new(app));
+            let app_ui = Rc::clone(&app);
+            let escape_owners = Rc::new(RefCell::new(Vec::new()));
+            let owners_ui = Rc::clone(&escape_owners);
+            let mut initialized = false;
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(1100.0, 800.0))
+                .build_ui(move |ui| {
+                    let ctx = ui.ctx();
+                    if !initialized {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        crate::ime_focus::install_ime_input_policy(ctx);
+                        initialized = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    let mut app = app_ui.borrow_mut();
+                    app.update_ime_state(ctx);
+                    let escape = ctx.input(|input| input.key_pressed(egui::Key::Escape));
+                    let owner = app.keyboard_owner_for_pass(ctx);
+                    let action = app.handle_fs_key_input(ctx, 0, false);
+                    // The edit-mode early return must also prevent a fullscreen close.
+                    assert!(!action.close && !action.close_to_page_list);
+                    if escape {
+                        owners_ui.borrow_mut().push(owner);
+                        if matches!(owner, KeyboardOwner::TextInput { .. }) {
+                            assert!(
+                                ctx.input(|input| input.key_pressed(egui::Key::Escape)),
+                                "the numeric editor must receive Escape"
+                            );
+                        }
+                    }
+                    let full_rect = ctx.content_rect();
+                    if sns {
+                        app.draw_sns_split_panel(ctx, 0, full_rect, Some(image_size), None);
+                    } else {
+                        app.draw_export_crop_panel(ctx, full_rect, 0, Some(image_size));
+                    }
+                });
+            harness.run();
+            // Even with the Custom seam editor visible, merely opening the
+            // mode must not reserve Escape for an untouched numeric field.
+            harness.key_press(egui::Key::Escape);
+            harness.run();
+            assert!(app.borrow().sns_split.is_none());
+            assert!(!app.borrow().export_crop_mode);
+            assert_eq!(app.borrow().fullscreen_idx, Some(0));
+            {
+                let mut app = app.borrow_mut();
+                app.sns_split = original_layout;
+                app.export_crop_mode = !sns;
+            }
+            harness.run();
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::SpinButton, label)
+                .focus();
+            harness.run();
+            // An incomplete numeric string must never be committed by Escape.
+            harness.event(egui::Event::Text("-".to_owned()));
+            harness.run();
+            harness.key_press(egui::Key::Escape);
+            harness.run();
+            assert!(
+                matches!(
+                    escape_owners.borrow().last(),
+                    Some(KeyboardOwner::TextInput {
+                        phase: TextInputPhase::FocusRecovery,
+                        ..
+                    })
+                ),
+                "{label}: {:?}",
+                escape_owners.borrow()
+            );
+            assert_eq!(app.borrow().sns_split, original_layout);
+            assert_eq!(
+                app.borrow_mut().export_crop_for_idx(0, image_size),
+                Some(crop)
+            );
+            assert_eq!(app.borrow().export_crop_mode, !sns);
+
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::SpinButton, label)
+                .focus();
+            harness.run();
+            harness.event(egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "あ".to_owned(),
+                active_range_chars: None,
+            }));
+            harness.key_press(egui::Key::Escape);
+            harness.run();
+            assert_eq!(app.borrow().sns_split, original_layout);
+            assert_eq!(app.borrow().export_crop_mode, !sns);
+            // End composition before exercising the ordinary, unfocused Escape.
+            harness.event(egui::Event::Ime(egui::ImeEvent::Commit(String::new())));
+            harness.run();
+
+            // No numeric focus: the next Escape exits the mode, not fullscreen.
+            harness.key_press(egui::Key::Escape);
+            harness.run();
+            assert!(app.borrow().sns_split.is_none());
+            assert!(!app.borrow().export_crop_mode);
+            assert_eq!(app.borrow().fullscreen_idx, Some(0));
+        }
+    }
+
+    #[test]
     fn crop_overlay_keeps_edit_handles_without_repainting_page_dim_or_border() {
         let mut app = crate::app::setup_app_for_test();
         let path = app.tmp.path().join("crop-overlay.jpg");
@@ -1423,6 +1585,7 @@ mod tests {
 
     #[test]
     fn crop_drag_escape_restores_memory_without_writing_db() {
+        let _input_guard = crate::key_input::lock_test_input();
         for existing in [false, true] {
             let mut app = crate::app::setup_app_for_test();
             let path = app.tmp.path().join("crop-cancel.jpg");
@@ -1493,7 +1656,9 @@ mod tests {
                         ..Default::default()
                     },
                     |ctx| {
-                        app.handle_export_crop_keys(ctx, 0);
+                        let action = app.handle_fs_key_input(ctx, 0, false);
+                        assert!(!action.close);
+                        app.draw_export_crop_panel(ctx, ctx.content_rect(), 0, Some(image_size));
                     },
                 )
                 .drop_without_applying_deltas();

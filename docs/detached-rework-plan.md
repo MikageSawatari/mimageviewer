@@ -1654,6 +1654,13 @@ BA 分類は **BA-7 主、BA-5 関連**。実装 `53d224a5c` の独立レビュ�
 描画側の孤児除外や兄弟の 3D を無視する条件を加える症状パッチではない。
 全画面の閲覧そのものを閉じる案は既存の閲覧保持を変えるので採らず、Depth と未完了入場の寿命だけを終端する。
 検証結果と未確認は [depth-parallax-plan §17.17](depth-parallax-plan.md) に集約する。
+### 2026-11-14: フォルダツリーのポインター入力を ROOT の pass に所有させる (§1.769)
+
+`begin_folder_pane_label_input` は ROOT だけで、前の ROOT pass のツリー描画表を使う。メインの枠を描かない表示形態では表・ジェスチャ・結果を失効させるため、既存の native backdrop / embedded still / deferred reopen / viewport enter holdover の判定を読み取る。これらの述語、detached の状態・遷移・HWND・viewport identity・context bundle は変更しない。ROOT 以外からはツリーの新しい入力所有へ触れず、表示を飛ばした pass の結果も持ち越さない。
+
+設計担当の [フォルダツリー計画 §12.5](folder-tree-refresh-plan.md#125-再開時の設計-2-回目は押した瞬間に1-回目の位置と時刻で判定する-2026-11-13claudecode) の ROOT 限定契約を実装したもの。Codex 実装者と独立 Sol / xhigh レビューは、他機能の入力を正しい表示先へ限定する構造修正であり、detached の症状パッチではないと照合した。今回の回帰は headless 入力を使い、実ウィンドウの起動・操作は行わない。
+
+`6f5791d1e` の独立レビュー P3 への対応では、入力側に再記述していた表示条件を既存描画側から共用する。native backdrop と embedded still は既存の述語を継続利用する。重複していた in-window deferred reopen の条件を副作用のない述語にまとめ、入力・描画前 poll・描画前 pending の保持・holdover 描画から参照する。静止画 viewport enter suppression は読み取り専用の真偽判定を切り出し、入力と既存の描画側抑止処理が共用する。描画側の `until=None` 即 return、invalid context / expired の cleanup 二枝、描画前の active / pending の保持、描画後 active の OR、早期 return の順序・副作用は維持する。新しい状態・時間窓・条件は加えず、detached 述語自体・状態遷移・所有先も変えない。利用者から指定された共通化と Codex / 独立 Sol / xhigh の事前照合により、症状パッチではなく読み取り条件の正本を一つにする構造修正と判断した。実装・検証の結果はフォルダツリー計画 §12.5 に記録する。
 
 ### 2026-11-12: 検索中の移動で、出発 context の移譲を検索の退役より先に行う (§1.682 / §1.688 §12.3)
 

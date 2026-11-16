@@ -2,7 +2,7 @@
 
 use eframe::egui;
 
-use super::{draw_rotated_image, drive_display_label, is_miv_upscaled_derivative};
+use super::{draw_rotated_image_uv_ex, drive_display_label, is_miv_upscaled_derivative};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::settings::{AudioThumbnailIndicator, VideoThumbnailIndicator};
 use crate::thumb_overlay_layout::{
@@ -17,16 +17,11 @@ fn draw_thumb_texture(
     painter: &egui::Painter,
     inner: egui::Rect,
     tex: &egui::TextureHandle,
+    thumb: &ThumbnailState,
     rotation: crate::rotation_db::Rotation,
 ) -> egui::Rect {
-    let tex_size = tex.size_vec2();
-    // 90°/270° 回転時は幅と高さが入れ替わる
-    let display_size = match rotation {
-        crate::rotation_db::Rotation::Cw90 | crate::rotation_db::Rotation::Cw270 => {
-            egui::vec2(tex_size.y, tex_size.x)
-        }
-        _ => tex_size,
-    };
+    let view = thumb.tile_view_for_texture(tex, rotation);
+    let display_size = view.displayed_size;
     let scale = (inner.width() / display_size.x).min(inner.height() / display_size.y);
     let img_rect = egui::Rect::from_center_size(inner.center(), display_size * scale);
 
@@ -36,15 +31,18 @@ fn draw_thumb_texture(
     painter.rect_filled(img_rect, 0.0, egui::Color32::BLACK);
 
     if rotation.is_none() {
-        painter.image(
-            tex.id(),
-            img_rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
+        painter.image(tex.id(), img_rect, view.uv, egui::Color32::WHITE);
     } else {
         // 回転したテクスチャを Mesh で描画
-        draw_rotated_image(painter, tex.id(), img_rect, rotation);
+        draw_rotated_image_uv_ex(
+            painter,
+            tex.id(),
+            img_rect,
+            view.uv,
+            rotation,
+            0.0,
+            img_rect.center(),
+        );
     }
     img_rect
 }
@@ -111,7 +109,7 @@ fn draw_thumb(
     match thumb {
         ThumbnailState::Loaded { tex, .. } => {
             let use_tex = adjusted_tex.unwrap_or(tex);
-            record(draw_thumb_texture(painter, inner, use_tex, rotation));
+            record(draw_thumb_texture(painter, inner, use_tex, thumb, rotation));
         }
         ThumbnailState::Pending | ThumbnailState::Evicted => {
             let bg = if dark {
@@ -1080,7 +1078,7 @@ fn paint_cell(
         GridItem::Folder(_) => match thumb {
             ThumbnailState::Loaded { tex, .. } => {
                 let use_tex = adjusted_tex.unwrap_or(tex);
-                record(draw_thumb_texture(painter, inner, use_tex, rotation));
+                record(draw_thumb_texture(painter, inner, use_tex, thumb, rotation));
             }
             ThumbnailState::Pending
             | ThumbnailState::Evicted
@@ -1125,7 +1123,7 @@ fn paint_cell(
             match thumb {
                 ThumbnailState::Loaded { tex, .. } => {
                     // 動画サムネは補正対象外 (adjusted_tex は常に None)
-                    record(draw_thumb_texture(painter, inner, tex, rotation));
+                    record(draw_thumb_texture(painter, inner, tex, thumb, rotation));
                 }
                 ThumbnailState::Pending | ThumbnailState::Evicted => {
                     painter.rect_filled(inner, 2.0, egui::Color32::from_gray(40));
@@ -1162,7 +1160,7 @@ fn paint_cell(
         }
         GridItem::Audio(_) => {
             if let ThumbnailState::Loaded { tex, .. } = thumb {
-                record(draw_thumb_texture(painter, inner, tex, rotation));
+                record(draw_thumb_texture(painter, inner, tex, thumb, rotation));
             } else {
                 painter.rect_filled(inner, 2.0, pending_placeholder_bg);
                 record(inner);
@@ -1208,7 +1206,7 @@ fn paint_cell(
             match thumb {
                 ThumbnailState::Loaded { tex, .. } => {
                     // ZipFile/PdfFile の代表サムネは補正対象外 (adjusted_tex は常に None)
-                    record(draw_thumb_texture(painter, inner, tex, rotation));
+                    record(draw_thumb_texture(painter, inner, tex, thumb, rotation));
                 }
                 ThumbnailState::Pending
                 | ThumbnailState::Evicted
@@ -1234,7 +1232,7 @@ fn paint_cell(
             // 表示する。未変換・キャッシュ失効時は汎用アーカイブアイコンへフォールバック。
             match thumb {
                 ThumbnailState::Loaded { tex, .. } => {
-                    record(draw_thumb_texture(painter, inner, tex, rotation));
+                    record(draw_thumb_texture(painter, inner, tex, thumb, rotation));
                 }
                 ThumbnailState::Pending
                 | ThumbnailState::Evicted
@@ -1262,7 +1260,7 @@ fn paint_cell(
             if *is_archive {
                 match thumb {
                     ThumbnailState::Loaded { tex, .. } => {
-                        record(draw_thumb_texture(painter, inner, tex, rotation));
+                        record(draw_thumb_texture(painter, inner, tex, thumb, rotation));
                     }
                     ThumbnailState::Pending
                     | ThumbnailState::Evicted
@@ -1285,7 +1283,7 @@ fn paint_cell(
             } else {
                 match thumb {
                     ThumbnailState::Loaded { tex, .. } => {
-                        record(draw_thumb_texture(painter, inner, tex, rotation));
+                        record(draw_thumb_texture(painter, inner, tex, thumb, rotation));
                     }
                     ThumbnailState::Pending
                     | ThumbnailState::Evicted
@@ -1343,7 +1341,9 @@ fn paint_cell(
                 let thumb_rect = geometry.thumb;
                 if let ThumbnailState::Loaded { tex, .. } = thumb {
                     // 代表サムネは色調補正対象外 (adjusted_tex は常に None)
-                    record(draw_thumb_texture(painter, thumb_rect, tex, rotation));
+                    record(draw_thumb_texture(
+                        painter, thumb_rect, tex, thumb, rotation,
+                    ));
                 }
                 // 種別アイコン (小) を左上隅に重ねて Folder/ZIP を示す
                 let badge_size = geometry.marker_font;
@@ -3800,7 +3800,7 @@ pub(crate) fn tq_draw_preview(
             painter.image(
                 t.id(),
                 img_rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
         }
@@ -4630,3 +4630,164 @@ mod audio_indicator_tests {
 #[cfg(test)]
 #[path = "grid_type_icon_tests.rs"]
 mod type_icon_tests;
+
+#[cfg(test)]
+mod auto_cover_paint_tests {
+    use super::*;
+    use crate::cover_auto_material::{AutoCropResults, AutoMaterial};
+    use crate::folder_thumb_pins::CoverCrop;
+    use crate::rotation_db::Rotation;
+
+    #[test]
+    fn auto_cover_late_pixels_keep_four_way_material_and_use_live_angle() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let path = app.tmp.path().join("delayed.zip");
+        let key = crate::adjustment_db::zip_entry_key(&path, "cover.png");
+        app.items = vec![GridItem::ZipFile(path)];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![Some((1, 1))];
+        app.keep_set.insert(0);
+        app.keep_range = (0, 1);
+        app.settings.thumb_aspect_auto = true;
+        let material = AutoMaterial::Automatic(AutoCropResults::new([
+            None,
+            CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap(),
+            None,
+            None,
+        ]));
+        let generation = app.items_generation;
+        let request_id = app
+            .requested
+            .begin(
+                0,
+                generation,
+                crate::app::thumbnail_requests::ThumbnailRequestKind::Normal,
+                None,
+            )
+            .unwrap();
+        let pixels = crate::thumb_loader::ThumbMsg::from_legacy_parts(
+            0,
+            Some(egui::ColorImage::filled([400, 200], egui::Color32::WHITE)),
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            false,
+            None,
+            Some((400, 200)),
+            None,
+            false,
+            false,
+            0,
+            generation,
+        )
+        .with_request_id(request_id)
+        .with_cover(crate::cover_identity::CoverIdentity::Page(key.clone()))
+        .with_auto_material(material);
+        app.update_rotation_page_owner([(key.clone(), Rotation::Cw90)]);
+        app.tx.send(pixels).unwrap();
+        app.poll_thumbnails(&ctx, crate::app::ThumbnailConsumptionPolicy::Grid);
+        let ThumbnailState::Loaded {
+            tex, auto_material, ..
+        } = &app.thumbnails[0]
+        else {
+            panic!("late automatic material must be accepted");
+        };
+        assert_eq!(*auto_material, material);
+        let texture_id = tex.id();
+        let view = app.thumbnails[0].tile_view_for_texture(tex, app.grid_tile_rotation_memory(0));
+        assert_eq!(view.displayed_size, egui::vec2(200.0, 200.0));
+        assert_eq!(view.uv.max.x, 0.5);
+        assert_eq!(
+            app.auto_aspect.samples.get(&0),
+            Some(&0.5),
+            "samples remain zero-degree"
+        );
+        app.update_rotation_page_owner([(key, Rotation::Cw180)]);
+        let ThumbnailState::Loaded {
+            tex, auto_material, ..
+        } = &app.thumbnails[0]
+        else {
+            panic!("rotation must preserve accepted material");
+        };
+        assert_eq!(tex.id(), texture_id);
+        assert_eq!(*auto_material, material);
+        assert_eq!(
+            app.thumbnails[0]
+                .tile_view_for_texture(tex, app.grid_tile_rotation_memory(0))
+                .displayed_size,
+            egui::vec2(400.0, 200.0)
+        );
+        assert_eq!(app.auto_aspect.samples.get(&0), Some(&0.5));
+        assert!(!app.requested.contains_key(&0));
+    }
+
+    #[test]
+    fn auto_cover_paint_and_hit_geometry_follow_current_angle_without_reupload() {
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "automatic-cover",
+            egui::ColorImage::filled([400, 200], egui::Color32::WHITE),
+            Default::default(),
+        );
+        let texture_id = texture.id();
+        let mut thumb = ThumbnailState::loaded_raster(
+            texture.clone(),
+            crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+            false,
+            400,
+            crate::source_coverage::SourceCoverage::FullSource,
+            Some((400, 200)),
+            None,
+        );
+        if let ThumbnailState::Loaded { auto_material, .. } = &mut thumb {
+            *auto_material = AutoMaterial::Automatic(AutoCropResults::new([
+                CoverCrop::new([0, 0, 500_000, 1_000_000]).unwrap(),
+                None,
+                CoverCrop::new([500_000, 0, 1_000_000, 1_000_000]).unwrap(),
+                None,
+            ]));
+        }
+        let inner = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(300.0, 300.0));
+        for (angle, size, first_uv) in [
+            (
+                Rotation::None,
+                egui::vec2(300.0, 300.0),
+                egui::pos2(0.0, 0.0),
+            ),
+            (
+                Rotation::Cw90,
+                egui::vec2(150.0, 300.0),
+                egui::pos2(0.0, 1.0),
+            ),
+            (
+                Rotation::Cw180,
+                egui::vec2(300.0, 300.0),
+                egui::pos2(1.0, 1.0),
+            ),
+            (
+                Rotation::Cw270,
+                egui::vec2(150.0, 300.0),
+                egui::pos2(1.0, 0.0),
+            ),
+        ] {
+            let mut hit = egui::Rect::NOTHING;
+            let output =
+                crate::test_ui::headless_paint_output(ctx.run_ui(Default::default(), |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        hit = draw_thumb_texture(ui.painter(), inner, &texture, &thumb, angle);
+                    });
+                }));
+            assert_eq!(hit, egui::Rect::from_center_size(inner.center(), size));
+            let mesh = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::Shape::Mesh(mesh) if mesh.texture_id == texture_id => Some(mesh),
+                    _ => None,
+                })
+                .expect("production thumbnail texture mesh");
+            assert_eq!(mesh.vertices[0].uv, first_uv);
+            assert_eq!(mesh.calc_bounds(), hit);
+            assert_eq!(texture.id(), texture_id);
+        }
+    }
+}

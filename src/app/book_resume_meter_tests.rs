@@ -349,9 +349,10 @@ fn stored_row(data_dir: &Path, path: &Path) -> Option<(i64, Option<i64>, Option<
 fn seed_saved_media(app: &mut AppTestEnv) {
     for name in ["one.mp4", "two.mp3"] {
         let key = crate::adjustment_db::normalize_path(&app.tmp.path().join(name));
-        app.settings
-            .video_resume_positions
-            .insert(key.clone(), 18.0);
+        app.settings.video_resume_positions.insert(
+            key.clone(),
+            crate::settings::VideoResumePosition::Media(18.0),
+        );
         app.settings.video_watched_to_end.insert(key.clone());
         app.settings.video_audio_track_choices.insert(
             key,
@@ -464,7 +465,13 @@ fn saved_position_media_clear_preserves_books_and_other_settings_then_saves_and_
         at_eof: false,
         audio_track_choice: None,
     }]);
-    assert_eq!(app.settings.video_resume_positions.get(&key), Some(&23.0));
+    assert_eq!(
+        app.settings
+            .video_resume_positions
+            .get(&key)
+            .map(crate::settings::VideoResumePosition::stored_secs),
+        Some(&23.0)
+    );
 }
 
 #[test]
@@ -781,12 +788,21 @@ fn saved_position_media_clear_poll_video_discards_pre_key_capture_then_records_a
                     .any(|(text, _)| text.contains("クリアしました"))
             );
         } else {
-            assert_eq!(app.settings.video_resume_positions.get(&key), Some(&23.0));
+            assert_eq!(
+                app.settings
+                    .video_resume_positions
+                    .get(&key)
+                    .map(crate::settings::VideoResumePosition::stored_secs),
+                Some(&23.0)
+            );
         }
         app.video_resume_last_save = None;
         app.poll_video(&ctx);
         assert_eq!(
-            app.settings.video_resume_positions.get(&key),
+            app.settings
+                .video_resume_positions
+                .get(&key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&23.0),
             "a post-clear sample remains recordable"
         );
@@ -848,7 +864,13 @@ fn saved_position_media_clear_fences_teardown_and_track_updates_but_keeps_histor
         Some(23_000)
     );
     app.apply_remote_media_resume_update(path, 31.0, 120.0, false, true);
-    assert_eq!(app.settings.video_resume_positions.get(&key), Some(&31.0));
+    assert_eq!(
+        app.settings
+            .video_resume_positions
+            .get(&key)
+            .map(crate::settings::VideoResumePosition::stored_secs),
+        Some(&31.0)
+    );
 }
 
 #[cfg(windows)]
@@ -924,9 +946,10 @@ fn saved_position_clear_egui_image_and_audio_handlers_respect_keyboard_ownership
                     GridItem::Image(path.clone())
                 }];
                 app.fullscreen_idx = Some(0);
-                app.settings
-                    .video_resume_positions
-                    .insert("keep".into(), 18.0);
+                app.settings.video_resume_positions.insert(
+                    "keep".into(),
+                    crate::settings::VideoResumePosition::Media(18.0),
+                );
                 app.keymap =
                     crate::keymap::Keymap::from_ini_str("[Global]\nClearVideoMediaMemory = F16\n");
                 let ctx = egui::Context::default();

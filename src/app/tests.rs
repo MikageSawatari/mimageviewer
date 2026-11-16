@@ -241,6 +241,7 @@ mod section1452_book_cover_cache {
                         Some((8, 12)),
                         &webp,
                         &crate::cover_identity::CoverIdentity::Legacy,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     )
                     .unwrap();
                 let catalog = crate::catalog::CatalogDb::open(&cache_dir, &path).unwrap();
@@ -314,7 +315,15 @@ mod section1452_book_cover_cache {
             crate::adjustment_db::zip_entry_key(&zip_path, "root.png"),
         );
         parent_db
-            .save_thumb_bytes(parent_key, 1, 2, None, &webp, &cover)
+            .save_thumb_bytes(
+                parent_key,
+                1,
+                2,
+                None,
+                &webp,
+                &cover,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
+            )
             .unwrap();
         // The projected first row differs from the source page of the parent's pixels.
         let target_key = "chapter/page.png";
@@ -486,6 +495,7 @@ mod section1452_book_cover_cache {
                         Some((4, 6)),
                         &webp,
                         &crate::cover_identity::CoverIdentity::Legacy,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     )
                     .unwrap();
             }
@@ -748,7 +758,10 @@ fn acceptance_f_resume_thumbnails_require_a_video_stream_and_keep_audio_position
             .unwrap();
         app.save_all_video_resume_positions();
         assert_eq!(
-            app.settings.video_resume_positions.get(&key),
+            app.settings
+                .video_resume_positions
+                .get(&key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&15.0),
             "{name}"
         );
@@ -765,7 +778,10 @@ fn acceptance_f_resume_thumbnails_require_a_video_stream_and_keep_audio_position
         );
         app.save_viewer_context_media_teardown_resumes(&[plan]);
         assert_eq!(
-            app.settings.video_resume_positions.get(&key),
+            app.settings
+                .video_resume_positions
+                .get(&key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&15.0),
             "teardown {name}"
         );
@@ -784,7 +800,13 @@ fn acceptance_f_remote_audio_progress_saves_position_without_thumbnail() {
     let path = app.tmp.path().join("RemoteAudio.MP3");
     let key = crate::adjustment_db::normalize_path(&path);
     app.apply_remote_media_resume_update(path, 15.0, 60.0, false, false);
-    assert_eq!(app.settings.video_resume_positions.get(&key), Some(&15.0));
+    assert_eq!(
+        app.settings
+            .video_resume_positions
+            .get(&key)
+            .map(crate::settings::VideoResumePosition::stored_secs),
+        Some(&15.0)
+    );
     assert!(!app.video_resume_thumb_last_request.contains_key(&key));
 }
 
@@ -2270,6 +2292,7 @@ fn ordinary_video_folder_seed_upgrades_identity_only_and_then_preserves_the_row(
             None,
             &webp,
             &CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
@@ -2367,6 +2390,7 @@ fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_a
             None,
             &webp,
             &crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let source = app
@@ -2400,6 +2424,7 @@ fn mutation_refresh_synthetic_worker_prepares_cascade_and_video_seed_before_ui_a
             None,
             &webp,
             &crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let old_map = Arc::new(std::sync::RwLock::new(catalog.load_all().unwrap()));
@@ -2634,7 +2659,8 @@ fn mutation_refresh_synthetic_worker_seed_failure_purges_same_key_old_frame() {
                 resolved.file_size,
                 None,
                 &old_bytes,
-                &crate::cover_identity::CoverIdentity::Legacy
+                &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic
             )
             .unwrap()
     );
@@ -5585,6 +5611,7 @@ fn epub_auto_aspect_seed_ignores_source_metadata_cache_hit() {
     let map = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([(
         key,
         crate::catalog::CacheEntry {
+            auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
             cover: crate::cover_identity::CoverIdentity::Legacy,
             mtime: 123,
             file_size: 456,
@@ -9301,12 +9328,14 @@ fn metadata_folder_pin_refresh_does_not_navigate_or_close_detached_viewers() {
             None,
             b"x",
             &crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     let cache_map =
         std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([(
             stale_pin_key.clone(),
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 1,
                 file_size: 1,
@@ -14156,7 +14185,7 @@ fn video_resume_for_open_grid_and_nav_modes() {
         None,
         "grid 開く・先頭から"
     );
-    assert_eq!(video_resume_for_open(None, true, true, Resume), None);
+    assert_eq!(video_resume_for_open(None::<f64>, true, true, Resume), None);
 
     // Ctrl+↑↓ / ホイール等 (from_grid=false): nav_resume が判定、open 設定は無視。
     assert_eq!(
@@ -14169,7 +14198,10 @@ fn video_resume_for_open_grid_and_nav_modes() {
         None,
         "nav・先頭から"
     );
-    assert_eq!(video_resume_for_open(None, false, false, Resume), None);
+    assert_eq!(
+        video_resume_for_open(None::<f64>, false, false, Resume),
+        None
+    );
 }
 
 #[test]
@@ -20073,6 +20105,7 @@ mod phase_c_key_tests {
                 Some((80, 60)),
                 &webp_bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         let auto_key = container_cache_base_key(
@@ -20092,6 +20125,7 @@ mod phase_c_key_tests {
                 Some((80, 60)),
                 &webp_bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
 
@@ -20139,6 +20173,7 @@ mod phase_c_key_tests {
                 Some((80, 60)),
                 &webp_bytes,
                 &cover,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         // §1.718 §7: the provisional seed copies the selected catalog row.
@@ -20163,6 +20198,7 @@ mod phase_c_key_tests {
                 Some((80, 60)),
                 &webp_bytes,
                 &cover,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&cache_map, Some(&drive_list_db));
@@ -20315,6 +20351,7 @@ mod phase_c_key_tests {
                 None,
                 &webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         parent
@@ -20327,6 +20364,7 @@ mod phase_c_key_tests {
                 None,
                 &webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         app.items = vec![GridItem::Folder(drive.clone())];
@@ -20670,6 +20708,7 @@ mod phase_c_key_tests {
                 Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                 Some(&proof),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         app.items = vec![GridItem::Folder(drive.clone())];
@@ -20790,6 +20829,7 @@ mod phase_c_key_tests {
                 Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                 Some(&current_proof),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
@@ -20855,6 +20895,7 @@ mod phase_c_key_tests {
                 None,
                 &old_webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         map.write()
@@ -20881,6 +20922,7 @@ mod phase_c_key_tests {
                 None,
                 &old_webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
@@ -20939,6 +20981,7 @@ mod phase_c_key_tests {
                 None,
                 &page_one_webp,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         if case == "new_generation" {
@@ -20968,6 +21011,7 @@ mod phase_c_key_tests {
                     Some(crate::catalog::FolderThumbProvenance::AutoSelected),
                     Some(&old_proof),
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
             map.write()
@@ -20995,6 +21039,7 @@ mod phase_c_key_tests {
                     None,
                     &new_webp,
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
             let (seed, final_red, finalized, messages) = load(&app, &map);
@@ -21183,6 +21228,7 @@ mod phase_c_key_tests {
                 None,
                 &webp(240),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         parent
@@ -21195,6 +21241,7 @@ mod phase_c_key_tests {
                 None,
                 &webp(40),
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         app.items = vec![GridItem::Folder(drive.clone())];
@@ -21378,6 +21425,7 @@ mod phase_c_key_tests {
                 Some((100, 50)),
                 &webp_bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
 
@@ -21475,6 +21523,7 @@ mod phase_c_key_tests {
                 Some((120, 80)),
                 &wrong_webp_bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
 
@@ -22534,9 +22583,10 @@ mod phase_c_folder_nav_history_tests {
             None,
             None,
         ));
-        app.settings
-            .video_resume_positions
-            .insert("/miv-test/movie.mp4".to_string(), 91.5);
+        app.settings.video_resume_positions.insert(
+            "/miv-test/movie.mp4".to_string(),
+            crate::settings::VideoResumePosition::Media(91.5),
+        );
         app.settings.save();
 
         let _ = app.apply_ring_action(
@@ -22606,7 +22656,8 @@ mod phase_c_folder_nav_history_tests {
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get("/miv-test/movie.mp4"),
+                .get("/miv-test/movie.mp4")
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&91.5)
         );
         assert_eq!(
@@ -22641,7 +22692,10 @@ mod phase_c_folder_nav_history_tests {
                 .all(Vec::is_empty)
         );
         assert_eq!(
-            persisted.video_resume_positions.get("/miv-test/movie.mp4"),
+            persisted
+                .video_resume_positions
+                .get("/miv-test/movie.mp4")
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&91.5)
         );
         assert_eq!(
@@ -27475,6 +27529,7 @@ mod phase_c_folder_nav_history_tests {
                     Some((36, 48)),
                     root_png.get_ref(),
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
         }
@@ -27793,6 +27848,7 @@ mod phase_c_folder_nav_history_tests {
                         Some((96, 128)),
                         encoded.get_ref(),
                         &crate::cover_identity::CoverIdentity::Legacy,
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
                     )
                     .unwrap();
             }
@@ -34014,7 +34070,13 @@ mod phase_c_drill_nav_tests {
 
         app.record_reading_history_path(path.clone(), ReadingHistoryKind::Video, None, None, None);
         app.apply_remote_media_resume_update(path.clone(), 20.0, 100.0, false, true);
-        assert_eq!(app.settings.video_resume_positions.get(&key), Some(&20.0));
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
+            Some(&20.0)
+        );
         #[cfg(windows)]
         assert_eq!(app.video_resume_thumb_last_request.get(&key), Some(&20_000));
         app.apply_remote_media_resume_update(path.clone(), 2.0, 100.0, false, true);
@@ -34069,7 +34131,10 @@ mod phase_c_drill_nav_tests {
 
         let path = std::path::PathBuf::from("c:/media/completed.mp4");
         let key = crate::adjustment_db::normalize_path(&path);
-        let mut resume = std::collections::HashMap::from([(key.clone(), 90.0)]);
+        let mut resume = std::collections::HashMap::from([(
+            key.clone(),
+            crate::settings::VideoResumePosition::Media(90.0),
+        )]);
         let mut watched = std::collections::HashSet::new();
         assert!(!crate::app::save_video_resume_position(
             &mut resume,
@@ -36377,6 +36442,7 @@ fn begin_detached_bookmark_media_test(
         std::collections::HashMap::from([(
             "main-grid-color".to_string(),
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 1,
                 file_size: 2,
@@ -47519,6 +47585,7 @@ mod favorite_adjustment_defaults_tests {
         let cache_map = std::sync::RwLock::new(std::collections::HashMap::from([(
             key,
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 11,
                 file_size: 22,
@@ -49016,6 +49083,7 @@ mod favorite_adjustment_defaults_tests {
         let cache_map = std::sync::RwLock::new(std::collections::HashMap::from([(
             pinned_key,
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 333,
                 file_size: 444,
@@ -50897,8 +50965,11 @@ mod favorite_adjustment_defaults_tests {
         )
         .unwrap();
         assert_eq!(
-            entries.iter().map(|entry| entry.suffix).collect::<Vec<_>>(),
-            vec![0, 1, 2, 3, 4]
+            entries
+                .iter()
+                .map(|entry| entry.suffix.as_str())
+                .collect::<Vec<_>>(),
+            vec!["0", "1", "2", "3", "4"]
         );
     }
 
@@ -51003,7 +51074,7 @@ mod favorite_adjustment_defaults_tests {
         let entries = (0..5)
             .map(|suffix| crate::export_dialog::ExportEntry {
                 label: format!("preset {suffix}"),
-                suffix,
+                suffix: suffix.to_string(),
                 conceal_preset: None,
                 crop_override: None,
             })
@@ -53236,6 +53307,7 @@ mod favorite_adjustment_defaults_tests {
                     Some((8, 8)),
                     &webp,
                     &crate::cover_identity::CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
             let folder_meta = std::fs::metadata(&folder).unwrap();
@@ -53349,6 +53421,7 @@ mod favorite_adjustment_defaults_tests {
                 Some((100, 100)),
                 &webp_bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
 
@@ -53457,6 +53530,7 @@ mod favorite_adjustment_defaults_tests {
         cache_map.write().unwrap().insert(
             target_key.clone(),
             crate::catalog::CacheEntry {
+                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
                 mtime: 999,
                 file_size: 4096,
@@ -53601,6 +53675,7 @@ mod favorite_adjustment_defaults_tests {
                 None,
                 &bad_bytes,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
 
@@ -53645,6 +53720,7 @@ mod favorite_adjustment_defaults_tests {
                 None,
                 &bad,
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .expect("Err なし、Ok(false) で skip 表現");
         assert!(!saved, "壊れたバイト列は save 断念 → false");
@@ -76801,6 +76877,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 None,
                 b"cached-thumbnail",
                 &crate::cover_identity::CoverIdentity::Legacy,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
         assert!(catalog.load_one("keep.jpg").unwrap().is_some());
@@ -78638,7 +78715,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             assert_eq!(
                 app.settings
                     .video_resume_positions
-                    .get(&crate::adjustment_db::normalize_path(&path)),
+                    .get(&crate::adjustment_db::normalize_path(&path))
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&30.0)
             );
 
@@ -78717,7 +78795,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&video_path)),
+                .get(&crate::adjustment_db::normalize_path(&video_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&17.5)
         );
         assert!(!app.slideshow_playing);
@@ -79733,7 +79812,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             assert_eq!(
                 app.settings
                     .video_resume_positions
-                    .get(&crate::adjustment_db::normalize_path(path)),
+                    .get(&crate::adjustment_db::normalize_path(path))
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&position)
             );
         }
@@ -79776,7 +79856,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             assert_eq!(
                 app.settings
                     .video_resume_positions
-                    .get(&crate::adjustment_db::normalize_path(&path)),
+                    .get(&crate::adjustment_db::normalize_path(&path))
+                    .map(crate::settings::VideoResumePosition::stored_secs),
                 Some(&42.0)
             );
 
@@ -79848,13 +79929,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&active_path)),
+                .get(&crate::adjustment_db::normalize_path(&active_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&51.0)
         );
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&parked_path)),
+                .get(&crate::adjustment_db::normalize_path(&parked_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&63.0)
         );
     }
@@ -81118,9 +81201,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.transition_detached_window_state(61, DetachedWindowState::ParkedLive, "test_setup");
 
         let resume_key = crate::adjustment_db::normalize_path(std::path::Path::new(video_path));
-        app.settings
-            .video_resume_positions
-            .insert(resume_key.clone(), 12.5);
+        app.settings.video_resume_positions.insert(
+            resume_key.clone(),
+            crate::settings::VideoResumePosition::Media(12.5),
+        );
         app.video_resume_thumb_last_request
             .insert(resume_key.clone(), 1);
 
@@ -81289,16 +81373,19 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.comic_page_keys.insert(format!("{old_k}::p1.jpg"));
         app.export_crop_page_keys
             .insert(format!("{old_k}/cropped.jpg"));
-        app.settings
-            .video_resume_positions
-            .insert(format!("{old_k}/v.mp4"), 12.0);
+        app.settings.video_resume_positions.insert(
+            format!("{old_k}/v.mp4"),
+            crate::settings::VideoResumePosition::Media(12.0),
+        );
         // 新キー側に既存値 (リネーム後に先へ再生した想定) → 既存優先。
-        app.settings
-            .video_resume_positions
-            .insert(format!("{old_k}/w.mp4"), 5.0);
-        app.settings
-            .video_resume_positions
-            .insert(format!("{new_k}/w.mp4"), 99.0);
+        app.settings.video_resume_positions.insert(
+            format!("{old_k}/w.mp4"),
+            crate::settings::VideoResumePosition::Media(5.0),
+        );
+        app.settings.video_resume_positions.insert(
+            format!("{new_k}/w.mp4"),
+            crate::settings::VideoResumePosition::Media(99.0),
+        );
 
         app.rewrite_page_edit_presence_for_rename(old, new);
         app.migrate_video_resume_positions_for_renamed_path(old, new);
@@ -81323,14 +81410,16 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&format!("{new_k}/v.mp4")),
+                .get(&format!("{new_k}/v.mp4"))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&12.0),
             "再生位置が新キーへ移る"
         );
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&format!("{new_k}/w.mp4")),
+                .get(&format!("{new_k}/w.mp4"))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&99.0),
             "新キー側の既存値を優先する"
         );
@@ -82143,7 +82232,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 audio_track_choice: None,
             },
         ];
-        let mut resume = std::collections::HashMap::from([(finished.clone(), 10.0)]);
+        let mut resume = std::collections::HashMap::from([(
+            finished.clone(),
+            crate::settings::VideoResumePosition::Media(10.0),
+        )]);
         let mut watched = std::collections::HashSet::from([kept.clone()]);
 
         let removed = apply_viewer_context_media_resume_updates(
@@ -82154,7 +82246,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             0,
         );
 
-        assert_eq!(resume.get(&kept), Some(&37.5));
+        assert_eq!(
+            resume.get(&kept),
+            Some(&crate::settings::VideoResumePosition::Media(37.5))
+        );
         assert!(!resume.contains_key(&finished));
         assert!(!watched.contains(&kept));
         assert!(watched.contains(&finished));
@@ -82309,6 +82404,179 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     #[cfg(windows)]
+    fn saved_resume_pending_metadata_survives_periodic_and_save_all() {
+        use crate::settings::VideoResumePosition::{LegacyRaw, Media};
+        for saved in [LegacyRaw(36012.0), Media(12.0), Media(28.0)] {
+            for audio_mode in [false, true] {
+                let mut app = setup_app();
+                app.video_tile_cache = None;
+                let path = app.tmp.path().join("loading-resume.ts");
+                let idx = push_video(&mut app, path.to_str().unwrap());
+                let key = crate::adjustment_db::normalize_path(&path);
+                let (player, _tx, _info) =
+                    crate::video::VideoPlayer::loading_resume_disconnected_for_test(
+                        path, saved, false,
+                    );
+                app.fs_cache.insert(
+                    idx,
+                    FsCacheEntry::Video {
+                        player: Box::new(player),
+                        load_seq: 0,
+                    },
+                );
+                app.video_audio_mode = audio_mode.then_some(idx);
+                app.settings
+                    .video_resume_positions
+                    .insert(key.clone(), saved);
+                app.settings.video_watched_to_end.insert(key.clone());
+                app.video_resume_thumb_last_request
+                    .insert(key.clone(), 12_000);
+                let positions = app.settings.video_resume_positions.clone();
+                let watched = app.settings.video_watched_to_end.clone();
+                let thumbnails = app.video_resume_thumb_last_request.clone();
+                let ctx = egui::Context::default();
+                for _ in 0..2 {
+                    app.video_resume_last_save = None;
+                    app.poll_video(&ctx);
+                    app.save_all_video_resume_positions();
+                    assert_eq!(app.settings.video_resume_positions, positions, "{saved:?}");
+                    assert_eq!(app.settings.video_watched_to_end, watched, "{saved:?}");
+                    assert_eq!(app.video_resume_thumb_last_request, thumbnails, "{saved:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn saved_resume_metadata_resolution_enables_periodic_migration() {
+        use crate::settings::VideoResumePosition::{LegacyRaw, Media};
+        for saved in [LegacyRaw(36012.0), Media(12.0)] {
+            let mut app = setup_app();
+            app.video_tile_cache = None;
+            let path = app.tmp.path().join("resolved-resume.ts");
+            let idx = push_video(&mut app, path.to_str().unwrap());
+            let key = crate::adjustment_db::normalize_path(&path);
+            let (player, tx, mut info) =
+                crate::video::VideoPlayer::loading_resume_disconnected_for_test(path, saved, false);
+            info.timeline_origin_secs = 36000.0;
+            app.fs_cache.insert(
+                idx,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+            app.settings
+                .video_resume_positions
+                .insert(key.clone(), saved);
+            let ctx = egui::Context::default();
+            app.poll_video(&ctx);
+            assert_eq!(app.settings.video_resume_positions.get(&key), Some(&saved));
+            tx.send(Ok(info)).unwrap();
+            app.video_resume_last_save = None;
+            app.poll_video(&ctx);
+            assert_eq!(
+                app.settings.video_resume_positions.get(&key),
+                Some(&Media(12.0))
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn saved_resume_pending_metadata_survives_detached_exit_and_passive_teardown() {
+        use crate::settings::VideoResumePosition::{LegacyRaw, Media};
+        for saved in [LegacyRaw(36012.0), Media(12.0), Media(28.0)] {
+            let mut app = setup_app();
+            app.video_tile_cache = None;
+            let ctx = egui::Context::default();
+            let active_path = app.tmp.path().join("loading-active.ts");
+            let parked_path = app.tmp.path().join("loading-parked.ts");
+            let (active_player, _active_tx, _) =
+                crate::video::VideoPlayer::loading_resume_disconnected_for_test(
+                    active_path.clone(),
+                    saved,
+                    false,
+                );
+            let (parked_player, _parked_tx, _) =
+                crate::video::VideoPlayer::loading_resume_disconnected_for_test(
+                    parked_path.clone(),
+                    saved,
+                    false,
+                );
+            app.build_active_context_for_test(None, DetachedSource::Video, move |active| {
+                active.items.push(GridItem::Video(active_path));
+                active.fullscreen_idx = Some(0);
+                active.fs_cache.insert(
+                    0,
+                    FsCacheEntry::Video {
+                        player: Box::new(active_player),
+                        load_seq: 0,
+                    },
+                );
+            });
+            let parked_key = crate::adjustment_db::normalize_path(&parked_path);
+            app.push_window_context_for_test(&ctx, 613, move |parked| {
+                parked.items.push(GridItem::Video(parked_path));
+                parked.fullscreen_idx = Some(0);
+                parked.fs_cache.insert(
+                    0,
+                    FsCacheEntry::Video {
+                        player: Box::new(parked_player),
+                        load_seq: 0,
+                    },
+                );
+            });
+            let active_key = app
+                .with_active_viewer_context(|active| match &active.items[0] {
+                    GridItem::Video(path) => crate::adjustment_db::normalize_path(path),
+                    _ => unreachable!(),
+                })
+                .unwrap();
+            for key in [&active_key, &parked_key] {
+                app.settings
+                    .video_resume_positions
+                    .insert(key.clone(), saved);
+                app.settings.video_watched_to_end.insert(key.clone());
+                app.video_resume_thumb_last_request
+                    .insert(key.clone(), 12_000);
+            }
+            let positions = app.settings.video_resume_positions.clone();
+            let watched = app.settings.video_watched_to_end.clone();
+            let thumbnails = app.video_resume_thumb_last_request.clone();
+            app.save_detached_video_resume_positions_for_exit();
+            assert_eq!(
+                app.settings.video_resume_positions, positions,
+                "exit {saved:?}"
+            );
+            assert_eq!(app.settings.video_watched_to_end, watched, "exit {saved:?}");
+            assert_eq!(
+                app.video_resume_thumb_last_request, thumbnails,
+                "exit {saved:?}"
+            );
+            assert!(
+                app.teardown_paused_media_bundles_for_window_ids(
+                    &[613],
+                    "test_pending_saved_resume_teardown",
+                )
+                .is_ok()
+            );
+            assert!(app.locate_window_context(613).is_none());
+            assert_eq!(
+                app.settings.video_resume_positions, positions,
+                "drop {saved:?}"
+            );
+            assert_eq!(app.settings.video_watched_to_end, watched, "drop {saved:?}");
+            assert_eq!(
+                app.video_resume_thumb_last_request, thumbnails,
+                "drop {saved:?}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn save_all_video_resume_removes_eof_even_when_duration_is_zero() {
         let mut app = setup_app();
         let eof_path = PathBuf::from(r"C:\clips\mpeg-ps-eof.mpg");
@@ -82335,9 +82603,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 load_seq: 0,
             },
         );
-        app.settings
-            .video_resume_positions
-            .insert(eof_key.clone(), 13.046);
+        app.settings.video_resume_positions.insert(
+            eof_key.clone(),
+            crate::settings::VideoResumePosition::Media(13.046),
+        );
         app.settings.video_watched_to_end.insert(mid_key.clone());
 
         app.save_all_video_resume_positions();
@@ -82346,7 +82615,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.settings.video_watched_to_end.contains(&eof_key));
         assert!(!app.settings.video_watched_to_end.contains(&mid_key));
         assert_eq!(
-            app.settings.video_resume_positions.get(&mid_key),
+            app.settings
+                .video_resume_positions
+                .get(&mid_key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&40.0),
             "normal midpoint remains saved when the player is not at EOF"
         );
@@ -82374,7 +82646,13 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.settings.video_watched_to_end.insert(key.clone());
 
         app.save_all_video_resume_positions();
-        assert_eq!(app.settings.video_resume_positions.get(&key), Some(&40.0));
+        assert_eq!(
+            app.settings
+                .video_resume_positions
+                .get(&key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
+            Some(&40.0)
+        );
         assert!(!app.settings.video_watched_to_end.contains(&key));
 
         let items = app.items.clone();
@@ -82454,13 +82732,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&active_path)),
+                .get(&crate::adjustment_db::normalize_path(&active_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&41.0)
         );
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&parked_path)),
+                .get(&crate::adjustment_db::normalize_path(&parked_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&52.0)
         );
         assert!(app.active_viewer_context_id().is_some());
@@ -82500,7 +82780,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(plan.resume_updates.len(), 1);
         assert!(plan.resume_updates[0].at_eof);
         assert_eq!(plan.resume_updates[0].duration, 0.0);
-        let mut resume = std::collections::HashMap::from([(key.clone(), 13.046)]);
+        let mut resume = std::collections::HashMap::from([(
+            key.clone(),
+            crate::settings::VideoResumePosition::Media(13.046),
+        )]);
         let mut watched = std::collections::HashSet::new();
 
         let removed = apply_viewer_context_media_resume_updates(
@@ -82595,9 +82878,10 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.transition_detached_window_state(98, DetachedWindowState::ParkedLive, "test_setup");
         let old_key = crate::adjustment_db::normalize_path(&old_path);
         let new_key = crate::adjustment_db::normalize_path(&new_path);
-        app.settings
-            .video_resume_positions
-            .insert(old_key.clone(), 32.5);
+        app.settings.video_resume_positions.insert(
+            old_key.clone(),
+            crate::settings::VideoResumePosition::Media(32.5),
+        );
 
         app.release_viewer_surfaces_for_removed_paths(
             &ctx,
@@ -82605,14 +82889,20 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             "test_rename_close",
         );
         assert_eq!(
-            app.settings.video_resume_positions.get(&old_key),
+            app.settings
+                .video_resume_positions
+                .get(&old_key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&37.5),
             "close 時点の最終位置が旧 path へ先に保存される"
         );
 
         app.migrate_video_resume_positions_for_renamed_path(&old_path, &new_path);
         assert_eq!(
-            app.settings.video_resume_positions.get(&new_key),
+            app.settings
+                .video_resume_positions
+                .get(&new_key)
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&37.5)
         );
         assert!(!app.settings.video_resume_positions.contains_key(&old_key));
@@ -91508,13 +91798,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&first_path)),
+                .get(&crate::adjustment_db::normalize_path(&first_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&21.0)
         );
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&second_path)),
+                .get(&crate::adjustment_db::normalize_path(&second_path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&42.0)
         );
         assert!(
@@ -91601,7 +91893,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert_eq!(
             app.settings
                 .video_resume_positions
-                .get(&crate::adjustment_db::normalize_path(&path)),
+                .get(&crate::adjustment_db::normalize_path(&path))
+                .map(crate::settings::VideoResumePosition::stored_secs),
             Some(&33.0)
         );
         assert!(
@@ -112188,6 +112481,7 @@ fn excluded_png_zip_parent_seed_never_becomes_first_visible_jpg_cache() {
             None,
             &old_png,
             &crate::cover_identity::CoverIdentity::Legacy,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic,
         )
         .unwrap();
     app.settings

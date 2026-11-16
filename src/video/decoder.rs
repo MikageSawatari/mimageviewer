@@ -18,6 +18,11 @@
 //! 2 系・4 系では `ChannelLayout` 周りの API が変わっているので、
 //! `cargo check` で型エラーが出たらそこを最初に疑うこと。
 
+use super::media_timeline::MediaTimeline;
+
+#[cfg(test)]
+#[path = "timeline_origin_tests.rs"]
+mod timeline_origin_tests;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1760,7 +1765,7 @@ pub struct AudioTrackInfo {
     pub sample_rate: Option<u32>,
     /// AV_DISPOSITION_DEFAULT が立っているか。
     pub disposition_default: bool,
-    /// Seconds from this stream's timestamps and stream metadata only.
+    /// Media seconds from this stream's timestamps and stream metadata only.
     pub start_secs: Option<f64>,
     pub end_secs: Option<f64>,
 }
@@ -1771,6 +1776,8 @@ pub struct VideoInfo {
     pub width: u32,
     pub height: u32,
     pub duration_secs: f64,
+    /// Effective origin; diagnostics and legacy resume migration only.
+    pub timeline_origin_secs: f64,
     /// Stream codec id name (h264 / hevc / av1 / vp9 ...).
     pub video_codec: String,
     /// FFmpeg decoder selected by avcodec_find_decoder/open_as.
@@ -2115,14 +2122,39 @@ fn send_video_info(
 }
 
 /// Input の stream metadata だけを読む。音声 setup / 出力 device には触れない。
+#[cfg(test)]
 fn enumerate_audio_tracks(input: &ffmpeg_the_third::format::context::Input) -> Vec<AudioTrackInfo> {
-    use ffmpeg_the_third::codec::decoder;
-    enumerate_audio_tracks_with_decoder(input, |codec_id| decoder::find(codec_id).is_some())
+    enumerate_audio_tracks_with_timeline(input, MediaTimeline::from_input(input))
 }
 
+fn enumerate_audio_tracks_with_timeline(
+    input: &ffmpeg_the_third::format::context::Input,
+    timeline: MediaTimeline,
+) -> Vec<AudioTrackInfo> {
+    use ffmpeg_the_third::codec::decoder;
+    enumerate_audio_tracks_with_decoder_and_timeline(
+        input,
+        |codec_id| decoder::find(codec_id).is_some(),
+        timeline,
+    )
+}
+
+#[cfg(test)]
 fn enumerate_audio_tracks_with_decoder(
     input: &ffmpeg_the_third::format::context::Input,
     decoder_available: impl Fn(ffmpeg_the_third::codec::Id) -> bool,
+) -> Vec<AudioTrackInfo> {
+    enumerate_audio_tracks_with_decoder_and_timeline(
+        input,
+        decoder_available,
+        MediaTimeline::from_input(input),
+    )
+}
+
+fn enumerate_audio_tracks_with_decoder_and_timeline(
+    input: &ffmpeg_the_third::format::context::Input,
+    decoder_available: impl Fn(ffmpeg_the_third::codec::Id) -> bool,
+    timeline: MediaTimeline,
 ) -> Vec<AudioTrackInfo> {
     use ffmpeg_the_third::format::stream::Disposition;
     use ffmpeg_the_third::media::Type as MediaType;
@@ -2152,14 +2184,26 @@ fn enumerate_audio_tracks_with_decoder(
                 .filter(|value| !value.is_empty())
                 .map(str::to_owned);
             let raw_start = stream.start_time();
-            let start_secs = stream_timestamp_secs(raw_start, stream.time_base(), true);
+            let time_base = stream.time_base();
+            let media_start = (raw_start != ffmpeg_the_third::ffi::AV_NOPTS_VALUE
+                && time_base.numerator() > 0
+                && time_base.denominator() > 0)
+                .then(|| {
+                    timeline.raw_to_media_secs(
+                        raw_start as f64 * f64::from(stream.time_base().numerator())
+                            / f64::from(stream.time_base().denominator()),
+                    )
+                });
+            let start_secs = media_start.and_then(valid_stream_secs);
             let stream_duration =
                 stream_timestamp_secs(stream.duration(), stream.time_base(), false);
             let end_secs = if let Some(duration) = stream_duration {
                 let origin = if raw_start == ffmpeg_the_third::ffi::AV_NOPTS_VALUE {
-                    Some(0.0)
+                    Some(timeline.raw_to_media_secs(0.0))
                 } else {
-                    start_secs
+                    // An actual negative preroll start can still have a known,
+                    // nonnegative end. Validate the two absolute bounds separately.
+                    media_start
                 };
                 origin.and_then(|start| valid_stream_secs(start + duration))
             } else if raw_start == 0 || raw_start == ffmpeg_the_third::ffi::AV_NOPTS_VALUE {
@@ -2410,7 +2454,8 @@ fn run_decoder(
         open_phase_t0.elapsed().as_secs_f64() * 1000.0
     ));
 
-    let audio_tracks = enumerate_audio_tracks(&input);
+    let timeline = MediaTimeline::from_input(&input);
+    let audio_tracks = enumerate_audio_tracks_with_timeline(&input, timeline);
 
     // ── 動画ストリーム選択 (任意) ──
     //
@@ -2618,7 +2663,7 @@ fn run_decoder(
         (if injected_open_setup_failure {
             Err("injected AudioSetup failure".to_string())
         } else {
-            build_audio_setup(&input, stream.index(), target_audio_sample_rate)
+            build_audio_setup(&input, stream.index(), target_audio_sample_rate, timeline)
         })
         .inspect_err(|error| crate::logger::log(format!("audio setup failed: {error}")))
         .ok()
@@ -2626,7 +2671,7 @@ fn run_decoder(
     let saved_open_failed = saved_matched && audio_setup.is_none();
     if saved_open_failed {
         audio_setup = default_audio_stream_index.and_then(|index| {
-            build_audio_setup(&input, index, target_audio_sample_rate)
+            build_audio_setup(&input, index, target_audio_sample_rate, timeline)
                 .inspect_err(|error| {
                     crate::logger::log(format!("default audio setup failed: {error}"))
                 })
@@ -2760,7 +2805,7 @@ fn run_decoder(
             let tb_den = tb.denominator() as f64;
             let to_secs = |t: i64| -> f64 {
                 if tb_den > 0.0 {
-                    t as f64 * tb_num / tb_den
+                    timeline.raw_to_media_secs(t as f64 * tb_num / tb_den)
                 } else {
                     0.0
                 }
@@ -2790,6 +2835,7 @@ fn run_decoder(
         width: vi_width,
         height: vi_height,
         duration_secs,
+        timeline_origin_secs: timeline.origin_secs(),
         video_codec: vi_video_codec,
         video_decoder: vi_video_decoder,
         d3d11va_supported: vi_d3d11va_supported,
@@ -2828,7 +2874,8 @@ fn run_decoder(
 
     if let Some(v) = video_setup.as_ref() {
         crate::logger::log(format!(
-            "video decoder: codec={} decoder={} hw_requested={hw_decode_requested} hw_effective={hw_decode_requested} d3d11va_supported={} hw_active_initially={} gpu_path={gpu_path_active} field_order={} stream_interlaced={} sar={}/{} d3d11va_config={}",
+            "video decoder: timeline_origin_secs={} codec={} decoder={} hw_requested={hw_decode_requested} hw_effective={hw_decode_requested} d3d11va_supported={} hw_active_initially={} gpu_path={gpu_path_active} field_order={} stream_interlaced={} sar={}/{} d3d11va_config={}",
+            timeline.origin_secs(),
             v.codec_name,
             v.decoder_name,
             v.hw_probe.d3d11va_supported,
@@ -2949,6 +2996,10 @@ fn run_decoder(
                 ),
                 ("avg_fps", serde_json::Value::from(video_avg_fps)),
                 ("duration_secs", serde_json::Value::from(duration_secs)),
+                (
+                    "timeline_origin_secs",
+                    serde_json::Value::from(timeline.origin_secs()),
+                ),
                 ("audio_codec", serde_json::Value::from(audio_codec)),
                 ("audio_rate", serde_json::Value::from(audio_rate)),
                 ("audio_channels", serde_json::Value::from(audio_ch)),
@@ -3128,6 +3179,7 @@ fn run_decoder(
                         tb_den_i32,
                         video_tb_num,
                         video_tb_den,
+                        timeline,
                         video_fps_num,
                         video_fps_den,
                         video_sar_num,
@@ -3307,7 +3359,12 @@ fn run_decoder(
                     let result = if injected_failure {
                         Err("injected AudioSetup failure".to_string())
                     } else {
-                        build_audio_setup(&input, choice.stream_index, target_audio_sample_rate)
+                        build_audio_setup(
+                            &input,
+                            choice.stream_index,
+                            target_audio_sample_rate,
+                            timeline,
+                        )
                     };
                     if crate::perf::is_enabled() {
                         crate::perf::event(
@@ -3364,7 +3421,7 @@ fn run_decoder(
             // 「seek 要求を受け取り → input.seek() を実行 → 両 decode thread に Flush
             // marker を送る」までを担当。
             // タイムスタンプは AV_TIME_BASE_Q (1/1_000_000 秒、マイクロ秒) 単位。
-            let target_pts = (target_secs * 1_000_000.0) as i64;
+            let target_pts = timeline.media_to_av_time_base(target_secs);
 
             // 後方 / 絶対シークは `av_seek_frame + AVSEEK_FLAG_BACKWARD` を使う。
             // `avformat_seek_file` (= `Input::seek`) は AVSEEK_FLAG_BACKWARD を
@@ -3649,8 +3706,9 @@ fn run_decoder(
                 // queue が満杯なら demux 側を一時 stall させて逆圧をかけるのが正しい。
                 // seek Flush は別 control channel で優先配送するので、ここでは
                 // packet queue の満杯に巻き込まれない。
-                let packet_pts =
-                    packet_timestamp(&packet).map(|pts| (pts as f64) * video_tb_num / video_tb_den);
+                let packet_pts = packet_timestamp(&packet).map(|pts| {
+                    timeline.raw_to_media_secs((pts as f64) * video_tb_num / video_tb_den)
+                });
                 let packet_size = packet.size();
                 let seek_serial = demux_serial.packet_serial(&clock);
                 let queue_len_before = video_pkt_tx.len();
@@ -3782,7 +3840,8 @@ fn run_decoder(
                     // 抜ける条件なので、既に読めている video packet を audio back-pressure
                     // の後ろに取り残さない。
                     let packet_pts = audio_time_base_for_demux.and_then(|(tb_num, tb_den)| {
-                        packet_timestamp(&packet).map(|pts| (pts as f64) * tb_num / tb_den)
+                        packet_timestamp(&packet)
+                            .map(|pts| timeline.raw_to_media_secs((pts as f64) * tb_num / tb_den))
                     });
                     let seek_serial = demux_serial.packet_serial(&clock);
                     let queue_len_before = audio_pkt_tx.len();
@@ -4015,6 +4074,7 @@ fn run_video_decode(
     video_tb_den_i32: i32,
     video_tb_num: f64,
     video_tb_den: f64,
+    timeline: MediaTimeline,
     video_fps_num: u32,
     video_fps_den: u32,
     video_sar_num: u32,
@@ -4323,8 +4383,9 @@ fn run_video_decode(
                         stale_drop_burst_count = 0;
                     }
                     if first_packet_logged_for_serial != Some(serial) {
-                        let packet_pts = packet_timestamp(&packet)
-                            .map(|pts| (pts as f64) * video_tb_num / video_tb_den);
+                        let packet_pts = packet_timestamp(&packet).map(|pts| {
+                            timeline.raw_to_media_secs((pts as f64) * video_tb_num / video_tb_den)
+                        });
                         crate::logger::log(format!(
                             "[video-decode] first packet for serial={serial}: pts={packet_pts:?} pkt_rx_len={} video_tx_len={}",
                             video_pkt_rx.len(),
@@ -4748,15 +4809,14 @@ fn run_video_decode(
             consecutive_send_packet_errors = 0;
             recoverable_invalid_data_packets = 0;
             let decode_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
-            let pts = match video_frame_timestamp(&frame) {
-                Some(pts) => pts,
+            let mut pts_secs = match video_frame_timestamp(&frame) {
+                Some(pts) => timeline.raw_to_media_secs((pts as f64) * video_tb_num / video_tb_den),
                 None if frame_step_decode.is_some() => {
                     frame = Video::empty();
                     continue;
                 }
-                None => 0,
+                None => 0.0,
             };
-            let mut pts_secs = (pts as f64) * video_tb_num / video_tb_den;
             if frame_step_abort_discard_serial == Some(current_seek_serial) {
                 frame = Video::empty();
                 continue;
@@ -5526,8 +5586,9 @@ fn run_video_decode(
                     match filter.filter_one(frame_for_scaler) {
                         Ok(Some(filtered)) => {
                             if let Some(filtered_pts) = video_frame_timestamp(&filtered) {
-                                pts_secs_for_output =
-                                    (filtered_pts as f64) * video_tb_num / video_tb_den;
+                                pts_secs_for_output = timeline.raw_to_media_secs(
+                                    (filtered_pts as f64) * video_tb_num / video_tb_den,
+                                );
                             }
                             filtered_owned = Some(filtered);
                         }
@@ -6398,8 +6459,9 @@ fn run_audio_decode(
                 if let Some(min) = drop_before_secs {
                     let pkt_pts = packet_timestamp(&packet).unwrap_or(i64::MIN);
                     if pkt_pts != i64::MIN {
-                        let pkt_pts_secs =
-                            (pkt_pts as f64) * setup.time_base_num / setup.time_base_den;
+                        let pkt_pts_secs = setup.timeline.raw_to_media_secs(
+                            (pkt_pts as f64) * setup.time_base_num / setup.time_base_den,
+                        );
                         let pkt_dur_secs = (packet.duration().max(0) as f64) * setup.time_base_num
                             / setup.time_base_den;
                         if pkt_pts_secs + pkt_dur_secs < min - 0.020 {
@@ -6590,11 +6652,14 @@ fn log_audio_resample_boundary(
     timeline: &AudioResampleTimeline,
     flushed_frames: usize,
 ) {
-    let input_end = timeline
-        .0
-        .as_ref()
-        .map(|position| position.expected_input_end);
-    let output_end = timeline.output_pts();
+    let input_end = timeline.0.as_ref().map(|position| {
+        setup
+            .timeline
+            .raw_to_media_secs(position.expected_input_end)
+    });
+    let output_end = timeline
+        .output_pts()
+        .map(|pts| setup.timeline.raw_to_media_secs(pts));
     let input_delay = audio_resampler_delay_frames(setup, setup.input_rate);
     let output_delay = audio_resampler_delay_frames(setup, setup.out_rate);
     crate::logger::log(format!(
@@ -6944,6 +7009,10 @@ fn emit_audio_samples(
         convert_ms,
         emit_t0,
     } = converted;
+    // The resampler keeps its raw source timeline; trim, clocks and diagnostics
+    // leave this lane exclusively in media seconds, including the EOF tail.
+    pts_secs = setup.timeline.raw_to_media_secs(pts_secs);
+    let raw_pts_secs = raw_pts_secs.map(|pts| setup.timeline.raw_to_media_secs(pts));
     const CHANNELS: usize = 2;
     // post-seek preroll の trim:
     // avformat_seek は keyframe に戻るので、target_secs 未満の
@@ -7513,6 +7582,7 @@ impl FastDownmixToStereo {
 }
 
 struct AudioSetup {
+    timeline: MediaTimeline,
     stream_idx: usize,
     out_rate: u32,
     input_rate: u32,
@@ -7537,6 +7607,7 @@ fn build_audio_setup(
     input: &ffmpeg_the_third::format::context::Input,
     stream_index: usize,
     target_audio_sample_rate: u32,
+    timeline: MediaTimeline,
 ) -> Result<AudioSetup, String> {
     use ffmpeg::format::sample::{Sample, Type as SampleType};
     use ffmpeg::software::resampling::Context as ResampleContext;
@@ -7606,6 +7677,7 @@ fn build_audio_setup(
     ));
     let resampler = result.map_err(|e| format!("audio resampler init failed: {e}"))?;
     Ok(AudioSetup {
+        timeline,
         stream_idx: stream_index,
         out_rate,
         input_rate,
@@ -8718,6 +8790,8 @@ fn try_init_d3d11va_for_codec(
             return None;
         }
 
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         // HW デバイスコンテキスト作成。
         //    gpu_video_device があれば mIV の D3D11 デバイスを共有、なければ FFmpeg
         //    が新デバイスを作る (= 旧経路)。
@@ -9153,7 +9227,7 @@ fn try_gpu_blit_path(
 
 #[cfg(test)]
 mod audio_tail_seek_fixture_tests {
-    use super::{AudioResampleTimeline, DecodeHandles, VideoDynamicState, spawn};
+    use super::{AudioResampleTimeline, DecodeHandles, MediaTimeline, VideoDynamicState, spawn};
     use crate::video::clock::AvClock;
     use crate::video::engine::actor::state_code;
     use crate::video::{EngineEventSender, VideoUiWake};
@@ -9305,7 +9379,9 @@ mod audio_tail_seek_fixture_tests {
             let path =
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tail/tail4ms.wav");
             let input = ffmpeg_the_third::format::input(&path).unwrap();
-            let mut setup = super::build_audio_setup(&input, 0, 44_100).unwrap();
+            let mut setup =
+                super::build_audio_setup(&input, 0, 44_100, MediaTimeline::from_input(&input))
+                    .unwrap();
             let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
             clock.set_playing(true);
             let state = AtomicU8::new(state_code::PLAYING);
@@ -9404,7 +9480,8 @@ mod audio_tail_seek_fixture_tests {
         ffmpeg_the_third::init().unwrap();
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tail/tail4ms.wav");
         let input = ffmpeg_the_third::format::input(&path).unwrap();
-        let mut setup = super::build_audio_setup(&input, 0, 44_100).unwrap();
+        let mut setup =
+            super::build_audio_setup(&input, 0, 44_100, MediaTimeline::from_input(&input)).unwrap();
         let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
         clock.set_playing(true);
         let state = Arc::new(AtomicU8::new(state_code::PLAYING));
@@ -9506,7 +9583,9 @@ mod audio_tail_seek_fixture_tests {
             frame
         };
         let reference = {
-            let mut setup = super::build_audio_setup(&input, 0, 44_100).unwrap();
+            let mut setup =
+                super::build_audio_setup(&input, 0, 44_100, MediaTimeline::from_input(&input))
+                    .unwrap();
             let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
             clock.set_playing(true);
             let state = AtomicU8::new(state_code::PLAYING);
@@ -9543,7 +9622,9 @@ mod audio_tail_seek_fixture_tests {
                 .collect::<Vec<_>>()
         };
         for action in ["resume", "seek", "cancel"] {
-            let mut setup = super::build_audio_setup(&input, 0, 44_100).unwrap();
+            let mut setup =
+                super::build_audio_setup(&input, 0, 44_100, MediaTimeline::from_input(&input))
+                    .unwrap();
             let clock = Arc::new(AvClock::new(1.0, Arc::new(AtomicU64::new(0))));
             clock.set_playing(true);
             let state = Arc::new(AtomicU8::new(state_code::PLAYING));
@@ -9656,7 +9737,9 @@ mod audio_tail_seek_fixture_tests {
             let path =
                 Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/audio-tail/tail4ms.wav");
             let input = ffmpeg_the_third::format::input(&path).unwrap();
-            let mut setup = super::build_audio_setup(&input, 0, rate).unwrap();
+            let mut setup =
+                super::build_audio_setup(&input, 0, rate, MediaTimeline::from_input(&input))
+                    .unwrap();
             let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
             clock.set_playing(true);
             let state = AtomicU8::new(state_code::PLAYING);
@@ -9900,6 +9983,28 @@ mod audio_track_fixture_tests {
             Arc::new(super::VideoDynamicState::default()),
             Some(saved),
         )
+    }
+
+    #[test]
+    fn enumerate_audio_track_end_survives_a_genuinely_negative_start() {
+        let mut input = ffmpeg_the_third::format::input(&fixture_path("multi.mkv")).unwrap();
+        let audio_index = input.streams().best(MediaType::Audio).unwrap().index();
+        let time_base = input.stream(audio_index).unwrap().time_base();
+        assert_eq!((time_base.numerator(), time_base.denominator()), (1, 1000));
+        // SAFETY: this test exclusively owns Input, and no borrowed stream is
+        // retained. Model known stream metadata spanning media time -1..1.
+        unsafe {
+            let stream = *(*input.as_mut_ptr()).streams.add(audio_index);
+            (*stream).start_time = -1000;
+            (*stream).duration = 2000;
+        }
+        let tracks = enumerate_audio_tracks(&input);
+        let track = tracks
+            .iter()
+            .find(|track| track.stream_index == audio_index)
+            .unwrap();
+        assert_eq!(track.start_secs, None);
+        assert_eq!(track.end_secs, Some(1.0));
     }
 
     #[test]

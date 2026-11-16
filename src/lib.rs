@@ -51,6 +51,9 @@ mod run_native_failure;
 mod ui_previous_run_notice;
 pub use run_native_failure::PreparedRunExit;
 #[cfg(test)]
+#[path = "../tests/support/gpu_test_group.rs"]
+pub(crate) mod test_gpu_group;
+#[cfg(test)]
 mod test_native_focus;
 #[cfg(test)]
 #[path = "../tests/support/ui_harness.rs"]
@@ -67,6 +70,7 @@ pub mod ai_caption_db;
 mod app;
 pub(crate) mod caption_display_cache;
 pub(crate) mod cover_auto_crop;
+pub(crate) mod cover_auto_material;
 pub(crate) mod cover_auto_sample;
 pub mod cover_identity;
 pub mod cover_source_scope;
@@ -1987,6 +1991,8 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     let diagnostic_checkpoint = session.diagnostics.publisher();
     let mut depth_export_owner = depth_export::DepthExportProcessOwner::default();
     let depth_export_workers = depth_export_owner.client();
+    #[cfg(test)]
+    crate::test_gpu_group::assert_gpu_test_group();
     let run_result = eframe::run_native(
         "mimageviewer",
         options,

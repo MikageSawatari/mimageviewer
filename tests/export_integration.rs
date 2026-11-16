@@ -158,7 +158,7 @@ fn page_from_source(
 fn entry(label: &str, suffix: u8) -> ExportEntry {
     ExportEntry {
         label: label.to_string(),
-        suffix,
+        suffix: suffix.to_string(),
         conceal_preset: None,
         crop_override: None,
     }
@@ -366,7 +366,7 @@ fn conceal_presets_replace_only_the_current_conceal_setting() {
         entry("current", 0),
         ExportEntry {
             label: "preset".to_string(),
-            suffix: 1,
+            suffix: "1".to_string(),
             conceal_preset: Some(alternate.clone()),
             crop_override: None,
         },
@@ -397,7 +397,7 @@ fn conceal_presets_replace_only_the_current_conceal_setting() {
         ExportComposite::Single(page(&source, edits(BakeStage::Edits), [2, 1])),
         vec![ExportEntry {
             label: "preset".to_string(),
-            suffix: 1,
+            suffix: "1".to_string(),
             conceal_preset: Some(alternate),
             crop_override: None,
         }],
@@ -443,7 +443,7 @@ fn sns_frames_are_scaled_against_the_actual_composed_dimensions() {
         .enumerate()
         .map(|(index, crop)| ExportEntry {
             label: format!("frame {index}"),
-            suffix: (index + 1) as u8,
+            suffix: (index + 1).to_string(),
             conceal_preset: None,
             crop_override: Some((crop, [5, 2])),
         })
@@ -560,7 +560,7 @@ fn spread_conceal_is_composed_independently_for_each_page() {
     black.conceal_type = mimageviewer::conceal::ConcealType::BlackFill;
     let preset_entry = ExportEntry {
         label: "black".to_string(),
-        suffix: 1,
+        suffix: "1".to_string(),
         conceal_preset: Some(black),
         crop_override: None,
     };
@@ -865,7 +865,7 @@ fn session_basename_reserves_every_selected_suffix() {
     std::fs::write(temp.path().join("batch_2.png"), b"existing").unwrap();
 
     assert_eq!(
-        resolve_session_basename(temp.path(), "batch", "png", &[0, 1, 2]).unwrap(),
+        resolve_session_basename(temp.path(), "batch", "png", &["0", "1", "2"]).unwrap(),
         "batch_0001"
     );
 }
