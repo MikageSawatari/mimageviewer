@@ -1196,3 +1196,9 @@ App の発行境界で寿命とnative fadeを確定して、既存 toast state �
 libavif / dav1d / libyuv をリンクする。safe Rust APIが予算検査・RGBA8確保・表示変換と
 画素を確保しない寸法解析を所有し、core / Remote / EPUBで共用する。`avif_decoder` は本体のperf/ログ層。`image_decode` は形式選択と WIC 接続、使用デコーダと向き状態を共有する。
 worker・queue・context owner・永続 schema は追加しない。
+
+## App の低頻度状態の保持
+
+`App` のインライン領域は `app::tests::history_transition_storage_keeps_app_stack_footprint_bounded` で上限110,000バイトを保つ。大きな低頻度状態は、描画や入力の hot な状態と混ぜず、既存ownerのままヒープに置く。
+`export_dialog` と `book_reorder` はダイアログを開くときだけ `Option<Box<...>>` を作り、描画中の take／再挿入では同じBoxを保持する。書き出しは検証を通った開始時にだけ中身をworker要求へ移す。
+`settings_restore_state` はApp生成時に一度だけBoxを確保する。非表示中の完了poll・取消・終了処理は維持し、状態のリセットはBoxの中身へ代入する。毎フレームの再確保や初期化の先送りは行わない。

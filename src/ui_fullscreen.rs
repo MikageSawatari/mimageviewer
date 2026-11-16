@@ -57134,7 +57134,7 @@ impl App {
         if sns_split_export {
             self.complete_sns_split_mode();
         }
-        self.export_dialog = Some(crate::export_dialog::ExportDialogState {
+        self.export_dialog = Some(Box::new(crate::export_dialog::ExportDialogState {
             source: target.source,
             source_label: target.source_label,
             original_format: target.original_format.clone(),
@@ -57167,7 +57167,7 @@ impl App {
             original_include_metadata,
             initial_focus_done: false,
             error: None,
-        });
+        }));
         ctx.request_repaint();
         true
     }
@@ -57855,7 +57855,7 @@ impl App {
     fn start_export_from_dialog(
         &mut self,
         ctx: &egui::Context,
-        state_slot: &mut Option<crate::export_dialog::ExportDialogState>,
+        state_slot: &mut Option<Box<crate::export_dialog::ExportDialogState>>,
     ) -> Result<(), String> {
         let state = state_slot
             .as_ref()
@@ -57943,7 +57943,7 @@ impl App {
         // (AllDone) の単一トリガで refresh する。中間 Completed イベントでの
         // note_exported_file_for_folder_refresh は呼ばない (Codex review CONFIRMED)。
         let effective_include_metadata = state.include_metadata && metadata_possible;
-        let state = state_slot
+        let state = *state_slot
             .take()
             .expect("validated export dialog state must still exist");
         let request = crate::export_dialog::ExportRequest {

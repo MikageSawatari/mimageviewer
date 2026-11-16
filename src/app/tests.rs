@@ -3619,6 +3619,30 @@ fn mutation_refresh_zip_pin_keeps_level_cursor_scroll_filter_and_checks() {
 }
 
 #[test]
+fn cold_dialog_owners_keep_app_stack_footprint_bounded() {
+    use std::mem::size_of;
+    fn field_size<T>(_: fn(&App) -> &T) -> usize {
+        size_of::<T>()
+    }
+    // These cold payloads may grow without increasing the inline App footprint.
+    for (name, bytes) in [
+        ("export_dialog", field_size(|app| &app.export_dialog)),
+        (
+            "settings_restore_state",
+            field_size(|app| &app.settings_restore_state),
+        ),
+        ("book_reorder", field_size(|app| &app.book_reorder)),
+    ] {
+        println!("cold owner {name}={bytes}");
+        assert_eq!(
+            bytes,
+            size_of::<usize>(),
+            "{name} must stay off the App stack"
+        );
+    }
+}
+
+#[test]
 fn history_transition_storage_keeps_app_stack_footprint_bounded() {
     use std::mem::size_of;
     println!(

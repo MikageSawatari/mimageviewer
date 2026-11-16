@@ -414,7 +414,7 @@ impl App {
     pub(crate) fn open_settings_restore_dialog(&mut self) {
         let dir = crate::data_dir::get();
         let backups = settings_restore::list_backups(&dir);
-        self.settings_restore_state = SettingsRestoreState {
+        *self.settings_restore_state = SettingsRestoreState {
             backups,
             ..SettingsRestoreState::default()
         };
@@ -468,7 +468,7 @@ impl App {
             && !preferences_transfer_open
         {
             self.show_settings_restore = false;
-            self.settings_restore_state = SettingsRestoreState::default();
+            *self.settings_restore_state = SettingsRestoreState::default();
             if self.settings_boot_problem_source.is_some() {
                 self.show_settings_boot_problem_notice = true;
             }
@@ -804,7 +804,7 @@ impl App {
         }
         if exit_for_remote {
             self.show_settings_restore = false;
-            self.settings_restore_state = SettingsRestoreState::default();
+            *self.settings_restore_state = SettingsRestoreState::default();
             self.request_application_quit(ctx);
             return;
         }
@@ -815,7 +815,7 @@ impl App {
                 ResultKind::FailedRecoverable => {
                     // 状態は無傷、アプリ続行可。ダイアログを閉じるだけ。
                     self.show_settings_restore = false;
-                    self.settings_restore_state = SettingsRestoreState::default();
+                    *self.settings_restore_state = SettingsRestoreState::default();
                     if self.settings_boot_problem_source.is_some() {
                         self.show_settings_boot_problem_notice = true;
                     }
@@ -830,7 +830,7 @@ impl App {
                     // 親ダイアログも閉じる: viewport close は 1-2 frame 遅延するので、
                     // その間に親ウィンドウが flicker するのを防ぐ。
                     self.show_settings_restore = false;
-                    self.settings_restore_state = SettingsRestoreState::default();
+                    *self.settings_restore_state = SettingsRestoreState::default();
                     self.request_application_quit(ctx);
                 }
             }
