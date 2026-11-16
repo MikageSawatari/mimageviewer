@@ -139,6 +139,7 @@ fn emit(value: serde_json::Value) {
 }
 
 fn headless_gpu() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
+    crate::test_gpu_group::assert_gpu_test_group();
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::DX12;
     descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;

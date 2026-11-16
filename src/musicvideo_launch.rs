@@ -111,6 +111,8 @@ impl crate::app::App {
                 .map_err(|error| format!("音楽ビデオエディタの場所を解決できません: {error}"))?;
             let command = LaunchCommand::resolve(&core, request)?;
             // Dropping Child detaches; the GUI subsystem needs no console flags.
+            #[cfg(test)]
+            crate::test_gpu_group::assert_gpu_test_group();
             launch_with(command, cancel, |command| command.spawn().map(|_| ()))
         });
     }

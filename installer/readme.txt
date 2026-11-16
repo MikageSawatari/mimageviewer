@@ -125,6 +125,10 @@ Component（WIC）が必要ですが、Windows 11 には標準で
 
     %APPDATA%\mimageviewer\
 
+インストーラ版は、mImageViewer を使っている AI アプリ
+(Claude・ChatGPT など) を起動したまま更新できます。
+更新中は mImageViewer が終了するため、更新が終わってから起動してください。
+
 単体 exe 版を手動で置き換える場合は、mImageViewer と、
 mImageViewer を使っている AI アプリ (Claude・ChatGPT など) を
 終了してから置き換えてください。

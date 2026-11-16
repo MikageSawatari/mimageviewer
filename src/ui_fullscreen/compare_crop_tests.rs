@@ -6,6 +6,7 @@ fn assert_ready_compare_crop(editing: bool, oversized_legacy: bool, shader: bool
     #[cfg(windows)]
     let _input = crate::key_input::lock_test_input();
     let gpu = shader.then(|| {
+        crate::test_gpu_group::assert_gpu_test_group();
         egui_kittest::wgpu::create_render_state(
             crate::test_ui::wgpu_setup(),
             egui_wgpu::RendererOptions::default(),

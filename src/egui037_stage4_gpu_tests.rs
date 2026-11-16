@@ -11,6 +11,7 @@ pub(crate) struct OffscreenGpu {
 
 impl OffscreenGpu {
     pub(crate) fn new() -> Self {
+        crate::test_gpu_group::assert_gpu_test_group();
         let mut descriptor = wgpu::InstanceDescriptor {
             // Match the existing vendor GPU fixture; avoid Windows WGL initialization.
             backends: if cfg!(target_os = "windows") {

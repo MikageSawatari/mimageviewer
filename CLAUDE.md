@@ -408,6 +408,11 @@ VST3 bridge、署名、packagingなどrelease構成そのものを確認する�
   試験用 portable ビルドを使い捨ての path で起動することは、毎回の承認なしに常設で許可されている。範囲と条件は
   [docs/interactive-release-verification.md](docs/interactive-release-verification.md) の該当節と
   [docs/nightly-combination-test-plan.md](docs/nightly-combination-test-plan.md) §11。Sandbox の外には広げない。
+- **例外 (2026-11-15 利用者決定)**: サブ PC では、製品のインストーラ (配布版・開発中の版) を確認のために継続して
+  使ってよい。サブ PC にインストール済みの mIV は、確認のために更新・アンインストールしてよい (利用者の言葉:
+  「サブPCについて、製品のインストーラを継続的につかってもよいとしたいと思います。サブPCにインストール済みのｍIVは、
+  確認のために更新・削除したりしても問題ありません。」)。データは試験用の場所 (`--data-dir` 等) に向け、アンインストールの
+  「設定とキャッシュを削除しますか」は本物の `%APPDATA%` を指すので「いいえ」を選ぶ。メイン PC には広げない。
 - ユニットテストで再現できない Windows ネイティブ挙動を変えたら、実機確認を頼む前に検証用バイナリを用意する
   (core 内の挙動は `.\scripts\build-dev.ps1`、release 構成に依存する挙動は `.\scripts\build-release.ps1`)。
   エージェントのツールから呼ぶときは `*>&1` を付けない。

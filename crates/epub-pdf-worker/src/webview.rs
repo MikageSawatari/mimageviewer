@@ -260,6 +260,8 @@ impl Host {
         ));
         let ud = wide(&user_data.to_string_lossy());
         let options = network_options()?;
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         unsafe {
             CreateCoreWebView2EnvironmentWithOptions(
                 PCWSTR::null(),

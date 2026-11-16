@@ -296,6 +296,7 @@ mod tests {
 
     #[test]
     fn capture_headless_callback_readback_preserves_rgba_and_unpads_bgra() {
+        crate::test_gpu_group::assert_gpu_test_group();
         struct RestoreProbe(bool);
         impl Drop for RestoreProbe {
             fn drop(&mut self) {

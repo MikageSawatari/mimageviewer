@@ -2,6 +2,11 @@
 # The full gate runs workspace doctests separately with cargo test --doc.
 nextest-version = "0.9.143"
 
+[test-groups]
+# Limit simultaneous GPU device/session tests, not devices within one test.
+# Driver contention is an unconfirmed hypothesis; see docs/gpu-test-groups.md.
+gpu = { max-threads = 2 }
+
 [profile.default]
 test-threads = "num-cpus"
 retries = 0
@@ -35,3 +40,125 @@ filter = '''
 '''
 priority = 100
 slow-timeout = { period = "120s", terminate-after = 5 }
+
+# Overrides resolve each setting independently: retain the slow tests' priority
+# and timeout above while assigning this group. New GPU helpers/tests belong in
+# a gpu_tests module, or must extend this inventory (including transitive callers).
+# Test-only device/session entry points must call assert_gpu_test_group; see
+# tests/support/gpu_test_group.rs and docs/gpu-test-groups.md.
+# Package/binary predicates reject absent names in standalone vendor graphs.
+# A shared binary regex is valid in workspace and every standalone vendor graph;
+# kind(test) restricts its assignments to the integration targets. Vendor lib
+# alternatives validate the matcher there without grouping their CPU tests.
+[[profile.default.overrides]]
+filter = '''
+    test(/(^|::)gpu_tests::/)
+    | test(/(^|::)test_gpu_group::tests::/)
+    | (kind(test) & binary(/^(ui_snapshot|book_composition_editor_snapshots|test_ai_upscale|test_tile_blend|egui(_wgpu|_winit)?|epaint|eframe)$/))
+    | test(/^app::depth_export::main_window_tests::/)
+    | test(/^app::depth_export::tests::/)
+    | test(/^app::depth_main_window_tests::/)
+    | test(/^app::depth_setup_entry_tests::/)
+    | test(/^app::gamepad_input::overview_guide_snapshots::/)
+    | test(/^app::tests::ai_crash_655::/)
+    | test(/^compare_wgpu::gpu_tests::/)
+    | test(/^local_adjust_effect_ui::tests::/)
+    | test(/^native::run::tests::windows_process_test::/)
+    | test(/^page_turn_animation::snapshot_tests::/)
+    | test(/^panorama_wgpu::gpu_tests::/)
+    | test(/^ui_adjustment_panel::creative_lut_ui_tests::/)
+    | test(/^ui_dialogs::preferences::pages::plain_folder_spread_tests::/)
+    | test(/^ui_fullscreen::canonical_demand::draw_key_tests::/)
+    | test(/^ui_fullscreen::depth_main_window_tests::/)
+    | test(/^video::native_window_thread_spike::/)
+    | test(=ai::vlm_worker::tests::real_model_serve_matches_v1_0_on_all_26_images_when_configured)
+    | test(/^app::depth_view_tests::(depth_actual_f12_both_directions_end_depth_and_offer_reentry|depth_actual_forks_retire_before_new_identity_and_keep_sibling_request_or_slot|depth_actual_independent_activation_retires_own_request_or_slot_and_keeps_sibling|depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms|depth_actual_still_window_toggle_retires_before_the_next_presentation)$/)
+    | test(/^app::depth_view_tests::(depth_actual_touch_page_navigation_ignores_suspended_committed_z_zoom|depth_actual_viewer_pass_retires_video_spread_continuous_and_late_animation|depth_actual_z_d_keys_preserve_committed_zoom_through_idle_and_blocked_input|depth_background_change_preserves_panorama_key_suppression_and_existing_ring_behavior|depth_background_cycle_actual_viewer_updates_underlay_and_retires_replaced_material)$/)
+    | test(/^app::depth_view_tests::(depth_background_cycle_key_and_ring_preserve_owner_and_alpha_rules|depth_close_and_foreground_park_remove_the_context_owner|depth_collapsed_preference_survives_d_exit_and_reentry|depth_continuation_ends_for_animation_continuous_reading_and_closed_viewer|depth_continues_between_stills_but_video_cannot_resurrect_it)$/)
+    | test(/^app::depth_view_tests::(depth_exclusive_owner_survives_sibling_open_close_without_cross_context_reset|depth_f11_d_reentry_rejects_old_readback_and_estimation_after_new_slot_is_published|depth_f12_without_depth_preserves_plain_mode_notifications|depth_fork_retirement_preserves_existing_panorama_state_and_intent_transfer|depth_i_and_tab_toggle_only_the_depth_panel_through_the_shared_key_handler)$/)
+    | test(/^app::depth_view_tests::(depth_linked_close_retires_request_or_gpu_slot_immediately|depth_linked_f11_keeps_readback_estimation_and_ready_owners_in_both_directions|depth_linked_independent_open_retires_before_publishing_the_new_session_flag|depth_missing_model_opens_setup_without_capturing_or_replacing_panorama|depth_native_color_readback_and_lru_are_registered_then_retired_from_vram_accounting)$/)
+    | test(/^app::depth_view_tests::(depth_new_managed_texture_owns_the_wake_for_backend_registration_without_pointer_input|depth_panel_footer_uses_live_keymap_through_app_draw|depth_panel_hide_toast_uses_first_chord_once_and_show_is_silent_through_key_and_ring|depth_presentation_entry_continuation_and_commit_share_context_eligibility|depth_rejects_spread_and_editing_at_the_shared_entry_boundary)$/)
+    | test(/^app::depth_view_tests::(depth_replaces_active_or_inactive_panorama_and_clears_only_its_intent|depth_ring_dispatch_preserves_transforms_and_conflicting_modes|depth_same_presentation_preserves_request_lru_and_slot|depth_toggle_off_uses_effective_key_and_keeps_unassigned_d_inactive|depth_wait_actual_viewer_box_disappears_for_ready_failed_and_off)$/)
+    | test(/^app::depth_view_tests::(depth_wait_actual_viewer_box_obeys_delay_and_panel_visibility|depth_wait_actual_viewer_caption_uses_effective_binding_and_hides_while_not_visible|depth_wait_clock_survives_readback_estimation_and_resets_only_after_terminal)$/)
+    | test(/^app::final_prepare_budget::native_tests::(back_all_live_next_precede_previous_in_both_route_orders_and_unknown_sibling|back_early_service_discards_previous_after_animation_off|back_mixed_unknown_pending_siblings_cancel_previous_in_both_visit_orders|back_next_native_pending_and_unknown_block_previous_cpu_and_registration|back_previous_ready_is_taken_by_display_on_direction_reversal_without_slot)$/)
+    | test(/^app::final_prepare_budget::native_tests::(back_root_waits_for_next_native_then_starts_and_registers_previous_resident_job|d3_4b_activity_and_changed_inputs_do_not_claim_and_quiet_opportunity_resumes|d3_4b_all_contexts_final_registration_precedes_first_context_native_miss|d3_4b_live_sibling_blocks_native_and_park_preserves_material_while_b_resumes|d3_4b_pair_native_misses_share_one_slot_and_converge_in_two_opportunities)$/)
+    | test(/^app::final_prepare_budget::native_tests::(d3_4b_remote_acquisition_invalidates_collected_native_demand_without_claim|d3_4b_retry_discards_candidate_values_without_refunding_activity|d3_4b_root_hook_waits_for_backing_without_claim_then_normal_prepare_hits)$/)
+    | test(/^app::grid_paint::book_resume_meter_tests::(book_resume_meter_snapshot_dark|book_resume_meter_snapshot_dark_high_dpi|book_resume_meter_snapshot_light|book_resume_meter_snapshot_light_high_dpi|media_resume_meter_snapshot_badge_off_dark)$/)
+    | test(/^app::grid_paint::book_resume_meter_tests::(media_resume_meter_snapshot_badge_off_light|media_resume_meter_snapshot_dark|media_resume_meter_snapshot_dark_high_dpi|media_resume_meter_snapshot_light|media_resume_meter_snapshot_light_high_dpi)$/)
+    | test(/^app::grid_paint::book_resume_meter_tests::(reserved_resume_meter_snapshot_dark|reserved_resume_meter_snapshot_dark_high_dpi|reserved_resume_meter_snapshot_light|reserved_resume_meter_snapshot_light_high_dpi)$/)
+    | test(/^app::grid_paint::type_icon_tests::(thumbnail_type_icon_snapshot_dark|thumbnail_type_icon_snapshot_light|thumbnail_type_icon_write_previews)$/)
+    | test(=app::mp4_tests::p4b3_start_pauses_audio_cancels_preview_and_suppresses_new_workers)
+    | test(/^app::multiwindow_scenario_tests::(multiwindow_depth_addon_embedded|multiwindow_depth_addon_embedded_independent_still|multiwindow_depth_addon_embedded_independent_video|multiwindow_depth_addon_fullscreen|multiwindow_depth_addon_grid)$/)
+    | test(/^app::multiwindow_scenario_tests::(multiwindow_depth_addon_linked|multiwindow_depth_addon_linked_parked_media|multiwindow_depth_export_embedded|multiwindow_depth_export_embedded_independent_still|multiwindow_depth_export_embedded_independent_video)$/)
+    | test(/^app::multiwindow_scenario_tests::(multiwindow_depth_export_linked|multiwindow_depth_export_linked_parked_media)$/)
+    | test(=app::tests::remote_video_stream_keeps_remote_dialog_without_entering_fullscreen)
+    | test(=capture::tests::capture_headless_callback_readback_preserves_rgba_and_unpads_bgra)
+    | test(=depth_estimation::tests::depth_real_model_matches_python_static_stretch)
+    | test(/^depth_export::tests::(depth_export_cancel_removes_each_partial_and_preserves_destination|depth_export_job_drop_cancels_and_cleans_each_format_without_ui_wait|depth_export_mp4_roundtrip_has_even_size_two_cycles_and_cfr_timestamps|depth_export_process_exit_reaps_partial_files_after_on_exit_and_app_drop)$/)
+    | test(/^depth_parallax_wgpu::focus_sampling_tests::(depth_focus_gpu_clicked_surface_stays_fixed_for_planes_and_continuous_depth|depth_focus_gpu_highlight_band_preserves_premultiplied_alpha)$/)
+    | test(/^depth_parallax_wgpu::tests::(depth_export_gpu_matches_screen_gamma_alpha_and_rotated_checker|depth_gpu_blit_shader_stale_guard_and_lru|depth_gpu_nonuniform_planes_rotate_and_crop_with_color|depth_gpu_transparency_matches_2d_changing_underlays_without_rebuilding_resources)$/)
+    | test(=global_search_ui::everything::ui::tests::everything_search_bar_not_responding_narrow_dark)
+    | test(/^gpu_lanczos::prewarm_tests::(prewarm_delivery_claim_cache_hit_and_output_lease_use_normal_ownership|prewarm_execution_rejects_changed_source_and_freed_backing_before_claim)$/)
+    | test(/^gpu_lanczos::tests::(back_native_execution_rechecks_no_removal_before_backing_claim_or_mutation|ordinary_prepare_output_limit_fallback_captures_actual_managed_allocation)$/)
+    | test(/^gpu_lanczos::measurement_tests::(lazy_776_default_only_then_other_families_through_prewarm_and_resolve|lazy_776_prepared_jobs_encode_after_resampler_drop_for_all_families|measure_776_dx12_fxc_first_resampler_and_upscale_jobs)$/)
+    | test(=native::wgpu_integration::viewport_retirement_tests::retirement_texture_delivery_wgpu_startup_before_full_and_free_only)
+    | test(/^renderer::tests::(managed_mipmaps_regenerate_after_partial_upload_and_respect_view_options|public_mipmap_generator_preserves_odd_edge_texels)$/)
+    | test(/^test_ui::tests::(context_root_fixture_panel_matches_raw_root_without_wrapper_margin|render_state_enumerates_only_product_backends)$/)
+    | test(=ui_adjustment_panel::adjust_scope_selector_tests::adjust_scope_action_labels_fit_258px_body)
+    | test(/^ui_adjustment_panel::local_adjust_segmentation_tests::(colorize_gradient_preview_snapshot_custom_palette|colorize_preset_slots_snapshot_single_row|local_adjust_panel_snapshot_empty_layer_list|local_adjust_panel_snapshot_layer_disabled|local_adjust_panel_snapshot_one_full_layer)$/)
+    | test(/^ui_adjustment_panel::local_adjust_segmentation_tests::(local_adjust_panel_snapshot_preview_to_selected_layer_active|local_adjust_panel_snapshot_repair_clone_effect|local_adjust_panel_snapshot_repair_effect|local_adjust_panel_snapshot_two_layers_second_selected|local_adjust_segmentation_choice_buttons_snapshot)$/)
+    | test(=ui_adjustment_panel::picker_layout_1727_tests::effect_picker_default_dark_snapshot)
+    | test(=ui_dialogs::about::tests::miv_sound_credits_snapshot_light_and_narrow_dark)
+    | test(=ui_dialogs::caption_delete::tests::caption_delete_confirmation_snapshot)
+    | test(=ui_dialogs::caption_job::tests::caption_job_progress_snapshot)
+    | test(/^ui_dialogs::collections::tests::(collection_grid_remove_confirm_light_snapshot|collection_manager_import_preview_light_snapshot|collection_manager_populated_dark_snapshot|collection_reorder_dark_snapshot)$/)
+    | test(=ui_dialogs::context_menu::delete_confirm_tests::delete_confirm_modal_blocks_background_pointer_action)
+    | test(/^ui_dialogs::depth_addon::tests::(depth_addon_confirm_snapshot|depth_addon_preferences_snapshot)$/)
+    | test(/^ui_dialogs::favorites_editor::tests::(favorites_full_outcomes_and_maintenance_snapshot_dark|similar_index_progress_snapshot_dark)$/)
+    | test(/^ui_dialogs::preferences::pages::fullscreen_manual_nav_wrap_setting_tests::(fullscreen_manual_nav_wrap_setting_snapshot_dark_on|fullscreen_manual_nav_wrap_setting_snapshot_light_off)$/)
+    | test(/^ui_dialogs::preferences::pages::page_turn_animation_settings_tests::(page_turn_animation_settings_snapshot_dark_off|page_turn_animation_settings_snapshot_light_on)$/)
+    | test(=ui_dialogs::preferences::pages::tests::command_chords_catalog_snapshot_dark)
+    | test(/^ui_dialogs::preferences::tests::(auto_view_trim_default_setting_snapshot_dark_on|auto_view_trim_default_setting_snapshot_light_off|clipboard_bake_stage_preferences_snapshot|preferences_context_menu_layout_snapshot|preferences_duplicate_files_epub_option_snapshot)$/)
+    | test(/^ui_dialogs::preferences::tests::(preferences_folder_edit_restore_snapshot|preferences_parallelism_pdf_count_snapshot|preferences_recycle_bin_delete_confirmation_snapshot|preferences_search_results_snapshot|preferences_search_window_hints_snapshot)$/)
+    | test(/^ui_dialogs::preferences::tests::(preferences_still_seek_strip_height_settings_snapshot_narrow_width|preferences_still_seek_strip_height_settings_snapshot_regular_width|preferences_video_seek_strip_height_settings_snapshot_narrow_width|preferences_video_seek_strip_height_settings_snapshot_regular_width|preferences_viewer_notice_visibility_snapshot)$/)
+    | test(/^ui_dialogs::preferences::tests::(singleton_spread_placement_setting_snapshot|singleton_spread_placement_setting_snapshot_dark_on|singleton_spread_placement_setting_snapshot_light_off|singleton_spread_placement_setting_snapshot_light_on|spread_page_supplement_setting_snapshot)$/)
+    | test(=ui_dialogs::settings_restore::tests::operation_customize_diff_preview_snapshot)
+    | test(/^ui_dialogs::vlm_addon::tests::(vlm_setup_confirm_snapshot|vlm_setup_preferences_snapshot_and_busy_buttons)$/)
+    | test(=ui_dialogs::whats_new::tests::version_highlights_initial_width_respects_037_window_budget)
+    | test(=ui_folder_pane::tests::sort_control_and_reload_fit_the_minimum_folder_pane_width)
+    | test(=ui_fullscreen::compare_crop_tests::crop_ready_compare_shader_wipe_affordance_precedes_dim_frame_and_handles)
+    | test(/^ui_fullscreen::depth_focus_tests::(depth_collapsed_panel_next_pass_routes_mouse_ctrl_hover_and_touch_in_both_presentations|depth_focus_click_pending_failed_and_original_hold_never_navigate|depth_focus_click_saves_once_across_discard_and_highlight_repaints|depth_focus_click_uses_same_pass_resized_transform_with_gradient|depth_focus_click_uses_same_pass_rotated_transform_with_gradient)$/)
+    | test(/^ui_fullscreen::depth_focus_tests::(depth_focus_highlight_repaints_stationary_mouse_but_not_hidden_minimized_or_export_modal|depth_focus_modal_remote_and_mouse_drag_keep_canvas_unmodified|depth_focus_paint_checks_pass_resource_bounds_lru_and_media_radius|depth_focus_real_presentations_register_before_paint_with_deferred_wheel_and_discard|depth_focus_touch_panel_is_excluded_and_ctrl_taps_outside_still_turn_pages)$/)
+    | test(/^ui_fullscreen::music_overflow_tests::(music_overflow_snapshot_hud_narrow|music_overflow_snapshot_hud_normal|music_overflow_snapshot_panel)$/)
+    | test(=ui_fullscreen::page_turn::final_prepare_tests::back_root_native_reaches_real_backward_single_pair_offer_and_d2_handoff)
+    | test(=ui_fullscreen::page_turn::roi_tests::page_turn_actual_native_roi_roundoff_starts_and_completes_ltr_rtl_forward_backward)
+    | test(=ui_fullscreen::page_turn_submission_tests::page_turn_animation_mesh_visual_snapshots)
+    | test(/^ui_fullscreen::tests::(fullscreen_overflow_panel_snapshot_navigator_submenu|fullscreen_overflow_panel_snapshot_page_turn_on|fullscreen_overflow_panel_snapshot_root|fullscreen_overflow_panel_snapshot_root_tall_without_scrollbar|fullscreen_overflow_panel_snapshot_slideshow)$/)
+    | test(/^ui_fullscreen::tests::(last_page_supplement_visual_snapshots|similar_preview_navigator_snapshot_dark|still_seek_real_overlay_snapshots)$/)
+    | test(=ui_fullscreen::tests::still_seek_menu::still_seek_popup_regular_and_narrow_snapshots)
+    | test(=ui_fullscreen::tests::still_seek_rotation::still_seek_f6_real_overlay_rotation_snapshots)
+    | test(=ui_helpers::mask_bucket_1673_tests::mask_bucket_1673_options_snapshot_and_color_control_state)
+    | test(=ui_helpers::tests::snapshot_texture_assets_survive_local_drop_without_name_or_context_aliasing)
+    | test(=ui_main::applied_at_details_column_tests::tag_sort_choices_snapshot_dark)
+    | test(/^ui_main::section207_tests::(file_organize_destinations_location_menu_navigation_and_snapshot|file_organize_destinations_location_toggle_snapshot|file_organize_destinations_many_location_entries_scroll_and_select_last|physical_parent_folder_bar_snapshot|section207_default_folder_geometry_matches_the_separate_panels)$/)
+    | test(/^ui_main::section207_tests::(section207_folder_separator_reservation_matches_the_separate_panels|section207_reported_controls_keep_left_input_right_order|section207_snapshot_label_keeps_input_minimum_order_and_panel_bounds)$/)
+    | test(/^ui_main::section292_tests::(section292_facet_sort_snapshot_dark|section292_facet_sort_snapshot_narrow_dark)$/)
+    | test(/^ui_metadata_panel::caption_panel_tests::(caption_panel_book_snapshot_changed_cover_keeps_text|caption_panel_book_snapshot_ok|caption_panel_book_snapshot_video_cover_does_not_offer_recreation|caption_panel_snapshot_failed|caption_panel_snapshot_ok)$/)
+    | test(/^ui_metadata_panel::caption_panel_tests::(caption_panel_snapshot_rotation_stale|caption_panel_snapshot_stale_dark_strong|caption_panel_snapshot_stale_keeps_description|caption_panel_snapshot_stale_light|caption_panel_snapshot_stale_light_strong)$/)
+    | test(=ui_metadata_panel::metadata_info_target_tests::metadata_info_target_selector_snapshot_and_click)
+    | test(=ui_music_panels::tests::music_audio_track_selector_open_dark_snapshot)
+    | test(/^ui_music_timeline::tests::(timeline_bass_partial_raster_snapshot|timeline_key_states_raster_snapshot)$/)
+    | test(/^ui_previous_run_notice::tests::(previous_run_notice_snapshot_checkpoint_small_light|previous_run_notice_snapshot_observations_small_light|previous_run_notice_snapshot_small_200_dark|previous_run_notice_snapshot_small_light)$/)
+    | test(/^ui_text::tests::(annotation_add_dialog_snapshot_dark|bubble_body_stays_within_panel_width_with_fill_on_or_off)$/)
+    | test(=ui_tools_menu::tests::tools_menu_snapshot_dark_and_light)
+    | test(/^video::clockless_transcode::tests::(finite_fixture_flushes_final_fragment_and_endlist|finite_source_reaches_end_after_filling_the_live_window_without_a_next_fetch)$/)
+    | test(/^video::native_presenter::overlay_draw::tests::(native_top_bar_long_title_snapshot|native_video_adjustment_anime4k_panel_snapshot|native_video_adjustment_lut_panel_snapshot|native_video_adjustment_tone_panel_snapshot|native_video_more_popup_snapshot)$/)
+    | test(/^video::native_presenter::render_core::resample_pipeline::tests::(anime4k_chain_writes_target_with_native_fullscreen_vertex_shader|measure_anime4k_variants_with_gpu_timestamps|measure_anime4k_vl_runtime_compile_versus_bytecode_load|nis_draw_writes_target_with_default_d3d11_rasterizer)$/)
+    | test(=video::native_window_pump::tests::production_parent_destroy_remains_bounded_during_render_stall)
+    | test(=video::seek_strip_thumbs::tests::probe_app_thumbnail_worker_window_from_env)
+    | test(=video::stream::encoder::tests::probe_local_h264_encoder_open_results)
+    | test(/^winit::tests::(acquisition_failure_equivalent_and_normal_submission_share_completion_owner|discard_texture_delivery_offscreen_actual_retry_immediate_callback_drop_readback|discard_texture_delivery_offscreen_unavailable_pending_later_free_not_cancelled|mipmap_submission_tracks_later_writes_without_duplicate_empty_submit|no_surface_drains_ordered_full_partial_submits_uploads_then_frees)$/)
+    | test(/^winit::tests::(public_window_removal_paths_keep_sibling_attachments_and_shared_renderer|retirement_texture_delivery_offscreen_startup_preserves_first_full_atlas_and_user_texture|surface_size_limit_constrains_initial_safe_unsafe_resize_and_recreate|texture_delivery_observer_follows_normal_drop_mip_and_no_paint_submission_before_free|texture_delivery_observer_skips_disabled_absent_renderer_and_unchanged_updates)$/)
+    | test(=winit::tests::zero_client_surface_skips_configure_and_acquire_then_resumes_rendering)
+'''
+test-group = "gpu"
