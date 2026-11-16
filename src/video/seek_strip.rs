@@ -255,8 +255,14 @@ fn time_grid_cell_secs(index: usize, interval_secs: f64, duration_secs: f64) -> 
     let last_cell_secs = (duration_secs - interval_secs).max(0.0);
     regular_secs.min(last_cell_secs)
 }
+
+// Like thin_keyframes, allow a few f64 rounding steps at the timestamp scale:
+// subtracting two cell times can round an exact half interval downward. This is
+// arithmetic roundoff, not FRAME_PTS_MATCH_EPSILON_SECS's 5 ms decode tolerance.
+const TIME_GRID_TAIL_RELATIVE_ROUNDING_GUARD: f64 = 8.0 * f64::EPSILON;
+
 /// 有効な格子セル数。端数の末尾候補を寄せた後の距離で採否をここだけで決める。
-/// 半間隔未満なら候補を 1 つ省き、半間隔ちょうどなら残す。唯一のセルは省かない。
+/// 丸め誤差を除いて半間隔未満なら候補を 1 つ省き、半間隔ちょうどなら残す。唯一のセルは省かない。
 fn time_grid_cell_count(interval_secs: f64, duration_secs: f64) -> usize {
     if !interval_secs.is_finite()
         || interval_secs <= 0.0
@@ -280,7 +286,9 @@ fn time_grid_cell_count(interval_secs: f64, duration_secs: f64) -> usize {
     if count > 1 {
         let last = time_grid_cell_secs(count - 1, interval_secs, duration_secs);
         let previous = time_grid_cell_secs(count - 2, interval_secs, duration_secs);
-        if last - previous < interval_secs * 0.5 {
+        let comparison_scale = last.abs().max(previous.abs()).max(interval_secs);
+        let rounding_guard = TIME_GRID_TAIL_RELATIVE_ROUNDING_GUARD * comparison_scale;
+        if last - previous < interval_secs * 0.5 - rounding_guard {
             count -= 1;
         }
     }
@@ -1696,6 +1704,37 @@ mod tests {
             }
             if duration >= interval {
                 assert!(duration - actual.last().unwrap() >= interval);
+            }
+        }
+    }
+
+    #[test]
+    fn time_grid_fractional_half_interval_keeps_only_roundoff_at_the_boundary() {
+        // 6.6 - 1.2 - 4 * 1.2 is 0.5999999999999996 in f64, although
+        // the intended gap is exactly half an interval. A real 1 ns deficit
+        // must still omit the cell. Scale both directions to reject a fixed
+        // tolerance in seconds and exercise cancellation at different magnitudes.
+        for scale in [1.0, 1.0e-6, 1.0e6] {
+            for (delta, expected_count, expected_last) in
+                [(0.0, 6, 5.4), (-1.0e-9, 5, 4.8), (1.0e-9, 6, 5.4 + 1.0e-9)]
+            {
+                let axis = StripAxis::TimeGrid {
+                    interval_secs: 1.2 * scale,
+                    fallback_interval_secs: 1.2 * scale,
+                    duration_secs: (6.6 + delta) * scale,
+                };
+                assert_eq!(
+                    axis.cell_count(),
+                    expected_count,
+                    "scale={scale} delta={delta}"
+                );
+                let last = axis.cell(expected_count - 1).unwrap();
+                let expected_last = expected_last * scale;
+                assert!(
+                    (last - expected_last).abs() <= 16.0 * f64::EPSILON * expected_last.abs(),
+                    "scale={scale} delta={delta} last={last} expected={expected_last}"
+                );
+                assert_eq!(axis.cell(expected_count), None);
             }
         }
     }

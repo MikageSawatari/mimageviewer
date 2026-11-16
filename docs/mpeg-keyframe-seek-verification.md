@@ -254,3 +254,29 @@ run IDはそれぞれ`88c08f2c-d522-4c29-ab84-fde49cf9ec0b`、`5318f099-d8ec-440
 `git diff --check`は成功し、HEADは`afbbffe34`のまま。呼出し元の検索記録は
 `target/785-grid/callers-audit.txt`、最終ソースのSHA-256は`source-snapshot.json`へ保存した。
 本体lib全件・build-dev・製品バイナリ起動・コミットは実施していない。実機での修正後の表示は未確認。
+
+## 小数間隔の半分ちょうどと丸め誤差（2026-11-16、独立レビューP3）
+
+対象は`e81fcde5b`からの未コミット差分。独立レビュー（ACCEPT WITH CHANGES）で、6.6秒/1.2秒の
+末尾候補と直前の差がf64で`0.5999999999999996`になり、本来半間隔ちょうどの6枠目を省く指摘を受けた。
+
+`time_grid_cell_count`の比較に、`8 * f64::EPSILON * max(abs(last), abs(previous), interval)`を
+丸め許容として入れた。既存の`thin_keyframes`と同じ演算丸めの扱いを、この比較専用の定数と理由の
+コメントで明示する。減算前の時刻の大きさを使うため、桁落ちも時刻のscaleに応じて許容する。
+`FRAME_PTS_MATCH_EPSILON_SECS`は復号時刻用の固定5msであり、本当に半間隔未満の差まで隠すため使わない。
+採否の判定は引き続き一箇所で、セルの時刻・末尾の寄せ方は変更しない。
+
+回帰試験は6.6/1.2を6枠・末尾5.4とし、長さを1ns短くした場合は5枠・末尾4.8、
+1ns長くした場合は6枠・末尾5.4+1nsとする。同じケースを時刻と間隔の1e-6倍・1e6倍でも検査し、
+固定の秒数許容で境界前後を同一視しないこと、範囲外のセルを返さないことを検査する。
+
+指定runner（Owner=`fix-785`）経由で、次のfilterだけを通常feature / test profileで実行した。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/video::seek_strip/)' --test-threads 2 --ignore-default-filter --run-ignored default --retries 0 --no-tests fail --no-fail-fast --failure-output immediate
+```
+
+**156件成功・失敗0、6.898秒**（compile 1分54秒）。run IDは`bc8aa27a-a5fa-4109-a408-36b0385f8935`。
+scriptとログは`target/785-grid-rounding/focused.ps1` / `seek-strip.log`。
+最後に引数なしの`cargo fmt`と`cargo fmt --check`も同runner内で成功（09:29:05、exit=0）。
+`git diff --check`は成功。本体lib全件・他のfilter・build-dev・製品バイナリ起動・コミットは実施していない。
