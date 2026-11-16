@@ -34393,7 +34393,7 @@ impl App {
                 // Current SW_HIDE state, not a snapshot taken when the worker began.
                 // Terminals consumed while Pending cannot reach this manager. Resample
                 // durable pending rows after adoption, even if its initial drain finished.
-                manager.notify_caption_changed();
+                manager.notify_derived_text_changed();
                 manager.set_io_throttled(!self.window_visible);
                 if crate::perf::is_enabled() {
                     crate::perf::event("startup", "metadata_search_ready", None, 0, &[]);
@@ -50419,16 +50419,16 @@ impl App {
         crate::logger::log(message);
     }
 
-    /// DB writers publish only committed caption changes. Startup also drains
+    /// DB writers publish only committed derived text changes. Startup also drains
     /// durable pending rows when the manager is not ready yet.
-    pub(crate) fn notify_caption_changed(&self) {
+    pub(crate) fn notify_derived_text_changed(&self) {
         if let Some(manager) = self.indexer_init.as_ref() {
-            manager.notify_caption_changed();
+            manager.notify_derived_text_changed();
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn caption_epoch_for_test(
+    pub(crate) fn derived_text_epoch_for_test(
         &mut self,
         data_dir: &std::path::Path,
     ) -> Arc<std::sync::atomic::AtomicU64> {
@@ -50444,7 +50444,7 @@ impl App {
                 .expect("caption sender test manager"),
             );
         }
-        self.indexer_init.as_ref().unwrap().caption_epoch()
+        self.indexer_init.as_ref().unwrap().derived_text_epoch()
     }
 
     pub(crate) fn apply_metadata_import_terminal_refresh(

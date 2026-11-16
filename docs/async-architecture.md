@@ -1539,13 +1539,17 @@ detachedの述語・viewport・context別cacheを変更せず、Remoteのパネ�
 境界と簡素化の判断は [画像の設計 §21.11.2](local-vlm-caption-plan.md#21112-v1-4a-画像の説明文の表示) と
 [本の設計 §21.13](local-vlm-caption-plan.md#2113-v1-4b-の設計-2026-11-03) を参照。
 
-### 3.2.5 AI 説明文の索引への反映（V2a・V2b、未リリース）
+### 3.2.5 派生テキスト（説明文・文字起こし）の索引への反映
 
-反映待ちの正本は `ai_caption.db` の `captions.indexed = 0` と `caption_removed`。
-`IndexerManager` が1つの `Arc<AtomicU64>`（`caption_epoch`）を所有し、再構成workerから
+反映待ちの正本は各DBの `indexed = 0` と削除印（`caption_removed` / `transcript_removed`）。
+`STORES` の `derived_text` が対象の一覧、`display_cache` が表示失効の宣言を持つ。
+変更の集計・metadata transfer・復元・削除・改名は同じdescriptorから索引通知と表示の印を作る。
+`derived_text` モジュールが両DBの読取とpending/ack SQLを共用し、ingestとCtrl+Fも同じ本文変換を使う。
+`IndexerManager` が1つの `Arc<AtomicU64>`（`derived_text_epoch`）を所有し、再構成workerから
 全 metadata supervisor へ同じ参照を渡す。送り手は内容のcommit後、Appの既存完了採用点から
 世代を進めるだけで、UIスレッドのDB参照・管理役一覧への配布・容量付き通知channelを追加しない。
-固定表紙だけの変更は世代を進めない。managerが未準備の間の変更もDBの反映待ちに残る。
+固定表紙だけの変更は世代を進めない。文字起こしの保存は中止後に届くcommit済み終端も同じ通知へ渡す。
+managerが未準備の間の変更もDBの反映待ちに残る。
 AppがReadyを採用するときにも世代を一度進め、background側の初回反映完了からUI採用までの
 間にcommit終端を採用した場合を拾う。新たな待機状態や未処理フラグは持たない。
 

@@ -247,7 +247,7 @@ pub struct StoreMutationEffects {
     book_composition_changed: bool,
     caption_display_stale: bool,
     transcript_display_stale: bool,
-    ai_captions_changed: bool,
+    derived_text_changed: bool,
     rotation_keys: BTreeSet<String>,
 }
 
@@ -268,7 +268,7 @@ impl StoreMutationEffects {
             book_composition_changed: false,
             caption_display_stale: false,
             transcript_display_stale: false,
-            ai_captions_changed: false,
+            derived_text_changed: false,
             rotation_keys: BTreeSet::new(),
         }
     }
@@ -285,7 +285,7 @@ impl StoreMutationEffects {
     pub(crate) fn record_rows_changed(&mut self, descriptor: &StoreDescriptor, rows: usize) {
         self.record_completed(descriptor);
         self.book_composition_changed |= descriptor.file == "book_composition.db" && rows > 0;
-        self.ai_captions_changed |= descriptor.file == "ai_caption.db" && rows > 0;
+        self.derived_text_changed |= descriptor.derived_text.is_some() && rows > 0;
         if rows > 0 {
             self.record_display_cache_stale(descriptor);
         }
@@ -312,8 +312,8 @@ impl StoreMutationEffects {
         self.transcript_display_stale
     }
 
-    pub(crate) fn ai_captions_changed(&self) -> bool {
-        self.ai_captions_changed
+    pub(crate) fn derived_text_changed(&self) -> bool {
+        self.derived_text_changed
     }
 
     pub(crate) fn rotation_keys(&self) -> &BTreeSet<String> {
@@ -329,7 +329,7 @@ impl StoreMutationEffects {
         self.book_composition_changed |= other.book_composition_changed;
         self.caption_display_stale |= other.caption_display_stale;
         self.transcript_display_stale |= other.transcript_display_stale;
-        self.ai_captions_changed |= other.ai_captions_changed;
+        self.derived_text_changed |= other.derived_text_changed;
         self.rotation_keys.extend(other.rotation_keys);
     }
 
@@ -1086,6 +1086,7 @@ pub(crate) enum StoreDisplayCache {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StoreDescriptor {
     pub(crate) display_cache: Option<StoreDisplayCache>,
+    pub(crate) derived_text: Option<crate::derived_text::DerivedTextKind>,
     pub(crate) file: &'static str,
     pub(crate) table: &'static str,
     pub(crate) column: &'static str,
@@ -1099,6 +1100,11 @@ pub(crate) struct StoreDescriptor {
 }
 
 impl StoreDescriptor {
+    const fn derived_text(mut self, kind: crate::derived_text::DerivedTextKind) -> Self {
+        self.derived_text = Some(kind);
+        self
+    }
+
     const fn display_cache(mut self, kind: StoreDisplayCache) -> Self {
         self.display_cache = Some(kind);
         self
@@ -1132,6 +1138,7 @@ const fn store(
 ) -> StoreDescriptor {
     StoreDescriptor {
         display_cache: None,
+        derived_text: None,
         file,
         table,
         column,
@@ -1156,6 +1163,7 @@ const fn optional_legacy_store(
 ) -> StoreDescriptor {
     StoreDescriptor {
         display_cache: None,
+        derived_text: None,
         file,
         table,
         column,
@@ -1223,7 +1231,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         BookStorePolicy::Follow,
         false,
     )
-    .display_cache(StoreDisplayCache::Caption),
+    .display_cache(StoreDisplayCache::Caption)
+    .derived_text(crate::derived_text::DerivedTextKind::Caption),
     store(
         "transcript.db",
         "transcripts",
@@ -1233,7 +1242,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         BookStorePolicy::Follow,
         false,
     )
-    .display_cache(StoreDisplayCache::Transcript),
+    .display_cache(StoreDisplayCache::Transcript)
+    .derived_text(crate::derived_text::DerivedTextKind::Transcript),
     store(
         "content_identity.db",
         "edit_origin",
@@ -1455,6 +1465,7 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
     ),
     StoreDescriptor {
         display_cache: None,
+        derived_text: None,
         file: "reading_history.db",
         table: "reading_history",
         column: "key",
@@ -4463,30 +4474,30 @@ mod tests {
             .unwrap();
         let mut effects = StoreMutationEffects::default();
         assert!(!effects.caption_display_stale());
-        assert!(!effects.ai_captions_changed());
+        assert!(!effects.derived_text_changed());
         effects.record_completed(caption);
         effects.record_rows_changed(caption, 0);
         effects.record_rows_changed(other, 1);
         assert!(!effects.caption_display_stale());
-        assert!(!effects.ai_captions_changed());
+        assert!(!effects.derived_text_changed());
         let mut changed = StoreMutationEffects::default();
         changed.record_rows_changed(caption, 1);
         assert!(changed.caption_display_stale());
-        assert!(changed.ai_captions_changed());
+        assert!(changed.derived_text_changed());
         effects.merge(changed);
         effects.merge(StoreMutationEffects::default());
         assert!(effects.caption_display_stale());
-        assert!(effects.ai_captions_changed());
+        assert!(effects.derived_text_changed());
         assert!(!StoreMutationEffects::for_content_identity_index_stale().caption_display_stale());
         for file in ["folder_thumb_pins.db", "video_pins.db"] {
             for descriptor in STORES.iter().filter(|store| store.file == file) {
                 let mut effects = StoreMutationEffects::default();
                 effects.record_rows_changed(descriptor, 0);
                 assert!(!effects.caption_display_stale());
-                assert!(!effects.ai_captions_changed());
+                assert!(!effects.derived_text_changed());
                 effects.record_rows_changed(descriptor, 1);
                 assert!(effects.caption_display_stale(), "{file}");
-                assert!(!effects.ai_captions_changed(), "pin-only change: {file}");
+                assert!(!effects.derived_text_changed(), "pin-only change: {file}");
             }
         }
     }
@@ -4541,7 +4552,7 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, 1);
         assert!(report.store_mutations.transcript_display_stale());
-        assert!(!report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         let copied_state = transcript_state(&connection, &copied_key);
         assert_eq!(copied_state.0, "source caption");
         assert!(copied_state.1 > source_rev);
@@ -4551,7 +4562,7 @@ mod tests {
         let report = run_at(dir.path(), copied, moved);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(report.store_mutations.transcript_display_stale());
-        assert!(!report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         let moved_state = transcript_state(&connection, &moved_key);
         assert_eq!(moved_state.0, "source caption");
         assert!(moved_state.1 > copied_state.1);
@@ -4569,7 +4580,7 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, 1);
         assert!(report.store_mutations.transcript_display_stale());
-        assert!(!report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         let tombstone_rev: i64 = connection
             .query_row(
                 "SELECT MAX(rev) FROM transcript_removed WHERE item_key = ?1",
@@ -4588,15 +4599,15 @@ mod tests {
         );
         assert!(no_copy.errors.is_empty(), "{:?}", no_copy.errors);
         assert!(!no_copy.store_mutations.transcript_display_stale());
-        assert!(!no_copy.store_mutations.ai_captions_changed());
+        assert!(!no_copy.store_mutations.derived_text_changed());
         let no_rename = run_at(dir.path(), missing, untouched);
         assert!(no_rename.errors.is_empty(), "{:?}", no_rename.errors);
         assert!(!no_rename.store_mutations.transcript_display_stale());
-        assert!(!no_rename.store_mutations.ai_captions_changed());
+        assert!(!no_rename.store_mutations.derived_text_changed());
         let no_purge = purge_removed_paths_at(dir.path(), &[moved.to_path_buf()], &[]);
         assert!(no_purge.errors.is_empty(), "{:?}", no_purge.errors);
         assert!(!no_purge.store_mutations.transcript_display_stale());
-        assert!(!no_purge.store_mutations.ai_captions_changed());
+        assert!(!no_purge.store_mutations.derived_text_changed());
     }
 
     #[test]
@@ -4641,7 +4652,7 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.deleted_total(), 1);
         assert!(report.store_mutations.transcript_display_stale());
-        assert!(!report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         assert_eq!(transcript_state(&connection, &existing_key).0, "keep");
         // Cleanup intentionally excludes the managed bookshelf, even when a
         // physical page has disappeared. Captions follow the same safety rule.
@@ -4678,7 +4689,7 @@ mod tests {
         };
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(!report.store_mutations.transcript_display_stale());
-        assert!(!report.store_mutations.ai_captions_changed());
+        assert!(!report.store_mutations.derived_text_changed());
     }
     #[test]
     fn ai_caption_copy_restore_rename_and_hard_purge_keep_trigger_ownership() {
@@ -4712,7 +4723,7 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, 1);
         assert!(report.store_mutations.caption_display_stale());
-        assert!(report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         let copied_state = caption_state(&connection, &copied_key);
         assert_eq!(copied_state.0, "source caption");
         assert!(copied_state.1 > source_rev);
@@ -4722,7 +4733,7 @@ mod tests {
         let report = run_at(dir.path(), copied, moved);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(report.store_mutations.caption_display_stale());
-        assert!(report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         let moved_state = caption_state(&connection, &moved_key);
         assert_eq!(moved_state.0, "source caption");
         assert!(moved_state.1 > copied_state.1);
@@ -4740,7 +4751,7 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, 1);
         assert!(report.store_mutations.caption_display_stale());
-        assert!(report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         let tombstone_rev: i64 = connection
             .query_row(
                 "SELECT MAX(rev) FROM caption_removed WHERE item_key = ?1",
@@ -4759,15 +4770,15 @@ mod tests {
         );
         assert!(no_copy.errors.is_empty(), "{:?}", no_copy.errors);
         assert!(!no_copy.store_mutations.caption_display_stale());
-        assert!(!no_copy.store_mutations.ai_captions_changed());
+        assert!(!no_copy.store_mutations.derived_text_changed());
         let no_rename = run_at(dir.path(), missing, untouched);
         assert!(no_rename.errors.is_empty(), "{:?}", no_rename.errors);
         assert!(!no_rename.store_mutations.caption_display_stale());
-        assert!(!no_rename.store_mutations.ai_captions_changed());
+        assert!(!no_rename.store_mutations.derived_text_changed());
         let no_purge = purge_removed_paths_at(dir.path(), &[moved.to_path_buf()], &[]);
         assert!(no_purge.errors.is_empty(), "{:?}", no_purge.errors);
         assert!(!no_purge.store_mutations.caption_display_stale());
-        assert!(!no_purge.store_mutations.ai_captions_changed());
+        assert!(!no_purge.store_mutations.derived_text_changed());
     }
 
     #[test]
@@ -4794,7 +4805,7 @@ mod tests {
         );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(report.store_mutations.caption_display_stale());
-        assert!(report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         assert_eq!(caption_state(&connection, &a_key).0, "B");
         assert_eq!(caption_state(&connection, &b_key).0, "A");
         for (key, old_rev) in [(&a_key, a_rev), (&b_key, b_rev)] {
@@ -4814,7 +4825,7 @@ mod tests {
         let report = migrate_book_paths_at(dir.path(), &[], &[(a, b)], &guard);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(report.store_mutations.caption_display_stale());
-        assert!(report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         let count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM captions WHERE item_key = ?1",
@@ -4836,7 +4847,7 @@ mod tests {
             let report = migrate_book_paths_at(dir.path(), &moves, &copies, &guard);
             assert!(report.errors.is_empty(), "{:?}", report.errors);
             assert!(!report.store_mutations.caption_display_stale());
-            assert!(!report.store_mutations.ai_captions_changed());
+            assert!(!report.store_mutations.derived_text_changed());
         }
     }
 
@@ -4882,7 +4893,7 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.deleted_total(), 1);
         assert!(report.store_mutations.caption_display_stale());
-        assert!(report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         assert_eq!(caption_state(&connection, &existing_key).0, "keep");
         // Cleanup intentionally excludes the managed bookshelf, even when a
         // physical page has disappeared. Captions follow the same safety rule.
@@ -4919,7 +4930,7 @@ mod tests {
         };
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(!report.store_mutations.caption_display_stale());
-        assert!(!report.store_mutations.ai_captions_changed());
+        assert!(!report.store_mutations.derived_text_changed());
     }
 
     #[test]
@@ -6747,6 +6758,7 @@ mod tests {
         let descriptor = StoreDescriptor {
             file: "equivalence.db",
             display_cache: None,
+            derived_text: None,
             table: "range_rows",
             column: "path",
             unique: true,
@@ -6822,6 +6834,7 @@ mod tests {
         let descriptor = StoreDescriptor {
             file: "perf.db",
             display_cache: None,
+            derived_text: None,
             table: "entries",
             column: "path",
             unique: true,

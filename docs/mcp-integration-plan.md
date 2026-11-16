@@ -347,7 +347,7 @@ Disabledも公開の機能説明だけは同じ一覧を返す（2026-11-14、§
 | tool | 内容 | 本体側の既存経路 |
 |---|---|---|
 | `miv_status` | mIV の版、AI 連携の設定、索引の状態、Remote 操作中か | 設定・`IndexerManager`・`SessionHandle` |
-| `search_items` | Ctrl+G と同じ構文で検索。種類の絞り込み、件数上限、cursor | `global_search::run` (headless caller、`wake=None`) |
+| `search_items` | Ctrl+G と同じ構文で検索。種類の絞り込み、件数上限、cursor。保存済みの説明文・文字起こしは各許可がONのときだけ対象 | `global_search::run` (headless caller、`wake=None`)。admissionの同じpermission snapshotから候補収集・STORED最終照合のtargetを作る。文字起こしで一致しても通常のItemを返し、応答型・IPC版は変えない |
 | `list_tags` | ピン留め / 最近 / よく使う / すべて のタグと件数 | `CollectionEngine` の TagBrowse |
 | `items_by_tag` | タグの付いた項目 | `CollectionEngine` の TagItems |
 | `list_collections` | コレクションの一覧と件数 | `CollectionStoreClient::list_catalog` |

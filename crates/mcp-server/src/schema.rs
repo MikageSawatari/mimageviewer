@@ -431,7 +431,7 @@ pub fn tools() -> Vec<Value> {
     TOOL_NAMES.into_iter().map(|name| {
         let description=match name {
             "miv_status"=>"Read mImageViewer (mIV) version, AI permissions, index readiness and Remote activity.",
-            "search_items"=>"Search mImageViewer (mIV)'s index (Ctrl+G syntax): paths/names/kinds/tags/ratings; AI captions when permitted.",
+            "search_items"=>"Search mImageViewer (mIV)'s index (Ctrl+G syntax): paths/names/kinds/tags/ratings; AI captions and transcripts require their respective mIV permissions.",
             "list_tags"=>"List mImageViewer (mIV) tags/counts: pinned/recent/frequent/all.",
             "items_by_tag"=>"List via mImageViewer (mIV)'s tag-view query.",
             "list_collections"=>"List mImageViewer (mIV) collection IDs/names/item counts.",
@@ -494,6 +494,18 @@ pub fn tools() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_items_description_names_transcript_and_caption_permissions() {
+        let tools = tools();
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "search_items")
+            .unwrap();
+        let description = tool["description"].as_str().unwrap();
+        assert!(description.contains("AI captions and transcripts"));
+        assert!(description.contains("respective mIV permissions"));
+    }
     #[test]
     fn tool_descriptions_name_product_in_first_sentence() {
         for tool in tools() {

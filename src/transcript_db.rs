@@ -127,6 +127,10 @@ impl TranscriptDb {
         Ok(Self { conn })
     }
 
+    pub(crate) fn into_connection(self) -> Connection {
+        self.conn
+    }
+
     fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version != 0 && version != 1 {

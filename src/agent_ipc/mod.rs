@@ -1103,6 +1103,7 @@ fn caption_search_target(permission: PermissionSnapshot) -> crate::fts_index::Se
             .iter()
             .copied()
             .filter(|source| permission.ai_captions || *source != SourceKind::AiCaption)
+            .filter(|source| permission.transcripts || *source != SourceKind::Transcript)
             .collect(),
     )
 }

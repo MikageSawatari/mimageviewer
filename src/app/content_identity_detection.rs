@@ -55,8 +55,8 @@ impl App {
     ) {
         self.caption_display
             .invalidate_rotation_keys(effects.rotation_keys().iter().map(String::as_str));
-        if effects.ai_captions_changed() {
-            self.notify_caption_changed();
+        if effects.derived_text_changed() {
+            self.notify_derived_text_changed();
         }
         if effects.caption_display_stale() {
             self.caption_display.clear();

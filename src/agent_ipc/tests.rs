@@ -390,6 +390,87 @@ fn fts_fixture_search_uses_live_favorites_and_has_cursor() {
 }
 
 #[test]
+fn search_items_transcript_permissions_filter_both_candidates_and_stored_postfilter() {
+    use crate::fts_index::{Container, IndexDoc, IndexKind, upsert_doc};
+    let f = Fixture::new();
+    f.seed_index();
+    let favorite =
+        crate::settings_db::with_db_result(|db| Ok(db.load_into_settings()?.favorites[0].id))
+            .unwrap();
+    let fts = f.handlers.readers.fts.read().unwrap().clone().unwrap();
+    let mut writer = fts.writer().unwrap();
+    for (index, kind) in [IndexKind::Video, IndexKind::Audio].into_iter().enumerate() {
+        let path = f._dir.path().join(format!(
+            "orchard-{index}.{}",
+            if index == 0 { "mp4" } else { "mp3" }
+        ));
+        std::fs::write(&path, b"fixture").unwrap();
+        upsert_doc(
+            &writer,
+            fts.fields(),
+            &IndexDoc {
+                path: crate::path_key::normalize_keep_drive(&path),
+                display_path: path.to_string_lossy().into_owned(),
+                container: Container::Fs,
+                zip_entry: String::new(),
+                favorite_id: favorite,
+                kind,
+                mtime: 0,
+                file_size: 7,
+                norms: crate::ingest_text::PerSourceText {
+                    name: format!("orchard-{index}"),
+                    transcript: "transcriptsecret garden".into(),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+    }
+    writer.commit().unwrap();
+    drop(writer);
+    fts.reload_reader().unwrap();
+    let connection = f.connection();
+    for captions in [false, true] {
+        for transcripts in [false, true] {
+            crate::settings_db::with_db_result(|db| {
+                let mut settings = db.load_into_settings()?;
+                settings.agent_show_ai_captions = captions;
+                settings.agent_show_transcripts = transcripts;
+                db.save_full(&settings)
+            })
+            .unwrap();
+            for (query, on, off) in [
+                ("transcriptsecret", 2, 0),
+                ("orchard transcriptsecret", 2, 0),
+                ("orchard -transcriptsecret", 0, 2),
+            ] {
+                let Payload::Items(page) = f
+                    .call(
+                        &connection,
+                        1,
+                        Command::SearchItems {
+                            query: query.into(),
+                            kind: None,
+                            limit: None,
+                            cursor: None,
+                        },
+                    )
+                    .result
+                    .unwrap()
+                else {
+                    panic!("items")
+                };
+                assert_eq!(
+                    page.items.len(),
+                    if transcripts { on } else { off },
+                    "{query}/{captions}/{transcripts}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn search_items_excludes_ai_captions_from_query_and_postfilter() {
     let f = Fixture::new();
     f.seed_index();

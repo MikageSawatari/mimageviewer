@@ -798,7 +798,8 @@ detachedは既存の共通パネルを使い、述語・viewport・bundleの交�
 | `search_index_db.rs` | Ctrl+S 用 `search_index.db` (お気に入り配下のフォルダ / ZIP / PDF / 動画名) |
 | `fts_index.rs` | Tantivy 0.26 ラッパ。`IndexDoc` / `Fields` / `QueryFilters` / `build_bigram_and_query` / `search_page`。bigram tokenizer + lower_caser |
 | `fts_meta.rs` | `fts_meta.db` (SQLite) ラッパ。ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たない (Tantivy STORED に集約) |
-| `ingest_text.rs` | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / sidecar、旧 tags は移行専用) のビルダー |
+| `ingest_text.rs` | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / sidecar / ai_caption / transcript、旧 tags は移行専用) のビルダー |
+| `derived_text.rs` | `STORES` に登録した索引用の派生テキスト（AI 説明文・文字起こし）の読取、範囲内の反映待ちと revision 一致による確認を共用する。既存の索引 worker 上で使う |
 | `ingest_worker.rs` | メタ抽出 + Tantivy buffer + バッチ commit + commit 成功フレームでのみ SQLite を更新 (Tantivy First 書き込み順序) |
 | `indexer_manager.rs` | 全お気に入りの `SupervisorHandle` 統括。アイテム索引または別バージョン索引が有効なお気に入りごとに 1 本だけ立て、Ctrl+G ワーカー spawn、App drop 時の停止を担う |
 | `indexer_supervisor.rs` | お気に入り単位の共有 supervisor。初期メタ走査 + FsWatcher + ingest を担い、同じ watcher の変更通知を別バージョン索引の差分照合にも渡す |

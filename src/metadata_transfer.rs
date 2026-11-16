@@ -210,14 +210,14 @@ pub struct ImportChangedSections {
 }
 
 impl ImportChangedSections {
-    /// 表示の失効は STORES の宣言に従い、説明文の索引通知は従来どおり維持する。
+    /// 索引通知・表示の失効は同じSTORESの宣言から決める。
     pub(crate) fn store_mutations(self) -> crate::rename_key_migration::StoreMutationEffects {
         use crate::rename_key_migration::{STORES, StoreDisplayCache, StoreMutationEffects};
         let mut effects = StoreMutationEffects::default();
         for descriptor in STORES {
-            let changed = match descriptor.display_cache {
-                Some(StoreDisplayCache::Caption) => self.ai_captions,
-                Some(StoreDisplayCache::Transcript) => self.transcripts,
+            let changed = match descriptor.derived_text {
+                Some(crate::derived_text::DerivedTextKind::Caption) => self.ai_captions,
+                Some(crate::derived_text::DerivedTextKind::Transcript) => self.transcripts,
                 None => false,
             };
             if changed {
@@ -8410,7 +8410,7 @@ mod tests {
                 .store_mutations
                 .transcript_display_stale()
         );
-        assert!(!imported.committed.store_mutations.ai_captions_changed());
+        assert!(imported.committed.store_mutations.derived_text_changed());
         let destination_db =
             crate::transcript_db::TranscriptDb::open_read_only(destination.join("transcript.db"))
                 .unwrap()
@@ -8471,14 +8471,14 @@ mod tests {
         }
         .store_mutations();
         assert!(transcript.transcript_display_stale());
-        assert!(!transcript.ai_captions_changed());
+        assert!(transcript.derived_text_changed());
         assert!(!transcript.caption_display_stale());
         let caption = ImportChangedSections {
             ai_captions: true,
             ..Default::default()
         }
         .store_mutations();
-        assert!(caption.ai_captions_changed());
+        assert!(caption.derived_text_changed());
         assert!(caption.caption_display_stale());
         assert!(!caption.transcript_display_stale());
         let pins = ImportChangedSections {
@@ -8487,7 +8487,7 @@ mod tests {
         }
         .store_mutations();
         assert!(pins.caption_display_stale());
-        assert!(!pins.ai_captions_changed());
+        assert!(!pins.derived_text_changed());
         assert!(!pins.transcript_display_stale());
     }
 

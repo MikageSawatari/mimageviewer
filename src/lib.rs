@@ -75,6 +75,7 @@ pub mod cover_source_scope;
 pub mod depth_addon;
 pub(crate) mod depth_estimation;
 pub(crate) mod depth_preprocess;
+pub mod derived_text;
 pub mod detached_window_geometry;
 pub(crate) mod feedback;
 pub mod transcript_db;

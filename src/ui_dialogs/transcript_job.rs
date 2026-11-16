@@ -379,7 +379,7 @@ impl App {
                     None
                 }
                 Ok(TranscriptWorkerEvent::ItemDone(outcome)) => {
-                    // T1 では DB の indexed 印が正本。表示 cache と indexer は後段で接続する。
+                    // commit済みの保存だけを、表示cacheと派生テキストの索引通知へ渡す。
                     if matches!(
                         outcome,
                         TranscriptItemOutcome::Created | TranscriptItemOutcome::FailedWritten
