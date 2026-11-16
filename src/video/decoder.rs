@@ -8790,6 +8790,8 @@ fn try_init_d3d11va_for_codec(
             return None;
         }
 
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         // HW デバイスコンテキスト作成。
         //    gpu_video_device があれば mIV の D3D11 デバイスを共有、なければ FFmpeg
         //    が新デバイスを作る (= 旧経路)。

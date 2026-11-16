@@ -5106,6 +5106,8 @@ fn create_present_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), 
     let mut feature_level = D3D_FEATURE_LEVEL::default();
     let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
     let flags = D3D11_CREATE_DEVICE_FLAG(D3D11_CREATE_DEVICE_BGRA_SUPPORT.0);
+    #[cfg(test)]
+    crate::test_gpu_group::assert_gpu_test_group();
     unsafe {
         D3D11CreateDevice(
             None,
@@ -5407,6 +5409,8 @@ impl NativeRenderCore {
                 .map_err(|e| format!("SetMaximumFrameLatency: {e:?}"))?;
             let waitable = swap_chain2.GetFrameLatencyWaitableObject();
 
+            #[cfg(test)]
+            crate::test_gpu_group::assert_gpu_test_group();
             let dcomp_device: IDCompositionDevice = DCompositionCreateDevice(&dxgi_device)
                 .map_err(|e| format!("DCompositionCreateDevice: {e:?}"))?;
             let presenter_target = config.targets.presenter();

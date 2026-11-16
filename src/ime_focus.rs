@@ -11,6 +11,12 @@ pub(crate) use egui_ime::{
     install_ime_input_policy, recovering_text_input,
 };
 
+pub(crate) fn track_drag_value_focus(response: &egui::Response) {
+    begin_pass_diagnostics(&response.ctx);
+    egui_ime::track_drag_value_focus(response);
+    observe_helper_widget(&response.ctx, response.id);
+}
+
 const TEXT_INPUT_KEY_DIAGNOSTIC_ID: &str = "miv_text_input_key_diagnostic";
 const TEXT_INPUT_KEY_DIAGNOSTIC_STARTED_ID: &str = "miv_text_input_key_diagnostic_started";
 const TEXT_INPUT_KEY_DIAGNOSTIC_ROUTINE_BUDGET_BYTES: usize = 1024 * 1024;
@@ -571,6 +577,36 @@ mod tests {
         let ctx = egui::Context::default();
         install_ime_input_policy(&ctx);
         ctx
+    }
+
+    #[test]
+    fn drag_value_facade_observes_normal_numeric_editing_for_diagnostics() {
+        let ctx = test_context();
+        let mut value = 17;
+        let mut field = egui::Id::NULL;
+        ctx.run_ui(Default::default(), |ui| {
+            let response = ui.add(egui::DragValue::new(&mut value));
+            field = response.id;
+            response.request_focus();
+            track_drag_value_focus(&response);
+        })
+        .drop_without_applying_deltas();
+        ctx.run_ui(
+            viewport_raw_input(egui::ViewportId::ROOT, vec![key_event(egui::Key::ArrowUp)]),
+            |ui| {
+                // App's viewport entry starts diagnostics before DragValue can
+                // consume the arrow in its internal numeric editor.
+                begin_pass_diagnostics(&ctx);
+                let response = ui.add(egui::DragValue::new(&mut value));
+                track_drag_value_focus(&response);
+                record_text_owner(&ctx, field);
+                let diagnostic = diagnostic_for_pass(&ctx).unwrap();
+                assert!(diagnostic.field_seen_after);
+                assert_eq!(diagnostic.field_id_after, Some(field));
+                assert!(!diagnostic_is_anomalous(&diagnostic, Some(field)));
+            },
+        )
+        .drop_without_applying_deltas();
     }
 
     fn key_event(key: egui::Key) -> egui::Event {

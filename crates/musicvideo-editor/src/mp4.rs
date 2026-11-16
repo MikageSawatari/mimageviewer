@@ -65,6 +65,10 @@ pub(crate) fn export_snapshot(
     progress: &dyn Fn(ExportProgress),
     cancel: &AtomicBool,
 ) -> Result<ExportSummary, ExportError> {
+    #[cfg(test)]
+    if request.encoder != EncoderPreference::OpenH264 {
+        crate::test_gpu_group::assert_gpu_test_group();
+    }
     export_music_video(request, progress, cancel)
 }
 

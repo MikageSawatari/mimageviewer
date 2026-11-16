@@ -3,6 +3,7 @@ use epaint::{Color32, ColorImage, ImageDelta, TextureId, textures::TextureOption
 
 // No window, surface, application profile or egui FullOutput is created by these GPU tests.
 fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    crate::test_gpu_group::assert_gpu_test_group();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         // Avoid the OpenGL/WGL adapter initialization path on Windows test machines.
         backends: if cfg!(target_os = "windows") {

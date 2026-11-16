@@ -23,11 +23,16 @@ fn worker_resolution_precedence_covers_debug_release_and_both_flavors_without_io
     }
 }
 
+static FAKE_WORKER_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+
+pub(super) fn is_fake_worker(path: &Path) -> bool {
+    FAKE_WORKER_FIXTURE.get().is_some_and(|fake| fake == path)
+}
+
 pub(crate) fn fake_worker() -> &'static Path {
     use sha2::{Digest as _, Sha256};
 
-    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
-    FIXTURE.get_or_init(|| {
+    FAKE_WORKER_FIXTURE.get_or_init(|| {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = manifest.join("tests/support/vlm_fake_worker.rs");
         // include_bytes also makes Cargo rebuild the tests when the peer changes.
@@ -759,6 +764,7 @@ fn real_model_serve_matches_v1_0_on_all_26_images_when_configured() {
     let [Some(model), Some(mmproj), Some(images)] = configured else {
         return;
     };
+    crate::test_gpu_group::assert_gpu_test_group();
     let executable = std::env::var_os("MIV_VLM_WORKER")
         .map(PathBuf::from)
         .unwrap_or_else(|| {

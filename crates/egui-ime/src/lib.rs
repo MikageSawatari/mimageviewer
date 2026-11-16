@@ -303,7 +303,8 @@ pub fn ime_composing_with_pending_events(
     state.composing()
 }
 
-/// Return the helper-managed TextEdit that currently owns egui focus.
+/// Return the helper-managed text input that currently owns egui focus,
+/// including a tracked DragValue numeric editor.
 ///
 /// The contract is recorded while the widget is actually drawn. Reading it in
 /// the next pass lets input handlers that run before panel drawing distinguish
@@ -375,6 +376,20 @@ fn forget_text_focus(ctx: &egui::Context, widget_id: egui::Id) {
             data.remove_temp::<u64>(focus_retry_id(viewport_id, widget_id));
         }
     });
+}
+
+/// Record a DragValue's numeric editor in the shared text-input focus contract.
+/// Unlike free-text helpers, this never restores focus: Escape belongs to the
+/// DragValue's own edit cancellation.
+pub fn track_drag_value_focus(response: &egui::Response) {
+    let ctx = &response.ctx;
+    if response.has_focus() {
+        // Numeric settings are not sensitive text. Standard diagnostics already
+        // redact character keys and never record the entered value.
+        remember_text_focus(ctx, response.id, TextInputDiagnosticKeyPolicy::Standard);
+    } else if response.lost_focus() {
+        forget_text_focus(ctx, response.id);
+    }
 }
 
 /// Finish explicit editing without leaving a keyboard-driven recovery claim.

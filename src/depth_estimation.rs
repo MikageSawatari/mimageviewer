@@ -839,6 +839,7 @@ mod tests {
     #[test]
     #[ignore = "requires MIV_DEPTH_MODEL_DIR and the locally built DA3 model/oracle"]
     fn depth_real_model_matches_python_static_stretch() {
+        crate::test_gpu_group::assert_gpu_test_group();
         let _data = crate::data_dir::TestDataDirGuard::new();
         let root = std::path::PathBuf::from(
             std::env::var_os("MIV_DEPTH_MODEL_DIR").expect("MIV_DEPTH_MODEL_DIR"),

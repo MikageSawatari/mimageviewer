@@ -1723,7 +1723,7 @@ MCP の exe は console subsystem・CRT 静的リンク (DLL 不要)・引数は
   古い版の掃除が消さない。掃除は動いている process の image がある木も残す既存の守りもある)。`Handoff` (core の起動完了の合図) は
   使わない。
 - **`--mcp` の間は名前付き mutex `Global\mImageViewerMcp_v1` を持つ** (子が終わるまで。設計レビュー 15 巡目 P2-2)。AI アプリが MCP を
-  使っている間は launcher も動き続け、インストール先の `mimageviewer.exe` が使用中になる。インストーラはこの mutex で検出する (下)。
+  使っている間は launcher も動き続け、インストール先の `mimageviewer.exe` が使用中になる。アンインストーラはこの mutex で検出する (下)。
   **権限** (設計レビュー 16 巡目 P2-1): 生きていることの印として使うだけなので、DACL は「Everyone に `SYNCHRONIZE`、作った人に全権」に
   し、作る時も既存を開く時も `SYNCHRONIZE` だけを求める (`CreateMutexExW`)。こうすると別のユーザーの launcher も同じ object に
   handle を足せ、最後の handle が閉じるまで検出される。core の既存の `Global\mImageViewerInstance_v1` が同じ問題を解いていれば
@@ -1761,14 +1761,33 @@ MCP の exe は console subsystem・CRT 静的リンク (DLL 不要)・引数は
   他の名前だけに残す)。`build-release.sh` の名前だけの `taskkill`、release・portable の `PreserveRuntime` の判定 (今は path で絞る前の
   一覧を見ている)、`build-dist.ps1` の拒む一覧も同じ規則にそろえる。テスト: インストール先の launcher・MCP の親子は対象外、
   build の出力の exe は対象、path 不明は対象外、を mock の process 一覧で確かめる。
-- **インストーラ** (`installer/mimageviewer.iss`): 既存の独自の確認 (core の mutex を開いて終了を頼む) の後に、
-  `Global\mImageViewerMcp_v1` を `OpenMutexW(SYNCHRONIZE)` で確かめる。開けたら「AI アプリ (Claude・ChatGPT など) が
-  mImageViewer を使っています。AI アプリを終了してから、もう一度実行してください」と出して中止する。**不在と扱うのは
-  `ERROR_FILE_NOT_FOUND` の時だけ**で、それ以外の失敗 (アクセス拒否など) は「確認できませんでした。AI アプリを終了してから、
-  もう一度実行してください」と出して中止する (設計レビュー 16 巡目 P2-1) (更新とアンインストールの両方。自動の終了・再接続は作らない。
-  通常の操作で起こる組み合わせを、終了してもらう契約で無くす)。内包する exe を列挙したコメントも直す。
-  単体 exe 版を手で置き換える時と portable を置き換える時も同じ契約で、`installer/readme.txt`・`installer/readme_portable.txt` に
-  「AI アプリを終了してから置き換えてください」と書き、ファイル一覧に MCP の exe を足す。
+- **インストーラ** (`installer/mimageviewer.iss`、共通処理 `installer/launcher_swap.iss`):
+  [次のリリースの課題](next-release-backlog.md) §1.789 の A-1 (2026-11-15 利用者決定) により、
+  更新では MCP の mutex を確認しない。
+  `PrepareToInstall` で既存の `SignalAppShutdown` により本体の終了を確認してから、launcher があれば
+  `{app}\mimageviewer.exe.<GUID>.old` へ改名する。無ければ新規インストールとして続け、改名に失敗したら
+  AI アプリを終了してから再実行するよう案内して止める。`CloseApplicationsFilterExcludes=mimageviewer.exe` により
+  launcher を Restart Manager の対象から外し、AI アプリが使っている process は閉じない。
+  設計担当の隔離試験ログでは、退避後は元の名前を登録しても使用者が見つからず、launcher は閉じられなかった。
+  除外は退避前に RM が動く構成へ変わった場合などの二重の守りとして残す。
+  退避ファイルは成功まで残し、`CurStepChanged(ssPostInstall)` の先頭で成功を記録した後、
+  `{app}\mimageviewer.exe.*.old` をすべて削除してみる。使用中などで消せなかったものは次の更新かアンインストールまで残す。
+  取消・失敗では、Inno のロールバック後の `DeinitializeSetup` で、成功の印が無く、今回の退避ファイルがあり、
+  正規の名前の launcher が無い場合だけ元に戻す。復元できなければ再インストールを案内して終える。
+  `[InstallDelete]`、再起動時の削除予約、再試行や多段の回復は使わない。
+  **アンインストールは従来どおり**、本体へ終了を頼んだ後 `Global\mImageViewerMcp_v1` を
+  `OpenMutexW(SYNCHRONIZE)` で確かめ、開けたら AI アプリの終了を案内して止める。**不在と扱うのは
+  `ERROR_FILE_NOT_FOUND` の時だけ**で、それ以外の失敗も確認できなかった旨を出して止める (設計レビュー 16 巡目 P2-1)。
+  `[UninstallDelete]` で残っている `.old` も削除する。
+  単体 exe 版を手で置き換える時と portable の更新は従来どおり AI アプリを終了してから行う
+  (`installer/readme.txt`・`installer/readme_portable.txt`)。
+  `scripts/test-installer-launcher-swap.ps1` は同じ include と試験専用の識別子・保存先を使い、製品を起動せずに
+  新規・通常/使用中/連続の更新・失敗による取消後の復元・アンインストールを Inno Setup で確かめる。
+  RM 除外の試験では `/LOGCLOSEAPPLICATIONS` を付け、セッション開始と `RmGetList` 成功を必須にする。
+  未使用の試験用 DLL を照会対象として残し、除外した launcher は登録されないことをログで確認する。
+  除外だけを外した試験用 installer でも使用中の更新を行い、launcher の正規の path が RM に登録されることを確認する。
+  対照試験もセッション開始・照会成功を必須とし、launcher の検出・終了は期待しない。
+  RM が動かなかった実行は除外の確認を PASS にせず、ほかの試験と後片付けを終えて非 0 で終了する。
 - `test-full.ps1` の前提 (`target\release` の exe) が 3 本から 4 本になる。CLAUDE.md・`development-build-and-test.md`・
   `native-dependencies.md`・`release-checklist.md`・`release-operations.md`・`portable-build-plan.md` の該当の記述 (ビルドの順序・
   前提の本数・署名の一覧・内包の木) を同時に直す。
@@ -2008,6 +2027,9 @@ Susie の初期化の待ちを既存の枠の保持で扱うことは妥当と�
 | P2-1 止める・拒む一覧が名前だけの経路 (`.sh`・`PreserveRuntime`・build-dist) を含み、常駐の launcher も拒まれる | 妥当。launcher と MCP は出力の path と一致するものだけ、path 不明は対象外 | §15.8 スクリプト |
 | P2-2 常駐の launcher で更新・アンインストールの時にファイルが使用中 | 妥当。`--mcp` の間 mutex を持ち、インストーラが検出して「AI アプリを終了して」と中止 | §15.8 launcher・インストーラ |
 | P2-3 core を起動しない検証では tool の成功を確かめられない | 妥当。launcher 単独と、起動済みの portable の core への接続に分ける。通常の登録を読まない | §15.8 確かめ方 |
+
+上表は当時の判断の記録。P2-2 の更新時の中止は §1.789 A-1 (2026-11-15 利用者決定) で置き換えた。
+現在の確認手順は §15.8 のとおり、更新は AI アプリと launcher を閉じずに成功し、アンインストールは従来どおり拒否する。
 
 16 巡目: 15 巡目の P2-1・P2-2・P2-3 は解消 (P2-2 は契約として)。新しい指摘 P2 2 件: (1) 固定名の Global の mutex の既定の DACL では
 別のユーザーの launcher が開けず、`OpenMutexW` の失敗は不在と拒否を区別しない → `SYNCHRONIZE` だけの共有と、不在は
