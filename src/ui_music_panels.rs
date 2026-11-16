@@ -18,6 +18,319 @@ use crate::app::App;
 use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::GridItem;
 use crate::ui_fullscreen::MusicChromeViewState;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum MusicLeftPanelTab {
+    #[default]
+    Jump,
+    Transcript,
+}
+
+/// 音楽ビューの表示セッションだけの状態。App の既存 close 境界からも破棄する。
+#[derive(Default)]
+pub(crate) struct MusicTranscriptPanelSession {
+    owner: Option<egui::Id>,
+    tab: MusicLeftPanelTab,
+    transcript: crate::transcript_panel::TranscriptPanelState,
+}
+impl MusicTranscriptPanelSession {
+    pub(crate) fn reset(&mut self) {
+        *self = Self::default();
+    }
+    fn bind(&mut self, owner: egui::Id) {
+        if self.owner != Some(owner) {
+            self.reset();
+            self.owner = Some(owner);
+        }
+    }
+}
+
+fn draw_music_left_panel_tabs(
+    ui: &mut egui::Ui,
+    header: egui::Rect,
+    session: &mut MusicTranscriptPanelSession,
+) {
+    let mut header_ui = ui.new_child(egui::UiBuilder::new().max_rect(header));
+    header_ui.horizontal(|ui| {
+        for (tab, label) in [
+            (MusicLeftPanelTab::Jump, "ジャンプ"),
+            (MusicLeftPanelTab::Transcript, "文字起こし"),
+        ] {
+            if ui.selectable_label(session.tab == tab, label).clicked() {
+                if session.tab != tab {
+                    session.transcript.reset();
+                }
+                session.tab = tab;
+            }
+        }
+    });
+}
+#[cfg(test)]
+mod transcript_session_tests {
+    use super::*;
+    use egui_kittest::kittest::{NodeT, Queryable};
+
+    fn music_transcript_composite_harness(
+        dark: bool,
+        missing: bool,
+    ) -> egui_kittest::Harness<'static, MusicTranscriptPanelSession> {
+        use crate::transcript_display::{TranscriptDataState, TranscriptSnapshot};
+        let snapshot = if missing {
+            TranscriptSnapshot {
+                key: "sample.flac".into(),
+                ..Default::default()
+            }
+        } else {
+            TranscriptSnapshot {
+                key:"sample.flac".into(),state:TranscriptDataState::Stale,
+                segments:std::sync::Arc::new(vec![
+                    (1000,4000,"この音声ファイルの文字起こしを表示しています。長い文も途中で省略せず、幅に合わせて折り返します。".into()),
+                    (5000,9000,"今再生している行を強調し、再生位置に合わせて一覧を送ります。".into()),
+                    (10000,14000,"一覧を手で送った後は、再生位置へ戻るボタンで自動送りを再開できます。".into()),
+                ]),
+                used_audio_stream:Some(0),applied_audio_stream:Some(0),
+                ..Default::default()
+            }
+        };
+        crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(640.0, 460.0))
+            .build_ui_state(
+                move |root_ui, session| {
+                    crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                        let ctx = root_ui.ctx().clone();
+                        crate::os_theme::apply_resolved(
+                            &ctx,
+                            if dark {
+                                crate::os_theme::ResolvedTheme::Dark
+                            } else {
+                                crate::os_theme::ResolvedTheme::Light
+                            },
+                        );
+                        root_ui.painter().rect_filled(
+                            ctx.content_rect(),
+                            0.0,
+                            ctx.global_style().visuals.panel_fill,
+                        );
+                        let main_text_color = ctx.global_style().visuals.text_color();
+                        let left = egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(MUSIC_LEFT_PANEL_WIDTH, 460.0),
+                        );
+                        let right = egui::Rect::from_min_size(
+                            egui::pos2(320.0, 0.0),
+                            egui::vec2(320.0, 460.0),
+                        );
+                        for (panel, is_left) in [(left, true), (right, false)] {
+                            root_ui.painter().rect_filled(panel, 0.0, PANEL_BG);
+                            let edge = if is_left {
+                                [panel.right_top(), panel.right_bottom()]
+                            } else {
+                                [panel.left_top(), panel.left_bottom()]
+                            };
+                            root_ui
+                                .painter()
+                                .line_segment(edge, egui::Stroke::new(1.0, PANEL_DIVIDER));
+                        }
+                        let mut left_ui = root_ui.new_child(egui::UiBuilder::new().max_rect(left));
+                        left_ui.set_clip_rect(left);
+                        crate::os_theme::apply_dark_ui(&mut left_ui);
+                        draw_music_left_panel_tabs(
+                            &mut left_ui,
+                            egui::Rect::from_min_max(
+                                left.min + egui::vec2(8.0, 4.0),
+                                egui::pos2(left.right() - 32.0, 30.0),
+                            ),
+                            session,
+                        );
+                        let body = egui::Rect::from_min_max(
+                            left.min + egui::vec2(8.0, 40.0),
+                            left.max - egui::vec2(8.0, 6.0),
+                        );
+                        let mut body_ui = left_ui.new_child(egui::UiBuilder::new().max_rect(body));
+                        body_ui.set_clip_rect(body);
+                        crate::transcript_panel::draw_transcript_panel_body(
+                            &mut body_ui,
+                            &snapshot,
+                            1.5,
+                            &mut session.transcript,
+                        );
+                        let mut right_ui = root_ui.new_child(
+                            egui::UiBuilder::new().max_rect(right.shrink2(egui::vec2(12.0, 8.0))),
+                        );
+                        right_ui.set_clip_rect(right);
+                        crate::os_theme::apply_dark_ui(&mut right_ui);
+                        right_ui.label(egui::RichText::new("情報").strong());
+                        right_ui.add_space(12.0);
+                        info_row(
+                            &mut right_ui,
+                            "文字起こし",
+                            &crate::transcript_panel::summary_value(&snapshot),
+                            &mut None,
+                        );
+                        assert_eq!(
+                            ctx.global_style().visuals.dark_mode,
+                            dark,
+                            "音楽パネルの暗色設定を main へ漏らさない"
+                        );
+                        assert_eq!(ctx.global_style().visuals.text_color(), main_text_color);
+                    });
+                },
+                MusicTranscriptPanelSession {
+                    tab: MusicLeftPanelTab::Transcript,
+                    ..Default::default()
+                },
+            )
+    }
+
+    #[test]
+    fn music_transcript_panels_dark_snapshot() {
+        let mut harness = music_transcript_composite_harness(true, false);
+        harness.run_steps(8);
+        harness.snapshot("music_transcript_panels_dark");
+    }
+
+    #[test]
+    fn music_transcript_panels_light_snapshot() {
+        let mut harness = music_transcript_composite_harness(false, false);
+        harness.run_steps(8);
+        harness.snapshot("music_transcript_panels_light");
+    }
+
+    #[test]
+    fn music_transcript_missing_composite_keeps_tab_notice_and_right_summary_visible() {
+        for dark in [true, false] {
+            let mut harness = music_transcript_composite_harness(dark, true);
+            harness.run_steps(6);
+            let bounds = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 460.0));
+            // 右の行ラベルも同じ名前なので、タブを button として特定する。
+            assert!(
+                bounds.contains_rect(
+                    harness
+                        .get_by_role_and_label(egui::accesskit::Role::Button, "文字起こし")
+                        .rect()
+                )
+            );
+            let notice = harness
+                .get_by_label("文字起こしはまだありません。一覧の右クリックで作れます")
+                .rect();
+            assert!(bounds.contains_rect(notice));
+            assert!(notice.right() <= MUSIC_LEFT_PANEL_WIDTH);
+            let summary = harness.get_by_label("なし").rect();
+            assert!(summary.left() >= 320.0);
+            assert!(bounds.contains_rect(summary));
+        }
+    }
+
+    #[test]
+    fn music_transcript_session_is_owned_by_context_and_source_and_resets_on_close() {
+        let mut session = MusicTranscriptPanelSession::default();
+        let a = egui::Id::unique((1, "a.mp4"));
+        session.bind(a);
+        session.tab = MusicLeftPanelTab::Transcript;
+        session.bind(a);
+        assert_eq!(session.tab, MusicLeftPanelTab::Transcript);
+        session.bind(egui::Id::unique((2, "a.mp4")));
+        assert_eq!(session.tab, MusicLeftPanelTab::Jump);
+        session.tab = MusicLeftPanelTab::Transcript;
+        session.bind(egui::Id::unique((2, "b.mp4")));
+        assert_eq!(session.tab, MusicLeftPanelTab::Jump);
+        session.tab = MusicLeftPanelTab::Transcript;
+        session.reset();
+        assert_eq!(session.tab, MusicLeftPanelTab::Jump);
+        assert!(session.owner.is_none());
+    }
+    #[test]
+    fn music_transcript_tab_is_always_visible_and_clickable_in_small_panel() {
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(320.0, 240.0))
+            .build_ui_state(
+                |ui, session| {
+                    draw_music_left_panel_tabs(
+                        ui,
+                        egui::Rect::from_min_size(egui::pos2(8.0, 4.0), egui::vec2(270.0, 26.0)),
+                        session,
+                    );
+                },
+                MusicTranscriptPanelSession::default(),
+            );
+        harness.run_steps(4);
+        for label in ["ジャンプ", "文字起こし"] {
+            assert!(harness.get_by_label(label).rect().right() < 288.0);
+        }
+        harness.get_by_label("文字起こし").click();
+        harness.run_steps(2);
+        assert_eq!(harness.state().tab, MusicLeftPanelTab::Transcript);
+        harness.get_by_label("ジャンプ").click();
+        harness.run_steps(2);
+        assert_eq!(harness.state().tab, MusicLeftPanelTab::Jump);
+    }
+
+    #[test]
+    fn music_transcript_tab_reopens_and_switches_source_at_current_gap() {
+        let snapshot = crate::transcript_display::TranscriptSnapshot {
+            key: "sample.flac".into(),
+            state: crate::transcript_display::TranscriptDataState::Available,
+            segments: std::sync::Arc::new(
+                (0..300)
+                    .map(|row| (row * 2000, row * 2000 + 1000, format!("発話{row}")))
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(320.0, 460.0))
+            .build_ui_state(
+                |ui,
+                 (session, snapshot, position): &mut (
+                    MusicTranscriptPanelSession,
+                    crate::transcript_display::TranscriptSnapshot,
+                    f64,
+                )| {
+                    session.bind(egui::Id::unique((1, &snapshot.key)));
+                    draw_music_left_panel_tabs(
+                        ui,
+                        egui::Rect::from_min_size(egui::pos2(8.0, 4.0), egui::vec2(270.0, 26.0)),
+                        session,
+                    );
+                    if session.tab == MusicLeftPanelTab::Transcript {
+                        let body = egui::Rect::from_min_max(
+                            egui::pos2(8.0, 40.0),
+                            egui::pos2(312.0, 454.0),
+                        );
+                        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(body));
+                        child.set_clip_rect(body);
+                        crate::transcript_panel::draw_transcript_panel_body(
+                            &mut child,
+                            snapshot,
+                            *position,
+                            &mut session.transcript,
+                        );
+                    }
+                },
+                (MusicTranscriptPanelSession::default(), snapshot, 119.5),
+            );
+        harness.run_steps(4);
+        for boundary in 0..3 {
+            if boundary == 1 {
+                // パネルのclose/hideは既存のsession境界で破棄する。
+                harness.state_mut().0.reset();
+                harness.state_mut().2 = 399.5;
+            } else if boundary == 2 {
+                harness.state_mut().1.key = "next.flac".into();
+            }
+            harness.run_steps(2);
+            assert_eq!(harness.state().0.tab, MusicLeftPanelTab::Jump);
+            harness.get_by_label("文字起こし").click();
+            harness.run_steps(2);
+            let (following, layout) = harness.state().0.transcript.scroll_state_for_test();
+            assert!(following);
+            assert!(layout.unwrap().offset.y > if boundary == 0 { 1000.0 } else { 5000.0 });
+        }
+    }
+}
 // 音楽ビューはメイン egui ctx (アプリテーマ = Light になり得る) に描くため、egui 既定の
 // `on_hover_text` はツールチップが明色になる。動画 native HUD (専用ダーク ctx) と見た目を
 // 揃えるため、ctx テーマに依らずダーク枠で描く `hover_tip_dark` を使う。
@@ -1151,6 +1464,9 @@ impl App {
             .map(|it| it.name().to_string())
             .unwrap_or_default();
         let stars = self.get_rating(fs_idx);
+        let transcript_summary = crate::transcript_panel::summary_value(
+            &self.transcript_snapshot_for_player(ctx, fs_idx),
+        );
         let mut set_rating: Option<u8> = None;
         let mut open_external_url: Option<String> = None;
 
@@ -1188,6 +1504,12 @@ impl App {
                         .strong(),
                 );
                 ui.add_space(6.0);
+                info_row(
+                    ui,
+                    "文字起こし",
+                    &transcript_summary,
+                    &mut open_external_url,
+                );
                 if let Some(p) = probe.as_ref() {
                     if !p.format_name.is_empty() {
                         info_row(ui, "形式", &p.format_name, &mut open_external_url);
@@ -1308,6 +1630,13 @@ impl App {
         };
         let has_chapters = !chapters.is_empty();
         let entries = build_music_jump_entries(&self.music_bookmarks, &chapters);
+        let transcript_snapshot = self.transcript_snapshot_for_player(ctx, fs_idx);
+        let owner = egui::Id::unique((self.virtual_list_context_id(), &transcript_snapshot.key));
+        let mut panel_session = std::mem::take(&mut *self.music_transcript_panel);
+        panel_session.bind(owner);
+        if !show_panel {
+            panel_session.reset();
+        }
 
         // 借用衝突を避けるためダイアログ state を self から取り出し、末尾で書き戻す。
         let mut title_edit = self.music_bookmark_title_edit.take();
@@ -1335,24 +1664,51 @@ impl App {
                     // (既定ダーク ctx) と揃えてダーク描画する。メイン ctx が Light テーマでも
                     // 暗いパネル上に明色スクロールバーが出ないようにする。
                     crate::os_theme::apply_dark_ui(ui);
-                    draw_native_jump_panel_body(
-                        ui,
-                        panel_rect,
-                        &opts,
-                        0.0,
-                        position_secs,
-                        &entries,
-                        &empty_tex,
-                        None,
-                        &mut title_edit,
-                        &mut bulk,
-                        &mut commands,
+                    ui.painter().rect_filled(panel_rect, 0.0, PANEL_BG);
+                    let header = egui::Rect::from_min_max(
+                        panel_rect.min + egui::vec2(8.0, 4.0),
+                        egui::pos2(panel_rect.right() - 32.0, panel_rect.top() + 30.0),
                     );
+                    draw_music_left_panel_tabs(ui, header, &mut panel_session);
+                    let body_rect = egui::Rect::from_min_max(
+                        panel_rect.min + egui::vec2(0.0, 34.0),
+                        panel_rect.max,
+                    );
+                    match panel_session.tab {
+                        MusicLeftPanelTab::Jump => draw_native_jump_panel_body(
+                            ui,
+                            body_rect,
+                            &opts,
+                            0.0,
+                            position_secs,
+                            &entries,
+                            &empty_tex,
+                            None,
+                            &mut title_edit,
+                            &mut bulk,
+                            &mut commands,
+                        ),
+                        MusicLeftPanelTab::Transcript => {
+                            let body_rect = body_rect.shrink2(egui::vec2(8.0, 6.0));
+                            let mut child =
+                                ui.new_child(egui::UiBuilder::new().max_rect(body_rect));
+                            child.set_clip_rect(body_rect);
+                            if let Some(target_secs) =
+                                crate::transcript_panel::draw_transcript_panel_body(
+                                    &mut child,
+                                    &transcript_snapshot,
+                                    position_secs,
+                                    &mut panel_session.transcript,
+                                )
+                            {
+                                commands.push(NativeOverlayCommand::Seek { target_secs });
+                            }
+                        }
+                    }
                     if explicit_open {
-                        // 共有 body の右側はブックマーク / 一括ボタンが使うため、タイトル直後に
-                        // music 専用の明示クローズを置く。
+                        // 本文の登録ボタンとは分け、タブ行の右端に明示クローズを置く。
                         let close_rect = egui::Rect::from_min_size(
-                            panel_rect.min + egui::vec2(102.0, 6.0),
+                            panel_rect.right_top() + egui::vec2(-30.0, 6.0),
                             egui::vec2(24.0, 24.0),
                         );
                         let close_response = ui
@@ -1376,7 +1732,9 @@ impl App {
         }
         if close_left_requested {
             self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;
+            panel_session.reset();
         }
+        *self.music_transcript_panel = panel_session;
 
         // ── 中央モーダル (改名 / 一括登録) は開いている間常に描く ──
         // 背後 timeline / パネルへクリックが漏れないよう半透明バックドロップで吸収する。

@@ -1,6 +1,8 @@
 //! Keep the pre-input preparation and actual viewport paint in the same pass.
 use super::*;
 
+mod canvas_click;
+
 struct PaintedFrame {
     pages: Vec<DisplayedImageTransform>,
     unit: egui::Rect,
@@ -33,11 +35,20 @@ fn key_event(key: egui::Key, pressed: bool) -> egui::Event {
 }
 
 fn paint_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) -> PaintedFrame {
+    paint_frame_in_rect(app, ctx, arrival_viewport(), events)
+}
+
+fn paint_frame_in_rect(
+    app: &mut App,
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    events: Vec<egui::Event>,
+) -> PaintedFrame {
     app.frame_counter += 1;
     crate::key_input::set_test_frame_for_viewport(ctx.viewport_id(), Vec::new());
     let output = ctx.run_pass(
         egui::RawInput {
-            screen_rect: Some(arrival_viewport()),
+            screen_rect: Some(rect),
             focused: true,
             time: Some(app.frame_counter as f64 / 60.0),
             events,

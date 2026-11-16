@@ -47,3 +47,35 @@ pub(super) fn draw_progress(ui: &mut egui::Ui, progress: &InstallProgress) {
         }
     }
 }
+
+/// 取得・中止・再開の表示はモデルの種類によらず共用する。
+pub(super) fn draw_download_status(
+    ui: &mut egui::Ui,
+    progress: &InstallProgress,
+    operation: crate::addon::AddonOperation,
+) {
+    if matches!(
+        operation,
+        crate::addon::AddonOperation::Cancelling | crate::addon::AddonOperation::Removing
+    ) {
+        ui.label("前の処理を片付けています");
+    } else {
+        ui.label("モデルをダウンロードしています。取得中も閲覧できます。");
+        draw_progress(ui, progress);
+    }
+}
+
+pub(super) fn draw_download_cancel(
+    ui: &mut egui::Ui,
+    operation: crate::addon::AddonOperation,
+) -> bool {
+    ui.add_enabled(
+        operation == crate::addon::AddonOperation::Installing,
+        egui::Button::new("キャンセル"),
+    )
+    .clicked()
+}
+
+pub(super) fn draw_download_cancelled(ui: &mut egui::Ui) {
+    ui.label("ダウンロードをキャンセルしました。次回は続きから取得できます。");
+}

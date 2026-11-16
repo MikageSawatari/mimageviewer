@@ -24,7 +24,10 @@
 
 ## 渡す物 (依頼で場所を指定する)
 
-- 旧版のインストーラ: v5.2.1 の `mImageViewer_setup.exe`。
+- 旧版のインストーラ: v5.2.1 の `mImageViewer_setup.exe` (SHA256 `566786871773da089683733064c808ab9fa6cbf6032654da62b08c34550ccea4`、GitHub の v5.2.1 の配布物と同じ)。
+- **新しいインストーラの版の番号は 5.2.1 と違うこと** (Cargo の workspace の version と installer の `MyAppVersion`)。launcher は版ごとの
+  `runtime\<版>` へ展開するので、同じ 5.2.1 のままだと、古い adapter が使っている `runtime\5.2.1\mimageviewer-mcp.exe` に新しい中身を書こうとして失敗する
+  (コードの読みによる。`crates/launcher/src/main.rs` の `VERSION` と `ensure_asset`)。実際の更新では版が必ず上がるので、製品の問題ではない。
 - 新しいインストーラ: A-1・A-2・文字起こし T1 を入れた版 (IPC の版 4)。第 1 部と第 2 部の両方でこれを使う (release のビルドを 1 回で済ませるため)。
   第 1 部の手順 4 の「同じセッションで tool が成功する」は、A-2 で古い adapter (版 3) を新しい core (版 4) が受け付けるから成り立つ。
 

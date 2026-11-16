@@ -1455,6 +1455,40 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-16: 本文の保存回転による本自身の自動代表cache失効 (§1.773、表紙計画§29)
+
+設計担当と独立レビュー担当は、P案を撤回した後の単純な保存側失効について改めて設計合意した。
+変更対象は `viewer_context_registry.rs` の既存mounted / AtRest / Retiring owner別退避、Loadedのruntime stampの保持/clone、
+snapshot / Smart / direct-sourceの復元後照合と最終aspect samplesである。Smartではsaved samples代入後に照合する。
+本自身のAutomatic行と同じmemoryの厳密キー削除を短命workerで行い、Appが削除完了を受けた後に対象要求・CPU待ち・textureだけを退避する。
+元contextの移動/parkで通知を捨てず、同じ本・代表のUIセッション番号で古い保持素材を識別する。無変更の兄弟contextや通常ページは退避しない。
+
+自動keyだけをv4/v4fへ更新し、出荷済みv3/v3fを移行しない。素材codec/schemaとK2のv1互換は保ち、本文proof、K2内生成、v3 fallback、親の専用退避は追加しない。
+viewport生成/破棄、HWND、geometry、入力述語、promote/retire遷移、PDF epoch所有は変更しない。
+新しいdetached用bool/Option、時間窓、viewport推測、worker完了の同期待ちを足さず、共有cache変更の事実を既存context所有境界へ届ける構造修正として§2に適合すると合意した。
+以前のP案への合意の流用ではない。実装・独立completion review・自動検証の結果は[表紙計画§29.12](cover-crop-plan.md)へ集約し、本記録だけで完了とはしない。
+
+独立実装レビュー修正では、同じowner別退避の照合対象へ実在行由来のslotを加え、削除中の新要求とCPU待ちの遅着を拒否する。ZipDirのwriter identityと固定先の読取scopeの区別はworkerのsource facts内で行う。合意済みの構造的修正の範囲内であり、registryの所有・viewport・PDF epoch・入力述語には新しい経路や状態を追加しない。
+
+再レビューではZipDirの実効prefix照合を撤回し、同じ外側書庫のAutomaticを保守的に失効させる。runtime stampは外側書庫＋代表ページで共有する。削除通知はslot・catalog・keyを一組とし、registryでは既存ownerのpoolを共有照合へ渡す。別カタログの同名キーで兄弟要求を取消さないための所有境界の修正であり、新たなviewport／状態遷移／常駐ownerは追加しない。
+
+### 2026-11-15: 通常画像のクリック判定に自動初期配置の owner を持たせる (§1.745)
+
+`FsAutomaticInitialView` は通常画像の表示単位の自動配置結果で、配置要求の完了後も比較用に保持する。
+利用者の変形と区別するため、倍率・純粋な自動 pan の基準を `fs_zoom` / `fs_pan` と同じ
+`ViewerContextBundle` に持たせ、既存の初期化・swap・移譲・破棄へ登録する。共有設定による既存の parked context の pan リセットでは基準も破棄する。
+2026-11-16 追補: 初版の世代・anchor・slice 照合と snapshot 保存漏れは、外部独立レビューで P2 と判定され、設計担当も確認した。
+基準を一覧の identity から分離し、変形を保つ世代変更・index の詰め直し・片側移動では基準も保つ。
+snapshot の共通 capture と Clone は zoom/pan・自由回転・基準を一緒に保存し、通常画像と collection-root の再開は同じ owner で復元する。
+AtRest の live bundle 再開は bundle の状態を保つ。overview / ParkedLive media の snapshot は従来の既定変形に合わせ基準も持たない。
+設計指示の context 分離を実現する共有表示状態の所有変更であり、detached 固有の guard は追加しない。
+detached 述語・viewport routing・HWND・focus・timer は変更しない。設計担当と外部独立レビュアーは、
+bundle の所有自体が症状パッチではなく構造的変更であることに合意している。この合意を初版全体の検収成功とは扱わない。
+独立レビュー round 2 の追補: 完成後の resize と片側移動で保持する自動 pan の由来は、配置要求の作成時に固定する。
+未操作の origin からは適用後の pan 全体を基準にし、手動 origin の非配置軸は従来どおり基準との差に残す。
+要求内の情報だけを追加し、bundle / snapshot の所有・detached 述語・viewport routing は変更しない。
+配置結果と寿命は [fullscreen-page-start-position-plan.md](fullscreen-page-start-position-plan.md) に記録する。
+
 ### 2026-11-14: フォルダツリーのポインター入力を ROOT の pass に所有させる (§1.769)
 
 `begin_folder_pane_label_input` は ROOT だけで、前の ROOT pass のツリー描画表を使う。メインの枠を描かない表示形態では表・ジェスチャ・結果を失効させるため、既存の native backdrop / embedded still / deferred reopen / viewport enter holdover の判定を読み取る。これらの述語、detached の状態・遷移・HWND・viewport identity・context bundle は変更しない。ROOT 以外からはツリーの新しい入力所有へ触れず、表示を飛ばした pass の結果も持ち越さない。
@@ -7451,3 +7485,14 @@ mount・swap・兄弟 context の表示状態の変更はしない。作り直�
 別窓を実際にmountするheadlessテストで拒否を確認し、mainへ戻ると同じ本を再び受け付けることも検査する。
 独立追レビューはこの受付を対象ownerの構造的一致としてACCEPT。
 焦点検証・確認用buildの結果は `cover-crop-plan.md` §15.4に記録した。
+
+### ローカル文字起こしの表示（2026-11-14、ASR T1 区切り3）
+
+動画の左パネルに「文字起こし」タブを足し、表示用 snapshot を再生器へ渡す値として 1 つ追加した。
+presenter は既存の latest-value の command slot と同じ形で受け取り、source swap で空へ戻す。
+F12 の配置変更で render core を作り直すときは、既存の再生成データの復元 batch に snapshot を 1 つ足して渡し直す。
+detached の述語・viewport／host／placement の判断経路、bundle の所有・交換は変更していない。
+表示キャッシュは AI 説明文 (V1-4a) と同じく bundle の外の App 共有 owner に置き、読み込みは専用 worker が行う。
+独立レビュー (gpt-6.1-sol / xhigh、コミット `e34a28713`) と設計担当 ClaudeCode は、これを既存の復元 batch に値を足す構造的変更であり
+症状パッチではないことに合意した。正本は [文字起こし計画 §8.2](local-asr-transcript-plan.md#82-データの流れ)。
+同じ output 内の F12 往復は実機未確認。

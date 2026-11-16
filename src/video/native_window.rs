@@ -3042,6 +3042,15 @@ fn signed_high_word(value: isize) -> i32 {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn native_mouse_wheel_control_flag_comes_from_message_wparam() {
+        use super::*;
+        let delta = (360_usize) << 16;
+        assert!(mouse_ctrl(WPARAM(delta | 0x0008)));
+        assert!(!mouse_ctrl(WPARAM(delta)));
+        assert!(!mouse_ctrl(WPARAM(delta | 0x0004)));
+    }
+
+    #[test]
     fn registered_editor_is_internal_but_an_external_foreground_is_not() {
         use super::{ForegroundUiGroup, classify_foreground_ui_group};
         let editors = std::collections::HashMap::from([(0x301_u64, 42_u32)]);

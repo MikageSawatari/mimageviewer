@@ -3,6 +3,9 @@ use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, Pre
 use super::*;
 use crate::ui_dialogs::context_menu::DeleteTarget;
 
+mod repro742;
+mod section1768;
+
 pub(crate) fn assert_cache_book_cover_only_worker_catalog_contract(
     app: &mut App,
     directory: &Path,
@@ -3645,6 +3648,9 @@ fn cold_dialog_owners_keep_app_stack_footprint_bounded() {
 #[test]
 fn history_transition_storage_keeps_app_stack_footprint_bounded() {
     use std::mem::size_of;
+    fn storage<T>(_: fn(&App) -> &T) -> usize {
+        size_of::<T>()
+    }
     println!(
         "sizes App={} FolderNavHistoryTarget={} OpenRequestOwner={} DirectPdfAdoption={} EpubOpenRestore={} PdfPasswordRequestOwner={} PdfPasswordRequest={} PdfEnumeratePending={} GpuLanczosCache={}",
         size_of::<App>(),
@@ -3656,6 +3662,29 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         size_of::<PdfPasswordRequest>(),
         size_of::<PdfEnumeratePending>(),
         size_of::<crate::gpu_lanczos::GpuLanczosCache>(),
+    );
+    #[cfg(windows)]
+    println!(
+        "T1 storage asr_setup={} transcript_job={} transcript_delete={} show_transcript_progress={} transcript_display={} music_transcript_panel={}; payload AsrSetup={} TranscriptJob={} TranscriptDeleteState={} TranscriptDisplayCache={} MusicTranscriptPanelSession={}",
+        storage(|app| &app.asr_setup),
+        storage(|app| &app.transcript_job),
+        storage(|app| &app.transcript_delete),
+        storage(|app| &app.show_transcript_progress),
+        storage(|app| &app.transcript_display),
+        storage(|app| &app.music_transcript_panel),
+        size_of::<crate::ui_dialogs::asr_addon::AsrSetup>(),
+        size_of::<crate::ui_dialogs::transcript_job::TranscriptJob>(),
+        size_of::<crate::ui_dialogs::transcript_delete::TranscriptDeleteState>(),
+        size_of::<crate::transcript_display_cache::TranscriptDisplayCache>(),
+        size_of::<crate::ui_music_panels::MusicTranscriptPanelSession>(),
+    );
+    println!(
+        "master storage Settings={} thumb_cover_auto_crop_binding={} thumb_cover_auto_crop_folders={} video_resume_positions={} legacy_resume_map={}",
+        storage(|app| &app.settings),
+        storage(|app| &app.settings.thumb_cover_auto_crop_binding),
+        storage(|app| &app.settings.thumb_cover_auto_crop_folders),
+        storage(|app| &app.settings.video_resume_positions),
+        size_of::<HashMap<String, f64>>(),
     );
     // A staged history request is rarely active and must not be stored inline in every App.
     // The capture/fullscreen input test creates several App values on a default test stack.
@@ -3685,6 +3714,8 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         size_of::<Option<Box<crate::ui_dialogs::epub_convert::EpubConvertState>>>(),
         size_of::<usize>()
     );
+    #[cfg(windows)]
+    assert_eq!(storage(|app| &app.asr_setup), size_of::<usize>());
     assert!(size_of::<App>() < 110_000);
 }
 
@@ -3946,7 +3977,12 @@ fn epub_batch_completion_refreshes_grid_and_applies_same_name_pdf_priority() {
     app.epub_batch_convert = Some(
         crate::ui_dialogs::epub_batch_convert::EpubBatchPending::completed_for_test(
             epub.clone(),
-            crate::ui_dialogs::epub_batch_convert::EpubBatchResult::Saved(pdf.clone(), vec![]),
+            Ok(crate::epub_convert::SavedPdf {
+                path: pdf.clone(),
+                reused_cache: false,
+                user_data_errors: vec![],
+                metadata: Default::default(),
+            }),
         ),
     );
     app.poll_epub_batch_convert();
@@ -8414,7 +8450,7 @@ fn epub_batch_modal_blocks_grid_keyboard_and_click_open() {
     app.epub_batch_convert = Some(
         crate::ui_dialogs::epub_batch_convert::EpubBatchPending::completed_for_test(
             PathBuf::from("book.epub"),
-            crate::ui_dialogs::epub_batch_convert::EpubBatchResult::Skipped,
+            Err(crate::epub_convert::EpubConvertError::ExistingPdf),
         ),
     );
     let ctx = egui::Context::default();
@@ -9211,6 +9247,7 @@ fn contextless_test_window(ctx: &egui::Context, id: u64) -> DetachedImageWindowS
         image_dims: None,
         rotation: crate::rotation_db::Rotation::None,
         zoom_pan: None,
+        automatic_initial_view: None,
         free_rotation: 0.0,
         image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
         image_content_bbox: None,
@@ -23380,6 +23417,7 @@ mod phase_c_folder_nav_history_tests {
                 path: pdf.clone(),
                 reused_cache: false,
                 user_data_errors: Vec::new(),
+                metadata: Default::default(),
             },
             old_state.surface_generation,
             old_state.smart_transition_sequence,
@@ -80992,6 +81030,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -81081,6 +81120,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -81310,6 +81350,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -81385,6 +81426,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -81953,6 +81995,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -82263,6 +82306,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -83111,6 +83155,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -83163,6 +83208,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -84436,6 +84482,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: Some((1, 1)),
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -84584,6 +84631,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: Some((1, 1)),
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -84798,6 +84846,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: Some((1, 1)),
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -88367,6 +88416,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: Some((1, 1)),
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -88434,6 +88484,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 // Equal to open's reset values: the CAS guard cannot distinguish
                 // this explicit saved-position restoration from untouched input.
                 zoom_pan: Some((1.0, egui::Vec2::ZERO)),
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -88546,6 +88597,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -88686,6 +88738,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: Some((1, 1)),
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -88716,6 +88769,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -88974,6 +89028,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -89313,6 +89368,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -90594,6 +90650,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -90655,6 +90712,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -92434,6 +92492,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -95063,6 +95122,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 image_dims: Some((1, 1)),
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(
                     egui::pos2(0.0, 0.0),
@@ -95151,6 +95211,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             image_dims: Some((1, 1)),
             rotation: crate::rotation_db::Rotation::None,
             zoom_pan: None,
+            automatic_initial_view: None,
             free_rotation: 0.0,
             image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             image_content_bbox: None,
@@ -95253,6 +95314,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             image_dims: Some((1, 1)),
             rotation: crate::rotation_db::Rotation::None,
             zoom_pan: None,
+            automatic_initial_view: None,
             free_rotation: 0.0,
             image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             image_content_bbox: None,

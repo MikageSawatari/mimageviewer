@@ -105,6 +105,46 @@ Remote は source のメディア時刻から、さらに配信 generation の `
 保存済みの旧続き位置とキャッシュの互換方針、fixture、受入条件の正本は
 [動画の時刻原点の設計](video-timeline-origin-plan.md)。
 
+## TS / PS の seek
+
+`mpegts` / `mpegtsraw` / `mpeg` の timestamp seek は keyframe に着地する保証がない。
+`src/video/keyframe_seek.rs` の `PacketReader` が各 worker の Input ごとに seek と保持 packet の
+読み口を所有する。拡張子や `AVFMT_TS_DISCONT` では判定しない。音声だけの Input と他形式は
+元の seek 引数のまま `Direct` へ進む。時刻原点の変換は引き続き `MediaTimeline` だけで行う。
+
+目標の raw video tick から 1 / 2 / 4 / 8 / 16 / 32 秒ずつ手前へ戻し、着地点から映像 DTS が
+目標を超える packet まで保持する。集合 J は DTS が既知かつ目標以下の映像 key packet だけ。
+「J に既知 PTS が目標以下の key がある」または「MPEG-1/2 で J が2個以上かつすべて PTS 不明」
+で確認する。窓の終端 packet は保持するが J には含めない。先頭へ戻る場合だけ byte 0 を使い、
+stream の start PTS への seek は使わない。確認成功後に再 seek せず、映像の非 key packet や
+side data も含めた保持列を、そのまま decoder の flush 後へ渡す。読み口は保持列を尽くしてから
+同じ Input の続きを読む。
+
+再生 demux thread は Flush の受理と古い pending の破棄の後、保持した映像を順に
+`pending_video_packets` へ非blockingで移す。保持した音声が詰まっても既存の video drain が
+映像を配送できる。stream 内の順序を保ち、stream をまたぐ配送順だけは既存 pending と同様に
+緩める。新要求・serial 不一致・停止で `Aborted` になった古い要求は、準備済みの音声 setup と
+保持列を捨て、forward 再試行・採用・`SeekCompleted` を行わない。通常の trim・音声採用開始と
+frame-step の seek_start / base は要求したメディア時刻のまま。
+
+保持は64 MiB、FFmpeg の `AVIOContext.bytes_read` 増分は全試行で128 MiBに制限する。
+各 seek と read の呼び出し後に予算と取消を確認し、時間の予算は設けない。量超過や32秒の
+確認失敗では元の stream index・単位の locator で seek して `Unverified` と記録する。
+FFmpeg の1回の呼び出しの内部は中断できない。読み取りエラーはその窓の終わりとして扱う。
+H.264 recovery point / intra refresh、途中の時刻不連続、32秒を超える GOP は保証の対象外。
+
+再生・hover・tile・strip の枠・screenshot・Remote の時計なし transcode がこの読み口を使う。
+thumbnail / tile は EOF で decoder を drain し、screenshot は packet/frame の240上限を置かず、
+目標到達・EOF drain・読み取りエラーを区別する。TS/PS の strip 軸は探索点の索引を読まず
+`TimeGrid` にし、索引 warmup も省く。upscale の分割は packet 順と表示順の番号付けの別問題
+(バックログ §1.798) があるため今回変更しない。
+TS/PS の seek 直後は音声 PES の途中から再同期し、先頭の音声 packet が不完全になることがある。
+Remote の音声 decoder は対象3 demuxerの開始時だけ、`InvalidData` を最大3 packet記録して読み進める。
+最初の音声 frame が復号できた時点（採用前のprerollを含む）で許可を閉じ、以降のエラー、
+他形式、上限超過、他のエラーは従来どおり終了する。読み飛ばした後、音声 frame が一つも復号できず
+終端に達した場合も成功にしない。音声の採用時刻・DSP・resampler・trim は変更しない。
+契約・割り切りと受入条件の正本は [MPEG keyframe seek の設計](mpeg-keyframe-seek-plan.md)。
+
 ## 採用アーキテクチャ: native presenter (独立 HWND + D3D11 swap chain) 必須
 
 旧版では「DX12 wgpu backend なら egui_wgpu callback で zero-copy GPU 描画、それ以外
@@ -514,7 +554,12 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
 入力 owner を同じ派生判定で一時抑止する。保存済みの open / lock / tag picker state は変更せず、mode 終了後に
 同じ状態へ戻す。上部・下部 HUD はこの抑止に含めない。
 右メタデータパネルは App の per-file `fs_click_info_open` を正本として presenter へ同期し、
-左パネルは上段の「ジャンプ / 画像補正」タブと、画像補正内の「色調 / フィルタ」タブで構成する。
+左パネルは上段の「ジャンプ / 文字起こし / 画像補正」タブと、画像補正内の「色調 / フィルタ」タブで構成する。
+文字起こしは常時タブを出し、Appの共通snapshotだけを受け取る。render threadでDB/ファイルは読まない。
+古い/別trackの本文は警告とともに保持する。全文折返し一覧はmusicと同じrendererで、可視行だけをlayoutし、
+Fenwick高さ索引を使う。再生中の行へ自動送りし、手動scrollで停止、再生位置へ戻る操作で再開する。
+このfollow/scrollはtab・panelの閉鎖/source変更で破棄する一時状態で、設定へは保存しない。
+右metadataにも同snapshotから文字起こしの状態1行を表示する。
 ジャンプの開閉と選択中タブは presenter-local な session 状態、色調と Creative LUT の値は
 viewer-wide な `Settings::video_adjustments` を正本とする。画像補正パネル末尾には動画専用の
 10 個の保存スロットを読込行 / 保存行で表示する。スロット内容は App 側の
@@ -3034,6 +3079,15 @@ viewport へ切り替わる間に新 viewport がフォーカスを取るまで�
 ⊞ ボタン (× の左)。
 
 ### 動画→音声モード (音楽ビュー)
+
+音楽ビューの左は「ジャンプ / 文字起こし」の2タブ。Appがnative動画と同じsnapshotを作り、
+共通一覧rendererへ渡す。tab/follow/scrollはviewer contextとsourceに属する現在のmusic panel sessionが持ち、
+閉鎖・動画とのmode遷移で破棄する。右情報にも同snapshotの状態1行を出す。
+文字起こしの保存時刻は再生側と同じメディア時刻。抽出のInputに属する `MediaTimeline` が原点を処理し、
+表示の強調と行からのseekは保存時刻を直接使う。UIでの再probe・原点待ち・表示側の加減算は不要。
+TS/PSはO_eff基準、正の開始時刻を持つMKVも再生側と同じ原点0を使い、音声の先頭遅延を保持する。
+既存seekの `[0, duration_secs - 0.1]` 制限を共用し、文字起こし専用のclampや迂回は設けない
+（[ASR計画 §8.3](local-asr-transcript-plan.md#83-時刻の精度)）。
 
 音声ファイル (`GridItem::Audio`) の再生と、動画再生中に映像をカットして音声だけ聴く
 「動画→音声モード」は、どちらも同じ再生エンジンを使い、映像面を egui の音楽ビュー overlay

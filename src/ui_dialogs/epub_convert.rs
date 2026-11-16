@@ -348,12 +348,35 @@ fn start_save(state: &mut EpubConvertState) -> Result<(), String> {
             };
             drop(progress_tx);
             let _ = forward.join();
-            let _ = tx.send(EpubConvertMsg::SaveDone(result));
+            send_save_done(&tx, result);
         })
         .map_err(|_| "PDF の保存を開始できませんでした".to_owned())?;
     state.rx = rx;
     state.phase = EpubConvertPhase::Saving(None);
     Ok(())
+}
+
+fn send_save_done(
+    tx: &mpsc::Sender<EpubConvertMsg>,
+    result: Result<epub_convert::SavedPdf, EpubConvertError>,
+) -> bool {
+    send_save_done_with_log(tx, result, |message| crate::logger::log(message))
+}
+
+fn send_save_done_with_log(
+    tx: &mpsc::Sender<EpubConvertMsg>,
+    result: Result<epub_convert::SavedPdf, EpubConvertError>,
+    log: impl FnOnce(String),
+) -> bool {
+    if let Err(error) = tx.send(EpubConvertMsg::SaveDone(result)) {
+        if let EpubConvertMsg::SaveDone(Ok(saved)) = error.0 {
+            log(epub_convert::saved_pdf_completion_not_received_message(
+                &saved.path,
+            ));
+        }
+        return false;
+    }
+    true
 }
 
 impl App {
@@ -669,6 +692,7 @@ impl App {
                     return;
                 }
                 Ok(EpubConvertMsg::SaveDone(Ok(saved))) => {
+                    self.apply_epub_saved_metadata(saved.metadata);
                     self.finish_epub_conversion_open(
                         state,
                         saved.path,
@@ -815,6 +839,197 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PDF rendering/publication are omitted; exercise the actual shared worker tail.
+    fn section1761_copy_saved_metadata(data_dir: &Path, source: &Path) -> epub_convert::SavedPdf {
+        let saved = epub_convert::copy_saved_pdf_metadata(
+            data_dir,
+            source,
+            source.with_extension("pdf"),
+            false,
+        );
+        assert!(
+            saved.user_data_errors.is_empty(),
+            "{:?}",
+            saved.user_data_errors
+        );
+        saved
+    }
+
+    fn section1761_seed_rotation(app: &mut App, source: &Path) -> String {
+        let key = format!("{}::page_1", crate::adjustment_db::normalize_path(source));
+        app.rotation_db
+            .as_ref()
+            .unwrap()
+            .set_key(&key, crate::rotation_db::Rotation::Cw90)
+            .unwrap();
+        app.update_rotation_page_owner([(key.clone(), crate::rotation_db::Rotation::Cw90)]);
+        key
+    }
+
+    fn section1761_assert_copied_rotation_visible(app: &mut App, destination: PathBuf) {
+        let key = format!(
+            "{}::page_1",
+            crate::adjustment_db::normalize_path(&destination)
+        );
+        assert_eq!(
+            app.rotation_db.as_ref().unwrap().get_key(&key),
+            Some(crate::rotation_db::Rotation::Cw90),
+            "the real worker helper committed the destination rotation"
+        );
+        app.items = vec![crate::grid_item::GridItem::PdfFile(destination)];
+        assert_eq!(
+            (
+                app.rotation_for_page_key(&key),
+                app.grid_edit_badges(0).rotation
+            ),
+            (crate::rotation_db::Rotation::Cw90, true),
+            "a committed copied rotation must reach the memory-only cover and badge owner"
+        );
+    }
+
+    #[test]
+    fn section1761_single_save_completion_adopts_committed_rotation() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = app.tmp.path().join("single.epub");
+        section1761_seed_rotation(&mut app, &source);
+        let data_dir = app.tmp.path().to_path_buf();
+        let worker_source = source.clone();
+        let epoch = crate::page_edit_write_epoch::TestEpochScope::capture().unwrap();
+        let saved = std::thread::spawn(move || {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::enter(epoch);
+            section1761_copy_saved_metadata(&data_dir, &worker_source)
+        })
+        .join()
+        .unwrap();
+        let destination = saved.path.clone();
+        app.epub_convert = Some(EpubConvertState::saved_for_test(
+            source,
+            OpenRequestOwner::Navigation,
+            saved,
+            0,
+            0,
+            crate::app::StartupListIntent::PageContinuation,
+        ));
+        egui::Context::default()
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
+        assert!(app.epub_convert.is_none());
+        assert!(
+            app.pdf_enumerate_pending
+                .as_ref()
+                .is_some_and(|pending| pending.0 == destination),
+            "the real SaveDone handler accepted and opened the saved PDF"
+        );
+        section1761_assert_copied_rotation_visible(&mut app, destination);
+    }
+
+    #[test]
+    fn section1761_readback_failure_warns_and_opens_without_replacing_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = app.tmp.path().join("failed_read.epub");
+        let destination = source.with_extension("pdf");
+        let key = crate::edit_source::page_key_for_pdf(&destination, 1);
+        app.update_rotation_page_owner([(key.clone(), crate::rotation_db::Rotation::Cw270)]);
+        let data = app.tmp.path().to_path_buf();
+        // The worker's actual readback fails after the copy tail, rather than a hand-built report.
+        rusqlite::Connection::open(data.join("rotation.db"))
+            .unwrap()
+            .execute_batch("DROP TABLE rotations")
+            .unwrap();
+        let epoch = crate::page_edit_write_epoch::TestEpochScope::capture().unwrap();
+        let worker_source = source.clone();
+        let saved = std::thread::spawn(move || {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::enter(epoch);
+            epub_convert::copy_saved_pdf_metadata(
+                &data,
+                &worker_source,
+                worker_source.with_extension("pdf"),
+                false,
+            )
+        })
+        .join()
+        .unwrap();
+        assert!(saved.metadata.presence.is_err());
+        app.epub_convert = Some(EpubConvertState::saved_for_test(
+            source,
+            OpenRequestOwner::Navigation,
+            saved,
+            0,
+            0,
+            crate::app::StartupListIntent::PageContinuation,
+        ));
+        egui::Context::default()
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
+        assert_eq!(
+            app.rotation_for_page_key(&key),
+            crate::rotation_db::Rotation::Cw270
+        );
+        assert!(
+            app.pdf_enumerate_pending
+                .as_ref()
+                .is_some_and(|pending| pending.0 == destination)
+        );
+        assert!(app.feedback_toasts_for_test.iter().any(|(text, kind)| {
+            text.contains("一部の設定を引き継げませんでした")
+                && *kind == crate::feedback::FeedbackKind::Warning
+        }));
+    }
+
+    #[test]
+    fn section1761_replaced_dialog_late_copy_defers_memory_adoption() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = app.tmp.path().join("replaced.epub");
+        section1761_seed_rotation(&mut app, &source);
+        let (mut state, tx, cancel) = fake_state(EpubConvertPhase::Saving(None));
+        state.src_path = source.clone();
+        state.src_owner = crate::pdf_loader::LeasedEpubPath::try_new(source.clone()).unwrap();
+        app.epub_convert = Some(state);
+        let data_dir = app.tmp.path().to_path_buf();
+        let worker_source = source.clone();
+        let (release, wait) = mpsc::channel();
+        let epoch = crate::page_edit_write_epoch::TestEpochScope::capture().unwrap();
+        let worker = std::thread::spawn(move || {
+            let _epoch = crate::page_edit_write_epoch::TestEpochScope::enter(epoch);
+            wait.recv().unwrap();
+            // The actual post-publication copy accepts no CancelToken: retiring
+            // the dialog cannot prevent this already-published worker tail.
+            let saved = section1761_copy_saved_metadata(&data_dir, &worker_source);
+            let mut logged = None;
+            let sent = send_save_done_with_log(&tx, Ok(saved), |message| logged = Some(message));
+            (!sent, logged)
+        });
+        let (replacement, _replacement_tx, _) = fake_state(EpubConvertPhase::Scanning);
+        app.replace_epub_convert_state(replacement);
+        assert!(cancel.is_cancelled());
+        release.send(()).unwrap();
+        let (not_received, logged) = worker.join().unwrap();
+        assert!(not_received, "the old dialog receiver was retired");
+        let logged = logged.expect("send failure must log deferred display adoption");
+        assert!(logged.contains("次回起動時"));
+        assert!(logged.contains(&source.with_extension("pdf").display().to_string()));
+        egui::Context::default()
+            .run_pass(Default::default(), |ctx| app.show_epub_convert_dialog(ctx))
+            .drop_without_applying_deltas();
+        assert!(matches!(
+            app.epub_convert.as_ref().map(|state| &state.phase),
+            Some(EpubConvertPhase::Scanning)
+        ));
+        let key = format!(
+            "{}::page_1",
+            crate::adjustment_db::normalize_path(&source.with_extension("pdf"))
+        );
+        assert_eq!(
+            app.rotation_db.as_ref().unwrap().get_key(&key),
+            Some(crate::rotation_db::Rotation::Cw90)
+        );
+        assert_eq!(
+            app.rotation_for_page_key(&key),
+            crate::rotation_db::Rotation::None
+        );
+        // R4 user decision: the receiver is gone; the worker logs deferred RAM adoption.
+    }
 
     #[test]
     fn epub_do_not_ask_again_changes_only_epub_policy() {
@@ -1130,6 +1345,7 @@ mod tests {
             path: pdf.clone(),
             reused_cache: false,
             user_data_errors: Vec::new(),
+            metadata: Default::default(),
         })))
         .unwrap();
         let _ = ctx

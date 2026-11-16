@@ -45,6 +45,9 @@ pub mod ffmpeg_loader;
 mod frame_selection;
 #[cfg(windows)]
 pub mod gpu_renderer;
+pub(crate) mod keyframe_seek;
+#[cfg(test)]
+pub(crate) mod keyframe_seek_test_support;
 pub(crate) mod media_timeline;
 pub mod mvexport;
 #[cfg(windows)]
@@ -88,6 +91,8 @@ pub mod swscale_helpers;
 pub mod thumbnail;
 pub mod tile_thumb_cache;
 pub mod tile_thumbnails;
+#[cfg(all(windows, test))]
+mod transcript_display_tests;
 pub mod upscale;
 #[allow(dead_code)]
 pub(crate) mod window_host_contract;
@@ -1639,6 +1644,9 @@ enum NativeVideoOutputCommand {
     SetJumpEntries {
         entries: Vec<native_presenter::NativeOverlayJumpEntry>,
     },
+    SetTranscriptSnapshot {
+        snapshot: crate::transcript_display::TranscriptSnapshot,
+    },
     SetVideoGrade {
         grade: crate::creative_lut::VideoGradeSnapshot,
     },
@@ -2125,7 +2133,7 @@ impl<F> FramePresentationState<F> {
 }
 
 #[cfg(windows)]
-const NATIVE_COMMAND_LATEST_SLOTS: usize = 34;
+const NATIVE_COMMAND_LATEST_SLOTS: usize = 35;
 
 #[cfg(windows)]
 fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usize> {
@@ -2163,6 +2171,7 @@ fn native_command_latest_slot(command: &NativeVideoOutputCommand) -> Option<usiz
         NativeVideoOutputCommand::SetPanoramaPose { .. } => Some(31),
         NativeVideoOutputCommand::SetVideoZoomState { .. } => Some(32),
         NativeVideoOutputCommand::SetVideoCanvasColor { .. } => Some(33),
+        NativeVideoOutputCommand::SetTranscriptSnapshot { .. } => Some(34),
         NativeVideoOutputCommand::ResetSidePanelSession
         | NativeVideoOutputCommand::StartAnime4kMeasurement
         | NativeVideoOutputCommand::ShowToast { .. }
@@ -2846,6 +2855,8 @@ pub(crate) struct NativeVideoOutput {
     last_checked: AtomicBool,
     last_text_contrast_strong: AtomicBool,
     last_video_canvas_color: AtomicU32,
+    // 新しい output は未配信から始まるため、presenter 再生成後も同じ本文を再配信する。
+    last_transcript_snapshot: Mutex<Option<crate::transcript_display::TranscriptSnapshot>>,
     visibility_gate: Arc<NativeVideoOutputVisibilityGate>,
     command_tx: NativeCommandSender,
     event_rx: std::sync::Mutex<NativeOutputEventReceiver>,
@@ -2948,6 +2959,7 @@ impl NativeVideoOutput {
             last_checked: AtomicBool::new(false),
             last_text_contrast_strong: AtomicBool::new(false),
             last_video_canvas_color: AtomicU32::new(pack_native_video_canvas_color([0, 0, 0])),
+            last_transcript_snapshot: Mutex::new(None),
             visibility_gate,
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
@@ -3136,6 +3148,7 @@ impl NativeVideoOutput {
             last_video_canvas_color: AtomicU32::new(pack_native_video_canvas_color(
                 initial_video_canvas_color,
             )),
+            last_transcript_snapshot: Mutex::new(None),
             visibility_gate,
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
@@ -3243,6 +3256,22 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetJumpEntries { entries });
+    }
+
+    fn set_transcript_snapshot(&self, snapshot: crate::transcript_display::TranscriptSnapshot) {
+        let mut previous = self.last_transcript_snapshot.lock().unwrap();
+        if previous
+            .as_ref()
+            .is_some_and(|old| old.same_presentation(&snapshot))
+        {
+            return;
+        }
+        *previous = Some(snapshot.clone());
+        drop(previous);
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetTranscriptSnapshot { snapshot });
+        crate::video::native_window::post_wake(self.hwnd.load(Ordering::Acquire));
     }
 
     fn set_video_grade(&self, grade: crate::creative_lut::VideoGradeSnapshot) {
@@ -3487,6 +3516,8 @@ impl NativeVideoOutput {
 
     #[allow(dead_code)]
     fn switch_source(&self, payload: SwitchSourcePayload) {
+        // render 側の既存 source reset と対になる。次の同期を同じキーでも省略しない。
+        *self.last_transcript_snapshot.lock().unwrap() = None;
         self.first_presented.store(false, Ordering::Release);
         self.source_epoch
             .store(payload.source_epoch, Ordering::Release);
@@ -5437,6 +5468,7 @@ fn run_native_video_output(
     let mut cur_video_compact: Option<bool> = None;
     let mut cur_fallback_file_name = config.fallback_file_name.clone();
     let mut cur_video_grade = config.video_grade.clone();
+    let mut cur_transcript_snapshot = crate::transcript_display::TranscriptSnapshot::default();
     let mut cur_panorama_pose: Option<(
         crate::panorama::PanoPose,
         crate::panorama::PanoUvTransform,
@@ -5908,6 +5940,10 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetJumpEntries { entries } => {
                     presenter.set_overlay_jump_entries(entries);
+                }
+                NativeVideoOutputCommand::SetTranscriptSnapshot { snapshot } => {
+                    cur_transcript_snapshot = snapshot.clone();
+                    presenter.set_overlay_transcript_snapshot(snapshot);
                 }
                 NativeVideoOutputCommand::SetVideoGrade { grade } => {
                     let render_grade_changed = video_grade_render_changed(&cur_video_grade, &grade);
@@ -6451,6 +6487,8 @@ fn run_native_video_output(
                     presenter.set_overlay_metadata(None);
                     presenter.set_overlay_timeline_markers(Vec::new());
                     presenter.set_overlay_jump_entries(Vec::new());
+                    cur_transcript_snapshot = Default::default();
+                    presenter.set_overlay_transcript_snapshot(cur_transcript_snapshot.clone());
                     if let Err(err) = presenter.reset_overlay_source_session() {
                         crate::logger::log(format!(
                             "[native-video] reset seek-strip transform failed: {err}"
@@ -6773,6 +6811,9 @@ fn run_native_video_output(
                             cur_vst3_available && placement.is_fullscreen_borderless(),
                         );
                         new_presenter.set_video_grade(cur_video_grade.clone())?;
+                        // 配置の判断・viewport 経路は変えず、同じsourceの表示データだけを復元する。
+                        new_presenter
+                            .set_overlay_transcript_snapshot(cur_transcript_snapshot.clone());
                         new_presenter.set_panorama_pose(cur_panorama_pose)?;
                         new_presenter.set_video_zoom_state(cur_video_zoom_state)?;
                         new_presenter.set_overlay_audio_only(config.audio_only);
@@ -12118,6 +12159,28 @@ impl VideoPlayer {
         if let Some(output) = self.native_output.as_ref() {
             output.set_jump_entries(entries);
         }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn set_native_transcript_snapshot(
+        &self,
+        snapshot: crate::transcript_display::TranscriptSnapshot,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_transcript_snapshot(snapshot);
+        }
+    }
+
+    #[cfg(all(windows, test))]
+    pub(crate) fn native_transcript_snapshot_for_test(
+        &self,
+    ) -> Option<crate::transcript_display::TranscriptSnapshot> {
+        self.native_output
+            .as_ref()?
+            .last_transcript_snapshot
+            .lock()
+            .unwrap()
+            .clone()
     }
 
     #[cfg(windows)]

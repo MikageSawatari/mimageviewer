@@ -4,20 +4,33 @@ use super::*;
 pub(super) struct ReadContext {
     pub(super) cancel: Arc<AtomicBool>,
     pub(super) granted: PermissionGrant,
+    /// The adapter's accepted Hello version, fixed for this request's connection.
+    #[allow(dead_code)] // Reserved for version-aware handlers (e.g. search T2).
+    pub(super) adapter_protocol_version: u32,
     progress: Arc<Mutex<Option<Payload>>>,
     deadline: Instant,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
 }
 impl ReadContext {
+    #[cfg(test)]
     pub(super) fn new(
         handlers: &Handlers,
         granted: PermissionGrant,
         cancel: Arc<AtomicBool>,
     ) -> Self {
+        Self::for_adapter(handlers, granted, cancel, AGENT_PROTOCOL_VERSION)
+    }
+    pub(super) fn for_adapter(
+        handlers: &Handlers,
+        granted: PermissionGrant,
+        cancel: Arc<AtomicBool>,
+        adapter_protocol_version: u32,
+    ) -> Self {
         let clock = handlers.clock();
         Self {
             cancel,
             granted,
+            adapter_protocol_version,
             progress: Arc::new(Mutex::new(None)),
             deadline: clock() + Duration::from_secs(20),
             clock,

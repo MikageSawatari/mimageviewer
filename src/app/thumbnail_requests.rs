@@ -38,6 +38,7 @@ enum Phase {
 }
 struct Request {
     cover_scope: Option<crate::cover_source_scope::CoverSourceScope>,
+    automatic_cover_request: Option<crate::thumb_loader::LoadRequest>,
     refresh_legacy_cover: bool,
     id: ThumbnailRequestId,
     items_gen: u64,
@@ -113,6 +114,13 @@ impl ThumbnailRequests {
         let id = self.begin(req.idx, req.items_gen, kind, edit_preview_epoch)?;
         let r = self.entries.get_mut(&req.idx)?.request_mut()?;
         r.cover_scope = req.cover_scope.clone();
+        r.automatic_cover_request = req.auto_cover_crop.map(|_| {
+            let mut admitted = req.clone();
+            // The caller assigns the returned ID after admission. These retained
+            // facts already belong to the reservation created above.
+            admitted.request_id = id;
+            admitted
+        });
         r.refresh_legacy_cover = req.refresh_legacy_cover;
         Some(id)
     }
@@ -123,6 +131,13 @@ impl ThumbnailRequests {
     ) -> Option<(Option<crate::cover_source_scope::CoverSourceScope>, bool)> {
         let r = self.entries.get(&idx)?.request()?;
         (r.id == id).then(|| (r.cover_scope.clone(), r.refresh_legacy_cover))
+    }
+    /// Immutable admission facts, never a fresh source/DB lookup on the UI thread.
+    pub(crate) fn automatic_cover_requests(&self) -> Vec<crate::thumb_loader::LoadRequest> {
+        self.entries
+            .values()
+            .filter_map(|slot| slot.request()?.automatic_cover_request.clone())
+            .collect()
     }
     /// Normal and Upgrade share admission: changing the producer alone never releases a wait.
     pub(crate) fn admission(
@@ -164,6 +179,7 @@ impl ThumbnailRequests {
             idx,
             Slot::Request(Request {
                 cover_scope: None,
+                automatic_cover_request: None,
                 refresh_legacy_cover: false,
                 id,
                 items_gen,

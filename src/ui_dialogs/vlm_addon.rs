@@ -574,15 +574,10 @@ fn draw_dialog(
                             if warning { ui.colored_label(ui.visuals().warn_fg_color, "AI 補正と同時に使うと遅くなることがあります。快適に使うには AI 補正を『軽量』にして、mIV を再起動してください。"); }
                         }
                         Dialog::Running(_) => {
-                            if operation == AddonOperation::Cancelling || operation == AddonOperation::Removing {
-                                ui.label("前の処理を片付けています");
-                            } else {
-                                ui.label("モデルをダウンロードしています。取得中も画像を閲覧できます。");
-                                super::model_addon::draw_progress(ui, progress);
-                            }
+                            super::model_addon::draw_download_status(ui, progress, operation);
                         }
                         Dialog::Done => { ui.label("モデルのダウンロードが完了しました。"); }
-                        Dialog::Cancelled => { ui.label("ダウンロードをキャンセルしました。次回は続きから取得できます。"); }
+                        Dialog::Cancelled => { super::model_addon::draw_download_cancelled(ui); }
                         Dialog::Error(message) => { ui.colored_label(ui.visuals().error_fg_color, "モデルの処理に失敗しました"); ui.label(message); }
                         Dialog::GpuError(message) => { ui.colored_label(ui.visuals().error_fg_color, "GPU の確認に失敗しました"); ui.label(message); ui.label("mIV を再起動してからもう一度お試しください。"); }
                         Dialog::RemoveConfirm => { ui.label("AI 説明文のモデルを削除しますか？"); ui.label("保存済みの説明文は消えません。必要になったら再ダウンロードできます。"); }
@@ -595,7 +590,7 @@ fn draw_dialog(
                     if ui.button("今はしない").clicked() { action = Action::Close; }
                 }
                 Dialog::Running(_) => {
-                    if ui.add_enabled(operation == AddonOperation::Installing, egui::Button::new("キャンセル")).clicked() { action = Action::Cancel; }
+                    if super::model_addon::draw_download_cancel(ui, operation) { action = Action::Cancel; }
                 }
                 Dialog::RemoveConfirm => {
                     if ui.button("削除する").clicked() { action = Action::Remove; }

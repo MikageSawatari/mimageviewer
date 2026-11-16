@@ -393,6 +393,8 @@ fn send_audio_packet_with_video_drain(
                     }
                 }
 
+                #[cfg(test)]
+                clock.wait_at_demux_audio_backpressure_for_test(pending_video_packets.len());
                 let now = std::time::Instant::now();
                 let waited = now.duration_since(wait_started);
                 if waited >= std::time::Duration::from_millis(250)
@@ -833,11 +835,38 @@ fn recv_video_decode_input_with_timeout(
     }
 }
 
+#[cfg(test)]
+#[path = "mpeg_keyframe_seek_decoder_tests.rs"]
+mod mpeg_keyframe_seek_decoder_tests;
+
 struct QueuedVideoPacket {
     serial: u64,
     packet: ffmpeg_the_third::Packet,
     pts_secs: Option<f64>,
     size_bytes: usize,
+}
+
+fn queue_held_seek_video(
+    reader: &mut super::keyframe_seek::PacketReader,
+    video_stream: usize,
+    serial: u64,
+    timeline: MediaTimeline,
+    seconds_per_tick: f64,
+    pending: &mut VecDeque<QueuedVideoPacket>,
+    pending_bytes: &mut usize,
+) {
+    reader.take_held_video(video_stream, |packet| {
+        let pts_secs = packet_timestamp(&packet)
+            .map(|pts| timeline.raw_to_media_secs(pts as f64 * seconds_per_tick));
+        let size_bytes = packet.size();
+        *pending_bytes = pending_bytes.saturating_add(size_bytes);
+        pending.push_back(QueuedVideoPacket {
+            serial,
+            packet,
+            pts_secs,
+            size_bytes,
+        });
+    });
 }
 
 fn emit_demux_packet_send_wait(
@@ -2127,7 +2156,7 @@ fn enumerate_audio_tracks(input: &ffmpeg_the_third::format::context::Input) -> V
     enumerate_audio_tracks_with_timeline(input, MediaTimeline::from_input(input))
 }
 
-fn enumerate_audio_tracks_with_timeline(
+pub(crate) fn enumerate_audio_tracks_with_timeline(
     input: &ffmpeg_the_third::format::context::Input,
     timeline: MediaTimeline,
 ) -> Vec<AudioTrackInfo> {
@@ -3228,6 +3257,7 @@ fn run_decoder(
     // Both decode workers start at open serial 0. Requests made while opening
     // are still pending and must be handled before any packet gets their serial.
     let mut demux_serial = DemuxSerial(0);
+    let mut packet_reader = super::keyframe_seek::PacketReader::default();
 
     'outer: loop {
         if cancel.load(Ordering::Acquire) {
@@ -3418,33 +3448,16 @@ fn run_decoder(
             };
             // Phase B: post_seek_frame_sent / drop_before_secs / current_seek_serial は
             // すべて video decode thread のローカル変数として所有される。demux thread は
-            // 「seek 要求を受け取り → input.seek() を実行 → 両 decode thread に Flush
+            // 「seek 要求を受け取り → 共通 seek owner を実行 → 両 decode thread に Flush
             // marker を送る」までを担当。
             // タイムスタンプは AV_TIME_BASE_Q (1/1_000_000 秒、マイクロ秒) 単位。
             let target_pts = timeline.media_to_av_time_base(target_secs);
 
-            // 後方 / 絶対シークは `av_seek_frame + AVSEEK_FLAG_BACKWARD` を使う。
+            // 後方 / 絶対シークは共通 owner の backward seek を使う。TS / PS では
+            // BACKWARD だけでは key に着かないため、手前の窓を確認して保持列を渡す。
             // `avformat_seek_file` (= `Input::seek`) は AVSEEK_FLAG_BACKWARD を
             // 無視するため、デマクサが target を跨いだ前後どちらの keyframe を
-            // 選ぶか不定。raw FFI 経由で確実に target 以前へ飛ばす。
-            let backward =
-                |input: &mut ffmpeg::format::context::Input| -> Result<(), ffmpeg::Error> {
-                    use ffmpeg_the_third::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
-                    let ret = unsafe {
-                        av_seek_frame(
-                            input.as_mut_ptr(),
-                            -1,
-                            target_pts,
-                            AVSEEK_FLAG_BACKWARD as i32,
-                        )
-                    };
-                    if ret >= 0 {
-                        Ok(())
-                    } else {
-                        Err(ffmpeg::Error::from(ret))
-                    }
-                };
-
+            // 選ぶか不定。索引を持つ形式では av_seek_frame の BACKWARD を使う。
             // Phase 9.F (2026-04-30): 前方/後方/絶対に関係なく **常に backward seek**
             // (= `av_seek_frame + AVSEEK_FLAG_BACKWARD`) を使う。旧コードは前方相対で
             // `input.seek(target..)` (= avformat_seek_file with min_ts=target、target 以降
@@ -3455,8 +3468,8 @@ fn run_decoder(
             // UI tick の `pts <= now + lead_tol` 判定で video frame が future 扱い →
             // 表示停止、音声だけ進む現象が起きていた。
             //
-            // backward seek なら video/audio 両方が **target 直前の keyframe** で始まる
-            // ので、anchor を target に書いても video frame は anchor より過去 =
+            // target 以前から video/audio の preroll を復号するため、anchor を target
+            // に書いても preroll の video frame は anchor より過去 =
             // `pts <= now + lead_tol` で処理できる。mIV はすべての seek で preroll
             // trim (= drop_before_secs) を行い、target 前の keyframe preview は表示しない。
             // これにより 1 秒 seek などで映像が「逆方向へ跳ねる」見え方を避ける。
@@ -3465,17 +3478,48 @@ fn run_decoder(
             #[cfg(not(test))]
             let injected_seek_failure = false;
             let mut seek_result = if injected_seek_failure {
+                packet_reader.clear();
                 Err(ffmpeg::Error::from(-22))
             } else {
-                backward(&mut input)
+                packet_reader.seek(&mut input, -1, target_pts, video_stream_idx, || {
+                    #[cfg(test)]
+                    clock.wait_at_demux_seek_gate_for_test();
+                    cancel.load(Ordering::Acquire)
+                        || clock.peek_seek_request_pending()
+                        || clock.current_seek_serial() != serial
+                })
             };
+            #[cfg(test)]
+            clock.record_demux_seek_for_test(super::clock::DemuxSeekObservation {
+                serial,
+                pending_video_packets: pending_video_packets.len(),
+                audio_packet_queue_len: audio_pkt_tx.len(),
+                outcome: seek_result.as_ref().ok().copied(),
+            });
+            // Supersession is not a seek failure. In particular, do not retry
+            // forward, apply the prepared audio setup, flush/adopt this serial,
+            // or send its SeekCompleted. Locals drop the obsolete setup here.
+            if seek_result == Ok(super::keyframe_seek::SeekOutcome::Aborted)
+                || cancel.load(Ordering::Acquire)
+                || clock.peek_seek_request_pending()
+                || clock.current_seek_serial() != serial
+            {
+                packet_reader.clear();
+                if cancel.load(Ordering::Acquire) {
+                    break 'outer;
+                }
+                continue 'outer;
+            }
             // backward が失敗したら forward を retry (= EOF 近傍など、target 以前に
             // keyframe が無い場合)。
             if seek_result.is_err() && !injected_seek_failure {
                 crate::logger::log(format!(
                     "backward seek failed at {target_secs:.3}s, retry as forward"
                 ));
-                seek_result = input.seek(target_pts, target_pts..);
+                packet_reader.clear();
+                seek_result = input
+                    .seek(target_pts, target_pts..)
+                    .map(|()| super::keyframe_seek::SeekOutcome::Unverified);
             }
             crate::logger::log(format!(
                 "seek: target={target_secs:.3}s audio_adoption_start={audio_adoption_start_secs:.3}s serial={serial} kind={kind:?} result={seek_result:?}"
@@ -3631,6 +3675,23 @@ fn run_decoder(
                 }
                 SeekFlushResult::Terminated => break 'outer,
             }
+            // Old pending packets were discarded above, and the new serial's
+            // Flush has been accepted. Queue ALL held video without blocking
+            // before held audio enters its potentially backpressured send.
+            if let Some(video_stream) = video_stream_idx {
+                queue_held_seek_video(
+                    &mut packet_reader,
+                    video_stream,
+                    serial,
+                    timeline,
+                    video_tb_num / video_tb_den,
+                    &mut pending_video_packets,
+                    &mut pending_video_packet_bytes,
+                );
+                pending_video_peak_packets =
+                    pending_video_peak_packets.max(pending_video_packets.len());
+                pending_video_peak_bytes = pending_video_peak_bytes.max(pending_video_packet_bytes);
+            }
             // 成功時のみ anchor を target に進める。失敗時に target を anchor すると
             // demux 位置とクロックが食い違い、anchor < frame_pts な audio set_audio_pts
             // 経路が monotonic-clamp で進まなくなる。
@@ -3667,6 +3728,15 @@ fn run_decoder(
             }
         }
 
+        // A request publishes its serial before its payload. After an aborted
+        // seek the Input position is unspecified: stay at the existing worker
+        // pacing boundary until that newer request can perform its own seek.
+        if demux_serial.0 != clock.current_seek_serial() {
+            packet_reader.clear();
+            sleep_video_pacing();
+            continue 'outer;
+        }
+
         // 1 パケット読み込み前に pending video backlog を drain。
         if !drain_pending_video_packets(
             &mut pending_video_packets,
@@ -3680,12 +3750,8 @@ fn run_decoder(
 
         #[cfg(test)]
         clock.wait_at_demux_packet_gate_for_test();
-        let packet_iter = input.packets();
-        // ※ packets() は &mut input を取るので毎ループ作り直す形になる。
-        //    ffmpeg-the-third 3.x では packets() のアイテムが Result<(Stream, Packet), Error>
-        //    に変わったので unwrap してから分解する。
         let mut got_packet = false;
-        for item in packet_iter {
+        while let Some(item) = packet_reader.next(&mut input) {
             let (stream, packet) = match item {
                 Ok(sp) => sp,
                 Err(e) => {
@@ -3697,7 +3763,7 @@ fn run_decoder(
             if cancel.load(Ordering::Acquire) {
                 break 'outer;
             }
-            if Some(stream.index()) == video_stream_idx {
+            if Some(stream) == video_stream_idx {
                 // Phase B: video packet は decode せず video decode thread に転送する。
                 // pre-decode preroll trim (= drop_before_secs check) と pacing logic は
                 // すべて video decode thread 側に移管。
@@ -3825,7 +3891,7 @@ fn run_decoder(
                 }
                 break; // 1 パケット消費したらループ先頭でシークチェック
             } else if let Some(audio_idx) = audio_stream_idx_for_demux {
-                if stream.index() == audio_idx {
+                if stream == audio_idx {
                     // Phase A: 音声 packet は decode せず audio decode thread に転送する。
                     // packet 段階の pre-decode preroll trim と sample-level trim は両方
                     // audio decode thread 側に移管した (= AudioControlMsg::Flush で渡した
@@ -7133,6 +7199,10 @@ fn emit_audio_samples(
         let frame = pending_frame
             .take()
             .expect("pending audio frame should exist before send_timeout");
+        #[cfg(test)]
+        if audio_tx.is_full() {
+            clock.wait_at_full_audio_output_for_test();
+        }
         match audio_tx.send_timeout(frame, send_wait) {
             Ok(()) => break,
             Err(crossbeam_channel::SendTimeoutError::Timeout(frame)) => {
@@ -9910,7 +9980,7 @@ mod audio_tail_seek_fixture_tests {
 }
 
 #[cfg(test)]
-mod audio_track_fixture_tests {
+pub(in crate::video) mod audio_track_fixture_tests {
     use super::{
         AudioTrackInfo, DecodeHandles, VideoInfo, enumerate_audio_tracks,
         enumerate_audio_tracks_with_decoder, spawn, spawn_with_initial_audio_track,
@@ -10105,7 +10175,9 @@ mod audio_track_fixture_tests {
             has_audio: info.has_audio,
             has_video: info.has_video,
         });
-        let video = wait_video_frame(&handles.video_rx, 0, 0.0);
+        let video = info
+            .has_video
+            .then(|| wait_video_frame(&handles.video_rx, 0, 0.0));
         let audio = handles
             .audio_rx
             .recv_timeout(Duration::from_secs(10))
@@ -10115,15 +10187,18 @@ mod audio_track_fixture_tests {
             pts: audio.pts_secs.max(0.0),
             wall_now: std::time::Instant::now(),
         });
-        actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
-            epoch: 0,
-            pts: video.pts_secs,
-        });
+        if let Some(video) = video {
+            actor.handle_decoder_event(DecoderEvent::FirstFrameReady {
+                epoch: 0,
+                pts: video.pts_secs,
+            });
+        }
         assert_eq!(actor.published_state_code(), state_code::PLAYING);
     }
 
     struct SwitchSession {
         handles: DecodeHandles,
+        info: VideoInfo,
         selection: Arc<AudioTrackSelection>,
         clock: Arc<AvClock>,
         actor: EngineActor,
@@ -10137,18 +10212,29 @@ mod audio_track_fixture_tests {
         }
 
         fn new_for(name: &str, initial_stream: usize) -> Self {
+            Self::new_at(fixture_path(name), initial_stream)
+        }
+
+        fn new_at(path: PathBuf, initial_stream: usize) -> Self {
             let cancel = Arc::new(AtomicBool::new(false));
             let serial = Arc::new(AtomicU64::new(0));
             let clock = Arc::new(AvClock::new(1.0, Arc::clone(&serial)));
             let mut actor = EngineActor::new(OpenOptions::default(), serial, Arc::clone(&clock));
             actor.begin_loading();
             let (event_tx, event_rx) = bounded(64);
-            let handles = spawn_headless(
-                name,
+            let handles = spawn(
+                path,
                 Arc::clone(&clock),
                 Arc::clone(&cancel),
+                48_000,
+                false,
+                crate::settings::VideoDeinterlaceMode::Off,
+                #[cfg(windows)]
+                None,
                 actor.published_state_handle(),
-                event_tx,
+                EngineEventSender::new(event_tx, Arc::new(VideoUiWake::default())),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(super::VideoDynamicState::default()),
             );
             let info = handles
                 .info_rx
@@ -10163,6 +10249,7 @@ mod audio_track_fixture_tests {
             start_actor_playing(&mut actor, &info, &handles);
             Self {
                 handles,
+                info,
                 selection,
                 clock,
                 actor,
@@ -10376,7 +10463,7 @@ mod audio_track_fixture_tests {
         }
     }
 
-    fn open_fixture_info_path(path: PathBuf) -> VideoInfo {
+    pub(in crate::video) fn open_fixture_info_path(path: PathBuf) -> VideoInfo {
         let input = ffmpeg_the_third::format::input(&path).expect("open committed fixture");
         let tracks = enumerate_audio_tracks(&input);
         let default_index = input.streams().best(MediaType::Audio).map(|s| s.index());
@@ -10412,6 +10499,31 @@ mod audio_track_fixture_tests {
         assert_eq!(info.audio_tracks, tracks);
         assert_eq!(info.default_audio_stream_index, default_index);
         info
+    }
+
+    #[test]
+    fn transcript_media_time_is_unchanged_across_real_audio_track_switches() {
+        use crate::video::audio_track_selection::AudioTrackSelectionDisplayState as Display;
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ai/transcript_audio/offset_tracks.mka");
+        let session = SwitchSession::new_at(path, 0);
+        assert_eq!(session.info.timeline_origin_secs, 0.0);
+        let delayed = session
+            .info
+            .audio_tracks
+            .iter()
+            .find(|track| track.stream_index == 1)
+            .unwrap();
+        assert_eq!(delayed.start_secs, Some(13.0));
+        let saved_start_secs = 13_000_u64 as f64 / 1000.0;
+        session.request(1, saved_start_secs);
+        session.wait_display_state(Display::Applied);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 1);
+        assert_eq!(session.info.timeline_origin_secs, 0.0);
+        session.request(0, 10.0);
+        session.wait_display_state(Display::Applied);
+        assert_eq!(session.selection.snapshot().applied.stream_index, 0);
+        assert_eq!(saved_start_secs, 13.0);
     }
 
     #[test]

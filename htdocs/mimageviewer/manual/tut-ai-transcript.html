@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>動画や音声を AI で文字起こしする — チュートリアル — mImageViewer</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="動画や音声ファイルの話し言葉を PC 内の AI で文字にする手順。モデルの取得、進捗と中止、左パネルで読んで場面へ移動、作り直し・削除と持ち運びを説明します。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/tut-ai-transcript.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/tut-ai-transcript.html">
+  <meta property="og:title" content="動画や音声を AI で文字起こしする｜mImageViewer">
+  <meta property="og:description" content="動画や音声ファイルの話し言葉を PC 内の AI で文字にする手順。モデルの取得、進捗と中止、左パネルで読んで場面へ移動、作り直し・削除と持ち運びを説明します。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="動画や音声を AI で文字起こしする｜mImageViewer">
+  <meta name="twitter:description" content="動画や音声ファイルの話し言葉を PC 内の AI で文字にする手順。モデルの取得、進捗と中止、左パネルで読んで場面へ移動、作り直し・削除と持ち運びを説明します。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <a href="tutorial.html">チュートリアル</a>
+    <span class="sep">›</span>
+    <span>動画や音声を AI で文字起こしする</span>
+  </nav>
+</header>
+
+<div class="layout tut-wide">
+  <main class="content">
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+    <h1 class="page-title">動画や音声を AI で文字起こしする</h1>
+    <p class="page-desc">
+      動画ファイルや音声ファイルの話し言葉を AI が聞き取り、時刻つきの日本語の文字にして PC 内に保存します。
+      文字起こしを作っておくと、動画や音楽を見ながら話の流れを読み、聞きたい場面へすぐ移動できます。まずは短い動画 1 本で、作成から移動まで試してみましょう。
+    </p>
+
+    <div class="box info">
+      <div class="box-body">
+        <strong>文字起こしの作成は PC 内で行い、動画・音声の音声や文字にした内容を外へ送りません。</strong>
+        モデルの取得時には通信します。また、別の機能である AI アプリとの連携で「文字起こしを AI に見せる」をオンにすると、
+        保存済みの文字起こしが AI アプリへ渡り、その提供元へ送られます。この許可は既定ではオフです。
+        詳しくは<a href="../privacy.html">プライバシーポリシー</a>をご覧ください。
+      </div>
+    </div>
+
+    <h2 id="prepare">1. 使える PC とモデルを確認する</h2>
+    <p><strong>Vulkan に対応した GPU が必要</strong>です。内蔵 GPU でも使えます。CPU だけの PC や、対応していない GPU・ドライバでは作成できず、
+      最初の操作のときにその理由を表示します。</p>
+    <p>かかる時間は GPU と音声の長さで変わります。目安として、内蔵 GPU では 1 時間の音声に 10 分前後かかります。
+      AI 説明文の作成や表示時の AI 処理と同時に使うと、遅くなることがあります。</p>
+    <p>初めて文字起こしを作るときは、追加のモデル（約 574 MB）をダウンロードします。取得元・大きさ・ライセンスは確認画面に表示されます。
+      詳しくは<a href="grid.html#transcripts">文字起こしを作る</a>をご覧ください。通常の起動や閲覧だけでは、自動で取得・作成しません。</p>
+
+    <h2 id="create">2. 動画や音声ファイルを選んで作成する</h2>
+    <ol class="step-list">
+      <li>一覧で、文字起こしを作りたい動画や音声ファイルを選びます。複数ならチェックし、チェックした項目の一つを右クリックします。</li>
+      <li>メニューバーの<strong>「ツール → 文字起こしを作る」</strong>、または右クリックメニューの<strong>「文字起こしを作る」</strong>を選びます。チェックした項目に現在の選択が含まれる場合は、チェックした全項目が対象です。</li>
+      <li>モデルがまだない場合は<strong>「文字起こしのモデル」</strong>の案内が出ます。内容を確認して<strong>「ダウンロード」</strong>を押します。今回は取得しない場合は「今はしない」で閉じられます。</li>
+      <li>取得が終わると、手順 2 の時点で選んでいた対象で作成が始まります。モデルを取得済みの場合は、手順 2 から作成へ進みます。</li>
+    </ol>
+    <p>一覧の空白部分を右クリックした場合は、現在のフォルダ直下の動画・音声ファイルを処理します。サブフォルダの中までは処理しません。</p>
+    <ul>
+      <li>対象は PC 上の動画ファイルと音声ファイルです。ZIP などの書庫の中の動画・音声、画像や本は対象外です。</li>
+      <li>言語は日本語に固定しています。</li>
+      <li>複数の音声トラックがある動画では、そのファイルで選んでいる音声トラックを使います。別のトラックで作り直したいときは、先に動画の再生で使うトラックを切り替えてから作成します。</li>
+      <li>リモート閲覧中は作成できません。</li>
+    </ul>
+
+    <h2 id="progress">3. 進み具合を見る・中止する</h2>
+    <p><strong>「文字起こしを作成」</strong>の小窓に、処理した件数、今のファイルの名前、音声のどこまで進んだか（割合と、「音声」の行の処理済みの時間 / 全体の長さ）が表示されます。
+      新しく作った数（「作成」）、既にあって飛ばした数（「既にあり」）、音声のないファイルの数（「音声なし」）、対象外や失敗などの数も確認できます。
+      作成中も閲覧できます。別の対象で「文字起こしを作る」を選ぶと、今の処理の後ろへ追加します。</p>
+    <p>小窓は × で閉じても作成を続けます。<strong>「ツール → 文字起こしの作成状況」</strong>で開き直せます。終了時は結果を通知します。作成中の文字起こしがないときは作成状況を開けません。</p>
+    <p><strong>「中止」</strong>を押すと、処理中のファイルもその場で止め、そのファイルの結果は保存しません。
+      それまでに保存した文字起こしは残ります。終了処理中は、終わってから対象を選び直してください。</p>
+    <p>処理中にファイルの中身や名前が変わった場合は、結果を保存せず「変更により破棄」に数えます。</p>
+    <p>モデルの取得は、取得画面の<strong>「キャンセル」</strong>で中止できます。次回は続きから取得しますが、作成対象は選び直してください。</p>
+
+    <h2 id="view">4. 左パネルで読んで、その場面へ移動する</h2>
+    <ol class="step-list">
+      <li>文字起こしを作った動画を開いて再生し、画面左端の<a href="video.html#transcripts">左パネル</a>を表示して、上部の<strong>「文字起こし」</strong>タブを選びます。パネルの表示方法は<a href="video.html#loop">動画再生</a>をご覧ください。</li>
+      <li>時刻と文の行が並びます。再生中の行は強調され、再生に合わせて一覧が自動で送られます。</li>
+      <li>読みたい行を押すと、その時刻へ移動します。言葉の少し前から再生が始まることがあります。</li>
+      <li>ホイールやドラッグで一覧を動かすと自動送りが止まります。再生位置に戻すときは<strong>「再生位置へ戻る」</strong>を押します。</li>
+    </ol>
+    <p>音声ファイルや、動画の音声モード（<kbd>Z</kbd>）では、<a href="music.html#transcripts">音楽ビューの左パネル</a>の「文字起こし」タブで同じように読めます。
+      右の情報パネルには、文字起こしの状態（「あり」と作成日、「なし」「作成中」「古い」など）が 1 行で表示されます。</p>
+    <div class="box warn">
+      <div class="box-body">
+        <strong>文字起こしは音声を AI が文字にしたもので、聞き違いや抜けがあります。</strong>大事な内容は、行を押して実際の音声を聞いて確かめてください。
+      </div>
+    </div>
+
+    <h2 id="search">5. 話された言葉で探す</h2>
+    <p>文字起こしを作成した動画・音声は、<kbd>Ctrl</kbd>+<kbd>F</kbd>の現在地フィルタと、
+      <kbd>Ctrl</kbd>+<kbd>G</kbd>のアイテム検索で、対象を<strong>「文字起こし」</strong>または<strong>「すべての対象」</strong>にして探せます。
+      アイテム検索は、お気に入りで「アイテム索引」をオンにした場所が対象です。作成・削除・取り込みの反映には少し時間がかかります。
+      古い文字起こしも検索に使います。聞き違いによる一致や見落としもあるので、見つけたファイルを開いて音声を確かめてください。</p>
+    <p>AIアプリからの検索でも、「文字起こしを AI に見せる」をオンにすると対象に含めます。
+      検索では見つかった項目を返し、文字起こしの本文を読む操作とは別です。詳しくは<a href="search.html#ctrl-g">検索の使い方</a>をご覧ください。</p>
+
+    <h2 id="update">6. 作り直す・削除する</h2>
+    <ul>
+      <li>タブに「文字起こしが古くなっています。作り直せます」と出たら、作成後にファイルか文字起こしの作成条件が変わっています。一覧でそのファイルを右クリックし、<strong>「文字起こしを作る」</strong>で作り直します。作り直すまでは、古い文字起こしをそのまま表示します。</li>
+      <li>「文字起こしを表示できませんでした。作り直せます」と出た場合も、同じ操作で作り直せます。</li>
+      <li>文字起こしが要らなくなったら、一覧でそのファイルを右クリックして<strong>「文字起こしを削除」</strong>を選び、件数を確認して<strong>「削除」</strong>を押します。元に戻せません。詳しくは<a href="grid.html#transcripts-delete">文字起こしを削除する</a>をご覧ください。</li>
+    </ul>
+    <p>同じファイル・同じ音声トラックに同じ条件で作成済みなら飛ばすため、もう一度選ぶだけで必ず文章が変わるわけではありません。</p>
+
+    <h2 id="transfer">7. 文字起こしを別の環境へ持っていく</h2>
+    <p>保存済みの文字起こしは、<a href="metadata-transfer.html">メタ情報の移行</a>に含まれます。
+      対象の実フォルダで「ファイル」→<strong>「メタ情報をエクスポート…」</strong>を使い、書き出したメタ情報を動画や音声ファイルと一緒にコピーします。
+      移行先では「ファイル」→<strong>「メタ情報をインポート…」</strong>で取り込めます。作成失敗の記録は含みません。</p>
+    <p>話された氏名や私的な会話も文字になって書き出されます。ほかの人に渡す際は、文字起こしの内容も確認してください。</p>
+
+    <h2 id="share">8. 必要なら AI アプリにも見せる</h2>
+    <p>Claude Desktop や ChatGPT (Codex) に動画の内容を読ませたい場合は、<a href="tut-ai-integration.html">AI アプリとの連携のチュートリアル</a>で登録し、
+      「設定」→「AI 連携…」の<strong>「文字起こしを AI に見せる」</strong>をオンにします。既定ではオフです。</p>
+    <p>オンにすると、AI アプリが文字起こしを時刻つきで読めるようになり、ファイルの情報を調べたときに文字起こしの有無や作成日も受け取ります。
+      渡った情報は AI アプリの提供元へ送られます。話した人の氏名や私的な会話も含まれるため、内容を確認してから許可してください。
+      文字起こしの作成自体は AI アプリからは頼めず、mIV で始めます。詳しくは<a href="ai-integration.html#permissions">許可の範囲</a>をご覧ください。</p>
+
+    <a class="tut-back" href="tutorial.html">← チュートリアル一覧へ戻る</a>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

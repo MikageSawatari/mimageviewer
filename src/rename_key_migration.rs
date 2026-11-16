@@ -246,17 +246,29 @@ pub struct StoreMutationEffects {
     content_identity_index_stale: bool,
     book_composition_changed: bool,
     caption_display_stale: bool,
-    ai_captions_changed: bool,
+    transcript_display_stale: bool,
+    derived_text_changed: bool,
     rotation_keys: BTreeSet<String>,
 }
 
 impl StoreMutationEffects {
+    /// 専用 writer も STORES と同じ宣言から失効情報を作る。
+    pub(crate) fn record_transcripts_changed(&mut self) {
+        for descriptor in STORES
+            .iter()
+            .filter(|store| store.display_cache == Some(StoreDisplayCache::Transcript))
+        {
+            self.record_rows_changed(descriptor, 1);
+        }
+    }
+
     pub(crate) fn for_content_identity_index_stale() -> Self {
         Self {
             content_identity_index_stale: true,
             book_composition_changed: false,
             caption_display_stale: false,
-            ai_captions_changed: false,
+            transcript_display_stale: false,
+            derived_text_changed: false,
             rotation_keys: BTreeSet::new(),
         }
     }
@@ -273,11 +285,19 @@ impl StoreMutationEffects {
     pub(crate) fn record_rows_changed(&mut self, descriptor: &StoreDescriptor, rows: usize) {
         self.record_completed(descriptor);
         self.book_composition_changed |= descriptor.file == "book_composition.db" && rows > 0;
-        self.ai_captions_changed |= descriptor.file == "ai_caption.db" && rows > 0;
-        self.caption_display_stale |= matches!(
-            descriptor.file,
-            "ai_caption.db" | "folder_thumb_pins.db" | "video_pins.db"
-        ) && rows > 0;
+        self.derived_text_changed |= descriptor.derived_text.is_some() && rows > 0;
+        if rows > 0 {
+            self.record_display_cache_stale(descriptor);
+        }
+    }
+
+    /// ピンの変更は説明文の表示だけを失効させ、索引通知を進めない。
+    pub(crate) fn record_display_cache_stale(&mut self, descriptor: &StoreDescriptor) {
+        match descriptor.display_cache {
+            Some(StoreDisplayCache::Caption) => self.caption_display_stale = true,
+            Some(StoreDisplayCache::Transcript) => self.transcript_display_stale = true,
+            None => {}
+        }
     }
 
     pub(crate) fn book_composition_changed(&self) -> bool {
@@ -288,8 +308,12 @@ impl StoreMutationEffects {
         self.caption_display_stale
     }
 
-    pub(crate) fn ai_captions_changed(&self) -> bool {
-        self.ai_captions_changed
+    pub(crate) fn transcript_display_stale(&self) -> bool {
+        self.transcript_display_stale
+    }
+
+    pub(crate) fn derived_text_changed(&self) -> bool {
+        self.derived_text_changed
     }
 
     pub(crate) fn rotation_keys(&self) -> &BTreeSet<String> {
@@ -304,7 +328,8 @@ impl StoreMutationEffects {
         self.content_identity_index_stale |= other.content_identity_index_stale;
         self.book_composition_changed |= other.book_composition_changed;
         self.caption_display_stale |= other.caption_display_stale;
-        self.ai_captions_changed |= other.ai_captions_changed;
+        self.transcript_display_stale |= other.transcript_display_stale;
+        self.derived_text_changed |= other.derived_text_changed;
         self.rotation_keys.extend(other.rotation_keys);
     }
 
@@ -1051,8 +1076,17 @@ pub(crate) enum BookStorePolicy {
     ServiceOwned,
 }
 
+/// 汎用 store 操作の commit 後に失効させる表示キャッシュ。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StoreDisplayCache {
+    Caption,
+    Transcript,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StoreDescriptor {
+    pub(crate) display_cache: Option<StoreDisplayCache>,
+    pub(crate) derived_text: Option<crate::derived_text::DerivedTextKind>,
     pub(crate) file: &'static str,
     pub(crate) table: &'static str,
     pub(crate) column: &'static str,
@@ -1066,6 +1100,16 @@ pub(crate) struct StoreDescriptor {
 }
 
 impl StoreDescriptor {
+    const fn derived_text(mut self, kind: crate::derived_text::DerivedTextKind) -> Self {
+        self.derived_text = Some(kind);
+        self
+    }
+
+    const fn display_cache(mut self, kind: StoreDisplayCache) -> Self {
+        self.display_cache = Some(kind);
+        self
+    }
+
     pub(crate) fn optional_legacy_table(self) -> bool {
         self.table_availability == StoreTableAvailability::OptionalInLegacySchema
     }
@@ -1093,6 +1137,8 @@ const fn store(
     copies_with_book_page: bool,
 ) -> StoreDescriptor {
     StoreDescriptor {
+        display_cache: None,
+        derived_text: None,
         file,
         table,
         column,
@@ -1116,6 +1162,8 @@ const fn optional_legacy_store(
     copies_with_book_page: bool,
 ) -> StoreDescriptor {
     StoreDescriptor {
+        display_cache: None,
+        derived_text: None,
         file,
         table,
         column,
@@ -1182,7 +1230,20 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         StoreKeyNormalization::KeepDrive,
         BookStorePolicy::Follow,
         false,
-    ),
+    )
+    .display_cache(StoreDisplayCache::Caption)
+    .derived_text(crate::derived_text::DerivedTextKind::Caption),
+    store(
+        "transcript.db",
+        "transcripts",
+        "item_key",
+        true,
+        StoreKeyNormalization::KeepDrive,
+        BookStorePolicy::Follow,
+        false,
+    )
+    .display_cache(StoreDisplayCache::Transcript)
+    .derived_text(crate::derived_text::DerivedTextKind::Transcript),
     store(
         "content_identity.db",
         "edit_origin",
@@ -1317,7 +1378,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         StoreKeyNormalization::KeepDrive,
         BookStorePolicy::Follow,
         false,
-    ),
+    )
+    .display_cache(StoreDisplayCache::Caption),
     // id が PK で path は非一意 (1 ファイル複数ブックマーク)。
     store(
         "video_bookmarks.db",
@@ -1336,7 +1398,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         StoreKeyNormalization::KeepDrive,
         BookStorePolicy::Follow,
         false,
-    ),
+    )
+    .display_cache(StoreDisplayCache::Caption),
     store(
         "book_resume.db",
         "book_resume",
@@ -1401,6 +1464,8 @@ pub(crate) const STORES: &[StoreDescriptor] = &[
         false,
     ),
     StoreDescriptor {
+        display_cache: None,
+        derived_text: None,
         file: "reading_history.db",
         table: "reading_history",
         column: "key",
@@ -4409,34 +4474,223 @@ mod tests {
             .unwrap();
         let mut effects = StoreMutationEffects::default();
         assert!(!effects.caption_display_stale());
-        assert!(!effects.ai_captions_changed());
+        assert!(!effects.derived_text_changed());
         effects.record_completed(caption);
         effects.record_rows_changed(caption, 0);
         effects.record_rows_changed(other, 1);
         assert!(!effects.caption_display_stale());
-        assert!(!effects.ai_captions_changed());
+        assert!(!effects.derived_text_changed());
         let mut changed = StoreMutationEffects::default();
         changed.record_rows_changed(caption, 1);
         assert!(changed.caption_display_stale());
-        assert!(changed.ai_captions_changed());
+        assert!(changed.derived_text_changed());
         effects.merge(changed);
         effects.merge(StoreMutationEffects::default());
         assert!(effects.caption_display_stale());
-        assert!(effects.ai_captions_changed());
+        assert!(effects.derived_text_changed());
         assert!(!StoreMutationEffects::for_content_identity_index_stale().caption_display_stale());
         for file in ["folder_thumb_pins.db", "video_pins.db"] {
             for descriptor in STORES.iter().filter(|store| store.file == file) {
                 let mut effects = StoreMutationEffects::default();
                 effects.record_rows_changed(descriptor, 0);
                 assert!(!effects.caption_display_stale());
-                assert!(!effects.ai_captions_changed());
+                assert!(!effects.derived_text_changed());
                 effects.record_rows_changed(descriptor, 1);
                 assert!(effects.caption_display_stale(), "{file}");
-                assert!(!effects.ai_captions_changed(), "pin-only change: {file}");
+                assert!(!effects.derived_text_changed(), "pin-only change: {file}");
             }
         }
     }
 
+    fn transcript_fixture(data_dir: &Path) -> rusqlite::Connection {
+        let path = data_dir.join("transcript.db");
+        crate::transcript_db::TranscriptDb::open_at(&path).unwrap();
+        rusqlite::Connection::open(path).unwrap()
+    }
+    fn insert_transcript(connection: &rusqlite::Connection, key: &str, text: &str) {
+        connection.execute("INSERT INTO transcripts(item_key,mtime,size,audio_stream,model_id,config_version,lang,duration_ms,segments,removed_counts,status,created_at)
+            VALUES(?1,123,456,0,?2,1,'ja',1000,'[[0,1000,\"text\"]]','{\"stock\":0,\"repeat\":0}','ok',789)", rusqlite::params![key,text]).unwrap();
+    }
+    fn transcript_state(connection: &rusqlite::Connection, key: &str) -> (String, i64, i64) {
+        connection
+            .query_row(
+                "SELECT model_id,rev,indexed FROM transcripts WHERE item_key=?1",
+                [key],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+    #[test]
+    fn transcript_copy_restore_rename_and_hard_purge_keep_trigger_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Path::new(r"C:\Images\old.jpg");
+        let copied = Path::new(r"D:\Images\copy.jpg");
+        let moved = Path::new(r"E:\Images\moved.jpg");
+        let descriptor = STORES
+            .iter()
+            .find(|store| store.table == "transcripts")
+            .unwrap();
+        assert!(descriptor.unique);
+        assert_eq!(descriptor.book_policy, BookStorePolicy::Follow);
+        assert!(!descriptor.copies_with_book_page);
+        assert_eq!(descriptor.normalization, StoreKeyNormalization::KeepDrive);
+        let connection = transcript_fixture(dir.path());
+        let old_key = descriptor.normalize_path(old);
+        let copied_key = descriptor.normalize_path(copied);
+        let moved_key = descriptor.normalize_path(moved);
+        insert_transcript(&connection, &old_key, "source caption");
+        connection
+            .execute("UPDATE transcripts SET indexed = 1", [])
+            .unwrap();
+        let source_rev = transcript_state(&connection, &old_key).1;
+
+        // This is the same generic copy boundary used by content identity restore.
+        let report = copy_restore_stores_without_identity_at(
+            dir.path(),
+            &[StoreCopyPathMapping::exact(old, copied)],
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, 1);
+        assert!(report.store_mutations.transcript_display_stale());
+        assert!(report.store_mutations.derived_text_changed());
+        let copied_state = transcript_state(&connection, &copied_key);
+        assert_eq!(copied_state.0, "source caption");
+        assert!(copied_state.1 > source_rev);
+        assert_eq!(copied_state.2, 0);
+        assert_eq!(transcript_state(&connection, &old_key).2, 1);
+
+        let report = run_at(dir.path(), copied, moved);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(report.store_mutations.transcript_display_stale());
+        assert!(report.store_mutations.derived_text_changed());
+        let moved_state = transcript_state(&connection, &moved_key);
+        assert_eq!(moved_state.0, "source caption");
+        assert!(moved_state.1 > copied_state.1);
+        assert_eq!(moved_state.2, 0);
+        let removed: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM transcript_removed WHERE item_key = ?1)",
+                [&copied_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(removed);
+
+        let report = purge_removed_paths_at(dir.path(), &[moved.to_path_buf()], &[]);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.rows, 1);
+        assert!(report.store_mutations.transcript_display_stale());
+        assert!(report.store_mutations.derived_text_changed());
+        let tombstone_rev: i64 = connection
+            .query_row(
+                "SELECT MAX(rev) FROM transcript_removed WHERE item_key = ?1",
+                [&moved_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(tombstone_rev > moved_state.1);
+        assert_eq!(transcript_state(&connection, &old_key).0, "source caption");
+
+        let missing = Path::new(r"C:\Images\missing.jpg");
+        let untouched = Path::new(r"C:\Images\untouched.jpg");
+        let no_copy = copy_restore_stores_without_identity_at(
+            dir.path(),
+            &[StoreCopyPathMapping::exact(missing, untouched)],
+        );
+        assert!(no_copy.errors.is_empty(), "{:?}", no_copy.errors);
+        assert!(!no_copy.store_mutations.transcript_display_stale());
+        assert!(!no_copy.store_mutations.derived_text_changed());
+        let no_rename = run_at(dir.path(), missing, untouched);
+        assert!(no_rename.errors.is_empty(), "{:?}", no_rename.errors);
+        assert!(!no_rename.store_mutations.transcript_display_stale());
+        assert!(!no_rename.store_mutations.derived_text_changed());
+        let no_purge = purge_removed_paths_at(dir.path(), &[moved.to_path_buf()], &[]);
+        assert!(no_purge.errors.is_empty(), "{:?}", no_purge.errors);
+        assert!(!no_purge.store_mutations.transcript_display_stale());
+        assert!(!no_purge.store_mutations.derived_text_changed());
+    }
+
+    #[test]
+    fn transcript_orphan_cleanup_deletes_rows_and_queues_index_removal() {
+        use crate::metadata_cleanup::WorkerResult;
+        let dir = tempfile::tempdir().unwrap();
+        let books = dir.path().join("books");
+        std::fs::create_dir_all(&books).unwrap();
+        let images = dir.path().join("images");
+        std::fs::create_dir_all(&images).unwrap();
+        let existing = images.join("keep.jpg");
+        let missing = images.join("gone.jpg");
+        let bookshelf_missing = books.join("gone.jpg");
+        std::fs::write(&existing, b"image").unwrap();
+        let connection = transcript_fixture(dir.path());
+        let existing_key = crate::adjustment_db::normalize_path(&existing);
+        let missing_key = crate::adjustment_db::normalize_path(&missing);
+        let bookshelf_key = crate::adjustment_db::normalize_path(&bookshelf_missing);
+        insert_transcript(&connection, &existing_key, "keep");
+        insert_transcript(&connection, &missing_key, "remove");
+        insert_transcript(&connection, &bookshelf_key, "protected book page");
+        let old_rev = transcript_state(&connection, &missing_key).1;
+        let pending = crate::metadata_cleanup::spawn_scan(dir.path().to_path_buf(), books.clone());
+        let WorkerResult::Scan(scan) = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        else {
+            panic!("cleanup scan expected");
+        };
+        assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+        assert_eq!(scan.orphan_total(), 1);
+        let pending =
+            crate::metadata_cleanup::spawn_delete(dir.path().to_path_buf(), books.clone(), scan);
+        let WorkerResult::Delete(report) = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        else {
+            panic!("cleanup delete expected");
+        };
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.deleted_total(), 1);
+        assert!(report.store_mutations.transcript_display_stale());
+        assert!(report.store_mutations.derived_text_changed());
+        assert_eq!(transcript_state(&connection, &existing_key).0, "keep");
+        // Cleanup intentionally excludes the managed bookshelf, even when a
+        // physical page has disappeared. Captions follow the same safety rule.
+        assert_eq!(
+            transcript_state(&connection, &bookshelf_key).0,
+            "protected book page"
+        );
+        let rev: i64 = connection
+            .query_row(
+                "SELECT MAX(rev) FROM transcript_removed WHERE item_key = ?1",
+                [&missing_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(rev > old_rev);
+
+        let pending = crate::metadata_cleanup::spawn_scan(dir.path().to_path_buf(), books.clone());
+        let WorkerResult::Scan(scan) = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        else {
+            panic!("cleanup scan expected");
+        };
+        assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+        assert_eq!(scan.orphan_total(), 0);
+        let pending = crate::metadata_cleanup::spawn_delete(dir.path().to_path_buf(), books, scan);
+        let WorkerResult::Delete(report) = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+        else {
+            panic!("cleanup delete expected");
+        };
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(!report.store_mutations.transcript_display_stale());
+        assert!(!report.store_mutations.derived_text_changed());
+    }
     #[test]
     fn ai_caption_copy_restore_rename_and_hard_purge_keep_trigger_ownership() {
         let dir = tempfile::tempdir().unwrap();
@@ -4469,7 +4723,7 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, 1);
         assert!(report.store_mutations.caption_display_stale());
-        assert!(report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         let copied_state = caption_state(&connection, &copied_key);
         assert_eq!(copied_state.0, "source caption");
         assert!(copied_state.1 > source_rev);
@@ -4479,7 +4733,7 @@ mod tests {
         let report = run_at(dir.path(), copied, moved);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(report.store_mutations.caption_display_stale());
-        assert!(report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         let moved_state = caption_state(&connection, &moved_key);
         assert_eq!(moved_state.0, "source caption");
         assert!(moved_state.1 > copied_state.1);
@@ -4497,7 +4751,7 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.rows, 1);
         assert!(report.store_mutations.caption_display_stale());
-        assert!(report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         let tombstone_rev: i64 = connection
             .query_row(
                 "SELECT MAX(rev) FROM caption_removed WHERE item_key = ?1",
@@ -4516,15 +4770,15 @@ mod tests {
         );
         assert!(no_copy.errors.is_empty(), "{:?}", no_copy.errors);
         assert!(!no_copy.store_mutations.caption_display_stale());
-        assert!(!no_copy.store_mutations.ai_captions_changed());
+        assert!(!no_copy.store_mutations.derived_text_changed());
         let no_rename = run_at(dir.path(), missing, untouched);
         assert!(no_rename.errors.is_empty(), "{:?}", no_rename.errors);
         assert!(!no_rename.store_mutations.caption_display_stale());
-        assert!(!no_rename.store_mutations.ai_captions_changed());
+        assert!(!no_rename.store_mutations.derived_text_changed());
         let no_purge = purge_removed_paths_at(dir.path(), &[moved.to_path_buf()], &[]);
         assert!(no_purge.errors.is_empty(), "{:?}", no_purge.errors);
         assert!(!no_purge.store_mutations.caption_display_stale());
-        assert!(!no_purge.store_mutations.ai_captions_changed());
+        assert!(!no_purge.store_mutations.derived_text_changed());
     }
 
     #[test]
@@ -4551,7 +4805,7 @@ mod tests {
         );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(report.store_mutations.caption_display_stale());
-        assert!(report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         assert_eq!(caption_state(&connection, &a_key).0, "B");
         assert_eq!(caption_state(&connection, &b_key).0, "A");
         for (key, old_rev) in [(&a_key, a_rev), (&b_key, b_rev)] {
@@ -4571,7 +4825,7 @@ mod tests {
         let report = migrate_book_paths_at(dir.path(), &[], &[(a, b)], &guard);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(report.store_mutations.caption_display_stale());
-        assert!(report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         let count: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM captions WHERE item_key = ?1",
@@ -4593,7 +4847,7 @@ mod tests {
             let report = migrate_book_paths_at(dir.path(), &moves, &copies, &guard);
             assert!(report.errors.is_empty(), "{:?}", report.errors);
             assert!(!report.store_mutations.caption_display_stale());
-            assert!(!report.store_mutations.ai_captions_changed());
+            assert!(!report.store_mutations.derived_text_changed());
         }
     }
 
@@ -4639,7 +4893,7 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(report.deleted_total(), 1);
         assert!(report.store_mutations.caption_display_stale());
-        assert!(report.store_mutations.ai_captions_changed());
+        assert!(report.store_mutations.derived_text_changed());
         assert_eq!(caption_state(&connection, &existing_key).0, "keep");
         // Cleanup intentionally excludes the managed bookshelf, even when a
         // physical page has disappeared. Captions follow the same safety rule.
@@ -4676,7 +4930,7 @@ mod tests {
         };
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(!report.store_mutations.caption_display_stale());
-        assert!(!report.store_mutations.ai_captions_changed());
+        assert!(!report.store_mutations.derived_text_changed());
     }
 
     #[test]
@@ -5706,10 +5960,10 @@ mod tests {
         let covered = STORES.iter().filter(|descriptor| descriptor.unique).count();
         assert_eq!(
             STORES.len(),
-            30,
-            "watched、endpoint / page-alone preference と logical shift を含む現行 descriptor 数"
+            31,
+            "watched、endpoint / page-alone preference、logical shift と文字起こしを含む現行 descriptor 数"
         );
-        assert_eq!(covered, 29);
+        assert_eq!(covered, 30);
         assert_eq!(report.rows, covered * 2);
         assert_eq!(report.committed_thumbnail_pins, 4);
         let rotation_store = STORES
@@ -6503,6 +6757,8 @@ mod tests {
 
         let descriptor = StoreDescriptor {
             file: "equivalence.db",
+            display_cache: None,
+            derived_text: None,
             table: "range_rows",
             column: "path",
             unique: true,
@@ -6577,6 +6833,8 @@ mod tests {
 
         let descriptor = StoreDescriptor {
             file: "perf.db",
+            display_cache: None,
+            derived_text: None,
             table: "entries",
             column: "path",
             unique: true,

@@ -1,5 +1,8 @@
 mod ai_failure_feedback;
 mod cover_rotation;
+mod cover_rotation_cache;
+#[cfg(test)]
+mod cover_rotation_cache_tests;
 mod diagnostic_checkpoint;
 use crate::previous_run_diagnostics::checkpoint::{
     ActivityLease, CheckpointPublisher, JobLease, JobMetadata, JobStage, JobUpdate,
@@ -10,6 +13,7 @@ mod reading_history_origin;
 use reading_history_origin::MainListRestoreDestination;
 mod grid_parent;
 mod music_bass;
+mod transcript_display;
 
 #[cfg(test)]
 use crate::test_native_focus as foreground_observer;
@@ -560,6 +564,7 @@ mod detached_page_overview;
 mod detached_placement;
 #[cfg(windows)]
 mod detached_window_manager;
+mod epub_saved_metadata;
 #[cfg(windows)]
 pub(crate) use detached_page_overview::DetachedPageOverviewInputProvenance;
 mod facet_name_filter;
@@ -2082,6 +2087,7 @@ pub(crate) struct DetachedImageWindowSnapshot {
     pub(crate) image_dims: Option<(u32, u32)>,
     pub(crate) rotation: crate::rotation_db::Rotation,
     pub(crate) zoom_pan: Option<(f32, egui::Vec2)>,
+    pub(crate) automatic_initial_view: Option<crate::ui_fullscreen::FsAutomaticInitialView>,
     pub(crate) free_rotation: f32,
     pub(crate) image_rect_norm: egui::Rect,
     pub(crate) image_content_bbox: Option<egui::Rect>,
@@ -2356,6 +2362,20 @@ impl DeferredDetachedImageWindowShared {
 }
 
 #[cfg(windows)]
+impl DetachedImageWindowSnapshot {
+    /// Restore the saved transform and its automatic-placement provenance together.
+    fn restore_view_transform(&self, app: &mut App) {
+        if let Some((zoom, pan)) = self.zoom_pan {
+            app.fs_zoom = zoom;
+            app.fs_pan = pan;
+            app.clear_fs_initial_placement_request();
+        }
+        app.fs_free_rotation = self.free_rotation;
+        app.fs_automatic_initial_view = self.automatic_initial_view;
+    }
+}
+
+#[cfg(windows)]
 impl Clone for DetachedImageWindowSnapshot {
     fn clone(&self) -> Self {
         Self {
@@ -2366,6 +2386,7 @@ impl Clone for DetachedImageWindowSnapshot {
             image_dims: self.image_dims,
             rotation: self.rotation,
             zoom_pan: self.zoom_pan,
+            automatic_initial_view: self.automatic_initial_view,
             free_rotation: self.free_rotation,
             image_rect_norm: self.image_rect_norm,
             image_content_bbox: self.image_content_bbox,
@@ -13283,6 +13304,7 @@ impl App {
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
         self.clear_fs_initial_placement_request();
+        self.fs_automatic_initial_view = None;
     }
 
     /// 編集ツールを抜けたのに見開きが戻っていない状態を解消する。
@@ -13352,6 +13374,7 @@ impl App {
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
         self.clear_fs_initial_placement_request();
+        self.fs_automatic_initial_view = None;
     }
 }
 
@@ -17585,6 +17608,9 @@ pub struct App {
         std::collections::HashMap<String, Option<crate::external_metadata::SidecarDisplay>>,
     /// All viewer contexts read this one cache; never move it into ViewerContextBundle.
     pub(crate) caption_display: crate::caption_display_cache::CaptionDisplayCache,
+    /// 表示値だけを共有し、panel session の scroll/follow はここへ入れない。
+    pub(crate) transcript_display: Box<crate::transcript_display_cache::TranscriptDisplayCache>,
+    pub(crate) music_transcript_panel: Box<crate::ui_music_panels::MusicTranscriptPanelSession>,
     /// 360 度パノラマビュー: インタラクティブステート (フルスクリーン内のみ Some)。
     /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
     /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
@@ -18385,6 +18411,7 @@ pub struct App {
     pub(crate) fs_pan: egui::Vec2,
     pub(crate) fs_initial_placement_request:
         Option<crate::ui_fullscreen::FsInitialPlacementRequest>,
+    pub(crate) fs_automatic_initial_view: Option<crate::ui_fullscreen::FsAutomaticInitialView>,
 
     // ── ZipPla 風 全画面ズームモード (Z キー、v2.0.0) ──────────────
     // 画像の一部を画面いっぱいに拡大 (cover) し、マウス位置で表示範囲をパンする
@@ -18846,6 +18873,7 @@ pub struct App {
     pub(crate) comic_page_keys: std::collections::BTreeSet<String>,
     /// 非破壊回転の非 0 角度の正本 (page_path / video key)。
     pub(crate) rotation_page_keys: std::collections::BTreeMap<String, crate::rotation_db::Rotation>,
+    pub(crate) cover_rotation_cache: crate::cover_rotation_cache::CoverRotationCache,
     /// 最後段 crop を持つ page_path キー集合 (親コンテナへの「切」状態ロールアップ用)。
     pub(crate) export_crop_page_keys: std::collections::BTreeSet<String>,
     /// お気に入り単位の標準パラメータ: favorite_id → AdjustParams。
@@ -19325,6 +19353,16 @@ pub struct App {
     /// 編集用追加パックの確認ダイアログを「今はしない」で閉じたか (このセッション中)。
     /// true の間は編集系入口での再 prompt を抑制する (spec §4.1 `declined_this_session`)。
     pub(crate) editing_addon_declined_session: bool,
+    /// モデル準備の状態はヒープに置き、Appのstackサイズを抑える。
+    #[cfg(windows)]
+    pub(crate) asr_setup: Box<crate::ui_dialogs::asr_addon::AsrSetup>,
+    #[cfg(windows)]
+    pub(crate) transcript_job: Option<Box<crate::ui_dialogs::transcript_job::TranscriptJob>>,
+    #[cfg(windows)]
+    pub(crate) transcript_delete:
+        Option<crate::ui_dialogs::transcript_delete::TranscriptDeleteState>,
+    #[cfg(windows)]
+    pub(crate) show_transcript_progress: bool,
     pub(crate) vlm_setup: crate::ui_dialogs::vlm_addon::VlmSetup,
     pub(crate) depth_setup: crate::ui_dialogs::depth_addon::DepthSetup,
     pub(crate) depth_export_operation: Option<Box<depth_export::Operation>>,
@@ -20187,6 +20225,8 @@ impl Drop for App {
         self.retire_depth_export_for_exit();
         #[cfg(windows)]
         self.stop_caption_job_for_exit();
+        #[cfg(windows)]
+        self.stop_transcript_job_for_exit();
         self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.pdf_render_epoch.retire();
         self.transfer_spread_shift_exit_ownership();
@@ -21522,6 +21562,8 @@ impl App {
             xmp_panorama_info: std::collections::HashMap::new(),
             sidecar_display_cache: std::collections::HashMap::new(),
             caption_display: crate::caption_display_cache::CaptionDisplayCache::default(),
+            transcript_display: Box::default(),
+            music_transcript_panel: Box::default(),
             fs_exclusive_view: crate::fs_exclusive_view::FsExclusiveView::None,
             video_zoom_state: None,
             #[cfg(windows)]
@@ -21811,6 +21853,7 @@ impl App {
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
             fs_initial_placement_request: None,
+            fs_automatic_initial_view: None,
             fs_zoom_active: false,
             fs_zoom_aiming: false,
             // 既定 1.0 = cover (縦長画像では横幅目一杯)。ZipPla 単ページの既定に合わせる。
@@ -21967,6 +22010,7 @@ impl App {
             conceal_page_keys,
             comic_page_keys,
             rotation_page_keys,
+            cover_rotation_cache: Default::default(),
             export_crop_page_keys,
             adjustment_favorite_params: std::collections::HashMap::new(),
             favorite_view_states: std::collections::HashMap::new(),
@@ -22133,6 +22177,14 @@ impl App {
             trt_install_state: None,
             editing_addon_install_state: None,
             editing_addon_declined_session: false,
+            #[cfg(windows)]
+            asr_setup: Default::default(),
+            #[cfg(windows)]
+            transcript_job: None,
+            #[cfg(windows)]
+            transcript_delete: None,
+            #[cfg(windows)]
+            show_transcript_progress: false,
             vlm_setup: Default::default(),
             depth_setup: Default::default(),
             depth_export_operation: None,
@@ -24164,7 +24216,9 @@ impl App {
 
     /// ダイアログキャンセル用の Escape が押されたか。IME 変換中は常に false を返す。
     pub(crate) fn dialog_escape_pressed(&self, ctx: &egui::Context) -> bool {
-        !self.ime_input_active(ctx) && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        !self.ime_input_active(ctx)
+            && crate::keyboard_input::app_escape_allowed(ctx)
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
     }
 
     /// いずれかのモーダルダイアログが開いているか。
@@ -24343,6 +24397,10 @@ impl App {
             ($( $cond:expr => $name:literal ),+ $(,)?) => {
                 $( if $cond { return Some($name); } )+
             };
+        }
+        #[cfg(windows)]
+        if self.transcript_delete_dialog_visible() || self.asr_setup.modal_open() {
+            return Some("transcript_modal");
         }
         #[cfg(windows)]
         if self.caption_delete_dialog_visible() {
@@ -34363,7 +34421,7 @@ impl App {
                 // Current SW_HIDE state, not a snapshot taken when the worker began.
                 // Terminals consumed while Pending cannot reach this manager. Resample
                 // durable pending rows after adoption, even if its initial drain finished.
-                manager.notify_caption_changed();
+                manager.notify_derived_text_changed();
                 manager.set_io_throttled(!self.window_visible);
                 if crate::perf::is_enabled() {
                     crate::perf::event("startup", "metadata_search_ready", None, 0, &[]);
@@ -50389,16 +50447,16 @@ impl App {
         crate::logger::log(message);
     }
 
-    /// DB writers publish only committed caption changes. Startup also drains
+    /// DB writers publish only committed derived text changes. Startup also drains
     /// durable pending rows when the manager is not ready yet.
-    pub(crate) fn notify_caption_changed(&self) {
+    pub(crate) fn notify_derived_text_changed(&self) {
         if let Some(manager) = self.indexer_init.as_ref() {
-            manager.notify_caption_changed();
+            manager.notify_derived_text_changed();
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn caption_epoch_for_test(
+    pub(crate) fn derived_text_epoch_for_test(
         &mut self,
         data_dir: &std::path::Path,
     ) -> Arc<std::sync::atomic::AtomicU64> {
@@ -50414,7 +50472,7 @@ impl App {
                 .expect("caption sender test manager"),
             );
         }
-        self.indexer_init.as_ref().unwrap().caption_epoch()
+        self.indexer_init.as_ref().unwrap().derived_text_epoch()
     }
 
     pub(crate) fn apply_metadata_import_terminal_refresh(
@@ -50423,12 +50481,7 @@ impl App {
         changed: crate::metadata_transfer::ImportChangedSections,
     ) -> (Vec<String>, bool) {
         // DB writes have committed even if a context needs another terminal refresh.
-        if changed.ai_captions {
-            self.notify_caption_changed();
-        }
-        if changed.ai_captions || changed.thumbnail_pins {
-            self.caption_display.clear();
-        }
+        self.apply_content_identity_store_mutations(changed.store_mutations());
         #[cfg(windows)]
         let stale_before_apply = result.contexts.iter().any(|context| {
             match self.viewer_context_residence(context.context_id) {
@@ -57361,11 +57414,13 @@ impl App {
                     source_dims,
                     layout_dims,
                 );
+                let cover_cache_stamp = self.automatic_cover_stamp(i, &cover, auto_material);
                 self.thumbnails[i] = ThumbnailState::Loaded {
                     cover: crate::cover_source_scope::LoadedCoverIdentity::from_material(
                         cover, scope,
                     ),
                     auto_material,
+                    cover_cache_stamp,
                     display_basis,
                     tex: handle,
                     origin,
@@ -69316,15 +69371,8 @@ impl App {
                 self.detached_image_windows.insert(pos, snapshot);
                 return false;
             }
-            let zoom_pan = snapshot.zoom_pan;
-            let free_rotation = snapshot.free_rotation;
             self.with_window_viewer_context(snapshot.id, |app| {
-                if let Some((zoom, pan)) = zoom_pan {
-                    app.fs_zoom = zoom;
-                    app.fs_pan = pan;
-                    app.clear_fs_initial_placement_request();
-                }
-                app.fs_free_rotation = free_rotation;
+                snapshot.restore_view_transform(app);
             })
             .expect("resumed collection root context must remain bound");
             return true;
@@ -69368,8 +69416,6 @@ impl App {
                 activate_window_id,
                 "resume_still_snapshot",
             );
-            let activate_zoom_pan = snapshot.zoom_pan;
-            let activate_free_rotation = snapshot.free_rotation;
             if !self.park_and_close_current_active_detached_viewer(ctx) {
                 self.log_detached_image_window_debug(format!(
                     "passive_activate_still_aborted id={} reason=park_current_failed",
@@ -69390,12 +69436,7 @@ impl App {
             self.fs_open_intent_from_grid = false;
             self.adopt_active_detached_viewport_runtime_from_passive("resume_still_snapshot");
             self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
-            if let Some((zoom, pan)) = activate_zoom_pan {
-                self.fs_zoom = zoom;
-                self.fs_pan = pan;
-                self.clear_fs_initial_placement_request();
-            }
-            self.fs_free_rotation = activate_free_rotation;
+            snapshot.restore_view_transform(self);
             self.log_detached_image_window_debug(format!(
                 "passive_activate_still_committed id={} active_context={} fs_idx={:?} \
                  independent={} session={:?}",
@@ -69821,6 +69862,23 @@ impl App {
         shrank_hard && previous_was_substantial
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn capture_detached_image_window_snapshot_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        window_id: u64,
+    ) -> Option<DetachedImageWindowSnapshot> {
+        self.set_detached_window_binding_for_test(Some(window_id));
+        let snapshot = self.build_active_detached_image_window_snapshot(Some(ctx));
+        self.set_detached_window_binding_for_test(None);
+        self.transition_detached_window_state(
+            window_id,
+            DetachedWindowState::Parked,
+            "test_capture_saved_view",
+        );
+        snapshot
+    }
+
     #[cfg(windows)]
     fn build_active_detached_image_window_snapshot(
         &mut self,
@@ -69912,6 +69970,7 @@ impl App {
                 image_dims: None,
                 rotation: crate::rotation_db::Rotation::None,
                 zoom_pan: None,
+                automatic_initial_view: None,
                 free_rotation: 0.0,
                 image_rect_norm: egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
                 image_content_bbox: None,
@@ -69995,6 +70054,7 @@ impl App {
             .flatten();
         let texture_size = base_texture.full_source_size_vec2();
         let zoom_pan = self.fs_zoom_pan();
+        let automatic_initial_view = self.fs_automatic_initial_view;
         let free_rotation = self.fs_free_rotation;
         let id = self.ensure_detached_viewer_window_id();
         let _ = self.capture_detached_window_placement_at_decision(id, "build_active_snapshot");
@@ -70129,6 +70189,7 @@ impl App {
             image_dims: Some((texture_size.x as u32, texture_size.y as u32)),
             rotation,
             zoom_pan,
+            automatic_initial_view,
             free_rotation,
             image_rect_norm,
             image_content_bbox,
@@ -70177,6 +70238,7 @@ impl App {
             image_dims: None,
             rotation: crate::rotation_db::Rotation::None,
             zoom_pan: None,
+            automatic_initial_view: None,
             free_rotation: 0.0,
             image_rect_norm: egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
             image_content_bbox: None,
@@ -72745,6 +72807,12 @@ impl App {
                 self.begin_extracted_result_view();
             }
         }
+        // 新規入場と別ページへの open は、前のページで見ていた半分を引き継がない。
+        // 同一 index の内部 refresh は保持し、明示 slice を持つ移動は着地後に採用する。
+        // 分割方向と寸法による最初の半分の解決は、表示側の reconcile に任せる。
+        if self.fullscreen_idx != Some(idx) {
+            self.set_fullscreen_page_slice_for_display_unit(crate::page_split::PageSlice::Full);
+        }
         self.fullscreen_idx = Some(idx);
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
@@ -72914,6 +72982,7 @@ impl App {
         self.analysis_sv_cache = None;
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
+        self.fs_automatic_initial_view = None;
         self.request_fs_initial_placement(idx);
         self.fs_pan_drag_start = None;
         self.fs_vertical_scroll = 0.0;
@@ -77473,6 +77542,7 @@ impl App {
         }
         self.caption_display
             .invalidate_rotation_keys(changed.iter().map(String::as_str));
+        self.invalidate_automatic_covers_after_rotation(&changed);
         self.evict_legacy_cover_thumbnails();
     }
 
@@ -79834,7 +79904,7 @@ impl App {
     }
 
     /// Both video and music builders read the same in-memory, normalized-path choice.
-    fn saved_audio_track_choice_for_path(
+    pub(crate) fn saved_audio_track_choice_for_path(
         &self,
         path: &std::path::Path,
     ) -> Option<crate::video::SavedAudioTrackChoice> {
@@ -82939,6 +83009,7 @@ impl App {
         destination: FullscreenCloseDestination,
     ) {
         self.clear_fs_initial_placement_request();
+        self.fs_automatic_initial_view = None;
         self.cancel_original_material_entry_intents(None);
         self.pending_fs_page_turn_ready = None;
         self.page_turn_presentation.deactivate("closed");
@@ -93212,6 +93283,7 @@ impl App {
     }
 
     fn close_fs_side_panel_runtime(&mut self) {
+        self.music_transcript_panel.reset();
         // 右情報パネルはロック中だけ維持する。表示対象が変わっても内容を更新するだけで
         // 閉じない、というのがロックの意味 (backlog §1.158)。ロックを解くのは
         // フルスクリーンを本当に出たときだけで、その判断は `close_fullscreen` が持つ。
@@ -100822,6 +100894,7 @@ impl App {
             self.maybe_apply_deferred_native_video_nav(ctx);
             self.poll_audio_track_notice_toast(fs_idx);
             self.sync_native_video_metadata(fs_idx);
+            self.sync_native_transcript_snapshot(ctx, fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
             self.sync_native_video_tile_overlay(ctx, fs_idx);
             self.sync_native_video_seek_strip(ctx, fs_idx);
@@ -101599,6 +101672,8 @@ impl App {
         // TRT pack オンラインインストールダイアログ (環境設定から起動)。
         self.show_trt_install_dialog(ctx);
         self.show_vlm_addon_dialog(ctx);
+        #[cfg(windows)]
+        self.show_asr_addon_dialog(ctx);
         if !main_viewer_blocked && self.fullscreen_idx.is_none() {
             self.show_depth_addon_dialog(ctx);
         }
@@ -102267,8 +102342,15 @@ impl eframe::App for App {
         #[cfg(windows)]
         self.poll_caption_job();
         #[cfg(windows)]
+        self.poll_asr_setup(ctx);
+        #[cfg(windows)]
+        self.poll_transcript_job(ctx);
+        #[cfg(windows)]
+        self.poll_transcript_delete();
+        #[cfg(windows)]
         self.poll_caption_delete();
         self.caption_display.poll();
+        self.transcript_display.poll();
         self.poll_capture_selection(ctx);
         self.render_update_before_frame(ctx);
         #[cfg(not(windows))]
@@ -102331,6 +102413,8 @@ impl eframe::App for App {
         self.retire_depth_export_for_exit();
         #[cfg(windows)]
         self.stop_caption_job_for_exit();
+        #[cfg(windows)]
+        self.stop_transcript_job_for_exit();
         self.retire_close_return_owners(ViewerCloseCause::AppExit);
         self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.diagnostics_export.retire();

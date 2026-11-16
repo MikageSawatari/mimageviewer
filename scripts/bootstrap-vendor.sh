@@ -122,7 +122,7 @@ else
     # model download, APPDATA import, or unverified backup publication here.
     if ! powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass \
         -File "$SCRIPT_DIR/vlm-worker-identity.ps1" -RestoreBackupRepo "$REPO_ROOT"; then
-        echo "  VLM backup was not published. See scripts/setup-llama-cpp.ps1 and crates/vlm-worker/README.md."
+        echo "  VLM backup was not published. See scripts/setup-llama-cpp.ps1, scripts/setup-whisper-cpp.ps1 and crates/vlm-worker/README.md."
     fi
 fi
 

@@ -605,6 +605,7 @@ pub enum ThumbnailState {
     Loaded {
         cover: crate::cover_source_scope::LoadedCoverIdentity,
         auto_material: crate::cover_auto_material::AutoMaterial,
+        cover_cache_stamp: crate::cover_rotation_cache::CoverCacheStamp,
         tex: egui::TextureHandle,
         origin: crate::thumb_loader::ThumbLoadOrigin,
         /// 非破壊編集プレビュー由来。通常の低品質 catalog cache と異なり、
@@ -641,6 +642,7 @@ impl ThumbnailState {
         Self::Loaded {
             cover: crate::cover_source_scope::LoadedCoverIdentity::Unrotatable,
             auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
+            cover_cache_stamp: Default::default(),
             tex,
             origin,
             from_edit_preview,

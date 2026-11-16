@@ -424,8 +424,8 @@ impl App {
                 .iter()
                 .map(String::as_str),
         );
-        if report.store_mutations.ai_captions_changed() {
-            self.notify_caption_changed();
+        if report.store_mutations.derived_text_changed() {
+            self.notify_derived_text_changed();
         }
         if report.store_mutations.caption_display_stale() {
             self.caption_display.clear();
@@ -487,7 +487,7 @@ impl App {
     /// Worker が直接更新した destination page について、DB の miss まで materialize する
     /// read-once cache だけを page key 単位で失効させる。idx-keyed page state と rating / tags
     /// は後続の `finish_book_page_edit_mapping` が既存の ownership 境界で処理する。
-    fn invalidate_content_restore_destination_caches(
+    pub(crate) fn invalidate_content_restore_destination_caches(
         &mut self,
         presence: &crate::content_identity::RestorePresence,
     ) {
@@ -898,7 +898,7 @@ mod tests {
     fn caption_restore_completion_clears_shared_display_without_ledger_reload() {
         let mut app = crate::app::setup_app_for_test();
         let index_data = app.tmp.path().join("caption-index");
-        let caption_epoch = app.caption_epoch_for_test(&index_data);
+        let derived_text_epoch = app.derived_text_epoch_for_test(&index_data);
         // Model a completed startup load, with no earlier loader still owned.
         if let Some(pending) = app.content_identity_index_load_pending.take() {
             pending.cancel();
@@ -933,7 +933,7 @@ mod tests {
             app.caption_display
                 .seed_for_test("d:/images/other-viewer.jpg");
             let epoch = app.caption_display.epoch_for_test();
-            let before = caption_epoch.load(std::sync::atomic::Ordering::Acquire);
+            let before = derived_text_epoch.load(std::sync::atomic::Ordering::Acquire);
             let (tx, rx) = mpsc::channel();
             tx.send(crate::content_identity::ContentRestoreReport {
                 // An actual store commit owns invalidation even without any
@@ -947,8 +947,8 @@ mod tests {
             app.poll_content_identity_restore(&egui::Context::default());
 
             assert_eq!(
-                caption_epoch.load(std::sync::atomic::Ordering::Acquire),
-                before + u64::from(mutation.ai_captions_changed())
+                derived_text_epoch.load(std::sync::atomic::Ordering::Acquire),
+                before + u64::from(mutation.derived_text_changed())
             );
             assert!(app.content_identity_restore_pending.is_none());
             assert!(app.content_identity_index_load_pending.is_none());

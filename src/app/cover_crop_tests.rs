@@ -161,6 +161,8 @@ fn cover_crop_drive_catalog_prefix_skips_newer_cropped_and_auto_rows() {
         ("40|23|autocrop:v1:rtl", 40),
         ("50|23|autocrop:v2:rtl", 50),
         ("60|23|autocrop:v3:rtl", 60),
+        ("60|23|autocrop:v4:rtl", 60),
+        ("60|23|autocrop:v4f:rtl", 60),
     ] {
         db.save_thumb_bytes(
             &format!("{prefix}{suffix}"),
@@ -410,9 +412,9 @@ fn cover_crop_zipdir_changed_crop_replaces_existing_key_and_prunes_old_row() {
 }
 
 #[test]
-fn cover_crop_epub_completed_key_retention_matches_existing_1742_limit() {
-    // §1.742 predates cover crop: the current keep set has the pending pin key,
-    // while the worker appends the EPUB generation. Do not fix it in §1.764.
+fn cover_crop_epub_completed_generation_is_retained_by_folder_cleanup() {
+    // §1.742 retains the worker's resolved generation against the pending pin
+    // inventory, including the unchanged manual cover-crop identity.
     let temporary = tempfile::tempdir().unwrap();
     let epub = temporary.path().join("book.epub");
     std::fs::write(&epub, b"epub identity").unwrap();
@@ -452,6 +454,8 @@ fn cover_crop_epub_completed_key_retention_matches_existing_1742_limit() {
         let key = crate::thumb_loader::cache_key_for_request(&completed)
             .unwrap()
             .into_owned();
+        assert_eq!(key.contains("|crop:"), cover_crop.is_some());
+        assert!(key.ends_with("|generation:91:200"));
         let existing = folder_thumb_existing_keys_for_with_visibility(
             &item,
             Some((17, 23)),
@@ -463,7 +467,11 @@ fn cover_crop_epub_completed_key_retention_matches_existing_1742_limit() {
             &Default::default(),
         )
         .into_iter()
-        .collect();
+        .collect::<std::collections::HashSet<_>>();
+        assert!(
+            !existing.contains(&key),
+            "inventory must still use the pending identity"
+        );
         let catalog =
             crate::catalog::CatalogDb::open(&temporary.path().join("cache"), temporary.path())
                 .unwrap();
@@ -481,8 +489,8 @@ fn cover_crop_epub_completed_key_retention_matches_existing_1742_limit() {
         assert!(catalog.load_one(&key).unwrap().is_some());
         catalog.delete_missing(&existing).unwrap();
         assert!(
-            catalog.load_one(&key).unwrap().is_none(),
-            "§1.742 boundary changed; update this documented limitation"
+            catalog.load_one(&key).unwrap().is_some(),
+            "completed EPUB generation must survive cleanup with its manual crop token"
         );
     }
 }

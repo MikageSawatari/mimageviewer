@@ -87,3 +87,17 @@ ffprobe -v error -select_streams v:0 -show_frames -show_entries frame=best_effor
 ```
 
 `ffmpeg` と `ffprobe` は PATH 上の生成・検査用ツールで、アプリの配布物には含めません。生成と上記の非対話検査では mImageViewer を起動しません。
+
+## T1の既存TS素材（区切り7bで移動、2026-11-15）
+
+`transcript-origin-video.ts` は旧 `src/video/transcript_time/fixtures/origin-video.ts` をそのまま移したものです。
+64×64・5fps・4秒のtestsrc2と48kHzのsineを含むMPEG-2/AAC TSで、私有素材は含みません。
+サイズ96,820 bytes、SHA-256は `214e5226cec7878e74eefe5f57b20e58954cf9cd8376d210b3b0cac8efdfe10e`。
+原点Oは1.578667秒、Dは4.021333秒です。上記の全intra素材とは別の、旧T1の回帰用素材です。
+
+```powershell
+ffmpeg -hide_banner -loglevel error -n -f lavfi -i testsrc2=size=64x64:rate=5:duration=4 -f lavfi -i sine=duration=4:sample_rate=48000 -c:v mpeg2video -threads:v 1 -c:a aac -f mpegts testdata/timeline-origin/transcript-origin-video.ts
+```
+
+抽出した先頭の音はメディア時刻0付近（AAC primingを許す50ms以内）、保存時刻3秒の行のseek先はそのまま3秒です。
+原点を再加算せず、範囲外のseekだけ通常のplayerのclampを受けることを検査します。

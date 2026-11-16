@@ -457,8 +457,9 @@ ZipPlaFork (commit 07955f52、**AGPL v3**) の公開コードを読んだ結果�
 
 - 解析用 raster を高さ 256 にそろえても、JPEG の DCT 倍率・PDF の render 寸法が違えば画素は同じにならない。倍率を変えて判定の矩形が
   安定する (境目の位置が解析用 raster で ±1 列程度) ことをテストで確かめる。揺れるなら解析用 raster の作り方 (面積平均の縮小など) を決め直す。
-- EPUB の世代付きの行と存続集合の食い違いは既存の §1.742 で、今回の接尾辞の正規化とは別件。手動・自動それぞれの完成 key で
-  「保存 → 一覧の読み直し (`delete_missing`) → 行が残る」の回帰テストを置き、§1.742 に当たる場合はその旨を記録する (直すのは §1.742)。
+- §1.764 の設計時は、EPUB の世代付きの行と pending の存続集合の食い違いを §1.742 の別件として扱った。
+  現在は §1.742 で修正済み。手動・自動の切り取り token を持つ完成 key でも、共通の存続照合で
+  「保存 → 一覧の読み直し (`delete_missing`) → 行が残る」ことを確認する回帰テストへ更新した。
 
 ## 13. 利用者の決定
 
@@ -526,7 +527,8 @@ ZipPlaFork (commit 07955f52、**AGPL v3**) の公開コードを読んだ結果�
 
 - r3 の 6 項目はすべて解消。新しい設計上の問題なし。
 - 実装担当への注記: 子の手動 / 自動 / 対象外ごとの key 一致、代替要求の指示の保持、`|types:`・`|autocrop:`・`|generation:` の
-  正規化と存続集合を回帰テストで確かめる。解析倍率の安定性と §1.742 は §12.7 のとおり。
+  正規化と存続集合を回帰テストで確かめる。解析倍率の安定性は §12.7 のとおり。
+  当時は境界の確認対象だった §1.742 も修正済みで、EPUB の完成行が手動・自動 token 付きでも保持されることを確認する (§12.7)。
 
 ## 15. 第1段（手動）の実装と検証（2026-11-11）
 
@@ -549,8 +551,10 @@ ZipPlaFork (commit 07955f52、**AGPL v3**) の公開コードを読んだ結果�
 - 在メモリ回転と同じ本棚判定を保つため、既定本棚パスの解決は worker に移す。
   独立レビューで見つかった AI 説明文生成・表示側の兄弟 consumer も追従した。
 - Remote の Image／Folder ピンには手動範囲を渡す。Remote の個別色調補正キー未設定は既存の動作として維持する。
-- §1.742 は今回の範囲外。EPUB の worker 完成キーには generation が付く一方、現行の存続集合には pending キーだけが入り、
-  `delete_missing` で行が消える既存の境界を、範囲なし／手動範囲ありの両方で記録するテストを置いた。
+- 第1段の実装時は §1.742 を範囲外とし、EPUB の worker 完成キーの generation と pending の存続集合の食い違いにより、
+  `delete_missing` で行が消える境界を範囲なし／手動範囲ありの両方で記録する見張りテストを置いた。
+  現在は §1.742 で修正済みのため、`cover_crop_epub_completed_generation_is_retained_by_folder_cleanup` として
+  手動の切り取り token 付き完成行の保持を確認する期待値へ更新した。
   Folder／ZIP／PDF の手動範囲の完成行は別の存続テストで検査する。
 
 ### 15.2 検証の担当
@@ -690,8 +694,11 @@ cargo nextest run -p mimageviewer --lib -E 'test(/cover_auto|auto_cover_crop|aut
   K2の手動／自動／RAW／動画／音声／Folder Seeded pinの子writer key一致を確認した。
   Folder/ZIP/PDF/ZipDirの現設定キーと従来キーの存続、旧綴じ方向の自動キーの除去、
   OFFのgolden・Collection digest・色フィルタ・設定の保存／転送も含む。
-- §1.742のEPUB完成generationキーと存続集合の既存境界は、手動に続き自動付きでも記録した。
-  generation付きの完成行が現行のpending集合では残らない点は§1.742の修正対象で、今回変更しない。
+- 第2段の実装時も、§1.742のEPUB完成generationキーとpendingの存続集合の食い違いを、手動に続き自動付きの見張りテストで記録した。
+  当時は完成行が残らない点を§1.742の修正対象として変更しなかった。
+  現在は§1.742で修正済みで、`cover_auto_epub_completed_generation_is_retained_by_folder_cleanup` として
+  自動の切り取り token 付き完成行も保持される期待値へ更新した。手動・自動とも token の存在と generation を検査し、
+  完成キー自体を含まない pending の存続集合で `delete_missing` を通す。
 - 反復中の3件の失敗は、設定転送の件数期待値、CacheOnly用fixtureの在メモリmap未水和、cubic rasterの倍率間の揺れだった。
   件数を追加項目分更新し、fixtureは既存Fixed providerの契約どおりmapを水和し、rasterは§16.1の面積平均へ修正した。
   続く1件は転送wireの件数期待値の更新漏れで修正済み。最終成功件数にはこれらの失敗を含めない。
@@ -1875,3 +1882,397 @@ lib全件・build-dev・製品起動・独立レビュー・コミットは行�
 ### 28.6 実機確認と左右の欠けの扱い (利用者確認、2026-11-15)
 
 利用者が切り出しの結果を見て、概ね正しく切れていると判断した。表表紙の左右がわずかに欠ける本がある。裁断してスキャンした本は本文のページの中央側が少し削られるため、本文の比率ちょうどの幅で切ると表紙の左右が少し欠ける。利用者の判断で、これは仕様とする (幅の補正は入れない)。お気に入りごとの入/切は次以降の版で検討する。
+
+## 29. 本文の保存回転による自動切り出しの作り直し (§1.773 続編、v5.3.0)
+
+設計日: 2026-11-15。コード確認対象は `68101a56e`（設計更新を含む `cf50483ee` でも該当コードを再確認）。**利用者決定（2026-11-15、統括経由）により単純な保存側失効案へ改訂。2026-11-16にkey-only v4/v4fへの更新を含めて独立設計レビューと設計担当の合意を得た。実装・検証の集約先は§29.12。**
+本節は§28.3の「作り直さない」という制約を解消する次段の設計であり、§28.3の出荷記録は残す。
+判定の式・標本の選択・4方向の結果・手動範囲の座標系は変えない。
+
+### 29.0 単純な案との比較（統括提案を先に検討、2026-11-15）
+
+#### 比較する案と推薦
+
+- **S0・単純削除案**: 回転保存に伴い本の自動代表のcatalog行/memoryと祖先フォルダ代表を削除/退避する。
+  新しい本文proof、親の要求内での子の生成、子の世代の運搬は作らない。最後の古い書戻しはログと手動復旧で割り切る。
+- **S1・削除＋通知の補強**: S0に、削除完了の通知、全保持一覧の対象別退避、子の通常の保存完了時の親再読込を足す。
+  K2の既存の「完成した子だけを使う」という規則をそのまま使う。
+- **P・決定前の§29案**: 古い行を残し、本文proofの不一致を再生成資格として読む。親が先に必要になっても、
+  古い行を持つ選ばれた子だけ同じworkerで作り直す。coldの選択規則は保つ。
+
+**比較時点ではPを推薦したが、利用者が下記の制約を受け入れ、今回は単純な案を採ると決定した。** 以下の比較は判断の経緯として残す。以前の推薦の根拠は、旧workerの最後の書戻しへの完全対策ではなく、
+下記の「子がcoldになって生成されない」「保存OFFでは生成後も子の行が無い」という通常順序である。
+単純な案がこの2点を残すことを仕様として受け入れるならS1の方が小さいが、これは今回の
+「本文を回した後、必要な本/親の代表を作り直す」と既存の代表表示・保存policyを保つ条件を弱める。
+特に先のREVISEで指定された「画像の無い親を先に要求しても、古い子の行を失って代表が消えない」条件を維持する限りの推薦である。
+その機能制限を、まれな失敗として暗黙に受け入れたことにはしない。
+以下はコードからの順序の確認であり、実機での発生頻度測定や実装済みの試験結果ではない。
+
+#### 29.0.a 実際に使える既存部品と、その限界
+
+| 既存の入口/関数 | 単純案で再利用できること | そのままでは行わないこと |
+| --- | --- | --- |
+| `rotation_page_owner_changed` (`app.rs:77470`) | 変更したページキーを受け、既存のUI失効を呼ぶ起点。reset/importもownerの更新へ集約済み。 | 本/祖先の自動代表行を削除するworkerは起動していない。 |
+| `CatalogDb::delete_one` (`catalog.rs:2025`) | 指定した厳密なキーのthumbnail行を削除する。既存のcatalog revision triggerも進む。 | ページキーから本・全祖先・pin/type/binding/generation別の行・別namespaceのaliasを逆引きして一括削除しない。UIから新たにSQLを直呼びしてよいという意味ではない。 |
+| `pin_materialization::Request::prepare` → `commit_pin_materializations` | 既存metadata workerで、選んだ行群のDB削除/seedとmemoryの置換を準備する型。UI同期I/Oを増やさない構造の参考になる。 | pin用のscope/identity/context取消の処理。本の本文回転を保存した後、移動先や全保持snapshotまで自動追跡する汎用の削除通知ではない。 |
+| `evict_thumbnail_for_reload` (`app.rs:85279`) | 該当idxのqueue/request ID/CPU画像/textureを一体で退避し、通常demandへ戻す。 | catalog行や共有cache_mapは消さない。これだけだと同じstampの古い行を再びhitする。 |
+| `evict_legacy_cover_thumbnails` (`viewer_context_registry.rs:1169`) | mountedとAtRest/Retiringの各ownerの該当idxだけを退避する走査・色失効の形。 | 現行はLegacyのLoadedだけ。snapshot内のsaved/list-view配列、Smartの退避grid全部を変更通知で消す処理ではない。 |
+| `reconcile_restored_cover_thumbnails` (`cover_rotation.rs:11`) | snapshot/Smart/direct-sourceの復元時の共通入口。 | 「Automaticも対象」とするだけでは新旧を識別できない。Legacyの `scope.has_rotation(owner)` は非ゼロの有無なので、最後の回転を0°へ戻したことは検出せず、非ゼロなら生成後も復元のたび再退避し得る。 |
+| `FolderResolveContext::cached_candidate` / `folder_cached_row_usable_in_cache_dir_with_pins` (`thumb_loader.rs:5335、5499付近`) | 既存のfolder selection proofが、調べたcatalogのrevision（候補行無しも含む）を保存・読取時照合する。 | 子が無ければ生成しない。表示済みの親textureをcatalog revisionの変更だけで直ちに退避する通知も無い。 |
+| `ThumbMsg` のFinalized → `poll_thumbnails` → `fire_virtual_folder_writeback_if_ready` (`app.rs:57235、43622付近`) | 子の保存/省略が終わった事実を既存要求の完了として受け取る入口。 | 現行writebackは設定済みtarget_idx/items_genに限るミラー。全祖先の行/texture/休眠snapshotを対象にする通知ではない。旧request IDの完了はpollで捨てられ、parked contextの未pollの完了から別の表示中contextへ通知する保証も無い。 |
+
+「消す関数が全く無い」とはしない。削除・owner単位の退避・復元入口はある。
+一方、**回転保存→本と全ての該当親の行削除→保持一覧の失効→子の生成完了後の再選択**が
+一つの既存関数で完結している、という前提も置けない。
+削除する正確なキー/namespaceは既存builderで求め、ZIP内の文字を含む任意のLIKE/prefix削除へ置き換えない。
+
+#### 29.0.b 通常の操作の順序（まれな失敗としては扱わない）
+
+| 順序 | S0の結果・既存コードでの確認 | S1での塞ぎと残る条件 |
+| --- | --- | --- |
+| 一覧から本を開く→本文R/L→Escで一覧へ戻る | DB行を消してもsnapshotのLoadedは既に画素を持つので、そのまま戻る。`snapshot_ops.rs:1502/1634` の現行復元guardはAutomaticを見ない。 | 回転通知で保存配列を対象別にEvictedへ書き換えるか、復元時に変更済みの本を識別する情報が必要。単に現ownerに非ゼロ角度があるかでは不十分。Smartはsamplesの代入順も直す（§29.6）。 |
+| 本Aの行を消す→Aのタイルを要求せず、一つ上のフォルダPの代表を先に読む | 現K2はAをcoldとして飛ばす（`thumb_loader.rs:6194–6210`）。BがあればB、ZIP/PDFのAしか無ければNone。**Aを表示する通常要求が無ければAの生成は一度も始まらない。** | 親も削除するだけ、または「子が出来たら通知」だけでは塞がらない。来ない完了通知では親を復旧できない。親を読むときの子生成を禁じるなら、回転保存側で別途、非表示でもAを生成する要求が必要。 |
+| 上記でBを親行へ保存→後からAの通常タイルを作る | Aの保存が同じ子catalogのrevisionを進める。Bの既存folder selection proofはAの行を探したcatalogのrevisionも記録するので、**次の親worker読取ではBがmissになり再選択する**。DBのBが永久に正しいと判定される、とは限らない。 | ここは既存の選択proofを使える（新しい本文proofではない）。ただしLoadedのBは再読取されないため、子の保存完了後に対象の親texture/要求/保持配列を退避する通知が要る。 |
+| Aの再生成を表示したがcache policyがOff、またはAutoで保存を選ばない | `load_one_cached` のcache_map追加はDB保存成功の枝にあり（`thumb_loader.rs:7517`付近）、生成した画素だけではK2の完成行は出来ない。子の行は消えたまま。 | 親を再読込してもK2はAを再び飛ばす。子をforce-saveすれば保存policyを変える。policyを保つなら、子の生成素材を親へ渡すか、親の要求で生成する仕組みが別途必要。単純な完了通知では足りない。 |
+| 同じ本/親を別ウィンドウにも表示、またはmainをparkしてF12で本文回転 | 一方の `thumbnails` だけの退避ではもう一方のLoadedと共有/別々のmemory行が残る。 | Legacyのregistry走査の形を再利用し、該当ownerのrequest/queue/画素と全ての保持配列を対象にする。全contextの一括clearや、実装上のmountをして回る必要は無いが、既存述語の変更だけでは済まない。 |
+| 本/親の削除完了後、子を一度も表示せず正常終了→再起動して親Pから開く | 消した行自体が復活することは無い。しかしAがcoldになった事実もそのまま残るため、Aしか無いPは次回もNone、BがあればB。 | 揮発的な「子生成待ち」/完了通知だけでは復旧しない。削除前のAと元からcoldな候補を区別する永続の印、または新起動の読取側での子生成が必要。**途中で強制終了したという前提は不要**。 |
+| 初回の判定中、向きの違う本を開いてR/Lで直す | 利用者はthumbnail jobを意識せず普通に回せる。Loadedだけを見た退避ではpending/CPU待ちを取りこぼす。request IDをremoveしても、そのworkerが後からcacheへ保存することまでは止めない。 | 同じ本/該当親のpendingも取消対象にし、queue/CPU画像を既存ownerから除く必要がある。この操作全体を「初回だからまれ」とは分類しない。頻度の実測なしに、長いPDF/初回decodeとの重なりを無条件に割り切らない。 |
+| 削除workerを投げた直後に一覧へ戻り、新しい要求が古いmemory/DBを読む | UIで新しいSQLを出来ないので削除は非同期になる。新request IDのcache hitは、旧request IDの取消では拒否できない。 | 削除完了後にも対象を退避するか、完了まで対象要求を抑止する順序が要る。元contextを離れたことだけで削除/完了通知を捨てる設計にはできない。 |
+
+最初の削除でK2がBを選ぶこと自体は既存のcold規則であり、Bを出すことを一律禁止する必要はない。
+問題は、**Aの生成開始が無い/行にならない場合**と、**BのLoadedが次の読取へ進まない場合**である。
+この2つを「古い保存が最後の瞬間に割り込む」という1ケースにまとめない。
+
+#### 29.0.c まれな失敗・狭い競合として割り切るもの
+
+DB削除/保存失敗、disk full、処理中の強制終了は既定どおりログ・通知と手動範囲指定/キャッシュ再作成で扱う。
+そのためのtransaction横断rollback、retry timer、終了時の全job待合せは追加しない。
+また、通常順序の取消/失効が済んだ直後の最後のDB commitとの競合だけが残る設計なら、統括提案のとおり割り切る余地がある。
+ただし、上表のK2・保存OFF・正常再起動は並行処理が一切無くても再現するため、この区分には入れない。
+初回判定中の回転も通常の入口であり、UIに古い結果を採用することまで丸ごと許す理由にはしない。
+Pもwriter停止・保存barrierを増やさない。正常な読取に必要なproof照合が旧行をmissにすることを使い、
+まれな障害のためだけに回復状態を追加しない。
+
+#### 29.0.d 最小限の塞ぎを足した場合の比較
+
+S1に必要な追加は次の3群である。まずこの範囲で止められるか検討した。
+
+1. **既存UI失効の補強**: 本/該当祖先の行削除をworkerで行い、完了後にも対象のmemory/request/textureを失効する。
+   既存registryとsnapshot/Smartの保存配列を同じscopeで退避し、0°へ戻す操作も扱う。
+2. **親の再読込**: 子の保存完了を元contextがparked/移動済みでも対象親へ届ける。
+   既存のUI request IDのcurrentnessと、保存が完了してcatalog revisionが進んだ通知を混同しない。
+   親workerの次の読取では既存folder selection proofを使い、Bのcacheを再選択する。
+3. **なお残る穴**: 子が非表示/保存OFF/再起動済みでもAの素材を用意する必要がある。
+   これを閉じるには、削除側に非表示の子の生成要求とその完了を管理する責務を足すか、
+   永続のdirty印から新起動でも生成を再開するか、読取側で子を生成する必要がある。
+   force-saveや「本の一覧を一度開く」を必須にするなら機能/操作の変更として明示の判断が要る。
+
+3まで閉じる案をS2とする。S2は実装案として採らず、必要な責務を以下に比較する。
+これはテストの**責務の種類**の比較で、実装LOCや実行済みテスト数の見積りを装わない。
+
+| 比較項目 | S0 | S1（1・2まで） | S2（通常順序の全穴を閉じる） | P（旧proof案） |
+| --- | --- | --- | --- | --- |
+| 新しい永続情報 | 無し | 無し | 子が削除済み/元からcoldを識別するdirty情報が要る。不要にするなら親読取時生成等へ制約を緩める。 | 素材の最大8組の本文proof。別のdirty queue/DB無し。 |
+| UIの追加分岐 | 対象退避 | 削除完了・子保存完了・保持配列・pendingの退避 | S1に加え子の要求開始/完了/失敗/正常終了後の再開の扱い | 既存退避＋採用/復元のメモリ照合。一時fallbackだけ選択証拠を運ぶ。 |
+| K2/source生成 | 変更無し、代表無し/Bのままが残る | 子の通常要求が来て保存された場合だけ復旧 | 非表示の子生成と親への完了連携、Offなら非永続素材の受渡し、または親読取時生成 | 古い行を持つ子だけ、親を処理中のworkerで共通helperを呼ぶ。新しい子job/常駐owner無し。 |
+| 普通の復元/複数窓のテスト | 問題を検出するが直らない | 通知の宛先/保存配列/完了前後/parked等を検査 | S1＋起動/終了/途中の移動をまたぐdirtyと生成責務の遷移 | §29.10のowner単位・採用/復元の照合を検査 |
+| 再起動/Off/親を先に開くテスト | 不成立 | 不成立のまま | 永続dirty→生成→親更新、非永続素材の寿命を追加検査 | 古い行を残すので、同じ読取→生成の検査へ集約できる |
+| 失敗後のBとAへの復帰 | 元からcoldとの区別を失う | 完成通知が来なければ復帰しない | 子の失敗と再開・Bの有効期間を別途決める必要がある | TemporaryFallback/認証不足の最小memoは必要。これはPの明確な追加コスト。 |
+
+S0の小ささは認める。S1もPよりpayload/codecの変更が少なく、限定された場面では十分である。
+しかし通常の全条件を守るS2は「既存の削除関数を呼ぶだけ」ではなく、新たな子生成/dirtyの管理へ移る。
+Pも大きいが、**保存してある素材そのものを入力の証拠とし、必要になったworkerだけが作り直す**ので、
+新しい常駐の生成ownerや永続の作業待ち列を持たず、完了待ちの組合せを減らせる。
+
+#### 29.0.e 利用者の決定と採用する案（2026-11-15）
+
+利用者は、回転した本のtileを表示する前に上のfolderを開くと代表が別の本/無しになること、
+再起動をまたいでも子の行が出来るまで続くことを受け入れ、**単純な保存側失効を採る**と決定した（統括経由）。
+§29.0の比較で「親の制約を残さない」としていた条件をここで変更するため、比較時のP推薦は現在の結論ではない。
+
+採用案はS0に、削除完了後の対象退避と、保持素材のセッション番号による復元判定だけを足す。
+S1にあった「子保存完了で親を特別に退避」も採らず、親は既存catalog revisionに基づく次の読取に任せる。
+Off/Auto非保存では本を表示しても行が出来ないことを含め、§29.0の制約を受入れ範囲として明記する。
+Pのproof/codec変更・読取照合・K2内生成・子の世代の引継ぎは撤回し、§29.11の退けた案へまとめる。
+以後の§29.1〜29.11はこの利用者決定を正本とする。比較表は採用案の保証へ読み替えない。
+
+### 29.1 採用する範囲と採らない範囲
+
+利用者決定（2026-11-15、統括経由）により、**回転保存側で本の自動代表cacheを消し、完了後に通常の要求で読み直す案**を採る。
+§29.0の比較で挙げた親代表の制約を受け入れる。P案の「子を必ず親の中で生成する」という保証は要件から外す。
+
+- 自動のキーだけを `|autocrop:v4:{rtl|ltr}`、画像フォルダを `v4f` へ更新する。出荷済みv3/v3fには本文回転後の古い結果が残り得るため、新しいキーの通常要求で作り直す。旧行のコピー・一括移行・削除は行わない。
+  `AutoMaterial`、`auto_crops`、4方向の結果、schema/codecは変更せず、本文proofも追加しない。v4はキーの世代であり、新しい素材形式を意味しない。
+  K2の出荷済みv1互換は保つが、v3/v3fへのfallbackは追加しない。現行行が無い場合の既存v1互換だけを維持し、現行行の不正・署名不一致時に旧行へ戻らない。
+- 新しい本文proof、読取の5入口での照合、採用直前の本文角度照合、K2内の子生成、子の世代/素材の新しい運搬は作らない。
+- 対象は回転の変わったページを本文として持つ**本自身のAutomatic**。ZIP・変換書庫は同じ外側書庫の全ZipDirも保守的に対象とする（2026-11-16、設計担当判断）。全方向が見送りのAutomaticも含む。
+  手動範囲・edit preview・NotAutomatic・LegacyV1・通常のページ行・RAW/動画/Remoteの対象範囲を変えない。
+- 代表自身の回転だけなら削除/再生成しない。既存4方向の結果を在メモリの角度で選び直す。
+- 本文標本8枚を再現して対象を絞る処理は足さない。代表以外のページ変更は、その本の自動結果を保守的に失効する。
+  本ごとの失効であり、全回転revisionや全contextの一括clearにはしない。
+- 親の代表へ専用処理を足さない。子の削除/保存でcatalog revisionが変われば、既存folder selection proofが次の読取で再選択する。
+  親Loadedの即時更新、子の生成完了通知での親退避、非表示の子の強制生成は今回の範囲外。
+
+### 29.2 対象の本と「表紙だけ」の求め方
+
+ページキーは既存の `page_key_for_pdf` / `zip_entry_key` / `normalize_path` と同じ規則を使う。
+**ページキーの文字列だけでは、ZIP全体/ZipDirという論理単位、変換元の書庫、画像フォルダの代表選択までは一意に決まらない。**
+通常の回転handlerでは `GridItem`・現在の論理source・archive overrideを一緒に捕捉し、
+reset/import等のkeysだけの通知では同じtyped source helperにworkerで照合させる。拡張子や区切り文字だけの別解釈を作らない。
+
+| ページの種類 | 本の識別と照合 |
+| --- | --- |
+| PDF / EPUB | `GridItem::PdfPage` と既存の論理PDF/EPUB path、0始まりpage番号を使う。EPUBの生成PDFを別の本としない。 |
+| ZIP | 外側の物理ZIPとentryの組を既存helperで扱う。entry中の `::` / `|generation:` / `#pin:` 等をderived keyと混同しない。 |
+| ZipDir | 保存キーの論理prefixは維持するが、失効は外側のZIP・変換元書庫の単位とする。変更ページを含むprefixに限定せず、未保持の別prefixやその外へ固定した行も同じ書庫なら対象にする。 |
+| 変換書庫 | viewerの保存回転キーは既存どおり変換後ZIP。`archive_source_override` / 既存の変換元対応で論理書庫へ結び、変換元tileのwriterキーを求める。対応のworker lookupも既存cache DBで行い、UIで新たに開かない。 |
+| 画像フォルダ | 画像の直上folderを本の候補とする。`FolderImageOrigin::Direct` に相当する代表だけが対象。祖先folderがK2で継承した素材は、その祖先自身の対象行としては消さない。 |
+
+本の識別は既存 `BookCoverContainer` / `ReadLocation` / request builderの入力を共有した純粋な値とする。
+表紙の判定はUIでscanせず、workerが格納行の `CoverIdentity::Page` を復元して変更ページと比較する。
+**変更ページ==その行の代表ページならその行を残す**。pin/代表順が違う過去の行は、行ごとの代表で判定する。
+画像フォルダでは既存selection proofのwinnerとcoverから、直下画像と子由来の代表を区別する。
+同じleafを持つことだけで、上のfolderや別の外側書庫の行まで削除しない。
+
+ZIP・変換書庫ではpinの実効prefixで失効範囲を絞る方式を撤回する。本文回転はまれで、同じ書庫内の再生成の費用より、未保持の固定元を取りこぼす分岐を減らすことを優先する。既存derived-key parserで現行印を確認し、外側書庫とcatalog scopeを厳密に比べて全ZipDir行を列挙する。変更keysにその行の代表以外のページが一つも無い場合だけ、その行を残す。同じ書庫の別代表にとって本文変更なら、その別代表は作り直され得る。PDF・画像フォルダの範囲は従来どおり。
+
+初回生成中で行が無い場合は、捕捉した通常要求のpin/代表選択をworkerの既存解決helperで確認して同じ除外を行う。
+PDFの既定page、ZIPの先頭選択、folderの既存sortを共有し、**decode/自動判定/子の生成は起こさない**。
+不明な対応や読取失敗はログを出し、推測した全体削除や別の本への拡張はしない。新しい回復機構は足さない。
+
+### 29.3 消す行、保存先、workerのmemory
+
+削除は短命のcache更新workerで行う。UIは変更keys・typed source・既存handle/設定値を捕捉するだけ。
+既存metadata/pin materialization workerの「準備→DB更新→完了通知」の実行パターンを使うが、pin変更として通知せず、
+元contextを離れたという理由だけでこのcache削除を取り消さない。UI同期SQL・Shell・画像decodeを追加しない。
+
+1. 通常のsource parent catalog、`collection_source_parent_identity`、現在/保持中の `RequestCatalog` と
+   `ThumbnailPoolCatalog` の保存先を、既存storage-scope規則で求める。
+   再起動後に開く別名行も残さないよう、固定synthetic scopeは既存のsynthetic-path helperと設定中のSmart等のIDから
+   到達可能な保存先を列挙する。UIはID/handleだけを捕捉し、DBの存在/ヘッダ読取はworkerで行う。
+   `search_results_synthetic_path` / `rating_view_synthetic_path` / `reading_history_synthetic_path` /
+   `bookmark_view_synthetic_path` / `subfolder_expansion_synthetic_path` / `smart_folder_synthetic_path` の既存識別を使う。
+   全cacheディレクトリの再帰scanや、hashからのパス逆算を通常の回転に追加しない。
+   既存のCatalogWork/admissionを守り、存在するDBだけを更新する。cache削除によりretiredになった旧受付が
+   新しいepochを取得し直してDBやdirectoryを作り直す経路は作らない。
+2. **既存builderだけで、過去の全キーを有限の設定値から列挙できるとはしない。**
+   `|types:<16hex>` は過去のpolicyのdigestであり、pin・sort/depth・generationの過去の組合せもある。
+   対象catalogで既存行のkey/cover/material/selectionのヘッダを読み、保持memoryの実在キーも候補にする。
+   WebP blobを全件decodeせず、必要ならヘッダ専用のcatalog readerを既存readerの列互換規則に沿って用意する。
+3. `representative_auto_crop_key_parts` の厳密な位置/文法で現行v4/v4fを識別する。
+   v1/v2/v2f/v3/v3fは正規化で旧印として認識するが、旧行の移行・再採用やprefix削除には使わない。
+   `folder_thumb_*_cache_key_for_path`、`cache_key_for_request`、`pinned_cache_key`、
+   `representative_cache_key_for_policy_with_auto` 等の既存builderと照合する小さな単一helperで、その本自身の行かを確認する。
+   行から得た検証済みderived部品はそのまま保持し、生成元を復元できないtypes digestを推測しない。
+   右綴じ/左綴じ、full-path/basename、pin/type/generation、folderの既存sort/depthを網羅する。
+   過去pinの行の実在文字列も扱うが、通常のZIPページ名の一部を代表キーと誤認しない。
+4. §29.2の表紙除外とAutomaticの確認を通った**実在する厳密なキーの集合**を作り、
+   `CatalogDb::delete_one` または同等の `WHERE filename = ?` のbatch削除に渡す。
+   LIKE/SQL prefix削除にしない。OFF/uncroppedのキーの綴り、行、pin設定は変更しない。
+5. workerが参照する `cache_map` の同じ行も除去する。SQL中はmap/queueのlockを持たない。
+   完了通知は `InvalidatedRow { slot, catalog, key }` の行単位で返し、捕捉後に作られた現在/保持先のmemoryにも同じ行の除去だけを適用する。未解決の要求は同じ行のslot・保存先・キーを一組として照合し、別の行の一致を組み合わせない。保存先はRequestCatalogのParent row.folder／Collection identity、Fixedはowner poolを使い、Parentのキーにはrow.row_keyを使う。
+   その処理はmemoryの短い操作に限り、UIでDBへ問い合わせない。
+
+これは本のcacheの失効であり、親folderのDELETE、親のepoch更新、K2への特別な生成要求を発行しない。
+catalog revisionは既存triggerに任せ、counterを手動調整しない。
+
+### 29.4 読み直しの順序（削除完了後に退避）
+
+**先にLoadedを退避して削除workerを待たせる方式は採らず、削除とmemory除去の完了通知を受けてから退避する。**
+新しい要求が削除前の古い行を再hitする順序を避け、要求抑止のフラグ・待合せ・timerを増やさないためである。
+処理中は従来のtextureを保ち、UIをモーダル化したりworker完了を同期で待ったりしない。
+
+```text
+回転ownerの実効変更（0°へ戻す場合も含む）
+ → keys/source/設定/handleを捕捉して有限のcache削除workerへ渡す
+ → DBの厳密キー削除と既知cache_mapの同じ行の除去
+ → App所有の完了通知を非blockingで受ける
+ → 対象のセッション番号を進め、現在のmemoryも同じキーで除去
+ → mounted / AtRest / Retiringの対象idxと要求を退避
+ → 次の通常demandが新request IDで読み直す
+```
+
+完了通知はview/items generationの結果として破棄せず、Appがその本の失効として受ける。
+新しい常駐actor/子jobは作らず、短命workerの報告を受ける小さなApp所有のserviceに、番号と完了channelをまとめる。
+個々のcontextへpending boolを足さない。複数回のR/Lは有限の変更batchとして処理し、完了順に対象番号を進めればよい。
+古い削除完了が後着してもう一度退避することは許し、順序の巻戻し・再試行protocolを作らない。
+
+- `rotation_page_owner_changed` を共通入口にし、同じ角度への更新は既存どおり何もしない。
+  `scope.has_rotation(owner)` の非ゼロ有無を失効の代用にせず、変更keysを扱うので90°→0°も検出する。
+- mountedは `evict_thumbnail_for_reload`、AtRest/Retiringは `evict_legacy_cover_thumbnails` の走査と同じowner単位の処理を使う。
+  AutomaticのLoadedだけでなく、その本の自動要求で**Pending/Upgrade中、queue内、CPU画像待ち**も対象にする。
+  `requested.remove` が保持するCPU画像とupload_orderも除き、遅い同IDの結果は既存照合で捨てる。
+  表紙だけの変更に当たる要求はworkerの代表確認で除外する。Loadedが無いことだけで全要求を対象にしない。
+  ただし、代表ページがまだ決まっていない (leaf 未解決の) 生成中の要求は、同じ書庫の別の代表が本文の変更として
+  失効したとき、書庫単位の一致で取り消すことがある (実装レビュー r3 の P2)。これは結果が正しいままの不要な
+  再生成だけで、同じ書庫の別代表を別 context で生成中に表紙のページを回す、という組み合わせに限られる。
+  §29.2 の書庫単位の失効 (粗く単純にする判断) と同じ考えで割り切り、要求 ID と writer キーを結び付ける
+  照合は足さない (設計担当判断 2026-11-16)。
+- epoch全体をbumpしたり、thumbnail poolを再起動したりしない。兄弟contextと同contextの無関係な本・通常ページの要求は保つ。
+  色filterも既存のmain-only権限を保ち、対象の寄与だけを除去する。
+- 初回判定中の要求や削除完了までに開始された要求も、通知時の対象走査に含める。
+  通知を受けて退避した後の新要求は、削除済みのDB/memoryを使う。source jobの最後の保存がその後で割り込む場合だけは§29.7の割切りとする。
+
+### 29.5 保持一覧の判定（素材に付けたセッション番号）
+
+既存の復元入口を使い、**素材がロードされたときの番号**を復元時に比べる。
+snapshotへ保持したときの現在番号を後付けする案は採らない。古いLoadedを保存し直しただけで新しい素材になってしまうためである。
+
+最小限のruntime値の案:
+
+```rust
+// 永続化しない。既存typed sourceから得る。
+struct AutoCoverSlot { logical_book: BookCoverId, representative_page_key: String }
+enum CoverCacheStamp {
+    Untracked,
+    Tracked { slot: Arc<AutoCoverSlot>, serial: u64 },
+}
+// App内: slotごとの完了済み削除番号。未登録は0。
+```
+
+本ごとの番号を代表ページ別のslotに分けるのは、過去pin/sortの異なる行を一緒に消す場合にも、
+「その行にとって表紙だけの回転」を誤って失効させないためである。bindingだけが違い代表が同じなら同じslotを使う。
+slotの本はPDF・画像フォルダではtile自身、ZIP・変換書庫では**外側書庫**に正規化する。同じ書庫・代表ページならprefixをまたいで同じ番号を使い、未保持のZipDir行からも捕捉後の保持素材へ失効が届く。writerキーとcatalogの行の形は変えない。K2の子の番号を親へコピーしない。
+親が子のAutomaticを持っていても、その親のslotは更新しない。
+
+1. 削除完了時、削除/失効対象のslotだけ `serial += 1`。代表だけの変更で除外したslotは進めない。
+   実在行の無い初回要求でも、workerで本文変更と確認した通常の代表選択slotは対象にする。
+   全回転global revision、変更履歴、永続のdirty印にはしない。
+2. AutomaticをUIで採用するとき、その本と `CoverIdentity::Page` からslotを付け、現在の番号をstampに記録する。
+   このstampは `ThumbnailState::Loaded` のUI側の小さな付帯値とし、AutoMaterial/worker結果/catalogへは入れない。
+   NoRowの初回要求の識別に必要な論理本の事実は、既存のrequest admission/source factsへ含めるが、番号を子へ運搬しない。
+   通知前の古い素材は通知で退避され、通知後の旧request IDは採用されないので、採用直前の本文proof照合は不要。
+3. contextやsnapshotのcloneは付帯stampもそのまま保持する。番号をclone時に更新しない。
+   snapshotのsaved/list-view、Smartのprepared grid、direct-sourceも同じ規則にする。
+4. 復元先のitems/thumbnails/generation/auto_aspect等をそろえてから、`reconcile_restored_cover_thumbnails` でstampを比較する。
+   現在のslot番号と異なるAutomaticだけEvictedにし、そのidxの古いaspect寄与とCPU/要求を残さない。
+   DBを読まず、在メモリの番号だけを比較する。
+5. `rebuild_auto_aspect_samples_from_loaded` で最終Loadedに整合する。Smartでは現在の照合→auto_aspect再代入の順を逆にし、
+   saved auto_aspectの代入後に照合する。snapshot/direct-source/list-viewには照合後の再代入は無いが、最終境界のsamplesを同様に検査する。
+   古いstreak/gateは再利用せず、scroll/selection/無変更の兄弟contextを一括resetしない。
+
+この番号は受動的な保持素材の新旧判定だけに使い、worker cacheの読取照合、依存証明、保存の世代比較には使わない。
+再起動で番号はリセットする。削除が完了していればDB行は既に無いため、番号を永続化する必要は無い。
+
+### 29.6 親の代表と、受け入れた制約
+
+親への専用削除・退避・子の生成完了通知は追加しない。
+子のcatalog行を削除するとrevisionが進み、既存K2の `cached_candidate` は行無しを飛ばす。
+既存の親のselection proofも次のworker読取で古くなるので、その時点で通常の候補選びへ戻る。
+表示中の親textureを即時に選び直す保証は付けない。
+
+利用者が受け入れた挙動:
+
+- 回転した本のtileを表示する前に上のfolderを開くと、別の子の代表、または代表なしになる。
+- 子のtileを通常要求で生成し**子の行が保存された場合**、次に親を読むと既存revision照合で元の候補へ戻れる。
+  「一度表示すれば必ず保存される」とはしない。OffやAutoの非保存では行が出来ず、別の代表/代表なしが続くことも§29.0の受入れ範囲である。
+  force-saveや新しい親子間の画素転送でこの制約を隠さない。
+- 再起動をまたいでも、子の行が出来るまでこの状態は続く。元からcoldか削除済みかを識別する印を保存しない。
+
+### 29.7 まれな組合せは割り切る
+
+削除完了前の古い行の再採用と、通知時点で識別できるpending/CPU待ちは§29.4で通常の順序として塞ぐ。
+一方、最後の旧workerのDB/memory書戻し、削除失敗、削除処理中の終了などはログを残し、
+手動の範囲指定またはcache再作成で直す。再試行timer・writer停止・終了barrier・rollback・回復用の永続印は追加しない。
+処理の開始/完了と対象をログへ出し、DBの実エラーは既存の通知経路を使う。
+初回判定中の回転を丸ごと無視するのではなく、最後の保存との競合だけがこの割切りに残るようにする。
+
+### 29.8 detachedの範囲と合意の扱い
+
+対象は `viewer_context_registry.rs` の既存owner別退避、Loadedのruntime stampの保持/clone、保持一覧の復元に限る。
+viewport生成/破棄、HWND、geometry、入力述語、promote/retireの状態遷移、PDF epoch所有を変更しない。
+これは共有データの変更通知を該当ownerのcacheに反映し、古い保持素材を識別する構造的変更であり、
+windowの表示状態を推測して症状を隠す修正ではない。`detached-rework-plan.md` §2に沿う。
+
+**2026-11-16、単純な保存側失効について設計担当と独立レビュー担当が改めて合意した。**
+今回の合意は、key-only v4/v4f、削除完了後のowner別退避、UI側session stampとclone/復元、Smartのsamples代入順を対象とする。
+P案の本文proof/codec変更やK2内生成を承認したものではなく、以前のP案への合意の流用でもない。
+新しいdetached専用状態、時間窓、viewport推測を作らず、共有cache変更の事実を既存context所有境界へ届ける構造的修正として§2に適合すると判断した。
+同計画§11にもこの範囲と合意を記録する。
+
+### 29.9 触るファイルと関数（実装時）
+
+| ファイル | 範囲 |
+| --- | --- |
+| `src/app.rs` / `src/app/cover_rotation.rs` | `rotation_page_owner_changed`、typed source捕捉、削除workerの完了poll、slot番号、`evict_thumbnail_for_reload` と復元のstamp比較。 |
+| `src/app/viewer_context_registry.rs` | Legacyと同じowner別走査で対象のmemory/request/textureを退避。stampの保持とclone。兄弟/通常ページの要求はそのまま。 |
+| `src/grid_item.rs` | Loadedのruntime stamp。AutoMaterial/永続codecを変えず、snapshot等で自然にcloneする。 |
+| `src/catalog.rs` / 既存metadata worker周辺 | ヘッダ読取と厳密キーの削除batch、既存CatalogWork/admission/column互換を維持。新しいschemaや全cacheのretirementを行わない。 |
+| `src/thumb_loader.rs` / `src/app/book_cover.rs` / `src/app.rs` のkey builder周辺 | 本と代表の共通識別、削除する実在キーの厳密な照合helper、自動keyだけのv4/v4f更新。source生成/K2の選択規則/判定式/AutoMaterialは変更せず、v1互換を保つ。 |
+| `src/app/thumbnail_requests.rs` | 必要な論理本のsource factsの保持と、対象のPending/Upgrade/CPU待ちの既存remove経路への接続。新しい子requestや世代は作らない。 |
+| `src/app/snapshot_ops.rs` / `src/app/smart_folder.rs` | 保存素材のstampを保持し、復元先の全状態を代入してから照合。Smartのauto_aspectの順序を修正。 |
+| `docs/display-pipeline.md` / `docs/ui-responsiveness.md` / `docs/virtual-folders.md` | write側失効、worker限定SQL、復元順序、親の制約。新しいread proofがあるという説明は書かない。 |
+| `htdocs/mimageviewer/manual/known-issues.html` / `manual/grid.html` | 旧問題の項目を削除し、下記の受入れ制約を説明する。CHANGELOGは公開担当が扱う。 |
+
+### 29.10 テスト方針と公開文書
+
+全て合成入力と隔離DBを使う。以下は実装後の回帰条件であり、設計段階の実行結果ではない。
+
+1. **対象/key**: PDF・EPUB・ZIP/ZipDir・変換書庫・画像folder、binding両方、pin/types/generation/drive/Collection等の別名を検査。
+   任意の区切り文字を含む通常ページ、別の外側書庫/PDF/画像フォルダ、手動/NotAutomatic、K2の親自身の行は削除しない。同じ書庫の別prefixは対象にする。
+   未表示のaliasから次回起動後に古い同じ本の行を再採用しないことを検査する。
+2. **表紙除外**: 代表ページをR/Lしても行・memory・Loadedのstamp/textureを維持し、描画角度だけが変わる。
+   別代表を持つ過去pinの行は行単位で判定し、cold/初回生成中でも同じ代表選択規則を通す。
+3. **0°/本文**: 本文90°→0°でも厳密な対象行とmemoryが消え、次の通常要求で現在の保存回転を使う。
+   同角度のupdateではjob/serial更新無し。非標本の本文ページによる保守的な同じ本の失効は許す。
+4. **順序**: barrierで削除workerを止め、削除前はLoadedを保ち、完了後だけ退避する。
+   完了前に出た新request、Pending、Upgrade、CPU upload待ちも除き、旧IDの画像/Finalizedが新要求を壊さない。
+   最後のDB書戻しとの競合は復旧保証のテストを増やさず、割切りの境界をログで検査する。
+5. **context**: mounted/AtRest/Retiringの該当する本（ZIP・変換書庫はその中の全ZipDir）が退避し、兄弟の別書庫/PDF/画像フォルダ/通常ページのrequest ID・queue・pixels・generationは不変。
+   元contextを離れてから削除完了しても通知を捨てず、新しい表示先と共有memoryへ反映する。全体poolの再起動はしない。
+6. **保持一覧**: 一覧→本→本文回転→Esc、snapshot saved/list-view、Smart、direct-sourceで、古い素材のserialが保持され、
+   復元完了後に対象Loadedと旧samplesが無いことを検査。古いLoadedを新しくsnapshot保存してもserialを更新しない。
+   Smartはauto_aspect代入後に照合。無変更の復元/同じ一覧の同期再利用は再decode/兄弟失効を起こさない。
+7. **親の制約**: 子行を消した後で親を先に読むと別代表/Noneになる既存K2を固定する。
+   子の通常生成と保存後、親の次の読取でcatalog revisionにより再選択する。子を生成しない/Off非保存/正常再起動では
+   制約が残ることも期待値に書き、隠れた強制生成・force-save・親の即時退避をしないことを検査する。
+8. **互換/失敗**: キーだけv4/v4fに更新し、出荷済みv3/v3fの旧行を再採用/移行しない。K2のv1互換と全kindのcodecは不変で、v3 fallbackは無い。
+   UIのSQL read counterを増やさず、LIKE/prefix DELETEを使わない。
+   削除失敗はログ/既存通知で完了し、retry/印の永続化/保存データの再作成を起こさない。
+
+既知問題「本文のページを回転した後も、表表紙の自動切り出しの結果が前のまま残る」のh3/pを削除する。
+受入れた親の挙動は**既知の不具合として新設せず、grid.htmlの自動切り出しの説明へ制約として記載する**。
+意図的に採った選択規則だからである。公開文:
+
+> 本文のページを回転した後、本のタイルを表示する前に上のフォルダを開くと、代表が別の表紙になったり、表示されなくなったりすることがあります。
+> 本のタイルを表示してサムネイルが保存されると、その後でフォルダの一覧を読み直したときに、再びその本が代表に選ばれるようになります。
+> キャッシュポリシーが「Off」の場合や、「Auto」で保存されなかった場合は、本のタイルを表示しても、別の代表または代表なしの状態が続くことがあります。
+
+実装用語・版の説明を公開文へ出さない。CHANGELOGは公開担当が扱う。
+
+### 29.11 退けた案と理由
+
+- **P案**: 素材のcodec変更、読取の5入口での本文proof照合、採用直前の照合、親の要求内での子の作り直し、
+  PDFの世代ticketの引継ぎが必要となり、独立設計レビューでREVISEが続いた。
+  さらに失敗時のBとAへの復帰のために一時選択証拠と認証memoまで必要になった。
+  利用者が親の制約を受け入れたので、より小さい保存側失効を採る（2026-11-15）。旧詳細は `9a8a37f4e` 以前の設計履歴と§29.0に残る。
+  BodyRotationProof / ReadUnavailable / FolderSelectionEvidence / K2の子生成helper / 認証失敗LRUは今回作らない。
+  P案の素材形式としてのv4は撤回し、採用案では旧結果を避けるキーだけのv4/v4fを使う。
+- **消す前に退避して新要求を抑止する案**: 抑止/解除の状態が必要。削除完了後に既存退避を使えば足りる。
+- **保持時点で現在番号を付ける案**: 古いLoadedを保存し直すと失効を隠す。実際の採用時のstampをcloneする。
+- **全回転revision/全context clear**: 無関係な本や通常ページまで失効するため採らない。
+- **親の即時更新・非表示の子生成・強制保存**: 制約をなくす代わりに生成/完了ownerや保存policyの変更が要る。利用者の今回の決定では採らない。
+- **旧writerの停止・永続dirty・終了待ち・retry**: まれな組合せのために設けず、ログと手動の範囲指定/cache再作成で扱う。
+
+### 29.12 実装・検証の記録（2026-11-16）
+
+- 設計: §29.1のkey-only v4/v4fと、§29.8の単純な保存側失効に対する独立設計レビュー／設計担当の合意を反映した。
+- 文書: display-pipeline／ui-responsiveness／virtual-folders、detached計画§11、公開マニュアルの自動切り出しと既知問題を同じ範囲へ更新した。
+- 実装: `cover_rotation_cache.rs` に短命workerとApp所有の完了channel／slot番号、`app/cover_rotation_cache.rs` にsource捕捉と完了後退避を置いた。workerは既存catalogのヘッダだけを読み、既存builderで検証した実在キーをtransactionで厳密削除する。memoryのlock中にSQLを実行しない。新たなschema・素材codec・本文proof・K2生成は追加していない。
+- 完了は `app/logic_service.rs` で非blockingに受ける。mountedとregistryのAtRest／Retiringの該当要求・CPU待ち・画素のみを除去し、全体epochを進めない。workerは既存のrepaint contextで完了を通知する。`ThumbnailState::Loaded` のstampをcloneのまま保持し、snapshot saved／list-view、Smart、direct-sourceの復元時に照合する。復元後に設置されたmemoryも厳密なslot／source照合で除去する。
+- 回帰テスト: `cover_cache_completion_*`（通知前の画素保持、通知後の対象別退避、mounted／AtRest／Retiring、CPU待ち、旧IDの画像／Finalized拒否）、`cover_cache_snapshot_saved_and_list_view_restore_evict_old_material_and_samples`、`smart_folder_cover_cache_restore_does_not_resurrect_stale_auto_aspect`、`cover_cache_direct_reader_split_restores_stale_saved_basis_without_pixels_or_aspect_sample`。worker側の `cover_rotation_*` は厳密キー、表紙除外、PDF／EPUB／変換書庫／ZipDir／画像folder、Collectionのdrive、未表示source、初回pending、復元memoryを検査する。
+- 更新互換と親の制約: `auto_material_v4_source_rebuilds_v3_with_preexisting_saved_body_rotation` と `cover_rotation_k2_keeps_parent_until_normal_reread_and_child_save` を追加した。v3の後に本文回転済みでも追加操作なしでv4を生成し、K2は子の削除後の別代表／再起動相当のcold状態と、通常保存後の次回再選択を検査する。
+- WIP後の補修: 受付時に保持するsource factsへ採番済みrequest IDを設定した。snapshotの回帰は「子の本→固定一覧→固定解除」という既存の復元手順、名前の回帰は既存の自然順、K2の回帰は空のpin DBの実revisionを使う。v4の期待値と、将来の未知の印を含むmaster互換corpusも更新した。
+- 変換書庫の保持素材: UIで別名未解決のsource factsを先に落とさず、workerで同じ論理ソースのZIP別名を共有してから対象を絞る。複数のpin/request選択は残し、ZipDirのprefix別所有も維持する。`cover_cache_unsaved_retained_archive_uses_mounted_reader_alias_before_source_filtering` はDB・memory行なし、逆引きcache DBなしの実worker→AtRest退避を検査し、`cover_rotation_zipdir_shares_outer_source_alias_without_invalidating_sibling_prefix` は別prefix不変を検査する。新しいowner・永続状態は足していない。
+- 最終検証（`8e3dc58bd`＋作業ツリー）: `run-heavy.ps1 -Owner "773b impl"` 経由で、重いコマンドを1本ずつ実行した。nextestの `test(/cover_cache|cover_rotation|representative_cache_key|auto_material|folder_auto|folder_thumb|catalog|cover_auto|cover_crop/)` は **612成功・0失敗**（17,375除外、`--test-threads 1`、run ID `542fd1b1-b594-450f-aae5-2912b2e39188`）。初回に失敗した6件の補修確認と、未保存変換書庫の追加回帰も成功した。
+- `cargo check -p mimageviewer --bin mimageviewer-core`、`cargo run -p viewer_context_audit` は成功。`cargo test -p mimageviewer --test ui_snapshot cover_ -- --test-threads=1` は **5成功**（手動／自動範囲画面の100%／200%と環境設定の本の表紙、PNG更新なし）。`cargo fmt`（引数なし）、`python scripts/check_ui_glyphs.py`（危険な文字0件）、`git diff --check` も成功した。
+- 検証環境: 子のTEMP/TMPは作業ツリーの `target/tmp`、FFmpeg DLLは `target/debug/deps` とPATHへ配置した。sandboxでTurboJPEGのMSBuildが失敗したため、同じ `turbojpeg-sys 1.2.0`／静的CRT設定の既存ビルド成果物を `target/native` へ実ファイルでコピーし、検証用プロセスのexplicit指定だけで再利用した。製品の依存設定・Cargo.lockは変更していない。
+- 独立実装レビューは設計担当へ引き継ぐ。利用者の指定によりlib全件・確認用build・製品起動・実データ評価・commitは実行しない。
+- 独立実装レビュー修正: 削除中に受付された要求も、完了通知の実在行由来の `affected_slots` で照合し、該当request IDとCPU待ちを既存のowner別退避で除く。leafが未解決の要求は削除した厳密キーでも照合し、別の過去pinによる表紙だけの変更を巻き込まない。`cover_cache_real_row_completion_cancels_requests_admitted_during_deletion` は実workerの「affectedあり・pending空」の通知、明示leaf／未解決要求、CPU待ち／通信中、旧画像／Finalizedの遅着を検査する。
+- ZipDirの保存先の論理identityと実効の読取scopeを分離した。workerでpinを解決してから変更ページ／代表ページの所属を照合し、`A/`から`B/`への固定でも保存キーとstampは`A/`のまま失効させる。`cover_cache_zipdir_external_pin_invalidates_writer_rows_and_retained_loaded` は実App requestのprefix、保存行あり／なし、受付済み要求あり／なし、保持Loadedの復元、表紙だけ／元のprefix／兄弟の不変を検査する。codec・schema・公開文書・viewport経路は変更しない。
+- レビュー修正の検証（`c482014b6`＋作業ツリー）: `run-heavy.ps1 -Owner "773b r1"` 経由で直列実行。追加の主要2件は2成功、その後 `test(/cover_cache|cover_rotation|thumbnail_requests/) --test-threads 1` は **72成功・0失敗**（run ID `26d00105-4e1f-4e60-95d9-31c99d18cb01`）。`cover_cache_historical_pin_completion_preserves_unresolved_cover_only_request` と、affectedだけの通知に強めたAtRest／Retiringの既存テストも含む。`cargo check -p mimageviewer --bin mimageviewer-core`、`cargo fmt`（引数なし）、`git diff --check` は成功。UIの見た目・文字列・snapshotの変更はない。
+- 同じ直列検証で `cargo run -p viewer_context_audit` も成功した（exit 0）。detached記録は§11の既存項目に追記し、owner／viewportの範囲を拡張していない。
+
+- 再レビュー対応（2026-11-16）: P2-aは書庫単位の保守的失効へ簡素化し、前回のread_book・実効prefixによる所属判定と、変更ページから包含prefixだけを作る処理を削除した。writerのキーは不変、runtime slotを外側書庫＋代表ページへそろえる。`cover_rotation_archive_inventory_deletes_unheld_external_zipdir_pins_after_restart` はpin DB・対象tileのhint無しでZIP／変換書庫の外部prefix固定、両binding、区切り文字を含む名前、手動の保持と受動stampを検査する。
+- P2-bは通知を `InvalidatedRow { slot, catalog, key }` にまとめた。`cover_cache_correlated_deleted_rows_preserve_same_name_cover_only_request_in_other_catalog` は実workerの複数catalog batchで、表紙だけのAの未解決要求／CPU待ちを保ち、本文のBだけを取消す。既存ZipDirの別prefix不変テストは、今回受け入れた同書庫内の失効へ期待値を変更する。無関係な別書庫/contextは引き続き不変。
+- 再レビュー修正の検証（`1bdf4736d`＋作業ツリー）: run-heavy経由、子TEMP/TMPはtarget/tmp、build jobs 2／test threads 1で直列実行した。初回の3失敗は、明示leafのaffected-only通知の取消、slotのパス正規化、新しい書庫単位方針の期待値を補修した。最終の `test(/cover_cache|cover_rotation|thumbnail_requests/)` は **74成功・0失敗**（run ID `65380bb3-3cfb-4555-b908-994b5ec6f154`）。`cargo check -p mimageviewer --bin mimageviewer-core`、`cargo run -p viewer_context_audit`、`cargo fmt`（引数なし）、`git diff --check` も成功。UI文字列・見た目・snapshotは変更していない。マニュアルには同じ書庫内の本も判定し直すことを追記した。

@@ -200,6 +200,15 @@ mainの成功したitems置換・Quick Folder切替で退役し、遅延結果�
 
 ## EPUB → PDF 読み取り境界とオープン導線 (S2b / S2c-1)
 
+§1.761 (段階 D R4): 明示保存の worker は従来どおり PDF 公開・source guard 解放の後で設定をコピーし、
+直後に同じ worker が保存先 PDF の exact key と `root::` だけの 7 family の存在と確定回転を readonly で読む。
+`SavedPdf` はこの data-only report と caption の `StoreMutationEffects` を単発 `SaveDone` / 一括各 `Done(Saved)` へ運ぶ。
+App は単発の open / 一括の一覧 reload より前に保存先 scope を置換し、非存在・0°を削除する。
+兄弟 scope と `root/` 以下は変えず、UI は DB を読まない。読返し失敗は空集合と区別し、owner を採用せずログと既存の一部引継ぎ失敗通知へ載せる。
+最後の区間で取消・窓閉じ・dialog 置換・context park / Remote 移管により受信先を失った場合、DB は保存されるが
+メモリの反映は次回起動まで遅れる (2026-11-15 利用者判断)。送信失敗を検出した worker はその旨をログに残す。
+公開順序・取消点を変えず、App-global channel・epoch・取消待ちを足さない。既存の全体 snapshot との競合は別件。
+
 S2b は `pdf_loader` の読み取り経路を用意した。S2c-1 では、アドレスバー・起動引数・復元先に指定された
 `.epub` を PDF 系の本として開く。S3a では通常フォルダ・スマートフォルダ・サブ展開などの一覧でも
 `PdfFile` として分類し、元 EPUB パスを保つ。同じフォルダに同名 PDF がある場合は設定に従って EPUB を隠す。
@@ -243,7 +252,15 @@ S2c-2 の派生データは EPUB について `(世代 ID, 世代 PDF サイズ)
 表示用属性に保つ。タイルとページの UI 要求は worker 解決印を持ち、worker は同一 `ReadTarget` で
 cache hit 判定、PDFium 描画、保存を行う。auto-aspect の初期 seed は EPUB の元属性から
 hit させず、worker サムネイル結果で比率を集める。ピンの EPUB source ID は worker が固定世代を
-付けて確定する。内容同定は論理パスの EPUB 種別を使い、固定済みなら世代表の元サイズ・時刻・
+付けて確定する。通常フォルダ inventory の掃除と pin 更新 materialization は共通の pure helper で、
+同じ pending pin identity に対応する解決済み世代行を保持する (§1.742)。緩和するのは
+`folderthumb:` / `pdfthumb:` の直接 PDF leaf、または正規 SHA256 route hash を持つ cascade のみで、
+末尾 pending pair 直後の標準十進 i64 世代 suffix 一段に限る。ZIP entry / ZipDir の literal 名が
+suffix を模倣しても完全一致以外で保持しない。crop・policy・pin 変更や解除後は不一致となり掃除される。
+保持は読取許可ではなく、lookup は固定世代の完全一致キーと stamp を使い、旧世代へ fallback しない。
+通常再生成は別世代を消さないため存続 pin の旧世代行は残り得る。形式変更や migration は行わない。
+詳細な保持条件・容量の代償・掃除入口は [catalog 設計](catalog-design.md#epub-pin-の存続照合-1742) を参照。
+内容同定は論理パスの EPUB 種別を使い、固定済みなら世代表の元サイズ・時刻・
 ハッシュを読み、未固定なら元 EPUB を読む。非同期 backfill は分岐時の来歴を保存し、
 本ごとの固定ロック内で固定状態と元ファイル状態を再照合して台帳を書き込む。
 stage-0 検出と復元時の台帳更新も同じ境界を使う。復元候補は検出時の未固定元状態を保持し、
@@ -1119,19 +1136,27 @@ cascade は leaf の範囲を route hash に含める。範囲なしの綴りは
 基本キーの種類設定はmasterの処理を保ち、最初の`#pin:`より前の末尾の16桁hex `|types:`を1つだけ付け直す。
 自動はその区切りの直前（固定なしならキー末尾）にある完全一致トークンだけを外して付け直す。`|generation:`は区切らない。
 自動切り出しは `thumb_cover_auto_crop`（既定 OFF）と既定の綴じ方向をキーに反映する。
-基本キーの `|types:` の後、`#pin:` より前に `|autocrop:v2:rtl` / `|autocrop:v2:ltr` を付ける。
+基本キーの `|types:` の後、`#pin:` より前に `|autocrop:v4:rtl` / `|autocrop:v4:ltr` を付ける。
 手動範囲・ページ一覧・仮想フォルダの seed/writeback・ドライブ・Remote には付けない。
-フォルダの自動代表にも設定 identity を付ける。`thumb_cover_auto_crop_folders`（既定OFF）が有効ならフォルダだけ `|autocrop:v2f:{binding}` に替え、直下から選んだ画像を判定する。
-再帰先の画像とSeededピンは親が判定しない。K2は子の実効キーの完成行から素材の種類と結果をそのまま読む。v2fにはv1移行を掛けない。
-自動の素材は全体画素と4方向の範囲を持つ `AutoMaterial` ごとコピーする。K2ではv2の子の行が存在しない場合だけ同じ子のv1行を読み、
-切り済み画素の `LegacyV1` として運ぶ。同方向のv1の署名が古ければ逆方向の候補へ進む。古いキーは存続集合へ足さず、v2の行が壊れている／古い場合にv1へ戻らない。
-catalogの追加列 `auto_crops` は単一codecで素材の種類を保存し、v2キーでNULL／不正値は読み損ねとする。
+フォルダの自動代表にも設定 identity を付ける。`thumb_cover_auto_crop_folders`（既定OFF）が有効ならフォルダだけ `|autocrop:v4f:{binding}` に替え、直下から選んだ画像を判定する。
+再帰先の画像とSeededピンは親が判定しない。K2は子の実効キーの完成行から素材の種類と結果をそのまま読む。v4fにはv1互換読取を掛けない。
+自動の素材は全体画素と4方向の範囲を持つ `AutoMaterial` ごとコピーする。K2ではv4の子の行が存在しない場合だけ同じ子のv1行を読み、
+切り済み画素の `LegacyV1` として運ぶ。同方向のv1の署名が古ければ逆方向の候補へ進む。古いキーは存続集合へ足さず、v4の行が壊れている／古い場合にv1へ戻らない。
+出荷済みv3/v3fは本文回転後の古い結果が残り得るのでfallbackに使わず、移行・コピーしない。正規化はv1/v2/v2f/v3/v3fを旧印として識別する。
+v4/v4fはkey-onlyの更新であり、catalogの `auto_crops`、`AutoMaterial`、schema/codecは変更しない。現行キーでNULL／不正値は読み損ねとする。
 移行前から開いていた読み取り専用handleも、プロセス内schema世代の変化で列の有無を再検出する。
 存続集合は従来の基本・固定キー、手動範囲付きの完成キーと、現設定の自動 identity 付きのキーを含め、ピンなし ZipDir も明示して残す。
 ネストでない ZIP/変換 ZIP の近傍ページは最大8枚の先頭256KBずつで寸法だけを調べる。
 PDF/変換済み EPUB は代表描画と同じ password・`ReadTarget` lease の `PageSizes` を使い、追加の変換や問い合わせはしない。
 ネスト ZIP・直接読む RAR は先読みしない。画像フォルダは代表選択時の一覧を名前順で再利用し、同じ最大8枚・256KiBの規則で寸法を読む。
-標本の寸法は余分な読み取りをせず写真の判定にも使い、本文の同名上書きでは判定し直さない（表紙が変わるまで結果を保持する）。
+標本寸法へ既存のEXIF/WICの向きと保存回転を一度ずつ反映する。撮影情報による写真の見送りは保ち、本文の写真比率による見送りはしない。
+本文の同名上書きでは判定し直さない。本文の保存回転が変わった場合は、本自身のAutomatic（全方向見送りも含む）の実在する厳密キーとmemoryをworkerで削除する。
+PDF/EPUBの論理ページキー、変換元と読取先の区別、画像フォルダの代表選択は既存typed helperで解決する。ZIP/ZipDirの保存キーは従来のprefixを保つが、失効は同じ外側ZIP・変換元書庫の全自動代表へ広げる。未保持の別prefixへの固定も対象にし、runtime stampは外側書庫＋代表ページで共有する。
+代表自身だけの回転、手動範囲、通常ページ、別の外側書庫・PDF・画像フォルダ、K2で選ぶ親自身の行はこの削除の対象にしない。
+元親/Collection元親、現在・保持poolと既存synthetic scopeの到達可能catalogは既存保存先規則とadmissionでworkerが調べる。
+ヘッダと実在キーを検査し、`WHERE filename = ?` の削除を使う。ページ名中の `::` / `#pin:` 等をderived keyと誤認せず、LIKE/prefix削除や全cache再帰scanをしない。
+完了後のowner別退避と保持素材のセッション番号照合は[表紙計画§29](cover-crop-plan.md)に従う。本文proof、K2内の子生成、親の専用削除/退避は追加しない。
+子の削除/保存による既存catalog revisionで親は次の読取時に再選択する。子のtileを表示して保存する前は別代表/無しになり、Off/Auto非保存では表示後も続き得る。再起動後も子の保存行が出来るまでは同じ制約がある。
 
 ユーザーが「このフォルダ / ZIP / PDF / 変換済み RAR・7z・LZH の代表サムネは中の特定アイテム」を手動で指定
 できる機能。優先順位は **手動ピン > 自動代表選定 > フォルダ/ZIP/PDF/アーカイブアイコン**。
