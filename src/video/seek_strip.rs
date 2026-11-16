@@ -239,22 +239,24 @@ pub(crate) fn time_grid_interval_secs(fallback_interval_secs: f64, min_gap_secs:
     }
 }
 
-/// 格子セルの時刻。**末尾セルだけは 1 間隔ぶん手前へ寄せる。**
+/// 格子セル候補の時刻。採否は `time_grid_cell_count` が決め、`StripAxis::cell` が範囲を守る。
 ///
 /// 尺は間隔の整数倍とは限らないので、素直に `index * interval` を使うと最後のセルが
 /// 尺の端数の位置に来る。172.7 秒 / 5 秒間隔なら最後は 170.0 秒で、そこへスクラブすると
 /// **残り 2.7 秒しか無く、すぐ次の動画へ移ってしまう** (利用者報告 2026-08-27)。
-/// 末尾セルを `duration - interval` に置けば、どのセルへ移っても最低 1 間隔ぶんは見られ、
-/// セルの右端が動画の末尾と一致する。
+/// 末尾候補を `duration - interval` まで手前へ寄せ、最低 1 間隔ぶん見られる位置にする。
+/// 素材自体が 1 間隔より短い場合は 0 のままにする。
 ///
-/// 末尾以外は動かさない。`count = ceil(duration / interval)` なので
-/// `(count - 1) * interval < duration`、つまり `(count - 2) * interval < duration - interval`
-/// が常に成り立ち、**直前のセルと同時刻になることはない**。
+/// 寄せた候補が直前のセルから半間隔未満しか離れていなければ、個数の決定側で省く。
+/// 省いた後もこの min の規則を変えず、新しい末尾は追加で動かさない。その末尾から終わり
+/// までは 1 間隔以上あるため、最低 1 間隔ぶん見られる性質も維持する。
 fn time_grid_cell_secs(index: usize, interval_secs: f64, duration_secs: f64) -> f64 {
     let regular_secs = index as f64 * interval_secs;
     let last_cell_secs = (duration_secs - interval_secs).max(0.0);
     regular_secs.min(last_cell_secs)
 }
+/// 有効な格子セル数。端数の末尾候補を寄せた後の距離で採否をここだけで決める。
+/// 半間隔未満なら候補を 1 つ省き、半間隔ちょうどなら残す。唯一のセルは省かない。
 fn time_grid_cell_count(interval_secs: f64, duration_secs: f64) -> usize {
     if !interval_secs.is_finite()
         || interval_secs <= 0.0
@@ -274,6 +276,13 @@ fn time_grid_cell_count(interval_secs: f64, duration_secs: f64) -> usize {
     // 浮動小数点の丸めで比が整数をわずかに越えても、動画末尾と同時刻のセルは作らない。
     while count > 0 && (count - 1) as f64 * interval_secs >= duration_secs {
         count -= 1;
+    }
+    if count > 1 {
+        let last = time_grid_cell_secs(count - 1, interval_secs, duration_secs);
+        let previous = time_grid_cell_secs(count - 2, interval_secs, duration_secs);
+        if last - previous < interval_secs * 0.5 {
+            count -= 1;
+        }
     }
     count
 }
@@ -1621,12 +1630,12 @@ mod tests {
             fallback_interval_secs: 3.0,
             duration_secs: 10.0,
         };
-        assert_eq!(axis.cell_count(), 4);
+        assert_eq!(axis.cell_count(), 3);
         assert_eq!(axis.cell(0), Some(0.0));
-        // 末尾セルは 9.0 ではなく 10.0 - 3.0。9.0 だと残り 1 秒しか無く、そこへ移ると
-        // すぐ次の動画へ移ってしまう (利用者報告 2026-08-27)。
-        assert_eq!(axis.cell(3), Some(7.0));
-        assert_eq!(axis.cell(4), None);
+        // 9.0 の候補を 10.0 - 3.0 へ寄せる（利用者報告 2026-08-27）。さらに今回は
+        // 直前 6.0 との距離が半間隔未満なので省き、新しい末尾 6.0 は動かさない。
+        assert_eq!(axis.cell(2), Some(6.0));
+        assert_eq!(axis.cell(3), None);
 
         let exact = StripAxis::TimeGrid {
             interval_secs: 3.0,
@@ -1637,6 +1646,58 @@ mod tests {
         // 尺が間隔の整数倍なら、末尾セルはもともと 1 間隔ぶん手前にある。動かさない。
         assert_eq!(exact.cell(2), Some(6.0));
         assert_eq!(exact.cell(3), None);
+    }
+
+    #[test]
+    fn time_grid_tail_candidate_requires_at_least_half_an_interval() {
+        for (duration, interval, expected) in [
+            (60.0, 15.0, vec![0.0, 15.0, 30.0, 45.0]),
+            (60.02, 15.0, vec![0.0, 15.0, 30.0, 45.0]),
+            (68.0, 15.0, vec![0.0, 15.0, 30.0, 45.0, 53.0]),
+            (67.5, 15.0, vec![0.0, 15.0, 30.0, 45.0, 52.5]),
+            (
+                172.7,
+                5.0,
+                (0..34).map(|i| i as f64 * 5.0).chain([167.7]).collect(),
+            ),
+            (172.2, 5.0, (0..34).map(|i| i as f64 * 5.0).collect()),
+            (0.0, 15.0, vec![]),
+            (4.0, 15.0, vec![0.0]),
+        ] {
+            let axis = StripAxis::TimeGrid {
+                interval_secs: interval,
+                fallback_interval_secs: interval,
+                duration_secs: duration,
+            };
+            assert_eq!(
+                axis.cell_count(),
+                expected.len(),
+                "duration={duration} interval={interval}"
+            );
+            let actual: Vec<_> = (0..axis.cell_count())
+                .map(|i| axis.cell(i).unwrap())
+                .collect();
+            assert_eq!(actual, expected, "duration={duration} interval={interval}");
+            assert_eq!(axis.cell(actual.len()), None);
+            assert!(
+                actual
+                    .windows(2)
+                    .all(|pair| pair[1] - pair[0] >= interval * 0.5)
+            );
+            if !actual.is_empty() {
+                assert_eq!(
+                    axis.time_for_center_index(actual.len() as f64),
+                    Some(duration)
+                );
+                assert_eq!(
+                    axis.center_index_for_time(duration),
+                    Some(actual.len() as f64)
+                );
+            }
+            if duration >= interval {
+                assert!(duration - actual.last().unwrap() >= interval);
+            }
+        }
     }
 
     /// 実機で報告された形。172.7 秒 / 5 秒間隔で、末尾セルが 170.0 秒に来ていた。
@@ -1718,7 +1779,7 @@ mod tests {
         assert_close(axis.time_for_center_index(9.0), 20.0);
     }
     #[test]
-    fn time_grid_last_cell_ends_at_the_material_end() {
+    fn time_grid_retained_tail_cell_keeps_a_full_interval_to_material_end() {
         let duration_secs = 172.733_243_f64;
         let interval_secs = 5.0_f64;
         let axis = StripAxis::TimeGrid {

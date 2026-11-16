@@ -202,3 +202,55 @@ EOF時刻と停止中Abortedの追加検査もこの成功に含む。
 `git diff --check`も成功、`python scripts/check_ui_glyphs.py`は不足字形0。
 最終ソースのSHA-256は`target/785-review/source-snapshot.json`に保存した。
 build-dev・全件lib・製品バイナリ起動・コミットはいずれもこの修正では実施していない。
+
+## 場面（周辺）の時刻格子の末尾端数（2026-11-16、依頼61）
+
+対象は`afbbffe34`からの未コミット差分。サブPC担当の実機確認（依頼61）で、60.01〜60.02秒の
+TS/PSを15秒間隔で表示すると5枠目が現れ、4枠目とほぼ同じ画になったという報告を受けた。
+観測された表示順frame番号はPSが`0/435/885/1335/1335`、TSが`0/435/885/1335/1350`。
+60.000秒のMP4は4枠だった。これはサブPC担当の観測で、実装担当は製品アプリを起動していない。
+
+原因は出荷済みの格子の数え方で、`ceil(duration / interval)`により60.02/15では5枠を作り、
+末尾を`duration - interval`へ寄せると45.0秒と45.02秒が隣接した。§1.785でTS/PSは必ず格子に
+なるため目立つが、確認付きseekの着地とは別の問題。統括・設計担当の決定に従って次を変更した。
+
+- `seek_strip.rs`: 寄せた末尾候補と直前の距離が半間隔未満なら、`time_grid_cell_count`だけで1枠省く。
+  半間隔ちょうどは残す。`time_grid_cell_secs`は採用済み個数の範囲内で従来のminを使い、
+  新しい末尾を追加で動かさない。素材自体が1間隔以上あれば、末尾から終わりまで最低1間隔残る。
+  2026-08-27の「末尾ですぐ次へ進む」という報告の経緯を残し、両関数の契約・コメントを更新した。
+- 単体試験: 60.0/15と60.02/15は`0,15,30,45`、68.0/15は末尾53.0、
+  67.5/15は末尾52.5。172.7/5は35枠で末尾167.7、172.2/5は34枠で末尾165。
+  省いた後の末尾時刻を動かさないこと、範囲外cellが無いこと、末尾までの中心位置の相互変換も検査する。
+  既存10.0/3.0の試験も新しい決定に合わせ、末尾候補7.0を省いて6.0を残す期待値へ更新した。
+- `seek_strip_thumbs.rs`: 実素材9本（TS7本・PS2本）について、実Inputのdurationを使い、
+  0.5 / 1 / 2 / 5 / 15秒の5間隔で実際の軸解決を通す。隣接枠に半間隔未満の組が無いことを検査する。
+  別の窓計画試験で枠数・範囲・ID・キャッシュtimestampが同じ採用列に一致することも検査する。
+
+呼出し元と同等式の検索結果: 2関数は`StripAxis::cell_count/cell`を通して使われ、周辺窓・逆写像・
+描画側もこの軸に従う。枠IDとキャッシュtimestampは`axis.cell(index)`の時刻から作るため、
+省く枠以外の時刻・キーは変わらず、キャッシュ無効化は不要。`seek_strip_batch.rs`の枚数報告・
+検証窓も`axis.cell_count/cell`に従い、独立のceilによる数え直しは無かった。
+全体表示の`StripAxis::whole`も実際の`cell_count`で所定枚数を合わせる。`ui_video_tile.rs`のceilは
+別機能の動画タイルの個数で、末尾をduration−intervalへ寄せる経路ではないため変更しない。
+恒久仕様の説明は`video-seek-strip-plan.md`の末尾セルD29へ追補した。
+
+焦点テストは指定runner（Owner=`fix-785`）経由、通常feature / test profile、nextest default、2並列で実行した。
+
+| 対象 | コマンド（共通引数は下記） | 結果 |
+| --- | --- | --- |
+| seek_strip関係 | `cargo nextest run -p mimageviewer --lib -E 'test(/video::seek_strip/)'` | 155件成功・失敗0、6.932秒。compile 3分24秒 |
+| 前回と同じ新規試験filter | `cargo nextest run -p mimageviewer --lib -E 'test(/keyframe_seek\|mpeg_strip\|mpeg_timestamp\|remote_mpeg/)'` | 36件成功・失敗0、7.699秒。compile確認1.18秒 |
+
+共通引数: `--test-threads 2 --ignore-default-filter --run-ignored default --retries 0 --no-tests fail --no-fail-fast --failure-output immediate`。
+二つの実行には重複があり、実素材の格子試験1件を足したため後者の一致数は前回35件から36件になった。
+scriptは`target/785-grid/focused.ps1`、ログは同directoryの`seek-strip.log` / `prior-filter.log`。
+run IDはそれぞれ`88c08f2c-d522-4c29-ab84-fde49cf9ec0b`、`5318f099-d8ec-440f-ac9e-ba249f4ae09a`。
+初回は追加した窓試験で`CellRange`と標準範囲型を比較したコンパイルエラー（exit=101、実行0件）があり、
+試験側を既存の`start/end` APIに合わせて修正した。初回ログは`seek-strip-compile-error.log`。
+製品ロジックや上記境界の期待値を緩めた修正はない。
+
+成功後は関数の注釈を「候補時刻の計算と採否の所有」として整理しただけで、ロジック・試験は変更していない。
+最終`cargo fmt`（引数なし）と`cargo fmt --check`も指定runner内で成功（09:18:09、exit=0）。
+`git diff --check`は成功し、HEADは`afbbffe34`のまま。呼出し元の検索記録は
+`target/785-grid/callers-audit.txt`、最終ソースのSHA-256は`source-snapshot.json`へ保存した。
+本体lib全件・build-dev・製品バイナリ起動・コミットは実施していない。実機での修正後の表示は未確認。

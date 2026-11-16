@@ -3273,6 +3273,97 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mpeg_strip_real_time_grid_cells_keep_half_interval_spacing() {
+        ffmpeg_the_third::init().unwrap();
+        for name in [
+            "h264-small.ts",
+            "mpeg2-large.ts",
+            "hevc-open.ts",
+            "mpeg2-missing-pts.mpg",
+            "mid-gop.ts",
+            "mid-gop.mpg",
+            "long-gop.ts",
+            "pts-delayed.ts",
+            "short-key-gap.ts",
+        ] {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/mpeg-keyframe-seek")
+                .join(name);
+            let input = ffmpeg_the_third::format::input(&path).unwrap();
+            let duration = input.duration() as f64 / 1_000_000.0;
+            assert!(duration > 0.0);
+            for interval in [0.5, 1.0, 2.0, 5.0, 15.0] {
+                let ResolvedStripAxisOutcome::Ready(resolved) =
+                    resolve_strip_axis(&path, duration, interval, interval).unwrap()
+                else {
+                    panic!("{name}: MPEG strip axis must remain available");
+                };
+                let StripAxis::TimeGrid { interval_secs, .. } = &resolved.axis else {
+                    panic!("{name}: expected time grid");
+                };
+                let times: Vec<_> = (0..resolved.axis.cell_count())
+                    .map(|i| resolved.axis.cell(i).unwrap())
+                    .collect();
+                assert!(!times.is_empty());
+                for pair in times.windows(2) {
+                    assert!(
+                        pair[1] - pair[0] >= interval_secs * 0.5,
+                        "{name} interval={interval_secs} pair={pair:?}"
+                    );
+                }
+                assert_eq!(resolved.axis.cell(times.len()), None);
+                if duration >= *interval_secs {
+                    assert!(
+                        duration - times.last().unwrap() >= *interval_secs,
+                        "{name} interval={interval_secs} times={times:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn time_grid_tail_omission_keeps_window_ids_and_cache_times_consistent() {
+        for (duration, interval, expected_times) in [
+            (60.02, 15.0, vec![0.0, 15.0, 30.0, 45.0]),
+            (172.2, 5.0, (0..34).map(|i| i as f64 * 5.0).collect()),
+        ] {
+            let axis = StripAxis::TimeGrid {
+                interval_secs: interval,
+                fallback_interval_secs: interval,
+                duration_secs: duration,
+            };
+            let count = expected_times.len();
+            let work = plan_strip_window_work(
+                &axis,
+                StripWindowSpec::new(count as f64 * 0.5, count + 4, StripLookahead::default()),
+                &BTreeSet::new(),
+            );
+            assert!(work.invalid_cells.is_empty());
+            let visible = work.visible_range.unwrap();
+            assert_eq!(visible.start(), 0);
+            assert_eq!(visible.end(), count - 1);
+            let mut cells = work.cache_lookup;
+            cells.sort_by_key(|cell| cell.index);
+            assert_eq!(cells.len(), count);
+            let mut expected_ids = BTreeSet::new();
+            for (index, (cell, expected_time)) in cells.iter().zip(expected_times).enumerate() {
+                assert_eq!(cell.index, index);
+                assert_eq!(cell.target_secs, expected_time);
+                assert_eq!(cell.timestamp_ms, (expected_time * 1000.0).round() as i64);
+                let expected_id = StripCellId::from_secs(expected_time).unwrap();
+                assert_eq!(cell.id, expected_id);
+                expected_ids.insert(expected_id);
+            }
+            assert_eq!(
+                work.visible_ids.into_iter().collect::<BTreeSet<_>>(),
+                expected_ids
+            );
+            assert_eq!(work.requested_ids, expected_ids);
+        }
+    }
+
     fn timeline_test_cell(target_secs: f64, exact_keyframe: bool) -> PlannedStripCell {
         PlannedStripCell {
             index: 0,
