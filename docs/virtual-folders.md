@@ -200,6 +200,15 @@ mainの成功したitems置換・Quick Folder切替で退役し、遅延結果�
 
 ## EPUB → PDF 読み取り境界とオープン導線 (S2b / S2c-1)
 
+§1.761 (段階 D R4): 明示保存の worker は従来どおり PDF 公開・source guard 解放の後で設定をコピーし、
+直後に同じ worker が保存先 PDF の exact key と `root::` だけの 7 family の存在と確定回転を readonly で読む。
+`SavedPdf` はこの data-only report と caption の `StoreMutationEffects` を単発 `SaveDone` / 一括各 `Done(Saved)` へ運ぶ。
+App は単発の open / 一括の一覧 reload より前に保存先 scope を置換し、非存在・0°を削除する。
+兄弟 scope と `root/` 以下は変えず、UI は DB を読まない。読返し失敗は空集合と区別し、owner を採用せずログと既存の一部引継ぎ失敗通知へ載せる。
+最後の区間で取消・窓閉じ・dialog 置換・context park / Remote 移管により受信先を失った場合、DB は保存されるが
+メモリの反映は次回起動まで遅れる (2026-11-15 利用者判断)。送信失敗を検出した worker はその旨をログに残す。
+公開順序・取消点を変えず、App-global channel・epoch・取消待ちを足さない。既存の全体 snapshot との競合は別件。
+
 S2b は `pdf_loader` の読み取り経路を用意した。S2c-1 では、アドレスバー・起動引数・復元先に指定された
 `.epub` を PDF 系の本として開く。S3a では通常フォルダ・スマートフォルダ・サブ展開などの一覧でも
 `PdfFile` として分類し、元 EPUB パスを保つ。同じフォルダに同名 PDF がある場合は設定に従って EPUB を隠す。
@@ -243,7 +252,15 @@ S2c-2 の派生データは EPUB について `(世代 ID, 世代 PDF サイズ)
 表示用属性に保つ。タイルとページの UI 要求は worker 解決印を持ち、worker は同一 `ReadTarget` で
 cache hit 判定、PDFium 描画、保存を行う。auto-aspect の初期 seed は EPUB の元属性から
 hit させず、worker サムネイル結果で比率を集める。ピンの EPUB source ID は worker が固定世代を
-付けて確定する。内容同定は論理パスの EPUB 種別を使い、固定済みなら世代表の元サイズ・時刻・
+付けて確定する。通常フォルダ inventory の掃除と pin 更新 materialization は共通の pure helper で、
+同じ pending pin identity に対応する解決済み世代行を保持する (§1.742)。緩和するのは
+`folderthumb:` / `pdfthumb:` の直接 PDF leaf、または正規 SHA256 route hash を持つ cascade のみで、
+末尾 pending pair 直後の標準十進 i64 世代 suffix 一段に限る。ZIP entry / ZipDir の literal 名が
+suffix を模倣しても完全一致以外で保持しない。crop・policy・pin 変更や解除後は不一致となり掃除される。
+保持は読取許可ではなく、lookup は固定世代の完全一致キーと stamp を使い、旧世代へ fallback しない。
+通常再生成は別世代を消さないため存続 pin の旧世代行は残り得る。形式変更や migration は行わない。
+詳細な保持条件・容量の代償・掃除入口は [catalog 設計](catalog-design.md#epub-pin-の存続照合-1742) を参照。
+内容同定は論理パスの EPUB 種別を使い、固定済みなら世代表の元サイズ・時刻・
 ハッシュを読み、未固定なら元 EPUB を読む。非同期 backfill は分岐時の来歴を保存し、
 本ごとの固定ロック内で固定状態と元ファイル状態を再照合して台帳を書き込む。
 stage-0 検出と復元時の台帳更新も同じ境界を使う。復元候補は検出時の未固定元状態を保持し、

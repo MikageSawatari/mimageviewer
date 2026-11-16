@@ -3,6 +3,9 @@ use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, Pre
 use super::*;
 use crate::ui_dialogs::context_menu::DeleteTarget;
 
+mod repro742;
+mod section1768;
+
 pub(crate) fn assert_cache_book_cover_only_worker_catalog_contract(
     app: &mut App,
     directory: &Path,
@@ -3949,7 +3952,12 @@ fn epub_batch_completion_refreshes_grid_and_applies_same_name_pdf_priority() {
     app.epub_batch_convert = Some(
         crate::ui_dialogs::epub_batch_convert::EpubBatchPending::completed_for_test(
             epub.clone(),
-            crate::ui_dialogs::epub_batch_convert::EpubBatchResult::Saved(pdf.clone(), vec![]),
+            Ok(crate::epub_convert::SavedPdf {
+                path: pdf.clone(),
+                reused_cache: false,
+                user_data_errors: vec![],
+                metadata: Default::default(),
+            }),
         ),
     );
     app.poll_epub_batch_convert();
@@ -8417,7 +8425,7 @@ fn epub_batch_modal_blocks_grid_keyboard_and_click_open() {
     app.epub_batch_convert = Some(
         crate::ui_dialogs::epub_batch_convert::EpubBatchPending::completed_for_test(
             PathBuf::from("book.epub"),
-            crate::ui_dialogs::epub_batch_convert::EpubBatchResult::Skipped,
+            Err(crate::epub_convert::EpubConvertError::ExistingPdf),
         ),
     );
     let ctx = egui::Context::default();
@@ -23384,6 +23392,7 @@ mod phase_c_folder_nav_history_tests {
                 path: pdf.clone(),
                 reused_cache: false,
                 user_data_errors: Vec::new(),
+                metadata: Default::default(),
             },
             old_state.surface_generation,
             old_state.smart_transition_sequence,

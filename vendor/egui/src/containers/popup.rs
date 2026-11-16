@@ -744,6 +744,16 @@ impl Popup<'_> {
         ctx.memory(|mem| mem.any_popup_open())
     }
 
+    /// The popup actually retained in memory for the specified viewport.
+    ///
+    /// Unlike `is_any_open`, this returns no synthetic owner in the
+    /// `everything_is_visible` test mode. This only observes the retained ID;
+    /// it neither opens a popup nor inspects the pass-local drawn-popup registry.
+    /// Callers choose when to capture this live memory state.
+    pub fn current_open_id_for(ctx: &Context, viewport_id: crate::ViewportId) -> Option<Id> {
+        ctx.memory(|mem| mem.retained_popup_id_for(viewport_id))
+    }
+
     /// Open the given popup and close all others.
     pub fn open_id(ctx: &Context, popup_id: Id) {
         ctx.memory_mut(|mem| mem.open_popup(popup_id));

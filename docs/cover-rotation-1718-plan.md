@@ -85,13 +85,14 @@ pub(crate) enum CoverIdentity {
   フォルダ削除時の retain / `edit_bundle_bulk`。snapshot を作る worker は DB から角度も読む。
 - 画像フォルダ→ZIP 変換は、完了時に既に `page_state=true` の metadata refresh で全体 snapshot を読み直して owner を置き換えている
   (`image_folder_zip_operation.rs` → `metadata_import_refresh.rs`)。この snapshot が角度を持つようにするだけで足りる。
-- **EPUB→PDF 変換は今回の範囲から外す** (既知の制限、[バックログ §1.761](next-release-backlog.md))。`epub_convert.rs` の
-  `copy_restore_stores_without_identity_at` (単発・一括) は回転を PDF のキーへ DB だけでコピーし、今の `rotation_page_keys` も更新しない。
-  これは変換機能に元からある不足で、今回の修正で悪化しない (変換後の PDF の本のタイルが回転しないのは今と同じ。次回起動で直る)。
-  - 外す理由: 正しく直すには、変換 worker の DB コピーと、利用者の回転操作・snapshot の置き換えなど owner の全ての更新の間に
-    順序を付ける仕組みが要る (ダイアログが置き換わっても worker はコピーを続けるため、ダイアログの寿命では順序を守れない。
-    2026-11-10 の設計レビュー 3 回目)。§1.718 の本体 (表紙の identity と描画時の角度) とは独立した、変換機能側の構造の問題。
-  - 他の書き手は、画面の操作か全体 snapshot の置き換えで owner を更新しており、この問題は無い。
+- **EPUB→PDF 明示保存は §1.761 の段階 D R4 で通常の成功経路を接続する** (2026-11-15 利用者判断)。
+  `copy_restore_stores_without_identity_at` の直後に同じ worker が保存先 exact / `root::` の 7 family の存在と
+  確定角度を readonly で読み返し、caption 完了印とともに `SavedPdf` へ載せる。単発 `SaveDone` / 一括各
+  `Done(Saved)` を受けた App が open / reload より前に scope を置換する。角度 0・非存在は削除、
+  兄弟 scope と `root/` 以下は保持。失敗した読返しは owner を変えずログと既存の一部引継ぎ失敗通知へ載せる。
+  公開→guard 解放→コピーの順序と取消点は従来どおり。最後の区間で受信先が消えた場合は DB が正しくても
+  RAM 反映が次回起動まで遅れることを利用者判断で受け入れ、送信失敗を検出できた worker でログを残す。
+  R1〜R3 の App-global channel / epoch / 公開前採用は撤回。既存の全体 snapshot との競合は別件として残す。
 - 回転の実変更を通知する helper を 1 つにまとめる (owner の更新 + 説明文の失効 + §5.2 の旧行タイルの再要求)。
   snapshot の読み直しで値が変わらなかったキーについては失効を出さない。
 
@@ -106,9 +107,9 @@ pub(crate) enum CoverIdentity {
 - 呼び出し元 (全描画入口): 一覧の 2 か所 (`ui_main.rs` の grid 描画)、`repaint_grid_cell_after_input`、詳細表示の hover サムネ
   (`painter.image` を直接呼ぶ箇所)。hit-area / overlay の計算が回転後の寸法を使う箇所があれば、描画と同じ値を使う。
 - **詳細表示の hover は、ページ item も含めて owner だけを引く** (メモリのみ)。`get_rotation` は cache miss で同期 SELECT をするので
-  hover から呼ばない。owner は、§1.761 (EPUB→PDF 変換でコピーした PDF のキー) を除く全非 0 回転を持つので、キーが無ければ
-  0° として描く。§1.761 の PDF のキーは次回起動 (または全体 snapshot の読み直し) まで owner に無く、その間は本のタイル・hover・
-  旧行の作り直しの判定が回転なしとして扱う (ページ一覧のタイルは `get_rotation` の DB 読みで回る)。hover の表示枠と配置の寸法も
+  hover から呼ばない。owner は全非 0 回転を持ち、キーが無ければ 0° として描く。§1.761 の保存先 PDF は通常の成功通知の
+  採用時に owner へ入る。最後の区間で通知の受信先が失われた場合だけ、次回起動 (または全体 snapshot の読直し) まで遅れる
+  (§4.1 の利用者判断)。hover の表示枠と配置の寸法も
   90°/270° で縦横を入れ替える (最後の mesh だけでなく)。ページ item の hover が回るようになるのは今回の修正に含める
   (一覧と hover の向きを揃える)。
 - 新しく足す描画経路は DB を引かない。

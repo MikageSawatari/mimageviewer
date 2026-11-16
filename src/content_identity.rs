@@ -20,7 +20,8 @@ mod restore;
 
 pub(crate) use restore::{
     ContentRestoreReport, DeclinedRestore, InternalByteCopyDeclineRecorder, RestorePresence,
-    RestoreSidecarMirror, SelectedRestore, restore_candidates_at_with_progress,
+    RestoreSidecarMirror, SelectedRestore, load_container_restore_presence,
+    restore_candidates_at_with_progress,
 };
 
 const HEAD_HASH_BYTES: u64 = 64 * 1024;

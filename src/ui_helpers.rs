@@ -1592,6 +1592,13 @@ pub(crate) fn singleline_text_edit_context_menu(
     let state = output.state.clone();
     let char_count = text.chars().count();
     let target_id = id.with("miv_singleline_context_menu_target");
+    // Use the same pre-input owner as the parent, even if another widget changed
+    // Memory before this field drew. A fresh menu cannot inherit another menu's Esc.
+    let retained_menu = crate::keyboard_input::popup_owned_escape_at_pass_start(
+        &output.response.ctx,
+        egui::Popup::default_response_id(&output.response),
+    );
+    let escape = crate::keyboard_input::popup_escape_pressed(&output.response.ctx);
     // Popup::context_menu uses secondary_clicked() to open/reopen this popup,
     // including when it is already open at another pointer position.
     if !output.response.context_menu_opened() || output.response.secondary_clicked() {
@@ -1602,7 +1609,10 @@ pub(crate) fn singleline_text_edit_context_menu(
     }
 
     let mut changed = false;
-    output.response.context_menu(|ui| {
+    let shown = output.response.context_menu(|ui| {
+        if escape {
+            ui.close();
+        }
         // Popup::show applies its open command before calling this closure.
         // Capture only here: context_menu_opened() before show still reports
         // the previous memory state on the opening pass.
@@ -1690,6 +1700,10 @@ pub(crate) fn singleline_text_edit_context_menu(
             ui.close();
         }
     });
+
+    if retained_menu && escape && shown.is_some() && !output.response.context_menu_opened() {
+        crate::keyboard_input::claim_popup_escape(&output.response.ctx);
+    }
 
     // Includes item actions, Escape and outside clicks handled by Popup::show.
     // If the field disappeared, egui retires the abandoned popup; the next
