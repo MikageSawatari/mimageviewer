@@ -19,6 +19,10 @@ mod project_file;
 mod resource_blobs;
 mod startup;
 
+#[cfg(test)]
+#[path = "../../../tests/support/gpu_test_group.rs"]
+mod test_gpu_group;
+
 /// 開発用 bin の入口。診断の本体とテストは共通ホストに置く。
 pub fn run_dev() {
     let mut args = std::env::args().skip(1);
@@ -162,6 +166,8 @@ fn run_preview_benchmark(frames: usize) -> Result<(), String> {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
         ..Default::default()
     };
+    #[cfg(test)]
+    crate::test_gpu_group::assert_gpu_test_group();
     eframe::run_native(
         "mIV 音楽ビデオ ラボ — プレビュー計測",
         options,
@@ -246,6 +252,8 @@ fn run_gui() -> eframe::Result {
         viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 820.0]),
         ..Default::default()
     };
+    #[cfg(test)]
+    crate::test_gpu_group::assert_gpu_test_group();
     let result = eframe::run_native(
         "mIV 音楽ビデオ ラボ",
         options,

@@ -391,6 +391,8 @@ impl<'app> WgpuWinitApp<'app> {
 
         {
             profiling::scope!("set_window");
+            #[cfg(test)]
+            crate::test_gpu_group::assert_gpu_test_group();
             pollster::block_on(painter.set_window(ViewportId::ROOT, Some(Arc::clone(&window))))?;
         }
 
@@ -860,6 +862,8 @@ impl WgpuWinitRunning<'_> {
 
             {
                 profiling::scope!("set_window");
+                #[cfg(test)]
+                crate::test_gpu_group::assert_gpu_test_group();
                 pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(window))))?;
             }
 
@@ -1481,6 +1485,8 @@ impl Viewport {
 
                 let window = Arc::new(window);
 
+                #[cfg(test)]
+                crate::test_gpu_group::assert_gpu_test_group();
                 if let Err(err) =
                     pollster::block_on(painter.set_window(viewport_id, Some(Arc::clone(&window))))
                 {
@@ -1795,6 +1801,8 @@ impl super::frame_output::ImmediateViewportBackend for NativeWgpuImmediateBacken
         let started = Instant::now();
         {
             profiling::scope!("set_window");
+            #[cfg(test)]
+            crate::test_gpu_group::assert_gpu_test_group();
             if let Err(err) =
                 pollster::block_on(painter.set_window(ids.this, Some(Arc::clone(window))))
             {

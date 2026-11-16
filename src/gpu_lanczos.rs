@@ -3151,6 +3151,8 @@ struct Lanczos3Resampler {
 
 impl Lanczos3Resampler {
     fn new(device: &wgpu::Device) -> Self {
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: None,
             entries: &[

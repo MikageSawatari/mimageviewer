@@ -7,10 +7,23 @@ use std::ffi::OsStr;
 
 #[track_caller]
 pub(crate) fn assert_gpu_test_group() {
-    assert_membership(
-        std::env::var_os("NEXTEST").as_deref(),
-        std::env::var_os("NEXTEST_TEST_GROUP").as_deref(),
-    );
+    let caller = std::panic::Location::caller();
+    let result = std::panic::catch_unwind(|| {
+        assert_membership(
+            std::env::var_os("NEXTEST").as_deref(),
+            std::env::var_os("NEXTEST_TEST_GROUP").as_deref(),
+        );
+    });
+    if let Err(panic) = result {
+        // Worker panics may be caught or their JoinHandle discarded. Fail the
+        // test process itself so a background GPU creation cannot escape this
+        // gate. This module is only included by test targets / cfg(test).
+        if let Some(message) = panic.downcast_ref::<String>() {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr().lock(), "{message}\nGPU entry: {caller}");
+        }
+        std::process::exit(101);
+    }
 }
 
 #[track_caller]

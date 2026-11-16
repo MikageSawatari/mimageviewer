@@ -1200,6 +1200,8 @@ pub(super) fn measure_video_anime4k_on_adapter(
     let mut base_device = None;
     let mut context = None;
     let mut feature_level = D3D_FEATURE_LEVEL::default();
+    #[cfg(test)]
+    crate::test_gpu_group::assert_gpu_test_group();
     unsafe {
         D3D11CreateDevice(
             adapter,

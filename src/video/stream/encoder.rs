@@ -548,6 +548,10 @@ fn open_ffmpeg_encoder(
         }
         H264EncoderKind::MediaFoundation => {}
     }
+    #[cfg(test)]
+    if encoder != H264EncoderKind::OpenH264 {
+        crate::test_gpu_group::assert_gpu_test_group();
+    }
     context.open_as_with(codec, options)
 }
 

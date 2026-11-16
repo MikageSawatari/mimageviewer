@@ -238,6 +238,8 @@ pub unsafe fn create_ffmpeg_hw_device_ctx(
     }
 
     // 2. 確定。失敗時は buf を release。
+    #[cfg(test)]
+    crate::test_gpu_group::assert_gpu_test_group();
     let ret = unsafe { av_hwdevice_ctx_init(buf) };
     if ret < 0 {
         let mut buf_to_free = buf;
@@ -476,6 +478,8 @@ impl HwFramesPool {
             drop(stale);
         }
 
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         let ret = unsafe { av_hwframe_ctx_init(params_ref) };
         if ret < 0 {
             unsafe { av_buffer_unref(&mut params_ref) };

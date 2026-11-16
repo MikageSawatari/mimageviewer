@@ -1980,6 +1980,8 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     let diagnostic_checkpoint = session.diagnostics.publisher();
     let mut depth_export_owner = depth_export::DepthExportProcessOwner::default();
     let depth_export_workers = depth_export_owner.client();
+    #[cfg(test)]
+    crate::test_gpu_group::assert_gpu_test_group();
     let run_result = eframe::run_native(
         "mimageviewer",
         options,

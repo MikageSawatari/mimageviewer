@@ -305,6 +305,8 @@ impl RenderState {
                     |adapter: wgpu::Adapter| {
                         let descriptor = (*device_descriptor)(&adapter);
                         async move {
+                            #[cfg(test)]
+                            crate::test_gpu_group::assert_gpu_test_group();
                             profiling::scope!("request_device");
                             adapter.request_device(&descriptor).await
                         }

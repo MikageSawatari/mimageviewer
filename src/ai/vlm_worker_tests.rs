@@ -23,11 +23,16 @@ fn worker_resolution_precedence_covers_debug_release_and_both_flavors_without_io
     }
 }
 
-fn fake_worker() -> &'static Path {
+static FAKE_WORKER_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+
+pub(super) fn is_fake_worker(path: &Path) -> bool {
+    FAKE_WORKER_FIXTURE.get().is_some_and(|fake| fake == path)
+}
+
+pub(super) fn fake_worker() -> &'static Path {
     use sha2::{Digest as _, Sha256};
 
-    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
-    FIXTURE.get_or_init(|| {
+    FAKE_WORKER_FIXTURE.get_or_init(|| {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
         let source = manifest.join("tests/support/vlm_fake_worker.rs");
         // include_bytes also makes Cargo rebuild the tests when the peer changes.

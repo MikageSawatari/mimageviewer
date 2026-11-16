@@ -93,6 +93,8 @@ impl OverlayGpuService {
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let loss_latch = Arc::new(DeviceLossLatch::new(generation));
         let device_t0 = Instant::now();
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("mIV native egui overlay"),
             ..Default::default()

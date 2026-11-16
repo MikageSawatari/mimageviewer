@@ -931,6 +931,8 @@ impl RenderBackend {
         let mut context = None;
         let mut feature_level = D3D_FEATURE_LEVEL::default();
         let feature_levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         unsafe {
             D3D11CreateDevice(
                 None,
@@ -1019,6 +1021,8 @@ impl RenderBackend {
                 error,
             )
         })?;
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         let dcomp: IDCompositionDevice = unsafe { DCompositionCreateDevice(&dxgi_device) }
             .map_err(|error| {
                 HarnessFailure::backend(
