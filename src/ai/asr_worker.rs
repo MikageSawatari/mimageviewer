@@ -144,6 +144,8 @@ enum ClientState {
     Loaded,
 }
 pub struct AsrWorkerClient {
+    #[cfg(test)]
+    test_fake_worker: bool,
     owner: Option<Arc<ProcessOwner>>,
     stdin: Option<std::fs::File>,
     replies: Option<mpsc::Receiver<Result<Frame, WorkerError>>>,
@@ -190,6 +192,8 @@ impl AsrWorkerClient {
                 }
             })?;
         Ok(Self {
+            #[cfg(test)]
+            test_fake_worker: super::vlm_worker::tests::is_fake_worker(executable),
             owner: Some(owner),
             stdin: Some(stdin),
             replies: Some(replies),
@@ -271,6 +275,10 @@ impl AsrWorkerClient {
                 .as_ref()
                 .unwrap()
                 .fail(AsrError::Protocol("invalid GPU LUID".into()));
+        }
+        #[cfg(test)]
+        if !self.test_fake_worker {
+            crate::test_gpu_group::assert_gpu_test_group();
         }
         let header = self.exchange(
             json!({"type":"load", "model_path":request.model_path,
