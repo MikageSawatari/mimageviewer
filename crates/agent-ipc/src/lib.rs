@@ -1,4 +1,21 @@
 //! Private, versioned wire contract between the core and the stdio MCP adapter.
+//!
+//! Compatibility contract (docs/next-release-backlog.md §1.789):
+//! - Wire changes are additive: new commands, payloads only for new commands,
+//!   and fields. Preserve existing field names, types, and meanings. Defaults
+//!   let the core read omitted request fields; old adapters ignore unknown
+//!   response fields (response-only additions do not require defaults).
+//! - Never add variants to enums an old adapter can receive, including errors
+//!   and row kinds, without translating them for its negotiated version.
+//! - Preserve old adapters' frame, image, row, and page budgets on their responses.
+//! - Adapters deserialize typed IPC and build structuredContent from their own
+//!   types, discarding unknown response fields instead of forwarding raw JSON.
+//! - Keep the handshake independent of business types: 4-byte LE length, UTF-8
+//!   JSON, MAX_FRAME_BYTES cap, request
+//!   {"id":…,"command":{"type":"hello","version":N,…}}, response
+//!   {"id":…,"result":{"Ok":{"type":"hello","data":{"version":N}}}}.
+//! - Freeze shipped adapter types/frames and verify decoding, structuredContent,
+//!   and output budgets. Raise MIN only as a planned, documented design change.
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
@@ -12,6 +29,10 @@ mod folder_types;
 pub use folder_types::*;
 
 pub const AGENT_PROTOCOL_VERSION: u32 = 4;
+pub const MIN_ADAPTER_PROTOCOL_VERSION: u32 = 3;
+/// Fixed pipe namespace identifier, unrelated to business IPC versions. Never change it.
+pub const AGENT_PIPE_NAMESPACE: &str = "mimageviewer-agent-v3";
+pub const VERSION_MISMATCH_MESSAGE: &str = "mIV と AI 連携の版が違います。mIV を終了して起動し直し、AI アプリを再起動 (Claude Code は MCP の再接続) してください。直らない時は、AI アプリを終了してから mIV のファイルを置き換え直してください";
 pub const MAX_CLIENT_NAME_CHARS: usize = 128;
 pub const MAX_CLIENT_VERSION_CHARS: usize = 64;
 
@@ -412,16 +433,22 @@ impl std::fmt::Display for AgentError {
 }
 impl std::error::Error for AgentError {}
 
-/// The private core/adapter protocol has exact equality, independent of MCP versions.
+/// The adapter accepts only its own version echoed by the core, independently of MCP.
 pub fn check_version(version: u32) -> Result<(), AgentError> {
     if version == AGENT_PROTOCOL_VERSION {
         Ok(())
     } else {
-        Err(AgentError::new(
-            ErrorCode::VersionMismatch,
-            "mIV と AI 連携の版が違います。設定の案内に従って登録し直してください",
-        ))
+        Err(version_mismatch())
     }
+}
+
+/// Core compatibility is deliberately one-way: older adapters, never newer ones.
+pub fn supports_adapter_version(version: u32) -> bool {
+    (MIN_ADAPTER_PROTOCOL_VERSION..=AGENT_PROTOCOL_VERSION).contains(&version)
+}
+
+pub fn version_mismatch() -> AgentError {
+    AgentError::new(ErrorCode::VersionMismatch, VERSION_MISMATCH_MESSAGE)
 }
 
 /// A clean EOF returns None; partial headers and bodies are errors. Validate before allocation.
@@ -503,7 +530,7 @@ pub fn derive_pipe_name(resolved_absolute_data_dir: &Path, user_sid: &str) -> io
     let digest = Sha256::digest(normalized.as_bytes());
     let hash: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
     Ok(format!(
-        r"\\.\pipe\mimageviewer-agent-v{AGENT_PROTOCOL_VERSION}-{user_sid}-{hash}"
+        r"\\.\pipe\{AGENT_PIPE_NAMESPACE}-{user_sid}-{hash}"
     ))
 }
 
@@ -566,10 +593,7 @@ mod tests {
             } else {
                 let error = check_version(version).unwrap_err();
                 assert_eq!(error.code, ErrorCode::VersionMismatch);
-                assert_eq!(
-                    error.message,
-                    "mIV と AI 連携の版が違います。設定の案内に従って登録し直してください"
-                );
+                assert_eq!(error.message, VERSION_MISMATCH_MESSAGE);
             }
         }
     }
@@ -613,9 +637,7 @@ mod tests {
     fn namespace_is_normalized_and_isolated() {
         let sid = "S-1-5-21-123";
         let base = derive_pipe_name(Path::new(r"C:\Users\Test\data"), sid).unwrap();
-        assert!(base.starts_with(&format!(
-            r"\\.\pipe\mimageviewer-agent-v{AGENT_PROTOCOL_VERSION}-"
-        )));
+        assert!(base.starts_with(r"\\.\pipe\mimageviewer-agent-v3-"));
         assert_eq!(
             base,
             derive_pipe_name(Path::new("c:/users/test/data/"), sid).unwrap()
