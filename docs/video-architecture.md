@@ -1,5 +1,26 @@
 # 動画再生サブシステム アーキテクチャ
 
+## 独立メディアから静止画への表示ホスト交換 (§1.767)
+
+フル機能 + `effective_media_in_media_window()` の独立 Video / Audio から静止画へ進む採用境界で、
+`exchange_independent_media_window_for_still` が同じ context のホスト A を B に交換する。
+旧 player・音声モード・VST 表示・音楽表示と native presentation request/effects は旧メディアの寿命で終端し、
+静止画の cache、一覧、順序、context は保持する。旧 native output の drop 後に request owner を終端するため、
+旧チャネルの完了を待たない。request id は単調増加を維持し、遅着を次の要求へ採用しない。
+placement と F11 の target / restore を旧ホストの Closing 前に捕捉し、B の最初の builder から適用する。
+通常の連動窓、一覧からの open、複数ウィンドウモードの種類変更、独立静止画からメディアへの拒否は維持する。
+
+受理済み Manual が ParkedLive 後に届いた場合、静止画への窓交換を要する結果は採用前にログ付きで捨てる。
+通常 resolver / Collection の request owner は共通の active 判定を通す。同種メディアは従来どおり背景で採用する。
+背景メディアの通常 landing / native swap 不成立時は旧 Audio EOF と共通の context 内採用部品へ渡し、
+active session を公開しない。旧 output の drop は同 context の request を終端し、成功 swap の output は保持する。
+破棄後に残る同 host の native request の完了も、context 内の確定と active session / front / DSP の公開を分ける。
+
+独立性は binding の予約・公開で初期確定し、同じ binding の open は継承する。F12 の明示切替では
+presentation と独立性を一緒に確定する。native の遅延切替は既存 `PresentationRequest` に解決済み独立性を保持し、
+同 host の rect 同期は現在値を継承する。F12 が現在の表示先へ戻る要求は native reducer が確定を省略できるため、
+採用後に独立性だけを同期確定する。詳細と検証は [3D 写真設計 §6.4.5・§17.18](depth-parallax-plan.md)。
+
 2026-11-04 受入 F: 再生位置は音声・動画とも従来の共通保存規則を使うが、続きの画像は
 プレイヤーの`VideoInfo.has_video`が確定している場合だけ要求する。通常flushとcontext終了時の
 退避保存を両方対象にし、後者は既存`MediaResumeUpdate`へプレイヤー生存中の映像能力を

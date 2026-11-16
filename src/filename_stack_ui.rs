@@ -2611,6 +2611,7 @@ mod tests {
             let cancel = Arc::clone(&handle.cancel);
             app.pdf_enumerate_pending.as_mut().expect("cold PDF open").2 = handle;
             app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,

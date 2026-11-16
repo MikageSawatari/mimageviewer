@@ -1,20 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use super::ActionSurface;
-#[cfg(not(test))]
-use super::App;
 #[cfg(windows)]
 use super::DetachedRightDragViewerIdentity;
 #[cfg(windows)]
 use crate::ring_shortcut::RightDragCommand;
-
-#[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum DetachedWindowHwndDiff {
-    Created(u64),
-    NoChange,
-    Ambiguous(Vec<u64>),
-}
 
 #[cfg(windows)]
 #[allow(dead_code)]
@@ -175,6 +165,7 @@ impl From<IdentifiedRightDragCommand> for DetachedWindowCommand {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum DetachedActivationIntent {
     ActivateOnly,
+    Discrete(super::detached_activation::DetachedActivationRequest),
     RightDrag(PendingRightDragCommand),
     PageOverview(PendingPageOverviewCommand),
 }
@@ -184,376 +175,7 @@ pub(crate) enum DetachedActivationIntent {
 pub(crate) struct DetachedActivationDispatch {
     pub(crate) window_id: u64,
     pub(crate) command: Option<DetachedWindowCommand>,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DetachedActivationCloseHitTest {
-    ImageBar,
-    MusicChrome,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetachedActivationWatchTarget {
-    pub(crate) window_id: u64,
-    pub(crate) hwnd: u64,
-    pub(crate) eligible: bool,
-    pub(crate) close_hit_test: DetachedActivationCloseHitTest,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetachedActivationWatchTargetRect {
-    pub(crate) window_id: u64,
-    pub(crate) hwnd: u64,
-    pub(crate) eligible: bool,
-    pub(crate) close_hit_test: DetachedActivationCloseHitTest,
-    pub(crate) left: i32,
-    pub(crate) top: i32,
-    pub(crate) right: i32,
-    pub(crate) bottom: i32,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DetachedActivationWatchSample {
-    pub(crate) left_button_down: bool,
-    pub(crate) foreground_hwnd: u64,
-    pub(crate) cursor_root_hwnd: u64,
-    pub(crate) native_close_hit_hwnd: u64,
-    pub(crate) cursor_pos: Option<(i32, i32)>,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DetachedActivationClickIntent {
-    Activate,
-    Close,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetachedActivationClickCandidate {
-    pub(crate) window_id: u64,
-    pub(crate) hwnd: u64,
-    pub(crate) repair_hwnd: Option<u64>,
-    pub(crate) start_screen_pos: Option<(i32, i32)>,
-    pub(crate) drag_sensitive: bool,
-    pub(crate) intent: DetachedActivationClickIntent,
-    pub(crate) moved_too_far: bool,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DetachedActivationWatchState {
-    pub(crate) left_button_was_down: bool,
-    pub(crate) active_click: Option<DetachedActivationClickCandidate>,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetachedActivationWatchDiagnostic {
-    pub(crate) reason: &'static str,
-    pub(crate) foreground_hwnd: u64,
-    pub(crate) cursor_root_hwnd: u64,
-    pub(crate) cursor_pos: Option<(i32, i32)>,
-    pub(crate) target_window_id: Option<u64>,
-    pub(crate) target_hwnd: Option<u64>,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetachedActivationRequest {
-    pub(crate) window_id: u64,
-    pub(crate) repair_hwnd: Option<u64>,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DetachedCloseRequest {
-    pub(crate) window_id: u64,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct DetachedActivationWatchStepResult {
-    pub(crate) activation: Option<DetachedActivationRequest>,
-    pub(crate) close: Option<DetachedCloseRequest>,
-    pub(crate) diagnostic: Option<DetachedActivationWatchDiagnostic>,
-}
-
-#[cfg(all(windows, not(test)))]
-struct DetachedActivationWatchCommand {
-    targets: Vec<DetachedActivationWatchTarget>,
-    main_hwnd: u64,
-    claimed_hwnds: Vec<u64>,
-    repaint_ctx: egui::Context,
-}
-
-#[cfg(windows)]
-pub(crate) struct DetachedActivationWatcher {
-    #[cfg(not(test))]
-    command_tx: std::sync::mpsc::Sender<DetachedActivationWatchCommand>,
-    activation_rx: std::sync::mpsc::Receiver<DetachedActivationRequest>,
-    close_rx: std::sync::mpsc::Receiver<DetachedCloseRequest>,
-    diagnostic_rx: std::sync::mpsc::Receiver<DetachedActivationWatchDiagnostic>,
-}
-
-#[cfg(windows)]
-impl DetachedActivationWatcher {
-    fn new() -> Self {
-        let (activation_tx, activation_rx) = std::sync::mpsc::channel();
-        let (close_tx, close_rx) = std::sync::mpsc::channel();
-        let (diagnostic_tx, diagnostic_rx) = std::sync::mpsc::channel();
-        #[cfg(not(test))]
-        {
-            let (command_tx, command_rx) = std::sync::mpsc::channel();
-            std::thread::Builder::new()
-                .name("detached-activation-watch".to_string())
-                .spawn(move || {
-                    Self::watch_thread(command_rx, activation_tx, close_tx, diagnostic_tx);
-                })
-                .expect("failed to spawn detached activation watcher");
-            Self {
-                command_tx,
-                activation_rx,
-                close_rx,
-                diagnostic_rx,
-            }
-        }
-        #[cfg(test)]
-        {
-            let _ = (activation_tx, close_tx, diagnostic_tx);
-            Self {
-                activation_rx,
-                close_rx,
-                diagnostic_rx,
-            }
-        }
-    }
-
-    fn update_targets(
-        &self,
-        targets: Vec<DetachedActivationWatchTarget>,
-        main_hwnd: u64,
-        claimed_hwnds: Vec<u64>,
-        ctx: &egui::Context,
-    ) {
-        #[cfg(not(test))]
-        {
-            let _ = self.command_tx.send(DetachedActivationWatchCommand {
-                targets,
-                main_hwnd,
-                claimed_hwnds,
-                repaint_ctx: ctx.clone(),
-            });
-        }
-        #[cfg(test)]
-        {
-            let _ = (targets, main_hwnd, claimed_hwnds, ctx);
-        }
-    }
-
-    fn drain_activation_requests(&self) -> Vec<DetachedActivationRequest> {
-        let mut requests = Vec::new();
-        loop {
-            match self.activation_rx.try_recv() {
-                Ok(request) => requests.push(request),
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-        requests
-    }
-
-    fn drain_close_requests(&self) -> Vec<DetachedCloseRequest> {
-        let mut requests = Vec::new();
-        loop {
-            match self.close_rx.try_recv() {
-                Ok(request) => requests.push(request),
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-        requests
-    }
-
-    fn drain_diagnostics(&self) -> Vec<DetachedActivationWatchDiagnostic> {
-        let mut diagnostics = Vec::new();
-        loop {
-            match self.diagnostic_rx.try_recv() {
-                Ok(diagnostic) => diagnostics.push(diagnostic),
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
-        diagnostics
-    }
-
-    #[cfg(not(test))]
-    fn watch_thread(
-        command_rx: std::sync::mpsc::Receiver<DetachedActivationWatchCommand>,
-        activation_tx: std::sync::mpsc::Sender<DetachedActivationRequest>,
-        close_tx: std::sync::mpsc::Sender<DetachedCloseRequest>,
-        diagnostic_tx: std::sync::mpsc::Sender<DetachedActivationWatchDiagnostic>,
-    ) {
-        let mut targets = Vec::new();
-        let mut main_hwnd = 0;
-        let mut claimed_hwnds = Vec::new();
-        let mut repaint_ctx: Option<egui::Context> = None;
-        let mut state = DetachedActivationWatchState::default();
-        loop {
-            if targets.is_empty() {
-                match command_rx.recv() {
-                    Ok(command) => {
-                        targets = command.targets;
-                        main_hwnd = command.main_hwnd;
-                        claimed_hwnds = command.claimed_hwnds;
-                        repaint_ctx = Some(command.repaint_ctx);
-                        state = DetachedActivationWatchState::default();
-                    }
-                    Err(_) => break,
-                }
-                continue;
-            }
-
-            while let Ok(command) = command_rx.try_recv() {
-                targets = command.targets;
-                main_hwnd = command.main_hwnd;
-                claimed_hwnds = command.claimed_hwnds;
-                repaint_ctx = Some(command.repaint_ctx);
-                if targets.is_empty() {
-                    state = DetachedActivationWatchState::default();
-                    break;
-                }
-            }
-            if targets.is_empty() {
-                continue;
-            }
-
-            let rects = Self::os_target_rects(&targets);
-            let sample = Self::os_sample();
-            let result = App::detached_activation_watch_step_result_with_context(
-                &mut state,
-                sample,
-                &rects,
-                main_hwnd,
-                &claimed_hwnds,
-            );
-            if let Some(diagnostic) = result.diagnostic {
-                let _ = diagnostic_tx.send(diagnostic);
-            }
-            if let Some(request) = result.activation {
-                let _ = activation_tx.send(request);
-                if let Some(ctx) = repaint_ctx.as_ref() {
-                    ctx.request_repaint();
-                }
-            }
-            if let Some(request) = result.close {
-                let _ = close_tx.send(request);
-                if let Some(ctx) = repaint_ctx.as_ref() {
-                    ctx.request_repaint();
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(8));
-        }
-    }
-
-    #[cfg(not(test))]
-    fn os_sample() -> DetachedActivationWatchSample {
-        use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
-        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, HTCLOSE, SMTO_ABORTIFHUNG,
-            SendMessageTimeoutW, WM_NCHITTEST, WindowFromPoint,
-        };
-
-        // Mouse capture is outside the keyboard-only synthetic timeline, so
-        // this physical button level intentionally bypasses key_input.
-        let left_button_down =
-            unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
-        let foreground_hwnd = unsafe { GetForegroundWindow().0 as u64 };
-        let mut point = POINT::default();
-        let cursor_ok = unsafe { GetCursorPos(&mut point) }.is_ok();
-        let cursor_pos = cursor_ok.then_some((point.x, point.y));
-        let cursor_root_hwnd = if cursor_ok {
-            unsafe {
-                let hwnd = WindowFromPoint(point);
-                if hwnd.0.is_null() {
-                    0
-                } else {
-                    let root = GetAncestor(hwnd, GA_ROOT);
-                    root.0 as u64
-                }
-            }
-        } else {
-            0
-        };
-        let native_close_hit_hwnd = if cursor_ok && cursor_root_hwnd != 0 {
-            let packed = ((point.y as u32 & 0xffff) << 16) | (point.x as u32 & 0xffff);
-            let mut hit_test_result = 0usize;
-            let send_result = unsafe {
-                SendMessageTimeoutW(
-                    HWND(cursor_root_hwnd as *mut _),
-                    WM_NCHITTEST,
-                    WPARAM(0),
-                    LPARAM(packed as isize),
-                    SMTO_ABORTIFHUNG,
-                    50,
-                    Some(&mut hit_test_result),
-                )
-            };
-            if send_result.0 != 0 && hit_test_result as u32 == HTCLOSE {
-                cursor_root_hwnd
-            } else {
-                0
-            }
-        } else {
-            0
-        };
-        DetachedActivationWatchSample {
-            left_button_down,
-            foreground_hwnd,
-            cursor_root_hwnd,
-            native_close_hit_hwnd,
-            cursor_pos,
-        }
-    }
-
-    #[cfg(not(test))]
-    fn os_target_rects(
-        targets: &[DetachedActivationWatchTarget],
-    ) -> Vec<DetachedActivationWatchTargetRect> {
-        use windows::Win32::Foundation::{HWND, RECT};
-        use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, IsWindow};
-
-        targets
-            .iter()
-            .filter_map(|target| {
-                let hwnd = HWND(target.hwnd as *mut _);
-                unsafe {
-                    if !IsWindow(Some(hwnd)).as_bool() {
-                        return None;
-                    }
-                    let mut rect = RECT::default();
-                    if GetWindowRect(hwnd, &mut rect).is_err() {
-                        return None;
-                    }
-                    Some(DetachedActivationWatchTargetRect {
-                        window_id: target.window_id,
-                        hwnd: target.hwnd,
-                        eligible: target.eligible,
-                        close_hit_test: target.close_hit_test,
-                        left: rect.left,
-                        top: rect.top,
-                        right: rect.right,
-                        bottom: rect.bottom,
-                    })
-                }
-            })
-            .collect()
-    }
+    pub(crate) activation: Option<super::detached_activation::DetachedActivationRequest>,
 }
 
 #[cfg(windows)]
@@ -564,11 +186,46 @@ pub(crate) struct DetachedTrimBBoxEntry {
 }
 
 #[cfg(windows)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum DetachedNativeHost {
+    #[default]
+    Absent,
+    Backend(eframe::native_window_input::NativeWindowAllocationWitness),
+    #[cfg(test)]
+    Fixture(u64),
+}
+
+#[cfg(windows)]
+impl DetachedNativeHost {
+    fn cached_hwnd(&self) -> u64 {
+        match self {
+            Self::Absent => 0,
+            Self::Backend(owner) => owner
+                .allocation()
+                .windows_hwnd
+                .map(|hwnd| hwnd as u64)
+                .unwrap_or(0),
+            #[cfg(test)]
+            Self::Fixture(hwnd) => *hwnd,
+        }
+    }
+
+    fn is_current(&self) -> bool {
+        match self {
+            Self::Absent => false,
+            Self::Backend(owner) => owner.is_alive(),
+            #[cfg(test)]
+            Self::Fixture(hwnd) => *hwnd != 0,
+        }
+    }
+}
+
+#[cfg(windows)]
 #[derive(Debug, Clone)]
 pub(crate) struct DetachedWindowRuntime {
     pub(crate) window_id: u64,
     pub(crate) state: DetachedWindowState,
-    pub(crate) hwnd: u64,
+    native_host: DetachedNativeHost,
     pub(crate) host_incarnation: u64,
     viewport_binding: Option<super::viewport_retirement::ViewportCommandBinding>,
     pub(crate) placement: Option<crate::detached_window_geometry::PhysicalWindowPlacement>,
@@ -583,11 +240,20 @@ pub(crate) struct DetachedWindowRuntime {
 
 #[cfg(windows)]
 impl DetachedWindowRuntime {
+    /// Current backend allocation only; a retained old Window Arc is not authority.
+    pub(crate) fn hwnd(&self) -> u64 {
+        if self.native_host.is_current() {
+            self.native_host.cached_hwnd()
+        } else {
+            0
+        }
+    }
+
     fn new(window_id: u64, linked: bool) -> Self {
         Self {
             window_id,
             state: DetachedWindowState::Opening,
-            hwnd: 0,
+            native_host: DetachedNativeHost::Absent,
             host_incarnation: 0,
             viewport_binding: None,
             placement: None,
@@ -605,14 +271,23 @@ impl DetachedWindowRuntime {
 ///
 /// `App` remains responsible for cross-cutting orchestration (settings persistence,
 /// media presenter changes, and logging), while runtime state transitions, HWND
-/// registration, activation-watch queues, and surface ownership live here.
+/// registration and surface ownership live here.
 pub(crate) struct DetachedWindowManager {
     runtimes: HashMap<u64, DetachedWindowRuntime>,
     next_host_incarnation: u64,
-    activation_watcher: DetachedActivationWatcher,
     #[cfg(test)]
     live_hwnds_for_test: HashSet<u64>,
     last_input_surface: ActionSurface,
+}
+
+impl Drop for DetachedWindowManager {
+    fn drop(&mut self) {
+        for runtime in self.runtimes.values_mut() {
+            if let Some(binding) = runtime.viewport_binding.take() {
+                crate::key_input::retire_native_detached_input_target(binding.registration());
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -629,7 +304,6 @@ impl DetachedWindowManager {
         Self {
             runtimes: HashMap::new(),
             next_host_incarnation: 0,
-            activation_watcher: DetachedActivationWatcher::new(),
             #[cfg(test)]
             live_hwnds_for_test: HashSet::new(),
             last_input_surface: ActionSurface::MainWindow,
@@ -660,7 +334,12 @@ impl DetachedWindowManager {
             return;
         };
         if let Some(runtime) = self.runtimes.get_mut(&window_id) {
-            runtime.viewport_binding = Some(binding);
+            let registration = binding.registration();
+            if let Some(previous) = runtime.viewport_binding.replace(binding)
+                && previous.registration() != registration
+            {
+                crate::key_input::retire_native_detached_input_target(previous.registration());
+            }
         }
     }
 
@@ -671,6 +350,7 @@ impl DetachedWindowManager {
             .get_mut(&window_id)
             .and_then(|runtime| runtime.viewport_binding.take())
         {
+            crate::key_input::retire_native_detached_input_target(binding.registration());
             binding.transfer_retirement();
         }
     }
@@ -742,7 +422,7 @@ impl DetachedWindowManager {
 
     pub(super) fn hwnd_raw(&self, window_id: u64) -> Option<u64> {
         self.runtime(window_id)
-            .map(|runtime| runtime.hwnd)
+            .map(|runtime| runtime.hwnd())
             .filter(|hwnd| *hwnd != 0)
     }
 
@@ -750,7 +430,7 @@ impl DetachedWindowManager {
         let runtime = self.runtime(window_id)?;
         Some(match runtime.host_placement {
             HostPlacement::Placed { incarnation, .. }
-                if runtime.hwnd == 0 || incarnation != runtime.host_incarnation =>
+                if runtime.hwnd() == 0 || incarnation != runtime.host_incarnation =>
             {
                 HostPlacement::default()
             }
@@ -946,64 +626,99 @@ impl DetachedWindowManager {
     pub(super) fn host_claim_alive(&self, window_id: u64) -> Option<DetachedHostClaim> {
         let runtime = self.runtime(window_id)?;
         if runtime.state == DetachedWindowState::Closing
-            || runtime.hwnd == 0
+            || runtime.hwnd() == 0
             || runtime.host_incarnation == 0
-            || !self.hwnd_is_alive(runtime.hwnd)
+            || !self.hwnd_is_alive(runtime.hwnd())
         {
             return None;
         }
         Some(DetachedHostClaim {
             lease: DetachedSessionLease { window_id },
             incarnation: runtime.host_incarnation,
-            hwnd: runtime.hwnd,
+            hwnd: runtime.hwnd(),
         })
     }
 
     pub(super) fn host_claim_is_alive(&self, claim: DetachedHostClaim) -> bool {
         self.runtime(claim.lease.window_id).is_some_and(|runtime| {
             runtime.state != DetachedWindowState::Closing
-                && runtime.hwnd == claim.hwnd
+                && runtime.hwnd() == claim.hwnd
                 && runtime.host_incarnation == claim.incarnation
-                && self.hwnd_is_alive(runtime.hwnd)
+                && self.hwnd_is_alive(runtime.hwnd())
         })
     }
 
     pub(super) fn clear_hwnd(&mut self, window_id: u64) -> Option<u64> {
         let runtime = self.runtimes.get_mut(&window_id)?;
-        let hwnd = std::mem::take(&mut runtime.hwnd);
+        let hwnd = runtime.native_host.cached_hwnd();
+        runtime.native_host = DetachedNativeHost::Absent;
         runtime.host_placement = HostPlacement::default();
         runtime.last_geometry_notification = None;
         (hwnd != 0).then_some(hwnd)
     }
 
     pub(super) fn clear_hwnd_if_dead(&mut self, window_id: u64) -> Option<u64> {
-        let hwnd = self.hwnd_raw(window_id)?;
-        if self.hwnd_is_alive(hwnd) {
+        let runtime = self.runtime(window_id)?;
+        let hwnd = runtime.native_host.cached_hwnd();
+        if hwnd == 0 || (runtime.native_host.is_current() && self.hwnd_is_alive(hwnd)) {
             None
         } else {
             self.clear_hwnd(window_id)
         }
     }
 
+    pub(super) fn has_native_allocation(
+        &self,
+        window_id: u64,
+        owner: &eframe::native_window_input::NativeWindowAllocationWitness,
+    ) -> bool {
+        self.runtime(window_id).is_some_and(|runtime|
+            matches!(&runtime.native_host, DetachedNativeHost::Backend(current) if current == owner && current.is_alive()))
+    }
+
+    pub(super) fn set_native_allocation(
+        &mut self,
+        window_id: u64,
+        owner: eframe::native_window_input::NativeWindowAllocationWitness,
+        default_linked: bool,
+    ) -> Option<u64> {
+        self.set_native_host(
+            window_id,
+            DetachedNativeHost::Backend(owner),
+            default_linked,
+        )
+    }
+
+    #[cfg(test)]
     pub(super) fn set_hwnd(
         &mut self,
         window_id: u64,
         hwnd: u64,
         default_linked: bool,
     ) -> Option<u64> {
-        if hwnd == 0 {
+        self.set_native_host(window_id, DetachedNativeHost::Fixture(hwnd), default_linked)
+    }
+
+    fn set_native_host(
+        &mut self,
+        window_id: u64,
+        host: DetachedNativeHost,
+        default_linked: bool,
+    ) -> Option<u64> {
+        if host.cached_hwnd() == 0 {
             return self.clear_hwnd(window_id);
         }
         let needs_new_incarnation = self
             .runtime(window_id)
-            .is_none_or(|runtime| runtime.hwnd != hwnd || runtime.host_incarnation == 0);
+            .is_none_or(|runtime| runtime.native_host != host || runtime.host_incarnation == 0);
         let new_incarnation = needs_new_incarnation.then(|| {
             self.next_host_incarnation = self.next_host_incarnation.wrapping_add(1).max(1);
             self.next_host_incarnation
         });
         let runtime = self.entry_mut(window_id, default_linked);
-        let previous = (runtime.hwnd != 0).then_some(runtime.hwnd);
-        runtime.hwnd = hwnd;
+        let previous =
+            (runtime.native_host.cached_hwnd() != 0).then_some(runtime.native_host.cached_hwnd());
+        runtime.native_host = host;
         if let Some(incarnation) = new_incarnation {
             runtime.last_geometry_notification = None;
             if runtime.host_incarnation != 0 {
@@ -1026,15 +741,9 @@ impl DetachedWindowManager {
     pub(super) fn registered_hwnds(&self) -> HashSet<u64> {
         self.runtimes
             .values()
-            .map(|runtime| runtime.hwnd)
+            .map(|runtime| runtime.hwnd())
             .filter(|hwnd| *hwnd != 0)
             .collect()
-    }
-
-    pub(super) fn hwnd_claimed_by_other(&self, window_id: u64, hwnd: u64) -> Option<u64> {
-        self.runtimes.iter().find_map(|(&other_id, runtime)| {
-            (other_id != window_id && runtime.hwnd == hwnd).then_some(other_id)
-        })
     }
 
     pub(super) fn transition_state(
@@ -1048,9 +757,19 @@ impl DetachedWindowManager {
             window_id: runtime.window_id,
             from: runtime.state,
             to: new_state,
-            hwnd: runtime.hwnd,
+            hwnd: runtime.hwnd(),
             linked: runtime.linked,
         };
+        if new_state == DetachedWindowState::Closing
+            && matches!(
+                runtime.activation_intent,
+                Some(DetachedActivationIntent::Discrete(_))
+            )
+            && let Some(DetachedActivationIntent::Discrete(request)) =
+                runtime.activation_intent.take()
+        {
+            request.log("discard", super::DetachedActivationDecision::CloseOwned);
+        }
         runtime.state = new_state;
         transition
     }
@@ -1098,9 +817,32 @@ impl DetachedWindowManager {
         self.runtime(window_id).is_some_and(|runtime| {
             matches!(
                 runtime.activation_intent,
-                Some(DetachedActivationIntent::ActivateOnly)
+                Some(
+                    DetachedActivationIntent::ActivateOnly | DetachedActivationIntent::Discrete(_)
+                )
             )
         })
+    }
+
+    /// A discrete request may use only an already-owned runtime. In particular,
+    /// a stale native event must never recreate a retired detached context.
+    pub(super) fn queue_discrete_activation(
+        &mut self,
+        request: super::detached_activation::DetachedActivationRequest,
+    ) -> bool {
+        let Some(runtime) = self.runtimes.get_mut(&request.window_id) else {
+            return false;
+        };
+        if runtime.state == DetachedWindowState::Closing
+            || !matches!(
+                runtime.activation_intent,
+                None | Some(DetachedActivationIntent::ActivateOnly)
+            )
+        {
+            return false;
+        }
+        runtime.activation_intent = Some(DetachedActivationIntent::Discrete(request));
+        true
     }
 
     /// Read-only arbitration probe used before a test-script activation joins the
@@ -1121,9 +863,16 @@ impl DetachedWindowManager {
         let runtime = self.entry_mut(window_id, default_linked);
         let accepted = matches!(
             runtime.activation_intent,
-            None | Some(DetachedActivationIntent::ActivateOnly)
+            None | Some(
+                DetachedActivationIntent::ActivateOnly | DetachedActivationIntent::Discrete(_)
+            )
         );
         if accepted {
+            if let Some(DetachedActivationIntent::Discrete(request)) =
+                runtime.activation_intent.as_ref()
+            {
+                request.log("discard", super::DetachedActivationDecision::CommandOwned);
+            }
             runtime.activation_intent = Some(DetachedActivationIntent::RightDrag(
                 PendingRightDragCommand::Recognized { command },
             ));
@@ -1154,6 +903,7 @@ impl DetachedWindowManager {
                     && matches!(
                         runtime.activation_intent,
                         Some(DetachedActivationIntent::ActivateOnly)
+                            | Some(DetachedActivationIntent::Discrete(_))
                             | Some(DetachedActivationIntent::RightDrag(
                                 PendingRightDragCommand::Recognized { .. }
                             ))
@@ -1167,8 +917,9 @@ impl DetachedWindowManager {
         ids.sort_unstable();
         let id = ids.into_iter().next()?;
         let runtime = self.runtimes.get_mut(&id)?;
-        let command = match runtime.activation_intent.take()? {
-            DetachedActivationIntent::ActivateOnly => None,
+        let (command, activation) = match runtime.activation_intent.take()? {
+            DetachedActivationIntent::ActivateOnly => (None, None),
+            DetachedActivationIntent::Discrete(request) => (None, Some(request)),
             DetachedActivationIntent::RightDrag(PendingRightDragCommand::Recognized {
                 command,
             }) => {
@@ -1177,7 +928,7 @@ impl DetachedWindowManager {
                         command: command.clone(),
                     },
                 ));
-                Some(DetachedWindowCommand::RightDrag(command))
+                (Some(DetachedWindowCommand::RightDrag(command)), None)
             }
             DetachedActivationIntent::PageOverview(PendingPageOverviewCommand::Recognized {
                 command,
@@ -1187,7 +938,7 @@ impl DetachedWindowManager {
                         command: command.clone(),
                     },
                 ));
-                Some(DetachedWindowCommand::PageOverview(command))
+                (Some(DetachedWindowCommand::PageOverview(command)), None)
             }
             other => {
                 runtime.activation_intent = Some(other);
@@ -1197,6 +948,7 @@ impl DetachedWindowManager {
         Some(DetachedActivationDispatch {
             window_id: id,
             command,
+            activation,
         })
     }
 
@@ -1214,6 +966,11 @@ impl DetachedWindowManager {
         if runtime.state == DetachedWindowState::Closing {
             return false;
         }
+        if let Some(DetachedActivationIntent::Discrete(request)) =
+            runtime.activation_intent.as_ref()
+        {
+            request.log("discard", super::DetachedActivationDecision::CommandOwned);
+        }
         match runtime.activation_intent.as_mut() {
             Some(DetachedActivationIntent::PageOverview(pending)) => {
                 match pending {
@@ -1225,7 +982,10 @@ impl DetachedWindowManager {
                     PendingPageOverviewCommand::Activating { .. } => false,
                 }
             }
-            None | Some(DetachedActivationIntent::ActivateOnly) => {
+            None
+            | Some(
+                DetachedActivationIntent::ActivateOnly | DetachedActivationIntent::Discrete(_),
+            ) => {
                 let batch = IdentifiedPageOverviewCommand::new(command);
                 runtime.activation_intent =
                     Some(DetachedActivationIntent::PageOverview(if activate {
@@ -1406,7 +1166,22 @@ impl DetachedWindowManager {
     }
 
     pub(super) fn remove(&mut self, window_id: u64) -> Option<DetachedWindowRuntime> {
-        self.runtimes.remove(&window_id)
+        let mut runtime = self.runtimes.remove(&window_id)?;
+        if let Some(binding) = runtime.viewport_binding.as_ref() {
+            crate::key_input::retire_native_detached_input_target(binding.registration());
+        }
+        if matches!(
+            runtime.activation_intent,
+            Some(DetachedActivationIntent::Discrete(_))
+        ) && let Some(DetachedActivationIntent::Discrete(request)) =
+            runtime.activation_intent.take()
+        {
+            request.log(
+                "discard",
+                super::DetachedActivationDecision::RetiredRegistration,
+            );
+        }
+        Some(runtime)
     }
 
     pub(super) fn is_empty(&self) -> bool {
@@ -1432,31 +1207,9 @@ impl DetachedWindowManager {
     pub(super) fn claimed_hwnds(&self) -> Vec<u64> {
         self.runtimes
             .values()
-            .map(|runtime| runtime.hwnd)
+            .map(|runtime| runtime.hwnd())
             .filter(|hwnd| *hwnd != 0)
             .collect()
-    }
-
-    pub(super) fn update_activation_watch_targets(
-        &self,
-        targets: Vec<DetachedActivationWatchTarget>,
-        main_hwnd: u64,
-        ctx: &egui::Context,
-    ) {
-        self.activation_watcher
-            .update_targets(targets, main_hwnd, self.claimed_hwnds(), ctx);
-    }
-
-    pub(super) fn drain_watch_diagnostics(&self) -> Vec<DetachedActivationWatchDiagnostic> {
-        self.activation_watcher.drain_diagnostics()
-    }
-
-    pub(super) fn drain_close_requests(&self) -> Vec<DetachedCloseRequest> {
-        self.activation_watcher.drain_close_requests()
-    }
-
-    pub(super) fn drain_activation_requests(&self) -> Vec<DetachedActivationRequest> {
-        self.activation_watcher.drain_activation_requests()
     }
 
     pub(super) fn note_input_surface(&mut self, surface: ActionSurface) {
@@ -1509,6 +1262,94 @@ impl DetachedWindowManager {
 mod tests {
     use super::*;
 
+    fn retained_input_target(
+        context: &egui::Context,
+        window_id: u64,
+    ) -> (
+        crate::key_input::NativeDetachedInputTarget,
+        std::sync::Weak<()>,
+    ) {
+        let viewport = super::super::App::detached_image_window_viewport_id(window_id);
+        context.set_embed_viewports(false);
+        context.show_viewport_deferred(viewport, Default::default(), |_, _| {});
+        let retained = std::sync::Arc::new(());
+        let weak = std::sync::Arc::downgrade(&retained);
+        let captured_context = context.clone();
+        (
+            crate::key_input::NativeDetachedInputTarget {
+                registration: context.viewport_registration(viewport).unwrap(),
+                kind: crate::key_input::NativeDetachedInputTargetKind::Parked,
+                availability: crate::key_input::NativeTargetAvailability::Enabled,
+                sink: std::sync::Arc::new(move |_| {
+                    let _ = (&retained, &captured_context);
+                }),
+            },
+            weak,
+        )
+    }
+
+    #[test]
+    fn terminal_transfer_and_manager_drop_retire_only_their_exact_input_registration() {
+        let _input = crate::key_input::lock_test_input();
+        let first_ctx = egui::Context::default();
+        let sibling_ctx = egui::Context::default();
+        let (first_target, first_retained) = retained_input_target(&first_ctx, 81);
+        let (sibling_target, sibling_retained) = retained_input_target(&sibling_ctx, 82);
+        let mut first = DetachedWindowManager::new();
+        let mut sibling = DetachedWindowManager::new();
+        first.transition_state(81, DetachedWindowState::Parked, false);
+        sibling.transition_state(82, DetachedWindowState::Parked, false);
+        first.capture_viewport_registration(81, &first_ctx);
+        sibling.capture_viewport_registration(82, &sibling_ctx);
+        crate::key_input::set_native_detached_input_targets(vec![first_target, sibling_target]);
+        first.transfer_viewport_retirement(81);
+        assert!(first_retained.upgrade().is_none());
+        assert!(sibling_retained.upgrade().is_some());
+        first.remove(81);
+        drop(first);
+        assert!(sibling_retained.upgrade().is_some());
+        drop(sibling);
+        assert!(sibling_retained.upgrade().is_none());
+    }
+
+    #[test]
+    fn runtime_remove_retires_input_even_without_prior_retirement_transfer() {
+        let _input = crate::key_input::lock_test_input();
+        let ctx = egui::Context::default();
+        let (target, retained) = retained_input_target(&ctx, 83);
+        let mut manager = DetachedWindowManager::new();
+        manager.transition_state(83, DetachedWindowState::Parked, false);
+        manager.capture_viewport_registration(83, &ctx);
+        crate::key_input::set_native_detached_input_targets(vec![target]);
+        let runtime = manager.remove(83).unwrap();
+        assert!(retained.upgrade().is_none());
+        assert!(
+            runtime.viewport_binding.is_some(),
+            "existing retirement authority is still available to teardown"
+        );
+    }
+
+    #[test]
+    fn capture_replacement_retires_old_registration_but_same_registration_keeps_input() {
+        let _input = crate::key_input::lock_test_input();
+        let old_ctx = egui::Context::default();
+        let next_ctx = egui::Context::default();
+        let (old_target, old_retained) = retained_input_target(&old_ctx, 84);
+        let (next_target, next_retained) = retained_input_target(&next_ctx, 84);
+        assert_ne!(old_target.registration, next_target.registration);
+        let mut manager = DetachedWindowManager::new();
+        manager.transition_state(84, DetachedWindowState::Parked, false);
+        manager.capture_viewport_registration(84, &old_ctx);
+        crate::key_input::set_native_detached_input_targets(vec![old_target, next_target]);
+        manager.capture_viewport_registration(84, &old_ctx);
+        assert!(old_retained.upgrade().is_some());
+        manager.capture_viewport_registration(84, &next_ctx);
+        assert!(old_retained.upgrade().is_none());
+        assert!(next_retained.upgrade().is_some());
+        drop(manager);
+        assert!(next_retained.upgrade().is_none());
+    }
+
     fn short_click_command() -> RightDragCommand {
         RightDragCommand::ViewerShortRightClick {
             context: crate::ring_shortcut::RightDragContext::ImageFullscreen,
@@ -1540,6 +1381,46 @@ mod tests {
         assert!(dispatch.command.is_none());
         assert!(manager.activation_intent(7).is_none());
         assert!(!manager.has_activation_intent());
+    }
+
+    #[test]
+    fn discrete_activation_keeps_ownership_metadata_without_recreating_retired_runtime() {
+        use crate::app::detached_activation::{
+            DetachedActivationRequest, DetachedActivationSource,
+        };
+        let request = DetachedActivationRequest {
+            window_id: 77,
+            registration: None,
+            context_id: None,
+            source: DetachedActivationSource::ClientClick,
+            expected_state: super::super::DetachedActivationTargetState::Parked,
+            allocation: None,
+        };
+        let mut manager = DetachedWindowManager::new();
+        assert!(!manager.queue_discrete_activation(request.clone()));
+        assert!(manager.runtime(77).is_none());
+        manager.transition_state(77, DetachedWindowState::Parked, false);
+        assert!(manager.queue_discrete_activation(request.clone()));
+        assert!(!manager.queue_discrete_activation(request.clone()));
+        let dispatch = manager.take_pending_deferred_activation().unwrap();
+        assert_eq!(dispatch.activation, Some(request.clone()));
+        assert!(dispatch.command.is_none());
+
+        assert!(manager.queue_discrete_activation(request));
+        assert!(
+            manager
+                .queue_right_drag_command(77, identified(short_click_command()), false)
+                .0
+        );
+        let dispatch = manager.take_pending_deferred_activation().unwrap();
+        assert!(
+            dispatch.activation.is_none(),
+            "recognized commands keep priority over a plain activation"
+        );
+        assert!(matches!(
+            dispatch.command,
+            Some(DetachedWindowCommand::RightDrag(_))
+        ));
     }
 
     #[test]

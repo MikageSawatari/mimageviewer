@@ -1,6 +1,9 @@
 //! Shared physical-input and guide boundaries for ordinary viewer and page overview.
 use super::*;
 
+#[cfg(test)]
+mod release_tests;
+
 impl App {
     pub(super) fn dispatch_viewer_middle_short_click(&mut self, ctx: &egui::Context) {
         if let Some(nav) = self.apply_mouse_button(
@@ -79,6 +82,20 @@ impl App {
         let secondary_released = !overflow_pointer_input
             .owns_release(egui::PointerButton::Secondary)
             && ctx.input(|i| i.pointer.secondary_released());
+        let secondary_events: Vec<_> = ctx.input(|i| {
+            i.pointer
+                .button_events()
+                .filter(|event| match event {
+                    egui::PointerButtonEvent::Pressed { button, .. } => {
+                        *button == egui::PointerButton::Secondary
+                    }
+                    egui::PointerButtonEvent::Released { button, .. } => {
+                        *button == egui::PointerButton::Secondary
+                            && !overflow_pointer_input.owns_release(*button)
+                    }
+                })
+                .collect()
+        });
         let press_owner = overflow_pointer_input.secondary_owner;
         if overflow_pointer_input.secondary_owned {
             self.cancel_mouse_ring_flick();
@@ -86,13 +103,6 @@ impl App {
             return FsSecondaryAction::None;
         }
         let secondary_pos = fullscreen_pointer_pos_or(ctx, full_rect, full_rect.center());
-        let passive_secondary_pos = fullscreen_pointer_pos_or(
-            ctx,
-            full_rect,
-            self.fs_secondary_press
-                .start_pos()
-                .unwrap_or(full_rect.center()),
-        );
         // 旧 egui HUD は撤去済 (native presenter overlay が右クリックも独自処理)。
         // egui main window 側に右クリックを吸収すべき HUD 矩形は無い。
         let popup_open = self.spread_popup_open
@@ -120,16 +130,64 @@ impl App {
             right_drag_gate_reject.is_some(),
             secondary_in_overlay_chrome,
         );
-        let passive_press_outcome = self.fs_secondary_press.advance(
+        let now = std::time::Instant::now();
+        let mut passive_press_outcome = FullscreenSecondaryPressOutcome::None;
+        // Process the canonical button edges in order. A positionless terminal
+        // cancels the old hold, while a later real press can own a new hold in
+        // this same frame. Neither fallback nor later motion supplies an Up point.
+        for event in &secondary_events {
+            let (pressed, released, pos) = match *event {
+                egui::PointerButtonEvent::Pressed { pos, .. } => (true, false, pos),
+                egui::PointerButtonEvent::Released { pos: Some(pos), .. } => (false, true, pos),
+                egui::PointerButtonEvent::Released { pos: None, .. } => {
+                    self.fs_secondary_press.cancel();
+                    continue;
+                }
+            };
+            let outcome = self.fs_secondary_press.advance(
+                passive_press_owner,
+                FullscreenSecondaryPressSample {
+                    pressed,
+                    down: pressed,
+                    released,
+                    pos,
+                    now,
+                },
+            );
+            if matches!(
+                outcome,
+                FullscreenSecondaryPressOutcome::ShortTap(_)
+                    | FullscreenSecondaryPressOutcome::LongPress(_)
+            ) {
+                passive_press_outcome = outcome;
+            }
+        }
+        let passive_secondary_pos = fullscreen_pointer_pos_or(
+            ctx,
+            full_rect,
+            self.fs_secondary_press
+                .start_pos()
+                .unwrap_or(full_rect.center()),
+        );
+        let passive_level_outcome = self.fs_secondary_press.advance(
             passive_press_owner,
             FullscreenSecondaryPressSample {
-                pressed: secondary_pressed,
+                pressed: false,
                 down: secondary_down,
-                released: secondary_released,
+                released: false,
                 pos: passive_secondary_pos,
-                now: std::time::Instant::now(),
+                now,
             },
         );
+        // Cancellation concerns the currently held sequence. It cannot revoke
+        // an earlier position-qualified action completed in this same frame.
+        if matches!(
+            passive_level_outcome,
+            FullscreenSecondaryPressOutcome::ShortTap(_)
+                | FullscreenSecondaryPressOutcome::LongPress(_)
+        ) {
+            passive_press_outcome = passive_level_outcome;
+        }
         #[cfg(windows)]
         if self.viewer_session_is_detached_or_switching()
             && Self::detached_image_window_debug_enabled()
@@ -233,54 +291,116 @@ impl App {
                     };
                     if secondary_in_overlay_chrome {
                         self.cancel_mouse_ring_flick();
-                    } else if secondary_pressed {
-                        self.start_mouse_ring_flick(
-                            ctx,
-                            crate::ring_shortcut::RightDragOwner::Root,
-                            ring_context,
-                            secondary_pos,
-                            None,
-                        );
+                        return FsSecondaryAction::None;
                     }
-                    let recognition = self.recognize_mouse_ring_flick_with_pos(
+                    let mut action = FsSecondaryAction::None;
+                    for event in &secondary_events {
+                        match *event {
+                            egui::PointerButtonEvent::Pressed { pos, .. } => {
+                                self.start_mouse_ring_flick(
+                                    ctx,
+                                    crate::ring_shortcut::RightDragOwner::Root,
+                                    ring_context,
+                                    pos,
+                                    None,
+                                );
+                            }
+                            egui::PointerButtonEvent::Released { pos: Some(pos), .. } => {
+                                let recognition = self.recognize_mouse_ring_flick_with_pos(
+                                    ctx,
+                                    crate::ring_shortcut::RightDragOwner::Root,
+                                    ring_context,
+                                    pos,
+                                    false,
+                                    true,
+                                );
+                                if recognition.command.is_some()
+                                    || recognition.outcome
+                                        == crate::ring_shortcut::MouseFlickOutcome::ShortTap
+                                {
+                                    action = FsSecondaryAction::Recognized {
+                                        context: right_drag_context,
+                                        pos,
+                                        recognition,
+                                    };
+                                }
+                            }
+                            egui::PointerButtonEvent::Released { pos: None, .. } => {
+                                self.cancel_right_drag_for_owner(
+                                    crate::ring_shortcut::RightDragOwner::Root,
+                                );
+                                self.clear_native_video_ring_guide_overlay(ctx);
+                            }
+                        }
+                    }
+                    self.recognize_mouse_ring_flick_with_pos(
                         ctx,
                         crate::ring_shortcut::RightDragOwner::Root,
                         ring_context,
                         secondary_pos,
                         secondary_down,
-                        secondary_released,
+                        false,
                     );
-                    return FsSecondaryAction::Recognized {
-                        context: right_drag_context,
-                        pos: secondary_pos,
-                        recognition,
-                    };
+                    return action;
                 }
                 crate::ring_shortcut::RightDragMode::MouseGesture => {
                     if secondary_in_overlay_chrome {
                         self.cancel_mouse_gesture();
-                    } else if secondary_pressed {
-                        self.start_mouse_gesture(
-                            ctx,
-                            crate::ring_shortcut::RightDragOwner::Root,
-                            right_drag_context,
-                            secondary_pos,
-                            None,
-                        );
+                        return FsSecondaryAction::None;
                     }
-                    let recognition = self.recognize_mouse_gesture_with_pos(
+                    let mut action = FsSecondaryAction::None;
+                    for event in &secondary_events {
+                        match *event {
+                            egui::PointerButtonEvent::Pressed { pos, .. } => {
+                                self.start_mouse_gesture(
+                                    ctx,
+                                    crate::ring_shortcut::RightDragOwner::Root,
+                                    right_drag_context,
+                                    pos,
+                                    None,
+                                );
+                            }
+                            egui::PointerButtonEvent::Released { pos: Some(pos), .. } => {
+                                let recognition = self.recognize_mouse_gesture_with_pos(
+                                    ctx,
+                                    crate::ring_shortcut::RightDragOwner::Root,
+                                    right_drag_context,
+                                    pos,
+                                    false,
+                                    true,
+                                );
+                                if recognition.command.is_some()
+                                    || recognition.outcome
+                                        == crate::ring_shortcut::MouseFlickOutcome::ShortTap
+                                {
+                                    action = FsSecondaryAction::Recognized {
+                                        context: right_drag_context,
+                                        pos,
+                                        recognition,
+                                    };
+                                }
+                            }
+                            egui::PointerButtonEvent::Released { pos: None, .. } => {
+                                self.cancel_right_drag_for_owner(
+                                    crate::ring_shortcut::RightDragOwner::Root,
+                                );
+                                if right_drag_context
+                                    == crate::ring_shortcut::RightDragContext::VideoFullscreen
+                                {
+                                    self.clear_native_video_mouse_gesture_overlay(ctx);
+                                }
+                            }
+                        }
+                    }
+                    self.recognize_mouse_gesture_with_pos(
                         ctx,
                         crate::ring_shortcut::RightDragOwner::Root,
                         right_drag_context,
                         secondary_pos,
                         secondary_down,
-                        secondary_released,
+                        false,
                     );
-                    return FsSecondaryAction::Recognized {
-                        context: right_drag_context,
-                        pos: secondary_pos,
-                        recognition,
-                    };
+                    return action;
                 }
                 crate::ring_shortcut::RightDragMode::Disabled
                 | crate::ring_shortcut::RightDragMode::Unknown(_) => {
@@ -399,7 +519,7 @@ impl App {
         self.draw_favorite_default_clear_confirm_dialog(ctx);
         self.draw_export_dialog(ctx);
         self.draw_export_progress_dialog(ctx);
-        if self.mounted_viewer_owns_depth_dialogs() {
+        if self.depth_export_dialog_in_mounted_viewer() {
             self.draw_depth_export_dialog(ctx);
         }
     }

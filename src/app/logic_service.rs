@@ -27,8 +27,6 @@ impl App {
         self.poll_book_bookmark_service_responses();
         self.service_cancelled_ai_terminals();
         self.service_remote_session(ctx);
-        #[cfg(windows)]
-        self.service_detached_watcher_close_requests(ctx);
         self.service_folder_watch(ctx);
         self.service_periodic_folder_work(ctx);
         self.drain_gamepad_physical_input(ctx, std::time::Instant::now());

@@ -655,8 +655,9 @@ GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付�
 | `ViewerContextBundle` (app.rs) | ビューア文脈の状態束。active detached (独立 / Book) と parked live 窓は bundle swap で mount/unmount する。現行仕様に pin はない。通常画像の always-new grid open も open 前に `DetachedPhysical` active bundle へ昇格し、main の検索・選択・スクロールから分離する。仮想一覧由来でも backing `items` は複製せず、通常フォルダは bundle-owned worker scan、ZIP/PDF は既存 enumerate worker で完全な物理一覧を構築し、対象 leaf を新しい物理 index へ解決する。folder-nav pending、PDF/ZIP enumerate、nav lock generation、遅延 nav intent、holdover texture、ページ寸法の generation 付き CPU cache も context-owned。thumb channel / cancel_token / ワーカーキュー / keep-range atomic の「ロード複合体」も per-context (v2.3.0、bundle Drop が worker pool を畳む)。swap前後のApp-global rating session差分は各context cacheへ同期するが、ownership交換自体はnavigationではないためfacet scope / suppressionを変更しない |
 | detached open request state (app.rs) | 通常画像のscan、ZIP/PDF enumerate、protected PDFのpassword request・session password・保存予約、明示leafの`Required` targetをbundle内に保持する。グリッドのFolderはmain-owned worker scanで「候補」を先に分類し、画像本と確定したcompleted scanだけをdetached contextへ移譲する。混在Folderはsession/runtimeを作らず通常main navigationへ戻す。password dialogはowner bundleをmountして再開する。空／error／必須target消失でviewportが未生成でも共通terminal closeがsession finishとwindow runtime削除を行う。実フォルダscan errorは空一覧と区別し、catalogへ適用しない |
 | `ViewerSession` (`app/viewer_session.rs`) | 退避中 bundle の表示先・同期 stamp・独立 detached 状態・window ID を一括所有する。現在表示中の session は当面 `App` の既存フィールドへマウントし、`swap_with_mounted` で5項目を同時交換する |
-| `DetachedWindowManager` (`app/detached_window_manager.rs`) | 窓ごとの HWND / placement / 状態遷移 (`Opening/Active/Parked/ParkedLive/Resuming/Closing`) と activation watcher を一元管理する。passive window は window collection / frozen 表示上の役割であり、runtime state 名ではない。`ViewerSession` の意味状態とは分離する |
-| `dwm_transitions.rs` | DWM トランジション抑止 + UI スレッド窓 snapshot (HWND を生成イベントの before/after 差分で同定 = rect 一致捕捉の全廃、BA-1 根治) + 仮想デスクトップ移動 |
+| `DetachedWindowManager` (`app/detached_window_manager.rs`) | 窓ごとの HWND / placement / 状態遷移 (`Opening/Active/Parked/ParkedLive/Resuming/Closing`) と activation intent を一元管理する。Parked静止画はcallbackの完結したclick/tap、non-clientは確定HWNDのnative input owner、mediaは既存native入力から離散要求を送り、rootの同じcommitで復帰する。level polling watcherは撤去。passive windowはwindow collection / frozen表示上の役割で、runtime state名ではない。`ViewerSession` の意味状態とは分離する |
+| `dwm_transitions.rs` | DWM トランジション抑止・窓状態の観測・仮想デスクトップ移動。入力 HWND の所有は決めない |
+| `eframe::native_window_input` / `key_input.rs` | backend の native allocation が root / child の HWND と viewport の唯一の正本。backend 所有 lease が key subclass・入力対応・未配送 native 入力を同期退役し、旧 WindowId の配送対応を撤去してから後継を公開する。App の detached host はこの対応を参照し、rect や列挙差分では同定しない |
 | `app/native_video.rs` | F12 host migration / source-swap / 動画→音声モード enter/exit など、native 動画 presenter と detached 窓の接続層 |
 
 ★固定の `snapshot`、評価 filter の一時解除 anchor、Ctrl+S / Ctrl+G 由来の synthetic
@@ -666,9 +667,32 @@ context は空から始める。snapshot が `items` を直接交換するとき
 `thumbnails` / `image_metas` と Details の order / prewarm / metadata pending も同じ generation
 境界で交換・失効・再構築する。
 
-BA-1 の不変条件は geometry 非依存の HWND 所有である。detached host 登録は registry 化済みだが、
-キー入力 subclass に rect 選択が残る具体的な仕様違反は
-[v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) に記録されており、後続リワークへ引き継ぐ。
+BA-1 の不変条件は geometry 非依存の HWND 所有である。依頼50 Cでは、
+[v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) で残っていた入力用 rect 選択も撤去する。
+Wgpu / Glow の生成・再生成・GC・終了を同じ native allocation lease へ接続し、
+logical viewport の RawInput / IME の保持とは寿命を分ける。immediate 生成の hook は
+App に再入せず共有入力 owner だけを変更する。仮想デスクトップ同期など入力以外の rect 利用は残る。
+App の host cache は backend lease の撤去で失効する Weak owner を参照し、同じ HWND 数値を再利用した別 allocation を区別する。
+
+依頼50 Aのclient復帰は、egui-winitが実際にraw inputを追加する時点のParked input ownerへ結び付く。
+Active時に蓄積した入力を新deferred callbackへ再所属させないため、opaqueなproof IDを非操作の
+`Event::PointerInputProvenance`としてStartと同じ列に置く。callbackのgesture ownerだけが同ID／scopeを照合し、
+完了したprimary click／long press／drag・単指touchをactivation intentへ送る。
+復帰操作は終端まで消費してページ送り／パンへ再配送しない。State再生成時の保留RawInput・IME終端は一括clearせず保持する。
+Windowsのegui-winit Stateは最後のCursorMovedの物理位置を保持し、CursorLeftではlogical位置だけを消す。
+同座標再入でwinitがCursorMovedを省略しても、CursorEnteredで現在の実効倍率へ戻す。
+新native allocationのStateは履歴なしで始まり、touchのlogical位置清掃や兄弟viewportと履歴を共有しない。
+Stateがforwardした実mouse押下は、CursorLeft後の位置なしUpでも
+`Event::PointerButtonReleased`で一度だけ終わる。古い座標のclickやhoverは作らず、
+eguiの保持・observer・callbackと各command ownerのrelease順序を同じraw終端へ揃える。
+releaseの位置資格はeguiのcanonical列に保持し、停止Response／drop／独自recognizerは
+その実点だけを使う。位置なし終端は保持清掃だけで、操作認可の例外はParked復帰に限る。
+受理済みdropと同frameの新heldは同一plugin内の別操作として扱い、互いの終端を流用しない。
+caption buttonは解放時のhitとOSの選択確定を同native ownerで扱い、途中のmotionでは取り消さない。
+vendorの入力診断Infoは専用の正確な2targetだけが製品の非同期通常sinkへ届く。
+logical targetはその窓のregistrationの終端／Manager dropで退役し、native allocationの再生成では維持する。
+既に egui に渡した synthetic Primary は通常入力境界で対象 button / widget の所有だけを一度取り消し、通常の click / drag 完了を発生させない。
+synthetic keyもlogical registration／key単位で終端権限を持ち、physical Downへの移譲後は旧repeat／Upで保持を再取得・解除しない。
 
 ### 補正 / 編集 / AI
 

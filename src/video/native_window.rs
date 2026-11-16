@@ -34,11 +34,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_SHOWWINDOW, SetWindowLongPtrW, TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS, WM_APPCOMMAND,
     WM_CANCELMODE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION,
     WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NULL,
-    WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERENTER, WM_POINTERLEAVE, WM_POINTERUP,
-    WM_POINTERUPDATE, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE,
-    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK,
+    WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY,
+    WM_NULL, WM_POINTERCAPTURECHANGED, WM_POINTERDOWN, WM_POINTERENTER, WM_POINTERLEAVE,
+    WM_POINTERUP, WM_POINTERUPDATE, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK,
     WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
     WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
@@ -196,6 +196,8 @@ fn native_window_event_latest_slot(event: &NativeVideoWindowEvent) -> Option<usi
 
 struct NativeWindowEventRouteShared {
     next_sequence: AtomicU64,
+    /// Read-only projection of the pump's existing Visible input owner.
+    native_input_epoch: Arc<AtomicU64>,
     latest: Vec<LatestWindowEventSlot>,
     overflow_fault: Arc<AtomicBool>,
     raise_diagnostics: Option<NativeRaiseRouteDiagnostics>,
@@ -288,6 +290,7 @@ fn native_window_event_route_with_diagnostics(
     });
     let shared = Arc::new(NativeWindowEventRouteShared {
         next_sequence: AtomicU64::new(1),
+        native_input_epoch: Arc::new(AtomicU64::new(0)),
         latest: (0..WINDOW_EVENT_LATEST_SLOTS)
             .map(|_| LatestWindowEventSlot::empty())
             .collect(),
@@ -307,6 +310,16 @@ fn native_window_event_route_with_diagnostics(
 }
 
 impl NativeWindowEventRoute {
+    pub(crate) fn publish_native_input_epoch(&self, epoch: u64) {
+        self.shared
+            .native_input_epoch
+            .store(epoch, Ordering::Release);
+    }
+
+    fn native_input_epoch(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared.native_input_epoch)
+    }
+
     fn record_raise_diagnostic(&self, sample: NativeRaiseSample, replaced: bool) {
         if let Some(diagnostic) = &self.shared.raise_diagnostics
             && diagnostic.tx.try_send((sample, replaced)).is_err()
@@ -363,11 +376,26 @@ impl NativeWindowEventReceiver {
 /// enqueues; the pump and render routes perform work after dispatch returns.
 #[derive(Clone)]
 pub(crate) struct NativeVideoWindowEventSink {
+    /// Logical detached host, before the OS owner transform for placement.
+    /// Canvas touch captures this registered host at native ingress.
+    detached_activation_host: NativeDetachedTouchHost,
     epoch: u64,
     generation: u64,
     source: NativeVideoWindowSource,
     pump_route: NativeWindowEventRoute,
     render_route: NativeWindowEventRoute,
+}
+
+#[derive(Clone, Debug, Default)]
+enum NativeDetachedTouchHost {
+    #[default]
+    Unbound,
+    Unavailable,
+    Bound {
+        allocation: crate::key_input::NativeInputAllocationWitness,
+        source_epoch: Arc<AtomicU64>,
+        output_cancel: Arc<AtomicBool>,
+    },
 }
 
 impl NativeVideoWindowEventSink {
@@ -379,11 +407,80 @@ impl NativeVideoWindowEventSink {
         render_route: NativeWindowEventRoute,
     ) -> Self {
         Self {
+            detached_activation_host: NativeDetachedTouchHost::Unbound,
             epoch,
             generation,
             source,
             pump_route,
             render_route,
+        }
+    }
+
+    pub(crate) fn with_detached_activation_host(
+        mut self,
+        hwnd: u64,
+        source_epoch: Arc<AtomicU64>,
+        output_cancel: Arc<AtomicBool>,
+    ) -> Self {
+        self.detached_activation_host = if hwnd == 0 {
+            NativeDetachedTouchHost::Unbound
+        } else if let Some(allocation) =
+            crate::key_input::native_input_allocation_witness_for_hwnd(hwnd)
+        {
+            NativeDetachedTouchHost::Bound {
+                allocation,
+                source_epoch,
+                output_cancel,
+            }
+        } else {
+            crate::key_input::report_native_window_input_failure(format!(
+                "native canvas touch host allocation unavailable hwnd=0x{hwnd:x}"
+            ));
+            NativeDetachedTouchHost::Unavailable
+        };
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_input_epoch_for_test(&self, epoch: u64) {
+        self.pump_route.publish_native_input_epoch(epoch);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replacement_input_epoch_for_test(&self, epoch: u64) -> Self {
+        let mut next = self.clone();
+        next.epoch = epoch;
+        next.generation = epoch;
+        next
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owned_touch_for_test(
+        &self,
+        ownership: &mut NativeTouchOwnership,
+        touch: NativeVideoTouchEvent,
+    ) {
+        if touch.phase == NativeVideoTouchPhase::Start {
+            assert_eq!(
+                ownership.begin(touch.pointer_id, true, NativePointerTypeProbe::Touch),
+                NativeTouchOwnershipDecision::Owned
+            );
+        }
+        ownership.record_client_position(touch.pointer_id, touch.x, touch.y);
+        send_touch_event(
+            ownership,
+            Some(self),
+            touch.source,
+            touch.pointer_id,
+            [touch.x, touch.y],
+            touch.phase,
+            touch.suppress_widget_primary,
+        );
+        if matches!(
+            touch.phase,
+            NativeVideoTouchPhase::End | NativeVideoTouchPhase::Cancel
+        ) {
+            ownership.release(touch.pointer_id);
         }
     }
 
@@ -1945,6 +2042,7 @@ fn pointer_client_info(hwnd: HWND, pointer_id: u32) -> Option<PointerClientInfo>
 }
 
 fn send_touch_event(
+    ownership: &mut NativeTouchOwnership,
     sink: Option<&NativeVideoWindowEventSink>,
     source: NativeVideoWindowSource,
     pointer_id: u32,
@@ -1953,6 +2051,48 @@ fn send_touch_event(
     suppress_widget_primary: bool,
 ) {
     if let Some(sink) = sink {
+        use crate::key_input::NativeMediaTouchRoute as Route;
+        let mut route = ownership.input_route(pointer_id);
+        if phase == NativeVideoTouchPhase::Start && matches!(route, Route::Unstarted) {
+            route = match &sink.detached_activation_host {
+                NativeDetachedTouchHost::Unbound => Route::Regular,
+                NativeDetachedTouchHost::Unavailable => Route::Suppressed,
+                NativeDetachedTouchHost::Bound {
+                    allocation,
+                    source_epoch,
+                    output_cancel,
+                } => crate::key_input::begin_native_media_touch(
+                    allocation,
+                    egui::Id::new((
+                        "native-canvas-contact",
+                        sink.epoch,
+                        source == NativeVideoWindowSource::Presenter,
+                        pointer_id,
+                    )),
+                    Arc::clone(source_epoch),
+                    sink.pump_route.native_input_epoch(),
+                    sink.epoch,
+                    Arc::clone(output_cancel),
+                    source == NativeVideoWindowSource::Presenter,
+                    ownership.only_contact(pointer_id),
+                ),
+            };
+            ownership.set_input_route(pointer_id, route.clone());
+        }
+        if let Route::ActivateOnly(token) | Route::CommandOwned(token) = &route {
+            if matches!(
+                phase,
+                NativeVideoTouchPhase::End | NativeVideoTouchPhase::Cancel
+            ) {
+                crate::key_input::end_native_media_touch(
+                    token,
+                    phase == NativeVideoTouchPhase::Cancel,
+                );
+            }
+        }
+        if matches!(route, Route::ActivateOnly(_) | Route::Suppressed) {
+            return;
+        }
         sink.send(NativeVideoWindowEvent::Touch(NativeVideoTouchEvent {
             source,
             pointer_id,
@@ -2128,6 +2268,7 @@ fn handle_native_touch_pointer_message(
             NativeVideoTouchPhase::Start
         };
         send_touch_event(
+            ownership,
             sink,
             policy.source,
             pointer_id,
@@ -2170,6 +2311,7 @@ fn handle_owned_pointer_followup(
         let suppress_widget_primary = ownership.suppresses_widget_primary(pointer_id);
         if let Some(position) = ownership.last_client_position(pointer_id) {
             send_touch_event(
+                ownership,
                 sink,
                 policy.source,
                 pointer_id,
@@ -2190,6 +2332,7 @@ fn handle_owned_pointer_followup(
             let suppress_widget_primary = ownership.suppresses_widget_primary(pointer_id);
             if let Some(position) = ownership.last_client_position(pointer_id) {
                 send_touch_event(
+                    ownership,
                     sink,
                     policy.source,
                     pointer_id,
@@ -2208,6 +2351,7 @@ fn handle_owned_pointer_followup(
     let suppress_widget_primary = ownership.suppresses_widget_primary(pointer_id);
     let phase = native_touch_followup_phase(info.cancelled, msg == WM_POINTERUP);
     send_touch_event(
+        ownership,
         sink,
         policy.source,
         pointer_id,
@@ -2229,6 +2373,7 @@ pub(crate) fn cancel_hud_touch_streams(
         let suppress_widget_primary = ownership.suppresses_widget_primary(pointer_id);
         if let Some(position) = ownership.last_client_position(pointer_id) {
             send_touch_event(
+                ownership,
                 Some(sink),
                 NativeVideoWindowSource::Hud,
                 pointer_id,
@@ -2363,6 +2508,13 @@ unsafe extern "system" fn wnd_proc(
             }
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
+            if wparam.0 == 0x1b
+                && let Some(state) = window_state(hwnd)
+            {
+                state
+                    .touch_ownership
+                    .cancel_detached_activation(crate::key_input::NativeInputCancelReason::Escape);
+            }
             if let Some(sink) = window_state(hwnd).and_then(|s| s.event_sink.as_ref())
                 && let Some(key) = native_key_event(hwnd, msg, wparam, lparam)
             {
@@ -2685,6 +2837,13 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_CAPTURECHANGED | WM_CANCELMODE => {
             if let Some(state) = window_state_mut(hwnd) {
+                state
+                    .touch_ownership
+                    .cancel_detached_activation(if msg == WM_CANCELMODE {
+                        crate::key_input::NativeInputCancelReason::CancelMode
+                    } else {
+                        crate::key_input::NativeInputCancelReason::CaptureLost
+                    });
                 if let Some(sink) = state.event_sink.as_ref() {
                     sink.send(NativeVideoWindowEvent::CursorOwnership(
                         NativeCursorOwnershipEdge::CaptureLost,
@@ -2699,6 +2858,14 @@ unsafe extern "system" fn wnd_proc(
                 } else {
                     state.held_mouse_buttons = NativeHeldMouseButtons::default();
                 }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_KILLFOCUS => {
+            if let Some(state) = window_state(hwnd) {
+                state.touch_ownership.cancel_detached_activation(
+                    crate::key_input::NativeInputCancelReason::FocusLost,
+                );
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }

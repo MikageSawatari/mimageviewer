@@ -3,6 +3,122 @@
 use super::*;
 use crate::ui_fullscreen::page_turn_submission_tests::{draw_current, ready_app};
 
+#[test]
+fn native_unknown_pointer_release_clears_only_its_page_turn_delivery() {
+    use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+    struct NoDisplay;
+    impl winit::raw_window_handle::HasDisplayHandle for NoDisplay {
+        fn display_handle(
+            &self,
+        ) -> Result<
+            winit::raw_window_handle::DisplayHandle<'_>,
+            winit::raw_window_handle::HandleError,
+        > {
+            Err(winit::raw_window_handle::HandleError::Unavailable)
+        }
+    }
+    for (native, button) in [
+        (MouseButton::Left, egui::PointerButton::Primary),
+        (MouseButton::Right, egui::PointerButton::Secondary),
+        (MouseButton::Middle, egui::PointerButton::Middle),
+        (MouseButton::Back, egui::PointerButton::Extra1),
+        (MouseButton::Forward, egui::PointerButton::Extra2),
+    ] {
+        let ctx = egui::Context::default();
+        let mut state = egui_winit::State::new(
+            ctx.clone(),
+            egui::ViewportId::ROOT,
+            &NoDisplay,
+            Some(1.0),
+            None,
+            None,
+        );
+        let mouse = |button, state| WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state,
+            button,
+        };
+        let movement = |x| WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: winit::dpi::PhysicalPosition::new(x, 200.0),
+        };
+        let survivor = if button == egui::PointerButton::Primary {
+            egui::PointerButton::Secondary
+        } else {
+            egui::PointerButton::Primary
+        };
+        let survivor_native = if survivor == egui::PointerButton::Secondary {
+            MouseButton::Right
+        } else {
+            MouseButton::Left
+        };
+        let press_id = egui::Id::unique(("page_turn_pointer_presses", egui::ViewportId::ROOT));
+        let transaction_id =
+            egui::Id::unique(("page_turn_pointer_transaction", egui::ViewportId::ROOT));
+        let mut frame = |events: Vec<WindowEvent>| {
+            for event in events {
+                let _ = state
+                    .on_pointer_event(&event, 1.0)
+                    .expect("native pointer event");
+            }
+            ctx.run_pass(state.egui_input_mut().take(), observe_pointer_transaction)
+                .drop_without_applying_deltas();
+        };
+        frame(vec![
+            movement(599.0),
+            mouse(native, ElementState::Pressed),
+            mouse(survivor_native, ElementState::Pressed),
+        ]);
+        let original = ctx
+            .data(|d| d.get_temp::<PointerPresses>(press_id))
+            .unwrap();
+        assert!(original.buttons[button as usize].id().is_some());
+        let survivor_id = original.buttons[survivor as usize].id();
+        assert!(survivor_id.is_some());
+        frame(vec![movement(601.0)]);
+        frame(vec![WindowEvent::CursorLeft {
+            device_id: DeviceId::dummy(),
+        }]);
+        frame(vec![mouse(native, ElementState::Released)]);
+        let remaining = ctx
+            .data(|d| d.get_temp::<PointerPresses>(press_id))
+            .unwrap();
+        assert!(
+            remaining.buttons[button as usize].id().is_none(),
+            "{button:?}: terminal release must clear its delivery"
+        );
+        assert_eq!(
+            remaining.buttons[survivor as usize].id(),
+            survivor_id,
+            "sibling hold remains owned"
+        );
+        let transaction = ctx
+            .data(|d| d.get_temp::<PointerTransaction>(transaction_id))
+            .unwrap();
+        assert!(
+            transaction.facts.is_empty(),
+            "unknown release authorizes no page operation"
+        );
+        // A later positioned release cannot revive the retired press delivery.
+        frame(vec![movement(500.0)]);
+        frame(vec![mouse(native, ElementState::Released)]);
+        let transaction = ctx
+            .data(|d| d.get_temp::<PointerTransaction>(transaction_id))
+            .unwrap();
+        assert!(
+            transaction.facts.is_empty(),
+            "{button:?}: old delivery must stay retired"
+        );
+        assert_eq!(
+            ctx.data(|d| d.get_temp::<PointerPresses>(press_id))
+                .unwrap()
+                .buttons[survivor as usize]
+                .id(),
+            survivor_id
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 enum InputRoute {
     ViewerEgui,

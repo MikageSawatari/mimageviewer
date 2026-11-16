@@ -784,6 +784,7 @@ fn manual_nav_wrap_nonwrapped_hidden_pdf_lands_on_plain_image() {
 fn manual_nav_wrap_permission_free_hidden_skip_keeps_other_routes_unchanged() {
     for route in [
         BookTargetRoute::FullscreenOpen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             metadata_boundary: FsMetadataBoundary::Manual,
             resume_notice: None,
         },

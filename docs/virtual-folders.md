@@ -12,6 +12,16 @@ facet の手動復元は有効な帰路 frame 一件だけを消費し、新し�
 階層消失と wrapper collapse が重なる場合、実際の祖先 scope に保存した条件を復元し、
 route の位置番号によって外側の条件まで復元しない。
 
+## 外部openとviewer採用の所有（§1.767、依頼50 B）
+
+起動・別プロセスから受けた新規openは、typed startup ownerで `MainNew` を確定し、既存navigation／
+hydration／deferred reopenに保持する。対象ページを採用できる最終境界で通常gridと同じhandoffを一度通し、
+旧独立ownerのpark／closeを終えてから新sessionを公開する。mainの採用済み一覧は物理静止画の新Cへ移さない。
+Bookmarkのloading C、Collectionのreopen、既にCが所有する列挙継続は `ContextContinuation`として自己parkしない。
+PDF cached rowsの即時採用や既存verificationの待機条件、DirectMediaのreader／main basis対の所有条件は維持する。
+Smart childとZIP内変換提案も採用区分を失わず、未発見・拒否・取消・staleでhandoffしない。
+詳細と検証は[依頼50調査書 §3](depth-parallax-realmachine50-investigation.md#3-b--外部openが旧独立ownerを退役させずsessionを置き換える)を参照。
+
 ## 画像folder→Stored ZIP（§1.242 G、実装中・検証待ち）
 
 `image_folder_zip`が直下全画像のmanifestとentry対応、Stored/ZIP64出力とno-clobber公開を担当する。

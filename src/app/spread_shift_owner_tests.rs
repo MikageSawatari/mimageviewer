@@ -1171,6 +1171,7 @@ fn retained_sibling_fence_is_independent_of_other_contexts_pending_global_checki
     env.settings.sidecar_backup_enabled = true;
     let now = Instant::now();
     let continuation = SidecarLoadContinuation {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         navigation_after_hydration: None,
         audio_art_prune: None,
         first_display_action: FirstDisplayAction::None,
@@ -1480,6 +1481,7 @@ fn sibling_memory_toggle_refreshes_fresh_common_policy_and_keeps_original_resume
         .unwrap();
     let now = Instant::now();
     let continuation = SidecarLoadContinuation {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         navigation_after_hydration: None,
         audio_art_prune: None,
         first_display_action: FirstDisplayAction::None,
@@ -1755,6 +1757,7 @@ fn fresh_common_resume_fence_ends_before_later_session_resume_reads() {
     );
     let now = Instant::now();
     let continuation = SidecarLoadContinuation {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         navigation_after_hydration: None,
         audio_art_prune: None,
         first_display_action: FirstDisplayAction::None,
@@ -1884,6 +1887,7 @@ fn begin_test_book_open(app: &mut App, root: &Path) {
     use super::sidecar_restore::{FirstDisplayAction, SidecarLoadContinuation};
     let now = Instant::now();
     let continuation = SidecarLoadContinuation {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         navigation_after_hydration: None,
         audio_art_prune: None,
         first_display_action: FirstDisplayAction::None,

@@ -112,6 +112,7 @@ pub(super) enum FirstDisplayAction {
 }
 
 pub(crate) struct SidecarLoadContinuation {
+    pub(super) viewer_adoption: super::ViewerOpenAdoption,
     pub(super) navigation_after_hydration: Option<super::MainListAfterHydration>,
     /// Accepted folder maintenance travels with this continuation to its new worker queue.
     /// Dropping a superseded continuation also drops the work and its catalog admission.
@@ -193,6 +194,7 @@ struct Common {
 }
 
 struct DeferredFullscreen {
+    viewer_adoption: super::ViewerOpenAdoption,
     idx: usize,
     trigger: HistoryTrigger,
     item_key: String,
@@ -692,6 +694,7 @@ impl SidecarRestoreState {
         load_contract: FsPageLoadContract,
         metadata_boundary: FsMetadataBoundary,
         resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: super::ViewerOpenAdoption,
     ) -> bool {
         if !self.target_matches(context, generation) {
             return false;
@@ -701,14 +704,19 @@ impl SidecarRestoreState {
             *after_prepare = IndexOnlyAfterPrepare::None;
         }
         if let ContinuationOwner::Live(continuation) = &mut self.common.continuation
-            && matches!(
+            && (matches!(
                 continuation.first_display_action,
                 FirstDisplayAction::ArchiveBook(_)
-            )
+            ) || (viewer_adoption == super::ViewerOpenAdoption::MainNew
+                && matches!(
+                    continuation.first_display_action,
+                    FirstDisplayAction::AutoFullscreenFolder
+                )))
         {
             continuation.first_display_action = FirstDisplayAction::None;
         }
         self.common.deferred_fullscreen = Some(DeferredFullscreen {
+            viewer_adoption,
             idx,
             trigger,
             item_key,
@@ -1020,6 +1028,7 @@ impl App {
                 tag_item_keys: Vec::new(),
                 source_path: Some(folder.clone()),
                 continuation: ContinuationOwner::Live(SidecarLoadContinuation {
+                    viewer_adoption: super::ViewerOpenAdoption::ContextContinuation,
                     first_display_action: FirstDisplayAction::None,
                     navigation_after_hydration: None,
                     audio_art_prune: None,
@@ -1234,6 +1243,27 @@ impl App {
         metadata_boundary: FsMetadataBoundary,
         resume_notice: Option<BookResumeNotice>,
     ) -> bool {
+        self.defer_sidecar_restore_fullscreen_with_adoption(
+            idx,
+            trigger,
+            requested_materialization,
+            load_contract,
+            metadata_boundary,
+            resume_notice,
+            super::ViewerOpenAdoption::ContextContinuation,
+        )
+    }
+
+    pub(super) fn defer_sidecar_restore_fullscreen_with_adoption(
+        &mut self,
+        idx: usize,
+        trigger: HistoryTrigger,
+        requested_materialization: FsOpenMaterialization,
+        load_contract: FsPageLoadContract,
+        metadata_boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: super::ViewerOpenAdoption,
+    ) -> bool {
         if self.sidecar_restore.is_none() {
             return false;
         }
@@ -1251,6 +1281,7 @@ impl App {
                     load_contract,
                     metadata_boundary,
                     resume_notice,
+                    viewer_adoption,
                 )
             } else {
                 false
@@ -2702,7 +2733,7 @@ impl App {
             }
             if let Some(deferred) = state.common.deferred_fullscreen.take() {
                 if deferred.matches_item(&self.items) {
-                    self.open_fullscreen_with_metadata_boundary(
+                    self.open_fullscreen_with_metadata_boundary_and_adoption(
                         deferred.idx,
                         deferred.trigger,
                         deferred.requested_materialization,
@@ -2710,6 +2741,7 @@ impl App {
                         None,
                         deferred.metadata_boundary,
                         deferred.resume_notice,
+                        deferred.viewer_adoption,
                     );
                 } else {
                     #[cfg(windows)]
@@ -2760,7 +2792,7 @@ impl App {
                 .get(deferred.idx)
                 .is_some_and(|item| item.perf_key() == deferred.item_key)
             {
-                self.open_fullscreen_with_metadata_boundary(
+                self.open_fullscreen_with_metadata_boundary_and_adoption(
                     deferred.idx,
                     deferred.trigger,
                     deferred.requested_materialization,
@@ -2768,6 +2800,7 @@ impl App {
                     None,
                     deferred.metadata_boundary,
                     deferred.resume_notice,
+                    deferred.viewer_adoption,
                 );
             } else {
                 deferred_identity_mismatch = true;
@@ -3172,6 +3205,7 @@ fn sidecar_restore_retains_egui_event(event: &egui::Event) -> bool {
         event,
         egui::Event::Key { pressed: false, .. }
             | egui::Event::PointerButton { pressed: false, .. }
+            | egui::Event::PointerButtonReleased { .. }
             | egui::Event::PointerGone
             | egui::Event::Touch {
                 phase: egui::TouchPhase::End | egui::TouchPhase::Cancel,
@@ -3453,6 +3487,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let now = std::time::Instant::now();
         SidecarLoadContinuation {
+            viewer_adoption: super::ViewerOpenAdoption::ContextContinuation,
             navigation_after_hydration: None,
             audio_art_prune: None,
             first_display_action: FirstDisplayAction::None,
@@ -4260,6 +4295,7 @@ mod tests {
                     };
                     continuation.navigation_after_hydration =
                         Some(crate::app::MainListAfterHydration::RequiredFullscreen {
+                            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                             target: crate::snapshot::SnapshotTarget::Fs(page.clone()),
                             history_trigger: HistoryTrigger::UserChosen,
                         });
@@ -4278,6 +4314,7 @@ mod tests {
                         FsPageLoadContract::Sequential
                     ));
                     owner.fs_nav_after_pdf_enumerate = Some(crate::app::DeferredFsReopen {
+                        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                         history_trigger: HistoryTrigger::UserChosen,
                         resume_slideshow: false,
                         target: crate::app::DeferredFsTarget::None,
@@ -4374,6 +4411,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let now = std::time::Instant::now();
         let continuation = SidecarLoadContinuation {
+            viewer_adoption: super::ViewerOpenAdoption::ContextContinuation,
             navigation_after_hydration: None,
             audio_art_prune: None,
             first_display_action: FirstDisplayAction::None,
@@ -4436,6 +4474,7 @@ mod tests {
         let (thumb_tx, _thumb_rx) = mpsc::channel::<ThumbMsg>();
         let started_at = std::time::Instant::now();
         let continuation = SidecarLoadContinuation {
+            viewer_adoption: super::ViewerOpenAdoption::ContextContinuation,
             first_display_action: FirstDisplayAction::None,
             navigation_after_hydration: None,
             audio_art_prune: None,
@@ -4525,6 +4564,7 @@ mod tests {
         assert!(
             app.begin_sidecar_restore(
                 SidecarLoadContinuation {
+                    viewer_adoption: super::ViewerOpenAdoption::ContextContinuation,
                     first_display_action: FirstDisplayAction::None,
                     navigation_after_hydration: None,
                     audio_art_prune: None,
@@ -5063,6 +5103,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<ThumbMsg>();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut owner = ContinuationOwner::Live(SidecarLoadContinuation {
+            viewer_adoption: super::ViewerOpenAdoption::ContextContinuation,
             first_display_action: FirstDisplayAction::None,
             navigation_after_hydration: None,
             audio_art_prune: None,
@@ -5094,6 +5135,7 @@ mod tests {
     #[test]
     fn deferred_fullscreen_preserves_virtual_page_open_contract() {
         let deferred = DeferredFullscreen {
+            viewer_adoption: super::ViewerOpenAdoption::ContextContinuation,
             idx: 7,
             trigger: HistoryTrigger::UserChosen,
             item_key: "page-key".into(),
@@ -5269,6 +5311,7 @@ mod tests {
             assert!(!app.sidecar_restore_navigation_fullscreen_wait_active());
             let action = if required {
                 MainListAfterHydration::RequiredFullscreen {
+                    viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                     target: crate::snapshot::SnapshotTarget::Fs(folder.join("page.jpg")),
                     history_trigger: HistoryTrigger::UserChosen,
                 }

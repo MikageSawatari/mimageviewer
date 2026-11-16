@@ -456,7 +456,7 @@ fn run_depth_dialog_owner_case(host: &'static str, export: bool) {
         if let Some(sibling) = sibling {
             assert!(
                 !app.with_viewer_context(sibling, |owner| owner
-                    .mounted_viewer_owns_depth_dialogs())
+                    .depth_addon_dialog_in_mounted_viewer())
                     .unwrap()
             );
             assert!(
@@ -495,6 +495,70 @@ macro_rules! depth_dialog_owner_scenario {
     };
 }
 depth_dialog_owner_scenario!(multiwindow_depth_addon_grid, "grid", false);
+
+#[test]
+fn multiwindow_depth_paused_last_active_resume_close_does_not_register_passive_again() {
+    std::thread::spawn(|| {
+        for main_fullscreen in [false, true] {
+            for depth in [false, true] {
+                let mut app = setup_app_for_test();
+                app.initialized = true;
+                app.indexer_init.mark_unavailable_if_not_ready();
+                let mut driver = ScenarioDriver::new();
+                crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+                let ctx = driver.ctx.clone();
+                super::depth_view_tests::install_pages(&mut app, &ctx);
+                app.viewer_presentation = ViewerPresentation::Fullscreen;
+                app.native_video_in_window_active = false;
+                app.settings.fullscreen_keep_on_app_switch = true;
+                if !main_fullscreen {
+                    app.fullscreen_idx = None;
+                }
+                let path = app.tmp.path().join("paused-resume.png");
+                save_portrait(&path, [60, 90, 120]);
+                let window = 89_100;
+                let owner = app.build_active_context_for_test(Some(window), DetachedSource::Image, |app| {
+                    configure_active_still(app, &ctx, path, window, egui::Color32::LIGHT_BLUE);
+                    if depth {
+                        app.set_fs_exclusive_view(
+                            crate::fs_exclusive_view::FsExclusiveView::Depth(
+                                crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context())),
+                            "paused_resume_fixture",
+                        );
+                    }
+                });
+                app.last_active_detached_window_id = Some(window);
+                assert!(app.pause_current_active_viewer_context(&ctx));
+                assert_eq!(app.last_active_detached_window_id, Some(window));
+                assert_eq!(app.active_viewer_context_id(), None);
+                assert_eq!(app.detached_image_windows.iter().filter(|s| s.id == window).count(), 1);
+                assert!(app.activate_detached_image_window_snapshot(&ctx, window));
+                assert_eq!(app.active_viewer_context_id(), Some(owner));
+                assert_eq!(app.detached_image_windows.iter().filter(|s| s.id == window).count(), 0,
+                    "main_fullscreen={main_fullscreen} depth={depth}: active owns no passive snapshot");
+                let viewport = App::detached_image_window_viewport_id(window);
+                driver.focus(viewport);
+                driver.root(&mut app);
+                assert_eq!(app.accept_active_detached_window_close(&ctx, window, "paused_resume_close"), Some(true));
+                assert!(app.locate_window_context(window).is_none());
+                assert_eq!(app.viewer_context_residence(owner), ContextResidence::Retired);
+                assert!(app.detached_window_state(window).is_none());
+                assert!(!app.detached_image_windows.iter().any(|s| s.id == window));
+                driver.focus(egui::ViewportId::ROOT);
+                // First pass retires the old child; subsequent passes must never
+                // seed it again from an orphan passive snapshot.
+                for _ in 0..3 {
+                    driver.root(&mut app);
+                }
+                assert!(!driver.known.borrow().contains(&viewport));
+                assert!(!driver.callbacks.contains_key(&viewport));
+                assert!(!app.deferred_detached_image_window_views.contains_key(&window));
+                assert!(app.locate_window_context(window).is_none());
+                assert!(app.detached_window_state(window).is_none());
+            }
+        }
+    }).join().unwrap();
+}
 depth_dialog_owner_scenario!(multiwindow_depth_addon_embedded, "embedded", false);
 depth_dialog_owner_scenario!(multiwindow_depth_export_embedded, "embedded", true);
 depth_dialog_owner_scenario!(multiwindow_depth_addon_fullscreen, "fullscreen", false);
@@ -565,8 +629,93 @@ struct ScenarioDriver {
     child_outputs: Rc<RefCell<Vec<(egui::ViewportId, egui::FullOutput)>>>,
     focused: Rc<RefCell<Option<egui::ViewportId>>>,
     known: Rc<RefCell<HashSet<egui::ViewportId>>>,
+    child_events: Rc<RefCell<HashMap<egui::ViewportId, Vec<egui::Event>>>>,
     callbacks: HashMap<egui::ViewportId, Arc<egui::DeferredViewportUiCallback>>,
     number: usize,
+}
+
+#[test]
+fn multiwindow_independent_media_exchange_does_not_register_a_and_closes_b_once() {
+    std::thread::spawn(|| {
+        use super::detached_media_exchange_tests as fixture;
+        let mut app = setup_app_for_test();
+        app.initialized = true;
+        app.indexer_init.mark_unavailable_if_not_ready();
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        let root = app.tmp.path().to_path_buf();
+        fixture::install_items(&mut app, &driver.ctx, &root, false);
+        let (a, c) = fixture::activate_independent_media(&mut app, &driver.ctx);
+        let main = (
+            app.items.clone(),
+            app.selected,
+            app.fullscreen_idx,
+            app.items_generation,
+        );
+        let va = App::detached_image_window_viewport_id(a);
+        driver.focus(va);
+        driver.root(&mut app);
+        assert!(
+            driver.known.borrow().contains(&va),
+            "A registered its real child output before replacement"
+        );
+        app.with_active_viewer_context(|owner| {
+            fixture::resolve_navigation(owner, &driver.ctx, Some(2), true);
+        })
+        .unwrap();
+        let b = app.active_detached_window_id().unwrap();
+        assert_ne!(a, b);
+        let vb = App::detached_image_window_viewport_id(b);
+        driver.focus(vb);
+        for _ in 0..3 {
+            driver.root(&mut app);
+        }
+        assert!(!driver.known.borrow().contains(&va));
+        assert!(!driver.callbacks.contains_key(&va));
+        assert!(driver.known.borrow().contains(&vb));
+        assert_eq!(app.viewer_context_window(c), Some(b));
+        assert_eq!(
+            (
+                app.items.clone(),
+                app.selected,
+                app.fullscreen_idx,
+                app.items_generation
+            ),
+            main
+        );
+        app.with_active_viewer_context(|owner| {
+            assert!(owner.detached_viewer_independent_active);
+            owner.open_fullscreen_from_fs_navigation(&driver.ctx, 3, HistoryTrigger::UserChosen);
+        })
+        .unwrap();
+        assert_eq!(app.active_detached_window_id(), Some(b));
+        fixture::install_media(&mut app, 1);
+        fixture::open_grid(&mut app, &driver.ctx, 1);
+        assert!(
+            app.locate_window_context(b).is_some(),
+            "new list media preserves the independent still B"
+        );
+        assert!(app.detached_window_state(b).is_some());
+        assert!(app.activate_detached_image_window_snapshot(&driver.ctx, b));
+        assert_eq!(
+            app.accept_active_detached_window_close(&driver.ctx, b, "exchange_close"),
+            Some(true)
+        );
+        assert_eq!(app.viewer_context_residence(c), ContextResidence::Retired);
+        driver.focus(egui::ViewportId::ROOT);
+        for _ in 0..3 {
+            driver.root(&mut app);
+        }
+        for (id, viewport) in [(a, va), (b, vb)] {
+            assert!(app.locate_window_context(id).is_none());
+            assert!(app.detached_window_state(id).is_none());
+            assert!(!driver.known.borrow().contains(&viewport));
+            assert!(!driver.callbacks.contains_key(&viewport));
+            assert!(!app.deferred_detached_image_window_views.contains_key(&id));
+        }
+    })
+    .join()
+    .unwrap();
 }
 
 impl ScenarioDriver {
@@ -580,13 +729,19 @@ impl ScenarioDriver {
         let child_outputs = Rc::new(RefCell::new(Vec::new()));
         let focused = Rc::new(RefCell::new(None));
         let known = Rc::new(RefCell::new(HashSet::from([egui::ViewportId::ROOT])));
+        let child_events = Rc::new(RefCell::new(
+            HashMap::<egui::ViewportId, Vec<egui::Event>>::new(),
+        ));
+        let injected_events = Rc::clone(&child_events);
         let capture = Rc::clone(&child_outputs);
         let child_focus = Rc::clone(&focused);
         let child_known = Rc::clone(&known);
         egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
             let id = viewport.ids.this;
             child_known.borrow_mut().insert(id);
-            let input = Self::input(id, *child_focus.borrow(), CHILD_SIZE, &child_known.borrow());
+            let mut input =
+                Self::input(id, *child_focus.borrow(), CHILD_SIZE, &child_known.borrow());
+            input.events = injected_events.borrow_mut().remove(&id).unwrap_or_default();
             let output = ctx.run_ui(input, |ui| (viewport.viewport_ui_cb)(ui));
             capture.borrow_mut().push((id, output));
         });
@@ -596,6 +751,7 @@ impl ScenarioDriver {
             child_outputs,
             focused,
             known,
+            child_events,
             callbacks: HashMap::new(),
             number: 0,
         }
@@ -710,9 +866,18 @@ impl ScenarioDriver {
     /// Deferred children repaint independently after ROOT registration. Their events
     /// become visible to the App on the next ROOT update.
     fn deferred(&mut self, id: egui::ViewportId) -> ScenarioFrame {
+        self.deferred_with_events(id, Vec::new())
+    }
+
+    fn deferred_with_events(
+        &mut self,
+        id: egui::ViewportId,
+        events: Vec<egui::Event>,
+    ) -> ScenarioFrame {
         self.number += 1;
         let callback = Arc::clone(self.callbacks.get(&id).expect("ROOT registered child"));
-        let input = Self::input(id, *self.focused.borrow(), CHILD_SIZE, &self.known.borrow());
+        let mut input = Self::input(id, *self.focused.borrow(), CHILD_SIZE, &self.known.borrow());
+        input.events = events;
         let output = with_capture(|| self.ctx.run_ui(input, |ui| callback(ui)));
         let mut records = HashMap::new();
         let mut white = HashMap::new();
@@ -735,6 +900,886 @@ impl ScenarioDriver {
     fn focus(&mut self, id: egui::ViewportId) {
         *self.focused.borrow_mut() = Some(id);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParkedActivationCase {
+    Click,
+    TouchTap,
+    Drag,
+    TouchDrag,
+    ModalInterruption,
+    UncapturedModalInterruption,
+    ActiveSibling,
+    BarClose,
+    TouchBarClose,
+    OverviewTouchClose,
+    OverviewCloseMargin,
+    CanonicalFreshClick,
+    StateInsideRelease,
+    StateOutsideRelease,
+    StateReenteredRelease,
+    BufferedActiveClick,
+}
+
+fn realmachine50_parked_click_case(depth: bool, case: ParkedActivationCase) {
+    realmachine50_parked_click_case_with_touch_policy(depth, case, false, false);
+}
+
+fn realmachine50_parked_click_case_with_touch_policy(
+    depth: bool,
+    case: ParkedActivationCase,
+    gestures_disabled: bool,
+    split_batch: bool,
+) {
+    std::thread::spawn(move || {
+        let _input = crate::key_input::lock_test_input();
+        crate::touch_correlation::with_gestures_disabled(gestures_disabled, || {
+        let mut app = setup_app_for_test();
+        app.initialized = true;
+        app.indexer_init.mark_unavailable_if_not_ready();
+        app.settings.detached_viewer_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.fullscreen_keep_on_app_switch = true;
+        app.settings.page_turn_animation_enabled = false;
+        if case == ParkedActivationCase::TouchDrag {
+            app.settings.touch_still_chrome_learned = true;
+        }
+        let mut driver = ScenarioDriver::new();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&driver.ctx);
+        let ctx = driver.ctx.clone();
+        let paths = [app.tmp.path().join("first.png"), app.tmp.path().join("second.png")];
+        for path in &paths { save_portrait(path, [60, 90, 120]); }
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.image_metas = vec![None; 2];
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.rebuild_visible_indices();
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        for idx in 0..2 {
+            super::source_texture_test_support::seed(&mut app, &ctx, idx);
+        }
+        assert!(app.prepare_detached_context_for_grid_open(&ctx, 0));
+        app.fs_open_intent_from_grid = true;
+        app.open_fullscreen(0, HistoryTrigger::UserChosen);
+        let first = app.active_detached_window_id().unwrap();
+        let owner = app.locate_window_context(first).unwrap().0;
+        assert_ne!(owner, app.viewer_context_main());
+        driver.focus(App::detached_image_window_viewport_id(first));
+        for _ in 0..3 { driver.root(&mut app); }
+        let real_state = matches!(case, ParkedActivationCase::StateInsideRelease | ParkedActivationCase::StateOutsideRelease | ParkedActivationCase::StateReenteredRelease);
+        let canonical_input = if real_state || matches!(case, ParkedActivationCase::CanonicalFreshClick | ParkedActivationCase::BufferedActiveClick | ParkedActivationCase::Drag | ParkedActivationCase::TouchDrag | ParkedActivationCase::TouchTap | ParkedActivationCase::BarClose | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose | ParkedActivationCase::OverviewCloseMargin) {
+            let registration = ctx.viewport_registration(App::detached_image_window_viewport_id(first)).unwrap();
+            Some(crate::key_input::register_test_native_input_allocation(registration, 0x7675_0001))
+        } else { None };
+        if case == ParkedActivationCase::BufferedActiveClick {
+            use egui_winit::pointer_input_observer::{NormalizedPointerInput as Phase, PointerInputSource as Source};
+            let input = canonical_input.as_ref().unwrap();
+            assert!(input.normalized_input(Phase::Pressed(Source::Mouse)).is_none());
+            assert!(input.normalized_input(Phase::Released(Source::Mouse)).is_none());
+            // Its raw click remains in the backend queue while ROOT opens a
+            // sibling. Merely changing callback class must not re-own it.
+        }
+        app.with_viewer_context(owner, |viewer| {
+            assert!(viewer.detached_viewer_independent_active);
+            if real_state {
+                viewer.fs_zoom = 2.0;
+                viewer.fs_pan = egui::vec2(12.0, 8.0);
+            }
+            if depth {
+                viewer.set_fs_exclusive_view(
+                    crate::fs_exclusive_view::FsExclusiveView::Depth(
+                        crate::depth_parallax::DepthViewState::new(viewer.edit_request_owner_context())),
+                    "realmachine50_depth_before_pause",
+                );
+            }
+        }).unwrap();
+        if matches!(case, ParkedActivationCase::OverviewTouchClose | ParkedActivationCase::OverviewCloseMargin) {
+            app.with_viewer_context(owner, |viewer| {
+                // The image fixture seeds items directly. Supply the immutable
+                // metadata that normal list hydration prepares before overview.
+                viewer.page_identity_index = Arc::new(super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &viewer.items, viewer.current_folder.as_deref(), viewer.settings.file_type_visibility.clone()));
+                assert!(viewer.prepared_page_overview_projection().is_some());
+                assert!(viewer.open_page_overview_for_viewer(&ctx),
+                    "overview fixture admission={:?}, owner={:?}, barrier={}, sequence={}",
+                    viewer.page_overview_unavailable_reason(), viewer.page_overview_active_context_serial(),
+                    viewer.page_turn_barrier_active(), viewer.fs_navigation_sequence_blocks_new_target());
+            }).unwrap();
+            driver.root(&mut app);
+        }
+        assert!(app.prepare_detached_context_for_grid_open(&ctx, 1));
+        app.fs_open_intent_from_grid = true;
+        app.open_fullscreen(1, HistoryTrigger::UserChosen);
+        let second = app.active_detached_window_id().unwrap();
+        assert_ne!(second, first);
+        assert_eq!(app.detached_window_state(first), Some(DetachedWindowState::Parked));
+        app.with_viewer_context(owner, |viewer| assert!(!viewer.fs_exclusive_view.is_depth())).unwrap();
+        driver.focus(App::detached_image_window_viewport_id(second));
+        driver.root(&mut app);
+        let sibling_owner = app.locate_window_context(second).unwrap().0;
+        if case != ParkedActivationCase::ActiveSibling {
+            assert_eq!(app.accept_active_detached_window_close(&ctx, second, "realmachine50_sibling_close"), Some(true));
+        }
+        let viewport = App::detached_image_window_viewport_id(first);
+        let hwnd = 0x7675_0001;
+        app.detached_window_hwnd_set(first, hwnd);
+        app.set_detached_window_live_hwnds_for_test([hwnd]);
+        driver.focus(egui::ViewportId::ROOT);
+        for _ in 0..3 { driver.root(&mut app); }
+        assert!(driver.callbacks.contains_key(&viewport));
+        if matches!(case, ParkedActivationCase::OverviewTouchClose | ParkedActivationCase::OverviewCloseMargin) {
+            assert!(app.detached_image_windows.iter().find(|window| window.id == first).unwrap().display.overview().is_some());
+        }
+        driver.focus(viewport);
+        let pos = if case == ParkedActivationCase::OverviewTouchClose {
+            let rect = App::page_overview_window_close_rect(egui::Rect::from_min_size(egui::Pos2::ZERO, CHILD_SIZE));
+            let pos = egui::pos2(rect.right() - 1.0, rect.center().y);
+            assert!(!crate::ui_fullscreen::detached_image_window_bar_close_button_rect(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, CHILD_SIZE)).contains(pos));
+            pos
+        } else if case == ParkedActivationCase::OverviewCloseMargin {
+            let rect = crate::ui_fullscreen::detached_image_window_bar_close_button_rect(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, CHILD_SIZE));
+            let pos = egui::pos2(rect.left() + 1.0, rect.center().y);
+            assert!(!App::page_overview_window_close_rect(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, CHILD_SIZE)).contains(pos));
+            pos
+        } else if matches!(case, ParkedActivationCase::BarClose | ParkedActivationCase::TouchBarClose) {
+            crate::ui_fullscreen::detached_image_window_bar_close_button_rect(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, CHILD_SIZE)).center()
+        } else { egui::pos2(80.0, 100.0) };
+        let edge = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary,
+            pressed, modifiers: egui::Modifiers::NONE };
+        if case == ParkedActivationCase::BarClose {
+            driver.deferred_with_events(viewport, vec![egui::Event::PointerMoved(pos)]);
+        }
+        let mut events = vec![egui::Event::PointerMoved(pos), edge(true)];
+        if matches!(case, ParkedActivationCase::TouchTap | ParkedActivationCase::TouchDrag | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose) {
+            let touch = |phase| egui::Event::Touch { device_id: egui::TouchDeviceId(7), id: egui::TouchId(1), phase, pos, force: None };
+            events.insert(0, touch(egui::TouchPhase::Start));
+            events.push(touch(egui::TouchPhase::End));
+        }
+        if matches!(case, ParkedActivationCase::Drag | ParkedActivationCase::TouchDrag) {
+            if case == ParkedActivationCase::TouchDrag {
+                // End and its promoted release follow the motion in a later callback.
+                events.pop();
+                for moved in [egui::pos2(250.0, 170.0), pos] {
+                    events.extend([egui::Event::Touch { device_id: egui::TouchDeviceId(7), id: egui::TouchId(1), phase: egui::TouchPhase::Move, pos: moved, force: None }, egui::Event::PointerMoved(moved)]);
+                }
+                events.push(egui::Event::Touch { device_id: egui::TouchDeviceId(7), id: egui::TouchId(1), phase: egui::TouchPhase::End, pos, force: None });
+            } else {
+                events.extend([egui::Event::PointerMoved(egui::pos2(250.0, 170.0)), egui::Event::PointerMoved(pos)]);
+            }
+        }
+        if matches!(case, ParkedActivationCase::ModalInterruption | ParkedActivationCase::UncapturedModalInterruption) {
+            let shared = app.deferred_detached_image_window_views[&first].clone();
+            let origin = app.detached_activation_request(&ctx, first, DetachedActivationSource::ClientClick);
+            if case == ParkedActivationCase::ModalInterruption {
+                driver.deferred_with_events(viewport, events.clone());
+            } else {
+                // Only native control metadata is delivered here; activation
+                // must still come from the actual deferred callback below.
+                shared.feed_native_activation_boundary(origin.clone(), crate::key_input::NativeClientInputBoundary {
+                    operation: egui::Id::new("uncaptured-modal"), boundary: crate::key_input::NativeClientBoundary::Pressed,
+                });
+                events.insert(1, egui::Event::PointerInputProvenance(egui::Id::new("uncaptured-modal")));
+            }
+            app.show_settings_restore = true;
+            assert!(app.common_modal_dialog_open());
+            driver.root(&mut app);
+            app.show_settings_restore = false;
+            driver.root(&mut app);
+            if case == ParkedActivationCase::ModalInterruption {
+                events = Vec::new();
+            } else {
+                shared.feed_native_activation_boundary(origin, crate::key_input::NativeClientInputBoundary {
+                    operation: egui::Id::new("uncaptured-modal"), boundary: crate::key_input::NativeClientBoundary::Released,
+                });
+            }
+        }
+        events.push(edge(false));
+        if matches!(case, ParkedActivationCase::TouchTap | ParkedActivationCase::TouchDrag | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose) { events.push(egui::Event::PointerGone); }
+        if matches!(case, ParkedActivationCase::CanonicalFreshClick | ParkedActivationCase::Drag | ParkedActivationCase::TouchDrag | ParkedActivationCase::TouchTap | ParkedActivationCase::BarClose | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose | ParkedActivationCase::OverviewCloseMargin) {
+            use egui_winit::pointer_input_observer::{NormalizedPointerInput as Phase, PointerInputSource as Source};
+            let input = canonical_input.as_ref().unwrap();
+            let touch = matches!(case, ParkedActivationCase::TouchTap | ParkedActivationCase::TouchDrag | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose);
+            let source = if touch { Source::Touch(1) } else { Source::Mouse };
+            let operation = input.normalized_input(Phase::Pressed(source)).expect("parked canonical owner proves the press");
+            if !split_batch && !matches!(case, ParkedActivationCase::Drag | ParkedActivationCase::TouchDrag) {
+                assert!(input.normalized_input(Phase::Released(source)).is_none());
+            }
+            events.insert(if touch { 0 } else { 1 }, egui::Event::PointerInputProvenance(operation));
+        }
+        let pan_before = app.with_viewer_context(owner, |viewer| (viewer.fs_zoom, viewer.fs_pan)).unwrap();
+        if real_state {
+            use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+            crate::key_input::install_normalized_pointer_input_observer(&ctx);
+            let mut state = realmachine55_pointer_state(&ctx, viewport);
+            let mouse = |phase| WindowEvent::MouseInput { device_id: DeviceId::dummy(), state: phase, button: MouseButton::Left };
+            state.on_pointer_event(&mouse(ElementState::Pressed), 2.0);
+            state.on_pointer_event(&WindowEvent::CursorMoved { device_id: DeviceId::dummy(), position: winit::dpi::PhysicalPosition::new(if case == ParkedActivationCase::StateInsideRelease { 500.0 } else { -40.0 }, 340.0) }, 2.0);
+            if case != ParkedActivationCase::StateInsideRelease {
+                // Captured outside motion followed by TrackMouseEvent's leave.
+                state.on_pointer_event(&WindowEvent::CursorLeft { device_id: DeviceId::dummy() }, 2.0);
+            }
+            if case == ParkedActivationCase::StateReenteredRelease {
+                state.on_pointer_event(&WindowEvent::CursorEntered { device_id: DeviceId::dummy() }, 2.0);
+                state.on_pointer_event(&WindowEvent::CursorMoved { device_id: DeviceId::dummy(), position: winit::dpi::PhysicalPosition::new(160.0, 200.0) }, 2.0);
+            }
+            driver.deferred_with_events(viewport, state.egui_input_mut().take().events);
+            app.process_deferred_detached_image_window_events_for_test(&ctx);
+            assert!(!app.detached_window_deferred_activation_pending(first), "held State drag cannot resume");
+            assert_eq!(app.detached_window_state(first), Some(DetachedWindowState::Parked));
+            state.on_pointer_event(&mouse(ElementState::Released), 2.0);
+            driver.deferred_with_events(viewport, state.egui_input_mut().take().events);
+            assert!(!ctx.input_for(viewport, |input| input.pointer.primary_down()), "physical release must terminate egui hold without inventing position");
+            if case == ParkedActivationCase::StateOutsideRelease {
+                assert_eq!(ctx.input_for(viewport, |input| input.pointer.hover_pos()), None);
+            }
+        } else if matches!(case, ParkedActivationCase::Drag | ParkedActivationCase::TouchDrag) {
+            let release = events.iter().position(|event| matches!(event, egui::Event::Touch { phase: egui::TouchPhase::End, .. }))
+                .unwrap_or_else(|| events.iter().position(|event| matches!(event, egui::Event::PointerButton { pressed: false, .. })).unwrap());
+            let released = events.split_off(release);
+            driver.deferred_with_events(viewport, events);
+            app.process_deferred_detached_image_window_events_for_test(&ctx);
+            assert!(!app.detached_window_deferred_activation_pending(first), "held drag cannot resume before release");
+            assert_eq!(app.detached_window_state(first), Some(DetachedWindowState::Parked));
+            assert_eq!(app.with_viewer_context(owner, |viewer| (viewer.fullscreen_idx, viewer.fs_zoom, viewer.fs_pan)).unwrap(), (Some(0), pan_before.0, pan_before.1));
+            use egui_winit::pointer_input_observer::{NormalizedPointerInput as Phase, PointerInputSource as Source};
+            let source = if case == ParkedActivationCase::TouchDrag { Source::Touch(1) } else { Source::Mouse };
+            assert!(canonical_input.as_ref().unwrap().normalized_input(Phase::Released(source)).is_none());
+            driver.deferred_with_events(viewport, released);
+        } else if split_batch {
+            assert_eq!(case, ParkedActivationCase::TouchTap);
+            let end = events.iter().position(|event| matches!(event,
+                egui::Event::Touch { phase: egui::TouchPhase::End, .. })).unwrap();
+            let released = events.split_off(end);
+            driver.deferred_with_events(viewport, events);
+            app.process_deferred_detached_image_window_events_for_test(&ctx);
+            assert!(!app.detached_window_deferred_activation_pending(first));
+            assert_eq!(app.detached_window_state(first), Some(DetachedWindowState::Parked));
+            assert!(canonical_input.as_ref().unwrap().normalized_input(
+                egui_winit::pointer_input_observer::NormalizedPointerInput::Released(
+                    egui_winit::pointer_input_observer::PointerInputSource::Touch(1))).is_none());
+            driver.deferred_with_events(viewport, released);
+        } else {
+            driver.deferred_with_events(viewport, events);
+        }
+        let main = app.viewer_context_main();
+        let main_before = app.with_viewer_context_ref(main, |viewer| (viewer.selected(), viewer.items_generation())).unwrap();
+        app.process_deferred_detached_image_window_events_for_test(&ctx);
+        if matches!(case, ParkedActivationCase::BarClose | ParkedActivationCase::TouchBarClose | ParkedActivationCase::OverviewTouchClose) {
+            assert!(app.detached_window_state(first).is_none());
+            assert!(app.locate_window_context(first).is_none());
+            assert!(!app.detached_window_deferred_activation_pending(first));
+            assert!(app.active_detached_window_id().is_none());
+            assert_eq!(app.with_viewer_context_ref(main, |viewer| (viewer.selected(), viewer.items_generation())).unwrap(), main_before);
+            return;
+        }
+        if case == ParkedActivationCase::OverviewCloseMargin {
+            assert_eq!(app.detached_window_state(first), Some(DetachedWindowState::Parked));
+            assert_eq!(app.locate_window_context(first).unwrap().0, owner);
+            assert!(!app.detached_window_deferred_activation_pending(first));
+            assert!(app.active_detached_window_id().is_none());
+            app.with_viewer_context(owner, |viewer| assert!(viewer.page_overview_view().is_some())).unwrap();
+            assert_eq!(app.with_viewer_context_ref(main, |viewer| (viewer.selected(), viewer.items_generation())).unwrap(), main_before);
+            return;
+        }
+        if matches!(case, ParkedActivationCase::ModalInterruption | ParkedActivationCase::UncapturedModalInterruption | ParkedActivationCase::BufferedActiveClick) {
+            assert_eq!(app.detached_window_state(first), Some(DetachedWindowState::Parked));
+            assert!(!app.detached_window_deferred_activation_pending(first));
+            assert!(app.active_detached_window_id().is_none());
+            driver.root(&mut app);
+            let mut fresh = vec![egui::Event::PointerMoved(pos), edge(true), edge(false)];
+            if let Some(input) = canonical_input.as_ref() {
+                use egui_winit::pointer_input_observer::{NormalizedPointerInput as Phase, PointerInputSource as Source};
+                let operation = input.normalized_input(Phase::Pressed(Source::Mouse)).unwrap();
+                input.normalized_input(Phase::Released(Source::Mouse));
+                fresh.insert(1, egui::Event::PointerInputProvenance(operation));
+            }
+            driver.deferred_with_events(viewport, fresh);
+            app.process_deferred_detached_image_window_events_for_test(&ctx);
+        }
+        assert!(app.detached_window_deferred_activation_pending(first));
+        assert_ne!(app.active_detached_window_id(), Some(first), "callback handoff only queues, root commits");
+        driver.root(&mut app);
+        assert_eq!(app.active_detached_window_id(), Some(first),
+            "the paused viewport received a complete click, even though neither OS sample contained its down edge");
+        assert_eq!(app.active_viewer_context_id(), Some(owner));
+        assert_eq!(app.viewer_context_window(owner), Some(first));
+        assert_eq!(app.with_viewer_context_ref(main, |viewer| (viewer.selected(), viewer.items_generation())).unwrap(), main_before);
+        if case == ParkedActivationCase::ActiveSibling {
+            assert_eq!(app.locate_window_context(second).unwrap().0, sibling_owner);
+            assert_eq!(app.viewer_context_window(sibling_owner), Some(second));
+            assert_eq!(app.detached_window_state(second), Some(DetachedWindowState::Parked));
+            app.with_viewer_context(sibling_owner, |viewer| assert_eq!(viewer.fullscreen_idx, Some(1))).unwrap();
+        }
+        assert!(!app.detached_image_windows.iter().any(|window| window.id == first));
+        app.with_viewer_context(owner, |viewer| assert_eq!(viewer.fullscreen_idx, Some(0),
+            "the activation click must not turn the reactivated viewer page")).unwrap();
+        driver.root(&mut app);
+        assert_eq!(app.active_detached_window_id(), Some(first));
+        app.with_viewer_context(owner, |viewer| assert_eq!(viewer.fullscreen_idx, Some(0))).unwrap();
+        if real_state || matches!(case, ParkedActivationCase::Drag | ParkedActivationCase::TouchDrag) {
+            assert_eq!(app.with_viewer_context(owner, |viewer| (viewer.fs_zoom, viewer.fs_pan)).unwrap(), pan_before,
+                "the resume drag must not pan the reactivated viewer");
+            if real_state {
+                // A zoomed canvas owns clicks as view operations; it does not
+                // turn pages. Prove the next fresh drag reaches that same view.
+                let start = egui::pos2(CHILD_SIZE.x * 0.5, CHILD_SIZE.y * 0.5);
+                let end = start + egui::vec2(40.0, 30.0);
+                let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+                for events in [vec![egui::Event::PointerMoved(start), button(start, true)],
+                    vec![egui::Event::PointerMoved(end)], vec![button(end, false)]] {
+                    driver.child_events.borrow_mut().insert(viewport, events);
+                    driver.root(&mut app);
+                    assert!(driver.child_events.borrow().is_empty());
+                }
+                app.with_viewer_context(owner, |viewer| {
+                    assert_eq!(viewer.fullscreen_idx, Some(0));
+                    assert_eq!(viewer.fs_zoom, pan_before.0);
+                    assert_ne!(viewer.fs_pan, pan_before.1, "the next fresh drag must pan the zoomed viewer");
+                }).unwrap();
+                return;
+            }
+            let rtl = app.with_viewer_context(owner, |viewer| {
+                assert_eq!(viewer.fullscreen_idx, Some(0));
+                assert_eq!(viewer.items.len(), 2, "the restored viewer has a next page");
+                assert!(viewer.reading_flow.is_paged());
+                viewer.spread_mode.advances_right_to_left()
+            }).unwrap();
+            // Single-page mode uses LTR input: its left half requests the
+            // previous page and correctly stays at page zero without wrapping.
+            let next = egui::pos2(CHILD_SIZE.x * if rtl { 0.25 } else { 0.75 }, CHILD_SIZE.y * 0.5);
+            assert_eq!(crate::touch_input::classify_tap(&crate::touch_input::TapZoneGeometry {
+                surface: egui::Rect::from_min_size(egui::Pos2::ZERO, CHILD_SIZE),
+                excluded: Vec::new(),
+                behavior: crate::touch_input::TouchSurfaceBehavior::Viewer { accepts_pinch: true, tap_zones: true },
+            }, next), crate::touch_input::TapZone::PageSide { left: rtl });
+            let button = |pressed| egui::Event::PointerButton { pos: next, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            let mut next_events = vec![egui::Event::PointerMoved(next), button(true), button(false)];
+            if case == ParkedActivationCase::TouchDrag {
+                let touch = |phase| egui::Event::Touch { device_id: egui::TouchDeviceId(7), id: egui::TouchId(2), phase, pos: next, force: None };
+                next_events.insert(0, touch(egui::TouchPhase::Start));
+                next_events.insert(3, touch(egui::TouchPhase::End));
+                next_events.push(egui::Event::PointerGone);
+            }
+            driver.child_events.borrow_mut().insert(viewport, next_events);
+            driver.root(&mut app);
+            app.with_viewer_context(owner, |viewer| assert_eq!(viewer.fullscreen_idx, Some(1),
+                "the next normal click/tap must reach the active viewer")).unwrap();
+            assert!(driver.child_events.borrow().is_empty());
+        }
+        });
+    }).join().unwrap();
+}
+
+#[test]
+fn realmachine50_parked_depth_window_click_reactivates_after_sibling_close() {
+    realmachine50_parked_click_case(true, ParkedActivationCase::Click);
+}
+
+#[test]
+fn realmachine50_parked_flat_window_click_reactivates_after_sibling_close() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::Click);
+}
+
+#[test]
+fn realmachine50_parked_touch_tap_reactivates_without_page_delivery() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::TouchTap);
+}
+#[test]
+fn realmachine50_parked_diagnostic_touch_disable_same_batch_tap_reactivates() {
+    realmachine50_parked_click_case_with_touch_policy(
+        false,
+        ParkedActivationCase::TouchTap,
+        true,
+        false,
+    );
+}
+#[test]
+fn realmachine50_parked_diagnostic_touch_disable_split_batch_tap_reactivates() {
+    realmachine50_parked_click_case_with_touch_policy(
+        false,
+        ParkedActivationCase::TouchTap,
+        true,
+        true,
+    );
+}
+#[test]
+fn realmachine50_parked_diagnostic_touch_disable_bar_close_owns_the_tap() {
+    realmachine50_parked_click_case_with_touch_policy(
+        false,
+        ParkedActivationCase::TouchBarClose,
+        true,
+        false,
+    );
+}
+#[test]
+fn realmachine55_parked_drag_reactivates_without_page_delivery() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::Drag);
+}
+#[test]
+fn realmachine55_real_state_inside_release_resumes_without_page_or_pan() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::StateInsideRelease);
+}
+#[test]
+fn realmachine55_real_state_outside_release_resumes_without_page_or_pan() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::StateOutsideRelease);
+}
+#[test]
+fn realmachine55_real_state_reentered_release_resumes_without_page_or_pan() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::StateReenteredRelease);
+}
+#[test]
+fn realmachine55_parked_touch_drag_reactivates_without_page_or_pan_delivery() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::TouchDrag);
+}
+#[test]
+fn realmachine50_parked_modal_interruption_does_not_carry_old_release() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::ModalInterruption);
+}
+#[test]
+fn realmachine50_parked_uncaptured_native_press_cannot_cross_brief_modal() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::UncapturedModalInterruption);
+}
+#[test]
+fn realmachine50_parked_click_preserves_sibling_binding_and_page() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::ActiveSibling);
+}
+#[test]
+fn realmachine50_parked_canonical_client_click_reactivates_the_owning_window() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::CanonicalFreshClick);
+}
+#[test]
+fn realmachine50_active_buffered_click_is_not_reowned_after_parking() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::BufferedActiveClick);
+}
+#[test]
+fn realmachine50_parked_coalesced_touch_closes_without_previous_bar_target() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::TouchBarClose);
+}
+
+#[test]
+fn realmachine50_parked_overview_actual_close_rect_accepts_coalesced_touch() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::OverviewTouchClose);
+}
+
+#[test]
+fn realmachine50_parked_overview_margin_keeps_command_owner_without_closing() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::OverviewCloseMargin);
+}
+
+#[test]
+fn realmachine50_parked_bar_close_wins_over_client_activation() {
+    realmachine50_parked_click_case(false, ParkedActivationCase::BarClose);
+}
+
+/// A real egui-winit State with synthetic native events and no desktop window.
+fn realmachine55_pointer_state(
+    ctx: &egui::Context,
+    viewport: egui::ViewportId,
+) -> egui_winit::State {
+    struct NoDisplay;
+    impl winit::raw_window_handle::HasDisplayHandle for NoDisplay {
+        fn display_handle(
+            &self,
+        ) -> Result<
+            winit::raw_window_handle::DisplayHandle<'_>,
+            winit::raw_window_handle::HandleError,
+        > {
+            Err(winit::raw_window_handle::HandleError::Unavailable)
+        }
+    }
+    let mut state =
+        egui_winit::State::new(ctx.clone(), viewport, &NoDisplay, Some(2.0), None, None);
+    state.on_pointer_event(
+        &winit::event::WindowEvent::CursorMoved {
+            device_id: winit::event::DeviceId::dummy(),
+            position: winit::dpi::PhysicalPosition::new(160.0, 200.0),
+        },
+        2.0,
+    );
+    // The active pass already consumed the original move before parking.
+    let _ = state.egui_input_mut().take();
+    state
+}
+
+fn realmachine55_same_position_reentry_click(state: &mut egui_winit::State) -> Vec<egui::Event> {
+    use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+    for event in [
+        WindowEvent::CursorLeft {
+            device_id: DeviceId::dummy(),
+        },
+        WindowEvent::CursorEntered {
+            device_id: DeviceId::dummy(),
+        },
+        // winit omits CursorMoved on same-client-position reentry.
+        WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state: ElementState::Pressed,
+            button: MouseButton::Left,
+        },
+        WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state: ElementState::Released,
+            button: MouseButton::Left,
+        },
+    ] {
+        state
+            .on_pointer_event(&event, 2.0)
+            .expect("actual pointer event");
+    }
+    let events = state.egui_input_mut().take().events;
+    let positions: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                ..
+            } => Some(*pos),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        positions,
+        vec![egui::pos2(80.0, 100.0); 2],
+        "same-position Down/Up use retained physical position"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, egui::Event::PointerInputProvenance(_)))
+            .count(),
+        1,
+        "the real State/observer binds one new operation to its parked owner"
+    );
+    events
+}
+
+/// Real State conversion/observer, allocation lease and App lifecycle. Backend
+/// WindowId routing/GC remain the responsibility of the separate adapter tests.
+fn realmachine55_repeated_client_resume_case(stop_by_sibling: bool, reactivate_sibling: bool) {
+    std::thread::spawn(move || {
+        use eframe::native_window_input::*;
+
+        let _input = crate::key_input::lock_test_input();
+        let mut app = setup_app_for_test();
+        app.initialized = true;
+        app.indexer_init.mark_unavailable_if_not_ready();
+        app.settings.detached_viewer_enabled = false;
+        app.settings.detached_viewer_open_images_in_window = false;
+        app.settings.video_in_window_mode = false;
+        app.settings.fullscreen_keep_on_app_switch = false;
+        app.settings.page_turn_animation_enabled = false;
+        let mut driver = ScenarioDriver::new();
+        let ctx = driver.ctx.clone();
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+        crate::key_input::install_normalized_pointer_input_observer(&ctx);
+        set_native_window_input_listener(
+            &ctx,
+            Arc::new(crate::key_input::TestNativeWindowInputListener),
+        )
+        .unwrap();
+
+        let paths = [
+            app.tmp.path().join("main.png"),
+            app.tmp.path().join("sibling.png"),
+        ];
+        let first_path = app.tmp.path().join("resumed.png");
+        for path in paths.iter().chain([&first_path]) {
+            save_portrait(path, [60, 90, 120]);
+        }
+        app.current_folder = Some(app.tmp.path().to_path_buf());
+        app.items = paths.iter().cloned().map(GridItem::Image).collect();
+        app.image_metas = vec![None; 2];
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.rebuild_visible_indices();
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        for idx in 0..2 {
+            super::source_texture_test_support::seed(&mut app, &ctx, idx);
+        }
+
+        let window = 89_155;
+        let owner =
+            app.build_active_context_for_test(Some(window), DetachedSource::Image, |viewer| {
+                configure_active_still(viewer, &ctx, first_path, window, egui::Color32::LIGHT_BLUE);
+            });
+        let viewport = App::detached_image_window_viewport_id(window);
+        driver.focus(viewport);
+        driver.root(&mut app);
+        let register = |viewport_id, hwnd: u64| {
+            register_native_window_allocation(
+                &ctx,
+                NativeWindowAllocation {
+                    viewport_id,
+                    registration: ctx.viewport_registration(viewport_id).unwrap(),
+                    window_id: NativeWindowId::from(hwnd),
+                    windows_hwnd: Some(hwnd as isize),
+                },
+            )
+        };
+        let _root_lease = register(egui::ViewportId::ROOT, 0x7675_5500);
+        let _first_lease = register(viewport, 0x7675_5501);
+        let root_allocation =
+            native_window_allocation_witness(&ctx, egui::ViewportId::ROOT).unwrap();
+        let first_allocation = native_window_allocation_witness(&ctx, viewport).unwrap();
+        let registration = ctx.viewport_registration(viewport).unwrap();
+        let input_allocation =
+            crate::key_input::native_input_allocation_witness(registration).unwrap();
+        let mut pointer_states = std::collections::HashMap::from([(
+            viewport,
+            realmachine55_pointer_state(&ctx, viewport),
+        )]);
+        app.set_detached_window_live_hwnds_for_test([0x7675_5501]);
+        for _ in 0..2 {
+            driver.root(&mut app);
+        }
+        assert_eq!(app.active_detached_window_id(), Some(window));
+        assert_eq!(app.locate_window_context(window).unwrap().0, owner);
+
+        let mut retained_sibling: Option<(
+            u64,
+            ViewerContextId,
+            egui::ViewportRegistration,
+            NativeWindowAllocationWitness,
+            NativeWindowAllocationLease,
+        )> = None;
+        // The first sibling round establishes the two existing windows. Then
+        // the control performs three B -> A client reactivation round trips.
+        let cycles = if reactivate_sibling { 4 } else { 3 };
+        for cycle in 0..cycles {
+            let (opened_viewport, mut opened_lease, opened_allocation) = if let Some((
+                sibling,
+                sibling_owner,
+                sibling_registration,
+                sibling_allocation,
+                _lease,
+            )) = &retained_sibling
+            {
+                // This is the part3 control: an already existing sibling resumes
+                // through client input and parks A, without another grid open.
+                let sibling_viewport = App::detached_image_window_viewport_id(*sibling);
+                driver.focus(sibling_viewport);
+                for _ in 0..3 {
+                    driver.root(&mut app);
+                }
+                assert!(driver.callbacks.contains_key(&sibling_viewport));
+                assert_eq!(
+                    ctx.viewport_registration(sibling_viewport),
+                    Some(*sibling_registration)
+                );
+                let sibling_input =
+                    crate::key_input::native_input_allocation_witness(*sibling_registration)
+                        .unwrap();
+                let events = realmachine55_same_position_reentry_click(
+                    pointer_states.get_mut(&sibling_viewport).unwrap(),
+                );
+                driver.deferred_with_events(sibling_viewport, events);
+                app.process_deferred_detached_image_window_events_for_test(&ctx);
+                assert!(app.detached_window_deferred_activation_pending(*sibling));
+                driver.root(&mut app);
+                assert_eq!(app.active_detached_window_id(), Some(*sibling));
+                assert_eq!(app.active_viewer_context_id(), Some(*sibling_owner));
+                assert_eq!(
+                    app.detached_window_state(window),
+                    Some(DetachedWindowState::Parked)
+                );
+                assert_eq!(
+                    native_window_allocation_witness(&ctx, sibling_viewport),
+                    Some(sibling_allocation.clone())
+                );
+                assert!(sibling_allocation.is_alive());
+                assert!(sibling_input.is_current());
+                (sibling_viewport, None, sibling_allocation.clone())
+            } else {
+                let idx = usize::from(stop_by_sibling);
+                assert!(app.prepare_detached_context_for_grid_open(&ctx, idx));
+                assert_eq!(
+                    app.detached_window_state(window),
+                    Some(DetachedWindowState::Parked)
+                );
+                app.detached_viewer_open_next_still_detached_once = stop_by_sibling;
+                app.fs_open_intent_from_grid = true;
+                app.open_fullscreen(idx, HistoryTrigger::UserChosen);
+                let opened_viewport = if stop_by_sibling {
+                    let sibling = app
+                        .active_detached_window_id()
+                        .expect("grid opens an independent sibling");
+                    assert_ne!(sibling, window);
+                    App::detached_image_window_viewport_id(sibling)
+                } else {
+                    assert_eq!(app.fullscreen_idx, Some(0));
+                    assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
+                    app.fullscreen_viewport_id()
+                };
+                driver.focus(opened_viewport);
+                driver.root(&mut app);
+                let lease = register(opened_viewport, 0x7675_5510 + cycle);
+                let allocation = native_window_allocation_witness(&ctx, opened_viewport).unwrap();
+                if reactivate_sibling {
+                    pointer_states.insert(
+                        opened_viewport,
+                        realmachine55_pointer_state(&ctx, opened_viewport),
+                    );
+                    let sibling = app.active_detached_window_id().unwrap();
+                    retained_sibling = Some((
+                        sibling,
+                        app.locate_window_context(sibling).unwrap().0,
+                        ctx.viewport_registration(opened_viewport).unwrap(),
+                        allocation.clone(),
+                        lease,
+                    ));
+                    app.set_detached_window_live_hwnds_for_test([0x7675_5501, 0x7675_5510]);
+                    (opened_viewport, None, allocation)
+                } else {
+                    (opened_viewport, Some(lease), allocation)
+                }
+            };
+            if stop_by_sibling && !reactivate_sibling {
+                let sibling = app.active_detached_window_id().unwrap();
+                assert_eq!(
+                    app.accept_active_detached_window_close(
+                        &ctx,
+                        sibling,
+                        "realmachine55_sibling_close"
+                    ),
+                    Some(true)
+                );
+                opened_lease.as_mut().unwrap().retire();
+            }
+            driver.focus(viewport);
+            for _ in 0..3 {
+                driver.root(&mut app);
+            }
+            assert!(
+                driver.callbacks.contains_key(&viewport),
+                "cycle={cycle}: parked callback remains registered"
+            );
+            assert_eq!(ctx.viewport_registration(viewport), Some(registration));
+            assert_eq!(
+                native_window_allocation_witness(&ctx, viewport),
+                Some(first_allocation.clone())
+            );
+            assert!(first_allocation.is_alive());
+            assert!(root_allocation.is_alive());
+            assert!(input_allocation.is_current());
+
+            let events = realmachine55_same_position_reentry_click(
+                pointer_states.get_mut(&viewport).unwrap(),
+            );
+            driver.deferred_with_events(viewport, events);
+            app.process_deferred_detached_image_window_events_for_test(&ctx);
+            assert!(
+                app.detached_window_deferred_activation_pending(window),
+                "cycle={cycle}: client click queues activation"
+            );
+            driver.root(&mut app);
+            assert_eq!(
+                app.active_detached_window_id(),
+                Some(window),
+                "cycle={cycle}: client click resumes the same window"
+            );
+            assert_eq!(app.active_viewer_context_id(), Some(owner));
+            assert_eq!(app.locate_window_context(window).unwrap().0, owner);
+            assert_eq!(app.viewer_context_window(owner), Some(window));
+            assert!(
+                !app.detached_image_windows
+                    .iter()
+                    .any(|snapshot| snapshot.id == window)
+            );
+            app.with_viewer_context(owner, |viewer| {
+                assert_eq!(
+                    viewer.fullscreen_idx,
+                    Some(0),
+                    "cycle={cycle}: activation does not turn the resumed page"
+                )
+            })
+            .unwrap();
+
+            if !stop_by_sibling {
+                // The observed sequence contains a real main-focus close between
+                // successive grid opens. Exercise that consumer, not close_fullscreen.
+                app.fs_focus_grace_elapsed = true;
+                app.reconcile_fullscreen_after_main_focus(&ctx, true, true, false);
+                assert_eq!(
+                    app.fullscreen_idx, None,
+                    "cycle={cycle}: main focus guard closes its own fullscreen"
+                );
+                opened_lease.as_mut().unwrap().retire();
+            }
+            if let Some((
+                sibling,
+                sibling_owner,
+                sibling_registration,
+                sibling_allocation,
+                _lease,
+            )) = &retained_sibling
+            {
+                assert!(opened_allocation.is_alive());
+                assert_eq!(
+                    app.detached_window_state(*sibling),
+                    Some(DetachedWindowState::Parked)
+                );
+                assert_eq!(
+                    app.locate_window_context(*sibling).unwrap().0,
+                    *sibling_owner
+                );
+                assert_eq!(app.viewer_context_window(*sibling_owner), Some(*sibling));
+                assert_eq!(
+                    ctx.viewport_registration(opened_viewport),
+                    Some(*sibling_registration)
+                );
+                assert_eq!(
+                    native_window_allocation_witness(&ctx, opened_viewport),
+                    Some(sibling_allocation.clone())
+                );
+                app.with_viewer_context(*sibling_owner, |viewer| {
+                    assert_eq!(
+                        viewer.fullscreen_idx,
+                        Some(1),
+                        "cycle={cycle}: sibling activation preserves its page"
+                    )
+                })
+                .unwrap();
+                assert!(
+                    app.fullscreen_idx.is_none(),
+                    "sibling reactivation does not create main fullscreen"
+                );
+            } else {
+                assert!(!opened_allocation.is_alive());
+            }
+            driver.root(&mut app);
+            assert_eq!(app.active_detached_window_id(), Some(window));
+            assert_eq!(ctx.viewport_registration(viewport), Some(registration));
+            assert_eq!(
+                native_window_allocation_witness(&ctx, viewport),
+                Some(first_allocation.clone())
+            );
+            assert!(first_allocation.is_alive());
+            assert!(root_allocation.is_alive());
+            assert!(input_allocation.is_current());
+        }
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn realmachine55_client_resume_survives_repeated_main_focus_close_and_grid_open() {
+    realmachine55_repeated_client_resume_case(false, false);
+}
+
+#[test]
+fn realmachine55_client_resume_survives_repeated_sibling_open_and_close() {
+    realmachine55_repeated_client_resume_case(true, false);
+}
+
+#[test]
+fn realmachine55_client_resume_survives_repeated_sibling_reactivation() {
+    realmachine55_repeated_client_resume_case(true, true);
 }
 
 fn records_for(frame: &ScenarioFrame, id: egui::ViewportId) -> &[PaintRecord] {
@@ -3551,4 +4596,362 @@ fn multiwindow_scenario_collection_root_stale_grid_open_is_terminal() {
     })
     .join()
     .expect("scenario thread");
+}
+
+fn independent_depth_dialog_scenario(export: bool, running_close: bool) {
+    std::thread::spawn(move || {
+        let _input = crate::key_input::lock_test_input();
+        let mut app = setup_app_for_test();
+        app.initialized = true;
+        app.indexer_init.mark_unavailable_if_not_ready();
+        // Main is the embedded viewer beside an independent child, not a linked
+        // F12 viewer competing for the active session's child viewport identity.
+        let viewer = super::depth_main_window_tests::RootDepthViewer::new(&mut app);
+        let ctx = viewer.ctx.clone();
+        app.set_fs_exclusive_view(
+            crate::fs_exclusive_view::FsExclusiveView::None,
+            "independent_owner_fixture",
+        );
+        let child =
+            app.build_active_context_for_test(Some(88_980), DetachedSource::Image, |owner| {
+                super::depth_view_tests::install_pages(owner, &ctx);
+                crate::app::source_texture_test_support::seed(owner, &ctx, 0);
+                owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+                owner.detached_viewer_independent_active = true;
+                owner.native_video_in_window_active = false;
+            });
+        app.with_viewer_context(child, |owner| {
+            owner.mark_active_detached_viewport_rendered(&ctx);
+            if export {
+                super::depth_view_tests::install_ready_depth_for_export(owner);
+                viewer.ready(owner);
+                super::depth_view_tests::record_ready_display(owner, &ctx);
+                owner.open_depth_export(&ctx, 0);
+                assert!(owner.depth_export_dialog_open());
+            } else {
+                owner
+                    .depth_setup
+                    .set_status_for_test(crate::addon::AddonStatus::Missing);
+                owner.toggle_depth_parallax(&ctx, 0);
+                assert!(owner.depth_setup.dialog_open_for_test());
+            }
+        })
+        .unwrap();
+        let viewport = App::detached_image_window_viewport_id(88_980);
+        let mut driver = ScenarioDriver::with_ctx(ctx.clone());
+        driver.focus(viewport);
+        let title = if export {
+            "3D 写真の書き出し"
+        } else {
+            "3D 写真の追加モデル"
+        };
+        // Match run_depth_dialog_owner_case: egui's first Area/Window pass only
+        // sizes the newly shown window and intentionally emits no visible title.
+        // Check lifetime on those setup passes too, then require unique placement
+        // on several settled passes rather than treating sizing as missing UI.
+        for pass in 0..7 {
+            let frame = driver.root(&mut app);
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+            assert!(app.fullscreen_embedded_still_active());
+            app.with_viewer_context(child, |owner| {
+                assert_eq!(owner.fullscreen_idx, Some(0));
+                assert_eq!(
+                    owner.viewer_presentation,
+                    ViewerPresentation::DetachedWindow
+                );
+            })
+            .unwrap();
+            if pass < 4 {
+                continue;
+            }
+            let surfaces: Vec<_> = frame
+                .labels
+                .iter()
+                .filter(|(_, labels)| labels.iter().any(|s| s == title))
+                .map(|(id, _)| *id)
+                .collect();
+            assert_eq!(
+                surfaces,
+                vec![viewport],
+                "independent owner only: {:?}",
+                frame.labels
+            );
+        }
+        let draws_in_main = if export {
+            app.depth_export_dialog_in_mounted_viewer()
+        } else {
+            app.depth_addon_dialog_in_mounted_viewer()
+        };
+        assert!(!draws_in_main);
+        if running_close {
+            app.depth_setup.set_dialog_running_for_test();
+            assert!(!app.depth_setup.modal_open());
+            assert!(!app.document_open_modal_admission_blocked());
+            app.close_fullscreen(); // Main is now a grid; independent owner remains live.
+            assert_eq!(
+                app.accept_active_detached_window_close(&ctx, 88_980, "addon_running_close"),
+                Some(true)
+            );
+            for _ in 0..2 {
+                driver.root(&mut app);
+            }
+            let frame = driver.root(&mut app);
+            let surfaces: Vec<_> = frame
+                .labels
+                .iter()
+                .filter(|(_, labels)| labels.iter().any(|s| s == title))
+                .map(|(id, _)| *id)
+                .collect();
+            assert_eq!(surfaces, vec![egui::ViewportId::ROOT]);
+            assert!(!app.common_modal_dialog_open());
+        }
+        crate::key_input::clear_test_frame();
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn multiwindow_depth_independent_addon_dialog_is_drawn_only_in_owner_live_pass() {
+    independent_depth_dialog_scenario(false, false);
+}
+#[test]
+fn multiwindow_depth_independent_export_dialog_is_drawn_only_in_owner_live_pass() {
+    independent_depth_dialog_scenario(true, false);
+}
+#[test]
+fn multiwindow_depth_independent_running_addon_returns_to_actual_root_after_os_close() {
+    independent_depth_dialog_scenario(false, true);
+}
+
+fn depth_transition_pdf(path: &Path) {
+    // Same tiny two-page, valid-xref fixture used by collection-return tests.
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [4 0 R 6 0 R] /Count 2 >>",
+        "<< /Length 0 >>\nstream\nendstream",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 3 0 R >>",
+        "<< /Length 0 >>\nstream\nendstream",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 5 0 R >>",
+    ];
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![];
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n{}\nendobj\n", index + 1, object).as_bytes());
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(b"xref\n0 7\n0000000000 65535 f \n");
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!("trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn depth_accepted_transition_case(kind: &str, export: bool) {
+    // Keep the path-scoped in-process PDF worker registered until App and every
+    // outstanding PDF request have dropped, as in collection-return fixtures.
+    let mut _pdf_backend = None;
+    let mut app = setup_app_for_test();
+    app.initialized = true;
+    app.indexer_init.mark_unavailable_if_not_ready();
+    app.settings.sidecar_backup_enabled = false;
+    app.settings.tag_sidecar_backup_enabled = false;
+    app.settings.auto_fullscreen_image_folders = true;
+    app.settings.auto_fullscreen_zip_pdf = true;
+    app.settings.book_nav_resume = crate::settings::ResumeMode::FromStart;
+    let ctx = egui::Context::default();
+    crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
+    let nav_root = app.tmp.path().join("depth-accepted-transition");
+    let current = nav_root.join("a");
+    std::fs::create_dir_all(&current).unwrap();
+    save_portrait(&current.join("old.png"), [90, 100, 110]);
+    let target = match kind {
+        "folder" => {
+            let target = nav_root.join("b");
+            std::fs::create_dir(&target).unwrap();
+            save_portrait(&target.join("new.png"), [110, 120, 130]);
+            target
+        }
+        "zip" => {
+            let target = nav_root.join("b.zip");
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&target).unwrap());
+            let options: zip::write::FileOptions<'_, ()> = zip::write::FileOptions::default();
+            zip.start_file("new.png", options).unwrap();
+            std::io::copy(
+                &mut std::fs::File::open(current.join("old.png")).unwrap(),
+                &mut zip,
+            )
+            .unwrap();
+            zip.finish().unwrap();
+            target
+        }
+        "pdf" => {
+            let target = nav_root.join("b.pdf");
+            depth_transition_pdf(&target);
+            target
+        }
+        _ => unreachable!(),
+    };
+    if kind == "pdf" {
+        _pdf_backend = Some(crate::pdf_loader::RemotePdfTestBackend::for_path(&target));
+    }
+    super::depth_view_tests::install_pages(&mut app, &ctx);
+    let main_generation = app.items_generation;
+    let owner = app.build_active_context_for_test(Some(88_995), DetachedSource::Book, |owner| {
+        super::depth_view_tests::install_pages(owner, &ctx);
+        owner.current_folder = Some(current.clone());
+        owner.navigation_scope = ViewerNavigationScope::DetachedPhysical;
+        owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+        owner.detached_viewer_independent_active = true;
+        if export {
+            super::depth_view_tests::install_ready_depth_for_export(owner);
+        }
+    });
+    app.depth_setup
+        .set_status_for_test(crate::addon::AddonStatus::Missing);
+    app.with_viewer_context(owner, |mounted| {
+        mounted.mark_active_detached_viewport_rendered(&ctx);
+        assert!(!mounted.active_detached_transition_outstanding());
+        if export {
+            super::depth_view_tests::record_ready_display(mounted, &ctx);
+            assert!(mounted.capture_depth_export(&ctx, true).is_some());
+        }
+        let enumeration_export_capture =
+            export.then(|| mounted.capture_depth_export(&ctx, true).unwrap());
+        mounted.start_folder_nav(current.clone(), true, FolderNavMode::Fullscreen);
+        assert!(mounted.active_detached_transition_outstanding());
+        if export {
+            mounted.open_depth_export(&ctx, 0);
+        } else {
+            mounted.toggle_depth_parallax(&ctx, 0);
+        }
+        assert!(!mounted.depth_export_dialog_open());
+        assert!(!mounted.depth_setup.dialog_open_for_test());
+        assert_eq!(
+            mounted.fs_feedback_toast.as_ref().unwrap().0,
+            "読み込みが終わってから使ってください"
+        );
+        let mut result = None;
+        wait_until(
+            "accepted depth folder-nav result",
+            std::time::Duration::from_secs(10),
+            || {
+                result = mounted.poll_folder_nav();
+                result.is_some()
+            },
+        );
+        let result = result.unwrap();
+        assert_eq!(result.target.as_ref().unwrap().logical_source(), target);
+        mounted.apply_folder_nav_result(&ctx, result);
+        // Enumeration is a continuation of the accepted request, not a new modal.
+        if kind == "zip" {
+            assert!(mounted.zip_enumerate_pending.is_some());
+        }
+        if kind == "pdf" {
+            assert!(mounted.pdf_enumerate_pending.is_some());
+        }
+        if kind != "folder" {
+            assert!(mounted.active_detached_transition_outstanding());
+            // The normal reopen path has retired the old viewer; D cannot acquire
+            // a model modal from that no-image interval. Do not restore stale items.
+            assert!(mounted.fullscreen_idx.is_none());
+            mounted.toggle_depth_parallax(&ctx, 0);
+            assert!(!mounted.depth_setup.dialog_open_for_test());
+            assert!(!mounted.depth_export_dialog_open());
+            if let Some(capture) = enumeration_export_capture {
+                // A capture accepted from the last image can outlive its paint.
+                // Exercise its actual admission owner during enumeration too.
+                mounted.admit_depth_export(&ctx, capture);
+                assert_eq!(
+                    mounted.fs_feedback_toast.as_ref().unwrap().0,
+                    "読み込みが終わってから使ってください"
+                );
+                assert!(!mounted.depth_export_dialog_open());
+            }
+            assert!(
+                !mounted.document_open_modal_admission_blocked(),
+                "accepted enumeration must be free to finish"
+            );
+        }
+        let reopen_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+                mounted.poll_zip_enumerate();
+                mounted.poll_pdf_enumerate();
+                mounted.poll_sidecar_restore(&ctx);
+                mounted.finish_page_identity_preparation_for_test();
+                // PDF's deferred reopen can transfer to the ordinary document
+                // composition/read owner after enumeration. Poll that owner as
+                // update_active_viewer_context does; sidecar polling alone cannot
+                // adopt its projection or consume the retained fullscreen open.
+                mounted.poll_book_composition_read(&ctx);
+                if mounted.fullscreen_idx.is_some()
+                    && mounted.zip_enumerate_pending.is_none()
+                    && mounted.pdf_enumerate_pending.is_none()
+                    && !mounted.sidecar_restore_active()
+                {
+                    mounted.mark_active_detached_viewport_rendered(&ctx);
+                }
+                if mounted.fullscreen_idx.is_some()
+                    && mounted.current_folder.as_deref() == Some(target.as_path())
+                    && !mounted.active_detached_transition_outstanding()
+                    && !mounted.sidecar_restore_active()
+                {
+                    break;
+                }
+                assert!(std::time::Instant::now() < reopen_deadline,
+                    "{kind}: accepted transition did not reopen: folder={:?}, idx={:?}, rows={}, pdf_pending={}, zip_pending={}, hydration={}, composition_pending={}, deferred_reopen={}, outstanding={}, feedback={:?}",
+                    mounted.current_folder, mounted.fullscreen_idx, mounted.items.len(),
+                    mounted.pdf_enumerate_pending.is_some(), mounted.zip_enumerate_pending.is_some(),
+                    mounted.sidecar_restore_active(), mounted.book_composition.is_pending(),
+                    mounted.fs_nav_after_pdf_enumerate.is_some(), mounted.active_detached_transition_outstanding(),
+                    mounted.fs_feedback_toast);
+                std::thread::yield_now();
+        }
+        assert_eq!(mounted.edit_request_owner_context(), owner);
+        assert_eq!(mounted.active_detached_window_id(), Some(88_995));
+        assert_eq!(
+            mounted.viewer_presentation,
+            ViewerPresentation::DetachedWindow
+        );
+        assert_eq!(mounted.fullscreen_idx, Some(0));
+        assert!(!mounted.active_detached_window_is_closing());
+        assert!(!mounted.depth_setup.dialog_open_for_test());
+        assert!(!mounted.depth_export_dialog_open());
+        // Positive control: with the continuation gone the same window can start a modal.
+        mounted
+            .depth_setup
+            .set_status_for_test(crate::addon::AddonStatus::Missing);
+        mounted.toggle_depth_parallax(&ctx, 0);
+        assert!(mounted.depth_setup.confirming_for_test());
+        assert_eq!(mounted.depth_setup.dialog_owner_context(), Some(owner));
+    })
+    .unwrap();
+    assert_eq!(app.items_generation, main_generation);
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert_eq!(app.active_viewer_context_id(), Some(owner));
+}
+
+#[test]
+fn multiwindow_depth_accepted_folder_transition_rejects_entry_and_export_then_reopens_same_context()
+{
+    for export in [false, true] {
+        depth_accepted_transition_case("folder", export);
+    }
+}
+#[test]
+fn multiwindow_depth_accepted_zip_transition_rejects_entry_and_export_then_reopens_same_context() {
+    for export in [false, true] {
+        depth_accepted_transition_case("zip", export);
+    }
+}
+#[test]
+fn multiwindow_depth_accepted_pdf_transition_rejects_entry_and_export_then_reopens_same_context() {
+    for export in [false, true] {
+        depth_accepted_transition_case("pdf", export);
+    }
 }

@@ -139,6 +139,7 @@ struct GlutinWindowContext {
 
 struct Viewport {
     ids: ViewportIdPair,
+    native_input: Option<crate::native_window_input::NativeWindowAllocationLease>,
     registration: Option<egui::ViewportRegistration>,
     parent_registration: Option<egui::ViewportRegistration>,
     class: ViewportClass,
@@ -189,6 +190,47 @@ impl Viewport {
             );
         }
     }
+}
+
+impl Drop for Viewport {
+    fn drop(&mut self) {
+        if let Some(mut input) = self.native_input.take() {
+            input.retire();
+        }
+    }
+}
+
+impl Drop for GlutinWindowContext {
+    fn drop(&mut self) {
+        self.retire_native_input();
+    }
+}
+
+impl GlutinWindowContext {
+    fn retire_native_input(&mut self) {
+        retire_glow_native_input(
+            &mut self.viewports,
+            &mut self.viewport_from_window,
+            &mut self.window_from_viewport,
+        );
+    }
+}
+
+/// Shutdown ends input ownership without depending on the GL/window objects'
+/// final destruction. The headless lifecycle adapter uses this same boundary.
+fn retire_glow_native_input(
+    viewports: &mut OrderedViewportIdMap<Viewport>,
+    from_window: &mut HashMap<WindowId, ViewportId>,
+    from_viewport: &mut OrderedViewportIdMap<WindowId>,
+) {
+    for viewport in viewports.values_mut() {
+        crate::native_window_input::retire_window(
+            &mut viewport.native_input,
+            viewport.ids.this,
+            from_window,
+        );
+    }
+    from_viewport.clear();
 }
 
 // ----------------------------------------------------------------------------
@@ -542,6 +584,7 @@ impl WinitApp for GlowWinitApp<'_> {
                     pending_deltas: &running.pending_deltas,
                 },
             );
+            running.glutin.borrow_mut().retire_native_input();
             running.painter.borrow_mut().destroy();
         }
     }
@@ -1135,7 +1178,13 @@ impl GlowWinitRunning<'_> {
         event: &winit::event::WindowEvent,
     ) -> EventResult {
         let mut glutin = self.glutin.borrow_mut();
-        let viewport_id = glutin.viewport_from_window.get(&window_id).copied();
+        let viewport_id = viewport_for_native_event(&glutin.viewport_from_window, window_id);
+        crate::native_window_input::log_unmapped_primary_press(
+            "glow",
+            window_id,
+            viewport_id,
+            event,
+        );
 
         // On Windows, if a window is resized by the user, it should repaint synchronously, inside the
         // event handler.
@@ -1783,6 +1832,7 @@ impl GlutinWindowContext {
             ViewportId::ROOT,
             Viewport {
                 ids: ViewportIdPair::ROOT,
+                native_input: None,
                 registration: egui_ctx.viewport_registration(ViewportId::ROOT),
                 parent_registration: None,
                 class: ViewportClass::Root,
@@ -1937,6 +1987,13 @@ impl GlutinWindowContext {
             self.current_gl_context = Some(current_gl_context);
         }
 
+        if viewport.native_input.is_none() {
+            viewport.native_input = Some(crate::native_window_input::register_window(
+                &self.egui_ctx,
+                viewport_id,
+                window,
+            ));
+        }
         self.viewport_from_window.insert(window.id(), viewport_id);
         self.window_from_viewport.insert(viewport_id, window.id());
 
@@ -1947,6 +2004,20 @@ impl GlutinWindowContext {
     fn on_suspend(&mut self) -> Result {
         log::debug!("received suspend event. dropping window and surface");
         for viewport in self.viewports.values_mut() {
+            if let Some(state) = viewport.egui_winit.as_mut() {
+                epi_integration::retain_viewport_input_before_state_replacement(
+                    viewport.ids.this,
+                    &mut viewport.pending_raw_input,
+                    state,
+                );
+            }
+            crate::native_window_input::retire_window(
+                &mut viewport.native_input,
+                viewport.ids.this,
+                &mut self.viewport_from_window,
+            );
+            self.window_from_viewport.remove(&viewport.ids.this);
+            viewport.egui_winit = None;
             viewport.gl_surface = None;
             viewport.window = None;
         }
@@ -2053,6 +2124,8 @@ impl GlutinWindowContext {
                 class,
                 builder,
                 viewport_ui_cb,
+                &mut self.viewport_from_window,
+                &mut self.window_from_viewport,
             );
 
             viewport.registration = Some(registration);
@@ -2078,6 +2151,41 @@ impl GlutinWindowContext {
     }
 }
 
+/// This is the native WindowEvent source lookup, independent of logical input
+/// retention. Recreation removes the old source before a new State is visible.
+fn viewport_for_native_event(
+    viewport_from_window: &HashMap<WindowId, ViewportId>,
+    source: WindowId,
+) -> Option<ViewportId> {
+    viewport_from_window.get(&source).copied()
+}
+
+/// The allocation preparation of the native immediate backend. Native GL/window
+/// creation follows this boundary; the headless adapter supplies its own window.
+fn prepare_immediate_viewport<'a>(
+    ctx: &egui::Context,
+    viewports: &'a mut OrderedViewportIdMap<Viewport>,
+    current: &mut Option<ViewportId>,
+    ids: ViewportIdPair,
+    builder: ViewportBuilder,
+    sources: &mut HashMap<WindowId, ViewportId>,
+    reverse: &mut OrderedViewportIdMap<WindowId>,
+) -> &'a mut Viewport {
+    let viewport = initialize_or_update_viewport(
+        viewports,
+        current,
+        ids,
+        ViewportClass::Immediate,
+        builder,
+        None,
+        sources,
+        reverse,
+    );
+    viewport.registration = ctx.viewport_registration(ids.this);
+    viewport.parent_registration = ctx.viewport_registration(ids.parent);
+    viewport
+}
+
 fn initialize_or_update_viewport<'a>(
     viewports: &'a mut OrderedViewportIdMap<Viewport>,
     current_viewport: &mut Option<ViewportId>,
@@ -2085,6 +2193,8 @@ fn initialize_or_update_viewport<'a>(
     class: ViewportClass,
     mut builder: ViewportBuilder,
     viewport_ui_cb: Option<Arc<dyn Fn(&mut egui::Ui) + Send + Sync>>,
+    viewport_from_window: &mut HashMap<WindowId, ViewportId>,
+    window_from_viewport: &mut OrderedViewportIdMap<WindowId>,
 ) -> &'a mut Viewport {
     profiling::function_scope!();
 
@@ -2111,6 +2221,7 @@ fn initialize_or_update_viewport<'a>(
             log::debug!("Creating new viewport {:?} ({:?})", ids.this, builder.title);
             entry.insert(Viewport {
                 ids,
+                native_input: None,
                 registration: None,
                 parent_registration: None,
                 class,
@@ -2142,7 +2253,6 @@ fn initialize_or_update_viewport<'a>(
                     ids.this,
                     viewport.builder.title
                 );
-                viewport.window = None;
                 if let Some(state) = viewport.egui_winit.as_mut() {
                     epi_integration::retain_viewport_input_before_state_replacement(
                         viewport.ids.this,
@@ -2150,6 +2260,13 @@ fn initialize_or_update_viewport<'a>(
                         state,
                     );
                 }
+                crate::native_window_input::retire_window(
+                    &mut viewport.native_input,
+                    ids.this,
+                    viewport_from_window,
+                );
+                window_from_viewport.remove(&ids.this);
+                viewport.window = None;
                 viewport.egui_winit = None;
                 viewport.gl_surface = None;
                 if *current_viewport == Some(ids.this) {
@@ -2217,17 +2334,15 @@ impl ImmediateViewportBackend for NativeGlowImmediateBackend<'_> {
         replace_stale_glow_viewport(self.glutin, self.pending_deltas, self.egui_ctx, ids.this);
         let mut glutin = self.glutin.borrow_mut();
         let glutin = &mut *glutin;
-        initialize_or_update_viewport(
+        prepare_immediate_viewport(
+            self.egui_ctx,
             &mut glutin.viewports,
             &mut glutin.current_viewport,
             ids,
-            ViewportClass::Immediate,
             builder,
-            None,
+            &mut glutin.viewport_from_window,
+            &mut glutin.window_from_viewport,
         );
-        let viewport = glutin.viewports.get_mut(&ids.this)?;
-        viewport.registration = self.egui_ctx.viewport_registration(ids.this);
-        viewport.parent_registration = self.egui_ctx.viewport_registration(ids.parent);
         let ret = event_loop_context::with_current_event_loop(|event_loop| {
             glutin.initialize_window(ids.this, event_loop)
         });
@@ -2711,6 +2826,8 @@ mod viewport_input_tests {
                 ViewportClass::Deferred,
                 ViewportBuilder::default(),
                 Some(Arc::new(|_| {})),
+                &mut Default::default(),
+                &mut Default::default(),
             );
             viewport.pending_raw_input = egui::RawInput {
                 viewport_id: id,
@@ -2765,6 +2882,8 @@ mod viewport_input_tests {
             // end the viewport's lifetime or its unconsumed input ownership.
             ViewportBuilder::default().with_active(false),
             None,
+            &mut Default::default(),
+            &mut Default::default(),
         );
         assert!(current.is_none());
         assert!(viewport.class == ViewportClass::Immediate);
@@ -2795,6 +2914,8 @@ mod viewport_input_tests {
             ViewportClass::Deferred,
             ViewportBuilder::default(),
             Some(Arc::new(|_| {})),
+            &mut Default::default(),
+            &mut Default::default(),
         );
         assert!(recreated.pending_raw_input.events.is_empty());
         let sibling_input = &viewports[&sibling].pending_raw_input;
@@ -2833,6 +2954,8 @@ mod child_close_tests {
                 Some(Arc::new(|_| {
                     panic!("Close must not invoke a child callback")
                 })),
+                &mut Default::default(),
+                &mut Default::default(),
             );
             vp.info.minimized = Some(true);
             vp.egui_winit = Some(egui_winit::State::new(
@@ -3396,8 +3519,8 @@ mod viewport_retirement_tests {
 
     struct Headless {
         viewports: OrderedViewportIdMap<Viewport>,
-        from_window: HashMap<usize, ViewportId>,
-        from_viewport: OrderedViewportIdMap<usize>,
+        from_window: HashMap<WindowId, ViewportId>,
+        from_viewport: OrderedViewportIdMap<WindowId>,
         current: Option<ViewportId>,
         focused: Option<ViewportId>,
         delta: TexturesDelta,
@@ -3478,6 +3601,32 @@ mod viewport_retirement_tests {
             );
         }
     }
+
+    fn bind_headless_native_input(
+        ctx: &egui::Context,
+        viewports: &mut OrderedViewportIdMap<Viewport>,
+        sources: &mut HashMap<WindowId, ViewportId>,
+        reverse: &mut OrderedViewportIdMap<WindowId>,
+    ) {
+        for (id, viewport) in viewports {
+            if viewport.native_input.is_none() {
+                let source = WindowId::from(id.0.value());
+                viewport.native_input = Some(
+                    crate::native_window_input::register_native_window_allocation(
+                        ctx,
+                        crate::native_window_input::NativeWindowAllocation {
+                            viewport_id: *id,
+                            registration: viewport.registration.unwrap(),
+                            window_id: source,
+                            windows_hwnd: Some(id.0.value() as isize),
+                        },
+                    ),
+                );
+                sources.insert(source, *id);
+                reverse.insert(*id, source);
+            }
+        }
+    }
     impl Adapter for Headless {
         fn new(_: &egui::Context) -> Self {
             Self {
@@ -3501,6 +3650,8 @@ mod viewport_retirement_tests {
                     output.class,
                     output.builder.clone(),
                     output.viewport_ui_cb.clone(),
+                    &mut self.from_window,
+                    &mut self.from_viewport,
                 );
                 viewport.registration = Some(output.registration);
                 viewport.parent_registration = output.parent_registration;
@@ -3521,6 +3672,36 @@ mod viewport_retirement_tests {
                         .push(egui::Event::Text(format!("pending-{id:?}")));
                 }
             }
+            bind_headless_native_input(
+                ctx,
+                &mut self.viewports,
+                &mut self.from_window,
+                &mut self.from_viewport,
+            );
+        }
+
+        fn prepare_immediate(
+            &mut self,
+            ctx: &egui::Context,
+            ids: ViewportIdPair,
+            builder: ViewportBuilder,
+        ) {
+            self.replace_stale_native(ctx, ids.this);
+            prepare_immediate_viewport(
+                ctx,
+                &mut self.viewports,
+                &mut self.current,
+                ids,
+                builder,
+                &mut self.from_window,
+                &mut self.from_viewport,
+            );
+            bind_headless_native_input(
+                ctx,
+                &mut self.viewports,
+                &mut self.from_window,
+                &mut self.from_viewport,
+            );
         }
         fn registration_for(&self, id: ViewportId) -> Option<egui::ViewportRegistration> {
             self.viewports.get(&id).and_then(|vp| vp.registration)
@@ -3593,6 +3774,31 @@ mod viewport_retirement_tests {
             }
             events
         }
+        fn allocation_sources(&self) -> Vec<(WindowId, ViewportId, ViewportClass)> {
+            self.from_window
+                .iter()
+                .map(|(source, id)| {
+                    assert_eq!(self.from_viewport.get(id), Some(source));
+                    (*source, *id, self.viewports[id].class)
+                })
+                .collect()
+        }
+        fn shutdown_native_input(&mut self) {
+            retire_glow_native_input(
+                &mut self.viewports,
+                &mut self.from_window,
+                &mut self.from_viewport,
+            );
+        }
+    }
+    #[test]
+    fn realmachine55_glow_repeated_park_main_retirement_keeps_native_source() {
+        scenarios::realmachine55_repeated_park_main_retirement::<Headless>();
+    }
+
+    #[test]
+    fn native_window_input_glow_gc_terminal_close_shutdown() {
+        scenarios::native_window_input_lifecycle::<Headless>();
     }
     #[test]
     fn viewport_retirement_glow_full_logic_gc_discard() {
@@ -3757,5 +3963,183 @@ mod viewport_retirement_tests {
         deliver(&mut pending, &mut painter, &mut context_entries);
         assert_eq!(context_entries, 2);
         assert!(pending.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod native_allocation_input_tests {
+    use super::*;
+    use crate::native_window_input::{
+        NativeWindowAllocation, native_window_allocation, register_native_window_allocation,
+    };
+
+    struct NoDisplay;
+    impl raw_window_handle::HasDisplayHandle for NoDisplay {
+        fn display_handle(
+            &self,
+        ) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+        {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+
+    #[test]
+    fn native_window_input_glow_recreate_revokes_old_source_before_successor_state() {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let child = ViewportId::from_hash_of("native allocation child");
+        let sibling = ViewportId::from_hash_of("native allocation sibling");
+        ctx.run_ui(Default::default(), |ui| {
+            for id in [child, sibling] {
+                ui.ctx()
+                    .show_viewport_deferred(id, Default::default(), |_, _| {});
+            }
+        })
+        .drop_without_applying_deltas();
+        let old_source = WindowId::from(501);
+        let new_source = WindowId::from(502);
+        let sibling_source = WindowId::from(503);
+        let allocation = |id, source| NativeWindowAllocation {
+            viewport_id: id,
+            registration: ctx.viewport_registration(id).unwrap(),
+            window_id: source,
+            windows_hwnd: Some(u64::from(source) as isize),
+        };
+        let mut viewports = OrderedViewportIdMap::default();
+        let mut sources = HashMap::default();
+        let mut current = None;
+        let mut reverse = OrderedViewportIdMap::default();
+
+        for (id, source) in [(child, old_source), (sibling, sibling_source)] {
+            let ids = ViewportIdPair::from_self_and_parent(id, ViewportId::ROOT);
+
+            initialize_or_update_viewport(
+                &mut viewports,
+                &mut current,
+                ids,
+                ViewportClass::Deferred,
+                ViewportBuilder::default(),
+                None,
+                &mut sources,
+                &mut reverse,
+            );
+            reverse.insert(id, source);
+
+            let viewport = viewports.get_mut(&id).unwrap();
+            viewport.registration = ctx.viewport_registration(id);
+            viewport.native_input = Some(register_native_window_allocation(
+                &ctx,
+                allocation(id, source),
+            ));
+            viewport.egui_winit = Some(egui_winit::State::new(
+                ctx.clone(),
+                id,
+                &NoDisplay,
+                None,
+                None,
+                None,
+            ));
+            sources.insert(source, id);
+        }
+        let ime = egui::Event::Ime(egui::ImeEvent::Commit("unconsumed logical input".into()));
+        viewports
+            .get_mut(&child)
+            .unwrap()
+            .egui_winit
+            .as_mut()
+            .unwrap()
+            .egui_input_mut()
+            .events
+            .push(ime.clone());
+        let registration = viewports[&child].registration;
+        let ids = ViewportIdPair::from_self_and_parent(child, ViewportId::ROOT);
+
+        initialize_or_update_viewport(
+            &mut viewports,
+            &mut current,
+            ids,
+            ViewportClass::Immediate,
+            ViewportBuilder::default().with_active(false),
+            None,
+            &mut sources,
+            &mut reverse,
+        );
+        assert!(!reverse.contains_key(&child));
+        assert_eq!(reverse[&sibling], sibling_source);
+
+        assert!(native_window_allocation(&ctx, child).is_none());
+        assert!(viewport_for_native_event(&sources, old_source).is_none());
+        assert_eq!(
+            viewport_for_native_event(&sources, sibling_source),
+            Some(sibling)
+        );
+        assert_eq!(viewports[&child].registration, registration);
+        assert_eq!(viewports[&child].pending_raw_input.events, vec![ime]);
+        assert!(viewports[&child].egui_winit.is_none());
+
+        // The successor belongs to the same logical registration. Late native
+        // events still use the production source lookup, not that registration.
+        let viewport = viewports.get_mut(&child).unwrap();
+        viewport.native_input = Some(register_native_window_allocation(
+            &ctx,
+            allocation(child, new_source),
+        ));
+        viewport.egui_winit = Some(egui_winit::State::new(
+            ctx.clone(),
+            child,
+            &NoDisplay,
+            None,
+            None,
+            None,
+        ));
+        sources.insert(new_source, child);
+        for (source, text) in [
+            (old_source, "stale"),
+            (new_source, "new"),
+            (sibling_source, "sibling"),
+        ] {
+            if let Some(id) = viewport_for_native_event(&sources, source) {
+                viewports
+                    .get_mut(&id)
+                    .unwrap()
+                    .egui_winit
+                    .as_mut()
+                    .unwrap()
+                    .egui_input_mut()
+                    .events
+                    .push(egui::Event::Text(text.into()));
+            }
+        }
+        assert_eq!(
+            viewports
+                .get_mut(&child)
+                .unwrap()
+                .egui_winit
+                .as_mut()
+                .unwrap()
+                .egui_input_mut()
+                .events,
+            vec![egui::Event::Text("new".into())]
+        );
+        assert_eq!(
+            viewports
+                .get_mut(&sibling)
+                .unwrap()
+                .egui_winit
+                .as_mut()
+                .unwrap()
+                .egui_input_mut()
+                .events,
+            vec![egui::Event::Text("sibling".into())]
+        );
+        assert_eq!(
+            native_window_allocation(&ctx, child),
+            Some(allocation(child, new_source))
+        );
+        // Releasing the logical backend owner ends its input even with Context
+        // (and therefore the query registry) still alive.
+        drop(viewports);
+        assert!(native_window_allocation(&ctx, child).is_none());
+        assert!(native_window_allocation(&ctx, sibling).is_none());
     }
 }

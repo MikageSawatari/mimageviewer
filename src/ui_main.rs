@@ -1175,6 +1175,20 @@ fn grid_primary_input_events(
                     phase: egui::TouchPhase::Cancel,
                     ..
                 } => events.push(GridPrimaryInput::TouchCancelled),
+                egui::Event::PointerButtonReleased { button, .. } => {
+                    // This release has no widget witness or click position. It
+                    // still occupies its adjudicated release and primary ordinal.
+                    let Some((released_button, click)) = releases.next() else {
+                        return vec![GridPrimaryInput::Cancelled];
+                    };
+                    if released_button != button || click.is_some() {
+                        return vec![GridPrimaryInput::Cancelled];
+                    }
+                    if button == egui::PointerButton::Primary {
+                        ordinal += 1;
+                    }
+                    events.push(GridPrimaryInput::Cancelled);
+                }
                 egui::Event::PointerButton {
                     pos,
                     button,
@@ -5564,7 +5578,15 @@ fn book_reorder_group_move_changes_order(
     state: &crate::app::BookReorderState,
     insert_index: usize,
 ) -> bool {
-    let indices = selected_book_reorder_indices(&state.entries, &state.selected_keys);
+    book_reorder_keys_move_changes_order(state, &state.selected_keys, insert_index)
+}
+
+fn book_reorder_keys_move_changes_order(
+    state: &crate::app::BookReorderState,
+    keys: &HashSet<String>,
+    insert_index: usize,
+) -> bool {
+    let indices = selected_book_reorder_indices(&state.entries, keys);
     let Some(&first) = indices.first() else {
         return false;
     };
@@ -5578,7 +5600,16 @@ fn move_selected_book_reorder_group(
     state: &mut crate::app::BookReorderState,
     insert_index: usize,
 ) -> bool {
-    let selected_indices = selected_book_reorder_indices(&state.entries, &state.selected_keys);
+    let keys = state.selected_keys.clone();
+    move_book_reorder_group(state, &keys, insert_index)
+}
+
+fn move_book_reorder_group(
+    state: &mut crate::app::BookReorderState,
+    keys: &HashSet<String>,
+    insert_index: usize,
+) -> bool {
+    let selected_indices = selected_book_reorder_indices(&state.entries, keys);
     if selected_indices.is_empty() {
         return false;
     }
@@ -5591,17 +5622,24 @@ fn move_selected_book_reorder_group(
         .selected
         .and_then(|idx| state.entries.get(idx))
         .map(book_reorder_entry_key);
+    let anchor_key = state
+        .selection_anchor
+        .and_then(|idx| state.entries.get(idx))
+        .map(book_reorder_entry_key);
+    let drag_key = state
+        .dragging
+        .and_then(|idx| state.entries.get(idx))
+        .map(book_reorder_entry_key);
     let dst = adjusted_book_reorder_group_insert_index(
         &selected_indices,
         insert_index,
         state.entries.len(),
     );
-    let selected_keys = state.selected_keys.clone();
     let mut moving = Vec::with_capacity(selected_indices.len());
     let mut remaining =
         Vec::with_capacity(state.entries.len().saturating_sub(selected_indices.len()));
     for entry in state.entries.drain(..) {
-        if selected_keys.contains(&book_reorder_entry_key(&entry)) {
+        if keys.contains(&book_reorder_entry_key(&entry)) {
             moving.push(entry);
         } else {
             remaining.push(entry);
@@ -5623,6 +5661,19 @@ fn move_selected_book_reorder_group(
                 .first()
                 .copied()
         });
+    state.selection_anchor = anchor_key.and_then(|key| {
+        state
+            .entries
+            .iter()
+            .position(|entry| book_reorder_entry_key(entry) == key)
+    });
+    state.dragging = drag_key.and_then(|key| {
+        state
+            .entries
+            .iter()
+            .position(|entry| book_reorder_entry_key(entry) == key)
+    });
+    state.drag_insert_index = None;
     let after = state
         .entries
         .iter()
@@ -10500,9 +10551,31 @@ impl App {
                         );
                     }
                 }
-                let pointer_released = ui.input(|i| i.pointer.any_released());
-                let pointer_pos =
-                    ui.input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()));
+                let (terminal, pointer_pos) = ui.input(|input| {
+                    let terminal = input.pointer.button_releases().next();
+                    let pos = input
+                        .pointer
+                        .hover_pos()
+                        .or_else(|| input.pointer.interact_pos());
+                    (terminal, pos)
+                });
+                // Freeze the operation that ended before row Responses can
+                // start a different drag or replace the selected group.
+                let ending_drag = terminal.and_then(|(button, pos)| {
+                    state.dragging.take().map(|source| {
+                        (
+                            source,
+                            state.selected_keys.clone(),
+                            (button == egui::PointerButton::Primary)
+                                .then_some(pos)
+                                .flatten(),
+                        )
+                    })
+                });
+                if terminal.is_some() {
+                    state.drag_auto_scroll_enabled = false;
+                    state.drag_insert_index = None;
+                }
                 let mut move_request: Option<(usize, usize)> = None;
                 state.drag_insert_index = None;
                 ui.allocate_ui_with_layout(
@@ -10538,7 +10611,15 @@ impl App {
                                                         egui::Sense::hover(),
                                                     );
                                                     if !busy
-                                                        && let Some(src) = state.dragging
+                                                        && let Some((source, _, Some(pos))) =
+                                                            ending_drag.as_ref()
+                                                        && rect.contains(*pos)
+                                                    {
+                                                        move_request =
+                                                            Some((*source, state.entries.len()));
+                                                    }
+                                                    if !busy
+                                                        && state.dragging.is_some()
                                                         && pointer_pos
                                                             .is_some_and(|pos| rect.contains(pos))
                                                     {
@@ -10561,20 +10642,41 @@ impl App {
                                                             out.cursor_icon =
                                                                 egui::CursorIcon::Text;
                                                         });
-                                                        if pointer_released {
-                                                            move_request =
-                                                                Some((src, insert_index));
-                                                        }
                                                     }
                                                     continue;
                                                 };
-                                                let (rect, response) = ui.allocate_exact_size(
+                                                let key = book_reorder_entry_key(entry);
+                                                let (rect, _) = ui.allocate_exact_size(
                                                     tile,
+                                                    egui::Sense::hover(),
+                                                );
+                                                // A pending press follows its page when an older
+                                                // drag changes the order before the next pass.
+                                                let response = ui.interact(
+                                                    rect,
+                                                    ui.make_persistent_id((
+                                                        "book_reorder_entry",
+                                                        &key,
+                                                    )),
                                                     egui::Sense::click_and_drag(),
                                                 );
-                                                let key = crate::search_index_db::normalize_path(
-                                                    &entry.path,
-                                                );
+                                                #[cfg(test)]
+                                                ui.ctx().data_mut(|data| {
+                                                    data.insert_temp(
+                                                        egui::Id::unique((
+                                                            "book_reorder_test_rect",
+                                                            i,
+                                                        )),
+                                                        rect,
+                                                    );
+                                                    data.insert_temp(
+                                                        egui::Id::unique((
+                                                            "book_reorder_test_response_id",
+                                                            i,
+                                                        )),
+                                                        response.id,
+                                                    );
+                                                });
                                                 let selected = state.selected_keys.contains(&key);
                                                 let dragging = state.dragging.is_some() && selected;
                                                 let fill = if dragging {
@@ -10712,7 +10814,7 @@ impl App {
                                                     state.drag_insert_index = Some(i);
                                                 }
                                                 if !busy
-                                                    && let Some(src) = state.dragging
+                                                    && state.dragging.is_some()
                                                     && let Some((insert_index, indicator_x)) =
                                                         book_reorder_drop_target_for_pos(
                                                             rect,
@@ -10732,9 +10834,21 @@ impl App {
                                                     ui.output_mut(|out| {
                                                         out.cursor_icon = egui::CursorIcon::Text;
                                                     });
-                                                    if pointer_released {
-                                                        move_request = Some((src, insert_index));
-                                                    }
+                                                }
+                                                if !busy
+                                                    && let Some((source, _, Some(pos))) =
+                                                        ending_drag.as_ref()
+                                                    && let Some((insert_index, _)) =
+                                                        book_reorder_drop_target_for_pos(
+                                                            rect,
+                                                            i,
+                                                            state.entries.len(),
+                                                            cols,
+                                                            gap,
+                                                            Some(*pos),
+                                                        )
+                                                {
+                                                    move_request = Some((*source, insert_index));
                                                 }
                                             }
                                             ui.end_row();
@@ -10744,7 +10858,6 @@ impl App {
                         );
                         state.scroll_offset_y = scroll_output.state.clamped_offset().y;
                         if !busy
-                            && !pointer_released
                             && state.dragging.is_some()
                             && state.drag_auto_scroll_enabled
                             && let Some(pos) = pointer_pos
@@ -10765,23 +10878,18 @@ impl App {
                         }
                     },
                 );
-                if let Some((src, insert_index)) = move_request {
+                if let Some((src, insert_index)) = move_request
+                    && let Some((_, keys, _)) = ending_drag.as_ref()
+                {
                     let len = state.entries.len();
                     if src < len {
-                        if book_reorder_group_move_changes_order(state, insert_index)
+                        if book_reorder_keys_move_changes_order(state, keys, insert_index)
                             && self.admit_book_append_followup_mutation()
-                            && move_selected_book_reorder_group(state, insert_index)
+                            && move_book_reorder_group(state, keys, insert_index)
                         {
                             state.dirty = true;
                         }
                     }
-                    state.dragging = None;
-                    state.drag_auto_scroll_enabled = false;
-                    state.drag_insert_index = None;
-                } else if pointer_released {
-                    state.dragging = None;
-                    state.drag_auto_scroll_enabled = false;
-                    state.drag_insert_index = None;
                 }
             });
         self.book_reorder = Some(reorder_state);
@@ -13355,15 +13463,21 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }
             });
         }
-        if resp.drag_stopped_by(egui::PointerButton::Primary) {
+        if resp.drag_stopped() {
             let drag = ui
                 .ctx()
                 .data_mut(|d| d.remove_temp::<Option<ToolbarSectionDrag>>(drag_id))
                 .flatten();
-            if let Some(mut drag) = drag {
-                if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
-                    drag.latest = pos;
-                }
+            if let Some(mut drag) = drag
+                && ui.ctx().input(|input| {
+                    matches!(
+                        input.pointer.button_releases().next(),
+                        Some((egui::PointerButton::Primary, Some(_)))
+                    )
+                })
+                && let Some(pos) = resp.drag_stopped_pos()
+            {
+                drag.latest = pos;
                 // 誤ドラッグ防止: 移動量が小さい場合は並べ替えない (= ただのクリック扱い)。
                 if drag.section == section && (drag.latest - drag.start).length() >= 6.0 {
                     let vis_idx = toolbar_drop_index(last_anchors, drag.latest);
@@ -17367,8 +17481,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let release_pos = ctx.input(|input| {
             input
                 .pointer
-                .interact_pos()
-                .or_else(|| input.pointer.latest_pos())
+                .button_release_position(egui::PointerButton::Primary)
                 .map(|pos| (pos.x, pos.y))
         });
         if !trace.terminal_reported {
@@ -18523,6 +18636,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     }
                 }
                 GridPrimaryInput::FocusLost | GridPrimaryInput::Cancelled => {
+                    self.cancel_right_drag_for_owner(crate::ring_shortcut::RightDragOwner::Root);
                     self.grid_right_drag_primary_suppression =
                         GridRightDragPrimarySuppression::Idle;
                 }
@@ -19499,15 +19613,21 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 data.insert_temp(drag_state_id, Some(drag));
             });
         }
-        if response.drag_stopped_by(egui::PointerButton::Primary) {
+        if response.drag_stopped() {
             let stopped_drag = ui
                 .ctx()
                 .data_mut(|data| data.remove_temp::<Option<DetailsHeaderDrag>>(drag_state_id))
                 .flatten();
-            if let Some(mut drag) = stopped_drag {
-                if let Some(pos) = ui.ctx().input(|input| input.pointer.latest_pos()) {
-                    drag.latest = pos;
-                }
+            if let Some(mut drag) = stopped_drag
+                && ui.ctx().input(|input| {
+                    matches!(
+                        input.pointer.button_releases().next(),
+                        Some((egui::PointerButton::Primary, Some(_)))
+                    )
+                })
+                && let Some(pos) = response.drag_stopped_pos()
+            {
+                drag.latest = pos;
                 if finish_details_header_drag(
                     &mut self.settings,
                     column_set,
@@ -24854,6 +24974,114 @@ mod book_reorder_drag_tests {
     }
 
     #[test]
+    fn realmachine55_book_reorder_old_release_preserves_fresh_group_identity() {
+        let mut state = reorder_state(&["A", "B", "C", "D", "E"], &["A"]);
+        let old_group = state.selected_keys.clone();
+        book_reorder_select_single(&mut state, 1);
+        let fresh_group = state.selected_keys.clone();
+        state.selection_anchor = Some(1);
+        state.dragging = Some(1);
+        state.drag_auto_scroll_enabled = true;
+
+        assert!(move_book_reorder_group(&mut state, &old_group, 3));
+        assert_eq!(reorder_names(&state), vec!["B", "C", "A", "D", "E"]);
+        assert_eq!(state.selected_keys, fresh_group);
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(state.selection_anchor, Some(0));
+        assert_eq!(state.dragging, Some(0));
+        assert!(state.drag_auto_scroll_enabled);
+    }
+
+    #[test]
+    fn realmachine55_book_reorder_handler_known_end_then_fresh_drag_same_batch() {
+        let mut app = crate::app::setup_app_for_test();
+        app.book_reorder = Some(reorder_state(&["A", "B", "C", "D", "E"], &["A"]));
+        let ctx = egui::Context::default();
+        let frame = |app: &mut crate::app::App, events| {
+            ctx.run_pass(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1500.0, 1000.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| app.draw_book_reorder(ctx),
+            )
+            .drop_without_applying_deltas();
+        };
+        for _ in 0..3 {
+            frame(&mut app, vec![]);
+        }
+        let rect = |index| {
+            ctx.data(|data| {
+                data.get_temp::<egui::Rect>(egui::Id::unique(("book_reorder_test_rect", index)))
+                    .unwrap()
+            })
+        };
+        let a = rect(0usize).center();
+        let b = rect(1usize).center();
+        let b_response_id = ctx.data(|data| {
+            data.get_temp::<egui::Id>(egui::Id::unique(("book_reorder_test_response_id", 1usize)))
+                .unwrap()
+        });
+        let c = rect(2usize).right_center() - egui::vec2(6.0, 0.0);
+        let edge = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&mut app, vec![egui::Event::PointerMoved(a), edge(a, true)]);
+        frame(&mut app, vec![egui::Event::PointerMoved(c)]);
+        assert_eq!(app.book_reorder.as_ref().unwrap().dragging, Some(0));
+        frame(
+            &mut app,
+            vec![
+                edge(c, false),
+                edge(b, true),
+                egui::Event::PointerMoved(b + egui::vec2(20.0, 0.0)),
+            ],
+        );
+        assert_eq!(
+            reorder_names(app.book_reorder.as_ref().unwrap()),
+            vec!["B", "C", "A", "D", "E"]
+        );
+        assert!(
+            ctx.read_response(b_response_id)
+                .unwrap()
+                .is_pointer_button_down_on()
+        );
+        assert!(!ctx.read_response(b_response_id).unwrap().drag_started());
+        assert_eq!(ctx.dragged_id(), None);
+        // click_and_drag keeps this new press pending until the next pass.
+        // Reordering A must not reassign B's captured widget to its old slot.
+        frame(&mut app, vec![]);
+        assert_eq!(
+            ctx.data(|data| data
+                .get_temp::<egui::Id>(egui::Id::unique(("book_reorder_test_response_id", 0usize)))
+                .unwrap()),
+            b_response_id
+        );
+        assert_eq!(ctx.dragged_id(), Some(b_response_id));
+        let response = ctx.read_response(b_response_id).unwrap();
+        assert!(response.drag_started() && response.dragged());
+        assert!(response.is_pointer_button_down_on());
+        let state = app.book_reorder.as_ref().unwrap();
+        assert_eq!(reorder_names(state), vec!["B", "C", "A", "D", "E"]);
+        assert_eq!(state.selected, Some(0));
+        assert_eq!(state.selection_anchor, Some(0));
+        assert_eq!(state.dragging, Some(0));
+        assert!(state.drag_auto_scroll_enabled);
+        assert!(
+            state
+                .selected_keys
+                .contains(&book_reorder_entry_key(&state.entries[0]))
+        );
+    }
+
+    #[test]
     fn drop_target_uses_pointer_position_inside_target_rect() {
         let rect = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 140.0));
 
@@ -27483,6 +27711,66 @@ mod compute_cell_size_tests {
             .position(|id| *id == DetailsColumnId::Name)
             .expect("name column is present");
         assert!(size_pos < name_pos);
+    }
+
+    #[test]
+    fn realmachine55_positionless_release_does_not_reorder_details_header() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let columns = details_column_rects(
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1200.0, 24.0)),
+            &app.settings,
+            false,
+            false,
+        );
+        let size_rect = columns
+            .iter()
+            .find(|(col, _)| *col == DetailsColumn::Size)
+            .unwrap()
+            .1;
+        let name_rect = columns
+            .iter()
+            .find(|(col, _)| *col == DetailsColumn::Name)
+            .unwrap()
+            .1;
+        let from = size_rect.center();
+        let to = name_rect.left_center() + egui::vec2(4.0, 0.0);
+        let before = app.settings.details_column_order.clone();
+        let mut draw = |events| {
+            ctx.run_pass(
+                egui::RawInput {
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().show(root_ui, |ui| {
+                            app.interact_details_header_drag(
+                                ui,
+                                DetailsColumnSet::Details,
+                                DetailsColumn::Size,
+                                size_rect,
+                                &columns,
+                            );
+                        })
+                    });
+                },
+            )
+            .drop_without_applying_deltas();
+        };
+        draw(vec![egui::Event::PointerMoved(from)]);
+        draw(vec![egui::Event::PointerButton {
+            pos: from,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        draw(vec![egui::Event::PointerMoved(to)]);
+        draw(vec![egui::Event::PointerButtonReleased {
+            button: egui::PointerButton::Primary,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert_eq!(app.settings.details_column_order, before);
     }
 
     #[test]
@@ -32715,6 +33003,68 @@ mod grid_reclick_open_tests {
         assert_eq!(harness.state().app.selected, Some(1));
         assert_eq!(harness.state().app.checked, HashSet::from([0, 1]));
         assert_eq!(harness.state().activations, 0);
+    }
+
+    #[test]
+    fn realmachine55_positionless_grid_release_preserves_the_next_cell_click() {
+        for button in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Check, false, None, false, false);
+            harness.hover_at(cell_rect(0).center());
+            harness.run();
+            pointer_button(&mut harness, cell_rect(0).center(), button, true);
+            let mut events = vec![egui::Event::PointerButtonReleased {
+                button,
+                modifiers: egui::Modifiers::NONE,
+            }];
+            events.extend(section1680_edges(
+                cell_rect(1).center(),
+                &[true, false],
+                egui::Modifiers::CTRL,
+            ));
+            harness.input_mut().events = events;
+            harness.run();
+            assert_eq!(harness.state().app.selected, Some(1));
+            assert_eq!(harness.state().app.checked, HashSet::from([1]));
+            assert_eq!(harness.state().activations, 0);
+            assert!(harness.state().app.context_menu_idx.is_none());
+        }
+    }
+
+    #[test]
+    fn realmachine55_positionless_grid_release_retires_old_right_drag_before_fresh_press() {
+        let mut harness = handler_harness(GridClickSelectionMode::Check, false, None, false, false);
+        let first = cell_rect(0).center();
+        let next = cell_rect(1).center();
+        harness
+            .state_mut()
+            .app
+            .settings
+            .ring_shortcuts
+            .set_right_drag_mode(
+                crate::ring_shortcut::RightDragContext::Grid,
+                crate::ring_shortcut::RightDragMode::RingShortcut,
+            );
+        pointer_button(&mut harness, first, egui::PointerButton::Secondary, true);
+        assert!(harness.state().app.mouse_ring_flick.is_some());
+        harness.input_mut().events = vec![
+            egui::Event::PointerButtonReleased {
+                button: egui::PointerButton::Secondary,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: next,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        // A held ring gesture intentionally requests further frames: inspect
+        // this input boundary instead of waiting for the UI to become idle.
+        harness.step();
+        let flick = harness.state().app.mouse_ring_flick.as_ref().unwrap();
+        assert_eq!(flick.start_pos, next);
+        assert!(harness.state().app.context_menu_idx.is_none());
     }
 
     #[test]

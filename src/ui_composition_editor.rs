@@ -1262,6 +1262,468 @@ mod row_tests {
         }
     }
 
+    #[cfg(target_os = "windows")]
+    mod native_dnd_tests {
+        use super::*;
+        use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+
+        /// Exercise the real native conversion and the editor's actual source
+        /// rows, without creating a desktop window or fabricating egui Up events.
+        struct SourceDragHarness {
+            ctx: egui::Context,
+            native: egui_winit::State,
+            view: EditorView,
+            state: EditorUiState,
+            rows: [(egui::Id, egui::Rect); 2],
+            native_events: Vec<egui::Event>,
+            frame: u32,
+        }
+
+        impl SourceDragHarness {
+            fn new() -> Self {
+                struct NoDisplay;
+                impl winit::raw_window_handle::HasDisplayHandle for NoDisplay {
+                    fn display_handle(
+                        &self,
+                    ) -> Result<
+                        winit::raw_window_handle::DisplayHandle<'_>,
+                        winit::raw_window_handle::HandleError,
+                    > {
+                        Err(winit::raw_window_handle::HandleError::Unavailable)
+                    }
+                }
+                let ctx = egui::Context::default();
+                ctx.enable_accesskit();
+                ctx.global_style_mut(|style| {
+                    style.animation_time = 0.0;
+                    style.scroll_animation = egui::style::ScrollAnimation::none();
+                });
+                let native = egui_winit::State::new(
+                    ctx.clone(),
+                    egui::ViewportId::ROOT,
+                    &NoDisplay,
+                    Some(1.0),
+                    None,
+                    None,
+                );
+                let mut harness = Self {
+                    ctx,
+                    native,
+                    view: fixture(2),
+                    state: EditorUiState::default(),
+                    rows: [(egui::Id::NULL, egui::Rect::NOTHING); 2],
+                    native_events: Vec::new(),
+                    frame: 0,
+                };
+                for _ in 0..4 {
+                    assert!(harness.run(&[]).is_empty());
+                }
+                harness
+            }
+
+            fn run(&mut self, events: &[WindowEvent]) -> Vec<EditorUiAction> {
+                for event in events {
+                    let _ = self
+                        .native
+                        .on_pointer_event(event, 1.0)
+                        .expect("real native pointer event");
+                }
+                let mut input = self.native.egui_input_mut().take();
+                self.native_events = input.events.clone();
+                self.frame += 1;
+                input.time = Some(f64::from(self.frame) / 60.0);
+                input.screen_rect = Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(480.0, 320.0),
+                ));
+                let mut actions = Vec::new();
+                let output =
+                    crate::test_ui::headless_paint_output(self.ctx.run_pass(input, |ctx| {
+                        ctx.root_ui(|root_ui| {
+                            egui::CentralPanel::default().show(root_ui, |ui| {
+                                source_list(
+                                    ui,
+                                    &self.view,
+                                    &mut self.state,
+                                    260.0,
+                                    true,
+                                    &mut actions,
+                                    &mut Vec::new(),
+                                );
+                            });
+                        });
+                    }));
+                let nodes = &output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .expect("source row accessibility tree")
+                    .nodes;
+                for (index, label) in ["1: page-0", "2: page-1"].into_iter().enumerate() {
+                    let (node_id, _) = nodes
+                        .iter()
+                        .find(|(_, node)| node.label() == Some(label))
+                        .expect("actual composition source row");
+                    // This is the high-entropy widget id emitted by egui itself.
+                    let id = unsafe { egui::Id::from_high_entropy_bits(node_id.0) };
+                    let response = self.ctx.read_response(id).expect("actual row response");
+                    self.rows[index] = (id, response.rect);
+                }
+                output.drop_without_applying_deltas();
+                actions
+            }
+
+            fn start_drag(&mut self, page: usize) {
+                let (id, rect) = self.rows[page];
+                let center = rect.center();
+                assert!(
+                    self.run(&[
+                        cursor(center),
+                        mouse(ElementState::Pressed, MouseButton::Left)
+                    ])
+                    .is_empty()
+                );
+                assert!(
+                    self.run(&[cursor(center + egui::vec2(20.0, 0.0))])
+                        .is_empty()
+                );
+                assert_eq!(self.ctx.dragged_id(), Some(id), "drag the real source row");
+                assert_eq!(
+                    egui::DragAndDrop::payload::<DragItem>(&self.ctx)
+                        .expect("source row published its drag payload")
+                        .0,
+                    page
+                );
+            }
+
+            fn assert_unknown_release_ended_drag(&self, source: egui::Id) {
+                assert!(self.native_events.iter().any(|event| matches!(
+                    event,
+                    egui::Event::PointerButtonReleased {
+                        button: egui::PointerButton::Primary,
+                        ..
+                    }
+                )));
+                assert!(!self.ctx.input(|input| input.pointer.primary_down()));
+                assert!(self.ctx.input(|input| input.pointer.primary_released()));
+                assert_eq!(self.ctx.dragged_id(), None, "ordinary drag must end");
+                assert_eq!(self.ctx.drag_stopped_id(), Some(source));
+                assert!(!egui::DragAndDrop::has_any_payload(&self.ctx));
+            }
+
+            fn assert_fresh_drag_still_reorders(&mut self) {
+                self.start_drag(0);
+                let target = self.rows[1].1.center();
+                assert!(self.run(&[cursor(target)]).is_empty());
+                assert_eq!(
+                    self.run(&[mouse(ElementState::Released, MouseButton::Left)]),
+                    vec![EditorUiAction::MovePage { page: 0, before: 1 }],
+                    "a fresh positioned release must retain ordinary page reordering"
+                );
+                assert!(!egui::DragAndDrop::has_any_payload(&self.ctx));
+            }
+        }
+
+        fn cursor(pos: egui::Pos2) -> WindowEvent {
+            WindowEvent::CursorMoved {
+                device_id: DeviceId::dummy(),
+                position: winit::dpi::PhysicalPosition::new(f64::from(pos.x), f64::from(pos.y)),
+            }
+        }
+
+        fn mouse(state: ElementState, button: MouseButton) -> WindowEvent {
+            WindowEvent::MouseInput {
+                device_id: DeviceId::dummy(),
+                state,
+                button,
+            }
+        }
+
+        fn leave() -> WindowEvent {
+            WindowEvent::CursorLeft {
+                device_id: DeviceId::dummy(),
+            }
+        }
+
+        #[test]
+        fn native_unknown_release_before_same_batch_move_cannot_reorder_source_pages() {
+            let mut harness = SourceDragHarness::new();
+            harness.start_drag(0);
+            let source = harness.rows[0].0;
+            let target = harness.rows[1].1.center();
+            assert!(
+                harness
+                    .run(&[cursor(egui::pos2(-20.0, target.y)), leave()])
+                    .is_empty()
+            );
+            assert!(
+                harness
+                    .run(&[
+                        mouse(ElementState::Released, MouseButton::Left),
+                        cursor(target)
+                    ])
+                    .is_empty(),
+                "later Move must not provide a position for the earlier native Up"
+            );
+            harness.assert_unknown_release_ended_drag(source);
+            assert!(
+                harness.run(&[]).is_empty(),
+                "cancelled payload must not replay"
+            );
+            harness.assert_fresh_drag_still_reorders();
+        }
+
+        #[test]
+        fn native_unknown_release_after_gone_cannot_drop_at_lingering_interact_position() {
+            let mut harness = SourceDragHarness::new();
+            harness.start_drag(0);
+            let source = harness.rows[0].0;
+            let target = harness.rows[1].1.center();
+            assert!(harness.run(&[cursor(target)]).is_empty());
+            assert!(
+                harness
+                    .run(&[leave(), mouse(ElementState::Released, MouseButton::Left)])
+                    .is_empty(),
+                "PointerGone retains interact_pos, which is not a release coordinate"
+            );
+            assert_eq!(harness.ctx.pointer_latest_pos(), None);
+            assert_eq!(harness.ctx.pointer_interact_pos(), Some(target));
+            harness.assert_unknown_release_ended_drag(source);
+            assert!(harness.run(&[cursor(target)]).is_empty());
+            harness.assert_fresh_drag_still_reorders();
+        }
+
+        #[test]
+        fn native_unknown_release_does_not_reuse_earlier_positioned_release_authorization() {
+            let mut harness = SourceDragHarness::new();
+            harness.start_drag(0);
+            let source = harness.rows[0].0;
+            let origin = harness.rows[0].1.center();
+            let target = harness.rows[1].1.center();
+            assert!(
+                harness
+                    .run(&[
+                        cursor(egui::pos2(-20.0, target.y)),
+                        mouse(ElementState::Released, MouseButton::Left),
+                        cursor(origin),
+                        mouse(ElementState::Pressed, MouseButton::Left),
+                        leave(),
+                        mouse(ElementState::Released, MouseButton::Left),
+                        cursor(target),
+                    ])
+                    .is_empty(),
+                "earlier positioned terminal outside the editor cannot authorize the last unknown Up"
+            );
+            assert!(
+                harness.native_events.iter().any(|event| matches!(
+                    event,
+                    egui::Event::PointerButton { pressed: false, .. }
+                ))
+            );
+            harness.assert_unknown_release_ended_drag(source);
+            harness.assert_fresh_drag_still_reorders();
+        }
+
+        #[test]
+        fn native_unknown_release_does_not_drop_or_clear_a_later_pending_drag_in_the_same_batch() {
+            let mut harness = SourceDragHarness::new();
+            harness.start_drag(0);
+            let first_source = harness.rows[0].0;
+            let (second_source, second_rect) = harness.rows[1];
+            assert!(
+                harness
+                    .run(&[cursor(egui::pos2(-20.0, second_rect.center().y)), leave()])
+                    .is_empty()
+            );
+            let second_origin = second_rect.center();
+            assert!(
+                harness
+                    .run(&[
+                        mouse(ElementState::Released, MouseButton::Left),
+                        cursor(second_origin),
+                        mouse(ElementState::Pressed, MouseButton::Left),
+                        cursor(second_origin + egui::vec2(20.0, 0.0)),
+                    ])
+                    .is_empty(),
+                "the old terminal cannot drop either operation's payload"
+            );
+            assert!(harness.ctx.input(|input| input.pointer.primary_down()));
+            assert_eq!(harness.ctx.drag_stopped_id(), Some(first_source));
+            assert_eq!(harness.ctx.dragged_id(), None);
+            let new_response = harness.ctx.read_response(second_source).unwrap();
+            // click_and_drag deliberately remains undecided in any frame
+            // containing its new press, even when that frame also moves it.
+            assert!(!new_response.dragged() && !new_response.drag_started());
+            assert!(new_response.is_pointer_button_down_on());
+            assert_eq!(
+                harness.ctx.input(|input| input.pointer.press_origin()),
+                Some(second_origin)
+            );
+            assert!(
+                !egui::DragAndDrop::has_any_payload(&harness.ctx),
+                "the old cancelled payload is retired before the new drag starts"
+            );
+            assert!(harness.run(&[]).is_empty());
+            assert_eq!(harness.ctx.dragged_id(), Some(second_source));
+            let new_response = harness.ctx.read_response(second_source).unwrap();
+            assert!(new_response.drag_started() && new_response.dragged());
+            assert!(new_response.is_pointer_button_down_on());
+            assert_eq!(
+                egui::DragAndDrop::payload::<DragItem>(&harness.ctx)
+                    .expect("new drag must survive the old release's end-pass cleanup")
+                    .0,
+                1
+            );
+            let target = harness.rows[0].1.center();
+            assert!(harness.run(&[cursor(target)]).is_empty());
+            assert_eq!(
+                harness.run(&[mouse(ElementState::Released, MouseButton::Left)]),
+                vec![EditorUiAction::MovePage { page: 1, before: 0 }]
+            );
+            assert!(!egui::DragAndDrop::has_any_payload(&harness.ctx));
+        }
+
+        #[test]
+        fn native_positioned_release_drops_at_its_position_before_a_later_move() {
+            let mut harness = SourceDragHarness::new();
+            harness.start_drag(0);
+            let source = harness.rows[0].0;
+            let target = harness.rows[1].1.center();
+            let later = egui::pos2(-20.0, target.y);
+            assert!(harness.run(&[cursor(target)]).is_empty());
+            assert_eq!(
+                harness.run(&[
+                    mouse(ElementState::Released, MouseButton::Left),
+                    cursor(later),
+                ]),
+                vec![EditorUiAction::MovePage { page: 0, before: 1 }],
+                "the actual Up coordinate determines the drop, rather than final hover"
+            );
+            assert_eq!(harness.ctx.pointer_latest_pos(), Some(later));
+            assert_eq!(
+                harness
+                    .ctx
+                    .read_response(source)
+                    .unwrap()
+                    .interact_pointer_pos(),
+                Some(target),
+                "a stopped response retains its own release position"
+            );
+            assert!(!egui::DragAndDrop::has_any_payload(&harness.ctx));
+        }
+
+        #[test]
+        fn native_unknown_release_preserves_a_fresh_pending_drag_on_the_same_source() {
+            let mut harness = SourceDragHarness::new();
+            harness.start_drag(0);
+            let (source, rect) = harness.rows[0];
+            assert!(
+                harness
+                    .run(&[cursor(egui::pos2(-20.0, rect.center().y)), leave()])
+                    .is_empty()
+            );
+            let origin = rect.center();
+            let moved = origin + egui::vec2(20.0, 0.0);
+            assert!(
+                harness
+                    .run(&[
+                        mouse(ElementState::Released, MouseButton::Left),
+                        cursor(origin),
+                        mouse(ElementState::Pressed, MouseButton::Left),
+                        cursor(moved),
+                    ])
+                    .is_empty()
+            );
+            let response = harness.ctx.read_response(source).unwrap();
+            assert!(!response.dragged() && !response.drag_started());
+            assert!(response.is_pointer_button_down_on());
+            assert!(
+                response.drag_stopped(),
+                "the previous drag ended while the new press is still pending"
+            );
+            assert_eq!(response.drag_stopped_pos(), None);
+            assert_eq!(response.interact_pointer_pos(), Some(moved));
+            assert_eq!(
+                harness.ctx.input(|input| input.pointer.press_origin()),
+                Some(origin)
+            );
+            assert!(!egui::DragAndDrop::has_any_payload(&harness.ctx));
+            // is_decidedly_dragging excludes the press frame; the retained
+            // new hold and its recorded movement start the drag next pass.
+            assert!(harness.run(&[]).is_empty());
+            let response = harness.ctx.read_response(source).unwrap();
+            assert!(response.dragged() && response.drag_started());
+            assert!(response.is_pointer_button_down_on());
+            assert!(!response.drag_stopped());
+            assert_eq!(
+                egui::DragAndDrop::payload::<DragItem>(&harness.ctx)
+                    .expect("fresh same-source drag publishes a new payload")
+                    .0,
+                0
+            );
+            let target = harness.rows[1].1.center();
+            assert!(harness.run(&[cursor(target)]).is_empty());
+            assert_eq!(
+                harness.run(&[mouse(ElementState::Released, MouseButton::Left)]),
+                vec![EditorUiAction::MovePage { page: 0, before: 1 }]
+            );
+            assert!(!egui::DragAndDrop::has_any_payload(&harness.ctx));
+        }
+
+        #[test]
+        fn native_positioned_drop_and_pending_same_source_drag_keep_separate_payloads() {
+            let mut harness = SourceDragHarness::new();
+            harness.start_drag(0);
+            let (source, rect) = harness.rows[0];
+            let target = harness.rows[1].1.center();
+            let origin = rect.center();
+            let moved = origin + egui::vec2(20.0, 0.0);
+            assert_eq!(
+                harness.run(&[
+                    cursor(target),
+                    mouse(ElementState::Released, MouseButton::Left),
+                    cursor(origin),
+                    mouse(ElementState::Pressed, MouseButton::Left),
+                    cursor(moved),
+                ]),
+                vec![EditorUiAction::MovePage { page: 0, before: 1 }],
+                "the new pending press must preserve the old qualified drop"
+            );
+            let response = harness.ctx.read_response(source).unwrap();
+            assert!(!response.drag_started() && !response.dragged());
+            assert!(response.is_pointer_button_down_on());
+            assert!(response.drag_stopped());
+            assert_eq!(response.drag_stopped_pos(), Some(target));
+            assert_eq!(response.interact_pointer_pos(), Some(moved));
+            assert_eq!(
+                harness.ctx.input(|input| input.pointer.press_origin()),
+                Some(origin)
+            );
+            assert!(
+                !egui::DragAndDrop::has_any_payload(&harness.ctx),
+                "taking the old qualified drop retires its payload while the next press is pending"
+            );
+            assert!(harness.run(&[]).is_empty());
+            let response = harness.ctx.read_response(source).unwrap();
+            assert!(response.drag_started() && response.dragged());
+            assert!(!response.drag_stopped());
+            assert_eq!(response.interact_pointer_pos(), Some(moved));
+            assert_eq!(
+                egui::DragAndDrop::payload::<DragItem>(&harness.ctx)
+                    .expect("taking the old drop must preserve the new held payload")
+                    .0,
+                0
+            );
+            assert!(harness.run(&[cursor(target)]).is_empty());
+            assert_eq!(
+                harness.run(&[mouse(ElementState::Released, MouseButton::Left)]),
+                vec![EditorUiAction::MovePage { page: 0, before: 1 }],
+                "the second operation retains its own positioned release"
+            );
+            assert!(!egui::DragAndDrop::has_any_payload(&harness.ctx));
+        }
+    }
+
     #[test]
     fn confirmation_keeps_editor_fill_opaque_under_modal_backdrop() {
         fn covering_fill(

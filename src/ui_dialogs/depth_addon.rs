@@ -1,6 +1,6 @@
 //! App-owned depth model management. Download completion never starts 3D mode.
 use crate::addon::{AddonEvent, AddonOperation, AddonStatus, InstallProgress};
-use crate::app::{App, DepthEntryRequest};
+use crate::app::{App, DepthEntryRequest, ViewerContextId};
 use crate::depth_addon::DepthAddon;
 use eframe::egui;
 use std::path::PathBuf;
@@ -9,7 +9,7 @@ use std::time::Duration;
 
 #[derive(Debug, PartialEq)]
 enum Dialog {
-    Checking(CheckingOrigin),
+    Checking,
     Confirm,
     Running,
     RemoveConfirm,
@@ -24,10 +24,26 @@ enum CheckingOrigin {
     ModeEntry(DepthEntryRequest),
 }
 
+/// The request origin and dialog phase share one lifetime, including modeless progress.
+#[derive(Debug, PartialEq)]
+struct OwnedDialog {
+    origin: CheckingOrigin,
+    phase: Dialog,
+}
+
+impl OwnedDialog {
+    fn preferences(phase: Dialog) -> Self {
+        Self {
+            origin: CheckingOrigin::Preferences,
+            phase,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct DepthSetup {
     addon: DepthAddon,
-    dialog: Option<Dialog>,
+    dialog: Option<OwnedDialog>,
     folder_result: Option<mpsc::Receiver<Result<(), String>>>,
 }
 
@@ -52,12 +68,23 @@ impl DepthSetup {
 
     #[cfg(test)]
     pub(crate) fn checking_for_test(&self) -> bool {
-        matches!(self.dialog, Some(Dialog::Checking(_)))
+        matches!(
+            self.dialog.as_ref().map(|dialog| &dialog.phase),
+            Some(Dialog::Checking)
+        )
     }
 
     #[cfg(test)]
     pub(crate) fn confirming_for_test(&self) -> bool {
-        self.dialog == Some(Dialog::Confirm)
+        matches!(
+            self.dialog.as_ref().map(|dialog| &dialog.phase),
+            Some(Dialog::Confirm)
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_dialog_running_for_test(&mut self) {
+        self.set_dialog_phase(Dialog::Running);
     }
 
     #[cfg(test)]
@@ -70,11 +97,52 @@ impl DepthSetup {
         self.addon.set_status_for_test(status);
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_operation_for_test(&mut self, operation: AddonOperation) {
+        self.addon.set_operation_for_test(operation);
+    }
+
     pub(crate) fn modal_open(&self) -> bool {
         matches!(
-            self.dialog,
-            Some(Dialog::Confirm | Dialog::RemoveConfirm | Dialog::Checking(_))
+            self.dialog.as_ref().map(|dialog| &dialog.phase),
+            Some(Dialog::Confirm | Dialog::RemoveConfirm | Dialog::Checking)
         )
+    }
+
+    pub(crate) fn dialog_owner_context(&self) -> Option<ViewerContextId> {
+        match self.dialog.as_ref()?.origin {
+            CheckingOrigin::ModeEntry(request) => Some(request.context),
+            CheckingOrigin::Preferences => None,
+        }
+    }
+
+    pub(crate) fn entry_modal_owner_context(&self) -> Option<ViewerContextId> {
+        let dialog = self.dialog.as_ref()?;
+        if matches!(dialog.phase, Dialog::Checking | Dialog::Confirm) {
+            self.dialog_owner_context()
+        } else {
+            None
+        }
+    }
+
+    /// Forget only the pending admission. The addon scan and management UI have
+    /// their own lifetime and must continue after the requesting display is lost.
+    pub(crate) fn invalidate_mode_entry(&mut self, context: ViewerContextId) {
+        if self.entry_modal_owner_context() == Some(context) {
+            self.dialog = None;
+        }
+    }
+
+    /// An in-progress addon operation opens modeless progress instead of checking.
+    pub(crate) fn entry_check_opens_modal(&self) -> bool {
+        self.addon.operation() == AddonOperation::None
+    }
+
+    fn set_dialog_phase(&mut self, phase: Dialog) {
+        match self.dialog.as_mut() {
+            Some(dialog) => dialog.phase = phase,
+            None => self.dialog = Some(OwnedDialog::preferences(phase)),
+        }
     }
     /// Cached API for the mode entry path in stage B; it performs no I/O.
     pub(crate) fn installed_model_path(&self) -> Option<&std::path::Path> {
@@ -131,16 +199,17 @@ impl App {
     }
 
     fn request_depth_addon_check(&mut self, ctx: &egui::Context, origin: CheckingOrigin) {
-        if self.depth_setup.addon.operation() != AddonOperation::None {
-            self.depth_setup.dialog = Some(Dialog::Running);
-        } else {
+        let phase = if self.depth_setup.entry_check_opens_modal() {
             self.depth_setup.addon.request_scan();
-            self.depth_setup.dialog = Some(if self.depth_setup.addon.is_scanning() {
-                Dialog::Checking(origin)
+            if self.depth_setup.addon.is_scanning() {
+                Dialog::Checking
             } else {
                 Dialog::Confirm
-            });
-        }
+            }
+        } else {
+            Dialog::Running
+        };
+        self.depth_setup.dialog = Some(OwnedDialog { origin, phase });
         ctx.request_repaint();
     }
     pub(crate) fn refresh_depth_preferences(&mut self) {
@@ -169,7 +238,7 @@ impl App {
             self.request_depth_addon_setup(ctx);
         }
         if remove && self.depth_setup.view().can_remove {
-            self.depth_setup.dialog = Some(Dialog::RemoveConfirm);
+            self.depth_setup.dialog = Some(OwnedDialog::preferences(Dialog::RemoveConfirm));
         }
         if folder && self.depth_setup.folder_result.is_none() {
             let dir = self.depth_setup.addon.root().to_owned();
@@ -188,7 +257,9 @@ impl App {
                     repaint.request_repaint();
                 }) {
                 Ok(_) => self.depth_setup.folder_result = Some(rx),
-                Err(error) => self.depth_setup.dialog = Some(Dialog::Error(error.to_string())),
+                Err(error) => self
+                    .depth_setup
+                    .set_dialog_phase(Dialog::Error(error.to_string())),
             }
         }
     }
@@ -205,7 +276,7 @@ impl App {
                 self.depth_setup.folder_result = None;
                 if let Err(error) = result {
                     crate::logger::log(format!("[Depth addon] open folder: {error}"));
-                    self.depth_setup.dialog = Some(Dialog::Error(error));
+                    self.depth_setup.set_dialog_phase(Dialog::Error(error));
                 }
             }
         }
@@ -215,11 +286,11 @@ impl App {
                 AddonEvent::Installed { .. } => {
                     if cancelling {
                         if self.depth_setup.dialog.is_some() {
-                            self.depth_setup.dialog = Some(Dialog::Cancelled);
+                            self.depth_setup.set_dialog_phase(Dialog::Cancelled);
                         }
                     } else {
                         if self.depth_setup.dialog.is_some() {
-                            self.depth_setup.dialog = Some(Dialog::Done);
+                            self.depth_setup.set_dialog_phase(Dialog::Done);
                         }
                         self.show_feedback_result(
                             depth_setup_completion_message(&self.keymap),
@@ -229,7 +300,7 @@ impl App {
                 }
                 AddonEvent::Cancelled => {
                     if self.depth_setup.dialog.is_some() {
-                        self.depth_setup.dialog = Some(Dialog::Cancelled);
+                        self.depth_setup.set_dialog_phase(Dialog::Cancelled);
                     }
                 }
                 AddonEvent::Removed => self.depth_setup.dialog = None,
@@ -239,26 +310,32 @@ impl App {
                         "3D 写真モデルの処理に失敗しました".into(),
                         crate::feedback::FeedbackKind::Error,
                     );
-                    self.depth_setup.dialog = Some(Dialog::Error(message));
+                    self.depth_setup.set_dialog_phase(Dialog::Error(message));
                 }
                 AddonEvent::StatusChanged => {}
             }
         }
-        if matches!(self.depth_setup.dialog, Some(Dialog::Checking(_)))
-            && !self.depth_setup.addon.is_scanning()
+        if matches!(
+            self.depth_setup.dialog.as_ref().map(|dialog| &dialog.phase),
+            Some(Dialog::Checking)
+        ) && !self.depth_setup.addon.is_scanning()
         {
-            let Some(Dialog::Checking(origin)) = self.depth_setup.dialog.take() else {
+            let Some(mut dialog) = self.depth_setup.dialog.take() else {
                 unreachable!()
             };
             if self.depth_setup.installed_model_path().is_some() {
-                match origin {
+                match dialog.origin {
                     CheckingOrigin::ModeEntry(request) => {
-                        self.resume_depth_entry_after_check(ctx, request);
+                        self.resume_depth_entry_in_request_context(ctx, request);
                     }
-                    CheckingOrigin::Preferences => self.depth_setup.dialog = Some(Dialog::Done),
+                    CheckingOrigin::Preferences => {
+                        dialog.phase = Dialog::Done;
+                        self.depth_setup.dialog = Some(dialog);
+                    }
                 }
             } else {
-                self.depth_setup.dialog = Some(Dialog::Confirm);
+                dialog.phase = Dialog::Confirm;
+                self.depth_setup.dialog = Some(dialog);
             }
         }
         if self.depth_setup.addon.is_scanning()
@@ -274,7 +351,7 @@ impl App {
         };
         let action = draw_dialog(
             ctx,
-            &dialog,
+            &dialog.phase,
             self.depth_setup.addon.progress(),
             self.depth_setup.addon.operation(),
             self.depth_setup.addon.root(),
@@ -282,12 +359,12 @@ impl App {
         );
         match action {
             Action::Download => match self.depth_setup.addon.start_install() {
-                Ok(()) => dialog = Dialog::Running,
-                Err(error) => dialog = Dialog::Error(error),
+                Ok(()) => dialog.phase = Dialog::Running,
+                Err(error) => dialog.phase = Dialog::Error(error),
             },
             Action::Remove => match self.depth_setup.addon.start_remove() {
-                Ok(()) => dialog = Dialog::Running,
-                Err(error) => dialog = Dialog::Error(error),
+                Ok(()) => dialog.phase = Dialog::Running,
+                Err(error) => dialog.phase = Dialog::Error(error),
             },
             Action::Cancel => self.depth_setup.addon.cancel(),
             Action::Close => {
@@ -353,7 +430,7 @@ fn draw_dialog(
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     match dialog {
-                        Dialog::Checking(_) => {
+                        Dialog::Checking => {
                             ui.label("モデルを確認中...");
                         }
                         Dialog::Confirm => {
@@ -479,12 +556,8 @@ mod tests {
     #[test]
     fn depth_management_modal_boundary_keeps_download_modeless() {
         let mut setup = DepthSetup::default();
-        for dialog in [
-            Dialog::Confirm,
-            Dialog::Checking(CheckingOrigin::Preferences),
-            Dialog::RemoveConfirm,
-        ] {
-            setup.dialog = Some(dialog);
+        for dialog in [Dialog::Confirm, Dialog::Checking, Dialog::RemoveConfirm] {
+            setup.dialog = Some(OwnedDialog::preferences(dialog));
             assert!(setup.modal_open());
         }
         for dialog in [
@@ -493,7 +566,7 @@ mod tests {
             Dialog::Cancelled,
             Dialog::Error("failure".into()),
         ] {
-            setup.dialog = Some(dialog);
+            setup.dialog = Some(OwnedDialog::preferences(dialog));
             assert!(!setup.modal_open());
         }
     }
@@ -507,7 +580,7 @@ mod tests {
         app.request_depth_addon_setup(&ctx);
         assert_eq!(
             app.depth_setup.dialog,
-            Some(Dialog::Checking(CheckingOrigin::Preferences))
+            Some(OwnedDialog::preferences(Dialog::Checking))
         );
         assert_eq!(app.depth_setup.addon.operation(), AddonOperation::None);
         assert!(app.depth_setup.installed_model_path().is_none());
@@ -517,7 +590,10 @@ mod tests {
             assert!(std::time::Instant::now() < until);
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(app.depth_setup.dialog, Some(Dialog::Confirm));
+        assert_eq!(
+            app.depth_setup.dialog,
+            Some(OwnedDialog::preferences(Dialog::Confirm))
+        );
         assert!(!temp.path().join("depth").exists());
         app.request_depth_addon_setup(&ctx);
         assert!(!app.depth_setup.addon.is_scanning());
@@ -532,11 +608,7 @@ mod tests {
                     0 => (Dialog::Confirm, AddonOperation::None, "ダウンロード"),
                     1 => (Dialog::Running, AddonOperation::Installing, "キャンセル"),
                     2 => (Dialog::RemoveConfirm, AddonOperation::None, "削除する"),
-                    3 => (
-                        Dialog::Checking(CheckingOrigin::Preferences),
-                        AddonOperation::None,
-                        "閉じる",
-                    ),
+                    3 => (Dialog::Checking, AddonOperation::None, "閉じる"),
                     4 => (Dialog::Done, AddonOperation::None, "閉じる"),
                     5 => (Dialog::Cancelled, AddonOperation::None, "閉じる"),
                     _ => (

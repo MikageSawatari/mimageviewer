@@ -1,5 +1,81 @@
 # egui 0.37.0 のローカル変更（段2a-1／2a-2／2a-3）
 
+## 依頼55 独立レビュー: 位置のない物理button終端（2026-11-15）
+
+再レビューの規則を反映し、位置なし終端は保持だけを終え、click／tap／短押し／drop／seek／closeの
+認可にはしない。例外は本体のParked復帰だけ。`PointerEvent::Released.position: Option<Pos2>`を
+同じcanonical列に保持し、`PointerState::button_events`／`button_releases`／`button_release_position`で
+公開する。既存release／drag_stopped通知はcleanup用として維持し、frameの一括bool取消に置き換えない。
+
+`Context::get_response`は最終snapshotのdrag levelを旧releaseで再clearしない。
+`Response::drag_stopped_pos()` はinteraction snapshotで旧Idを実際に終えた終端だけに結ぶ。
+未知終端・Escape等はNoneとし、同frameの別clickのUpや旧interact_posを借用しない。
+同frameの新しい保持がある通常interact_posと、停止した旧操作の位置を区別する。
+`button_click_position`はcanonicalなclick終端の実点だけを公開し、seekのclick目標とheld更新を分離する。
+同widgetへの終端→再pressも別operationとして新drag_startedを出し、新heldへ旧stopを付けない。
+Dndは単一plugin内で新heldと既知終端のready payloadを別操作として保持する。
+旧heldは最初の終端でtakeし、未知なら破棄、既知なら実点／viewport付きreadyへ渡す。
+新UI発行heldは旧readyを消さず、drop／終了は対象viewportのreadyだけを消費・退役する。
+drop先は通常と同じwidget/layer hit-testを実release点で評価し、後着hoverや開始位置で認可しない。
+scrollの外部capture short press／barと通常inertiaもこの位置資格に揃える。
+Panelの位置なし停止も新collapse/expandを認可しない。pre-drag自然幅を保持する既存PanelStateとは別に、
+resize widgetが適用済みの幅だけをtemp geometryとして持ち、未知終端ではその幅の保存と保持終了だけを行う。
+
+上流へ戻す際は本体の独自recognizer・並べ替え・seek／text／captureのconsumer移行と一緒に扱う。
+`any_released=false`や`click=None`への一括置換では、通常dragの保持終端と正当なdropを両立できない。
+全consumerの検索・判定と実State回帰、テスト証跡は依頼50調査書§5.9とその監査付表を参照。
+
+`Event::PointerButtonReleased { button, modifiers }` はintegrationがforwardした押下に対する
+実releaseで、解放座標がない場合に用いる。PointerStateのdown／press_originを終え、
+click=NoneのReleasedを一つ記録する。hover／interact位置を作らず、PointerGone自体の意味は変えない。
+Contextの順序付きbutton capture witnessも終端し、同frame後続pressに旧widgetを渡さない。
+上流へ戻す際はegui-winitの実mouse保持所有とraw終端、Appのrelease ordinal／command取消を
+一緒に移す。既知の古い座標を通常PointerButton releaseへ転用してはならない。
+実widgetとState・callbackのheadless回帰および根拠は依頼50調査書§5.8を参照。
+
+## §1.767 A: pointer開始の所有証跡（2026-11-14）
+
+`Event::PointerInputProvenance(Id)`は、直後のraw Touch Start／primary pressだけに属するopaqueな証跡で、
+単独ではpointer・キー・IME・focusを操作しない。egui-winitの実入力追加点で所有者が返したIDを付け、
+Appの既存gesture ownerが同じIDのscope付きproofと照合する。旧Active表示の蓄積済clickを新Parked callbackへ
+再所属させないためのAの契約であり、Cのnative allocation寿命・HWND同定は変更しない。
+並列Vecのindexではなく同じevent列に置くため、RawInputのtake／append、native State再生成時の保留入力、
+先頭へのキーrelease追加、layout replayでも証跡とpressの関係が保たれる。孤立markerを後のpressへ持ち越してはならない。
+InputStateの既存event保持を使い、RawInput／IME／touch終端の一括clearをしない。
+
+上流へ戻すときはegui-winitのobserver・本体gesture consumerと一緒に扱うこと。
+observerを導入しないintegrationはmarkerを生成せず、従来の入力動作を維持する。
+`data/input/event.rs`のheadless試験で非操作性・take／append・replay時の保持を検査する。
+
+`Response::clicked_with_keyboard_or_accessibility()`は既存の`FAKE_PRIMARY_CLICKED`だけを公開する。
+Parked窓のpointer closeを同じcanonical gesture ownerへ移し、既存keyboard／accessibility操作は
+保持するためのprojectionであり、新たなキー判定・focus変更を加えない。同frameのpointer操作と
+keyboard操作が共存しても、pointer位置や`clicked_by`の否定から入力元を推測しない。
+`response.rs`の3試験でpointerだけ／keyboardだけ／同時入力を検査する。
+上流へ戻す際は既存`clicked()`の意味を保ち、アプリ側のpointer command ownerと合わせて移す。
+
+## §1.767: native入力所有者の正確なpointer取消（2026-11-14）
+
+`Context::cancel_pointer_button_for(ViewportRegistration, PointerButton, Id)` は、
+integrationが継続して所有するsynthetic gestureだけを、通常入力を処理する前の
+input pluginから一度だけ取り消す。呼出側はlogical registrationと押下先widgetの所有を
+保持し、physical takeoverを受ける前にsynthetic所有を手放すこと。backendのnative退役hookから
+Contextへ再入する用途ではない。
+
+一致する既存logical lifetimeの指定button levelだけを終了し、release/clickを生成しない。
+Memoryのclick/drag captureと前passのinteraction snapshotは指定widget一致分だけを除去し、
+通常の`drag_stopped` commitを生成させない。他buttonのlevel、別widgetのcapture、兄弟viewport、
+座標、キー、IMEを保持する。logical lifetimeが消えていればno-opで、新しいviewportを作らない。
+cancelをlayout再passへ再配送すると第1passの後継pressを消すため、呼出側は終端要求を一度で消費する。
+
+`src/context/pointer_cancellation_tests.rs` は短時間click/dragと通常releaseの対照、他buttonと
+別widget captureの保持をheadlessな実widgetで検査する。本体の入力回帰は実`run_ui`の
+`request_discard`、physical takeover、その後のnative退役、同logical/native再生成と
+logical ID再openを区別して検査する。
+最終検証は本crateの `pointer_cancellation|viewport_retirement|input_state` 26件成功、
+本体の指定回帰2,257件成功、引数なしfmt成功。コマンドと中間失敗を含む証跡は
+[依頼50調査書 §4.4](../../docs/depth-parallax-realmachine50-investigation.md#44-c-実装記録2026-11-14独立設計レビュー反映)に記録する。
+
 原本とchecksum・VCSの記録は [upstream-provenance.json](../upstream-provenance.json) を参照。
 段2a-1では0.37.0原本を基準に、旧`vendor/egui`の既存パッチを付け直した。
 段2a-2のIME中断要求の生成・集約修正と段2a-3の非描画退役は末尾の追補に記録する。

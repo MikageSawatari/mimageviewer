@@ -166,6 +166,7 @@ fn target(app: &App) -> DeferredFsReopen {
         .as_deref()
         .unwrap_or(&nav.tree.zip_path);
     DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::CurrentArchiveBook(ArchiveBookTarget {
@@ -649,6 +650,7 @@ fn composition_wait_case(
         let (tx, _thumbs) = mpsc::channel();
         let now = Instant::now();
         let continuation = sidecar_restore::SidecarLoadContinuation {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             navigation_after_hydration: None,
             audio_art_prune: None,
             first_display_action: sidecar_restore::FirstDisplayAction::Zip {

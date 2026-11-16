@@ -1,5 +1,14 @@
 # 非同期・並列アーキテクチャ
 
+## 外部openの採用区分（§1.767、依頼50 B）
+
+既存startup ownerが新規main採用／既存C継続を確定し、`MainListNavigation`から返された正本hydrationへ、
+またsidecar exact request・composition・required／列挙reopenへ同じtyped値を運ぶ。
+`Navigation`や要求処理の`Continuation` stageだけでviewerの由来を判定しない。
+採用可能なrowが決まってから新規mainだけが通常gridのhandoffを一度通す。modal解除にcleanupを足さず、
+既存の最後の1件保留から同じ採用へ戻す。PDF warmの即時行採用、既存worker／非同期待機は維持する。
+明示leafは同じsidecar ownerのauto-folder page-choiceを置換し、二つの完了から別々にviewerを公開しない。
+区分の確定・移譲箇所は[依頼50調査書 §3.3](depth-parallax-realmachine50-investigation.md#33-非active化と同型入口の監査)を参照。
 ## ローカル文字起こしの transport・作成・表示（T1 区切り3）
 
 `ai::asr_worker` は `mimageviewer-vlm.exe --asr-serve` を Job Object 内で起動する。
@@ -57,7 +66,9 @@ navigation / supersession / rollback の組合せを追加しない。
 パネルのクリックはframe内の意図とし、描画後の素材・ページ・一覧世代を照合して受付する。
 保存時は最新のReady素材と描画snapshotを一組で捕捉し、設定画面中のresizeや背景の素材更新を
 旧snapshotと混ぜない。ナビゲーションの共通受付はmanual／slideshowとも停止し、
-OS closeだけは所有contextの取消へ通す。
+main が所有するときの OS close は従来どおり取消へ通す。main 以外の独立 context が所有するときは、
+modal の間だけ所有窓の OS close を拒否し、通常の body を描く表示先を保持する
+([3D 写真設計](depth-parallax-plan.md) §6.4.3)。
 
 worker は凍結した色・深度 Arc だけを読み、画面と同じ WGSL を専用 pipeline / uniform /
 bind group で不透明な `Rgba8Unorm` へ描く。GPU submit / map / `poll(Wait)`、GIF/APNG の
@@ -86,6 +97,10 @@ map する。`map_async` の完了 channel と `PollType::Poll` を使い、UI �
 
 要求は context / request ID / TextureId / cancel に相関し、結果も同じ所有者で照合する。
 source 切替・OFF・presentation変更・Dropは receiver/cancel と自分の GPU slot を退役する。
+独立 context への表示所有の移動が成功して main の全画面が live pass を失うときも、main を mount して
+同じ終了経路を通す。main 由来の Checking / Confirm の ModeEntry はその境界で失効させるが、
+モデル確認 worker 自体と Preferences 由来の案内は維持する。埋め込み main と通常更新・scoped mount は終了しない
+([3D 設計 §6.4.4](depth-parallax-plan.md))。
 兄弟 context の状態・cache・要求を変更しない。現在色と4件の深度 LRU を所有し、
 色・深度・readback buffer は既存 VRAM 会計へ渡す。推論は共有 AI runtime の直列契約を維持する。
 状態・入口・実装レビューと検証結果の正本は [3D 設計 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位)。

@@ -216,6 +216,11 @@ pub use native::file_storage::storage_dir;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod icon_data;
 
+/// Native allocation ownership and input registration shared by all viewports.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(any(feature = "glow", feature = "wgpu_no_default_features"))]
+pub mod native_window_input;
+
 /// Opt-in event-loop wait diagnostics for mImageViewer test-script builds.
 #[cfg(all(not(target_arch = "wasm32"), feature = "miv-test-script-wait-witness"))]
 #[doc(hidden)]

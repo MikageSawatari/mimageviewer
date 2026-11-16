@@ -1048,6 +1048,11 @@ impl PumpRuntime {
             ));
         }
         self.state = transition.state;
+        // Native canvas touch is interpreted at wndproc ingress. Project this
+        // same owner before effects can publish or retire either HWND; queued
+        // raw input and direct activation use one generation boundary.
+        self.pump_route
+            .publish_native_input_epoch(cursor_input_epoch(self.state).map_or(0, |epoch| epoch.0));
         for effect in transition.effects {
             let action_host = transition_action.and_then(|(_, _, action)| match (action, effect) {
                 ("Publish", WindowHostEffect::Publish { host, .. }) => Some(host),
@@ -1197,6 +1202,11 @@ impl PumpRuntime {
             NativeVideoWindowSource::Presenter,
             self.pump_route.clone(),
             self.render_route.clone(),
+        )
+        .with_detached_activation_host(
+            placement.owner_hwnd,
+            Arc::clone(&self.source_epoch),
+            Arc::clone(&self.cancel),
         );
         let hud_sink = super::native_window::NativeVideoWindowEventSink::new(
             epoch.0,
@@ -1204,6 +1214,11 @@ impl PumpRuntime {
             NativeVideoWindowSource::Hud,
             self.pump_route.clone(),
             self.render_route.clone(),
+        )
+        .with_detached_activation_host(
+            placement.owner_hwnd,
+            Arc::clone(&self.source_epoch),
+            Arc::clone(&self.cancel),
         );
         let create_t0 = Instant::now();
         let mut window = NativeWindowHost::create(NativeWindowHostConfig {

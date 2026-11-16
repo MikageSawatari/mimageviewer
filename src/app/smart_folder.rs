@@ -3892,6 +3892,7 @@ impl App {
                 prefix.as_deref(),
             );
         }
+        let viewer_adoption = navigation.viewer_adoption;
         let Some(mut adoption) = self.prepare_main_list_adoption(navigation, destination) else {
             self.retire_smart_folder_payloads([Box::new(child) as RetiredSmartFolderPayload]);
             return false;
@@ -3913,6 +3914,7 @@ impl App {
                 rows,
                 prepared_visible.with_install_boundary(boundary),
                 boundary,
+                viewer_adoption,
             );
             if let Some(commit) = archive_commit {
                 app.commit_smart_folder_archive_source(commit);
@@ -3933,6 +3935,7 @@ impl App {
         rows: Option<(Vec<GridItem>, Vec<Option<(i64, i64)>>, HashSet<String>)>,
         prepared_visible: super::PreparedVisibleInstall,
         install_boundary: super::MainListInstallBoundary,
+        viewer_adoption: super::ViewerOpenAdoption,
     ) -> super::MainListHydration {
         let path = source.load_path.clone();
         // The old visible PDF/ZIP receivers still belong to the prior view until this exact
@@ -3971,6 +3974,7 @@ impl App {
                 self.pending_auto_fs_open = true;
             } else if !matches!(&child, SmartPhysicalReady::Error(_)) {
                 self.fs_nav_after_pdf_enumerate = Some(super::DeferredFsReopen {
+                    viewer_adoption,
                     history_trigger: super::HistoryTrigger::UserChosen,
                     resume_slideshow: false,
                     target: super::DeferredFsTarget::None,
@@ -10457,6 +10461,7 @@ mod tests {
         let (_path, _owner) = stage_smart_epub_conversion(&mut app);
         assert!(smart_epub_waiting(&app));
         app.epub_convert.as_mut().unwrap().deferred_fullscreen = Some(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
