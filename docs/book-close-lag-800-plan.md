@@ -460,5 +460,5 @@ r4 の指摘は §4 の案に対するもので、S1 では片付けを worker �
   今と同じ順序・条件で準備する。
 - P3-5: 計装 (`thumb_catalog_lookup` の分類、cache hit は `load_phases` まで進まない)、`bench_scroll` の「キャッシュなし」の意味、
   Rust の実経路での warm / cold・1 万件・writeback 競合の受け入れ条件。
-- 写しの完全さに頼る読み手の照合表 (r5 の全文は scratchpad の review-800-r5.md): 4S.1 の表のほか、ドライブ一覧の独立した
+- 写しの完全さに頼る読み手の照合表 (r5 の全文は統括の共有メモのフォルダの review-800-r5.md): 4S.1 の表のほか、ドライブ一覧の独立した
   `load_all` の入口 (app.rs `seed_drive_list_pin_thumbs_from_catalog` の呼び出し元) の範囲を明記すること。
