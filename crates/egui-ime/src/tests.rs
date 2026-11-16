@@ -21,6 +21,51 @@ fn key_event_state(key: egui::Key, pressed: bool) -> egui::Event {
     }
 }
 
+#[test]
+fn drag_value_focus_records_recovers_escape_and_forgets_without_restoring() {
+    let ctx = test_context();
+    let mut value = 17;
+    let mut field = egui::Id::NULL;
+    ctx.run_ui(Default::default(), |ui| {
+        let response = ui.add(egui::DragValue::new(&mut value));
+        field = response.id;
+        response.request_focus();
+        track_drag_value_focus(&response);
+        assert_eq!(focused_text_input(&ctx), Some(field));
+        assert_eq!(
+            text_focus_contract_snapshot(&ctx)
+                .unwrap()
+                .diagnostic_key_policy,
+            TextInputDiagnosticKeyPolicy::Standard
+        );
+    })
+    .drop_without_applying_deltas();
+    ctx.run_ui(Default::default(), |ui| {
+        let response = ui.add(egui::DragValue::new(&mut value));
+        track_drag_value_focus(&response);
+        assert_eq!(focused_text_input(&ctx), Some(field));
+    })
+    .drop_without_applying_deltas();
+    ctx.run_ui(
+        egui::RawInput {
+            events: vec![key_event(egui::Key::Escape)],
+            ..Default::default()
+        },
+        |ui| {
+            assert_eq!(ctx.memory(|memory| memory.focused()), None);
+            assert_eq!(recovering_text_input(&ctx), Some(field));
+            let response = ui.add(egui::DragValue::new(&mut value));
+            assert!(response.lost_focus());
+            track_drag_value_focus(&response);
+            assert_eq!(ctx.memory(|memory| memory.focused()), None);
+            assert!(text_focus_contract_snapshot(&ctx).is_none());
+            assert_eq!(recovering_text_input(&ctx), None);
+        },
+    )
+    .drop_without_applying_deltas();
+    assert_eq!(value, 17);
+}
+
 fn viewport_raw_input(viewport_id: egui::ViewportId, events: Vec<egui::Event>) -> egui::RawInput {
     let mut input = egui::RawInput {
         viewport_id,

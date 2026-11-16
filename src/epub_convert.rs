@@ -1196,6 +1196,12 @@ mod windows_process {
         }
     }
     pub(super) fn spawn(spec: &WorkerSpec) -> Result<Box<dyn WorkerChild>, EpubConvertError> {
+        #[cfg(test)]
+        if matches!(&spec.operation, WorkerOperation::Convert { .. })
+            && spec.native_test_args.is_none()
+        {
+            crate::test_gpu_group::assert_gpu_test_group();
+        }
         let args = worker_arguments(spec);
         #[cfg(test)]
         let args: Vec<OsString> = if let Some(test_args) = &spec.native_test_args {

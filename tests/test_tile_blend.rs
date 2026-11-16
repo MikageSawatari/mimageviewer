@@ -10,6 +10,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+#[path = "support/gpu_test_group.rs"]
+mod test_gpu_group;
+
 fn find_models_dir() -> PathBuf {
     let cwd_models = std::env::current_dir().unwrap().join("models");
     if cwd_models.exists() {
@@ -133,6 +136,7 @@ fn test_manga_tile_blend() {
         return;
     }
 
+    test_gpu_group::assert_gpu_test_group();
     let runtime = mimageviewer::ai::runtime::AiRuntime::new().unwrap();
     runtime
         .load_model(mimageviewer::ai::ModelKind::UpscaleRealCugan4x, &cugan_path)
@@ -190,6 +194,7 @@ fn test_screentone_patterns() {
         return;
     }
 
+    test_gpu_group::assert_gpu_test_group();
     let runtime = mimageviewer::ai::runtime::AiRuntime::new().unwrap();
     runtime
         .load_model(mimageviewer::ai::ModelKind::UpscaleRealCugan4x, &cugan_path)
@@ -317,6 +322,7 @@ fn test_screentone_tile_blend() {
         return;
     }
 
+    test_gpu_group::assert_gpu_test_group();
     let runtime = mimageviewer::ai::runtime::AiRuntime::new().unwrap();
     runtime
         .load_model(mimageviewer::ai::ModelKind::UpscaleRealCugan4x, &cugan_path)

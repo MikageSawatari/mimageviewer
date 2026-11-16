@@ -18,6 +18,10 @@
 
 pub use wgpu;
 
+#[cfg(test)]
+#[path = "../../../tests/support/gpu_test_group.rs"]
+mod test_gpu_group;
+
 mod adapter_candidates;
 /// Low-level painting of [`egui`](https://github.com/emilk/egui) on [`wgpu`].
 pub mod atlas_diag;
@@ -301,6 +305,8 @@ impl RenderState {
                     |adapter: wgpu::Adapter| {
                         let descriptor = (*device_descriptor)(&adapter);
                         async move {
+                            #[cfg(test)]
+                            crate::test_gpu_group::assert_gpu_test_group();
                             profiling::scope!("request_device");
                             adapter.request_device(&descriptor).await
                         }

@@ -20,6 +20,10 @@ mod bridge;
 mod plugin_gui;
 mod scanner;
 
+#[cfg(test)]
+#[path = "../../../tests/support/gpu_test_group.rs"]
+mod test_gpu_group;
+
 use std::sync::{Arc, Mutex};
 
 use audio::{AudioEngine, Mode, ToneParams};
@@ -67,6 +71,8 @@ fn main() -> eframe::Result {
             .with_title("VST3 Host Tester"),
         ..Default::default()
     };
+    #[cfg(test)]
+    crate::test_gpu_group::assert_gpu_test_group();
     eframe::run_native(
         "vst3-host-tester",
         native_options,

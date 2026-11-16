@@ -116,6 +116,10 @@ egui と native 動画の resolver / dispatcher、双方の動画ヘルプへ登
 既存の `GlobalOpenFolder` / `MenuCommandId::FileOpenFolder` も検索中だけ成功時終了へそろえ、検索なしの Direct は維持する。
 詳細は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md) を参照。
 
+2026-11-15 §1.782: crop の X/Y/W/H と SNS 分割の継ぎ目の数値入力は、egui-ime の共有 focus contract へ記録する。
+固定 Escape は KeyboardOwner の fullscreen raw-key permit を通し、数値入力・FocusRecovery・IME の所有中は消費せず欄の取消に残す。
+モード handler は従来どおり early return し、後段の fullscreen close へは流さない。
+
 2026-10-22: crop / SNS 分割の固定 Escape は、ドラッグ中なら開始前の状態へ戻してドラッグだけを取り消し、
 ドラッグが無ければ従来どおりモードを終了する。消しゴム / 補正レイヤーと同じモード内の取消優先であり、
 キー割当や新しい KeyAction は追加しない。通常 release（窓外で離した OS level の確認を含む）の確定と
