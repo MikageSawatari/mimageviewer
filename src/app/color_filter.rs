@@ -1234,7 +1234,7 @@ mod tests {
         app.settings.thumb_cover_auto_crop = true;
         let ltr = app.color_identity_for_idx(0).unwrap().0;
         assert_ne!(ltr, off);
-        assert!(ltr.contains("|autocrop:v3:ltr"));
+        assert!(ltr.contains("|autocrop:v4:ltr"));
         app.settings.default_reading_direction = crate::settings::ReadingDirection::Rtl;
         assert_eq!(app.color_identity_for_idx(0).unwrap().0, ltr);
         app.settings.default_reading_direction = crate::settings::ReadingDirection::Ltr;

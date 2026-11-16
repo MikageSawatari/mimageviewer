@@ -693,11 +693,11 @@ fn gates_and_identity_are_explicit() {
     }
     assert_eq!(
         AutoCropIdentity::new(ReadingDirection::Rtl).suffix(),
-        "v3:rtl"
+        "v4:rtl"
     );
     assert_eq!(
         AutoCropIdentity::new(ReadingDirection::Ltr).suffix(),
-        "v3:ltr"
+        "v4:ltr"
     );
 }
 
