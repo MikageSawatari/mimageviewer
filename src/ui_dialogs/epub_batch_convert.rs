@@ -10,14 +10,14 @@ use crate::grid_item::GridItem;
 
 #[derive(Debug)]
 pub(crate) enum EpubBatchResult {
-    Saved(PathBuf, Vec<String>, epub_convert::SavedPdfMetadata),
+    Saved(PathBuf, Vec<String>),
     Skipped,
     Failed(String),
 }
 
 pub(crate) enum EpubBatchMsg {
     Start(String),
-    Done(PathBuf, EpubBatchResult),
+    Done(PathBuf, Result<epub_convert::SavedPdf, EpubConvertError>),
     Finished,
 }
 
@@ -33,7 +33,10 @@ pub(crate) struct EpubBatchPending {
 
 #[cfg(test)]
 impl EpubBatchPending {
-    pub(crate) fn completed_for_test(source: PathBuf, result: EpubBatchResult) -> Self {
+    pub(crate) fn completed_for_test(
+        source: PathBuf,
+        result: Result<epub_convert::SavedPdf, EpubConvertError>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         tx.send(EpubBatchMsg::Done(source, result)).unwrap();
         tx.send(EpubBatchMsg::Finished).unwrap();
@@ -65,15 +68,11 @@ fn run_batch(
             .to_string_lossy()
             .into_owned();
         let _ = tx.send(EpubBatchMsg::Start(name));
-        let result = match save(&source) {
-            Ok(saved) => EpubBatchResult::Saved(saved.path, saved.user_data_errors, saved.metadata),
-            Err(EpubConvertError::ExistingPdf) => EpubBatchResult::Skipped,
-            Err(error) => EpubBatchResult::Failed(super::epub_convert::error_message(&error)),
-        };
+        let result = save(&source);
         if let Err(error) = tx.send(EpubBatchMsg::Done(source, result))
-            && let EpubBatchMsg::Done(_, EpubBatchResult::Saved(path, ..)) = error.0
+            && let EpubBatchMsg::Done(_, Ok(saved)) = error.0
         {
-            epub_convert::log_saved_pdf_completion_not_received(&path);
+            epub_convert::log_saved_pdf_completion_not_received(&saved.path);
         }
     }
     let _ = tx.send(EpubBatchMsg::Finished);
@@ -180,9 +179,16 @@ impl App {
             match pending.rx.try_recv() {
                 Ok(EpubBatchMsg::Start(name)) => pending.current_name = name,
                 Ok(EpubBatchMsg::Done(path, result)) => {
-                    if let EpubBatchResult::Saved(_, _, metadata) = &result {
-                        self.apply_epub_saved_metadata(metadata.clone());
-                    }
+                    let result = match result {
+                        Ok(saved) => {
+                            self.apply_epub_saved_metadata(saved.metadata);
+                            EpubBatchResult::Saved(saved.path, saved.user_data_errors)
+                        }
+                        Err(EpubConvertError::ExistingPdf) => EpubBatchResult::Skipped,
+                        Err(error) => {
+                            EpubBatchResult::Failed(super::epub_convert::error_message(&error))
+                        }
+                    };
                     pending.results.push((path, result));
                 }
                 Ok(EpubBatchMsg::Finished) => {
@@ -256,7 +262,7 @@ impl App {
                             .unwrap_or(source.as_os_str())
                             .to_string_lossy();
                         let result = match result {
-                            EpubBatchResult::Saved(destination, warnings, _)
+                            EpubBatchResult::Saved(destination, warnings)
                                 if warnings.is_empty() =>
                             {
                                 format!(
@@ -267,7 +273,7 @@ impl App {
                                         .to_string_lossy()
                                 )
                             }
-                            EpubBatchResult::Saved(destination, warnings, _) => format!(
+                            EpubBatchResult::Saved(destination, warnings) => format!(
                                 "{} を保存しました（設定の引き継ぎに失敗: {}）",
                                 destination
                                     .file_name()
@@ -361,7 +367,7 @@ mod tests {
         assert!(pending.finished && pending.refreshed);
         assert!(matches!(
             &pending.results[0].1,
-            EpubBatchResult::Saved(path, warnings, _) if path == &destination && warnings.is_empty()
+            EpubBatchResult::Saved(path, warnings) if path == &destination && warnings.is_empty()
         ));
         assert_eq!(
             app.rotation_db.as_ref().unwrap().get_key(&destination_key),
@@ -377,6 +383,66 @@ mod tests {
             (crate::rotation_db::Rotation::Cw90, true),
             "batch refresh must adopt the copied rotation into the memory-only cover and badge owner"
         );
+    }
+
+    #[test]
+    fn section1761_batch_moves_report_and_retains_only_display_result() {
+        let mut app = crate::app::setup_app_for_test();
+        let source = app.tmp.path().join("display-only.epub");
+        let destination = source.with_extension("pdf");
+        let source_key = crate::edit_source::page_key_for_pdf(&source, 0);
+        let destination_key = crate::edit_source::page_key_for_pdf(&destination, 0);
+        app.rotation_db
+            .as_ref()
+            .unwrap()
+            .set_key(&source_key, crate::rotation_db::Rotation::Cw90)
+            .unwrap();
+        let mut saved = epub_convert::copy_saved_pdf_metadata(
+            app.tmp.path(),
+            &source,
+            destination.clone(),
+            false,
+        );
+        assert!(saved.user_data_errors.is_empty());
+        assert_eq!(
+            saved
+                .metadata
+                .presence
+                .as_ref()
+                .unwrap()
+                .rotations
+                .get(&destination_key),
+            Some(&crate::rotation_db::Rotation::Cw90)
+        );
+        saved.user_data_errors.push("display warning".into());
+        let (tx, rx) = mpsc::channel();
+        tx.send(EpubBatchMsg::Done(source.clone(), Ok(saved)))
+            .unwrap();
+        app.epub_batch_convert = Some(EpubBatchPending {
+            rx,
+            cancel_after_current: Arc::new(AtomicBool::new(false)),
+            total: 1,
+            current_name: String::new(),
+            results: Vec::new(),
+            finished: false,
+            refreshed: false,
+        });
+        app.poll_epub_batch_convert();
+        assert_eq!(
+            app.rotation_for_page_key(&destination_key),
+            crate::rotation_db::Rotation::Cw90
+        );
+        let pending = app.epub_batch_convert.as_ref().unwrap();
+        assert!(!pending.finished && !pending.refreshed);
+        assert_eq!(pending.results.len(), 1);
+        assert_eq!(pending.results[0].0, source);
+        // The completed result has exactly these display fields; it cannot retain
+        // the worker's page-key report after its ownership moved into App.
+        let EpubBatchResult::Saved(path, warnings) = &pending.results[0].1 else {
+            panic!("expected the saved display result");
+        };
+        assert_eq!(path, &destination);
+        assert_eq!(warnings, &["display warning".to_string()]);
     }
 
     #[test]
@@ -516,13 +582,9 @@ mod tests {
             })
             .collect();
         assert_eq!(done.len(), 3);
-        assert!(
-            matches!(&done[0].1, EpubBatchResult::Saved(path, ..) if path == &PathBuf::from("new.pdf"))
-        );
-        assert!(matches!(&done[1].1, EpubBatchResult::Skipped));
-        assert!(
-            matches!(&done[2].1, EpubBatchResult::Failed(message) if message.contains("不正な EPUB"))
-        );
+        assert!(matches!(&done[0].1, Ok(saved) if saved.path == PathBuf::from("new.pdf")));
+        assert!(matches!(&done[1].1, Err(EpubConvertError::ExistingPdf)));
+        assert!(matches!(&done[2].1, Err(EpubConvertError::Invalid)));
     }
 
     #[test]
