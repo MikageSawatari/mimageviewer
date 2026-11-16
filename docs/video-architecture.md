@@ -137,7 +137,7 @@ H.264 recovery point / intra refresh、途中の時刻不連続、32秒を超え
 thumbnail / tile は EOF で decoder を drain し、screenshot は packet/frame の240上限を置かず、
 目標到達・EOF drain・読み取りエラーを区別する。TS/PS の strip 軸は探索点の索引を読まず
 `TimeGrid` にし、索引 warmup も省く。upscale の分割は packet 順と表示順の番号付けの別問題
-(バックログ §1.797) があるため今回変更しない。
+(バックログ §1.798) があるため今回変更しない。
 TS/PS の seek 直後は音声 PES の途中から再同期し、先頭の音声 packet が不完全になることがある。
 Remote の音声 decoder は対象3 demuxerの開始時だけ、`InvalidData` を最大3 packet記録して読み進める。
 最初の音声 frame が復号できた時点（採用前のprerollを含む）で許可を閉じ、以降のエラー、
