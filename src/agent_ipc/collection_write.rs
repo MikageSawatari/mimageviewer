@@ -71,10 +71,7 @@ fn checkpoint(ctx: &ReadContext) -> Result<(), AgentError> {
 fn admission(handlers: &Handlers, ctx: &ReadContext) -> Result<(), AgentError> {
     checkpoint(ctx)?;
     if permission()?.0.level < AgentLevel::Organize {
-        return Err(error(
-            ErrorCode::Disabled,
-            "コレクションを変更する許可がありません",
-        ));
+        return Err(error(ErrorCode::Disabled, ORGANIZE_PERMISSION_MESSAGE));
     }
     if !handlers.changes.is_ready() {
         return Err(error(ErrorCode::NotReady, "mIV の起動処理中です"));

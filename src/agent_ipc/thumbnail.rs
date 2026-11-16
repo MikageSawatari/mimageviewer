@@ -15,7 +15,7 @@ impl Handlers {
         ctx: &ReadContext,
     ) -> Result<Payload, AgentError> {
         if !ctx.granted.0.thumbnails {
-            return Err(error(ErrorCode::Disabled, "縮小画像の共有は無効です"));
+            return Err(error(ErrorCode::Disabled, THUMBNAIL_PERMISSION_MESSAGE));
         }
         if items.is_empty() || items.len() > MAX_THUMBNAIL_ITEMS {
             return Err(error(

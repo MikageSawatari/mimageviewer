@@ -1,4 +1,4 @@
-//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=11)。
+//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=12)。
 //!
 //! docs/search-architecture.md に準拠する。
 //!
@@ -45,7 +45,8 @@ use crate::search_index_db::normalize_path;
 /// - 9: AI 生成メタデータの対応形式拡充と EXIF UserComment の Negative 除外。
 /// - 10: ComfyUI prompt provenance を分離し、未解決 template / Negative の索引混入を防止。
 /// - 11: AI 説明文検索 (SourceKind::AiCaption + ai_caption_text) を追加。
-pub const INDEX_VERSION: i64 = 11;
+/// - 12: 文字起こし検索 (SourceKind::Transcript + transcript_text) を追加。
+pub const INDEX_VERSION: i64 = 12;
 
 const TANTIVY_REBUILD_PENDING_KEY: &str = "tantivy_rebuild_pending";
 #[derive(Clone, Debug)]
@@ -1604,7 +1605,45 @@ mod tests {
                 .unwrap()
                 .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
                 .unwrap(),
-            11
+            INDEX_VERSION
+        );
+    }
+
+    /// 初回 open で `application_id` が `HOUSEKEEPING_VERSION` に設定され、
+    /// 2 回目以降の open では VACUUM がスキップされる。
+    #[test]
+    fn opening_v11_requires_transcript_schema_rebuild_and_clears_scan_marker() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("fts_meta.db");
+        let db = FtsMetaDb::open_at(&db_path).unwrap();
+        db.upsert_meta_ok(
+            "c:/fav/a.jpg",
+            Uuid::new_v4(),
+            Path::new("C:/fav"),
+            IndexKind::Image,
+            1,
+            1,
+        )
+        .unwrap();
+        db.mark_scanned_once("c:/fav", "v11-fingerprint").unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("UPDATE files SET index_version=11; PRAGMA user_version=11;")
+            .unwrap();
+        drop(db);
+        let reopened = FtsMetaDb::open_at(&db_path).unwrap();
+        assert!(reopened.rebuilt_on_open);
+        assert!(reopened.get("c:/fav/a.jpg").unwrap().is_none());
+        assert!(reopened.scanned_once("c:/fav").unwrap().is_none());
+        assert_eq!(
+            reopened
+                .conn
+                .lock()
+                .unwrap()
+                .pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            INDEX_VERSION
         );
     }
 

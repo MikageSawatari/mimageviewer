@@ -1,4 +1,4 @@
-mImageViewer local AI caption worker - third-party notices
+mImageViewer local AI caption / transcription worker - third-party notices
 
 These notices cover code statically linked into mimageviewer-vlm.exe and
 header code compiled into it. The Vulkan loader and graphics driver are
@@ -6,10 +6,12 @@ provided by the operating system / driver and are not redistributed here.
 The separately downloaded model has its own LICENSE and NOTICE.
 
 llama.cpp source: b12032, dde879bc4f954b809892fd0d660515f42536394a
+whisper.cpp source: v1.9.5, d1be6fde11ac6e0407606b4e42fe72d34add8037
 Vulkan / SPIR-V headers: Vulkan SDK 1.4.363.0
 
 llama.cpp, ggml and libmtmd (b12032)
 ====================================
+The following identical MIT notice also covers whisper.cpp v1.9.5.
 
 MIT License
 

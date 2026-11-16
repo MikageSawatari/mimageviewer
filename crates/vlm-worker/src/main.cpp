@@ -1,6 +1,7 @@
 #include "devices.h"
 #include "inference.h"
 #include "serve.h"
+#include "asr.h"
 #include "exclusive_output.h"
 #include "prompt.h"
 #include "build_identity.h"
@@ -18,6 +19,7 @@ int run(const std::vector<std::string> & args) {
     std::cerr << MIV_VLM_SOURCE_MARKER << '\n';
     route_engine_logs_to_stderr();
     if (args.size() == 1 && args[0] == "--serve") return serve();
+    if (args.size() == 1 && args[0] == "--asr-serve") return asr_serve();
     if (args.size() == 1 && args[0] == "--list-devices") {
         std::cout << list_devices().dump(2) << '\n';
         return 0;

@@ -72,6 +72,7 @@ DX12 は wgpu、MF は FFmpeg `h264_mf` 経由。情報照会の除外は仮説�
 | `src/ai/runtime.rs` | DirectML / TensorRT・CUDA EP登録前の2か所。CPU EP・force_cpu・environment作成だけ・cached session取得は除外 |
 | `src/ai/trt_worker_pool.rs` / `WorkerHandle::spawn` | concrete TRT子workerの起動前。fake factoryは迂回 |
 | `src/ai/vlm_worker.rs` / `VlmWorkerClient::load` | 有効なload要求を実 / 未知workerへ送る前。spawn / hello / GPU情報照会だけは除外 |
+| `src/ai/asr_worker.rs` / `AsrWorkerClient::load` | 有効なLUIDのload要求を実 / 未知workerへ送る前。`transcript_job_worker::run` の起動・hello後もこの入口を通るため、ジョブ側・共有transportには重ねて置かない |
 | `src/gpu_lanczos.rs` / `Lanczos3Resampler::new` | 借りたdeviceで実GPU pipelineを作る前。pure plan / cache検査は除外 |
 | `vendor/egui-wgpu/src/lib.rs` / `RenderState::create` | CreateNew分岐の実`adapter.request_device`直前。instance / adapter照会・Existing setup・mock候補closureは除外 |
 | `vendor/eframe/src/native/{wgpu_integration,glow_integration}.rs` | wgpuの4つの実window登録境界と、実GL contextを作るclosure。set_window(None) cleanup / instance-only / mockは除外 |
@@ -100,6 +101,49 @@ VLMのCPU fakeも製品load APIを使うため、`cfg(test)`だけのmarkerで�
 既存fake fixtureが初期化した共有`OnceLock<PathBuf>`の`get()`と完全path一致だけでfakeと認める。
 検査がfakeをbuildすることはなく、未知・実workerは既定で検査する。caption側の重複fake準備は
 同じ共有fixtureへ統一した。製品の型・動作とtestcaseのassertは変わらない。
+
+### 文字起こしの入口（2026-11-16、ASR区切り9）
+
+ASRも `cfg(test)` だけのmarkerを起動時に持ち、VLMと同じ `vlm_worker::tests::is_fake_worker`
+で既知fixtureを判定する。判定の複製や別のfake登録はせず、未知・実workerへのload前に所属を検査する。
+`transcript_job_worker::run` は `AsrWorkerClient::start_at` → hello → loadを使うので、
+実workerのジョブもここで検査される。spawn / hello自体はGPU sessionを作らない。
+
+VLM/ASR共通の `worker_gpu::{inventory,probe_inventory,system_vulkan_loader_available}` は
+DLLの確認、DXGI列挙とworkerの `--list-devices` による情報照会である。
+workerの `Inventory` とggml Vulkanの列挙・properties/memory照会まで追い、Vulkan instanceと
+physical-device情報だけで、logical device / backend sessionを作らないことを確認した。
+既存VLMと同じく列挙には検査を追加しない。T1/T2のASR transportと作成ジョブのテストは
+既知の同じfake workerを使い、抽出・後処理・DB・検索はASRの実GPU推論を開始しない。
+
+ただしT1/T2で加わった次のsnapshot 10件は、共通 `test_ui` のLazyRendererから実wgpu deviceを
+作る。masterの一覧には無かったためgpu groupへ追加した。CPUだけの表示・入力・状態テストを
+module単位で巻き込まず、次の完全名だけを選ぶ。max-threads=2、timeout・priority・retryは変更しない。
+
+- `global_search_ui::transcript_target_ui_tests::transcript_search_target_combo_handler_and_dark_light_snapshots`
+- `transcript_panel::tests::transcript_panel_snapshots`
+- `ui_dialogs::about::tests::ai_worker_credits_snapshot_light_and_dark`
+- `ui_dialogs::asr_addon::tests::asr_setup_confirm_snapshot`
+- `ui_dialogs::transcript_delete::tests::transcript_delete_confirm_snapshot`
+- `ui_dialogs::transcript_job::tests::transcript_progress_snapshot`
+- `ui_music_panels::transcript_session_tests::music_transcript_panels_{dark,light}_snapshot`（2件）
+- `video::native_presenter::overlay_draw::tests::native_transcript_panels_{dark,light}_snapshot`（2件）
+
+区切り9の焦点検査は、共有runner経由の
+`cargo nextest run -p mimageviewer --lib -E 'test(/asr|transcript|vlm_worker|caption_job|test_gpu_group/)'`
+（成功stdout保存の指定を付加）で **245件成功、失敗0、10.571秒**。
+ASR / VLM fake、作成ジョブ、所属の純粋な検査、文字起こしsnapshotを含む。
+実行ログは `target/asr-chunk9/focused.log`。全件・製品起動・commitは行っていない。
+
+焦点filter外のAboutは
+`cargo nextest run -p mimageviewer --lib -E 'test(=ui_dialogs::about::tests::ai_worker_credits_snapshot_light_and_dark)'`
+を同じ共有runnerから実行し、**1件成功、2.606秒**。PNGの更新はない。
+`cargo nextest show-config test-groups --verbose -p mimageviewer --lib --groups gpu --no-pager` と
+`cargo nextest list -p mimageviewer --lib --message-format json` を共有runnerから実行し、
+同じ現在のテスト一覧へ現行設定・変更前設定を適用して照合した（default features）。
+gpu所属は **294 → 304件**、追加は上記10件だけ、削除0。TOMLの構造比較でも所属filter以外の
+設定値が不変で、max-threads=2を確認した。検査結果は `target/asr-chunk9/group-verification.json`、
+一覧とログも同所。fakeのASR推論テストはgroupへ追加していない。
 
 ## 新しく所属させるテスト
 

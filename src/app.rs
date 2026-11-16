@@ -13,6 +13,7 @@ mod reading_history_origin;
 use reading_history_origin::MainListRestoreDestination;
 mod grid_parent;
 mod music_bass;
+mod transcript_display;
 
 #[cfg(test)]
 use crate::test_native_focus as foreground_observer;
@@ -567,6 +568,7 @@ mod detached_page_overview;
 mod detached_placement;
 #[cfg(windows)]
 mod detached_window_manager;
+mod epub_saved_metadata;
 #[cfg(windows)]
 pub(crate) use detached_activation::{
     DetachedActivationDecision, DetachedActivationRequest, DetachedActivationSource,
@@ -16994,6 +16996,9 @@ pub struct App {
         std::collections::HashMap<String, Option<crate::external_metadata::SidecarDisplay>>,
     /// All viewer contexts read this one cache; never move it into ViewerContextBundle.
     pub(crate) caption_display: crate::caption_display_cache::CaptionDisplayCache,
+    /// 表示値だけを共有し、panel session の scroll/follow はここへ入れない。
+    pub(crate) transcript_display: Box<crate::transcript_display_cache::TranscriptDisplayCache>,
+    pub(crate) music_transcript_panel: Box<crate::ui_music_panels::MusicTranscriptPanelSession>,
     /// 360 度パノラマビュー: インタラクティブステート (フルスクリーン内のみ Some)。
     /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
     /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
@@ -18736,6 +18741,16 @@ pub struct App {
     /// 編集用追加パックの確認ダイアログを「今はしない」で閉じたか (このセッション中)。
     /// true の間は編集系入口での再 prompt を抑制する (spec §4.1 `declined_this_session`)。
     pub(crate) editing_addon_declined_session: bool,
+    /// モデル準備の状態はヒープに置き、Appのstackサイズを抑える。
+    #[cfg(windows)]
+    pub(crate) asr_setup: Box<crate::ui_dialogs::asr_addon::AsrSetup>,
+    #[cfg(windows)]
+    pub(crate) transcript_job: Option<Box<crate::ui_dialogs::transcript_job::TranscriptJob>>,
+    #[cfg(windows)]
+    pub(crate) transcript_delete:
+        Option<crate::ui_dialogs::transcript_delete::TranscriptDeleteState>,
+    #[cfg(windows)]
+    pub(crate) show_transcript_progress: bool,
     pub(crate) vlm_setup: crate::ui_dialogs::vlm_addon::VlmSetup,
     pub(crate) depth_setup: crate::ui_dialogs::depth_addon::DepthSetup,
     pub(crate) depth_export_operation: Option<Box<depth_export::Operation>>,
@@ -19598,6 +19613,8 @@ impl Drop for App {
         self.retire_depth_export_for_exit();
         #[cfg(windows)]
         self.stop_caption_job_for_exit();
+        #[cfg(windows)]
+        self.stop_transcript_job_for_exit();
         self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.pdf_render_epoch.retire();
         self.transfer_spread_shift_exit_ownership();
@@ -20934,6 +20951,8 @@ impl App {
             xmp_panorama_info: std::collections::HashMap::new(),
             sidecar_display_cache: std::collections::HashMap::new(),
             caption_display: crate::caption_display_cache::CaptionDisplayCache::default(),
+            transcript_display: Box::default(),
+            music_transcript_panel: Box::default(),
             fs_exclusive_view: crate::fs_exclusive_view::FsExclusiveView::None,
             video_zoom_state: None,
             #[cfg(windows)]
@@ -21547,6 +21566,14 @@ impl App {
             trt_install_state: None,
             editing_addon_install_state: None,
             editing_addon_declined_session: false,
+            #[cfg(windows)]
+            asr_setup: Default::default(),
+            #[cfg(windows)]
+            transcript_job: None,
+            #[cfg(windows)]
+            transcript_delete: None,
+            #[cfg(windows)]
+            show_transcript_progress: false,
             vlm_setup: Default::default(),
             depth_setup: Default::default(),
             depth_export_operation: None,
@@ -23578,7 +23605,9 @@ impl App {
 
     /// ダイアログキャンセル用の Escape が押されたか。IME 変換中は常に false を返す。
     pub(crate) fn dialog_escape_pressed(&self, ctx: &egui::Context) -> bool {
-        !self.ime_input_active(ctx) && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        !self.ime_input_active(ctx)
+            && crate::keyboard_input::app_escape_allowed(ctx)
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
     }
 
     /// いずれかのモーダルダイアログが開いているか。
@@ -23757,6 +23786,10 @@ impl App {
             ($( $cond:expr => $name:literal ),+ $(,)?) => {
                 $( if $cond { return Some($name); } )+
             };
+        }
+        #[cfg(windows)]
+        if self.transcript_delete_dialog_visible() || self.asr_setup.modal_open() {
+            return Some("transcript_modal");
         }
         #[cfg(windows)]
         if self.caption_delete_dialog_visible() {
@@ -33793,7 +33826,7 @@ impl App {
                 // Current SW_HIDE state, not a snapshot taken when the worker began.
                 // Terminals consumed while Pending cannot reach this manager. Resample
                 // durable pending rows after adoption, even if its initial drain finished.
-                manager.notify_caption_changed();
+                manager.notify_derived_text_changed();
                 manager.set_io_throttled(!self.window_visible);
                 if crate::perf::is_enabled() {
                     crate::perf::event("startup", "metadata_search_ready", None, 0, &[]);
@@ -49877,16 +49910,16 @@ impl App {
         crate::logger::log(message);
     }
 
-    /// DB writers publish only committed caption changes. Startup also drains
+    /// DB writers publish only committed derived text changes. Startup also drains
     /// durable pending rows when the manager is not ready yet.
-    pub(crate) fn notify_caption_changed(&self) {
+    pub(crate) fn notify_derived_text_changed(&self) {
         if let Some(manager) = self.indexer_init.as_ref() {
-            manager.notify_caption_changed();
+            manager.notify_derived_text_changed();
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn caption_epoch_for_test(
+    pub(crate) fn derived_text_epoch_for_test(
         &mut self,
         data_dir: &std::path::Path,
     ) -> Arc<std::sync::atomic::AtomicU64> {
@@ -49902,7 +49935,7 @@ impl App {
                 .expect("caption sender test manager"),
             );
         }
-        self.indexer_init.as_ref().unwrap().caption_epoch()
+        self.indexer_init.as_ref().unwrap().derived_text_epoch()
     }
 
     pub(crate) fn apply_metadata_import_terminal_refresh(
@@ -49911,12 +49944,7 @@ impl App {
         changed: crate::metadata_transfer::ImportChangedSections,
     ) -> (Vec<String>, bool) {
         // DB writes have committed even if a context needs another terminal refresh.
-        if changed.ai_captions {
-            self.notify_caption_changed();
-        }
-        if changed.ai_captions || changed.thumbnail_pins {
-            self.caption_display.clear();
-        }
+        self.apply_content_identity_store_mutations(changed.store_mutations());
         #[cfg(windows)]
         let stale_before_apply = result.contexts.iter().any(|context| {
             match self.viewer_context_residence(context.context_id) {
@@ -79401,7 +79429,7 @@ impl App {
     }
 
     /// Both video and music builders read the same in-memory, normalized-path choice.
-    fn saved_audio_track_choice_for_path(
+    pub(crate) fn saved_audio_track_choice_for_path(
         &self,
         path: &std::path::Path,
     ) -> Option<crate::video::SavedAudioTrackChoice> {
@@ -92790,6 +92818,7 @@ impl App {
     }
 
     fn close_fs_side_panel_runtime(&mut self) {
+        self.music_transcript_panel.reset();
         // 右情報パネルはロック中だけ維持する。表示対象が変わっても内容を更新するだけで
         // 閉じない、というのがロックの意味 (backlog §1.158)。ロックを解くのは
         // フルスクリーンを本当に出たときだけで、その判断は `close_fullscreen` が持つ。
@@ -100548,6 +100577,7 @@ impl App {
             self.maybe_apply_deferred_native_video_nav(ctx);
             self.poll_audio_track_notice_toast(fs_idx);
             self.sync_native_video_metadata(fs_idx);
+            self.sync_native_transcript_snapshot(ctx, fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
             self.sync_native_video_tile_overlay(ctx, fs_idx);
             self.sync_native_video_seek_strip(ctx, fs_idx);
@@ -101323,6 +101353,8 @@ impl App {
         // TRT pack オンラインインストールダイアログ (環境設定から起動)。
         self.show_trt_install_dialog(ctx);
         self.show_vlm_addon_dialog(ctx);
+        #[cfg(windows)]
+        self.show_asr_addon_dialog(ctx);
         if !main_viewer_blocked
             && self.fullscreen_idx.is_none()
             && self.depth_addon_dialog_on_main()
@@ -101994,8 +102026,15 @@ impl eframe::App for App {
         #[cfg(windows)]
         self.poll_caption_job();
         #[cfg(windows)]
+        self.poll_asr_setup(ctx);
+        #[cfg(windows)]
+        self.poll_transcript_job(ctx);
+        #[cfg(windows)]
+        self.poll_transcript_delete();
+        #[cfg(windows)]
         self.poll_caption_delete();
         self.caption_display.poll();
+        self.transcript_display.poll();
         self.poll_capture_selection(ctx);
         self.render_update_before_frame(ctx);
         #[cfg(not(windows))]
@@ -102058,6 +102097,8 @@ impl eframe::App for App {
         self.retire_depth_export_for_exit();
         #[cfg(windows)]
         self.stop_caption_job_for_exit();
+        #[cfg(windows)]
+        self.stop_transcript_job_for_exit();
         self.retire_close_return_owners(ViewerCloseCause::AppExit);
         self.close_local_composition_editor(CompositionEditorCloseReason::Shutdown);
         self.diagnostics_export.retire();

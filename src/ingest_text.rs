@@ -44,6 +44,7 @@ pub struct PerSourceText {
     pub sidecar: String,
     /// Local AI caption, visible text and keywords (only successful rows).
     pub ai_caption: String,
+    pub transcript: String,
 }
 
 impl PerSourceText {
@@ -58,6 +59,7 @@ impl PerSourceText {
             SourceKind::Tags => &self.tags,
             SourceKind::Sidecar => &self.sidecar,
             SourceKind::AiCaption => &self.ai_caption,
+            SourceKind::Transcript => &self.transcript,
         }
     }
 
@@ -74,6 +76,7 @@ impl PerSourceText {
                 + self.tags.len()
                 + self.sidecar.len()
                 + self.ai_caption.len()
+                + self.transcript.len()
                 + 9,
         );
         for s in [
@@ -86,6 +89,7 @@ impl PerSourceText {
             &self.tags,
             &self.sidecar,
             &self.ai_caption,
+            &self.transcript,
         ] {
             if !s.is_empty() {
                 if !out.is_empty() {
@@ -107,12 +111,13 @@ impl PerSourceText {
             && self.tags.is_empty()
             && self.sidecar.is_empty()
             && self.ai_caption.is_empty()
+            && self.transcript.is_empty()
     }
 
     /// Tantivy の STORED 原文へ投入する UTF-8 byte 数。
     ///
     /// `combined()` は検索互換用の一時文字列なので含めず、実際に個別保存する
-    /// 9 source field の総量だけを数える。
+    /// 10 source field の総量だけを数える。
     pub(crate) fn stored_text_byte_sizes(&self) -> (usize, usize) {
         let png_prompt_bytes = self.png_prompt.len();
         let total_bytes = self.name.len()
@@ -123,9 +128,25 @@ impl PerSourceText {
             + self.video_meta.len()
             + self.tags.len()
             + self.sidecar.len()
-            + self.ai_caption.len();
+            + self.ai_caption.len()
+            + self.transcript.len();
         (total_bytes, png_prompt_bytes)
     }
+}
+
+/// ingest と Ctrl+F は成功した区間の本文を同じ規則で正規化する。
+/// 署名・設定が古い行も検索に残し、status だけで除外する。
+pub fn transcript_search_text(row: &crate::transcript_db::TranscriptRow) -> String {
+    if row.status != crate::transcript_db::TranscriptStatus::Ok {
+        return String::new();
+    }
+    normalize_for_match(
+        &row.segments
+            .iter()
+            .map(|segment| segment.2.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 /// The same normalized successful caption text is used by ingest and Ctrl+F.
@@ -466,6 +487,7 @@ pub fn build_per_source_for_pdf(display_name: &str, info_text: &str) -> PerSourc
         tags: String::new(),
         sidecar: String::new(),
         ai_caption: String::new(),
+        transcript: String::new(),
     }
 }
 
@@ -1040,6 +1062,7 @@ mod tests {
             tags: "".into(),
             sidecar: "".into(),
             ai_caption: "caption text".into(),
+            transcript: String::new(),
         };
         let c = pst.combined();
         assert_eq!(c, "photo.jpg canon 5d prompt text video title caption text");
@@ -1057,6 +1080,7 @@ mod tests {
             tags: "t".into(),
             sidecar: "s".into(),
             ai_caption: "a".into(),
+            transcript: String::new(),
         };
         assert_eq!(pst.get(SourceKind::Filename), "n");
         assert_eq!(pst.get(SourceKind::Exif), "e");

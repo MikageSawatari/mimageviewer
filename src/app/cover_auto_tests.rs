@@ -593,7 +593,7 @@ fn direction_for_suffix(direction: ReadingDirection) -> &'static str {
 }
 
 #[test]
-fn cover_auto_epub_completed_generation_retains_documented_1742_boundary() {
+fn cover_auto_epub_completed_generation_is_retained_by_folder_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let epub = temp.path().join("book.epub");
     std::fs::write(&epub, b"identity").unwrap();
@@ -613,6 +613,8 @@ fn cover_auto_epub_completed_generation_retains_documented_1742_boundary() {
         let key = crate::thumb_loader::cache_key_for_request(&completed)
             .unwrap()
             .into_owned();
+        assert_eq!(key.contains("|autocrop:"), auto.is_some());
+        assert!(key.ends_with("|generation:91:200"));
         let keep = folder_thumb_existing_keys_for_with_auto_crop(
             &item,
             Some((17, 23)),
@@ -625,7 +627,11 @@ fn cover_auto_epub_completed_generation_retains_documented_1742_boundary() {
             auto,
         )
         .into_iter()
-        .collect();
+        .collect::<std::collections::HashSet<_>>();
+        assert!(
+            !keep.contains(&key),
+            "inventory must still use the pending identity"
+        );
         let db = crate::catalog::CatalogDb::open(&temp.path().join("cache"), temp.path()).unwrap();
         db.save_thumb_bytes(
             &key,
@@ -639,8 +645,8 @@ fn cover_auto_epub_completed_generation_retains_documented_1742_boundary() {
         .unwrap();
         db.delete_missing(&keep).unwrap();
         assert!(
-            db.load_one(&key).unwrap().is_none(),
-            "§1.742 changed; update the documented boundary"
+            db.load_one(&key).unwrap().is_some(),
+            "completed EPUB generation must survive cleanup with its auto-crop token"
         );
     }
 }

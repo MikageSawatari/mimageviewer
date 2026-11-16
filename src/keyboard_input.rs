@@ -157,6 +157,109 @@ pub(crate) fn popup_owns_keyboard(ctx: &egui::Context) -> bool {
     egui::Popup::is_any_open(ctx) || ctx.any_popup_open()
 }
 
+#[derive(Clone, Copy)]
+struct PassEscapeOwner {
+    pass: u64,
+    popup_id: Option<egui::Id>,
+}
+
+fn escape_owner_id(viewport: egui::ViewportId) -> egui::Id {
+    egui::Id::unique(("popup_escape_owner", viewport))
+}
+
+struct PopupEscapeInputPolicy;
+
+impl egui::Plugin for PopupEscapeInputPolicy {
+    fn debug_name(&self) -> &'static str {
+        "miv_popup_escape_ownership"
+    }
+
+    fn input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        // The input hook runs before Memory switches to the incoming viewport.
+        // Observe that viewport explicitly, before any widget can open/close a menu.
+        let viewport = input.viewport_id;
+        let snapshot = PassEscapeOwner {
+            pass: ctx.cumulative_pass_nr_for(viewport),
+            popup_id: egui::Popup::current_open_id_for(ctx, viewport),
+        };
+        ctx.data_mut(|data| data.insert_temp(escape_owner_id(viewport), snapshot));
+    }
+}
+
+pub(crate) fn install_popup_escape_policy(ctx: &egui::Context) {
+    ctx.add_plugin(PopupEscapeInputPolicy);
+}
+
+fn retained_escape_popup(ctx: &egui::Context) -> Option<egui::Id> {
+    let pass = ctx.cumulative_pass_nr();
+    let id = escape_owner_id(ctx.viewport_id());
+    ctx.data(|data| {
+        data.get_temp::<PassEscapeOwner>(id)
+            .filter(|snapshot| snapshot.pass == pass)
+            .and_then(|snapshot| snapshot.popup_id)
+    })
+}
+
+/// Both parents and menus read the same pre-input snapshot. No live Memory or
+/// pass-local popup query is allowed here: a fresh open+close must keep its Esc
+/// for the parent. Production installs the policy alongside IME before pass 0;
+/// an uninstalled context has no retained Escape owner.
+pub(crate) fn app_escape_allowed(ctx: &egui::Context) -> bool {
+    retained_escape_popup(ctx).is_none()
+}
+
+pub(crate) fn popup_owned_escape_at_pass_start(ctx: &egui::Context, popup_id: egui::Id) -> bool {
+    retained_escape_popup(ctx) == Some(popup_id)
+}
+
+/// The menu receives the egui copy; native-only deliveries use the same local
+/// close action. IME owns its Escape and must retain both copies.
+pub(crate) fn popup_escape_pressed(ctx: &egui::Context) -> bool {
+    if crate::ime_focus::ime_input_active(ctx) {
+        return false;
+    }
+    if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+        return true;
+    }
+    #[cfg(windows)]
+    return crate::key_input::pressed_key_down(ctx.viewport_id(), |edge| edge.virtual_key == 0x1B);
+    #[cfg(not(windows))]
+    false
+}
+
+/// A local history/menu action claims the same delivery in both input systems.
+/// History accepts plain chords; egui context-menu dismissal accepts any Esc.
+fn claim_local_key(ctx: &egui::Context, key: egui::Key, plain_only: bool) {
+    ctx.input_mut(|input| {
+        input.events.retain(|event| {
+            !matches!(event, egui::Event::Key { key: pressed, pressed: true, modifiers, .. }
+                if *pressed == key && (!plain_only || modifiers.is_none()))
+        });
+    });
+    #[cfg(windows)]
+    {
+        let virtual_key = match key {
+            egui::Key::ArrowDown => 0x28,
+            egui::Key::ArrowUp => 0x26,
+            egui::Key::Enter => 0x0D,
+            egui::Key::Escape => 0x1B,
+            _ => unreachable!("local claims only handle history keys and popup Escape"),
+        };
+        crate::key_input::consume_key_edges(ctx.viewport_id(), |edge| {
+            edge.virtual_key == virtual_key
+                && (!plain_only || (!edge.ctrl && !edge.shift && !edge.alt))
+        });
+    }
+}
+
+pub(crate) fn claim_history_key(ctx: &egui::Context, key: egui::Key) {
+    claim_local_key(ctx, key, true);
+}
+
+pub(crate) fn claim_popup_escape(ctx: &egui::Context) {
+    claim_local_key(ctx, egui::Key::Escape, false);
+}
+
 /// Why a viewport pass may dispatch discrete keyboard input.
 ///
 /// Focus is only one possible proof. On Windows a key edge already stamped
@@ -659,6 +762,10 @@ pub(crate) fn keymap_owner_blocks_shortcuts(ctx: &egui::Context) -> bool {
         // fail-closed instead of falling back to another egui ownership read.
         .unwrap_or(true)
 }
+
+#[cfg(test)]
+#[path = "keyboard_input/popup_escape_tests.rs"]
+mod popup_escape_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,24 @@
 # アーキテクチャ概観
 
+## ローカル文字起こし（T1 区切り3）
+
+VLM worker と同じ exe の ASR 役割が、whisper.cpp v1.9.5 を llama.cpp の ggml 上で使う。
+`ai::worker_transport` / `ai::worker_gpu` が実行ファイル・framing・起動・列挙を共有し、
+`ai::asr_worker` と既存の VLM client は独立したプロセスと状態を所有する。
+`asr_addon` は共通の `addon::ModelAddon` に ASR の index 契約と保存先を与える。
+Appの単一 `TranscriptJob` が受付とRunning/Stoppingを所有し、`transcript_job_worker` が
+FFmpegの逐次抽出・ASR pipeの並列送受信・後処理・署名再確認を伴う保存を実行する。
+`transcript.db` は1本1行の独立storeで、STORES経由の改名・削除・復元とmetadata転送に参加する。
+表示cacheの種類はstore descriptorで宣言し、確定した変更でApp共通の `TranscriptDisplayCache` を消す。
+単一readerがDB/署名を読み、世代照合後のArc区間を共通snapshotにまとめる。
+native動画の左3タブ、音楽ビューの左2タブは `transcript_panel` の全文折返し一覧を共有し、右には状態1行だけを出す。
+本文とjob案内は別に保持し、実再生のapplied trackから別trackを導く。panelのscroll/followは各sessionが所有する。
+抽出は自身のInputの `MediaTimeline` でメディア時刻0へそろえ、保存・強調・seekで同じ時刻を使う。
+表示側の原点変換や原点待ちは持たず、既存seekの範囲制限を共用する。
+MCP・検索は後続。
+[計画](local-asr-transcript-plan.md)、[区切り1](local-asr-t1-chunk1-report.md)、
+[区切り2](local-asr-t1-chunk2-report.md)、[区切り3](local-asr-t1-chunk3-report.md) を参照。
+
 ## 製本した本の管理順（§1.683）
 
 `book_order`が本棚直下の`mimageviewer.book-order.json`を読み、名前順または手動順を解決する。既存の本・設定の保存形式は維持する。`app/book_shelf`はApp共通のroot/選択epoch/表示revision付きsnapshotと型付き読込・保存・未保存phaseを所有し、番号・固定集合・追加先候補を同じrowsから導く。Remoteは共通reader/resolverで保存済み順を読む。順序読取異常は名前順＋書込停止で原本を保持する。閲覧contextのitems・cache・generation・channelは変更しない。[設計と検証](book-order-plan.md)。
@@ -175,6 +194,12 @@ IME helperが予約を描画前の実フォーカスへ渡し、本体facadeが�
 検索履歴の記録は共通 submit の受付と、App update の一箇所で直前 pass の検索入力フォーカスから判定する通常離脱だけ。
 非同期結果の到着や個々の欄の lost_focus では記録しない。ログ・Remote・MCPの出力境界には履歴を公開しない。
 詳細は [入力履歴の設計](search-input-history-plan.md)。
+
+§1.768 の単一行編集メニューは、IME と同じ Context pre-input 境界で捕捉した viewport / pass / retained popup ID を共用する。
+親の eligibility と対象メニューの claim は同じ snapshot を読み、helper 到達時の Memory や描画済み popup から所有者を再推測しない。
+既に開いていたメニューを Esc で閉じた場合だけ、履歴と共通の下位処理で egui/native の対応キーを claim する。
+同フレームに開いて閉じたメニューは親へ Esc を残し、次 pass へ所有状態を持ち越さない。
+App の pending field、worker、永続設定は追加しない。
 
 ## PDF render epochのviewer-context所有（§1.377）
 
@@ -803,7 +828,8 @@ detachedは既存の共通パネルを使い、述語・viewport・bundleの交�
 | `search_index_db.rs` | Ctrl+S 用 `search_index.db` (お気に入り配下のフォルダ / ZIP / PDF / 動画名) |
 | `fts_index.rs` | Tantivy 0.26 ラッパ。`IndexDoc` / `Fields` / `QueryFilters` / `build_bigram_and_query` / `search_page`。bigram tokenizer + lower_caser |
 | `fts_meta.rs` | `fts_meta.db` (SQLite) ラッパ。ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たない (Tantivy STORED に集約) |
-| `ingest_text.rs` | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / sidecar、旧 tags は移行専用) のビルダー |
+| `ingest_text.rs` | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / sidecar / ai_caption / transcript、旧 tags は移行専用) のビルダー |
+| `derived_text.rs` | `STORES` に登録した索引用の派生テキスト（AI 説明文・文字起こし）の読取、範囲内の反映待ちと revision 一致による確認を共用する。既存の索引 worker 上で使う |
 | `ingest_worker.rs` | メタ抽出 + Tantivy buffer + バッチ commit + commit 成功フレームでのみ SQLite を更新 (Tantivy First 書き込み順序) |
 | `indexer_manager.rs` | 全お気に入りの `SupervisorHandle` 統括。アイテム索引または別バージョン索引が有効なお気に入りごとに 1 本だけ立て、Ctrl+G ワーカー spawn、App drop 時の停止を担う |
 | `indexer_supervisor.rs` | お気に入り単位の共有 supervisor。初期メタ走査 + FsWatcher + ingest を担い、同じ watcher の変更通知を別バージョン索引の差分照合にも渡す |

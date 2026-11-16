@@ -1125,6 +1125,10 @@ impl OpenPopup {
 ///
 /// Used by [`crate::Popup`].
 impl Memory {
+    pub(crate) fn retained_popup_id_for(&self, viewport_id: ViewportId) -> Option<Id> {
+        self.popups.get(&viewport_id).map(|state| state.id)
+    }
+
     pub(crate) fn is_popup_open(&self, popup_id: Id) -> bool {
         self.popups
             .get(&self.viewport_id)

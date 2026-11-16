@@ -21,6 +21,7 @@ fn context(fixture: &Fixture) -> ReadContext {
         &fixture.handlers,
         (
             PermissionSnapshot {
+                transcripts: false,
                 level: AgentLevel::ReadOnly,
                 thumbnails: false,
                 gps: false,

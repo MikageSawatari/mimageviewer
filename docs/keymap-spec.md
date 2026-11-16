@@ -1,5 +1,10 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+2026-11-14: 「文字起こしを作る」「文字起こしの作成状況」はツールメニュー、
+「文字起こしを作る」「文字起こしを削除」は一覧の右クリックから操作する。
+長いバッチ処理を明示的に始める管理操作のため、既定のショートカットは設けない
+（既存の AI 説明文と同じく MenuCommandSpec.action は None）。
+
 2026-11-04 受入 E: `GlobalLocalSearch`（既定Ctrl+F）はPDF/EPUBのページ表示中には
 現在地フィルタを開始せず、「本のページ表示中は現在地を絞り込めません」と短く通知する。
 既存keymapによる発火・focus/IME/modalの受付規則を維持する。ファイルメニューの同項目は
@@ -153,6 +158,15 @@ TILE11の接続修正・検証記録は[一覧設計書§23](detached-book-page-
 Ctrl／sibling navigation → Confirm → その他の一覧操作／固定 cursor とし、一つの edge を一度消費する。
 toggle を Enter に割り当てると Confirm との競合を表示し、実行時は toggle だけで一回取消す。
 潜在的な競合は一時的な modal／nav lock によって消さず、一覧の全許可集合で検査する。
+
+単一行入力の右クリックメニュー（§1.768）は、既に開いていたメニューを Esc で閉じた場合、
+その viewport・delivery frame の egui / native Esc を共有 claim する。背面の検索終了や親 dialog の取消へ渡さない。
+IME と共通の Context pre-input 境界で、RawInput の viewport・pass・Memory が保持する popup ID を一度捕捉する。
+親の `app_escape_allowed` は所有者の有無、メニューの claim は同じ snapshot と対象 popup ID の一致を読む。
+helper 到達時の Memory や `any_popup_open()` は再観測せず、途中の open / close / 別メニューへの切替で所有者を変えない。
+同じ RawInput の右クリック release と Esc で初めて開いて閉じたメニューは claim せず、親が Esc を扱う。
+この pass 内の描画によって親の先読み判断を変更せず、次の pass の新しい Esc は通常経路へ戻す。
+IME 変換中はメニューの追加 claim を行わず、IME / TextEdit の処理を優先する。
 
 ## 手動の前後移動ループ（§1.400）
 
@@ -848,6 +862,7 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 | OS 予約 | <kbd>Alt</kbd>+<kbd>F4</kbd>、<kbd>Alt</kbd>+<kbd>Tab</kbd>、<kbd>Win</kbd> キー系など | Windows 側が先に処理する。mIV の keymap では上書きしない |
 | keyboard focus 移動 | <kbd>Tab</kbd> traversal | 非テキスト widget へ focus が移って `wants_keyboard_input()` が true のまま残り、全 shortcut が停止した履歴と、TextEdit から 1 hop だけ移動する不統一を避けるため、アプリ全体で常に無効。Tab chord 自体は `KeyAction` へ割り当て可能 |
 | フォーカスローカル UI | テキスト入力、IME 変換、コンボボックス、リスト、フォルダツリー、製本並べ替えダイアログ内の矢印 / Enter / Esc / PageUp / PageDown / Home / End など | その UI 部品の中だけで意味を持ち、グローバルショートカットとして外へ漏らさない |
+| 単一行入力の右クリックメニュー（§1.768） | 開いていたメニューの Esc = メニューだけ閉じる | `KeyAction` 対象外。IME を優先し、受理した Esc は修飾付きも同 viewport / delivery frame の egui・native で共有 claim。開く release と同時の Esc は親へ残す。二度目の新しい Esc は検索・dialog の従来経路へ届く |
 | 検索欄・フォルダアドレス欄の履歴（§1.756） | 入力フォーカス中の修飾なし <kbd>↓</kbd> = 履歴を開き先頭を選択、開いている間の <kbd>↑</kbd>/<kbd>↓</kbd> = 端で止まる選択移動、<kbd>Enter</kbd>（NumpadEnter 含む）= 選択項目を確定、<kbd>Esc</kbd> = 一覧だけを閉じる | コンボボックスと同じ部品内操作なので `KeyAction` 対象外。IME 変換中は扱わず、入力欄を開いただけでは一覧を出さない。選択なしの Enter は一覧を閉じて通常の確定へ渡す。閉鎖中の ↑ / Esc も従来経路へ残す。未フォーカス欄の▼直後も、viewport/widget単位の既存フォーカス予約が↓・↑・Enterを所有する。消費した押下は egui/native で共有 claim し、背面の検索終了やショートカットへ漏らさない。履歴選択は検索の共通 submit（アドレス欄は既存の移動）へ排他的に渡す。詳細は [入力履歴の設計](search-input-history-plan.md) |
 | 本の構成editor (G4、next-book) | 実ページのクリック、左のページ順ドラッグ・非表示、右のページ指定、各編集button、IME-safe な Enter = 保存 / Escape = キャンセル | 本HUD・本一覧右クリック・「本」menuから開く局所UI。新しい KeyAction は設けない。Enter はフォーカスwidgetがなく確認中でないときだけ保存し、Escape は確認を先に閉じる。保存 / 再読込中は取消を受け付けず、IME変換中は Enter / Escape の保存・取消を行わない。modal owner が背面の閲覧 / メタ情報 / ナビゲータ入力を止める。解除確認は明示buttonで行う。組の変更確認はなく、結果を直接表示し元に戻す/やり直すで修正する |
 | 画像folder→ZIP変換 (G) | 「ZIP に変換」「取消」「閉じる」、IME-safe な Escape = 取消 / 閉じる | folder右クリックと構成対象外案内から開く局所UI。新しい KeyAction / global shortcut は設けない。変換は明示buttonで確定し、取消可能なphaseだけEscapeを受け付ける。保存確定以降は取消しない。process modal ownerがmain / fullscreen / detachedの背面操作と新しいopenを止める |

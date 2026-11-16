@@ -370,8 +370,33 @@ RAW、表紙、一括作成、seed、pin batch、音声アートの SQL 直書�
 `load_source_dims_matching` は WebP の寸法に合成し、`page_dims` を優先する。後者は両表へ同じ
 mtime/file_size 条件を適用してから合成するため、EPUB の変換世代を混ぜない。Blob は読まない。
 通常・Collection の read-only open は表を作らず、旧 catalog に表が無い場合は WebP の寸法だけを返す。
-`delete_missing` は両表を存続集合で掃除する。指定フォルダの SQL 削除経路も `page_dims` を消し、
+`delete_missing` は両表を存続集合で掃除する。EPUB pin の保持判定は後述の共通規則を使う。
+指定フォルダの SQL 削除経路も `page_dims` を消し、
 共有 DB にある別ドライブの音声 scope は従来どおり残す。全件・期限削除は DB ファイル単位のまま。
+
+### EPUB pin の存続照合 (§1.742)
+
+UI の inventory は EPUB の世代を解決せず、pin identity の末尾に
+`|generation-pending|generation-pending` を持つ。worker は固定した世代の
+`|generation:<mtime>:<size>` を追加して保存する。`thumbnail_cache_key::inventory_retains_key`
+は完全一致を先に認め、それ以外はこの解決済み suffix 一段を外した pending identity と
+inventory を照合する。`delete_missing` の `thumbnails` / `page_dims` と、pin 更新 worker の
+materialization retained 判定は同じ pure helper を共有する。世代解決・stat・DB query は追加しない。
+
+緩和は `folderthumb:` / `pdfthumb:` に限り、最初の `#pin:` の直後が `pdfpage|` /
+`pdffile|`、または `cascade:<64桁の小文字 SHA256 hex>:<同じ leaf kind>|` の場合だけ。
+suffix の直前は pending pair、絶対末尾の世代値は worker と同じ標準十進 i64 表記を要求する。
+overflow・非標準表記・多重 suffix は拒否する。ZIP entry は任意の literal 名なので、
+`zipdir:`・`zipthumb:`・`archivethumb:` と `zipentry` leaf は模倣した末尾でも認定しない
+（inventory との完全一致は他のキーと同じく保持する）。
+crop・policy・pin 経路は identity のまま保持し、変更・解除・物理項目消失後の inventory 掃除で削除する。
+音声の namespace 除外、対象 prefix、context、取消、transaction の所有は従来どおり。
+
+この helper は行を保持するためだけに使い、表示 lookup の完全一致キーと stamp は緩めない。
+通常の再生成は他世代を削除しないため、存続中の pin には再変換の世代数分だけ行が残り得る。
+同世代の通常閲覧では増えず、容量上限・最大世代推定は設けない。pin 変更等の掃除に加え、
+明示的な cache 全削除・対象フォルダ削除・期限削除で消える。期限判定は DB ファイルの更新時刻なので、
+使い続ける catalog の全旧世代を必ず回収する保証はない。保存形式・schema・既存行は変更しない。
 
 ### 動画・音声メタデータ (`video_meta`)
 

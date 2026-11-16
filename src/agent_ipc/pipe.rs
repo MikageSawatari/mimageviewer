@@ -161,7 +161,8 @@ fn serve(pipe: &Stream, handlers: Arc<super::Handlers>) {
             }
         });
         let mut jobs: Vec<JoinHandle<()>> = Vec::new();
-        while !writer_failed.load(Ordering::Acquire) {
+        let handshake_read = connection.read_handshake(&mut reader, tx.clone()).is_ok();
+        while handshake_read && !writer_failed.load(Ordering::Acquire) {
             let request = match read_frame::<_, Request>(&mut reader) {
                 Ok(Some(r)) => r,
                 _ => break,

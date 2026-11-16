@@ -290,6 +290,13 @@ test = false
 bench = false
 required-features = ["dev-tools"]
 
+[[bin]]
+name = "transcript_extract_bench"
+path = "src/bin/transcript_extract_bench.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
 # Manual TensorRT-pack E2E smoke helper.  It is intentionally runnable via
 # `cargo run --features manual-e2e --bin test_trt_install`, while the feature
 # gate keeps `cargo test --all-targets` from trying to execute an

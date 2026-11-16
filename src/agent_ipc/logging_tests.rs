@@ -1,6 +1,37 @@
 use super::tests::Fixture;
 use super::*;
 
+#[test]
+fn transcript_result_logging_uses_counts_without_private_text() {
+    let result = Ok(Payload::Transcript(TranscriptReadResult::Present(
+        TranscriptPage {
+            info: TranscriptInfo {
+                model: "private-model".into(),
+                created_at: 1,
+                audio_stream: Some(0),
+                duration_secs: 1.0,
+                segment_count: 1,
+                char_count: 12,
+                stale: false,
+            },
+            segments: vec![TranscriptSegmentInfo {
+                start_secs: 0.0,
+                end_secs: 1.0,
+                text: TextValue {
+                    text: "private-conversation".into(),
+                    truncated: false,
+                },
+            }],
+            cursor: Some("private-cursor".into()),
+            truncated: true,
+        },
+    )));
+    assert_eq!(result_summary(&result), (1, "none"));
+    let line = request_log_line("get_transcript", Instant::now(), &result);
+    assert!(line.contains("tool=get_transcript") && line.contains("count=1"));
+    assert!(!line.contains("private"));
+}
+
 fn poll(fixture: &Fixture, version: u32) {
     // Match the adapter's fresh connection + Hello + Status for every poll.
     let connection = Connection::new(fixture.handlers.clone());
@@ -195,6 +226,7 @@ fn polling_logs_permission_changes_errors_and_recovery_once() {
 fn polling_state_is_bounded_to_permission_epoch_and_error_kind() {
     let mut log = LaneLog::default();
     let snapshot = PermissionSnapshot {
+        transcripts: false,
         level: AgentLevel::ReadOnly,
         thumbnails: false,
         gps: false,

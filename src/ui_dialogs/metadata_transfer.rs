@@ -1143,6 +1143,7 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 summary.ai_captions,
                 summary.thumbnail_pins,
             ));
+            ui.label(format!("文字起こし: {}", summary.transcripts));
             if summary.skipped_reparse_directories > 0 {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
@@ -1194,6 +1195,10 @@ fn draw_result(ui: &mut egui::Ui, result: &ResultState, recursive: bool) {
                 summary.committed.composition_removals,
             ));
             ui.label(format!("AI説明文: 変更 {}", summary.committed.ai_captions));
+            ui.label(format!(
+                "文字起こし: 変更 {}",
+                summary.committed.transcripts
+            ));
             if summary.skipped_kind_mismatch > 0 {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,

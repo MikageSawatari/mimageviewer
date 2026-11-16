@@ -3,7 +3,7 @@
 //! No UI, database, image decoder, retries or automatic worker restarts live here.
 
 use std::ffi::OsString;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -11,37 +11,18 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::job_process::JobChild;
 pub use crate::job_process::KillHandle;
-use crate::job_process::{self, JobChild, StdinMode};
 
 pub const PROTOCOL_VERSION: u32 = 2;
 pub const PROMPT_VERSION: i64 = 1;
 pub const MIN_VRAM_BYTES: u64 = 15 * 1024 * 1024 * 1024 / 2;
-#[cfg(not(feature = "portable"))]
-#[path = "vlm_worker_extract.rs"]
-mod extract;
-const MAX_FRAME: usize = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VlmError {
-    Timeout,
-    Unavailable,
-    Fatal(String),
-    Protocol(String),
-    Io(String),
-}
-
-impl std::fmt::Display for VlmError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "VLM worker: {self:?}")
-    }
-}
-impl std::error::Error for VlmError {}
-impl From<io::Error> for VlmError {
-    fn from(error: io::Error) -> Self {
-        Self::Io(error.to_string())
-    }
-}
+pub use super::worker_transport::WorkerError as VlmError;
+pub use super::worker_transport::worker_executable;
+use super::worker_transport::{Frame, encode_frame, read_frame, spawn_pipes};
+#[cfg(test)]
+use super::worker_transport::{MAX_FRAME, WorkerExecutableSource, worker_executable_source};
 
 #[derive(Clone)]
 struct Timeouts {
@@ -75,22 +56,7 @@ pub struct LoadResult {
     pub device: Device,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
-pub struct Adapter {
-    pub name: String,
-    pub luid: String,
-    pub dedicated_bytes: u64,
-    pub software: bool,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-pub struct Device {
-    pub name: String,
-    pub luid: String,
-    pub physical_index: u32,
-    pub dxgi: Adapter,
-}
-
+pub use super::worker_gpu::{Adapter, Device};
 #[derive(Debug, Deserialize)]
 pub struct Validation {
     pub encoding_valid: bool,
@@ -161,50 +127,6 @@ enum State {
     Dead,
 }
 
-struct Frame {
-    header: Value,
-    bytes: Vec<u8>,
-}
-
-fn encode_frame(header: &Value, bytes: &[u8]) -> Result<Vec<u8>, VlmError> {
-    let json = serde_json::to_vec(header).map_err(|e| VlmError::Protocol(e.to_string()))?;
-    let len = 4usize
-        .checked_add(json.len())
-        .and_then(|n| n.checked_add(bytes.len()))
-        .filter(|n| *n <= MAX_FRAME)
-        .ok_or_else(|| VlmError::Protocol("frame too large".into()))?;
-    let mut frame = Vec::with_capacity(len + 4);
-    frame.extend_from_slice(&(len as u32).to_le_bytes());
-    frame.extend_from_slice(&(json.len() as u32).to_le_bytes());
-    frame.extend_from_slice(&json);
-    frame.extend_from_slice(bytes);
-    Ok(frame)
-}
-
-fn read_frame(reader: &mut impl Read) -> Result<Frame, VlmError> {
-    let mut prefix = [0; 4];
-    reader.read_exact(&mut prefix)?;
-    let len = u32::from_le_bytes(prefix) as usize;
-    if !(4..=MAX_FRAME).contains(&len) {
-        return Err(VlmError::Protocol("invalid frame length".into()));
-    }
-    let mut body = vec![0; len];
-    reader.read_exact(&mut body)?;
-    let json_len = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
-    if json_len == 0 || json_len > len - 4 {
-        return Err(VlmError::Protocol("invalid JSON length".into()));
-    }
-    let header: Value = serde_json::from_slice(&body[4..4 + json_len])
-        .map_err(|e| VlmError::Protocol(e.to_string()))?;
-    if !header.is_object() {
-        return Err(VlmError::Protocol("JSON object required".into()));
-    }
-    Ok(Frame {
-        header,
-        bytes: body[4 + json_len..].to_vec(),
-    })
-}
-
 /// Own one process for one caption job. The V1-3 owner uses `start_at`, publishes
 /// `kill_handle()` to the App, then calls `hello`, `load` once, and `caption`
 /// serially on its worker thread. This makes even the hello wait interruptible
@@ -266,16 +188,7 @@ impl VlmWorkerClient {
         args: &[OsString],
         timeouts: Timeouts,
     ) -> Result<Self, VlmError> {
-        let mut child = job_process::spawn(
-            executable,
-            args,
-            &std::env::vars_os().collect::<Vec<_>>(),
-            StdinMode::Pipe,
-        )?;
-        let mut stdin = child.take_stdin()?;
-        let mut stdout = child.take_stdout()?;
-        let stderr = child.take_stderr()?;
-        let kill = child.kill_handle();
+        let (child, kill, mut stdin, mut stdout) = spawn_pipes(executable, args, "vlm")?;
         let (writer_tx, writer_rx) = mpsc::sync_channel::<Vec<u8>>(1);
         let (reply_tx, replies) = mpsc::channel();
         let errors = reply_tx.clone();
@@ -303,22 +216,6 @@ impl VlmWorkerClient {
                     }
                     if reply_tx.send(frame).is_err() || failed {
                         break;
-                    }
-                }
-            })?;
-        std::thread::Builder::new()
-            .name("vlm-stderr".into())
-            .spawn(move || {
-                // Bound each log chunk even if a damaged worker never writes a newline.
-                let mut reader = BufReader::new(stderr);
-                loop {
-                    let mut chunk = Vec::new();
-                    match reader.by_ref().take(8192).read_until(b'\n', &mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => crate::logger::log(format!(
-                            "vlm_worker: {}",
-                            String::from_utf8_lossy(&chunk).trim_end()
-                        )),
                     }
                 }
             })?;
@@ -524,53 +421,6 @@ fn error_message(header: &Value) -> String {
         .to_owned()
 }
 
-/// Resolve/extract only on a worker thread. Release builds ignore overrides.
-pub fn worker_executable() -> io::Result<PathBuf> {
-    let override_path = if cfg!(debug_assertions) {
-        std::env::var_os("MIV_VLM_WORKER")
-    } else {
-        None
-    };
-    match worker_executable_source(
-        cfg!(debug_assertions),
-        cfg!(feature = "portable"),
-        override_path,
-    ) {
-        WorkerExecutableSource::Override(path) => Ok(path),
-        #[cfg(feature = "portable")]
-        WorkerExecutableSource::Bundled => {
-            crate::native_assets::bundled("mimageviewer-vlm.exe").map_err(io::Error::other)
-        }
-        #[cfg(not(feature = "portable"))]
-        WorkerExecutableSource::Embedded => extract::worker_executable(),
-        _ => unreachable!("worker source must match the compile-time portable feature"),
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum WorkerExecutableSource {
-    Override(PathBuf),
-    Bundled,
-    Embedded,
-}
-
-// Keep the precedence independent of environment mutation and filesystem I/O so
-// both build flavors and release's ignored override are covered in one test.
-fn worker_executable_source(
-    debug: bool,
-    portable: bool,
-    override_path: Option<OsString>,
-) -> WorkerExecutableSource {
-    if debug && let Some(path) = override_path {
-        return WorkerExecutableSource::Override(path.into());
-    }
-    if portable {
-        WorkerExecutableSource::Bundled
-    } else {
-        WorkerExecutableSource::Embedded
-    }
-}
-
 /// One immutable decision for this process, evaluated lazily on a worker thread.
 /// The largest dedicated-memory DXGI adapter is selected even if it cannot run
 /// Vulkan; a smaller adapter is never silently substituted. Pass its LUID to load.
@@ -600,16 +450,16 @@ pub fn detect_gpu() -> Result<GpuDetection, VlmError> {
     static DECISION: std::sync::OnceLock<Result<GpuDetection, VlmError>> =
         std::sync::OnceLock::new();
     DECISION
-        .get_or_init(|| {
-            detect_gpu_with(system_vulkan_loader_available, || {
-                detect_gpu_at(&worker_executable()?, Duration::from_secs(30))
-            })
+        .get_or_init(|| match super::worker_gpu::inventory()? {
+            None => Ok(GpuDetection::VulkanLoaderUnavailable),
+            Some(inventory) => select_gpu(&inventory).map(GpuDetection::Device),
         })
         .clone()
 }
 
 /// Injection boundary also guarantees that no extraction or process launch is
 /// attempted when the system loader is absent. Call only from a worker thread.
+#[cfg(test)]
 pub(crate) fn detect_gpu_with(
     loader_available: impl FnOnce() -> bool,
     probe: impl FnOnce() -> Result<GpuDecision, VlmError>,
@@ -618,40 +468,6 @@ pub(crate) fn detect_gpu_with(
         return Ok(GpuDetection::VulkanLoaderUnavailable);
     }
     probe().map(GpuDetection::Device)
-}
-
-fn system_vulkan_loader_available() -> bool {
-    use windows::Win32::Foundation::FreeLibrary;
-    use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
-    let Some(path) = system_vulkan_loader_path() else {
-        return false;
-    };
-    // Use an absolute path as well as SYSTEM32: a bare name can reuse an
-    // already-loaded app-local module before the directory search runs.
-    let Ok(module) = (unsafe {
-        LoadLibraryExW(
-            windows::core::PCWSTR(path.as_ptr()),
-            None,
-            LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )
-    }) else {
-        return false;
-    };
-    let _ = unsafe { FreeLibrary(module) };
-    true
-}
-
-fn system_vulkan_loader_path() -> Option<Vec<u16>> {
-    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
-    let mut directory = vec![0u16; 32768];
-    let length = unsafe { GetSystemDirectoryW(Some(&mut directory)) } as usize;
-    if length == 0 || length >= directory.len() {
-        return None;
-    }
-    directory.truncate(length);
-    directory.extend("\\vulkan-1.dll".encode_utf16());
-    directory.push(0);
-    Some(directory)
 }
 
 fn select_gpu(inventory: &Value) -> Result<GpuDecision, VlmError> {
@@ -686,65 +502,10 @@ fn select_gpu(inventory: &Value) -> Result<GpuDecision, VlmError> {
 }
 
 fn detect_gpu_at(executable: &Path, timeout: Duration) -> Result<GpuDecision, VlmError> {
-    use std::os::windows::io::AsRawHandle as _;
-    use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
-    use windows::Win32::System::Threading::WaitForSingleObject;
-    let start = std::time::Instant::now();
-    let mut child = job_process::spawn(
-        executable,
-        &[OsString::from("--list-devices")],
-        &std::env::vars_os().collect::<Vec<_>>(),
-        StdinMode::Null,
-    )?;
-    let stdout = child.take_stdout()?;
-    let stderr = child.take_stderr()?;
-    let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new()
-        .name("vlm-device-stdout".into())
-        .spawn(move || {
-            let mut bytes = Vec::new();
-            let result = stdout
-                .take(MAX_FRAME as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map(|_| bytes);
-            let _ = tx.send(result);
-        })?;
-    std::thread::Builder::new()
-        .name("vlm-device-stderr".into())
-        .spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            loop {
-                let mut chunk = Vec::new();
-                match reader.by_ref().take(8192).read_until(b'\n', &mut chunk) {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => crate::logger::log(format!(
-                        "vlm_device: {}",
-                        String::from_utf8_lossy(&chunk).trim_end()
-                    )),
-                }
-            }
-        })?;
-    let bytes = rx.recv_timeout(timeout).map_err(|e| match e {
-        mpsc::RecvTimeoutError::Timeout => VlmError::Timeout,
-        mpsc::RecvTimeoutError::Disconnected => VlmError::Unavailable,
-    })??;
-    if bytes.len() > MAX_FRAME {
-        return Err(VlmError::Protocol("device inventory too large".into()));
-    }
-    let remaining = timeout
-        .saturating_sub(start.elapsed())
-        .as_millis()
-        .min(u32::MAX as u128 - 1) as u32;
-    if unsafe { WaitForSingleObject(HANDLE(child.process_handle().as_raw_handle()), remaining) }
-        != WAIT_OBJECT_0
-    {
-        return Err(VlmError::Timeout);
-    }
-    if child.exit_code()? != 0 {
-        return Err(VlmError::Fatal("device probe failed".into()));
-    }
-    select_gpu(&serde_json::from_slice(&bytes).map_err(|e| VlmError::Protocol(e.to_string()))?)
+    select_gpu(&super::worker_gpu::probe_inventory(executable, timeout)?)
 }
+#[cfg(test)]
+use super::worker_gpu::{system_vulkan_loader_available, system_vulkan_loader_path};
 
 #[cfg(test)]
 pub(super) fn fake_worker_for_test() -> &'static Path {
@@ -753,4 +514,4 @@ pub(super) fn fake_worker_for_test() -> &'static Path {
 
 #[cfg(test)]
 #[path = "vlm_worker_tests.rs"]
-mod tests;
+pub(crate) mod tests;

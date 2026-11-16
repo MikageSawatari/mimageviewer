@@ -192,6 +192,12 @@ focus 喪失時は全状態を消す（egui も keys_down を消去する）。
 非表示で放棄された欄も、egui が popup を退役させた後の次回描画で削除する。
 開閉判定・focus surrender・IME policy 自体は egui／既存 IME helper に任せる。
 
+§1.768 の Esc は、IME と共通の Context pre-input 境界で捕捉した viewport / pass / retained popup ID に従う。
+親と menu helper は同じ snapshot の有無／ID 一致だけを読み、helper 呼出時の Memory から再観測しない。
+Memory に保持されていた右クリックメニューを Esc で閉じたときだけ、同 delivery frame の egui / native Esc を共有 claim する。
+同じ RawInput でメニューを開いて閉じた場合は親へ Esc を残すため、親 dialog の描画前の先読み位置は動かさない。
+IME 変換中は追加 claim をしない。メニューを閉じるだけで text submit の focus 終了 helper を呼ばない。
+
 **借用の注意**:
 `egui::Window::show(ctx, |ui| {...})` の closure 内で `self` 経由のメソッド呼び出しは
 借用衝突になりやすい。`dialog_enter_pressed` / `dialog_escape_pressed` は closure の**前**で

@@ -14022,6 +14022,7 @@ impl App {
     /// (`NativeVideoOutputEvent::ToggleAudioMode`)、音声モード維持 source-swap の deferred completion。
     #[cfg(windows)]
     pub(crate) fn reset_video_audio_side_panel_sessions(&mut self, fs_idx: usize) {
+        self.music_transcript_panel.reset();
         self.music_left_panel_active = false;
         self.music_right_panel_active = false;
         self.music_left_panel_open = crate::ui_helpers::MetadataPanelOpenState::Closed;

@@ -457,8 +457,9 @@ ZipPlaFork (commit 07955f52、**AGPL v3**) の公開コードを読んだ結果�
 
 - 解析用 raster を高さ 256 にそろえても、JPEG の DCT 倍率・PDF の render 寸法が違えば画素は同じにならない。倍率を変えて判定の矩形が
   安定する (境目の位置が解析用 raster で ±1 列程度) ことをテストで確かめる。揺れるなら解析用 raster の作り方 (面積平均の縮小など) を決め直す。
-- EPUB の世代付きの行と存続集合の食い違いは既存の §1.742 で、今回の接尾辞の正規化とは別件。手動・自動それぞれの完成 key で
-  「保存 → 一覧の読み直し (`delete_missing`) → 行が残る」の回帰テストを置き、§1.742 に当たる場合はその旨を記録する (直すのは §1.742)。
+- §1.764 の設計時は、EPUB の世代付きの行と pending の存続集合の食い違いを §1.742 の別件として扱った。
+  現在は §1.742 で修正済み。手動・自動の切り取り token を持つ完成 key でも、共通の存続照合で
+  「保存 → 一覧の読み直し (`delete_missing`) → 行が残る」ことを確認する回帰テストへ更新した。
 
 ## 13. 利用者の決定
 
@@ -526,7 +527,8 @@ ZipPlaFork (commit 07955f52、**AGPL v3**) の公開コードを読んだ結果�
 
 - r3 の 6 項目はすべて解消。新しい設計上の問題なし。
 - 実装担当への注記: 子の手動 / 自動 / 対象外ごとの key 一致、代替要求の指示の保持、`|types:`・`|autocrop:`・`|generation:` の
-  正規化と存続集合を回帰テストで確かめる。解析倍率の安定性と §1.742 は §12.7 のとおり。
+  正規化と存続集合を回帰テストで確かめる。解析倍率の安定性は §12.7 のとおり。
+  当時は境界の確認対象だった §1.742 も修正済みで、EPUB の完成行が手動・自動 token 付きでも保持されることを確認する (§12.7)。
 
 ## 15. 第1段（手動）の実装と検証（2026-11-11）
 
@@ -549,8 +551,10 @@ ZipPlaFork (commit 07955f52、**AGPL v3**) の公開コードを読んだ結果�
 - 在メモリ回転と同じ本棚判定を保つため、既定本棚パスの解決は worker に移す。
   独立レビューで見つかった AI 説明文生成・表示側の兄弟 consumer も追従した。
 - Remote の Image／Folder ピンには手動範囲を渡す。Remote の個別色調補正キー未設定は既存の動作として維持する。
-- §1.742 は今回の範囲外。EPUB の worker 完成キーには generation が付く一方、現行の存続集合には pending キーだけが入り、
-  `delete_missing` で行が消える既存の境界を、範囲なし／手動範囲ありの両方で記録するテストを置いた。
+- 第1段の実装時は §1.742 を範囲外とし、EPUB の worker 完成キーの generation と pending の存続集合の食い違いにより、
+  `delete_missing` で行が消える境界を範囲なし／手動範囲ありの両方で記録する見張りテストを置いた。
+  現在は §1.742 で修正済みのため、`cover_crop_epub_completed_generation_is_retained_by_folder_cleanup` として
+  手動の切り取り token 付き完成行の保持を確認する期待値へ更新した。
   Folder／ZIP／PDF の手動範囲の完成行は別の存続テストで検査する。
 
 ### 15.2 検証の担当
@@ -690,8 +694,11 @@ cargo nextest run -p mimageviewer --lib -E 'test(/cover_auto|auto_cover_crop|aut
   K2の手動／自動／RAW／動画／音声／Folder Seeded pinの子writer key一致を確認した。
   Folder/ZIP/PDF/ZipDirの現設定キーと従来キーの存続、旧綴じ方向の自動キーの除去、
   OFFのgolden・Collection digest・色フィルタ・設定の保存／転送も含む。
-- §1.742のEPUB完成generationキーと存続集合の既存境界は、手動に続き自動付きでも記録した。
-  generation付きの完成行が現行のpending集合では残らない点は§1.742の修正対象で、今回変更しない。
+- 第2段の実装時も、§1.742のEPUB完成generationキーとpendingの存続集合の食い違いを、手動に続き自動付きの見張りテストで記録した。
+  当時は完成行が残らない点を§1.742の修正対象として変更しなかった。
+  現在は§1.742で修正済みで、`cover_auto_epub_completed_generation_is_retained_by_folder_cleanup` として
+  自動の切り取り token 付き完成行も保持される期待値へ更新した。手動・自動とも token の存在と generation を検査し、
+  完成キー自体を含まない pending の存続集合で `delete_missing` を通す。
 - 反復中の3件の失敗は、設定転送の件数期待値、CacheOnly用fixtureの在メモリmap未水和、cubic rasterの倍率間の揺れだった。
   件数を追加項目分更新し、fixtureは既存Fixed providerの契約どおりmapを水和し、rasterは§16.1の面積平均へ修正した。
   続く1件は転送wireの件数期待値の更新漏れで修正済み。最終成功件数にはこれらの失敗を含めない。

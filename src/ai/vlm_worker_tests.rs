@@ -25,11 +25,11 @@ fn worker_resolution_precedence_covers_debug_release_and_both_flavors_without_io
 
 static FAKE_WORKER_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 
-pub(super) fn is_fake_worker(path: &Path) -> bool {
+pub(crate) fn is_fake_worker(path: &Path) -> bool {
     FAKE_WORKER_FIXTURE.get().is_some_and(|fake| fake == path)
 }
 
-pub(super) fn fake_worker() -> &'static Path {
+pub(crate) fn fake_worker() -> &'static Path {
     use sha2::{Digest as _, Sha256};
 
     FAKE_WORKER_FIXTURE.get_or_init(|| {

@@ -66,9 +66,9 @@ pub struct IngestStats {
     pub ingested_failed: usize,
     pub deleted: usize,
     pub skipped_unsupported: usize,
-    /// Per-batch diagnostics; reflection must not acknowledge unread caption content.
-    pub caption_read_errors: usize,
-    /// Counted metadata I/O only; excludes FFmpeg, PDFium and caption DB reads.
+    /// 未読の派生テキストを反映済みにしないためのバッチ単位の診断。
+    pub derived_text_read_errors: usize,
+    /// Counted metadata I/O only; excludes FFmpeg, PDFium and derived text DB reads.
     pub metadata_bytes_read: u64,
     /// Ingest candidates with at least one counted byte (sidecar included), once per candidate.
     pub metadata_files_read: usize,
@@ -102,9 +102,12 @@ pub struct IngestSession<'a> {
     /// UI 操作中は ingest を一時停止するためのゲート (2026-04)。
     /// `None` なら停止しない (単体テスト用)。
     pub activity_gate: Option<&'a crate::activity_gate::ActivityGate>,
-    pub caption_db_path: PathBuf,
-    caption_db: Result<Option<CaptionDb>, String>,
-    caption_read_errors: Cell<usize>,
+    pub derived_text_paths: crate::derived_text::DerivedTextPaths,
+    derived_readers: Vec<(
+        crate::derived_text::DerivedTextKind,
+        Result<Option<crate::derived_text::Reader>, String>,
+    )>,
+    derived_text_read_errors: Cell<usize>,
 }
 
 impl<'a> IngestSession<'a> {
@@ -131,67 +134,129 @@ impl<'a> IngestSession<'a> {
         fts: &'a FtsIndex,
         caption_db_path: PathBuf,
     ) -> Self {
+        Self::new_with_derived_text_paths(
+            favorite_id,
+            favorite_root,
+            meta_db,
+            fts,
+            crate::derived_text::DerivedTextPaths::with_caption_path(caption_db_path),
+        )
+    }
+
+    pub fn new_with_derived_text_paths(
+        favorite_id: Uuid,
+        favorite_root: PathBuf,
+        meta_db: &'a FtsMetaDb,
+        fts: &'a FtsIndex,
+        paths: crate::derived_text::DerivedTextPaths,
+    ) -> Self {
+        let derived_readers = paths.iter().map(|(kind, _)| (kind, Ok(None))).collect();
         let mut session = Self {
             favorite_id,
             favorite_root,
             meta_db,
             fts,
             activity_gate: None,
-            caption_db_path,
-            caption_db: Ok(None),
-            caption_read_errors: Cell::new(0),
+            derived_text_paths: paths,
+            derived_readers,
+            derived_text_read_errors: Cell::new(0),
         };
-        session.reopen_caption_connection();
+        session.reopen_derived_text_connections();
         session
     }
 
-    /// Retry a store absent at startup before a scan or pending reflection.
-    /// A live read-only connection sees later commits without being reopened.
-    /// Returns whether a published reader is available for this attempt.
-    pub fn reopen_caption_connection(&mut self) -> bool {
-        if !matches!(self.caption_db, Ok(Some(_))) {
-            self.caption_db = CaptionDb::open_read_only(&self.caption_db_path).map_err(|error| {
-                crate::logger::log(format!("ingest: opening AI caption store failed: {error}"));
-                error.to_string()
-            });
+    pub fn reopen_derived_text_connection(
+        &mut self,
+        kind: crate::derived_text::DerivedTextKind,
+    ) -> bool {
+        let entry = self
+            .derived_readers
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == kind)
+            .unwrap();
+        if !matches!(entry.1, Ok(Some(_))) {
+            entry.1 = crate::derived_text::Reader::open(kind, self.derived_text_paths.path(kind))
+                .map_err(|error| {
+                    crate::logger::log(format!("ingest: opening {kind:?} failed: {error}"));
+                    error.to_string()
+                });
         }
-        matches!(self.caption_db, Ok(Some(_)))
+        matches!(entry.1, Ok(Some(_)))
+    }
+
+    pub fn reopen_derived_text_connections(&mut self) {
+        for store in crate::derived_text::stores() {
+            self.reopen_derived_text_connection(store.derived_text.unwrap());
+        }
+    }
+
+    pub fn reopen_caption_connection(&mut self) -> bool {
+        self.reopen_derived_text_connection(crate::derived_text::DerivedTextKind::Caption)
     }
 
     pub(crate) fn caption_db(&self) -> Option<&CaptionDb> {
-        self.caption_db.as_ref().ok().and_then(Option::as_ref)
+        self.derived_readers
+            .iter()
+            .find_map(|(_, reader)| match reader {
+                Ok(Some(crate::derived_text::Reader::Caption(db))) => Some(db),
+                _ => None,
+            })
     }
 
-    /// Override the worker's store location, including for disposable tests.
-    pub fn with_caption_db_path(mut self, path: PathBuf) -> Self {
-        self.caption_db_path = path;
-        self.caption_db = Ok(None);
-        self.reopen_caption_connection();
+    pub fn with_caption_db_path(self, path: PathBuf) -> Self {
+        Self::new_with_derived_text_paths(
+            self.favorite_id,
+            self.favorite_root,
+            self.meta_db,
+            self.fts,
+            crate::derived_text::DerivedTextPaths::with_caption_path(path),
+        )
+        .with_optional_activity_gate(self.activity_gate)
+    }
+
+    fn with_optional_activity_gate(
+        mut self,
+        gate: Option<&'a crate::activity_gate::ActivityGate>,
+    ) -> Self {
+        self.activity_gate = gate;
         self
     }
 
-    fn caption_text(&self, key: &str) -> String {
-        let db = match &self.caption_db {
-            Ok(Some(db)) => db,
-            Ok(None) => return String::new(),
-            Err(_) => {
-                self.caption_read_errors
-                    .set(self.caption_read_errors.get() + 1);
-                return String::new();
-            }
+    fn derived_text(&self, kind: crate::derived_text::DerivedTextKind, key: &str) -> String {
+        let started = crate::perf::is_enabled().then(std::time::Instant::now);
+        let entry = &self
+            .derived_readers
+            .iter()
+            .find(|(candidate, _)| *candidate == kind)
+            .unwrap()
+            .1;
+        let result = match entry {
+            Ok(Some(reader)) => reader.text(key).map_err(|error| error.to_string()),
+            Ok(None) => Ok(String::new()),
+            Err(error) => Err(error.clone()),
         };
-        match db.get(key) {
-            Ok(Some(row)) => crate::ingest_text::caption_search_text(&row),
-            Ok(None) => String::new(),
-            Err(error) => {
-                crate::logger::log(format!(
-                    "ingest: reading AI caption for {key} failed: {error}"
-                ));
-                self.caption_read_errors
-                    .set(self.caption_read_errors.get() + 1);
-                String::new()
-            }
+        if let Some(started) = started {
+            crate::perf::event(
+                "ingest",
+                "derived_text_read",
+                Some(key),
+                0,
+                &[
+                    ("store", kind.descriptor().file.into()),
+                    ("success", result.is_ok().into()),
+                    ("text_bytes", result.as_ref().map_or(0, String::len).into()),
+                    ("ms", (started.elapsed().as_secs_f64() * 1000.0).into()),
+                ],
+            );
         }
+        result.unwrap_or_else(|error| {
+            crate::logger::log(format!(
+                "ingest: reading {kind:?} for {key} failed: {error}"
+            ));
+            self.derived_text_read_errors
+                .set(self.derived_text_read_errors.get() + 1);
+            String::new()
+        })
     }
 
     /// ActivityGate を設定する。ingest の各ファイル処理前にこのゲートで待つ。
@@ -216,7 +281,7 @@ impl<'a> IngestSession<'a> {
     ) -> tantivy::Result<IngestStats> {
         use crate::fts_writer_dispatcher::WriterPriority;
 
-        self.caption_read_errors.set(0);
+        self.derived_text_read_errors.set(0);
         let mut stats = IngestStats::default();
         let mut batch_upserts: Vec<IndexDoc> = Vec::with_capacity(BATCH_FLUSH_COUNT);
         let mut batch_deletes: Vec<String> = Vec::new();
@@ -411,11 +476,14 @@ impl<'a> IngestSession<'a> {
         if let Some(p) = progress {
             p.clear_count();
         }
-        stats.caption_read_errors = self.caption_read_errors.take();
-        if stats.caption_read_errors > 0 {
-            // A normal scan/watch may replace an already-indexed caption with an empty
+        stats.derived_text_read_errors = self.derived_text_read_errors.take();
+        if stats.derived_text_read_errors > 0 {
+            // A normal scan/watch may replace already-indexed derived text with an empty
             // field. Existing next-start rebuild reservation repairs that case too.
-            writer.report_failure("ingest AI caption read", &"caption text could not be read");
+            writer.report_failure(
+                "ingest derived text read",
+                &"derived text could not be read",
+            );
         }
         Ok(stats)
     }
@@ -456,7 +524,7 @@ impl<'a> IngestSession<'a> {
         self.build_doc(cand, Container::Fs, IndexKind::Video, norms)
     }
 
-    /// 音声ファイルからファイル名だけの IndexDoc を組み立てる。
+    /// 音声のファイル名を用意し、共通のbuild_docで保存済み文字起こしを加える。
     /// ID3 等の埋め込みメタデータは将来スコープのため読み取らない。
     fn build_doc_for_audio(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
         let norms = crate::ingest_text::build_per_source_for_filename(&cand.abs_path);
@@ -496,7 +564,7 @@ impl<'a> IngestSession<'a> {
         self.build_doc(cand, Container::Fs, IndexKind::Pdf, norms)
     }
 
-    /// IndexDoc ビルド。説明文は読み、Tantivy 投入用の構造体のみ返す。
+    /// IndexDoc ビルド。説明文・文字起こしは読み、Tantivy 投入用の構造体のみ返す。
     /// SQLite 側の status=Ok 書き込みは `flush_batch` 内で Tantivy commit 成功後に行う。
     /// `norms` は move で受けて IndexDoc に埋め込む — per-file で複製は発生しない。
     fn build_doc(
@@ -510,7 +578,12 @@ impl<'a> IngestSession<'a> {
             kind,
             IndexKind::Image | IndexKind::Pdf | IndexKind::Zip | IndexKind::Folder
         ) {
-            norms.ai_caption = self.caption_text(&cand.key);
+            norms.ai_caption =
+                self.derived_text(crate::derived_text::DerivedTextKind::Caption, &cand.key);
+        }
+        if matches!(kind, IndexKind::Video | IndexKind::Audio) {
+            norms.transcript =
+                self.derived_text(crate::derived_text::DerivedTextKind::Transcript, &cand.key);
         }
         if crate::perf::is_enabled() {
             let (stored_total_bytes, png_prompt_bytes) = norms.stored_text_byte_sizes();
@@ -751,12 +824,12 @@ mod tests {
         let cand = make_image_file(tmp.path(), "image.jpg");
         let mut session = IngestSession::new(Uuid::new_v4(), tmp.path().into(), &meta, &fts)
             .with_caption_db_path(path.clone());
-        assert!(matches!(session.caption_db, Ok(None)));
+        assert!(session.caption_db().is_none());
         assert!(!path.exists());
         let db = CaptionDb::open_at(&path).unwrap();
         save_caption(&db, &cand, false);
         session.reopen_caption_connection();
-        assert!(matches!(session.caption_db, Ok(Some(_))));
+        assert!(session.caption_db().is_some());
         assert!(
             session
                 .build_doc_for_image(&cand, &mut IngestStats::default())
@@ -1629,7 +1702,7 @@ mod tests {
                 &fts,
                 path.clone(),
             );
-            assert!(matches!(session.caption_db, Ok(None)));
+            assert!(session.caption_db().is_none());
             let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start_with_reporter(
                 fts.writer().unwrap(),
                 std::sync::Arc::clone(&fts),
@@ -1651,14 +1724,14 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(result.ingested_ok, 1);
-            assert_eq!(result.caption_read_errors, 0);
+            assert_eq!(result.derived_text_read_errors, 0);
             assert!(!meta.tantivy_rebuild_pending().unwrap());
             assert!(writer.test_take_failure_notifications().is_empty());
 
             let db = CaptionDb::open_at(&path).unwrap();
             save_caption(&db, &candidate, false);
             session.reopen_caption_connection();
-            assert!(matches!(session.caption_db, Ok(Some(_))));
+            assert!(session.caption_db().is_some());
             let result = session
                 .apply(
                     vec![candidate.clone()],
@@ -1670,7 +1743,7 @@ mod tests {
                     None,
                 )
                 .unwrap();
-            assert_eq!(result.caption_read_errors, 0);
+            assert_eq!(result.derived_text_read_errors, 0);
             let searcher = fts.searcher();
             let address = fts_index::find_doc_by_path(&searcher, fts.fields(), &candidate.key)
                 .unwrap()
@@ -1715,7 +1788,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(result.caption_read_errors, 0);
+        assert_eq!(result.derived_text_read_errors, 0);
         assert!(!meta.tantivy_rebuild_pending().unwrap());
         let db = CaptionDb::open_at(&path).unwrap();
         save_caption(&db, &candidate, false);
@@ -1744,7 +1817,7 @@ mod tests {
             result.ingested_ok, 1,
             "ordinary metadata ingest continues without caption text"
         );
-        assert_eq!(result.caption_read_errors, 1);
+        assert_eq!(result.derived_text_read_errors, 1);
         assert!(meta.tantivy_rebuild_pending().unwrap());
         let indexed: bool = conn
             .query_row(

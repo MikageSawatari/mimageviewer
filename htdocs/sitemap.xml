@@ -32,7 +32,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/ai-integration.html</loc>
-    <lastmod>2026-11-08</lastmod>
+    <lastmod>2026-11-14</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -122,7 +122,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/index.html</loc>
-    <lastmod>2026-11-13</lastmod>
+    <lastmod>2026-11-14</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -137,7 +137,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/metadata-transfer.html</loc>
-    <lastmod>2026-11-11</lastmod>
+    <lastmod>2026-11-14</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -147,7 +147,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/music.html</loc>
-    <lastmod>2026-11-03</lastmod>
+    <lastmod>2026-11-14</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -867,7 +867,12 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/tut-ai-integration.html</loc>
-    <lastmod>2026-11-03</lastmod>
+    <lastmod>2026-11-14</lastmod>
+    <priority>0.5</priority>
+  </url>
+  <url>
+    <loc>https://mikage.to/mimageviewer/manual/tut-ai-transcript.html</loc>
+    <lastmod>2026-11-14</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -1037,12 +1042,12 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/tutorial.html</loc>
-    <lastmod>2026-11-03</lastmod>
+    <lastmod>2026-11-14</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/manual/video.html</loc>
-    <lastmod>2026-11-05</lastmod>
+    <lastmod>2026-11-14</lastmod>
     <priority>0.5</priority>
   </url>
   <url>
@@ -1082,7 +1087,7 @@
   </url>
   <url>
     <loc>https://mikage.to/mimageviewer/privacy.html</loc>
-    <lastmod>2026-11-13</lastmod>
+    <lastmod>2026-11-14</lastmod>
     <priority>0.5</priority>
   </url>
 </urlset>

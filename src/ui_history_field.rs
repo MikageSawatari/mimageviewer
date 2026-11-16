@@ -138,26 +138,7 @@ fn plain_key(ctx: &Context, key: Key) -> bool {
 }
 
 fn consume_key(ctx: &Context, key: Key) {
-    ctx.input_mut(|input| {
-        input.events.retain(|event| {
-            !matches!(event,
-            egui::Event::Key { key: pressed, pressed: true, modifiers, .. }
-                if *pressed == key && modifiers.is_none())
-        });
-    });
-    #[cfg(windows)]
-    {
-        let virtual_key = match key {
-            Key::ArrowDown => 0x28,
-            Key::ArrowUp => 0x26,
-            Key::Enter => 0x0D,
-            Key::Escape => 0x1B,
-            _ => unreachable!("history only handles arrows, Enter and Escape"),
-        };
-        crate::key_input::consume_key_edges(ctx.viewport_id(), |edge| {
-            edge.virtual_key == virtual_key && !edge.ctrl && !edge.shift && !edge.alt
-        });
-    }
+    crate::keyboard_input::claim_history_key(ctx, key);
 }
 
 /// Editing wins over history navigation in an aggregated backend input batch.

@@ -31,7 +31,7 @@ const OUT_CHANNELS: usize = 2;
 
 static FFMPEG_INIT: Once = Once::new();
 
-fn ensure_ffmpeg_init() {
+pub(crate) fn ensure_ffmpeg_init() {
     FFMPEG_INIT.call_once(|| {
         let _ = ffmpeg::init();
     });
@@ -199,21 +199,17 @@ fn open_audio_decode(
 
     // 再生 player が確定した stream を開く。`stream.parameters()` は stream を借用するので、
     // codec context の構築まで stream スコープ内で済ませてから owned な context を取り出す。
-    let (stream_index, stream_time_base, codec_ctx) = {
+    let (stream_index, stream_time_base) = {
         let stream = ictx
             .stream(stream_index)
             .filter(|stream| stream.parameters().medium() == ffmpeg::media::Type::Audio)
             .ok_or(AudioDecodeOpenError::NoAudioTrack)?;
         let idx = stream.index();
         let time_base = stream.time_base();
-        let ctx = ffmpeg::codec::context::Context::from_parameters(stream.parameters())
-            .map_err(|e| AudioDecodeOpenError::Failed(format!("codec context: {e}")))?;
-        (idx, time_base, ctx)
+        (idx, time_base)
     };
-    let decoder = codec_ctx
-        .decoder()
-        .audio()
-        .map_err(|e| AudioDecodeOpenError::Failed(format!("audio decoder open: {e}")))?;
+    let decoder =
+        open_audio_stream_decoder(&ictx, stream_index).map_err(AudioDecodeOpenError::Failed)?;
 
     let in_fmt = decoder.format();
     let in_rate = decoder.rate();
@@ -619,7 +615,9 @@ pub fn decode_audio_file_progressive(
 
 /// 入力レイアウトを swresample が扱える (mask を持つ native order の) レイアウトへ
 /// 正規化する。mask を持たない (UNSPEC) 入力はチャンネル数から既定レイアウトへ差し替える。
-fn normalize_layout(layout: ffmpeg::ChannelLayout<'_>) -> ffmpeg::ChannelLayout<'static> {
+pub(crate) fn normalize_layout(
+    layout: ffmpeg::ChannelLayout<'_>,
+) -> ffmpeg::ChannelLayout<'static> {
     if layout.mask().is_some() {
         return ffmpeg::ChannelLayout::from(layout.into_owned());
     }
@@ -633,6 +631,22 @@ fn normalize_layout(layout: ffmpeg::ChannelLayout<'_>) -> ffmpeg::ChannelLayout<
     } else {
         ffmpeg::ChannelLayout::MONO
     }
+}
+
+/// Shared offline decoder open. Output format and pacing belong to the caller.
+pub(crate) fn open_audio_stream_decoder(
+    input: &ffmpeg::format::context::Input,
+    stream_index: usize,
+) -> Result<ffmpeg::decoder::Audio, String> {
+    let stream = input
+        .stream(stream_index)
+        .filter(|stream| stream.parameters().medium() == ffmpeg::media::Type::Audio)
+        .ok_or_else(|| "audio stream unavailable".to_owned())?;
+    ffmpeg::codec::context::Context::from_parameters(stream.parameters())
+        .map_err(|e| format!("codec context: {e}"))?
+        .decoder()
+        .audio()
+        .map_err(|e| format!("audio decoder open: {e}"))
 }
 
 /// 音声ファイルのソースメタ情報 (avformat probe)。

@@ -275,7 +275,7 @@ struct DisplayEpoch {
 fn seed_display(app: &mut AppTestEnvForTest) -> DisplayEpoch {
     let index_data = app.tmp.path().join("caption-index");
     let caption = app
-        .caption_epoch_for_test(&index_data)
+        .derived_text_epoch_for_test(&index_data)
         .load(Ordering::Acquire);
     app.caption_display.seed_for_test("c:/images/changed.jpg");
     app.caption_display
@@ -286,12 +286,12 @@ fn seed_display(app: &mut AppTestEnvForTest) -> DisplayEpoch {
     }
 }
 
-fn assert_caption_epoch(app: &App, expected: u64) {
+fn assert_derived_text_epoch(app: &App, expected: u64) {
     assert_eq!(
         app.indexer_init
             .as_ref()
             .unwrap()
-            .caption_epoch()
+            .derived_text_epoch()
             .load(Ordering::Acquire),
         expected
     );
@@ -319,7 +319,7 @@ fn caption_store_mutation_clears_shared_display_with_identity_setting_disabled()
     let epoch = seed_display(&mut app);
     app.apply_content_identity_store_mutations(StoreMutationEffects::default());
     assert_eq!(app.caption_display.epoch_for_test(), epoch.display);
-    assert_caption_epoch(&app, epoch.caption);
+    assert_derived_text_epoch(&app, epoch.caption);
     assert!(
         app.caption_display
             .contains_for_test("c:/images/changed.jpg")
@@ -327,7 +327,7 @@ fn caption_store_mutation_clears_shared_display_with_identity_setting_disabled()
 
     app.apply_content_identity_store_mutations(caption_mutation());
     assert_display_cleared(&app, epoch);
-    assert_caption_epoch(&app, epoch.caption + 1);
+    assert_derived_text_epoch(&app, epoch.caption + 1);
     assert!(app.content_identity_index_load_pending.is_none());
 }
 
@@ -358,7 +358,7 @@ fn caption_rename_completion_clears_shared_display() {
     app.poll_rename_migration_pending(&egui::Context::default());
 
     assert_display_cleared(&app, epoch);
-    assert_caption_epoch(&app, epoch.caption + 1);
+    assert_derived_text_epoch(&app, epoch.caption + 1);
 }
 
 #[test]
@@ -387,7 +387,7 @@ fn caption_delete_done_completion_clears_shared_display() {
 
     assert!(app.delete_pending.is_none());
     assert_display_cleared(&app, epoch);
-    assert_caption_epoch(&app, epoch.caption + 1);
+    assert_derived_text_epoch(&app, epoch.caption + 1);
 }
 
 #[test]
@@ -410,7 +410,7 @@ fn caption_delete_purge_retry_completion_clears_shared_display() {
 
     assert!(app.delete_purge_retry_pending.is_none());
     assert_display_cleared(&app, epoch);
-    assert_caption_epoch(&app, epoch.caption + 1);
+    assert_derived_text_epoch(&app, epoch.caption + 1);
 }
 
 #[test]
@@ -425,7 +425,7 @@ fn caption_cleanup_completion_clears_shared_display_before_empty_key_return() {
     });
 
     assert_display_cleared(&app, epoch);
-    assert_caption_epoch(&app, epoch.caption + 1);
+    assert_derived_text_epoch(&app, epoch.caption + 1);
 }
 
 #[test]
@@ -440,7 +440,7 @@ fn caption_book_store_completion_clears_shared_display() {
     });
 
     assert_display_cleared(&app, epoch);
-    assert_caption_epoch(&app, epoch.caption + 1);
+    assert_derived_text_epoch(&app, epoch.caption + 1);
 }
 
 #[test]
@@ -460,7 +460,7 @@ fn caption_book_append_undo_completion_clears_shared_display() {
     });
 
     assert_display_cleared(&app, epoch);
-    assert_caption_epoch(&app, epoch.caption + 1);
+    assert_derived_text_epoch(&app, epoch.caption + 1);
 }
 
 #[test]
@@ -482,7 +482,7 @@ fn caption_book_append_metadata_completion_only_clears_for_deleted_captions() {
     let epoch = seed_display(&mut app);
     app.finish_book_append_metadata(&summary);
     assert_eq!(app.caption_display.epoch_for_test(), epoch.display);
-    assert_caption_epoch(&app, epoch.caption);
+    assert_derived_text_epoch(&app, epoch.caption);
     assert!(
         app.caption_display
             .contains_for_test("c:/images/changed.jpg")
@@ -491,7 +491,7 @@ fn caption_book_append_metadata_completion_only_clears_for_deleted_captions() {
     summary.metadata_copy.captions_changed = true;
     app.finish_book_append_metadata(&summary);
     assert_display_cleared(&app, epoch);
-    assert_caption_epoch(&app, epoch.caption + 1);
+    assert_derived_text_epoch(&app, epoch.caption + 1);
 }
 
 fn metadata_refresh(
@@ -512,7 +512,7 @@ fn caption_metadata_import_completion_only_clears_when_captions_changed() {
         .apply_metadata_import_terminal_refresh(metadata_refresh(Vec::new()), Default::default());
     assert!(!stale);
     assert_eq!(app.caption_display.epoch_for_test(), epoch.display);
-    assert_caption_epoch(&app, epoch.caption);
+    assert_derived_text_epoch(&app, epoch.caption);
     assert!(
         app.caption_display
             .contains_for_test("c:/images/changed.jpg")
@@ -527,7 +527,7 @@ fn caption_metadata_import_completion_only_clears_when_captions_changed() {
     );
     assert!(!stale);
     assert_display_cleared(&app, epoch);
-    assert_caption_epoch(&app, epoch.caption + 1);
+    assert_derived_text_epoch(&app, epoch.caption + 1);
 }
 
 #[test]
@@ -559,7 +559,7 @@ fn caption_metadata_import_stale_refresh_still_clears_committed_captions() {
 
     assert!(stale);
     assert_display_cleared(&app, epoch);
-    assert_caption_epoch(&app, epoch.caption + 1);
+    assert_derived_text_epoch(&app, epoch.caption + 1);
 }
 
 #[test]
@@ -574,7 +574,7 @@ fn caption_thumbnail_pin_import_and_store_effects_invalidate_all_viewer_values()
         },
     );
     assert_display_cleared(&app, epoch);
-    assert_caption_epoch(&app, epoch.caption);
+    assert_derived_text_epoch(&app, epoch.caption);
     for file in ["folder_thumb_pins.db", "video_pins.db"] {
         let descriptor = crate::rename_key_migration::STORES
             .iter()
@@ -585,7 +585,7 @@ fn caption_thumbnail_pin_import_and_store_effects_invalidate_all_viewer_values()
         let epoch = seed_display(&mut app);
         app.apply_content_identity_store_mutations(effects);
         assert_display_cleared(&app, epoch);
-        assert_caption_epoch(&app, epoch.caption);
+        assert_derived_text_epoch(&app, epoch.caption);
     }
 }
 
@@ -605,14 +605,14 @@ fn caption_folder_pin_set_and_remove_clear_at_database_mutation_boundary() {
         }
     ));
     assert_display_cleared(&app, epoch);
-    assert_caption_epoch(&app, epoch.caption);
+    assert_derived_text_epoch(&app, epoch.caption);
     // The ZIP caller can consume the thumbnail dirty marker immediately;
     // invalidation must already have happened inside the writer itself.
     app.folder_thumb_pin_dirty.clear();
     let epoch = seed_display(&mut app);
     assert!(app.remove_folder_thumb_pin(&folder));
     assert_display_cleared(&app, epoch);
-    assert_caption_epoch(&app, epoch.caption);
+    assert_derived_text_epoch(&app, epoch.caption);
 }
 
 #[test]
@@ -675,17 +675,17 @@ fn caption_changes_before_ready_are_resampled_on_startup_adoption() {
         vec![],
     )
     .unwrap();
-    let epoch = manager.caption_epoch();
+    let epoch = manager.derived_text_epoch();
     app.indexer_init = IndexerInit::NotStarted;
     // A background manager may already have drained startup pending rows while
     // App still cannot deliver a committed job/import terminal to it.
-    app.notify_caption_changed();
+    app.notify_derived_text_changed();
     assert_eq!(epoch.load(Ordering::Acquire), 0);
     app.adopt_startup_init(
         crate::indexer_manager::StartupInitOutcome::Ready(manager),
         false,
     );
     assert_eq!(epoch.load(Ordering::Acquire), 1);
-    app.notify_caption_changed();
+    app.notify_derived_text_changed();
     assert_eq!(epoch.load(Ordering::Acquire), 2);
 }
