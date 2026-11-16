@@ -153,6 +153,19 @@ OS／別threadの到達を待つ期限は従来の20秒とし、未到達は失�
 本体lib全件は `.\scripts\test-lib-full.ps1` を使い、上の「結果の再利用」に従う。
 nextestは1テスト1プロセスでAppのprocess-global lockを分離する。
 `.config/nextest.toml` はCPU数並列・retryなし・60秒ごとの警告と300秒での打ち切りを使う。
+実 GPU device / GPU 実行 session を作るテストは `gpu` test-group（同時2プロセス）で制限する。
+DXGI / VRAM / SM の情報照会だけ、wgpu Instance 作成だけのテストは対象外とする。
+同時 device / session 作成と PC 停止の関係は未確認の仮説であり、原因確定を意味しない。
+新しい GPU helper とそのテストは原則 `gpu_tests` サブモジュールへ置く（filter が自動で拾う）。
+製品側の device / session 作成点にも `#[cfg(test)]` 限定で `assert_gpu_test_group()` を置く。
+テスト専用入口も検査する。nextest 上で `gpu` 以外から到達すると、設定への追加を促して
+生成前にテストプロセスを非ゼロ終了させ、background workerのpanic握り潰しも防ぐ。
+既存 helper の新しい呼び出し元も所属を確認する。スナップショット等の4統合テストは
+binary 全体を選び、混在するCPUテストも含める。通常の `cargo test` では入口検査を行わない。
+`cfg(test)` はdependencyへ伝播しないため、別integration / 別crateから通常libを呼ぶGPU経路は、
+そのbinaryの所属または自crate側の検査でも覆う。製品ビルドの動作は変えない。
+group 内だけの実行では group 外の呼び出し漏れは検証できず、取り込み後の全件実行で検出する。
+経路別の対象・継承・一覧照合と時間見積もりは [GPU test-group](gpu-test-groups.md) を参照。
 workspaceの全package・補助bin・integrationと、standalone vendorのegui／egui-winit／egui-wgpu／
 eframe（wgpu・glow）の5実行を棚卸しし、成功実行で60秒を超えた12件は120秒ごとの警告・600秒で打ち切る。
 本体libだけの「最長約60秒」を全体の根拠にはしない。workspaceのLibRaw検査174.018秒、

@@ -6,6 +6,7 @@ use crate::ui_fullscreen::page_turn_submission_tests::{
 };
 
 fn render_state() -> egui_wgpu::RenderState {
+    crate::test_gpu_group::assert_gpu_test_group();
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
     let instance = wgpu::Instance::new(descriptor);

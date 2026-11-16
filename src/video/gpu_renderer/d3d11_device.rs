@@ -612,6 +612,8 @@ impl GpuVideoDevice {
             D3D11_CREATE_DEVICE_BGRA_SUPPORT.0 | D3D11_CREATE_DEVICE_VIDEO_SUPPORT.0,
         );
 
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         unsafe {
             D3D11CreateDevice(
                 None,
