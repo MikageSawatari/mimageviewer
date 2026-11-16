@@ -1200,6 +1200,8 @@ pub(super) fn measure_video_anime4k_on_adapter(
     let mut base_device = None;
     let mut context = None;
     let mut feature_level = D3D_FEATURE_LEVEL::default();
+    #[cfg(test)]
+    crate::test_gpu_group::assert_gpu_test_group();
     unsafe {
         D3D11CreateDevice(
             adapter,
@@ -1539,6 +1541,7 @@ mod tests {
     }
 
     fn warp_device() -> (ID3D11Device1, ID3D11DeviceContext) {
+        crate::test_gpu_group::assert_gpu_test_group();
         let mut base_device: Option<ID3D11Device> = None;
         let mut context: Option<ID3D11DeviceContext> = None;
         let mut feature_level = D3D_FEATURE_LEVEL::default();
@@ -1850,6 +1853,7 @@ mod tests {
     #[test]
     #[ignore = "manual B3 GPU timestamp calibration on the active hardware adapter"]
     fn measure_anime4k_variants_with_gpu_timestamps() {
+        crate::test_gpu_group::assert_gpu_test_group();
         let mut base_device = None;
         let mut context = None;
         let mut feature_level = D3D_FEATURE_LEVEL::default();

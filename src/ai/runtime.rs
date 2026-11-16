@@ -695,6 +695,8 @@ impl AiRuntime {
         &self,
         builder: ort::session::builder::SessionBuilder,
     ) -> ort::session::builder::SessionBuilder {
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         match builder.with_execution_providers([ort::ep::DirectML::default().build()]) {
             Ok(b) => b,
             Err(e) => {
@@ -781,6 +783,8 @@ impl AiRuntime {
             .with_engine_hw_compatible(TRT_HW_COMPAT)
             .build();
         let cuda = ort::ep::CUDA::default().build();
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
         match builder.with_execution_providers([trt, cuda]) {
             Ok(b) => b,
             Err(e) => {

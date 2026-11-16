@@ -597,6 +597,8 @@ fn ai_failure_feedback_hover_small_light() {
     );
 }
 
+#[path = "support/gpu_test_group.rs"]
+mod test_gpu_group;
 #[path = "support/ui_harness.rs"]
 mod test_ui;
 

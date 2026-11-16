@@ -1747,6 +1747,8 @@ impl GlutinWindowContext {
             default_attributes,
             fallback_attributes,
             |context_attributes| unsafe {
+                #[cfg(test)]
+                crate::test_gpu_group::assert_gpu_test_group();
                 profiling::scope!("create_context");
                 gl_config
                     .display()

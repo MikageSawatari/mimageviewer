@@ -217,6 +217,8 @@ fn read_frame(reader: &mut impl Read) -> Result<Frame, VlmError> {
 /// Any transport/protocol/fatal error permanently retires this client. Only
 /// `ImageFailure` permits the next image. No call retries or restarts a process.
 pub struct VlmWorkerClient {
+    #[cfg(test)]
+    test_fake_worker: bool,
     _child: JobChild,
     kill: KillHandle,
     writer: Option<mpsc::SyncSender<Vec<u8>>>,
@@ -321,6 +323,8 @@ impl VlmWorkerClient {
                 }
             })?;
         Ok(Self {
+            #[cfg(test)]
+            test_fake_worker: tests::is_fake_worker(executable),
             _child: child,
             kill,
             writer: Some(writer_tx),
@@ -397,6 +401,10 @@ impl VlmWorkerClient {
     pub fn load(&mut self, request: &LoadRequest) -> Result<LoadResult, VlmError> {
         if !matches!(self.state, State::Unloaded) {
             return Err(VlmError::Unavailable);
+        }
+        #[cfg(test)]
+        if !self.test_fake_worker {
+            crate::test_gpu_group::assert_gpu_test_group();
         }
         let mut header = match serde_json::to_value(request) {
             Ok(header) => header,
@@ -736,6 +744,11 @@ fn detect_gpu_at(executable: &Path, timeout: Duration) -> Result<GpuDecision, Vl
         return Err(VlmError::Fatal("device probe failed".into()));
     }
     select_gpu(&serde_json::from_slice(&bytes).map_err(|e| VlmError::Protocol(e.to_string()))?)
+}
+
+#[cfg(test)]
+pub(super) fn fake_worker_for_test() -> &'static Path {
+    tests::fake_worker()
 }
 
 #[cfg(test)]
