@@ -69,9 +69,16 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 
 ### 1.785 MPEG-TS / PS の seek が keyframe の手前に着地しない — コード調査 (2026-11-14)
 
-- 状態: **実装済み・独立レビュー ACCEPT (2026-11-16、gpt-6.1-sol / xhigh、2 巡)・実機確認待ち**。ブランチ `fix-785-mpeg-seek`。
+- 状態: **実装済み・独立レビュー ACCEPT・実機確認済み・本体 lib 全件成功 (2026-11-16)**。ブランチ `fix-785-mpeg-seek`。
     第4版の [keyframe 確認付き seek 設計](mpeg-keyframe-seek-plan.md) に沿って共通 seek owner・保持列・各 worker の接続・
-    TS/PS の TimeGrid を実装。[実装の検証記録](mpeg-keyframe-seek-verification.md)。本体 lib 全件と実機 (サブ PC) の確認は未実施。
+    TS/PS の TimeGrid を実装。[実装の検証記録](mpeg-keyframe-seek-verification.md)。独立レビュー (gpt-6.1-sol / xhigh) は本体 2 巡、
+    時刻格子の末尾の枠の修正 2 巡で ACCEPT。
+  - 実機 (サブ PC の依頼 61・63、観測者: サブ PC 担当、合成素材の TS・PS の `.mpg` と MP4): 末尾付近への seek で前の画が残らず、
+    末尾付近の frame step は 1 frame ずつ動き、シークストリップの枠は埋まった。`keyframe_seek` は Verified / StartOfStream / Direct だけで、
+    Unverified・SeekFailed・ERROR・WARN・panic は 0。依頼 61 で見つかった時刻格子の末尾の枠の重なり (出荷済みのコードの端数の問題、
+    TS・PS が時刻格子になって目立つ) は同じブランチで直し、依頼 63 で 4 枠に揃ったことを確認 (観測者: サブ PC 担当)。
+  - 本体 lib 全件: `test-lib-full.ps1` で 17,928 件成功・76 skip (master 6d765d3d3 以降を取り込んだ状態)。
+  - 一時停止中のシークで再生が始まるのは出荷済みの動きで、§1.791 で扱う。
   時刻原点の補正とは独立した既存不具合で、
   [動画の時刻原点の修正](video-timeline-origin-plan.md) の対象外とする (2026-11-14 設計担当決定)。
 - 観測は同梱 FFmpeg DLL を使った headless probe。製品アプリの起動・実画面確認はしていない。
