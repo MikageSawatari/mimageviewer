@@ -1,6 +1,6 @@
 # §1.800 本を Enter で開き Esc で一覧へ戻るときのもたつき — 調査と設計
 
-- 状態: 調査・設計 (2026-11-17)。実装前。設計の独立レビュー r1〜r3 = REVISE を反映済み (§8)。§3.5 の比較で案 S1 (一括で読まない) へ切り替えた。S1 の設計は §4S、r5 でレビュー。
+- 状態: 調査・設計 (2026-11-17)。実装前。設計の独立レビュー r1〜r3 = REVISE を反映済み (§8)。§3.5 の比較で案 S1 (一括で読まない) へ切り替えた。S1 の設計は §4S。r5 = REVISE (S1 の方向は支持、P2 4 件)、統括の判断待ち。
 - ブランチ: `perf-800-book-close` (worktree `G:\home\mimageviewer-perf-800`)。
 - 目標版: v5.3.0。
 
@@ -440,3 +440,25 @@ UI の待ちの上限にならない。UI の writeback と seed の親 `load_on
 
 対応: r3 までの案は直すたびに仕組みが増える (今回は writeback の worker 化) ので、§3.5 の比較に基づき案 S1 (§4S) へ切り替えた。
 r4 の指摘は §4 の案に対するもので、S1 では片付けを worker へ移さないので該当しない。
+
+### r5 (同じセッションの resume、2026-11-17、dd365d954 = 案 S1 に対して) — REVISE、P1 なし。S1 の方向は支持
+
+- §3.5 の判断 (S2 単独を退け、不要な全行の読み込みをやめる) に賛成。合成ビューの全行の写しを控えとして扱うことも可、mode は不要。
+  worker の分岐は `uses_lazy_catalog` の意味を変えず、Fixed の未ヒット時の lookup を局所的に許す形なら成立する (Parent の観測・
+  EPUB の世代・ピン・cascade・自動切り抜きの鍵・retired CacheOnly・Legacy の置換・SourceOnly を保てる。Fixed の PDF メタの補完は
+  `initial_catalog` のまま)。
+- P2-1: UI の DB I/O を増やさない。4S.1 の表の seed の照合・見本の取得は既存の一覧準備の worker にまとめ、writeback も UI は対象・
+  stamp・payload の確定までにして保存を worker へ。件数の上限を UI の I/O を許す条件にしない。worker の 1 件ずつの lookup は
+  共有の接続で UI の writeback と競合する機会を増やす。
+- P2-2: 表紙の失効の窓は S1 でも残る (worker が旧行を読む → 失効が DB と控えから消す → UI が完了を処理 → worker が旧行を控えへ登録)。
+  lookup・控えへの登録・画像の採用を、表紙の失効の所有者と同じ有効性の契約にまとめる必要がある。
+  (設計担当の注: 保存した行を控えへ入れる今の経路 `thumb_loader.rs` の保存後の `map.insert` にも同じ形がある。S1 は読む回数が多いぶん
+  当たりやすくなる。)
+- P2-3: 表に `pin_materialization` (app/pin_materialization.rs) が漏れている。控えの鍵から DB の削除対象を作るので、疎な控えでは
+  旧ピンの行が残る。
+- P2-4: 自動縦横比の「最大 48 件」は誤り。今は有効な見本が集まるまで項目を探し、48 は旧行のヘッダを調べる回数の予算。worker 側で
+  今と同じ順序・条件で準備する。
+- P3-5: 計装 (`thumb_catalog_lookup` の分類、cache hit は `load_phases` まで進まない)、`bench_scroll` の「キャッシュなし」の意味、
+  Rust の実経路での warm / cold・1 万件・writeback 競合の受け入れ条件。
+- 写しの完全さに頼る読み手の照合表 (r5 の全文は scratchpad の review-800-r5.md): 4S.1 の表のほか、ドライブ一覧の独立した
+  `load_all` の入口 (app.rs `seed_drive_list_pin_thumbs_from_catalog` の呼び出し元) の範囲を明記すること。
