@@ -59,42 +59,37 @@ pub fn capture_frame(path: &Path, target_secs: f64) -> Result<CapturedVideoFrame
     // (詳細は `src/video/swscale_helpers.rs`)
 
     let target_pts = timeline.media_to_av_time_base(target_secs);
-    let seek_ok = unsafe {
-        use ffmpeg::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
-        av_seek_frame(
-            input.as_mut_ptr(),
-            -1,
-            target_pts,
-            AVSEEK_FLAG_BACKWARD as i32,
-        ) >= 0
-    };
-    if !seek_ok {
-        return Err(format!("seek failed: target={target_secs:.3}s"));
-    }
+    let mut reader = crate::video::keyframe_seek::PacketReader::default();
+    reader
+        .seek(&mut input, -1, target_pts, Some(stream_idx), || false)
+        .map_err(|e| format!("seek failed: target={target_secs:.3}s: {e}"))?;
     decoder.flush();
 
     let mut got_frame: Option<(Video, f64)> = None;
     let mut before_frame: Option<(Video, f64)> = None;
-    let mut video_packets_seen = 0;
-    let mut frames_seen = 0;
-    for item in input.packets() {
-        let (stream, packet) = match item {
-            Ok(sp) => sp,
-            Err(e) => return Err(format!("read packet failed: {e}")),
+    // Normal preroll can exceed 240 packets/frames for a long GOP. Finish only
+    // after reaching the target or draining EOF; a read error is not an EOF.
+    loop {
+        let draining = match reader.next(&mut input) {
+            Some(Ok((packet_stream_idx, packet))) => {
+                if packet_stream_idx != stream_idx {
+                    continue;
+                }
+                if decoder.send_packet(&packet).is_err() {
+                    continue;
+                }
+                false
+            }
+            Some(Err(e)) => return Err(format!("read packet failed: {e}")),
+            None => {
+                decoder
+                    .send_eof()
+                    .map_err(|e| format!("screenshot decoder drain failed: {e}"))?;
+                true
+            }
         };
-        if stream.index() != stream_idx {
-            continue;
-        }
-        video_packets_seen += 1;
-        if video_packets_seen > 240 {
-            break;
-        }
-        if decoder.send_packet(&packet).is_err() {
-            continue;
-        }
         let mut frame = Video::empty();
         while decoder.receive_frame(&mut frame).is_ok() {
-            frames_seen += 1;
             let Some(raw_pts) = crate::video::decoder::video_frame_timestamp(&frame) else {
                 frame = Video::empty();
                 continue;
@@ -120,13 +115,9 @@ pub fn capture_frame(path: &Path, target_secs: f64) -> Result<CapturedVideoFrame
                 };
                 break;
             }
-            if frames_seen >= 240 {
-                got_frame = before_frame.take();
-                break;
-            }
             frame = Video::empty();
         }
-        if got_frame.is_some() {
+        if got_frame.is_some() || draining {
             break;
         }
     }
@@ -239,6 +230,37 @@ pub(crate) mod timeline_test_support {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mpeg_keyframe_seek_screenshot_matches_frame_oracle_and_drains_eof() {
+        use crate::video::keyframe_seek_test_support::{Fixture, WORKER_FIXTURES, assert_frame_id};
+        for name in WORKER_FIXTURES {
+            let fixture = Fixture::load(name);
+            let mut targets = fixture.targets();
+            if *name == "long-gop.ts" {
+                // 60 fps, six-second GOP: over 240 video packets precede 5.4s.
+                targets.push(5.4);
+            }
+            for target in targets {
+                let expected = fixture.nearest(target);
+                let image = super::capture_frame(&fixture.path, target)
+                    .unwrap_or_else(|e| panic!("{name} target={target}: {e}"));
+                assert_frame_id(
+                    &image.rgba,
+                    image.width,
+                    image.height,
+                    expected.frame_id,
+                    &format!("{name} screenshot target={target}"),
+                );
+                assert!(
+                    (image.target_secs - expected.media_secs).abs() < 1.0e-6,
+                    "{name} target={target}: actual={}, expected={}",
+                    image.target_secs,
+                    expected.media_secs,
+                );
+            }
+        }
+    }
+
     #[test]
     fn timeline_origin_screenshot_returns_requested_colour() {
         use super::timeline_test_support::{VIDEO_FIXTURES, assert_colour, fixture};

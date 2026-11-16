@@ -45,6 +45,9 @@ pub mod ffmpeg_loader;
 mod frame_selection;
 #[cfg(windows)]
 pub mod gpu_renderer;
+pub(crate) mod keyframe_seek;
+#[cfg(test)]
+pub(crate) mod keyframe_seek_test_support;
 pub(crate) mod media_timeline;
 pub mod mvexport;
 #[cfg(windows)]

@@ -797,7 +797,6 @@ impl TouchCorrelationState {
             .0
     }
 
-    #[cfg(test)]
     fn process_frame_with_diagnostics(
         &mut self,
         geometry: &TapZoneGeometry,

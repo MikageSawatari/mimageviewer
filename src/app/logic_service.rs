@@ -7,6 +7,7 @@ impl App {
         let lifecycle = self.accept_root_lifecycle_before_frame(ctx);
         self.diagnostics_export.poll();
         self.edit_preview_repaint_ctx = Some(ctx.clone());
+        self.poll_cover_rotation_cache(ctx);
         self.service_capture_main_window(ctx, frame);
         if self.settings.minimize_to_tray_on_close || self.tray_controller.is_some() {
             self.service_tray_requests(ctx);

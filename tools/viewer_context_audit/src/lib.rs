@@ -283,6 +283,10 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     // Each at-rest/retiring owner reloads its own legacy book covers that now need
     // a different angle (same predicate as the live list); no mount or sibling swap.
     "inherent fn    App ::  pub (crate) fn evict_legacy_cover_thumbnails (& mut self)",
+    // 1.773 §29: read-only capture and exact completion-driven eviction stay
+    // inside each mounted/at-rest/retiring owner; no projection or epoch change.
+    "inherent fn    App ::  pub (super) fn append_parked_cover_cache_inputs (& self , inputs : & mut super :: cover_rotation_cache :: CoverCacheInputs ,)",
+    "inherent fn    App ::  pub (super) fn evict_parked_automatic_covers (& mut self , completed : & [crate :: cover_rotation_cache :: InvalidationCompletion] ,)",
     // 1.337 reads the owning presentation to suppress automatic EffeTune in fullscreen.
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn presentation (self) -> ViewerPresentation",
     // RAW context-owned demand/park inventory and read-only mounted/at-rest view (3e57109e4).

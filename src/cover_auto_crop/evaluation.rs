@@ -574,7 +574,7 @@ fn evaluate_directory(
         }
     }
     sheet.save(output.join("sheet.png"))?;
-    let summary = json!({"algorithm":"autocrop:v3","decode_mode":mode.name(),"display_px":mode.display_px,"thumb_px":mode.thumb_px,
+    let summary = json!({"algorithm":"autocrop:v4","decode_mode":mode.name(),"display_px":mode.display_px,"thumb_px":mode.thumb_px,
         "analysis_decode_height":1024,"image_rotation":mode.image_rotation.degrees(),
         "physical_jpeg_reencode_quality":(!mode.image_rotation.is_none() || mode.reencode_input).then_some(95),
         "reencode_input_control":mode.reencode_input,
@@ -754,7 +754,7 @@ fn folder_evaluation_production_v3_counts_keep_guard_and_emit_no_images_or_ident
         assert!(!text.contains("private-"));
         assert!(!text.contains(&temp.path().to_string_lossy().into_owned()));
         let summary: serde_json::Value = serde_json::from_str(&text)?;
-        assert_eq!(summary["algorithm"], "autocrop:v3f");
+        assert_eq!(summary["algorithm"], "autocrop:v4f");
         assert_eq!(summary["total"], 2);
         assert_eq!(summary["cropped"], 1);
         assert_eq!(summary["declined"], 1);
@@ -1045,7 +1045,7 @@ fn evaluation_layout_directory_summary_counts_each_type_and_keeps_positions_and_
         assert_eq!(summary["good"], 8);
         assert_eq!(summary["wrong"], 0);
         assert_eq!(summary["fallback_cropped"], 0);
-        assert_eq!(summary["algorithm"], "autocrop:v3");
+        assert_eq!(summary["algorithm"], "autocrop:v4");
         assert_eq!(summary["ratio_distribution"]["count"], 8);
         for row in summary["rows"].as_array().unwrap() {
             assert_eq!(row["production_method"], "layout-fallback");

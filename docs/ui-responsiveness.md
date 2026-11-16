@@ -514,8 +514,16 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 判定用decode（JPEGは高さ1024以上の最小DCT倍率、PDFは高さ1024、その他は全体）はworker・範囲画面・評価器で共有する。
 workerは4方向の範囲と全体画素を一度作って運び、UIは在メモリの保存回転を引いて純粋な `auto_crop_view` で範囲を選ぶ。
 画像フォルダの判定は専用設定ON時だけ、代表選択で読んだ一覧から最大8枚×256KiBの寸法をworkerで取る（再走査なし）。
-写真の判定もworker・範囲画面の準備スレッドで同じhelperを使い、既存のデコードのEXIF解析と比率標本を再利用する。UI側へ新しいI/Oや判定を持ち込まない。
-回転変更・遅着・退避一覧の復元に伴う再判定、キャッシュ追い出し、同期I/Oは追加しない。
+撮影情報による写真の判定もworker・範囲画面の準備スレッドで同じhelperを使い、既存のデコードのEXIF解析を再利用する。本文の写真比率による見送りはしない。UI側へ新しいI/Oや判定を持ち込まない。
+本文の保存回転変更（§1.773、表紙計画§29）ではUIは変更keys・typed source・設定値・既存handleだけを捕捉する。
+本/代表の照合、catalogヘッダ読取、厳密キー削除、workerのmemory除去は短命workerに置き、全cache再帰scan・画像decode・親のための子生成を足さない。
+SQL中はmap/queue lockを持たない。新しい要求抑止やmodalを作らず、処理中は既存textureを保つ。
+Appが完了通知を非blockingで受けた後、対象のmemoryとowner別の要求・CPU待ち・textureだけを退避する。通知のslot・catalog・keyは同じ行の一組で照合し、UIで保存先を問い合わせない。ZIP・変換書庫の失効単位は外側書庫とし、pinの実効prefixで絞らない。
+通知は元contextの移動/parkで捨てず、本・代表別のUIセッション番号を進める。新しい常駐actor・retry timer・終了待合せは設けない。
+保持Loadedは採用時の番号をcloneし、snapshot / Smart / direct-sourceの状態を全て戻してから在メモリ照合する。
+Smartはsaved aspect samples代入後に照合し、最終Loadedにsamplesを整える。復元時のDB読取・decode・全context clearはしない。
+自動keyはv4/v4fへ更新するだけで、本文proofや素材codec/schemaの変更はしない。旧v3/v3fを移行せず、K2のv1互換を保つ。
+親への専用通知は追加せず、次の通常読取が既存catalog revisionで再選択する。子が保存される前、Off/Auto非保存時の別代表/無しは受入れた制約とする。
 ZIP は最大8×256KBの先頭読み、PDF/EPUB は代表と同じ password・`ReadTarget` の `PageSizes` を使う。
 通常のサムネイル生成では cache miss の時だけ判定し、`CacheOnly` や idle の周期起床に解析を足さない。
 設定変更の反映には既存の種類表示変更と同じ一覧読み直しを使い、専用の live rebuild 状態を追加しない。
