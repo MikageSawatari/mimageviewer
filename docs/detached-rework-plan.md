@@ -1467,6 +1467,9 @@ AtRest の live bundle 再開は bundle の状態を保つ。overview / ParkedLi
 設計指示の context 分離を実現する共有表示状態の所有変更であり、detached 固有の guard は追加しない。
 detached 述語・viewport routing・HWND・focus・timer は変更しない。設計担当と外部独立レビュアーは、
 bundle の所有自体が症状パッチではなく構造的変更であることに合意している。この合意を初版全体の検収成功とは扱わない。
+独立レビュー round 2 の追補: 完成後の resize と片側移動で保持する自動 pan の由来は、配置要求の作成時に固定する。
+未操作の origin からは適用後の pan 全体を基準にし、手動 origin の非配置軸は従来どおり基準との差に残す。
+要求内の情報だけを追加し、bundle / snapshot の所有・detached 述語・viewport routing は変更しない。
 配置結果と寿命は [fullscreen-page-start-position-plan.md](fullscreen-page-start-position-plan.md) に記録する。
 
 ### 2026-11-14: フォルダツリーのポインター入力を ROOT の pass に所有させる (§1.769)

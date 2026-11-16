@@ -12,6 +12,8 @@ pub(crate) struct FsInitialPlacementRequest {
     /// Immutable placement basis captured at accepted page entry.
     pub(crate) origin_zoom: f32,
     pub(crate) origin_pan: egui::Vec2,
+    /// Whether the origin matched its automatic view before this request.
+    pub(crate) origin_automatic: bool,
     /// Last automatic placement, used only to detect an intervening writer.
     pub(crate) applied_zoom: f32,
     pub(crate) applied_pan: egui::Vec2,
@@ -75,6 +77,11 @@ impl App {
                     anchor_idx,
                     origin_zoom: self.fs_zoom,
                     origin_pan: self.fs_pan,
+                    origin_automatic: !self.fs_view_has_moved(
+                        self.fs_zoom,
+                        self.fs_pan,
+                        self.fs_free_rotation,
+                    ),
                     applied_zoom: self.fs_zoom,
                     applied_pan: self.fs_pan,
                 });
@@ -170,16 +177,20 @@ impl App {
         self.fs_pan = pan;
         self.fs_automatic_initial_view = Some(FsAutomaticInitialView {
             zoom: self.fs_zoom,
-            // Half navigation preserves manual pan on non-overflowing axes.
-            // Only the placement computed from zero is an automatic baseline.
-            pan: reading_start_pan(
-                zero_pan_unit.expect("validated placement material"),
-                viewport,
-                self.spread_mode
-                    .reading_direction()
-                    .unwrap_or(self.reading_direction),
-                egui::Vec2::ZERO,
-            ),
+            // Half navigation retains pan on non-overflowing axes. Preserve
+            // automatic origins there, but keep manual components distinct.
+            pan: if request.origin_automatic {
+                pan
+            } else {
+                reading_start_pan(
+                    zero_pan_unit.expect("validated placement material"),
+                    viewport,
+                    self.spread_mode
+                        .reading_direction()
+                        .unwrap_or(self.reading_direction),
+                    egui::Vec2::ZERO,
+                )
+            },
         });
         self.fs_initial_placement_request = match material_kind {
             FullscreenPageMaterialKind::Complete => None,

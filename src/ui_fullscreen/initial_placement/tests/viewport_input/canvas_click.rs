@@ -443,6 +443,134 @@ fn canvas_move_745_provisional_resize_and_complete_keep_automatic_click_baseline
 }
 
 #[test]
+fn canvas_move_745_round2_resized_automatic_half_step_keeps_click_turns() {
+    resized_half_step_click_rule(false);
+}
+
+#[test]
+fn canvas_move_745_round2_resized_manual_half_step_keeps_clicks_stopped() {
+    resized_half_step_click_rule(true);
+}
+
+fn resized_half_step_click_rule(manual: bool) {
+    let _serial = crate::key_input::lock_test_input();
+    let _cleanup = TestKeyboardFrameCleanup;
+    for wheel in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx, SpreadMode::SplitLtr, true);
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Width;
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+        app.request_fs_initial_placement(0);
+        let placed = super::paint_frame_in_rect(&mut app, &ctx, arrival_viewport(), vec![]);
+        assert!(
+            placed.request.is_none(),
+            "complete paint must retire placement"
+        );
+        assert!(placed.unit.height() > placed.pages[0].viewport_rect.height());
+        assert!(placed.pan.y.abs() > TRANSFORM_EPSILON);
+        assert_eq!(
+            app.fullscreen_page_slice,
+            crate::page_split::PageSlice::Left
+        );
+
+        let taller = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 800.0));
+        let resized = super::paint_frame_in_rect(&mut app, &ctx, taller, vec![]);
+        assert!(resized.unit.height() < resized.pages[0].viewport_rect.height());
+        assert!(resized.request.is_none());
+        assert_eq!(
+            resized.pan, placed.pan,
+            "resize retains the completed automatic pan"
+        );
+        if manual {
+            let pan = app.fs_pan + egui::vec2(0.0, -30.0);
+            app.set_fs_pan_from_input(1.0, pan);
+        }
+        let origin_pan = app.fs_pan;
+        assert!(matches!(
+            (manual, planned_click(&mut app, false, false)),
+            (true, FsCanvasClickAction::None) | (false, FsCanvasClickAction::PageSide(1))
+        ));
+        let event = if wheel {
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -120.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+            }
+        } else {
+            key_event(egui::Key::ArrowRight, true)
+        };
+        super::paint_frame_in_rect(&mut app, &ctx, taller, vec![event]);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(
+            app.fullscreen_page_slice,
+            crate::page_split::PageSlice::Right
+        );
+        // The accepted step can retain the old half for its input frame.
+        // Resolve against the new half on the following real paint.
+        let events = if wheel {
+            vec![]
+        } else {
+            vec![key_event(egui::Key::ArrowRight, false)]
+        };
+        let stepped = super::paint_frame_in_rect(&mut app, &ctx, taller, events);
+        assert_eq!(
+            stepped.pages[0].uv_rect,
+            crate::page_split::PageSlice::Right.source_bbox(crate::rotation_db::Rotation::None)
+        );
+        assert!(stepped.request.is_none());
+        assert_eq!(
+            stepped.pan.y, origin_pan.y,
+            "the non-placed axis survives the half step"
+        );
+        assert!(
+            matches!(
+                (manual, planned_click(&mut app, false, false)),
+                (true, FsCanvasClickAction::None) | (false, FsCanvasClickAction::PageSide(1))
+            ),
+            "wheel={wheel}, manual={manual}"
+        );
+    }
+}
+
+#[test]
+fn canvas_move_745_round2_provisional_placement_keeps_manual_origin_identity() {
+    let ctx = egui::Context::default();
+    let mut app = reading_app(&ctx, SpreadMode::Single);
+    app.set_fs_pan_from_input(1.0, egui::vec2(0.0, 70.0));
+    app.request_fs_initial_placement(0);
+    let small = viewport();
+    let unit = egui::Rect::from_center_size(small.center(), egui::vec2(600.0, 600.0));
+    assert!(app.resolve_fs_initial_placement(
+        0,
+        true,
+        small,
+        Some(unit),
+        FullscreenPageMaterialKind::Provisional
+    ));
+    assert_eq!(app.fs_pan.y, 100.0);
+    assert!(matches!(
+        planned_click(&mut app, false, false),
+        FsCanvasClickAction::PageSide(1)
+    ));
+    let large = egui::Rect::from_min_size(small.min, egui::vec2(600.0, 800.0));
+    let unit = egui::Rect::from_center_size(large.center(), egui::vec2(600.0, 600.0));
+    assert!(app.resolve_fs_initial_placement(
+        0,
+        true,
+        large,
+        Some(unit),
+        FullscreenPageMaterialKind::Complete
+    ));
+    assert_eq!(app.fs_pan.y, 70.0);
+    assert!(matches!(
+        planned_click(&mut app, false, false),
+        FsCanvasClickAction::None
+    ));
+}
+
+#[test]
 fn canvas_move_745_half_step_retains_manual_pan_on_the_axis_not_automatically_placed() {
     let ctx = egui::Context::default();
     let mut app = composition_switch_app(&ctx, SpreadMode::SplitLtr, true, ReadingDirection::Ltr);
