@@ -72,6 +72,7 @@ DX12 は wgpu、MF は FFmpeg `h264_mf` 経由。情報照会の除外は仮説�
 | `src/ai/runtime.rs` | DirectML / TensorRT・CUDA EP登録前の2か所。CPU EP・force_cpu・environment作成だけ・cached session取得は除外 |
 | `src/ai/trt_worker_pool.rs` / `WorkerHandle::spawn` | concrete TRT子workerの起動前。fake factoryは迂回 |
 | `src/ai/vlm_worker.rs` / `VlmWorkerClient::load` | 有効なload要求を実 / 未知workerへ送る前。spawn / hello / GPU情報照会だけは除外 |
+| `src/ai/asr_worker.rs` / `AsrWorkerClient::load` | 有効なLUIDのload要求を実 / 未知workerへ送る前。`transcript_job_worker::run` の起動・hello後もこの入口を通るため、ジョブ側・共有transportには重ねて置かない |
 | `src/gpu_lanczos.rs` / `Lanczos3Resampler::new` | 借りたdeviceで実GPU pipelineを作る前。pure plan / cache検査は除外 |
 | `vendor/egui-wgpu/src/lib.rs` / `RenderState::create` | CreateNew分岐の実`adapter.request_device`直前。instance / adapter照会・Existing setup・mock候補closureは除外 |
 | `vendor/eframe/src/native/{wgpu_integration,glow_integration}.rs` | wgpuの4つの実window登録境界と、実GL contextを作るclosure。set_window(None) cleanup / instance-only / mockは除外 |
@@ -100,6 +101,49 @@ VLMのCPU fakeも製品load APIを使うため、`cfg(test)`だけのmarkerで�
 既存fake fixtureが初期化した共有`OnceLock<PathBuf>`の`get()`と完全path一致だけでfakeと認める。
 検査がfakeをbuildすることはなく、未知・実workerは既定で検査する。caption側の重複fake準備は
 同じ共有fixtureへ統一した。製品の型・動作とtestcaseのassertは変わらない。
+
+### 文字起こしの入口（2026-11-16、ASR区切り9）
+
+ASRも `cfg(test)` だけのmarkerを起動時に持ち、VLMと同じ `vlm_worker::tests::is_fake_worker`
+で既知fixtureを判定する。判定の複製や別のfake登録はせず、未知・実workerへのload前に所属を検査する。
+`transcript_job_worker::run` は `AsrWorkerClient::start_at` → hello → loadを使うので、
+実workerのジョブもここで検査される。spawn / hello自体はGPU sessionを作らない。
+
+VLM/ASR共通の `worker_gpu::{inventory,probe_inventory,system_vulkan_loader_available}` は
+DLLの確認、DXGI列挙とworkerの `--list-devices` による情報照会である。
+workerの `Inventory` とggml Vulkanの列挙・properties/memory照会まで追い、Vulkan instanceと
+physical-device情報だけで、logical device / backend sessionを作らないことを確認した。
+既存VLMと同じく列挙には検査を追加しない。T1/T2のASR transportと作成ジョブのテストは
+既知の同じfake workerを使い、抽出・後処理・DB・検索はASRの実GPU推論を開始しない。
+
+ただしT1/T2で加わった次のsnapshot 10件は、共通 `test_ui` のLazyRendererから実wgpu deviceを
+作る。masterの一覧には無かったためgpu groupへ追加した。CPUだけの表示・入力・状態テストを
+module単位で巻き込まず、次の完全名だけを選ぶ。max-threads=2、timeout・priority・retryは変更しない。
+
+- `global_search_ui::transcript_target_ui_tests::transcript_search_target_combo_handler_and_dark_light_snapshots`
+- `transcript_panel::tests::transcript_panel_snapshots`
+- `ui_dialogs::about::tests::ai_worker_credits_snapshot_light_and_dark`
+- `ui_dialogs::asr_addon::tests::asr_setup_confirm_snapshot`
+- `ui_dialogs::transcript_delete::tests::transcript_delete_confirm_snapshot`
+- `ui_dialogs::transcript_job::tests::transcript_progress_snapshot`
+- `ui_music_panels::transcript_session_tests::music_transcript_panels_{dark,light}_snapshot`（2件）
+- `video::native_presenter::overlay_draw::tests::native_transcript_panels_{dark,light}_snapshot`（2件）
+
+区切り9の焦点検査は、共有runner経由の
+`cargo nextest run -p mimageviewer --lib -E 'test(/asr|transcript|vlm_worker|caption_job|test_gpu_group/)'`
+（成功stdout保存の指定を付加）で **245件成功、失敗0、10.571秒**。
+ASR / VLM fake、作成ジョブ、所属の純粋な検査、文字起こしsnapshotを含む。
+実行ログは `target/asr-chunk9/focused.log`。全件・製品起動・commitは行っていない。
+
+焦点filter外のAboutは
+`cargo nextest run -p mimageviewer --lib -E 'test(=ui_dialogs::about::tests::ai_worker_credits_snapshot_light_and_dark)'`
+を同じ共有runnerから実行し、**1件成功、2.606秒**。PNGの更新はない。
+`cargo nextest show-config test-groups --verbose -p mimageviewer --lib --groups gpu --no-pager` と
+`cargo nextest list -p mimageviewer --lib --message-format json` を共有runnerから実行し、
+同じ現在のテスト一覧へ現行設定・変更前設定を適用して照合した（default features）。
+gpu所属は **294 → 304件**、追加は上記10件だけ、削除0。TOMLの構造比較でも所属filter以外の
+設定値が不変で、max-threads=2を確認した。検査結果は `target/asr-chunk9/group-verification.json`、
+一覧とログも同所。fakeのASR推論テストはgroupへ追加していない。
 
 ## 新しく所属させるテスト
 
@@ -249,3 +293,76 @@ priority 100を先行、同順位は過去の開始順とし、GPU満杯でも�
 1枠の見込みは指定最新記録で約0.27分延びる。
 build・integration・vendor・競合減少によるtestcase時間の変化を含まない予測であり、
 全件の実所要・停止原因・2枠での停止予防効果は未確認。上限を増やす負荷実験はしない。
+
+## §1.767 ブランチの推移的caller登録（2026-11-16）
+
+`feat-767-stage2` のmaster取り込み `5975008e4`／`82b883c40` 後、設計担当の本体lib全件
+`20261116T112427019Z-6a76bc41` で21件が所属検査により失敗した。
+テスト本体・製品・検査入口を変えず、既存gpu inventoryへ完全名に固定したregex／equalityを追加する。
+混在module全体や `realmachine50_` 全体は選ばない。`gpu.max-threads = 2`、global並列数、
+retry／timeout／priority、既存overrideの継承とignoreは維持する。
+
+| callerのまとまり | 追加件数 | device生成へ至るhelper／理由 |
+| --- | ---: | --- |
+| `book_composition_permission::tests::realmachine50_composition_*` の対象3件 | 3 | `realmachine50_composition_open_recheck` → `depth_view_tests::install_pages`。継続／hidden判定前に生成 |
+| `depth_view_tests` の独立close／park・main handoff・readonly entry・snapshot activation | 6 | `install_pages`／`renderer`。状態検査だけに見える場合もWindowsでdeviceを作る |
+| `multiwindow_depth_accepted_(folder\|pdf\|zip)_transition_*` | 3 | `depth_accepted_transition_case` → `install_pages` |
+| `multiwindow_depth_independent_*` の対象3件 | 3 | `independent_depth_dialog_scenario` → `RootDepthViewer::new` → `install_pages` |
+| `multiwindow_depth_paused_last_active_resume_close_does_not_register_passive_again` | 1 | `install_pages` の直接呼出し |
+| `startup_ops::tests::realmachine50_*` のbookmark対象3件 | 3 | `install_pages`直接／`realmachine50_live_depth_owner_fixture`経由。取消・staleでも先にfixtureを作る |
+| smart-folderのforeign ZIP／startup restoreのwarm PDF | 2 | 両方の旧owner fixtureで `install_pages` |
+
+既存inventoryと同じ形式の9行で21件を追加した。名前実行のfilterは設定のregexから作らず、
+要求21件を完全名の `test(=...)` ORとして別に固定する。
+
+追加漏れの監査では、`depth_view_tests::{renderer,install_pages}`、`isolate_depth_renderer`、
+`RootDepthViewer::{new,linked}`、`DepthWaitViewerFixture::new` からhelper呼出し元を追った。
+12のソース範囲の通常test 118件と、`depth_dialog_owner_scenario!` の展開名12件を照合した。
+既存分も含む計130件で、修正前の未登録は要求21件だけ、修正後は0件。
+`install_ready_depth_for_export`／`record_ready_display` の他module callerも確認した。
+全件で失敗しなかったcallerも含め、`depth_setup_entry_tests`、`depth_export::main_window_tests`、
+`depth_main_window_tests` の追加／既存testは既存module prefixで所属し、dialog macro12件も登録済みだった。
+master側merge parentとの差分のdevice生成・実renderer／snapshot呼出しも調べ、
+このブランチから追加された別のGPU到達テストの漏れは見つからなかった。
+監査集合とcall-siteは `target/gpu-767-caller-audit.json`／`target/gpu-767-call-sites.txt`。
+
+対照として、Parked clickの3D状態fixtureは `DepthViewState` のみで実rendererを持たず、
+`SourceDragHarness` はNoDisplayのegui-winit State／Context／CPU headless paintだけを使う。
+native入力のfake allocation／disconnected playerや、PDF epoch等の `snapshot()` も実device生成ではない。
+これらを名前の類似だけでGPU所属にしない。未知のAPIを含む網羅保証や、group外の全実行を行った
+という意味ではない。取り込み後の全件gateは設計担当が実施する。
+
+### 検証結果
+
+対象は `82b883c40` ＋今回の設定差分。すべて共有 `run-heavy.ps1` 経由、
+Owner `codex/767-gpu-group`、WorkDir `G:/home/mimageviewer-767s2`、直列実行。
+共有全件ロックが続いたため待機し、取得済みの変更前／全一覧は再利用して、残りを
+`target/gpu-767-remaining.ps1` の1wrapperへまとめた。テストの再試行はしていない。
+lock／G: TEMPに書けない警告後はrunner既定のBelowNormal／6 build jobs／既定TEMPで継続した。
+
+| コマンド | 件数／確認 | exit |
+| --- | --- | ---: |
+| `cargo nextest list -p mimageviewer --lib --config-file target/gpu-767-before.toml --run-ignored all -E 'group(gpu)' --message-format json` | 変更前gpu 318件 | 0 |
+| `cargo nextest list -p mimageviewer --lib --run-ignored all --message-format json` | 一覧18,208件（実行しない） | 0 |
+| `cargo nextest list -p mimageviewer --lib --run-ignored all -E 'group(gpu)' --message-format json` | 変更後gpu 339件 | 0 |
+| `cargo nextest show-config test-groups -p mimageviewer --lib --groups gpu --no-pager` | 指定21件の所属・max threads = 2 | 0 |
+| `cargo nextest run -p mimageviewer --lib -E $requestedFilter --no-fail-fast --test-threads 4` | 指定21件全成功、19.126秒 | 0 |
+| `cargo fmt` | 最後のCargo操作、引数なしで成功 | 0 |
+
+`$requestedFilter` は `Get-Content -Raw -Encoding UTF8 target/gpu-767-exact-filter.txt` で読む、
+固定21完全名の `test(=...)` OR。名前リストは `target/gpu-767-requested.txt`。
+設定の追加regexをそのまま実行filterに流用していない。
+
+binary ID＋完全名で前後集合と実一覧を照合し、追加は指定21件だけ、削除0、余分なCPU追加0。
+21件のignoredは0、監査した130 callerも全件gpu所属。gpu件数318／339はignoredを含む一覧の件数。
+`target/gpu-767-verification.json` に集計を保存した。
+JUnitは実行21件と指定名の集合が一致し、failure／errorは0。
+`report-skipped = all` による非実行18,187件のmetadataは、実行件数へ含めない。
+区間の素の集計はミリ秒丸めにより最大1msの3重なりが出るが、その精度以内を除く最大は2。
+実行時の設定表示も2枠であり、制限値の変更や負荷を増やす試験はしていない。
+
+証跡は `target/gpu-767-{before,all,group}-list.json`、各同名log、
+`gpu-767-show-group.log`、`gpu-767-requested-run.log`、`gpu-767-requested-junit.xml`、
+`gpu-767-fmt.log`、`gpu-767-remaining-wrapper.log`（いずれもtarget配下）。
+変更ファイルは本書と `.config/nextest.toml` の2件だけ。
+テスト本体・製品・vendorは変更せず、全件テスト・製品起動・build-dev・commit／pushは実施していない。

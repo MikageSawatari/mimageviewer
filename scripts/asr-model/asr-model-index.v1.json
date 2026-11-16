@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "model_id": "whisper-large-v3-turbo-q5_0-394221709cd5",
+  "files": [
+    {
+      "name": "ggml-large-v3-turbo-q5_0.bin",
+      "kind": "model",
+      "bytes": 574041195,
+      "sha256": "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
+      "license": "MIT",
+      "parts": []
+    },
+    {
+      "name": "LICENSE",
+      "kind": "license",
+      "bytes": 1063,
+      "sha256": "b5d65a59060e68c4ff940e1eddfa6f94b2d68fdf58ed7f4dd57721c997e35e9d",
+      "license": "MIT",
+      "parts": []
+    },
+    {
+      "name": "NOTICE",
+      "kind": "notice",
+      "bytes": 849,
+      "sha256": "7df49a85c703ce7fa49b0f40b0cda977c274ef5732907803c1a646ce65268453",
+      "license": "MIT",
+      "parts": []
+    }
+  ]
+}

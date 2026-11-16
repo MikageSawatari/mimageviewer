@@ -89,11 +89,66 @@ impl MediaTimeline {
         (self.media_to_raw_secs(media_secs) * f64::from(time_base.denominator())
             / f64::from(time_base.numerator())) as i64
     }
+
+    /// 音声filterへ渡す整数PTSも同じ原点で変換する。原点0では丸めず恒等に保つ。
+    pub(crate) fn raw_stream_ticks_to_media(self, raw: i64, time_base: Rational) -> Option<i64> {
+        if self.origin_av_time_base == 0 {
+            return Some(raw);
+        }
+        if time_base.numerator() <= 0 || time_base.denominator() <= 0 {
+            return None;
+        }
+        // AVFormatContextの整数原点をstreamのtickへ丸める。秒のf64往復はしない。
+        let origin_ticks = unsafe {
+            ffmpeg_the_third::ffi::av_rescale_q(
+                self.origin_av_time_base,
+                ffmpeg_the_third::ffi::AVRational {
+                    num: 1,
+                    den: ffmpeg_the_third::ffi::AV_TIME_BASE,
+                },
+                ffmpeg_the_third::ffi::AVRational {
+                    num: time_base.numerator(),
+                    den: time_base.denominator(),
+                },
+            )
+        };
+        raw.checked_sub(origin_ticks)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcript_integer_audio_pts_share_media_origin_and_preserve_preroll() {
+        let timeline = MediaTimeline::from_demuxer_start("mpegts", 36_001_378_667);
+        let ticks = Rational(1, 90_000);
+        assert_eq!(
+            timeline.raw_stream_ticks_to_media(3_240_124_080, ticks),
+            Some(0)
+        );
+        assert_eq!(
+            timeline.raw_stream_ticks_to_media(3_240_124_080 + 360_000, ticks),
+            Some(360_000)
+        );
+        assert_eq!(
+            timeline.raw_stream_ticks_to_media(3_240_124_079, ticks),
+            Some(-1)
+        );
+        assert_eq!(timeline.raw_stream_ticks_to_media(i64::MIN, ticks), None);
+        for name in ["matroska,webm", "mov,mp4,m4a,3gp,3g2,mj2", "mp3"] {
+            let identity = MediaTimeline::from_demuxer_start(name, 10_000_000);
+            for raw in [i64::MIN, -1, 0, 208_000, i64::MAX] {
+                assert_eq!(
+                    identity.raw_stream_ticks_to_media(raw, Rational(1, 16_000)),
+                    Some(raw)
+                );
+            }
+        }
+        let negative = MediaTimeline::from_demuxer_start("mpegts", -4_621_333);
+        assert_eq!(negative.raw_stream_ticks_to_media(-415_920, ticks), Some(0));
+    }
 
     #[test]
     fn demuxer_policy_does_not_follow_discontinuity_flag_or_positive_start() {

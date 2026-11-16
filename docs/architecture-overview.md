@@ -1,5 +1,24 @@
 # アーキテクチャ概観
 
+## ローカル文字起こし（T1 区切り3）
+
+VLM worker と同じ exe の ASR 役割が、whisper.cpp v1.9.5 を llama.cpp の ggml 上で使う。
+`ai::worker_transport` / `ai::worker_gpu` が実行ファイル・framing・起動・列挙を共有し、
+`ai::asr_worker` と既存の VLM client は独立したプロセスと状態を所有する。
+`asr_addon` は共通の `addon::ModelAddon` に ASR の index 契約と保存先を与える。
+Appの単一 `TranscriptJob` が受付とRunning/Stoppingを所有し、`transcript_job_worker` が
+FFmpegの逐次抽出・ASR pipeの並列送受信・後処理・署名再確認を伴う保存を実行する。
+`transcript.db` は1本1行の独立storeで、STORES経由の改名・削除・復元とmetadata転送に参加する。
+表示cacheの種類はstore descriptorで宣言し、確定した変更でApp共通の `TranscriptDisplayCache` を消す。
+単一readerがDB/署名を読み、世代照合後のArc区間を共通snapshotにまとめる。
+native動画の左3タブ、音楽ビューの左2タブは `transcript_panel` の全文折返し一覧を共有し、右には状態1行だけを出す。
+本文とjob案内は別に保持し、実再生のapplied trackから別trackを導く。panelのscroll/followは各sessionが所有する。
+抽出は自身のInputの `MediaTimeline` でメディア時刻0へそろえ、保存・強調・seekで同じ時刻を使う。
+表示側の原点変換や原点待ちは持たず、既存seekの範囲制限を共用する。
+MCP・検索は後続。
+[計画](local-asr-transcript-plan.md)、[区切り1](local-asr-t1-chunk1-report.md)、
+[区切り2](local-asr-t1-chunk2-report.md)、[区切り3](local-asr-t1-chunk3-report.md) を参照。
+
 ## 製本した本の管理順（§1.683）
 
 `book_order`が本棚直下の`mimageviewer.book-order.json`を読み、名前順または手動順を解決する。既存の本・設定の保存形式は維持する。`app/book_shelf`はApp共通のroot/選択epoch/表示revision付きsnapshotと型付き読込・保存・未保存phaseを所有し、番号・固定集合・追加先候補を同じrowsから導く。Remoteは共通reader/resolverで保存済み順を読む。順序読取異常は名前順＋書込停止で原本を保持する。閲覧contextのitems・cache・generation・channelは変更しない。[設計と検証](book-order-plan.md)。
@@ -175,6 +194,12 @@ IME helperが予約を描画前の実フォーカスへ渡し、本体facadeが�
 検索履歴の記録は共通 submit の受付と、App update の一箇所で直前 pass の検索入力フォーカスから判定する通常離脱だけ。
 非同期結果の到着や個々の欄の lost_focus では記録しない。ログ・Remote・MCPの出力境界には履歴を公開しない。
 詳細は [入力履歴の設計](search-input-history-plan.md)。
+
+§1.768 の単一行編集メニューは、IME と同じ Context pre-input 境界で捕捉した viewport / pass / retained popup ID を共用する。
+親の eligibility と対象メニューの claim は同じ snapshot を読み、helper 到達時の Memory や描画済み popup から所有者を再推測しない。
+既に開いていたメニューを Esc で閉じた場合だけ、履歴と共通の下位処理で egui/native の対応キーを claim する。
+同フレームに開いて閉じたメニューは親へ Esc を残し、次 pass へ所有状態を持ち越さない。
+App の pending field、worker、永続設定は追加しない。
 
 ## PDF render epochのviewer-context所有（§1.377）
 
@@ -630,8 +655,9 @@ GPU 情報・ドライバー・段階・エラー行・試行履歴と条件付�
 | `ViewerContextBundle` (app.rs) | ビューア文脈の状態束。active detached (独立 / Book) と parked live 窓は bundle swap で mount/unmount する。現行仕様に pin はない。通常画像の always-new grid open も open 前に `DetachedPhysical` active bundle へ昇格し、main の検索・選択・スクロールから分離する。仮想一覧由来でも backing `items` は複製せず、通常フォルダは bundle-owned worker scan、ZIP/PDF は既存 enumerate worker で完全な物理一覧を構築し、対象 leaf を新しい物理 index へ解決する。folder-nav pending、PDF/ZIP enumerate、nav lock generation、遅延 nav intent、holdover texture、ページ寸法の generation 付き CPU cache も context-owned。thumb channel / cancel_token / ワーカーキュー / keep-range atomic の「ロード複合体」も per-context (v2.3.0、bundle Drop が worker pool を畳む)。swap前後のApp-global rating session差分は各context cacheへ同期するが、ownership交換自体はnavigationではないためfacet scope / suppressionを変更しない |
 | detached open request state (app.rs) | 通常画像のscan、ZIP/PDF enumerate、protected PDFのpassword request・session password・保存予約、明示leafの`Required` targetをbundle内に保持する。グリッドのFolderはmain-owned worker scanで「候補」を先に分類し、画像本と確定したcompleted scanだけをdetached contextへ移譲する。混在Folderはsession/runtimeを作らず通常main navigationへ戻す。password dialogはowner bundleをmountして再開する。空／error／必須target消失でviewportが未生成でも共通terminal closeがsession finishとwindow runtime削除を行う。実フォルダscan errorは空一覧と区別し、catalogへ適用しない |
 | `ViewerSession` (`app/viewer_session.rs`) | 退避中 bundle の表示先・同期 stamp・独立 detached 状態・window ID を一括所有する。現在表示中の session は当面 `App` の既存フィールドへマウントし、`swap_with_mounted` で5項目を同時交換する |
-| `DetachedWindowManager` (`app/detached_window_manager.rs`) | 窓ごとの HWND / placement / 状態遷移 (`Opening/Active/Parked/ParkedLive/Resuming/Closing`) と activation watcher を一元管理する。passive window は window collection / frozen 表示上の役割であり、runtime state 名ではない。`ViewerSession` の意味状態とは分離する |
-| `dwm_transitions.rs` | DWM トランジション抑止 + UI スレッド窓 snapshot (HWND を生成イベントの before/after 差分で同定 = rect 一致捕捉の全廃、BA-1 根治) + 仮想デスクトップ移動 |
+| `DetachedWindowManager` (`app/detached_window_manager.rs`) | 窓ごとの HWND / placement / 状態遷移 (`Opening/Active/Parked/ParkedLive/Resuming/Closing`) と activation intent を一元管理する。Parked静止画はcallbackの完結したclick/tap、non-clientは確定HWNDのnative input owner、mediaは既存native入力から離散要求を送り、rootの同じcommitで復帰する。level polling watcherは撤去。passive windowはwindow collection / frozen表示上の役割で、runtime state名ではない。`ViewerSession` の意味状態とは分離する |
+| `dwm_transitions.rs` | DWM トランジション抑止・窓状態の観測・仮想デスクトップ移動。入力 HWND の所有は決めない |
+| `eframe::native_window_input` / `key_input.rs` | backend の native allocation が root / child の HWND と viewport の唯一の正本。backend 所有 lease が key subclass・入力対応・未配送 native 入力を同期退役し、旧 WindowId の配送対応を撤去してから後継を公開する。App の detached host はこの対応を参照し、rect や列挙差分では同定しない |
 | `app/native_video.rs` | F12 host migration / source-swap / 動画→音声モード enter/exit など、native 動画 presenter と detached 窓の接続層 |
 
 ★固定の `snapshot`、評価 filter の一時解除 anchor、Ctrl+S / Ctrl+G 由来の synthetic
@@ -641,9 +667,32 @@ context は空から始める。snapshot が `items` を直接交換するとき
 `thumbnails` / `image_metas` と Details の order / prewarm / metadata pending も同じ generation
 境界で交換・失効・再構築する。
 
-BA-1 の不変条件は geometry 非依存の HWND 所有である。detached host 登録は registry 化済みだが、
-キー入力 subclass に rect 選択が残る具体的な仕様違反は
-[v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) に記録されており、後続リワークへ引き継ぐ。
+BA-1 の不変条件は geometry 非依存の HWND 所有である。依頼50 Cでは、
+[v2.8.1 detached 監査](review-v2.8.1/s2-detached.md) で残っていた入力用 rect 選択も撤去する。
+Wgpu / Glow の生成・再生成・GC・終了を同じ native allocation lease へ接続し、
+logical viewport の RawInput / IME の保持とは寿命を分ける。immediate 生成の hook は
+App に再入せず共有入力 owner だけを変更する。仮想デスクトップ同期など入力以外の rect 利用は残る。
+App の host cache は backend lease の撤去で失効する Weak owner を参照し、同じ HWND 数値を再利用した別 allocation を区別する。
+
+依頼50 Aのclient復帰は、egui-winitが実際にraw inputを追加する時点のParked input ownerへ結び付く。
+Active時に蓄積した入力を新deferred callbackへ再所属させないため、opaqueなproof IDを非操作の
+`Event::PointerInputProvenance`としてStartと同じ列に置く。callbackのgesture ownerだけが同ID／scopeを照合し、
+完了したprimary click／long press／drag・単指touchをactivation intentへ送る。
+復帰操作は終端まで消費してページ送り／パンへ再配送しない。State再生成時の保留RawInput・IME終端は一括clearせず保持する。
+Windowsのegui-winit Stateは最後のCursorMovedの物理位置を保持し、CursorLeftではlogical位置だけを消す。
+同座標再入でwinitがCursorMovedを省略しても、CursorEnteredで現在の実効倍率へ戻す。
+新native allocationのStateは履歴なしで始まり、touchのlogical位置清掃や兄弟viewportと履歴を共有しない。
+Stateがforwardした実mouse押下は、CursorLeft後の位置なしUpでも
+`Event::PointerButtonReleased`で一度だけ終わる。古い座標のclickやhoverは作らず、
+eguiの保持・observer・callbackと各command ownerのrelease順序を同じraw終端へ揃える。
+releaseの位置資格はeguiのcanonical列に保持し、停止Response／drop／独自recognizerは
+その実点だけを使う。位置なし終端は保持清掃だけで、操作認可の例外はParked復帰に限る。
+受理済みdropと同frameの新heldは同一plugin内の別操作として扱い、互いの終端を流用しない。
+caption buttonは解放時のhitとOSの選択確定を同native ownerで扱い、途中のmotionでは取り消さない。
+vendorの入力診断Infoは専用の正確な2targetだけが製品の非同期通常sinkへ届く。
+logical targetはその窓のregistrationの終端／Manager dropで退役し、native allocationの再生成では維持する。
+既に egui に渡した synthetic Primary は通常入力境界で対象 button / widget の所有だけを一度取り消し、通常の click / drag 完了を発生させない。
+synthetic keyもlogical registration／key単位で終端権限を持ち、physical Downへの移譲後は旧repeat／Upで保持を再取得・解除しない。
 
 ### 補正 / 編集 / AI
 
@@ -779,7 +828,8 @@ detachedは既存の共通パネルを使い、述語・viewport・bundleの交�
 | `search_index_db.rs` | Ctrl+S 用 `search_index.db` (お気に入り配下のフォルダ / ZIP / PDF / 動画名) |
 | `fts_index.rs` | Tantivy 0.26 ラッパ。`IndexDoc` / `Fields` / `QueryFilters` / `build_bigram_and_query` / `search_page`。bigram tokenizer + lower_caser |
 | `fts_meta.rs` | `fts_meta.db` (SQLite) ラッパ。ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たない (Tantivy STORED に集約) |
-| `ingest_text.rs` | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / sidecar、旧 tags は移行専用) のビルダー |
+| `ingest_text.rs` | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / sidecar / ai_caption / transcript、旧 tags は移行専用) のビルダー |
+| `derived_text.rs` | `STORES` に登録した索引用の派生テキスト（AI 説明文・文字起こし）の読取、範囲内の反映待ちと revision 一致による確認を共用する。既存の索引 worker 上で使う |
 | `ingest_worker.rs` | メタ抽出 + Tantivy buffer + バッチ commit + commit 成功フレームでのみ SQLite を更新 (Tantivy First 書き込み順序) |
 | `indexer_manager.rs` | 全お気に入りの `SupervisorHandle` 統括。アイテム索引または別バージョン索引が有効なお気に入りごとに 1 本だけ立て、Ctrl+G ワーカー spawn、App drop 時の停止を担う |
 | `indexer_supervisor.rs` | お気に入り単位の共有 supervisor。初期メタ走査 + FsWatcher + ingest を担い、同じ watcher の変更通知を別バージョン索引の差分照合にも渡す |
@@ -1196,3 +1246,9 @@ App の発行境界で寿命とnative fadeを確定して、既存 toast state �
 libavif / dav1d / libyuv をリンクする。safe Rust APIが予算検査・RGBA8確保・表示変換と
 画素を確保しない寸法解析を所有し、core / Remote / EPUBで共用する。`avif_decoder` は本体のperf/ログ層。`image_decode` は形式選択と WIC 接続、使用デコーダと向き状態を共有する。
 worker・queue・context owner・永続 schema は追加しない。
+
+## App の低頻度状態の保持
+
+`App` のインライン領域は `app::tests::history_transition_storage_keeps_app_stack_footprint_bounded` で上限110,000バイトを保つ。大きな低頻度状態は、描画や入力の hot な状態と混ぜず、既存ownerのままヒープに置く。
+`export_dialog` と `book_reorder` はダイアログを開くときだけ `Option<Box<...>>` を作り、描画中の take／再挿入では同じBoxを保持する。書き出しは検証を通った開始時にだけ中身をworker要求へ移す。
+`settings_restore_state` はApp生成時に一度だけBoxを確保する。非表示中の完了poll・取消・終了処理は維持し、状態のリセットはBoxの中身へ代入する。毎フレームの再確保や初期化の先送りは行わない。

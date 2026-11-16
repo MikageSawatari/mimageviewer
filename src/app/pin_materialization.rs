@@ -162,7 +162,8 @@ impl Request {
         let mut deletes: HashSet<_> = map
             .keys()
             .filter(|key| {
-                prefixes.iter().any(|prefix| key.starts_with(prefix)) && !retained.contains(*key)
+                prefixes.iter().any(|prefix| key.starts_with(prefix))
+                    && !crate::thumbnail_cache_key::inventory_retains_key(&retained, key)
             })
             .cloned()
             .collect();
@@ -280,5 +281,128 @@ impl Request {
             replacement: Some(Arc::new(RwLock::new(map))),
             identity: self.identity,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::folder_thumb_pins::{FolderPin, FolderPinSource};
+
+    #[test]
+    fn epub_pin_retention_prepares_private_map_and_preserves_sibling_and_cancelled_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let epub = tmp.path().join("book.epub");
+        let sibling = tmp.path().join("sibling.epub");
+        let item = GridItem::PdfFile(epub.clone());
+        let pins = HashMap::from([(
+            crate::path_key::normalize_keep_drive(&epub),
+            FolderPin::from(FolderPinSource::PdfPage {
+                pdf_rel: String::new(),
+                page: 2,
+            }),
+        )]);
+        let inventory = super::super::folder_thumb_existing_keys_for(
+            &item,
+            Some((123, 456)),
+            &pins,
+            None,
+            Some(crate::settings::SortOrder::Numeric),
+            3,
+            false,
+        );
+        let pending = inventory.iter().find(|key| key.contains("#pin:")).unwrap();
+        assert!(pending.ends_with("|generation-pending|generation-pending"));
+        let first = format!("{pending}|generation:17:4096");
+        let second = format!("{pending}|generation:18:8192");
+        let removed = first.replace("|-|2|", "|-|3|");
+        let sibling_key = "pdfthumb:sibling.epub#pin:pdfpage||-|3|generation-pending|generation-pending|generation:19:12288";
+        let catalog = Arc::new(CatalogDb::open(&tmp.path().join("catalogs"), tmp.path()).unwrap());
+        for key in [
+            first.as_str(),
+            second.as_str(),
+            removed.as_str(),
+            sibling_key,
+        ] {
+            catalog
+                .save(
+                    key,
+                    17,
+                    4096,
+                    8,
+                    12,
+                    None,
+                    b"opaque pixels",
+                    &CoverIdentity::Legacy,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
+                )
+                .unwrap();
+        }
+        let live = Arc::new(RwLock::new(catalog.load_all().unwrap()));
+        // Another context can still hold the old map; preparation must not mutate it.
+        let sibling_context = live.clone();
+        let identity = Identity {
+            cache: Some(Arc::as_ptr(&live) as usize),
+            catalog: Some(Arc::as_ptr(&catalog) as usize),
+            sort: crate::settings::SortOrder::Numeric,
+            depth: 3,
+            full_path: false,
+        };
+        let make_request = || Request {
+            rows: vec![
+                Row {
+                    index: 0,
+                    item: item.clone(),
+                    metadata: Some((123, 456)),
+                    container: epub.clone(),
+                    dependency_root: epub.clone(),
+                },
+                Row {
+                    index: 1,
+                    item: GridItem::PdfFile(sibling.clone()),
+                    metadata: Some((123, 456)),
+                    container: sibling.clone(),
+                    dependency_root: sibling.clone(),
+                },
+            ],
+            identity,
+            cache: Some((live.clone(), catalog.clone())),
+            scope: CurrentViewRefresh::Pins {
+                folders: HashSet::from([epub.clone()]),
+                videos: HashSet::new(),
+            },
+        };
+        assert!(
+            make_request()
+                .prepare(vec![0, 1], &pins, None, None, &AtomicBool::new(true))
+                .is_none()
+        );
+        assert!(catalog.load_one(&removed).unwrap().is_some());
+        assert_eq!(live.read().unwrap().len(), 4);
+
+        let prepared = make_request()
+            .prepare(vec![0, 1], &pins, None, None, &AtomicBool::new(false))
+            .unwrap();
+        assert!(prepared.matches(identity));
+        let other_identity = Identity {
+            cache: Some(0),
+            ..identity
+        };
+        assert!(!prepared.matches(other_identity));
+        assert_eq!(prepared.reset_indices, vec![0]);
+        let replacement = prepared.replacement.unwrap();
+        assert!(!Arc::ptr_eq(&live, &replacement));
+        let replacement = replacement.read().unwrap();
+        assert_eq!(replacement.len(), 3);
+        for key in [first.as_str(), second.as_str(), sibling_key] {
+            assert!(replacement.contains_key(key));
+            assert!(catalog.load_one(key).unwrap().is_some());
+        }
+        assert!(!replacement.contains_key(&removed));
+        assert!(catalog.load_one(&removed).unwrap().is_none());
+        let sibling_context = sibling_context.read().unwrap();
+        assert_eq!(sibling_context.len(), 4);
+        assert!(sibling_context.contains_key(&removed));
+        assert!(sibling_context.contains_key(sibling_key));
     }
 }

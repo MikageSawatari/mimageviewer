@@ -1298,6 +1298,7 @@ fn resume_refusal_composed_fallback_saves_canonical_first_page_position() {
         .unwrap();
     adopt(&mut env, &service, &scope);
     let outcome = env.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
@@ -1378,6 +1379,7 @@ fn g3_initial_deferred_entry_waits_for_projection_then_opens_first_visible_real(
         env.fullscreen_idx = None;
         env.selected = None;
         let outcome = env.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -1430,6 +1432,7 @@ fn g3_composition_poll_cannot_consume_source_owned_deferred_reopen() {
             rx: source_receiver,
         });
         let deferred = DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -1465,6 +1468,7 @@ fn g3_source_terminal_reopen_survives_automatic_projection() {
     env.fullscreen_idx = None;
     env.selected = None;
     let outcome = env.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
@@ -1506,6 +1510,7 @@ fn startup_notices_book_wait_escape_and_close_retire_reopen_before_late_completi
             let (service, owner) = runtime(&mut env, &data);
             save(&service, &scope, ReadingDirection::Ltr);
             let deferred = DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
@@ -1640,6 +1645,7 @@ fn g3_source_terminal_required_hidden_or_missing_target_never_uses_another_page(
         // cannot select a replacement page. Projection itself remaps this row.
         env.selected = Some(3);
         let deferred = DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::Required(crate::snapshot::SnapshotTarget::PdfPage {

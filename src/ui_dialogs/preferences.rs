@@ -289,6 +289,7 @@ mod immediate_agent_permission_tests {
             app.settings.agent_show_thumbnails = true;
             app.settings.agent_show_gps = true;
             app.settings.agent_show_ai_captions = true;
+            app.settings.agent_show_transcripts = true;
             assert!(app.settings.save_checked());
             if apply {
                 app.apply_preferences_dialog(&egui::Context::default());
@@ -302,10 +303,11 @@ mod immediate_agent_permission_tests {
             );
             assert!(app.settings.agent_show_thumbnails && app.settings.agent_show_gps);
             assert!(app.settings.agent_show_ai_captions);
+            assert!(app.settings.agent_show_transcripts);
             let (saved, _) =
                 crate::settings_db::with_db_result(|db| db.load_agent_permission()).unwrap();
             assert_eq!(saved.level, crate::settings::AgentLevel::Organize);
-            assert!(saved.thumbnails && saved.gps && saved.ai_captions);
+            assert!(saved.thumbnails && saved.gps && saved.ai_captions && saved.transcripts);
         }
     }
 }
@@ -2466,6 +2468,7 @@ pub(crate) fn prepare_preferences_settings_for_commit(
     edited.agent_show_thumbnails = live.agent_show_thumbnails;
     edited.agent_show_gps = live.agent_show_gps;
     edited.agent_show_ai_captions = live.agent_show_ai_captions;
+    edited.agent_show_transcripts = live.agent_show_transcripts;
     edited.remote_service_enabled = live.remote_service_enabled;
     edited.route_preferences_view_state(standard_view_state, active_view_state);
 

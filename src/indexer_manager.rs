@@ -82,7 +82,7 @@ pub struct IndexerManager {
     excluded_roots: Vec<std::path::PathBuf>,
     /// 再構成 worker が supervisor ハンドルと構成 snapshot を所有する。
     runtime: crate::metadata_reconfiguration::Runtime,
-    caption_epoch: Arc<AtomicU64>,
+    derived_text_epoch: Arc<AtomicU64>,
     startup_diag: StartupDiag,
     reporter: Arc<crate::fts_integrity::FailureReporter>,
 }
@@ -468,12 +468,14 @@ impl IndexerManager {
         if let Some(p) = progress.as_ref() {
             p("アイテム索引を整理中…");
         }
-        let caption_epoch = Arc::new(AtomicU64::new(0));
+        let derived_text_epoch = Arc::new(AtomicU64::new(0));
         let runtime_spawn = span(Lane::Indexer, Stage::IndexerMetadataSpawn);
         let runtime_result = crate::metadata_reconfiguration::Runtime::start(
             crate::metadata_reconfiguration::Stores {
-                caption_epoch: Arc::clone(&caption_epoch),
-                caption_db_path,
+                derived_text_epoch: Arc::clone(&derived_text_epoch),
+                derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                    caption_db_path,
+                ),
                 meta: Arc::clone(&meta_db),
                 fts: Arc::clone(&fts),
                 writer: Arc::clone(&writer),
@@ -506,7 +508,7 @@ impl IndexerManager {
             excluded_roots,
             runtime,
             reporter,
-            caption_epoch,
+            derived_text_epoch,
             startup_diag: StartupDiag {
                 io_permits: permits,
                 ..StartupDiag::default()
@@ -515,13 +517,13 @@ impl IndexerManager {
         Some(mgr)
     }
 
-    /// Publish only after a committed change to caption contents; no I/O or channel send.
-    pub fn notify_caption_changed(&self) {
-        self.caption_epoch.fetch_add(1, Ordering::Release);
+    /// Publish only after a committed derived text change; no I/O or channel send.
+    pub fn notify_derived_text_changed(&self) {
+        self.derived_text_epoch.fetch_add(1, Ordering::Release);
     }
 
-    pub fn caption_epoch(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.caption_epoch)
+    pub fn derived_text_epoch(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.derived_text_epoch)
     }
 
     /// 起動 overlay を閉じた後に呼ぶ。`fts_meta.db` の housekeeping (VACUUM) を
@@ -947,11 +949,13 @@ mod tests {
         similar: Option<crate::similar_index::SimilarIndexNotifier>,
     ) -> IndexerManager {
         let reporter = crate::fts_integrity::FailureReporter::new(Arc::clone(&meta));
-        let caption_epoch = Arc::new(AtomicU64::new(0));
+        let derived_text_epoch = Arc::new(AtomicU64::new(0));
         let runtime = crate::metadata_reconfiguration::Runtime::start(
             crate::metadata_reconfiguration::Stores {
-                caption_epoch: Arc::clone(&caption_epoch),
-                caption_db_path: crate::ai_caption_db::CaptionDb::db_path(),
+                derived_text_epoch: Arc::clone(&derived_text_epoch),
+                derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                    crate::ai_caption_db::CaptionDb::db_path(),
+                ),
                 meta: Arc::clone(&meta),
                 fts: Arc::clone(&fts),
                 writer: Arc::clone(&writer),
@@ -970,7 +974,7 @@ mod tests {
             io_sem: io,
             excluded_roots: Vec::new(),
             runtime,
-            caption_epoch,
+            derived_text_epoch,
             startup_diag: StartupDiag::default(),
             reporter,
         }
@@ -2173,7 +2177,77 @@ mod tests {
     }
 
     #[test]
-    fn caption_epoch_updates_nested_owners_and_full_rescan_drains_without_notification() {
+    fn transcript_derived_text_notifications_reingest_create_delete_import_and_rename() {
+        use crate::derived_text::test_support::{save, stored};
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let root = temp.path().join("media");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("voice.mp3");
+        std::fs::write(&path, b"synthetic").unwrap();
+        let manager = IndexerManager::new_at(
+            &data,
+            &[mk_fav("media", &root, true)],
+            crate::settings::IndexerSpeedProfile::default(),
+            Arc::new(ActivityGate::new(0)),
+            vec![],
+        )
+        .unwrap();
+        wait_until("initial media scan", || {
+            manager.supervisor_count() == 1 && manager.all_supervisors_idle()
+        });
+        let db = crate::transcript_db::TranscriptDb::open_at(data.join("transcript.db")).unwrap();
+        let key = save(&db, &path, Some("created orchard"));
+        manager.notify_derived_text_changed();
+        wait_until("created transcript indexed", || {
+            db.get(&key).unwrap().is_some_and(|row| row.indexed)
+        });
+        assert_eq!(
+            stored(&manager.fts, &key).unwrap().transcript,
+            "created orchard"
+        );
+        db.delete(&key).unwrap();
+        manager.notify_derived_text_changed();
+        wait_until("deleted transcript cleared", || {
+            stored(&manager.fts, &key).is_some_and(|row| row.transcript.is_empty())
+        });
+        let source = temp.path().join("source-data");
+        let source_db =
+            crate::transcript_db::TranscriptDb::open_at(source.join("transcript.db")).unwrap();
+        save(&source_db, &path, Some("imported orchard"));
+        drop(source_db);
+        let cancel = AtomicBool::new(false);
+        let exported =
+            crate::metadata_transfer::export_at(&source, &root, false, &cancel, |_| {}).unwrap();
+        assert_eq!(exported.transcripts, 1);
+        let imported = crate::metadata_transfer::import_at(&data, &root, &cancel, |_| {}).unwrap();
+        assert!(imported.committed.store_mutations.derived_text_changed());
+        manager.notify_derived_text_changed();
+        wait_until("imported transcript indexed", || {
+            db.get(&key).unwrap().is_some_and(|row| row.indexed)
+        });
+        assert_eq!(
+            stored(&manager.fts, &key).unwrap().transcript,
+            "imported orchard"
+        );
+        let new_path = root.join("renamed.mp3");
+        std::fs::rename(&path, &new_path).unwrap();
+        let report = crate::rename_key_migration::run_at(&data, &path, &new_path);
+        assert!(report.store_mutations.derived_text_changed());
+        manager.notify_derived_text_changed();
+        let new_key = crate::transcript_db::TranscriptDb::normalize_path(&new_path);
+        wait_until("renamed transcript indexed", || {
+            db.get(&new_key).unwrap().is_some_and(|row| row.indexed)
+                && stored(&manager.fts, &new_key)
+                    .is_some_and(|row| row.transcript == "imported orchard")
+        });
+        wait_until("old search key removed", || {
+            stored(&manager.fts, &key).is_none()
+        });
+    }
+
+    #[test]
+    fn derived_text_epoch_updates_nested_owners_and_full_rescan_drains_without_notification() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
         let root = tmp.path().join("images");
@@ -2215,7 +2289,7 @@ mod tests {
             .unwrap()
                 == 2
         };
-        manager.notify_caption_changed();
+        manager.notify_derived_text_changed();
         wait_until("both owners reflected caption epoch", indexed);
         let text_for = |key: &str| {
             let searcher = manager.fts.searcher();

@@ -23,7 +23,7 @@ Everythingは別の名前索引から同じSearch surfaceへ結果を供給す�
 | **Ctrl+R** | Everything ファイル名検索 | Everything の構文で実フォルダと対応する実ファイルを探す | Everything の索引範囲（お気に入り外も含む） | worker-only の直接 QUERY2 IPC → 完成dataset → 共通Search prepare/adopt |
 
 - **動画はコンテナ索引 (Ctrl+S) の対象外** — 動画はアイテムなので Ctrl+G で扱う。
-- **音声はコンテナ索引 (Ctrl+S) の対象外** — 音声はアイテムなので Ctrl+G でファイル名を扱う。
+- **音声はコンテナ索引 (Ctrl+S) の対象外** — 音声はアイテムなので Ctrl+G でファイル名と保存済み文字起こしを扱う。
 - **ZIP は原則として Ctrl+S で扱う**。保存済みの AI 説明文がある書庫・フォルダの本は
   Ctrl+G のアイテム索引にも載せる (U17、§4.6)。ZIP 内画像のメタ検索はどのモードでも行わない。
 - **製本ルート (`Settings.book_root` / 既定 `Pictures\mimageviewer\books`) は
@@ -263,7 +263,7 @@ separator は `search_norm::ZIP_ENTRY_SEP` = U+001F Unit Separator) を通す。
 
 Ctrl+S の EPUB は既存の `search_index.db` の `PdfFile`、Ctrl+G の EPUB は既存の
 `fts_meta.db` / Tantivy の `Pdf` として追加する。既存行・列・kind 値・索引の schema は
-変えず、EPUB の追加では `fts_meta::INDEX_VERSION` は当時の 10 のままにした。現在の 11 への変更は AI 説明文による (§4.11)。
+変えず、EPUB の追加では `fts_meta::INDEX_VERSION` は当時の 10 のままにした。11への変更はAI説明文（§4.11）、現在の12への変更は文字起こし（§4.12）による。
 前方互換では新しい EPUB 行だけが増え、移行は不要。
 「EPUB の処理」が「無視する」のとき、Ctrl+S は SQLite の `WHERE` で EPUB を除いてから
 5,000 件の上限を適用する。Ctrl+G は検索ワーカーが EPUB のパスを STORED 原文取得前に
@@ -346,7 +346,7 @@ AI 説明文は画像・PDF・EPUB と、説明文がある書庫・フォルダ
 接続が無かった場合は次の反映・走査開始時に開き直す。動画・音声には説明文を付けない。
 反映待ちを読むのは公開済みのreadonly接続を確保できた回だけとする。未公開・open失敗の回は
 pendingを読まずACKもしない。直後に初回作成がcommitされても、書き手の世代更新を次の起床で拾う。
-説明文の commit は共有の `caption_epoch` を進め、各 supervisor は自分の既処理世代と比較する。
+説明文・文字起こしのcommitは共有の `derived_text_epoch` を進め、各supervisorは自分の既処理世代と比較する。
 起動時 (初回走査省略時も)・全件走査後・世代変化時に、自分の `OwnedRange` の反映待ちを
 DB から有界 batch で読み、既存候補作成・ingest/delete 経路へ渡す。索引 commit 成功後だけ
 読み取った `(item_key, rev, removed)` と一致する印を消す。反映途中の書き込みは次世代に残る。
@@ -789,7 +789,7 @@ DFS・戻る/次の本・facet帰路は、正規化キーで同一性とcomponen
 説明文・画像内の文字・検索語の空白区切りへまとめ、他のソースと同じ正規化を行う。
 作成時と署名が違う古い説明文も検索対象に残す。モデルの有無は表示・検索に影響しない。
 保存元 DB の更新・削除・キー移行を索引へ反映する所有境界は §4.1、Ctrl+F は §5.2 を参照。
-MCP `search_items` は独立した許可を追加するまで `AiCaption` を query と後置絞り込みの両方から除外する。
+MCP `search_items` は `AiCaption` / `Transcript` の各許可がOFFなら、そのソースをqueryと後置絞り込みの両方から除外する。
 
 PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた生成メタデータを
 `png_prompt_text` フィールドへ正規化して入れる。実装は
@@ -823,6 +823,25 @@ PNG の tEXt/iTXt/zTXt と JPEG/JFIF の EXIF UserComment に埋め込まれた�
   `png_prompt_bytes` を記録する。巨大テンプレートが索引へ残っていないことを再索引後に確認できる。
 
 ---
+
+### 4.12 保存済み文字起こしと派生テキストの反映（INDEX_VERSION=12）
+
+`SourceKind::Transcript`（表示名「文字起こし」）と `transcript_text`（bigram + STORED）を追加した。
+「すべての対象」にも含める。動画・音声のingest workerが `transcript.db` のstatus=okの区間本文を
+空白で結び、他の原文と同じ正規化をして保存する。署名・設定版が古い行も検索対象、failed・行なしは空とする。
+v11からの初回起動は既存のversion gateで管理行とTantivyを作り直し、scan markerも消して全件走査する。
+
+反映の正本は `derived_text` と `STORES`。descriptorの `derived_text` が索引通知、`display_cache` が表示の失効を決め、
+DB名の条件分岐は増やさない。metadata transferの変更集計も同じdescriptor一覧を使う。
+共通のAtomicU64とsupervisorごとのseenを保ち、起動・全件走査後・通知時に同じ反映処理で両ストアを巡回する。
+各ストアの `indexed=0` と削除印を所有範囲で読み、再ingestとcommit/reload後に読んだkey/revだけをackする。
+説明文の本候補解決・ピンだけの表示失効・reader公開前のack禁止は維持する。
+
+Ctrl+Fは現在地の背景workerで同じストア一覧・本文変換を使う。文字起こしはFS上のVideo/Audioだけに加え、
+ファイル名とのAND・除外語も同じ照合で判定する。UIでDBを開かず、検索のための音声復号もしない。
+MCP `search_items` はadmission snapshotのai_captions/transcriptsが許すソースだけを候補収集と最終照合へ渡す。
+文字起こしで当たっても通常のItemで返し、IPC型と版は変えない。
+ingestの `derived_text_read` perf eventにはストア・本文byte数・読取時間・成否を記録する。
 
 ## 5. クエリ実行パス
 
@@ -1013,7 +1032,7 @@ UI (global_search_ui::render_global_search_bar)
   [worker] スレッド内ループ:
     0. クエリ検証 (mode ごとの最小長、1 文字語拒否、NOT-only 禁止。§1.2)
     1. 正トークンを bigram 分解し build_bigram_and_query で BooleanQuery を構築
-       - include: target フィールド (filename/exif/xmp_tweet/png_prompt/pdf_meta/video_meta/sidecar/ai_caption)
+       - include: target フィールド (filename/exif/xmp_tweet/png_prompt/pdf_meta/video_meta/sidecar/ai_caption/transcript)
          ごとの OR を各トークンの子クエリにし、mode=AND なら top-level Must で、
          mode=OR なら Should 群を 1 Must にまとめる
        - favorite_id / kind は Must (exact term の OR)
@@ -1054,7 +1073,7 @@ UI (global_search_ui::render_global_search_bar)
 200 ms 以内と確認できていないため持たず、索引再構築を伴わない累計値だけを使う。
 
 Ctrl+F / Ctrl+G 共通の `TARGET_CHOICES` は「AI 説明」を持ち、「すべての対象」にも含める。
-MCP の `search_items` は `SearchTarget::Only(SourceKind::ALL から AiCaption を除く)` を
+MCP の `search_items` は `SearchTarget::Only(SourceKind::ALL から許可のない AiCaption / Transcript を除く)` を
 `SearchScope.target` に捕捉し、同じ対象を bigram query と `doc_text_for_target` の後置絞り込みに使う。
 説明文だけにある語で MCP の結果が増えたり、NOT 語で結果が減ったりしない。
 

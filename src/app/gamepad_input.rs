@@ -1,5 +1,168 @@
 mod physical;
 
+#[cfg(test)]
+mod positionless_release_tests {
+    use super::*;
+
+    fn pointer_frame(ctx: &egui::Context, events: Vec<egui::Event>, f: impl FnMut()) {
+        let mut f = f;
+        ctx.run_pass(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |_| f(),
+        )
+        .drop_without_applying_deltas();
+    }
+
+    fn button(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn realmachine55_positionless_release_never_finishes_middle_short_click() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let pos = egui::pos2(40.0, 50.0);
+        let middle = egui::PointerButton::Middle;
+        pointer_frame(&ctx, vec![button(pos, middle, true)], || {
+            assert!(!app.update_mouse_middle_short_click(
+                &ctx,
+                true,
+                super::super::ActionSurface::MainWindow
+            ));
+        });
+        pointer_frame(
+            &ctx,
+            vec![egui::Event::PointerButtonReleased {
+                button: middle,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            || {
+                assert!(!app.update_mouse_middle_short_click(
+                    &ctx,
+                    true,
+                    super::super::ActionSurface::MainWindow
+                ));
+                assert!(app.mouse_middle_click_start.is_none());
+            },
+        );
+        pointer_frame(&ctx, vec![button(pos, middle, true)], || {
+            assert!(!app.update_mouse_middle_short_click(
+                &ctx,
+                true,
+                super::super::ActionSurface::MainWindow
+            ));
+        });
+        pointer_frame(&ctx, vec![button(pos, middle, false)], || {
+            assert!(app.update_mouse_middle_short_click(
+                &ctx,
+                true,
+                super::super::ActionSurface::MainWindow
+            ));
+        });
+    }
+
+    #[test]
+    fn realmachine55_positionless_release_preserves_fresh_middle_down_same_frame() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let first = egui::pos2(40.0, 50.0);
+        let next = egui::pos2(240.0, 50.0);
+        let middle = egui::PointerButton::Middle;
+        pointer_frame(&ctx, vec![button(first, middle, true)], || {
+            assert!(!app.update_mouse_middle_short_click(
+                &ctx,
+                true,
+                super::super::ActionSurface::MainWindow
+            ));
+        });
+        pointer_frame(
+            &ctx,
+            vec![
+                egui::Event::PointerButtonReleased {
+                    button: middle,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                button(next, middle, true),
+            ],
+            || {
+                assert!(!app.update_mouse_middle_short_click(
+                    &ctx,
+                    true,
+                    super::super::ActionSurface::MainWindow
+                ));
+                assert_eq!(
+                    app.mouse_middle_click_start
+                        .as_ref()
+                        .map(|state| state.start),
+                    Some(next)
+                );
+            },
+        );
+        pointer_frame(&ctx, vec![button(next, middle, false)], || {
+            assert!(app.update_mouse_middle_short_click(
+                &ctx,
+                true,
+                super::super::ActionSurface::MainWindow
+            ));
+        });
+    }
+
+    #[test]
+    fn realmachine55_positionless_release_cancels_right_flick_and_gesture_without_short_tap() {
+        for gesture in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            let pos = egui::pos2(40.0, 50.0);
+            let secondary = egui::PointerButton::Secondary;
+            let owner = RightDragOwner::Root;
+            pointer_frame(&ctx, vec![button(pos, secondary, true)], || {});
+            if gesture {
+                app.mouse_gesture = Some(MouseGestureState::new(
+                    owner,
+                    RightDragContext::Grid,
+                    Instant::now(),
+                    pos,
+                ));
+            } else {
+                app.mouse_ring_flick = Some(MouseFlickState::new(
+                    owner,
+                    RingShortcutContext::Grid,
+                    Instant::now(),
+                    pos,
+                ));
+            }
+            pointer_frame(
+                &ctx,
+                vec![egui::Event::PointerButtonReleased {
+                    button: secondary,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                || {
+                    let outcome = if gesture {
+                        app.update_mouse_gesture(&ctx, owner, RightDragContext::Grid)
+                    } else {
+                        app.update_mouse_ring_flick(&ctx, owner, RingShortcutContext::Grid)
+                    };
+                    assert!(!matches!(
+                        outcome,
+                        MouseFlickOutcome::ShortTap | MouseFlickOutcome::Fired
+                    ));
+                    assert!(app.mouse_gesture.is_none());
+                    assert!(app.mouse_ring_flick.is_none());
+                },
+            );
+        }
+    }
+}
+
 pub(crate) use physical::GamepadPhysicalInput;
 use physical::{PadPhysicalEvent, PadPhysicalHandoff};
 
@@ -2969,15 +3132,52 @@ impl App {
             return MouseFlickOutcome::None;
         }
 
-        let fallback_pos = existing.current_pos;
-        let (secondary_down, secondary_released, pointer_pos) = ctx.input(|i| {
+        let events = ctx.input(|input| input.pointer.button_events().collect::<Vec<_>>());
+        let mut outcome = MouseFlickOutcome::None;
+        for event in events {
+            match event {
+                egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Primary,
+                    ..
+                }
+                | egui::PointerButtonEvent::Released {
+                    button: egui::PointerButton::Secondary,
+                    pos: None,
+                } => {
+                    self.cancel_right_drag_for_owner(owner);
+                    self.clear_native_video_ring_guide_overlay(ctx);
+                }
+                egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Secondary,
+                    pos,
+                } => {
+                    self.start_mouse_ring_flick(ctx, owner, context, pos, None);
+                }
+                egui::PointerButtonEvent::Released {
+                    button: egui::PointerButton::Secondary,
+                    pos: Some(pos),
+                } => {
+                    let recognition =
+                        self.update_mouse_ring_flick_at(ctx, owner, context, pos, false, true);
+                    let next = self.dispatch_right_drag_recognition(ctx, owner, recognition);
+                    if next != MouseFlickOutcome::None {
+                        outcome = next;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(flick) = self
+            .mouse_ring_flick
+            .as_ref()
+            .filter(|flick| flick.owner == owner && flick.context == context)
+        else {
+            return outcome;
+        };
+        let (secondary_down, pointer_pos) = ctx.input(|input| {
             (
-                i.pointer.secondary_down(),
-                i.pointer.secondary_released(),
-                i.pointer
-                    .interact_pos()
-                    .or_else(|| i.pointer.latest_pos())
-                    .unwrap_or(fallback_pos),
+                input.pointer.secondary_down(),
+                input.pointer.interact_pos().unwrap_or(flick.current_pos),
             )
         });
         let recognition = self.update_mouse_ring_flick_at(
@@ -2986,9 +3186,14 @@ impl App {
             context,
             pointer_pos,
             secondary_down,
-            secondary_released,
+            false,
         );
-        self.dispatch_right_drag_recognition(ctx, owner, recognition)
+        let next = self.dispatch_right_drag_recognition(ctx, owner, recognition);
+        if next == MouseFlickOutcome::None {
+            outcome
+        } else {
+            next
+        }
     }
 
     pub(crate) fn update_native_mouse_ring_flick(
@@ -3174,25 +3379,66 @@ impl App {
             // alive until that surface updates or closes.
             return MouseFlickOutcome::None;
         }
-        let fallback_pos = existing.current_pos;
-        let (secondary_down, secondary_released, pointer_pos) = ctx.input(|i| {
+        let events = ctx.input(|input| input.pointer.button_events().collect::<Vec<_>>());
+        let mut outcome = MouseFlickOutcome::None;
+        for event in events {
+            match event {
+                egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Primary,
+                    ..
+                }
+                | egui::PointerButtonEvent::Released {
+                    button: egui::PointerButton::Secondary,
+                    pos: None,
+                } => {
+                    self.cancel_right_drag_for_owner(owner);
+                    self.clear_native_video_mouse_gesture_overlay(ctx);
+                }
+                egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Secondary,
+                    pos,
+                } => {
+                    self.start_mouse_gesture(ctx, owner, context, pos, None);
+                }
+                egui::PointerButtonEvent::Released {
+                    button: egui::PointerButton::Secondary,
+                    pos: Some(pos),
+                } => {
+                    let next =
+                        self.update_mouse_gesture_with_pos(ctx, owner, context, pos, false, true);
+                    if next != MouseFlickOutcome::None {
+                        outcome = next;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(gesture) = self
+            .mouse_gesture
+            .as_ref()
+            .filter(|gesture| gesture.owner == owner && gesture.context == context)
+        else {
+            return outcome;
+        };
+        let (secondary_down, pointer_pos) = ctx.input(|input| {
             (
-                i.pointer.secondary_down(),
-                i.pointer.secondary_released(),
-                i.pointer
-                    .interact_pos()
-                    .or_else(|| i.pointer.latest_pos())
-                    .unwrap_or(fallback_pos),
+                input.pointer.secondary_down(),
+                input.pointer.interact_pos().unwrap_or(gesture.current_pos),
             )
         });
-        self.update_mouse_gesture_with_pos(
+        let next = self.update_mouse_gesture_with_pos(
             ctx,
             owner,
             context,
             pointer_pos,
             secondary_down,
-            secondary_released,
-        )
+            false,
+        );
+        if next == MouseFlickOutcome::None {
+            outcome
+        } else {
+            next
+        }
     }
 
     pub(crate) fn update_native_mouse_gesture(
@@ -6497,7 +6743,7 @@ impl App {
         let _ = ctx;
     }
 
-    fn clear_native_video_ring_guide_overlay(&mut self, ctx: &egui::Context) {
+    pub(crate) fn clear_native_video_ring_guide_overlay(&mut self, ctx: &egui::Context) {
         #[cfg(windows)]
         {
             self.set_native_video_ring_guide_overlay(None);
@@ -6529,7 +6775,7 @@ impl App {
         let _ = ctx;
     }
 
-    fn clear_native_video_mouse_gesture_overlay(&mut self, ctx: &egui::Context) {
+    pub(crate) fn clear_native_video_mouse_gesture_overlay(&mut self, ctx: &egui::Context) {
         #[cfg(windows)]
         {
             self.set_native_video_ring_picker_overlay(None);
@@ -7605,19 +7851,53 @@ impl App {
         surface: crate::app::ActionSurface,
         allow_release: bool,
     ) -> bool {
-        let sample = ctx.input(|i| MouseMiddleInputSample {
-            is_down: i.pointer.button_down(egui::PointerButton::Middle),
-            is_pressed: i.pointer.button_pressed(egui::PointerButton::Middle),
-            is_released: allow_release && i.pointer.button_released(egui::PointerButton::Middle),
-            current_pos: i.pointer.interact_pos(),
+        let events = ctx.input(|input| input.pointer.button_events().collect::<Vec<_>>());
+        let now = Instant::now();
+        let mut clicked = false;
+        for event in events {
+            let sample = match event {
+                egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Middle,
+                    pos,
+                } => MouseMiddleInputSample {
+                    is_down: true,
+                    is_pressed: true,
+                    is_released: false,
+                    current_pos: Some(pos),
+                },
+                egui::PointerButtonEvent::Released {
+                    button: egui::PointerButton::Middle,
+                    pos,
+                } => MouseMiddleInputSample {
+                    is_down: false,
+                    is_pressed: false,
+                    is_released: allow_release && pos.is_some(),
+                    current_pos: pos,
+                },
+                _ => continue,
+            };
+            clicked |= update_mouse_middle_click_state(
+                &mut self.mouse_middle_click_start,
+                sample,
+                surface,
+                allow_start,
+                now,
+            );
+        }
+        let sample = ctx.input(|input| MouseMiddleInputSample {
+            is_down: input.pointer.button_down(egui::PointerButton::Middle),
+            is_pressed: false,
+            is_released: false,
+            current_pos: input.pointer.interact_pos(),
         });
-        update_mouse_middle_click_state(
-            &mut self.mouse_middle_click_start,
-            sample,
-            surface,
-            allow_start,
-            Instant::now(),
-        )
+        clicked
+            | update_mouse_middle_click_state(
+                &mut self.mouse_middle_click_start,
+                sample,
+                surface,
+                allow_start,
+                now,
+            )
     }
 
     pub(crate) fn apply_mouse_button(

@@ -730,6 +730,91 @@ fn section1335_prepared_pdf_adoption_keeps_direct_and_explicit_list_intents() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn realmachine50_forwarded_warm_pdf_keeps_main_origin_without_delaying_cached_rows() {
+    let _input = crate::key_input::lock_test_input();
+    let (mut env, parent, _) = book_env();
+    let ctx = egui::Context::default();
+    env.initialized = true;
+    env.indexer_init.mark_unavailable_if_not_ready();
+    env.settings.detached_viewer_enabled = true;
+    env.settings.detached_viewer_open_images_in_window = true;
+    let pdf = parent.join("warm-forwarded.pdf");
+    std::fs::write(&pdf, b"%PDF-1.4\n").unwrap();
+    let stamp = std::fs::metadata(&pdf).unwrap();
+    env.get_or_open_catalog(&parent)
+        .unwrap()
+        .set_pdf_meta(
+            "warm-forwarded.pdf",
+            crate::ui_helpers::mtime_secs(&stamp),
+            stamp.len() as i64,
+            2,
+            false,
+        )
+        .unwrap();
+    let pool = crate::pdf_loader::TestPdfEnumeratePool::new(&pdf);
+    let old_window = 88_996;
+    let old =
+        env.build_active_context_for_test(Some(old_window), DetachedSource::Image, |viewer| {
+            crate::app::depth_view_tests::install_pages(viewer, &ctx);
+            viewer.viewer_presentation = ViewerPresentation::DetachedWindow;
+            viewer.detached_viewer_independent_active = true;
+            viewer.set_fs_exclusive_view(
+                crate::fs_exclusive_view::FsExclusiveView::Depth(
+                    crate::depth_parallax::DepthViewState::new(viewer.edit_request_owner_context()),
+                ),
+                "realmachine50_warm_pdf_before_verification",
+            );
+        });
+    env.activation_open_path_tx
+        .send(crate::single_instance::ActivationOpenPath::received(
+            pdf.clone(),
+            env.remote_session_handle(),
+        ))
+        .unwrap();
+    env.poll_activation_open_paths(&ctx);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while env.pdf_enumerate_pending.is_none() {
+        env.poll_startup_open_path_resolve(&ctx);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "warm direct loader did not adopt"
+        );
+        std::thread::yield_now();
+    }
+    // The real worker queue is still held. Warm rows must already be visible;
+    // no native PDF renderer or child process is needed for this ownership proof.
+    let job = pool.take();
+    assert!(!job.cancelled());
+    assert_eq!(env.items.len(), 2);
+    assert!(
+        env.items
+            .iter()
+            .all(|item| matches!(item, GridItem::PdfPage { pdf_path, .. }
+        if crate::path_key::eq_keep_drive(pdf_path, &pdf)))
+    );
+    assert!(matches!(
+        &env.pdf_enumerate_pending.as_ref().unwrap().5,
+        PdfOpenPhase::CommittedVerification {
+            placeholder_count: 2
+        }
+    ));
+    assert_eq!(
+        env.fs_nav_after_pdf_enumerate
+            .as_ref()
+            .unwrap()
+            .viewer_adoption,
+        StartupOpenPathOwner::Activation.viewer_open_adoption()
+    );
+    assert_eq!(env.active_detached_window_id(), Some(old_window));
+    assert_eq!(env.locate_window_context(old_window).unwrap().0, old);
+    assert!(env.detached_image_windows.is_empty());
+    env.with_viewer_context(old, |viewer| assert!(viewer.fs_exclusive_view.is_depth()))
+        .unwrap();
+    drop(job);
+}
+
 #[test]
 fn section1335_warm_pdf_verification_does_not_reinterpret_original_presentation_intent() {
     for (explicit, actual_count) in [(false, 2), (false, 3), (true, 2), (true, 3)] {

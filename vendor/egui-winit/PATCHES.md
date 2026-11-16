@@ -74,3 +74,100 @@ The shared IME implementation lives in crates/egui-ime; egui-winit and
 eframe use ../../crates/egui-ime. Archive/VCS/checksum and original file hashes
 were moved to vendor/upstream-provenance.json. Graph migration is not evidence
 that runtime checks or release gates have passed.
+
+## 依頼50 A: normalized pointer observer（2026-11-14）
+
+Parked静止画の復帰gestureを、後続passでRawInputを読む時点ではなく、実入力を生成した時点の
+ownerに所属させるための観測APIを追加した。Active時に蓄積したDown/Upを、Immediateから
+Deferredへ切り替えた後の新callbackが復帰操作として再所属させないために使う。
+
+- `pointer_input_observer`の公開APIはContext共有のobserverを登録・解除する。
+  `State::on_window_event`は既存変換をinnerへ委譲し、そのWindowEventが実際に追加した
+  `egui_input.events`のsliceだけを観測する。observerはContext data lockを解放してから
+  最大一度呼ぶ。利用側は共有input ownerへのenqueueだけを行い、App/eframeへ再入しない。
+- observerは`Option<egui::Id>`を返す。Pressedの生成時ownerを証明できた場合のopaque tokenだけを、
+  そのWindowEventが追加した最初のraw Touch Startまたはprimary pressの直前へ
+  `Event::PointerInputProvenance(id)`として挿入する。NoneとReleased/Cancelledの返値では挿入しない。
+  markerは非操作イベントで、古いActive入力と新しいParked入力が同じbatchへ合流しても
+  新しいproofを古いDownが奪わないための相関である。event indexによる推測は使わず、
+  RawInputのtake/append、旧Stateの保留入力との合流、key releaseの先頭追加、raw列の再利用でも
+  markerが対応Startと一緒に移動する。eguiの通常pointer操作を生成・取消するmarkerではない。
+  egui自身のdiscard再passはvolatile eventsを再配送しないため、markerもStartも再配送しない。
+- sourceは物理WindowEventに従い、MouseInputのtouch simulationもMouse、TouchはTouch(id)とする。
+  mouse primaryのraw pressがなければPressedを生成しない。位置消失等でraw releaseを追加できない
+  mouse releaseはCancelledを通知し、既存gestureを未来のreleaseへ残さない。
+  Touchはraw Start/End/Cancelを使い、primary昇格のない指も通知する。昇格分の二重通知はしない。
+  motion、focus、keyboard、非primary mouseは復帰producerにしない。
+- RawInput/IME/event列を消去・再構成せず、State fieldを追加しない。winitのWM_POINTER履歴や
+  WM_TOUCH、eframeのallocation/lifecycleには手を入れない。headlessテストのため、既存のtouch
+  変換が必要とするWindow由来のscaleとcursor座標変換だけをhelper境界へ分けた。
+
+回帰は実WindowEvent・Stateの実mouse/touch producer・追加sliceのmappingを使い、位置なし、
+既存queueの非再所属、touch simulation、非昇格touch、取消、二重昇格なし、Context/viewportの
+所有、callbackからのContext参照・observer解除を検査する。Window/EventLoopは生成しない。
+provenanceのSome/None、fresh Start直前だけの挿入、Touchの昇格有無、terminal返値の無視、
+RawInputの実take/appendとkey先頭追加、eguiのdiscardによる実再passも検査する。
+実Window経由の配送・実機での復帰はこのheadless回帰の証明範囲には含めない。
+
+上流へ戻す際は、このAPIを削除するだけで利用側を古いRawInputの推測へ戻さないこと。
+同等の生成時通知・物理source・一イベント一通知・Context lock外callbackの契約を保ち、
+利用側のowner証明と、markerによる実Startとの相関を合わせて移植する。
+単なるnative Down/Up通知やbatch内FIFO/indexで置換してはならない。
+## 依頼55 独立レビュー: 位置なしreleaseと診断sink（2026-11-15）
+
+再レビュー§5.9では、simulate_touch_screenの位置なしmouse Upから出すraw Touchを
+EndではなくCancelに変更した。最後の検出点をTouch Endへ渡すとtap等の認可になり得るため、
+接点保持だけを終える。physical `PointerButtonReleased`とobserverのReleasedは維持し、
+案1のParked復帰は同じ既存ownerで完了できる。通常の位置付きtouch／mouse入力は変更しない。
+
+winit 0.30.13 Windowsはcapture中にも窓外座標のCursorMovedを送り、後着の
+WM_MOUSELEAVEがCursorLeftだけを出し得る。WM_LBUTTONUPはReleaseCaptureの後に
+位置なしMouseInputを送り、last_positionを更新しない。logical位置Noneはrelease取消の証拠ではない。
+
+Stateは実MouseInputでforwardした保持をbuttonごとに所有し、位置なしの実Upは
+eguiの`PointerButtonReleased`で一度だけ終える。過去の座標をPointerButtonへ代入しない。
+observerはこのraw終端をReleasedとして認め、downを見ていないUpは従来どおりCancelled。
+touch昇格は物理mouse保持を作らず、State再生成でも保持を移さない。
+simulate_touch_screenのraw Touch Endは既存Touch契約の最後に検出した点で終え、hoverを復元しない。
+上流へ戻す際はegui側の位置なし終端とAppのordered consumerを一緒に移し、
+通常のPointerGoneはdownを消さないという上流の意味を維持すること。
+
+診断Infoのtargetは`egui_winit::pointer_input_observer::diagnostic`へ固定する。
+製品loggerはこの正確なtargetだけを許可し、vendor全体のInfoは開けない。
+入力破棄の押下境界だけで出力する。通常sinkへの到達も製品側の実writer回帰で検査する。
+caption buttonの判定はvendorで推測せず、既存native ownerの解放hit／WM_SYSCOMMANDに委ねる。
+根拠・headlessと実機未確認の区別は依頼50調査書§5.8を参照。
+
+## 依頼55: client入力破棄の診断（2026-11-15）
+
+primary押下の境界だけで `PointerInputDiscardReason` を通常ログへ出す。
+Stateにpointer位置がない場合は `PointerPositionUnavailable`、raw押下が生成されても
+Context共有observerが未設置なら `ObserverNotInstalled`。viewportと現在registrationを併記する。
+入力生成・配送・cursor寿命は変更せず、位置のOS再探索、observerの再設置、retryはしない。
+上流移植時は観測と対処を分け、この診断の代わりに位置推定や入力再生を導入しないこと。
+
+## 依頼55 A: Windowsの同座標再入とpointer位置の寿命（2026-11-15）
+
+winit 0.30.13のWindows backendはWM_MOUSELEAVEでCursorLeftを出すが、
+MouseState::last_positionを保持する。再入時のWM_MOUSEMOVEはCursorEnteredを出しても、
+同client座標ならCursorMovedを省略する。egui-winitがLeftでlogical位置を消した後、
+Enteredで復元しなかったためMouseInputからPointerButtonを作れなかった。
+
+- Windowsの各Stateは最後のCursorMovedの物理位置を保持する。
+  winitのlast_positionと保持位置はCursorMovedごとに一致する。Leftでは従来どおり
+  pointer_pos_in_pointsをNoneにしてPointerGoneを出し、物理位置は保持する。
+  Enteredは保持した値を現在の実効pixels_per_point（native scale×egui zoom）へ変換し、
+  通常のon_cursor_movedと同じPointerMoved生成を通す。後続の別位置Movedはそれを上書きする。
+- Touch End／Cancelのlogical位置清掃では物理mouse位置を消さない（winitも消さない）。
+  新規StateはNoneで始める。Windows eframeのState再作成はnative window再生成と同じ寿命で、
+  別allocation／兄弟Stateへ履歴を引き継がない。根拠範囲に合わせ、Entered復元はWindowsだけとする。
+- `State::on_pointer_event` はWindow不要のpointer-only変換API。
+  normal WindowEvent経路と同じprivate変換helperを使い、normalized observerを一度だけ呼ぶ。
+  normal経路のAccessKit／IME traceとouter observerの位置は維持する。
+  非pointer eventはNone／無変更。Appのheadless反復試験もこの正規変換で実observer／proofを通す。
+
+回帰は同座標Left→Entered→Down、別Movedの上書き、履歴なし、倍率変更、touch終端後、
+root／child分離、新Stateの履歴なし、observer一回を検査する。
+実機の依頼55との対応とpart3の座標差は未観測で、原因機構の証明とは区別する。
+上流へ戻す際はwinitのlast_position／Entered／Movedの契約を再確認し、
+入力の位置推定・OS照会・rect探索・次frameの再送へ置換しないこと。

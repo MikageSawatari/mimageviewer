@@ -3,6 +3,29 @@ use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, Pre
 use super::*;
 use crate::ui_dialogs::context_menu::DeleteTarget;
 
+#[cfg(windows)]
+pub(super) fn backend_window_for_test(
+    ctx: &egui::Context,
+    window_id: u64,
+    hwnd: u64,
+) -> eframe::native_window_input::NativeWindowAllocationLease {
+    use eframe::native_window_input::*;
+    let viewport_id = App::detached_image_window_viewport_id(window_id);
+    ctx.set_embed_viewports(false);
+    ctx.show_viewport_deferred(viewport_id, Default::default(), |_, _| {});
+    register_native_window_allocation(
+        ctx,
+        NativeWindowAllocation {
+            viewport_id,
+            registration: ctx.viewport_registration(viewport_id).unwrap(),
+            window_id: NativeWindowId::from(hwnd),
+            windows_hwnd: Some(hwnd as isize),
+        },
+    )
+}
+mod repro742;
+mod section1768;
+
 pub(crate) fn assert_cache_book_cover_only_worker_catalog_contract(
     app: &mut App,
     directory: &Path,
@@ -3619,10 +3642,37 @@ fn mutation_refresh_zip_pin_keeps_level_cursor_scroll_filter_and_checks() {
 }
 
 #[test]
+fn cold_dialog_owners_keep_app_stack_footprint_bounded() {
+    use std::mem::size_of;
+    fn field_size<T>(_: fn(&App) -> &T) -> usize {
+        size_of::<T>()
+    }
+    // These cold payloads may grow without increasing the inline App footprint.
+    for (name, bytes) in [
+        ("export_dialog", field_size(|app| &app.export_dialog)),
+        (
+            "settings_restore_state",
+            field_size(|app| &app.settings_restore_state),
+        ),
+        ("book_reorder", field_size(|app| &app.book_reorder)),
+    ] {
+        println!("cold owner {name}={bytes}");
+        assert_eq!(
+            bytes,
+            size_of::<usize>(),
+            "{name} must stay off the App stack"
+        );
+    }
+}
+
+#[test]
 fn history_transition_storage_keeps_app_stack_footprint_bounded() {
     use std::mem::size_of;
+    fn storage<T>(_: fn(&App) -> &T) -> usize {
+        size_of::<T>()
+    }
     println!(
-        "sizes App={} FolderNavHistoryTarget={} OpenRequestOwner={} DirectPdfAdoption={} EpubOpenRestore={} PdfPasswordRequestOwner={} PdfPasswordRequest={} PdfEnumeratePending={}",
+        "sizes App={} FolderNavHistoryTarget={} OpenRequestOwner={} DirectPdfAdoption={} EpubOpenRestore={} PdfPasswordRequestOwner={} PdfPasswordRequest={} PdfEnumeratePending={} GpuLanczosCache={}",
         size_of::<App>(),
         size_of::<FolderNavHistoryTarget>(),
         size_of::<OpenRequestOwner>(),
@@ -3631,6 +3681,30 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         size_of::<PdfPasswordRequestOwner>(),
         size_of::<PdfPasswordRequest>(),
         size_of::<PdfEnumeratePending>(),
+        size_of::<crate::gpu_lanczos::GpuLanczosCache>(),
+    );
+    #[cfg(windows)]
+    println!(
+        "T1 storage asr_setup={} transcript_job={} transcript_delete={} show_transcript_progress={} transcript_display={} music_transcript_panel={}; payload AsrSetup={} TranscriptJob={} TranscriptDeleteState={} TranscriptDisplayCache={} MusicTranscriptPanelSession={}",
+        storage(|app| &app.asr_setup),
+        storage(|app| &app.transcript_job),
+        storage(|app| &app.transcript_delete),
+        storage(|app| &app.show_transcript_progress),
+        storage(|app| &app.transcript_display),
+        storage(|app| &app.music_transcript_panel),
+        size_of::<crate::ui_dialogs::asr_addon::AsrSetup>(),
+        size_of::<crate::ui_dialogs::transcript_job::TranscriptJob>(),
+        size_of::<crate::ui_dialogs::transcript_delete::TranscriptDeleteState>(),
+        size_of::<crate::transcript_display_cache::TranscriptDisplayCache>(),
+        size_of::<crate::ui_music_panels::MusicTranscriptPanelSession>(),
+    );
+    println!(
+        "master storage Settings={} thumb_cover_auto_crop_binding={} thumb_cover_auto_crop_folders={} video_resume_positions={} legacy_resume_map={}",
+        storage(|app| &app.settings),
+        storage(|app| &app.settings.thumb_cover_auto_crop_binding),
+        storage(|app| &app.settings.thumb_cover_auto_crop_folders),
+        storage(|app| &app.settings.video_resume_positions),
+        size_of::<HashMap<String, f64>>(),
     );
     // A staged history request is rarely active and must not be stored inline in every App.
     // The capture/fullscreen input test creates several App values on a default test stack.
@@ -3660,6 +3734,8 @@ fn history_transition_storage_keeps_app_stack_footprint_bounded() {
         size_of::<Option<Box<crate::ui_dialogs::epub_convert::EpubConvertState>>>(),
         size_of::<usize>()
     );
+    #[cfg(windows)]
+    assert_eq!(storage(|app| &app.asr_setup), size_of::<usize>());
     assert!(size_of::<App>() < 110_000);
 }
 
@@ -3921,7 +3997,12 @@ fn epub_batch_completion_refreshes_grid_and_applies_same_name_pdf_priority() {
     app.epub_batch_convert = Some(
         crate::ui_dialogs::epub_batch_convert::EpubBatchPending::completed_for_test(
             epub.clone(),
-            crate::ui_dialogs::epub_batch_convert::EpubBatchResult::Saved(pdf.clone(), vec![]),
+            Ok(crate::epub_convert::SavedPdf {
+                path: pdf.clone(),
+                reused_cache: false,
+                user_data_errors: vec![],
+                metadata: Default::default(),
+            }),
         ),
     );
     app.poll_epub_batch_convert();
@@ -4301,6 +4382,7 @@ fn epub_modal_rejects_second_direct_open_and_cancel_preserves_history() {
         PdfOpenFailureRoute::ConversionDialogOpened
     );
     app.epub_convert.as_mut().unwrap().deferred_fullscreen = Some(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
@@ -4535,6 +4617,7 @@ fn epub_modal_blocks_pane_scan_until_cancel() {
     app.address = epub.to_string_lossy().into_owned();
     let state = app.epub_convert.as_mut().unwrap();
     state.deferred_fullscreen = Some(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
@@ -4603,6 +4686,7 @@ fn epub_modal_blocks_failed_pane_scan_and_cancel_restores_source() {
     );
     let state = app.epub_convert.as_mut().unwrap();
     state.deferred_fullscreen = Some(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
@@ -4677,6 +4761,7 @@ fn epub_ready_pane_replacement_scenario(c_succeeds: bool) {
     );
     let state = app.epub_convert.as_mut().unwrap();
     state.deferred_fullscreen = Some(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
@@ -4812,6 +4897,7 @@ fn epub_published_stale_collection_reopen_preserves_other_pending_attachments() 
         crate::app::StartupListIntent::ExplicitList,
     );
     state.deferred_fullscreen = Some(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,
@@ -6571,6 +6657,7 @@ fn recreated_detached_host_preserves_maximized_placement_until_visible_commit() 
                 id: 41,
                 current: ViewerPresentation::Fullscreen,
                 target: ViewerPresentation::DetachedWindow,
+                target_independent: None,
                 activate: true,
                 announce_main_hint: false,
                 outgoing_presenter_hwnd: 0xA117,
@@ -6849,17 +6936,11 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
     let old_viewport_h = App::detached_image_window_viewport_id(OLD_WINDOW_H);
     app.set_detached_window_binding_for_test(Some(OLD_WINDOW_H));
     app.begin_active_detached_session(OLD_WINDOW_H, DetachedSource::Video);
+    let _backend = backend_window_for_test(&ctx, OLD_WINDOW_H, LATE_HWND);
 
     app.begin_active_detached_session_close("test_late_registration_closing");
-    assert!(
-        app.detached_window_hwnd_snapshot_before_show(
-            OLD_WINDOW_H,
-            "test_late_registration_closing",
-            old_viewport_h,
-        )
-        .is_none(),
-        "pre-show registration must reject a Closing lease"
-    );
+    app.register_detached_window_hwnd_after_show(&ctx, OLD_WINDOW_H, "test_late", old_viewport_h);
+    assert_eq!(app.detached_window_hwnd_get_raw(OLD_WINDOW_H), None);
     app.adopt_deferred_detached_window_hwnd_after_callback(&ctx, OLD_WINDOW_H, old_viewport_h);
     assert_eq!(
         app.detached_window_state(OLD_WINDOW_H),
@@ -6870,7 +6951,8 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
         app.detached_window_hwnd_set_for_reusable_lease(
             &ctx,
             OLD_WINDOW_H,
-            LATE_HWND,
+            eframe::native_window_input::native_window_allocation_witness(&ctx, old_viewport_h)
+                .unwrap(),
             "test_late_registration_closing",
         )
         .is_err(),
@@ -6880,15 +6962,8 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
 
     app.finish_active_detached_session_close("test_late_registration_removed");
     assert!(app.detached_window_manager.runtime(OLD_WINDOW_H).is_none());
-    assert!(
-        app.detached_window_hwnd_snapshot_before_show(
-            OLD_WINDOW_H,
-            "test_late_registration_removed",
-            old_viewport_h,
-        )
-        .is_none(),
-        "a stale pre-show path must not recreate a removed lease"
-    );
+    app.register_detached_window_hwnd_after_show(&ctx, OLD_WINDOW_H, "test_late", old_viewport_h);
+    assert_eq!(app.detached_window_hwnd_get_raw(OLD_WINDOW_H), None);
     app.adopt_deferred_detached_window_hwnd_after_callback(&ctx, OLD_WINDOW_H, old_viewport_h);
     assert!(
         app.detached_window_manager.runtime(OLD_WINDOW_H).is_none(),
@@ -6898,7 +6973,8 @@ fn late_post_show_hwnd_registration_cannot_recreate_a_terminal_lease() {
         app.detached_window_hwnd_set_for_reusable_lease(
             &ctx,
             OLD_WINDOW_H,
-            LATE_HWND,
+            eframe::native_window_input::native_window_allocation_witness(&ctx, old_viewport_h)
+                .unwrap(),
             "test_late_registration_removed",
         )
         .is_err(),
@@ -8389,7 +8465,7 @@ fn epub_batch_modal_blocks_grid_keyboard_and_click_open() {
     app.epub_batch_convert = Some(
         crate::ui_dialogs::epub_batch_convert::EpubBatchPending::completed_for_test(
             PathBuf::from("book.epub"),
-            crate::ui_dialogs::epub_batch_convert::EpubBatchResult::Skipped,
+            Err(crate::epub_convert::EpubConvertError::ExistingPdf),
         ),
     );
     let ctx = egui::Context::default();
@@ -23356,6 +23432,7 @@ mod phase_c_folder_nav_history_tests {
                 path: pdf.clone(),
                 reused_cache: false,
                 user_data_errors: Vec::new(),
+                metadata: Default::default(),
             },
             old_state.surface_generation,
             old_state.smart_transition_sequence,
@@ -43938,6 +44015,7 @@ mod favorite_adjustment_defaults_tests {
     fn pdf_password_prompt_preserves_only_explicit_deferred_reopen() {
         let mut app = setup_app();
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -43952,6 +44030,7 @@ mod favorite_adjustment_defaults_tests {
         );
 
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -53876,6 +53955,7 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = None;
         app.items_generation = locked_gen + 1;
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -54856,6 +54936,7 @@ mod favorite_adjustment_defaults_tests {
         app.fullscreen_idx = None;
         app.items_generation += 1;
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -69894,6 +69975,7 @@ mod still_window_mode_key_tests {
 
     fn keep_detached_transition_gap_open(app: &mut App) {
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -69995,6 +70077,7 @@ mod still_window_mode_key_tests {
 
         install_detached_transition_gap_for_test(&mut app, window_id, move |bundle| {
             bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
@@ -70021,28 +70104,6 @@ mod still_window_mode_key_tests {
             );
         })
         .expect("the deferred reopen owner must stay mounted");
-    }
-
-    fn thread_window_entry(
-        hwnd_raw: u64,
-        is_main: bool,
-        class_name: &str,
-    ) -> crate::dwm_transitions::ThreadWindowSnapshotEntry {
-        crate::dwm_transitions::ThreadWindowSnapshotEntry {
-            hwnd_raw,
-            is_main,
-            visible: true,
-            iconic: false,
-            rect_ok: true,
-            rect: windows::Win32::Foundation::RECT {
-                left: 0,
-                top: 0,
-                right: 800,
-                bottom: 600,
-            },
-            class_name: class_name.to_string(),
-            title: String::new(),
-        }
     }
 
     #[test]
@@ -70143,9 +70204,20 @@ mod still_window_mode_key_tests {
         DetachedRightDragEvent {
             sequence,
             kind: DetachedRightDragEventKind::Input {
-                secondary_pressed,
+                button_events: secondary_pressed
+                    .then_some(egui::PointerButtonEvent::Pressed {
+                        button: egui::PointerButton::Secondary,
+                        pos,
+                    })
+                    .into_iter()
+                    .chain(
+                        secondary_released.then_some(egui::PointerButtonEvent::Released {
+                            button: egui::PointerButton::Secondary,
+                            pos: Some(pos),
+                        }),
+                    )
+                    .collect(),
                 secondary_down,
-                secondary_released,
                 pointer_pos: Some(pos),
             },
         }
@@ -70391,7 +70463,9 @@ mod still_window_mode_key_tests {
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let pos = egui::pos2(120.0, 90.0);
-        app.build_window_context_for_test(79, |context| {
+        app.settings.ring_shortcuts.right_drag_image =
+            Some(crate::ring_shortcut::RightDragMode::MouseGesture);
+        app.push_window_context_for_test(&ctx, 79, |context| {
             configure_passive_right_drag_image(context, r"C:\pics\deferred-primary-cancel.jpg");
         });
         let window = contextless_test_window(&ctx, 79);
@@ -70401,35 +70475,39 @@ mod still_window_mode_key_tests {
             false,
         );
         let shared = DeferredDetachedImageWindowShared::new(view);
+        app.transition_detached_window_state(79, DetachedWindowState::Parked, "test");
 
-        assert!(matches!(
-            capture_deferred_pointer_button(
-                &shared,
-                &ctx,
-                pos,
-                egui::PointerButton::Secondary,
-                true,
-            )
-            .map(|event| event.kind),
-            Some(DetachedRightDragEventKind::Input {
-                secondary_pressed: true,
-                secondary_down: true,
-                secondary_released: false,
-                ..
-            })
-        ));
+        let pressed = capture_deferred_pointer_button(
+            &shared,
+            &ctx,
+            pos,
+            egui::PointerButton::Secondary,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(&pressed.kind, DetachedRightDragEventKind::Input {
+            button_events, secondary_down: true, ..
+        } if *button_events == vec![egui::PointerButtonEvent::Pressed { button: egui::PointerButton::Secondary, pos }]));
+        app.process_passive_detached_right_drag_events_for_test(&ctx, vec![(79, pressed)]);
+        assert!(app.mouse_gesture.is_some());
+        let primary =
+            capture_deferred_pointer_button(&shared, &ctx, pos, egui::PointerButton::Primary, true)
+                .unwrap();
         assert_eq!(
-            capture_deferred_pointer_button(
-                &shared,
-                &ctx,
-                pos,
-                egui::PointerButton::Primary,
-                true,
-            )
-            .map(|event| event.kind),
-            Some(DetachedRightDragEventKind::Cancel {
-                reason: DetachedRightDragCancelReason::PrimaryButtonPressed,
-            })
+            primary.kind,
+            DetachedRightDragEventKind::Input {
+                button_events: vec![egui::PointerButtonEvent::Pressed {
+                    button: egui::PointerButton::Primary,
+                    pos
+                }],
+                secondary_down: true,
+                pointer_pos: Some(pos),
+            }
+        );
+        app.process_passive_detached_right_drag_events_for_test(&ctx, vec![(79, primary)]);
+        assert!(
+            app.mouse_gesture.is_none(),
+            "the transported primary press must cancel the owning right drag"
         );
     }
 
@@ -71043,49 +71121,6 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn detached_hwnd_diff_accepts_single_created_egui_window() {
-        let before = vec![thread_window_entry(0x10, true, "Window Class")];
-        let after = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x20, false, "Window Class"),
-        ];
-
-        assert_eq!(
-            App::select_detached_created_hwnd(&before, &after),
-            DetachedWindowHwndDiff::Created(0x20)
-        );
-    }
-
-    #[test]
-    fn detached_hwnd_diff_retries_on_no_change_or_ambiguous_created_windows() {
-        let before = vec![thread_window_entry(0x10, true, "Window Class")];
-        let no_change = before.clone();
-        assert_eq!(
-            App::select_detached_created_hwnd(&before, &no_change),
-            DetachedWindowHwndDiff::NoChange
-        );
-
-        let ambiguous = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x20, false, "Window Class"),
-            thread_window_entry(0x30, false, "Window Class"),
-        ];
-        assert_eq!(
-            App::select_detached_created_hwnd(&before, &ambiguous),
-            DetachedWindowHwndDiff::Ambiguous(vec![0x20, 0x30])
-        );
-
-        let wrong_class = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x40, false, "Other Class"),
-        ];
-        assert_eq!(
-            App::select_detached_created_hwnd(&before, &wrong_class),
-            DetachedWindowHwndDiff::NoChange
-        );
-    }
-
-    #[test]
     fn detached_hwnd_registry_clears_dead_hwnd_and_retries_generation_diff() {
         let mut app = setup_app();
         app.detached_window_hwnd_set(7, 0x700);
@@ -71096,23 +71131,6 @@ mod still_window_mode_key_tests {
         assert_eq!(app.detached_window_hwnd_alive(7), None);
         assert_eq!(app.detached_window_hwnd_clear_if_dead(7), Some(0x700));
         assert_eq!(app.detached_window_hwnd_get_raw(7), None);
-    }
-
-    #[test]
-    fn detached_hwnd_snapshot_is_skipped_while_registered_hwnd_is_alive() {
-        let mut app = setup_app();
-        set_detached_host_for_test(&mut app, 12, 0x1200, true);
-        app.main_hwnd = None;
-
-        assert!(
-            app.detached_window_hwnd_snapshot_before_show(
-                12,
-                "test",
-                App::detached_image_window_viewport_id(12),
-            )
-            .is_none(),
-            "live registry entries must avoid per-frame thread-window snapshots"
-        );
     }
 
     #[test]
@@ -71131,14 +71149,11 @@ mod still_window_mode_key_tests {
         set_detached_host_for_test(&mut app, 12, 0x1200, false);
         app.main_hwnd = None;
 
-        assert!(
-            app.detached_window_hwnd_snapshot_before_show(
-                12,
-                "passive",
-                App::detached_image_window_viewport_id(12),
-            )
-            .is_none(),
-            "without a main HWND the test stops after the dead-host ownership transition"
+        app.register_detached_window_hwnd_after_show(
+            &ctx,
+            12,
+            "passive",
+            App::detached_image_window_viewport_id(12),
         );
         assert_eq!(
             app.detached_window_state(12),
@@ -71169,24 +71184,28 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn watcher_repair_rejects_when_target_hwnd_is_still_alive() {
+    fn backend_adoption_keeps_own_hwnd_without_rect_guessing() {
         let mut app = setup_app();
+        let ctx = egui::Context::default();
         app.detached_window_hwnd_set(7, 0x7000);
-        app.transition_detached_window_state(7, DetachedWindowState::Parked, "test_repair");
+        app.transition_detached_window_state(7, DetachedWindowState::Parked, "test");
+        let _backend = backend_window_for_test(&ctx, 7, 0x7000);
+        let _sibling = backend_window_for_test(&ctx, 9, 0x9000);
         app.set_detached_window_live_hwnds_for_test([0x7000, 0x9000]);
-        let snapshot = [
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x9000, false, App::EGUI_VIEWPORT_CLASS),
-        ];
-
-        assert!(
-            !app.repair_detached_window_hwnd_from_watcher_with_snapshot(
-                &egui::Context::default(),
-                7,
-                0x9000,
-                &snapshot,
-            ),
-            "watcher repair must not replace a live registered HWND with a geometry-derived one"
+        assert!(app.adopt_backend_detached_window_hwnd(
+            &ctx,
+            7,
+            "passive",
+            App::detached_image_window_viewport_id(7)
+        ));
+        assert_eq!(
+            eframe::native_window_input::native_window_allocation(
+                &ctx,
+                App::detached_image_window_viewport_id(9)
+            )
+            .unwrap()
+            .windows_hwnd,
+            Some(0x9000)
         );
         assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x7000);
         assert_eq!(
@@ -71196,42 +71215,37 @@ mod still_window_mode_key_tests {
     }
 
     #[test]
-    fn watcher_hwnd_repair_does_not_demote_parked_live_media() {
+    fn backend_adoption_does_not_demote_parked_live_media() {
         let mut app = setup_app();
-        app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
-
-        assert!(app.repair_detached_window_hwnd_from_watcher_unchecked(
-            &egui::Context::default(),
+        let ctx = egui::Context::default();
+        app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test");
+        let _backend = backend_window_for_test(&ctx, 7, 0x7000);
+        assert!(app.adopt_backend_detached_window_hwnd(
+            &ctx,
             7,
-            0x7000,
+            "passive",
+            App::detached_image_window_viewport_id(7)
         ));
         assert_eq!(
             app.detached_window_state(7),
-            Some(DetachedWindowState::ParkedLive),
-            "HWND repair changes the OS host identity, not the media lifecycle"
+            Some(DetachedWindowState::ParkedLive)
         );
     }
 
     #[test]
-    fn watcher_repair_adopts_observed_hwnd_when_registered_hwnd_is_dead() {
+    fn backend_adoption_replaces_dead_registered_hwnd() {
         let mut app = setup_app();
+        let ctx = egui::Context::default();
         app.detached_window_hwnd_set(7, 0x7000);
-        app.transition_detached_window_state(7, DetachedWindowState::Opening, "test_repair");
+        app.transition_detached_window_state(7, DetachedWindowState::Opening, "test");
+        let _backend = backend_window_for_test(&ctx, 7, 0x9000);
         app.set_detached_window_live_hwnds_for_test([0x9000]);
-        let snapshot = [
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x9000, false, App::EGUI_VIEWPORT_CLASS),
-        ];
-
-        assert!(
-            app.repair_detached_window_hwnd_from_watcher_with_snapshot(
-                &egui::Context::default(),
-                7,
-                0x9000,
-                &snapshot,
-            ),
-            "watcher repair remains valid when the registered HWND is genuinely stale"
-        );
+        assert!(app.adopt_backend_detached_window_hwnd(
+            &ctx,
+            7,
+            "passive",
+            App::detached_image_window_viewport_id(7)
+        ));
         assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x9000);
         assert_eq!(
             app.detached_window_state(7),
@@ -71260,18 +71274,6 @@ mod still_window_mode_key_tests {
             Some(0x4200),
             "active->passive handoff keeps the same live OS window registered"
         );
-        let mut another_unknown_already_claimed = true;
-        assert!(
-            app.deferred_detached_window_registration_allowed(
-                42,
-                &mut another_unknown_already_claimed
-            ),
-            "a parked window with a live HWND must never be delayed by deferred creation serialization"
-        );
-        assert!(
-            another_unknown_already_claimed,
-            "confirmed windows must not consume the per-frame unknown-window slot"
-        );
         assert_eq!(
             app.detached_image_window_cursor_show_pending,
             vec![42],
@@ -71281,126 +71283,6 @@ mod still_window_mode_key_tests {
         assert!(
             !app.cursor_hidden(),
             "active viewer auto-hide state must not leak into the passive or next viewer"
-        );
-    }
-
-    #[test]
-    fn detached_hwnd_unclaimed_adopts_single_unregistered_egui_window() {
-        let mut app = setup_app();
-        app.detached_window_hwnd_set(7, 0x700);
-        app.detached_window_hwnd_set(8, 0x800);
-        app.set_detached_window_live_hwnds_for_test([0x800]);
-        assert_eq!(app.detached_window_hwnd_clear_if_dead(7), Some(0x700));
-
-        let after = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x800, false, "Window Class"),
-            thread_window_entry(0x900, false, "Window Class"),
-        ];
-        let claimed = app.detached_window_registered_hwnds();
-
-        assert_eq!(
-            App::select_detached_unclaimed_hwnd(&after, &claimed),
-            DetachedWindowHwndDiff::Created(0x900)
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn unclaimed_hwnd_adoption_ignores_hidden_and_iconic_viewports() {
-        // review-v2.3.0 hunt P2 (BA-1/BA-4): hidden / minimized / rect 取得不能な stale
-        // egui viewport を「唯一の未登録窓」として detached host に誤採用しない。
-        let claimed = std::collections::HashSet::from([0x800_u64]);
-        let mut hidden = thread_window_entry(0x900, false, "Window Class");
-        hidden.visible = false;
-        let mut iconic = thread_window_entry(0xa00, false, "Window Class");
-        iconic.iconic = true;
-        let mut rect_err = thread_window_entry(0xb00, false, "Window Class");
-        rect_err.rect_ok = false;
-        let after = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x800, false, "Window Class"),
-            hidden,
-            iconic,
-            rect_err,
-        ];
-        assert_eq!(
-            App::select_detached_unclaimed_hwnd(&after, &claimed),
-            DetachedWindowHwndDiff::NoChange,
-            "不可視 viewport はフォールバック採用しない (次フレーム再試行に任せる)"
-        );
-
-        // 可視の未登録窓が 1 つだけなら、hidden が同居していても曖昧化せず採用する。
-        let mut hidden2 = thread_window_entry(0x900, false, "Window Class");
-        hidden2.visible = false;
-        let after_with_visible = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x800, false, "Window Class"),
-            hidden2,
-            thread_window_entry(0xc00, false, "Window Class"),
-        ];
-        assert_eq!(
-            App::select_detached_unclaimed_hwnd(&after_with_visible, &claimed),
-            DetachedWindowHwndDiff::Created(0xc00)
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn detached_hwnd_no_change_path_adopts_single_unclaimed_egui_window() {
-        let mut app = setup_app();
-        app.transition_detached_window_state(7, DetachedWindowState::Opening, "test");
-        app.detached_window_hwnd_set(8, 0x800);
-        app.set_detached_window_live_hwnds_for_test([0x800]);
-
-        let after = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x800, false, "Window Class"),
-            thread_window_entry(0x900, false, "Window Class"),
-        ];
-
-        assert!(app.adopt_unclaimed_detached_window_hwnd_after_show(
-            &egui::Context::default(),
-            7,
-            "active_render",
-            App::detached_image_window_viewport_id(7),
-            &after,
-            None,
-        ));
-        assert_eq!(
-            app.detached_window_hwnd_raw_for_window_id(7),
-            0x900,
-            "a no-diff show frame must still claim the one unregistered egui viewport"
-        );
-        assert_eq!(
-            app.detached_window_state(7),
-            Some(DetachedWindowState::Opening),
-            "HWND adoption alone must not complete the content lifecycle"
-        );
-    }
-
-    #[test]
-    fn detached_hwnd_unclaimed_retries_on_zero_or_multiple_unregistered_egui_windows() {
-        let mut claimed = std::collections::HashSet::new();
-        claimed.insert(0x800);
-        let none = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x800, false, "Window Class"),
-        ];
-        assert_eq!(
-            App::select_detached_unclaimed_hwnd(&none, &claimed),
-            DetachedWindowHwndDiff::NoChange
-        );
-
-        let ambiguous = vec![
-            thread_window_entry(0x10, true, "Window Class"),
-            thread_window_entry(0x900, false, "Window Class"),
-            thread_window_entry(0xa00, false, "Window Class"),
-            thread_window_entry(0xb00, false, "Other Class"),
-        ];
-        assert_eq!(
-            App::select_detached_unclaimed_hwnd(&ambiguous, &claimed),
-            DetachedWindowHwndDiff::Ambiguous(vec![0x900, 0xa00])
         );
     }
 
@@ -76254,6 +76136,67 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     #[cfg(windows)]
+    fn detached_scanned_folder_binding_session_follows_new_open_setting() {
+        for independent in [false, true] {
+            let mut app = setup_app();
+            app.settings.detached_viewer_enabled = true;
+            app.settings.detached_viewer_open_images_in_window = independent;
+            let folder = app.tmp.path().join("prepared-folder-session");
+            std::fs::create_dir(&folder).unwrap();
+            image::RgbImage::new(8, 12)
+                .save(folder.join("page.png"))
+                .unwrap();
+            let before = (
+                app.items.clone(),
+                app.selected,
+                app.current_folder.clone(),
+                app.items_generation,
+            );
+            assert!(
+                app.start_active_detached_book_context_from_scanned_folder_with_restore(
+                    folder.clone(),
+                    scan_directory(&folder),
+                    &egui::Context::default(),
+                    None,
+                    None,
+                )
+            );
+            app.with_active_viewer_context(|viewer| {
+                assert_eq!(
+                    viewer.viewer_presentation,
+                    ViewerPresentation::DetachedWindow
+                );
+                assert_eq!(viewer.detached_viewer_independent_active, independent);
+                let window = viewer.detached_viewer_window_id().unwrap();
+                assert_eq!(
+                    viewer
+                        .detached_window_manager
+                        .runtime(window)
+                        .unwrap()
+                        .linked,
+                    !independent
+                );
+                assert_eq!(
+                    viewer.viewer_context_window(viewer.projected_viewer_context_id()),
+                    Some(window)
+                );
+                assert_eq!(viewer.current_folder.as_deref(), Some(folder.as_path()));
+            })
+            .unwrap();
+            assert_eq!(
+                (
+                    app.items.clone(),
+                    app.selected,
+                    app.current_folder.clone(),
+                    app.items_generation
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn mixed_folder_completion_uses_request_collection_anchor_after_selection_moves() {
         let mut app = setup_app();
         app.settings.detached_viewer_open_images_in_window = true;
@@ -76726,6 +76669,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                     ));
                     assert!(
                         app.with_active_viewer_context(|mounted| {
+                            assert_eq!(mounted.viewer_presentation, ViewerPresentation::DetachedWindow);
+                            assert!(mounted.detached_viewer_independent_active);
+                            let window = mounted.detached_viewer_window_id().unwrap();
+                            assert!(!mounted.detached_window_manager.runtime(window).unwrap().linked,
+                                "the loading shell publishes its initial independent runtime before any page opens");
                             mounted.folder_pane_open_pending.is_none()
                         })
                         .unwrap_or(false)
@@ -77642,6 +77590,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
@@ -77681,6 +77630,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let window_id = 22u64;
         let viewport_id = install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
@@ -78289,6 +78239,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
         install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
@@ -83639,6 +83590,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.visible_indices = vec![0];
 
         app.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::None,
@@ -83685,6 +83637,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.visible_indices = vec![0];
 
         let outcome = app.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+            viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
             history_trigger: crate::app::HistoryTrigger::UserChosen,
             resume_slideshow: false,
             target: DeferredFsTarget::Required(crate::snapshot::SnapshotTarget::PdfPage {
@@ -84281,7 +84234,16 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             app.thumbnails = vec![ThumbnailState::Pending];
             app.image_metas = vec![None];
             app.visible_indices = vec![0];
+            // This raw build fixture bypasses descriptor admission. Initialize the
+            // reserved binding as a new book open does, before deferred page open.
+            let independent = app.new_detached_open_is_independent(0);
+            app.commit_viewer_session(
+                ViewerPresentation::DetachedWindow,
+                independent,
+                "test_new_book_binding",
+            );
             app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+                viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                 history_trigger: crate::app::HistoryTrigger::UserChosen,
                 resume_slideshow: false,
                 target: DeferredFsTarget::None,
@@ -92394,7 +92356,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.begin_active_detached_session(5, DetachedSource::Book);
         app.transition_detached_window_state(82, DetachedWindowState::ParkedLive, "test_setup");
 
-        assert!(app.prepare_parked_live_audio_continuous_target(audio_b));
+        assert!(app.prepare_parked_live_media_target(audio_b));
 
         let session = app
             .active_detached_session
@@ -94347,701 +94309,6 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     #[cfg(windows)]
-    fn deferred_detached_registration_serializes_unconfirmed_hwnds_per_frame() {
-        let mut app = setup_app();
-        app.detached_window_hwnd_set(10, 0x1010);
-        app.set_detached_window_live_hwnds_for_test([0x1010]);
-
-        let mut unconfirmed_claimed = false;
-        assert!(
-            app.deferred_detached_window_registration_allowed(10, &mut unconfirmed_claimed),
-            "an already confirmed deferred viewport may be registered even after another unknown one"
-        );
-        assert!(!unconfirmed_claimed);
-        assert!(
-            app.deferred_detached_window_registration_allowed(11, &mut unconfirmed_claimed),
-            "the first unknown deferred viewport in a frame is allowed to create its HWND"
-        );
-        assert!(unconfirmed_claimed);
-        assert!(
-            app.deferred_detached_window_registration_allowed(10, &mut unconfirmed_claimed),
-            "confirmed deferred viewports must not be delayed even after another unknown viewport claimed the frame"
-        );
-        assert!(
-            !app.deferred_detached_window_registration_allowed(12, &mut unconfirmed_claimed),
-            "a second unknown deferred viewport in the same frame would make unclaimed HWND adoption ambiguous"
-        );
-
-        let mut next_frame_claim = false;
-        assert!(
-            app.deferred_detached_window_registration_allowed(12, &mut next_frame_claim),
-            "serialization is per-frame; the delayed viewport is allowed on the next root pass"
-        );
-    }
-
-    #[cfg(windows)]
-    fn activation_target_rect(eligible: bool) -> DetachedActivationWatchTargetRect {
-        activation_target_rect_with_close_hit_test(
-            eligible,
-            DetachedActivationCloseHitTest::ImageBar,
-        )
-    }
-
-    #[cfg(windows)]
-    fn activation_target_rect_with_close_hit_test(
-        eligible: bool,
-        close_hit_test: DetachedActivationCloseHitTest,
-    ) -> DetachedActivationWatchTargetRect {
-        DetachedActivationWatchTargetRect {
-            window_id: 7,
-            hwnd: 0x1000,
-            eligible,
-            close_hit_test,
-            left: 100,
-            top: 100,
-            right: 300,
-            bottom: 240,
-        }
-    }
-
-    #[cfg(windows)]
-    fn activation_sample(
-        left_button_down: bool,
-        foreground_hwnd: u64,
-        cursor_root_hwnd: u64,
-        cursor_pos: Option<(i32, i32)>,
-    ) -> DetachedActivationWatchSample {
-        DetachedActivationWatchSample {
-            left_button_down,
-            foreground_hwnd,
-            cursor_root_hwnd,
-            native_close_hit_hwnd: 0,
-            cursor_pos,
-        }
-    }
-
-    #[cfg(windows)]
-    fn activation_sample_native_close(
-        left_button_down: bool,
-        foreground_hwnd: u64,
-        cursor_root_hwnd: u64,
-        native_close_hit_hwnd: u64,
-        cursor_pos: Option<(i32, i32)>,
-    ) -> DetachedActivationWatchSample {
-        DetachedActivationWatchSample {
-            left_button_down,
-            foreground_hwnd,
-            cursor_root_hwnd,
-            native_close_hit_hwnd,
-            cursor_pos,
-        }
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_commits_click_release_inside_passive_window() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x1000, 0x1000, Some((123, 132))),
-                &targets,
-            ),
-            Some(7),
-            "down/up with a small movement inside the passive HWND should activate"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_ignores_alt_tab_focus_without_mouse_down() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x1000, 0x1000, Some((120, 130))),
-                &targets,
-            ),
-            None,
-            "focus changes without a physical left-button down edge must not activate"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_drops_title_bar_drag_release() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((120, 112))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((160, 112))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x1000, 0x1000, Some((160, 112))),
-                &targets,
-            ),
-            None,
-            "large movement from the passive title bar is treated as a window drag, not activation"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_commits_content_drag_release() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((120, 170))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((190, 210))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x1000, 0x1000, Some((190, 210))),
-                &targets,
-            ),
-            Some(7),
-            "content-area pointer movement is still an activation click because passive content has no drag operation"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_close_button_sends_close_not_activation() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step_result(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((270, 120))),
-                &targets,
-            ),
-            DetachedActivationWatchStepResult::default()
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample(false, 0x1000, 0x1000, Some((270, 120))),
-            &targets,
-        );
-        assert_eq!(result.activation, None);
-        assert_eq!(result.close, Some(DetachedCloseRequest { window_id: 7 }));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_close_button_release_outside_is_ignored() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step_result(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((270, 120))),
-                &targets,
-            ),
-            DetachedActivationWatchStepResult::default()
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample(false, 0x1000, 0x1000, Some((250, 120))),
-            &targets,
-        );
-        assert_eq!(result.activation, None);
-        assert_eq!(result.close, None);
-        assert_eq!(
-            result.diagnostic.map(|diagnostic| diagnostic.reason),
-            Some("up_close_outside"),
-            "a close-button press released outside the button is a canceled button click"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_native_caption_close_sends_close_not_activation() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step_result(
-                &mut state,
-                activation_sample_native_close(true, 0x2000, 0x1000, 0x1000, Some((294, 106))),
-                &targets,
-            ),
-            DetachedActivationWatchStepResult::default()
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample_native_close(false, 0x1000, 0x1000, 0x1000, Some((294, 106))),
-            &targets,
-        );
-        assert_eq!(
-            result.close,
-            Some(DetachedCloseRequest { window_id: 7 }),
-            "the OS caption close button must close a passive window even before it activates"
-        );
-        assert_eq!(
-            result.activation, None,
-            "native caption close must win over passive activation"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_native_caption_close_release_outside_is_ignored() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step_result(
-                &mut state,
-                activation_sample_native_close(true, 0x2000, 0x1000, 0x1000, Some((294, 106))),
-                &targets,
-            ),
-            DetachedActivationWatchStepResult::default()
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample_native_close(false, 0x1000, 0x1000, 0, Some((294, 106))),
-            &targets,
-        );
-        assert_eq!(result.close, None);
-        assert_eq!(result.activation, None);
-        assert_eq!(
-            result.diagnostic.map(|diagnostic| diagnostic.reason),
-            Some("up_close_outside"),
-            "native caption close is canceled when release no longer hits HTCLOSE"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_native_caption_close_works_before_activation_ready() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(false)];
-
-        assert_eq!(
-            App::detached_activation_watch_step_result(
-                &mut state,
-                activation_sample_native_close(true, 0x2000, 0x1000, 0x1000, Some((294, 106))),
-                &targets,
-            ),
-            DetachedActivationWatchStepResult::default()
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample_native_close(false, 0x1000, 0x1000, 0x1000, Some((294, 106))),
-            &targets,
-        );
-        assert_eq!(
-            result.close,
-            Some(DetachedCloseRequest { window_id: 7 }),
-            "window manager close must not be gated by passive activation readiness"
-        );
-        assert_eq!(result.activation, None);
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn detached_window_close_button_hit_uses_bar_layout_rect() {
-        let target = activation_target_rect(true);
-        assert!(App::detached_activation_close_button_contains(
-            target,
-            Some((target.right - 10, target.top + 10))
-        ));
-        assert!(!App::detached_activation_close_button_contains(
-            target,
-            Some((target.right - 50, target.top + 10))
-        ));
-        assert!(!App::detached_activation_close_button_contains(
-            target,
-            Some((target.right - 10, target.top + 50))
-        ));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn detached_music_window_close_button_hit_uses_music_chrome_slot() {
-        let target = activation_target_rect_with_close_hit_test(
-            true,
-            DetachedActivationCloseHitTest::MusicChrome,
-        );
-        let full = egui::Rect::from_min_max(
-            egui::pos2(target.left as f32, target.top as f32),
-            egui::pos2(target.right as f32, target.bottom as f32),
-        );
-        let close = App::parked_live_music_close_slot_rect(
-            full,
-            crate::ui_helpers::panel_edge_trigger_px(full.width()),
-        )
-        .expect("normal music parked window should have a close slot");
-
-        assert!(App::detached_activation_close_button_contains(
-            target,
-            Some((close.center().x as i32, close.center().y as i32))
-        ));
-        assert!(
-            !App::detached_activation_close_button_contains(
-                target,
-                Some((target.right - 10, target.top + 10))
-            ),
-            "music parked windows must not reuse the legacy image close-bar hit rect"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn detached_music_window_close_button_hit_ignores_invalid_layout() {
-        let target = DetachedActivationWatchTargetRect {
-            window_id: 7,
-            hwnd: 0x7000,
-            left: 100,
-            top: 100,
-            right: 140,
-            bottom: 140,
-            eligible: true,
-            close_hit_test: DetachedActivationCloseHitTest::MusicChrome,
-        };
-
-        assert!(
-            App::parked_live_music_close_slot_rect(
-                egui::Rect::from_min_max(
-                    egui::pos2(target.left as f32, target.top as f32),
-                    egui::pos2(target.right as f32, target.bottom as f32),
-                ),
-                crate::ui_helpers::panel_edge_trigger_px((target.right - target.left) as f32),
-            )
-            .is_none(),
-            "the tiny music window layout has no valid close slot"
-        );
-        assert!(
-            !App::detached_activation_close_button_contains(
-                target,
-                Some((
-                    (target.left + target.right) / 2,
-                    (target.top + target.bottom) / 2
-                ))
-            ),
-            "invalid music chrome layout must not treat the whole window as the close button"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_ignores_down_edge_outside_passive_hwnd() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x2000, 0x2000, Some((20, 30))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x2000, 0x2000, Some((20, 30))),
-                &targets,
-            ),
-            None,
-            "clicks whose cursor root HWND is not a passive window are ignored"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_resolves_overlapping_targets_by_cursor_root_hwnd() {
-        // findings-19 実機バグ: parked 窓が重なっているとき、targets のリスト順
-        // (≠ z-order) の矩形あたり判定が背面窓を照準に選び、前面窓へのクリックが
-        // hwnd 不一致で丸ごと棄却されていた。OS の cursor_root_hwnd と一致する
-        // target を優先して解決することを固定する。
-        let back = DetachedActivationWatchTargetRect {
-            window_id: 3,
-            hwnd: 0x3000,
-            eligible: true,
-            close_hit_test: DetachedActivationCloseHitTest::ImageBar,
-            left: 50,
-            top: 50,
-            right: 350,
-            bottom: 300,
-        };
-        let front = DetachedActivationWatchTargetRect {
-            window_id: 6,
-            hwnd: 0x6000,
-            eligible: true,
-            close_hit_test: DetachedActivationCloseHitTest::ImageBar,
-            left: 100,
-            top: 100,
-            right: 400,
-            bottom: 350,
-        };
-        // 背面窓がリスト先頭 = 実機で踏んだ順序。クリック点は両矩形の重なり内。
-        let targets = [back, front];
-        let mut state = DetachedActivationWatchState::default();
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x6000, 0x6000, Some((200, 200))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x6000, 0x6000, Some((200, 200))),
-                &targets,
-            ),
-            Some(6),
-            "a click on the front window must activate it even when a back window's \
-             rect also contains the cursor and precedes it in the target list"
-        );
-
-        // 逆方向: 同じ重なり点でも root が背面窓なら背面窓が照準になる。
-        let mut state = DetachedActivationWatchState::default();
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x3000, 0x3000, Some((200, 200))),
-                &targets,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x3000, 0x3000, Some((200, 200))),
-                &targets,
-            ),
-            Some(3),
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_rejects_repair_candidate_claimed_by_other_runtime() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-        let result = App::detached_activation_watch_step_result_with_context(
-            &mut state,
-            activation_sample(true, 0x4000, 0x4000, Some((120, 170))),
-            &targets,
-            0,
-            &[0x4000],
-        );
-        assert_eq!(result.activation, None);
-        assert_eq!(
-            result.diagnostic.map(|diagnostic| diagnostic.reason),
-            Some("down_claimed_window"),
-            "rect fallback must not attribute clicks on an already-claimed HWND to another parked window"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_rejects_repair_candidate_on_main_window() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-        let result = App::detached_activation_watch_step_result_with_context(
-            &mut state,
-            activation_sample(true, 0x5000, 0x5000, Some((120, 170))),
-            &targets,
-            0x5000,
-            &[],
-        );
-        assert_eq!(result.activation, None);
-        assert_eq!(
-            result.diagnostic.map(|diagnostic| diagnostic.reason),
-            Some("down_main_window"),
-            "rect fallback must not treat a main-window click as a parked-window repair candidate"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_allows_foreground_lag_on_down_edge() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x2000, 0x1000, Some((120, 130))),
-                &targets,
-            ),
-            None,
-            "down edge should use the cursor root HWND, not the still-stale foreground HWND"
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x1000, 0x1000, Some((122, 131))),
-                &targets,
-            ),
-            Some(7),
-            "up edge validates foreground after Windows has completed activation"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_rejects_when_foreground_never_moves_to_target() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x2000, 0x1000, Some((120, 130))),
-                &targets,
-            ),
-            None
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample(false, 0x2000, 0x1000, Some((122, 131))),
-            &targets,
-        );
-        assert_eq!(result.activation, None);
-        assert_eq!(
-            result.diagnostic.map(|diagnostic| diagnostic.reason),
-            Some("up_foreground_mismatch"),
-            "up edge remains the safety gate when foreground did not settle on the clicked window"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_requests_hwnd_repair_for_stale_registry() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x2000, 0x3000, Some((120, 130))),
-                &targets,
-            ),
-            None,
-            "down edge may see a newly recreated HWND under the cursor before the registry updates"
-        );
-        let result = App::detached_activation_watch_step_result(
-            &mut state,
-            activation_sample(false, 0x3000, 0x3000, Some((122, 131))),
-            &targets,
-        );
-        assert_eq!(
-            result.activation,
-            Some(DetachedActivationRequest {
-                window_id: 7,
-                repair_hwnd: Some(0x3000),
-            }),
-            "up edge should preserve activation and carry the observed HWND for App-side validation"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_consumes_park_origin_click_while_ineligible() {
-        let mut state = DetachedActivationWatchState::default();
-        let ineligible = [activation_target_rect(false)];
-        let eligible = [activation_target_rect(true)];
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
-                &ineligible,
-            ),
-            None
-        );
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(false, 0x1000, 0x1000, Some((120, 130))),
-                &eligible,
-            ),
-            None,
-            "the click that caused park is consumed before activation becomes eligible"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn activation_watcher_resets_when_no_passive_targets_exist() {
-        let mut state = DetachedActivationWatchState::default();
-        let targets = [activation_target_rect(true)];
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
-                &targets,
-            ),
-            None
-        );
-        assert!(state.left_button_was_down);
-
-        assert_eq!(
-            App::detached_activation_watch_step(
-                &mut state,
-                activation_sample(true, 0x1000, 0x1000, Some((120, 130))),
-                &[],
-            ),
-            None
-        );
-        assert_eq!(
-            state,
-            DetachedActivationWatchState::default(),
-            "passive zero stops the watcher state instead of carrying a stale press"
-        );
-    }
-
-    #[test]
-    #[cfg(windows)]
     fn parked_hwnd_liveness_recreation_returns_to_activatable_parked() {
         let mut app = setup_app();
         let ctx = egui::Context::default();
@@ -95106,12 +94373,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             Some(DetachedWindowState::Parked),
             "passive post-show registration must return a recreated host to Parked"
         );
-        assert!(
-            app.deferred_detached_activation_watch_targets()
-                .iter()
-                .any(|target| target.window_id == 7),
-            "the recreated passive window must re-enter activation watcher ownership"
-        );
+        assert!(app.detached_window_can_activate(7));
     }
 
     #[test]
@@ -95185,8 +94447,93 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             right_drag: None,
         });
 
+        ctx.set_embed_viewports(false);
+        let viewport = App::detached_image_window_viewport_id(7);
+        let template =
+            app.detached_activation_request(&ctx, 7, DetachedActivationSource::ClientClick);
+        let callback_shared = shared.clone();
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let callback_shared = callback_shared.clone();
+            let template = template.clone();
+            ui.ctx().show_viewport_deferred(
+                viewport,
+                egui::ViewportBuilder::default(),
+                move |ui, _| {
+                    let ctx = ui.ctx();
+                    let geometry = crate::touch_input::TapZoneGeometry {
+                        surface: egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(400.0, 300.0),
+                        ),
+                        excluded: Vec::new(),
+                        behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                            accepts_pinch: true,
+                            tap_zones: true,
+                        },
+                    };
+                    let mut request = template.clone();
+                    request.registration = ctx.viewport_registration(viewport);
+                    if callback_shared
+                        .capture_client_activation(
+                            ctx,
+                            geometry,
+                            detached_activation_gesture::ClientActivationAvailability::Available,
+                            request.clone(),
+                            egui::Rect::NOTHING,
+                        )
+                        .is_some()
+                    {
+                        callback_shared
+                            .push_event(DeferredDetachedImageWindowEvent::Activation { request });
+                    }
+                },
+            );
+        });
+        let callback = output.viewport_output[&viewport]
+            .viewport_ui_cb
+            .clone()
+            .unwrap();
+        output.drop_without_applying_deltas();
+        let pos = egui::pos2(100.0, 100.0);
+        let mut input = egui::RawInput {
+            viewport_id: viewport,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+            ..Default::default()
+        };
+        input.viewports.insert(
+            viewport,
+            egui::ViewportInfo {
+                parent: Some(egui::ViewportId::ROOT),
+                ..Default::default()
+            },
+        );
+        ctx.run_ui(input, |ui| callback(ui))
+            .drop_without_applying_deltas();
         app.process_deferred_detached_image_window_events_for_test(&ctx);
-        app.queue_deferred_detached_window_activation(7, "test_watcher");
+        // A late passive render in this root frame must not commit the queued
+        // client request after the active viewer's update has already finished.
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            app.render_detached_image_windows(ui.ctx());
+        })
+        .drop_without_applying_deltas();
 
         assert_eq!(
             app.detached_image_windows.len(),
@@ -100172,6 +99519,7 @@ mod smart_folder_transition_tests {
                 owner_context: app.projected_viewer_context_id(),
                 restore_video_tile: false,
                 reopen: DeferredFsReopen {
+                    viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
                     history_trigger: crate::app::HistoryTrigger::UserChosen,
                     resume_slideshow: false,
                     target: DeferredFsTarget::None,
@@ -100459,6 +99807,74 @@ mod smart_folder_transition_tests {
             app.show_archive_convert_dialog(ctx);
         })
         .drop_without_applying_deltas();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn realmachine50_foreign_zip_offer_transfers_main_origin_and_cancel_does_not_handoff() {
+        let _input = crate::key_input::lock_test_input();
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings
+            .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+        let path = app.tmp.path().join("main-origin-foreign.zip");
+        write_convert_completion_zip(&path);
+        app.load_folder(path.clone());
+        super::phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut app);
+        app.finish_page_identity_preparation_for_test();
+        let ctx = egui::Context::default();
+        let old_window = 88_995;
+        let old =
+            app.build_active_context_for_test(Some(old_window), DetachedSource::Image, |viewer| {
+                crate::app::depth_view_tests::install_pages(viewer, &ctx);
+                viewer.viewer_presentation = ViewerPresentation::DetachedWindow;
+                viewer.detached_viewer_independent_active = true;
+                viewer.set_fs_exclusive_view(
+                    crate::fs_exclusive_view::FsExclusiveView::Depth(
+                        crate::depth_parallax::DepthViewState::new(
+                            viewer.edit_request_owner_context(),
+                        ),
+                    ),
+                    "realmachine50_foreign_offer_before_confirmation",
+                );
+            });
+        let origin = StartupOpenPathOwner::Activation.viewer_open_adoption();
+        app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            viewer_adoption: origin,
+            history_trigger: HistoryTrigger::UserChosen,
+            resume_slideshow: false,
+            target: DeferredFsTarget::None,
+            resume_to_last_page: false.into(),
+            from_explicit_open: true,
+            preserve_after_password_prompt: true,
+        });
+        app.finish_installed_zip_first_display(true, StartupListIntent::PageContinuation);
+        let Some(HistoryNavigationTransition::Physical(request)) =
+            app.top_level_grid_view.history_navigation_transition()
+        else {
+            panic!("the offer must own the same main viewer adoption");
+        };
+        assert_eq!(request.navigation.viewer_adoption, origin);
+        assert!(app.fs_nav_after_pdf_enumerate.is_none());
+        assert_eq!(app.active_detached_window_id(), Some(old_window));
+        assert_eq!(app.locate_window_context(old_window).unwrap().0, old);
+        app.with_viewer_context(old, |viewer| assert!(viewer.fs_exclusive_view.is_depth()))
+            .unwrap();
+        assert!(app.detached_image_windows.is_empty());
+        assert!(app.cancel_archive_convert_for_navigation("realmachine50_foreign_cancel"));
+        app.poll_collection_history_transition(&ctx);
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        assert_eq!(app.active_detached_window_id(), Some(old_window));
+        assert_eq!(app.locate_window_context(old_window).unwrap().0, old);
+        app.with_viewer_context(old, |viewer| assert!(viewer.fs_exclusive_view.is_depth()))
+            .unwrap();
+        assert!(app.detached_image_windows.is_empty());
     }
 
     #[test]
@@ -110522,7 +109938,26 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
     let body = method_body("take_and_close_current_active_viewer_context_with_metadata_boundary");
     assert!(body.contains("self.take_and_close_active_context_with_cause(ctx, reason, boundary, ViewerCloseCause::User)"),
         "metadata境界付きseamがUser causeを持つterminal ownerへ配送されていない");
-    let body = method_body("take_and_close_active_context_with_cause");
+    let active = method_body("take_and_close_active_context_with_cause");
+    let resolve = active
+        .find("let id = self.active_viewer_context_id()?;")
+        .expect("active wrapper must resolve its owner");
+    let delegate = active
+        .find("self.take_and_close_context_with_cause(ctx, id, reason, boundary, cause)")
+        .expect("active wrapper must delegate its resolved id and typed cause");
+    assert!(
+        resolve < delegate,
+        "resolve the active id before delegation"
+    );
+    let body = method_body("take_and_close_context_with_cause");
+    assert!(
+        body.contains("id: ViewerContextId"),
+        "terminal owner accepts the explicit context id"
+    );
+    assert!(
+        !body.contains("self.active_viewer_context_id()"),
+        "terminal owner must not retarget the supplied id"
+    );
     let body = body.as_str();
     let transfer = body
         .find("self.transfer_terminal_close_return(id, cause);")
@@ -110581,6 +110016,42 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
             .unwrap()
             .0
             .contains("close_fullscreen_to_completion")
+    );
+
+    // Resume handoff retains the source resolved before the destination is taken.
+    let handoff = method_body("park_detached_viewer_for_handoff");
+    assert!(handoff.contains("source: Option<ViewerContextId>"));
+    assert!(handoff.contains("else if let Some(id) = source_at_rest"));
+    let explicit_args = handoff
+        .split_once(".take_and_close_context_with_cause(")
+        .expect("snapshot-less handoff must use the same explicit-id terminal owner")
+        .1
+        .split_once(')')
+        .expect("handoff terminal call must close its argument list")
+        .0
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    assert!(explicit_args.starts_with("ctx,id,"));
+    assert!(explicit_args.contains("FsMetadataBoundary::Manual"));
+    assert!(explicit_args.contains("ViewerCloseCause::Replaced"));
+    assert_eq!(
+        src.matches("take_and_close_context_with_cause(").count(),
+        3,
+        "explicit-id terminal owner has its definition, active wrapper and handoff caller; audit any new entry"
+    );
+    let activation = method_body("take_detached_snapshot_for_activation");
+    let park = activation
+        .find(
+            "self.park_detached_viewer_for_handoff(ctx, source, preserve_fullfeature_linked_still)",
+        )
+        .expect("activation must hand off its captured source through the shared owner");
+    let take = activation
+        .find("self.detached_image_windows.remove(pos)")
+        .expect("activation must take its destination snapshot");
+    assert!(
+        park < take,
+        "handoff the captured source before taking the destination"
     );
 }
 
@@ -111368,7 +110839,13 @@ fn detached_host_change_wakes_root_without_touching_sibling_context() {
     app.transition_detached_window_state(7, DetachedWindowState::ParkedLive, "test_setup");
     app.pending_detached_video_host_resync = true;
 
-    assert!(app.repair_detached_window_hwnd_from_watcher_unchecked(&ctx, 7, 0x7000));
+    let _backend = backend_window_for_test(&ctx, 7, 0x7000);
+    assert!(app.adopt_backend_detached_window_hwnd(
+        &ctx,
+        7,
+        "passive",
+        App::detached_image_window_viewport_id(7)
+    ));
 
     assert!(requests.lock().unwrap().iter().any(|request| {
         request.viewport_id == egui::ViewportId::ROOT && request.delay.is_zero()
@@ -112996,6 +112473,19 @@ fn visibility_detached_collection_root_adopts_its_captured_policy_and_identity()
         None
     ));
     app.with_active_viewer_context(|active| {
+        assert_eq!(
+            active.viewer_presentation,
+            ViewerPresentation::DetachedWindow
+        );
+        assert!(active.detached_viewer_independent_active);
+        let window = active.detached_viewer_window_id().unwrap();
+        assert!(
+            !active
+                .detached_window_manager
+                .runtime(window)
+                .unwrap()
+                .linked
+        );
         assert_eq!(active.page_identity_index.policy, accepted_policy);
         assert!(Arc::ptr_eq(&active.page_identity_index, &accepted_map));
         assert_eq!(
@@ -115783,4 +115273,109 @@ mod ring_saved_group_fullscreen_tests {
         assert!(app.saved_group_open.is_none());
         app.shutdown_collection_runtime_for_exit();
     }
+}
+
+#[test]
+#[cfg(windows)]
+fn detached_backend_hwnd_authority_is_per_viewport_and_recreation_keeps_sibling() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    for id in [7, 8] {
+        app.transition_detached_window_state(id, DetachedWindowState::Opening, "test");
+    }
+    app.set_detached_window_live_hwnds_for_test([0x7000, 0x7100, 0x8000]);
+    let mut old = backend_window_for_test(&ctx, 7, 0x7000);
+    let _sibling = backend_window_for_test(&ctx, 8, 0x8000);
+    let vp = App::detached_image_window_viewport_id(7);
+    app.register_detached_window_hwnd_after_show(&ctx, 7, "active_render", vp);
+    app.adopt_deferred_detached_window_hwnd_after_callback(
+        &ctx,
+        8,
+        App::detached_image_window_viewport_id(8),
+    );
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x7000);
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(8), 0x8000);
+    old.retire();
+    let _new = backend_window_for_test(&ctx, 7, 0x7100);
+    app.register_detached_window_hwnd_after_show(&ctx, 7, "active_render", vp);
+    drop(old);
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x7100);
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(8), 0x8000);
+    assert_eq!(
+        app.detached_window_state(7),
+        Some(DetachedWindowState::Opening)
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn detached_backend_hwnd_adoption_requires_current_logical_lifetime() {
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    app.transition_detached_window_state(7, DetachedWindowState::Opening, "test");
+    let mut old = backend_window_for_test(&ctx, 7, 0x7000);
+    let viewport = App::detached_image_window_viewport_id(7);
+    let old_registration = ctx.viewport_registration(viewport).unwrap();
+    ctx.retire_viewport(viewport);
+    ctx.show_viewport_deferred(viewport, Default::default(), |_, _| {});
+    assert_ne!(ctx.viewport_registration(viewport), Some(old_registration));
+    // Logical retirement precedes the backend's native cleanup. An old physical
+    // allocation may still be queried, but it cannot become the new host.
+    app.adopt_deferred_detached_window_hwnd_after_callback(&ctx, 7, viewport);
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0);
+    old.retire();
+    let _new = backend_window_for_test(&ctx, 7, 0x7100);
+    app.adopt_deferred_detached_window_hwnd_after_callback(&ctx, 7, viewport);
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0x7100);
+}
+
+#[test]
+#[cfg(windows)]
+fn detached_backend_hwnd_reuse_retires_host_claim_and_reseeds_same_handle() {
+    use super::detached_window_manager::PlacementOutcome;
+    let mut app = phase_c_support::setup_app();
+    let ctx = egui::Context::default();
+    app.push_window_context_for_test(&ctx, 7, |_| {});
+    let placement = app.default_detached_viewer_window_placement();
+    app.detached_window_manager
+        .set_placement(7, placement, false);
+    app.set_detached_window_live_hwnds_for_test([0x7000]);
+    let mut old = backend_window_for_test(&ctx, 7, 0x7000);
+    let viewport = App::detached_image_window_viewport_id(7);
+    app.register_detached_window_hwnd_after_show(&ctx, 7, "passive", viewport);
+    let old_claim = app.detached_window_manager.host_claim_alive(7).unwrap();
+    app.detached_window_manager
+        .mark_host_placed(old_claim, PlacementOutcome::Exact);
+    app.detached_image_windows
+        .iter_mut()
+        .find(|window| window.id == 7)
+        .unwrap()
+        .initial_placement_applied = true;
+    assert!(app.detached_window_host_is_placed(7));
+    old.retire();
+    // IsWindow alone still reports this numeric handle alive (e.g. a retained
+    // old Arc<Window>); the native owner has nevertheless ended synchronously.
+    assert!(app.detached_window_hwnd_is_alive(0x7000));
+    assert_eq!(app.detached_window_hwnd_raw_for_window_id(7), 0);
+    assert_eq!(app.detached_window_hwnd_alive(7), None);
+    assert!(!app.detached_window_manager.host_claim_is_alive(old_claim));
+    assert!(!app.detached_window_host_is_placed(7));
+    let _new = backend_window_for_test(&ctx, 7, 0x7000);
+    app.register_detached_window_hwnd_after_show(&ctx, 7, "passive", viewport);
+    let new_claim = app.detached_window_manager.host_claim_alive(7).unwrap();
+    assert_ne!(old_claim.incarnation, new_claim.incarnation);
+    assert!(!app.detached_window_manager.host_claim_is_alive(old_claim));
+    assert_eq!(
+        app.detached_window_manager.runtime(7).unwrap().placement,
+        Some(placement)
+    );
+    assert!(
+        !app.detached_image_windows
+            .iter()
+            .find(|window| window.id == 7)
+            .unwrap()
+            .initial_placement_applied
+    );
+    drop(old);
+    assert!(app.detached_window_manager.host_claim_is_alive(new_claim));
 }

@@ -1,5 +1,61 @@
 # 非同期・並列アーキテクチャ
 
+## 外部openの採用区分（§1.767、依頼50 B）
+
+既存startup ownerが新規main採用／既存C継続を確定し、`MainListNavigation`から返された正本hydrationへ、
+またsidecar exact request・composition・required／列挙reopenへ同じtyped値を運ぶ。
+`Navigation`や要求処理の`Continuation` stageだけでviewerの由来を判定しない。
+採用可能なrowが決まってから新規mainだけが通常gridのhandoffを一度通す。modal解除にcleanupを足さず、
+既存の最後の1件保留から同じ採用へ戻す。PDF warmの即時行採用、既存worker／非同期待機は維持する。
+明示leafは同じsidecar ownerのauto-folder page-choiceを置換し、二つの完了から別々にviewerを公開しない。
+区分の確定・移譲箇所は[依頼50調査書 §3.3](depth-parallax-realmachine50-investigation.md#33-非active化と同型入口の監査)を参照。
+## ローカル文字起こしの transport・作成・表示（T1 区切り3）
+
+`ai::asr_worker` は `mimageviewer-vlm.exe --asr-serve` を Job Object 内で起動する。
+VLM と共有するのは executable の取り出し、framing、子の起動と GPU 列挙だけで、
+モデル・pipe・状態・停止権は各プロセスに所属する。GPU の使用可否は役割ごとに判定する。
+ASR は software adapter を除いた最大専用メモリの GPU を選び、専用メモリ0も残す。
+選択したLUIDをloadへ送り、workerは最新の列挙へLUIDで照合する。応答のLUIDも要求と照合し、
+列挙順が変わっても選択したGPUのidentityを維持する。
+
+`AsrWorkerClient::start` 後に kill handle を公開し、worker thread で hello/load を行う。
+`split` 後の `AsrInput` は抽出 thread が begin/PCM/end を書き、`AsrOutput` は別 thread が
+begin/progress/window/end を読む。PCM は1枠1MiBまで、結果の読み取り queue は容量1。
+一方の endpoint の Drop または KillHandle でプロセスを止め、相手の pipe 待ちも解く。
+モデルは複数の begin/end で保持する。中止命令、再起動、再試行、UI thread の待ちは追加しない。
+採用するtoken本文の復元不能なUTF-8はworkerがその断片だけ捨て、不一致byteを再評価する。
+正常な区間またぎの持越しは維持し、窓末尾の未完断片は捨てる。WindowとEndは捨てたbyte数・
+断片数を持ち、clientは窓の合計と終端を照合する。作成workerが入力ごとにperfとログへ出し、DBには保存しない。
+入力単位の失敗応答や読み捨て状態は持たない。抽出失敗時は本体が途中でendを送り、
+返った窓を捨てれば同じモデルで次のbeginへ進める。
+入力側の全sample数と終端durationも照合する。壊れたwireやGPU・モデル失敗は致命的なまま。
+Appの単一 `TranscriptJob` が待ち行列とRunning/Stoppingを所有し、実行役には1件ずつ渡す。
+中止は受付を閉じ、取消の印とkillを即時に伝える。保存commit済みのItemDoneとFinishedは
+中止後も採用し、Finishedまではownerを解放しない。説明文ジョブとは別process・別状態で動く。
+UIのイベント採用は1pass最大64件。上限まで処理してownerが残る場合だけ次passを予約し、
+大量のProgressの後ろにある保存・終了通知も処理する。空queueと終端では追加予約しない。
+モデル案内と削除の全phaseだけをmodalにし、長い作成と取得の進捗はmodelessで閲覧を止めない。
+
+`transcript_job_worker` はprobe・署名・DB参照と保存を所有する。同じ入力のPCM抽出・pipe書込みは
+scoped thread、窓の受信・後処理は実行役で並行する。joinするのは背景の実行役だけで、UIでは待たない。
+FFmpegは既存のdecoder-open・音声一覧と選択関数を共用する。自身のInputから作る `MediaTimeline` が
+音声PTSをメディア時刻へ変換し、`aresample=async=1:first_pts=0` で0からの先頭遅延を無音で埋め、
+負のsampleを捨てる。正の開始時刻を持つMKVは原点0のためその先頭遅延を保持する。tempfileは作らない。
+保存は `BEGIN IMMEDIATE` 内で署名を取り直してから行う。失敗で既存okを上書きしない。
+
+`transcript.db` のtriggerがrev・indexed・削除印を管理する。STORESの表示cache記述から
+説明文/文字起こしの失効印を作り、metadata転送も同じ完了採用点へ渡す。
+App共通の `TranscriptDisplayCache` がこの印で失効する。遅延起動する単一readerが短いread-only SELECTとstatを行い、
+rootはtry_recvとepoch/要求世代の照合だけを行う。clear/invalidate後は旧Arcを外してLoadingを配信する。
+読み取り表示の再入場refreshだけでは既存値を消さず、兄弟panelの本文を維持する。cacheは32entry上限、joinはしない。
+共通snapshotは保存本文、job所属、applied track、作成日をまとめる。区間・再生位置・seekは同じメディア時刻で、
+snapshotに原点や原点待ちの状態は持たせない。
+nativeのlatest-value commandはmarker同期から独立し、同じ値なら再送しない。
+source swapで空にし、F12のrender core再生成ではsource側のsnapshotを復元する。
+musicは同じbuilderとrendererを使い、panelの一時状態をnativeと共有しない。索引への反映はT2で接続する。
+仕様は [ASR計画 §4〜6](local-asr-transcript-plan.md)、検証記録は
+[区切り1](local-asr-t1-chunk1-report.md)・[区切り2](local-asr-t1-chunk2-report.md)・[区切り3](local-asr-t1-chunk3-report.md) を参照。
+
 ## 3D 写真の書き出し worker（2026-11-07、段 C）
 
 `depth_export.rs` はモーダル操作ごとに `depth-export` thread を1本作る。App の単一
@@ -10,7 +66,9 @@ navigation / supersession / rollback の組合せを追加しない。
 パネルのクリックはframe内の意図とし、描画後の素材・ページ・一覧世代を照合して受付する。
 保存時は最新のReady素材と描画snapshotを一組で捕捉し、設定画面中のresizeや背景の素材更新を
 旧snapshotと混ぜない。ナビゲーションの共通受付はmanual／slideshowとも停止し、
-OS closeだけは所有contextの取消へ通す。
+main が所有するときの OS close は従来どおり取消へ通す。main 以外の独立 context が所有するときは、
+modal の間だけ所有窓の OS close を拒否し、通常の body を描く表示先を保持する
+([3D 写真設計](depth-parallax-plan.md) §6.4.3)。
 
 worker は凍結した色・深度 Arc だけを読み、画面と同じ WGSL を専用 pipeline / uniform /
 bind group で不透明な `Rgba8Unorm` へ描く。GPU submit / map / `poll(Wait)`、GIF/APNG の
@@ -39,6 +97,10 @@ map する。`map_async` の完了 channel と `PollType::Poll` を使い、UI �
 
 要求は context / request ID / TextureId / cancel に相関し、結果も同じ所有者で照合する。
 source 切替・OFF・presentation変更・Dropは receiver/cancel と自分の GPU slot を退役する。
+独立 context への表示所有の移動が成功して main の全画面が live pass を失うときも、main を mount して
+同じ終了経路を通す。main 由来の Checking / Confirm の ModeEntry はその境界で失効させるが、
+モデル確認 worker 自体と Preferences 由来の案内は維持する。埋め込み main と通常更新・scoped mount は終了しない
+([3D 設計 §6.4.4](depth-parallax-plan.md))。
 兄弟 context の状態・cache・要求を変更しない。現在色と4件の深度 LRU を所有し、
 色・深度・readback buffer は既存 VRAM 会計へ渡す。推論は共有 AI runtime の直列契約を維持する。
 状態・入口・実装レビューと検証結果の正本は [3D 設計 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位)。
@@ -1492,13 +1554,17 @@ detachedの述語・viewport・context別cacheを変更せず、Remoteのパネ�
 境界と簡素化の判断は [画像の設計 §21.11.2](local-vlm-caption-plan.md#21112-v1-4a-画像の説明文の表示) と
 [本の設計 §21.13](local-vlm-caption-plan.md#2113-v1-4b-の設計-2026-11-03) を参照。
 
-### 3.2.5 AI 説明文の索引への反映（V2a・V2b、未リリース）
+### 3.2.5 派生テキスト（説明文・文字起こし）の索引への反映
 
-反映待ちの正本は `ai_caption.db` の `captions.indexed = 0` と `caption_removed`。
-`IndexerManager` が1つの `Arc<AtomicU64>`（`caption_epoch`）を所有し、再構成workerから
+反映待ちの正本は各DBの `indexed = 0` と削除印（`caption_removed` / `transcript_removed`）。
+`STORES` の `derived_text` が対象の一覧、`display_cache` が表示失効の宣言を持つ。
+変更の集計・metadata transfer・復元・削除・改名は同じdescriptorから索引通知と表示の印を作る。
+`derived_text` モジュールが両DBの読取とpending/ack SQLを共用し、ingestとCtrl+Fも同じ本文変換を使う。
+`IndexerManager` が1つの `Arc<AtomicU64>`（`derived_text_epoch`）を所有し、再構成workerから
 全 metadata supervisor へ同じ参照を渡す。送り手は内容のcommit後、Appの既存完了採用点から
 世代を進めるだけで、UIスレッドのDB参照・管理役一覧への配布・容量付き通知channelを追加しない。
-固定表紙だけの変更は世代を進めない。managerが未準備の間の変更もDBの反映待ちに残る。
+固定表紙だけの変更は世代を進めない。文字起こしの保存は中止後に届くcommit済み終端も同じ通知へ渡す。
+managerが未準備の間の変更もDBの反映待ちに残る。
 AppがReadyを採用するときにも世代を一度進め、background側の初回反映完了からUI採用までの
 間にcommit終端を採用した場合を拾う。新たな待機状態や未処理フラグは持たない。
 

@@ -216,6 +216,7 @@ pub type Viewports = egui::OrderedViewportIdMap<Viewport>;
 
 pub struct Viewport {
     ids: ViewportIdPair,
+    native_input: Option<crate::native_window_input::NativeWindowAllocationLease>,
     registration: Option<egui::ViewportRegistration>,
     parent_registration: Option<egui::ViewportRegistration>,
     class: ViewportClass,
@@ -241,10 +242,31 @@ pub struct Viewport {
     pending_raw_input: egui::RawInput,
 }
 
+impl SharedState {
+    fn retire_native_input(&mut self) {
+        for viewport in self.viewports.values_mut() {
+            crate::native_window_input::retire_window(
+                &mut viewport.native_input,
+                viewport.ids.this,
+                &mut self.viewport_from_window,
+            );
+        }
+    }
+}
+
 impl Drop for SharedState {
     fn drop(&mut self) {
+        self.retire_native_input();
         // The renderer/Context delivery destination ends here, not when a viewport closes.
         self.pending_deltas.clear();
+    }
+}
+
+impl Drop for Viewport {
+    fn drop(&mut self) {
+        if let Some(mut input) = self.native_input.take() {
+            input.retire();
+        }
     }
 }
 
@@ -319,6 +341,7 @@ impl<'app> WgpuWinitApp<'app> {
             self.native_options.viewport.clone(),
             None,
             painter,
+            viewport_from_window,
         )
         .initialize_window(
             event_loop,
@@ -333,7 +356,13 @@ impl<'app> WgpuWinitApp<'app> {
     fn drop_window(&mut self) -> Result<(), egui_wgpu::WgpuError> {
         if let Some(running) = &mut self.running {
             let mut shared = running.shared.borrow_mut();
-            shared.viewports.remove(&ViewportId::ROOT);
+            if let Some(mut viewport) = shared.viewports.remove(&ViewportId::ROOT) {
+                crate::native_window_input::retire_window(
+                    &mut viewport.native_input,
+                    viewport.ids.this,
+                    &mut shared.viewport_from_window,
+                );
+            }
             pollster::block_on(shared.painter.set_window(ViewportId::ROOT, None))?;
         }
         Ok(())
@@ -464,6 +493,10 @@ impl<'app> WgpuWinitApp<'app> {
             raw_display_handle: window.display_handle().map(|h| h.as_raw()),
             raw_window_handle: window.window_handle().map(|h| h.as_raw()),
         };
+        // ROOT follows the same allocation contract as immediate/deferred
+        // children. App creation can attach a listener and replay ROOT now.
+        let native_input =
+            crate::native_window_input::register_window(&egui_ctx, ViewportId::ROOT, &window);
         let app = {
             profiling::scope!("user_app_creator");
             app_creator(&cc).map_err(crate::Error::AppCreation)?
@@ -477,6 +510,7 @@ impl<'app> WgpuWinitApp<'app> {
             ViewportId::ROOT,
             Viewport {
                 ids: ViewportIdPair::ROOT,
+                native_input: Some(native_input),
                 registration: egui_ctx.viewport_registration(ViewportId::ROOT),
                 parent_registration: None,
                 class: ViewportClass::Root,
@@ -753,6 +787,7 @@ impl WgpuWinitRunning<'_> {
 
         super::viewport_lifecycle::finish_pending_retirements(&ctx, &mut self.shared);
         let mut shared = self.shared.borrow_mut();
+        shared.retire_native_input();
         shared.painter.destroy();
     }
 
@@ -1204,7 +1239,13 @@ impl WgpuWinitRunning<'_> {
         } = self;
         let mut shared = shared_owner.borrow_mut();
 
-        let viewport_id = shared.viewport_from_window.get(&window_id).copied();
+        let viewport_id = viewport_for_native_event(&shared.viewport_from_window, window_id);
+        crate::native_window_input::log_unmapped_primary_press(
+            "wgpu",
+            window_id,
+            viewport_id,
+            event,
+        );
 
         // A renderer may be entered from message dispatch only for an InteractiveResize frame
         // responding to this window's non-zero client resize. This decision uses event provenance
@@ -1481,8 +1522,6 @@ impl Viewport {
 
         match egui_winit::create_window(egui_ctx, event_loop, &self.builder) {
             Ok(window) => {
-                windows_id.insert(window.id(), viewport_id);
-
                 let window = Arc::new(window);
 
                 #[cfg(test)]
@@ -1506,6 +1545,12 @@ impl Viewport {
 
                 egui_winit::update_viewport_info(&mut self.info, egui_ctx, &window, true);
                 self.surface_generation = self.surface_generation.wrapping_add(1).max(1);
+                self.native_input = Some(crate::native_window_input::register_window(
+                    egui_ctx,
+                    viewport_id,
+                    &window,
+                ));
+                windows_id.insert(window.id(), viewport_id);
                 self.window = Some(window);
             }
             Err(err) => {
@@ -1632,16 +1677,14 @@ impl super::frame_output::ImmediateViewportBackend for NativeWgpuImmediateBacken
             clipboard_shortcuts,
             ..
         } = &mut *self.shared.borrow_mut();
-        let viewport = initialize_or_update_viewport(
+        let viewport = prepare_immediate_viewport(
+            egui_ctx,
             viewports,
             ids,
-            ViewportClass::Immediate,
             builder,
-            None,
             painter,
+            viewport_from_window,
         );
-        viewport.registration = egui_ctx.viewport_registration(ids.this);
-        viewport.parent_registration = egui_ctx.viewport_registration(ids.parent);
         if viewport.window.is_none() {
             event_loop_context::with_current_event_loop(|event_loop| {
                 viewport.initialize_window(
@@ -1982,8 +2025,8 @@ fn retain_viewport_resources<K: Eq + std::hash::Hash>(
     active: &ViewportIdSet,
     mut retain_surfaces: impl FnMut(&ViewportIdSet),
 ) {
-    viewports.retain(|id, _| active.contains(id));
     viewport_from_window.retain(|_, id| active.contains(id));
+    viewports.retain(|id, _| active.contains(id));
     retain_surfaces(active);
 }
 
@@ -2189,7 +2232,7 @@ fn handle_viewport_output(
     viewport_output: &OrderedViewportIdMap<ViewportOutput>,
     viewports: &mut Viewports,
     painter: &mut egui_wgpu::winit::Painter,
-    _viewport_from_window: &mut HashMap<WindowId, ViewportId>,
+    viewport_from_window: &mut HashMap<WindowId, ViewportId>,
 ) {
     for (
         viewport_id,
@@ -2216,8 +2259,15 @@ fn handle_viewport_output(
         }
         let ids = ViewportIdPair::from_self_and_parent(viewport_id, parent);
 
-        let viewport =
-            initialize_or_update_viewport(viewports, ids, class, builder, viewport_ui_cb, painter);
+        let viewport = initialize_or_update_viewport(
+            viewports,
+            ids,
+            class,
+            builder,
+            viewport_ui_cb,
+            painter,
+            viewport_from_window,
+        );
 
         #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
         if crate::miv_test_script_window_witness::capture_probe_detail_allowed() {
@@ -2271,6 +2321,40 @@ fn handle_viewport_output(
     }
 }
 
+/// Native event delivery uses only the allocation map. Recreation revokes the
+/// old source before publishing the replacement State, even for the same egui
+/// viewport registration.
+fn viewport_for_native_event(
+    viewport_from_window: &HashMap<WindowId, ViewportId>,
+    source: WindowId,
+) -> Option<ViewportId> {
+    viewport_from_window.get(&source).copied()
+}
+
+/// Allocation preparation shared with the headless lifecycle adapter; only the
+/// following native-window creation requires an event loop and renderer.
+fn prepare_immediate_viewport<'a>(
+    ctx: &egui::Context,
+    viewports: &'a mut Viewports,
+    ids: ViewportIdPair,
+    builder: ViewportBuilder,
+    painter: &mut egui_wgpu::winit::Painter,
+    sources: &mut HashMap<WindowId, ViewportId>,
+) -> &'a mut Viewport {
+    let viewport = initialize_or_update_viewport(
+        viewports,
+        ids,
+        ViewportClass::Immediate,
+        builder,
+        None,
+        painter,
+        sources,
+    );
+    viewport.registration = ctx.viewport_registration(ids.this);
+    viewport.parent_registration = ctx.viewport_registration(ids.parent);
+    viewport
+}
+
 fn initialize_or_update_viewport<'a>(
     viewports: &'a mut Viewports,
     ids: ViewportIdPair,
@@ -2278,6 +2362,7 @@ fn initialize_or_update_viewport<'a>(
     mut builder: ViewportBuilder,
     viewport_ui_cb: Option<Arc<dyn Fn(&mut egui::Ui) + Send + Sync>>,
     painter: &mut egui_wgpu::winit::Painter,
+    viewport_from_window: &mut HashMap<WindowId, ViewportId>,
 ) -> &'a mut Viewport {
     use std::collections::btree_map::Entry;
 
@@ -2296,6 +2381,7 @@ fn initialize_or_update_viewport<'a>(
             log::debug!("Creating new viewport {:?} ({:?})", ids.this, builder.title);
             entry.insert(Viewport {
                 ids,
+                native_input: None,
                 registration: None,
                 parent_registration: None,
                 class,
@@ -2334,6 +2420,11 @@ fn initialize_or_update_viewport<'a>(
                         state,
                     );
                 }
+                crate::native_window_input::retire_window(
+                    &mut viewport.native_input,
+                    ids.this,
+                    viewport_from_window,
+                );
                 viewport.window = None;
                 viewport.egui_winit = None;
                 if let Err(err) = pollster::block_on(painter.set_window(viewport.ids.this, None)) {
@@ -2616,6 +2707,7 @@ mod stage2c1_tests {
                 ViewportBuilder::default(),
                 Some(Arc::new(|_| {})),
                 &mut painter,
+                &mut Default::default(),
             );
             viewport.pending_raw_input = egui::RawInput {
                 viewport_id: id,
@@ -2648,6 +2740,7 @@ mod stage2c1_tests {
             ViewportBuilder::default().with_active(false),
             None,
             &mut painter,
+            &mut Default::default(),
         );
         let input = super::super::epi_integration::take_viewport_input(
             &mut viewport.pending_raw_input,
@@ -2685,6 +2778,7 @@ mod stage2c1_tests {
             ViewportBuilder::default(),
             Some(Arc::new(|_| {})),
             &mut painter,
+            &mut Default::default(),
         );
         assert!(recreated.pending_raw_input.events.is_empty());
         assert!(recreated.egui_winit.is_none());
@@ -2767,6 +2861,7 @@ mod stage2c1_tests {
                 ViewportBuilder::default(),
                 None,
                 &mut shared.painter,
+                &mut Default::default(),
             );
         }
         shared
@@ -2871,6 +2966,7 @@ mod stage2c4a_tests {
                 ViewportBuilder::default(),
                 None,
                 &mut shared.painter,
+                &mut Default::default(),
             );
         }
         shared
@@ -3176,6 +3272,7 @@ mod stage2c4a_tests {
             ViewportBuilder::default(),
             None,
             &mut shared.painter,
+            &mut Default::default(),
         );
         let retired = native_viewport_subtree(&shared.viewports, child);
         assert_eq!(retired.len(), 2);
@@ -3417,6 +3514,29 @@ mod viewport_retirement_tests {
         assert!(pollster::block_on(validation.pop()).is_none());
     }
 
+    fn bind_headless_native_input(
+        ctx: &egui::Context,
+        viewports: &mut Viewports,
+        sources: &mut HashMap<WindowId, ViewportId>,
+    ) {
+        for (id, viewport) in viewports {
+            if viewport.native_input.is_none() {
+                let source = WindowId::from(id.0.value());
+                viewport.native_input = Some(
+                    crate::native_window_input::register_native_window_allocation(
+                        ctx,
+                        crate::native_window_input::NativeWindowAllocation {
+                            viewport_id: *id,
+                            registration: viewport.registration.unwrap(),
+                            window_id: source,
+                            windows_hwnd: Some(id.0.value() as isize),
+                        },
+                    ),
+                );
+                sources.insert(source, *id);
+            }
+        }
+    }
     impl Adapter for Headless {
         fn new(ctx: &egui::Context) -> Self {
             Rc::new(RefCell::new(SharedState {
@@ -3444,6 +3564,7 @@ mod viewport_retirement_tests {
                 ..
             } = &mut *state;
             handle_viewport_output(ctx, outputs, viewports, painter, viewport_from_window);
+            bind_headless_native_input(ctx, viewports, viewport_from_window);
             for (id, viewport) in viewports {
                 viewport.pending_raw_input.viewport_id = *id;
                 if *id != ViewportId::ROOT {
@@ -3461,6 +3582,24 @@ mod viewport_retirement_tests {
                         .push(egui::Event::Text(format!("pending-{id:?}")));
                 }
             }
+        }
+
+        fn prepare_immediate(
+            &mut self,
+            ctx: &egui::Context,
+            ids: ViewportIdPair,
+            builder: ViewportBuilder,
+        ) {
+            replace_stale_wgpu_viewport(self, ctx, ids.this);
+            let mut state = self.borrow_mut();
+            let SharedState {
+                viewports,
+                painter,
+                viewport_from_window,
+                ..
+            } = &mut *state;
+            prepare_immediate_viewport(ctx, viewports, ids, builder, painter, viewport_from_window);
+            bind_headless_native_input(ctx, viewports, viewport_from_window);
         }
         fn registration_for(&self, id: ViewportId) -> Option<egui::ViewportRegistration> {
             self.borrow()
@@ -3532,6 +3671,27 @@ mod viewport_retirement_tests {
             }
             events
         }
+        fn allocation_sources(&self) -> Vec<(WindowId, ViewportId, ViewportClass)> {
+            let state = self.borrow();
+            state
+                .viewport_from_window
+                .iter()
+                .map(|(source, id)| (*source, *id, state.viewports[id].class))
+                .collect()
+        }
+        fn shutdown_native_input(&mut self) {
+            self.borrow_mut().retire_native_input();
+        }
+    }
+
+    #[test]
+    fn realmachine55_wgpu_repeated_park_main_retirement_keeps_native_source() {
+        scenarios::realmachine55_repeated_park_main_retirement::<Headless>();
+    }
+
+    #[test]
+    fn native_window_input_wgpu_gc_terminal_close_shutdown() {
+        scenarios::native_window_input_lifecycle::<Headless>();
     }
 
     #[test]
@@ -3622,5 +3782,183 @@ mod viewport_retirement_tests {
         drop(shared);
         assert!(weak.upgrade().is_none());
         drop(scope);
+    }
+}
+
+#[cfg(test)]
+mod native_allocation_input_tests {
+    use super::*;
+    use crate::native_window_input::{
+        NativeWindowAllocation, native_window_allocation, register_native_window_allocation,
+    };
+
+    struct NoDisplay;
+    impl raw_window_handle::HasDisplayHandle for NoDisplay {
+        fn display_handle(
+            &self,
+        ) -> std::result::Result<raw_window_handle::DisplayHandle<'_>, raw_window_handle::HandleError>
+        {
+            Err(raw_window_handle::HandleError::Unavailable)
+        }
+    }
+
+    #[test]
+    fn native_window_input_wgpu_recreate_revokes_old_source_before_successor_state() {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let child = ViewportId::from_hash_of("native allocation child");
+        let sibling = ViewportId::from_hash_of("native allocation sibling");
+        ctx.run_ui(Default::default(), |ui| {
+            for id in [child, sibling] {
+                ui.ctx()
+                    .show_viewport_deferred(id, Default::default(), |_, _| {});
+            }
+        })
+        .drop_without_applying_deltas();
+        let old_source = WindowId::from(501);
+        let new_source = WindowId::from(502);
+        let sibling_source = WindowId::from(503);
+        let allocation = |id, source| NativeWindowAllocation {
+            viewport_id: id,
+            registration: ctx.viewport_registration(id).unwrap(),
+            window_id: source,
+            windows_hwnd: Some(u64::from(source) as isize),
+        };
+        let mut viewports = OrderedViewportIdMap::default();
+        let mut sources = HashMap::default();
+
+        let mut painter = pollster::block_on(egui_wgpu::winit::Painter::new(
+            ctx.clone(),
+            Default::default(),
+            false,
+            Default::default(),
+        ));
+
+        for (id, source) in [(child, old_source), (sibling, sibling_source)] {
+            let ids = ViewportIdPair::from_self_and_parent(id, ViewportId::ROOT);
+
+            initialize_or_update_viewport(
+                &mut viewports,
+                ids,
+                ViewportClass::Deferred,
+                ViewportBuilder::default(),
+                None,
+                &mut painter,
+                &mut sources,
+            );
+
+            let viewport = viewports.get_mut(&id).unwrap();
+            viewport.registration = ctx.viewport_registration(id);
+            viewport.native_input = Some(register_native_window_allocation(
+                &ctx,
+                allocation(id, source),
+            ));
+            viewport.egui_winit = Some(egui_winit::State::new(
+                ctx.clone(),
+                id,
+                &NoDisplay,
+                None,
+                None,
+                None,
+            ));
+            sources.insert(source, id);
+        }
+        let ime = egui::Event::Ime(egui::ImeEvent::Commit("unconsumed logical input".into()));
+        viewports
+            .get_mut(&child)
+            .unwrap()
+            .egui_winit
+            .as_mut()
+            .unwrap()
+            .egui_input_mut()
+            .events
+            .push(ime.clone());
+        let registration = viewports[&child].registration;
+        let ids = ViewportIdPair::from_self_and_parent(child, ViewportId::ROOT);
+
+        initialize_or_update_viewport(
+            &mut viewports,
+            ids,
+            ViewportClass::Immediate,
+            ViewportBuilder::default().with_active(false),
+            None,
+            &mut painter,
+            &mut sources,
+        );
+
+        assert!(native_window_allocation(&ctx, child).is_none());
+        assert!(viewport_for_native_event(&sources, old_source).is_none());
+        assert_eq!(
+            viewport_for_native_event(&sources, sibling_source),
+            Some(sibling)
+        );
+        assert_eq!(viewports[&child].registration, registration);
+        assert_eq!(viewports[&child].pending_raw_input.events, vec![ime]);
+        assert!(viewports[&child].egui_winit.is_none());
+
+        // The successor belongs to the same logical registration. Late native
+        // events still use the production source lookup, not that registration.
+        let viewport = viewports.get_mut(&child).unwrap();
+        viewport.native_input = Some(register_native_window_allocation(
+            &ctx,
+            allocation(child, new_source),
+        ));
+        viewport.egui_winit = Some(egui_winit::State::new(
+            ctx.clone(),
+            child,
+            &NoDisplay,
+            None,
+            None,
+            None,
+        ));
+        sources.insert(new_source, child);
+        for (source, text) in [
+            (old_source, "stale"),
+            (new_source, "new"),
+            (sibling_source, "sibling"),
+        ] {
+            if let Some(id) = viewport_for_native_event(&sources, source) {
+                viewports
+                    .get_mut(&id)
+                    .unwrap()
+                    .egui_winit
+                    .as_mut()
+                    .unwrap()
+                    .egui_input_mut()
+                    .events
+                    .push(egui::Event::Text(text.into()));
+            }
+        }
+        assert_eq!(
+            viewports
+                .get_mut(&child)
+                .unwrap()
+                .egui_winit
+                .as_mut()
+                .unwrap()
+                .egui_input_mut()
+                .events,
+            vec![egui::Event::Text("new".into())]
+        );
+        assert_eq!(
+            viewports
+                .get_mut(&sibling)
+                .unwrap()
+                .egui_winit
+                .as_mut()
+                .unwrap()
+                .egui_input_mut()
+                .events,
+            vec![egui::Event::Text("sibling".into())]
+        );
+        assert_eq!(
+            native_window_allocation(&ctx, child),
+            Some(allocation(child, new_source))
+        );
+        // Releasing the logical backend owner ends its input even with Context
+        // (and therefore the query registry) still alive.
+        drop(viewports);
+        assert!(native_window_allocation(&ctx, child).is_none());
+        assert!(native_window_allocation(&ctx, sibling).is_none());
     }
 }

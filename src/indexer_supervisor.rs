@@ -237,8 +237,8 @@ impl Drop for SupervisorHandle {
 
 /// Supervisor construction parameters.
 pub struct SupervisorParams {
-    pub caption_epoch: Arc<AtomicU64>,
-    pub caption_db_path: PathBuf,
+    pub derived_text_epoch: Arc<AtomicU64>,
+    pub derived_text_paths: crate::derived_text::DerivedTextPaths,
     pub favorite_id: Uuid,
     pub favorite_root: PathBuf,
     pub excluded_roots: Vec<PathBuf>,
@@ -284,8 +284,8 @@ pub fn spawn(
     let excluded_roots = params.excluded_roots.clone();
     let enable_metadata_index = params.enable_metadata_index;
     let skip_initial_scan = params.skip_initial_scan;
-    let caption_epoch = Arc::clone(&params.caption_epoch);
-    let caption_db_path = params.caption_db_path.clone();
+    let derived_text_epoch = Arc::clone(&params.derived_text_epoch);
+    let derived_text_paths = params.derived_text_paths.clone();
     let similar_notifier = params.similar_notifier.clone();
     let similar_registration = similar_notifier
         .as_ref()
@@ -315,8 +315,8 @@ pub fn spawn(
                 excluded_roots,
                 enable_metadata_index,
                 skip_initial_scan,
-                caption_epoch,
-                caption_db_path,
+                derived_text_epoch,
+                derived_text_paths,
                 similar_notifier,
                 similar_registration,
                 meta_db,
@@ -375,8 +375,8 @@ fn supervisor_loop(
     excluded_roots: Vec<PathBuf>,
     enable_metadata_index: bool,
     skip_initial_scan: bool,
-    caption_epoch: Arc<AtomicU64>,
-    caption_db_path: PathBuf,
+    derived_text_epoch: Arc<AtomicU64>,
+    derived_text_paths: crate::derived_text::DerivedTextPaths,
     similar_notifier: Option<crate::similar_index::SimilarIndexNotifier>,
     similar_registration: Option<crate::similar_index::SimilarWatchRegistration>,
     meta_db: Arc<FtsMetaDb>,
@@ -391,12 +391,12 @@ fn supervisor_loop(
     change_tx: Sender<DebouncedChange>,
     change_rx: Receiver<DebouncedChange>,
 ) {
-    let mut session = IngestSession::new_with_caption_db_path(
+    let mut session = IngestSession::new_with_derived_text_paths(
         favorite_id,
         favorite_root.clone(),
         &meta_db,
         &fts,
-        caption_db_path,
+        derived_text_paths,
     )
     .with_activity_gate(&activity_gate);
 
@@ -443,7 +443,7 @@ fn supervisor_loop(
         .then(|| Instant::now() + WATCH_RETRY_DELAYS[0]);
 
     // 2. 初期スキャン実行 (cancel は Arc のまま渡す — walker 途中で shutdown 可能に)
-    let mut caption_seen = caption_epoch.load(Ordering::Acquire);
+    let mut derived_text_seen = derived_text_epoch.load(Ordering::Acquire);
     if enable_metadata_index && !skip_initial_scan {
         run_initial_scan(
             favorite_id,
@@ -461,7 +461,7 @@ fn supervisor_loop(
         crate::logger::log(format!("indexer[{favorite_id}]: initial scan skipped"));
     }
     if enable_metadata_index && skip_initial_scan {
-        reflect_captions(
+        reflect_derived_text(
             &mut session,
             &writer,
             &io_sem,
@@ -521,8 +521,8 @@ fn supervisor_loop(
             break;
         }
         if enable_metadata_index {
-            poll_caption_epoch(&caption_epoch, &mut caption_seen, || {
-                reflect_captions(
+            poll_derived_text_epoch(&derived_text_epoch, &mut derived_text_seen, || {
+                reflect_derived_text(
                     &mut session,
                     &writer,
                     &io_sem,
@@ -733,7 +733,7 @@ fn supervisor_loop(
 }
 
 /// Sample before reading pending rows. Never consume a write published during reflection.
-fn poll_caption_epoch(epoch: &AtomicU64, seen: &mut u64, reflect: impl FnOnce()) {
+fn poll_derived_text_epoch(epoch: &AtomicU64, seen: &mut u64, reflect: impl FnOnce()) {
     let current = epoch.load(Ordering::Acquire);
     if current != *seen {
         reflect();
@@ -741,11 +741,11 @@ fn poll_caption_epoch(epoch: &AtomicU64, seen: &mut u64, reflect: impl FnOnce())
     }
 }
 
-const CAPTION_REFLECTION_LIMIT: usize = 500;
+const DERIVED_TEXT_REFLECTION_LIMIT: usize = 500;
 
 /// Pending rows belong to SQLite; only this supervisor's existing metadata range is read.
 #[allow(clippy::too_many_arguments)]
-fn reflect_captions(
+fn reflect_derived_text(
     session: &mut IngestSession,
     writer: &crate::fts_writer_dispatcher::FtsWriterDispatcher,
     io_sem: &GlobalIoSemaphore,
@@ -754,13 +754,43 @@ fn reflect_captions(
     stats: &Mutex<SupervisorStats>,
     progress: &ProgressReporter,
 ) {
-    if cancel.load(Ordering::Relaxed) || !session.caption_db_path.exists() {
+    let paths = session.derived_text_paths.clone();
+    for (kind, path) in paths.iter() {
+        reflect_derived_text_store(
+            session,
+            writer,
+            io_sem,
+            excluded_roots,
+            cancel,
+            stats,
+            progress,
+            kind,
+            path,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reflect_derived_text_store(
+    session: &mut IngestSession,
+    writer: &crate::fts_writer_dispatcher::FtsWriterDispatcher,
+    io_sem: &GlobalIoSemaphore,
+    excluded_roots: &[PathBuf],
+    cancel: &AtomicBool,
+    stats: &Mutex<SupervisorStats>,
+    progress: &ProgressReporter,
+    kind: crate::derived_text::DerivedTextKind,
+    path: &std::path::Path,
+) {
+    if cancel.load(Ordering::Relaxed) || !path.exists() {
         return;
     }
-    let reader_ready = session.reopen_caption_connection();
+    let reader_ready = session.reopen_derived_text_connection(kind);
     #[cfg(test)]
     {
-        let after_reopen = CAPTION_REFLECTION_AFTER_REOPEN.with(|hook| hook.borrow_mut().take());
+        let after_reopen = (kind == crate::derived_text::DerivedTextKind::Caption)
+            .then(|| CAPTION_REFLECTION_AFTER_REOPEN.with(|hook| hook.borrow_mut().take()))
+            .flatten();
         if let Some(after_reopen) = after_reopen {
             after_reopen();
         }
@@ -770,17 +800,16 @@ fn reflect_captions(
     if !reader_ready {
         return;
     }
-    let db =
-        match crate::ai_caption_db::CaptionDb::open_existing_for_write(&session.caption_db_path) {
-            Ok(db) => db,
-            Err(error) => {
-                crate::logger::log(format!(
-                    "indexer[{}]: caption reflection open failed: {error}",
-                    session.favorite_id
-                ));
-                return;
-            }
-        };
+    let db = match crate::derived_text::PendingStore::open(kind, path) {
+        Ok(db) => db,
+        Err(error) => {
+            crate::logger::log(format!(
+                "indexer[{}]: derived text {kind:?} reflection open failed: {error}",
+                session.favorite_id
+            ));
+            return;
+        }
+    };
     let ranges = crate::metadata_ownership::OwnedRange {
         root: crate::metadata_ownership::root_key(&session.favorite_root),
         exclusions: excluded_roots
@@ -793,11 +822,11 @@ fn reflect_captions(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let pending = match db.pending_in_ranges(&ranges, CAPTION_REFLECTION_LIMIT) {
+        let pending = match db.pending_in_ranges(&ranges, DERIVED_TEXT_REFLECTION_LIMIT) {
             Ok(pending) => pending,
             Err(error) => {
                 crate::logger::log(format!(
-                    "indexer[{}]: caption pending read failed: {error}",
+                    "indexer[{}]: derived text {kind:?} pending read failed: {error}",
                     session.favorite_id
                 ));
                 break;
@@ -847,14 +876,14 @@ fn reflect_captions(
                 if applied.cancelled
                     || cancel.load(Ordering::Relaxed)
                     || applied.ingested_failed > 0
-                    || applied.caption_read_errors > 0
+                    || applied.derived_text_read_errors > 0
                 {
                     break;
                 }
             }
             Err(error) => {
                 crate::logger::log(format!(
-                    "indexer[{}]: caption reflection apply failed: {error}",
+                    "indexer[{}]: derived text {kind:?} reflection apply failed: {error}",
                     session.favorite_id
                 ));
                 break;
@@ -864,7 +893,7 @@ fn reflect_captions(
         // cannot be acknowledged by this batch, including delete/reinsert and key swaps.
         if let Err(error) = db.mark_reflected(&pending) {
             crate::logger::log(format!(
-                "indexer[{}]: caption acknowledgement failed: {error}",
+                "indexer[{}]: derived text {kind:?} acknowledgement failed: {error}",
                 session.favorite_id
             ));
             break;
@@ -896,7 +925,7 @@ fn run_initial_scan(
     stats: &Mutex<SupervisorStats>,
     progress: &ProgressReporter,
 ) {
-    session.reopen_caption_connection();
+    session.reopen_derived_text_connections();
     run_initial_scan_inner(
         favorite_id,
         favorite_root,
@@ -908,7 +937,7 @@ fn run_initial_scan(
         stats,
         progress,
     );
-    reflect_captions(
+    reflect_derived_text(
         session,
         writer,
         io_sem,
@@ -1669,8 +1698,10 @@ mod tests {
         gate.set_paused(true);
         let handle = spawn(
             SupervisorParams {
-                caption_epoch: Arc::new(AtomicU64::new(0)),
-                caption_db_path: tmp.path().join("ai_caption.db"),
+                derived_text_epoch: Arc::new(AtomicU64::new(0)),
+                derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                    tmp.path().join("ai_caption.db"),
+                ),
                 favorite_id: id,
                 favorite_root: root.clone(),
                 excluded_roots: Vec::new(),
@@ -1740,7 +1771,7 @@ mod tests {
                 true,
                 true,
                 Arc::new(AtomicU64::new(0)),
-                caption_path,
+                crate::derived_text::DerivedTextPaths::with_caption_path(caption_path),
                 None,
                 None,
                 worker_meta,
@@ -1976,8 +2007,10 @@ mod tests {
         assert_eq!(skip, !change_extensions);
         let handle = spawn(
             SupervisorParams {
-                caption_epoch: Arc::new(AtomicU64::new(0)),
-                caption_db_path: tmp.path().join("ai_caption.db"),
+                derived_text_epoch: Arc::new(AtomicU64::new(0)),
+                derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                    tmp.path().join("ai_caption.db"),
+                ),
                 favorite_id: id,
                 favorite_root: root,
                 excluded_roots: vec![],
@@ -2381,8 +2414,10 @@ mod tests {
         let fav_id = Uuid::new_v4();
         let handle = spawn(
             SupervisorParams {
-                caption_epoch: Arc::new(AtomicU64::new(0)),
-                caption_db_path: tmp.path().join("ai_caption.db"),
+                derived_text_epoch: Arc::new(AtomicU64::new(0)),
+                derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                    tmp.path().join("ai_caption.db"),
+                ),
                 favorite_id: fav_id,
                 favorite_root: fav_root.clone(),
                 excluded_roots: Vec::new(),
@@ -2429,8 +2464,10 @@ mod tests {
         fs::create_dir_all(&fav_root).unwrap();
         let handle = spawn(
             SupervisorParams {
-                caption_epoch: Arc::new(AtomicU64::new(0)),
-                caption_db_path: tmp.path().join("ai_caption.db"),
+                derived_text_epoch: Arc::new(AtomicU64::new(0)),
+                derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                    tmp.path().join("ai_caption.db"),
+                ),
                 favorite_id: Uuid::new_v4(),
                 favorite_root: fav_root,
                 excluded_roots: Vec::new(),
@@ -2462,8 +2499,10 @@ mod tests {
         let fav_id = Uuid::new_v4();
         let handle = spawn(
             SupervisorParams {
-                caption_epoch: Arc::new(AtomicU64::new(0)),
-                caption_db_path: tmp.path().join("ai_caption.db"),
+                derived_text_epoch: Arc::new(AtomicU64::new(0)),
+                derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                    tmp.path().join("ai_caption.db"),
+                ),
                 favorite_id: fav_id,
                 favorite_root: fav_root,
                 excluded_roots: Vec::new(),
@@ -2512,8 +2551,10 @@ mod tests {
         let fav_b = Uuid::new_v4();
         let handle_a = spawn(
             SupervisorParams {
-                caption_epoch: Arc::new(AtomicU64::new(0)),
-                caption_db_path: tmp.path().join("ai_caption.db"),
+                derived_text_epoch: Arc::new(AtomicU64::new(0)),
+                derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                    tmp.path().join("ai_caption.db"),
+                ),
                 favorite_id: fav_a,
                 favorite_root: root_a,
                 excluded_roots: Vec::new(),
@@ -2529,8 +2570,10 @@ mod tests {
         );
         let handle_b = spawn(
             SupervisorParams {
-                caption_epoch: Arc::new(AtomicU64::new(0)),
-                caption_db_path: tmp.path().join("ai_caption.db"),
+                derived_text_epoch: Arc::new(AtomicU64::new(0)),
+                derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                    tmp.path().join("ai_caption.db"),
+                ),
                 favorite_id: fav_b,
                 favorite_root: root_b,
                 excluded_roots: Vec::new(),
@@ -2575,8 +2618,10 @@ mod tests {
         let fav_id = Uuid::new_v4();
         let handle = spawn(
             SupervisorParams {
-                caption_epoch: Arc::new(AtomicU64::new(0)),
-                caption_db_path: tmp.path().join("ai_caption.db"),
+                derived_text_epoch: Arc::new(AtomicU64::new(0)),
+                derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                    tmp.path().join("ai_caption.db"),
+                ),
                 favorite_id: fav_id,
                 favorite_root: fav_root.clone(),
                 excluded_roots: Vec::new(),
@@ -2642,8 +2687,10 @@ mod tests {
         let fav_id = Uuid::new_v4();
         let handle = spawn(
             SupervisorParams {
-                caption_epoch: Arc::new(AtomicU64::new(0)),
-                caption_db_path: tmp.path().join("ai_caption.db"),
+                derived_text_epoch: Arc::new(AtomicU64::new(0)),
+                derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                    tmp.path().join("ai_caption.db"),
+                ),
                 favorite_id: fav_id,
                 favorite_root: fav_root.clone(),
                 excluded_roots: Vec::new(),
@@ -2705,8 +2752,10 @@ mod tests {
 
         let handle = spawn(
             SupervisorParams {
-                caption_epoch: Arc::new(AtomicU64::new(0)),
-                caption_db_path: tmp.path().join("ai_caption.db"),
+                derived_text_epoch: Arc::new(AtomicU64::new(0)),
+                derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                    tmp.path().join("ai_caption.db"),
+                ),
                 favorite_id: Uuid::new_v4(),
                 favorite_root: fav_root,
                 excluded_roots: Vec::new(),
@@ -2822,7 +2871,7 @@ mod tests {
                         "updated caption",
                     );
                 }
-                reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+                reflect_derived_text(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
             }
             let (tx, rx) = crossbeam_channel::unbounded();
             crate::global_search::run(
@@ -3157,7 +3206,7 @@ mod tests {
                 "watcher must preserve {path:?}"
             );
         }
-        reflect_captions(
+        reflect_derived_text(
             &mut session,
             &writer,
             &sem,
@@ -3192,7 +3241,7 @@ mod tests {
         let removed = scan();
         assert!(removed.to_ingest.is_empty());
         assert_eq!(removed.to_delete.len(), books.len());
-        reflect_captions(
+        reflect_derived_text(
             &mut session,
             &writer,
             &sem,
@@ -3224,7 +3273,7 @@ mod tests {
             &crate::search_index_db::normalize_path(&plain),
             "new-caption",
         );
-        reflect_captions(
+        reflect_derived_text(
             &mut session,
             &writer,
             &sem,
@@ -3345,8 +3394,8 @@ mod tests {
                 epoch.fetch_add(1, Ordering::Release);
             }));
         });
-        poll_caption_epoch(&epoch, &mut seen, || {
-            reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        poll_derived_text_epoch(&epoch, &mut seen, || {
+            reflect_derived_text(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
         });
         assert_eq!(seen, 1);
         assert_eq!(epoch.load(Ordering::Acquire), 2);
@@ -3361,13 +3410,13 @@ mod tests {
 
         // The pre-read sample cannot consume the commit's new epoch. The next
         // wakeup reopens the now-published reader and reflects the still-pending row.
-        poll_caption_epoch(&epoch, &mut seen, || {
-            reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        poll_derived_text_epoch(&epoch, &mut seen, || {
+            reflect_derived_text(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
         });
         assert_eq!(seen, 2);
         assert!(db.get(&key).unwrap().unwrap().indexed);
         assert_eq!(caption_text(&fts, &key).as_deref(), Some("first-caption"));
-        poll_caption_epoch(&epoch, &mut seen, || panic!("unchanged epoch"));
+        poll_derived_text_epoch(&epoch, &mut seen, || panic!("unchanged epoch"));
     }
 
     #[test]
@@ -3385,7 +3434,7 @@ mod tests {
             IngestSession::new_with_caption_db_path(Uuid::new_v4(), root, &meta, &fts, path);
         assert!(!session.reopen_caption_connection());
         let stats = Mutex::new(SupervisorStats::default());
-        reflect_captions(
+        reflect_derived_text(
             &mut session,
             &writer,
             &sem,
@@ -3427,7 +3476,7 @@ mod tests {
         let stats = Mutex::new(SupervisorStats::default());
         let progress = ProgressReporter::new();
         let cancel = AtomicBool::new(false);
-        reflect_captions(
+        reflect_derived_text(
             &mut session,
             &writer,
             &sem,
@@ -3446,7 +3495,7 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute("DELETE FROM captions WHERE item_key=?1", [&key])
             .unwrap();
-        reflect_captions(
+        reflect_derived_text(
             &mut session,
             &writer,
             &sem,
@@ -3469,7 +3518,7 @@ mod tests {
         // Missing files follow the same candidate/delete boundary as watcher updates.
         put_caption(&path, &key, "changed");
         fs::remove_file(root.join("one.jpg")).unwrap();
-        reflect_captions(
+        reflect_derived_text(
             &mut session,
             &writer,
             &sem,
@@ -3504,33 +3553,33 @@ mod tests {
         let stats = Mutex::new(SupervisorStats::default());
         let progress = ProgressReporter::new();
         let cancel = AtomicBool::new(true);
-        reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        reflect_derived_text(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
         assert!(!db.get(&key).unwrap().unwrap().indexed);
         cancel.store(false, Ordering::Release);
         writer.test_set_reload_failure(true);
-        reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        reflect_derived_text(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
         assert!(!db.get(&key).unwrap().unwrap().indexed);
         writer.test_set_reload_failure(false);
-        reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        reflect_derived_text(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
         assert!(db.get(&key).unwrap().unwrap().indexed);
         assert_eq!(caption_text(&fts, &key).as_deref(), Some("still-pending"));
     }
 
     #[test]
-    fn caption_epoch_retains_writes_during_reflection_for_every_supervisor() {
+    fn derived_text_epoch_retains_writes_during_reflection_for_every_supervisor() {
         let epoch = AtomicU64::new(1);
         let mut first_seen = 0;
         let mut second_seen = 0;
         let mut first_runs = 0;
-        poll_caption_epoch(&epoch, &mut first_seen, || {
+        poll_derived_text_epoch(&epoch, &mut first_seen, || {
             first_runs += 1;
             epoch.fetch_add(1, Ordering::Release);
         });
         assert_eq!(first_seen, 1);
-        poll_caption_epoch(&epoch, &mut second_seen, || {});
+        poll_derived_text_epoch(&epoch, &mut second_seen, || {});
         assert_eq!(second_seen, 2);
-        poll_caption_epoch(&epoch, &mut first_seen, || first_runs += 1);
-        poll_caption_epoch(&epoch, &mut first_seen, || panic!("unchanged epoch"));
+        poll_derived_text_epoch(&epoch, &mut first_seen, || first_runs += 1);
+        poll_derived_text_epoch(&epoch, &mut first_seen, || panic!("unchanged epoch"));
         assert_eq!(first_runs, 2);
         assert_eq!(first_seen, second_seen);
     }
@@ -3546,8 +3595,10 @@ mod tests {
         put_caption(&path, &key, "startup-pending");
         let handle = spawn(
             SupervisorParams {
-                caption_epoch: Arc::new(AtomicU64::new(0)),
-                caption_db_path: path.clone(),
+                derived_text_epoch: Arc::new(AtomicU64::new(0)),
+                derived_text_paths: crate::derived_text::DerivedTextPaths::with_caption_path(
+                    path.clone(),
+                ),
                 favorite_id: Uuid::new_v4(),
                 favorite_root: root,
                 excluded_roots: vec![],
@@ -3593,7 +3644,7 @@ mod tests {
         let stats = Mutex::new(SupervisorStats::default());
         let progress = ProgressReporter::new();
         let cancel = Arc::new(AtomicBool::new(false));
-        reflect_captions(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
+        reflect_derived_text(&mut session, &writer, &sem, &[], &cancel, &stats, &progress);
         let indexed: bool = conn
             .query_row(
                 "SELECT indexed FROM captions WHERE item_key=?1",

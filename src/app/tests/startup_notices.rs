@@ -29,6 +29,7 @@ fn escape_input() -> egui::RawInput {
 
 fn deferred_navigation_reopen() -> DeferredFsReopen {
     DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::None,

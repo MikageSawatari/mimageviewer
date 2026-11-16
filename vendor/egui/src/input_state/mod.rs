@@ -986,6 +986,21 @@ pub(crate) enum PointerEvent {
     Released {
         click: Option<Click>,
         button: PointerButton,
+        position: Option<Pos2>,
+    },
+}
+
+/// Ordered physical button facts. A release without a position ends its hold
+/// but cannot authorize a click, drop, seek, or other pointer operation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PointerButtonEvent {
+    Pressed {
+        button: PointerButton,
+        pos: Pos2,
+    },
+    Released {
+        button: PointerButton,
+        pos: Option<Pos2>,
     },
 }
 
@@ -1133,6 +1148,28 @@ impl Default for PointerState {
 }
 
 impl PointerState {
+    /// Withdraw an owned button without creating a release or click.
+    pub(crate) fn cancel_button(&mut self, button: PointerButton) {
+        self.down[button as usize] = false;
+        self.pointer_events.retain(|event| match event {
+            PointerEvent::Pressed {
+                button: event_button,
+                ..
+            }
+            | PointerEvent::Released {
+                button: event_button,
+                ..
+            } => *event_button != button,
+            PointerEvent::Moved(_) => true,
+        });
+        if !self.any_down() {
+            self.press_origin = None;
+            self.press_start_time = None;
+            self.has_moved_too_much_for_a_click = false;
+            self.started_decidedly_dragging = false;
+        }
+    }
+
     #[must_use]
     pub(crate) fn begin_pass(mut self, time: f64, new: &RawInput, options: InputOptions) -> Self {
         let was_decidedly_dragging = self.is_decidedly_dragging();
@@ -1217,14 +1254,31 @@ impl PointerState {
                             None
                         };
 
-                        self.pointer_events
-                            .push(PointerEvent::Released { click, button });
+                        self.pointer_events.push(PointerEvent::Released {
+                            click,
+                            button,
+                            position: Some(pos),
+                        });
 
                         self.press_origin = None;
                         self.press_start_time = None;
                     }
 
                     self.down[button as usize] = pressed; // must be done after the above call to `could_any_button_be_click`
+                }
+                Event::PointerButtonReleased { button, .. } => {
+                    let button = *button;
+                    // The integration owns a real press/release pair but has no
+                    // release coordinate. Do not reuse the old interact_pos for
+                    // a click or restore hover after PointerGone.
+                    self.pointer_events.push(PointerEvent::Released {
+                        click: None,
+                        button,
+                        position: None,
+                    });
+                    self.down[button as usize] = false;
+                    self.press_origin = None;
+                    self.press_start_time = None;
                 }
                 Event::PointerGone => {
                     self.latest_pos = None;
@@ -1431,6 +1485,7 @@ impl PointerState {
     }
 
     /// Was any pointer button released (`down -> !down`) this frame?
+    /// Includes positionless hold termination; this does not authorize an operation.
     pub fn any_released(&self) -> bool {
         self.pointer_events.iter().any(|event| event.is_release())
     }
@@ -1443,10 +1498,51 @@ impl PointerState {
     }
 
     /// Was the button given released this frame?
+    /// Includes positionless hold termination. Use the ordered position fact to
+    /// authorize an operation, rather than a retained pointer position.
     pub fn button_released(&self, button: PointerButton) -> bool {
         self.pointer_events
             .iter()
             .any(|event| matches!(event, &PointerEvent::Released{button: b, ..} if button == b))
+    }
+
+    /// Canonical button edges in input order. In particular, a positionless
+    /// terminal before a new press cannot terminate or authorize the new hold.
+    pub fn button_events(&self) -> impl DoubleEndedIterator<Item = PointerButtonEvent> + '_ {
+        self.pointer_events.iter().filter_map(|event| match *event {
+            PointerEvent::Pressed { position, button } => Some(PointerButtonEvent::Pressed {
+                button,
+                pos: position,
+            }),
+            PointerEvent::Released {
+                position, button, ..
+            } => Some(PointerButtonEvent::Released {
+                button,
+                pos: position,
+            }),
+            PointerEvent::Moved(_) => None,
+        })
+    }
+
+    /// Ordered releases, including terminal-only `(button, None)` edges.
+    /// Do not substitute hover/interact/press positions for the missing point.
+    pub fn button_releases(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (PointerButton, Option<Pos2>)> + '_ {
+        self.button_events().filter_map(|event| match event {
+            PointerButtonEvent::Released { button, pos } => Some((button, pos)),
+            PointerButtonEvent::Pressed { .. } => None,
+        })
+    }
+
+    /// Actual point of the last release of this button. `None` for a
+    /// positionless release or no release. Hold cleanup uses `button_released`;
+    /// ordered recognizers should use `button_events` to preserve fresh presses.
+    pub fn button_release_position(&self, button: PointerButton) -> Option<Pos2> {
+        self.button_releases()
+            .rev()
+            .find(|(released, _)| *released == button)
+            .and_then(|(_, pos)| pos)
     }
 
     /// Was the primary button pressed this frame?
@@ -1490,7 +1586,23 @@ impl PointerState {
     pub fn button_clicked(&self, button: PointerButton) -> bool {
         self.pointer_events
             .iter()
-            .any(|event| matches!(event, &PointerEvent::Released { button: b, click: Some(_) } if button == b))
+            .any(|event| matches!(event, &PointerEvent::Released { button: b, click: Some(_), .. } if button == b))
+    }
+
+    /// Actual point of the last adjudicated click for this button this pass.
+    /// Later movement or a fresh held press does not replace that click's point.
+    pub fn button_click_position(&self, button: PointerButton) -> Option<Pos2> {
+        self.pointer_events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                PointerEvent::Released {
+                    button: released,
+                    click: Some(click),
+                    ..
+                } if *released == button => Some(click.pos),
+                _ => None,
+            })
     }
 
     /// Returns all pointer-button releases from this pass in raw-event order, together with
@@ -1503,7 +1615,7 @@ impl PointerState {
         &self,
     ) -> impl Iterator<Item = (PointerButton, Option<(Pos2, u32)>)> + '_ {
         self.pointer_events.iter().filter_map(|event| match event {
-            PointerEvent::Released { click, button } => Some((
+            PointerEvent::Released { click, button, .. } => Some((
                 *button,
                 click.as_ref().map(|click| (click.pos, click.count)),
             )),
@@ -1519,6 +1631,7 @@ impl PointerState {
                 PointerEvent::Released {
                     click: Some(click),
                     button: b,
+                    ..
                 } if *b == button && click.is_double()
             )
         })
@@ -1532,6 +1645,7 @@ impl PointerState {
                 PointerEvent::Released {
                     click: Some(click),
                     button: b,
+                    ..
                 } if *b == button && click.is_triple()
             )
         })

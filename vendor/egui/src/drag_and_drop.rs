@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use core::any::Any;
 
-use crate::{Context, CursorIcon, Plugin, Ui};
+use crate::{Context, CursorIcon, Plugin, Pos2, Ui, ViewportId};
 
 /// Plugin for tracking drag-and-drop payload.
 ///
@@ -21,8 +21,18 @@ use crate::{Context, CursorIcon, Plugin, Ui};
 #[doc(alias = "drag and drop")]
 #[derive(Clone, Default)]
 pub struct DragAndDrop {
-    /// The current drag-and-drop payload, if any. Automatically cleared when drag ends.
+    /// The current held operation. UI may publish this after an older release.
     payload: Option<Arc<dyn Any + Send + Sync>>,
+    /// Completed operations available only to the pass/viewport that received
+    /// their actual endpoint. These are distinct from the new held operation.
+    released: Vec<ReleasedPayload>,
+}
+
+#[derive(Clone)]
+struct ReleasedPayload {
+    data: Arc<dyn Any + Send + Sync>,
+    pos: Pos2,
+    viewport: ViewportId,
 }
 
 impl Plugin for DragAndDrop {
@@ -34,7 +44,12 @@ impl Plugin for DragAndDrop {
     ///
     /// This needs to happen at frame start so we can properly capture the escape key.
     fn on_begin_pass(&mut self, ui: &mut Ui) {
-        let has_any_payload = self.payload.is_some();
+        let viewport = ui.ctx().viewport_id();
+        let has_any_payload = self.payload.is_some()
+            || self
+                .released
+                .iter()
+                .any(|released| released.viewport == viewport);
 
         if has_any_payload {
             let abort_dnd_due_to_escape_key =
@@ -42,7 +57,19 @@ impl Plugin for DragAndDrop {
 
             if abort_dnd_due_to_escape_key {
                 self.payload = None;
+                self.released
+                    .retain(|released| released.viewport != viewport);
             }
+        }
+        if let Some((_, position)) = ui.input(|input| input.pointer.button_releases().next())
+            && let Some(data) = self.payload.take()
+            && let Some(pos) = position
+        {
+            self.released.push(ReleasedPayload {
+                data,
+                pos,
+                viewport: ui.ctx().viewport_id(),
+            });
         }
     }
 
@@ -52,22 +79,16 @@ impl Plugin for DragAndDrop {
     /// This must happen at end-of-frame such that we don't shadow the mouse release event from user
     /// code.
     fn on_end_pass(&mut self, ui: &mut Ui) {
-        let has_any_payload = self.payload.is_some();
-
-        if has_any_payload {
-            let abort_dnd_due_to_mouse_release = ui.input_mut(|i| i.pointer.any_released());
-
-            if abort_dnd_due_to_mouse_release {
-                self.payload = None;
-            } else {
-                // We set the cursor icon only if its default, as the user code might have
-                // explicitly set it already.
-                ui.output_mut(|o| {
-                    if o.cursor_icon == CursorIcon::Default {
-                        o.cursor_icon = CursorIcon::Grabbing;
-                    }
-                });
-            }
+        let viewport = ui.ctx().viewport_id();
+        self.released
+            .retain(|released| released.viewport != viewport);
+        if self.payload.is_some() {
+            // Only the current held operation controls the grabbing cursor.
+            ui.output_mut(|output| {
+                if output.cursor_icon == CursorIcon::Default {
+                    output.cursor_icon = CursorIcon::Grabbing;
+                }
+            });
         }
     }
 }
@@ -85,7 +106,10 @@ impl DragAndDrop {
 
     /// Clears the payload, setting it to `None`.
     pub fn clear_payload(ctx: &Context) {
-        ctx.plugin::<Self>().lock().payload = None;
+        let plugin = ctx.plugin::<Self>();
+        let mut state = plugin.lock();
+        state.payload = None;
+        state.released.clear();
     }
 
     /// Retrieve the payload, if any.
@@ -98,9 +122,17 @@ impl DragAndDrop {
     where
         Payload: Any + Send + Sync,
     {
-        Arc::clone(ctx.plugin::<Self>().lock().payload.as_ref()?)
-            .downcast()
-            .ok()
+        let viewport = ctx.viewport_id();
+        let plugin = ctx.plugin::<Self>();
+        let state = plugin.lock();
+        let data = state.payload.as_ref().or_else(|| {
+            state
+                .released
+                .iter()
+                .find(|released| released.viewport == viewport)
+                .map(|released| &released.data)
+        })?;
+        Arc::clone(data).downcast().ok()
     }
 
     /// Retrieve and clear the payload, if any.
@@ -113,7 +145,40 @@ impl DragAndDrop {
     where
         Payload: Any + Send + Sync,
     {
-        ctx.plugin::<Self>().lock().payload.take()?.downcast().ok()
+        let viewport = ctx.viewport_id();
+        let plugin = ctx.plugin::<Self>();
+        let mut state = plugin.lock();
+        let data = state.payload.take().or_else(|| {
+            let index = state
+                .released
+                .iter()
+                .position(|released| released.viewport == viewport)?;
+            Some(state.released.remove(index).data)
+        })?;
+        data.downcast().ok()
+    }
+
+    pub(crate) fn release_position(ctx: &Context) -> Option<Pos2> {
+        let viewport = ctx.viewport_id();
+        ctx.plugin::<Self>()
+            .lock()
+            .released
+            .iter()
+            .find(|released| released.viewport == viewport)
+            .map(|released| released.pos)
+    }
+
+    pub(crate) fn take_released_payload<Payload: Any + Send + Sync>(
+        ctx: &Context,
+    ) -> Option<Arc<Payload>> {
+        let viewport = ctx.viewport_id();
+        let plugin = ctx.plugin::<Self>();
+        let mut state = plugin.lock();
+        let index = state
+            .released
+            .iter()
+            .position(|released| released.viewport == viewport)?;
+        state.released.remove(index).data.downcast().ok()
     }
 
     /// Are we carrying a payload of the given type?
@@ -132,6 +197,124 @@ impl DragAndDrop {
     /// Returns `true` both during a drag and on the frame the pointer is released
     /// (if there is a payload).
     pub fn has_any_payload(ctx: &Context) -> bool {
-        ctx.plugin::<Self>().lock().payload.is_some()
+        let viewport = ctx.viewport_id();
+        let plugin = ctx.plugin::<Self>();
+        let state = plugin.lock();
+        state.payload.is_some()
+            || state
+                .released
+                .iter()
+                .any(|released| released.viewport == viewport)
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::*;
+    use crate::{Event, Modifiers, PointerButton, RawInput, pos2};
+    fn positioned(pos: Pos2) -> Event {
+        Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::NONE,
+        }
+    }
+    fn unknown() -> Event {
+        Event::PointerButtonReleased {
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+        }
+    }
+    fn pass(ctx: &Context, events: Vec<Event>, run: impl FnMut(&mut Ui)) {
+        ctx.run_ui(
+            RawInput {
+                events,
+                ..Default::default()
+            },
+            run,
+        )
+        .drop_without_applying_deltas();
+    }
+    #[test]
+    fn dnd_first_terminal_owns_payload_and_does_not_reuse_later_releases() {
+        for first_known in [false, true] {
+            let ctx = Context::default();
+            DragAndDrop::set_payload(&ctx, 1_u32);
+            let events = if first_known {
+                vec![
+                    positioned(pos2(10.0, 20.0)),
+                    unknown(),
+                    Event::PointerMoved(pos2(50.0, 60.0)),
+                ]
+            } else {
+                vec![unknown(), positioned(pos2(50.0, 60.0))]
+            };
+            pass(&ctx, events, |ui| {
+                assert_eq!(
+                    DragAndDrop::release_position(ui.ctx()),
+                    first_known.then_some(pos2(10.0, 20.0))
+                );
+                assert_eq!(DragAndDrop::payload::<u32>(ui.ctx()).is_some(), first_known);
+            });
+            assert!(!DragAndDrop::has_any_payload(&ctx));
+        }
+    }
+    #[test]
+    fn dnd_new_payload_is_not_dropped_by_the_previous_payloads_terminal() {
+        let ctx = Context::default();
+        DragAndDrop::set_payload(&ctx, 1_u32);
+        pass(&ctx, vec![unknown()], |ui| {
+            assert!(!DragAndDrop::has_any_payload(ui.ctx()));
+            DragAndDrop::set_payload(ui.ctx(), 2_u32);
+            assert_eq!(DragAndDrop::release_position(ui.ctx()), None);
+        });
+        assert_eq!(*DragAndDrop::payload::<u32>(&ctx).unwrap(), 2);
+        pass(&ctx, vec![positioned(pos2(10.0, 20.0))], |ui| {
+            assert_eq!(
+                DragAndDrop::release_position(ui.ctx()),
+                Some(pos2(10.0, 20.0))
+            );
+            assert_eq!(
+                *DragAndDrop::take_released_payload::<u32>(ui.ctx()).unwrap(),
+                2
+            );
+        });
+        assert!(!DragAndDrop::has_any_payload(&ctx));
+    }
+    #[test]
+    fn dnd_released_payload_cannot_be_taken_or_retired_by_a_nested_viewport() {
+        let ctx = Context::default();
+        DragAndDrop::set_payload(&ctx, 1_u32);
+        pass(&ctx, vec![positioned(pos2(10.0, 20.0))], |ui| {
+            let child = ViewportId::from_hash_of("nested-release");
+            let mut raw = RawInput {
+                viewport_id: child,
+                ..Default::default()
+            };
+            raw.viewports.insert(
+                child,
+                crate::ViewportInfo {
+                    parent: Some(ViewportId::ROOT),
+                    ..Default::default()
+                },
+            );
+            ui.ctx()
+                .run_ui(raw, |child_ui| {
+                    assert_eq!(DragAndDrop::release_position(child_ui.ctx()), None);
+                    assert!(!DragAndDrop::has_any_payload(child_ui.ctx()));
+                    assert!(DragAndDrop::payload::<u32>(child_ui.ctx()).is_none());
+                    assert!(DragAndDrop::take_released_payload::<u32>(child_ui.ctx()).is_none());
+                })
+                .drop_without_applying_deltas();
+            assert_eq!(
+                DragAndDrop::release_position(ui.ctx()),
+                Some(pos2(10.0, 20.0))
+            );
+            assert_eq!(
+                *DragAndDrop::take_released_payload::<u32>(ui.ctx()).unwrap(),
+                1
+            );
+        });
     }
 }

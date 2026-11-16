@@ -231,6 +231,16 @@ pub(crate) enum ContextResidence {
     Unknown,
 }
 
+/// Semantic work for the restored source projection, completed only after the
+/// fork table has published its stable identities. Not part of either bundle.
+#[cfg(windows)]
+struct DirectMediaMainRestore {
+    owner: ViewerContextId,
+    basis_generation: u64,
+    origin: PathBuf,
+    selected: Option<usize>,
+}
+
 enum Projection {
     Mounted(ViewerContextId),
     Building {
@@ -4240,6 +4250,52 @@ impl App {
     pub(in crate::app) fn split_current_context_preserving_main_grid(
         &mut self,
     ) -> Box<ViewerContextBundle> {
+        let restore = self.capture_direct_media_main_restore();
+        let payload = self.split_current_context_preserving_main_grid_payload();
+        self.finish_direct_media_main_restore(restore);
+        payload
+    }
+
+    #[cfg(windows)]
+    fn capture_direct_media_main_restore(&self) -> Option<DirectMediaMainRestore> {
+        let snapshot = self.snapshot.as_ref()?;
+        let crate::snapshot::SnapshotSourceLabel::DirectMedia {
+            basis_generation, ..
+        } = &snapshot.source_label
+        else {
+            return None;
+        };
+        Some(DirectMediaMainRestore {
+            owner: self.projected_viewer_context_id(),
+            basis_generation: *basis_generation,
+            origin: snapshot.origin.clone(),
+            selected: snapshot.saved_selected,
+        })
+    }
+
+    #[cfg(windows)]
+    fn finish_direct_media_main_restore(&mut self, restore: Option<DirectMediaMainRestore>) {
+        let Some(restore) = restore else {
+            return;
+        };
+        assert_eq!(self.projected_viewer_context_id(), restore.owner);
+        let record_matches_basis = self.folder_observation.as_ref().is_some_and(|record| {
+            record.generation == restore.basis_generation
+                && record.source == restore.origin
+                && self.current_folder.as_ref() == Some(&record.source)
+        });
+        self.bump_items_generation();
+        if record_matches_basis {
+            self.folder_observation.as_mut().unwrap().generation = self.items_generation;
+        }
+        self.bump_render_epoch_only();
+        self.reconcile_restored_cover_thumbnails();
+        self.move_grid_cursor(restore.selected, crate::app::GridCursorIntent::Automatic);
+        self.viewer_navigation_caches.invalidate();
+    }
+
+    #[cfg(windows)]
+    fn split_current_context_preserving_main_grid_payload(&mut self) -> Box<ViewerContextBundle> {
         // This boundary executes only after the table admitted the successful fork.
         // Depth belongs to the original main fullscreen identity. Retire its request
         // and callback slot before moving viewer state to a new owner. Panorama's
@@ -4907,17 +4963,6 @@ impl App {
             ai_classify_cache,
         );
         if let Some((mut snapshot, surface)) = direct_owner {
-            let basis_generation = match &snapshot.source_label {
-                crate::snapshot::SnapshotSourceLabel::DirectMedia {
-                    basis_generation, ..
-                } => *basis_generation,
-                _ => unreachable!("direct media owner has direct media source"),
-            };
-            let record_matches_basis = self.folder_observation.as_ref().is_some_and(|record| {
-                record.generation == basis_generation
-                    && record.source == snapshot.origin
-                    && self.current_folder.as_ref() == Some(&record.source)
-            });
             self.items = std::mem::take(&mut snapshot.saved_items);
             self.thumbnails = std::mem::take(&mut snapshot.saved_thumbnails);
             self.image_metas = std::mem::take(&mut snapshot.saved_image_metas);
@@ -4928,20 +4973,9 @@ impl App {
                 .set_position(snapshot.saved_scroll_offset_y);
             self.zip_nav = snapshot.saved_zip_nav.take();
             self.top_level_grid_view = top_level_grid_view::TopLevelGridView::default();
-            // Appended target removal leaves every basis index stable. Retain its
-            // metadata/edit caches and invalidate only generation-bound main work.
-            self.bump_items_generation();
-            if record_matches_basis {
-                self.folder_observation.as_mut().unwrap().generation = self.items_generation;
-            }
-            self.bump_render_epoch_only();
-            self.reconcile_restored_cover_thumbnails();
-            self.move_grid_cursor(
-                snapshot.saved_selected,
-                crate::app::GridCursorIntent::Automatic,
-            );
-            self.viewer_navigation_caches.invalidate();
-            // The generation setter retires requests and owned CPU images together.
+            // The payload movement is complete here. Generation retirement,
+            // observation rebind and cursor publication belong to the stable
+            // source projection after finish_fork, not this table operation.
             let basis_len = self.items.len();
             self.checked.retain(|idx| *idx < basis_len);
             self.rating_cache.retain(|idx, _| *idx < basis_len);
@@ -4968,7 +5002,24 @@ impl App {
         idx: usize,
         items_generation: u64,
     ) -> Box<ViewerContextBundle> {
-        let mut detached = self.split_current_context_preserving_main_grid();
+        let restore = self.capture_direct_media_main_restore();
+        let payload = self.split_materialized_physical_context_payload(
+            physical_context,
+            idx,
+            items_generation,
+        );
+        self.finish_direct_media_main_restore(restore);
+        payload
+    }
+
+    #[cfg(windows)]
+    fn split_materialized_physical_context_payload(
+        &mut self,
+        physical_context: &Path,
+        idx: usize,
+        items_generation: u64,
+    ) -> Box<ViewerContextBundle> {
+        let mut detached = self.split_current_context_preserving_main_grid_payload();
 
         detached.view_trim_mode = self.view_trim_mode;
         detached.view_trim_book_preference = self.view_trim_book_preference;
@@ -5206,7 +5257,7 @@ impl App {
     ) -> Box<ViewerContextBundle> {
         match (policy, spec.take()) {
             (ForkPolicy::LiveMediaPark { .. }, Some(ProductionForkSpec::LiveMedia)) => {
-                self.split_current_context_preserving_main_grid()
+                self.split_current_context_preserving_main_grid_payload()
             }
             (_, Some(spec)) => self.fork_materialized_payload(spec),
             _ => panic!("viewer-context fork plan was missing"),
@@ -5220,7 +5271,7 @@ impl App {
             items_generation,
         } = spec
         {
-            self.split_materialized_physical_context_for_detached_scope(
+            self.split_materialized_physical_context_payload(
                 &physical_context,
                 idx,
                 items_generation,
@@ -5728,6 +5779,22 @@ impl App {
         result
     }
 
+    /// The outgoing session/output must be retired before replacing this reader's host.
+    pub(in crate::app) fn replace_mounted_detached_window_binding(&mut self, old: u64) -> u64 {
+        let mounted = self
+            .mounted_viewer_context_id()
+            .expect("host exchange is mounted");
+        if let Some((owner, residence)) = self.locate_window_context(old) {
+            assert_eq!((owner, residence), (mounted, ContextResidence::Mounted));
+            assert_eq!(self.unbind_window(old), Some(mounted));
+        }
+        assert!(self.viewer_context_window(mounted).is_none());
+        let new = self.allocate_detached_viewer_window_id();
+        self.bind_window(mounted, new)
+            .expect("replacement host has one binding");
+        new
+    }
+
     #[track_caller]
     pub(in crate::app) fn reserve_window_binding_for_build(&mut self, window_id: u64) {
         self.viewer_contexts
@@ -5950,10 +6017,12 @@ impl App {
             .as_ref()
             .filter(|source_key| source_key.owner_context_id == source)
             .cloned();
+        let restore = self.capture_direct_media_main_restore();
         let (id, ops) = self.viewer_contexts.table.plan_fork(policy);
         self.execute_viewer_context_ops(ops, Some(spec));
         let finished = self.viewer_contexts.table.finish_fork();
         assert_eq!(finished, id);
+        self.finish_direct_media_main_restore(restore);
         self.publish_mounted_context_rating_writes_at_boundary("fork_incoming");
         // Music analysis lives on App, outside the viewer bundle. Transfer its exact
         // source and worker inbox only when the same player and applied track moved.

@@ -5707,6 +5707,10 @@ pub struct Settings {
     #[serde(default)]
     pub agent_show_ai_captions: bool,
 
+    /// AI アプリへ動画・音声の文字起こしを渡す。既定 OFF。
+    #[serde(default)]
+    pub agent_show_transcripts: bool,
+
     /// ラベル、ボタン、メニュー、ダイアログ、フルスクリーン HUD の文字コントラスト。
     #[serde(default)]
     pub text_contrast: TextContrast,
@@ -8155,6 +8159,7 @@ impl Default for Settings {
             agent_show_thumbnails: false,
             agent_show_gps: false,
             agent_show_ai_captions: false,
+            agent_show_transcripts: false,
             text_contrast: TextContrast::default(),
             notification_duration: NotificationDuration::default(),
             ui_scale_factor: default_ui_scale_factor(),

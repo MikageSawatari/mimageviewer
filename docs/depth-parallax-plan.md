@@ -22,7 +22,7 @@
 
 ### v1 に含める
 
-- メイン context のウィンドウ表示 / 全画面 / linked F12 別ウィンドウの **3D 表示モード** (以下「3D モード」、§6.4.2)。ON/OFF はキーと閲覧上部の
+- ウィンドウ表示 / 全画面 / 別ウィンドウの **3D 表示モード** (以下「3D モード」、§6.4.3)。main と独立 context のどちらでも使え、同時に持てるのは 1 context。ON/OFF はキーと閲覧上部の
   ボタン。入ると右側に **3D パネル**が出る。
 - 動き: **マウス追従 / 左右 / 円 / 8 の字 / 上下**。強さ・周期・止まる深さ・奥行き整形をパネルで選ぶ。
   設定は画像ごとではなく全体の設定として保存する。
@@ -37,7 +37,7 @@
 | --- | --- |
 | 動画、アニメーション画像 (GIF / APNG / WebP) | フレームごとに深度が変わりちらつく。研究調査 §6 と同じ |
 | 見開き・連結読み | 2 ページを 1 つの奥行きとして扱えない。360° と同じく入口で弾く |
-| **独立 session の別ウィンドウ、独立 context** | §6.4.2 第 2 段。複数ウィンドウモードの窓・メディアウィンドウは対象外。main の linked F12 は対象 |
+| **複数 context での同時 3D** | §6.4.3。複数ウィンドウモード・メディアウィンドウも対象だが、一度に 1 context だけが持つ |
 | 360° パノラマ表示との同時使用 | どちらも表示を占有するモード。3D に入ると 360° は終わり、3D 中は 360° に入れない (§6.2) |
 | 深度の手修正、左右並び (SBS)、2 層化と背景補完 | 研究調査 §6 の v1.x / v2 |
 | 先読み (次のページの深度を前もって計算) | dGPU では 30〜50 ms で不要。内蔵 GPU で 1 秒待つ点は試験実装で評価してから |
@@ -212,7 +212,7 @@ CPU の画素 (`ColorImage`) を探さず、**表示中のテクスチャを GPU
 
 - プロセスに 1 本の常駐 thread `depth-estimation`。要求は **1 つの slot (最新が勝つ)** を
   `Mutex + Condvar` で渡す (coding-conventions の並行処理。try_lock の再試行ループは書かない)。
-  v1 は 3D モードがメインの viewer だけ (§6.4) なので、同時に要る要求は 1 つ。
+  3D モードを持てるのはプロセス全体で 1 context (§6.4.3) なので、同時に要る要求は 1 つ。
 - 要求: `DepthRequest { context, request_id, viewport, key, input_504, guide, cancel: CancelToken, reply }`。
   - `request_id` は単調増加。**要求の寿命は `TextureId` ではなく context + `request_id` で識別する**。
     同じテクスチャで OFF → ON した場合に、取り消した前の要求の結果を受け取らないため。
@@ -303,7 +303,7 @@ hidden / minimized は予約せず、Ready / Failed / OFFでは箱と箱由来�
 
 - 画像の閲覧中でない、動画、アニメーション画像
 - 見開きの 2 ページ表示中、連結読み
-- メイン context の MainWindow / Fullscreen / 独立でない DetachedWindow でない (§6.4.2)。共通の `App::depth_presentation_eligible` で context・presentation・session の独立性を照合する
+- ほかの context が 3D を持っている (§6.4.3)。`other_viewer_context_ids` と `with_viewer_context_ref` で読み取り、`OtherWindow` で拒否する。presentation と独立性の許可集合は持たない
 - wgpu の描画状態が無い
 - 編集系のモード (消しゴム・隠蔽加工・補正レイヤー・テキスト注釈・切り取り・SNS 分割) の最中
 
@@ -312,7 +312,7 @@ hidden / minimized は予約せず、Ready / Failed / OFFでは箱と箱由来�
 360° が ON のときに 3D へ入るのは弾かず、§6.2 の 1 つの持ち主が 360° を終わらせてから 3D にする。
 
 **同じ条件を「続けてよいか」にも使う**: 入口条件のうちページと表示の状態に関わるもの
-(静止画・1 ページ・連結読みでない・メインの表示) は、3D 中も毎フレーム同じ関数で照合する (§6.3)。
+(静止画・1 ページ・連結読みでない・ほかが 3D を持っていない) は、3D 中も毎フレーム同じ関数で照合する (§6.3)。
 
 ### 6.2 状態 — 表示を占有するモードの持ち主を 1 つにする
 
@@ -376,10 +376,10 @@ pub enum DepthSourcePhase {
 | D キー / 上部の 3D ボタン | 入口条件を通れば ON。ON なら OFF |
 | 上部バーの × | 3D を OFF (閲覧表示は閉じない。360° と同じ) |
 | Esc / 一覧へ戻る / フォルダ移動 | 既存の閲覧終了で 3D も終わる |
-| MainWindow ⇔ Fullscreen (F11)、MainWindow / Fullscreen ⇔ linked DetachedWindow (F12) の実切替 | 共通の `commit_viewer_session` で 3D を終了し、実効キー (未割当なら上部ボタン) で再入場できるとトーストで知らせる。同じ presentation かつ同じ独立性の再確定では継続 |
-| linked F12 窓内の F11 (枠なし全画面)、リサイズ・DPI 変更 | presentation・context・viewport は同じなので 3D と実行中要求を継続。現在の pass の矩形・倍率で描く |
+| MainWindow ⇔ Fullscreen (F11)、MainWindow / Fullscreen ⇔ DetachedWindow (F12)、session の独立性の実切替 | 共通の `commit_viewer_session` で 3D を終了し、実効キー (未割当なら上部ボタン) で再入場できるとトーストで知らせる。同じ presentation かつ同じ独立性の再確定では継続 |
+| 別ウィンドウ内の F11 (枠なし全画面)、リサイズ・DPI 変更 | presentation・context・viewport は同じなので 3D と実行中要求を継続。現在の pass の矩形・倍率で描く |
 | 静止画の次 / 前ページへ移動 | ON のまま。新しいページの表示が安定したら深度を作る |
-| **続ける条件を満たさなくなった** (動画・アニメーション画像のページへ移った、同じページでアニメーションと後から分かった、見開き・連結読みに切り替わった、独立 session になった) | **3D を OFF にする** (§6.2 の持ち主を通る)。トーストで知らせる |
+| **続ける条件を満たさなくなった** (動画・アニメーション画像のページへ移った、同じページでアニメーションと後から分かった、見開き・連結読みに切り替わった) | **3D を OFF にする** (§6.2 の持ち主を通る)。トーストで知らせる |
 | 3D パネルの「書き出し…」 | モーダルの書き出しダイアログ (§7) |
 
 - 「ON のまま続ける条件を満たさない」状態を作らない。360° は「state を保ったまま非アクティブ」
@@ -409,33 +409,29 @@ pub enum DepthSourcePhase {
 
 ### 6.4 別ウィンドウ (detached viewer) と 3D モード
 
-- **メイン context の MainWindow / Fullscreen / linked DetachedWindow** で使える (§6.4.2 第 1 段)。独立 session・独立 context は対象外。理由: 3D モードは毎フレームの再描画・
-  GPU 資源・深度 worker を持つ。複数の viewer で同時に動かすと、`callback_resources` の slot、
-  worker の要求の取り合い、park / fork 時の移動先、と組み合わせが増える。v1 では入口で弾いて
-  組み合わせを作らない。
-- それでも状態は `ViewerContextBundle` に置く。メインの bundle が mount を外れる間 (active detached を
-  mount している間) に App の field として見えてしまわないため。
-- **「メイン」の定義**: context の識別子 (メインの bundle か) と、**今の presentation** (メイン窓の
-  MainWindow / Fullscreen / linked DetachedWindow か) と session の独立性で決める。メインの context 自身も複数ウィンドウモードでは独立 session に
-  なるので、識別子の比較だけでは足りない。独立性は mounted の `ViewerSession.independent_active` を読む。
+- **main・独立 context のどの画像閲覧表示でも使える** (§6.4.3)。複数ウィンドウモードで main 自身が独立 session になっている窓も含む。
+  GPU slot・worker・ダイアログの組合せは、入口で「プロセス全体で 1 context」に制限して減らす。
+- 状態は `ViewerContextBundle` に置き、scoped mount では維持する。ほかの context の 3D は読み取りだけで照合し、
+  新しい入場のために兄弟の状態を終えたり資源を消したりしない。
+- **「メイン」の定義**は context の識別子。main 所有と環境設定由来のダイアログの見え方・受付規則は維持する。
+  presentation・session の独立性は入場の許可条件ではなく、実 session 切替の終了判定にだけ使う。
 - **presentation の切替を確定する所で 3D を終える**: 通常の F12 は
   `apply_egui_viewer_presentation_for_current_item` (app.rs:91819 → 91624) で presentation を変え、
   `reset_detached_pause_foreground_modes` は通らない。F12 のキー処理に OFF を足すのではなく、
-  **viewer の session を確定する共通の確定点** (`commit_viewer_session`。presentation だけの入口は `commit_viewer_presentation`) で、実際の表示・独立性の切替または切替先が共通適格性を満たさなければ §6.2 の持ち主で
+  **viewer の session を確定する共通の確定点** (`commit_viewer_session`。presentation だけの入口は `commit_viewer_presentation`) で、実際の表示・独立性の切替があれば §6.2 の持ち主で
   `Depth` を終える。360° は別ウィンドウでも使えるので、ここでは `Depth` だけを終える。
-  - 加えて §6.3 の描画直前の照合が、確定点を通らない経路があっても不適格な session で 3D を
+  - 加えて §6.3 の描画直前の照合が、媒体・ページ・排他条件を満たさない状態で 3D を
     描かないことを保証する (2 つは役割が違う: 確定点は状態の持ち主の後始末、照合は描画の安全)。
   - F12 の表示先切替では終了し、切替先で新しく D を押せば入場する。窓内 F11 は確定点を通らず継続する。
-- park / fork の経路で main の 3D の状態を相手側へ渡す処理は作らない。main の Depth を搬送する前に
-  既存 fork の退役点・park の `reset_detached_pause_foreground_modes` を通して OFF にする。
-  main 以外の live-media park の終了漏れは §6.4.2 第 2 段の検討対象とする。
-- detached の述語に触れる箇所 (入口条件の「メインの viewer か」と park 時の OFF) は、
+- live pass を失う park / fork / close では Depth を終了する。独立した live-media park も snapshot 作成前に
+  その context の Depth だけを退役し、360° の意図を変えない。ダイアログの寿命・表示先・独立所有窓の modal 保護は §6.4.3 の規則に従う。
+- detached の述語に触れる箇所 (live・dialog 所有・modal の受付・park 時の OFF) は、
   CLAUDE.md「Detached viewer リワーク中のルール」に従い、**ClaudeCode と Codex の双方のレビューで
   症状パッチではない構造的な変更だと合意**し、detached-rework-plan.md §11 に記録する。
 
 #### 6.4.1 MainWindow 対応 (2026-11-08、案1を採択・実装済み)
 
-以下は MainWindow 対応時点の記録。現在の適用範囲は §6.4.2 を正本とする。
+以下は MainWindow 対応時点の記録。現在の適用範囲は §6.4.3 を正本とする。
 当時の対象は **メイン context の `MainWindow` と `Fullscreen`**。`DetachedWindow` と独立 context は
 引き続き対象外で、§6.4 の複数 viewer・GPU slot・worker・park/fork の理由を変更しない。
 設計担当 ClaudeCode が案1を採択し、独立 Sol / xhigh と症状パッチではない構造変更であることに合意した。
@@ -531,18 +527,20 @@ pub enum DepthSourcePhase {
 
 #### 6.4.2 F12 の別ウィンドウ対応 (§1.767、2026-11-11)
 
+以下は第 1 段の設計・実装の記録。現在は §6.4.3 で独立した窓も対象にしている。
+本節の決定 B・C・E は維持し、main 限定の適格性と決定 D は §6.4.3 の所有・表示先の規則へ一般化した。
+
 設計: ClaudeCode Opus 5.5。worktree `G:\home\mimageviewer-depth2`、ブランチ `feat-766-767-depth-ui`。
 利用者決定 (2026-11-11): 360° は別ウィンドウで使えるので、3D も F12 の別ウィンドウで使えるようにする。
 行番号は基点 `18d528908` の調査時点 (関数名を追跡の正本とする)。
 
 **範囲を 2 段に分ける (設計担当の判断)**
 
-- **第 1 段 (今回実装)**: フル機能ウィンドウモードで F12 を押し、**main context をそのまま別ウィンドウに出している表示**
+- **第 1 段 (実装済み)**: フル機能ウィンドウモードで F12 を押し、**main context をそのまま別ウィンドウに出している表示**
   (linked F12。`ViewerPresentation::DetachedWindow` かつ独立 session でない) とその枠なし全画面。バックログ §1.767 の
   「まず F12 で開く閲覧ウィンドウの通常表示と枠なし全画面が対象」に当たる。
-- **第 2 段 (保留、統括・利用者の判断待ち)**: 複数ウィンドウモードの各窓、フル機能モードのメディアウィンドウなど、
-  **main 以外の独立 context** での 3D。下の「第 2 段で要るもの」のとおり、資源とダイアログの持ち主が main 以外になることで
-  設計が大きく増え、既存操作に新しい制限も入る。
+- **第 2 段 (§6.4.3 で利用者採択)**: 複数ウィンドウモードの各窓、フル機能モードのメディアウィンドウなど、
+  **main 以外の独立 context** での 3D。下の課題を単一所有と独立所有窓だけの modal 保護へ整理した。
 
 **調査で分かったこと (コード確認)**
 
@@ -625,7 +623,7 @@ E. **backstop の frame は 2D のまま**。描画経路を 2 つにしない�
 **状態を減らす検討**: 3D の持ち主を main 1 つに保つことで、資源の取り合い・ダイアログの持ち主・所有 viewer の終了後の表示先は、
 すべて今の main の挙動の範囲に収まる。新しい状態・gate・待ちは足さない。
 
-**第 2 段で要るもの (設計レビュー r1〜r3 で分かったこと。保留)**
+**第 2 段へ整理した課題 (設計レビュー r1〜r3 の調査記録。採択仕様は §6.4.3)**
 
 独立 context を対象にすると、3D とダイアログの持ち主が main 以外になる。r1〜r3 のレビューで次が必要と分かった:
 - プロセス全体で 3D は 1 context (main の埋め込みと独立 context が同じ frame に live pass を持つため。入口で他の bundle を読んで拒否)。
@@ -635,7 +633,7 @@ E. **backstop の frame は 2D のまま**。描画経路を 2 つにしない�
   窓の切替・外部からの開く要求を追加モデルの確認中も拒否する (**今は受け付けている操作への新しい制限**)、所有窓の OS の閉じる操作を拒否する、
   modal 中の自動送り (スライドショー・フォルダをまたぐ送り) と受付済みの遷移の扱い。
 - 独立 context から D を押したときの、モデル確認の完了後の入場の再開 (ROOT の poll から要求元 context へ配送)。
-これらは「既存操作に新しい制限を入れるか」(CLAUDE.md「通常の使い方が不便になる変更」) を含むので、統括・利用者の判断を待つ。
+これらの新しい制限は、利用者が第 2 段を進めると決めた後、§6.4.3 の範囲で採択した。
 
 **detached 述語・viewport 経路に触れる範囲 (第 1 段)** (CLAUDE.md「Detached viewer リワーク中のルール」)
 
@@ -687,6 +685,380 @@ E. **backstop の frame は 2D のまま**。描画経路を 2 つにしない�
   P3 1 件 (linked F12 と独立 context の通常 body は 2 つ並ばない) → 調査 2・テスト 4 を訂正。独立フラグは context ごとの projection、
   ROOT の地点では main が mount されていることを確認。判定「指摘修正後に実装開始可」、構造的変更に合意 (はい)。
   P1 の修正は独立化の既存の所有境界で閉じるもので、追加の guard・待ち・再試行・repaint は不要との見解。
+
+#### 6.4.3 独立した窓での 3D (§1.767 第 2 段、2026-11-11、設計)
+
+設計: ClaudeCode Opus 5.5。基点 `1ff4082a8` (第 1 段は実装・レビュー・全件済み)。
+利用者決定 (2026-11-11): 第 2 段も進める (第 1 段の報告で、独立した窓を持ち主にすると窓をまたぐ新しい制限が要ることを示したうえでの判断)。
+
+**対象**: main 以外の独立 context (複数ウィンドウモードの各窓、フル機能モードでメディアウィンドウから静止画へ進んだ窓、
+PDF / ZIP の連動静止画を再開した独立窓など) と、複数ウィンドウモードで main 自身が独立の静止画窓になっている場合。
+どの presentation でも、その context の live pass (`render_fs_body`) があれば 3D を使える。
+
+**第 1 段からの変更点だけを書く** (第 1 段の決定 B・C・E はそのまま。D は下の 3 で一般化する)。
+
+1. **3D を持てるのはプロセス全体で 1 context** (§6.4.2 調査 2 の「main 埋め込み + アクティブな独立 context の 2 つの通常 body」のため)。
+   - 適格性 (`depth_session_eligible`) から「main context」と「独立でない」を外す。presentation の許可集合は 3 種すべてになるので持たない
+     (常に真の述語は残さない)。代わりに入口条件へ「**ほかの context が 3D を持っていない**」を足す: `other_viewer_context_ids()` の各 context を
+     `with_viewer_context_ref` で読み、`fs_exclusive_view` が Depth なら拒否 (読み取りだけ。兄弟の状態を変えない。mount 中の自分は含まれない)。
+   - 拒否は `DepthEntryBlock::OtherWindow` (`Detached` を置き換え):「3D 写真は別のウィンドウで表示中です。そちらを終了してから使ってください」。
+     上部の 3D ボタンの有効表示も同じ答え。継続の照合 (`depth_view_may_continue`) も同じ関数だが、自分が持つ間に他が持つことは入口で起きない。
+   - 確定点 `commit_viewer_session` は残す: presentation か独立かどうかが実際に変わったら 3D を終える (第 1 段の案 1 と B)。
+     確定点の「不適格な切替先」の分岐は到達しなくなるので消す。
+   - 採らなかった案: 後から入った側を優先して他 context の 3D を終える (兄弟の状態を書き換える)、2 つ同時に動かす (worker の待ちは最新 1 件、
+     GPU slot は 1 つ)、2 つの通常 body がある間だけ禁止 (frame ごとに答えが揺れる)。
+2. **live pass を失う遷移はすべて 3D を終える**。欠けている `park_active_detached_context_as_live_media` (アクティブな独立 context を
+   ParkedLive へ移す) に、fork と同じ「Depth だけを `set_fs_exclusive_view(None)` で終える」を、snapshot 作成の前 (その context を mount した closure の中)
+   に入れる。`reset_detached_pause_foreground_modes` は呼ばない (360° 動画の意図の扱いを変えないため。fork の前例と同じ)。
+   ほかの経路 (pause・静止画の park・fork・close / retire・確定点・Remote の取得) は既に終える (設計レビュー r1〜r3 で確認)。scoped mount では終えない。
+3. **3D のダイアログを描く場所を 1 つの関数で決める** (第 1 段の D の一般化)。
+   ```text
+   depth_dialog_owner_surface(owner: Option<ViewerContextId>) -> DepthDialogSurface
+     owner が Some(c)、c ≠ main、viewer_context_live(c)  → Viewer(c)
+     それ以外                                              → Main   (第 1 段の規則: main の viewer pass、main に閲覧が無ければ ROOT)
+   viewer_context_live(c) (c ≠ main) = active_viewer_context_id() == Some(c) かつ detached_active_window_alive_wanted()
+   ```
+   - owner: 書き出しは `Operation.resource.context`。追加モデルの案内は、`DepthSetup` がダイアログの寿命の間持つ入口
+     (`ModeEntry(request)` → `Some(request.context)`、`Preferences` → `None`)。今は Checking の間しか入口を持たないので、ダイアログと一緒に持たせる。
+   - 描く側: viewer pass の 2 か所は `Viewer(mount 中の context)` のとき、または `Main` かつ mount 中が main のとき。ROOT は `Main` のときだけ
+     (ROOT の 3D 書き出しは既存条件 `main_window_should_draw_export_dialogs` に、追加モデルの案内は第 1 段の条件に、`Main` を加える。
+     独立 context が持ち主の間は main が一覧でも ROOT で描かない)。
+   - **main が持ち主のときは第 1 段と同じ** (main の今の見え方を変えない)。
+4. **modal の間、独立した持ち主の窓は終わらない**。持ち主が独立 context のとき、3 の答えが `Main` に落ちると、main の閲覧が
+   body を描かない状態 (列挙待ちの holdover・native 動画など) では modal が見えなくなる (設計レビュー r2 P1)。そこで、
+   **持ち主が main 以外の独立 context で、3D の modal (書き出しの全段階、または 3D の入口から開いた追加モデルの案内の Checking / Confirm。
+   RemoveConfirm は環境設定からしか開かず持ち主を持たない) が開いている間**だけ、その持ち主を終わらせる操作を受け付けない:
+   - キー・ポインタ (Esc・F12・F11・ページ移動・×・D): 既存の共通 modal が止める (変更なし)。
+   - 窓の切替 (他の窓の activation) と外部からの開く要求 (関連付け・D&D・単一起動・Everything 等): `document_open_modal_admission_blocked`
+     は書き出しを既に含む。**追加モデルの案内を「持ち主が独立 context の modal 段階」の間だけ**この述語に加える
+     (`Preferences` 由来や main が持ち主の案内では今までどおり受け付ける)。
+   - 持ち主の窓の OS の閉じる操作: `accept_active_detached_window_close` に、**閉じようとする窓の context が独立した 3D modal の持ち主**なら
+     拒否を加える (既存の `viewer_mutation_modal_active` と同じ扱い)。持ち主でない窓は今までどおり閉じられる。
+   - 自動送り (スライドショー・フォルダをまたぐ送り): 書き出し中は `handle_fs_navigation_with_render_perf` が既に止める。追加モデルの modal 中も、
+     持ち主が独立 context なら同じ条件で止める (持ち主でなければ今までどおり)。
+   - Remote の取得: 書き出しは既存の lease が止める。追加モデルの modal 中の取得は全 viewer を閉じ、main は一覧になるので答えは `Main` で ROOT が描ける。
+   - **受付済みの遷移がある間は modal を始めない** (設計レビュー r5 P1)。独立 context でフォルダ移動などを受け付けた後、旧画像の表示中に
+     modal を始めると、移動の完了 (`apply_folder_nav_result`) が旧 viewer を閉じた後の reopen を、上で広げた開く要求の拒否が自分で拒み、
+     持ち主の窓が終わり得る (通常の操作の競合)。そこで、持ち主になる context が独立 context のとき、modal を始める 2 か所
+     (3D の入口でモデル確認のダイアログを開く `toggle_depth_parallax`、書き出しの受付 `admit_depth_export`) で、その context が
+     **`active_detached_transition_outstanding()`** (アクティブな別ウィンドウの内部遷移が残っているかの唯一の判定。フォルダ移動・
+     PDF / ZIP の列挙待ち・遅延 reopen・Preparing などを含む) なら、modal を開かずに「読み込みが終わってから使ってください」と通知して拒否する。
+     判断は viewer を閉じる前の、modal を開く時点で行う。main・環境設定由来には広げない。
+     modal を開いた後は、新しい遷移は開く要求の拒否・共通 modal・自動送りの停止で受け付けないので、modal 中に持ち主が終わる通常の経路は残らない。
+   - これらはすべて、独立した窓で 3D を使うときだけ現れる新しい制限で、main の MainWindow / Fullscreen / linked F12 の挙動は変えない。
+   - 非 modal の段階 (追加モデルの Running / Done / Cancelled / Error) は止めない。持ち主が終われば `Main` に移り、main の閲覧が body を描かない間は
+     見えなくても入力は止めず、通常の body に戻れば描かれる (今の環境設定由来の案内と同じ性質)。
+   - 受入条件: 固定した状態では描く場所が 1 つ。持ち主の退場後は生存する表示先だけが描く。frame 全体での呼出し回数を 1 にそろえる frame フラグは作らない。
+5. **入場の再開を要求元 context へ配送する** (設計レビュー r1 P2)。モデル確認は ROOT の `poll_depth_setup` のまま。`ModeEntry(request)` の再開は、
+   `request.context` が main 以外なら `with_viewer_context(request.context, …)` で mount してその context の `resume_depth_entry_after_check` を呼ぶ。
+   照合は今の items 世代・fs_idx・item_id に加えて `viewer_context_live`。満たさなければ再開しない (既存の「古い要求は捨てる」)。
+   mount の中で 1 の「ほかの context が 3D を持っていない」も同じ関数で判定される。`DepthViewState::new(edit_request_owner_context())` は要求元を所有者にし、
+   推論の wake 先は後続の子 pass の `advance_depth_source` が子 viewport で捕捉する (r2 で確認済み)。
+6. **一時データの id を持ち主の context で分ける**: `depth_panel_rect` と `depth_export_display_snapshot` の id に 3D の持ち主の context を混ぜる
+   (1 により同時に 1 つしか書かないが、「context 固有の値は所有 context だけが読み書きする」を形で保証する)。
+
+**まれな失敗の割り切り**: modal 中に所有窓の viewer が失敗で閉じる (読み込み失敗でフォルダ移動が窓を閉じる等) 場合、答えは `Main` に移り、
+main の閲覧が body を描かない状態と重なると modal がしばらく見えない。通常の操作では起きない組み合わせなので、仕組みは足さない (ログ + 既存の通知)。
+
+**状態を減らす検討**: 持ち主を常に 1 つに保ち (1)、持ち主が終われば 3D も終わり (2)、modal の間は独立した持ち主を終わらせない (4)。
+これにより「持ち主の無い modal」「2 つの 3D」「at rest の 3D」の組み合わせを作らない。新しい保留状態・ハンドオーバー・待ち・再試行は足さない。
+入口 (`CheckingOrigin`) をダイアログの寿命の間持つのは、既存の値の寿命を延ばすだけで状態の種類は増えない。
+
+**detached 述語・viewport 経路に触れる範囲** (第 1 段に加えて)
+
+- 変える: 適格性 (presentation・独立の許可集合を外し、プロセス全体で 1 つの条件へ)、`park_active_detached_context_as_live_media` の 3D 終了、
+  ダイアログの描く場所の関数、`document_open_modal_admission_blocked` / `accept_active_detached_window_close` / 自動送りの停止条件に
+  「独立した 3D modal の持ち主」を加えること、入場の再開の配送、一時データの id。
+- 変えない: viewport の生成・id・builder、HWND の同定、placement、focus、z-order、bundle の swap、fork / park の手順、`reset_detached_pause_foreground_modes`、
+  `render_fs_body` の root / child の振り分け、backstop、F11 / F12 のキー経路。App に detached 用の bool / Option を新設しない
+  (持ち主は既存の operation と `DepthSetup` から読む)。時間窓・再試行・追加 repaint は足さない。
+
+**テスト** (第 1 段のテストに加えて)
+
+1. 入口の matrix: 独立 context × DetachedWindow、main の独立窓で許可。ほかの context (at rest) が 3D を持つときは両方向
+   (main 埋め込みが持つ → 独立 context で D、独立 context が持つ → main で D) で `OtherWindow` を返し、どちらの状態も変えない。上部ボタンも同じ。
+2. 寿命: アクティブ独立 context の 3D → 他の窓の activation (pause / park) で終わる、`park_active_detached_context_as_live_media` で終わる
+   (要求の取消・slot 除去)、閉じる (推論中を含む) で終わる。終えた後に別の context で入場でき、`OtherWindow` にならない。scoped mount では終わらない。
+3. ダイアログ: 独立 context で D (モデル未導入) → 案内がその窓の pass だけに出て、main の埋め込み・ROOT では描かれない。独立 context の書き出し →
+   その窓だけ。持ち主が main のとき・環境設定由来は第 1 段と同じ。
+4. modal 中の保護 (独立した持ち主): 書き出しの各段階と追加モデルの Checking / Confirm で、その窓の OS の閉じる操作・他の窓の activation・外部からの開く要求・
+   スライドショーの送り (フォルダをまたぐ送りを含む) が拒否 / 停止され、状態が変わらない。持ち主でない窓は閉じられる。main が持ち主の案内・環境設定由来の
+   案内では、開く要求・activation・スライドショーが今までどおり受け付けられる (退行なし)。
+4b. 受付済み遷移との排他: 独立 context でフォルダ移動を受け付け → 結果が届く前に D (モデル未導入) / 書き出し → modal は開かず通知で拒否 →
+   正常な結果が届き、同じ窓・同じ context で新しいフォルダが開く。通常フォルダと PDF / ZIP (列挙待ち) の両方。遷移が無ければ modal は開く。
+5. 非 modal: 独立 context の追加モデル Running 中にその窓を閉じる → 案内は main の表示 (一覧なら ROOT) に移り、操作できる。
+6. 入場の再開: 独立 context で D → ROOT の poll で「導入済み」の確認完了 → その独立 context だけが入場 (1 回の D で始まる)。確認中にページが変わった・
+   窓がアクティブでない場合は再開しない。
+7. 一時データの id: 3D を終えて別の context で始めた最初の pass に、前の context のパネル矩形・書き出し snapshot を読まない。
+8. 既存回帰: `test(/depth|export|presentation|window_mode|panorama|detached|multiwindow_scenario|slideshow/)`。
+
+**設計レビュー r5 (GPT-6.1 Sol / xhigh、read-only、基点 `1ff4082a8`)**: P1 1 件 (受付済みのフォルダ移動の完了が、広げた開く要求の拒否で
+reopen を拒まれ、modal 中に持ち主の窓が終わる通常の競合) → 4 の「受付済みの遷移がある間は modal を始めない」とテスト 4b を追加。
+ほかの点 (1 context 制約、ParkedLive の終了、入場の再開の配送、live 判定と描く場所、modal の分類、close の範囲、main・環境設定由来の非退行、
+Remote・トレイ・終了、まれな失敗の割り切り) は妥当との確認。P2・P3 なし。判定「指摘修正後に実装開始可」、構造的変更に合意 (はい)。
+
+**文書**: マニュアル (3D 写真の「使える場面」: 別ウィンドウでも使える、一度に 1 つの窓だけ、独立した窓でモデル確認・書き出し中はその窓を閉じたり
+他の窓へ切り替えたりできない)、keymap-spec の 3D の節、本書 §1・§6.1・§6.4・§6.4.2 の「第 2 段は保留」の記述、detached-rework-plan §11 (第 2 段の記録)。
+
+#### 6.4.4 第 2 段の実機課題の修正 (§1.767、2026-11-13、設計)
+
+**対象**: §17.16 の課題 1〜4。サブ PC 確認 依頼 39 (観測はサブ PC 担当) で見つかった。原因の調査は実装担当とは別の GPT-6.1 Sol / high (read-only) が
+コードと `C:\miv-subpc\results-39\` のログで行い、設計担当がコードで照合した。課題 1〜3 はどれも v5.1.0 から既存の detached の所有の不整合で、
+第 2 段の「同時に 1 context だけが 3D を持つ」規則で利用者に見えるようになった (課題 3 の「断られる」組合せだけが第 2 段で生じた)。
+凍結ルールにより、どれも症状パッチではなく所有の移動・確定点を正す構造的修正とし、独立 Sol / xhigh と合意して detached-rework-plan §11 に記録する。
+
+**課題 1 — 独立した窓の中の送りで独立性を失う (BA-7)**
+
+- 原因: 送りの行き先は `requested_viewer_presentation_for_open` が「今の session が独立 detached で、次が静止画」を根拠に DetachedWindow を選ぶ
+  (第 1 条件)。ところが確定の `prepare_viewer_presentation_open` は独立性を `detached_still_open_is_independent` (「画像を別ウィンドウで開く」設定か
+  一度きりの指定) で決め直し、今の session の独立性を見ない。フル機能モードで独立になったメディアウィンドウ (メインで別のものを開いて
+  ParkedLive になり、再び有効にした窓) では、動画→最初の画像で独立性が false になり、次の送りは F12 設定 OFF なら `open_non_detached` でメインへ移る。
+  同じ事実 (この session は独立か) を 2 か所で別々に決めているのが根本。
+- 修正: 表示先と独立性を 1 回の解決で決め、確定時に設定から決め直さない。**既存の session の中の移動 (送り・ページ移動・フォルダ移動後の reopen など、
+  新しい閲覧を始めない遷移) は、今の session の独立性を引き継ぐ**。一覧・外部・コレクションなどから新しく開く場合は、今どおり設定と一度きりの指定で決める。
+  解決結果 (presentation, independent) を 1 つの値として `prepare_viewer_presentation_open` の確定点へ渡し、`commit_viewer_session` はその値だけを書く。
+  「既存 session の中の移動か」は呼び出し元の既存の区別 (fs navigation と grid open の入口) から型で渡し、App に新しい bool / Option を足さない。
+- 通常の使い方への影響 (3D を使わなくても変わる): **独立したメディアウィンドウで画像を送り続けられるようになる** (今は 2 枚目からメインへ移り、
+  メディアウィンドウは閉じる)。一覧から動画を開いただけの連動したメディアウィンドウ (メインの閲覧の一部) は変えない (画像へ進むとメインで開く)。
+  F12 の連動ウィンドウ・複数ウィンドウモードの窓は、もともと独立性が設定と一致しているので変わらない。1 枚目は今も窓に留まるので、
+  「1 枚目は窓、2 枚目はメイン」という食い違いをなくす変更であり、手間が増える・できなくなる操作は無い。
+- 3D は、表示先が変わらない送りでは続く (§6.4.1 の継続条件のまま)。
+
+**課題 2 — 再開した窓が、閉じた後に待機中の窓として作り直される (BA-7、BA-5 関連)**
+
+- 原因: `activate_detached_image_window_snapshot` は、再開する窓の snapshot を `detached_image_windows` から先に remove し、その後で
+  `park_and_close_current_active_detached_viewer` を呼ぶ。そこで使う `active_viewer_context_id` は、session が無いとき window binding /
+  `last_active_detached_window_id` から移動元を探し、「snapshot が無い窓 = active」と判定する。再開する窓が直前の active 窓だった場合
+  (pause → 再開)、snapshot を先に消したためにその窓自身が移動元と判定され、`pause_current_active_viewer_context` が同じ context の snapshot を
+  もう一度 push する。再開後は active と snapshot の両方に同じ窓番号が残る。active の間は passive 描画から現在の active id が除外されるので見えず、
+  × の active close が snapshot を消さないため、閉じた後に `render_detached_image_windows` が残った snapshot を `deferred_passive_seed` で描き直す。
+  メインの全画面の close (`main focus guard`) は前提ではない。3D も成立条件ではない (v5.1.0 から既存)。
+- 修正: 再開を **移動元と移動先を明示した 1 つの所有の移動**にする。移動元 (今の active owner) を、対象の snapshot を消す前に確定し、
+  対象の取り出しで移動元を推定し直さない。snapshot の消費・active の選択・runtime の遷移を同じ処理が確定する。ParkedLive の再開
+  (`activate_parked_live_media_window_snapshot`、移動元を park してから対象を remove する) と同じ順序の規則にそろえ、両方が同じ helper を通る形を優先する。
+  描画側に「registry に無い snapshot は描かない」guard を足すことはしない (孤児の snapshot と所有の不整合が残るため)。
+- 通常の使い方への影響: なし (二重登録の除去のみ)。
+
+**課題 3 — 描かれないメインの全画面が 3D を持ち続ける (BA-7、BA-5 関連)**
+
+- 原因: 独立した窓の context を更新したフレームでは、メインの閲覧は埋め込み表示のときだけ描かれ、通常の全画面は描かれない
+  (`should_render_main_fullscreen_viewport_after_detached_context`、既存テスト `main_embedded_fullscreen_still_renders_while_detached_context_is_active`
+  が意図として検査)。全画面の child viewport は呼ばれないので egui が退役させ、root は一覧を描く (利用者には「全画面が閉じて一覧に戻った」と見える)。
+  一方でメインの `fullscreen_idx`・presentation・Depth はそのまま残る。detached の pause は Depth を終えるが、この「メインが表示を失う」遷移は
+  その終了の境界を通らない。第 2 段の入場条件は兄弟の Depth の有無だけを読むので、見えないメインが持ち主として残り、別の窓の D が断られる。
+- 修正: **メインが表示を失う遷移 (独立した context を有効にして、メインの全画面が描かれなくなる確定点) で、メイン context の中で既存の
+  `set_fs_exclusive_view(None)` を行い 3D を終える**。要求の取消と GPU slot の除去は既存の Depth 終了と同じ経路で済む。埋め込み表示のメインは
+  実際に描かれるので終えない (その場合の「別のウィンドウで表示中」の拒否は維持)。確定点は、独立 context を active にする既存の入口
+  (ParkedLive の再開、passive 窓の再開、新しい独立窓を開く入口) を列挙し、1 つの helper にまとめる。D の判定から兄弟を書き換えたり、
+  毎フレームの描画結果を見て終えたりはしない。
+- 採らない案: メインの見えない全画面の閲覧そのものを閉じる (状態は最も減るが、3D を使わない通常の閲覧で閲覧位置・`fullscreen_keep_on_app_switch` の
+  保持を変える。リリース済みの挙動の変更なので利用者の判断が要り、今回の範囲を超える)。入場判定で見えないメインの Depth を無視する
+  (単一 owner の規則を破り、要求と GPU slot が 2 つになる)。
+- 通常の使い方への影響: メインの全画面で 3D 中に独立した窓を有効にすると、メインの 3D が終わる (戻ったときは D で再開)。これは detached の
+  pause と同じ規則で、3D 以外の閲覧は変えない。
+
+**課題 4 — 文言**
+
+- マニュアル `fullscreen.html` の「その窓を閉じる操作、ほかの閲覧ウィンドウへの切り替え、外部からファイルを開く操作、自動のページ送りが止められる場合があります」
+  を、外部からの要求は画面を閉じた後に開くこと (`src/app/startup_ops.rs` の既存の保留、最後の 1 件) が分かる文言に直す。
+- 「一度に 1 つのウィンドウだけ」の説明に、ほかの窓へ切り替えると前の窓の 3D は終わることを加える (断られるのは前の窓が表示されたまま 3D を
+  持っているときだけ)。
+
+**記録のみ (課題 5)**: 一覧にマウスが届かなかった件は原因不明のまま (§17.16 の 5)。課題 3 の「一覧が描かれていても、見えないメインの閲覧が
+残っている」状態との関係は未確認 (依頼 39 の 1 回目の経路ではメインの全画面は Esc で閉じていた)。
+
+**テスト** (旧実装で落ちること):
+
+1. 状態遷移 / handler: 設定 OFF で独立したメディア session → 画像 A → 画像 B。両方の移動後も同じ context・window_id・DetachedWindow・独立性。
+   Depth あり / なし。ありでは表示先変更による Depth 終了が起きない。対照: 連動のメディアウィンドウ (一覧から動画を開いた直後) の画像はメインへ、
+   明示的な F12 の切替、動画への往復、一覧から新しく開く場合は今どおり設定で決まる。
+2. 状態遷移: 最後の active 窓 A を pause → A を再開した直後に、A の passive snapshot が 0 件。実 close handler を 1 回通すと、context・binding・
+   runtime・passive の描画要求がすべて消え、後続の root pass で同じ id を再登録しない (multiwindow scenario で、メインが一覧 / 全画面、Depth あり / なし)。
+   通常の A→B 切替、ParkedLive の再開、再開を断る場合の対象の保持も回帰に含める。
+3. 状態遷移 / multiwindow scenario: メインの全画面 + Depth → 独立した窓を実際の activation で有効にする → メインの Depth が終わり、要求の取消・slot の除去が
+   済み、独立した窓の D が成功する。メインの埋め込み表示 + Depth では終わらず、独立した窓の D は OtherWindow で断られる (対照)。
+4. 既存の第 1 段・第 2 段のテストはそのまま通る。
+
+**凍結ルール**: 3 件とも、所有の移動・確定点を 1 か所にそろえる変更で、guard / delay / retry / 追加 repaint / silent fallback を足さない。
+App に detached 用の bool / Option を足さない。viewport の生成・HWND・placement・focus・z-order・bundle swap・backstop は変えない
+(課題 2 の snapshot の push / remove の順序と、課題 1 の確定点に渡す値は変える)。detached-rework-plan §11 に範囲と理由を記録する。
+まれな失敗は既定の割り切り (ログ + 通知)。
+
+**設計レビュー r1 (GPT-6.1 Sol / xhigh、read-only、対象 `3108c2cd2`)**: P1 1 件・P2 2 件、判定「指摘修正後に実装開始可」、構造的変更であることに**合意**。
+課題 2・3 の原因、BA 分類、触れない範囲の見通しは妥当とされた。反映:
+
+- **P1 (課題 1)**: 独立性を引き継ぐだけでは、既存の 2 つの操作が変わる。(a) 独立した静止画の窓は動画・音声への送りを断る
+  (`should_block_detached_independent_still_navigation_to_video`、`open_fullscreen_from_fs_navigation_with_contract`) ので、3D を使わない
+  「動画→画像→動画」の往復が新たに止まる。(b) F12 は `requested_viewer_presentation_for_open` の「今の session が独立」の条件が優先され、
+  設定を OFF にしてもメインへ移らなくなる。「できなくなる操作は無い」の評価は誤りだった。**課題 1 は利用者の判断待ちとし、実装から外す**。案:
+  - 案 A: 独立したメディアウィンドウを「メディアの窓」として扱い続ける (画像も動画も送れる、F12 でメインへ移せる)。送りの可否・F12・
+    フォルダ / 本 / PDF / ZIP の遅延 reopen・再開・新規 open・fork / promote の入口ごとに所有の扱いを決める (P2-3 の分類表) 必要があり、規模が大きい。
+  - 案 B: メディアウィンドウを 3D の対象から外す。入場条件を「メインの context か、独立した session (複数ウィンドウモードの窓など)」にし、
+    動画から画像へ進んで連動になったメディアウィンドウでは D を断る。行き先の規則は変えず (リリース済みの「2 枚目からメインへ」のまま)、状態の組み合わせが最も少ない。
+  - 案 C: 今のまま (メディアウィンドウの 3D は最初の 1 枚だけで、送るとメインへ移り 3D が終わる)。
+- **P2-2 (課題 3)**: 表示を失う境界では、Depth だけでなく、その表示から出た未完了のモデル確認の入場要求 (`DepthEntryRequest`、Checking) も同じ寿命として
+  失効させる。メインの全画面で初回 D → 確認中に独立した窓を再開 → 確認完了で見えないメインが Depth に入る、という通常の非同期の順序を閉じるため。
+  モデルの確認処理そのもの・環境設定由来の案内は取り消さない。境界の入口は、`activate_parked_live_media_window_snapshot`・
+  `activate_detached_image_window_snapshot` に加えて `start_active_detached_loading_context`・`start_active_detached_collection_root_image`・
+  `start_active_detached_book_context_with_start`・materialized fork の後の open を監査し、通常の更新や一時 mount と、初めて表示の所有が移る確定を区別する。
+  パノラマ (360°) は対象に含めない。
+- **P2-3 (課題 1 の入口分類)**: 案 A を採る場合に限り、同じ閲覧内の送り・フォルダ / 本 / PDF / ZIP 移動後の reopen (`close_fullscreen_for_folder_nav_reopen`、
+  `DeferredFsReopen`)・passive / ParkedLive の再開と descriptor による再構築 (`continue_active_detached_book_context_from_descriptor` は既存窓でも
+  `fs_open_intent_from_grid=true` を立てる)・新規 open・F12・fork / promote の分類と、遅延する要求への由来の受け渡しを設計に書いてから実装する。
+- 課題 2 の共通 helper は、移動元を先に確定して park し、対象を id で取り直して消費する順序にする。ParkedLive 側の `preserve_fullfeature_linked_still=true`
+  と各再開方式に固有の処理は保つ。helper の中で移動元を推定し直さない。テストは `last_active_detached_window_id=A` を持つ実際の pause → 再開を使う。
+- pin (切り離し) は現行の正本では廃止済みなので、範囲の記述から外す。「送りでは 3D が続く」は同じ一覧の中の静止画の送りに限る (フォルダ移動は既存の閲覧終了で 3D が終わる)。
+
+**実装の範囲 (r1 の後)**: 課題 2・課題 3 (P2-2 を含む)・課題 4 の文言を先に実装する。課題 1 は利用者の判断の後に別に設計・実装する。
+
+#### 6.4.5 課題 1 — 独立したメディアウィンドウから静止画の窓への交換 (§1.767、2026-11-14、設計)
+
+**利用者の決定 (2026-11-14)**: (a) フル機能モード + 「動画・音声は別ウィンドウで再生」で、**独立した**メディアウィンドウ (メインで別のものを開いて ParkedLive になり、
+再び有効にした窓) から同じ閲覧の送りで画像へ進んだら、メディアウィンドウを閉じ、**同じ独立した閲覧 (同じ context・同じ一覧) のまま静止画の窓を開き直す**。
+メインは変えない。連動したメディアウィンドウ (一覧から動画を開いた直後) からの画像は今どおりメインへ (F12 ON なら F12 の窓)。(b) 一覧から開くときの今の動きは変えない。
+(c)(d) 静止画から動画・音声へ送ったときの今の動きは変えない (独立した静止画の窓は今どおり断る)。(e) 開き直した窓は元の窓の位置と大きさを引き継ぐ。
+独立性を設定から決め直している根本もあわせて直す。本節は §6.4.4 の課題 1 (と r1 の案 A〜C) を置き換える。下書きは GPT-6.1 Sol / high (read-only) が master
+`403725b81` のコードで作り、設計担当が範囲を絞った (下の「由来の扱い」)。
+
+**適用範囲**: フル機能モード (複数ウィンドウモードでない) かつ `effective_media_in_media_window()`。複数ウィンドウモードのメディア窓 → 画像は今どおり同じ窓・独立のまま
+(利用者の決定の範囲外)。分類は `GridItem` で行う: メディア = `Video`・`Audio` (音声モード・音楽表示を含む)、静止画 = `Image`・`ZipImage`・`PdfPage`。
+
+**不変条件**:
+1. フル機能モードのメディアウィンドウ (専用の表示先としての役割) は Video / Audio だけを表示する。F12 ON の連動ホストを静止画表示へ再利用するのは既存の F12 の静止画表示であり、
+   この役割ではない (「一度でも動画を出した OS 窓には画像を出さない」という定義にはしない)。
+2. **独立性は閲覧 (context と窓の結び付き) の性質であり、確定点で設定から決め直さない**。独立性が決まるのは、新しく窓を結び付けるとき (一覧などからの新規 open は
+   設定・一度きりの指定で決める)、fork / promote / 再開の既存の所有移動、F12 (明示的な表示先の変更) だけ。
+3. 独立した閲覧のメディア → 静止画は、窓の役割の明示的な交換として 1 か所で確定する。
+
+**由来の扱い (設計担当の決定、下書きからの簡素化)**: 下書きは、送り・遅延 reopen・descriptor 再構築など全ての入口に「新規 / 継続 / 表示先変更」の由来の型を付け、
+遅延する要求 (`DeferredFsReopen`・book composition の `OpenIntent`・`MediaNavigationPending`・source-swap pending・descriptor 継続) まで運ぶ案だった
+(実装 3〜5 人日)。由来を運ぶ代わりに、**確定点で「この context に、今この窓が結び付いた独立の session があるか」という既存の事実から決める**:
+- `prepare_viewer_presentation_open` で、開く context に detached の window binding があり、その session を続ける (同じ window id のまま確定する) なら、
+  独立性は今の値 (`detached_viewer_independent_active`、その context の bundle に属する) を引き継ぐ。設定 (`detached_still_open_is_independent`) は見ない。
+- binding が無い (新しく窓を結び付ける) ときだけ、今どおり設定と一度きりの指定で決める。一覧からの新規 open は、既存の `prepare_detached_context_for_grid_open` が
+  先に park / 再開を済ませるので、ここに来る時点で binding が無い (下書きの分類と同じ結果になる)。
+- F12 は既存の `toggle_detached_viewer_mode` / `always_new_media_f12_target_presentation` が表示先と独立性を明示的に決める。その経路では「今が独立」という理由で
+  DetachedWindow を優先しない (`requested_viewer_presentation_for_open` の第 1 条件を通常の送りの解決だけに使う)。presentation が同じで独立性だけ変わる場合も確定を通す。
+- 遅延 reopen (フォルダ / 本 / PDF / ZIP、`close_fullscreen_for_folder_nav_reopen` は window id を保つ) と descriptor による既存窓の再構築は、binding が残るので引き継ぐ。
+  `fs_open_intent_from_grid` は独立性の判定に使わない。
+- これで、メディアへの送り (動画 A → 動画 B) でも独立性を false に戻さない (今はメディアへの open でも false に書き戻している)。
+この簡素化が成り立たない経路 (binding が残っているのに新しい閲覧として独立性を決め直すべき入口、または binding が一時的に外れている継続) がコードにあれば、
+その入口だけに既存の要求の型で由来を足す。App に bool / Option を足さない。
+
+**解決規則** (送り・自動送り・遅延 reopen の確定点。表示先と独立性を 1 回で決め、`commit_viewer_session` はその値だけを書く):
+
+| 今の閲覧と送り先 | 結果 | 窓 |
+| --- | --- | --- |
+| フル機能・独立メディア → 静止画 | DetachedWindow・独立 | A を退役し、新しい B を同じ context に結ぶ (下) |
+| フル機能・連動メディア → 静止画、F12 OFF | メイン (`non_detached_viewer_presentation`)・連動 | 既存の `open_non_detached` |
+| 同、F12 ON | DetachedWindow・連動 | 既存ホストを F12 の静止画表示に再利用 |
+| 独立静止画 → 静止画 | DetachedWindow・独立 | 同じ窓 |
+| 独立静止画 → Video / Audio | 既存どおり断る | 変えない |
+| メイン / F12 の静止画 → Video / Audio | 今の presentation のまま | 変えない |
+| メディア → メディア | 今の presentation と独立性のまま | 同じ窓 (既存の source-swap) |
+| 複数ウィンドウモードのメディア → 静止画 | DetachedWindow・独立 | 今どおり同じ窓 |
+
+**窓の交換 (独立メディア A → 独立静止画 B、同じ context C)**: 閲覧の終了ではなく C の表示ホストの交換。park・別 context の作成・フォルダの読み直しをしない。
+`close_fullscreen()` → `open_fullscreen()` は使わない (スライドショー停止・pending 取消・キャッシュ破棄が起きる。`close_fullscreen_now_for_destination`)。1 つの helper で:
+1. 送り先が採用できる (候補・提示許可が決まった) 境界で行う。決まる前に A を閉じない。交換を起こした要求は局所値に取り出してから進める。
+2. A の placement を Closing の前に捕捉する (`capture_detached_window_placement_at_decision` → `ensure_detached_window_runtime_placement`)。最大化も含む。
+3. C の旧メディア資源だけを既存の項目離脱の規則で退役する (player、native presenter、音声モード / VST、音楽表示)。**メディアの再生は止まる** (同じ閲覧で別の項目へ進むため)。
+   C 全体の `fs_cache.clear()` はしない。join・sleep・終了待ちを足さない。
+4. A の session と出力を `close_active_detached_session_exact` / `finish_active_detached_session_close` の部品で退役し、A–C の binding を明示的に外す
+   (独立 C では自動の unbind が効かない)。`remove_detached_window_runtime_inner` が A 所有の pending を取り消すので、手順 1 の後に呼ぶ。
+5. `allocate_detached_viewer_window_id` で B を作って C に結ぶ。B の runtime を `Opening`・連動でない・placement P (A のもの、offset なし) で、最初の builder より前に確定する
+   (`set_detached_window_runtime_placement`)。`last_active_detached_window_id` なども B にし、A を指す passive snapshot・deferred view・入力要求を残さない。
+6. (DetachedWindow, 独立) で B の静止画 session を始め、以後は通常の画像ロード・描画経路。前景の送りからの交換では B を前に出す (既存の表示・focus の確定に渡す)。
+   メインの reclaim は起動しない。新しい foreground 奪取・繰り返しの raise・時間窓を足さない。
+7. A が F11 の枠なし全画面だった場合: B も枠なし全画面で開く (既存の F11 の状態を B の最初の確定で適用する)。既存の部品で確定前に適用できない場合は、通常窓で開いて
+   設計担当へ戻す (新しい待ちや再試行で合わせない)。
+同じ window id のまま役割だけ替える案は、利用者の決定 (閉じて開き直す) を表さず、旧メディアと新しい静止画の寿命が同じ lease に残るので採らない。BA-4 (同種の送りでは
+窓 id を保つ) とは、種類変更だけを明示的な新しい窓にする点で整合する。B は静止画の runtime で旧 player を持たないので、一覧から新しいメディアを開いても
+`close_parked_live_media_windows_for_new_media` (ParkedLive でメディア資源を持つ窓を置き換える) の対象にならないことをテストで確かめる (除外用のフラグは足さない)。
+
+**3D**: メディアウィンドウに静止画を出さないので、メディアウィンドウでの 3D の入口は無くなる。A は動画を表示していたので交換時に引き継ぐ 3D は無い。B では第 2 段の規則で
+3D が使え、同じ一覧の静止画の送りでは C・B・presentation・独立性が変わらないので 3D は続く。
+
+**テスト** (旧実装で落ちること。resolver の期待値だけでなく実 handler と所有移動の結果まで):
+- 独立メディア A → 画像 1 → 画像 2 (実 navigation handler): 画像 1 で B≠A、同じ C・一覧・順序、B は独立。画像 2 も同じ B。メインの一覧・選択・閲覧は変わらない (multiwindow scenario)。
+- 独立メディア → 同種メディア → 画像: 途中も独立のまま、画像で 1 回だけ交換。音声・動画の音声モードでも同じ。
+- A の完全退役: session・binding・runtime・passive / deferred の描画要求が消え、後続の ROOT pass で A を再登録しない。B を 1 回の × で閉じられる。
+- 配置: A の P が B の runtime と最初の builder seed に一致。F11 の枠なし全画面から交換しても枠なしで開く。
+- 遅延 reopen (フォルダ / PDF / ZIP) と descriptor 再構築: 独立した窓で独立性を保つ。`fs_open_intent_from_grid=true` でも既存の閲覧を新規扱いしない。
+- F12: 実 F12 handler で、独立した窓から設定に従って表示先・独立性が変わる。遅延の完了が F12 を取り消さない。
+- 対照 (変えない): 連動メディア → 画像 (F12 OFF はメイン、ON は同じ連動ホスト)、一覧からの画像 → メディア → 画像 (静止画の窓の再利用・ParkedLive の再生継続・
+  同じメディアの再開)、静止画 → Video / Audio (メイン / F12 は今の表示先、独立静止画は断る)、複数ウィンドウモード、B を残して一覧から新しいメディアを開いても B が閉じない、
+  B の 3D → 同じ一覧の次の画像で 3D が続く。候補なし・取消のときは A を閉じない。
+- 既存テストの対照: `independent_detached_still_blocks_navigation_to_video`、`independent_still_video_navigation_uses_detached_hint_not_global_toast`、
+  `fullfeature_linked_still_is_preserved_before_different_media_open`、`fullfeature_image_media_image_reuses_parked_linked_still_window`、
+  `fullfeature_image_media_media_image_reuses_same_still_window`、`same_media_grid_open_activates_parked_live_without_close`、
+  `parked_live_audio_window_is_identified_for_minimal_live_display`、`parked_live_video_audio_mode_uses_music_display_and_preserves_mode`。
+
+**触る範囲**: `src/app.rs` (表示先と独立性の解決、`prepare_viewer_presentation_open`、F12 の確定、窓交換の helper)、`src/app/viewer_context_registry.rs`
+(同じ C の A → B の binding 交換を既存の単一 binding の規則の中で行う helper)、`src/app/native_video.rs` (旧メディア資源の退役の接続)、テスト、本書・
+detached-rework-plan §11・関連文書・マニュアル。**触らない範囲**: 課題 2・3 の修正そのもの、decoder・presenter・音声処理・VST bridge、HWND の同定、
+placement の計算・保存形式、focus / z-order の基盤、メインへの C の移管、複数ウィンドウモードの種類変更、静止画 → メディアの仕様。App に detached 用の
+bool / Option / pending を足さない。guard / delay / retry / 追加 repaint / silent fallback を足さない。まれな失敗は既定の割り切り (ログ + 通知)。
+
+**BA 分類**: BA-7 主 (表示先と独立性の二重決定、種類変更の窓交換の分散を 1 つの確定に直す)、BA-4 関連 (同種の送りは安定した id、明示交換だけ新しい id)、
+BA-6 関連 (runtime の placement を次の窓の seed に渡す。新しい保存先・同期経路を作らない)、BA-5 関連 (旧窓の描画要求を残さない)。
+
+**規模**: 由来を状態から決める簡素化で、実装は課題 2・3 の確定後に 1 人の実装担当が 1.5〜2.5 人日、独立レビューと修正で 0.5〜1 人日の見込み
+(利用者が了承した 1〜1.5 日を超える。統括に報告済み)。
+
+**設計レビュー r1 (GPT-6.1 Sol / xhigh、read-only、対象はこの節の案)**: P1 1 件・P2 2 件・P3 1 件、判定「指摘修正後に実装開始可」、構造的変更であることに**合意**
+(BA-7 主、BA-4・BA-6 関連、BA-5 を退役の回帰対象とする分類も妥当)。由来を状態から決める簡素化は、下の補正つきで採用できるとされた。反映:
+
+- **P1**: descriptor による再構築 (`activate_detached_image_window_snapshot` → `resume_active_detached_book_context_from_descriptor` →
+  `start_active_detached_book_context_with_start`) は、同じ window id でも**新しい context** を作り、`ViewerSession::default` の独立性は false。
+  「binding が残るので引き継ぐ」は誤りだった。**binding を予約・公開する時点で、解決済みの (presentation, 独立性) を bundle へ初期確定する**:
+  既存の `resume_window_id` / `DetachedBookContextStart` の開始・再開の区別を使い、再開なら再開元の独立性、新規 detached book open なら新規 open の規則で決める
+  (コレクション root の `start_active_detached_collection_root_image` は既に独立性を初期設定している)。以後のページ open は現在値を引き継ぐ。
+  由来を `DeferredFsReopen` や media pending へ広げる必要はない。回帰: 設定から独立性を得られない状態で、実 activation → descriptor 再構築 → 列挙完了 → 最初・次のページ。
+- **P2**: 複数ウィンドウモードの新規 Video / Audio は今 `independent_detached_still=false` で確定し、次の画像で設定から true になっている。継承の規則では false を引き継いで
+  「同じ窓・独立」にならない。**新しく binding するときの規則で、複数ウィンドウモードのメディアは (DetachedWindow, 独立) を初期確定**し、以後は引き継ぐ。
+  一覧の選択追従・F12 は今の動きを保つ (対照)。回帰は独立フラグを手で立てた fixture ではなく、通常の一覧から新規 Video / Audio → 画像 1 → 画像 2 で、
+  窓 id・独立性・メインの選択・静止画からメディアへの拒否を検査する。
+- **P2 (F11)**: F11 は即座に bool を切り替えず `DetachedViewerBorderlessTransition::target_borderless` に要求を持つ。F11 直後の送りは通常の操作で起こる
+  (`fs_nav_is_locked` は遷移をロックしない)。**交換の前に、遷移中ならその target、無ければ確定した状態を捕捉し、通常時の restore placement と一緒に B の最初の
+  生成 (`build_detached_viewer_viewport_builder`、初回から枠なしを指定できる) へ渡す**。`reset_active_detached_viewport_runtime_for_new_window` が borderless /
+  restore / transition を消すので、その後に B へ設定する。上の手順 7 の「確定前に適用できない場合は通常窓で開いて戻す」は削除する (通常の操作の表示の変更であり、
+  まれな失敗の割り切りではない)。回帰: F11 確定後・入り途中・戻り途中の交換と、B で F11 を戻したときの通常の配置・最大化の復元
+  (枠なしのときは runtime の通常配置 P と builder の全画面矩形が違うので、単純な一致を期待しない)。
+- **P3**: session の確定 (`commit_viewer_session_deferred_feedback`、`src/app/depth_view.rs`) は `target_independent` を 3D の終了判定に使うだけで独立性を書かない。
+  **`src/app/depth_view.rs` を変更範囲に入れ、確定点が (presentation, 独立性) を一緒に書く**。F12 の egui 経路 (`apply_egui_viewer_presentation_for_current_item`) と
+  native の確定経路 (`apply_video_presentation_switched`) も解決済みの独立性を確定する (presentation だけの helper を呼び続けると古い独立性が残る)。
+- 訂正: 一覧などからの新規 open は「全て binding が無い」わけではない (連動の静止画の窓は再利用されて binding が残る)。その場合の現在値 (連動 = false) の継承は結果を変えない。
+  外部・single instance・MCP・検索・タグ・履歴・sidecar / パスワード待ち・source-swap・EOF・スライドショーで、誤って独立性を引き継ぐ追加の経路は見つからなかった。
+- 通常の使い方への影響に追記: 画像へ移った後は、その窓から動画・音声へ送り戻せない (独立した静止画の窓は動画・音声への送りを断る、利用者の決定 (c)(d) に含まれる)。
+  窓の作り直しによる表示の間隔・フォーカスの変化は未測定。
+- 規模: 実装 2〜3 人日、レビューと修正 0.5〜1 人日 (全件テストと実機確認は別)。
+
+**実装中の追加決定 (2026-11-14、設計担当)**:
+種類の変更（独立メディア A → 静止画 B の窓交換）は、所有する閲覧が active のときだけ確定する。
+受理済み Manual の結果が A の ParkedLive 後に届き、送り先が交換を要する静止画なら、理由をログに残して
+結果を採用せず捨てる。A は現在の動画・音声を再生する ParkedLive のまま、active な別窓 D の session・binding・
+window は変更しない。同種メディアの結果は従来どおり背景で採用する。再 activation 待ちの pending と背景 B の生成は追加しない。
+
+判定は `admit_manual_media_navigation_target` の1か所へ集約する。通常の `MediaNavigationPending` と
+Collection 専用 Manual の各 request owner が currentness と対象を照合した後、一覧・表示・資源の採用前に呼ぶ。
+交換の要否は送り先の `GridItem` と現在の閲覧から、active かどうかは owner の window binding と
+`active_detached_session.window_id` の一致から決める。native の Manual landing / AwaitingNative 中の結果も
+同じ採用規則を通す。描画側の guard、新しい App の bool / Option、待機や再試行は加えない。
+
+理由: フル機能モードのメディアウィンドウが背景で静止画を表示する旧動作は、不変条件1に反する課題1の一部である。
+背景交換には B の準備・非同期採用・F11 / focus の追加設計が要り、再 activation までの保留は状態を増やすため採らない
+（CLAUDE.md「設計の簡素化」）。画像が出ないのは要求の受理から結果までの間に別窓へ切り替えた場合だけで、
+元の窓を選んで送り直せる。設計担当の決定として採用し、利用者への追加照会は行わない。
+
+#### 6.4.6 サブPC依頼50の停止窓・外部open・HWND登録（2026-11-14、調査・修正設計）
+
+観測・コード原因・未確定点・修正案・旧版比較の正本は
+[依頼50の調査と修正設計](depth-parallax-realmachine50-investigation.md)。
+今回は製品コードを変えず、失敗回帰だけを追加する。
+停止窓のcallbackクリック受付欠落と、外部openによる旧Depth ownerの孤児化、
+rectに依存するキーsubclassの誤同定を分け、Aの実機入力を通常ログだけで断定しない。
+BA-1 / BA-7 / BA-5の所有境界を直す設計とし、設計担当の検収と独立設計レビュー後に実装範囲を確定する。
 
 ### 6.5 他の機能との関係 — 「表示を占有するモード」を 1 つの述語にする
 
@@ -2004,7 +2376,7 @@ stage／commit・製品起動・build-dev・filterなし全件は実施しない
 - **続ける条件の照合** (§6.3): open_fullscreen の各種、スライドショー再開、フォルダをまたぐ移動、
   動画タイル、ページ一覧からの移動、同じページでの見開き・連結読みの切替、アニメーションと後から
   分かる場合の各経路で 3D が OFF になる。F12 の表示先切替でも終了し、linked の別ウィンドウでは
-  新しい D の再入場で 3D を描く。独立 session/context は入場・継続を拒否する (§6.4.2)。
+  新しい D の再入場で 3D を描く。独立 session/context も許可し、ほかの context が 3D を持つ間は `OtherWindow` で拒否する (§6.4.3)。
 - **占有モードの持ち主** (§6.2): 360° ON から 3D に入ると `Depth` に切り替わり、360° の state と
   `intent.on` が消え、`intent.projection` は残る、3D 中に
   360° のページへ移っても 360° が復帰しない、3D 中の V キーは弾かれる、360° の非アクティブ state が
@@ -2016,7 +2388,7 @@ stage／commit・製品起動・build-dev・filterなし全件は実施しない
   別の context の状態が変わらない。
 - **起こす責任**: ポインタを動かさずに 3D を ON にして `Ready` まで進む。
 - **GPU 資源**: OFF・終了・terminal close で `callback_resources` の slot が消え、VRAM の会計から外れる。
-- **入口条件**: 動画・アニメーション・見開き・連結読み・独立 session/context・編集モード・紙めくりの最中で弾き、
+- **入口条件**: 動画・アニメーション・見開き・連結読み・他 context の 3D 所有・編集モード・紙めくりの最中で弾き、
   理由が正しい。360° ON では弾かずに切り替わる (上)。3D 中は紙めくりが起きない。
 - **占有モードの述語**: 3D 中に止めるキー・入口が 360° 中と同じであること (分類表の「止める」側)。
   360° 固有の挙動 (ホイール = 画角) が 3D 中に出ないこと。
@@ -2963,3 +3335,675 @@ backstop / interlude の数 frame の見え方、実モデルでの推論。head
 - `cargo test --workspace --exclude mimageviewer-launcher --features pack-build-tools --no-run`: exit 0。launcher を含めると、この worktree に
   release の exe 5 本が無いため launcher の build.rs で止まる (CLAUDE.md の test-full の前提どおり。launcher は今回変更なし)。
 - `build-dev.ps1`: exit 0。確認用 `target/dev-runtime/mimageviewer-core.exe`。製品は起動していない (実機確認は統括経由でサブ PC へ依頼)。
+
+### 17.15 実装記録 (§6.4.3 第 2 段)
+
+2026-11-11 着手、2026-11-12 に専用 worktree `G:\home\mimageviewer-767s2`、ブランチ
+`feat-767-stage2` で再開。基点は設計追加の `cc0264f3a`。中断時の 20 ファイルの差分は
+設計担当が `196dec7fc` として保存し、再開時に基点との差分を確認した。旧 worktree は変更していない。
+設計担当 ClaudeCode Opus と独立 GPT-6.1 Sol / xhigh の設計レビュー r5 による構造的変更への合意を前提に、
+§6.4.3 の 1〜6 を実装した。第 1 段の決定 B・C・E は維持する。
+
+前提のコード確認:
+
+- 3D の状態・要求・LRU・GPU slot は既存の context bundle / Depth owner に属する。
+  `other_viewer_context_ids` と `with_viewer_context_ref` で兄弟の所有だけを読み、入場のために兄弟を mount / reset しない。
+  presentation と独立性の許可集合をなくし、同時に 1 context の条件へ置き換えた。
+- `commit_viewer_session` は実際の presentation / 独立性の切替だけで Depth を終える。
+  F12 の表示先切替と窓内 F11 の違いは既存経路に由来し、キー処理は変更していない。
+  第 1 段の独立フラグの書き込み一覧も再照合した。`prepare_detached_image_windows_for_open` の false 代入は、
+  `should_park_active` が現ページを持つことを保証し、park 入口の既存 reset が snapshot の成否より前に Depth を退役する。
+  旧「独立 session は Depth 不可」という根拠には依存しない。ほかの書き込みも既存確定点・close / fork / park の退役、
+  または同じ context の bundle 一括投影であることを維持する。
+- `park_active_detached_context_as_live_media` は対象を mount した closure 内で snapshot を作る。
+  その直前に Depth だけを終了し、既存 fork と同じ所有境界で要求の取消・slot の除去を済ませる。
+  360° の意図を扱う `reset_detached_pause_foreground_modes` は追加しない。
+- dialog の所有者は書き出しの既存 `Operation.resource.context` と追加モデル案内の既存 `CheckingOrigin` から決める。
+  `OwnedDialog` は入口と phase を 1 つの寿命で保持し、別の owner sentinel を作らない。
+  live 判定と `depth_dialog_owner_surface` を 1 か所に置き、viewer / ROOT の 4 か所から同じ答えを読む。
+- 独立所有者の modal の間だけ既存 document-open admission・OS close 受付・自動送り停止を広げる。
+  所有窓以外の close、main 所有の案内、環境設定由来の案内、非 modal の進行画面は従来どおり。
+- 受付済み遷移の判定は既存 `active_detached_transition_outstanding()` を読む。
+  新しい pending / 完了待ちを作らず、modal 開始時に拒否することで通常の reopen を自分で拒まないようにした (r5 P1)。
+  入口の導入済みモデルを使う通常 3D と、処理中の Running 案内はこの拒否の対象外。
+- ROOT の model scan は維持し、main 以外の要求だけを要求元へ scoped mount して再開する。
+  live・context・世代・ページ・item の既存照合で古い要求を捨て、main の配送規則は変えない。
+- 一時データの panel / display snapshot は context を含む id で所有を分ける。
+  viewport の生成・id・builder、HWND / placement / focus / z-order、bundle の swap、fork / park の搬送手順、
+  backstop、root / child 振り分けは変更せず、App の detached 用状態・待ち・再試行・追加 repaint は足していない。
+
+| ファイル | 変更 |
+| --- | --- |
+| `src/app/depth_view.rs`、`src/depth_parallax.rs` | 単一 context の入口条件、`OtherWindow`、実 session 切替の終了、要求元への再開、context 付き panel id |
+| `src/app/depth_dialog.rs` (新規) | live / dialog 表示先・独立 modal 所有・遷移中の modal 受付を既存の事実から導く |
+| `src/ui_dialogs/depth_addon.rs` | 入口と dialog phase の共通寿命、実 modal 開始の判定、ROOT からの要求元配送 |
+| `src/app/depth_export.rs` | 全 phase の所有 context、遷移中の受付拒否、context 付き display snapshot id |
+| `src/app.rs`、`src/app/viewport_retirement.rs`、`src/app/update_phases.rs` | 独立 live-media park の Depth 退役、独立 modal の open / close 受付、ROOT dialog 表示先 |
+| `src/ui_fullscreen.rs`、`src/ui_fullscreen/viewer_chrome.rs` | viewer dialog 表示先・所有者の自動送り停止・context 付き panel 参照 |
+| `src/addon.rs` | `cfg(test)` の既存 operation fixture を setter として再利用。worker / HTTP / I/O なしで非 modal を検査 |
+| `src/app/depth_view_tests.rs`、`src/app/depth_main_window_tests.rs`、`src/app/depth_export_main_window_tests.rs` | 入口・上部ボタン・資源寿命・export 全 phase・一時データ所有の回帰 |
+| `src/app/depth_setup_entry_tests.rs`、`src/app/multiwindow_scenario_tests.rs`、`src/ui_fullscreen/depth_focus_tests.rs` | ROOT 再開・独立実 pass・modal 排他・受付済み遷移・main 非退行、既存 fixture の context id 更新 |
+| `htdocs/mimageviewer/manual/fullscreen.html`、`shortcuts.html`、`htdocs/mimageviewer/index.html`、`docs/keymap-spec.md` | 独立した窓・一度に 1 窓・modal と読み込み中の受付範囲。FAQ に該当記述なし |
+| 本書、`docs/detached-rework-plan.md` §11、`docs/async-architecture.md` | 現行仕様、構造上の理由、OS close の所有者別の規則、検証記録 |
+
+書き換えた第 1 段のテストと理由:
+
+- 入口・継続・上部ボタンの matrix は、main の独立 DetachedWindow と独立 context の旧「拒否」を「許可」へ変更。
+  独立性そのものを拒否する規則を廃止したため。代わりに main → 独立 / 独立 → main の両方向で `OtherWindow` と
+  兄弟の状態・要求・slot の不変を検査する。同 session の再確定は継続、実独立性切替では終了する。
+- panel / display snapshot の fixture と receipt は context を含む id へ合わせた。
+  `RootDepthViewer` の receipt context は作成時の main 固定ではなく、各 frame の mount に追従させる。
+  製品の描画・状態を変えてテストに合わせてはいない。
+- main の要求を兄弟 mount 中に直接再開しない既存テストは保持する。新しい ROOT 配送は main 以外の要求にだけ適用する。
+
+検証は Windows・通常 feature。全 Cargo に `MSBUILDDISABLENODEREUSE=1` を使用する。
+新しい target の初回 core check と lib test graph のビルドは、それぞれ TurboJPEG の CMake 並列ビルドで exit 101 となり、
+`CARGO_BUILD_JOBS=1` で再実行した。vendor・依存設定は変更していない。
+直列の lib test ビルドも rustc の `memory allocation of 2097152 bytes failed` で exit 101 となった
+(`target/depth-1767-phase2-focused-serial.log`)。この時点でテスト実行は 0 件であり、製品テストの失敗とは区別する。
+空きメモリを確認し、以後のテストビルドは `CARGO_BUILD_JOBS=1` と `CARGO_INCREMENTAL=0` を使用する。
+通常 feature・ソース・依存設定は同じで、ビルドのための環境変数だけを変えた。
+§6.4.3 の受入条件と回帰の対応:
+
+1. `depth_presentation_entry_continuation_and_commit_share_context_eligibility` と
+   `depth_top_button_color_matches_the_context_and_session_entry_matrix` は main / 独立の全表示と上部ボタンの実色を検査する。
+   `depth_other_window_entry_is_readonly_in_both_directions_and_scoped_mount_keeps_owner` は at rest の兄弟を両方向で照合し、
+   拒否側と既存所有者の状態・要求を変えず、一時 mount では Depth を終えないことを検査する。
+2. `depth_independent_live_media_park_retires_request_and_slot_and_releases_entry` と
+   `depth_independent_os_close_retires_request_and_slot_and_releases_entry` は要求中 / Ready の取消・slot 除去・次の入場を検査する。
+   独立化・fork / pause の既存所有テスト、F12 双方向・窓内 F11 の資源保持も回帰として残す。
+3. `multiwindow_depth_independent_addon_dialog_is_drawn_only_in_owner_live_pass` と
+   `multiwindow_depth_independent_export_dialog_is_drawn_only_in_owner_live_pass` は実 ROOT 更新と子 viewport を駆動し、
+   main の埋め込みと独立 viewer が同時にある frame で所有側だけに描かれることを検査する。main の各表示・環境設定由来は第 1 段の実 pass テストを維持する。
+4. `depth_setup_independent_checking_and_confirm_protect_owner_but_allow_sibling_close` と
+   `depth_independent_export_all_phases_protect_owner_and_allow_sibling_close` は Checking / Confirm と export の
+   Settings / Running / Stopping / Finished で実 close・activation・外部 open の受付と manual / timer / NextFolder 停止を検査する。
+   `depth_setup_main_and_preferences_keep_external_open_activation_and_slideshow_admission` は追加制限の非退行を対照にする。
+   `multiwindow_depth_accepted_{folder,zip,pdf}_transition_rejects_entry_and_export_then_reopens_same_context` は 4b の
+   実 DFS / enumerate / hydration 完了と、同じ context / window の正常 reopen・modal 開始まで検査する。
+5. `multiwindow_depth_independent_running_addon_returns_to_actual_root_after_os_close` は非 modal のまま owner close を受け付け、
+   実 ROOT pass に操作可能な案内が戻ることを検査する。
+6. `depth_setup_independent_installed_scan_*` の 3 条件は ROOT の poll で要求元だけを入場させ、ページ変更・非 active では破棄する。
+7. `depth_first_pass_in_new_context_cannot_read_previous_panel_or_export_snapshot` は旧 snapshot の resource / 世代も新所有者に一致させ、
+   id の context による分離自体で拒否されることを検査する。
+8. depth・export・presentation・window_mode・panorama・detached・multiwindow_scenario・slideshow・admission を指定 filter で回帰実行する。
+
+実装担当のセッション内のレビュー (GPT-6.1 Sol / xhigh) では、削除 API / variant の既存テスト追従漏れ 3 か所を P2 1 件、
+非 modal の Running 案内にまで遷移拒否を広げていた点を P3 1 件として修正した。
+後者は phase 選択と同じ `entry_check_opens_modal()` を入口でも読み、Installing / Cancelling / Removing の Running を拒否しない。
+`depth_setup_running_operations_remain_modeless_during_accepted_independent_transition` がその対照を持つ。
+再レビューは構造的変更として受入可、未解決 P1/P2/P3 なし。検証は実装担当が所有し、レビュー担当は重複実行しない。
+
+初回の depth 実行は **222 件中 217 成功・5 失敗、exit 100**
+(`target/depth-1767-phase2-focused-noincremental.log`)。失敗した追加 fixture を次のように修正した:
+
+- live-media park の既存末尾は main を一覧へ戻す。閲覧していない main に直接 entry Ok を期待せず、
+  main の `fullscreen_idx == None` を確認し、通常の `open_fullscreen` で別の閲覧を開いてから入場可能を検査する。
+- 独立 dialog の 3 条件は main の linked F12 を残して別の active context を直接構築しており、
+  通常は handoff / park で解消される組合せを捏造していた。設計対象の main 埋め込み + 独立 child に直し、
+  各 ROOT pass で両 viewer の寿命と唯一の描画先を確認する。export の準備は既存 display fixture と実受付 handler に分け、
+  独立 child は実 ROOT の `ScenarioDriver` から描く。共有 dialog の描画条件や製品の routing は変更していない。
+- PDF の 4b は既存 PDF テスト用の path 限定 `RemotePdfTestBackend` を登録しておらず、test exe を製品の subprocess worker として
+  起動する経路へ落ちていた。既存 fixture と同じ worker 内の実 PDFium 解析へ接続し、guard を App より長寿命にする。
+  通常の非同期所有者が行う `poll_book_composition_read` も補い、projection / permission 待ちから reopen まで進める。
+  15 秒の待機上限は変えず、失敗時に残る待機状態を表示する。旧 items の復元や製品 guard は加えていない。
+
+修正差分も同じセッション内のレビューで検査条件の弱体化なしと確認した。修正後の実行結果は下表で確認する。
+この修正後の 5 件再実行は **2 成功・3 失敗、exit 100** (`target/depth-1767-phase2-focused-r2.log`)。
+park と PDF は成功し、残った dialog 3 件は新 Window の最初の不可視 sizing pass でタイトルを要求していた。
+既存の成功 fixture と同じ 4 pass の準備後に検査するよう観測点を修正し、全 7 pass の両 viewer の寿命確認と、
+後続 3 pass の唯一 surface の検査を維持した。egui の通常の初回計測に合わせる修理であり、
+製品への待ち・repaint・frame フラグや vendor の変更はない。同じセッション内のレビューでも owner / mount / live の矛盾なしと確認した。
+続く 3 件再実行は **2 成功・1 失敗、exit 100** (`target/depth-1767-phase2-focused-r3.log`)。
+唯一 surface の検査は 3 条件とも通ったが、export 条件の末尾で addon 用 helper を誤って検査していた。
+addon が無いときの `Main` fallback は正しいため、存在する dialog に合わせて export / addon の helper を選ぶよう修正した。
+この修正も同じセッション内のレビューで妥当と確認し、個別の重複実行はせず、以下の指定回帰 filter 内で全 depth 条件を再確認する。
+
+| コマンド | 結果・証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|export\|presentation\|window_mode\|panorama\|detached\|multiwindow_scenario\|slideshow\|admission/)'` | **1,523 成功 / 0 失敗、exit 0** (15,801 skipped、106.632 秒)。`target/depth-1767-phase2-regression.log`。全 depth 222 件と修正した独立 dialog 3 件を含む |
+| `cargo test --test ui_snapshot` (更新指定なし) | **250 成功 / 0 失敗、exit 0**。`target/depth-1767-phase2-snapshot.log`。`UPDATE_SNAPSHOTS` 未設定、PNG 差分なし |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0。`target/depth-1767-phase2-check-serial.log`。以後の Rust 変更はテスト fixture と整形だけで、製品の意味変更なし |
+| `python scripts/check_ui_glyphs.py` | exit 0、危険グリフ 0 件。`target/depth-1767-phase2-glyphs.log` |
+| `python scripts/check_site_cards.py` | exit 0、53 カード・上限超過 0 件。`target/depth-1767-phase2-site.log` |
+| `cargo fmt` (引数なし、最終) | exit 0。`target/depth-1767-phase2-fmt.log`。上記回帰以後は整形と実装記録だけで、Rust の意味変更なし |
+| `git diff --check` | exit 0。`target/depth-1767-phase2-diff-check.log`。基点からの vendor / PNG の diff も exit 0、差分なし |
+
+最後の意味変更はテストの export / addon helper 選択だけで、その後に上記の指定回帰を実行した。
+製品コードに追加の guard・待ち・repaint は加えず、失敗した fixture の観測条件を修理した。
+設計との差分はない。上の「同じセッション内のレビュー」は実装担当のセッションの中で行われたもので、正式な独立レビューには数えない。
+**正式な独立実装レビュー (GPT-6.1 Sol / xhigh、read-only、実装者とは別のセッション、対象 `08cc9da88`、差分 `cc0264f3a..08cc9da88`)**:
+P1 / P2 / P3 なし、判定「受入可」。単一所有と寿命、dialog 表示先の集約、独立所有者に限った modal 保護、r5 P1 の遷移中拒否と正常 reopen、
+ROOT からの再開配送の照合、context 付き一時 id、テストの強さ (旧実装で通るだけの検査なし、fixture 修理で条件の弱体化なし)、文書の整合を確認。
+「症状パッチではなく構造的な変更」であることに**合意** (既存の所有者と遷移状態から受付・表示先・退役を導き、追加の detached 状態・時間窓・待ち・
+再試行・追加 repaint を作らない)。レビュー担当は上記 1,523 件と snapshot 250 件の成功ログを参照し、Cargo を重複実行していない。
+
+設計担当による最終確認 (2026-11-12、対象 `47a93b304` = 製品コードは `08cc9da88` と同一、いずれも共有の `run-heavy.ps1` 経由):
+
+| コマンド | 結果 |
+| --- | --- |
+| `.\scripts\test-lib-full.ps1` (`-FullTest`、共有ロック test-lib-full 下) | **17,249 成功 / 0 失敗 / 75 skipped、795.6 秒、exit 0** |
+| `cargo test --workspace --exclude mimageviewer-launcher --features pack-build-tools --no-run` | exit 0 (launcher はこの worktree に release exe 5 本が無く build.rs で止まるため除外。コード起因ではない) |
+| `.\scripts\build-dev.ps1` | exit 0、`target\dev-runtime\mimageviewer-core.exe` |
+| `cargo test --test ui_snapshot` | 実装担当の 250 成功を再利用 (その後の変更はテスト fixture・整形・文書だけ) |
+
+### 17.16 第 2 段の実機確認と、次の版へ回した課題 (2026-11-12)
+
+サブ PC 確認 依頼 39 (ビルド `865eeac20`、観測はすべてサブ PC 担当、結果は `C:\miv-subpc\results-39\`) の後、利用者の決定 (2026-11-12 夜) で第 2 段は次の版へ回した。第 1 段 (`1ff4082a8`) は今回の版に入る。ブランチ `feat-767-stage2` はそのまま残す。
+
+期待どおりだったもの: モデル未導入の案内はメディアウィンドウにだけ出て、案内中は × で閉じない。メディアウィンドウ・複数ウィンドウモードの窓で 3D を開始でき、パネル・折りたたみ・Ctrl+クリック・F11 往復が動く。書き出し画面は所有の窓にだけ出て、書き出し中・結果画面の間は × で閉じない (GIF 45 フレーム)。F12 の別ウィンドウ (第 1 段) に退行なし。ログに ERROR / WARN / panic なし。
+
+次の版で直す課題 (設計担当がログとコードで調べた範囲。実機での再確認は未実施):
+
+1. **メディアウィンドウで画像を送ると窓が閉じ、3D が終わる。** 一覧から動画を開いた直後のメディアウィンドウはメインの閲覧の一部で、画像へ進むと閉じて画像はメインに開く。メインで別のものを開いて独立した窓になった後でも、動画から画像へ進んだ時点で `prepare_viewer_presentation_open` が独立性を `detached_still_open_is_independent` (「画像を別ウィンドウで開く」設定か一度きりの指定) で決め直すため「連動」になり、次の送りは F12 の別ウィンドウ表示がオフなら `open_non_detached` でメインへ行く。行き先の関数 (`requested_viewer_presentation_for_open`・`prepare_viewer_presentation_open`・`activate_parked_live_media_window_snapshot`・`park_and_close_current_active_detached_viewer_for_media_handoff`・`activate_mounted_as_independent_detached`) は v5.1.0 と第 2 段の基点で同一で、第 2 段は表示先が変わったときの 3D の終了だけを足している。既定の設定ではメディアウィンドウの 3D は最初の 1 枚に限られる。対象に残すなら、独立した窓で画像へ進んでも独立のまま保つ行き先の変更 (detached の規則の変更、構造的修正の合意が要る) を設計する。対象から外す案も比べる。
+2. **3D 中のメディアウィンドウの × で窓が作り直される。** ログ (`logs-part2-resumed`) では 491.359 秒に `close_active_viewer_context` で閲覧が閉じ、491.372 秒に見えないメインの全画面が `main focus guard closing session` で閉じた直後、同じ窓番号 3 が `deferred_passive_seed` で待機中の窓として作り直された。2 回目の × で閉じた。窓番号が有効な閲覧と待機中の窓の記録の両方に残っていた疑いがあるが未特定。3D なしでも起きるか、メインの全画面が開いていない場合に起きるかは未確認。detached-rework-plan §2 の BA 分類と構造的修正の合意の手順で直す。
+3. **見えないメインの全画面が 3D の持ち主として残る。** メインが全画面のとき、独立した窓の有効中はメインを描かない (既存)。その間もメインの閲覧は開いたまま (ハートビートの `fullscreen=Some(2)`) で 3D を持ち続け、メディアウィンドウの D は「別のウィンドウで表示中」で断られた。持ち主の判定は事実としては正しいが、利用者には見えない窓のせいで断られる。設計レビュー r5 で「生きている判定は描画を保証しない」と割り切った点が表に出たもの。見えない閲覧を持ち主として扱わない (その時点で 3D を終える) か、文言で持ち主の窓を示すかを決める。
+4. **手順書と文言の想定違い。** 別の窓を開く・有効にすると前の窓は既存の切り替え (`pause_active_context`) で止まり、その窓の 3D も終わる (§6.4.3 の park / pause での終了)。そのため 2 つ目の窓の D は断られず、断る場面は前の窓が止まらずに 3D を持ち続けるとき (課題 3) だけ。外から開く要求は、書き出し・モデル確認の画面の間は保留され、閉じた後に最後の 1 件が開く (`src/app/startup_ops.rs` の既存の保留)。マニュアルの「外部からファイルを開く操作…が止められる場合があります」を「画面を閉じた後に開きます」に直し、手順書の期待もこれに合わせる。
+5. **記録: 一覧にマウスが届かなかった件 (原因不明)。** 依頼 39 の 1 回目、「動画・音声は別ウィンドウで再生」ON で動画をメディアウィンドウで再生 → ↑ (窓が閉じ画像がメインの全画面) → Esc で一覧へ、の約 2 秒後から一覧へのクリック・ホバーが届かず、キーボードは届いた。ログ (`logs-part1-first-try`) では 144〜174 秒にクリックの時刻にだけ描画が起き、マウス移動では起きていない。押した位置は閉じたメディアウィンドウの範囲の中。build-759 と、新しい版の第 2 部の同じ経路では再現しなかった。再現したら `C:\miv-subpc\whichwin.ps1` (カーソル下の窓・mIV の全トップレベル窓・capture を出す) で記録する。
+
+未確認: 実 OS 窓での close / activation / focus、native の保存先画面、実モニタ間の DPI 移動、実モデルでの推論、
+backstop / interlude の数 frame の見え方。headless の成功とは区別する。
+製品起動・`build-dev.ps1`・`test-lib-full.ps1`・`test-full.ps1`・コミット・push は依頼どおり実施しない。
+確認用 build・全件 gate・実機確認は設計担当へ引き継ぐ。vendor は変更していない。
+
+### 17.17 実装記録 (§6.4.4 実機課題 2・3・4)
+
+2026-11-14、`G:\home\mimageviewer-767s2` / `feat-767-stage2`、基点 `bbad4507d`。
+§6.4.4 の設計レビュー r1 後の範囲に従い、課題 2・3（P2-2 を含む）・4 を実装した。
+課題 1 は利用者判断待ちのままとし、行き先・独立性の解決規則は変更しない。
+
+着手前の主要前提の確認:
+
+- `active_viewer_context_id` は active session が無いとき、window binding と
+  `detached_viewer_window_id().or(last_active_detached_window_id)` を使い、同 id の passive snapshot があれば active としない。
+  旧 passive activation は先に snapshot を remove してから park を呼ぶため、実際に pause した直前の A が自分自身の移動元になり、
+  pause が同 id の snapshot を再度 push する。active close はその孤児を消さず、後の passive renderer が同 id を再登録する。
+  ParkedLive は既に park → id で取り直し → remove の順であり、linked still 保持を true で呼ぶことを確認した。
+- `should_render_main_fullscreen_viewport_after_detached_context` は独立 context の更新中、main の embedded active / pending だけを描く。
+  main の通常 Fullscreen の閲覧状態は残る。Depth の Drop は要求取消と自分の GPU slot 除去を持ち、
+  `set_fs_exclusive_view(None)` が既存の終了経路であることを確認した。
+- `DepthSetup::OwnedDialog` は Checking / Confirm の間も `ModeEntry(DepthEntryRequest)` を保持し、ROOT の poll で確認後に入場を再開する。
+  main は `viewer_context_live` が常に true のため、表示所有の移動時にその入場要求も失効させる必要がある。
+  ModeEntry の dialog だけを閉じれば確認処理は継続し、Preferences と Running 以降には影響しない。
+- 以上は設計の主要前提と一致した。毎フレームの描画検査、D からの兄弟の変更、孤児描画 guard は追加していない。
+
+変更ファイル:
+
+| ファイル | 変更 |
+| --- | --- |
+| `src/app.rs` | 明示した移動元を使う park / pause / live-media / close の共用、passive / ParkedLive の共通 snapshot 消費、成功した独立 activation / build / fork-open の確定点への接続 |
+| `src/app/depth_view.rs` | main context 内で、表示を失う Fullscreen の Depth と未完了の入場だけを終える helper |
+| `src/ui_dialogs/depth_addon.rs` | 指定 context の Checking / Confirm の ModeEntry 失効。確認処理と管理由来の案内を維持 |
+| `src/app/depth_view_tests.rs`、`src/app/depth_setup_entry_tests.rs`、`src/app/multiwindow_scenario_tests.rs` | 実 activation、要求取消・GPU slot、Checking / Confirm / Preferences、pause→再開→実 close→ROOT の回帰 |
+| `htdocs/mimageviewer/manual/fullscreen.html` | 切替時の 3D 終了と、外から開く要求の最後の 1 件を画面を閉じた後に開く説明 |
+| 本書、`docs/detached-rework-plan.md` §11、`docs/async-architecture.md` | 変更境界、BA 分類、入場の寿命、検証記録 |
+
+課題 3 の入口監査:
+
+| 入口 | 表示所有の移動の確定点 |
+| --- | --- |
+| `activate_detached_image_window_snapshot` の既存 context 再開 | mount で独立化が成功し、active session を設定した後 |
+| `activate_parked_live_media_window_snapshot` | 固有の pending owner 引継ぎ・runtime / session の再開を確定した後 |
+| `start_active_detached_loading_context` | Building を Commit し binding と active session を公開した後。Abort では終了しない |
+| `start_active_detached_collection_root_image` | anchor を解決して build を Commit し session を公開した後、画像を open する前 |
+| `start_active_detached_book_context_with_start` | descriptor / scanned-folder の受理で build を Commit し session を公開した後 |
+| materialized fork 後の open | fork context の open と binding が成功した後。この入口は main の fullscreen_idx が無い場合に限り、通常は終了対象を持たない |
+| stamp による旧 still snapshot の再開 | 既存の main / linked の open。別 context を有効にしないので新しい終了境界を足さない |
+| descriptor の継続、通常の更新・scoped mount | 既存 owner の処理。helper を呼ばない |
+
+全画面の閲覧自体を閉じる簡素化は既存の閲覧保持を変えるため採用しない（§6.4.4）。
+既存の owner と成功確定点だけを共用し、新しい App 状態、待ち、回復の仕組みは追加しない。
+
+検証環境: Windows、通常 feature、test / dev profile。Cargo のビルド・テストはすべて
+`powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner "codex/767-p2b" -WorkDir G:\home\mimageviewer-767s2 -Command "<下記コマンド>"`
+を使った。ロック領域へ書けない警告が出たため、そのまま BelowNormal で継続した。
+Command 内で `CARGO_BUILD_JOBS=1`、`CARGO_INCREMENTAL=0`、`MSBUILDDISABLENODEREUSE=1` を設定した
+（この worktree の第 2 段の既存メモリ不足時と同じ条件）。重いコマンドは同時に 1 本だけ実行した。
+
+| コマンド / 対象 | 件数・exit code・証拠 |
+| --- | --- |
+| 旧製品コード `bbad4507d` + 新テスト: `cargo nextest run -p mimageviewer --lib -E 'test(/paused_last_active_resume\|main_live_pass_handoff/)' --no-fail-fast` | **4 実行 / 0 成功 / 4 失敗、exit 100**。`target/767-p2b-red.log`。A の passive が 1 件残る、main の Depth が残る（通常再開と loading build）、Checking が残る、の各不変条件で失敗。コンパイル成功、製品の不変条件違反を検出した |
+| 修正後の焦点: `cargo nextest run -p mimageviewer --lib -E 'test(/paused_last_active_resume\|main_live_pass_handoff\|snapshot_activation_handoff/)' --no-fail-fast` | **5 実行 / 4 成功 / 1 失敗、exit 100**。`target/767-p2b-focused-r1.log`。失敗と補修の理由は下記 |
+| 最終回帰: `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|export\|presentation\|window_mode\|panorama\|detached\|multiwindow_scenario\|slideshow\|admission/)' --no-fail-fast` | **1,537 成功 / 0 失敗、exit 0**（16,161 skipped、117.004 秒）。`target/767-p2b-regression.log`。新規 5 件と既存の第 1 段・第 2 段・detached・multiwindow の指定回帰を含む |
+| `python scripts/check_ui_glyphs.py` | 危険グリフ **0 件、exit 0**。`target/767-p2b-glyphs.log` |
+| `python scripts/check_site_cards.py` | **53 カード、超過 0 件、exit 0**。`target/767-p2b-site.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit 0**（テスト実行なし、4 分 22 秒）。`target/767-p2b-check.log` |
+| `cargo fmt`（最後に引数なし、同じ run-heavy 経由） | **exit 0**。`target/767-p2b-fmt.log`。最終回帰・core check 後の Rust 変更は整形だけ |
+| `git diff --check` | **exit 0**。`target/767-p2b-diff-check.log`。変更は上記 10 ファイル、vendor 差分なし |
+
+旧コード比較の間だけ製品 3 ファイルを HEAD と同一にし、終了時に実装を戻した。
+旧コード比較後には、資源検査の renderer を main / child で同じ専用 renderer に固定し、
+A→B→A と再開拒否時の保持の対照 1 件も加えた。旧コードの 4 件の失敗点と根拠は変わらない。
+
+焦点検証の multiwindow 1 件は、修正で再開直後の snapshot 0 件の assertion を通過し、その先の ROOT pass で
+`fullscreen navigator input tracking must run at begin-pass` により停止した。
+新しい fixture で `install_fs_navigator_input_tracking` の登録を省いていたため、既存 scenario と同じ登録を追加した。
+assertion の削除・緩和や製品コードの変更はせず、上記の最終回帰で新規 5 件を含めてすべて成功した。
+最終回帰の製品コードは焦点検証と同じで、追加変更は fixture 初期化 1 行だけである。
+
+新規回帰と根拠:
+
+- `multiwindow_depth_paused_last_active_resume_close_does_not_register_passive_again`:
+  実際の pause と `last_active_detached_window_id=A` を使い、再開直後は A の passive が 0 件。
+  実 close handler を 1 回通し、context の Retired、binding / runtime / passive 要求の消滅、
+  後続 3 回の実 ROOT pass で callback / viewport / deferred view の再登録が無いことを検査した。
+  main 一覧 / 全画面 × Depth なし / ありの 4 条件を完走した。
+- `depth_main_live_pass_handoff_retires_only_fullscreen_on_actual_still_and_media_activation`:
+  passive / ParkedLive × 推論待ち / Ready × main 全画面 / 埋め込みの 8 条件で、main 全画面だけの終了、
+  cancel token / GPU slot の退役、子の実 D の成功を検査した。埋め込み main は保持し、子の D は OtherWindow。
+  事前の scoped mount は main の資源を維持する。
+- `depth_main_live_pass_handoff_invalidates_checking_and_confirm_entry_but_keeps_preferences`:
+  初回 D の実 Checking とローカル pack の実確認完了を使い、表示を失った main は後から入場しない。
+  main 由来の Confirm も失効する。確認処理は完了してモデルの状態を採用し、Preferences の案内は残る。
+  埋め込み main の Checking / Confirm は保持し、Checking の完了で main だけに入場する。
+- `depth_main_live_pass_handoff_new_loading_owner_commits_but_aborted_build_keeps_depth`:
+  build Commit で終了し、Abort では main の Depth と要求を保持する。
+- `detached_snapshot_activation_handoff_switches_a_b_and_keeps_rejected_destination`:
+  A→B→A で active と passive の二重所有を作らず、再開を断った対象と現在の active owner を保持する。
+
+見た目・レイアウト・アプリ内 UI 文字列は変更していないため、`cargo test --test ui_snapshot` は実施していない。
+unit 側の既存 depth snapshot は上記の指定回帰に含まれる。
+
+未確認 / 引継ぎ:
+
+- 実 OS 窓の activation / close / HWND / focus / z-order、backstop の見え方、実モデルでの推論、実モニタ間 DPI は未確認。
+  headless の実 handler / ROOT pass と、利用者の実機結果は区別する。課題 5 の一覧へのマウス入力は原因不明のまま。
+- `test-lib-full.ps1`・`test-full.ps1`・`build-dev.ps1`、製品起動、コミット・push は依頼どおり実施しない。
+  全件 gate・確認用 build・実機確認と独立実装レビューは設計担当へ引き継ぐ。
+  vendor は変更していない。独立レビュー後の構造合意は detached-rework-plan §11 に設計担当が追記する。
+
+独立実装レビュー (2026-11-14、GPT-6.1 Sol / xhigh、read-only、対象 `53d224a5c`): **受入可、P1 / P2 / P3 なし**。
+再開の順序 (移動元の確定 → park → 対象を id で取り直して消費)、Depth と入場要求を終える 6 か所の確定点、マニュアルの文言、テストの条件、
+範囲外の変更が無いことを確認した。**症状パッチではなく構造的な変更であることに合意** (snapshot の二重所有を作る順序を所有移動の入口で正し、
+表示を失う確定点で Depth と入場要求の寿命を閉じる)。設計担当 (ClaudeCode) も同じ判断で検収した。
+
+### 17.18 実装記録 (§6.4.5 課題 1)
+
+2026-11-14、`G:\home\mimageviewer-767s2` / `feat-767-stage2`、基点 `01f5e898f`。
+§6.4.5 の r1 補正を優先して実装した。課題 2・3 の所有移動 helper と main Depth 退役の確定点は変更しない。
+
+変更ファイル:
+
+- `src/app.rs`: 新規 binding の初期解決と既存 session の継承、descriptor build 初期化、
+  採用後・旧項目更新前の窓交換 helper、F12 の明示解決（遅延 reopen 中を含む）、
+  遅着 Manual の窓交換を active に限定する共通採用判定。
+- `src/app/collection_navigation.rs`: 同じ採用判定を exact target 確認後・root の install 前に適用。
+- `src/app/depth_view.rs`: presentation と独立性の同時 commit。
+- `src/app/viewer_context_registry.rs`: session 退役後の同じ mounted context の A→B binding 交換。
+- `src/app/native_video.rs`: 旧 media 項目だけの退役、native F12 と通常の同 host 同期の区別。
+- `src/app/presentation_transition.rs`: 既存 request に解決済み独立性を保持し、旧 media output の
+  drop とともに旧 request/effects を終端する（次の request id は巻き戻さない）。
+- `src/app/detached_media_exchange_tests.rs`、`src/app/multiwindow_scenario_tests.rs`、
+  `src/ui_fullscreen.rs`、`src/app/tests.rs`: handler・所有移動・初回 builder の回帰。
+- 本書、`docs/detached-rework-plan.md` §11、`docs/video-architecture.md`、`docs/keymap-spec.md`、
+  `htdocs/mimageviewer/manual/fullscreen.html`: 仕様・所有境界と公開説明。
+
+着手前の前提確認（実装者と独立 GPT-6.1 Sol / xhigh のコード照合）:
+
+| 前提 | コードで確認した結果 |
+| --- | --- |
+| 独立性の二重決定 | prepare が静止画設定から再計算し、media で false を書き戻していた |
+| binding の予約・公開 | Building は私有予約、Commit 後に公開して session を開始する。継続は同じ binding を読む |
+| descriptor 再構築 | resume_window_id を保持しても新しい context / default session になる。予約直後に解決済み pair を初期化した |
+| 複数ウィンドウの新規 media | 旧コードは最初 false。新規 open の binding 初期解決で独立とし、その後は引き継ぐ |
+| F11 | transition が target を保持。return Settle では restore は消費済みで runtime に通常配置が戻っている |
+| session commit | target_independent を Depth 終了判定にだけ使用していた。同じ確定点で独立性も書く |
+
+r1 補正を優先すれば実装を妨げる矛盾はなかった。追加の入口監査で DetachedImage の scan 完了が
+独立性と one-shot を再設定する箇所も確認し、binding 初期確定に一本化した。
+F12 の native 同 host request は rect 同期 / VST 退出にも使われるため、通常要求は継承し、F12 の明示要求だけ
+解決し直す。現在の表示先へ戻す反転は reducer が Apply を省略できるので、採用後に独立性を同期確定する。
+
+交換は admission / 候補採用後だけ実行する。旧 C の media 資源を項目離脱の部品で終端し、
+C 全体の close、cache clear、park、再走査は行わない。既存の窓を閉じて開く簡素化を窓の役割交換に採用し、
+閲覧全体の close→open は slideshow / pending / cache を失うため使わない。
+App の新しい状態、待ち、リトライ、救済用 repaint、focus / z-order の仕組みは加えていない。
+
+検証はこの worktree だけで、Cargo のビルド・テストをすべて次で直列実行する:
+
+`powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner "codex/767-issue1" -WorkDir G:\home\mimageviewer-767s2 -Command "<コマンド>"`
+
+ロック領域へ書けない警告は指定どおり継続。nextest は既存のこの worktree の検証条件と揃え、
+`CARGO_BUILD_JOBS=1` / `CARGO_INCREMENTAL=0` / `MSBUILDDISABLENODEREUSE=1` を使う。
+
+追加決定前の検証履歴（当時の未解決 P1 による非ゼロを含む。追加決定後の最終結果は後掲）:
+
+| コマンド | 件数 / exit code / 証拠 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core`（初回） | exit 0、4分09秒。最終検証前の中間状態 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/independent_media_exchange/)' --no-fail-fast`（r1） | **10成功 / 0失敗、exit 0**。compile 8分54秒、実行2.858秒。`target/767-issue1-focused-r1.log`。遅着Manualの追加回帰前 |
+| 同じ焦点コマンド（r2、遅着 Manual / native request 回帰と F12 OFF 完了を追加） | **12実行 / 11成功 / 1失敗、exit 100**。compile 8分57秒、実行2.941秒。`target/767-issue1-focused-r2.log`。失敗は下記の設計境界だけ |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|export\|presentation\|window_mode\|panorama\|detached\|multiwindow_scenario\|slideshow\|admission/)' --no-fail-fast`（回帰 r1） | **1,548実行 / 1,546成功 / 2失敗、exit 100**。109.438秒。`target/767-issue1-regression.log`。設計境界の P1 と下記 fixture |
+| 同じ回帰コマンド（r2、fixture 初期化だけ補正） | **1,548実行 / 1,547成功 / 1失敗、exit 100**。compile 8分38秒、実行121.461秒。`target/767-issue1-regression-r2.log`。未解決の遅着 Manual P1 だけが失敗。指定の既存対照・課題2/3回帰を含む |
+| `cargo check -p mimageviewer --bin mimageviewer-core`（最終） | **exit 0**、1分21秒（テスト実行なし）。`target/767-issue1-check.log` |
+| `cargo fmt`（最後に引数なし、run-heavy 経由） | **exit 0**。`target/767-issue1-fmt.log`。最終回帰後の Rust 変更は整形のみ |
+| `git diff --check` | **exit 0**。`target/767-issue1-diff-check.log`。LF→CRLF の既存設定による警告のみ。HEAD は `01f5e898f` のまま、vendor 差分なし |
+| `python scripts/check_ui_glyphs.py` | 危険グリフ 0、exit 0 |
+| `python scripts/check_site_cards.py` | 53カード、超過0、exit 0 |
+
+初回 nextest 呼出は PowerShell の filter 引数が未引用で解釈され、Cargo 起動前に exit 1。
+ASCII の target 内実行スクリプトに filter を引用して直した（テスト失敗件数には含めない）。
+
+回帰 r1 のもう1件は `detached_book_active_context_mount_restores_main_after_fullscreen_open`。
+生の `build_active_context_for_test` が default session のまま binding を作り、列挙完了後に設定から
+独立性を決める旧 prepare の副作用を前提にしていた。fixture 内の items 準備直後に
+`new_detached_open_is_independent` で新規規則を解決し、session を初期 commit するよう修正した。
+main の復元・ページ open・独立性の assertion はすべて維持し、共通 fixture や製品側の例外は追加しない。
+独立レビューもこの fixture 補正を妥当と確認した。製品の新規 descriptor 初期化は別の実 activation 回帰で検査している。
+
+未確認 / 引継ぎ:
+
+- 実 OS 窓の表示間隔、focus / z-order、実 player の停止音・VST GUI、F11 の実画面・最大化復元、
+  マルチモニター / DPI、実モデルでの3Dは未確認。headless handler / ROOT / builder の検証と区別する。
+  「active」は owner と active session の window 一致を指す。結果待ち中に他アプリへ前景を移した場合の
+  B の表示・focus は実機未確認で、OS 前景判定や最初の builder の既定動作は今回変更していない。
+- 旧製品コードへ差し戻して新規回帰を実行する比較は未実施。描画部品・レイアウト・UI文字列は変更していない。
+  `cargo test --test ui_snapshot` は未実施で、窓の初回条件は headless builder と ROOT scenario で検査した。
+- 依頼どおり `test-lib-full.ps1`・`test-full.ps1`・`build-dev.ps1`、製品起動、commit / push は実施しない。
+  vendor は変更しない。全件 gate、検証用 build、実機確認は設計担当へ引き継ぐ。
+
+#### 追加監査と設計担当の追加決定: 遅延 Manual の採用境界
+
+独立レビューで、独立 A の Manual 要求 → 別窓 D の実 activation → ParkedLive A への結果到着、という経路を確認した。
+park は input_seq を進めず、通常要求は `rebind_native_video_pending_owners` で `None` → `Some(A)` へ移る。
+従来の交換 helper は global active session を A とみなして D を閉じ、binding の所有 assert が失敗した。
+焦点 r2 と回帰 r2 の遅着テストで、D の `ViewerContextId(2) / AtRest` と C の `ViewerContextId(1) / Mounted` の
+不一致を再現した。これは timeout / harness の失敗ではない。追加決定前の独立レビューは P1 1件で未受入だった。
+
+設計担当が §6.4.5 末尾の追加決定を行った。交換の必要な遅着 Manual は inactive なら採用せずログ付きで破棄し、
+A の再生と ParkedLive、D の session / binding / window を保持する。同種メディアは背景で採用を続ける。
+利用者への照会は不要となり、保留状態や背景 B の寿命は作らない。
+
+追加の入口監査では、通常 resolver と別に Collection の request owner があり、その passive poll でも
+Manual が採用されることを確認した。共通 `admit_manual_media_navigation_target` へ判定を1か所に集約し、
+通常 resolver は result の currentness 照合後、Collection は exact target の照合後・root install 前に通す。
+Collection の対象は最新 prepared entry の `GridItem` を使い、旧一覧の index から分類しない。
+これは2つの request owner に同じ規則を適用する所有境界の修正であり、描画側の症状 guard ではない。
+
+追加回帰:
+
+- 遅着静止画: 通常の一覧から実 open / park / activation で独立 A を作り、実 Manual 要求後に D を実 activation。
+  A で結果を採用せず、元の media identity・再生意図・items / generation・binding・ParkedLive を保持する。
+  D の session・binding・runtime、共有 F11 / focus / viewport 状態、main の一覧と選択も不変。
+  Video / Audio と Image / ZipImage / PdfPage の組合せを検査する。
+- 遅着同種メディア: Video / Audio とも、A は同じ窓で次の media に進み、D と main は維持する。
+- native request: A の実同 host request を AwaitingNative まで進めてから Manual → D activation。
+  静止画結果を同じ採用規則で捨て、A の request / player と D を保持する。
+- Collection: 実 actor・最新 prepared root・実 Manual → D activation → passive poll を通し、
+  Video / Audio の静止画結果は捨て、同種メディアは背景で採用する。
+
+追加決定後の焦点 r3 は **15実行 / 13成功 / 2失敗、exit 100**（compile 9分11秒、実行11.308秒、
+`target/767-issue1-focused-r3.log`）。通常の遅着静止画と AwaitingNative 中の破棄は通過した。
+同種メディア対照で、旧 Manual の Fullscreen landing と native swap 不成立時の通常 open が
+`prepare_viewer_presentation_open` の active session publish へ入る旧経路を確認した。
+Collection の検査は native continuation の完了待ちで失敗した。コード上でも同じ通常 open を通り、
+A が Resuming に変わると ParkedLive poll の対象から外れる経路を確認した。
+これはテスト runner の timeout ではなく、回帰内の完了条件の未達である。
+
+同種メディアの背景採用を保つため、旧 Audio EOF の bundle 内採用部品を Video / Audio の共通部品にした。
+通常 resolver / Collection の Manual landing は共通入口を通し、native の成功した output swap は維持する。
+swap 不成立時と egui landing の背景メディアは、通常の全体 open に入らず、所有 C の idx / cache / marker と
+既存の media load だけを更新する。Video↔Audio も同じ窓で扱う。
+新旧 player の退役・resume 保存・normalize は既存の load に委ね、旧 output を drop したときだけ
+同じ C の presentation request/effects を終端する。成功 swap の output は終端しない。
+Manual の history / NewSource と EOF の ContinuousAdvance を保持し、cached / Audio へ動画の one-shot を残さない。
+Audio→Video の解析資源は `music_analysis_source.owner_context_id` が C に一致するものだけ退役する。
+起動時の音響処理待ちは既存 `vst3_deferred_media_open` へ送り、既存の所有 context ごとの完了処理から再開する。
+native の背景 swap の履歴も、候補の受付時ではなく確定点で記録する。
+
+さらに、破棄後に残した旧 same-host request の NativeReady / NativeCommitted は背景でも正当な完了である。
+その ApplyPresentation が A を active に戻す旧経路も確認し、ParkedLive の同 host Detached→Detached の確定を
+C の pair / native flag / sync stamp / A の runtime linked flag の更新に閉じた。
+active session / front 同期 / DSP owner の公開は前景側に属するため、この背景確定では行わない。
+別 host への明示切替の背景化・取消の仕様は追加していない。HWND 同定や focus / z-order の基盤は変更しない。
+
+回帰は Video↔Audio の両方向（通常 / Collection）、旧 AwaitingNative がある背景 media 採用での
+output 退役と遅着無効、既存の起動待ち gate と owner ごとの再開も追加した。
+同種メディアの対照でも D の共有 F11 / focus / viewport と one-shot 不変を検査する。
+静止画を捨てた native ケースは、その後の NativeReady / NativeCommitted と実 ApplyPresentation effect を通し、
+A の ParkedLive と D の session / 共有状態をもう一度検査する。
+native の host readiness / decoder と native 完了の事実だけに既存の headless seam を用い、
+request owner / current item / pending 完了 / continuation / App 側の確定 handler は実経路を使う。
+
+焦点 r4 は **18実行 / 16成功 / 2失敗、exit 100**（compile 9分34秒、実行4.156秒、
+`target/767-issue1-focused-r4.log`）。通常の背景採用、破棄後の同 host native 完了、旧 output の退役、
+起動待ち gate は通過した。2失敗は accepted Collection media の世代を旧値に固定した新規テストの期待だった。
+この fixture では既存の root replacement を1回通るため、
+`apply_collection_grid_prepared_install` → `install_new_items_inner` が世代を1回進める。
+accepted Collection media だけ `old_generation.wrapping_add(1)` とし、rows / 順序・C / A・D の所有不変と
+旧 player の退役を引き続き検査する。破棄する静止画は root install 前なので旧世代の完全不変を維持する。
+独立レビューでこの期待の補正を確認し、製品側の root reuse / replacement は変更しない。
+Collection 一般を常に世代更新する仕様にはしていない（既存の同一 root 再利用は世代不変）。
+
+追加決定後の最終検証（Cargo はすべて上記 runner 経由、重い処理は直列）:
+
+| コマンド | 件数 / exit code / 証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/independent_media_exchange/)' --no-fail-fast`（r5） | **18成功 / 0失敗、exit 0**。compile 17分23秒、実行11.213秒。`target/767-issue1-focused-r5.log`。r4 以後の変更は上記の新規 Collection テストの世代期待だけ |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|export\|presentation\|window_mode\|panorama\|detached\|multiwindow_scenario\|slideshow\|admission/)' --no-fail-fast`（回帰 r3） | **1,554成功 / 0失敗、exit 0**。build確認1.16秒、実行117.535秒。`target/767-issue1-regression-r3.log`。指定の既存対照・課題2/3回帰を含む |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/healthy_.*swap.*same_output_identity\|parked_audio_continuous_target_stays_inside_bundle\|effetune_and_vst_startup_gate\|parked_video_deferred_swap_completion\|parked_source_swap_pending_/)' --no-fail-fast` | **7成功 / 0失敗、exit 0**。build確認1.20秒、実行0.952秒。`target/767-issue1-background-controls.log`。既存の音声EOF、起動gate、成功したnative output再利用、背景swapとowner照合 |
+| `cargo check -p mimageviewer --bin mimageviewer-core`（追加決定後） | **exit 0**、1分19秒（テスト実行なし）。`target/767-issue1-check-r2.log` |
+| `cargo fmt`（最後の Cargo 操作、引数なし） | **exit 0**。`target/767-issue1-fmt-r2.log`。以後の Rust 変更なし |
+| `git diff --check` | **exit 0**。`target/767-issue1-diff-check-r2.log`。既存 LF→CRLF 設定の警告のみ |
+| `python scripts/check_site_cards.py` | **53カード / 超過0、exit 0** |
+| `python scripts/check_ui_glyphs.py` | **危険グリフ0、exit 0** |
+
+r4 は共有 runner が別セッションの全件テストのロック解放を待ってから開始した。
+待機中はこちらの Cargo は起動せず、ロックを変更しない。再ビルド中も中断せず完了まで待った。
+こちらから全件テストは起動していない。
+
+追加決定に沿った実装と指定の自動検証を完了した。独立 GPT-6.1 Sol / xhigh の再監査では
+追加 P1 / P2 はなく、同じソースの焦点18件・指定回帰1,554件・背景対照7件の成功ログを照合した。
+core check / fmt と整形後の差分を含む最終証跡も独立レビューが照合し、今回の指定スコープを受入可と判定した。
+未解決 P1 / P2 はない。実機確認・全件 gate・検証用 build は上記の引継ぎ事項として残す。
+HEAD は `01f5e898f`、ブランチは `feat-767-stage2` のまま。変更は上記15ファイルだけで vendor 差分なし。
+製品起動・検証用 build・全件 gate・commit / push は依頼どおり実施しない。
+描画 / レイアウトは変更しておらず ui_snapshot は実施しない。実 OS / 再生音 / focus・F11・DPI / 実3Dなど、
+上記の未確認点は引き続き実機確認へ引き継ぐ。
+
+#### 独立実装レビュー r1 (2026-11-14、Sol / xhigh)
+
+上記実装 `9044445e6` に対する設計担当の独立実装レビューは「指摘修正後に受入可」。
+構造的変更であることには合意し、P2 1件を指摘した。今回の修正基点は文書記録を含む `bc5c3415a`。
+上記の当時の検証・レビュー記録は履歴として残し、この指摘の修正と検証を以下に追記する。
+
+**P2 — 遅着した同一ホストの保守要求が、fork / 再開で確定した独立性を巻き戻す。**
+連動 media A で rect 同期等を発行すると、generic native request が発行時の独立性 false を保存していた。
+D の実 activation は `park_current_viewer_context_as_live_media_inner` で A を新 context C に fork し、
+独立 true と runtime linked=false を確定する。request も C に移るが、旧要求の Apply が保存済み false を
+session / runtime に書き戻していた。A の再 activation 後に完了した場合、次の画像送りが B への交換にならない。
+D が active のままの完了でも、A の独立性が巻き戻る。前回の same-host apply 所有分離だけでは防げなかった。
+
+**修正（BA-7）:**
+
+- `src/app/presentation_transition.rs`: 既存 `PresentationRequest.target_independent` を `Option<bool>` にし、
+  factory は `None`、明示 F12 setter だけ `Some(解決値)` を保存する。
+- `src/app/native_video.rs`: generic request では独立性を捕捉しない。実 Apply effect で `None` を
+  その時点の mounted C の独立性へ解決し、session と runtime linked flag へ同じ値を渡す。
+  明示 F12 は従来どおり保存した解決値を確定する。同 host の同期 F12 / 反転時の同期確定も維持する。
+- `src/app/detached_media_exchange_tests.rs`: 実 linked open → D activation / fork → A 再 activation →
+  旧 native 完了 → 実画像 navigation で B へ交換する回帰と、D が active のまま完了する回帰を追加。
+  どちらも bool を手で立てず、C の独立性・runtime・binding、一覧 / 順序・main・D の内容 / binding / runtime を検査する。
+  明示 F12 の対照は実 Fullscreen open → 実 F12 toggle による Detached 要求 → 既存の独立化部品で現在値 true →
+  native 完了の実 Apply で `Some(false)` を確定する。host / decoder の事実だけを headless seam で供給する。
+- `src/app/tests.rs`: 既存 host effect fixture の request literal を新しい保守要求の型（`None`）に合わせる。
+  assertion は変更しない。
+- 本書と `docs/detached-rework-plan.md` §11 に記録する。変更は以上の6ファイル。
+
+待ち / activation 制限や guard を追加して組合せを抑える案は、通常操作を制限するため採らない。
+保守要求が独立性の決定を運ばない型にすることで、時間順の例外処理を増やさず正本を C に一本化する。
+新しい App の bool / Option / pending、retry、追加 repaint、silent fallback は加えない。
+request の abort / retire 中の後継は外側 `Preparing.request` が所有し、既存 setter で更新できる。
+内側の旧 aborted / retiring request は変更しない。setter 前に新要求の payload が effects に逃げる経路もない。
+
+**同型経路の列挙監査（実装者と独立 Sol / xhigh）:**
+
+| 経路 | 独立性の扱い・結論 |
+| --- | --- |
+| native rect 同期、音声モード復帰の generic switch、F11 の main / fullscreen 間要求 | `None`。発行時の独立性を持たず、完了時の C を継承する。activate の有無を F12 の代用にはしない |
+| native 明示 F12、同 host F12、反転して現在の表示先へ戻る F12 | 明示の非同期要求だけ `Some`。同期確定 / reducer の Stable 短絡は既存 handler がその場で確定する |
+| `apply_video_presentation_switched` 同期 wrapper | 呼出時に解決し、非同期 request に古い bool を保存しない。非同期の実 Apply は上記 typed request の確定点に集約する |
+| `apply_egui_viewer_presentation_for_current_item`、`commit_viewer_session_deferred_feedback` | F12 の同 stack 同期確定。後者で deferred なのは通知だけであり、古い独立性を非同期保存しない |
+| descriptor 開始 / 再開、列挙完了 | binding の初期確定は開始時の runtime / 設定から同期解決。列挙後の open は現在の binding / session を継承し、旧 bool を持たない |
+| folder / PDF / ZIP の遅延 reopen | close を挟む pair の捕捉・復元は同 stack。worker 完了は現在の binding / session で open し、独立性の旧値を書き戻さない |
+| ViewerSession / registry の swap、fork / resume | C 自身の正本の所有移動、または独立への明示移行。遅着結果による scalar の書き戻しではない |
+| NativeVideoOpenPending、source-swap、VST deferred、Manual / Collection の遅延確定 | 独立 bool を payload に持たず、現在の C の load / open に着地する。追加の同型 P2 は確認できなかった |
+
+**旧コードでの再現:**
+
+`cargo nextest run -p mimageviewer --lib -E 'test(/independent_media_exchange_request_independence/)' --no-fail-fast`
+を指定 `run-heavy.ps1` 経由で実行。**3実行 / 0成功 / 3失敗、exit 100**、compile 9分05秒、実行0.465秒。
+証拠は `target/767-issue1-r1-red.log`。保守要求の2件は、実 fork 後 true の事前条件を満たしてから、
+旧 Apply 後 false（期待 true）になることを確認し、P2 の再現とした。
+残る1件は旧 F12 対照 fixture の setup failure。同 host の AwaitingHost 要求を置換すると reducer が Stable へ
+短絡するため遅延 Apply に到達しなかった。上記の Fullscreen→Detached fixture に直し、製品 reducer は変更しない。
+
+**修正後の検証:** すべて同じ worktree で指定 runner 経由・直列とし、
+設計担当の全件ロックがあれば解放を待つ。全件 gate / 検証用 build / 製品起動 / commit / push は実施しない。
+
+| コマンド | 件数 / exit code / 証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/independent_media_exchange/)' --no-fail-fast` | **21成功 / 0失敗、exit 0**。compile 12分42秒、実行15.204秒。`target/767-issue1-r1-focused.log`。新規3件と既存同 host / 反転 F12・descriptor / 遅延 reopen を含む |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|export\|presentation\|window_mode\|panorama\|detached\|multiwindow_scenario\|slideshow\|admission/)' --no-fail-fast` | **1,557成功 / 0失敗、exit 0**。build確認3.06秒、実行240.304秒。`target/767-issue1-r1-regression.log`。depth focus の1件は SLOW 表示（65.364秒）だったが成功 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/native_video\|video_audio\|video_presentation\|presentation_transition/)' --no-fail-fast` | **197成功 / 0失敗、exit 0**。build確認2.45秒、実行26.901秒。`target/767-issue1-r1-native.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit 0**、3分08秒（テスト実行なし）。`target/767-issue1-r1-check.log` |
+| `cargo fmt`（最後の Cargo 操作、引数なし） | **exit 0**。`target/767-issue1-r1-fmt.log`。以後の Rust 変更なし |
+| `git diff --check` | **exit 0**。`target/767-issue1-r1-diff-check.log` |
+
+指定の自動検証を完了した。描画 / レイアウト / UI文字列の変更はなく、ui_snapshot / glyph / site card の再実行は不要。
+実 HWND / focus / F11・DPI / 実再生などの実機確認は今回未実施で、headless の状態・handler 検証と区別する。
+こちらから全件 gate・検証用 build・製品起動・commit / push は実施していない。vendor 差分なし、
+ブランチ `feat-767-stage2` / HEAD `bc5c3415a` のまま。独立 Sol / xhigh が整形後の差分と全証跡を照合し、
+r1 P2 の指定スコープを **受入可、未解決 P1 / P2 なし** と判定した。
+
+#### 独立実装レビュー r2 (2026-11-14、設計担当が依頼した別セッションの GPT-6.1 Sol / xhigh、read-only、対象 `01c9b2195`)
+
+**受入可、P1 / P2 / P3 なし**。r1 の P2 は解消。保守要求の完了は `None` を所有 context の確定値へ解決し、追加テストは実 linked open → D の activation / fork →
+A の再 activation 後の完了と、D が active のままの完了を検査している。F12 以外で表示先が変わる実呼出は `toggle_video_window_mode` の MainWindow ↔ Fullscreen だけで、
+非 detached の独立性 false を継承するので正しい。新規 open とメディアウィンドウ設定による移動は `prepare_viewer_presentation_open` が同期で確定する。
+F12 の経路 (native・egui・`toggle_detached_viewer_mode`) は明示値を保つ。**症状パッチではなく構造的な変更であることに合意** (保守完了が参照する独立性の正本を
+所有 context に一本化した)。r1 (`9044445e6`) の判定「指摘修正後に受入可・構造的変更に合意」と合わせ、課題 1 の実装を設計担当 (ClaudeCode) が検収した。
+
+#### 全件 gate の失敗 2 件の修正 (2026-11-14)
+
+設計担当が `600b0a99d` で実行した本体 lib 全件は **17,643実行 / 17,641成功 / 2失敗、exit 100**。
+証拠は `target/test-lib-full/runs/20261113T192240046Z-e0d51430/stderr.log`。
+今回の作業基点も同じ HEAD とし、以下の2件を修正した。全件 gate 自体はこちらから再実行しない。
+
+**prepared 内部本の独立性（BA-7）:**
+
+`section1675_multiwindow_scope_literal_prefix_prepared` は、loading shell が private binding を予約し、
+`(DetachedWindow, true)` を確定した後、prepared ZIP の同期 install 中に失っていた。
+`finalize_zip_enumerate` → `install_prepared_zip_grid` → 一覧の内容入替 → 内部 content close の
+`prepare_viewer_presentation_close` が、公開後の active session だけで生存を判定していたためである。
+Building の予約はまだ逆引きに公開されておらず、session pair が非 detached / false に消された。
+`9044445e6` より前は、その後の open が設定から独立性を再決定してこの欠落を隠していた。
+設定の再参照や install 後の true の再代入で修復せず、予約から公開まで同じ所有者の確定値を保つ。
+
+- `src/app.rs`: 内容だけの close は、公開済みの既存生存条件に加え、Building の projected context が
+  Detached session と private binding の生存 runtime を所有している間、その初期 pair を維持する。
+  Closing / runtime 不在にはこの保持を適用しない。連動 false もそのまま保持し、独立へ強制しない。
+  terminal close / abort の binding 退役・非公開規則は変更しない。
+- loading shell と Collection root の新規 context は、予約直後に session pair と runtime linked flag を
+  一緒に初期確定する。descriptor builder と同じ順序とし、ページ open 前の runtime も独立にそろえる。
+  新しい App 状態、描画 guard、待ち、retry、追加 repaint、一括 reset は追加しない。
+- `src/app/archive_inner_book_s3.rs`: 元の期待をすべて残し、通常 ZIP / 変換元付き ZIP の両方で
+  prepared install 前後の pair・runtime と、公開前の private binding を追加検査する。
+  同じ context の内容・literal prefix / raw scope・main 不変も従来どおり検査する。
+- `src/app/tests.rs`: 実 loading-shell 入口と Collection root の既存テストを強化し、
+  新規 `detached_scanned_folder_binding_session_follows_new_open_setting` は実 ScannedFolder handler で
+  設定から得た独立 true / 連動 false の両方、runtime / binding、main の一覧・選択・世代不変を検査する。
+
+**同型入口の確認:** production の新規 `build_viewer_context` は次の3系統で、残りの直接呼出しは test fixture。
+
+| 予約・公開の所有者 | 入口 / prepared・deferred の扱い |
+| --- | --- |
+| `start_active_detached_loading_context` | §1.675 の prepared scope / literal prefix 回帰が直接使う先行 shell。production では Bookmark / startup、FolderCandidate / ConvertibleArchive が共用する。同期 prepared install の欠落を上記共通 close で修正し、非同期完了は公開済みの同じ pair を継承する |
+| `start_active_detached_book_context_with_start` | 新規 / 再開の descriptor（フォルダ・PDF・ZIP・画像、§1.675 の ZIP BookScope を含む）と ScannedFolder。予約時の pair / runtime 初期確定は既存どおり。同期 ScannedFolder でも今回の保持規則が必要。deferred enumerate / reopen は所有 context の現在値を継承し、新たな設定の再決定はしない |
+| `start_active_detached_collection_root_image` | 独自の一覧 install は共有 content close を通らず pair の欠落はないが、予約時の runtime 初期値も session に一致させる。既存の独立 true 方針と一覧 policy / identity は変えない |
+
+ScannedFolder の直接入口は現在 test wrapper のみだが、共有 factory の同期 install 分岐も実経路で検査する。
+
+**close seam の source-text test:**
+
+`the_close_and_retire_seam_finishes_the_transition_it_starts` は課題2の `53d224a5c` で本体が
+明示 id の `take_and_close_context_with_cause` へ移ったことに追従していなかった。
+検査対象をその本体へ移し、帰還の移譲 → `close_and_retire_context` の順序、terminal closure の
+`close_fullscreen_to_completion`、Windows 側に素の `close_fullscreen()` がないこと、終端 owner の一意性を維持する。
+active wrapper が active id を先に解決して typed cause とともに本体へ渡すことも追加検査する。
+明示 id のもう1つの入口は `park_detached_viewer_for_handoff` で、snapshot がない移動元を同じ本体へ渡す。
+`take_detached_snapshot_for_activation` が、取り出す前に捕捉した source をこの handoff へ渡す順序も検査する。
+これらはテストの更新だけで、close 本体や課題2の所有移動は変更しない。
+
+変更ファイルは上記 Rust 3ファイルと本書、`docs/detached-rework-plan.md` の5ファイル。
+独立 Sol / xhigh は実行前の差分と同型入口の監査を確認し、追加 P1 / P2 なし、予約中の所有境界を直す構造修正と評価した。
+
+**検証記録:** Cargo は指定 `run-heavy.ps1`（Owner `codex/767-issue1`、WorkDir は本 worktree）経由で直列実行し、
+他セッションの全件ロックがあれば変更せず解放を待つ。既存の検証と同じく jobs=1 / incremental=0 / MSBuild node reuse 無効を使用する。
+
+- 修正前の `600b0a99d` で失敗2件だけを再実行し、**2実行 / 0成功 / 2失敗、exit 100**。
+  `cargo nextest run -p mimageviewer --lib -E 'test(section1675_multiwindow_scope_literal_prefix_prepared) | test(the_close_and_retire_seam_finishes_the_transition_it_starts)' --no-fail-fast`。
+  compile 9分31秒、実行0.580秒、`target/767-gate-current-red.log`。
+- 旧版比較は worktree 内の `target/767-gate-old-01f5e898f` に Git blob から物理コピーを作り、
+  `src` の1,036 blob 全件が `01f5e898f` と一致することを検証した。
+  同じ版の依存（`Cargo.toml` / lock / build.rs / crates / vendor に基点との差分なし）を使うため、
+  snapshot の manifest だけ path dependency を既存実体の絶対パスへ変更し、共通 target を指定する。
+  native の必要資産は実体コピーし、junction / symlink は作らない。比較対象の App ソースと既存テストは変更しない。
+  一致検証の証拠は `target/767-gate-old-source-verify.log`（exit 0）。
+  `CARGO_TARGET_DIR` を本 worktree の target にして、
+  `cargo nextest run --manifest-path .\target\767-gate-old-01f5e898f\Cargo.toml -p mimageviewer --lib -E 'test(section1675_multiwindow_scope_literal_prefix_prepared)' --no-fail-fast`
+  を同じ runner 経由で実行し、**1実行 / 1成功 / 0失敗、exit 0**。compile 12分24秒、実行0.827秒。
+  `target/767-gate-old-test.log`。旧版で同じ既存テストが通り、基点で落ちる退行を確認した。
+  runner は別セッションの全件ロック解放を待ち、解放後は書込不可の警告に従って slot なし・低優先度で続行した。
+
+修正途中の最初の2件検証は **2実行 / 1成功 / 1失敗、exit 100**（compile 8分16秒、実行0.551秒、
+`target/767-gate-two-r1.log`）。close seam は成功したが、prepared install 後の追加 pair 検査で Fullscreen を検出した。
+Building の保持条件で用いた `viewer_session_is_detached()` は `fullscreen_idx.is_some()` も要求するため、
+ページがない初期予約を表せなかった。同じ所有境界で予約済みの `viewer_presentation == DetachedWindow` を直接参照する形に直し、
+テストでも最初のページ前であることを明示する。設定の再決定や後段の修復は加えない。
+
+**修正後の最終検証（指定 runner 経由・直列）:**
+
+| コマンド | 件数 / exit code / 証拠 |
+| --- | --- |
+| `cargo nextest run -p mimageviewer --lib -E 'test(section1675_multiwindow_scope_literal_prefix_prepared) \| test(the_close_and_retire_seam_finishes_the_transition_it_starts)' --no-fail-fast` | **2成功 / 0失敗、exit 0**。compile 7分58秒、実行0.820秒。`target/767-gate-two-green.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/section1675\|archive_inner_book\|multiwindow\|close_and_retire/)' --no-fail-fast` | **160成功 / 0失敗、exit 0**。build確認1.02秒、実行16.511秒。`target/767-gate-related.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/independent_media_exchange/)' --no-fail-fast` | **21成功 / 0失敗、exit 0**。build確認0.98秒、実行3.690秒。`target/767-gate-focused.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|export\|presentation\|window_mode\|panorama\|detached\|multiwindow_scenario\|slideshow\|admission/)' --no-fail-fast` | **1,558成功 / 0失敗、exit 0**。build確認0.97秒、実行102.260秒。`target/767-gate-regression.log`。新規 ScannedFolder の両設定と、強化した loading shell（所属 module の `window_mode` で選択）/ Collection root、課題2/3・abortの既存対照を含む |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit 0**、56.95秒（テスト実行なし）。`target/767-gate-check.log` |
+| `cargo fmt`（最後の Cargo 操作、引数なし） | **exit 0**。`target/767-gate-fmt.log`。以後の Rust 変更なし |
+| `git diff --check` | **exit 0**。`target/767-gate-diff-check.log`。既存 LF→CRLF 設定の警告のみ |
+
+指定の自動検証を完了した。既存テストの期待をすべて維持し、予約中の pair / runtime と入口の委譲検査を追加した。
+描画・レイアウト・UI文字列の変更はなく、ui_snapshot / glyph / site card は再実行しない。
+実 HWND / focus / F11・DPI / 実再生などの実機確認と、本体 lib 全件 gate の再実行は未実施。
+全件 gate・検証用 build・製品起動・commit / push は今回の指示どおり実行していない。
+変更は上記5ファイルで vendor 差分なし、ブランチ `feat-767-stage2` / HEAD `600b0a99d` のまま。
+独立 GPT-6.1 Sol / xhigh が整形後の5ファイル差分と全証跡を照合し、今回の修正は **受入可、未解決 P1 / P2 なし** と判定した。
+
+#### 独立実装レビュー r3 (2026-11-14、設計担当が依頼した別セッションの GPT-6.1 Sol / xhigh、read-only、対象 `178a3ece2`)
+
+**受入可、P1 / P2 / P3 なし**。原因 (同期 install の内容 close が `prepare_viewer_presentation_close` で公開前の Building の session pair を非 detached / false に解除) の説明は正しく、
+`preserve_detached_for_folder_nav` の条件は registry 所有の私的予約と同じ窓の runtime から生存を判定するもので、Mounted には影響せず、Closing / runtime 不在は保持しない。
+取消と build abort で保持した pair が残る経路は無い。同型の経路 (loading shell / collection root / descriptor / ScannedFolder) に取りこぼしは無い。テストは弱めていない。
+**症状パッチではなく構造的な変更であることに合意** (内容の close と予約済み表示 session の寿命を区別し、公開前後で同じ所有者の確定値を保つ)。設計担当 (ClaudeCode) も同じ判断で検収した。
+
+#### 全件 gate と確認用 build (2026-11-14、設計担当、すべて run-heavy.ps1 経由)
+
+| コマンド | 結果 |
+|---|---|
+| `.\scripts\test-lib-full.ps1` (`-FullTest`、コード `178a3ece2`) | 1 回目 (`01c9b2195`) は 17,643 件中 2 件失敗 (上記で修正)。2 回目 **17,644 件成功 / 0 件失敗、exit 0** (901.6 秒)。実行中に文書だけのコミットを入れたため、再利用の記録は残っていない |
+| `cargo test --workspace --exclude mimageviewer-launcher --features pack-build-tools --no-run` | 1 回目はページング ファイル不足 (os error 1455、並行ビルドによる) で失敗、`-j 4` で再実行して **exit 0** |
+| `.\scripts\build-dev.ps1` | **exit 0**。`target\dev-runtime\mimageviewer-core.exe` (2026-11-14 06:51) |
+
+描画・レイアウトの変更が無いので ui_snapshot は回していない。実機確認 (サブ PC、手順 `C:\miv-subpc\steps-767-stage2.md`) は未実施。
+
+### 17.19 サブPC依頼50の原因調査・修正設計・失敗回帰（2026-11-14、製品未変更）
+
+基点 `d96e47c0b` / 製品 `178a3ece2`。
+サブPC担当の観測と通常ログ、ソース、現コード／旧コードの同じテストを照合した記録は
+[依頼50の調査と修正設計](depth-parallax-realmachine50-investigation.md) を正本とする。
+停止した窓のclick配送、外部openの旧Depth ownerの孤児化、rectによるキーHWND誤同定を分ける。
+実機Aの入力欠落の瞬間は通常ログから未確定であり、再現できるcallback欠落の機構と区別する。
+既存3テストファイルへ5件の失敗回帰を追加し、製品・ログ・vendorは変更しない。
+失敗出力・コマンド・件数・exit code、BA分類、修正案、次段のscope判断、未確認点は正本§1〜8に記録する。

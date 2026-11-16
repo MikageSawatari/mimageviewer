@@ -1,5 +1,26 @@
 # 動画再生サブシステム アーキテクチャ
 
+## 独立メディアから静止画への表示ホスト交換 (§1.767)
+
+フル機能 + `effective_media_in_media_window()` の独立 Video / Audio から静止画へ進む採用境界で、
+`exchange_independent_media_window_for_still` が同じ context のホスト A を B に交換する。
+旧 player・音声モード・VST 表示・音楽表示と native presentation request/effects は旧メディアの寿命で終端し、
+静止画の cache、一覧、順序、context は保持する。旧 native output の drop 後に request owner を終端するため、
+旧チャネルの完了を待たない。request id は単調増加を維持し、遅着を次の要求へ採用しない。
+placement と F11 の target / restore を旧ホストの Closing 前に捕捉し、B の最初の builder から適用する。
+通常の連動窓、一覧からの open、複数ウィンドウモードの種類変更、独立静止画からメディアへの拒否は維持する。
+
+受理済み Manual が ParkedLive 後に届いた場合、静止画への窓交換を要する結果は採用前にログ付きで捨てる。
+通常 resolver / Collection の request owner は共通の active 判定を通す。同種メディアは従来どおり背景で採用する。
+背景メディアの通常 landing / native swap 不成立時は旧 Audio EOF と共通の context 内採用部品へ渡し、
+active session を公開しない。旧 output の drop は同 context の request を終端し、成功 swap の output は保持する。
+破棄後に残る同 host の native request の完了も、context 内の確定と active session / front / DSP の公開を分ける。
+
+独立性は binding の予約・公開で初期確定し、同じ binding の open は継承する。F12 の明示切替では
+presentation と独立性を一緒に確定する。native の遅延切替は既存 `PresentationRequest` に解決済み独立性を保持し、
+同 host の rect 同期は現在値を継承する。F12 が現在の表示先へ戻る要求は native reducer が確定を省略できるため、
+採用後に独立性だけを同期確定する。詳細と検証は [3D 写真設計 §6.4.5・§17.18](depth-parallax-plan.md)。
+
 2026-11-04 受入 F: 再生位置は音声・動画とも従来の共通保存規則を使うが、続きの画像は
 プレイヤーの`VideoInfo.has_video`が確定している場合だけ要求する。通常flushとcontext終了時の
 退避保存を両方対象にし、後者は既存`MediaResumeUpdate`へプレイヤー生存中の映像能力を
@@ -554,7 +575,12 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
 入力 owner を同じ派生判定で一時抑止する。保存済みの open / lock / tag picker state は変更せず、mode 終了後に
 同じ状態へ戻す。上部・下部 HUD はこの抑止に含めない。
 右メタデータパネルは App の per-file `fs_click_info_open` を正本として presenter へ同期し、
-左パネルは上段の「ジャンプ / 画像補正」タブと、画像補正内の「色調 / フィルタ」タブで構成する。
+左パネルは上段の「ジャンプ / 文字起こし / 画像補正」タブと、画像補正内の「色調 / フィルタ」タブで構成する。
+文字起こしは常時タブを出し、Appの共通snapshotだけを受け取る。render threadでDB/ファイルは読まない。
+古い/別trackの本文は警告とともに保持する。全文折返し一覧はmusicと同じrendererで、可視行だけをlayoutし、
+Fenwick高さ索引を使う。再生中の行へ自動送りし、手動scrollで停止、再生位置へ戻る操作で再開する。
+このfollow/scrollはtab・panelの閉鎖/source変更で破棄する一時状態で、設定へは保存しない。
+右metadataにも同snapshotから文字起こしの状態1行を表示する。
 ジャンプの開閉と選択中タブは presenter-local な session 状態、色調と Creative LUT の値は
 viewer-wide な `Settings::video_adjustments` を正本とする。画像補正パネル末尾には動画専用の
 10 個の保存スロットを読込行 / 保存行で表示する。スロット内容は App 側の
@@ -3074,6 +3100,15 @@ viewport へ切り替わる間に新 viewport がフォーカスを取るまで�
 ⊞ ボタン (× の左)。
 
 ### 動画→音声モード (音楽ビュー)
+
+音楽ビューの左は「ジャンプ / 文字起こし」の2タブ。Appがnative動画と同じsnapshotを作り、
+共通一覧rendererへ渡す。tab/follow/scrollはviewer contextとsourceに属する現在のmusic panel sessionが持ち、
+閉鎖・動画とのmode遷移で破棄する。右情報にも同snapshotの状態1行を出す。
+文字起こしの保存時刻は再生側と同じメディア時刻。抽出のInputに属する `MediaTimeline` が原点を処理し、
+表示の強調と行からのseekは保存時刻を直接使う。UIでの再probe・原点待ち・表示側の加減算は不要。
+TS/PSはO_eff基準、正の開始時刻を持つMKVも再生側と同じ原点0を使い、音声の先頭遅延を保持する。
+既存seekの `[0, duration_secs - 0.1]` 制限を共用し、文字起こし専用のclampや迂回は設けない
+（[ASR計画 §8.3](local-asr-transcript-plan.md#83-時刻の精度)）。
 
 音声ファイル (`GridItem::Audio`) の再生と、動画再生中に映像をカットして音声だけ聴く
 「動画→音声モード」は、どちらも同じ再生エンジンを使い、映像面を egui の音楽ビュー overlay

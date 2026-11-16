@@ -10,7 +10,7 @@ use std::time::Instant;
 static START: OnceLock<Instant> = OnceLock::new();
 static CONFIGURED: OnceLock<()> = OnceLock::new();
 
-/// Forward selected dependency warnings/errors to the existing asynchronous sink.
+/// Forward selected dependency diagnostics to the existing asynchronous sink.
 /// Keep Tantivy's normal segment activity and unrelated renderer diagnostics out of the log.
 struct ProductDiagnostics;
 static PRODUCT_DIAGNOSTICS: ProductDiagnostics = ProductDiagnostics;
@@ -19,7 +19,9 @@ impl log::Log for ProductDiagnostics {
         dependency_enabled(
             metadata.level(),
             metadata.target(),
-            crate::gpu_startup_diagnostics::capturing(),
+            metadata.level() == log::Level::Error
+                && crate::gpu_startup_diagnostics::is_gpu_target(metadata.target())
+                && crate::gpu_startup_diagnostics::capturing(),
         )
     }
     fn log(&self, record: &log::Record<'_>) {
@@ -42,8 +44,14 @@ impl log::Log for ProductDiagnostics {
 }
 
 fn dependency_enabled(level: log::Level, target: &str, gpu_startup: bool) -> bool {
-    (level <= log::Level::Warn
-        && (target.starts_with("tantivy::") || target == "egui_wgpu::surface_window_limit"))
+    (level == log::Level::Info
+        && matches!(
+            target,
+            "egui_winit::pointer_input_observer::diagnostic"
+                | "eframe::native_window_input::diagnostic"
+        ))
+        || (level <= log::Level::Warn
+            && (target.starts_with("tantivy::") || target == "egui_wgpu::surface_window_limit"))
         || (gpu_startup
             && level == log::Level::Error
             && crate::gpu_startup_diagnostics::is_gpu_target(target))
@@ -263,7 +271,7 @@ fn init_inner(file_name: &str, truncate: bool) {
         truncate,
     });
     if log::set_logger(&PRODUCT_DIAGNOSTICS).is_ok() {
-        log::set_max_level(log::LevelFilter::Warn);
+        log::set_max_level(log::LevelFilter::Info);
     }
     log(LogRetention::from_environment().description());
 }
@@ -452,6 +460,139 @@ pub fn current_thread_id_num() -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn realmachine55_pointer_diagnostics_reach_normal_sink() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "logger::tests::realmachine55_pointer_diagnostics_sink_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("MIV_RM55_LOGGER_TEST_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated diagnostic sink test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated helper invoked by realmachine55_pointer_diagnostics_reach_normal_sink"]
+    fn realmachine55_pointer_diagnostics_sink_child() {
+        use winit::event::{DeviceId, ElementState, MouseButton, WindowEvent};
+
+        assert_eq!(std::env::var("MIV_RM55_LOGGER_TEST_CHILD").unwrap(), "1");
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            crate::data_dir::DATA_DIR
+                .set(directory.path().to_owned())
+                .is_ok()
+        );
+        // Use the product initialization, including the log facade's max-level
+        // gate, and the real asynchronous writer with only a disposable path.
+        init();
+
+        struct NoDisplay;
+        impl winit::raw_window_handle::HasDisplayHandle for NoDisplay {
+            fn display_handle(
+                &self,
+            ) -> Result<
+                winit::raw_window_handle::DisplayHandle<'_>,
+                winit::raw_window_handle::HandleError,
+            > {
+                Err(winit::raw_window_handle::HandleError::Unavailable)
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut state = egui_winit::State::new(
+            ctx,
+            egui::ViewportId::ROOT,
+            &NoDisplay,
+            Some(1.0),
+            None,
+            None,
+        );
+        let press = WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state: ElementState::Pressed,
+            button: MouseButton::Left,
+        };
+        state.on_pointer_event(&press, 1.0);
+        state.on_pointer_event(
+            &WindowEvent::CursorMoved {
+                device_id: DeviceId::dummy(),
+                position: winit::dpi::PhysicalPosition::new(20.0, 30.0),
+            },
+            1.0,
+        );
+        state.on_pointer_event(&press, 1.0);
+        // eframe's backend producer is crate-private. Exercise its dedicated
+        // facade target here; its producer boundary has vendor coverage.
+        log::info!(
+            target: "eframe::native_window_input::diagnostic",
+            "rm55 backend diagnostic"
+        );
+        for target in [
+            "egui_winit::pointer_input_observer",
+            "eframe::native_window_input",
+            "egui_winit::pointer_input_observer::diagnostic::other",
+            "eframe::native_window_input::diagnostics",
+            "other::eframe::native_window_input::diagnostic",
+            "tantivy::indexer",
+            "egui_wgpu::surface_window_limit",
+        ] {
+            log::info!(target: target, "rm55 filtered ordinary info {target}");
+        }
+        for target in [
+            "egui_winit::pointer_input_observer::diagnostic",
+            "eframe::native_window_input::diagnostic",
+        ] {
+            log::warn!(target: target, "rm55 filtered diagnostic warning {target}");
+            log::debug!(target: target, "rm55 filtered diagnostic debug {target}");
+        }
+        for target in ["tantivy::indexer", "egui_wgpu::surface_window_limit"] {
+            log::warn!(target: target, "rm55 retained warning {target}");
+            log::error!(target: target, "rm55 retained error {target}");
+        }
+        crate::gpu_startup_diagnostics::begin(crate::wgpu_backend_policy::GpuBackendRequest::Auto);
+        log::error!(target: "wgpu_hal::dx12", "rm55 retained startup error");
+        log::warn!(target: "wgpu_hal::dx12", "rm55 filtered startup warning");
+        crate::gpu_startup_diagnostics::stop_snapshot();
+        log::error!(target: "wgpu_hal::dx12", "rm55 filtered post-startup error");
+
+        assert!(crate::log_writer::shutdown_until(
+            Instant::now() + std::time::Duration::from_secs(5)
+        ));
+        let text = std::fs::read_to_string(directory.path().join("logs/mimageviewer.log")).unwrap();
+        for reason in ["PointerPositionUnavailable", "ObserverNotInstalled"] {
+            assert!(
+                text.lines().any(|line| {
+                    line.contains("[INFO] egui_winit::pointer_input_observer::diagnostic:")
+                        && line.contains(&format!("decision={reason}"))
+                }),
+                "real pointer diagnostic {reason} did not reach normal sink:\n{text}"
+            );
+        }
+        assert!(
+            text.contains(
+                "[INFO] eframe::native_window_input::diagnostic: rm55 backend diagnostic"
+            )
+        );
+        for target in ["tantivy::indexer", "egui_wgpu::surface_window_limit"] {
+            assert!(text.contains(&format!("[WARN] {target}: rm55 retained warning")));
+            assert!(text.contains(&format!("[ERROR] {target}: rm55 retained error")));
+        }
+        assert!(text.contains("[ERROR] wgpu_hal::dx12: rm55 retained startup error"));
+        assert!(
+            !text.contains("rm55 filtered"),
+            "unexpected vendor log:\n{text}"
+        );
+    }
 
     #[test]
     fn dependency_diagnostics_forward_only_warn_and_error() {

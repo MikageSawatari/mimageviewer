@@ -7,9 +7,14 @@
 //! registered `ViewportId` before it enters the queue.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
+
+/// Standalone development probe; it uses the production input owner and never
+/// creates an App or enables the test-script input contract.
+#[cfg(feature = "dev-tools")]
+pub mod native_detached_probe;
 
 #[cfg(all(windows, any(test, feature = "test-script")))]
 use std::sync::mpsc;
@@ -18,12 +23,17 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CONTROL, VK_MENU, VK_PROCESSKEY, VK_SHIFT,
 };
-use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_NCDESTROY, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLOSE, HTGROWBOX, HTHELP, HTLEFT,
+    HTMAXBUTTON, HTMINBUTTON, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, SC_CLOSE, SC_CONTEXTHELP,
+    SC_MAXIMIZE, SC_MINIMIZE, SC_RESTORE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_EXITSIZEMOVE,
+    WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NCDESTROY, WM_NCLBUTTONDBLCLK, WM_NCLBUTTONDOWN, WM_NCLBUTTONUP,
+    WM_NCMOUSEMOVE, WM_NCPOINTERDOWN, WM_NCPOINTERUP, WM_NCPOINTERUPDATE, WM_POINTERCAPTURECHANGED,
+    WM_POINTERDOWN, WM_POINTERUP, WM_POINTERUPDATE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
-const MAIN_KEY_INPUT_SUBCLASS_ID: usize = 0x6D69_6B31; // "mik1"
 const MAX_PENDING_EVENTS: usize = 256;
 const MAX_LOGGED_UNREGISTERED_HWND: usize = 16;
 const MAX_SYNTHETIC_INPUT_ISSUES: usize = 64;
@@ -684,6 +694,34 @@ impl SyntheticPointerTransaction {
             Self::Held { latch, .. } => Some(&latch.owner),
             Self::TerminalFailure { handle, .. } => Some(&handle.owner),
             Self::Idle => None,
+        }
+    }
+
+    fn retire_hwnd(&mut self, hwnd: u64) {
+        if !self
+            .owner()
+            .is_some_and(|owner| owner.identity.hwnd() == hwnd)
+        {
+            return;
+        }
+        // The native allocation is leaving, so no cleanup may be delivered to
+        // a successor's show. Complete only its outstanding waiter and retire
+        // the native gesture; egui's logical viewport/IME state is independent.
+        match std::mem::replace(self, Self::Idle) {
+            Self::Queued(mut step)
+            | Self::Prepared(mut step)
+            | Self::DeliveredAwaitingTail(mut step)
+            | Self::Cancelling(SyntheticPointerCancelPhase::Queued(mut step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::Prepared(mut step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::AwaitingOriginalTail(mut step))
+            | Self::Cancelling(SyntheticPointerCancelPhase::DeliveredCleanupAwaitingTail(
+                mut step,
+            )) => {
+                step.complete(Err(
+                    "synthetic pointer native window allocation retired".into()
+                ));
+            }
+            Self::Idle | Self::Held { .. } | Self::TerminalFailure { .. } => {}
         }
     }
 
@@ -1353,10 +1391,837 @@ impl ReturnKeyState {
     }
 }
 
+/// Non-owning identity of the exact input allocation. A copied HWND or a live
+/// lease clone is insufficient: retirement removes this epoch from the registry.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeInputAllocationWitness {
+    hwnd: u64,
+    epoch: Weak<()>,
+    #[cfg(test)]
+    registration: egui::ViewportRegistration,
+}
+
+impl NativeInputAllocationWitness {
+    pub(crate) fn is_current(&self) -> bool {
+        state().lock().ok().is_some_and(|guard| {
+            guard
+                .installed_hwnds
+                .registration(self.hwnd)
+                .is_some_and(|entry| {
+                    Weak::ptr_eq(&self.epoch, &Arc::downgrade(&entry.subclass_owner))
+                })
+        })
+    }
+
+    pub(crate) fn same_allocation(&self, other: &Self) -> bool {
+        self.hwnd == other.hwnd && Weak::ptr_eq(&self.epoch, &other.epoch)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn normalized_input(
+        &self,
+        input: egui_winit::pointer_input_observer::NormalizedPointerInput,
+    ) -> Option<egui::Id> {
+        observe_normalized_pointer_input(self.registration, input)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_message_for_test(&self, message: u32, wparam: usize, lparam: isize) {
+        self.native_message_with_origin_for_test(
+            message,
+            wparam,
+            lparam,
+            NativeMouseOrigin::Ordinary,
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_promoted_message_for_test(
+        &self,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+    ) {
+        self.native_message_with_origin_for_test(
+            message,
+            wparam,
+            lparam,
+            NativeMouseOrigin::PointerPromotion,
+        );
+    }
+
+    #[cfg(test)]
+    fn native_message_with_origin_for_test(
+        &self,
+        message: u32,
+        wparam: usize,
+        lparam: isize,
+        origin: NativeMouseOrigin,
+    ) {
+        let subclass = state()
+            .lock()
+            .unwrap()
+            .installed_hwnds
+            .registration(self.hwnd)
+            .filter(|entry| Weak::ptr_eq(&self.epoch, &Arc::downgrade(&entry.subclass_owner)))
+            .map(InstalledHwnd::subclass_id);
+        if let Some(subclass) = subclass {
+            native_detached_message_with_origin(
+                self.hwnd,
+                Some(subclass),
+                message,
+                wparam,
+                lparam,
+                NativeDetachedDispatch::Subclass(test_native_call(
+                    self.hwnd, subclass, message, wparam, origin,
+                )),
+                origin,
+            );
+            dispatch_native_detached_input();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finish_native_dispatch_for_test(&self, message: u32) {
+        let subclass = state()
+            .lock()
+            .unwrap()
+            .installed_hwnds
+            .registration(self.hwnd)
+            .filter(|entry| Weak::ptr_eq(&self.epoch, &Arc::downgrade(&entry.subclass_owner)))
+            .map(InstalledHwnd::subclass_id);
+        if let Some(subclass) = subclass {
+            if let Some(call) = test_take_native_call(self.hwnd, subclass, message) {
+                finish_native_detached_dispatch(self.hwnd, subclass, call);
+                dispatch_native_detached_input();
+            }
+        }
+    }
+}
+
+pub(crate) fn native_input_allocation_witness(
+    registration: egui::ViewportRegistration,
+) -> Option<NativeInputAllocationWitness> {
+    let guard = state().lock().ok()?;
+    let entry = guard
+        .installed_hwnds
+        .entries
+        .iter()
+        .find(|entry| entry.logical_registration == Some(registration))?;
+    Some(NativeInputAllocationWitness {
+        hwnd: entry.hwnd_raw,
+        epoch: Arc::downgrade(&entry.subclass_owner),
+        #[cfg(test)]
+        registration,
+    })
+}
+
+pub(crate) fn native_input_allocation_witness_for_hwnd(
+    hwnd: u64,
+) -> Option<NativeInputAllocationWitness> {
+    let guard = state().lock().ok()?;
+    let entry = guard.installed_hwnds.registration(hwnd)?;
+    Some(NativeInputAllocationWitness {
+        hwnd,
+        epoch: Arc::downgrade(&entry.subclass_owner),
+        #[cfg(test)]
+        registration: entry.logical_registration?,
+    })
+}
+
+/// Attach once during App creation. The canonical producer runs immediately
+/// after egui-winit appends a physical input to the owning State's RawInput.
+/// RootEnter may park that viewport before its callback receives the batch;
+/// inputs appended without an eligible target must never acquire a later scope.
+pub(crate) fn install_normalized_pointer_input_observer(ctx: &egui::Context) {
+    egui_winit::pointer_input_observer::set_observer(
+        ctx,
+        Some(Arc::new(|context, viewport, input| {
+            let Some(registration) = context.viewport_registration(viewport) else {
+                log_normalized_pointer_discard(
+                    viewport,
+                    None,
+                    input,
+                    NormalizedPointerDiscardReason::MissingViewportRegistration,
+                );
+                return None;
+            };
+            observe_normalized_pointer_input(registration, input)
+        })),
+    );
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum NormalizedPointerDiscardReason {
+    MissingViewportRegistration,
+    RegistrationNotInstalled,
+    Unbound,
+    GestureOwned(NativeDetachedGesture),
+    InputStateUnavailable,
+}
+
+fn log_normalized_pointer_discard(
+    viewport: egui::ViewportId,
+    registration: Option<egui::ViewportRegistration>,
+    input: egui_winit::pointer_input_observer::NormalizedPointerInput,
+    reason: NormalizedPointerDiscardReason,
+) {
+    if matches!(
+        input,
+        egui_winit::pointer_input_observer::NormalizedPointerInput::Pressed(_)
+    ) {
+        crate::logger::log(format!(
+            "[detached-activation] boundary=normalized_discard input={input:?} reason={reason:?} viewport={viewport:?} registration={registration:?}"
+        ));
+    }
+}
+
+fn observe_normalized_pointer_input(
+    registration: egui::ViewportRegistration,
+    input: egui_winit::pointer_input_observer::NormalizedPointerInput,
+) -> Option<egui::Id> {
+    use egui_winit::pointer_input_observer::{NormalizedPointerInput, PointerInputSource};
+    let mut marker = None;
+    if let Ok(mut guard) = state().lock() {
+        let mut retired = Vec::new();
+        let targets = guard.native_detached_targets.clone();
+        let Some(entry) = guard
+            .installed_hwnds
+            .entries
+            .iter_mut()
+            .find(|entry| entry.logical_registration == Some(registration))
+        else {
+            log_normalized_pointer_discard(
+                registration.viewport_id(),
+                Some(registration),
+                input,
+                NormalizedPointerDiscardReason::RegistrationNotInstalled,
+            );
+            return None;
+        };
+        let NativeDetachedInputBinding::Bound { target, gesture } = &mut entry.native_detached
+        else {
+            log_normalized_pointer_discard(
+                registration.viewport_id(),
+                Some(registration),
+                input,
+                NormalizedPointerDiscardReason::Unbound,
+            );
+            return None;
+        };
+        if matches!(input, NormalizedPointerInput::Pressed(_))
+            && *gesture != NativeDetachedGesture::Idle
+        {
+            log_normalized_pointer_discard(
+                registration.viewport_id(),
+                Some(registration),
+                input,
+                NormalizedPointerDiscardReason::GestureOwned(gesture.clone()),
+            );
+        }
+        let pointer_source = match input {
+            NormalizedPointerInput::Pressed(source)
+            | NormalizedPointerInput::Released(source)
+            | NormalizedPointerInput::Cancelled(source) => match source {
+                PointerInputSource::Mouse => NativePointerSource::Mouse,
+                PointerInputSource::Touch(id) => NativePointerSource::Pointer(id),
+            },
+        };
+        let mut kinds = Vec::new();
+        match input {
+            NormalizedPointerInput::Pressed(_) if *gesture == NativeDetachedGesture::Idle => {
+                let operation =
+                    egui::Id::new(("detached-client-input-operation", native_input_sequence()));
+                marker = Some(operation);
+                kinds.push(native_client_input(
+                    operation,
+                    NativeClientBoundary::Pressed,
+                ));
+                if target.availability == NativeTargetAvailability::Blocked {
+                    kinds.push(native_client_input(
+                        operation,
+                        NativeClientBoundary::Cancelled(NativeInputCancelReason::ModalOwned),
+                    ));
+                } else {
+                    *gesture = NativeDetachedGesture::ClientPressed {
+                        source: pointer_source,
+                        operation,
+                    };
+                }
+            }
+            NormalizedPointerInput::Released(_) => {
+                if let Some(operation) = gesture.client_operation(pointer_source) {
+                    *gesture = NativeDetachedGesture::Idle;
+                    kinds.push(native_client_input(
+                        operation,
+                        NativeClientBoundary::Released,
+                    ));
+                }
+            }
+            NormalizedPointerInput::Cancelled(_) => {
+                if let Some(operation) = gesture.client_operation(pointer_source) {
+                    *gesture = NativeDetachedGesture::Idle;
+                    kinds.push(native_client_input(
+                        operation,
+                        NativeClientBoundary::Cancelled(NativeInputCancelReason::PointerCancelled),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        let deliveries: Vec<_> = kinds
+            .into_iter()
+            .filter_map(|kind| {
+                entry
+                    .native_detached
+                    .delivery(entry.hwnd_raw, &entry.subclass_owner, kind)
+            })
+            .collect();
+        if let NativeDetachedInputBinding::Bound {
+            target,
+            gesture: NativeDetachedGesture::Idle,
+        } = &mut entry.native_detached
+            && let Some(latest) = targets
+                .iter()
+                .find(|latest| latest.registration == registration)
+        {
+            retired.push(NativeDetachedInputEffect::RetireTarget(std::mem::replace(
+                target,
+                latest.clone(),
+            )));
+        }
+        guard.native_detached_effects.extend(
+            deliveries
+                .into_iter()
+                .map(NativeDetachedInputEffect::Deliver),
+        );
+        guard.native_detached_effects.extend(retired);
+    } else {
+        log_normalized_pointer_discard(
+            registration.viewport_id(),
+            Some(registration),
+            input,
+            NormalizedPointerDiscardReason::InputStateUnavailable,
+        );
+    }
+    dispatch_native_detached_input();
+    marker
+}
+
+#[cfg(test)]
+pub(crate) fn register_test_native_input_allocation(
+    registration: egui::ViewportRegistration,
+    hwnd: u64,
+) -> NativeInputAllocationWitness {
+    let mut guard = state().lock().unwrap();
+    guard.register_hwnd(hwnd, registration.viewport_id());
+    guard.bind_native_detached_registration(hwnd, Some(registration));
+    let entry = guard.installed_hwnds.registration(hwnd).unwrap();
+    let witness = NativeInputAllocationWitness {
+        hwnd,
+        epoch: Arc::downgrade(&entry.subclass_owner),
+        registration,
+    };
+    drop(guard);
+    dispatch_native_detached_input();
+    witness
+}
+
+/// Exercise the backend allocation/retirement contract with synthetic HWNDs,
+/// without installing a Win32 subclass on a real desktop window.
+#[cfg(test)]
+pub(crate) struct TestNativeWindowInputListener;
+
+#[cfg(test)]
+impl eframe::native_window_input::NativeWindowInputListener for TestNativeWindowInputListener {
+    fn install(
+        &self,
+        allocation: eframe::native_window_input::NativeWindowAllocation,
+    ) -> Result<Box<dyn eframe::native_window_input::NativeWindowInputLease>, String> {
+        struct Lease(Option<NativeInputAllocationWitness>);
+        impl eframe::native_window_input::NativeWindowInputLease for Lease {
+            fn retire(&mut self) {
+                if let Some(witness) = self.0.take() {
+                    if let Ok(mut guard) = state().lock()
+                        && let Some(entry) = guard.installed_hwnds.registration(witness.hwnd)
+                        && Weak::ptr_eq(&witness.epoch, &Arc::downgrade(&entry.subclass_owner))
+                    {
+                        let subclass = entry.subclass_id();
+                        guard.unregister_subclass(witness.hwnd, subclass);
+                    }
+                    dispatch_native_detached_input();
+                }
+            }
+        }
+        let hwnd = allocation
+            .windows_hwnd
+            .ok_or("test allocation has no HWND")?;
+        Ok(Box::new(Lease(Some(
+            register_test_native_input_allocation(allocation.registration, hwnd as u64),
+        ))))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeTargetAvailability {
+    Enabled,
+    Blocked,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeInputCancelReason {
+    ModalOwned,
+    CaptureLost,
+    PointerCancelled,
+    CancelMode,
+    FocusLost,
+    Escape,
+    /// The native button call returned without selecting a matching system command.
+    CaptionButtonOutside,
+    RetiredRegistration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeNonClientOutcome {
+    Completed,
+    MinimizeOwned,
+    Cancelled(NativeInputCancelReason),
+    CloseOwned,
+}
+
+/// Ordered control metadata, never an activation producer. The ordinary client
+/// callback remains the sole producer of click/tap activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeClientBoundary {
+    Pressed,
+    Released,
+    Cancelled(NativeInputCancelReason),
+}
+
+/// One canonical physical operation. Its marker travels beside its actual
+/// RawInput press through take/append and layout replay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NativeClientInputBoundary {
+    pub(crate) operation: egui::Id,
+    pub(crate) boundary: NativeClientBoundary,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeDetachedInputSource {
+    pub(crate) registration: egui::ViewportRegistration,
+    pub(crate) hwnd: u64,
+    pub(crate) epoch: NativeInputAllocationWitness,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeDetachedInputEventKind {
+    NonClient(NativeNonClientOutcome),
+    NativeMediaTouch(NativeNonClientOutcome),
+    ClientBoundary(NativeClientInputBoundary),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeDetachedInputEvent {
+    pub(crate) source: NativeDetachedInputSource,
+    pub(crate) sequence: u64,
+    pub(crate) kind: NativeDetachedInputEventKind,
+}
+
+#[derive(Clone)]
+pub(crate) struct NativeDetachedInputTarget {
+    pub(crate) registration: egui::ViewportRegistration,
+    pub(crate) kind: NativeDetachedInputTargetKind,
+    pub(crate) availability: NativeTargetAvailability,
+    // Only enqueue into the existing transport. This callback must not enter App.
+    pub(crate) sink: Arc<dyn Fn(NativeDetachedInputEvent) + Send + Sync>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeDetachedInputTargetKind {
+    Parked,
+    ParkedLive,
+}
+
+/// Captured at native ingress. A later park, source switch or HWND reuse can
+/// never assign the tail of this physical contact to a new activation owner.
+#[derive(Clone, Debug)]
+pub(crate) struct NativeMediaTouchToken {
+    allocation: NativeInputAllocationWitness,
+    operation: egui::Id,
+    contact: egui::Id,
+    scope: NativeMediaTouchScope,
+}
+
+#[derive(Clone, Debug)]
+struct NativeMediaTouchScope {
+    source_epoch: Arc<AtomicU64>,
+    expected_source_epoch: u64,
+    input_epoch: Arc<AtomicU64>,
+    expected_input_epoch: u64,
+    output_cancel: Arc<AtomicBool>,
+}
+
+impl NativeMediaTouchScope {
+    fn is_current(&self) -> bool {
+        self.source_epoch.load(Ordering::Acquire) == self.expected_source_epoch
+            && self.input_epoch.load(Ordering::Acquire) == self.expected_input_epoch
+            && !self.output_cancel.load(Ordering::Acquire)
+    }
+}
+
+impl PartialEq for NativeMediaTouchScope {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.source_epoch, &other.source_epoch)
+            && self.expected_source_epoch == other.expected_source_epoch
+            && Arc::ptr_eq(&self.input_epoch, &other.input_epoch)
+            && self.expected_input_epoch == other.expected_input_epoch
+            && Arc::ptr_eq(&self.output_cancel, &other.output_cancel)
+    }
+}
+
+impl Eq for NativeMediaTouchScope {}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) enum NativeMediaTouchRoute {
+    #[default]
+    Unstarted,
+    Regular,
+    CommandOwned(NativeMediaTouchToken),
+    ActivateOnly(NativeMediaTouchToken),
+    Suppressed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeMediaTouchPhase {
+    ActivateOnly,
+    CommandOwned,
+    Cancelled(NativeInputCancelReason),
+}
+
+impl std::fmt::Debug for NativeDetachedInputTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeDetachedInputTarget")
+            .field("registration", &self.registration)
+            .field("availability", &self.availability)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The OS selected one matching button command. This is a closed disposition,
+/// not a second request: minimizing never authorizes viewer activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeButtonAction {
+    ActivateViewer,
+    MinimizeOwned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeNonClientPhase {
+    Pressed,
+    Released,
+    ButtonActionCommitted(NativeButtonAction),
+    Cancelled(NativeInputCancelReason),
+    CloseOwned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeNonClientScope {
+    InNativeCall(NativeDetachedCall),
+    AwaitingRelease,
+    InReleaseCall(NativeDetachedCall),
+}
+
+/// Identity belongs to the subclass invocation, not its message number or hit.
+/// The same HWND and message can synchronously reenter with a different call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeDetachedCall {
+    sequence: u64,
+    message: u32,
+    wparam: usize,
+    origin: NativeMouseOrigin,
+}
+
+impl NativeDetachedCall {
+    fn new(message: u32, wparam: usize, origin: NativeMouseOrigin) -> Self {
+        Self {
+            sequence: native_input_sequence(),
+            message,
+            wparam,
+            origin,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NativeDetachedDispatch {
+    Hook,
+    Subclass(NativeDetachedCall),
+}
+
+#[cfg(test)]
+thread_local! {
+    // Compatibility for older fake native drivers that dispatch and return in
+    // separate steps. Reentrancy regressions use the explicit token directly.
+    static TEST_NATIVE_CALLS: std::cell::RefCell<Vec<(u64, usize, NativeDetachedCall)>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+fn test_native_call(
+    hwnd: u64,
+    subclass: usize,
+    message: u32,
+    wparam: usize,
+    origin: NativeMouseOrigin,
+) -> NativeDetachedCall {
+    let call = NativeDetachedCall::new(message, wparam, origin);
+    TEST_NATIVE_CALLS.with(|calls| calls.borrow_mut().push((hwnd, subclass, call)));
+    call
+}
+
+#[cfg(test)]
+fn test_take_native_call(hwnd: u64, subclass: usize, message: u32) -> Option<NativeDetachedCall> {
+    TEST_NATIVE_CALLS.with(|calls| {
+        let mut calls = calls.borrow_mut();
+        let index = calls
+            .iter()
+            .rposition(|(h, s, call)| *h == hwnd && *s == subclass && call.message == message)?;
+        Some(calls.remove(index).2)
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativePointerSource {
+    Mouse,
+    Pointer(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeMouseOrigin {
+    Ordinary,
+    PointerPromotion,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NativeNonClientPressTarget {
+    hit: u32,
+}
+
+impl NativeNonClientPressTarget {
+    fn is_button(self) -> bool {
+        matches!(self.hit, HTMINBUTTON | HTMAXBUTTON | HTHELP)
+    }
+
+    fn matches_button_command(self, command: u32) -> bool {
+        match self.hit {
+            HTMINBUTTON => matches!(command, SC_MINIMIZE | SC_RESTORE),
+            HTMAXBUTTON => matches!(command, SC_MAXIMIZE | SC_RESTORE),
+            HTHELP => command == SC_CONTEXTHELP,
+            _ => false,
+        }
+    }
+
+    fn is_move_or_resize(self) -> bool {
+        matches!(
+            self.hit,
+            HTCAPTION
+                | HTGROWBOX
+                | HTLEFT
+                | HTRIGHT
+                | HTTOP
+                | HTTOPLEFT
+                | HTTOPRIGHT
+                | HTBOTTOM
+                | HTBOTTOMLEFT
+                | HTBOTTOMRIGHT
+        )
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum NativeDetachedGesture {
+    #[default]
+    Idle,
+    ClientPressed {
+        source: NativePointerSource,
+        operation: egui::Id,
+    },
+    ClientPhysicalReleased {
+        source: NativePointerSource,
+        operation: egui::Id,
+    },
+    NonClient {
+        source: NativePointerSource,
+        press_target: NativeNonClientPressTarget,
+        phase: NativeNonClientPhase,
+        scope: NativeNonClientScope,
+    },
+    NativeMediaTouch {
+        operation: egui::Id,
+        contacts: Vec<egui::Id>,
+        phase: NativeMediaTouchPhase,
+        scope: NativeMediaTouchScope,
+    },
+}
+
+impl NativeDetachedGesture {
+    fn client_operation(&self, source: NativePointerSource) -> Option<egui::Id> {
+        match *self {
+            Self::ClientPressed {
+                source: owner,
+                operation,
+            }
+            | Self::ClientPhysicalReleased {
+                source: owner,
+                operation,
+            } if owner == source => Some(operation),
+            _ => None,
+        }
+    }
+}
+
+fn native_client_input(
+    operation: egui::Id,
+    boundary: NativeClientBoundary,
+) -> NativeDetachedInputEventKind {
+    NativeDetachedInputEventKind::ClientBoundary(NativeClientInputBoundary {
+        operation,
+        boundary,
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+enum NativeDetachedInputBinding {
+    #[default]
+    Unbound,
+    Bound {
+        target: NativeDetachedInputTarget,
+        gesture: NativeDetachedGesture,
+    },
+}
+
+struct NativeDetachedInputDelivery {
+    sink: Arc<dyn Fn(NativeDetachedInputEvent) + Send + Sync>,
+    event: NativeDetachedInputEvent,
+}
+
+/// Delivery and resource destruction share the same synchronous flush boundary.
+/// In particular the last sink can own an egui Context, whose destruction may
+/// retire native input again, so it must never run under the input-state lock.
+enum NativeDetachedInputEffect {
+    Deliver(NativeDetachedInputDelivery),
+    RetireBinding(NativeDetachedInputBinding),
+    RetireTarget(NativeDetachedInputTarget),
+}
+
+fn native_input_sequence() -> u64 {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    SEQUENCE.fetch_add(1, Ordering::Relaxed)
+}
+
+impl NativeDetachedInputBinding {
+    fn delivery(
+        &self,
+        hwnd: u64,
+        epoch: &Arc<()>,
+        kind: NativeDetachedInputEventKind,
+    ) -> Option<NativeDetachedInputDelivery> {
+        let Self::Bound { target, .. } = self else {
+            return None;
+        };
+        Some(NativeDetachedInputDelivery {
+            sink: Arc::clone(&target.sink),
+            event: NativeDetachedInputEvent {
+                source: NativeDetachedInputSource {
+                    registration: target.registration,
+                    hwnd,
+                    epoch: NativeInputAllocationWitness {
+                        hwnd,
+                        epoch: Arc::downgrade(epoch),
+                        #[cfg(test)]
+                        registration: target.registration,
+                    },
+                },
+                sequence: native_input_sequence(),
+                kind,
+            },
+        })
+    }
+
+    fn cancel(&mut self, reason: NativeInputCancelReason) -> Option<NativeDetachedInputEventKind> {
+        let Self::Bound { gesture, .. } = self else {
+            return None;
+        };
+        if let NativeDetachedGesture::NativeMediaTouch { phase, .. } = gesture {
+            // Keep all contacts until their native tails drain. In particular,
+            // closing a modal must not revive an older multi-contact stream.
+            return if *phase == NativeMediaTouchPhase::ActivateOnly {
+                *phase = NativeMediaTouchPhase::Cancelled(reason);
+                Some(NativeDetachedInputEventKind::NativeMediaTouch(
+                    NativeNonClientOutcome::Cancelled(reason),
+                ))
+            } else {
+                None
+            };
+        }
+        match std::mem::take(gesture) {
+            NativeDetachedGesture::Idle => None,
+            NativeDetachedGesture::ClientPressed { operation, .. }
+            | NativeDetachedGesture::ClientPhysicalReleased { operation, .. } => Some(
+                native_client_input(operation, NativeClientBoundary::Cancelled(reason)),
+            ),
+            NativeDetachedGesture::NonClient {
+                phase: NativeNonClientPhase::CloseOwned,
+                ..
+            } => Some(NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::CloseOwned,
+            )),
+            NativeDetachedGesture::NonClient { .. } => Some(
+                NativeDetachedInputEventKind::NonClient(NativeNonClientOutcome::Cancelled(reason)),
+            ),
+            NativeDetachedGesture::NativeMediaTouch { .. } => unreachable!(),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct InstalledHwnd {
     hwnd_raw: u64,
     viewport: egui::ViewportId,
+    // This allocation stays alive in the backend-owned lease until explicit
+    // retirement. Its address also distinguishes a reused numeric HWND from
+    // callbacks/cleanup belonging to its previous native allocation.
+    subclass_owner: Arc<()>,
+    logical_registration: Option<egui::ViewportRegistration>,
+    native_detached: NativeDetachedInputBinding,
+}
+
+#[derive(Clone, Debug)]
+struct NativeInputIdentity {
+    hwnd_raw: u64,
+    viewport: egui::ViewportId,
+    subclass_owner: Arc<()>,
+}
+
+impl NativeInputIdentity {
+    fn subclass_id(&self) -> usize {
+        Arc::as_ptr(&self.subclass_owner) as usize
+    }
+}
+
+impl InstalledHwnd {
+    fn subclass_id(&self) -> usize {
+        Arc::as_ptr(&self.subclass_owner) as usize
+    }
+
+    fn identity(&self) -> NativeInputIdentity {
+        NativeInputIdentity {
+            hwnd_raw: self.hwnd_raw,
+            viewport: self.viewport,
+            subclass_owner: Arc::clone(&self.subclass_owner),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1380,8 +2245,23 @@ impl HwndViewportRegistry {
                 RegisterHwndResult::ConflictingViewport(existing.viewport)
             };
         }
-        self.entries.push(InstalledHwnd { hwnd_raw, viewport });
+        self.entries.push(InstalledHwnd {
+            hwnd_raw,
+            viewport,
+            subclass_owner: Arc::new(()),
+            logical_registration: None,
+            native_detached: NativeDetachedInputBinding::Unbound,
+        });
         RegisterHwndResult::Inserted
+    }
+
+    fn registration(&self, hwnd_raw: u64) -> Option<&InstalledHwnd> {
+        self.entries.iter().find(|entry| entry.hwnd_raw == hwnd_raw)
+    }
+
+    fn owns_subclass(&self, hwnd_raw: u64, subclass_id: usize) -> bool {
+        self.registration(hwnd_raw)
+            .is_some_and(|entry| entry.subclass_id() == subclass_id)
     }
 
     fn viewport_for_hwnd(&self, hwnd_raw: u64) -> Option<egui::ViewportId> {
@@ -1395,12 +2275,12 @@ impl HwndViewportRegistry {
         self.entries.iter().any(|entry| entry.viewport == viewport)
     }
 
-    fn remove(&mut self, hwnd_raw: u64) -> Option<egui::ViewportId> {
+    fn remove(&mut self, hwnd_raw: u64) -> Option<InstalledHwnd> {
         let index = self
             .entries
             .iter()
             .position(|entry| entry.hwnd_raw == hwnd_raw)?;
-        Some(self.entries.remove(index).viewport)
+        Some(self.entries.remove(index))
     }
 
     fn unique_viewports(&self) -> Vec<egui::ViewportId> {
@@ -1413,6 +2293,7 @@ impl HwndViewportRegistry {
         viewports
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -1506,19 +2387,6 @@ impl MaterializedSyntheticEvent {
             alt: self.modifiers.alt,
         }
     }
-
-    fn egui_event(self) -> egui::Event {
-        let key = self.key.egui_key();
-        egui::Event::Key {
-            key,
-            physical_key: Some(key),
-            pressed: self.pressed,
-            // Match egui-winit: egui derives repeat from viewport-local
-            // keys_down while processing the event stream.
-            repeat: false,
-            modifiers: self.modifiers.to_egui(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1600,6 +2468,12 @@ impl Default for SyntheticTimeline {
 }
 
 impl SyntheticTimeline {
+    fn retire_hwnd(&mut self, hwnd: u64) {
+        self.held.retain(|held| held.target.hwnd != hwnd);
+        #[cfg(all(windows, any(test, feature = "test-script")))]
+        self.pointer.retire_hwnd(hwnd);
+    }
+
     #[cfg(any(test, feature = "test-script"))]
     fn arm(&mut self) {
         *self = Self::default();
@@ -2042,6 +2916,8 @@ impl SyntheticTimeline {
 #[derive(Default)]
 struct KeyInputState {
     installed_hwnds: HwndViewportRegistry,
+    native_detached_targets: Vec<NativeDetachedInputTarget>,
+    native_detached_effects: Vec<NativeDetachedInputEffect>,
     pending: VecDeque<KeyEdge>,
     frame: Vec<KeyEdge>,
     /// Immutable delivery facts, including edges already claimed by handlers.
@@ -2052,11 +2928,47 @@ struct KeyInputState {
     return_keys: ViewportReturnKeyStates,
     logged_unregistered_hwnds: Vec<u64>,
     synthetic: SyntheticTimeline,
+    // Plugin transports outlive timeline arm/disarm. Keep their native input
+    // retirement ownership here, alongside the HWND registry and edge queues.
+    prepared_frames: Vec<Weak<Mutex<PreparedSyntheticFrame>>>,
+    synthetic_logical_gestures: Vec<SyntheticLogicalGesture>,
     #[cfg(test)]
     test_foreground_hwnd: Option<u64>,
 }
 
 impl KeyInputState {
+    fn bind_native_detached_registration(
+        &mut self,
+        hwnd: u64,
+        registration: Option<egui::ViewportRegistration>,
+    ) {
+        let target = registration.and_then(|registration| {
+            self.native_detached_targets
+                .iter()
+                .find(|target| target.registration == registration)
+                .cloned()
+        });
+        if let Some(entry) = self
+            .installed_hwnds
+            .entries
+            .iter_mut()
+            .find(|entry| entry.hwnd_raw == hwnd)
+        {
+            entry.logical_registration = registration;
+            if let Some(target) = target {
+                let retired = std::mem::replace(
+                    &mut entry.native_detached,
+                    NativeDetachedInputBinding::Bound {
+                        target,
+                        gesture: NativeDetachedGesture::Idle,
+                    },
+                );
+                self.native_detached_effects
+                    .push(NativeDetachedInputEffect::RetireBinding(retired));
+            }
+        }
+    }
+
     fn register_hwnd(&mut self, hwnd_raw: u64, viewport: egui::ViewportId) -> RegisterHwndResult {
         let result = self.installed_hwnds.register(hwnd_raw, viewport);
         if matches!(result, RegisterHwndResult::Inserted) {
@@ -2067,7 +2979,28 @@ impl KeyInputState {
     }
 
     fn unregister_hwnd(&mut self, hwnd_raw: u64) -> Option<egui::ViewportId> {
-        let viewport = self.installed_hwnds.remove(hwnd_raw)?;
+        if let Some(entry) = self
+            .installed_hwnds
+            .entries
+            .iter_mut()
+            .find(|entry| entry.hwnd_raw == hwnd_raw)
+            && let Some(kind) = entry
+                .native_detached
+                .cancel(NativeInputCancelReason::RetiredRegistration)
+            && let Some(delivery) =
+                entry
+                    .native_detached
+                    .delivery(hwnd_raw, &entry.subclass_owner, kind)
+        {
+            self.native_detached_effects
+                .push(NativeDetachedInputEffect::Deliver(delivery));
+        }
+        let removed = self.installed_hwnds.remove(hwnd_raw)?;
+        let viewport = removed.viewport;
+        self.native_detached_effects
+            .push(NativeDetachedInputEffect::RetireBinding(
+                removed.native_detached,
+            ));
         // Edges are stamped with their source HWND. Once that HWND dies, do
         // not let an edge queued before WM_NCDESTROY reach a recreated
         // viewport that happens to reuse the same ViewportId.
@@ -2075,17 +3008,189 @@ impl KeyInputState {
         self.frame.retain(|edge| edge.source_hwnd != hwnd_raw);
         self.operation_frame
             .retain(|edge| edge.source_hwnd != hwnd_raw);
+        self.synthetic.retire_hwnd(hwnd_raw);
+        self.retire_prepared_hwnd(hwnd_raw, viewport);
+        for gesture in &mut self.synthetic_logical_gestures {
+            if let SyntheticLogicalGesture::Held {
+                source,
+                registration,
+                input,
+            } = *gesture
+                && source.hwnd == hwnd_raw
+            {
+                *gesture = SyntheticLogicalGesture::Releasing {
+                    source,
+                    registration,
+                    input,
+                };
+            }
+        }
         if !self.installed_hwnds.contains_viewport(viewport) {
             self.return_keys.clear_viewport(viewport);
-        }
-        if self.installed_hwnds.is_empty() {
-            self.pending.clear();
-            self.frame.clear();
-            self.operation_frame.clear();
-            self.frame_active_viewports.clear();
-            self.return_keys.clear();
+            self.frame_active_viewports
+                .retain(|active| *active != viewport);
         }
         Some(viewport)
+    }
+
+    fn retire_prepared_hwnd(&mut self, hwnd: u64, viewport: egui::ViewportId) {
+        let final_modifiers = self.synthetic.modifiers().to_egui();
+        self.prepared_frames.retain(|weak| {
+            let Some(prepared) = weak.upgrade() else {
+                return false;
+            };
+            if let Ok(mut frame) = prepared.lock() {
+                frame.batches.retain(|batch| batch.target.hwnd != hwnd);
+                frame
+                    .hold_attributions
+                    .retain(|(target, _)| *target != viewport);
+                frame.final_modifiers = final_modifiers;
+                #[cfg(all(windows, any(test, feature = "test-script")))]
+                if matches!(
+                    &frame.pointer_delivery,
+                    PreparedSyntheticPointerDelivery::Pending(pointer)
+                        | PreparedSyntheticPointerDelivery::Delivered(pointer)
+                        if pointer.step.latch.owner.identity.hwnd() == hwnd
+                ) {
+                    frame.pointer_delivery = PreparedSyntheticPointerDelivery::Absent;
+                }
+            }
+            true
+        });
+    }
+
+    fn record_synthetic_logical_input(
+        &mut self,
+        source: SyntheticRoutingTarget,
+        registration: egui::ViewportRegistration,
+        input: SyntheticLogicalInput,
+        pressed: bool,
+    ) {
+        self.synthetic_logical_gestures.retain(|gesture| {
+            !matches!(gesture, SyntheticLogicalGesture::Held { source: held_source, registration: held_registration, input: held_input }
+                if *held_source == source && *held_registration == registration && held_input.same_slot(input))
+        });
+        if pressed {
+            self.synthetic_logical_gestures
+                .push(SyntheticLogicalGesture::Held {
+                    source,
+                    registration,
+                    input,
+                });
+        }
+    }
+
+    fn take_synthetic_logical_terminations(
+        &mut self,
+        viewport: egui::ViewportId,
+        mut registration_is_live: impl FnMut(egui::ViewportRegistration) -> bool,
+    ) -> Vec<(egui::ViewportRegistration, SyntheticLogicalInput)> {
+        let mut terminations = Vec::new();
+        self.synthetic_logical_gestures.retain(|gesture| {
+            match *gesture {
+                SyntheticLogicalGesture::Releasing {
+                    source,
+                    registration,
+                    input,
+                } => {
+                    if !registration_is_live(registration) {
+                        return false;
+                    }
+                    if source.viewport != viewport {
+                        return true;
+                    }
+                    terminations.push((registration, input));
+                    return false;
+                }
+                _ => {}
+            }
+            true
+        });
+        terminations
+    }
+
+    fn relinquish_synthetic_pointer(&mut self, viewport: egui::ViewportId) {
+        for gesture in &mut self.synthetic_logical_gestures {
+            if let SyntheticLogicalGesture::Held {
+                source,
+                registration,
+                input: input @ SyntheticLogicalInput::Primary { .. },
+            } = *gesture
+                && source.viewport == viewport
+            {
+                *gesture = SyntheticLogicalGesture::Releasing {
+                    source,
+                    registration,
+                    input,
+                };
+            }
+        }
+    }
+
+    fn relinquish_synthetic_keys(
+        &mut self,
+        registration: egui::ViewportRegistration,
+        keys: &[egui::Key],
+    ) {
+        for gesture in &mut self.synthetic_logical_gestures {
+            if let SyntheticLogicalGesture::Held {
+                source,
+                registration: held_registration,
+                input: input @ SyntheticLogicalInput::Key { key, .. },
+            } = *gesture
+                && held_registration == registration
+                && keys.contains(&key)
+            {
+                // Finish the old level before the incoming physical Down. Its
+                // owner is consumed in this hook, never on a later retirement.
+                *gesture = SyntheticLogicalGesture::Releasing {
+                    source,
+                    registration,
+                    input,
+                };
+            }
+        }
+    }
+
+    fn admit_synthetic_key(
+        &mut self,
+        source: SyntheticRoutingTarget,
+        registration: egui::ViewportRegistration,
+        event: &PreparedSyntheticKey,
+        key_down_before: bool,
+    ) -> bool {
+        let input = SyntheticLogicalInput::Key {
+            key: event.key,
+            physical_key: event.physical_key,
+        };
+        let owned = self.synthetic_logical_gestures.iter().any(|gesture| {
+            matches!(gesture, SyntheticLogicalGesture::Held {
+                source: held_source, registration: held_registration, input: held_input,
+            } if *held_source == source && *held_registration == registration && held_input.same_slot(input))
+        });
+        match event.phase {
+            SyntheticKeyPhase::Repeat => owned,
+            SyntheticKeyPhase::Down if owned || !key_down_before => {
+                self.record_synthetic_logical_input(source, registration, input, true);
+                true
+            }
+            SyntheticKeyPhase::Up if owned => {
+                self.record_synthetic_logical_input(source, registration, input, false);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn unregister_subclass(
+        &mut self,
+        hwnd_raw: u64,
+        subclass_id: usize,
+    ) -> Option<egui::ViewportId> {
+        if !self.installed_hwnds.owns_subclass(hwnd_raw, subclass_id) {
+            return None;
+        }
+        self.unregister_hwnd(hwnd_raw)
     }
 
     fn stamp_key_edge(&mut self, mut edge: KeyEdge) -> KeyEdge {
@@ -2278,8 +3383,92 @@ impl From<Option<f64>> for RawInputTimeKey {
 
 #[derive(Clone, Debug)]
 struct SyntheticViewportBatch {
-    viewport: egui::ViewportId,
-    events: Vec<egui::Event>,
+    target: SyntheticRoutingTarget,
+    events: Vec<PreparedSyntheticKey>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SyntheticKeyPhase {
+    Down,
+    Repeat,
+    Up,
+}
+
+/// Keep the producer's phase until delivery. egui derives its own repeat flag,
+/// which cannot establish or restore synthetic release authority.
+#[derive(Clone, Debug, PartialEq)]
+struct PreparedSyntheticKey {
+    key: egui::Key,
+    physical_key: Option<egui::Key>,
+    modifiers: egui::Modifiers,
+    phase: SyntheticKeyPhase,
+}
+
+impl From<MaterializedSyntheticEvent> for PreparedSyntheticKey {
+    fn from(event: MaterializedSyntheticEvent) -> Self {
+        Self {
+            key: event.key.egui_key(),
+            physical_key: Some(event.key.egui_key()),
+            modifiers: event.modifiers.to_egui(),
+            phase: if !event.pressed {
+                SyntheticKeyPhase::Up
+            } else if event.repeat {
+                SyntheticKeyPhase::Repeat
+            } else {
+                SyntheticKeyPhase::Down
+            },
+        }
+    }
+}
+
+impl PreparedSyntheticKey {
+    fn egui_event(&self) -> egui::Event {
+        egui::Event::Key {
+            key: self.key,
+            physical_key: self.physical_key,
+            pressed: self.phase != SyntheticKeyPhase::Up,
+            repeat: false,
+            modifiers: self.modifiers,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SyntheticLogicalInput {
+    Key {
+        key: egui::Key,
+        physical_key: Option<egui::Key>,
+    },
+    Primary {
+        owner: egui::Id,
+    },
+}
+
+impl SyntheticLogicalInput {
+    fn same_slot(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Key { key: left, .. }, Self::Key { key: right, .. }) => left == right,
+            (Self::Primary { .. }, Self::Primary { .. }) => true,
+            _ => false,
+        }
+    }
+}
+
+/// Only a synthetic Down actually delivered to egui owns a logical release.
+/// Native retirement changes that ownership into a terminal transport, rather
+/// than clearing unrelated physical keys, pointer state, text or IME state.
+#[derive(Clone, Copy, Debug)]
+enum SyntheticLogicalGesture {
+    Held {
+        source: SyntheticRoutingTarget,
+        registration: egui::ViewportRegistration,
+        input: SyntheticLogicalInput,
+    },
+    Releasing {
+        source: SyntheticRoutingTarget,
+        registration: egui::ViewportRegistration,
+        input: SyntheticLogicalInput,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -2311,7 +3500,7 @@ enum PreparedSyntheticPointerDelivery {
 
 #[derive(Default)]
 struct SyntheticInputPlugin {
-    prepared: Option<PreparedSyntheticFrame>,
+    prepared: Option<Arc<Mutex<PreparedSyntheticFrame>>>,
     issues: VecDeque<SyntheticInputIssue>,
     next_frame_nr: u64,
 }
@@ -2327,19 +3516,25 @@ impl SyntheticInputPlugin {
     fn record_undelivered_previous_frame(&mut self) {
         // Clone the immutable one-frame transport before recording issues, because issue
         // recording mutates the plugin queue.
-        let Some(prepared) = self.prepared.clone() else {
+        let Some(prepared) = self
+            .prepared
+            .as_ref()
+            .and_then(|prepared| prepared.lock().ok().map(|frame| frame.clone()))
+        else {
             return;
         };
         let misses: Vec<_> = prepared
             .batches
             .iter()
             .filter(|batch| {
-                batch.viewport != egui::ViewportId::ROOT
+                batch.target.viewport != egui::ViewportId::ROOT
                     && !batch.events.is_empty()
-                    && !prepared.delivered_viewports.contains(&batch.viewport)
+                    && !prepared
+                        .delivered_viewports
+                        .contains(&batch.target.viewport)
             })
             .map(|batch| SyntheticInputIssue::TargetViewportNotRendered {
-                viewport: batch.viewport,
+                viewport: batch.target.viewport,
                 raw_input_time: prepared.raw_input_time,
                 event_count: batch.events.len(),
             })
@@ -2388,11 +3583,11 @@ impl SyntheticInputPlugin {
 
     fn prepare_root(&mut self, input: &egui::RawInput) {
         let time_key = RawInputTimeKey::from(input.time);
-        if self
-            .prepared
-            .as_ref()
-            .is_some_and(|prepared| prepared.time_key == time_key)
-        {
+        if self.prepared.as_ref().is_some_and(|prepared| {
+            prepared
+                .lock()
+                .is_ok_and(|frame| frame.time_key == time_key)
+        }) {
             return;
         }
 
@@ -2440,23 +3635,23 @@ impl SyntheticInputPlugin {
 
         let mut batches: Vec<SyntheticViewportBatch> = Vec::new();
         for event in materialized.events {
-            let egui_event = event.egui_event();
+            let prepared_event = PreparedSyntheticKey::from(event);
             if let Some(batch) = batches
                 .iter_mut()
-                .find(|batch| batch.viewport == event.target.viewport)
+                .find(|batch| batch.target == event.target)
             {
-                batch.events.push(egui_event);
+                batch.events.push(prepared_event);
             } else {
                 batches.push(SyntheticViewportBatch {
-                    viewport: event.target.viewport,
-                    events: vec![egui_event],
+                    target: event.target,
+                    events: vec![prepared_event],
                 });
             }
         }
         if let Some(issue) = materialized.issue {
             self.record_issue(issue);
         }
-        self.prepared = Some(PreparedSyntheticFrame {
+        let prepared = Arc::new(Mutex::new(PreparedSyntheticFrame {
             frame_nr,
             time_key,
             raw_input_time: input.time,
@@ -2478,11 +3673,22 @@ impl SyntheticInputPlugin {
                     })
                 })
                 .unwrap_or(PreparedSyntheticPointerDelivery::Absent),
-        });
+        }));
+        if let Ok(mut guard) = state().lock() {
+            guard
+                .prepared_frames
+                .retain(|frame| frame.strong_count() != 0);
+            guard.prepared_frames.push(Arc::downgrade(&prepared));
+        }
+        self.prepared = Some(prepared);
     }
 
     fn inject_prepared(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
-        let Some(prepared) = self.prepared.as_mut() else {
+        let Some(prepared) = self
+            .prepared
+            .as_ref()
+            .and_then(|frame| frame.lock().ok().map(|prepared| prepared.clone()))
+        else {
             return;
         };
         if !prepared.armed {
@@ -2504,16 +3710,42 @@ impl SyntheticInputPlugin {
         let Some(batch) = prepared
             .batches
             .iter()
-            .find(|batch| batch.viewport == input.viewport_id)
+            .find(|batch| batch.target.viewport == input.viewport_id)
         else {
             append_modifiers(&mut input.events, prepared.final_modifiers);
             return;
         };
+        let Some(registration) = ctx.viewport_registration(input.viewport_id) else {
+            return;
+        };
+        let mut admitted = Vec::new();
         for event in &batch.events {
-            if let egui::Event::Key { modifiers, .. } = event {
-                append_modifiers(&mut input.events, *modifiers);
+            let key_down_before = input.events.iter().fold(
+                ctx.input_for(input.viewport_id, |state| state.key_down(event.key)),
+                |down, existing| match existing {
+                    egui::Event::Key { key, pressed, .. } if *key == event.key => *pressed,
+                    _ => down,
+                },
+            );
+            let deliver = state().lock().is_ok_and(|mut guard| {
+                guard.admit_synthetic_key(batch.target, registration, event, key_down_before)
+            });
+            if deliver {
+                append_modifiers(&mut input.events, event.modifiers);
+                input.events.push(event.egui_event());
+                admitted.push(event);
             }
-            input.events.push(event.clone());
+        }
+        // Admission belongs to this one-frame transport. A discard replay must
+        // not reacquire a key whose physical input was present only in pass one.
+        if admitted.len() != batch.events.len()
+            && let Some(mut frame) = self.prepared.as_ref().and_then(|frame| frame.lock().ok())
+            && let Some(batch) = frame
+                .batches
+                .iter_mut()
+                .find(|cached| cached.target == batch.target)
+        {
+            batch.events = admitted.iter().map(|event| (*event).clone()).collect();
         }
         append_modifiers(&mut input.events, prepared.final_modifiers);
         if !prepared.delivered_viewports.contains(&input.viewport_id) {
@@ -2521,14 +3753,14 @@ impl SyntheticInputPlugin {
             if crate::test_script::release_checks::is_active() {
                 let hwnd = eframe::miv_test_script_window_witness::latest(input.viewport_id)
                     .map(|w| w.hwnd());
-                for event in &batch.events {
+                for event in admitted {
                     if let egui::Event::Key {
                         key,
                         pressed,
                         repeat,
                         modifiers,
                         ..
-                    } = event
+                    } = event.egui_event()
                     {
                         let name = match key {
                             egui::Key::ArrowDown => "Down",
@@ -2545,8 +3777,81 @@ impl SyntheticInputPlugin {
                     }
                 }
             }
-            prepared.delivered_viewports.push(input.viewport_id);
+            if let Some(mut frame) = self.prepared.as_ref().and_then(|frame| frame.lock().ok()) {
+                frame.delivered_viewports.push(input.viewport_id);
+            }
         }
+    }
+
+    fn hand_off_keys_to_physical_input(&mut self, ctx: &egui::Context, input: &egui::RawInput) {
+        let keys: Vec<_> = input
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Key {
+                    key, pressed: true, ..
+                } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        let Some(registration) = ctx.viewport_registration(input.viewport_id) else {
+            return;
+        };
+        if let Ok(mut guard) = state().lock() {
+            guard.relinquish_synthetic_keys(registration, &keys);
+        }
+        if let Some(mut frame) = self.prepared.as_ref().and_then(|frame| frame.lock().ok()) {
+            for batch in &mut frame.batches {
+                if batch.target.viewport == input.viewport_id {
+                    batch.events.retain(|event| !keys.contains(&event.key));
+                }
+            }
+        }
+    }
+
+    fn inject_logical_releases(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        let modifiers = input.events.iter().fold(
+            ctx.input_for(input.viewport_id, |state| state.modifiers),
+            |current, event| match event {
+                egui::Event::ModifiersChanged(modifiers) => *modifiers,
+                _ => current,
+            },
+        );
+        let terminations = state()
+            .lock()
+            .map(|mut guard| {
+                guard.take_synthetic_logical_terminations(input.viewport_id, |registration| {
+                    ctx.viewport_registration(registration.viewport_id()) == Some(registration)
+                })
+            })
+            .unwrap_or_default();
+        let mut releases = Vec::new();
+        for (registration, termination) in terminations {
+            match termination {
+                SyntheticLogicalInput::Key { key, physical_key } => {
+                    releases.push(egui::Event::Key {
+                        key,
+                        physical_key,
+                        pressed: false,
+                        repeat: false,
+                        modifiers,
+                    })
+                }
+                SyntheticLogicalInput::Primary { owner } => {
+                    ctx.cancel_pointer_button_for(
+                        registration,
+                        egui::PointerButton::Primary,
+                        owner,
+                    );
+                }
+            }
+        }
+        // End the previous synthetic ownership before this allocation's native
+        // input. A new press of the same key/button remains a new press.
+        input.events.splice(0..0, releases);
     }
 
     #[cfg(all(windows, any(test, feature = "test-script")))]
@@ -2556,6 +3861,7 @@ impl SyntheticInputPlugin {
                 event,
                 egui::Event::PointerMoved(_)
                     | egui::Event::PointerButton { .. }
+                    | egui::Event::PointerButtonReleased { .. }
                     | egui::Event::PointerGone
             )
         });
@@ -2563,6 +3869,7 @@ impl SyntheticInputPlugin {
             return;
         }
         let handle = state().lock().ok().and_then(|mut guard| {
+            guard.relinquish_synthetic_pointer(input.viewport_id);
             guard
                 .synthetic
                 .pointer
@@ -2574,15 +3881,16 @@ impl SyntheticInputPlugin {
     }
 
     #[cfg(all(windows, any(test, feature = "test-script")))]
-    fn inject_prepared_pointer(&mut self, input: &mut egui::RawInput) {
-        let Some(pointer) =
-            self.prepared
-                .as_ref()
-                .and_then(|frame| match &frame.pointer_delivery {
-                    PreparedSyntheticPointerDelivery::Pending(pointer) => Some(pointer.clone()),
-                    PreparedSyntheticPointerDelivery::Absent
-                    | PreparedSyntheticPointerDelivery::Delivered(_) => None,
-                })
+    fn inject_prepared_pointer(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        let Some(pointer) = self
+            .prepared
+            .as_ref()
+            .and_then(|frame| frame.lock().ok())
+            .and_then(|frame| match &frame.pointer_delivery {
+                PreparedSyntheticPointerDelivery::Pending(pointer) => Some(pointer.clone()),
+                PreparedSyntheticPointerDelivery::Absent
+                | PreparedSyntheticPointerDelivery::Delivered(_) => None,
+            })
         else {
             return;
         };
@@ -2601,6 +3909,26 @@ impl SyntheticInputPlugin {
                     .identity
                     .matches_backend_witness(witness)
             });
+        // A synthetic gesture acquires an otherwise idle pointer. Without
+        // this ownership boundary a pre-existing physical button would share
+        // egui's single widget capture with the synthetic primary button.
+        if owner_matches
+            && witness_matches
+            && input.time.is_some()
+            && matches!(pointer.step.kind, SyntheticPointerStepKind::Down { .. })
+            && ctx.input_for(input.viewport_id, |input| input.pointer.any_down())
+        {
+            let handle = state().lock().ok().and_then(|mut guard| {
+                guard
+                    .synthetic
+                    .pointer
+                    .fail_physical_input_mixed(input.viewport_id)
+            });
+            if let Some(handle) = handle {
+                self.record_issue(SyntheticInputIssue::PointerPhysicalInputMixed { handle });
+            }
+            return;
+        }
         let rejection = if !owner_matches || !witness_matches {
             Some("prepared pointer did not join the active lexical child show".to_string())
         } else if input.time.is_none() {
@@ -2634,8 +3962,26 @@ impl SyntheticInputPlugin {
             PreparedPointerDeliveryDisposition::Delivered => {}
         }
         input.events.extend(pointer.step.egui_events());
+        if let Some(registration) = ctx.viewport_registration(input.viewport_id)
+            && let Ok(mut guard) = state().lock()
+        {
+            guard.record_synthetic_logical_input(
+                SyntheticRoutingTarget {
+                    hwnd: pointer.step.latch.owner.identity.hwnd(),
+                    viewport: input.viewport_id,
+                },
+                registration,
+                SyntheticLogicalInput::Primary {
+                    owner: pointer.step.latch.widget_id,
+                },
+                matches!(
+                    pointer.step.kind,
+                    SyntheticPointerStepKind::Down { .. } | SyntheticPointerStepKind::Move { .. }
+                ),
+            );
+        }
         crate::test_script::pointer_input::record_delivery_proof(&pointer, input);
-        if let Some(prepared_frame) = self.prepared.as_mut()
+        if let Some(mut prepared_frame) = self.prepared.as_ref().and_then(|frame| frame.lock().ok())
             && matches!(
                 &prepared_frame.pointer_delivery,
                 PreparedSyntheticPointerDelivery::Pending(cached) if cached.same_payload(&pointer)
@@ -2737,9 +4083,11 @@ impl egui::Plugin for SyntheticInputPlugin {
         }
         #[cfg(all(windows, any(test, feature = "test-script")))]
         self.reject_physical_pointer_mix(input);
+        self.hand_off_keys_to_physical_input(ctx, input);
+        self.inject_logical_releases(ctx, input);
         self.inject_prepared(ctx, input);
         #[cfg(all(windows, any(test, feature = "test-script")))]
-        self.inject_prepared_pointer(input);
+        self.inject_prepared_pointer(ctx, input);
         #[cfg(all(windows, feature = "test-script"))]
         crate::test_script::append_widget_click_events(input);
     }
@@ -3067,6 +4415,7 @@ pub(crate) fn synthetic_hold_observations(ctx: &egui::Context) -> Vec<SyntheticH
             plugin
                 .prepared
                 .as_ref()
+                .and_then(|prepared| prepared.lock().ok())
                 .map(|prepared| (prepared.frame_nr, prepared.armed))
         })
         .flatten()
@@ -3114,9 +4463,10 @@ pub(crate) fn synthetic_frame_hold_id(
             plugin
                 .prepared
                 .as_ref()
+                .and_then(|prepared| prepared.lock().ok())
                 .into_iter()
-                .flat_map(|prepared| prepared.hold_attributions.iter())
-                .filter_map(|(target, hold_id)| (*target == viewport).then_some(*hold_id))
+                .flat_map(|prepared| prepared.hold_attributions.clone())
+                .filter_map(|(target, hold_id)| (target == viewport).then_some(hold_id))
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
@@ -3367,53 +4717,192 @@ pub fn disarm_synthetic_input() {
     }
 }
 
+#[cfg(test)]
 pub fn install_main_window_subclass(hwnd_raw: u64) -> bool {
     install_window_subclass(hwnd_raw, egui::ViewportId::ROOT, "main")
 }
 
+#[cfg(test)]
 pub fn install_viewport_window_subclass(hwnd_raw: u64, viewport: egui::ViewportId) -> bool {
     install_window_subclass(hwnd_raw, viewport, "viewport")
 }
 
+#[cfg(test)]
 fn install_window_subclass(hwnd_raw: u64, viewport: egui::ViewportId, label: &'static str) -> bool {
-    if hwnd_raw == 0 {
-        return false;
+    match install_window_input(hwnd_raw, viewport, None) {
+        Ok(_) => true,
+        Err(error) => {
+            crate::logger::log(format!("key-input: {label}: {error}"));
+            false
+        }
     }
-    let registration = match state().lock() {
-        Ok(mut guard) => guard.register_hwnd(hwnd_raw, viewport),
-        Err(_) => return false,
-    };
-    match registration {
-        RegisterHwndResult::AlreadyRegistered => return true,
+}
+
+fn install_window_input(
+    hwnd_raw: u64,
+    viewport: egui::ViewportId,
+    logical_registration: Option<egui::ViewportRegistration>,
+) -> Result<Option<NativeInputIdentity>, String> {
+    if hwnd_raw == 0 {
+        return Err("cannot install key input on a null HWND".into());
+    }
+    let mut guard = state()
+        .lock()
+        .map_err(|_| "key input state poisoned".to_string())?;
+    match guard.register_hwnd(hwnd_raw, viewport) {
+        RegisterHwndResult::AlreadyRegistered => return Ok(None),
         RegisterHwndResult::ConflictingViewport(existing) => {
-            crate::logger::log(format!(
-                "key-input: HWND registration conflict label={label} hwnd=0x{hwnd_raw:x} \
+            return Err(format!(
+                "HWND registration conflict hwnd=0x{hwnd_raw:x} \
                  existing_viewport={existing:?} requested_viewport={viewport:?}"
             ));
-            return false;
         }
         RegisterHwndResult::Inserted => {}
     }
+    guard.bind_native_detached_registration(hwnd_raw, logical_registration);
+    let registration = guard
+        .installed_hwnds
+        .registration(hwnd_raw)
+        .expect("inserted input registration")
+        .identity();
+    drop(guard);
+    dispatch_native_detached_input();
     let hwnd = HWND(hwnd_raw as *mut _);
     let ok = unsafe {
         SetWindowSubclass(
             hwnd,
             Some(main_key_input_subclass_proc),
-            MAIN_KEY_INPUT_SUBCLASS_ID,
+            registration.subclass_id(),
             0,
         )
         .as_bool()
     };
     if !ok {
         if let Ok(mut guard) = state().lock() {
-            guard.unregister_hwnd(hwnd_raw);
+            guard.unregister_subclass(hwnd_raw, registration.subclass_id());
         }
-        crate::logger::log(format!(
-            "key-input: SetWindowSubclass failed label={label} hwnd=0x{hwnd_raw:x} \
+        dispatch_native_detached_input();
+        return Err(format!(
+            "SetWindowSubclass failed hwnd=0x{hwnd_raw:x} \
              viewport={viewport:?}"
         ));
     }
-    ok
+    Ok(Some(registration))
+}
+
+/// The backend owns one of these leases for each native allocation. A lease is
+/// explicitly retired while the old HWND still exists, before publishing its
+/// successor; WM_NCDESTROY is only an additional terminal path.
+enum NativeKeyInputLease {
+    Installed(NativeInputIdentity),
+    Retired,
+}
+
+impl NativeKeyInputLease {
+    fn retire_with(&mut self, remove: impl FnOnce(&NativeInputIdentity) -> bool) {
+        let Self::Installed(registration) = std::mem::replace(self, Self::Retired) else {
+            return;
+        };
+        let owns_subclass = state().lock().map(|guard| {
+            guard
+                .installed_hwnds
+                .owns_subclass(registration.hwnd_raw, registration.subclass_id())
+        });
+        match owns_subclass {
+            Ok(false) => return, // NCDESTROY already retired this exact allocation.
+            Err(_) => {
+                report_native_window_input_failure(
+                    "key input state poisoned during retirement".into(),
+                );
+                return;
+            }
+            Ok(true) => {}
+        }
+        if !remove(&registration) {
+            report_native_window_input_failure(format!(
+                "RemoveWindowSubclass failed hwnd=0x{:x} viewport={:?}",
+                registration.hwnd_raw, registration.viewport,
+            ));
+        }
+        // Even a rare native removal failure must withdraw the old input
+        // owner. Its exact subclass ID can never publish into a successor.
+        match state().lock() {
+            Ok(mut guard) => {
+                guard.unregister_subclass(registration.hwnd_raw, registration.subclass_id());
+            }
+            Err(_) => report_native_window_input_failure(
+                "key input state poisoned during retirement".into(),
+            ),
+        }
+        dispatch_native_detached_input();
+    }
+}
+
+impl eframe::native_window_input::NativeWindowInputLease for NativeKeyInputLease {
+    fn retire(&mut self) {
+        self.retire_with(|registration| unsafe {
+            RemoveWindowSubclass(
+                HWND(registration.hwnd_raw as *mut _),
+                Some(main_key_input_subclass_proc),
+                registration.subclass_id(),
+            )
+            .as_bool()
+        });
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct NativeKeyInputListener;
+
+impl eframe::native_window_input::NativeWindowInputListener for NativeKeyInputListener {
+    fn install(
+        &self,
+        allocation: eframe::native_window_input::NativeWindowAllocation,
+    ) -> Result<Box<dyn eframe::native_window_input::NativeWindowInputLease>, String> {
+        let result = allocation
+            .windows_hwnd
+            .ok_or_else(|| "native window allocation has no Windows HWND".to_string())
+            .and_then(|hwnd| {
+                install_window_input(
+                    hwnd as u64,
+                    allocation.viewport_id,
+                    Some(allocation.registration),
+                )
+            })
+            .and_then(|registration| {
+                registration.ok_or_else(|| {
+                    "native window allocation already has a key input owner".to_string()
+                })
+            });
+        match result {
+            Ok(registration) => Ok(Box::new(NativeKeyInputLease::Installed(registration))),
+            Err(error) => {
+                report_native_window_input_failure(error.clone());
+                Err(error)
+            }
+        }
+    }
+}
+
+fn native_window_input_failures() -> &'static Mutex<Vec<String>> {
+    static FAILURES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub(crate) fn report_native_window_input_failure(error: String) {
+    crate::logger::log(format!("key-input: {error}"));
+    if let Ok(mut failures) = native_window_input_failures().lock() {
+        failures.push(error);
+    }
+}
+
+/// Drain on the App's normal update path into its existing error feedback.
+/// Native backend hooks never enter App or acquire its UI/plugin state.
+pub(crate) fn take_native_window_input_failures() -> Vec<String> {
+    native_window_input_failures()
+        .lock()
+        .map(|mut failures| std::mem::take(&mut *failures))
+        .unwrap_or_default()
 }
 
 pub fn begin_frame() {
@@ -3805,9 +5294,11 @@ pub fn advance_test_synthetic_input(now: Instant) {
 
 #[cfg(test)]
 pub fn clear_test_synthetic_input() {
-    if let Ok(mut guard) = state().lock() {
-        *guard = KeyInputState::default();
-    }
+    let retired = state()
+        .lock()
+        .ok()
+        .map(|mut guard| std::mem::take(&mut *guard));
+    drop(retired);
 }
 
 #[cfg(test)]
@@ -3842,7 +5333,9 @@ fn reset_test_input_state() {
         state().clear_poison();
         poisoned.into_inner()
     });
-    *guard = KeyInputState::default();
+    let retired = std::mem::take(&mut *guard);
+    drop(guard);
+    drop(retired);
 }
 
 /// Serialization token for one input test. See [`lock_test_input`].
@@ -3964,10 +5457,1030 @@ pub fn routed_return_key_held(viewport: egui::ViewportId, extended: bool) -> Opt
         .and_then(|guard| guard.routed_return_key_held(viewport, extended))
 }
 
-fn push_edge(hwnd_raw: u64, raw: RawKeyEdge) {
+/// Logical targets can be published before their native allocation is created.
+/// Updating a sink for the same registration keeps its gesture; removing or
+/// blocking that owner terminates it synchronously.
+pub(crate) fn set_native_detached_input_targets(targets: Vec<NativeDetachedInputTarget>) {
+    if let Ok(mut guard) = state().lock() {
+        let mut deliveries = Vec::new();
+        let mut retired = Vec::new();
+        for entry in &mut guard.installed_hwnds.entries {
+            let target = entry.logical_registration.and_then(|registration| {
+                targets
+                    .iter()
+                    .find(|target| target.registration == registration)
+                    .cloned()
+            });
+            let same_owner = matches!((&entry.native_detached, &target),
+                (NativeDetachedInputBinding::Bound { target: old, .. }, Some(new))
+                    if old.registration == new.registration && old.kind == new.kind);
+            if !same_owner
+                || target
+                    .as_ref()
+                    .is_some_and(|target| target.availability == NativeTargetAvailability::Blocked)
+            {
+                let reason = if same_owner {
+                    NativeInputCancelReason::ModalOwned
+                } else {
+                    NativeInputCancelReason::RetiredRegistration
+                };
+                if let Some(kind) = entry.native_detached.cancel(reason)
+                    && let Some(delivery) =
+                        entry
+                            .native_detached
+                            .delivery(entry.hwnd_raw, &entry.subclass_owner, kind)
+                {
+                    deliveries.push(delivery);
+                }
+            }
+            match (&mut entry.native_detached, target) {
+                (
+                    NativeDetachedInputBinding::Bound {
+                        target: old,
+                        gesture,
+                    },
+                    Some(mut new),
+                ) if same_owner => {
+                    if *gesture != NativeDetachedGesture::Idle {
+                        // The sink captures window/context ownership at press.
+                        // A newer view is only the sink for the next operation.
+                        // Move the unused reference into RetireTarget as well;
+                        // every sink reference is released at the outside-lock
+                        // flush, even while a held operation keeps its old sink.
+                        std::mem::swap(&mut new.sink, &mut old.sink);
+                    }
+                    retired.push(NativeDetachedInputEffect::RetireTarget(std::mem::replace(
+                        old, new,
+                    )));
+                }
+                (binding, Some(target)) => {
+                    retired.push(NativeDetachedInputEffect::RetireBinding(std::mem::replace(
+                        binding,
+                        NativeDetachedInputBinding::Bound {
+                            target,
+                            gesture: NativeDetachedGesture::Idle,
+                        },
+                    )));
+                }
+                (binding, None) => retired.push(NativeDetachedInputEffect::RetireBinding(
+                    std::mem::take(binding),
+                )),
+            }
+        }
+        retired.extend(
+            std::mem::replace(&mut guard.native_detached_targets, targets)
+                .into_iter()
+                .map(NativeDetachedInputEffect::RetireTarget),
+        );
+        guard.native_detached_effects.extend(
+            deliveries
+                .into_iter()
+                .map(NativeDetachedInputEffect::Deliver),
+        );
+        guard.native_detached_effects.extend(retired);
+    }
+    dispatch_native_detached_input();
+}
+
+/// Terminal retirement of one logical owner, independently of native allocation
+/// replacement. Sibling registrations and their in-flight gestures stay intact.
+pub(crate) fn retire_native_detached_input_target(registration: egui::ViewportRegistration) {
+    let mut discarded = Vec::new();
+    if let Ok(mut guard) = state().lock() {
+        for effect in std::mem::take(&mut guard.native_detached_effects) {
+            if matches!(&effect, NativeDetachedInputEffect::Deliver(delivery) if delivery.event.source.registration == registration)
+            {
+                // An already queued completion cannot outlive its logical owner.
+                discarded.push(effect);
+            } else {
+                guard.native_detached_effects.push(effect);
+            }
+        }
+        let mut retired = Vec::new();
+        for target in std::mem::take(&mut guard.native_detached_targets) {
+            if target.registration == registration {
+                retired.push(NativeDetachedInputEffect::RetireTarget(target));
+            } else {
+                guard.native_detached_targets.push(target);
+            }
+        }
+        let mut deliveries = Vec::new();
+        for entry in &mut guard.installed_hwnds.entries {
+            if !matches!(&entry.native_detached, NativeDetachedInputBinding::Bound { target, .. } if target.registration == registration)
+            {
+                continue;
+            }
+            if let Some(kind) = entry
+                .native_detached
+                .cancel(NativeInputCancelReason::RetiredRegistration)
+                && let Some(delivery) =
+                    entry
+                        .native_detached
+                        .delivery(entry.hwnd_raw, &entry.subclass_owner, kind)
+            {
+                deliveries.push(delivery);
+            }
+            retired.push(NativeDetachedInputEffect::RetireBinding(std::mem::take(
+                &mut entry.native_detached,
+            )));
+        }
+        guard.native_detached_effects.extend(
+            deliveries
+                .into_iter()
+                .map(NativeDetachedInputEffect::Deliver),
+        );
+        guard.native_detached_effects.extend(retired);
+    }
+    // Both discarded deliveries and last sink/Context references are destroyed
+    // only after releasing the global input owner.
+    drop(discarded);
+    dispatch_native_detached_input();
+}
+
+fn dispatch_native_detached_input() {
+    let effects = state()
+        .lock()
+        .ok()
+        .map(|mut guard| std::mem::take(&mut guard.native_detached_effects))
+        .unwrap_or_default();
+    // Native hooks never acquire App or egui locks. A sink only appends to the
+    // existing event transport; invoke it outside the input-owner lock as well.
+    for effect in effects {
+        match effect {
+            NativeDetachedInputEffect::Deliver(delivery) => (delivery.sink)(delivery.event),
+            NativeDetachedInputEffect::RetireBinding(binding) => drop(binding),
+            NativeDetachedInputEffect::RetireTarget(target) => drop(target),
+        }
+    }
+}
+
+/// Claims only a native presenter canvas contact. HUD contacts join the same
+/// physical group as command owners, so another finger cannot resume a parked
+/// window after the original activation contact has ended.
+pub(crate) fn begin_native_media_touch(
+    allocation: &NativeInputAllocationWitness,
+    contact: egui::Id,
+    source_epoch: Arc<AtomicU64>,
+    input_epoch: Arc<AtomicU64>,
+    expected_input_epoch: u64,
+    output_cancel: Arc<AtomicBool>,
+    canvas: bool,
+    only_contact_in_receiver: bool,
+) -> NativeMediaTouchRoute {
+    let mut route = NativeMediaTouchRoute::Regular;
+    let host = allocation.hwnd;
+    let scope = NativeMediaTouchScope {
+        expected_source_epoch: source_epoch.load(Ordering::Acquire),
+        source_epoch,
+        input_epoch,
+        expected_input_epoch,
+        output_cancel,
+    };
+    if !scope.is_current() {
+        return NativeMediaTouchRoute::Suppressed;
+    }
+    if let Ok(mut guard) = state().lock() {
+        let latest = guard.native_detached_targets.clone();
+        let Some(entry) = guard.installed_hwnds.entries.iter_mut().find(|entry| {
+            entry.hwnd_raw == host
+                && Weak::ptr_eq(&allocation.epoch, &Arc::downgrade(&entry.subclass_owner))
+        }) else {
+            return if canvas {
+                NativeMediaTouchRoute::Suppressed
+            } else {
+                route
+            };
+        };
+        let mut deliveries = Vec::new();
+        let mut retired = Vec::new();
+        if matches!(&entry.native_detached, NativeDetachedInputBinding::Bound {
+            gesture: NativeDetachedGesture::NativeMediaTouch { scope: old, .. }, ..
+        } if !old.is_current())
+        {
+            let kind = entry
+                .native_detached
+                .cancel(NativeInputCancelReason::RetiredRegistration);
+            if let Some(delivery) = kind.and_then(|kind| {
+                entry
+                    .native_detached
+                    .delivery(host, &entry.subclass_owner, kind)
+            }) {
+                deliveries.push(NativeDetachedInputEffect::Deliver(delivery));
+            }
+            if let NativeDetachedInputBinding::Bound { target, gesture } =
+                &mut entry.native_detached
+            {
+                *gesture = NativeDetachedGesture::Idle;
+                if let Some(current) = latest
+                    .iter()
+                    .find(|current| current.registration == target.registration)
+                {
+                    retired.push(NativeDetachedInputEffect::RetireTarget(std::mem::replace(
+                        target,
+                        current.clone(),
+                    )));
+                }
+            }
+        }
+        let NativeDetachedInputBinding::Bound { target, gesture } = &mut entry.native_detached
+        else {
+            return route;
+        };
+        if target.kind != NativeDetachedInputTargetKind::ParkedLive {
+            return route;
+        }
+        let mut kind = None;
+        if *gesture == NativeDetachedGesture::Idle {
+            *gesture = NativeDetachedGesture::NativeMediaTouch {
+                operation: egui::Id::new(("native-media-touch", native_input_sequence())),
+                contacts: Vec::new(),
+                phase: if target.availability == NativeTargetAvailability::Blocked {
+                    NativeMediaTouchPhase::Cancelled(NativeInputCancelReason::ModalOwned)
+                } else if canvas && only_contact_in_receiver {
+                    NativeMediaTouchPhase::ActivateOnly
+                } else {
+                    NativeMediaTouchPhase::CommandOwned
+                },
+                scope: scope.clone(),
+            };
+        }
+        if let NativeDetachedGesture::NativeMediaTouch {
+            operation,
+            contacts,
+            phase,
+            ..
+        } = gesture
+        {
+            if !contacts.contains(&contact) {
+                if !contacts.is_empty() && *phase == NativeMediaTouchPhase::ActivateOnly {
+                    *phase =
+                        NativeMediaTouchPhase::Cancelled(NativeInputCancelReason::PointerCancelled);
+                    kind = Some(NativeDetachedInputEventKind::NativeMediaTouch(
+                        NativeNonClientOutcome::Cancelled(
+                            NativeInputCancelReason::PointerCancelled,
+                        ),
+                    ));
+                }
+                contacts.push(contact);
+            }
+            let token = NativeMediaTouchToken {
+                allocation: allocation.clone(),
+                operation: *operation,
+                contact,
+                scope,
+            };
+            route = if canvas {
+                NativeMediaTouchRoute::ActivateOnly(token)
+            } else {
+                NativeMediaTouchRoute::CommandOwned(token)
+            };
+        } else if canvas {
+            route = NativeMediaTouchRoute::Suppressed;
+        }
+        let delivery = kind.and_then(|kind| {
+            entry
+                .native_detached
+                .delivery(host, &entry.subclass_owner, kind)
+        });
+        if let Some(delivery) = delivery {
+            deliveries.push(NativeDetachedInputEffect::Deliver(delivery));
+        }
+        guard.native_detached_effects.extend(deliveries);
+        guard.native_detached_effects.extend(retired);
+    } else {
+        report_native_window_input_failure(
+            "native canvas touch owner state unavailable".to_string(),
+        );
+        route = NativeMediaTouchRoute::Suppressed;
+    }
+    dispatch_native_detached_input();
+    route
+}
+
+#[derive(Clone, Copy)]
+enum NativeMediaTouchBoundary {
+    Cancel(NativeInputCancelReason),
+    End,
+    Drop,
+}
+
+pub(crate) fn cancel_native_media_touch(
+    token: &NativeMediaTouchToken,
+    reason: NativeInputCancelReason,
+) {
+    transition_native_media_touch(token, NativeMediaTouchBoundary::Cancel(reason));
+}
+
+pub(crate) fn end_native_media_touch(token: &NativeMediaTouchToken, cancelled: bool) {
+    transition_native_media_touch(
+        token,
+        if cancelled {
+            NativeMediaTouchBoundary::Drop
+        } else {
+            NativeMediaTouchBoundary::End
+        },
+    );
+}
+
+fn transition_native_media_touch(
+    token: &NativeMediaTouchToken,
+    boundary: NativeMediaTouchBoundary,
+) {
+    if let Ok(mut guard) = state().lock() {
+        let targets = guard.native_detached_targets.clone();
+        let Some(entry) = guard.installed_hwnds.entries.iter_mut().find(|entry| {
+            entry.hwnd_raw == token.allocation.hwnd
+                && Weak::ptr_eq(
+                    &token.allocation.epoch,
+                    &Arc::downgrade(&entry.subclass_owner),
+                )
+        }) else {
+            return;
+        };
+        let NativeDetachedInputBinding::Bound { gesture, .. } = &mut entry.native_detached else {
+            return;
+        };
+        let NativeDetachedGesture::NativeMediaTouch {
+            operation,
+            contacts,
+            phase,
+            ..
+        } = gesture
+        else {
+            return;
+        };
+        if *operation != token.operation || !contacts.contains(&token.contact) {
+            return;
+        }
+        let reason = match boundary {
+            NativeMediaTouchBoundary::Cancel(reason) => Some(reason),
+            NativeMediaTouchBoundary::Drop => Some(NativeInputCancelReason::PointerCancelled),
+            NativeMediaTouchBoundary::End if !token.scope.is_current() => {
+                Some(NativeInputCancelReason::RetiredRegistration)
+            }
+            NativeMediaTouchBoundary::End => None,
+        };
+        let mut kind = None;
+        if let Some(reason) = reason
+            && *phase == NativeMediaTouchPhase::ActivateOnly
+        {
+            *phase = NativeMediaTouchPhase::Cancelled(reason);
+            kind = Some(NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(reason),
+            ));
+        }
+        if !matches!(boundary, NativeMediaTouchBoundary::Cancel(_)) {
+            contacts.retain(|contact| *contact != token.contact);
+            if contacts.is_empty() {
+                if *phase == NativeMediaTouchPhase::ActivateOnly {
+                    kind = Some(NativeDetachedInputEventKind::NativeMediaTouch(
+                        NativeNonClientOutcome::Completed,
+                    ));
+                }
+                *gesture = NativeDetachedGesture::Idle;
+            }
+        }
+        let delivery = kind.and_then(|kind| {
+            entry
+                .native_detached
+                .delivery(entry.hwnd_raw, &entry.subclass_owner, kind)
+        });
+        let retired = if let NativeDetachedInputBinding::Bound {
+            target,
+            gesture: NativeDetachedGesture::Idle,
+        } = &mut entry.native_detached
+            && let Some(latest) = targets
+                .iter()
+                .find(|latest| latest.registration == target.registration)
+        {
+            Some(NativeDetachedInputEffect::RetireTarget(std::mem::replace(
+                target,
+                latest.clone(),
+            )))
+        } else {
+            None
+        };
+        if let Some(delivery) = delivery {
+            guard
+                .native_detached_effects
+                .push(NativeDetachedInputEffect::Deliver(delivery));
+        }
+        guard.native_detached_effects.extend(retired);
+    } else {
+        report_native_window_input_failure(
+            "native canvas touch terminal owner state unavailable".to_string(),
+        );
+    }
+    dispatch_native_detached_input();
+}
+
+fn native_pointer_cancelled(message: u32, wparam: usize) -> bool {
+    if !matches!(
+        message,
+        WM_POINTERUPDATE | WM_POINTERUP | WM_NCPOINTERUPDATE | WM_NCPOINTERUP
+    ) {
+        return false;
+    }
+    use windows::Win32::UI::Input::Pointer::{GetPointerInfo, POINTER_FLAG_CANCELED, POINTER_INFO};
+    let mut info = POINTER_INFO::default();
+    unsafe { GetPointerInfo((wparam & 0xffff) as u32, &mut info) }.is_ok()
+        && info.pointerFlags & POINTER_FLAG_CANCELED == POINTER_FLAG_CANCELED
+}
+
+/// Observe only messages removed by the existing UI-thread WH_GETMESSAGE hook.
+/// Internal native move/button loops consume Up/Escape without dispatching them
+/// to the subclass. These are termination facts, never another click producer.
+pub(crate) fn observe_native_detached_message(
+    hwnd: u64,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+) {
+    if !native_detached_message_interesting(message) {
+        return;
+    }
+    native_detached_message(
+        hwnd,
+        None,
+        message,
+        wparam,
+        lparam,
+        NativeDetachedDispatch::Hook,
+    );
+    dispatch_native_detached_input();
+}
+
+fn native_detached_message_interesting(message: u32) -> bool {
+    matches!(
+        message,
+        WM_LBUTTONDOWN
+            | WM_LBUTTONDBLCLK
+            | WM_LBUTTONUP
+            | WM_NCLBUTTONDOWN
+            | WM_NCLBUTTONDBLCLK
+            | WM_NCLBUTTONUP
+            | WM_MOUSEMOVE
+            | WM_NCMOUSEMOVE
+            | WM_NCPOINTERDOWN
+            | WM_NCPOINTERUP
+            | WM_NCPOINTERUPDATE
+            | WM_SYSCOMMAND
+            | WM_CANCELMODE
+            | WM_KILLFOCUS
+            | WM_POINTERCAPTURECHANGED
+            | WM_POINTERDOWN
+            | WM_POINTERUPDATE
+            | WM_POINTERUP
+            | WM_KEYDOWN
+            | WM_SYSKEYDOWN
+            | WM_CAPTURECHANGED
+            | WM_EXITSIZEMOVE
+    )
+}
+
+fn native_mouse_origin(message: u32) -> NativeMouseOrigin {
+    if !matches!(
+        message,
+        WM_NCLBUTTONDOWN
+            | WM_NCLBUTTONDBLCLK
+            | WM_NCLBUTTONUP
+            | WM_NCMOUSEMOVE
+            | WM_MOUSEMOVE
+            | WM_LBUTTONUP
+    ) {
+        return NativeMouseOrigin::Ordinary;
+    }
+    use windows::Win32::UI::Input::{
+        GetCurrentInputMessageSource, IMDT_PEN, IMDT_TOUCH, INPUT_MESSAGE_SOURCE,
+    };
+    let mut source = INPUT_MESSAGE_SOURCE::default();
+    if unsafe { GetCurrentInputMessageSource(&mut source) }.is_ok()
+        && (source.deviceType == IMDT_TOUCH || source.deviceType == IMDT_PEN)
+    {
+        NativeMouseOrigin::PointerPromotion
+    } else {
+        NativeMouseOrigin::Ordinary
+    }
+}
+
+/// Raw pointers own caption/resize/close. For buttons the OS instead selects
+/// the action in its promoted mouse Down/DoubleClick call (Down observed in
+/// touch.log). Button calls share the ordinary mouse owner; raw button calls
+/// create no owner. App admission owns duplicate requests if start hits differ;
+/// no raw-to-promoted correlation is needed (investigation §5.11).
+fn native_detached_message_is_owned(
+    message: u32,
+    wparam: usize,
+    origin: NativeMouseOrigin,
+) -> bool {
+    match (message, origin) {
+        (WM_NCPOINTERDOWN, _) => !NativeNonClientPressTarget {
+            hit: ((wparam >> 16) & 0xffff) as u32,
+        }
+        .is_button(),
+        (WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK, NativeMouseOrigin::PointerPromotion) => {
+            NativeNonClientPressTarget { hit: wparam as u32 }.is_button()
+        }
+        (_, NativeMouseOrigin::PointerPromotion) => false,
+        (_, NativeMouseOrigin::Ordinary) => true,
+    }
+}
+
+fn native_non_client_start(message: u32, wparam: usize) -> Option<(NativePointerSource, u32)> {
+    match message {
+        WM_NCPOINTERDOWN => Some((
+            NativePointerSource::Pointer((wparam & 0xffff) as u64),
+            ((wparam >> 16) & 0xffff) as u32,
+        )),
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK => Some((NativePointerSource::Mouse, wparam as u32)),
+        _ => None,
+    }
+}
+
+fn native_pointer_release(message: u32, wparam: usize) -> Option<NativePointerSource> {
+    match message {
+        WM_LBUTTONUP | WM_NCLBUTTONUP => Some(NativePointerSource::Mouse),
+        WM_POINTERUP | WM_NCPOINTERUP => {
+            Some(NativePointerSource::Pointer((wparam & 0xffff) as u64))
+        }
+        _ => None,
+    }
+}
+
+fn native_detached_message(
+    hwnd: u64,
+    subclass_id: Option<usize>,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    dispatch: NativeDetachedDispatch,
+) {
+    native_detached_message_with_origin(
+        hwnd,
+        subclass_id,
+        message,
+        wparam,
+        lparam,
+        dispatch,
+        native_mouse_origin(message),
+    );
+}
+
+fn native_detached_message_with_origin(
+    hwnd: u64,
+    subclass_id: Option<usize>,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    dispatch: NativeDetachedDispatch,
+    origin: NativeMouseOrigin,
+) {
+    // A subclass invocation keeps its captured origin through DefSubclassProc.
+    // Only the hook has no call token and supplies the message-source hint.
+    let origin = match dispatch {
+        NativeDetachedDispatch::Subclass(call) => call.origin,
+        NativeDetachedDispatch::Hook => origin,
+    };
+    #[cfg(feature = "dev-tools")]
+    let _probe_trace = native_detached_probe::MessageTrace::begin(
+        hwnd,
+        message,
+        Some((wparam, lparam)),
+        if matches!(dispatch, NativeDetachedDispatch::Subclass(_)) {
+            "dispatch"
+        } else {
+            "hook"
+        },
+        &format!("dispatch={dispatch:?} origin={origin:?}"),
+    );
+    if !native_detached_message_is_owned(message, wparam, origin) {
+        return;
+    }
+    let pointer_cancelled = native_pointer_cancelled(message, wparam);
+    let call = match dispatch {
+        NativeDetachedDispatch::Subclass(call) => Some(call),
+        NativeDetachedDispatch::Hook => None,
+    };
+    let non_client_start = call.and_then(|_| native_non_client_start(message, wparam));
     let Ok(mut guard) = state().lock() else {
         return;
     };
+    let latest_target = if non_client_start.is_some() {
+        guard
+            .installed_hwnds
+            .registration(hwnd)
+            .and_then(|entry| entry.logical_registration)
+            .and_then(|registration| {
+                guard
+                    .native_detached_targets
+                    .iter()
+                    .find(|target| target.registration == registration)
+                    .cloned()
+            })
+    } else {
+        None
+    };
+    let Some(entry) = guard.installed_hwnds.entries.iter_mut().find(|entry| {
+        entry.hwnd_raw == hwnd && subclass_id.is_none_or(|id| entry.subclass_id() == id)
+    }) else {
+        return;
+    };
+    let mut kinds = Vec::new();
+    let mut deliveries = Vec::new();
+    let mut retired = Vec::new();
+    let binding = &mut entry.native_detached;
+    if non_client_start.is_some()
+        && !matches!(
+            binding,
+            NativeDetachedInputBinding::Bound {
+                gesture: NativeDetachedGesture::NonClient { .. },
+                ..
+            }
+        )
+    {
+        if let Some(kind) = binding.cancel(NativeInputCancelReason::CancelMode)
+            && let Some(delivery) = binding.delivery(hwnd, &entry.subclass_owner, kind)
+        {
+            deliveries.push(delivery);
+        }
+        if let (NativeDetachedInputBinding::Bound { target, .. }, Some(latest)) =
+            (&mut *binding, latest_target)
+        {
+            retired.push(NativeDetachedInputEffect::RetireTarget(std::mem::replace(
+                target, latest,
+            )));
+        }
+    }
+    let NativeDetachedInputBinding::Bound { target, gesture } = binding else {
+        return;
+    };
+
+    // The admission above chooses raw pointers for non-buttons and the OS's
+    // promoted mouse Down/DoubleClick for buttons. Each start uses its own hit;
+    // raw/promoted requests are not correlated across differing start hits.
+    if let Some((source, hit)) = non_client_start {
+        if matches!(gesture, NativeDetachedGesture::NonClient { .. }) {
+            return;
+        }
+        let phase = if hit == HTCLOSE {
+            NativeNonClientPhase::CloseOwned
+        } else if target.availability == NativeTargetAvailability::Blocked {
+            NativeNonClientPhase::Cancelled(NativeInputCancelReason::ModalOwned)
+        } else {
+            NativeNonClientPhase::Pressed
+        };
+        *gesture = NativeDetachedGesture::NonClient {
+            source,
+            press_target: NativeNonClientPressTarget { hit },
+            phase,
+            scope: NativeNonClientScope::InNativeCall(
+                call.expect("a start belongs to a subclass invocation"),
+            ),
+        };
+    } else if let Some(released) = native_pointer_release(message, wparam) {
+        match gesture {
+            NativeDetachedGesture::ClientPressed { source, operation } if *source == released => {
+                let operation = *operation;
+                if pointer_cancelled {
+                    *gesture = NativeDetachedGesture::Idle;
+                    kinds.push(native_client_input(
+                        operation,
+                        NativeClientBoundary::Cancelled(NativeInputCancelReason::PointerCancelled),
+                    ));
+                } else {
+                    // Physical Up only identifies the normal ReleaseCapture.
+                    // The canonical RawInput append owns Released provenance.
+                    *gesture = NativeDetachedGesture::ClientPhysicalReleased {
+                        source: released,
+                        operation,
+                    };
+                }
+            }
+            NativeDetachedGesture::NonClient {
+                source,
+                press_target,
+                phase: phase @ (NativeNonClientPhase::Pressed | NativeNonClientPhase::Released),
+                scope,
+            } if *source == released && !press_target.is_button() => {
+                if *scope == NativeNonClientScope::AwaitingRelease
+                    && let Some(call) = call
+                {
+                    // The hook may already have seen this Up. Its actual dispatch
+                    // claims the release call once; nested returns cannot replace it.
+                    *scope = NativeNonClientScope::InReleaseCall(call);
+                }
+                if *phase == NativeNonClientPhase::Pressed {
+                    *phase = if pointer_cancelled {
+                        NativeNonClientPhase::Cancelled(NativeInputCancelReason::PointerCancelled)
+                    } else {
+                        NativeNonClientPhase::Released
+                    };
+                }
+            }
+            _ => {}
+        }
+    } else if message == WM_SYSCOMMAND {
+        if let NativeDetachedGesture::NonClient {
+            press_target,
+            phase,
+            scope,
+            ..
+        } = gesture
+        {
+            let command = wparam as u32 & 0xfff0;
+            if command == SC_CLOSE && !press_target.is_button() {
+                *phase = NativeNonClientPhase::CloseOwned;
+            } else if call.is_some()
+                && press_target.matches_button_command(command)
+                && *phase == NativeNonClientPhase::Pressed
+                && matches!(scope, NativeNonClientScope::InNativeCall(_))
+            {
+                // A matching system action is the native button loop's own
+                // selection fact, including when it consumed Up internally.
+                // Its focus/capture side effects cannot undo that selection.
+                // Target blocking/retirement still cancels the binding itself.
+                *phase = NativeNonClientPhase::ButtonActionCommitted(
+                    if press_target.hit == HTMINBUTTON && command == SC_MINIMIZE {
+                        NativeButtonAction::MinimizeOwned
+                    } else {
+                        NativeButtonAction::ActivateViewer
+                    },
+                );
+            }
+        }
+    } else if message == WM_EXITSIZEMOVE {
+        if let NativeDetachedGesture::NonClient {
+            press_target,
+            phase: phase @ (NativeNonClientPhase::Pressed | NativeNonClientPhase::Released),
+            scope,
+            ..
+        } = gesture
+            && press_target.is_move_or_resize()
+        {
+            // The OS modal loop can consume Up without forwarding it through
+            // the subclass or PM_REMOVE hook. Its explicit end is conclusive.
+            *phase = NativeNonClientPhase::Released;
+            if *scope == NativeNonClientScope::AwaitingRelease
+                && let Some(call) = call
+            {
+                *scope = NativeNonClientScope::InReleaseCall(call);
+            }
+        }
+    } else {
+        let pointer_owner_matches = match *gesture {
+            NativeDetachedGesture::ClientPressed {
+                source: NativePointerSource::Pointer(id),
+                ..
+            }
+            | NativeDetachedGesture::NonClient {
+                source: NativePointerSource::Pointer(id),
+                ..
+            } => id == (wparam & 0xffff) as u64,
+            _ => false,
+        };
+        let cancellation = if message == WM_CANCELMODE {
+            Some(NativeInputCancelReason::CancelMode)
+        } else if message == WM_KILLFOCUS {
+            Some(NativeInputCancelReason::FocusLost)
+        } else if (message == WM_POINTERCAPTURECHANGED || pointer_cancelled)
+            && pointer_owner_matches
+            && !matches!(
+                gesture,
+                NativeDetachedGesture::NonClient {
+                    phase: NativeNonClientPhase::Released,
+                    ..
+                }
+            )
+        {
+            Some(NativeInputCancelReason::PointerCancelled)
+        } else if matches!(message, WM_KEYDOWN | WM_SYSKEYDOWN) && wparam == 0x1b {
+            Some(NativeInputCancelReason::Escape)
+        } else if message == WM_CAPTURECHANGED
+            && lparam as u64 != hwnd
+            && !(lparam == 0
+                && matches!(
+                    gesture,
+                    NativeDetachedGesture::NonClient {
+                        source: NativePointerSource::Mouse,
+                        press_target,
+                        scope: NativeNonClientScope::InNativeCall(_),
+                        ..
+                    } if press_target.is_move_or_resize()
+                ))
+            && matches!(
+                gesture,
+                NativeDetachedGesture::ClientPressed {
+                    source: NativePointerSource::Mouse,
+                    ..
+                } | NativeDetachedGesture::NonClient {
+                    source: NativePointerSource::Mouse,
+                    phase: NativeNonClientPhase::Pressed,
+                    ..
+                }
+            )
+        {
+            Some(NativeInputCancelReason::CaptureLost)
+        } else {
+            None
+        };
+        if let Some(reason) = cancellation {
+            match gesture {
+                NativeDetachedGesture::NonClient {
+                    press_target,
+                    phase,
+                    ..
+                } if !press_target.is_button()
+                    && matches!(
+                        phase,
+                        NativeNonClientPhase::Pressed | NativeNonClientPhase::Released
+                    ) =>
+                {
+                    *phase = NativeNonClientPhase::Cancelled(reason)
+                }
+                NativeDetachedGesture::ClientPressed { operation, .. }
+                | NativeDetachedGesture::ClientPhysicalReleased { operation, .. } => {
+                    let operation = *operation;
+                    *gesture = NativeDetachedGesture::Idle;
+                    kinds.push(native_client_input(
+                        operation,
+                        NativeClientBoundary::Cancelled(reason),
+                    ));
+                }
+                NativeDetachedGesture::NativeMediaTouch { phase, .. }
+                    if *phase == NativeMediaTouchPhase::ActivateOnly =>
+                {
+                    *phase = NativeMediaTouchPhase::Cancelled(reason);
+                    kinds.push(NativeDetachedInputEventKind::NativeMediaTouch(
+                        NativeNonClientOutcome::Cancelled(reason),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    deliveries.extend(
+        kinds
+            .into_iter()
+            .filter_map(|kind| binding.delivery(hwnd, &entry.subclass_owner, kind)),
+    );
+    guard.native_detached_effects.extend(
+        deliveries
+            .into_iter()
+            .map(NativeDetachedInputEffect::Deliver),
+    );
+    guard.native_detached_effects.extend(retired);
+}
+
+fn finish_native_detached_dispatch(hwnd: u64, subclass_id: usize, call: NativeDetachedCall) {
+    let message = call.message;
+    #[cfg(feature = "dev-tools")]
+    let _probe_trace = native_detached_probe::MessageTrace::begin(
+        hwnd,
+        message,
+        None,
+        "finish",
+        &format!("returned_call={call:?}"),
+    );
+    if !native_detached_message_is_owned(message, call.wparam, call.origin) {
+        return;
+    }
+    let Ok(mut guard) = state().lock() else {
+        return;
+    };
+    let targets = guard.native_detached_targets.clone();
+    let Some(entry) = guard
+        .installed_hwnds
+        .entries
+        .iter_mut()
+        .find(|entry| entry.hwnd_raw == hwnd && entry.subclass_id() == subclass_id)
+    else {
+        return;
+    };
+    let NativeDetachedInputBinding::Bound { gesture, .. } = &mut entry.native_detached else {
+        return;
+    };
+    if let NativeDetachedGesture::NonClient {
+        source,
+        press_target,
+        scope,
+        phase,
+        ..
+    } = gesture
+    {
+        let native_call_returned = *scope == NativeNonClientScope::InNativeCall(call)
+            && match source {
+                NativePointerSource::Mouse => {
+                    matches!(message, WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK)
+                }
+                NativePointerSource::Pointer(id) => {
+                    message == WM_NCPOINTERDOWN && *id == (call.wparam & 0xffff) as u64
+                }
+            };
+        if press_target.is_button() {
+            // The OS button tracking call owns selection and cancellation.
+            // Up/hit re-queries and focus/capture side effects are not evidence
+            // of its choice. Only matching SC dispatched within this Down call
+            // commits; the return of this same call is its only terminal seam.
+            if !native_call_returned {
+                return;
+            }
+            if *phase == NativeNonClientPhase::Pressed {
+                *phase =
+                    NativeNonClientPhase::Cancelled(NativeInputCancelReason::CaptionButtonOutside);
+            }
+        } else {
+            if native_call_returned
+                && *source == NativePointerSource::Mouse
+                && press_target.is_move_or_resize()
+                && *phase == NativeNonClientPhase::Pressed
+            {
+                // Mouse caption/resize Down/DoubleClick owns the synchronous native
+                // operation until DefSubclassProc returns. No later Up is owed.
+                *phase = NativeNonClientPhase::Released;
+            }
+            let awaited_release_returned = match *scope {
+                NativeNonClientScope::InReleaseCall(owner) => owner == call,
+                NativeNonClientScope::AwaitingRelease => matches!(
+                    phase,
+                    NativeNonClientPhase::Cancelled(_) | NativeNonClientPhase::CloseOwned
+                ),
+                NativeNonClientScope::InNativeCall(_) => false,
+            };
+            if !native_call_returned && !awaited_release_returned {
+                return;
+            }
+            *scope = NativeNonClientScope::AwaitingRelease;
+        }
+    }
+    let outcome = match *gesture {
+        NativeDetachedGesture::NonClient {
+            phase:
+                NativeNonClientPhase::Released
+                | NativeNonClientPhase::ButtonActionCommitted(NativeButtonAction::ActivateViewer),
+            ..
+        } => Some(NativeNonClientOutcome::Completed),
+        NativeDetachedGesture::NonClient {
+            phase: NativeNonClientPhase::ButtonActionCommitted(NativeButtonAction::MinimizeOwned),
+            ..
+        } => Some(NativeNonClientOutcome::MinimizeOwned),
+        NativeDetachedGesture::NonClient {
+            phase: NativeNonClientPhase::Cancelled(reason),
+            ..
+        } => Some(NativeNonClientOutcome::Cancelled(reason)),
+        NativeDetachedGesture::NonClient {
+            phase: NativeNonClientPhase::CloseOwned,
+            ..
+        } if matches!(
+            message,
+            WM_NCLBUTTONDOWN
+                | WM_NCLBUTTONDBLCLK
+                | WM_NCLBUTTONUP
+                | WM_LBUTTONUP
+                | WM_NCPOINTERDOWN
+                | WM_NCPOINTERUP
+                | WM_POINTERUP
+        ) =>
+        {
+            Some(NativeNonClientOutcome::CloseOwned)
+        }
+        _ => None,
+    };
+    if let Some(outcome) = outcome {
+        *gesture = NativeDetachedGesture::Idle;
+        let delivery = entry.native_detached.delivery(
+            hwnd,
+            &entry.subclass_owner,
+            NativeDetachedInputEventKind::NonClient(outcome),
+        );
+        let retired = if let NativeDetachedInputBinding::Bound { target, .. } =
+            &mut entry.native_detached
+            && let Some(latest) = targets
+                .iter()
+                .find(|latest| latest.registration == target.registration)
+        {
+            Some(NativeDetachedInputEffect::RetireTarget(std::mem::replace(
+                target,
+                latest.clone(),
+            )))
+        } else {
+            None
+        };
+        if let Some(delivery) = delivery {
+            guard
+                .native_detached_effects
+                .push(NativeDetachedInputEffect::Deliver(delivery));
+        }
+        guard.native_detached_effects.extend(retired);
+    }
+}
+
+fn push_edge(hwnd_raw: u64, subclass_id: usize, raw: RawKeyEdge) {
+    let Ok(mut guard) = state().lock() else {
+        return;
+    };
+    if !guard.installed_hwnds.owns_subclass(hwnd_raw, subclass_id) {
+        return;
+    }
     let (edge, should_log_unregistered) = guard.enqueue_raw_edge(hwnd_raw, raw);
     drop(guard);
     if should_log_unregistered {
@@ -4015,14 +6528,31 @@ unsafe extern "system" fn main_key_input_subclass_proc(
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
-    _id: usize,
+    id: usize,
     _ref_data: usize,
 ) -> LRESULT {
     let hwnd_raw = hwnd.0 as u64;
+    let native_interesting = native_detached_message_interesting(msg);
+    let native_origin = native_mouse_origin(msg);
+    let call = NativeDetachedCall::new(msg, wparam.0, native_origin);
+    if native_interesting {
+        native_detached_message_with_origin(
+            hwnd_raw,
+            Some(id),
+            msg,
+            wparam.0,
+            lparam.0,
+            NativeDetachedDispatch::Subclass(call),
+            native_origin,
+        );
+        dispatch_native_detached_input();
+    }
     if let Some(edge) = key_edge_from_message(msg, wparam, lparam) {
-        push_edge(hwnd_raw, edge);
+        push_edge(hwnd_raw, id, edge);
     } else if msg == WM_KILLFOCUS {
-        if let Ok(mut guard) = state().lock() {
+        if let Ok(mut guard) = state().lock()
+            && guard.installed_hwnds.owns_subclass(hwnd_raw, id)
+        {
             // A key-up can be delivered to another HWND after focus moves. Do
             // not let an Enter flavor remain latched in a later frame.
             let viewport = guard
@@ -4034,9 +6564,2478 @@ unsafe extern "system" fn main_key_input_subclass_proc(
     } else if msg == WM_NCDESTROY
         && let Ok(mut guard) = state().lock()
     {
-        guard.unregister_hwnd(hwnd_raw);
+        guard.unregister_subclass(hwnd_raw, id);
     }
-    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+    let result = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+    if native_interesting || msg == WM_NCDESTROY {
+        finish_native_detached_dispatch(hwnd_raw, id, call);
+        dispatch_native_detached_input();
+    }
+    result
+}
+
+#[cfg(test)]
+mod native_detached_tests {
+    use super::*;
+    use egui_winit::pointer_input_observer::{NormalizedPointerInput, PointerInputSource};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        HTCAPTION, HTMAXBUTTON, HTMINBUTTON, SC_MAXIMIZE, WM_MOVING, WM_NCMOUSEMOVE,
+        WM_NCPOINTERDOWN, WM_NCPOINTERUP, WM_SIZING,
+    };
+
+    struct Fixture {
+        _ctx: egui::Context,
+        target: NativeDetachedInputTarget,
+        events: Arc<Mutex<Vec<NativeDetachedInputEvent>>>,
+        hwnd: u64,
+        subclass: usize,
+    }
+
+    impl Fixture {
+        fn new(name: &str, hwnd: u64) -> Self {
+            let ctx = egui::Context::default();
+            ctx.set_embed_viewports(false);
+            let viewport = egui::ViewportId::from_hash_of(name);
+            ctx.show_viewport_deferred(viewport, Default::default(), |_, _| {});
+            let registration = ctx.viewport_registration(viewport).unwrap();
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let captured = Arc::clone(&events);
+            let target = NativeDetachedInputTarget {
+                registration,
+                kind: NativeDetachedInputTargetKind::Parked,
+                availability: NativeTargetAvailability::Enabled,
+                sink: Arc::new(move |event| {
+                    // Delivery must be outside the input state lock.
+                    let _ = event.source.epoch.is_current();
+                    captured.lock().unwrap().push(event);
+                }),
+            };
+            let targets = {
+                let guard = state().lock().unwrap();
+                let mut targets = guard.native_detached_targets.clone();
+                targets.push(target.clone());
+                targets
+            };
+            // Exercise the real pre-native registration seam.
+            set_native_detached_input_targets(targets);
+            let subclass = {
+                let mut guard = state().lock().unwrap();
+                guard.register_hwnd(hwnd, viewport);
+                guard.bind_native_detached_registration(hwnd, Some(registration));
+                guard
+                    .installed_hwnds
+                    .registration(hwnd)
+                    .unwrap()
+                    .subclass_id()
+            };
+            Self {
+                _ctx: ctx,
+                target,
+                events,
+                hwnd,
+                subclass,
+            }
+        }
+
+        fn message(&self, message: u32, wparam: usize, lparam: isize) -> NativeDetachedCall {
+            self.message_with_origin(message, wparam, lparam, NativeMouseOrigin::Ordinary)
+        }
+
+        fn message_with_origin(
+            &self,
+            message: u32,
+            wparam: usize,
+            lparam: isize,
+            origin: NativeMouseOrigin,
+        ) -> NativeDetachedCall {
+            let call = test_native_call(self.hwnd, self.subclass, message, wparam, origin);
+            native_detached_message_with_origin(
+                self.hwnd,
+                Some(self.subclass),
+                message,
+                wparam,
+                lparam,
+                NativeDetachedDispatch::Subclass(call),
+                origin,
+            );
+            dispatch_native_detached_input();
+            call
+        }
+
+        fn promoted_mouse(&self, message: u32) {
+            self.message_with_origin(
+                message,
+                HTCAPTION as usize,
+                0,
+                NativeMouseOrigin::PointerPromotion,
+            );
+        }
+
+        fn finish_promoted_call(&self, call: NativeDetachedCall) {
+            assert_eq!(call.origin, NativeMouseOrigin::PointerPromotion);
+            self.finish_call(call);
+        }
+
+        fn canonical(&self, input: NormalizedPointerInput) -> Option<egui::Id> {
+            observe_normalized_pointer_input(self.target.registration, input)
+        }
+
+        fn take_client_inputs(&self) -> Vec<NativeClientInputBoundary> {
+            self.take()
+                .into_iter()
+                .map(|kind| match kind {
+                    NativeDetachedInputEventKind::ClientBoundary(input) => input,
+                    other => panic!("client input unexpectedly produced {other:?}"),
+                })
+                .collect()
+        }
+
+        fn take_client(&self) -> Vec<NativeClientBoundary> {
+            self.take_client_inputs()
+                .into_iter()
+                .map(|input| input.boundary)
+                .collect()
+        }
+
+        fn finish(&self, message: u32) {
+            if let Some(call) = test_take_native_call(self.hwnd, self.subclass, message) {
+                self.finish_call(call);
+            }
+        }
+
+        fn finish_call(&self, call: NativeDetachedCall) {
+            TEST_NATIVE_CALLS.with(|calls| calls.borrow_mut().retain(|(_, _, held)| *held != call));
+            finish_native_detached_dispatch(self.hwnd, self.subclass, call);
+            dispatch_native_detached_input();
+        }
+
+        fn take(&self) -> Vec<NativeDetachedInputEventKind> {
+            std::mem::take(&mut *self.events.lock().unwrap())
+                .into_iter()
+                .map(|event| event.kind)
+                .collect()
+        }
+
+        fn media(&mut self) {
+            self.target.kind = NativeDetachedInputTargetKind::ParkedLive;
+            let targets = {
+                let guard = state().lock().unwrap();
+                guard
+                    .native_detached_targets
+                    .iter()
+                    .map(|target| {
+                        if target.registration == self.target.registration {
+                            self.target.clone()
+                        } else {
+                            target.clone()
+                        }
+                    })
+                    .collect()
+            };
+            set_native_detached_input_targets(targets);
+        }
+    }
+
+    struct MediaTouchReceivers {
+        _pump: crate::video::native_window::NativeWindowEventReceiver,
+        render: crate::video::native_window::NativeWindowEventReceiver,
+    }
+
+    impl MediaTouchReceivers {
+        fn drain(&self) -> Vec<crate::video::native_window::NativeVideoWindowEventEnvelope> {
+            self.render.drain()
+        }
+    }
+
+    fn media_touch_sink(
+        f: &Fixture,
+        source: crate::video::native_window::NativeVideoWindowSource,
+        epoch: Arc<AtomicU64>,
+    ) -> (
+        crate::video::native_window::NativeVideoWindowEventSink,
+        MediaTouchReceivers,
+    ) {
+        media_touch_sink_for_output(f, source, epoch, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn media_touch_sink_for_output(
+        f: &Fixture,
+        source: crate::video::native_window::NativeVideoWindowSource,
+        epoch: Arc<AtomicU64>,
+        cancel: Arc<AtomicBool>,
+    ) -> (
+        crate::video::native_window::NativeVideoWindowEventSink,
+        MediaTouchReceivers,
+    ) {
+        use crate::video::native_window::*;
+        let fault = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (pump, pump_rx) = native_window_event_route(32, Arc::clone(&fault));
+        pump.publish_native_input_epoch(41);
+        let (render, render_rx) = native_window_event_route(32, fault);
+        (
+            NativeVideoWindowEventSink::new(41, 41, source, pump, render)
+                .with_detached_activation_host(f.hwnd, epoch, cancel),
+            MediaTouchReceivers {
+                _pump: pump_rx,
+                render: render_rx,
+            },
+        )
+    }
+
+    fn media_touch(
+        sink: &crate::video::native_window::NativeVideoWindowEventSink,
+        ownership: &mut crate::video::native_touch::NativeTouchOwnership,
+        source: crate::video::native_window::NativeVideoWindowSource,
+        id: u32,
+        phase: crate::video::native_window::NativeVideoTouchPhase,
+    ) {
+        sink.owned_touch_for_test(
+            ownership,
+            crate::video::native_window::NativeVideoTouchEvent {
+                source,
+                pointer_id: id,
+                x: if phase == crate::video::native_window::NativeVideoTouchPhase::Start {
+                    100
+                } else {
+                    900
+                },
+                y: 400,
+                phase,
+                suppress_widget_primary: false,
+            },
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_captures_parked_owner_at_start_and_preserves_next_input() {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-start-owner", 0x7560);
+        let (sink, raw) = media_touch_sink(&f, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        let mut ownership = NativeTouchOwnership::default();
+        media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::Start);
+        f.media();
+        media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::Move);
+        media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::End);
+        assert!(
+            f.take().is_empty(),
+            "a later park cannot relabel an active contact"
+        );
+        assert_eq!(
+            raw.drain().len(),
+            3,
+            "the original regular stream keeps its normal commands"
+        );
+        for phase in [Phase::Start, Phase::Move, Phase::End, Phase::End] {
+            media_touch(&sink, &mut ownership, Source::Presenter, 8, phase);
+        }
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        assert!(
+            raw.drain().is_empty(),
+            "only the parked canvas stream is consumed"
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_multi_contact_stays_cancelled_until_all_native_ends() {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-multi", 0x7561);
+        f.media();
+        let epoch = Arc::new(AtomicU64::new(1));
+        let (canvas, raw_canvas) = media_touch_sink(&f, Source::Presenter, Arc::clone(&epoch));
+        let (hud, raw_hud) = media_touch_sink(&f, Source::Hud, epoch);
+        let mut canvas_owner = NativeTouchOwnership::default();
+        let mut hud_owner = NativeTouchOwnership::default();
+        media_touch(
+            &canvas,
+            &mut canvas_owner,
+            Source::Presenter,
+            7,
+            Phase::Start,
+        );
+        media_touch(&hud, &mut hud_owner, Source::Hud, 8, Phase::Start);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::PointerCancelled)
+            )]
+        );
+        media_touch(&canvas, &mut canvas_owner, Source::Presenter, 7, Phase::End);
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&canvas, &mut canvas_owner, Source::Presenter, 9, phase);
+        }
+        media_touch(&hud, &mut hud_owner, Source::Hud, 8, Phase::End);
+        assert!(
+            f.take().is_empty(),
+            "remaining HUD contact prevents a third finger from reviving activation"
+        );
+        assert_eq!(
+            raw_hud.drain().len(),
+            2,
+            "existing HUD owner still receives its stream"
+        );
+        assert!(raw_canvas.drain().is_empty());
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&canvas, &mut canvas_owner, Source::Presenter, 10, phase);
+        }
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_modal_and_os_cancel_do_not_revive_on_late_end() {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-cancel", 0x7562);
+        f.media();
+        let (sink, _) = media_touch_sink(&f, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        let mut ownership = NativeTouchOwnership::default();
+        for reason in [
+            NativeInputCancelReason::ModalOwned,
+            NativeInputCancelReason::CancelMode,
+            NativeInputCancelReason::CaptureLost,
+            NativeInputCancelReason::FocusLost,
+            NativeInputCancelReason::Escape,
+        ] {
+            media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::Start);
+            if reason == NativeInputCancelReason::ModalOwned {
+                let mut blocked = f.target.clone();
+                blocked.availability = NativeTargetAvailability::Blocked;
+                set_native_detached_input_targets(vec![blocked]);
+                set_native_detached_input_targets(vec![f.target.clone()]);
+            } else {
+                ownership.cancel_detached_activation(reason);
+            }
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                    NativeNonClientOutcome::Cancelled(reason)
+                )]
+            );
+            media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::End);
+            assert!(f.take().is_empty());
+        }
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&sink, &mut ownership, Source::Presenter, 8, phase);
+        }
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_source_swap_and_native_drop_preserve_fresh_contact() {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-source", 0x7563);
+        f.media();
+        let epoch = Arc::new(AtomicU64::new(1));
+        let (sink, _) = media_touch_sink(&f, Source::Presenter, Arc::clone(&epoch));
+        let mut ownership = NativeTouchOwnership::default();
+        media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::Start);
+        epoch.store(2, Ordering::Release);
+        media_touch(&sink, &mut ownership, Source::Presenter, 7, Phase::End);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::RetiredRegistration)
+            )]
+        );
+        media_touch(&sink, &mut ownership, Source::Presenter, 8, Phase::Start);
+        ownership.clear();
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::PointerCancelled)
+            )]
+        );
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&sink, &mut ownership, Source::Presenter, 9, phase);
+        }
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_retired_allocation_cannot_finish_reused_host_or_sibling() {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-retired", 0x7564);
+        let mut sibling = Fixture::new("rm55-media-touch-retired-sibling", 0x7565);
+        f.media();
+        sibling.media();
+        let (sink, _) = media_touch_sink(&f, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        let (other, _) = media_touch_sink(&sibling, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        let mut old = NativeTouchOwnership::default();
+        let mut fresh = NativeTouchOwnership::default();
+        let mut other_owner = NativeTouchOwnership::default();
+        media_touch(&sink, &mut old, Source::Presenter, 7, Phase::Start);
+        media_touch(&other, &mut other_owner, Source::Presenter, 7, Phase::Start);
+        retire_native_detached_input_target(f.target.registration);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::RetiredRegistration)
+            )]
+        );
+        state()
+            .lock()
+            .unwrap()
+            .unregister_subclass(f.hwnd, f.subclass);
+        dispatch_native_detached_input();
+        let _replacement = register_test_native_input_allocation(f.target.registration, f.hwnd);
+        set_native_detached_input_targets(vec![f.target.clone(), sibling.target.clone()]);
+        let (replacement_sink, _) =
+            media_touch_sink(&f, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        media_touch(
+            &replacement_sink,
+            &mut fresh,
+            Source::Presenter,
+            8,
+            Phase::Start,
+        );
+        media_touch(&sink, &mut old, Source::Presenter, 7, Phase::End);
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&sink, &mut old, Source::Presenter, 9, phase);
+        }
+        assert!(f.take().is_empty());
+        assert!(sibling.take().is_empty());
+        media_touch(
+            &replacement_sink,
+            &mut fresh,
+            Source::Presenter,
+            8,
+            Phase::End,
+        );
+        media_touch(&other, &mut other_owner, Source::Presenter, 7, Phase::End);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        assert_eq!(
+            sibling.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_uses_published_child_epoch_and_preserves_fresh_child() {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-child-epoch", 0x7566);
+        let mut sibling = Fixture::new("rm55-media-touch-child-epoch-sibling", 0x7567);
+        f.media();
+        sibling.media();
+        let source = Arc::new(AtomicU64::new(1));
+        let (old_sink, _) = media_touch_sink(&f, Source::Presenter, Arc::clone(&source));
+        let (other, _) = media_touch_sink(&sibling, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        let new_sink = old_sink.replacement_input_epoch_for_test(42);
+        let mut old = NativeTouchOwnership::default();
+        let mut new = NativeTouchOwnership::default();
+        let mut other_owner = NativeTouchOwnership::default();
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&new_sink, &mut new, Source::Presenter, 1, phase);
+        }
+        assert!(
+            f.take().is_empty(),
+            "a candidate child cannot activate before its pump publish"
+        );
+        media_touch(&old_sink, &mut old, Source::Presenter, 2, Phase::Start);
+        media_touch(&other, &mut other_owner, Source::Presenter, 2, Phase::Start);
+        old_sink.publish_input_epoch_for_test(42);
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&old_sink, &mut old, Source::Presenter, 3, phase);
+        }
+        assert!(
+            f.take().is_empty(),
+            "retired child cannot claim a new native contact"
+        );
+        media_touch(&new_sink, &mut new, Source::Presenter, 4, Phase::Start);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::RetiredRegistration)
+            )]
+        );
+        media_touch(&old_sink, &mut old, Source::Presenter, 2, Phase::End);
+        assert!(
+            f.take().is_empty(),
+            "old child tail cannot finish the new child's operation"
+        );
+        media_touch(&new_sink, &mut new, Source::Presenter, 4, Phase::End);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        assert!(sibling.take().is_empty());
+        media_touch(&other, &mut other_owner, Source::Presenter, 2, Phase::End);
+        assert_eq!(
+            sibling.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        media_touch(&new_sink, &mut new, Source::Presenter, 5, Phase::Start);
+        new_sink.publish_input_epoch_for_test(0);
+        media_touch(&new_sink, &mut new, Source::Presenter, 5, Phase::End);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::RetiredRegistration)
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine55_native_canvas_touch_output_retirement_rejects_old_ingress_and_preserves_fresh_output()
+     {
+        use crate::video::native_touch::NativeTouchOwnership;
+        use crate::video::native_window::{
+            NativeVideoTouchPhase as Phase, NativeVideoWindowSource as Source,
+        };
+        let _serial = lock_test_input();
+        let mut f = Fixture::new("rm55-media-touch-output-retired", 0x7568);
+        let mut sibling = Fixture::new("rm55-media-touch-output-retired-sibling", 0x7569);
+        f.media();
+        sibling.media();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (old_sink, _) = media_touch_sink_for_output(
+            &f,
+            Source::Presenter,
+            Arc::new(AtomicU64::new(1)),
+            Arc::clone(&cancelled),
+        );
+        let (fresh_sink, _) = media_touch_sink(&f, Source::Presenter, Arc::new(AtomicU64::new(2)));
+        let (other, _) = media_touch_sink(&sibling, Source::Presenter, Arc::new(AtomicU64::new(1)));
+        let mut old = NativeTouchOwnership::default();
+        let mut fresh = NativeTouchOwnership::default();
+        let mut other_owner = NativeTouchOwnership::default();
+        media_touch(&old_sink, &mut old, Source::Presenter, 1, Phase::Start);
+        media_touch(&other, &mut other_owner, Source::Presenter, 1, Phase::Start);
+        cancelled.store(true, Ordering::Release);
+        for phase in [Phase::Start, Phase::End] {
+            media_touch(&old_sink, &mut old, Source::Presenter, 2, phase);
+        }
+        assert!(
+            f.take().is_empty(),
+            "output cancellation is authoritative before the next pump tick"
+        );
+        media_touch(&old_sink, &mut old, Source::Presenter, 1, Phase::End);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::RetiredRegistration)
+            )]
+        );
+        media_touch(&fresh_sink, &mut fresh, Source::Presenter, 3, Phase::Start);
+        media_touch(&old_sink, &mut old, Source::Presenter, 1, Phase::End);
+        assert!(
+            f.take().is_empty(),
+            "the retired output's held End cannot finish its successor"
+        );
+        media_touch(&fresh_sink, &mut fresh, Source::Presenter, 3, Phase::End);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        assert!(sibling.take().is_empty());
+        media_touch(&other, &mut other_owner, Source::Presenter, 1, Phase::End);
+        assert_eq!(
+            sibling.take(),
+            vec![NativeDetachedInputEventKind::NativeMediaTouch(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine55_caption_native_return_finishes_without_forwarded_up() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-caption-return", 0x7550);
+        for start in [WM_NCLBUTTONDOWN, WM_NCLBUTTONDBLCLK] {
+            f.message(start, HTCAPTION as usize, 0);
+            // DefSubclassProc's move loop can consume Up itself, then release
+            // capture before returning. Neither is an external cancellation.
+            observe_native_detached_message(f.hwnd, WM_CAPTURECHANGED, 0, 0);
+            f.finish(WM_CAPTURECHANGED);
+            assert!(f.take().is_empty(), "the outer native call owns completion");
+            f.finish(start);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+            let operation = f.canonical(NormalizedPointerInput::Pressed(PointerInputSource::Mouse));
+            assert!(
+                operation.is_some(),
+                "caption completion must release the client owner"
+            );
+            f.canonical(NormalizedPointerInput::Released(PointerInputSource::Mouse));
+            f.take();
+        }
+    }
+
+    #[test]
+    fn realmachine55_caption_exit_size_move_is_terminal_without_up() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE;
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-caption-exit", 0x7551);
+        f.message(WM_NCPOINTERDOWN, (HTCAPTION as usize) << 16 | 7, 0);
+        f.finish(WM_NCPOINTERDOWN);
+        assert!(
+            f.take().is_empty(),
+            "raw pointer Down may return before its operation"
+        );
+        f.message(WM_EXITSIZEMOVE, 0, 0);
+        f.finish(WM_EXITSIZEMOVE);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        f.message(WM_NCPOINTERUP, 7, 0);
+        f.finish(WM_NCPOINTERUP);
+        assert!(
+            f.take().is_empty(),
+            "late Up cannot create a second activation"
+        );
+    }
+
+    #[test]
+    fn realmachine55_caption_modal_drag_completes_at_native_return() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE;
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-caption-drag", 0x7552);
+        f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        let mut rect = windows::Win32::Foundation::RECT {
+            left: 19,
+            top: 10,
+            right: 419,
+            bottom: 310,
+        };
+        f.message(WM_MOVING, 0, (&mut rect as *mut _) as isize);
+        observe_native_detached_message(f.hwnd, WM_CAPTURECHANGED, 0, 0);
+        f.message(WM_EXITSIZEMOVE, 0, 0);
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine55_raw_caption_drag_completes_on_exit_without_up_and_is_not_replayed() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-raw-caption-drag", 0x7555);
+        let sibling = Fixture::new("rm55-raw-caption-drag-sibling", 0x7556);
+        let down = (HTCAPTION as usize) << 16 | 7;
+        for moving in [WM_MOVING, WM_SIZING] {
+            f.message(WM_NCPOINTERDOWN, down, 0);
+            sibling.message(WM_NCPOINTERDOWN, down, 0);
+            f.finish(WM_NCPOINTERDOWN);
+            assert!(f.take().is_empty());
+            let mut rect = windows::Win32::Foundation::RECT {
+                left: -800,
+                top: -700,
+                right: 1000,
+                bottom: 900,
+            };
+            f.message(moving, 0, (&mut rect as *mut _) as isize);
+            f.message(WM_EXITSIZEMOVE, 0, 0);
+            f.finish(WM_EXITSIZEMOVE);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )],
+                "native drag completion retains its original allocation owner"
+            );
+            assert!(sibling.take().is_empty());
+            f.message(WM_NCPOINTERUP, 7, 0);
+            f.finish(WM_NCPOINTERUP);
+            f.finish(WM_EXITSIZEMOVE);
+            assert!(
+                f.take().is_empty(),
+                "late native boundaries cannot replay completion"
+            );
+            sibling.message(WM_NCPOINTERUP, 7, 0);
+            sibling.finish(WM_NCPOINTERDOWN);
+            assert_eq!(
+                sibling.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine55_caption_drag_retains_actual_native_cancellation() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-caption-drag-cancel", 0x7557);
+        for (message, wparam, lparam, reason) in [
+            (
+                WM_CAPTURECHANGED,
+                0,
+                0x777,
+                NativeInputCancelReason::CaptureLost,
+            ),
+            (WM_CANCELMODE, 0, 0, NativeInputCancelReason::CancelMode),
+            (WM_KILLFOCUS, 0, 0, NativeInputCancelReason::FocusLost),
+            (WM_KEYDOWN, 0x1b, 0, NativeInputCancelReason::Escape),
+        ] {
+            f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+            let mut rect = windows::Win32::Foundation::RECT {
+                left: -400,
+                top: -300,
+                right: 1200,
+                bottom: 1000,
+            };
+            f.message(WM_MOVING, 0, (&mut rect as *mut _) as isize);
+            f.message(message, wparam, lparam);
+            f.finish(message);
+            f.finish(WM_NCLBUTTONDOWN);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Cancelled(reason)
+                )]
+            );
+            f.message(WM_NCLBUTTONUP, HTCAPTION as usize, 0);
+            f.finish(WM_NCLBUTTONUP);
+            assert!(f.take().is_empty());
+        }
+    }
+
+    #[test]
+    fn realmachine55_resize_native_return_and_raw_exit_complete_once() {
+        use windows::Win32::UI::WindowsAndMessaging::HTLEFT;
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-native-resize", 0x7558);
+        for start in [WM_NCLBUTTONDOWN, WM_NCPOINTERDOWN] {
+            let hit = if start == WM_NCPOINTERDOWN {
+                (HTLEFT as usize) << 16 | 7
+            } else {
+                HTLEFT as usize
+            };
+            f.message(start, hit, 0);
+            let mut rect = windows::Win32::Foundation::RECT {
+                left: -400,
+                top: 10,
+                right: 410,
+                bottom: 310,
+            };
+            f.message(WM_SIZING, 0, (&mut rect as *mut _) as isize);
+            if start == WM_NCPOINTERDOWN {
+                f.finish(start);
+                assert!(f.take().is_empty());
+                f.message(WM_EXITSIZEMOVE, 0, 0);
+                f.finish(WM_EXITSIZEMOVE);
+            } else {
+                observe_native_detached_message(f.hwnd, WM_CAPTURECHANGED, 0, 0);
+                f.finish(start);
+            }
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+            f.message(WM_NCPOINTERUP, 7, 0);
+            f.finish(WM_NCPOINTERUP);
+            f.finish(WM_EXITSIZEMOVE);
+            assert!(f.take().is_empty());
+        }
+    }
+
+    #[test]
+    fn native_detached_modal_loop_up_finishes_once_without_client_producer() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-nc-click", 0x701);
+        f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        observe_native_detached_message(f.hwnd, WM_LBUTTONUP, 0, 0);
+        f.message(WM_CAPTURECHANGED, 0, 0);
+        f.finish(WM_CAPTURECHANGED);
+        assert!(
+            f.take().is_empty(),
+            "nested ReleaseCapture is not the end of DefWindowProc"
+        );
+        f.finish(WM_NCLBUTTONDOWN);
+        f.message(WM_NCLBUTTONUP, 0, 0);
+        f.finish(WM_NCLBUTTONUP);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn native_detached_cancel_ends_at_native_return_and_does_not_resume_on_late_up() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-nc-cancel", 0x702);
+        for (message, wparam, lparam, reason) in [
+            (
+                WM_CAPTURECHANGED,
+                0,
+                0,
+                NativeInputCancelReason::CaptureLost,
+            ),
+            (
+                WM_CAPTURECHANGED,
+                0,
+                0x777,
+                NativeInputCancelReason::CaptureLost,
+            ),
+            (WM_CANCELMODE, 0, 0, NativeInputCancelReason::CancelMode),
+            (WM_KEYDOWN, 0x1b, 0, NativeInputCancelReason::Escape),
+        ] {
+            // A button with no OS command cancels at its Down return; the
+            // remaining caption cancellation cases keep their original reason.
+            let hit = if message == WM_CAPTURECHANGED && lparam == 0 {
+                HTMAXBUTTON
+            } else {
+                HTCAPTION
+            };
+            let reason = if hit == HTMAXBUTTON {
+                NativeInputCancelReason::CaptionButtonOutside
+            } else {
+                reason
+            };
+            f.message(WM_NCLBUTTONDOWN, hit as usize, 0);
+            observe_native_detached_message(f.hwnd, message, wparam, lparam);
+            f.finish(message);
+            assert!(f.take().is_empty());
+            f.finish(WM_NCLBUTTONDOWN);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Cancelled(reason)
+                )]
+            );
+            f.message(WM_NCLBUTTONUP, 0, 0);
+            f.finish(WM_NCLBUTTONUP);
+            assert!(f.take().is_empty());
+        }
+    }
+
+    #[test]
+    fn native_detached_drag_maximize_and_close_have_one_owner() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-nc-operations", 0x703);
+        f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        let mut rect = windows::Win32::Foundation::RECT {
+            left: 10,
+            top: 10,
+            right: 410,
+            bottom: 310,
+        };
+        f.message(WM_MOVING, 0, (&mut rect as *mut _) as isize);
+        rect.left += 9;
+        rect.right += 9;
+        f.message(WM_MOVING, 0, (&mut rect as *mut _) as isize);
+        observe_native_detached_message(f.hwnd, WM_LBUTTONUP, 0, 0);
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+
+        f.message(WM_NCLBUTTONDBLCLK, HTCAPTION as usize, 0);
+        f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+        f.finish(WM_SYSCOMMAND);
+        f.finish(WM_NCLBUTTONDBLCLK);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )],
+            "caption double-click completes at its native return"
+        );
+        f.message(WM_NCLBUTTONUP, 0, 0);
+        f.finish(WM_NCLBUTTONUP);
+        assert!(f.take().is_empty(), "late Up cannot activate twice");
+
+        f.message(WM_NCLBUTTONDOWN, HTCLOSE as usize, 0);
+        f.message(WM_SYSCOMMAND, SC_CLOSE as usize, 0);
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::CloseOwned
+            )]
+        );
+    }
+
+    fn screen_point(x: i16, y: i16) -> isize {
+        (u32::from(x as u16) | (u32::from(y as u16) << 16)) as isize
+    }
+
+    #[test]
+    fn realmachine58_review_promoted_button_doubleclick_maximize_completes_once() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm58-review-dbl-max", 0x8158);
+        let raw_down = f.message(WM_NCPOINTERDOWN, (HTMAXBUTTON as usize) << 16 | 2, 0);
+        f.finish_call(raw_down);
+        assert!(f.take().is_empty());
+        let raw_up = f.message(WM_NCPOINTERUP, (HTMAXBUTTON as usize) << 16 | 2, 0);
+        f.finish_call(raw_up);
+        assert!(f.take().is_empty());
+        let double = f.message_with_origin(
+            WM_NCLBUTTONDBLCLK,
+            HTMAXBUTTON as usize,
+            0,
+            NativeMouseOrigin::PointerPromotion,
+        );
+        let sc = f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+        f.finish_call(sc);
+        assert!(
+            f.take().is_empty(),
+            "SC return cannot end the owning double-click call"
+        );
+        f.finish_promoted_call(double);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        f.finish_promoted_call(double);
+        assert!(f.take().is_empty(), "one call can complete only once");
+    }
+
+    #[test]
+    fn realmachine58_review_promoted_button_doubleclick_minimize_keeps_os_owner() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm58-review-dbl-min", 0x8159);
+        let raw_down = f.message(WM_NCPOINTERDOWN, (HTMINBUTTON as usize) << 16 | 3, 0);
+        f.finish_call(raw_down);
+        let raw_up = f.message(WM_NCPOINTERUP, (HTMINBUTTON as usize) << 16 | 3, 0);
+        f.finish_call(raw_up);
+        assert!(f.take().is_empty());
+        let double = f.message_with_origin(
+            WM_NCLBUTTONDBLCLK,
+            HTMINBUTTON as usize,
+            0,
+            NativeMouseOrigin::PointerPromotion,
+        );
+        let sc = f.message(WM_SYSCOMMAND, SC_MINIMIZE as usize | 2, 0);
+        f.message(WM_KILLFOCUS, 0, 0);
+        f.message(WM_CAPTURECHANGED, 0, 0);
+        f.finish_call(sc);
+        assert!(f.take().is_empty());
+        f.finish_promoted_call(double);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::MinimizeOwned
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine58_minimize_button_keeps_os_action_without_activation() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm58-minimize", 0x8058);
+        for origin in [
+            NativeMouseOrigin::Ordinary,
+            NativeMouseOrigin::PointerPromotion,
+        ] {
+            let down = f.message_with_origin(WM_NCLBUTTONDOWN, HTMINBUTTON as usize, 0, origin);
+            let sc = f.message(WM_SYSCOMMAND, SC_MINIMIZE as usize | 2, 0);
+            f.message(WM_KILLFOCUS, 0, 0);
+            f.message(WM_CAPTURECHANGED, 0, 0);
+            f.finish_call(sc);
+            assert!(
+                f.take().is_empty(),
+                "the selected command is not the owning return"
+            );
+            f.finish_call(down);
+            let events = f.take();
+            assert_eq!(events.len(), 1);
+            let NativeDetachedInputEventKind::NonClient(outcome) = events[0] else {
+                panic!("non-client outcome required");
+            };
+            assert_eq!(outcome, NativeNonClientOutcome::MinimizeOwned);
+        }
+    }
+
+    #[test]
+    fn realmachine57_touch_button_observed_maximize_restore_sequence() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-touch-observed", 0x7957);
+        for command in [SC_MAXIMIZE, SC_RESTORE] {
+            let pointer = (HTMAXBUTTON as usize) << 16 | 2;
+            let down = f.message(WM_NCPOINTERDOWN, pointer, 0);
+            f.finish_call(down);
+            assert!(
+                f.take().is_empty(),
+                "raw Down does not own OS button selection"
+            );
+            let up = f.message(WM_NCPOINTERUP, pointer, 0);
+            f.finish_call(up);
+            assert!(
+                f.take().is_empty(),
+                "raw Up does not produce a button outcome"
+            );
+            let promoted = f.message_with_origin(
+                WM_NCLBUTTONDOWN,
+                HTMAXBUTTON as usize,
+                0,
+                NativeMouseOrigin::PointerPromotion,
+            );
+            f.message(WM_CAPTURECHANGED, 0, 0);
+            let sc = f.message(WM_SYSCOMMAND, command as usize, 0);
+            f.finish_call(sc);
+            assert!(
+                f.take().is_empty(),
+                "SC return is not the owning Down return"
+            );
+            f.finish_promoted_call(promoted);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+            let tail = f.message_with_origin(
+                WM_NCLBUTTONUP,
+                HTMAXBUTTON as usize,
+                0,
+                NativeMouseOrigin::PointerPromotion,
+            );
+            f.finish_promoted_call(tail);
+            assert!(f.take().is_empty(), "promotion yields one outcome only");
+        }
+    }
+
+    #[test]
+    fn realmachine57_touch_button_promoted_call_is_the_only_button_owner() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-touch-owner", 0x7958);
+        for (hit, command) in [
+            (HTMAXBUTTON, SC_MAXIMIZE),
+            (HTMINBUTTON, SC_MINIMIZE),
+            (HTHELP, SC_CONTEXTHELP),
+        ] {
+            // There is deliberately no raw-to-mouse correlation or pending.
+            let down = f.message_with_origin(
+                WM_NCLBUTTONDOWN,
+                hit as usize,
+                0,
+                NativeMouseOrigin::PointerPromotion,
+            );
+            let nested = f.message_with_origin(
+                WM_NCLBUTTONDOWN,
+                hit as usize,
+                0,
+                NativeMouseOrigin::PointerPromotion,
+            );
+            f.finish_promoted_call(nested);
+            assert!(
+                f.take().is_empty(),
+                "a nested Down cannot end the owning call"
+            );
+            let sc = f.message(WM_SYSCOMMAND, command as usize, 0);
+            f.finish_call(sc);
+            assert!(f.take().is_empty());
+            f.finish_promoted_call(down);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    if command == SC_MINIMIZE {
+                        NativeNonClientOutcome::MinimizeOwned
+                    } else {
+                        NativeNonClientOutcome::Completed
+                    }
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine57_touch_button_without_promotion_or_without_command() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-touch-no-selection", 0x7959);
+        let down = f.message(WM_NCPOINTERDOWN, (HTMAXBUTTON as usize) << 16 | 2, 0);
+        f.finish_call(down);
+        let up = f.message(WM_NCPOINTERUP, (HTCAPTION as usize) << 16 | 2, 0);
+        f.finish_call(up);
+        assert!(
+            f.take().is_empty(),
+            "no promotion means no button gesture or outcome"
+        );
+        let down = f.message_with_origin(
+            WM_NCLBUTTONDOWN,
+            HTMAXBUTTON as usize,
+            0,
+            NativeMouseOrigin::PointerPromotion,
+        );
+        f.message(WM_CAPTURECHANGED, 0, 0);
+        f.finish_promoted_call(down);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::CaptionButtonOutside)
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine57_touch_raw_button_leaves_client_operation_unchanged() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-touch-client-owner", 0x7961);
+        let operation = f
+            .canonical(NormalizedPointerInput::Pressed(PointerInputSource::Mouse))
+            .unwrap();
+        assert_eq!(
+            f.take_client_inputs(),
+            vec![NativeClientInputBoundary {
+                operation,
+                boundary: NativeClientBoundary::Pressed
+            }]
+        );
+        for hit in [HTMINBUTTON, HTMAXBUTTON, HTHELP] {
+            let raw = f.message(WM_NCPOINTERDOWN, (hit as usize) << 16 | 9, 0);
+            f.finish_call(raw);
+            let up = f.message(WM_NCPOINTERUP, (hit as usize) << 16 | 9, 0);
+            f.finish_call(up);
+            assert!(
+                f.take().is_empty(),
+                "a raw button must not cancel or replace the client owner"
+            );
+        }
+        // Released appends the operation boundary; only Pressed returns the
+        // RawInput correlation marker. Inspect the actual delivered owner.
+        let _ = f.canonical(NormalizedPointerInput::Released(PointerInputSource::Mouse));
+        assert_eq!(
+            f.take_client_inputs(),
+            vec![NativeClientInputBoundary {
+                operation,
+                boundary: NativeClientBoundary::Released
+            }]
+        );
+    }
+
+    #[test]
+    fn realmachine57_touch_caption_and_close_keep_raw_owner_without_second_outcome() {
+        use windows::Win32::UI::WindowsAndMessaging::SC_MOVE;
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-touch-non-button", 0x7960);
+        for (hit, command, expected) in [
+            (HTCAPTION, SC_MOVE | 2, NativeNonClientOutcome::Completed),
+            (HTCLOSE, SC_CLOSE, NativeNonClientOutcome::CloseOwned),
+        ] {
+            let raw_down = f.message(WM_NCPOINTERDOWN, (hit as usize) << 16 | 5, 0);
+            f.finish_call(raw_down);
+            if hit == HTCAPTION {
+                assert!(f.take().is_empty());
+            } else {
+                assert_eq!(
+                    f.take(),
+                    vec![NativeDetachedInputEventKind::NonClient(expected)]
+                );
+            }
+            let raw_up = f.message(WM_NCPOINTERUP, (hit as usize) << 16 | 5, 0);
+            f.finish_call(raw_up);
+            if hit == HTCAPTION {
+                assert_eq!(
+                    f.take(),
+                    vec![NativeDetachedInputEventKind::NonClient(expected)]
+                );
+            } else {
+                assert!(f.take().is_empty());
+            }
+            let mouse_down = f.message_with_origin(
+                WM_NCLBUTTONDOWN,
+                hit as usize,
+                0,
+                NativeMouseOrigin::PointerPromotion,
+            );
+            let sc = f.message(WM_SYSCOMMAND, command as usize, 0);
+            f.finish_call(sc);
+            f.finish_promoted_call(mouse_down);
+            assert!(
+                f.take().is_empty(),
+                "caption/close promotion cannot produce another outcome"
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine57_reentrant_pointer_down_returns_only_its_own_call() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-nested-pointer", 0x7857);
+        let outer = f.message(WM_NCPOINTERDOWN, (HTCAPTION as usize) << 16 | 7, 0);
+        let nested = f.message(WM_NCPOINTERDOWN, (HTLEFT as usize) << 16 | 8, 0);
+        f.finish_call(nested);
+        assert!(
+            f.take().is_empty(),
+            "contact 8 did not start contact 7's operation"
+        );
+        let up = f.message(WM_NCPOINTERUP, 7, 0);
+        f.finish_call(up);
+        assert!(f.take().is_empty());
+        f.finish_call(outer);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine57_reentrant_mouse_down_returns_only_its_own_call() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-nested-mouse", 0x7858);
+        let outer = f.message(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize, 0);
+        let nested = f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        f.finish_call(nested);
+        assert!(
+            f.take().is_empty(),
+            "a nested Down cannot return the outer Down"
+        );
+        f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+        f.finish(WM_SYSCOMMAND);
+        f.finish_call(outer);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine57_reentrant_caption_and_resize_return_only_their_own_call() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-nested-caption", 0x7859);
+        for hit in [HTCAPTION, HTLEFT] {
+            let outer = f.message(WM_NCLBUTTONDOWN, hit as usize, 0);
+            let nested = f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+            f.finish_call(nested);
+            assert!(
+                f.take().is_empty(),
+                "caption/resize belongs to the outer call too"
+            );
+            f.finish_call(outer);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine57_reentrant_pointer_release_returns_only_its_own_call() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-nested-up", 0x7860);
+        for hook_first in [false, true] {
+            for nested_id in [7, 8] {
+                let down = f.message(WM_NCPOINTERDOWN, (HTCAPTION as usize) << 16 | 7, 0);
+                f.finish_call(down);
+                assert!(f.take().is_empty());
+                if hook_first {
+                    observe_native_detached_message(f.hwnd, WM_NCPOINTERUP, 7, 0);
+                }
+                let own_up = f.message(WM_NCPOINTERUP, 7, 0);
+                let nested_up = f.message(WM_NCPOINTERUP, nested_id, 0);
+                f.finish_call(nested_up);
+                assert!(
+                    f.take().is_empty(),
+                    "even the same contact cannot return another call"
+                );
+                f.finish_call(own_up);
+                assert_eq!(
+                    f.take(),
+                    vec![NativeDetachedInputEventKind::NonClient(
+                        NativeNonClientOutcome::Completed
+                    )]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn realmachine57_reentrant_exit_size_move_returns_only_its_own_call() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-nested-exit", 0x7861);
+        let down = f.message(WM_NCPOINTERDOWN, (HTCAPTION as usize) << 16 | 7, 0);
+        f.finish_call(down);
+        assert!(f.take().is_empty());
+        observe_native_detached_message(f.hwnd, WM_EXITSIZEMOVE, 0, 0);
+        let own_exit = f.message(WM_EXITSIZEMOVE, 0, 0);
+        let nested_exit = f.message(WM_EXITSIZEMOVE, 0, 0);
+        f.finish_call(nested_exit);
+        assert!(f.take().is_empty());
+        f.finish_call(own_exit);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine57_caption_button_os_command_survives_misleading_release_hit() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        use windows::core::w;
+        static QUERIES: AtomicU64 = AtomicU64::new(0);
+        static HIT: AtomicU64 = AtomicU64::new(0);
+        unsafe extern "system" fn fake_hit_test(
+            hwnd: HWND,
+            msg: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+        ) -> LRESULT {
+            if msg == WM_NCHITTEST {
+                QUERIES.fetch_add(1, Ordering::Relaxed);
+                LRESULT(HIT.load(Ordering::Relaxed) as isize)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+            }
+        }
+        struct QueryWindow(HWND);
+        impl Drop for QueryWindow {
+            fn drop(&mut self) {
+                unsafe {
+                    DestroyWindow(self.0).unwrap();
+                }
+            }
+        }
+        let _serial = lock_test_input();
+        let module = unsafe { GetModuleHandleW(None) }.unwrap();
+        static CLASS: OnceLock<()> = OnceLock::new();
+        CLASS.get_or_init(|| {
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(fake_hit_test),
+                hInstance: module.into(),
+                lpszClassName: w!("mIV.Test.CaptionButton.Query"),
+                ..Default::default()
+            };
+            assert_ne!(unsafe { RegisterClassW(&class) }, 0);
+        });
+        // A message-only HWND implements the misleading OS query, with no
+        // display, focus, native interaction loop or synthetic desktop input.
+        let window = QueryWindow(
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("mIV.Test.CaptionButton.Query"),
+                    w!(""),
+                    WINDOW_STYLE::default(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    Some(module.into()),
+                    None,
+                )
+            }
+            .unwrap(),
+        );
+        let f = Fixture::new("rm57-real-button-order", window.0.0 as u64);
+        for (release_hit, command) in [(HTCAPTION, SC_MAXIMIZE), (HTMINBUTTON, SC_RESTORE)] {
+            HIT.store(u64::from(release_hit), Ordering::Relaxed);
+            assert_eq!(
+                unsafe { SendMessageW(window.0, WM_NCHITTEST, None, Some(LPARAM(0))) }.0,
+                release_hit as isize,
+                "the fake is installed at the real OS query boundary"
+            );
+            QUERIES.store(0, Ordering::Relaxed);
+            f.message(
+                WM_NCLBUTTONDOWN,
+                HTMAXBUTTON as usize,
+                screen_point(852, 145),
+            );
+            observe_native_detached_message(f.hwnd, WM_LBUTTONUP, 0, screen_point(714, -16));
+            f.message(WM_CAPTURECHANGED, 0, 0);
+            f.message(WM_SYSCOMMAND, command as usize, 0);
+            f.finish(WM_SYSCOMMAND);
+            assert!(f.take().is_empty());
+            f.finish(WM_NCLBUTTONDOWN);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+            assert_eq!(
+                QUERIES.load(Ordering::Relaxed),
+                0,
+                "button tracking must never query release hit"
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine57_caption_button_no_command_ends_at_down_return() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-no-command", 0x7758);
+        for hit in [HTMAXBUTTON, HTMINBUTTON, HTHELP] {
+            f.message(WM_NCLBUTTONDOWN, hit as usize, 0);
+            observe_native_detached_message(f.hwnd, WM_LBUTTONUP, 0, screen_point(714, -16));
+            f.message(WM_CAPTURECHANGED, 0, 0);
+            f.finish(WM_LBUTTONUP);
+            assert!(f.take().is_empty());
+            f.finish(WM_NCLBUTTONDOWN);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Cancelled(
+                        NativeInputCancelReason::CaptionButtonOutside
+                    )
+                )]
+            );
+            f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+            f.finish(WM_SYSCOMMAND);
+            f.finish(WM_NCLBUTTONDOWN);
+            assert!(
+                f.take().is_empty(),
+                "a late command cannot revive the returned call"
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine55_caption_button_native_command_finishes_at_outer_return_without_up() {
+        use windows::Win32::UI::WindowsAndMessaging::{SC_MINIMIZE, SC_RESTORE};
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-button-native-command", 0x7570);
+        for (hit, command) in [
+            (HTMAXBUTTON, SC_MAXIMIZE),
+            (HTMAXBUTTON, SC_RESTORE),
+            (HTMINBUTTON, SC_MINIMIZE),
+            (HTMINBUTTON, SC_RESTORE),
+            (HTHELP, SC_CONTEXTHELP),
+        ] {
+            f.message(WM_NCLBUTTONDOWN, hit as usize, 0);
+            f.message(WM_SYSCOMMAND, command as usize | 2, 0);
+            f.finish(WM_SYSCOMMAND);
+            assert!(
+                f.take().is_empty(),
+                "the outer native call still owns the action"
+            );
+            f.finish(WM_NCLBUTTONDOWN);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    if command == SC_MINIMIZE {
+                        NativeNonClientOutcome::MinimizeOwned
+                    } else {
+                        NativeNonClientOutcome::Completed
+                    }
+                )]
+            );
+            f.message(WM_NCLBUTTONUP, hit as usize, 0);
+            f.finish(WM_NCLBUTTONUP);
+            assert!(
+                f.take().is_empty(),
+                "late Up cannot produce another activation"
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine55_caption_button_committed_minimize_keeps_its_native_focus_side_effect() {
+        use windows::Win32::UI::WindowsAndMessaging::SC_MINIMIZE;
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-button-minimize-focus", 0x7571);
+        f.message(WM_NCLBUTTONDOWN, HTMINBUTTON as usize, 0);
+        observe_native_detached_message(f.hwnd, WM_NCLBUTTONUP, HTMINBUTTON as usize, 0);
+        f.message(WM_SYSCOMMAND, SC_MINIMIZE as usize, 0);
+        f.message(WM_KILLFOCUS, 0, 0);
+        f.finish(WM_KILLFOCUS);
+        f.finish(WM_SYSCOMMAND);
+        assert!(
+            f.take().is_empty(),
+            "minimize has not returned to its Down caller"
+        );
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::MinimizeOwned
+            )]
+        );
+    }
+
+    #[test]
+    fn realmachine57_caption_button_native_side_effects_do_not_override_os_choice() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-button-native-cancel", 0x7572);
+        for (message, wparam, lparam) in [
+            (WM_CANCELMODE, 0, 0),
+            (WM_KEYDOWN, 0x1b, 0),
+            (WM_KILLFOCUS, 0, 0),
+            (WM_CAPTURECHANGED, 0, 0x777),
+        ] {
+            f.message(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize, 0);
+            f.message(message, wparam, lparam);
+            observe_native_detached_message(f.hwnd, WM_NCLBUTTONUP, HTMAXBUTTON as usize, 0);
+            f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+            f.finish(WM_SYSCOMMAND);
+            f.finish(WM_NCLBUTTONDOWN);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine57_caption_button_raw_calls_cannot_commit_without_promotion() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm57-raw-button-no-owner", 0x7574);
+        let pointer = (HTMINBUTTON as usize) << 16 | 7;
+        let down = f.message(WM_NCPOINTERDOWN, pointer, 0);
+        let up = f.message(WM_NCPOINTERUP, pointer, 0);
+        f.message(WM_POINTERCAPTURECHANGED, 7, 0);
+        let sc = f.message(WM_SYSCOMMAND, SC_MINIMIZE as usize, 0);
+        f.message(WM_KILLFOCUS, 0, 0);
+        f.message(WM_CAPTURECHANGED, 0, 0);
+        f.finish_call(sc);
+        f.finish_call(up);
+        f.finish_call(down);
+        assert!(
+            f.take().is_empty(),
+            "raw button messages never own or commit a button gesture"
+        );
+    }
+
+    #[test]
+    fn realmachine55_caption_button_unmatched_or_queued_command_is_not_execution_proof() {
+        use windows::Win32::UI::WindowsAndMessaging::SC_MINIMIZE;
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-button-nonexecution", 0x7575);
+        for command in [Some(SC_MINIMIZE), Some(SC_CLOSE), None] {
+            f.message(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize, 0);
+            observe_native_detached_message(f.hwnd, WM_NCLBUTTONUP, HTMAXBUTTON as usize, 0);
+            if let Some(command) = command {
+                f.message(WM_SYSCOMMAND, command as usize, 0);
+            } else {
+                observe_native_detached_message(f.hwnd, WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+            }
+            f.message(WM_KILLFOCUS, 0, 0);
+            f.finish(WM_NCLBUTTONDOWN);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Cancelled(
+                        NativeInputCancelReason::CaptionButtonOutside
+                    )
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn realmachine55_caption_button_commit_does_not_override_modal_or_retirement() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("rm55-button-modal-retirement", 0x7576);
+        let sibling = Fixture::new("rm55-button-modal-retirement-sibling", 0x7577);
+        for reason in [
+            NativeInputCancelReason::ModalOwned,
+            NativeInputCancelReason::RetiredRegistration,
+        ] {
+            set_native_detached_input_targets(vec![f.target.clone(), sibling.target.clone()]);
+            f.message(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize, 0);
+            sibling.message(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize, 0);
+            f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+            if reason == NativeInputCancelReason::ModalOwned {
+                let mut blocked = f.target.clone();
+                blocked.availability = NativeTargetAvailability::Blocked;
+                set_native_detached_input_targets(vec![blocked, sibling.target.clone()]);
+            } else {
+                retire_native_detached_input_target(f.target.registration);
+            }
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Cancelled(reason)
+                )]
+            );
+            f.finish(WM_NCLBUTTONDOWN);
+            f.message(WM_NCLBUTTONUP, HTMAXBUTTON as usize, 0);
+            f.finish(WM_NCLBUTTONUP);
+            assert!(f.take().is_empty());
+            assert!(sibling.take().is_empty());
+            sibling.message(WM_NCLBUTTONUP, HTMAXBUTTON as usize, 0);
+            sibling.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+            sibling.finish(WM_NCLBUTTONDOWN);
+            assert_eq!(
+                sibling.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn native_detached_caption_button_outside_release_cancels_without_rect_change() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-button-outside", 0x720);
+        let sibling = Fixture::new("native-button-outside-sibling", 0x721);
+        for hit in [HTMAXBUTTON, HTMINBUTTON] {
+            let point = screen_point(-120, 30);
+            sibling.message(WM_NCLBUTTONDOWN, hit as usize, point);
+            f.message(WM_NCLBUTTONDOWN, hit as usize, point);
+            // PM_REMOVE sees the Up inside DefSubclassProc's native button
+            // loop. No WM_MOVING/SIZING or rectangle change occurs.
+            observe_native_detached_message(f.hwnd, WM_NCLBUTTONUP, HTCAPTION as usize, point);
+            f.finish(WM_NCLBUTTONDOWN);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Cancelled(
+                        NativeInputCancelReason::CaptionButtonOutside
+                    )
+                )],
+                "without an OS selection command the button must not resume"
+            );
+            assert!(sibling.take().is_empty());
+            sibling.message(WM_NCLBUTTONUP, hit as usize, point);
+            sibling.message(
+                WM_SYSCOMMAND,
+                if hit == HTMINBUTTON {
+                    SC_MINIMIZE
+                } else {
+                    SC_MAXIMIZE
+                } as usize,
+                0,
+            );
+            sibling.finish(WM_NCLBUTTONDOWN);
+            assert_eq!(
+                sibling.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    if hit == HTMINBUTTON {
+                        NativeNonClientOutcome::MinimizeOwned
+                    } else {
+                        NativeNonClientOutcome::Completed
+                    }
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn native_detached_caption_button_out_and_back_completes_with_os_command() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-button-out-back", 0x722);
+        let point = screen_point(300, 25);
+        f.message(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize, point);
+        observe_native_detached_message(f.hwnd, WM_NCMOUSEMOVE, HTCAPTION as usize, point);
+        observe_native_detached_message(f.hwnd, WM_NCMOUSEMOVE, HTMAXBUTTON as usize, point);
+        observe_native_detached_message(f.hwnd, WM_NCLBUTTONUP, HTMAXBUTTON as usize, point);
+        f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        f.message(WM_NCLBUTTONUP, HTMAXBUTTON as usize, point);
+        f.finish(WM_NCLBUTTONUP);
+        assert!(
+            f.take().is_empty(),
+            "late Up cannot complete the same operation twice"
+        );
+        f.message(WM_NCLBUTTONDOWN, HTMAXBUTTON as usize, point);
+        f.promoted_mouse(WM_NCMOUSEMOVE);
+        observe_native_detached_message(
+            f.hwnd,
+            WM_NCMOUSEMOVE,
+            HTMAXBUTTON as usize,
+            screen_point(308, 25),
+        );
+        observe_native_detached_message(f.hwnd, WM_NCLBUTTONUP, HTMAXBUTTON as usize, point);
+        f.message(WM_SYSCOMMAND, SC_MAXIMIZE as usize, 0);
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )],
+            "the next ordinary button click remains available"
+        );
+    }
+
+    #[test]
+    fn native_detached_caption_button_far_motion_completes_with_os_command() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-button-far-motion", 0x723);
+        f.message(
+            WM_NCLBUTTONDOWN,
+            HTMINBUTTON as usize,
+            screen_point(300, 25),
+        );
+        observe_native_detached_message(
+            f.hwnd,
+            WM_NCMOUSEMOVE,
+            HTMINBUTTON as usize,
+            screen_point(309, 25),
+        );
+        observe_native_detached_message(
+            f.hwnd,
+            WM_NCLBUTTONUP,
+            HTMINBUTTON as usize,
+            screen_point(300, 25),
+        );
+        f.message(WM_SYSCOMMAND, SC_MINIMIZE as usize, 0);
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::MinimizeOwned
+            )]
+        );
+    }
+
+    #[test]
+    fn native_detached_raw_caption_button_leaves_other_pointer_owner_unchanged() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-pointer-button-pass-through", 0x724);
+        for hit in [HTMAXBUTTON, HTMINBUTTON, HTHELP] {
+            let owner = f.message(WM_NCPOINTERDOWN, (HTCAPTION as usize) << 16 | 7, 0);
+            let raw_button = f.message(WM_NCPOINTERDOWN, (hit as usize) << 16 | 8, 0);
+            f.finish_call(raw_button);
+            let other_up = f.message(WM_NCPOINTERUP, (hit as usize) << 16 | 8, 0);
+            f.finish_call(other_up);
+            assert!(
+                f.take().is_empty(),
+                "raw button calls cannot end another pointer's owner"
+            );
+            // Caption may end over a button. Up's hit must not select ownership.
+            let own_up = f.message(WM_NCPOINTERUP, (hit as usize) << 16 | 7, 0);
+            f.finish_call(own_up);
+            assert!(
+                f.take().is_empty(),
+                "the original Down call still owns the return"
+            );
+            f.finish_call(owner);
+            assert_eq!(
+                f.take(),
+                vec![NativeDetachedInputEventKind::NonClient(
+                    NativeNonClientOutcome::Completed
+                )]
+            );
+        }
+    }
+
+    #[test]
+    fn native_detached_raw_nc_pointer_finishes_without_mouse_promotion_and_ignores_other_ids() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-raw-pointer", 0x708);
+        let sibling = Fixture::new("native-raw-pointer-sibling", 0x709);
+        let down = (HTCAPTION as usize) << 16 | 7;
+        f.message(WM_NCPOINTERDOWN, down, 0);
+        sibling.message(WM_NCPOINTERDOWN, down, 0);
+        // A nested promoted mouse operation cannot finish the raw pointer call.
+        f.promoted_mouse(WM_NCLBUTTONDOWN);
+        f.finish(WM_NCLBUTTONDOWN);
+        f.finish(WM_NCPOINTERDOWN);
+        f.message(WM_POINTERCAPTURECHANGED, 8, 0);
+        f.message(WM_NCPOINTERUP, 8, 0);
+        f.finish(WM_NCPOINTERUP);
+        assert!(f.take().is_empty());
+        f.message(WM_NCPOINTERUP, 7, 0);
+        f.finish(WM_NCPOINTERUP);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        assert!(
+            sibling.take().is_empty(),
+            "the same pointer number in another HWND is not this owner"
+        );
+        sibling.message(WM_POINTERUP, 7, 0);
+        sibling.finish(WM_NCPOINTERDOWN);
+        assert_eq!(
+            sibling.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        // Late promotion is not a second action, even after the raw owner ended.
+        f.promoted_mouse(WM_NCLBUTTONDOWN);
+        f.finish(WM_NCLBUTTONDOWN);
+        f.promoted_mouse(WM_NCLBUTTONUP);
+        f.finish(WM_NCLBUTTONUP);
+        assert!(f.take().is_empty());
+    }
+
+    #[test]
+    fn native_detached_cancelled_raw_pointer_cannot_restart_from_promoted_mouse() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-raw-pointer-cancel", 0x70a);
+        f.message(WM_NCPOINTERDOWN, (HTCAPTION as usize) << 16 | 4, 0);
+        f.message(WM_POINTERCAPTURECHANGED, 4, 0);
+        f.finish(WM_POINTERCAPTURECHANGED);
+        assert!(f.take().is_empty());
+        f.finish(WM_NCPOINTERDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::PointerCancelled)
+            )]
+        );
+        f.promoted_mouse(WM_NCLBUTTONDOWN);
+        f.finish(WM_NCLBUTTONDOWN);
+        f.message(WM_NCPOINTERUP, 4, 0);
+        f.finish(WM_NCPOINTERUP);
+        f.promoted_mouse(WM_NCLBUTTONUP);
+        f.finish(WM_NCLBUTTONUP);
+        assert!(f.take().is_empty());
+        f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        observe_native_detached_message(f.hwnd, WM_LBUTTONUP, 0, 0);
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn native_detached_raw_client_pointer_boundaries_own_normal_capture_release() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-raw-client-boundaries", 0x70b);
+        let _ = f.canonical(NormalizedPointerInput::Pressed(PointerInputSource::Touch(
+            3,
+        )));
+        f.message(WM_POINTERDOWN, 3, 0);
+        f.message(WM_LBUTTONDOWN, 0, 0);
+        f.message(WM_POINTERCAPTURECHANGED, 9, 0); // sibling contact
+        f.message(WM_POINTERUP, 3, 0);
+        f.message(WM_POINTERCAPTURECHANGED, 3, 0); // normal raw Up release
+        f.finish(WM_POINTERUP);
+        f.message(WM_LBUTTONUP, 0, 0);
+        f.finish(WM_LBUTTONUP);
+        let _ = f.canonical(NormalizedPointerInput::Released(PointerInputSource::Touch(
+            3,
+        )));
+        assert_eq!(
+            f.take_client(),
+            vec![
+                NativeClientBoundary::Pressed,
+                NativeClientBoundary::Released,
+            ]
+        );
+        let _ = f.canonical(NormalizedPointerInput::Pressed(PointerInputSource::Touch(
+            3,
+        )));
+        f.message(WM_POINTERDOWN, 3, 0);
+        f.message(WM_POINTERCAPTURECHANGED, 3, 0);
+        f.message(WM_POINTERUP, 3, 0);
+        let _ = f.canonical(NormalizedPointerInput::Cancelled(
+            PointerInputSource::Touch(3),
+        ));
+        assert_eq!(
+            f.take_client(),
+            vec![
+                NativeClientBoundary::Pressed,
+                NativeClientBoundary::Cancelled(NativeInputCancelReason::PointerCancelled),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_detached_client_boundaries_distinguish_normal_release_from_capture_loss() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-client-boundaries", 0x704);
+        observe_native_detached_message(f.hwnd, WM_LBUTTONDOWN, 0, 0);
+        f.message(WM_LBUTTONDOWN, 0, 0);
+        assert!(
+            f.take_client().is_empty(),
+            "raw native Down is never client proof"
+        );
+        let _ = f.canonical(NormalizedPointerInput::Pressed(PointerInputSource::Mouse));
+        observe_native_detached_message(f.hwnd, WM_LBUTTONUP, 0, 0);
+        // winit releases capture before queuing its normalized MouseInput Up.
+        f.message(WM_CAPTURECHANGED, 0, 0);
+        f.message(WM_LBUTTONUP, 0, 0);
+        f.finish(WM_LBUTTONUP);
+        assert_eq!(
+            f.take_client(),
+            vec![NativeClientBoundary::Pressed],
+            "raw Up has not emitted a canonical Released proof"
+        );
+        let _ = f.canonical(NormalizedPointerInput::Released(PointerInputSource::Mouse));
+        let _ = f.canonical(NormalizedPointerInput::Released(PointerInputSource::Mouse));
+        assert_eq!(f.take_client(), vec![NativeClientBoundary::Released,]);
+        let _ = f.canonical(NormalizedPointerInput::Pressed(PointerInputSource::Mouse));
+        f.message(WM_LBUTTONDOWN, 0, 0);
+        f.message(WM_CAPTURECHANGED, 0, 0);
+        f.message(WM_LBUTTONUP, 0, 0);
+        f.finish(WM_LBUTTONUP);
+        let _ = f.canonical(NormalizedPointerInput::Released(PointerInputSource::Mouse));
+        assert_eq!(
+            f.take_client(),
+            vec![
+                NativeClientBoundary::Pressed,
+                NativeClientBoundary::Cancelled(NativeInputCancelReason::CaptureLost),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_detached_old_active_input_cannot_gain_proof_after_target_is_parked() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("canonical-parked-owner", 0x70c);
+        let sibling = Fixture::new("canonical-parked-sibling", 0x70d);
+        set_native_detached_input_targets(vec![sibling.target.clone()]);
+        let _ = sibling.canonical(NormalizedPointerInput::Pressed(PointerInputSource::Mouse));
+        // The backend appends this batch while the owner is Active/unregistered.
+        f.message(WM_LBUTTONDOWN, 0, 0);
+        assert!(
+            f.canonical(NormalizedPointerInput::Pressed(PointerInputSource::Mouse))
+                .is_none()
+        );
+        f.message(WM_LBUTTONUP, 0, 0);
+        let _ = f.canonical(NormalizedPointerInput::Released(PointerInputSource::Mouse));
+        assert!(f.take_client().is_empty());
+        // RootEnter parks it before its callback consumes that existing batch.
+        set_native_detached_input_targets(vec![f.target.clone(), sibling.target.clone()]);
+        let _ = f.canonical(NormalizedPointerInput::Released(PointerInputSource::Mouse));
+        assert!(
+            f.take_client().is_empty(),
+            "a new target never replays or adopts old input"
+        );
+        assert!(
+            f.canonical(NormalizedPointerInput::Pressed(PointerInputSource::Mouse))
+                .is_some()
+        );
+        let _ = f.canonical(NormalizedPointerInput::Released(PointerInputSource::Mouse));
+        assert_eq!(
+            f.take_client(),
+            vec![
+                NativeClientBoundary::Pressed,
+                NativeClientBoundary::Released,
+            ]
+        );
+        let _ = sibling.canonical(NormalizedPointerInput::Released(PointerInputSource::Mouse));
+        assert_eq!(
+            sibling.take_client(),
+            vec![
+                NativeClientBoundary::Pressed,
+                NativeClientBoundary::Released,
+            ]
+        );
+    }
+
+    #[test]
+    fn native_detached_canonical_touch_supports_u64_ids_and_cancels_before_late_release() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("canonical-touch-owner", 0x70e);
+        let source = PointerInputSource::Touch(1u64 << 40);
+        let _ = f.canonical(NormalizedPointerInput::Pressed(source));
+        let _ = f.canonical(NormalizedPointerInput::Cancelled(source));
+        let _ = f.canonical(NormalizedPointerInput::Released(source));
+        assert_eq!(
+            f.take_client(),
+            vec![
+                NativeClientBoundary::Pressed,
+                NativeClientBoundary::Cancelled(NativeInputCancelReason::PointerCancelled),
+            ]
+        );
+    }
+
+    #[test]
+    fn native_detached_canonical_marker_owns_release_cancel_and_blocked_start() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("canonical-marker-owner", 0x70f);
+        let source = PointerInputSource::Mouse;
+        let first = f
+            .canonical(NormalizedPointerInput::Pressed(source))
+            .unwrap();
+        f.message(WM_LBUTTONUP, 0, 0);
+        f.message(WM_CAPTURECHANGED, 0, 0);
+        assert!(
+            f.canonical(NormalizedPointerInput::Released(source))
+                .is_none()
+        );
+        assert_eq!(
+            f.take_client_inputs(),
+            vec![
+                NativeClientInputBoundary {
+                    operation: first,
+                    boundary: NativeClientBoundary::Pressed
+                },
+                NativeClientInputBoundary {
+                    operation: first,
+                    boundary: NativeClientBoundary::Released
+                },
+            ]
+        );
+
+        let second = f
+            .canonical(NormalizedPointerInput::Pressed(source))
+            .unwrap();
+        assert_ne!(first, second);
+        f.message(WM_CAPTURECHANGED, 0, 0);
+        assert!(
+            f.canonical(NormalizedPointerInput::Released(source))
+                .is_none()
+        );
+        assert_eq!(
+            f.take_client_inputs(),
+            vec![
+                NativeClientInputBoundary {
+                    operation: second,
+                    boundary: NativeClientBoundary::Pressed
+                },
+                NativeClientInputBoundary {
+                    operation: second,
+                    boundary: NativeClientBoundary::Cancelled(NativeInputCancelReason::CaptureLost)
+                },
+            ]
+        );
+
+        let mut blocked = f.target.clone();
+        blocked.availability = NativeTargetAvailability::Blocked;
+        set_native_detached_input_targets(vec![blocked]);
+        let third = f
+            .canonical(NormalizedPointerInput::Pressed(source))
+            .unwrap();
+        assert_ne!(second, third);
+        set_native_detached_input_targets(vec![f.target.clone()]);
+        assert!(
+            f.canonical(NormalizedPointerInput::Released(source))
+                .is_none()
+        );
+        assert_eq!(
+            f.take_client_inputs(),
+            vec![
+                NativeClientInputBoundary {
+                    operation: third,
+                    boundary: NativeClientBoundary::Pressed
+                },
+                NativeClientInputBoundary {
+                    operation: third,
+                    boundary: NativeClientBoundary::Cancelled(NativeInputCancelReason::ModalOwned)
+                },
+            ],
+            "unblocking cannot revive a press which began while modal"
+        );
+    }
+
+    #[test]
+    fn native_detached_non_client_takeover_cancels_old_client_operation_in_its_scope() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("canonical-native-takeover", 0x710);
+        let operation = f
+            .canonical(NormalizedPointerInput::Pressed(PointerInputSource::Mouse))
+            .unwrap();
+        let next_events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&next_events);
+        let mut updated = f.target.clone();
+        updated.sink = Arc::new(move |event| captured.lock().unwrap().push(event));
+        set_native_detached_input_targets(vec![updated]);
+        f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        observe_native_detached_message(f.hwnd, WM_LBUTTONUP, 0, 0);
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take_client_inputs(),
+            vec![
+                NativeClientInputBoundary {
+                    operation,
+                    boundary: NativeClientBoundary::Pressed
+                },
+                NativeClientInputBoundary {
+                    operation,
+                    boundary: NativeClientBoundary::Cancelled(NativeInputCancelReason::CancelMode)
+                },
+            ]
+        );
+        let events = next_events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].kind,
+            NativeDetachedInputEventKind::NonClient(NativeNonClientOutcome::Completed)
+        );
+    }
+
+    #[test]
+    fn native_detached_sink_update_keeps_press_context_and_removal_is_terminal() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-sink-owner", 0x707);
+        f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        let new_events = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&new_events);
+        let mut updated = f.target.clone();
+        updated.sink = Arc::new(move |event| captured.lock().unwrap().push(event));
+        set_native_detached_input_targets(vec![updated]);
+        observe_native_detached_message(f.hwnd, WM_LBUTTONUP, 0, 0);
+        f.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+        assert!(new_events.lock().unwrap().is_empty());
+        f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        set_native_detached_input_targets(Vec::new());
+        f.message(WM_NCLBUTTONUP, 0, 0);
+        f.finish(WM_NCLBUTTONDOWN);
+        let events = new_events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].kind,
+            NativeDetachedInputEventKind::NonClient(NativeNonClientOutcome::Cancelled(
+                NativeInputCancelReason::RetiredRegistration
+            ))
+        );
+    }
+
+    #[test]
+    fn native_detached_held_sink_update_keeps_owner_and_drops_unused_capture_outside_lock() {
+        struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(state().try_lock().is_ok(), Ordering::Relaxed);
+            }
+        }
+        let _serial = lock_test_input();
+        let f = Fixture::new("held-sink-update", 0x716);
+        let source = PointerInputSource::Mouse;
+        let first = f
+            .canonical(NormalizedPointerInput::Pressed(source))
+            .unwrap();
+        let dropped_outside = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retained = Arc::new(DropProbe(Arc::clone(&dropped_outside)));
+        let weak = Arc::downgrade(&retained);
+        let captured = Arc::clone(&retained);
+        let mut unused = f.target.clone();
+        unused.sink = Arc::new(move |_| {
+            let _ = &captured;
+        });
+        drop(retained);
+        set_native_detached_input_targets(vec![unused]);
+        assert!(
+            weak.upgrade().is_some(),
+            "the latest sink remains available to the next operation"
+        );
+
+        let next_events = Arc::new(Mutex::new(Vec::new()));
+        let captured_events = Arc::clone(&next_events);
+        let mut latest = f.target.clone();
+        latest.sink = Arc::new(move |event| captured_events.lock().unwrap().push(event));
+        set_native_detached_input_targets(vec![latest]);
+        assert!(
+            weak.upgrade().is_none(),
+            "superseding an unused latest sink releases its last capture"
+        );
+        assert!(dropped_outside.load(Ordering::Relaxed));
+        let _ = f.canonical(NormalizedPointerInput::Released(source));
+        assert_eq!(
+            f.take_client_inputs(),
+            vec![
+                NativeClientInputBoundary {
+                    operation: first,
+                    boundary: NativeClientBoundary::Pressed
+                },
+                NativeClientInputBoundary {
+                    operation: first,
+                    boundary: NativeClientBoundary::Released
+                },
+            ]
+        );
+        assert!(
+            next_events.lock().unwrap().is_empty(),
+            "a held operation keeps its original sink"
+        );
+        let second = f
+            .canonical(NormalizedPointerInput::Pressed(source))
+            .unwrap();
+        let _ = f.canonical(NormalizedPointerInput::Released(source));
+        let events = next_events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].kind,
+            native_client_input(second, NativeClientBoundary::Pressed)
+        );
+        assert_eq!(
+            events[1].kind,
+            native_client_input(second, NativeClientBoundary::Released)
+        );
+    }
+
+    #[test]
+    fn native_detached_target_block_retirement_and_same_hwnd_reuse_are_scoped() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("native-owner", 0x705);
+        let sibling = Fixture::new("native-sibling", 0x706);
+        let old = native_input_allocation_witness(f.target.registration).unwrap();
+        f.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        sibling.message(WM_NCLBUTTONDOWN, HTCAPTION as usize, 0);
+        let mut blocked = f.target.clone();
+        blocked.availability = NativeTargetAvailability::Blocked;
+        set_native_detached_input_targets(vec![blocked, sibling.target.clone()]);
+        assert_eq!(
+            f.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Cancelled(NativeInputCancelReason::ModalOwned)
+            )]
+        );
+        assert!(sibling.take().is_empty());
+        state()
+            .lock()
+            .unwrap()
+            .unregister_subclass(f.hwnd, f.subclass);
+        assert!(!old.is_current());
+        {
+            let mut guard = state().lock().unwrap();
+            guard.register_hwnd(f.hwnd, f.target.registration.viewport_id());
+            guard.bind_native_detached_registration(f.hwnd, Some(f.target.registration));
+        }
+        let successor = native_input_allocation_witness(f.target.registration).unwrap();
+        assert!(!old.same_allocation(&successor));
+        f.message(WM_NCLBUTTONUP, 0, 0); // stale subclass cannot publish into successor
+        f.finish(WM_NCLBUTTONDOWN);
+        assert!(f.take().is_empty());
+        observe_native_detached_message(sibling.hwnd, WM_LBUTTONUP, 0, 0);
+        sibling.finish(WM_NCLBUTTONDOWN);
+        assert_eq!(
+            sibling.take(),
+            vec![NativeDetachedInputEventKind::NonClient(
+                NativeNonClientOutcome::Completed
+            )]
+        );
+    }
+
+    #[test]
+    fn native_detached_terminal_registration_retirement_cancels_only_its_owner() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("terminal-input-owner", 0x711);
+        let sibling = Fixture::new("terminal-input-sibling", 0x712);
+        let operation = f
+            .canonical(NormalizedPointerInput::Pressed(PointerInputSource::Mouse))
+            .unwrap();
+        let sibling_operation = sibling
+            .canonical(NormalizedPointerInput::Pressed(PointerInputSource::Mouse))
+            .unwrap();
+        let epoch = native_input_allocation_witness(f.target.registration).unwrap();
+        retire_native_detached_input_target(f.target.registration);
+        retire_native_detached_input_target(f.target.registration);
+        assert_eq!(
+            f.take_client_inputs(),
+            vec![
+                NativeClientInputBoundary {
+                    operation,
+                    boundary: NativeClientBoundary::Pressed
+                },
+                NativeClientInputBoundary {
+                    operation,
+                    boundary: NativeClientBoundary::Cancelled(
+                        NativeInputCancelReason::RetiredRegistration
+                    )
+                },
+            ]
+        );
+        assert!(
+            epoch.is_current(),
+            "logical target retirement does not retire the native allocation"
+        );
+        assert!(
+            f.canonical(NormalizedPointerInput::Pressed(PointerInputSource::Mouse))
+                .is_none()
+        );
+        let _ = sibling.canonical(NormalizedPointerInput::Released(PointerInputSource::Mouse));
+        assert_eq!(
+            sibling.take_client_inputs(),
+            vec![
+                NativeClientInputBoundary {
+                    operation: sibling_operation,
+                    boundary: NativeClientBoundary::Pressed
+                },
+                NativeClientInputBoundary {
+                    operation: sibling_operation,
+                    boundary: NativeClientBoundary::Released
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn native_detached_terminal_retirement_releases_sink_outside_lock_even_with_native_lease() {
+        struct DropProbe(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(state().try_lock().is_ok(), Ordering::Relaxed);
+            }
+        }
+        let _serial = lock_test_input();
+        let f = Fixture::new("terminal-drop-owner", 0x713);
+        let dropped_outside_lock = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retained = Arc::new(DropProbe(Arc::clone(&dropped_outside_lock)));
+        let weak = Arc::downgrade(&retained);
+        let captured = Arc::clone(&retained);
+        let mut target = f.target.clone();
+        target.sink = Arc::new(move |_| {
+            let _ = &captured;
+        });
+        set_native_detached_input_targets(vec![target]);
+        let identity = state()
+            .lock()
+            .unwrap()
+            .installed_hwnds
+            .registration(f.hwnd)
+            .unwrap()
+            .identity();
+        let mut native_lease = NativeKeyInputLease::Installed(identity);
+        drop(retained);
+        assert!(weak.upgrade().is_some());
+        retire_native_detached_input_target(f.target.registration);
+        assert!(
+            weak.upgrade().is_none(),
+            "the native lease must not retain an application sink"
+        );
+        assert!(dropped_outside_lock.load(Ordering::Relaxed));
+        native_lease.retire_with(|_| true);
+    }
+
+    #[test]
+    fn native_detached_allocation_recreation_keeps_its_logical_target() {
+        let _serial = lock_test_input();
+        let f = Fixture::new("recreated-logical-target", 0x714);
+        let old = native_input_allocation_witness(f.target.registration).unwrap();
+        let identity = state()
+            .lock()
+            .unwrap()
+            .installed_hwnds
+            .registration(f.hwnd)
+            .unwrap()
+            .identity();
+        let mut native_lease = NativeKeyInputLease::Installed(identity);
+        native_lease.retire_with(|_| true);
+        assert!(!old.is_current());
+        let successor = register_test_native_input_allocation(f.target.registration, f.hwnd);
+        assert!(!old.same_allocation(&successor));
+        assert!(
+            successor
+                .normalized_input(NormalizedPointerInput::Pressed(PointerInputSource::Mouse))
+                .is_some()
+        );
+        let _ =
+            successor.normalized_input(NormalizedPointerInput::Released(PointerInputSource::Mouse));
+        assert_eq!(
+            f.take_client(),
+            vec![
+                NativeClientBoundary::Pressed,
+                NativeClientBoundary::Released
+            ]
+        );
+    }
+    #[test]
+    fn native_detached_terminal_retirement_drops_queued_completion_outside_lock() {
+        struct DeliveryDropProbe(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DeliveryDropProbe {
+            fn drop(&mut self) {
+                self.0.store(state().try_lock().is_ok(), Ordering::Relaxed);
+            }
+        }
+        let _serial = lock_test_input();
+        let f = Fixture::new("terminal-queued-owner", 0x715);
+        let dropped_outside = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let retained = Arc::new(DeliveryDropProbe(Arc::clone(&dropped_outside)));
+        let weak = Arc::downgrade(&retained);
+        let captured = Arc::clone(&retained);
+        let reported = Arc::clone(&delivered);
+        let delivery = NativeDetachedInputDelivery {
+            sink: Arc::new(move |_| {
+                let _ = &captured;
+                reported.store(true, Ordering::Relaxed);
+            }),
+            event: NativeDetachedInputEvent {
+                source: NativeDetachedInputSource {
+                    registration: f.target.registration,
+                    hwnd: f.hwnd,
+                    epoch: native_input_allocation_witness(f.target.registration).unwrap(),
+                },
+                sequence: native_input_sequence(),
+                kind: NativeDetachedInputEventKind::NonClient(NativeNonClientOutcome::Completed),
+            },
+        };
+        state()
+            .lock()
+            .unwrap()
+            .native_detached_effects
+            .push(NativeDetachedInputEffect::Deliver(delivery));
+        drop(retained);
+        retire_native_detached_input_target(f.target.registration);
+        assert!(
+            !delivered.load(Ordering::Relaxed),
+            "a queued completion cannot publish after terminal retirement"
+        );
+        assert!(weak.upgrade().is_none());
+        assert!(dropped_outside.load(Ordering::Relaxed));
+    }
 }
 
 #[cfg(test)]
@@ -4155,12 +9154,52 @@ mod tests {
         input
     }
 
-    fn run_input_hook(plugin: &mut SyntheticInputPlugin, input: &mut egui::RawInput) {
-        <SyntheticInputPlugin as egui::Plugin>::input_hook(
-            plugin,
-            &egui::Context::default(),
-            input,
-        );
+    fn synthetic_test_context(viewports: &[egui::ViewportId]) -> egui::Context {
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        ctx.run_ui(egui::RawInput::default(), |ui| {
+            for &viewport in viewports {
+                if viewport != egui::ViewportId::ROOT {
+                    ui.ctx()
+                        .show_viewport_deferred(viewport, Default::default(), |_, _| {});
+                }
+            }
+        })
+        .drop_without_applying_deltas();
+        ctx
+    }
+
+    fn prepared_key(event: egui::Event) -> super::PreparedSyntheticKey {
+        let egui::Event::Key {
+            key,
+            physical_key,
+            pressed,
+            repeat,
+            modifiers,
+        } = event
+        else {
+            panic!("synthetic key fixture requires a key event");
+        };
+        super::PreparedSyntheticKey {
+            key,
+            physical_key,
+            modifiers,
+            phase: if !pressed {
+                super::SyntheticKeyPhase::Up
+            } else if repeat {
+                super::SyntheticKeyPhase::Repeat
+            } else {
+                super::SyntheticKeyPhase::Down
+            },
+        }
+    }
+
+    fn run_input_hook(
+        ctx: &egui::Context,
+        plugin: &mut SyntheticInputPlugin,
+        input: &mut egui::RawInput,
+    ) {
+        <SyntheticInputPlugin as egui::Plugin>::input_hook(plugin, ctx, input);
     }
 
     fn raw_edge(virtual_key: u32, pressed: bool) -> RawKeyEdge {
@@ -4781,6 +9820,1056 @@ mod tests {
     }
 
     #[test]
+    fn native_allocation_retirement_precedes_hwnd_reuse_and_preserves_siblings() {
+        let _serial = lock_test_input();
+        for viewport in [
+            egui::ViewportId::ROOT,
+            egui::ViewportId::from_hash_of("native-child"),
+        ] {
+            clear_test_synthetic_input();
+            let sibling = egui::ViewportId::from_hash_of(("native-sibling", viewport));
+            let old = {
+                let mut input = state().lock().unwrap();
+                input.register_hwnd(0x810, viewport);
+                input.register_hwnd(0x820, sibling);
+                input.enqueue_raw_edge(0x810, raw_edge(0x0D, true));
+                input.enqueue_raw_edge(0x820, raw_edge(0x0D, true));
+                input
+                    .installed_hwnds
+                    .registration(0x810)
+                    .unwrap()
+                    .identity()
+            };
+            begin_frame();
+            {
+                let mut input = state().lock().unwrap();
+                input.enqueue_raw_edge(0x810, raw_edge(0x44, true));
+                input.enqueue_raw_edge(0x820, raw_edge(0x26, true));
+            }
+            let mut lease = super::NativeKeyInputLease::Installed(old.clone());
+            let mut removed = 0;
+            lease.retire_with(|registration| {
+                removed += 1;
+                let input = state().lock().unwrap();
+                assert!(
+                    input
+                        .installed_hwnds
+                        .owns_subclass(0x810, registration.subclass_id())
+                );
+                true
+            });
+            assert_eq!(removed, 1);
+            let replacement = {
+                let mut input = state().lock().unwrap();
+                assert_eq!(input.installed_hwnds.viewport_for_hwnd(0x810), None);
+                assert!(input.pending.iter().all(|edge| edge.source_hwnd == 0x820));
+                assert!(input.frame.iter().all(|edge| edge.source_hwnd == 0x820));
+                assert!(
+                    input
+                        .operation_frame
+                        .iter()
+                        .all(|edge| edge.source_hwnd == 0x820)
+                );
+                assert!(!input.return_keys.is_down(viewport, false));
+                assert!(input.return_keys.is_down(sibling, false));
+                assert!(!input.frame_active_viewports.contains(&viewport));
+                assert!(input.frame_active_viewports.contains(&sibling));
+                assert_eq!(
+                    input.register_hwnd(0x810, viewport),
+                    RegisterHwndResult::Inserted
+                );
+                input.enqueue_raw_edge(0x810, raw_edge(0x44, true));
+                input
+                    .installed_hwnds
+                    .registration(0x810)
+                    .unwrap()
+                    .identity()
+            };
+            assert_ne!(replacement.subclass_id(), old.subclass_id());
+            lease.retire_with(|_| panic!("retired lease must not remove its successor"));
+            // A delayed native callback and an old cleanup cannot affect a
+            // successor even when both HWND and logical viewport are reused.
+            super::push_edge(0x810, old.subclass_id(), raw_edge(0x5A, true));
+            {
+                let mut input = state().lock().unwrap();
+                assert_eq!(input.unregister_subclass(0x810, old.subclass_id()), None);
+                assert!(
+                    input
+                        .installed_hwnds
+                        .owns_subclass(0x810, replacement.subclass_id())
+                );
+                assert_eq!(
+                    input
+                        .pending
+                        .iter()
+                        .filter(|edge| edge.source_hwnd == 0x810)
+                        .count(),
+                    1
+                );
+                assert!(input.pending.iter().all(|edge| edge.virtual_key != 0x5A));
+            }
+            super::push_edge(0x810, replacement.subclass_id(), raw_edge(0x27, true));
+            assert!(state().lock().unwrap().pending.iter().any(|edge| {
+                edge.source_hwnd == 0x810
+                    && edge.source_viewport == viewport
+                    && edge.virtual_key == 0x27
+            }));
+        }
+    }
+
+    #[test]
+    fn native_allocation_retirement_withdraws_only_its_synthetic_transports_and_holds() {
+        let _serial = lock_test_input();
+        let viewport = egui::ViewportId::from_hash_of("retired-synthetic-native");
+        let sibling = egui::ViewportId::ROOT;
+        let start = Instant::now();
+        arm_test_synthetic_input(0x830, viewport);
+        enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+            start,
+            SyntheticNavigationKey::Right,
+            SyntheticModifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+        ));
+        materialize_test_synthetic_input(start, |_| Some(true));
+        {
+            let mut input = state().lock().unwrap();
+            input.register_hwnd(0x840, sibling);
+            input.test_foreground_hwnd = Some(0x840);
+            input.synthetic.enqueue(SyntheticKeyCommand::down(
+                start,
+                SyntheticNavigationKey::Left,
+                SyntheticModifiers::default(),
+            ));
+        }
+        materialize_test_synthetic_input(start, |_| Some(true));
+        let key = egui::Event::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let prepared = super::Arc::new(super::Mutex::new(super::PreparedSyntheticFrame {
+            frame_nr: 1,
+            time_key: super::RawInputTimeKey::from(Some(1.0)),
+            raw_input_time: Some(1.0),
+            batches: vec![
+                super::SyntheticViewportBatch {
+                    target: super::SyntheticRoutingTarget {
+                        hwnd: 0x830,
+                        viewport,
+                    },
+                    events: vec![prepared_key(key.clone())],
+                },
+                super::SyntheticViewportBatch {
+                    target: super::SyntheticRoutingTarget {
+                        hwnd: 0x840,
+                        viewport: sibling,
+                    },
+                    events: vec![prepared_key(key.clone())],
+                },
+            ],
+            hold_attributions: vec![(viewport, 1), (sibling, 2)],
+            delivered_viewports: Vec::new(),
+            final_modifiers: egui::Modifiers::CTRL,
+            armed: true,
+            #[cfg(windows)]
+            pointer_delivery: super::PreparedSyntheticPointerDelivery::Absent,
+        }));
+        {
+            let mut input = state().lock().unwrap();
+            input.prepared_frames.push(super::Arc::downgrade(&prepared));
+            input.unregister_hwnd(0x830);
+            assert_eq!(input.synthetic.held.len(), 1);
+            assert_eq!(input.synthetic.held[0].target.hwnd, 0x840);
+            assert!(
+                !input
+                    .synthetic
+                    .physical_key_down(PhysicalKeySlot::new(0x27, true))
+            );
+            assert!(
+                input
+                    .synthetic
+                    .physical_key_down(PhysicalKeySlot::new(0x25, true))
+            );
+        }
+        {
+            let frame = prepared.lock().unwrap();
+            assert_eq!(frame.batches.len(), 1);
+            assert_eq!(frame.batches[0].target.hwnd, 0x840);
+            assert_eq!(frame.hold_attributions, vec![(sibling, 2)]);
+            assert_eq!(frame.final_modifiers, egui::Modifiers::NONE);
+        }
+        let mut plugin = SyntheticInputPlugin {
+            prepared: Some(prepared),
+            ..Default::default()
+        };
+        let received = egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "入力".into(),
+            active_range_chars: None,
+        });
+        let mut replacement = raw_input(viewport, 1.0, true);
+        replacement.events.push(received.clone());
+        plugin.inject_prepared(&egui::Context::default(), &mut replacement);
+        assert_eq!(replacement.events, vec![received]);
+        let ctx = synthetic_test_context(&[sibling]);
+        let mut sibling_input = raw_input(sibling, 1.0, true);
+        plugin.inject_prepared(&ctx, &mut sibling_input);
+        assert_eq!(sibling_input.events, vec![key]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_allocation_retirement_completes_only_its_pointer_waiter() {
+        let _serial = lock_test_input();
+        let viewport = egui::ViewportId::from_hash_of("retired-pointer-native");
+        let owner = pointer_owner(viewport, 41, 43);
+        let hwnd = owner.identity.hwnd();
+        let (reply, completion) = super::mpsc::sync_channel(1);
+        let mut step = pointer_step(
+            owner,
+            13,
+            13 << 32,
+            SyntheticPointerStepKind::Down {
+                point: egui::pos2(50.0, 30.0),
+            },
+        );
+        step.completion = Some(reply);
+        let mut input = KeyInputState::default();
+        input.register_hwnd(hwnd, viewport);
+        input.register_hwnd(0x850, egui::ViewportId::ROOT);
+        input.synthetic.pointer = SyntheticPointerTransaction::Prepared(step);
+        input.unregister_hwnd(0x850);
+        assert!(matches!(
+            input.synthetic.pointer,
+            SyntheticPointerTransaction::Prepared(_)
+        ));
+        assert!(matches!(
+            completion.try_recv(),
+            Err(super::mpsc::TryRecvError::Empty)
+        ));
+        input.unregister_hwnd(hwnd);
+        assert!(input.synthetic.pointer.is_idle());
+        assert!(
+            completion
+                .try_recv()
+                .unwrap()
+                .unwrap_err()
+                .contains("allocation retired")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_recreation_releases_delivered_synthetic_keys_and_primary_only() {
+        let _serial = lock_test_input();
+        let ctx = egui::Context::default();
+        crate::ime_focus::install_ime_input_policy(&ctx);
+        ctx.set_embed_viewports(false);
+        let viewport = egui::ViewportId::from_hash_of("retained-synthetic-child");
+        let hwnd = 0x503d;
+        let sibling_hwnd = 0x860;
+        let backend = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _backend_scope = backend.enter(&ctx, viewport, hwnd);
+        let witness = eframe::miv_test_script_window_witness::active().unwrap();
+        let owner = pointer_owner(viewport, 61, witness.token());
+        assert_eq!(owner.identity.hwnd(), hwnd);
+        let step = pointer_step(
+            owner.clone(),
+            17,
+            17 << 32,
+            SyntheticPointerStepKind::Down {
+                point: egui::pos2(50.0, 30.0),
+            },
+        );
+        let key = |key, pressed| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let prepared = super::Arc::new(super::Mutex::new(PreparedSyntheticFrame {
+            frame_nr: 1,
+            time_key: super::RawInputTimeKey::from(Some(1.0)),
+            raw_input_time: Some(1.0),
+            batches: vec![
+                super::SyntheticViewportBatch {
+                    target: super::SyntheticRoutingTarget { hwnd, viewport },
+                    events: vec![prepared_key(key(egui::Key::ArrowRight, true))],
+                },
+                super::SyntheticViewportBatch {
+                    target: super::SyntheticRoutingTarget {
+                        hwnd: sibling_hwnd,
+                        viewport: egui::ViewportId::ROOT,
+                    },
+                    events: vec![prepared_key(key(egui::Key::ArrowLeft, true))],
+                },
+            ],
+            hold_attributions: Vec::new(),
+            delivered_viewports: Vec::new(),
+            final_modifiers: egui::Modifiers::NONE,
+            armed: true,
+            pointer_delivery: PreparedSyntheticPointerDelivery::Pending(
+                PreparedSyntheticPointerStep {
+                    raw_frame: 1,
+                    raw_time_bits: 1.0_f64.to_bits(),
+                    step: step.clone(),
+                },
+            ),
+        }));
+        {
+            let mut input = state().lock().unwrap();
+            input.register_hwnd(hwnd, viewport);
+            input.register_hwnd(sibling_hwnd, egui::ViewportId::ROOT);
+            input.prepared_frames.push(super::Arc::downgrade(&prepared));
+            input.synthetic.pointer = SyntheticPointerTransaction::Prepared(step);
+        }
+        let mut plugin = SyntheticInputPlugin {
+            prepared: Some(prepared),
+            ..Default::default()
+        };
+        let mut sibling_input = raw_input(egui::ViewportId::ROOT, 1.0, true);
+        sibling_input.viewports.entry(viewport).or_default();
+        plugin.inject_prepared(&ctx, &mut sibling_input);
+        ctx.run_ui(sibling_input, |ui| {
+            ui.ctx()
+                .show_viewport_deferred(viewport, Default::default(), |_, _| {});
+        })
+        .drop_without_applying_deltas();
+
+        let _show = crate::test_script::pointer_input::enter_show(Some(
+            crate::test_script::pointer_input::ShowOwner {
+                identity: owner.identity,
+                items_generation: owner.items_generation,
+            },
+        ));
+        let mut first = raw_input(viewport, 1.0, true);
+        first.events = vec![
+            key(egui::Key::A, true),
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+        ];
+        plugin.inject_prepared(&ctx, &mut first);
+        plugin.inject_prepared_pointer(&ctx, &mut first);
+        ctx.begin_pass(first);
+        assert!(ctx.input(|input| input.key_down(egui::Key::ArrowRight)));
+        assert!(ctx.input(|input| input.key_down(egui::Key::A)));
+        assert!(ctx.input(|input| input.pointer.primary_down()));
+        assert!(crate::ime_focus::ime_input_active_in_viewport(
+            &ctx, viewport
+        ));
+        ctx.end_pass().drop_without_applying_deltas();
+        {
+            let mut input = state().lock().unwrap();
+            // Transport ownership survives script disarm, independently of the
+            // native allocation and logical egui viewport lifetimes.
+            input.synthetic.disarm();
+            input.unregister_hwnd(hwnd);
+            input.register_hwnd(hwnd, viewport);
+        }
+        let make_replacement = || {
+            let mut input = raw_input(viewport, 1.01, true);
+            input.events = vec![
+                key(egui::Key::B, true),
+                egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "継続".into(),
+                    active_range_chars: None,
+                }),
+            ];
+            input
+        };
+        let mut replacement = make_replacement();
+        plugin.inject_logical_releases(&ctx, &mut replacement);
+        assert!(matches!(
+            replacement.events.as_slice(),
+            [
+                egui::Event::Key {
+                    key: egui::Key::ArrowRight,
+                    pressed: false,
+                    ..
+                },
+                egui::Event::Key {
+                    key: egui::Key::B,
+                    pressed: true,
+                    ..
+                },
+                egui::Event::Ime(_),
+            ]
+        ));
+        ctx.begin_pass(replacement);
+        assert!(!ctx.input(|input| input.key_down(egui::Key::ArrowRight)));
+        assert!(!ctx.input(|input| input.pointer.primary_down()));
+        assert!(ctx.input(|input| input.key_down(egui::Key::A)));
+        assert!(ctx.input(|input| input.key_down(egui::Key::B)));
+        assert!(ctx.input_for(egui::ViewportId::ROOT, |input| {
+            input.key_down(egui::Key::ArrowLeft)
+        }));
+        assert!(crate::ime_focus::ime_input_active_in_viewport(
+            &ctx, viewport
+        ));
+        ctx.end_pass().drop_without_applying_deltas();
+        let mut next = raw_input(viewport, 3.0, true);
+        plugin.inject_logical_releases(&ctx, &mut next);
+        assert!(
+            next.events.is_empty(),
+            "terminal releases last only one input frame"
+        );
+
+        let old_registration = ctx.viewport_registration(viewport).unwrap();
+        let source = super::SyntheticRoutingTarget { hwnd, viewport };
+        let point = egui::pos2(50.0, 30.0);
+        let mut closing = raw_input(viewport, 3.5, true);
+        closing.events = vec![
+            key(egui::Key::ArrowRight, true),
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        ctx.begin_pass(closing);
+        ctx.end_pass().drop_without_applying_deltas();
+        {
+            let mut input = state().lock().unwrap();
+            input.record_synthetic_logical_input(
+                source,
+                old_registration,
+                super::SyntheticLogicalInput::Key {
+                    key: egui::Key::ArrowRight,
+                    physical_key: Some(egui::Key::ArrowRight),
+                },
+                true,
+            );
+            input.record_synthetic_logical_input(
+                source,
+                old_registration,
+                super::SyntheticLogicalInput::Primary {
+                    owner: egui::Id::unique("pointer-track"),
+                },
+                true,
+            );
+            input.unregister_hwnd(hwnd);
+        }
+        // Logical retirement removes the old egui state. Reusing its ID is a
+        // different lifetime, so the former lifetime has nothing to release.
+        ctx.run_ui(raw_input(egui::ViewportId::ROOT, 4.0, true), |ui| {
+            ui.ctx().approve_viewport_retirement(old_registration);
+        })
+        .drop_without_applying_deltas();
+        assert!(ctx.viewport_registration(viewport).is_none());
+        ctx.run_ui(raw_input(egui::ViewportId::ROOT, 5.0, true), |ui| {
+            ui.ctx()
+                .show_viewport_deferred(viewport, Default::default(), |_, _| {});
+        })
+        .drop_without_applying_deltas();
+        assert_ne!(ctx.viewport_registration(viewport), Some(old_registration));
+        state().lock().unwrap().register_hwnd(hwnd, viewport);
+        let mut reopened = raw_input(viewport, 6.0, true);
+        reopened.events = vec![
+            key(egui::Key::ArrowRight, true),
+            egui::Event::PointerButton {
+                pos: point,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ];
+        let new_events = reopened.events.clone();
+        plugin.inject_logical_releases(&ctx, &mut reopened);
+        assert_eq!(
+            reopened.events, new_events,
+            "old logical releases cannot enter a reopened registration"
+        );
+        ctx.begin_pass(reopened);
+        assert!(ctx.input(|input| input.key_down(egui::Key::ArrowRight)));
+        assert!(ctx.input(|input| input.pointer.primary_down()));
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn terminal_synthetic_input_is_consumed_once_before_physical_takeover_and_real_discard() {
+        let _serial = lock_test_input();
+        for retire_before_takeover in [false, true] {
+            clear_test_synthetic_input();
+            let ctx = egui::Context::default();
+            ctx.add_plugin(SyntheticInputPlugin::default());
+            let widget_id = egui::Id::unique("terminal-pointer-widget");
+            let rect = egui::Rect::from_min_max(egui::pos2(10.0, 10.0), egui::pos2(110.0, 60.0));
+            let pointer = |pressed| egui::Event::PointerButton {
+                pos: rect.center(),
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let key = |pressed| egui::Event::Key {
+                key: egui::Key::ArrowRight,
+                physical_key: Some(egui::Key::ArrowRight),
+                pressed,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let draw =
+                |ui: &mut egui::Ui| ui.interact(rect, widget_id, egui::Sense::click_and_drag());
+            ctx.run_ui(raw_input(egui::ViewportId::ROOT, 0.9, true), |ui| {
+                draw(ui);
+            })
+            .drop_without_applying_deltas();
+            let registration = ctx.viewport_registration(egui::ViewportId::ROOT).unwrap();
+            let mut first = raw_input(egui::ViewportId::ROOT, 1.0, true);
+            first.events = vec![key(true), pointer(true)];
+            ctx.run_ui(first, |ui| {
+                let response = draw(ui);
+                assert!(response.is_pointer_button_down_on());
+            })
+            .drop_without_applying_deltas();
+            let old_subclass = {
+                let mut input = state().lock().unwrap();
+                input.register_hwnd(0x870, egui::ViewportId::ROOT);
+                let source = super::SyntheticRoutingTarget {
+                    hwnd: 0x870,
+                    viewport: egui::ViewportId::ROOT,
+                };
+                input.record_synthetic_logical_input(
+                    source,
+                    registration,
+                    super::SyntheticLogicalInput::Primary { owner: widget_id },
+                    true,
+                );
+                input.record_synthetic_logical_input(
+                    source,
+                    registration,
+                    super::SyntheticLogicalInput::Key {
+                        key: egui::Key::ArrowRight,
+                        physical_key: Some(egui::Key::ArrowRight),
+                    },
+                    true,
+                );
+                let old = input
+                    .installed_hwnds
+                    .registration(0x870)
+                    .unwrap()
+                    .identity();
+                if retire_before_takeover {
+                    input.unregister_hwnd(0x870);
+                    input.register_hwnd(0x870, egui::ViewportId::ROOT);
+                }
+                old
+            };
+            let mut takeover = raw_input(egui::ViewportId::ROOT, 1.01, true);
+            takeover.events = vec![key(true), pointer(true)];
+            let mut passes = 0;
+            ctx.run_ui(takeover, |ui| {
+                passes += 1;
+                let response = draw(ui);
+                assert!(
+                    !response.clicked(),
+                    "terminal cancellation must not commit a short click"
+                );
+                assert!(
+                    !response.drag_stopped(),
+                    "terminal cancellation must not finish a drag"
+                );
+                assert!(ui.input(|input| input.pointer.primary_down()));
+                assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)));
+                if passes == 1 {
+                    ui.ctx()
+                        .request_discard("terminal input ownership regression");
+                }
+            })
+            .drop_without_applying_deltas();
+            assert_eq!(passes, 2, "exercise egui's actual RawInput::take replay");
+            {
+                let mut input = state().lock().unwrap();
+                if !retire_before_takeover {
+                    input.unregister_hwnd(0x870);
+                    input.register_hwnd(0x870, egui::ViewportId::ROOT);
+                }
+                assert_eq!(
+                    input.unregister_subclass(0x870, old_subclass.subclass_id()),
+                    None
+                );
+            }
+            ctx.run_ui(raw_input(egui::ViewportId::ROOT, 1.02, true), |ui| {
+                let response = draw(ui);
+                assert!(ui.input(|input| input.pointer.primary_down()));
+                assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)));
+                assert!(!response.clicked() && !response.drag_stopped());
+            })
+            .drop_without_applying_deltas();
+            let mut released = raw_input(egui::ViewportId::ROOT, 1.03, true);
+            released.events = vec![key(false), pointer(false)];
+            let mut committed = false;
+            ctx.run_ui(released, |ui| {
+                committed |= draw(ui).clicked();
+            })
+            .drop_without_applying_deltas();
+            assert!(
+                committed,
+                "the successor's real physical click still completes normally"
+            );
+        }
+    }
+
+    fn synthetic_key_event(key: egui::Key, pressed: bool, repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed,
+            repeat,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn prepare_key_delivery(
+        ctx: &egui::Context,
+        target: super::SyntheticRoutingTarget,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) {
+        ctx.plugin::<SyntheticInputPlugin>().lock().prepared = Some(super::Arc::new(
+            super::Mutex::new(super::PreparedSyntheticFrame {
+                frame_nr: time as u64,
+                time_key: super::RawInputTimeKey::from(Some(time)),
+                raw_input_time: Some(time),
+                batches: vec![super::SyntheticViewportBatch {
+                    target,
+                    events: events.into_iter().map(prepared_key).collect(),
+                }],
+                hold_attributions: Vec::new(),
+                delivered_viewports: Vec::new(),
+                final_modifiers: egui::Modifiers::NONE,
+                armed: true,
+                #[cfg(windows)]
+                pointer_delivery: super::PreparedSyntheticPointerDelivery::Absent,
+            }),
+        ));
+    }
+
+    #[test]
+    fn synthetic_key_physical_takeover_survives_repeat_up_and_native_recreation() {
+        let _serial = lock_test_input();
+        let _cleanup = ClearSyntheticInput;
+        let ctx = egui::Context::default();
+        ctx.add_plugin(SyntheticInputPlugin::default());
+        crate::ime_focus::install_ime_input_policy(&ctx);
+        let viewport = egui::ViewportId::ROOT;
+        let source = super::SyntheticRoutingTarget {
+            hwnd: 0x871,
+            viewport,
+        };
+        state().lock().unwrap().register_hwnd(source.hwnd, viewport);
+        prepare_key_delivery(
+            &ctx,
+            source,
+            1.0,
+            vec![
+                synthetic_key_event(egui::Key::ArrowRight, true, false),
+                synthetic_key_event(egui::Key::ArrowLeft, true, false),
+            ],
+        );
+        let mut first = raw_input(viewport, 1.0, true);
+        first.events = vec![
+            synthetic_key_event(egui::Key::A, true, false),
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+        ];
+        ctx.run_ui(first, |ui| {
+            assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)
+                && input.key_down(egui::Key::ArrowLeft)));
+        })
+        .drop_without_applying_deltas();
+        prepare_key_delivery(
+            &ctx,
+            source,
+            2.0,
+            vec![
+                synthetic_key_event(egui::Key::ArrowRight, true, true),
+                synthetic_key_event(egui::Key::ArrowRight, false, false),
+            ],
+        );
+        let mut takeover = raw_input(viewport, 2.0, true);
+        takeover.events = vec![
+            synthetic_key_event(egui::Key::ArrowRight, true, false),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "継続".into(),
+                active_range_chars: None,
+            }),
+        ];
+        let mut passes = 0;
+        ctx.run_ui(takeover, |ui| {
+            passes += 1;
+            assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)));
+            if passes == 1 {
+                let right = ui.input(|input| {
+                    input
+                        .raw
+                        .events
+                        .iter()
+                        .filter_map(|event| match event {
+                            egui::Event::Key {
+                                key: egui::Key::ArrowRight,
+                                pressed,
+                                repeat,
+                                ..
+                            } => Some((*pressed, *repeat)),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                });
+                assert_eq!(
+                    right,
+                    [(false, false), (true, false)],
+                    "old owner ends before the fresh physical Down"
+                );
+                ui.ctx().request_discard("synthetic key physical handoff");
+            }
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
+        {
+            let mut input = state().lock().unwrap();
+            input.unregister_hwnd(source.hwnd);
+            input.register_hwnd(source.hwnd, viewport);
+        }
+        // No replacement Down is supplied: the previous physical level itself
+        // must survive, while the unrelated synthetic key ends normally.
+        ctx.run_ui(raw_input(viewport, 3.0, true), |ui| {
+            assert!(ui.input(
+                |input| input.key_down(egui::Key::ArrowRight) && input.key_down(egui::Key::A)
+            ));
+            assert!(!ui.input(|input| input.key_down(egui::Key::ArrowLeft)));
+            assert!(crate::ime_focus::ime_input_active_in_viewport(
+                ui.ctx(),
+                viewport
+            ));
+        })
+        .drop_without_applying_deltas();
+        // A later old timeline repeat/Up cannot reacquire terminal authority.
+        prepare_key_delivery(
+            &ctx,
+            source,
+            4.0,
+            vec![
+                synthetic_key_event(egui::Key::ArrowRight, true, true),
+                synthetic_key_event(egui::Key::ArrowRight, false, false),
+            ],
+        );
+        ctx.run_ui(raw_input(viewport, 4.0, true), |ui| {
+            assert!(ui.input(|input| {
+                input
+                    .raw
+                    .events
+                    .iter()
+                    .all(|event| !matches!(event, egui::Event::Key { .. }))
+            }));
+            assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)));
+        })
+        .drop_without_applying_deltas();
+        let mut up = raw_input(viewport, 5.0, true);
+        up.events
+            .push(synthetic_key_event(egui::Key::ArrowRight, false, false));
+        ctx.run_ui(up, |ui| {
+            assert!(!ui.input(|input| input.key_down(egui::Key::ArrowRight)))
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn synthetic_key_down_cannot_acquire_a_retained_physical_key() {
+        let _serial = lock_test_input();
+        let _cleanup = ClearSyntheticInput;
+        let ctx = egui::Context::default();
+        ctx.add_plugin(SyntheticInputPlugin::default());
+        let source = super::SyntheticRoutingTarget {
+            hwnd: 0x872,
+            viewport: egui::ViewportId::ROOT,
+        };
+        state()
+            .lock()
+            .unwrap()
+            .register_hwnd(source.hwnd, source.viewport);
+        let mut physical = raw_input(source.viewport, 1.0, true);
+        physical
+            .events
+            .push(synthetic_key_event(egui::Key::ArrowRight, true, false));
+        ctx.run_ui(physical, |_| {}).drop_without_applying_deltas();
+        prepare_key_delivery(
+            &ctx,
+            source,
+            2.0,
+            vec![synthetic_key_event(egui::Key::ArrowRight, true, false)],
+        );
+        let mut passes = 0;
+        ctx.run_ui(raw_input(source.viewport, 2.0, true), |ui| {
+            passes += 1;
+            assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)));
+            assert!(ui.input(|input| {
+                input
+                    .raw
+                    .events
+                    .iter()
+                    .all(|event| !matches!(event, egui::Event::Key { .. }))
+            }));
+            if passes == 1 {
+                ui.ctx().request_discard("physical key already owns level");
+            }
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
+        state().lock().unwrap().unregister_hwnd(source.hwnd);
+        ctx.run_ui(raw_input(source.viewport, 3.0, true), |ui| {
+            assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)))
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn synthetic_key_physical_tap_rejection_is_stable_through_discard() {
+        let _serial = lock_test_input();
+        let _cleanup = ClearSyntheticInput;
+        let ctx = egui::Context::default();
+        ctx.add_plugin(SyntheticInputPlugin::default());
+        let source = super::SyntheticRoutingTarget {
+            hwnd: 0x873,
+            viewport: egui::ViewportId::ROOT,
+        };
+        state()
+            .lock()
+            .unwrap()
+            .register_hwnd(source.hwnd, source.viewport);
+        prepare_key_delivery(
+            &ctx,
+            source,
+            1.0,
+            vec![synthetic_key_event(egui::Key::ArrowRight, true, false)],
+        );
+        let mut physical = raw_input(source.viewport, 1.0, true);
+        physical.events = vec![
+            synthetic_key_event(egui::Key::ArrowRight, true, false),
+            synthetic_key_event(egui::Key::ArrowRight, false, false),
+        ];
+        let mut passes = 0;
+        ctx.run_ui(physical, |ui| {
+            passes += 1;
+            assert!(!ui.input(|input| input.key_down(egui::Key::ArrowRight)));
+            if passes == 1 {
+                ui.ctx()
+                    .request_discard("physical tap cannot become a synthetic hold");
+            }
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
+        // A fresh synthetic operation can acquire the now idle key normally.
+        prepare_key_delivery(
+            &ctx,
+            source,
+            2.0,
+            vec![synthetic_key_event(egui::Key::ArrowRight, true, false)],
+        );
+        ctx.run_ui(raw_input(source.viewport, 2.0, true), |ui| {
+            assert!(ui.input(|input| input.key_down(egui::Key::ArrowRight)))
+        })
+        .drop_without_applying_deltas();
+        prepare_key_delivery(
+            &ctx,
+            source,
+            3.0,
+            vec![synthetic_key_event(egui::Key::ArrowRight, false, false)],
+        );
+        ctx.run_ui(raw_input(source.viewport, 3.0, true), |ui| {
+            assert!(!ui.input(|input| input.key_down(egui::Key::ArrowRight)))
+        })
+        .drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn synthetic_key_takeover_keeps_other_registration_authority() {
+        let _serial = lock_test_input();
+        let _cleanup = ClearSyntheticInput;
+        let child = egui::ViewportId::from_hash_of("synthetic-key-sibling");
+        let ctx = synthetic_test_context(&[child]);
+        let root = ctx.viewport_registration(egui::ViewportId::ROOT).unwrap();
+        let sibling = ctx.viewport_registration(child).unwrap();
+        let slot = super::SyntheticLogicalInput::Key {
+            key: egui::Key::ArrowRight,
+            physical_key: Some(egui::Key::ArrowRight),
+        };
+        let mut input = state().lock().unwrap();
+        for (hwnd, registration) in [(0x874, root), (0x875, sibling)] {
+            input.record_synthetic_logical_input(
+                super::SyntheticRoutingTarget {
+                    hwnd,
+                    viewport: registration.viewport_id(),
+                },
+                registration,
+                slot,
+                true,
+            );
+        }
+        input.relinquish_synthetic_keys(root, &[egui::Key::ArrowRight]);
+        assert_eq!(
+            input.take_synthetic_logical_terminations(root.viewport_id(), |_| true),
+            [(root, slot)]
+        );
+        assert!(
+            input
+                .take_synthetic_logical_terminations(child, |_| true)
+                .is_empty()
+        );
+        assert!(input.admit_synthetic_key(
+            super::SyntheticRoutingTarget {
+                hwnd: 0x875,
+                viewport: child
+            },
+            sibling,
+            &prepared_key(synthetic_key_event(egui::Key::ArrowRight, false, false)),
+            true
+        ));
+    }
+
+    #[test]
+    fn synthetic_key_rejected_old_up_keeps_equal_new_up_through_discard() {
+        let _serial = lock_test_input();
+        let _cleanup = ClearSyntheticInput;
+        let ctx = egui::Context::default();
+        ctx.add_plugin(SyntheticInputPlugin::default());
+        let source = super::SyntheticRoutingTarget {
+            hwnd: 0x876,
+            viewport: egui::ViewportId::ROOT,
+        };
+        state()
+            .lock()
+            .unwrap()
+            .register_hwnd(source.hwnd, source.viewport);
+        prepare_key_delivery(
+            &ctx,
+            source,
+            1.0,
+            vec![synthetic_key_event(egui::Key::ArrowRight, true, false)],
+        );
+        ctx.run_ui(raw_input(source.viewport, 1.0, true), |_| {})
+            .drop_without_applying_deltas();
+        for (time, pressed) in [(2.0, true), (3.0, false)] {
+            let mut physical = raw_input(source.viewport, time, true);
+            physical
+                .events
+                .push(synthetic_key_event(egui::Key::ArrowRight, pressed, false));
+            ctx.run_ui(physical, |_| {}).drop_without_applying_deltas();
+        }
+        prepare_key_delivery(
+            &ctx,
+            source,
+            4.0,
+            vec![
+                synthetic_key_event(egui::Key::ArrowRight, false, false),
+                synthetic_key_event(egui::Key::ArrowRight, true, false),
+                synthetic_key_event(egui::Key::ArrowRight, false, false),
+            ],
+        );
+        let mut passes = 0;
+        ctx.run_ui(raw_input(source.viewport, 4.0, true), |ui| {
+            passes += 1;
+            assert!(
+                !ui.input(|input| input.key_down(egui::Key::ArrowRight)),
+                "pass={passes}: the fresh hold must retain its own Up"
+            );
+            assert_eq!(
+                ui.input(|input| input
+                    .raw
+                    .events
+                    .iter()
+                    .filter_map(|event| match event {
+                        egui::Event::Key { pressed, .. } => Some(*pressed),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()),
+                [true, false]
+            );
+            if passes == 1 {
+                ui.ctx()
+                    .request_discard("distinct old/new Up have equal payloads");
+            }
+        })
+        .drop_without_applying_deltas();
+        assert_eq!(passes, 2);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn synthetic_pointer_down_cannot_acquire_a_retained_physical_button() {
+        let _serial = lock_test_input();
+        let ctx = egui::Context::default();
+        let viewport = egui::ViewportId::ROOT;
+        let mut retained = raw_input(viewport, 1.0, true);
+        retained.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(50.0, 30.0),
+            button: egui::PointerButton::Secondary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        ctx.begin_pass(retained);
+        ctx.end_pass().drop_without_applying_deltas();
+        let backend = eframe::miv_test_script_window_witness::WindowWitnessFixture::new();
+        let _backend_scope = backend.enter(&ctx, viewport, 0x880);
+        let witness = eframe::miv_test_script_window_witness::active().unwrap();
+        let owner = SyntheticPointerOwner {
+            identity: crate::test_script::TestScriptWindowIdentity::Root {
+                context_serial: 81,
+                hwnd: 0x880,
+                backend_token: witness.token(),
+            },
+            items_generation: 7,
+        };
+        let step = pointer_step(
+            owner.clone(),
+            19,
+            19 << 32,
+            SyntheticPointerStepKind::Down {
+                point: egui::pos2(50.0, 30.0),
+            },
+        );
+        state().lock().unwrap().synthetic.pointer =
+            SyntheticPointerTransaction::Prepared(step.clone());
+        let _show = crate::test_script::pointer_input::enter_show(Some(
+            crate::test_script::pointer_input::ShowOwner {
+                identity: owner.identity,
+                items_generation: owner.items_generation,
+            },
+        ));
+        let mut plugin = SyntheticInputPlugin {
+            prepared: Some(super::Arc::new(super::Mutex::new(PreparedSyntheticFrame {
+                frame_nr: 1,
+                time_key: super::RawInputTimeKey::from(Some(1.01)),
+                raw_input_time: Some(1.01),
+                batches: Vec::new(),
+                hold_attributions: Vec::new(),
+                delivered_viewports: Vec::new(),
+                final_modifiers: egui::Modifiers::NONE,
+                armed: true,
+                pointer_delivery: PreparedSyntheticPointerDelivery::Pending(
+                    PreparedSyntheticPointerStep {
+                        raw_frame: 1,
+                        raw_time_bits: 1.01_f64.to_bits(),
+                        step,
+                    },
+                ),
+            }))),
+            ..Default::default()
+        };
+        let mut input = raw_input(viewport, 1.01, true);
+        plugin.inject_prepared_pointer(&ctx, &mut input);
+        assert!(input.events.is_empty());
+        assert!(matches!(
+            plugin.issues.front(),
+            Some(SyntheticInputIssue::PointerPhysicalInputMixed { .. })
+        ));
+        assert!(ctx.input(|input| input.pointer.secondary_down()));
+        assert!(!ctx.input(|input| input.pointer.primary_down()));
+    }
+
+    #[test]
     fn unregistered_hwnd_edge_is_explicitly_routed_to_root() {
         let mut input = KeyInputState::default();
         let (edge, should_log) = input.enqueue_raw_edge(0x301, raw_edge(0x27, true));
@@ -4812,13 +10901,14 @@ mod tests {
             SyntheticNavigationKey::Right,
         ));
 
+        let ctx = synthetic_test_context(&[viewport]);
         let mut plugin = SyntheticInputPlugin::default();
         let mut root = raw_input(egui::ViewportId::ROOT, 1.0, true);
         root.viewports.entry(viewport).or_default().focused = Some(true);
-        run_input_hook(&mut plugin, &mut root);
+        run_input_hook(&ctx, &mut plugin, &mut root);
         assert!(root.events.is_empty());
         let mut child = raw_input(viewport, 1.0, true);
-        run_input_hook(&mut plugin, &mut child);
+        run_input_hook(&ctx, &mut plugin, &mut child);
 
         let edges: Vec<_> = state()
             .lock()
@@ -5117,16 +11207,17 @@ mod tests {
             },
         ));
 
+        let ctx = egui::Context::default();
         let mut plugin = SyntheticInputPlugin::default();
         let mut first = raw_input(egui::ViewportId::ROOT, 7.0, true);
-        run_input_hook(&mut plugin, &mut first);
+        run_input_hook(&ctx, &mut plugin, &mut first);
         let pending_after_first = state()
             .lock()
             .expect("key input state poisoned")
             .pending
             .len();
         let mut second = raw_input(egui::ViewportId::ROOT, 7.0, true);
-        run_input_hook(&mut plugin, &mut second);
+        run_input_hook(&ctx, &mut plugin, &mut second);
         let pending_after_second = state()
             .lock()
             .expect("key input state poisoned")
@@ -5194,34 +11285,40 @@ mod tests {
 
     #[test]
     fn synthetic_modifier_changes_precede_their_edges_without_rewriting_received_keys() {
+        let _serial = lock_test_input();
         let ctx = egui::Context::default();
-        let key = |modifiers, pressed| egui::Event::Key {
-            key: egui::Key::Enter,
+        let key = |key, modifiers, pressed| egui::Event::Key {
+            key,
             physical_key: None,
             pressed,
             repeat: false,
             modifiers,
         };
-        let received = key(egui::Modifiers::ALT, true);
+        let received = key(egui::Key::A, egui::Modifiers::ALT, true);
         let mut plugin = SyntheticInputPlugin {
-            prepared: Some(super::PreparedSyntheticFrame {
-                frame_nr: 3,
-                time_key: super::RawInputTimeKey::from(Some(1.0)),
-                raw_input_time: Some(1.0),
-                batches: vec![super::SyntheticViewportBatch {
-                    viewport: egui::ViewportId::ROOT,
-                    events: vec![
-                        key(egui::Modifiers::CTRL, true),
-                        key(egui::Modifiers::NONE, false),
-                    ],
-                }],
-                hold_attributions: Vec::new(),
-                delivered_viewports: Vec::new(),
-                final_modifiers: egui::Modifiers::NONE,
-                armed: true,
-                #[cfg(windows)]
-                pointer_delivery: super::PreparedSyntheticPointerDelivery::Absent,
-            }),
+            prepared: Some(super::Arc::new(super::Mutex::new(
+                super::PreparedSyntheticFrame {
+                    frame_nr: 3,
+                    time_key: super::RawInputTimeKey::from(Some(1.0)),
+                    raw_input_time: Some(1.0),
+                    batches: vec![super::SyntheticViewportBatch {
+                        target: super::SyntheticRoutingTarget {
+                            hwnd: 1,
+                            viewport: egui::ViewportId::ROOT,
+                        },
+                        events: vec![
+                            prepared_key(key(egui::Key::Enter, egui::Modifiers::CTRL, true)),
+                            prepared_key(key(egui::Key::Enter, egui::Modifiers::NONE, false)),
+                        ],
+                    }],
+                    hold_attributions: Vec::new(),
+                    delivered_viewports: Vec::new(),
+                    final_modifiers: egui::Modifiers::NONE,
+                    armed: true,
+                    #[cfg(windows)]
+                    pointer_delivery: super::PreparedSyntheticPointerDelivery::Absent,
+                },
+            ))),
             ..Default::default()
         };
         let mut input = egui::RawInput {
@@ -5238,9 +11335,9 @@ mod tests {
                 egui::Event::ModifiersChanged(egui::Modifiers::ALT),
                 received,
                 egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
-                key(egui::Modifiers::CTRL, true),
+                key(egui::Key::Enter, egui::Modifiers::CTRL, true),
                 egui::Event::ModifiersChanged(egui::Modifiers::NONE),
-                key(egui::Modifiers::NONE, false),
+                key(egui::Key::Enter, egui::Modifiers::NONE, false),
             ]
         );
         ctx.begin_pass(input);
@@ -5260,13 +11357,14 @@ mod tests {
             SyntheticModifiers::default(),
         ));
 
+        let ctx = synthetic_test_context(&[viewport]);
         let mut undrawn_plugin = SyntheticInputPlugin::default();
         let mut first_root = raw_input(egui::ViewportId::ROOT, 10.0, true);
         first_root.viewports.entry(viewport).or_default().focused = Some(true);
-        run_input_hook(&mut undrawn_plugin, &mut first_root);
+        run_input_hook(&ctx, &mut undrawn_plugin, &mut first_root);
         let mut next_root = raw_input(egui::ViewportId::ROOT, 11.0, true);
         next_root.viewports.entry(viewport).or_default().focused = Some(true);
-        run_input_hook(&mut undrawn_plugin, &mut next_root);
+        run_input_hook(&ctx, &mut undrawn_plugin, &mut next_root);
         assert!(undrawn_plugin.issues.iter().any(|issue| matches!(
             issue,
             SyntheticInputIssue::TargetViewportNotRendered {
@@ -5286,16 +11384,16 @@ mod tests {
         let mut focus_plugin = SyntheticInputPlugin::default();
         let mut focused_root = raw_input(egui::ViewportId::ROOT, 20.0, true);
         focused_root.viewports.entry(viewport).or_default().focused = Some(true);
-        run_input_hook(&mut focus_plugin, &mut focused_root);
+        run_input_hook(&ctx, &mut focus_plugin, &mut focused_root);
         let mut focused_child = raw_input(viewport, 20.0, true);
-        run_input_hook(&mut focus_plugin, &mut focused_child);
+        run_input_hook(&ctx, &mut focus_plugin, &mut focused_child);
         assert!(physical_key_down(PhysicalKeySlot::new(0x23, false)));
 
         let mut blurred_root = raw_input(egui::ViewportId::ROOT, 21.0, true);
         blurred_root.viewports.entry(viewport).or_default().focused = Some(false);
-        run_input_hook(&mut focus_plugin, &mut blurred_root);
+        run_input_hook(&ctx, &mut focus_plugin, &mut blurred_root);
         let mut blurred_child = raw_input(viewport, 21.0, false);
-        run_input_hook(&mut focus_plugin, &mut blurred_child);
+        run_input_hook(&ctx, &mut focus_plugin, &mut blurred_child);
         assert!(!physical_key_down(PhysicalKeySlot::new(0x23, false)));
         assert!(matches!(
             blurred_child.events.as_slice(),
@@ -5428,7 +11526,7 @@ mod tests {
         }
 
         let mut plugin = SyntheticInputPlugin {
-            prepared: Some(PreparedSyntheticFrame {
+            prepared: Some(super::Arc::new(super::Mutex::new(PreparedSyntheticFrame {
                 frame_nr: 3,
                 time_key: super::RawInputTimeKey::from(Some(1.0)),
                 raw_input_time: Some(1.0),
@@ -5438,7 +11536,7 @@ mod tests {
                 final_modifiers: egui::Modifiers::NONE,
                 armed: true,
                 pointer_delivery: PreparedSyntheticPointerDelivery::Pending(prepared),
-            }),
+            }))),
             ..Default::default()
         };
         let context = egui::Context::default();
@@ -5454,7 +11552,7 @@ mod tests {
             },
         ));
         let mut input = raw_input(viewport, 1.005, true);
-        plugin.inject_prepared_pointer(&mut input);
+        plugin.inject_prepared_pointer(&context, &mut input);
 
         assert!(input.events.is_empty());
         assert!(plugin.issues.is_empty());

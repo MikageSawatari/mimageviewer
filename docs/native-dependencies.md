@@ -572,11 +572,12 @@ VST のロゴは使用しない。名称の文字表記も商標ガイドライ�
 文字表記によってガイドラインを回避できるとは扱わない。この記録は採用した表記方針を
 示すもので、ガイドラインへの適合や商標侵害の有無を断定するものではない。
 
-## ローカル AI 説明文 worker
+## ローカル AI 説明文・文字起こし worker
 
 `crates/vlm-worker` は llama.cpp b12032 (commit
 `dde879bc4f954b809892fd0d660515f42536394a`) の ggml / llama / mtmd と
-MSVC CRT を静的リンクする。`vendor/llama.cpp` は変更しない。
+whisper.cpp v1.9.5 と MSVC CRT を静的リンクする。whisper は llama.cpp の ggml を共有し、
+自前の ggml を追加しない。`vendor/llama.cpp` と `vendor/whisper.cpp` は変更しない。
 現ソースの identity と一致する `vendor/vlm-worker/mimageviewer-vlm.exe` があれば、
 `build-vlm-worker.ps1` は CMake の探索・実行をせず再利用する。CMake / Vulkan SDK / llama.cpp のソースは不要。
 worker が欠落していれば、まず `bootstrap-vendor.sh` または次の PowerShell でバックアップを復旧する。
@@ -595,6 +596,20 @@ SHA-256 照合後に staging へ安全に展開し、欠落している `vendor/
 GitHub が archive を作り直して hash が変わった場合は、取得を止めて照合し直す。
 既存 source tree を削除・置換せず、archive の traversal・絶対パス・リンク・Windows 名の別名・重複を拒否する。
 この段階では worker やモデルを起動しない。
+
+文字起こしを含む combined worker の再ビルドには、`scripts/setup-whisper-cpp.ps1` で
+固定 v1.9.5 の GitHub tag ZIP を取得する。SHA-256 は
+`7a7a73071939f16bc028ad2f713f16f26e37afb6cc155d0f19e3d65705d2b1d9`。
+同じ staging・安全な展開・検証後の no-overwrite 公開を使い、既存の `vendor/whisper.cpp` を置換しない。
+現 identity の worker exe があれば、両方のソースと SDK は再利用に不要。
+
+**worker のソース (`crates/vlm-worker`) を変えたブランチを master へ取り込んだら、そのブランチで作った
+`mimageviewer-vlm.exe` を、master の `vendor\vlm-worker\` とバックアップ
+(`C:\home\mimageviewer_vendor_backup\vlm-worker\`) の両方へ実ファイルでコピーし直す。**
+コピーの後に `.\scripts\vlm-worker-identity.ps1 -ValidateRepo .` が通ることを確かめる。
+これを忘れると、master の build-dev・リリースビルドが identity の検査で止まり、バックアップからの復旧でも
+直らない (2026-11-17、文字起こし T1 の取り込みの後に §1.767 の作業ツリーで発生)。
+バックアップには署名なしの原本を置く。配布物の署名は `build-release.ps1 -Sign` が内包の前に行う。
 
 実際に C++ の変更で再ビルドする場合だけ Vulkan SDK `C:\VulkanSDK\1.4.363.0` と
 Visual Studio 18 2026 の C++ build tools / CMake が必要。リポジトリルートで実行する。
@@ -626,10 +641,13 @@ build-portable のコピー前すべてで検査し、`-SkipBuild` の再利用�
 build-release / build-portable は内包・コピー前に build helper を呼ぶ。一致する worker は再利用し、missing / stale の場合だけ build する。
 署名時は通常版が内包前に vendor exe を署名し、portable はコピー後の PE 一覧に含めて署名・検証する。
 protocol 2 の hello では DB と同じ整数の `prompt_version=1` も照合し、実行時には source identity を比較しない。
+文字起こしは同じ exe の `--asr-serve`、protocol 1、`settings_version=1` で独立に起動する。
+GPU の一覧は共用し、ASR はソフトウェア以外の Vulkan GPU (内蔵を含む) を使い、VRAM の下限を設けない。
+VLM のGPU選択条件は変えない。初回統合と whisper/llama/ggml の更新では両方の役割を回帰確認する。
 非起動の回帰検査は `powershell -NoProfile -File scripts/test-vlm-worker-identity.ps1`。
 
 root の `VLM-WORKER-LICENSE.txt` を about の全文表示と portable の loose file に使う。
-llama.cpp / ggml / libmtmd の root MIT に加え、現 CMake 構成で有効な
+llama.cpp / ggml / libmtmd / whisper.cpp の MIT に加え、現 CMake 構成で有効な
 llamafile (Mozilla MIT)、rotate-bits、xxHash、JSON for Modern C++、stb_image、miniaudio、
 SHA の public-domain 表記、SDK の Vulkan / SPIR-V header の MIT 表記を含む。
 `GGML_LLAMAFILE=ON`、`MTMD_VIDEO=OFF` (subprocess header は未使用)、Vulkan loader は

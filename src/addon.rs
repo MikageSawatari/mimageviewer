@@ -24,6 +24,268 @@ pub(crate) const MAX_MODEL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 pub(crate) const MAX_PART_BYTES: u64 = 2 * 1024 * 1024 * 1024 - 1;
 
 #[cfg(test)]
+mod asr_tests {
+    use super::*;
+    use crate::asr_addon::{AsrAddon, tests::fixture};
+    use crate::vlm_addon_download::tests::{ok, server, server_with_hook};
+    use std::time::{Duration, Instant};
+
+    fn wait(owner: &mut AsrAddon) -> AddonEvent {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(event) = owner.poll() {
+                return event;
+            }
+            assert!(Instant::now() < deadline, "ASR worker did not complete");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn asr_install_verifies_all_files_before_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, bodies) = fixture();
+        let mut responses = vec![ok(&serde_json::to_vec(&index).unwrap())];
+        responses.extend(bodies.iter().map(|body| ok(body)));
+        let (base, requests, join) = server(responses);
+        let (tx, _rx) = mpsc::sync_channel(8);
+        install_for_kind(
+            AddonKind::Asr,
+            dir.path(),
+            &base,
+            &AtomicBool::new(false),
+            &tx,
+        )
+        .unwrap();
+        join.join().unwrap();
+        let requested: Vec<_> = requests
+            .try_iter()
+            .map(|request| request.lines().next().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            requested,
+            [
+                "GET /asr-model-index.json HTTP/1.1",
+                "GET /ggml-large-v3-turbo-q5_0.bin HTTP/1.1",
+                "GET /LICENSE HTTP/1.1",
+                "GET /NOTICE HTTP/1.1",
+            ]
+        );
+        let scan = || scan_for_kind(AddonKind::Asr, dir.path(), &AtomicBool::new(false));
+        assert!(matches!(
+            scan(),
+            AddonStatus::Valid {
+                mmproj_path: None,
+                ..
+            }
+        ));
+        let pack = dir.path().join("packs").join(&index.model_id);
+        assert!(pack.join("INSTALL_OK").exists());
+        assert!(pack.join("asr-model-index.json").exists());
+        assert!(!pack.join(INDEX_NAME).exists());
+        for (file, body) in index.files.iter().zip(&bodies) {
+            let path = pack.join(&file.name);
+            fs::write(&path, vec![b'x'; body.len()]).unwrap();
+            assert!(
+                matches!(scan(), AddonStatus::Corrupt(_)),
+                "{} hash",
+                file.name
+            );
+            fs::write(&path, b"x").unwrap();
+            assert!(
+                matches!(scan(), AddonStatus::Corrupt(_)),
+                "{} size",
+                file.name
+            );
+            fs::remove_file(&path).unwrap();
+            assert!(
+                matches!(scan(), AddonStatus::Corrupt(_)),
+                "{} missing",
+                file.name
+            );
+            fs::write(&path, body).unwrap();
+        }
+        assert!(matches!(scan(), AddonStatus::Valid { .. }));
+        fs::remove_file(pack.join("INSTALL_OK")).unwrap();
+        assert_eq!(scan(), AddonStatus::Missing);
+    }
+
+    #[test]
+    fn asr_wrong_index_or_download_never_publishes() {
+        for invalid_index in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut index, _) = fixture();
+            if invalid_index {
+                index.files[0].name = "../escape.bin".into();
+            }
+            let mut responses = vec![ok(&serde_json::to_vec(&index).unwrap())];
+            if !invalid_index {
+                responses.push(ok(b"bad-model!"));
+            }
+            let (base, requests, join) = server(responses);
+            let (tx, _rx) = mpsc::sync_channel(8);
+            assert!(
+                install_for_kind(
+                    AddonKind::Asr,
+                    dir.path(),
+                    &base,
+                    &AtomicBool::new(false),
+                    &tx
+                )
+                .is_err()
+            );
+            join.join().unwrap();
+            assert_eq!(
+                requests.try_iter().count(),
+                if invalid_index { 1 } else { 2 }
+            );
+            assert!(!dir.path().join("active.json").exists());
+            assert_eq!(
+                scan_for_kind(AddonKind::Asr, dir.path(), &AtomicBool::new(false)),
+                AddonStatus::Missing
+            );
+            if invalid_index {
+                assert!(!dir.path().join("downloads").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn asr_resume_uses_shared_range_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, bodies) = fixture();
+        let downloads = dir.path().join("downloads").join(&index.model_id);
+        fs::create_dir_all(&downloads).unwrap();
+        fs::write(
+            downloads.join(format!("{}.partial", index.files[0].name)),
+            &bodies[0][..4],
+        )
+        .unwrap();
+        let mut range = format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes 4-{}/{}\r\nConnection: close\r\n\r\n",
+            bodies[0].len() - 4, bodies[0].len() - 1, bodies[0].len()).into_bytes();
+        range.extend(&bodies[0][4..]);
+        let mut responses = vec![ok(&serde_json::to_vec(&index).unwrap()), range];
+        responses.extend(bodies[1..].iter().map(|body| ok(body)));
+        let (base, requests, join) = server(responses);
+        let (tx, _rx) = mpsc::sync_channel(8);
+        install_for_kind(
+            AddonKind::Asr,
+            dir.path(),
+            &base,
+            &AtomicBool::new(false),
+            &tx,
+        )
+        .unwrap();
+        join.join().unwrap();
+        let requests: Vec<_> = requests.try_iter().collect();
+        assert!(requests[1].to_ascii_lowercase().contains("range: bytes=4-"));
+        assert!(matches!(
+            scan_for_kind(AddonKind::Asr, dir.path(), &AtomicBool::new(false)),
+            AddonStatus::Valid { .. }
+        ));
+    }
+
+    #[test]
+    fn asr_cancel_keeps_staged_model_for_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let (index, bodies) = fixture();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let server_cancel = cancel.clone();
+        let (base, _, join) = server_with_hook(
+            vec![
+                ok(&serde_json::to_vec(&index).unwrap()),
+                ok(&bodies[0]),
+                ok(&bodies[1]),
+            ],
+            move |ordinal| {
+                if ordinal == 2 {
+                    server_cancel.store(true, Ordering::Relaxed);
+                }
+            },
+        );
+        let (tx, _rx) = mpsc::sync_channel(8);
+        assert_eq!(
+            install_for_kind(AddonKind::Asr, dir.path(), &base, &cancel, &tx).unwrap_err(),
+            AddonKind::Asr.cancelled()
+        );
+        join.join().unwrap();
+        assert!(!dir.path().join("active.json").exists());
+        let mut responses = vec![ok(&serde_json::to_vec(&index).unwrap())];
+        responses.extend(bodies[1..].iter().map(|body| ok(body)));
+        let (base, requests, join) = server(responses);
+        install_for_kind(
+            AddonKind::Asr,
+            dir.path(),
+            &base,
+            &AtomicBool::new(false),
+            &tx,
+        )
+        .unwrap();
+        join.join().unwrap();
+        assert_eq!(requests.try_iter().count(), 3);
+        assert!(matches!(
+            scan_for_kind(AddonKind::Asr, dir.path(), &AtomicBool::new(false)),
+            AddonStatus::Valid { .. }
+        ));
+    }
+
+    #[test]
+    fn asr_cached_owner_and_removal_preserve_siblings_and_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("addons/asr");
+        let (index, bodies) = fixture();
+        let pack = root.join("packs").join(&index.model_id);
+        fs::create_dir_all(&pack).unwrap();
+        for (file, body) in index.files.iter().zip(&bodies) {
+            fs::write(pack.join(&file.name), body).unwrap();
+        }
+        fs::write(
+            pack.join("asr-model-index.json"),
+            serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        fs::write(pack.join("INSTALL_OK"), b"1\n").unwrap();
+        fs::write(
+            root.join("active.json"),
+            serde_json::to_vec(&ActivePointer {
+                schema: 1,
+                model_id: index.model_id.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let vlm = dir.path().join("addons/vlm");
+        fs::create_dir_all(&vlm).unwrap();
+        fs::write(vlm.join("active.json"), b"sibling").unwrap();
+        fs::write(dir.path().join("transcript.db"), b"user transcripts").unwrap();
+        let mut owner = AsrAddon::new(root.clone());
+        assert!(!owner.is_scanning());
+        owner.request_scan();
+        assert!(owner.is_scanning());
+        assert!(owner.start_remove().is_err());
+        assert!(owner.start_install().is_err());
+        assert!(matches!(wait(&mut owner), AddonEvent::StatusChanged));
+        assert_eq!(
+            owner.installed_model_path(),
+            Some(pack.join(&index.files[0].name).as_path())
+        );
+        owner.request_scan();
+        assert!(!owner.is_scanning());
+        owner.start_remove().unwrap();
+        assert_eq!(owner.operation(), AddonOperation::Removing);
+        assert!(owner.start_install().is_err());
+        assert!(matches!(wait(&mut owner), AddonEvent::Removed));
+        assert!(owner.installed_model_path().is_none());
+        assert!(!root.exists());
+        assert_eq!(fs::read(vlm.join("active.json")).unwrap(), b"sibling");
+        assert_eq!(
+            fs::read(dir.path().join("transcript.db")).unwrap(),
+            b"user transcripts"
+        );
+    }
+}
+
+#[cfg(test)]
 mod depth_tests {
     use super::*;
     use crate::depth_addon::tests::fixture;
@@ -152,6 +414,11 @@ mod depth_tests {
                 .default_base_url()
                 .ends_with("/depth-model-v1")
         );
+        assert_eq!(AddonKind::Asr.index_name(), "asr-model-index.json");
+        assert_eq!(
+            AddonKind::Asr.default_base_url(),
+            "https://github.com/MikageSawatari/mimageviewer/releases/download/asr-model-v1"
+        );
     }
 
     #[test]
@@ -165,6 +432,9 @@ mod depth_tests {
             "depth-model-install"
         );
         assert_eq!(AddonKind::Depth.remove_thread_name(), "depth-model-remove");
+        assert_eq!(AddonKind::Asr.scan_thread_name(), "asr-model-scan");
+        assert_eq!(AddonKind::Asr.install_thread_name(), "asr-model-install");
+        assert_eq!(AddonKind::Asr.remove_thread_name(), "asr-model-remove");
     }
 
     #[test]
@@ -177,7 +447,11 @@ mod depth_tests {
             .unwrap()
             .to_string();
         assert!(source.contains("VLM_detail"));
-        for (kind, label) in [(AddonKind::Vlm, "VLM"), (AddonKind::Depth, "Depth")] {
+        for (kind, label) in [
+            (AddonKind::Vlm, "VLM"),
+            (AddonKind::Depth, "Depth"),
+            (AddonKind::Asr, "ASR"),
+        ] {
             assert_eq!(
                 scan_for_kind(kind, dir.path(), &AtomicBool::new(false)),
                 AddonStatus::Corrupt(format!("Invalid {label} active.json: {source}"))
@@ -197,7 +471,7 @@ mod depth_tests {
         )
         .unwrap();
         fs::write(pack.join("INSTALL_OK"), b"1").unwrap();
-        for kind in [AddonKind::Vlm, AddonKind::Depth] {
+        for kind in [AddonKind::Vlm, AddonKind::Depth, AddonKind::Asr] {
             let path = pack.join(kind.index_name());
             let source = File::open(&path).err().unwrap();
             let expected = format!("Open {}: {source}", path.display());
@@ -222,6 +496,7 @@ mod depth_tests {
 pub enum AddonKind {
     Vlm,
     Depth,
+    Asr,
 }
 
 impl AddonKind {
@@ -229,36 +504,42 @@ impl AddonKind {
         match self {
             Self::Vlm => "VLM",
             Self::Depth => "Depth",
+            Self::Asr => "ASR",
         }
     }
     pub(crate) fn cancelled(self) -> &'static str {
         match self {
             Self::Vlm => http::CANCELLED,
             Self::Depth => "Depth installation cancelled",
+            Self::Asr => "ASR installation cancelled",
         }
     }
     fn scan_thread_name(self) -> &'static str {
         match self {
             Self::Vlm => "vlm-model-scan",
             Self::Depth => "depth-model-scan",
+            Self::Asr => "asr-model-scan",
         }
     }
     fn install_thread_name(self) -> &'static str {
         match self {
             Self::Vlm => "vlm-model-install",
             Self::Depth => "depth-model-install",
+            Self::Asr => "asr-model-install",
         }
     }
     fn remove_thread_name(self) -> &'static str {
         match self {
             Self::Vlm => "vlm-model-remove",
             Self::Depth => "depth-model-remove",
+            Self::Asr => "asr-model-remove",
         }
     }
     pub fn index_name(self) -> &'static str {
         match self {
             Self::Vlm => INDEX_NAME,
             Self::Depth => "depth-model-index.json",
+            Self::Asr => "asr-model-index.json",
         }
     }
     pub fn default_base_url(self) -> &'static str {
@@ -267,12 +548,16 @@ impl AddonKind {
             Self::Depth => {
                 "https://github.com/MikageSawatari/mimageviewer/releases/download/depth-model-v1"
             }
+            Self::Asr => {
+                "https://github.com/MikageSawatari/mimageviewer/releases/download/asr-model-v1"
+            }
         }
     }
     fn base_url(self) -> String {
         let variable = match self {
             Self::Vlm => "MIV_VLM_MODEL_BASE_URL",
             Self::Depth => "MIV_DEPTH_MODEL_BASE_URL",
+            Self::Asr => "MIV_ASR_MODEL_BASE_URL",
         };
         #[cfg(debug_assertions)]
         if let Ok(value) = std::env::var(variable) {
@@ -334,6 +619,7 @@ impl ModelIndex {
         match kind {
             AddonKind::Vlm => self.validate(),
             AddonKind::Depth => crate::depth_addon::validate_index(self),
+            AddonKind::Asr => crate::asr_addon::validate_index(self),
         }
     }
 
@@ -499,17 +785,22 @@ impl ModelAddon {
     #[cfg(test)]
     pub(crate) fn with_test_operation(root: PathBuf, operation: AddonOperation) -> Self {
         let mut addon = Self::with_test_status(root, AddonStatus::Missing);
+        addon.set_operation_for_test(operation);
+        addon
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_operation_for_test(&mut self, operation: AddonOperation) {
         let running = Running {
             rx: std::sync::mpsc::sync_channel(1).1,
             cancel: Arc::new(AtomicBool::new(false)),
         };
-        addon.state = match operation {
+        self.state = match operation {
             AddonOperation::None => WorkerState::Idle,
             AddonOperation::Installing => WorkerState::Installing(running),
             AddonOperation::Cancelling => WorkerState::Cancelling(running),
             AddonOperation::Removing => WorkerState::Removing(running),
         };
-        addon
     }
 
     #[cfg(test)]

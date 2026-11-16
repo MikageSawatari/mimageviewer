@@ -216,7 +216,7 @@ fn recent_apps_record_timeout_with_identity_captured_at_request_start() {
     assert!(
         f.call(&c, 3, hello("later", "2", RequestKind::Internal))
             .result
-            .is_ok()
+            .is_err()
     );
     elapsed.store(20, Ordering::Release);
     let response = replies

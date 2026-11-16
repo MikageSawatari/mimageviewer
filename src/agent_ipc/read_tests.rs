@@ -222,6 +222,7 @@ fn set_snapshot(snapshot: PermissionSnapshot) {
         settings.agent_show_thumbnails = snapshot.thumbnails;
         settings.agent_show_gps = snapshot.gps;
         settings.agent_show_ai_captions = snapshot.ai_captions;
+        settings.agent_show_transcripts = snapshot.transcripts;
         db.save_full(&settings)
     })
     .unwrap();
@@ -238,6 +239,7 @@ fn revoke_or_cycle(which: usize, original: PermissionSnapshot) {
         }),
         2 => {
             set_snapshot(PermissionSnapshot {
+                transcripts: false,
                 level: AgentLevel::Disabled,
                 thumbnails: false,
                 gps: false,
@@ -249,6 +251,10 @@ fn revoke_or_cycle(which: usize, original: PermissionSnapshot) {
             ai_captions: false,
             ..original
         }),
+        4 => set_snapshot(PermissionSnapshot {
+            transcripts: false,
+            ..original
+        }),
         _ => unreachable!(),
     }
 }
@@ -256,10 +262,11 @@ fn revoke_or_cycle(which: usize, original: PermissionSnapshot) {
 #[test]
 fn real_read_results_recheck_whole_snapshot_during_work_and_at_wire_boundary() {
     for change_before_worker_finishes in [true, false] {
-        for field in 0..4 {
+        for field in 0..5 {
             let mut f = Fixture::new();
             let base = Instant::now();
             let original = PermissionSnapshot {
+                transcripts: true,
                 level: AgentLevel::ReadOnly,
                 thumbnails: true,
                 gps: true,

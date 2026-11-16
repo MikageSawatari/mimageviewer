@@ -1653,6 +1653,7 @@ fn password_wait_can_resume_and_true_cancel_releases_the_viewer_owner() {
     let pdf = PathBuf::from(r"C:\pdf\locked.pdf");
     app.pdf_password_request = Some(PdfPasswordRequest::legacy(pdf.clone()));
     app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
         history_trigger: HistoryTrigger::UserChosen,
         resume_slideshow: false,
         target: DeferredFsTarget::Required(SnapshotTarget::PdfPage {

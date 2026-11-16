@@ -53,6 +53,8 @@ pub enum ContextMenuItemId {
     OrganizeFiles,
     CreateAiCaptions,
     DeleteAiCaptions,
+    CreateTranscripts,
+    DeleteTranscripts,
     ConvertImageFolderToZip,
     NewFolder,
     Paste,
@@ -95,6 +97,8 @@ impl ContextMenuItemId {
         Self::OrganizeFiles,
         Self::CreateAiCaptions,
         Self::DeleteAiCaptions,
+        Self::CreateTranscripts,
+        Self::DeleteTranscripts,
         Self::ConvertImageFolderToZip,
         Self::NewFolder,
         Self::Paste,
@@ -137,6 +141,8 @@ impl ContextMenuItemId {
             Self::OrganizeFiles => "OrganizeFiles",
             Self::CreateAiCaptions => "CreateAiCaptions",
             Self::DeleteAiCaptions => "DeleteAiCaptions",
+            Self::CreateTranscripts => "CreateTranscripts",
+            Self::DeleteTranscripts => "DeleteTranscripts",
             Self::ConvertImageFolderToZip => "ConvertImageFolderToZip",
             Self::NewFolder => "NewFolder",
             Self::Paste => "Paste",
@@ -197,6 +203,8 @@ impl ContextMenuItemId {
             Self::OrganizeFiles => "ファイル整理先…",
             Self::CreateAiCaptions => "AI 説明文を作る",
             Self::DeleteAiCaptions => "AI 説明文を削除",
+            Self::CreateTranscripts => "文字起こしを作る",
+            Self::DeleteTranscripts => "文字起こしを削除",
             Self::ConvertImageFolderToZip => "ZIP に変換…",
             Self::NewFolder => "新しいフォルダ…",
             Self::Paste => "貼り付け",
@@ -243,6 +251,8 @@ impl ContextMenuItemId {
             MenuCommand::OrganizeFiles => Self::OrganizeFiles,
             MenuCommand::CreateAiCaptions => Self::CreateAiCaptions,
             MenuCommand::DeleteAiCaptions => Self::DeleteAiCaptions,
+            MenuCommand::CreateTranscripts => Self::CreateTranscripts,
+            MenuCommand::DeleteTranscripts => Self::DeleteTranscripts,
             MenuCommand::ConvertImageFolderToZip => Self::ConvertImageFolderToZip,
             MenuCommand::CopyPath => Self::CopyPath,
             MenuCommand::CopyFileName => Self::CopyFileName,
@@ -562,6 +572,16 @@ impl ContextMenuPreviewScenario {
                     | ContextMenuItemKind::ConvertibleArchive
             ))
             .then(|| CAPTION_DELETE_NO_TARGET_REASON.into()),
+            transcript_creation_disabled_reason: (!matches!(
+                kind,
+                ContextMenuItemKind::Video | ContextMenuItemKind::Audio
+            ))
+            .then(|| TRANSCRIPT_NO_TARGET_REASON.into()),
+            transcript_deletion_disabled_reason: (!matches!(
+                kind,
+                ContextMenuItemKind::Video | ContextMenuItemKind::Audio
+            ))
+            .then(|| TRANSCRIPT_NO_TARGET_REASON.into()),
             can_paste_edit_bundle: true,
             has_explorer_folder: true,
             collection_reference,
@@ -834,6 +854,8 @@ pub enum MenuCommand {
     OrganizeFiles,
     CreateAiCaptions,
     DeleteAiCaptions,
+    CreateTranscripts,
+    DeleteTranscripts,
     ConvertImageFolderToZip,
     CopyPath,
     CopyFileName,
@@ -1016,6 +1038,8 @@ pub struct ContextMenuInput {
     /// Computed from the same effective selection/direct-folder targets as admission.
     pub caption_creation_disabled_reason: Option<String>,
     pub caption_deletion_disabled_reason: Option<String>,
+    pub transcript_creation_disabled_reason: Option<String>,
+    pub transcript_deletion_disabled_reason: Option<String>,
     pub can_paste_edit_bundle: bool,
     pub has_explorer_folder: bool,
     /// Collection root の参照解除権限。元ファイル操作は独立した対象を持つ。
@@ -1130,6 +1154,32 @@ fn caption_deletion_node(input: &ContextMenuInput) -> MenuNode {
         label: "AI 説明文を削除".into(),
         enabled: input.caption_deletion_disabled_reason.is_none(),
         disabled_reason: input.caption_deletion_disabled_reason.clone(),
+    }
+}
+
+pub(crate) const TRANSCRIPT_NO_TARGET_REASON: &str =
+    "文字起こしの対象となる動画・音声ファイルがありません。書庫内の項目は対象外です";
+
+fn transcript_node(input: &ContextMenuInput, delete: bool) -> MenuNode {
+    let reason = if delete {
+        &input.transcript_deletion_disabled_reason
+    } else {
+        &input.transcript_creation_disabled_reason
+    };
+    MenuNode::Item {
+        command: if delete {
+            MenuCommand::DeleteTranscripts
+        } else {
+            MenuCommand::CreateTranscripts
+        },
+        label: if delete {
+            "文字起こしを削除"
+        } else {
+            "文字起こしを作る"
+        }
+        .into(),
+        enabled: reason.is_none(),
+        disabled_reason: reason.clone(),
     }
 }
 
@@ -1491,6 +1541,8 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
                 [
                     caption_creation_node(input, "AI 説明文を作る"),
                     caption_deletion_node(input),
+                    transcript_node(input, false),
+                    transcript_node(input, true),
                 ],
             );
         }
@@ -1623,6 +1675,8 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             [
                 caption_creation_node(input, "AI 説明文を作る"),
                 caption_deletion_node(input),
+                transcript_node(input, false),
+                transcript_node(input, true),
             ],
         );
     }
@@ -2125,6 +2179,16 @@ mod tests {
                     | ContextMenuItemKind::ConvertibleArchive
             ))
             .then(|| CAPTION_DELETE_NO_TARGET_REASON.into()),
+            transcript_creation_disabled_reason: (!matches!(
+                kind,
+                ContextMenuItemKind::Video | ContextMenuItemKind::Audio
+            ))
+            .then(|| TRANSCRIPT_NO_TARGET_REASON.into()),
+            transcript_deletion_disabled_reason: (!matches!(
+                kind,
+                ContextMenuItemKind::Video | ContextMenuItemKind::Audio
+            ))
+            .then(|| TRANSCRIPT_NO_TARGET_REASON.into()),
             can_paste_edit_bundle: false,
             has_explorer_folder: false,
             collection_reference: CollectionReferenceAvailability::NotCollectionRoot,
@@ -2701,6 +2765,8 @@ mod tests {
                     "ファイル整理先…",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
+                    "文字起こしを作る",
+                    "文字起こしを削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2724,6 +2790,8 @@ mod tests {
                     "ファイル整理先…",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
+                    "文字起こしを作る",
+                    "文字起こしを削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2742,6 +2810,8 @@ mod tests {
                     "ファイル整理先…",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
+                    "文字起こしを作る",
+                    "文字起こしを削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2761,6 +2831,8 @@ mod tests {
                     "ファイル整理先…",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
+                    "文字起こしを作る",
+                    "文字起こしを削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2776,6 +2848,8 @@ mod tests {
                     "ファイル整理先…",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
+                    "文字起こしを作る",
+                    "文字起こしを削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2794,6 +2868,8 @@ mod tests {
                     "ファイル整理先…",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
+                    "文字起こしを作る",
+                    "文字起こしを削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2812,6 +2888,8 @@ mod tests {
                     "ファイル整理先…",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
+                    "文字起こしを作る",
+                    "文字起こしを削除",
                     "名前の変更…",
                     "パスをコピー",
                     "ファイル名をコピー",
@@ -2828,6 +2906,8 @@ mod tests {
                     "ファイル整理先…",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
+                    "文字起こしを作る",
+                    "文字起こしを削除",
                     "パスをコピー",
                     "ファイル名をコピー",
                     "画像をクリップボードにコピー",
@@ -2847,6 +2927,8 @@ mod tests {
                     "ファイル整理先…",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
+                    "文字起こしを作る",
+                    "文字起こしを削除",
                     "パスをコピー",
                     "ページ名をコピー",
                     "編集を反映した画像をコピー",
@@ -2865,6 +2947,8 @@ mod tests {
                     "ファイル整理先…",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
+                    "文字起こしを作る",
+                    "文字起こしを削除",
                     "代表画像のパスをコピー",
                     "アプリケーションで開く…",
                     "外部ツールの設定…",
@@ -2876,6 +2960,8 @@ mod tests {
                     "ファイル整理先…",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
+                    "文字起こしを作る",
+                    "文字起こしを削除",
                     "パスをコピー",
                 ][..],
             ),
@@ -2885,6 +2971,8 @@ mod tests {
                     "ファイル整理先…",
                     "AI 説明文を作る",
                     "AI 説明文を削除",
+                    "文字起こしを作る",
+                    "文字起こしを削除",
                     "パスをコピー",
                 ][..],
             ),
@@ -3011,6 +3099,8 @@ mod tests {
                 "ファイル整理先…",
                 "AI 説明文を作る",
                 "AI 説明文を削除",
+                "文字起こしを作る",
+                "文字起こしを削除",
                 "選択項目のパスをコピー [5件]",
                 "左に回転 (L)",
                 "右に回転 (R)",
@@ -3211,6 +3301,8 @@ mod tests {
             &[
                 "AI 説明文を作る",
                 "AI 説明文を削除",
+                "文字起こしを作る",
+                "文字起こしを削除",
                 "新しいフォルダ…",
                 "貼り付け",
                 "このフォルダのパスをコピー",
@@ -3420,6 +3512,8 @@ mod tests {
                 "|",
                 "CreateAiCaptions",
                 "DeleteAiCaptions",
+                "CreateTranscripts",
+                "DeleteTranscripts",
                 "|",
                 "Rename",
                 "|",
@@ -3466,6 +3560,8 @@ mod tests {
                 "|",
                 "CreateAiCaptions",
                 "DeleteAiCaptions",
+                "CreateTranscripts",
+                "DeleteTranscripts",
                 "|",
                 "CopyPath",
                 "|",
@@ -3768,6 +3864,40 @@ mod tests {
         for background in [false, true] {
             case.is_folder_context = background;
             assert_eq!(root_layout_ids(&build_context_menu(&case))[0], id);
+        }
+    }
+
+    #[test]
+    fn transcript_commands_are_grid_only_and_keep_disabled_reason_and_custom_visibility() {
+        for kind in [
+            ContextMenuItemKind::Video,
+            ContextMenuItemKind::Audio,
+            ContextMenuItemKind::Image,
+        ] {
+            let mut case = input(kind, ContextMenuSurface::Grid);
+            for (command, id) in [
+                (
+                    MenuCommand::CreateTranscripts,
+                    ContextMenuItemId::CreateTranscripts,
+                ),
+                (
+                    MenuCommand::DeleteTranscripts,
+                    ContextMenuItemId::DeleteTranscripts,
+                ),
+            ] {
+                let reason = (kind == ContextMenuItemKind::Image)
+                    .then(|| TRANSCRIPT_NO_TARGET_REASON.to_owned());
+                assert_eq!(
+                    command_state(&build_context_menu(&case), command.clone()),
+                    Some((id.label().into(), reason.is_none(), reason))
+                );
+                case.layout.set_visible(id, false);
+                assert!(command_state(&build_context_menu(&case), command.clone()).is_none());
+                case.layout.set_visible(id, true);
+                case.surface = ContextMenuSurface::Fullscreen;
+                assert!(command_state(&build_context_menu(&case), command).is_none());
+                case.surface = ContextMenuSurface::Grid;
+            }
         }
     }
 

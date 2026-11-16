@@ -1,5 +1,10 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+2026-11-14: 「文字起こしを作る」「文字起こしの作成状況」はツールメニュー、
+「文字起こしを作る」「文字起こしを削除」は一覧の右クリックから操作する。
+長いバッチ処理を明示的に始める管理操作のため、既定のショートカットは設けない
+（既存の AI 説明文と同じく MenuCommandSpec.action は None）。
+
 2026-11-04 受入 E: `GlobalLocalSearch`（既定Ctrl+F）はPDF/EPUBのページ表示中には
 現在地フィルタを開始せず、「本のページ表示中は現在地を絞り込めません」と短く通知する。
 既存keymapによる発火・focus/IME/modalの受付規則を維持する。ファイルメニューの同項目は
@@ -9,15 +14,29 @@
 
 `FsDepthParallax` は画像閲覧 (`FsImage`) の `Press` 操作、既定は
 <kbd>D</kbd>。再度押すか右パネルの×で終了する。操作カスタマイズで変更・解除できる。
-main context の MainWindow / Fullscreen / 一覧と連動する F12 の DetachedWindow
-（枠なし全画面を含む）の単ページ静止画を対象とする。複数ウィンドウモードの窓と
-メディアウィンドウなどの独立 context、動画・アニメーション・見開き・連結読み・
+MainWindow / Fullscreen / DetachedWindow（枠なし全画面を含む）の単ページ静止画を対象とする。
+複数ウィンドウモードの窓や独立した静止画 context でも使えるが、
+プロセス全体で 1 context だけが 3D を所有できる。ほかの context が所有中なら入口で拒否し、
+その context の状態は変更しない。動画・アニメーション・見開き・連結読み・
 編集・紙めくり中では受け付けない。360度表示からは3Dへ切り替える。
 3D中の360度切替は受け付けない。
 F12 の ON / OFF による表示先切替と、main の F11 による MainWindow / Fullscreen 切替では
 3Dを終了し、`FsDepthParallax` の実効キー（既定D）での再開を通知する。
-linked F12 の窓内で F11 により通常表示 / 枠なし全画面を切り替えた場合は3Dを継続する。
+別ウィンドウの窓内で F11 により通常表示 / 枠なし全画面を切り替えた場合は3Dを継続する。
 F11 / F12 も既存の `FsToggleWindowMode` / `ToggleDetachedViewerMode` の実効キーを使う。
+フル機能 + メディア別窓の独立 Video / Audio から静止画へ進むと、同じ context のまま
+メディア窓 A を退役して静止画窓 B に交換する。B の画像送りでは3Dを継続する。
+F12 は現在の独立性を継承せず、設定に従う表示先・独立性を一緒に確定する。
+遅延 reopen 中に現在項目が無い場合も、残る binding の session に適用する。
+独立 context が pause / park / fork / close などで live pass を失うときは3Dを終了し、
+一時的な context mount では終了しない。
+main 以外の独立 context から開いたモデル確認の Checking / Confirm と、書き出しの全 phase は、
+共通 modal に加え、所有窓の OS close・他窓の activation・外部 open・自動送りを拒否する。
+所有窓以外の OS close、main owner のモデル確認、環境設定由来のモデル案内には、この追加制限を広げない。
+main 以外の独立 context に `active_detached_transition_outstanding()` がある間は、モデル確認・書き出しの modal を
+開始する入口だけを通知付きで拒否する。導入済みモデルを使う通常の3D入場は、この条件では拒否しない。
+モデル案内の Running / Done / Cancelled / Error は非 modal のまま。詳細は
+[3D 写真設計](depth-parallax-plan.md) §6.4.3 を参照。
 3D中も `FsBgCycle`（既定Shift+B）とリングの背景色サイクルを受け付ける。
 透過画像だけで黒→白→市松（AIアップスケール中は黒/白）を循環し、3Dは終了しない。
 書き出しダイアログを開いている間はモーダルのため受け付けない。
@@ -156,6 +175,15 @@ toggle を Enter に割り当てると Confirm との競合を表示し、実行
 通常送りでも起点を保ち、組の意味の受理済み変更と本の切替・編集への単ページ化・閉じる操作で退役する。
 押下は既存の frame 単位 coalescing と operation attribution を使う。着地の演出は行わず、
 演出中は解決済みの意図を既存の 1 件予算で持ち越す。正本は [設計 §3–5](one-page-step-plan.md)。
+
+単一行入力の右クリックメニュー（§1.768）は、既に開いていたメニューを Esc で閉じた場合、
+その viewport・delivery frame の egui / native Esc を共有 claim する。背面の検索終了や親 dialog の取消へ渡さない。
+IME と共通の Context pre-input 境界で、RawInput の viewport・pass・Memory が保持する popup ID を一度捕捉する。
+親の `app_escape_allowed` は所有者の有無、メニューの claim は同じ snapshot と対象 popup ID の一致を読む。
+helper 到達時の Memory や `any_popup_open()` は再観測せず、途中の open / close / 別メニューへの切替で所有者を変えない。
+同じ RawInput の右クリック release と Esc で初めて開いて閉じたメニューは claim せず、親が Esc を扱う。
+この pass 内の描画によって親の先読み判断を変更せず、次の pass の新しい Esc は通常経路へ戻す。
+IME 変換中はメニューの追加 claim を行わず、IME / TextEdit の処理を優先する。
 
 ## 手動の前後移動ループ（§1.400）
 
@@ -851,6 +879,7 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 | OS 予約 | <kbd>Alt</kbd>+<kbd>F4</kbd>、<kbd>Alt</kbd>+<kbd>Tab</kbd>、<kbd>Win</kbd> キー系など | Windows 側が先に処理する。mIV の keymap では上書きしない |
 | keyboard focus 移動 | <kbd>Tab</kbd> traversal | 非テキスト widget へ focus が移って `wants_keyboard_input()` が true のまま残り、全 shortcut が停止した履歴と、TextEdit から 1 hop だけ移動する不統一を避けるため、アプリ全体で常に無効。Tab chord 自体は `KeyAction` へ割り当て可能 |
 | フォーカスローカル UI | テキスト入力、IME 変換、コンボボックス、リスト、フォルダツリー、製本並べ替えダイアログ内の矢印 / Enter / Esc / PageUp / PageDown / Home / End など | その UI 部品の中だけで意味を持ち、グローバルショートカットとして外へ漏らさない |
+| 単一行入力の右クリックメニュー（§1.768） | 開いていたメニューの Esc = メニューだけ閉じる | `KeyAction` 対象外。IME を優先し、受理した Esc は修飾付きも同 viewport / delivery frame の egui・native で共有 claim。開く release と同時の Esc は親へ残す。二度目の新しい Esc は検索・dialog の従来経路へ届く |
 | 検索欄・フォルダアドレス欄の履歴（§1.756） | 入力フォーカス中の修飾なし <kbd>↓</kbd> = 履歴を開き先頭を選択、開いている間の <kbd>↑</kbd>/<kbd>↓</kbd> = 端で止まる選択移動、<kbd>Enter</kbd>（NumpadEnter 含む）= 選択項目を確定、<kbd>Esc</kbd> = 一覧だけを閉じる | コンボボックスと同じ部品内操作なので `KeyAction` 対象外。IME 変換中は扱わず、入力欄を開いただけでは一覧を出さない。選択なしの Enter は一覧を閉じて通常の確定へ渡す。閉鎖中の ↑ / Esc も従来経路へ残す。未フォーカス欄の▼直後も、viewport/widget単位の既存フォーカス予約が↓・↑・Enterを所有する。消費した押下は egui/native で共有 claim し、背面の検索終了やショートカットへ漏らさない。履歴選択は検索の共通 submit（アドレス欄は既存の移動）へ排他的に渡す。詳細は [入力履歴の設計](search-input-history-plan.md) |
 | 本の構成editor (G4、next-book) | 実ページのクリック、左のページ順ドラッグ・非表示、右のページ指定、各編集button、IME-safe な Enter = 保存 / Escape = キャンセル | 本HUD・本一覧右クリック・「本」menuから開く局所UI。新しい KeyAction は設けない。Enter はフォーカスwidgetがなく確認中でないときだけ保存し、Escape は確認を先に閉じる。保存 / 再読込中は取消を受け付けず、IME変換中は Enter / Escape の保存・取消を行わない。modal owner が背面の閲覧 / メタ情報 / ナビゲータ入力を止める。解除確認は明示buttonで行う。組の変更確認はなく、結果を直接表示し元に戻す/やり直すで修正する |
 | 画像folder→ZIP変換 (G) | 「ZIP に変換」「取消」「閉じる」、IME-safe な Escape = 取消 / 閉じる | folder右クリックと構成対象外案内から開く局所UI。新しい KeyAction / global shortcut は設けない。変換は明示buttonで確定し、取消可能なphaseだけEscapeを受け付ける。保存確定以降は取消しない。process modal ownerがmain / fullscreen / detachedの背面操作と新しいopenを止める |

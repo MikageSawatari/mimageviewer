@@ -17,6 +17,16 @@ mod normalize;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const REPETITION_CLEANUP: &str = "scalar_repetition_cleanup_v1";
 
+/// 説明文・文字起こしのschema 1はDDLとuser_versionを同時にcommitして公開する。
+/// 初期作成中のversion 0だけを未公開とし、未知版や公開後の破損はエラーにする。
+pub(crate) fn schema_is_published(conn: &Connection) -> rusqlite::Result<bool> {
+    match conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(rusqlite::Error::InvalidQuery),
+    }
+}
+
 struct CommitWait {
     cancel: Arc<AtomicBool>,
     deadline: Instant,
@@ -95,7 +105,7 @@ impl Drop for CommitBusyGuard<'_> {
     }
 }
 
-fn commit_unless_cancelled(
+pub(crate) fn commit_unless_cancelled(
     conn: &Connection,
     tx: Transaction<'_>,
     cancel: &Arc<AtomicBool>,
@@ -272,14 +282,11 @@ impl CaptionDb {
         conn.busy_timeout(BUSY_TIMEOUT)?;
         // Schema and this version are published by the same initialization commit.
         // Opening the file can race that commit, so version zero is still absent.
-        match conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))? {
-            0 => Ok(None),
-            1 => {
-                let has_rotation = Self::has_rotation_column(&conn)?;
-                Ok(Some(Self { conn, has_rotation }))
-            }
-            _ => Err(rusqlite::Error::InvalidQuery),
+        if !schema_is_published(&conn)? {
+            return Ok(None);
         }
+        let has_rotation = Self::has_rotation_column(&conn)?;
+        Ok(Some(Self { conn, has_rotation }))
     }
 
     /// Existing, already-initialized database; never creates a missing store.
@@ -443,6 +450,10 @@ impl CaptionDb {
             .collect()
     }
 
+    pub(crate) fn into_connection(self) -> Connection {
+        self.conn
+    }
+
     /// Read pending changes only inside the caller's existing metadata ownership.
     /// Each interval is half-open and uses the same BINARY keys as OwnedRange.
     pub fn pending_in_ranges(
@@ -450,77 +461,30 @@ impl CaptionDb {
         ranges: &[crate::metadata_ownership::PathRange],
         limit: usize,
     ) -> rusqlite::Result<Vec<(String, i64, bool)>> {
-        let mut pending = Vec::new();
-        let mut statement = self.conn.prepare(
-            "SELECT item_key, rev, removed FROM (
-                SELECT item_key, rev, 0 AS removed FROM captions WHERE indexed = 0
-                UNION ALL
-                SELECT item_key, rev, 1 AS removed FROM caption_removed
-             ) WHERE item_key >= ?1 COLLATE BINARY AND item_key < ?2 COLLATE BINARY
-             ORDER BY item_key, rev, removed LIMIT ?3",
-        )?;
-        for range in ranges {
-            let remaining = limit.saturating_sub(pending.len());
-            if remaining == 0 {
-                break;
-            }
-            let rows = statement.query_map(
-                params![
-                    range.start,
-                    range.end,
-                    i64::try_from(remaining).unwrap_or(i64::MAX)
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
-            for row in rows {
-                pending.push(row?);
-            }
-        }
-        Ok(pending)
+        crate::derived_text::pending_in_ranges(
+            &self.conn,
+            crate::derived_text::DerivedTextKind::Caption,
+            ranges,
+            limit,
+        )
     }
 
-    /// Acknowledge only the exact revisions whose index commit succeeded.
-    /// Content/key updates allocate a new global revision, so stale acks are inert.
     pub fn mark_reflected(&self, changes: &[(String, i64, bool)]) -> rusqlite::Result<()> {
-        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        {
-            let mut indexed =
-                tx.prepare("UPDATE captions SET indexed = 1 WHERE item_key = ?1 AND rev = ?2")?;
-            let mut removed =
-                tx.prepare("DELETE FROM caption_removed WHERE item_key = ?1 AND rev = ?2")?;
-            for (key, rev, is_removed) in changes {
-                if *is_removed {
-                    removed.execute(params![key, rev])?;
-                } else {
-                    indexed.execute(params![key, rev])?;
-                }
-            }
-        }
-        tx.commit()
+        crate::derived_text::mark_reflected(
+            &self.conn,
+            crate::derived_text::DerivedTextKind::Caption,
+            changes,
+        )
     }
 
-    /// Startup cleanup uses all favorite roots (including metadata-disabled ones),
-    /// never the narrower exclusive owner ranges used for reflection.
     pub fn cleanup_removed_outside_ranges(
         &self,
         ranges: &[crate::metadata_ownership::PathRange],
     ) -> rusqlite::Result<usize> {
-        if ranges.is_empty() {
-            return self.conn.execute("DELETE FROM caption_removed", []);
-        }
-        let values = std::iter::repeat_n("(?, ?)", ranges.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "WITH roots(start, end) AS (VALUES {values})
-             DELETE FROM caption_removed WHERE NOT EXISTS (
-                SELECT 1 FROM roots WHERE item_key >= start COLLATE BINARY
-                  AND item_key < end COLLATE BINARY
-             )"
-        );
-        self.conn.execute(
-            &sql,
-            rusqlite::params_from_iter(ranges.iter().flat_map(|range| [&range.start, &range.end])),
+        crate::derived_text::cleanup_removed(
+            &self.conn,
+            crate::derived_text::DerivedTextKind::Caption,
+            ranges,
         )
     }
 
@@ -786,7 +750,7 @@ pub(crate) fn validate_caption(
     Ok(())
 }
 
-fn system_time_ms(value: SystemTime) -> Option<i64> {
+pub(crate) fn system_time_ms(value: SystemTime) -> Option<i64> {
     value
         .duration_since(UNIX_EPOCH)
         .ok()

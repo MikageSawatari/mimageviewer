@@ -57,7 +57,7 @@ impl CallControl {
 }
 
 /// Adapter-local transport state is distinct from a reachable core's NotReady.
-/// Keep this off the agent wire: readiness errors must not advertise tools.
+/// Tool calls report these failures; static discovery never depends on reachability.
 #[derive(Debug)]
 pub enum BackendError {
     Unreachable,
@@ -176,6 +176,45 @@ fn receive(file: &mut PipeStream, id: u64) -> BackendResult {
     response.result.map_err(Into::into)
 }
 
+/// Only our exact Hello permits a tool write. Old core errors and unknown wire
+/// responses share neutral guidance; never forward an old core's registration advice.
+fn receive_hello(reader: &mut impl std::io::Read) -> Result<(), BackendError> {
+    let response: Response = match read_frame(reader) {
+        Ok(Some(response)) => response,
+        Ok(None) => return Err(BackendError::Unreachable),
+        Err(error)
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+            ) =>
+        {
+            return Err(communication_error(error));
+        }
+        Err(_) => return Err(version_mismatch().into()),
+    };
+    match response {
+        Response {
+            id: 1,
+            result: Ok(Payload::Hello { version }),
+        } => check_version(version).map_err(Into::into),
+        _ => Err(version_mismatch().into()),
+    }
+}
+
+fn after_hello<R: std::io::Read, T>(
+    reader: &mut R,
+    control: &CallControl,
+    send: impl FnOnce(&mut R) -> Result<T, BackendError>,
+) -> Result<T, BackendError> {
+    let hello = receive_hello(reader);
+    // Local cancellation remains cancellation even while Hello is pending.
+    if control.cancelled.load(Ordering::Acquire) {
+        return Err(AgentError::new(ErrorCode::Cancelled, "取り消しました").into());
+    }
+    hello?;
+    send(reader)
+}
+
 /// Only opens need foreground permission. Failure remains diagnostic-only and
 /// never carries a path, pipe name, or OS error message into the log.
 #[cfg(any(test, windows))]
@@ -259,25 +298,26 @@ impl Backend for PipeBackend {
         )
         .map_err(communication_error)?;
         drop(writer);
-        match receive(&mut reader, 1)? {
-            Payload::Hello { version } => check_version(version)?,
-            _ => return Err(invalid_response().into()),
-        }
-        {
+        after_hello(&mut reader, &control, |reader| {
             let mut writer = control.writer.lock().map_err(|_| invalid_response())?;
             if control.cancelled.load(Ordering::Acquire) {
                 return Err(AgentError::new(ErrorCode::Cancelled, "取り消しました").into());
             }
             let writer = writer.as_mut().unwrap();
             writer.request_id = 2;
-            best_effort_open_foreground(&command, &reader);
+            best_effort_open_foreground(&command, reader);
             write_frame(&mut writer.file, &Request { id: 2, command })
                 .map_err(communication_error)?;
-        }
+            Ok(())
+        })?;
         // The only reader owns blocking I/O. Cancellation writes use its cloned handle.
         receive(&mut reader, 2)
     }
 }
+
+#[cfg(test)]
+#[path = "pipe_compatibility_tests.rs"]
+mod compatibility_tests;
 
 #[cfg(test)]
 mod tests {

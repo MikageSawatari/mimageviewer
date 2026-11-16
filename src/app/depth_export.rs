@@ -44,7 +44,7 @@ mod tests {
         let paint_pass = ctx.cumulative_pass_nr();
         ctx.data_mut(|data| {
             data.insert_temp(
-                snapshot_id(),
+                snapshot_id(app.edit_request_owner_context()),
                 DisplaySnapshot {
                     resource_id: state.ready().unwrap().resource_id,
                     paint_pass,
@@ -189,9 +189,11 @@ mod tests {
         install_ready_depth_for_export(&mut app);
         remember_display(&app, &ctx);
         ctx.data_mut(|data| {
-            let mut display = data.get_temp::<DisplaySnapshot>(snapshot_id()).unwrap();
+            let mut display = data
+                .get_temp::<DisplaySnapshot>(snapshot_id(app.edit_request_owner_context()))
+                .unwrap();
             display.resource_id += 1;
-            data.insert_temp(snapshot_id(), display);
+            data.insert_temp(snapshot_id(app.edit_request_owner_context()), display);
         });
         assert!(!app.depth_export_available(&ctx));
         app.open_depth_export(&ctx, 0);
@@ -355,6 +357,7 @@ mod tests {
         .unwrap();
         record_display(
             ctx,
+            app.edit_request_owner_context(),
             state.ready().unwrap().resource_id,
             app.items_generation,
             &transform,
@@ -525,12 +528,13 @@ mod tests {
     }
 }
 
-fn snapshot_id() -> egui::Id {
-    egui::Id::unique("depth_export_display_snapshot")
+fn snapshot_id(context: ViewerContextId) -> egui::Id {
+    egui::Id::unique(("depth_export_display_snapshot", context))
 }
 
 pub(crate) fn record_display(
     ctx: &egui::Context,
+    context: ViewerContextId,
     resource_id: u64,
     items_generation: u64,
     transform: &crate::displayed_image_transform::DisplayedImageTransform,
@@ -539,7 +543,7 @@ pub(crate) fn record_display(
     let paint_pass = ctx.cumulative_pass_nr();
     ctx.data_mut(|data| {
         data.insert_temp(
-            snapshot_id(),
+            snapshot_id(context),
             DisplaySnapshot {
                 resource_id,
                 paint_pass,
@@ -557,8 +561,11 @@ pub(crate) fn record_display(
 /// Observe the real child's paint receipt without clearing the previous pass's
 /// snapshot, which the export button needs before the next image is painted.
 #[cfg(test)]
-pub(crate) fn display_painted_this_pass_for_test(ctx: &egui::Context) -> bool {
-    ctx.data(|data| data.get_temp::<DisplaySnapshot>(snapshot_id()))
+pub(crate) fn display_painted_this_pass_for_test(
+    ctx: &egui::Context,
+    context: ViewerContextId,
+) -> bool {
+    ctx.data(|data| data.get_temp::<DisplaySnapshot>(snapshot_id(context)))
         .is_some_and(|display| display.paint_pass == ctx.cumulative_pass_nr())
 }
 
@@ -661,6 +668,12 @@ impl App {
         }
     }
 
+    pub(crate) fn depth_export_owner_context(&self) -> Option<ViewerContextId> {
+        self.depth_export_operation
+            .as_ref()
+            .map(|op| op.resource.context)
+    }
+
     pub(crate) fn depth_export_dialog_open(&self) -> bool {
         self.depth_export_operation.is_some()
     }
@@ -680,7 +693,7 @@ impl App {
         };
         let resource = state.ready()?;
         let display = self
-            .current_depth_export_display(ctx, resource.resource_id)
+            .current_depth_export_display(ctx, resource.context, resource.resource_id)
             .filter(|display| !same_pass || display.paint_pass == ctx.cumulative_pass_nr())?;
         Some(ExportCapture { resource, display })
     }
@@ -688,9 +701,10 @@ impl App {
     fn current_depth_export_display(
         &self,
         ctx: &egui::Context,
+        context: ViewerContextId,
         resource_id: u64,
     ) -> Option<DisplaySnapshot> {
-        ctx.data(|data| data.get_temp::<DisplaySnapshot>(snapshot_id()))
+        ctx.data(|data| data.get_temp::<DisplaySnapshot>(snapshot_id(context)))
             .filter(|display| {
                 display.resource_id == resource_id
                     && self.fullscreen_idx == Some(display.page_idx)
@@ -709,6 +723,10 @@ impl App {
     }
 
     pub(crate) fn admit_depth_export(&mut self, ctx: &egui::Context, capture: ExportCapture) {
+        if self.depth_modal_entry_waiting_for_transition() {
+            self.show_feedback_toast("読み込みが終わってから使ってください".into());
+            return;
+        }
         if self.common_modal_dialog_open() || self.document_open_modal_admission_blocked() {
             return;
         }

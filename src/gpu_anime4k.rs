@@ -2,6 +2,8 @@
 
 use std::borrow::Cow;
 
+use crate::gpu_lanczos::measure_resampler_cpu_ms;
+
 use wgpu::util::DeviceExt as _;
 
 const RECEPTIVE_MARGIN: i64 = 8;
@@ -83,6 +85,50 @@ impl Anime4kVariantData {
 
 include!("gpu_anime4k_generated.rs");
 
+// Sized from generated topology; recording creation never allocates another Vec.
+const MAX_CONVOLUTION_PASSES: usize = {
+    let mut max = 0;
+    let mut i = 0;
+    while i < GENERATED_ANIME4K_VARIANTS.len() {
+        let count = GENERATED_ANIME4K_VARIANTS[i].pass_inputs.len() - 1;
+        if count > max {
+            max = count;
+        }
+        i += 1;
+    }
+    max
+};
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Anime4kCreationTimings {
+    variant: &'static str,
+    bind_group_layout_ms: f64,
+    pipeline_layout_ms: f64,
+    shader_module_ms: f64,
+    convolution_pipelines_ms: [f64; MAX_CONVOLUTION_PASSES],
+    convolution_count: usize,
+    resolve_pipeline_ms: f64,
+}
+
+impl Anime4kCreationTimings {
+    pub(crate) fn perf_value(self) -> serde_json::Value {
+        let pipelines: serde_json::Map<String, serde_json::Value> = self.convolution_pipelines_ms
+            [..self.convolution_count]
+            .iter()
+            .enumerate()
+            .map(|(index, ms)| (format!("fs_anime4k_{index}"), (*ms).into()))
+            .collect();
+        serde_json::json!({
+            "variant": self.variant,
+            "bind_group_layout_ms": self.bind_group_layout_ms,
+            "pipeline_layout_ms": self.pipeline_layout_ms,
+            "shader_module_ms": self.shader_module_ms,
+            "convolution_pipelines_ms": pipelines,
+            "resolve_pipeline_ms": self.resolve_pipeline_ms,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Anime4kPlan {
     pub(crate) source_size: [u32; 2],
@@ -134,6 +180,7 @@ impl Anime4kPlan {
 }
 
 pub(crate) struct Anime4kResampler {
+    pub(crate) creation_timings: Anime4kCreationTimings,
     variant_data: &'static Anime4kVariantData,
     bind_group_layout: wgpu::BindGroupLayout,
     convolution_pipelines: Vec<wgpu::RenderPipeline>,
@@ -143,6 +190,15 @@ pub(crate) struct Anime4kResampler {
 impl Anime4kResampler {
     pub(crate) fn new(device: &wgpu::Device, variant: Anime4kVariant) -> Self {
         let variant_data = variant.data();
+        let mut creation_timings = Anime4kCreationTimings {
+            variant: variant_data.label,
+            bind_group_layout_ms: 0.0,
+            pipeline_layout_ms: 0.0,
+            shader_module_ms: 0.0,
+            convolution_pipelines_ms: [0.0; MAX_CONVOLUTION_PASSES],
+            convolution_count: variant_data.intermediate_count(),
+            resolve_pipeline_ms: 0.0,
+        };
         let mut entries = (0..variant_data.input_binding_count)
             .map(|binding| wgpu::BindGroupLayoutEntry {
                 binding: binding as u32,
@@ -165,38 +221,54 @@ impl Anime4kResampler {
             },
             count: None,
         });
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("anime4k bind group layout"),
-            entries: &entries,
+        let bind_group_layout =
+            measure_resampler_cpu_ms(&mut creation_timings.bind_group_layout_ms, || {
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("anime4k bind group layout"),
+                    entries: &entries,
+                })
+            });
+        let layout = measure_resampler_cpu_ms(&mut creation_timings.pipeline_layout_ms, || {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("anime4k pipeline layout"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            })
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("anime4k pipeline layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
-            immediate_size: 0,
-        });
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(variant_data.label),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(variant_data.shader)),
+        let shader = measure_resampler_cpu_ms(&mut creation_timings.shader_module_ms, || {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(variant_data.label),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(variant_data.shader)),
+            })
         });
         let convolution_pipelines = (0..variant_data.intermediate_count())
             .map(|index| {
+                measure_resampler_cpu_ms(
+                    &mut creation_timings.convolution_pipelines_ms[index],
+                    || {
+                        create_pipeline(
+                            device,
+                            &layout,
+                            &shader,
+                            &format!("fs_anime4k_{index}"),
+                            wgpu::TextureFormat::Rgba16Float,
+                        )
+                    },
+                )
+            })
+            .collect();
+        let resolve_pipeline =
+            measure_resampler_cpu_ms(&mut creation_timings.resolve_pipeline_ms, || {
                 create_pipeline(
                     device,
                     &layout,
                     &shader,
-                    &format!("fs_anime4k_{index}"),
-                    wgpu::TextureFormat::Rgba16Float,
+                    "fs_anime4k_resolve",
+                    wgpu::TextureFormat::Rgba8Unorm,
                 )
-            })
-            .collect();
-        let resolve_pipeline = create_pipeline(
-            device,
-            &layout,
-            &shader,
-            "fs_anime4k_resolve",
-            wgpu::TextureFormat::Rgba8Unorm,
-        );
+            });
         Self {
+            creation_timings,
             variant_data,
             bind_group_layout,
             convolution_pipelines,

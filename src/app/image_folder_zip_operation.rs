@@ -1319,8 +1319,8 @@ mod tests {
     fn caption_folder_zip_refresh_poll_clears_shared_display() {
         let mut app = setup_app_for_test();
         let index_data = app.tmp.path().join("caption-index");
-        let caption_epoch = app.caption_epoch_for_test(&index_data);
-        let before = caption_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let derived_text_epoch = app.derived_text_epoch_for_test(&index_data);
+        let before = derived_text_epoch.load(std::sync::atomic::Ordering::Acquire);
         let source = app.tmp.path().join("photos");
         app.image_folder_zip_operation = Some(Box::new(Operation {
             owner: app.projected_viewer_context_id(),
@@ -1373,7 +1373,7 @@ mod tests {
         );
         assert_ne!(app.caption_display.epoch_for_test(), epoch);
         assert_eq!(
-            caption_epoch.load(std::sync::atomic::Ordering::Acquire),
+            derived_text_epoch.load(std::sync::atomic::Ordering::Acquire),
             before
         );
     }

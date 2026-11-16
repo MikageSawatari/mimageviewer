@@ -97,6 +97,13 @@ bench = false
 # Development-only helpers.  Keeping these behind one feature prevents normal
 # application builds and integration tests from compiling every helper binary.
 [[bin]]
+name = "native_detached_probe"
+path = "src/bin/native_detached_probe.rs"
+test = true
+bench = false
+required-features = ["dev-tools"]
+
+[[bin]]
 name = "bench_ai"
 path = "src/bin/bench_ai.rs"
 test = false
@@ -283,6 +290,13 @@ test = false
 bench = false
 required-features = ["dev-tools"]
 
+[[bin]]
+name = "transcript_extract_bench"
+path = "src/bin/transcript_extract_bench.rs"
+test = false
+bench = false
+required-features = ["dev-tools"]
+
 # Manual TensorRT-pack E2E smoke helper.  It is intentionally runnable via
 # `cargo run --features manual-e2e --bin test_trt_install`, while the feature
 # gate keeps `cargo test --all-targets` from trying to execute an
@@ -296,6 +310,7 @@ bench = false
 required-features = ["manual-e2e"]
 
 [target.'cfg(windows)'.dependencies]
+egui-winit = { version = "0.37.0", default-features = false }
 libraw-sys = { path = "crates/libraw-sys" }
 libavif-sys = { path = "crates/libavif-sys" }
 windows-sys = { version = "0.61.2", features = [

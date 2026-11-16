@@ -7,7 +7,292 @@ fn permission(gps: bool) -> PermissionSnapshot {
         thumbnails: false,
         gps,
         ai_captions: false,
+        transcripts: false,
     }
+}
+
+fn transcript_config_version() -> i64 {
+    #[cfg(windows)]
+    {
+        crate::ai::transcript_job_worker::CONFIG_VERSION
+    }
+    #[cfg(not(windows))]
+    {
+        1
+    }
+}
+
+fn seed_transcript(
+    path: &Path,
+    result: crate::transcript_db::TranscriptResult,
+    config_version: i64,
+) {
+    use crate::transcript_db::{FileSignature, SaveOutcome, SaveRequest, TranscriptDb};
+    assert_eq!(
+        TranscriptDb::open()
+            .unwrap()
+            .save(&SaveRequest {
+                item_path: path.to_owned(),
+                signature: FileSignature::from_metadata(&std::fs::metadata(path).unwrap()).unwrap(),
+                model_id: "whisper@fixture".into(),
+                config_version,
+                lang: "ja".into(),
+                result,
+            })
+            .unwrap(),
+        SaveOutcome::Written
+    );
+}
+
+#[test]
+fn transcript_summary_reports_media_rows_without_exporting_text() {
+    use crate::transcript_db::{RemovedCounts, TranscriptResult};
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let allowed = PermissionSnapshot {
+        transcripts: true,
+        ..permission(false)
+    };
+    for name in ["voice.mp4", "voice.mp3"] {
+        let path = directory.path().join(name);
+        std::fs::write(&path, b"media").unwrap();
+        let read_media = || read(&item(&path, None), allowed, &AtomicBool::new(false)).unwrap();
+        assert_eq!(read_media().transcript, TranscriptField::None);
+        seed_transcript(&path, TranscriptResult::Failed, transcript_config_version());
+        assert_eq!(read_media().transcript, TranscriptField::Failed);
+        seed_transcript(
+            &path,
+            TranscriptResult::Ok {
+                segments: vec![(0, 1500, "PRIVATE声😀".into()), (1500, 2250, "後半".into())],
+                removed_counts: RemovedCounts::default(),
+                duration_ms: 2250,
+                audio_stream: 2,
+            },
+            transcript_config_version(),
+        );
+        let output = read_media();
+        let TranscriptField::Present(info) = &output.transcript else {
+            panic!("missing summary");
+        };
+        assert_eq!(info.model, "whisper@fixture");
+        assert!(info.created_at > 0);
+        assert_eq!(info.audio_stream, Some(2));
+        assert_eq!(info.duration_secs, 2.25);
+        assert_eq!(info.segment_count, 2);
+        assert_eq!(info.char_count, 11);
+        assert!(!info.stale);
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(!json.contains("PRIVATE"));
+        assert!(!json.contains("segments"));
+        assert!(!json.contains("removed_counts"));
+        assert!(!json.contains("\"lang\""));
+        std::fs::write(&path, b"changed media").unwrap();
+        assert!(matches!(
+            read_media().transcript,
+            TranscriptField::Present(TranscriptInfo { stale: true, .. })
+        ));
+    }
+}
+
+#[test]
+fn transcript_summary_off_does_not_open_store_and_read_failure_is_not_none() {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let path = directory.path().join("voice.mp4");
+    std::fs::write(&path, b"media").unwrap();
+    let db_path = crate::transcript_db::TranscriptDb::db_path();
+    let corrupt = b"unreadable transcript database";
+    std::fs::write(&db_path, corrupt).unwrap();
+    assert_eq!(
+        read(
+            &item(&path, None),
+            permission(false),
+            &AtomicBool::new(false)
+        )
+        .unwrap()
+        .transcript,
+        TranscriptField::NotPermitted
+    );
+    assert_eq!(
+        read(
+            &item(&path, None),
+            PermissionSnapshot {
+                transcripts: true,
+                ..permission(false)
+            },
+            &AtomicBool::new(false)
+        )
+        .unwrap_err()
+        .code,
+        ErrorCode::Internal
+    );
+    assert_eq!(std::fs::read(&db_path).unwrap(), corrupt);
+    let unpublished = directory.path().join("unpublished.db");
+    drop(rusqlite::Connection::open(&unpublished).unwrap());
+    assert_eq!(
+        read_transcript_summary(&unpublished, &path, None, true).unwrap(),
+        TranscriptField::None
+    );
+    let missing = directory.path().join("absent/transcript.db");
+    assert_eq!(
+        read_transcript_summary(&missing, &path, None, true).unwrap(),
+        TranscriptField::None
+    );
+    assert!(!missing.parent().unwrap().exists());
+}
+
+#[test]
+fn transcript_summary_non_media_and_subresources_never_open_store() {
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let db_path = crate::transcript_db::TranscriptDb::db_path();
+    std::fs::write(&db_path, b"corrupt store must not be read").unwrap();
+    let image = directory.path().join("image.png");
+    std::fs::write(&image, png(&[])).unwrap();
+    let archive = directory.path().join("book.zip");
+    std::fs::write(&archive, zip_bytes(&[("page.png", &png(&[]))])).unwrap();
+    let folder = directory.path().join("folder.mp4");
+    std::fs::create_dir(&folder).unwrap();
+    for permitted in [false, true] {
+        let permission = PermissionSnapshot {
+            transcripts: permitted,
+            ..permission(false)
+        };
+        for input in [
+            item(&image, None),
+            item(&archive, None),
+            item(&archive, Some("page.png")),
+            item(&folder, None),
+            item(&directory.path().join("missing.mp4"), None),
+        ] {
+            let mut output = read(&input, permission, &AtomicBool::new(false)).unwrap();
+            let expected = if permitted {
+                TranscriptField::None
+            } else {
+                TranscriptField::NotPermitted
+            };
+            assert_eq!(output.transcript, expected);
+            // PDF page identity and actual media subresources are excluded by
+            // the same ownership rule, without starting their helper processes.
+            output.item.subresource = Some("page_0".into());
+            output.kind = ItemKind::Video;
+            enrich_transcript(
+                &mut output,
+                &image,
+                std::fs::metadata(&image).ok().as_ref(),
+                permitted,
+            )
+            .unwrap();
+            assert_eq!(output.transcript, expected);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn transcript_summary_config_change_uses_ui_staleness_rule() {
+    use crate::transcript_db::{RemovedCounts, TranscriptResult};
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let path = directory.path().join("voice.mp4");
+    std::fs::write(&path, b"media").unwrap();
+    seed_transcript(
+        &path,
+        TranscriptResult::Ok {
+            segments: vec![],
+            removed_counts: RemovedCounts::default(),
+            duration_ms: 2000,
+            audio_stream: 0,
+        },
+        transcript_config_version() + 1,
+    );
+    let output = read(
+        &item(&path, None),
+        PermissionSnapshot {
+            transcripts: true,
+            ..permission(false)
+        },
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert!(matches!(
+        output.transcript,
+        TranscriptField::Present(TranscriptInfo {
+            stale: true,
+            segment_count: 0,
+            char_count: 0,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn transcript_summary_fifty_long_recordings_keep_item_and_page_budgets() {
+    use crate::transcript_db::{RemovedCounts, TranscriptResult};
+    let directory = crate::settings_db::DataDirOverrideGuard::new();
+    let path = directory.path().join("long.mp4");
+    std::fs::write(&path, b"media").unwrap();
+    let private = "PRIVATE声😀".repeat(5000);
+    seed_transcript(
+        &path,
+        TranscriptResult::Ok {
+            segments: vec![(0, 60_000, private.clone())],
+            removed_counts: RemovedCounts::default(),
+            duration_ms: 60_000,
+            audio_stream: 1,
+        },
+        transcript_config_version(),
+    );
+    let output = read(
+        &item(&path, None),
+        PermissionSnapshot {
+            transcripts: true,
+            ..permission(false)
+        },
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let TranscriptField::Present(info) = &output.transcript else {
+        panic!("missing summary")
+    };
+    assert_eq!(info.char_count, private.chars().count() as u64);
+    assert!(mcp_content_chars(&output).unwrap() <= MAX_ITEM_CHARS);
+    let rows = vec![output; 50];
+    let args = serde_json::json!(["50 recordings"]);
+    let mut offset = 0;
+    let mut pages = 0;
+    while offset < rows.len() {
+        let (items, cursor, truncated) = crate::agent_ipc::bounded_rows(
+            rows[offset..].to_vec(),
+            offset,
+            false,
+            "get_item_info",
+            args.clone(),
+            "items",
+            7,
+        )
+        .unwrap();
+        assert!(!items.is_empty());
+        assert!(items.iter().all(|row| matches!(row, PageRow::Value(_))));
+        offset += items.len();
+        let page = InfoPage {
+            items,
+            cursor,
+            truncated,
+        };
+        assert!(mcp_content_chars(&page).unwrap() <= MAX_PAGE_CHARS);
+        assert!(!serde_json::to_string(&page).unwrap().contains("PRIVATE"));
+        if offset < rows.len() {
+            assert!(truncated);
+            assert_eq!(
+                crate::agent_ipc::decode_cursor(page.cursor.as_deref(), "get_item_info", &args, 7)
+                    .unwrap(),
+                offset
+            );
+        } else {
+            assert!(!truncated);
+            assert!(page.cursor.is_none());
+        }
+        pages += 1;
+    }
+    assert_eq!(offset, 50);
+    assert!(pages > 1);
 }
 
 fn seed_caption(path: &Path, failed: bool) {
@@ -1642,6 +1927,7 @@ fn pdf_page_rating_and_container_tags_match_ui_without_starting_pdf_worker() {
         generation: InfoField::NotApplicable,
         ai_caption: CaptionField::None,
         container_ai_caption: None,
+        transcript: TranscriptField::NotPermitted,
     };
     enrich(
         &mut output,

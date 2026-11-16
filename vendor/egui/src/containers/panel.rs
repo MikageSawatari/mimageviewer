@@ -49,6 +49,15 @@ pub struct PanelState {
     pub outer_rect: Rect,
 }
 
+/// Geometry already applied by the resize widget's current drag. This is not
+/// an endpoint: an unknown terminal may persist it, but cannot use it to
+/// authorize collapse or expansion. The persisted PanelState intentionally
+/// retains the pre-drag natural size while the drag is live.
+#[derive(Clone, Copy, Default)]
+struct AppliedPanelResize {
+    outer_size: f32,
+}
+
 impl PanelState {
     pub fn load(ctx: &Context, bar_id: Id) -> Option<Self> {
         ctx.data_mut(|d| d.get_persisted(bar_id))
@@ -759,12 +768,39 @@ impl Panel {
             let axis = side.axis();
             let available_size = available_rect.size_along(axis);
 
+            let applied_size_id = resize_id.with("__applied_outer_size");
+            let stopped_geometry = parent_ui.data_mut(|data| {
+                match resize_response.as_ref() {
+                    Some(response) if response.drag_started() => {
+                        data.remove::<AppliedPanelResize>(applied_size_id);
+                        None
+                    }
+                    Some(response) if response.drag_stopped() => {
+                        data.remove_temp::<AppliedPanelResize>(applied_size_id)
+                    }
+                    Some(response) if response.dragged() => None,
+                    _ => {
+                        // A missing/idle widget cannot revive a former drag.
+                        // A widget not shown at all retains only inert cached
+                        // geometry until its next appearance or Context drop.
+                        data.remove::<AppliedPanelResize>(applied_size_id);
+                        None
+                    }
+                }
+            });
+            let pointer_resize = resize_response.as_ref().and_then(|response| {
+                if response.dragged() {
+                    response.interact_pointer_pos()
+                } else {
+                    response.drag_stopped_pos()
+                }
+            });
+
             // The size the user asked for, before clamping. Either from a pointer drag…
-            let raw_outer_size = if let Some(resize_response) = resize_response
-                && (resize_response.dragged() || resize_response.drag_stopped())
-                && let Some(pointer) = resize_response.interact_pointer_pos()
-            {
-                resize_drag_in_progress = resize_response.dragged();
+            let raw_outer_size = if let Some(pointer) = pointer_resize {
+                resize_drag_in_progress = resize_response
+                    .as_ref()
+                    .is_some_and(|response| response.dragged());
                 // Signed distance from the fixed edge to the pointer along the
                 // panel's axis. Going past the fixed edge yields a negative size,
                 // which `clamp_to_range` then snaps up to `min` — DON'T use
@@ -808,6 +844,17 @@ impl Panel {
                         *is_expanded = true;
                     }
                 }
+            } else if let Some(applied) = stopped_geometry {
+                // End only the old hold. Save already applied geometry without
+                // passing it through the endpoint collapse/expand predicates.
+                outer_size = clamp_to_range(applied.outer_size, self.outer_size_range)
+                    .at_most(available_size);
+                side.set_rect_size(&mut outer_rect, outer_size);
+            }
+            if resize_drag_in_progress {
+                parent_ui.data_mut(|data| {
+                    data.insert_temp(applied_size_id, AppliedPanelResize { outer_size })
+                });
             }
         }
 
@@ -1425,4 +1472,185 @@ impl CentralPanel {
 fn clamp_to_range(x: f32, range: Rangef) -> f32 {
     let range = range.as_positive();
     x.clamp(range.min, range.max)
+}
+
+#[cfg(test)]
+mod positionless_release_tests {
+    use super::*;
+    use crate::{Event, Modifiers, PointerButton, RawInput, pos2};
+
+    struct Sample {
+        width: f32,
+        stored_width: f32,
+        resize: Response,
+        applied: Option<f32>,
+    }
+
+    fn edge(x: f32, pressed: bool) -> Event {
+        Event::PointerButton {
+            pos: pos2(x, 80.0),
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    fn unknown_end() -> Event {
+        Event::PointerButtonReleased {
+            button: PointerButton::Primary,
+            modifiers: Modifiers::NONE,
+        }
+    }
+
+    fn frame(ctx: &Context, expanded: &mut bool, events: Vec<Event>) -> Sample {
+        let mut sample = None;
+        ctx.run_ui(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(
+                    crate::Pos2::ZERO,
+                    Vec2::new(600.0, 400.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let panel = Panel::left("positionless-resize")
+                    .resizable(true)
+                    .default_size(150.0)
+                    .size_range(120.0..=300.0)
+                    .frame(Frame::NONE);
+                let id = panel.id(ui);
+                let resize_id = panel.resize_id(ui);
+                // A real viewport uses the space offered by the panel. Empty
+                // contents shrink its Frame to min_size during sizing instead.
+                let shown = panel.show_inside_dyn(
+                    ui,
+                    Some(&mut *expanded),
+                    Box::new(|ui| ui.expand_to_include_rect(ui.max_rect())),
+                );
+                sample = Some(Sample {
+                    width: shown.response.rect.width(),
+                    stored_width: PanelState::load(ctx, id).unwrap().outer_rect.width(),
+                    resize: ctx.read_response(resize_id).unwrap(),
+                    applied: ctx
+                        .data(|data| {
+                            data.get_temp::<AppliedPanelResize>(
+                                resize_id.with("__applied_outer_size"),
+                            )
+                        })
+                        .map(|value| value.outer_size),
+                });
+            },
+        )
+        .drop_without_applying_deltas();
+        sample.unwrap()
+    }
+
+    fn begin_live_resize(ctx: &Context, expanded: &mut bool) -> Sample {
+        // Input hit testing uses the previous pass. Publish a normal enabled
+        // handle after the initial sizing pass before sending its press.
+        frame(ctx, expanded, vec![]);
+        let ready = frame(ctx, expanded, vec![]);
+        assert!(ready.resize.enabled());
+        assert_eq!(ready.width, 150.0);
+        assert_eq!(ready.resize.rect.center().x, 150.0);
+        let pressed = frame(
+            ctx,
+            expanded,
+            vec![edge(ready.resize.rect.center().x, true)],
+        );
+        assert!(
+            pressed.resize.is_pointer_button_down_on(),
+            "the real resize handle must own the initial press: {:?}",
+            pressed.resize
+        );
+        let held = frame(ctx, expanded, vec![Event::PointerMoved(pos2(122.0, 80.0))]);
+        assert!(held.resize.dragged());
+        assert_eq!(held.width, 122.0);
+        assert_eq!(held.stored_width, 150.0);
+        assert_eq!(held.applied, Some(122.0));
+        held
+    }
+
+    #[test]
+    fn positionless_panel_stop_persists_applied_width_without_fresh_pending_collapse() {
+        for known_end in [false, true] {
+            let ctx = Context::default();
+            let mut expanded = true;
+            begin_live_resize(&ctx, &mut expanded);
+            let ended = frame(
+                &ctx,
+                &mut expanded,
+                vec![
+                    if known_end {
+                        edge(180.0, false)
+                    } else {
+                        unknown_end()
+                    },
+                    edge(118.0, true),
+                ],
+            );
+            assert!(ended.resize.drag_stopped());
+            assert!(ended.resize.is_pointer_button_down_on());
+            assert!(!ended.resize.dragged());
+            assert_eq!(ended.resize.interact_pointer_pos(), Some(pos2(118.0, 80.0)));
+            assert_eq!(ended.width, if known_end { 180.0 } else { 122.0 });
+            assert_eq!(ended.stored_width, ended.width);
+            assert!(
+                expanded,
+                "the pending new press cannot authorize old-stop collapse"
+            );
+            assert_eq!(ended.applied, None, "the old geometry owner ends once");
+
+            let fresh = frame(
+                &ctx,
+                &mut expanded,
+                vec![Event::PointerMoved(pos2(160.0, 80.0))],
+            );
+            assert!(fresh.resize.dragged());
+            assert_eq!(fresh.width, 160.0);
+            assert_eq!(fresh.applied, Some(160.0));
+            let saved = frame(&ctx, &mut expanded, vec![edge(160.0, false)]);
+            assert_eq!(saved.stored_width, 160.0);
+            assert_eq!(saved.applied, None);
+            assert!(expanded);
+        }
+    }
+
+    #[test]
+    fn positionless_panel_disappearance_cannot_revive_cached_drag_geometry() {
+        let ctx = Context::default();
+        let mut expanded = true;
+        begin_live_resize(&ctx, &mut expanded);
+        ctx.run_ui(
+            RawInput {
+                events: vec![unknown_end()],
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .drop_without_applying_deltas();
+        let returned = frame(&ctx, &mut expanded, vec![]);
+        assert_eq!(returned.applied, None);
+        assert_eq!(returned.stored_width, 150.0);
+        assert!(!returned.resize.dragged());
+        assert!(expanded);
+    }
+
+    #[test]
+    fn positionless_panel_cancellation_retires_applied_geometry() {
+        let ctx = Context::default();
+        let mut expanded = true;
+        let held = begin_live_resize(&ctx, &mut expanded);
+        ctx.cancel_pointer_button_for(
+            ctx.viewport_registration(crate::ViewportId::ROOT).unwrap(),
+            PointerButton::Primary,
+            held.resize.id,
+        );
+        let cancelled = frame(&ctx, &mut expanded, vec![]);
+        assert_eq!(cancelled.applied, None);
+        assert_eq!(cancelled.stored_width, 150.0);
+        assert!(!cancelled.resize.dragged());
+        assert!(expanded);
+    }
 }

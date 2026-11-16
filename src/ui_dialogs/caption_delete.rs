@@ -131,7 +131,7 @@ impl App {
             CaptionDeleteState::Deleting { rx } => match rx.try_recv() {
                 Ok(Ok(deleted)) => {
                     let message = if deleted > 0 {
-                        self.notify_caption_changed();
+                        self.notify_derived_text_changed();
                         self.caption_display.clear();
                         format!("AI 説明文を {deleted} 件削除しました")
                     } else {
@@ -332,7 +332,7 @@ mod tests {
         let mut app = fixture();
         let ctx = egui::Context::default();
         let data = app.tmp.path().join("index");
-        let epoch = app.caption_epoch_for_test(&data);
+        let epoch = app.derived_text_epoch_for_test(&data);
         let before = epoch.load(Ordering::Acquire);
         app.caption_display.seed_for_test("cached");
         app.request_delete_ai_captions(&ctx, false);

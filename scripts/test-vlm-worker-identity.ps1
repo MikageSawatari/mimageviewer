@@ -30,10 +30,12 @@ try {
     $source = Join-Path $testRoot 'crates\vlm-worker'
     $worker = Join-Path $testRoot 'vendor\vlm-worker\mimageviewer-vlm.exe'
     New-Item -ItemType Directory -Path (Split-Path -Parent $worker) -Force | Out-Null
-    foreach ($name in @('CMakeLists.txt', 'tools/source-identity.ps1', 'src/prompt.h', 'src/main.cpp', 'tests/protocol.cpp')) {
+    foreach ($name in @('CMakeLists.txt', 'tools/source-identity.ps1', 'src/prompt.h', 'src/main.cpp', 'tests/protocol.cpp', 'whisper-source-manifest.json')) {
         $path = Join-Path $source $name
         New-Item -ItemType Directory -Path (Split-Path -Parent $path) -Force | Out-Null
-        [System.IO.File]::WriteAllText($path, "fixture $name`r`n")
+        if ($name -eq 'whisper-source-manifest.json') {
+            [System.IO.File]::Copy((Join-Path $repo 'crates/vlm-worker/whisper-source-manifest.json'), $path)
+        } else { [System.IO.File]::WriteAllText($path, "fixture $name`r`n") }
     }
     $hash = Get-MivVlmWorkerSourceHash $source
     Assert-Throws { Assert-MivVlmWorkerIdentity $testRoot } 'Vendor worker is missing'
@@ -186,7 +188,83 @@ try {
     Assert-True ((Get-Content -LiteralPath $installedLicense -Raw -Encoding UTF8) -eq 'fixture') 'Existing source tree changed'
     $script:MivLlamaArchiveSha256 = ''
 
-    foreach ($name in @('build-release.ps1', 'build-portable.ps1', 'build-vlm-worker.ps1', 'vlm-worker-identity.ps1', 'test-vlm-worker-identity.ps1', 'setup-llama-cpp.ps1')) {
+    # Run the same no-network archive/publication fixtures for pinned whisper.
+    function Test-WhisperSetup([string] $WhisperTestRoot) {
+        $testRoot = $WhisperTestRoot
+        New-Item -ItemType Directory -Path $testRoot | Out-Null
+    . (Join-Path $PSScriptRoot 'setup-whisper-cpp.ps1')
+    # Simulate an unset pin: acquisition must stop before any network or directory change.
+    $script:MivWhisperArchiveSha256 = ''
+    function global:Invoke-WebRequest { throw 'Network command was called with an unset checksum.' }
+    $newRepo = Join-Path $testRoot 'must-not-be-created'
+    Assert-Throws { Install-MivPinnedWhisperSource -RepoRoot $newRepo } 'SHA-256 is not configured'
+    Assert-True (-not (Test-Path -LiteralPath $newRepo)) 'Unset checksum mutated directories'
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    Add-Type -AssemblyName System.IO.Compression
+    function Write-TestSourceZip([string] $Path, [object[]] $Entries) {
+        $archive = [System.IO.Compression.ZipFile]::Open($Path, [System.IO.Compression.ZipArchiveMode]::Create)
+        try {
+            foreach ($fixture in $Entries) {
+                $entry = $archive.CreateEntry($fixture.Name)
+                if ($fixture.ContainsKey('Attributes')) { $entry.ExternalAttributes = $fixture.Attributes }
+                $stream = $entry.Open()
+                try { $bytes = [System.Text.Encoding]::UTF8.GetBytes('fixture'); $stream.Write($bytes, 0, $bytes.Length) }
+                finally { $stream.Dispose() }
+            }
+        } finally { $archive.Dispose() }
+    }
+    $version = 'v1.9.5'
+    $prefix = "whisper.cpp-$($version.TrimStart('v'))/"
+    $goodArchive = Join-Path $testRoot 'good.zip'
+    Write-TestSourceZip $goodArchive @(
+        @{Name=$prefix+'CMakeLists.txt'}, @{Name=$prefix+'LICENSE'},
+        @{Name=$prefix+'ggml/CMakeLists.txt'}, @{Name=$prefix+'include/whisper.h'}, @{Name=$prefix+'src/whisper.cpp'})
+    $expanded = Join-Path $testRoot 'expanded'
+    New-Item -ItemType Directory -Path $expanded | Out-Null
+    Expand-MivPinnedWhisperArchive $goodArchive $expanded $version
+    Assert-True (Test-Path -LiteralPath (Join-Path $expanded 'LICENSE') -PathType Leaf) 'Safe archive was not extracted'
+    $badIndex = 0
+    foreach ($entry in @(
+        @{Name=$prefix+'../outside.txt'}, @{Name=$prefix+'C:/outside.txt'},
+        @{Name=$prefix+'dir\outside.txt'}, @{Name=$prefix+'NUL.txt'},
+        @{Name='wrong-root/CMakeLists.txt'}, @{Name=$prefix+'link'; Attributes=-1610612736})) {
+        $badArchive = Join-Path $testRoot ("bad-$badIndex.zip")
+        Write-TestSourceZip $badArchive @($entry)
+        Assert-Throws { Expand-MivPinnedWhisperArchive $badArchive (Join-Path $testRoot "bad-output-$badIndex") $version } 'Unsafe archive'
+        $badIndex++
+    }
+    $duplicate = Join-Path $testRoot 'duplicate.zip'
+    Write-TestSourceZip $duplicate @(@{Name=$prefix+'duplicate'}, @{Name=$prefix+'DUPLICATE'})
+    Assert-Throws { Expand-MivPinnedWhisperArchive $duplicate (Join-Path $testRoot 'duplicate-output') $version } 'Duplicate archive'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $testRoot 'outside.txt'))) 'Archive escaped staging'
+
+    # Private fixture pin and mocked transport: prove hash verification precedes
+    # extraction/publication. The production script exposes no pin/URL override.
+    $global:MivVlmTestArchive = $goodArchive
+    $global:MivVlmTestNetworkMarker = Join-Path $testRoot 'fake-download.txt'
+    function global:Invoke-WebRequest {
+        param([string] $Uri, [string] $OutFile, [switch] $UseBasicParsing)
+        if ($Uri -cne 'https://github.com/ggml-org/whisper.cpp/archive/refs/tags/v1.9.5.zip') { throw 'Unexpected archive URI.' }
+        [System.IO.File]::AppendAllText($global:MivVlmTestNetworkMarker, "fixture download`n")
+        [System.IO.File]::Copy($global:MivVlmTestArchive, $OutFile)
+    }
+    $fixtureRepo = Join-Path $testRoot 'source-install'
+    New-Item -ItemType Directory -Path $fixtureRepo | Out-Null
+    $script:MivWhisperArchiveSha256 = '0' * 64
+    Assert-Throws { Install-MivPinnedWhisperSource $fixtureRepo } 'SHA-256 mismatch'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $fixtureRepo 'vendor\whisper.cpp'))) 'Wrong archive hash was published'
+    $script:MivWhisperArchiveSha256 = (Get-FileHash -LiteralPath $goodArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+    Install-MivPinnedWhisperSource $fixtureRepo
+    $installedLicense = Join-Path $fixtureRepo 'vendor\whisper.cpp\LICENSE'
+    Assert-True (Test-Path -LiteralPath $installedLicense) 'Verified archive was not published'
+    Assert-Throws { Install-MivPinnedWhisperSource $fixtureRepo } 'already exists'
+    Assert-True ((Get-Content -LiteralPath $installedLicense -Raw -Encoding UTF8) -eq 'fixture') 'Existing source tree changed'
+    $script:MivWhisperArchiveSha256 = ''
+
+    }
+    Test-WhisperSetup (Join-Path $testRoot 'whisper-setup')
+
+    foreach ($name in @('build-release.ps1', 'build-portable.ps1', 'build-vlm-worker.ps1', 'vlm-worker-identity.ps1', 'test-vlm-worker-identity.ps1', 'setup-llama-cpp.ps1', 'setup-whisper-cpp.ps1')) {
         $path = Join-Path $PSScriptRoot $name
         $tokens = $null; $errors = $null
         $null = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
@@ -205,6 +283,8 @@ try {
     Assert-True ($portable.Contains("src = 'VLM-WORKER-LICENSE.txt'")) 'Portable package omits native-worker notices'
     Assert-True ($portable.IndexOf('Assert-MivVlmWorkerIdentity -RepoRoot $repoRoot') -lt $portable.IndexOf('$copies = @(')) 'Portable identity must precede copying'
     Assert-True ($portable.Substring($portable.IndexOf('$portablePe = @(')).Contains("'mimageviewer-vlm.exe',")) 'Portable signing omits worker'
+    $whisperSetup = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'setup-whisper-cpp.ps1')
+    Assert-True ($whisperSetup.Contains("`$script:MivWhisperArchiveSha256 = '7a7a73071939f16bc028ad2f713f16f26e37afb6cc155d0f19e3d65705d2b1d9'")) 'Production whisper checksum is not pinned'
     Write-Host '[vlm-identity-test] PASS'
 } finally {
     Remove-Item Function:\cmake -ErrorAction SilentlyContinue

@@ -664,6 +664,8 @@ fn menu_entry(action: MenuCommandId) -> MenuEntry {
         | ConvertToZip
         | ToolsCreateAiCaptions
         | ToolsShowCaptionProgress
+        | ToolsCreateTranscripts
+        | ToolsShowTranscriptProgress
         | VideoRegisterUpscale
         | VideoDeleteUpscale
         | VideoShowUpscaleTasks

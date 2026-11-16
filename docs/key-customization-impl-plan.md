@@ -5,6 +5,11 @@
 共通 handler を使う。既存見開き調整とは別操作で、読み順固定・保存/通知なし。
 ページ送りの per-frame coalescing と operation attribution は既存契約を保つ。
 
+§1.768: 単一行入力の右クリックメニューの Esc は固定の部品内操作として扱う。
+保持中のメニューが消費した Esc は egui/native で共有 claim し、検索・dialog の背面操作へ漏らさない。
+同じ入力フレームでメニューを開いて閉じた場合は親が Esc を使う。入力所有の詳細は keymap-spec.md を参照。
+新しい KeyAction や保存する割当は追加しない。
+
 §1.690: `GridSearchNameEverything` / `GridSearchNameMetadata` / `GridSearchNameLocal` は
 Grid / Press、既定キーなし。メイン窓の一覧のカーソル位置の名前を既存の検索欄へ入れ、
 フォーカス・全選択だけを要求する。検索は実行せず Enter で確定する。

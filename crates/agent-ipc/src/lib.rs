@@ -1,4 +1,21 @@
 //! Private, versioned wire contract between the core and the stdio MCP adapter.
+//!
+//! Compatibility contract (docs/next-release-backlog.md §1.789):
+//! - Wire changes are additive: new commands, payloads only for new commands,
+//!   and fields. Preserve existing field names, types, and meanings. Defaults
+//!   let the core read omitted request fields; old adapters ignore unknown
+//!   response fields (response-only additions do not require defaults).
+//! - Never add variants to enums an old adapter can receive, including errors
+//!   and row kinds, without translating them for its negotiated version.
+//! - Preserve old adapters' frame, image, row, and page budgets on their responses.
+//! - Adapters deserialize typed IPC and build structuredContent from their own
+//!   types, discarding unknown response fields instead of forwarding raw JSON.
+//! - Keep the handshake independent of business types: 4-byte LE length, UTF-8
+//!   JSON, MAX_FRAME_BYTES cap, request
+//!   {"id":…,"command":{"type":"hello","version":N,…}}, response
+//!   {"id":…,"result":{"Ok":{"type":"hello","data":{"version":N}}}}.
+//! - Freeze shipped adapter types/frames and verify decoding, structuredContent,
+//!   and output budgets. Raise MIN only as a planned, documented design change.
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
@@ -11,7 +28,11 @@ pub use read_types::*;
 mod folder_types;
 pub use folder_types::*;
 
-pub const AGENT_PROTOCOL_VERSION: u32 = 3;
+pub const AGENT_PROTOCOL_VERSION: u32 = 4;
+pub const MIN_ADAPTER_PROTOCOL_VERSION: u32 = 3;
+/// Fixed pipe namespace identifier, unrelated to business IPC versions. Never change it.
+pub const AGENT_PIPE_NAMESPACE: &str = "mimageviewer-agent-v3";
+pub const VERSION_MISMATCH_MESSAGE: &str = "mIV と AI 連携の版が違います。mIV を終了して起動し直し、AI アプリを再起動 (Claude Code は MCP の再接続) してください。直らない時は、AI アプリを終了してから mIV のファイルを置き換え直してください";
 pub const MAX_CLIENT_NAME_CHARS: usize = 128;
 pub const MAX_CLIENT_VERSION_CHARS: usize = 64;
 
@@ -121,6 +142,11 @@ pub enum Command {
         limit: Option<u32>,
         cursor: Option<String>,
     },
+    GetTranscript {
+        item: ItemRef,
+        start_secs: Option<f64>,
+        cursor: Option<String>,
+    },
     ListFolder {
         path: String,
         subresource: Option<String>,
@@ -187,6 +213,7 @@ pub enum Payload {
     Collections(CollectionPage),
     Library(LibraryPage),
     Info(InfoPage),
+    Transcript(TranscriptReadResult),
     Folder(FolderPage),
     Thumbnails(ThumbnailResponse),
     Opened(OpenResult),
@@ -315,6 +342,8 @@ pub struct PermissionSnapshot {
     pub gps: bool,
     #[serde(default)]
     pub ai_captions: bool,
+    #[serde(default)]
+    pub transcripts: bool,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -404,16 +433,22 @@ impl std::fmt::Display for AgentError {
 }
 impl std::error::Error for AgentError {}
 
-/// The private core/adapter protocol has exact equality, independent of MCP versions.
+/// The adapter accepts only its own version echoed by the core, independently of MCP.
 pub fn check_version(version: u32) -> Result<(), AgentError> {
     if version == AGENT_PROTOCOL_VERSION {
         Ok(())
     } else {
-        Err(AgentError::new(
-            ErrorCode::VersionMismatch,
-            "mIV と AI 連携の版が違います。設定の案内に従って登録し直してください",
-        ))
+        Err(version_mismatch())
     }
+}
+
+/// Core compatibility is deliberately one-way: older adapters, never newer ones.
+pub fn supports_adapter_version(version: u32) -> bool {
+    (MIN_ADAPTER_PROTOCOL_VERSION..=AGENT_PROTOCOL_VERSION).contains(&version)
+}
+
+pub fn version_mismatch() -> AgentError {
+    AgentError::new(ErrorCode::VersionMismatch, VERSION_MISMATCH_MESSAGE)
 }
 
 /// A clean EOF returns None; partial headers and bodies are errors. Validate before allocation.
@@ -495,7 +530,7 @@ pub fn derive_pipe_name(resolved_absolute_data_dir: &Path, user_sid: &str) -> io
     let digest = Sha256::digest(normalized.as_bytes());
     let hash: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
     Ok(format!(
-        r"\\.\pipe\mimageviewer-agent-v{AGENT_PROTOCOL_VERSION}-{user_sid}-{hash}"
+        r"\\.\pipe\{AGENT_PIPE_NAMESPACE}-{user_sid}-{hash}"
     ))
 }
 
@@ -552,16 +587,13 @@ mod tests {
     use super::*;
     #[test]
     fn handshake_version_requires_exact_equality() {
-        for version in [0, 1, 2, AGENT_PROTOCOL_VERSION, u32::MAX] {
+        for version in [0, 1, 2, 3, AGENT_PROTOCOL_VERSION, u32::MAX] {
             if version == AGENT_PROTOCOL_VERSION {
                 assert!(check_version(version).is_ok());
             } else {
                 let error = check_version(version).unwrap_err();
                 assert_eq!(error.code, ErrorCode::VersionMismatch);
-                assert_eq!(
-                    error.message,
-                    "mIV と AI 連携の版が違います。設定の案内に従って登録し直してください"
-                );
+                assert_eq!(error.message, VERSION_MISMATCH_MESSAGE);
             }
         }
     }
@@ -605,9 +637,7 @@ mod tests {
     fn namespace_is_normalized_and_isolated() {
         let sid = "S-1-5-21-123";
         let base = derive_pipe_name(Path::new(r"C:\Users\Test\data"), sid).unwrap();
-        assert!(base.starts_with(&format!(
-            r"\\.\pipe\mimageviewer-agent-v{AGENT_PROTOCOL_VERSION}-"
-        )));
+        assert!(base.starts_with(r"\\.\pipe\mimageviewer-agent-v3-"));
         assert_eq!(
             base,
             derive_pipe_name(Path::new("c:/users/test/data/"), sid).unwrap()
@@ -677,7 +707,7 @@ mod tests {
             incomplete["command"].as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<Request>(incomplete).is_err());
         }
-        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
     }
 
     #[test]
@@ -725,6 +755,14 @@ mod tests {
                 }],
                 limit: Some(MAX_INFO_LIMIT),
                 cursor: Some("info-cursor".into()),
+            },
+            Command::GetTranscript {
+                item: ItemRef {
+                    path: "C:/videos/cat.mkv".into(),
+                    subresource: None,
+                },
+                start_secs: Some(12.5),
+                cursor: Some("transcript-cursor".into()),
             },
             Command::Cancel { request_id: 2 },
             Command::OpenInViewer {
@@ -784,13 +822,14 @@ mod tests {
                 thumbnails: false,
                 gps: false,
                 ai_captions: false,
+                transcripts: false,
             }
         );
     }
 
     #[test]
     fn collection_write_wire_roundtrips_grouped_input_positions() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -848,11 +887,13 @@ mod tests {
     }
 
     #[test]
-    fn caption_permission_defaults_false_without_protocol_change() {
+    fn caption_and_transcript_permissions_default_false() {
         let old = r#"{"level":"read_only","thumbnails":true,"gps":false}"#;
         let mut permission: PermissionSnapshot = serde_json::from_str(old).unwrap();
         assert!(!permission.ai_captions);
+        assert!(!permission.transcripts);
         permission.ai_captions = true;
+        permission.transcripts = true;
         assert_eq!(
             serde_json::from_str::<PermissionSnapshot>(
                 &serde_json::to_string(&permission).unwrap()
@@ -860,12 +901,86 @@ mod tests {
             .unwrap(),
             permission
         );
-        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
+    }
+
+    #[test]
+    fn transcript_wire_roundtrips_tagged_states_and_flattened_pages() {
+        let info = TranscriptInfo {
+            model: "fixture-model".into(),
+            created_at: 1_730_000_000_000,
+            audio_stream: Some(2),
+            duration_secs: 60.5,
+            segment_count: 2,
+            char_count: 8,
+            stale: false,
+        };
+        for field in [
+            TranscriptField::Present(info.clone()),
+            TranscriptField::None,
+            TranscriptField::Failed,
+            TranscriptField::NotPermitted,
+        ] {
+            let value = serde_json::to_value(&field).unwrap();
+            assert_eq!(
+                serde_json::from_value::<TranscriptField>(value.clone()).unwrap(),
+                field
+            );
+            assert_eq!(
+                value.get("value").is_some(),
+                matches!(field, TranscriptField::Present(_))
+            );
+        }
+        let page = TranscriptPage {
+            info,
+            segments: vec![TranscriptSegmentInfo {
+                start_secs: 12.5,
+                end_secs: 15.0,
+                text: TextValue {
+                    text: "猫の声".into(),
+                    truncated: true,
+                },
+            }],
+            cursor: Some("opaque".into()),
+            truncated: true,
+        };
+        let value = serde_json::to_value(&page).unwrap();
+        assert!(value.get("info").is_none());
+        assert_eq!(value["model"], "fixture-model");
+        assert_eq!(value["segments"][0]["start_secs"], 12.5);
+        assert_eq!(value["segments"][0]["text"]["truncated"], true);
+        for read in [
+            TranscriptReadResult::Present(page),
+            TranscriptReadResult::None,
+            TranscriptReadResult::Failed,
+            TranscriptReadResult::NotApplicable,
+        ] {
+            let response = Response {
+                id: 5,
+                result: Ok(Payload::Transcript(read.clone())),
+            };
+            let mut bytes = vec![];
+            write_frame(&mut bytes, &response).unwrap();
+            assert_eq!(
+                read_frame::<_, Response>(&mut &bytes[..]).unwrap(),
+                Some(response)
+            );
+            let value = serde_json::to_value(&read).unwrap();
+            assert_eq!(
+                value.get("value").is_some(),
+                matches!(read, TranscriptReadResult::Present(_))
+            );
+        }
+        assert!(serde_json::from_str::<TranscriptField>(r#"{"status":"not_applicable"}"#).is_err());
+        assert!(
+            serde_json::from_str::<TranscriptReadResult>(r#"{"status":"not_permitted"}"#).is_err()
+        );
+        assert!(serde_json::from_str::<TranscriptReadResult>(r#"{"status":"present"}"#).is_err());
     }
 
     #[test]
     fn metadata_write_wire_roundtrips_and_full_batch_outcomes_fit_budget() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -942,7 +1057,7 @@ mod tests {
 
     #[test]
     fn open_wire_uses_typed_accepted_result_without_changing_protocol_version() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 3);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
         assert_eq!(
             serde_json::to_value(Command::OpenInViewer {
                 path: "C:/猫.png".into(),

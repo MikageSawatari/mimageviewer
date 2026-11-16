@@ -1564,6 +1564,22 @@ impl App {
         };
 
         let openable = resolution.path;
+        let viewer_adoption = owner.viewer_open_adoption();
+        let navigation = navigation
+            .or_else(|| {
+                (viewer_adoption == ViewerOpenAdoption::MainNew)
+                    .then(|| {
+                        self.capture_physical_open_navigation(
+                            &owner.open_request_owner(),
+                            &openable,
+                        )
+                    })
+                    .flatten()
+            })
+            .map(|mut navigation| {
+                navigation.viewer_adoption = viewer_adoption;
+                navigation
+            });
         if matches!(resolution.kind, crate::folder_tree::OpenablePathKind::File)
             && matches!(owner, StartupOpenPathOwner::Bookmark(_))
             && let Some(reason) = self.pdf_open_refusal(&openable)
@@ -1635,7 +1651,10 @@ impl App {
                     super::StartupListIntent::PageContinuation,
                 );
                 if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
-                    self.open_startup_file_if_visible(&result.requested);
+                    self.open_startup_file_if_visible(
+                        &result.requested,
+                        ViewerOpenAdoption::ContextContinuation,
+                    );
                 }
                 return match outcome {
                     FolderOpenOutcome::Loaded
@@ -1794,7 +1813,10 @@ impl App {
                     .file_type_visibility
                     .allows_physical_file(&result.requested)
             {
-                let action = MainListAfterHydration::DirectMedia(prepared);
+                let action = MainListAfterHydration::DirectMedia {
+                    prepared,
+                    viewer_adoption,
+                };
                 let action = match self.sidecar_restore.as_mut() {
                     Some(state) => state.defer_main_list_action(action).err(),
                     None => Some(action),
@@ -1803,7 +1825,7 @@ impl App {
                     self.finish_main_list_after_hydration(action);
                 }
             } else {
-                self.open_startup_file_if_visible(&result.requested);
+                self.open_startup_file_if_visible(&result.requested, viewer_adoption);
             }
         }
         StartupOpenApplyOutcome::Opened
@@ -2067,7 +2089,10 @@ impl App {
                     let outcome =
                         app.load_folder_or_convert_archive_with_auto_fullscreen(openable, true);
                     if select_requested_file && matches!(outcome, FolderOpenOutcome::Loaded) {
-                        app.open_startup_file_if_visible(requested);
+                        app.open_startup_file_if_visible(
+                            requested,
+                            ViewerOpenAdoption::ContextContinuation,
+                        );
                     }
                     outcome
                 });
@@ -2423,8 +2448,16 @@ impl App {
         }
     }
 
-    fn open_startup_file_if_visible(&mut self, requested: &Path) {
-        if let Err(error) = self.open_loaded_file_fullscreen(requested, "startup_open_file") {
+    fn open_startup_file_if_visible(
+        &mut self,
+        requested: &Path,
+        viewer_adoption: ViewerOpenAdoption,
+    ) {
+        if let Err(error) = self.open_loaded_file_fullscreen_with_adoption(
+            requested,
+            "startup_open_file",
+            viewer_adoption,
+        ) {
             crate::logger::log(format!("startup open: {error}"));
         }
     }
@@ -2435,6 +2468,19 @@ impl App {
         &mut self,
         requested: &Path,
         input_reason: &'static str,
+    ) -> Result<usize, String> {
+        self.open_loaded_file_fullscreen_with_adoption(
+            requested,
+            input_reason,
+            ViewerOpenAdoption::MainNew,
+        )
+    }
+
+    fn open_loaded_file_fullscreen_with_adoption(
+        &mut self,
+        requested: &Path,
+        input_reason: &'static str,
+        viewer_adoption: ViewerOpenAdoption,
     ) -> Result<usize, String> {
         let Some(idx) = startup_file_idx(&self.items, requested) else {
             return Err(format!(
@@ -2456,7 +2502,12 @@ impl App {
         ));
         self.bump_input_seq_for_item(input_reason, idx);
         self.fs_open_intent_from_grid = true;
-        self.open_fullscreen(idx, crate::app::HistoryTrigger::UserChosen);
+        self.open_fullscreen_with_adoption(
+            idx,
+            crate::app::HistoryTrigger::UserChosen,
+            None,
+            viewer_adoption,
+        );
         Ok(idx)
     }
 }
@@ -2776,6 +2827,211 @@ mod tests {
             reader.finish_history_restore_preparation_for_test();
             reader.finish_page_identity_preparation_for_test();
         });
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn realmachine50_bookmark_preparing_context_leaf_open_keeps_its_owner_and_sibling() {
+        let _input = crate::key_input::lock_test_input();
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.active_quick_folder_slot = None;
+        app.settings.detached_viewer_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        app.settings.page_turn_animation_enabled = false;
+        let folder = app.tmp.path().join("realmachine50-bookmark-continuation");
+        std::fs::create_dir_all(&folder).unwrap();
+        let requested = folder.join("page.jpg");
+        image::RgbImage::from_pixel(8, 12, image::Rgb([90, 100, 110]))
+            .save(&requested)
+            .unwrap();
+        let sibling_window = 89_050;
+        let sibling = app.push_window_context_for_test(&ctx, sibling_window, |reader| {
+            crate::app::depth_view_tests::install_pages(reader, &ctx);
+        });
+        let sibling_before = app.with_window_context_for_test(sibling, |reader| {
+            (
+                reader.items.clone(),
+                reader.items_generation,
+                reader.fullscreen_idx,
+            )
+        });
+
+        // The real bookmark admission reserves the loading C and its window lease.
+        app.open_bookmark_browser_row(&ctx, &section1419_row(&folder));
+        let window = app
+            .active_detached_window_id()
+            .expect("bookmark loading window");
+        let context = app
+            .active_viewer_context_id()
+            .expect("bookmark loading context");
+        assert_ne!(context, app.viewer_context_main());
+        assert!(
+            app.active_detached_session.is_some_and(
+                |session| session.content_phase == DetachedSessionContentPhase::Preparing
+            )
+        );
+        let owner = app
+            .startup_open_path_resolve_pending
+            .as_ref()
+            .unwrap()
+            .owner
+            .clone();
+        assert!(matches!(&owner, StartupOpenPathOwner::Bookmark(owner)
+            if owner.detached_lease == Some(DetachedSessionLease { window_id: window })));
+        assert_eq!(
+            owner.viewer_open_adoption(),
+            ViewerOpenAdoption::ContextContinuation
+        );
+
+        app.with_window_viewer_context(window, |reader| {
+            // Give the real Preparing bookmark owner the existing loaded-page
+            // fixture, then exercise its leaf adoption seam.
+            crate::app::depth_view_tests::install_pages(reader, &ctx);
+            reader.items[0] = GridItem::Image(requested.clone());
+            reader.current_folder = Some(folder.clone());
+            reader.fullscreen_idx = None;
+            reader
+                .open_startup_file_if_visible(&requested, ViewerOpenAdoption::ContextContinuation);
+            assert_eq!(reader.projected_viewer_context_id(), context);
+            assert_eq!(reader.detached_viewer_window_id(), Some(window));
+            let idx = reader
+                .fullscreen_idx
+                .expect("continuation opens the loaded page");
+            assert!(matches!(&reader.items[idx], GridItem::Image(path)
+                if crate::path_key::eq_keep_drive(path, &requested)));
+        })
+        .unwrap();
+
+        assert_eq!(app.active_viewer_context_id(), Some(context));
+        assert_eq!(app.active_detached_window_id(), Some(window));
+        assert_eq!(app.viewer_context_window(context), Some(window));
+        assert_eq!(
+            app.detached_image_windows.len(),
+            1,
+            "the loading owner never parks itself"
+        );
+        assert_eq!(app.detached_image_windows[0].id, sibling_window);
+        assert_eq!(app.viewer_context_window(sibling), Some(sibling_window));
+        app.with_window_context_for_test(sibling, |reader| {
+            assert_eq!(reader.items, sibling_before.0);
+            assert_eq!(reader.items_generation, sibling_before.1);
+            assert_eq!(reader.fullscreen_idx, sibling_before.2);
+        });
+    }
+
+    #[cfg(windows)]
+    fn realmachine50_live_depth_owner_fixture() -> (
+        crate::app::AppTestEnvForTest,
+        egui::Context,
+        ViewerContextId,
+        (u64, u64),
+    ) {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.active_quick_folder_slot = None;
+        app.settings.detached_viewer_enabled = true;
+        app.settings.detached_viewer_open_images_in_window = true;
+        app.settings.sidecar_backup_enabled = false;
+        app.settings.tag_sidecar_backup_enabled = false;
+        let old =
+            app.build_active_context_for_test(Some(89_051), DetachedSource::Image, |reader| {
+                crate::app::depth_view_tests::install_pages(reader, &ctx);
+                reader.viewer_presentation = ViewerPresentation::DetachedWindow;
+                reader.detached_viewer_independent_active = true;
+                crate::app::depth_view_tests::install_ready_depth_for_export(reader);
+            });
+        let evidence = app.with_window_context_for_test(old, |reader| {
+            reader.mark_active_detached_viewport_rendered(&ctx);
+            let crate::fs_exclusive_view::FsExclusiveView::Depth(depth) = &reader.fs_exclusive_view
+            else {
+                unreachable!()
+            };
+            (depth.ready().unwrap().resource_id, reader.items_generation)
+        });
+        (app, ctx, old, evidence)
+    }
+
+    #[cfg(windows)]
+    fn realmachine50_assert_live_owner_not_handed_off(
+        app: &mut App,
+        old: ViewerContextId,
+        evidence: (u64, u64),
+    ) {
+        assert_eq!(app.active_viewer_context_id(), Some(old));
+        assert_eq!(app.active_detached_window_id(), Some(89_051));
+        assert_eq!(app.viewer_context_window(old), Some(89_051));
+        assert!(
+            app.detached_image_windows.is_empty(),
+            "unaccepted completion cannot park the live owner"
+        );
+        app.with_window_viewer_context(89_051, |reader| {
+            let crate::fs_exclusive_view::FsExclusiveView::Depth(depth) = &reader.fs_exclusive_view else {
+                panic!("unaccepted completion must retain the old Depth owner");
+            };
+            assert_eq!(depth.ready().unwrap().resource_id, evidence.0);
+            assert_eq!(reader.items_generation, evidence.1);
+            assert_eq!(reader.fullscreen_idx, Some(0));
+            assert!(matches!(&reader.items[0], GridItem::Image(path) if path == Path::new("depth-first.jpg")));
+        }).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn realmachine50_cancelled_bookmark_resolve_does_not_handoff_live_owner() {
+        let _input = crate::key_input::lock_test_input();
+        for completion_first in [false, true] {
+            let (mut app, ctx, old, evidence) = realmachine50_live_depth_owner_fixture();
+            let target = app.tmp.path().join("cancelled-bookmark");
+            std::fs::create_dir_all(&target).unwrap();
+            let owner = arm_section1339_bookmark(&mut app, 50_301, &target);
+            let (tx, cancel) = section1285_resolver(
+                &mut app,
+                StartupOpenPathOwner::Bookmark(owner.clone()),
+                &target,
+            );
+            if completion_first {
+                tx.send(section1285_result(&target)).unwrap();
+            }
+            assert!(app.cancel_bookmark_open_request(owner.request_id, "realmachine50_cancel"));
+            assert!(cancel.load(Ordering::Relaxed));
+            if !completion_first {
+                assert!(tx.send(section1285_result(&target)).is_err());
+            }
+            app.poll_startup_open_path_resolve(&ctx);
+            assert!(app.startup_open_path_resolve_pending.is_none());
+            assert!(app.bookmark_open_pending.is_none());
+            realmachine50_assert_live_owner_not_handed_off(&mut app, old, evidence);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn realmachine50_stale_bookmark_resolve_does_not_handoff_live_owner() {
+        let _input = crate::key_input::lock_test_input();
+        let (mut app, ctx, old, evidence) = realmachine50_live_depth_owner_fixture();
+        let target = app.tmp.path().join("stale-bookmark");
+        let replacement = app.tmp.path().join("current-bookmark");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&replacement).unwrap();
+        let stale = arm_section1339_bookmark(&mut app, 50_302, &target);
+        let current = arm_section1339_bookmark(&mut app, 50_303, &replacement);
+        assert!(
+            !app.startup_open_path_owner_is_current(&StartupOpenPathOwner::Bookmark(stale.clone()))
+        );
+        app.finish_startup_open_path_resolve(
+            StartupOpenPathOwner::Bookmark(stale),
+            section1285_result(&target),
+            &ctx,
+        );
+        assert_eq!(
+            app.bookmark_open_pending.as_ref().unwrap().request_id(),
+            current.request_id
+        );
+        assert!(!app.sidecar_restore_active());
+        realmachine50_assert_live_owner_not_handed_off(&mut app, old, evidence);
     }
 
     fn section1419_candidate(app: &mut App, target: &Path, ctx: &egui::Context) {
@@ -4741,6 +4997,196 @@ mod tests {
             assert_eq!(app.items_generation, main_generation);
             assert!(Arc::ptr_eq(&app.page_identity_index, &basis_index));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn realmachine50_direct_media_production_forks_materialized_reader_and_restores_main_basis() {
+        realmachine50_direct_media_production_fork_case(false);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn realmachine50_direct_media_production_forks_live_policy_reader_and_restores_main_basis() {
+        realmachine50_direct_media_production_fork_case(true);
+    }
+
+    #[cfg(windows)]
+    fn realmachine50_direct_media_production_fork_case(live: bool) {
+        use super::super::file_type_resume::{PositionResolution, PreparedPageIdentityIndex};
+        let mut app = direct_reader_fixture();
+        let parent = app.current_folder.clone().unwrap();
+        let main = app.viewer_context_main();
+        app.selected = Some(1);
+        let basis_items = app.items.clone();
+        let basis_index = app.page_identity_index.clone();
+        let basis_generation = app.items_generation;
+        let projection_key = app.current_folder_projection_key(&parent);
+        let rows = Arc::new(folder_scan::FolderRowRecord::from_projection(
+            &parent,
+            &app.items,
+            &app.image_metas,
+            &HashMap::new(),
+            &[],
+        ));
+        app.folder_observation = Some(FolderObservation {
+            source: parent.clone(),
+            generation: basis_generation,
+            projection_key,
+            rows: rows.clone(),
+            removed: Arc::new(FolderRemovedRows::default()),
+            revision: 73,
+        });
+        let sibling_window = 89_053;
+        let sibling_folder = app.tmp.path().join("unrelated-direct-fork-sibling");
+        let sibling = app.build_window_context_for_test(sibling_window, |owner| {
+            owner.current_folder = Some(sibling_folder.clone());
+            owner.items = vec![GridItem::Image(sibling_folder.join("sibling.jpg"))];
+            owner.visible_indices = vec![0];
+            owner.thumbnails = vec![ThumbnailState::Pending];
+            owner.image_metas = vec![None];
+            owner.selected = Some(0);
+            owner.current_folder_watch = Some(CurrentFolderWatch::new(sibling_folder.clone(), 91));
+        });
+        let sibling_before = app.with_window_context_for_test(sibling, |owner| {
+            (
+                owner.pdf_render_epoch.snapshot(),
+                owner.items_generation,
+                owner.current_folder_watch.as_ref().unwrap().epoch,
+                owner.items.clone(),
+            )
+        });
+        let target = direct_fixture_target(&app, "m.png");
+        app.install_direct_media_reader(target).unwrap();
+        app.page_identity_index = Arc::new(PreparedPageIdentityIndex::prepare(
+            &app.items,
+            None,
+            app.settings.file_type_visibility.clone(),
+        ));
+        app.fullscreen_idx = Some(2);
+        // Live parking preserves a valid grid cursor separately from the active
+        // hidden media page. Materialized opening explicitly selects that page.
+        app.selected = Some(if live { 0 } else { 2 });
+        let reader_items = app.items.clone();
+        let reader_index = app.page_identity_index.clone();
+        let reader_generation = app.items_generation;
+        let reader_snapshot_generation = app.snapshot.as_ref().unwrap().generation_id;
+        let reader_positions: Vec<_> = reader_items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| crate::book_resume_db::ReadingPosition {
+                page: index,
+                identity: Some(crate::book_resume_db::PageIdentity::for_item(item, None).unwrap()),
+            })
+            .collect();
+        assert_eq!(app.current_reader_order(), &[0, 2, 1]);
+        let main_epoch = app.pdf_render_epoch.snapshot();
+
+        // Exercise the real registry plan/finish boundary. The live policy has
+        // no native runtime in this fixture and still transfers its real binding.
+        let live_window = live.then(|| app.ensure_detached_viewer_window_id());
+        let reader = if let Some(window) = live_window {
+            assert!(app.video_audio_mode_runtime.is_none());
+            app.fork_mounted_live_media_context(window)
+        } else {
+            app.fork_materialized_still_context(&parent, 2)
+        };
+        assert_ne!(reader, main);
+        assert_eq!(app.projected_viewer_context_id(), main);
+        assert!(!app.direct_media_reader_active());
+        assert!(app.snapshot.is_none());
+        assert_eq!(app.items, basis_items);
+        assert_eq!(app.current_reader_order(), &[0, 1]);
+        assert_eq!(app.visible_indices, vec![0, 1]);
+        assert_eq!(app.selected, Some(1), "restore the saved grid selection");
+        assert!(Arc::ptr_eq(&app.page_identity_index, &basis_index));
+        assert_eq!(app.items_generation, reader_generation.wrapping_add(1));
+        let restored_generation = app.items_generation;
+        assert!(
+            main_epoch.is_stale(),
+            "restoring the main basis retires its old work"
+        );
+        let fresh_main_epoch = app.pdf_render_epoch.snapshot();
+        assert!(!fresh_main_epoch.is_stale());
+        let observation = app
+            .folder_observation
+            .as_ref()
+            .expect("main basis observation");
+        assert_eq!(observation.source, parent);
+        assert_eq!(observation.generation, restored_generation);
+        assert_eq!(observation.projection_key, projection_key);
+        assert_eq!(observation.revision, 73);
+        assert!(Arc::ptr_eq(&observation.rows, &rows));
+        for (index, position) in reader_positions.iter().take(2).enumerate() {
+            assert_eq!(
+                app.page_identity_index.resolve(position),
+                PositionResolution::Restored(index)
+            );
+        }
+        assert_eq!(
+            app.page_identity_index.resolve(&reader_positions[2]),
+            PositionResolution::HiddenIdentity
+        );
+        if let Some(window) = live_window {
+            assert_eq!(app.viewer_context_window(reader), Some(window));
+            assert_eq!(app.viewer_context_window(main), None);
+        }
+        app.with_viewer_context(reader, |owner| {
+            assert!(owner.direct_media_reader_active());
+            assert!(matches!(owner.top_level_grid_view.surface(), top_level_grid_view::TopLevelGridSurface::Snapshot));
+            assert_eq!(owner.items, reader_items);
+            assert_eq!(owner.current_reader_order(), &[0, 2, 1]);
+            assert_eq!(owner.fullscreen_idx, Some(2));
+            assert_eq!(owner.selected, Some(if live { 0 } else { 2 }));
+            if live {
+                assert_eq!(owner.items_generation, reader_generation);
+            } else {
+                assert_ne!(owner.items_generation, reader_generation);
+                assert_ne!(owner.items_generation, restored_generation);
+            }
+            assert!(Arc::ptr_eq(&owner.page_identity_index, &reader_index));
+            assert_eq!(owner.snapshot.as_ref().unwrap().generation_id, reader_snapshot_generation);
+            assert!(matches!(&owner.snapshot.as_ref().unwrap().source_label,
+                crate::snapshot::SnapshotSourceLabel::DirectMedia { basis_generation: retained, target, .. }
+                    if *retained == basis_generation && target == &parent.join("m.png")));
+            for (index, position) in reader_positions.iter().enumerate() {
+                assert_eq!(owner.page_identity_index.resolve(position), PositionResolution::Restored(index));
+            }
+            let observation = owner.folder_observation.as_ref().expect("reader observation");
+            assert_eq!(observation.source, parent);
+            assert_eq!(observation.generation, owner.items_generation);
+            assert!(Arc::ptr_eq(&observation.rows, &rows));
+        }).unwrap();
+        assert_eq!(
+            app.items_generation, restored_generation,
+            "mounting the reader does not restore twice"
+        );
+        assert_eq!(app.selected, Some(1));
+        assert!(Arc::ptr_eq(&app.page_identity_index, &basis_index));
+        assert!(
+            app.pdf_render_epoch
+                .snapshot()
+                .same_request(&fresh_main_epoch)
+        );
+        assert_eq!(app.viewer_context_window(sibling), Some(sibling_window));
+        app.with_window_viewer_context(sibling_window, |owner| {
+            assert!(
+                owner
+                    .pdf_render_epoch
+                    .snapshot()
+                    .same_request(&sibling_before.0)
+            );
+            assert!(!sibling_before.0.is_stale());
+            assert_eq!(owner.items_generation, sibling_before.1);
+            assert_eq!(
+                owner.current_folder_watch.as_ref().unwrap().epoch,
+                sibling_before.2
+            );
+            assert_eq!(owner.items, sibling_before.3);
+            assert_eq!(owner.current_folder.as_ref(), Some(&sibling_folder));
+            assert_eq!(owner.selected, Some(0));
+        })
+        .unwrap();
     }
 
     fn arm_section1339_bookmark(
