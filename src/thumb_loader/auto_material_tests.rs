@@ -19,6 +19,7 @@ fn cover_rotation_k2_keeps_parent_until_normal_reread_and_child_save() {
     let _data = crate::data_dir::TestDataDirGuard::new();
     let temp = TempDir::new().unwrap();
     let cache = temp.path().join("cache");
+    let pin_db = crate::folder_thumb_pins::FolderThumbPinDb::open_at(&temp.path().join("pins.db")).unwrap();
     let folder = temp.path().join("books");
     std::fs::create_dir(&folder).unwrap();
     let a = folder.join("a.zip");
@@ -45,7 +46,7 @@ fn cover_rotation_k2_keeps_parent_until_normal_reread_and_child_save() {
     }
     let auto = Some(crate::cover_auto_crop::AutoCropIdentity::new(crate::settings::ReadingDirection::Rtl));
     let select = || select_folder_thumb_image_with_policy_and_auto(&folder, crate::settings::SortOrder::Numeric, 3,
-        None, &cache, None, &Default::default(), auto);
+        Some(&pin_db), &cache, None, &Default::default(), auto);
     let (first, proof) = select();
     let Some(FolderThumbResolution::CachedPinned(first)) = first else { panic!("A must be the initial cached child") };
     assert_eq!(first.source_path, a);
@@ -59,7 +60,8 @@ fn cover_rotation_k2_keeps_parent_until_normal_reread_and_child_save() {
     let parent_request = LoadRequest { path: folder.clone(), cache_key_override: Some(parent_key.clone()),
         folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected), ..Default::default() };
     let previous_parent = parent.load_one(&parent_key).unwrap().unwrap();
-    assert!(folder_cached_row_usable_in_cache_dir(&parent_request, &previous_parent, &cache));
+    let usable = |row| folder_cached_row_usable_in_cache_dir_with_pins(&parent_request, row, &cache, Some(&pin_db));
+    assert!(usable(&previous_parent));
     let mut parent_hint = SourceHint::new(BookCoverId::Folder(folder.clone()));
     parent_hint.representative_page_keys.push(crate::adjustment_db::zip_entry_key(&a, "000.png"));
     let completion = crate::cover_rotation_cache::run_invalidation(InvalidationRequest {
@@ -72,14 +74,14 @@ fn cover_rotation_k2_keeps_parent_until_normal_reread_and_child_save() {
     assert_eq!(completion.affected_slots.len(), 1);
     assert!(catalog.load_one("zipthumb:a.zip|autocrop:v4:rtl").unwrap().is_none());
     assert!(parent.load_one(&parent_key).unwrap().is_some(), "write-side deletion never removes K2 parent rows");
-    assert!(!folder_cached_row_usable_in_cache_dir(&parent_request, &previous_parent, &cache));
+    assert!(!usable(&previous_parent));
     let (replacement, replacement_proof) = select();
     let Some(FolderThumbResolution::CachedPinned(replacement)) = replacement else { panic!("cold A must be skipped in favor of cached B") };
     assert_eq!(replacement.source_path, b);
     parent.save_auto_folder_bytes(&parent_key, 1, 0, replacement.source_dims, replacement.layout_dims,
         &replacement.webp_data, replacement_proof.as_ref(), &replacement.cover, replacement.auto_material).unwrap();
     let b_parent = parent.load_one(&parent_key).unwrap().unwrap();
-    assert!(folder_cached_row_usable_in_cache_dir(&parent_request, &b_parent, &cache));
+    assert!(usable(&b_parent));
     // A normal restart or a policy which has not saved A leaves the same cold
     // fact. Merely selecting the parent never starts a source job or saves A.
     drop(crate::catalog::CatalogDb::open_existing_read_only(&cache, &folder).unwrap().unwrap());
@@ -94,7 +96,7 @@ fn cover_rotation_k2_keeps_parent_until_normal_reread_and_child_save() {
     let generated = run_cover_crop_request(&mut normal, &catalog, None);
     assert!(generated.iter().any(|message| message.pixels().is_some()));
     assert!(catalog.load_one("zipthumb:a.zip|autocrop:v4:rtl").unwrap().is_some());
-    assert!(!folder_cached_row_usable_in_cache_dir(&parent_request, &b_parent, &cache), "ordinary child save invalidates the existing selection proof");
+    assert!(!usable(&b_parent), "ordinary child save invalidates the existing selection proof");
     let (restored, _) = select();
     assert!(matches!(restored, Some(FolderThumbResolution::CachedPinned(ref selected)) if selected.source_path == a));
 }

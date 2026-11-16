@@ -114,7 +114,13 @@ impl ThumbnailRequests {
         let id = self.begin(req.idx, req.items_gen, kind, edit_preview_epoch)?;
         let r = self.entries.get_mut(&req.idx)?.request_mut()?;
         r.cover_scope = req.cover_scope.clone();
-        r.automatic_cover_request = req.auto_cover_crop.map(|_| req.clone());
+        r.automatic_cover_request = req.auto_cover_crop.map(|_| {
+            let mut admitted = req.clone();
+            // The caller assigns the returned ID after admission. These retained
+            // facts already belong to the reservation created above.
+            admitted.request_id = id;
+            admitted
+        });
         r.refresh_legacy_cover = req.refresh_legacy_cover;
         Some(id)
     }

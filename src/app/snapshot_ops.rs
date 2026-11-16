@@ -3381,10 +3381,12 @@ mod tests {
                     ..Default::default()
                 });
             app.poll_cover_rotation_cache(&ctx);
-            if list_view {
-                assert!(app.snapshot_return_to_list_view());
-                drain_snapshot_identity_preparation(&mut app);
-            } else {
+            // Leaving a child book returns to the fixed list first. Unfixing
+            // while still inside it intentionally keeps that child's list.
+            assert!(app.snapshot_return_to_list_view());
+            drain_snapshot_identity_preparation(&mut app);
+            if !list_view {
+                assert!(app.snapshot.as_ref().unwrap().saved_thumbnails[0].has_pixels());
                 app.deactivate_snapshot();
                 drain_snapshot_identity_preparation(&mut app);
             }

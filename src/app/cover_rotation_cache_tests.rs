@@ -426,6 +426,75 @@ fn cover_cache_representative_only_completion_preserves_pixels_and_return_to_zer
 
 #[cfg(windows)]
 #[test]
+fn cover_cache_unsaved_retained_archive_uses_mounted_reader_alias_before_source_filtering() {
+    use std::io::Write;
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let source = app.tmp.path().join("book.rar");
+    let cached = app.tmp.path().join("converted.zip");
+    std::fs::write(&source, b"logical source metadata only").unwrap();
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&cached).unwrap());
+    for name in ["cover.png", "body.png"] {
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"selection must not decode these entries")
+            .unwrap();
+    }
+    zip.finish().unwrap();
+    let book_item = GridItem::ConvertibleArchive {
+        path: source.clone(),
+        format: crate::archive_converter::ArchiveFormat::Rar,
+    };
+    let target = AutoCoverSlot {
+        logical_book: BookCoverId::from_grid_item(&book_item).unwrap(),
+        representative_page_key: crate::adjustment_db::zip_entry_key(&cached, "cover.png"),
+    };
+    app.items = vec![GridItem::ZipImage {
+        zip_path: cached,
+        entry_name: "body.png".into(),
+    }];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.archive_source_override = Some(source);
+    // No disk/memory row and no reverse cache DB lookup can rescue a discarded
+    // retained tile. Only the mounted reader supplies the physical alias.
+    app.archive_cache_db = None;
+    app.folder_thumb_pin_db = None;
+    app.settings.thumb_cover_auto_crop = true;
+    let generation = app.items_generation;
+    let page_request = app
+        .requested
+        .begin(0, generation, ThumbnailRequestKind::Normal, None)
+        .unwrap();
+    let before = app.cover_rotation_cache.stamp(target.clone());
+    let parked = app.build_window_context_for_test(177332, |owner| {
+        owner.items = vec![book_item];
+        owner.thumbnails = vec![loaded(&ctx, &target, before.clone())];
+        owner.archive_source_override = None;
+        owner.converted_archive_cache_paths.clear();
+        owner.thumbnail_pool_catalog = ThumbnailPoolCatalog::None;
+        owner.current_color_cache_map = None;
+    });
+    let GridItem::ZipImage { zip_path, .. } = &app.items[0] else {
+        unreachable!()
+    };
+    let changed = crate::adjustment_db::zip_entry_key(zip_path, "body.png");
+    app.invalidate_automatic_covers_after_rotation(&[changed]);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while app.cover_rotation_cache.is_current(&before) && std::time::Instant::now() < deadline {
+        app.poll_cover_rotation_cache(&ctx);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!app.cover_rotation_cache.is_current(&before));
+    assert_eq!(
+        app.cover_cache_context_rows_for_test(parked),
+        vec![(true, false, false, false)]
+    );
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
+    assert_eq!(app.requested.id(0), Some(page_request));
+}
+
+#[cfg(windows)]
+#[test]
 fn cover_cache_direct_reader_split_restores_stale_saved_basis_without_pixels_or_aspect_sample() {
     for materialized in [false, true] {
         let mut app = setup_app_for_test();

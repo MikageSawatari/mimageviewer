@@ -848,12 +848,11 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
         }
     }
     let mut merged: Vec<SourceHint> = Vec::new();
+    let mut first_by_book = HashMap::new();
     for hint in request.source_hints.drain(..) {
         if hint.selection.is_none() {
-            if let Some(existing) = merged
-                .iter_mut()
-                .find(|existing| existing.book == hint.book)
-            {
+            if let Some(&index) = first_by_book.get(&hint.book) {
+                let existing: &mut SourceHint = &mut merged[index];
                 for alias in hint.aliases {
                     if !existing.aliases.iter().any(|old| same_path(old, &alias)) {
                         existing.aliases.push(alias);
@@ -867,6 +866,9 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
                 continue;
             }
         }
+        first_by_book
+            .entry(hint.book.clone())
+            .or_insert(merged.len());
         merged.push(hint);
     }
     request.source_hints = merged;
@@ -906,6 +908,36 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
             }
         }
     }
+    // Different contexts may retain different pin/request selections for the
+    // same book. Their physical aliases are source facts shared by all those
+    // selections, including a Loaded material which was never saved to disk.
+    let alias_owner = |book: &BookCoverId| match book {
+        BookCoverId::Zip { path, .. } | BookCoverId::Archive(path) => {
+            BookCoverId::Archive(path.clone())
+        }
+        other => other.clone(),
+    };
+    let mut aliases: HashMap<BookCoverId, Vec<PathBuf>> = HashMap::new();
+    for hint in &request.source_hints {
+        let known = aliases.entry(alias_owner(&hint.book)).or_default();
+        for alias in &hint.aliases {
+            if !known.iter().any(|path| same_path(path, alias)) {
+                known.push(alias.clone());
+            }
+        }
+    }
+    for hint in &mut request.source_hints {
+        hint.aliases = aliases
+            .get(&alias_owner(&hint.book))
+            .cloned()
+            .unwrap_or_default();
+    }
+    request.source_hints.retain(|hint| {
+        request
+            .changed_keys
+            .iter()
+            .any(|key| hint.contains_page_key(key))
+    });
     // A body page belongs to the whole ZIP and every containing ZipDir. These
     // are logical books, not ancestor physical folders. Derive only prefixes of
     // entries inside a known typed outer container, never by splitting a raw
@@ -1541,7 +1573,8 @@ mod tests {
                 crate::settings::SortOrder::FileName,
                 &policy
             ),
-            Some(crate::adjustment_db::normalize_path(&folder.join("10.jpg")))
+            // FileName uses the released natural FileNameSortKey, too.
+            Some(crate::adjustment_db::normalize_path(&folder.join("2.jpg")))
         );
     }
 
@@ -1637,6 +1670,55 @@ mod tests {
         assert_eq!(completion.affected_slots.len(), 1);
         assert_eq!(completion.affected_slots[0].representative_page_key, cover);
         assert!(db.load_one(key).unwrap().is_none());
+    }
+
+    #[test]
+    fn cover_rotation_zipdir_shares_outer_source_alias_without_invalidating_sibling_prefix() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("book.rar");
+        let physical = temp.path().join("converted.zip");
+        let mut outer = SourceHint::new(BookCoverId::Archive(source.clone()));
+        outer.aliases.push(physical.clone());
+        let mut selected = SourceHint::new(BookCoverId::Zip {
+            path: source.clone(),
+            prefix: Some("book/".into()),
+        });
+        let cover = crate::adjustment_db::zip_entry_key(&physical, "book/cover.png");
+        selected.representative_page_keys.push(cover.clone());
+        // Preserve a distinct selection, as in a retained owner. No pending
+        // source selection or persisted row supplies this Loaded material.
+        selected.selection = Some(SelectionHint {
+            request: Default::default(),
+            pin_db: None,
+        });
+        let mut sibling = SourceHint::new(BookCoverId::Zip {
+            path: source,
+            prefix: Some("other/".into()),
+        });
+        sibling
+            .representative_page_keys
+            .push(crate::adjustment_db::zip_entry_key(
+                &physical,
+                "other/cover.png",
+            ));
+        let target = selected.book.clone();
+        let changed = crate::adjustment_db::zip_entry_key(&physical, "book/body.png");
+        let done = run_invalidation(request(
+            &temp.path().join("cache"),
+            &changed,
+            vec![outer, selected, sibling],
+            vec![],
+        ));
+        assert!(done.errors.is_empty());
+        assert_eq!(
+            done.affected_slots,
+            vec![AutoCoverSlot {
+                logical_book: target,
+                representative_page_key: cover
+            }]
+        );
+        assert!(done.pending_slots.is_empty());
+        assert!(done.deleted_keys.is_empty());
     }
 
     #[test]

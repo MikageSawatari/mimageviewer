@@ -358,15 +358,18 @@ impl App {
         let mut inputs = CoverCacheInputs::default();
         self.append_current_cover_cache_inputs(&mut inputs);
         self.append_parked_cover_cache_inputs(&mut inputs);
-        inputs
-            .hints
-            .retain(|hint| changed.iter().any(|key| hint.contains_page_key(key)));
+        // A retained archive tile may know its logical owner and cover, while
+        // the mounted reader alone knows the converted ZIP alias. Keep these
+        // facts together until the worker has resolved and joined aliases.
         // Only actual owner maps and relevant source-parent identities need
         // scanning. A collection with many books must not open every unrelated
         // physical catalog because one page was rotated.
         inputs.scopes.retain(|scope| {
             !scope.memory.is_empty()
                 || inputs.hints.iter().any(|hint| {
+                    if !changed.iter().any(|key| hint.contains_page_key(key)) {
+                        return false;
+                    }
                     hint.book.path().parent().is_some_and(|parent| {
                         crate::path_key::eq_keep_drive(parent, &scope.folder)
                             || crate::catalog::collection_source_parent_identity(parent)
