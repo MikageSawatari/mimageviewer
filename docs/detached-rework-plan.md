@@ -1468,6 +1468,8 @@ viewport生成/破棄、HWND、geometry、入力述語、promote/retire遷移、
 新しいdetached用bool/Option、時間窓、viewport推測、worker完了の同期待ちを足さず、共有cache変更の事実を既存context所有境界へ届ける構造修正として§2に適合すると合意した。
 以前のP案への合意の流用ではない。実装・独立completion review・自動検証の結果は[表紙計画§29.12](cover-crop-plan.md)へ集約し、本記録だけで完了とはしない。
 
+独立実装レビュー修正では、同じowner別退避の照合対象へ実在行由来のslotを加え、削除中の新要求とCPU待ちの遅着を拒否する。ZipDirのwriter identityと固定先の読取scopeの区別はworkerのsource facts内で行う。合意済みの構造的修正の範囲内であり、registryの所有・viewport・PDF epoch・入力述語には新しい経路や状態を追加しない。
+
 ### 2026-11-14: フォルダツリーのポインター入力を ROOT の pass に所有させる (§1.769)
 
 `begin_folder_pane_label_input` は ROOT だけで、前の ROOT pass のツリー描画表を使う。メインの枠を描かない表示形態では表・ジェスチャ・結果を失効させるため、既存の native backdrop / embedded still / deferred reopen / viewport enter holdover の判定を読み取る。これらの述語、detached の状態・遷移・HWND・viewport identity・context bundle は変更しない。ROOT 以外からはツリーの新しい入力所有へ触れず、表示を飛ばした pass の結果も持ち越さない。

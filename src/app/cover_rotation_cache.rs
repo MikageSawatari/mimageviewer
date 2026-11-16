@@ -227,16 +227,28 @@ pub(super) fn affected_cover_indices(
                 req.pdf_page
                     .map(|page| crate::edit_source::page_key_for_pdf(&req.path, page))
             });
-        if completed
-            .iter()
-            .flat_map(|done| &done.pending_slots)
-            .any(|slot| {
-                slot.logical_book == book
-                    && explicit
-                        .as_ref()
-                        .is_none_or(|page| page == &slot.representative_page_key)
-            })
-        {
+        let matches_slot = |slot: &AutoCoverSlot| {
+            slot.logical_book == book
+                && explicit
+                    .as_ref()
+                    .is_none_or(|page| page == &slot.representative_page_key)
+        };
+        // A request may be admitted after the worker captured its inputs.
+        // Existing rows identify that request even without a captured pending
+        // selection. An unresolved request must match its exact deleted key;
+        // an unrelated historical pin must not cancel a cover-only request.
+        let request_key = crate::thumb_loader::cache_key_for_request(&req);
+        let affected_request = completed.iter().any(|done| {
+            done.pending_slots.iter().any(matches_slot)
+                || (done.affected_slots.iter().any(matches_slot)
+                    && (explicit.is_some()
+                        || request_key.as_ref().is_some_and(|key| {
+                            done.deleted_keys
+                                .iter()
+                                .any(|(_, keys)| keys.iter().any(|deleted| deleted == key.as_ref()))
+                        })))
+        });
+        if affected_request {
             result.insert(req.idx);
         }
     }

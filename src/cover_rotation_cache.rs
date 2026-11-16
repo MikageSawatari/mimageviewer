@@ -126,6 +126,8 @@ impl CoverCacheStamp {
 #[derive(Clone)]
 pub(crate) struct SourceHint {
     pub(crate) book: BookCoverId,
+    // Writer identity stays in `book`; a ZipDir pin can read another prefix.
+    read_book: BookCoverId,
     pub(crate) aliases: Vec<PathBuf>,
     pub(crate) representative_page_keys: Vec<String>,
     pub(crate) selection: Option<SelectionHint>,
@@ -139,17 +141,19 @@ pub(crate) struct SelectionHint {
 
 impl SourceHint {
     pub(crate) fn new(book: BookCoverId) -> Self {
+        let book = book.normalized();
         Self {
-            book: book.normalized(),
+            read_book: book.clone(),
+            book,
             aliases: Vec::new(),
             representative_page_keys: Vec::new(),
             selection: None,
         }
     }
     pub(crate) fn contains_page_key(&self, key: &str) -> bool {
-        self.book.contains_page_key(key)
+        self.read_book.contains_page_key(key)
             || self.aliases.iter().any(|p| {
-                let id = match &self.book {
+                let id = match &self.read_book {
                     BookCoverId::Zip { prefix, .. } => BookCoverId::Zip {
                         path: p.clone(),
                         prefix: prefix.clone(),
@@ -159,6 +163,34 @@ impl SourceHint {
                 };
                 id.contains_page_key(key)
             })
+    }
+
+    /// Worker-only pin resolution, before filtering by a changed body page.
+    fn resolve_selection(&mut self) {
+        self.read_book = self.book.clone();
+        if self.selection.is_none() {
+            return;
+        }
+        let Some(request) = resolved_selection_request(self) else {
+            self.selection = None;
+            return;
+        };
+        if let BookCoverId::Zip {
+            path,
+            prefix: Some(prefix),
+        } = &self.book
+        {
+            self.read_book = BookCoverId::Zip {
+                path: path.clone(),
+                prefix: Some(
+                    request
+                        .zip_dir_prefix
+                        .clone()
+                        .unwrap_or_else(|| prefix.clone()),
+                ),
+            };
+        }
+        self.selection.as_mut().unwrap().request = request;
     }
 }
 
@@ -512,7 +544,7 @@ fn affected_slot(
         })
 }
 
-fn selected_representative(hint: &SourceHint) -> Option<String> {
+fn resolved_selection_request(hint: &SourceHint) -> Option<crate::thumb_loader::LoadRequest> {
     let selection = hint.selection.as_ref()?;
     let mut resolved_request = selection.request.clone();
     if resolved_request.zip_entry.is_none() && resolved_request.pdf_page.is_none() {
@@ -552,10 +584,8 @@ fn selected_representative(hint: &SourceHint) -> Option<String> {
                     }
                     match target.kind {
                         ResolvedKind::PdfFirstPage | ResolvedKind::PdfPage => {
-                            return Some(crate::edit_source::page_key_for_pdf(
-                                &target.abs_path,
-                                target.pdf_page.unwrap_or(0),
-                            ));
+                            resolved_request.path = target.abs_path;
+                            resolved_request.pdf_page = Some(target.pdf_page.unwrap_or(0));
                         }
                         ResolvedKind::ZipEntry => {
                             let entry = target.zip_entry.as_deref()?;
@@ -565,10 +595,8 @@ fn selected_representative(hint: &SourceHint) -> Option<String> {
                                 None,
                             )
                             .ok()?;
-                            return Some(crate::adjustment_db::zip_entry_key(
-                                &target.abs_path,
-                                entry,
-                            ));
+                            resolved_request.zip_entry = Some(entry.to_owned());
+                            resolved_request.path = target.abs_path;
                         }
                         ResolvedKind::ZipFirstImage
                         | ResolvedKind::ArchiveFirstImage
@@ -594,7 +622,11 @@ fn selected_representative(hint: &SourceHint) -> Option<String> {
             resolved_request.path = hint.aliases.first()?.clone();
         }
     }
-    let req = &resolved_request;
+    Some(resolved_request)
+}
+
+fn selected_representative(hint: &SourceHint) -> Option<String> {
+    let req = &hint.selection.as_ref()?.request;
     // These are admitted request facts, including the effective pin, not a new
     // parse of the derived cache key. Manual/pinned-folder material is excluded.
     if req.auto_cover_crop.is_none() || req.cover_crop.is_some() {
@@ -799,6 +831,7 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
                 } else {
                     BookCoverId::Archive(path.clone())
                 };
+                root.read_book = root.book.clone();
                 root.representative_page_keys.clear();
                 root.selection = None;
                 Some(root)
@@ -828,6 +861,7 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
                     } => BookCoverId::Archive(path.clone()),
                     _ => owner.book.clone(),
                 };
+                hint.read_book = hint.book.clone();
                 hint.aliases = owner.aliases.clone();
             }
             if !request
@@ -905,6 +939,7 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
                         &snapshot.source_path,
                     ))),
                 };
+                hint.read_book = hint.book.clone();
             }
         }
     }
@@ -931,6 +966,15 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
             .get(&alias_owner(&hint.book))
             .cloned()
             .unwrap_or_default();
+        if matches!(
+            &hint.book,
+            BookCoverId::Zip {
+                prefix: Some(_),
+                ..
+            }
+        ) {
+            hint.resolve_selection();
+        }
     }
     request.source_hints.retain(|hint| {
         request
@@ -961,6 +1005,7 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
                             path: hint.book.path().to_owned(),
                             prefix: Some(prefix.clone()),
                         };
+                        derived.read_book = derived.book.clone();
                         derived.representative_page_keys.clear();
                         if let Some(selection) = &mut derived.selection {
                             selection.request.zip_entry = None;
@@ -968,6 +1013,7 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
                             selection.request.zip_dir_prefix = Some(prefix);
                             selection.request.path = path.to_owned();
                         }
+                        derived.resolve_selection();
                         if !request
                             .source_hints
                             .iter()
@@ -1012,6 +1058,19 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
                 folder,
                 memory: Vec::new(),
             });
+        }
+    }
+    // Other books retain the existing order: filter by source before resolving
+    // their pin. Only ZipDir needs pin scope to decide source membership itself.
+    for hint in &mut request.source_hints {
+        if !matches!(
+            &hint.book,
+            BookCoverId::Zip {
+                prefix: Some(_),
+                ..
+            }
+        ) {
+            hint.resolve_selection();
         }
     }
     let hints: Vec<_> = request
@@ -1549,6 +1608,7 @@ mod tests {
             },
             pin_db: Some(pins),
         });
+        hint.resolve_selection();
         assert_eq!(
             selected_representative(&hint),
             Some(crate::edit_source::page_key_for_pdf(&pdf, 3))

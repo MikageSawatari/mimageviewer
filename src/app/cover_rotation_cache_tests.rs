@@ -334,8 +334,7 @@ fn cover_cache_completion_reaches_at_rest_and_retiring_cpu_pending_without_mount
     let target = slot("c:/book.zip");
     app.cover_rotation_cache
         .complete_for_test(InvalidationCompletion {
-            affected_slots: vec![target.clone()],
-            pending_slots: vec![target],
+            affected_slots: vec![target],
             ..Default::default()
         });
     app.poll_cover_rotation_cache(&ctx);
@@ -355,6 +354,305 @@ fn cover_cache_completion_reaches_at_rest_and_retiring_cpu_pending_without_mount
     })
     .unwrap();
     assert_eq!(app.projected_viewer_context_id(), mounted);
+}
+
+#[test]
+fn cover_cache_real_row_completion_cancels_requests_admitted_during_deletion() {
+    use crate::cover_rotation_cache::{CatalogScope, InvalidationRequest, SourceHint};
+    for queued_pixels in [false, true] {
+        for explicit in [false, true] {
+            let mut app = setup_app_for_test();
+            let ctx = egui::Context::default();
+            let parent = app.tmp.path().join("during-deletion");
+            let book = parent.join("book.zip");
+            let cache = app.tmp.path().join("catalog");
+            let cover = crate::adjustment_db::zip_entry_key(&book, "cover.png");
+            let db = crate::catalog::CatalogDb::open(&cache, &parent).unwrap();
+            let key = "zipthumb:book.zip|autocrop:v4:rtl";
+            db.save(
+                key,
+                1,
+                2,
+                2,
+                1,
+                None,
+                b"header only",
+                &CoverIdentity::Page(cover),
+                automatic_material(),
+            )
+            .unwrap();
+            // Capture while the reader has no book-tile request. The worker can
+            // discover the affected slot only from its existing catalog row.
+            let captured = InvalidationRequest {
+                changed_keys: vec![crate::adjustment_db::zip_entry_key(&book, "body.png")],
+                source_hints: vec![SourceHint::new(
+                    BookCoverId::from_grid_item(&GridItem::ZipFile(book.clone())).unwrap(),
+                )],
+                scopes: vec![CatalogScope {
+                    folder: parent,
+                    memory: vec![],
+                }],
+                work: crate::catalog::CatalogWork::capture(&cache),
+                archive_cache: None,
+            };
+            // Opening the parent during deletion admits an old-cache request after
+            // capture. Exercise both CPU upload backlog and still-in-flight pixels.
+            app.items = vec![GridItem::ZipFile(book.clone())];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            let old = if explicit {
+                begin_automatic(&mut app, 0)
+            } else {
+                let mut request = LoadRequest {
+                    idx: 0,
+                    path: book,
+                    cache_key_override: Some("zipthumb:book.zip".into()),
+                    auto_cover_crop: Some(crate::cover_auto_crop::AutoCropIdentity::new(
+                        crate::settings::ReadingDirection::Rtl,
+                    )),
+                    items_gen: app.items_generation,
+                    ..Default::default()
+                };
+                request.request_id = app
+                    .requested
+                    .begin_for_request(&request, ThumbnailRequestKind::Normal, None)
+                    .unwrap();
+                request
+            };
+            if queued_pixels {
+                app.requested.receive(pixels(&old));
+            }
+            let completion = crate::cover_rotation_cache::run_invalidation(captured);
+            assert!(completion.errors.is_empty(), "{:?}", completion.errors);
+            assert_eq!(completion.affected_slots.len(), 1);
+            assert!(completion.pending_slots.is_empty());
+            assert!(db.load_one(key).unwrap().is_none());
+            app.cover_rotation_cache.complete_for_test(completion);
+            app.poll_cover_rotation_cache(&ctx);
+            assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+            assert!(!app.requested.contains_key(&0));
+            assert!(app.requested.next_image().is_none());
+            let fresh = begin_automatic(&mut app, 0);
+            assert_ne!(fresh.request_id, old.request_id);
+            assert!(matches!(
+                app.requested.receive(pixels(&old)),
+                ThumbnailReceipt::Ignored
+            ));
+            let mut finalized = pixels(&old);
+            finalized.payload = crate::thumb_loader::ThumbMsgPayload::Finalized;
+            assert!(matches!(
+                app.requested.receive(finalized),
+                ThumbnailReceipt::Ignored
+            ));
+            assert_eq!(app.requested.id(0), Some(fresh.request_id));
+        }
+    }
+}
+
+#[test]
+fn cover_cache_zipdir_external_pin_invalidates_writer_rows_and_retained_loaded() {
+    use super::cover_rotation_cache::CoverCacheInputs;
+    use crate::cover_rotation_cache::InvalidationRequest;
+    use crate::folder_thumb_pins::FolderPinSource;
+    use std::io::Write;
+
+    for persisted in [false, true] {
+        for admitted in [false, true] {
+            let mut app = setup_app_for_test();
+            let ctx = egui::Context::default();
+            let path = app.tmp.path().join("books.zip");
+            let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+            for entry in ["A/0.png", "A/1.png", "B/0.png", "B/1.png", "C/0.png"] {
+                zip.start_file(entry, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(b"selection needs entry metadata only")
+                    .unwrap();
+            }
+            zip.finish().unwrap();
+            let pins = app.folder_thumb_pin_db.as_ref().unwrap().clone();
+            let owner = book_container_key(&path, "A/");
+            pins.set(
+                &owner,
+                &FolderPinSource::ZipDir {
+                    zip_rel: String::new(),
+                    dir_prefix: "B/".into(),
+                },
+            )
+            .unwrap();
+            app.settings.thumb_cover_auto_crop = true;
+            app.items = ["A/", "C/"]
+                .map(|prefix| GridItem::ZipDir {
+                    zip_path: path.clone(),
+                    dir_prefix: prefix.into(),
+                    representative: Some(format!("{prefix}0.png")),
+                    is_archive: false,
+                })
+                .to_vec();
+            let target = AutoCoverSlot {
+                logical_book: BookCoverId::from_grid_item(&app.items[0]).unwrap(),
+                representative_page_key: crate::adjustment_db::zip_entry_key(&path, "B/0.png"),
+            };
+            let sibling = AutoCoverSlot {
+                logical_book: BookCoverId::from_grid_item(&app.items[1]).unwrap(),
+                representative_page_key: crate::adjustment_db::zip_entry_key(&path, "C/0.png"),
+            };
+            let retained = loaded(
+                &ctx,
+                &target,
+                app.cover_rotation_cache.stamp(target.clone()),
+            );
+            app.thumbnails = vec![
+                retained.clone(),
+                loaded(
+                    &ctx,
+                    &sibling,
+                    app.cover_rotation_cache.stamp(sibling.clone()),
+                ),
+            ];
+            app.thumbnail_pool_catalog = ThumbnailPoolCatalog::Folder(path.clone());
+            let mut req = make_load_request_with_auto_crop(
+                &app.items[0],
+                0,
+                17,
+                23,
+                false,
+                None,
+                Some(app.settings.folder_thumb_sort),
+                app.settings.folder_thumb_depth,
+                &pins.lookup_many([owner]),
+                &HashMap::new(),
+                None,
+                None,
+                Some(&pins),
+                None,
+                false,
+                &app.settings.file_type_visibility,
+                configured_thumbnail_auto_crop(&app.settings),
+            )
+            .unwrap();
+            assert_eq!(req.zip_dir_prefix.as_deref(), Some("B/"));
+            let key = crate::thumb_loader::cache_key_for_request(&req)
+                .unwrap()
+                .into_owned();
+            assert!(key.starts_with("zipdir:A/|autocrop:v4:"), "{key}");
+            if admitted {
+                req.items_gen = app.items_generation;
+                app.requested
+                    .begin_for_request(&req, ThumbnailRequestKind::Normal, None)
+                    .unwrap();
+            }
+            let cache = app.tmp.path().join("catalog");
+            let db = crate::catalog::CatalogDb::open(&cache, &path).unwrap();
+            let sibling_key = "zipdir:C/|autocrop:v4:rtl";
+            for (row, slot) in [(&key[..], &target), (sibling_key, &sibling)] {
+                if persisted {
+                    db.save(
+                        row,
+                        1,
+                        2,
+                        2,
+                        1,
+                        None,
+                        b"header only",
+                        &CoverIdentity::Page(slot.representative_page_key.clone()),
+                        automatic_material(),
+                    )
+                    .unwrap();
+                }
+            }
+            let inputs = || {
+                let mut inputs = CoverCacheInputs::default();
+                inputs.grid(
+                    &app.items,
+                    &app.thumbnails,
+                    Some(&app.requested),
+                    None,
+                    &app.converted_archive_cache_paths,
+                    &app.thumbnail_pool_catalog,
+                    None,
+                    &app.settings,
+                    Some(&pins),
+                );
+                inputs
+            };
+            let invalidate = |changed: &str| {
+                let inputs = inputs();
+                crate::cover_rotation_cache::run_invalidation(InvalidationRequest {
+                    changed_keys: vec![crate::adjustment_db::zip_entry_key(&path, changed)],
+                    source_hints: inputs.hints,
+                    scopes: inputs.scopes,
+                    work: crate::catalog::CatalogWork::capture(&cache),
+                    archive_cache: None,
+                })
+            };
+            // The source's cover-only change and the writer's original (now
+            // unused) body scope must not advance this material's stamp.
+            for changed in ["B/0.png", "A/1.png"] {
+                let completion = invalidate(changed);
+                assert!(completion.errors.is_empty(), "{:?}", completion.errors);
+                assert!(!completion.affected_slots.contains(&target));
+                if persisted {
+                    assert!(db.load_one(&key).unwrap().is_some());
+                }
+            }
+            let completion = invalidate("B/1.png");
+            assert!(completion.errors.is_empty(), "{:?}", completion.errors);
+            assert!(completion.affected_slots.contains(&target));
+            assert!(!completion.affected_slots.contains(&sibling));
+            assert!(db.load_one(&key).unwrap().is_none());
+            if persisted {
+                assert!(db.load_one(sibling_key).unwrap().is_some());
+            }
+            app.cover_rotation_cache.complete_for_test(completion);
+            app.poll_cover_rotation_cache(&ctx);
+            assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+            assert!(app.thumbnails[1].has_pixels());
+            assert!(!app.cover_rotation_cache.is_current(stamp(&retained)));
+            app.thumbnails[0] = retained;
+            app.auto_aspect.samples.insert(0, 0.5);
+            assert!(app.reconcile_restored_cover_thumbnails());
+            assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+            assert!(!app.auto_aspect.samples.contains_key(&0));
+            assert!(app.thumbnails[1].has_pixels());
+        }
+    }
+}
+
+#[test]
+fn cover_cache_historical_pin_completion_preserves_unresolved_cover_only_request() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    app.items = vec![GridItem::ZipFile(PathBuf::from("c:/book.zip"))];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    let req = LoadRequest {
+        idx: 0,
+        path: PathBuf::from("c:/book.zip"),
+        cache_key_override: Some("zipthumb:book.zip".into()),
+        auto_cover_crop: Some(crate::cover_auto_crop::AutoCropIdentity::new(
+            crate::settings::ReadingDirection::Rtl,
+        )),
+        items_gen: app.items_generation,
+        ..Default::default()
+    };
+    let id = app
+        .requested
+        .begin_for_request(&req, ThumbnailRequestKind::Normal, None)
+        .unwrap();
+    // The changed cover is somebody else's historical pinned row's body. Its
+    // deletion must not cancel the current unresolved first-page selection.
+    let mut historical = slot("c:/book.zip");
+    historical.representative_page_key = "c:/book.zip::old-pin.png".into();
+    app.cover_rotation_cache
+        .complete_for_test(InvalidationCompletion {
+            affected_slots: vec![historical],
+            deleted_keys: vec![(
+                PathBuf::from("c:/"),
+                vec!["zipthumb:book.zip|autocrop:v4:rtl#pin:old-pin.png".into()],
+            )],
+            ..Default::default()
+        });
+    app.poll_cover_rotation_cache(&ctx);
+    assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
+    assert_eq!(app.requested.id(0), Some(id));
 }
 
 #[test]
