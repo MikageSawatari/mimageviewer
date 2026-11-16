@@ -1,6 +1,6 @@
 # §1.800 本を Enter で開き Esc で一覧へ戻るときのもたつき — 調査と設計
 
-- 状態: 調査・設計 (2026-11-17)。実装前。設計の独立レビュー (GPT-6.1 Sol / xhigh) を受ける。
+- 状態: 調査・設計 (2026-11-17)。実装前。設計の独立レビュー r1 = REVISE を反映済み (§8)、r2 待ち。
 - ブランチ: `perf-800-book-close` (worktree `G:\home\mimageviewer-perf-800`)。
 - 目標版: v5.3.0。
 
@@ -85,72 +85,131 @@
 
 判定: 片付けが走らない条件自体は v4.6.0 から。**行数を倍にしたのは v5.2.0 の自動切り抜き**で、v5.3.0 の v4 でさらに増える。
 
-## 4. 直し方 (段階 A・B を v5.3.0、段階 C は判断待ち)
+## 4. 直し方 (段階 A を v5.3.0 で必須、段階 B は条件付き、段階 C は後段)
 
-### 段階 A: 通常フォルダの catalog の読み込み・片付けを worker へ移す (必須)
+r1 レビュー (§8) を受けて改訂した。段階 A は**今の意味を変えずに場所だけ worker へ移す**ことに絞り、行を減らす工夫は段階 B に分けた。
 
-合成ビューで既にある形 (`PreparedAggregateCatalog` を worker が作り、continuation が受け取る) を通常フォルダにも使う。
+### 段階 A: 通常の一覧の catalog の開く・読み込み・片付けを worker へ移す (必須)
 
-- 前半 (`start_loading_items` の continuation を作る箇所) で、通常フォルダなら catalog の読み込みを 1 回限りの worker へ出す。
-  渡すもの: 開いてあれば `Arc<CatalogDb>` (UI で cold open しない。キャッシュに無ければ worker が開く)、`catalog_existing_keys`、
-  片付けを行うか (今の条件と同じ)。返すもの: `PreparedFolderCatalog { db: Option<Arc<CatalogDb>>, entries }`。
-- worker の中の順序: (片付けの条件を満たすなら) `delete_missing` → 読み込み。今は「読み込み → 片付け」だが、片付けた行は
-  読み込んでも誰も引かない (§4 段階 B の論拠と同じ) ので、順序を入れ替えても結果は同じで、読む量が減る。
-- **合流点は 1 か所**: `resume_loading_items_after_sidecar` の入口で、サイドカーの終端と catalog の結果の**両方が揃うまで
-  continuation を進めない**。所有者はサイドカー復元の continuation (`SidecarLoadContinuation`) 1 つに置き、catalog 用の受信口を
-  そこへ持たせる。別の pending や bool を App に足さない。
-- 取り消し: continuation の `cancel` を worker にも渡す。取り消された結果は worker 側で捨てる (大きな map の drop を UI でしない)。
-- 失敗 (開けない・読めない): ログを出し `db: None` で続ける (サムネイルは catalog 無しで作られる。合成ビューと同じ扱い)。
-  まれな失敗は割り切り (ログ + 次回の読み込みで再試行)。UI での再試行はしない。
-- worker の完了で `ctx.request_repaint()` を呼び、次のフレームで合流させる。
-- 対象: 通常フォルダと、本 (PDF/ZIP の仮想フォルダ)。合成ビューは今の経路のまま。
-- **状態の組み合わせ**: 新しい状態は「continuation の中の catalog 受信口」1 つで、終端はサイドカーと同じ所有者が見る。
-  閉じて開き直す・別フォルダへ移る・取り消しは、今のサイドカー continuation の取り消し経路にそのまま乗る。
-  `sidecar_restore` の段 (Checking など) の中に catalog を混ぜる案は、サイドカーが無い・再利用の経路などで段を通らない場合が
-  あり分岐が増えるので採らない。
+合成ビューで既にある形 (prepare worker が `PreparedAggregateCatalog` を作り、continuation が受け取る) を、通常の一覧にも使う。
 
-効果の見込み (推定): 閉じるときの 186〜258 ms のフレームが無くなる。サムネイルが出始めるまでは
-「サイドカーの待ち + 読み込み」(230〜370 ms) から「どちらか長いほう」へ縮む。
+**対象**: `start_loading_items` の continuation を作る唯一の製品コードの箇所 (src/app.rs の `SidecarLoadContinuation { .. }`) を通る一覧
+すべて。通常フォルダ、PDF/EPUB の仮想フォルダ、ZIP・変換書庫の物理一覧。合成ビュー (`prepared_aggregate`) は今の経路のまま。
+ZIP 内の階層移動 (`IndexOnly`、`install_new_items` の軽量経路) は continuation を作らないので対象外。
 
-### 段階 B: 今の一覧で引く鍵の行だけ読む (推奨)
+**型付きの状態 1 つ**: continuation に `catalog: FolderCatalogPreparation` を持たせる。
 
-- worker の読み込みを `CatalogDb::load_keys(&existing_keys)` (新設) にする。`filename` だけの SELECT (2 ms) で該当行を絞り、
-  該当行だけ本体を読む。このフォルダでは 3,124 行・87 MB → 1,466 行・54 MB (今の設定で読まれる行だけ)。v5.3.0 の v4 の組が
-  増えても読む量は増えない。
-- 論拠: `cache_map` の未ヒットは、通常フォルダでは DB を引き直さずに元から作り直す (`thumb_loader.rs` の `uses_lazy_catalog` が
-  偽の経路)。`cache_map` を引く鍵は `make_load_request` の鍵で、`catalog_existing_keys` は「`delete_missing` の存続キー集合と
-  `make_load_request` の読み書きキーが乖離しない」ことを前提に同じ helper で作られている。表示を絞っていない利用者では
-  集合外の行は既に `delete_missing` で消えているので、集合外の行に頼る読み手があれば既に壊れているはず。
-- 適用条件は型で持つ: `CatalogLoadScope::{All, ExactKeys(Arc<HashSet<String>>)}`。`catalog_existing_keys` が空集合のまま
-  continuation を作る経路 (テスト・一部の continuation) を「全部捨てる」と取り違えないよう、空集合を目印にしない。
-- **レビューで確かめてほしい点**: `cache_map` (と `current_color_cache_map`) を、一覧の項目の鍵以外で引く読み手が無いか
-  (色フィルタ、リモートのコンテナ一覧、仮想フォルダの seed / writeback、動画ピンの seed、自動縦横比の seed、K2 の流用)。
+```text
+enum FolderCatalogPreparation {
+    NotRequested,                 // 空の一覧。読み込みも片付けもしない (下記)
+    Waiting { rx, cancel, invalidations: Vec<完了した表紙の失効> },
+    Ready   { prepared: PreparedFolderCatalog, invalidations: Vec<…> },
+}
+struct PreparedFolderCatalog { db: Option<Arc<CatalogDb>>, entries: HashMap<String, CacheEntry> }
+```
 
-### 段階 C: 表示を絞っている利用者の古い行の片付け (判断待ち、v5.3.0 には入れない案)
+App に別の pending / bool は足さない。所有者はサイドカー復元の continuation で、取り消し・別フォルダ・閉じて開き直す・context の
+退避は、今の continuation の経路にそのまま乗る。
+
+**worker の中身 (今の UI の処理と同じ順序・同じ条件)**: 開く → `load_all` → (今と同じ条件なら) `delete_missing`。
+- 開く: 受付時に開いてある `Arc<CatalogDb>` があればそれを使う。無ければ受付時に捕捉した `CatalogWork` (admission) で worker が開く。
+  worker の中で新しい admission を取り直さない (catalog の保守との順序を受付時点で固定するため。src/catalog.rs の admission)。
+- 読み込みと片付けの順序は今のまま「読み込み → 片付け」。片付けで消した行も map には残る (今と同じ)。DirectMedia の明示対象は
+  `catalog_existing_keys` に入らないが、今は map に残るので使える。順序を変えるとこれが失われる (r1 指摘 3)。
+- 片付けの条件は今と同じ (`!is_synthetic_view_path && is_all_visible`)。表示を絞っている利用者の古い行は段階 C で扱う。
+- 失敗 (開けない・読めない): ログを出し `db: None`・空の map で続ける。まれな失敗は割り切り (ログ + 次回の読み込みで再試行)。
+  UI で開き直さない (合成ビューと同じ)。
+- 完了したら結果を送り `ctx.request_repaint()`。
+
+**合流点**: `sidecar_restore.rs` の終端境界で、`state.common.continuation.take_live()` を呼ぶ**前**に catalog の状態を見る。
+- `Waiting` で未受信なら、復元の state をそのまま戻して次のフレームで再 poll する (終端の処理 = 警告の表示・効果の適用・
+  `favorite_failures` などは、合流できた 1 回だけ行う。合流待ちの間に二度行わない)。
+- 受信したら `Ready` にして続ける。context・generation・source の照合は今の終端の照合をそのまま使う。
+- `Ready` は continuation の catalog 節 (`resume_loading_items_after_sidecar` の「カタログを開く + cache_map ロード + 削除掃除」) で
+  採用するまで continuation に残す。DirectMedia は同じ continuation を再 hydration するので、`Ready` を持ち越して 2 回目の終端では
+  待たない。
+- 空の一覧の直接 resume (`start_sidecar_restore` の `self.items.is_empty() && !restore_sidecar` の枝) は catalog を
+  `NotRequested` で作る。採用時は「開いてある catalog があればその Arc、無ければ None」・空の map で、読み込みも片付けもしない。
+  今は空の一覧でも UI で開いて全行を読み、全種類表示なら空集合で `delete_missing` (= 全行削除) を呼ぶ。列挙の失敗・パスワード待ち・
+  読み込み中の殻で一覧が空になる場合もあり (r1 の表)、全行削除は避けるほうが正しいと考える (要レビュー確認、§8 Q1)。
+
+**表紙の失効との競合 (r1 指摘 1)**: 表紙の回転などで catalog の行を消す処理 (`cover_rotation_cache`) の完了は、
+`poll_cover_rotation_cache` が `current_color_cache_map` から該当行を消して知らせる。合流前は `current_color_cache_map` が `None`
+なので、worker が読んだ後・採用前に完了した失効が map に反映されない。本を閉じる直前に回転した場合が該当し、まれではない。
+- `poll_cover_rotation_cache` で完了を受け取ったとき、`Waiting` / `Ready` の continuation があれば、その `invalidations` にも積む。
+- 採用時、`entries` に `clear_deleted_cover_memory` と同じ処理を `invalidations` で当ててから `cache_map` にする。
+- 読み込み前に完了した失効は DB に反映済み、採用後の完了は今の経路 (`current_color_cache_map`) が受け持つ。窓の両端が閉じる。
+- 同じく採用前の map に作用する他の失効・書き込みが無いかを実装で列挙する (`current_color_cache_map` の書き手: collection_grid、
+  smart_folder の退避・復帰、viewer_context_registry の swap、cover_rotation_cache)。
+
+**取り消し (r1 指摘 5)**: `ContinuationOwner::discard()` で `Live` を `Discarded` へ置き換えるとき、catalog の状態
+(`Waiting` の受信口、`Ready` の結果) を既存の worker 側の破棄経路 (`retire_smart_folder_payloads` 等) へ移し、大きな map の drop を
+UI でしない。worker は cancel を見て、取り消し後は送らない。送信済み・未受信のまま取り消された場合も受信口ごと worker 側で破棄する。
+
+**簡素化の比較 (r1 の求め)**:
+- 直列 (サイドカーの終端の後に catalog を読む): 合流が要らず状態は減るが、表示開始までの時間は今と同じ「サイドカー + 読み込み」で、
+  UI が固まらなくなるだけ。
+- 並列 (採用案): 閉じるときのサイドカーの待ち 70〜122 ms (§2) が読み込みと重なる分だけ早い。増える状態は continuation 内の
+  `FolderCatalogPreparation` 1 つで、終端・取り消し・失効の 3 か所で扱う。利用者の不満は表示までの間 (ワンテンポ) なので並列を採る。
+  実装後に perf で `sli_catalog_join_wait` (合流で待った時間) を見て、重なりの効果を確かめる。重なりがほとんど無いと分かったら
+  直列へ戻す。
+- 親フォルダの `cache_map` を保持して戻るときに使い回す案: 設定変更・外部の更新・writeback・表紙の失効への追従が要り、保持する状態が
+  増えるので採らない。
+- サイドカーの Checking worker の中で読む案: Checking を通らない経路 (空の一覧、再利用) があり分岐が増える。`PreparingPageIndex`
+  (空でない一覧は必ず通る) に入れる案は、ページ索引の準備と直列になり並列の利点が無い。
+
+効果の見込み (推定): 閉じた直後の 186〜258 ms のフレームが無くなる。サムネイルが出始めるまでは「サイドカーの待ち + 読み込み」
+(230〜370 ms) から「長いほう」(この利用者で 130〜220 ms) へ縮む。
+
+### 段階 B: 今の一覧が読む行だけを読む (条件付き)
+
+- worker の読み込みを、`filename` だけの SELECT (2 ms) で行を絞ってから本体を読む形にする。このフォルダでは 3,124 行・87 MB →
+  約 1,466 行・54 MB。v5.3.0 の自動切り抜き v4 の組が増えても読む量は増えない。段階 A で読み込みが worker に移るので、B は
+  表示開始の時間とメモリのための追加で、UI の停止とは関係しない。
+- 絞り方は完全一致ではなく、`delete_missing` と同じ `thumbnail_cache_key::inventory_retains_key(existing, name)` で残る行
+  (r1 指摘 2: EPUB ピンの `|generation:mtime:size` 付きの行は pending の鍵から派生する)。表示時の鍵・stamp の照合は今のまま。
+- 適用範囲は型で持つ: `CatalogLoadScope::{All, Inventory(Arc<HashSet<String>>)}`。`Inventory` は「今の一覧の鍵を全部入れた」と
+  分かっているときだけ。DirectMedia の continuation は `All` (明示対象が集合に入らないため。r1 指摘 3)。空集合は目印にしない。
+- 読み手の確認 (r1 の表): 色フィルタ・自動縦横比・動画ピンの seed・仮想フォルダの seed は要求の鍵か集合内の鍵を使う。リモートと
+  K2 は DB を直接読むので map の縮小と独立。表紙回転のキャッシュは map と DB の見出しを併せて読み、map に全行は要らない。
+- 採る条件: 上の読み手の確認をテストで固め (EPUB の直接ピン・cascade ピン、DirectMedia、色フィルタ)、段階 A と同じ版に入れられる
+  場合だけ。間に合わなければ A を先に出す。
+
+### 段階 C: 表示を絞っている利用者の古い行の片付け (後段、v5.3.0 には入れない)
 
 - 段階 B で時間への影響は消えるが、ディスク上の古い行は残る (このフォルダで 33 MB)。
-- 案: 表示中の項目について、今の設定の鍵 (`representative_existing_keys` の 2 つ) と**同じ項目・同じ種類の表示方針**で、
-  自動切り抜きの印だけが違う行 (旧版・逆の読み方向) を消す。隠した種類のファイルの行と、別の表示方針の行 (`types` 無し) は
-  今の意図どおり残す。
-- K2 (フォルダの自動代表が子の本の v1 の行を流用する、docs/cover-crop-plan.md) との関係を整理する必要があり、v5.3.0 の締めに
-  間に合わせる規模ではない。§1.800 の後段として残す。
+- 案: 表示中の項目について、今の鍵と同じ項目・同じ表示方針で、自動切り抜きの印だけが違う行 (旧版・逆の読み方向) を消す。
+  隠した種類のファイルの行と、別の表示方針の行は今の意図どおり残す。
+- K2 (フォルダの自動代表が子の本の v1 の行を流用する、docs/cover-crop-plan.md、`thumb_loader.rs` の `legacy_auto_child_keys`) と
+  衝突するので、v5.3.0 の締めには間に合わせない。§1.800 の後段に残す。
 
 ## 5. 通常の使い方への影響
 
-- 退行なし (見込み)。表示されるサムネイルは同じ。閉じた直後に固まる 1 フレームが無くなり、空のセルの時間は今のサイドカー待ちと
-  同程度。メモリは段階 B で減る (このフォルダで約 33 MB)。
-- 永続データ: 形を変えない (読み方だけ)。段階 C を行う場合も消すのは再生成できるサムネイルのキャッシュだけ。
+- 退行なし (見込み)。表示されるサムネイルは同じ。閉じた直後に固まる 1 フレームが無くなり、空のセルが見える時間は今のサイドカーの
+  待ちと同程度。
+- 変わる点: 空の一覧で catalog を開かず、片付け (全行削除) もしない。後で項目が入った一覧を読み込むときに今どおり片付く。
+- メモリは段階 B で減る (このフォルダで約 33 MB)。
+- 永続データ: 形を変えない (読む場所と範囲だけ)。段階 C を行う場合も、消すのは作り直せるサムネイルのキャッシュだけ。
 
 ## 6. 検証
 
-- 単体: `CatalogDb::load_keys` (集合内だけ返す、空集合で何も返さない、`audioart:` を除く今の扱いを保つ)。
-- 状態遷移: continuation が「サイドカー先・catalog 先・どちらかの途中で取り消し・別フォルダへ移動」のどれでも、合流は 1 回だけ、
-  取り消し後に古い結果を採らないこと (request の相関で確かめる)。
-- 回帰: 片付けの条件 (`is_all_visible`) を満たす読み込みで、今と同じ行が残ること。合成ビューは経路が変わらないこと。
-- perf: `sli_catalog_load_all` を worker 側の区間 (`sli_catalog_preload`、ms・entries・scope) と、合流までの待ち
-  (`sli_catalog_join_wait`) に分ける。
+- 状態遷移 (段階 A):
+  - 「サイドカー先 → catalog 後」「catalog 先 → サイドカー後」で、合流・worker 起動・選択の復元・first-display action が各 1 回。
+  - 合流待ちの間に取り消し / 別フォルダへ移動 / 閉じて開き直す: 古い結果を採らない。送信済み・未受信の取り消しで map が UI で
+    drop されない。
+  - 「読み込み完了 → 表紙の失効の完了を poll → 合流」で、失効した行が `cache_map` に無い (決定的な回帰テスト)。
+  - DirectMedia: `Ready` を持ち越し、2 回目の終端で待たない。明示対象の行が map に残る。
+  - 空の一覧: catalog を読まず、片付けも呼ばない。
+  - detached viewer の context (Mounted / AtRest / Retired) で、対象の context だけが変わり、兄弟の context が変わらない。
+- 回帰: 全種類表示の読み込みで、今と同じ行が DB に残る。合成ビューの経路が変わらない。
+- 段階 B: `inventory_retains_key` と同じ行を返す (EPUB の直接ピン・cascade ピンの世代付き行を含む)。`audioart:` を除く今の扱い。
+  DirectMedia は `All`。
+- perf (r1 指摘 6): `sli_sidecar_import` はサイドカー単独の終端までに改め、次を分けて同じ要求番号で出す:
+  `sli_catalog_preload` (worker: open / load / delete の各 ms・entries・scope)、`sli_catalog_join_wait` (サイドカーの終端から
+  合流までの待ち)、`sli_catalog_adopt` (UI: 失効の適用・seed・採用)。`scripts/analyze_perf.py` の `nav` の固定イベント一覧と
+  「SLI 全体 (UI)」の表記を合わせて直す (今の `sli` は非同期の待ちを含む経過時間)。
 - 利用者の実機確認 (開発版 `build-dev.ps1`): 1,000 冊級のフォルダで本を開いて閉じ、perf ログで閉じた直後の大きなフレーム間隔が
-  消えたことを確かめてもらう。
+  消えたことと `sli_catalog_join_wait` を見る。最終の速さの比較は release 構成 (次の版のインストーラ) で行う。
 
 ## 7. 本件の範囲外で見つかったもの (別項目の候補、いずれもログからの読み・未確認)
 
@@ -158,3 +217,26 @@
 2. 開く側: 最初の全画面フレームが 133 ms。`fs.final_composite_build` が保持していた AI 拡大済みのページ (4800×6916、idx 25)
    の合成に 86 ms (`post_ms` 45・`upload_ms` 40)。開いたページ (idx 0) とは別のページの合成が、最初の描画の前に UI で走っている。
 3. `sli_settings_save` が開く・閉じるたびに 6〜9 ms (起動直後は 212 ms)。`last_folder` の保存が UI で同期。
+
+## 8. 設計レビューの記録
+
+### r1 (GPT-6.1 Sol / xhigh、2026-11-17、0854e6fbb に対して) — REVISE、P1 なし
+
+調査の (a)〜(d) はコードと一致 ((d) は通常のサムネイル経路について。retired な CacheOnly と色フィルタの代表画像は map 未ヒットで
+`load_one` する例外がある)。指摘と対応:
+
+| 指摘 | 対応 |
+| --- | --- |
+| P2-1 先読みした map が、採用前に完了した表紙の失効を取りこぼす | §4 段階 A「表紙の失効との競合」: 完了を continuation に積み、採用時に当てる |
+| P2-2 段階 B の完全一致では EPUB ピンの世代付きの行を読み落とす | §4 段階 B: `inventory_retains_key` と同じ範囲にした |
+| P2-3 DirectMedia の明示対象は存続キーに入らない。片付けを先にすると今は使える行が消える | §4 段階 A: 順序は今のまま「読み込み → 片付け」。段階 B は DirectMedia で `All` |
+| P2-4 関数の入口で待つと、待つ間の所有者が無い。空の一覧の直接 resume と DirectMedia の再 hydration も要る | §4 段階 A「合流点」: `take_live()` の前で `FolderCatalogPreparation` を見て state を戻す。空の一覧は `NotRequested`、DirectMedia は `Ready` を持ち越す。admission は受付時に捕捉 |
+| P2-5 送信済み・未受信の取り消しで大きな map が UI で drop される | §4 段階 A「取り消し」: 受信口・結果を worker 側の破棄経路へ |
+| P3-6 perf の区間がまた混ざる | §6 の perf: 区間を分け `analyze_perf.py` も直す。最終比較は release 構成 |
+| 簡素化の比較が足りない | §4 段階 A「簡素化の比較」に直列・並列・保持・Checking/PreparingPageIndex を並べた |
+
+r2 で確かめてほしい点:
+
+- Q1: 空の一覧で `delete_missing(空集合)` が全行を消す今の挙動は、列挙の失敗・パスワード待ち・読み込み中の殻でも起きているか。
+  起きているなら、空の一覧で片付けをしない (`NotRequested`) のは正しい変更か。
+- Q2: 表紙の失効を continuation に積む形で窓が閉じるか。ほかに採用前の map に作用すべき書き手・失効が無いか。
