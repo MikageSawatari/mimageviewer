@@ -487,30 +487,32 @@ impl App {
                 } => {
                     if crate::perf::is_enabled() {
                         let key = plan.key();
+                        let mut fields = vec![
+                            ("renderer", render_state.renderer.read().diag_id().into()),
+                            ("context", unit.destination.context.serial().into()),
+                            ("demand_position", unit.position.as_str().into()),
+                            ("requested_position", unit.position.as_str().into()),
+                            (
+                                "source_texture_id",
+                                format!("{:?}", key.source_texture_id()).into(),
+                            ),
+                            ("output_texture_id", format!("{output_texture_id:?}").into()),
+                            ("native_key", key.perf_key().into()),
+                            ("scale_branch", key.scale_branch().as_str().into()),
+                            ("roi", format!("{:?}", key.visible_source_uv_rect()).into()),
+                            ("target", serde_json::json!(key.target_size())),
+                            ("encode_submit_cpu_ms", stats.encode_submit_cpu_ms.into()),
+                            ("output_bytes", allocation.output_bytes.into()),
+                            ("temporary_bytes", allocation.temporary_bytes.into()),
+                            ("outer_frame", self.speculative_gpu_frame.frame.into()),
+                        ];
+                        stats.append_timing_fields(&mut fields);
                         crate::perf::event(
                             "fs",
                             "final_prepare_native_submitted",
                             None,
                             self.input_seq,
-                            &[
-                                ("renderer", render_state.renderer.read().diag_id().into()),
-                                ("context", unit.destination.context.serial().into()),
-                                ("demand_position", unit.position.as_str().into()),
-                                ("requested_position", unit.position.as_str().into()),
-                                (
-                                    "source_texture_id",
-                                    format!("{:?}", key.source_texture_id()).into(),
-                                ),
-                                ("output_texture_id", format!("{output_texture_id:?}").into()),
-                                ("native_key", key.perf_key().into()),
-                                ("scale_branch", key.scale_branch().as_str().into()),
-                                ("roi", format!("{:?}", key.visible_source_uv_rect()).into()),
-                                ("target", serde_json::json!(key.target_size())),
-                                ("encode_submit_cpu_ms", stats.encode_submit_cpu_ms.into()),
-                                ("output_bytes", allocation.output_bytes.into()),
-                                ("temporary_bytes", allocation.temporary_bytes.into()),
-                                ("outer_frame", self.speculative_gpu_frame.frame.into()),
-                            ],
+                            &fields,
                         );
                     }
                     // Only a remaining miss may request the existing busy-frame

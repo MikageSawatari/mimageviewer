@@ -119,6 +119,7 @@ filter = '''
     | test(=global_search_ui::everything::ui::tests::everything_search_bar_not_responding_narrow_dark)
     | test(/^gpu_lanczos::prewarm_tests::(prewarm_delivery_claim_cache_hit_and_output_lease_use_normal_ownership|prewarm_execution_rejects_changed_source_and_freed_backing_before_claim)$/)
     | test(/^gpu_lanczos::tests::(back_native_execution_rechecks_no_removal_before_backing_claim_or_mutation|ordinary_prepare_output_limit_fallback_captures_actual_managed_allocation)$/)
+    | test(/^gpu_lanczos::measurement_tests::(lazy_776_default_only_then_other_families_through_prewarm_and_resolve|lazy_776_prepared_jobs_encode_after_resampler_drop_for_all_families|measure_776_dx12_fxc_first_resampler_and_upscale_jobs)$/)
     | test(=native::wgpu_integration::viewport_retirement_tests::retirement_texture_delivery_wgpu_startup_before_full_and_free_only)
     | test(/^renderer::tests::(managed_mipmaps_regenerate_after_partial_upload_and_respect_view_options|public_mipmap_generator_preserves_odd_edge_texels)$/)
     | test(/^test_ui::tests::(context_root_fixture_panel_matches_raw_root_without_wrapper_margin|render_state_enumerates_only_product_backends)$/)

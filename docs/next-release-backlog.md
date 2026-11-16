@@ -285,10 +285,18 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 
 ### 1.776 最初に全画面を開いたとき、全画面の 2 コマ目で約 0.5 秒止まる — ReleaseChecks の first-ai から (2026-11-13)
 
-- 状態: **未着手・次の版以降。v5.2.0 は既知として出荷 (利用者決定 2026-11-13)**。
+- 状態: **案 A 実装済み・独立レビュー ACCEPT (Sol xhigh、2026-11-16、指摘なし。App の大きさの対応 b8f2d42aa・b1755b840 も 2026-11-17 に ACCEPT)・本体 lib 全件 18,227 / 18,228 件成功 (2026-11-17、master 5d3b8e308 取り込み後。失敗 1 件は `app::collection_grid::tests::phase_a2_collection_prepare_rejects_external_edit_after_worker_read` の collection actor の 4 秒の待ち時間切れで、単独の再実行では `collection_grid` 130 件すべて成功)・build-dev 作成済み・利用者の実機確認前（v5.3.0 の承認済み計画）。製品（release）での効果は未計測**。v5.2.0 は既知として出荷した (利用者決定 2026-11-13)。
 - 観測 (ReleaseChecks の記録、隔離した診断ポータブル版): v5.2.0 の run `release-checks-20261113-050011-2e1435fd` の first-ai で、`open_fullscreen` 直後の全画面 viewport の 2 コマ目が `immediate_viewport total=489.9ms run=487.1` (段別 `fullscreen_viewport_ms` 490ms)、`ui-frame-gap 492.7ms`。AI の action を送る前の段階。10-29 の run `release-checks-20261029-161208-c3ed5627` でも同じ場所で `total=543.6ms`。今回の版の変更によるものではない。
 - これまで見つからなかった理由: first-ai は §1.483 の台本の不具合で全画面を開いた直後に落ちており、v5.2.0 で台本を直して初めて最後まで走った。ほかの ReleaseChecks のケースは全画面を開かない。
-- 次にすること: `run=487ms` の中身 (全画面 viewport の初回の描画・surface の作成・`[fullscreen] virtual desktop synced` 前後の処理) を計装で特定する。原因が分かるまで、ReleaseChecks の分類 (known-*) に足して黙らせない。
+- 調査 (2026-11-15、ブランチ `inv-776-fs-first-frame`、コミット 9859ea9b9):
+  - 既存ログ (上の v5.2.0 run の `perf_events.jsonl`): 止まったフレーム 490ms のうち 477ms が同じフレームの `gpu/lanczos_regenerate` (`regeneration_count=1`、884x444→3840x1928 の upscale、`encode_submit_cpu_ms=477.4`)。§1.87・§1.279 と同じ形。
+  - 変更前のコード（計装コミット 9859ea9b9 時点）: `src/gpu_lanczos.rs` の `generate_with_source` が、セッション初回だけ UI スレッドで `Lanczos3Resampler::new` を呼ぶ。シェーダー 4 本とレンダーパイプライン 6 本 (縮小 2・可視範囲拡大 2・NIS・ピクセルアート) をまとめて同期で作る。DX12 + FXC。既定 (`PostFilter::None`) の拡大で使うのは可視範囲拡大の 2 本だけで、NIS は「くっきり拡大」(`UpscaleSharp`) を選んだときだけ使う。
+  - 計測 (実 GPU テスト `measure_776`、製品と同じ DX12 + FXC、RTX 4090、`dev-runtime` プロファイル = opt-level 2、3 回。観測者: ClaudeCode がテストを実行): 初回の作成 652〜1,444ms のうち NIS のパイプライン作成が 577〜1,267ms (88〜89%)。NIS のシェーダーモジュール作成は 3ms。ほかの 5 本は 1 本 13〜41ms で、既定の拡大で使う 2 本の合計は 26〜63ms。同じデバイスで 2 回目の作成は 5〜12ms。初回の拡大 job の prepare / encode / submit は合計 3〜4ms (1 回目の run だけ encode 264ms)。最適化なしの test プロファイルでは NIS が 5.6〜7.8 秒。
+  - 製品 (release) での内訳は未計測。perf event に区間別のフィールド (`resampler_create_breakdown` など) を足したので、次に ReleaseChecks の first-ai か perf smoke を流すと製品での値が出る。NIS のパイプライン作成の中身 (naga の HLSL 変換と FXC のどちらか) は分けて測っていない。動画側では NIS の FXC コンパイルが 2.1 秒かかっていた前例がある (§1.122、build.rs で DXBC 化して解消)。
+  - Anime4K (アニメ拡大を選んだときだけ) の初回作成も 587〜1,517ms で、同じ型。
+- 案 A の実装: layout 2 個は本体作成時、shader と pipeline は縮小・可視範囲拡大・NIS・ピクセルアートの枝ごとの初回 prepare 時に作る。prepare で確定した pipeline を job が保持し、通常と既存 prewarm は同じ型で encode する。作るスレッド・各枝の出力・cache key は維持。非同期化・新しい prewarm（案 B）と Anime4K の変更は今回含めない。[表示パイプライン](display-pipeline.md#241-フルスクリーン静止画の-gpu-lanczos3-縮小標準拡大と選択式拡大)。製品（release）での効果は未計測。
+- 案 A の後の計測 (`measure_776`、同じ条件 = DX12 + FXC・RTX 4090・`dev-runtime`・3 回、コミット db5bd3626。観測者: ClaudeCode がテストを実行): 枝ごとの初回の作成は、既定の拡大 (可視範囲拡大) 25〜30ms (案 A の前は resampler 全体で 652〜1,444ms)、縮小 22〜28ms、ピクセルアート 14〜17ms、NIS 445〜797ms。既定の拡大の 2 回目は作成なし (0.3ms)。Anime4K の初回作成は 492〜539ms (変更なし)。別の枝を初めて使うとき (例: 縮小しか使っていなかった後に拡大) は、その枝の分だけ止まる (数十 ms)。
+- 残り (案 B、今回は入れない・統括決定 2026-11-16): NIS (「くっきり拡大」) と Anime4K (アニメ拡大) を選んだ人の初回の止まり (上の計測で約 0.45〜0.8 秒と約 0.5 秒) は残る。直すなら、ビルド時にコンパイルしたシェーダーを渡す (wgpu で使えるかの確認が要る) か、裏で先に作る (処理中の状態が増える)。製品での値は次の ReleaseChecks / perf smoke の新しいフィールドで確かめてから決める。
 - 関連: §1.483、[ReleaseChecks 自動化計画](release-check-automation-plan.md)。規模 / 優先度: 調査から / P2。
 
 ### 1.775 SNS 分割書き出しの枚数の上限を 4 から 20 へ — X の仕様変更への追従 (2026-11-13)
@@ -1274,6 +1282,7 @@ HarmNet 化の前から同じ式なので、今回の変更で生じた差では
 
 ### 1.279 フルスクリーンで最初に高画質縮小を使うフレームが UI スレッドで約 0.6 秒止まる (2026-09-25)
 
+- 既定の拡大縮小の初回は §1.776 案 A で軽くなった（コード上、未使用の枝の作成を除外。製品 release での効果は未計測）。くっきり拡大 (NIS)・アニメ拡大 (Anime4K) の初回の重さは残る (案 B、§1.776)。
 - 重複: §1.87 (セッション最初の拡大で 0.5 秒止まる) と同じ現象。着手するときは 2 つをまとめて扱う (2026-10-21 整理で確認)。
 
 - 出典: v4.1.0 公開前の perf smoke (`perf_events.1.jsonl`、2026-09-25 20:15)。観測は perf ログから。
@@ -3435,6 +3444,7 @@ v3.6.0 の `TABLE` はダイアログを短く保つため新機能 3 件に絞�
 
 ### 1.87 セッション最初の拡大で UI スレッドが 0.5 秒止まる (拡大パイプラインの初回作成)
 
+- 既定の拡大縮小の初回は §1.776 案 A で軽くなった（コード上、未使用の枝の作成を除外。製品 release での効果は未計測）。くっきり拡大 (NIS)・アニメ拡大 (Anime4K) の初回の重さは残る (案 B、§1.776)。
 - 重複: §1.279 (2026-09-25) と同じ現象 (最初の高画質縮小で UI スレッドが止まる)。着手するときは 2 つをまとめて扱う (2026-10-21 整理で確認)。
 
 - 出典: v3.0.0 リリース前の perf smoke (2026-08-15)。

@@ -16699,7 +16699,8 @@ pub struct App {
     /// `設定` メニュー →「設定の復元…」で開くダイアログの可視フラグ。
     pub(crate) show_settings_restore: bool,
     /// 復元ダイアログの状態 (一覧キャッシュ + 確認/結果のステート機械)。
-    pub(crate) settings_restore_state: crate::ui_dialogs::settings_restore::SettingsRestoreState,
+    pub(crate) settings_restore_state:
+        Box<crate::ui_dialogs::settings_restore::SettingsRestoreState>,
     /// 設定を既定値へ退避し、保存抑止で保護起動した原因。
     /// `None` なら通常起動。非互換と全復旧失敗を同じ安全側UIへ流す。
     pub(crate) settings_boot_problem_source: Option<crate::settings_db::BootSource>,
@@ -16832,12 +16833,12 @@ pub struct App {
     /// セクションを描く前) に確定するので、全セクションの矩形が揃っている前フレーム値を
     /// 参照する (toolbar_content_rect と同型のパターン)。v2.0.0 Phase 3。
     pub(crate) toolbar_section_anchors: Vec<(crate::settings::ToolbarSectionId, egui::Rect)>,
-    pub(crate) book_reorder: Option<BookReorderState>,
+    pub(crate) book_reorder: Option<Box<BookReorderState>>,
     /// Ctrl+Alt+Shift+D / 画像パイプラインデバッグ出力の worker 完了待ち。
     pub(crate) pipeline_debug_export_pending:
         Option<crate::pipeline_debug::PipelineDebugExportPending>,
     /// Ctrl+E / 編集済み画像エクスポートのダイアログ状態。
-    pub(crate) export_dialog: Option<crate::export_dialog::ExportDialogState>,
+    pub(crate) export_dialog: Option<Box<crate::export_dialog::ExportDialogState>>,
     /// Ctrl+E / グリッド選択の一括エクスポートのダイアログ状態。
     pub(crate) export_batch_dialog: Option<crate::ui_dialogs::export_batch::ExportBatchDialogState>,
     /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。単ページと一括の両方が使う。
@@ -20812,8 +20813,7 @@ impl App {
             show_operation_customize: false,
             show_operation_customize_discard_confirm: false,
             show_settings_restore: false,
-            settings_restore_state:
-                crate::ui_dialogs::settings_restore::SettingsRestoreState::default(),
+            settings_restore_state: Box::default(),
             settings_boot_problem_source,
             show_settings_boot_problem_notice: settings_boot_problem_source.is_some(),
             pref_state: None,

@@ -10040,7 +10040,7 @@ impl App {
         if let Some(first) = entries.first() {
             selected_keys.insert(book_reorder_entry_key(first));
         }
-        self.book_reorder = Some(crate::app::BookReorderState {
+        self.book_reorder = Some(Box::new(crate::app::BookReorderState {
             folder,
             entries,
             selected: Some(0),
@@ -10060,7 +10060,7 @@ impl App {
             thumb_tile_px: BOOK_REORDER_DEFAULT_TILE_PX,
             transfer_target_book: String::new(),
             error: None,
-        });
+        }));
         self.book_shelf.snapshot = None;
         self.request_book_list_refresh();
     }

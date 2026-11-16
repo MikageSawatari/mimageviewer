@@ -12255,46 +12255,7 @@ impl App {
                         "lanczos_regenerate",
                         key.as_deref(),
                         self.input_seq,
-                        &[
-                            ("source_w", stats.source_size[0].into()),
-                            ("source_h", stats.source_size[1].into()),
-                            ("target_w", stats.target_size[0].into()),
-                            ("target_h", stats.target_size[1].into()),
-                            ("scale_branch", stats.scale_branch.as_str().into()),
-                            (
-                                "visible_source_x",
-                                stats
-                                    .visible_source_region
-                                    .map(|region| region[0].into())
-                                    .unwrap_or(serde_json::Value::Null),
-                            ),
-                            (
-                                "visible_source_y",
-                                stats
-                                    .visible_source_region
-                                    .map(|region| region[1].into())
-                                    .unwrap_or(serde_json::Value::Null),
-                            ),
-                            (
-                                "visible_source_w",
-                                stats
-                                    .visible_source_region
-                                    .map(|region| region[2].into())
-                                    .unwrap_or(serde_json::Value::Null),
-                            ),
-                            (
-                                "visible_source_h",
-                                stats
-                                    .visible_source_region
-                                    .map(|region| region[3].into())
-                                    .unwrap_or(serde_json::Value::Null),
-                            ),
-                            ("smoothing_percent", stats.smoothing_percent.into()),
-                            ("blur_factor", f64::from(stats.blur_factor).into()),
-                            ("texture_fetches", stats.texture_fetches.into()),
-                            ("encode_submit_cpu_ms", stats.encode_submit_cpu_ms.into()),
-                            ("regeneration_count", stats.regeneration_count.into()),
-                        ],
+                        &stats.perf_fields(),
                     );
                 }
                 crate::gpu_lanczos::LanczosPerfEvent::UpscaleLimitFallback(stats) => {
@@ -57464,7 +57425,7 @@ impl App {
         if sns_split_export {
             self.complete_sns_split_mode();
         }
-        self.export_dialog = Some(crate::export_dialog::ExportDialogState {
+        self.export_dialog = Some(Box::new(crate::export_dialog::ExportDialogState {
             source: target.source,
             source_label: target.source_label,
             original_format: target.original_format.clone(),
@@ -57497,7 +57458,7 @@ impl App {
             original_include_metadata,
             initial_focus_done: false,
             error: None,
-        });
+        }));
         ctx.request_repaint();
         true
     }
@@ -58185,7 +58146,7 @@ impl App {
     fn start_export_from_dialog(
         &mut self,
         ctx: &egui::Context,
-        state_slot: &mut Option<crate::export_dialog::ExportDialogState>,
+        state_slot: &mut Option<Box<crate::export_dialog::ExportDialogState>>,
     ) -> Result<(), String> {
         let state = state_slot
             .as_ref()
@@ -58273,7 +58234,7 @@ impl App {
         // (AllDone) の単一トリガで refresh する。中間 Completed イベントでの
         // note_exported_file_for_folder_refresh は呼ばない (Codex review CONFIRMED)。
         let effective_include_metadata = state.include_metadata && metadata_possible;
-        let state = state_slot
+        let state = *state_slot
             .take()
             .expect("validated export dialog state must still exist");
         let request = crate::export_dialog::ExportRequest {
