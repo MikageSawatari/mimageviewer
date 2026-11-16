@@ -131,83 +131,77 @@ v5.3.0 の自動切り抜き v4 で鍵が変わると、片付けるまでの間
 変えるので、上の「行が無い = DB に無い」とみなす読み手を漏れなく列挙するのが前提で、独立レビューでその列挙を確かめる。
 S1 が成り立たないと分かった場合だけ §4 の段階 A に戻る。
 
-## 4S. 案 S1 の設計 (採用。r5 の指摘を受けて r6 で改訂、2026-11-17)
+## 4S. 案 S1 の設計 (採用。r6 の指摘を受けて r7 で改訂、2026-11-17)
 
 r4 (r3 までの案へのレビュー、§8) は「片付けを区切っても UI の writeback の待ちは上限にならず、writeback 自体を worker へ移す必要がある」と
 して REVISE だった。r3 までの案は直すたびに仕組みが増えるので、§3.5 の案 S1 に切り替えた。r5 は S1 の方向を支持し、P2 4 件で REVISE。
 利用者決定 (2026-11-17、統括経由): **S1 を v5.3.0 に入れる。**
 
-r6 の改訂の方針は「**一覧の catalog を読む・書くのは、その一覧のサムネイル worker だけにする**」。r5 の P2 を、UI に照合の処理を
-足して塞ぐのではなく、照合が要る仕事を、その鍵を持っている worker の要求へ移して塞ぐ。新しく足す非同期の入口は 1 つ
-(自動縦横比の見本の job) だけで、ほかは今ある要求・保存経路に載せる。§1.773b の表紙の失効とは、DB から引いた行を控えへ
-登録しないことで、新しい競合を作らない (4S.4)。
+方針は「**一覧の catalog を読む・書くのは、その一覧のサムネイル worker だけにする**」。§1.773b の表紙の失効とは、DB から引いた行を
+控えへ登録しないことで、新しい競合を作らない (4S.4)。
 
-### 4S.1 変えること (worker 側)
+r6 では、自動縦横比の見本を集める job を pool に足したことから、指摘 5 件のうち 3 件 (seed との順序、UI の要求の組み立てによる I/O、
+失効をまたいだ見本の採用) と job の占有が出た。動画ピンの古い行の削除を「順序の依存が無い job」にしたことからも、ピン更新との
+書き込みの順序の指摘が出た。r7 では job をやめ、**今 UI で一覧の開始時に行っている seed を、順序ごとそのまま、その一覧の pool の
+最初の 1 手 (一覧の準備) に移す**。自動縦横比の catalog からの見本は、collection と同じく控えからだけ取る形にする (4S.1-7、
+通常の使い方への影響があるので統括経由で利用者に確認する)。
+
+### 4S.1 変えること
 
 1. **一覧の読み込みで `load_all` を呼ばない。** `resume_loading_items_after_sidecar` の catalog 節で、通常の一覧 (合成ビュー以外。
    通常フォルダ、PDF/EPUB の仮想フォルダ、ZIP・変換書庫の物理一覧) の `cache_map` を空で作る。catalog の open
    (`get_or_open_catalog`)・`delete_missing` は今のまま UI で行う (行名だけを読む 1〜2 ms、今と同じ)。合成ビューは今の
-   `prepared_aggregate` のまま (worker が作った全行の写し)。**ドライブ一覧** (`app.rs` のドライブ一覧の読み込み、独自の `load_all` と
-   `seed_drive_list_pin_thumbs_from_catalog`) は catalog が数行なので変えない (範囲外と明記する)。
-2. **`cache_map` の意味を「控え」にする。** 「この一覧で worker が保存した行と、seed した行」の控えで、無いことは「DB に無い」を
-   意味しない。合成ビューの写しも控えとして扱う (控えに無ければ DB を引くだけ)。型や mode の印は足さない。
-3. **サムネイル worker: `RequestCatalog::Fixed` でも、控えに無ければ DB を鍵で引く。** `thumb_loader.rs` のキャッシュ判定
-   (`uses_lazy_catalog` で DB を引くか決めている箇所) で、`uses_lazy_catalog` の意味は変えず、「未ヒットで DB を引く」条件だけを
-   `lazy || (Fixed かつ catalog が retired でない)` に広げる (例: `looks_up_catalog_on_miss`)。Fixed の PDF メタ補完が使う
-   `initial_catalog`、Parent の観測と stamp 変換、retired な CacheOnly の読み取り専用の継続、Legacy の置換、SourceOnly の bypass、
-   EPUB の世代解決後の鍵、ピン・cascade・自動切り抜きの鍵は今の分岐のまま。
+   `prepared_aggregate` のまま (worker が作った全行の写し)。**ドライブ一覧** (独自の `load_all` と
+   `seed_drive_list_pin_thumbs_from_catalog`) は catalog が数行なので変えない (範囲外)。
+2. **`cache_map` の意味を「控え」にする。** 「この一覧で worker が保存した行と、一覧の準備で seed した行」の控えで、無いことは
+   「DB に無い」を意味しない。合成ビューの写しも控えとして扱う。型や mode の印は足さない。
+3. **サムネイル worker: `RequestCatalog::Fixed` でも、控えに無ければ DB を鍵で引く。** `uses_lazy_catalog` の意味は変えず、
+   「未ヒットで DB を引く」条件だけを `lazy || (Fixed かつ catalog が retired でない)` に広げる (例: `looks_up_catalog_on_miss`)。
+   Fixed の PDF メタ補完が使う `initial_catalog`、Parent の観測と stamp 変換、retired な CacheOnly の読み取り専用の継続、Legacy の
+   置換、SourceOnly の bypass、EPUB の世代解決後の鍵、ピン・cascade・自動切り抜きの鍵は今の分岐のまま。
    - **DB から引いた行は控えに登録しない** (今の collection の lazy 読みと同じ。Parent だけが今どおり stamp を変えて登録する)。
-     控えに入るのは、この一覧の worker が保存した行と seed した行だけになる。
    - 引いた行の WebP が壊れていれば、lazy と同じくログと `record_cache_error` を出し、通常の生成へ進む。
 4. **ピンだけの要求の前方一致の探索** (`send_pinned_only_cached` の preview と本命の 2 か所): 控えの走査をやめ、今の `resumed`
    経路と同じ `load_latest_uncropped_with_prefix_matching` で DB を引く。
-5. **動画ピンの seed を、その項目の要求に載せる** (`seed_folder_video_pin_thumbs` の UI の一覧走査をやめる)。
-   - `make_load_request` は今も動画ピンの WebP の有無を `video_pins.db` で確かめている (`has_webp`、UI、既存)。この読みで得た
-     WebP と cover (`CoverIdentity::Page(動画)`) を、pinned_key の要求に `video_pin_seed` として載せる (UI の読みは増えない。
-     今の seed が同じ WebP を一覧の開始時にもう一度読んでいた分は無くなる)。
-   - worker: 控え → DB の順に pinned_key の行を引き、stamp・WebP のバイト列・cover が一致すればそのまま使う (今の
-     `already_seeded`)。一致しなければ `save_seeded_folder_bytes` で書き、控えに入れて使う。WebP が壊れていれば (今の
-     `Ok(false)`) 行を消して通常の未ヒットの経路へ進む (今と同じ)。
-   - 項目の要求ごとなので、seed と生成の順序が自然に保たれ、pool の作り直し (`replace_thumbnail_workers`) にも影響されない。
-   - **WebP が無い動画ピンの古い行の削除** (今の `purge_stale`): 要求は今どおり base_req に戻るので、その項目の要求とは競合しない。
-     UI は今の seed と同じ走査 (ピンの cascade 解決と `video_pins.db` の有無、どちらも今の seed が UI で行っている読み) で
-     削除する鍵だけを集め、6 の一覧の job に渡す。worker が DB の存在を確かめてから消す (控えにあれば控えからも消す)。
-6. **一覧の catalog 準備 job を 1 つ足す** (`LoadRequestSource::AudioArtPrune` と同じく、この一覧の pool の queue に入れる job)。
-   中身は (a) 自動縦横比の見本 (下の 7)、(b) 5 の WebP が無い動画ピンの古い行の削除。どちらも要求の処理と順序の依存が無い
-   ((a) は読むだけ、(b) の鍵はその項目の要求では使わない)。pool の取り消し (`cancel`) を見て途中で止まる。止まった場合、(a) は
-   サムネイルの到着からの通常の集計に任せ、(b) は次に一覧を開いたときにまた行う。
-7. **自動縦横比の見本を job で集める** (`reset_and_seed_auto_aspect_with_seed` の通常フォルダの経路)。
-   - UI に残すもの: 世代のリセット、`auto_aspect_cache` の復元 (今どおり最初の描画の前)、`eligible_total`・`min_samples` の計算、
-     **候補の列挙**。候補は今のループと同じ順序・同じ除外 (container の icon-only、`image_metas` 無し、要求が作れない、
-     `ResolveInWorker` の EPUB) で、`(idx, 鍵, req.mtime, req.file_size)` を作る。今のループは「控えに行がある候補」が
-     `min_samples` 件そろった時点で止まるが、UI は DB を読まないので行の有無が分からず、**eligible な全項目について候補を作る**
-     (CPU だけ。要求の組み立ては可視範囲の要求と同じ関数で、ピン留めした container ではピン DB を読む。これは今の seed も行っている)。
-   - job で行うもの: 候補を順に、控え → DB の順で引き、今と同じ判定をする。stamp が要求と一致する行だけ使い、`source_dims` が
-     `Some((w>0, h))` なら見本、`Some(0)` なら飛ばす、`None` なら**ヘッダ確認の予算** (`min_samples × 2`) が残っている間だけ
-     WebP のヘッダから寸法を取る。`auto_crop_view` で表示上の比を出し、`min_samples` 件そろったら止める。
-     **「引く候補の数」に上限は無く、上限があるのは「ヘッダを調べる回数」だけ** (今のコードと同じ)。
-   - 結果は `ThumbMsg` の新しい payload (例: `AutoAspectSamples(Vec<(usize, f32)>)`) で、今のサムネイルと同じ channel で UI へ返す。
-     UI は `items_gen` が今の世代と一致するときだけ採り、request の相関・`cache_gen_done` の計数の対象にしない。採るときは、
-     すでにサムネイルの到着で記録した idx は上書きせず、残りを入れて `maybe_apply_auto_aspect(true)` を呼ぶ (今の seed と同じ即決)。
-   - collection (`collection_grid.rs`) の呼び出しは、控えだけから見本を取る今の動きのまま (collection は今も lazy で控えが疎)。
-8. **仮想フォルダの seed と writeback を、先頭ページの要求に載せる** (`setup_virtual_folder_seed_and_writeback` と
-   `fire_virtual_folder_writeback_if_ready` の UI の DB 処理をやめる)。
-   - UI は今と同じ条件 (PDF・ZIP、EPUB は対象外) で対象 (先頭ページの idx・鍵、親 catalog、親の鍵、`cache_book_cover_only` による
-     seed の有無、items の世代) を決め、`VirtualFolderWriteback` の代わりに「親との対応」として持つ。親 catalog の open
-     (`get_or_open_catalog`、LRU にあることが多い) は今のまま UI。その idx の要求を組み立てるときに、この対応を要求へ載せる。
-   - worker の seed: 先頭ページの要求で控えにも DB にも行が無いとき (stamp 不一致も含む)、親 catalog から親の鍵の行を引き、
-     stamp が要求と一致すれば仮想 catalog に写して (今の `save_thumb_bytes_with_layout_dims`) 使う。一致しなければ通常の生成へ。
-     今の UI の seed は stamp を見ずに写していた (worker は stamp 不一致で作り直して上書きしていた) ので、無駄な写しが減る。
-   - worker の writeback: 先頭ページの行を生成して保存し終えた直後 (Finalized を送る前)、同じ WebP を親 catalog の親の鍵へ写す。
-     親のファイル (PDF・ZIP) の mtime・大きさは今は本を開いたときに UI で `std::fs::metadata` しているが、worker が写す時点で読む。
-     保存を省いた要求 (cache policy) では写さない (今も、控えに要求の stamp の行が無ければ写さない)。
-   - seed と writeback が同じ要求の中で行われるので、順序は 1 つの所有者で保たれる。`VirtualFolderWriteback` の一回限りの状態と
-     世代の掃除は要らなくなる。
+5. **一覧の準備: 今の UI の seed を、順序ごと pool の最初の 1 手へ移す。**
+   - 今 UI で行っているのは、仮想フォルダの seed (`setup_virtual_folder_seed_and_writeback` の seed の部分) → 動画ピンの seed と古い行の
+     削除 (`seed_folder_video_pin_thumbs`) の順。このうち catalog と控えを使う部分 (`already_in_virtual`・親の行の `load_one`・
+     仮想 catalog への保存、`already_seeded`・`save_seeded_folder_bytes`・`purge_stale`) を、pool の準備の thread で同じ順に行う。
+     控えを見ていた判定は「控え → DB (`load_one`)」で行い、保存・削除した行は今どおり控えにも反映する。
+   - UI に残すのは、今も UI で行っている入力の確定だけ: 対象の項目、鍵、親 catalog の open、ピンの cascade 解決、`video_pins.db` の
+     WebP の読み (どれも今の seed が UI で行っている。catalog の I/O は UI に残らない)。これを Box にした「一覧の準備」の入力として
+     `spawn_thumbnail_workers` に渡す。
+   - pool の worker は、準備が終わるまで要求を取り出さない (pool の中だけの門。今は UI が準備を終えてから pool を起動しているので、
+     要求が待つ順序は今と同じ)。門は準備の thread が終わる (panic を含む) と必ず開く。
+   - 準備は pool の取り消しを見ない。仕事の量は「仮想フォルダの 1 件 + 一覧の中で動画にピン留めしたフォルダの数」で、今 UI が
+     一覧の開始時に同期で行っている量と同じ。新しい一覧へ移っても、古い準備は自分の catalog に今の seed と同じ書き込みをして終わる。
+   - pool の作り直し (`replace_thumbnail_workers`) では準備を渡さない (今も作り直しで seed はしない)。
+   - **割り切り**: 準備は一覧の開始から数 ms で終わる。その間に利用者のピン更新の commit が重なる (ピンの設定は一覧を開いた後の
+     利用者の操作なので、数 ms の間に入ることは通常の操作では起きない)、または pool の作り直しが重なると、古い seed・削除と新しい
+     書き込みの順序が入れ替わり得る。これは既定の割り切り (次に一覧を開いたときの準備で正しい seed に戻る) とし、書き込み権の
+     失効などの仕組みは足さない。(r6 P2-3 の「job の queue の待ちの間に起きる」順序は、準備が要求より先に走り、待たないので生じない。)
+6. **仮想フォルダの writeback を、先頭ページの要求に載せる** (`fire_virtual_folder_writeback_if_ready` の UI の保存をやめる)。
+   - UI は今と同じ条件 (PDF・ZIP、EPUB は対象外) で、対象 (仮想フォルダの source、先頭ページの idx と鍵、items の世代、親 catalog、
+     親の鍵、**本を開いた時点の親ファイルの mtime・大きさ**) を「親との対応」として `VirtualFolderWriteback` の代わりに持つ。
+     親ファイルの stat は今どおり UI (本を開くときの既存の 1 回)。
+   - 要求に載せるのは、この一覧の pool へ出す要求を組み立てる共通の付加処理 1 か所で、source・鍵・世代・idx がすべて一致するとき
+     だけ。可視・prefetch・navigation・still seek・overview・hover・idle upgrade はこの付加処理を通る。色フィルタ・独立プレビュー・
+     Remote・自動縦横比には載せない (idx が一致するだけでは載せない)。
+   - worker: 先頭ページの行を生成して保存し終えた直後 (Finalized を送る前)、親ファイルを stat し、**載せてきた開いた時点の stamp と
+     一致するときだけ**、同じ WebP をその stamp で親 catalog の親の鍵へ写す。変わっていれば写さない (旧版から作った画像に新版の
+     stamp を付けない)。保存を省いた要求では写さない (今も、控えに要求の stamp の行が無ければ写さない)。
+   - 一覧の切り替え・context の swap で「親との対応」を捨てるのは、今の `VirtualFolderWriteback` と同じ場所。一回限りの発火の状態は
+     要らなくなる (同じ要求を作り直したときに写し直すのは同じ内容の上書き)。
+7. **自動縦横比: catalog からの見本は控えからだけ取る** (collection と同じ。統括経由で利用者に確認する)。
+   - `reset_and_seed_auto_aspect_with_seed` は今のまま呼ぶ (世代のリセット、`auto_aspect_cache` の復元は最初の描画の前)。控えは一覧の
+     開始時に空なので、catalog からの見本は入らない。見本はサムネイルの到着 (DB から引いた行を含む) で今の集計 (`poll_thumbnails`) に
+     入り、今の判定のゲート (入力 idle・連勝) を通って決まる。新しい job・payload・UI での要求の組み立ては足さない。
+   - 見える違いは 4S.6。
 
 ### 4S.2 metadata のピン更新 (`pin_materialization`、r5 P2-3)
 
 `pin_materialization` の worker は共有の控えを写して、その中の鍵から DB の削除対象を決めている。控えが疎になると、DB にだけある
-古いピンの行を消し損なう。既存の worker の中で次のように直す (新しい pending は足さない)。
+古いピンの行を消し損なう。既存の worker の中で次のように直す (新しい pending は足さない)。r6 で「単体では十分」と確認済み。
 
 - 古いピンの variant の削除候補は、DB の鍵から求める (`prefix` で始まる行名を catalog から読む。行名だけなので軽い)。
   残す条件は今の `inventory_retains_key` のまま。
@@ -221,11 +215,12 @@ r6 の改訂の方針は「**一覧の catalog を読む・書くのは、その
 | --- | --- | --- |
 | 通常 worker のキャッシュ判定 | `thumb_loader.rs` | 4S.1-3 (Fixed も未ヒットで DB を引く、登録しない) |
 | ピンだけの要求の前方一致 | `send_pinned_only_cached` | 4S.1-4 |
-| 動画ピンの seed | `seed_folder_video_pin_thumbs` | 4S.1-5 (要求に載せる) と 4S.1-6 (古い行の削除は job) |
-| 仮想フォルダの seed・writeback | `setup_virtual_folder_seed_and_writeback` ほか | 4S.1-8 (先頭ページの要求に載せる) |
-| 自動縦横比 | `reset_and_seed_auto_aspect_with_seed` | 4S.1-7 (候補は UI、照合は job) |
+| 動画ピンの seed・古い行の削除 | `seed_folder_video_pin_thumbs` | 4S.1-5 (一覧の準備で、控え → DB) |
+| 仮想フォルダの seed | `setup_virtual_folder_seed_and_writeback` | 4S.1-5 (一覧の準備で、控え → DB) |
+| 仮想フォルダの writeback | `fire_virtual_folder_writeback_if_ready` | 4S.1-6 (先頭ページの要求に載せる) |
+| 自動縦横比 | `reset_and_seed_auto_aspect_with_seed` | 4S.1-7 (控えからだけ。collection と同じ) |
 | metadata のピン更新 | `pin_materialization.rs` | 4S.2 |
-| 色フィルタ | `color_filter.rs` | 通常の画像は 4S.1-3 の共通の helper で効く。代表画像用の私有の一行の控えと鮮度判定は今のまま |
+| 色フィルタ | `color_filter.rs` | 通常の画像は 4S.1-3 の共通の helper で効く。代表画像用の私有の一行の控えと鮮度判定は今のまま。seed・writeback は載せない |
 | ドライブ一覧の seed | `seed_drive_list_pin_thumbs_from_catalog` | ドライブ一覧は変えない (4S.1-1) |
 | 表紙回転の失効 | `cover_rotation_cache.rs` | 失効 worker は DB の見出しと控えを合わせて対象を決めるので、疎な控えで足りる。競合は 4S.4 |
 | Everything の seed | `everything/metadata.rs` | 削除する鍵を明示して DB と控えへ当てるので影響なし |
@@ -236,73 +231,70 @@ r6 の改訂の方針は「**一覧の catalog を読む・書くのは、その
 | test-script | `test_script/release_checks.rs` | 控えに無いことと DB に無いことを別々に確かめており、そのまま使える。空の控えで元画像からの読みを期待する fixture は直す |
 | 類似画像の worker | `ui_metadata_panel.rs` | 私有の空の控え・catalog 無しで共通処理を呼ぶので、DB を引かない |
 
-### 4S.4 表紙の失効 (§1.773b) との関係 (r5 P2-2)
+### 4S.4 表紙の失効 (§1.773b) との関係 (r5 P2-2、r6 で解消を確認)
 
-§1.773b (`docs/cover-crop-plan.md` §29) の契約は次のとおり。失効 worker が DB と控えから対象の行を消し、UI は完了を受けて
+§1.773b (`docs/cover-crop-plan.md` §29) の契約: 失効 worker が DB と控えから対象の行を消し、UI は完了を受けて
 `clear_deleted_cover_memory` で今の控えからも消し、対象の idx (表示中・要求中) を退避して読み直す。表示した素材にはセッション番号を
-付け、復元のときに比べる。**最後の旧 worker の DB・控えへの書き戻しは割り切る** (§29.7: ログと手動の範囲指定・キャッシュ再作成)。
+付け、復元のときに比べる。**最後の旧 worker の DB・控えへの書き戻しは割り切る** (§29.7)。
 
-S1 はこの契約に次の形で揃える。
-
-- **DB から引いた行を控えに登録しない** (4S.1-3)。r5 の順序 (`worker が旧行を読む → 失効 worker が DB と控えから削除 → UI が
-  完了を処理 → worker が旧行を控えへ登録`) の最後の手が無くなるので、引いた行が後の別の要求のメモリ hit になることは無い。
-  後の要求は毎回 DB を引くので、削除済みの行は引かない。
-- 引いた要求そのものの結果は、今の要求中の扱いで塞がっている。UI が完了を処理する前に届けば、表示した素材は対象の idx として退避・
-  読み直しされる。後に届けば、その要求は退避で request ID を失っているので採られない。
-- 控えに入るのは、この一覧の worker が保存・seed した行だけ。これは今の保存経路と同じで、その最後の書き戻しは §29.7 の割り切りの
-  範囲 (S1 で増えない)。4S.1-8 の仮想フォルダの seed (親の行を仮想 catalog へ写す) も、今の UI の seed と同じ形の写しで、
-  失効と重なったときの扱いは同じ割り切り。動画ピンの行は NotAutomatic で、表紙回転の失効の対象外。
-- 合成ビューの準備済みの全行の写しが、失効の完了後に採られる窓は S1 の前からある (S1 は合成ビューの経路を変えない)。
-  §7 に別項目の候補として記録する。
+- **DB から引いた行を控えに登録しない** (4S.1-3)。r5 の順序の最後の手 (旧行を控えへ登録) が無くなり、後の要求は毎回 DB を引くので、
+  削除済みの行は引かない。r6 で「この窓は解消する」と確認された。
+- 引いた要求そのものの結果は、今の要求中の扱い (退避で request ID を失う、または採った素材を退避して読み直す) で塞がっている。
+- 控えに入るのは、この一覧の worker が保存した行と一覧の準備で seed した行だけ。仮想フォルダの seed (親の行を仮想 catalog へ写す) は
+  今の UI の seed と同じ写しで、失効と重なったときの扱いも今と同じ割り切り。動画ピンの行は NotAutomatic で失効の対象外。
+- 自動縦横比の見本は 4S.1-7 で新しい採用経路を作らないので、r6 P2-4 (失効をまたいだ見本の採用) は生じない。到着した素材の見本は
+  今どおり失効の処理 (`poll_cover_rotation_cache`) で除かれる。
+- 合成ビューの準備済みの全行の写しが、失効の完了後に採られる窓は S1 の前からある (§7-4)。
 - 回帰テスト: 「worker が DB から行を引いた後に、失効が DB と控えから消し、UI が完了を処理し、そのあとで同じ鍵の新しい要求が来る」
   順序を固定し、新しい要求が旧行を使わず (控えにも無い)、作り直すことを確かめる。
 
 ### 4S.5 変えないこと・状態
 
-- 一覧ごとに足す状態は無い。自動縦横比の job の結果は今のサムネイルの channel と世代で採る。仮想フォルダの「親との対応」は今の
-  `VirtualFolderWriteback` の置き換え (一回限りの発火と世代の掃除が無くなるぶん単純になる)。App に足すものは Box にする。
+- 一覧ごとに足す状態は、pool の中だけの「準備が終わるまで要求を取り出さない」門 1 つ (pool と一緒に作られ、一緒に捨てられる)。
+  App・context には足さない。仮想フォルダの「親との対応」は今の `VirtualFolderWriteback` の置き換え。App に足すものは Box にする。
 - 片付け (`delete_missing`) は今のまま UI で (全種類表示のときだけ)。表示を絞っている利用者の古い行は段階 C (後段)。
 - 永続データの形は変えない (catalog の schema・鍵・行の中身は同じ)。
-- まれな失敗 (DB の読み書きの失敗など) は既定の割り切り (ログ + 既存の通知、次の要求でまた試す)。再試行の仕組みは足さない。
+- まれな失敗 (DB の読み書きの失敗など) は既定の割り切り (ログ + 既存の通知、次の要求・次の一覧の準備でまた行う)。
 
 ### 4S.6 通常の使い方への影響 (見込み)
 
-- 閉じて一覧へ戻るとき、UI の 134〜221 ms の停止が無くなる。動画ピンの seed・仮想フォルダの seed と writeback の UI の DB 処理も
-  無くなる。
+- 閉じて一覧へ戻るとき、UI の 134〜221 ms の停止が無くなる。仮想フォルダ・動画ピンの seed と writeback の UI の catalog 処理も無くなる。
 - worker は要求ごとに鍵 1 件の SELECT が増える (OS のキャッシュが温まった状態で 0.03 ms)。デコード (数 ms) に比べて小さい。
-  同じ項目を何度も表示し直す (可視範囲を出入りする) と毎回 DB を引くが、今の Parent・collection の lazy 読みと同じ。
+  同じ項目を表示し直すと毎回 DB を引くが、今の Parent・collection の lazy 読みと同じ。
 - メモリは、控えが一覧で保存・seed した行の分だけになる。
-- **見える違いが 1 つある**: 自動縦横比の見本が、最初の描画の前ではなく job の完了時 (数 ms〜数十 ms 後) に入る。フォルダの縦横比の
-  記録 (`auto_aspect_cache`) が復元される一覧 (一度自動で決まった一覧。本を閉じて戻る一覧はこれ) では最初の描画から今と同じ比で、
-  違いは出ない。記録が無く catalog には行がある一覧 (以前は自動をオフにしていた等) では、最初の数フレームが既定の比で描かれ、
-  見本が入ると比が切り替わる。
-- 候補の列挙は eligible な全項目について要求を組み立てるので、UI の CPU が項目数に比例して増える (1 項目数 µs の見込み。1 万件で
-  数十 ms になり得る)。実測を perf に出し (4S.7)、許容できない値なら実装前に設計へ戻す。
+- **自動縦横比 (利用者に確認する)**: 今は一覧を開いたとき、catalog にある行から見本を取り、最初の描画の前に比を決め直せる (入力 idle・
+  連勝のゲートを飛ばす即決)。S1 では catalog からの見本が無くなり、見本はサムネイルの到着で入って、今のゲートを通って決まる。
+  - フォルダの縦横比の記録 (`auto_aspect_cache`) がある一覧 (一度自動で決まった一覧。本を閉じて戻る一覧はこれ) では、最初の描画は
+    記録した比で今と同じ。中身が変わって比が変わる場合だけ、切り替わりが最初の描画の前からゲートの後へ移る。
+  - 記録が無く catalog には行がある一覧 (以前に自動をオフにしていた、記録を消した等) では、最初の描画は既定の比で、サムネイルが
+    届いてゲートを通った後に切り替わる。初めて開くフォルダと同じ動きになる。一度決まると記録されるので、次からは今と同じ。
+  - collection は今もこの動き。
+  - 今と同じ即決を残す案 (catalog からの見本を集める job を足す) は r6 で、seed との順序・失効との有効性・job の占有・UI の要求の
+    組み立ての I/O の 4 点の指摘を受けた。残すなら、これらを塞ぐ仕組みが要る。
 
 ### 4S.7 検証と計装
 
 - worker: 控えが空でも、DB にある行 (stamp 一致) を使い、作り直さない。stamp 不一致は使わない。引いた行を控えに登録しない。
   EPUB の世代付きの鍵・ピンの鍵・自動切り抜きの鍵でも同じ。retired な catalog は引かない。色フィルタの worker も同じ。
-- 動画ピン: 控えが空で DB に同じ seed がある → 書き直さない。WebP が変わった → 書き直す。WebP が無い → 古い行を job が消す
-  (Codex Phase C P3 の再発防止)。pool を作り直しても seed が抜けない。
-- 仮想フォルダ: 控えが空で仮想 catalog に行がある → seed しない。無い → 親から写す (stamp 一致のときだけ)。生成して保存した →
-  親へ写す。保存を省いた → 写さない。EPUB は対象外。
-- 自動縦横比: 今のループと同じ見本 (順序・stamp・除外・見本数・ヘッダ予算) を job が返すことを、同じ fixture で今の関数の結果と
-  比べる。世代が変わった後の結果は採らない。到着済みの idx を上書きしない。
+- 一覧の準備: 控えが空で DB に同じ動画ピンの seed がある → 書き直さない。WebP が変わった → 書き直す。WebP が無い → 古い行を消す
+  (Codex Phase C P3 の再発防止)。仮想 catalog に行がある → seed しない、無い → 親から写す。準備が終わるまで pool が要求を取り出さない
+  (ピン留めした項目の要求が準備より先に走って auto-pick を pinned_key に保存しない)。準備の thread が panic しても門が開く。
+- writeback: 生成して保存した → 開いた時点の stamp で親へ写す。親ファイルが変わった → 写さない。保存を省いた → 写さない。EPUB は
+  対象外。付加処理が source・鍵・世代・idx の一致でだけ載せる。色フィルタ・独立プレビューには載らない。
 - pin_materialization: 控えが空で DB に古いピンの行がある → 消す。
 - 表紙の失効: 4S.4 の順序の回帰テスト。
+- 自動縦横比: 控えが空の一覧で catalog からの見本が入らず、到着した見本で今のゲートどおりに決まる。記録の復元は最初の描画の前。
 - perf:
   - `thumb_catalog_lookup` を Fixed に対応させ (`catalog_kind` に `fixed`)、接続の待ちを含む時間・hit を出す。
   - 一覧の読み込みの区間は `sli_catalog_load_all` を「控えの用意」の区間に改め (`entries` は控えの件数)、`analyze_perf.py` の
     区間名も合わせる。ログの `entries in DB` は控えの件数の表記へ改める。
-  - 自動縦横比の候補の列挙 (UI) の時間と件数、job の時間・引いた件数・ヘッダ確認の回数を出す。
+  - 一覧の準備の時間・件数 (仮想 seed・動画ピンの seed・削除) と、pool の最初の要求が門で待った時間を出す。
 - ベンチ (`bench_scroll`): 「控えあり (今の全行)」「DB あり・空の控え (S1)」「SourceOnly」を分ける。今の「キャッシュなし」は
   空の控えと既存の DB を渡しているので、S1 では DB hit になり意味が変わる。合成した 1 万件の catalog で、初期表示とスクロール、
-  新しい接続 (SQLite のページキャッシュが冷えた状態) と温まった状態を比べる。OS のファイルキャッシュが冷えた状態は利用者の実機の
-  perf ログで見る。
+  新しい接続 (SQLite のページキャッシュが冷えた状態) と温まった状態、空の DB・stamp 不一致の多い DB・部分的にある DB、worker の
+  少ない設定を比べる。OS のファイルキャッシュが冷えた状態は利用者の実機の perf ログで見る。
 - 受け入れの条件: (1) 1 万件で UI の閉じる・開くの区間が今より短い、(2) 初期表示の可視範囲のサムネイルが出るまでの時間が、今の
-  全行の控えより遅くならない (同程度)、(3) 自動縦横比の候補の列挙が 1 万件で 1 フレーム (16 ms) に収まる。満たさなければ実装を
-  止めて設計へ戻す。
+  全行の控えより遅くならない (同程度)。満たさなければ実装を止めて設計へ戻す。
 - 利用者の実機確認 (`build-dev.ps1`): 1,000 冊級のフォルダで本を開いて閉じ、閉じた直後の大きなフレーム間隔が消えたことと、
   サムネイルが作り直されず (PDF の描き直しが走らず) に出ることを perf ログで見る。
 
@@ -594,4 +586,24 @@ r5 への対応 (r6 の改訂、§4S): 統括の指示どおり、仕組みを�
 | P2-3 | pin_materialization の削除候補を DB の行名から求め、動画ピンの一致判定を DB で行う (4S.2) |
 | P2-4 | 候補は今と同じ順序・除外で UI が全 eligible について作り (DB を読まない)、照合 (stamp・`source_dims`・ヘッダ予算・見本数) は一覧の job で今のループと同じに行う (4S.1-6/7)。見える違い (見本が数 ms 遅れて入る) を 4S.6 に書いた |
 | P3-5 | `thumb_catalog_lookup` の Fixed 対応、区間名と `analyze_perf.py`、`bench_scroll` の 3 つの mode、1 万件の受け入れ条件 (4S.7) |
+
+### r6 (同じセッションの resume、2026-11-17、153bf9f4b に対して) — REVISE、P1 なし
+
+- r5 P2-2 の元の窓は、Fixed の DB hit を控えへ登録しないことで解消する。4S.2 (pin_materialization) は単体で十分。計装・ベンチの三分割は妥当。
+- P2-1: 自動縦横比の候補を全項目について UI で作ると、ピンの cascade・stat・動画 WebP の読みが UI に増える。
+- P2-2: 見本の job は seed と順序の依存がある (仮想 seed・動画ピンの seed より先に走ると同じ見本にならない)。
+- P2-3: 古い動画ピン行の削除 job は、起動時の snapshot で、後のピン更新が書いた正しい行を消し得る (要求に載せた古い WebP の保存も同じ)。
+- P2-4: 見本の結果を世代だけで採ると、表紙の失効をまたいだ旧見本を再登録する。
+- P2-5: writeback の時点の stat を、旧版から作った WebP の stamp として保存してはいけない。
+- P3-6: 要求への付加の入口と、job の結果の配送の境界 (poll_thumbnails の request 相関の前で分ける) の具体化。
+- P3-7: 全件 miss の job の占有、記録がある一覧でも見本が後から比を変え得る点。
+
+r6 への対応 (r7、§4S): 指摘の多くが「見本の job」と「順序に依存しないとした削除 job」から出ていたので、job をやめた。
+
+| 指摘 | 対応 |
+| --- | --- |
+| P2-1・P2-2・P2-4・P3-7 | 見本の job をやめ、catalog からの見本は控えからだけ取る (collection と同じ、4S.1-7)。見える違いは 4S.6 に書き、統括経由で利用者に確認する |
+| P2-3 | 動画ピン・仮想フォルダの seed と古い行の削除は、今の UI の順序ごと pool の最初の 1 手 (一覧の準備) へ移し、要求はその後に取り出す (4S.1-5)。queue で待つ job ではないので、起動時の snapshot が後で効くことは無い。一覧の開始から数 ms の間にピン更新が重なる場合は既定の割り切り |
+| P2-5 | 開いた時点の親の stamp を要求に載せ、worker の stat と一致するときだけ、その stamp で写す (4S.1-6) |
+| P3-6 | 付加は pool へ出す要求の共通の付加処理 1 か所で、source・鍵・世代・idx の一致でだけ載せる。色フィルタ・独立プレビュー・Remote・自動縦横比には載せない (4S.1-6)。新しい payload は無くなった |
 
