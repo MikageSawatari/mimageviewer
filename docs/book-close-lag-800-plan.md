@@ -1,6 +1,6 @@
 # §1.800 本を Enter で開き Esc で一覧へ戻るときのもたつき — 調査と設計
 
-- 状態: 調査・設計 (2026-11-17)。実装前。設計の独立レビュー r1・r2 = REVISE を反映済み (§8)、r3 待ち。
+- 状態: 調査・設計 (2026-11-17)。実装前。設計の独立レビュー r1〜r3 = REVISE を反映済み (§8)、r4 待ち。
 - ブランチ: `perf-800-book-close` (worktree `G:\home\mimageviewer-perf-800`)。
 - 目標版: v5.3.0。
 
@@ -122,19 +122,35 @@ App に別の pending / bool は足さない。所有者はサイドカー復元
 | 上以外の空の一覧 (列挙の失敗・パスワード待ちなど) | しない (`NotRequested`) | — | しない |
 | 合成ビュー・テストの fixture | 今の経路のまま | — | — |
 
-DirectMedia になり得るかは、親フォルダの読み込みを頼む時点 (`startup_ops.rs` の起動時 open) で分かっているので、その印を
-読み込みの要求に載せて `start_loading_items` まで運ぶ。continuation の `navigation_after_hydration` (後から付く) では判断しない。
+DirectMedia になり得るかは、親フォルダの読み込みを頼む時点で分かっているので、その印を読み込みの要求に載せて
+`start_loading_items` まで運ぶ。continuation の `navigation_after_hydration` (後から付く) では判断しない。DirectMedia を作る製品コードは
+`startup_ops.rs` の起動時 open の適用経路 1 か所 (r3 で確認)。印は `InitialStartup` だけでなく、activation・Agent も通る共通の
+適用経路から渡す。Bookmark は `result.direct_media` を作らないので対象外。
 
-**worker の中身 (今の UI の処理と同じ順序・同じ条件)**: 開く → 読み込み → (今と同じ条件なら) `delete_missing`。
-- 開く: 受付時に開いてある `Arc<CatalogDb>` があればそれを使う。無ければ受付時に捕捉した `CatalogWork` (admission) で worker が開く。
-  worker の中で新しい admission を取り直さない (catalog の保守との順序を受付時点で固定するため。src/catalog.rs の admission)。
+**worker の中身 (今の UI の処理と同じ順序・同じ条件)**: 書き手の準備 → 読み込み → (今と同じ条件なら) `delete_missing`。
+初めてのフォルダ・移行前の DB も分岐させず、次の一本道にする (r3 指摘 3):
+1. 書き手の準備: 受付時に開いてある `Arc<CatalogDb>` があればそれを使う。無ければ受付時に捕捉した `CatalogWork::open` で開く
+   (作成・WAL・スキーマの初期化・PDF 寸法の移行まで終える。今の `get_or_open_catalog` と同じ)。
+2. 読み込み: 同じ受付時の admission で `CatalogWork::open_existing` (= `open_existing_read_only_admitted`) の別の読み取り専用の接続を
+   開き、読み込みを終えて statement と読み取りの transaction を閉じる。本当に空なら SELECT が空を返す (「file が無かった」の観測で
+   読み込みを省かない)。移行は 1 で済んでいるので、移行前の行を map に取り込まない。
+3. 片付け: 2 の後、共有の接続 (書き手) で `delete_missing` (区切って行う。下記)。
+- worker の中で新しい admission を取り直さない (catalog の保守との順序を受付時点で固定するため。src/catalog.rs の admission)。
+  lease は各段の SQL の間だけ握り、合流待ちまで持ち越さない。保守が途中で受け付けられたら、古い admission の SQL は拒否される。
+  その場合は失敗として扱い (下の「失敗」)、片付けまで完走させる保証はしない。
 - **長い読み込みは別の読み取り専用の接続で行う (r2 指摘 2)**。`CatalogDb` は 1 本の接続を Mutex で守り、`load_all` は読み込みの間
   ずっと握る (`CatalogDb::phase`)。一方、仮想フォルダの writeback (`app.rs` のサムネイル完了の poll から親 catalog へ同期保存) は
   UI から同じ接続を取る。共有の接続で読むと、例えば別ウィンドウの PDF の writeback が、メインの先読みの SELECT を UI で待つ。
-  そこで読み込みは `CatalogDb::open_existing_read_only_admitted` と同じ形の、受付時の admission で開く別の読み取り専用の接続で行う
-  (WAL なので書き手を止めない)。共有の接続 (`db`) は、サムネイル worker に渡すためと、短い `delete_missing` だけに使う。
-  `delete_missing` が長くなるのは版が上がった直後の初回 (古い組をまとめて消す) だけで、その間の UI の writeback の待ちは割り切る。
-- DB の file が無い (初めてのフォルダ) ときは、共有の接続を開いて作り (今の `get_or_open_catalog` と同じ)、読み込みは空。
+  そこで読み込みは上の 2 のとおり別の読み取り専用の接続で行う (WAL なので読み手は書き手を止めない)。共有の接続 (`db`) は、
+  サムネイル worker に渡すためと、片付けだけに使う。
+- **片付けは区切って行う (r3 指摘 2)**。今の `delete_missing` は両表の全行名の取得・判定・削除・commit を 1 回の Mutex の保持と
+  1 つの transaction で行うので、worker に移すと、その間 UI の writeback が待つ (WAL でも書き手は 1 つ)。全種類表示では毎回走り、
+  大量に消す回もあるので割り切れない。そこで `delete_missing` を「行名の取得 (2 ms 程度) → 消す行の判定 → 一定数 (例: 64 行) ごとに
+  `phase()` を取り直して DELETE + commit」に分け、区切りの間で Mutex と SQLite の書き込みの権利を手放す。UI の writeback の待ちは
+  1 区切り分 (数 ms) が上限になり、サムネイル worker の保存と UI の writeback が今すでに同じ接続を順に使っているのと同じ種類の待ちに
+  収まる。区切りの間に同じ名前の行が保存し直されても、消す判定は今と同じ「存続キー集合に無い」なので結果は変わらない。
+  - 代わりに UI の writeback を worker へ移す案は、writeback の書き手が UI 以外にも増え、仮想フォルダの seed と writeback の順序の
+    所有が変わるので採らない。
 - 読み込みと片付けの順序は今のまま「読み込み → 片付け」。片付けで消した行も map には残る (今と同じ)。DirectMedia の明示対象は
   `catalog_existing_keys` に入らないが、今は map に残るので使える。順序を変えるとこれが失われる (r1 指摘 3)。
 - 片付けの条件は今と同じ (`!is_synthetic_view_path && is_all_visible`)。表示を絞っている利用者の古い行は段階 C で扱う。
@@ -151,14 +167,14 @@ DirectMedia になり得るかは、親フォルダの読み込みを頼む時�
 - `Ready` は continuation の catalog 節 (`resume_loading_items_after_sidecar` の「カタログを開く + cache_map ロード + 削除掃除」) で
   採用するまで continuation に残す。DirectMedia は同じ continuation を再 hydration するので、`Ready` を持ち越して 2 回目の終端では
   待たない。
-- 空の一覧の直接 resume (`start_sidecar_restore` の `self.items.is_empty() && !restore_sidecar` の枝) は待つ所有者が無い。
-  catalog 節に `NotRequested` または `Waiting` のまま来たら待たず、`Waiting` は受信口ごと worker 側で破棄し、「開いてある catalog が
-  あればその Arc、無ければ None」・空の map で続ける。読み込みも片付けもしない。
+- 空の一覧の直接 resume (`start_sidecar_restore` の `self.items.is_empty() && !restore_sidecar` の枝) は、条件を「空の一覧かつ
+  サイドカー不要**かつ catalog が `NotRequested`**」に狭める (r3 指摘 1)。catalog が `Waiting` (DirectMedia になり得る空の一覧) なら
+  直接 resume せず、既存の復元の所有者を作り、空のページ索引を準備済みとして共通の合流へ進める。別の pending や worker の
+  やり直しは足さない。`NotRequested` の空の一覧は、catalog 節で「開いてある catalog があればその Arc、無ければ None」・空の map で
+  続け、読み込みも片付けもしない。
   - 今は空の一覧でも UI で開いて全行を読み、全種類表示なら空集合で `delete_missing` (= `audioart:` 以外の全行削除) を呼ぶ。
     r2 の確認で、ZIP・PDF の列挙の失敗・worker の切断、PDF のパスワード待ちの一部の枝で実際に到達する (ZIP の純粋な読み込み中の殻は
     到達しない)。失敗や待機は物理的な消失の証拠ではないので、空の一覧で片付けないのは正しい変更とした (§8 Q1)。
-  - 割り切る点: サイドカーが無効で、DirectMedia の対象のほかに表示できる項目が無いフォルダを起動時に開いた場合、DirectMedia の
-    サムネイルは catalog の行を使わず 1 枚作り直す (表示はされる。データは失われない)。
 
 **表紙の失効との競合 (r1 指摘 1)**: 表紙の回転などで catalog の行を消す処理 (`cover_rotation_cache`) の完了は、
 `poll_cover_rotation_cache` が `current_color_cache_map` から該当行を消して知らせる。合流前は `current_color_cache_map` が `None`
@@ -220,8 +236,6 @@ UI でしない。worker は cancel を見て、取り消し後は送らない�
   待ちと同程度。
 - 変わる点: 空の一覧で catalog を開かず、片付け (全行削除) もしない。後で項目が入った一覧を読み込むときに今どおり片付く。
   列挙の失敗・パスワード待ちの一覧で、今は消えていたサムネイルのキャッシュが残るようになる (良い方向)。
-- 割り切る点: サイドカーが無効で、DirectMedia の対象のほかに表示できる項目が無いフォルダを起動時に開いた場合だけ、そのサムネイルを
-  1 枚作り直す (§4 段階 A)。
 - メモリは段階 B で減る (このフォルダで約 33 MB)。
 - 永続データ: 形を変えない (読む場所と範囲だけ)。段階 C を行う場合も、消すのは作り直せるサムネイルのキャッシュだけ。
 
@@ -233,10 +247,13 @@ UI でしない。worker は cancel を見て、取り消し後は送らない�
     drop されない。
   - 「読み込み完了 → 表紙の失効の完了を poll → 合流」で、失効した行が `cache_map` に無い (決定的な回帰テスト)。
   - DirectMedia: 「表示できる兄弟あり / なし」×「サイドカー有効 / 無効」の 4 通りで、範囲が開始前に `All` に決まり、`Ready` を持ち越して
-    2 回目の終端で待たず、明示対象の既存の行を使う (兄弟なし・サイドカー無効は §4 の割り切りどおり 1 枚作り直す)。catalog の準備と
+    2 回目の終端で待たず、明示対象の既存の行を使う (4 通りとも作り直さない)。catalog の準備と
     サムネイル worker の起動が各 1 回。
   - 空の一覧 (DirectMedia でない): catalog を読まず、片付けも呼ばない。直接 resume の枝に `Waiting` で来たときは待たずに破棄する。
-  - 読み込みが別の読み取り専用の接続で行われ、先読み中に UI から共有の接続 (writeback) を取っても長く待たない。
+  - 読み込みが別の読み取り専用の接続で行われ、先読み中に UI から共有の接続 (writeback) を取っても長く待たない。片付けの最中も、
+    UI の writeback の待ちが 1 区切り分に収まる (区切りの間で Mutex を手放すことをテストで確かめる)。
+  - catalog の DB: 初めてのフォルダ (file が無い)、移行前の古い DB、保守 (admission) の受付が読み込みの前・最中・後の各場合で、
+    移行前の行を map に入れない・新しい admission を取り直さない・保守の後の SQL が拒否されて失敗扱いになる。
   - detached viewer の context (Mounted / AtRest / Retired) で、対象の context だけが変わり、兄弟の context が変わらない。
 - 回帰: 全種類表示の読み込みで、今と同じ行が DB に残る。合成ビューの経路が変わらない。
 - 段階 B: `inventory_retains_key` と同じ行を返す (EPUB の直接ピン・cascade ピンの世代付き行を含む)。`audioart:` を除く今の扱い。
@@ -296,3 +313,16 @@ r3 で確かめてほしい点:
 
 - Q3: 別の読み取り専用の接続で読む形で、admission (catalog の保守・退避) と矛盾しないか。初めてのフォルダ (file が無い) の順序。
 - Q4: DirectMedia の印を起動時 open から `start_loading_items` まで運ぶ経路が 1 本で足りるか (ほかに DirectMedia を付ける入口が無いか)。
+
+### r3 (同じセッションの resume、2026-11-17、088efe603 に対して) — REVISE、P1 なし
+
+r2 の P3-3 (合流の位置・失効の範囲) と P3-4 は解消。Q3 (別の読み取り専用の接続) は原理的に矛盾なし、順序の固定が必要。
+Q4 は DirectMedia を作る入口が 1 か所で足りる (activation・Agent も通る共通の適用経路から印を渡す。Bookmark は対象外)。
+
+| 指摘 | 対応 |
+| --- | --- |
+| P2-1 空の一覧の DirectMedia で、起動した catalog の結果を捨てて作り直す (通常の操作で毎回起こる。割り切れない) | §4 段階 A: 直接 resume を `NotRequested` の空の一覧だけに狭め、`Waiting` なら復元の所有者を作って共通の合流へ。割り切りを撤回 |
+| P2-2 共有の接続での `delete_missing` の間、UI の writeback が待つ (毎回走る通常の保守。割り切れない) | §4 段階 A: 片付けを一定数ごとの transaction に区切り、区切りの間で Mutex を手放す。待ちの上限は 1 区切り |
+| P3-3 初めての DB で「読み込みは空」を判断する時点が曖昧 | §4 段階 A: 書き手の準備 → 読み取り専用で読む → 片付け の一本道。初回も分岐しない |
+
+§6 に、初めての DB・移行前の DB・保守の受付の前後、DirectMedia 4 通りの行の再利用、片付け中の writeback の待ちの検証を足した。
