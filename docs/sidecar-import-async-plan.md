@@ -349,7 +349,8 @@ CLAUDE.md「設計の簡素化」に従い、restore phaseや待機状態を増�
 調整する案を選んだ。計装だけは既存request owner内の`Cell`にtypedな
 `Unseen / Candidate / Shown`の3状態を持たせ、phase・入力gateには使わない。
 retained readoptionもReading ownerが記録を所有し、次requestには移送しない。
-perf無効時は候補登録・確定・イベント生成を行わない。可視かつ非sizingのModal構築は
+perf無効時は候補登録・確定・イベント生成を行わない。root viewportの描画だけを数え、
+可視かつ非sizingのModal構築は
 `Unseen`のときだけ候補にとどめ、`post_render_sidecar_restore`入口で通常restoreと
 retained readoptionの両ownerを、完了処理・pollより前に一度確定する。
 `ctx.will_discard()`がtrueなら`Unseen`へ戻し、falseなら`Shown`として一度だけ
@@ -357,8 +358,9 @@ retained readoptionの両ownerを、完了処理・pollより前に一度確定�
 通常restoreは`seq`で既存の`nav/sli_sidecar_import`と対応付け、後者は元の場所・タイミングで
 即時発行し、`Shown`かどうかを`modal_shown` boolとして加える。
 `source`は`sidecar_restore` / `spread_shift_retained_readoption`で区別する。後者はReading phase、
-`request_id`は既存のopen receipt id、`seq=0`とする。detachedの直接描画経路は計装対象外なので、
-`modal_shown=false`は全viewportで未表示だった証明ではない。
+`request_id`は既存のopen receipt id、`seq=0`とする。子viewport（detachedの直接描画経路・
+共通helper経由とも）は計装対象外で、`modal_shown=false`は子viewportで未表示だった証明ではない。
+rootのメイン描画・確定点はdetached contextの一時mountの外にあり、同じmain ownerを観測する。
 確認した本番のdiscard要求はeguiのUI構築と、mIV本体の`ui_depth_parallax.rs`・
 `ui_dialogs/mod.rs`・`ui_history_field.rs`のUI構築中に出るもので、
 `post_render_sidecar_restore`より後（`on_end_pass`等）の本番要求は見つかっていないため、

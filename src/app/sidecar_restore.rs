@@ -47,6 +47,11 @@ struct ModalPaint {
 
 impl SidecarModalObservation {
     #[cfg(test)]
+    pub(super) fn is_unseen(&self) -> bool {
+        matches!(self.record.get(), ModalObservationState::Unseen)
+    }
+
+    #[cfg(test)]
     pub(super) fn has_candidate(&self) -> bool {
         matches!(self.record.get(), ModalObservationState::Candidate(_))
     }
@@ -4029,6 +4034,56 @@ mod tests {
         early.drop_without_applying_deltas();
         sizing.drop_without_applying_deltas();
         visible.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn sidecar_modal_child_helper_draw_keeps_observation_unseen() {
+        let capture = ModalPerfCapture::new();
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("child-modal");
+        app.activate_sidecar_restore_modal_for_test(folder);
+        let state = app.sidecar_restore.as_ref().unwrap();
+        let deadline = state.common.started_at + SIDECAR_RESTORE_MODAL_GRACE;
+        let ctx = egui::Context::default();
+        let child = egui::ViewportId::from_hash_of("sidecar modal child");
+        let mut visible = false;
+        for _ in 0..2 {
+            let mut input = egui::RawInput {
+                viewport_id: child,
+                ..Default::default()
+            };
+            input.viewports.insert(
+                child,
+                egui::ViewportInfo {
+                    parent: Some(egui::ViewportId::ROOT),
+                    ..Default::default()
+                },
+            );
+            let output = ctx.run_pass(input, |ctx| {
+                assert_eq!(ctx.viewport_id(), child);
+                app.show_sidecar_restore_dialog_at(ctx, deadline);
+                assert!(state.common.modal_observation.is_unseen());
+                assert!(app.sidecar_restore_blocks_projected_context());
+            });
+            visible |= output
+                .shapes
+                .iter()
+                .any(|shape| !matches!(shape.shape, egui::Shape::Noop));
+            output.drop_without_applying_deltas();
+        }
+        assert!(visible, "child presentation must still draw after sizing");
+        // A later root confirmation cannot interpret a child's paint using root discard state.
+        for discard in [false, true] {
+            ctx.run_pass(Default::default(), |ctx| {
+                if discard {
+                    ctx.request_discard("root layout after child draw");
+                }
+                state.confirm_modal_paint(ctx);
+                assert!(state.common.modal_observation.is_unseen());
+            })
+            .drop_without_applying_deltas();
+        }
+        assert!(capture.events().is_empty());
     }
 
     #[test]

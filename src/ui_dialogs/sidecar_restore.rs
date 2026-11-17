@@ -33,6 +33,10 @@ impl App {
         if !self.sidecar_restore_blocks_projected_context() {
             return;
         }
+        // Count only root viewport draws, where the main context is mounted.
+        // Child viewports (direct or shared-helper draws) are outside this diagnostic metric;
+        // modal_shown=false does not prove that a child viewport never displayed the Modal.
+        let observe_root = ctx.viewport_id() == egui::ViewportId::ROOT;
         if let Some(started_at) = self.spread_shift.retained_readoption_started_at() {
             let remaining = crate::app::SIDECAR_RESTORE_MODAL_GRACE
                 .saturating_sub(now.saturating_duration_since(started_at));
@@ -46,7 +50,8 @@ impl App {
                     heading: "表示を準備中",
                     detail: "保存された見開き調整を表示へ反映しています。",
                 },
-            ) {
+            ) && observe_root
+            {
                 self.spread_shift.offer_retained_readoption_modal_paint();
             }
             return;
@@ -61,7 +66,7 @@ impl App {
             ctx.request_repaint_after(remaining);
             return;
         }
-        if draw_sidecar_restore_modal(ctx, state.presentation()) {
+        if draw_sidecar_restore_modal(ctx, state.presentation()) && observe_root {
             state.offer_modal_paint();
         }
     }

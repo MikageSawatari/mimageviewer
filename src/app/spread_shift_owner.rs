@@ -1092,6 +1092,73 @@ mod sidecar_restore_modal_tests {
     }
 
     #[test]
+    fn retained_readoption_child_helper_draw_keeps_observation_unseen() {
+        let capture = super::super::sidecar_restore::ModalPerfCapture::new();
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("child-retained.pdf");
+        app.current_folder = Some(folder.clone());
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: folder,
+            page_num: 0,
+            content_type: None,
+        }];
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        let restore = app.capture_book_shift_restore(1, true).unwrap();
+        let started_at = std::time::Instant::now();
+        app.spread_shift.retained = RetainedReadoption::Reading {
+            restore: Box::new(restore),
+            started_at,
+            modal_observation: SidecarModalObservation::default(),
+        };
+        let RetainedReadoption::Reading {
+            modal_observation, ..
+        } = &app.spread_shift.retained
+        else {
+            panic!("reading fixture")
+        };
+        let ctx = egui::Context::default();
+        let child = egui::ViewportId::from_hash_of("retained modal child");
+        let mut visible = false;
+        for _ in 0..2 {
+            let mut input = egui::RawInput {
+                viewport_id: child,
+                ..Default::default()
+            };
+            input.viewports.insert(
+                child,
+                egui::ViewportInfo {
+                    parent: Some(egui::ViewportId::ROOT),
+                    ..Default::default()
+                },
+            );
+            let output = ctx.run_pass(input, |ctx| {
+                assert_eq!(ctx.viewport_id(), child);
+                app.show_sidecar_restore_dialog_at(ctx, started_at + SIDECAR_RESTORE_MODAL_GRACE);
+                assert!(modal_observation.is_unseen());
+                assert!(app.sidecar_restore_blocks_projected_context());
+            });
+            visible |= output
+                .shapes
+                .iter()
+                .any(|shape| !matches!(shape.shape, egui::Shape::Noop));
+            output.drop_without_applying_deltas();
+        }
+        assert!(visible, "child presentation must still draw after sizing");
+        for discard in [false, true] {
+            ctx.run_pass(Default::default(), |ctx| {
+                if discard {
+                    ctx.request_discard("root layout after retained child draw");
+                }
+                app.spread_shift
+                    .confirm_retained_readoption_modal_paint(ctx);
+                assert!(modal_observation.is_unseen());
+            })
+            .drop_without_applying_deltas();
+        }
+        assert!(capture.events().is_empty());
+    }
+
+    #[test]
     fn retained_readoption_uses_the_shared_modal_grace_and_keeps_input_gated() {
         let mut app = crate::app::setup_app_for_test();
         let folder = app.tmp.path().join("retained-modal.pdf");
