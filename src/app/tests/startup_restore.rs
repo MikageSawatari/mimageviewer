@@ -3602,6 +3602,23 @@ fn backspace_image_folder_book_to_list(app: &mut App, book: &Path) {
 
 #[test]
 #[cfg(windows)]
+fn section1795_off_image_folder_book_resumes_and_closes_to_same_list() {
+    let _input_guard = crate::key_input::lock_test_input();
+    let (mut env, parent, book) = direct_tray_image_folder_book_env();
+    env.settings.restore_folder_cursor_on_revisit = false;
+    backspace_image_folder_book_to_list(&mut env, &book);
+    phase_c_support::wait_for_book_resume_write(&env, &book);
+    assert_eq!(env.book_resume_db.as_ref().unwrap().get(&book), Some(1));
+    env.select_after_load = Some("book".into());
+    env.load_folder(parent);
+    env.finish_page_identity_preparation_for_test();
+    open_selected_image_folder_book(&mut env, &book);
+    assert_eq!(env.fullscreen_idx, Some(1));
+    backspace_image_folder_book_to_list(&mut env, &book);
+}
+
+#[test]
+#[cfg(windows)]
 fn section1335_tray_image_folder_book_direct_hide_restore_preserves_parent_cursor_and_resume() {
     for restore_last_cursor in [true, false] {
         let (mut env, parent, book) = direct_tray_image_folder_book_env();

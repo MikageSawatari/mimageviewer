@@ -44416,7 +44416,7 @@ impl App {
             audio_art_prune,
             auto_aspect_seed,
             source_path,
-            source_is_directory: _,
+            source_is_directory,
             mut prepared_subfolder,
             prepared_page_edits: direct_page_edits,
             mut prepared_aggregate,
@@ -44843,7 +44843,18 @@ impl App {
         // ときは履歴より優先する: 深い階層から BS で戻ったとき、最初にフォルダへ入った位置
         // ではなく「今いる位置」にカーソルを合わせるため。指定アイテムが items に見つから
         // なかった場合 (削除等) のみ履歴へフォールバック。
-        let history_state = (!detached_physical)
+        // Use the accepted load's intent and existing directory classification, not path
+        // equality: opening a favorite for the current folder is still an entry. Keep
+        // refresh/resume, books, extracted views and detached lists on their existing policy.
+        let skip_folder_position = !self.settings.restore_folder_cursor_on_revisit
+            && !detached_physical
+            && source_is_directory
+            && matches!(
+                self.projection_recipe,
+                book_materialization::ProjectionRecipe::OrdinaryList
+            )
+            && restore_intent.enters_folder_list();
+        let history_state = (!detached_physical && !skip_folder_position)
             .then(|| self.folder_history.get(&source_path).copied())
             .flatten();
         let refresh_cursor = (!detached_physical)
@@ -44898,6 +44909,7 @@ impl App {
         // 復元する (= 再起動を跨いだ「続きから」)。
         if !restored
             && history_state.is_none()
+            && !skip_folder_position
             && !matches!(
                 self.fs_nav_after_pdf_enumerate
                     .as_ref()
@@ -44913,6 +44925,12 @@ impl App {
                 self.grid_scroll.set_reveal_requested(true);
                 self.redirect_selected_to_visible();
             }
+        }
+        if !restored && skip_folder_position {
+            self.move_grid_cursor(
+                self.current_grid_order().first().copied(),
+                crate::app::GridCursorIntent::Automatic,
+            );
         }
         // A freshly loaded grid must not inherit stale idle-upgrade timing from
         // the previous grid. Scroll history has been restored by this point, so

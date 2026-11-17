@@ -9393,6 +9393,25 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
         ui.add_space(12.0);
     });
+    anchored(
+        ui,
+        state,
+        "folder/restore-cursor-on-revisit",
+        |ui, state| {
+            ui.checkbox(
+                &mut state.settings.restore_folder_cursor_on_revisit,
+                "フォルダに入り直したとき、前回のカーソル位置を復元する",
+            );
+            ui.label(
+            egui::RichText::new(
+                "OFF にすると、フォルダを開き直したときは一覧の先頭を選びます。起動時の復元は「起動」の設定に従います。",
+            )
+            .size(11.0)
+            .color(ui.visuals().weak_text_color()),
+        );
+            ui.add_space(12.0);
+        },
+    );
     anchored(ui, state, "folder/edit-restore", |ui, state| {
         let s = &mut state.settings;
         ui.checkbox(

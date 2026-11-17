@@ -27,6 +27,7 @@ mod auto_aspect_s1;
 mod book_close_s1;
 mod repro742;
 mod section1768;
+mod section1795;
 
 pub(crate) fn assert_cache_book_cover_only_worker_catalog_contract(
     app: &mut App,
