@@ -7,6 +7,64 @@ use crate::app::tests::phase_c_support::setup_app;
 use crate::book_composition::{CompositionToken, PageDomain, StoredComposition, fixtures};
 use std::time::Duration;
 
+#[test]
+fn spread_step_memory_on_never_admits_a_shift_write_or_toast() {
+    let mut env = setup_app();
+    let root = env.tmp.path().join("one-page.pdf");
+    install_document(&mut env,&root,&[0,1,2,3]);
+    let (service,owner) = SpreadShiftService::spawn_at(env.tmp.path().join("step-shift"),None).unwrap();
+    env.spread_shift_service = Some(service.clone());
+    env.settings.remember_spread_shift_per_book = true;
+    env.fullscreen_idx = Some(0);
+    env.get_nav_indices();
+    let before = service.watermarks();
+    let shift = env.spread_shift.clone();
+    let toast = env.fs_feedback_toast.clone();
+    let mut action = crate::ui_fullscreen::FsKeyAction::default();
+    env.queue_spread_step_action(0,1,&mut action);
+    assert_eq!(action.page_nav,crate::ui_fullscreen::FsPageNav::Target(1));
+    assert_eq!(env.spread_step.unwrap().start_idx,1);
+    assert_eq!(service.watermarks(),before);
+    assert_eq!(env.spread_shift,shift);
+    assert_eq!(env.fs_feedback_toast,toast);
+    let scope = env.current_spread_shift_scope().unwrap();
+    let read = service.read_after(scope,before.admitted).recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(read.row.is_none());
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn spread_step_retained_and_import_adoption_retire_after_success_only() {
+    for imported in [false,true] {
+        let mut env = setup_app();
+        let root = env.tmp.path().join("step-adoption.pdf");
+        install_document(&mut env,&root,&[0,1,2,3]);
+        let scope = env.current_spread_shift_scope().unwrap();
+        let (service,owner) = SpreadShiftService::spawn_at(env.tmp.path().join("step-read"),None).unwrap();
+        env.spread_shift_service = Some(service.clone());
+        env.settings.remember_spread_shift_per_book = true;
+        seed(&service,&scope,1);
+        env.spread_step = Some(SpreadStep { start_idx:2 });
+        if imported {
+            let read = service.read_after(scope.clone(),service.watermarks().admitted)
+                .recv_timeout(Duration::from_secs(10)).unwrap();
+            let mut failed = read.clone();
+            failed.status = Err("injected read failure".into());
+            env.adopt_imported_shift_read(scope.clone(),failed);
+            assert!(env.spread_step.is_some());
+            env.adopt_imported_shift_read(scope,read);
+        } else {
+            let mut restore = env.capture_book_shift_restore(1796,true).unwrap();
+            assert!(env.spread_step.is_some(),"preparation is not retirement");
+            service.read_after(scope,service.watermarks().admitted)
+                .recv_timeout(Duration::from_secs(10)).unwrap();
+            assert!(env.poll_book_shift_restore(&mut restore).unwrap());
+        }
+        assert!(env.spread_step.is_none());
+        owner.shutdown_and_join();
+    }
+}
+
 #[cfg(test)]
 fn install_document(app: &mut App, root: &Path, pages: &[u32]) {
     app.current_folder = Some(root.to_path_buf());

@@ -96,6 +96,7 @@ global chord snapshot 方式 (`install_global_native_video_shortcuts` /
 `ImageToggleMetadata`→`FsToggleMetadata`、`ImageSlideshow`→`FsSlideshow`、`ImagePixelGrid`→`FsPixelGrid`、
 `ImageBackgroundCycle`→`FsBgCycle`、`ImageComparePin`→`FsCompareToggle`(比較系・近似)、
 `ImageSpreadShiftLeft/Right/Prev/Next`→`FsSpreadShiftLeft/Right/Prev/Next`、
+`ImageSpreadStepPrev/Next`→`FsSpreadStepPrev/Next`（読み順固定、既定なし、画像 FS）、
 `ImageZoomMode`→`FsZoomMode` (KeyHold の照準表示は一発アクションではスキップ)。
 動画 FS: `VideoCapture/Mute/Loop/Bookmark/MarkerPrev/MarkerNext/TileMode/ExternalPlayer` は同名 `KeyAction` あり。
 

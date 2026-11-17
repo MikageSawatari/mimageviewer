@@ -2085,6 +2085,7 @@ pub(in crate::app) struct ViewerContextBundle {
     singleton_spread_endpoint_preferences: crate::settings::SingletonSpreadEndpointPreferences,
     page_alone_preferences: crate::settings::PageAlonePreferences,
     pub(super) spread_shift: super::spread_shift_owner::ViewerSpreadShift,
+    pub(super) spread_step: Option<super::spread_shift_owner::SpreadStep>,
     pub(super) book_composition: super::book_composition_runtime::ViewerBookComposition,
     pub(super) composition_editor: super::book_composition_editor::CompositionEditorState,
     pub(super) book_composition_permission:
@@ -3084,6 +3085,7 @@ const _: () = {
 impl ViewerContextBundle {
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            retire_spread_step(&mut self.spread_step);
             self.page_overview.close();
             self.requested.clear();
             crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
@@ -3344,6 +3346,7 @@ impl ViewerContextBundle {
                 crate::settings::SingletonSpreadEndpointPreferences::default(),
             page_alone_preferences: crate::settings::PageAlonePreferences::default(),
             spread_shift: Default::default(),
+            spread_step: None,
             book_composition: Default::default(),
             composition_editor: Default::default(),
             book_composition_permission: Default::default(),
@@ -3776,6 +3779,7 @@ impl App {
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
             spread_shift,
+            spread_step,
             book_composition,
             composition_editor,
             book_composition_permission,
@@ -4112,6 +4116,7 @@ impl App {
         swap_field!(singleton_spread_endpoint_preferences);
         swap_field!(page_alone_preferences);
         swap_field!(spread_shift);
+        swap_field!(spread_step);
         swap_field!(book_composition);
         swap_field!(composition_editor);
         swap_field!(book_composition_permission);
@@ -4550,6 +4555,7 @@ impl App {
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
             spread_shift,
+            spread_step,
             book_composition,
             composition_editor,
             book_composition_permission,
@@ -4700,6 +4706,12 @@ impl App {
             reading_history_return_from,
             bookmark_view_state,
         );
+        // A fork starts without a transient origin; the source context is unchanged.
+        retire_spread_step(spread_step);
+        // Its duplicated cache must not retain the source effective projection.
+        if self.spread_step.is_some() {
+            *spread_display_units_cache = Default::default();
+        }
 
         *grid_scroll = self.grid_scroll.fork();
 
@@ -4896,6 +4908,7 @@ impl App {
             singleton_spread_endpoint_preferences,
             page_alone_preferences,
             spread_shift,
+            spread_step,
             book_composition,
             // A fork keeps the exact editor request with its original context. Its new
             // sibling starts Closed; the mount-independent operation owner never changes.
@@ -5658,6 +5671,7 @@ impl App {
             {
                 continue;
             }
+            retire_spread_step(&mut bundle.spread_step);
             bundle.similar_panel.reset_info_target();
             bundle.similar_panel.preview.invalidate();
             bundle
@@ -6424,11 +6438,63 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    include!("spread_step_context_tests.rs");
     use super::*;
     use std::cell::RefCell;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::rc::Rc;
 
+    #[cfg(windows)]
+    #[test]
+    fn spread_step_context_swap_park_mount_sibling_and_presentation_ownership() {
+        let mut app = crate::app::setup_app_for_test();
+        seed_step_context(&mut app, 1);
+        let sibling = app.build_window_context_for_test(1796, |owner| seed_step_context(owner, 3));
+        for presentation in [
+            super::super::ViewerPresentation::DetachedWindow,
+            super::super::ViewerPresentation::Fullscreen,
+            super::super::ViewerPresentation::MainWindow,
+        ] {
+            app.viewer_presentation = presentation;
+            assert_eq!(app.spread_step.unwrap().start_idx, 1);
+            app.with_viewer_context(sibling, |owner| {
+                assert_eq!(owner.spread_step.unwrap().start_idx, 3);
+                super::super::spread_shift_owner::retire_spread_step(&mut owner.spread_step);
+            })
+            .unwrap();
+            assert_eq!(app.spread_step.unwrap().start_idx, 1);
+            app.with_viewer_context(sibling, |owner| {
+                assert!(owner.spread_step.is_none());
+                owner.spread_step =
+                    Some(super::super::spread_shift_owner::SpreadStep { start_idx: 3 });
+            })
+            .unwrap();
+        }
+        let mut parked = ViewerContextBundle::empty();
+        app.swap_viewer_context_bundle(&mut parked);
+        assert!(app.spread_step.is_none());
+        assert_eq!(parked.spread_step.unwrap().start_idx, 1);
+        app.swap_viewer_context_bundle(&mut parked);
+        assert_eq!(app.spread_step.unwrap().start_idx, 1);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn spread_step_context_both_generation_setters_retire_only_changed_owner() {
+        let mut app = crate::app::setup_app_for_test();
+        seed_step_context(&mut app, 1);
+        let generation = app.items_generation;
+        app.set_items_generation(generation);
+        assert!(app.spread_step.is_some());
+        app.set_items_generation(generation + 1);
+        assert!(app.spread_step.is_none());
+        let mut parked = ViewerContextBundle::empty();
+        parked.spread_step = Some(super::super::spread_shift_owner::SpreadStep { start_idx: 3 });
+        let generation = parked.items_generation;
+        parked.set_items_generation(generation);
+        assert!(parked.spread_step.is_some());
+        parked.set_items_generation(generation + 1);
+        assert!(parked.spread_step.is_none());
+    }
     #[cfg(windows)]
     fn seed_zip_list_choices_for_test(app: &mut App, source: &Path) {
         let tree = Arc::new(crate::zip_tree::ZipTree::build(
