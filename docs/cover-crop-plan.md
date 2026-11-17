@@ -2276,3 +2276,143 @@ P案の本文proof/codec変更やK2内生成を承認したものではなく、
 - 再レビュー対応（2026-11-16）: P2-aは書庫単位の保守的失効へ簡素化し、前回のread_book・実効prefixによる所属判定と、変更ページから包含prefixだけを作る処理を削除した。writerのキーは不変、runtime slotを外側書庫＋代表ページへそろえる。`cover_rotation_archive_inventory_deletes_unheld_external_zipdir_pins_after_restart` はpin DB・対象tileのhint無しでZIP／変換書庫の外部prefix固定、両binding、区切り文字を含む名前、手動の保持と受動stampを検査する。
 - P2-bは通知を `InvalidatedRow { slot, catalog, key }` にまとめた。`cover_cache_correlated_deleted_rows_preserve_same_name_cover_only_request_in_other_catalog` は実workerの複数catalog batchで、表紙だけのAの未解決要求／CPU待ちを保ち、本文のBだけを取消す。既存ZipDirの別prefix不変テストは、今回受け入れた同書庫内の失効へ期待値を変更する。無関係な別書庫/contextは引き続き不変。
 - 再レビュー修正の検証（`1bdf4736d`＋作業ツリー）: run-heavy経由、子TEMP/TMPはtarget/tmp、build jobs 2／test threads 1で直列実行した。初回の3失敗は、明示leafのaffected-only通知の取消、slotのパス正規化、新しい書庫単位方針の期待値を補修した。最終の `test(/cover_cache|cover_rotation|thumbnail_requests/)` は **74成功・0失敗**（run ID `65380bb3-3cfb-4555-b908-994b5ec6f154`）。`cargo check -p mimageviewer --bin mimageviewer-core`、`cargo run -p viewer_context_audit`、`cargo fmt`（引数なし）、`git diff --check` も成功。UI文字列・見た目・snapshotは変更していない。マニュアルには同じ書庫内の本も判定し直すことを追記した。
+
+## 30. 直接読む RAR の自動切り出しと手動の範囲指定 (§1.778、2026-11-17 設計)
+
+- 要件の正本: [next-release-backlog.md §1.778](next-release-backlog.md) (5ch >>778・793)。ブランチ `feat-778-rar-cover-crop`。
+- 既定の割り切り: まれな失敗 (DB の読み書き失敗・処理途中の強制終了など) はログ + 通知 (CLAUDE.md)。
+
+### 30.1 コードで確かめた前提 (master `96ed160a0`)
+
+- 直接読む RAR / CBR のタイルは `GridItem::ConvertibleArchive { format: Rar }`。読み取り元は `converted_archive_cache_paths` の
+  `Direct(解決済みの RAR、分割なら先頭巻)` / `CachedZip` / `Pending` / `Unavailable` で、変換済み ZIP があれば `CachedZip` が優先される。
+  ソリッド・入れ子・暗号化の RAR は `Unavailable` (変換して開く)。
+- 基本キーは読み取り元によらず `archivethumb:rar:{名前}` (`convertible_archive_cache_base_key`)、stamp は元の RAR の mtime/size。
+  `Pending` は同じキーの `CacheOnly` で読む。自動 ON では `make_load_request_with_auto_crop` が ConvertibleArchive にも自動の印を付けるので、
+  **v5.3.0 は直接読む RAR を `archivethumb:rar:X.rar|autocrop:v4:{rtl|ltr}` のキーで `AutoMaterial::NotAutomatic` (判定しない素材) として保存している**。
+  worker は `automatic_container_source` が `AutoCoverSkip::DirectRar` を返して判定に進まないため。CachedZip の RAR は同じキーで判定済み。
+- worker は heavy I/O キュー ("io{n}"、1〜2 本) で、表紙は `rar_loader::read_first_image_bytes` (ヘッダ順の最初の画像を丸ごと) で読む。
+  cancel はプール共通の `Arc<AtomicBool>`。`rar_loader` は自前パッチの `unrar` 0.5.8。一覧 (`enumerate_image_entries_detailed_with_cancel`) は
+  entry ごとに cancel を確かめ、重複名を `page (2).png` 形式にした名前と展開後の大きさ (`unpacked_size`) を返す。entry の読み取り
+  (`read_entry_bytes`) は丸ごとで cancel が無い。部分読みは無い。
+- **手動の範囲指定は、直接読む RAR でもすでに通る**: メニュー (`cover_crop_menu_state`) は `Direct` を有効にし、準備 worker
+  (`prepare_cover_inner`) は `read_entry_bytes` で表紙を読む。止まるのは自動の判定だけ (`AutoStop::Source(DirectRar)`「変換前の RAR は自動の対象外です」)。
+  手動の範囲を解除した後に自動へ戻るかの `auto_eligible_after_clear` も RAR では false。マニュアル (grid.html) の対象の列挙は「変換済みの書庫」だけを書いている。
+- **キャンセル・一時的な読み取り失敗が判定済みと混ざる (既存の不具合、全形式)**:
+  - 判定用のデコードが cancel で止まると `reason="analysis-decode-failed"` になり、`NotAutomatic` のまま catalog に保存される。
+  - ZIP の標本の読み取り (`read_cover_auto_page_prefixes(...).unwrap_or_default()`) は I/O エラーを空の一覧にし、`TooFew` →
+    全方向 `PageAspectMissing` の `Automatic([None; 4])` (判定済みの見送り) として保存される。
+  - 範囲画面は標本が `Err` なら判定せず `Stopped(PageAspect)` にする (worker と扱いが違う)。
+
+### 30.2 状態を減らす検討 (CLAUDE.md「設計の簡素化」)
+
+- **判定は今の thumbnail worker の 1 つの仕事の中で行う** (採用)。表紙を読んだ同じ heavy I/O の仕事で標本を読み、判定してから 1 回だけ送る。
+  「先に切らない画を出し、裏の別の仕事で判定して差し替える」2 段構えにしない。差し替えの見える切り替わり、判定待ちの中間状態、
+  その間の cancel・退避・別 context の扱いが要らない。UI スレッドは何もしない (バックログの「バックグラウンドで」はこの worker を指す)。
+  代償は、自動 ON で RAR の本を初めて表示するときにタイルが出るまでの時間が延びること (§30.7 で測る)。
+- **読み取り元 (Direct / CachedZip) を key に入れない** (採用)。同じ判定式・同じ表紙なので、どちらで作った素材も同じキーで正しい。
+  RAR を後から ZIP に変換しても作り直さない。標本の読み方 (RAR は丸ごと、ZIP は先頭 256 KiB) の違いは寸法に影響しない。
+- **部分読みを作らない** (バックログの方針)。初回の費用が大きいと分かった場合の後続案とする (unrar の展開を先頭で打ち切る等)。
+- **手動の範囲指定に新しい経路を作らない** (採用)。既存の経路が通るので、テストで固定し、文書を直すだけにする。
+- **キャンセル・読み取り失敗は「保存しない」で表す** (採用、§30.5)。失敗の記録・再試行の予定・回数の上限は持たない。
+  次に同じタイルを読むとき (退避後・次回起動) に自然に判定し直す。
+
+### 30.3 キー: RAR の本だけ自動の印を `v4r` にする
+
+- `AutoCropIdentity::suffix_for_key` で、フォルダでない代表キーのうち **`archivethumb:rar:` で始まるもの** (CBR も同じ綴り) だけ
+  `|autocrop:v4r:{rtl|ltr}` を付ける。置き場所 (最初の `#pin:` の直前、固定なしは末尾) と正規化は v4 と同じ。固定した RAR の本
+  (`archivethumb:rar:X|autocrop:v4r:rtl#pin:…`) も同じ。7z・LZH の書庫、ZIP、PDF、ZipDir は v4 のまま (作り直さない)。
+- 理由: v5.3.0 が直接読む RAR を v4 のキーで `NotAutomatic` として保存しているので、同じキーのままでは有効な行として当たり続け、判定されない。
+  RAR の本だけキーを変えれば、旧行は読まれず、既存の存続キー (`delete_missing`) で消える。素材の codec・catalog の schema は変えない (key-only、§29 の v4 と同じ型の更新)。
+- 費用: 自動 ON の利用者の RAR の本 (CachedZip も含む) のタイルを 1 回ずつ作り直す。ZIP・PDF などは作り直さない。
+- 正規化: `archivethumb:rar:` 以外のキーに付いた `v4r` は v4f と同じく既知の印として扱わず文字列のままにする。`archivethumb:rar:` の v4 は旧印として外す。
+  v4 の印を名前で探している箇所 (`representative_auto_crop_key_parts`、catalog の `decode_auto_material` の「現行キーの NULL・不正値は読み損ね」、
+  `cover_rotation_cache` の削除対象の判定、`rating_view`、評価器の `algorithm`) をすべて v4r にも対応させる。実装時に `autocrop:v4` を全数 grep する。
+- **K2 (フォルダの自動代表が子の本の行を流用) の互換読み取りは足さない**。v4r の子の行がまだ無い間は、子の本のタイルを一度表示して保存するまで
+  フォルダの代表が別の画像になるか無くなる。§29 で v3→v4 に上げたときに受け入れた制約と同じ。旧 v4 の RAR の行は直接読みでは切っていない画素だが、
+  変換済み (CachedZip) の行は本文の保存回転で古くなり得る (§29 が v3 を流用しない理由と同じ) ので、行の種類で分ける読み取りも作らない。
+  `legacy_auto_child_keys` (v1 互換) は v4 のキーだけが対象のままで、v4r には v1 互換を付けない。
+
+### 30.4 RAR の標本の読み方
+
+- **選び方を ZIP と共有する**: `(名前, 展開後の大きさ)` の一覧から、無視するファイル・prefix 外・入れ子・画像でないものを除き、`FileNameSortKey` で並べ、
+  leaf の位置から既存の `sample_indices` (最大 8 枚、leaf の次から。leaf が最後なら前) で選ぶ helper を 1 つ置く。ZIP の
+  `read_cover_auto_page_prefixes` もこの helper を使う (ZIP の挙動は変えない)。RAR の一覧の名前は重複変換後の名前で、leaf も
+  worker が読んだのと同じ名前で照合する。
+- **上限** (定数、§30.9 で利用者に確認):
+  - 1 枚: 展開後の大きさが 32 MiB を超える entry は読まず、その枠は「読めない」(既存の `None` の枠) にする。
+  - 合計: 選んだ順に展開後の大きさを足し、64 MiB を超える entry からは読まない (同じく `None` の枠)。読む集合は**展開する前に一覧の大きさだけで決める**ので、結果は毎回同じ。
+  - `None` の枠が多ければ既存の合議 (読めたページが 3 以上 等) で見送りになる。これは判定済みの見送りとして保存する。
+- **展開**: RAR を 1 回だけ開き、ヘッダ順に進めて選んだ名前だけを展開し、それ以外は読み飛ばす (非ソリッドなので読み飛ばしは展開しない)。
+  entry の前ごとに cancel を確かめる。名前の照合は `read_entry_bytes` と同じ重複変換。表紙 (leaf) は読み直さない。
+- 寸法は ZIP と同じ `probe_image_dims_from_bytes` (EXIF の向きを含む) で取り、本文の保存回転は viewer のページキー
+  `zip_entry_key(解決済みの RAR, entry 名)` で引く (§28.3 の rotation-aware sampler に RAR の読み方を足す)。以降の比率の合議・判定は変えない。
+- 置き場所: `cover_auto_sample` に RAR の sampler を足し、展開は `rar_loader` に「選んだ名前の集合を 1 回の走査で読む (cancel・合計の上限つき)」関数を置く。
+  `read_cover_auto_page_prefixes` と `sample_zip_pages_with_rotations` の先頭の「RAR なら空」は外し、worker の分岐 (`AutoCoverInput::Container`) で
+  RAR の sampler を呼ぶ。worker・範囲画面・評価器 (BOOK_LIST) が同じ sampler を使う。
+- `AutoCoverSkip::DirectRar` と範囲画面の文言「変換前の RAR は自動の対象外です」、評価器の `direct-rar` を削除する
+  (直接読む RAR は非ソリッド・入れ子なし・暗号化なししか無いので、ほかの停止理由は不要)。
+
+### 30.5 判定済みと中断を分ける (全形式)
+
+- 標本の読み取りと判定用のデコードの結果を、型で 3 つに分ける:
+  1. **判定した** (`Automatic(4 方向)`、全方向見送りを含む)。ページの画像が壊れている・寸法が取れない・大きさの上限で読まない枠は、
+     その本の中身の性質なので `None` の枠として判定に含める。
+  2. **判定しない** (`NotAutomatic`): 自動の対象でない (動画の leaf 等、今と同じ)。判定用のデコードが画像の中身の理由で失敗した場合も今と同じくここ。
+  3. **中断** (`Cancelled` / `ReadFailed`): cancel、書庫・PDF を開けない・読み取りの I/O エラー、PDF ワーカーの失敗。
+- 中断の扱い:
+  - `Cancelled`: worker の既存の cancel の扱いに乗せ、catalog に保存しない。
+  - `ReadFailed`: 切らない画 (`NotAutomatic`) を今回の表示用に送るが、**catalog には保存しない**。ログと perf event に理由を残す。
+    次にそのタイルを読むとき (退避後・次回起動) に判定し直す。再試行の予定や失敗の記録は持たない (まれな失敗の割り切り)。
+  - 保存しない経路は、既存の「保存しない」完了 (source pixels の後の Finalized 等の約束) を使い、新しい完了の形を作らない。実装担当が既存の経路を確かめる。
+- ZIP の `unwrap_or_default()` をやめ、I/O エラーを `ReadFailed` として返す (leaf が一覧に無いのは今と同じ `TooFew` の判定済み)。
+  PDF の `PageSizes` の失敗も `ReadFailed`。画像フォルダの標本も同じ型に揃える。
+- 範囲画面も同じ型を使う: 中断は「本文のページを読めませんでした」で止める (cancel は画面を閉じた場合だけなので表示しない)。判定した結果は worker と同じ。
+- 出荷済みの挙動の変化: ZIP・PDF でキャンセル・一時的な失敗のときに「切らない」が固定されなくなるだけで、通常の使い方が不便になる変化は無い。
+
+### 30.6 失効
+
+- RAR の更新: キーの stamp (元の RAR の mtime/size) が外れて作り直す (今と同じ)。キャッシュの消去でも作り直す。
+- 本文の保存回転 (§29): 直接読む RAR のページキーは `{解決済みの RAR}::entry`。§29 の失効が「外側書庫 = その RAR」として直接読む RAR の
+  v4r の Automatic 行を消すことを確かめ、足りなければ同じ仕組みに RAR を加える (新しい仕組みは作らない)。
+
+### 30.7 計測 (perf event)
+
+- `thumb/auto_cover_sample`: `format` (rar / zip / pdf / folder)、`selected` (選んだ枚数)、`read` (読めた枚数)、`skipped_limit` (上限で読まなかった枚数)、
+  `bytes` (展開した合計)、`list_ms`・`read_ms`、`outcome` (judged / cancelled / read_failed)。
+- 既存の `thumb/auto_cover_crop` の `reason` に `cancelled` / `read-failed` を足し、`sample_ms` を足す。
+- 初回は `auto_cover_sample` の ms と、同じ要求のタイルの生成時間で費用を見る。2 回目以降 (キャッシュ利用) は `auto_cover_sample` が出ないこと、
+  キャッシュ読みの時間が RAR 以外と同じことで見る。`scripts/analyze_perf.py` に集計が要るかは実装時に判断する。
+
+### 30.8 テスト
+
+- テスト用の RAR は合成データで作り、`testdata/archives/cover-auto-rar/` にコミットする (WinRAR の `Rar.exe` が要るので実行時には作らない)。
+  生成手順 (合成の画像は既存の Rust の合成表紙・本文の生成器を使う) を README と生成用のコード (`#[ignore]` のテストまたは script) に残す。
+  利用者の書庫・評価用の実データは使わない。
+  - 切れる本: つながったカバー (折り返し・表表紙・背・裏表紙) + 縦長の本文 8 枚。
+  - 見送る本: 表紙だけ / 本文が 2 枚しか無い。
+  - 重複名の entry を含む本、上限の境界 (テストでは上限を引数で小さくする)。
+- sampler: 選んだ集合が ZIP と同じ規則、1 回の走査、合計・1 枚の上限、cancel で `Cancelled`、開けない書庫で `ReadFailed`、本文の保存回転のキー。
+- worker: 自動 ON の直接読む RAR で `v4r` のキーに `Automatic` を保存し、2 回目はキャッシュから判定せずに読む (`auto_cover_sample` が呼ばれない)。
+  見送りも保存して 2 回目に読み直さない。cancel・読み取り失敗で保存しない。v5.3.0 の v4 の `NotAutomatic` 行があっても v4r で判定する。
+  CachedZip と Direct で同じキーの素材を共有する。ZIP の I/O 失敗・判定用デコードの cancel が保存されない (既存不具合の回帰)。
+- key: `archivethumb:rar:` だけ v4r、7z/ZIP/PDF は v4 の golden、固定あり・種類設定ありの綴り、正規化の往復、存続キー、`v4r` を名前で探す各所。
+- 範囲画面: 直接読む RAR で自動の判定結果が初期の枠に出る、手動の範囲を OK → 固定キーで切った画が出る、解除後に自動へ戻る旨の表示、中断の文言。
+- §29: 直接読む RAR の本文を回転すると v4r の Automatic 行が消える。
+
+### 30.9 利用者に確認すること (推奨案つき)
+
+- 上限の値: **推奨 1 枚 32 MiB・合計 64 MiB**。ふつうの漫画の 1 ページは 0.5〜5 MB 程度なので、ほとんどの本は 8 枚とも読む。大きな PNG の本で合計に当たると
+  読む枚数が減り、3 枚未満なら切らない (今の表示のまま)。
+- 初回の費用: 自動 ON で RAR の本を初めて表示するとき、本ごとに本文を最大 8 枚 (64 MiB まで) 展開するので、その本のタイルが出るまでの時間が延び、
+  同じ heavy I/O の列の後ろのタイルも遅れる。2 回目以降はキャッシュから出す。自動 OFF (既定) では何も変わらない。
+- 更新直後: 自動 ON の利用者は RAR の本のタイルを 1 回ずつ作り直す。その RAR の本を代表にしていたフォルダは、その本を一度表示するまで代表が変わるか
+  無くなる (§29 と同じ制約)。
+
+### 30.10 退けた案
+
+- **全形式の印を v5 に上げる**: ZIP・PDF の本まで全部作り直しになり、K2 の互換読み取りも要る。
+- **読むときに「RAR の v4 で NotAutomatic の行」を読み損ねにする**: 動画が leaf の RAR など正しい NotAutomatic の行まで毎回作り直す。
+- **素材の codec に新しい値を足して旧行と見分ける**: リリース済みの列の意味を変えるので、旧版との行き来の扱いが要る。
+- **表示を先に出して裏で判定し差し替える**: §30.2。
+- **失敗を記録して一定時間後に再試行**: まれな失敗の割り切りに反する。
