@@ -276,6 +276,10 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn book_bookmark_title_editing (self) -> bool",
     // 1.350 cache deletion invalidates shared source owners without mounting parked contexts.
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn invalidate_converted_archive_sources_in_parked_contexts (& mut self)",
+    // 1.767 (9044445e6): an independent media window exchanged for a still window
+    // rebinds only the mounted reader's own host after its session/output retired;
+    // asserts the old binding belongs to the mounted context and never touches siblings.
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn replace_mounted_detached_window_binding (& mut self , old : u64) -> u64",
     // 1.347 explicit cache maintenance resets only terminal audio art in living owners.
     "inherent fn    App ::  pub (crate) fn invalidate_audio_art_terminals_after_catalog_maintenance (& mut self , parent : Option < & Path > ,) -> usize",
     "inherent fn    App ::  pub (crate) fn invalidate_all_continuous_specified_fit_references (& mut self)",
