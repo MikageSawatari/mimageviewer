@@ -17914,6 +17914,8 @@ pub struct App {
     ///
     /// `None` の場合、wgpu を使う機能はすべて no-op になる。
     pub(crate) wgpu_render_state: Option<egui_wgpu::RenderState>,
+    pub(crate) scaler_pipeline_store:
+        Option<Arc<crate::scaler_pipeline_store::ScalerPipelineStore>>,
     /// 動画 GPU レンダリング用の共有 D3D11 デバイス。VideoPlayer ごとに生成すると
     /// FFmpeg HW デコーダ + ID3D11VideoProcessor を別デバイスに作る重複コストが
     /// 発生するため、App レベルで 1 つ確保して使い回す。`None` の場合は
@@ -21265,6 +21267,7 @@ impl App {
             applied_ui_theme: None,
             applied_text_contrast: None,
             wgpu_render_state: None,
+            scaler_pipeline_store: None,
             #[cfg(windows)]
             gpu_video_device: None,
             pdf_passwords,
@@ -102139,6 +102142,26 @@ impl eframe::App for App {
         self.reconcile_startup_visibility(ctx, frame);
         self.sync_startup_present_watch(ctx, false);
         self.poll_startup_owner(ctx);
+        if let (Some(store), Some(rs)) = (&self.scaler_pipeline_store, &self.wgpu_render_state) {
+            store.request_startup(
+                miv_startup::normal_presented(),
+                &rs.device,
+                std::iter::once(self.settings.global_preset.post_filter)
+                    .chain(
+                        self.settings
+                            .preset_slots
+                            .slots
+                            .iter()
+                            .flatten()
+                            .map(|slot| slot.params.post_filter),
+                    )
+                    .chain(
+                        self.adjustment_favorite_params
+                            .values()
+                            .map(|params| params.post_filter),
+                    ),
+            );
+        }
         egui_wgpu::set_root_startup_frame_tag(ctx, false);
         if first_update {
             miv_startup::milestone("core.first_update");

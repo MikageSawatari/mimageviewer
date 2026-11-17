@@ -1,5 +1,22 @@
 # 非同期・並列アーキテクチャ
 
+## 静止画 scaler の先行作成（§1.776 案 B-B）
+
+App 所有の device 単位 `ScalerPipelineStore` が、不変な NIS / Anime4K パイプラインを共有する。
+通常 UI の初回 present 後、root の1か所でメモリ上の preset・場所別標準を一度だけ判定する。
+対象の種類ごとに低優先度の `miv-scaler-prebuild-<kind>` を最大1本起動する。
+開始済みは種類ごとの Once、作成状態は `OnceLock<Option<Arc<…>>>` だけで表す。
+設定変更、個別ページ設定、timer は起動契機にしない。
+
+worker は device clone と store の Arc を保持し、renderer / App mutex は取得しない。
+Validation・Internal・OutOfMemory の scope を同じスレッドで push し、逆順ですべて pop 後に結果を集約する。
+失敗は None とログ、panic は未初期化のまま。どちらも背景 retry は行わない。
+終了時に join せず、作成中は device clone が寿命を保つ。
+全画面が先行作成中に来た場合だけ、利用者の指定どおり `get_or_init` で残りを待つ。
+未着手・失敗時は従来と同じ直接作成で context の単一 slot を埋める。
+出力 texture・uniform・bind group・cache entry は context 固有のまま、store は park / swap に含めない。
+詳細と終端表は [表示パイプライン §2.4.1](display-pipeline.md#241-フルスクリーン静止画の-gpu-lanczos3-縮小標準拡大と選択式拡大)。
+
 ## 一覧 catalog の控えと先頭ページの書き戻し（§1.800 S1）
 
 通常一覧は catalog を開いたときに `load_all` せず、空の `cache_map` で始める。

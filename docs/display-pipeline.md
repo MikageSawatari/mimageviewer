@@ -2321,7 +2321,7 @@ backstop/frozenの全typed paint入口が共通helperを使う。callback内で�
 perf log の
 `gpu/lanczos_regenerate` に source / target、smoothing percent / blur、推定 fetch 数、
 encode + submit CPU 時間、累積再生成回数、拡大 / 縮小の別を記録する。
-`resampler_created` / `resampler_create_ms` は resampler 本体の作成、`pipeline_created` / `pipeline_create_ms` は Lanczos3Resampler の4枝のうち今回初めて使う枝の shader・pipeline 作成を表す（Anime4K は従来どおり本体作成時間に内包）。後者を除いた資源準備の `prepare_job_ms` / `register_texture_ms` / `encode_ms`（encoder 作成・finish 含む）/ `submit_ms` と合わせて排他的な CPU 壁時計時間で、既存合計との差を `unaccounted_ms` に記録する。
+`resampler_created` / `resampler_create_ms` は resampler 本体の作成、`pipeline_created` / `pipeline_create_ms` は今回初めて使う枝の shader・pipeline 作成を表す（Anime4K は本体作成時間に内包）。案 B-B では NIS set の取得を pipeline_create_ms、Anime4K の共有取得を resampler_create_ms に含め、共有済みなら created フラグは立てない。ほかの3枝は Lanczos3Resampler 内に保持する。資源準備の `prepare_job_ms` / `register_texture_ms` / `encode_ms`（encoder 作成・finish 含む）/ `submit_ms` と合わせて排他的な CPU 壁時計時間で、既存合計との差を `unaccounted_ms` に記録する。
 本体または枝を作成した回だけ `resampler_create_breakdown` を出す。kind（lanczos3 / anime4k）、本体の `steps`、新規枝の `branch`（枝名と shader・pipeline の `steps`）を名前付きで載せ、作っていない項目は省略する。枝だけ初作成なら `resampler_created=false` でも内訳を出す。内訳は各作成時間の内数であり、driver 内部の原因や GPU 実行時間は未特定。Lanczos3 / NIS /
 Anime4K / pixel-AA は event 名を共用し、`scale_branch`
 (`upscale` / `upscale_nis` / `upscale_anime` / `upscale_pixel_art`)
@@ -2353,9 +2353,37 @@ reflection の HLSL entry 名を FXC と passthrough に使う。FXC は ENABLE_
 DEBUG 版は DEBUG / SKIP_OPTIMIZATION (`/Zi /Od`) を追加し、root と同じ
 `InstanceFlags::from_build_config().with_env()` で選ぶ。動画の `/O3` は流用しない。
 
-既存の枝ごとの作成・context 所有・prepare/encode・計装は維持する。新しい prewarm / worker 作成（案 B の別案）は
-今回採らず、初回 prepare で同期作成する。作成中・取消・supersession の状態を増やす必要がない。
-DXBC 化後にもドライバの PSO 作成は残り、初回停止がなくなるという意味ではない。
+DXBC 化後にもドライバの PSO 作成は残る。案 B-A 単独では初回 prepare で同期作成する。
+後続の案 B-B は、この同じ直接 builder を起動後の worker から先に呼ぶ。
+
+案 B-B の `ScalerPipelineStore` は App が device ごとに1つ所有し、NIS / Anime4K ごとの
+`OnceLock<Option<Arc<…>>>` に未着手・作成中・完成・失敗を集約する。各 context の
+`GpuLanczosCache` は種類ごとに1つの `Option<Arc<…>>` を保持し、初回 prepare で埋める。
+NIS は bgl・pipeline layout・pipeline の組 `NisPipelineSet` を共有し、その bgl から bind group を作る。
+prepare / encode は同じ Arc を使う。出力 texture・bind group・uniform・entry の所有は context のまま。
+store を context の park / swap に含めず、detached も同じ store を参照する。
+
+開始契機は root の初回 `normal_presented()` 後の1か所だけ。store の `Once` が、メモリ上の
+global preset・全 preset slot・`adjustment_favorite_params` の post_filter を一度だけ判定する。
+対象なしでも判定を消費し、後の設定変更・ページ個別補正による request はしない。
+種類ごとの起動用 `Once` が低優先度の `miv-scaler-prebuild-<kind>` を最大1本起動する。
+worker は device clone を持ち、renderer / App の lock を取らず、終了時にも join しない。
+
+| 取得時の状態 | 動作 |
+| --- | --- |
+| 完成 | store の Arc を context の slot に保持する |
+| 作成中 | `get_or_init` で残りを待つ。別の画質で先に描かない |
+| 未着手、worker panic 後 | その場で直接作成する |
+| 失敗 None | context で直接作成し、同じ slot に保持する。背景 retry はしない |
+| 異なる device | ログを出して context で直接作成する。元の store は変更しない |
+| 設定変更・context の破棄 | store の既存資源を保持する |
+
+共有 builder は Validation / Internal / OutOfMemory scope を push し、逆順ですべて pop してから
+エラーを集約する。エラーは None とログ1行にする。context の直接作成でも失敗すれば従来の
+uncaptured handler に進む。取消・再試行・デバイス復旧の仕組みは追加しない。
+作成中の全画面は利用者が決めた同期の待ちとなる。
+`gpu/scaler_prebuild` と既存作成計測の `pipeline_source` / `pipeline_wait_ms` で区別する。
+待ち時間は作成区間の内数であり、合計へ再加算しない。
 
 **wgpu 更新時の確認**: `naga_wgpu` の固定版を実行時 naga / wgpu-hal とそろえ、
 register / special constants / HLSL Options / entry linkage / FXC flags と、
@@ -2375,7 +2403,14 @@ NIS 初回127.709ms、Anime4K VL 初回663.719ms。最終ソースのDEBUG有無
 実行条件・生成物照合・検証コマンドは [B-A実装記録](section776ba-implementation.md) を参照する。
 製品releaseの表示フレーム時間は未計測である。
 
-Lanczos3 / Anime4K の resampler は cache 内の `Option<Box<...>>` で所有し、作成内訳や枝の保持領域を App にインラインで積まない。Box は各 resampler の初回作成区間内で一度だけ確保し、再利用フレームでは確保しない。
+Lanczos3 の resampler は cache 内の `Option<Box<...>>`、Anime4K と NIS は前述の `Option<Arc<...>>` で保持し、作成内訳や枝の保持領域を App にインラインで積まない。再利用フレームでは確保しない。
+
+案 B-B の常設 GPU テストは背景作成と直接作成の全画素一致、2 context の Arc 共有・片方の drop、
+失敗時の単一 slot、device 不一致を検査する（ignore なし、gpu group）。wgpu 更新時は B-A の binding / bytecode
+契約に加え、scope のスレッド所属・全 pop、共有 layout と prepare / encode の Arc 一致も確認する。
+ignored の `measure_776b_anime4k_ui_queue_overlap` は、製品と同じ DX12 + FXC + DXBC 条件で背景作成中に
+write_buffer / write_texture / submit / poll を実行し、時刻区間の重なりと API 待ちの中央値・最大を記録する。
+これは実アプリの present / フレーム時間の測定ではない。[B-B 実装記録](impl-776b-prebuild-result.md)。
 
 通常の `resolve → resolve_key → generate` と、既存 `execute_prewarm → execute_prewarm_with_policy`（Ordinary / NoRemoval）は `generate_with_source` に合流する。`query_prewarm`・cache hit・admission/claim 拒否では枝を作らず、clear/retain・context 退避/交換も既存の cache 所有を維持する。4 枝の prepare は作成済み pipeline ハンドルを非 optional な job フィールドへ保持し、encode は job だけを受け取る。したがって cache の `Option` / 未作成の枝を encode 時に調べる経路はなく、resampler がなくても job のハンドルで encode できる。製品（release）での効果は未計測。
 

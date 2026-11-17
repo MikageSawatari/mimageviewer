@@ -304,6 +304,7 @@ fn page_turn_actual_native_roi_roundoff_starts_and_completes_ltr_rtl_forward_bac
                 .unwrap();
             let (resource, _) = app.fs_lanczos_cache.resolve(
                 Some(&gpu),
+                None,
                 &normal,
                 page.transform.total_scale,
                 1.5,

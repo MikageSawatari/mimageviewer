@@ -1,5 +1,21 @@
 # UI スレッドの応答性 (Ctrl+↑↓ 連打が引っかからないために)
 
+## 静止画 scaler の先行作成と待ちの計装（§1.776 案 B-B）
+
+初回通常 present 後に、設定済みの NIS / Anime4K を低優先度 worker で作る。
+`gpu/scaler_prebuild` は `phase=begin/end`、`scaler_kind=nis/anime4k`、`trigger=startup`、
+`ms`、終了時の `result=ready/failed/already` を記録する。JSONL の `kind` は event 名の予約欄なので、
+種類には `scaler_kind` を使う。
+初回 context 取得時の既存 `lanczos_regenerate` / `final_prepare_native_submitted` は
+`pipeline_source=prebuilt/waited/inline` と `pipeline_wait_ms` を持つ。
+Anime4K の取得は `resampler_create_ms`、NIS は `pipeline_create_ms` に含み、待ち時間を合計へ二重加算しない。
+共有済みの取得では過去の作成内訳を今回の作成として転載しない。
+
+作成中に全画面が来た場合は残りを同期的に待つ（利用者が指定した動作）。
+通常の queue 操作との競合は ignored GPU 計測 `measure_776b_anime4k_ui_queue_overlap` で調べる。
+背景作成と実 API 呼出しの時刻区間を照合し、終了をまたぐ呼出しも最大値から除外しない。
+計測結果と限界は [B-B 実装記録](impl-776b-prebuild-result.md)。
+
 ## 全画面の帰路から走査開始までの待ちの計装（§1.801）
 
 `nav/close_nav_stage` はmainのclose帰路消費・即時applyに限り、型付きの小区間と早期returnの理由を記録する。

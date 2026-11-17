@@ -193,6 +193,7 @@ pub mod metadata_transfer;
 mod page_turn_animation;
 #[cfg(windows)]
 pub(crate) mod presentation_observer;
+mod scaler_pipeline_store;
 pub(crate) mod spread_shift;
 mod startup_window_geometry;
 #[cfg(windows)]
@@ -2207,6 +2208,9 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
                         }
                     }
                 }
+                app.scaler_pipeline_store = Some(Arc::new(
+                    scaler_pipeline_store::ScalerPipelineStore::new(&rs.device),
+                ));
                 app.wgpu_render_state = Some(rs);
             }
             // お気に入り単位の補正標準を DB から復元 (+ 削除されたお気に入りの orphan 行を掃除)。

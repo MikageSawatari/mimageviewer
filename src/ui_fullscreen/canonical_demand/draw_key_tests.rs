@@ -116,6 +116,7 @@ fn prewarm(app: &mut App, ctx: &egui::Context, page: &CanonicalPageDemand) -> La
     assert!(matches!(
         app.fs_lanczos_cache.execute_prewarm(
             app.wgpu_render_state.as_ref().unwrap(),
+            None,
             &resource,
             plan,
             |_| true,

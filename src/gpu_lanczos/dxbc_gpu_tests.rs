@@ -3,6 +3,9 @@
 //! No adapter/device skip: a Windows GPU gate without DX12 is a failed gate.
 use super::*;
 
+#[path = "prebuild_gpu_tests.rs"]
+mod prebuild;
+
 #[test]
 fn still_nis_dxbc_matches_wgsl_pixels() {
     compare(false);
@@ -55,7 +58,7 @@ fn compare(anime: bool) {
         }))
         .expect("DX12 device required for static-image parity");
         let input = fixture(&device, &queue);
-        let nis = (!anime).then(|| Lanczos3Resampler::new(&device));
+        let nis = (!anime).then(|| Arc::new(NisPipelineSet::new(&device)));
         let vl = anime.then(|| Anime4kResampler::new(&device, STILL_IMAGE_ANIME4K_VARIANT));
         let mut results = Vec::new();
         // Integer/noninteger scales, clamped edges, fractional ROI phase.
@@ -80,7 +83,7 @@ fn compare(anime: bool) {
                 let job = nis
                     .as_ref()
                     .unwrap()
-                    .prepare_nis_upscale_job(&device, &input, plan, &mut Default::default())
+                    .prepare_job(&device, &input, plan, &mut Default::default())
                     .unwrap();
                 job.encode(&mut encoder);
                 job.output_texture
@@ -161,12 +164,10 @@ fn measure(anime: bool) {
             "steps":resampler.creation_timings.perf_value()});
         (Some(resampler), details)
     } else {
-        let resampler = Lanczos3Resampler::new(&device);
-        let mut timings = LanczosGenerationTimings::default();
-        let _pipeline = resampler.nis_pipelines(&device, &mut timings);
+        let resampler = NisPipelineSet::new(&device);
         let ms = started.elapsed().as_secs_f64() * 1000.0;
         let details = serde_json::json!({"family":"nis", "first_create_ms":ms,
-            "steps":timings.creation_breakdown()});
+            "steps":resampler.creation_timings});
         (None, details)
     };
     println!("MEASURE776_PRODUCT_FLAGS {flags:?}");
