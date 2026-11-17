@@ -1363,8 +1363,9 @@ keyframe が疎すぎる material unavailable も同じ UI surface と入力 gat
 
 #### `mod.rs` (`VideoPlayer`)
 - 公開 API (`open` / `tick` / `seek` / `set_volume` / `set_loop_enabled` / `shutdown`)
-- 再生するseek APIは必須の `SeekOrigin::User` / `Internal(InternalContinuation)` を受ける。
-  UserはEOF／再生意図なしの受付時、DSP取得より前にUserPlayを登録し、actorの既存start判定を使う。
+- seek APIは必須の `SeekPlayback` と `SeekOrigin::User` / `Internal(InternalContinuation)` を受ける。
+  再生を要求するUser seekだけがEOF／再生意図なしの受付時、DSP取得より前にUserPlayを登録し、
+  actorの既存start判定を使う。位置変更・明示再生・EOFの分類は下の§1.791を参照。
   内部Pauseでは非EOFのSuccessReady／Establishedを保持し、ユーザーPauseによるNoneへの破棄と区別する。
   Loop・音声トラック・DSP・cached openの内部seekはstartを増やさず、seekによる再生強制は従来どおり。
   Now Playingの最終EOFはAppの再生方針／連続navigationの結果確定が判断する。
@@ -2345,6 +2346,48 @@ egui内部の平滑化残量を別実装したり、全ての残量を元panel�
 headless回帰はproductionと同じdriver / wheel planner、実eguiのstrip handler / ScrollAreaで検査する。
 fixtureの制御時計は単調に進めるが、実GPU出力・USER32配送や実処理時間を検証したことにはしない。
 検証の完了範囲は [v3.7.0 作業台帳](v3.7.0-priority-work.md) を参照。
+
+#### シークの再生意図（§1.791）
+
+`seek` / `seek_relative` / strip 確定用 `seek_immediate` は必須の
+`SeekPlayback::PreserveIntent` / `StartPlayback` と `SeekOrigin` を受ける。
+位置変更は操作時点の意図を引き継ぎ、一時停止中は移動先のフレームを表示して停止を維持する。
+再生中は再生を続ける。例外は engine の published `is_at_eof()` 後で、従来どおり再生を始める。
+demux の先読み EOF はこの例外ではない。
+
+| 呼び出し元 | 指定 |
+| --- | --- |
+| 通常シークバーのクリック・スクラブ | PreserveIntent（coalesce あり） |
+| サムネイル／波形シークストリップの確定 | PreserveIntent（即時 precise seek） |
+| 左右キー・リング・タッチ・ゲームパッドの相対シーク | PreserveIntent |
+| J/K・HUD・ゲームパッドのマーカー前後ジャンプ、前が無いときの先頭 | PreserveIntent |
+| 音楽ビューのバー・timeline・ブックマーク・相対シーク・マーカー移動 | PreserveIntent |
+| HUD「最初から再生」、W、音楽ビューの頭出し | StartPlayback |
+| タイル「この場面から再生」、ブックマークを指定して開く | StartPlayback |
+| 内部 loop / navigation の従来再生 seek | StartPlayback + Internal |
+
+EOF の Space replay、configuration / DSP の `seek_with_play_state`、Remote の
+`seek_for_remote_streaming` は既存の専用経路を維持する。
+停止を維持する seek は UserPlay を予約せず、DSP 取得を始めず、音声バッファと frame-step 目標を
+クリアする。engine へ seek → Pause の順に渡し、途中にも Play を作らない。
+
+coalesce の pending は位置だけを所有し、後から発行するときの再生／停止は engine の意図を読む。
+明示再生や EOF replay が新たな再生意図を要求した場合は即時発行して engine に確立する。
+Space 再生は pending を維持し、Space 停止は既存の clear 経路で pending を取り消す。
+DSP 取得が必要な Space 再生では、新規 handoff 開始時に最新 pending 位置を take して既存の
+`LocalDspPosition::Exact` へ移譲する。取得中の内部 Pause を利用者の停止とは解釈せず、同じ
+handoff owner の要求を参照する。pending に別の再生 bool は足さない。
+相対シークは従来どおり新規 DSP 取得を始めず、既存 handoff がある場合だけその要求位置を更新する。
+ほかの local player に DSP の札を渡して素通し再生している context から、相対移動で札を取り返さない。
+取得中に Space／明示 Pause で取り消すときも、選択済み Exact 位置を停止 seek へ引き継ぐ。
+未取得 metadata に依存する CurrentAfterMetadata は保存位置の解決を維持し、0 の seek で上書きしない。
+相対シークの基準は pending → DSP 要求位置 → 未表示の発行済み target → 時計位置の順。
+`configuration_seek_base_secs` の表示前 target の保持と `last_issued` の記録も共用する。
+
+モーダル化は通常のスクラブや Space 操作を制限するため採用せず、既存 engine / handoff の
+所有へ集約して状態の組み合わせを減らす。まれな失敗は既定のログ＋通知で割り切る。
+本体窓と F12 別窓は、mount 中の context の `poll_video` → native event handler と同じ
+VideoPlayer API を通る。detached 固有の述語・viewport 経路は変更しない。
 
 #### シーク操作の終端と論理pass（§1.192）
 

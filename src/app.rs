@@ -54560,7 +54560,11 @@ impl App {
             player.path().display(),
             self.viewer_presentation
         ));
-        player.seek(target, crate::video::SeekOrigin::User);
+        player.seek(
+            target,
+            crate::video::SeekPlayback::StartPlayback,
+            crate::video::SeekOrigin::User,
+        );
         crate::logger::log(format!(
             "[bookmark-open] seek issued path={} after={:.3} serial_after={}",
             player.path().display(),
@@ -72576,6 +72580,7 @@ impl App {
                         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
                             player.seek(
                                 0.0,
+                                crate::video::SeekPlayback::StartPlayback,
                                 crate::video::SeekOrigin::Internal(
                                     crate::video::InternalContinuation::Transport,
                                 ),
@@ -99540,6 +99545,7 @@ impl App {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.seek(
                     0.0,
+                    crate::video::SeekPlayback::StartPlayback,
                     crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
                 );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
@@ -99688,6 +99694,7 @@ impl App {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.seek(
                     0.0,
+                    crate::video::SeekPlayback::StartPlayback,
                     crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
                 );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
@@ -99718,6 +99725,7 @@ impl App {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.seek(
                     0.0,
+                    crate::video::SeekPlayback::StartPlayback,
                     crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
                 );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
@@ -99840,6 +99848,7 @@ impl App {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.seek(
                         seek_to,
+                        crate::video::SeekPlayback::StartPlayback,
                         crate::video::SeekOrigin::Internal(
                             crate::video::InternalContinuation::Loop,
                         ),
@@ -99991,6 +100000,7 @@ impl App {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.seek(
                     0.0,
+                    crate::video::SeekPlayback::StartPlayback,
                     crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
                 );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
@@ -100087,6 +100097,7 @@ impl App {
                 if target_is_video && ignore_resume {
                     player.seek(
                         0.0,
+                        crate::video::SeekPlayback::StartPlayback,
                         crate::video::SeekOrigin::Internal(
                             crate::video::InternalContinuation::Transport,
                         ),
@@ -104917,7 +104928,11 @@ mod now_playing_lifecycle_tests {
                             player(&app).mark_eof_for_test(30.0);
                         }
                         "seek" => {
-                            player(&app).seek(0.0, crate::video::SeekOrigin::User);
+                            player(&app).seek(
+                                0.0,
+                                crate::video::SeekPlayback::PreserveIntent,
+                                crate::video::SeekOrigin::User,
+                            );
                         }
                         "missing" => {
                             app.media_navigation_resolver = None;

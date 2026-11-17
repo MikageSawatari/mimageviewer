@@ -1082,7 +1082,11 @@ impl App {
     /// を再計算するため `apply_music_loop_mode` を必ず通す (旧区間の target 残留を防ぐ、Codex P2)。
     pub(crate) fn music_seek_to(&mut self, fs_idx: usize, secs: f64) {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.seek(secs.max(0.0), crate::video::SeekOrigin::User);
+            player.seek(
+                secs.max(0.0),
+                crate::video::SeekPlayback::PreserveIntent,
+                crate::video::SeekOrigin::User,
+            );
         }
         self.apply_music_loop_mode(fs_idx);
     }
@@ -1091,9 +1095,10 @@ impl App {
     /// 動画 `seek_relative` の音声版。seek 後のループ target 再計算のため `music_seek_to` に集約する。
     pub(crate) fn music_seek_relative(&mut self, fs_idx: usize, delta_secs: f64) {
         let (pos, dur) = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => {
-                (player.position().max(0.0), player.duration().max(0.0))
-            }
+            Some(FsCacheEntry::Video { player, .. }) => (
+                player.user_seek_base_secs().max(0.0),
+                player.duration().max(0.0),
+            ),
             _ => return,
         };
         let target = if dur > 0.0 {
@@ -1105,10 +1110,17 @@ impl App {
     }
 
     /// 頭出し (先頭 0.0 へ seek + 即再生)。下 HUD の 頭出しボタンと W キー (VideoSeekStart) の
-    /// 共通実体。ユーザー seek 自体が再生開始を要求する。先に内部 Play を送ると
+    /// 共通実体。明示的な再生開始として seek する。先に内部 Play を送ると
     /// EOF が Seeking へ進んでしまい、UserPlay の登録境界を失うため送らない。
     pub(crate) fn music_seek_start(&mut self, fs_idx: usize) {
-        self.music_seek_to(fs_idx, 0.0);
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.seek(
+                0.0,
+                crate::video::SeekPlayback::StartPlayback,
+                crate::video::SeekOrigin::User,
+            );
+        }
+        self.apply_music_loop_mode(fs_idx);
     }
 
     /// 音楽ビューの下 HUD の前/次ファイルボタンの実体。動画 HUD の ↑↓ ボタン

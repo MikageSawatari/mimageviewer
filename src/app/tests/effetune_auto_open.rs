@@ -88,7 +88,11 @@ fn effetune_auto_open_same_source_eof_loop_does_not_reconsider_armed_session() {
         panic!()
     };
     player.mark_eof_for_test(30.0);
-    player.seek(0.0, crate::video::SeekOrigin::User);
+    player.seek(
+        0.0,
+        crate::video::SeekPlayback::PreserveIntent,
+        crate::video::SeekOrigin::User,
+    );
     player.complete_seek_for_test(0.0);
     app.poll_video(&egui::Context::default());
     assert!(requested(&app));

@@ -353,6 +353,11 @@ impl EngineActor {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_awaiting_playback_start_for_test(&self) -> bool {
+        matches!(self.playback_start, PlaybackStart::AwaitingSuccess { .. })
+    }
+
     pub fn playback_success_is_current(&self, id: u64) -> bool {
         matches!(self.playback_start, PlaybackStart::Established { id: current, .. } if current == id)
     }

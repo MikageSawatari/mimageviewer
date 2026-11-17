@@ -355,17 +355,21 @@ fn player_for_info(info: &VideoInfo, position: f64) -> crate::video::VideoPlayer
 #[test]
 fn timeline_origin_player_seek_relative_and_engine_eof_use_media_duration() {
     use crate::video::engine::state::DecoderEvent;
-    use crate::video::{RelativeSeekOutcome, SeekOrigin};
+    use crate::video::{RelativeSeekOutcome, SeekOrigin, SeekPlayback};
     let session = start("large-origin.ts", None);
     let duration = session.info.duration_secs;
     let player = player_for_info(&session.info, 0.0);
-    player.seek(duration - 1.0, SeekOrigin::User);
+    player.seek(
+        duration - 1.0,
+        SeekPlayback::PreserveIntent,
+        SeekOrigin::User,
+    );
     assert!(
         (player.clock.take_seek_request().unwrap().target_secs - (duration - 1.0)).abs() < 0.001
     );
     let player = player_for_info(&session.info, duration - 2.0);
     assert_eq!(
-        player.seek_relative(0.5, SeekOrigin::User),
+        player.seek_relative(0.5, SeekPlayback::PreserveIntent, SeekOrigin::User),
         RelativeSeekOutcome::Seeked
     );
     assert!(
