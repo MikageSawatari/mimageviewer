@@ -2078,11 +2078,32 @@ impl App {
     }
 
     pub(crate) fn has_detached_collection_navigation_origin(&self) -> bool {
+        // Keep Ctrl+up/down's existing return-origin semantics. A temporary list can
+        // also retain this return destination; sibling input uses the owner below.
         self.top_level_grid_view.collection_session().is_none()
             && matches!(
                 self.top_level_grid_view.return_to(),
                 Some(TopLevelGridRestore::Collection(_))
             )
+    }
+
+    pub(crate) fn collection_sibling_navigation_origin_available(&self) -> bool {
+        match self.top_level_grid_view.surface() {
+            TopLevelGridSurface::Collection(_) => {
+                self.top_level_grid_view.collection_session().is_some()
+            }
+            TopLevelGridSurface::Folder => {
+                self.navigation_scope == super::ViewerNavigationScope::DetachedPhysical
+                    && self.has_detached_collection_navigation_origin()
+            }
+            // Snapshot/Search return_to is a restoration destination, not this list's owner.
+            _ => false,
+        }
+    }
+
+    pub(crate) fn independent_collection_sibling_navigation_available(&self) -> bool {
+        self.projected_viewer_context_id() != self.viewer_context_main()
+            && self.collection_sibling_navigation_origin_available()
     }
 
     pub(crate) fn start_list_origin_fullscreen_navigation(
@@ -2093,13 +2114,15 @@ impl App {
         native_toast: bool,
         sibling: bool,
     ) -> bool {
-        if self.start_collection_outer_fullscreen_navigation(
-            ctx,
-            fs_idx,
-            forward,
-            false,
-            native_toast,
-        ) {
+        if (!sibling || self.collection_sibling_navigation_origin_available())
+            && self.start_collection_outer_fullscreen_navigation(
+                ctx,
+                fs_idx,
+                forward,
+                false,
+                native_toast,
+            )
+        {
             return true;
         }
         if self.top_level_grid_view.smart_folder().is_some()
@@ -2114,8 +2137,10 @@ impl App {
     /// An unresolved origin-order request already owns its destination sequence. Admit
     /// compatible presses before the generic sequence gate, without routing a new target.
     pub(crate) fn list_origin_fullscreen_navigation_can_accumulate(&self, sibling: bool) -> bool {
-        self.top_level_grid_view
-            .collection_outer_navigation_available(true)
+        ((!sibling || self.collection_sibling_navigation_origin_available())
+            && self
+                .top_level_grid_view
+                .collection_outer_navigation_available(true))
             || ((!sibling || self.smart_folder_book_navigation_available())
                 && (self.staged_smart_fullscreen_ctrl_step_available()
                     || matches!(
@@ -2129,9 +2154,10 @@ impl App {
         forward: bool,
         sibling: bool,
     ) -> bool {
-        if self
-            .top_level_grid_view
-            .accumulate_collection_outer_navigation(true, forward)
+        if (!sibling || self.collection_sibling_navigation_origin_available())
+            && self
+                .top_level_grid_view
+                .accumulate_collection_outer_navigation(true, forward)
         {
             return true;
         }

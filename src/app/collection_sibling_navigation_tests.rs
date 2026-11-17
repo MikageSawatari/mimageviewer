@@ -12,14 +12,36 @@ fn fixture(
     AppTestEnvForTest,
     Arc<CollectionPreparedSnapshot>,
 ) {
+    fixture_with_next_kind(kind, CollectionResolvedKind::Folder)
+}
+
+fn fixture_with_next_kind(
+    kind: CollectionResolvedKind,
+    next_kind: CollectionResolvedKind,
+) -> (
+    tempfile::TempDir,
+    AppTestEnvForTest,
+    Arc<CollectionPreparedSnapshot>,
+) {
     let temp = tempfile::tempdir().unwrap();
     let before = temp.path().join("z-before");
-    let after = temp.path().join("a-after");
-    for folder in [&before, &after] {
+    let after = temp
+        .path()
+        .join(if next_kind == CollectionResolvedKind::Image {
+            "a-after.png"
+        } else {
+            "a-after"
+        });
+    for folder in std::iter::once(&before)
+        .chain((next_kind == CollectionResolvedKind::Folder).then_some(&after))
+    {
         std::fs::create_dir_all(folder).unwrap();
         image::RgbImage::new(2, 2)
             .save(folder.join("page.png"))
             .unwrap();
+    }
+    if next_kind == CollectionResolvedKind::Image {
+        image::RgbImage::new(2, 2).save(&after).unwrap();
     }
     let source = temp.path().join(match kind {
         CollectionResolvedKind::Zip => "middle.zip",
@@ -65,8 +87,7 @@ fn fixture(
                     )
                     .unwrap(),
                     crate::collection_store::CollectionRegistration::from_trusted_path(
-                        &after,
-                        CollectionResolvedKind::Folder,
+                        &after, next_kind,
                     )
                     .unwrap(),
                 ],
@@ -211,6 +232,148 @@ fn section1763_collection_root_image_sibling_uses_outer_order() {
         Some(&prepared.entries[2].source_path)
     );
     app.shutdown_collection_runtime_for_exit();
+}
+
+#[test]
+fn section1763_collection_snapshot_siblings_keep_playable_traversal_and_overview() {
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    let (_temp, mut app, prepared) =
+        fixture_with_next_kind(CollectionResolvedKind::Image, CollectionResolvedKind::Image);
+    app.navigation_scope = ViewerNavigationScope::Main;
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+    app.finish_page_identity_preparation_for_test();
+    assert!(matches!(
+        app.top_level_grid_view.surface(),
+        TopLevelGridSurface::Snapshot
+    ));
+    assert!(app.top_level_grid_view.collection_session().is_none());
+    assert!(matches!(
+        app.top_level_grid_view.return_to(),
+        Some(TopLevelGridRestore::Collection(_))
+    ));
+    assert!(app.has_detached_collection_navigation_origin()); // Legacy Ctrl predicate also matches.
+    assert!(!app.collection_sibling_navigation_origin_available());
+    app.fullscreen_idx = Some(1);
+    let ctx = egui::Context::default();
+    for (forward, expected) in [(true, 2), (false, 1)] {
+        let action = if forward {
+            crate::keymap::KeyAction::FsSiblingNext
+        } else {
+            crate::keymap::KeyAction::FsSiblingPrev
+        };
+        assert!(app.page_overview_executable_actions().contains(&action));
+        let idx = app.fullscreen_idx.unwrap();
+        app.handle_fullscreen_sibling_nav_context(&ctx, idx, forward, false);
+        assert_eq!(app.fullscreen_idx, Some(expected));
+        assert_eq!(
+            app.items[expected],
+            GridItem::Image(prepared.entries[expected].source_path.clone())
+        );
+        assert!(!app.top_level_grid_view.collection_navigation_pending());
+        assert!(app.folder_nav_pending.is_none());
+    }
+    app.shutdown_collection_runtime_for_exit();
+}
+
+#[test]
+fn section1763_collection_search_and_local_filter_siblings_keep_noop_and_overview() {
+    use crate::ui_fullscreen::{FsBoundaryHint, FsNavNoOpReason};
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    for search in ["global", "favorite", "local"] {
+        let (_temp, mut app, _) = fixture(CollectionResolvedKind::Image);
+        // Main's local filter retains the Collection surface/session. Unlike an
+        // independent root-media viewer, it must reach the existing filter refusal.
+        app.navigation_scope = ViewerNavigationScope::Main;
+        match search {
+            "global" => app.open_global_search(),
+            "favorite" => app.open_favsearch(),
+            _ => app.open_local_metadata_search(),
+        }
+        app.finish_page_identity_preparation_for_test();
+        if search == "local" {
+            assert!(matches!(
+                app.top_level_grid_view.surface(),
+                TopLevelGridSurface::Collection(_)
+            ));
+            assert!(app.top_level_grid_view.collection_session().is_some());
+        } else {
+            assert!(matches!(
+                app.top_level_grid_view.surface(),
+                TopLevelGridSurface::Search(_)
+            ));
+            assert!(app.top_level_grid_view.collection_session().is_none());
+            assert!(matches!(
+                app.top_level_grid_view.return_to(),
+                Some(TopLevelGridRestore::Collection(_))
+            ));
+            assert!(!app.collection_sibling_navigation_origin_available());
+        }
+        app.fullscreen_idx = Some(1);
+        let ctx = egui::Context::default();
+        for forward in [true, false] {
+            let action = if forward {
+                crate::keymap::KeyAction::FsSiblingNext
+            } else {
+                crate::keymap::KeyAction::FsSiblingPrev
+            };
+            assert!(
+                !app.page_overview_executable_actions().contains(&action),
+                "{search}"
+            );
+            app.handle_fullscreen_sibling_nav_context(&ctx, 1, forward, false);
+            let expected = if search == "local" {
+                FsNavNoOpReason::LocalFilterActive
+            } else {
+                FsNavNoOpReason::SearchSiblingUnsupported
+            };
+            assert!(
+                matches!(app.fs_boundary_hint, Some(FsBoundaryHint::NavNoOp { reason, .. }) if reason == expected),
+                "{search}"
+            );
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert!(!app.top_level_grid_view.collection_navigation_pending());
+            assert!(app.folder_nav_pending.is_none());
+        }
+        app.shutdown_collection_runtime_for_exit();
+    }
+}
+
+#[test]
+fn section1763_temporary_collection_return_keeps_legacy_ctrl_navigation() {
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    for search in ["snapshot", "global", "favorite"] {
+        let (_temp, mut app, _) = fixture(CollectionResolvedKind::Image);
+        app.navigation_scope = ViewerNavigationScope::Main;
+        match search {
+            "snapshot" => app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed),
+            "global" => app.open_global_search(),
+            _ => app.open_favsearch(),
+        }
+        app.finish_page_identity_preparation_for_test();
+        app.fullscreen_idx = Some(1);
+        assert!(
+            app.page_overview_executable_actions()
+                .contains(&crate::keymap::KeyAction::FsCtrlNavNext)
+        );
+        app.handle_fullscreen_ctrl_nav_context(&egui::Context::default(), 1, true, false);
+        assert!(matches!(
+            pending_action(&mut app),
+            CollectionNavigationAction::OuterFullscreen { forward: true, .. }
+        ));
+        assert!(
+            !app.page_overview_executable_actions()
+                .contains(&crate::keymap::KeyAction::FsSiblingNext)
+        );
+        app.handle_fullscreen_sibling_nav_context(&egui::Context::default(), 1, true, false);
+        assert!(matches!(
+            pending_action(&mut app),
+            CollectionNavigationAction::OuterFullscreen {
+                queued_steps: 0,
+                ..
+            }
+        ));
+        app.shutdown_collection_runtime_for_exit();
+    }
 }
 
 #[test]
@@ -544,6 +707,49 @@ fn section1763_physical_tag_and_reading_history_keep_sibling_routes() {
 
 #[test]
 #[cfg(windows)]
+fn section1763_independent_collection_root_sibling_ignores_main_filters() {
+    let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+    let (_temp, mut app, prepared) = fixture(CollectionResolvedKind::Image);
+    app.navigation_scope = ViewerNavigationScope::Main;
+    app.show_search_bar = true;
+    app.favsearch.active = true;
+    let main_items = app.items.clone();
+    let active = app.build_active_context_for_test(Some(97633), DetachedSource::Book, |owner| {
+        owner.navigation_scope = ViewerNavigationScope::CollectionRoot;
+        owner.viewer_presentation = ViewerPresentation::DetachedWindow;
+        owner.detached_viewer_independent_active = true;
+        owner.top_level_grid_view.begin(
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: prepared.collection_id,
+            }),
+            None,
+        );
+        owner.apply_collection_grid_prepared(Arc::clone(&prepared), None);
+        owner.fullscreen_idx = Some(1);
+    });
+    let ctx = egui::Context::default();
+    app.with_viewer_context(active, |owner| {
+        assert!(
+            owner
+                .page_overview_executable_actions()
+                .contains(&crate::keymap::KeyAction::FsSiblingNext)
+        );
+        owner.handle_fullscreen_sibling_nav_context(&ctx, 1, true, false);
+        pending_action(owner);
+        drain(owner, &ctx);
+        assert_eq!(
+            owner.effective_folder().as_ref(),
+            Some(&prepared.entries[2].source_path)
+        );
+    })
+    .unwrap();
+    assert_eq!(app.items, main_items);
+    assert!(!app.top_level_grid_view.collection_navigation_pending());
+    app.shutdown_collection_runtime_for_exit();
+}
+
+#[test]
+#[cfg(windows)]
 fn section1763_detached_collection_sibling_only_mutates_its_owner() {
     let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
     let (_temp, mut app, prepared) = fixture(CollectionResolvedKind::Folder);
@@ -570,6 +776,9 @@ fn section1763_detached_collection_sibling_only_mutates_its_owner() {
         app.folder_nav_pending.is_some(),
         app.top_level_grid_view.collection_navigation_pending(),
     );
+    // These filters belong to main, not to the independent collection book.
+    app.show_search_bar = true;
+    app.favsearch.active = true;
     let entry = &prepared.entries[1];
     let active = app.build_active_context_for_test(Some(97632), DetachedSource::Book, |owner| {
         owner.navigation_scope = ViewerNavigationScope::DetachedPhysical;
@@ -599,6 +808,11 @@ fn section1763_detached_collection_sibling_only_mutates_its_owner() {
         owner.fullscreen_idx = Some(0);
     });
     app.with_viewer_context(active, |owner| {
+        assert!(
+            owner
+                .page_overview_executable_actions()
+                .contains(&crate::keymap::KeyAction::FsSiblingNext)
+        );
         owner.handle_fullscreen_sibling_nav_context(&ctx, 0, true, false);
         assert!(matches!(
             pending_action(owner),

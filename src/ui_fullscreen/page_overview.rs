@@ -520,13 +520,19 @@ impl App {
             return false;
         }
         if self.fs_nav_is_locked() {
-            return self
-                .top_level_grid_view
-                .collection_outer_navigation_available(true)
+            return ((!sibling || self.collection_sibling_navigation_origin_available())
+                && self
+                    .top_level_grid_view
+                    .collection_outer_navigation_available(true))
                 || self.locked_fullscreen_folder_nav_request(sibling).is_some();
         }
-        let collection_available = self.collection_outer_fullscreen_navigation_available(idx);
-        let detached_collection_origin = self.has_detached_collection_navigation_origin();
+        let collection_available = self.collection_outer_fullscreen_navigation_available(idx)
+            && (!sibling || self.collection_sibling_navigation_origin_available());
+        let detached_collection_origin = if sibling {
+            self.independent_collection_sibling_navigation_available()
+        } else {
+            self.has_detached_collection_navigation_origin()
+        };
         if collection_available && detached_collection_origin {
             return true;
         }
@@ -535,7 +541,8 @@ impl App {
             if self.detached_physical_folder_nav_available() {
                 return self.effective_folder().is_some();
             }
-            if collection_available
+            if !sibling
+                && collection_available
                 && matches!(
                     self.navigation_scope,
                     crate::app::ViewerNavigationScope::CollectionRoot

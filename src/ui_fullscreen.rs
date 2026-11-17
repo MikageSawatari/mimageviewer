@@ -43630,9 +43630,9 @@ impl App {
         self.slideshow_anchor_idx = None;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
-        // Collection origin takes priority over independent physical navigation, exactly
-        // as for Ctrl+up/down. Sibling input deliberately skips ZIP-internal DFS.
-        if self.has_detached_collection_navigation_origin()
+        // Only an independent collection owner precedes physical viewer routing and
+        // App-shared main-list filters. Main keeps its snapshot/search/filter priority.
+        if self.independent_collection_sibling_navigation_available()
             && self.start_list_origin_fullscreen_navigation(
                 ctx,
                 fs_idx,
@@ -43641,19 +43641,6 @@ impl App {
                 true,
             )
         {
-            return;
-        }
-        #[cfg(windows)]
-        if matches!(
-            self.navigation_scope,
-            crate::app::ViewerNavigationScope::CollectionRoot
-        ) && self.start_list_origin_fullscreen_navigation(
-            ctx,
-            fs_idx,
-            forward,
-            native_toast,
-            true,
-        ) {
             return;
         }
         #[cfg(windows)]
