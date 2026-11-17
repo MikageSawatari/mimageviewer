@@ -41,14 +41,66 @@ pub(crate) enum SampleFailureKind {
     ReadFailed,
 }
 
-pub(crate) fn classify_io_error(error: &std::io::Error) -> SampleFailureKind {
+#[derive(Clone, Copy)]
+pub(crate) enum SampleIoOrigin {
+    Direct,
+    ZipDecoder,
+}
+
+/// Preserve source provenance when a reader synthesizes an error without an
+/// OS code. Real OS errors retain their original raw_os_error and payload.
+#[derive(Debug)]
+struct SourceReadError(std::io::Error);
+
+impl std::fmt::Display for SourceReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for SourceReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+pub(crate) fn source_read_error(error: std::io::Error) -> std::io::Error {
+    if error.raw_os_error().is_some() {
+        error
+    } else {
+        std::io::Error::new(error.kind(), SourceReadError(error))
+    }
+}
+
+pub(crate) fn classify_io_error_at(
+    error: &std::io::Error,
+    origin: SampleIoOrigin,
+) -> SampleFailureKind {
     use std::io::ErrorKind;
+    if error.raw_os_error().is_some()
+        || error
+            .get_ref()
+            .is_some_and(|error| error.is::<SourceReadError>())
+    {
+        return SampleFailureKind::ReadFailed;
+    }
+    // ZIP exposes decoder/CRC/structure errors as io::Error too. In
+    // particular flate2 uses InvalidInput for malformed Deflate streams.
+    // Only the underlying reader's errors above denote source I/O failure.
+    if matches!(origin, SampleIoOrigin::ZipDecoder) {
+        return SampleFailureKind::Data;
+    }
     match error.kind() {
-        ErrorKind::InvalidData | ErrorKind::UnexpectedEof | ErrorKind::Unsupported => {
-            SampleFailureKind::Data
-        }
+        ErrorKind::InvalidData
+        | ErrorKind::InvalidInput
+        | ErrorKind::UnexpectedEof
+        | ErrorKind::Unsupported => SampleFailureKind::Data,
         _ => SampleFailureKind::ReadFailed,
     }
+}
+
+pub(crate) fn classify_io_error(error: &std::io::Error) -> SampleFailureKind {
+    classify_io_error_at(error, SampleIoOrigin::Direct)
 }
 
 pub(crate) fn classify_unrar_error(code: unrar::error::Code) -> SampleFailureKind {
@@ -71,12 +123,20 @@ pub(crate) fn check_cancel(cancel: Option<&AtomicBool>) -> Result<(), SampleAbor
 
 impl SampleRead {
     pub(crate) fn from_io(result: std::io::Result<Vec<u8>>, cancel: Option<&AtomicBool>) -> Self {
+        Self::from_io_at(result, cancel, SampleIoOrigin::Direct)
+    }
+
+    pub(crate) fn from_io_at(
+        result: std::io::Result<Vec<u8>>,
+        cancel: Option<&AtomicBool>,
+        origin: SampleIoOrigin,
+    ) -> Self {
         if check_cancel(cancel).is_err() {
             return Self::Cancelled;
         }
         match result {
             Ok(bytes) => Self::Read(bytes),
-            Err(error) => match classify_io_error(&error) {
+            Err(error) => match classify_io_error_at(&error, origin) {
                 SampleFailureKind::Data => Self::Unreadable,
                 SampleFailureKind::ReadFailed => Self::ReadFailed(error.to_string()),
             },
@@ -488,7 +548,8 @@ fn read_folder_prefix_typed(path: &Path, cancel: Option<&AtomicBool>) -> SampleR
     SampleRead::from_io(
         file.take(MAX_SAMPLE_PREFIX_BYTES)
             .read_to_end(&mut bytes)
-            .map(|_| bytes),
+            .map(|_| bytes)
+            .map_err(source_read_error),
         cancel,
     )
 }

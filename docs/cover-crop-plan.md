@@ -2407,9 +2407,12 @@ P案の本文proof/codec変更やK2内生成を承認したものではなく、
   全体を中断として返す (読めない枠と混ぜない)。判定用デコードの戻り値も `Cancelled / ReadFailed / Decode(データ)` の enum にする。
 - 分類の規則 (1 か所の関数に置く):
   - `Cancelled`: cancel の検査で止めた。
-  - `ReadFailed`: 元のファイル・書庫を開けない、読み取りの OS エラー (std の `io::Error` で `InvalidData` / `UnexpectedEof` / `Unsupported` 以外)、
+  - `ReadFailed`: 元のファイル・書庫を開けない、読み取りの OS エラー（`raw_os_error`を持つもの、または元readerのread/seek境界で出自を付けたもの。`ErrorKind`だけでは判別しない）、
     unrar の開く・読む・作るのエラー (`EOpen` / `ERead` / `ECreate` 等、データでないもの)、PDF ワーカーの失敗・再起動・時間切れ。
-  - データ: 画像の形式・寸法が読めない、CRC・圧縮データの破損 (unrar の `BadData` / `BadArchive` 等、zip の `InvalidArchive`)、ZIP の `InvalidData`。
+  - データ: 画像の形式・寸法が読めない、CRC・圧縮データの破損 (unrar の `BadData` / `BadArchive` 等、zip の `InvalidArchive`)。
+    ZIPの展開・CRC・構造層が返したエラーは、元readerのI/Oに由来しない限りデータとする。flate2 1.1.10の壊れたDeflateは`io::ErrorKind::InvalidInput`であり、`InvalidData`とは限らない。
+    通常の画像decodeの`IoError`でも、OSエラー／元reader由来を先に除外し、`InvalidInput` / `InvalidData` / `UnexpectedEof` / `Unsupported`はデータとする。
+    分類は`cover_auto_sample::classify_io_error_at`へ集約し、ZIP層と通常のI/O境界を引数で区別する。
     → 標本ならその枠は `None`、表紙の判定用デコードなら今と同じ `NotAutomatic`。
   - leaf が一覧に無い・候補が足りないのは今と同じ判定済みの見送り。
 - PDF の `PageSizes` の失敗は `ReadFailed`。ただし PDF のデコードの完了済みの結果を cancel で捨てない既存の区別 (`HarvestOnCancel`) は保つ。
@@ -2566,3 +2569,32 @@ cargo nextest run -p mimageviewer --lib -E 'test(=ui_dialogs::cover_crop::tests:
 - `python scripts/check_ui_glyphs.py`: 危険なグリフ0。`python scripts/check_site_cards.py`: **53カード・超過0**。
 - `cargo fmt`（引数なし）と `git diff --check`: 成功。整形だけで無関係なファイルは変更していない。
 - 実機での初回/キャッシュ利用時の時間比較、lib全件・確認用build・起動は未実施。共有runnerのsandbox fallbackではBelowNormal・build jobs 6で実行した。
+
+#### 実装レビュー r1 の対応（2026-11-18）
+
+- 基点 `bc67469c8`。P2の原因は、flate2 1.1.10が壊れたDeflateを`io::ErrorKind::InvalidInput`で返し、ZIPの展開器と元ファイルのI/Oを同じkind規則で分類していたこと。
+- ZIPの物理readerのread/seek境界で元I/Oの出自を保持する。OSコードを持つエラーは元の値を保ち、OSコードの無い元readerエラーには`SourceReadError`を付ける。
+  `classify_io_error_at`の1か所で、元I/OをReadFailed、ZIPの展開・CRC・構造層のエラーをkindによらずデータへ分類する。
+  sourceのInvalidInputを見送りへ化けさせず、Deflate破損の枠だけをNoneにして残りで判定・保存する。書庫自体のopen失敗は従来どおりReadFailed。
+- 他形式を確認した。画像フォルダの直接read、JPEGのstd::fs::read、native画像decoderのopenにも元I/Oの出自を保持し、通常画像decodeの未マークInvalidInputはデータとする。
+  RARはunrarのコード、PDFのPageSizes/renderは型付き結果で分類しており、ZIPのkind依存による取り違えはない。CancelledとHarvestOnCancelの規則は変更していない。
+- 回帰はテスト内で合成PNGのZIPを作り、本文001のDeflate先頭のBTYPEを予約値3へ変える。中央目次やCRCだけを壊すテストではない。利用者の書庫や画像は使わず、追加のfixtureファイルも保存しない。
+  `zip_sample_deflate_invalid_input_is_data_and_other_pages_remain_readable`で実際のInvalidInput・未知1枠・正常7枠を確認する。
+  `zip_sample_classification_uses_reader_origin_instead_of_error_kind`と既存`zip_sample_entry_io_retains_os_error_instead_of_unreadable_data`で同kindの元reader失敗を区別する。
+  `cover_auto_zip_deflate_corrupt_sample_is_judged_saved_and_cache_reused`でworkerのAutomatic保存、cropの存在、2回目のcache利用・標本呼出し無しまで確認する。
+  既存`cover_auto_analysis_preserves_os_failure_and_data_decode_failure`もInvalidInputと元reader由来の組を追加した。
+- 変更ファイル: `src/cover_auto_sample.rs`、`src/zip_loader.rs`、`src/thumb_loader/cover_auto_analysis.rs`、`src/thumb_loader/cover_auto_rar_tests.rs`、本書§30.5/§30.12。
+  検証は前回と同じ環境・共有runner・焦点式で直列実行し、ログを`target/verification-778/r1-*.log`へ残す。コミットは設計担当へ引き継ぐ。
+- `cargo check -p mimageviewer --bin mimageviewer-core`: **成功、exit 0**（`r1-check.log`）。
+- 上記と同じ焦点nextest式（test threads 6、retries 0、既定features/test profile）: **786件中785成功・1失敗**。
+  run ID `2ecf2000-847c-40c2-a090-a010206cc173`、`r1-focused.log`。追加3回帰と変更した分類回帰は全て成功した。
+  失敗は差分外の `app::search_nav_book_tests::search_nav_book_cold_collection_catalog_reenters_the_shared_prepared_open`。
+  空のコレクションを作成・冷えたcatalogから開く既存テストで、「Collection 1未登録」の通知後、30秒の採用待ちassertが失敗した。
+  今回のZIP/画像標本読み取りはそのテストの移動受付経路に関与しない。ソース・環境を変えず、下記で診断用の単独実行を行い **1成功・0失敗**。
+  run ID `239b9696-cdc7-45e7-bfd8-3e5d19899e22`、`r1-catalog-diagnostic.log`。並列実行時の原因は未確定として設計担当へ引き継ぎ、失敗を隠す期待値変更や無関係な実装修正は行わない。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(=app::search_nav_book_tests::search_nav_book_cold_collection_catalog_reenters_the_shared_prepared_open)' --test-threads 1 --retries 0 --no-tests fail
+```
+
+- 最後の `cargo fmt`（引数なし）・`git diff --check`: **成功、exit 0**。今回もlib全件・確認用build・製品起動・コミットは行わない。

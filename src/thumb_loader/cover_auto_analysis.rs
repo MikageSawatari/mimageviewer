@@ -89,7 +89,10 @@ pub(crate) fn decode_cover_auto_analysis_image(
                     .len();
                 if size <= MAX_TURBOJPEG_INPUT_SIZE {
                     owned = std::fs::read(path).map_err(|error| {
-                        CoverAutoAnalysisError::from_image(error.into(), cancel)
+                        CoverAutoAnalysisError::from_image(
+                            crate::cover_auto_sample::source_read_error(error).into(),
+                            cancel,
+                        )
                     })?;
                     // Recheck a file that grew between metadata and read.
                     (owned.len() as u64 <= MAX_TURBOJPEG_INPUT_SIZE).then_some(owned.as_slice())
@@ -192,7 +195,8 @@ fn decode_native_metadata_path(
         None,
         cancel.map(Arc::as_ref),
         || {
-            let mut decoder = image::ImageReader::open(path)?
+            let mut decoder = image::ImageReader::open(path)
+                .map_err(crate::cover_auto_sample::source_read_error)?
                 .with_guessed_format()?
                 .into_decoder()?;
             metadata = Some(metadata::from_decoder(&mut decoder));
@@ -358,6 +362,7 @@ mod tests {
         ));
         for kind in [
             std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::InvalidInput,
             std::io::ErrorKind::UnexpectedEof,
             std::io::ErrorKind::Unsupported,
         ] {
@@ -374,6 +379,15 @@ mod tests {
                 image::ImageError::IoError(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "I/O"
+                )),
+                None
+            ),
+            CoverAutoAnalysisError::ReadFailed(_)
+        ));
+        assert!(matches!(
+            CoverAutoAnalysisError::from_image(
+                image::ImageError::IoError(crate::cover_auto_sample::source_read_error(
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "source read")
                 )),
                 None
             ),

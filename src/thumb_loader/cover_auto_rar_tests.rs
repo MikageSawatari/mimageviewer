@@ -414,3 +414,44 @@ fn cover_auto_worker_analysis_decode_cancel_is_not_a_saved_not_automatic_decisio
     assert!(messages.iter().any(ThumbMsg::is_canceled));
     assert!(catalog.load_one(&key).unwrap().is_none());
 }
+
+#[test]
+fn cover_auto_zip_deflate_corrupt_sample_is_judged_saved_and_cache_reused() {
+    let _data = crate::data_dir::TestDataDirGuard::new();
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("broken-deflate.zip");
+    crate::zip_loader::cover_auto_deflate_corruption_fixture_for_test(&path);
+    let catalog =
+        Arc::new(crate::catalog::CatalogDb::open(&temp.path().join("cache"), temp.path()).unwrap());
+    let mut req = request(&path, "zipthumb:broken-deflate.zip", "000.png");
+    let before = crate::cover_auto_sample::container_sample_calls_for_test();
+    let messages = run(&mut req, &catalog, always(), None);
+    let pixels = messages.iter().find_map(ThumbMsg::pixels).unwrap();
+    let AutoMaterial::Automatic(results) = pixels.auto_material else {
+        panic!("valid body pages must be judged")
+    };
+    assert!(results.crops().iter().any(Option::is_some));
+    assert_eq!(
+        crate::cover_auto_sample::container_sample_calls_for_test(),
+        before + 1
+    );
+    let key = cache_key_for_request(&req).unwrap().into_owned();
+    assert_eq!(
+        catalog.load_one(&key).unwrap().unwrap().auto_material,
+        pixels.auto_material
+    );
+    req.source_policy = LoadSourcePolicy::CacheOnly;
+    let cached = run(&mut req, &catalog, always(), None);
+    assert_eq!(
+        cached
+            .iter()
+            .find_map(ThumbMsg::pixels)
+            .unwrap()
+            .auto_material,
+        pixels.auto_material
+    );
+    assert_eq!(
+        crate::cover_auto_sample::container_sample_calls_for_test(),
+        before + 1
+    );
+}

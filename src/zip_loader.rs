@@ -316,9 +316,11 @@ impl PositionedFileReader {
             probe.os_read_calls.fetch_add(1, Ordering::Relaxed);
         }
         #[cfg(windows)]
-        let read = std::os::windows::fs::FileExt::seek_read(self.file.as_ref(), buffer, position)?;
+        let read = std::os::windows::fs::FileExt::seek_read(self.file.as_ref(), buffer, position)
+            .map_err(crate::cover_auto_sample::source_read_error)?;
         #[cfg(not(windows))]
-        let read = std::os::unix::fs::FileExt::read_at(self.file.as_ref(), buffer, position)?;
+        let read = std::os::unix::fs::FileExt::read_at(self.file.as_ref(), buffer, position)
+            .map_err(crate::cover_auto_sample::source_read_error)?;
         #[cfg(test)]
         if let Some(probe) = &self.io_probe {
             probe
@@ -409,7 +411,13 @@ impl Seek for PositionedFileReader {
         let next = match position {
             SeekFrom::Start(position) => position as i128,
             SeekFrom::Current(offset) => self.position as i128 + offset as i128,
-            SeekFrom::End(offset) => self.file.metadata()?.len() as i128 + offset as i128,
+            SeekFrom::End(offset) => {
+                self.file
+                    .metadata()
+                    .map_err(crate::cover_auto_sample::source_read_error)?
+                    .len() as i128
+                    + offset as i128
+            }
         };
         if !(0..=u64::MAX as i128).contains(&next) {
             return Err(std::io::Error::new(
@@ -3014,7 +3022,9 @@ pub(crate) fn read_cover_auto_page_samples(
     Vec<(String, crate::cover_auto_sample::SampleRead)>,
     crate::cover_auto_sample::SampleAbort,
 > {
-    use crate::cover_auto_sample::{SampleAbort, SampleRead, check_cancel, select_archive_samples};
+    use crate::cover_auto_sample::{
+        SampleAbort, SampleIoOrigin, SampleRead, check_cancel, select_archive_samples,
+    };
     check_cancel(cancel)?;
     if split_nested_zip_path(leaf_entry).len() > 1 {
         return Ok(Vec::new());
@@ -3030,7 +3040,11 @@ pub(crate) fn read_cover_auto_page_samples(
         check_cancel(cancel)?;
         let entry = match archive.by_index_raw(index) {
             Ok(entry) => entry,
-            Err(error) => match SampleRead::from_io(Err(zip_error_to_io(error, cancel)), cancel) {
+            Err(error) => match SampleRead::from_io_at(
+                Err(zip_error_to_io(error, cancel)),
+                cancel,
+                SampleIoOrigin::ZipDecoder,
+            ) {
                 SampleRead::Unreadable => break,
                 SampleRead::Cancelled => return Err(SampleAbort::Cancelled),
                 SampleRead::ReadFailed(reason) => return Err(SampleAbort::ReadFailed(reason)),
@@ -3050,7 +3064,7 @@ pub(crate) fn read_cover_auto_page_samples(
     let mut prefixes = Vec::new();
     for (name, _) in selected {
         check_cancel(cancel)?;
-        let read = SampleRead::from_io(
+        let read = SampleRead::from_io_at(
             read_prefix_by_name(
                 &mut archive,
                 &name,
@@ -3059,6 +3073,7 @@ pub(crate) fn read_cover_auto_page_samples(
                 cancel,
             ),
             cancel,
+            SampleIoOrigin::ZipDecoder,
         );
         if let SampleRead::Read(bytes) = &read {
             metrics.read += 1;
@@ -3076,10 +3091,49 @@ pub(crate) fn read_cover_auto_page_samples(
     Ok(prefixes)
 }
 
+/// Only synthetic PNGs; corrupt the Deflate block type, not merely its CRC.
+#[cfg(test)]
+pub(crate) fn cover_auto_deflate_corruption_fixture_for_test(path: &Path) {
+    use std::io::Write;
+    let mut cover = Cursor::new(Vec::new());
+    crate::cover_auto_sample::rar_tests::fixture_jacket()
+        .write_to(&mut cover, image::ImageFormat::Png)
+        .unwrap();
+    let mut body = Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(70, 100)
+        .write_to(&mut body, image::ImageFormat::Png)
+        .unwrap();
+    let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..9 {
+        archive
+            .start_file(
+                format!("{index:03}.png"),
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated),
+            )
+            .unwrap();
+        archive
+            .write_all(if index == 0 {
+                cover.get_ref()
+            } else {
+                body.get_ref()
+            })
+            .unwrap();
+    }
+    let mut bytes = archive.finish().unwrap().into_inner();
+    let offset = {
+        let mut reader = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let offset = reader.by_index_raw(1).unwrap().data_start() as usize;
+        offset
+    };
+    bytes[offset] |= 0b110; // Reserved BTYPE=3; flate2 reports InvalidInput.
+    std::fs::write(path, bytes).unwrap();
+}
+
 #[cfg(test)]
 mod cover_sample_boundary_tests {
     use super::*;
-    use crate::cover_auto_sample::{SampleAbort, SampleMetrics, SampleRead};
+    use crate::cover_auto_sample::{SampleAbort, SampleIoOrigin, SampleMetrics, SampleRead};
     use std::cell::Cell;
     use std::io::Write;
     use std::rc::Rc;
@@ -3107,9 +3161,11 @@ mod cover_sample_boundary_tests {
     impl Read for FailingReader {
         fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
             if self.fail.get() {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "injected source read failure",
+                Err(crate::cover_auto_sample::source_read_error(
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "injected source read failure",
+                    ),
                 ))
             } else {
                 self.cursor.read(bytes)
@@ -3135,10 +3191,10 @@ mod cover_sample_boundary_tests {
         let result = read_prefix_by_name(&mut archive, "001.png", None, 256 * 1024, None);
         assert_eq!(
             result.as_ref().unwrap_err().kind(),
-            std::io::ErrorKind::PermissionDenied
+            std::io::ErrorKind::InvalidInput
         );
         assert!(matches!(
-            SampleRead::from_io(result, None),
+            SampleRead::from_io_at(result, None, SampleIoOrigin::ZipDecoder),
             SampleRead::ReadFailed(_)
         ));
     }
@@ -3159,7 +3215,7 @@ mod cover_sample_boundary_tests {
             std::io::ErrorKind::InvalidData
         );
         assert!(matches!(
-            SampleRead::from_io(result, None),
+            SampleRead::from_io_at(result, None, SampleIoOrigin::ZipDecoder),
             SampleRead::Unreadable
         ));
         let cancel = AtomicBool::new(true);
@@ -3190,6 +3246,62 @@ mod cover_sample_boundary_tests {
             &mut metrics,
         );
         assert!(matches!(result, Err(SampleAbort::ReadFailed(_))));
+    }
+
+    #[test]
+    fn zip_sample_deflate_invalid_input_is_data_and_other_pages_remain_readable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("broken-deflate.zip");
+        cover_auto_deflate_corruption_fixture_for_test(&path);
+        let mut archive = zip::ZipArchive::new(File::open(&path).unwrap()).unwrap();
+        let result = read_prefix_by_name(&mut archive, "001.png", None, 256 * 1024, None);
+        let error = result.as_ref().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(error.raw_os_error(), None);
+        assert!(matches!(
+            SampleRead::from_io_at(result, None, SampleIoOrigin::ZipDecoder),
+            SampleRead::Unreadable
+        ));
+        let mut metrics = SampleMetrics::default();
+        let slots =
+            read_cover_auto_page_samples(&path, "000.png", None, None, &mut metrics).unwrap();
+        assert_eq!((metrics.selected, metrics.read), (8, 7));
+        assert!(matches!(slots[0].1, SampleRead::Unreadable));
+        assert!(
+            slots[1..]
+                .iter()
+                .all(|(_, read)| matches!(read, SampleRead::Read(_)))
+        );
+    }
+
+    #[test]
+    fn zip_sample_classification_uses_reader_origin_instead_of_error_kind() {
+        use crate::cover_auto_sample::{
+            SampleFailureKind, classify_io_error_at, source_read_error,
+        };
+        for kind in [
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::Other,
+        ] {
+            let decoder = std::io::Error::new(kind, "decoder");
+            assert_eq!(
+                classify_io_error_at(&decoder, SampleIoOrigin::ZipDecoder),
+                SampleFailureKind::Data
+            );
+            let source = source_read_error(std::io::Error::new(kind, "source"));
+            assert_eq!(
+                classify_io_error_at(&source, SampleIoOrigin::ZipDecoder),
+                SampleFailureKind::ReadFailed
+            );
+        }
+        assert_eq!(
+            classify_io_error_at(
+                &std::io::Error::from_raw_os_error(87),
+                SampleIoOrigin::ZipDecoder
+            ),
+            SampleFailureKind::ReadFailed
+        );
     }
 }
 
