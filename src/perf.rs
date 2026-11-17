@@ -26,6 +26,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod close_nav;
 pub(crate) mod memory;
 pub(crate) mod stall;
 #[cfg(feature = "test-script")]

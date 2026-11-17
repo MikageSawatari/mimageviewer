@@ -25,6 +25,7 @@ pub(super) fn backend_window_for_test(
 }
 mod auto_aspect_s1;
 mod book_close_s1;
+mod close_nav_801;
 mod repro742;
 mod section1768;
 

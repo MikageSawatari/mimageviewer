@@ -36,6 +36,9 @@ macro_rules! queue_thumbnail_for_test {
     }};
 }
 
+use crate::perf::close_nav::{
+    Outcome as CloseNavOutcome, Span as CloseNavSpan, Stage as CloseNavStage,
+};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -24541,7 +24544,17 @@ impl App {
     pub(crate) fn take_pending_return_to_parent_nav(
         &mut self,
     ) -> Option<crate::ui_main::AddressBarNav> {
-        self.take_close_return_navigation()
+        // Polling without a request is a per-frame hot path: no clock or event there.
+        if !self.pending_return_to_parent.is_pending() {
+            return self.take_close_return_navigation();
+        }
+        let _trace = crate::perf::close_nav::Trace::begin(self.input_seq, self.frame_counter);
+        let mut span = CloseNavSpan::new(CloseNavStage::TakeReturn);
+        let nav = self.take_close_return_navigation();
+        if nav.is_none() {
+            span.outcome(CloseNavOutcome::NoDestination);
+        }
+        nav
     }
 
     fn apply_collection_input_nav(
@@ -24577,12 +24590,15 @@ impl App {
         &mut self,
         nav: crate::ui_main::AddressBarNav,
     ) -> bool {
+        let _trace = crate::perf::close_nav::Trace::begin(self.input_seq, self.frame_counter);
+        let mut span = CloseNavSpan::new(CloseNavStage::ApplyReturn);
         if matches!(
             nav,
             crate::ui_main::AddressBarNav::HistoryBack
                 | crate::ui_main::AddressBarNav::HistoryForward
                 | crate::ui_main::AddressBarNav::SavedGroupReady(_)
         ) {
+            span.outcome(CloseNavOutcome::UnsupportedNavigation);
             return false;
         }
         self.dispatch_main_input_nav_immediate(nav, true);
@@ -24596,6 +24612,7 @@ impl App {
         nav: crate::ui_main::AddressBarNav,
         fullscreen_close_origin: bool,
     ) {
+        let _span = CloseNavSpan::new(CloseNavStage::Dispatch);
         match nav {
             crate::ui_main::AddressBarNav::Favorite(path) => {
                 if let Some(path) = self.dispatch_favorite_navigation(path) {
@@ -24618,12 +24635,19 @@ impl App {
                 self.apply_zip_list_return(plan);
             }
             crate::ui_main::AddressBarNav::Direct(path, restore_intent) => {
+                let mut span = CloseNavSpan::new(CloseNavStage::DirectOpen);
                 let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
                     path,
                     false,
                     OpenRequestOwner::Navigation,
                     restore_intent,
                 );
+                span.outcome(match outcome {
+                    FolderOpenOutcome::Loaded => CloseNavOutcome::Loaded,
+                    FolderOpenOutcome::Classifying => CloseNavOutcome::Classifying,
+                    FolderOpenOutcome::Refused(_) => CloseNavOutcome::AdmissionRefused,
+                    _ => CloseNavOutcome::Ignored,
+                });
                 self.clear_pending_folder_nav_steps();
                 // The bool means this one-shot close navigation was consumed.  A rejected
                 // destination already reported its reason and must not be replayed next frame.
@@ -30456,19 +30480,38 @@ impl App {
         restore_intent: crate::app::StartupListIntent,
         stage: MainListRequestStage,
     ) -> FolderOpenOutcome {
-        let path = crate::path_key::normalize_input_path(&path);
-        if restore_intent.captures_list_departure() {
-            self.capture_main_list_restore_cursor();
+        let mut span = CloseNavSpan::new(CloseNavStage::OpenAdmission);
+        let path = {
+            let _span = CloseNavSpan::new(CloseNavStage::NormalizePath);
+            crate::path_key::normalize_input_path(&path)
+        };
+        {
+            let _span = CloseNavSpan::new(CloseNavStage::CaptureCursor);
+            if restore_intent.captures_list_departure() {
+                self.capture_main_list_restore_cursor();
+            }
         }
 
-        if self.document_open_modal_admission_blocked() {
+        let blocked = {
+            let _span = CloseNavSpan::new(CloseNavStage::ModalAdmission);
+            self.document_open_modal_admission_blocked()
+        };
+        if blocked {
+            span.outcome(CloseNavOutcome::ModalBlocked);
             return FolderOpenOutcome::Ignored;
         }
-        if !self.snapshot_scope_allows_open(&path, &owner) {
+        let allowed = {
+            let _span = CloseNavSpan::new(CloseNavStage::SnapshotAdmission);
+            self.snapshot_scope_allows_open(&path, &owner)
+        };
+        if !allowed {
+            span.outcome(CloseNavOutcome::SnapshotRefused);
             self.show_snapshot_out_of_scope_open_feedback();
             return FolderOpenOutcome::Ignored;
         }
         if Self::path_needs_open_classification(&path) {
+            let _span = CloseNavSpan::new(CloseNavStage::ClassifyPath);
+            span.outcome(CloseNavOutcome::Classifying);
             return match self.start_open_path_classification_at_stage(
                 path.clone(),
                 ClassifiedOpenContinuation::Direct {
@@ -30572,6 +30615,7 @@ impl App {
         navigation: Option<MainListNavigation>,
         stage: MainListRequestStage,
     ) -> FolderOpenOutcome {
+        let mut span = CloseNavSpan::new(CloseNavStage::OpenClassified);
         let visibility_source = self.physical_open_visibility_source(&path);
         // Direct media opens keep their released behavior; container/page targets use the list policy.
         if classified_kind != Some(OpenPathKind::Directory)
@@ -30595,16 +30639,20 @@ impl App {
                 .file_type_visibility
                 .allows_physical_file(visibility_source)
         {
+            span.outcome(CloseNavOutcome::VisibilityRefused);
             self.show_open_admission_refusal(OpenAdmissionRefusal::FileTypeExcluded);
             return FolderOpenOutcome::Refused(FolderOpenRefusal::Admission(
                 OpenAdmissionRefusal::FileTypeExcluded,
             ));
         }
-        let navigation =
-            navigation.or_else(|| self.capture_physical_open_navigation(&owner, &path));
+        let navigation = {
+            let _span = CloseNavSpan::new(CloseNavStage::CaptureNavigation);
+            navigation.or_else(|| self.capture_physical_open_navigation(&owner, &path))
+        };
         // Scope refusal must precede lifecycle adoption: claim_open_request_owner cancels an
         // in-flight archive conversion, unresolved startup open, and conflicting bookmark open.
         if !self.snapshot_scope_allows_open(&path, &owner) {
+            span.outcome(CloseNavOutcome::SnapshotRefused);
             self.reject_snapshot_out_of_scope_open();
             return FolderOpenOutcome::Ignored;
         }
@@ -30614,6 +30662,7 @@ impl App {
             && self.main_folder_history_available()
             && smart_folder::is_smart_folder_synthetic_path(&path)
         {
+            span.outcome(CloseNavOutcome::SmartDispatched);
             return if self
                 .restore_smart_folder_for_synthetic_path_with_navigation(&path, navigation)
             {
@@ -30635,7 +30684,10 @@ impl App {
                 )
             })
             && !self.navigation_scope.is_detached_physical()
-            && let Some(kind) = self.smart_physical_target_kind(&path)
+            && let Some(kind) = {
+                let _span = CloseNavSpan::new(CloseNavStage::SmartTarget);
+                self.smart_physical_target_kind(&path)
+            }
         {
             let kind = if classified_kind == Some(OpenPathKind::Directory) {
                 smart_folder::SmartChildKind::Folder
@@ -30726,6 +30778,7 @@ impl App {
             .and_then(|e| e.to_str())
             .and_then(crate::archive_converter::ArchiveFormat::from_extension);
         if classified_kind.unwrap_or_else(|| {
+            let _span = CloseNavSpan::new(CloseNavStage::PathIsFile);
             if path.is_file() {
                 OpenPathKind::File
             } else {
@@ -31188,9 +31241,13 @@ impl App {
         explicit_request: bool,
         stage: MainListRequestStage,
     ) -> bool {
+        let mut span = CloseNavSpan::new(CloseNavStage::ClaimOwner);
+        // Every early refusal below consumes this attempted claim without adoption.
+        span.outcome(CloseNavOutcome::AdmissionRefused);
         // A document dialog owns its entire open until its typed retry/cancel continuation.
         // This must precede the cancellations below, including detached and bookmark owners.
         if self.document_open_modal_admission_blocked() {
+            span.outcome(CloseNavOutcome::ModalBlocked);
             return false;
         }
         let claimed = match owner {
@@ -31240,9 +31297,11 @@ impl App {
                         .as_ref()
                         .map(|_| "detached_grid_archive_owner_stale_normal_navigation")
                         .unwrap_or("normal_navigation");
-                    if self.cancel_archive_convert_for_navigation_to(path, cancel_reason)
-                        && let Some(owner) = detached_owner
-                    {
+                    let cancelled = {
+                        let _span = CloseNavSpan::new(CloseNavStage::CancelArchive);
+                        self.cancel_archive_convert_for_navigation_to(path, cancel_reason)
+                    };
+                    if cancelled && let Some(owner) = detached_owner {
                         crate::logger::log(format!(
                             "[detached-grid-archive] request stale id={} reason=normal_navigation source={} destination={}",
                             owner.request_id,
@@ -31250,10 +31309,16 @@ impl App {
                             path.display()
                         ));
                     }
-                    self.cancel_unresolved_open_for_navigation(
-                        explicit_request && stage == MainListRequestStage::Admission,
-                    );
-                    self.cancel_conflicting_bookmark_open_for_navigation(path);
+                    {
+                        let _span = CloseNavSpan::new(CloseNavStage::CancelStartup);
+                        self.cancel_unresolved_open_for_navigation(
+                            explicit_request && stage == MainListRequestStage::Admission,
+                        );
+                    }
+                    {
+                        let _span = CloseNavSpan::new(CloseNavStage::CancelBookmark);
+                        self.cancel_conflicting_bookmark_open_for_navigation(path);
+                    }
                 }
                 true
             }
@@ -31323,13 +31388,20 @@ impl App {
                 _ => Some(self.projected_viewer_context_id()),
             };
             if owner_context == Some(self.projected_viewer_context_id()) {
-                self.retire_book_deferred_open();
-                self.top_level_grid_view.set_open_path_classification(None);
+                {
+                    let _span = CloseNavSpan::new(CloseNavStage::RetireBookOpen);
+                    self.retire_book_deferred_open();
+                }
+                {
+                    let _span = CloseNavSpan::new(CloseNavStage::RetireClassification);
+                    self.top_level_grid_view.set_open_path_classification(None);
+                }
                 let retire_cold = self.pdf_enumerate_pending.as_ref().is_some_and(|pending| {
                     matches!(pending.5, PdfOpenPhase::ColdCandidate { .. })
                         && !crate::folder_tree::path_eq(&pending.0, path)
                 });
                 if retire_cold {
+                    let _span = CloseNavSpan::new(CloseNavStage::RetireColdDocument);
                     self.retire_direct_document_open_for_history_admission();
                 }
                 if path
@@ -31354,9 +31426,15 @@ impl App {
                         }
                     })
             {
+                let _span = CloseNavSpan::new(CloseNavStage::RetireHistory);
                 self.replace_history_navigation_transition(None);
             }
         }
+        span.outcome(if claimed {
+            CloseNavOutcome::Complete
+        } else {
+            CloseNavOutcome::AdmissionRefused
+        });
         claimed
     }
 
@@ -31709,6 +31787,7 @@ impl App {
         stage: MainListRequestStage,
         search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
     ) -> FolderOpenOutcome {
+        let mut span = CloseNavSpan::new(CloseNavStage::LoadClaimed);
         let detached_physical = self.navigation_scope.is_detached_physical();
         if classified_kind != Some(OpenPathKind::Directory)
             && let Some(reason) = self.pdf_open_refusal(&path)
@@ -31784,24 +31863,33 @@ impl App {
         }
         let scan_started = std::time::Instant::now();
         let pre_scanned = pre_scan.is_some();
-        let scan = match pre_scan {
-            Some(scan) => scan,
-            None => match scan_directory_with_settings(&path, &self.settings) {
-                Ok(scan) => scan,
-                Err(error) => {
-                    crate::logger::log(format!(
-                        "load_folder scan failed path={} error={error}",
-                        path.display()
-                    ));
-                    self.pending_auto_fs_open = false;
-                    self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
-                    self.release_fs_nav_lock();
-                    self.show_feedback_warning("フォルダを読み取れませんでした".into());
-                    return FolderOpenOutcome::Ignored;
-                }
-            },
+        let scan = {
+            let _span = CloseNavSpan::new(CloseNavStage::ScanDirectory);
+            match pre_scan {
+                Some(scan) => scan,
+                None => match scan_directory_with_settings(&path, &self.settings) {
+                    Ok(scan) => scan,
+                    Err(error) => {
+                        crate::logger::log(format!(
+                            "load_folder scan failed path={} error={error}",
+                            path.display()
+                        ));
+                        self.pending_auto_fs_open = false;
+                        self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+                        self.release_fs_nav_lock();
+                        self.show_feedback_warning("フォルダを読み取れませんでした".into());
+                        span.outcome(CloseNavOutcome::ScanFailed);
+                        return FolderOpenOutcome::Ignored;
+                    }
+                },
+            }
         };
-        if !self.open_request_owner_is_current(&path, &owner) {
+        let current = {
+            let _span = CloseNavSpan::new(CloseNavStage::OwnerCurrent);
+            self.open_request_owner_is_current(&path, &owner)
+        };
+        if !current {
+            span.outcome(CloseNavOutcome::OwnerStale);
             return FolderOpenOutcome::Ignored;
         }
         let full_keys = use_full_path_cache_keys_for_folder(&path);
@@ -31818,9 +31906,13 @@ impl App {
             restore_intent,
             full_keys,
         );
-        let token = match self.prepare_visible_install(&path, &prepared.items, None) {
+        let token = match {
+            let _span = CloseNavSpan::new(CloseNavStage::PrepareInstall);
+            self.prepare_visible_install(&path, &prepared.items, None)
+        } {
             Ok(token) => token,
             Err(reason) => {
+                span.outcome(CloseNavOutcome::AdmissionRefused);
                 self.show_open_admission_refusal(reason);
                 return FolderOpenOutcome::Ignored;
             }
@@ -31895,6 +31987,7 @@ impl App {
             }
             self.hydrate_installed_main_list(hydration);
         }
+        span.outcome(CloseNavOutcome::Loaded);
         FolderOpenOutcome::Loaded
     }
 
@@ -31961,6 +32054,7 @@ impl App {
         restore_intent: crate::app::StartupListIntent,
         use_full_path_cache_keys: bool,
     ) -> PreparedScannedFolderListing {
+        let _span = CloseNavSpan::new(CloseNavStage::PrepareListing);
         let detached_physical = self.navigation_scope.is_detached_physical();
         let FolderListingMetrics {
             seq: lf_seq,
@@ -31976,7 +32070,10 @@ impl App {
         // Keep the image-book boundary independent from the caller and from the eventual
         // detached/main owner. Grid Folder preflight uses this same predicate before it
         // commits a context, preventing the two load paths from drifting apart.
-        let scanned_folder_is_image_book = self.scanned_folder_is_image_book(&path, &scan);
+        let scanned_folder_is_image_book = {
+            let _span = CloseNavSpan::new(CloseNavStage::BookRoot);
+            self.scanned_folder_is_image_book(&path, &scan)
+        };
         // フォーカス復帰時の差分判定用シグネチャ。scan を消費する前に計算しておき、
         // `start_loading_items` に引数として渡す。
         let audio_inventory = scan.complete_audio_inventory.take();
@@ -31989,6 +32086,7 @@ impl App {
         // the still-visible source. The real overlay transition belongs to admitted install.
         let mut listing_settings = self.settings.clone();
         if !detached_physical {
+            let _span = CloseNavSpan::new(CloseNavStage::FavoriteProjection);
             self.favorite_view_state_for_path(&path)
                 .apply_to_settings(&mut listing_settings);
         }
@@ -32004,19 +32102,23 @@ impl App {
                 ]);
                 *listing
             }
-            None => folder_scan::materialize_local_folder_listing_with_order(
-                &path,
-                scan,
-                &listing_settings,
-                order_request,
-                |keys| {
-                    self.rating_db
-                        .as_ref()
-                        .ok_or_else(|| "レーティング DB を利用できません".to_owned())?
-                        .get_many_complete(keys, rating_generation_before_read)
-                        .map_err(|error| error.to_string())
-                },
-            ),
+            None => {
+                let _span = CloseNavSpan::new(CloseNavStage::MaterializeListing);
+                folder_scan::materialize_local_folder_listing_with_order(
+                    &path,
+                    scan,
+                    &listing_settings,
+                    order_request,
+                    |keys| {
+                        let _span = CloseNavSpan::new(CloseNavStage::RatingRead);
+                        self.rating_db
+                            .as_ref()
+                            .ok_or_else(|| "レーティング DB を利用できません".to_owned())?
+                            .get_many_complete(keys, rating_generation_before_read)
+                            .map_err(|error| error.to_string())
+                    },
+                )
+            }
         };
         #[cfg(test)]
         if matches!(

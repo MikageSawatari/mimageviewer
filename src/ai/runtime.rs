@@ -253,6 +253,13 @@ impl AiRuntimeInitOwner {
             AiRuntimeInitState::Failed(Arc::new(AiError::Ort(message.to_owned())));
         owner
     }
+
+    #[cfg(test)]
+    pub(crate) fn ready_for_test(runtime: Arc<AiRuntime>) -> Arc<Self> {
+        let owner = Self::new();
+        *owner.state.lock().unwrap() = AiRuntimeInitState::Ready(runtime);
+        owner
+    }
 }
 
 // portable ビルドでは埋め込まず exe 隣の loose onnxruntime*.dll を使う (native_assets 参照)。
@@ -611,7 +618,13 @@ impl AiRuntime {
 
     /// 指定モデルのセッションがロード済みか確認する。
     pub fn is_loaded(&self, kind: ModelKind) -> bool {
-        self.sessions.lock().unwrap().contains_key(&kind)
+        let wait = crate::perf::close_nav::Wait::new(
+            crate::perf::close_nav::WaitSite::AiSessions,
+            "is_loaded",
+        );
+        let sessions = self.sessions.lock().unwrap();
+        wait.acquired();
+        sessions.contains_key(&kind)
     }
 
     /// モデルファイルからセッションをロードしてキャッシュする。
@@ -631,7 +644,12 @@ impl AiRuntime {
         model_path: &Path,
         force_cpu: bool,
     ) -> Result<(), AiError> {
+        let wait = crate::perf::close_nav::Wait::new(
+            crate::perf::close_nav::WaitSite::AiSessions,
+            "load_model",
+        );
         let mut sessions = self.sessions.lock().unwrap();
+        wait.acquired();
         if sessions.contains_key(&kind) {
             return Ok(());
         }
@@ -805,7 +823,12 @@ impl AiRuntime {
     where
         F: FnOnce(&mut Session) -> Result<R, AiError>,
     {
+        let wait = crate::perf::close_nav::Wait::new(
+            crate::perf::close_nav::WaitSite::AiSessions,
+            "with_session",
+        );
         let mut sessions = self.sessions.lock().unwrap();
+        wait.acquired();
         let session = sessions
             .get_mut(&kind)
             .ok_or(AiError::ModelNotFound(kind))?;
@@ -815,7 +838,20 @@ impl AiRuntime {
     /// 指定モデルのセッションをアンロードする。
     #[allow(dead_code)]
     pub fn unload_model(&self, kind: ModelKind) {
-        self.sessions.lock().unwrap().remove(&kind);
+        let wait = crate::perf::close_nav::Wait::new(
+            crate::perf::close_nav::WaitSite::AiSessions,
+            "unload_model",
+        );
+        let mut sessions = self.sessions.lock().unwrap();
+        wait.acquired();
+        sessions.remove(&kind);
+    }
+
+    /// The real inference mutex, without constructing an ORT session/GPU device.
+    #[cfg(test)]
+    pub(crate) fn hold_sessions_for_test(&self, held: impl FnOnce()) {
+        let _sessions = self.sessions.lock().unwrap();
+        held();
     }
 }
 

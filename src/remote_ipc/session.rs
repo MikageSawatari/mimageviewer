@@ -1893,24 +1893,41 @@ impl SessionHandle {
     }
 
     pub(crate) fn snapshot(&self) -> SessionSnapshot {
-        let mut snapshot = self
-            .inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .snapshot();
+        let _span =
+            crate::perf::close_nav::Span::new(crate::perf::close_nav::Stage::RemoteSnapshot);
+        let mut snapshot = {
+            let wait = crate::perf::close_nav::Wait::for_close(
+                crate::perf::close_nav::WaitSite::RemoteSessionState,
+                "snapshot",
+            );
+            let state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+            wait.acquired();
+            state.snapshot()
+        };
         if let Some(active) = snapshot.active.as_mut() {
             active.elapsed = self.now().saturating_sub(active.elapsed);
         }
+        let wait = crate::perf::close_nav::Wait::for_close(
+            crate::perf::close_nav::WaitSite::RemoteWebConnections,
+            "snapshot",
+        );
         let remote_web_connections = self
             .remote_web_connections
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        wait.acquired();
         snapshot.remote_web_connected = !remote_web_connections.is_empty();
         snapshot.remote_web = remote_web_connections
             .iter()
             .rev()
             .find_map(|(_, info)| info.clone());
         snapshot
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_snapshot_state_for_test(&self, held: impl FnOnce()) {
+        let _state = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        held();
     }
 
     #[cfg(test)]

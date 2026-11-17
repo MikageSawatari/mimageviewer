@@ -1,5 +1,13 @@
 # UI スレッドの応答性 (Ctrl+↑↓ 連打が引っかからないために)
 
+## 全画面の帰路から走査開始までの待ちの計装（§1.801）
+
+`nav/close_nav_stage` はmainのclose帰路消費・即時applyに限り、型付きの小区間と早期returnの理由を記録する。
+`sync/lock_wait` は取得まで5 ms以上のときだけ資源名・operationを記録する。
+`lf_scan.ms` はloader入口からの時間ではなく、`load_folder_end.ms` の開始点も実走査直前である。
+AIの `upscale_end` も画素正規化・結果送信の前なので、UI再開時刻だけで推論lock待ちと断定しない。
+候補の到達表、計装条件、headless検証と限界は [調査記録](section801-close-navigation-investigation.md)。原因修正は未実装。
+
 ## 本を閉じるときの catalog 全行読み込みの撤去（§1.800 S1）
 
 通常一覧の `resume_loading_items_after_sidecar` は空の控えを作り、画像 BLOB の
