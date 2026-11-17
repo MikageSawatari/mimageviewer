@@ -233,21 +233,26 @@ impl Request {
             };
             let cover =
                 CoverIdentity::Page(crate::adjustment_db::normalize_path(&resolved.abs_path));
-            let existing = map.get(&key).cloned().or_else(|| {
-                catalog.load_one(&key).unwrap_or_else(|error| {
-                    crate::logger::log(format!(
-                        "metadata video seed lookup failed: {error} ({key})"
-                    ));
-                    catalog.record_cache_error(format!("video seed lookup: {error}"));
-                    None
+            let already_seeded = map
+                .get(&key)
+                .map(|entry| {
+                    entry.mtime == resolved.mtime
+                        && entry.file_size == resolved.file_size
+                        && entry.jpeg_data == webp
+                        && entry.cover == cover
                 })
-            });
-            if existing.is_some_and(|entry| {
-                entry.mtime == resolved.mtime
-                    && entry.file_size == resolved.file_size
-                    && entry.jpeg_data == webp
-                    && entry.cover == cover
-            }) {
+                .unwrap_or_else(|| {
+                    catalog
+                        .matches_video_seed(&key, resolved.mtime, resolved.file_size, &webp, &cover)
+                        .unwrap_or_else(|error| {
+                            crate::logger::log(format!(
+                                "metadata video seed lookup failed: {error} ({key})"
+                            ));
+                            catalog.record_cache_error(format!("video seed lookup: {error}"));
+                            false
+                        })
+                });
+            if already_seeded {
                 continue;
             }
             seeds.push((

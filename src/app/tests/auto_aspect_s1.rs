@@ -140,6 +140,163 @@ fn prepared_aggregate_and_collection_wrappers_keep_initial_sampling() {
 }
 
 #[test]
+fn rating_install_preserves_legacy_synthetic_pixels_and_initial_samples_without_parent_db() {
+    use crate::rating_db::{RatingItemKind, RatingMeta};
+    use crate::thumb_loader::{LoadSourcePolicy, RequestCatalog, ThumbMsgPayload};
+
+    let mut app = setup_app_for_test();
+    app.settings.thumb_aspect_auto = true;
+    app.settings.cache_policy = crate::settings::CachePolicy::Off;
+    app.settings.rating_view_sort =
+        crate::rating_view::RatingViewSort::Normal(crate::settings::SortOrder::FileName);
+    let folder = app.tmp.path().join("rating-legacy-only-parent");
+    std::fs::create_dir(&folder).unwrap();
+    let cache_dir = crate::catalog::default_cache_dir();
+    let parent_db_path = crate::catalog::db_path_for(&cache_dir, &folder);
+    assert!(!parent_db_path.exists());
+    let synthetic = crate::app::rating_view_synthetic_path();
+    let old_catalog = crate::catalog::CatalogDb::open(&cache_dir, &synthetic).unwrap();
+    let bytes = crate::catalog::encode_thumb_webp(
+        &image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            80,
+            120,
+            image::Rgb([200, 60, 20]),
+        )),
+        32,
+        80.0,
+    )
+    .unwrap()
+    .0;
+    let expected_pixels = crate::catalog::decode_thumb_to_color_image(&bytes).unwrap();
+    for index in 0..8 {
+        let path = folder.join(format!("rated-{index}.png"));
+        // The real Rating builder can stat these rows, but source decoding cannot
+        // accidentally make this legacy-cache preservation test pass.
+        std::fs::write(&path, b"intentionally not a decodable PNG").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let page_key = crate::adjustment_db::normalize_path(&path);
+        app.rating_db
+            .as_ref()
+            .unwrap()
+            .set_user_rating(
+                &page_key,
+                3,
+                Some(&RatingMeta::new(RatingItemKind::Image).with_source_path(&path)),
+            )
+            .unwrap();
+        assert!(
+            old_catalog
+                .save_thumb_bytes(
+                    &crate::app::image_full_path_cache_key(&path),
+                    crate::ui_helpers::mtime_secs(&metadata),
+                    metadata.len() as i64,
+                    Some((80, 120)),
+                    &bytes,
+                    &crate::cover_identity::CoverIdentity::Page(page_key),
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
+                )
+                .unwrap()
+        );
+    }
+    drop(old_catalog);
+
+    // Exercise the production Rating admission/build/install/hydration route,
+    // not reset_and_seed_auto_aspect with a manually supplied cache map.
+    app.current_folder = Some(folder);
+    app.enter_rating_view(3);
+    let ctx = egui::Context::default();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        app.poll_rating_view();
+        app.poll_sidecar_restore(&ctx);
+        if app.rating_view_pending.is_none() && !app.sidecar_restore_active() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "real Rating install did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(app.items_are_rating_view);
+    assert_eq!(app.current_folder.as_deref(), Some(synthetic.as_path()));
+    assert_eq!(app.items.len(), 8);
+    assert_eq!(
+        app.auto_aspect.samples.len(),
+        crate::auto_aspect::min_samples_for(8)
+    );
+    assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait2x3);
+    let map = app.current_color_cache_map.as_ref().unwrap().clone();
+    assert_eq!(
+        map.read().unwrap().len(),
+        8,
+        "synthetic install must load the existing legacy rows"
+    );
+    assert!(!parent_db_path.exists());
+
+    let (mtime, file_size) = app.image_metas[0].unwrap();
+    let mut request = crate::app::make_load_request(
+        &app.items[0],
+        0,
+        mtime,
+        file_size,
+        false,
+        None,
+        Some(app.settings.folder_thumb_sort),
+        app.settings.folder_thumb_depth,
+        &app.folder_pin_map,
+        &app.converted_archive_cache_paths,
+        None,
+        app.current_folder.as_deref(),
+        app.folder_thumb_pin_db.as_deref(),
+        app.video_pin_db.as_ref(),
+        app.use_full_path_cache_keys(),
+    )
+    .unwrap();
+    request.source_policy = LoadSourcePolicy::CacheOnly;
+    app.attach_pool_thumbnail_context(&mut request);
+    assert!(matches!(
+        &request.catalog_target,
+        RequestCatalog::Parent { .. }
+    ));
+    let key = crate::thumb_loader::cache_key_for_request(&request)
+        .unwrap()
+        .into_owned();
+    assert_eq!(map.read().unwrap().get(&key).unwrap().jpeg_data, bytes);
+    app.keep_start_shared.store(0, Ordering::Relaxed);
+    app.keep_end_shared.store(8, Ordering::Relaxed);
+    let queue = app.reload_queue.as_ref().unwrap().clone();
+    queue.0.lock().unwrap().push(request.clone());
+    queue.1.notify_one();
+    let message = app
+        .rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("real worker cache hit");
+    let pixels = message
+        .pixels()
+        .expect("legacy memory row must provide cache pixels");
+    assert!(pixels.origin.from_cache());
+    assert_eq!(pixels.image.size, expected_pixels.size);
+    assert_eq!(pixels.image.pixels, expected_pixels.pixels);
+    assert!(
+        !parent_db_path.exists(),
+        "memory hit must not create a Parent catalog"
+    );
+
+    // A negative control proves the Parent fallback has no pixels to return.
+    // The first successful result therefore came from the installed legacy map.
+    map.write().unwrap().clear();
+    queue.0.lock().unwrap().push(request);
+    queue.1.notify_one();
+    let miss = app
+        .rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("real worker cache-only miss");
+    assert!(matches!(miss.payload, ThumbMsgPayload::CacheOnlyMiss));
+    assert!(!parent_db_path.exists());
+}
+
+#[test]
 fn arriving_samples_keep_saved_sample_input_idle_and_streak_gates() {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();

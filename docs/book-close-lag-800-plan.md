@@ -158,7 +158,10 @@ DB から引いた行を控えへ登録しないことで、新しい競合を�
 1. **一覧の読み込みで `load_all` を呼ばない。** `resume_loading_items_after_sidecar` の catalog 節で、通常の一覧 (合成ビュー以外。
    通常フォルダ、PDF/EPUB の仮想フォルダ、ZIP・変換書庫の物理一覧) の `cache_map` を空で作る。catalog の open
    (`get_or_open_catalog`)・`delete_missing` は今のまま UI で行う (行名だけを読む 1〜2 ms、今と同じ)。合成ビューは今の
-   `prepared_aggregate` のまま (worker が作った全行の写し)。**ドライブ一覧** (独自の `load_all` と
+   `prepared_aggregate` のまま (worker が作った全行の写し)。準備済みの catalog が無い合成ビュー
+   (★一覧など) は今どおり UI の `load_all` で全行の控えを作る。空にするのは
+   `!is_synthetic_view_path(&source_path)` の一覧だけで、合成ビューの worker 化は本件の範囲外。
+   **ドライブ一覧** (独自の `load_all` と
    `seed_drive_list_pin_thumbs_from_catalog`) は catalog が数行なので変えない (範囲外)。
 2. **`cache_map` の意味を「控え」にする。** 「この一覧で worker が保存した行と、一覧の開始時に UI が seed した行」の控えで、無いことは
    「DB に無い」を意味しない。合成ビューの写しも控えとして扱う。型や mode の印は足さない。
@@ -177,6 +180,9 @@ DB から引いた行を控えへ登録しないことで、新しい競合を�
    存在だけを読む) にする。書いた行・消した行は今どおり控えにも反映する。
    - `already_in_virtual` (仮想 catalog に先頭ページの行があるか): 鍵 1 件の存在の読み。
    - 動画ピンの `already_seeded` (stamp・WebP・cover が同じ seed があるか): pinned_key 1 件の読み。
+     `matches_video_seed` で mtime・file_size・WebP・CoverIdentity だけを読み、cover の復号・比較は従来どおり。
+     完全な `CacheEntry` が必要な worker の読みは維持し、`load_one` と存在確認も `prepare_cached` を使う。
+     仮想 seed 無効時は存在確認をせず、追加読みの `reads` は0とする。親との対応の準備は維持する。
    - 動画ピンの `purge_stale` (古い seed の行があるなら消す): 控えではなく DB に行があるときに消す。
    | 一覧を開くときの UI の catalog の I/O | 今 | S1 (r10) |
    | --- | --- | --- |
@@ -208,7 +214,8 @@ DB から引いた行を控えへ登録しないことで、新しい競合を�
    - `reset_and_seed_auto_aspect_with_seed` を「世代のリセットと記録 (`auto_aspect_cache`) の復元」と「控えから見本を探す処理」に
      分ける。通常の一覧の S1 経路は前者だけを呼ぶ (控えは空なので、後者は全項目の要求を組み立てても見本が見つからず、ピンの cascade・
      stat・動画 WebP の読みを UI で全件に行ってしまう。r7 P2-1)。合成ビューと collection は今どおり両方を呼ぶ (準備済みの控えに行が
-     あれば今と同じく見本を取る)。空の控えを判定の印にはせず、呼び出し側の目的で分ける。
+     あれば今と同じく見本を取る)。準備済み catalog の無い★一覧等も、UI で読んだ全行の控えから
+     従来どおり見本を取る。合成かは `is_synthetic_view_path` で判定し、空の控えを判定の印にはしない。
    - 見本はサムネイルの到着 (DB から引いた行を含む) で今の集計 (`poll_thumbnails`) に入り、今の判定のゲートを通って決まる。新しい
      job・payload は足さない。見える違いは 4S.6。
 
@@ -219,7 +226,7 @@ DB から引いた行を控えへ登録しないことで、新しい競合を�
 
 - 古いピンの variant の削除候補は、DB の鍵から求める (`prefix` で始まる行名を catalog から読む。行名だけなので軽い)。
   残す条件は今の `inventory_retains_key` のまま。
-- 動画ピンの seed の一致判定は、控え → DB (`load_one`) の順で行を引いて比べる。WebP が無い・壊れているときの削除は、控えの有無ではなく
+- 動画ピンの seed の一致判定は、控え → DB (`matches_video_seed`) の順で同じ4項目を比べる。WebP が無い・壊れているときの削除は、控えの有無ではなく
   DB の存在で決める。
 - 置き換えの控え (`replacement`) は今どおり、写した控えから削除を除き seed を足したもの (疎のままでよい)。
 
@@ -695,7 +702,20 @@ seed のループを worker へ移すことは S1 の前からある課題とし
   動画ピンが多い一覧の比較を受け入れ条件に足した。P3-2: §3.5 と控えの定義に撤回した案の記述が残る → 直した。
 - 4S.1-7 の挙動変更を利用者が受け入れれば、実装へ進めてよい。
 
+### 独立実装レビューと設計担当の修正指示 (2026-11-17) — REVISE
+
+`2ee4ecb9a`・`dab099abb` の独立レビュー (Sol / xhigh) はP1なし、P2が2件、P3が1件。
+P2-1は「全ての合成ビューが `prepared_aggregate` を持つ」という設計書の前提が誤っていた。
+★一覧は `prepared_subfolder=None` で共通ローダーに入り、空の控えでは§1.741の旧合成DBだけに
+ある行と初期縦横比の見本を失う。設計担当は「合成ビューは今のまま」を正本とし、未準備の合成ビューは
+従来のUI `load_all` を維持するよう指定した。レビューのworker化提案は今回は採らず、従来と同じI/Oを保つ。
+P2-2はSQLの再prepareと動画seed照合の不要列を削減し、同じベンチを許容差変更なしで再比較する。
+P3は仮想seed無効時の存在確認を省き、`reads` を実数にする。親との対応・writebackの条件は変えない。
+自動縦横比の通常一覧の変更は2026-11-17に利用者が承認済み (`cf3b228f7`)。
+
 ## 9. S1 の実装と検証 (2026-11-17)
+
+9.1〜9.3の初回結果は履歴として残す。後続の独立実装レビューによる訂正・再検証は9.4と9.3末尾に追記する。
 
 ### 9.1 実装と設計の対応
 
@@ -739,6 +759,9 @@ RAW 継続の対応落ち、世代変更時の破棄、テストの待機と fix
   fixture移行後の限定再確認は関連26件すべて成功 (7.190秒、exit 0)。
   `target/tests-800-full-fixture-corrections.log` に分け、全件成功の代わりにはしない。
 
+当時はRatingの失敗もfixtureの問題と判断したが、後続の独立実装レビューで、合成ビューの初期見本を
+失う製品退行を期待値変更で取り込んでいたと判明した。今回のP2-1ではRatingの24件の期待値を元に戻す。
+
 元の HEAD に `ui_main` の並べ替えテストの型不整合 (`Option<Box<BookReorderState>>` に非Box値を代入) があった。
 検証を通すため、そのテストの `Box::new` 1か所だけを S1 と別差分で修正した。製品の並べ替え処理は変えていない。
 
@@ -774,4 +797,83 @@ assertion はすべて成功。判定ツールの `evidence_errors=[]`、結果�
 §4S.7 に従って追加の製品実装・最適化を止めた。S1 の採用完了とはせず、結果を設計担当へ返す。
 現在の具体的な差分について非対話の全件ゲートを終えたが、上記のとおり非ゼロである。
 全件ゲート未成立のため、検証用の `build-dev.ps1` は前提を満たさず未実行。アプリは起動していない。
+
+#### P2-2修正後の再計測 (2026-11-17)
+
+`target/catalog-s1-revise-run1/` に新規作成。前回と同じ `dev-runtime`、
+`bench_scroll --synthetic-suite target/catalog-s1-revise-run1 --threads 4 --repetitions 3` を使用した。
+DB modeの動画seed照合だけを製品と同じ4項目のAPIへ揃え、memoryの旧Fixed条件・fixture・
+件数・接続の温め方・判定ツールは維持。許容差は両方0。今回も217行を完走し、
+hit数・旧miss数・書込み数・控えを増やさないことのassertionは成功、`evidence_errors=[]`。
+実行ログは `target/bench-800-revise-run1.log`、測定値・判定は新規ディレクトリの
+`results.jsonl` / `summary.json`。以下はいずれも3回の中央値、時間の単位はms。
+
+| 条件 | 前回 | 今回 | 今回の自動判定 |
+| --- | --- | --- | --- |
+| (1) 全行1万件のcatalog準備 (memory → DB) | 184.438〜211.926 → 0.957〜1.153 | 186.247〜224.603 → 1.106〜1.366 | 達成（実UI全体は未確認） |
+| (2) 初期可視まで (DB − memory の最大増分) | 空DBで +0.472 | 空DBで +4.667 | 未達 |
+| (3) 200ピンの開始 (全行読込＋seed、DB − memory の最大増分) | 背景0・部分欠落・warmで +3.061 | 背景0・一致済み・freshで +0.269 | 未達 |
+
+空DBの初期可視までの増減 (DB − memory)。ほかのcatalog形状では今回もすべて短縮した。
+
+| 接続 / worker数 | 前回 | 今回 |
+| --- | --- | --- |
+| fresh / 1 | +0.227 | +4.667 |
+| fresh / 4 | +0.472 | +1.540 |
+| warm / 1 | +0.185 | +0.627 |
+| warm / 4 | -0.292 | -0.047 |
+
+背景行0・200ピンの開始区間の増減 (全行読込＋seed、DB − memory)。
+
+| seedの状態 / 接続 | 前回 | 今回 |
+| --- | --- | --- |
+| 空 / fresh | -0.251 | -0.840 |
+| 空 / warm | +0.413 | -2.053 |
+| 部分欠落 / fresh | +2.010 | -0.902 |
+| 部分欠落 / warm | +3.061 | -4.559 |
+| 一致済み / fresh | +0.491 | +0.269 |
+| 一致済み / warm | +1.187 | -0.899 |
+
+背景1万行の200ピンでは、前回175.049〜203.099、今回は202.449〜459.590短縮した。
+両runでmemory側の絶対時間も変動している（例えば背景0・空・freshは40.169→57.650）。
+この比較から時間差の全量をSQL固定費へ帰属させたり、seed単体が一律に速くなったとはしない。
+新規接続はSQLiteのページcacheの条件で、OS cold cacheや実アプリの大きなframe間隔は今回も未確認。
+判定は(1) true / (2) false / (3) falseのまま記録し、許容差や設計を変えず設計担当へ渡す。
+
+### 9.4 独立実装レビューの修正
+
+初回差分は設計担当が `2ee4ecb9a` (本体)、`dab099abb` (自動縦横比) としてコミットした。
+既存テストのBox修正はmasterの `9ec9b8585` と重複するため破棄し、`8aa1296e0` でmasterを取り込み済み。
+利用者の自動縦横比の承認記録は `cf3b228f7`。
+
+- P2-1: 未準備の合成一覧は従来のUI `load_all` を保ち、`is_synthetic_view_path` に基づいて初期見本も取る。
+  Ratingの実入口→実poolで旧合成DBだけの画素を使い、初期見本が揃う回帰テストを追加した。
+  Fixedの未ヒットlookupはそのまま。仮想seed/writebackはPDF・ZIPの実sourceだけが対象で、合成一覧には付加しない。
+  動画seedは従来の準備済み値による実行済み判定とfull-pathキーを維持し、UIでの位置・順序も変えない。
+- P2-2: `load_one`・存在確認を `prepare_cached` にし、動画seedのUI照合とmetadata workerのDB fallback、
+  ベンチのDB modeを `matches_video_seed` に揃えた。metadata workerの控え→DBの優先順は保つ。
+  stamp・WebP・coverだけを読み、coverの復号と比較規則は従来どおり。通常workerの完全な行は維持。
+- P3: 仮想seed有効時だけ存在確認を行い、追加読み件数は無効時0。親との対応・stamp・writebackは維持。
+  disposable targetの読取りを失敗させるテストで、無効時の読取り省略と対応の保持を検査する。
+
+今回の本体lib全件ゲートは設計担当が後で行うため、実装担当は再実行しない。
+
+- 通常coreの `cargo check -p mimageviewer --bin mimageviewer-core`: 成功 (`target/check-800-revise.log`)。
+- catalog・thumb_loader・pin_materialization・S1・Rating復帰等の限定nextest: 354件すべて成功、26.963秒
+  (`target/tests-800-revise.log`)。新しいGPUは作っていない。
+- `cargo fmt --check`: 成功 (`target/fmt-check-800-revise.log`)。
+- 最適化benchのbuildと上記217行の実行: 成功。判定ツールは条件(2)(3)未達でexit 1。
+- 独立再レビュー (Sol / xhigh): 追加P1・P2なし。検証結果と採用判断は設計担当へ引き継ぐ。
+- `build-dev.ps1 -PreserveRuntime -WaitForOtherBuildsMinutes 0`: core・remote・EPUB worker・MCP・music-video editorの
+  通常featureビルドと配置が成功、VCRT/PE検査も成功 (`target/build-800-revise-dev.log`、exit 0)。
+  製品バイナリは起動していない。今回の限定検証と、この利用者用ビルドは全件ゲートの代用ではない。
+
+コミットは指定どおり行わず、次の対応で作業ツリーへ残す。`src/app.rs`、本書、
+`docs/ui-responsiveness.md` は複数項目にまたがるため、コミット時は項目の差分を分ける。
+
+| 項目 | 変更ファイル |
+| --- | --- |
+| P2-1 | `src/app.rs`、`src/app/tests.rs`、`src/app/tests/auto_aspect_s1.rs`、`docs/architecture-overview.md`、`docs/async-architecture.md`、`docs/auto-thumb-aspect-plan.md`、`docs/ui-responsiveness.md`、本書 |
+| P2-2 | `src/app.rs`、`src/catalog.rs`、`src/app/pin_materialization.rs`、`src/bin/bench_scroll/synthetic.rs`、`docs/ui-responsiveness.md`、本書（再ベンチ・検証記録を含む） |
+| P3 | `src/app.rs`、`src/app/tests/book_close_s1.rs`、`docs/virtual-folders.md`、`docs/ui-responsiveness.md`、本書 |
 

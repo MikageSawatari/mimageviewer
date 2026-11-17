@@ -5,10 +5,13 @@
 通常一覧の `resume_loading_items_after_sidecar` は空の控えを作り、画像 BLOB の
 `load_all` を UI で行わない。DB 未ヒットの読みはサムネイル worker が鍵1件で行う。
 `sli_catalog_prepare` は控えの用意だけを計測し、`entries` も控えの件数を表す。
-合成一覧の準備済みの写しと、少数行のドライブ一覧は変更しない。
+合成一覧の準備済みの写しと、未準備の合成一覧（★一覧など）の従来の UI `load_all` は維持する。
+この既存I/Oをworkerへ移すことは本件の範囲外。少数行のドライブ一覧も変更しない。
 
 既存 seed を worker へ移す案は、ピン更新・pool 再作成・正本の更新との順序を複雑にするため採らない。
 seed は従来の位置・順序を維持し、照合用に仮想先頭ページ1件と動画ピン対象ごとの DB 読みを加える。
+仮想seedが無効なら存在確認を省く。動画seed照合はstamp・WebP・coverだけを読み、存在確認・
+`load_one` とともにSQLの `prepare_cached` を使って繰返しprepareの費用を省く。
 `sli_virtual_seed` / `sli_video_pin_seed` は時間と追加読み件数 `reads` を記録する。
 この既存同期ループ自体の worker 化は別課題。catalog が空でピンが多い場合も含めて
 全行読み込み＋seed の合計を比較する。UI の writeback は撤去し、worker の

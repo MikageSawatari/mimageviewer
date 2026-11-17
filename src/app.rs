@@ -43040,14 +43040,20 @@ impl App {
         // 開いた時点の設定を使い、writeback の準備は従来どおり続ける。
         let seed_enabled = !self.settings.cache_book_cover_only;
         let seed_started = std::time::Instant::now();
+        let mut seed_reads = 0;
         // 仮想 catalog 側に既にあれば何もしない (再 seed 不要)。
-        let already_in_virtual = target_db
-            .contains_filename(&target_key)
-            .unwrap_or_else(|error| {
-                crate::logger::log(format!("virtual seed lookup failed: {error}"));
-                target_db.record_cache_error(format!("virtual seed lookup: {error}"));
-                false
-            });
+        let already_in_virtual = if seed_enabled {
+            seed_reads += 1;
+            target_db
+                .contains_filename(&target_key)
+                .unwrap_or_else(|error| {
+                    crate::logger::log(format!("virtual seed lookup failed: {error}"));
+                    target_db.record_cache_error(format!("virtual seed lookup: {error}"));
+                    false
+                })
+        } else {
+            false
+        };
         let parent_entry = if seed_enabled && !already_in_virtual {
             parent_db.load_one(&parent_key).ok().flatten()
         } else {
@@ -43099,7 +43105,7 @@ impl App {
                     "ms",
                     serde_json::json!(seed_started.elapsed().as_secs_f64() * 1000.0),
                 ),
-                ("reads", serde_json::json!(1)),
+                ("reads", serde_json::json!(seed_reads)),
             ],
         );
 
@@ -44664,6 +44670,12 @@ impl App {
         > = shared_prepared_entries.unwrap_or_else(|| {
             Arc::new(std::sync::RwLock::new(match prepared_catalog {
                 Some(prepared) => prepared.entries,
+                // Older synthetic rows live only in this view's catalog. Keep
+                // the existing UI snapshot when its producer has not prepared one.
+                None if is_synthetic_view_path(&source_path) => catalog_arc
+                    .as_ref()
+                    .and_then(|catalog| catalog.load_all().ok())
+                    .unwrap_or_default(),
                 // This is a record of rows saved/seeded in this listing, not a DB snapshot.
                 None => HashMap::new(),
             }))
@@ -44737,8 +44749,9 @@ impl App {
         }
 
         // Ordinary listings restore the saved ratio before drawing, then collect
-        // samples as thumbnails arrive. Only aggregates scan already prepared rows.
-        if aggregate_catalog_was_prepared {
+        // samples as thumbnails arrive. Synthetic views retain their initial scan,
+        // including producers that load their catalog snapshot here on the UI thread.
+        if is_synthetic_view_path(&source_path) {
             self.reset_and_seed_auto_aspect_with_seed(&cache_map, auto_aspect_seed, None);
         } else {
             self.reset_auto_aspect_with_seed(auto_aspect_seed);
@@ -46110,19 +46123,18 @@ impl App {
             // Identity is part of the seed: old rows are upgraded even if pixels match.
             reads.set(reads.get() + 1);
             let already_seeded = cat
-                .load_one(&pinned_key)
+                .matches_video_seed(
+                    &pinned_key,
+                    resolved.mtime,
+                    resolved.file_size,
+                    &webp,
+                    &cover,
+                )
                 .unwrap_or_else(|error| {
                     crate::logger::log(format!("video seed lookup failed: {error}"));
                     cat.record_cache_error(format!("video seed lookup: {error}"));
-                    None
-                })
-                .map(|entry| {
-                    entry.mtime == resolved.mtime
-                        && entry.file_size == resolved.file_size
-                        && entry.jpeg_data == webp
-                        && entry.cover == cover
-                })
-                .unwrap_or(false);
+                    false
+                });
             if already_seeded {
                 continue;
             }

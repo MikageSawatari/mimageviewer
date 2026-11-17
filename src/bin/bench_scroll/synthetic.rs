@@ -506,10 +506,8 @@ fn seed_cases(args: &Args, f: &Fixture, out: &mut std::fs::File) {
                                     .is_some_and(|entry| seed_same(entry, 123, 456, &webp, &cover))
                             } else {
                                 reads += 1;
-                                db.load_one(&key)
+                                db.matches_video_seed(&key, 123, 456, &webp, &cover)
                                     .unwrap()
-                                    .as_ref()
-                                    .is_some_and(|entry| seed_same(entry, 123, 456, &webp, &cover))
                             };
                             if already_seeded {
                                 continue;

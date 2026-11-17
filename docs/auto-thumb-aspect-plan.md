@@ -110,9 +110,11 @@ ColorImage サイズが取れる Loaded サムネは全部集計に入れる」�
 通常フォルダ、ZIP・変換書庫内、PDF/EPUB 内の通常一覧はこの復元だけを呼ぶ。見本は表示・先読みで
 サムネイルが到着した時に `poll_thumbnails` から集め、既存の入力 idle・見本数・連勝・cooldown の判定を通す。
 
-合成一覧と Collection の準備済み `cache_map` には既存の見本がある場合があるため、
+合成一覧と Collection の `cache_map` には既存の見本がある場合があるため、
 `reset_and_seed_auto_aspect_with_seed` は上記の復元と `seed_auto_aspect_from_cache` の両方を呼ぶ。
-空の map を通常一覧の印には使わず、呼出元の目的で使い分ける。以下の初期 seed の規則は、この準備済み一覧だけに適用する。
+準備済み catalog の無い★一覧なども、従来の UI `load_all` による全行の控えから見本を取る。
+合成かは `is_synthetic_view_path` で判定し、準備済み値の有無や空のmapを通常一覧の印には使わない。
+以下の初期 seed の規則は、この合成一覧・Collectionに適用する。
 
 `cache_map` は DB の全行を表すものではなく、古い名前の行も含み得る。
 **map を直接 for-each すると消えたファイルの比率が混入する**。

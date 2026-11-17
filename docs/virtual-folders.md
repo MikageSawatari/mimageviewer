@@ -16,7 +16,8 @@ route の位置番号によって外側の条件まで復元しない。
 
 通常一覧の控えは空で始まり、worker が保存した行と UI が seed した行を持つ。
 仮想先頭ページの seed は pool 起動前に従来どおり行い、仮想 catalog の鍵の存在を
-直接照合する。`cache_book_cover_only` 有効時は seed せず、EPUB は親 seed/writeback の対象外。
+直接照合する。`cache_book_cover_only` 有効時は存在確認もseedも行わず、`sli_virtual_seed` の追加読みは0件。
+親との対応の準備は保つ。EPUB は親 seed/writeback の対象外。
 
 親との対応は開いた時点の source・先頭ページの鍵／idx・items 世代・親 catalog／鍵・
 親ファイル stamp を保持する。可視／先読み／navigation／seek／overview／hover／idle upgrade の

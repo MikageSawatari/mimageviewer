@@ -229,6 +229,55 @@ fn virtual_seed_db_only_row_does_not_reseed_or_fill_sparse_map() {
 }
 
 #[test]
+fn virtual_seed_disabled_skips_target_lookup_but_keeps_parent_binding() {
+    let mut app = setup_app_for_test();
+    app.settings.cache_book_cover_only = true;
+    let source = app.tmp.path().join("book.pdf");
+    std::fs::write(&source, b"source").unwrap();
+    let cache_dir = crate::catalog::default_cache_dir();
+    let target = crate::catalog::CatalogDb::open(&cache_dir, &source).unwrap();
+    // A target lookup would fail and publish a cache notice. No test-only
+    // production hook is needed to distinguish skipping the read from a miss.
+    rusqlite::Connection::open(crate::catalog::db_path_for(&cache_dir, &source))
+        .unwrap()
+        .execute_batch("DROP TABLE thumbnails")
+        .unwrap();
+    assert!(target.contains_filename("page_0000").is_err());
+    let access = crate::catalog::CatalogAccess::for_cache_dir(&cache_dir);
+    assert!(access.take_cache_notice().is_none());
+    app.items = vec![GridItem::PdfPage {
+        pdf_path: source.clone(),
+        page_num: 0,
+        content_type: None,
+    }];
+    let map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+    app.setup_virtual_folder_seed_and_writeback(&source, &target, &map);
+    assert!(
+        access.take_cache_notice().is_none(),
+        "disabled seed must not query target"
+    );
+    assert!(map.read().unwrap().is_empty());
+    let binding = app.virtual_folder_parent.as_ref().unwrap();
+    assert_eq!(binding.source_path, source);
+    assert_eq!(binding.target_key, crate::grid_item::pdf_page_cache_key(0));
+    assert_eq!(binding.target_idx, 0);
+    assert_eq!(
+        (binding.parent_entry_mtime, binding.parent_entry_size),
+        source_stamp(&source)
+    );
+    // The same target is actually queried when seed is enabled.
+    app.settings.cache_book_cover_only = false;
+    app.setup_virtual_folder_seed_and_writeback(&source, &target, &map);
+    assert!(
+        access
+            .take_cache_notice()
+            .unwrap()
+            .contains("virtual seed lookup")
+    );
+    assert!(app.virtual_folder_parent.is_some());
+}
+
+#[test]
 fn video_seed_db_only_match_change_missing_and_corrupt() {
     use crate::folder_thumb_pins::{FileKind, FolderPinSource};
     let mut app = setup_app_for_test();

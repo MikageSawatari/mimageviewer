@@ -1657,11 +1657,51 @@ impl CatalogDb {
     /// rows with NULL pixels do not count, matching the rows accepted by `load_all`.
     pub fn contains_filename(&self, filename: &str) -> rusqlite::Result<bool> {
         let conn = self.phase()?;
-        conn.query_row(
+        let mut statement = conn.prepare_cached(
             "SELECT EXISTS(SELECT 1 FROM thumbnails WHERE filename = ?1 AND thumb_data IS NOT NULL)",
-            params![filename],
-            |row| row.get(0),
-        )
+        )?;
+        statement.query_row(params![filename], |row| row.get(0))
+    }
+
+    /// Compare the fields owned by a video seed without decoding unrelated
+    /// thumbnail metadata or allocating a second copy of its stored pixels.
+    pub fn matches_video_seed(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        thumb_data: &[u8],
+        cover: &CoverIdentity,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.phase()?;
+        let columns = self.thumbnail_columns(&conn)?;
+        let cover_column = if columns.cover { "cover_key" } else { "NULL" };
+        let sql = format!(
+            "SELECT mtime, file_size, thumb_data, {cover_column} FROM thumbnails \
+             WHERE filename = ?1 AND thumb_data IS NOT NULL"
+        );
+        let mut statement = conn.prepare_cached(&sql)?;
+        statement
+            .query_row(params![filename], |row| {
+                if row.get::<_, i64>(0)? != mtime || row.get::<_, i64>(1)? != file_size {
+                    return Ok(false);
+                }
+                let pixels = row.get_ref(2)?;
+                let rusqlite::types::ValueRef::Blob(pixels) = pixels else {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        2,
+                        "thumb_data".to_owned(),
+                        pixels.data_type(),
+                    ));
+                };
+                if pixels != thumb_data {
+                    return Ok(false);
+                }
+                let stored_cover = row.get::<_, Option<String>>(3)?;
+                Ok(CoverIdentity::from_sql(stored_cover.as_deref(), self.cover_drive) == *cover)
+            })
+            .optional()
+            .map(|matches| matches.unwrap_or(false))
     }
 
     /// Read only row names under a literal prefix, including `%` and `_` in names.
@@ -1700,7 +1740,7 @@ impl CatalogDb {
             "SELECT mtime, file_size, thumb_data, source_width, source_height, \
                     {layout_columns}, {proof_columns}, {cover_column}, {material_column} FROM thumbnails WHERE filename = ?1"
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let mut iter = stmt.query_map(params![filename], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -3642,6 +3682,176 @@ mod tests {
                 .1
                 .auto_material,
             material
+        );
+    }
+
+    #[test]
+    fn video_seed_match_checks_each_owned_field_without_decoding_other_metadata() {
+        let db = open_in_memory();
+        let cover = CoverIdentity::Page("c:/books/clip.mp4".into());
+        let pixels = b"stored video pixels";
+        db.save(
+            "seed",
+            17,
+            4096,
+            8,
+            12,
+            None,
+            pixels,
+            &cover,
+            AutoMaterial::NotAutomatic,
+        )
+        .unwrap();
+        assert!(
+            db.matches_video_seed("seed", 17, 4096, pixels, &cover)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("missing", 17, 4096, pixels, &cover)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("seed", 18, 4096, pixels, &cover)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("seed", 17, 8192, pixels, &cover)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("seed", 17, 4096, b"changed pixels", &cover)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("seed", 17, 4096, pixels, &CoverIdentity::Legacy)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed(
+                "seed",
+                17,
+                4096,
+                pixels,
+                &CoverIdentity::Page("c:/books/other.mp4".into())
+            )
+            .unwrap()
+        );
+
+        // The video seed contract does not consume dimensions, auto-crop material
+        // or selection proof. A full worker load remains responsible for those.
+        db.phase().unwrap().execute(
+            "UPDATE thumbnails SET source_width='invalid integer', auto_crops='invalid material', selection_proof='invalid proof' WHERE filename='seed'", [],
+        ).unwrap();
+        assert!(db.load_one("seed").is_err());
+        assert!(
+            db.matches_video_seed("seed", 17, 4096, pixels, &cover)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn video_seed_match_decodes_raw_cover_values_like_full_entry_load() {
+        let mut db = open_in_memory();
+        let pixels = b"video pixels";
+        db.save(
+            "seed",
+            1,
+            2,
+            8,
+            12,
+            None,
+            pixels,
+            &CoverIdentity::Legacy,
+            AutoMaterial::NotAutomatic,
+        )
+        .unwrap();
+        for raw in [
+            None,
+            Some("u"),
+            Some("n"),
+            Some("p:d:/external/clip.mp4"),
+            Some("q:/books/clip.mp4"),
+            Some("future:value"),
+        ] {
+            db.phase()
+                .unwrap()
+                .execute(
+                    "UPDATE thumbnails SET cover_key=?1 WHERE filename='seed'",
+                    params![raw],
+                )
+                .unwrap();
+            let expected = db.load_one("seed").unwrap().unwrap().cover;
+            assert!(
+                db.matches_video_seed("seed", 1, 2, pixels, &expected)
+                    .unwrap(),
+                "{raw:?}"
+            );
+            let different = if expected == CoverIdentity::Legacy {
+                CoverIdentity::Unknown
+            } else {
+                CoverIdentity::Legacy
+            };
+            assert!(
+                !db.matches_video_seed("seed", 1, 2, pixels, &different)
+                    .unwrap(),
+                "{raw:?}"
+            );
+        }
+        db.phase()
+            .unwrap()
+            .execute(
+                "UPDATE thumbnails SET cover_key='q:/books/clip.mp4' WHERE filename='seed'",
+                [],
+            )
+            .unwrap();
+        db.cover_drive = Some('e');
+        let expected = db.load_one("seed").unwrap().unwrap().cover;
+        assert_eq!(expected, CoverIdentity::Page("e:/books/clip.mp4".into()));
+        assert!(
+            db.matches_video_seed("seed", 1, 2, pixels, &expected)
+                .unwrap()
+        );
+        db.cover_drive = None;
+        let expected = db.load_one("seed").unwrap().unwrap().cover;
+        assert_eq!(expected, CoverIdentity::Unknown);
+        assert!(
+            db.matches_video_seed("seed", 1, 2, pixels, &expected)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn video_seed_match_accepts_legacy_cover_schema_and_rejects_null_pixels() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE thumbnails (filename TEXT PRIMARY KEY, mtime INTEGER, file_size INTEGER, thumb_data BLOB, source_width INTEGER, source_height INTEGER);
+            INSERT INTO thumbnails VALUES ('legacy',1,2,X'0102',8,12);
+            INSERT INTO thumbnails VALUES ('dims-only',1,2,NULL,8,12);").unwrap();
+        let db = CatalogDb::from_connection(
+            conn,
+            std::sync::Arc::new(CatalogAccess::new()),
+            CatalogAdmission::Admitted(0),
+            THUMBNAIL_SCHEMA_GENERATION.load(Ordering::Acquire),
+            ThumbnailColumns::default(),
+            Some('c'),
+        );
+        let expected = db.load_one("legacy").unwrap().unwrap().cover;
+        assert_eq!(expected, CoverIdentity::Legacy);
+        assert!(
+            db.matches_video_seed("legacy", 1, 2, &[1, 2], &expected)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("legacy", 1, 2, &[1, 2], &CoverIdentity::Unknown)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("dims-only", 1, 2, &[], &CoverIdentity::Legacy)
+                .unwrap()
+        );
+        assert!(!db.contains_filename("dims-only").unwrap());
+        assert!(
+            !db.matches_video_seed("missing", 1, 2, &[], &CoverIdentity::Legacy)
+                .unwrap()
         );
     }
 
