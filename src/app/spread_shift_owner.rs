@@ -66,6 +66,7 @@ enum RetainedReadoption {
     Reading {
         restore: Box<ViewerBookRestore>,
         started_at: std::time::Instant,
+        modal_observation: SidecarModalObservation,
     },
 }
 impl Clone for RetainedReadoption {
@@ -133,6 +134,22 @@ impl ViewerSpreadShift {
         match self.retained {
             RetainedReadoption::Reading { started_at, .. } => Some(started_at),
             _ => None,
+        }
+    }
+    pub(crate) fn record_retained_readoption_modal_shown(&self) {
+        if let RetainedReadoption::Reading {
+            restore,
+            started_at,
+            modal_observation,
+        } = &self.retained
+        {
+            modal_observation.record_shown(
+                *started_at,
+                "spread_shift_retained_readoption",
+                "Reading",
+                restore.receipt.open_id,
+                0,
+            );
         }
     }
     pub(crate) fn cancel_retained_readoption(&mut self) {
@@ -342,6 +359,7 @@ impl App {
                 self.spread_shift.retained = RetainedReadoption::Reading {
                     restore: Box::new(restore),
                     started_at: std::time::Instant::now(),
+                    modal_observation: SidecarModalObservation::default(),
                 }
             }
             Err(error) => {
@@ -358,6 +376,7 @@ impl App {
         let RetainedReadoption::Reading {
             mut restore,
             started_at,
+            modal_observation,
         } = std::mem::take(&mut self.spread_shift.retained)
         else {
             return;
@@ -368,6 +387,7 @@ impl App {
                 self.spread_shift.retained = RetainedReadoption::Reading {
                     restore,
                     started_at,
+                    modal_observation,
                 };
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
             }
@@ -512,6 +532,7 @@ impl App {
                 self.spread_shift.retained = RetainedReadoption::Reading {
                     restore: Box::new(restore),
                     started_at: std::time::Instant::now(),
+                    modal_observation: SidecarModalObservation::default(),
                 };
             }
             Err(error) => {
@@ -977,6 +998,69 @@ impl App {
     pub(crate) fn set_spread_shift_anchor_for_test(&mut self, anchor: Option<usize>) {
         self.spread_shift.projection = None;
         self.spread_shift.state = anchor.map_or(ViewerShift::None, ViewerShift::Ordinary);
+    }
+}
+
+#[cfg(test)]
+mod sidecar_restore_modal_tests {
+    use super::*;
+
+    #[test]
+    fn retained_readoption_uses_the_shared_modal_grace_and_keeps_input_gated() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("retained-modal.pdf");
+        app.current_folder = Some(folder.clone());
+        app.items = vec![GridItem::PdfPage {
+            pdf_path: folder.clone(),
+            page_num: 0,
+            content_type: None,
+        }];
+        app.spread_mode = crate::settings::SpreadMode::Ltr;
+        assert_eq!(
+            app.current_spread_shift_scope(),
+            Some(BookScopeKey::document(&folder).unwrap())
+        );
+        let restore = app.capture_book_shift_restore(1, true).unwrap();
+        let started_at = std::time::Instant::now();
+        let deadline = started_at + SIDECAR_RESTORE_MODAL_GRACE;
+        app.spread_shift.retained = RetainedReadoption::Reading {
+            restore: Box::new(restore),
+            started_at,
+            modal_observation: SidecarModalObservation::default(),
+        };
+        assert!(app.sidecar_restore_blocks_projected_context());
+        let ctx = egui::Context::default();
+        let early = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            app.show_sidecar_restore_dialog_at(ctx, deadline - std::time::Duration::from_millis(1));
+        });
+        assert!(early.shapes.is_empty());
+        assert!(
+            early.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                <= std::time::Duration::from_millis(1)
+        );
+        let sizing = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            app.show_sidecar_restore_dialog_at(ctx, deadline);
+        });
+        assert!(!sizing.shapes.is_empty());
+        assert!(
+            sizing
+                .shapes
+                .iter()
+                .all(|shape| matches!(shape.shape, egui::Shape::Noop))
+        );
+        let visible = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            app.show_sidecar_restore_dialog_at(ctx, deadline);
+        });
+        assert!(
+            visible
+                .shapes
+                .iter()
+                .any(|shape| !matches!(shape.shape, egui::Shape::Noop))
+        );
+        assert!(app.sidecar_restore_blocks_projected_context());
+        early.drop_without_applying_deltas();
+        sizing.drop_without_applying_deltas();
+        visible.drop_without_applying_deltas();
     }
 }
 

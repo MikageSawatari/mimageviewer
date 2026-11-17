@@ -47,10 +47,11 @@ v3.8.0ではlegacy seedはフォルダ表示後のバックグラウンド処理
 - `Quiescing` は保存中のsidecar/metadata writerとDB releaseを従来どおり待つ。廃止した
   `tag_legacy_seed_pending` は存在せず、初訪問の画像XMP走査を待たない。rating readerのcancelと
   ほかの保存保護barrierは維持する。
-- 待機が100ms以内に終わればダイアログは描画しない。100msを超えるとphase別の見出しと説明を
+- 表示猶予は当時100ms（2026-11-18 に 500 ms へ変更。根拠は[非同期復旧計画](sidecar-import-async-plan.md)参照）。
+  待機が猶予内に終わればダイアログは描画しない。猶予以上でactiveならphase別の見出しと説明を
   描画する。`Quiescing` は「保存中の設定を確定中」、`Checking` は
   「保存されている設定を確認中」、`Running` だけが「サイドカーから設定を復元中」となる。
-  この100msは表示の点滅を抑える猶予であり、restore state、入力gate、worker pollを遅らせない。
+  この猶予は表示の点滅を抑えるものであり、restore state、入力gate、worker pollを遅らせない。
 - seed完了後のworkerはsidecar writerのstrict idleを確認し、`mimageviewer.dat` のmetadata/readと
   source再検証、要求familyの中央DB marker読取を行う。sidecarが無ければmarkerの有無を調べ、
   古いmarkerだけがあれば削除する。sidecarがありmarkerと一致しなければimportへ進む。
@@ -66,7 +67,8 @@ v3.8.0ではlegacy seedはフォルダ表示後のバックグラウンド処理
 
 今回の証拠から確定できるのは、初回の約0.9秒が300件の旧タグseed完了に支配され、seed後の
 sidecar flush/probeから入力解放までが約22msだったこと、固定見出しが実処理phaseを誤認させた
-ことである。自動seedとその待機ownerを型ごと撤去し、100msの表示猶予や保存barrierは維持した。
+ことである。自動seedとその待機ownerを型ごと撤去し、当時100msの表示猶予や保存barrierは維持した
+（表示猶予は2026-11-18 に 500 ms へ変更）。
 
 ## 旧XMPタグ自動seedの廃止（利用者了承・実装済み）
 

@@ -17,7 +17,61 @@ pub(super) fn import_starts_for_test() -> usize {
 }
 
 const SIDECAR_WRITER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-const SIDECAR_RESTORE_MODAL_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+// User perf logs: ordinary waits reach ~350 ms and post-load frames take 50–140 ms.
+// 100 ms could flash the full-viewport backdrop for a few frames; report waits above 500 ms.
+pub(crate) const SIDECAR_RESTORE_MODAL_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
+/// Request-owned telemetry only; never drives restore phases, polling or input gates.
+#[derive(Default)]
+pub(crate) struct SidecarModalObservation {
+    first_shown_at: std::cell::Cell<Option<std::time::Instant>>,
+}
+
+impl SidecarModalObservation {
+    pub(crate) fn was_shown(&self) -> bool {
+        self.first_shown_at.get().is_some()
+    }
+
+    fn record_once(&self, enabled: bool, now: std::time::Instant, emit: impl FnOnce()) {
+        if !enabled || self.was_shown() {
+            return;
+        }
+        self.first_shown_at.set(Some(now));
+        emit();
+    }
+
+    pub(crate) fn record_shown(
+        &self,
+        started_at: std::time::Instant,
+        source: &'static str,
+        phase: &'static str,
+        request_id: u64,
+        seq: u64,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        self.record_once(true, now, || {
+            crate::perf::event(
+                "nav",
+                "sli_sidecar_modal_shown",
+                None,
+                seq,
+                &[
+                    ("source", source.into()),
+                    ("phase", phase.into()),
+                    ("request_id", request_id.into()),
+                    (
+                        "ms",
+                        (now.saturating_duration_since(started_at).as_secs_f64() * 1000.0).into(),
+                    ),
+                ],
+            );
+        });
+    }
+}
 const SIDECAR_REUSE_MAX_FOLDERS: usize = 4;
 const SIDECAR_REUSE_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 const _: () = assert!(SIDECAR_REUSE_MAX_FOLDERS > 0);
@@ -169,6 +223,7 @@ enum RequiredAction {
 
 struct Common {
     request_id: u64,
+    modal_observation: SidecarModalObservation,
     /// Presentation grace starts with the typed restore owner.  It never delays the
     /// quiescence/probe state machine or relaxes its input gate.
     started_at: std::time::Instant,
@@ -736,6 +791,28 @@ impl SidecarRestoreState {
         SIDECAR_RESTORE_MODAL_GRACE
             .saturating_sub(now.saturating_duration_since(self.common.started_at))
     }
+
+    pub(crate) fn record_modal_shown(&self) {
+        let seq = match &self.common.continuation {
+            ContinuationOwner::Live(continuation) => continuation.sli_seq,
+            _ => 0,
+        };
+        self.common.modal_observation.record_shown(
+            self.common.started_at,
+            "sidecar_restore",
+            match self.phase {
+                Phase::PreparingPageIndex(_) => "PreparingPageIndex",
+                Phase::Checking(_) => "Checking",
+                Phase::Quiescing(_) => "Quiescing",
+                Phase::Running(_) => "Running",
+                Phase::CacheRefreshing(_) => "CacheRefreshing",
+                Phase::InvalidatingPreview(_) => "InvalidatingPreview",
+                Phase::Resuming => "Resuming",
+            },
+            self.common.request_id,
+            seq,
+        );
+    }
 }
 
 impl App {
@@ -977,6 +1054,7 @@ impl App {
         self.sidecar_restore = Some(SidecarRestoreState {
             checking_relay: None,
             common: Common {
+                modal_observation: SidecarModalObservation::default(),
                 request_id: 1,
                 started_at: std::time::Instant::now(),
                 target_context,
@@ -1015,6 +1093,7 @@ impl App {
         self.sidecar_restore = Some(SidecarRestoreState {
             checking_relay: None,
             common: Common {
+                modal_observation: SidecarModalObservation::default(),
                 request_id: 1,
                 started_at,
                 target_context,
@@ -1454,7 +1533,7 @@ impl App {
             self.retire_smart_folder_payloads([
                 Box::new(previous) as smart_folder::RetiredSmartFolderPayload
             ]);
-            self.resume_loading_items_after_sidecar(continuation);
+            self.resume_loading_items_after_sidecar(continuation, false);
             return Ok(());
         }
 
@@ -1514,6 +1593,7 @@ impl App {
             #[cfg(test)]
             checking_relay: None,
             common: Common {
+                modal_observation: SidecarModalObservation::default(),
                 request_id,
                 started_at,
                 target_context,
@@ -1704,6 +1784,7 @@ impl App {
             #[cfg(test)]
             checking_relay: None,
             common: Common {
+                modal_observation: SidecarModalObservation::default(),
                 request_id,
                 started_at: std::time::Instant::now(),
                 target_context: self.sidecar_restore_projected_context(),
@@ -2780,7 +2861,10 @@ impl App {
                 // first display can transfer it to composition or retire the fenced result.
                 self.capture_deferred_book_resume(deferred);
             }
-            self.resume_loading_items_after_sidecar(continuation);
+            self.resume_loading_items_after_sidecar(
+                continuation,
+                state.common.modal_observation.was_shown(),
+            );
         }
         for command in favorite_failures {
             self.restore_failed_favorite_command(command);
@@ -3699,6 +3783,7 @@ mod tests {
         SidecarRestoreState {
             checking_relay: None,
             common: Common {
+                modal_observation: SidecarModalObservation::default(),
                 request_id: 1,
                 started_at: std::time::Instant::now(),
                 target_context: ViewerContextId::for_test(1),
@@ -3764,6 +3849,16 @@ mod tests {
             SIDECAR_RESTORE_MODAL_GRACE
         );
         assert_eq!(
+            SIDECAR_RESTORE_MODAL_GRACE,
+            std::time::Duration::from_millis(500)
+        );
+        assert_eq!(
+            app.sidecar_restore.as_ref().unwrap().modal_delay_remaining(
+                started_at + SIDECAR_RESTORE_MODAL_GRACE - std::time::Duration::from_millis(1)
+            ),
+            std::time::Duration::from_millis(1)
+        );
+        assert_eq!(
             app.sidecar_restore
                 .as_ref()
                 .unwrap()
@@ -3771,28 +3866,83 @@ mod tests {
             std::time::Duration::ZERO
         );
 
-        app.sidecar_restore.as_mut().unwrap().common.started_at =
-            std::time::Instant::now() + SIDECAR_RESTORE_MODAL_GRACE;
-        let early = egui::Context::default().run_pass(egui::RawInput::default(), |ctx| {
-            app.show_sidecar_restore_dialog(ctx);
+        let ctx = egui::Context::default();
+        let deadline = started_at + SIDECAR_RESTORE_MODAL_GRACE;
+        let early = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            app.show_sidecar_restore_dialog_at(ctx, deadline - std::time::Duration::from_millis(1));
         });
         assert!(
             early.shapes.is_empty(),
             "presentation alone must stay hidden during the grace"
         );
+        assert!(
+            early.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+                <= std::time::Duration::from_millis(1)
+        );
 
-        app.sidecar_restore.as_mut().unwrap().common.started_at =
-            std::time::Instant::now() - SIDECAR_RESTORE_MODAL_GRACE;
-        let visible = egui::Context::default().run_pass(egui::RawInput::default(), |ctx| {
-            app.show_sidecar_restore_dialog(ctx);
+        let sizing = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            app.show_sidecar_restore_dialog_at(ctx, deadline);
         });
         assert!(
-            !visible.shapes.is_empty(),
+            !sizing.shapes.is_empty(),
+            "the deadline must start the Modal's sizing pass"
+        );
+        assert!(
+            sizing
+                .shapes
+                .iter()
+                .all(|shape| matches!(shape.shape, egui::Shape::Noop))
+        );
+        let visible = ctx.run_pass(egui::RawInput::default(), |ctx| {
+            app.show_sidecar_restore_dialog_at(ctx, deadline);
+        });
+        assert!(
+            visible
+                .shapes
+                .iter()
+                .any(|shape| !matches!(shape.shape, egui::Shape::Noop)),
             "an active restore must draw its progress modal after the grace"
         );
         assert!(app.sidecar_restore_blocks_projected_context());
         early.drop_without_applying_deltas();
+        sizing.drop_without_applying_deltas();
         visible.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn sidecar_modal_observation_emits_once_per_request_and_is_inert_when_disabled() {
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("modal-observation");
+        app.activate_sidecar_restore_modal_for_test(folder.clone());
+        let mut events = Vec::new();
+        let now = std::time::Instant::now();
+        let state = app.sidecar_restore.as_mut().unwrap();
+        state
+            .common
+            .modal_observation
+            .record_once(false, now, || events.push("disabled"));
+        assert!(!state.common.modal_observation.was_shown());
+        state
+            .common
+            .modal_observation
+            .record_once(true, now, || events.push("first"));
+        state.phase = Phase::Quiescing(Quiescing {
+            local_adjust_fence: LocalAdjustFence::NotStarted,
+            favorite_started: false,
+        });
+        state
+            .common
+            .modal_observation
+            .record_once(true, now, || events.push("second phase"));
+        assert!(state.common.modal_observation.was_shown());
+        app.activate_sidecar_restore_modal_for_test(folder);
+        let state = app.sidecar_restore.as_ref().unwrap();
+        assert!(!state.common.modal_observation.was_shown());
+        state
+            .common
+            .modal_observation
+            .record_once(true, now, || events.push("new request"));
+        assert_eq!(events, ["first", "new request"]);
     }
 
     #[test]
@@ -4499,10 +4649,9 @@ mod tests {
         assert!(app.begin_sidecar_restore(continuation, false).is_ok());
         assert!(app.sidecar_restore_blocks_projected_context());
         assert_eq!(
-            app.sidecar_restore
-                .as_ref()
-                .unwrap()
-                .modal_delay_remaining(started_at + std::time::Duration::from_millis(99)),
+            app.sidecar_restore.as_ref().unwrap().modal_delay_remaining(
+                started_at + SIDECAR_RESTORE_MODAL_GRACE - std::time::Duration::from_millis(1)
+            ),
             std::time::Duration::from_millis(1),
             "a fast Missing/no-marker or synchronized Current terminal must not flash the modal"
         );

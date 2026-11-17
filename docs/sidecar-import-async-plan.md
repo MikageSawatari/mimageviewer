@@ -321,10 +321,42 @@ write permit と lossless deferred intent を実装する必要はない。§4.1
 移さない。モーダルは競合する操作を新しく発生させないための仕様であり、UI thread を block する
 仕組みではない。worker の進捗待ちは毎 frame の poll と repaint deadline で進める。
 state と target の入力 gate は旧同期 import 点で直ちに確立するが、モーダルの描画だけは開始から
-100 ms の猶予を置く。猶予中も state machine は遅延せず、deadline までの repaint を予約する。
+500 ms の猶予を置く (`SIDECAR_RESTORE_MODAL_GRACE` を retained readoption と共有)。
+猶予中も state machine は遅延せず、deadline までの repaint を予約する。
 Missing かつ marker 無し、または同期済みの短い確認が猶予内に terminal へ達した場合は表示を
 flash させず、猶予を超えて active な場合だけ進捗を表示する。これは安全な probe を省略する
 fast path ではなく、quiescence、flush、strict probe、tail の一回所有を一切変えない表示方針である。
+
+### 2026-11-18 モーダル表示猶予の見直し
+
+利用者の既存 perf / 通常ログでは、通常の確認待ちは最大約0.35秒、フォルダ読み込み直後の
+UIフレームは50〜140 msだった。100 msでは短い待ちでも全面暗幕付きの小窓が1〜数フレーム
+点滅し得るため、表示猶予を500 msへ延ばす。これはお気に入り切替時のちらつきの最有力候補
+への対処であり、実機の目視による原因確定はまだ行っていない。0.5秒以上でactiveな待ちは
+従来のモーダルで操作できない理由を知らせる。猶予中もrestore state・入力gate・worker pollは
+進み、`request_repaint_after(remaining)` による猶予終端の再描画予約を維持する。
+detached fullscreen の直接描画経路とvendorは変更しない。
+
+検討して採らなかった案:
+
+- 暗幕だけを消す: 長い待ちの「操作できない理由」の見せ方が変わり、短い待ちでは中央の小窓の
+  点滅が残るため採らない。
+- worker結果の回収を描画前へ移す: `post_render_sidecar_restore` は `update_frame` のearly return群の
+  外側で回収し、終端フレームの入力passまでgateを保持する配置である。この契約を崩し、実際に
+  100 msを超える待ちにも効かないため採らない。
+
+CLAUDE.md「設計の簡素化」に従い、restore phaseや待機状態を増やさず既存の表示期限だけを
+調整する案を選んだ。計装だけは既存request owner内にtypedな初回描画記録を持たせ、
+`&self`から記録してもphase・入力gateには使わない。retained readoptionもそのReading ownerが
+記録を所有し、pollで所有権を移しても保持、完了・取消・新規requestで破棄する。
+perf無効時は記録もイベント生成もしない。実際の初回描画直後に一度だけ
+`nav/sli_sidecar_modal_shown` (`source`, `phase`, `request_id`, `ms` = restore開始からの時間) を記録し、
+通常restoreは`seq`で既存の`nav/sli_sidecar_import`と対応付け、後者へ`modal_shown` boolを加える。
+`source`は`sidecar_restore` / `spread_shift_retained_readoption`で区別する。後者はReading phase、
+`request_id`は既存のopen receipt id、`seq=0`とする。新たな回復処理は設けない。
+egui Areaの初回不可視sizing passは表示に数えず、Modal contentが可視かつsizing passでない
+場合だけ記録する。headless回帰では499 msの非構築、500 msでの不可視sizing、同じContextの
+次フレームでの可視描画を区別し、非Noop shapeと描画関数の戻り値で確認する。
 
 ### 5.1 state owner と pause 位置
 
@@ -724,7 +756,7 @@ consumer と、結果を install する最後の terminal の両方で照合す�
 - synchronized/Missing/disabled probe より前に local-adjust/edit-bundle/favorite completion が残る race で
   全 completion/mirror 反映と flush 後の strict probe を通ること
 - 製品 `Settings` の sidecar backup default は有効のまま維持すること。Missing/marker無しまたは同期済みの
-  短い terminal は100 ms未満ならモーダルを描かずtailを一度だけ実行し、100 msを超えてactiveなら
+  短い terminal は500 ms未満ならモーダルを描かずtailを一度だけ実行し、500 ms以上でactiveなら
   target gateを維持したままモーダルを描くこと。marker clear/import/dirty outgoingは同じbarrierを通ること
 - sidecar復元と無関係な共有navigation fixtureは edit/tag backupを両方OFFにした明示的な `NoSidecar`
   profileとする。復元/default契約testは明示的にONにしてstateをpollし、production cfgをtest都合で変えないこと
