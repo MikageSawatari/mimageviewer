@@ -1,4 +1,4 @@
-# 直接移動のフォルダ走査を worker へ移す (§1.NNN)
+# 直接移動のフォルダ走査を worker へ移す (§1.805)
 
 状態: 設計 (2026-11-18)。担当: 設計・検収 = ClaudeCode Opus 5.5、実装 = Codex GPT-6.1 Sol / high、
 独立レビュー = GPT-6.1 Sol / xhigh。
