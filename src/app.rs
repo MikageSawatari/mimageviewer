@@ -44368,7 +44368,7 @@ impl App {
     fn resume_loading_items_after_sidecar(
         &mut self,
         mut continuation: sidecar_restore::SidecarLoadContinuation,
-        modal_shown: bool,
+        modal_observation: &SidecarModalObservation,
     ) {
         if matches!(
             continuation.navigation_after_hydration,
@@ -44441,23 +44441,7 @@ impl App {
         self.page_edit_snapshot = prepared_page_edits
             .as_mut()
             .map(|(snapshot, _)| std::mem::take(snapshot));
-        if crate::perf::is_enabled() {
-            crate::perf::event(
-                "nav",
-                "sli_sidecar_import",
-                None,
-                sli_seq,
-                &[
-                    (
-                        "ms",
-                        serde_json::Value::from(
-                            restore_started_at.elapsed().as_secs_f64() * 1000.0,
-                        ),
-                    ),
-                    ("modal_shown", modal_shown.into()),
-                ],
-            );
-        }
+        modal_observation.record_import(sli_seq, restore_started_at);
         let adj_t0 = std::time::Instant::now();
         if let Some((_, projection)) = prepared_page_edits.as_mut() {
             self.adjustment_page_params = std::mem::take(&mut projection.adjustment);

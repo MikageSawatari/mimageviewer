@@ -47,7 +47,7 @@ impl App {
                     detail: "保存された見開き調整を表示へ反映しています。",
                 },
             ) {
-                self.spread_shift.record_retained_readoption_modal_shown();
+                self.spread_shift.offer_retained_readoption_modal_paint();
             }
             return;
         }
@@ -62,7 +62,7 @@ impl App {
             return;
         }
         if draw_sidecar_restore_modal(ctx, state.presentation()) {
-            state.record_modal_shown();
+            state.offer_modal_paint();
         }
     }
 }

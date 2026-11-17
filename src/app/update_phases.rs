@@ -2266,6 +2266,13 @@ impl App {
 
     /// Must run even after update_frame returns, after this pass's modal/input gate.
     pub(super) fn post_render_sidecar_restore(&mut self, ctx: &egui::Context) {
+        // Production discard requests found so far occur during UI construction before here;
+        // later requests (e.g. on_end_pass) are outside this diagnostic metric's scope.
+        if let Some(restore) = &self.sidecar_restore {
+            restore.confirm_modal_paint(ctx);
+        }
+        self.spread_shift
+            .confirm_retained_readoption_modal_paint(ctx);
         self.poll_sidecar_restore(ctx);
     }
 }

@@ -25,23 +25,33 @@ pub(crate) const SIDECAR_RESTORE_MODAL_GRACE: std::time::Duration =
 /// Request-owned telemetry only; never drives restore phases, polling or input gates.
 #[derive(Default)]
 pub(crate) struct SidecarModalObservation {
-    first_shown_at: std::cell::Cell<Option<std::time::Instant>>,
+    record: std::cell::Cell<ModalObservationState>,
+}
+
+#[derive(Clone, Copy, Default)]
+enum ModalObservationState {
+    #[default]
+    Unseen,
+    Candidate(ModalPaint),
+    Shown,
+}
+
+#[derive(Clone, Copy)]
+struct ModalPaint {
+    ms: f64,
+    source: &'static str,
+    phase: &'static str,
+    request_id: u64,
+    seq: u64,
 }
 
 impl SidecarModalObservation {
-    pub(crate) fn was_shown(&self) -> bool {
-        self.first_shown_at.get().is_some()
+    #[cfg(test)]
+    pub(super) fn has_candidate(&self) -> bool {
+        matches!(self.record.get(), ModalObservationState::Candidate(_))
     }
 
-    fn record_once(&self, enabled: bool, now: std::time::Instant, emit: impl FnOnce()) {
-        if !enabled || self.was_shown() {
-            return;
-        }
-        self.first_shown_at.set(Some(now));
-        emit();
-    }
-
-    pub(crate) fn record_shown(
+    pub(crate) fn offer_paint(
         &self,
         started_at: std::time::Instant,
         source: &'static str,
@@ -49,28 +59,136 @@ impl SidecarModalObservation {
         request_id: u64,
         seq: u64,
     ) {
-        if !crate::perf::is_enabled() {
+        if !modal_perf_enabled() || !matches!(self.record.get(), ModalObservationState::Unseen) {
             return;
         }
-        let now = std::time::Instant::now();
-        self.record_once(true, now, || {
-            crate::perf::event(
-                "nav",
-                "sli_sidecar_modal_shown",
-                None,
+        self.record
+            .set(ModalObservationState::Candidate(ModalPaint {
+                ms: started_at.elapsed().as_secs_f64() * 1000.0,
+                source,
+                phase,
+                request_id,
                 seq,
-                &[
-                    ("source", source.into()),
-                    ("phase", phase.into()),
-                    ("request_id", request_id.into()),
-                    (
-                        "ms",
-                        (now.saturating_duration_since(started_at).as_secs_f64() * 1000.0).into(),
-                    ),
-                ],
-            );
-        });
+            }));
     }
+
+    pub(crate) fn confirm_paint(&self, ctx: &egui::Context) {
+        if !modal_perf_enabled() {
+            return;
+        }
+        let ModalObservationState::Candidate(paint) = self.record.get() else {
+            return;
+        };
+        if ctx.will_discard() {
+            self.record.set(ModalObservationState::Unseen);
+            return;
+        }
+        self.record.set(ModalObservationState::Shown);
+        emit_modal_perf(
+            "sli_sidecar_modal_shown",
+            paint.seq,
+            &[
+                ("source", paint.source.into()),
+                ("phase", paint.phase.into()),
+                ("request_id", paint.request_id.into()),
+                ("ms", paint.ms.into()),
+            ],
+        );
+    }
+
+    pub(crate) fn record_import(&self, seq: u64, started_at: std::time::Instant) {
+        if !modal_perf_enabled() {
+            return;
+        }
+        emit_modal_perf(
+            "sli_sidecar_import",
+            seq,
+            &[
+                ("ms", (started_at.elapsed().as_secs_f64() * 1000.0).into()),
+                (
+                    "modal_shown",
+                    matches!(self.record.get(), ModalObservationState::Shown).into(),
+                ),
+            ],
+        );
+    }
+}
+
+fn modal_perf_enabled() -> bool {
+    #[cfg(test)]
+    if MODAL_PERF_CAPTURE.with(|capture| capture.borrow().is_some()) {
+        return true;
+    }
+    crate::perf::is_enabled()
+}
+
+fn emit_modal_perf(kind: &str, seq: u64, fields: &[(&str, serde_json::Value)]) {
+    #[cfg(test)]
+    if MODAL_PERF_CAPTURE.with(|capture| {
+        let mut capture = capture.borrow_mut();
+        let Some(events) = capture.as_mut() else {
+            return false;
+        };
+        let mut event = serde_json::json!({"kind": kind, "seq": seq});
+        for (key, value) in fields {
+            event[*key] = value.clone();
+        }
+        events.push(event);
+        true
+    }) {
+        return;
+    }
+    crate::perf::event("nav", kind, None, seq, fields);
+}
+
+#[cfg(test)]
+thread_local! {
+    static MODAL_PERF_CAPTURE: std::cell::RefCell<Option<Vec<serde_json::Value>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) struct ModalPerfCapture;
+
+#[cfg(test)]
+impl ModalPerfCapture {
+    pub(super) fn new() -> Self {
+        MODAL_PERF_CAPTURE.with(|capture| {
+            assert!(capture.borrow().is_none());
+            *capture.borrow_mut() = Some(Vec::new());
+        });
+        Self
+    }
+    pub(super) fn events(&self) -> Vec<serde_json::Value> {
+        MODAL_PERF_CAPTURE.with(|capture| capture.borrow().as_ref().unwrap().clone())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ModalPerfCapture {
+    fn drop(&mut self) {
+        MODAL_PERF_CAPTURE.with(|capture| *capture.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn warm_modal_for_test(ctx: &egui::Context) {
+    let mut visible = false;
+    for _ in 0..2 {
+        ctx.run_pass(Default::default(), |ctx| {
+            visible = crate::ui_dialogs::sidecar_restore::draw_sidecar_restore_modal(
+                ctx,
+                SidecarRestorePresentation {
+                    heading: "heading",
+                    detail: "detail",
+                },
+            );
+        })
+        .drop_without_applying_deltas();
+    }
+    assert!(
+        visible,
+        "prepare a genuinely visible Area before offering a candidate"
+    );
 }
 const SIDECAR_REUSE_MAX_FOLDERS: usize = 4;
 const SIDECAR_REUSE_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
@@ -792,12 +910,16 @@ impl SidecarRestoreState {
             .saturating_sub(now.saturating_duration_since(self.common.started_at))
     }
 
-    pub(crate) fn record_modal_shown(&self) {
+    pub(crate) fn confirm_modal_paint(&self, ctx: &egui::Context) {
+        self.common.modal_observation.confirm_paint(ctx);
+    }
+
+    pub(crate) fn offer_modal_paint(&self) {
         let seq = match &self.common.continuation {
             ContinuationOwner::Live(continuation) => continuation.sli_seq,
             _ => 0,
         };
-        self.common.modal_observation.record_shown(
+        self.common.modal_observation.offer_paint(
             self.common.started_at,
             "sidecar_restore",
             match self.phase {
@@ -1533,7 +1655,10 @@ impl App {
             self.retire_smart_folder_payloads([
                 Box::new(previous) as smart_folder::RetiredSmartFolderPayload
             ]);
-            self.resume_loading_items_after_sidecar(continuation, false);
+            self.resume_loading_items_after_sidecar(
+                continuation,
+                &SidecarModalObservation::default(),
+            );
             return Ok(());
         }
 
@@ -2861,10 +2986,7 @@ impl App {
                 // first display can transfer it to composition or retire the fenced result.
                 self.capture_deferred_book_resume(deferred);
             }
-            self.resume_loading_items_after_sidecar(
-                continuation,
-                state.common.modal_observation.was_shown(),
-            );
+            self.resume_loading_items_after_sidecar(continuation, &state.common.modal_observation);
         }
         for command in favorite_failures {
             self.restore_failed_favorite_command(command);
@@ -3910,39 +4032,149 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_modal_observation_emits_once_per_request_and_is_inert_when_disabled() {
-        let mut app = crate::app::setup_app_for_test();
-        let folder = app.tmp.path().join("modal-observation");
-        app.activate_sidecar_restore_modal_for_test(folder.clone());
-        let mut events = Vec::new();
-        let now = std::time::Instant::now();
-        let state = app.sidecar_restore.as_mut().unwrap();
-        state
-            .common
-            .modal_observation
-            .record_once(false, now, || events.push("disabled"));
-        assert!(!state.common.modal_observation.was_shown());
-        state
-            .common
-            .modal_observation
-            .record_once(true, now, || events.push("first"));
-        state.phase = Phase::Quiescing(Quiescing {
-            local_adjust_fence: LocalAdjustFence::NotStarted,
-            favorite_started: false,
-        });
-        state
-            .common
-            .modal_observation
-            .record_once(true, now, || events.push("second phase"));
-        assert!(state.common.modal_observation.was_shown());
-        app.activate_sidecar_restore_modal_for_test(folder);
-        let state = app.sidecar_restore.as_ref().unwrap();
-        assert!(!state.common.modal_observation.was_shown());
-        state
-            .common
-            .modal_observation
-            .record_once(true, now, || events.push("new request"));
-        assert_eq!(events, ["first", "new request"]);
+    fn sidecar_modal_observation_confirms_once_per_request_after_ui_discard() {
+        for source in ["sidecar_restore", "spread_shift_retained_readoption"] {
+            let capture = ModalPerfCapture::new();
+            let ctx = egui::Context::default();
+            ctx.options_mut(|options| options.max_passes = 2.try_into().unwrap());
+            let observation = SidecarModalObservation::default();
+            let started = std::time::Instant::now();
+            ctx.run_pass(Default::default(), |ctx| {
+                let phase = if ctx.current_pass_index() == 0 {
+                    "Quiescing"
+                } else {
+                    "Checking"
+                };
+                observation.offer_paint(started, source, phase, 1, 7);
+                assert!(capture.events().is_empty());
+                if ctx.current_pass_index() == 0 {
+                    ctx.request_discard("UI layout after Modal");
+                }
+                observation.confirm_paint(ctx);
+            })
+            .drop_without_applying_deltas();
+            assert_eq!(capture.events().len(), 1);
+            assert_eq!(capture.events()[0]["phase"], "Checking");
+            assert_eq!(capture.events()[0]["source"], source);
+            ctx.run_pass(Default::default(), |ctx| {
+                observation.offer_paint(started, source, "Running", 1, 7);
+                observation.confirm_paint(ctx);
+                observation.confirm_paint(ctx);
+            })
+            .drop_without_applying_deltas();
+            observation.record_import(7, started);
+            assert_eq!(capture.events().len(), 2);
+            assert_eq!(capture.events()[1]["modal_shown"], true);
+            let next = SidecarModalObservation::default();
+            ctx.run_pass(Default::default(), |ctx| {
+                next.offer_paint(started, source, "Checking", 2, 8);
+                next.confirm_paint(ctx);
+            })
+            .drop_without_applying_deltas();
+            assert_eq!(capture.events().len(), 3);
+            assert_eq!(capture.events()[2]["request_id"], 2);
+        }
+    }
+
+    #[test]
+    fn sidecar_modal_observation_disabled_keeps_unseen() {
+        assert!(!modal_perf_enabled());
+        let observation = SidecarModalObservation::default();
+        let ctx = egui::Context::default();
+        ctx.run_pass(Default::default(), |ctx| {
+            observation.offer_paint(
+                std::time::Instant::now(),
+                "sidecar_restore",
+                "Checking",
+                1,
+                0,
+            );
+            observation.confirm_paint(ctx);
+            observation.record_import(0, std::time::Instant::now());
+        })
+        .drop_without_applying_deltas();
+        assert!(matches!(
+            observation.record.get(),
+            ModalObservationState::Unseen
+        ));
+    }
+
+    #[test]
+    fn sidecar_modal_completion_reports_ui_discard_before_poll() {
+        // A discard request ignored at the pass limit still counts as visible.
+        for (discard, max_passes) in [(false, 2), (true, 2), (true, 1)] {
+            let capture = ModalPerfCapture::new();
+            let ctx = egui::Context::default();
+            warm_modal_for_test(&ctx);
+            ctx.options_mut(|options| options.max_passes = max_passes.try_into().unwrap());
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().join("accepted-modal");
+            std::fs::create_dir_all(&folder).unwrap();
+            app.current_folder = Some(folder.clone());
+            let _receiver = app.activate_live_sidecar_restore_for_test(folder);
+            let deadline = app.sidecar_restore.as_ref().unwrap().common.started_at
+                + SIDECAR_RESTORE_MODAL_GRACE;
+            let shown = !discard || max_passes == 1;
+            let output = ctx.run_pass(Default::default(), |ctx| {
+                if app.sidecar_restore.is_some() {
+                    app.show_sidecar_restore_dialog_at(ctx, deadline);
+                    assert!(
+                        app.sidecar_restore
+                            .as_ref()
+                            .unwrap()
+                            .common
+                            .modal_observation
+                            .has_candidate()
+                    );
+                    assert!(capture.events().is_empty());
+                    if discard {
+                        ctx.request_discard("UI layout after Modal");
+                    }
+                    app.post_render_sidecar_restore(ctx);
+                    assert!(
+                        app.sidecar_restore.is_none(),
+                        "the real continuation must finish in this pass"
+                    );
+                    let events = capture.events();
+                    assert_eq!(
+                        events.len(),
+                        1 + usize::from(shown),
+                        "events are emitted synchronously at the original tail"
+                    );
+                    assert_eq!(events.last().unwrap()["kind"], "sli_sidecar_import");
+                    assert_eq!(events.last().unwrap()["modal_shown"], shown);
+                }
+            });
+            let events = capture.events();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["kind"] == "sli_sidecar_modal_shown")
+                    .count(),
+                usize::from(shown)
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["kind"] == "sli_sidecar_import")
+                    .count(),
+                1
+            );
+            if shown {
+                assert!(
+                    output
+                        .shapes
+                        .iter()
+                        .any(|shape| !matches!(shape.shape, egui::Shape::Noop))
+                );
+            } else {
+                assert!(
+                    output.shapes.is_empty(),
+                    "only the second, Modal-free pass is adopted"
+                );
+            }
+            output.drop_without_applying_deltas();
+        }
     }
 
     #[test]

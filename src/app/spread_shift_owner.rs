@@ -136,20 +136,28 @@ impl ViewerSpreadShift {
             _ => None,
         }
     }
-    pub(crate) fn record_retained_readoption_modal_shown(&self) {
+    pub(crate) fn offer_retained_readoption_modal_paint(&self) {
         if let RetainedReadoption::Reading {
             restore,
             started_at,
             modal_observation,
         } = &self.retained
         {
-            modal_observation.record_shown(
+            modal_observation.offer_paint(
                 *started_at,
                 "spread_shift_retained_readoption",
                 "Reading",
                 restore.receipt.open_id,
                 0,
             );
+        }
+    }
+    pub(crate) fn confirm_retained_readoption_modal_paint(&self, ctx: &egui::Context) {
+        if let RetainedReadoption::Reading {
+            modal_observation, ..
+        } = &self.retained
+        {
+            modal_observation.confirm_paint(ctx);
         }
     }
     pub(crate) fn cancel_retained_readoption(&mut self) {
@@ -1004,6 +1012,84 @@ impl App {
 #[cfg(test)]
 mod sidecar_restore_modal_tests {
     use super::*;
+
+    #[test]
+    fn retained_readoption_completion_reports_ui_discard_before_poll() {
+        for (discard, max_passes) in [(false, 2), (true, 2), (true, 1)] {
+            let capture = super::super::sidecar_restore::ModalPerfCapture::new();
+            let ctx = egui::Context::default();
+            super::super::sidecar_restore::warm_modal_for_test(&ctx);
+            ctx.options_mut(|options| options.max_passes = max_passes.try_into().unwrap());
+            let mut app = crate::app::setup_app_for_test();
+            let folder = app.tmp.path().join("accepted-retained.pdf");
+            app.current_folder = Some(folder.clone());
+            app.items = vec![GridItem::PdfPage {
+                pdf_path: folder.clone(),
+                page_num: 0,
+                content_type: None,
+            }];
+            app.thumbnails = vec![ThumbnailState::Pending];
+            app.image_metas = vec![None];
+            app.visible_indices = vec![0];
+            app.page_identity_index =
+                Arc::new(file_type_resume::PreparedPageIdentityIndex::prepare(
+                    &app.items,
+                    Some(&folder),
+                    app.settings.file_type_visibility.clone(),
+                ));
+            let restore = app.capture_book_shift_restore(1, true).unwrap();
+            let started_at = std::time::Instant::now();
+            app.spread_shift.retained = RetainedReadoption::Reading {
+                restore: Box::new(restore),
+                started_at,
+                modal_observation: SidecarModalObservation::default(),
+            };
+            let output = ctx.run_pass(Default::default(), |ctx| {
+                if app.spread_shift.retained_readoption_pending() {
+                    app.show_sidecar_restore_dialog_at(
+                        ctx,
+                        started_at + SIDECAR_RESTORE_MODAL_GRACE,
+                    );
+                    let RetainedReadoption::Reading {
+                        modal_observation, ..
+                    } = &app.spread_shift.retained
+                    else {
+                        unreachable!()
+                    };
+                    assert!(modal_observation.has_candidate());
+                    assert!(capture.events().is_empty());
+                    if discard {
+                        ctx.request_discard("UI layout after retained Modal");
+                    }
+                    app.post_render_sidecar_restore(ctx);
+                    assert!(
+                        !app.spread_shift.retained_readoption_pending(),
+                        "the actual retained poll must complete in this pass"
+                    );
+                    assert_eq!(
+                        capture.events().len(),
+                        usize::from(!discard || max_passes == 1)
+                    );
+                }
+            });
+            let shown = !discard || max_passes == 1;
+            let events = capture.events();
+            assert_eq!(events.len(), usize::from(shown));
+            if shown {
+                assert_eq!(events[0]["kind"], "sli_sidecar_modal_shown");
+                assert_eq!(events[0]["source"], "spread_shift_retained_readoption");
+                assert!(
+                    output
+                        .shapes
+                        .iter()
+                        .any(|shape| !matches!(shape.shape, egui::Shape::Noop))
+                );
+            } else {
+                assert!(output.shapes.is_empty());
+            }
+            output.drop_without_applying_deltas();
+        }
+    }
 
     #[test]
     fn retained_readoption_uses_the_shared_modal_grace_and_keeps_input_gated() {

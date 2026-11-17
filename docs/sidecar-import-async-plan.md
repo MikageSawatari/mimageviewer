@@ -346,16 +346,26 @@ detached fullscreen の直接描画経路とvendorは変更しない。
   100 msを超える待ちにも効かないため採らない。
 
 CLAUDE.md「設計の簡素化」に従い、restore phaseや待機状態を増やさず既存の表示期限だけを
-調整する案を選んだ。計装だけは既存request owner内にtypedな初回描画記録を持たせ、
-`&self`から記録してもphase・入力gateには使わない。retained readoptionもそのReading ownerが
-記録を所有し、pollで所有権を移しても保持、完了・取消・新規requestで破棄する。
-perf無効時は記録もイベント生成もしない。実際の初回描画直後に一度だけ
-`nav/sli_sidecar_modal_shown` (`source`, `phase`, `request_id`, `ms` = restore開始からの時間) を記録し、
-通常restoreは`seq`で既存の`nav/sli_sidecar_import`と対応付け、後者へ`modal_shown` boolを加える。
+調整する案を選んだ。計装だけは既存request owner内の`Cell`にtypedな
+`Unseen / Candidate / Shown`の3状態を持たせ、phase・入力gateには使わない。
+retained readoptionもReading ownerが記録を所有し、次requestには移送しない。
+perf無効時は候補登録・確定・イベント生成を行わない。可視かつ非sizingのModal構築は
+`Unseen`のときだけ候補にとどめ、`post_render_sidecar_restore`入口で通常restoreと
+retained readoptionの両ownerを、完了処理・pollより前に一度確定する。
+`ctx.will_discard()`がtrueなら`Unseen`へ戻し、falseなら`Shown`として一度だけ
+`nav/sli_sidecar_modal_shown` (`source`, `phase`, `request_id`, `ms` = restore開始からの時間) を記録する。
+通常restoreは`seq`で既存の`nav/sli_sidecar_import`と対応付け、後者は元の場所・タイミングで
+即時発行し、`Shown`かどうかを`modal_shown` boolとして加える。
 `source`は`sidecar_restore` / `spread_shift_retained_readoption`で区別する。後者はReading phase、
-`request_id`は既存のopen receipt id、`seq=0`とする。新たな回復処理は設けない。
-egui Areaの初回不可視sizing passは表示に数えず、Modal contentが可視かつsizing passでない
-場合だけ記録する。headless回帰では499 msの非構築、500 msでの不可視sizing、同じContextの
+`request_id`は既存のopen receipt id、`seq=0`とする。detachedの直接描画経路は計装対象外なので、
+`modal_shown=false`は全viewportで未表示だった証明ではない。
+確認した本番のdiscard要求はeguiのUI構築と、mIV本体の`ui_depth_parallax.rs`・
+`ui_dialogs/mod.rs`・`ui_history_field.rs`のUI構築中に出るもので、
+`post_render_sidecar_restore`より後（`on_end_pass`等）の本番要求は見つかっていないため、
+その後のdiscardはこの調査用計装では扱わない。
+CLAUDE.md「設計の簡素化」に従い、Plugin・共有owner・イベント発行保留は設けず、
+既存owner内の観測と確定点1か所に限定する。新たな回復処理は設けない。
+headless回帰では499 msの非構築、500 msでの不可視sizing、同じContextの
 次フレームでの可視描画を区別し、非Noop shapeと描画関数の戻り値で確認する。
 
 ### 5.1 state owner と pause 位置
