@@ -12,6 +12,20 @@
 
 ---
 
+## v5.3.0 (2026-11-17)
+
+- **対象**: master `23b60a1b1` (配布ビルドの入力、タグ v5.3.0)。v5.2.1 以降の文字起こし T1・T2、§1.789 (AI アプリ連携中の更新)・§1.769・§1.755 (mIV Sound 0.17.0-miv.1)・§1.767 第 2 段・§1.800 (本を閉じるときのもたつき)・§1.776 案 A・§1.796 (見開きのまま 1 ページ送る)・§1.745/§1.747・§1.773b ほか。更新履歴は利用者承認済み (8,053 バイト、短縮版なし)。「重要な変更点」に §1.745 (動かした画像のクリックで送らない) を必読、文字起こしと 1 ページ送りを目玉で追加。依存の更新は見送り (利用者決定)。既知の問題は変更なし。
+- **CI 相当**: §1.767 第 2 段の `replace_mounted_detached_window_binding` が viewer_context_audit の A4 に当たり、許可一覧に登録 (`ade93d03d`)。push 後の CI (main) は成功。
+- **自動テスト**: 1 回目の配布ビルドは全体テストの 2 件で停止。(1) launcher の `real_core_source_and_installer_keep_legacy_base_names` が、§1.789 A-1 で `installer/launcher_swap.iss` へ移した名前を古い場所で探していた。(2) 起動時の「重要な変更点」のスナップショット 2 枚 (v5.3.0 の項目を足したための想定どおりの変化。目視で確認して更新)。どちらも §1.789 の master 取り込み後に全体テストを流していなかったため (`23b60a1b1`)。やり直した配布ビルド内の全体テスト 20,639 件成功 (87 skip、再試行なし) と vendor・doc が成功。
+- **ReleaseChecks (ClaudeCode が実行、利用者了承 2026-11-17、first-ai なし)**: 1 回目 `release-checks-20261117-091124-3d7204a8` は裏のプロセスから前面を取れず環境で停止。利用者の指示でターミナル パネルから回し直した `release-checks-20261117-091650-6be1ac21` で seed・idle 5・perf 2 が PASS。idle は CPU 1 コア比 0.5% 以下・測定中の描画 0 フレーム。perf-cached は drawn 16ms 未満 99.67%・max 40ms、perf-uncached は 99.01%・max 53ms。pre_grid p95 0.117 / 0.119ms。100ms 超 0。
+- **bench**: 10 クエリすべて OK (文字起こしで索引の形式が変わったため実施)。
+- **panic.log**: 54 件 17 種すべて disposition あり (`check-panic-log.ps1` exit 0)。製品ページのカード 53 件は上限内。
+- **署名・成果物**: `build-dist.ps1 -SkipVst3Bridge` (署名あり)。単体exe・setup.exe・ポータブル版の mimageviewer.exe を `signtool verify /pa` で確認 (exit 0)。全 PE / VC runtime gate 通過。sha256: 単体exe `d4d0c88f8042428fee4cd93cd0e30cc74c0137f684310681d56da6347826e4ff` (603,867,224 bytes)、setup.exe `de31442806d7c9cb73a611afb25e5063ea624215c734c266d6a3d27caee03587` (273,135,400 bytes)、portable zip `3e74294a3dd9ee271d7de860b8bc6779ba553745517b11a274d84884acff006a` (323,847,626 bytes)、Vector zip `f13a3e0583cf6fdce139cddab49f22c038a0a82b71e220ceab9017571acf1550` (272,706,274 bytes)。
+- **VirusTotal (2026-11-17、送信は利用者の了承のうえ利用者が実行、結果は ClaudeCode が結果ページで確認)**: `effetune/mIV Sound.vst3/Contents/x86_64-win/mIV Sound.vst3` (8,318,040 bytes、0.17.0-miv.1) sha256 `cd41ed82d465fd466b07f7b5162e01e850fde593229ba72b1e258642075a3364` — 0/71、Google・Microsoft とも Undetected。https://www.virustotal.com/gui/file/cd41ed82d465fd466b07f7b5162e01e850fde593229ba72b1e258642075a3364 。VST3 host は vendor の実体が前回と同じ (`194ddc8d…`) で再署名のみのため送っていない (チェックリスト 12.6)。
+- **実機確認 (利用者、インストール版、2026-11-17)**: 確認 4 項目 (§1.776・§1.800・§1.745・§1.773b) は期待どおり。本を閉じたとき 1 回ひっかかりを感じた。perf ログ (統括が解析): 本を閉じて一覧へ戻る 4 回中 3 回は 10〜12 ms で §1.800 の止まりは出ていない。残る 1 回の 345 ms は AI 高画質化の最中の close で、v5.2.1 と推定される前日の session にも同じ形があり (§1.801)、今回の版の変更ではない。最初の全画面の 907 ms は「アニメ拡大」の初回作成 864 ms (§1.776 の案 B の範囲)。2.9 秒・1.7 秒の区間は右クリックメニューを開いていた時間。
+- **公開 (2026-11-17 夜)**: GitHub Release v5.3.0 (タグ・main = `23b60a1b1`、main は 08cca1eca から fast-forward)、資産 4 点の sha256 が手元と一致・latest。mikage.to 反映 158 ファイル (mIV Sound 0.17 の説明書と `.htaccess` の許可一覧を含む)、verify-site 405/406 (`.htaccess` の 403 のみ)、DL 3 点 200・サイズ一致。Vector 申請は利用者が実施。
+- **MS Store**: setup.exe を R2 `https://dl.mikage.jp/mimageviewer/v5.3.0/mImageViewer_setup.exe` に配置 (200・サイズと配信 sha256 一致)。サブ PC の Windows Sandbox (GPU なし、依頼 69、観測者はサブ PC 担当。統括が watch.txt と画像を確認) で Store と同じ引数のインストール exit 0、初回 180 秒・2 回目 92 秒とも応答なしは 0 件で、初回設定の付いたメイン窓が描かれた。認定の注意事項は文字起こしの任意ダウンロードを足した版に差し替え (1,957 字)。Package validation 中 (利用者の報告)。
+
 ## v5.2.1 (2026-11-15)
 
 - **対象**: ブランチ `release-5.2.1` の `be26f0088` (配布ビルドの入力、タグ v5.2.1)。v5.2.0 の後の文書 (`230228e25`) を基点に、§1.773 (表紙の自動切り出し: 綴じ方向の専用設定・画像フォルダの本・寸法の型・高さ全体・本文の保存回転・判定の理由の表示)・§1.775 (SNS 分割を 20 枚まで)・入力履歴のポップアップの配色・動画の時刻原点 (開始時刻が 0 でない MPEG)・環境設定「お気に入りごとに表示状態を記憶する」の配置を載せた修正版。master には v5.3.0 向けの未出荷の変更があるため、master からは出さなかった。更新履歴は利用者承認済み (4,955 バイト、短縮版なし)。「重要な変更点」に綴じ方向の専用設定を必読で追加 (起動時の 2 枚のスナップショットを更新、1093×614 で閉じる操作が見えることを目視)。既知の問題に「本文のページを回転した後も、自動切り出しの結果が前のまま残る」を追加 (次の版で直す)。
