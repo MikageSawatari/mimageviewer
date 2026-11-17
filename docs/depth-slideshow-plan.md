@@ -1069,3 +1069,5 @@ Collection の適用範囲についての残件は解消した。設計担当の
 製品 exe 起動・commit・追加の独立レビューは行っていない。
 本体 lib 全件・`build-dev.ps1` は設計担当の担当として未実施。実機表示と初回の既存試験失敗の原因は未確認。
 最終の `python scripts/check_ui_glyphs.py` は危険グリフ 0 件・exit 0、`git diff --check` も exit 0。
+
+P3 対応 (独立レビュー第 2 回後): root owner / target の拒否判定を installer 冒頭へ集約し、採用確定後・root 変更前に呼出し側の `FnOnce` で通知・close を実行する形へ変更 (永続状態の追加なし)。既存の owner 欠落試験に「拒否時は closure を呼ばない」検査を追加し、Depth 保持・非通知の既存回帰も成功。指定 runner / `MSBUILDDISABLENODEREUSE=1` 経由で `cargo check -p mimageviewer --bin mimageviewer-core` exit 0、`cargo nextest run -p mimageviewer --lib -E 'test(/depth_slideshow/)'` 25 / 25 成功 (11.458 秒)、`cargo nextest run -p mimageviewer --lib -E 'test(/collection_navigation::/)'` 63 / 63 成功 (13.771 秒)、最後の `cargo fmt` (引数なし) と `git diff --check` は exit 0。ログ: `target/771-logs/p3-validation.{out,err}.log`、JUnit: `target/771-logs/p3-{depth-slideshow,collection}-passed.junit.xml`。commit・製品 exe 起動なし。
