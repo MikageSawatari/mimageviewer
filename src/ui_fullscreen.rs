@@ -17617,6 +17617,30 @@ fn resolve_spread_display_composition(
     )
 }
 
+fn spread_composition_requires_complete(
+    mode: SpreadMode,
+    final_cover: bool,
+    placement: crate::settings::SingletonSpreadEndpointSettings,
+    page_alone: crate::settings::PageAloneSettings,
+) -> bool {
+    (mode.has_cover() && final_cover)
+        || placement.first
+        || placement.last
+        || (mode.has_cover() && (page_alone.after_cover || page_alone.last))
+}
+
+fn effective_spread_page_alone(
+    mode: SpreadMode,
+    requested: crate::settings::PageAloneSettings,
+    complete: bool,
+) -> crate::settings::PageAloneSettings {
+    if mode.has_cover() && complete {
+        requested
+    } else {
+        Default::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct SpreadDisplayUnitsToken {
     items_generation: u64,
@@ -20848,11 +20872,11 @@ impl App {
                 .complete_page_permutation(nav, self.items_generation)
                 .unwrap_or_else(|| self.spread_complete_page_permutation(nav))
         });
-        let page_alone = if complete_proof == Some(true) {
-            requested_page_alone
-        } else {
-            crate::settings::PageAloneSettings::default()
-        };
+        let page_alone = effective_spread_page_alone(
+            self.spread_mode,
+            requested_page_alone,
+            complete_proof == Some(true),
+        );
         if let Some(units) = self.spread_display_units_cache.get_with_source(
             nav,
             self.items_generation,
@@ -21110,20 +21134,14 @@ impl App {
         let final_cover = self.final_cover_spread_enabled_for_current_book();
         let placement = self.spread_singleton_display_endpoint_settings();
         let alone = self.page_alone_enabled_for_current_book();
-        let needs_complete = (self.spread_mode.has_cover() && final_cover)
-            || placement.first
-            || placement.last
-            || (self.spread_mode.has_cover() && (alone.after_cover || alone.last));
+        let needs_complete =
+            spread_composition_requires_complete(self.spread_mode, final_cover, placement, alone);
         let eligible = if needs_complete && self.spread_complete_book_context_eligible() {
             cache.complete_page_permutation?
         } else {
             false
         };
-        let page_alone = if self.spread_mode.has_cover() && eligible {
-            alone
-        } else {
-            Default::default()
-        };
+        let page_alone = effective_spread_page_alone(self.spread_mode, alone, eligible);
         if token.page_alone != page_alone {
             return None;
         }
@@ -21226,14 +21244,12 @@ impl App {
     ) -> (bool, crate::settings::SingletonSpreadEndpointSettings, bool) {
         let final_cover_enabled = self.final_cover_spread_enabled_for_current_book();
         let singleton_placement_enabled = self.spread_singleton_display_endpoint_settings();
-        let eligible = ((self.spread_mode.has_cover() && final_cover_enabled)
-            || singleton_placement_enabled.first
-            || singleton_placement_enabled.last
-            || (self.spread_mode.has_cover() && {
-                let page_alone = self.page_alone_enabled_for_current_book();
-                page_alone.after_cover || page_alone.last
-            }))
-            && self.spread_complete_book_eligible(nav);
+        let eligible = spread_composition_requires_complete(
+            self.spread_mode,
+            final_cover_enabled,
+            singleton_placement_enabled,
+            self.page_alone_enabled_for_current_book(),
+        ) && self.spread_complete_book_eligible(nav);
         (final_cover_enabled, singleton_placement_enabled, eligible)
     }
 
@@ -25510,6 +25526,15 @@ impl App {
     }
 
     fn fs_front_menu_presented(&mut self, ctx: &egui::Context, full_rect: egui::Rect) -> bool {
+        self.fs_front_menu_presented_for_viewport(ctx, full_rect, ctx.viewport_id())
+    }
+
+    fn fs_front_menu_presented_for_viewport(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        viewport: egui::ViewportId,
+    ) -> bool {
         let Some(idx) = self.fullscreen_idx else {
             return false;
         };
@@ -25521,15 +25546,28 @@ impl App {
             self.panorama_state().is_some(),
             self.fs_exclusive_view_active(idx).is_some(),
         );
-        let rotation = fs_rotation_popup_open(ctx);
-        let seek = fs_still_seek_strip_popup_open(ctx);
+        let (rotation, seek, any_popup) = if viewport == ctx.viewport_id() {
+            (
+                fs_rotation_popup_open(ctx),
+                fs_still_seek_strip_popup_open(ctx),
+                egui::Popup::is_any_open(ctx),
+            )
+        } else {
+            let popup = egui::Popup::current_open_id_for(ctx, viewport);
+            (
+                popup == Some(egui::Id::unique("fs_rotation_btn").with("popup")),
+                popup
+                    == Some(egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup")),
+                popup.is_some(),
+            )
+        };
         (self.fullscreen_top_bar_chrome_allowed(idx)
             && ((eligible.image && (self.fit_popup_open || self.spread_popup_open || rotation))
                 || (eligible.panorama && self.panorama_projection_popup_open)))
             || (seek && self.fullscreen_seek_menu_eligible(full_rect, idx))
             || self.fs_context_menu_presented()
             // egui memory is viewport scoped. Known menus above also need their draw gate.
-            || (egui::Popup::is_any_open(ctx) && !rotation && !seek)
+            || (any_popup && !rotation && !seek)
     }
 
     fn fullscreen_top_bar_locked_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
@@ -37626,7 +37664,7 @@ impl App {
             }
             if !owner.blocks_legacy_keymap_shortcuts()
                 && !self.fs_overflow_panel_state.is_open()
-                && !self.fs_front_menu_presented(ctx, ctx.content_rect())
+                && !self.fs_page_scroll_front_menu_presented(ctx)
             {
                 for key_action in [
                     KeyAction::FsPageScrollUp,

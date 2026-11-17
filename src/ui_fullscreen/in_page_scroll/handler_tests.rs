@@ -36,7 +36,7 @@ pub(super) fn full_rect() -> Rect {
     Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))
 }
 
-fn run_in_viewport(
+pub(super) fn run_in_viewport(
     ctx: &egui::Context,
     viewport: egui::ViewportId,
     rect: Rect,

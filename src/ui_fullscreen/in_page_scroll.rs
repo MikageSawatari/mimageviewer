@@ -386,12 +386,40 @@ impl App {
     }
 
     fn fs_scroll_resident_auto_trim(&self, idx: usize) -> Option<Option<Rect>> {
-        self.resident_canonical_auto_trim(idx).ok().or_else(|| {
+        #[cfg(windows)]
+        if self.viewer_session_is_detached()
+            && let Some(window) = self.detached_viewer_window_id()
+            && let Some(bbox) = self.detached_window_runtime_trim_bbox(window, idx)
+        {
+            return Some(bbox);
+        }
+        // RAW previews are analyzed by ordinary paint but are not baked into
+        // detached runtime. The pixel cache proves the exact painted answer.
+        self.resident_pixel_auto_trim(idx).ok().or_else(|| {
             // Ordinary auto trim deliberately does not analyze animated
             // entries. This resident variant proves no trim; it is not a
             // missing static-pixel answer disguised as None.
             matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Animated { .. })).then_some(None)
         })
+    }
+
+    pub(super) fn fs_page_scroll_front_menu_presented(&mut self, ctx: &egui::Context) -> bool {
+        let viewport = self.fs_page_scroll_destination_viewport();
+        // Preserve the ingress viewport's existing front-UI gate as well as
+        // checking the fullscreen destination of a ROOT-forwarded key.
+        if viewport != ctx.viewport_id() && self.fs_front_menu_presented(ctx, ctx.content_rect()) {
+            return true;
+        }
+        let rect = ctx.input_for(viewport, |input| input.content_rect());
+        self.fs_front_menu_presented_for_viewport(ctx, rect, viewport)
+    }
+
+    fn fs_page_scroll_destination_viewport(&self) -> egui::ViewportId {
+        if self.fullscreen_embedded_still_active() {
+            egui::ViewportId::ROOT
+        } else {
+            self.fullscreen_viewport_id()
+        }
     }
 
     fn fs_scroll_resident_trim(
@@ -416,11 +444,7 @@ impl App {
         let idx = self.fullscreen_idx?;
         // ROOT can dispatch keys for another viewport. Read the destination's
         // current size and DPI, never the handler Context's current viewport.
-        let target = if self.fullscreen_embedded_still_active() {
-            egui::ViewportId::ROOT
-        } else {
-            self.fullscreen_viewport_id()
-        };
+        let target = self.fs_page_scroll_destination_viewport();
         let (full_rect, ppp) = ctx.input_for(target, |input| {
             (input.content_rect(), input.pixels_per_point())
         });

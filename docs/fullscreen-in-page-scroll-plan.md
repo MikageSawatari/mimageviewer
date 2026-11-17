@@ -765,6 +765,58 @@ UI文言と描画は変更していない。PNGの更新なし。修正差分の
 
 ログ（すべて `target/` 内）: `474-r1-check.stdout.log` / `474-r1-check.stderr.log`、`474-r1-tests.stdout.log` / `474-r1-tests.stderr.log`、`474-r1-seek.stdout.log` / `474-r1-seek.stderr.log`、`474-r1-static.log`、`474-r1-fmt.stdout.log` / `474-r1-fmt.stderr.log`、`474-r1-diff-check.stdout.log` / `474-r1-diff-check.stderr.log`。
 
+### 7.8 独立実装レビュー r2 の指摘対応（2026-11-18、修正・関連検証完了）
+
+基準コミットは `47f42bab6`。利用者から伝えられた r2 の P2 2件・P3 1件に対応する。
+修正差分の独立再レビュー・独立目視は未実施。設計担当による既存の出どころの訂正は保持する。
+
+| ファイル | 変更 |
+| --- | --- |
+| `src/ui_fullscreen.rs` | 前面メニューの共通判定に照会先viewportを渡せる入口を追加。同一viewportの判定は既存のまま、新Actionだけ配送先を照会する。完全性が必要な条件を `spread_composition_requires_complete`、有効なpage_aloneの決定を `effective_spread_page_alone` に集約し、通常の構成producerとpeekで共用。 |
+| `src/ui_fullscreen/in_page_scroll.rs` | 新Actionの入力先と幾何の入力先を同じ配送先helperから取得。r1の配送元前面UI判定を残したまま配送先も照会する。自動trimはdetached runtimeの回答を優先し、未保存なら描画済み画素の検出cacheを読む。 |
+| `src/ui_fullscreen/canonical_demand.rs` | 既存のload_seq・画素pointerを照合するreaderを `resident_pixel_auto_trim` に分けて共用。canonical collectorのdetached runtime必須の規則は維持。 |
+| `src/ui_fullscreen/in_page_scroll/handler_tests.rs` | 既存のviewport指定のheadless fixtureを回帰テストから利用可能にする。 |
+| `src/ui_fullscreen/in_page_scroll/review_regression_tests.rs` | ROOT転送・detached RAWプレビュー・通常とpeekの構成方針の回帰テストを3件追加。 |
+| `docs/detached-rework-plan.md` §11の§1.474記録 | 入力照合側で触れた読み取り範囲と、状態・保存規則を変更しない理由を追記。 |
+| 本書 §6.11・§7.8 | r2の指摘の出どころ・対応・検証結果を記録。 |
+
+追加テスト名:
+
+- `root_dispatched_scroll_keys_leave_the_destination_rotation_popup_unconsumed`
+- `detached_raw_auto_trim_uses_the_painted_pixel_cache_and_keeps_runtime_priority`
+- `cached_and_ordinary_composition_share_completeness_and_page_alone_policy`
+
+ROOT転送は実際の `handle_fullscreen_root_key_input` にK/Jを渡し、配送先のフォーカスなし回転Popup中のpan不変・未消費と、閉じた後の受付、配送元ROOTの前面UI所有も保つことを検査する。
+detached RAWは既存のregistryに所有contextを作り、描画前の消費のみ、通常描画後のスクロール、load_seq・画素pointer失効時の不取得、runtimeに保存済みのNoneの優先を検査する。
+構成は表紙・先頭/末尾配置・page_aloneの8組で通常producerとpeekの結果、証明欠落時のpeek不成立、通常producerでの再取得を検査する。
+新しい実行時状態、待機・再試行、同期読み込みは追加しない。設計との差分はない。
+
+範囲外の既存ROOT経路（コード上の所見）:
+`src/ui_fullscreen.rs` の `handle_fullscreen_root_key_input` はROOTのctxを共通handlerに渡す。
+そのhandlerの既存の `fs_still_seek_strip_popup_open(ctx)` 早期return（`src/ui_fullscreen.rs:35388`）と `consume_arrow`（同:36350）は配送先のPopupを照会しないため、
+配送先シークPopupが開いていてROOT側ownerが遮断しないとき、固定矢印等が背後へ進み得る。今回、この既存経路は変更しない。
+実機での観測ではなくコードの参照による所見である。
+
+指定runnerと `MSBUILDDISABLENODEREUSE=1` で次を実行した。
+
+```text
+cargo check -p mimageviewer --bin mimageviewer-core
+cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen::in_page_scroll/) | test(/ui_fullscreen::front_popup_input_tests/) | test(/ui_fullscreen::canonical_demand/) | test(/final_cover_composition/) | test(/page_alone/) | test(/book_composition_tests/) | test(/ui_view_trim::tests/) | test(/retained_material_entry_.*trim/) | test(/final_demand_topology_tests/)'
+cargo fmt
+```
+
+初回checkは成功（46.82秒）、nextestは196件中195件成功・1件失敗（実行62.097秒、ビルド3分01秒）。
+ROOT回帰fixtureが配送先viewportをパスごとに登録しておらず、eguiの未使用viewport GCでPopupが破棄されていた。
+fixtureの登録を直した単独再実行は1件成功（0.634秒、ビルド2分11秒）。
+その後、配送元ROOTの既存の前面UI判定を保持するコードと検査も加えたため、最終checkと同じ196件を再実行した。
+最終checkは成功（17.79秒）。最終nextestは196件成功・失敗0件（実行60.508秒、ビルド2分14秒）。
+依存ビルドの失敗なし。sandboxの書き込み制約により指定runnerの低優先度・6並列で実行し、TEMP/TMPはworktreeの `target/474-tmp` を使用した。
+引数なしの `cargo fmt` と `git diff --check` も成功。
+既存のROOT転送handler、pan clamp、自動トリムの解析・detached保存関数の本体が基準コミットと同一であることを静的照合した。
+
+ログ（すべて `target/` 内）: `474-r2-check.stdout.log` / `474-r2-check.stderr.log`、`474-r2-tests.stdout.log` / `474-r2-tests.stderr.log`、`474-r2-root.stdout.log` / `474-r2-root.stderr.log`、`474-r2-final-check.stdout.log` / `474-r2-final-check.stderr.log`、`474-r2-final-tests.stdout.log` / `474-r2-final-tests.stderr.log`、`474-r2-static.log`、`474-r2-fmt.stdout.log` / `474-r2-fmt.stderr.log`、`474-r2-diff-check.stdout.log` / `474-r2-diff-check.stderr.log`。
+コミット・build-dev・全件テスト・製品起動は行わない。UI文言・PNGの更新なし。
+
 ### 6.8 実装担当の停止報告と決定 (2026-11-18)
 
 実装担当 (Codex gpt-6.1-sol / high、session 01a1ea54) が、§2.3 の「同じ frame の倍率変更は既存 clamp と同じ投影で扱う」と実描画の矛盾を報告して停止した
@@ -789,3 +841,13 @@ UI文言と描画は変更していない。PNGの更新なし。修正差分の
 | P2-2: 入力の幾何取得が回転の同期DB SELECT・自動trim解析・構成の構築に到達し得る | 取得済みmetadataのみのreaderへ変更。世代・表示単位を先に照合し、cache missは消費のみ。metadata producer禁止guardとcache不変・描画後の復帰を検査。 |
 
 この節は受領した指摘と対応の記録であり、修正差分の独立再レビュー・再受入れを行った記録ではない。
+
+### 6.11 独立実装レビュー r2（REVISE、P2 2件・P3 1件）と対応（2026-11-18）
+
+利用者からr2の結果と、設計担当もコードを読んで妥当と判断したとの連絡を受けた。対応の詳細は §7.8。
+
+- P2-1: 新Actionだけ配送先viewportの既存Popup記憶を照会する。配送元の既存の前面UI判定も保つ。既存の固定矢印・その他のROOTキー経路は維持し、同種の範囲外の所見を記録する。
+- P2-2: detached runtime回答を優先し、未保存の場合は描画で取得済みの画素cacheを検証して読む。自動解析とruntime保存規則は変更しない。
+- P3: 完全性が必要な条件と有効なpage_aloneを共通の純粋helperへ集約する。通常producerとpeekは証明の取得方法を分ける。
+
+これは受領したレビューと実装対応の記録であり、この修正差分への独立再レビュー・受入れの記録ではない。

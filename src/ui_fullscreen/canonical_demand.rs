@@ -367,6 +367,13 @@ impl App {
                 .detached_window_runtime_trim_bbox(window, idx)
                 .ok_or(CanonicalDemandUnavailable::AutoTrim);
         }
+        self.resident_pixel_auto_trim(idx)
+    }
+
+    pub(super) fn resident_pixel_auto_trim(
+        &self,
+        idx: usize,
+    ) -> Result<Option<egui::Rect>, CanonicalDemandUnavailable> {
         let (seq, ptr) = match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static {
                 load_seq, pixels, ..
