@@ -37,6 +37,210 @@ fn assert_position(app: &App, selected: Option<usize>, scroll: f32) {
     assert_eq!(app.grid_scroll.offset(), scroll);
 }
 
+fn stack_entry_fixture(restore: bool) -> (phase_c_support::AppTestEnv, PathBuf) {
+    let mut env = setup_app_for_test();
+    env.active_quick_folder_slot = None;
+    env.settings.restore_folder_cursor_on_revisit = restore;
+    env.settings.auto_fullscreen_image_folders = false;
+    env.settings.stack_script_enabled = false;
+    env.settings.restore_last_cursor = true;
+    env.settings.stack_separator = '_';
+    env.settings.sort_order = crate::settings::SortOrder::FileName;
+    env.settings.facet_filter.exts.insert("png".into());
+    let folder = env.tmp.path().join("stack-entry");
+    std::fs::create_dir_all(&folder).unwrap();
+    for name in ["a_1.jpg", "a_2.jpg", "b_1.png", "c_1.png"] {
+        image::RgbImage::new(1, 1).save(folder.join(name)).unwrap();
+    }
+    open(&mut env, &folder);
+    env.stack_mode_requested = true;
+    env.grid_scroll.set_position(420.0);
+    // The same-path ExplicitList is the intent used by a favorite/address open.
+    open(&mut env, &folder);
+    assert!(env.stack_script_pending.is_some());
+    assert!(
+        env.stack_view.is_none(),
+        "hold aggregate adoption until the test polls"
+    );
+    assert_eq!(env.selected, Some(2));
+    assert_eq!(env.items[2].name(), "b_1.png");
+    (env, folder)
+}
+
+fn finish_stack_entry(app: &mut App) {
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.stack_script_pending.is_some() || app.sidecar_restore_active() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "stack entry did not settle"
+        );
+        app.poll_stack_script(&ctx);
+        app.finish_page_identity_preparation_for_test();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(app.stack_view.is_some());
+}
+
+#[test]
+fn section1795_off_stack_same_path_entry_selects_final_visible_first() {
+    let (mut env, _) = stack_entry_fixture(false);
+    finish_stack_entry(&mut env);
+    assert_eq!(
+        env.items
+            .iter()
+            .map(|item| item.name().into_owned())
+            .collect::<Vec<_>>(),
+        ["a", "b_1.png", "c_1.png"]
+    );
+    assert_eq!(env.current_grid_order(), [1, 2]);
+    assert_position(&env, Some(1), 0.0);
+    assert_eq!(env.items[env.selected.unwrap()].name(), "b_1.png");
+}
+
+#[test]
+fn section1795_stack_pending_explicit_cursor_wins_over_entry_policy() {
+    for restore in [false, true] {
+        for keep in [false, true] {
+            let (mut env, folder) = stack_entry_fixture(restore);
+            // Keep a row after the chosen item so accidental index clamping cannot
+            // make a raw-index restore look like an identity-preserving selection.
+            image::RgbImage::new(1, 1)
+                .save(folder.join("d_1.png"))
+                .unwrap();
+            open(&mut env, &folder);
+            if keep {
+                env.move_grid_cursor(Some(3), GridCursorIntent::Automatic);
+                env.move_grid_cursor(Some(3), GridCursorIntent::ExplicitKeep);
+            } else {
+                env.move_grid_cursor(Some(3), GridCursorIntent::Explicit(GridCursorMove::Move));
+            }
+            finish_stack_entry(&mut env);
+            assert_eq!(env.selected, Some(2), "restore={restore}, keep={keep}");
+            assert_eq!(env.items[env.selected.unwrap()].name(), "c_1.png");
+            assert!(env.grid_scroll.reveal_requested());
+        }
+    }
+}
+
+#[test]
+fn section1795_off_stack_new_entry_retires_previous_pending_selection() {
+    let (mut env, folder) = stack_entry_fixture(false);
+    env.move_grid_cursor(Some(3), GridCursorIntent::Explicit(GridCursorMove::Move));
+    open(&mut env, &folder);
+    assert_eq!(env.selected, Some(2));
+    finish_stack_entry(&mut env);
+    assert_position(&env, Some(1), 0.0);
+}
+
+#[test]
+fn section1795_off_stack_load_hints_survive_final_aggregation() {
+    for hint in ["name", "operation", "startup"] {
+        let (mut env, folder) = stack_entry_fixture(false);
+        let intent = match hint {
+            "operation" => {
+                env.request_post_operation_selection(
+                    folder.clone(),
+                    crate::post_operation_selection::ExpectedOutputs::Known(vec![
+                        folder.join("c_1.png"),
+                    ]),
+                );
+                StartupListIntent::ExplicitList
+            }
+            "startup" => StartupListIntent::RestoreList {
+                target: crate::settings::StartupListTarget::PhysicalList {
+                    logical_path: folder.clone(),
+                    zip_prefix: None,
+                },
+                cursor: Some(crate::settings::ListCursorHint {
+                    name: "c_1.png".into(),
+                    rows_above: None,
+                }),
+            },
+            _ => {
+                env.select_after_load = Some("c_1.png".into());
+                StartupListIntent::ExplicitList
+            }
+        };
+        assert!(env.load_folder_with_scan_owned(
+            folder,
+            None,
+            OpenRequestOwner::Navigation,
+            intent
+        ));
+        env.finish_page_identity_preparation_for_test();
+        assert_eq!(env.selected, Some(3), "hint={hint}");
+        finish_stack_entry(&mut env);
+        assert_eq!(env.selected, Some(2), "hint={hint}");
+        assert_eq!(env.grid_scroll.offset(), 0.0);
+    }
+}
+
+#[test]
+fn section1795_off_stack_parent_hint_keeps_passthrough_folder() {
+    let (mut env, folder) = stack_entry_fixture(false);
+    let child = folder.join("child");
+    std::fs::create_dir(folder.join("before-child")).unwrap();
+    std::fs::create_dir(&child).unwrap();
+    env.settings.facet_filter.exts.clear();
+    env.select_after_load = Some("child".into());
+    open(&mut env, &folder);
+    assert_eq!(
+        env.items[env.selected.unwrap()].drag_source_path(),
+        Some(child.as_path())
+    );
+    finish_stack_entry(&mut env);
+    assert_eq!(
+        env.items[env.selected.unwrap()].drag_source_path(),
+        Some(child.as_path())
+    );
+    assert_eq!(env.grid_scroll.offset(), 0.0);
+}
+
+#[test]
+fn section1795_off_stack_pending_selection_hidden_by_facet_stays_visible() {
+    let (mut env, _) = stack_entry_fixture(false);
+    env.settings.facet_filter.exts.clear();
+    env.rebuild_visible_indices();
+    env.move_grid_cursor(Some(0), GridCursorIntent::Explicit(GridCursorMove::Move));
+    // Facet input keeps the cursor before rebuilding visibility. Its previous
+    // target must not reselect the hidden JPG stack after aggregate hydration.
+    env.move_grid_cursor(Some(0), GridCursorIntent::ExplicitKeep);
+    env.settings.facet_filter.exts.insert("png".into());
+    env.rebuild_visible_indices();
+    finish_stack_entry(&mut env);
+    assert_eq!(env.selected, Some(1));
+    assert!(env.idx_visible(env.selected.unwrap()));
+}
+
+#[test]
+fn section1795_on_stack_entry_keeps_legacy_automatic_index_restore() {
+    let (mut env, folder) = stack_entry_fixture(true);
+    // Even without an earlier session record, aggregate installation records the
+    // provisional list's raw index. Keep this existing ON behavior in this fix.
+    env.folder_history.remove(&folder);
+    env.grid_scroll.set_position(125.0);
+    finish_stack_entry(&mut env);
+    assert_eq!(env.folder_history[&folder].1, Some(2));
+    assert_position(&env, Some(2), 125.0);
+    assert_eq!(env.items[env.selected.unwrap()].name(), "c_1.png");
+}
+
+#[test]
+fn section1795_stack_pending_fullscreen_return_keeps_last_page() {
+    for restore in [false, true] {
+        let (mut env, _) = stack_entry_fixture(restore);
+        // Drive the existing close landing boundary without starting a renderer.
+        env.fullscreen_idx = Some(3);
+        env.restore_grid_cursor_to_fullscreen_item();
+        env.fullscreen_idx = None;
+        assert_eq!(env.selected, Some(3));
+        finish_stack_entry(&mut env);
+        assert_eq!(env.selected, Some(2), "restore={restore}");
+        assert_eq!(env.items[env.selected.unwrap()].name(), "c_1.png");
+    }
+}
+
 fn save_reading_position(
     app: &mut App,
     source: &Path,

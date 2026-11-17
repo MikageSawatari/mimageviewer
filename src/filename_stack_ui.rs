@@ -29,6 +29,7 @@ use crate::settings::SortOrder;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StackSelectionTarget {
+    /// A media member, or a physical passthrough row (folder/archive/document).
     MemberPath(PathBuf),
     GroupKey(String),
 }
@@ -1479,7 +1480,13 @@ impl crate::app::App {
             .take()
             .and_then(|target| match target {
                 StackSelectionTarget::MemberPath(path) => {
-                    view.aggregated_index_for_member_path(&path)
+                    view.aggregated_index_for_member_path(&path).or_else(|| {
+                        prepared.items.iter().position(|item| {
+                            item.drag_source_path().is_some_and(|candidate| {
+                                crate::folder_tree::path_eq(candidate, &path)
+                            })
+                        })
+                    })
                 }
                 StackSelectionTarget::GroupKey(key) => view.aggregated_index_for_group_key(&key),
             });
@@ -1956,6 +1963,23 @@ impl crate::app::App {
     /// グリッドのセルクリック → フラットフルスクリーンへ入れる状態かの判定に使う。
     pub(crate) fn stack_mode_aggregated(&self) -> bool {
         self.stack_view.is_some() && !self.stack_showing_flat
+    }
+
+    /// An explicit cursor or load hint on provisional rows supersedes entry positioning.
+    /// Keep identity, never a raw index: grouping can remove rows before this item.
+    pub(crate) fn remember_pending_stack_selection(&mut self) {
+        if !self.stack_mode_requested
+            || self.stack_view.is_some()
+            || self.stack_script_pending.is_none()
+        {
+            return;
+        }
+        self.stack_selection_target = self.selected.and_then(|index| {
+            self.items
+                .get(index)?
+                .drag_source_path()
+                .map(|path| StackSelectionTarget::MemberPath(path.to_path_buf()))
+        });
     }
 
     /// 現在カーソル位置 (selected) のセルの代表画像/動画パス。スタックトグルで被写体を保つため。

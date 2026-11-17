@@ -32360,6 +32360,11 @@ impl App {
                 "評価順を読み取れなかったため、名前順で表示しました".to_owned(),
             );
         }
+        if restore_intent.enters_folder_list() {
+            // An accepted new entry retires selection from the previous aggregation.
+            // This load's explicit hints are applied after its worker is installed.
+            self.stack_selection_target = None;
+        }
         if let Some((script_enabled, separator, listing, stack_existing, stack_folder)) =
             stack_async_prep
         {
@@ -32376,7 +32381,13 @@ impl App {
                 script_enabled,
                 false,
                 if restore_intent.imports_sidecars() {
-                    StartupListIntent::InternalInstall
+                    if restore_intent.enters_folder_list() {
+                        // The provisional rows already own adoption, but entry position
+                        // policy must also reach the final, aggregated visible order.
+                        StartupListIntent::InternalHydration(Box::new(restore_intent.clone()))
+                    } else {
+                        StartupListIntent::InternalInstall
+                    }
                 } else {
                     // Keep only the hydration import policy. The first adoption already
                     // consumed the refresh cursor and owns list/history acceptance.
@@ -45080,8 +45091,7 @@ impl App {
                 let _ = completed.send(());
             }
             MainListAfterHydration::StackSelection { select } => {
-                self.move_grid_cursor(Some(select), crate::app::GridCursorIntent::Automatic);
-                self.grid_scroll.set_reveal_requested(true);
+                self.select_item_after_load(select);
             }
             MainListAfterHydration::DirectMedia {
                 prepared,
@@ -76467,6 +76477,7 @@ impl App {
             }
             GridCursorIntent::ExplicitKeep => {
                 self.cancel_rating_membership_restore();
+                self.remember_pending_stack_selection();
                 return;
             }
             GridCursorIntent::Automatic => GridCursorMove::Move,
@@ -76478,6 +76489,9 @@ impl App {
             target,
             movement,
         );
+        if matches!(intent, GridCursorIntent::Explicit(_)) {
+            self.remember_pending_stack_selection();
+        }
     }
 
     /// 親復帰で解決済みの item を選択し、通常の ensure-visible 経路へ渡す。
@@ -76487,6 +76501,7 @@ impl App {
         self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
         self.grid_scroll.set_reveal_requested(true);
         self.redirect_selected_to_visible();
+        self.remember_pending_stack_selection();
     }
 
     /// 選択中の実ファイル / 実フォルダのパス。仮想項目・未選択では `None`。
@@ -83153,6 +83168,7 @@ impl App {
         self.grid_scroll.set_reveal_requested(true);
         self.update_last_selected_image();
         self.redirect_selected_to_visible();
+        self.remember_pending_stack_selection();
     }
 
     // -------------------------------------------------------------------
