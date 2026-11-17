@@ -698,6 +698,8 @@ pub enum RingActionId {
     ImageSpreadShiftRight,
     ImageSpreadShiftPrev,
     ImageSpreadShiftNext,
+    ImageSpreadStepPrev,
+    ImageSpreadStepNext,
     ImageRotateLeft,
     ImageRotateRight,
     ImageCapture,
@@ -1439,6 +1441,8 @@ impl RingActionId {
             Self::ImageSpreadShiftRight => "image_spread_shift_right",
             Self::ImageSpreadShiftPrev => "image_spread_shift_prev",
             Self::ImageSpreadShiftNext => "image_spread_shift_next",
+            Self::ImageSpreadStepPrev => "image_spread_step_prev",
+            Self::ImageSpreadStepNext => "image_spread_step_next",
             Self::ImageRotateLeft => "image_rotate_left",
             Self::ImageRotateRight => "image_rotate_right",
             Self::ImageCapture => "image_capture",
@@ -1574,6 +1578,8 @@ impl RingActionId {
             "image_spread_shift_right" => Self::ImageSpreadShiftRight,
             "image_spread_shift_prev" => Self::ImageSpreadShiftPrev,
             "image_spread_shift_next" => Self::ImageSpreadShiftNext,
+            "image_spread_step_prev" => Self::ImageSpreadStepPrev,
+            "image_spread_step_next" => Self::ImageSpreadStepNext,
             "image_rotate_left" => Self::ImageRotateLeft,
             "image_rotate_right" => Self::ImageRotateRight,
             "image_capture" => Self::ImageCapture,
@@ -1802,6 +1808,8 @@ impl RingActionId {
             Self::ImageSpreadShiftRight => "見開き 1Pずらし 右",
             Self::ImageSpreadShiftPrev => "見開き 1Pずらし 前",
             Self::ImageSpreadShiftNext => "見開き 1Pずらし 次",
+            Self::ImageSpreadStepPrev => "見開きのまま 1 ページ戻る",
+            Self::ImageSpreadStepNext => "見開きのまま 1 ページ進む",
             Self::ImageRotateLeft => "回転 L",
             Self::ImageRotateRight => "回転 R",
             Self::ImageCapture => "キャプチャ保存",
@@ -1928,6 +1936,8 @@ impl RingActionId {
                     | Self::ImageSpreadShiftRight
                     | Self::ImageSpreadShiftPrev
                     | Self::ImageSpreadShiftNext
+                    | Self::ImageSpreadStepPrev
+                    | Self::ImageSpreadStepNext
                     | Self::ImageRotateLeft
                     | Self::ImageRotateRight
                     | Self::ImageCapture
@@ -2091,6 +2101,8 @@ impl RingActionId {
                 Self::ImageSpreadShiftRight,
                 Self::ImageSpreadShiftPrev,
                 Self::ImageSpreadShiftNext,
+                Self::ImageSpreadStepPrev,
+                Self::ImageSpreadStepNext,
                 Self::ImageRotateLeft,
                 Self::ImageRotateRight,
                 Self::ImageCapture,

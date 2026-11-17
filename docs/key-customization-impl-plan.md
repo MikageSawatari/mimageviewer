@@ -1,5 +1,10 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.796: `FsSpreadStepPrev` / `FsSpreadStepNext` は FsImage / Press、既定なし。
+`ImageSpreadStepPrev/Next` と双方向対応し、リング・ボタン・ジェスチャ・パッドは
+共通 handler を使う。既存見開き調整とは別操作で、読み順固定・保存/通知なし。
+ページ送りの per-frame coalescing と operation attribution は既存契約を保つ。
+
 §1.768: 単一行入力の右クリックメニューの Esc は固定の部品内操作として扱う。
 保持中のメニューが消費した Esc は egui/native で共有 claim し、検索・dialog の背面操作へ漏らさない。
 同じ入力フレームでメニューを開いて閉じた場合は親が Esc を使う。入力所有の詳細は keymap-spec.md を参照。

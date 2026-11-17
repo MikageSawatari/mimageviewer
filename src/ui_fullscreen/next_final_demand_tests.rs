@@ -98,6 +98,7 @@ fn d3_next_landscape_alone_blank_and_vacant_never_invent_pixel_pages() {
                 &[0, 1, 2, 3],
                 mode,
                 None,
+                None,
                 Default::default(),
                 &overrides,
                 |_, _| false,

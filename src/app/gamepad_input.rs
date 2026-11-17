@@ -8768,6 +8768,17 @@ impl App {
                 self.apply_ring_image_spread_shift(ctx, 1, source);
                 None
             }
+            RingActionId::ImageSpreadStepPrev | RingActionId::ImageSpreadStepNext
+                if context == RingShortcutContext::ImageFullscreen =>
+            {
+                let dir = if action == RingActionId::ImageSpreadStepNext {
+                    1
+                } else {
+                    -1
+                };
+                self.apply_ring_image_spread_step(ctx, dir, source);
+                None
+            }
             RingActionId::ImageRotateLeft if context == RingShortcutContext::ImageFullscreen => {
                 if let Some(fs_idx) = self.fullscreen_idx {
                     if self.current_fullscreen_spread_is_double(fs_idx) {
@@ -9136,6 +9147,39 @@ impl App {
         match (right, rtl) {
             (true, false) | (false, true) => 1,
             (true, true) | (false, false) => -1,
+        }
+    }
+
+    fn apply_ring_image_spread_step(
+        &mut self,
+        ctx: &egui::Context,
+        dir: i32,
+        source: &'static str,
+    ) {
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        let mut action = crate::ui_fullscreen::FsKeyAction::default();
+        self.queue_spread_step_action_for_frame(
+            ctx,
+            fs_idx,
+            dir,
+            &mut action,
+            self.gamepad_operation_for_navigation(ctx),
+        );
+        if !action.page_nav.is_none() || action.jump_to.is_some() {
+            self.bump_input_seq(source, Some(&format!("spread_step_dir={dir}")));
+            self.handle_fs_navigation(
+                ctx,
+                false,
+                false,
+                None,
+                None,
+                None,
+                action.page_nav,
+                action.jump_to,
+                fs_idx,
+            );
         }
     }
 
@@ -14916,3 +14960,6 @@ mod physical_boundary_tests {
         assert!(app.final_composite_cache.get(&main_key).is_none());
     }
 }
+#[cfg(test)]
+#[path = "spread_step_input_tests.rs"]
+mod spread_step_input_tests;

@@ -683,6 +683,7 @@ enum ContinuationKind {
     Page,
     Slideshow,
     SpreadShift,
+    SpreadStep,
 }
 
 #[test]
@@ -693,6 +694,7 @@ fn regression_1750_far_boundary_retires_stale_shift_but_preserves_page_and_slide
         ContinuationKind::Page,
         ContinuationKind::Slideshow,
         ContinuationKind::SpreadShift,
+        ContinuationKind::SpreadStep,
     ] {
         let _clock = TestClock::at(Instant::now());
         let ctx = egui::Context::default();
@@ -723,6 +725,8 @@ fn regression_1750_far_boundary_retires_stale_shift_but_preserves_page_and_slide
                 ),
                 ContinuationKind::SpreadShift =>
                     app.page_turn_defer_spread_shift(ctx, old_nudge.0, Some(operation), old_nudge.1),
+                ContinuationKind::SpreadStep =>
+                    app.page_turn_defer_spread_step(ctx, 11, Some(operation), 11),
             });
             assert!(!draw_receipt(&mut app, ui, ctx).curl);
         });
@@ -746,7 +750,10 @@ fn regression_1750_far_boundary_retires_stale_shift_but_preserves_page_and_slide
             let committed = app.commit_page_turn_continuation(ctx);
             assert_eq!(
                 committed,
-                !matches!(kind, ContinuationKind::SpreadShift),
+                !matches!(
+                    kind,
+                    ContinuationKind::SpreadShift | ContinuationKind::SpreadStep
+                ),
                 "{kind:?}: {}",
                 completion_debug(&app, ctx)
             );
@@ -770,7 +777,10 @@ fn regression_1750_far_boundary_retires_stale_shift_but_preserves_page_and_slide
             .count();
         assert_eq!(
             commits,
-            usize::from(!matches!(kind, ContinuationKind::SpreadShift)),
+            usize::from(!matches!(
+                kind,
+                ContinuationKind::SpreadShift | ContinuationKind::SpreadStep
+            )),
             "{events:?}"
         );
     }
@@ -866,6 +876,91 @@ fn regression_1750_changed_continuation_target_retires_without_resolving_another
             completion_debug(&app, ctx)
         );
     });
+}
+
+#[test]
+fn spread_step_barrier_defers_without_mutation_and_commits_once() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let _clock = TestClock::at(Instant::now());
+    let ctx = egui::Context::default();
+    install(&ctx);
+    let mut app = ready_app(&ctx, SpreadMode::Ltr);
+    portrait_boundary_book(&ctx, &mut app);
+    start_boundary_turn(&ctx, &mut app);
+    let operation = ViewerOperationId::Slideshow(next_operation_batch());
+    frame(&ctx, |ui, ctx| {
+        let mut action = FsKeyAction::default();
+        app.queue_spread_step_action_for_frame(ctx, 10, 1, &mut action, Some(operation));
+        assert!(action.page_nav.is_none());
+        assert!(app.spread_step.is_none());
+        // The existing one-command budget keeps the first resolved intent.
+        app.queue_spread_step_action_for_frame(ctx, 10, -1, &mut action, Some(operation));
+        assert!(app.spread_step.is_none());
+        assert!(!draw_receipt(&mut app, ui, ctx).curl);
+    });
+    frame(&ctx, |_, ctx| {
+        assert!(
+            app.commit_page_turn_continuation(ctx),
+            "{}",
+            completion_debug(&app, ctx)
+        );
+        assert_eq!(app.fullscreen_idx, Some(11));
+        assert_eq!(app.spread_step.unwrap().start_idx, 11);
+        assert!(!app.commit_page_turn_continuation(ctx));
+        assert!(!app.page_turn_barrier_active());
+    });
+}
+
+#[test]
+fn spread_step_immediate_landing_has_its_own_curl_exclusion() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    install(&ctx);
+    let mut app = ready_app(&ctx, SpreadMode::Ltr);
+    app.settings.page_turn_animation_enabled = true;
+    frame(&ctx, |ui, ctx| {
+        draw_current(&mut app, ui, ctx);
+    });
+    let operation = ViewerOperationId::Slideshow(next_operation_batch());
+    take_test_events();
+    frame(&ctx, |ui, ctx| {
+        app.page_turn_external_operation(ctx, operation, OperationPhase::Press, "step-test");
+        let mut action = FsKeyAction::default();
+        app.queue_spread_step_action_for_frame(ctx, 0, 1, &mut action, Some(operation));
+        assert_eq!(action.page_nav, FsPageNav::Target(1));
+        app.handle_fs_navigation(
+            ctx,
+            false,
+            false,
+            None,
+            None,
+            None,
+            action.page_nav,
+            None,
+            0,
+        );
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert!(!draw_receipt(&mut app, ui, ctx).curl);
+        assert!(!app.page_turn_barrier_active());
+    });
+    let events = take_test_events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|(fact, kind, reason)| fact.operation_id == operation
+                && *kind == "skip"
+                && *reason == "stage1_spread_step")
+            .count(),
+        1,
+        "{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|(fact, kind, _)| fact.operation_id == operation && *kind == "offer")
+    );
 }
 
 #[test]

@@ -35,6 +35,10 @@ enum ResolvedNavigationIntent {
         anchor: usize,
         topology: Arc<Vec<SpreadDisplayUnit>>,
     },
+    SpreadStep {
+        anchor: usize,
+        topology: Arc<Vec<SpreadDisplayUnit>>,
+    },
 }
 
 #[cfg(test)]
@@ -57,6 +61,29 @@ impl PageTurnPresentation {
 }
 
 impl App {
+    pub(crate) fn page_turn_defer_spread_step(
+        &mut self,
+        ctx: &egui::Context,
+        target_idx: usize,
+        operation: Option<ViewerOperationId>,
+        anchor: usize,
+    ) -> bool {
+        if !self.page_turn_barrier_active() {
+            return false;
+        }
+        self.resolve_page_turn_layout_before_lookup();
+        self.page_turn_defer_navigation_intent(
+            ctx,
+            target_idx,
+            crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+            operation,
+            ResolvedNavigationIntent::SpreadStep {
+                anchor,
+                topology: Arc::clone(&self.spread_display_units_cache.units),
+            },
+        )
+    }
+
     pub(crate) fn page_turn_wheel_navigation_operation(
         &self,
         ctx: &egui::Context,
@@ -360,7 +387,7 @@ impl App {
             || command.items != self.items_generation
             || !command.from_binding.matches_navigation(self)
             || !command.target_binding.matches_navigation(self)
-            || matches!(&command.intent, ResolvedNavigationIntent::SpreadShift { topology, .. }
+            || matches!(&command.intent, ResolvedNavigationIntent::SpreadShift { topology, .. } | ResolvedNavigationIntent::SpreadStep { topology, .. }
                 if !Arc::ptr_eq(topology, &self.spread_display_units_cache.units))
             || self.fullscreen_idx != Some(command.from_idx)
         {
@@ -391,19 +418,27 @@ impl App {
         emit(
             &command.fact,
             "skip",
-            "stage1_continuation_instant",
+            if matches!(command.intent, ResolvedNavigationIntent::SpreadStep { .. }) {
+                "stage1_spread_step"
+            } else {
+                "stage1_continuation_instant"
+            },
             &[("target_idx", command.target_idx.into())],
         );
         let slice = match &command.intent {
             ResolvedNavigationIntent::Page { slice }
             | ResolvedNavigationIntent::Slideshow { slice, .. } => *slice,
-            ResolvedNavigationIntent::SpreadShift { .. } => None,
+            ResolvedNavigationIntent::SpreadShift { .. }
+            | ResolvedNavigationIntent::SpreadStep { .. } => None,
         };
         if let ResolvedNavigationIntent::SpreadShift { anchor, .. } = &command.intent {
             if !self.set_live_spread_shift(*anchor) {
                 return true;
             }
             self.adjust_spread_target = None;
+        }
+        if let ResolvedNavigationIntent::SpreadStep { anchor, .. } = &command.intent {
+            self.set_spread_step(*anchor);
         }
         if let ResolvedNavigationIntent::Slideshow { slice, purpose } = &command.intent {
             self.complete_book_slideshow_target(ctx, command.target_idx, *slice, *purpose);

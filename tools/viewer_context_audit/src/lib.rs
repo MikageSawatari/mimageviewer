@@ -306,7 +306,9 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     // 1.364 D2 keeps the accepted spread-shift owner in the bundle across mount/swap/fork.
     // 1.242 G1-G4 retains recipe/composition/editor state in this same context owner.
     // 1.444 freezes the main listing order in this bundle; forks leave it with the parent.
-    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { pub (in crate :: app) list_order : Option < Arc < super :: ListOrderSnapshot > > , pub (super) spread_shift : super :: spread_shift_owner :: ViewerSpreadShift , pub (super) book_composition : super :: book_composition_runtime :: ViewerBookComposition , pub (super) composition_editor : super :: book_composition_editor :: CompositionEditorState , pub (super) book_composition_permission : super :: book_composition_permission :: ViewerPresentationPermission }",
+    // 1.796 r5: the ephemeral exact spread origin shares this context owner;
+    // mount/swap preserve it, and a fork starts without it or its projection.
+    "item struct # [cfg (windows)] pub (in crate :: app) struct ViewerContextBundle { pub (in crate :: app) list_order : Option < Arc < super :: ListOrderSnapshot > > , pub (super) spread_shift : super :: spread_shift_owner :: ViewerSpreadShift , pub (super) spread_step : Option < super :: spread_shift_owner :: SpreadStep > , pub (super) book_composition : super :: book_composition_runtime :: ViewerBookComposition , pub (super) composition_editor : super :: book_composition_editor :: CompositionEditorState , pub (super) book_composition_permission : super :: book_composition_permission :: ViewerPresentationPermission }",
     "trait impl # [cfg (windows)]   ViewerContextBundle  Drop {   fn drop (& mut self) }",
     "item struct # [cfg (windows)] pub (in crate :: app) struct ContextRef < 'a > { }",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn mounted (app : & 'a App) -> Self",

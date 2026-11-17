@@ -3074,6 +3074,7 @@ impl App {
                             && self.page_alone_preferences.last
                                 == crate::settings::PageAlonePreference::FollowGlobal)
                 {
+                    crate::app::spread_shift_owner::retire_spread_step(&mut self.spread_step);
                     self.similar_panel.reset_info_target();
                     self.invalidate_singleton_spread_placement_display(ctx);
                 }
@@ -10909,3 +10910,6 @@ mod tests {
         }
     }
 }
+#[cfg(test)]
+#[path = "preferences/spread_step_tests.rs"]
+mod spread_step_tests;

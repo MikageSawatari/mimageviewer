@@ -1767,6 +1767,8 @@ pub enum KeyAction {
     FsSpreadShiftRight,
     FsSpreadShiftPrev,
     FsSpreadShiftNext,
+    FsSpreadStepPrev,
+    FsSpreadStepNext,
     FsTogglePageAfterCoverAlone,
     FsToggleLastPageAlone,
     FsSlideshow,
@@ -2383,6 +2385,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsSpreadShiftRight,
     KeyAction::FsSpreadShiftPrev,
     KeyAction::FsSpreadShiftNext,
+    KeyAction::FsSpreadStepPrev,
+    KeyAction::FsSpreadStepNext,
     KeyAction::FsTogglePageAfterCoverAlone,
     KeyAction::FsToggleLastPageAlone,
     KeyAction::FsSlideshow,
@@ -4642,6 +4646,8 @@ impl KeyAction {
             FsSpreadShiftRight => "FsSpreadShiftRight",
             FsSpreadShiftPrev => "FsSpreadShiftPrev",
             FsSpreadShiftNext => "FsSpreadShiftNext",
+            FsSpreadStepPrev => "FsSpreadStepPrev",
+            FsSpreadStepNext => "FsSpreadStepNext",
             FsTogglePageAfterCoverAlone => "FsTogglePageAfterCoverAlone",
             FsToggleLastPageAlone => "FsToggleLastPageAlone",
             FsSlideshow => "FsSlideshow",
@@ -5423,6 +5429,8 @@ impl KeyAction {
             FsSpreadShiftRight => "見開き表示を右方向へ1ページずらす",
             FsSpreadShiftPrev => "見開き表示を前のページ方向へ1ページずらす",
             FsSpreadShiftNext => "見開き表示を次のページ方向へ1ページずらす",
+            FsSpreadStepPrev => "見開きのまま 1 ページ戻る",
+            FsSpreadStepNext => "見開きのまま 1 ページ進む",
             FsTogglePageAfterCoverAlone => "表紙の次のページを単独で表示",
             FsToggleLastPageAlone => "最終ページを単独で表示",
             FsSlideshow => "スライドショーの再生または停止を切り替える",
@@ -6013,6 +6021,8 @@ impl KeyAction {
             | FsSpreadShiftRight
             | FsSpreadShiftPrev
             | FsSpreadShiftNext
+            | FsSpreadStepPrev
+            | FsSpreadStepNext
             | FsTogglePageAfterCoverAlone
             | FsToggleLastPageAlone
             | FsPagePrev
@@ -6586,6 +6596,8 @@ impl KeyAction {
             | FsSpreadShiftRight
             | FsSpreadShiftPrev
             | FsSpreadShiftNext
+            | FsSpreadStepPrev
+            | FsSpreadStepNext
             | FsTogglePageAfterCoverAlone
             | FsToggleLastPageAlone
             | FsSlideshow
@@ -7162,7 +7174,9 @@ impl KeyAction {
             FsContinuousScrollBack => ChordList::one(Chord::key(PageUp)),
             FsSpreadShiftLeft => ChordList::one(Chord::ctrl(Left)),
             FsSpreadShiftRight => ChordList::one(Chord::ctrl(Right)),
-            FsSpreadShiftPrev | FsSpreadShiftNext => ChordList::EMPTY,
+            FsSpreadShiftPrev | FsSpreadShiftNext | FsSpreadStepPrev | FsSpreadStepNext => {
+                ChordList::EMPTY
+            }
             FsTogglePageAfterCoverAlone | FsToggleLastPageAlone => ChordList::EMPTY,
             FsSlideshow => ChordList::one(Chord::key(S)),
             FsSeekStripToggle => ChordList::one(Chord::shift(S)),
@@ -11829,6 +11843,8 @@ mod tests {
             "ImageSpreadShiftRight".to_string(),
             "ImageSpreadShiftPrev".to_string(),
             "ImageSpreadShiftNext".to_string(),
+            "ImageSpreadStepPrev".to_string(),
+            "ImageSpreadStepNext".to_string(),
             "VideoCapture".to_string(),
             "VideoMute".to_string(),
             "VideoLoop".to_string(),

@@ -1467,6 +1467,19 @@ detached の述語、viewport、状態遷移は変更しない。親への保存
 一致した pool 要求の worker が行う。時間窓・追加の発火状態を設けない所有境界の変更であり、
 症状パッチではない。両 context の対応が往復 swap で保持される回帰テストを加えた。
 
+### 2026-11-17: 見開きのまま 1 ページ送りの context 所有（§1.796）
+
+- 確定設計 [one-page-step-plan.md r5 §3–4](one-page-step-plan.md) の設計担当・独立レビューの合意に沿い、
+  `ViewerContextBundle` の `spread_shift` 隣へ保存しない `spread_step` を追加する。
+  Codex の実装前提確認でも、既存 bundle の移送境界へ載せる構造変更であり症状パッチではないと確認した。
+- empty・網羅的 destructuring・swap・park/mount で既存所有を保つ。
+  新 context の fork は起点を引き継がず、fork 先の表示単位 cache も一時の列を残さない。
+  F12 の同 context 表示先切替は起点を保持する。detached 固有の guard・述語・viewport 経路は追加しない。
+- 退役は受理済みの組の意味の切替だけで行い、兄弟 context の列や cache は失効させない。
+  context 回帰は swap/park/mount・兄弟分離・両世代 setter・fork・parked 単独ページ設定・collection 受付を対象とする。
+  - `viewer_context_audit` の bundle public API fingerprint を、このフィールド追加分だけ更新する。
+    bundle を直接生成する2テストは registry 本体の test module に置き、監査の例外は増やさない。
+
 ### 2026-11-15: §1.767 サブPC依頼57 — caption buttonの確定点を一致SCに統一
 
 タッチ・最小化の独立レビュー（基点9c69805bd、Sol / xhigh、REJECT）は構造修正に合意。
