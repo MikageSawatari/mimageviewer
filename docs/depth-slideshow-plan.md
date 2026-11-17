@@ -1,6 +1,6 @@
 # 3D 写真のままスライドショー (次のページの奥行きの先読み) — 設計書 (§1.771)
 
-状態: **設計第 6 版 (2026-11-18)。第 5 版が独立設計レビューで ACCEPT。利用者の決定 (§10) を反映し、待ちの終端の分類 (§5.4.1) を足した差分の確認待ち。利用者の判断待ちの項目あり (§10)**。
+状態: **設計第 7 版 (2026-11-18)。第 5 版が独立設計レビューで ACCEPT。利用者の決定 (§10) を反映した差分を確認中 (第 6 回 REVISE を反映)。利用者の判断待ちの項目あり (§10)**。
 worktree `G:\home\mimageviewer-771`、ブランチ `feat-771-depth-slideshow` (master `96ed160a0` から)。
 3D 写真の全体設計は [depth-parallax-plan.md](depth-parallax-plan.md) が正本。本書はその §1「v1 に含めない: 先読み」、
 §6.3「ON にするときの後始末: スライドショー停止」、§6.5 と §10 段 B の全箇所分類表 (topbar・リング・S キーの抑止) を
@@ -168,8 +168,8 @@ fn depth_slideshow_gate(&mut self, ctx, idx, now) -> DepthSlideshowGate
   時間ではなく終端の分類で保証する。
 - `Go`: 3D でない / 送り先の素材のテクスチャの `key` が LRU にある / 送り先が読み込み済みでアニメーション (`fs_entry_is_animated`。
   着地して既存の継続条件で 3D を終える、§10 の 2) / **先読みの対象外** (透過背景のモードが既定でない、書き出しの操作中。
-  §5.3 の 2 のうち、待っても状態が変わらない条件) / §5.4.1 の分類が `Unavailable` (作る仕事が無い・終端した)。
-- `Wait`: §5.4.1 の分類が `Producing` (今のページの深度がまだ終わっていない場合を含む)。`advance_slideshow` は何も変えずに戻る。
+  §5.3 の 2 のうち、待っても状態が変わらない条件) / §5.4.1 の分類で送り先が `Unavailable` (作る仕事が無い・始まっていない・終端した)。
+- `Wait`: §5.4.1 の分類で今のページか送り先が `Producing`。`advance_slideshow` は何も変えずに戻る。
   `slideshow_next_at` は過ぎたままなので、次のフレームで同じ照合をする。タイマーの既存の
   `request_repaint_after(remaining.min(100ms))` (remaining = 0) で再描画が続く。先読みの完了でも worker が repaint する。
 - 待ち中は今のページの 3D を描き続ける。画面上の表示は足さない (§10 の 1)。
@@ -180,44 +180,50 @@ fn depth_slideshow_gate(&mut self, ctx, idx, now) -> DepthSlideshowGate
   今の 3D の経路で表示する (平面 → 立体が見え得る)。非表示のページを含む本の構成は 3D の写真の閲覧ではまれで、
   許可待ちの継続の所有者 (再入の仕組み) に照合を足すと状態が増えるため、制限として受け入れる (§5.8)。
 
-#### 5.4.1 待ちの終端 — 送り先の準備の分類 (1 つの関数)
+#### 5.4.1 待ちの終端 — ページの準備の分類 (今のページと送り先で共通の 1 つの関数)
 
 ```rust
-enum NextDepthProgress {
-    Ready,        // LRU に送り先の key がある → Go
-    Producing,    // 終わりが保証された仕事が動いている → Wait
-    Unavailable,  // 作る仕事が無い・失敗・取消で終端した → Go (送り先は今の 3D の経路で表示)
+enum DepthPageProgress {
+    Ready,        // 今のページ: §5.7 の事実がある。送り先: LRU に素材の key がある
+    Producing,    // すでに始まっていて、終わりが保証された仕事が動いている
+    Unavailable,  // それ以外 (仕事が無い・始まっていない・失敗・取消・登録を見送られた)
 }
-fn next_depth_progress(&self, ctx, idx) -> NextDepthProgress   // 読み取りだけ。要求も状態の変更もしない
+fn depth_page_progress(&self, ctx, idx, role: DepthPageRole /* Current | Next */) -> DepthPageProgress
+// 読み取りだけ。要求の発行・再試行・待ちの開始時刻の記録をしない
 ```
 
-上から順に判定し、最初に当てはまったものを返す。**分類に迷うものは `Unavailable` に倒す** (誤って `Producing` にすると止まり、
-誤って `Unavailable` にすると平面 → 立体が 1 回見えるだけなので)。
+**原則 (第 6 回レビュー P1-2・P2-4 を受けて)**: `Producing` に数えるのは、**すでに始まっていて、既存の所有者が成功・失敗・取消のどれかで
+必ず終える仕事だけ**。まだ始まっていない仕事 (読み込みの未発行、D3 の未開始、CPU 予約の拒否で始められない仕事) は数えない。
+分類に迷うものは `Unavailable` に倒す (誤って `Producing` にすると止まり、誤って `Unavailable` にすると平面 → 立体が 1 回見えるだけ)。
+送り先の仕事は、今のページを 3D で見せてから期限までの間隔 (最短 0.5 秒、既定 3 秒) の間に始まるので、通常は期限の時点で
+始まっているか終わっている。始まっていなければ待たずに送る。
+
+上から順に判定し、最初に当てはまったものを返す。
 
 | 段 | 状態 | 分類 | 終わりの保証 |
 | --- | --- | --- | --- |
-| 0 | 今のページの事実 (§5.7) がまだ無い | `Producing` | 今のページの深度は既存の所有者が Ready / Failed / 取消 (素材の変化) で必ず終わる。素材待ちが長い場合も今のページの既存の挙動 |
-| 1 | 送り先の素材の key が LRU にある | `Ready` | — |
-| 2 | 先読みの枠が送り先・その key で `ReadingBack` / `Estimating` | `Producing` | 読み戻しは map の成功 / 失敗で、推論は結果 / 失敗 / 取消で終わる (既存) |
-| 3 | 先読みの枠が送り先・その key で `Failed` | `Unavailable` | — |
-| 4 | 素材が resident だが renderer の backing がまだ無い / 枠をこれから作る (§5.3 の 4) | `Producing` | 次のパスで登録・枠の作成が起きる |
+| 1 | 今のページ: §5.7 の事実がある (`Presented` / `Failed`)。送り先: 素材の key が LRU にある | `Ready` | — |
+| 2 | 深度の仕事が動いている (今のページ: `source` が `ReadingBack` / `Estimating`。送り先: 枠がその key で `ReadingBack` / `Estimating`) | `Producing` | 読み戻しは map の成功 / 失敗、推論は結果 / 失敗 / 取消で終わる (既存) |
+| 3 | 送り先の枠がその key で `Failed` | `Unavailable` | — |
+| 4 | 素材が resident だが renderer の backing がまだ無い | `Producing` | managed texture はそのフレームの末尾で登録される (既存の `TexturePending` と同じ) |
 | 5 | 元画像の読み込み (`fs_page_load_state(idx)`) が `LoadPending` / `UploadPending` | `Producing` | 既存の読み込みは成功か `LoadFailed` で終わる |
-| 6 | 同じく `LoadFailed` | `Unavailable` | — |
-| 7 | 同じく `NeedsLoad` で、送り先が元画像の先読みの保持範囲 (`prefetch_forward` 枚) の中 | `Producing` | 先読みの調整 (`reconcile_paged_prefetch_window`) が同じフレームの流れで読み込みを出す。範囲の外 (先読み 0 枚の設定等) は 8 へ |
-| 8 | 同じく `NeedsLoad` で範囲の外 | `Unavailable` | — |
-| 9 | 元画像は読み込み済みで、送り先の final 系の仕事 (`final_effect_pending` の今の key の項目) が `Computing` / `Registering`、または `CpuReady` で登録の順番待ち | `Producing` | worker の job は結果 / 失敗 / 取消で、登録は ROOT の共通枠で 1 フレーム 1 枚ずつ終わる |
-| 10 | 同じく `CpuReady` だが VRAM 予算で登録を見送られている (`FinalPrepareGpuDeferred::OverBudget`) | `Unavailable` | 着地すれば表示の要求が既存の手順で引き取る (`take_prepared_final_for_display`) |
-| 11 | final AI の仕事が送り先の今の key で動いている (既存の AI 先読みの pending) | `Producing` | AI worker の結果 / 失敗 / 取消で終わる。その後 D3 の after-AI 計画へ進む (段 12) |
-| 12 | 仕事は無いが、D3 がこのページで仕事を始められる (D3 の開始判定と同じ純粋な述語: `prepared_edit_page(idx)` または `final_prepare_plan_from_resident(idx).is_some()`、かつ §5.6 の述語が真) | `Producing` | D3 は同じフレームの流れで job を出すか、共通の permit 待ち (先行する job の終わり) の後に出す |
-| 13 | 上のどれでもない (D3 の対象外: AI が要るのに AI の先読みが無い、注釈の font が未準備、取消後に誰も作らない 等) | `Unavailable` | — |
+| 6 | 元画像は読み込み済みで、final 系の仕事 (`final_effect_pending` の今の key の項目) が `Computing` | `Producing` | worker の job は結果 / 失敗 / 取消で終わる |
+| 7 | 同じく `CpuReady` / `Registering` で、残りの登録が、登録の受付と**同じ純粋な予算判定**で受け付けられる | `Producing` | ROOT の共通の登録枠で 1 フレーム 1 枚ずつ終わる |
+| 8 | 同じく `CpuReady` / `Registering` で、予算判定が受け付けない | `Unavailable` | 着地すれば表示の要求が既存の手順で引き取る (`take_prepared_final_for_display`) |
+| 9 | final AI の仕事が今の key で動いている (既存の AI の pending) | `Producing` | AI worker の結果 / 失敗 / 取消で pending が除かれる (第 6 回レビューで確認) |
+| 10 | 上のどれでもない (読み込みが `NeedsLoad` / `LoadFailed`、D3 が未開始、D3 の対象外、AI が要るのに AI の仕事が無い、取消後に誰も作らない、元画像の保持だけ 等) | `Unavailable` | — |
 
-- この関数は既存の所有者の状態を読むだけで、要求の発行・再試行・待ち時間の記録をしない。待ちの開始時刻も覚えない。
-- 実装担当は着手時に、段 5〜12 の各状態の読み方 (関数・フィールド) をコードで特定し、各 `Producing` の段について「その仕事が必ず
-  終端へ進むこと」と、終端したときにこの関数が `Ready` か `Unavailable` を返すことを確かめる。確かめられない段は `Unavailable` に倒し、
-  設計担当へ報告する。段 7 と段 12 は「まだ始まっていない仕事」を `Producing` と数えるので、それぞれ始める側 (先読みの調整・D3) が
-  同じ条件で必ず始めることをテストで固定する。
-- 例外 (段 0): 今のページの深度が終わらない限り送らないのは、今の挙動 (間隔は今のページを見せてから数える) と同じ。今のページの
-  素材が来ない場合は今までどおり 2D のまま待つ。
+- 段 7・8 の予算判定は、登録を受け付ける既存の判定 (`final_prepare_budget.rs` の GPU admission) と同じ純粋な関数を、副作用なしで呼ぶ。
+  診断用の記録 (`FinalPrepareGpuDeferred`、perf 無効では記録されない) を状態として使わない (第 6 回レビュー P1-1)。
+  純粋な判定を切り出せない場合は、`CpuReady` / `Registering` を `Unavailable` に倒し、設計担当へ報告する。
+- 実装担当は着手時に、段 2〜9 の各状態の読み方 (関数・フィールド) をコードで特定し、各 `Producing` の段について「その仕事が必ず
+  終端へ進み、終端したらこの関数が `Ready` か `Unavailable` を返すこと」をテストで固定する。
+- **今のページ (`role = Current`)**: 間隔の開始 (§5.7.1) と照合の最初の段で使う。`Unavailable` (読み込みの終端失敗、素材の生産者が
+  無い、元画像の保持だけ 等) は終端として扱い、間隔を数え始め、期限で送る (第 6 回レビュー P2-3)。D3 と先読みの開始は
+  §5.7 の事実 (`Ready`) だけを証拠にし、`Unavailable` では始めない (提示の証拠を緩めない)。そのとき送り先は段 10 で `Unavailable` になり、待たずに送る。
+
+照合 (§5.4) での使い方: まず今のページの分類が `Producing` なら `Wait`。次に送り先の分類が `Ready` なら `Go`、`Producing` なら `Wait`、
+`Unavailable` なら `Go`。
 
 ### 5.5 送った後の引き継ぎ (先読みの途中を捨てない)
 
@@ -260,7 +266,7 @@ fn next_depth_progress(&self, ctx, idx) -> NextDepthProgress   // 読み取り�
    (`app.rs:91333`) としてそのまま採用され、`resident_final_prepare_material` が返した TextureId と同じになることをテストで固定する。
    さらに、送った後の最初の描画で深度の callback が実際に出ることまで確かめる (§8)。
 4. 元画像の先読み数が 0、VRAM 予算外、AI 先読み 0 で AI が要るページなど、表示前の素材が作られない設定では、
-   §5.4.1 の分類が `Unavailable` になり、待たずに送る (そのページは平面 → 立体が見える)。設定の組み合わせとして受け入れ、マニュアルに書く。
+   §5.4.1 の分類が `Unavailable` (段 10) になり、待たずに送る (そのページは平面 → 立体が見える)。設定の組み合わせとして受け入れ、マニュアルに書く。
 
 ### 5.7 「今のページを 3D で見せた」事実と、間隔の数え方
 
@@ -320,8 +326,9 @@ fn next_depth_progress(&self, ctx, idx) -> NextDepthProgress   // 読み取り�
   `ctx` は描画 closure の中だけの変数 (`ui_fullscreen.rs:28081`) なので、タイマー側で `ctx` から可視性や viewport id を読み直さない
   (`viewport_id()` は現在の viewport stack を見る、`vendor/egui/src/context.rs:751`。第 4 回レビュー P2)。
   main の埋め込み表示・通常全画面 (child viewport)・detached のどれでも、描画 closure の中で同じ式で取る。
-- 3D 中の `current_slideshow_frame_ready` = 見えているパス かつ (`depth_current_settled()` **または** 既存の `fs_load_failed`
-  (元画像の読み込みの終端失敗。通知後は通常どおり送る。第 2 回レビュー P3-4、第 3 回 P3-2))。
+- 3D 中の `current_slideshow_frame_ready` = 見えているパス かつ 今のページの §5.4.1 の分類が `Ready` か `Unavailable`
+  (`Unavailable` は元画像の読み込みの終端失敗 (`LoadFailed`、既存の `fs_load_failed` の通知はそのまま) や素材の生産者が無い状態。
+  終端として数え始め、期限で送る。第 2 回レビュー P3-4、第 3 回 P3-2、第 6 回 P2-3)。
 - 3D 中の別のページへの着地 (`complete_book_slideshow_target`、`ui_fullscreen.rs:43181`) では、期限と anchor を設定せず
   anchor を未設定のまま残す。描画後の `sync_slideshow_anchor_for_frame` が事実を確認して起算する (第 2 回レビュー P3-3)。
   先読みが当たったページは移った最初のパスで `Presented` を記録するので、その sync で起算され、追加の待ちは生じない。
@@ -395,9 +402,9 @@ fn next_depth_progress(&self, ctx, idx) -> NextDepthProgress   // 読み取り�
    補正なしのページ (fs_cache 共有) と、補正ありのページ (紙めくり OFF、新しいトポロジー、D3 の worker 開始から完成テクスチャの
    登録まで) の両方。TextureId の一致を確かめる。
 5. §5.4.1 の各段: `Producing` の間は送らず (`Wait`)、時間が経っても送らない。各 `Producing` の仕事が終端 (成功・失敗・取消) すると
-   `Ready` か `Unavailable` になって送る。`Unavailable` の各段 (読み込み失敗、先読み範囲の外、VRAM 予算の見送り、D3 の対象外、
-   深度の失敗) で待たずに送る。段 7・段 12 で、始める側が同じ条件で必ず仕事を始める。送った後に推論中の先読みが今のページへ
-   引き継がれ、取り消されない。
+   `Ready` か `Unavailable` になって送る。`Unavailable` の各段 (読み込みの未発行・失敗、D3 の未開始・対象外、予算判定で登録を見送られた
+   `CpuReady` / `Registering`、深度の失敗) で待たずに送る。今のページが `Unavailable` (読み込みの終端失敗など) でも止まらず、
+   間隔を数えて送る。送った後に推論中の先読みが今のページへ引き継がれ、取り消されない。
 6. 手動で送り先へ移ったとき (`NavigationSequence` の `PageTransition` を経る)、枠が引き継がれる。別のページへ移ると捨てられる。
 7. 送り先が読み込み済みのアニメーションなら待たずに送り、着地で 3D が終わる (トースト)。
 8. 透過背景を切り替えたページからは先読みも照合もしない。着地の次のページから先読みに戻る。
@@ -433,7 +440,8 @@ fn next_depth_progress(&self, ctx, idx) -> NextDepthProgress   // 読み取り�
    推奨案の時点で書いた「表示前の素材が作られない設定では止まったように見える」は、§5.4.1 の終端の分類で起きないようにした。
 2. **アニメーション画像のページ: 着地して 3D を終え、トーストで知らせて 2D で続ける** (推奨どおり)。→ §5.4 の `Go`。
 3. **「次のフォルダへ」の境目: 今どおり 3D を終えて 2D で続け、トーストを足す** (推奨どおり)。全画面を閉じて開き直す経路で、
-   3D を持っていた場合だけ、スライドショーの次のフォルダへの移動であることが分かる時点でトーストを出す
+   3D を持っていた場合だけ、フォルダ移動の結果を適用する側 (`FolderNavMode::SlideshowNext` を確認できる `app.rs:62385` 付近) で、
+   3D を退役させる前にトーストを出す。共通の `close_fullscreen` には足さない (手動の移動まで通知してしまうため。第 6 回レビュー)
    (例: 「3D 写真を終了しました: 次のフォルダへ進みました。<キー> キーでもう一度使えます」。キーの表記は既存の終了の通知と同じ helper)。
 4. **先読みできない場合を制限として受け入れ、マニュアルに書く** (推奨どおり): コレクションの直接登録画像のスライドショー
    (毎ページ平面 → 立体)、末尾から先頭への折り返し (1 周に 1 回)、分割表示 (毎ページ)、透過部分の背景を既定から切り替えたページ
@@ -499,6 +507,18 @@ RAW の入力世代を含むこと (`app.rs:87458`・`88074`)、着地で anchor
 
 **ACCEPT** (指摘なし)。第 4 回の 2 件の解消と、detached-rework-plan.md §11 の合意記録 (設計段階の合意として正確、実装・検証済みとは
 扱っていない) を確認。§10 の判断を実装仕様へ反映する前提で、実装を妨げる点は無い。
+
+### 第 6 回 (2026-11-18、同じセッションの継続、read-only、利用者の決定の差分だけ、基点 `78dac76d0`)
+
+**REVISE** (P1 2 件、P2 2 件)。待ちの分類で `Producing` に数えた段に、終わらない場合が残っていた。NextFolder のトーストの方針は妥当
+(移動の結果を適用する側で、3D の退役の前に出す)。段 11 (AI の pending) の終端は確認された。設計担当がすべて採用して第 7 版に反映した。
+
+| 指摘 | 内容 | 反映 |
+| --- | --- | --- |
+| P1-1 | `Registering` のまま予算で保持される場合が永久待ち。診断用の記録は状態に使えない | §5.4.1 段 7・8: `CpuReady` / `Registering` とも、登録の受付と同じ純粋な予算判定で分ける |
+| P1-2 | 「D3 の対象」は「始められる」ではない (AI 待ち、CPU 予約の拒否) | §5.4.1 の原則: 始まっていない仕事は `Producing` に数えない |
+| P2-3 | 今のページが読み込みに失敗すると、段 0 が永久に `Producing` | §5.4.1: 今のページにも同じ分類を使い、`Unavailable` は終端として数え始めて送る。D3・先読みの開始の証拠は緩めない |
+| P2-4 | 紙めくり OFF では先読みの調整が動かず、保持範囲の中でも読み込みが出ない場合がある | §5.4.1: `NeedsLoad` は `Unavailable` (未発行の読み込みを待たない) |
 
 ## 12. 実装記録
 
