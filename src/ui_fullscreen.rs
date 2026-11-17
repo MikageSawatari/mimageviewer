@@ -59081,7 +59081,7 @@ impl App {
             let markers = self.collect_video_nav_markers(fs_idx);
             let current = self
                 .fs_video_player(fs_idx)
-                .map(|p| p.position())
+                .map(|p| p.user_seek_base_secs())
                 .unwrap_or(0.0);
             let target: Option<NavMarker> = if next_marker_key {
                 markers
@@ -59178,7 +59178,7 @@ impl App {
                     if player.error().is_some() || player.info().is_none() {
                         None
                     } else {
-                        Some((player.path().clone(), player.position()))
+                        Some((player.path().clone(), player.user_seek_base_secs()))
                     }
                 }
                 _ => None,

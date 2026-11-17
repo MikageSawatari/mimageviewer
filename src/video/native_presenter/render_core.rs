@@ -4969,6 +4969,7 @@ pub enum NativeOverlayCommand {
     },
     ToggleLoop,
     ToggleContinuous,
+    AddBookmarkCurrent,
     AddBookmarkAt {
         target_secs: f64,
     },

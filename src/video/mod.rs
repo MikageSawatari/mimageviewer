@@ -1333,6 +1333,7 @@ pub enum NativeVideoOutputEvent {
     FrameStep {
         direction: i32,
     },
+    AddBookmarkCurrent,
     AddBookmarkAt {
         target_secs: f64,
     },
@@ -5105,6 +5106,7 @@ fn send_native_overlay_command(
         Command::FrameStep { direction } => NativeVideoOutputEvent::FrameStep { direction },
         Command::ToggleLoop => NativeVideoOutputEvent::ToggleLoop,
         Command::ToggleContinuous => NativeVideoOutputEvent::ToggleContinuous,
+        Command::AddBookmarkCurrent => NativeVideoOutputEvent::AddBookmarkCurrent,
         Command::AddBookmarkAt { target_secs } => {
             NativeVideoOutputEvent::AddBookmarkAt { target_secs }
         }
@@ -7891,6 +7893,13 @@ fn run_native_video_output(
                                     NativeVideoOutputEvent::FrameStep { direction },
                                 );
                             }
+                            crate::video::native_presenter::NativeOverlayCommand::AddBookmarkCurrent => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::AddBookmarkCurrent,
+                                );
+                            }
                             crate::video::native_presenter::NativeOverlayCommand::AddBookmarkAt {
                                 target_secs,
                             } => {
@@ -9493,6 +9502,18 @@ impl VideoPlayer {
         self.user_seek_base_secs()
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn enable_dsp_acquisition_for_test(&mut self) {
+        self.audio = Some(self.audio.take().unwrap().with_dsp_chain_for_test(
+            audio::AudioDspChain {
+                user: None,
+                effetune: Arc::new(crate::effetune::EffetuneAudioSlot::default()),
+                coordinator: Arc::new(dsp::coordinator::DspProcessingCoordinator::default()),
+            },
+            true,
+        ));
+    }
+
     #[cfg(test)]
     pub(crate) fn set_duration_for_test(&mut self, duration_secs: f64) {
         self.info
@@ -10502,7 +10523,8 @@ impl VideoPlayer {
         self.clock.set_playback_speed(speed);
     }
 
-    /// Phase 9.G: シーク中 (= override 設定中、UI が post-seek 1 枚目を表示する前) か。
+    /// Phase 9.G: シーク中 (= override 設定中、映像提示／音声消費の前) か。
+    /// 音声のみの停止 seek は engine の readiness 完了で override を解除する。
     /// perf overlay の graph freeze 判定に使う。
     pub fn is_seeking(&self) -> bool {
         self.clock.is_seeking()
@@ -11013,6 +11035,10 @@ impl VideoPlayer {
         }
     }
 
+    /// Latest requested position for operations that choose a target from the
+    /// current position. Display and saved playback positions still use position().
+    /// Latest requested position for operations that select a target. Display and
+    /// saved playback position must continue to use the clock/presentation APIs.
     pub(crate) fn user_seek_base_secs(&self) -> f64 {
         let (pending, issued) = self
             .user_seek_coalesce
@@ -14159,6 +14185,160 @@ mod tests {
         player.set_playing_internal(false, InternalContinuation::Normalize);
         player.set_playing_internal(true, InternalContinuation::Normalize);
         assert!(player.take_playback_success().is_none());
+    }
+
+    #[test]
+    fn paused_seek_audio_only_completes_on_readiness_for_position_and_configuration_apis() {
+        use super::{InternalContinuation, SeekOrigin};
+        for route in ["absolute", "relative", "strip", "configuration"] {
+            let player = audio_only_paused_seek_player();
+            player.clock.set_paused_position(10.0);
+            match route {
+                "absolute" => player.seek(15.0, SeekPlayback::PreserveIntent, SeekOrigin::User),
+                "relative" => {
+                    player.seek_relative(5.0, SeekPlayback::PreserveIntent, SeekOrigin::User);
+                }
+                "strip" => {
+                    player.seek_immediate(15.0, SeekPlayback::PreserveIntent, SeekOrigin::User)
+                }
+                "configuration" => player.seek_with_play_state(
+                    15.0,
+                    false,
+                    SeekOrigin::Internal(InternalContinuation::AudioTrack),
+                ),
+                _ => unreachable!(),
+            }
+            let request = player.clock.take_seek_request().unwrap();
+            assert_eq!(request.target_secs, 15.0, "{route}");
+            assert!(player.is_seeking());
+            assert!(!player.intent_playing());
+            player.engine.lock().unwrap().handle_decoder_event(
+                super::engine::state::DecoderEvent::SeekCompleted {
+                    epoch: request.serial,
+                    actual_pts: 15.0,
+                },
+            );
+            assert!(player.is_seeking(), "audio must be ready first: {route}");
+            player.engine.lock().unwrap().handle_audio_event(
+                super::engine::state::AudioEvent::BufferReady {
+                    epoch: request.serial,
+                    pts: 15.0,
+                    wall_now: std::time::Instant::now(),
+                },
+            );
+            assert!(!player.is_seeking(), "{route}");
+            assert_eq!(player.position(), 15.0, "{route}");
+            assert_eq!(player.engine_state_name(), "Paused", "{route}");
+            assert!(!player.intent_playing());
+            assert!(!player.is_playing());
+            assert!(player.take_playback_success().is_none());
+        }
+    }
+
+    fn audio_only_paused_seek_player() -> super::VideoPlayer {
+        let mut player =
+            super::VideoPlayer::stream_ready_disconnected_for_test("paused.mp3".into());
+        player.set_has_video_for_test(false);
+        {
+            let mut engine = player.engine.lock().unwrap();
+            engine.begin_loading();
+            engine.handle_decoder_event(super::engine::state::DecoderEvent::InfoReceived {
+                epoch: 0,
+                duration_secs: 30.0,
+                has_audio: true,
+                has_video: false,
+            });
+        }
+        player.set_playing_with_origin(false, super::PlaybackStartOrigin::UserPlay);
+        player
+    }
+
+    fn complete_audio_seek_epoch(player: &super::VideoPlayer, epoch: u64, target: f64) {
+        let mut engine = player.engine.lock().unwrap();
+        engine.handle_decoder_event(super::engine::state::DecoderEvent::SeekCompleted {
+            epoch,
+            actual_pts: target,
+        });
+        engine.handle_audio_event(super::engine::state::AudioEvent::BufferReady {
+            epoch,
+            pts: target,
+            wall_now: std::time::Instant::now(),
+        });
+    }
+
+    #[test]
+    fn paused_seek_audio_only_pending_completes_without_playing() {
+        let player = audio_only_paused_seek_player();
+        player.seek(5.0, SeekPlayback::PreserveIntent, super::SeekOrigin::User);
+        let first = player.clock.take_seek_request().unwrap();
+        player.seek(8.0, SeekPlayback::PreserveIntent, super::SeekOrigin::User);
+        assert_eq!(
+            player
+                .user_seek_coalesce
+                .lock()
+                .unwrap()
+                .pending_target_secs,
+            Some(8.0)
+        );
+        assert_eq!(player.current_seek_serial(), first.serial);
+        complete_audio_seek_epoch(&player, first.serial, 5.0);
+        assert!(!player.is_seeking());
+        assert_eq!(player.position(), 5.0);
+        player.maybe_issue_pending_user_seek();
+        let second = player.clock.take_seek_request().unwrap();
+        assert_eq!(second.serial, first.serial + 1);
+        assert_eq!(second.target_secs, 8.0);
+        assert!(player.is_seeking());
+        complete_audio_seek_epoch(&player, second.serial, 8.0);
+        assert!(!player.is_seeking());
+        assert_eq!(player.position(), 8.0);
+        assert!(!player.is_playing());
+        assert!(!player.intent_playing());
+        assert!(player.take_playback_success().is_none());
+    }
+
+    #[test]
+    fn paused_seek_audio_only_stale_readiness_keeps_newer_override() {
+        let player = audio_only_paused_seek_player();
+        player.seek(5.0, SeekPlayback::PreserveIntent, super::SeekOrigin::User);
+        let old_epoch = player.current_seek_serial();
+        player.seek_immediate(12.0, SeekPlayback::PreserveIntent, super::SeekOrigin::User);
+        let epoch = player.current_seek_serial();
+        assert!(epoch > old_epoch);
+        complete_audio_seek_epoch(&player, old_epoch, 5.0);
+        assert!(player.is_seeking());
+        assert_eq!(player.position(), 12.0);
+        assert_eq!(player.engine_state_name(), "Seeking");
+        complete_audio_seek_epoch(&player, epoch, 12.0);
+        assert!(!player.is_seeking());
+        complete_audio_seek_epoch(&player, old_epoch, 5.0);
+        assert_eq!(player.position(), 12.0);
+        assert!(!player.is_playing());
+        assert!(!player.intent_playing());
+    }
+
+    #[test]
+    fn paused_seek_readiness_keeps_playing_audio_and_paused_video_overrides() {
+        let audio = audio_only_paused_seek_player();
+        audio.seek(5.0, SeekPlayback::StartPlayback, super::SeekOrigin::User);
+        complete_audio_seek_epoch(&audio, audio.current_seek_serial(), 5.0);
+        assert!(audio.is_playing());
+        assert!(
+            audio.is_seeking(),
+            "playing audio still waits for sample consumption"
+        );
+
+        let video = playback_start_test_player();
+        video.confirm_playback_start_for_test(super::PlaybackStartOrigin::NewSource);
+        video.take_playback_success();
+        video.set_playing_with_origin(false, super::PlaybackStartOrigin::UserPlay);
+        video.seek(5.0, SeekPlayback::PreserveIntent, super::SeekOrigin::User);
+        video.complete_seek_for_test(5.0);
+        assert!(!video.is_playing());
+        assert!(
+            video.is_seeking(),
+            "video still waits for frame presentation"
+        );
     }
 
     #[test]

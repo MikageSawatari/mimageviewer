@@ -944,6 +944,12 @@ impl EngineActor {
             self.transition_to_playing(anchor);
         } else {
             self.transition_to_paused(anchor.pts_secs);
+            if !self.has_video {
+                // No video presentation or audio consumption follows a paused
+                // audio-only seek. Readiness is its terminal event; retire only
+                // this latch's epoch, never a newer seek's override.
+                self.av_clock.clear_seek_target_override(self.latch.epoch);
+            }
         }
     }
 }

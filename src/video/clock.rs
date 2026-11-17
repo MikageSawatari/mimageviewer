@@ -1127,7 +1127,8 @@ impl AvClock {
     ///
     /// **注意**: この関数は `seek_target_override` をクリアしない。override クリアは
     /// fill_output 側 (post-seek 後最初の有効サンプル消費時) または UI tick 側
-    /// (post-seek 後最初の動画フレーム到着時) で行う。
+    /// (post-seek 後最初の動画フレーム到着時) で行う。音声のみの停止 seek は
+    /// 実消費がないため、EngineActor の readiness 完了 → Paused 入場時に行う。
     pub fn notify_seek_completed(&self, new_pts: f64) {
         // recorded_at = 今 にしておき、now_secs を wall 推定で進める。後追いで届く実
         // audio pts が現在値より小さくても `set_audio_pts` の単調性ガードで後退を防ぐ。
@@ -1146,10 +1147,11 @@ impl AvClock {
         self.audio_bookkeeping.reset();
     }
 
-    /// post-seek 後の有効フレーム / サンプルを最初に消費した時に呼ぶ。
+    /// post-seek 後の有効フレーム / サンプルを最初に消費した時、または音声のみの
+    /// 停止 seek の readiness が完了した時に呼ぶ。
     /// **`completed_serial` (= 自分が処理した世代)** が現在の override 世代以上
     /// であり、かつ override_bits が cur_bits のままの場合のみ SEEK_NONE に置く。
-    /// 音声経路 (fill_output) と UI 経路 (VideoPlayer::tick) の両方から呼んで OK。
+    /// 音声経路 (fill_output)、UI 経路 (VideoPlayer::tick)、停止音声の engine 終端で共用する。
     pub fn clear_seek_target_override(&self, completed_serial: u64) {
         // ⚠️ load 順序が重要。**bits を先に load** → serial を validate → CAS の順。
         //

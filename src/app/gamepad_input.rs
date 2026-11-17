@@ -9743,7 +9743,7 @@ impl App {
         }
         let current = self
             .fs_video_player(fs_idx)
-            .map(|player| player.position())
+            .map(|player| player.user_seek_base_secs())
             .unwrap_or(0.0);
         let selected = markers
             .iter()

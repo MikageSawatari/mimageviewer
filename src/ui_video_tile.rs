@@ -186,8 +186,8 @@ impl App {
         let cache = self.video_tile_cache.clone();
         // worker には extract サイズ (= 最大列幅) を渡す。描画用の tile_w/tile_h は
         // VideoTileState に持って native overlay 側の描画でスケーリングに使う。
-        let selected_idx =
-            tile_index_after_position(&timestamps, player.position()).unwrap_or_default();
+        let selected_idx = tile_index_after_position(&timestamps, player.user_seek_base_secs())
+            .unwrap_or_default();
         let worker = TileThumbnailWorker::spawn(
             path.clone(),
             timestamps.clone(),

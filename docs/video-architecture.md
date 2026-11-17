@@ -2370,6 +2370,10 @@ EOF の Space replay、configuration / DSP の `seek_with_play_state`、Remote �
 `seek_for_remote_streaming` は既存の専用経路を維持する。
 停止を維持する seek は UserPlay を予約せず、DSP 取得を始めず、音声バッファと frame-step 目標を
 クリアする。engine へ seek → Pause の順に渡し、途中にも Play を作らない。
+音声のみの停止 seek は、engine が当該 epoch の音声 BufferReady を受けて
+Buffering → Paused に入る点を終端とする。凍結 anchor を確定してから latch の epoch を
+既存の serial CAS へ渡して override を解除する。即時／coalesce／configuration seek で共通とし、
+古い完了で新しい override を外さない。映像ありは従来の提示、再生中の音声は実消費が終端となる。
 
 coalesce の pending は位置だけを所有し、後から発行するときの再生／停止は engine の意図を読む。
 明示再生や EOF replay が新たな再生意図を要求した場合は即時発行して engine に確立する。
@@ -2383,6 +2387,11 @@ handoff owner の要求を参照する。pending に別の再生 bool は足さ�
 未取得 metadata に依存する CurrentAfterMetadata は保存位置の解決を維持し、0 の seek で上書きしない。
 相対シークの基準は pending → DSP 要求位置 → 未表示の発行済み target → 時計位置の順。
 `configuration_seek_base_secs` の表示前 target の保持と `last_issued` の記録も共用する。
+マーカー前後移動（native／egui の J/K、ゲームパッド選択、音楽ビュー）、現在位置への
+ブックマーク追加、loop 区間の選択、strip／タイルを開く際の初期選択も、この要求位置を基準にする。
+jump panel の現在位置追加は `AddBookmarkCurrent` として App で位置を解決し、
+hover 等の任意時刻を渡す `AddBookmarkAt` と区別する。loop の再生境界監視と baseline、
+表示位置、保存する再生位置は時計を維持する。画面上のフレームを選ぶピン操作と明示 tile の位置も維持する。
 
 モーダル化は通常のスクラブや Space 操作を制限するため採用せず、既存 engine / handoff の
 所有へ集約して状態の組み合わせを減らす。まれな失敗は既定のログ＋通知で割り切る。

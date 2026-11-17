@@ -1152,7 +1152,10 @@ impl App {
     /// filter/dedup 済み) を使う。
     pub(crate) fn music_marker_jump(&mut self, fs_idx: usize, forward: bool) {
         let starts = self.music_bookmark_starts_for(fs_idx);
-        let pos = self.music_player_position(fs_idx).unwrap_or(0.0);
+        let pos = self
+            .fs_video_player(fs_idx)
+            .map(|player| player.user_seek_base_secs().max(0.0))
+            .unwrap_or(0.0);
         match music_marker_target(&starts, pos, forward) {
             Some(MusicMarkerJump::Marker(t)) => {
                 self.music_seek_to(fs_idx, t);
@@ -1189,14 +1192,15 @@ impl App {
 
     /// 現在の再生位置にブックマークを追加する (B キー)。近接重複 (±1s) は避ける。
     pub(crate) fn add_music_bookmark_at_current(&mut self, fs_idx: usize) {
-        let Some(pos) = self.music_player_position(fs_idx) else {
+        let Some(player) = self.fs_video_player(fs_idx) else {
             return;
         };
+        let pos = player.user_seek_base_secs().max(0.0);
         self.add_music_bookmark_at(fs_idx, pos);
     }
 
     /// 指定秒にブックマークを追加する。近接重複 (±1s) は避ける。パネルヘッダの
-    /// ブックマークボタン (`AddBookmarkAt { target_secs }` コマンド) からも使う。
+    /// 任意位置を指定する `AddBookmarkAt { target_secs }` コマンドからも使う。
     fn add_music_bookmark_at(&mut self, fs_idx: usize, secs: f64) {
         let Some(path) = self.fs_music_source_for_idx(fs_idx) else {
             return;
@@ -1802,6 +1806,9 @@ impl App {
                 }
                 NativeOverlayCommand::AddBookmarkAt { target_secs } => {
                     self.add_music_bookmark_at(fs_idx, target_secs)
+                }
+                NativeOverlayCommand::AddBookmarkCurrent => {
+                    self.add_music_bookmark_at_current(fs_idx)
                 }
                 NativeOverlayCommand::DeleteBookmark { id } => {
                     self.delete_music_bookmark(fs_idx, id)

@@ -1234,9 +1234,7 @@ pub(crate) fn draw_native_jump_panel_body(
         shortcut_labels.and_then(|s| s.bookmark.as_deref()),
     ));
     if bm_resp.clicked() {
-        commands.push(NativeOverlayCommand::AddBookmarkAt {
-            target_secs: position_secs,
-        });
+        commands.push(NativeOverlayCommand::AddBookmarkCurrent);
     }
 
     let content_rect = egui::Rect::from_min_max(rect.min + egui::vec2(0.0, 34.0), rect.max);

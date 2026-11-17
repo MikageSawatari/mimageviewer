@@ -99766,15 +99766,17 @@ impl App {
         let has_bm = !bookmark_starts.is_empty();
         let display_mode = self.settings.video_loop_mode;
         let eff = crate::settings::effective_loop_mode(display_mode, false, has_bm);
-        let (pos, serial) = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => {
-                (player.position_secs(), player.current_seek_serial())
-            }
+        let (seek_base, pos, serial) = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => (
+                player.user_seek_base_secs(),
+                player.position_secs(),
+                player.current_seek_serial(),
+            ),
             _ => return,
         };
         let target = match eff {
             crate::settings::VideoLoopMode::Bookmark => {
-                crate::settings::start_at(&bookmark_starts, pos).unwrap_or(0.0)
+                crate::settings::start_at(&bookmark_starts, seek_base).unwrap_or(0.0)
             }
             // Off / Full / (Chapter は音声で Full に降格) はすべて先頭ループ (target=0.0)。
             _ => 0.0,
