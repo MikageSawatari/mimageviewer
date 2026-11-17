@@ -1,6 +1,6 @@
 # 3D 写真のままスライドショー (次のページの奥行きの先読み) — 設計書 (§1.771)
 
-状態: **設計第 2 版 (2026-11-18)。独立設計レビュー第 1 回 REVISE を反映 (§11)。利用者の判断待ちの項目あり (§10)**。
+状態: **設計第 3 版 (2026-11-18)。独立設計レビュー第 1・2 回の REVISE を反映 (§11)。利用者の判断待ちの項目あり (§10)**。
 worktree `G:\home\mimageviewer-771`、ブランチ `feat-771-depth-slideshow` (master `96ed160a0` から)。
 3D 写真の全体設計は [depth-parallax-plan.md](depth-parallax-plan.md) が正本。本書はその §1「v1 に含めない: 先読み」、
 §6.3「ON にするときの後始末: スライドショー停止」、§6.5 と §10 段 B の全箇所分類表 (topbar・リング・S キーの抑止) を
@@ -160,10 +160,12 @@ enum DepthSlideshowGate { Go, Wait }
 fn depth_slideshow_gate(&mut self, ctx, idx, now) -> DepthSlideshowGate
 ```
 
+- 窓が見えていないパスでは、まず `Wait` を返す (上限も数えない。§5.7.1)。
 - `Go`: 3D でない / 送り先の素材のテクスチャの `key` が LRU にある / 枠がその `key` で `Failed` / 送り先が読み込み済みで
-  アニメーション (`fs_entry_is_animated`。着地して既存の継続条件で 3D を終える、§10 の判断 2) / §5.3 の 2 の条件を満たさない
-  (背景モード・書き出し等で先読みしない状態) / 待ちが上限を超えた (`now >= slideshow_next_at + 上限`、§10 の判断 1)。
-- `Wait`: 上記以外 (素材がまだ無い、読み戻し中、推論中)。`advance_slideshow` は何も変えずに戻る。
+  アニメーション (`fs_entry_is_animated`。着地して既存の継続条件で 3D を終える、§10 の判断 2) / **先読みの対象外**
+  (透過背景のモードが既定でない、書き出しの操作中。§5.3 の 2 のうち、待っても状態が変わらない条件) /
+  待ちが上限を超えた (`now >= slideshow_next_at + 上限`、§10 の判断 1)。
+- `Wait`: 上記以外 (素材がまだ無い、今のページの深度がまだ終わっていない、読み戻し中、推論中)。`advance_slideshow` は何も変えずに戻る。
   `slideshow_next_at` は過ぎたままなので、次のフレームで同じ照合をする。タイマーの既存の
   `request_repaint_after(remaining.min(100ms))` (remaining = 0) で再描画が続く。先読みの完了でも worker が repaint する。
 - 待ち中は今のページの 3D を描き続ける。画面上の表示は足さない (§10 の判断 1 の推奨)。
@@ -178,6 +180,9 @@ fn depth_slideshow_gate(&mut self, ctx, idx, now) -> DepthSlideshowGate
 
 今のページの `select_source(key)` が LRU に無い `key` を選んだとき、枠が同じ送り先 (今のページ) と同じ `key` を持っていれば、
 新しく読み戻しを出さずに枠の段階 (`ReadingBack` / `Estimating` / `Failed`) を今のページの段階へ移し、枠を空にする。
+移す前に、枠の送り先 (idx・item の識別子・items_generation) と `key` が今のページの素材と一致すること、`Estimating` なら
+その要求が取り消されていないこと (`DepthPending` の cancel token) を確かめる。外れたら枠を捨て、今のページは通常どおり読み戻しから始める
+(第 2 回レビュー P1)。
 色テクスチャは描画用に今までどおり `copy_color` で作る。上限で送った場合も、手動で送り先へ移った場合も同じ。
 推論のやり直し (同じ context の新しい要求による取消) が起きない。
 
@@ -221,7 +226,7 @@ fn depth_slideshow_gate(&mut self, ctx, idx, now) -> DepthSlideshowGate
   ```rust
   pub(crate) struct DepthSettled {
       pub fs_idx: usize,
-      pub items_generation: u64,
+      pub edit_key: EditResultKey,          // item の識別子・items_generation・入力世代 (source_gen) 等を含む
       pub key: DepthSourceKey,
       pub outcome: DepthSettledOutcome,     // Presented | Failed
   }
@@ -230,12 +235,32 @@ fn depth_slideshow_gate(&mut self, ctx, idx, now) -> DepthSlideshowGate
 
   - `Presented`: `try_paint_depth` が深度の callback を出したとき (その key・今のページ)。
   - `Failed`: `advance_depth_source` で、このパスで選んだ素材の key について `Failed` が確定したとき。
-  - 事実は「その時点の今のページ」に対してだけ有効。読む側は `fs_idx == fullscreen_idx`・`items_generation` 一致・同じ context で
-    照合する (3D の書き出しの表示 snapshot の照合 `depth_export.rs:701` と同じ考え方)。古い事実を消す処理は足さない
-    (照合で外れるだけ)。一時的な素材待ちでも消さない (同じページ・同じ key の失敗は再試行しない既存の規則と一致)。
-- この事実を読むのは 2 か所: (1) 3D 中の間隔の開始 (`current_slideshow_frame_ready` を、3D 中は「今のページの事実がある」に
-  する)、(2) §5.3 の 2 の先読みの開始と §5.6 の 2 の D3 の開始。どちらも同じ照合関数を使う。
-- 間隔は「3D で見えている時間」になる。先読みが当たったページは移った最初のフレームで `Presented` になるので、すぐ数え始める。
+- **照合 (1 つの関数 `depth_current_settled(&self) -> bool`)**: 次をすべて満たすときだけ真。
+  1. 同じ context の `DepthViewState` が持つ事実で、`fs_idx == fullscreen_idx`
+  2. `edit_key == current_edit_result_key(fs_idx)` — 描画前でも、RAW の現像の到着 (一覧世代を変えずに入力世代だけを進める、
+     `raw_page_store.rs:2479`) や編集の世代の変化を検出できる (第 2 回レビュー P1)
+  3. `DepthViewState.source` が `Ready { key }` または `Failed { key }` で、その `key` が事実の `key` と同じ —
+     補正の変更などで素材のテクスチャが変わり、今のページが新しい要求を出した時点で偽になる
+  古い事実を消す処理は足さない (照合で外れるだけ)。一時的な素材待ちでも事実は消さないが、3 で外れる。
+  素材の変化が描画のパスで初めて分かる場合 (補正の変更など、2 が変わらない変化) は、D3 の開始が 1 フレームだけ古い事実で
+  許され得る。D3 は次ユニットを作るだけで今のページの素材の生産を止めないので、これは受け入れる。先読みの `submit` は 4 で防ぐ。
+  4. 先読みの `submit` (§5.3 の 4) と枠の保持 (§5.3 の 1 (a)) は、`advance_depth_source` の中で今のページの選択と進行を済ませた
+     **後**に、同じパスで照合する。今のページが新しい要求を出したパスでは 3 が偽になるので、先読みは出ず、枠も捨てられる。
+- この照合を読むのは 2 か所: (1) 3D 中の間隔の開始 (§5.7.1)、(2) §5.3 の 2 の先読みの開始と §5.6 の 2 の D3 の開始。
+
+#### 5.7.1 間隔の数え方 (3D 中)
+
+- 3D 中の `current_slideshow_frame_ready` = (`depth_current_settled()` かつ このパスで窓が見えている) **または** 既存の
+  `fs_load_failed` (元画像の読み込みの終端失敗。通知後は通常どおり送る。第 2 回レビュー P3-4)。
+- 3D 中の別のページへの着地 (`complete_book_slideshow_target`、`ui_fullscreen.rs:43181`) では、期限と anchor を設定せず
+  anchor を未設定のまま残す。描画後の `sync_slideshow_anchor_for_frame` が事実を確認して起算する (第 2 回レビュー P3-3)。
+  先読みが当たったページは移った最初のパスで `Presented` を記録するので、その sync で起算され、追加の待ちは生じない。
+- 間隔は「3D で見えている時間」になる。
+- **非表示・最小化** (第 2 回レビュー P2): 見えていないパスでは ready が偽になるので、既存の分岐 (anchor と同じページで未 ready なら
+  anchor を外す、`ui_fullscreen.rs:42658`) で起算が止まる。§5.4 の照合も見えていないパスでは上限を数えず `Wait` を返す。
+  復帰したら、今のページを 3D で描いたパスから間隔を数え直す。最小化の間にパスが 1 つも走らなかった場合は、アプリからは
+  長いフレームと同じに見える。その場合も、復帰後の最初のパスでは描画 (先読みの結果の採用を含む) が送りのタイマーより先に
+  走る (`ui_fullscreen.rs:29493` の後に `30773`) ので、先読みが終わっていれば当たったまま送る。
 
 ### 5.8 先読みしない場合 (平面 → 立体が見えてよい場合)
 
@@ -262,7 +287,8 @@ fn depth_slideshow_gate(&mut self, ctx, idx, now) -> DepthSlideshowGate
 - **別ウィンドウ・複数ウィンドウ**: 新しい状態はすべて 3D の context 所有の `DepthViewState` と、context ごとのスライドショーの状態の中。
   App 全体の状態を足さない。3D を持てるのはプロセスで 1 context (既存) なので、先読みも 1 context だけ。
   detached の述語・viewport の経路には触れない (第 1 回レビューも同じ判断)。実装で触れる必要が出たら止めて設計担当へ返す。
-- **非表示・最小化**: 先読みも今のページと同じく進めない。スライドショーは §5.4 の上限まで待つ。
+- **非表示・最小化**: 先読みも今のページと同じく進めない。3D 中の自動送りと間隔の起算は休止し、復帰後に今のページを 3D で描いてから
+  数え直す (§5.7.1)。
 - **Remote**: 3D は Remote に出さない (既存)。変更なし。
 
 ## 6. UI スレッドと GPU (ui-responsiveness §4)
@@ -301,7 +327,10 @@ fn depth_slideshow_gate(&mut self, ctx, idx, now) -> DepthSlideshowGate
 11. 書き出し中は先読みを出さない。
 12. `slideshow_next_target` の `InItems` が、D3 の次ユニットと一致する (単ページ・ページ表示)。分割・折り返し・コレクションは `Other`。
 13. 紙めくり ON / OFF の両方で、3D でないときの D3・紙めくりの既存テストが変わらない。
-14. 既存回帰: `test(/depth|slideshow|page_turn|final_prepare|prepared_edit|panorama|export|admission|ring/)`。
+14. 今のページの素材が変わったとき (RAW の現像の到着で入力世代だけが進む場合、補正の変更でテクスチャが変わる場合) に、
+    事実の照合が偽になり、先読みが出ない・枠が捨てられる・取消済みの要求を引き継がない。枠が `ReadingBack` / `Estimating` の両方で。
+15. 3D 中に窓を最小化すると送りと起算が止まり、戻すと今のページから数え直す。元画像の読み込みが終端失敗したページでは止まらずに送る。
+16. 既存回帰: `test(/depth|slideshow|page_turn|final_prepare|prepared_edit|panorama|export|admission|ring/)`。
 
 ## 9. 文書
 
@@ -333,8 +362,11 @@ fn depth_slideshow_gate(&mut self, ctx, idx, now) -> DepthSlideshowGate
    - 3D を続けたまま次のフォルダへ進む (次のフォルダの最初のページだけ平面 → 立体が見える)。全画面を閉じる経路で 3D を残す
      作り直しが要り、作業が大きい。今回の版の方針 (大きな新機能なし) から外れる。
 4. **先読みできない場合を制限として受け入れてよいか** (推奨: 受け入れる。マニュアルに書く): コレクションの直接登録画像の
-   スライドショー (毎ページ平面 → 立体)、末尾から先頭への折り返し (1 周に 1 回)、分割表示 (毎ページ)、白背景にしたページからの
-   送り (その 1 回)。
+   スライドショー (毎ページ平面 → 立体)、末尾から先頭への折り返し (1 周に 1 回)、分割表示 (毎ページ)、透過部分の背景を既定から
+   切り替えたページ (白・市松) からの送り (その 1 回。着地で背景は既定に戻る)、本の構成で非表示にしたページのために送り先が
+   変わった場合 (その 1 回)。
+6. **最小化・非表示の間** (推奨: 3D 中は自動送りを休止し、戻したら今のページから数え直す)。今の 2D のスライドショーの
+   最小化中の動きは変えない。
 5. **先読みは 3D のスライドショー中だけ** (手動のページ送りでは先読みを始めない)。正本の判断 (dGPU では不要) のまま。(推奨: このまま)
 
 ## 11. 独立設計レビューの記録
@@ -353,6 +385,19 @@ fn depth_slideshow_gate(&mut self, ctx, idx, now) -> DepthSlideshowGate
 | P2-6 | フォルダ内の手動送りはスライドショーを止めない。手動送りの `PageTransition` で枠を捨ててしまう | §1・§5.3 の 1 (b)・§5.9 を訂正 |
 | P2-7 | リングの抑止は 3D だけ。360° 中は使える | §4 の 2 を訂正 |
 | P3-8 | 未読のアニメーションの例外を選択肢に明記 | §10 の 2 |
+
+### 第 2 回 (2026-11-18、同じセッションの継続、read-only、基点 `a8d7c9930`)
+
+**REVISE** (P1 1 件、P2 1 件、P3 3 件)。第 1 回の P1-1・P1-2・P2-3・P2-4・P2-6・P2-7・P3-8 は解消と評価。P2-5 は下の P1 で未解消。
+設計担当がコードで確かめ、すべて採用して第 3 版に反映した。
+
+| 指摘 | 内容 | 反映 |
+| --- | --- | --- |
+| P1 | 事実の照合に今の素材との一致が無い。RAW の現像は一覧世代を変えずに入力世代を進めるので古い `Presented` が有効なまま残り、取消済みの先読みを引き継ぎ得る | §5.7 の照合に `EditResultKey` と今の `source` の key の一致を加え、submit と枠の保持は今のページの処理の後の同じパスで照合する。§5.5 の引き継ぎで送り先・key・取消を確かめる |
+| P2 | 非表示・最小化で、照合は送るのに今のページの事実が作られず、間隔が止まる | §5.4・§5.7.1: 見えていないパスでは `Wait`、起算も休止し、復帰後に数え直す。§10 の 6 |
+| P3-3 | 着地の直後に期限が設定され、3D を見せる前から数え始める | §5.7.1: 3D 中の着地では anchor を設定せず、描画後の sync で起算する |
+| P3-4 | 元画像の読み込みの終端失敗で 3D の事実ができず止まる | §5.7.1: 既存の `fs_load_failed` を ready に含める |
+| P3-5 | §10 の制限一覧に本の構成の許可待ちと、白以外 (市松) の背景が無い | §10 の 4 |
 
 ## 12. 実装記録
 
