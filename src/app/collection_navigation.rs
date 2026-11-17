@@ -86,6 +86,17 @@ enum CollectionNavigationAction {
 }
 
 impl CollectionNavigationAction {
+    fn resume_slideshow(&self) -> bool {
+        matches!(
+            self,
+            Self::Slideshow { .. }
+                | Self::OuterFullscreen {
+                    resume_slideshow: true,
+                    ..
+                }
+        )
+    }
+
     fn startup_list_intent(&self) -> super::StartupListIntent {
         match self {
             Self::OuterGrid { .. } => super::StartupListIntent::ExplicitList,
@@ -271,6 +282,7 @@ impl PreparedCollectionPhysicalNavigation {
             self.request.action,
             CollectionNavigationAction::OuterGrid { .. }
         ) {
+            app.notify_depth_slideshow_folder_nav_exit(self.resume_slideshow());
             app.close_fullscreen_for_folder_nav_reopen();
         }
         app.install_collection_navigation_root_with_origin(
@@ -344,14 +356,7 @@ impl PreparedCollectionPhysicalNavigation {
     }
 
     fn resume_slideshow(&self) -> bool {
-        matches!(
-            self.request.action,
-            CollectionNavigationAction::Slideshow { .. }
-                | CollectionNavigationAction::OuterFullscreen {
-                    resume_slideshow: true,
-                    ..
-                }
-        )
+        self.request.action.resume_slideshow()
     }
 
     fn continuation(&self) -> Option<super::CollectionArchiveNavigationContinuation> {
@@ -3841,6 +3846,7 @@ impl App {
         let boundary_plan = self.physical_main_list_boundary_plan(&prepared.token);
         self.adopt_main_list_navigation(prepared.adoption, boundary_plan, |app, boundary| {
             if !matches!(request.action, CollectionNavigationAction::OuterGrid { .. }) {
+                app.notify_depth_slideshow_folder_nav_exit(request.action.resume_slideshow());
                 app.close_fullscreen_for_folder_nav_reopen();
             }
             app.install_collection_navigation_root_with_origin(
@@ -4193,12 +4199,6 @@ impl App {
             return;
         }
 
-        if is_outer_target
-            && request.navigation.is_none()
-            && !matches!(action, CollectionNavigationAction::OuterGrid { .. })
-        {
-            self.close_fullscreen_for_folder_nav_reopen();
-        }
         if self.settings.epub_file_handling_ignores_epub()
             && matches!(ready.target.resolved_kind, CollectionResolvedKind::Pdf)
             && ready
@@ -4253,6 +4253,20 @@ impl App {
         let landing = if common_outer {
             None
         } else {
+            if is_outer_target
+                && request.navigation.is_none()
+                && !matches!(action, CollectionNavigationAction::OuterGrid { .. })
+            {
+                // The root installer can refuse an absent prepared owner.
+                // Keep that refusal, like the EPUB refusal above, before the
+                // irreversible close. Target identity was validated already.
+                if request.root_thumbnail_sources.is_none() {
+                    self.finish_collection_navigation_without_target(ctx, &action);
+                    return;
+                }
+                self.notify_depth_slideshow_folder_nav_exit(action.resume_slideshow());
+                self.close_fullscreen_for_folder_nav_reopen();
+            }
             let Some(landing) = self.install_collection_navigation_root(
                 &mut request,
                 Arc::clone(&prepared),
@@ -4838,6 +4852,9 @@ impl CollectionResolvedKindExt for CollectionResolvedKind {
 }
 
 #[cfg(test)]
+mod depth_slideshow_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::{AppTestEnvForTest, setup_app_for_test};
@@ -5105,7 +5122,7 @@ mod tests {
         }
     }
 
-    fn write_single_page_zip(path: &std::path::Path, page: &str) {
+    pub(super) fn write_single_page_zip(path: &std::path::Path, page: &str) {
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
         zip.start_file(page, zip::write::SimpleFileOptions::default())
@@ -6063,14 +6080,16 @@ mod tests {
         });
     }
 
-    fn recv<T>(receiver: crossbeam_channel::Receiver<Result<T, CollectionStoreError>>) -> T {
+    pub(super) fn recv<T>(
+        receiver: crossbeam_channel::Receiver<Result<T, CollectionStoreError>>,
+    ) -> T {
         receiver
             .recv_timeout(Duration::from_secs(3))
             .expect("collection actor reply")
             .expect("collection actor operation")
     }
 
-    fn navigation_test_lease() -> crate::collection_store::CollectionReadLease {
+    pub(super) fn navigation_test_lease() -> crate::collection_store::CollectionReadLease {
         crate::collection_store::CollectionReadLease::new(
             crate::collection_store::CollectionReadScope::app_global("navigation-test"),
             Instant::now(),
@@ -6078,7 +6097,7 @@ mod tests {
         )
     }
 
-    fn start_ready_app(
+    pub(super) fn start_ready_app(
         db_path: &std::path::Path,
     ) -> (
         AppTestEnvForTest,
@@ -6103,7 +6122,9 @@ mod tests {
         (app, client)
     }
 
-    fn prepare_snapshot(snapshot: &CollectionSnapshot) -> Arc<CollectionPreparedSnapshot> {
+    pub(super) fn prepare_snapshot(
+        snapshot: &CollectionSnapshot,
+    ) -> Arc<CollectionPreparedSnapshot> {
         Arc::new(
             crate::collection_store::prepare_collection_snapshot(
                 snapshot,
@@ -6115,7 +6136,7 @@ mod tests {
         )
     }
 
-    fn prepared_thumbnail_sources(
+    pub(super) fn prepared_thumbnail_sources(
         sources: CollectionGridThumbnailSources,
     ) -> CollectionGridPreparedThumbnailDelivery {
         super::super::collection_grid::prepare_collection_grid_thumbnail_sources(
@@ -6125,7 +6146,7 @@ mod tests {
         .unwrap()
     }
 
-    fn navigation_sources(
+    pub(super) fn navigation_sources(
         app: &App,
         prepared: &CollectionPreparedSnapshot,
         sources: CollectionGridPreparedThumbnailDelivery,

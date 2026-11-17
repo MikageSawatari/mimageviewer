@@ -916,3 +916,156 @@ runner はロック領域 / G: TEMP に書けない警告後、既定の BelowNo
 
 本体 lib 全件、`build-dev.ps1`、実機での操作・最小化 / 復帰・実モデルの速度確認、実装の独立レビューは今回の実装側では未実施。
 利用者の指示どおり設計担当へ引き継ぐ。製品 exe の起動・commit は行っていない。
+
+### 独立実装レビュー第 1 回 P2: staged フォルダ移動の終了通知 (`e96789a9c` 後)
+
+設計担当から、独立実装レビュー第 1 回は本件 P2 1 件を除き ACCEPT 相当、SlideshowTimerPass の構造的修正にも
+合意したとの報告を受けた。今回の実装側では独立レビューを追加しない。
+
+コード調査では、`apply_folder_nav_result` の ZIP / PDF / 変換書庫の `physical_staged` は通常の通知分岐より前に return し、
+成功した `commit_physical_history_transition` の採用 closure で実際に閉じることを確認した。
+この close に通知が無く、§10-3 の条件を満たす移動でも通知が欠落していた。
+
+- 通知だけの `notify_depth_slideshow_folder_nav_exit(resume_slideshow)` を共有する。
+  通常経路と physical staged の採用 closure の、既存 close の直前で呼ぶ。
+  既存の再開意図と現在の Depth 所有だけを読み、状態・通知済み flag を増やさない。
+- staged 側は採用の検証が通った closure でのみ通知する。準備中・失敗・不採用ではこの処理へ入らない。
+  自動 NextFolder は事前に `slideshow_playing = false` にするので、現在の再生 bool を通知条件にはしない。
+- close 自体が Depth を退役させるため、通常フォルダの close 後に内部 ZIP の staged 採用で再度 close しても通知は増えない。
+  `close_fullscreen_for_folder_nav_reopen` の本体・detached の述語・viewport 分岐は変更しない。
+
+#### 同形経路の棚卸し
+
+| 経路 | 調査結果 / 対応 |
+| --- | --- |
+| 通常 `apply_folder_nav_result` の Fullscreen / SiblingFullscreen / ListOrder / SlideshowNext | 既存 resume 意図が true で Depth を所有する場合だけ、実 close 直前の共有通知を使用。手動移動は非通知 |
+| `commit_physical_history_transition` → `MainListAfterHydration::Dfs` | ZIP / PDF / cached ZIP / 変換書庫 / EPUB の同じ採用 closure。fullscreen の実 close に共有通知を接続 |
+| 通常フォルダ → `find_fullscreen_nav_target_filtered` → 内部 ZIP/PDF | `attach_inner_book_reading_continuation` が既存 Dfs に resume 意図を引き継ぐ。通常・staged の両 close を通す ZIP 回帰試験で二重通知を検査 |
+| `finish_main_list_after_hydration` / PDF・ZIP enumerate / 本の構成の遅延 open | 再開だけを行う。Depth の close は既に上記境界で完了するため通知を追加しない |
+| archive conversion の deferred fullscreen (`resume_archive_convert_viewer_after_load`) | 既存 owner 照合後の再開だけ。通常経路で先に close する場合と physical staged の成功採用で close する場合を上記で扱う |
+| favsearch の subtree / sibling / search-end の close | 既存 continuation の resume は false。手動移動の既存挙動を維持し非通知 |
+| SmartFolder の staged DFS (`begin_smart_folder_dfs_navigation`) | 独自の SmartFolder 手動意図。採用後の reopen の resume 引数は false。今回の自動再開の通知条件には当たらない |
+| Snapshot の prepared archive cache → physical Dfs | 既存 `PhysicalHistoryDfsContinuation` の resume 意図を持って共通の physical 採用に入るため、上記の通知で扱う |
+| RequiredFullscreen (`prepare_required_fullscreen_navigation`) | 明示 target の準備 / 再表示で、自動フォルダ移動の resume 意図ではない。共通 close 本体への通知追加はしない |
+| ZIP 内 DFS (`zip_nav_dfs_fullscreen`) | 同じ ZIP 内の一覧 / book target 更新で、folder-nav の close を呼ばない。外へ抜ける場合は通常の FolderNav 経路へ進む |
+| Collection 外側の自動移動 | 設計担当の回答で §10-3 の対象と確定。下の追補で独自の 3 か所の close も共有通知へ接続 |
+
+#### 追加試験と検証
+
+`src/app.rs` の既存 `depth_slideshow_folder_tests` に以下を追加した。
+
+- ZIP / PDF の staged 採用から 2D の再表示・再生再開まで。Depth 自動 / 2D 自動 / Depth 手動、採用前は非通知、成功後に必要な 1 回だけ通知する。
+- ZIP / PDF の preflight 失敗。既存の表示・Depth・停止済み再生意図を保持し、終了通知は出ない。
+- 通常フォルダの close → 内部 ZIP の physical staged 採用の両方を通し、通知は合計 1 回。
+
+ZIP は生成した実 ZIP の列挙を使い、失敗試験では不正な ZIP を実際に列挙させる。
+PDF は test 専用 enumerate pool の子プロセス応答だけを成功 / 失敗で置き換え、enqueue・preflight・採用・hydration・再表示を通常処理で通す。
+製品プロセス・実窓は起動しない。GPU を作る新規試験はない。
+
+焦点 nextest は指定 runner / `MSBUILDDISABLENODEREUSE=1` で開始し、共有全件ロック待ちを中断せず待機した。
+05:24:50 に実行開始、コンパイル 5 分 04 秒。**4 件全成功、18,650 skip、実行 2.887 秒、exit 0**。
+新規 3 件と既存の通常経路 1 件で、ZIP/PDF の Depth 自動 / 2D 自動 / Depth 手動、失敗と二重 close を検査した。
+ログは `target/771-logs/p2-focus-1.{out,err}.log`、JUnit は `target/771-logs/p2-focus-passed.junit.xml`。
+
+通常 / physical staged の修正範囲での最終検証は以下のとおり。
+すべて指定 `run-heavy.ps1 -Owner "771-codex" -WorkDir G:\home\mimageviewer-771` と
+`MSBUILDDISABLENODEREUSE=1` 経由。共有全件ロック / heavy 枠の待機は中断していない。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、48.33 秒 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth_slideshow_folder_tests/)'` | 4 / 4 成功、18,650 skip、exit 0、2.887 秒 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|slideshow\|page_turn\|final_prepare\|prepared_edit\|panorama\|export\|admission\|ring/)'` | 1,674 / 1,674 成功、16,980 skip、exit 0、276.439 秒 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_nav\|next_folder\|staged/)'` | 241 / 241 成功、18,413 skip、exit 0、27.113 秒 |
+| `cargo fmt` (引数なし、最後の Cargo 操作) | exit 0 |
+
+型検査 → 指定回帰 → フォルダ移動回帰 → 成功時の cargo fmt を同じ runner 内で順に実行し、
+05:38:38 に runner exit 0。ログは `target/771-logs/p2-validation.{out,err}.log`、JUnit は
+`target/771-logs/p2-{regression,folder}-passed.junit.xml`。
+runner のロック領域 / G: TEMP 書込み警告後は既定の BelowNormal / 6 build jobs / 既定 TEMP で続行した。
+依存物の MSBuild 再失敗は発生していない。
+最終の `python scripts/check_ui_glyphs.py` は危険グリフ 0 件・exit 0、`git diff --check` も exit 0。
+
+変更ファイルは `src/app.rs` (共有通知と 2 か所の接続、新規 3 試験) と本書 (棚卸し・検証記録) の 2 件。
+製品の新しい状態・I/O・待機・再試行・キー操作は追加していない。製品 exe 起動・commit・自己レビューは行っていない。
+本体 lib 全件・`build-dev.ps1`・実機での表示は今回の実装側では未実施。
+
+**設計確認の残件は解消**: 設計担当から Collection 外側の自動移動も §10-3 の対象との回答を受けた。
+上の成功試験は通常 / physical staged の範囲の記録であり、Collection の実装・検証は次の追補に分けて記す。
+
+### Collection 外側の自動移動の終了通知 (設計担当の回答による追補)
+
+「スライドショーの自動送りで別の一覧へ移る同じ境目であり、移動先の種類で通知の有無を変えない」という
+設計担当の判断に従い、`try_start_slideshow_next_folder` → `OuterFullscreen { resume_slideshow: true }` も対象にした。
+
+- `PreparedCollectionPhysicalNavigation::install` と `install_collection_outer_physical_adoption` は、
+  それぞれ既存の採用 closure 内の close 直前に同じ `notify_depth_slideshow_folder_nav_exit` を呼ぶ。
+- `commit_collection_navigation` の main navigation を持たない既存経路も接続する。
+  EPUB の設定による拒否と、root installer が拒否する準備済み owner の欠落を close より前で扱い、
+  現在の target / revision / request の検証後に通知・close・root の採用へ進む。
+- 既存の再生再開意図を `CollectionNavigationAction::resume_slideshow()` に共有する。
+  `PreparedCollectionPhysicalNavigation` の従来の判定も同じ問い合わせへ委譲し、手動 / media EOF 等は false のまま。
+  新しい状態や通知済み flag、待機・再試行は追加しない。
+- 先に別経路で Depth が退役した場合、後続の close は同じ helper が Depth 非所有として通知しない。
+  detached の述語・viewport 分岐・close helper 本体は変更しない。
+
+Collection の新規焦点試験と、前回指定回帰・folder_nav / next_folder / staged・該当する Collection 既存回帰を実行した結果は以下に記録する。
+
+追加した `src/app/collection_navigation/depth_slideshow_tests.rs` の 4 試験は、実 Collection actor の
+登録・snapshot・prepare・preflight を使う。各採用経路を自動再開 / 手動で通し、2D の着地と再生再開、
+通知 1 回 / 0 回を確認する。採用後の再 close でも通知が増えないことを検査する。
+拒否試験は legacy の準備済み root owner 欠落と、準備対象に含まれない target の不採用を通し、
+元の Depth / ページ / generation を保持して通知しないことを確認する。
+physical continuation は Folder の準備済み payload を既存の physical adoption callback へ渡し、
+`PreparedCollectionPhysicalNavigation::install` と finish の 2D 再開まで通す。
+新規試験による GPU 作成・製品 exe 起動はない。
+
+追補の型検査は 06:04:41 に開始し、23.67 秒で exit 0。
+焦点 `test(/depth_slideshow_folder_tests|collection_navigation::depth_slideshow_tests/)` は
+コンパイル 5 分 29 秒、**8 / 8 成功、18,650 skip、2.479 秒、exit 0**。
+新規 Collection 4 件と通常 / ZIP / PDF の既存 4 件を同じソースで確認した。
+型検査ログは `target/771-logs/collection-depth-check.{out,err}.log`、
+焦点の JUnit は `target/771-logs/collection-depth-focus-passed.junit.xml`。
+
+指定回帰の初回は **1,678 実行・1,677 成功・1 失敗、16,980 skip、316.110 秒、exit 100**。
+既存 `ui_fullscreen::page_turn::draw_submit_tests::page_turn_mainwindow_submits_visible_vacant_leaf_both_directions`
+の逆方向の面積比較が `[144, 162, 0, 0]` で失敗した (line 488)。
+同じソースで同試験だけを診断実行すると **1 / 1 成功、18,657 skip、2.862 秒、exit 0**。
+試験は `Instant::now()` を使った描画時刻で面積の単調変化を比較するが、初回失敗の原因は未確定であり、
+今回の通知修正・製品の紙めくり処理・試験コードは変更せず、指定フィルタ全体を再実行した。
+初回失敗ログは `target/771-logs/collection-depth-validation-failed-1.{out,err}.log`、
+JUnit は `collection-depth-regression-failed-1.junit.xml`、単独成功は
+`collection-depth-page-turn-diagnostic-passed.junit.xml` (いずれも同じログディレクトリ)。
+
+追補の最終検証は以下のとおり。Cargo はすべて指定の
+`run-heavy.ps1 -Owner "771-codex" -WorkDir G:\home\mimageviewer-771` と
+`MSBUILDDISABLENODEREUSE=1` 経由で実行した。共有全件ロックの待機は中断していない。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、23.67 秒 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth_slideshow_folder_tests\|collection_navigation::depth_slideshow_tests/)'` | 8 / 8 成功、18,650 skip、exit 0、2.479 秒 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/page_turn_mainwindow_submits_visible_vacant_leaf_both_directions/)'` | 診断実行 1 / 1 成功、18,657 skip、exit 0、2.862 秒 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|slideshow\|page_turn\|final_prepare\|prepared_edit\|panorama\|export\|admission\|ring/)'` | 再実行 1,678 / 1,678 成功、16,980 skip、exit 0、303.506 秒 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/folder_nav\|next_folder\|staged/)'` | 241 / 241 成功、18,417 skip、exit 0、29.644 秒 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/collection_navigation::/) & test(/outer\|slideshow\|preflight\|prune\|reject\|cancel\|reus\|epub\|convert\|root\|intent/)'` | 44 / 44 成功 (既存 40 + 新規 4)、18,614 skip、exit 0、11.215 秒 |
+| `cargo fmt` (引数なし、最後の Cargo 操作) | exit 0 |
+
+単独診断 → 指定回帰 → フォルダ移動回帰 → Collection 関連回帰 → cargo fmt を順に実行し、
+06:22:52 に runner exit 0。ログは `target/771-logs/collection-depth-validation.{out,err}.log`、
+成功時の JUnit は `target/771-logs/collection-depth-{regression,folder,existing}-passed.junit.xml`。
+runner の書込み警告後は既定の BelowNormal / 6 build jobs / 既定 TEMP で続行した。
+依存物の MSBuild 再失敗は発生していない。
+
+今回までの未コミット変更は次の 4 ファイル。
+
+- `src/app.rs`: 通常 / physical staged 採用の共有通知 helper と接続、ZIP/PDF と二重 close の回帰試験。
+- `src/app/collection_navigation.rs`: Collection の 3 か所の接続、再生再開意図の共有問い合わせ、拒否判定を close 前に配置、試験 helper の共有。
+- `src/app/collection_navigation/depth_slideshow_tests.rs`: 実 actor / prepared payload による 3 採用経路と不採用の新規 4 試験。
+- `docs/depth-slideshow-plan.md`: 同形経路の棚卸し、設計担当の回答、変更・試験・検証の記録。
+
+Collection の適用範囲についての残件は解消した。設計担当の回答から外れた実装はない。
+既存の D3 設定参照・先読み・照合・タイマー・perf の実装と前提の確認結果は、本節の先行記録から変更していない。
+製品 exe 起動・commit・追加の独立レビューは行っていない。
+本体 lib 全件・`build-dev.ps1` は設計担当の担当として未実施。実機表示と初回の既存試験失敗の原因は未確認。
+最終の `python scripts/check_ui_glyphs.py` は危険グリフ 0 件・exit 0、`git diff --check` も exit 0。
