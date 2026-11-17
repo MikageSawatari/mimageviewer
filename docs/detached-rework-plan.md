@@ -1458,6 +1458,16 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-18: 3D 写真のままスライドショー（§1.771、設計段階の合意）
+
+3D 中のスライドショーの自動送りを、所有 viewer の描画の後の呼び出しだけで評価する。スライドショーのタイマーを直接呼ぶ 2 か所
+(`render_fullscreen_viewport_with_root_input` の描画後と、汎用の入力処理の wrapper `handle_fs_navigation_with_list_order_operation`) に
+`SlideshowTimerPass { ViewerRender { viewport, visible } | InputOnly }` を足し、描画 closure の中で取った所有 viewport の id と可視性を運ぶ。
+root の `ctx` から可視性を読み直さない。3D でないときは両方で今までどおり評価する。detached の述語・registry・所有者の判定は変えない。
+独立設計レビュー (gpt-6.1-sol / xhigh、第 4 回、基点 `8954ef4a4`) と設計担当 ClaudeCode は、入力の処理と描画後の自動処理を区別し
+所有描画の時点の事実を渡す構造的修正であり、症状パッチではないことに合意した。実装レビューで同じ主張への合意を取り直し、ここに追記する。
+正本は [3D スライドショー設計 §5.7.1](depth-slideshow-plan.md)。
+
 ### 2026-11-17: §1.800 S1 の仮想フォルダと親との対応
 
 設計担当の §4S（独立設計レビュー r10 ACCEPT）と実装の独立レビューで、UI の一回限りの

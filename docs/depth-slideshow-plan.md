@@ -1,6 +1,6 @@
 # 3D 写真のままスライドショー (次のページの奥行きの先読み) — 設計書 (§1.771)
 
-状態: **設計第 4 版 (2026-11-18)。独立設計レビュー第 1〜3 回の REVISE を反映 (§11)。利用者の判断待ちの項目あり (§10)**。
+状態: **設計第 5 版 (2026-11-18)。独立設計レビュー第 1〜4 回の REVISE を反映 (§11)。利用者の判断待ちの項目あり (§10)**。
 worktree `G:\home\mimageviewer-771`、ブランチ `feat-771-depth-slideshow` (master `96ed160a0` から)。
 3D 写真の全体設計は [depth-parallax-plan.md](depth-parallax-plan.md) が正本。本書はその §1「v1 に含めない: 先読み」、
 §6.3「ON にするときの後始末: スライドショー停止」、§6.5 と §10 段 B の全箇所分類表 (topbar・リング・S キーの抑止) を
@@ -252,16 +252,32 @@ fn depth_slideshow_gate(&mut self, ctx, idx, now) -> DepthSlideshowGate
 #### 5.7.1 間隔の数え方 (3D 中)
 
 - **3D 中の自動送りを評価するパス** (第 3 回レビュー P2): スライドショーのタイマー (`handle_fs_navigation_with_render_perf` の
-  タイマー部分) は、所有する viewer の描画の後の呼び出し (`ui_fullscreen.rs:30773` 等、`render_fullscreen_viewport_with_root_input`
-  の中) と、root のキー入力の転送 (`handle_fullscreen_root_key_input` → `ui_fullscreen.rs:34225`、画像 viewport の描画より前) の
-  両方から呼ばれる。3D 中は、タイマーの評価 (送り先が `InItems` か `Other` かによらず、自動送り全体) を**所有 viewer の描画後の
-  呼び出しだけ**で行う。root の転送では手動操作だけを配送し、3D 中のタイマーは評価しない。呼び出し側が明示する引数
-  (例: `SlideshowTimerPass::ViewerRender` / `RootForwarded`) で区別し、3D でないときは今までどおり両方で評価する (挙動を変えない)。
-  新しい pending は作らない。
-- **「見えているパス」の定義**: 所有 viewer の描画パスで、`advance_depth_source` と同じ述語 (`self.window_visible` かつ その viewport の
-  `ctx.input(|i| i.viewport().minimized != Some(true))`、`depth_view.rs:560`) が真であること。main の埋め込み表示・通常全画面
-  (child viewport)・detached のどれでも、描画パスの `ctx` はその viewer の viewport のものなので、同じ式で定義できる。
-  root の `ctx` の可視性は使わない。
+  タイマー部分) を直接呼ぶのは 2 か所: 所有 viewer の描画の後 (`render_fullscreen_viewport_with_root_input` の中、
+  `ui_fullscreen.rs:30773`) と、汎用の入力処理の wrapper (`handle_fs_navigation_with_list_order_operation`、`ui_fullscreen.rs:43910`)。
+  後者には root のキー入力の転送 (`ui_fullscreen.rs:34225`、画像 viewport の描画より前)、ゲームパッド (`gamepad_input.rs:9611`)、
+  ホイール操作の途中処理 (`ui_fullscreen.rs:41682`) などが入る (第 4 回レビュー P3)。
+  3D 中は、タイマーの評価 (送り先が `InItems` か `Other` かによらず、自動送り全体) を**所有 viewer の描画後の呼び出しだけ**で行う。
+  呼び出し側が明示する引数で区別する:
+
+  ```rust
+  enum SlideshowTimerPass {
+      /// 30773: 所有 viewer の描画の後。描画 closure の中で取った値を運ぶ
+      ViewerRender { viewport: egui::ViewportId, visible: bool },
+      /// 43910 の wrapper 経由のすべて (root の転送・ゲームパッド・ホイール等): 手動操作だけを配送する
+      InputOnly,
+  }
+  ```
+
+  3D でないときは、今までどおり両方でタイマーを評価する (挙動を変えない)。新しい pending は作らない。
+  45729 の `advance_slideshow` の呼び出しは連結読み用で、3D の対象外 (3D は連結読みを入口で弾く)。
+  所有描画の後のタイマーには既存の 50 / 100 ms の起床要求があり、子 viewport の再描画要求は親へ接続されるので、`InputOnly` で
+  評価しなくても自動送りは止まらない (第 4 回レビューの確認)。
+- **「見えているパス」の定義**: 所有 viewer の描画 closure の中で、`advance_depth_source` と同じ述語 (`self.window_visible` かつ
+  その viewport の `ctx.input(|i| i.viewport().minimized != Some(true))`、`depth_view.rs:560`) を値として取り、viewport id と一緒に
+  `ViewerRender { viewport, visible }` で運ぶ。30773 で渡す外側の `ctx` は ROOT のもの (`ui_fullscreen.rs:27741`) で、所有 viewport の
+  `ctx` は描画 closure の中だけの変数 (`ui_fullscreen.rs:28081`) なので、タイマー側で `ctx` から可視性や viewport id を読み直さない
+  (`viewport_id()` は現在の viewport stack を見る、`vendor/egui/src/context.rs:751`。第 4 回レビュー P2)。
+  main の埋め込み表示・通常全画面 (child viewport)・detached のどれでも、描画 closure の中で同じ式で取る。
 - 3D 中の `current_slideshow_frame_ready` = 見えているパス かつ (`depth_current_settled()` **または** 既存の `fs_load_failed`
   (元画像の読み込みの終端失敗。通知後は通常どおり送る。第 2 回レビュー P3-4、第 3 回 P3-2))。
 - 3D 中の別のページへの着地 (`complete_book_slideshow_target`、`ui_fullscreen.rs:43181`) では、期限と anchor を設定せず
@@ -300,8 +316,12 @@ fn depth_slideshow_gate(&mut self, ctx, idx, now) -> DepthSlideshowGate
 - **別ウィンドウ・複数ウィンドウ**: 新しい状態はすべて 3D の context 所有の `DepthViewState` と、context ごとのスライドショーの状態の中。
   App 全体の状態を足さない。3D を持てるのはプロセスで 1 context (既存) なので、先読みも 1 context だけ。
   detached の述語には触れない (第 1 回レビューも同じ判断)。§5.7.1 でスライドショーのタイマーの呼び出し 2 か所 (所有 viewer の
-  描画後、root のキー入力の転送) に「どちらのパスか」の引数を足すが、どの viewport・context が所有者かの判定は変えず、3D でないときの
-  挙動も変えない。それ以外で detached の述語・viewport の経路に触れる必要が出たら、止めて設計担当へ返す (CLAUDE.md のリワーク中のルール)。
+  描画後、汎用の入力処理の wrapper) に `SlideshowTimerPass` の引数を足し、描画 closure で取った viewport id と可視性を運ぶ。
+  どの viewport・context が所有者かの判定は変えず、3D でないときの挙動も変えない。これは viewport の経路に触れるので CLAUDE.md の
+  リワーク中のルールの対象であり、**入力の処理と描画後の自動処理を区別し、所有描画の時点の事実を渡す構造的な修正で、症状パッチでは
+  ない**ことに、独立レビュー (第 4 回) と設計担当 (ClaudeCode) が合意した。範囲と理由を
+  [detached-rework-plan.md](detached-rework-plan.md) §11 に記録する。実装レビューでもこの主張への合意を取り直す。
+  それ以外で detached の述語・viewport の経路に触れる必要が出たら、止めて設計担当へ返す。
 - **非表示・最小化**: 先読みも今のページと同じく進めない。3D 中の自動送りと間隔の起算は休止し、復帰後に今のページを 3D で描いてから
   数え直す (§5.7.1)。
 - **Remote**: 3D は Remote に出さない (既存)。変更なし。
@@ -427,6 +447,17 @@ RAW の入力世代を含むこと (`app.rs:87458`・`88074`)、着地で anchor
 | P2 | スライドショーのタイマーは root のキー入力の転送 (描画より前、可視性は ROOT の状態) からも評価される | §5.7.1: 3D 中の自動送りは所有 viewer の描画後の呼び出しだけで評価し、可視性はその viewport の述語で定義する。`Other` の送りにも適用 |
 | P3-2 | `fs_load_failed` が可視性の条件の外にある | §5.7.1: `見えているパス かつ (事実 または fs_load_failed)` |
 | P3-3 | 描画パスが走らなかった最小化の例外を §10 の 6 にも書く。番号の順 | §10 の 5・6 |
+
+### 第 4 回 (2026-11-18、同じセッションの継続、read-only、基点 `8954ef4a4`)
+
+**REVISE** (P2 1 件、P3 1 件)。第 3 回の指摘は可視性の取得場所を除き解消と評価。`InputOnly` でタイマーを評価しなくても自動送りは
+止まらないこと (所有描画後の既存の起床要求、子 viewport の再描画要求の親への接続) も確認された。新しい引数は viewport の経路に触れるので
+凍結ルールの対象であり、**症状パッチではない構造的修正であることに合意**した (設計担当も合意、detached-rework-plan.md §11 に記録)。
+
+| 指摘 | 内容 | 反映 |
+| --- | --- | --- |
+| P2 | 30773 で渡す `ctx` は ROOT のもので、所有 viewport の `ctx` は描画 closure の中だけ | §5.7.1: 描画 closure の中で viewport id と可視性を値で取り、`ViewerRender { viewport, visible }` で運ぶ |
+| P3 | 描画しない側の呼び出しは root の転送だけでなく、ゲームパッド・ホイール操作等を含む汎用の wrapper | §5.7.1: `InputOnly` に改名し、範囲を明記 |
 
 ## 12. 実装記録
 
