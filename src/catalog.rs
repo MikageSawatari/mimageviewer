@@ -1653,6 +1653,28 @@ impl CatalogDb {
         Ok(map)
     }
 
+    /// Thumbnail payload existence without reading or decoding it. Dimensions-only
+    /// rows with NULL pixels do not count, matching the rows accepted by `load_all`.
+    pub fn contains_filename(&self, filename: &str) -> rusqlite::Result<bool> {
+        let conn = self.phase()?;
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM thumbnails WHERE filename = ?1 AND thumb_data IS NOT NULL)",
+            params![filename],
+            |row| row.get(0),
+        )
+    }
+
+    /// Read only row names under a literal prefix, including `%` and `_` in names.
+    pub fn list_filenames_with_prefix(&self, prefix: &str) -> rusqlite::Result<Vec<String>> {
+        let conn = self.phase()?;
+        let mut statement =
+            conn.prepare("SELECT filename FROM thumbnails WHERE substr(filename, 1, ?1) = ?2")?;
+        let rows = statement.query_map(params![prefix.chars().count() as i64, prefix], |row| {
+            row.get(0)
+        })?;
+        rows.collect()
+    }
+
     /// 単一エントリのみ取り出す。`load_all` を呼ぶほどではないが特定 key だけ確認したい
     /// 場合用 (例: 仮想フォルダ進入時の親 catalog からの seed lookup)。
     pub fn load_one(&self, filename: &str) -> rusqlite::Result<Option<CacheEntry>> {
@@ -3621,6 +3643,39 @@ mod tests {
                 .auto_material,
             material
         );
+    }
+
+    #[test]
+    fn filename_inventory_uses_literal_unicode_prefix_without_reading_payloads() {
+        let db = open_in_memory();
+        let prefix = "folderthumb:日本%_本#pin:";
+        let first = format!("{prefix}first");
+        let second = format!("{prefix}second");
+        let wildcard_neighbor = "folderthumb:日本XX本#pin:other";
+        let case_neighbor = "folderthumb:日本%_本#PIN:other";
+        // Invalid payload columns must not affect these filename-only reads.
+        for key in [
+            first.as_str(),
+            second.as_str(),
+            wildcard_neighbor,
+            case_neighbor,
+        ] {
+            db.conn.lock().unwrap().execute(
+                "INSERT INTO thumbnails (filename, mtime, file_size, width, height, thumb_data) VALUES (?1, 1, 2, 3, 4, 'invalid pixels')",
+                params![key],
+            ).unwrap();
+        }
+        assert!(db.contains_filename(&first).unwrap());
+        assert!(!db.contains_filename(prefix).unwrap());
+        let mut keys = db.list_filenames_with_prefix(prefix).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec![first, second]);
+        assert!(db.list_filenames_with_prefix("absent").unwrap().is_empty());
+        assert_eq!(db.list_filenames_with_prefix("").unwrap().len(), 4);
+        db.save_page_dims("dims-only", 1, 2, Some((3, 4)), None)
+            .unwrap();
+        assert!(!db.contains_filename("dims-only").unwrap());
+        assert!(db.list_filenames_with_prefix("dims-").unwrap().is_empty());
     }
 
     #[test]
@@ -7544,5 +7599,114 @@ mod tests {
             Some((10, false)),
             "safe 経路の確信 (password_required=false) で上書きされる"
         );
+    }
+}
+
+#[cfg(test)]
+mod s1_writeback_order_tests {
+    use super::*;
+    use crate::thumb_loader::*;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, RwLock, mpsc};
+
+    #[test]
+    fn virtual_parent_publication_precedes_finalized_at_the_worker_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("book.zip");
+        std::fs::write(&path, b"already developed RAW page").unwrap();
+        let cache = temp.path().join("catalogs");
+        let page = Arc::new(CatalogDb::open(&cache, &path).unwrap());
+        let parent = Arc::new(CatalogDb::open(&cache, temp.path()).unwrap());
+        let meta = std::fs::metadata(&path).unwrap();
+        let stamp = (crate::ui_helpers::mtime_secs(&meta), meta.len() as i64);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        parent
+            .phase()
+            .unwrap()
+            .authorizer(Some(move |auth: AuthContext<'_>| {
+                if matches!(
+                    auth.action,
+                    AuthAction::Insert {
+                        table_name: "thumbnails"
+                    }
+                ) {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                Authorization::Allow
+            }));
+        let mut req = LoadRequest {
+            path: path.clone(),
+            zip_entry: Some("first.cr2".into()),
+            mtime: stamp.0,
+            file_size: stamp.1,
+            raw_source: LoadRequestSource::RawHalfDeveloped {
+                image: image::DynamicImage::new_rgb8(8, 12),
+                developed_dims: [16, 24],
+                decode_ms: 40.0,
+                folder_selection_proof: None,
+            },
+            virtual_folder_parent: Some(Box::new(crate::thumb_loader::VirtualFolderParent {
+                source_path: path,
+                parent_catalog: parent.clone(),
+                parent_key: "zipthumb:book.zip".into(),
+                target_key: "first.cr2".into(),
+                target_idx: 0,
+                items_gen: 0,
+                parent_entry_mtime: stamp.0,
+                parent_entry_size: stamp.1,
+            })),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let done = Arc::new(AtomicUsize::new(0));
+            process_load_request(
+                &mut req,
+                &RwLock::new(std::collections::HashMap::new()),
+                &tx,
+                Some(&page),
+                64,
+                75,
+                64,
+                CacheDecision {
+                    policy: crate::settings::CachePolicy::Always,
+                    threshold_ms: 0,
+                    size_threshold: 0,
+                    webp_always: true,
+                    zip_always: true,
+                    pdf_always: true,
+                    cache_book_cover_only: false,
+                },
+                &done,
+                &Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+                None,
+                &Arc::new(AtomicUsize::new(0)),
+                &Arc::new(AtomicUsize::new(1)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(done.load(Ordering::Relaxed), 1);
+        });
+        // The authorizer holds the actual parent INSERT, without timing sleeps.
+        // Even when pixels are already delivered, Finalized must still be withheld.
+        let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let before_save: Vec<_> = rx.try_iter().collect();
+        let _ = release_tx.send(());
+        worker.join().unwrap();
+        assert!(
+            entered.is_ok(),
+            "worker must reach parent publication: {entered:?}"
+        );
+        assert!(before_save.iter().any(|msg| msg.pixels().is_some()));
+        assert!(before_save.iter().all(|msg| !msg.is_finalized()));
+        assert!(rx.try_iter().any(|msg| msg.is_finalized()));
+        assert!(parent.load_one("zipthumb:book.zip").unwrap().is_some());
     }
 }

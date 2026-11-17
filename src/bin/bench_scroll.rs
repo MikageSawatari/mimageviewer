@@ -11,9 +11,18 @@
 //!   --rows N         画面行数 (default: 4)
 //!   --scroll-to N    スクロール先の行番号 (default: total_rows/2)
 //!   --threads N      ワーカー数 (default: auto)
-//!   --no-cache       キャッシュを無効化 (常にフルデコード)
+//!   --cache-mode M   memory (全行の控え), db (空の控え), source (SourceOnly)
+//!   --no-cache       --cache-mode source の別名
 //!   --delete-cache   計測前にキャッシュ DB を削除
+//!   --synthetic-suite DIR  新規の使い捨て DIR に 1 万件の比較用 fixture を作る
+//!   --repetitions N  合成ベンチの反復数 (default: 3)
+//!
+//! 物理フォルダの memory は全行を控えに載せた S1 worker (未ヒットなら DB も参照)。
+//! 旧 Fixed worker の未ヒット時の動作との比較は、通常 PNG の合成ベンチだけで行う。
 //! ```
+
+#[path = "bench_scroll/synthetic.rs"]
+mod synthetic;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -45,15 +54,40 @@ struct Args {
     rows: usize,
     scroll_to: Option<usize>, // None = auto (total/2)
     threads: usize,
-    no_cache: bool,
+    cache_mode: CacheMode,
     delete_cache: bool,
+    synthetic_suite: Option<PathBuf>,
+    repetitions: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheMode {
+    Memory,
+    Db,
+    Source,
+}
+
+impl CacheMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Memory => "memory",
+            Self::Db => "db",
+            Self::Source => "source",
+        }
+    }
+
+    fn configure_request(self, req: &mut LoadRequest) {
+        if self == Self::Source {
+            req.source_policy = mimageviewer::thumb_loader::LoadSourcePolicy::SourceOnly;
+        }
+    }
 }
 
 fn parse_args() -> Args {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.is_empty() {
         eprintln!(
-            "Usage: bench_scroll <folder> [--cols N] [--rows N] [--scroll-to N] [--threads N] [--no-cache] [--delete-cache]"
+            "Usage: bench_scroll <folder> [--cols N] [--rows N] [--scroll-to N] [--threads N] [--cache-mode memory|db|source] [--no-cache] [--delete-cache]\n       bench_scroll --synthetic-suite <new-directory> [--threads N] [--repetitions N]"
         );
         std::process::exit(1);
     }
@@ -65,8 +99,10 @@ fn parse_args() -> Args {
         threads: std::thread::available_parallelism()
             .map(|p| p.get().saturating_sub(2).max(2))
             .unwrap_or(4),
-        no_cache: false,
+        cache_mode: CacheMode::Memory,
         delete_cache: false,
+        synthetic_suite: None,
+        repetitions: 3,
     };
     let mut i = 0;
     while i < raw.len() {
@@ -87,8 +123,33 @@ fn parse_args() -> Args {
                 i += 1;
                 args.threads = raw[i].parse().unwrap_or(4);
             }
-            "--no-cache" => args.no_cache = true,
+            "--cache-mode" => {
+                i += 1;
+                args.cache_mode = match raw.get(i).map(String::as_str) {
+                    Some("memory") => CacheMode::Memory,
+                    Some("db") => CacheMode::Db,
+                    Some("source") => CacheMode::Source,
+                    _ => panic!("--cache-mode requires memory, db, or source"),
+                };
+            }
+            "--no-cache" => args.cache_mode = CacheMode::Source,
             "--delete-cache" => args.delete_cache = true,
+            "--synthetic-suite" => {
+                i += 1;
+                args.synthetic_suite = Some(PathBuf::from(raw.get(i).expect("suite directory")));
+            }
+            "--repetitions" => {
+                i += 1;
+                args.repetitions = raw
+                    .get(i)
+                    .expect("repetitions")
+                    .parse()
+                    .expect("positive repetitions");
+                assert!(args.repetitions > 0);
+            }
+            "--data-dir" => {
+                i += 1;
+            }
             other => {
                 if args.folder.as_os_str().is_empty() {
                     args.folder = PathBuf::from(other);
@@ -97,7 +158,8 @@ fn parse_args() -> Args {
         }
         i += 1;
     }
-    if args.folder.as_os_str().is_empty() {
+    assert!(args.cols > 0 && args.rows > 0 && args.threads > 0);
+    if args.folder.as_os_str().is_empty() && args.synthetic_suite.is_none() {
         eprintln!("Error: folder path is required");
         std::process::exit(1);
     }
@@ -310,83 +372,49 @@ fn make_load_request(
     mtime: i64,
     file_size: i64,
 ) -> Option<LoadRequest> {
-    let base = LoadRequest {
-        idx,
-        mtime,
-        file_size,
-        pdf_render_validity: mimageviewer::pdf_loader::PdfRenderValidity::Unscoped,
-        ..Default::default()
-    };
+    // This binary is a separate crate; construct through public request fields.
+    let mut req = LoadRequest::default();
+    req.idx = idx;
+    req.mtime = mtime;
+    req.file_size = file_size;
     match item {
-        GridItem::Image(p) => Some(LoadRequest {
-            path: p.clone(),
-            ..base
-        }),
+        GridItem::Image(p) => req.path = p.clone(),
         GridItem::ZipFile(p) => {
-            let fname = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            Some(LoadRequest {
-                path: p.clone(),
-                cache_key_override: Some(format!("{CACHE_KEY_ZIP}{fname}")),
-                ..base
-            })
+            req.path = p.clone();
+            req.cache_key_override = Some(format!("{CACHE_KEY_ZIP}{}", p.file_name()?.to_str()?));
         }
         GridItem::PdfFile(p) => {
-            let fname = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            Some(LoadRequest {
-                path: p.clone(),
-                pdf_page: Some(0),
-                cache_key_override: Some(format!("{CACHE_KEY_PDF}{fname}")),
-                ..base
-            })
+            req.path = p.clone();
+            req.pdf_page = Some(0);
+            req.cache_key_override = Some(format!("{CACHE_KEY_PDF}{}", p.file_name()?.to_str()?));
         }
         GridItem::Folder(p) => {
-            let fname = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            let folder_thumb_sort = SortOrder::Numeric;
-            let folder_thumb_depth = 3;
-            Some(LoadRequest {
-                path: p.clone(),
-                cache_key_override: Some(folder_thumb_auto_cache_key(
-                    &fname,
-                    folder_thumb_sort,
-                    folder_thumb_depth,
-                )),
-                folder_thumb_sort: Some(folder_thumb_sort),
-                folder_thumb_depth,
-                folder_thumb_provenance: Some(
-                    mimageviewer::catalog::FolderThumbProvenance::AutoSelected,
-                ),
-                ..base
-            })
+            req.path = p.clone();
+            req.folder_thumb_sort = Some(SortOrder::Numeric);
+            req.folder_thumb_depth = 3;
+            req.folder_thumb_provenance = Some(catalog::FolderThumbProvenance::AutoSelected);
+            req.cache_key_override = Some(folder_thumb_auto_cache_key(
+                p.file_name()?.to_str()?,
+                SortOrder::Numeric,
+                3,
+            ));
         }
         GridItem::ZipImage {
             zip_path,
             entry_name,
-        } => Some(LoadRequest {
-            path: zip_path.clone(),
-            zip_entry: Some(entry_name.clone()),
-            ..base
-        }),
+        } => {
+            req.path = zip_path.clone();
+            req.zip_entry = Some(entry_name.clone());
+        }
         GridItem::PdfPage {
             pdf_path, page_num, ..
-        } => Some(LoadRequest {
-            path: pdf_path.clone(),
-            pdf_page: Some(*page_num),
-            ..base
-        }),
-        _ => None,
+        } => {
+            req.path = pdf_path.clone();
+            req.pdf_page = Some(*page_num);
+        }
+        _ => return None,
     }
+    Some(req)
 }
 
 // ───────────────────────────────────────────────────────────────────
@@ -598,16 +626,17 @@ fn run_bench(
                     }
                 }
             }
-        });
+        })
     };
 
+    let mut workers = Vec::new();
     // 通常ワーカー: reload_queue
     for _ in 0..regular_threads {
-        spawn_worker(Arc::clone(&reload_queue));
+        workers.push(spawn_worker(Arc::clone(&reload_queue)));
     }
     // I/O ワーカー: heavy_io_queue
     for _ in 0..io_threads {
-        spawn_worker(Arc::clone(&heavy_io_queue));
+        workers.push(spawn_worker(Arc::clone(&heavy_io_queue)));
     }
     drop(tx); // メインスレッドの tx を閉じる
 
@@ -657,6 +686,7 @@ fn run_bench(
                 continue;
             };
             req.priority = i >= vis_first && i < vis_end;
+            args.cache_mode.configure_request(&mut req);
             new_reqs.push(req);
         }
 
@@ -778,6 +808,9 @@ fn run_bench(
 
     // ワーカー停止
     cancel.store(true, Ordering::Relaxed);
+    for worker in workers {
+        worker.join().expect("benchmark worker");
+    }
 
     BenchResult {
         scroll_time_ms,
@@ -797,10 +830,13 @@ fn run_bench(
 // ───────────────────────────────────────────────────────────────────
 
 fn main() {
+    let args = parse_args();
+    if let Some(root) = &args.synthetic_suite {
+        synthetic::run(&args, root);
+        return;
+    }
     // data_dir 初期化 (catalog パスの解決に必要)
     mimageviewer::data_dir::init();
-
-    let args = parse_args();
 
     println!("=== Bench Scroll: {} ===", args.folder.display());
 
@@ -858,18 +894,30 @@ fn main() {
     }
 
     // キャッシュ準備
+    let prepare_started = Instant::now();
     let catalog_arc: Option<Arc<CatalogDb>> =
         CatalogDb::open(&cache_dir, &args.folder).ok().map(Arc::new);
 
-    let full_cache_map: HashMap<String, catalog::CacheEntry> = if args.no_cache {
-        HashMap::new()
-    } else {
-        catalog_arc
-            .as_ref()
-            .and_then(|c| c.load_all().ok())
-            .unwrap_or_default()
-    };
-    println!("Cache entries: {}", full_cache_map.len());
+    let full_cache_map: HashMap<String, catalog::CacheEntry> =
+        if args.cache_mode == CacheMode::Memory {
+            catalog_arc
+                .as_ref()
+                .and_then(|c| c.load_all().ok())
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+    println!("Cache mode: {}", args.cache_mode.label());
+    if args.cache_mode == CacheMode::Memory {
+        println!(
+            "Memory workload: preloaded map with S1 worker (DB lookup on miss); old Fixed baseline is synthetic-suite only"
+        );
+    }
+    println!(
+        "Cache preparation: {:.3} ms",
+        prepare_started.elapsed().as_secs_f64() * 1000.0
+    );
+    println!("Memory entries: {}", full_cache_map.len());
     println!();
 
     // ── Run 1: キャッシュあり ──
@@ -882,19 +930,6 @@ fn main() {
             catalog_arc.clone(),
             Arc::clone(&pin_db),
         );
-        print_result("With cache", &result);
-    }
-
-    // ── Run 2: キャッシュなし ──
-    if !args.no_cache {
-        let cache_map = Arc::new(RwLock::new(HashMap::new()));
-        let result = run_bench(
-            &args,
-            &contents,
-            cache_map,
-            catalog_arc.clone(),
-            Arc::clone(&pin_db),
-        );
-        print_result("Without cache", &result);
+        print_result(args.cache_mode.label(), &result);
     }
 }

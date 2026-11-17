@@ -167,6 +167,7 @@ fn cover_auto_pdf_transposed_page_dimensions_continue_detection_with_same_lease(
     let identity =
         crate::cover_auto_crop::AutoCropIdentity::new(crate::settings::ReadingDirection::Rtl);
     load_one_cached(
+        None,
         &path,
         None,
         None,

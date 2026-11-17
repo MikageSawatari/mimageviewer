@@ -1458,6 +1458,15 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-17: §1.800 S1 の仮想フォルダと親との対応
+
+設計担当の §4S（独立設計レビュー r10 ACCEPT）と実装の独立レビューで、UI の一回限りの
+`VirtualFolderWriteback` を、要求へ運ぶ不変な `VirtualFolderParent` に置き換えた。
+App／`ViewerContextBundle` は `Option<Box<_>>` で同じ所有・swap・退役経路を保つ。
+detached の述語、viewport、状態遷移は変更しない。親への保存は source・鍵・世代・idx が
+一致した pool 要求の worker が行う。時間窓・追加の発火状態を設けない所有境界の変更であり、
+症状パッチではない。両 context の対応が往復 swap で保持される回帰テストを加えた。
+
 ### 2026-11-15: §1.767 サブPC依頼57 — caption buttonの確定点を一致SCに統一
 
 タッチ・最小化の独立レビュー（基点9c69805bd、Sol / xhigh、REJECT）は構造修正に合意。

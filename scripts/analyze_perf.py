@@ -2273,8 +2273,10 @@ def cmd_nav(events: list[dict]) -> None:
       nav.lf_{scan,sort,dup_filter,auto_index}  — load_folder 内の小区間
       nav.sli_begin / sli_end             — start_loading_items 全体
       nav.sli_{sidecar_flush,prewarm_rating,sidecar_import,adjustment_db,
-               mask_db,catalog_open,catalog_load_all,catalog_delete_missing,
+               mask_db,catalog_open,catalog_prepare,catalog_delete_missing,
+               virtual_seed,video_pin_seed,
                spawn_workers,settings_save}  — 内訳
+      nav.sli_catalog_load_all            — 旧版の全行読込 (別区間として比較)
       nav.close_fullscreen_begin/_end     — close_fullscreen 区間
     """
     buckets: dict[str, list[float]] = defaultdict(list)
@@ -2317,7 +2319,9 @@ def cmd_nav(events: list[dict]) -> None:
         ("  sli 内訳", [
             "sli_sidecar_flush", "sli_prewarm_rating", "sli_sidecar_import",
             "sli_adjustment_db", "sli_mask_db",
-            "sli_catalog_open", "sli_catalog_load_all", "sli_catalog_delete_missing",
+            "sli_catalog_open", "sli_catalog_prepare", "sli_catalog_load_all",
+            "sli_catalog_delete_missing",
+            "sli_virtual_seed", "sli_video_pin_seed",
             "sli_spawn_workers", "sli_settings_save",
         ]),
     ]
@@ -2332,6 +2336,23 @@ def cmd_nav(events: list[dict]) -> None:
                 found = True
         if not found:
             print("  (イベントなし)")
+
+    print("\n[catalog seed の DB 読み]")
+    for kind in ("sli_virtual_seed", "sli_video_pin_seed"):
+        rows = [e for e in events if e.get("cat") == "nav" and e.get("kind") == kind]
+        counts = [e.get("catalog_reads", e.get("reads")) for e in rows]
+        counts = [n for n in counts if isinstance(n, (int, float)) and not isinstance(n, bool)]
+        if counts:
+            print(f"  {kind}: events={len(rows)} measured={len(counts)} reads={sum(counts):g} max={max(counts):g}")
+        elif rows:
+            print(f"  {kind}: events={len(rows)} (読み件数なし)")
+    writebacks = [e for e in events if e.get("kind") == "virtual_writeback"]
+    if writebacks:
+        print("\n[virtual_writeback (worker)]")
+        stats("virtual_writeback", [float(e["ms"]) for e in writebacks if isinstance(e.get("ms"), (int, float))])
+        copied = sum(e.get("copied") is True for e in writebacks)
+        skipped = sum(e.get("copied") is False for e in writebacks)
+        print(f"  events={len(writebacks)} copied={copied} skipped={skipped} unknown={len(writebacks) - copied - skipped}")
 
     # DFS 由来の input_seq ごとの End-to-End レイテンシ
     # input.grid_ctrl_nav / fs_ctrl_nav から nav.apply_end までの経過

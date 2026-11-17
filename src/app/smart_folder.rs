@@ -8595,7 +8595,7 @@ impl App {
         self.zip_enumerate_pending = None;
         self.fs_nav_after_pdf_enumerate = None;
         self.pdf_placeholder_count = None;
-        self.virtual_folder_writeback = None;
+        self.virtual_folder_parent = None;
         self.pdf_prefetch_grace_until = None;
         self.zip_nav = None;
         self.archive_source_override = None;

@@ -12825,36 +12825,8 @@ impl AdjustSpreadTarget {
     }
 }
 
-/// 仮想フォルダ (PDF/ZIP) 進入時の親 catalog への write-back ターゲット。
-/// `start_loading_items` で仮想フォルダ用 catalog を開くタイミングで構築し、
-/// `poll_thumbnails` の finalize シグナル経路で発火する。
-pub(crate) struct VirtualFolderWriteback {
-    pub parent_catalog: Arc<crate::catalog::CatalogDb>,
-    /// 親 catalog 側の保存キー (例: `pdfthumb:foo.pdf` / `zipthumb:foo.zip`)。
-    pub parent_key: String,
-    /// 仮想 catalog 側の対応キー (= cache_map の lookup に使う、例: `page_0000`)。
-    pub target_key: String,
-    /// 監視対象の items 内 idx (= 最初の PdfPage / ZipImage の idx)。
-    pub target_idx: usize,
-    /// このターゲットが有効な items 世代。`fire_*` で `App::items_generation` と
-    /// 一致しなければ無視 + クリア (Codex P2 対策)。
-    ///
-    /// `start_loading_items` でも仮想 writeback はクリアされるが、
-    /// `replace_search_view_items` (Ctrl+G 検索ビュー切替、`global_search_ui.rs`) や
-    /// `remove_items_batch` (削除直後の idx 詰め、`app.rs`) は `items_generation` を
-    /// 直接 +1 するだけで `start_loading_items` を通らない。この場で書き戻しが発火
-    /// すると古い PDF/ZIP の親 catalog に書いてしまうので、このフィールドが
-    /// 実質的な唯一のガードになる。
-    pub items_gen: u64,
-    /// 現フォルダの cache_map 参照。worker がここに WebP データを put 後、
-    /// 本構造体経由で親 catalog にミラーする。
-    pub cache_map:
-        Arc<std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>>,
-    /// 親 catalog の `pdfthumb:` / `zipthumb:` 行に書き込む mtime / size。
-    /// PDF/ZIP **ファイル本体**の mtime / size を入れる (親 grid 表示時の値と一致)。
-    pub parent_entry_mtime: i64,
-    pub parent_entry_size: i64,
-}
+/// Context-owned PDF/ZIP first-page correspondence, copied into pool requests.
+type VirtualFolderParent = crate::thumb_loader::VirtualFolderParent;
 
 /// 画像補正パネルのスライダードラッグ中に保持するスナップショット。
 ///
@@ -19214,13 +19186,10 @@ pub struct App {
     /// legacy 名は context bundle の機械的な差分を抑えるため維持している。
     pub(crate) fs_holdover_tex: Option<FsHoldover>,
 
-    /// 仮想フォルダ (PDF/ZIP) 進入時に「最初のページのサムネを完成させたら親 catalog
-    /// にも書き戻す」ための write-back ターゲット。`Some` のとき finalize シグナルが
-    /// `target_idx` で届いた時点で `cache_map` から WebP データを取り出して親 catalog
-    /// の `parent_key` (= `pdfthumb:foo.pdf` / `zipthumb:foo.zip`) に保存する。
-    /// 一度発火したら None に戻して二重書き込みを防ぐ。
-    /// items 入れ替え時 (`start_loading_items` 冒頭) に再初期化される。
-    pub(crate) virtual_folder_writeback: Option<VirtualFolderWriteback>,
+    /// PDF/ZIP listing's first-page correspondence. Matching pool requests carry
+    /// it to the worker, which copies the persisted row before Finalized.
+    /// Context swaps retain it; a replaced listing clears it. Cache hits do not copy.
+    pub(crate) virtual_folder_parent: Option<Box<VirtualFolderParent>>,
 
     /// PDFium ワーカープールの thrash 抑制用 grace period。
     /// PDF/ZIP を仮想フォルダとして開いた直後の数十 ms はユーザーが Ctrl+↑↓ で
@@ -21742,7 +21711,7 @@ impl App {
             fs_nav_dropped_block_count: 0,
             fs_load_skip_signature: None,
             fs_holdover_tex: None,
-            virtual_folder_writeback: None,
+            virtual_folder_parent: None,
             pdf_prefetch_grace_until: None,
             pdf_render_epoch: crate::pdf_loader::PdfRenderEpochOwner::fresh(),
             pdf_visible_promotion: PdfVisiblePromotionState::Idle,
@@ -29408,7 +29377,7 @@ impl App {
         self.pdf_enumerate_pending = None;
         self.zip_enumerate_pending = None;
         self.fs_nav_after_pdf_enumerate = None;
-        self.virtual_folder_writeback = None;
+        self.virtual_folder_parent = None;
         self.retire_book_deferred_open();
         self.pdf_prefetch_grace_until = None;
 
@@ -42967,7 +42936,7 @@ impl App {
     /// 1. **seed**: 親 catalog にエントリがあれば仮想 catalog にコピー (= 再生成回避)。
     ///    既に grid を経由していたケースは即時ヒット。
     /// 2. **writeback ターゲット設定**: 仮想 catalog 側で worker が page_0000 を
-    ///    完成させた後、`poll_thumbnails` の finalize で親 catalog にもミラー書き込み。
+    ///    完成させた後、worker が Finalized 前に親 catalog にもミラー書き込み。
     ///    grid を経由しないルート (= Ctrl+↑↓ で直接 PDF を開く流れ) では、初回の
     ///    PDFium レンダリングコストは取り戻せないが、2 回目以降の同じフォルダ進入で
     ///    seed 経路がヒットするようになる。
@@ -43046,11 +43015,15 @@ impl App {
         // ON ではページ WebP を増やさず、既に記録した最新の寸法も維持する。
         // 開いた時点の設定を使い、writeback の準備は従来どおり続ける。
         let seed_enabled = !self.settings.cache_book_cover_only;
+        let seed_started = std::time::Instant::now();
         // 仮想 catalog 側に既にあれば何もしない (再 seed 不要)。
-        let already_in_virtual = cache_map
-            .read()
-            .map(|m| m.contains_key(&target_key))
-            .unwrap_or(false);
+        let already_in_virtual = target_db
+            .contains_filename(&target_key)
+            .unwrap_or_else(|error| {
+                crate::logger::log(format!("virtual seed lookup failed: {error}"));
+                target_db.record_cache_error(format!("virtual seed lookup: {error}"));
+                false
+            });
         let parent_entry = if seed_enabled && !already_in_virtual {
             parent_db.load_one(&parent_key).ok().flatten()
         } else {
@@ -43092,6 +43065,19 @@ impl App {
         } else if seed_enabled && !already_in_virtual {
             crate::perf::event("nav", "virtual_seed_miss", Some(&parent_key), 0, &[]);
         }
+        crate::perf::event(
+            "nav",
+            "sli_virtual_seed",
+            None,
+            self.input_seq,
+            &[
+                (
+                    "ms",
+                    serde_json::json!(seed_started.elapsed().as_secs_f64() * 1000.0),
+                ),
+                ("reads", serde_json::json!(1)),
+            ],
+        );
 
         // ── writeback ターゲット設定 ──────────────────────────────
         // 親エントリの mtime / size を取得 (= PDF/ZIP ファイル本体のメタ)。
@@ -43103,73 +43089,19 @@ impl App {
             }
             Err(_) => (0, 0),
         };
-        self.virtual_folder_writeback = Some(VirtualFolderWriteback {
+        self.virtual_folder_parent = Some(Box::new(VirtualFolderParent {
             parent_catalog: parent_db,
             parent_key,
             target_key,
             target_idx,
             items_gen: self.items_generation,
-            cache_map: Arc::clone(cache_map),
+            source_path: source_path.to_owned(),
             parent_entry_mtime: entry_mtime,
             parent_entry_size: entry_size,
-        });
+        }));
     }
 
-    /// `poll_thumbnails` の finalize シグナル経路から呼ばれ、
-    /// `virtual_folder_writeback` の対象 idx が完成していたら親 catalog にミラー書き込みする。
-    /// 一度発火したら writeback を None にして二重書き込みを防ぐ。
-    ///
-    /// 古い items 世代の writeback が残っていた (= `items_generation` 進行後) 場合は
-    /// idx 一致でも発火させずクリアのみする (Codex P2: 別フォルダの親 catalog への
-    /// 誤書き込み防止)。
-    fn fire_virtual_folder_writeback_if_ready(&mut self, finalized_idx: usize) {
-        let Some(wb) = self.virtual_folder_writeback.as_ref() else {
-            return;
-        };
-        if wb.items_gen != self.items_generation {
-            self.virtual_folder_writeback = None;
-            return;
-        }
-        if finalized_idx != wb.target_idx {
-            return;
-        }
-        // 同じ items 世代の要求 stamp と一致する WebP だけを親へ写す。
-        // 保存を省略した要求では cache_map に古い stamp の行が残ることがある。
-        let request_stamp = self.image_metas.get(wb.target_idx).copied().flatten();
-        // cache_map から WebP データを取り出す。
-        // RwLock の read guard を save() 越しに保持しないために clone する
-        // (save 中はファイル I/O で blocking、guard 保持は他スレッドの読み書きを止める)。
-        // None なら from_cache 経路 (cache hit で finalize 不発) など、worker が
-        // cache_map にエントリを残さなかったケース。再発火させても効果がないので
-        // 1 回試してクリアする (Codex P2: 失敗で stale 残置を防ぐ)。
-        let entry_opt = wb
-            .cache_map
-            .read()
-            .ok()
-            .and_then(|m| m.get(&wb.target_key).cloned())
-            .filter(|entry| request_stamp == Some((entry.mtime, entry.file_size)));
-        if let Some(entry) = entry_opt {
-            let parent_key = wb.parent_key.clone();
-            let _ = wb.parent_catalog.save_thumb_bytes_with_layout_dims(
-                &parent_key,
-                wb.parent_entry_mtime,
-                wb.parent_entry_size,
-                entry.source_dims,
-                entry.layout_dims,
-                &entry.jpeg_data,
-                &entry.cover,
-                entry.auto_material,
-            );
-            crate::perf::event("nav", "virtual_writeback", Some(&parent_key), 0, &[]);
-        }
-        self.virtual_folder_writeback = None;
-    }
-
-    /// `catalog_cache` の全エントリを drop し、SQLite Connection を閉じる。
-    /// キャッシュマネージャの「削除」操作 (DeleteOld / DeleteAll / DeleteFolder)
-    /// 呼び出し前に必須。Windows では Connection が握っている `.db` ファイルは
-    /// `remove_file` で削除できず silent fail するので、削除前に Connection を
-    /// 全部畳む必要がある (Codex P3)。LRU が小さいので評価コストは無視可能。
+    /// Close cached connections before Windows catalog file deletion.
     pub(crate) fn evict_all_catalog_cache(&mut self) {
         self.catalog_cache.clear();
         self.catalog_cache_order.clear();
@@ -43842,7 +43774,7 @@ impl App {
         // が来た瞬間に「全く違う PDF/ZIP の親 catalog」へ書き込みを発火させてしまう。
         // setup_virtual_folder_seed_and_writeback が新フォルダ用に再設定する場合は
         // それが上書きするので問題ない。
-        self.virtual_folder_writeback = None;
+        self.virtual_folder_parent = None;
         self.pdf_prefetch_grace_until = None;
         // フォルダ切替直後は「直前にスクロールしたのと同じ扱い」で prefetch gate を効かせる。
         // None だと `decide_prefetch_allowed` が「未スクロール → 即 allow」と判定して
@@ -44708,14 +44640,12 @@ impl App {
         > = shared_prepared_entries.unwrap_or_else(|| {
             Arc::new(std::sync::RwLock::new(match prepared_catalog {
                 Some(prepared) => prepared.entries,
-                None => catalog_arc
-                    .as_ref()
-                    .and_then(|c| c.load_all().ok())
-                    .unwrap_or_default(),
+                // This is a record of rows saved/seeded in this listing, not a DB snapshot.
+                None => HashMap::new(),
             }))
         });
         let catalog_entries = cache_map.read().unwrap().len();
-        crate::logger::log(format!("  catalog: {catalog_entries} entries in DB"));
+        crate::logger::log(format!("  catalog: {catalog_entries} entries in memory"));
         self.current_color_cache_map = Some(Arc::clone(&cache_map));
         self.current_color_catalog = catalog_arc.clone();
         self.thumbnail_pool_catalog = if is_synthetic_view_path(&source_path) {
@@ -44723,6 +44653,19 @@ impl App {
         } else {
             ThumbnailPoolCatalog::Folder(source_path.clone())
         };
+        crate::perf::event(
+            "nav",
+            "sli_catalog_prepare",
+            None,
+            sli_seq,
+            &[
+                (
+                    "ms",
+                    serde_json::json!(catalog_load_t0.elapsed().as_secs_f64() * 1000.0),
+                ),
+                ("entries", serde_json::json!(catalog_entries)),
+            ],
+        );
 
         // PDF / ZIP を仮想フォルダとして開いた場合、親フォルダ catalog の
         // pdfthumb: / zipthumb: 先頭サムネを仮想 catalog の page_0000 / 最初の
@@ -44744,22 +44687,6 @@ impl App {
         if !aggregate_catalog_was_prepared {
             self.seed_folder_video_pin_thumbs(&cache_map, catalog_arc.as_ref(), None);
         }
-        if crate::perf::is_enabled() {
-            crate::perf::event(
-                "nav",
-                "sli_catalog_load_all",
-                None,
-                sli_seq,
-                &[
-                    (
-                        "ms",
-                        serde_json::Value::from(catalog_load_t0.elapsed().as_secs_f64() * 1000.0),
-                    ),
-                    ("entries", serde_json::Value::from(catalog_entries)),
-                ],
-            );
-        }
-
         let catalog_del_t0 = std::time::Instant::now();
         // Projection is not evidence of physical deletion. Preserve hidden-page and older
         // representative cache rows; same-policy request keys still govern reuse.
@@ -45148,6 +45075,7 @@ impl App {
 
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            self.virtual_folder_parent = None;
             self.clear_fs_initial_placement_request();
             self.close_page_overview();
             self.finish_export_crop_drag(crate::ui_crop::OverlayDragEnd::OwnerChanged);
@@ -46041,6 +45969,8 @@ impl App {
         let use_full_path_keys = self.use_full_path_cache_keys();
         let mut seeded = 0u32;
         let mut purged = 0u32;
+        let seed_started = std::time::Instant::now();
+        let reads = std::cell::Cell::new(0usize);
         let candidates: Box<dyn Iterator<Item = &GridItem> + '_> = match indices {
             Some(indices) => Box::new(indices.iter().filter_map(|index| self.items.get(*index))),
             None => Box::new(self.items.iter()),
@@ -46114,11 +46044,12 @@ impl App {
             // 旧 pin の WebP が cache_hit で復活しないようにする (Codex Phase C P3 指摘)。
             // 削除中だけで使うのでローカル変数 + 通常関数として書く方が借用が単純になる。
             let purge_stale = |pinned_key: &str| -> bool {
-                let stale_exists = cache_map
-                    .read()
-                    .ok()
-                    .map(|map| map.contains_key(pinned_key))
-                    .unwrap_or(false);
+                reads.set(reads.get() + 1);
+                let stale_exists = cat.contains_filename(pinned_key).unwrap_or_else(|error| {
+                    crate::logger::log(format!("video seed existence lookup failed: {error}"));
+                    cat.record_cache_error(format!("video seed existence lookup: {error}"));
+                    false
+                });
                 if !stale_exists {
                     return false;
                 }
@@ -46150,16 +46081,19 @@ impl App {
                 crate::adjustment_db::normalize_path(&resolved.abs_path),
             );
             // Identity is part of the seed: old rows are upgraded even if pixels match.
-            let already_seeded = cache_map
-                .read()
-                .ok()
-                .and_then(|map| {
-                    map.get(&pinned_key).map(|entry| {
-                        entry.mtime == resolved.mtime
-                            && entry.file_size == resolved.file_size
-                            && entry.jpeg_data == webp
-                            && entry.cover == cover
-                    })
+            reads.set(reads.get() + 1);
+            let already_seeded = cat
+                .load_one(&pinned_key)
+                .unwrap_or_else(|error| {
+                    crate::logger::log(format!("video seed lookup failed: {error}"));
+                    cat.record_cache_error(format!("video seed lookup: {error}"));
+                    None
+                })
+                .map(|entry| {
+                    entry.mtime == resolved.mtime
+                        && entry.file_size == resolved.file_size
+                        && entry.jpeg_data == webp
+                        && entry.cover == cover
                 })
                 .unwrap_or(false);
             if already_seeded {
@@ -46219,6 +46153,21 @@ impl App {
                 "folder_thumb_pin: video seed = {seeded}, purged stale = {purged}"
             ));
         }
+        crate::perf::event(
+            "nav",
+            "sli_video_pin_seed",
+            None,
+            self.input_seq,
+            &[
+                (
+                    "ms",
+                    serde_json::json!(seed_started.elapsed().as_secs_f64() * 1000.0),
+                ),
+                ("reads", serde_json::json!(reads.get())),
+                ("seeded", serde_json::json!(seeded)),
+                ("purged", serde_json::json!(purged)),
+            ],
+        );
     }
 
     fn drive_list_pin_seed_entry(
@@ -56013,6 +55962,17 @@ impl App {
         req.capture_parent_request_key();
     }
 
+    /// Common pool attachment: visible, prefetch, navigation, seek, overview, hover,
+    /// and idle upgrades. Independent color/preview readers only stamp context.
+    fn attach_pool_thumbnail_context(&self, req: &mut LoadRequest) {
+        self.attach_viewer_thumbnail_context(req);
+        req.virtual_folder_parent = self
+            .virtual_folder_parent
+            .as_ref()
+            .filter(|parent| parent.matches(req))
+            .cloned();
+    }
+
     fn promote_viewer_pdf_keys(
         &mut self,
         keys: HashSet<String>,
@@ -56749,7 +56709,6 @@ impl App {
                     }
                     if source_changed {
                         self.invalidate_color_representative(i);
-                        self.fire_virtual_folder_writeback_if_ready(i);
                     }
                 }
                 ThumbnailReceipt::Terminal(
@@ -57696,7 +57655,7 @@ impl App {
             req.force_cache = true;
         }
         req.priority = true;
-        self.attach_viewer_thumbnail_context(&mut req);
+        self.attach_pool_thumbnail_context(&mut req);
         let is_heavy = self.items.get(idx).is_some_and(|item| item.is_heavy_io());
         let queue = if is_heavy {
             self.heavy_io_queue.clone()
@@ -58128,7 +58087,7 @@ impl App {
                 deferred_pdf_prefetch = true;
                 continue;
             }
-            self.attach_viewer_thumbnail_context(&mut req);
+            self.attach_pool_thumbnail_context(&mut req);
             let is_heavy = self.items.get(i).is_some_and(|it| it.is_heavy_io());
             // perf: エンキューイベント (タスク種別 + 優先度 + 相関 seq)
             self.attach_edit_preview_to_request(&mut req);
@@ -58813,7 +58772,7 @@ impl App {
             req.relative_page_provenance = self.relative_page_provenance_for_idx(i);
             req.priority = foreground;
             // 通常エンキューと同じく現世代を載せる (旧 items への upgrade 混入防止)
-            self.attach_viewer_thumbnail_context(&mut req);
+            self.attach_pool_thumbnail_context(&mut req);
             upgrade_reqs.push(req);
         }
 
@@ -103969,6 +103928,7 @@ fn apply_folder_thumb_pin(
         // すると cache_hit を踏み越えて is_folder_thumb 経路で folder の auto-pick を
         // pinned_key 下に書き戻してしまい、video frame が消える。
         return LoadRequest {
+            virtual_folder_parent: None,
             file_type_visibility: base_req.file_type_visibility.clone(),
             cover_scope: None,
             refresh_legacy_cover: false,
@@ -104127,6 +104087,7 @@ fn apply_folder_thumb_pin(
         Some(scope)
     };
     let mut request = LoadRequest {
+        virtual_folder_parent: None,
         file_type_visibility: base_req.file_type_visibility.clone(),
         cover_scope,
         refresh_legacy_cover: base_req.refresh_legacy_cover,

@@ -2113,7 +2113,7 @@ pub(in crate::app) struct ViewerContextBundle {
     fs_load_skip_signature: Option<String>,
     fs_holdover_tex: Option<FsHoldover>,
     fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
-    virtual_folder_writeback: Option<VirtualFolderWriteback>,
+    virtual_folder_parent: Option<Box<VirtualFolderParent>>,
     pdf_prefetch_grace_until: Option<std::time::Instant>,
     thumb_pixels: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
     thumb_edit_preview_layers: std::collections::HashMap<
@@ -3084,6 +3084,7 @@ const _: () = {
 impl ViewerContextBundle {
     fn set_items_generation(&mut self, items_generation: u64) {
         if self.items_generation != items_generation {
+            self.virtual_folder_parent = None;
             self.page_overview.close();
             self.requested.clear();
             crate::thumb_loader::cancel_raw_thumb_tickets(&self.raw_thumb_develop);
@@ -3371,7 +3372,7 @@ impl ViewerContextBundle {
             fs_load_skip_signature: None,
             fs_holdover_tex: None,
             fs_boundary_hint: None,
-            virtual_folder_writeback: None,
+            virtual_folder_parent: None,
             pdf_prefetch_grace_until: None,
             thumb_pixels: std::collections::HashMap::new(),
             thumb_edit_preview_layers: std::collections::HashMap::new(),
@@ -3803,7 +3804,7 @@ impl App {
             fs_load_skip_signature,
             fs_holdover_tex,
             fs_boundary_hint,
-            virtual_folder_writeback,
+            virtual_folder_parent,
             pdf_prefetch_grace_until,
             thumb_pixels,
             thumb_edit_preview_layers,
@@ -4139,7 +4140,7 @@ impl App {
         swap_field!(fs_load_skip_signature);
         swap_field!(fs_holdover_tex);
         swap_field!(fs_boundary_hint);
-        swap_field!(virtual_folder_writeback);
+        swap_field!(virtual_folder_parent);
         swap_field!(pdf_prefetch_grace_until);
         swap_field!(thumb_pixels);
         swap_field!(thumb_edit_preview_layers);
@@ -4577,7 +4578,7 @@ impl App {
             fs_load_skip_signature,
             fs_holdover_tex,
             fs_boundary_hint,
-            virtual_folder_writeback,
+            virtual_folder_parent,
             pdf_prefetch_grace_until,
             thumb_pixels,
             thumb_edit_preview_layers,
@@ -4909,7 +4910,7 @@ impl App {
             fs_nav_after_pdf_enumerate,
             pending_auto_fs_open,
             pdf_placeholder_count,
-            virtual_folder_writeback,
+            virtual_folder_parent,
             pdf_prefetch_grace_until,
             thumb_pixels,
             thumb_edit_preview_layers,
@@ -6999,6 +7000,63 @@ mod tests {
             &other_snapshot
         ));
         assert_eq!(app.list_order_position().unwrap().1, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn virtual_parent_bundle_swap_keeps_each_context_correspondence() {
+        let mut app = crate::app::setup_app_for_test();
+        let db = Arc::new(
+            crate::catalog::CatalogDb::open(&app.tmp.path().join("catalogs"), app.tmp.path())
+                .unwrap(),
+        );
+        let binding = |name: &str, generation| {
+            Box::new(VirtualFolderParent {
+                source_path: PathBuf::from(name),
+                parent_catalog: db.clone(),
+                parent_key: format!("pdfthumb:{name}"),
+                target_key: "page_0000".into(),
+                target_idx: 0,
+                items_gen: generation,
+                parent_entry_mtime: 7,
+                parent_entry_size: 9,
+            })
+        };
+        app.set_items_generation(12);
+        app.virtual_folder_parent = Some(binding("main.pdf", 12));
+        let mut sibling = ViewerContextBundle::empty();
+        sibling.set_items_generation(34);
+        sibling.virtual_folder_parent = Some(binding("sibling.pdf", 34));
+        for _ in 0..2 {
+            app.swap_viewer_context_bundle(&mut sibling);
+            assert_eq!(
+                app.virtual_folder_parent.as_ref().unwrap().source_path,
+                Path::new("sibling.pdf")
+            );
+            assert_eq!(app.virtual_folder_parent.as_ref().unwrap().items_gen, 34);
+            assert_eq!(
+                sibling.virtual_folder_parent.as_ref().unwrap().items_gen,
+                12
+            );
+            app.swap_viewer_context_bundle(&mut sibling);
+            assert_eq!(
+                app.virtual_folder_parent.as_ref().unwrap().source_path,
+                Path::new("main.pdf")
+            );
+            assert_eq!(app.virtual_folder_parent.as_ref().unwrap().items_gen, 12);
+            assert_eq!(
+                sibling.virtual_folder_parent.as_ref().unwrap().items_gen,
+                34
+            );
+        }
+        app.set_items_generation(12);
+        sibling.set_items_generation(34);
+        assert!(app.virtual_folder_parent.is_some());
+        assert!(sibling.virtual_folder_parent.is_some());
+        app.bump_items_generation();
+        sibling.set_items_generation(35);
+        assert!(app.virtual_folder_parent.is_none());
+        assert!(sibling.virtual_folder_parent.is_none());
     }
 
     #[cfg(windows)]

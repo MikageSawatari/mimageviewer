@@ -1,5 +1,25 @@
 # 非同期・並列アーキテクチャ
 
+## 一覧 catalog の控えと先頭ページの書き戻し（§1.800 S1）
+
+通常一覧は catalog を開いたときに `load_all` せず、空の `cache_map` で始める。
+控えはこの一覧で保存・seed した行を保持し、未登録は DB の不在を意味しない。
+Fixed worker も未ヒットの鍵を非退役 catalog から読むが、DB hit を控えへ登録しない。
+Parent の観測・stamp 変換後の登録、collection の遅延所有、retired CacheOnly の読取継続は従来どおり。
+合成一覧の準備済みの写しと、数行のドライブ一覧の `load_all` は維持する。
+
+仮想フォルダ→動画ピンの seed は pool 起動前の UI の順序を保つ。完全な控えの代わりに
+仮想先頭ページの存在、動画 seed の一致／削除を保存先 DB の鍵1件で照合する。
+metadata のピン更新 worker は DB の行名から旧 variant の削除候補を得る。
+
+PDF/ZIP の親との対応は context 所有の Box に保持し、pool 要求の共通付加処理で
+source・鍵・items 世代・idx が一致した要求にだけ渡す。色フィルタ、独立プレビュー、Remote は対象外。
+worker が元から生成した先頭ページの保存（省略を含む）後、Finalized 前に、開いた時点の
+親 stamp と現在の stat が一致する場合だけ、要求 stamp の仮想 catalog 行を親へ写す。
+RAW 現像継続も同じ対応を運ぶ。cache hit では写さず、再生成時は毎回写す。
+context swap は対応を移し、一覧の置き換えは破棄する。永続 schema・鍵・保存内容は変えない。
+採用設計・表紙失効との順序は [案 S1 §4S](book-close-lag-800-plan.md) を参照。
+
 ## 外部openの採用区分（§1.767、依頼50 B）
 
 既存startup ownerが新規main採用／既存C継続を確定し、`MainListNavigation`から返された正本hydrationへ、
@@ -1708,7 +1728,8 @@ texture backlogは画像とoriginを一緒に保持し、旧items世代やkeep�
 texture_backlog` をcontext-localな `ThumbnailRequests` に集約した。sourceの予約は
 **workerの保存/省略終端と、その要求の画像の採用/破棄の両方**まで残す。
 Pending / Evicted / Loaded高画質化のどれでも同じで、8枚/frameの超過画像も同ownerに残る。
-通知はitems generationとrequest IDを照合してから、texture・寸法・色代表・writebackへ触れる。
+通知はitems generationとrequest IDを照合してから、texture・寸法・色代表へ触れる。
+§1.800 の仮想先頭ページの親 writeback は、要求に結び付いた対応・stamp を worker が照合し、通知前に終える。
 input_seqは操作計装であり、要求identityには使わない。
 
 - lock下で実行前queueから除いた一致するIDは局所取消で終了する。
@@ -2395,7 +2416,7 @@ single-row I/O に収めてあるため `cargo run --perf-log` でも hitches �
 | `lookup_many` | UI (load_folder 内) | フォルダロード 1 回ごと | 親コンテナ N 件分のピンを 500 件 chunked IN クエリで一括取得し `App::folder_pin_map: HashMap` に格納。N=数百でも `<5ms` |
 | `set` / `remove` | UI (アドレスバー 📌 / 右クリックメニュー) | ユーザー操作 1 回ごと | single-row INSERT/DELETE。`folder_thumb_pin_dirty = true` を立てるだけで再ロードは別経路 |
 | `apply_folder_thumb_pin` の `pin_map.get(&key)` | UI (`make_load_request`) | 親コンテナアイテム 1 つにつき 1 回 | DB ヒットなし (HashMap lookup のみ)。pin source 解決時に **追加で 1 回 `std::fs::metadata`** (target ファイル) を取る点だけ注意 — Folder pin source でサブフォルダを再帰探索する場合は worker thread 側の `resolve_folder_thumb_image` に委譲する |
-| `seed_folder_video_pin_thumbs` | UI (load_folder 内) | フォルダロード 1 回ごと | folder_pin_map の Video pin だけ走査 → `video_pins.db` lookup → 既存 cache_map と byte 比較 → 差分があるときだけ `catalog.save_thumb_bytes` (single-row UPSERT)。典型的なフォルダで 0〜数件しか該当しない |
+| `seed_folder_video_pin_thumbs` | UI (load_folder 内) | フォルダロード 1 回ごと | folder_pin_map の Video pin だけ走査 → `video_pins.db` lookup → 保存先 catalog の鍵1件と stamp・bytes・cover を比較 → 差分があるときだけ single-row UPSERT。書いた／消した行を控えにも反映。時間と追加読み件数を計測 |
 
 **再ロードトリガ**: 書き換え反映は `App::consume_folder_thumb_pin_dirty` が
 `folder_thumb_pin_dirty` を take して `load_folder` を呼ぶ。これは `App::update` の

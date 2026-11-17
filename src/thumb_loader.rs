@@ -21,6 +21,8 @@ mod catalog_provider;
 mod cover_rotation_tests;
 #[cfg(test)]
 mod key_normalization_tests;
+#[cfg(test)]
+mod s1_tests;
 pub(crate) use catalog_provider::{ParentObservedStamp, ParentRow, RequestCatalog};
 pub use catalog_provider::{ThumbnailCatalogProvider, ThumbnailSaveTarget};
 
@@ -1455,6 +1457,8 @@ pub(crate) fn automatic_container_source(
 
 #[derive(Clone, Default)]
 pub struct LoadRequest {
+    /// Only the owning listing pool attaches its first-page/parent correspondence.
+    pub(crate) virtual_folder_parent: Option<Box<VirtualFolderParent>>,
     /// Immutable source facts, captured before representative/pin path rewriting.
     pub cover_scope: Option<crate::cover_source_scope::CoverSourceScope>,
     pub refresh_legacy_cover: bool,
@@ -1543,6 +1547,84 @@ pub struct LoadRequest {
     /// Typed source owner: the original source, a RAW development handoff, or an Audio thumbnail.
     /// Only the thumbnail worker may resize, cache, count, and signal its result.
     pub raw_source: LoadRequestSource,
+}
+
+/// Immutable correspondence captured when a PDF/ZIP listing opens. It survives
+/// context swaps and is copied into matching pool requests, without a fired latch.
+#[derive(Clone)]
+pub(crate) struct VirtualFolderParent {
+    pub source_path: std::path::PathBuf,
+    pub parent_catalog: Arc<crate::catalog::CatalogDb>,
+    pub parent_key: String,
+    pub target_key: String,
+    pub target_idx: usize,
+    pub items_gen: u64,
+    pub parent_entry_mtime: i64,
+    pub parent_entry_size: i64,
+}
+
+impl VirtualFolderParent {
+    pub(crate) fn matches(&self, req: &LoadRequest) -> bool {
+        self.source_path == req.path
+            && self.items_gen == req.items_gen
+            && self.target_idx == req.idx
+            && cache_key_for_request(req).as_deref() == Some(self.target_key.as_str())
+    }
+
+    /// Worker-only, after page admission (including omitted saves), before Finalized.
+    pub(crate) fn writeback(
+        &self,
+        catalog: &crate::catalog::CatalogDb,
+        stamp: (i64, i64),
+        input_seq: u64,
+    ) {
+        let started = std::time::Instant::now();
+        let copied = (|| -> rusqlite::Result<bool> {
+            let Ok(meta) = std::fs::metadata(&self.source_path) else {
+                return Ok(false);
+            };
+            if (crate::ui_helpers::mtime_secs(&meta), meta.len() as i64)
+                != (self.parent_entry_mtime, self.parent_entry_size)
+            {
+                return Ok(false);
+            }
+            let Some(entry) = catalog
+                .load_one(&self.target_key)?
+                .filter(|entry| (entry.mtime, entry.file_size) == stamp)
+            else {
+                return Ok(false);
+            };
+            self.parent_catalog.save_thumb_bytes_with_layout_dims(
+                &self.parent_key,
+                self.parent_entry_mtime,
+                self.parent_entry_size,
+                entry.source_dims,
+                entry.layout_dims,
+                &entry.jpeg_data,
+                &entry.cover,
+                entry.auto_material,
+            )
+        })()
+        .unwrap_or_else(|error| {
+            crate::logger::log(format!("virtual folder writeback failed: {error}"));
+            self.parent_catalog
+                .record_cache_error(format!("virtual folder writeback: {error}"));
+            false
+        });
+        crate::perf::event(
+            "nav",
+            "virtual_writeback",
+            Some(&self.parent_key),
+            input_seq,
+            &[
+                (
+                    "ms",
+                    serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
+                ),
+                ("copied", serde_json::json!(copied)),
+            ],
+        );
+    }
 }
 
 /// Derive the original listing identity before representative-source resolution.
@@ -2963,6 +3045,7 @@ fn send_pinned_child_miss(
     gen_done.fetch_add(1, Ordering::Relaxed);
 }
 
+#[cfg(test)]
 fn drive_list_cache_key_allowed(key: &str) -> bool {
     !key.contains("|crop:") && !key.contains("|autocrop:")
 }
@@ -2970,7 +3053,7 @@ fn drive_list_cache_key_allowed(key: &str) -> bool {
 fn send_pinned_only_cached(
     req: &LoadRequest,
     pin: &PinnedOnlyRequest,
-    cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+    _cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     tx: &mpsc::Sender<ThumbMsg>,
     gen_done: &Arc<AtomicUsize>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
@@ -3004,21 +3087,12 @@ fn send_pinned_only_cached(
         // Keep the pre-EPUB first-frame seed: it can be shown before the
         // child pin, PDF generation, and exact writer key are resolved. The
         // following exact lookup is authoritative and replaces or rejects it.
-        let preview = if let Some(db) = resumed.as_ref() {
+        let preview = resumed.as_ref().or(catalog).and_then(|db| {
             db.load_latest_uncropped_with_prefix_matching(&cache_key_prefix, None)
                 .ok()
                 .flatten()
                 .map(|(_, entry)| entry)
-        } else {
-            cache_map.read().ok().and_then(|map| {
-                map.iter()
-                    .filter(|(key, _)| {
-                        key.starts_with(&cache_key_prefix) && drive_list_cache_key_allowed(key)
-                    })
-                    .max_by_key(|(_, entry)| (entry.mtime, entry.file_size))
-                    .map(|(_, entry)| entry.clone())
-            })
-        };
+        });
         if canceled() {
             return false;
         }
@@ -3082,24 +3156,11 @@ fn send_pinned_only_cached(
         }),
         None => None,
     };
-    let cached = if let Some(db) = resumed.as_ref() {
+    let cached = resumed.as_ref().or(catalog).and_then(|db| {
         db.load_latest_uncropped_with_prefix_matching(&cache_key_prefix, epub_stamp)
             .ok()
             .flatten()
-    } else {
-        cache_map.read().ok().and_then(|map| {
-            map.iter()
-                .filter(|(key, entry)| {
-                    key.starts_with(&cache_key_prefix)
-                        && drive_list_cache_key_allowed(key)
-                        && epub_stamp.is_none_or(|(mtime, size)| {
-                            entry.mtime == mtime && entry.file_size == size
-                        })
-                })
-                .max_by_key(|(_, entry)| (entry.mtime, entry.file_size))
-                .map(|(key, entry)| (key.clone(), entry.clone()))
-        })
-    };
+    });
     if canceled() {
         return false;
     }
@@ -3588,6 +3649,7 @@ fn process_load_request_with_provider(
             .and_then(|key| adjustment_db.and_then(|db| db.get_page_params(key)))
             .filter(|params| !params.is_color_identity());
         load_one_cached(
+            req.virtual_folder_parent.as_deref(),
             &req.path,
             req.zip_entry.as_deref(),
             None,
@@ -3915,7 +3977,7 @@ fn process_load_request_with_provider(
     if req.source_policy.allows_cache() {
         let cached = memory.or_else(|| {
             let db = resolved_catalog.as_ref()?;
-            if !provider.uses_lazy_catalog(req) && !retired_cache_only {
+            if !provider.looks_up_catalog_on_miss(req, db) && !retired_cache_only {
                 return None;
             }
             let started = std::time::Instant::now();
@@ -3947,6 +4009,8 @@ fn process_load_request_with_provider(
                                 RequestCatalog::Parent { .. }
                             ) {
                                 "parent"
+                            } else if matches!(req.catalog_target, RequestCatalog::Fixed { .. }) {
+                                "fixed"
                             } else {
                                 "collection"
                             }),
@@ -3978,12 +4042,10 @@ fn process_load_request_with_provider(
                     None => image,
                 }
             });
-            if provider.uses_lazy_catalog(req) && ci.is_none() {
-                crate::logger::log(format!(
-                    "collection thumbnail: invalid cached WebP: {filename}"
-                ));
+            if (provider.uses_lazy_catalog(req) || !memory_hit) && ci.is_none() {
+                crate::logger::log(format!("thumbnail: invalid cached WebP: {filename}"));
                 if let Some(db) = resolved_catalog.as_ref() {
-                    db.record_cache_error("collection thumbnail: invalid cached WebP");
+                    db.record_cache_error("thumbnail: invalid cached WebP");
                 }
             } else {
                 if matches!(req.catalog_target, RequestCatalog::Parent { .. }) {
@@ -4419,6 +4481,7 @@ fn process_load_request_with_provider(
     let deferred_req = matches!(req.raw_source, LoadRequestSource::Original).then(|| req.clone());
     let raw_source = req.raw_source.clone();
     load_one_cached(
+        req.virtual_folder_parent.as_deref(),
         load_path,
         zip_entry_ref,
         preloaded_zip_bytes,
@@ -6390,6 +6453,7 @@ fn cover_pdf_page_sizes(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn load_one_cached(
+    virtual_folder_parent: Option<&VirtualFolderParent>,
     path: &Path,
     zip_entry: Option<&str>,
     // プリロード済み ZIP エントリバイト列。Some の場合 read_entry_bytes を省略する。
@@ -7608,6 +7672,10 @@ pub(crate) fn load_one_cached(
             ),
             &mut normal_log,
         );
+    }
+
+    if let (Some(parent), Some(catalog)) = (virtual_folder_parent, catalog) {
+        parent.writeback(catalog, (mtime, file_size), input_seq);
     }
 
     // 成功・失敗を問わず完了としてカウント（タイトルバーの進捗に反映）
@@ -10573,6 +10641,7 @@ mod tests {
         let stats = std::sync::Arc::new(std::sync::Mutex::new(crate::stats::ThumbStats::default()));
 
         load_one_cached(
+            None,
             &img_path,
             None,
             None,
@@ -11067,8 +11136,8 @@ mod tests {
         pins: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
         display_px: u32,
     ) -> Vec<ThumbMsg> {
-        // Ordinary Fixed requests receive an already-hydrated memory cache;
-        // the worker deliberately does not reopen their catalog on cache miss.
+        // Source-generation fixtures explicitly select SourceOnly; an empty S1
+        // record alone no longer bypasses the DB. CacheOnly also exercises memory hits.
         let map = std::sync::RwLock::new(if request.source_policy == LoadSourcePolicy::CacheOnly {
             catalog.load_all().unwrap()
         } else {
@@ -11255,6 +11324,7 @@ mod tests {
         let identity =
             crate::cover_auto_crop::AutoCropIdentity::new(crate::settings::ReadingDirection::Rtl);
         load_one_cached(
+            None,
             &path,
             None,
             None,
@@ -11429,6 +11499,7 @@ mod tests {
                 let (tx, rx) = mpsc::channel();
                 let done = Arc::new(AtomicUsize::new(0));
                 load_one_cached(
+                    None,
                     &path,
                     None,
                     None,

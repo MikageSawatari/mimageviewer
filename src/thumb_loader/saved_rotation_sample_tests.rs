@@ -93,7 +93,7 @@ fn cover_auto_pdf_worker_samples_body_rotation_from_logical_page_with_same_passw
         }));
         let (tx, rx) = mpsc::channel();
         let done = Arc::new(AtomicUsize::new(0));
-        load_one_cached(&path, None, None, None, Some(0), Some(&read), Some("same password"),
+        load_one_cached(None, &path, None, None, None, Some(0), Some(&read), Some("same password"),
             None, 0, &tx, None.into(), None, 7, 9, &done, 64, 75, 256,
             make_decision(CachePolicy::Off, 0, 0),
             &Arc::new(Mutex::new(crate::stats::ThumbStats::default())), None, true, 1, 1,

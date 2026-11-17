@@ -25,6 +25,11 @@ MCP・検索は後続。
 
 ## 一覧の永続サムネイルと保存先の所有（§1.668、§1.741）
 
+§1.800 S1 では通常一覧の `cache_map` は全行の写しでなく、保存・seed した行の控え。
+Fixed の未ヒットは worker が DB を引き、DB hit を控えに登録しない。合成一覧の準備済みの写しと
+ドライブ一覧は維持する。PDF/ZIP の親との対応は context 所有の Box を pool 要求へ渡し、
+保存後の worker が stamp を照合して親へ写す（[詳細](book-close-lag-800-plan.md#4s-案-s1-の設計-採用r9-の指摘を受けて-r10-で改訂2026-11-17)）。
+
 `thumb_loader/catalog_provider.rs` の `ThumbnailCatalogProvider` はpoolの固定catalogと
 `LazyCatalogs` を所有する。共通受付で `RequestCatalog` (Fixed / Parent / CollectionSourceParent)
 と `CatalogWork` のadmissionを一つに決め、workerが個別lookup/saveする。

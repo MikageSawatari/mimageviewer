@@ -12,6 +12,21 @@ facet の手動復元は有効な帰路 frame 一件だけを消費し、新し�
 階層消失と wrapper collapse が重なる場合、実際の祖先 scope に保存した条件を復元し、
 route の位置番号によって外側の条件まで復元しない。
 
+## 一覧の先頭ページと親 catalog（§1.800 S1）
+
+通常一覧の控えは空で始まり、worker が保存した行と UI が seed した行を持つ。
+仮想先頭ページの seed は pool 起動前に従来どおり行い、仮想 catalog の鍵の存在を
+直接照合する。`cache_book_cover_only` 有効時は seed せず、EPUB は親 seed/writeback の対象外。
+
+親との対応は開いた時点の source・先頭ページの鍵／idx・items 世代・親 catalog／鍵・
+親ファイル stamp を保持する。可視／先読み／navigation／seek／overview／hover／idle upgrade の
+pool 要求だけへ共通処理で付加し、source・鍵・世代・idx の全一致を要求する。
+生成 worker は保存後（保存省略時は既存行）、Finalized 前に、要求 stamp の仮想行を
+親へ写す。親の stat が開いた時点から変わっていれば写さない。cache hit は写さず、
+再生成ごとに写すため親の画質が更新され得る。UI の一回限りの finalize 書き込みは廃止する。
+一時的な context swap では対応を保持し、一覧の置き換えで破棄する。
+詳しい条件・意図した差分は [案 S1 §4S.1-6](book-close-lag-800-plan.md) を参照。
+
 ## 外部openとviewer採用の所有（§1.767、依頼50 B）
 
 起動・別プロセスから受けた新規openは、typed startup ownerで `MainNew` を確定し、既存navigation／

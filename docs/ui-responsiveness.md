@@ -1,5 +1,19 @@
 # UI スレッドの応答性 (Ctrl+↑↓ 連打が引っかからないために)
 
+## 本を閉じるときの catalog 全行読み込みの撤去（§1.800 S1）
+
+通常一覧の `resume_loading_items_after_sidecar` は空の控えを作り、画像 BLOB の
+`load_all` を UI で行わない。DB 未ヒットの読みはサムネイル worker が鍵1件で行う。
+`sli_catalog_prepare` は控えの用意だけを計測し、`entries` も控えの件数を表す。
+合成一覧の準備済みの写しと、少数行のドライブ一覧は変更しない。
+
+既存 seed を worker へ移す案は、ピン更新・pool 再作成・正本の更新との順序を複雑にするため採らない。
+seed は従来の位置・順序を維持し、照合用に仮想先頭ページ1件と動画ピン対象ごとの DB 読みを加える。
+`sli_virtual_seed` / `sli_video_pin_seed` は時間と追加読み件数 `reads` を記録する。
+この既存同期ループ自体の worker 化は別課題。catalog が空でピンが多い場合も含めて
+全行読み込み＋seed の合計を比較する。UI の writeback は撤去し、worker の
+`virtual_writeback` に `ms` と `copied` を出す。
+
 ## 本棚順の即時表示と保存（§1.683）
 
 上下操作はメモリのrowsだけを交換する。順序ファイルのbounded read、JSON検証、フォルダ/ページ数列挙、内容digestと集合の再照合、temp保存・flush/sync・atomic replaceは製本workerで行う。UIは単一receiverを非blockingでpollし、最新の完全表示を次の一件へ集約する。idleの周期I/O・周期repaintは増やさない。管理行は可視行だけ描画し、本identityでwidgetを維持する。[所有・失敗契約](book-order-plan.md)。

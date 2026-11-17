@@ -543,6 +543,7 @@ fn decode_remote_source(
             request.books_root.as_deref(),
         );
         crate::thumb_loader::load_one_cached(
+            None,
             &request.path,
             request.zip_entry.as_deref(),
             Some(bytes),

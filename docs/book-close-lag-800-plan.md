@@ -1,6 +1,6 @@
 # §1.800 本を Enter で開き Esc で一覧へ戻るときのもたつき — 調査と設計
 
-- 状態: 調査・設計 (2026-11-17)。実装前。設計の独立レビュー r1〜r3 = REVISE を反映済み (§8)。§3.5 の比較で案 S1 (一括で読まない) へ切り替えた。S1 の設計は §4S。r5 = REVISE (S1 の方向は支持、P2 4 件)、統括の判断待ち。
+- 状態: S1 実装・性能受け入れ条件未達 (2026-11-17)。正本は独立設計レビュー r10 ACCEPT の §4S。§4 の旧案は実装していない。§9.3 の厳密判定で条件(2)(3)が未達となったため、製品コードの追加変更を止め、設計へ返す。自動縦横比の変更 (§4S.1-7) は利用者承認待ちの独立差分。
 - ブランチ: `perf-800-book-close` (worktree `G:\home\mimageviewer-perf-800`)。
 - 目標版: v5.3.0。
 
@@ -690,4 +690,84 @@ seed のループを worker へ移すことは S1 の前からある課題とし
 - P3-1: 「全ての場合に UI の I/O が減る」は言い過ぎ (catalog が空で動画ピンが多い一覧では照合の分だけ増え得る) → 表現を改め、
   動画ピンが多い一覧の比較を受け入れ条件に足した。P3-2: §3.5 と控えの定義に撤回した案の記述が残る → 直した。
 - 4S.1-7 の挙動変更を利用者が受け入れれば、実装へ進めてよい。
+
+## 9. S1 の実装と検証 (2026-11-17)
+
+### 9.1 実装と設計の対応
+
+- 4S.1-1/2: 通常一覧の控えを空で作る。合成一覧の準備済みの写しとドライブ一覧は維持。
+- 4S.1-3/4: Fixed の非退役 DB の鍵 lookup を許可し、DB hit は控えへ登録しない。ピンだけの前方一致も DB を読む。
+  `uses_lazy_catalog`、Parent の観測・登録、`initial_catalog`、retired CacheOnly、Legacy、SourceOnly、EPUB の鍵解決は維持。
+- 4S.1-5 / 4S.2: UI seed の位置・順序・比較項目は維持し、3か所の照合とピン更新の削除 inventory を DB に移した。
+  存在の読みは画像行だけを数え、寸法だけの記録を seed 済みとはみなさない。
+- 4S.1-6: `VirtualFolderParent` を App/context の Box と要求に保持する。共通の pool 付加で source・鍵・世代・idx を照合し、
+  worker が保存後・Finalized 前に要求 stamp の行を親へ写す。開いた時点の親 stamp と stat が違えば写さない。
+  RAW 現像継続も明示的に対応を運ぶ。同世代と swap では保持し、App と退避 bundle の世代変更時に破棄する。
+- 4S.1-7: 世代リセット・記録復元と控えの見本探索を分離し、通常一覧は前者だけを呼ぶ。
+  利用者承認待ちのため、技術文書・公開文書・4件の headless テストを含めて独立差分に分けた。
+- 4S.7: `fixed` lookup、控えの用意、seed の時間・追加読み数、worker writeback の時間・結果を計装。
+  analyzer は新旧の `sli_catalog_prepare` / `sli_catalog_load_all` を別集計し、過去ログとの比較を維持。
+
+永続 schema・鍵の体系・保存内容は変更していない。独立実装レビュー (Sol / xhigh) は本体・自動縦横比とも ACCEPT。
+RAW 継続の対応落ち、世代変更時の破棄、テストの待機と fixture の指摘は反映済み。
+
+### 9.2 検証と差分の受け渡し
+
+重いコマンドはすべて利用者指定の `run-heavy.ps1 -Owner "800-codex"` 経由。
+ロック/TEMP 領域への書込み拒否時はラッパーの低優先度・6並列 fallback で継続した。
+新しい native graph の TurboJPEG が並列 MSBuild で失敗したため、Cargo build jobs を1にして準備した
+(`nextest` の build は `--build-jobs 1`。`-j` は test threads の指定なので区別する)。
+
+- core / bench の `cargo check --features dev-tools`: 成功 (`target/check-800-tools.log`)。
+- 関連235件: 233成功・2 fixture 失敗。DB に無い前方一致プレビューを控えだけへ置く旧 fixture と、
+  要求の設定を伴わない直書きの自動切り抜き鍵を修正した。対象と追加の順序テスト等12件は全成功 (`target/tests-800-corrections.log`)。
+- 色フィルタ21件: 全成功。疎な控えの DB hit と SourceOnly の元画像の両方を明示 (`target/tests-800-color.log`)。
+- worker の最終7件: 全成功。SourceOnly の保存、再生成ごとの親更新、保存省略時の一致／不一致／不在、
+  cache hit で写さないことと Finalized 前の保存順序を確認 (`target/tests-800-writeback-final.log`)。
+- Python: analyzer 106件と追加5件が成功。UI glyph 検査0件、site cards 53件・上限超過0件。
+- 全件の正規コマンドは `run-heavy.ps1 -FullTest -Command ".\scripts\test-lib-full.ps1"`。
+  1回実行し、18,488件中18,476成功・12失敗・81除外、1177.947秒、exit 100。
+  失敗10件は旧fixture (通常Ratingの初期24見本と、DBを渡さないdrive-listの前方一致) なので、
+  既存の比率・位置・画素のassertを維持してS1の経路へ移行した。残る2件は名前付きpipeの
+  `PermissionDenied` (OS code 5)。全件の成功台帳は無く、全件成功とは扱わない。
+  stdout は `target/tests-800-full.log`、JUnit・詳細は
+  `target/test-lib-full/runs/20261116T233502231Z-65dda7d6/`。
+  fixture移行後の限定再確認は関連26件すべて成功 (7.190秒、exit 0)。
+  `target/tests-800-full-fixture-corrections.log` に分け、全件成功の代わりにはしない。
+
+元の HEAD に `ui_main` の並べ替えテストの型不整合 (`Option<Box<BookReorderState>>` に非Box値を代入) があった。
+検証を通すため、そのテストの `Box::new` 1か所だけを S1 と別差分で修正した。製品の並べ替え処理は変えていない。
+
+Git 管理領域 `C:/home/mimageviewer/.git/worktrees/mimageviewer-perf-800` は sandbox から書けず、
+`git add -- <明示パス>` が `index.lock: Permission denied` で拒否された。コミット・push は行えていない。
+代わりに `target/s1-main.patch`、`target/s1-auto-aspect.patch`、`target/s1-prerequisite-test.patch` に分け、
+元の HEAD のファイルへ3本を適用すると作業差分全体と一致することを確認した。
+自動縦横比のパッチだけを差し替えられる。実アプリの起動・操作は行っていない。
+
+### 9.3 非対話ベンチの比較条件
+
+`bench_scroll --synthetic-suite <新規ディレクトリ> --threads 4 --repetitions 3` は、1万行の実 catalog と
+通常 PNG の実 worker を使う。最適化した `dev-runtime` (opt-level 2、LTO off) で、1/4 worker、
+全行・空・90% stamp 不一致・50%欠落、新しい SQLite 接続と可視鍵を温めた接続を比較する。
+OS の cold cache・実アプリ全体のフレーム間隔は、この測定で確認したことにはしない。
+
+合成 `memory` は旧 Fixed を再現し、控えが無い／stamp が違う要求は SourceOnly として DB lookup を省く。
+`db` は S1 の空の控え、`source` は常に SourceOnly。動画ピン200件は背景0/1万行と、空・一致済み・部分欠落を比較する。
+判定ツールの既定は許容差ゼロ。明示的な設計判断なしに判定の tolerance を緩めない。
+測定値は `target/catalog-s1-run1/results.jsonl`、3条件の判定は同ディレクトリの `summary.json` を参照。
+
+217行 (protocol 1 + catalog 144 + seed 72) を完走し、要求の hit 数・旧 Fixed の miss 数・控えを増やさないことの
+assertion はすべて成功。判定ツールの `evidence_errors=[]`、結果は次のとおり (各3回の中央値)。
+
+| 条件 | 観測 | 判定 |
+| --- | --- | --- |
+| (1) 1万行の準備区間が短い | catalog の open＋控えの用意が旧184.4〜211.9 ms → S1 0.96〜1.15 ms。全行 DB の初期可視も旧195.7〜255.1 ms → S1 12.95〜45.31 ms | 非対話の catalog 区間では達成。実 UI 全体のフレーム間隔は未確認 |
+| (2) 初期可視が遅くならない | 全行／stamp 不一致多数／部分欠落では短縮。空 DB の3条件で +0.185〜0.472 ms、最大は4 worker・新規接続の5.918 → 6.390 ms | 許容差ゼロの判定では未達 |
+| (3) 200動画ピンの開始区間が長くならない | 背景1万行では175〜203 ms短縮。背景0・一部欠落では新規接続27.206 → 29.216 ms (+2.010)、温まった接続27.476 → 30.538 ms (+3.061)。一致済みでも +0.491／1.187 ms | 未達 |
+
+条件(2)の「同程度」に含める許容幅は合意されていないため、測定後に tolerance を緩めて成功とはしない。
+条件(3)は全行を読む費用が小さい一覧で、seed の追加読みの費用が残ることを示す。
+§4S.7 に従って追加の製品実装・最適化を止めた。S1 の採用完了とはせず、結果を設計担当へ返す。
+現在の具体的な差分について非対話の全件ゲートを終えたが、上記のとおり非ゼロである。
+全件ゲート未成立のため、検証用の `build-dev.ps1` は前提を満たさず未実行。アプリは起動していない。
 
