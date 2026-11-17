@@ -1458,6 +1458,18 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-18: sidecar復元Modalの共通表示猶予とroot限定の計装
+
+設計担当ClaudeCodeの方針とCodexの前提確認に基づき、共通helperの表示猶予定数
+`SIDECAR_RESTORE_MODAL_GRACE`を100 msから500 msへ変更した範囲を記録する。
+通常の待ちが約350 ms、読込直後のフレームが50〜140 msとなる利用者ログに対し、
+全viewport共通の表示方針の値を調整したもので、detached固有のguard／delayではない。
+detached子viewportから共通helper経由で描くModalの表示時期にも同じ値が効く。
+計装はroot viewportの描画だけを数え、子viewportの直接描画・共通helper経由は対象外とする。
+detachedのコード・述語・viewport経路は変更しない。新しい待機状態や回復処理も加えない。
+症状に応じたdetachedの条件追加ではなく、共通表示方針の調整と計装対象の明確化である。
+詳細は[sidecar非同期復元計画](sidecar-import-async-plan.md)のModal表示猶予・計装の記述を参照。
+
 ### 2026-11-17: §1.800 S1 の仮想フォルダと親との対応
 
 設計担当の §4S（独立設計レビュー r10 ACCEPT）と実装の独立レビューで、UI の一回限りの
