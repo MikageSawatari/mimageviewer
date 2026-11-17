@@ -15,6 +15,13 @@
 
 ## 含める経路
 
+§1.776 B-A の `gpu_lanczos::gpu_tests::still_nis_dxbc_matches_wgsl_pixels` と
+`still_anime4k_vl_dxbc_matches_wgsl_pixels` は `gpu_tests` prefix で自動所属する（Windows 限定、ignore なし）。
+DX12 adapter / device / PASSTHROUGH_SHADERS の欠落は panic で gate を失敗させ、黙って skip しない。
+同じ adapter から feature なし/あり device を作り、製品 WGSL/DXBC の prepare・encode・readback を比較する。
+wgpu 更新時の register 配置と passthrough 契約の変化を検出する目的で常設する。
+Linux の WGSL 検査とは分け、Windows の GPU gate で必ず実行する。
+
 名前ではなく、生成点から helper と呼び出すテストを追った。モデル・adapter・環境変数などの
 条件が成立すると生成へ到達するテストも含む。既存 ignored テストは通常の全件では実行しない。
 

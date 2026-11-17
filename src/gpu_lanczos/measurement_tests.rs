@@ -142,6 +142,7 @@ fn headless_gpu() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::
     crate::test_gpu_group::assert_gpu_test_group();
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::DX12;
+    descriptor.flags = wgpu::InstanceFlags::from_build_config().with_env();
     descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
     let instance = wgpu::Instance::new(descriptor);
     let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -169,6 +170,7 @@ fn headless_gpu() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::
     }));
     match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("measure_776 DX12 FXC"),
+        required_features: crate::gpu_still_shaders::request_passthrough(adapter.features()),
         ..Default::default()
     })) {
         Ok((device, queue)) => Some((instance, adapter, device, queue)),

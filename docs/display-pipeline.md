@@ -2330,7 +2330,50 @@ Anime4K / pixel-AA は event 名を共用し、`scale_branch`
 
 同じ作成フラグ・区間時間・内訳を既存の `fs/final_prepare_native_submitted` にも出す。prewarm が初回作成を済ませた後に通常経路が cache hit しても、作成時の計測を失わない。既存の合計時間や prewarm の metadata は維持する。
 
-§1.776 案 A は、layout 2 個だけを `Lanczos3Resampler::new` に残し、縮小・可視範囲拡大・NIS・ピクセルアートの独立した `OnceCell` を各 prepare の初回に完成させる。shader、entry point、format、uniform、texture、cache key は変更しない。初期化は従来と同じ UI スレッド上の prepare 呼出し中で、非同期化・新しい prewarm・worker 移動（案 B）は採らない。待機や supersession を管理する新しい状態も不要である。Anime4K は従来のまま。
+§1.776 案 A は、layout 2 個だけを `Lanczos3Resampler::new` に残し、縮小・可視範囲拡大・NIS・ピクセルアートの独立した `OnceCell` を各 prepare の初回に完成させる。format、uniform、texture、cache key は変更しない。初期化は従来と同じ UI スレッド上の prepare 呼出し中で行う。
+
+§1.776 案 B-A は、静止画 NIS と固定 Anime4K VL の shader だけをビルド時 DXBC にする。
+`build/still_image_shaders.rs` は動画の naga 27 とは独立した naga 30.0.1 で同じ WGSL を変換し、
+FXC SM5.1 で VS 2 本・PS 19 本を DEBUG 有無の 2 組生成する。
+`gpu_still_shaders::ResamplerShaders::new` の 1 か所で、DX12 かつ device が
+`PASSTHROUGH_SHADERS` を持つ場合にだけ埋め込み bytecode を passthrough API の `dxil` 欄へ渡す。
+root の device descriptor は adapter が公開するこの feature だけを追加要求し、既存の feature / limits と
+test-script の失敗注入 wrapper を保持する。この feature は明示 passthrough API の使用許可であり、
+通常の WGSL module の検証・コンパイルは変えない。他 backend / feature なし / 他 Anime4K variant は WGSL のまま。
+作成失敗時は従来と同じ wgpu のエラー処理へ進み、WGSL での作り直しや retry は行わない。
+
+生成条件は wgpu-hal 30.0.1 `dx12/device.rs` の固定 layout の register 配置と
+`load_shader`、`shader_compilation.rs::compile_fxc` に合わせる。
+NIS は `t0/b0`、VL は `t0..t13/b0`、first-vertex 等の特殊定数は両方 `b1`（すべて space0）。
+sampler/dynamic offset/immediate は使わない。bounds check、loop bounding、zero init、
+sampler heap target、task dispatch limit も HAL と同じ Options を明示する。
+VS の fragment linkage は元 IR から作り、entry ごとに空 constants の `process_overrides` を通し、
+reflection の HLSL entry 名を FXC と passthrough に使う。FXC は ENABLE_STRICTNESS (`/Ges`)、既定 O1。
+全 FS の linkage に対して VS の生成 HLSL と entry が等しいことをビルド時に検査し、共有 VS の前提変更を拒否する。
+DEBUG 版は DEBUG / SKIP_OPTIMIZATION (`/Zi /Od`) を追加し、root と同じ
+`InstanceFlags::from_build_config().with_env()` で選ぶ。動画の `/O3` は流用しない。
+
+既存の枝ごとの作成・context 所有・prepare/encode・計装は維持する。新しい prewarm / worker 作成（案 B の別案）は
+今回採らず、初回 prepare で同期作成する。作成中・取消・supersession の状態を増やす必要がない。
+DXBC 化後にもドライバの PSO 作成は残り、初回停止がなくなるという意味ではない。
+
+**wgpu 更新時の確認**: `naga_wgpu` の固定版を実行時 naga / wgpu-hal とそろえ、
+register / special constants / HLSL Options / entry linkage / FXC flags と、
+`dxil` 欄の bytes を D3D12 にそのまま渡す実装を再確認する。この DXBC 使用は HAL 実装への依存で、
+公開 API が DXBC 対応を保証するものではない。passthrough は shader interface / binding の通常検証を省くため、
+固定 layout とビルド入力を一緒に維持する。
+`gpu_still_shaders::tests::still_bytecode_contract_tracks_locked_hal_and_naga` は lock の
+wgpu / wgpu-core / wgpu-hal と実行時 naga 依存、build 用 naga の固定版を検査し、更新時に契約の再確認を要求する。
+`gpu_lanczos::gpu_tests::still_{nis,anime4k_vl}_dxbc_matches_wgsl_pixels` は Windows DX12 の常設テスト（ignore なし、gpu group）。
+斜線・細部・透明境界を持つ同じ入力を feature なし/あり device の製品 prepare/encode で描き、整数倍・非整数倍・
+小数 ROI の最終 RGBA8 を完全一致で検査する。GPU/feature 不在は成功扱いにせず失敗する。
+更新時は DEBUG ありの通常 test と DEBUG なしの dev-runtime で実行し、生成 HLSL の HAL 実出力との照合も行う。
+中間 RGBA16Float 値や他 GPU の互換性まで証明する試験ではない。
+
+製品経路の headless 計測（2026-11-18、実装担当 Codex、RTX 4090 / DX12+FXC / dev-runtime、各3回中央値）は
+NIS 初回127.709ms、Anime4K VL 初回663.719ms。最終ソースのDEBUG有無の計12比較は全画素一致。
+実行条件・生成物照合・検証コマンドは [B-A実装記録](section776ba-implementation.md) を参照する。
+製品releaseの表示フレーム時間は未計測である。
 
 Lanczos3 / Anime4K の resampler は cache 内の `Option<Box<...>>` で所有し、作成内訳や枝の保持領域を App にインラインで積まない。Box は各 resampler の初回作成区間内で一度だけ確保し、再利用フレームでは確保しない。
 

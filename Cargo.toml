@@ -531,6 +531,8 @@ egui_kittest = { version = "0.37.0", features = ["snapshot", "wgpu"] }
 [build-dependencies]
 winresource = "0.1"
 naga = { version = "27", features = ["wgsl-in", "hlsl-out"] }
+# Static-image DX12 bytecode must use the same naga as wgpu-hal (video stays on 27).
+naga_wgpu = { package = "naga", version = "=30.0.1", features = ["wgsl-in", "hlsl-out"] }
 
 # 行番号付きバックトレース (panic / cdb のスタック) を保ちつつ、型情報を含む巨大な PDB と
 # rlib を避ける。test profile は dev を継承するので、ここだけに書く。dev と test で設定が

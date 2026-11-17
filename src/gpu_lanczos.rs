@@ -3547,16 +3547,16 @@ impl Lanczos3Resampler {
     ) -> &wgpu::RenderPipeline {
         get_or_create_pipeline(&self.nis, timings, LanczosPipelineBranch::Nis, |steps| {
             let shader = measure_creation_step(&mut steps.nis_shader_module_ms, || {
-                device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: None,
-                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(NIS_UPSCALE_SHADER)),
-                })
+                crate::gpu_still_shaders::ResamplerShaders::new(
+                    device,
+                    NIS_UPSCALE_SHADER,
+                    Some(crate::gpu_still_shaders::Family::Nis),
+                )
             });
             measure_creation_step(&mut steps.nis_upscale_pipeline_ms, || {
-                create_pipeline(
+                shader.create_pipeline(
                     device,
                     &self.pipeline_layout,
-                    &shader,
                     "fs_nis",
                     wgpu::TextureFormat::Rgba8Unorm,
                 )
@@ -4071,6 +4071,10 @@ mod prewarm_tests;
 #[cfg(test)]
 #[path = "gpu_lanczos/measurement_tests.rs"]
 mod measurement_tests;
+
+#[cfg(all(test, windows))]
+#[path = "gpu_lanczos/dxbc_gpu_tests.rs"]
+mod gpu_tests;
 
 #[cfg(test)]
 mod tests {

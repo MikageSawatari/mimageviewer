@@ -4169,6 +4169,7 @@ dependencies = [
  "music-core",
  "musicvideo-core",
  "naga 27.0.3",
+ "naga 30.0.1",
  "ndarray",
  "notify",
  "opener",

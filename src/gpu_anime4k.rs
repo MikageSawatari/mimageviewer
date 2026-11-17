@@ -1,7 +1,5 @@
 //! Anime-style visible-region GPU upscaling generated from Anime4K x2 variants.
 
-use std::borrow::Cow;
-
 use crate::gpu_lanczos::measure_resampler_cpu_ms;
 
 use wgpu::util::DeviceExt as _;
@@ -236,20 +234,21 @@ impl Anime4kResampler {
             })
         });
         let shader = measure_resampler_cpu_ms(&mut creation_timings.shader_module_ms, || {
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(variant_data.label),
-                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(variant_data.shader)),
-            })
+            crate::gpu_still_shaders::ResamplerShaders::new(
+                device,
+                variant_data.shader,
+                (variant == Anime4kVariant::VeryLarge)
+                    .then_some(crate::gpu_still_shaders::Family::Anime4kVl),
+            )
         });
         let convolution_pipelines = (0..variant_data.intermediate_count())
             .map(|index| {
                 measure_resampler_cpu_ms(
                     &mut creation_timings.convolution_pipelines_ms[index],
                     || {
-                        create_pipeline(
+                        shader.create_pipeline(
                             device,
                             &layout,
-                            &shader,
                             &format!("fs_anime4k_{index}"),
                             wgpu::TextureFormat::Rgba16Float,
                         )
@@ -259,10 +258,9 @@ impl Anime4kResampler {
             .collect();
         let resolve_pipeline =
             measure_resampler_cpu_ms(&mut creation_timings.resolve_pipeline_ms, || {
-                create_pipeline(
+                shader.create_pipeline(
                     device,
                     &layout,
-                    &shader,
                     "fs_anime4k_resolve",
                     wgpu::TextureFormat::Rgba8Unorm,
                 )
@@ -530,40 +528,6 @@ fn create_bind_group(
         label: Some("anime4k pass inputs"),
         layout,
         entries: &entries,
-    })
-}
-
-fn create_pipeline(
-    device: &wgpu::Device,
-    layout: &wgpu::PipelineLayout,
-    shader: &wgpu::ShaderModule,
-    fragment_entry: &str,
-    format: wgpu::TextureFormat,
-) -> wgpu::RenderPipeline {
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(fragment_entry),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_main"),
-            compilation_options: Default::default(),
-            buffers: &[],
-        },
-        primitive: Default::default(),
-        depth_stencil: None,
-        multisample: Default::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some(fragment_entry),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: None,
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        multiview_mask: None,
-        cache: None,
     })
 }
 

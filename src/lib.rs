@@ -187,6 +187,7 @@ pub mod file_type_visibility;
 mod fullscreen_specified_scale;
 mod gpu_anime4k;
 mod gpu_lanczos;
+mod gpu_still_shaders;
 mod material_display_basis;
 pub mod metadata_transfer;
 mod page_turn_animation;
@@ -1817,6 +1818,12 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     }));
     if let egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
         configure_root_gpu_descriptor(&mut create_new.instance_descriptor, gpu_request);
+        let descriptor = Arc::clone(&create_new.device_descriptor);
+        create_new.device_descriptor = Arc::new(move |adapter| {
+            let mut desc = descriptor(adapter);
+            desc.required_features |= gpu_still_shaders::request_passthrough(adapter.features());
+            desc
+        });
         create_new.native_adapter_candidates = Some(Arc::new(move |adapters, surface| {
             let candidates = gpu_request.native_adapter_candidates(adapters, surface);
             gpu_startup_diagnostics::candidates(
