@@ -1,6 +1,6 @@
 # 3D 写真のままスライドショー (次のページの奥行きの先読み) — 設計書 (§1.771)
 
-状態: **設計第 7 版 (2026-11-18)。第 5 版が独立設計レビューで ACCEPT。利用者の決定 (§10) を反映した差分を確認中 (第 6 回 REVISE を反映)。利用者の判断待ちの項目あり (§10)**。
+状態: **設計第 8 版 (2026-11-18)。第 5 版が独立設計レビューで ACCEPT。利用者の決定 (§10) を反映した差分を確認中 (第 6・7 回 REVISE を反映)。利用者の判断待ちの項目あり (§10)**。
 worktree `G:\home\mimageviewer-771`、ブランチ `feat-771-depth-slideshow` (master `96ed160a0` から)。
 3D 写真の全体設計は [depth-parallax-plan.md](depth-parallax-plan.md) が正本。本書はその §1「v1 に含めない: 先読み」、
 §6.3「ON にするときの後始末: スライドショー停止」、§6.5 と §10 段 B の全箇所分類表 (topbar・リング・S キーの抑止) を
@@ -203,11 +203,12 @@ fn depth_page_progress(&self, ctx, idx, role: DepthPageRole /* Current | Next */
 | 段 | 状態 | 分類 | 終わりの保証 |
 | --- | --- | --- | --- |
 | 1 | 今のページ: §5.7 の事実がある (`Presented` / `Failed`)。送り先: 素材の key が LRU にある | `Ready` | — |
-| 2 | 深度の仕事が動いている (今のページ: `source` が `ReadingBack` / `Estimating`。送り先: 枠がその key で `ReadingBack` / `Estimating`) | `Producing` | 読み戻しは map の成功 / 失敗、推論は結果 / 失敗 / 取消で終わる (既存) |
+| 2 | 深度の仕事が動いている (今のページ: `source` が `ReadingBack` / `Estimating`。送り先: 枠がその key で `ReadingBack` / `Estimating`)。`Estimating` はその要求の cancel token が立っていないこと | `Producing` | 読み戻しは map の成功 / 失敗、推論は結果 / 失敗 / 取消で終わる (既存)。取り消された要求は `try_result` が `None` を返し続けるので数えない |
 | 3 | 送り先の枠がその key で `Failed` | `Unavailable` | — |
 | 4 | 素材が resident だが renderer の backing がまだ無い | `Producing` | managed texture はそのフレームの末尾で登録される (既存の `TexturePending` と同じ) |
-| 5 | 元画像の読み込み (`fs_page_load_state(idx)`) が `LoadPending` / `UploadPending` | `Producing` | 既存の読み込みは成功か `LoadFailed` で終わる |
+| 5 | 元画像の読み込みが、対象ページ・今の世代の実際の要求として発行済みで未取消 (`fs_page_load_state(idx)` の `LoadPending` / `UploadPending` のうち、RAW の `PreviewAbsent` で現像が始まっていない場合などの投影を除く) | `Producing` | 既存の読み込みは成功か `LoadFailed` で終わる |
 | 6 | 元画像は読み込み済みで、final 系の仕事 (`final_effect_pending` の今の key の項目) が `Computing` | `Producing` | worker の job は結果 / 失敗 / 取消で終わる |
+| 6b | 素材を作る、D3 の外の既存の独立した worker が、今の条件 (同じ下地・世代・key) で動いている: 注釈のベイク (`comic_bake_pending`、`app.rs:92066`)、局所補正・隠蔽・消しゴムの段の producer (`current_edit_stage_producer_pending`、`app.rs:88368` 付近) 等 | `Producing` | 各 worker は結果 / 失敗 / 取消で終わる (既存)。読み取りだけで、深度の `source` は変えない (第 7 回レビュー P2) |
 | 7 | 同じく `CpuReady` / `Registering` で、残りの登録が、登録の受付と**同じ純粋な予算判定**で受け付けられる | `Producing` | ROOT の共通の登録枠で 1 フレーム 1 枚ずつ終わる |
 | 8 | 同じく `CpuReady` / `Registering` で、予算判定が受け付けない | `Unavailable` | 着地すれば表示の要求が既存の手順で引き取る (`take_prepared_final_for_display`) |
 | 9 | final AI の仕事が今の key で動いている (既存の AI の pending) | `Producing` | AI worker の結果 / 失敗 / 取消で pending が除かれる (第 6 回レビューで確認) |
@@ -216,8 +217,10 @@ fn depth_page_progress(&self, ctx, idx, role: DepthPageRole /* Current | Next */
 - 段 7・8 の予算判定は、登録を受け付ける既存の判定 (`final_prepare_budget.rs` の GPU admission) と同じ純粋な関数を、副作用なしで呼ぶ。
   診断用の記録 (`FinalPrepareGpuDeferred`、perf 無効では記録されない) を状態として使わない (第 6 回レビュー P1-1)。
   純粋な判定を切り出せない場合は、`CpuReady` / `Registering` を `Unavailable` に倒し、設計担当へ報告する。
-- 実装担当は着手時に、段 2〜9 の各状態の読み方 (関数・フィールド) をコードで特定し、各 `Producing` の段について「その仕事が必ず
-  終端へ進み、終端したらこの関数が `Ready` か `Unavailable` を返すこと」をテストで固定する。
+- 実装担当は着手時に、段 2〜9 (6b を含む) の各状態の読み方 (関数・フィールド) をコードで特定し、各 `Producing` の段について「その仕事が必ず
+  終端へ進み、終端したらこの関数が `Ready` か `Unavailable` を返すこと」をテストで固定する。各 `Producing` の段は「対象ページ・今の世代の
+  実際の要求が存在し、取り消されていない」ことを条件に含める (状態名だけで判定しない)。段 6b は、今のページの素材の選択
+  (`resolve_fs_processed_payload_and_depth` の `NotYet` の理由) を作っている worker を漏れなく列挙する。
 - **今のページ (`role = Current`)**: 間隔の開始 (§5.7.1) と照合の最初の段で使う。`Unavailable` (読み込みの終端失敗、素材の生産者が
   無い、元画像の保持だけ 等) は終端として扱い、間隔を数え始め、期限で送る (第 6 回レビュー P2-3)。D3 と先読みの開始は
   §5.7 の事実 (`Ready`) だけを証拠にし、`Unavailable` では始めない (提示の証拠を緩めない)。そのとき送り先は段 10 で `Unavailable` になり、待たずに送る。
@@ -519,6 +522,16 @@ RAW の入力世代を含むこと (`app.rs:87458`・`88074`)、着地で anchor
 | P1-2 | 「D3 の対象」は「始められる」ではない (AI 待ち、CPU 予約の拒否) | §5.4.1 の原則: 始まっていない仕事は `Producing` に数えない |
 | P2-3 | 今のページが読み込みに失敗すると、段 0 が永久に `Producing` | §5.4.1: 今のページにも同じ分類を使い、`Unavailable` は終端として数え始めて送る。D3・先読みの開始の証拠は緩めない |
 | P2-4 | 紙めくり OFF では先読みの調整が動かず、保持範囲の中でも読み込みが出ない場合がある | §5.4.1: `NeedsLoad` は `Unavailable` (未発行の読み込みを待たない) |
+
+### 第 7 回 (2026-11-18、同じセッションの継続、read-only、差分だけ、基点 `7200b6b8f`)
+
+**REVISE** (P2 1 件、P3 1 件)。第 6 回の永久待ち (D3 の未開始・CPU 予約の拒否・`NeedsLoad`・登録の予算) は解消、通常時に永久に
+`Wait` する経路は他に無いと確認された。§10 の 3 のトーストの位置も適切。設計担当が採用して第 8 版に反映した。
+
+| 指摘 | 内容 | 反映 |
+| --- | --- | --- |
+| P2 | 今のページの注釈のベイク等、D3 の外の素材の worker を拾えず、3D を一度も見せずに送り得る | §5.4.1 段 6b |
+| P3 | 状態名だけでは「未取消の開始済みの仕事」を示せない (取消後の `Estimating`、RAW の `PreviewAbsent` の投影) | §5.4.1 段 2・5 と実装担当への指示 |
 
 ## 12. 実装記録
 
