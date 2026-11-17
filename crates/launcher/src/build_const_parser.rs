@@ -107,8 +107,14 @@ mod tests {
             Some(r"\\.\pipe\mImageViewerOpenPath_v1")
         );
 
+        // §1.789 A-1 moved the names into the swap code shared with the isolated
+        // test installer. The product installer must include it without overriding them.
+        let swap = include_str!("../../../installer/launcher_swap.iss");
+        assert!(swap.contains("#define ShutdownEventName \"Global\\mImageViewerShutdown_v1\""));
+        assert!(swap.contains("#define AppMutexName \"Global\\mImageViewerInstance_v1\""));
         let installer = include_str!("../../../installer/mimageviewer.iss");
-        assert!(installer.contains("ShutdownEventName = 'Global\\mImageViewerShutdown_v1';"));
-        assert!(installer.contains("AppMutexName = 'Global\\mImageViewerInstance_v1';"));
+        assert!(installer.contains("#include \"launcher_swap.iss\""));
+        assert!(!installer.contains("#define ShutdownEventName"));
+        assert!(!installer.contains("#define AppMutexName"));
     }
 }
