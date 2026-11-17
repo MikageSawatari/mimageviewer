@@ -262,9 +262,12 @@ fn depth_page_progress(&self, ctx, idx, role: DepthPageRole /* Current | Next */
    - Previous / Current の位置の準備は今までどおり紙めくり ON のときだけ。
 2. **開始の条件「今のユニットを提示した」** (`page_turn_current_unit_presented()`、`final_prepare.rs:447`): 紙めくりの提示状態
    (`PresentationState::Flat` の受理済みの証拠) を見る。3D の描画は submission を `LegacyRendered` にする (`ui_fullscreen.rs:45337`)
-   ので、3D 中はこの証拠が作られない見込み。`depth_slideshow_prefetch_active()` の間は、この条件を §5.7 の「今のページを 3D で
-   見せた / 失敗が確定した」事実に置き換える (同じ述語の中で選ぶ。別の開始経路を作らない)。
-   実装担当は着手前に、3D 中に紙めくりの提示状態が作られないことをコードとテストで確かめ、違えば設計担当へ返す。
+   ので、3D 中は新しい証拠が作られない。ただし 3D に入る前の同じページの受理済みの `Flat` は残り、照合は Depth の有無を見ないので、
+   3D に入ったページでは古い証拠で真になり得る (実装担当の前提調査、§12)。
+   **`depth_slideshow_prefetch_active()` の間は、この条件を §5.7 の「今のページを 3D で見せた」事実 (`depth_current_settled()` が真で
+   `Presented`) だけに置き換える**。紙めくりの提示状態は (古い証拠を含めて) 読まない。OR で併用しない。同じ述語の中で選び、
+   別の開始経路を作らない。紙めくりの提示状態の寿命は変えない (3D でないときの紙めくり・D3 の挙動を保つ)。
+   3D のスライドショー中でないとき (3D の手動閲覧を含む) は今の条件のまま。
 3. **着地後の同一性**: D3 が作った final が、送った後に `ensure_final_composite_texture_impl` の cached exact-complete
    (`app.rs:91333`) としてそのまま採用され、`resident_final_prepare_material` が返した TextureId と同じになることをテストで固定する。
    さらに、送った後の最初の描画で深度の callback が実際に出ることまで確かめる (§8)。
@@ -539,4 +542,81 @@ RAW の入力世代を含むこと (`app.rs:87458`・`88074`)、着地で anchor
 
 ## 12. 実装記録
 
-(実装後に、D3 の紙めくり設定の参照箇所の表 (§5.6 の 1) と検証結果を書く)
+### 着手前の前提調査 (2026-11-18、実装保留 → 設計担当が §5.6 の 2 を明確化して再開)
+
+**前提 1 がコードと食い違うため、指示どおり製品の実装を開始せず、設計担当へ返す。**
+新しい `DepthNextSlot` / `DepthSettled` / `SlideshowTimerPass` はまだ実装していない。
+下記の再現テストは未実行であり、実行時の結果としては扱わない。
+
+#### 前提 1: 新しい提示証拠を作らないことと、既存の証拠が偽になることは異なる
+
+- `try_paint_depth` が成功した描画は `FsDisplayUnitSubmission::LegacyRendered` を返し
+  (`ui_fullscreen.rs` の `draw_fs_image_with_receipt`)、新しい紙めくりの受理証拠を作らない。
+  この部分は §5.6.2 の見込みと一致する。
+- しかし、同じページを通常表示して受理済みの `PresentationState::Flat` がある場合、
+  `enter_depth_parallax` → `set_fs_exclusive_view` / `close_fs_exclusive_conflicts` は
+  `page_turn_presentation` を退役させない。
+- `page_turn_current_unit_presented` → `page_turn_presented_unit` は受理済みの `Flat` を返す。
+  さらに `page_turn_unit_matches_current` → `PageTurnUnitBinding::matches_current` は
+  ページ・context・一覧世代・layout・content の一致を調べるが、Depth の有無を調べない。
+  したがって、その一致を保ったまま 3D に入れば古い証拠で真になり得る。
+- 紙めくりの `PageTurnPresentation::cancel` も `Flat` はそのまま保持するため、
+  対象外の描画を通っただけでは証拠が無効になる保証はない。
+
+§5.6.2 の「3D 中は証拠が作られない」から「提示述語が偽」とする前提を修正する設計判断が必要。
+既存の証拠の寿命を変更するか等の代案は実装担当では選んでいない。
+
+**設計担当の判断 (2026-11-18)**: §5.6 の 2 は元から「3D のスライドショー中はこの条件を 3D の事実に置き換える」としており、
+古い証拠が真でも判定に使わないので、設計の結論は変わらない。前提の文言 (「3D 中はこの証拠が作られない見込み」を根拠にしていた部分) を
+直し、置き換えが排他的 (紙めくりの提示状態を読まない) であることを明記した。証拠の寿命は変えない。
+
+#### D3 の設定参照の調査表 (置換方針は本設計によるもの、変更は未実施)
+
+| 箇所 (調査基点の行) | 区分 | 設計上の置換 / 維持と理由 |
+| --- | --- | --- |
+| `ui_fullscreen.rs:21302` `prepare_final_demand_topologies` | 需要トポロジー | 置換。Depth スライドショーの Next もトポロジーを必要とする |
+| `ui_fullscreen.rs:21434` `observe_next_final_unit_demand` | 需要の perf 観測 | 置換。同じ Next の需要を観測する |
+| `final_prepare.rs:495` `d3_final_prepare_unit_at` | ユニットの決定 | Next は置換。Previous / Current の準備は紙めくり ON の条件を維持 (§5.6.1) |
+| `final_prepare.rs:516` `speculative_final_unit_is_needed` | 保持 / 取消 / 採用 | 置換。Next の所有を広げる。着地済みの同じユニットの保持もこの判定を通る |
+| `app.rs:90585` 付近 `adopt_final_prepare_results`、`prepared_edit.rs` `adopt_prepared_edit` | 採用前の取消 | 設定の直接参照はなく、上記の保持述語を読む。別の有効条件は足さない |
+| `final_prepare_budget.rs:526` `defer_legacy_final_prefetch_registration` | legacy の登録延期 / 予算 | 維持。紙めくり ON の legacy 登録方針そのもの。新しい D3 の Speculative origin は既存の予算 / 登録枠を通る |
+| `app.rs:83921` `page_turn_prefetch_policy_enabled` | source / AI の先読み範囲と保持 | 維持。§5.6.1 で変更しないと指定されている範囲 |
+| `ui_fullscreen.rs:21134` | 見開き端の配置 | 維持。紙めくりの演出そのもの |
+| `ui_fullscreen.rs` の紙めくりの受付・操作・演出、`app.rs:19907` の設定初期化 | 紙めくり本体 | 維持。D3 Next の有効条件ではない |
+
+`final_prepare*.rs` / `prepared_edit*.rs` の直接参照は上表の 495 / 516 / 526
+(および既存テストの設定代入) だった。開始点 `prefetch_next_final_unit` の
+`page_turn_current_unit_presented` は §5.6.2 の事実による切替対象であり、設定の直接参照ではない。
+Previous の開始点 `prefetch_previous_final_unit` の提示条件は広げない。
+
+#### その他の前提の到達点
+
+| 前提 | 調査結果 / 未確認 |
+| --- | --- |
+| 2: D3 の設定参照 | 上表の静的調査まで。置換・回帰テストは未実施 |
+| 3: 各 Producing の実要求・終端 | `DepthPending::try_result` は取消後に `None` を返し続けること、`FinalEffectState` の Computing / CpuReady / Registering、`validate_final_prepare_pending`、`current_edit_stage_producer_pending`、RAW PreviewAbsent の LoadPending 投影を確認。全 producer の列挙と終端テストは前提 1 で保留 |
+| 3: 段 7 / 8 の純粋な予算判定 | `speculative_vram_admitted` は既存の副作用なしの関数で、`admit_final_prepare_registration` が使っている。複数の未登録素材を持つ Registering の残り全体との同一性の切出し・テストは未実施 |
+| SlideshowTimerPass | `handle_fs_navigation_with_render_perf` の直接呼出しは所有描画後と汎用 wrapper の 2 か所。所有 viewport の値を描画 closure 内で捕捉する実装と、起床・最小化のテストは未実施 |
+| 4: 着地の TextureId と最初の深度 callback | 未確認。補正なし / 紙めくり OFF の D3 完成品についての着地テストは未追加 |
+
+#### 変更と検証
+
+- `src/app/depth_view.rs`: `#[cfg(all(test, windows))] mod gpu_tests` に
+  `depth_slideshow_premise_existing_flat_evidence_survives_depth_draw` を追加。
+  通常描画の受理 → 実際の Depth 入場 → 同じ表示素材の LRU を使用した深度 callback の送出後も
+  以前の提示述語が真かを調べる調査用テスト。`gpu_tests` の既存 filter に所属する。
+  ウィンドウや製品 exe、実モデルは起動しない。現挙動を記録するためのテストであり、
+  この挙動を今後の仕様として承認するものではない。
+- `docs/depth-slideshow-plan.md`: 本調査・保留理由を記録。製品動作・公開マニュアルは変更していない。
+- 焦点コマンド:
+  `cargo nextest run -p mimageviewer --lib -E 'test(/depth_slideshow_premise_existing_flat_evidence_survives_depth_draw/)'`。
+  全試行で指定の `run-heavy.ps1 -Owner "771-codex" -WorkDir G:\home\mimageviewer-771 -Command ...` を使用。
+  初回は完了出力を取得できず結果不採用。再取得した 01:43:20 の試行は `turbojpeg-sys v1.2.0` の
+  CMake / MSBuild が exit 1、Cargo / runner の報告 exit 101 (外側のコマンドツールは exit 1)。
+  `MSBUILDDISABLENODEREUSE=1` を指定した 01:43:56 の試行も同じ結果。
+  **テスト実行 0 件。成功証拠なし。** テスト用の Rust コードのコンパイルも未確認。
+- runner は共有ロックと G: の TEMP に書けない警告後、既定の BelowNormal / 6 build jobs /
+  既定 TEMP で実行。ビルド設定・依存ファイルは変更していない。
+- 本体 lib 全件、`build-dev.ps1`、製品起動、commit は実施しない。
+- 最後の Cargo 操作は同じ runner 経由の `cargo fmt` (引数なし)、exit 0。
+  `git diff --check` も exit 0。UI 文字列は変更していない。

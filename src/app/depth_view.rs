@@ -14,6 +14,108 @@ pub(crate) struct DepthEntryRequest {
     item_id: crate::item_identity::ItemId,
 }
 
+#[cfg(all(test, windows))]
+mod gpu_tests {
+    use super::*;
+
+    /// Investigation evidence for depth-slideshow-plan §5.6.2: a depth draw
+    /// creates no paper-turn receipt, but an earlier accepted Flat survives.
+    #[test]
+    fn depth_slideshow_premise_existing_flat_evidence_survives_depth_draw() {
+        use crate::depth_estimation::{DepthMap, DepthSourceKey};
+        use crate::ui_fullscreen::page_turn_submission_tests::{
+            draw_current_without_sources, frame, install_presentation,
+        };
+
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        crate::app::depth_view_tests::install_pages(&mut app, &ctx);
+        // Keep callback slots private while sharing the existing test device.
+        let mut render = app.wgpu_render_state.clone().unwrap();
+        render.renderer = Arc::new(egui::epaint::mutex::RwLock::new(egui_wgpu::Renderer::new(
+            &render.device,
+            render.target_format,
+            Default::default(),
+        )));
+        app.wgpu_render_state = Some(render.clone());
+        app.settings.page_turn_animation_enabled = true;
+        install_presentation(&ctx);
+        frame(&ctx, |ui, ctx| {
+            draw_current_without_sources(&mut app, ui, ctx);
+            // The headless frame helper discards deltas at the end of UI.
+            // Deliver the selected source's real backing before that boundary.
+            for (id, delta) in ctx.tex_manager().write().take_delta().set {
+                render
+                    .renderer
+                    .write()
+                    .update_texture(&render.device, &render.queue, id, &delta);
+            }
+        });
+        assert!(app.page_turn_current_unit_presented());
+        assert_eq!(app.depth_entry_allowed(0), Ok(()));
+
+        app.enter_depth_parallax(&ctx);
+        assert!(app.fs_exclusive_view.is_depth());
+        assert!(app.page_turn_current_unit_presented(), "entry retains Flat");
+        let material = app.resolve_fs_processed_material(&ctx, 0, false).unwrap();
+        let key = DepthSourceKey {
+            texture_id: material.source_texture().id(),
+        };
+        for (id, delta) in ctx.tex_manager().write().take_delta().set {
+            render
+                .renderer
+                .write()
+                .update_texture(&render.device, &render.queue, id, &delta);
+        }
+        let backing = render
+            .renderer
+            .read()
+            .texture(&key.texture_id)
+            .unwrap()
+            .texture
+            .clone()
+            .unwrap();
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        state.lru.insert(
+            key,
+            Arc::new(
+                crate::depth_parallax_wgpu::DepthTexture::upload(
+                    &render.device,
+                    &render.queue,
+                    DepthMap {
+                        key,
+                        width: 2,
+                        height: 3,
+                        values: vec![half::f16::from_f32(0.5); 6],
+                        median: 0.5,
+                    },
+                )
+                .unwrap(),
+            ),
+        );
+        state
+            .select_source(&render.device, &render.queue, &backing, key)
+            .unwrap();
+        let output = frame(&ctx, |ui, ctx| {
+            draw_current_without_sources(&mut app, ui, ctx);
+        });
+        assert!(
+            output
+                .shapes
+                .iter()
+                .any(|shape| matches!(shape.shape, egui::Shape::Callback(_))),
+            "the normal image draw must emit the depth callback"
+        );
+        assert!(app.fs_exclusive_view.is_depth());
+        assert!(
+            app.page_turn_current_unit_presented(),
+            "an actual depth draw still retains the earlier accepted Flat evidence"
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DepthWaitStatus {
     PreparingModel,
