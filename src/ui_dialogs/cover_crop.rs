@@ -533,7 +533,8 @@ fn prepare_cover_inner(
                 crate::image_decode::Source::Path(path),
                 None,
                 Some(cancel),
-            )?;
+            )
+            .map_err(|error| error.to_string())?;
             let image = analysis.image.clone();
             predecoded_auto_analysis = Some(analysis);
             image
@@ -555,7 +556,8 @@ fn prepare_cover_inner(
                 },
                 None,
                 Some(cancel),
-            )?;
+            )
+            .map_err(|error| error.to_string())?;
             let image = analysis.image.clone();
             predecoded_auto_analysis = Some(analysis);
             image
@@ -656,54 +658,68 @@ fn prepare_cover_inner(
             ReadLocation::File(path) => {
                 match cover.auto_cover_crop.as_ref().ok().map(|auto| &auto.input) {
                     Some(crate::thumb_loader::AutoCoverInput::FolderPages(pages)) => {
-                        crate::cover_auto_sample::sample_folder_pages_with_rotations(
+                        crate::cover_auto_sample::sample_folder_pages_with_rotations_cancellable(
                             pages,
                             path,
                             |key| sample_rotations.get(key),
+                            Some(cancel),
                         )
                     }
-                    _ => crate::cover_auto_sample::page_aspect_from_sizes_report(&[], 0),
+                    _ => Ok(crate::cover_auto_sample::page_aspect_from_sizes_report(
+                        &[],
+                        0,
+                    )),
                 }
             }
             ReadLocation::ArchiveEntry { archive, entry } => {
-                crate::cover_auto_sample::sample_zip_pages_with_rotations(
+                crate::cover_auto_sample::sample_container_pages_with_rotations_cancellable(
                     archive,
                     entry,
                     cover.zip_dir_prefix.as_deref(),
                     archive,
                     |key| sample_rotations.get(key),
+                    Some(cancel),
                 )
             }
             ReadLocation::PdfPage { pdf, page } => {
                 let sizes = cover
                     .epub_read
                     .as_ref()
-                    .and_then(|read| {
-                        crate::pdf_loader::get_page_sizes_with_read_target(
-                            pdf,
-                            read,
-                            cover.pdf_password.as_deref(),
+                    .ok_or_else(|| {
+                        crate::cover_auto_sample::SampleAbort::ReadFailed(
+                            "PDF read lease missing".into(),
                         )
-                        .ok()
                     })
-                    .unwrap_or_default();
-                crate::cover_auto_sample::page_aspect_from_sizes_with_rotations_report(
-                    &sizes,
-                    *page as usize,
-                    pdf,
-                    |key| sample_rotations.get(key),
-                )
+                    .and_then(|read| {
+                        crate::cover_auto_sample::page_sizes_read_result(
+                            crate::pdf_loader::get_page_sizes_with_read_target(
+                                pdf,
+                                read,
+                                cover.pdf_password.as_deref(),
+                            ),
+                        )
+                    });
+                sizes.map(|sizes| {
+                    crate::cover_auto_sample::page_aspect_from_sizes_with_rotations_report(
+                        &sizes,
+                        *page as usize,
+                        pdf,
+                        |key| sample_rotations.get(key),
+                    )
+                })
             }
-            _ => crate::cover_auto_sample::page_aspect_from_sizes_report(&[], 0),
+            _ => Ok(crate::cover_auto_sample::page_aspect_from_sizes_report(
+                &[],
+                0,
+            )),
         };
-        let page_aspect = sample;
-        if let Err(reason) = page_aspect {
+        if let Ok(Err(reason)) = &sample {
             crate::logger::log(format!(
                 "auto cover: dialog page-aspect={}",
                 reason.as_str()
             ));
         }
-        let mut analyze = || -> Result<AutoDetection, String> {
+        let mut analyze = |page_aspect| -> Result<AutoDetection, String> {
             let analysis = if let Some(analysis) = predecoded_auto_analysis.take() {
                 Ok(analysis)
             } else {
@@ -734,7 +750,12 @@ fn prepare_cover_inner(
                                 bytes: cover
                                     .preloaded_bytes
                                     .as_deref()
-                                    .ok_or("書庫の画像を読み込めませんでした")?,
+                                    .ok_or_else(|| {
+                                        crate::thumb_loader::CoverAutoAnalysisError::ReadFailed(
+                                            "書庫の画像を読み込めませんでした".into(),
+                                        )
+                                    })
+                                    .map_err(|error| error.to_string())?,
                                 hint: entry,
                             },
                             Some(&image),
@@ -748,19 +769,36 @@ fn prepare_cover_inner(
                 Ok(analysis) => AutoDetection::analyze(
                     &analysis.image,
                     analysis.native_dims,
-                    sample.ok(),
+                    Some(page_aspect),
                     analysis.shot_exif,
                     auto.binding,
                 ),
                 Err(error) => {
                     crate::logger::log(format!("cover crop dialog analysis failed: {error}"));
-                    AutoDetection::Stopped(AutoStop::AnalysisFailed)
+                    match error {
+                        crate::thumb_loader::CoverAutoAnalysisError::Cancelled => {
+                            return Err("キャンセルしました".into());
+                        }
+                        crate::thumb_loader::CoverAutoAnalysisError::ReadFailed(_) => {
+                            AutoDetection::Stopped(AutoStop::ReadFailed)
+                        }
+                        crate::thumb_loader::CoverAutoAnalysisError::Decode(_) => {
+                            AutoDetection::Stopped(AutoStop::AnalysisFailed)
+                        }
+                    }
                 }
             })
         };
-        match page_aspect {
-            Ok(_) => analyze()?,
-            Err(reason) => AutoDetection::Stopped(AutoStop::PageAspect(reason)),
+        match sample {
+            Ok(Ok(page_aspect)) => analyze(page_aspect)?,
+            Ok(Err(reason)) => AutoDetection::Stopped(AutoStop::PageAspect(reason)),
+            Err(crate::cover_auto_sample::SampleAbort::Cancelled) => {
+                return Err("キャンセルしました".into());
+            }
+            Err(crate::cover_auto_sample::SampleAbort::ReadFailed(error)) => {
+                crate::logger::log(format!("cover crop dialog sample failed: {error}"));
+                AutoDetection::Stopped(AutoStop::ReadFailed)
+            }
         }
     } else {
         AutoDetection::Stopped(AutoStop::AnalysisFailed)
@@ -1321,6 +1359,181 @@ mod tests {
                 saved.or(automatic)
             );
         }
+    }
+
+    #[test]
+    fn cover_crop_direct_rar_initial_auto_ok_fixed_pixels_and_clear_restore_auto() {
+        // The App harness already owns the process-wide data-dir isolation.
+        let mut app = crate::app::setup_app_for_test();
+        let archive = app.tmp.path().join("jacket.rar");
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/archives/cover-auto-rar/jacket.rar"),
+            &archive,
+        )
+        .unwrap();
+        let db = Arc::new(
+            crate::folder_thumb_pins::FolderThumbPinDb::open_at(
+                &app.tmp.path().join("crop-pins.db"),
+            )
+            .unwrap(),
+        );
+        app.folder_thumb_pin_db = Some(db.clone());
+        app.current_folder = Some(app.tmp.path().to_owned());
+        let env = BookCoverEnv {
+            books_root: Some(app.tmp.path().join("unused-books")),
+            pin_db: Some(db.clone()),
+            auto_cover_crop: Some(crate::cover_auto_crop::AutoCropIdentity::new(
+                crate::settings::ReadingDirection::Rtl,
+            )),
+            ..Default::default()
+        };
+        let container = BookCoverContainer {
+            path: archive.clone(),
+            kind: BookKind::Archive(crate::archive_converter::ArchiveFormat::Rar),
+            zip_dir_prefix: None,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let prepared = prepare_cover(&container, None, &env, 512, &cancel).unwrap();
+        let automatic = prepared
+            .auto_detection
+            .crop_for(Rotation::None)
+            .expect("the real RAR jacket is automatically cropped");
+        let (tx, rx) = mpsc::channel();
+        app.cover_crop_generation = 7;
+        app.cover_crop_dialog = Some(CoverCropDialog {
+            generation: 7,
+            container: archive.clone(),
+            cancel: cancel.clone(),
+            phase: Phase::Loading(rx),
+            placement: WindowPlacement::Initial,
+        });
+        tx.send((7, Ok(prepared))).ok().unwrap();
+        let mut h = app_harness(app);
+        h.run_steps(4);
+        let Phase::Ready(draft) = &h.state().cover_crop_dialog.as_ref().unwrap().phase else {
+            panic!("prepared RAR crop draft");
+        };
+        assert_eq!(draft.crop, crop_rect(Some(automatic)));
+        assert!(!draft.had_manual_crop);
+        h.get_by_label(OK_LABEL).click();
+        h.run_steps(2);
+        assert!(!h.state().cover_crop_dialog_open());
+        let pin = db.lookup(&archive).unwrap();
+        assert_eq!(pin.cover_crop, Some(automatic));
+
+        // Read the saved pin through its production key and worker, rather
+        // than merely asserting that the DB retained the crop coordinates.
+        let resolved = crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+            &archive,
+            &pin,
+            |path| db.lookup(path),
+            3,
+        )
+        .unwrap();
+        let base = crate::app::convertible_archive_cache_base_key(
+            &archive,
+            crate::archive_converter::ArchiveFormat::Rar,
+            false,
+        )
+        .unwrap();
+        let mut request = crate::thumb_loader::LoadRequest {
+            path: resolved.abs_path.clone(),
+            zip_entry: resolved.zip_entry.clone(),
+            source_policy: crate::thumb_loader::LoadSourcePolicy::SourceOnly,
+            ..Default::default()
+        };
+        resolved.assign_to_load_request(
+            &mut request,
+            &base,
+            crate::folder_thumb_pins::PinKeyMode::Exact,
+            None,
+        );
+        request.set_auto_cover_crop(env.auto_cover_crop);
+        let key = request.cache_key_override.as_deref().unwrap();
+        assert!(key.starts_with("archivethumb:rar:jacket.rar#pin:"), "{key}");
+        assert!(!key.contains("|autocrop:"), "manual crop wins: {key}");
+        assert!(key.contains("|crop:"), "{key}");
+        let settings = crate::settings::Settings {
+            cache_policy: crate::settings::CachePolicy::Off,
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        crate::thumb_loader::process_load_request(
+            &mut request,
+            &std::sync::RwLock::new(Default::default()),
+            &tx,
+            None,
+            128,
+            75,
+            128,
+            crate::thumb_loader::CacheDecision::from_settings(&settings),
+            &done,
+            &Arc::new(std::sync::Mutex::new(crate::stats::ThumbStats::default())),
+            None,
+            &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            &Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let messages: Vec<_> = rx.try_iter().collect();
+        let pixels = messages
+            .iter()
+            .find_map(crate::thumb_loader::ThumbMsg::pixels)
+            .expect("fixed RAR thumbnail pixels");
+        let [x0, y0, x1, y1] = automatic.values().map(f64::from);
+        let expected_ratio = 892.0 * (x1 - x0) / (512.0 * (y1 - y0));
+        let ratio = pixels.image.width() as f64 / pixels.image.height() as f64;
+        assert!(
+            (ratio - expected_ratio).abs() < 0.03,
+            "{ratio}/{expected_ratio}"
+        );
+        assert_eq!(
+            pixels.auto_material,
+            crate::cover_auto_material::AutoMaterial::NotAutomatic
+        );
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let prepared = prepare_cover(&container, None, &env, 512, &cancel).unwrap();
+        assert_eq!(
+            prepared.auto_detection,
+            AutoDetection::Stopped(AutoStop::Manual {
+                automatic_enabled: true,
+            })
+        );
+        let (tx, rx) = mpsc::channel();
+        h.state_mut().cover_crop_generation = 8;
+        h.state_mut().cover_crop_dialog = Some(CoverCropDialog {
+            generation: 8,
+            container: archive.clone(),
+            cancel: cancel.clone(),
+            phase: Phase::Loading(rx),
+            placement: WindowPlacement::Initial,
+        });
+        tx.send((8, Ok(prepared))).ok().unwrap();
+        h.run_steps(4);
+        h.get_by_label("手動の範囲を解除すると、自動の判定に戻ります。");
+        h.get_by_label("手動の範囲を解除").click();
+        h.run_steps(2);
+        assert!(!h.state().cover_crop_dialog_open());
+        assert_eq!(db.lookup(&archive).unwrap().cover_crop, None);
+        let restored = prepare_cover(
+            &container,
+            None,
+            &env,
+            512,
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.auto_detection.crop_for(Rotation::None),
+            Some(automatic)
+        );
+        assert_eq!(restored.crop, None);
     }
 
     #[test]

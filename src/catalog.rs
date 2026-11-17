@@ -1029,6 +1029,7 @@ fn decode_auto_material(filename: &str, value: Option<&str>) -> Option<AutoMater
                     || token.starts_with("|autocrop:v3f:")
                     || token.starts_with("|autocrop:v4:")
                     || token.starts_with("|autocrop:v4f:")
+                    || token.starts_with("|autocrop:v4r:")
             },
         ))
         .then_some(AutoMaterial::NotAutomatic),
@@ -3488,6 +3489,10 @@ mod tests {
             ("folderthumb:null|autocrop:v4f:rtl", None),
             ("zipthumb:bad|autocrop:v4:ltr", Some("automatic-v1:-;-;-")),
             ("folderthumb:bad|autocrop:v4f:ltr", Some("broken")),
+            ("archivethumb:rar:null.rar|autocrop:v4r:rtl", None),
+            ("archivethumb:rar:bad.cbr|autocrop:v4r:ltr", Some("broken")),
+            ("zipdir:null/|autocrop:v4r:rtl#pin:cover", None),
+            ("zipdir:bad/|autocrop:v4r:ltr", Some("automatic-v1:-;-;-")),
             (
                 "pdfthumb:pinned|autocrop:v4:rtl#pin:pdf|page|1|generation:17:4096",
                 None,

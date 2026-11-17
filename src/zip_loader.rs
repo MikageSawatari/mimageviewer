@@ -83,11 +83,14 @@ fn cancelled_read_error() -> std::io::Error {
     std::io::Error::other("ZIP source read was cancelled")
 }
 
-fn zip_error_to_io(error: impl ToString, cancel: Option<&AtomicBool>) -> std::io::Error {
+fn zip_error_to_io(error: zip::result::ZipError, cancel: Option<&AtomicBool>) -> std::io::Error {
     if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
         interrupted_error()
     } else {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
+        match error {
+            zip::result::ZipError::Io(error) => error,
+            error => std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()),
+        }
     }
 }
 
@@ -2969,63 +2972,225 @@ fn read_prefix_by_name<R: Read + Seek>(
 
 /// Dimension-sampling input for auto covers. Inspect only this outer ZIP's
 /// central directory and read bounded prefixes through the same open handle.
-/// Nested ZIPs and direct RAR never enter a full-entry compatibility fallback.
+/// Compatibility projection. Saving callers use the typed sampler below.
 pub(crate) fn read_cover_auto_page_prefixes(
     zip_path: &Path,
     leaf_entry: &str,
     prefix: Option<&str>,
 ) -> std::io::Result<Vec<(String, Option<Vec<u8>>)>> {
-    if crate::rar_loader::is_rar_path(zip_path) || split_nested_zip_path(leaf_entry).len() > 1 {
+    use crate::cover_auto_sample::{SampleAbort, SampleMetrics};
+    let mut metrics = SampleMetrics::default();
+    let samples = if crate::rar_loader::is_rar_path(zip_path) {
+        crate::rar_loader::read_cover_auto_page_samples(
+            zip_path,
+            leaf_entry,
+            prefix,
+            None,
+            crate::cover_auto_sample::MAX_RAR_SAMPLE_ENTRY_BYTES,
+            crate::cover_auto_sample::MAX_RAR_SAMPLE_TOTAL_BYTES,
+            &mut metrics,
+        )
+    } else {
+        read_cover_auto_page_samples(zip_path, leaf_entry, prefix, None, &mut metrics)
+    };
+    let to_io = |error| match error {
+        SampleAbort::Cancelled => interrupted_error(),
+        SampleAbort::ReadFailed(reason) => std::io::Error::other(reason),
+    };
+    samples
+        .map_err(&to_io)?
+        .into_iter()
+        .map(|(name, read)| read.into_slot().map(|bytes| (name, bytes)).map_err(&to_io))
+        .collect()
+}
+
+pub(crate) fn read_cover_auto_page_samples(
+    zip_path: &Path,
+    leaf_entry: &str,
+    prefix: Option<&str>,
+    cancel: Option<&AtomicBool>,
+    metrics: &mut crate::cover_auto_sample::SampleMetrics,
+) -> Result<
+    Vec<(String, crate::cover_auto_sample::SampleRead)>,
+    crate::cover_auto_sample::SampleAbort,
+> {
+    use crate::cover_auto_sample::{SampleAbort, SampleRead, check_cancel, select_archive_samples};
+    check_cancel(cancel)?;
+    if split_nested_zip_path(leaf_entry).len() > 1 {
         return Ok(Vec::new());
     }
-    let mut archive = ARCHIVE_DIRECTORY_CACHE.open_archive(zip_path, None)?;
-    let prefix = prefix.map(|p| {
-        let p = p.replace('\\', "/");
-        if p.is_empty() {
-            p
-        } else {
-            format!("{}/", p.trim_end_matches('/'))
-        }
-    });
+    let started = Instant::now();
+    // A source/open failure is never a judged missing aspect, including a
+    // damaged archive that cannot supply a central directory at all.
+    let mut archive = ARCHIVE_DIRECTORY_CACHE
+        .open_archive(zip_path, None)
+        .map_err(|error| SampleAbort::ReadFailed(error.to_string()))?;
     let mut names = Vec::new();
     for index in 0..archive.len() {
-        let entry = archive
-            .by_index_raw(index)
-            .map_err(|e| zip_error_to_io(e, None))?;
+        check_cancel(cancel)?;
+        let entry = match archive.by_index_raw(index) {
+            Ok(entry) => entry,
+            Err(error) => match SampleRead::from_io(Err(zip_error_to_io(error, cancel)), cancel) {
+                SampleRead::Unreadable => break,
+                SampleRead::Cancelled => return Err(SampleAbort::Cancelled),
+                SampleRead::ReadFailed(reason) => return Err(SampleAbort::ReadFailed(reason)),
+                SampleRead::Read(_) => unreachable!("an error cannot contain sample bytes"),
+            },
+        };
         if entry.is_dir() {
             continue;
         }
         let name = normalized_zip_entry_name(&entry);
-        if should_ignore(&name)
-            || prefix
-                .as_ref()
-                .is_some_and(|prefix| !name.starts_with(prefix))
-            || split_nested_zip_path(&name).len() > 1
-            || !lowercase_ext(&name).is_some_and(|ext| is_image_ext(&ext))
-        {
-            continue;
-        }
-        names.push((crate::filename_sort::FileNameSortKey::new(&name), name));
+        names.push((name, entry.size()));
     }
-    names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    let leaf = leaf_entry.replace('\\', "/");
-    let Some(leaf_index) = names.iter().position(|(_, name)| name == &leaf) else {
-        return Ok(Vec::new());
-    };
+    let selected = select_archive_samples(names, leaf_entry, prefix);
+    metrics.selected = selected.len();
+    metrics.list_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let read_started = Instant::now();
     let mut prefixes = Vec::new();
-    for index in crate::cover_auto_sample::sample_indices(names.len(), leaf_index) {
-        let name = &names[index].1;
-        let bytes = read_prefix_by_name(
-            &mut archive,
-            name,
-            None,
-            crate::cover_auto_sample::MAX_SAMPLE_PREFIX_BYTES,
-            None,
-        )
-        .ok();
-        prefixes.push((name.clone(), bytes));
+    for (name, _) in selected {
+        check_cancel(cancel)?;
+        let read = SampleRead::from_io(
+            read_prefix_by_name(
+                &mut archive,
+                &name,
+                None,
+                crate::cover_auto_sample::MAX_SAMPLE_PREFIX_BYTES,
+                cancel,
+            ),
+            cancel,
+        );
+        if let SampleRead::Read(bytes) = &read {
+            metrics.read += 1;
+            metrics.bytes += bytes.len();
+        }
+        // Stop immediately on abort; do not turn a failing slot into a skip.
+        match &read {
+            SampleRead::Cancelled => return Err(SampleAbort::Cancelled),
+            SampleRead::ReadFailed(reason) => return Err(SampleAbort::ReadFailed(reason.clone())),
+            _ => {}
+        }
+        prefixes.push((name, read));
     }
+    metrics.read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
     Ok(prefixes)
+}
+
+#[cfg(test)]
+mod cover_sample_boundary_tests {
+    use super::*;
+    use crate::cover_auto_sample::{SampleAbort, SampleMetrics, SampleRead};
+    use std::cell::Cell;
+    use std::io::Write;
+    use std::rc::Rc;
+
+    fn sample_zip_bytes() -> Vec<u8> {
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        writer
+            .start_file(
+                "001.png",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+        writer
+            .write_all(b"synthetic image bytes with a CRC")
+            .unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    struct FailingReader {
+        cursor: Cursor<Vec<u8>>,
+        fail: Rc<Cell<bool>>,
+    }
+
+    impl Read for FailingReader {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail.get() {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected source read failure",
+                ))
+            } else {
+                self.cursor.read(bytes)
+            }
+        }
+    }
+
+    impl Seek for FailingReader {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.cursor.seek(position)
+        }
+    }
+
+    #[test]
+    fn zip_sample_entry_io_retains_os_error_instead_of_unreadable_data() {
+        let fail = Rc::new(Cell::new(false));
+        let reader = FailingReader {
+            cursor: Cursor::new(sample_zip_bytes()),
+            fail: Rc::clone(&fail),
+        };
+        let mut archive = zip::ZipArchive::new(reader).unwrap();
+        fail.set(true);
+        let result = read_prefix_by_name(&mut archive, "001.png", None, 256 * 1024, None);
+        assert_eq!(
+            result.as_ref().unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(matches!(
+            SampleRead::from_io(result, None),
+            SampleRead::ReadFailed(_)
+        ));
+    }
+
+    #[test]
+    fn zip_sample_crc_is_an_unknown_slot_and_cancel_stays_distinct() {
+        let mut bytes = sample_zip_bytes();
+        let offset = {
+            let mut archive = zip::ZipArchive::new(Cursor::new(&bytes)).unwrap();
+            let offset = archive.by_index_raw(0).unwrap().data_start() as usize;
+            offset
+        };
+        bytes[offset] ^= 1;
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let result = read_prefix_by_name(&mut archive, "001.png", None, 256 * 1024, None);
+        assert_eq!(
+            result.as_ref().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        assert!(matches!(
+            SampleRead::from_io(result, None),
+            SampleRead::Unreadable
+        ));
+        let cancel = AtomicBool::new(true);
+        assert!(matches!(
+            SampleRead::from_io(Ok(vec![1]), Some(&cancel)),
+            SampleRead::Cancelled
+        ));
+        let mut metrics = SampleMetrics::default();
+        let result = read_cover_auto_page_samples(
+            Path::new("missing.zip"),
+            "000.png",
+            None,
+            Some(&cancel),
+            &mut metrics,
+        );
+        assert!(matches!(result, Err(SampleAbort::Cancelled)));
+    }
+
+    #[test]
+    fn zip_sample_source_open_failure_aborts_even_without_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut metrics = SampleMetrics::default();
+        let result = read_cover_auto_page_samples(
+            &directory.path().join("missing.zip"),
+            "000.png",
+            None,
+            None,
+            &mut metrics,
+        );
+        assert!(matches!(result, Err(SampleAbort::ReadFailed(_))));
+    }
 }
 
 fn decoded_name_index<R: Read + Seek>(

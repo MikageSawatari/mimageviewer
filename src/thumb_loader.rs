@@ -22,6 +22,8 @@ mod cover_rotation_tests;
 #[cfg(test)]
 mod key_normalization_tests;
 #[cfg(test)]
+mod rar_key_tests;
+#[cfg(test)]
 mod s1_tests;
 pub(crate) use catalog_provider::{ParentObservedStamp, ParentRow, RequestCatalog};
 pub use catalog_provider::{ThumbnailCatalogProvider, ThumbnailSaveTarget};
@@ -72,24 +74,27 @@ impl LoadRequest {
             .is_some_and(is_representative_cache_key);
         self.auto_cover_crop = identity.filter(|_| eligible && self.cover_crop.is_none());
         if let Some(key) = self.cache_key_override.as_mut() {
-            *key = representative_cache_key_for_policy_with_auto(
+            *key = representative_cache_key_for_policy_with_auto_in_archive(
                 key,
                 &self.file_type_visibility,
                 self.auto_cover_crop,
+                Some(&self.path),
             );
         }
         if let Some(row) = self.parent_row.as_mut() {
-            row.row_key = representative_cache_key_for_policy_with_auto(
+            row.row_key = representative_cache_key_for_policy_with_auto_in_archive(
                 &row.row_key,
                 &self.file_type_visibility,
                 self.auto_cover_crop,
+                Some(&self.path),
             );
         }
         if let RequestCatalog::Parent { row, .. } = &mut self.catalog_target {
-            row.row_key = representative_cache_key_for_policy_with_auto(
+            row.row_key = representative_cache_key_for_policy_with_auto_in_archive(
                 &row.row_key,
                 &self.file_type_visibility,
                 self.auto_cover_crop,
+                Some(&self.path),
             );
         }
     }
@@ -296,10 +301,11 @@ pub fn cache_key_for_request(req: &LoadRequest) -> Option<std::borrow::Cow<'_, s
         CatalogRowKind::Override(key) => {
             if is_representative_cache_key(key) {
                 Some(std::borrow::Cow::Owned(
-                    representative_cache_key_for_policy_with_auto(
+                    representative_cache_key_for_policy_with_auto_in_archive(
                         key,
                         &req.file_type_visibility,
                         req.auto_cover_crop,
+                        Some(&req.path),
                     ),
                 ))
             } else {
@@ -382,6 +388,35 @@ pub(crate) fn representative_cache_key_for_policy_with_auto(
     policy: &crate::file_type_visibility::FileTypeVisibility,
     auto: Option<crate::cover_auto_crop::AutoCropIdentity>,
 ) -> String {
+    representative_cache_key_for_policy_with_auto_in_archive(key, policy, auto, None)
+}
+
+/// The logical archive tile keeps one key across Direct/CachedZip/Pending.
+/// ZipDir instead belongs to the physical tree being read, including pinned
+/// directories whose logical pin root can still be the original RAR.
+pub(crate) fn auto_token(
+    key: &str,
+    physical_archive: Option<&Path>,
+    identity: crate::cover_auto_crop::AutoCropIdentity,
+) -> &'static str {
+    if key.starts_with("archivethumb:rar:")
+        || (key.starts_with("zipdir:")
+            && physical_archive.is_some_and(crate::rar_loader::is_rar_path))
+    {
+        return match identity.binding {
+            crate::settings::ReadingDirection::Rtl => "v4r:rtl",
+            crate::settings::ReadingDirection::Ltr => "v4r:ltr",
+        };
+    }
+    identity.suffix_for_key(key)
+}
+
+pub(crate) fn representative_cache_key_for_policy_with_auto_in_archive(
+    key: &str,
+    policy: &crate::file_type_visibility::FileTypeVisibility,
+    auto: Option<crate::cover_auto_crop::AutoCropIdentity>,
+    physical_archive: Option<&Path>,
+) -> String {
     if !is_representative_cache_key(key) {
         return key.to_owned();
     }
@@ -401,7 +436,10 @@ pub(crate) fn representative_cache_key_for_policy_with_auto(
             .unwrap_or(normalized.len());
         normalized.insert_str(
             split,
-            &format!("|autocrop:{}", auto.suffix_for_key(&normalized)),
+            &format!(
+                "|autocrop:{}",
+                auto_token(&normalized, physical_archive, auto)
+            ),
         );
     }
     normalized
@@ -421,6 +459,8 @@ pub(crate) fn representative_auto_crop_key_parts(key: &str) -> Option<(&str, &st
         "|autocrop:v4:ltr",
         "|autocrop:v4f:rtl",
         "|autocrop:v4f:ltr",
+        "|autocrop:v4r:rtl",
+        "|autocrop:v4r:ltr",
         "|autocrop:v3:rtl",
         "|autocrop:v3:ltr",
         "|autocrop:v3f:rtl",
@@ -432,6 +472,12 @@ pub(crate) fn representative_auto_crop_key_parts(key: &str) -> Option<(&str, &st
         "|autocrop:v1:rtl",
         "|autocrop:v1:ltr",
     ] {
+        if token.starts_with("|autocrop:v4r:")
+            && !key.starts_with("archivethumb:rar:")
+            && !key.starts_with("zipdir:")
+        {
+            continue;
+        }
         // Folder-only versions are emitted only for folder representatives. On another kind they
         // remains literal source text, just like any unknown derived token.
         if (token.starts_with("|autocrop:v4f:")
@@ -1097,7 +1143,6 @@ pub(crate) enum AutoCoverSkip {
     PinnedFolder,
     ChildRepresentative,
     FolderDisabled,
-    DirectRar,
     NestedZip,
     Unsupported,
 }
@@ -1427,7 +1472,7 @@ fn automatic_container_location(location: &ReadLocation) -> Result<(), AutoCover
 
 // Shared by source resolution and the decoder's last eligibility check.
 pub(crate) fn automatic_container_source(
-    path: &Path,
+    _path: &Path,
     entry: Option<&str>,
     page: Option<u32>,
 ) -> Result<(), AutoCoverSkip> {
@@ -1435,9 +1480,6 @@ pub(crate) fn automatic_container_source(
         return Ok(());
     }
     let entry = entry.ok_or(AutoCoverSkip::Unsupported)?;
-    if crate::rar_loader::is_rar_path(path) {
-        return Err(AutoCoverSkip::DirectRar);
-    }
     if crate::zip_loader::split_nested_zip_path(entry).len() != 1 {
         return Err(AutoCoverSkip::NestedZip);
     }
@@ -2224,6 +2266,28 @@ impl CacheDecision {
             }
         }
     }
+}
+
+/// Include the automatic work only for a completed judgement. Thresholds and
+/// the format-specific always-cache policy remain owned by CacheDecision.
+fn auto_cover_should_cache(
+    decision: CacheDecision,
+    path: &Path,
+    size: i64,
+    decode_ms: f64,
+    display_ms: f64,
+    automatic_ms: f64,
+    material: crate::cover_auto_material::AutoMaterial,
+) -> bool {
+    let automatic_ms = if matches!(
+        material,
+        crate::cover_auto_material::AutoMaterial::Automatic(_)
+    ) {
+        automatic_ms
+    } else {
+        0.0
+    };
+    decision.should_cache(path, size, decode_ms + automatic_ms, display_ms)
 }
 
 // -----------------------------------------------------------------------
@@ -3528,17 +3592,19 @@ fn process_load_request_with_provider(
     #[cfg(all(windows, any(test, feature = "test-script")))]
     trace_request_begin(req, display_px);
     if let Some(key) = req.cache_key_override.as_mut() {
-        *key = representative_cache_key_for_policy_with_auto(
+        *key = representative_cache_key_for_policy_with_auto_in_archive(
             key,
             &req.file_type_visibility,
             req.auto_cover_crop,
+            Some(&req.path),
         );
     }
     if let RequestCatalog::Parent { row, .. } = &mut req.catalog_target {
-        row.row_key = representative_cache_key_for_policy_with_auto(
+        row.row_key = representative_cache_key_for_policy_with_auto_in_archive(
             &row.row_key,
             &req.file_type_visibility,
             req.auto_cover_crop,
+            Some(&req.path),
         );
     }
     if matches!(req.catalog_target, RequestCatalog::Parent { .. }) {
@@ -7224,7 +7290,8 @@ pub(crate) fn load_one_cached(
     let offer_raster = offer_started.map(|at| at.finish()).unwrap_or_default();
     let mut img = img;
     let mut source_dims = source_dims;
-    let mut auto_material = crate::cover_auto_material::AutoMaterial::NotAutomatic;
+    let mut auto_evaluation = Ok(crate::cover_auto_material::AutoMaterial::NotAutomatic);
+    let mut automatic_ms = 0.0;
     if let Some(auto) = auto_cover_crop.filter(|_| cover_crop.is_none()) {
         let started = std::time::Instant::now();
         let book_display = auto_book_display.as_deref().unwrap_or("?");
@@ -7240,40 +7307,74 @@ pub(crate) fn load_one_cached(
             crate::pdf_loader::JobPriority::Normal
         };
         let mut reason = "unsupported_source";
+        let mut sample_ms = 0.0;
         if supported {
+            #[cfg(test)]
+            cover_auto_rar_tests::before_sample();
             // Source/decode worker only. Cache hits and CacheOnly never reach
             // this bounded page sampling or open the rotation store.
             let sample_rotations = crate::cover_auto_sample::SampleRotations::for_worker();
+            // A harvested PDF result is completed work. Other formats stop at
+            // every sampling boundary when their owning request is cancelled.
+            let sample_cancel = if pdf_page.is_some()
+                && cancel_policy == crate::pdf_loader::CancelWaitPolicy::HarvestOnCancel
+            {
+                None
+            } else {
+                cancel.map(Arc::as_ref)
+            };
+            let sample_started = std::time::Instant::now();
             let sample = match &auto.input {
                 AutoCoverInput::FolderPages(pages) => {
-                    crate::cover_auto_sample::sample_folder_pages_with_rotations(
+                    crate::cover_auto_sample::sample_folder_pages_with_rotations_cancellable(
                         pages,
                         path,
                         |key| sample_rotations.get(key),
+                        sample_cancel,
                     )
                 }
                 AutoCoverInput::Container => {
                     if let Some(page) = pdf_page {
-                        let sizes =
-                            cover_pdf_page_sizes(path, epub_read, pdf_password).unwrap_or_default();
-                        crate::cover_auto_sample::page_aspect_from_sizes_with_rotations_report(
-                            &sizes,
-                            page as usize,
-                            path,
-                            |key| sample_rotations.get(key),
-                        )
+                        let sizes = crate::cover_auto_sample::page_sizes_read_result(
+                            cover_pdf_page_sizes(path, epub_read, pdf_password),
+                        );
+                        let mut metrics = crate::cover_auto_sample::SampleMetrics::default();
+                        metrics.list_ms = sample_started.elapsed().as_secs_f64() * 1000.0;
+                        if let Ok(sizes) = &sizes {
+                            metrics.selected = crate::cover_auto_sample::sample_indices(
+                                sizes.len(),
+                                page as usize,
+                            )
+                            .len();
+                            metrics.read = metrics.selected;
+                        }
+                        let result = sizes.map(|sizes| {
+                            crate::cover_auto_sample::page_aspect_from_sizes_with_rotations_report(
+                                &sizes,
+                                page as usize,
+                                path,
+                                |key| sample_rotations.get(key),
+                            )
+                        });
+                        metrics.emit(path, "pdf", &result);
+                        result
                     } else {
-                        crate::cover_auto_sample::sample_zip_pages_with_rotations(
+                        crate::cover_auto_sample::sample_container_pages_with_rotations_cancellable(
                             path,
-                            zip_entry.expect("supported ZIP leaf"),
+                            zip_entry.expect("supported archive leaf"),
                             auto_zip_prefix,
                             path,
                             |key| sample_rotations.get(key),
+                            sample_cancel,
                         )
                     }
                 }
             };
-            let aspect_result = sample;
+            sample_ms = sample_started.elapsed().as_secs_f64() * 1000.0;
+            let evaluated = sample.and_then(|sample| {
+                let aspect_result = sample;
+                #[cfg(test)]
+                cover_auto_rar_tests::before_analysis();
             let analysis = if let Some(analysis) = predecoded_auto_analysis.take() {
                 Ok(analysis)
             } else if let Some(page) = pdf_page {
@@ -7324,7 +7425,7 @@ pub(crate) fn load_one_cached(
                                 ));
                             },
                         );
-                    auto_material = crate::cover_auto_material::AutoMaterial::Automatic(results);
+                    let auto_material = crate::cover_auto_material::AutoMaterial::Automatic(results);
                     reason = if results.crops().iter().any(Option::is_some) {
                         "cropped-at-draw"
                     } else {
@@ -7386,11 +7487,35 @@ pub(crate) fn load_one_cached(
                             }
                         }
                     }
+                    crate::cover_auto_sample::check_cancel(sample_cancel)?;
+                    return Ok(auto_material);
                 }
-                Err(error) => {
+                Err(CoverAutoAnalysisError::Cancelled) => {
+                    return Err(crate::cover_auto_sample::SampleAbort::Cancelled);
+                }
+                Err(CoverAutoAnalysisError::ReadFailed(error)) => {
+                    return Err(crate::cover_auto_sample::SampleAbort::ReadFailed(error));
+                }
+                Err(CoverAutoAnalysisError::Decode(error)) => {
                     reason = "analysis-decode-failed";
                     crate::logger::log(format!("auto cover analysis decode failed: {error}"));
                 }
+            }
+            Ok(crate::cover_auto_material::AutoMaterial::NotAutomatic)
+            });
+            auto_evaluation = evaluated;
+            automatic_ms = started.elapsed().as_secs_f64() * 1000.0;
+            #[cfg(test)]
+            {
+                automatic_ms = cover_auto_rar_tests::automatic_ms(automatic_ms);
+            }
+            match &auto_evaluation {
+                Err(crate::cover_auto_sample::SampleAbort::Cancelled) => reason = "cancelled",
+                Err(crate::cover_auto_sample::SampleAbort::ReadFailed(error)) => {
+                    reason = "read-failed";
+                    crate::logger::log(format!("auto cover sample interrupted: {error}"));
+                }
+                Ok(_) => {}
             }
         }
         crate::logger::log(format!(
@@ -7404,6 +7529,7 @@ pub(crate) fn load_one_cached(
                 input_seq,
                 &[
                     ("reason", serde_json::json!(reason)),
+                    ("sample_ms", serde_json::json!(sample_ms)),
                     (
                         "ms",
                         serde_json::json!(started.elapsed().as_secs_f64() * 1000.0),
@@ -7412,6 +7538,33 @@ pub(crate) fn load_one_cached(
             );
         }
     }
+    if matches!(
+        auto_evaluation,
+        Err(crate::cover_auto_sample::SampleAbort::Cancelled)
+    ) {
+        let _ = tx.send(
+            ThumbMsg::from_legacy_parts(
+                idx,
+                None,
+                ThumbLoadOrigin::SourceIntrinsic,
+                false,
+                None,
+                None,
+                None,
+                true,
+                false,
+                input_seq,
+                items_gen,
+            )
+            .with_request_id(request_id),
+        );
+        gen_done.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let auto_material = auto_evaluation
+        .as_ref()
+        .copied()
+        .unwrap_or(crate::cover_auto_material::AutoMaterial::NotAutomatic);
     // Manual ranges remain destructive and do not carry automatic material.
     let (img, source_dims, layout_dims) =
         apply_cover_crop(img, source_dims, layout_dims, cover_crop);
@@ -7509,8 +7662,20 @@ pub(crate) fn load_one_cached(
     // (B) キャッシュ保存判定 (段階 C)
     // The destination opens a Collection writer only after the measured policy
     // decision. A missing lookup DB does not disable future saving.
-    let policy_should_save = cache_decision.should_cache(path, file_size, decode_ms, display_ms);
-    let save_catalog = save_target.open_if(force_cache, policy_should_save);
+    let policy_should_save = auto_cover_should_cache(
+        cache_decision,
+        path,
+        file_size,
+        decode_ms,
+        display_ms,
+        automatic_ms,
+        auto_material,
+    );
+    // Even force-cache must not persist an interrupted automatic decision.
+    let save_catalog = auto_evaluation
+        .is_ok()
+        .then(|| save_target.open_if(force_cache, policy_should_save))
+        .flatten();
     let should_save = save_catalog.is_some();
     #[cfg(all(windows, any(test, feature = "test-script")))]
     if let (ThumbnailRequestId::Registered(request_id), Some(key)) = (request_id, diagnostic_key) {
@@ -7804,6 +7969,10 @@ pub(crate) fn load_one_cached(
 // -----------------------------------------------------------------------
 
 #[cfg(test)]
+#[path = "thumb_loader/cover_auto_rar_tests.rs"]
+mod cover_auto_rar_tests;
+
+#[cfg(test)]
 pub(crate) fn with_test_pdf_render_result<T>(
     result: crate::pdf_loader::RenderResult,
     run: impl FnOnce() -> T,
@@ -7818,7 +7987,8 @@ pub(crate) mod cover_auto_eval_decode;
 #[path = "thumb_loader/cover_auto_analysis.rs"]
 mod cover_auto_analysis;
 pub(crate) use cover_auto_analysis::{
-    CoverAutoAnalysis, decode_cover_auto_analysis_image, decode_cover_auto_analysis_pdf,
+    CoverAutoAnalysis, CoverAutoAnalysisError, decode_cover_auto_analysis_image,
+    decode_cover_auto_analysis_pdf,
 };
 
 #[cfg(test)]
@@ -11170,27 +11340,7 @@ mod tests {
     }
 
     fn auto_cover_jacket() -> image::DynamicImage {
-        image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(892, 512, |x, y| {
-            image::Rgb(if x < 140 {
-                if y % 73 < 8 {
-                    [65, 65, 65]
-                } else {
-                    [246, 242, 220]
-                }
-            } else if x < 498 {
-                [
-                    35 + (y % 80) as u8,
-                    55 + (y % 155) as u8,
-                    200 - (y % 80) as u8,
-                ]
-            } else if x < 534 {
-                [18, 28, 38]
-            } else if y % 73 < 8 {
-                [75, 75, 75]
-            } else {
-                [246, 242, 220]
-            })
-        }))
+        crate::cover_auto_sample::rar_tests::fixture_jacket()
     }
 
     #[test]

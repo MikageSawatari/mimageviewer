@@ -65,7 +65,6 @@ fn skip_reason(skip: AutoCoverSkip) -> &'static str {
         AutoCoverSkip::PinnedFolder => "pinned-folder",
         AutoCoverSkip::ChildRepresentative => "child-representative",
         AutoCoverSkip::FolderDisabled => "folder-disabled",
-        AutoCoverSkip::DirectRar => "direct-rar",
         AutoCoverSkip::NestedZip => "nested-zip",
         AutoCoverSkip::Unsupported => "unsupported",
     }
@@ -82,7 +81,11 @@ fn kind(path: &Path, folders_only: bool) -> Result<(BookKind, &'static str), Str
     match BookKind::for_path(path) {
         BookKind::Zip => Ok((BookKind::Zip, "zip")),
         BookKind::Pdf => Ok((BookKind::Pdf, "pdf")),
-        _ => Err("book-list entry must be a PDF, ZIP or image folder".into()),
+        BookKind::Archive(crate::archive_converter::ArchiveFormat::Rar) => Ok((
+            BookKind::Archive(crate::archive_converter::ArchiveFormat::Rar),
+            "rar",
+        )),
+        _ => Err("book-list entry must be a PDF, ZIP, RAR, CBR or image folder".into()),
     }
 }
 
@@ -95,6 +98,26 @@ fn evaluate_one(
     config: FallbackConfig,
 ) -> Result<Row, String> {
     let (kind, label) = kind(path, folders_only)?;
+    // Build the production representative family before asking its single
+    // token selector; logical RAR tiles share this across Direct/CachedZip.
+    let representative = match kind {
+        BookKind::Archive(format) => {
+            crate::app::convertible_archive_cache_base_key(path, format, false)
+                .ok_or("archive cache identity missing")?
+        }
+        BookKind::Zip => "zipthumb:".into(),
+        BookKind::Pdf => "pdfthumb:".into(),
+        BookKind::Folder => "folderthumb:".into(),
+    };
+    let token = crate::thumb_loader::auto_token(
+        &representative,
+        Some(path),
+        AutoCropIdentity {
+            binding: options.binding,
+            folders: true,
+        },
+    );
+    let algorithm = format!("autocrop:{}", token.split_once(':').unwrap().0);
     let env = BookCoverEnv {
         // Avoid Shell/default-root lookup. These inputs are ordinary image
         // folders, not compiled direct children of an implicit books root.
@@ -151,38 +174,47 @@ fn evaluate_one(
     let sample = match (&cover.location, &cover.auto_cover_crop) {
         (ReadLocation::File(leaf), Ok(auto)) => match &auto.input {
             AutoCoverInput::FolderPages(pages) => {
-                crate::cover_auto_sample::sample_folder_pages_with_rotations(pages, leaf, |key| {
-                    rotations.get(key)
-                })
+                crate::cover_auto_sample::sample_folder_pages_with_rotations_cancellable(
+                    pages,
+                    leaf,
+                    |key| rotations.get(key),
+                    None,
+                )
             }
-            _ => Err(crate::cover_auto_sample::PageAspectDecline::TooFew),
+            _ => Ok(Err(crate::cover_auto_sample::PageAspectDecline::TooFew)),
         },
         (ReadLocation::ArchiveEntry { archive, entry }, Ok(_)) => {
-            crate::cover_auto_sample::sample_zip_pages_with_rotations(
+            crate::cover_auto_sample::sample_container_pages_with_rotations_cancellable(
                 archive,
                 entry,
                 cover.zip_dir_prefix.as_deref(),
                 archive,
                 |key| rotations.get(key),
+                None,
             )
         }
         (ReadLocation::PdfPage { pdf, page }, Ok(_)) => {
             let read = cover.epub_read.as_ref().ok_or("PDF read lease missing")?;
-            let sizes = crate::pdf_loader::get_page_sizes_with_read_target(
-                pdf,
-                read,
-                cover.pdf_password.as_deref(),
+            let sizes = crate::cover_auto_sample::page_sizes_read_result(
+                crate::pdf_loader::get_page_sizes_with_read_target(
+                    pdf,
+                    read,
+                    cover.pdf_password.as_deref(),
+                ),
             )
             .map_err(|error| format!("page sizes: {error}"))?;
-            crate::cover_auto_sample::page_aspect_from_sizes_with_rotations_report(
-                &sizes,
-                *page as usize,
-                pdf,
-                |key| rotations.get(key),
+            Ok(
+                crate::cover_auto_sample::page_aspect_from_sizes_with_rotations_report(
+                    &sizes,
+                    *page as usize,
+                    pdf,
+                    |key| rotations.get(key),
+                ),
             )
         }
-        _ => Err(crate::cover_auto_sample::PageAspectDecline::TooFew),
-    };
+        _ => Ok(Err(crate::cover_auto_sample::PageAspectDecline::TooFew)),
+    }
+    .map_err(|error| format!("page sample: {error}"))?;
     let outcomes = cover.auto_cover_crop.as_ref().ok().map(|_| {
         evaluate_angles(
             &analysis.image,
@@ -229,7 +261,7 @@ fn evaluate_one(
     };
     let ratio = layout_ratio(analysis.native_dims, sample.ok(), saved);
     let mut row = json!({
-        "sequence": sequence, "index": sequence - 1, "kind": label,
+        "sequence": sequence, "index": sequence - 1, "kind": label, "algorithm": algorithm,
         "reason": reason, "rotation": saved.degrees(),
         "R": ratio, "layout_ratio": ratio, "page_aspect": sample.ok(),
         "page_aspect_decline": sample.err().map(crate::cover_auto_sample::PageAspectDecline::as_str),
@@ -338,6 +370,9 @@ pub(super) fn evaluate(
                             match BookKind::for_path(path) {
                                 BookKind::Pdf => "pdf",
                                 BookKind::Zip => "zip",
+                                BookKind::Archive(crate::archive_converter::ArchiveFormat::Rar) => {
+                                    "rar"
+                                }
                                 _ => "folder",
                             }
                         };
@@ -393,7 +428,13 @@ pub(super) fn evaluate(
         }
         rows.push(row.json);
     }
-    let summary = json!({"algorithm": "autocrop:v4f", "source": if folders_only {"folder-list"} else {"book-list"},
+    // Keep the existing summary field for report readers, while mixed lists
+    // identify each source's cache algorithm in its row and this version set.
+    let algorithms = rows
+        .iter()
+        .filter_map(|row| row["algorithm"].as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let summary = json!({"algorithm": "autocrop:v4f", "algorithms": algorithms, "source": if folders_only {"folder-list"} else {"book-list"},
         "binding": if options.binding == ReadingDirection::Rtl { "rtl" } else { "ltr" },
         "total": paths.len(), "cropped": cropped, "declined": declined, "failed": failed,
         "decline_reasons": reasons, "fallback_mode": config.name(), "fallback_richer": config.includes_richer(),

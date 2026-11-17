@@ -39,6 +39,111 @@ fn saved_bytes() -> Vec<u8> {
 }
 
 #[test]
+fn cover_auto_rar_zipdir_request_and_survival_use_physical_archive_even_when_pinned() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("book.rar");
+    let cached = temp.path().join("converted.zip");
+    std::fs::write(&source, b"metadata only").unwrap();
+    std::fs::write(&cached, b"metadata only").unwrap();
+    let auto = Some(AutoCropIdentity::new(ReadingDirection::Rtl));
+    let visibility = Default::default();
+    for physical in [&source, &cached] {
+        for pinned in [false, true] {
+            let item = GridItem::ZipDir {
+                zip_path: physical.clone(),
+                dir_prefix: "book/".into(),
+                representative: Some("book/cover.png".into()),
+                is_archive: false,
+            };
+            let container = book_container_key(&source, "book/");
+            let pin = FolderPin::from(FolderPinSource::ZipEntry {
+                zip_rel: String::new(),
+                entry: "book/cover.png".into(),
+            });
+            let pins = if pinned {
+                HashMap::from([(
+                    crate::path_key::normalize_keep_drive(&container),
+                    pin.clone(),
+                )])
+            } else {
+                HashMap::new()
+            };
+            let req = make_load_request_with_auto_crop(
+                &item,
+                0,
+                17,
+                23,
+                false,
+                None,
+                None,
+                3,
+                &pins,
+                &HashMap::new(),
+                Some(&source),
+                Some(physical),
+                None,
+                None,
+                false,
+                &visibility,
+                auto,
+            )
+            .unwrap();
+            assert_eq!(&req.path, physical);
+            let key = crate::thumb_loader::cache_key_for_request(&req)
+                .unwrap()
+                .into_owned();
+            assert!(
+                key.contains(if physical == &source {
+                    "|autocrop:v4r:rtl"
+                } else {
+                    "|autocrop:v4:rtl"
+                }),
+                "{key}"
+            );
+            let base = crate::grid_item::zipdir_cache_key("book/");
+            let mut survival =
+                representative_existing_keys_in_archive(&base, &visibility, auto, Some(physical));
+            if pinned {
+                let target =
+                    crate::folder_thumb_pins::resolve_pin_target_cascaded_via_with_metadata(
+                        &container,
+                        &pin,
+                        |_| None,
+                        |_| Some((17, 23)),
+                        0,
+                    )
+                    .unwrap();
+                assert_eq!(target.abs_path, source);
+                survival.push(pinned_cache_key_with_auto_crop(
+                    &GridItem::ZipFile(physical.clone()),
+                    &target,
+                    &base,
+                    Some("book/"),
+                    &visibility,
+                    auto,
+                ));
+            }
+            assert!(survival.contains(&key), "{key} missing from {survival:?}");
+            let db = crate::catalog::CatalogDb::open(&temp.path().join("cache"), physical).unwrap();
+            db.save(
+                &key,
+                17,
+                23,
+                2,
+                2,
+                None,
+                &saved_bytes(),
+                &crate::cover_identity::CoverIdentity::Unrotatable,
+                crate::cover_auto_material::AutoMaterial::NotAutomatic,
+            )
+            .unwrap();
+            db.delete_missing(&survival.into_iter().collect()).unwrap();
+            assert!(db.load_one(&key).unwrap().is_some());
+        }
+    }
+}
+
+#[test]
 fn cover_auto_zipdir_real_request_scopes_last_page_sampling_to_its_book_and_dialog() {
     use std::io::{Cursor, Write};
     let temp = tempfile::tempdir().unwrap();

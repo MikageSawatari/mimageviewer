@@ -12,6 +12,41 @@ pub(super) fn shot_exif_from_bytes(bytes: &[u8]) -> bool {
 
 const ANALYSIS_DECODE_HEIGHT: u32 = 1024;
 
+/// Preserve interruption across the decode boundary. Only a data error is a
+/// durable decision to leave this cover uncropped.
+#[derive(Debug)]
+pub(crate) enum CoverAutoAnalysisError {
+    Cancelled,
+    ReadFailed(String),
+    Decode(String),
+}
+
+impl std::fmt::Display for CoverAutoAnalysisError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("cover analysis decode cancelled"),
+            Self::ReadFailed(error) | Self::Decode(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for CoverAutoAnalysisError {}
+
+impl CoverAutoAnalysisError {
+    fn from_image(error: image::ImageError, cancel: Option<&Arc<AtomicBool>>) -> Self {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Self::Cancelled;
+        }
+        if let image::ImageError::IoError(error) = &error
+            && crate::cover_auto_sample::classify_io_error(error)
+                == crate::cover_auto_sample::SampleFailureKind::ReadFailed
+        {
+            return Self::ReadFailed(error.to_string());
+        }
+        Self::Decode(error.to_string())
+    }
+}
+
 pub(crate) struct CoverAutoAnalysis {
     pub image: image::DynamicImage,
     pub decoder: crate::stats::DecodeSource,
@@ -23,9 +58,9 @@ pub(crate) struct CoverAutoAnalysis {
     pub dct_scale_num: Option<u32>,
 }
 
-fn check_cancel(cancel: Option<&Arc<AtomicBool>>) -> Result<(), String> {
+fn check_cancel(cancel: Option<&Arc<AtomicBool>>) -> Result<(), CoverAutoAnalysisError> {
     if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
-        Err("cover analysis decode cancelled".into())
+        Err(CoverAutoAnalysisError::Cancelled)
     } else {
         Ok(())
     }
@@ -38,7 +73,7 @@ pub(crate) fn decode_cover_auto_analysis_image(
     source: Source<'_>,
     full_decode: Option<&image::DynamicImage>,
     cancel: Option<&Arc<AtomicBool>>,
-) -> Result<CoverAutoAnalysis, String> {
+) -> Result<CoverAutoAnalysis, CoverAutoAnalysisError> {
     check_cancel(cancel)?;
     let jpeg = is_jpeg_extension(source.extension());
     let mut exif = None;
@@ -50,10 +85,12 @@ pub(crate) fn decode_cover_auto_analysis_image(
             }
             Source::Path(path) => {
                 let size = std::fs::metadata(path)
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| CoverAutoAnalysisError::ReadFailed(error.to_string()))?
                     .len();
                 if size <= MAX_TURBOJPEG_INPUT_SIZE {
-                    owned = std::fs::read(path).map_err(|error| error.to_string())?;
+                    owned = std::fs::read(path).map_err(|error| {
+                        CoverAutoAnalysisError::from_image(error.into(), cancel)
+                    })?;
                     // Recheck a file that grew between metadata and read.
                     (owned.len() as u64 <= MAX_TURBOJPEG_INPUT_SIZE).then_some(owned.as_slice())
                 } else {
@@ -91,7 +128,9 @@ pub(crate) fn decode_cover_auto_analysis_image(
                 }
                 // Allocation admission is terminal. Falling back to a full
                 // decoder here would bypass the DCT raster safety boundary.
-                Err(DctDecodeError::TerminalRejection(error)) => return Err(error),
+                Err(DctDecodeError::TerminalRejection(error)) => {
+                    return Err(CoverAutoAnalysisError::Decode(error));
+                }
                 Err(DctDecodeError::Fallback(_)) => {}
             }
         }
@@ -119,7 +158,7 @@ pub(crate) fn decode_cover_auto_analysis_image(
             false,
             cancel,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| CoverAutoAnalysisError::from_image(error, cancel))?;
         decoder = decoded.decoder;
         if decoded.orientation == crate::image_decode::Orientation::Applied {
             decoded.image
@@ -144,7 +183,7 @@ pub(crate) fn decode_cover_auto_analysis_image(
 fn decode_native_metadata_path(
     path: &Path,
     cancel: Option<&Arc<AtomicBool>>,
-) -> Result<CoverAutoAnalysis, String> {
+) -> Result<CoverAutoAnalysis, CoverAutoAnalysisError> {
     let source = Source::Path(path);
     let mut metadata = None;
     let decoded = crate::image_decode::primary(
@@ -166,7 +205,7 @@ fn decode_native_metadata_path(
         }
         crate::image_decode::susie(source, false, cancel.cloned()).map_err(|_| primary)
     })
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| CoverAutoAnalysisError::from_image(error, cancel))?;
     check_cancel(cancel)?;
     let mut metadata = metadata.unwrap_or_default();
     let decoder = decoded.decoder;
@@ -209,16 +248,22 @@ pub(crate) fn decode_cover_auto_analysis_pdf(
     priority: crate::pdf_loader::JobPriority,
     validity: crate::pdf_loader::PdfRenderValidity,
     cancel_policy: crate::pdf_loader::CancelWaitPolicy,
-) -> Result<CoverAutoAnalysis, String> {
-    let sizes = cover_pdf_page_sizes(path, read, password).map_err(|error| error.to_string())?;
-    let (width, height) = sizes
-        .get(page as usize)
-        .copied()
-        .ok_or_else(|| "cover analysis PDF page size missing".to_owned())?;
-    let target = pdf_analysis_target(width, height)?;
+) -> Result<CoverAutoAnalysis, CoverAutoAnalysisError> {
+    // Harvested PDF renders remain usable even when the caller was cancelled.
+    if cancel_policy == crate::pdf_loader::CancelWaitPolicy::AbortOnCancel {
+        check_cancel(cancel)?;
+    }
+    let sizes = cover_pdf_page_sizes(path, read, password)
+        .map_err(|error| CoverAutoAnalysisError::ReadFailed(error.to_string()))?;
+    let (width, height) = sizes.get(page as usize).copied().ok_or_else(|| {
+        CoverAutoAnalysisError::Decode("cover analysis PDF page size missing".into())
+    })?;
+    let target = pdf_analysis_target(width, height).map_err(CoverAutoAnalysisError::Decode)?;
     let native_dims = crate::pdf_loader::PdfPageSizePoints { width, height }
         .catalog_layout_dims()
-        .ok_or_else(|| "cover analysis PDF page size out of range".to_owned())?;
+        .ok_or_else(|| {
+            CoverAutoAnalysisError::Decode("cover analysis PDF page size out of range".into())
+        })?;
     let rendered = render_cover_pdf(
         path,
         read,
@@ -230,7 +275,15 @@ pub(crate) fn decode_cover_auto_analysis_pdf(
         validity,
         cancel_policy,
     )
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| {
+        if cancel_policy == crate::pdf_loader::CancelWaitPolicy::AbortOnCancel
+            && cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        {
+            CoverAutoAnalysisError::Cancelled
+        } else {
+            CoverAutoAnalysisError::ReadFailed(error.to_string())
+        }
+    })?;
     Ok(CoverAutoAnalysis {
         image: rendered.image,
         decoder: crate::stats::DecodeSource::Native,
@@ -275,7 +328,57 @@ mod tests {
         assert_eq!(result.image.to_rgb8(), image.to_rgb8());
         assert_eq!(result.native_dims, (73, 129));
         let cancel = Arc::new(AtomicBool::new(true));
-        assert!(decode_cover_auto_analysis_image(source, Some(&image), Some(&cancel)).is_err());
+        assert!(matches!(
+            decode_cover_auto_analysis_image(source, Some(&image), Some(&cancel)),
+            Err(CoverAutoAnalysisError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn cover_auto_analysis_preserves_os_failure_and_data_decode_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            decode_cover_auto_analysis_image(
+                Source::Path(&temp.path().join("missing.jpg")),
+                None,
+                None
+            ),
+            Err(CoverAutoAnalysisError::ReadFailed(_))
+        ));
+        assert!(matches!(
+            decode_cover_auto_analysis_image(
+                Source::Bytes {
+                    bytes: b"broken JPEG",
+                    hint: "page.jpg"
+                },
+                None,
+                None
+            ),
+            Err(CoverAutoAnalysisError::Decode(_))
+        ));
+        for kind in [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::Unsupported,
+        ] {
+            assert!(matches!(
+                CoverAutoAnalysisError::from_image(
+                    image::ImageError::IoError(std::io::Error::new(kind, "data")),
+                    None
+                ),
+                CoverAutoAnalysisError::Decode(_)
+            ));
+        }
+        assert!(matches!(
+            CoverAutoAnalysisError::from_image(
+                image::ImageError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "I/O"
+                )),
+                None
+            ),
+            CoverAutoAnalysisError::ReadFailed(_)
+        ));
     }
 
     #[test]

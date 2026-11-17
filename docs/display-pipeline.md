@@ -532,9 +532,9 @@ JPEG DCT と PDF render の目標を範囲に応じて広げ、WIC・image crate
 種類除外等の代替要求は範囲付きキーを引き継がず、自身のキーへ保存する。
 ドライブ一覧は範囲・自動 identity のない近似行だけを参照し、Remote の本タイルは既存のピン省略を維持する。
 
-`thumb_cover_auto_crop`（既定 OFF）が ON の場合、手動範囲のないファイルの本（ZIP・PDF・EPUB・変換済み書庫・ZipDir）の
+`thumb_cover_auto_crop`（既定 OFF）が ON の場合、手動範囲のないファイルの本（ZIP・PDF・EPUB・変換済み書庫・直接読むRAR/CBR・ZipDir）の
 代表だけを worker で自動判定する。既定の綴じ方向を使い、本別の見開き設定は読まない。
-編集 preview のある固定ページは従来の preview を優先し、RAW・動画・音声・ネスト ZIP・直接読む RAR は判定しない。
+編集 preview のある固定ページは従来の preview を優先し、RAW・動画・音声・ネスト ZIP は判定しない。
 判定用 decode は worker・範囲画面・評価器で共用し、JPEG は EXIF 後の高さが1024以上になる最小のDCT倍率（元が小さければ等倍）、
 PDF は高さ1024、その他は全体 decode とする。表示サイズの設定には依存しない。
 近傍ページの比率はEXIF/WICの向きと各ページの保存回転を一度ずつ反映した寸法から取り、判定用画像を各保存回転へ回してから高さ256の解析 raster に通す。
@@ -542,6 +542,14 @@ PDF は高さ1024、その他は全体 decode とする。表示サイズの設�
 類似画像索引には従来どおり全体の raster を渡す。全方向の範囲の有効長辺が表示では `display_px`、保存では `thumb_px` に届く全体画素を持ち、
 全体長辺4096を上限とする。必要なら同じ bytes / PDF lease から大きい画像を一度だけ得る。
 基本キーは種類設定の後、pin の前に `|autocrop:v4:rtl` / `|autocrop:v4:ltr` を持つ。手動範囲には付けない。
+RAR/CBRの本（`archivethumb:rar:`）と、物理の読み取り先がRARのZipDirは `|autocrop:v4r:{binding}` を使う。
+単一の `auto_token` に要求path／`tree.zip_path`を渡して印を選ぶため、変換ZIPの中のZipDirはv4のまま、RARの本のキーはDirect/CachedZip/Pendingで共通になる。
+RARの標本もZIPと同じ名前順・近傍の最大8枚を選び、一覧サイズで1枚32MiB・合計64MiBの読む集合を先に固定して1回のopenで展開する。
+寸法は共通probeで取り、本文の保存回転は読み取ったRARのページキーを使う。CRC・ヘッダ破損は残りをNoneとして判定し、OS読取失敗・cancelは型付き中断とする。
+中断はcatalogへ保存せず、ReadFailedは全体画素をSourcePixels→非保存Finalizedで表示する。判定用decodeのデータ破損は従来どおりNotAutomatic。
+Automaticの保存時間判定には標本読み取り・判定用decode・判定を加える。PDFの完了済みrenderをHarvestOnCancelで回収する区別は保つ。
+本文回転の削除照合は本番の書庫builder＋印を使い、親一覧なしで直接開いたRARも外側をArchiveとして正規化する。
+DirectとCachedZipの入れ替わりに既存行のcoverが追従しない制約は今回変更しない（[表紙計画§30.2](cover-crop-plan.md)）。
 `thumb_cover_auto_crop_folders`（既定OFF）が有効なフォルダは `|autocrop:v4f:{binding}` を使い、直下から選んだ画像だけを判定する。
 代表選択時の一覧を名前順に渡し、再走査せず最大8枚の先頭256KiBから比率と寸法を得る。再帰先の画像・Seededピンは親が判定しない。
 K2は子の素材の種類と4方向の結果をそのままコピーする。自動の指示がある代替要求は指示と元の pinned key を保持する。

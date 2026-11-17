@@ -2469,7 +2469,7 @@ P案の本文proof/codec変更やK2内生成を承認したものではなく、
 
 ### 30.9 利用者に確認すること (推奨案つき)
 
-- 上限の値: **推奨 1 枚 32 MiB・合計 64 MiB**。ふつうの漫画の 1 ページは 0.5〜5 MB 程度なので、ほとんどの本は 8 枚とも読む。大きな PNG の本で合計に当たると
+- 上限の値: **1 枚 32 MiB・合計 64 MiB (利用者決定 2026-11-18、統括経由。推奨どおり)**。ふつうの漫画の 1 ページは 0.5〜5 MB 程度なので、ほとんどの本は 8 枚とも読む。大きな PNG の本で合計に当たると
   読む枚数が減り、3 枚未満なら切らない (今の表示のまま)。
 - 初回の費用: 自動 ON で RAR の本を初めて表示するとき、本ごとに本文を最大 8 枚 (64 MiB まで) 展開するので、その本のタイルが出るまでの時間が延び、
   同じ heavy I/O の列の後ろのタイルも遅れる。2 回目以降はキャッシュから出す。自動 OFF (既定) では何も変わらない。
@@ -2505,3 +2505,64 @@ P案の本文proof/codec変更やK2内生成を承認したものではなく、
   → 照合案を取り下げ、読み取り元の入れ替わりは自動 OFF にもある出荷済みの不一致として別の項目に切り出した (§30.2)。§1.778 では入れ替わった本に限る制約として受け入れる。
 - r4 (同じレビュー担当、`40f111127` に対して、**ACCEPT**、指摘なし): 範囲の分離は妥当。§1.778 の受け入れ条件 (判定の保存と再利用、RAR の更新・サムネイルキャッシュの消去での再判定、中断の非保存、上限、計測、手動の範囲指定) は残っている。
   ここでいう「キャッシュの消去」はサムネイルキャッシュで、変換 ZIP のキャッシュの消去に伴う読み取り元の入れ替わりは別件の制約に含まれる。
+
+### 30.12 実装記録（2026-11-18）
+
+- 作業ツリー `G:\home\mimageviewer-778`、`feat-778-rar-cover-crop` の未コミット差分。利用者の書庫・評価画像・通常設定は使わず、製品は起動しない。
+- `thumb_loader::auto_token` に印の選択を集約した。RAR/CBR tileは読み取り元によらずv4r、ZipDirは要求path／`tree.zip_path`がRARのときだけv4r。
+  再正規化・種類設定・固定・ピンなしを含む存続集合・catalogのNULL/不正値・rating一覧・評価器も接続した。v4/v1/K2の対象は広げず、schema/codecは変えていない。
+- `cover_auto_sample::select_archive_samples` にZIPとRARの候補除外・名前順・前後8枚を集約した。
+  RARは一覧のunpacked_sizeで32MiB/64MiBの集合を先に決め、重複名を通常読取と同じ規則で照合し、1回のprocessing openで対象だけ展開する。
+  CRC/ヘッダ破損はその走査を終えて未読枠をNoneにし、本文の保存回転は物理のRARのviewerページキーを使う。
+- 読み取り境界の `SampleRead`、全体の `SampleAbort`、判定用decodeの `CoverAutoAnalysisError` でデータ破損と中断を区別した。
+  ZIPのentry読み取り・フォルダのopen/read・unrar・判定用decode・PDFのPageSizes/renderからenumで運ぶ。
+  workerはReadFailedを切らないSourcePixels→非保存Finalizedへ、Cancelledを既存の取消完了へ通す。force-cacheでも中断を保存しない。
+  PDFのHarvestOnCancelは完了した結果を保つ。範囲画面の中断は「本文のページを読めませんでした」と表示する。
+- Automatic素材の保存時間判定に標本・判定用decode・判定を加え、閾値と形式の常時保存規則を維持した。
+  `thumb/auto_cover_sample` の各数値とoutcome、`thumb/auto_cover_crop` のsample_ms/cancelled/read-failedを追加した。
+  既存のperf event出力で項目別に確認できるため、`analyze_perf.py` に今回専用の集計は増やしていない。
+- §29は形式付きの本番builderで照合し、Direct RARの未保存要求の代表解決と、親一覧・変換DBのないRARのroot ownerを修正した。
+  ZipDir hintだけ残るmemoryにも外側書庫のwriterキーを照合する。Direct/CachedZipの入れ替わりへの追従は§30.2どおり変更していない。
+- 範囲画面は既存の手動経路を維持し、自動の初期枠→OK→固定キーで切った画→手動解除→自動復帰をheadless回帰で検査する。
+  BOOK_LISTはRAR/CBRを受け付け、同じsamplerへ通す。混在リストのsummaryの既存algorithmは互換のため維持し、各行のalgorithmとsummaryのalgorithms配列でv4rを識別する。
+- 合成fixtureは `testdata/archives/cover-auto-rar/` と生成用ignored testに置いた。非ソリッド・パスワードなしで、CRC破損も合成書庫から作る。
+  **このディレクトリは既存.gitignoreの対象なので、設計担当のコミット時には `git add -f -- testdata/archives/cover-auto-rar` が必要。**
+
+主な追加・更新回帰:
+
+- `rar_auto_key_golden_uses_logical_tiles_and_physical_zipdirs`、`rar_auto_key_normalization_binding_and_off_round_trip`、`rar_auto_request_renormalizes_all_row_keys_with_physical_path`。
+- `cover_auto_rar_zipdir_request_and_survival_use_physical_archive_even_when_pinned`、`cover_auto_rating_rar_survival_uses_current_v4r_key`、catalogの現行印NULL/不正値回帰。
+- `shared_archive_selection_preserves_zip_dot_name_and_prefix_rules`、`rar_sampler_matches_zip_selection_and_reads_one_processing_scan`、`rar_sample_scope_duplicate_names_and_saved_rotation_use_viewer_keys`、`rar_sampler_limits_are_inclusive_and_fixed_before_extraction`。
+- `rar_sampler_cover_only_and_two_pages_are_judged_declines`、`sample_boundaries_keep_os_errors_cancel_and_data_separate`、`rar_crc_failure_retains_earlier_reads_and_unknown_remaining_slots`、`rar_header_failure_is_judged_data_and_keeps_earlier_pages`。
+- `zip_sample_entry_io_retains_os_error_instead_of_unreadable_data`、`zip_sample_crc_is_an_unknown_slot_and_cancel_stays_distinct`、`zip_sample_source_open_failure_aborts_even_without_candidates`、`unrar_read_errors_preserve_data_versus_io_at_the_boundary`。
+- `cover_auto_rar_worker_saves_v4r_and_reuses_judged_and_declined_without_sampling`、`cover_auto_worker_sample_io_failure_displays_uncropped_and_does_not_force_save`、`cover_auto_worker_sample_cancel_uses_existing_cancel_completion_without_saving`。
+- `cover_auto_rar_sampling_cost_is_cached_without_changing_threshold_or_policy`、`cover_auto_rar_updated_stamp_and_thumbnail_cache_clear_rejudge`、`cover_auto_worker_analysis_decode_cancel_is_not_a_saved_not_automatic_decision`、`cover_auto_analysis_preserves_os_failure_and_data_decode_failure`。
+- `cover_crop_direct_rar_initial_auto_ok_fixed_pixels_and_clear_restore_auto`、`evaluation_book_list_accepts_real_rar_and_cbr_with_shared_body_sampler`。
+- `cover_rotation_archive_rows_use_production_format_builder_for_every_key_shape`、`cover_rotation_direct_rar_without_parent_or_conversion_rows_deletes_tile_and_zipdirs`、`cover_rotation_late_rar_memory_with_only_zipdir_hint_uses_outer_writer_key`。
+
+検証は共有runner（Owner `778 impl`）で1本ずつ集約する。子TEMP/TMPは作業ツリーのtarget/tmp、FFmpeg DLLはtarget/debug/depsへ実体コピー。
+初回core checkはTurboJPEGのMSBuildで失敗（exit 101、Rust本体の型検査前）。§29.12と同じく、同じturbojpeg-sys 1.2.0の既存Debug/静的CRT成果物を
+target/native/turbojpegへ実体コピーし、検証プロセスだけTURBOJPEG_SOURCE=explicitで指定する。LibRaw用に同じ静的libのbasenameと通常表記のincludeパスも補った。
+依存設定・Cargo.lock・本体作業ツリーは変更しない。検証プロセスの環境設定は `target/verification-778/env.ps1`、出力ログも同ディレクトリへ保存する。
+
+- `cargo check -p mimageviewer --bin mimageviewer-core`: **成功（exit 0）**。ログ `check-native-include.log`。初回のnative依存準備の失敗は製品テストの失敗とは数えない。
+- `cargo test -p mimageviewer --lib cover_auto_sample::rar_tests::generate_cover_auto_rar_fixtures -- --ignored --exact`: **1成功・0失敗**。Rust共通生成器とRar.exeでfixture全6本を再生成した（合計66,409 bytes）。ログ `fixture-generation.log`。
+- 焦点nextest（783件、run ID `6b926c51-7a97-4393-8ce7-b0557a89fbf6`）は **782成功、新規範囲画面テスト1件を中断**。
+  `setup_app_for_test()` が所有する隔離ロックを、テストの外側の `TestDataDirGuard` で二重取得したハーネス不備を確認し、その1プロセスだけを終了した。
+  外側guardを削除し、製品コードは変えずに該当テストだけ再実行して **1成功・0失敗**（run ID `ad53aad8-4888-4c03-bd4c-99655fdfafa6`）。
+  正常な782件の結果は変更のない経路の検証として再利用し、焦点対象783件に未解決の失敗はない。ログ `focused.log`、`dialog-regression.log`。
+
+焦点コマンド（既定features / test profile、shared runnerで直列実行）:
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/cover_auto|cover_crop|cover_rotation|cover_cache|representative_cache_key|auto_material|folder_auto|folder_thumb|catalog|rar_loader|zip_loader|color_filter|rar_auto|pdf.*(cancel|harvest)/)' --test-threads 6 --retries 0 --no-fail-fast --no-tests fail
+cargo nextest run -p mimageviewer --lib -E 'test(=ui_dialogs::cover_crop::tests::cover_crop_direct_rar_initial_auto_ok_fixed_pixels_and_clear_restore_auto)' --test-threads 1 --retries 0 --no-tests fail
+```
+
+実装担当が作業中に行った自己確認（読み取り専用）で、テストのZipDir/CachedZip共通キー期待と公開文書の句点漏れを修正した（設計担当が依頼する独立実装レビューとは別）。
+利用者指定によりlib全件・build-dev・製品起動・実データ評価・commitは行わず、設計担当へ引き継ぐ。
+
+- `cargo test -p mimageviewer --test ui_snapshot cover_ -- --test-threads=1`: **5成功・0失敗、PNG更新なし**。ログ `snapshots.log`。
+- `python scripts/check_ui_glyphs.py`: 危険なグリフ0。`python scripts/check_site_cards.py`: **53カード・超過0**。
+- `cargo fmt`（引数なし）と `git diff --check`: 成功。整形だけで無関係なファイルは変更していない。
+- 実機での初回/キャッシュ利用時の時間比較、lib全件・確認用build・起動は未実施。共有runnerのsandbox fallbackではBelowNormal・build jobs 6で実行した。
