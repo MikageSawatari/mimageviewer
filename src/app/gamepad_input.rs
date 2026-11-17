@@ -8252,11 +8252,16 @@ impl App {
             ) {
                 return;
             }
-            self.handle_grid_tree_folder_nav(forward, source);
+            self.handle_grid_tree_folder_nav(ctx, forward, source);
         }
     }
 
-    fn handle_grid_tree_folder_nav(&mut self, forward: bool, source: &'static str) {
+    fn handle_grid_tree_folder_nav(
+        &mut self,
+        ctx: &egui::Context,
+        forward: bool,
+        source: &'static str,
+    ) {
         self.bump_input_seq(
             source,
             Some(if forward { "tree_forward" } else { "tree_back" }),
@@ -8281,7 +8286,7 @@ impl App {
         } else if self.items_are_subfolder_expansion_view {
             self.cancel_pending_folder_nav();
         } else if self.zip_nav_handle_ctrl_updown(forward) {
-        } else if self.start_smart_folder_scope_nav(forward, false) {
+        } else if self.start_list_origin_grid_navigation(ctx, forward, false) {
         } else if let Some(cur) = self.effective_folder() {
             self.start_folder_nav(cur, forward, FolderNavMode::Grid);
         }
@@ -8331,6 +8336,7 @@ impl App {
                 || self.items_are_smart_folder_view
             {
                 self.cancel_pending_folder_nav();
+            } else if self.start_list_origin_grid_navigation(ctx, forward, true) {
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, forward, FolderNavMode::SiblingGrid);
             }
@@ -9929,8 +9935,7 @@ impl App {
             self.cancel_pending_folder_nav();
         } else if self.zip_nav_handle_ctrl_updown(forward) {
             // ネスト ZIP 内: ツリーを DFS で前後のノードへ (#4 改)。端では false → 下で ZIP を抜ける。
-        } else if self.start_collection_outer_grid_navigation(ctx, forward) {
-        } else if self.start_smart_folder_scope_nav(forward, false) {
+        } else if self.start_list_origin_grid_navigation(ctx, forward, false) {
         } else if let Some(cur) = self.effective_folder() {
             self.start_folder_nav(cur, forward, FolderNavMode::Grid);
         }

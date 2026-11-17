@@ -272,7 +272,18 @@ book 内部のページ順、archive 列挙、通常の前後ページ操作は�
 Collection surface / child origin が有効なときだけ、外側の folder/book traversal を最新
 prepared snapshot の effective order から作る。登録された Folder / Zip / Pdf /
 ConvertibleArchive の root entry を順に使い、Folder の子を outer sequence へ再帰追加しない。
-collection 外、通常 Folder、Search、SmartFolder の sibling navigation は既存経路のまま。
+§1.763（2026-11-17 利用者決定）: Collection から開いた本の兄弟移動も同じ outer sequence を使う。
+実装検証で `OuterGrid` の所有者検証が Root の選択行だけを受理し、本内一覧からの既存 Ctrl+上下を
+棄却する欠けを確認した。設計担当の決定（2026-11-18）に従い、PhysicalSource も受理する。
+要求の起点で既存 `CollectionGridPhysicalLoadOwner` を捕捉し、origin anchorのentry/sourceと照合した後、
+`collection_grid_physical_load_owner_is_current` のPhysicalSource規則へ委譲する。context／surface generation／
+intent sequence／fullscreen不在を維持し、positionと現在の論理path／accepted revisionで照合する。
+同じ本の一覧の行世代とwanted revisionの進行は許可し、別の本や採用revisionへの変更後は旧要求を棄却する。
+Rootの既存selected／installed-items条件は変更しない。
+Ctrl+上下の ZIP 内 DFS 優先は維持し、兄弟移動では ZIP 内をたどらず登録した同じ段の本へ移る。
+一覧 Root の兄弟移動は従来の無操作を維持する。Root の画像・動画の全画面では Ctrl+上下と同じ outer sequence を使う。
+collection 外の通常 Folder / Search / 履歴 / タグ等の兄弟移動は既存経路のまま。SmartFolder は
+[§1.257](section257-smart-folder-navigation.md) の §1.763 追補を参照。
 
 ### 7.3 再生中編集
 

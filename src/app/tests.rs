@@ -102502,6 +102502,214 @@ mod smart_folder_transition_tests {
     }
 
     #[test]
+    fn section1763_smart_siblings_share_ctrl_targets_and_zip_stays_outer() {
+        for zip_book in [false, true] {
+            for fullscreen in [false, true] {
+                for sibling in [false, true] {
+                    for forward in [false, true] {
+                        let mut app = setup_app();
+                        app.active_quick_folder_slot = None;
+                        app.settings.sort_order = SortOrder::FileName;
+                        let root = app.tmp.path().join("section1763-smart");
+                        let first = root.join("a-before");
+                        let last = root.join("c-after");
+                        let book = root.join(if zip_book { "b-book.zip" } else { "b-book" });
+                        for folder in [&first, &last] {
+                            std::fs::create_dir_all(folder).unwrap();
+                            image::RgbImage::new(2, 2)
+                                .save(folder.join("page.png"))
+                                .unwrap();
+                        }
+                        if zip_book {
+                            let mut writer =
+                                zip::ZipWriter::new(std::fs::File::create(&book).unwrap());
+                            for name in ["root.jpg", "internal/page.jpg"] {
+                                writer
+                                    .start_file(name, zip::write::SimpleFileOptions::default())
+                                    .unwrap();
+                                std::io::Write::write_all(&mut writer, b"fixture").unwrap();
+                            }
+                            writer.finish().unwrap();
+                        } else {
+                            std::fs::create_dir_all(&book).unwrap();
+                            image::RgbImage::new(2, 2)
+                                .save(book.join("page.png"))
+                                .unwrap();
+                        }
+                        let definition = definition("Sibling order", root);
+                        let id = definition.id;
+                        app.settings.smart_folders = vec![definition];
+                        let ctx = egui::Context::default();
+                        app.open_smart_folder(id, false);
+                        wait_for_smart_folder_idle(&mut app, &ctx, id);
+                        let index = select_real_path(&mut app, &book);
+                        if zip_book {
+                            assert!(app.begin_smart_grid_container_navigation(
+                                index,
+                                book.clone(),
+                                false,
+                                StartupListIntent::ExplicitList
+                            ));
+                            wait_for_staged_smart_terminal(&mut app, &ctx);
+                        } else {
+                            app.open_staged_smart_folder_and_wait(&ctx, &book);
+                        }
+                        let expected = app
+                            .top_level_grid_view
+                            .smart_folder()
+                            .unwrap()
+                            .entry_at_offset(forward)
+                            .unwrap()
+                            .to_path_buf();
+                        let from = app
+                            .items
+                            .iter()
+                            .position(|item| {
+                                matches!(item, GridItem::Image(_) | GridItem::ZipImage { .. })
+                            })
+                            .unwrap();
+                        if fullscreen {
+                            app.fullscreen_idx = Some(from);
+                            if sibling {
+                                app.handle_fullscreen_sibling_nav_context(
+                                    &ctx, from, forward, false,
+                                );
+                            } else {
+                                app.handle_fullscreen_ctrl_nav_context(&ctx, from, forward, false);
+                            }
+                        } else {
+                            section1763_grid_key(
+                                &mut app,
+                                match (sibling, forward) {
+                                    (true, true) => egui::Key::PageDown,
+                                    (true, false) => egui::Key::PageUp,
+                                    (false, true) => egui::Key::ArrowDown,
+                                    (false, false) => egui::Key::ArrowUp,
+                                },
+                            );
+                        }
+                        if zip_book && !sibling && forward {
+                            assert!(app.folder_nav_pending.is_none());
+                            assert!(app.items.iter().any(|item| matches!(item, GridItem::ZipImage { entry_name, .. } if entry_name == "internal/page.jpg")));
+                        } else {
+                            assert!(matches!(
+                                app.folder_nav_pending.as_ref().map(|pending| &pending.mode),
+                                Some(FolderNavMode::SmartFolder { .. })
+                            ));
+                            drain_smart_folder_nav(&mut app, &ctx);
+                            assert_eq!(app.effective_folder(), Some(expected));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn section1763_grid_key(app: &mut App, key: egui::Key) {
+        let ctx = egui::Context::default();
+        let modifiers = egui::Modifiers::CTRL;
+        ctx.begin_pass(egui::RawInput {
+            events: vec![
+                egui::Event::ModifiersChanged(modifiers),
+                egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                },
+            ],
+            ..Default::default()
+        });
+        app.handle_keyboard(&ctx);
+        ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn section1763_smart_mixed_burst_lock_and_root_boundary() {
+        for fullscreen in [false, true] {
+            let mut app = setup_app();
+            app.active_quick_folder_slot = None;
+            app.settings.sort_order = SortOrder::FileName;
+            let root = app.tmp.path().join("section1763-smart-burst");
+            let entries = ["a", "b", "c"].map(|name| root.join(name));
+            for folder in &entries {
+                std::fs::create_dir_all(folder).unwrap();
+                image::RgbImage::new(2, 2)
+                    .save(folder.join("page.png"))
+                    .unwrap();
+            }
+            let definition = definition("Sibling burst", root);
+            let id = definition.id;
+            app.settings.smart_folders = vec![definition];
+            let ctx = egui::Context::default();
+            app.open_smart_folder(id, false);
+            wait_for_smart_folder_idle(&mut app, &ctx, id);
+            section1763_grid_key(&mut app, egui::Key::PageDown);
+            assert!(
+                app.folder_nav_pending.is_none(),
+                "root list keeps its no-op"
+            );
+            app.open_staged_smart_folder_and_wait(&ctx, &entries[0]);
+            if fullscreen {
+                app.fullscreen_idx = Some(0);
+                app.handle_fullscreen_sibling_nav_context(&ctx, 0, true, false);
+                let cancel = Arc::clone(&app.folder_nav_pending.as_ref().unwrap().cancel);
+                app.handle_fullscreen_ctrl_nav_context(&ctx, 0, true, false);
+                app.handle_fullscreen_sibling_nav_context(&ctx, 0, false, false);
+                assert_eq!(app.pending_folder_nav_steps, 0);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let result = loop {
+                    if let Some(result) = app.poll_folder_nav() {
+                        break result;
+                    }
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::yield_now();
+                };
+                app.apply_folder_nav_result(&ctx, result);
+                assert!(app.staged_smart_fullscreen_ctrl_step_available());
+                app.handle_fullscreen_sibling_nav_context(&ctx, 0, true, false);
+                assert!(!cancel.load(Ordering::Relaxed));
+            } else {
+                for key in [
+                    egui::Key::PageDown,
+                    egui::Key::ArrowDown,
+                    egui::Key::PageUp,
+                    egui::Key::PageDown,
+                ] {
+                    section1763_grid_key(&mut app, key);
+                }
+            }
+            if !fullscreen {
+                assert_eq!(app.pending_folder_nav_steps, 1);
+            }
+            drain_smart_folder_nav(&mut app, &ctx);
+            assert_eq!(app.effective_folder().as_ref(), Some(&entries[2]));
+            app.finish_fs_navigation_sequence(FsNavigationSequenceFinish::RequestFailed);
+            if fullscreen {
+                app.fullscreen_idx = Some(0);
+                app.handle_fullscreen_sibling_nav_context(&ctx, 0, true, false);
+            } else {
+                section1763_grid_key(&mut app, egui::Key::PageDown);
+            }
+            drain_smart_folder_nav(&mut app, &ctx);
+            assert_eq!(app.effective_folder().as_ref(), Some(&entries[2]));
+            if fullscreen {
+                assert!(matches!(
+                    app.fs_boundary_hint,
+                    Some(crate::ui_fullscreen::FsBoundaryHint::SearchEnd { forward: true, .. })
+                ));
+            } else {
+                assert!(
+                    app.feedback_toasts_for_test
+                        .iter()
+                        .any(|(text, _)| text == "スマートフォルダ内の次のフォルダはありません")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn smart_folder_ctrl_down_from_entry_a_to_c_returns_cursor_to_c() {
         let mut app = setup_app();
         app.active_quick_folder_slot = None;

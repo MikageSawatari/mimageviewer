@@ -35,6 +35,15 @@ struct CollectionNavigationOrigin {
     items_generation: u64,
     intent_sequence: u64,
     anchor: Option<CollectionNavigationAnchor>,
+    grid_source: CollectionNavigationGridSource,
+}
+
+/// Grid roots validate the selected row; physical book lists keep their accepted
+/// source owner through asynchronous traversal, independently of row refreshes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CollectionNavigationGridSource {
+    Root,
+    PhysicalSource(Box<super::top_level_grid_view::CollectionGridPhysicalLoadOwner>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1543,6 +1552,7 @@ impl App {
         let partner =
             partner_idx.and_then(|index| Self::collection_navigation_identity_at(prepared, index));
         Some(CollectionNavigationOrigin {
+            grid_source: CollectionNavigationGridSource::Root,
             context_id: self.collection_grid_context_id(),
             collection_id: session.identity.collection_id,
             surface_generation: self.top_level_grid_view.generation(),
@@ -1588,7 +1598,19 @@ impl App {
                 }
                 CollectionGridPosition::Root => None,
             };
+            let grid_source = if current_idx.is_none()
+                && matches!(
+                    session.position,
+                    CollectionGridPosition::PhysicalSource { .. }
+                ) {
+                CollectionNavigationGridSource::PhysicalSource(Box::new(
+                    self.collection_grid_physical_reload_owner(&self.effective_folder()?)?,
+                ))
+            } else {
+                CollectionNavigationGridSource::Root
+            };
             return Some(CollectionNavigationOrigin {
+                grid_source,
                 context_id: self.collection_grid_context_id(),
                 collection_id: session.identity.collection_id,
                 surface_generation: self.top_level_grid_view.generation(),
@@ -1611,6 +1633,7 @@ impl App {
                 partner: None,
             });
         Some(CollectionNavigationOrigin {
+            grid_source: CollectionNavigationGridSource::Root,
             context_id: self.collection_grid_context_id(),
             collection_id: restore.identity.collection_id,
             surface_generation: self.top_level_grid_view.generation(),
@@ -2020,6 +2043,113 @@ impl App {
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         *outer = true;
+    }
+
+    /// Share the origin's order between tree and sibling input. The caller keeps its
+    /// existing snapshot/search/filter priority and (for tree input) ZIP-internal DFS.
+    pub(crate) fn start_list_origin_grid_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        forward: bool,
+        sibling: bool,
+    ) -> bool {
+        if sibling
+            && self
+                .top_level_grid_view
+                .collection_session()
+                .is_some_and(|session| matches!(session.position, CollectionGridPosition::Root))
+        {
+            return false;
+        }
+        self.start_collection_outer_grid_navigation(ctx, forward)
+            || ((!sibling || self.smart_folder_book_navigation_available())
+                && self.start_smart_folder_scope_nav(forward, false))
+    }
+
+    pub(crate) fn smart_folder_book_navigation_available(&self) -> bool {
+        self.top_level_grid_view
+            .smart_folder()
+            .is_some_and(|state| {
+                !matches!(
+                    state.position,
+                    super::top_level_grid_view::SmartFolderPosition::Root
+                )
+            })
+    }
+
+    pub(crate) fn has_detached_collection_navigation_origin(&self) -> bool {
+        self.top_level_grid_view.collection_session().is_none()
+            && matches!(
+                self.top_level_grid_view.return_to(),
+                Some(TopLevelGridRestore::Collection(_))
+            )
+    }
+
+    pub(crate) fn start_list_origin_fullscreen_navigation(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        forward: bool,
+        native_toast: bool,
+        sibling: bool,
+    ) -> bool {
+        if self.start_collection_outer_fullscreen_navigation(
+            ctx,
+            fs_idx,
+            forward,
+            false,
+            native_toast,
+        ) {
+            return true;
+        }
+        if self.top_level_grid_view.smart_folder().is_some()
+            && (!sibling || self.smart_folder_book_navigation_available())
+        {
+            self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
+            return self.start_smart_folder_scope_nav(forward, true);
+        }
+        false
+    }
+
+    /// An unresolved origin-order request already owns its destination sequence. Admit
+    /// compatible presses before the generic sequence gate, without routing a new target.
+    pub(crate) fn list_origin_fullscreen_navigation_can_accumulate(&self, sibling: bool) -> bool {
+        self.top_level_grid_view
+            .collection_outer_navigation_available(true)
+            || ((!sibling || self.smart_folder_book_navigation_available())
+                && (self.staged_smart_fullscreen_ctrl_step_available()
+                    || matches!(
+                        self.inflight_fullscreen_folder_nav_mode(false),
+                        Some(super::FolderNavMode::SmartFolder { .. })
+                    )))
+    }
+
+    pub(crate) fn accumulate_list_origin_fullscreen_navigation(
+        &mut self,
+        forward: bool,
+        sibling: bool,
+    ) -> bool {
+        if self
+            .top_level_grid_view
+            .accumulate_collection_outer_navigation(true, forward)
+        {
+            return true;
+        }
+        if !sibling || self.smart_folder_book_navigation_available() {
+            if self.accumulate_staged_smart_fullscreen_ctrl_step(forward) {
+                return true;
+            }
+            if let Some(mode @ super::FolderNavMode::SmartFolder { .. }) =
+                self.inflight_fullscreen_folder_nav_mode(false)
+            {
+                // The same-kind branch of start_folder_nav only extends its existing worker.
+                if let Some(current) = self.effective_folder() {
+                    self.start_folder_nav(current, forward, mode);
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub(crate) fn start_collection_outer_grid_navigation(
@@ -3237,29 +3367,41 @@ impl App {
             }
             CollectionNavigationAction::OuterGrid { .. } => {
                 self.fullscreen_idx.is_none()
-                    && self
-                        .top_level_grid_view
-                        .collection_session()
-                        .filter(|session| {
-                            matches!(session.position, CollectionGridPosition::Root)
-                                && session.installed_items_generation == Some(self.items_generation)
-                        })
-                        .is_some_and(|session| {
-                            let selected = self.selected.and_then(|index| {
-                                session.prepared()?.entries.get(index).map(|entry| {
-                                    CollectionNavigationEntryIdentity {
-                                        entry_id: entry.entry_id,
-                                        source_key: entry.source_key.clone(),
-                                    }
-                                })
-                            });
-                            let requested = request
-                                .origin
-                                .anchor
-                                .as_ref()
-                                .map(|anchor| anchor.primary.clone());
-                            selected == requested
-                        })
+                    && match &request.origin.grid_source {
+                        CollectionNavigationGridSource::PhysicalSource(owner) => {
+                            request.origin.anchor.as_ref().is_some_and(|anchor| {
+                                anchor.primary.entry_id == owner.anchor.entry_id
+                                    && anchor.primary.source_key == owner.anchor.source_key
+                            }) && self.collection_grid_physical_load_owner_is_current(
+                                owner,
+                                &owner.target_path,
+                            )
+                        }
+                        CollectionNavigationGridSource::Root => self
+                            .top_level_grid_view
+                            .collection_session()
+                            .filter(|session| {
+                                matches!(session.position, CollectionGridPosition::Root)
+                                    && session.installed_items_generation
+                                        == Some(self.items_generation)
+                            })
+                            .is_some_and(|session| {
+                                let selected = self.selected.and_then(|index| {
+                                    session.prepared()?.entries.get(index).map(|entry| {
+                                        CollectionNavigationEntryIdentity {
+                                            entry_id: entry.entry_id,
+                                            source_key: entry.source_key.clone(),
+                                        }
+                                    })
+                                });
+                                let requested = request
+                                    .origin
+                                    .anchor
+                                    .as_ref()
+                                    .map(|anchor| anchor.primary.clone());
+                                selected == requested
+                            }),
+                    }
             }
         }
     }
@@ -4838,6 +4980,10 @@ impl CollectionResolvedKindExt for CollectionResolvedKind {
 }
 
 #[cfg(test)]
+#[path = "collection_sibling_navigation_tests.rs"]
+mod sibling_navigation_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::{AppTestEnvForTest, setup_app_for_test};
@@ -4850,6 +4996,7 @@ mod tests {
     ) -> CollectionNavigationRequest {
         CollectionNavigationRequest {
             origin: CollectionNavigationOrigin {
+                grid_source: CollectionNavigationGridSource::Root,
                 context_id,
                 collection_id: CollectionId::new(),
                 surface_generation: app.top_level_grid_view.generation(),
@@ -6063,7 +6210,9 @@ mod tests {
         });
     }
 
-    fn recv<T>(receiver: crossbeam_channel::Receiver<Result<T, CollectionStoreError>>) -> T {
+    pub(super) fn recv<T>(
+        receiver: crossbeam_channel::Receiver<Result<T, CollectionStoreError>>,
+    ) -> T {
         receiver
             .recv_timeout(Duration::from_secs(3))
             .expect("collection actor reply")
@@ -6078,7 +6227,7 @@ mod tests {
         )
     }
 
-    fn start_ready_app(
+    pub(super) fn start_ready_app(
         db_path: &std::path::Path,
     ) -> (
         AppTestEnvForTest,
@@ -6103,7 +6252,9 @@ mod tests {
         (app, client)
     }
 
-    fn prepare_snapshot(snapshot: &CollectionSnapshot) -> Arc<CollectionPreparedSnapshot> {
+    pub(super) fn prepare_snapshot(
+        snapshot: &CollectionSnapshot,
+    ) -> Arc<CollectionPreparedSnapshot> {
         Arc::new(
             crate::collection_store::prepare_collection_snapshot(
                 snapshot,
@@ -7362,6 +7513,7 @@ mod tests {
         app.collection_ui.set_read_phase_for_test(true);
         let ctx = egui::Context::default();
         let origin = CollectionNavigationOrigin {
+            grid_source: CollectionNavigationGridSource::Root,
             context_id: app.collection_grid_context_id(),
             collection_id,
             surface_generation: app.top_level_grid_view.generation(),
@@ -9860,6 +10012,7 @@ mod tests {
                 };
                 let mut request = CollectionNavigationRequest {
                     origin: CollectionNavigationOrigin {
+                        grid_source: CollectionNavigationGridSource::Root,
                         context_id: app.collection_grid_context_id(),
                         collection_id,
                         surface_generation: app.top_level_grid_view.generation(),
@@ -10291,6 +10444,7 @@ mod tests {
             .advance_collection_navigation_sequence();
         let request = CollectionNavigationRequest {
             origin: CollectionNavigationOrigin {
+                grid_source: CollectionNavigationGridSource::Root,
                 context_id: app.collection_grid_context_id(),
                 collection_id,
                 surface_generation: app.top_level_grid_view.generation(),

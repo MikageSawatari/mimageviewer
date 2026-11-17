@@ -59093,6 +59093,8 @@ impl App {
                     let _ = self.snapshot_navigate_grid(forward);
                 } else if self.items_are_subfolder_expansion_view {
                     self.cancel_pending_folder_nav();
+                } else if self.start_list_origin_grid_navigation(ctx, forward, mode.sibling_only())
+                {
                 } else if let Some(folder) = self.effective_folder() {
                     self.start_folder_nav(folder, forward, mode);
                 }
@@ -59954,8 +59956,7 @@ impl App {
             } else if self.zip_nav_handle_ctrl_updown(true) {
                 // ネスト ZIP 内: ツリーを DFS 前順で次のノードへ (#4 改)。ツリーの端では
                 // false が返り、下の effective_folder 分岐で ZIP を抜けて実フォルダ DFS へ。
-            } else if self.start_collection_outer_grid_navigation(ctx, true) {
-            } else if self.start_smart_folder_scope_nav(true, false) {
+            } else if self.start_list_origin_grid_navigation(ctx, true, false) {
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, true, FolderNavMode::Grid);
             }
@@ -59981,8 +59982,7 @@ impl App {
                 self.cancel_pending_folder_nav();
             } else if self.zip_nav_handle_ctrl_updown(false) {
                 // ネスト ZIP 内: ツリーを DFS 逆前順で前のノードへ (#4 改)。
-            } else if self.start_collection_outer_grid_navigation(ctx, false) {
-            } else if self.start_smart_folder_scope_nav(false, false) {
+            } else if self.start_list_origin_grid_navigation(ctx, false, false) {
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, false, FolderNavMode::Grid);
             }
@@ -60002,6 +60002,7 @@ impl App {
                 self.cancel_pending_folder_nav();
             } else if self.items_are_subfolder_expansion_view || self.items_are_smart_folder_view {
                 self.cancel_pending_folder_nav();
+            } else if self.start_list_origin_grid_navigation(ctx, true, true) {
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, true, FolderNavMode::SiblingGrid);
             }
@@ -60016,6 +60017,7 @@ impl App {
                 self.cancel_pending_folder_nav();
             } else if self.items_are_subfolder_expansion_view || self.items_are_smart_folder_view {
                 self.cancel_pending_folder_nav();
+            } else if self.start_list_origin_grid_navigation(ctx, false, true) {
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, false, FolderNavMode::SiblingGrid);
             }

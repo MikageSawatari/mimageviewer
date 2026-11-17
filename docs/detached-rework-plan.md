@@ -1458,6 +1458,19 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-18: §1.763 コレクション由来の兄弟移動の入力共有
+
+- 設計担当の実装依頼（2026-11-17 決定）と Codex の事前確認・独立 Sol / xhigh の設計レビューで、
+  既存の述語・要求所有者を共有する構造的修正であり症状パッチではないと合意した。
+- `has_detached_collection_navigation_origin` に既存 Ctrl+上下の Collection return 判定を抽出し、
+  両全画面 handler とページ一覧の受付で共有する。兄弟は ZIP 内 DFS を経由せず、同じ Collection
+  origin / outer request へ渡す。独立物理窓の述語・scope・viewport・host・placement の規則は変えない。
+- Collection の pending と Smart の worker / staged preflight への混在追加入力も既存 owner に集約する。
+  新しい detached 状態や pending owner、guard、delay、retry、repaint、reset は追加しない。
+  OuterGrid の PhysicalSource 起点には既存の物理 owner を捕捉して検証し、mount 中の context だけが既存処理を実行する。
+- 別窓 Collection 本の移動で main と別の別窓の items / generation / pending / lock が変わらない
+  handler 回帰を追加する。実アプリの起動・実機確認は本実装作業では行わない。
+
 ### 2026-11-17: §1.800 S1 の仮想フォルダと親との対応
 
 設計担当の §4S（独立設計レビュー r10 ACCEPT）と実装の独立レビューで、UI の一回限りの

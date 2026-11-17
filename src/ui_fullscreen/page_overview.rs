@@ -513,26 +513,20 @@ impl App {
             return false;
         };
         let sibling = matches!(action, KeyAction::FsSiblingPrev | KeyAction::FsSiblingNext);
-        if !sibling && self.staged_smart_fullscreen_ctrl_step_available() {
+        if self.list_origin_fullscreen_navigation_can_accumulate(sibling) {
             return true;
         }
         if self.fs_navigation_sequence_blocks_new_target() {
             return false;
         }
         if self.fs_nav_is_locked() {
-            return (!sibling
-                && self
-                    .top_level_grid_view
-                    .collection_outer_navigation_available(true))
+            return self
+                .top_level_grid_view
+                .collection_outer_navigation_available(true)
                 || self.locked_fullscreen_folder_nav_request(sibling).is_some();
         }
-        let collection_available =
-            !sibling && self.collection_outer_fullscreen_navigation_available(idx);
-        let detached_collection_origin = self.top_level_grid_view.collection_session().is_none()
-            && matches!(
-                self.top_level_grid_view.return_to(),
-                Some(crate::app::top_level_grid_view::TopLevelGridRestore::Collection(_))
-            );
+        let collection_available = self.collection_outer_fullscreen_navigation_available(idx);
+        let detached_collection_origin = self.has_detached_collection_navigation_origin();
         if collection_available && detached_collection_origin {
             return true;
         }
@@ -570,10 +564,10 @@ impl App {
         if sibling && self.items_are_smart_folder_view {
             return false;
         }
-        if !sibling
-            && (self.zip_nav.is_some()
-                || collection_available
-                || self.top_level_grid_view.smart_folder().is_some())
+        if collection_available
+            || self.smart_folder_book_navigation_available()
+            || (!sibling
+                && (self.zip_nav.is_some() || self.top_level_grid_view.smart_folder().is_some()))
         {
             return true;
         }
@@ -1603,6 +1597,52 @@ mod thumbnail_tests {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn section1763_overview_accepts_smart_sibling_worker_and_display_wait() {
+        use crate::app::top_level_grid_view::{SmartFolderViewState, TopLevelGridSurface};
+        let mut app = crate::app::setup_app_for_test();
+        let book = app.tmp.path().join("book");
+        let mut state = SmartFolderViewState::root(uuid::Uuid::new_v4(), vec![book.clone()]);
+        assert!(state.enter_containing_path(&book));
+        app.top_level_grid_view
+            .begin(TopLevelGridSurface::SmartFolder(state.clone()), None);
+        app.current_folder = Some(book);
+        app.items = vec![GridItem::Image(app.tmp.path().join("book/page.png"))];
+        app.visible_indices = vec![0];
+        app.thumbnails = vec![ThumbnailState::Pending];
+        app.image_metas = vec![None];
+        app.fullscreen_idx = Some(0);
+        let ctx = egui::Context::default();
+        app.begin_fs_folder_navigation_sequence(&ctx, 0);
+        assert!(app.start_smart_folder_scope_nav(true, true));
+        assert!(app.fs_navigation_sequence_blocks_new_target());
+        assert!(app.page_overview_folder_navigation_available(KeyAction::FsSiblingNext));
+        app.cancel_pending_folder_nav();
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        assert!(app.page_overview_folder_navigation_available(KeyAction::FsSiblingPrev));
+        app.handle_fullscreen_sibling_nav_context(&ctx, 0, false, false);
+        assert!(matches!(
+            app.inflight_fullscreen_folder_nav_mode(false),
+            Some(crate::app::FolderNavMode::SmartFolder { .. })
+        ));
+        app.cancel_pending_folder_nav();
+        #[cfg(windows)]
+        {
+            // A retained main Smart state never changes an independent physical viewer's
+            // sibling display-wait mode into DFS.
+            app.navigation_scope = crate::app::ViewerNavigationScope::DetachedPhysical;
+            app.viewer_presentation = ViewerPresentation::DetachedWindow;
+            app.detached_viewer_independent_active = true;
+            app.fs_nav_locked_gen = Some(app.items_generation);
+            app.handle_fullscreen_sibling_nav_context(&ctx, 0, true, false);
+            assert!(matches!(
+                app.inflight_fullscreen_folder_nav_mode(true),
+                Some(crate::app::FolderNavMode::SiblingFullscreen)
+            ));
+            app.cancel_pending_folder_nav();
+        }
+    }
 
     struct ClearOverviewKeyFrame;
     impl Drop for ClearOverviewKeyFrame {

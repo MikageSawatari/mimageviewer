@@ -753,7 +753,7 @@ committed PDFのpoll保留は出荷済みの状態削減策であり、
 | `quick_folder_switch_owner_is_current` | コピー済みtarget slot/pathだけで行を読まないためsource items世代条件とそのfieldを除く。他のowner／sequence／path条件は維持。現行Quick採用は直接installでこのpredicateを通らないが、native claim契約も同じ規則に揃える |
 | `collection_history_source_is_current`／`prepare_collection_history_child_session` | typed Collection／CollectionPhysical履歴は共通Surfaceと宛先catalog／revision／prepared snapshotを検証。source行世代の追加条件なし |
 | `collection_grid_physical_load_owner_is_current` | Rootは現entryの明示activationなのでitems／entry／revisionを厳密検証。PhysicalSourceはposition／path／revisionでitems条件なし。typed履歴はこのsource-row ownerを生成しない |
-| `collection_navigation_request_is_current`／manual continuation | indexed fullscreen／mediaとprepared entriesをindexで読むmanual continuationは行世代を維持。OuterGridはrefreshを許しselected stable identityを再検証。typed restoreと混同しない |
+| `collection_navigation_request_is_current`／manual continuation | indexed fullscreen／mediaとprepared entriesをindexで読むmanual continuationは行世代を維持。OuterGridのRootは既存のselected stable identity／installed-items条件を維持。PhysicalSourceは捕捉した`CollectionGridPhysicalLoadOwner`へ委譲し、origin anchor、positionのentry/source/path、現在の論理path、accepted revisionを照合する。行世代やwanted revisionの一致は要求しない。typed restoreと混同しない |
 | `main_grid_archive_transition_is_current` | Smart／Rating／Collection native ownerに委譲。通常のcopied archiveには追加行世代条件なし。RatingGrid ownerはExplicitの現行行activation |
 | `smart_folder_transition_request_is_current` | 元navigation／request ID／pathを照合。typed Smart restoreに独立した行世代条件なし。SmartGrid分類は元indexを読むのでRowを維持 |
 | `bookmark_open_owner_is_current`／startup | request ID／target／window leaseを照合。restoreへsource行世代を追加しない |
