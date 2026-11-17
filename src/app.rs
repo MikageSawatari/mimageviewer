@@ -22688,7 +22688,7 @@ impl App {
             .saturating_sub(icon_only)
     }
 
-    /// `auto_aspect` を新フォルダ用にリセットし、catalog の既存比率を一括投入する。
+    /// Reset this generation and seed samples from an already prepared cache map.
     ///
     /// 呼び出し位置: `start_loading_items` 内の `delete_missing()` 完了後、
     /// `spawn_thumbnail_workers()` 起動前。設計: [docs/auto-thumb-aspect-plan.md §4.1.2](../docs/auto-thumb-aspect-plan.md)
@@ -22713,6 +22713,16 @@ impl App {
         aspect_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
         prepared_eligible_total: Option<usize>,
     ) {
+        self.reset_auto_aspect_with_seed(aspect_seed);
+        self.seed_auto_aspect_from_cache(cache_map, prepared_eligible_total);
+    }
+
+    /// Restore the saved initial ratio without building thumbnail requests or
+    /// inspecting cache entries. Ordinary listings collect samples on arrival.
+    pub(crate) fn reset_auto_aspect_with_seed(
+        &mut self,
+        aspect_seed: Option<crate::auto_aspect_cache::AutoAspectCacheEntry>,
+    ) {
         let generation = self.items_generation;
         self.auto_aspect.reset_for_new_generation(generation);
 
@@ -22726,6 +22736,20 @@ impl App {
         // Auto 未確定時の Square を描画しない。通常の空フォルダでも、セルが無いため
         // 前回値を楽観的に保持して問題はない。
         self.restore_cached_auto_aspect(aspect_seed);
+    }
+
+    /// Aggregate and collection installs already own prepared rows. Preserve
+    /// their existing initial sample selection and immediate-decision gates.
+    fn seed_auto_aspect_from_cache(
+        &mut self,
+        cache_map: &Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        >,
+        prepared_eligible_total: Option<usize>,
+    ) {
+        if !self.settings.thumb_aspect_auto {
+            return;
+        }
 
         // 集計対象母数は items ベース (動画含む)。
         let eligible_total = prepared_eligible_total
@@ -44712,10 +44736,13 @@ impl App {
             );
         }
 
-        // ── auto_aspect: items 世代リセット + catalog 既存比率の seed ──
-        // delete_missing 完了後 / spawn_thumbnail_workers 起動前のこの位置で呼ぶ。
-        // この時点で self.items / image_metas / cache_map がすべて確定済み。
-        self.reset_and_seed_auto_aspect_with_seed(&cache_map, auto_aspect_seed, None);
+        // Ordinary listings restore the saved ratio before drawing, then collect
+        // samples as thumbnails arrive. Only aggregates scan already prepared rows.
+        if aggregate_catalog_was_prepared {
+            self.reset_and_seed_auto_aspect_with_seed(&cache_map, auto_aspect_seed, None);
+        } else {
+            self.reset_auto_aspect_with_seed(auto_aspect_seed);
+        }
 
         // ── 進捗カウンタリセット + 共有 display_px 更新 ──
         self.cache_gen_total = 0;

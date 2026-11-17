@@ -23,6 +23,7 @@ pub(super) fn backend_window_for_test(
         },
     )
 }
+mod auto_aspect_s1;
 mod book_close_s1;
 mod repro742;
 mod section1768;
@@ -27630,7 +27631,10 @@ mod phase_c_folder_nav_history_tests {
             app.cancel_token.store(true, Ordering::Relaxed);
             assert_eq!(app.selected, Some(309));
             assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
-            assert_eq!(app.auto_aspect.samples.len(), 24);
+            // §4S.1-7: this Rating install uses the ordinary listing path. Restore
+            // its saved ratio/sample gate, and collect fresh samples on arrival.
+            assert!(app.auto_aspect.samples.is_empty());
+            assert_eq!(app.auto_aspect.cached_sample_gate, Some(555));
             for _ in 0..8 {
                 draw(&mut app, &ctx, &mut frame);
                 assert!(
@@ -27947,7 +27951,10 @@ mod phase_c_folder_nav_history_tests {
             assert_eq!(app.selected, Some(104));
             assert_eq!(app.items[104].container_path(), Some(opened.as_path()));
             if warm {
-                assert_eq!(app.auto_aspect.samples.len(), 24, "real catalog warm seed");
+                // §4S.1-7: warm DB rows no longer seed ordinary listings before
+                // drawing. The saved sample count still protects restored geometry.
+                assert!(app.auto_aspect.samples.is_empty());
+                assert_eq!(app.auto_aspect.cached_sample_gate, Some(24));
                 assert_eq!(app.effective_thumb_aspect(), ThumbAspect::Portrait3x4);
                 assert_eq!(
                     app.auto_aspect.switches_done, 0,
