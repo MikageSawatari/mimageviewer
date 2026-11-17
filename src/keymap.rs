@@ -1824,6 +1824,12 @@ pub enum KeyAction {
     FsFitModeCycle,
     FsZoomIn,
     FsZoomOut,
+    FsPageNScrollNext,
+    FsPageNScrollPrev,
+    FsPageScrollUp,
+    FsPageScrollDown,
+    FsPageScrollLeft,
+    FsPageScrollRight,
     FsAiModelNext,
     FsAiModelPrev,
     FsAiModelReset,
@@ -2442,6 +2448,12 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsFitModeCycle,
     KeyAction::FsZoomIn,
     KeyAction::FsZoomOut,
+    KeyAction::FsPageNScrollNext,
+    KeyAction::FsPageNScrollPrev,
+    KeyAction::FsPageScrollUp,
+    KeyAction::FsPageScrollDown,
+    KeyAction::FsPageScrollLeft,
+    KeyAction::FsPageScrollRight,
     KeyAction::FsAiModelNext,
     KeyAction::FsAiModelPrev,
     KeyAction::FsAiModelReset,
@@ -4703,6 +4715,12 @@ impl KeyAction {
             FsFitModeCycle => "FsFitModeCycle",
             FsZoomIn => "FsZoomIn",
             FsZoomOut => "FsZoomOut",
+            FsPageNScrollNext => "FsPageNScrollNext",
+            FsPageNScrollPrev => "FsPageNScrollPrev",
+            FsPageScrollUp => "FsPageScrollUp",
+            FsPageScrollDown => "FsPageScrollDown",
+            FsPageScrollLeft => "FsPageScrollLeft",
+            FsPageScrollRight => "FsPageScrollRight",
             FsAiModelNext => "FsAiModelNext",
             FsAiModelPrev => "FsAiModelPrev",
             FsAiModelReset => "FsAiModelReset",
@@ -5486,6 +5504,12 @@ impl KeyAction {
             FsFitModeCycle => "ズーム/フィット方式を切り替える",
             FsZoomIn => "画像を拡大する",
             FsZoomOut => "画像を縮小する",
+            FsPageNScrollNext => "ページ内を指定の順 (N 字 / Z 字) で次へ読み進める",
+            FsPageNScrollPrev => "ページ内を指定の順 (N 字 / Z 字) で前へ戻る",
+            FsPageScrollUp => "ページ内を上へスクロールする",
+            FsPageScrollDown => "ページ内を下へスクロールする",
+            FsPageScrollLeft => "ページ内を左へスクロールする",
+            FsPageScrollRight => "ページ内を右へスクロールする",
             FsAiModelNext => "AIモデルを次へ切り替える",
             FsAiModelPrev => "AIモデルを前へ切り替える",
             FsAiModelReset => "AIモデルを標準に戻す",
@@ -6083,6 +6107,12 @@ impl KeyAction {
             | FsFitModeCycle
             | FsZoomIn
             | FsZoomOut
+            | FsPageNScrollNext
+            | FsPageNScrollPrev
+            | FsPageScrollUp
+            | FsPageScrollDown
+            | FsPageScrollLeft
+            | FsPageScrollRight
             | FsAiModelNext
             | FsAiModelPrev
             | FsAiModelReset
@@ -6648,6 +6678,12 @@ impl KeyAction {
             | FsFitModeCycle
             | FsZoomIn
             | FsZoomOut
+            | FsPageNScrollNext
+            | FsPageNScrollPrev
+            | FsPageScrollUp
+            | FsPageScrollDown
+            | FsPageScrollLeft
+            | FsPageScrollRight
             | FsAiModelNext
             | FsAiModelPrev
             | FsAiModelReset
@@ -7233,6 +7269,11 @@ impl KeyAction {
             FsFitModeCycle => digit_pair(Num0, Numpad0),
             FsZoomIn => ChordList::two(Chord::key(Period), Chord::key(NumpadAdd)),
             FsZoomOut => ChordList::two(Chord::key(Comma), Chord::key(NumpadSubtract)),
+            FsPageNScrollNext => ChordList::one(Chord::key(K)),
+            FsPageNScrollPrev => ChordList::one(Chord::key(J)),
+            FsPageScrollUp | FsPageScrollDown | FsPageScrollLeft | FsPageScrollRight => {
+                ChordList::EMPTY
+            }
             FsAiModelNext => ChordList::one(Chord::key(U)),
             FsAiModelPrev => ChordList::one(Chord::shift(U)),
             FsAiModelReset => ChordList::one(Chord::alt(U)),
@@ -17019,6 +17060,244 @@ mod tests {
             keymap.warnings()
         );
         assert!(keymap.overrides.is_empty());
+    }
+
+    #[test]
+    fn page_scroll_actions_have_image_scope_single_press_and_expected_defaults() {
+        for (action, key) in [
+            (KeyAction::FsPageNScrollNext, Some(KeySlot::K)),
+            (KeyAction::FsPageNScrollPrev, Some(KeySlot::J)),
+            (KeyAction::FsPageScrollUp, None),
+            (KeyAction::FsPageScrollDown, None),
+            (KeyAction::FsPageScrollLeft, None),
+            (KeyAction::FsPageScrollRight, None),
+        ] {
+            assert!(KeyAction::all().contains(&action));
+            assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));
+            assert_eq!(action.context(), KeyContext::FsImage);
+            assert_eq!(action.trigger(), KeyTrigger::Press);
+            assert_eq!(
+                action.press_multiplicity(),
+                PressMultiplicity::SinglePerFrame
+            );
+            assert!(action.is_user_facing());
+            assert!(!page_overview_action_allowed(action));
+            assert_eq!(
+                action.default_chords().iter().collect::<Vec<_>>(),
+                key.map(Chord::key).into_iter().collect::<Vec<_>>()
+            );
+            for chord in action.default_chords().iter() {
+                for other in KeyAction::all()
+                    .iter()
+                    .copied()
+                    .filter(|other| *other != action && actions_can_overlap(action, *other))
+                {
+                    assert!(
+                        !other
+                            .default_chords()
+                            .iter()
+                            .any(|candidate| candidate == chord),
+                        "{action:?}: {chord:?} conflicts with {other:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn page_n_scroll_defaults_keep_video_markers_and_edit_buckets_disjoint() {
+        let keymap = Keymap::empty();
+        for (action, other, chord) in [
+            (
+                KeyAction::FsPageNScrollNext,
+                KeyAction::VideoMarkerNext,
+                Chord::key(KeySlot::K),
+            ),
+            (
+                KeyAction::FsPageNScrollPrev,
+                KeyAction::VideoMarkerPrev,
+                Chord::key(KeySlot::J),
+            ),
+            (
+                KeyAction::FsPageNScrollNext,
+                KeyAction::EraseToolBucket,
+                Chord::key(KeySlot::K),
+            ),
+            (
+                KeyAction::FsPageNScrollNext,
+                KeyAction::ConcealToolBucket,
+                Chord::key(KeySlot::K),
+            ),
+            (
+                KeyAction::FsPageNScrollNext,
+                KeyAction::LaToolBucket,
+                Chord::key(KeySlot::K),
+            ),
+        ] {
+            assert!(
+                action
+                    .default_chords()
+                    .iter()
+                    .any(|candidate| candidate == chord)
+            );
+            assert!(
+                other
+                    .default_chords()
+                    .iter()
+                    .any(|candidate| candidate == chord)
+            );
+            assert!(!actions_can_overlap(action, other));
+            assert!(!keymap.binding_conflicts().iter().any(|conflict| {
+                (conflict.action == action && conflict.other_action == Some(other))
+                    || (conflict.action == other && conflict.other_action == Some(action))
+            }));
+        }
+        let overridden = Keymap::from_ini_str("[FsImage]\nFsCapture = K\n");
+        assert!(overridden.binding_conflicts().iter().any(|conflict| {
+            (conflict.action == KeyAction::FsCapture
+                && conflict.other_action == Some(KeyAction::FsPageNScrollNext))
+                || (conflict.action == KeyAction::FsPageNScrollNext
+                    && conflict.other_action == Some(KeyAction::FsCapture))
+        }));
+    }
+
+    #[test]
+    fn page_n_scroll_old_press_overrides_conflict_roundtrip_and_can_disable_new_defaults() {
+        fn roundtrip(keymap: &Keymap) -> Keymap {
+            let json = serde_json::to_string(&KeymapSettings::from_keymap(keymap)).unwrap();
+            Keymap::from_settings(&serde_json::from_str(&json).unwrap())
+        }
+        let old_ini = "[FsImage]\nFsCapture = K\nFsRotateCw = J\n";
+        for keymap in [
+            Keymap::from_ini_str(old_ini),
+            roundtrip(&Keymap::from_ini_str(old_ini)),
+        ] {
+            for (action, old_action, chord) in [
+                (
+                    KeyAction::FsPageNScrollNext,
+                    KeyAction::FsCapture,
+                    Chord::key(KeySlot::K),
+                ),
+                (
+                    KeyAction::FsPageNScrollPrev,
+                    KeyAction::FsRotateCw,
+                    Chord::key(KeySlot::J),
+                ),
+            ] {
+                assert_eq!(keymap.override_chords(action), None);
+                assert_eq!(keymap.effective_chords(action), vec![chord]);
+                assert_eq!(keymap.effective_chords(old_action), vec![chord]);
+                assert!(keymap.binding_conflicts().iter().any(|conflict| {
+                    conflict.kind == BindingConflictKind::Hard
+                        && conflict.chord == chord
+                        && ((conflict.action == action
+                            && conflict.other_action == Some(old_action))
+                            || (conflict.action == old_action
+                                && conflict.other_action == Some(action)))
+                }));
+            }
+        }
+        let disabled_ini = format!("{old_ini}FsPageNScrollNext = none\nFsPageNScrollPrev = none\n");
+        for keymap in [
+            Keymap::from_ini_str(&disabled_ini),
+            roundtrip(&Keymap::from_ini_str(&disabled_ini)),
+        ] {
+            for (action, old_action, chord) in [
+                (
+                    KeyAction::FsPageNScrollNext,
+                    KeyAction::FsCapture,
+                    Chord::key(KeySlot::K),
+                ),
+                (
+                    KeyAction::FsPageNScrollPrev,
+                    KeyAction::FsRotateCw,
+                    Chord::key(KeySlot::J),
+                ),
+            ] {
+                assert!(keymap.effective_chords(action).is_empty());
+                assert_eq!(keymap.effective_chords(old_action), vec![chord]);
+                assert_eq!(
+                    keymap.resolve_first_action_for_chord(
+                        chord,
+                        FS_IMAGE_ACTIVE_SCOPES,
+                        &[action, old_action]
+                    ),
+                    Some(old_action)
+                );
+                assert!(
+                    !keymap
+                        .binding_conflicts()
+                        .iter()
+                        .any(|conflict| conflict.action == action
+                            || conflict.other_action == Some(action))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn page_n_scroll_old_scrub_hold_conflict_roundtrip_and_none_preserve_hold_binding() {
+        fn roundtrip(keymap: &Keymap) -> Keymap {
+            let json = serde_json::to_string(&KeymapSettings::from_keymap(keymap)).unwrap();
+            Keymap::from_settings(&serde_json::from_str(&json).unwrap())
+        }
+        let old_ini = "[FsImage]\nFsScrubZoomHold = K\n";
+        let chord = Chord::key(KeySlot::K);
+        for keymap in [
+            Keymap::from_ini_str(old_ini),
+            roundtrip(&Keymap::from_ini_str(old_ini)),
+        ] {
+            assert_eq!(keymap.override_chords(KeyAction::FsPageNScrollNext), None);
+            assert_eq!(
+                keymap.effective_chords(KeyAction::FsScrubZoomHold),
+                vec![chord]
+            );
+            assert_eq!(
+                keymap.effective_chords(KeyAction::FsPageNScrollNext),
+                vec![chord]
+            );
+            assert!(keymap.binding_conflicts().iter().any(|conflict| {
+                conflict.kind == BindingConflictKind::TriggerMismatch
+                    && conflict.chord == chord
+                    && ((conflict.action == KeyAction::FsPageNScrollNext
+                        && conflict.other_action == Some(KeyAction::FsScrubZoomHold))
+                        || (conflict.action == KeyAction::FsScrubZoomHold
+                            && conflict.other_action == Some(KeyAction::FsPageNScrollNext)))
+            }));
+            assert!(keymap.warnings().iter().any(|warning| {
+                warning.contains("FsScrubZoomHold")
+                    && warning.contains("FsPageNScrollNext")
+                    && warning.contains("TriggerMismatch")
+            }));
+        }
+        let disabled_ini = format!("{old_ini}FsPageNScrollNext = none\nFsPageNScrollPrev = none\n");
+        for keymap in [
+            Keymap::from_ini_str(&disabled_ini),
+            roundtrip(&Keymap::from_ini_str(&disabled_ini)),
+        ] {
+            assert!(
+                keymap
+                    .effective_chords(KeyAction::FsPageNScrollNext)
+                    .is_empty()
+            );
+            assert!(
+                keymap
+                    .effective_chords(KeyAction::FsPageNScrollPrev)
+                    .is_empty()
+            );
+            assert_eq!(
+                keymap.effective_chords(KeyAction::FsScrubZoomHold),
+                vec![chord]
+            );
+            assert_eq!(KeyAction::FsScrubZoomHold.trigger(), KeyTrigger::KeyHold);
+            assert!(
+                !keymap
+                    .binding_conflicts()
+                    .iter()
+                    .any(|conflict| conflict.action == KeyAction::FsPageNScrollNext
+                        || conflict.other_action == Some(KeyAction::FsPageNScrollNext))
+            );
+        }
     }
 
     #[test]

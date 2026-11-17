@@ -15835,6 +15835,7 @@ pub(crate) enum FsOverflowPanelState {
     Closed,
     Root,
     NavigatorPosition,
+    PageReadingOrder,
     SpreadAdjustment,
     Slideshow,
     MusicNoteColor,

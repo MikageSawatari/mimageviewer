@@ -4468,6 +4468,106 @@ pub fn draw_file_type_visibility_snapshot_fixture(ui: &mut egui::Ui) {
     draw_page(ui, &mut state, false);
 }
 
+/// Exercises the real draft, controls, OK handler, and SQLite persistence for
+/// the fullscreen handler tests. The caller supplies a disposable App test profile.
+#[cfg(test)]
+pub(crate) fn commit_in_page_scroll_preferences_ui_for_test(
+    app: &mut App,
+    data_dir: &Path,
+) -> Settings {
+    use crate::settings::{
+        FullscreenNScrollOrder, FullscreenUpDownKeyAction, FullscreenWheelAction,
+    };
+    use egui_kittest::kittest::Queryable;
+
+    app.open_preferences_page(PreferencesPage::SpreadMode);
+    {
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_ui_state(
+                |root_ui, app| app.show_preferences_dialog(&root_ui.ctx().clone()),
+                &mut *app,
+            );
+        harness.run_steps(3);
+        for (label, selected) in [
+            ("上下キー", "ページ内スクロール"),
+            ("通常のホイール", "ページ内スクロール"),
+            ("N 字スクロールの順序", "横優先 (Z 字)"),
+        ] {
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::ComboBox, label)
+                .scroll_to_me();
+            harness.run_steps(3);
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::ComboBox, label)
+                .click();
+            harness.run_steps(3);
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::Button, selected)
+                .click();
+            harness.run_steps(3);
+        }
+        let draft = &harness.state().pref_state.as_ref().unwrap().settings;
+        assert_eq!(
+            draft.fullscreen_up_down_key_action,
+            FullscreenUpDownKeyAction::InPageScroll
+        );
+        assert_eq!(
+            draft.fullscreen_wheel_action,
+            FullscreenWheelAction::InPageScroll
+        );
+        assert_eq!(
+            draft.fullscreen_n_scroll_order,
+            FullscreenNScrollOrder::HorizontalFirst
+        );
+        assert_eq!(
+            harness.state().settings.fullscreen_up_down_key_action,
+            FullscreenUpDownKeyAction::PageTurn
+        );
+        assert_eq!(
+            harness.state().settings.fullscreen_wheel_action,
+            FullscreenWheelAction::PageTurn
+        );
+        assert_eq!(
+            harness.state().settings.fullscreen_n_scroll_order,
+            FullscreenNScrollOrder::VerticalFirst
+        );
+        // This is the production OK route: prepare_preferences_state_settings_for_commit,
+        // install_preferences_settings, and save are called by apply_preferences_dialog.
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+    }
+    assert_eq!(
+        app.settings.fullscreen_up_down_key_action,
+        FullscreenUpDownKeyAction::InPageScroll
+    );
+    assert_eq!(
+        app.settings.fullscreen_wheel_action,
+        FullscreenWheelAction::InPageScroll
+    );
+    assert_eq!(
+        app.settings.fullscreen_n_scroll_order,
+        FullscreenNScrollOrder::HorizontalFirst
+    );
+    let db = crate::settings_db::SettingsDb::open(data_dir).unwrap();
+    let persisted = db.load_into_settings().unwrap();
+    assert_eq!(
+        persisted.fullscreen_up_down_key_action,
+        app.settings.fullscreen_up_down_key_action
+    );
+    assert_eq!(
+        persisted.fullscreen_wheel_action,
+        app.settings.fullscreen_wheel_action
+    );
+    assert_eq!(
+        persisted.fullscreen_n_scroll_order,
+        app.settings.fullscreen_n_scroll_order
+    );
+    persisted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6641,6 +6741,63 @@ mod tests {
             app.install_preferences_settings(state.settings);
             assert_eq!(app.details_image_dims_state, LazyColumnState::Disabled);
         }
+    }
+
+    #[test]
+    fn fullscreen_in_page_scroll_preferences_ui_ok_save_reread_reopen_and_cancel() {
+        use crate::settings::{
+            FullscreenNScrollOrder, FullscreenUpDownKeyAction, FullscreenWheelAction,
+        };
+
+        let mut app = crate::app::setup_app_for_test();
+        let data_dir = app.tmp.path().to_path_buf();
+        let persisted = commit_in_page_scroll_preferences_ui_for_test(&mut app, &data_dir);
+        let mut reopened = preferences_state_for_test(&persisted);
+        assert_eq!(
+            reopened.settings.fullscreen_up_down_key_action,
+            FullscreenUpDownKeyAction::InPageScroll
+        );
+        assert_eq!(
+            reopened.settings.fullscreen_wheel_action,
+            FullscreenWheelAction::InPageScroll
+        );
+        assert_eq!(
+            reopened.settings.fullscreen_n_scroll_order,
+            FullscreenNScrollOrder::HorizontalFirst
+        );
+        reopened.settings.fullscreen_up_down_key_action = FullscreenUpDownKeyAction::PageTurn;
+        reopened.settings.fullscreen_wheel_action = FullscreenWheelAction::PageTurn;
+        reopened.settings.fullscreen_n_scroll_order = FullscreenNScrollOrder::VerticalFirst;
+        app.pref_state = Some(Box::new(reopened));
+        app.discard_preferences_dialog();
+        assert_eq!(
+            app.settings.fullscreen_up_down_key_action,
+            FullscreenUpDownKeyAction::InPageScroll
+        );
+        assert_eq!(
+            app.settings.fullscreen_wheel_action,
+            FullscreenWheelAction::InPageScroll
+        );
+        assert_eq!(
+            app.settings.fullscreen_n_scroll_order,
+            FullscreenNScrollOrder::HorizontalFirst
+        );
+        let after_cancel = crate::settings_db::SettingsDb::open(&data_dir)
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert_eq!(
+            after_cancel.fullscreen_up_down_key_action,
+            app.settings.fullscreen_up_down_key_action
+        );
+        assert_eq!(
+            after_cancel.fullscreen_wheel_action,
+            app.settings.fullscreen_wheel_action
+        );
+        assert_eq!(
+            after_cancel.fullscreen_n_scroll_order,
+            app.settings.fullscreen_n_scroll_order
+        );
     }
 
     #[test]

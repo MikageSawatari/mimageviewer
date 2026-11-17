@@ -261,6 +261,9 @@ fn depth_wheel_navigates_and_ctrl_wheel_never_uses_panorama_fov_or_hidden_zoom()
                 last_raw_ordinal: None,
             },
             operation: None,
+            class: FsWheelInPageClass::Legacy,
+            scroll_origin: None,
+            seek_hover: false,
         };
         assert_eq!(app.fs_wheel_action_requests_navigation(&action), !ctrl);
         assert!(!app.handle_panorama_wheel_if_active(&ctx, -120.0, ctrl));

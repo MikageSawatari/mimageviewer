@@ -1,6 +1,6 @@
 # ページ内スクロールと N 字スクロール (§1.474)
 
-- 状態: **設計 r4・独立設計レビュー r4 で ACCEPT (P1/P2 なし、P3 4 件を反映済み)・利用者判断済み (2026-11-18、§3.2 Q3〜Q5 とも推奨案、加えて N 字 / Z 字の順序の設定を追加)・実装前** (2026-11-18)。r2 の「描画時に解く」案は撤回し、入力時に照合付きで解く (§6.2・§6.3)。ブランチ `feat-474-page-scroll`。
+- 状態: **設計 r4・独立設計レビュー r4 で ACCEPT (P1/P2 なし、P3 4 件を反映済み)・利用者判断済み (2026-11-18、§3.2 Q3〜Q5 とも推奨案、加えて N 字 / Z 字の順序の設定を追加)・実装・対象検証完了、設計担当の受入れ待ち (§7)** (2026-11-18)。r2 の「描画時に解く」案は撤回し、入力時に照合付きで解く (§6.2・§6.3)。ブランチ `feat-474-page-scroll`。
 - 要望: 5ch >>642・>>767。通常のページ単位表示で、次のページを見せずに今のページ内を矢印キーやホイールで動かしたい。
   NeeView のような N 字スクロールもほしい。
 - 方針 (2026-11-12 利用者決定、backlog §1.474): 修飾なし ↑↓ と通常のホイールを、それぞれ独立に
@@ -36,19 +36,20 @@
 | 通常のホイール | ページ送り / ページ内スクロール | ページ送り |
 | N 字スクロールの順序 | 縦優先 (N 字) / 横優先 (Z 字) | 縦優先 (N 字) |
 
-- 既定は現行と完全に同じ。既定のままでは新しい経路を一切通らない。
+- 上下キー・ホイールの既定は現行と完全に同じ (既定のままでは置き換え点の新しい経路を通らない)。順序の操作 (§2.7) は既定キー `K` / `J` を持ち、変更・解除できる。
 - 順序の設定は §2.8 の操作 (`FsPageNScrollNext` / `Prev`) だけに効く (2026-11-18 利用者決定で追加。NeeView も N 字・Z 字を選べ、既定は N 字)。
   キーは順序ごとに分けず、「指定の順で次へ / 前へ」の 1 組だけにする (利用者「別々のキーアサインだと使いづらそう」)。
 - **全画面の「…」(その他の機能) からも順序を選べる** (2026-11-18 利用者決定): ルートに「ページ内の読み順」を足し、選ぶと
   ナビゲータ位置・スライドショーと同じ形の小パネル (`FsOverflowPanelState` の新しい状態) が開いて「縦優先 (N 字) / 横優先 (Z 字)」を選ぶ。
   書き換えるのは環境設定と同じ全体設定 1 つ (すぐ保存。スライドショーの小パネルと同じ保存の扱い)。本ごとには覚えない
-  (本ごとの記憶は、必要が分かってから既存の本ごとの記憶に乗せられるかを調べて足す)。ページを送ってもパネルは閉じない
-  (`closes_on_file_change` は false。全体設定のパネルと同じ)。ルートの項目は画像の通常表示で常に出し、使えない表示 (連結・Z など) でも
+  (本ごとの記憶は、必要が分かってから既存の本ごとの記憶に乗せられるかを調べて足す)。開閉は既存の小パネルと同じ扱い
+  (ホイール・シークバー・クリックで本やページが変わっても閉じない = `closes_on_file_change` は false。キーを押したときは、既存のパネルと同じく
+  閉じてからそのキーの操作を続ける。新しいパネルだけ別のキー処理を作らない。レビュー r5 P2)。ルートの項目は画像の通常表示で常に出し、使えない表示 (連結・Z など) でも
   設定は変えられる (既存のスライドショーの項目と同じ扱い)。読み順を切り替えるキー操作は足さない。
   日本の漫画をはみ出した状態でコマ順に読むなら横優先 (段の中を読む方向へ進み、次の段へ下がる)、4 コマの列や縦書きの文章なら縦優先が合う。
 - 共通設定のみ (`Settings`)。お気に入り別の表示状態・本ごとの設定には入れない。設定の転送は
   `fullscreen_horizontal_cursor_direction` と同じ分類。**未リリースの新設定**なので migration 不要 (serde default)。
-- 環境設定「見開き / 連結」の「カーソルキー左右の方向」の直後に 3 行 (順序の行には「N 字スクロールの操作にキーを割り当てたときに使います。」と添える)。上下キー・ホイールの説明 1 行:
+- 環境設定「見開き / 連結」の「カーソルキー左右の方向」の直後に 3 行 (順序の行には「ページ内を順に読み進める操作 (既定 K / J) の順序です。」と添える)。上下キー・ホイールの説明 1 行:
   「ページ単位の表示で、画像が画面からはみ出す分だけ動かします。ページの端で止まり、次のページへは送りません。」
 - 移動量は既存の「連結読みのスクロール量」(ホイール 1 ノッチ 20% / 矢印キー 1 回 16%、表示領域の大きさ基準) を共用し、
   見出しを「スクロール量 (連結読み・ページ内スクロール)」へ改める。新しい量の設定は作らない (判断事項 Q3)。
@@ -101,7 +102,7 @@ r2 の「意図だけを記録し、描画準備で解く」案は撤回した (
     (レビュー r4 P3-1)。TextureId・Arc のアドレス・frame 番号は入れない (素材を交換しても幾何が同じなら一致する)。
     白 companion はページの並びに入れず、幾何 (§2.4 の `unit`) にだけ含める。
   - 鍵は**描画と入力で同じ helper** (`App::fs_scroll_geometry_key(...)`) から作る。描画時は描いた表示単位について、入力時は今の
-    表示単位について作り、一致を照合する。倍率 (`fs_zoom`)・`fs_pan` は鍵に入れない (同 frame のズームは下の投影で扱う)。
+    表示単位について作り、一致を照合する。`fs_pan` は鍵に入れない。倍率は下の「同じ frame の倍率変更」のとおり、layout を描いたときの倍率と今の `fs_zoom` が一致することを照合に含める。
     入力時の素材は既存のメタデータ選択経路で引く。**作れない値があれば既定値や前回値で埋めず、照合不成立 (消費のみ)** にする。同期の読み込みはしない。
   - 鍵の viewport・DPI は**配送先の fullscreen viewport**のものを使う。ROOT で受けたキーの handler に渡る ROOT の `ctx` の
     `content_rect()` / `pixels_per_point()` をそのまま使わない (レビュー r4 P3-2)。
@@ -111,9 +112,15 @@ r2 の「意図だけを記録し、描画準備で解く」案は撤回した (
   窓サイズ変更中・HUD の固定を切り替えた frame のホイールなどがこれに当たる (レビュー r3 P2-2。r3 の「割り切り」は撤回)。
   照合で落ちるのは幾何が変わった後、新しい幾何で描いた layout から鍵を作り直せるまでの入力で、それ以降は通常どおり動く
   (連続した窓サイズ変更の間や、素材の寸法がまだ分からない間は落ち続ける)。
-- **同じ frame の倍率変更**: Ctrl+ホイール・キー拡大で入力時点の `fs_zoom` が layout を描いたときの倍率と違えば、既存の
-  `clamp_fullscreen_pan_from_layout` と同じく、各ページの基準 zoom / pan から描いた矩形を比率で投影して使う (投影の式を共有する)。
-  fit の切替えのように倍率と一緒に幾何の入力も変わる操作は、鍵の不一致で落ちる。
+- **同じ frame の倍率変更** (2026-11-18 設計担当の決定、実装担当の停止報告から): Ctrl+ホイール・キー拡大などで入力時点の `fs_zoom` が
+  layout を描いたときの倍率と違えば、照合不成立として**消費して何もしない**。次の frame の layout からはスクロールできる。
+  比べる倍率は `fs_zoom` の値ではなく**描いたときの実効の倍率** (`fs_zoom_pan()` が None なら 1、そうでなければその倍率) とする。
+  **スクロールで pan を書くときは、`fs_zoom` にも layout を描いた実効の倍率を書く** (§6.9)。1 付近の倍率 (例 0.9995) は pan 0 なら 1 倍で、
+  pan が付くとその倍率で描かれる既存の正規化 (`fs_zoom_pan_for`) があり、書かないとスクロールした瞬間に寸法が変わって端に空きが残るため。
+  描いた倍率をそのまま書くので、見た目の倍率は変わらない。
+  前 frame の矩形を倍率比で投影する案は採らない: 既存の `clamp_fullscreen_pan_from_layout` の投影は通常の見開きのページ間隔も倍率に比例させるが、
+  実際の描画は間隔を固定するので、端が間隔の差だけずれる (例: gap 200・倍率 1→2 で 100pt)。共有の投影を直すと既定設定の手動パン・ズームの
+  clamp にも影響するので、範囲を広げず、同じ frame の倍率変更とスクロールの組み合わせを捨てる。
 - **§1.726**: スクロールは `set_fs_pan_from_input` と同じく初期配置要求を消す。
 - **入力の配送**: 既存のページ送りと同じく、キーは受理した handler で、ホイールは `apply_fs_wheel_frame_proposal` (遅延時を含む) で、
   その context の `fs_pan` に書く。ROOT で受けたキーが fullscreen の context を動かす既存の経路をそのまま使い、新しい受け渡しを作らない。
@@ -123,7 +130,7 @@ r2 の「意図だけを記録し、描画準備で解く」案は撤回した (
 
 ### 2.4 スクロール範囲と 1 回の移動 (純関数)
 
-前 frame の layout (照合済み・倍率は投影済み) の、現在の表示単位から次を求める。
+前 frame の layout (照合済み。倍率も描いたときと同じ) の、現在の表示単位から次を求める。
 
 - **外接矩形 `unit`**: 描いた各ページの `paint_quad()` (clip 前) の四隅の外接矩形の和。自由回転 0 なら `paint_rect` と同じ。
   見開きで描く白 companion を含み、描かない Vacant 枠は含めない (レビュー r1 P2-4)。表示単位矩形の考え方は §1.726 と同じ
@@ -185,7 +192,7 @@ r2 の「意図だけを記録し、描画準備で解く」案は撤回した (
 - 端で止まる。はみ出していないページでは何もしない (D1)。
 - **同じ frame の複数 segment**: 適用は既存どおり segment の順に、遅延時 (`merge_at_frame_tail`) も含めて前面 UI が残した segment だけを使う。
   先に移動が起きた後の `InPageScroll` は上の再確認で消費して何もしない (移動後のページに旧ページの幾何で書かない)。
-  ズーム (`Legacy`) と `InPageScroll` は順に適用し、スクロールは §2.3 の投影で直前のズーム後の倍率を使う。
+  ズーム (`Legacy`) の後の `InPageScroll` は、§2.3 のとおり倍率が描いたときと違うので消費して何もしない。
 - **同じ frame のクリック**: クリックの計画は wheel の適用前なので、既存のズームの予測と同じく `propose_fs_wheel_click_transform` で
   ページ内スクロール後の pan も予測する (§2.4 と同じ純関数・同じ layout・同じ clamp)。予測した位置で §1.745 の規則がそのまま判定する
   (中央からスクロールした frame の単クリックは送らない)。タッチのページ送りは別経路で、変えない。
@@ -203,7 +210,7 @@ r2 の「意図だけを記録し、描画準備で解く」案は撤回した (
 - 面 (§2.2 の 3) が成立しないとき、または入力の所有が前面 UI (egui の fallback 右クリックメニューを含む) にあるときは**キーを消費しない**
   (§1.470 の `FsZoomIn` と同じ)。この規則は上下キー・ホイールの設定値に依存しない。面が成立して照合 (§2.3) が通らないときは消費して何もしない。
 - 4 方向の移動量は上下キーと同じ。左右も端で止まり、綴じ方向で反転しない (画面の左右)。
-- 上下キーの設定がページ送りでも、これらの Action は使える (キーを割り当てた人だけが使う)。
+- 上下キーの設定がページ送りでも、これらの Action は使える (順序の 2 つは既定 `K` / `J`、4 方向は割り当てた人だけが使う)。
 - リング・ジェスチャ・マウスボタン・ゲームパッドには今回足さない (キーボード専用。`ring-keyaction-parity.md` が
   KeyAction → Ring の方向を要求しないことを実装時に確認する)。
 
@@ -274,7 +281,7 @@ r2 の「意図だけを記録し、描画準備で解く」案は撤回した (
   扱う組み合わせが増えたので撤回した (§6.2)。
 - **照合して合わなければ捨てる。** 前 frame の layout が今の表示単位のもので幾何の入力も同じかを印で照合し、合わなければ入力を消費して何もしない。
   入力を溜めて後で適用する仕組みや待機状態を作らない (既存のページ送りの方針と同じ)。鍵は描画と入力で同じ helper から作るので、
-  照合の項目を 2 か所に書かない。倍率は既存 clamp と同じ投影で扱う。
+  照合の項目を 2 か所に書かない。同じ frame に倍率が変わった場合も投影せず捨てる (§2.3)。
 - **失効の書き手を増やさない。** fit・回転・トリム・構成などの変更経路ごとに印を消す処理を足すのではなく、鍵の比較で古い layout を見分ける
   (変更経路を列挙すると書き漏れが出るため)。
 - **可視性の領域を作らない。** 最終位置は既存の clamp が決め、進まない候補は採らない。端は「進まなかった」ことで分かる。
@@ -295,7 +302,7 @@ r2 の「意図だけを記録し、描画準備で解く」案は撤回した (
 - **D2 スクロール後のクリック送り**: 2026-11-15 の利用者決定 (§1.745「パン後は単クリックを止め、ダブルクリックで戻す」) のまま、
   ページ内スクロールもパンとして扱う。
 
-### 3.2 利用者判断 (2026-11-18 決定: Q3〜Q5 とも推奨案。統括経由で利用者「推奨案で進める」)
+### 3.2 利用者判断 (2026-11-18 決定: Q3〜Q5 とも推奨案。利用者がこの担当セッションで「推奨案で進める」と回答)
 
 決定: Q3 = 連結読みの量を共用・N 字は 85%、Q4 = N 字 2 つ + 4 方向 4 つを足し、位置合わせは入れない、Q5 = ゲームパッドは変えない。以下は判断時の選択肢の記録。
 追加の決定 (2026-11-18、利用者): 順序の設定 N 字 / Z 字 (既定 N 字) を足し、「…」からも選べる。N 字の 2 操作だけ既定キーを付ける:
@@ -329,9 +336,12 @@ r2 の「意図だけを記録し、描画準備で解く」案は撤回した (
   回転 90 度、自由回転 45 度・負の角度・トリム併用、viewport 原点が 0 でない (HUD 予約)。最終位置はすべて `set_fs_pan_from_input` を通した値で確かめる。
 - 既定キー: 画像の全画面で `K` が次・`J` が前に効く。動画・音声の全画面では従来どおりマーカー移動 (`VideoMarkerNext` / `Prev`)、
   消しゴム・隠蔽・補正レイヤーの `K` (塗りつぶし) は編集モードが先に受ける。操作カスタマイズの競合表示が、文脈の違うこれらを競合として出さないこと。
-  保存済みの keymap で `J` / `K` を別の FsImage 操作に割り当てていた人は、既存の競合表示と消費順で決まる (§1.470 と同じ扱い。移行処理なし)。
-- 「…」の読み順: ルートの行・小パネルの 2 択・戻る / 閉じる、選んだ値が環境設定と同じ全体設定に入り保存されること、ページを送っても
-  パネルが閉じないこと、行数・パネルの高さの既存の検査 (`fs_overflow_panel_body_row_count` 等) と UI スナップショット。
+  保存済みの keymap で `J` / `K` を別の FsImage 操作に割り当てていた人には、新 Action の override が無いので既定の `J` / `K` が補われ、
+  既存の競合表示が出る (自動の移行はしない。§1.470 と同じ扱い。保存済みの利用者に無影響とは書かない)。Press 同士の競合は消費順で片方が動く。
+  Press と KeyHold (例: 保存済みの `FsScrubZoomHold = K`) の競合は、hold が押下状態を読むので両方が動き得る。既存の `TriggerMismatch` の競合表示が出ること、
+  保存の往復、新 Action を `none` にすると旧来どおりになることを確かめる (レビュー r5 P3)。
+- 「…」の読み順: ルートの行・小パネルの 2 択・戻る / 閉じる / Esc、選んだ値が環境設定と同じ全体設定に入り保存されること、
+  ホイール・シークバー・クリックのページ送りではパネルが閉じず、キー (←→・J/K など) では既存のパネルと同じく閉じてからその操作が動くこと、行数・パネルの高さの既存の検査 (`fs_overflow_panel_body_row_count` 等) と UI スナップショット。
 - Z 字 (順序の設定 = 横優先): LTR・RTL での段の中の進み方、読み終わりの横端→1 段下の読み始め側の端、最後の段の端で何もしない、前方向の逆順、横だけ・縦だけはみ出す場合、縦の段移動が clamp で戻されるとき横を動かさず終端になる。順序の設定は N 字の 2 操作だけに効き、↑↓・ホイール・4 方向は変わらない。設定の編集 → OK → 効果の通し。
 - N 字: LTR・RTL での列の進み方、下端→次の列の上端、最後の列の下端で何もしない、前方向の逆順、縦だけ・横だけはみ出す場合、
   白 companion・高さの違う見開きで横が clamp に戻されるとき縦を動かさず終端になり、同じ列を繰り返さない。
@@ -344,7 +354,7 @@ r2 の「意図だけを記録し、描画準備で解く」案は撤回した (
   fit 記述子は同じで採用素材の寸法だけ変わった (丸めた AI / PDF の素材へ交換) 場合も不一致になり、素材を交換しても寸法が同じなら一致する。
   鍵の値を作れない (素材の寸法が未取得) ときは消費のみ。幾何の入力の鍵を描画と入力で同じ helper から作っていること。
   ROOT と対象窓の寸法・DPI が違うとき、鍵は対象窓の値で作られる。同じ frame に fit 変更キーと ↓ のリピートが届いたとき、
-  スクロールは fit 変更の後に照合されて落ちる。同じ frame の Ctrl+ホイール・キー拡大の後のスクロールは投影した幾何で端に揃う。
+  スクロールは fit 変更の後に照合されて落ちる。同じ frame の Ctrl+ホイール・キー拡大の後のスクロールは消費して pan 不変、次の frame からは新しい倍率の幾何で端に揃う。
   §1.726 の要求がスクロールで消える。
 - 2 軸のホイール: 斜めの入力、片方の軸だけ端 (もう片方は進む)、clamp が要求していない軸を補正する候補は採らない。
 - 上下キーの handler: 設定 2 つの全 4 組。ページ送りでは現行どおり `spread_page_nav` (回帰)、ページ内スクロールでは pan だけ変わり
@@ -427,3 +437,285 @@ NeeView は N 字・Z 字を含む 5 種の順序を持ち既定は N 字と分�
 利用者の提案で、順序ごとに別のキーを持たず「指定の順で次へ / 前へ」の 1 組にし、順序は全画面の「…」(その他の機能) からも選べるようにした (§2.1)。
 既定キーは空きを確かめた上で (画像の全画面で既定キーも固定の処理も無い文字は A・F・H・J・K・W・Y)、利用者決定で `K` = 次へ・`J` = 前へ
 (動画のマーカー移動と同じ向き、修飾キーなしで戻れる) とした (§2.7)。「…」の読み順は全体設定の切り替えで、本ごとには覚えない。
+
+### 6.7 追加分のレビュー (r5、同じ session、2026-11-18): REVISE → 反映
+
+P2: 既存の「…」の小パネルは、ファイル変更とは別に、キーを押すと閉じてからそのキーの操作を続ける。「ページを送っても閉じない」は
+キーでは成り立たないので、既存のパネルと同じ扱い (キーで閉じる、ホイール・シークバー・クリックの送りでは閉じない) に揃えた (§2.1)。
+P3: 保存済み keymap との競合の説明を Press 同士と Press / KeyHold に分けた (§5)。J / K の既定を足した後の説明 (§2.1・§2.7) を直した。
+Z 字の手順・終端・単調性、小パネルの行数・保存・入力所有、J / K と動画・編集モードの既定の重なりは問題なしとされた。
+
+<a id="implementation-record"></a>
+
+## 7. 実装記録（2026-11-18、実装・対象検証完了）
+
+**未コミット。実装・対象自動検証・文書更新を完了し、設計担当へ引き継ぐ。全件gateと実機での受入れは未実施。**
+設計担当の §6.8（B）と §6.9（実効倍率）の決定へ追従して再開した。製品の実画面での観測はない。
+以下の一覧は現在のソースを照合したもので、テストの定義と実行結果を分けて記録する。
+
+### 7.1 変更したファイル
+
+| ファイル | 現在の実装 |
+| --- | --- |
+| `src/settings.rs` / `src/settings_transfer.rs` | 3 設定・Unknown 正規化・既定・転送分類と件数、読み順の overflow 項目。未リリースの新設定なので migration は不要（serde default）。 |
+| `src/keymap.rs` / `docs/keymap.ini.default` | FsImage の 6 操作、K/J と既定なしの 4 方向、ini 往復・既存 Press / KeyHold との文脈と競合の回帰。 |
+| `src/key_input.rs` | cfg(test) の synthetic key に K を追加。保存済み K の Press / Hold と新しい既定キーを実 handler で検証するための fixture。 |
+| `src/ui_dialogs/preferences/pages.rs` / `search_index.rs` / `src/ui_dialogs/preferences.rs` | 3 行・説明・検索 anchor・スクロール量見出し。実 UI → OK → 保存 → DB 再読込と取消のテスト。 |
+| `src/app.rs` / `src/ui_fullscreen.rs` | 読み順小パネル、plain ↑↓ の typed consume 結果の分岐、ホイール分類・受理時の印・遅延適用・クリック予測、通常画像の描画完了後の印。小パネルのキー開閉は r5 の既存規則に従う。 |
+| `src/displayed_image_transform.rs` | context 所有の `FullscreenPageLayout` に描画済み単位の印を追加し、既存の begin / clear で退役する。 |
+| `src/ui_fullscreen/in_page_scroll.rs`（新規） | 実素材の幾何入力の鍵・照合、paint quad からの範囲、方向 / 2 軸 / N/Z の純関数、実効倍率を保つページ内スクロール専用の書込入口。 |
+| `src/ui_fullscreen/in_page_scroll/handler_tests.rs` / `overflow_tests.rs`（新規） | 実描画・入力・viewport・context・設定 UI・小パネルの headless 回帰。 |
+| `src/ui_fullscreen/in_page_scroll/interaction_tests.rs`（新規） | handler の既存 fixture helper を `pub(super)` で共有し、小パネルのキー / Esc / 非キー送りの開閉、キーとクリック、スクロール後の表示リセット、混在媒体と連結読みの入力所有を実経路で検証。`in_page_scroll.rs` にテストモジュールを登録。 |
+| `src/ui_dialogs/context_shortcuts.rs` | ↑↓・ホイールの設定と適用される面に応じた説明。 |
+| `src/ui_fullscreen/depth_tests.rs` | 既存の depth ホイールテストの `FsWheelAction` fixture に Legacy 分類と受理時情報の既定値を追加。 |
+| `src/app/search_nav_entry_inventory_tests.rs` | 追加した 6 KeyAction を既存の網羅 match で非ナビゲーション操作に分類。 |
+| `.config/nextest.toml` | 追加した環境設定 2 枚と読み順小パネル 1 枚の snapshot を既存 GPU group へ登録。 |
+| `docs/keymap-spec.md` / `key-customization-impl-plan.md` / `display-pipeline.md` / `spec.md` / `detached-rework-plan.md` / `architecture-overview.md` | 操作・設定・layout の所有と照合、実効倍率と既存機構を維持する境界。detached の述語・viewport 配送・HWND の機構は変更しない。 |
+| `htdocs/mimageviewer/manual/fullscreen.html` / `shortcuts.html` / `settings.html` | 3 設定、N/Z、J/K、任意 4 方向、端で送らない規則、クリック、読み始め、小パネルの開閉。版番号や実装用語は追加しない。 |
+| 本書 §7 / `next-release-backlog.md` §1.474 | 実装・対象検証完了の状態と実装記録。設計担当の §6.8・§6.9 を保持する。 |
+| `docs/ui-snapshot-policy.md` / `tests/snapshots/` の7枚 | 追加3枚・更新4枚と目視・通常比較の記録。画像の一覧と理由は §7.4。 |
+
+### 7.2 設計判断への追従と所有境界
+
+- **§6.8 / B**: layout の描画時と入力時の実効倍率が違う場合は、スクロールを消費するだけで動かさない。次の新しい描画済み layout から受け付ける。古い矩形を新倍率へ投影する helper の抽出は撤去した。
+- **§6.9**: 比較するのは raw `fs_zoom` でなく、`fs_zoom_pan()` / `fs_zoom_pan_for` が描画へ渡す実効倍率（None なら 1、Some ならその倍率）。印の倍率も実ページの採用 transform から取る。
+- **書込**: ページ内スクロールで pan が変わるときは専用の `write_fs_page_scroll_pan` から、同じ context の `fs_zoom` を layout の実効倍率へ揃えて `set_fs_pan_from_input` を呼ぶ。raw 0.9995 / pan 0 が 1 倍で描かれていた場合は 1.0 に揃え、パン開始で画像の寸法を変えない。動かない候補では書き込まない。
+- **既存コードの維持**: `clamp_fullscreen_pan_from_layout` と `fs_zoom_pan_for` の関数本体は、現在の HEAD と文字列で同一と確認した。既定 Legacy のパン・ズームの式と正規化を変更しない。
+- **範囲と採否**: 実際に描いた `paint_quad` の外接から描画時の pan を除いて範囲を求める。候補を既存 clamp に通し、意図した向きへの進みと直交軸の不変を確認して採る。N/Z の折り返しは 1 候補とし、同じ列・段を循環しない。
+- **ホイール**: `InPageScroll` / `Legacy` は共通分類を使う。受理した `FsWheelAction` の `scroll_origin` を遅延適用でも保ち、描画の更新や前面 UI による segment 分割で、当初不適格だった入力を後から有効化しない。適用とクリック予測は同じ受理時の印・純関数を使う。これは frame 内の入力 proposal の所有であり、待機・再試行の永続状態は作らない。
+- **context**: 新しい持続する実行時情報は layout の印だけ。既存の context swap と begin / clear を使い、layout・pan・zoom はその所有 context のみを読む／書く。
+- **入力と UI**: Shift+↑↓・←→・スタックジャンプ・動画音声・前面 UI の所有と既定 Legacy を維持。読み順は環境設定と「…」の共通全体設定。ホイール・シークバー・クリックの送りでは小パネルを保ち、キーでは既存規則で閉じてその操作を続ける。
+
+### 7.3 対象テストと snapshot の範囲
+
+一覧抽出時点の追加テストは 72 件（名前は §7.5）。うち純関数 11 件、handler 36 件、interaction 8 件、小パネル 2 件、keymap 4 件、設定・転送・環境設定 UI・検索・snapshot の 9 件、ヘルプ 2 件。
+追加72件は下記の対象実行で全て成功した。実行表には再実行と既存の回帰も含むため、実行件数は定義数とは異なる。
+
+- 純関数は軸別のはみ出し・端外・2 軸・見開きと白 companion・自由回転・トリム・N/Z・LTR/RTL・clamp による循環防止を対象にする。
+- handler は印と素材寸法・部分描画・holdover・幾何変更・viewport/DPI・ROOT 配送・上下設定 4 組・固定入力の consume 契約・J/K・前面 UI・wheel 分類と小デルタ・遅延入力の受理時の印・クリック予測・context swap・実設定 UI を対象にする。
+- B の倍率変更後の消費と新描画後の再開、gap 200 の見開き、near-fit の幅10000ptの表示単位のキー／ホイールの複数ステップ・最終端・描画幅、ホイール予測と実適用の一致も対象にする。
+- 保存済み K の Press / Hold と新しい既定 K の同時発火・既存消費順・新 Action の割り当て解除後の維持も、実 handler の追加 2 件で検証する。
+- interaction は読み順小パネルのキーで閉じて操作する規則・Esc・ホイールや絶対ページ移動での維持、同 frame の ↓ + 単クリック、スクロール + ホイール + ダブルクリック、元の自動位置へ戻した後のクリック送り復帰、画像から動画／音声へ移る混在入力、縦横連結読みの既存ホイール所有を追加 8 件で検証する。
+- snapshot は環境設定の明／暗 2 枚と読み順小パネル 1 枚を追加。既存 overflow の行数・高さ・root fixture も更新した。画像生成・通常比較・目視結果を §7.4 に記録した。
+- libtest の型検証で見つかった fixture の新 field 不足、Action の網羅 match 不足、テスト helper の引数・borrow の不整合は修正し、対象実行は成功した。製品の runtime assertion が失敗した記録とは区別する。
+
+### 7.4 検証記録
+
+以下は実装担当が実行した対象検証と、その有効範囲の記録。初回の失敗と修正後の成功を区別する。
+
+重いコマンドはすべて次の runner 経由。ロックを書けない場合は指定の警告付き fallback を使い、別の full-test がロックを持つ間は終了を待った。
+
+```powershell
+$env:TEMP = 'G:\home\mimageviewer-474\target\474-tmp'
+$env:TMP = $env:TEMP
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner codex-474 -WorkDir G:\home\mimageviewer-474 -Command '$env:MSBUILDDISABLENODEREUSE=''1''; <下記のコマンド>'
+```
+
+| 確認 | 現時点の結果と証跡 |
+| --- | --- |
+| 初回 `cargo check -p mimageviewer --bin mimageviewer-core` | turbojpeg-sys の CMake/MSBuild 並列 6 が exit 1、cargo exit 101。本体の型検証前。`target/474-check.stdout.log` / `474-check.stderr.log`。 |
+| 同依存の並列 6 再試行 | worktree 内 TEMP でも失敗。`MSBUILDDISABLENODEREUSE=1` を指定した再試行も並列 6 では失敗。MSBuild の「0 エラー」表示だけでは失敗原因を確定できない。`target/474-cmake.stdout.log` / `474-cmake.stderr.log`、`474-scroll-effective.stdout.log` / `474-scroll-effective.stderr.log`。 |
+| 同依存の直列 1 | `--parallel 1 /nodeReuse:false` で成功。check graph と libtest graph の依存を直列で準備した。初回記録は `target/474-cmake-single.stdout.log` / `474-cmake-single.stderr.log`。依存のソース・製品 build script は変更しない。 |
+| B 再開時の check | exit 0。`target/474-check-resume.stdout.log` / `474-check-resume.stderr.log`。実効倍率対応前の証拠として範囲を限定する。 |
+| 実効倍率対応後の check | `cargo check -p mimageviewer --bin mimageviewer-core`、exit 0、58.75 秒。`target/474-check-effective.stdout.log` / `474-check-effective.stderr.log`。以後のRust変更はtest限定の追加・fixture修正で、本番ロジックは不変。 |
+| 対象 nextest の初回依存ビルド | libtest graph の turbojpeg-sys が並列 6 で失敗し、テスト本体は未到達。`target/474-scroll-tests.stdout.log` / `474-scroll-tests.stderr.log`。 |
+| 依存直列化後の対象 libtest | 型エラーを検出し修正。記録は `target/474-scroll-serial.stdout.log` / `474-scroll-serial.stderr.log`。 |
+| 最初の対象実行 | `cargo nextest run -p mimageviewer --lib --build-jobs 1 -E 'test(/ui_fullscreen::in_page_scroll/)'`。ビルド 12分31秒、実行 76.721秒、57件中17成功・40失敗。38件は単ページの共通fixtureが Page / zoom=None に固定され、入力側の Width 等と一致しなかった。2件は原寸10000pxのテスト素材が既定の最大2048pxを超えた。`target/474-scroll-final.stdout.log` / `474-scroll-final.stderr.log`。本番コードは変えず、fixtureを実際の設定・倍率で描く形とテスト用のサイズ上限へ修正。 |
+| 純関数テストの実行時間 | 上の17成功のうち非対称見開きの1件は71.297秒。候補ごとにAppを構築していたため、各テスト1個のAppを再利用する形へ修正した。全候補の `set_fs_pan_from_input` による冪等性検査は維持。 |
+| fixture修正後の対象実行 | 同じ57件中49成功・8失敗、11.310秒。`target/474-scroll-fixture.stdout.log` / `474-scroll-fixture.stderr.log`。残った失敗は入力契約・素材サイズ等のテストfixtureを修正し、次の実行で再確認した。 |
+| 入力契約・素材fixture修正後の対象実行 | `cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen::in_page_scroll/)'`。ビルド2分12秒、実行16.525秒、57/57成功。`target/474-scroll-contracts.stdout.log` / `474-scroll-contracts.stderr.log`。旧fixtureの失敗を本番不具合として扱わず、本番コードは変更していない。 |
+| `test-focused.ps1` の5モジュール | `src/settings.rs`（334件）、`src/settings_transfer.rs`（43件）、`src/keymap.rs`（200件）、`src/key_input.rs`（102件）、`src/displayed_image_transform.rs`（48件）の計727件成功。runログは下記。 |
+| 対象 UI / handler / context 等の回帰 | 下記filterで222件を実行、220成功・2失敗、165.188秒。4件の検索ナビゲーションinventoryは162.880〜164.887秒で成功（slow表示）。`target/474-regression.stdout.log` / `474-regression.stderr.log`。失敗2件のfixtureを修正し、下記の再実行で2件とも成功した。成功済み220件は変更の影響がなく再利用した。 |
+| UI controls の失敗2件の再実行 | `cargo nextest run -p mimageviewer --lib -E 'test(fullscreen_n_scroll_order_selector_preserves_other_input_settings) \| test(calculated_overflow_panel_height_matches_all_states_and_scrolls_when_constrained)'`。2/2成功、3.176秒、ビルド4分01秒。前者はコンボのラベルで操作する形へ修正。後者は614ptのRootが11行でスクロールする現仕様に合わせ、内容の高さ不変のassertを維持し、Fits時のinner高さ・全Scrolls条件の末尾到達を検査。`target/474-ui-controls.stdout.log` / `474-ui-controls.stderr.log`。 |
+| snapshot 生成・通常比較・目視 | 下記filterの9件に `UPDATE_SNAPSHOTS=1` を指定し9/9成功（10.527秒）。環境変数を外して同じ9件を通常比較し9/9成功（9.251秒）。実装担当が変更7枚をすべて開いて確認し、設計担当も新規3枚と root / root_tall を目視した。追加の欠け・重なり・選択表示不良なし。`target/474-snapshot-update.*.log` / `474-snapshot-compare.*.log`。画像一覧は下記。 |
+| fmt / glyph / 差分確認 | `cargo fmt`（引数なし・workspace全体）成功、`python scripts/check_ui_glyphs.py` は危険文字0、`git diff --check` 成功。`target/474-fmt.*.log` / `474-glyphs.*.log` / `474-diff-check.*.log`。以後の変更は文書のみ。 |
+| integration `ui_snapshot` | `cargo test --test ui_snapshot -- --test-threads=2`、259/259成功、229.58秒、ビルド3分45秒。`UPDATE_SNAPSHOTS` は未指定。`target/474-ui-snapshot.stdout.log` / `474-ui-snapshot.stderr.log`。追加のPNG変更なし。 |
+| 全件 gate / 検証 build / 実機確認 | 利用者の指示どおり `test-lib-full.ps1` / `test-full.ps1` / `build-dev.ps1` は実行せず、製品バイナリも起動していない。全件gate・検証用ビルド・実機確認・コミットは設計担当へ引き継ぐ。設計判断待ちの項目はない。 |
+
+native 依存の並列ビルド失敗は、CMake/MSBuild の実行段階の失敗であり、mIV のテスト assertion や実行時不具合と混同しない。
+設計担当から、sandbox が起動した常駐 MSBuild ノードの再利用でアクセス拒否（MSB3191）になる既知事象との説明を受けた。
+以後の cargo は指定どおり `MSBUILDDISABLENODEREUSE=1` を付けている。依存の準備では併せて直列化が必要だった。
+共通ロックと外部 TEMP の作成は sandbox に拒否されたため、既存 runner の fallback と worktree 内の `target/474-tmp` を使った。
+後続の直列ビルド成功・型エラー修正によって、実行していないテストや実機検証の成功を主張しない。
+
+原寸10000pxの素材を作る旧fixtureはGPUの素材上限8192pxにも抵触するため、Height fit・1000×40pxの素材・
+1000×400ptのviewportで実表示単位の幅10000ptを作る形に変更した。
+`near_fit_wide_unit_key_scroll_keeps_exact_edge_and_painted_width_after_multiple_steps` と
+`near_fit_wide_unit_wheel_prediction_and_apply_keep_exact_edge_after_multiple_steps` は、raw 0.9995 / 0.999等の
+near-fit値から1.0へ揃え、端のpan=-4500と次の描画で空白が出ないことを維持して検査する。
+これはテスト素材の修正であり、製品のサイズ制約や描画・入力の機能を変更した記録ではない。
+
+5モジュールの成功runログ（すべて `target/test-focused/runs/` 配下、UTC日付は2026-11-17）:
+
+- settings: `20261117T182505155Z-d6a8a254`（334成功、3.272秒）
+- settings_transfer: `20261117T182731295Z-e3728ecf`（43成功、0.809秒）
+- keymap: `20261117T183015786Z-e2d8c1ee`（200成功、4.302秒）
+- key_input: `20261117T183027311Z-b4a07152`（102成功、1.434秒）
+- displayed_image_transform: `20261117T183033244Z-fcfd3a51`（48成功、0.730秒）
+
+222件の回帰filter（`target/474-verify-remaining.ps1` から転記。`cargo nextest run -p mimageviewer --lib -E` に渡した値）:
+
+```text
+test(/(wheel_frame_tests|initial_placement::tests|overflow_input_tests|front_popup_input_tests|context_shortcuts::tests|fullscreen_in_page_scroll|fullscreen_n_scroll_order|calculated_overflow_panel_height|fullscreen_overflow_rows|fullscreen_overflow_panel_(is_excluded|tall)|normal_video_wheel_setting|music_ctrl_wheel_blocks|seek_bar_hover_does_not|search_nav_entry_inventory|depth_tests::)/) & !test(/snapshot/)
+```
+
+`target/474-verify-ui.ps1` で上記UI controlsの2件再実行、snapshotの更新→通常比較、
+`cargo test --test ui_snapshot -- --test-threads=2` を順に実行した。別のfull-testのロック解放を待ち、04:14:32に開始した。
+
+snapshotのfilter:
+
+```text
+test(/(fullscreen_overflow_panel_snapshot|fullscreen_in_page_scroll_settings_snapshot|preferences_viewer_notice_visibility_snapshot)/)
+```
+
+変更したPNG（7枚、計285,387 bytes）:
+
+| `tests/snapshots/` のファイル名 | 種別・寸法 | 理由 |
+| --- | --- | --- |
+| `fullscreen_in_page_scroll_settings_light_default.png` | 追加・540×220 | 明色テーマの既定3設定と説明。 |
+| `fullscreen_in_page_scroll_settings_dark_enabled.png` | 追加・540×220 | 暗色テーマのページ内スクロール2設定とZ字の選択。 |
+| `fullscreen_overflow_panel_reading_order.png` | 追加・720×340 | 読み順の2択、選択中、戻る、閉じる。 |
+| `fullscreen_overflow_panel_root.png` | 更新・720×440 | 読み順の行を追加。高さ制約により下端はスクロール領域でclip。 |
+| `fullscreen_overflow_panel_page_turn_on.png` | 更新・720×440 | 同上。既存アニメーションON状態を維持。 |
+| `fullscreen_overflow_panel_root_tall.png` | 更新・720×680 | 11行全てを収める。従来の720×614からfixtureの高さを変更。 |
+| `preferences_viewer_notice_visibility.png` | 更新・560×360 | 同じ設定ページに3行増えたことによるスクロールバーの長さだけ。差は右端30px、bbox `(544,42,552,48)`。本文はpixel単位で同一。 |
+
+寸法・ファイルサイズ・SHA-256・pixel差の集計は `target/474-snapshots.json`。
+既存navigator小パネル・slideshowのPNGはbyte単位で不変。他のPNGの変更もない。
+実装差分の独立レビューは、この記録の後に別の担当 (Sol / xhigh) が行う (§6 に結果を記録する)。
+最終のファイル38件・追加テスト72件の掲載一致・PNGのhash不変・既存clampと倍率正規化のHEAD一致は `target/474-final-audit.log` に記録した。HEADは `10d6323c6` のまま。
+
+### 7.5 現在ソースから抽出した追加テスト名
+
+#### `src/keymap.rs` (4)
+
+- `page_scroll_actions_have_image_scope_single_press_and_expected_defaults`
+- `page_n_scroll_defaults_keep_video_markers_and_edit_buckets_disjoint`
+- `page_n_scroll_old_press_overrides_conflict_roundtrip_and_can_disable_new_defaults`
+- `page_n_scroll_old_scrub_hold_conflict_roundtrip_and_none_preserve_hold_binding`
+
+#### `src/settings.rs` (2)
+
+- `fullscreen_in_page_scroll_settings_default_and_round_trip_independently`
+- `fullscreen_in_page_scroll_settings_normalize_unknown_to_existing_defaults`
+
+#### `src/settings_transfer.rs` (1)
+
+- `fullscreen_in_page_scroll_transfer_roundtrip_missing_and_invalid_preserve_values`
+
+#### `src/ui_dialogs/preferences.rs` (1)
+
+- `fullscreen_in_page_scroll_preferences_ui_ok_save_reread_reopen_and_cancel`
+
+#### `src/ui_dialogs/preferences/pages.rs` (3)
+
+- `fullscreen_in_page_scroll_settings_snapshot_light_default`
+- `fullscreen_in_page_scroll_settings_snapshot_dark_enabled`
+- `fullscreen_n_scroll_order_selector_preserves_other_input_settings`
+
+#### `src/ui_dialogs/preferences/search_index.rs` (1)
+
+- `fullscreen_in_page_scroll_settings_are_searchable`
+
+#### `src/ui_dialogs/context_shortcuts.rs` (2)
+
+- `image_fixed_help_resolves_independent_settings_only_on_the_scroll_surface`
+- `image_help_shows_default_n_scroll_and_custom_cardinal_assignment`
+
+#### `src/ui_fullscreen.rs` (1)
+
+- `fullscreen_overflow_panel_snapshot_reading_order`
+
+#### `src/ui_fullscreen/in_page_scroll.rs` (11)
+
+- `axes_overflow_independently_and_stop_at_aligned_edges`
+- `outside_edge_moves_only_inward_without_snapping_to_near_edge`
+- `diagonal_wheel_keeps_moving_the_axis_that_has_not_reached_its_edge`
+- `scroll_geometry_removes_drawn_pan_without_scaling_the_unit`
+- `ordered_primary_and_wrap_moves_share_n_and_z_rules_in_both_directions`
+- `ordered_scroll_without_primary_overflow_uses_only_secondary_axis`
+- `asymmetric_original_spread_never_repeats_a_column_or_row_after_clamp`
+- `clamp_cannot_reverse_wheel_or_correct_an_unrequested_axis`
+- `white_companion_counts_for_edges_but_vacant_slot_does_not`
+- `saved_and_free_rotation_use_the_painted_quad_including_negative_angles_and_trim`
+- `empty_continuous_and_z_layouts_do_not_scroll`
+
+#### `src/ui_fullscreen/in_page_scroll/handler_tests.rs` (36)
+
+- `current_receipt_rejects_missing_generation_other_page_and_recovers_after_new_paint`
+- `holdover_partial_pair_and_comparison_paints_cannot_publish_scroll_receipts`
+- `geometry_key_rejects_same_frame_fit_rotation_free_rotation_gap_direction_and_limits`
+- `replacement_material_key_uses_dimensions_rather_than_texture_identity`
+- `resized_or_dpi_changed_viewport_rejects_old_receipt`
+- `root_dispatch_uses_destination_viewport_size_and_dpi`
+- `changed_zoom_skips_scroll_until_new_paint_then_cancels_initial_request`
+- `up_down_handler_obeys_all_four_independent_settings_combinations`
+- `up_down_short_tap_multiple_edges_and_released_repeat_move_at_most_once`
+- `shift_arrows_and_horizontal_arrows_keep_page_navigation`
+- `fallback_menu_consumes_replacement_arrows_without_moving_or_turning`
+- `default_j_k_actions_work_with_page_turn_settings_and_use_the_selected_order`
+- `new_action_is_left_for_front_ui_or_surface_outside_but_consumed_for_stale_layout`
+- `wheel_classifier_preserves_modifier_seek_and_surface_legacy_routes`
+- `wheel_prediction_uses_fractional_two_axis_scroll_and_stops_after_legacy_navigation`
+- `zoom_then_page_scroll_prediction_discards_scroll_for_the_unpainted_zoom`
+- `deferred_wheel_projects_only_segments_remaining_after_front_ui_consumption`
+- `context_swap_keeps_receipt_and_scroll_pan_with_the_owning_context`
+- `changed_slice_and_spread_screen_order_do_not_match_previous_unit`
+- `pending_navigation_sequence_consumes_scroll_without_using_previous_pixels`
+- `fit_change_and_down_in_one_real_handler_pass_discard_old_geometry`
+- `native_and_egui_down_share_one_consume_and_use_the_edge_modifier`
+- `stack_shift_arrow_stays_in_stack_route_even_with_page_scroll_enabled`
+- `actual_wheel_acceptance_keeps_fractional_scroll_and_legacy_thresholds_separate`
+- `real_preferences_controls_ok_persistence_then_handler_and_wheel_use_new_values`
+- `focused_text_input_keeps_new_action_and_up_down_away_from_the_canvas`
+- `wheel_and_single_click_same_frame_uses_the_scrolled_view_before_deciding_navigation`
+- `key_zoom_and_down_same_frame_consume_scroll_then_new_paint_can_reach_the_edge`
+- `ctrl_wheel_then_scroll_consumes_without_projection_and_resumes_after_new_paint`
+- `gap_200_spread_rejects_old_zoom_geometry_and_aligns_to_the_new_painted_edge`
+- `near_fit_zoom_normalization_does_not_permanently_discard_keys_or_wheel`
+- `near_fit_wide_unit_key_scroll_keeps_exact_edge_and_painted_width_after_multiple_steps`
+- `near_fit_wide_unit_wheel_prediction_and_apply_keep_exact_edge_after_multiple_steps`
+- `deferred_scroll_keeps_its_acceptance_receipt_across_repaint_and_click_prediction`
+- `saved_k_scrub_hold_and_default_k_press_both_reach_real_handlers_and_none_preserves_hold`
+- `saved_k_press_runs_in_existing_handler_order_before_new_page_scroll_press`
+
+#### `src/ui_fullscreen/in_page_scroll/overflow_tests.rs` (2)
+
+- `reading_order_overflow_real_controls_share_and_persist_the_global_setting`
+- `reading_order_overflow_is_global_in_all_image_modes_and_closes_like_existing_panels`
+
+#### `src/ui_fullscreen/in_page_scroll/interaction_tests.rs` (8)
+
+- `reading_order_keys_close_the_panel_then_continue_their_existing_action`
+- `reading_order_escape_matches_the_existing_root_panel_close_and_forward_policy`
+- `reading_order_non_key_wheel_and_absolute_page_navigation_keep_the_panel_open`
+- `down_and_single_click_same_frame_uses_the_key_scrolled_view`
+- `page_scroll_then_same_frame_wheel_and_double_click_resets_without_turning`
+- `returning_to_the_automatic_origin_with_scroll_keys_reenables_single_click`
+- `mixed_image_to_audio_or_video_keeps_legacy_consumer_and_discards_accepted_scroll`
+- `vertical_and_horizontal_real_wheel_keep_the_legacy_continuous_scroll_owner`
+
+### 7.6 更新した既存テストとfixture
+
+- `settings_transfer::tests::all_settings_fields_are_classified`：分類501件・転送対象164件・wire162件へ更新。転送用の非既定fixtureにも3設定を追加。
+- `ui_fullscreen::depth_tests::depth_wheel_navigates_and_ctrl_wheel_never_uses_panorama_fov_or_hidden_zoom`：既存ホイール入力にLegacy分類と受理時情報を追加。
+- `ui_fullscreen::tests::calculated_overflow_panel_height_matches_all_states_and_scrolls_when_constrained`：読み順を状態一覧へ追加し、Root11行で制約が生じる画面も末尾到達を検査。
+- `ui_fullscreen::tests::fullscreen_overflow_panel_tall_viewport_keeps_the_production_body_height`：11行が収まる680pt・720ptで検査。
+- `ui_fullscreen::tests::fullscreen_overflow_panel_snapshot_root` / `fullscreen_overflow_panel_snapshot_navigator_submenu` / `fullscreen_overflow_panel_snapshot_root_tall_without_scrollbar` / `fullscreen_overflow_panel_snapshot_page_turn_on` / `fullscreen_overflow_panel_snapshot_slideshow`：共有fixtureに読み順の行と選択値を追加。tallの高さを更新。navigator・slideshowのPNGは不変。
+- `ui_dialogs::preferences::tests::preferences_viewer_notice_visibility_snapshot`：同じ設定ページの内容増加に合わせ、スクロールバーだけを更新。
+
+検索ナビゲーションinventoryの補助 `key_entry` は6操作を非ナビゲーションに分類した。
+既存の音楽小パネル等の描画fixtureには新しいview項目の既定値を補った。本番の分岐は変更していない。
+
+### 6.8 実装担当の停止報告と決定 (2026-11-18)
+
+実装担当 (Codex gpt-6.1-sol / high、session 01a1ea54) が、§2.3 の「同じ frame の倍率変更は既存 clamp と同じ投影で扱う」と実描画の矛盾を報告して停止した
+(既存の投影は通常の見開きの間隔も倍率比例にするが、描画は間隔を固定する)。設計担当の決定: (B) 同じ frame に倍率が変わったらスクロールは消費のみ。
+共有の投影は変えない (既定設定の手動パン・ズームに影響させない)。§2.3・§2.4・§2.6・§2.10・§5 を直した。
+
+### 6.9 実装担当の 2 回目の停止報告と決定 (2026-11-18)
+
+既存の倍率の正規化 (`fs_zoom_pan_for`) は、1 付近の倍率 (例 0.9995) を pan 0 では 1 倍で描き、pan が付くとその倍率で描く。
+`fs_zoom` が変わらなくても、スクロールで pan が付いた瞬間に画像の寸法が変わり、端に空きが残る (原寸幅 10000 で約 2〜3pt、実装担当のコード上の計算)。
+設計担当の決定: 照合は描いたときの実効の倍率で比べ、スクロールで pan を書くときは `fs_zoom` にもその実効の倍率を書く (§2.3)。
+既存の正規化と手動パン・ズームの挙動は変えない。

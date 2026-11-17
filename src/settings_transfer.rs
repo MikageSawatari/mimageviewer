@@ -385,6 +385,9 @@ preferences_policy! {
         fullscreen_fixed_bar_gap_px: u32 => ("固定バーと画像の間隔", |v, _raw| (0..=FULLSCREEN_FIXED_BAR_GAP_MAX_PX).contains(v), plain, plain);
         fullscreen_seek_direction: FullscreenSeekDirection => ("静止画のシーク方向", |v, _raw| !matches!(v, FullscreenSeekDirection::Unknown), plain, plain);
         fullscreen_horizontal_cursor_direction: FullscreenHorizontalCursorDirection => ("閲覧表示の横カーソル方向", |v, _raw| !matches!(v, FullscreenHorizontalCursorDirection::Unknown), plain, plain);
+        fullscreen_up_down_key_action: FullscreenUpDownKeyAction => ("閲覧表示の上下キー操作", |v, _raw| FullscreenUpDownKeyAction::all().contains(v), plain, plain);
+        fullscreen_wheel_action: FullscreenWheelAction => ("閲覧表示の通常ホイール操作", |v, _raw| FullscreenWheelAction::all().contains(v), plain, plain);
+        fullscreen_n_scroll_order: FullscreenNScrollOrder => ("ページ内スクロールの読み順", |v, _raw| FullscreenNScrollOrder::all().contains(v), plain, plain);
         fullscreen_page_number_overlay: bool => ("ページ番号を重ねて表示", |_, _| true, plain, plain);
         fullscreen_keep_on_app_switch: bool => ("アプリ切替時に閲覧表示を維持", |_, _| true, plain, plain);
         fullscreen_cursor_hide_delay_secs: f32 => ("閲覧表示のカーソルを隠す時間", |v, _raw| (FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS..=FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS).contains(v) && raw_range(_raw, FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS, FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS), plain, plain);
@@ -1419,6 +1422,18 @@ mod tests {
                 FullscreenHorizontalCursorDirection::FollowSeekBar,
             ],
         );
+        settings.fullscreen_up_down_key_action = different_enum(
+            &settings.fullscreen_up_down_key_action,
+            FullscreenUpDownKeyAction::all(),
+        );
+        settings.fullscreen_wheel_action = different_enum(
+            &settings.fullscreen_wheel_action,
+            FullscreenWheelAction::all(),
+        );
+        settings.fullscreen_n_scroll_order = different_enum(
+            &settings.fullscreen_n_scroll_order,
+            FullscreenNScrollOrder::all(),
+        );
         settings.fullscreen_page_number_overlay = !settings.fullscreen_page_number_overlay;
         settings.fullscreen_keep_on_app_switch = !settings.fullscreen_keep_on_app_switch;
         settings.fullscreen_cursor_hide_delay_secs = if settings.fullscreen_cursor_hide_delay_secs
@@ -2271,15 +2286,89 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_in_page_scroll_transfer_roundtrip_missing_and_invalid_preserve_values() {
+        let mut source = Settings::default();
+        source.fullscreen_up_down_key_action = FullscreenUpDownKeyAction::InPageScroll;
+        source.fullscreen_wheel_action = FullscreenWheelAction::InPageScroll;
+        source.fullscreen_n_scroll_order = FullscreenNScrollOrder::HorizontalFirst;
+        let exported = export_preferences(&source).unwrap();
+        let mut destination = Settings::default();
+        let report = parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert_eq!(
+            destination.fullscreen_up_down_key_action,
+            source.fullscreen_up_down_key_action
+        );
+        assert_eq!(
+            destination.fullscreen_wheel_action,
+            source.fullscreen_wheel_action
+        );
+        assert_eq!(
+            destination.fullscreen_n_scroll_order,
+            source.fullscreen_n_scroll_order
+        );
+        parse_preferences(&document(json!({})))
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(
+            destination.fullscreen_up_down_key_action,
+            source.fullscreen_up_down_key_action
+        );
+        assert_eq!(
+            destination.fullscreen_wheel_action,
+            source.fullscreen_wheel_action
+        );
+        assert_eq!(
+            destination.fullscreen_n_scroll_order,
+            source.fullscreen_n_scroll_order
+        );
+        for field in [
+            "fullscreen_up_down_key_action",
+            "fullscreen_wheel_action",
+            "fullscreen_n_scroll_order",
+        ] {
+            for invalid in [
+                json!("FutureAction"),
+                json!("Unknown"),
+                json!(true),
+                json!(1),
+                Value::Null,
+            ] {
+                let mut values = Map::new();
+                values.insert(field.into(), invalid);
+                let report = parse_preferences(&document(Value::Object(values)))
+                    .unwrap()
+                    .apply_to(&mut destination);
+                assert_eq!(report.accepted_count, 0, "{field}");
+                assert_eq!(report.issues.len(), 1, "{field}");
+                assert_eq!(
+                    destination.fullscreen_up_down_key_action,
+                    source.fullscreen_up_down_key_action
+                );
+                assert_eq!(
+                    destination.fullscreen_wheel_action,
+                    source.fullscreen_wheel_action
+                );
+                assert_eq!(
+                    destination.fullscreen_n_scroll_order,
+                    source.fullscreen_n_scroll_order
+                );
+            }
+        }
+    }
+
+    #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 498);
+        assert_eq!(entries.len(), 501);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            161
+            164
         );
         assert_eq!(
             entries
@@ -2315,7 +2404,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 159);
+        assert_eq!(wire.len(), 162);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

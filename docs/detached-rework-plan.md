@@ -1458,6 +1458,19 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-18: ページ内スクロールの描画済み layout の印（§1.474）
+
+[ページ内スクロール設計 r4 §2.3](fullscreen-in-page-scroll-plan.md)（独立設計レビュー ACCEPT）に沿い、
+context 所有の `FullscreenPageLayout` に描画済み通常画像の表示単位・幾何の印を1つ追加する。
+layout の既存の swap / clear / begin と同じ寿命に置き、別の pending・世代同期・配送状態は作らない。
+キーとホイールは既存の入力配送を通り、所有 context の layout・`fs_pan`・`fs_zoom` だけを読み書きする。
+兄弟 context を失効・変更させず、detached 述語・viewport 経路・HWND は変更しない。
+入力時の実効倍率（`fs_zoom_pan()` が None なら1、Someならその倍率）が所有 layout の描画時と異なる場合は
+消費のみとし、次の描画からスクロールを受け付ける。スクロールを書き込むときは同じ context の `fs_zoom` も
+layout の実効倍率に揃え、見た目の倍率を保つ（設計 §6.9）。raw 倍率の比較で代用しない。
+既存のパン制約は変更せず、待機・再配送・新しい pending 状態を追加しない（設計 §6.8 の B 決定）。
+旧 layout に入力を適用しない照合であり、detached の症状パッチではない。
+
 ### 2026-11-17: §1.800 S1 の仮想フォルダと親との対応
 
 設計担当の §4S（独立設計レビュー r10 ACCEPT）と実装の独立レビューで、UI の一回限りの

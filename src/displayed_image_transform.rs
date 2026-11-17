@@ -1151,11 +1151,13 @@ pub(crate) enum FullscreenPageLayoutKind {
 pub(crate) struct FullscreenPageLayout {
     kind: FullscreenPageLayoutKind,
     pages: Vec<DisplayedPage>,
+    pub(crate) drawn_unit: Option<crate::ui_fullscreen::in_page_scroll::FsDrawnUnitStamp>,
 }
 
 impl FullscreenPageLayout {
     pub(crate) fn begin(&mut self, kind: FullscreenPageLayoutKind) {
         self.pages.clear();
+        self.drawn_unit = None;
         self.kind = kind;
     }
 

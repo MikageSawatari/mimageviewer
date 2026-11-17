@@ -417,6 +417,12 @@ fn key_entry(action: KeyAction) -> Entry {
         | FsFitModeCycle
         | FsZoomIn
         | FsZoomOut
+        | FsPageNScrollNext
+        | FsPageNScrollPrev
+        | FsPageScrollUp
+        | FsPageScrollDown
+        | FsPageScrollLeft
+        | FsPageScrollRight
         | FsAiModelNext
         | FsAiModelPrev
         | FsAiModelReset

@@ -16,8 +16,9 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode,
-    FullscreenHorizontalCursorDirection, FullscreenJumpMode, FullscreenPageStartPosition,
-    FullscreenSeekDirection, GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow,
+    FullscreenHorizontalCursorDirection, FullscreenJumpMode, FullscreenNScrollOrder,
+    FullscreenPageStartPosition, FullscreenSeekDirection, FullscreenUpDownKeyAction,
+    FullscreenWheelAction, GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow,
     SortOrder, SpreadMode, StartupFolderMode, StartupWindowState, TextContrast,
     UI_FONT_VERTICAL_ADJUST_MAX, UI_FONT_VERTICAL_ADJUST_MIN, UiFontSelection, UiTheme,
 };
@@ -10503,6 +10504,41 @@ pub(super) fn draw_fullscreen_page_start_position_setting(
     ui.small("画面からはみ出すとき、ページを切り替えた直後にどこから表示するか。");
 }
 
+fn draw_fullscreen_up_down_key_action_setting(
+    ui: &mut egui::Ui,
+    value: &mut FullscreenUpDownKeyAction,
+) {
+    egui::ComboBox::from_label("上下キー")
+        .selected_text(value.label())
+        .show_ui(ui, |ui| {
+            for &action in FullscreenUpDownKeyAction::all() {
+                ui.selectable_value(value, action, action.label());
+            }
+        });
+}
+
+fn draw_fullscreen_wheel_action_setting(ui: &mut egui::Ui, value: &mut FullscreenWheelAction) {
+    egui::ComboBox::from_label("通常のホイール")
+        .selected_text(value.label())
+        .show_ui(ui, |ui| {
+            for &action in FullscreenWheelAction::all() {
+                ui.selectable_value(value, action, action.label());
+            }
+        });
+    ui.small("ページ単位の表示で、画像が画面からはみ出す分だけ動かします。ページの端で止まり、次のページへは送りません。");
+}
+
+fn draw_fullscreen_n_scroll_order_setting(ui: &mut egui::Ui, value: &mut FullscreenNScrollOrder) {
+    egui::ComboBox::from_label("N 字スクロールの順序")
+        .selected_text(value.label())
+        .show_ui(ui, |ui| {
+            for &action in FullscreenNScrollOrder::all() {
+                ui.selectable_value(value, action, action.label());
+            }
+        });
+    ui.small("ページ内を順に読み進める操作 (既定 K / J) の順序です。");
+}
+
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "spread/chrome-suppression", |ui, state| {
         crate::ui_helpers::draw_fullscreen_chrome_suppression_setting(
@@ -10786,6 +10822,18 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             });
         ui.small("通常の左右キーによるページ移動だけに適用します。前／次コマンド、Shift+左右、Ctrl+左右、PageUp／PageDown、画面端クリック、ホイールの方向は変わりません。");
     });
+    anchored(ui, state, "spread/up-down-key-action", |ui, state| {
+        draw_fullscreen_up_down_key_action_setting(
+            ui,
+            &mut state.settings.fullscreen_up_down_key_action,
+        );
+    });
+    anchored(ui, state, "spread/wheel-action", |ui, state| {
+        draw_fullscreen_wheel_action_setting(ui, &mut state.settings.fullscreen_wheel_action);
+    });
+    anchored(ui, state, "spread/n-scroll-order", |ui, state| {
+        draw_fullscreen_n_scroll_order_setting(ui, &mut state.settings.fullscreen_n_scroll_order);
+    });
     anchored(ui, state, "spread/top-bar", |ui, state| {
         let s = &mut state.settings;
         ui.checkbox(&mut s.fullscreen_top_bar_locked, "上部情報バーを固定表示");
@@ -10924,7 +10972,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     ui.add_space(8.0);
     anchored(ui, state, "spread/continuous-scroll", |ui, state| {
         let s = &mut state.settings;
-        ui.label("連結読みのスクロール量 (画面サイズ基準)");
+        ui.label("スクロール量 (連結読み・ページ内スクロール)");
         ui.horizontal(|ui| {
             let label = ui.label("ホイール 1 ノッチ");
             ui.add(
@@ -10974,6 +11022,104 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         );
         ui.small(s.panorama_projection.description());
     });
+}
+
+#[cfg(test)]
+mod fullscreen_in_page_scroll_setting_tests {
+    use super::*;
+
+    fn draw(ui: &mut egui::Ui, settings: &mut Settings) {
+        draw_fullscreen_up_down_key_action_setting(ui, &mut settings.fullscreen_up_down_key_action);
+        draw_fullscreen_wheel_action_setting(ui, &mut settings.fullscreen_wheel_action);
+        draw_fullscreen_n_scroll_order_setting(ui, &mut settings.fullscreen_n_scroll_order);
+    }
+
+    fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme, enabled: bool) {
+        let mut settings = Settings::default();
+        if enabled {
+            settings.fullscreen_up_down_key_action = FullscreenUpDownKeyAction::InPageScroll;
+            settings.fullscreen_wheel_action = FullscreenWheelAction::InPageScroll;
+            settings.fullscreen_n_scroll_order = FullscreenNScrollOrder::HorizontalFirst;
+        }
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(540.0, 220.0))
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, theme);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        draw(ui, &mut settings);
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    #[test]
+    fn fullscreen_in_page_scroll_settings_snapshot_light_default() {
+        snapshot(
+            "fullscreen_in_page_scroll_settings_light_default",
+            crate::os_theme::ResolvedTheme::Light,
+            false,
+        );
+    }
+
+    #[test]
+    fn fullscreen_in_page_scroll_settings_snapshot_dark_enabled() {
+        snapshot(
+            "fullscreen_in_page_scroll_settings_dark_enabled",
+            crate::os_theme::ResolvedTheme::Dark,
+            true,
+        );
+    }
+
+    #[test]
+    fn fullscreen_n_scroll_order_selector_preserves_other_input_settings() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(540.0, 260.0))
+            .build_ui_state(
+                |root_ui, (settings, fonts_ready)| {
+                    let ctx = &root_ui.ctx().clone();
+                    if !*fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        *fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| draw(ui, settings));
+                },
+                (Settings::default(), false),
+            );
+        harness.run();
+        for (selected, expected) in [
+            ("横優先 (Z 字)", FullscreenNScrollOrder::HorizontalFirst),
+            ("縦優先 (N 字)", FullscreenNScrollOrder::VerticalFirst),
+        ] {
+            harness.get_by_label("N 字スクロールの順序").click();
+            harness.run();
+            harness.get_by_label(selected).click();
+            harness.run();
+            assert_eq!(harness.state().0.fullscreen_n_scroll_order, expected);
+            assert_eq!(
+                harness.state().0.fullscreen_up_down_key_action,
+                FullscreenUpDownKeyAction::PageTurn
+            );
+            assert_eq!(
+                harness.state().0.fullscreen_wheel_action,
+                FullscreenWheelAction::PageTurn
+            );
+        }
+    }
 }
 
 pub(super) fn draw_fullscreen_manual_nav_wrap_setting(ui: &mut egui::Ui, enabled: &mut bool) {

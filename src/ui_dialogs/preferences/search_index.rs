@@ -1244,6 +1244,31 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["矢印キー", "左右キー", "ページ移動"]
     ),
     entry!(
+        "spread/up-down-key-action",
+        SpreadMode,
+        "上下キー",
+        ["矢印キー", "修飾なし", "ページ送り", "ページ内スクロール"]
+    ),
+    entry!(
+        "spread/wheel-action",
+        SpreadMode,
+        "通常のホイール",
+        ["マウスホイール", "ページ送り", "ページ内スクロール"]
+    ),
+    entry!(
+        "spread/n-scroll-order",
+        SpreadMode,
+        "N 字スクロールの順序",
+        [
+            "ページ内スクロール",
+            "読み順",
+            "縦優先",
+            "横優先",
+            "N 字",
+            "Z 字"
+        ]
+    ),
+    entry!(
         "spread/top-bar",
         SpreadMode,
         "上部情報バーを固定表示",
@@ -1311,7 +1336,7 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
     entry!(
         "spread/continuous-scroll",
         SpreadMode,
-        "連結読みのスクロール量 (画面サイズ基準)",
+        "スクロール量 (連結読み・ページ内スクロール)",
         [
             "ホイール",
             "マウスホイール",
@@ -2228,6 +2253,23 @@ mod tests {
             .find(|entry| entry.anchor == "spread/seek-strip")
             .expect("静止画サムネイル列の最大高さが検索できる");
         assert_eq!(still_height.page, PreferencesPage::SpreadMode);
+    }
+
+    #[test]
+    fn fullscreen_in_page_scroll_settings_are_searchable() {
+        for (query, anchor) in [
+            ("上下キー ページ内", "spread/up-down-key-action"),
+            ("ホイール ページ内", "spread/wheel-action"),
+            ("横優先 読み順", "spread/n-scroll-order"),
+            ("Z 字", "spread/n-scroll-order"),
+            ("ページ内 スクロール量", "spread/continuous-scroll"),
+        ] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == anchor)
+                .expect("ページ内スクロール設定が検索できる");
+            assert_eq!(entry.page, PreferencesPage::SpreadMode);
+        }
     }
 
     #[test]
