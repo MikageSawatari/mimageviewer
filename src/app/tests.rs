@@ -23,6 +23,8 @@ pub(super) fn backend_window_for_test(
         },
     )
 }
+mod auto_aspect_s1;
+mod book_close_s1;
 mod repro742;
 mod section1768;
 
@@ -267,7 +269,7 @@ mod section1452_book_cover_cache {
                 }];
                 app.setup_virtual_folder_seed_and_writeback(&path, &catalog, &map);
                 let wb = app
-                    .virtual_folder_writeback
+                    .virtual_folder_parent
                     .as_ref()
                     .expect("writeback target remains prepared under either setting");
                 assert_eq!(wb.target_key, key);
@@ -339,7 +341,7 @@ mod section1452_book_cover_cache {
         assert_eq!(zip_db.load_one(target_key).unwrap().unwrap().cover, cover);
         assert_eq!(map.read().unwrap()[target_key].cover, cover);
         parent_db.delete_one(parent_key).unwrap();
-        app.fire_virtual_folder_writeback_if_ready(0);
+        book_close_s1::writeback(&app, 0, &zip_db, (1, 2));
         assert_eq!(
             parent_db.load_one(parent_key).unwrap().unwrap().cover,
             cover
@@ -505,35 +507,36 @@ mod section1452_book_cover_cache {
             app.settings.cache_book_cover_only = cover_only;
             app.items = vec![page.clone()];
             app.image_metas = vec![Some((40, 80))];
-            app.virtual_folder_writeback = Some(VirtualFolderWriteback {
+            let source_stamp = book_close_s1::source_stamp(&path);
+            app.virtual_folder_parent = Some(Box::new(VirtualFolderParent {
+                source_path: path.clone(),
                 parent_catalog: Arc::clone(&parent_db),
                 parent_key: parent_key.clone(),
                 target_key: key.clone(),
                 target_idx: 0,
                 items_gen: app.items_generation,
-                cache_map: Arc::clone(&map),
-                parent_entry_mtime: 900,
-                parent_entry_size: 1000,
-            });
+                parent_entry_mtime: source_stamp.0,
+                parent_entry_size: source_stamp.1,
+            }));
             let mut req = request(&app, &page, (40, 80));
+            app.attach_pool_thumbnail_context(&mut req);
             process(
                 &mut req,
                 &catalog,
                 &map,
                 CacheDecision::from_settings(&app.settings),
             );
-            app.fire_virtual_folder_writeback_if_ready(0);
             let copied = parent_db.load_one(&parent_key).unwrap();
             assert_eq!(copied.is_some(), expect_copy, "{name}");
             if let Some(copied) = copied {
-                assert_eq!((copied.mtime, copied.file_size), (900, 1000));
+                assert_eq!((copied.mtime, copied.file_size), source_stamp);
                 assert_eq!(copied.source_dims, Some((12, 8)));
                 assert_eq!(
                     copied.jpeg_data,
                     catalog.load_one(&key).unwrap().unwrap().jpeg_data
                 );
             }
-            assert!(app.virtual_folder_writeback.is_none());
+            assert!(app.virtual_folder_parent.is_some());
         }
     }
 
@@ -20793,10 +20796,8 @@ mod phase_c_key_tests {
             .unwrap(),
             &source,
         );
-        map.write().unwrap().insert(
-            drive_list_pinned_cache_key(&prefix, old.generation_id, old.pdf_size as i64),
-            parent.load_one(&key).unwrap().unwrap(),
-        );
+        // Match production: seed both the drive-list DB and its memory copy.
+        // Prefix previews read the DB, so a memory-only row is not a valid fixture.
         app.seed_drive_list_pin_thumbs_from_catalog(&map, Some(&target));
         let load = |app: &AppTestEnv,
                     map: &std::sync::Arc<
@@ -20818,7 +20819,7 @@ mod phase_c_key_tests {
                 &mut req.clone(),
                 map,
                 &tx,
-                None,
+                Some(&target),
                 64,
                 75,
                 64,
@@ -20959,6 +20960,9 @@ mod phase_c_key_tests {
                 crate::cover_auto_material::AutoMaterial::NotAutomatic,
             )
             .unwrap();
+        for cached_key in target.list_filenames_with_prefix(&prefix).unwrap() {
+            target.delete_one(&cached_key).unwrap();
+        }
         map.write()
             .unwrap()
             .retain(|cached_key, _| !cached_key.starts_with(&prefix));
@@ -21075,6 +21079,10 @@ mod phase_c_key_tests {
                     crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 )
                 .unwrap();
+            // Recreate an old-only seed in both stores, not just the memory copy.
+            for cached_key in target.list_filenames_with_prefix(&prefix).unwrap() {
+                target.delete_one(&cached_key).unwrap();
+            }
             map.write()
                 .unwrap()
                 .retain(|cached_key, _| !cached_key.starts_with(&prefix));
@@ -21440,7 +21448,7 @@ mod phase_c_key_tests {
         let target = crate::catalog::CatalogDb::open(&cache_dir, &epub).unwrap();
         let map = std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         app.setup_virtual_folder_seed_and_writeback(&epub, &target, &map);
-        assert!(app.virtual_folder_writeback.is_none());
+        assert!(app.virtual_folder_parent.is_none());
         assert!(map.read().unwrap().is_empty());
         assert!(
             app.pdf_prefetch_grace_until.is_some(),
@@ -53559,155 +53567,8 @@ mod favorite_adjustment_defaults_tests {
         assert!(!cache_map.read().unwrap().contains_key(&target_key));
         // writeback ターゲットは設定される (= 後続の worker 完成時に親 catalog にミラー)。
         assert!(
-            app.virtual_folder_writeback.is_some(),
+            app.virtual_folder_parent.is_some(),
             "親 catalog がミスでも writeback ターゲットは設定する"
-        );
-    }
-
-    /// 仮想 catalog で先頭ページが完成したとき、`fire_virtual_folder_writeback_if_ready`
-    /// が親 catalog の `pdfthumb:foo.pdf` 行に WebP データを書き戻すこと。
-    #[test]
-    fn fire_virtual_folder_writeback_mirrors_to_parent() {
-        let mut app = setup_app();
-        let parent_dir = app.tmp.path().join("parent3");
-        std::fs::create_dir_all(&parent_dir).unwrap();
-        let _pdf_path = parent_dir.join("bar.pdf");
-        let cache_dir = crate::catalog::default_cache_dir();
-        let parent_db_arc =
-            Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &parent_dir).unwrap());
-
-        // worker が page_0000 として cache_map に入れた WebP を準備。
-        let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 128, 255, 255]));
-        let mut webp_bytes: Vec<u8> = Vec::new();
-        image::DynamicImage::ImageRgba8(img)
-            .write_to(
-                &mut std::io::Cursor::new(&mut webp_bytes),
-                image::ImageFormat::WebP,
-            )
-            .unwrap();
-        let target_key = crate::grid_item::pdf_page_cache_key(0);
-        let cache_map: Arc<
-            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
-        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-        cache_map.write().unwrap().insert(
-            target_key.clone(),
-            crate::catalog::CacheEntry {
-                auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
-                cover: crate::cover_identity::CoverIdentity::Legacy,
-                mtime: 999,
-                file_size: 4096,
-                jpeg_data: webp_bytes.clone(),
-                source_dims: Some((400, 400)),
-                layout_dims: None,
-                folder_provenance: None,
-                selection_proof: None,
-            },
-        );
-
-        let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "bar.pdf");
-        app.image_metas = vec![None, None, None, Some((999, 4096))];
-        let cur_gen = app.items_generation;
-        app.virtual_folder_writeback = Some(crate::app::VirtualFolderWriteback {
-            parent_catalog: Arc::clone(&parent_db_arc),
-            parent_key: parent_key.clone(),
-            target_key: target_key.clone(),
-            target_idx: 3,
-            items_gen: cur_gen,
-            cache_map: Arc::clone(&cache_map),
-            parent_entry_mtime: 1234567,
-            parent_entry_size: 9999,
-        });
-
-        // 別 idx で発火しても何も起きない。
-        app.fire_virtual_folder_writeback_if_ready(2);
-        assert!(parent_db_arc.load_one(&parent_key).unwrap().is_none());
-        assert!(app.virtual_folder_writeback.is_some());
-
-        // target_idx で発火すると親 catalog にミラーされ、writeback がクリアされる。
-        app.fire_virtual_folder_writeback_if_ready(3);
-        let entry = parent_db_arc
-            .load_one(&parent_key)
-            .unwrap()
-            .expect("親 catalog にミラー保存される");
-        assert_eq!(entry.mtime, 1234567);
-        assert_eq!(entry.file_size, 9999);
-        assert_eq!(entry.source_dims, Some((400, 400)));
-        assert_eq!(entry.jpeg_data, webp_bytes);
-        assert!(
-            app.virtual_folder_writeback.is_none(),
-            "発火後は writeback を None に戻して二重書き込みを防ぐ"
-        );
-    }
-
-    /// Codex P2: items_generation がずれた古い writeback ターゲットは発火させずに
-    /// クリアするだけにする (= 別フォルダに飛んで戻ったときの誤発火防止)。
-    #[test]
-    fn fire_virtual_folder_writeback_drops_stale_generation() {
-        let mut app = setup_app();
-        let parent_dir = app.tmp.path().join("parent4");
-        std::fs::create_dir_all(&parent_dir).unwrap();
-        let cache_dir = crate::catalog::default_cache_dir();
-        let parent_db_arc =
-            Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &parent_dir).unwrap());
-        let cache_map: Arc<
-            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
-        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-        let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "stale.pdf");
-        app.virtual_folder_writeback = Some(crate::app::VirtualFolderWriteback {
-            parent_catalog: Arc::clone(&parent_db_arc),
-            parent_key: parent_key.clone(),
-            target_key: crate::grid_item::pdf_page_cache_key(0),
-            target_idx: 0,
-            // 古い世代 (現在 items_generation が進んだ状態を模す)。
-            items_gen: 0,
-            cache_map: Arc::clone(&cache_map),
-            parent_entry_mtime: 0,
-            parent_entry_size: 0,
-        });
-        // app.items_generation を進めて発火 → 親 catalog には何も書かれず writeback が
-        // None に戻る。`replace_search_view_items` / `remove_items_batch` 経由で
-        // items_generation だけが進む実機シナリオの再現。
-        app.items_generation = 7;
-        app.fire_virtual_folder_writeback_if_ready(0);
-        assert!(parent_db_arc.load_one(&parent_key).unwrap().is_none());
-        assert!(
-            app.virtual_folder_writeback.is_none(),
-            "古い世代の writeback はクリアして次に持ち越さない"
-        );
-    }
-
-    /// Codex P2: 同じ世代・対象 idx で発火しても `cache_map` が空なら親 catalog には
-    /// 何も書かず、writeback だけクリアする (= one-shot)。実機では from_cache 経路で
-    /// finalize シグナルが届かないため永続的に再発火しない、その場で諦める。
-    #[test]
-    fn fire_virtual_folder_writeback_clears_when_cache_map_empty() {
-        let mut app = setup_app();
-        let parent_dir = app.tmp.path().join("parent_empty");
-        std::fs::create_dir_all(&parent_dir).unwrap();
-        let cache_dir = crate::catalog::default_cache_dir();
-        let parent_db_arc =
-            Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &parent_dir).unwrap());
-        // cache_map は空のまま (= worker が page_0000 を入れていない)。
-        let cache_map: Arc<
-            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
-        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-        let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "empty.pdf");
-        let cur_gen = app.items_generation;
-        app.virtual_folder_writeback = Some(crate::app::VirtualFolderWriteback {
-            parent_catalog: Arc::clone(&parent_db_arc),
-            parent_key: parent_key.clone(),
-            target_key: crate::grid_item::pdf_page_cache_key(0),
-            target_idx: 0,
-            items_gen: cur_gen,
-            cache_map: Arc::clone(&cache_map),
-            parent_entry_mtime: 0,
-            parent_entry_size: 0,
-        });
-        app.fire_virtual_folder_writeback_if_ready(0);
-        assert!(parent_db_arc.load_one(&parent_key).unwrap().is_none());
-        assert!(
-            app.virtual_folder_writeback.is_none(),
-            "cache_map が空でも 1 度試したらクリアして次の finalize に持ち越さない"
         );
     }
 
@@ -53761,7 +53622,7 @@ mod favorite_adjustment_defaults_tests {
         );
         // writeback ターゲットは設定される (= 後続 worker が完成させたら親 catalog に
         // 書き戻して corrupt 行を上書きする経路は維持)。
-        assert!(app.virtual_folder_writeback.is_some());
+        assert!(app.virtual_folder_parent.is_some());
     }
 
     /// `save_thumb_bytes` 単体: 寸法が取れないバイト列を渡したら `Ok(false)` を返し、
@@ -112551,6 +112412,7 @@ fn excluded_png_zip_parent_seed_never_becomes_first_visible_jpg_cache() {
     let parent = app.tmp.path().join("projected-parent-seed");
     std::fs::create_dir_all(&parent).unwrap();
     let zip_path = parent.join("book.zip");
+    std::fs::write(&zip_path, b"source stamp fixture").unwrap();
     let cache_dir = crate::catalog::default_cache_dir();
     let parent_db = crate::catalog::CatalogDb::open(&cache_dir, &parent).unwrap();
     let target_db = crate::catalog::CatalogDb::open(&cache_dir, &zip_path).unwrap();
@@ -112596,15 +112458,25 @@ fn excluded_png_zip_parent_seed_never_becomes_first_visible_jpg_cache() {
         &app.settings.file_type_visibility,
     );
     assert_eq!(
-        app.virtual_folder_writeback.as_ref().unwrap().parent_key,
+        app.virtual_folder_parent.as_ref().unwrap().parent_key,
         scoped
     );
     let first_jpg = crate::catalog::CacheEntry {
         ..parent_db.load_one(&old_key).unwrap().unwrap()
     };
     app.image_metas = vec![Some((first_jpg.mtime, first_jpg.file_size))];
-    map.write().unwrap().insert("2.jpg".into(), first_jpg);
-    app.fire_virtual_folder_writeback_if_ready(0);
+    target_db
+        .save_thumb_bytes(
+            "2.jpg",
+            first_jpg.mtime,
+            first_jpg.file_size,
+            first_jpg.source_dims,
+            &first_jpg.jpeg_data,
+            &first_jpg.cover,
+            first_jpg.auto_material,
+        )
+        .unwrap();
+    book_close_s1::writeback(&app, 0, &target_db, (first_jpg.mtime, first_jpg.file_size));
     assert_eq!(
         parent_db.load_one(&old_key).unwrap().unwrap().jpeg_data,
         old_png

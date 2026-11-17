@@ -4,8 +4,8 @@
 サムネイル読み込みが進むにつれて統計的に最適なグリッドセル比率を選び、
 **ちらつかずに少ない回数で**確定させる機能を追加する。
 
-> **現況 (2026-07)**: `src/auto_aspect.rs` / `src/auto_aspect_cache.rs`、設定、UI、
-> フォルダ初期 seed、サンプル集計、切替時 scroll 補正まで実装済み。§3〜§7 は現行仕様、
+> **現況 (2026-11、§1.800 S1)**: `src/auto_aspect.rs` / `src/auto_aspect_cache.rs`、設定、UI、
+> 前回値の初期復元、サンプル集計、切替時 scroll 補正まで実装済み。通常一覧は到着したサムネイルから見本を集め、準備済みの合成一覧・Collectionだけ初期 seed も行う。§3〜§7 は現行仕様、
 > §8 は実装記録として読む。§9.4 の実機確認を完了した記録は本書から確認できないため未確認。
 
 ## 1. 背景・目的
@@ -103,12 +103,21 @@ ColorImage サイズが取れる Loaded サムネは全部集計に入れる」�
   かは Shell の挙動次第。期待外れなら §10 の「動画を集計対象から外す
   フラグ」オプションに退避する。
 
-### 4.1.2 初期シード段階の走査ルールと I/O 予算
+### 4.1.2 初期復元と準備済み一覧の走査ルール・I/O 予算
 
-⚠️ `cache_map` は `catalog::load_all()` 結果なので **stale なエントリ
-(旧ファイル名のレコード等) を含む** ([src/app.rs:7264-7272](../src/app.rs))。
-`delete_missing()` は DB 側の掃除であって `cache_map` ハッシュマップは更新
-しない。**`cache_map` を直接 for-each すると消えたファイルの比率が混入する**。
+§1.800 S1 では、`reset_auto_aspect_with_seed` が世代の状態をリセットして、前回の確定比率と
+`cached_sample_gate` を最初の描画前に復元する。この処理はサムネイル要求を作らず、ピンの解決・stat・動画画像の読みも行わない。
+通常フォルダ、ZIP・変換書庫内、PDF/EPUB 内の通常一覧はこの復元だけを呼ぶ。見本は表示・先読みで
+サムネイルが到着した時に `poll_thumbnails` から集め、既存の入力 idle・見本数・連勝・cooldown の判定を通す。
+
+合成一覧と Collection の `cache_map` には既存の見本がある場合があるため、
+`reset_and_seed_auto_aspect_with_seed` は上記の復元と `seed_auto_aspect_from_cache` の両方を呼ぶ。
+準備済み catalog の無い★一覧なども、従来の UI `load_all` による全行の控えから見本を取る。
+合成かは `is_synthetic_view_path` で判定し、準備済み値の有無や空のmapを通常一覧の印には使わない。
+以下の初期 seed の規則は、この合成一覧・Collectionに適用する。
+
+`cache_map` は DB の全行を表すものではなく、古い名前の行も含み得る。
+**map を直接 for-each すると消えたファイルの比率が混入する**。
 
 正しい走査: **`self.items` を idx 順に走査し、各 item の有効 cache key で
 `cache_map` を引く**。
@@ -227,16 +236,15 @@ WebP / JPEG 混在で問題ない。
 - **`min_samples` に達した時点で seed 終了 & 即決判定**。それ以上は読まない。
 - 不足する場合のみ、最大 **`min_samples * 2` 件** までを上限に
   `decode_thumb_dims(&entry.jpeg_data)` でヘッダ寸法を probe する。
-  **これは追加ファイル I/O ではなく、`catalog.load_all()` で既にメモリに
-  読まれた `Vec<u8>` 上の数バイト header decode** ([src/catalog.rs:77-110](../src/catalog.rs)
-  で `thumb_data` を `CacheEntry::jpeg_data` として読み込み済み)。
+  **これは追加ファイル I/O ではなく、準備済み map にある `Vec<u8>` 上の
+  数バイト header decode** (`CacheEntry::jpeg_data`)。
   CPU コストのみで、1 件あたり 1ms 未満を想定 (実測すべき)。
 - それでも不足する (= 完全に旧 cache のフォルダ) 場合は seed を諦め、Square
   で描画開始 → 後続の `poll_thumbnails` で段階確定に任せる。
 
-追加 I/O は発生しないため UI スレッド応答性への影響は CPU 時間のみで判断する。
-全件 (数千件) で probe しても 1 秒未満で済む見込みだが、念のため
-`min_samples * 2` で打ち切る。それでも UI が引っかかる兆候があれば
+この header probe 自体は追加 I/O を行わないが、要求の組立てには既存のピン解決等がある。
+通常一覧は空の map のために全項目の要求を組み立てることを避け、復元だけで始める。
+準備済み一覧での header probe は `min_samples * 2` で打ち切る。それでも UI が引っかかる兆候があれば
 [docs/ui-responsiveness.md](ui-responsiveness.md) §4 のチェックリストに従って
 worker 化する。詳細は §10 オープン論点。
 
@@ -466,7 +474,10 @@ impl App {
         }
     }
 
-    /// items_generation が変わったらリセット + catalog の既存比率を一括投入。
+    /// 通常一覧: 世代リセットと前回値の復元だけ。要求や初期見本は作らない。
+    fn reset_auto_aspect_with_seed(&mut self, aspect_seed: Option<AutoAspectCacheEntry>);
+
+    /// 準備済み合成一覧・Collection: 上記の復元と map からの見本投入。
     /// 十分量あれば即決もここで行う。
     ///
     /// **呼び出し位置**: `start_loading_items` 内の
@@ -488,7 +499,7 @@ impl App {
 #### 永続キャッシュ (`src/auto_aspect_cache.rs`)
 
 `AutoAspectCacheDb` は `auto_aspect_cache.db` に `folder_key -> aspect` を保存する。
-`App::reset_and_seed_auto_aspect` は Auto モードかつ検索結果等の内容依存ビューでない場合に
+`App::reset_auto_aspect_with_seed` は Auto モードかつ検索結果等の内容依存ビューでない場合に
 前回値を復元し、`maybe_apply_auto_aspect` は実際の切替または no-op 確定時に
 現在の確定値を upsert する。書き込みは 1 フォルダあたり通常 1〜2 回で、毎フレームの
 DB アクセスは行わない。
@@ -499,6 +510,13 @@ DB アクセスは行わない。
 リセットはサムネイルキャッシュ管理ダイアログの削除操作に連動する:
 現在フォルダ削除は該当 `folder_key`、古いキャッシュ削除は `updated_at` が指定日数より
 古い行、全削除は全行を削除する。
+
+通常一覧で記録が無い場合は 1:1 から始まり、表示・先読みで届いた見本が必要数に達してから切り替わる。
+以前の「一覧順で保存済み行を選ぶ」方法と異なり、再開したスクロール位置や見た範囲により、確定・保存される比率が変わり得る。
+必要数は対象数の 1/4 を基本とする 8〜24 件（8 件未満の一覧は全対象）で、復元済みなら前回の見本数によるゲートも残る。
+表示範囲で数が足りなければ、待つだけでは確定せず、別の項目を表示するまで前回値または 1:1 を保つ。
+保存済み行の見本を集める専用 job は、seed との順序・失効・占有・要求組立ての所有を増やすため採らなかった。
+設計の比較と合意経緯は [§1.800 S1 §4S.1-7 / §4S.6](book-close-lag-800-plan.md#4s-案-s1-の設計-採用r9-の指摘を受けて-r10-で改訂2026-11-17) を参照。
 
 #### レーティング一覧のsession位置と比率 (§1.328、2026-10-07)
 

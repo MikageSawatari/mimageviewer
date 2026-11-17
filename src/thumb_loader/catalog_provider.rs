@@ -248,6 +248,14 @@ impl ThumbnailCatalogProvider {
     pub(super) fn uses_lazy_catalog(&self, req: &LoadRequest) -> bool {
         req.catalog_target.lazy_scope().is_some()
     }
+    // Fixed listings keep only saved/seeded rows in memory. Lookup permission is
+    // deliberately separate from lazy ownership (PDF metadata and Parent stamps).
+    pub(super) fn looks_up_catalog_on_miss(&self, req: &LoadRequest, db: &CatalogDb) -> bool {
+        self.uses_lazy_catalog(req)
+            || (matches!(req.catalog_target, RequestCatalog::Fixed { .. })
+                && !req.catalog_target.is_retired()
+                && !db.is_retired())
+    }
     pub(super) fn lookup_identity<'a>(
         &self,
         req: &'a LoadRequest,

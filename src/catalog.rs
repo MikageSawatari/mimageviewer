@@ -1653,6 +1653,68 @@ impl CatalogDb {
         Ok(map)
     }
 
+    /// Thumbnail payload existence without reading or decoding it. Dimensions-only
+    /// rows with NULL pixels do not count, matching the rows accepted by `load_all`.
+    pub fn contains_filename(&self, filename: &str) -> rusqlite::Result<bool> {
+        let conn = self.phase()?;
+        let mut statement = conn.prepare_cached(
+            "SELECT EXISTS(SELECT 1 FROM thumbnails WHERE filename = ?1 AND thumb_data IS NOT NULL)",
+        )?;
+        statement.query_row(params![filename], |row| row.get(0))
+    }
+
+    /// Compare the fields owned by a video seed without decoding unrelated
+    /// thumbnail metadata or allocating a second copy of its stored pixels.
+    pub fn matches_video_seed(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        thumb_data: &[u8],
+        cover: &CoverIdentity,
+    ) -> rusqlite::Result<bool> {
+        let conn = self.phase()?;
+        let columns = self.thumbnail_columns(&conn)?;
+        let cover_column = if columns.cover { "cover_key" } else { "NULL" };
+        let sql = format!(
+            "SELECT mtime, file_size, thumb_data, {cover_column} FROM thumbnails \
+             WHERE filename = ?1 AND thumb_data IS NOT NULL"
+        );
+        let mut statement = conn.prepare_cached(&sql)?;
+        statement
+            .query_row(params![filename], |row| {
+                if row.get::<_, i64>(0)? != mtime || row.get::<_, i64>(1)? != file_size {
+                    return Ok(false);
+                }
+                let pixels = row.get_ref(2)?;
+                let rusqlite::types::ValueRef::Blob(pixels) = pixels else {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        2,
+                        "thumb_data".to_owned(),
+                        pixels.data_type(),
+                    ));
+                };
+                if pixels != thumb_data {
+                    return Ok(false);
+                }
+                let stored_cover = row.get::<_, Option<String>>(3)?;
+                Ok(CoverIdentity::from_sql(stored_cover.as_deref(), self.cover_drive) == *cover)
+            })
+            .optional()
+            .map(|matches| matches.unwrap_or(false))
+    }
+
+    /// Read only row names under a literal prefix, including `%` and `_` in names.
+    pub fn list_filenames_with_prefix(&self, prefix: &str) -> rusqlite::Result<Vec<String>> {
+        let conn = self.phase()?;
+        let mut statement =
+            conn.prepare("SELECT filename FROM thumbnails WHERE substr(filename, 1, ?1) = ?2")?;
+        let rows = statement.query_map(params![prefix.chars().count() as i64, prefix], |row| {
+            row.get(0)
+        })?;
+        rows.collect()
+    }
+
     /// 単一エントリのみ取り出す。`load_all` を呼ぶほどではないが特定 key だけ確認したい
     /// 場合用 (例: 仮想フォルダ進入時の親 catalog からの seed lookup)。
     pub fn load_one(&self, filename: &str) -> rusqlite::Result<Option<CacheEntry>> {
@@ -1678,7 +1740,7 @@ impl CatalogDb {
             "SELECT mtime, file_size, thumb_data, source_width, source_height, \
                     {layout_columns}, {proof_columns}, {cover_column}, {material_column} FROM thumbnails WHERE filename = ?1"
         );
-        let mut stmt = conn.prepare(&sql)?;
+        let mut stmt = conn.prepare_cached(&sql)?;
         let mut iter = stmt.query_map(params![filename], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -3621,6 +3683,209 @@ mod tests {
                 .auto_material,
             material
         );
+    }
+
+    #[test]
+    fn video_seed_match_checks_each_owned_field_without_decoding_other_metadata() {
+        let db = open_in_memory();
+        let cover = CoverIdentity::Page("c:/books/clip.mp4".into());
+        let pixels = b"stored video pixels";
+        db.save(
+            "seed",
+            17,
+            4096,
+            8,
+            12,
+            None,
+            pixels,
+            &cover,
+            AutoMaterial::NotAutomatic,
+        )
+        .unwrap();
+        assert!(
+            db.matches_video_seed("seed", 17, 4096, pixels, &cover)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("missing", 17, 4096, pixels, &cover)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("seed", 18, 4096, pixels, &cover)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("seed", 17, 8192, pixels, &cover)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("seed", 17, 4096, b"changed pixels", &cover)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("seed", 17, 4096, pixels, &CoverIdentity::Legacy)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed(
+                "seed",
+                17,
+                4096,
+                pixels,
+                &CoverIdentity::Page("c:/books/other.mp4".into())
+            )
+            .unwrap()
+        );
+
+        // The video seed contract does not consume dimensions, auto-crop material
+        // or selection proof. A full worker load remains responsible for those.
+        db.phase().unwrap().execute(
+            "UPDATE thumbnails SET source_width='invalid integer', auto_crops='invalid material', selection_proof='invalid proof' WHERE filename='seed'", [],
+        ).unwrap();
+        assert!(db.load_one("seed").is_err());
+        assert!(
+            db.matches_video_seed("seed", 17, 4096, pixels, &cover)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn video_seed_match_decodes_raw_cover_values_like_full_entry_load() {
+        let mut db = open_in_memory();
+        let pixels = b"video pixels";
+        db.save(
+            "seed",
+            1,
+            2,
+            8,
+            12,
+            None,
+            pixels,
+            &CoverIdentity::Legacy,
+            AutoMaterial::NotAutomatic,
+        )
+        .unwrap();
+        for raw in [
+            None,
+            Some("u"),
+            Some("n"),
+            Some("p:d:/external/clip.mp4"),
+            Some("q:/books/clip.mp4"),
+            Some("future:value"),
+        ] {
+            db.phase()
+                .unwrap()
+                .execute(
+                    "UPDATE thumbnails SET cover_key=?1 WHERE filename='seed'",
+                    params![raw],
+                )
+                .unwrap();
+            let expected = db.load_one("seed").unwrap().unwrap().cover;
+            assert!(
+                db.matches_video_seed("seed", 1, 2, pixels, &expected)
+                    .unwrap(),
+                "{raw:?}"
+            );
+            let different = if expected == CoverIdentity::Legacy {
+                CoverIdentity::Unknown
+            } else {
+                CoverIdentity::Legacy
+            };
+            assert!(
+                !db.matches_video_seed("seed", 1, 2, pixels, &different)
+                    .unwrap(),
+                "{raw:?}"
+            );
+        }
+        db.phase()
+            .unwrap()
+            .execute(
+                "UPDATE thumbnails SET cover_key='q:/books/clip.mp4' WHERE filename='seed'",
+                [],
+            )
+            .unwrap();
+        db.cover_drive = Some('e');
+        let expected = db.load_one("seed").unwrap().unwrap().cover;
+        assert_eq!(expected, CoverIdentity::Page("e:/books/clip.mp4".into()));
+        assert!(
+            db.matches_video_seed("seed", 1, 2, pixels, &expected)
+                .unwrap()
+        );
+        db.cover_drive = None;
+        let expected = db.load_one("seed").unwrap().unwrap().cover;
+        assert_eq!(expected, CoverIdentity::Unknown);
+        assert!(
+            db.matches_video_seed("seed", 1, 2, pixels, &expected)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn video_seed_match_accepts_legacy_cover_schema_and_rejects_null_pixels() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE thumbnails (filename TEXT PRIMARY KEY, mtime INTEGER, file_size INTEGER, thumb_data BLOB, source_width INTEGER, source_height INTEGER);
+            INSERT INTO thumbnails VALUES ('legacy',1,2,X'0102',8,12);
+            INSERT INTO thumbnails VALUES ('dims-only',1,2,NULL,8,12);").unwrap();
+        let db = CatalogDb::from_connection(
+            conn,
+            std::sync::Arc::new(CatalogAccess::new()),
+            CatalogAdmission::Admitted(0),
+            THUMBNAIL_SCHEMA_GENERATION.load(Ordering::Acquire),
+            ThumbnailColumns::default(),
+            Some('c'),
+        );
+        let expected = db.load_one("legacy").unwrap().unwrap().cover;
+        assert_eq!(expected, CoverIdentity::Legacy);
+        assert!(
+            db.matches_video_seed("legacy", 1, 2, &[1, 2], &expected)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("legacy", 1, 2, &[1, 2], &CoverIdentity::Unknown)
+                .unwrap()
+        );
+        assert!(
+            !db.matches_video_seed("dims-only", 1, 2, &[], &CoverIdentity::Legacy)
+                .unwrap()
+        );
+        assert!(!db.contains_filename("dims-only").unwrap());
+        assert!(
+            !db.matches_video_seed("missing", 1, 2, &[], &CoverIdentity::Legacy)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn filename_inventory_uses_literal_unicode_prefix_without_reading_payloads() {
+        let db = open_in_memory();
+        let prefix = "folderthumb:日本%_本#pin:";
+        let first = format!("{prefix}first");
+        let second = format!("{prefix}second");
+        let wildcard_neighbor = "folderthumb:日本XX本#pin:other";
+        let case_neighbor = "folderthumb:日本%_本#PIN:other";
+        // Invalid payload columns must not affect these filename-only reads.
+        for key in [
+            first.as_str(),
+            second.as_str(),
+            wildcard_neighbor,
+            case_neighbor,
+        ] {
+            db.conn.lock().unwrap().execute(
+                "INSERT INTO thumbnails (filename, mtime, file_size, width, height, thumb_data) VALUES (?1, 1, 2, 3, 4, 'invalid pixels')",
+                params![key],
+            ).unwrap();
+        }
+        assert!(db.contains_filename(&first).unwrap());
+        assert!(!db.contains_filename(prefix).unwrap());
+        let mut keys = db.list_filenames_with_prefix(prefix).unwrap();
+        keys.sort();
+        assert_eq!(keys, vec![first, second]);
+        assert!(db.list_filenames_with_prefix("absent").unwrap().is_empty());
+        assert_eq!(db.list_filenames_with_prefix("").unwrap().len(), 4);
+        db.save_page_dims("dims-only", 1, 2, Some((3, 4)), None)
+            .unwrap();
+        assert!(!db.contains_filename("dims-only").unwrap());
+        assert!(db.list_filenames_with_prefix("dims-").unwrap().is_empty());
     }
 
     #[test]
@@ -7544,5 +7809,114 @@ mod tests {
             Some((10, false)),
             "safe 経路の確信 (password_required=false) で上書きされる"
         );
+    }
+}
+
+#[cfg(test)]
+mod s1_writeback_order_tests {
+    use super::*;
+    use crate::thumb_loader::*;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, RwLock, mpsc};
+
+    #[test]
+    fn virtual_parent_publication_precedes_finalized_at_the_worker_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("book.zip");
+        std::fs::write(&path, b"already developed RAW page").unwrap();
+        let cache = temp.path().join("catalogs");
+        let page = Arc::new(CatalogDb::open(&cache, &path).unwrap());
+        let parent = Arc::new(CatalogDb::open(&cache, temp.path()).unwrap());
+        let meta = std::fs::metadata(&path).unwrap();
+        let stamp = (crate::ui_helpers::mtime_secs(&meta), meta.len() as i64);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        parent
+            .phase()
+            .unwrap()
+            .authorizer(Some(move |auth: AuthContext<'_>| {
+                if matches!(
+                    auth.action,
+                    AuthAction::Insert {
+                        table_name: "thumbnails"
+                    }
+                ) {
+                    entered_tx.send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                Authorization::Allow
+            }));
+        let mut req = LoadRequest {
+            path: path.clone(),
+            zip_entry: Some("first.cr2".into()),
+            mtime: stamp.0,
+            file_size: stamp.1,
+            raw_source: LoadRequestSource::RawHalfDeveloped {
+                image: image::DynamicImage::new_rgb8(8, 12),
+                developed_dims: [16, 24],
+                decode_ms: 40.0,
+                folder_selection_proof: None,
+            },
+            virtual_folder_parent: Some(Box::new(crate::thumb_loader::VirtualFolderParent {
+                source_path: path,
+                parent_catalog: parent.clone(),
+                parent_key: "zipthumb:book.zip".into(),
+                target_key: "first.cr2".into(),
+                target_idx: 0,
+                items_gen: 0,
+                parent_entry_mtime: stamp.0,
+                parent_entry_size: stamp.1,
+            })),
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let done = Arc::new(AtomicUsize::new(0));
+            process_load_request(
+                &mut req,
+                &RwLock::new(std::collections::HashMap::new()),
+                &tx,
+                Some(&page),
+                64,
+                75,
+                64,
+                CacheDecision {
+                    policy: crate::settings::CachePolicy::Always,
+                    threshold_ms: 0,
+                    size_threshold: 0,
+                    webp_always: true,
+                    zip_always: true,
+                    pdf_always: true,
+                    cache_book_cover_only: false,
+                },
+                &done,
+                &Arc::new(Mutex::new(crate::stats::ThumbStats::default())),
+                None,
+                &Arc::new(AtomicUsize::new(0)),
+                &Arc::new(AtomicUsize::new(1)),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            assert_eq!(done.load(Ordering::Relaxed), 1);
+        });
+        // The authorizer holds the actual parent INSERT, without timing sleeps.
+        // Even when pixels are already delivered, Finalized must still be withheld.
+        let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let before_save: Vec<_> = rx.try_iter().collect();
+        let _ = release_tx.send(());
+        worker.join().unwrap();
+        assert!(
+            entered.is_ok(),
+            "worker must reach parent publication: {entered:?}"
+        );
+        assert!(before_save.iter().any(|msg| msg.pixels().is_some()));
+        assert!(before_save.iter().all(|msg| !msg.is_finalized()));
+        assert!(rx.try_iter().any(|msg| msg.is_finalized()));
+        assert!(parent.load_one("zipthumb:book.zip").unwrap().is_some());
     }
 }

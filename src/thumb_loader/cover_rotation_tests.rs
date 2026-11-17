@@ -533,7 +533,19 @@ fn cover_identity_drive_seed_same_bytes_with_changed_identity_sends_terminal_pix
         if !same_identity {
             seed.cover = CoverIdentity::Legacy;
         }
-        let memory = Memory::from(HashMap::from([("drive-preview:old".into(), seed)]));
+        // Prefix preview lookup now reads the catalog, not a complete memory snapshot.
+        catalog
+            .save_thumb_bytes(
+                "drive-preview:old",
+                seed.mtime,
+                seed.file_size,
+                seed.source_dims,
+                &seed.jpeg_data,
+                &seed.cover,
+                seed.auto_material,
+            )
+            .unwrap();
+        let memory = Memory::default();
         let mut req = request(&root, "drive-result");
         req.source_policy = LoadSourcePolicy::CacheOnly;
         req.folder_thumb_sort = Some(crate::settings::SortOrder::Numeric);

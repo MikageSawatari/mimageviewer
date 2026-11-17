@@ -159,14 +159,25 @@ impl Request {
             }
             retained.extend(keys.into_iter().skip(1));
         }
-        let mut deletes: HashSet<_> = map
-            .keys()
-            .filter(|key| {
-                prefixes.iter().any(|prefix| key.starts_with(prefix))
-                    && !crate::thumbnail_cache_key::inventory_retains_key(&retained, key)
-            })
-            .cloned()
-            .collect();
+        // The private map is a sparse record of this context's writes, not an
+        // inventory of persisted rows. Inspect DB names without loading pixels.
+        let mut deletes = HashSet::new();
+        for prefix in prefixes {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            match catalog.list_filenames_with_prefix(&prefix) {
+                Ok(keys) => deletes.extend(keys.into_iter().filter(|key| {
+                    !crate::thumbnail_cache_key::inventory_retains_key(&retained, key)
+                })),
+                Err(error) => {
+                    crate::logger::log(format!(
+                        "metadata pin materialization inventory failed: {error} ({prefix})"
+                    ));
+                    catalog.record_cache_error(format!("pin materialization inventory: {error}"));
+                }
+            }
+        }
         let mut seeds = Vec::new();
         for row in rows {
             let Some(video_db) = video_db else {
@@ -209,19 +220,39 @@ impl Request {
             let Some(webp) =
                 webp.filter(|bytes| crate::catalog::decode_thumb_dims(bytes).is_some())
             else {
-                if map.contains_key(&key) {
+                if catalog.contains_filename(&key).unwrap_or_else(|error| {
+                    crate::logger::log(format!(
+                        "metadata video seed existence failed: {error} ({key})"
+                    ));
+                    catalog.record_cache_error(format!("video seed existence: {error}"));
+                    false
+                }) {
                     deletes.insert(key);
                 }
                 continue;
             };
             let cover =
                 CoverIdentity::Page(crate::adjustment_db::normalize_path(&resolved.abs_path));
-            if map.get(&key).is_some_and(|entry| {
-                entry.mtime == resolved.mtime
-                    && entry.file_size == resolved.file_size
-                    && entry.jpeg_data == webp
-                    && entry.cover == cover
-            }) {
+            let already_seeded = map
+                .get(&key)
+                .map(|entry| {
+                    entry.mtime == resolved.mtime
+                        && entry.file_size == resolved.file_size
+                        && entry.jpeg_data == webp
+                        && entry.cover == cover
+                })
+                .unwrap_or_else(|| {
+                    catalog
+                        .matches_video_seed(&key, resolved.mtime, resolved.file_size, &webp, &cover)
+                        .unwrap_or_else(|error| {
+                            crate::logger::log(format!(
+                                "metadata video seed lookup failed: {error} ({key})"
+                            ));
+                            catalog.record_cache_error(format!("video seed lookup: {error}"));
+                            false
+                        })
+                });
+            if already_seeded {
                 continue;
             }
             seeds.push((
@@ -254,7 +285,13 @@ impl Request {
                 // reload an old frame under the unchanged key. This is cleanup, not a seed
                 // retry; each purge checks cancellation inside the catalog writer boundary.
                 for (key, _) in seeds {
-                    if !map.contains_key(&key) {
+                    if !catalog.contains_filename(&key).unwrap_or_else(|error| {
+                        crate::logger::log(format!(
+                            "metadata video seed existence failed: {error} ({key})"
+                        ));
+                        catalog.record_cache_error(format!("video seed existence: {error}"));
+                        false
+                    }) {
                         continue;
                     }
                     match catalog.commit_pin_materializations(
@@ -290,7 +327,152 @@ mod tests {
     use crate::folder_thumb_pins::{FolderPin, FolderPinSource};
 
     #[test]
+    fn sparse_video_pin_seed_matches_purges_and_cleans_up_failed_replacement() {
+        for scenario in ["matching", "changed", "missing", "corrupt", "failed"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let folder = tmp.path().join("book");
+            std::fs::create_dir(&folder).unwrap();
+            let video = folder.join("movie.mp4");
+            std::fs::write(&video, b"video fixture").unwrap();
+            let pin = FolderPin::from(FolderPinSource::File {
+                rel: "movie.mp4".into(),
+                kind: crate::folder_thumb_pins::FileKind::Video,
+            });
+            let resolved = crate::folder_thumb_pins::resolve_pin_target(&folder, &pin).unwrap();
+            let base = crate::thumb_loader::folder_thumb_cache_key_for_path(
+                &folder,
+                false,
+                crate::settings::SortOrder::Numeric,
+                3,
+                FolderThumbProvenance::Seeded,
+            )
+            .unwrap();
+            let key =
+                resolved.pinned_cache_key(&base, crate::folder_thumb_pins::PinKeyMode::Exact, None);
+            let pixels = |red| {
+                let mut bytes = Vec::new();
+                image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                    2,
+                    3,
+                    image::Rgba([red, 0, 0, 255]),
+                ))
+                .write_to(
+                    &mut std::io::Cursor::new(&mut bytes),
+                    image::ImageFormat::WebP,
+                )
+                .unwrap();
+                bytes
+            };
+            let old_bytes = pixels(0);
+            let new_bytes = if scenario == "matching" {
+                old_bytes.clone()
+            } else {
+                pixels(255)
+            };
+            let video_db =
+                crate::video_pins::VideoPinDb::open_at(&tmp.path().join("video_pins.db")).unwrap();
+            if scenario != "missing" {
+                video_db
+                    .set_pin(
+                        &video,
+                        1.0,
+                        if scenario == "corrupt" {
+                            b"broken"
+                        } else {
+                            &new_bytes
+                        },
+                    )
+                    .unwrap();
+            }
+            let cache_dir = tmp.path().join("catalogs");
+            let catalog = Arc::new(CatalogDb::open(&cache_dir, tmp.path()).unwrap());
+            let cover = CoverIdentity::Page(crate::adjustment_db::normalize_path(&video));
+            catalog
+                .save(
+                    &key,
+                    resolved.mtime,
+                    resolved.file_size,
+                    2,
+                    3,
+                    None,
+                    &old_bytes,
+                    &cover,
+                    crate::cover_auto_material::AutoMaterial::NotAutomatic,
+                )
+                .unwrap();
+            if matches!(scenario, "matching" | "failed") {
+                rusqlite::Connection::open(crate::catalog::db_path_for(&cache_dir, tmp.path()))
+                    .unwrap()
+                    .execute_batch("CREATE TRIGGER reject_seed BEFORE INSERT ON thumbnails BEGIN SELECT RAISE(ABORT, 'rejected seed'); END;")
+                    .unwrap();
+            }
+            let live = Arc::new(RwLock::new(HashMap::new()));
+            let request = Request {
+                rows: vec![Row {
+                    index: 0,
+                    item: GridItem::Folder(folder.clone()),
+                    metadata: None,
+                    container: folder.clone(),
+                    dependency_root: folder.clone(),
+                }],
+                identity: Identity {
+                    cache: Some(Arc::as_ptr(&live) as usize),
+                    catalog: Some(Arc::as_ptr(&catalog) as usize),
+                    sort: crate::settings::SortOrder::Numeric,
+                    depth: 3,
+                    full_path: false,
+                },
+                cache: Some((live.clone(), catalog.clone())),
+                scope: CurrentViewRefresh::Full,
+            };
+            let pins = HashMap::from([(crate::path_key::normalize_keep_drive(&folder), pin)]);
+            let prepared = request
+                .prepare(
+                    vec![0],
+                    &pins,
+                    None,
+                    Some(&video_db),
+                    &AtomicBool::new(false),
+                )
+                .unwrap();
+            let replacement = prepared.replacement.unwrap();
+            let replacement = replacement.read().unwrap();
+            match scenario {
+                "matching" => {
+                    // The DB hit must avoid a write and stay out of the sparse map.
+                    assert_eq!(
+                        catalog.load_one(&key).unwrap().unwrap().jpeg_data,
+                        old_bytes
+                    );
+                    assert!(replacement.is_empty());
+                }
+                "changed" => {
+                    assert_eq!(
+                        catalog.load_one(&key).unwrap().unwrap().jpeg_data,
+                        new_bytes
+                    );
+                    assert_eq!(replacement[&key].jpeg_data, new_bytes);
+                }
+                _ => {
+                    assert!(!catalog.contains_filename(&key).unwrap(), "{scenario}");
+                    assert!(replacement.is_empty(), "{scenario}");
+                }
+            }
+            assert!(live.read().unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn epub_pin_retention_prepares_private_map_and_preserves_sibling_and_cancelled_owner() {
+        check_epub_pin_retention(false);
+    }
+
+    #[test]
+    fn sparse_epub_pin_retention_deletes_db_only_variants_and_preserves_siblings() {
+        check_epub_pin_retention(true);
+    }
+
+    fn check_epub_pin_retention(sparse: bool) {
         let tmp = tempfile::tempdir().unwrap();
         let epub = tmp.path().join("book.epub");
         let sibling = tmp.path().join("sibling.epub");
@@ -338,7 +520,11 @@ mod tests {
                 )
                 .unwrap();
         }
-        let live = Arc::new(RwLock::new(catalog.load_all().unwrap()));
+        let mut map = catalog.load_all().unwrap();
+        if sparse {
+            map.retain(|key, _| key == sibling_key);
+        }
+        let live = Arc::new(RwLock::new(map));
         // Another context can still hold the old map; preparation must not mutate it.
         let sibling_context = live.clone();
         let identity = Identity {
@@ -378,7 +564,7 @@ mod tests {
                 .is_none()
         );
         assert!(catalog.load_one(&removed).unwrap().is_some());
-        assert_eq!(live.read().unwrap().len(), 4);
+        assert_eq!(live.read().unwrap().len(), if sparse { 1 } else { 4 });
 
         let prepared = make_request()
             .prepare(vec![0, 1], &pins, None, None, &AtomicBool::new(false))
@@ -393,16 +579,16 @@ mod tests {
         let replacement = prepared.replacement.unwrap();
         assert!(!Arc::ptr_eq(&live, &replacement));
         let replacement = replacement.read().unwrap();
-        assert_eq!(replacement.len(), 3);
+        assert_eq!(replacement.len(), if sparse { 1 } else { 3 });
         for key in [first.as_str(), second.as_str(), sibling_key] {
-            assert!(replacement.contains_key(key));
+            assert_eq!(replacement.contains_key(key), !sparse || key == sibling_key);
             assert!(catalog.load_one(key).unwrap().is_some());
         }
         assert!(!replacement.contains_key(&removed));
         assert!(catalog.load_one(&removed).unwrap().is_none());
         let sibling_context = sibling_context.read().unwrap();
-        assert_eq!(sibling_context.len(), 4);
-        assert!(sibling_context.contains_key(&removed));
+        assert_eq!(sibling_context.len(), if sparse { 1 } else { 4 });
+        assert_eq!(sibling_context.contains_key(&removed), !sparse);
         assert!(sibling_context.contains_key(sibling_key));
     }
 }

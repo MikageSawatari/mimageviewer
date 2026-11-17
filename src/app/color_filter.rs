@@ -1001,7 +1001,7 @@ fn load_palette_for_request(
         req.force_cache = false;
     }
     // Pin resolution has already supplied the canonical #pin: key. This lookup stays on
-    // the color worker and leaves ordinary images' released cache_map -> decode path intact.
+    // the color worker; ordinary images use the shared cache_map -> catalog -> source path.
     let catalog_cache = color_representative_catalog_cache(&req, cache_map, catalog);
     crate::thumb_loader::process_load_request(
         &mut req,
@@ -1616,7 +1616,7 @@ mod tests {
     }
 
     #[test]
-    fn color_catalog_fallback_does_not_change_normal_image_pixels() {
+    fn color_fixed_catalog_hit_with_sparse_memory_and_source_only_preserves_source_pixels() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("image.png");
         image::RgbaImage::from_pixel(8, 8, image::Rgba([255u8, 0, 0, 255]))
@@ -1641,7 +1641,24 @@ mod tests {
             green.auto_material,
         )
         .unwrap();
-        let palette = scan_one(req, None, Default::default(), Some(db));
+        let palette = scan_one(req.clone(), None, Default::default(), Some(db.clone()));
+        assert!(crate::color_search::palette_matches(
+            &palette,
+            crate::color_search::srgb_to_lab([0, 255, 0]),
+            6.0
+        ));
+        assert!(!crate::color_search::palette_matches(
+            &palette,
+            crate::color_search::srgb_to_lab([255, 0, 0]),
+            6.0
+        ));
+        assert_eq!(
+            db.load_one("image.png").unwrap().unwrap().jpeg_data,
+            green.jpeg_data
+        );
+        let mut source = req;
+        source.source_policy = crate::thumb_loader::LoadSourcePolicy::SourceOnly;
+        let palette = scan_one(source, None, Default::default(), Some(db));
         assert!(crate::color_search::palette_matches(
             &palette,
             crate::color_search::srgb_to_lab([255, 0, 0]),
