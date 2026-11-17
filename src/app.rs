@@ -97762,6 +97762,15 @@ impl App {
         if !self.raw_fullscreen_fallback_allowed(idx) {
             return None;
         }
+        self.cached_passthrough_material_for_allowed_source(idx)
+    }
+
+    /// Cache identity/coverage only. Callers must establish their RAW source
+    /// policy before lookup; this part never reads the development mutex.
+    pub(crate) fn cached_passthrough_material_for_allowed_source(
+        &self,
+        idx: usize,
+    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         let pixels = self.thumb_pixels.get(&idx)?;
         let key = self.final_composite_key_for_pixels(
             self.current_edit_result_key(idx),

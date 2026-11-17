@@ -21,6 +21,12 @@ mouse / touch の zoom・pan と navigator は Depth 中だけ止め、通常2D�
 保存flagではなく `fs_zoom_owner()` に基づく実効helperを使い、通常のtouchページ送りを止めない。
 占有 owner、readiness、全入口の分類と検証状況の正本は [3D 設計](depth-parallax-plan.md)。
 
+3Dスライドショーは同じcontextの `DepthViewState` に次ページ枠を1つ持ち、resident final素材の
+TextureIdを鍵にbounded readback / 推論を進める。完了先は既存深度LRUだけで、着地の通常selectorが
+同じ素材を選べば最初の描画からcallbackを出す。紙めくりOFFでもD3のNextだけが素材を準備する。
+描画で記録した `DepthSettled` を素材世代と照合し、開始・間隔の根拠にする。
+待つ仕事と終端、対象外、最小化中の休止は [§1.771](depth-slideshow-plan.md) を参照。
+
 §1.668/§1.741: generic poolは固定catalogと遅延catalogを持ち、受付時の `RequestCatalog` と
 `CatalogWork` が保存先/admissionを決める。Collection rootはdrive/UNC保持の元親namespaceとfull-path行を維持し、
 通常catalogの旧行をseedせず、旧catalog由来の再帰CachedPinnedも新namespaceへmirrorしない。

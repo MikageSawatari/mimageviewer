@@ -34,19 +34,79 @@ pub(crate) enum DepthSlideshowGate {
     Wait,
 }
 
+#[cfg(test)]
+mod premise_tests {
+    use super::*;
+
+    /// Investigation evidence, not approval of this behavior: §5.7 assumes
+    /// NotYet makes old settled evidence ineligible, while Failed is sticky.
+    #[test]
+    fn depth_slideshow_failed_fact_survives_not_yet_after_parameter_change() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image("failed-depth-source.jpg".into())];
+        app.fullscreen_idx = Some(0);
+        let edit_key = app.current_edit_result_key(0);
+        let key = crate::depth_estimation::DepthSourceKey {
+            texture_id: egui::TextureId::Managed(771_501),
+        };
+        let mut state = DepthViewState::new(app.edit_request_owner_context());
+        state.source = DepthSourcePhase::Failed {
+            key,
+            reason: "completed failure".into(),
+        };
+        state.settled = Some(DepthSettled {
+            fs_idx: 0,
+            edit_key,
+            key,
+            outcome: DepthSettledOutcome::Failed,
+        });
+        app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "failed_fact_premise");
+        assert!(app.depth_current_settled());
+        let mut params = crate::adjustment::AdjustParams::default();
+        params.brightness = 15.0;
+        app.adjustment_page_params.insert(0, params);
+        assert_eq!(
+            app.current_edit_result_key(0),
+            edit_key,
+            "effect parameters are outside EditResultKey"
+        );
+        // This is exactly the existing NotYet branch in advance_depth_source.
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        state.wait_for_source(DepthSourceWait::IncompleteComposite);
+        assert!(matches!(state.source, DepthSourcePhase::Failed { key: old, .. } if old == key));
+        assert!(
+            app.depth_current_settled(),
+            "the previous failed fact still passes §5.7's three checks"
+        );
+        assert_eq!(
+            app.depth_page_progress(&ctx, 0, DepthPageRole::Current),
+            DepthPageProgress::Ready,
+            "stage 1 bypasses the current material's producers"
+        );
+    }
+}
+
 #[cfg(all(test, windows))]
 mod gpu_tests {
     use super::*;
 
     fn deliver_textures(ctx: &egui::Context, render: &egui_wgpu::RenderState) {
-        for (id, deltas) in ctx.tex_manager().write().take_delta().set {
+        let mut textures = ctx.tex_manager().write().take_delta();
+        for (id, deltas) in &textures.set {
             for delta in deltas {
                 render
                     .renderer
                     .write()
-                    .update_texture(&render.device, &render.queue, id, &delta);
+                    .update_texture(&render.device, &render.queue, *id, delta);
             }
         }
+        for id in &textures.free {
+            render.renderer.write().free_texture(id);
+        }
+        textures.clear();
     }
 
     #[test]
@@ -314,7 +374,7 @@ mod gpu_tests {
                     DepthPageProgress::Producing,
                     "managed final waits only for this frame's backend registration"
                 );
-            } else if let FsCacheEntry::Static { tex, .. } = &app.fs_cache[&2] {
+            } else if let Some(FsCacheEntry::Static { tex, .. }) = app.fs_cache.get(&2) {
                 assert_eq!(
                     key.texture_id,
                     tex.id(),
@@ -426,16 +486,7 @@ mod gpu_tests {
             draw_current_without_sources(&mut app, ui, ctx);
             // The headless frame helper discards deltas at the end of UI.
             // Deliver the selected source's real backing before that boundary.
-            for (id, deltas) in ctx.tex_manager().write().take_delta().set {
-                for delta in deltas {
-                    render.renderer.write().update_texture(
-                        &render.device,
-                        &render.queue,
-                        id,
-                        &delta,
-                    );
-                }
-            }
+            deliver_textures(ctx, &render);
         });
         assert!(app.page_turn_current_unit_presented());
         assert_eq!(app.depth_entry_allowed(0), Ok(()));
@@ -453,14 +504,7 @@ mod gpu_tests {
         let key = DepthSourceKey {
             texture_id: material.source_texture().id(),
         };
-        for (id, deltas) in ctx.tex_manager().write().take_delta().set {
-            for delta in deltas {
-                render
-                    .renderer
-                    .write()
-                    .update_texture(&render.device, &render.queue, id, &delta);
-            }
-        }
+        deliver_textures(&ctx, &render);
         let backing = render
             .renderer
             .read()

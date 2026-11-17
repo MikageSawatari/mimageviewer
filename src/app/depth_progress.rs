@@ -84,7 +84,9 @@ impl App {
         // Stage 5: do not use fs_page_load_state's RAW PreviewAbsent projection.
         // Pending owns a live scheduler ticket; backlog owns an accepted reply
         // after its ticket was disarmed and removed. Both are generation scoped.
-        if (self.fs_pending.current_items_generation() == self.items_generation
+        if (self
+            .fs_pending
+            .accepts_generation(idx, self.items_generation)
             && self
                 .fs_pending
                 .get(&idx)
@@ -412,11 +414,12 @@ mod tests {
         let mut app = fixture(&ctx);
         app.items[1] = GridItem::Image("progress-next.dng".into());
         app.fs_cache.remove(&1);
+        let item_key = app.page_path_key(1).unwrap();
         app.raw_pages.pages.insert(
             1,
             RawPageRecord::Page(RawPageState {
                 source: RawSourceIdentity {
-                    item_key: app.page_path_key(1).unwrap(),
+                    item_key,
                     path: "progress-next.dng".into(),
                     size: 1,
                     mtime_ticks: 1,
@@ -474,6 +477,7 @@ mod tests {
         let edit_key = app.current_edit_result_key(1);
         let key = app.final_composite_key_for_pixels(edit_key, [4, 4], app.effective_params(1));
         let (tx, rx) = mpsc::channel();
+        let items_generation = app.items_generation;
         app.final_effect_pending.insert(
             key,
             FinalEffectPending {
@@ -483,7 +487,7 @@ mod tests {
                 source_size: [4, 4],
                 cancel: Arc::new(AtomicBool::new(false)),
                 state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
-                items_generation: app.items_generation,
+                items_generation,
                 output_complete: true,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyDisplay,
@@ -544,12 +548,14 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         app.comic_pages.insert(1);
+        let comic_gen = app.comic_generation;
+        let items_gen = app.items_generation;
         app.comic_bake_pending.insert(
             1,
             ComicBakePending {
                 display_basis: basis,
-                comic_gen: app.comic_generation,
-                items_gen: app.items_generation,
+                comic_gen,
+                items_gen,
                 base: pixels.clone(),
                 dims: [4, 4],
                 preview_scale: 1,
@@ -730,6 +736,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let (_, progress_rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
+        let items_generation = app.items_generation;
+        let path_key = app.page_path_key(1);
         app.erase_inpaint_pending.insert(
             key,
             EraseInpaintPending {
@@ -738,8 +746,8 @@ mod tests {
                     crate::source_coverage::SourceCoverage::FullSource,
                 ),
                 idx: 1,
-                items_generation: app.items_generation,
-                path_key: app.page_path_key(1),
+                items_generation,
+                path_key,
                 rx,
                 progress_rx,
                 progress: EraseInpaintProgress::Preparing,

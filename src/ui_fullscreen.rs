@@ -12285,9 +12285,23 @@ impl App {
     }
 
     pub(crate) fn colorize_display_requires_final_effect(&self, idx: usize) -> bool {
+        if self.post_filter_bypassed || self.fs_entry_is_animated(idx) {
+            return false;
+        }
+        self.colorize_display_requires_final_effect_with_raw_blocked(
+            idx,
+            self.raw_development_blocked(idx),
+        )
+    }
+
+    pub(crate) fn colorize_display_requires_final_effect_with_raw_blocked(
+        &self,
+        idx: usize,
+        raw_blocked: bool,
+    ) -> bool {
         if self.post_filter_bypassed
             || self.fs_entry_is_animated(idx)
-            || self.raw_development_blocked(idx)
+            || raw_blocked
             || !matches!(
                 self.items.get(idx),
                 Some(GridItem::Image(_))

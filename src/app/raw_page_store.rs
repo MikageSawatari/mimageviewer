@@ -2372,7 +2372,10 @@ impl App {
     /// for development only after its existing owner has issued real work.
     pub(super) fn depth_raw_development_pending(&self, idx: usize) -> bool {
         if !self.is_raw_page(idx)
-            || self.raw_pages.pages.current_items_generation() != self.items_generation
+            || !self
+                .raw_pages
+                .pages
+                .accepts_generation(idx, self.items_generation)
         {
             return false;
         }

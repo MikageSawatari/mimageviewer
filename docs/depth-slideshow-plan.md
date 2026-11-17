@@ -296,12 +296,24 @@ fn depth_page_progress(&self, ctx, idx, role: DepthPageRole /* Current | Next */
      `raw_page_store.rs:2479`) や編集の世代の変化を検出できる (第 2 回レビュー P1)
   3. `DepthViewState.source` が `Ready { key }` または `Failed { key }` で、その `key` が事実の `key` と同じ —
      補正の変更などで素材のテクスチャが変わり、今のページが新しい要求を出した時点で偽になる
-  古い事実を消す処理は足さない (照合で外れるだけ)。一時的な素材待ちでも事実は消さないが、3 で外れる。
+  4. **直前の描画パスで今のページに選んだ素材の key** (`DepthViewState.current_material: Option<DepthSourceKey>`。
+     `advance_depth_source` が毎回の見えている描画パスで書く唯一の場所。素材が `Ready` ならその key、`NotYet` なら `None`) が
+     事実の `key` と同じ (実装中の前提調査、§12「Failed 事実と NotYet」)。既存の `wait_for_source` は失敗した key の再試行を避けるため
+     `Failed` を残すので、3 だけでは、補正・AI の設定の変更で新しい素材を作っている間 (`NotYet`) も旧 `Failed` の事実が通ってしまう。
+     4 で、新しい素材を待つ間は事実が外れ、§5.4.1 の段 6 / 6b / 9 (新しい素材の仕事) へ進む。素材が旧 key に戻れば `Failed` は有効に戻り、
+     再試行しない既存の規則と一致する。
+  古い事実を消す処理は足さない (照合で外れるだけ)。
   素材の変化が描画のパスで初めて分かる場合 (補正の変更など、2 が変わらない変化) は、D3 の開始が 1 フレームだけ古い事実で
-  許され得る。D3 は次ユニットを作るだけで今のページの素材の生産を止めないので、これは受け入れる。先読みの `submit` は 4 で防ぐ。
-  4. 先読みの `submit` (§5.3 の 4) と枠の保持 (§5.3 の 1 (a)) は、`advance_depth_source` の中で今のページの選択と進行を済ませた
+  許され得る。D3 は次ユニットを作るだけで今のページの素材の生産を止めないので、これは受け入れる。先読みの `submit` は 5 で防ぐ。
+  5. 先読みの `submit` (§5.3 の 4) と枠の保持 (§5.3 の 1 (a)) は、`advance_depth_source` の中で今のページの選択と進行を済ませた
      **後**に、同じパスで照合する。今のページが新しい要求を出したパスでは 3 が偽になるので、先読みは出ず、枠も捨てられる。
+- **今のページの素材の key は `current_material` だけから読む**: §5.4.1 の分類の `role = Current` (段 1・2・4 の key) も
+  `current_material` を使い、表示前の素材を返す `resident_final_prepare_material` は使わない (送り先 `role = Next` だけに使う)。
+  RAW の安定した preview のように、通常の selector が深度の入力にするが resident の helper が返さない素材でも、今のページの
+  読み戻し・推論中を `Producing` と分類できる (実装中の独立レビュー P2)。`current_material` が `None` (NotYet) のときは段 2 に
+  当たらず、段 5〜9 で新しい素材の仕事を見る。
 - この照合を読むのは 2 か所: (1) 3D 中の間隔の開始 (§5.7.1)、(2) §5.3 の 2 の先読みの開始と §5.6 の 2 の D3 の開始。
+- `current_material` は描画パスで書くので、D3 の開始など描画より前に読む側は直前のパスの値を見る (2 の世代の照合と組み合わせる)。
 
 #### 5.7.1 間隔の数え方 (3D 中)
 
@@ -691,3 +703,59 @@ MSBuild exit 1、build script exit 101で停止。今回のRust変更の型検�
 runner終了報告は02:07:28、exit 101 (外側のコマンドツールはexit 1)。焦点nextestは未実行。
 停止時の整形として、同じrunnerと `MSBUILDDISABLENODEREUSE=1` で最後に `cargo fmt` (引数なし) を実行しexit 0。
 `python scripts/check_ui_glyphs.py` は危険グリフ0件・exit 0、`git diff --check` もexit 0。
+
+### WIP `a2c04d79c` 後の再開と新たな設計確認 (2026-11-18)
+
+設計担当が依存ビルドを外側で完了した後、`target/771-logs/check1.log` / `notest1.log` の本体エラーを修正した。
+`ItemsGenerationMap::current_items_generation` はtest限定APIだったため既存の `accepts_generation` を使用し、
+AppTestEnv経由の同時borrowを事前の値取得へ変更した。texture deltaはDropを持つownerからmoveせず参照で登録してclearし、
+fs_cacheの添字を既存getへ直した。
+
+指定runner / `MSBUILDDISABLENODEREUSE=1` で `cargo check -p mimageviewer --bin mimageviewer-core` を実行し、
+02:20:35にexit 0 (1分29秒)を確認。依存MSBuildの再失敗は発生していない。
+HUD / timer試験は実Depthを退役させないGPU fixtureへ修正し、未取消の実pendingを期限後も待つ試験と、
+失敗 / 取消 / 未発行の終端で送る試験を追加した。これらの実行確認はまだ完了していない。
+
+§9の文書はdepth-parallaxの範囲 / 後始末 / 入力分類、display / async / page-turn設計、manual/fullscreen.html、
+製品ページを更新中。RAWCurrent用の非blocking照合に備え、既存のpassthrough cache照合とcolorize判定の純粋部分を
+共有helperへ切り出したが、RAWCurrentの分類への接続と試験は未着手。
+
+#### 設計担当へ返す食い違い: Failed事実とNotYet (§5.7) → 設計担当が §5.7 の照合 4 と `current_material` を追加して解決
+
+独立Sol / xhighレビューで次の経路を確認した。§5.7は「一時的な素材待ちでも事実は消さないが、sourceとの照合3で外れる」
+としているが、既存の `DepthViewState::wait_for_source` は失敗済みkeyの再試行を避けるため **Failedだけは保持する**。
+補正 / AI / post_filterパラメータは `EditResultKey` に含まれないため、次の順序では3条件すべてが成立したままになる。
+
+1. 現ページの深度がFailedで確定し、同じkeyのFailed事実が記録される。
+2. 補正 / AI等のパラメータが変わり、新素材を作るworkerが始まる。EditResultKeyは同じ。
+3. 通常selectorが `NotYet(IncompleteComposite)` 等を返し、`advance_depth_source` は既存 `wait_for_source` を呼ぶ。
+4. sourceの旧Failedは保持され、`depth_current_settled` が真のまま。分類段1がReadyを返すため、
+   新素材の実producerを待つ段6 / 6b / 9へ届かず、起算や先読みの継続を認め得る。
+
+「既存の失敗keyを再試行しない」「古い事実を消さない」「新状態を増やさない」と合わせ、現在素材の証明をどこで持つかの
+設計判断が必要なため、利用者の指示に従い機能実装の追加を停止した。代案や制限追加は選んでいない。
+`depth_view::premise_tests::depth_slideshow_failed_fact_survives_not_yet_after_parameter_change` を調査用に追加し、
+既存のwait操作とparams変更で旧事実 / Current=Readyが残ることを検査する。現挙動の記録であり仕様の承認ではない。
+
+独立レビューはREVISE。上の設計確認のほか、通常selectorが深度入力にする安定RAW previewをresident helperが返さず
+実ReadingBack / EstimatingをUnavailableとする分類漏れをP2として確認した。Nextの先読み範囲を広げず、Currentだけの
+現在素材の証明を既存selectorと共有する修正は未接続。残り登録量の純粋な予算判定に確定不具合は見つからなかったが、
+実CpuReady / Registeringに小予算を与えた分類 / adoption一致試験が不足している。
+perfの `next_prefetch.elapsed_ms` は現状pollのCPU時間で、readback / 推論の全所要時間ではない点も未修正(P3)。
+
+#### 今回の検証の確定結果
+
+すべて指定runner / `MSBUILDDISABLENODEREUSE=1` を使用した。
+
+| コマンド | 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | exit 0、02:20:35完了、1分29秒 |
+| `cargo nextest run -p mimageviewer --lib --no-run` | exit 0、02:35:23完了、9分39秒。現在のテスト実行体のコンパイルを確認、実行0件 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth_slideshow_failed_fact_survives_not_yet_after_parameter_change/)'` | 別作業 `778 lib-full` の共有全件ロック待ちで実行未開始。設計判断待ちの停止に合わせ、待機中の自分のrunnerだけを中断 (外側exit 1)。テスト失敗ではなく実行0件 |
+| `python scripts/check_ui_glyphs.py` | 危険グリフ0件、exit 0 |
+| `python scripts/check_site_cards.py` | 53カード、超過0件、exit 0 |
+| `git diff --check` | exit 0 |
+
+未実行の設計§8焦点 / 指定既存回帰を成功扱いにしない。今回の調査用テストも実行での再現確認は未完。
+機能実装の追加を停止した。`cargo fmt` も指定runnerで共有全件ロック待ちとなり未開始だったため、
+引継ぎ後に差分が自動変更されないよう自分の待機runnerを中断 (外側exit 1)。今回の整形は未実施で、再開後の最終整形に残す。

@@ -169,61 +169,6 @@ fn depth_slideshow_key_and_ring_allow_start_stop_and_panorama_key_stays_suppress
 }
 
 #[test]
-fn depth_slideshow_hud_exposes_play_but_keeps_overflow_hidden() {
-    #[cfg(windows)]
-    let _input = crate::key_input::lock_test_input();
-    let ctx = egui::Context::default();
-    crate::ui_fonts::configure_fonts(&ctx);
-    page_turn::install(&ctx);
-    install_fs_navigator_input_tracking(&ctx);
-    let mut app = page_turn_submission_tests::ready_app(&ctx, SpreadMode::Single);
-    app.settings.fullscreen_top_bar_locked = true;
-    app.settings.slideshow_interval_secs = 30.0;
-    #[cfg(windows)]
-    {
-        app.native_video_in_window_active = true;
-    }
-    install_depth(&mut app);
-    for playing in [true, false] {
-        render(&mut app, &ctx, vec![]);
-        assert!(
-            ctx.read_response(egui::Id::unique("fs_overflow_btn"))
-                .is_none()
-        );
-        let pos = ctx
-            .read_response(egui::Id::unique("fs_play_btn"))
-            .expect("Depth exposes slideshow playback")
-            .rect
-            .center();
-        render(&mut app, &ctx, vec![egui::Event::PointerMoved(pos)]);
-        render(
-            &mut app,
-            &ctx,
-            vec![
-                egui::Event::PointerMoved(pos),
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                },
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        assert_eq!(app.slideshow_playing, playing);
-    }
-    enter_panorama(&mut app);
-    render(&mut app, &ctx, vec![]);
-    render(&mut app, &ctx, vec![]);
-    assert!(ctx.read_response(egui::Id::unique("fs_play_btn")).is_none());
-}
-
-#[test]
 fn depth_slideshow_target_matches_d3_for_single_and_spread_singleton_with_video_gap() {
     for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
         let ctx = egui::Context::default();
@@ -268,56 +213,6 @@ fn depth_slideshow_target_matches_d3_for_single_and_spread_singleton_with_video_
         app.spread_mode = SpreadMode::SplitLtr;
         assert_eq!(app.slideshow_next_target(0), SlideshowNextTarget::Other);
     }
-}
-
-#[test]
-fn depth_slideshow_timer_ignores_forwarded_input_and_hidden_render_for_all_targets() {
-    for boundary in [false, true] {
-        let ctx = egui::Context::default();
-        let mut app = page_turn_submission_tests::ready_app(&ctx, SpreadMode::Single);
-        if boundary {
-            app.fullscreen_idx = Some(3);
-        }
-        install_depth(&mut app);
-        settle_failed(&mut app);
-        app.fs_transparent_bg_mode = 1; // The documented prefetch/gate exclusion.
-        app.settings.slideshow_end_action = crate::settings::SlideshowEndAction::LoopFolder;
-        arm_expired(&mut app);
-        let before = app.fullscreen_idx;
-        timer(&mut app, &ctx, SlideshowTimerPass::InputOnly);
-        assert_eq!(app.fullscreen_idx, before);
-        timer(
-            &mut app,
-            &ctx,
-            SlideshowTimerPass::ViewerRender {
-                viewport: egui::ViewportId::ROOT,
-                visible: false,
-            },
-        );
-        assert_eq!(app.fullscreen_idx, before);
-        timer(
-            &mut app,
-            &ctx,
-            SlideshowTimerPass::ViewerRender {
-                viewport: egui::ViewportId::ROOT,
-                visible: true,
-            },
-        );
-        assert_eq!(app.fullscreen_idx, Some(if boundary { 0 } else { 1 }));
-        assert_eq!(
-            app.slideshow_anchor_idx, None,
-            "landing waits for the owning Depth draw"
-        );
-    }
-    let ctx = egui::Context::default();
-    let mut app = page_turn_submission_tests::ready_app(&ctx, SpreadMode::Single);
-    arm_expired(&mut app);
-    timer(&mut app, &ctx, SlideshowTimerPass::InputOnly);
-    assert_eq!(
-        app.fullscreen_idx,
-        Some(1),
-        "2D keeps its existing timer behavior"
-    );
 }
 
 #[test]
@@ -381,4 +276,253 @@ fn depth_slideshow_stop_drops_the_context_owned_next_slot() {
     };
     assert!(state.next.is_none());
     assert_eq!(app.slideshow_anchor_idx, None);
+}
+
+#[cfg(windows)]
+mod gpu_tests {
+    use super::*;
+    use crate::app::depth_main_window_tests::RootDepthViewer;
+
+    #[test]
+    fn depth_slideshow_hud_exposes_play_but_keeps_overflow_hidden() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
+        let mut app = crate::app::setup_app_for_test();
+        let viewer = RootDepthViewer::new(&mut app);
+        let ctx = viewer.ctx.clone();
+        viewer.ready(&mut app);
+        page_turn::install(&ctx);
+        app.settings.fullscreen_top_bar_locked = true;
+        app.settings.slideshow_interval_secs = 30.0;
+        #[cfg(windows)]
+        {
+            app.native_video_in_window_active = true;
+        }
+        for playing in [true, false] {
+            render(&mut app, &ctx, vec![]);
+            assert!(
+                ctx.read_response(egui::Id::unique("fs_overflow_btn"))
+                    .is_none()
+            );
+            let pos = ctx
+                .read_response(egui::Id::unique("fs_play_btn"))
+                .expect("Depth exposes slideshow playback")
+                .rect
+                .center();
+            render(&mut app, &ctx, vec![egui::Event::PointerMoved(pos)]);
+            render(
+                &mut app,
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert!(
+                app.fs_exclusive_view.is_depth(),
+                "HUD test must retain real Depth eligibility"
+            );
+            assert_eq!(app.slideshow_playing, playing);
+        }
+        enter_panorama(&mut app);
+        render(&mut app, &ctx, vec![]);
+        render(&mut app, &ctx, vec![]);
+        assert!(ctx.read_response(egui::Id::unique("fs_play_btn")).is_none());
+    }
+
+    #[test]
+    fn depth_slideshow_expired_handler_waits_without_limit_then_advances_after_cancel_or_failure() {
+        use crate::app::depth_view::{DepthPageProgress, DepthPageRole, DepthSlideshowGate};
+        use crate::depth_estimation::DepthPending;
+        for failed in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = page_turn_submission_tests::ready_app(&ctx, SpreadMode::Single);
+            install_depth(&mut app);
+            settle_failed(&mut app);
+            let material = app.ensure_final_composite_material(&ctx, 1).unwrap();
+            let key = DepthSourceKey {
+                texture_id: material.source_texture().id(),
+            };
+            let context = app.edit_request_owner_context();
+            let (pending, _complete) = DepthPending::deferred_for_test(context, 771, key);
+            let target = app.depth_next_target(1);
+            let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+                unreachable!()
+            };
+            state.next = Some(DepthNextSlot {
+                target,
+                key,
+                phase: DepthNextPhase::Estimating { pending },
+            });
+            arm_expired(&mut app);
+            let deadline = app.slideshow_next_at;
+            for overdue in [
+                Duration::from_secs(1),
+                Duration::from_secs(3600),
+                Duration::from_secs(86_400),
+            ] {
+                assert_eq!(
+                    app.depth_page_progress(&ctx, 1, DepthPageRole::Next),
+                    DepthPageProgress::Producing
+                );
+                assert_eq!(
+                    app.depth_slideshow_gate(&ctx, 1, deadline + overdue),
+                    DepthSlideshowGate::Wait
+                );
+                timer(
+                    &mut app,
+                    &ctx,
+                    SlideshowTimerPass::ViewerRender {
+                        viewport: egui::ViewportId::ROOT,
+                        visible: true,
+                    },
+                );
+                assert_eq!(app.fullscreen_idx, Some(0));
+                assert_eq!(app.slideshow_next_at, deadline);
+            }
+            let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+                unreachable!()
+            };
+            let next = state.next.as_mut().unwrap();
+            if failed {
+                next.phase = DepthNextPhase::Failed {
+                    reason: "fixture depth failure".into(),
+                };
+            } else {
+                let DepthNextPhase::Estimating { pending } = &next.phase else {
+                    unreachable!()
+                };
+                pending.cancel();
+            }
+            assert_eq!(
+                app.depth_page_progress(&ctx, 1, DepthPageRole::Next),
+                DepthPageProgress::Unavailable
+            );
+            assert_eq!(
+                app.depth_slideshow_gate(&ctx, 1, Instant::now()),
+                DepthSlideshowGate::Go
+            );
+            timer(
+                &mut app,
+                &ctx,
+                SlideshowTimerPass::ViewerRender {
+                    viewport: egui::ViewportId::ROOT,
+                    visible: true,
+                },
+            );
+            assert_eq!(app.fullscreen_idx, Some(1), "failed={failed}");
+            assert!(app.slideshow_playing);
+        }
+    }
+
+    #[test]
+    fn depth_slideshow_unavailable_current_and_unissued_next_do_not_stall() {
+        use crate::app::depth_view::{DepthPageProgress, DepthPageRole, DepthSlideshowGate};
+        let ctx = egui::Context::default();
+        let mut app = page_turn_submission_tests::ready_app(&ctx, SpreadMode::Single);
+        install_depth(&mut app);
+        app.fs_cache.insert(0, FsCacheEntry::Failed);
+        app.fs_cache.remove(&1);
+        assert_eq!(
+            app.depth_page_progress(&ctx, 0, DepthPageRole::Current),
+            DepthPageProgress::Unavailable
+        );
+        assert_eq!(
+            app.depth_page_progress(&ctx, 1, DepthPageRole::Next),
+            DepthPageProgress::Unavailable
+        );
+        app.slideshow_playing = true;
+        app.slideshow_anchor_idx = None;
+        app.sync_slideshow_anchor_for_frame(
+            &ctx,
+            0,
+            &FsFrameState::overview_shell(),
+            SlideshowTimerPass::ViewerRender {
+                viewport: egui::ViewportId::ROOT,
+                visible: true,
+            },
+        );
+        assert_eq!(
+            app.slideshow_anchor_idx,
+            Some(0),
+            "terminal failure starts the interval"
+        );
+        assert_eq!(
+            app.depth_slideshow_gate(&ctx, 1, Instant::now()),
+            DepthSlideshowGate::Go
+        );
+        arm_expired(&mut app);
+        timer(
+            &mut app,
+            &ctx,
+            SlideshowTimerPass::ViewerRender {
+                viewport: egui::ViewportId::ROOT,
+                visible: true,
+            },
+        );
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert!(app.slideshow_playing);
+    }
+
+    #[test]
+    fn depth_slideshow_timer_ignores_forwarded_input_and_hidden_render_for_all_targets() {
+        for boundary in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let viewer = RootDepthViewer::new(&mut app);
+            let ctx = viewer.ctx.clone();
+            if boundary {
+                app.fullscreen_idx = Some(3);
+            }
+            install_depth(&mut app);
+            settle_failed(&mut app);
+            app.fs_transparent_bg_mode = 1; // The documented prefetch/gate exclusion.
+            app.settings.slideshow_end_action = crate::settings::SlideshowEndAction::LoopFolder;
+            arm_expired(&mut app);
+            let before = app.fullscreen_idx;
+            timer(&mut app, &ctx, SlideshowTimerPass::InputOnly);
+            assert_eq!(app.fullscreen_idx, before);
+            timer(
+                &mut app,
+                &ctx,
+                SlideshowTimerPass::ViewerRender {
+                    viewport: egui::ViewportId::ROOT,
+                    visible: false,
+                },
+            );
+            assert_eq!(app.fullscreen_idx, before);
+            timer(
+                &mut app,
+                &ctx,
+                SlideshowTimerPass::ViewerRender {
+                    viewport: egui::ViewportId::ROOT,
+                    visible: true,
+                },
+            );
+            assert_eq!(app.fullscreen_idx, Some(if boundary { 0 } else { 2 }));
+            assert_eq!(
+                app.slideshow_anchor_idx, None,
+                "landing waits for the owning Depth draw"
+            );
+        }
+        let ctx = egui::Context::default();
+        let mut app = page_turn_submission_tests::ready_app(&ctx, SpreadMode::Single);
+        arm_expired(&mut app);
+        timer(&mut app, &ctx, SlideshowTimerPass::InputOnly);
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(1),
+            "2D keeps its existing timer behavior"
+        );
+    }
 }
