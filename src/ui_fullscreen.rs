@@ -21084,6 +21084,59 @@ impl App {
             .unwrap_or_else(|| self.facet_outside_composition(anchor_idx))
     }
 
+    /// Read the ordinary composition from its installed navigation/unit owners.
+    /// Missing topology/complete-list proof is unknown; never build it here.
+    fn peek_spread_display_composition_for_anchor(
+        &self,
+        anchor_idx: usize,
+    ) -> Option<SpreadDisplayComposition> {
+        if !self.spread_mode.is_spread() {
+            return SpreadDisplayComposition::from_navigation_pages(anchor_idx, &[anchor_idx]);
+        }
+        let navigation = &self.viewer_navigation_caches;
+        let cache = &self.spread_display_units_cache;
+        let token = cache.token.as_ref()?;
+        let nav = navigation.nav_indices.as_ref()?;
+        if !self.final_demand_visible_inputs_are_current()
+            || navigation.source != Some((self.items_generation, self.reading_flow))
+            || !Arc::ptr_eq(nav, &token.nav)
+        {
+            return None;
+        }
+        if !nav.contains(&anchor_idx) {
+            self.peek_rotation(anchor_idx)?;
+            return Some(self.facet_outside_composition(anchor_idx));
+        }
+        let final_cover = self.final_cover_spread_enabled_for_current_book();
+        let placement = self.spread_singleton_display_endpoint_settings();
+        let alone = self.page_alone_enabled_for_current_book();
+        let needs_complete = (self.spread_mode.has_cover() && final_cover)
+            || placement.first
+            || placement.last
+            || (self.spread_mode.has_cover() && (alone.after_cover || alone.last));
+        let eligible = if needs_complete && self.spread_complete_book_context_eligible() {
+            cache.complete_page_permutation?
+        } else {
+            false
+        };
+        let page_alone = if self.spread_mode.has_cover() && eligible {
+            alone
+        } else {
+            Default::default()
+        };
+        if token.page_alone != page_alone {
+            return None;
+        }
+        self.spread_display_composition_for_cached_unit(
+            &cache.units,
+            cache.unit_position(anchor_idx)?,
+            anchor_idx,
+            final_cover,
+            placement,
+            eligible,
+        )
+    }
+
     /// A currently shown page may outlive a temporary facet. Keep that one real
     /// page without importing excluded neighbors or automatic endpoint companions.
     fn facet_outside_unit(&self, idx: usize) -> SpreadDisplayUnit {
@@ -37573,8 +37626,7 @@ impl App {
             }
             if !owner.blocks_legacy_keymap_shortcuts()
                 && !self.fs_overflow_panel_state.is_open()
-                && !self.spread_popup_open
-                && !self.fit_popup_open
+                && !self.fs_front_menu_presented(ctx, ctx.content_rect())
             {
                 for key_action in [
                     KeyAction::FsPageScrollUp,

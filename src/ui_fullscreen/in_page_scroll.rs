@@ -8,6 +8,8 @@ mod handler_tests;
 mod interaction_tests;
 #[cfg(test)]
 mod overflow_tests;
+#[cfg(test)]
+mod review_regression_tests;
 
 /// Remove only the pan used for the actual paint. The App boundary already
 /// checked the painted effective zoom; no rectangle is projected to another scale.
@@ -365,7 +367,52 @@ impl App {
         }
     }
 
-    fn fs_scroll_input_geometry(&mut self, ctx: &egui::Context) -> Option<FsScrollGeometryKey> {
+    fn fs_scroll_input_composition(&self) -> Option<SpreadDisplayComposition> {
+        let idx = self.fullscreen_idx?;
+        let base = self.peek_spread_display_composition_for_anchor(idx)?;
+        let demand = base.presentation_demand(self.spread_mode, self.fullscreen_page_slice);
+        let crate::book_composition::PresentationDecision::Allowed(allowed) =
+            self.book_presentation_allowed(&demand)
+        else {
+            return None;
+        };
+        base.permitted_projection(self.spread_mode, &allowed)
+    }
+
+    #[cfg(test)]
+    fn fs_scroll_input_geometry(&self, ctx: &egui::Context) -> Option<FsScrollGeometryKey> {
+        let composition = self.fs_scroll_input_composition()?;
+        self.fs_scroll_input_geometry_for_unit(ctx, &composition)
+    }
+
+    fn fs_scroll_resident_auto_trim(&self, idx: usize) -> Option<Option<Rect>> {
+        self.resident_canonical_auto_trim(idx).ok().or_else(|| {
+            // Ordinary auto trim deliberately does not analyze animated
+            // entries. This resident variant proves no trim; it is not a
+            // missing static-pixel answer disguised as None.
+            matches!(self.fs_cache.get(&idx), Some(FsCacheEntry::Animated { .. })).then_some(None)
+        })
+    }
+
+    fn fs_scroll_resident_trim(
+        &self,
+        idx: usize,
+        side: Option<crate::view_trim::ViewTrimSpreadSide>,
+    ) -> Option<Option<Rect>> {
+        if self.effective_view_trim_apply_mode_for_idx(idx)
+            == crate::view_trim::ViewTrimApplyMode::Auto
+        {
+            self.fs_scroll_resident_auto_trim(idx)
+        } else {
+            self.resident_canonical_trim(idx, side).ok()
+        }
+    }
+
+    fn fs_scroll_input_geometry_for_unit(
+        &self,
+        ctx: &egui::Context,
+        composition: &SpreadDisplayComposition,
+    ) -> Option<FsScrollGeometryKey> {
         let idx = self.fullscreen_idx?;
         // ROOT can dispatch keys for another viewport. Read the destination's
         // current size and DPI, never the handler Context's current viewport.
@@ -380,15 +427,36 @@ impl App {
         if !full_rect.is_finite() || !full_rect.is_positive() {
             return None;
         }
-        let viewport = self.fullscreen_media_rect(full_rect, idx, false);
-        let base = self.spread_display_composition_for_anchor(idx);
-        let demand = base.presentation_demand(self.spread_mode, self.fullscreen_page_slice);
-        let crate::book_composition::PresentationDecision::Allowed(allowed) =
-            self.book_presentation_allowed(&demand)
-        else {
-            return None;
+        // Match the ordinary viewport using only its already prepared chrome.
+        // fullscreen_media_rect can populate seek/navigation caches on a miss.
+        let seek_allowed = self.fullscreen_seek_overlay_allowed(idx, false);
+        let strip_has_content = if self.settings.still_seek_strip_visible && seek_allowed {
+            let navigation = &self.viewer_navigation_caches;
+            if navigation.source != Some((self.items_generation, self.reading_flow)) {
+                return None;
+            }
+            navigation
+                .fs_seek_info
+                .as_ref()
+                .filter(|(anchor, _)| *anchor == idx)?
+                .1
+                .has_page_strip_content()
+        } else {
+            false
         };
-        let composition = base.permitted_projection(self.spread_mode, &allowed)?;
+        let chrome = FsNavigationStillChromeInputs {
+            top_bar_eligible: self.fullscreen_top_bar_chrome_allowed(idx),
+            seek_eligible: seek_allowed,
+            strip_has_content,
+            info_panel_eligible: self.still_info_panel_eligible_for_idx(idx, false),
+        };
+        let seek = self.still_seek_geometry_for_navigation_chrome(full_rect, chrome);
+        let right = self.locked_info_panel_reserved_width_for_eligibility(
+            full_rect,
+            seek.total_height,
+            chrome.info_panel_eligible,
+        );
+        let viewport = seek.media_rect(full_rect, right);
         let occurrences = composition.pages_in_screen_order(self.spread_mode);
         let spread = occurrences.len() == 2;
         let mode = self.effective_fullscreen_fit_mode();
@@ -396,31 +464,47 @@ impl App {
         if spread {
             let left = occurrences[0].idx;
             let right = occurrences[1].idx;
-            let left_rot = self.get_rotation(left);
-            let right_rot = self.get_rotation(right);
+            let left_rot = self.peek_rotation(left)?;
+            let right_rot = self.peek_rotation(right)?;
             if left_rot.is_none() && right_rot.is_none() {
-                let (l, r) = self.view_trim_spread_content_bboxes(left, right);
+                let (l, r) = match self.resolved_view_trim_base_mode() {
+                    crate::view_trim::ViewTrimApplyMode::None => (None, None),
+                    crate::view_trim::ViewTrimApplyMode::Auto => {
+                        crate::view_trim::harmonize_spread_auto_bboxes(
+                            self.fs_scroll_resident_auto_trim(left)?,
+                            self.fs_scroll_resident_auto_trim(right)?,
+                        )
+                    }
+                    _ => (
+                        self.view_trim_spread_bbox(
+                            left,
+                            crate::view_trim::ViewTrimSpreadSide::Left,
+                        ),
+                        self.view_trim_spread_bbox(
+                            right,
+                            crate::view_trim::ViewTrimSpreadSide::Right,
+                        ),
+                    ),
+                };
                 trims.extend([l, r]);
             } else {
                 trims.extend([
-                    left_rot
-                        .is_none()
-                        .then(|| {
-                            self.view_trim_spread_content_bbox(
-                                left,
-                                crate::view_trim::ViewTrimSpreadSide::Left,
-                            )
-                        })
-                        .flatten(),
-                    right_rot
-                        .is_none()
-                        .then(|| {
-                            self.view_trim_spread_content_bbox(
-                                right,
-                                crate::view_trim::ViewTrimSpreadSide::Right,
-                            )
-                        })
-                        .flatten(),
+                    if left_rot.is_none() {
+                        self.fs_scroll_resident_trim(
+                            left,
+                            Some(crate::view_trim::ViewTrimSpreadSide::Left),
+                        )?
+                    } else {
+                        None
+                    },
+                    if right_rot.is_none() {
+                        self.fs_scroll_resident_trim(
+                            right,
+                            Some(crate::view_trim::ViewTrimSpreadSide::Right),
+                        )?
+                    } else {
+                        None
+                    },
                 ]);
             }
         }
@@ -439,7 +523,7 @@ impl App {
                     crate::material_display_basis::MaterialDisplayView::Single
                 };
                 let texture_size = resource.full_source_size_vec2();
-                let rotation = self.get_rotation(idx);
+                let rotation = self.peek_rotation(idx)?;
                 Some(FsScrollPageGeometry {
                     occurrence,
                     fit: self.fs_material_fit_input(mode, &resource, view).ok()?,
@@ -458,32 +542,55 @@ impl App {
                     trim: if spread {
                         trims[side]
                     } else {
-                        let trim = self.view_trim_single_content_bbox(idx);
+                        let trim = self
+                            .fs_scroll_resident_trim(idx, self.composed_blank_spread_side(idx))?;
                         self.fs_page_content_bbox(idx, rotation, trim)
                     },
                 })
             })
             .collect::<Option<Vec<_>>>()?;
-        self.fs_scroll_geometry_key(&composition, viewport, ppp, pages)
+        self.fs_scroll_geometry_key(composition, viewport, ppp, pages)
     }
 
-    pub(super) fn fs_scroll_layout_matches(&mut self, ctx: &egui::Context) -> bool {
+    pub(super) fn fs_scroll_layout_matches(&self, ctx: &egui::Context) -> bool {
         self.fs_scroll_layout_matches_at_zoom(ctx, self.fs_zoom_pan().map_or(1.0, |(zoom, _)| zoom))
     }
 
-    fn fs_scroll_layout_matches_at_zoom(&mut self, ctx: &egui::Context, zoom: f32) -> bool {
+    fn fs_scroll_layout_matches_at_zoom(&self, ctx: &egui::Context, zoom: f32) -> bool {
         if !self
             .fullscreen_page_layout
             .drawn_unit
             .as_ref()
-            .is_some_and(|stamp| stamp.drawn_zoom == zoom)
+            .is_some_and(|stamp| {
+                stamp.drawn_zoom == zoom && stamp.items_generation == self.items_generation
+            })
             || !self.fs_in_page_scroll_surface()
             || self.fs_navigation_sequence_blocks_new_target()
             || self.page_turn_barrier_active()
         {
             return false;
         }
-        let Some(key) = self.fs_scroll_input_geometry(ctx) else {
+        let Some(composition) = self.fs_scroll_input_composition() else {
+            return false;
+        };
+        let stamp = self
+            .fullscreen_page_layout
+            .drawn_unit
+            .as_ref()
+            .expect("checked stamp");
+        if stamp.geometry.slice != self.fullscreen_page_slice
+            || stamp.geometry.singleton != composition.singleton_placement()
+            || stamp
+                .geometry
+                .pages
+                .iter()
+                .map(|page| page.occurrence)
+                .collect::<Vec<_>>()
+                != composition.pages_in_screen_order(self.spread_mode)
+        {
+            return false;
+        }
+        let Some(key) = self.fs_scroll_input_geometry_for_unit(ctx, &composition) else {
             return false;
         };
         self.fullscreen_page_layout

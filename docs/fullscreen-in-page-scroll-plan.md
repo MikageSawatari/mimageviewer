@@ -707,6 +707,64 @@ test(/(fullscreen_overflow_panel_snapshot|fullscreen_in_page_scroll_settings_sna
 検索ナビゲーションinventoryの補助 `key_entry` は6操作を非ナビゲーションに分類した。
 既存の音楽小パネル等の描画fixtureには新しいview項目の既定値を補った。本番の分岐は変更していない。
 
+### 7.7 独立実装レビュー r1 の指摘対応（2026-11-18、修正・関連検証完了）
+
+基準コミットは `39e3670c5`。今回の修正は実装担当が行い、コミット・製品起動・build-dev・全件テストは行わない。
+初回記録の確認担当の出どころは設計担当による訂正を保持する。今回の修正差分の独立再レビューは未実施。
+
+| ファイル | 変更 |
+| --- | --- |
+| `src/ui_fullscreen.rs` | 新Actionの個別のspread/fit判定を既存の `fs_front_menu_presented` に統一。回転等の前面popup中は新Actionを消費しない。入力用の構成peekを追加し、既存のunit token・navigation・完全性の取得済み証明だけを使う。固定矢印の受付と置き換え点は変更しない。 |
+| `src/app.rs` | `peek_rotation` を追加。数値cacheと取得済みの構成本の回転だけを読む。既存 `get_rotation` のDB取得・memoizeは変更しない。 |
+| `src/ui_fullscreen/canonical_demand.rs` | 既存のresident trim readerを同じfullscreen内で共有する。test用のmetadata producer禁止guard入口を追加。 |
+| `src/ui_fullscreen/in_page_scroll.rs` | 世代を先に照合し、表示単位・sliceの不一致も素材幾何より先に棄却。入力幾何の取得を `&self` にし、回転・自動trim・構成・seek情報の未取得時には取得処理を起こさず不一致とする。Noneという取得済みtrim回答と未取得を区別する。 |
+| `src/ui_fullscreen/in_page_scroll/review_regression_tests.rs`（追加） | metadata guard下の実handler、cache不取得・次の描画後の再開、固定矢印の既存受付を検査。 |
+| `src/ui_fullscreen/front_popup_input_tests.rs` | 実際にマウスで開いた回転popupのフォーカスを外し、K/J/割当済み方向Actionのpan不変と未消費を検査。 |
+| 本書 §6.10・§7.7 | 指摘の出どころ、対応と検証結果を記録。 |
+
+入力側の自動trimは既存のresident readerを使い、非回転pairの調和、回転側のtrim抑止、白companionのsideも従来の描画と同じ規則で解く。
+取得済みのAnimatedエントリでは、既存の `cached_margin_bbox` が自動解析を適用しないため、その確定した「trimなし」を読む。静止画の未取得／失効cacheをNoneで埋めることはしない。
+構成のpeekはNative専用の厳しい受理条件を流用せず、通常描画が必要とする完全性の証明だけを要求する。
+キャッシュが揃わない入力を待機・再試行せず消費のみとする点、次の通常描画で取得した値から再開する点は設計どおり。
+設計との差分はない。
+
+追加テスト名:
+
+- `mouse_opened_unfocused_rotation_popup_keeps_page_scroll_keys_unconsumed`
+- `missing_rotation_is_consumed_without_metadata_production_and_new_paint_recovers`
+- `missing_or_replaced_auto_trim_is_consumed_without_analysis_and_new_paint_recovers`
+- `missing_composition_is_not_rebuilt_by_input_and_new_paint_recovers`
+- `ordinary_spread_does_not_require_an_unused_native_completeness_proof`
+- `animated_auto_trim_retains_the_known_untrimmed_value_without_analysis`
+- `missing_seek_geometry_is_not_populated_by_scroll_matcher_and_new_paint_recovers`
+- `stale_generation_and_page_skip_geometry_without_loading_metadata`
+- `rotation_popup_keeps_fixed_arrows_at_the_existing_replacement_point`
+
+指定runnerと `MSBUILDDISABLENODEREUSE=1` を使って検証した。
+
+```text
+cargo check -p mimageviewer --bin mimageviewer-core
+cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen::in_page_scroll/) | test(/ui_fullscreen::front_popup_input_tests/) | test(/ui_fullscreen::canonical_demand/)'
+cargo nextest run -p mimageviewer --lib -E 'test(/missing_seek_geometry_is_not_populated_by_scroll_matcher_and_new_paint_recovers/)'
+cargo fmt
+```
+
+`cargo check` は成功（36.14秒）。nextest初回は101件中100件成功・1件失敗（実行57.767秒）。
+追加のseek欠落テストが、handler全体の実行後もseek情報を使えないままと仮定してpan不変を要求していた。
+既存のhandler前段は `page_overview_available` を呼び、`src/app/page_overview.rs` の `page_overview_unavailable_reason` がseek情報を準備するため、この仮定が誤っていた。この既存経路は変更しない。
+このテストは照合処理自体をguard下で直接呼び、cache不変・不一致・pan不変を検査する形へ修正した。
+次の通常描画後の再開は実handlerで検査する。回転・自動trim・構成の欠落は初回からguard下の実handlerテストが成功した。
+修正したseekテストの再実行は1件成功・失敗0件（実行0.665秒、再ビルド2分51秒）。
+初回に成功した100件の後は本番コードを変更しておらず、その結果を再利用する。対象101件の有効な成功結果が揃った。
+依存ビルドの失敗なし。共有ロック待ちの後、sandboxの書き込み制約によりrunner指定の低優先度・6並列で実行した。
+TEMP/TMPはworktree内の `target/474-tmp` を使用した。
+引数なしの `cargo fmt` と `git diff --check` も成功。
+
+既存の `get_rotation`・`get_rotations_for_indices`・`cached_margin_bbox`・`clamp_fullscreen_pan_from_layout` の関数本体は基準コミットと同一であることを照合した。
+UI文言と描画は変更していない。PNGの更新なし。修正差分の独立目視・独立再レビューは未実施。
+
+ログ（すべて `target/` 内）: `474-r1-check.stdout.log` / `474-r1-check.stderr.log`、`474-r1-tests.stdout.log` / `474-r1-tests.stderr.log`、`474-r1-seek.stdout.log` / `474-r1-seek.stderr.log`、`474-r1-static.log`、`474-r1-fmt.stdout.log` / `474-r1-fmt.stderr.log`、`474-r1-diff-check.stdout.log` / `474-r1-diff-check.stderr.log`。
+
 ### 6.8 実装担当の停止報告と決定 (2026-11-18)
 
 実装担当 (Codex gpt-6.1-sol / high、session 01a1ea54) が、§2.3 の「同じ frame の倍率変更は既存 clamp と同じ投影で扱う」と実描画の矛盾を報告して停止した
@@ -719,3 +777,15 @@ test(/(fullscreen_overflow_panel_snapshot|fullscreen_in_page_scroll_settings_sna
 `fs_zoom` が変わらなくても、スクロールで pan が付いた瞬間に画像の寸法が変わり、端に空きが残る (原寸幅 10000 で約 2〜3pt、実装担当のコード上の計算)。
 設計担当の決定: 照合は描いたときの実効の倍率で比べ、スクロールで pan を書くときは `fs_zoom` にもその実効の倍率を書く (§2.3)。
 既存の正規化と手動パン・ズームの挙動は変えない。
+
+### 6.10 独立実装レビュー r1（REVISE、P2 2件）と対応（2026-11-18）
+
+利用者から、別担当 Sol / xhigh による独立実装レビューの結果を受領した。
+設計担当もコードを読み、2件とも妥当と判断したとの連絡を受けた。修正の記録は §7.7。
+
+| 指摘 | 対応 |
+| --- | --- |
+| P2-1: フォーカスのない回転popupの背後で新Actionが消費・実行される | 既存の前面メニュー所有判定に統一し、マウスで開いた回転popupで実handlerを検査。固定矢印・置き換え点の受付は維持。 |
+| P2-2: 入力の幾何取得が回転の同期DB SELECT・自動trim解析・構成の構築に到達し得る | 取得済みmetadataのみのreaderへ変更。世代・表示単位を先に照合し、cache missは消費のみ。metadata producer禁止guardとcache不変・描画後の復帰を検査。 |
+
+この節は受領した指摘と対応の記録であり、修正差分の独立再レビュー・再受入れを行った記録ではない。

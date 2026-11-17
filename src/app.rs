@@ -76930,6 +76930,14 @@ impl App {
             .start_still_seek_rotations(self.items_generation, requests, path, ctx);
     }
 
+    /// Read an adopted rotation without loading it or filling numeric slots.
+    pub(crate) fn peek_rotation(&self, idx: usize) -> Option<crate::rotation_db::Rotation> {
+        self.rotation_cache
+            .get(&idx)
+            .copied()
+            .or_else(|| self.prepared_composed_rotation(idx))
+    }
+
     /// 指定 idx の回転角度を取得する（キャッシュ + DB）。
     pub(crate) fn get_rotation(&mut self, idx: usize) -> crate::rotation_db::Rotation {
         #[cfg(test)]
