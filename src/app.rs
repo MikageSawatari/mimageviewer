@@ -89558,7 +89558,7 @@ impl App {
     /// independently budgeted retained CPU entry was evicted. Raw/edit producers
     /// continue to use `fs_page_load_state` and `ensure_fs_page_load` directly.
     pub(crate) fn fs_display_page_load_state(&self, idx: usize) -> FsPageLoadState {
-        if self.page_turn_prefetch_policy_enabled()
+        if self.next_unit_final_prepare_enabled()
             && self.exact_complete_final_composite_texture(idx).is_some()
         {
             FsPageLoadState::DisplayReady(FsPageDisplaySource::ResidentFinalComposite)
@@ -97762,15 +97762,6 @@ impl App {
         if !self.raw_fullscreen_fallback_allowed(idx) {
             return None;
         }
-        self.cached_passthrough_material_for_allowed_source(idx)
-    }
-
-    /// Cache identity/coverage only. Callers must establish their RAW source
-    /// policy before lookup; this part never reads the development mutex.
-    pub(crate) fn cached_passthrough_material_for_allowed_source(
-        &self,
-        idx: usize,
-    ) -> Option<crate::gpu_lanczos::FullscreenPaintResource> {
         let pixels = self.thumb_pixels.get(&idx)?;
         let key = self.final_composite_key_for_pixels(
             self.current_edit_result_key(idx),
@@ -107962,5 +107953,108 @@ mod agent_change_ui_tests {
         assert!(!controller.is_ready());
         app.poll_agent_changes();
         assert!(controller.is_ready());
+    }
+}
+
+#[cfg(test)]
+mod depth_slideshow_folder_tests {
+    use super::*;
+
+    fn settle_reopen(app: &mut App, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.fullscreen_idx.is_none() {
+            app.poll_sidecar_restore(ctx);
+            app.poll_open_path_classification(ctx);
+            app.poll_book_composition_service_for_test(ctx);
+            app.poll_book_composition_read(ctx);
+            app.poll_smart_folder(ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the accepted folder result did not finish its existing display continuation"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn depth_slideshow_next_folder_result_notifies_once_and_keeps_two_dimensional_playback() {
+        for (depth, automatic) in [(true, true), (false, true), (true, false)] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app_for_test();
+            let source = app.tmp.path().join("depth-slideshow-source");
+            let destination = app.tmp.path().join("depth-slideshow-destination");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::create_dir_all(&destination).unwrap();
+            for folder in [&source, &destination] {
+                image::RgbaImage::from_pixel(4, 6, image::Rgba([20, 80, 140, 255]))
+                    .save(folder.join("page.png"))
+                    .unwrap();
+            }
+            app.current_folder = Some(source.clone());
+            app.items = vec![GridItem::Image(source.join("page.png"))];
+            app.visible_indices = vec![0];
+            app.fullscreen_idx = Some(0);
+            app.settings.page_turn_animation_enabled = false;
+            app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsDepthParallax = F24\n");
+            if depth {
+                let owner = app.edit_request_owner_context();
+                app.set_fs_exclusive_view(
+                    crate::fs_exclusive_view::FsExclusiveView::Depth(
+                        crate::depth_parallax::DepthViewState::new(owner),
+                    ),
+                    "slideshow_folder_test",
+                );
+            }
+            app.slideshow_playing = automatic;
+            app.feedback_toasts_for_test.clear();
+            let make_result = |app: &App| FolderNavResult {
+                target: Some(FolderNavTarget {
+                    route: FolderNavRoute::FullFeature(destination.clone()),
+                    smart_kind: None,
+                    scanned: FolderNavScanResult::Ready(
+                        scan_directory_with_settings(&destination, &app.settings).unwrap(),
+                    ),
+                }),
+                hit_image_folder: true,
+                forward: true,
+                mode: if automatic {
+                    FolderNavMode::SlideshowNext
+                } else {
+                    FolderNavMode::Fullscreen
+                },
+                queued_steps: 0,
+            };
+            let result = make_result(&app);
+            app.apply_folder_nav_result(&ctx, result);
+            settle_reopen(&mut app, &ctx);
+            assert_eq!(app.current_folder.as_deref(), Some(destination.as_path()));
+            assert!(!app.fs_exclusive_view.is_depth());
+            assert!(app.fullscreen_idx.is_some());
+            assert_eq!(app.slideshow_playing, automatic);
+            let expected = usize::from(depth && automatic);
+            let notice_count = |app: &App| {
+                app.feedback_toasts_for_test
+                    .iter()
+                    .filter(|(message, _)| {
+                        message.starts_with("3D 写真を終了しました: 次のフォルダへ進みました。")
+                    })
+                    .count()
+            };
+            assert_eq!(
+                notice_count(&app),
+                expected,
+                "depth={depth}, automatic={automatic}"
+            );
+            if expected == 1 {
+                assert!(app.feedback_toasts_for_test.iter().any(|(message, _)| {
+                    message.contains("次のフォルダへ進みました。F24 キーでもう一度使えます")
+                }));
+            }
+            // A later ordinary 2D result has no Depth owner to retire again.
+            let result = make_result(&app);
+            app.apply_folder_nav_result(&ctx, result);
+            settle_reopen(&mut app, &ctx);
+            assert_eq!(notice_count(&app), expected);
+        }
     }
 }

@@ -34,21 +34,27 @@ pub(crate) enum DepthSlideshowGate {
     Wait,
 }
 
-#[cfg(test)]
-mod premise_tests {
+#[cfg(all(test, windows))]
+pub(super) mod gpu_tests {
     use super::*;
 
-    /// Investigation evidence, not approval of this behavior: §5.7 assumes
-    /// NotYet makes old settled evidence ineligible, while Failed is sticky.
     #[test]
-    fn depth_slideshow_failed_fact_survives_not_yet_after_parameter_change() {
+    fn depth_slideshow_failed_fact_waits_for_new_material_and_resumes_without_retry() {
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
-        app.items = vec![GridItem::Image("failed-depth-source.jpg".into())];
-        app.fullscreen_idx = Some(0);
+        crate::app::depth_view_tests::install_pages(&mut app, &ctx);
+        app.ai_runtime_init =
+            crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("failed-material fixture");
+        let render = app.wgpu_render_state.clone().unwrap();
+        let texture = app
+            .resolve_fs_processed_material(&ctx, 0, false)
+            .unwrap()
+            .source_texture()
+            .clone();
+        deliver_textures(&ctx, &render);
         let edit_key = app.current_edit_result_key(0);
         let key = crate::depth_estimation::DepthSourceKey {
-            texture_id: egui::TextureId::Managed(771_501),
+            texture_id: texture.id(),
         };
         let mut state = DepthViewState::new(app.edit_request_owner_context());
         state.source = DepthSourcePhase::Failed {
@@ -61,42 +67,55 @@ mod premise_tests {
             key,
             outcome: DepthSettledOutcome::Failed,
         });
-        app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "failed_fact_premise");
+        app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "failed_fact_regression");
+        app.advance_depth_source(
+            &ctx,
+            DepthSourceMaterial::Ready {
+                texture: texture.clone(),
+            },
+        );
         assert!(app.depth_current_settled());
         let mut params = crate::adjustment::AdjustParams::default();
         params.brightness = 15.0;
         app.adjustment_page_params.insert(0, params);
-        assert_eq!(
-            app.current_edit_result_key(0),
-            edit_key,
-            "effect parameters are outside EditResultKey"
+        assert_eq!(app.current_edit_result_key(0), edit_key);
+        let pending_key = crate::app::final_prepare_tests::queued_final(&mut app, 0);
+        app.advance_depth_source(
+            &ctx,
+            DepthSourceMaterial::NotYet(DepthSourceWait::IncompleteComposite),
         );
-        // This is exactly the existing NotYet branch in advance_depth_source.
-        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
-            unreachable!()
-        };
-        state.wait_for_source(DepthSourceWait::IncompleteComposite);
-        assert!(matches!(state.source, DepthSourcePhase::Failed { key: old, .. } if old == key));
+        assert!(!app.depth_current_settled());
         assert!(
-            app.depth_current_settled(),
-            "the previous failed fact still passes §5.7's three checks"
+            matches!(&app.fs_exclusive_view, FsExclusiveView::Depth(state)
+            if state.current_material.is_none() && matches!(state.source, DepthSourcePhase::Failed { key: old, .. } if old == key)
+                && state.settled.as_ref().is_some_and(|fact| fact.key == key))
         );
         assert_eq!(
             app.depth_page_progress(&ctx, 0, DepthPageRole::Current),
-            DepthPageProgress::Ready,
-            "stage 1 bypasses the current material's producers"
+            DepthPageProgress::Producing
         );
+        app.final_effect_pending.remove(&pending_key);
+        app.adjustment_page_params.remove(&0);
+        crate::depth_estimation::DepthWorker::take_submission_for_test();
+        app.advance_depth_source(&ctx, DepthSourceMaterial::Ready { texture });
+        assert!(app.depth_current_settled());
+        assert_eq!(
+            app.depth_page_progress(&ctx, 0, DepthPageRole::Current),
+            DepthPageProgress::Ready
+        );
+        assert!(crate::depth_estimation::DepthWorker::take_submission_for_test().is_none());
     }
-}
 
-#[cfg(all(test, windows))]
-mod gpu_tests {
-    use super::*;
-
-    fn deliver_textures(ctx: &egui::Context, render: &egui_wgpu::RenderState) {
+    pub(in crate::app) fn deliver_textures(ctx: &egui::Context, render: &egui_wgpu::RenderState) {
         let mut textures = ctx.tex_manager().write().take_delta();
         for (id, deltas) in &textures.set {
             for delta in deltas {
+                // These tests can deliver image backing before the first UI
+                // pass ends, while egui's font atlas is still a placeholder.
+                if delta.image.size().contains(&0) {
+                    assert_eq!(*id, egui::TextureId::Managed(0));
+                    continue;
+                }
                 render
                     .renderer
                     .write()
@@ -107,6 +126,125 @@ mod gpu_tests {
             render.renderer.write().free_texture(id);
         }
         textures.clear();
+    }
+
+    #[test]
+    fn depth_next_material_and_input_changes_retire_readback_and_estimation() {
+        use crate::depth_estimation::{DepthPending, DepthSourceKey};
+        use crate::depth_parallax::{DepthNextPhase, DepthNextSlot};
+        for estimating in [false, true] {
+            for change in 0..3 {
+                let ctx = egui::Context::default();
+                let mut app = crate::app::setup_app_for_test();
+                crate::app::depth_view_tests::install_pages(&mut app, &ctx);
+                app.ai_runtime_init =
+                    crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("supersession fixture");
+                let render = app.wgpu_render_state.clone().unwrap();
+                let texture = app
+                    .resolve_fs_processed_material(&ctx, 0, false)
+                    .unwrap()
+                    .source_texture()
+                    .clone();
+                let next_texture = app
+                    .resolve_fs_processed_material(&ctx, 2, false)
+                    .unwrap()
+                    .source_texture()
+                    .clone();
+                deliver_textures(&ctx, &render);
+                let key = DepthSourceKey {
+                    texture_id: texture.id(),
+                };
+                let next_key = DepthSourceKey {
+                    texture_id: next_texture.id(),
+                };
+                let target = app.depth_next_target(2);
+                let mut state = DepthViewState::new(app.edit_request_owner_context());
+                state.source = DepthSourcePhase::Ready { key };
+                state.current_material = Some(key);
+                state.settled = Some(DepthSettled {
+                    fs_idx: 0,
+                    edit_key: app.current_edit_result_key(0),
+                    key,
+                    outcome: DepthSettledOutcome::Presented,
+                });
+                let next_backing = render
+                    .renderer
+                    .read()
+                    .texture(&next_key.texture_id)
+                    .unwrap()
+                    .texture
+                    .clone()
+                    .unwrap();
+                let cancellation = if estimating {
+                    let (pending, _complete) =
+                        DepthPending::deferred_for_test(state.context, 781, next_key);
+                    let cancel = pending.cancellation_token_for_test();
+                    state.next = Some(DepthNextSlot {
+                        target,
+                        key: next_key,
+                        phase: DepthNextPhase::Estimating { pending },
+                        started_at: std::time::Instant::now(),
+                    });
+                    Some(cancel)
+                } else {
+                    state.start_next(
+                        &render.device,
+                        &render.queue,
+                        &next_backing,
+                        target,
+                        next_key,
+                    );
+                    None
+                };
+                app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "supersession_fixture");
+                app.slideshow_playing = true;
+                assert!(app.depth_current_settled());
+                let mut current_reply = None;
+                let selected = match change {
+                    0 => DepthSourceMaterial::NotYet(DepthSourceWait::IncompleteComposite),
+                    1 => {
+                        app.input_generation.insert(0, 771);
+                        DepthSourceMaterial::Ready {
+                            texture: texture.clone(),
+                        }
+                    }
+                    _ => {
+                        let replacement = ctx.load_texture(
+                            "replaced-source",
+                            egui::ColorImage::filled([2, 3], egui::Color32::BLACK),
+                            Default::default(),
+                        );
+                        deliver_textures(&ctx, &render);
+                        let replacement_key = DepthSourceKey {
+                            texture_id: replacement.id(),
+                        };
+                        let context = app.edit_request_owner_context();
+                        let (pending, reply) =
+                            DepthPending::deferred_for_test(context, 782, replacement_key);
+                        current_reply = Some(reply);
+                        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+                            unreachable!()
+                        };
+                        state.source = DepthSourcePhase::Estimating {
+                            key: replacement_key,
+                            pending,
+                        };
+                        DepthSourceMaterial::Ready {
+                            texture: replacement,
+                        }
+                    }
+                };
+                app.advance_depth_source(&ctx, selected);
+                assert!(!app.depth_current_settled());
+                assert!(
+                    matches!(&app.fs_exclusive_view, FsExclusiveView::Depth(state) if state.next.is_none() && state.readback_bytes() == 0)
+                );
+                if let Some(cancel) = cancellation {
+                    assert!(cancel.load(Ordering::Acquire));
+                }
+                drop(current_reply);
+            }
+        }
     }
 
     #[test]
@@ -147,6 +285,7 @@ mod gpu_tests {
                 target: saved_target,
                 key: saved_key,
                 phase: DepthNextPhase::Estimating { pending },
+                started_at: std::time::Instant::now(),
             });
             app.set_fs_exclusive_view(FsExclusiveView::Depth(state), "handoff_test");
             app.slideshow_playing = true;
@@ -235,6 +374,7 @@ mod gpu_tests {
             phase: DepthNextPhase::Failed {
                 reason: "test failure".into(),
             },
+            started_at: std::time::Instant::now(),
         });
         state
             .select_source_for_target(&render.device, &render.queue, &backing, key, Some(target))
@@ -264,6 +404,7 @@ mod gpu_tests {
             phase: DepthNextPhase::Estimating {
                 pending: DepthPending::completed_for_test(state.context, 773, map(next_key)),
             },
+            started_at: std::time::Instant::now(),
         });
         state.advance(
             &render.device,
@@ -307,10 +448,16 @@ mod gpu_tests {
         use crate::ui_fullscreen::page_turn_submission_tests::{
             draw_current_without_sources, frame,
         };
-        for adjusted in [false, true] {
+        for (adjusted, evict_source) in [(false, false), (true, false), (true, true)] {
             let ctx = egui::Context::default();
             let mut app = crate::app::setup_app_for_test();
             crate::app::depth_view_tests::install_pages(&mut app, &ctx);
+            // The general Depth fixture uses non-mipmapped, unbound textures.
+            // Source sharing must exercise the immutable display allocations
+            // produced by the ordinary fullscreen loader instead.
+            for idx in [0, 2, 3] {
+                crate::app::source_texture_test_support::seed(&mut app, &ctx, idx);
+            }
             let mut render = app.wgpu_render_state.clone().unwrap();
             render.renderer = Arc::new(egui::epaint::mutex::RwLock::new(egui_wgpu::Renderer::new(
                 &render.device,
@@ -341,12 +488,17 @@ mod gpu_tests {
                 unreachable!()
             };
             state.source = DepthSourcePhase::Ready { key: current_key };
+            state.current_material = Some(current_key);
             state.settled = Some(DepthSettled {
                 fs_idx: 0,
                 edit_key,
                 key: current_key,
                 outcome: DepthSettledOutcome::Presented,
             });
+            // The first Depth paint after playback starts owns this baseline;
+            // the preceding 2D paint happened while curl and playback were off.
+            app.spread_display_composition_for_anchor(0);
+            assert!(app.next_unit_current_presented());
             app.prefetch_next_final_unit(&ctx, 0);
             if adjusted {
                 let key = crate::app::final_prepare::tests::wait_ready(&mut app, 2);
@@ -361,10 +513,19 @@ mod gpu_tests {
                 );
                 assert!(app.exact_complete_final_composite_entry(2).is_some());
             }
+            if evict_source {
+                app.fs_cache.remove(&2);
+                assert!(matches!(
+                    app.fs_display_page_load_state(2),
+                    FsPageLoadState::DisplayReady(FsPageDisplaySource::ResidentFinalComposite)
+                ));
+            }
             let target = app.depth_next_target(2);
             let material = app
                 .resident_final_prepare_material(&ctx, 2)
-                .expect("next material must be prepared before display");
+                .unwrap_or_else(|| {
+                    panic!("next material must be prepared before display: adjusted={adjusted}")
+                });
             let key = DepthSourceKey {
                 texture_id: material.source_texture().id(),
             };
@@ -439,6 +600,10 @@ mod gpu_tests {
                 crate::app::book_composition_permission::BookTargetPurpose::Next,
             );
             assert_eq!(app.fullscreen_idx, Some(2));
+            assert!(
+                app.fs_pending.get(&2).is_none(),
+                "resident D3 output must not require source reload"
+            );
             let (_, selected) = app.resolve_fs_processed_payload_and_depth(&ctx, 2, false);
             assert!(
                 matches!(&selected, DepthSourceMaterial::Ready { texture } if texture.id() == key.texture_id)
@@ -480,6 +645,8 @@ mod gpu_tests {
             Default::default(),
         )));
         app.wgpu_render_state = Some(render.clone());
+        app.ai_runtime_init =
+            crate::ai::runtime::AiRuntimeInitOwner::failed_for_test("retained-flat fixture");
         app.settings.page_turn_animation_enabled = true;
         install_presentation(&ctx);
         frame(&ctx, |ui, ctx| {
@@ -540,6 +707,12 @@ mod gpu_tests {
             !app.next_unit_current_presented(),
             "Ready is not yet presented"
         );
+        app.advance_depth_source(
+            &ctx,
+            DepthSourceMaterial::Ready {
+                texture: material.source_texture().clone(),
+            },
+        );
         let output = frame(&ctx, |ui, ctx| {
             draw_current_without_sources(&mut app, ui, ctx);
         });
@@ -560,6 +733,19 @@ mod gpu_tests {
         app.settings.page_turn_animation_enabled = false;
         assert!(app.next_unit_final_prepare_enabled());
         assert!(app.next_unit_current_presented());
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        state.source = DepthSourcePhase::Failed {
+            key,
+            reason: "settled failure".into(),
+        };
+        state.settled.as_mut().unwrap().outcome = DepthSettledOutcome::Failed;
+        assert!(app.depth_current_settled());
+        assert!(
+            !app.next_unit_current_presented(),
+            "Failed is terminal but cannot authorize D3 Next"
+        );
         let old_key = app.current_edit_result_key(0);
         app.input_generation
             .insert(0, old_key.source_gen.wrapping_add(1));
@@ -655,6 +841,7 @@ impl App {
         self.fullscreen_idx == Some(fact.fs_idx)
             && state.context == self.edit_request_owner_context()
             && fact.edit_key == self.current_edit_result_key(fact.fs_idx)
+            && state.current_material == Some(fact.key)
             && matches!(state.source, DepthSourcePhase::Ready { key } | DepthSourcePhase::Failed { key, .. } if key == fact.key)
     }
 
@@ -1229,6 +1416,9 @@ impl App {
         let FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view else {
             return;
         };
+        // Sole production writer: capture the normal selector's value for
+        // this visible pass, including NotYet while a Failed key is retained.
+        state.current_material = selected_key;
         let failed_before = match &state.source {
             crate::depth_parallax::DepthSourcePhase::Failed { key, .. } => Some(*key),
             _ => None,
@@ -1364,9 +1554,14 @@ impl App {
             .as_ref()
             .is_none_or(|slot| slot.target != target || slot.key != key)
         {
-            let started = std::time::Instant::now();
             state.start_next(&render.device, &render.queue, &backing, target, key);
-            crate::depth_parallax::record_next_event("start", target, key, input_seq, started);
+            crate::depth_parallax::record_next_event(
+                "start",
+                target,
+                key,
+                input_seq,
+                state.next.as_ref().unwrap().started_at,
+            );
         }
         state.advance_next(
             &render.device,

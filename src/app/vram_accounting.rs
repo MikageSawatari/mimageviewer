@@ -5,6 +5,35 @@ use crate::vram_budget::{
 
 const VRAM_ACCOUNTING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+// Inject the detected hardware capacity, not an admission verdict. This allows
+// windowless tests to drive the real classifier and allocation gate with byte-
+// sized fixtures while retaining the same settings percentage and budget math.
+#[cfg(test)]
+thread_local! {
+    static DETECTED_VRAM_FOR_TEST: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) struct DetectedVramForTest(Option<u64>);
+
+#[cfg(test)]
+impl DetectedVramForTest {
+    pub(super) fn new(bytes: u64) -> Self {
+        Self(DETECTED_VRAM_FOR_TEST.replace(Some(bytes)))
+    }
+
+    pub(super) fn set(&self, bytes: u64) {
+        DETECTED_VRAM_FOR_TEST.set(Some(bytes));
+    }
+}
+
+#[cfg(test)]
+impl Drop for DetectedVramForTest {
+    fn drop(&mut self) {
+        DETECTED_VRAM_FOR_TEST.set(self.0);
+    }
+}
+
 fn add_fs_cache_entry(
     accountant: &mut VramAccountant,
     subsystem: VramSubsystem,
@@ -484,6 +513,14 @@ impl App {
     }
 
     pub(crate) fn vram_pool_budget(&self) -> VramPoolBudget {
+        #[cfg(test)]
+        if let Some(bytes) = DETECTED_VRAM_FOR_TEST.get() {
+            return VramPoolBudget::from_detected_vram(
+                self.settings.gpu_memory_percent,
+                self.vram_budget_mode(),
+                Some(bytes),
+            );
+        }
         VramPoolBudget::from_percent(self.settings.gpu_memory_percent, self.vram_budget_mode())
     }
 

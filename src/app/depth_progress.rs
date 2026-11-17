@@ -27,12 +27,17 @@ impl App {
         if role == DepthPageRole::Current && self.depth_current_settled() {
             return Ready;
         }
-        let material = self.resident_final_prepare_material(ctx, idx);
-        let key = material
-            .as_ref()
-            .map(|material| crate::depth_estimation::DepthSourceKey {
-                texture_id: material.source_texture().id(),
-            });
+        // Current must use the owning display selector's observation, including
+        // stable RAW previews which are outside pre-display final preparation.
+        // NotYet is None and falls through to the actual material producers.
+        let key = match role {
+            DepthPageRole::Current => state.current_material,
+            DepthPageRole::Next => self
+                .resident_final_prepare_material(ctx, idx)
+                .map(|material| crate::depth_estimation::DepthSourceKey {
+                    texture_id: material.source_texture().id(),
+                }),
+        };
         if let Some(key) = key {
             if role == DepthPageRole::Next && state.lru.contains(key) {
                 return Ready;
@@ -218,7 +223,7 @@ mod tests {
     use crate::depth_parallax::{DepthNextSlot, DepthNextTarget, DepthViewState};
     use DepthPageProgress::{Producing, Unavailable};
 
-    fn fixture(ctx: &egui::Context) -> AppTestEnvForTest {
+    pub(super) fn fixture(ctx: &egui::Context) -> AppTestEnvForTest {
         let mut app = setup_app_for_test();
         app.items = vec![
             GridItem::Image("progress-current.jpg".into()),
@@ -321,6 +326,7 @@ mod tests {
             target,
             key,
             phase: DepthNextPhase::Estimating { pending },
+            started_at: std::time::Instant::now(),
         });
         assert_eq!(next(&app, &ctx), Producing);
         cancel.store(true, Ordering::Release);
@@ -652,6 +658,7 @@ mod tests {
         let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
             unreachable!()
         };
+        state.current_material = Some(key);
         state.source = DepthSourcePhase::Estimating { key, pending };
         assert_eq!(
             app.depth_page_progress(&ctx, 0, DepthPageRole::Current),
@@ -664,12 +671,178 @@ mod tests {
         );
         cancel.store(false, Ordering::Release);
         app.adjustment_page_params.entry(0).or_default().brightness = 15.0;
+        // The owning selector reports NotYet while producing the adjusted input.
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        state.current_material = None;
         assert_eq!(
             app.depth_page_progress(&ctx, 0, DepthPageRole::Current),
             Unavailable,
             "old texture is not the new adjusted input"
         );
         drop(complete);
+    }
+
+    pub(super) fn install_current_raw_preview(
+        app: &mut App,
+        ctx: &egui::Context,
+    ) -> crate::depth_estimation::DepthSourceKey {
+        use super::super::raw_page_store::{
+            RawDevelopPhase, RawInstalledStage, RawPageRecord, RawPageState, RawPresentation,
+            RawPreviewPhase, RawSourceIdentity,
+        };
+        app.items[0] = GridItem::Image("progress-current.dng".into());
+        let pixels = Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::WHITE));
+        let tex = ctx.load_texture(
+            "current-raw-stable-preview",
+            pixels.clone(),
+            DISPLAY_IMAGE_TEXTURE_OPTIONS,
+        );
+        app.bind_display_texture_identity(&tex, app.item_id(0));
+        let key = crate::depth_estimation::DepthSourceKey {
+            texture_id: tex.id(),
+        };
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::RawPreview {
+                preview: Some(crate::fs_animation::RawPreviewTexture { tex, pixels }),
+                developed_dims: [40, 40],
+                load_seq: 1,
+            },
+        );
+        app.raw_pages.pages.insert(
+            0,
+            RawPageRecord::Page(RawPageState {
+                source: RawSourceIdentity {
+                    item_key: app.page_path_key(0).unwrap(),
+                    path: "progress-current.dng".into(),
+                    size: 1,
+                    mtime_ticks: 1,
+                },
+                developed_dims: Some([40, 40]),
+                stage: RawInstalledStage::PreviewShown,
+                preview: RawPreviewPhase::Done,
+                develop: Arc::new(Mutex::new(RawDevelopPhase::Idle)),
+                preview_started_at: std::time::Instant::now(),
+                develop_started_at: std::time::Instant::now(),
+                presented: RawPresentation::Nothing,
+            }),
+        );
+        key
+    }
+
+    #[test]
+    fn stable_raw_current_estimation_uses_selected_material_instead_of_next_resident_rules() {
+        let ctx = egui::Context::default();
+        let mut app = fixture(&ctx);
+        let key = install_current_raw_preview(&mut app, &ctx);
+        assert!(app.resident_final_prepare_material(&ctx, 0).is_none());
+        let (pending, complete) = crate::depth_estimation::DepthPending::deferred_for_test(
+            app.edit_request_owner_context(),
+            811,
+            key,
+        );
+        let cancel = pending.cancellation_token_for_test();
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        state.current_material = Some(key);
+        state.source = DepthSourcePhase::Estimating { key, pending };
+        assert_eq!(
+            app.depth_page_progress(&ctx, 0, DepthPageRole::Current),
+            Producing
+        );
+        assert_eq!(
+            app.depth_page_progress(&ctx, 0, DepthPageRole::Next),
+            Unavailable,
+            "RAW preview must not widen Next preparation"
+        );
+        cancel.store(true, Ordering::Release);
+        assert_eq!(
+            app.depth_page_progress(&ctx, 0, DepthPageRole::Current),
+            Unavailable
+        );
+        cancel.store(false, Ordering::Release);
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        state.current_material = Some(crate::depth_estimation::DepthSourceKey {
+            texture_id: egui::TextureId::Managed(u64::MAX),
+        });
+        assert_eq!(
+            app.depth_page_progress(&ctx, 0, DepthPageRole::Current),
+            Unavailable,
+            "a replacement preview must not inherit the old request"
+        );
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        state.current_material = None;
+        assert_eq!(
+            app.depth_page_progress(&ctx, 0, DepthPageRole::Current),
+            Unavailable
+        );
+        drop(complete);
+    }
+
+    #[test]
+    fn submitted_raw_development_has_a_read_only_atomic_cancellation_terminal() {
+        use super::super::raw_page_store::RawDevelopPhase;
+        let ctx = egui::Context::default();
+        let mut app = fixture(&ctx);
+        install_current_raw_preview(&mut app, &ctx);
+        let phase = app.raw_pages.page(0).unwrap().develop.clone();
+        let executor = crate::raw::RawDevelopExecutor::new(1).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (ticket, result) = executor.block_one_slot_with_result_for_test(started_tx, release_rx);
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let ticket = Arc::new(ticket);
+        *phase.lock().unwrap() = RawDevelopPhase::Submitted {
+            request_id: 912,
+            ticket: ticket.clone(),
+            brightness: app.settings.raw_brightness,
+        };
+        let producing = app.depth_page_progress(&ctx, 0, DepthPageRole::Current);
+        ticket.cancel();
+        let cancelled = app.depth_page_progress(&ctx, 0, DepthPageRole::Current);
+        release_tx.send(()).unwrap();
+        let _terminal = result
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        *phase.lock().unwrap() = RawDevelopPhase::Done;
+        assert_eq!(producing, Producing);
+        assert_eq!(cancelled, Unavailable);
+        assert_eq!(
+            app.depth_page_progress(&ctx, 0, DepthPageRole::Current),
+            Unavailable
+        );
+    }
+
+    fn install_failed_current_notyet(app: &mut App, idx: usize) {
+        use crate::depth_parallax::{DepthSettled, DepthSettledOutcome};
+        let edit_key = app.current_edit_result_key(idx);
+        let key = crate::depth_estimation::DepthSourceKey {
+            texture_id: egui::TextureId::Managed(u64::MAX - 1),
+        };
+        app.fullscreen_idx = Some(idx);
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        state.current_material = None;
+        state.source = DepthSourcePhase::Failed {
+            key,
+            reason: "previous material failed".into(),
+        };
+        state.settled = Some(DepthSettled {
+            fs_idx: idx,
+            edit_key,
+            key,
+            outcome: DepthSettledOutcome::Failed,
+        });
     }
 
     #[test]
@@ -702,6 +875,13 @@ mod tests {
                     rx,
                     ready: None,
                 },
+            );
+            install_failed_current_notyet(&mut app, 1);
+            assert!(!app.depth_current_settled());
+            assert_eq!(
+                app.depth_page_progress(&ctx, 1, DepthPageRole::Current),
+                Producing,
+                "old Failed fact cannot hide a current materializer"
             );
             assert_eq!(next(&app, &ctx), Producing);
             cancel.store(true, Ordering::Relaxed);
@@ -804,6 +984,13 @@ mod tests {
         );
         let (tx, rx) = mpsc::channel();
         app.final_ai_rx = Some(rx);
+        install_failed_current_notyet(&mut app, 1);
+        assert!(!app.depth_current_settled());
+        assert_eq!(
+            app.depth_page_progress(&ctx, 1, DepthPageRole::Current),
+            Producing,
+            "old Failed fact cannot hide current AI work"
+        );
         assert_eq!(next(&app, &ctx), Producing);
         cancel.store(true, Ordering::Relaxed);
         assert_eq!(next(&app, &ctx), Unavailable);
@@ -840,7 +1027,8 @@ mod tests {
 
     #[test]
     fn edited_registration_tracks_shared_and_already_registered_handles() {
-        use super::super::final_prepare_budget::FinalPrepareAdoption;
+        use super::super::final_prepare_budget::{FinalPrepareAdoption, FinalPrepareGpuAdmission};
+        use super::super::vram_accounting::DetectedVramForTest;
         use crate::app::final_prepare::tests::{begin_registration_frame, wait_ready};
         use crate::ui_fullscreen::FinalUnitPosition;
         for shared in [false, true] {
@@ -875,6 +1063,9 @@ mod tests {
                 Default::default(),
             );
             app.comic_font_registry_loaded = true;
+            // D3 derives from the installed visible topology. The preparation
+            // query itself must not build that owner from an unshown fixture.
+            let _ = app.page_turn_prefetch_targets(0, 2, 2);
             app.prepare_final_demand_topologies();
             let unit = app
                 .d3_final_prepare_unit_at(0, FinalUnitPosition::Next)
@@ -889,6 +1080,31 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(allocations.len(), if shared { 1 } else { 2 });
+            let allocation_bytes = |(size, options): &([usize; 2], egui::TextureOptions)| {
+                crate::vram_budget::rgba8_texels_to_bytes(crate::vram_budget::texture_size_texels(
+                    *size,
+                    options.mipmap_mode.is_some(),
+                ))
+            };
+            let resident = app.vram_accounting_snapshot().total_bytes();
+            let all_bytes: u64 = allocations.iter().map(allocation_bytes).sum();
+            let first_bytes = allocation_bytes(&allocations[0]);
+            app.settings.gpu_memory_percent = 100;
+            let detected = DetectedVramForTest::new(resident + first_bytes - 1);
+            assert_eq!(
+                next(&app, &ctx),
+                Unavailable,
+                "CpuReady must not wait for a rejected allocation"
+            );
+            begin_registration_frame(&mut app, 7);
+            assert!(
+                matches!(
+                    app.admit_final_prepare_registration(allocations[0].0, allocations[0].1),
+                    FinalPrepareGpuAdmission::OverBudget
+                ),
+                "real admission rejects the same first allocation"
+            );
+            detected.set(resident + all_bytes);
             assert_eq!(
                 next(&app, &ctx),
                 Producing,
@@ -899,6 +1115,25 @@ mod tests {
                 app.final_effect_pending[&key].state,
                 FinalEffectState::Registering(_)
             ));
+            if !shared {
+                // The first fits, but the full result does not. The classifier
+                // must reject the whole remaining allocation set before a
+                // private first texture could leave the second parked forever.
+                detected.set(resident + all_bytes - 1);
+                assert_eq!(next(&app, &ctx), Unavailable);
+            } else {
+                detected.set(resident + first_bytes - 1);
+                assert_eq!(
+                    next(&app, &ctx),
+                    Unavailable,
+                    "shared final handle does not bypass the annotation budget"
+                );
+                assert!(matches!(
+                    app.admit_final_prepare_registration(allocations[0].0, allocations[0].1),
+                    FinalPrepareGpuAdmission::OverBudget
+                ));
+                detected.set(resident + all_bytes);
+            }
             begin_registration_frame(&mut app, 9);
             app.adopt_prepared_edit(
                 &ctx,
@@ -919,6 +1154,19 @@ mod tests {
                     1,
                     "first private handle is resident and must not be charged again"
                 );
+                assert_eq!(
+                    next(&app, &ctx),
+                    Unavailable,
+                    "Registering remains terminal while the second texture is over budget"
+                );
+                assert!(
+                    matches!(
+                        app.admit_final_prepare_registration(remaining[0].0, remaining[0].1),
+                        FinalPrepareGpuAdmission::OverBudget
+                    ),
+                    "the real second admission agrees with Registering classification"
+                );
+                detected.set(resident + all_bytes);
                 assert_eq!(next(&app, &ctx), Producing);
                 begin_registration_frame(&mut app, 10);
                 app.adopt_prepared_edit(
@@ -936,5 +1184,53 @@ mod tests {
                 "completed registration is no longer a producer"
             );
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod gpu_tests {
+    use super::*;
+
+    #[test]
+    fn stable_raw_current_readback_uses_owning_material_observation() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        super::super::depth_view_tests::install_pages(&mut app, &ctx);
+        let key = super::tests::install_current_raw_preview(&mut app, &ctx);
+        let render = app.wgpu_render_state.clone().unwrap();
+        super::super::depth_view::gpu_tests::deliver_textures(&ctx, &render);
+        let texture = render
+            .renderer
+            .read()
+            .texture(&key.texture_id)
+            .unwrap()
+            .texture
+            .clone()
+            .unwrap();
+        let mut state =
+            crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context());
+        state
+            .select_source(&render.device, &render.queue, &texture, key)
+            .unwrap();
+        assert!(matches!(state.source, DepthSourcePhase::ReadingBack { .. }));
+        state.current_material = Some(key);
+        app.fs_exclusive_view = FsExclusiveView::Depth(state);
+        assert!(app.resident_final_prepare_material(&ctx, 0).is_none());
+        assert_eq!(
+            app.depth_page_progress(&ctx, 0, DepthPageRole::Current),
+            DepthPageProgress::Producing
+        );
+        assert_eq!(
+            app.depth_page_progress(&ctx, 0, DepthPageRole::Next),
+            DepthPageProgress::Unavailable
+        );
+        let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+            unreachable!()
+        };
+        state.current_material = None;
+        assert_eq!(
+            app.depth_page_progress(&ctx, 0, DepthPageRole::Current),
+            DepthPageProgress::Unavailable
+        );
     }
 }

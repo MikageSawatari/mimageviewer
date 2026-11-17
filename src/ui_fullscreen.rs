@@ -12285,23 +12285,9 @@ impl App {
     }
 
     pub(crate) fn colorize_display_requires_final_effect(&self, idx: usize) -> bool {
-        if self.post_filter_bypassed || self.fs_entry_is_animated(idx) {
-            return false;
-        }
-        self.colorize_display_requires_final_effect_with_raw_blocked(
-            idx,
-            self.raw_development_blocked(idx),
-        )
-    }
-
-    pub(crate) fn colorize_display_requires_final_effect_with_raw_blocked(
-        &self,
-        idx: usize,
-        raw_blocked: bool,
-    ) -> bool {
         if self.post_filter_bypassed
             || self.fs_entry_is_animated(idx)
-            || raw_blocked
+            || self.raw_development_blocked(idx)
             || !matches!(
                 self.items.get(idx),
                 Some(GridItem::Image(_))
@@ -21064,7 +21050,7 @@ impl App {
         anchor_idx: usize,
     ) -> SpreadDisplayComposition {
         if !self.spread_mode.is_spread() {
-            if self.page_turn_prefetch_policy_enabled()
+            if self.next_unit_final_prepare_enabled()
                 && is_spread_pairable_item(self.items.get(anchor_idx))
             {
                 let nav = self.get_nav_indices();

@@ -306,6 +306,8 @@ pub(crate) struct DepthNextSlot {
     pub target: DepthNextTarget,
     pub key: DepthSourceKey,
     pub phase: DepthNextPhase,
+    /// Perf only; never participates in readiness, cancellation or admission.
+    pub started_at: Instant,
 }
 
 pub(crate) enum DepthNextPhase {
@@ -348,6 +350,7 @@ pub(crate) struct DepthViewState {
     pub lru: DepthLru,
     pub next: Option<DepthNextSlot>,
     pub settled: Option<DepthSettled>,
+    pub current_material: Option<DepthSourceKey>,
     pub wait_reason: DepthSourceWait,
     gpu: Option<Arc<DepthGpu>>,
     color: Option<Arc<DepthColor>>,
@@ -372,6 +375,7 @@ impl DepthViewState {
             lru: DepthLru::default(),
             next: None,
             settled: None,
+            current_material: None,
             wait_reason: DepthSourceWait::TexturePending,
             gpu: None,
             color: None,
@@ -571,6 +575,7 @@ impl DepthViewState {
         target: DepthNextTarget,
         key: DepthSourceKey,
     ) {
+        let started_at = Instant::now();
         let gpu = self
             .gpu
             .get_or_insert_with(|| Arc::new(DepthGpu::new(device)));
@@ -583,7 +588,12 @@ impl DepthViewState {
                 DepthNextPhase::Failed { reason }
             }
         };
-        self.next = Some(DepthNextSlot { target, key, phase });
+        self.next = Some(DepthNextSlot {
+            target,
+            key,
+            phase,
+            started_at,
+        });
     }
 
     /// Shares the current source's per-frame upload allowance. No request is
@@ -597,10 +607,10 @@ impl DepthViewState {
         input_seq: u64,
         submit: impl FnOnce(DepthSourceKey, Vec<u8>, DepthGuide) -> Result<DepthPending, String>,
     ) {
-        let started = Instant::now();
         let Some(slot) = self.next.as_mut() else {
             return;
         };
+        let started = slot.started_at;
         let completion = match &mut slot.phase {
             DepthNextPhase::ReadingBack { readback } => {
                 let _ = device.poll(wgpu::PollType::Poll);

@@ -2139,7 +2139,6 @@ fn depth_ring_dispatch_preserves_transforms_and_conflicting_modes() {
         app.fs_zoom_mode_engaged(),
     );
     for action in [
-        RingActionId::ImageSlideshow,
         RingActionId::ImageZoomMode,
         RingActionId::ImagePixelGrid,
         RingActionId::ImageComparePin,
@@ -2160,6 +2159,21 @@ fn depth_ring_dispatch_preserves_transforms_and_conflicting_modes() {
             modes_before
         );
         assert_eq!(app.compare_view_mode, CompareViewMode::Off);
+        assert_eq!((app.fs_zoom, app.fs_pan), (2.5, egui::vec2(11.0, 13.0)));
+        assert!(app.fs_exclusive_view.is_depth());
+    }
+    // Slideshow is now compatible with Depth; the other conflicting modes
+    // above retain their existing suppression and every transform is preserved.
+    for playing in [true, false] {
+        app.apply_ring_action(
+            &ctx,
+            RingShortcutContext::ImageFullscreen,
+            RingActionId::ImageSlideshow,
+            "depth_ring_test",
+        );
+        assert_eq!(app.slideshow_playing, playing);
+        assert_eq!(app.fs_pixel_grid_enabled, modes_before.1);
+        assert_eq!(app.fs_zoom_mode_engaged(), modes_before.2);
         assert_eq!((app.fs_zoom, app.fs_pan), (2.5, egui::vec2(11.0, 13.0)));
         assert!(app.fs_exclusive_view.is_depth());
     }

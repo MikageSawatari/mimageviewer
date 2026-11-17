@@ -1,6 +1,6 @@
 # 3D 写真のままスライドショー (次のページの奥行きの先読み) — 設計書 (§1.771)
 
-状態: **設計第 8 版 (2026-11-18)。独立設計レビュー ACCEPT (第 5 回で全体、第 8 回で利用者の決定を反映した差分)。利用者の決定は §10。実装中**。
+状態: **設計第 8 版 (2026-11-18)。独立設計レビュー ACCEPT (第 5 回で全体、第 8 回で利用者の決定を反映した差分)。利用者の決定は §10。実装・焦点 / 指定回帰の検証完了。実装レビュー・全件・検証用 build は設計担当へ引継ぎ**。
 worktree `G:\home\mimageviewer-771`、ブランチ `feat-771-depth-slideshow` (master `96ed160a0` から)。
 3D 写真の全体設計は [depth-parallax-plan.md](depth-parallax-plan.md) が正本。本書はその §1「v1 に含めない: 先読み」、
 §6.3「ON にするときの後始末: スライドショー停止」、§6.5 と §10 段 B の全箇所分類表 (topbar・リング・S キーの抑止) を
@@ -759,3 +759,160 @@ perfの `next_prefetch.elapsed_ms` は現状pollのCPU時間で、readback / 推
 未実行の設計§8焦点 / 指定既存回帰を成功扱いにしない。今回の調査用テストも実行での再現確認は未完。
 機能実装の追加を停止した。`cargo fmt` も指定runnerで共有全件ロック待ちとなり未開始だったため、
 引継ぎ後に差分が自動変更されないよう自分の待機runnerを中断 (外側exit 1)。今回の整形は未実施で、再開後の最終整形に残す。
+
+### `e7248c54d` 後の実装記録 (2026-11-18)
+
+以下を今回の到達点とする。上の途中記録は各時点の履歴であり、現在の未修正事項や検証結果を表すものではない。
+実装の独立レビュー・本体 lib 全件・`build-dev.ps1` は設計担当の担当。今回の実装側では行わず、ACCEPT とも記録しない。
+
+#### 設計担当の追加判断の反映
+
+- `DepthViewState.current_material: Option<DepthSourceKey>` を追加。製品コードでの代入は
+  `advance_depth_source` だけで、見えている描画パスの通常 selector が Ready ならその key、NotYet なら None を書く。
+  `depth_current_settled` は従来の context・位置・EditResultKey・source の一致に加え、この素材との一致も要求する。
+  旧 Failed 事実は保存し、素材が旧 key に戻れば再び有効になる。同じ失敗の再試行はしない。
+- `depth_page_progress` の Current の段 1・2・4 は現在素材の観測を使う。
+  `resident_final_prepare_material` は Next だけが使う。安定 RAW preview の Current の読み戻し・推論は Producing になり、
+  表示前の RAW 先読み対象は広げない。調査用 Failed テストはこの動作の回帰試験に置き換えた。
+- 実 worker の CpuReady / Registering に小予算を与え、分類と実登録受付の一致を試験する。
+  テスト専用 RAII は検出 VRAM 容量だけを注入し、予算計算・admission の判定は製品と同じ関数を通す。
+- Next 枠の `started_at` は perf 専用。枠の作成前から LRU 投入までの累積所要時間を
+  `next_prefetch.elapsed_ms` に記録する。期限・受付・状態の判断には使わない。
+  RAW 調査用に一時切り出した passthrough / colorize helper は不要になったため元の関数内へ戻した。
+
+#### 変更ファイル (本課題全体)
+
+| ファイル | 要点 |
+| --- | --- |
+| `src/depth_parallax.rs` / `src/depth_estimation.rs` | context 所有 Next 枠・settled 事実・現在素材、途中仕事の引継ぎと取消、共有 upload 枠、LRU と readback 会計、perf、試験用結果注入 |
+| `src/app/depth_view.rs` | 入口・事実照合・D3 の有効条件 / 提示条件、Current 後の Next 進行、送り前 gate、GPU 回帰試験 |
+| `src/app/depth_progress.rs` (新規) | Current / Next の read-only 分類と各 producer の終端試験、実 CpuReady / Registering の予算一致試験、RAW Current 試験 |
+| `src/app/final_prepare.rs` | D3 Next の需要・ユニット・保持を共通有効条件へ。Previous / Current は従来どおり |
+| `src/app/final_prepare_budget.rs` / `src/app/prepared_edit.rs` | 実登録と同じ純粋な VRAM 判定、残りの未共有・未登録 allocation の列挙 |
+| `src/app/raw_page_store.rs` / `src/raw/executor.rs` | 実 RAW develop 要求・世代・取消の非ブロッキング読取 |
+| `src/app/vram_accounting.rs` | 実登録の小予算試験に検出 VRAM 容量を注入する test 限定 RAII |
+| `src/ui_fullscreen.rs` / `src/app/gamepad_input.rs` | S・再生ボタン・リング、共通送り先、gate、SlideshowTimerPass、所有描画 closure 内の可視性捕捉、停止時取消 |
+| `src/app.rs` | 分類 module、Panorama のみ入場時停止、次フォルダ結果適用時の終了通知と handler 試験、完成 D3 素材の表示採用条件 |
+| `src/ui_fullscreen/depth_slideshow_tests.rs` (新規) | 操作・HUD・送り先・無期限待ち・終端・停止・アニメーション着地・main child / detached の休止復帰試験 |
+| `src/app/depth_view_tests.rs` | 既存リング試験の ImageSlideshow だけを新しい共存仕様へ更新。他の競合モード抑止・変形保持の assertion は維持 |
+| `src/ui_fullscreen/page_turn/merge_master_tests.rs` / `slideshow_regression_tests.rs` | 既存呼出し 2 か所の TimerPass 引数追従 |
+| `docs/depth-parallax-plan.md` / `display-pipeline.md` / `async-architecture.md` / `page-turn-animation-plan.md` | §9 の範囲・所有者・D3 条件・入力分類を更新 |
+| `docs/architecture-overview.md` / `spec.md` / `keymap-spec.md` / `detached-rework-plan.md` | 状態所有・製品動作・既存 S 操作の条件と承認済み TimerPass 範囲の記録 |
+| `htdocs/mimageviewer/manual/fullscreen.html` / `htdocs/mimageviewer/index.html` | 3D スライドショー、待ち、休止、終了条件、先読みの制限を記載 |
+| 本書 | 設計判断・実装・前提確認・検証の記録 |
+
+#### D3 の紙めくり設定参照 (最終実装)
+
+| 経路 / 関数 | 置換 / 維持 | 理由 |
+| --- | --- | --- |
+| 単ページの可視ユニット生成: `spread_display_composition_for_anchor` | `page_turn_prefetch_policy_enabled` 呼出しを `next_unit_final_prepare_enabled` へ置換 | 紙めくり OFF でも通常描画の所有者が D3 の可視 baseline を作る必要がある。pure な需要派生や採用側で可視証拠を作らない。元画像 / AI の先読み範囲を決める呼出しではない |
+| 需要: `prepare_final_demand_topologies` | `next_unit_final_prepare_enabled` へ置換 | 紙めくり OFF の Depth slideshow Next にも同じ需要を作る。既存 fullscreen_idx guard は維持 |
+| 需要観測: `observe_next_final_unit_demand` | 同述語へ置換 | 実需要と perf 観測を一致させる |
+| ユニット: `d3_final_prepare_unit_at` | Next は同述語へ置換 | Previous / Current は別途紙めくり ON を要求。既存 post_filter_bypassed 条件を維持 |
+| 保持 / 取消: `speculative_final_unit_is_needed` | 同述語へ置換 | 需要・保持の有効条件を一致させ、着地済みユニットも既存手順で保持 |
+| 採用: `adopt_final_prepare_results` / `adopt_prepared_edit` | 直接の設定参照なし。上の保持述語を共有 | 採用だけ別の有効条件を増やさない |
+| 表示採用: `fs_display_page_load_state` | `page_turn_prefetch_policy_enabled` 呼出しを `next_unit_final_prepare_enabled` へ置換 | D3 の GPU 完成品がある場合は、元画像の CPU cache 退去後もその完成品を表示できる。対象一覧 / 先読み数 / keep 範囲の計算は変えず、既存の完成品を採用する条件を D3 の有効条件へ合わせる |
+| 開始: `prefetch_next_final_unit` | `next_unit_current_presented` へ置換 | Depth slideshow 中は照合済み Presented だけ。古い Flat を OR で併用しない |
+| 開始: `prefetch_previous_final_unit` | 従来の紙めくり提示条件を維持 | Previous の開始範囲は広げない |
+| 予算: `defer_legacy_final_prefetch_registration` | 設定参照を維持 | legacy 登録延期という紙めくり固有の方針。D3 Speculative は既存の GPU 予算・共通登録枠を使用 |
+| source / AI: `page_turn_prefetch_policy_enabled` と先読み範囲 / 保持の caller | 設定参照を維持 | 元画像・AI の先読み範囲は変更しない (§5.6)。上の可視ユニット生成の caller は D3 の用途なので区別する |
+| `previous_final_prepare_occurrences` の同 policy 呼出し | 維持 | Previous は従来どおり紙めくり ON の範囲に限る |
+| 見開き端配置、紙めくり受付 / 操作 / 演出、設定初期化 | 設定参照を維持 | D3 Next の有効条件ではなく紙めくり本体の動作 |
+
+#### 前提の確認結果
+
+1. 3D の描画は LegacyRendered となり新たな紙めくり受理証拠を作らないが、入場前の Flat は真のまま残り得る。
+   設計担当が明確化したとおり寿命は変えず、Depth slideshow の開始条件は照合済み Presented だけを読む。
+   回帰試験は古い Flat が真でも Ready / Failed では Next を開始できず、深度 callback 後にだけ許可されることを確かめる。
+2. 設定参照の需要・決定・保持・採用・取消・予算の全経路は上表のとおり。非 3D と Previous / Current の条件を保持した。
+3. 各 Producing の読取と終端は次表。分類は要求発行・再試行・診断記録更新をしない。
+4. 実 GPU 試験で、補正なしは fs_cache 共有、補正ありは紙めくり OFF の D3 worker → CpuReady → 実登録 →
+   Next readback → 深度結果 → LRU → slideshow 着地 → 実 selector → 最初の深度 callback を検査する。
+   key が一致し、その着地描画で再 readback / submit を出さないことを検査する。
+   補正ありは元画像 cache が resident の場合と退去済みの場合の両方で、完成品を採用し元画像の再読込みも発行しないことを確認する。
+
+| 段 | 読み取る実所有者 / 関数 | 終端の扱いと試験 |
+| --- | --- | --- |
+| 2 | Current の current_material / source、Next の現素材 / target / key / phase、DepthPending cancel token | map 成功 / 失敗、推論結果 / 失敗 / 取消。取消済みは Producing にしない。世代・素材置換、引継ぎも試験 |
+| 4 | managed texture の tex_manager meta と renderer backing | フレーム末の texture delivery 後はこの段から外れる。user texture の backing 不在は数えない |
+| 5 | fs_pending の現世代 ticket と cancel、fs_upload_backlog、depth_raw_development_pending の実要求 | 読込結果 / 失敗 / 取消、RAW 結果 / 取消。PreviewAbsent の表示上の LoadPending だけでは待たない |
+| 6 | final_prepare_pending_is_current と final_effect_pending::Computing | worker 完了 / 切断 / 取消・世代変更で外れる |
+| 6b | comic_bake_pending の下地 / 世代 / cancel、current_edit_stage_producer_pending、commit_pending_matches_current_erase_key | 注釈・局所補正・隠蔽・消しゴムの完了 / 失敗 / 取消 / 切断で外れる。旧 Failed + NotYet でも現在の producer を待つ |
+| 7 / 8 | prepared_edit_remaining_allocations、speculative_vram_allocations_admitted | 実 GPU admission と同じ純粋判定。共有 handle・既登録 handle を除外。全残量が入ると Producing、入らなければ Unavailable。実 CpuReady / Registering の過不足両側を試験 |
+| 9 | 現素材 / params からの final AI key と final_ai_pending cancel | 結果 / 失敗 / 取消で既存 poll が項目を除去する。未発行は Unavailable |
+
+`SlideshowTimerPass` 以外の viewport 経路や detached の述語は変更していない。
+main の通常全画面 child と detached の両方で、実描画 closure に渡す所有 viewport の hidden / minimized を試験し、
+root が minimized でも visible child が進むこと、InputOnly が Depth の期限を評価しないこと、復帰時に間隔を数え直すことを検査する。
+実描画 fixture で透過背景の白 / 市松による先読み抑止と既定復帰、実書き出し操作の admission / cancel を通す抑止と再開、
+実手動ナビゲーションの NavigationSequence / PageTransition を通す推論要求の引継ぎも試験する。
+製品 exe / 実窓 / 実モデルは起動しない。
+
+#### 最終検証
+
+Cargo はすべて指定 `run-heavy.ps1 -Owner "771-codex" -WorkDir G:\home\mimageviewer-771` と
+`MSBUILDDISABLENODEREUSE=1` を使用した。今回の共有全件ロック待ちは中断せず待機した。
+完了した最終結果は末尾の表のとおり。以下の失敗履歴を成功扱いにはしない。
+
+焦点初回 (`test(/depth_progress::|depth_slideshow|depth_next_/)`) は共有全件ロックの解放を待ち、
+03:18:21 に開始、03:24:37 に exit 100。コンパイルは成功し、37 件実行・26 成功・11 失敗 (7 abort を含む)。
+7 件は初回 UI pass 完了前の空 font atlas placeholder を test helper が GPU へ登録し、validation panic と
+未処理 delta の Drop panic が重なったもの。画像の非ゼロ delta はすべて登録し、空の Managed(0) だけを識別して除外する
+test helper に修正した。残る失敗は可視 topology を未構築の D3 / 予算 fixture、sidecar / 本の構成等による
+遅延再表示を未 service の NextFolder fixture、Panorama canvas の前提まで混ぜた HUD fixture を修正した。
+NextFolder の scan 自体は pre_scan で採用済みだった (当初の scan 待ちという説明を訂正)。製品コードの回避策は入れていない。
+初回ログは `target/771-logs/focus-final.{out,err}.log`、JUnit は `target/771-logs/focus-first.junit.xml`。
+
+焦点の第 2〜4 回はいずれも 37 件実行・36 成功・1 失敗、exit 100。残った着地試験を追い、
+汎用 Depth fixture が通常 loader と異なる sampler / 所有識別の texture を使っている点を直した後、
+単ページの可視 baseline 生成が紙めくりの source policy に依存する間接参照の取りこぼしを確認した。
+`spread_display_composition_for_anchor` の該当 caller を D3 の共通有効条件へ接続し、
+可視証拠の構築は従来の通常描画の所有者に置いた。`prepare_final_demand_topologies` の pure な派生・
+採用 / mount 側で可視証拠を作る変更はしていない。
+同じ間接参照の棚卸しで `fs_display_page_load_state` の GPU 完成品の表示採用も接続した。
+元画像 / AI の対象範囲・保持数を決める policy と Previous の条件は従来どおり。
+単ページの既存 unit builder は回転 DB / landscape metadata の I/O を行わない分岐を使う。
+
+焦点第 5 回は 04:30:39 開始、**37 件全成功・exit 0** (実行 22.582 秒)。
+同じ試験名の中で、補正なし / 紙めくり OFF の補正あり / その元画像 cache 退去後の 3 ケースを通した。
+実素材・D3 worker・登録・読み戻し・LRU・着地 selector・最初の深度 callback まで成功し、key の同一性を確認した。
+本課題の焦点 37 件は旧調査試験の置換を含む。GPU を生成する試験はすべて `gpu_tests` に置き、既存 test-group gpu の所属で実行した。
+ログは `target/771-logs/focus-fifth.{out,err}.log`、JUnit は `target/771-logs/focus-passed.junit.xml`。
+設計からの逸脱はない。上の間接参照 2 か所は §5.6 の需要生成 / 表示採用の実装漏れの修正である。
+
+#### §8 の試験との対応
+
+| §8 | 試験 / 検証箇所 |
+| --- | --- |
+| 1・2 | conflict cleanup、S / ring、実 HUD click。Panorama の S / topbar 抑止と ring の既存受付、3D の overflow 非表示 |
+| 3・14 | retained Flat の排他条件、Current の NotYet / 入力世代 / texture 変更 × Next ReadingBack / Estimating、旧 Failed の再照合 |
+| 4 | `depth_slideshow_prefetched_source_and_d3_off_final_paint_on_first_landing` の 3 ケース。通常の可視構成の生成から D3 worker / 登録を通す |
+| 5 | depth_progress の 16 件、期限切れ handler の無期限待ちと取消 / 失敗、Unavailable Current / Next の送り。実小予算 CpuReady / Registering の受付一致を含む |
+| 6 | 実手動 handler の NavigationSequence / PageTransition と同じ request ID / 未取消 token の引継ぎ、wrong target / generation / key / cancel の拒否 |
+| 7 | アニメーションへの実着地 / 通常描画、終了通知 1 回、2D 継続 |
+| 8・11 | 実描画で白 / 市松の背景除外と復帰、実 export admission / cancel による先読み抑止と再開 |
+| 9 | stop の Next token 取消、3D 退役時の request 取消と readback 解放。既存の context 終了・フォルダ移動・兄弟 context 所有試験も指定回帰で再検証 |
+| 10・15 | 事実 / Unavailable による起算、InputOnly の抑止、実 main child / detached の hidden / minimized / 復帰、minimized ROOT と visible child の区別 |
+| 12 | Single / Spread singleton の動画を挟む送り先と D3 の一致、末尾 / collection / split の Other |
+| 13・17 | 指定既存回帰 1,671 件全成功。非 3D、紙めくり ON / OFF、360°、D3、書き出し、ring 等を含む |
+| 16 | 実 NextFolder 結果適用と遅延再表示の完了、通知 1 回と 2D 継続、2D 自動 / Depth 手動の非通知 |
+
+#### 確定した最終結果と引継ぎ
+
+| コマンド | 件数 / 結果 |
+| --- | --- |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | 最終の製品差分で exit 0、35.47 秒 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth_progress::\|depth_slideshow\|depth_next_/)'` | 最終 37 / 37 成功、18,614 skip、exit 0、22.582 秒 |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/depth\|slideshow\|page_turn\|final_prepare\|prepared_edit\|panorama\|export\|admission\|ring/)'` | 1,671 / 1,671 成功、16,980 skip、exit 0、322.815 秒 |
+| `cargo fmt` (引数なし、最後の Cargo 操作) | exit 0 |
+| `python scripts/check_ui_glyphs.py` | 危険グリフ 0 件、exit 0 |
+| `python scripts/check_site_cards.py` | 53 カード、超過 0 件、exit 0 |
+| `git diff --check` | exit 0 |
+
+最後の型検査 → 指定回帰 → 成功時の `cargo fmt` は同じ指定 runner 内で順に実行し、04:41:31 に runner exit 0。
+ログは `target/771-logs/regression-final.{out,err}.log`、JUnit は `target/771-logs/regression-passed.junit.xml`。
+runner はロック領域 / G: TEMP に書けない警告後、既定の BelowNormal / 6 build jobs / 既定 TEMP で実行した。
+今回の再開後に依存物の MSBuild 再失敗は発生していない。
+
+本体 lib 全件、`build-dev.ps1`、実機での操作・最小化 / 復帰・実モデルの速度確認、実装の独立レビューは今回の実装側では未実施。
+利用者の指示どおり設計担当へ引き継ぐ。製品 exe の起動・commit は行っていない。
