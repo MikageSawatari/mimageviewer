@@ -620,3 +620,74 @@ Previous の開始点 `prefetch_previous_final_unit` の提示条件は広げな
 - 本体 lib 全件、`build-dev.ps1`、製品起動、commit は実施しない。
 - 最後の Cargo 操作は同じ runner 経由の `cargo fmt` (引数なし)、exit 0。
   `git diff --check` も exit 0。UI 文字列は変更していない。
+
+### 再開後の実装途中記録 (2026-11-18、依存ビルドの指定停止条件により中断)
+
+設計担当の §5.6.2 明確化 (`fedd1ed4f`) を受け再開した。以下は**未コンパイル・未検証の作業差分**であり、実装完了・ACCEPTの証拠ではない。
+`cargo check` が依存 `turbojpeg-sys` を再ビルドして MSBuild で失敗したため、利用者の
+「依存物の再ビルドでまた MSBuild が失敗したら、回避策を探さずにその時点で報告」の指示に従い停止した。
+別の Cargo コマンドでの回避や再試行は行っていない。§9 の関連文書・マニュアルの更新も未着手。
+
+#### 差分の所有と内容
+
+| ファイル | 実装途中の内容 |
+| --- | --- |
+| `src/depth_parallax.rs` / `src/depth_estimation.rs` | context 所有 Next 枠、settled 事実、LRU 読取、readback / 推論 / 失敗の引継ぎ、取消読取、Next readback の会計、現ページと共有する1frame1枚のR16登録、perfイベント |
+| `src/app/depth_view.rs` | 事実の照合、3D専用のD3開始条件、現在source進行後のNext保持・開始・進行、共通gate、描画callback / 選択済素材の失敗で事実を記録 |
+| `src/app/depth_progress.rs` (新規) | Current / Next 共通のread-only分類。実要求・世代・key・未取消の照合、既存producerと終端の分類 |
+| `src/app/final_prepare.rs` | Next需要 / 保持を新述語へ接続。Previous / Currentの準備は紙めくりONを維持。Depthスライドショー時はPresentedだけを開始証拠にする |
+| `src/app/final_prepare_budget.rs` / `src/app/prepared_edit.rs` | 実登録と共通の純粋なVRAM判定、共有 / 既登録handleを除いた残り全allocationの読取 |
+| `src/app/raw_page_store.rs` / `src/raw/executor.rs` | RAWの実develop要求・取消のread-only確認。1回のtry_lockで読めない場合は待たずUnavailable |
+| `src/ui_fullscreen.rs` / `src/app/gamepad_input.rs` | 3Dの開始停止入口、共通送り先、送り前gate、SlideshowTimerPass、描画closure内で捕捉する所有viewportの可視性、3D着地後の起算、停止時Next破棄 |
+| `src/app.rs` | 分類module登録、Panoramaだけの入場時停止、SlideshowNext結果のDepth終了通知 |
+| `src/ui_fullscreen/depth_slideshow_tests.rs` (新規) | 入口・キー・リング・HUD・送り先・タイマー・停止の7件 |
+| `src/ui_fullscreen/page_turn/{merge_master_tests,slideshow_regression_tests}.rs` | 既存2箇所のタイマーpass引数追従のみ |
+| 本書 | 停止理由と未確認事項の記録 |
+
+#### D3設定参照の実装状況
+
+| 箇所 | 今回の差分 |
+| --- | --- |
+| `prepare_final_demand_topologies` / `observe_next_final_unit_demand` | `next_unit_final_prepare_enabled` へ。前者のfullscreen_idxガードは維持 |
+| `d3_final_prepare_unit_at` | 共通有効条件へ。Next以外は紙めくりONが必要、元のpost_filter_bypassed条件を維持 |
+| `speculative_final_unit_is_needed` | 共通有効条件へ。採用・取消側の既存callerも同じ判定を読む |
+| `prefetch_next_final_unit` | `next_unit_current_presented` へ。Depthスライドショー中は `depth_current_settled && Presented` だけ、それ以外は従来の紙めくり提示述語 |
+| `prefetch_previous_final_unit` | 従来の紙めくり提示述語を維持 |
+| legacy登録延期 / source・AI先読み範囲 / 見開き端配置 / 演出・受付 | 変更なし。理由は上の着手前調査表と同じ |
+
+#### 前提とテストの到達点
+
+1. 古いFlatが真でもDepthスライドショーのNext開始判定には使わない形を実装。
+   旧調査テストは `depth_slideshow_ignores_retained_flat_until_depth_is_presented` へ置換し、
+   `update_texture` のSmallVecを要素ごとに渡す型誤りも修正した。実行は未確認。
+2. 設定参照は上表のとおり接続。Single / Spread singletonの入口許可範囲で、動画を挟む送り先とD3の一致を試験に追加。
+   非3DのSpread Doubleは従来の2ページ歩幅を保持する。
+3. 分類の段2は現resident素材のkeyとsource / slot・取消、段4はmanaged backing、段5はfs_pending / backlog / RAW実develop、
+   段6はcurrent final_effect_pending、6bはcomicの現下地 / 世代 / cancelとlocal・conceal・eraseの既存helper、
+   段7/8は残り全allocationと純粋VRAM判定、段9は現AI keyのpendingを読む。
+   完了 / 失敗 / 取消 / 切断の焦点試験13件を追加したが、実行による終端保証は未確認。
+   **RAWのCurrent深度推論中にresident素材でkeyを証明できない場合の分類と、実adoptionとの予算完全一致は独立レビューも未完**。
+4. 補正なしのsource共有と、紙めくりOFFのD3 worker開始→完成登録→Next readback→注入した深度結果→LRU→
+   slideshow着地→実 `resolve_fs_processed_payload_and_depth`→最初の深度callbackを通すGPU試験を追加。未実行。
+   他にreadback / Estimating / Failed引継ぎ、cancel / wrong target拒否、1frame1枚の現ページとの共有を追加。
+
+追加23件・旧調査テストの更新1件、計24件の追加 / 更新テストを用意した。GPU生成4件は `gpu_tests` に置いた。
+新規テスト・既存回帰とも実行0件。実窓・製品exe・実モデルは起動していない。
+
+独立Sol / xhighレビューは停止時点で判定保留。旧FlatをORしない条件とcontext所有枠の引継ぎを差分で確認し、
+`SlideshowTimerPass` は所有描画の事実を渡す構造的修正で症状パッチではないことに合意した。
+全Producingの終端・RAW素材同一性・予算同一性・試験網羅性のレビューは未完で、ACCEPTではない。
+
+#### 検証コマンド
+
+`MSBUILDDISABLENODEREUSE=1` を設定し、指定の
+`powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner "771-codex" -WorkDir G:\home\mimageviewer-771 -Command "cargo check -p mimageviewer --bin mimageviewer-core"`
+を実行 (02:04:07開始)。check用の依存ビルドで `turbojpeg-sys v1.2.0` の
+`cmake --build ...turbojpeg-sys-e58481dd5d2e733f/out/build --target install --config Debug --parallel 6` が
+MSBuild exit 1、build script exit 101で停止。今回のRust変更の型検査へは未到達。
+共有ロック / G: TEMPへ書けない警告の後、runner既定のBelowNormal / 6 build jobs / 既定TEMPを使用。
+本体lib全件とbuild-devは設計担当の担当のまま。コミットは行わない。
+
+runner終了報告は02:07:28、exit 101 (外側のコマンドツールはexit 1)。焦点nextestは未実行。
+停止時の整形として、同じrunnerと `MSBUILDDISABLENODEREUSE=1` で最後に `cargo fmt` (引数なし) を実行しexit 0。
+`python scripts/check_ui_glyphs.py` は危険グリフ0件・exit 0、`git diff --check` もexit 0。

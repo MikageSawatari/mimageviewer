@@ -31,6 +31,8 @@ mod depth_focus_tests;
 #[cfg(all(test, windows))]
 mod depth_main_window_tests;
 #[cfg(test)]
+mod depth_slideshow_tests;
+#[cfg(test)]
 mod depth_tests;
 #[cfg(test)]
 mod front_pointer_ownership_tests;
@@ -13353,7 +13355,7 @@ impl App {
 
     /// The display selector supplies readiness alongside the exact selected payload.
     /// Depth never repeats the final/comic/source priority rules.
-    fn resolve_fs_processed_payload_and_depth(
+    pub(crate) fn resolve_fs_processed_payload_and_depth(
         &mut self,
         ctx: &egui::Context,
         idx: usize,
@@ -17099,6 +17101,34 @@ pub(crate) enum FinalUnitPosition {
     Current,
     Next,
     Previous,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlideshowNextTarget {
+    InItems { idx: usize },
+    Other,
+}
+
+/// Rendering owns the visibility fact; forwarded input must not advance Depth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlideshowTimerPass {
+    ViewerRender {
+        viewport: egui::ViewportId,
+        visible: bool,
+    },
+    InputOnly,
+}
+
+impl SlideshowTimerPass {
+    fn visible_viewer(self) -> Option<egui::ViewportId> {
+        match self {
+            Self::ViewerRender {
+                viewport,
+                visible: true,
+            } => Some(viewport),
+            Self::ViewerRender { visible: false, .. } | Self::InputOnly => None,
+        }
+    }
 }
 
 impl FinalUnitPosition {
@@ -21299,12 +21329,7 @@ impl App {
     /// One cold pure derivation under the existing unit owner. Never resolve
     /// shift, read metadata, select a display texture, or replace visible proof.
     pub(crate) fn prepare_final_demand_topologies(&mut self) {
-        if !self.settings.page_turn_animation_enabled
-            || !self.reading_flow.is_paged()
-            || self.spread_mode.is_split()
-            || self.fullscreen_idx.is_none()
-            || self.remote_session_blocks_local_control()
-        {
+        if self.fullscreen_idx.is_none() || !self.next_unit_final_prepare_enabled() {
             return;
         }
         // A validated resume adopts results before the runtime changes from
@@ -21430,11 +21455,7 @@ impl App {
     /// Observation only in D3-1. Slideshow uses its actual installed still-image
     /// navigation list; Collection's future snapshot is never guessed here.
     pub(crate) fn observe_next_final_unit_demand(&mut self) {
-        if !crate::perf::is_enabled()
-            || !self.settings.page_turn_animation_enabled
-            || !self.reading_flow.is_paged()
-            || self.spread_mode.is_split()
-        {
+        if !crate::perf::is_enabled() || !self.next_unit_final_prepare_enabled() {
             return;
         }
         let Some(idx) = self.fullscreen_idx else {
@@ -28076,9 +28097,15 @@ impl App {
         let test_script_pointer_show_owner = active_render_window_id
             .and_then(|window_id| self.test_script_pointer_show_owner(window_id, fs_id));
 
+        let mut slideshow_timer_pass = SlideshowTimerPass::InputOnly;
         {
             let mut render_fs_body = |root_ui: &mut egui::Ui, embedded: bool| {
                 let ctx = &root_ui.ctx().clone();
+                slideshow_timer_pass = SlideshowTimerPass::ViewerRender {
+                    viewport: ctx.viewport_id(),
+                    visible: self.window_visible
+                        && ctx.input(|i| i.viewport().minimized != Some(true)),
+                };
                 #[cfg(windows)]
                 if !embedded {
                     self.capture_current_detached_viewport_registration(ctx);
@@ -29490,7 +29517,12 @@ impl App {
                             original_preview_visual_active,
                         );
                         }
-                        self.sync_slideshow_anchor_for_frame(ctx, paint_idx, &state);
+                        self.sync_slideshow_anchor_for_frame(
+                            ctx,
+                            paint_idx,
+                            &state,
+                            slideshow_timer_pass,
+                        );
                         self.draw_slideshow_progress_indicator(ui, content_rect, ctx);
                         if !state.is_video {
                             self.draw_compare_pin_indicator(ui, content_rect, ctx);
@@ -30782,6 +30814,7 @@ impl App {
             navigation_idx,
             list_order_nav,
             navigation_operation,
+            slideshow_timer_pass,
             &mut fs_render_perf,
         );
         #[cfg(all(windows, feature = "test-script"))]
@@ -36437,7 +36470,9 @@ impl App {
             .detached_viewer_image_edit_tools_disabled_reason()
             .is_some();
         let key_z = key_z_raw && !pano_active_now;
-        let key_s = key_s && !pano_active_now;
+        let key_s = key_s
+            && self.fs_exclusive_view_active(fs_idx)
+                != Some(crate::fs_exclusive_view::ExclusiveViewKind::Panorama);
         let key_e = key_e_raw;
         let key_m = key_m && !pano_active_now;
         // 透過部分の下地は3Dでも毎描画反映する。背景切替の抑止は360°固有。
@@ -42306,6 +42341,37 @@ impl App {
 
     // ── ナビゲーション & スライドショー ─────────────────────────────────
 
+    /// The installed still-image order shared by Depth prefetch and its gate.
+    /// Spread's ordinary two-page step remains owned by `advance_slideshow`.
+    pub(crate) fn slideshow_next_target(&self, cur: usize) -> SlideshowNextTarget {
+        if self.spread_mode.is_split()
+            || matches!(
+                self.navigation_scope,
+                crate::app::ViewerNavigationScope::CollectionRoot
+            )
+        {
+            return SlideshowNextTarget::Other;
+        }
+        let cached = (self.viewer_navigation_caches.source
+            == Some((self.items_generation, self.reading_flow)))
+        .then(|| self.viewer_navigation_caches.still_image_indices.as_deref())
+        .flatten();
+        let uncached;
+        let still = if let Some(cached) = cached {
+            cached.as_slice()
+        } else {
+            uncached = crate::ui_helpers::still_image_display_indices(
+                &self.items,
+                self.current_reader_order(),
+            );
+            &uncached
+        };
+        crate::ui_helpers::adjacent_idx_in_order(still, cur, 1)
+            .map_or(SlideshowNextTarget::Other, |idx| {
+                SlideshowNextTarget::InItems { idx }
+            })
+    }
+
     /// スライドショーを 1 ステップ進める。動画はスキップ ([adjacent_slideshow_idx])。
     /// フォルダ末尾に到達したら `slideshow_end_action` 設定に従って
     /// ループ / 次フォルダ / 停止する。
@@ -42351,6 +42417,13 @@ impl App {
             FsPageNav::None | FsPageNav::Boundary { .. } | FsPageNav::Wrap(_) => None,
         };
         if let Some(idx) = next_idx {
+            if self.fs_exclusive_view.is_depth()
+                && self.slideshow_next_target(cur) == (SlideshowNextTarget::InItems { idx })
+                && self.depth_slideshow_gate(ctx, idx, std::time::Instant::now())
+                    == crate::app::depth_view::DepthSlideshowGate::Wait
+            {
+                return;
+            }
             // フォルダ内の次の静止画系アイテムへ前進。
             let slice = match slide_nav {
                 FsPageNav::Split(step) => Some(step.slice),
@@ -42367,10 +42440,7 @@ impl App {
         // 末尾到達: 設定に従う。
         match self.settings.slideshow_end_action {
             crate::settings::SlideshowEndAction::Stop => {
-                self.slideshow_playing = false;
-                self.slideshow_anchor_idx = None;
-                self.continuous_reading_scroll_transition = None;
-                self.slideshow_scroll_range_cache = None;
+                self.stop_slideshow_playback();
             }
             crate::settings::SlideshowEndAction::LoopFolder => {
                 self.loop_slideshow_to_first(ctx);
@@ -42402,11 +42472,19 @@ impl App {
     pub(crate) fn stop_projected_slideshow_playback(&mut self) -> bool {
         self.cancel_collection_slideshow_navigation_intent();
         let was_playing = self.slideshow_playing;
+        self.discard_depth_slideshow_prefetch();
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
         was_playing
+    }
+
+    fn discard_depth_slideshow_prefetch(&mut self) {
+        if let crate::fs_exclusive_view::FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view
+        {
+            state.next = None;
+        }
     }
 
     /// HUD・キー/マウス割当・リング/ジェスチャで共有する、active viewer のトグル出口。
@@ -42443,6 +42521,7 @@ impl App {
                 crate::app::book_composition_permission::BookTargetPurpose::FirstInBook,
             );
         } else {
+            self.discard_depth_slideshow_prefetch();
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
             self.continuous_reading_scroll_transition = None;
@@ -42506,6 +42585,7 @@ impl App {
             }
             crate::app::book_composition_permission::BookDfsContinuation::Slideshow => {
                 if !self.try_start_slideshow_next_folder(ctx, idx) {
+                    self.discard_depth_slideshow_prefetch();
                     self.slideshow_playing = false;
                     self.slideshow_anchor_idx = None;
                     self.continuous_reading_scroll_transition = None;
@@ -42550,6 +42630,7 @@ impl App {
             // ツリーの端 (これ以上先の本がない): fall through して ZIP を抜けて次フォルダへ。
         }
         if self.start_collection_outer_fullscreen_navigation(ctx, fs_idx, true, true, false) {
+            self.discard_depth_slideshow_prefetch();
             self.slideshow_playing = false;
             self.slideshow_anchor_idx = None;
             self.continuous_reading_scroll_transition = None;
@@ -42562,6 +42643,7 @@ impl App {
         let Some(folder) = self.effective_folder() else {
             return false;
         };
+        self.discard_depth_slideshow_prefetch();
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
         self.continuous_reading_scroll_transition = None;
@@ -42619,7 +42701,21 @@ impl App {
         self.continuous_reading_scroll_transition = None;
     }
 
-    fn current_slideshow_frame_ready(&self, fs_idx: usize, state: &FsFrameState) -> bool {
+    fn current_slideshow_frame_ready(
+        &self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        state: &FsFrameState,
+        pass: SlideshowTimerPass,
+    ) -> bool {
+        if self.fs_exclusive_view.is_depth() {
+            return pass.visible_viewer().is_some()
+                && self.depth_page_progress(
+                    ctx,
+                    fs_idx,
+                    crate::app::depth_view::DepthPageRole::Current,
+                ) != crate::app::depth_view::DepthPageProgress::Producing;
+        }
         // 動画は ready 扱いにして必ずタイマーを進める。動画フレームは `state.tex` を
         // 持たず、サムネが未生成だと永久に「未 ready」で止まりうるため。タイマーが
         // 回れば advance_slideshow が adjacent_slideshow_idx で動画を飛ばして次へ送る
@@ -42640,8 +42736,11 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
         state: &FsFrameState,
+        pass: SlideshowTimerPass,
     ) {
-        if !self.slideshow_playing {
+        if !self.slideshow_playing
+            || (self.fs_exclusive_view.is_depth() && pass == SlideshowTimerPass::InputOnly)
+        {
             return;
         }
         // The interval is time to view the adopted flat page. Keep the existing
@@ -42654,7 +42753,7 @@ impl App {
         // 動画でスライドショーを止めない (ユーザー設定: 動画はスキップして継続)。
         // 自動送り (advance_slideshow) は adjacent_slideshow_idx で動画を飛ばすので、
         // 動画に居るのは手動ナビで来た場合のみ。1 間隔だけ表示して次の静止画へ送る。
-        let ready = self.current_slideshow_frame_ready(fs_idx, state);
+        let ready = self.current_slideshow_frame_ready(ctx, fs_idx, state, pass);
         if self.slideshow_anchor_idx == Some(fs_idx) {
             if !ready {
                 self.slideshow_anchor_idx = None;
@@ -43181,7 +43280,10 @@ impl App {
         self.slideshow_anchor_idx = None;
         // The accepted curl still owns presentation; arm the interval only after
         // its canonical flat is adopted, using the existing frame anchor owner.
-        if self.slideshow_playing && !self.page_turn_presentation_pending() {
+        if self.slideshow_playing
+            && !self.fs_exclusive_view.is_depth()
+            && !self.page_turn_presentation_pending()
+        {
             self.schedule_next_slideshow_from_now();
         }
     }
@@ -43396,6 +43498,7 @@ impl App {
             .preview
             .end_gesture_with_reason("navigation_or_close");
         self.page_turn_excluded_navigation_with_operation(ctx, "list_order_navigation", operation);
+        self.discard_depth_slideshow_prefetch();
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
         self.continuous_reading_scroll_transition = None;
@@ -43460,6 +43563,7 @@ impl App {
         // 挙動にする (フォルダ内移動の矢印/ホイール/クリックは継続のまま)。
         // SlideshowNext 自動送りはこの関数を経由せず start_folder_nav を直接呼ぶので
         // ここでは止まらない。
+        self.discard_depth_slideshow_prefetch();
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
         self.continuous_reading_scroll_transition = None;
@@ -43643,6 +43747,7 @@ impl App {
             }
             return;
         }
+        self.discard_depth_slideshow_prefetch();
         self.slideshow_playing = false;
         self.slideshow_anchor_idx = None;
         self.continuous_reading_scroll_transition = None;
@@ -43919,6 +44024,7 @@ impl App {
             fs_idx,
             list_order_nav,
             operation,
+            SlideshowTimerPass::InputOnly,
             &mut fs_render_perf,
         );
     }
@@ -43936,6 +44042,7 @@ impl App {
         fs_idx: usize,
         list_order_nav: Option<bool>,
         operation: Option<ViewerOperationId>,
+        slideshow_timer_pass: SlideshowTimerPass,
         fs_render_perf: &mut Option<FsRenderPerfRecorder>,
     ) {
         // Own manual navigation and slideshow timers at their common boundary.
@@ -44670,6 +44777,8 @@ impl App {
         // フォルダを変えた場合は close_fullscreen が slideshow_playing=false にする。
         let slideshow_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
         if self.slideshow_playing
+            && (!self.fs_exclusive_view.is_depth()
+                || slideshow_timer_pass.visible_viewer().is_some())
             && self.page_overview.session().is_none()
             && !self.viewer_mutation_modal_active()
             && !close_fs
@@ -52887,7 +52996,7 @@ impl App {
 
         // ▶/⏸ スライドショーボタン (画像モード) または ▦ タイルボタン (動画モード)
         // 360 モード中は非表示。
-        if panorama_mode_active {
+        if panorama_mode_active && !depth_active {
             // skip
         } else if is_video {
             let tile_resp = draw_bar_button(

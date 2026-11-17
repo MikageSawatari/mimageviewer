@@ -269,6 +269,11 @@ pub enum RawTicketState {
 }
 
 impl RawTicket {
+    /// Value-only cancellation query; does not lock the executor queue.
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.flag.load(Ordering::Acquire)
+    }
+
     pub fn state(&self) -> Option<RawTicketState> {
         let shared = self.shared.upgrade()?;
         let state = shared.state.lock().unwrap();

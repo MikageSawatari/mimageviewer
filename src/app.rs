@@ -773,7 +773,8 @@ pub(crate) use prepared_edit::{
 };
 mod depth_dialog;
 mod depth_export;
-mod depth_view;
+mod depth_progress;
+pub(crate) mod depth_view;
 pub(crate) use depth_dialog::DepthDialogSurface;
 pub(crate) use depth_view::DepthEntryRequest;
 #[cfg(all(test, windows))]
@@ -62383,6 +62384,15 @@ impl App {
             | FolderNavMode::SiblingFullscreen
             | FolderNavMode::SlideshowNext => {
                 let resume_slideshow = matches!(result.mode, FolderNavMode::SlideshowNext);
+                if resume_slideshow && self.fs_exclusive_view.is_depth() {
+                    let message = match self.keymap.first_chord_label(KeyAction::FsDepthParallax) {
+                        Some(key) => format!(
+                            "3D 写真を終了しました: 次のフォルダへ進みました。{key} キーでもう一度使えます"
+                        ),
+                        None => "3D 写真を終了しました: 次のフォルダへ進みました。上部の 3D ボタンでもう一度使えます".into(),
+                    };
+                    self.show_feedback_toast(message);
+                }
                 #[cfg(windows)]
                 let restore_video_tile = self.video_tile_mode_active;
                 #[cfg(not(windows))]
@@ -96857,14 +96867,11 @@ impl App {
         // 衝突する機能を停止 (docs/panorama-360-view-plan.md フィードバック対応):
         // 360 中は上バーのみの機能制限モードになるので、他の panel / mode を OFF
         // しておく。これらは 360 OFF 後にユーザーが再度有効化できる。
+        self.stop_slideshow_playback();
         self.close_fs_exclusive_conflicts();
     }
 
     pub(crate) fn close_fs_exclusive_conflicts(&mut self) {
-        self.slideshow_playing = false;
-        self.slideshow_anchor_idx = None;
-        self.continuous_reading_scroll_transition = None;
-        self.slideshow_scroll_range_cache = None;
         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;

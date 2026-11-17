@@ -2368,6 +2368,38 @@ fn raw_developed_raster(
 }
 
 impl App {
+    /// A missing embedded preview is only a projection of LoadPending. Wait
+    /// for development only after its existing owner has issued real work.
+    pub(super) fn depth_raw_development_pending(&self, idx: usize) -> bool {
+        if !self.is_raw_page(idx)
+            || self.raw_pages.pages.current_items_generation() != self.items_generation
+        {
+            return false;
+        }
+        let Some(page) = self.raw_pages.page(idx) else {
+            return false;
+        };
+        if self.page_path_key(idx).as_ref() != Some(&page.source.item_key) {
+            return false;
+        }
+        // Publishing a ticket briefly holds this mutex on a worker. The UI
+        // never waits for it; an ambiguous observation is Unavailable.
+        let Ok(phase) = page.develop.try_lock() else {
+            return false;
+        };
+        match &*phase {
+            RawDevelopPhase::Preparing {
+                cancel, brightness, ..
+            } if *brightness == self.settings.raw_brightness => cancel
+                .try_lock()
+                .is_ok_and(|ticket| !ticket.cancel_token().load(Ordering::Relaxed)),
+            RawDevelopPhase::Submitted {
+                ticket, brightness, ..
+            } => *brightness == self.settings.raw_brightness && !ticket.is_cancelled(),
+            _ => false,
+        }
+    }
+
     /// Removing a load receiver and retiring its preview request are one operation.
     /// Completed loads instead disarm their ticket: their request remains valid in backlog.
     pub(crate) fn cancel_fs_page_load(&mut self, idx: usize) {

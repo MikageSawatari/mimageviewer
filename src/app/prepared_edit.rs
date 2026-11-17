@@ -1000,6 +1000,58 @@ impl App {
         true
     }
 
+    /// Registration's exact remaining allocations, without publishing handles
+    /// or claiming the shared per-frame slot. None means a terminal/invalid
+    /// output. Sharing and comic exclusion mirror adopt_prepared_edit.
+    pub(super) fn prepared_edit_remaining_allocations(
+        &self,
+        ctx: &egui::Context,
+        key: FinalCompositeKey,
+        state: &FinalEffectState,
+    ) -> Option<Vec<([usize; 2], egui::TextureOptions)>> {
+        let (ready, final_registered, comic_registered) = match state {
+            FinalEffectState::CpuReady(FinalEffectReady::Edited(ready)) => (ready, false, false),
+            FinalEffectState::Registering(registration) => (
+                &registration.ready,
+                registration.final_texture.is_some(),
+                registration.comic_texture.is_some(),
+            ),
+            _ => return None,
+        };
+        let input = &ready.input;
+        let out = ready.output.as_ref().ok()?;
+        let options = if input.plan.needs_nearest_sampler() {
+            egui::TextureOptions::NEAREST
+        } else {
+            DISPLAY_IMAGE_TEXTURE_OPTIONS
+        };
+        let shared = if final_registered {
+            true
+        } else if matches!(input.final_input, PreparedFinalInput::Completed { .. }) {
+            self.exact_complete_final_composite_entry(key.edit_key.idx)
+                .is_some()
+        } else if let (Some(pixels), Some(upload)) = (&out.final_pixels, &out.final_upload)
+            && Arc::ptr_eq(pixels, upload)
+        {
+            self.shared_prepared_edit_texture(ctx, key, pixels, options)
+                .is_some()
+        } else {
+            false
+        };
+        let mut allocations = Vec::with_capacity(2);
+        if !shared && let Some(upload) = &out.final_upload {
+            allocations.push((upload.size, options));
+        }
+        if !comic_registered
+            && input.comic.is_some()
+            && self.validate_prepared_comic(input, out).is_ok()
+            && let Some(comic) = &out.comic
+        {
+            allocations.push((comic.upload.size, options));
+        }
+        Some(allocations)
+    }
+
     fn shared_prepared_edit_texture(
         &self,
         ctx: &egui::Context,

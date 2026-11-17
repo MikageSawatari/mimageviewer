@@ -273,6 +273,9 @@ impl DepthSourcePhase {
 #[derive(Default)]
 pub(crate) struct DepthLru(VecDeque<(DepthSourceKey, Arc<DepthTexture>)>);
 impl DepthLru {
+    pub(crate) fn contains(&self, key: DepthSourceKey) -> bool {
+        self.0.iter().any(|(saved, _)| *saved == key)
+    }
     pub(crate) fn get(&mut self, key: DepthSourceKey) -> Option<Arc<DepthTexture>> {
         let index = self.0.iter().position(|(k, _)| *k == key)?;
         let entry = self.0.remove(index)?;
@@ -292,6 +295,46 @@ impl DepthLru {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DepthNextTarget {
+    pub idx: usize,
+    pub item_id: crate::item_identity::ItemId,
+    pub items_generation: u64,
+}
+
+pub(crate) struct DepthNextSlot {
+    pub target: DepthNextTarget,
+    pub key: DepthSourceKey,
+    pub phase: DepthNextPhase,
+}
+
+pub(crate) enum DepthNextPhase {
+    ReadingBack { readback: DepthReadback },
+    Estimating { pending: DepthPending },
+    Failed { reason: String },
+}
+
+impl DepthNextSlot {
+    pub(crate) fn can_handoff(&self, target: DepthNextTarget, key: DepthSourceKey) -> bool {
+        self.target == target
+            && self.key == key
+            && !matches!(&self.phase, DepthNextPhase::Estimating { pending } if pending.is_cancelled())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DepthSettledOutcome {
+    Presented,
+    Failed,
+}
+
+pub(crate) struct DepthSettled {
+    pub fs_idx: usize,
+    pub edit_key: crate::app::EditResultKey,
+    pub key: DepthSourceKey,
+    pub outcome: DepthSettledOutcome,
+}
+
 pub(crate) struct DepthViewState {
     pub context: ViewerContextId,
     pub panel_visible: bool,
@@ -303,6 +346,8 @@ pub(crate) struct DepthViewState {
     pub focus_highlight: Option<Instant>,
     pub source: DepthSourcePhase,
     pub lru: DepthLru,
+    pub next: Option<DepthNextSlot>,
+    pub settled: Option<DepthSettled>,
     pub wait_reason: DepthSourceWait,
     gpu: Option<Arc<DepthGpu>>,
     color: Option<Arc<DepthColor>>,
@@ -325,6 +370,8 @@ impl DepthViewState {
             focus_highlight: None,
             source: DepthSourcePhase::WaitingForStableTexture,
             lru: DepthLru::default(),
+            next: None,
+            settled: None,
             wait_reason: DepthSourceWait::TexturePending,
             gpu: None,
             color: None,
@@ -370,6 +417,17 @@ impl DepthViewState {
         texture: &wgpu::Texture,
         key: DepthSourceKey,
     ) -> Result<(), String> {
+        self.select_source_for_target(device, queue, texture, key, None)
+    }
+
+    pub(crate) fn select_source_for_target(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        key: DepthSourceKey,
+        target: Option<DepthNextTarget>,
+    ) -> Result<(), String> {
         if self.source.key() == Some(key) {
             return Ok(());
         }
@@ -407,9 +465,24 @@ impl DepthViewState {
             )));
             self.source = DepthSourcePhase::Ready { key };
         } else {
-            self.source = DepthSourcePhase::ReadingBack {
-                key,
-                readback: gpu.readback(device, queue, &color),
+            self.source = match self
+                .next
+                .take()
+                .filter(|slot| target.is_some_and(|target| slot.can_handoff(target, key)))
+            {
+                Some(slot) => match slot.phase {
+                    DepthNextPhase::ReadingBack { readback } => {
+                        DepthSourcePhase::ReadingBack { key, readback }
+                    }
+                    DepthNextPhase::Estimating { pending } => {
+                        DepthSourcePhase::Estimating { key, pending }
+                    }
+                    DepthNextPhase::Failed { reason } => DepthSourcePhase::Failed { key, reason },
+                },
+                None => DepthSourcePhase::ReadingBack {
+                    key,
+                    readback: gpu.readback(device, queue, &color),
+                },
             };
         }
         self.color = Some(color);
@@ -487,6 +560,104 @@ impl DepthViewState {
     pub(crate) fn ready(&self) -> Option<Arc<DepthRenderResources>> {
         self.rendered.clone()
     }
+
+    /// Only resident inputs are accepted. The temporary color mip chain is
+    /// released immediately after encoding the bounded readback commands.
+    pub(crate) fn start_next(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture: &wgpu::Texture,
+        target: DepthNextTarget,
+        key: DepthSourceKey,
+    ) {
+        let gpu = self
+            .gpu
+            .get_or_insert_with(|| Arc::new(DepthGpu::new(device)));
+        let phase = match gpu.copy_color(device, queue, texture) {
+            Ok(color) => DepthNextPhase::ReadingBack {
+                readback: gpu.readback(device, queue, &color),
+            },
+            Err(reason) => {
+                crate::logger::log(format!("[Depth next] {reason}"));
+                DepthNextPhase::Failed { reason }
+            }
+        };
+        self.next = Some(DepthNextSlot { target, key, phase });
+    }
+
+    /// Shares the current source's per-frame upload allowance. No request is
+    /// submitted here unless the caller has revalidated this pass's settled fact.
+    pub(crate) fn advance_next(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        egui: &egui::Context,
+        viewport: egui::ViewportId,
+        input_seq: u64,
+        submit: impl FnOnce(DepthSourceKey, Vec<u8>, DepthGuide) -> Result<DepthPending, String>,
+    ) {
+        let started = Instant::now();
+        let Some(slot) = self.next.as_mut() else {
+            return;
+        };
+        let completion = match &mut slot.phase {
+            DepthNextPhase::ReadingBack { readback } => {
+                let _ = device.poll(wgpu::PollType::Poll);
+                egui.request_repaint_of(viewport);
+                readback.try_finish()
+            }
+            _ => None,
+        };
+        if let Some(result) = completion {
+            record_next_event(
+                "readback_complete",
+                slot.target,
+                slot.key,
+                input_seq,
+                started,
+            );
+            slot.phase = match result.and_then(|(input, guide)| submit(slot.key, input, guide)) {
+                Ok(pending) => DepthNextPhase::Estimating { pending },
+                Err(reason) => {
+                    crate::logger::log(format!("[Depth next] {reason}"));
+                    DepthNextPhase::Failed { reason }
+                }
+            };
+        }
+        let frame = egui.cumulative_frame_nr_for(viewport);
+        if matches!(slot.phase, DepthNextPhase::Estimating { .. })
+            && self.last_depth_upload_frame == Some(frame)
+        {
+            egui.request_repaint_of(viewport);
+            return;
+        }
+        let result = match &slot.phase {
+            DepthNextPhase::Estimating { pending } => pending.try_result(self.context, slot.key),
+            _ => None,
+        };
+        if let Some(result) = result {
+            record_next_event(
+                "estimate_complete",
+                slot.target,
+                slot.key,
+                input_seq,
+                started,
+            );
+            match result.and_then(|map| DepthTexture::upload(device, queue, map)) {
+                Ok(depth) => {
+                    self.last_depth_upload_frame = Some(frame);
+                    self.lru.insert(slot.key, Arc::new(depth));
+                    record_next_event("lru_insert", slot.target, slot.key, input_seq, started);
+                    self.next = None;
+                }
+                Err(reason) => {
+                    crate::logger::log(format!("[Depth next] {reason}"));
+                    slot.phase = DepthNextPhase::Failed { reason };
+                }
+            }
+        }
+    }
     pub(crate) fn publish(&self, resources: &mut egui_wgpu::CallbackResources) {
         if let Some(ready) = self.ready() {
             resources.insert(crate::depth_parallax_wgpu::DepthRenderResourcesRef(ready));
@@ -502,11 +673,40 @@ impl DepthViewState {
         self.lru.resident_bytes()
     }
     pub(crate) fn readback_bytes(&self) -> u64 {
-        match &self.source {
+        let current = match &self.source {
             DepthSourcePhase::ReadingBack { readback, .. } => readback.byte_size(),
             _ => 0,
-        }
+        };
+        current
+            + self.next.as_ref().map_or(0, |slot| match &slot.phase {
+                DepthNextPhase::ReadingBack { readback } => readback.byte_size(),
+                _ => 0,
+            })
     }
+}
+
+pub(crate) fn record_next_event(
+    stage: &'static str,
+    target: DepthNextTarget,
+    key: DepthSourceKey,
+    input_seq: u64,
+    started: Instant,
+) {
+    crate::perf::event(
+        "depth",
+        "next_prefetch",
+        None,
+        input_seq,
+        &[
+            ("stage", stage.into()),
+            ("idx", target.idx.into()),
+            ("key", format!("{:?}", key.texture_id).into()),
+            (
+                "elapsed_ms",
+                (started.elapsed().as_secs_f64() * 1000.0).into(),
+            ),
+        ],
+    );
 }
 impl Drop for DepthViewState {
     fn drop(&mut self) {

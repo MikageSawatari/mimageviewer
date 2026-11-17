@@ -47,7 +47,15 @@ fn draw_and_sync(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) -> Submi
         FsPageTurnDecision::normal(),
         &sources,
     );
-    app.sync_slideshow_anchor_for_frame(ctx, idx, &state);
+    app.sync_slideshow_anchor_for_frame(
+        ctx,
+        idx,
+        &state,
+        SlideshowTimerPass::ViewerRender {
+            viewport: ctx.viewport_id(),
+            visible: true,
+        },
+    );
     let FsDisplayUnitSubmission::Paged(receipt) = sources.submission else {
         panic!("paged receipt")
     };
