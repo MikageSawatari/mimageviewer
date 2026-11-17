@@ -857,3 +857,10 @@ fixtureの登録を直した単独再実行は1件成功（0.634秒、ビルド2
 同じレビュー担当 (Sol / xhigh、session 01a1eb01) が 6ba253d26 を確認し、P1〜P3 なしで ACCEPT。r2 の 3 件の解消、共有 helper が旧条件と同値で既定の見開き構成を変えないこと、
 §7.8 の範囲外記録 (既存 ROOT 経路のシーク Popup 判定・固定矢印が配送先の Popup を照会しない) が正確であることを確認した。
 detached の読み取り側の変更 (取得済みトリムの照合) は、レビュー担当と設計担当の双方が「症状パッチではなく構造的修正である」ことに合意した (docs/detached-rework-plan.md の §1.474 の記録)。
+
+### 7.9 最終の全件テストと検証用ビルド (2026-11-18、設計担当が実行)
+
+- 6ba253d26 (コードは 7f29bc310 と同じ) で `.\scripts\test-lib-full.ps1` (run-heavy 経由): 18,617 件成功・81 件 skip・失敗 0 (1,334 秒)。
+  39e3670c5 時点の全件では、無関係の 2 件 (`app::tests::scroll_661::retired_details_cell_release_does_not_consume_later_mouse_hold`、
+  `favorite_view_state::tests::sidecar_restore_barrier_observes_published_result_after_done`) が実装担当のビルドと並行した負荷の下で失敗し、単独の再実行では 2 件とも成功した。
+- `.\scripts\build-dev.ps1`: 成功 (`target\dev-runtime\mimageviewer-core.exe`)。製品バイナリは起動していない。実画面での確認は利用者の実機確認を待つ。
