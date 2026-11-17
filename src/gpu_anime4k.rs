@@ -178,6 +178,9 @@ impl Anime4kPlan {
 }
 
 pub(crate) struct Anime4kResampler {
+    // Snapshot the actual modules used below; they are dropped after creation.
+    #[cfg(test)]
+    pub(crate) shader_uses_dxbc: bool,
     pub(crate) creation_timings: Anime4kCreationTimings,
     variant_data: &'static Anime4kVariantData,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -266,6 +269,8 @@ impl Anime4kResampler {
                 )
             });
         Self {
+            #[cfg(test)]
+            shader_uses_dxbc: shader.uses_dxbc(),
             creation_timings,
             variant_data,
             bind_group_layout,

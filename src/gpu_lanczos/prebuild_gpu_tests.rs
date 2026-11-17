@@ -60,6 +60,10 @@ fn draw_cases(
         let output = match kind {
             ScalerKind::Nis => {
                 let pipelines = cache.nis_pipeline_set(device, store, &mut timings).clone();
+                assert!(
+                    pipelines.shader_uses_dxbc,
+                    "shader variant: product DX12 NIS must use DXBC, both prebuilt and inline"
+                );
                 let plan = NisUpscalePlan {
                     source_size: [63, 47],
                     target_size: target,
@@ -79,6 +83,10 @@ fn draw_cases(
             }
             ScalerKind::Anime4k => {
                 let pipelines = cache.anime_pipeline(device, store, &mut timings).clone();
+                assert!(
+                    pipelines.shader_uses_dxbc,
+                    "shader variant: product DX12 Anime4K must use DXBC, both prebuilt and inline"
+                );
                 let plan = Anime4kPlan::new([63, 47], target, region).unwrap();
                 let job = pipelines.prepare_job(device, input, plan).unwrap();
                 let encode_pipelines = cache.anime_resampler.as_ref().unwrap();

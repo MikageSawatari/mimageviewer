@@ -2395,6 +2395,8 @@ wgpu / wgpu-core / wgpu-hal と実行時 naga 依存、build 用 naga の固定�
 `gpu_lanczos::gpu_tests::still_{nis,anime4k_vl}_dxbc_matches_wgsl_pixels` は Windows DX12 の常設テスト（ignore なし、gpu group）。
 斜線・細部・透明境界を持つ同じ入力を feature なし/あり device の製品 prepare/encode で描き、整数倍・非整数倍・
 小数 ROI の最終 RGBA8 を完全一致で検査する。GPU/feature 不在は成功扱いにせず失敗する。
+画素比較だけでは両側が WGSL でも通るため、描画に使う pipeline を作成した実際の module variant も
+テスト専用の読み取りで確認する（feature ありは DXBC、なしは WGSL）。prebuild / inline の比較も両方の DXBC 選択を検査する。
 更新時は DEBUG ありの通常 test と DEBUG なしの dev-runtime で実行し、生成 HLSL の HAL 実出力との照合も行う。
 中間 RGBA16Float 値や他 GPU の互換性まで証明する試験ではない。
 

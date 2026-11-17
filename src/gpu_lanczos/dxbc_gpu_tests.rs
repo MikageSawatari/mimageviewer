@@ -60,6 +60,18 @@ fn compare(anime: bool) {
         let input = fixture(&device, &queue);
         let nis = (!anime).then(|| Arc::new(NisPipelineSet::new(&device)));
         let vl = anime.then(|| Anime4kResampler::new(&device, STILL_IMAGE_ANIME4K_VARIANT));
+        // Pixel parity alone would also pass if both sides accidentally used
+        // WGSL. Inspect the modules that built these exact rendering pipelines.
+        let actual_dxbc = if let Some(vl) = &vl {
+            vl.shader_uses_dxbc
+        } else {
+            nis.as_ref().unwrap().shader_uses_dxbc
+        };
+        assert_eq!(
+            actual_dxbc,
+            features.contains(wgpu::Features::PASSTHROUGH_SHADERS),
+            "shader variant: DX12 with passthrough must use DXBC, without it WGSL (anime={anime})"
+        );
         let mut results = Vec::new();
         // Integer/noninteger scales, clamped edges, fractional ROI phase.
         for (target, region) in [

@@ -66,6 +66,11 @@ pub(crate) fn request_passthrough(features: wgpu::Features) -> wgpu::Features {
 }
 
 impl ResamplerShaders {
+    #[cfg(test)]
+    pub(crate) fn uses_dxbc(&self) -> bool {
+        matches!(&self.modules, ShaderModules::Dxbc { .. })
+    }
+
     pub(crate) fn new(device: &wgpu::Device, source: &'static str, family: Option<Family>) -> Self {
         let bytecode = family.and_then(Family::bytecode).filter(|_| {
             device.adapter_info().backend == wgpu::Backend::Dx12

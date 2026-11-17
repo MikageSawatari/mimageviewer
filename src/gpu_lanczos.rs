@@ -3513,6 +3513,9 @@ fn create_resampler_layouts(
 }
 
 pub(crate) struct NisPipelineSet {
+    // Snapshot the actual modules used below; they are dropped after creation.
+    #[cfg(test)]
+    pub(crate) shader_uses_dxbc: bool,
     pub(crate) creation_timings: LanczosCreationTimings,
     bind_group_layout: wgpu::BindGroupLayout,
     _pipeline_layout: wgpu::PipelineLayout,
@@ -3536,6 +3539,8 @@ impl NisPipelineSet {
             shaders.create_pipeline(device, &layout, "fs_nis", wgpu::TextureFormat::Rgba8Unorm)
         });
         Self {
+            #[cfg(test)]
+            shader_uses_dxbc: shaders.uses_dxbc(),
             creation_timings,
             bind_group_layout,
             _pipeline_layout: layout,
