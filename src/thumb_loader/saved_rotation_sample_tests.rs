@@ -104,7 +104,7 @@ fn cover_auto_pdf_worker_samples_body_rotation_from_logical_page_with_same_passw
             Some(ResolvedAutoCover {
                 identity: crate::cover_auto_crop::AutoCropIdentity::new(crate::settings::ReadingDirection::Rtl),
                 input: AutoCoverInput::Container,
-            }), None);
+            }), None, None);
         assert_eq!(done.load(Ordering::Relaxed), 1);
         let messages: Vec<_> = rx.try_iter().collect();
         let material = messages.iter().find_map(ThumbMsg::pixels).unwrap().auto_material;

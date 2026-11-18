@@ -60,7 +60,7 @@ pub(crate) enum SearchMetadataInstall {
 
 pub(crate) struct EverythingMetadata {
     pub(crate) pins: HashMap<String, FolderPin>,
-    pub(crate) converted: HashMap<String, ConvertedArchiveSourceState>,
+    pub(crate) converted: crate::app::ConvertedArchiveSources,
     pub(crate) tags: HashMap<String, Vec<String>>,
     pub(crate) video_pin_blobs: Arc<HashMap<PathBuf, Vec<u8>>>,
     pub(crate) tag_stamp: WriteStamp,
@@ -227,7 +227,7 @@ pub(crate) fn prepare(
             }
         }
     }
-    let mut converted = HashMap::new();
+    let mut converted = crate::app::ConvertedArchiveSources::default();
     for (item, meta) in items.iter().zip(metas) {
         if let GridItem::ConvertibleArchive { path, .. } = item {
             let state = if meta.is_some() {

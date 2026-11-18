@@ -1074,6 +1074,8 @@ impl App {
         // (= BS で snapshot list 復帰した時に Pending リセットせず再利用するため)。
         let list_view_items = captured_items_grid.clone();
         let list_view_thumbnails = captured_thumbnails.clone();
+        let list_view_converted_archive_sources = self.converted_archive_cache_paths.clone();
+        let saved_converted_archive_sources = self.converted_archive_cache_paths.clone();
         let list_view_image_metas = captured_image_metas.clone();
         let saved_page_identity_index = self.page_identity_index.clone();
         // Fixing this list is an explicit display request; late initial opens must retire.
@@ -1136,6 +1138,7 @@ impl App {
             saved_projection_recipe,
             saved_viewing_state,
             saved_thumbnails,
+            saved_converted_archive_sources,
             saved_image_metas,
             saved_visible_indices,
             saved_scroll_offset_y,
@@ -1144,6 +1147,7 @@ impl App {
             list_view_items,
             list_view_projection_recipe: self.projection_recipe.clone(),
             list_view_thumbnails,
+            list_view_converted_archive_sources,
             list_view_image_metas,
             list_view_page_identity_index: Default::default(),
             pre_snapshot_search_origin,
@@ -1486,6 +1490,8 @@ impl App {
             self.page_identity_index = snap.saved_page_identity_index;
             self.projection_recipe = snap.saved_projection_recipe;
             self.thumbnails = merged_thumbnails;
+            self.converted_archive_cache_paths = snap.saved_converted_archive_sources;
+            self.catch_up_converted_archive_sources();
             self.image_metas = snap.saved_image_metas;
             self.visible_indices = snap.saved_visible_indices;
             self.grid_scroll.set_position(snap.saved_scroll_offset_y);
@@ -1557,6 +1563,7 @@ impl App {
             snap_origin,
             list_items,
             list_thumbs,
+            list_sources,
             list_image_metas,
             list_identity_index,
             list_recipe,
@@ -1569,6 +1576,7 @@ impl App {
                 snap.origin.clone(),
                 snap.list_view_items.clone(),
                 snap.list_view_thumbnails.clone(),
+                snap.list_view_converted_archive_sources.clone(),
                 snap.list_view_image_metas.clone(),
                 snap.list_view_page_identity_index.clone(),
                 snap.list_view_projection_recipe.clone(),
@@ -1620,6 +1628,8 @@ impl App {
         self.page_identity_index = list_identity_index;
         self.projection_recipe = list_recipe;
         self.thumbnails = list_thumbs;
+        self.converted_archive_cache_paths = list_sources;
+        self.catch_up_converted_archive_sources();
         self.image_metas = list_image_metas;
         self.visible_indices = (0..n).collect();
         self.display_epub_source = display_epub_source;
@@ -3353,6 +3363,104 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn converted_source_snapshot_keeps_each_source_table_through_child_and_unfix() {
+        use crate::app::{
+            ConvertedArchiveCachePathsMsg, ConvertedArchiveCachePathsPending,
+            ConvertedArchiveSourceState as S,
+        };
+        use crate::thumb_loader::ConvertedSourceBinding;
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        let (_, book, key) = snapshot_cover_rotation_zip(&app);
+        let logical = app.tmp.path().join("logical.rar");
+        let cached = app.tmp.path().join("converted.zip");
+        std::fs::write(&cached, b"cache").unwrap();
+        let archive_key = crate::path_key::normalize_keep_drive(&logical);
+        let db = app.archive_cache_db.as_ref().unwrap().clone();
+        app.current_folder = Some(app.tmp.path().to_owned());
+        app.items = vec![GridItem::ZipFile(book.clone())];
+        app.thumbnails = vec![snapshot_loaded_cover(
+            &ctx,
+            crate::cover_source_scope::LoadedCoverIdentity::Page(key),
+        )];
+        if let ThumbnailState::Loaded {
+            converted_source_binding,
+            ..
+        } = &mut app.thumbnails[0]
+        {
+            *converted_source_binding = Some(ConvertedSourceBinding {
+                archive_key: archive_key.clone(),
+                read_archive: crate::path_key::normalize_keep_drive(&logical),
+            });
+        }
+        app.converted_archive_cache_paths
+            .insert(archive_key.clone(), S::Direct(logical.clone()));
+        app.image_metas = vec![Some((1, 1))];
+        app.visible_indices = vec![0];
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
+        let child = app.tmp.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        app.install_new_items(vec![], vec![]);
+        app.current_folder = Some(child);
+        assert!(app.converted_archive_cache_paths.is_empty());
+        db.record(
+            &logical,
+            1,
+            1,
+            crate::archive_converter::ArchiveFormat::Rar,
+            &cached,
+            5,
+            1,
+            false,
+        )
+        .unwrap();
+
+        for unfix in [false, true] {
+            if unfix {
+                app.deactivate_snapshot();
+            } else {
+                assert!(app.snapshot_return_to_list_view());
+            }
+            drain_snapshot_identity_preparation(&mut app);
+            assert_eq!(app.items, vec![GridItem::ZipFile(book.clone())]);
+            assert!(matches!(
+                app.converted_archive_cache_paths.get(&archive_key),
+                Some(S::Pending)
+            ));
+            assert_eq!(
+                app.converted_archive_cache_paths.synced_revision(),
+                db.revision()
+            );
+            // Pending retains cached pixels until the existing decision handler confirms.
+            assert!(app.thumbnails[0].has_pixels());
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
+                generation: app.items_generation,
+                cascade_depth: app.settings.folder_thumb_depth as usize,
+                cancel: Default::default(),
+                desired_indices: Default::default(),
+                rx,
+                pin_archive_dependencies: Default::default(),
+            });
+            tx.send(ConvertedArchiveCachePathsMsg::Resolved {
+                archive_key: archive_key.clone(),
+                state: S::CachedZip {
+                    logical_source: logical.clone(),
+                    path: cached.clone(),
+                },
+                idx: 0,
+                ordinal: 0,
+                elapsed_ms: 0.0,
+                input_seq: 0,
+            })
+            .unwrap();
+            app.poll_converted_archive_cache_paths(&ctx);
+            assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
         }
     }
 

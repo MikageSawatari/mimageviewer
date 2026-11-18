@@ -2813,3 +2813,80 @@ cargo nextest run -p mimageviewer --lib -E 'test(=app::search_nav_book_tests::se
   実装レビューで確かめる点として、`Pending` / `CacheOnly` の要求が印の `archive_key` を付けられるだけの論理の識別を持つこと、画素を返すすべての経路
   (編集プレビューの早い return・元からの画素・CPU 画像の待ち行列) が印を運ぶこと、採用の照合が待ち行列へ入る時点ではなく採用の直前にあること、
   欠けたピンの候補を作るときに確定済みの候補を戻さないこと、が挙がった。
+
+#### §1.803 実装記録（2026-11-18〜19、未コミット）
+
+- 前提照合: DBの各writer、判定batchのDrop/cancelとreceiver破棄、Smartの準備・統合・復元、
+  prepared metadata、viewer context swap、snapshot/direct-readerの元一覧復元、workerの
+  memory/catalog/preview/source画素経路を読んだ。§31の前提に実装を止める食い違いは無かった。
+- A: `archive_cache.rs`に成功した実変更だけのプロセス内変更列とatomic revisionを追加。
+  `app/converted_archive_sources.rs`の`ConvertedArchiveSources`が表と反映済みrevisionを保持する。
+  変更列と最大番号を同じlockで取り、候補の状態変更が無くても新しい記録があれば旧batchを取消す。
+  `app.rs`、`smart_folder.rs`、`viewer_context_registry.rs`、`subfolder_expansion.rs`、
+  `global_search_ui.rs`と`everything/metadata.rs`で所有・採用・統合の境界へ接続した。
+  `snapshot.rs`・`snapshot_ops.rs`・`startup_ops.rs`で元一覧と固定一覧それぞれに表を対で保存する。
+  §29のsnapshot入力収集も対の表を使う。管理画面の削除結果による通知配布と休眠contextの直接変更は撤去。
+- B: `thumb_loader.rs`の要求に`ConvertedSourceRequest`（候補key＋任意の確定した物理書庫）、
+  画素と`grid_item.rs`のLoadedに`ConvertedSourceBinding`を追加。`app.rs`は要求生成時に表から事実を渡し、
+  workerは実際の分岐でだけbindingを付ける。UIは単一述語を採用直前・確定反映・
+  `cover_rotation.rs`の保持一覧復元で使い、不一致を既存の退避helperへ送る。
+- C: workerは不一致行をmemory/catalog/pinの読取でmissとし、Legacyと共通の
+  `CoverRowReplacement`で保存閾値によらず同じ行へ置換する。通常フォルダ代表fallbackへは
+  変換sourceの要求を引き継がない。catalogのschema・key・行形式、AutoMaterial、worker cacheの形式は変更しない。
+- r3注記: Pending/CacheOnlyも要求の候補keyを保持する。編集previewの早いreturn、cache hit、
+  元からの画素はbindingを運び、CPU画像待ち行列はThumbPixelsをそのまま保持する。
+  stale判定は待ち行列への受信時ではなく、取り出した画像の採用直前に行う。
+  PinRootResolvedでは`entry(...).or_insert(Pending)`だけを使い、既存の確定候補を戻さない。
+- 既存の制約: PendingのCacheOnlyで付いたidle-upgrade対象外の印は、一致しているLoadedには
+  今回も残る。不一致を退避する場合は既存helperが外す。一致時の印の解除は別件。
+- テスト: `archive_cache.rs`の変更列テスト、`app/converted_source_tests.rs`のhandler/contextテスト、
+  `app/converted_source_transition_tests.rs`の双方向の通し、`snapshot_ops.rs`の子一覧→固定一覧→解除、
+  `smart_folder.rs`の準備・統合・移譲、`thumb_loader/converted_source_tests.rs`の各画素・置換経路を追加。
+  既存の保持一覧・読書位置・request寿命のテストも影響する境界を絞って再検証する。
+- 検証の最終結果は本記録の末尾に追記する。full gate・build-dev・製品起動・コミットは
+  今回の実装担当には実施しない指示があり、設計担当の共有runner・受入へ引き継ぐ。
+
+##### focused検証（未コミット差分、Windows / default features / test profile）
+
+Cargoは`CARGO_BUILD_JOBS=1`、nextestは`--test-threads 1`。実キーボードの状態を読むテストは追加していない。
+`load_one_cached`のbinding引数追加に伴い、`remote_ipc/container.rs`、
+`thumb_loader/folder_auto_tests.rs`、`thumb_loader/saved_rotation_sample_tests.rs`の独立した呼出しにはNoneを渡す。
+`app/thumbnail_requests.rs`、`cover_rotation_cache_tests.rs`、`vram_accounting.rs`の既存fixtureも新fieldの初期値を補った。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/converted_source/) | test(/archive_changes_/) | test(/prepared_converted_rar_uses_cached_zip_before_direct_read/) | test(/smart_membership_merge_catches_each_source_map_up/) | test(/smart_root_source_transfer/) | test(/sort_only_prepare_reuses_path_metadata_without_db_phases/)' --test-threads 1
+```
+
+- **32 passed / 0 failed**（16.537秒、`target/803-focused.log`）。workerの置換matrixは
+  Direct↔CachedZip × memory/catalog × archive/ZipDir/pin × 自動OFF/ON。
+  通しは自動OFF/ONそれぞれでrecord→catch-up→確定→退避→置換→変換後の回転key、
+  delete/prune/lookup削除→逆向きの置換→次回hitを検査する。置換後の自動行の本文回転失効もworker側で検査。
+  q:のドライブ復元・p:の外部書庫・変換cacheの場所の移動・分割RARの先頭巻、
+  previewの早いreturn、通常代表fallback、CPU画像待ち、休眠context、snapshotの段階的復帰を含む。
+- 初回のテストcompileで既存ThumbPixels fixtureのfield不足を検出し、初期値を補ってから上記を実行した。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E '(test(/app::cover_rotation::tests/) | test(/app::cover_scope_tests/) | test(/app::cover_rotation_cache_tests/) | test(/app::rar_archive_cache_tests/) | test(/archive_cache::tests/) | test(/book_resume_meter_.*(cache|source|smart)/) | test(/cover_rotation_snapshot_|cover_cache_snapshot_|cover_rotation_prepared_smart_root|smart_folder_cover_cache_restore|direct_reader_split_restores/) | test(/app::thumbnail_requests::tests/) | test(/history_transition_storage_keeps_app_stack_footprint_bounded/) | test(/converted_archive/)) - test(/archive_changes_/)' --test-threads 1
+```
+
+- 初回 **126 passed / 2 failed**（128件、72.399秒、`target/803-regression.log`）。
+  失敗は`book_resume_meter_copied_data_dir_uses_existing_cache_save_restore_key`と
+  `book_resume_meter_deleted_cache_reconversion_and_source_change_resume_same_key`。
+  削除完了だけをpollする旧テストhelperが、新しいsource pollの追従を通していなかった。
+  `book_resume_meter_tests.rs`の削除・再判定helperを実フレームと同じ順序へ合わせた。
+  読書位置・保存済み行・再変換の期待値は変更していない。製品コードの追加変更は無い。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/book_resume_meter_.*(cache|source|smart)/)' --test-threads 1
+cargo nextest run -p mimageviewer --lib -E 'test(/book_resume_meter_multipart_direct_worker_keeps_later_thumbnail_but_hides_meter/) | test(/book_resume_meter_deleted_multipart_solid_rar_keeps_first_meter_only/)' --test-threads 1
+```
+
+- 修正後 **11 passed / 0 failed**（8.706秒、`target/803-regression-followup.log`）、
+  同じhelperを使う分割RARの追加確認も **2 passed / 0 failed**（1.191秒、`target/803-multipart-followup.log`）。
+  失敗した2件は前者で再実行して通過。他領域の有効な成功結果は再利用する。
+
+- 最終`cargo check -p mimageviewer --bin mimageviewer-core`は成功（exit 0、1分02秒、
+  `target/803-core-check.log`）。引き継ぎ時の整形・空白検査は`cargo fmt`（引数なし）と
+  `git diff --check`。ブランチ`fix-803-rar-cover-source-swap`、HEAD `2eeefaf08`の未コミット差分。
+  full suite・build-dev・製品起動・commitは利用者の今回の制限に従って未実施。
+- 最終`cargo fmt`（引数なし）と`git diff --check`もexit 0。未解消のテスト失敗は無い。

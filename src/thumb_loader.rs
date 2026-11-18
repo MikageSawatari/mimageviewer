@@ -853,6 +853,8 @@ pub enum ThumbMsgPayload {
 pub struct ThumbPixels {
     pub auto_material: crate::cover_auto_material::AutoMaterial,
     pub cover: CoverIdentity,
+    /// Worker-observed physical archive; never persisted in catalog/cache rows.
+    pub(crate) converted_source_binding: Option<ConvertedSourceBinding>,
     pub image: egui::ColorImage,
     pub origin: ThumbLoadOrigin,
     pub from_edit_preview: bool,
@@ -863,6 +865,18 @@ pub struct ThumbPixels {
 }
 
 impl ThumbMsg {
+    pub(crate) fn with_converted_source_binding(
+        mut self,
+        binding: Option<ConvertedSourceBinding>,
+    ) -> Self {
+        match &mut self.payload {
+            ThumbMsgPayload::Pixels(p)
+            | ThumbMsgPayload::SourcePixels(p)
+            | ThumbMsgPayload::ProvisionalPixels(p) => p.converted_source_binding = binding,
+            _ => {}
+        }
+        self
+    }
     pub fn with_auto_material(
         mut self,
         material: crate::cover_auto_material::AutoMaterial,
@@ -915,6 +929,7 @@ impl ThumbMsg {
             ThumbMsgPayload::Pixels(ThumbPixels {
                 auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: CoverIdentity::Unrotatable,
+                converted_source_binding: None,
                 image,
                 origin,
                 from_edit_preview,
@@ -1497,8 +1512,78 @@ pub(crate) fn automatic_container_source(
     Ok(())
 }
 
+/// The logical candidate survives Pending/CacheOnly without guessing its physical source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConvertedSourceRequest {
+    pub(crate) archive_key: String,
+    pub(crate) expected_archive: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConvertedSourceBinding {
+    pub(crate) archive_key: String,
+    pub(crate) read_archive: String,
+}
+
+impl ConvertedSourceRequest {
+    fn bind_archive(&self, archive: &Path) -> ConvertedSourceBinding {
+        ConvertedSourceBinding {
+            archive_key: self.archive_key.clone(),
+            read_archive: crate::adjustment_db::normalize_path(archive),
+        }
+    }
+
+    fn bind_cover(&self, cover: &CoverIdentity) -> Option<ConvertedSourceBinding> {
+        let CoverIdentity::Page(page) = cover else {
+            return None;
+        };
+        let (archive, _) = page.split_once("::")?;
+        Some(self.bind_archive(Path::new(archive)))
+    }
+}
+
+impl LoadRequest {
+    fn converted_binding_for_cover(&self, cover: &CoverIdentity) -> Option<ConvertedSourceBinding> {
+        self.converted_source.as_ref()?.bind_cover(cover)
+    }
+
+    fn converted_binding_for_row(
+        &self,
+        entry: &crate::catalog::CacheEntry,
+    ) -> Option<ConvertedSourceBinding> {
+        // A policy-excluded pin's automatic folder projection uses the same writer key.
+        // Its provenance is the actual fallback branch, not the requested archive pin.
+        if self.epub_pin_fallback.is_some()
+            && entry.folder_provenance == Some(crate::catalog::FolderThumbProvenance::AutoSelected)
+        {
+            return None;
+        }
+        self.converted_binding_for_cover(&entry.cover)
+    }
+
+    fn converted_row_mismatches(&self, entry: &crate::catalog::CacheEntry) -> bool {
+        self.source_policy.allows_source()
+            && self.converted_source.as_ref().is_some_and(|source| {
+                source.expected_archive.as_deref().is_some_and(|expected| {
+                    self.converted_binding_for_row(entry)
+                        .is_some_and(|binding| {
+                            binding.read_archive != crate::adjustment_db::normalize_path(expected)
+                        })
+                })
+            })
+    }
+}
+
+/// One replacement obligation shared by legacy migration and physical-source changes.
+#[derive(Clone, Copy)]
+enum CoverRowReplacement {
+    Legacy,
+    ConvertedSource,
+}
+
 #[derive(Clone, Default)]
 pub struct LoadRequest {
+    pub(crate) converted_source: Option<ConvertedSourceRequest>,
     /// Only the owning listing pool attaches its first-page/parent correspondence.
     pub(crate) virtual_folder_parent: Option<Box<VirtualFolderParent>>,
     /// Immutable source facts, captured before representative/pin path rewriting.
@@ -3151,12 +3236,16 @@ fn send_pinned_only_cached(
         // Keep the pre-EPUB first-frame seed: it can be shown before the
         // child pin, PDF generation, and exact writer key are resolved. The
         // following exact lookup is authoritative and replaces or rejects it.
-        let preview = resumed.as_ref().or(catalog).and_then(|db| {
-            db.load_latest_uncropped_with_prefix_matching(&cache_key_prefix, None)
-                .ok()
-                .flatten()
-                .map(|(_, entry)| entry)
-        });
+        let preview = resumed
+            .as_ref()
+            .or(catalog)
+            .and_then(|db| {
+                db.load_latest_uncropped_with_prefix_matching(&cache_key_prefix, None)
+                    .ok()
+                    .flatten()
+                    .map(|(_, entry)| entry)
+            })
+            .filter(|entry| !req.converted_row_mismatches(entry));
         if canceled() {
             return false;
         }
@@ -3178,6 +3267,7 @@ fn send_pinned_only_cached(
                     )
                     .with_request_id(req.request_id)
                     .with_auto_material(entry.auto_material)
+                    .with_converted_source_binding(req.converted_binding_for_row(&entry))
                     .with_cover(entry.cover.clone())
                     .provisional_pixels(),
                 );
@@ -3233,6 +3323,7 @@ fn send_pinned_only_cached(
         seed_request.cache_key_override = Some(key.clone());
         seed_request.folder_thumb_provenance = Some(crate::catalog::FolderThumbProvenance::Seeded);
         folder_cached_row_usable(&seed_request, entry, pin_db)
+            && !req.converted_row_mismatches(entry)
     });
 
     let Some((filename, entry)) = cached else {
@@ -3242,6 +3333,7 @@ fn send_pinned_only_cached(
         ));
         return false;
     };
+    let converted_source_binding = req.converted_binding_for_row(&entry);
     let crate::catalog::CacheEntry {
         cover,
         jpeg_data: webp_data,
@@ -3270,6 +3362,7 @@ fn send_pinned_only_cached(
             req.input_seq,
             req.items_gen,
         )
+        .with_converted_source_binding(converted_source_binding)
         .with_cover(cover)
         .with_request_id(req.request_id),
     );
@@ -3395,7 +3488,9 @@ fn send_pinned_child_folder_cached(
     child_request.path = child;
     child_request.cache_key_override = Some(key.clone());
     child_request.folder_thumb_provenance = Some(provenance);
-    if !folder_cached_row_usable(&child_request, &entry, pin_db) {
+    if !folder_cached_row_usable(&child_request, &entry, pin_db)
+        || req.converted_row_mismatches(&entry)
+    {
         return false;
     }
     if let Some(target) = resolved.as_ref() {
@@ -3454,6 +3549,7 @@ fn send_pinned_child_folder_cached(
             req.items_gen,
         )
         .with_auto_material(entry.auto_material)
+        .with_converted_source_binding(req.converted_binding_for_row(&entry))
         .with_cover(entry.cover)
         .with_request_id(req.request_id),
     );
@@ -3661,6 +3757,7 @@ fn process_load_request_with_provider(
             Ok(Some(pixels)) => ThumbMsgPayload::Pixels(ThumbPixels {
                 auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: CoverIdentity::Unrotatable,
+                converted_source_binding: None,
                 image: pixels.image,
                 origin: pixels.origin,
                 from_edit_preview: false,
@@ -3766,6 +3863,10 @@ fn process_load_request_with_provider(
             req.cover_crop,
             None, // RAW development never enters automatic cover detection.
             req.zip_dir_prefix.as_deref(),
+            req.converted_source
+                .as_ref()
+                .filter(|_| req.zip_entry.is_some())
+                .map(|source| source.bind_archive(&req.path)),
         );
         return;
     }
@@ -3811,6 +3912,7 @@ fn process_load_request_with_provider(
         && !policy_archive_pin_visible(req, cancel.map(AsRef::as_ref))
     {
         let mut fallback = req.epub_pin_fallback.as_deref().unwrap().clone();
+        fallback.converted_source = None;
         fallback.inherit_request_identity_from(req);
         // Keep the writer/reader pin route and stamp: parent and drive consumers must find
         // the completed automatic projection without inspecting archive ancestry themselves.
@@ -3847,6 +3949,7 @@ fn process_load_request_with_provider(
     let fallback_or_fail = || {
         if let Some(fallback) = req.epub_pin_fallback.as_deref() {
             let mut fallback = fallback.clone();
+            fallback.converted_source = None;
             fallback.inherit_request_identity_from(req);
             if req.cover_crop.is_none() && req.auto_cover_crop.is_some() {
                 fallback.cache_key_override = req.cache_key_override.clone();
@@ -3974,6 +4077,7 @@ fn process_load_request_with_provider(
                 req.items_gen,
             )
             .with_source_coverage(preview.coverage)
+            .with_converted_source_binding(req.converted_binding_for_cover(&cover))
             .with_cover(cover)
             .with_request_id(req.request_id),
         );
@@ -4017,19 +4121,26 @@ fn process_load_request_with_provider(
     } else {
         None
     };
-    // A Legacy memory hit must take the ordinary miss path, including Parent observation.
+    // Rejected memory rows take the ordinary miss path, including Parent observation.
     let mut legacy_fallback = None;
+    let mut replacement = None;
     let memory = memory.filter(|entry| {
         if req.refresh_legacy_cover && entry.cover == CoverIdentity::Legacy {
             legacy_fallback = Some(entry.clone());
+            if matches!(req.catalog_target, RequestCatalog::Fixed { .. }) {
+                replacement = Some(CoverRowReplacement::Legacy);
+            }
+            false
+        } else if req.converted_row_mismatches(entry) {
+            if matches!(req.catalog_target, RequestCatalog::Fixed { .. }) {
+                replacement = Some(CoverRowReplacement::ConvertedSource);
+            }
             false
         } else {
             true
         }
     });
-    // Synthetic search memory is not evidence that a Parent row exists.
-    let mut replace_legacy_row =
-        legacy_fallback.is_some() && matches!(req.catalog_target, RequestCatalog::Fixed { .. });
+    // Synthetic search memory alone is not evidence that a Parent row exists.
     if memory.is_none() && req.source_policy.allows_source() {
         observe_parent_stamp(req);
     }
@@ -4095,7 +4206,10 @@ fn process_load_request_with_provider(
         let cached = cached.filter(|entry| {
             if req.refresh_legacy_cover && entry.cover == CoverIdentity::Legacy {
                 legacy_fallback = Some(entry.clone());
-                replace_legacy_row = true;
+                replacement = Some(CoverRowReplacement::Legacy);
+                false
+            } else if req.converted_row_mismatches(entry) {
+                replacement = Some(CoverRowReplacement::ConvertedSource);
                 false
             } else {
                 true
@@ -4141,6 +4255,7 @@ fn process_load_request_with_provider(
                         req.items_gen,
                     )
                     .with_auto_material(entry.auto_material)
+                    .with_converted_source_binding(req.converted_binding_for_row(&entry))
                     .with_cover(entry.cover.clone())
                     .with_request_id(req.request_id),
                 );
@@ -4230,6 +4345,13 @@ fn process_load_request_with_provider(
 
     let resolved = resolve_read_after_cache_miss(req, pin_db, cancel);
     let cover = cover_identity_for_location(&resolved.location, req.books_root.as_deref());
+    let converted_source_binding = match &resolved.location {
+        ReadLocation::ArchiveEntry { archive, .. } => req
+            .converted_source
+            .as_ref()
+            .map(|source| source.bind_archive(archive)),
+        _ => None,
+    };
     let (load_path, zip_entry_ref) = match &resolved.location {
         ReadLocation::File(path) => (path.as_path(), None),
         ReadLocation::ArchiveEntry { archive, entry } => (archive.as_path(), Some(entry.as_str())),
@@ -4373,7 +4495,7 @@ fn process_load_request_with_provider(
         // never to the new source-parent namespace. Request origin is irrelevant.
         if let Some(cat) = save_target
             .fixed_catalog()
-            .filter(|_| req.force_cache || replace_legacy_row || policy_should_save)
+            .filter(|_| req.force_cache || replacement.is_some() || policy_should_save)
         {
             match cat.save_auto_folder_bytes(
                 filename,
@@ -4436,6 +4558,7 @@ fn process_load_request_with_provider(
                 req.items_gen,
             )
             .with_auto_material(cached.auto_material)
+            .with_converted_source_binding(None)
             .with_cover(cover)
             .with_request_id(req.request_id),
         );
@@ -4522,7 +4645,7 @@ fn process_load_request_with_provider(
     // (詳細は docs/pdf-pool-harvest-on-cancel-plan.md)
     let cancel_policy = if req.pdf_page.is_some()
         && req.source_policy.allows_cache()
-        && save_target.can_harvest(req.force_cache || replace_legacy_row, cache_decision)
+        && save_target.can_harvest(req.force_cache || replacement.is_some(), cache_decision)
     {
         crate::pdf_loader::CancelWaitPolicy::HarvestOnCancel
     } else {
@@ -4575,7 +4698,7 @@ fn process_load_request_with_provider(
         req.request_id,
         req.pdf_render_validity.clone(),
         cancel_policy,
-        req.force_cache || replace_legacy_row,
+        req.force_cache || replacement.is_some(),
         req.source_policy.bypasses_cache(),
         pinned_page_adjustment.as_ref(),
         req.folder_thumb_provenance,
@@ -4588,6 +4711,7 @@ fn process_load_request_with_provider(
         cover_crop,
         auto_cover_crop,
         req.zip_dir_prefix.as_deref(),
+        converted_source_binding,
     );
     if crate::perf::is_enabled() {
         let total_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
@@ -6580,6 +6704,7 @@ pub(crate) fn load_one_cached(
     cover_crop: Option<crate::folder_thumb_pins::CoverCrop>,
     auto_cover_crop: Option<ResolvedAutoCover>,
     auto_zip_prefix: Option<&str>,
+    converted_source_binding: Option<ConvertedSourceBinding>,
 ) {
     let catalog = save_target.fixed_catalog();
     // The existing continuation clone preserves the outer folder item even when
@@ -7630,6 +7755,7 @@ pub(crate) fn load_one_cached(
             items_gen,
         )
         .with_request_id(request_id)
+        .with_converted_source_binding(converted_source_binding)
         .with_cover(cover.clone())
         .with_auto_material(auto_material)
         .source_pixels(),
@@ -7996,6 +8122,7 @@ mod tests {
     include!("thumb_loader/auto_material_tests.rs");
     include!("thumb_loader/folder_auto_tests.rs");
     include!("thumb_loader/saved_rotation_sample_tests.rs");
+    include!("thumb_loader/converted_source_tests.rs");
     use super::*;
     use crate::settings::{CachePolicy, Settings, SortOrder};
     use std::collections::HashMap;
@@ -10852,6 +10979,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
 
         let source = rx.try_recv().unwrap();
@@ -11518,6 +11646,7 @@ mod tests {
                 input: AutoCoverInput::Container,
             }),
             None,
+            None,
         );
         assert_eq!(done.load(Ordering::Relaxed), 1);
         let messages: Vec<_> = rx.try_iter().collect();
@@ -11688,6 +11817,7 @@ mod tests {
                     CoverIdentity::Page(crate::adjustment_db::normalize_path(&path)),
                     None,
                     cropped.then(|| manual_cover_crop([750_000, 0, 1_000_000, 1_000_000])),
+                    None,
                     None,
                     None,
                 );

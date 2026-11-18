@@ -19,6 +19,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
@@ -150,6 +151,8 @@ pub struct ArchiveCacheEntry {
 /// 内部 `Connection` は `Mutex` で保護される。
 pub struct ArchiveCacheDb {
     conn: Mutex<Connection>,
+    revision: AtomicU64,
+    changes: Mutex<Vec<(u64, ArchiveCacheChange)>>,
     /// 変換 (`reserve_cache_zip_path` → 実際のファイル write → `record`) と
     /// 保守 (`delete_entry` / `clear_all`) を直列化するための独立 lock。
     ///
@@ -164,6 +167,14 @@ pub struct ArchiveCacheDb {
     /// 指示したタイミングでしか起きないので許容する。変換中に保守が待たされる
     /// ケースは通常秒オーダーで収束する。
     convert_lock: Mutex<()>,
+}
+
+/// Process-local changes to the source-to-cache mapping. Access-time updates do
+/// not change the mapping. Consumers retain their own last-applied revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ArchiveCacheChange {
+    Source(String),
+    AllCached,
 }
 
 /// Read-only mapping evidence for an aggregate worker. File existence alone never proves
@@ -196,6 +207,33 @@ impl ConvertedArchiveSnapshot {
 }
 
 impl ArchiveCacheDb {
+    /// Cheap comparison for frames with no mapping changes; no database access.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// Read changes and their maximum revision in one snapshot. Reading the
+    /// atomic again afterward could acknowledge a change absent from this batch.
+    pub(crate) fn changes_since(&self, revision: u64) -> (u64, Vec<(u64, ArchiveCacheChange)>) {
+        let changes = self.changes.lock().unwrap();
+        let current = changes.last().map_or(0, |(revision, _)| *revision);
+        let first = changes.partition_point(|(entry_revision, _)| *entry_revision <= revision);
+        (current, changes[first..].to_vec())
+    }
+
+    /// Called with the connection still locked, after a successful committed
+    /// write. Publishing last ensures readers never observe a revision before
+    /// its entry is present in the log. The log lives for this DB handle's life.
+    fn record_changes(&self, entries: impl IntoIterator<Item = ArchiveCacheChange>) {
+        let mut changes = self.changes.lock().unwrap();
+        let mut revision = changes.last().map_or(0, |(revision, _)| *revision);
+        for change in entries {
+            revision += 1;
+            changes.push((revision, change));
+        }
+        self.revision.store(revision, Ordering::Release);
+    }
+
     /// Worker-only lookup; no access-time updates, invalidation or cache deletion.
     pub(crate) fn snapshot_for_source(&self, source: &Path) -> Option<ConvertedArchiveSnapshot> {
         self.read_projection_snapshot("src_path_key", &crate::path_key::normalize(source))
@@ -274,6 +312,8 @@ impl ArchiveCacheDb {
         init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            revision: AtomicU64::new(0),
+            changes: Mutex::new(Vec::new()),
             convert_lock: Mutex::new(()),
         })
     }
@@ -286,6 +326,8 @@ impl ArchiveCacheDb {
         conn.pragma_update(None, "query_only", true)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            revision: AtomicU64::new(0),
+            changes: Mutex::new(Vec::new()),
             convert_lock: Mutex::new(()),
         })
     }
@@ -345,11 +387,14 @@ impl ArchiveCacheDb {
         // 古く上書きしてしまうのを避ける)。
         let conn = self.conn.lock().ok()?;
         if mismatch || !zip_exists {
-            let _ = conn.execute(
+            if let Ok(deleted) = conn.execute(
                 "DELETE FROM converted_archives \
                  WHERE src_path_key = ?1 AND src_mtime = ?2 AND src_size = ?3",
                 params![&key, m, s],
-            );
+            ) && deleted > 0
+            {
+                self.record_changes([ArchiveCacheChange::Source(key)]);
+            }
             return None;
         }
         let now = now_secs();
@@ -444,7 +489,7 @@ impl ArchiveCacheDb {
         let format_str = format_to_db(format);
         let now = now_secs();
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let changed = conn.execute(
             "INSERT OR REPLACE INTO converted_archives \
              (src_path_key, src_path, src_mtime, src_size, format, \
               cached_zip_path, cached_zip_size, converted_at, last_access_at, image_count, password_required, origin_manifest_version) \
@@ -462,6 +507,9 @@ impl ArchiveCacheDb {
                 if password_required { 1i64 } else { 0i64 },
             ],
         )?;
+        if changed > 0 {
+            self.record_changes([ArchiveCacheChange::Source(key)]);
+        }
         Ok(())
     }
 
@@ -558,10 +606,13 @@ impl ArchiveCacheDb {
         };
         remove_cache_file_and_dirs(Path::new(&cached));
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let deleted = conn.execute(
             "DELETE FROM converted_archives WHERE src_path_key = ?1",
             params![&key],
         )?;
+        if deleted > 0 {
+            self.record_changes([ArchiveCacheChange::Source(key)]);
+        }
         Ok(())
     }
 
@@ -616,6 +667,9 @@ impl ArchiveCacheDb {
             }
         }
         tx.commit()?;
+        if deleted > 0 {
+            self.record_changes([ArchiveCacheChange::AllCached]);
+        }
         Ok(deleted)
     }
 
@@ -694,14 +748,19 @@ impl ArchiveCacheDb {
 
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
+        let mut deleted_keys = Vec::new();
         {
             let mut stmt = tx.prepare("DELETE FROM converted_archives WHERE src_path_key = ?1")?;
             for key in &remove_keys {
-                stmt.execute(params![key])?;
+                if stmt.execute(params![key])? > 0 {
+                    deleted_keys.push(key.clone());
+                }
             }
         }
         tx.commit()?;
-        Ok(remove_keys.len())
+        let deleted = deleted_keys.len();
+        self.record_changes(deleted_keys.into_iter().map(ArchiveCacheChange::Source));
+        Ok(deleted)
     }
 
     /// 変換完了時に使う予定の出力パスを返す (親ディレクトリも作成する)。
@@ -800,6 +859,292 @@ fn remove_cache_file_and_dirs(zip_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source_change(src: &Path) -> ArchiveCacheChange {
+        ArchiveCacheChange::Source(crate::path_key::normalize(src))
+    }
+
+    fn record_revision_test_cache(db: &ArchiveCacheDb, src: &Path) -> rusqlite::Result<()> {
+        db.record(
+            src,
+            10,
+            20,
+            ArchiveFormat::Rar,
+            &src.with_extension("zip"),
+            100,
+            1,
+            false,
+        )
+    }
+
+    #[test]
+    fn archive_changes_record_and_lookup_only_publish_mapping_writes() {
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let db = ArchiveCacheDb::open().unwrap();
+        let src = guard.path().join("Book.rar");
+        let cached = src.with_extension("zip");
+        assert_eq!(db.revision(), 0);
+        assert_eq!(db.changes_since(0), (0, vec![]));
+
+        record_revision_test_cache(&db, &src).unwrap();
+        assert_eq!(db.changes_since(0), (1, vec![(1, source_change(&src))]));
+        // A new conversion can replace pixels at the same path and source stamp.
+        record_revision_test_cache(&db, &src).unwrap();
+        assert_eq!(db.changes_since(1), (2, vec![(2, source_change(&src))]));
+        std::fs::write(&cached, b"zip").unwrap();
+        assert_eq!(db.peek(&src, 10, 20), Some(cached.clone()));
+        assert_eq!(db.lookup(&src, 10, 20), Some(cached.clone()));
+        assert_eq!(
+            db.revision(),
+            2,
+            "access-time UPDATE is not a source change"
+        );
+        assert_eq!(db.changes_since(2), (2, vec![]));
+
+        assert!(db.lookup(&src, 11, 20).is_none());
+        assert_eq!(db.changes_since(2), (3, vec![(3, source_change(&src))]));
+        assert!(db.lookup(&src, 11, 20).is_none());
+        assert_eq!(
+            db.revision(),
+            3,
+            "an absent row does not publish a deletion"
+        );
+
+        record_revision_test_cache(&db, &src).unwrap();
+        assert!(!cached.exists());
+        assert!(db.lookup(&src, 10, 20).is_none());
+        assert_eq!(
+            db.changes_since(3),
+            (5, vec![(4, source_change(&src)), (5, source_change(&src))])
+        );
+    }
+
+    #[test]
+    fn archive_changes_record_and_deletes_ignore_noops_and_errors() {
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let db = ArchiveCacheDb::open().unwrap();
+        let src = guard.path().join("book.rar");
+        db.delete_entry(&src).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER ignore_insert BEFORE INSERT ON converted_archives \
+             BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        record_revision_test_cache(&db, &src).unwrap();
+        assert_eq!(db.revision(), 0);
+        assert!(db.list_all().unwrap().is_empty());
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER ignore_insert; PRAGMA query_only=ON;")
+            .unwrap();
+        assert!(record_revision_test_cache(&db, &src).is_err());
+        assert_eq!(db.revision(), 0);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only=OFF;")
+            .unwrap();
+        record_revision_test_cache(&db, &src).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER ignore_delete BEFORE DELETE ON converted_archives \
+             BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        db.delete_entry(&src).unwrap();
+        assert!(db.lookup(&src, 10, 20).is_none());
+        assert_eq!(db.changes_since(1), (1, vec![]));
+        assert_eq!(db.list_all().unwrap().len(), 1);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER ignore_delete; PRAGMA query_only=ON;")
+            .unwrap();
+        assert!(db.delete_entry(&src).is_err());
+        assert!(db.lookup(&src, 10, 20).is_none());
+        assert_eq!(db.changes_since(1), (1, vec![]));
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only=OFF;")
+            .unwrap();
+        db.delete_entry(&src).unwrap();
+        assert_eq!(db.changes_since(1), (2, vec![(2, source_change(&src))]));
+        db.delete_entry(&src).unwrap();
+        assert_eq!(db.revision(), 2);
+    }
+
+    #[test]
+    fn archive_changes_delete_missing_originals_only_publishes_deleted_sources() {
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let db = ArchiveCacheDb::open().unwrap();
+        let present = guard.path().join("present.rar");
+        let missing = guard.path().join("missing.rar");
+        std::fs::write(&present, b"rar").unwrap();
+        record_revision_test_cache(&db, &present).unwrap();
+        record_revision_test_cache(&db, &missing).unwrap();
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only=ON;")
+            .unwrap();
+        assert_eq!(db.delete_missing_originals().unwrap(), 0);
+        assert_eq!(db.changes_since(2), (2, vec![]));
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("PRAGMA query_only=OFF;")
+            .unwrap();
+        assert_eq!(db.delete_missing_originals().unwrap(), 1);
+        assert_eq!(db.changes_since(2), (3, vec![(3, source_change(&missing))]));
+        assert_eq!(db.delete_missing_originals().unwrap(), 0);
+        assert_eq!(db.revision(), 3);
+        assert_eq!(db.list_all().unwrap()[0].src_path, present);
+    }
+
+    #[test]
+    fn archive_changes_clear_all_only_publishes_committed_nonempty_deletion() {
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let db = ArchiveCacheDb::open().unwrap();
+        let a = guard.path().join("a.rar");
+        let b = guard.path().join("b.rar");
+        record_revision_test_cache(&db, &a).unwrap();
+        record_revision_test_cache(&db, &b).unwrap();
+        // Abort after the second DELETE: the first must roll back without a log entry.
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_second_delete AFTER DELETE ON converted_archives \
+             WHEN (SELECT COUNT(*) FROM converted_archives) = 0 \
+             BEGIN SELECT RAISE(ABORT, 'test deletion failure'); END;",
+            )
+            .unwrap();
+        assert!(db.clear_all().is_err());
+        assert_eq!(db.changes_since(2), (2, vec![]));
+        assert_eq!(db.list_all().unwrap().len(), 2);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_second_delete;")
+            .unwrap();
+        assert_eq!(db.clear_all().unwrap(), 2);
+        assert_eq!(
+            db.changes_since(2),
+            (3, vec![(3, ArchiveCacheChange::AllCached)])
+        );
+        assert_eq!(db.clear_all().unwrap(), 0);
+        assert_eq!(db.changes_since(3), (3, vec![]));
+    }
+
+    #[test]
+    fn archive_changes_prune_only_publishes_actual_committed_deletions() {
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let db = ArchiveCacheDb::open().unwrap();
+        let a = guard.path().join("a.rar");
+        let b = guard.path().join("b.rar");
+        let protected = guard.path().join("protected.rar");
+        for src in [&a, &b, &protected] {
+            record_revision_test_cache(&db, src).unwrap();
+        }
+        let _convert_guard = db.begin_convert();
+        assert_eq!(db.prune_to_size_limit_locked(0, &protected).unwrap(), 0);
+        assert_eq!(db.prune_to_size_limit_locked(300, &protected).unwrap(), 0);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "CREATE TEMP TRIGGER ignore_delete BEFORE DELETE ON converted_archives \
+             BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        assert_eq!(db.prune_to_size_limit_locked(100, &protected).unwrap(), 0);
+        assert_eq!(db.changes_since(3), (3, vec![]));
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch(
+                "DROP TRIGGER ignore_delete; \
+             CREATE TEMP TRIGGER fail_second_delete AFTER DELETE ON converted_archives \
+             WHEN (SELECT COUNT(*) FROM converted_archives) = 1 \
+             BEGIN SELECT RAISE(ABORT, 'test deletion failure'); END;",
+            )
+            .unwrap();
+        assert!(db.prune_to_size_limit_locked(100, &protected).is_err());
+        assert_eq!(db.changes_since(3), (3, vec![]));
+        assert_eq!(db.list_all().unwrap().len(), 3);
+        db.conn
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_second_delete;")
+            .unwrap();
+        assert_eq!(db.prune_to_size_limit_locked(100, &protected).unwrap(), 2);
+        assert_eq!(
+            db.changes_since(3),
+            (5, vec![(4, source_change(&a)), (5, source_change(&b))])
+        );
+        assert_eq!(db.prune_to_size_limit_locked(1, &protected).unwrap(), 0);
+        assert_eq!(db.changes_since(5), (5, vec![]));
+        assert_eq!(db.list_all().unwrap()[0].src_path, protected);
+    }
+
+    #[test]
+    fn archive_changes_snapshot_revision_covers_exactly_the_returned_changes() {
+        let guard = crate::data_dir::TestDataDirGuard::new();
+        let db = ArchiveCacheDb::open().unwrap();
+        let mut cursor = 0;
+        let mut observed = Vec::new();
+        std::thread::scope(|scope| {
+            for producer in 0..2 {
+                let db = &db;
+                let root = guard.path().to_path_buf();
+                scope.spawn(move || {
+                    for index in 0..32 {
+                        let src = root.join(format!("{producer}-{index}.rar"));
+                        record_revision_test_cache(db, &src).unwrap();
+                        std::thread::yield_now();
+                    }
+                });
+            }
+            for _ in 0..128 {
+                let (revision, changes) = db.changes_since(cursor);
+                assert_eq!(revision - cursor, changes.len() as u64);
+                assert_eq!(
+                    changes
+                        .iter()
+                        .map(|(revision, _)| *revision)
+                        .collect::<Vec<_>>(),
+                    ((cursor + 1)..=revision).collect::<Vec<_>>()
+                );
+                cursor = revision;
+                observed.extend(changes);
+                std::thread::yield_now();
+            }
+        });
+        let (revision, changes) = db.changes_since(cursor);
+        assert_eq!(revision - cursor, changes.len() as u64);
+        observed.extend(changes);
+        assert_eq!(revision, 64);
+        assert_eq!(db.revision(), revision);
+        assert_eq!(observed.len(), 64);
+        let sources: std::collections::HashSet<_> = observed
+            .into_iter()
+            .map(|(_, change)| match change {
+                ArchiveCacheChange::Source(source) => source,
+                ArchiveCacheChange::AllCached => panic!("only conversions were recorded"),
+            })
+            .collect();
+        assert_eq!(sources.len(), 64);
+        // Reopening starts a new process-local history; no schema or row revision.
+        let reopened = ArchiveCacheDb::open_readonly().unwrap();
+        assert_eq!(reopened.changes_since(0), (0, vec![]));
+    }
 
     #[test]
     fn visibility_cache_root_and_projection_lookup_accept_physical_spellings() {

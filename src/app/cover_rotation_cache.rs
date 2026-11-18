@@ -440,16 +440,24 @@ impl App {
             self.folder_thumb_pin_db.as_ref(),
         );
         if let Some(snapshot) = &self.snapshot {
-            for (items, thumbs) in [
-                (&snapshot.saved_items, &snapshot.saved_thumbnails),
-                (&snapshot.list_view_items, &snapshot.list_view_thumbnails),
+            for (items, thumbs, sources) in [
+                (
+                    &snapshot.saved_items,
+                    &snapshot.saved_thumbnails,
+                    &snapshot.saved_converted_archive_sources,
+                ),
+                (
+                    &snapshot.list_view_items,
+                    &snapshot.list_view_thumbnails,
+                    &snapshot.list_view_converted_archive_sources,
+                ),
             ] {
                 inputs.grid(
                     items,
                     thumbs,
                     None,
                     None,
-                    &self.converted_archive_cache_paths,
+                    sources,
                     &self.thumbnail_pool_catalog,
                     self.current_color_cache_map.as_ref(),
                     &self.settings,

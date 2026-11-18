@@ -2662,6 +2662,7 @@ impl App {
                 );
                 self.folder_pin_map = prepared.pins;
                 self.converted_archive_cache_paths = prepared.converted;
+                self.catch_up_converted_archive_sources();
                 (
                     Some(prepared.tags),
                     SearchVideoPins::Prepared(prepared.video_pin_blobs),
