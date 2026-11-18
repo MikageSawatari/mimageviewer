@@ -36400,6 +36400,10 @@ impl App {
     /// Retire an unfinished direct owner before admitting a staged request from its visible source.
     fn retire_direct_document_open_for_history_admission(&mut self) {
         self.retire_book_deferred_open();
+        self.retire_cold_pdf_candidate();
+    }
+
+    fn retire_cold_pdf_candidate(&mut self) {
         let Some(mut pending) = self.pdf_enumerate_pending.take() else {
             return;
         };
@@ -60449,6 +60453,108 @@ impl App {
         // decides whether a replacement request or a terminal finish releases it.
     }
 
+    /// A grid traversal replaces separate explicit opens, not its own adoption tail or a
+    /// same-list refresh. Keep the native request types as the source of this distinction.
+    fn retire_explicit_main_opens_for_grid_traversal(&mut self) {
+        fn explicit_open_intent(intent: &StartupListIntent) -> bool {
+            matches!(
+                intent,
+                StartupListIntent::ExplicitList
+                    | StartupListIntent::ClassifyFolder
+                    | StartupListIntent::PageContinuation
+            )
+        }
+        fn separate_open_navigation(navigation: &MainListNavigation) -> bool {
+            // A normal open inside a search uses Restore, so Direct alone is insufficient.
+            !matches!(
+                navigation.history,
+                MainHistoryOperation::SameLocation | MainHistoryOperation::Replay(_)
+            )
+        }
+        fn main_open_owner(owner: &OpenRequestOwner) -> bool {
+            match owner {
+                OpenRequestOwner::DetachedGridArchive(_) => false,
+                #[cfg(windows)]
+                OpenRequestOwner::Bookmark(bookmark) => bookmark.detached_lease.is_none(),
+                _ => true,
+            }
+        }
+
+        let main = self.viewer_context_main();
+        if self
+            .top_level_grid_view
+            .open_path_classification()
+            .is_some_and(|request| {
+                request.context == main
+                    && request
+                        .navigation
+                        .as_ref()
+                        .is_some_and(separate_open_navigation)
+                    && match request.continuation.as_deref() {
+                        Some(
+                            ClassifiedOpenContinuation::Direct {
+                                owner,
+                                restore_intent,
+                                ..
+                            }
+                            | ClassifiedOpenContinuation::DirectNavigation {
+                                owner,
+                                restore_intent,
+                                ..
+                            }
+                            | ClassifiedOpenContinuation::DirectScan {
+                                owner,
+                                restore_intent,
+                                ..
+                            },
+                        ) => main_open_owner(owner) && explicit_open_intent(restore_intent),
+                        Some(ClassifiedOpenContinuation::SmartGrid { restore_intent, .. }) => {
+                            explicit_open_intent(restore_intent)
+                        }
+                        Some(ClassifiedOpenContinuation::Physical {
+                            dfs_continuation,
+                            restore_intent,
+                            ..
+                        }) => dfs_continuation.is_none() && explicit_open_intent(restore_intent),
+                        _ => false,
+                    }
+            })
+        {
+            self.top_level_grid_view.set_open_path_classification(None);
+        }
+        if matches!(self.top_level_grid_view.history_navigation_transition(),
+            Some(HistoryNavigationTransition::Physical(request))
+                if request.source_context == main
+                    && request.dfs_continuation.is_none()
+                    && separate_open_navigation(&request.navigation)
+                    && explicit_open_intent(&request.restore_intent))
+        {
+            self.replace_history_navigation_transition(None);
+        }
+        if self
+            .folder_pane_open_pending
+            .as_ref()
+            .is_some_and(|request| {
+                matches!(
+                    request.purpose,
+                    FolderOpenScanPurpose::PaneNavigation
+                        | FolderOpenScanPurpose::DirectNavigation
+                        | FolderOpenScanPurpose::JumpToPhysicalFolder { .. }
+                        | FolderOpenScanPurpose::RequiredFullscreenTarget { .. }
+                )
+            })
+        {
+            self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+        }
+        if self.pdf_enumerate_pending.as_ref().is_some_and(|pending| {
+            main_open_owner(&pending.3)
+                && matches!(&pending.5, PdfOpenPhase::ColdCandidate { restore_intent, .. }
+                    if explicit_open_intent(restore_intent))
+        }) {
+            self.retire_cold_pdf_candidate();
+        }
+    }
+
     /// Retire the old grid request at a successful, explicit main admission.
     /// Hydrated rows remain adopted; only their obsolete navigation tail is removed.
     /// Classification/physical preflights are retired by the existing main arbiter.
@@ -60570,9 +60676,7 @@ impl App {
         }
         // 新しい nav 列開始: アキュームレータをリセットしてから spawn
         if mode.is_grid_traversal() && self.main_folder_history_available() {
-            // A new traversal wins over older main opens. Same-mode accumulation has
-            // already returned above, and no new worker exists yet at this boundary.
-            self.retire_replaced_main_list_requests(None);
+            self.retire_explicit_main_opens_for_grid_traversal();
         } else if self.direct_navigation_scan_pending() {
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
         }

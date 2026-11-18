@@ -508,3 +508,189 @@ fn tag_view_open_supersession_grid_candidate_main_fallback_retires_grid_worker()
         assert_eq!(app.effective_folder(), Some(a));
     }
 }
+
+#[test]
+fn tag_view_open_supersession_physical_repeat_keeps_its_staged_zip_preflight() {
+    for sibling in [false, true] {
+        let mut app = setup_app();
+        let root = app.tmp.path().to_owned();
+        let (a, b, _) = fixture(&mut app, &root, GridRoute::PhysicalDfs, true);
+        let ctx = egui::Context::default();
+        let press_next = |app: &mut App| {
+            app.handle_grid_book_navigation_keys(&ctx, !sibling, false, sibling, false);
+        };
+        press_next(&mut app);
+        let result = receive_grid(&mut app, &b);
+        adopt_grid(&mut app, &ctx, result);
+        app.settle_open_path_classification_for_test();
+        let (sender, payload) = hold_zip_preflight(&mut app, &b);
+        let Some(HistoryNavigationTransition::Physical(request)) =
+            app.top_level_grid_view.history_navigation_transition()
+        else {
+            unreachable!()
+        };
+        let request_id = request.request_id;
+        let continuation = request.dfs_continuation.as_ref().unwrap();
+        assert!(!continuation.fullscreen);
+        assert_eq!(continuation.queued_steps, 0);
+        assert_eq!(continuation.mode.sibling_only(), sibling);
+        assert_eq!(app.effective_folder(), Some(a.clone()));
+        assert!(app.folder_nav_pending.is_none());
+
+        press_next(&mut app);
+        // Physical Grid historically starts another worker from the visible A during
+        // ZIP preparation. Only repeats while that worker exists accumulate; do not
+        // impose ListOrder's refusal or Smart's staged-step coalescing on this path.
+        let pending = app.folder_nav_pending.as_ref().expect("repeat worker");
+        assert_eq!(pending.mode.sibling_only(), sibling);
+        let cancel = pending.cancel.clone();
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert_eq!(app.pending_folder_nav_steps, 0);
+        press_next(&mut app);
+        assert_eq!(app.pending_folder_nav_steps, 1);
+        assert!(Arc::ptr_eq(
+            &app.folder_nav_pending.as_ref().unwrap().cancel,
+            &cancel,
+        ));
+        assert!(!cancel.load(Ordering::Relaxed));
+        let Some(HistoryNavigationTransition::Physical(request)) =
+            app.top_level_grid_view.history_navigation_transition()
+        else {
+            panic!("repeat must not retire its own staged ZIP, sibling={sibling}");
+        };
+        assert_eq!(request.request_id, request_id);
+        assert_eq!(request.path, b);
+        assert!(matches!(
+            request.phase,
+            PhysicalHistoryPhase::Preflighting { .. }
+        ));
+        assert_eq!(request.dfs_continuation.as_ref().unwrap().queued_steps, 0);
+        // Retiring or re-preparing B drops the controlled receiver, even if its
+        // replacement happens to use the same path. The original result must land.
+        assert!(sender.send(Ok(payload)).is_ok());
+        settle(&mut app, &ctx);
+        assert_eq!(app.effective_folder(), Some(b));
+        assert!(app.fullscreen_idx.is_none());
+    }
+}
+
+#[test]
+fn tag_view_open_supersession_sibling_edge_keeps_real_current_view_order_refresh() {
+    let mut app = setup_app();
+    app.active_quick_folder_slot = None;
+    app.settings.auto_fullscreen_image_folders = false;
+    app.settings.sort_order = crate::settings::SortOrder::FileName;
+    // No later sibling exists. A failed navigation must leave the pending sort
+    // refresh able to update the same visible folder, rather than strand old rows.
+    // setup_app reserves tmp/books for compiled books, whose page order is
+    // intentionally Numeric. Exercise an ordinary folder where DateDesc applies.
+    let folder = app.tmp.path().join("library").join("A");
+    assert!(!crate::books::is_direct_book_folder(
+        &app.settings.books_root_path(),
+        &folder,
+    ));
+    std::fs::create_dir_all(&folder).unwrap();
+    for (name, modified_secs) in [("a.png", 1_600_000_000), ("b.png", 1_700_000_000)] {
+        let path = folder.join(name);
+        image::RgbImage::new(2, 2).save(&path).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(modified_secs)),
+            )
+            .unwrap();
+    }
+    let image_paths = |app: &App| {
+        app.items
+            .iter()
+            .filter_map(|item| match item {
+                GridItem::Image(path) => Some(path.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    app.load_folder(folder.clone());
+    app.finish_page_identity_preparation_for_test();
+    let ctx = egui::Context::default();
+    settle(&mut app, &ctx);
+    assert_eq!(
+        image_paths(&app),
+        [folder.join("a.png"), folder.join("b.png")]
+    );
+
+    app.settings.sort_order = crate::settings::SortOrder::DateDesc;
+    app.apply_sort_change_reload_without_ui_io();
+    let pending = app.folder_pane_open_pending.as_mut().expect("sort scan");
+    assert!(matches!(
+        pending.purpose,
+        FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+    ));
+    let scan = pending
+        .rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("real sort scan result");
+    assert!(scan.is_ok());
+    let cancel = pending.cancel.clone();
+    let (sender, receiver) = mpsc::channel();
+    pending.rx = receiver;
+
+    app.handle_grid_book_navigation_keys(&ctx, false, false, true, false);
+    assert!(matches!(
+        app.folder_nav_pending.as_ref().map(|pending| &pending.mode),
+        Some(FolderNavMode::SiblingGrid)
+    ));
+    assert!(!cancel.load(Ordering::Relaxed));
+    assert!(Arc::ptr_eq(
+        &app.folder_pane_open_pending.as_ref().unwrap().cancel,
+        &cancel,
+    ));
+    let result = app
+        .folder_nav_pending
+        .as_mut()
+        .unwrap()
+        .rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("real sibling edge result");
+    assert!(result.target.is_none());
+    adopt_grid(&mut app, &ctx, result);
+    assert_eq!(app.effective_folder(), Some(folder.clone()));
+    assert!(!cancel.load(Ordering::Relaxed));
+    assert!(sender.send(scan).is_ok(), "sort scan receiver was retired");
+    let ready = app
+        .poll_folder_pane_open(&ctx)
+        .expect("held sort result must remain current after the sibling edge");
+    #[cfg(windows)]
+    assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+    #[cfg(not(windows))]
+    match ready.purpose {
+        FolderOpenScanPurpose::CurrentViewOrderRefresh {
+            order,
+            reload_owner,
+        } => {
+            assert!(app.apply_current_view_order_refresh(
+                ready.path,
+                ready.scan.unwrap(),
+                order,
+                *reload_owner,
+            ));
+        }
+        _ => panic!("sort scan purpose changed"),
+    }
+    app.finish_page_identity_preparation_for_test();
+    settle(&mut app, &ctx);
+    assert_eq!(
+        app.settings.sort_order,
+        crate::settings::SortOrder::DateDesc
+    );
+    assert_eq!(
+        image_paths(&app),
+        [folder.join("b.png"), folder.join("a.png")]
+    );
+    assert_eq!(app.effective_folder(), Some(folder));
+    assert!(app.folder_pane_open_pending.is_none());
+    assert!(app.folder_nav_pending.is_none());
+    assert!(!cancel.load(Ordering::Relaxed));
+}

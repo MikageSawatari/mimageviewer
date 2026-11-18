@@ -113,7 +113,9 @@
   - Grid の Ctrl+↑↓ (物理の DFS) の連打累積は維持する。通常 main open との競合は、実装レビュー r1 の
     利用者裁定により、同じ受付境界で後勝ちへそろえる (§10 の r1 対応)。
   - 実装レビュー r1 追補: 一覧の ListOrder と通常 main open は、両方の受付順で後から受理した要求を残す。
-    ListOrder の受理で先の main open を既存の共通退役へ渡し、通常 open の受理で先の Grid 系移動を退役させる。
+    ListOrder の受理で先の別の明示 main open だけを退役し、通常 open の受理で先の Grid 系移動を退役させる。
+    r2 追補: 前者で共通退役を丸ごと呼ばず、既存の要求型から対象を区別する。移動自身の採用待ち・hydration の継続、
+    同じ一覧の並べ替え・表示条件・監視の更新は退役しない。Grid / SiblingGrid の採用待ち中の再入力と累積は `bed81647e` 前のまま。
     ListOrder 同士の連打拒否は維持する。追加した Grid の退役は自動 refresh・同じ要求の format 継続では発火させない。
 
 ### 4.2 入口の振り分け
@@ -457,7 +459,8 @@ nextest の leaky 2件の注記は上表のとおり残し、失敗0と区別す
   ここは初回 scan で startup の受付が済んでいるので既存の `false` を維持し、main navigation の退役だけを明示した。
   should_detach の計算・選別、非 main 側、shell / lease / viewport の処理は変更していない。
 - ListOrder 同士の準備 / 採用待ちの拒否、Grid DFS の既存の連打累積、Fullscreen 系の sequence / 継続契約は維持する。
-  source 監査の独立レビューは、refresh を新 open として取り消さない条件と、この限定した main 確定点の処理を確認して事前設計 ACCEPT。
+  実装担当内の別 context による source 監査では、refresh を新 open として取り消さない条件と、この限定した main 確定点の処理を確認した。
+  この確認は検収側の独立レビューとは別であり、後の検収側 r2 は下記2件を指摘して REVISE とした。
 - **P3**: `tag_list_order_folder_then_archive_returns_through_folder_before_results` は admission 直渡しを撤去した。
   本 A / stack `[A]` から実際の全画面 ListOrder → worker → Folder 行の採用 → hydration → 内部 ZIP の open / 採用まで通し、
   `[Folder 行, ZIP]` を検査する。音声 + 有効 PNG 入り ZIP の Folder を用い、FS 再開後に一覧へ戻して BS 2回、
@@ -502,9 +505,82 @@ staged 採用待ちの間に、元の通常フォルダの監視走査が `Refre
   filter は `tag_view|list_order|section1763|section257|favsearch|grid_parent|folder_nav|page_overview|gamepad|close_return|select_after_load|section1795|section1804|section1672|startup_restore|direct_navigation_worker|main_list`。
   新規7件と P3 の既存1件もこの934件に含むため、成功件数を重複加算しない。
 - `cargo fmt` (引数なし)、`cargo fmt --check`、`git diff --check` は成功。UI文字列の変更は無い。
-- 独立コードレビュー (`gpt-6.1-sol` / `xhigh`) は **ACCEPT**。
+- 実装担当内の別 context によるコード確認 (`gpt-6.1-sol` / `xhigh`) は **ACCEPT** とした。
+  検収側の独立レビューとは別の確認であり、検収側の r2 は **REVISE**。下記の2退行をこの内部確認では検出できなかった。
   explicit な通常 open の両順、main/context と Grid mode の限定、実 hydration / Fullscreen の保持、
   P3 の実採用・BS・再検索、refresh の既存事象の切り分けを確認。reviewer は Cargo を実行せず実装担当の証拠を使う。
 - 重い処理は今回も指定の run-heavy 経由の bin check と filter 付き nextest のみ。
   ロックを書けない場合は既定の BelowNormal / 6並列で絞ったものだけ実行し、full-test ロックがある場合は迂回せず待機した。
   全件 / full gate / dev・release ビルド / 実アプリ操作 / commit は行っていない。
+
+### 検収側の独立レビュー r2 の P2 2件への対応 (2026-11-19)
+
+利用者は `bed81647e` に対する検収側の独立レビュー r2 の2指摘を正しいと判断した。
+直前の `3c8cc77fe` (§1.804) の変更範囲には触れない。
+
+- **原因**: Grid 系移動の受付で `retire_replaced_main_list_requests(None)` を丸ごと呼んだため、
+  Grid DFS 自身の ZIP 採用待ちと、同じ一覧の `CurrentViewOrderRefresh` まで退役していた。
+  前者は同じキーの再入力で preflight を捨てて準備し直し、後者は兄弟移動が端で終わると新設定と旧表示の不一致を残した。
+- **対象を限定**: `start_folder_nav` は `retire_explicit_main_opens_for_grid_traversal` へ置き換える。
+  既存 request の型だけを読み、別の明示 main open を退役する。新しい field・pending・bool は足さない。
+  共通退役が行う tag/rating/collection/subfolder 等の一括退役、sidecar hydration や移動継続の解除は行わない。
+
+| 対象 | 今回の受理点で退役する要求 |
+| --- | --- |
+| パス分類 | main の通常 direct / SmartGrid / Physical open。生の `restore_intent` が `ExplicitList` / `ClassifyFolder` / `PageContinuation`。Physical は `dfs_continuation: None` のみ |
+| Physical preflight・変換待ち | main の上記明示 intent で、`dfs_continuation: None` の要求のみ |
+| pane scan | `PaneNavigation` / `DirectNavigation` / `JumpToPhysicalFolder` / `RequiredFullscreenTarget`。`CurrentViewOrderRefresh`、行先未確定 candidate、別窓目的は保持 |
+| 直接 PDF | 上記明示 intent の `ColdCandidate` のみ。`CommittedVerification` と retained source は保持 |
+
+分類と Physical の `SameLocation` / `Replay` は対象外にする。タグや検索内の通常 open は既存経路で
+`MainHistoryOperation::Restore` になるため、`Direct` だけの判定にはしない。
+`replaces_deferred_startup_open()` は `InternalHydration` の内側と `RestoreList` も明示扱いにするので使わず、生の variant を判定する。
+分類の `SnapshotArchiveCacheOnly` (手動 / 全画面 / slideshow が混在)、行先未確定の `BookmarkRow`、Collection 履歴要求は変更しない。
+既存 owner が別窓を指す分類 / PDF 要求は退役対象にしない。別窓の行先を決める既存述語や viewport の処理は変更していない。
+
+PDF 固有の既存 cleanup を `retire_cold_pdf_candidate` へ等価に分け、限定退役からはそれだけを呼ぶ。
+従来の共通退役側は従来どおり deferred book open も退役するが、今回の限定退役はそれを巻き込まない。
+PDF の source 復帰・EPUB address の復元は既存処理を使う。
+
+ListOrder 同士の拒否述語は変更しない。物理 Grid / SiblingGrid の ZIP 採用待ち中の再入力は、`bed81647e` 前と同じく
+元の Physical 要求を保持して worker を開始し、その worker への同種再入力を既存 accumulator に加える。
+新しい採用待ちの累積方式や再試行は導入しない。§1.805 の DirectNavigation scan の退役、
+通常 open の受理で古い Grid 系移動を退役する逆向きの処理も維持する。
+
+追加した回帰:
+
+- `tag_view_open_supersession_physical_repeat_keeps_its_staged_zip_preflight`:
+  Grid / SiblingGrid の実 handler と worker で B.zip の採用待ちまで進め、制御用 preflight を保持。
+  再入力後の request ID・receiver・queued steps と既存の累積、元の結果による実採用を検査する。
+- `tag_view_open_supersession_sibling_edge_keeps_real_current_view_order_refresh`:
+  実 sort refresh scan の結果を channel で保持し、端で終わる兄弟移動後も取消されず、新しい日付順の表示へ採用されることを検査する。
+
+変更ファイルは `src/app.rs`、`src/app/tag_view_open_supersession_tests.rs`、本書。
+r1 の既存7件、P3 の実経路テスト、ListOrder の連打拒否テストは変更しない。
+本修正は退役対象を既存 owner 境界で区別するもので、操作のモーダル化や待機・retry・追加 repaint は不要。
+まれな失敗向けの処理は追加しない。
+
+#### r2 の検証記録
+
+- `cargo check -p mimageviewer --bin mimageviewer-core` は **exit 0、29.92s** (`target/802-r2-check.log`)。
+- 初回の絞った nextest は12件中11成功、並べ替え更新の新規1件が最終行順の検査で失敗した。
+  要求の保持・受け渡しは成功していた。fixture が共通設定の製本 root (`tmp/books`) 直下にあり、
+  `book_materialization` の製本仕様による数字順固定を受けていたのが原因。
+  通常の物理フォルダ (`tmp/library/A`) へ移し、非製本の前提と DateDesc 設定の保持も断言する。
+  新しい日付順で表示される期待は維持し、製品コードの追加変更は行わない。
+  初回ログ `target/802-r2-focused.log`、JUnit控え `target/802-r2-focused-initial-junit.xml`。
+- fixture 修正後の同じ filter は **12件実行 / 12成功 / 失敗0、exit 0** (compile 2m42s、実行2.284s)。
+  `target/802-r2-focused-retry.log`、JUnit控え `target/802-r2-focused-junit.xml`。
+  r1 の7件・P3 の1件・今回の2件に加え、ListOrder の連打拒否
+  `tag_list_order_grid_pending_rejects_without_cancel_restart_or_accumulation` と
+  `tag_list_order_grid_zip_adoption_gate_keeps_owner_and_commits_new_root` も成功した。
+- `cargo fmt` (引数なし)、最終の `cargo fmt --check`、`git diff --check` は成功。UI文字列の変更は無い。
+- 実装担当内の別 context (`gpt-6.1-sol` / `xhigh`) による型・差分と fixture 修正の確認では、追加の修正指摘は無かった。
+  検収側の独立レビューとは別の確認。担当者は Cargo を実行せず、実行結果は実装担当が集約する。
+- 前回と同じ関連 filter の nextest は **938件実行 / 938成功 / 失敗0、exit 0** (compile 1.23s、実行92.130s、18005件除外)。
+  leaky 判定は0件。上の12件も含むことを JUnit で確認し、件数を重複加算しない。
+  `target/802-r2-related.log`、JUnit控え `target/802-r2-related-junit.xml`。
+  filter は `tag_view|list_order|section1763|section257|favsearch|grid_parent|folder_nav|page_overview|gamepad|close_return|select_after_load|section1795|section1804|section1672|startup_restore|direct_navigation_worker|main_list`。
+- 重い処理はすべて指定の `run-heavy.ps1 -Owner codex-802` 経由の bin check と filter 付き nextest のみ。
+  共通ロックを書けないため runner の BelowNormal / 6並列で実行した。
+  全件 / test-full / dev・release ビルド / 実アプリ操作 / commit は行っていない。
