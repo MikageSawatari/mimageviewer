@@ -2609,3 +2609,148 @@ cargo nextest run -p mimageviewer --lib -E 'test(=app::search_nav_book_tests::se
 - r1 (`bc67469c8` に対して、REVISE、P2 1): ZIP の Deflate 破損 (flate2 は `InvalidInput` で返す) が `ReadFailed` になり、残りの標本で判定できる本が保存されない → `748bf0ca7` でエラーの出自 (元の reader か展開器か) で分類する `classify_io_error_at` に集約。
 - r2 (`748bf0ca7` に対して、**ACCEPT**、指摘なし)。
 - 利用者決定 (2026-11-18、統括経由): 上限は推奨どおり 1 枚 32 MiB・合計 64 MiB。読み取り元の入れ替わりは §1.803。
+
+## 31. RAR の読み取り元の入れ替わりに保存済みの行・保持素材を追従させる (§1.803、2026-11-18 設計)
+
+- 要件の正本: [next-release-backlog.md §1.803](next-release-backlog.md)。ブランチ `fix-803-rar-cover-source-swap` (基点 master `605ba335b`)。
+- 既定の割り切り: まれな失敗 (DB の読み書き失敗・処理途中の強制終了など) はログ + 通知 (CLAUDE.md)。
+- 永続データ: thumbnail catalog の行の形・キー・schema は変えない (リリース済みのデータ)。不一致の行は同じキーへ上書きで置き換えるだけなので、移行は不要。
+
+### 31.1 コードで確かめた前提 (`605ba335b`)
+
+- 読み取り元表 `converted_archive_cache_paths` (`app.rs` の `enum ConvertedArchiveSourceState`) は、
+  新しい一覧で `Pending` から始まり、worker (`archive-cache-peek`) が `Resolved` を送り、`poll_converted_archive_cache_paths` が反映する。
+  反映は旧値と新値を比べ、変わった候補のピン依存のタイルを退避する。**候補自身は `Loaded` でないときだけ**退避する
+  (表示済みのタイルのちらつき対策、2026-08-19)。`Loaded` の素材の `cover` と新しい読み取り元は比べていない。
+- 変換キャッシュ DB (`ArchiveCacheDb`、App と Remote が同じ `Arc` を使う) を変える経路と、読み取り元表への伝わり方:
+
+  | 経路 | DB の変更 | 読み取り元表 |
+  | --- | --- | --- |
+  | 明示の変換 (`ui_dialogs/archive_convert.rs` の worker) | `record` + `prune_to_size_limit_locked` | **伝わらない**。次の一覧の作り直しまで `Direct` / `Unavailable` のまま |
+  | Remote の変換 (`remote_ipc/archive_job.rs`) | `record` + `prune_to_size_limit_locked` | **伝わらない** |
+  | 容量による自動の掃除 (上の 2 つの中) | 古い行とファイルを消す | **伝わらない**。消えた ZIP を指す `CachedZip` が残る |
+  | 管理画面の削除 (`cache_maintenance.rs`、`delete_entry` / `delete_missing_originals` / `clear_all`) | 行とファイルを消す | 完了時に `invalidate_converted_archive_cached_sources` が、表示中・Smart の退避・休眠の viewer context の `CachedZip` を `Pending` に戻す |
+
+  準備済み・再利用の metadata、Smart の退避した root、休眠の viewer context は、表を持ったまま後で表示へ戻る。
+  戻る時点で `invalidate_cached_paths` (`CachedZip` → `Pending`) を通す箇所がある (`app.rs` の prepared metadata の採用、`smart_folder.rs` の `invalidate_cached_sources`)。
+- 素材の `cover`: catalog の行から出すときは行の `cover` (`thumb_loader.rs` の catalog hit、`.with_cover(entry.cover)`)、元から読むときは読んだ書庫のページキー
+  (`zip_entry_key(load_path, entry)`)。一覧の表紙の回転 (`grid_tile_rotation_memory`) と §29 の失効の所属 (`CoverCacheInputs::grid` の hint、
+  worker の `row_belongs_to_with_slot`) は、この `cover` と**今の**読み取り元の別名だけを使う。
+- 保持一覧の復元は共通の入口 `reconcile_restored_cover_thumbnails` (`app/cover_rotation.rs`) を通る (snapshot・休眠の viewer context・Smart)。
+  今は Legacy の回転と §29 の番号だけを見る。
+- worker には、`refresh_legacy_cover` の要求で `CoverIdentity::Legacy` の行を読み損ねとして扱い、`replace_legacy_row` で保存の閾値によらず置き換える経路がある。
+- viewer のページキーは、直接読みでは `{RAR}::entry`、変換済みでは `{変換後の ZIP}::entry` (§28.3)。回転・編集の移し替えは無い。
+
+### 31.2 守る不変条件
+
+1. **読み取り元表は変換キャッシュ DB に追従する**。DB のある本の行が増えた・消えたら、その本の読み取り元は、表を持つどの持ち主でも、
+   次に使われる前に `Pending` へ戻って決め直される。
+2. **読み取り元が確定 (`Direct` / `CachedZip`) している本のタイルの素材は、その読み取り元の物理の書庫のページを `cover` に持つ**。
+   違う素材は表示に使い続けず、今の読み取り元から作り直す。
+3. **不一致の catalog の行は、作り直したときに置き換える** (保存の閾値によらない)。置き換えた後は次の起動でも 2 が成り立つので、作り直しが続かない。
+
+`Pending` の間に保存済みの行を出す出荷済みの動き (判定中の表示を遅らせない、§30.2) は変えない。その素材は確定時に 2 で照合する。
+
+### 31.3 状態を減らす検討 (CLAUDE.md「設計の簡素化」)
+
+- **読み取り元をキーに入れる**: 採らない (§30.2 と同じ理由。`Pending` の間に保存済みの表紙を出せなくなり、出荷済みの表示が遅くなる)。
+- **変換済みの本の viewer のページキーを元の RAR に揃える** (入れ替わりを見えなくする): 採らない。変換後の ZIP のキーで保存済みの回転・編集
+  (リリース済みのデータ) の移行が要り、viewer・編集・プリセット・しおりまで範囲が広がる。入れ替わり自体はまれなので、作り直しのほうが小さい。
+- **入れ替わったら一覧を読み直す** (閉じて作り直す): 採らない。変換 1 冊・掃除 1 回ごとに一覧全体の位置・選択・読み込みを捨てることになり、通常の操作が不便になる。
+  代わりに、本ごとの読み取り元を既存の決め直し (`Pending` → worker → `Resolved`) へ戻す。決め直しの経路・ちらつき対策・ピン依存の退避はそのまま使う。
+- **DB の変更の伝え方を 1 つにする** (採用): 変換・Remote の変換・自動の掃除・管理画面の削除の 4 経路それぞれに通知を足すのではなく、
+  `ArchiveCacheDb` の書き込み関数自身が変更の記録を持つ (§31.4)。管理画面の既存の通知もこの記録で置き換える。
+- **表の持ち主ごとに通知を配らない** (採用): 表に「どこまでの変更を反映したか」の番号を持たせ、表が使われる前の決まった時点で追いつかせる (§31.4)。
+  休眠・退避中の表へ配って回る処理を新しく足さない。
+- **照合の述語は 1 つ、使う時点は既存の 2 つ** (採用): 読み取り元の確定の反映 (`Resolved`) と保持一覧の復元の入口 (`reconcile_restored_cover_thumbnails`)。
+  確定の前に出した素材は確定の反映で、確定の後に戻ってきた素材は復元の入口で照合される。worker の結果の採用時の照合は足さない
+  (確定の前に出した要求は、確定の反映でタイルが退避されて要求 ID ごと捨てられ、確定の後の要求は §31.6 で一致した素材しか返さない)。
+- **不一致の行の扱いは Legacy の置き換えと同じ形にする** (採用): 新しい保存規則を作らず、既存の `replace_legacy_row` と同じく読み損ね + 置き換えの保存にする。
+
+### 31.4 変更 A: 変換キャッシュ DB の変更の記録と、読み取り元表の追いつき
+
+- `ArchiveCacheDb` に、プロセス内だけの変更の記録を持たせる (永続化しない)。
+  - 番号 (`AtomicU64`、0 から増える) と、`(番号, 変更)` の列 (`Mutex`)。変更は `Source(元の書庫の src_path_key)` か `AllCached` (`clear_all`)。
+  - `record` は記録した元の書庫、`delete_entry` は消した元の書庫、`delete_missing_originals` と `prune_to_size_limit_locked` は消した行の元の書庫を、
+    commit が成功した後に足す。`clear_all` は `AllCached` を足す。失敗した書き込みは足さない (DB は変わっていない)。
+  - 列は縮めない (1 回の起動で変換・掃除される本の数だけ増える。割り切り)。
+- 読み取り元表を、表と「反映済みの番号」を持つ 1 つの型にする (例: `ConvertedArchiveSources { states, synced_rev }`)。表を移す・複製するすべての箇所で番号も一緒に動く
+  (別の field に分けない)。新しい一覧で表を作るときは、作った時点の番号を入れる。
+- 追いつき `catch_up(&mut sources, &db)`: 番号が DB の番号より古ければ、それより新しい変更について、
+  - `Source(k)`: 元の書庫が `k` の候補 (`Direct(path)` の path、`CachedZip` / `Unavailable` の `logical_source`、`Rar { .. }` の中も同じ。比べるのは `src_path_key` と同じ正規化の値) を `Pending` に戻す。
+  - `AllCached`: 既存の `invalidate_cached_paths` と同じく `CachedZip` を `Pending` に戻す。
+  - 1 件でも `Pending` に戻したら、その持ち主の決め直しの batch (`converted_archive_cache_paths_pending`) を取り消す (変更より前に計算した返事を捨てるため。既存の管理画面の通知と同じ)。
+    取り消した後は既存の `maybe_start_…` が範囲の `Pending` を投入し直す。
+  - 番号を DB の番号にする。
+- 追いつく時点 (新しい入口は作らず、既存の時点に揃える):
+  1. 表示中の表: 毎フレームの `poll_converted_archive_cache_paths` の先頭。番号の比較だけなので、変更が無いフレームの費用は原子読み 1 回。
+  2. 表が表示へ戻る・採用される既存の時点: 今 `invalidate_cached_paths` を呼んでいる箇所 (prepared metadata の採用、Smart の `invalidate_cached_sources`) と、
+     休眠の viewer context が表示へ戻る swap の直後。既存の `invalidate_cached_paths` は消さずに残す (管理画面の削除を前提に置いている既存の再確認で、範囲を広げない)。
+     実装担当は、表を表示へ戻す箇所 (調査では `smart_folder.rs` の retain / take / restore、`global_search_ui.rs`、`viewer_context_registry.rs` の swap) を列挙し、
+     どれも 1 か 2 を通ることを確かめる。通らない箇所があれば設計担当へ返す。
+- 管理画面の削除の完了時の `invalidate_converted_archive_cached_sources` (表示中・Smart・休眠の context へ配る) は、記録と追いつきで同じことになるので外す。
+  外すことで休眠の context へ配る処理が無くなる点は §31.8 で扱う。
+- 効果: 変換した本は、一覧へ戻った時点 (表示中なら次のフレーム) で `Pending` → `CachedZip` に決め直される。`Unavailable` の本 (7z / LZH や直接読めない RAR) も、
+  変換の後に `CachedZip` になってタイルが出るようになる (今は次の一覧の作り直しまでアイコン)。掃除で消えた ZIP を指す `CachedZip` は残らない。
+
+### 31.5 変更 B: 素材と読み取り元の照合 (確定の反映と復元の入口)
+
+- 述語を 1 つ置く (例: `convertible_cover_mismatches_source(item, thumbnail, state) -> bool`)。真になるのは次のすべてを満たすときだけ。
+  - `item` が `GridItem::ConvertibleArchive`。
+  - `thumbnail` が `Loaded` で、`cover` が `LoadedCoverIdentity::Page(key)`。
+  - `state.read_source()` が `Direct(path)` か `CachedZip { path, .. }`。
+  - `key` の書庫の部分 (既存のページキーの分解 helper を使う。新しい文字列の解釈を作らない) が、`path` を `zip_entry_key` と同じ規則で正規化した値と違う。
+  `Pending` / `Unavailable`、Legacy の `cover`、`Loaded` 以外は偽 (今の動きのまま)。
+- 確定の反映 (`poll_converted_archive_cache_paths` の `Resolved`): `self_needs_reload` を「`Loaded` でない、**または述語が真**」にする。
+  一致している表示済みのタイルは今までどおり組み直さない (ちらつき対策を保つ)。
+- 復元の入口 (`reconcile_restored_cover_thumbnails`): 既存の Legacy・§29 の条件に「述語が真」を足す。復元先の表は、§31.4 の追いつきを先に済ませた表を使う
+  (追いついた結果 `Pending` になった本は偽になり、確定の反映で照合される)。
+- 退避は既存の `evict_thumbnail_for_reload` (要求・CPU 画像・texture・idle upgrade の対象外の印も外れる)。§29 の在メモリの行の除去は足さない
+  (catalog の行は §31.6 で置き換わる)。
+
+### 31.6 変更 C: worker で、不一致の行を読み損ねにして置き換える
+
+- 対象: `ConvertibleArchive` の要求のうち、読み取り元が確定していて元から読める要求 (`CacheOnly` 以外)。要求はすでに元の RAR (論理) と読む書庫 (`load_path`) を持つ。
+  在メモリの `cache_map` の hit と catalog の行の hit で、`cover` が `CoverIdentity::Page` で書庫の部分が `load_path` と違うものを、Legacy の行と同じく読み損ねにする。
+- 読み損ねにした場合は、`replace_legacy_row` と同じ扱い (Parent の観測、`force_cache || replace` の保存) で、作り直した素材を閾値によらず保存して行を置き換える。
+  既存の変数を「置き換える理由」を持つ形にまとめてよい (Legacy と不一致の 2 つ)。同じ意味の bool を 2 つ並べない。
+- `CacheOnly` (`Pending`) は今のまま行を返す (§31.2 の最後の段落)。
+- 本の中の `ZipDir` のタイル: 実装担当は、直接読む RAR の中の一覧と変換済み ZIP の中の一覧で、`zipdir:` の行が同じ catalog を共有するかをコードで確かめる。
+  共有するなら同じ規則 (書庫の部分が今の物理の書庫と違えば置き換え) を `ZipDir` にも当てる。共有しないなら対象外とし、理由を §31.10 に書く。
+
+### 31.7 範囲外・受け入れる制約
+
+- **一度だけの作り直し**: 入れ替わった本は、確定の反映で 1 回だけタイルを組み直す (表示中なら 1 回ちらつく)。行を置き換えた後は起きない。
+  入れ替わりは変換・キャッシュの削除・自動の掃除の後に限られ、通常の閲覧では起きない。
+- **親のフォルダの代表**: 入れ替わった本を代表にしている上のフォルダ (K2) は、子の行が置き換わって catalog の revision が進んだ後の次の読み取りで、
+  既存の selection proof により選び直される (§29.6 と同じ)。表示中の親の texture の即時の更新はしない。
+- **回転・編集の引き継ぎ**: 直接読みと変換済みで viewer のページキーが違い、片方で付けた回転・編集はもう片方に出ない (出荷済み、§28.3)。今回は変えない。
+  照合後の素材は今の読み取り元のキーで回転を引くので、タイルと viewer の表示は一致する。
+- **既存の idle upgrade の対象外の印**: `Pending` の間に `CacheOnly` で出た素材は idle upgrade の対象外の印が付き、確定後も一致していれば残る (調査で判明、既存)。
+  今回の照合で退避したタイルは印が外れる。一致しているタイルの印は今回は扱わない (別件として §31.10 に記録する)。
+
+### 31.8 複数の context・detached の扱い
+
+- 休眠・退避中の viewer context の表は、配るのではなく、表示へ戻るときに §31.4 の追いつきで反映する。番号が表と一緒に動くので、
+  休眠中に何回変換・削除があっても、戻ったときに 1 回で反映される。兄弟の context の表・素材には触れない (それぞれ自分の番号で追いつく)。
+- 休眠の context の表を管理画面の削除時に書き換えていた既存の処理を外すので、detached viewer の経路に触れる。
+  CLAUDE.md「Detached viewer リワーク中のルール」に従い、設計担当と独立レビュー担当の双方が「症状パッチではなく構造的修正
+  (DB の変更の伝え方を 1 つの記録と追いつきに集約し、持ち主ごとの配布を無くす)」に合意してから実装し、
+  [detached-rework-plan.md](detached-rework-plan.md) に触れた範囲を記録する。
+
+### 31.9 テスト
+
+- A: `ArchiveCacheDb` の各書き込み (`record` / `delete_entry` / `delete_missing_originals` / `prune_to_size_limit_locked` / `clear_all`) が、成功時だけ正しい変更を記録する。
+  追いつきが `Direct` / `CachedZip` / `Unavailable` / `Rar { .. }` の該当候補だけを `Pending` に戻し、無関係な候補・番号が新しい表は変えず、決め直しの batch を取り消す。
+  表を移す (metadata の採用・Smart・viewer context の swap) と番号が一緒に動き、休眠中の変更が表示へ戻ったときに 1 回で反映される。
+- B: 確定の反映で、一致している `Loaded` は退避せず、不一致の `Loaded` (Direct → CachedZip、CachedZip → Direct の両方向) は退避する。
+  復元の入口で、不一致の保持素材を退避し、一致・`Pending`・Legacy は今のまま。
+- C: worker の handler-level で、確定した要求に対して不一致の行 (memory hit と catalog hit) が読み損ねになり、閾値に届かない本でも置き換えが保存される。
+  `CacheOnly` は不一致の行を返す。次の同じ要求は置き換えた行を hit する (作り直しが続かない)。
+- 通しの状態遷移: 直接読みで保存 → 変換 (記録) → 追いつき → `CachedZip` の確定 → 退避 → 置き換え → 表紙の回転を変換後のキーで引く、
+  と、逆向き (変換キャッシュの削除・自動の掃除) を 1 本ずつ。§29 の本文の回転が、置き換え後の行を失効させる。
+- テストで実機のキーの状態を読む形は書かない (§1.814 (a))。
+
+### 31.10 実装・レビューの記録
+
+(実装後に記録する)
