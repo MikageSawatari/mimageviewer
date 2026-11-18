@@ -4376,7 +4376,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn direct_navigation_worker_preserves_collection_physical_owner() {
+    fn direct_navigation_sync_preserves_collection_physical_owner() {
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
         let child = temp.path().join("child");
@@ -4398,14 +4398,10 @@ mod tests {
         );
         assert_eq!(
             super::super::folder_scan::caller_scan_count_for_test(),
-            before
+            before + 1
         );
-        assert!(
-            matches!(&app.folder_pane_open_pending.as_ref().unwrap().purpose,
-            super::super::FolderOpenScanPurpose::DirectNavigation { collection_owner: Some(captured), .. }
-            if captured.stamp == owner.stamp && captured.anchor == owner.anchor)
-        );
-        app.finish_direct_navigation_scan_for_test();
+        assert!(app.folder_pane_open_pending.is_none());
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(app.current_folder.as_ref(), Some(&child));
         assert_eq!(
             app.top_level_grid_view

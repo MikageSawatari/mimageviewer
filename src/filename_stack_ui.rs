@@ -15,12 +15,13 @@
 //! 分割して収集し、grouping と集約/flat の materialize・ページ編集投影は worker で行う。
 //! 受理時に bundle identity、items generation、request sequence、write stamps を照合する。
 
-/// The owner which blocks grid item input; only StackRefresh accepts stack-only keys.
+/// The owner which blocks grid item input; only direct scans suppress legacy stack keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GridItemInputBlock {
     BookStructuralOperation,
     ImageFolderZip,
     LocationNavigation,
+    DirectNavigationScan,
     StackRefresh,
 }
 
@@ -2290,7 +2291,9 @@ impl crate::app::App {
     }
 
     pub(crate) fn grid_item_input_block(&self) -> Option<GridItemInputBlock> {
-        if self.book_structural_op.is_some() {
+        if self.direct_navigation_scan_pending() {
+            Some(GridItemInputBlock::DirectNavigationScan)
+        } else if self.book_structural_op.is_some() {
             Some(GridItemInputBlock::BookStructuralOperation)
         } else if self.image_folder_zip_operation.is_some() {
             Some(GridItemInputBlock::ImageFolderZip)

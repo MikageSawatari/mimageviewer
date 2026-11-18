@@ -22,8 +22,8 @@ metadata を読む。利用者の perf ログでは `nav/lf_scan` (`pre_scanned=
 
 ### 2.1 consumer (1 か所)
 
-`open_direct_navigation_target_at_stage` → `pre_scan` が `Some` なら確定済みのDirectoryとして、
-`None` なら `path_needs_open_classification` に従って、`open_direct_navigation_target_classified` へ進む。
+`open_direct_navigation_target_at_stage` → `pre_scan` の有無にかかわらず `path_needs_open_classification` に従って、
+`open_direct_navigation_target_classified` へ進む (r7 で「`pre_scan` が `Some` なら再分類しない」変更は撤回)。
 `pre_scan` が `Some` なら
 `load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation_at_stage`、`None` なら上記の同期経路。
 
@@ -264,7 +264,7 @@ r7: 範囲外の挙動を変えないため、Esc・スタック切替キーを�
 | --- | --- |
 | 走査中に表示中の一覧が別の採用で変わる | `main_list_navigation_is_current` が偽になり poll で cancel (既存) |
 | sidecar 復元中に完了 | poll が保留 (既存) |
-| worker の異常終了 | 既存の `Disconnected` 処理。予約も捨てる |
+| worker の異常終了 | 既存の `Disconnected` 処理 (r7 で全画面予約の移送を外したので、予約の扱いは従来の経路のまま) |
 
 まれな失敗 (走査中の I/O エラー) は既存どおりログ + 通知で割り切る。再試行は足さない。
 

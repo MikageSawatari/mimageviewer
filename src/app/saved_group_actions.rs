@@ -390,7 +390,7 @@ impl App {
         }
         // The readiness helper remains strict: a previously admitted saved group must
         // still yield to a later pane scan. Only this admission may replace these scans.
-        let replaceable_scan = self.replaceable_main_folder_scan_pending();
+        let replaceable_scan = self.direct_navigation_scan_pending();
         let other_pending = if replaceable_scan {
             self.folder_nav_pending.is_some()
                 || self.smart_folder_transition.is_some()

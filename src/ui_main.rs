@@ -861,7 +861,13 @@ pub(crate) enum LocationJumpTarget {
 pub(crate) enum AddressBarNav {
     LocationJump(LocationJumpTarget),
     AddressInput(LocationJumpTarget),
+    /// Physical target submitted through the address field Enter action.
+    AddressEnterPhysical(PathBuf),
     Favorite(PathBuf),
+    /// Favorite selected by the worker-enabled input producers.
+    WorkerFavorite(PathBuf),
+    /// Physical target selected from the recent-folder menu.
+    RecentFolder(PathBuf),
     ZipListReturn(crate::app::ZipListReturnRequest),
     Direct(PathBuf, crate::app::StartupListIntent),
     GridVirtual(crate::app::GridVirtualOpenIntent),
@@ -16190,7 +16196,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         | AddressBarNav::EverythingResults
                                         | AddressBarNav::LocationJump(_)
                                         | AddressBarNav::AddressInput(_)
+                                        | AddressBarNav::AddressEnterPhysical(_)
                                         | AddressBarNav::Favorite(_)
+                                        | AddressBarNav::WorkerFavorite(_)
+                                        | AddressBarNav::RecentFolder(_)
                                         | AddressBarNav::SavedGroupReady(_),
                                     )
                                     | None => "親フォルダへ [BS]".to_string(),
@@ -16661,10 +16670,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                         resolve_folder_bar_nav_path(path)
                                                     })
                                                 {
-                                                    result = Some(AddressBarNav::Direct(
-                                                        path,
-                                                        crate::app::StartupListIntent::ExplicitList,
-                                                    ));
+                                                    result =
+                                                        Some(AddressBarNav::RecentFolder(path));
                                                 }
                                             }
                                             crate::ui_helpers::set_accessibility_label(
@@ -16685,28 +16692,27 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                                         LocationJumpTarget::DriveList,
                                                     ));
                                                 } else if address_text == "本棚" {
-                                                    result = Some(AddressBarNav::AddressInput(
-                                                        LocationJumpTarget::Physical(
+                                                    result =
+                                                        Some(AddressBarNav::AddressEnterPhysical(
                                                             self.book_root_path(),
-                                                        ),
-                                                    ));
+                                                        ));
                                                 } else if let Some(book_name) =
                                                     address_text.strip_prefix("本棚 > ")
                                                 {
-                                                    result = Some(AddressBarNav::AddressInput(
-                                                        LocationJumpTarget::Physical(
+                                                    result =
+                                                        Some(AddressBarNav::AddressEnterPhysical(
                                                             crate::books::book_folder(
                                                                 &self.book_root_path(),
                                                                 book_name.trim(),
                                                             ),
-                                                        ),
-                                                    ));
+                                                        ));
                                                 } else if let Some(resolved) =
                                                     resolve_folder_bar_address_input(&self.address)
                                                 {
-                                                    result = Some(AddressBarNav::AddressInput(
-                                                        LocationJumpTarget::Physical(resolved),
-                                                    ));
+                                                    result =
+                                                        Some(AddressBarNav::AddressEnterPhysical(
+                                                            resolved,
+                                                        ));
                                                 } else {
                                                     let path = normalize_folder_bar_input_path(
                                                         &self.address,
@@ -35778,7 +35784,7 @@ mod section207_tests {
                     // parent. Exercise that actual candidate, then remove only the
                     // dedicated empty parent before its asynchronous scan starts.
                     assert!(
-                        matches!(candidates.borrow().as_slice(), [AddressBarNav::AddressInput(LocationJumpTarget::Physical(path))] if path == &fallback),
+                        matches!(candidates.borrow().as_slice(), [AddressBarNav::AddressEnterPhysical(path)] if path == &fallback),
                         "kind={kind} candidates={:?}",
                         candidates.borrow()
                     );
@@ -35801,7 +35807,7 @@ mod section207_tests {
                     };
                     if let Some(expected) = expected {
                         assert!(
-                            matches!(candidates.borrow().as_slice(), [AddressBarNav::AddressInput(LocationJumpTarget::Physical(path))] if path == expected),
+                            matches!(candidates.borrow().as_slice(), [AddressBarNav::AddressEnterPhysical(path)] if path == expected),
                             "kind={kind} form={form}"
                         );
                     } else {
@@ -36657,7 +36663,7 @@ mod section207_tests {
                     harness.get_by_label(target.to_str().unwrap()).click();
                     harness.run();
                     assert!(
-                        matches!(nav.borrow().as_slice(), [AddressBarNav::Direct(path, crate::app::StartupListIntent::ExplicitList)] if path == target),
+                        matches!(nav.borrow().as_slice(), [AddressBarNav::RecentFolder(path)] if path == target),
                         "history must preserve the native path: {target:?}"
                     );
                 } else {
@@ -36764,7 +36770,7 @@ mod section207_tests {
                     "input: {input:?}"
                 ),
                 Some(Some(expected)) => assert!(
-                    matches!(nav.borrow().as_slice(), [AddressBarNav::AddressInput(LocationJumpTarget::Physical(path))] if path == &expected),
+                    matches!(nav.borrow().as_slice(), [AddressBarNav::AddressEnterPhysical(path)] if path == &expected),
                     "input: {input:?}"
                 ),
             }
@@ -36815,7 +36821,7 @@ mod section207_tests {
         harness.key_press(egui::Key::Enter);
         harness.run();
         assert!(
-            matches!(nav.borrow().as_slice(), [AddressBarNav::AddressInput(LocationJumpTarget::Physical(path))] if path == &target)
+            matches!(nav.borrow().as_slice(), [AddressBarNav::AddressEnterPhysical(path)] if path == &target)
         );
         assert!(!app.borrow().address_has_focus);
         nav.borrow_mut().clear();
@@ -37020,7 +37026,7 @@ mod section207_tests {
         assert_ne!(harness.ctx.memory(|memory| memory.focused()), Some(edit_id));
         if address {
             assert!(
-                matches!(nav.borrow().as_slice(), [AddressBarNav::AddressInput(LocationJumpTarget::Physical(path))] if path == &target)
+                matches!(nav.borrow().as_slice(), [AddressBarNav::AddressEnterPhysical(path)] if path == &target)
             );
             assert!(!app.borrow().address_has_focus);
         } else {

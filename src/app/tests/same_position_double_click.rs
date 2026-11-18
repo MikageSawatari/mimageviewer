@@ -5,7 +5,6 @@ use std::io::Write;
 fn settle(app: &mut App, ctx: &egui::Context) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        app.poll_direct_navigation_scan_for_test(ctx);
         app.settle_open_path_classification_for_test();
         app.poll_history_navigation_transition_for_test(ctx);
         app.poll_zip_enumerate();
@@ -13,8 +12,7 @@ fn settle(app: &mut App, ctx: &egui::Context) {
         app.poll_sidecar_restore(ctx);
         app.poll_book_composition_service_for_test(ctx);
         app.poll_book_presentation_permission(ctx);
-        if !app.direct_navigation_scan_pending()
-            && app.top_level_grid_view.open_path_classification().is_none()
+        if app.top_level_grid_view.open_path_classification().is_none()
             && app
                 .top_level_grid_view
                 .history_navigation_transition()

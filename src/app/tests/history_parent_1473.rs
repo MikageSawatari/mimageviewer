@@ -104,7 +104,6 @@ pub(super) fn settle(app: &mut App) {
     let ctx = egui::Context::default();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        app.poll_direct_navigation_scan_for_test(&ctx);
         app.settle_open_path_classification_for_test();
         app.poll_collection_history_transition(&ctx);
         ctx.run_pass(egui::RawInput::default(), |ctx| {
@@ -137,11 +136,10 @@ pub(super) fn settle(app: &mut App) {
                 panic!("archive fixture failed: {message}");
             }
         }
-        if !app.direct_navigation_scan_pending()
-            && app
-                .top_level_grid_view
-                .history_navigation_transition()
-                .is_none()
+        if app
+            .top_level_grid_view
+            .history_navigation_transition()
+            .is_none()
             && app.top_level_grid_view.open_path_classification().is_none()
             && app.archive_convert.is_none()
             && app.zip_enumerate_pending.is_none()

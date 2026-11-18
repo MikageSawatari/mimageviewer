@@ -1104,7 +1104,7 @@ fn mixed_path_favorite_direct_navigation_standardizes_input_without_rewriting_sa
                             "mixed_favorite_regression",
                         )
                         .unwrap();
-                    let crate::ui_main::AddressBarNav::Favorite(path) = nav else {
+                    let crate::ui_main::AddressBarNav::WorkerFavorite(path) = nav else {
                         panic!("favorite input must produce a favorite navigation");
                     };
                     (
@@ -1151,13 +1151,15 @@ pub(super) fn assert_mixed_path_favorite_direct_navigation(
         "{source}: {folder_name}"
     );
     // The same acceptance call as App::update's menu/toolbar/input_nav merge.
-    app.open_direct_navigation_target(
+    app.open_direct_navigation_target_at_stage(
         path,
         None,
         OpenRequestOwner::Navigation,
         None,
         None,
         restore_intent,
+        super::MainListRequestStage::Admission,
+        super::DirectoryScanRoute::Worker,
     );
     let classification = app.top_level_grid_view.open_path_classification();
     assert_eq!(
@@ -7699,13 +7701,6 @@ fn phase_b_query_change_discards_old_stream_and_prepare() {
         &old_prepare_cancel,
         &app.search_prepare_cancel_for_test(),
     ));
-    // The empty projection is prepared asynchronously too. Establish its adoption
-    // before observing whether any late result from the cancelled producer reappears.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !app.items.is_empty() && std::time::Instant::now() < deadline {
-        app.poll_global_search_events(&ctx);
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
     for _ in 0..100 {
         app.poll_global_search_events(&ctx);
         std::thread::sleep(std::time::Duration::from_millis(5));
@@ -30324,11 +30319,14 @@ mod phase_c_folder_nav_history_tests {
                 app.update_ime_state(ctx);
                 app.note_main_chrome_pointer_block_transition(ctx);
                 if let Some(nav) = app.render_toolbar(root_ui).1 {
-                    let crate::ui_main::AddressBarNav::AddressInput(target) = nav else {
-                        panic!("address Enter must produce address-input navigation");
+                    let crate::ui_main::AddressBarNav::AddressEnterPhysical(path) = nav else {
+                        panic!("address Enter must produce marked physical navigation");
                     };
                     // The exact consumer used by App::update for address Enter.
-                    app.dispatch_address_input(target);
+                    app.dispatch_address_input_with_scan_route(
+                        crate::ui_main::LocationJumpTarget::Physical(path),
+                        crate::app::DirectoryScanRoute::Worker,
+                    );
                 }
             });
         harness.run();

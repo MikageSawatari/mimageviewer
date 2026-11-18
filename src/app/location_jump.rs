@@ -2,7 +2,7 @@
 //! are resolved when the winning navigation is dispatched, after search widgets.
 
 use super::{
-    App, DirectNavigationPurpose, FolderNavHistoryTarget, MainHistoryOperation,
+    App, DirectNavigationPurpose, DirectoryScanRoute, FolderNavHistoryTarget, MainHistoryOperation,
     MainListRequestStage, OpenRequestOwner, ReadingHistoryEntrance, StartupListIntent,
 };
 use crate::ui_dialogs::context_menu::{
@@ -68,11 +68,19 @@ impl App {
     }
 
     pub(crate) fn dispatch_address_input(&mut self, target: LocationJumpTarget) {
+        self.dispatch_address_input_with_scan_route(target, DirectoryScanRoute::UiThread);
+    }
+
+    pub(crate) fn dispatch_address_input_with_scan_route(
+        &mut self,
+        target: LocationJumpTarget,
+        scan_route: DirectoryScanRoute,
+    ) {
         if self.global_search.active || self.favsearch.active || self.tag_view.active {
             self.dispatch_location_jump(target);
         } else {
             // Address Enter keeps its released Direct / DriveList admission outside search.
-            self.dispatch_plain_location_jump(target);
+            self.dispatch_plain_location_jump(target, scan_route);
         }
     }
 
@@ -95,7 +103,7 @@ impl App {
             return;
         }
         if !(self.global_search.active || self.favsearch.active || self.tag_view.active) {
-            self.dispatch_plain_location_jump(target);
+            self.dispatch_plain_location_jump(target, DirectoryScanRoute::UiThread);
             return;
         }
 
@@ -125,7 +133,11 @@ impl App {
         }
     }
 
-    fn dispatch_plain_location_jump(&mut self, target: LocationJumpTarget) {
+    fn dispatch_plain_location_jump(
+        &mut self,
+        target: LocationJumpTarget,
+        scan_route: DirectoryScanRoute,
+    ) {
         match target {
             LocationJumpTarget::Physical(path) => self.open_direct_navigation_target_at_stage(
                 path,
@@ -135,6 +147,7 @@ impl App {
                 None,
                 StartupListIntent::ExplicitList,
                 MainListRequestStage::Admission,
+                scan_route,
             ),
             LocationJumpTarget::DriveList => self.enter_drive_list_from_navigation(None),
             LocationJumpTarget::ReadingHistory => {
@@ -1045,7 +1058,8 @@ mod tests {
             origin: &std::path::Path,
         ) {
             let target = match &candidate {
-                AddressBarNav::AddressInput(LocationJumpTarget::Physical(path)) => path.clone(),
+                AddressBarNav::AddressInput(LocationJumpTarget::Physical(path))
+                | AddressBarNav::AddressEnterPhysical(path) => path.clone(),
                 AddressBarNav::AddressInput(LocationJumpTarget::DriveList) => {
                     super::super::drive_list_synthetic_path()
                 }
@@ -1215,7 +1229,9 @@ mod tests {
                     let source = user_navigation_source_state(&app);
                     let ctx = egui::Context::default();
                     let candidate = favorite_handler_candidate(&mut app, &ctx, entrance);
-                    assert!(matches!(&candidate, AddressBarNav::Favorite(path) if path == &target));
+                    assert!(
+                        matches!(&candidate, AddressBarNav::WorkerFavorite(path) if path == &target)
+                    );
                     assert_search_active(&app, kind);
                     let mut frame = toolbar_favorite_frame(PathBuf::new());
                     frame.toolbar_fav_nav = None;
