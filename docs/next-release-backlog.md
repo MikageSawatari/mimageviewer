@@ -41,7 +41,11 @@
 
 ### 1.814 全件テスト (test-full) で負荷や実機のキー状態により不安定になるテスト — v5.4.0 向けの取り込み後の全件から (2026-11-18)
 
-- 状態: **未着手**。製品のコードではなく、テストの作りの問題。いずれも単独で流し直すと通る (統括が確認)。
+- 状態: **ブランチ `test-814-flaky` で修正 (master 未取り込み)**。製品のコードではなく、テストの作りの問題。いずれも単独で流し直すと通る (統括が確認)。
+- 修正 (2026-11-18): 製品の挙動は変えていない。
+  - (a) 4 箇所とも、偽の入力を消さずに `SyntheticKeyCommand::up` で放す (`release_hold()`)。`up` で Home と一緒に押した Ctrl も放されることは `src/key_input.rs` の `release_key` / `modifiers()` で確かめた。破壊検証 (実装担当): 実キーを読む側を「押されている」に固定しても直したテストは通り、旧 186 行の放し方に戻すと落ちる。
+  - (b) 4 件を、検索の種類 4 × 操作の分類 (`Entry`) の 56 件に分けた。各操作が新しい App で始まる形はそのまま。直列で 1 件あたり最大 5.8 秒 (分ける前は 1 件 46〜48 秒、実装担当の計測)。分けたテストの和が移動する操作全部と一致し、重複も無いことを検査するテストを足した。
+  - (c) `open_at_with_migration_info` の中身を、待ち時間を引数に取る private の `open_at_with_busy_timeout` に移した。製品は今の 2 秒で呼ぶ。同時に開くテストだけ 60 秒で呼び、製品の 2 秒の待ちではなく、直列化 (移行 1 回・revision 一致・デッドロックなし) を検査する。破壊検証 (実装担当): IMMEDIATE を DEFERRED にすると、1 回目で 0.04 秒の `database is locked` として落ちる。製品で負荷のもと 2 秒を超えたときの扱いは、まれな失敗の割り切りのまま。
 - (a) 実機の Ctrl を読むテスト: `src/ui_fullscreen/compare_original_tests.rs` の 186・283・638・695 行が、キーを放したことを `clear_test_synthetic_input()` (偽の入力の消去) で表している。消した後の判定 `physical_key_down_from` (`src/key_input.rs`) は `GetAsyncKeyState(VK_CONTROL)` で PC の実際のキーを読むので、その瞬間に Ctrl が押されていると落ちる (5093a7d70 の取り込み後の全件で 186 行の 1 件が失敗、単独では成功。判断は子セッション perf-801-776 のコード読み)。直し方: 消さずに `SyntheticKeyCommand::up` + `advance_test_synthetic_input` で放し、偽の入力が有効なまま判定する (`src/keymap.rs` の既存テストと同じ形)。消去は最後の後片付けだけにする。`up` で一緒に押した Ctrl も放されるかを実装時に確かめる。待ち時間は足さない。
 - (b) 上限に近い遅いテスト: `app::search_nav_entry_inventory_tests::search_nav_inventory_{container,everything,metadata,tag}_all_independent_key_inputs` の 4 件が、本体 lib 全件で 203〜210 秒、単独で 60〜87 秒かかり、test-full の負荷で 300 秒の上限を超えた (5093a7d70 の取り込み後)。テストを分けるか、走査の費用を減らすかを検討する。上限を延ばすだけにはしない。
 - (c) 負荷で DB の書き込み待ちが 5 秒を超えるテスト: `folder_thumb_pins::tests::concurrent_refresh_opens_preserve_pin_rows_and_store_revision` が test-full の中で `database is locked` (busy_timeout 超過) で失敗した (822f96595 の取り込み後)。単独の 10 回連続では全部成功。テストのスレッド数・待ちの前提が負荷に耐えるかを見直す。

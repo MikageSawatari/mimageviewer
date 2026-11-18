@@ -792,11 +792,18 @@ impl FolderThumbPinDb {
     }
 
     fn open_at_with_migration_info(path: &Path) -> SqlResult<(Self, bool)> {
+        Self::open_at_with_busy_timeout(path, std::time::Duration::from_secs(2))
+    }
+
+    fn open_at_with_busy_timeout(
+        path: &Path,
+        busy_timeout: std::time::Duration,
+    ) -> SqlResult<(Self, bool)> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(2))?;
+        conn.busy_timeout(busy_timeout)?;
         let migration_ran = Self::init_schema(&conn)?;
         Ok((Self::from_connection(conn), migration_ran))
     }
@@ -2886,9 +2893,13 @@ mod tests {
                         let pin = &pin;
                         scope.spawn(move || {
                             barrier.wait();
-                            let (db, migrated) =
-                                FolderThumbPinDb::open_at_with_migration_info(path)
-                                    .expect("concurrent refresh must acquire the schema writer");
+                            // This checks schema serialization, not the production
+                            // two-second latency budget under test-suite load.
+                            let (db, migrated) = FolderThumbPinDb::open_at_with_busy_timeout(
+                                path,
+                                std::time::Duration::from_secs(60),
+                            )
+                            .expect("concurrent refresh must acquire the schema writer");
                             let revision = db.selection_revision().unwrap();
                             if !fresh {
                                 assert_eq!(

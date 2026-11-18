@@ -716,28 +716,140 @@ fn search_nav_inventory_key_and_menu_registries_have_explicit_policies() {
     }
 }
 
-#[test]
-fn search_nav_inventory_metadata_all_independent_key_inputs() {
-    key_inputs_for_search(0);
+// Each partition still starts from the complete registry and each action creates
+// its own App. Splitting only bounds per-test work; it does not reuse mutable fixtures.
+macro_rules! independent_key_input_tests {
+    ($($name:ident => ($kind:literal, $entry:ident, $shard:literal, $shards:literal)),+ $(,)?) => {
+        const KEY_INPUT_CASES: &[(usize, Entry, usize, usize)] = &[
+            $(($kind, Entry::$entry, $shard, $shards)),+
+        ];
+        $(
+            #[test]
+            fn $name() {
+                key_inputs_for_search($kind, Entry::$entry, $shard, $shards);
+            }
+        )+
+    };
+}
+
+independent_key_input_tests! {
+    search_nav_inventory_metadata_saved_group_0_independent_key_inputs => (0, SavedGroup, 0, 4),
+    search_nav_inventory_metadata_saved_group_1_independent_key_inputs => (0, SavedGroup, 1, 4),
+    search_nav_inventory_metadata_saved_group_2_independent_key_inputs => (0, SavedGroup, 2, 4),
+    search_nav_inventory_metadata_saved_group_3_independent_key_inputs => (0, SavedGroup, 3, 4),
+    search_nav_inventory_metadata_book_manager_independent_key_inputs => (0, BookManager, 0, 1),
+    search_nav_inventory_metadata_collection_manager_independent_key_inputs => (0, CollectionManager, 0, 1),
+    search_nav_inventory_metadata_folder_dialog_independent_key_inputs => (0, FolderDialog, 0, 1),
+    search_nav_inventory_metadata_physical_parent_independent_key_inputs => (0, PhysicalParent, 0, 1),
+    search_nav_inventory_metadata_favorite_0_independent_key_inputs => (0, Favorite, 0, 2),
+    search_nav_inventory_metadata_favorite_1_independent_key_inputs => (0, Favorite, 1, 2),
+    search_nav_inventory_metadata_location_0_independent_key_inputs => (0, Location, 0, 4),
+    search_nav_inventory_metadata_location_1_independent_key_inputs => (0, Location, 1, 4),
+    search_nav_inventory_metadata_location_2_independent_key_inputs => (0, Location, 2, 4),
+    search_nav_inventory_metadata_location_3_independent_key_inputs => (0, Location, 3, 4),
+    search_nav_inventory_everything_saved_group_0_independent_key_inputs => (1, SavedGroup, 0, 4),
+    search_nav_inventory_everything_saved_group_1_independent_key_inputs => (1, SavedGroup, 1, 4),
+    search_nav_inventory_everything_saved_group_2_independent_key_inputs => (1, SavedGroup, 2, 4),
+    search_nav_inventory_everything_saved_group_3_independent_key_inputs => (1, SavedGroup, 3, 4),
+    search_nav_inventory_everything_book_manager_independent_key_inputs => (1, BookManager, 0, 1),
+    search_nav_inventory_everything_collection_manager_independent_key_inputs => (1, CollectionManager, 0, 1),
+    search_nav_inventory_everything_folder_dialog_independent_key_inputs => (1, FolderDialog, 0, 1),
+    search_nav_inventory_everything_physical_parent_independent_key_inputs => (1, PhysicalParent, 0, 1),
+    search_nav_inventory_everything_favorite_0_independent_key_inputs => (1, Favorite, 0, 2),
+    search_nav_inventory_everything_favorite_1_independent_key_inputs => (1, Favorite, 1, 2),
+    search_nav_inventory_everything_location_0_independent_key_inputs => (1, Location, 0, 4),
+    search_nav_inventory_everything_location_1_independent_key_inputs => (1, Location, 1, 4),
+    search_nav_inventory_everything_location_2_independent_key_inputs => (1, Location, 2, 4),
+    search_nav_inventory_everything_location_3_independent_key_inputs => (1, Location, 3, 4),
+    search_nav_inventory_container_saved_group_0_independent_key_inputs => (2, SavedGroup, 0, 4),
+    search_nav_inventory_container_saved_group_1_independent_key_inputs => (2, SavedGroup, 1, 4),
+    search_nav_inventory_container_saved_group_2_independent_key_inputs => (2, SavedGroup, 2, 4),
+    search_nav_inventory_container_saved_group_3_independent_key_inputs => (2, SavedGroup, 3, 4),
+    search_nav_inventory_container_book_manager_independent_key_inputs => (2, BookManager, 0, 1),
+    search_nav_inventory_container_collection_manager_independent_key_inputs => (2, CollectionManager, 0, 1),
+    search_nav_inventory_container_folder_dialog_independent_key_inputs => (2, FolderDialog, 0, 1),
+    search_nav_inventory_container_physical_parent_independent_key_inputs => (2, PhysicalParent, 0, 1),
+    search_nav_inventory_container_favorite_0_independent_key_inputs => (2, Favorite, 0, 2),
+    search_nav_inventory_container_favorite_1_independent_key_inputs => (2, Favorite, 1, 2),
+    search_nav_inventory_container_location_0_independent_key_inputs => (2, Location, 0, 4),
+    search_nav_inventory_container_location_1_independent_key_inputs => (2, Location, 1, 4),
+    search_nav_inventory_container_location_2_independent_key_inputs => (2, Location, 2, 4),
+    search_nav_inventory_container_location_3_independent_key_inputs => (2, Location, 3, 4),
+    search_nav_inventory_tag_saved_group_0_independent_key_inputs => (3, SavedGroup, 0, 4),
+    search_nav_inventory_tag_saved_group_1_independent_key_inputs => (3, SavedGroup, 1, 4),
+    search_nav_inventory_tag_saved_group_2_independent_key_inputs => (3, SavedGroup, 2, 4),
+    search_nav_inventory_tag_saved_group_3_independent_key_inputs => (3, SavedGroup, 3, 4),
+    search_nav_inventory_tag_book_manager_independent_key_inputs => (3, BookManager, 0, 1),
+    search_nav_inventory_tag_collection_manager_independent_key_inputs => (3, CollectionManager, 0, 1),
+    search_nav_inventory_tag_folder_dialog_independent_key_inputs => (3, FolderDialog, 0, 1),
+    search_nav_inventory_tag_physical_parent_independent_key_inputs => (3, PhysicalParent, 0, 1),
+    search_nav_inventory_tag_favorite_0_independent_key_inputs => (3, Favorite, 0, 2),
+    search_nav_inventory_tag_favorite_1_independent_key_inputs => (3, Favorite, 1, 2),
+    search_nav_inventory_tag_location_0_independent_key_inputs => (3, Location, 0, 4),
+    search_nav_inventory_tag_location_1_independent_key_inputs => (3, Location, 1, 4),
+    search_nav_inventory_tag_location_2_independent_key_inputs => (3, Location, 2, 4),
+    search_nav_inventory_tag_location_3_independent_key_inputs => (3, Location, 3, 4),
+}
+
+fn partition_key_inputs(
+    entry: Entry,
+    shard: usize,
+    shards: usize,
+) -> impl Iterator<Item = KeyAction> {
+    KeyAction::all()
+        .iter()
+        .copied()
+        .filter(move |&action| key_entry(action) == entry)
+        .enumerate()
+        .filter_map(move |(index, action)| (index % shards == shard).then_some(action))
 }
 
 #[test]
-fn search_nav_inventory_everything_all_independent_key_inputs() {
-    key_inputs_for_search(1);
+fn search_nav_inventory_key_input_partitions_cover_all_independent_actions_once() {
+    use std::collections::HashSet;
+    let expected: HashSet<_> = KeyAction::all()
+        .iter()
+        .copied()
+        .filter(|&action| match key_entry(action) {
+            Entry::SavedGroup
+            | Entry::BookManager
+            | Entry::CollectionManager
+            | Entry::FolderDialog
+            | Entry::PhysicalParent
+            | Entry::Favorite
+            | Entry::Location => true,
+            Entry::ResultNavigation
+            | Entry::History
+            | Entry::Refresh
+            | Entry::SearchSurface
+            | Entry::External
+            | Entry::NoLocationChange => false,
+        })
+        .collect();
+    for kind in 0..4 {
+        let mut covered = Vec::new();
+        for &(case_kind, entry, shard, shards) in KEY_INPUT_CASES {
+            assert!(shards > 0 && shard < shards);
+            if case_kind == kind {
+                let actions: Vec<_> = partition_key_inputs(entry, shard, shards).collect();
+                assert!(
+                    !actions.is_empty(),
+                    "empty partition: {kind} {entry:?} {shard}"
+                );
+                covered.extend(actions);
+            }
+        }
+        assert_eq!(covered.len(), expected.len(), "partition count: {kind}");
+        assert_eq!(
+            covered.into_iter().collect::<HashSet<_>>(),
+            expected,
+            "partition union: {kind}"
+        );
+    }
 }
 
-#[test]
-fn search_nav_inventory_container_all_independent_key_inputs() {
-    key_inputs_for_search(2);
-}
-
-#[test]
-fn search_nav_inventory_tag_all_independent_key_inputs() {
-    key_inputs_for_search(3);
-}
-
-fn key_inputs_for_search(kind: usize) {
-    for &action in KeyAction::all() {
+fn key_inputs_for_search(kind: usize, entry: Entry, shard: usize, shards: usize) {
+    for action in partition_key_inputs(entry, shard, shards) {
         match key_entry(action) {
             Entry::SavedGroup => {
                 super::search_nav_book_tests::assert_saved_group_search_action(action, kind);
