@@ -1,6 +1,6 @@
 # 直接移動のフォルダ走査を worker へ移す (§1.805)
 
-状態: 設計 r7 (2026-11-18、利用者決定で範囲をお気に入り・アドレス欄 Enter・最近開いたフォルダのメニューに戻した版、§3.2。r6 までは r4・r5 の指摘も反映。設計レビュー r1〜r3 の REJECT と統括の「組み合わせを減らす」指示を反映、§3.1)。担当: 設計・検収 = ClaudeCode Opus 5.5、
+状態: 設計 r8 (2026-11-18、r7 の新しい設計レビューの指摘を反映。r7 は 利用者決定で範囲をお気に入り・アドレス欄 Enter・最近開いたフォルダのメニューに戻した版、§3.2。r6 までは r4・r5 の指摘も反映。設計レビュー r1〜r3 の REJECT と統括の「組み合わせを減らす」指示を反映、§3.1)。担当: 設計・検収 = ClaudeCode Opus 5.5、
 実装 = Codex GPT-6.1 Sol / high、独立レビュー = GPT-6.1 Sol / xhigh。
 
 ## 1. 問題
@@ -61,6 +61,17 @@ worker 走査にするのは次の入口だけ:
 一覧のフォルダを開く (Enter・ダブルクリック・ゲームパッド)、親へ (BS・親ボタン・ZIP からの BS・スマート/サブフォルダ展開の親)、
 コレクションの物理元、コンテキストメニュー経由の open。理由は §3.2。
 
+印の付け方 (r8、設計レビュー r7 の割り振りによる): `Worker` の印は次の生成点で付ける。
+メニューのお気に入り (`fav_nav` の `Physical`、`update_phases.rs` 1272 付近)、ツールバーのお気に入り・ピン留め本
+(`toolbar_fav_nav`、同 1282 付近)、キーのお気に入り番号・前後とリング/ジェスチャ/ゲームパッドのお気に入り番号
+(`gamepad_input.rs` 7990・8221 付近の共通 producer)、ゲームパッドのお気に入りピッカー確定 (同 5816 付近)、
+アドレス欄 Enter の `Physical` (`ui_main.rs` 16707 付近。`dispatch_plain_location_jump` まで印を運ぶ)、
+最近開いたフォルダの選択 (`ui_main.rs` 16664 付近、専用の値で通常の `Direct` と区別)。
+同じ関数 (`dispatch_favorite_navigation`・`dispatch_plain_location_jump`) や同じ値 (`Favorite`・`Direct`・
+`LocationJump::Physical`) を通る他の入口は印を持たず `UiThread`: フォルダを開くダイアログ、一覧のフォルダ open、
+親移動 (通常・close-return・smart・サブ展開)、コレクション、コンテキストメニュー、`grid_nav`、場所メニュー・整理先・
+既知フォルダ・ドライブ選択/切替・ゲームパッドの場所ピッカー等の `LocationJump::Physical`、コンテキストの書庫ジャンプ。
+
 ### 2.3 この consumer を通らない同期走査 (範囲外として残す)
 
 - `dispatch_main_input_nav_immediate` (全画面を閉じる即時経路) の `Direct` / `CollectionSource` は
@@ -92,7 +103,10 @@ r1〜r6 の設計は、同じ consumer を通る一覧のフォルダを開く�
 
 範囲内の入口にも同じ性質はある: お気に入りを押した・アドレス欄で Enter した直後のキー入力は、走査待ちの間
 一覧に届かない (履歴の戻る/進むの待ちと同じ扱い)。これらの入口では、押した直後に一覧へキー入力を続ける使い方は
-一覧の Enter ほど一般的でないと判断し、規則 1 を適用する。この扱いは統括経由で利用者に確認し、利用者が了承した (2026-11-18、「これでよい」)。
+一覧の Enter ほど一般的でないと判断し、規則 1 を適用する。この扱いは統括経由で利用者に確認し、利用者が了承した (2026-11-18、「これでよい」)。了承の対象には、アドレス欄で
+パスを入力して Enter した直後に ↓ や Enter などのキーを一覧へ続ける操作も含む (アドレス確定でフォーカスが一覧へ移る
+ため、走査待ちの間のキーは一覧で処理されず捨てられる。従来の同期走査では UI が止まっている間 OS が入力を保持し、
+新しい一覧で処理されていた)。
 
 ### 3.1 割り込みの組み合わせを減らす (設計レビュー r1〜r3 と統括指示、2026-11-18)
 
@@ -129,11 +143,7 @@ pub(crate) enum FolderOpenScanPurpose {
     …
     /// main context の直接移動 (§2.2) の実フォルダ。拒否判定と所有権の受理は dispatch 時に済ませ、
     /// 完了したら pre_scan 付きで open_direct_navigation_target_at_stage へ戻る。
-    DirectNavigation {
-        restore_intent: StartupListIntent,
-        /// 受付時の `pending_auto_fs_open`。要求と寿命を同じにし、取消・失敗・stale では捨てる。
-        auto_fullscreen: bool,
-    },
+    DirectNavigation,
 }
 ```
 
@@ -176,7 +186,7 @@ enum DirectoryScanRoute { UiThread, Worker }
 
 満たすときの受付処理 (この順):
 
-1. `pending_auto_fs_open` を取り出して purpose の `auto_fullscreen` に移し、フィールドは `false` に戻す。
+1. (r8 で削除: 範囲内の入口は全画面予約を作らないので、`pending_auto_fs_open` の移送はしない。グローバルの値には触れない)
 2. 競合する main 要求を退役させる: `retire_replaced_main_list_requests_with_startup_intent(Some(Pane),
    restore_intent.replaces_deferred_startup_open() && stage == MainListRequestStage::Admission)`。
 3. 進行中の DFS (`folder_nav_pending`) を取り消し、累積ステップを消す。これは同期経路の install が
@@ -195,18 +205,15 @@ enum DirectoryScanRoute { UiThread, Worker }
 
 ### 4.3 完了 (既存の裁定へ戻す)
 
-- r7: 実装レビュー r1 の P2 対応で入れた「走査済みのパスを再分類しない」変更は、ツリー・GridFolderCandidate の完了にも
-  効いていたので撤回する (範囲外の経路を変えない)。DirectNavigation の対象は §4.2 の条件で分類の要らない名前に
+- r7: 実装レビュー r1 の P2 対応で入れた「走査済みのパスを再分類しない」変更 (Directory の推定とそれに伴う文書モーダルの
+  拒否を含む) は、ツリー・GridFolderCandidate の完了にも効いていたので撤回する (範囲外の経路を変えない)。DirectNavigation の対象は §4.2 の条件で分類の要らない名前に
   限られるので、完了の再入で再分類は起きない。
 - `poll_folder_pane_open` はそのまま (sidecar 復元中の保留、navigation の stale 取消、`Disconnected` の扱い)。
-- `resolve_main_folder_open_ready` に `DirectNavigation` の腕を足し、`pending_auto_fs_open = auto_fullscreen` を
-  設定してから `ResolvedMainFolderOpen { restore_intent, path, scan, collection_owner, epub_restore: None, navigation }`
-  を返す (`GridFolderCandidate` が `pending_auto_fs_open = image_book` を設定する前例と同じ)。走査失敗は既存の
-  共通処理 (ログ + 「フォルダを読み取れませんでした」) に乗り、予約は捨てる。
-- **全画面予約はその要求のすべての終端で消える**: 取消・走査失敗・stale に加え、完了後の再入で採用が拒否された
-  場合 (文書モーダル中の claim 拒否、snapshot 範囲外等) も、`pending_auto_fs_open` を `false` に戻す。
-  r7: この消去は DirectNavigation の完了からの再入だけに適用する。`GridFolderCandidate` の完了の既存の扱いは変えない
-  (範囲外。既存の漏れは §7 に記録)。
+- `resolve_main_folder_open_ready` に `DirectNavigation` の腕を足し、
+  `ResolvedMainFolderOpen { restore_intent: ExplicitList, path, scan, collection_owner: None, epub_restore: None, navigation }`
+  を返す。走査失敗は既存の共通処理 (ログ + 「フォルダを読み取れませんでした」) に乗る。
+- r8: 全画面予約の移送と、走査完了後の採用拒否での予約消去は削除する (範囲内の入口は予約を作らない。消去を残すと
+  ツリー・GridFolderCandidate の完了にも及ぶ)。実装済みの `pre_scan.is_some()` による消去と分類入口の消去も外す。
 - `update_phases.rs` の `folder_pane_open_ready` 分岐は変更不要: `navigate_stage = Continuation`、
   `navigate_pre_scan = Some(scan)`、`collection_owner` から `navigate_owner` を作り、
   `open_direct_navigation_target_at_stage(…, Some(scan), …)` へ入る。`#[cfg(not(windows))]` 側の match も
@@ -231,7 +238,8 @@ enum DirectoryScanRoute { UiThread, Worker }
 `grid_item_input_allowed()` はその `is_none()`)、スタック専用の操作 (Esc の切り替え) は理由がスタック更新のときだけ
 受け付ける。理由による制限はスタック専用の操作 (Esc 等) に限り、同じ関数が今許している非項目の操作 (戻る/進むボタン、
 ヘルプ・設定・操作カスタマイズ、最大化の切替等) はどの理由でも従来どおり通す。
-r7: 範囲外の挙動を変えないため、Esc・スタック切替キーを止めるのは**理由が直接移動の走査待ちのときだけ**とし、
+r7: 範囲外の挙動を変えないため、Esc・スタック切替キーを止めるのは**理由が直接移動の走査待ちのときだけ**とし
+(r8: 停止理由に直接移動の走査待ち専用の値を設け、履歴・レーティングの待ちの値と区別する)、
 履歴・レーティングの待ち・構造操作・画像フォルダの ZIP 化中の既存の扱い (Esc で切り替わる) は変えない。
 その既存の不具合は §7 に記録する。
 
@@ -244,7 +252,7 @@ r7: 範囲外の挙動を変えないため、Esc・スタック切替キーを�
 | 新しい入力 | 仕組み |
 | --- | --- |
 | 別の直接移動・ツリーのクリック・検索中の場所ジャンプ | 新しい要求の受付が旧 pending を cancel (既存) |
-| お気に入り・キーの nav・DFS 結果・アドレス欄・コンテキストの nav のうち一覧の判定の外で出るもの | 通常 nav 裁定の `higher_priority_than_folder_pane` で cancel (既存) |
+| お気に入り・キーの nav・DFS 結果・アドレス欄・コンテキストの nav のうち一覧の判定の外で出るもの | **r8 変更**: 通常 nav 裁定の `higher_priority_than_folder_pane` による事前の cancel は、`DirectNavigation` には適用しない (`PaneNavigation` は従来どおり事前に cancel)。そのフレームでは `DirectNavigation` の完了を poll せず、後続の候補が**受理されたときだけ**、その受付 (新しい走査の開始・`retire_replaced_main_list_requests`) で退役させる。後続が拒否された場合 (表示対象外の ZIP の指定、snapshot 中など) は走査待ちが残り、後のフレームで採用される。受理されても退役させない後続 (同期 install 等) は、一覧の source が変わるので stale 判定で捨てられる。受理時に退役も source の変更もしない main 要求が無いことを実装時に列挙して確かめる |
 | 履歴の戻る/進む、コレクション、レーティング、Quick Folder 切替、Remote 取得等の main 要求 | `retire_replaced_main_list_requests` が `cancel_folder_pane_open` (既存) |
 | **DFS (Ctrl+↑↓ 等) の開始** | **追加 (受付点 1)**: `start_folder_nav` が新しい DFS を受理したとき (既存 DFS への累積は除く)、main の `DirectNavigation` の pending を `cancel_folder_pane_open` で cancel する (r7: ツリーの `PaneNavigation` は従来どおり触れない)。`cancel_pending_folder_nav()` は新しい DFS 用の lock・holdover まで消すので流用しない。detached 用の purpose・`RequiredFullscreenTarget`・`CurrentViewOrderRefresh` 等には触れない |
 | **直接移動の受付 (DFS 実行中)** | **追加 (受付点 2)**: §4.2 の 3 |
@@ -301,7 +309,9 @@ r7: 範囲外の挙動を変えないため、Esc・スタック切替キーを�
    (結果取り出し後・同じフレームの境界を含む) も確かめる。
 6. 待機表示: 500 ms 未満の走査では「移動先を読み込み中…」を描かず、500 ms を超えたら描く。
 7. stale: 走査中に別の採用で一覧が変わったら、完了しても採用しない。
-8. 全画面予約: 直接移動の受付時に残っていた予約は要求とともに運ばれ、取消・失敗・採用拒否では消える。
+8. (r8 で削除: 全画面予約の移送はしない)
+8a. 拒否された後続: お気に入り A の走査中に、拒否される入力 (表示対象外の ZIP をアドレス欄で指定等) を実際の裁定で
+   与えても A の走査待ちは残り、後で A が採用される。ツリーの走査待ちは従来どおり事前に取り消される。
 9. 対象外の型 (ZIP/PDF、`.epub`/変換書庫、main 以外の context) は従来の経路のまま。
 10. (r7 で削除: CollectionGridPhysical は範囲外)
 11. 走査失敗で一覧を変えず、通知とログを出す。
@@ -318,7 +328,7 @@ ready済みの直接移動と同じフレームのお気に入り・アドレス
 - [ui-responsiveness.md](ui-responsiveness.md): 本件の節 (上部の近年の節と同じ形) と §5 の表への 1 行。
 - [async-architecture.md](async-architecture.md): 「物理フォルダ open 事前走査」の行と §718 付近の表に
   `DirectNavigation` と §4.4 の取消規則を追記。
-- [detached-rework-plan.md](detached-rework-plan.md) §11: bundle 所有の `FolderOpenScanPurpose` に main 専用の
+- [detached-rework-plan.md](detached-rework-plan.md) §11 (r8: 範囲を r7 に合わせて書き直す): bundle 所有の `FolderOpenScanPurpose` に main 専用の
   variant を足したこと、`start_folder_nav` の取消が detached 用 purpose に触れないこと、detached context は
   経路を変えないことを記録する (設計レビュー r1 で「構造的変更」に AGREE)。
 
