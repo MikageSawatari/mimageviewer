@@ -34,9 +34,10 @@ pub(super) fn draw_pan_correction(pages: &[DisplayedImageTransform]) -> egui::Ve
     );
     // Layout-origin snap, sampler-origin snap and joint gap alignment can
     // change the re-resolved edge by up to two physical pixels. Accept only
-    // that residual; a larger correction still goes all the way to the edge.
+    // that residual only while some of the unit remains visible. Edge contact
+    // alone must not hide a fully off-screen one- or two-pixel page.
     let snap_tolerance = 2.0 * physical_pixel_scale(first.pixels_per_point);
-    if correction.abs().max_elem() <= snap_tolerance {
+    if correction.abs().max_elem() <= snap_tolerance && unit.intersect(viewport).is_positive() {
         egui::Vec2::ZERO
     } else {
         correction

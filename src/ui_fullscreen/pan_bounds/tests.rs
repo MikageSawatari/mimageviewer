@@ -215,6 +215,177 @@ fn rotation_keeps_in_range_pan_exactly_and_rebounds_the_rest() {
 }
 
 #[test]
+fn tiny_rotated_pages_remain_visible_and_stationary_after_snap_correction() {
+    for dpi in [1.0, 1.25, 1.5] {
+        for thin_pixels in [10, 20] {
+            for horizontal in [true, false] {
+                for sign in [-1.0, 1.0] {
+                    let ctx = egui::Context::default();
+                    let mut app = app(&ctx, SpreadMode::Single);
+                    app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
+                    app.fs_zoom = 0.1;
+                    // Keep the unrotated long side at 100pt for every DPI, so
+                    // its edge position still meets the input-side 48pt rule.
+                    let long_pixels = (1000.0 * dpi) as usize;
+                    let size = if horizontal {
+                        [long_pixels, thin_pixels]
+                    } else {
+                        [thin_pixels, long_pixels]
+                    };
+                    let image = egui::ColorImage::filled(size, egui::Color32::WHITE);
+                    let texture = ctx.load_texture(
+                        "tiny-rotated-page",
+                        image.clone(),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    let FsCacheEntry::Static {
+                        tex,
+                        pixels,
+                        source_dims,
+                        ..
+                    } = app.fs_cache.get_mut(&0).unwrap()
+                    else {
+                        panic!("static source")
+                    };
+                    *tex = texture;
+                    *pixels = Arc::new(image);
+                    *source_dims = Some(size);
+                    app.record_page_dims_for_spread(0, (size[0] as u32, size[1] as u32));
+                    let payload = resource(&app, 0, FullscreenPageMaterialKind::Complete);
+                    let pixel = 1.0 / dpi;
+                    let pan = sign
+                        * if horizontal {
+                            egui::vec2(viewport().width() * 0.5 + pixel, 0.0)
+                        } else {
+                            egui::vec2(0.0, viewport().height() * 0.5 + pixel)
+                        };
+                    app.fs_pan = pan;
+                    frame(&ctx, viewport(), dpi, |ui| {
+                        single(
+                            &mut app,
+                            ui,
+                            &payload,
+                            true,
+                            false,
+                            Rotation::None,
+                            SingletonSpreadPlacement::Center,
+                        );
+                        assert_eq!(app.fs_pan, pan);
+                        assert_eq!(
+                            clamp_fullscreen_pan_from_layout(
+                                &app.fullscreen_page_layout,
+                                app.fs_zoom,
+                                pan
+                            ),
+                            pan
+                        );
+                    });
+                    // Independent oracle: actual painted bounds, not the result
+                    // of the pan helper whose tolerance caused the regression.
+                    let assert_visible = |t: DisplayedImageTransform| {
+                        let overlap_x = t.paint_rect.right().min(t.viewport_rect.right())
+                            - t.paint_rect.left().max(t.viewport_rect.left());
+                        let overlap_y = t.paint_rect.bottom().min(t.viewport_rect.bottom())
+                            - t.paint_rect.top().max(t.viewport_rect.top());
+                        assert!(
+                            overlap_x > 0.0 && overlap_y > 0.0,
+                            "dpi={dpi}, thin={thin_pixels}, horizontal={horizontal}, sign={sign}, rect={:?}",
+                            t.paint_rect
+                        );
+                        let thin_extent = if horizontal {
+                            t.paint_rect.width()
+                        } else {
+                            t.paint_rect.height()
+                        };
+                        assert!((thin_extent * dpi - thin_pixels as f32 * 0.1).abs() < 0.001);
+                    };
+                    app.rotation_cache.insert(0, Rotation::Cw90);
+                    frame(&ctx, viewport(), dpi, |ui| {
+                        let t = single(
+                            &mut app,
+                            ui,
+                            &payload,
+                            true,
+                            false,
+                            Rotation::Cw90,
+                            SingletonSpreadPlacement::Center,
+                        );
+                        assert_visible(t);
+                        assert_eq!(normal_zoom_pan(t).unwrap().1, app.fs_pan);
+                        assert!((app.fs_pan - pan).abs().max_elem() * dpi <= 2.001);
+                    });
+                    let bounded = app.fs_pan;
+                    for _ in 0..2 {
+                        frame(&ctx, viewport(), dpi, |ui| {
+                            let t = single(
+                                &mut app,
+                                ui,
+                                &payload,
+                                true,
+                                false,
+                                Rotation::Cw90,
+                                SingletonSpreadPlacement::Center,
+                            );
+                            assert_visible(t);
+                            assert_eq!(app.fs_pan, bounded);
+                            assert_eq!(draw_pan_correction(&[t]), egui::Vec2::ZERO);
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn snap_tolerance_requires_positive_area_and_preserves_visible_residuals() {
+    let vp = viewport();
+    let page = |rect, dpi| {
+        DisplayedImageTransform::from_resolved_rect(
+            DisplayedImageTransformInput {
+                page_idx: 0,
+                viewport_rect: vp,
+                source_size: egui::vec2(1.0, 20.0),
+                texture_size: egui::vec2(1.0, 20.0),
+                rotation: Rotation::None,
+                free_rotation_rad: 0.0,
+                content_bbox: None,
+                fit_mode: FullscreenFitInput::Legacy(FullscreenFitMode::Original),
+                fit_scale_limits: Default::default(),
+                pixels_per_point: dpi,
+                placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                pixel_fit: RectPixelFit::Proportional,
+            },
+            rect,
+        )
+        .unwrap()
+    };
+    for dpi in [1.0, 1.25, 1.5] {
+        for width in [1.0, 2.0] {
+            let pixel = 1.0 / dpi;
+            let visible = egui::Rect::from_min_size(
+                egui::pos2(vp.right() - width * pixel * 0.5, 100.0),
+                egui::vec2(width * pixel, 20.0),
+            );
+            assert_eq!(draw_pan_correction(&[page(visible, dpi)]), egui::Vec2::ZERO);
+            // A two-pixel page touches the edge; a one-pixel page is one pixel
+            // beyond it. Both need <= 2px and both used to stay entirely hidden.
+            let outside = egui::Rect::from_min_size(
+                egui::pos2(vp.right() + (2.0 - width) * pixel, 100.0),
+                egui::vec2(width * pixel, 20.0),
+            );
+            let correction = draw_pan_correction(&[page(outside, dpi)]);
+            assert!(correction.x < 0.0);
+            assert_eq!(correction.y, 0.0);
+            let actual = outside.translate(correction);
+            assert!(actual.right().min(vp.right()) - actual.left().max(vp.left()) > 0.0);
+            assert!(actual.bottom().min(vp.bottom()) - actual.top().max(vp.top()) > 0.0);
+            assert_eq!(draw_pan_correction(&[page(actual, dpi)]), egui::Vec2::ZERO);
+        }
+    }
+}
+
+#[test]
 fn partner_rotation_to_single_restricts_pan_without_a_rotation_history() {
     let ctx = egui::Context::default();
     let mut app = app(&ctx, SpreadMode::Ltr);

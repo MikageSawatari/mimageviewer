@@ -1,6 +1,6 @@
 # 全画面のパンの制限と前面メニュー中のキー入力 (§1.806・§1.807・§1.810) 設計書
 
-- 状態: §6.6・§6.7の裁定①を反映し、実装・対象297件・最終core check成功（2026-11-19）。未コミット、独立実装レビュー／全件gate／実機検収は設計担当の後続工程。再開基点 `ff2abdf5a`。過去の対象268件の結果と今回の検証は§6.5。実装前の独立レビュー: 案 B は r4 で ACCEPT、§1.810 を案 C (記録を持たず毎回収める) へ切り替えて r5〜r7 は REVISE、r8 で ACCEPT (§7)。
+- 状態: 独立実装レビューround 3のP2を修正し、対象22件・core check成功（2026-11-19、§6.8、基点 `aa5763c22`）。先行する§6.6・§6.7の裁定①反映と対象297件・core checkの成功履歴は§6.5。未コミット、再レビュー／全件gate／実機検収は設計担当の後続工程。実装前の独立レビュー: 案 B は r4 で ACCEPT、§1.810 を案 C (記録を持たず毎回収める) へ切り替えて r5〜r7 は REVISE、r8 で ACCEPT (§7)。
 - ブランチ: `fix-fs-pan-input-806-807-810` (作業ツリー `G:\home\mimageviewer-474`、master 605ba335b 起点)。
 - 担当: 設計・検収 = ClaudeCode Opus 5.5 / high、実装 = Codex gpt-6.1-sol / high、独立レビュー = 別の gpt-6.1-sol / xhigh。
 - 元の項目: [next-release-backlog.md](next-release-backlog.md) の §1.806・§1.807・§1.810。どれも §1.474 ([fullscreen-in-page-scroll-plan.md](fullscreen-in-page-scroll-plan.md)) の作業中に見つかった既存の問題。
@@ -124,6 +124,7 @@
   - 確定: 実際に描く素材が決まり、§3.3 の条件を満たすと分かった後で、補正量が 0 でなければ `fs_pan` を書き戻す。見開きは左右の素材を選び終えた後に一組で 1 回。
 - 収まりの安定 (毎 frame 動かないこと): 収めた後のパンで解決し直した矩形が、物理 px への寄せ (snap) のせいで再び範囲をわずかに外れ、次の frame でまた動く、ということが起きないこと。
   計算に使う矩形と規則の選び方 (寄せる前の矩形を使う、寄せの誤差の分だけ許す、など) は実装担当が決め、同じ入力で 2 frame 続けて描いても 2 回目の補正量が 0 になることをテストで確かめる。
+  丸め誤差として補正0を許す場合も、表示単位または実ページ候補のどれかがviewportと正の面積で交差することを保証する。辺の接触だけでは可視と扱わない（§6.8の裁定）。
 - `fullscreen_page_layout` に記録する矩形・パン (`zoom_pan`)・§1.474 の描いた表示単位の印 (`FsDrawnUnitStamp`) は、収めた後に実際に描いたものと一致すること。
 - `fs_pan` の書き戻しは「利用者入力」ではないので、`set_fs_pan_from_input` は通さない (初期配置の要求を消す副作用を持ち込まない)。
 - 自動の初期配置との関係 (`fs_automatic_initial_view`、クリック送りの可否 `fs_view_has_moved`):
@@ -255,9 +256,12 @@
 
 候補は最終transform（サンプラの縦横比のcontain、位置と寸法の整列、左右のgap整列を通したもの）の
 clip前AABBから求める。補正後にtransformを再解決する際、layoutの原点・samplerの原点・左右一体のgap整列の
-丸めが変わるため、描画側だけ各軸の残差が2物理px以下なら補正0とする。それより大きければ候補の補正を全量適用する。
+丸めが変わるため、描画側だけ各軸の残差が2物理px以下で、かつ**表示単位の矩形とviewportが正の面積で交差する場合だけ**補正0とする。
+表示単位の矩形はすべての実ページの候補を含むため、実ページのどれかが正の面積で交差する場合もこの条件を満たす。
+辺の接触や完全な画面外表示では、2物理px以下でも候補の補正を全量適用する。許容を超える場合も従来どおり全量適用する。
 入力側の48px規則は緩めない。もともと補正0の候補は常に0のままで、範囲内のパンを動かさない。
 同じ入力の連続描画、端ドラッグの入力→描画、DPI 1 / 1.25 / 1.5で再補正が起こらないことを検査する。
+1〜2物理pxのページは、90°回転後の実際のpaint矩形とviewportの交差を独立に計算し、そのframeから正の交差があること、次frameでpanと補正0が安定することを検査する（§6.8）。
 
 ### 6.3 パンの書き手・形を変える経路・一時表示の棚卸し
 
@@ -341,7 +345,7 @@ git diff --check
 初回はsandboxによりrunnerのlock書込みができず低優先度・6並列で実行、再実行は他担当のfull lock待ちになった。
 全件gate・build-dev・製品起動・コミットは実施していない。
 
-追加したテスト名（27件）:
+追加したテスト名（29件）:
 
 <!-- 806-test-names -->
 - `rotated_single_is_bounded_in_the_same_frame_with_matching_layout_and_stamp`
@@ -371,6 +375,8 @@ git diff --check
 - `held_spread_bounds_only_the_first_released_complete_frame`
 - `one_held_spread_page_keeps_the_entire_unit_pan`
 - `completing_without_matching_held_pages_still_bounds_normal_material`
+- `tiny_rotated_pages_remain_visible_and_stationary_after_snap_correction`
+- `snap_tolerance_requires_positive_area_and_preserves_visible_residuals`
 <!-- /806-test-names -->
 
 既存テストの期待値更新: `fallback_menu_leaves_navigation_arrows_unconsumed_without_moving_or_turning`、
@@ -449,6 +455,39 @@ WIPは設計担当が `ff2abdf5a` としてコミットし、実装担当はそ�
 保持とpanを同時に再選択する案②を採らず、一時表示ではpanを所有しない条件へそろえることで、保持→通常素材の選択と補正を相互依存させない。
 境界の4件と `prepare_boundary_tests`・`nonfinal_tests` の成功結果は§6.5に記録した。
 裁定①どおりの実装と検証を完了し、この停止事項は解消した。
+
+### 6.8 独立実装レビューround 3のP2: 小さいページと丸め許容（2026-11-19）
+
+別担当Sol / xhighの実装レビューはP1なし・P2 1件でREVISE。設計担当のコミット `aa5763c22` を基点に修正した。
+従来の2物理pxの許容は可視部分の有無を問わず補正を捨てたため、原寸・倍率0.1・1000×10・pan=(301,0)で
+90°回転後に幅1pxの矩形が[601,602]へ出ても、補正(-2,0)を捨てていた。
+
+- 裁定: 補正0を許す場合でも、表示単位または実ページ候補のどれかとviewportとの正の面積の交差を保証する。
+- `src/ui_fullscreen/pan_bounds.rs`: 既に求めた表示単位の矩形とviewportの正の交差を、丸め許容の適用条件へ追加した。
+  表示単位は実ページ候補を含むので、候補ごとの別の可視状態は持たない。非交差／辺だけの接触なら補正を全量適用する。
+  候補の選択・入力側の制限・保持素材の判定・context／viewportの経路は変更しない。
+- `src/ui_fullscreen/pan_bounds/tests.rs`: 上記2件を追加。UIの実resolverを通し、1／2物理px、DPI 1／1.25／1.5、左右・上下の端を検査する。
+  回転前が入力制限を満たすこと、回転後の実paint矩形の交差幅・高さが正であること、2frame目以降のpan不変・補正0を確認する。
+  可視性は `draw_pan_correction` や `assert_painted_pan` に頼らず、実際のpaint矩形とviewportの辺から独立に計算する。
+  正の交差が残る小さい残差は従来どおり0を返し、画面外と辺の接触には全量補正する純粋幾何の検査も行う。
+- 文書は本節と§6.2を更新する。利用者向けの説明は既存の「範囲外の表示位置を戻す」と同じため、マニュアルは変更なし。
+- 検証: `ui_fullscreen::pan_bounds` を対象にしたnextestは **22件成功・失敗0、exit 0**（コンパイル3分36秒、実行21.586秒）。
+  追加2件と、既存の端数DPIのsnap・端ドラッグ・白ページ・投影のテストを同じfilterで確認した。
+  最終core checkも **成功・exit 0、21.27秒**。check／nextestはいずれも以下の指定runnerを使用し、同時に2本は流していない。
+
+```text
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local\miv-locks\run-heavy.ps1 -Owner codex-806 -WorkDir G:\home\mimageviewer-474 -Command "<command>"
+cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen::pan_bounds/)'
+cargo check -p mimageviewer --bin mimageviewer-core
+cargo fmt
+git diff --check
+```
+
+通常feature・test/dev profile。TEMP/TMPはworktree内の `target/806-tmp`、MSBuild node reuseは無効。
+共有full lockを待った後、sandbox警告付きの低優先度・6並列で実行した。
+ログは `target/806-r4-snap-tests.{stdout,stderr}.log` と `target/806-review-r4-check.{stdout,stderr}.log`。
+最終の引数なし `cargo fmt` と `git diff --check` も成功。変更したRustの2ファイルは整形前後のSHA-256が一致し、テスト・checkの対象ソースを維持している。
+コミット・lib全件・build-dev・製品起動は行わない。
 
 ## 7. 実装前の独立レビュー
 
