@@ -130,6 +130,8 @@ pub(crate) fn draw_fullscreen_specified_scale_max_controls(
 mod name_colors;
 
 #[cfg(test)]
+mod hover_809;
+#[cfg(test)]
 mod hover_perf;
 mod pages;
 mod search_index;

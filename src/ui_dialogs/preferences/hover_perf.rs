@@ -156,7 +156,7 @@ fn draw(
     scroll
 }
 
-fn text_rect(shapes: &[ClippedShape], label: &str) -> Option<egui::Rect> {
+pub(super) fn text_rect(shapes: &[ClippedShape], label: &str) -> Option<egui::Rect> {
     fn find(shape: &Shape, clip: egui::Rect, label: &str) -> Option<egui::Rect> {
         match shape {
             Shape::Text(text) if text.galley.text() == label => {
@@ -270,7 +270,7 @@ fn sample(
     )
 }
 
-fn state(overrides: bool) -> PreferencesState {
+pub(super) fn state(overrides: bool) -> PreferencesState {
     let mut settings = Settings::default();
     if overrides {
         // Existing valid defaults, explicitly overridden, exercise parsing and override lookup
@@ -298,6 +298,19 @@ fn state(overrides: bool) -> PreferencesState {
     assert!(state.operation_keyboard_context.is_none());
     assert_eq!(state.selected, PreferencesPage::General);
     state
+}
+
+// Share only the existing test shell; the product dialog path remains untouched.
+pub(super) fn draw_809(ctx: &egui::Context, state: &mut PreferencesState, keyboard: bool) {
+    let _ = draw(
+        ctx,
+        state,
+        if keyboard {
+            Scene::Keyboard
+        } else {
+            Scene::Preferences
+        },
+    );
 }
 
 fn case(scene: Scene, overridden: bool, accessible: bool) -> Value {
