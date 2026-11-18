@@ -200,7 +200,8 @@ impl App {
                         .new_path
                         .file_name()
                         .and_then(|name| name.to_str())
-                        .map(str::to_owned);
+                        .map(str::to_owned)
+                        .map(crate::app::AfterLoadSelection::Name);
                     self.pending_reload = true;
                 }
                 self.show_feedback_toast(rename_success_message(&outcome.new_path));

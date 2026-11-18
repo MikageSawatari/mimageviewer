@@ -208,7 +208,12 @@ mod tests {
                     matches!(nav, Some(AddressBarNav::Direct(ref path, _)) if path == &origin),
                     "{mode:?}/{input}: {nav:?}"
                 );
-                assert_eq!(app.select_after_load.as_deref(), Some("child"));
+                assert_eq!(
+                    app.select_after_load
+                        .as_ref()
+                        .and_then(crate::app::AfterLoadSelection::name),
+                    Some("child")
+                );
             }
         }
     }
@@ -684,7 +689,8 @@ impl App {
                     self.close_detached_viewer_for_virtual_page_list_parent_nav();
                 }
                 if child_selection.is_some() {
-                    self.select_after_load = child_selection;
+                    self.select_after_load =
+                        child_selection.map(crate::app::AfterLoadSelection::Name);
                 }
                 Some(nav)
             }

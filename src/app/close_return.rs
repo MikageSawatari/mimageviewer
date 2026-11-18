@@ -428,7 +428,8 @@ impl App {
             State::Live => {
                 if let Some((nav, selection)) = self.resolve_close_return_navigation() {
                     if selection.is_some() {
-                        self.select_after_load = selection;
+                        self.select_after_load =
+                            selection.map(crate::app::AfterLoadSelection::Name);
                     }
                     Some(nav)
                 } else {
@@ -453,7 +454,8 @@ impl App {
                         select_after_load,
                     } => {
                         if select_after_load.is_some() {
-                            self.select_after_load = select_after_load;
+                            self.select_after_load =
+                                select_after_load.map(crate::app::AfterLoadSelection::Name);
                         }
                         Some(nav)
                     }

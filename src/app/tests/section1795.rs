@@ -669,7 +669,8 @@ fn section1795_off_startup_cursor_remains_independent() {
                 // Desktop/Specific startup uses this existing explicit hint adapter.
                 env.select_after_load =
                     crate::known_folders::startup_cursor_hint(&env.settings, &a)
-                        .map(|(name, _)| name);
+                        .map(|(name, _)| name)
+                        .map(crate::app::AfterLoadSelection::Name);
                 StartupListIntent::ExplicitList
             };
             assert!(env.load_folder_with_scan_owned(a, None, OpenRequestOwner::Navigation, intent));

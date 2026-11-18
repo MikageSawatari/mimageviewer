@@ -43639,6 +43639,9 @@ impl App {
         if self.is_snapshot_active() {
             return None;
         }
+        if self.tag_view.active {
+            return None;
+        }
         // Independent physical viewers retain their own sibling mode above. Only a
         // Smart-origin display wait shares the tree traversal's Smart request here.
         let sibling = sibling && !self.smart_folder_book_navigation_available();
@@ -43765,6 +43768,7 @@ impl App {
             crate::app::FolderNavMode::ListOrder {
                 snapshot,
                 from_index,
+                fullscreen: true,
             },
         );
     }
@@ -43919,6 +43923,15 @@ impl App {
             return;
         }
 
+        if self.tag_view.active {
+            if self.tag_view.nav_stack.is_empty() {
+                self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::SearchResultList, native_toast);
+            } else {
+                self.handle_fullscreen_list_order_nav_context(ctx, fs_idx, forward, native_toast);
+            }
+            return;
+        }
+
         if self.show_search_bar {
             self.cancel_pending_folder_nav();
             self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::LocalFilterActive, native_toast);
@@ -44035,6 +44048,19 @@ impl App {
                 FsNavNoOpReason::SearchSiblingUnsupported,
                 native_toast,
             );
+            return;
+        }
+
+        if self.tag_view.active {
+            if self.tag_view.nav_stack.is_empty() {
+                self.show_fullscreen_nav_noop(
+                    ctx,
+                    FsNavNoOpReason::SearchSiblingUnsupported,
+                    native_toast,
+                );
+            } else {
+                self.handle_fullscreen_list_order_nav_context(ctx, fs_idx, forward, native_toast);
+            }
             return;
         }
 

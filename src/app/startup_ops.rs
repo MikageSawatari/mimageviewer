@@ -2198,7 +2198,10 @@ impl App {
             let previous_selection = self.select_after_load.clone();
             let previous_scroll = self.grid_scroll.row_anchor();
             let hint = crate::known_folders::startup_cursor_hint(&self.settings, &folder);
-            self.select_after_load = hint.as_ref().map(|(name, _)| name.clone());
+            self.select_after_load = hint
+                .as_ref()
+                .map(|(name, _)| name.clone())
+                .map(crate::app::AfterLoadSelection::Name);
             self.grid_scroll
                 .set_row_anchor(hint.and_then(|(_, rows)| rows));
             let load = event_span(Lane::Navigation, Stage::InitialTargetScan, correlation)

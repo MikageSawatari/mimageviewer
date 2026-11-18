@@ -31706,7 +31706,12 @@ mod grid_reclick_open_tests {
                     matches!(&harness.state().background_navs[0], AddressBarNav::Direct(path, _) if path == harness.state().app.tmp.path())
                 );
                 assert_eq!(
-                    harness.state().app.select_after_load.as_deref(),
+                    harness
+                        .state()
+                        .app
+                        .select_after_load
+                        .as_ref()
+                        .and_then(crate::app::AfterLoadSelection::name),
                     Some("child")
                 );
                 click_at(&mut harness, egui::pos2(30.0, 170.0));

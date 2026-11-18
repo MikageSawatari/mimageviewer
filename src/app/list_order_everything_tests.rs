@@ -46,7 +46,7 @@ fn row_origin(app: &App, dataset_run: u64, row: &Path) -> SearchOpenOrigin {
 
 fn commit_row(app: &mut App, row: &Path) {
     let origin = row_origin(app, accepted_run(app), row);
-    app.commit_staged_search_navigation_effects(row, false, false, Some(origin));
+    app.commit_staged_search_navigation_effects(row, false, None, Some(origin));
 }
 
 fn settle_search(app: &mut App) {
@@ -433,7 +433,7 @@ fn list_order_everything_admission_requires_current_outer_run_and_accepted_datas
     app.cancel_everything_search();
     assert_ne!(app.global_search.run_sequence, run);
     assert!(!app.search_open_origin_is_current(&old_origin));
-    app.commit_staged_search_navigation_effects(&b, false, false, Some(old_origin));
+    app.commit_staged_search_navigation_effects(&b, false, None, Some(old_origin));
     assert_child(&app, &a);
     let current = row_origin(&app, run, &b);
     assert!(app.search_open_origin_is_current(&current));
@@ -441,26 +441,26 @@ fn list_order_everything_admission_requires_current_outer_run_and_accepted_datas
         matches!(&current, SearchOpenOrigin::Everything { run: outer, child: EverythingChildAdmission::ListOrderRow { dataset_run, .. }, .. } if outer != dataset_run)
     );
     let wrong_dataset = row_origin(&app, app.global_search.run_sequence, &b);
-    app.commit_staged_search_navigation_effects(&b, false, false, Some(wrong_dataset));
+    app.commit_staged_search_navigation_effects(&b, false, None, Some(wrong_dataset));
     assert_child(&app, &a);
-    app.commit_staged_search_navigation_effects(&a, false, false, Some(current.clone()));
+    app.commit_staged_search_navigation_effects(&a, false, None, Some(current.clone()));
     assert_child(&app, &a);
-    app.commit_staged_search_navigation_effects(&b, false, false, Some(current));
+    app.commit_staged_search_navigation_effects(&b, false, None, Some(current));
     assert_child(&app, &b);
     let outsider = root.join("outside.zip");
     let origin = row_origin(&app, run, &outsider);
-    app.commit_staged_search_navigation_effects(&outsider, false, false, Some(origin));
+    app.commit_staged_search_navigation_effects(&outsider, false, None, Some(origin));
     assert_child(&app, &b);
     let mut wrong_context = row_origin(&app, run, &a);
     if let SearchOpenOrigin::Everything { context, .. } = &mut wrong_context {
         *context = ViewerContextId::for_test(u64::MAX);
     }
     assert!(!app.search_open_origin_is_current(&wrong_context));
-    app.commit_staged_search_navigation_effects(&a, false, false, Some(wrong_context));
+    app.commit_staged_search_navigation_effects(&a, false, None, Some(wrong_context));
     assert_child(&app, &b);
     let inactive = row_origin(&app, run, &a);
     app.global_search.active = false;
-    app.commit_staged_search_navigation_effects(&a, false, false, Some(inactive));
+    app.commit_staged_search_navigation_effects(&a, false, None, Some(inactive));
     assert_child(&app, &b);
 }
 
@@ -974,6 +974,7 @@ fn list_order_everything_cancel_scan_failure_and_stale_preflight_keep_the_origin
                     mode: FolderNavMode::ListOrder {
                         snapshot: fixture.snapshot.clone(),
                         from_index: 0,
+                        fullscreen: true,
                     },
                     queued_steps: 0,
                 },

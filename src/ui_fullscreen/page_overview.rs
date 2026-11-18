@@ -565,6 +565,9 @@ impl App {
                 && self.favsearch.nav_stack.first().is_some()
                 && self.favsearch.nav_stack.last().is_some();
         }
+        if self.tag_view.active {
+            return self.list_order_position().is_some();
+        }
         if self.show_search_bar || self.items_are_subfolder_expansion_view {
             return false;
         }
@@ -1604,6 +1607,47 @@ mod thumbnail_tests {
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tag_view_page_overview_acceptance_matches_result_position_and_rejects_locked_continuation() {
+        use crate::app::top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
+        use crate::app::{ListOrderEntry, ListOrderEntryKind, ListOrderScope, ListOrderSnapshot};
+        let mut app = crate::app::setup_app_for_test();
+        let root = app.tmp.path().join("book");
+        app.tag_view.active = true;
+        app.tag_view.run = 7;
+        app.top_level_grid_view
+            .begin(TopLevelGridSurface::Search(TopLevelSearchView::Tag), None);
+        app.current_folder = Some(root.clone());
+        app.items = vec![GridItem::Image(root.join("page.png"))];
+        app.fullscreen_idx = Some(0);
+        app.list_order = Some(Arc::new(ListOrderSnapshot {
+            owner: app.virtual_list_context_id(),
+            scope: ListOrderScope::Tag { run: 7 },
+            entries: vec![ListOrderEntry {
+                path: root.clone(),
+                kind: ListOrderEntryKind::Folder,
+            }]
+            .into(),
+        }));
+        for action in [KeyAction::FsCtrlNavNext, KeyAction::FsSiblingNext] {
+            assert!(!app.page_overview_folder_navigation_available(action));
+            app.tag_view.nav_stack = vec![root.clone()];
+            assert!(app.page_overview_folder_navigation_available(action));
+            app.current_folder = Some(app.tmp.path().join("outside"));
+            assert!(!app.page_overview_folder_navigation_available(action));
+            app.current_folder = Some(root.clone());
+            app.tag_view.nav_stack.clear();
+        }
+        app.tag_view.nav_stack = vec![root];
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        for sibling in [false, true] {
+            assert!(app.locked_fullscreen_folder_nav_request(sibling).is_none());
+        }
+        for action in [KeyAction::FsCtrlNavNext, KeyAction::FsSiblingNext] {
+            assert!(!app.page_overview_folder_navigation_available(action));
+        }
+    }
 
     #[test]
     fn section1763_overview_accepts_smart_sibling_worker_and_display_wait() {

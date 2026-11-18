@@ -10764,7 +10764,12 @@ mod tests {
         };
         assert_eq!(path, folder);
         assert_eq!(owner.anchor, anchor);
-        assert_eq!(app.select_after_load.as_deref(), Some("chapter"));
+        assert_eq!(
+            app.select_after_load
+                .as_ref()
+                .and_then(crate::app::AfterLoadSelection::name),
+            Some("chapter")
+        );
 
         let sibling_book = temp.path().join("sibling").join("other.pdf");
         let sibling_parent = sibling_book.parent().unwrap().to_path_buf();
@@ -10777,7 +10782,13 @@ mod tests {
                 sibling.resolve_return_to_parent_nav(),
                 Some(crate::ui_main::AddressBarNav::Direct(path, _)) if path == sibling_parent
             ));
-            assert_eq!(sibling.select_after_load.as_deref(), Some("other.pdf"));
+            assert_eq!(
+                sibling
+                    .select_after_load
+                    .as_ref()
+                    .and_then(crate::app::AfterLoadSelection::name),
+                Some("other.pdf")
+            );
         })
         .expect("mount sibling context");
 
@@ -10790,7 +10801,12 @@ mod tests {
         assert_eq!(path, folder);
         assert_eq!(owner.stamp.collection_id, snapshot.collection_id());
         assert_eq!(owner.anchor, anchor);
-        assert_eq!(app.select_after_load.as_deref(), Some("chapter"));
+        assert_eq!(
+            app.select_after_load
+                .as_ref()
+                .and_then(crate::app::AfterLoadSelection::name),
+            Some("chapter")
+        );
         app.shutdown_collection_runtime_for_exit();
     }
 

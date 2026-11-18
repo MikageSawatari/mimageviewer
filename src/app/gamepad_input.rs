@@ -8274,7 +8274,6 @@ impl App {
         let in_favsearch = self.favsearch.active;
         let in_global_search = self.global_search.active;
         let in_global_search_drilled = in_global_search && self.global_search.drill.is_some();
-        let in_tag_view = self.tag_view.active;
 
         if self.is_snapshot_active() {
             let _ = self.snapshot_navigate_grid(forward);
@@ -8285,8 +8284,7 @@ impl App {
             self.cancel_pending_folder_nav();
         } else if in_favsearch {
             self.favsearch_ctrl_nav(forward);
-        } else if in_tag_view {
-            self.cancel_pending_folder_nav();
+        } else if self.route_tag_view_grid_book_navigation(ctx, forward) {
         } else if self.items_are_subfolder_expansion_view {
             self.cancel_pending_folder_nav();
         } else if self.zip_nav_handle_ctrl_updown(forward) {
@@ -8334,11 +8332,11 @@ impl App {
             );
             if self.is_snapshot_active() {
                 let _ = self.snapshot_navigate_grid_page(forward);
-            } else if self.global_search.active || self.favsearch.active || self.tag_view.active {
-            } else if self.show_search_bar
-                || self.items_are_subfolder_expansion_view
-                || self.items_are_smart_folder_view
-            {
+            } else if self.global_search.active || self.favsearch.active {
+            } else if self.show_search_bar {
+                self.cancel_pending_folder_nav();
+            } else if self.route_tag_view_grid_book_navigation(ctx, forward) {
+            } else if self.items_are_subfolder_expansion_view || self.items_are_smart_folder_view {
                 self.cancel_pending_folder_nav();
             } else if self.start_list_origin_grid_navigation(ctx, forward, true) {
             } else if let Some(cur) = self.effective_folder() {
@@ -9937,6 +9935,7 @@ impl App {
             self.cancel_pending_folder_nav();
         } else if in_favsearch {
             self.favsearch_ctrl_nav(forward);
+        } else if self.route_tag_view_grid_book_navigation(ctx, forward) {
         } else if self.items_are_subfolder_expansion_view {
             self.cancel_pending_folder_nav();
         } else if self.zip_nav_handle_ctrl_updown(forward) {

@@ -781,7 +781,7 @@ mod tests {
         let mut app = search_fixture(1);
         let row = app.tmp.path().join("result.zip");
         let origin = app.capture_search_open_origin();
-        app.commit_staged_search_navigation_effects(&row, false, false, origin);
+        app.commit_staged_search_navigation_effects(&row, false, None, origin);
         assert!(matches!(&app.global_search.accepted,
             crate::global_search_ui::SearchAccepted::Everything {
                 position: crate::global_search_ui::EverythingPosition::PhysicalChild { logical_source, .. }, ..

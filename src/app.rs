@@ -229,7 +229,12 @@ mod clipboard_capture_admission_tests {
         });
         assert_eq!(activations, 1);
         assert!(app.folder_pane_open_pending.is_some());
-        assert_eq!(app.select_after_load.as_deref(), Some("saved.png"));
+        assert_eq!(
+            app.select_after_load
+                .as_ref()
+                .and_then(crate::app::AfterLoadSelection::name),
+            Some("saved.png")
+        );
         assert!(app.fs_feedback_toast.is_none());
     }
 
@@ -758,10 +763,14 @@ mod location_jump;
 mod rating_membership_ops;
 #[cfg(test)]
 pub(crate) mod rating_membership_tests;
+#[cfg(test)]
+mod tag_view_list_order_tests;
 mod viewer_context_registry;
+pub(crate) use list_order_navigation::{
+    AfterLoadSelection, ListOrderScope, ListOrderSnapshot, TagViewNavAdmission,
+};
 #[cfg(test)]
 pub(crate) use list_order_navigation::{ListOrderEntry, ListOrderEntryKind};
-pub(crate) use list_order_navigation::{ListOrderScope, ListOrderSnapshot};
 #[cfg(windows)]
 pub(crate) use viewer_context_registry::ContextResidence;
 pub(crate) use viewer_context_registry::ViewerContextId;
@@ -1052,7 +1061,7 @@ pub(crate) struct PhysicalHistoryTransition {
     navigation: MainListNavigation,
     dfs_continuation: Option<PhysicalHistoryDfsContinuation>,
     favsearch_origin: bool,
-    tag_view_origin: bool,
+    tag_view_origin: Option<TagViewNavAdmission>,
     global_search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
     grid_open_effects: Option<GridVirtualOpenEffects>,
 }
@@ -1488,7 +1497,7 @@ pub(crate) struct MainListNavigation {
     pub(crate) source_proof: MainListSourceProof,
     pub(crate) history: MainHistoryOperation,
     pub(crate) destination: MainListRestoreDestination,
-    selection_after_load: Option<String>,
+    selection_after_load: Option<AfterLoadSelection>,
 }
 
 pub(crate) struct MainListAdoption {
@@ -4131,6 +4140,7 @@ pub(crate) enum FolderNavMode {
     ListOrder {
         snapshot: Arc<ListOrderSnapshot>,
         from_index: usize,
+        fullscreen: bool,
     },
     /// お気に入り検索コンテキスト。DFS 結果が root 配下なら `nav_stack` に積んで
     /// `load_folder`、root 外なら `favsearch_navigate_sibling` にフォールバックする。
@@ -16864,8 +16874,8 @@ pub struct App {
     pub(crate) compare_pin_pending: Option<ComparePinPending>,
     pub(crate) compare_preparation: ComparePreparationState,
     pub(crate) compare_prepared_next_key: u64,
-    /// フォルダ読み込み後に選択するアイテム名（BS で親に戻るとき等）
-    pub(crate) select_after_load: Option<String>,
+    /// 読み込み後の選択要求。通常は名前、複数の親を含む結果一覧へ戻るときは完全パス。
+    pub(crate) select_after_load: Option<AfterLoadSelection>,
 
     // ── 同名ファイル処理 ──────────────────────────────────────────
     pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
@@ -19881,7 +19891,8 @@ impl App {
             self.start_folder_pane_open(parent.to_path_buf());
             self.select_after_load = path
                 .file_name()
-                .map(|name| name.to_string_lossy().into_owned());
+                .map(|name| name.to_string_lossy().into_owned())
+                .map(crate::app::AfterLoadSelection::Name);
             ctx.request_repaint();
         }
     }
@@ -24570,7 +24581,7 @@ impl App {
     pub(crate) fn resolve_return_to_parent_nav(&mut self) -> Option<crate::ui_main::AddressBarNav> {
         let (nav, selection) = self.resolve_close_return_navigation()?;
         if selection.is_some() {
-            self.select_after_load = selection;
+            self.select_after_load = selection.map(crate::app::AfterLoadSelection::Name);
         }
         Some(nav)
     }
@@ -28353,7 +28364,8 @@ impl App {
         self.select_after_load = self
             .selected
             .and_then(|index| self.items.get(index))
-            .map(|item| item.name().into_owned());
+            .map(|item| item.name().into_owned())
+            .map(crate::app::AfterLoadSelection::Name);
     }
 
     /// The adopted location owns a refresh, including the parent provenance of physical children.
@@ -30417,6 +30429,7 @@ impl App {
             pre_scan,
             restore_intent,
             search_origin,
+            self.tag_view.active.then_some(TagViewNavAdmission::Descend),
         )
     }
 
@@ -30426,6 +30439,7 @@ impl App {
         pre_scan: Option<ScannedDir>,
         restore_intent: StartupListIntent,
         search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
+        tag_admission: Option<TagViewNavAdmission>,
     ) -> FolderOpenOutcome {
         use crate::folder_tree::FolderNavLandingKind;
         let path = match route {
@@ -30483,6 +30497,7 @@ impl App {
                 None,
                 MainListRequestStage::Continuation,
                 search_origin,
+                tag_admission,
             )
         }
     }
@@ -31271,6 +31286,7 @@ impl App {
             navigation,
             stage,
             search_origin,
+            self.tag_view.active.then_some(TagViewNavAdmission::Descend),
         )
     }
 
@@ -31285,6 +31301,7 @@ impl App {
         navigation: Option<MainListNavigation>,
         stage: MainListRequestStage,
         search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
+        tag_admission: Option<TagViewNavAdmission>,
     ) -> FolderOpenOutcome {
         if !self.snapshot_scope_allows_open(&path, &owner) {
             self.reject_snapshot_out_of_scope_open();
@@ -31345,6 +31362,7 @@ impl App {
             navigation,
             stage,
             search_origin,
+            tag_admission,
         )
     }
 
@@ -31948,6 +31966,7 @@ impl App {
             navigation,
             stage,
             search_origin,
+            self.tag_view.active.then_some(TagViewNavAdmission::Descend),
         )
     }
 
@@ -31963,6 +31982,7 @@ impl App {
         navigation: Option<MainListNavigation>,
         stage: MainListRequestStage,
         search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
+        tag_admission: Option<TagViewNavAdmission>,
     ) -> FolderOpenOutcome {
         let mut span = CloseNavSpan::new(CloseNavStage::LoadClaimed);
         let detached_physical = self.navigation_scope.is_detached_physical();
@@ -32109,7 +32129,7 @@ impl App {
             _ => None,
         };
         let location = self.physical_destination_for_owner(&path, &owner, rating.as_ref());
-        let search_origin = (self.favsearch.active, self.tag_view.active, search_origin);
+        let search_origin = (self.favsearch.active, tag_admission, search_origin);
         let book_prefix = grid_effects
             .as_ref()
             .is_some_and(|effects| effects.suppress_facet_filter)
@@ -34774,7 +34794,7 @@ impl App {
         }
         self.tag_view.nav_stack.push(path.to_path_buf());
         if self.tag_view.nav_stack.len() > MAX_FOLDER_NAV_STACK {
-            self.tag_view.nav_stack.remove(0);
+            self.tag_view.nav_stack.remove(1);
         }
     }
 
@@ -34792,7 +34812,7 @@ impl App {
         if let Some(popped_path) = popped.as_ref()
             && let Some(name) = popped_path.file_name().and_then(|n| n.to_str())
         {
-            self.select_after_load = Some(name.to_string());
+            self.select_after_load = Some(name.to_string().into());
         }
         if let Some(top) = self.tag_view.nav_stack.last().cloned() {
             match self.load_folder_or_convert_archive(top) {
@@ -34810,6 +34830,7 @@ impl App {
                 }
             }
         } else {
+            self.select_after_load = popped.map(AfterLoadSelection::ExactPath);
             self.execute_tag_view();
         }
     }
@@ -34858,6 +34879,11 @@ impl App {
         // 同じ検索語でのソート変更・再検索も、新しい結果一覧への明示要求。
         // 子を開く準備と同じ置換境界を通し、先に受理した要求を退役させる。
         self.retire_main_list_requests_for_surface_switch();
+        self.tag_view.run = self
+            .tag_view
+            .run
+            .checked_add(1)
+            .expect("tag result run exhausted");
         self.tag_view.last_executed = self.tag_view.query.clone();
         self.tag_view.last_executed_kind_filter = self.tag_view.kind_filter;
         self.tag_view.reject_message = None;
@@ -35205,7 +35231,7 @@ impl App {
         self.cancel_pending_folder_nav();
         if let Some(popped_path) = popped {
             if let Some(name) = popped_path.file_name().and_then(|n| n.to_str()) {
-                self.select_after_load = Some(name.to_string());
+                self.select_after_load = Some(name.to_string().into());
             }
         }
         if let Some(top) = self.favsearch.nav_stack.last().cloned() {
@@ -36698,6 +36724,10 @@ impl App {
             restore_intent.replaces_deferred_startup_open()
                 && stage == MainListRequestStage::Admission,
         );
+        let tag_view_origin = dfs_continuation.as_ref().map_or_else(
+            || self.tag_view.active.then_some(TagViewNavAdmission::Descend),
+            |continuation| self.tag_view_nav_admission(&continuation.mode, &path),
+        );
         let request = PhysicalHistoryTransition {
             request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             intent,
@@ -36708,7 +36738,7 @@ impl App {
             navigation,
             dfs_continuation,
             favsearch_origin: self.favsearch.active,
-            tag_view_origin: self.tag_view.active,
+            tag_view_origin,
             global_search_origin: search_origin,
             grid_open_effects: None,
 
@@ -36989,7 +37019,7 @@ impl App {
             navigation,
             dfs_continuation: None,
             favsearch_origin: self.favsearch.active,
-            tag_view_origin: self.tag_view.active,
+            tag_view_origin: self.tag_view.active.then_some(TagViewNavAdmission::Descend),
             global_search_origin: self.capture_search_open_origin(),
             grid_open_effects: None,
         };
@@ -38527,7 +38557,7 @@ impl App {
         &mut self,
         path: &Path,
         favsearch_origin: bool,
-        tag_view_origin: bool,
+        tag_view_origin: Option<TagViewNavAdmission>,
         global_search_origin: Option<crate::global_search_ui::SearchOpenOrigin>,
     ) {
         if favsearch_origin && self.favsearch.active {
@@ -38535,9 +38565,15 @@ impl App {
             self.favsearch.nav_stack.push(path.to_path_buf());
             self.update_favsearch_address();
         }
-        if tag_view_origin && self.tag_view.active {
+        if let Some(admission) = tag_view_origin.filter(|_| self.tag_view.active) {
             self.retire_tag_search_input_focus();
-            self.record_tag_view_nav_open(path);
+            if matches!(&admission, TagViewNavAdmission::ListOrderRow { run, row }
+                if *run == self.tag_view.run && crate::folder_tree::path_eq(path, row))
+            {
+                self.tag_view.nav_stack = vec![path.to_path_buf()];
+            } else {
+                self.record_tag_view_nav_open(path);
+            }
             self.update_tag_view_address();
         }
         if let Some(origin) =
@@ -40757,7 +40793,7 @@ impl App {
                 navigation,
                 dfs_continuation: None,
                 favsearch_origin: self.favsearch.active,
-                tag_view_origin: self.tag_view.active,
+                tag_view_origin: self.tag_view.active.then_some(TagViewNavAdmission::Descend),
                 global_search_origin: self.capture_search_open_origin(),
                 grid_open_effects: auto_fullscreen.then(|| GridVirtualOpenEffects {
                     reading_history_return_from: self.reading_history_return_from.clone(),
@@ -41541,7 +41577,7 @@ impl App {
                     navigation: request.navigation,
                     dfs_continuation: None,
                     favsearch_origin: self.favsearch.active,
-                    tag_view_origin: self.tag_view.active,
+                    tag_view_origin: self.tag_view.active.then_some(TagViewNavAdmission::Descend),
                     global_search_origin: self.capture_search_open_origin(),
                     grid_open_effects: None,
 
@@ -41729,7 +41765,7 @@ impl App {
         };
         let search_origin = (
             self.favsearch.active,
-            self.tag_view.active,
+            self.tag_view.active.then_some(TagViewNavAdmission::Descend),
             self.capture_search_open_origin(),
         );
         let enters_pdf = !matches!(
@@ -45174,7 +45210,7 @@ impl App {
             !detached_physical
                 && (self.try_select_after_load()
                     || refresh_cursor.is_some_and(|cursor| {
-                        self.select_after_load = Some(cursor.name);
+                        self.select_after_load = Some(cursor.name.into());
                         let restored = self.try_select_after_load();
                         if restored {
                             self.grid_scroll.set_row_anchor(cursor.rows_above);
@@ -59390,6 +59426,7 @@ impl App {
             if self.keymap.consume_action(ctx, action) {
                 if self.is_snapshot_active() {
                     let _ = self.snapshot_navigate_grid(forward);
+                } else if self.route_tag_view_grid_book_navigation(ctx, forward) {
                 } else if self.items_are_subfolder_expansion_view {
                     self.cancel_pending_folder_nav();
                 } else if self.start_list_origin_grid_navigation(ctx, forward, mode.sibling_only())
@@ -60188,12 +60225,6 @@ impl App {
             }
         }
 
-        // 検索コンテキスト中はファイルシステム遡りを禁止する:
-        // - BS はスタックベースで検索ルートまで戻る (favsearch_back)
-        // - Ctrl+↑↓ によるフォルダナビゲーションも無効化
-        let in_favsearch = self.favsearch.active;
-        let in_tag_view = self.tag_view.active;
-
         // BS: 親フォルダへ (検索中はスタックを戻る)
         // 既定の Ctrl+BS は上の個別補正解除で消費される。カスタムで同じキーへ
         // 割り当てた場合は競合警告の対象にし、先に消費した処理を優先する。
@@ -60221,6 +60252,27 @@ impl App {
             return self.history_key_navigation(FolderHistoryDirection::Forward);
         }
 
+        self.handle_grid_book_navigation_keys(
+            ctx,
+            ctrl_down,
+            ctrl_up,
+            ctrl_page_down,
+            ctrl_page_up,
+        );
+
+        None
+    }
+
+    /// Resolved key actions only: this dispatch never probes native key state.
+    fn handle_grid_book_navigation_keys(
+        &mut self,
+        ctx: &egui::Context,
+        ctrl_down: bool,
+        ctrl_up: bool,
+        ctrl_page_down: bool,
+        ctrl_page_up: bool,
+    ) {
+        let in_favsearch = self.favsearch.active;
         // Ctrl+↓: 深さ優先で次のフォルダへ（画像なしはスキップ）
         // バックグラウンドスレッドで navigate_folder_with_skip を実行し、
         // 結果は poll_folder_nav で非同期に受信する。
@@ -60249,8 +60301,7 @@ impl App {
                 self.cancel_pending_folder_nav();
             } else if in_favsearch {
                 self.favsearch_ctrl_nav(true);
-            } else if in_tag_view {
-                self.cancel_pending_folder_nav();
+            } else if self.route_tag_view_grid_book_navigation(ctx, true) {
             } else if self.items_are_subfolder_expansion_view {
                 self.cancel_pending_folder_nav();
             } else if self.zip_nav_handle_ctrl_updown(true) {
@@ -60276,8 +60327,7 @@ impl App {
                 self.cancel_pending_folder_nav();
             } else if in_favsearch {
                 self.favsearch_ctrl_nav(false);
-            } else if in_tag_view {
-                self.cancel_pending_folder_nav();
+            } else if self.route_tag_view_grid_book_navigation(ctx, false) {
             } else if self.items_are_subfolder_expansion_view {
                 self.cancel_pending_folder_nav();
             } else if self.zip_nav_handle_ctrl_updown(false) {
@@ -60296,10 +60346,11 @@ impl App {
             // Ctrl+PageUp/Down は image-like のみ巡回 (= page 版)、Ctrl+↑↓ は全 entry。
             if self.is_snapshot_active() {
                 let _ = self.snapshot_navigate_grid_page(true);
-            } else if in_global_search || in_favsearch || in_tag_view {
+            } else if in_global_search || in_favsearch {
                 // 検索ビューは仮想階層なので、実ファイルシステムの兄弟移動は行わない。
             } else if in_local_search {
                 self.cancel_pending_folder_nav();
+            } else if self.route_tag_view_grid_book_navigation(ctx, true) {
             } else if self.items_are_subfolder_expansion_view || self.items_are_smart_folder_view {
                 self.cancel_pending_folder_nav();
             } else if self.start_list_origin_grid_navigation(ctx, true, true) {
@@ -60311,10 +60362,11 @@ impl App {
             self.bump_input_seq("grid_sibling_nav", Some("backward"));
             if self.is_snapshot_active() {
                 let _ = self.snapshot_navigate_grid_page(false);
-            } else if in_global_search || in_favsearch || in_tag_view {
+            } else if in_global_search || in_favsearch {
                 // 同上。
             } else if in_local_search {
                 self.cancel_pending_folder_nav();
+            } else if self.route_tag_view_grid_book_navigation(ctx, false) {
             } else if self.items_are_subfolder_expansion_view || self.items_are_smart_folder_view {
                 self.cancel_pending_folder_nav();
             } else if self.start_list_origin_grid_navigation(ctx, false, true) {
@@ -60322,8 +60374,6 @@ impl App {
                 self.start_folder_nav(cur, false, FolderNavMode::SiblingGrid);
             }
         }
-
-        None
     }
 
     /// Cancel only navigation whose destination depends on the current folder-tree order.
@@ -60387,6 +60437,20 @@ impl App {
         if self.viewer_mutation_modal_active() {
             return;
         }
+        if matches!(
+            mode,
+            FolderNavMode::ListOrder {
+                fullscreen: false,
+                ..
+            }
+        ) && (self.folder_nav_pending.is_some()
+            || self.main_list_folder_navigation_adoption_pending())
+        {
+            crate::logger::log(
+                "[grid-nav] refused list-order request while folder navigation awaits adoption",
+            );
+            return;
+        }
         // List order neither joins a burst nor supersedes an in-flight traversal.
         if self.fs_list_order_navigation_blocks_new_target()
             || self.folder_nav_pending.as_ref().is_some_and(|pending| {
@@ -60438,11 +60502,16 @@ impl App {
         self.pending_folder_nav_mode = mode.clone();
         // Stamp only after admission. The handler's fresh FolderItems sequence starts as
         // Ordinary, so the initial request is admitted while every later request is rejected.
-        if matches!(mode, FolderNavMode::ListOrder { .. })
-            && let Some(sequence) = self
-                .fs_holdover_tex
-                .as_mut()
-                .and_then(FsHoldover::navigation_sequence_mut)
+        if matches!(
+            mode,
+            FolderNavMode::ListOrder {
+                fullscreen: true,
+                ..
+            }
+        ) && let Some(sequence) = self
+            .fs_holdover_tex
+            .as_mut()
+            .and_then(FsHoldover::navigation_sequence_mut)
         {
             sequence.purpose = FsNavigationPurpose::ListOrderNavigation;
         }
@@ -60517,6 +60586,7 @@ impl App {
             FolderNavMode::ListOrder {
                 snapshot,
                 from_index,
+                ..
             } => Some((Arc::clone(snapshot), *from_index)),
             _ => None,
         };
@@ -62428,7 +62498,22 @@ impl App {
         let Some(target) = result.target else {
             // DFS が尽きた (forward で末尾、backward で先頭に達した等)
             match result.mode {
-                FolderNavMode::ListOrder { .. } => {
+                FolderNavMode::ListOrder {
+                    fullscreen: false, ..
+                } => {
+                    self.show_feedback_warning(
+                        if result.forward {
+                            "一覧の末尾です"
+                        } else {
+                            "一覧の先頭です"
+                        }
+                        .into(),
+                    );
+                    self.clear_pending_folder_nav_steps();
+                }
+                FolderNavMode::ListOrder {
+                    fullscreen: true, ..
+                } => {
                     let hint = crate::ui_fullscreen::FsBoundaryHint::Edge {
                         scope: crate::ui_fullscreen::FsBoundaryEdgeScope::ListOrder,
                         at_end: result.forward,
@@ -62602,7 +62687,11 @@ impl App {
         // 中央ヒントを出す。Grid モードは従来通り移動 (段階的に進める導線)。
         if (matches!(
             result.mode,
-            FolderNavMode::Fullscreen | FolderNavMode::ListOrder { .. }
+            FolderNavMode::Fullscreen
+                | FolderNavMode::ListOrder {
+                    fullscreen: true,
+                    ..
+                }
         ) || (self.navigation_scope.is_detached_physical()
             && matches!(result.mode, FolderNavMode::SiblingFullscreen))
             || matches!(
@@ -62645,6 +62734,7 @@ impl App {
                 row: path.clone(),
             };
         }
+        let tag_admission = self.tag_view_nav_admission(&result.mode, &path);
         let smart_kind = target.smart_kind;
         let route = target.route;
         let scanned = match target.scanned {
@@ -62692,7 +62782,10 @@ impl App {
             let fullscreen = matches!(
                 result.mode,
                 FolderNavMode::Fullscreen
-                    | FolderNavMode::ListOrder { .. }
+                    | FolderNavMode::ListOrder {
+                        fullscreen: true,
+                        ..
+                    }
                     | FolderNavMode::SiblingFullscreen
                     | FolderNavMode::SlideshowNext
             );
@@ -62736,14 +62829,46 @@ impl App {
             return;
         }
         match result.mode {
-            FolderNavMode::Grid | FolderNavMode::SiblingGrid => {
+            FolderNavMode::Grid
+            | FolderNavMode::SiblingGrid
+            | FolderNavMode::ListOrder {
+                fullscreen: false, ..
+            } => {
                 if !matches!(
-                    self.load_folder_nav_target(route, scanned, restore_intent.clone(),),
+                    self.load_folder_nav_target_with_search_origin(
+                        route,
+                        scanned,
+                        restore_intent.clone(),
+                        search_origin,
+                        tag_admission
+                    ),
                     FolderOpenOutcome::Loaded
                 ) {
                     continue_burst = false;
                     self.clear_pending_folder_nav_steps();
                     self.release_fs_nav_lock();
+                } else if matches!(
+                    continuation_mode,
+                    FolderNavMode::ListOrder {
+                        fullscreen: false,
+                        ..
+                    }
+                ) && let Some(state) = self.sidecar_restore.as_mut()
+                {
+                    let completion = MainListAfterHydration::Dfs {
+                        continuation: PhysicalHistoryDfsContinuation {
+                            queued_steps: 0,
+                            mode: continuation_mode.clone(),
+                            history_trigger,
+                            restore_video_tile: false,
+                            resume_slideshow: false,
+                            fullscreen: false,
+                        },
+                        ctx: ctx.clone(),
+                    };
+                    if state.defer_main_list_action(completion).is_err() {
+                        unreachable!("new list-order install owns live hydration");
+                    }
                 }
             }
             FolderNavMode::SmartFolder { fullscreen, .. } => {
@@ -62782,7 +62907,9 @@ impl App {
                 return;
             }
             FolderNavMode::Fullscreen
-            | FolderNavMode::ListOrder { .. }
+            | FolderNavMode::ListOrder {
+                fullscreen: true, ..
+            }
             | FolderNavMode::SiblingFullscreen
             | FolderNavMode::SlideshowNext => {
                 let resume_slideshow = matches!(result.mode, FolderNavMode::SlideshowNext);
@@ -62803,6 +62930,7 @@ impl App {
                     scanned,
                     restore_intent.clone(),
                     search_origin,
+                    tag_admission,
                 );
                 if !matches!(open_outcome, FolderOpenOutcome::Loaded) {
                     let deferred_conversion =
@@ -76998,18 +77126,25 @@ impl App {
     /// selected を更新して true を返す。フィルタで隠れていれば直近の可視 idx に逃がす
     /// (`redirect_selected_to_visible` と同じ WYSIWYG 不変条件)。
     fn try_select_after_load(&mut self) -> bool {
-        let Some(name) = self.select_after_load.take() else {
+        let Some(selection) = self.select_after_load.take() else {
             return false;
         };
-        let name_lower = name.to_lowercase();
-        let Some(idx) = self
-            .items
-            .iter()
-            .position(|item| item.name().to_lowercase() == name_lower)
-        else {
+        let index = match selection {
+            AfterLoadSelection::Name(name) => {
+                let name = name.to_lowercase();
+                self.items
+                    .iter()
+                    .position(|item| item.name().to_lowercase() == name)
+            }
+            AfterLoadSelection::ExactPath(path) => self.items.iter().position(|item| {
+                item.drag_source_path()
+                    .is_some_and(|candidate| crate::folder_tree::path_eq(candidate, &path))
+            }),
+        };
+        let Some(index) = index else {
             return false;
         };
-        self.select_item_after_load(idx);
+        self.select_item_after_load(index);
         true
     }
 
@@ -83173,7 +83308,10 @@ impl App {
             if matches!(
                 pending.mode,
                 FolderNavMode::Fullscreen
-                    | FolderNavMode::ListOrder { .. }
+                    | FolderNavMode::ListOrder {
+                        fullscreen: true,
+                        ..
+                    }
                     | FolderNavMode::SiblingFullscreen
                     | FolderNavMode::Favsearch {
                         fullscreen: true,

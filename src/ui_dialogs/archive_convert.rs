@@ -1181,7 +1181,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|current| crate::folder_tree::path_eq(current, &parent))
             {
-                self.select_after_load = Some(output_name);
+                self.select_after_load = Some(output_name.into());
                 self.load_folder_with_scan_owned(
                     parent,
                     None,

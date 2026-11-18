@@ -220,6 +220,8 @@ impl TagViewKindFilter {
 #[derive(Default)]
 pub(crate) struct TagViewState {
     pub active: bool,
+    /// Result execution identity. Session-local and never reset when the view closes.
+    pub run: u64,
     pub query: String,
     pub last_executed: String,
     /// プロセス内だけで保持する session-local 選択。Settings / DB には永続化しない。

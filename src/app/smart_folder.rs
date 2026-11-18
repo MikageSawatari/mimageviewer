@@ -3958,7 +3958,7 @@ impl App {
             self.show_feedback_toast("★フィルタ一時解除中 (親へ戻ると復元)".into());
         }
         if let Some(anchor) = effects.select_after_load {
-            self.select_after_load = Some(anchor);
+            self.select_after_load = Some(anchor.into());
         }
         // Smart PDF pages and warm placeholders both become visible at this boundary.
         // Use the same one-time cleanup as ordinary PDF adoption before installing

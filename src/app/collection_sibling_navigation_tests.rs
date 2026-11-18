@@ -651,7 +651,7 @@ fn section1763_native_video_sibling_enters_collection_navigation() {
 }
 
 #[test]
-fn section1763_physical_tag_and_reading_history_keep_sibling_routes() {
+fn section1763_physical_and_history_keep_sibling_routes_tag_books_follow_results() {
     for origin in ["folder", "tag", "history"] {
         for fullscreen in [false, true] {
             let mut app = crate::app::setup_app_for_test();
@@ -661,7 +661,7 @@ fn section1763_physical_tag_and_reading_history_keep_sibling_routes() {
             for folder in [&first, &next] {
                 std::fs::create_dir_all(folder).unwrap();
             }
-            app.current_folder = Some(first);
+            app.current_folder = Some(first.clone());
             app.items = vec![GridItem::Image(app.tmp.path().join("a/page.png"))];
             app.thumbnails = vec![ThumbnailState::Pending];
             app.visible_indices = vec![0];
@@ -675,15 +675,56 @@ fn section1763_physical_tag_and_reading_history_keep_sibling_routes() {
                     )
                 }),
             );
+            let tag_next = if origin == "tag" {
+                let tag_next = app.tmp.path().join("tag-results/next-book");
+                std::fs::create_dir_all(&tag_next).unwrap();
+                image::RgbImage::new(2, 2)
+                    .save(tag_next.join("page.png"))
+                    .unwrap();
+                app.tag_view.run = 1;
+                app.tag_view.nav_stack = vec![first.clone()];
+                app.top_level_grid_view
+                    .replace_surface(TopLevelGridSurface::Search(
+                        super::super::top_level_grid_view::TopLevelSearchView::Tag,
+                    ));
+                app.list_order = Some(Arc::new(super::super::ListOrderSnapshot {
+                    owner: app.viewer_context_main(),
+                    scope: super::super::ListOrderScope::Tag { run: 1 },
+                    entries: [first, tag_next.clone()]
+                        .into_iter()
+                        .map(|path| super::super::ListOrderEntry {
+                            path,
+                            kind: super::super::ListOrderEntryKind::Folder,
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                }));
+                Some(tag_next)
+            } else {
+                None
+            };
             let ctx = egui::Context::default();
             if fullscreen {
                 app.fullscreen_idx = Some(0);
                 app.handle_fullscreen_sibling_nav_context(&ctx, 0, true, false);
+            } else if origin == "tag" {
+                // Resolved GridSiblingFolderNext, without probing physical key state.
+                app.handle_grid_book_navigation_keys(&ctx, false, false, true, false);
             } else {
                 grid_key(&mut app, egui::Key::PageDown);
             }
-            if origin == "tag" && !fullscreen {
-                assert!(app.folder_nav_pending.is_none());
+            if let Some(tag_next) = tag_next {
+                let pending = app.folder_nav_pending.take().expect("tag result order");
+                assert!(matches!(pending.mode,
+                    super::super::FolderNavMode::ListOrder { fullscreen: actual, .. }
+                    if actual == fullscreen));
+                let result = pending.rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let destination = result.target.as_ref().unwrap().logical_source();
+                assert_eq!(destination, tag_next);
+                assert_ne!(
+                    destination, next,
+                    "must not navigate to the physical sibling"
+                );
             } else {
                 let pending = app
                     .folder_nav_pending

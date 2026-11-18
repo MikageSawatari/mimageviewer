@@ -189,6 +189,7 @@ fn list_order_gate_rejects_both_directions_and_ctrl_through_sequence_and_display
             FolderNavMode::ListOrder {
                 snapshot: order.clone(),
                 from_index: 0,
+                fullscreen: true,
             },
         ] {
             let (cancel, _sender) = fake_pending(&mut app, mode.clone());
@@ -217,6 +218,7 @@ fn list_order_gate_rejects_both_directions_and_ctrl_through_sequence_and_display
                 FolderNavMode::ListOrder {
                     snapshot: order.clone(),
                     from_index: 0,
+                    fullscreen: true,
                 }
             };
             app.start_folder_nav(a.clone(), true, incoming);
@@ -506,6 +508,7 @@ fn list_order_boundary_keeps_viewer_and_snapshot_and_releases_gate() {
                 mode: FolderNavMode::ListOrder {
                     snapshot: order.clone(),
                     from_index: 0,
+                    fullscreen: true,
                 },
                 queued_steps: 0,
             },

@@ -816,6 +816,13 @@ fn reuse_proof_apply(
 }
 
 impl SidecarRestoreState {
+    pub(super) fn folder_navigation_adoption_pending(&self, owner: ViewerContextId) -> bool {
+        self.common.target_context == owner
+            && matches!(&self.common.continuation, ContinuationOwner::Live(continuation)
+                if matches!(continuation.navigation_after_hydration,
+                    Some(super::MainListAfterHydration::Dfs { .. })))
+    }
+
     #[cfg(test)]
     pub(super) fn cancel_for_test(&self) -> Arc<AtomicBool> {
         Arc::clone(self.common.continuation.cancel())

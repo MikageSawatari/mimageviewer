@@ -2030,7 +2030,7 @@ impl crate::app::App {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
         {
-            self.select_after_load = Some(name.to_string());
+            self.select_after_load = Some(name.to_string().into());
         }
         self.stack_mode_requested = !self.stack_mode_requested;
         self.stack_selection_target = if self.stack_mode_requested {

@@ -38,16 +38,20 @@ v4.9.0 の候補。コードの事実は 2026-10-26 時点の master を読ん�
 
 2026-11-11 §1.682: Everything 結果も対象に拡張する。詳細な採用契約は [検索結果ナビゲーション設計](search-result-navigation-682-688-plan.md) §2.2 を正本とする。
 
+2026-11-18 §1.802: タグビューの結果も `Tag { run }` scope として対象に拡張する。以下の追記は初版の範囲を拡張するもので、
+詳細な受付・着地・帰路の契約は [タグビューの結果順ナビゲーション設計](tag-view-result-order-navigation-802-plan.md) §3〜§5 を正本とする。
+
 ### 3.1 型と持ち主
 
 ```rust
 struct ListOrderSnapshot {
     owner: ViewerContextId,               // 取得した時点の main context
-    scope: ListOrderScope,               // Folder / Everything { run: accepted run }
+    scope: ListOrderScope,               // Folder / Everything { run: accepted run } / Tag { run }
     entries: Arc<[ListOrderEntry]>,       // 一覧の表示順。凍結。path は重複しない
 }
 struct ListOrderEntry { path: PathBuf, kind: ListOrderEntryKind } // Folder / Zip / Pdf / ConvertibleArchive
-enum ListOrderScope { Folder, Everything { run: u64 } } // accepted SubmittedEverything.run
+enum ListOrderScope { Folder, Everything { run: u64 }, Tag { run: u64 } }
+// Everything は accepted SubmittedEverything.run、Tag は結果一覧を出す実行ごとの TagViewState.run
 ```
 
 - `Option<ListOrderSnapshot>` を **`ViewerContextBundle` の 1 field** にする。context が持つ状態なので、park / mount の
@@ -64,7 +68,7 @@ enum ListOrderScope { Folder, Everything { run: u64 } } // accepted SubmittedEve
 
 ### 3.3 取得する時点 (置き換えるだけ)
 
-- **main の通常フォルダ一覧、または採用済み Everything 結果一覧から、本の行を開く操作を受け付けた時点**で、その context の列を新しい列に置き換える。
+- **main の通常フォルダ一覧、採用済み Everything 結果一覧、またはタグビューの結果一覧から、本の行を開く操作を受け付けた時点**で、その context の列を新しい列に置き換える。
   capture は要求の採用・取消・失敗を待たない。列は scope ごとに増やさず 1 つを置き換える。
 - 取得は 1 つの helper `capture_main_folder_list_order(idx)` に集め、本の行を開く要求を作る 3 か所から、**load を始める前に**呼ぶ:
   - 通常フォルダ・ZIP / PDF (`grid_physical_navigation` `src/app/collection_grid.rs` 約 1355 を呼ぶ入口)
@@ -74,9 +78,10 @@ enum ListOrderScope { Folder, Everything { run: u64 } } // accepted SubmittedEve
   実装時に入口を列挙して確かめる。
 - helper は次の条件をすべて満たすときだけ取る。満たさなければ何もしない (既存の列も消さない):
   main context である / ★固定が無効 (`is_snapshot_active()` が偽) / 通常フォルダ (`Folder` scope)、または
-  採用済み Everything が `Root` で `items_are_global_search_view` を満たす検索結果そのもの (`Everything { run }` scope) /
+  採用済み Everything が `Root` で `items_are_global_search_view` を満たす検索結果そのもの (`Everything { run }` scope)、または
+  タグビューが有効で `items_are_tag_view` かつ `tag_view.nav_stack` が空の結果一覧そのもの (`Tag { run }` scope) /
   要求の source が `Collection` / `Rating` owner でない / スマートフォルダの入口 (`begin_smart_grid_container_navigation`) に入らない。
-  Everything の `PhysicalChild` の物理一覧や dataset 外の物理一覧からは取らない。Metadata・favsearch・タグ検索、
+  Everything の `PhysicalChild` の物理一覧や dataset 外の物理一覧、タグ結果から入ったフォルダ内からは取らない。Metadata・favsearch、
   評価一覧・スマートフォルダ・閲覧履歴・コレクション・ブックマーク・サブフォルダ展開・ドライブ一覧からも取らない。
 - 下位の汎用 load 関数では取らない (DFS・起動時 open・アドレスバー入力が混ざるため)。
 - 開く操作が取消・失敗しても、列は「いま見ている一覧」の写しなので害は無い。元の列へ戻す処理は作らない。次に本を開けば、また置き換わる。
@@ -91,7 +96,8 @@ enum ListOrderScope { Folder, Everything { run: u64 } } // accepted SubmittedEve
 3. 表示先が `ViewerPresentation::MainWindow` か `Fullscreen` (通常の専用フルスクリーン。App の初期値) で、
    `DetachedWindow` でも独立 owner でもない
 4. ★固定が無効で `snapshot.scope == current_list_order_scope()`。`Folder` は通常フォルダ、
-   `Everything { run }` は採用済み `SubmittedEverything.run` と一致する検索 session だけで使える
+   `Everything { run }` は採用済み `SubmittedEverything.run` と一致する検索 session、`Tag { run }` は有効なタグビューの
+   `TagViewState.run` と一致する実行だけで使える
 5. scope に応じて現在位置を求められる。`Folder` は表示中の本 (`effective_folder()`) のパスから従来の 2 段で求める:
    1. `entries` のどれかの `path` と完全に一致すれば、その位置 (比較は `folder_tree::path_eq`)。
    2. 一致しなければ、**`Folder` の行だけ**を対象に、表示中のパスをその行の配下に含む行の位置 (パス成分の境界を守る既存の
@@ -106,6 +112,12 @@ enum ListOrderScope { Folder, Everything { run: u64 } } // accepted SubmittedEve
 Everything では `PhysicalChild.logical_source` と完全一致する行だけを使い、祖先の行から推定しない。
 その前に `effective_folder()` がその行と同じ physical key、または Folder 行の配下 (成分境界) であることを確かめる。
 照合は dataset membership と同じ `physical_path_spelling` の key (I/O なし)。Root・一致なし・範囲外なら位置は無い。
+
+Tag では `tag_view.nav_stack.first()` (結果から開いた根の行) と `path_eq` で一致する行だけを使う。
+`effective_folder()` がその行と同じか、Folder 行の配下 (成分境界) であることも確認する。結果一覧そのものと
+結果の画像を直接全画面で見ているときは根の行が無く、位置は無い。親子の Folder 行が両方結果にあっても、祖先から推定しない。
+降下の上限を超えたときも根の行を残し、2 番目を間引く。結果一覧への BS 復帰は再検索なので run が進み、旧列は使えない。
+次に結果から本を開くと新しい列へ置き換わる。種類・ファセット・タグ付与時刻順を含む並べ替えは取得時の表示順に従う。
 
 満たさないときは「一覧から開いた本で使えます」と短く知らせて何もしない。DFS へ黙って切り替えない。
 
@@ -122,6 +134,11 @@ Everything では `PhysicalChild.logical_source` と完全一致する行だけ�
   親 Folder 行の配下で既に読んでいる本が次の結果行にもある場合、行の基準だけが進んで物理の本が変わらないことがある。
   ListOrder の宛先と現在の本の physical key が両方存在して一致するときは「一覧の移動先は現在表示中の本です」と Info で伝え、
   通常の行採用を継続する。端の Edge 表示設定は変更しない。
+
+- Tag の一覧順移動では、成功採用時だけ `tag_view.nav_stack` を `[移動先の行]` に置き換え、アドレス欄も更新する。
+  取消・失敗では変えない。Folder 行から中の書庫へ進む場合は、その後の通常降下を積む。
+  結果一覧へ BS で戻ると、名前が同じ行があっても抜けてきた行を完全なパスで選ぶ。
+  行へ直接着地した場合は一覧で BS 1 回、中の書庫へ着いた場合は Folder 行を経由して結果一覧へ戻る。
 
 ## 4. 移動
 
@@ -209,10 +226,15 @@ Everything では `PhysicalChild.logical_source` と完全一致する行だけ�
 
 ## 6. 範囲外 (v1) と理由
 
-- **一覧側 (Grid) の同等操作**: 一覧に居るときは見えている順に選んで開けばよい。
+- **一覧側 (Grid) の新しい同等 Action**: 一覧に居るときは見えている順に選んで開けばよい。
+  §1.802 では例外として、タグ結果から開いた本の中の一覧で、既存の Ctrl+↑↓・Ctrl+PageUp/Down を
+  `ListOrder` の一覧着地 (`fullscreen: false`) へ向ける。両方とも同じ結果順で、結果一覧そのものでは何もしない。
+  `FsListOrderPrev/Next` は全画面専用のまま (`fullscreen: true`) で、既定キー・受付・全画面を保つ動きは変えない。
 - **detached・複数ウィンドウ・F12 linked の別窓での使用**: §3.4 で通知だけにする。列を別 context に渡す設計は、
   F12 往復・promote・park の組み合わせが増えるので v1 では作らない。
-- **評価一覧・スマートフォルダ・コレクション・Metadata / favsearch / タグ検索・閲覧履歴・サブフォルダ展開からの取得**: それぞれ既存の表示順ナビゲーションや検索の範囲がある。Everything 結果は §1.682 で対象に加えた。
+- **評価一覧・スマートフォルダ・コレクション・Metadata / favsearch・閲覧履歴・サブフォルダ展開からの取得**: それぞれ既存の表示順ナビゲーションや検索の範囲がある。Everything 結果は §1.682、タグ結果は §1.802 で対象に加えた。
+  タグビューの本では全画面の Ctrl+↑↓・Ctrl+PageUp/Down も同じ結果順へ向ける。結果の画像を直接全画面で見る場合や
+  位置が求まらない場合は案内だけにし、物理の DFS / 兄弟順には切り替えない。スライドショーと別窓の移動は拡張しない。
 - **新しいゲームパッド・リング操作**: キーボード操作の要望のため。
 
 ## 7. 検討した単純化 (CLAUDE.md「設計の簡素化」)

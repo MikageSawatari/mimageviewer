@@ -231,7 +231,7 @@
   DirectNavigation の走査待ちは、受理で退役する。
 - ページ一覧の受付: タグビューで位置があれば受け付け、無ければ受け付けない (ページ一覧は閉じない)。
 - nav_stack の上限: 101 段降りても先頭 (根の行) が残り、位置が求まる。
-- 既存の §1.444・§1.682 (Folder / Everything の一覧の順) と §1.763 のテストが変わらない。
+- 既存の §1.444・§1.682 (Folder / Everything の一覧の順) と §1.763 のテストは、タグビューの期待を除いて変わらない。
 - テストで実機のキー状態を読む形を新しく書かない (§1.814 (a))。
 
 ### 8.2 文書
@@ -264,3 +264,172 @@
 ### 第 2 版 (ACCEPT、同じレビュー担当、2026-11-18)
 
 - 追加の指摘なし。採用待ちの判定は、`PhysicalHistoryTransition.dfs_continuation` と `MainListAfterHydration::Dfs` に残る移動モードを使う (§4.1 に追記)。
+
+## 10. 実装記録 (2026-11-18、fix-tagnav-stack-802-804、未コミット)
+
+### 前提の照合と実装上の具体化
+
+- 設計の主要な前提に矛盾は無かった。`PhysicalHistoryTransition.dfs_continuation` は
+  ZIP / PDF / 変換書庫の準備から採用まで残り、採用後は `MainListAfterHydration::Dfs` へ渡る。
+  分類待ちの `ClassifiedOpenContinuation::Physical` にも同じ継続が残るため、採用待ち述語はここも見る。
+- 普通フォルダの一覧順着地は Grid の install / hydration を使う。hydration が残るときだけ
+  既存の `Dfs` 継続 (一覧用・累積0) を載せ、同じ述語で次の要求を拒否する。新しい pending / bool は増やしていない。
+  `DirectNavigation` の走査待ちはこの述語の対象外で、既存の `start_folder_nav` の受理点で退役する。
+- 完全パスで選ぶ既存処理は場所ジャンプの完了処理にあったが、タグの再検索完了まで要求を運ぶ経路は無かった。
+  `child_selection` も名前指定だった。§4.3 の「無ければ」に従い、既存の単一 `select_after_load` と
+  `MainListNavigation.selection_after_load` を `AfterLoadSelection::{Name, ExactPath}` に拡張した。
+  名前指定の producer / 退避 / 移送 / consumer と既存テストは型追従だけで、名前による選択の挙動を保つ。
+- 5 つの一覧入口を確認し、いずれもタグ判定を物理移動より前に同じ helper へ接続した。
+  通常キーの解決済み4操作だけを `handle_grid_book_navigation_keys` へ抽出し、実機キー状態を読まずに handler を検査する。
+  他入口の★固定・検索などをまとめる router への再編はしていない。
+- `take_origin_for_search_entry` が他の検索と★固定を退役させ、`close_searches_for_snapshot` はタグビューを終了する。
+  ★固定・Ctrl+G・お気に入り検索とタグビューが同時に有効にならない前提を確認した。
+- `FolderNavMode` の全参照をたどり、一覧用だけ `ExplicitList` / Grid 着地とし、従来の全画面操作は
+  `fullscreen: true` を明示した。same-kind は ListOrder を引き続き偽、history trigger / perf tag は従来のまま、
+  全画面の inflight 継続には ListOrder を加えていない。端では一覧用の通知と全画面の既存 Edge を使う。
+- 別窓の述語・viewport 経路、スライドショー、KeyAction の割り当てには変更が無い。
+
+### 文書と検証の範囲
+
+- §8.2 の文書に加え、リンク先のマニュアル `fullscreen.html` と architecture overview の一覧順の節を整合した。
+  `next-release-backlog.md` は変更していない。
+- 追加の利用者指示に従い、重い処理は `run-heavy.ps1 -Owner codex-802` 経由の bin check と
+  filter 付き nextest に限定する。lib 全件 / full gate / dev・release ビルドは検収側へ引き継ぐ。
+  アプリの起動・実機入力・コミットは行わない。
+
+### 変更ファイル
+
+| ファイル | 要点 |
+| --- | --- |
+| `src/tag_view.rs`、`src/app/list_order_navigation.rs` | run / Tag scope、根の行の位置、typed な採用・選択要求、一覧用の共通入口・採用待ち述語 |
+| `src/app.rs` | run の更新、根の保持、完全パスの帰路、採用時の根の置換、Grid ListOrder の着地・端・hydration、通常キー・停止中キーの接続 |
+| `src/app/gamepad_input.rs` | リング・ジェスチャの木／兄弟、ゲームパッド肩ボタンの接続 |
+| `src/ui_fullscreen.rs`、`src/ui_fullscreen/page_overview.rs` | タグの全画面入口、locked 継続、ページ一覧の受付と回帰 |
+| `src/app/sidecar_restore.rs`、`src/app/startup_list_restore.rs` | 既存 Dfs 継続による hydration の識別、一覧用 ListOrder の ExplicitList |
+| `src/app/close_return.rs`、`src/app/grid_parent.rs`、`src/app/smart_folder.rs`、`src/app/startup_ops.rs`、`src/filename_stack_ui.rs`、`src/ui_dialogs/archive_convert.rs`、`src/ui_dialogs/rename_item.rs`、`src/ui_dialogs/video_upscale.rs` | 既存の名前選択 producer の型追従。既存の名前選択を維持 |
+| `src/app/tag_view_list_order_tests.rs` | 新規17件の handler / 状態遷移回帰 |
+| `src/app/collection_sibling_navigation_tests.rs` | 利用者承認による既存 §1.763 のタグケース更新・改名。通常フォルダ・閲覧履歴の検査は維持 |
+| `src/app/close_return_tests.rs`、`src/app/collection_grid.rs`、`src/app/list_order_everything_tests.rs`、`src/app/list_order_worker_tests.rs`、`src/app/location_jump.rs`、`src/app/tests.rs`、`src/app/tests/section1795.rs`、`src/app/tests/startup_restore.rs`、`src/ui_main.rs` | 既存テストの型追従。タグ結果への BS の期待値だけ名前から完全パスへ変更 |
+| `docs/list-order-book-navigation-plan.md`、`docs/keymap-spec.md`、`docs/architecture-overview.md`、本書 | Tag scope と操作・実装記録 |
+| `htdocs/mimageviewer/manual/tags.html`、`shortcuts.html`、`fullscreen.html` | 結果順の本移動、結果一覧での no-op、戻り方と選択 |
+
+### 5 つの一覧入口
+
+| 入口 | 実装と直接回帰 |
+| --- | --- |
+| 通常キー | 既存 KeyAction の解決後、`handle_grid_book_navigation_keys` → 共通タグ helper。4操作・両方向を検査 |
+| 項目入力停止中のキー | `handle_stack_refresh_keyboard` の4操作のループ → 共通タグ helper。合成 egui / native frame で検査 |
+| リング・ジェスチャの木 | `handle_grid_tree_folder_nav` → 共通タグ helper。両入口・両方向を検査 |
+| リング・ジェスチャの兄弟 | `apply_sibling_folder_nav` の一覧側 → 共通タグ helper。両入口・両方向を検査 |
+| ゲームパッド肩ボタン | `handle_gamepad_grid_folder_nav` → 共通タグ helper。両方向を検査 |
+
+いずれもタグの本では `ListOrder { fullscreen: false }`、結果一覧では取消のみ、位置不明では通知のみ。
+ZIP 内 DFS・物理 DFS・兄弟移動へは落ちない。ほかの文脈の既存の分岐順は維持する。
+
+### 新規テスト名
+
+`src/app/tag_view_list_order_tests.rs` (17件):
+
+- `tag_list_order_capture_only_result_books_and_preserve_nested_snapshot`
+- `tag_list_order_grid_and_fullscreen_handlers_follow_results_in_both_directions`
+- `tag_list_order_root_absent_keeps_result_grid_and_shows_existing_fullscreen_guidance`
+- `tag_list_order_invalid_root_path_and_run_never_fall_back_to_physical_navigation`
+- `tag_list_order_boundary_does_not_wrap_or_replace_the_root`
+- `tag_list_order_adoption_replaces_only_matching_run_and_row`
+- `tag_list_order_back_requeries_and_selects_exact_same_named_row`
+- `tag_list_order_deep_descents_keep_original_root_even_when_nested_rows_are_results`
+- `tag_list_order_grid_pending_rejects_without_cancel_restart_or_accumulation`
+- `tag_list_order_grid_zip_adoption_gate_keeps_owner_and_commits_new_root`
+- `tag_list_order_grid_folder_hydration_gate_keeps_owner_until_completion`
+- `tag_list_order_cancel_and_scan_failure_preserve_the_opened_root`
+- `tag_list_order_grid_request_supersedes_direct_navigation_scan`
+- `tag_list_order_folder_then_archive_returns_through_folder_before_results`
+- `tag_list_order_normal_keyboard_tree_and_sibling_use_result_order`
+- `tag_list_order_ring_gesture_tree_sibling_and_gamepad_all_use_result_order`
+- `tag_list_order_blocked_item_keyboard_tree_and_sibling_use_result_order`
+
+`src/ui_fullscreen/page_overview.rs` (1件):
+
+- `tag_view_page_overview_acceptance_matches_result_position_and_rejects_locked_continuation`
+
+### 独立レビューと反復検証の記録
+
+- 独立ソースレビュー (`gpt-6.1-sol` / `xhigh`) は **ACCEPT**。
+  最初に指摘された一覧端通知の誤文字化は修正し、普通フォルダ hydration の直接回帰も追加した。
+  別窓の述語 / viewport の差分が無いこと、既存の Folder / Everything の全画面 ListOrder の維持も確認された。
+  reviewer は Cargo を実行していない。
+- 新規テストの初回コンパイルは **exit 101**。テストコードの `RawInput.modifiers` (現 API に無い) と
+  ページ一覧テストの非公開メソッド参照の2件で、`ModifiersChanged` イベントと既存の
+  `virtual_list_context_id()` を使う形に訂正した。ログ: `target/802-narrow.log`。
+- 訂正後の新規18件は **17成功 / 1失敗、exit 100** (test compile 9m18s、実行6.722s)。
+  ログ: `target/802-narrow-fixed.log`。失敗は停止中キー入口のテストが App pass の keyboard owner proof を
+  供給しておらず、Keymap が fail-closed で拒否したもの。製品コードは変更せず、合成
+  `KeyboardOwnershipSnapshot` → `decide_keyboard_owner` → `cache_keyboard_owner` をテストへ追加した。
+  reviewer はこの修正も ACCEPT とし、実機キー状態の読取りを追加していないことを確認した。
+- 重いコマンドのロック領域へ書けない場合は run-heavy の既定の BelowNormal / 6並列で絞ったものだけ実行した。
+  別担当の full-test ロックがある場合は、迂回せず run-heavy の待機に従った。
+
+### 関連検証と設計の検証条件の不整合 (2026-11-19、当初は判断待ちで停止)
+
+| 確認 | 結果 |
+| --- | --- |
+| 最終差分の `cargo check -p mimageviewer --bin mimageviewer-core` | **exit 0**、35.88s。`target/802-check-final.log` |
+| 関連 nextest | **922件実行、921成功 (うち1 leaky) / 1失敗、exit 100**。compile 2m50s、実行100.345s。`target/802-related.log` |
+| 新規18件 | 上の関連実行にすべて含まれ、**18件成功**。合成 keyboard owner proof の訂正後は停止中キー入口も成功 |
+| `cargo fmt` (引数なし)、最終 `cargo fmt --check` | 成功 |
+| `python scripts/check_ui_glyphs.py` / `git diff --check` | 危険文字0 / 成功 |
+| lib 全件 / full gate / dev・release ビルド / 実アプリ操作 / commit | 利用者指示により実行していない |
+
+関連実行は、指定の filter に名前選択の型追従の影響先を追加したもの。重いコマンドはいずれも
+指定の `run-heavy.ps1 -Owner codex-802 -WorkDir G:\home\mimageviewer-listnav -Command '<cargo command>'` 経由。
+
+```text
+cargo nextest run -p mimageviewer --lib -E "test(/tag_view|list_order|section1763|section257|favsearch|grid_parent|folder_nav|page_overview|gamepad|close_return|select_after_load|section1795|section1672|startup_restore|direct_navigation_worker/)"
+```
+
+失敗は既存 `section1763_physical_tag_and_reading_history_keep_sibling_routes`
+(`src/app/collection_sibling_navigation_tests.rs`) のタグ全画面ケースだけ。
+このケースは `tag_view.active = true`・空の nav_stack で **物理 `SiblingFullscreen` の開始**を要求する。
+一方、本書冒頭・§2・§4.2 はその物理への脱出を廃止し、この状態では案内のみとする。
+したがって、§8.1 の「既存の §1.763 のテストが変わらない」と、新しい動作の期待値が両立しない。
+同じテスト内の通常フォルダ・履歴の経路は今回変えていない。
+
+独立 reviewer はこの不整合を確認し、**製品コードの ACCEPT は維持、設計の検証条件は REVISE** とした。
+利用者の「設計と矛盾していれば、黙って変えずに止めて報告する」に従い、旧テストの期待値は変更していない。
+製品側へ物理移動を復活させる guard は追加しない。
+
+停止時に提示した最小案は「§1.763 の通常フォルダ・履歴の回帰は維持し、タグの旧期待値だけを §1.802 の
+結果順／根なし時の案内へ更新する」と §8.1 を明確化すること。今回の実行結果を隠す期待値緩和ではなく、
+明示的に廃止する旧仕様と新仕様の検証範囲を一致させるための変更であり、判断前には実施せず利用者へ確認した。
+
+### §8.1 の訂正と既存タグ回帰の更新 (2026-11-19、利用者承認)
+
+利用者より、§8.1 の「§1.763 のテストが変わらない」は検収側の書き誤りであり、
+通常フォルダ・閲覧履歴の期待は維持し、タグ部分だけを新仕様へ更新して続行するよう明示指示を受けた。
+§8.1 を「タグビューの期待を除いて」に訂正した。上の停止と失敗結果は、その判断前の記録として残す。
+
+- `section1763_physical_tag_and_reading_history_keep_sibling_routes` を
+  `section1763_physical_and_history_keep_sibling_routes_tag_books_follow_results` へ改名した。
+- 通常フォルダ・閲覧履歴は、従来の一覧 / 全画面の入力入口、物理 Sibling モードと移動先の期待をそのまま維持した。
+- タグ部分だけは正規の `Search(Tag)` surface・run・根の行・Tag scope の列を持つ本の状態にし、
+  物理兄弟とは異なる親にある結果行を次の行として配置した。一覧 / 全画面の兄弟操作がともに
+  `ListOrder` を作り、物理兄弟へ移らずその結果行へ進むことを検査する。
+  一覧側は解決済み操作の handler を使い、実機キー状態の読取りを追加していない。
+- 結果一覧上 / 根なし時の no-op・案内は、新規の §1.802 専用回帰で引き続き検査する。
+- 製品コードの変更は無い。今回追加で変更したファイルは、この設計書と
+  `src/app/collection_sibling_navigation_tests.rs` の2ファイルだけ。
+
+### 訂正後の最終確認 (2026-11-19、完了・未コミット)
+
+| 確認 | 結果・証跡 |
+| --- | --- |
+| 上記と同じ関連 nextest filter | **exit 0、922件実行 / 922成功 (2 leaky) / 失敗0、18,008 skip**。compile 4m50s、実行105.857s。`target/802-related-approved.log`、JUnit控え `target/802-related-approved-junit.xml` |
+| 新規18件と更新した §1.763 の1件 | すべて上の922件に含み成功。§1.763 の1件は通常フォルダ・閲覧履歴・タグ × 一覧 / 全画面の6ケースを検査 |
+| `cargo fmt` (引数なし) / `cargo fmt --check` / `git diff --check` | すべて成功 |
+| bin check | 前回最終の **exit 0** (`target/802-check-final.log`) を再利用。製品コードはその後変更しておらず、今回の Rust 差分は `cfg(test)` 内の既存テストだけ |
+| UI glyph | 前回最終の危険文字0を再利用。UI文字列に追加変更なし |
+| 今回の2ファイルの独立レビュー (`gpt-6.1-sol` / `xhigh`) | **ACCEPT**。非Tagの検査維持、Tagの結果行 / ListOrder と物理兄弟への非脱出、実機キー読取りなし、設計訂正と承認記録の整合を確認。reviewer は Cargo を実行せず親の実行結果を使用 |
+
+nextest の leaky 2件の注記は上表のとおり残し、失敗0と区別する。
+重い処理は引き続き指定の run-heavy 経由の絞った nextest のみ追加し、全件 / full gate / dev・release ビルドは行っていない。
+別ブランチ・別作業ツリー・`next-release-backlog.md` に変更は無く、アプリ起動・コミットも行っていない。
