@@ -4225,6 +4225,123 @@ fn keyboard_chord_tooltip(
     lines.join("\n")
 }
 
+/// Standalone phase timings deliberately kept out of production draw paths.
+/// These call the same functions once per frame, but are not additive timings
+/// of the complete dialog (they use a separate, warmed egui context/layout).
+#[cfg(test)]
+pub(super) mod hover_measurement {
+    use super::*;
+    use serde_json::json;
+    use std::time::Instant;
+
+    pub(in super::super) fn breakdown(
+        state: &mut PreferencesState,
+        warmup: usize,
+        measured: usize,
+    ) -> serde_json::Value {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let mut timings: Vec<[f64; 4]> = Vec::new();
+        for frame in 0..warmup + measured {
+            let mut times = [0.0; 4];
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 640.0),
+                    )),
+                    time: Some(frame as f64 / 60.0),
+                    ..Default::default()
+                },
+                |root_ui| {
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            let start = Instant::now();
+                            let keymap = Keymap::from_settings(&state.settings.keymap);
+                            times[0] = start.elapsed().as_secs_f64() * 1000.0;
+                            let start = Instant::now();
+                            let conflicts = keymap.binding_conflicts();
+                            times[1] = start.elapsed().as_secs_f64() * 1000.0;
+                            let start = Instant::now();
+                            keyboard_chord_picker(ui, state, &keymap);
+                            times[2] = start.elapsed().as_secs_f64() * 1000.0;
+                            let start = Instant::now();
+                            command_list(ui, state, &keymap, &conflicts);
+                            times[3] = start.elapsed().as_secs_f64() * 1000.0;
+                        });
+                    });
+                },
+            );
+            if frame >= warmup {
+                assert_eq!(output.platform_output.num_completed_passes, 1);
+                timings.push(times);
+            }
+            output.drop_without_applying_deltas();
+        }
+        let mut phases = serde_json::Map::new();
+        for (index, name) in [
+            "from_settings_including_conflicts",
+            "binding_conflicts_again",
+            "keyboard_chord_picker",
+            "command_list",
+        ]
+        .iter()
+        .enumerate()
+        {
+            phases.insert(
+                (*name).into(),
+                super::super::hover_perf::summary(timings.iter().map(|t| t[index])),
+            );
+        }
+        let key_count = keyboard_picker_main_rows()
+            .into_iter()
+            .chain(keyboard_picker_navigation_rows())
+            .chain(keyboard_picker_numpad_rows())
+            .flat_map(|row| row.iter())
+            .filter(|cell| matches!(cell, KeyboardPickerCell::Key(..)))
+            .count();
+        let filtered_actions = KeyAction::all()
+            .iter()
+            .filter(|a| {
+                a.is_user_facing()
+                    && operation_keyboard_context_filter_matches(
+                        state.operation_keyboard_context,
+                        a.context(),
+                    )
+            })
+            .count();
+        let catalog_actions = crate::keymap::command_catalog().count();
+        assert!(state.command_filter.is_empty() && state.command_key_filter.is_empty());
+        let keyboard_calls = key_count * filtered_actions;
+        let total = 2 * catalog_actions + keyboard_calls + filtered_actions;
+        // Count nonempty results outside the timed loops; this still is not an allocator trace.
+        let keymap = Keymap::from_settings(&state.settings.keymap);
+        let nonempty_tooltip_actions = KeyAction::all()
+            .iter()
+            .filter(|a| {
+                a.is_user_facing()
+                    && operation_keyboard_context_filter_matches(
+                        state.operation_keyboard_context,
+                        a.context(),
+                    )
+                    && !keymap.effective_chords(**a).is_empty()
+            })
+            .count();
+        json!({"case": if state.settings.keymap.overrides.is_empty() {"K_breakdown_default"} else {"K_breakdown_20_overrides"},
+            "kind": "standalone_same_functions_not_additive_to_dialog", "measured_frames": measured,
+            "count_note": "calculated effective_chords calls, not heap allocations (empty Vec need not allocate)",
+            "phase_ms": phases, "effective_chords_calls_per_page_frame_calculated": {
+                "catalog_actions": catalog_actions, "assignable_keys": key_count,
+                "filtered_user_facing_actions": filtered_actions,
+                "from_settings_conflict_scan": catalog_actions,
+                "second_conflict_scan": catalog_actions,
+                "keyboard_tooltip_eager_scans": keyboard_calls,
+                "nonempty_tooltip_actions": nonempty_tooltip_actions,
+                "keyboard_tooltip_nonempty_results": key_count * nonempty_tooltip_actions,
+                "command_list_chord_labels": filtered_actions, "total": total}})
+    }
+}
+
 fn assign_keyboard_picker_chord(state: &mut PreferencesState, keymap: &Keymap, chord: Chord) {
     let matches = actions_for_chord(keymap, chord, state.operation_keyboard_context);
     state.command_editor_source_chord = Some(chord);

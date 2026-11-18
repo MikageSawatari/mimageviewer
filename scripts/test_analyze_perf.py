@@ -17,6 +17,7 @@ from unittest import mock
 from analyze_perf import (
     validate_delivery,
     analyze_collection,
+    analyze_dialog_frames,
     analyze_thumb_adjustment_frames,
     analyze_page_turn,
     analyze_page_turn_animation,
@@ -25,6 +26,7 @@ from analyze_perf import (
     analyze_idle_health,
     cmd_colorize,
     cmd_collection,
+    cmd_dialog_frames,
     cmd_idle_health,
     cmd_hitches,
     cmd_metadata_search,
@@ -384,6 +386,118 @@ def remote_page_stage(
         "bytes": pixels * 4,
         "outcome": outcome,
     }
+
+
+class DialogFrameReportTests(unittest.TestCase):
+    @staticmethod
+    def begin(n, t, ms=99):
+        return {"cat": "frame", "kind": "begin", "n": n, "t": t, "prev_update_ms": ms}
+
+    @staticmethod
+    def dialog(n, page="Display", ms=2, **fields):
+        return {"cat": "ui", "kind": "dialog_frame", "dialog": "preferences",
+                "n": n, "page": page, "dialog_ms": ms, **fields}
+
+    def test_same_n_join_is_explicitly_lagged_and_grouped(self):
+        events = [session(1), self.begin(1, 1, 10), self.dialog(1, ms=2),
+                  self.begin(2, 1.02, 30), self.dialog(2, ms=4),
+                  self.begin(3, 1.04, 900), self.dialog(3, page="Fonts"),
+                  self.begin(4, 1.06, 50), self.dialog(4, search_results=True),
+                  self.begin(5, 1.08, 70),
+                  self.dialog(5, dialog="operation_customize", tab="Settings"),
+                  self.begin(6, 1.10, 80),
+                  self.dialog(6, dialog="operation_customize", tab="Keyboard", page="Some(Grid)")]
+        report = analyze_dialog_frames(events)
+        self.assertEqual(len(report["groups"]), 5)
+        row = next(row for row in report["groups"] if row["dialog"] == "preferences"
+                   and row["page"] == "Display" and not row["search_results"])
+        self.assertEqual(row["frames"], 2)
+        self.assertAlmostEqual(row["fps"], 50)
+        self.assertEqual(row["fps_intervals"], 1)
+        self.assertEqual(row["dialog_ms"], {"n": 2, "median_ms": 3, "p90_ms": 3.8})
+        self.assertEqual(row["lagged_prev_update_ms"], {"n": 2, "median_ms": 20, "p90_ms": 28})
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_dialog_frames(events)
+        self.assertIn("lagged_prev_update_ms = 前フレーム", output.getvalue())
+        self.assertIn("FPS=50.00", output.getvalue())
+
+    def test_sessions_and_partial_capture_never_join_across_boundaries(self):
+        report = analyze_dialog_frames([
+            self.begin(1, .1, 1), self.dialog(1), session(1), self.dialog(1),
+            self.begin(2, .2, 2), self.dialog(2), session(2),
+            self.begin(1, .1, 3), self.dialog(1), self.begin(2, .2, 4), self.dialog(2),
+        ])
+        row = report["groups"][0]
+        self.assertEqual(report["sessions"], 2)
+        self.assertEqual(report["partial_session_frames"], 1)
+        self.assertEqual(row["missing_begin"], 1)
+        self.assertEqual(row["lagged_prev_update_ms"]["n"], 4)
+        self.assertEqual(row["fps_intervals"], 1)
+        self.assertAlmostEqual(row["fps"], 10)
+
+    def test_missing_records_page_switch_and_counter_reset_break_fps(self):
+        events = [session(1), self.begin(1, .01, 1), self.dialog(1),
+                  self.begin(3, .03, 3), self.dialog(3),
+                  self.begin(4, .04, 4), self.dialog(4, page="Fonts"),
+                  self.begin(5, .05, 5), self.dialog(5),
+                  self.begin(1, .01, 6), self.dialog(1)]
+        report = analyze_dialog_frames(events)
+        row = next(row for row in report["groups"] if row["page"] == "Display")
+        self.assertEqual(report["inferred_restarts"], 1)
+        self.assertEqual(row["fps_intervals"], 0)
+        self.assertIsNone(row["fps"])
+        self.assertEqual(row["lagged_prev_update_ms"]["n"], 4)
+
+    def test_missing_invalid_and_ambiguous_joins_are_reported(self):
+        events = [session(1), self.dialog(1), self.begin(2, .02), self.begin(2, .02), self.dialog(2),
+                  self.begin(3, None, None), self.dialog(3, ms=float("nan")),
+                  self.begin(4, .04), self.dialog(4), self.dialog(4),
+                  self.dialog(True), self.dialog(8, dialog="operation_customize"),
+                  self.dialog(9, page=None),
+                  {"cat": "log", "kind": "records_dropped", "count": 3}]
+        report = analyze_dialog_frames(events)
+        row = report["groups"][0]
+        self.assertEqual(row["missing_begin"], 1)
+        self.assertEqual(row["ambiguous_begin"], 1)
+        self.assertEqual(row["duplicate_dialog"], 2)
+        self.assertEqual(row["missing_timestamp"], 1)
+        self.assertEqual(row["missing_prev_update_ms"], 1)
+        self.assertEqual(row["missing_dialog_ms"], 1)
+        self.assertEqual(report["malformed_events"], 3)
+        self.assertEqual(report["drop_reports"], 1)
+        self.assertIsNone(row["fps"])
+
+    def test_nonpositive_timestamp_intervals_and_empty_capture(self):
+        events = [self.begin(1, .1), self.dialog(1), self.begin(2, .1), self.dialog(2),
+                  self.begin(3, .09), self.dialog(3)]
+        self.assertIsNone(analyze_dialog_frames(events)["groups"][0]["fps"])
+        self.assertEqual(analyze_dialog_frames([])["groups"], [])
+
+    def test_interval_fps_quantiles_use_each_valid_interval(self):
+        events = [session(1), self.begin(1, 0), self.dialog(1),
+                  self.begin(2, .01), self.dialog(2),
+                  self.begin(3, .05), self.dialog(3),
+                  self.begin(5, .06), self.dialog(5)]
+        row = analyze_dialog_frames(events)["groups"][0]
+        self.assertEqual(row["fps_intervals"], 2)
+        self.assertAlmostEqual(row["fps"], 40)
+        self.assertAlmostEqual(row["fps_median"], 62.5)  # median(100, 25), not 1/median(delta).
+        self.assertAlmostEqual(row["fps_p90"], 92.5)
+        single = analyze_dialog_frames([self.begin(1, .1), self.dialog(1)])["groups"][0]
+        self.assertIsNone(single["fps_median"])
+        self.assertIsNone(single["fps_p90"])
+
+    def test_cli_accepts_dialog_frames(self):
+        with writable_test_directory() as directory:
+            path = directory / "perf.jsonl"
+            path.write_text("".join(json.dumps(row) + "\n" for row in
+                                    [session(1), self.begin(1, .1), self.dialog(1)]), encoding="utf-8")
+            with mock.patch.object(sys, "argv", ["analyze_perf.py", str(path), "dialog-frames"]), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                main()
+            self.assertIn("frames=1 FPS=- intervals=0", output.getvalue())
+            self.assertIn("FPS_interval: median=- p90=-", output.getvalue())
 
 
 class CollectionReportTests(unittest.TestCase):

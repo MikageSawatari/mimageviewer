@@ -8,6 +8,7 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [hover-805-measurement.md](hover-805-measurement.md) | 5ch 報告 805 の環境設定・操作カスタマイズのホバー計測。GPUを使わない ignored harness、dialog_frame perf event、dialog-frames集計と観測限界 |
 | [clear-history-actions.md](clear-history-actions.md) | 検索欄の入力履歴・閲覧履歴の全件消去をキー／リングへ割り当てる操作。共有処理・保存・確認・検証 |
 | [metadata-panel-spread-target-plan.md](metadata-panel-spread-target-plan.md) | §1.712 情報タブの左右ページ選択。編集／読書位置から独立したcontext所有、全ページ情報の対象、末尾補助表紙と初期化規則、検証 |
 | [list-order-book-navigation-plan.md](list-order-book-navigation-plan.md) | §1.444 一覧の表示順で前後の本へ移る操作。凍結列の context 所有・都度位置解決・既存 fullscreen 採用経路・検証記録 |
