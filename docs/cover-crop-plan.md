@@ -2814,7 +2814,13 @@ cargo nextest run -p mimageviewer --lib -E 'test(=app::search_nav_book_tests::se
   (編集プレビューの早い return・元からの画素・CPU 画像の待ち行列) が印を運ぶこと、採用の照合が待ち行列へ入る時点ではなく採用の直前にあること、
   欠けたピンの候補を作るときに確定済みの候補を戻さないこと、が挙がった。
 
-#### §1.803 実装記録（2026-11-18〜19、未コミット）
+#### §1.803 初回実装記録（2026-11-18〜19、後に `e80f78a65`）
+
+> この初回実装は後に `e80f78a65` としてcommitされた。以下の成功件数は当時実行したテストの結果であり、
+> 全分岐の受入完了を意味しない。独立実装レビューr1でP2が4件残った。
+> fallbackの旧回帰は通常Folderに限られ（変換sourceを人工的に付けていた）、書庫自身のfallbackを覆っていなかった。
+> Smart統合の旧回帰はmapの内容だけを検査し、保持Loadedの照合を覆っていなかった。
+> 修正と追加回帰の結果は末尾のr1対応記録に分けて残す。
 
 - 前提照合: DBの各writer、判定batchのDrop/cancelとreceiver破棄、Smartの準備・統合・復元、
   prepared metadata、viewer context swap、snapshot/direct-readerの元一覧復元、workerの
@@ -2889,4 +2895,84 @@ cargo nextest run -p mimageviewer --lib -E 'test(/book_resume_meter_multipart_di
   `target/803-core-check.log`）。引き継ぎ時の整形・空白検査は`cargo fmt`（引数なし）と
   `git diff --check`。ブランチ`fix-803-rar-cover-source-swap`、HEAD `2eeefaf08`の未コミット差分。
   full suite・build-dev・製品起動・commitは利用者の今回の制限に従って未実施。
-- 最終`cargo fmt`（引数なし）と`git diff --check`もexit 0。未解消のテスト失敗は無い。
+- 当時の最終`cargo fmt`（引数なし）と`git diff --check`もexit 0。当時実行した集合に未解消の失敗は無いが、
+  上記のとおりr1で見つかったfallback/Smart publicationの欠落を覆う回帰は含まれていなかった。
+
+#### 独立実装レビューr1対応（2026-11-19、基点 `e80f78a65`、未コミット）
+
+- レビュー結果はREVISE、P2が4件。コード照合でも4件の核心を確認した。
+  1. fallbackの自身のsource事実を無条件に消していた。通常Folderのbaseは最初からNoneだが、
+     ConvertibleArchiveのbaseはSomeを持つ。旧回帰は後者を覆っていなかった。
+  2. Smart membershipのmap統合は終端sourceの公開でもあるが、保持Loadedを照合していなかった。
+     同一の後続Resolvedはchanged=falseとなり、抜けた照合を補わない。旧回帰はmapだけを検査していた。
+  3. Resolvedを1件採用するたび全thumbnailを走査していた。replyのdrain単位へ集約する必要がある。
+  4. Everythingの新しい表がrevision=0で始まり、過去の全変更を採用時に再生していた。
+     catch-upも変更件数×状態数の走査だった。
+- 到達性の補足: 現在のZipDir factoryは自身の`epub_pin_fallback`を生成しない。
+  新しい回帰では実factoryのConvertibleArchive fallbackに加え、factoryで生成したZipDir baseを
+  fallbackとして組み合わせたhandler transportも別に検査する。後者を自然なfactory経路の証拠とはしない。
+  stamp失敗側も同じbaseを使った合成dispatch検査。ZipDirの新しい製品fallback経路は追加しない。
+- 往復の回帰は、修正前の動作を維持した状態で先に実行する。走査回数はcfg(test)のvisit observerで
+  測り、時間閾値を使わない。Everythingの途中変更はprepare内の決まった位置のone-shot hookで発生させる。
+
+##### r1の修正内容
+
+- P2-1: `thumb_loader.rs`の2つのfallback dispatchから無条件の`converted_source=None`を撤去。
+  fallbackは自身のfactoryで得た事実を保ち、外側要求のsourceは継承しない。
+  `thumb_loader/converted_source_tests.rs`の4回帰は両方向×新規生成/catalog/memoryを検査し、
+  不一致行の閾値未満での置換と次回hitも含む。通常Folderのcontrolもfactoryから作り、人工的なsource付与をやめた。
+  `app.rs`のfactory wrapperはcfg(test)のみ。`app/book_cover.rs`の類似fallbackは元から自身の事実を保つため変更不要。
+- P2-2: `smart_folder.rs`のmembership採用はincomingの終端source keyを集め、既存の同一snapshotへの
+  merge/cancel後に保持素材を照合する。共有helperは一致textureを保ち、不一致だけ既存の退避へ送る。
+  handler回帰はDirect→CachedZipと逆向きで、保持したstale Loadedと一致する兄弟ZipDirを持たせ、
+  同一の後続Resolved（changed=false）では抜けた照合を補えないことも検査する。
+- P2-3: `app.rs`はreply drain中に変更keyとpin依存/未Loaded候補のreload indexを集める。
+  `converted_archive_sources.rs`の共有publication helperがdrain後に全thumbnailを1回だけ走査し、
+  reload indexとstale bindingの集合を合わせて各tileを1回退避する。Smartの採用も同じhelperを使う。
+- P2-4: `global_search_ui/everything/metadata.rs`はprepareの先頭で現在のDB revisionを採取し、表を作る。
+  既存Arcは`global_search_ui.rs`のresources captureで渡すだけで、UI側にDB/FS読取を追加しない。
+  `thumbnail_owner_tests.rs`はresourcesのNone初期値だけ追加。
+  `ConvertedArchiveSources::apply`は新しいSource keyを重複除去し、AllCachedの有無を集約してから状態を1回走査する。
+  全変更がPendingへの遷移だけなので、この集約で変更の順序の意味は失わない。
+
+##### r1のred検証
+
+基点の動作を変えず、回帰・cfg(test)の計測hook・未使用のresources handle受渡しだけを足した段階で実行した。
+Cargoは`CARGO_BUILD_JOBS=1`、nextestは`--test-threads 1`。実キーボード状態を読む検査は追加していない。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/converted_source_factory_/) | test(/converted_source_excluded_pin_fallback_keeps_valid_folder_rows_and_has_no_binding/) | test(/smart_membership_source_publication_reconciles_/) | test(/converted_source_fresh_everything_revision/) | test(/converted_sources_resolution_batch_traverses_thumbnails_once/) | test(/converted_sources_catch_up_batches_history_before_single_state_traversal/)' --test-threads 1
+```
+
+- **1 passed / 10 failed**（11件、3.895秒、`target/803-r1-red.log`）。通過はfactory由来の通常Folder control。
+  新しい4つのfallback回帰はbindingがNone、Smartの2回帰は保持stale Loaded未退避で失敗。
+  Everythingの2回帰は履歴再生/途中変更前のrevisionが0で失敗した。
+  deterministic visit counterもreply 8件×513 tileで4104（期待513）、変更64件×3 stateで192（期待3）となり失敗。
+  10件とも対象の欠落・走査回数のassertionで失敗しており、compile失敗や時間閾値によるredではない。
+
+##### r1の修正後focused検証
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/converted_source/) | test(/smart_membership_/) | test(/global_search_ui::everything::metadata::tests/) | test(/global_search_ui::thumbnail_owner_tests/) | test(/converted_archive/) | test(/app::cover_scope_tests/) | test(/app::rar_archive_cache_tests/) | test(/app::cover_rotation::tests/) | test(/archive_changes_/) | test(/history_transition_storage_keeps_app_stack_footprint_bounded/)' --test-threads 1
+```
+
+- 初回は **148 passed / 2 failed**（150件、85.108秒、`target/803-r1-green.log`）。
+  Smartの両方向、両visit counter、Everythingの履歴/途中変更、stamp失敗fallbackと既存関連回帰は通過。
+  失敗した2件はvisibility fallbackの保存行assertion。新画素とbindingは正しく、seed行のstampが誤っていた。
+  factoryのpin targetは実ファイルのstamp、base fallbackはfixtureの(7,9)を持つ。
+  実dispatchはouter keyに加えてouter stampへも投影するため、visibilityはouter stamp、
+  stamp失敗はfallback stampでseedするよう**テストhelperだけ**を補正した。
+  保存行の置換・2回目hitのassertionは維持し、製品コードの追加変更は行っていない。
+  redで失敗したfreshケースはseed自体を使わないので、その基点の失敗証拠は変わらない。
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/converted_source_factory_/) | test(/converted_source_excluded_pin_fallback_keeps_valid_folder_rows_and_has_no_binding/)' --test-threads 1
+```
+
+- stamp補正後は **5 passed / 0 failed**（3.195秒、`target/803-r1-fallback-followup.log`）。
+  両方向・両dispatchの新規生成/catalog/memory、閾値未満の置換と次回hit、factory由来Folder controlを通過。
+  他148件の成功結果は製品コードと当該経路に変更が無いため再利用する。
+
+- `cargo check -p mimageviewer --bin mimageviewer-core`もexit 0（36.67秒、
+  `target/803-r1-core-check.log`）。最終`cargo fmt`（引数なし）と`git diff --check`もexit 0。
+  HEADは`e80f78a65`のまま、変更は未コミット。full suite・build-dev・製品起動・commitは指示どおり実施しない。

@@ -1744,6 +1744,12 @@ impl App {
         ]);
         if let Some(extra) = aggregate {
             self.folder_pin_map.extend(extra.folder_pin_map);
+            let published_archive_keys = extra
+                .converted_archive_cache_paths
+                .iter()
+                .filter(|(_, state)| state.load_path().is_some())
+                .map(|(key, _)| key.clone())
+                .collect();
             // Reconcile both owners against one log snapshot before combining their rows.
             // Even an unchanged Pending row can have an obsolete decision in flight.
             if self.converted_archive_cache_paths.merge_caught_up(
@@ -1753,6 +1759,7 @@ impl App {
             {
                 pending.cancel();
             }
+            self.reconcile_converted_archive_bindings(&published_archive_keys, HashSet::new());
         }
         if !appended_videos.is_empty() {
             self.spawn_video_thread(
@@ -12706,6 +12713,153 @@ mod tests {
             assert_eq!(app.items, original_items);
             assert!(Arc::ptr_eq(&app.page_identity_index, &current));
         }
+    }
+
+    fn assert_smart_membership_reconciles_published_source(cached_zip: bool) {
+        use crate::app::{ConvertedArchiveCachePathsMsg, ConvertedArchiveCachePathsPending};
+        use crate::thumb_loader::ConvertedSourceBinding;
+
+        let mut app = crate::app::setup_app_for_test();
+        install_smart_identity_test_root(&mut app, Default::default());
+        let source = PathBuf::from(r"C:\Smart\book.rar");
+        let cached = PathBuf::from(r"C:\Cache\book.zip");
+        let archive_key = crate::path_key::normalize_keep_drive(&source);
+        let direct = ConvertedArchiveSourceState::Direct(source.clone());
+        let converted = ConvertedArchiveSourceState::CachedZip {
+            logical_source: source.clone(),
+            path: cached.clone(),
+        };
+        let (previous, published, stale_read, matching_read) = if cached_zip {
+            (direct, converted, &source, &cached)
+        } else {
+            (converted, direct, &cached, &source)
+        };
+        app.items = vec![
+            GridItem::ConvertibleArchive {
+                path: source.clone(),
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+            GridItem::ZipDir {
+                zip_path: source.clone(),
+                dir_prefix: "chapter/".into(),
+                is_archive: false,
+                representative: Some("chapter/cover.jpg".into()),
+            },
+        ];
+        app.page_identity_index = Arc::new(
+            super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                &app.items,
+                None,
+                Default::default(),
+            ),
+        );
+        app.top_level_grid_view
+            .smart_folder_session_mut()
+            .unwrap()
+            .item_rating_masks = Some(vec![[true; 6]; 2]);
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "smart-membership-source-publication",
+            egui::ColorImage::filled([2, 1], egui::Color32::WHITE),
+            Default::default(),
+        );
+        app.thumbnails = [stale_read, matching_read]
+            .into_iter()
+            .map(|read_archive| {
+                let mut thumbnail = ThumbnailState::loaded_raster(
+                    texture.clone(),
+                    crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                    false,
+                    2,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((2, 1)),
+                    None,
+                );
+                if let ThumbnailState::Loaded {
+                    converted_source_binding,
+                    ..
+                } = &mut thumbnail
+                {
+                    *converted_source_binding = Some(ConvertedSourceBinding {
+                        archive_key: archive_key.clone(),
+                        read_archive: crate::path_key::normalize_keep_drive(read_archive),
+                    });
+                }
+                thumbnail
+            })
+            .collect();
+        let revision = app.archive_cache_db.as_ref().unwrap().revision();
+        app.converted_archive_cache_paths = ConvertedArchiveSources::new(revision);
+        app.converted_archive_cache_paths
+            .insert(archive_key.clone(), previous);
+        let (mut prepared, pending) = smart_membership_identity_test_result(&app);
+        let mut incoming = ConvertedArchiveSources::new(revision);
+        incoming.insert(archive_key.clone(), published.clone());
+        prepared.prepared.metadata.aggregate = Some(
+            super::super::subfolder_expansion::PreparedAggregateMetadata {
+                adjustment_page_params: HashMap::new(),
+                export_crop_page_settings: HashMap::new(),
+                view_trim_page_overrides: HashMap::new(),
+                mask_pages: HashSet::new(),
+                conceal_pages: HashSet::new(),
+                comic_pages: HashSet::new(),
+                folder_pin_map: HashMap::new(),
+                converted_archive_cache_paths: incoming,
+                catalog: None,
+            },
+        );
+
+        app.install_smart_folder_rating_membership(prepared, pending);
+        assert_eq!(
+            app.converted_archive_cache_paths.get(&archive_key),
+            Some(&published)
+        );
+        let evicted_at_publication = matches!(app.thumbnails[0], ThumbnailState::Evicted);
+        assert!(
+            matches!(&app.thumbnails[1], ThumbnailState::Loaded { tex, .. }
+            if tex.id() == texture.id())
+        );
+
+        // A previously queued equivalent reply sees changed=false. Publication itself
+        // must reconcile retained materials; this reply cannot repair a missed check.
+        let (tx, rx) = mpsc::channel();
+        tx.send(ConvertedArchiveCachePathsMsg::Resolved {
+            archive_key,
+            state: published,
+            idx: 0,
+            ordinal: 1,
+            elapsed_ms: 0.0,
+            input_seq: 0,
+        })
+        .unwrap();
+        app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
+            generation: app.items_generation,
+            cascade_depth: app.settings.folder_thumb_depth as usize,
+            cancel: Arc::new(AtomicBool::new(false)),
+            desired_indices: Arc::new(std::sync::RwLock::new(HashSet::from([0]))),
+            rx,
+            pin_archive_dependencies: HashMap::new(),
+        });
+        app.poll_converted_archive_cache_paths(&ctx);
+        assert!(
+            evicted_at_publication,
+            "membership publication kept a stale Loaded material"
+        );
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+        assert!(
+            matches!(&app.thumbnails[1], ThumbnailState::Loaded { tex, .. }
+            if tex.id() == texture.id())
+        );
+    }
+
+    #[test]
+    fn smart_membership_source_publication_reconciles_direct_to_cached_zip() {
+        assert_smart_membership_reconciles_published_source(true);
+    }
+
+    #[test]
+    fn smart_membership_source_publication_reconciles_cached_zip_to_direct() {
+        assert_smart_membership_reconciles_published_source(false);
     }
 
     #[test]

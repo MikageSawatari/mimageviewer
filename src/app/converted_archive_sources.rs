@@ -2,8 +2,31 @@
 use super::{App, ConvertedArchiveSourceState, ThumbnailState};
 use crate::archive_cache::{ArchiveCacheChange, ArchiveCacheDb};
 use crate::thumb_loader::ConvertedSourceBinding;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+
+#[cfg(test)]
+thread_local! {
+    static THUMBNAIL_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SOURCE_STATE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn observe_thumbnail_visit() {
+    THUMBNAIL_VISITS.with(|count| count.set(count.get() + 1));
+}
+#[cfg(test)]
+pub(super) fn take_thumbnail_visits() -> usize {
+    THUMBNAIL_VISITS.with(|count| count.replace(0))
+}
+#[cfg(test)]
+fn observe_source_state_visit() {
+    SOURCE_STATE_VISITS.with(|count| count.set(count.get() + 1));
+}
+#[cfg(test)]
+pub(super) fn take_source_state_visits() -> usize {
+    SOURCE_STATE_VISITS.with(|count| count.replace(0))
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConvertedArchiveSources {
@@ -25,29 +48,43 @@ impl ConvertedArchiveSources {
 
     fn apply(&mut self, revision: u64, changes: &[(u64, ArchiveCacheChange)]) -> bool {
         let changed = revision > self.synced_rev;
+        let mut source_keys = HashSet::new();
+        let mut all_cached = false;
         for (_, change) in changes.iter().filter(|(rev, _)| *rev > self.synced_rev) {
+            match change {
+                ArchiveCacheChange::Source(source) => {
+                    source_keys.insert(source.as_str());
+                }
+                ArchiveCacheChange::AllCached => all_cached = true,
+            }
+        }
+        // Every change can only move a state to Pending, so the invalidations commute.
+        // Gather/deduplicate the log first; traverse the candidates only once.
+        if all_cached || !source_keys.is_empty() {
             for (key, state) in &mut self.states {
-                let invalid = match change {
-                    ArchiveCacheChange::AllCached => matches!(
+                #[cfg(test)]
+                observe_source_state_visit();
+                let invalid = (all_cached
+                    && matches!(
                         state.read_source(),
                         ConvertedArchiveSourceState::CachedZip { .. }
-                    ),
-                    ArchiveCacheChange::Source(source) => {
-                        crate::path_key::normalize(Path::new(key)) == *source
+                    ))
+                    || (!source_keys.is_empty()
+                        && (source_keys
+                            .contains(crate::path_key::normalize(Path::new(key)).as_str())
                             || match state.read_source() {
                                 ConvertedArchiveSourceState::Direct(path) => {
-                                    crate::path_key::normalize(path) == *source
+                                    source_keys.contains(crate::path_key::normalize(path).as_str())
                                 }
                                 ConvertedArchiveSourceState::CachedZip {
                                     logical_source, ..
                                 }
                                 | ConvertedArchiveSourceState::Unavailable {
                                     logical_source: Some(logical_source),
-                                } => crate::path_key::normalize(logical_source) == *source,
+                                } => source_keys
+                                    .contains(crate::path_key::normalize(logical_source).as_str()),
                                 _ => false,
-                            }
-                    }
-                };
+                            }));
                 if invalid {
                     *state = ConvertedArchiveSourceState::Pending;
                 }
@@ -117,6 +154,31 @@ pub(crate) fn binding_is_stale(
 }
 
 impl App {
+    /// Publication can arrive in a reply drain or a prepared membership map.
+    /// Scan only once per publication and evict each requested/stale tile once.
+    pub(super) fn reconcile_converted_archive_bindings(
+        &mut self,
+        published_keys: &HashSet<String>,
+        mut reload_indices: HashSet<usize>,
+    ) {
+        if !published_keys.is_empty() {
+            for (idx, thumbnail) in self.thumbnails.iter().enumerate() {
+                #[cfg(test)]
+                observe_thumbnail_visit();
+                if matches!(thumbnail, ThumbnailState::Loaded {
+                    converted_source_binding: Some(binding), ..
+                } if published_keys.contains(&binding.archive_key))
+                    && self.converted_thumbnail_is_stale(thumbnail)
+                {
+                    reload_indices.insert(idx);
+                }
+            }
+        }
+        for idx in reload_indices {
+            self.evict_thumbnail_for_reload(idx);
+        }
+    }
+
     pub(crate) fn catch_up_converted_archive_sources(&mut self) {
         if self
             .converted_archive_cache_paths

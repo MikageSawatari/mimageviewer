@@ -46089,6 +46089,8 @@ impl App {
         // 作り直しが 1 フレームに積まれる。
         let mut rebuild_visible = false;
         let mut request_repaint = false;
+        let mut published_keys = HashSet::new();
+        let mut reload_indices = HashSet::new();
         loop {
             let (generation, cascade_depth, message) = {
                 let Some(pending) = self.converted_archive_cache_paths_pending.as_ref() else {
@@ -46183,38 +46185,22 @@ impl App {
                     }
                     self.converted_archive_cache_paths
                         .insert(archive_key.clone(), state);
-                    let mut dependent_indices = self
+                    published_keys.insert(archive_key.clone());
+                    let dependent_indices = self
                         .converted_archive_cache_paths_pending
                         .as_ref()
                         .and_then(|pending| {
                             pending.pin_archive_dependencies.get(&archive_key).cloned()
                         })
                         .unwrap_or_default();
-                    // Reconcile all bound materials, including sibling ZipDir tiles.
-                    for (tile_idx, thumbnail) in self.thumbnails.iter().enumerate() {
-                        let owns_binding = matches!(thumbnail, ThumbnailState::Loaded {
-                            converted_source_binding: Some(binding), ..
-                        } if binding.archive_key == archive_key);
-                        if owns_binding
-                            && self.converted_thumbnail_is_stale(thumbnail)
-                            && !dependent_indices.contains(&tile_idx)
-                        {
-                            dependent_indices.push(tile_idx);
-                        }
-                    }
-                    if (!matches!(
+                    reload_indices.extend(dependent_indices);
+                    // Bound Loaded materials are checked together after draining replies.
+                    // Candidate cache misses and pin dependents retain their existing reload rule.
+                    if !matches!(
                         self.thumbnails.get(idx),
                         Some(ThumbnailState::Loaded { .. })
-                    ) || self
-                        .thumbnails
-                        .get(idx)
-                        .is_some_and(|t| self.converted_thumbnail_is_stale(t)))
-                        && !dependent_indices.contains(&idx)
-                    {
-                        dependent_indices.push(idx);
-                    }
-                    for idx in dependent_indices {
-                        self.evict_thumbnail_for_reload(idx);
+                    ) {
+                        reload_indices.insert(idx);
                     }
                     rebuild_visible |= self.settings.facet_filter.has_rollup_edit_filter();
                     request_repaint = true;
@@ -46244,6 +46230,7 @@ impl App {
                 }
             }
         }
+        self.reconcile_converted_archive_bindings(&published_keys, reload_indices);
         if rebuild_visible {
             self.rebuild_visible_indices();
         }
@@ -103445,6 +103432,35 @@ fn make_load_request_with_auto_crop(
     };
     request.set_auto_cover_crop(auto.filter(|_| eligible && auto_crop_leaf_allowed(&request)));
     Some(request)
+}
+
+#[cfg(test)]
+pub(crate) fn converted_fallback_request_for_test(
+    item: &GridItem,
+    pins: &HashMap<String, crate::folder_thumb_pins::FolderPin>,
+    sources: &HashMap<String, ConvertedArchiveSourceState>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+) -> LoadRequest {
+    make_load_request_with_visibility(
+        item,
+        0,
+        7,
+        9,
+        false,
+        None,
+        Some(crate::settings::SortOrder::Numeric),
+        3,
+        pins,
+        sources,
+        None,
+        None,
+        pin_db,
+        None,
+        false,
+        visibility,
+    )
+    .expect("factory fallback fixture must produce a request")
 }
 
 fn make_load_request_with_visibility(

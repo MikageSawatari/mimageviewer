@@ -138,6 +138,106 @@ fn pixels(
 }
 
 #[test]
+fn converted_sources_resolution_batch_traverses_thumbnails_once() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let sources: Vec<_> = (0..8)
+        .map(|i| app.tmp.path().join(format!("book-{i}.rar")))
+        .collect();
+    let cached_paths: Vec<_> = (0..8)
+        .map(|i| app.tmp.path().join(format!("book-{i}.zip")))
+        .collect();
+    // Most rows have no binding, as during initial navigation in a large search list.
+    install_rows(&mut app, vec![candidate_item(&sources[0]); 513]);
+    for source in &sources {
+        app.converted_archive_cache_paths
+            .insert(key(source), ConvertedArchiveSourceState::Pending);
+    }
+    app.thumbnails[400] = loaded(
+        &ctx,
+        "stale-sibling",
+        Some(binding(&sources[7], &sources[7])),
+    );
+    app.thumbnails[401] = loaded(
+        &ctx,
+        "matching-sibling",
+        Some(binding(&sources[7], &cached_paths[7])),
+    );
+    let retained = match &app.thumbnails[401] {
+        ThumbnailState::Loaded { tex, .. } => tex.id(),
+        _ => unreachable!(),
+    };
+    let (tx, _) = decision_batch(&mut app);
+    for (source, cached_path) in sources.iter().zip(&cached_paths) {
+        tx.send(resolved(source, cached(source, cached_path)))
+            .unwrap();
+    }
+    tx.send(ConvertedArchiveCachePathsMsg::Finished {
+        peeked: 8,
+        hits: 8,
+        elapsed_ms: 0.0,
+        input_seq: 0,
+    })
+    .unwrap();
+    converted_archive_sources::take_thumbnail_visits();
+    app.poll_converted_archive_cache_paths(&ctx);
+    assert_eq!(
+        converted_archive_sources::take_thumbnail_visits(),
+        app.thumbnails.len(),
+        "one full-list traversal per drain, independent of reply count"
+    );
+    assert!(matches!(app.thumbnails[400], ThumbnailState::Evicted));
+    assert!(
+        matches!(&app.thumbnails[401], ThumbnailState::Loaded { tex, .. } if tex.id() == retained)
+    );
+    app.poll_converted_archive_cache_paths(&ctx);
+    assert_eq!(converted_archive_sources::take_thumbnail_visits(), 0);
+}
+
+#[test]
+fn converted_sources_catch_up_batches_history_before_single_state_traversal() {
+    let app = setup_app_for_test();
+    let db = app.archive_cache_db.as_ref().unwrap().clone();
+    let source = app.tmp.path().join("book.rar");
+    let read = app.tmp.path().join("cache.zip");
+    let unrelated = app.tmp.path().join("unrelated.rar");
+    let mut table = ConvertedArchiveSources::new(db.revision());
+    table.insert(
+        key(&source),
+        ConvertedArchiveSourceState::Direct(source.clone()),
+    );
+    table.insert("alias.rar".into(), cached(&source, &read));
+    table.insert(
+        key(&unrelated),
+        ConvertedArchiveSourceState::Direct(unrelated.clone()),
+    );
+    for _ in 0..64 {
+        record(&db, &source, &read);
+    }
+    converted_archive_sources::take_source_state_visits();
+    assert!(table.catch_up(Some(&db)));
+    assert_eq!(
+        converted_archive_sources::take_source_state_visits(),
+        table.len(),
+        "change history must be deduplicated before traversing states"
+    );
+    assert_eq!(
+        table.get(&key(&source)),
+        Some(&ConvertedArchiveSourceState::Pending)
+    );
+    assert_eq!(
+        table.get("alias.rar"),
+        Some(&ConvertedArchiveSourceState::Pending)
+    );
+    assert_eq!(
+        table.get(&key(&unrelated)),
+        Some(&ConvertedArchiveSourceState::Direct(unrelated))
+    );
+    assert!(!table.catch_up(Some(&db)));
+    assert_eq!(converted_archive_sources::take_source_state_visits(), 0);
+}
+
+#[test]
 fn converted_sources_record_cancels_pending_batch_before_queued_direct_reply() {
     let mut app = setup_app_for_test();
     let source = app.tmp.path().join("book.rar");

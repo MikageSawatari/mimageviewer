@@ -51,6 +51,194 @@ fn converted_source_zip(path: &Path) {
     zip.finish().unwrap();
 }
 
+fn converted_source_factory_fallback_dispatch(zipdir: bool, stamp_failure: bool) {
+    use crate::app::ConvertedArchiveSourceState;
+    use crate::folder_thumb_pins::FolderPinSource;
+    use crate::grid_item::GridItem;
+
+    let _data = crate::data_dir::TestDataDirGuard::new();
+    for to_converted in [false, true] {
+        // None also checks newly decoded pixels carry the fallback's own binding.
+        for memory_hit in [None, Some(false), Some(true)] {
+            let temp = TempDir::new().unwrap();
+            let original = temp.path().join("original.rar");
+            std::fs::copy(
+                crate::cover_auto_sample::rar_tests::fixture_root().join("jacket.rar"),
+                &original,
+            )
+            .unwrap();
+            let converted = temp.path().join("converted.zip");
+            converted_source_zip(&converted);
+            let (old, current) = if to_converted {
+                (&original, &converted)
+            } else {
+                (&converted, &original)
+            };
+            let archive_key = crate::path_key::normalize_keep_drive(&original);
+            let sources = HashMap::from([(
+                archive_key.clone(),
+                if to_converted {
+                    ConvertedArchiveSourceState::CachedZip {
+                        logical_source: original.clone(),
+                        path: converted.clone(),
+                    }
+                } else {
+                    ConvertedArchiveSourceState::Direct(original.clone())
+                },
+            )]);
+            let policy = crate::file_type_visibility::FileTypeVisibility {
+                excluded_extensions: ["zip".into()].into_iter().collect(),
+                ..Default::default()
+            };
+            let pins = HashMap::from([(
+                archive_key.clone(),
+                FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "inner.zip/page.png".into(),
+                }
+                .into(),
+            )]);
+            let mut request = crate::app::converted_fallback_request_for_test(
+                &GridItem::ConvertibleArchive {
+                    path: original.clone(),
+                    format: crate::archive_converter::ArchiveFormat::Rar,
+                },
+                &pins,
+                &sources,
+                None,
+                &policy,
+            );
+            assert!(request.epub_pin_fallback.is_some());
+            assert!(!policy_archive_pin_visible(&request, None));
+            if zipdir {
+                // ZipDir's factory does not currently create epub_pin_fallback.
+                // Compose a factory-generated ZipDir base with the real outer pin
+                // to exercise the handler's source-fact transport independently.
+                request.epub_pin_fallback = Some(Box::new(
+                    crate::app::converted_fallback_request_for_test(
+                        &GridItem::ZipDir {
+                            zip_path: original.clone(),
+                            dir_prefix: String::new(),
+                            is_archive: false,
+                            representative: Some("000.png".into()),
+                        },
+                        &HashMap::new(),
+                        &sources,
+                        None,
+                        &policy,
+                    ),
+                ));
+            }
+            let fallback = request.epub_pin_fallback.as_ref().unwrap();
+            assert_eq!(fallback.path, *current);
+            assert_eq!(
+                fallback.converted_source,
+                Some(ConvertedSourceRequest {
+                    archive_key: archive_key.clone(),
+                    expected_archive: Some(current.clone()),
+                })
+            );
+            let fallback_key = cache_key_for_request(fallback).unwrap().into_owned();
+            // The visibility projection publishes under both the outer pin key
+            // and outer stamp; stamp-error dispatch retains the fallback stamp.
+            let (mtime, file_size) = if stamp_failure {
+                (fallback.mtime, fallback.file_size)
+            } else {
+                (request.mtime, request.file_size)
+            };
+            let key = if stamp_failure {
+                // The stamp-error dispatch normally serves folder/EPUB pins.
+                // Compose its failed outer stamp with the same factory fallback
+                // to check the second dispatch preserves source ownership too.
+                request.path = temp.path().join("missing.epub");
+                request.zip_entry = None;
+                request.resolve_override = None;
+                request.pdf_page = Some(0);
+                request.pdf_stamp_policy = PdfStampPolicy::ResolveInWorker;
+                fallback_key
+            } else {
+                // Excluded pins publish the automatic projection at the pin key.
+                cache_key_for_request(&request).unwrap().into_owned()
+            };
+            let catalog = Arc::new(
+                crate::catalog::CatalogDb::open(&temp.path().join("cache"), temp.path()).unwrap(),
+            );
+            if memory_hit.is_some() {
+                catalog
+                    .save_thumb_bytes_with_layout_dims(
+                        &key,
+                        mtime,
+                        file_size,
+                        None,
+                        None,
+                        &fixture_webp(),
+                        &CoverIdentity::Page(crate::adjustment_db::zip_entry_key(old, "000.png")),
+                        crate::cover_auto_material::AutoMaterial::NotAutomatic,
+                    )
+                    .unwrap();
+            }
+            let map = std::sync::RwLock::new(if memory_hit == Some(true) {
+                catalog.load_all().unwrap()
+            } else {
+                HashMap::new()
+            });
+            assert!(!request.force_cache);
+            let messages = converted_source_run(&mut request, &catalog, &map, None);
+            let pixels = messages.iter().find_map(ThumbMsg::pixels).unwrap();
+            assert!(
+                matches!(pixels.origin, ThumbLoadOrigin::SourceGenerated { .. }),
+                "zipdir={zipdir} stamp_failure={stamp_failure} converted={to_converted} memory={memory_hit:?}"
+            );
+            let expected_binding = ConvertedSourceBinding {
+                archive_key: archive_key.clone(),
+                read_archive: crate::adjustment_db::normalize_path(current),
+            };
+            assert_eq!(
+                pixels.converted_source_binding.as_ref(),
+                Some(&expected_binding)
+            );
+            assert_eq!(
+                pixels.cover,
+                CoverIdentity::Page(crate::adjustment_db::zip_entry_key(current, "000.png"))
+            );
+            if memory_hit.is_some() {
+                // A mismatched row must be replaced below the normal save limits.
+                let stored = catalog.load_one(&key).unwrap().unwrap();
+                assert_eq!(stored.cover, pixels.cover);
+                map.write().unwrap().clear();
+                let messages = converted_source_run(&mut request, &catalog, &map, None);
+                let cached = messages.iter().find_map(ThumbMsg::pixels).unwrap();
+                assert_eq!(cached.origin, ThumbLoadOrigin::UpgradeableCache);
+                assert_eq!(
+                    cached.converted_source_binding.as_ref(),
+                    Some(&expected_binding)
+                );
+                assert_eq!(cached.cover, stored.cover);
+            }
+        }
+    }
+}
+
+#[test]
+fn converted_source_factory_archive_visibility_fallback_preserves_own_source() {
+    converted_source_factory_fallback_dispatch(false, false);
+}
+
+#[test]
+fn converted_source_factory_archive_stamp_failure_fallback_preserves_own_source() {
+    converted_source_factory_fallback_dispatch(false, true);
+}
+
+#[test]
+fn converted_source_factory_zipdir_composed_visibility_fallback_preserves_own_source() {
+    converted_source_factory_fallback_dispatch(true, false);
+}
+
+#[test]
+fn converted_source_factory_zipdir_composed_stamp_failure_fallback_preserves_own_source() {
+    converted_source_factory_fallback_dispatch(true, true);
+}
+
 #[test]
 fn converted_source_worker_replaces_memory_catalog_zipdir_and_pin_rows_both_directions() {
     let _data = crate::data_dir::TestDataDirGuard::new();
@@ -402,40 +590,42 @@ fn converted_source_excluded_pin_fallback_keeps_valid_folder_rows_and_has_no_bin
     image::RgbImage::from_pixel(12, 8, image::Rgb([30, 80, 150]))
         .save(root.join("cover.png"))
         .unwrap();
-    let archive = root.join("book.cbz");
-    visibility_archive_fixture(&archive);
+    let archive = root.join("book.rar");
+    std::fs::copy(
+        crate::cover_auto_sample::rar_tests::fixture_root().join("jacket.rar"),
+        &archive,
+    )
+    .unwrap();
     let policy = crate::file_type_visibility::FileTypeVisibility {
         excluded_extensions: ["zip".into()].into_iter().collect(),
         ..Default::default()
     };
-    let source = ConvertedSourceRequest {
-        archive_key: "book.rar".into(),
-        expected_archive: Some(archive.clone()),
-    };
-    let fallback = LoadRequest {
-        path: root.clone(),
-        resolve_override: Some(ResolveStrategy::FolderRepresentative),
-        folder_thumb_sort: Some(SortOrder::Numeric),
-        folder_thumb_depth: 3,
-        folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::AutoSelected),
-        file_type_visibility: policy.clone(),
-        // Even a cloned fallback must lose the pin's source expectation at dispatch.
-        converted_source: Some(source.clone()),
-        ..Default::default()
-    };
-    let mut request = LoadRequest {
-        path: archive,
-        zip_entry: Some("inner.zip/page.png".into()),
-        cache_key_override: Some("folderthumb:library#pin:hidden".into()),
-        folder_thumb_provenance: Some(crate::catalog::FolderThumbProvenance::Seeded),
-        converted_source: Some(source),
-        file_type_visibility: policy,
-        epub_pin_fallback: Some(Box::new(fallback)),
-        mtime: 7,
-        file_size: 9,
-        force_cache: true,
-        ..Default::default()
-    };
+    let sources = HashMap::from([(
+        crate::path_key::normalize_keep_drive(&archive),
+        crate::app::ConvertedArchiveSourceState::Direct(archive),
+    )]);
+    let pins = HashMap::from([(
+        crate::path_key::normalize_keep_drive(&root),
+        crate::folder_thumb_pins::FolderPinSource::ZipEntry {
+            zip_rel: "book.rar".into(),
+            entry: "inner.zip/page.png".into(),
+        }
+        .into(),
+    )]);
+    let mut request = crate::app::converted_fallback_request_for_test(
+        &crate::grid_item::GridItem::Folder(root.clone()),
+        &pins,
+        &sources,
+        None,
+        &policy,
+    );
+    assert!(request.converted_source.is_some());
+    assert_eq!(
+        request.epub_pin_fallback.as_ref().unwrap().converted_source,
+        None,
+        "the folder factory already owns no converted source"
+    );
+    request.force_cache = true;
     let catalog =
         Arc::new(crate::catalog::CatalogDb::open(&data.path().join("catalog"), &root).unwrap());
     let map = std::sync::RwLock::new(HashMap::new());

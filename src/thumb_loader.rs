@@ -3912,7 +3912,6 @@ fn process_load_request_with_provider(
         && !policy_archive_pin_visible(req, cancel.map(AsRef::as_ref))
     {
         let mut fallback = req.epub_pin_fallback.as_deref().unwrap().clone();
-        fallback.converted_source = None;
         fallback.inherit_request_identity_from(req);
         // Keep the writer/reader pin route and stamp: parent and drive consumers must find
         // the completed automatic projection without inspecting archive ancestry themselves.
@@ -3949,7 +3948,6 @@ fn process_load_request_with_provider(
     let fallback_or_fail = || {
         if let Some(fallback) = req.epub_pin_fallback.as_deref() {
             let mut fallback = fallback.clone();
-            fallback.converted_source = None;
             fallback.inherit_request_identity_from(req);
             if req.cover_crop.is_none() && req.auto_cover_crop.is_some() {
                 fallback.cache_key_override = req.cache_key_override.clone();
