@@ -1,6 +1,6 @@
 # 直接移動のフォルダ走査を worker へ移す (§1.805)
 
-状態: 設計 r3 (2026-11-18、設計レビュー r1・r2 の REJECT を反映)。担当: 設計・検収 = ClaudeCode Opus 5.5、
+状態: 設計 r4 (2026-11-18、設計レビュー r1〜r3 の REJECT と統括の「組み合わせを減らす」指示を反映、§3.1)。担当: 設計・検収 = ClaudeCode Opus 5.5、
 実装 = Codex GPT-6.1 Sol / high、独立レビュー = GPT-6.1 Sol / xhigh。
 
 ## 1. 問題
@@ -64,11 +64,30 @@ metadata を読む。利用者の perf ログでは `nav/lf_scan` (`pre_scanned=
 | A. ツリーと同じ `FolderPaneOpenPending` で走査し、完了を通常 nav 裁定へ戻して `pre_scan` 付きで consumer に再入する | **採用**。走査・置き換え・取消・stale 判定・完了の裁定・`pre_scan` 付きの読込は、ツリーのクリックが通る既存経路。直接移動側は「拒否判定と所有権の受理を今の同期経路のまま済ませ、走査の代わりに要求を出す」だけにする (§4.2)。採用時の読込は今の `pre_scan = Some` 分岐 (ツリー完了・DFS と同じ) で、install の挙動差を作らない |
 | B. ZIP の直接移動・履歴の戻る/進むと同じ `PhysicalHistoryTransition` (`Preflighting` → `Folder(ScannedDir)`) へ入れる | **不採用**。採用が `commit_physical_history_transition` / `prepare_physical_listing` の別の install 経路になり、今の直接移動のフォルダ読込 (検索 origin、smart 対象、book append、rating 行き先など) と挙動を照合し直す範囲が広い。[file-type-visibility-plan.md](file-type-visibility-plan.md) §9.2 の表は親の読込をこの経路へ寄せる方針を書いているが、現状は未実施で、本件では広げない |
 | C. `load_folder_with_scan_claimed_with_search_origin` の同期走査を全呼び出し元で worker 化する | **不採用 (今回)**。`load_folder` 等の多数の同期呼び出し元が読込直後の状態に依存している可能性があり、範囲が大きい。§7 の後続候補 |
-| D. 走査中はモーダルにする | **不採用**。走査中の別移動は「新しい入力が古い走査を取り消す」既存の規則で扱える (§4.4)。操作を止める理由がない |
+| D. 走査中は全体をモーダルにする | **不採用**。移動の入力 (お気に入り・アドレス欄・ツリー・履歴等) まで止める理由はない。後勝ちで扱える (§4.4)。採るなら利用者への相談が要る |
+
+### 3.1 割り込みの組み合わせを減らす (設計レビュー r1〜r3 と統括指示、2026-11-18)
+
+r1〜r3 のレビューでは、毎回「走査中に旧一覧で別の操作をする」組み合わせの指摘が出た
+(一覧のフォルダを開く、同じフレームの入力、画像・動画を開く、ZIP/PDF の構成確認待ちを経た open、
+保存済みの本を開く、DFS)。入口ごとに取消を足す形では、レビューのたびに次の入口が見つかる
+(CLAUDE.md「設計の簡素化」の EPUB 変換と履歴の経緯と同じ形)。組み合わせ自体を減らす形を比べた。
+
+| 形 | 判断 |
+| --- | --- |
+| (1) 移動の要求の持ち主を 1 か所にまとめ、どの入口からでも後勝ちにする。DFS と同じ経路・同じ世代番号に乗せる | **一部採用**。移動の要求どうしは、既存の一か所の退役 `retire_replaced_main_list_requests` と通常 nav 裁定 (§4.4) で後勝ちになる。DFS (`folder_nav_pending`) は独自の累積・モード・fs nav lock・bundle 所有を持つため、pane pending と保存場所を統合する改修は本件では行わない。代わりに、DFS の受付と直接移動の受付が互いの pending を退役させる 2 点だけを足す |
+| (1') 全ての main 要求の `MainListNavigation` に受付順の番号を入れ、`main_list_navigation_is_current` で「新しい受付があれば失効」とする | **不採用**。捕捉は 48 か所・照合は 42 か所あり、続きの処理での取り直しが自分の要求を失効させる危険がある。一覧の画像を開く操作や構成確認待ちは navigation を捕捉しないので、入口の列挙も残る。全非同期要求に効く広い改修で、本件の範囲を超える |
+| (2) 既存のフォルダ移動 (pre_scanned の経路) に直接移動を合流させる | **採用** (案 A そのもの)。完了は既存の `pre_scan = Some` の読込へ戻る |
+| (3) 走査待ちの間は、旧一覧の項目への入力を受け付けない | **採用**。既存の単一の判定 `grid_item_input_allowed()` (キー・ポインタ・タッチ・リング・ゲームパッド・メニューの全一覧入力が通る) は、履歴の戻る/進む・レーティング移動の待ち中に既に項目入力を止めている (`location_navigation_pending`)。直接移動の走査待ちをこの判定に加えるだけで、旧一覧での割り込みの組み合わせがまとめて消える。従来は走査中に UI 全体が止まっていたので、項目入力だけを止めるのは通常の使い方の退行ではない。移動の入力は止めない |
+| (3') ツリーの走査待ちにも (3) を適用する | **今回は不採用**。ツリーはリリース済みの挙動で、走査中も旧一覧を操作できる。変えるなら相談する。後続候補 (§7) |
+
+採った形のまとめ: **旧一覧の項目入力は止め、移動の入力は後勝ちにする。** 個別に残る受付点は、DFS の開始、
+直接移動の受付での DFS の退役、保存済みの本の受付の 3 つだけ (§4.4)。
 
 待ち時間中の見え方: 走査が終わるまで今の一覧を表示し続け、完了したフレームで新しい一覧に替わる。
-従来は UI が走査時間だけ止まってから替わっていた。ツリーのクリック・検索中のお気に入り・履歴の戻る/進むと
-同じ見え方である。走査中も今の一覧を操作できるので、その間の新しい入力は必ず古い走査に勝たせる (§4.4)。
+従来は UI が走査時間だけ止まってから替わっていた。走査中は旧一覧の項目入力を受け付けない (スクロール等の
+項目以外の操作と、移動の入力は受け付ける)。走査が 500 ms を超えたら、履歴の戻る/進むと同じ
+「移動先を読み込み中…」の表示を出す。短い走査では出さない (毎回一瞬出るとちらつきになるため)。
 
 ## 4. 設計
 
@@ -160,21 +179,34 @@ enum DirectoryScanRoute { UiThread, Worker }
 - 採用時の読込は今の `pre_scan = Some` 分岐で、snapshot scope・pdf refusal・smart 対象・claim (owner の現在性の
   再検証を含む)・install はツリー完了と同じ。
 
-### 4.4 置き換え・取消: 新しい入力は古い走査に必ず勝つ
+### 4.4 走査待ちの間の入力: 旧一覧の項目入力は止め、移動の入力は後勝ち
 
-| 状況 | 結果 | 仕組み |
-| --- | --- | --- |
-| 走査中に別の直接移動・ツリーのクリック・検索中の場所ジャンプ | 最後の操作が勝つ | 新しい要求の受付が旧 pending を cancel (既存) |
-| 走査中に高優先の nav (お気に入り・キー・DFS 結果・アドレス欄・コンテキスト) | 同上 | `higher_priority_than_folder_pane` で cancel (既存) |
-| **走査中に一覧のフォルダを開く (`grid_nav`)、完了と同じフレームを含む** | 同上 | **変更**: `grid_nav.is_some()` のフレームでも pane pending を cancel し、ready を poll しない。完了は入力ではないので、同じフレームの入力に負ける。ツリーの走査にも同じ規則が効く |
-| **走査中に一覧の画像・動画を開く (`open_fullscreen` を直接呼び、`grid_nav` を返さない)** | 同上 | **変更**: 明示の leaf open の受理境界 (`app.rs` 72200 付近、今は `RequiredFullscreenTarget` だけを取り消す) で、main context なら `PaneNavigation` / `DirectNavigation` の pending も取り消す。通常の main 表示では source 証明が変わらず stale 判定に掛からないため、受理時に退役させる |
-| **走査中に DFS (Ctrl+↑↓ 等) を開始** | 同上 | **変更**: `start_folder_nav` が受理したとき、main の利用者 nav 用の pane pending (`PaneNavigation` / `DirectNavigation`) を `cancel_folder_pane_open` で cancel する。`cancel_pending_folder_nav()` は新しい DFS 用の lock・holdover まで消すので流用しない。detached 用の purpose・`RequiredFullscreenTarget` (既存の supersede 経路がある)・`CurrentViewOrderRefresh` 等には触れない |
-| **DFS 実行中に直接移動** | 直接移動が勝つ | §4.2 の 3 で受付時に DFS を取り消す |
-| 走査中に保存済みの本・コレクションを開く (`saved_group_open_source_if_allowed`) | **変更**: 保存済みの本を開く操作が勝つ | 現在は `saved_group_other_main_nav_pending()` が pane pending を理由に「別の場所を開く処理が進行中です」で拒否する。従来の同期直接移動では起きなかった拒否なので、**受付 (`saved_group_open_source_if_allowed`) だけ**で、拒否判定の前に `PaneNavigation` / `DirectNavigation` の pending を取り消す。共通 helper `saved_group_other_main_nav_pending()` は変えない (既存 saved-group の poll・ready・失効判定が後発の pane scan に道を譲る契約、`ready_book_yields_candidate_to_later_pending_main_navigation` を保つ)。他の pending は従来どおり拒否 |
-| 走査中に別経路の main 要求 (履歴の戻る/進む、コレクション、レーティング、Quick Folder 切替等) が受理 | 同上 | `retire_replaced_main_list_requests` が `cancel_folder_pane_open` (既存)。Quick Folder A→B→A、Remote 取得も既存の取消経路で消えることをテストで確かめる |
-| 走査中に表示中の一覧が別の採用で変わる | 古い走査は採用しない | `main_list_navigation_is_current` が偽になり poll で cancel (既存) |
-| sidecar 復元中に完了 | 復元終了後に裁定 | poll が保留 (既存) |
-| worker の異常終了 | pending を破棄、予約も捨てる | 既存の `Disconnected` 処理 |
+**規則 1 (旧一覧の項目入力)**: main に `DirectNavigation` の pending があるあいだ、`grid_item_input_allowed()` は
+偽を返す。判定は既存の `location_navigation_pending()` と並ぶ一つの述語 (例: `direct_navigation_scan_pending()`) に置き、
+`grid_item_input_allowed()` から呼ぶ。これで一覧のフォルダを開く (`grid_nav`)・画像/動画を開く・構成確認待ちを経た
+open・コンテキストメニュー・スタック・ゲームパッドの項目操作など、項目入力の全入口がまとめて止まる
+(`grid_nav` も出なくなるので、完了と同じフレームの `grid_nav` という組み合わせも生じない)。
+`location_navigation_pending()` 自体には加えない (待機表示と `book_structural_op` の判定まで変わるため)。
+待機表示は §4.6。
+
+**規則 2 (移動の入力は後勝ち)**: 移動の入力は止めず、新しい要求が走査待ちを退役させる。
+
+| 新しい入力 | 仕組み |
+| --- | --- |
+| 別の直接移動・ツリーのクリック・検索中の場所ジャンプ | 新しい要求の受付が旧 pending を cancel (既存) |
+| お気に入り・キー/ゲームパッド/リングの nav・DFS 結果・アドレス欄・コンテキストの nav | 通常 nav 裁定の `higher_priority_than_folder_pane` で cancel (既存) |
+| 履歴の戻る/進む、コレクション、レーティング、Quick Folder 切替、Remote 取得等の main 要求 | `retire_replaced_main_list_requests` が `cancel_folder_pane_open` (既存) |
+| **DFS (Ctrl+↑↓ 等) の開始** | **追加 (受付点 1)**: `start_folder_nav` が新しい DFS を受理したとき (既存 DFS への累積は除く)、main の `DirectNavigation` / `PaneNavigation` の pending を `cancel_folder_pane_open` で cancel する。`cancel_pending_folder_nav()` は新しい DFS 用の lock・holdover まで消すので流用しない。detached 用の purpose・`RequiredFullscreenTarget`・`CurrentViewOrderRefresh` 等には触れない |
+| **直接移動の受付 (DFS 実行中)** | **追加 (受付点 2)**: §4.2 の 3 |
+| **保存済みの本・コレクションを開く** | **変更 (受付点 3)**: 現在は `saved_group_other_main_nav_pending()` が pane pending を理由に「別の場所を開く処理が進行中です」で拒否する。受付 (`saved_group_open_source_if_allowed`) で、本棚更新中・行き先の未登録など**既知の拒否判定をすべて通した後**に、置換できる走査 (`DirectNavigation` / `PaneNavigation`) だけを例外として取り消して進める。拒否された操作は走査待ちを壊さない。共通 helper `saved_group_other_main_nav_pending()` は変えない (既存 saved-group が後発の pane scan に道を譲る契約 `ready_book_yields_candidate_to_later_pending_main_navigation` を保つ) |
+
+**規則 3 (既存の失効)**:
+
+| 状況 | 仕組み |
+| --- | --- |
+| 走査中に表示中の一覧が別の採用で変わる | `main_list_navigation_is_current` が偽になり poll で cancel (既存) |
+| sidecar 復元中に完了 | poll が保留 (既存) |
+| worker の異常終了 | 既存の `Disconnected` 処理。予約も捨てる |
 
 まれな失敗 (走査中の I/O エラー) は既存どおりログ + 通知で割り切る。再試行は足さない。
 
@@ -186,6 +218,13 @@ enum DirectoryScanRoute { UiThread, Worker }
 - 採用時の `nav/lf_scan` は `pre_scanned=true` になり、UI 側の `ms` は走査を含まない。
 - `scripts/analyze_perf.py` の nav 内訳に `folder_open_scan` を足す。
 
+### 4.6 待機表示
+
+- 直接移動の走査待ちが 500 ms を超えたら、既存の `render_location_navigation_wait_overlay`
+  (「移動先を読み込み中…」) を同じ見た目で出す。500 ms 未満では出さない。開始時刻は pending に持たせ、
+  猶予の判定と再描画の予約は既存の待機表示の描画に寄せる (別の表示を作らない)。
+- 猶予の定数は本件専用に置く (sidecar 復元の猶予とは意味が違うので共有しない)。
+
 ## 5. 不変条件とテスト
 
 1. 対象の直接移動 (お気に入り・アドレス Enter・最近開いたフォルダ・一覧のフォルダ・親へ・コレクション物理元) は、
@@ -194,20 +233,24 @@ enum DirectoryScanRoute { UiThread, Worker }
 2. worker 完了後の poll + 裁定で、従来の同期経路と同じ一覧・選択・履歴 (Direct の push 1 回)・address が採用される。
 3. 拒否: snapshot 範囲外・file-type visibility の拒否は受付時に起き、既存の owner (startup open、履歴遷移、rating、
    collection 等) を壊さない。
-4. 置き換え (§4.4 の各行): 直接移動 A → B、直接移動 ↔ ツリー、直接移動 → 履歴の戻る、直接移動 → キー nav、
+4. 規則 1: 直接移動の走査待ちのあいだ `grid_item_input_allowed()` が偽で、一覧のフォルダを開く・画像を開く
+   (ZIP/PDF の構成確認待ちを経る open を含む) 操作が何も起こさない。走査が終われば項目入力が戻る。
+   ツリーの走査待ち (`PaneNavigation`) では従来どおり項目入力を受け付ける。
+5. 規則 2 の置き換え: 直接移動 A → B、直接移動 ↔ ツリー、直接移動 → 履歴の戻る、直接移動 → キー nav、
    DFS → 直接移動 (旧 DFS の結果を採用しない)、直接移動 → DFS (完了した直接移動が新しい DFS を消さない)、
-   完了と `grid_nav` の同じフレーム、完了と一覧の画像を開く操作の同じフレーム、saved-group open
-   (受付で取り消す) と saved-group → 後発の pane scan (既存契約のまま saved-group が譲る)、Quick Folder A→B→A、
-   Remote 取得。最後の要求だけが採用される。DFS の退役で fs nav lock・holdover が残らないこと
+   saved-group open (既知の拒否を通った後に取り消す)、saved-group の受付拒否 (走査待ちは保たれる)、
+   saved-group → 後発の pane scan (既存契約のまま saved-group が譲る)、Quick Folder A→B→A、Remote 取得。
+   最後の要求だけが採用される。DFS の退役で fs nav lock・holdover が残らないこと
    (結果取り出し後・同じフレームの境界を含む) も確かめる。
-5. stale: 走査中に別の採用で一覧が変わったら、完了しても採用しない。
-6. 全画面予約: 自動全画面付きの一覧フォルダ A → A を取消 → お気に入り B で、B は全画面にならない。A がそのまま
+6. 待機表示: 500 ms 未満の走査では「移動先を読み込み中…」を描かず、500 ms を超えたら描く。
+7. stale: 走査中に別の採用で一覧が変わったら、完了しても採用しない。
+8. 全画面予約: 自動全画面付きの一覧フォルダ A → A を取消 → お気に入り B で、B は全画面にならない。A がそのまま
    完了したときは従来どおり全画面になる。完了後の採用が拒否された場合 (文書モーダル中など) も予約が残らない。
-7. 対象外の型 (ZIP/PDF、`.epub`/変換書庫、main 以外の context) は従来の経路のまま。
-8. `CollectionGridPhysical` owner と非 ExplicitList の restore_intent が完了時に保たれる。
-9. 走査失敗で一覧を変えず、通知とログを出す。
-10. test-script の要求数が受付時 1 回のまま (取消された受理済み要求も数える)。
-11. 既存テストのうち、`pre_scan = None` の直接移動の直後に同期採用を前提にしていたものは、worker 完了 + 裁定を
+9. 対象外の型 (ZIP/PDF、`.epub`/変換書庫、main 以外の context) は従来の経路のまま。
+10. `CollectionGridPhysical` owner と非 ExplicitList の restore_intent が完了時に保たれる。
+11. 走査失敗で一覧を変えず、通知とログを出す。
+12. test-script の要求数が受付時 1 回のまま (取消された受理済み要求も数える)。
+13. 既存テストのうち、`pre_scan = None` の直接移動の直後に同期採用を前提にしていたものは、worker 完了 + 裁定を
     回す helper を通す形に直す (挙動の期待値は変えない)。期待値を変える必要が出たら止めて報告する。
 
 ## 6. 文書の更新
@@ -224,3 +267,6 @@ enum DirectoryScanRoute { UiThread, Worker }
 - `dispatch_main_input_nav_immediate` の `Direct` / `CollectionSource` (全画面を閉じる即時経路) の同期走査。
 - `load_folder` / `load_folder_with_scan(path, None)` の同期呼び出し元。
 - main 以外の context の直接移動 (detached はリワーク側で扱う)。
+- ツリーの走査待ち・DFS 実行中の旧一覧の項目入力にも規則 1 を適用するか (リリース済みの挙動の変更なので相談)。
+  現在はツリー・DFS の走査待ち中に旧一覧を操作でき、r1〜r3 で挙がった割り込み (同じフレームの入力、画像を開く等)
+  がそのまま起こり得る。
