@@ -34033,6 +34033,77 @@ mod grid_reclick_open_tests {
     }
 
     #[test]
+    fn section1804_stack_pending_background_click_keeps_explicit_deselection() {
+        use crate::app::{OpenRequestOwner, StartupListIntent};
+        use crate::filename_stack_ui::StackSelectionTarget;
+
+        for restore in [false, true] {
+            let mut harness =
+                handler_harness(GridClickSelectionMode::Explorer, false, None, false, false);
+            let folder = {
+                let app = &mut harness.state_mut().app;
+                app.active_quick_folder_slot = None;
+                app.settings.restore_folder_cursor_on_revisit = restore;
+                app.settings.auto_fullscreen_image_folders = false;
+                app.settings.stack_script_enabled = false;
+                app.settings.stack_separator = '_';
+                app.settings.sort_order = crate::settings::SortOrder::FileName;
+                app.settings.facet_filter.exts.insert("png".into());
+                let folder = app.tmp.path().join("stack-background-clear");
+                std::fs::create_dir(&folder).unwrap();
+                for name in ["a_1.jpg", "a_2.jpg", "b_1.png", "c_1.png"] {
+                    image::RgbImage::new(1, 1).save(folder.join(name)).unwrap();
+                }
+                for stacked in [false, true] {
+                    app.stack_mode_requested = stacked;
+                    assert!(app.load_folder_with_scan_owned(
+                        folder.clone(),
+                        None,
+                        OpenRequestOwner::Navigation,
+                        StartupListIntent::ExplicitList,
+                    ));
+                    app.finish_page_identity_preparation_for_test();
+                    if !stacked {
+                        app.move_grid_cursor(Some(3), crate::app::GridCursorIntent::Automatic);
+                        app.grid_scroll.set_position(175.0);
+                    }
+                }
+                assert!(app.stack_script_pending.is_some());
+                assert!(app.stack_view.is_none());
+                assert_eq!(app.folder_history[&folder], (175.0, Some(3)));
+                assert_eq!(app.selected, Some(if restore { 3 } else { 2 }));
+                let selected = app.selected.unwrap();
+                app.checked.insert(selected);
+                folder
+            };
+
+            // Drive the actual Explorer background handler with headless pointer events.
+            // The harness deliberately does not poll grouping while the click is handled.
+            click_at(&mut harness, egui::pos2(440.0, 170.0));
+            let app = &mut harness.state_mut().app;
+            assert_eq!(app.selected, None);
+            assert!(app.checked.is_empty());
+            assert_eq!(
+                app.stack_selection_target,
+                Some(StackSelectionTarget::Clear)
+            );
+            app.grid_scroll.set_position(250.0);
+            let ctx = egui::Context::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app.stack_script_pending.is_some() || app.sidecar_restore_active() {
+                assert!(std::time::Instant::now() < deadline, "stack did not settle");
+                app.poll_stack_script(&ctx);
+                app.finish_page_identity_preparation_for_test();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(app.stack_view.is_some());
+            assert_eq!(app.selected, None, "restore={restore}");
+            assert_eq!(app.grid_scroll.offset(), if restore { 250.0 } else { 0.0 });
+            assert_eq!(app.folder_history[&folder], (175.0, Some(3)));
+        }
+    }
+
+    #[test]
     fn background_gesture_left_cancel_does_not_clear_grid_selection() {
         let mut harness = handler_harness(
             GridClickSelectionMode::Explorer,

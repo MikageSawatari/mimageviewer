@@ -1126,7 +1126,8 @@ pub(super) enum MainListAfterHydration {
         viewer_adoption: ViewerOpenAdoption,
     },
     StackSelection {
-        select: usize,
+        select: Option<crate::filename_stack_ui::StackSelection>,
+        scroll_offset: Option<f32>,
     },
     JumpSelection(crate::ui_dialogs::context_menu::JumpToFolderSelection),
     CollectionNavigation {
@@ -43641,7 +43642,7 @@ impl App {
         existing_keys: std::collections::HashSet<String>,
         folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
         pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
-        select: Option<usize>,
+        select: Option<crate::filename_stack_ui::StackSelection>,
         hydration_intent: StartupListIntent,
     ) {
         let crate::filename_stack_ui::StackPreparedItems {
@@ -43660,16 +43661,24 @@ impl App {
                 return;
             }
         };
-        if matches!(recipe, book_materialization::ProjectionRecipe::OrdinaryList)
-            && hydration_intent.enters_folder_list()
-        {
-            // These provisional rows continue the same entry, so consume their departure
-            // boundary without saving folder/session positions. Restore from the record
-            // preceding this entry, not its automatic provisional index. Installation bumps
-            // the generation, leaving real departures from the aggregate writable as usual.
-            // Refresh/InternalInstall and extracted subfolder stacks keep their existing save.
-            self.top_level_grid_view.departed_items_generation = Some(self.items_generation);
-        }
+        let scroll_offset =
+            if matches!(recipe, book_materialization::ProjectionRecipe::OrdinaryList)
+                && hydration_intent.enters_folder_list()
+            {
+                // These provisional rows continue the same entry, so consume their departure
+                // boundary without saving folder/session positions. Restore from the record
+                // preceding this entry, not its automatic provisional index. Installation bumps
+                // the generation, leaving real departures from the aggregate writable as usual.
+                // Refresh/InternalInstall and extracted subfolder stacks keep their existing save.
+                self.top_level_grid_view.departed_items_generation = Some(self.items_generation);
+                // Keep the live viewport independently of automatic cursor restoration. This is
+                // the same scroll value the departing-record path preserved before §1.804.
+                self.settings
+                    .restore_folder_cursor_on_revisit
+                    .then(|| self.grid_scroll.offset())
+            } else {
+                None
+            };
         let mut hydration = self.install_loading_items_inner(
             source_path,
             items,
@@ -43688,8 +43697,11 @@ impl App {
         );
         if let Some((continuation, _)) = hydration.as_mut() {
             continuation.restore_intent = hydration_intent;
-            continuation.navigation_after_hydration =
-                select.map(|select| MainListAfterHydration::StackSelection { select });
+            continuation.navigation_after_hydration = (select.is_some() || scroll_offset.is_some())
+                .then_some(MainListAfterHydration::StackSelection {
+                    select,
+                    scroll_offset,
+                });
         }
         self.hydrate_installed_main_list(hydration);
     }
@@ -45417,8 +45429,23 @@ impl App {
                 }
                 let _ = completed.send(());
             }
-            MainListAfterHydration::StackSelection { select } => {
-                self.select_item_after_load(select);
+            MainListAfterHydration::StackSelection {
+                select,
+                scroll_offset,
+            } => {
+                if let Some(select) = select {
+                    match select {
+                        crate::filename_stack_ui::StackSelection::Select(index) => {
+                            self.select_item_after_load(index);
+                        }
+                        crate::filename_stack_ui::StackSelection::Clear => {
+                            self.move_grid_cursor(None, GridCursorIntent::Automatic);
+                        }
+                    }
+                }
+                if let Some(scroll_offset) = scroll_offset {
+                    self.grid_scroll.set_position(scroll_offset);
+                }
             }
             MainListAfterHydration::DirectMedia {
                 prepared,

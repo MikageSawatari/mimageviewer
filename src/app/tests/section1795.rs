@@ -221,7 +221,7 @@ fn section1795_on_stack_entry_without_history_selects_final_visible_first() {
     env.grid_scroll.set_position(125.0);
     finish_stack_entry(&mut env);
     assert!(!env.folder_history.contains_key(&folder));
-    assert_position(&env, Some(1), 0.0);
+    assert_position(&env, Some(1), 125.0);
     assert_eq!(env.items[env.selected.unwrap()].name(), "b_1.png");
 }
 
@@ -239,7 +239,7 @@ fn section1804_stack_reentry_restores_aggregate_history_before_provisional_redir
     env.grid_scroll.set_position(250.0);
     finish_stack_entry(&mut env);
     assert_eq!(env.folder_history[&folder], (175.0, Some(1)));
-    assert_position(&env, Some(1), 175.0);
+    assert_position(&env, Some(1), 250.0);
     assert_eq!(env.items[env.selected.unwrap()].name(), "b_1.png");
 
     // Only provisional departure was consumed; the installed generation still saves
@@ -253,6 +253,26 @@ fn section1804_stack_reentry_restores_aggregate_history_before_provisional_redir
 }
 
 #[test]
+fn section1804_stack_pending_scroll_preserves_on_viewport_without_changing_off_policy() {
+    for restore in [false, true] {
+        let (mut env, folder) = stack_entry_fixture(restore);
+        let history = env.folder_history[&folder];
+        assert!(env.stack_selection_target.is_none());
+        env.grid_scroll.set_position(250.0);
+        finish_stack_entry(&mut env);
+        assert_eq!(env.folder_history[&folder], history);
+        assert_position(
+            &env,
+            Some(if restore { 2 } else { 1 }),
+            if restore { 250.0 } else { 0.0 },
+        );
+        if restore {
+            assert!(env.grid_scroll.reveal_requested());
+        }
+    }
+}
+
+#[test]
 fn section1804_stack_reentry_keeps_existing_unstacked_history_index_semantics() {
     let (mut env, folder) = stack_entry_fixture(true);
     // The fixture's previous visit was unstacked: index 2 named b_1.png. History
@@ -261,7 +281,7 @@ fn section1804_stack_reentry_keeps_existing_unstacked_history_index_semantics() 
     env.grid_scroll.set_position(125.0);
     finish_stack_entry(&mut env);
     assert_eq!(env.folder_history[&folder], (420.0, Some(2)));
-    assert_position(&env, Some(2), 420.0);
+    assert_position(&env, Some(2), 125.0);
     assert_eq!(env.items[env.selected.unwrap()].name(), "c_1.png");
 }
 
