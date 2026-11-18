@@ -39,6 +39,13 @@
 
 ## 1. 優先候補
 
+### 1.814 全件テスト (test-full) で負荷や実機のキー状態により不安定になるテスト — v5.4.0 向けの取り込み後の全件から (2026-11-18)
+
+- 状態: **未着手**。製品のコードではなく、テストの作りの問題。いずれも単独で流し直すと通る (統括が確認)。
+- (a) 実機の Ctrl を読むテスト: `src/ui_fullscreen/compare_original_tests.rs` の 186・283・638・695 行が、キーを放したことを `clear_test_synthetic_input()` (偽の入力の消去) で表している。消した後の判定 `physical_key_down_from` (`src/key_input.rs`) は `GetAsyncKeyState(VK_CONTROL)` で PC の実際のキーを読むので、その瞬間に Ctrl が押されていると落ちる (5093a7d70 の取り込み後の全件で 186 行の 1 件が失敗、単独では成功。判断は子セッション perf-801-776 のコード読み)。直し方: 消さずに `SyntheticKeyCommand::up` + `advance_test_synthetic_input` で放し、偽の入力が有効なまま判定する (`src/keymap.rs` の既存テストと同じ形)。消去は最後の後片付けだけにする。`up` で一緒に押した Ctrl も放されるかを実装時に確かめる。待ち時間は足さない。
+- (b) 上限に近い遅いテスト: `app::search_nav_entry_inventory_tests::search_nav_inventory_{container,everything,metadata,tag}_all_independent_key_inputs` の 4 件が、本体 lib 全件で 203〜210 秒、単独で 60〜87 秒かかり、test-full の負荷で 300 秒の上限を超えた (5093a7d70 の取り込み後)。テストを分けるか、走査の費用を減らすかを検討する。上限を延ばすだけにはしない。
+- (c) 負荷で DB の書き込み待ちが 5 秒を超えるテスト: `folder_thumb_pins::tests::concurrent_refresh_opens_preserve_pin_rows_and_store_revision` が test-full の中で `database is locked` (busy_timeout 超過) で失敗した (822f96595 の取り込み後)。単独の 10 回連続では全部成功。テストのスレッド数・待ちの前提が負荷に耐えるかを見直す。
+
 ### 1.811 操作カスタマイズのコマンド一覧で、描き直すたびに割り当て表・競合・全行の配置と説明文を作り直して 1 フレーム約 75 ms かかる — §1.808 のサブ PC 確認から (2026-11-18)
 
 - 状態: **未着手・収録版未定**。
@@ -138,7 +145,7 @@
 
 ### 1.805 お気に入り・アドレス欄・最近開いたフォルダから直接移動すると、フォルダの読み込み (scan_directory_with_settings) を UI スレッドで同期実行して最大約 0.59 秒止まる — お気に入り切り替えのちらつき調査から (2026-11-18)
 
-- 状態: **実装済み (r10)・レビュー待ち** (2026-11-18)。利用者決定で対象入口を当初の範囲へ戻し、拒否された後続もツリーと同じ取消規則にそろえた。master 未 merge。ブランチ `fix-direct-nav-worker-scan` (作業ツリー `G:\home\mimageviewer-direct-nav-scan`)。設計書: [direct-navigation-worker-scan-plan.md](direct-navigation-worker-scan-plan.md)。
+- 状態: **master 入り (2026-11-18、822f96595)・利用者の実機で確認済み (2026-11-18、利用者申告: 移動中に固まらない・お気に入りのちらつきも直っていそう)**。以前の状態: **実装済み (r10)・レビュー待ち** (2026-11-18)。利用者決定で対象入口を当初の範囲へ戻し、拒否された後続もツリーと同じ取消規則にそろえた。master 未 merge。ブランチ `fix-direct-nav-worker-scan` (作業ツリー `G:\home\mimageviewer-direct-nav-scan`)。設計書: [direct-navigation-worker-scan-plan.md](direct-navigation-worker-scan-plan.md)。
 - 観測 (利用者の perf ログ、起点セッションの調査): お気に入り等からの移動で `nav/lf_scan` (`pre_scanned=false`) が最大約 590 ms。
 - 原因 (コード): `open_direct_navigation_target_classified` が `pre_scan` 無しのとき、`load_folder_with_scan_claimed_with_search_origin` の `scan_directory_with_settings` を UI スレッドで実行する。本件でworker化するのはお気に入り・アドレス欄 Enter (検索外)・最近開いたフォルダのメニューだけ。フォルダツリー・DFS・履歴の戻る/進む・検索中のお気に入りは worker 走査済み。
 - 方針: ツリーと同じ `FolderPaneOpenPending` にフィールドなしの `FolderOpenScanPurpose::DirectNavigation` を足し、完了したら ExplicitList・Navigation owner の `pre_scan` 付きで同じ consumer へ戻す。全画面予約の移送・消去と走査済みパスの再分類省略は行わない。通常nav裁定は拒否された後続でも取消し、裁定外の受理済み後続はclaim成功時 (owner_contextがmain) と共通退役 (retained == Paneも含む) で退役。DFS新規受付・saved-group受付で取消すのはDirectNavigationだけ。Esc・スタック切替キーを止めるのも直接移動専用の停止理由だけとする。
