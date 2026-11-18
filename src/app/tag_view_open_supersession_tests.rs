@@ -213,6 +213,14 @@ fn assert_destination(app: &App, route: GridRoute, a: &Path, destination: &Path,
     }
 }
 
+fn assert_grid_worker_owned(app: &App, cancel: &Arc<AtomicBool>, source: &Path) {
+    let pending = app.folder_nav_pending.as_ref().expect("old Grid worker");
+    assert!(Arc::ptr_eq(&pending.cancel, cancel));
+    assert!(!cancel.load(Ordering::Relaxed));
+    assert_eq!(app.pending_folder_nav_steps, 0);
+    assert_eq!(app.effective_folder().as_deref(), Some(source));
+}
+
 #[test]
 fn tag_view_open_supersession_tag_refuses_older_ordinary_zip_preflight() {
     let mut app = setup_app();
@@ -464,6 +472,208 @@ fn tag_view_open_supersession_tag_accepts_and_retires_direct_navigation_scan() {
     adopt_grid(&mut app, &ctx, result);
     settle(&mut app, &ctx);
     assert_destination(&app, GridRoute::TagListOrder, &a, &b, false);
+}
+
+#[test]
+fn tag_view_open_supersession_owned_classified_files_retire_after_classification_zip_pdf_on_admission()
+ {
+    for route in [GridRoute::TagListOrder, GridRoute::PhysicalDfs] {
+        for extension in ["zip", "epub", "pdf", "7z"] {
+            let mut app = setup_app();
+            let root = app.tmp.path().to_owned();
+            let (a, b, _) = fixture(&mut app, &root, route, false);
+            let destination = root.join(format!("explicit.{extension}"));
+            if extension == "zip" {
+                write_zip(&destination);
+            } else {
+                std::fs::write(&destination, b"unconverted or unparsed document").unwrap();
+            }
+            app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ask;
+            app.settings
+                .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ask);
+            let ctx = egui::Context::default();
+            start_grid(&mut app, &ctx, &a, route);
+            let result = receive_grid(&mut app, &b);
+            let pending = app.folder_nav_pending.as_mut().unwrap();
+            let cancel = pending.cancel.clone();
+            let (sender, receiver) = mpsc::channel();
+            pending.rx = receiver;
+            // The real old worker has completed, but its receiver has not been polled.
+            assert!(sender.send(result).is_ok());
+            let rows = app.items.clone();
+            let stack = app.tag_view.nav_stack.clone();
+            let outcome = app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                destination.clone(),
+                false,
+                OpenRequestOwner::Navigation,
+                StartupListIntent::ExplicitList,
+            );
+            if matches!(extension, "epub" | "7z") {
+                assert!(matches!(outcome, FolderOpenOutcome::Classifying));
+                assert!(app.top_level_grid_view.open_path_classification().is_some());
+                assert_grid_worker_owned(&app, &cancel, &a);
+                assert_eq!(app.items, rows);
+                assert_eq!(app.tag_view.nav_stack, stack);
+                assert!(
+                    sender
+                        .send(FolderNavThreadResult {
+                            target: None,
+                            hit_image_folder: false,
+                        })
+                        .is_ok()
+                );
+                app.settle_open_path_classification_for_test();
+            } else {
+                // ZIP/PDF do not enter suffix classification; their explicit admission
+                // must continue to retire the old request immediately.
+                assert!(matches!(outcome, FolderOpenOutcome::Loaded));
+                assert!(app.top_level_grid_view.open_path_classification().is_none());
+            }
+            assert!(cancel.load(Ordering::Relaxed), "{route:?}, {extension}");
+            assert!(app.folder_nav_pending.is_none());
+            assert_eq!(app.pending_folder_nav_steps, 0);
+            assert!(
+                sender
+                    .send(FolderNavThreadResult {
+                        target: None,
+                        hit_image_folder: false,
+                    })
+                    .is_err(),
+                "old Grid receiver survived: {route:?}, {extension}"
+            );
+            assert!(app.poll_folder_nav().is_none());
+            if extension == "pdf" {
+                // Keep native enumeration unpolled: only admission ownership is under test.
+                assert_eq!(
+                    app.pdf_enumerate_pending.as_ref().map(|pending| &pending.0),
+                    Some(&destination),
+                );
+            } else {
+                let Some(HistoryNavigationTransition::Physical(request)) =
+                    app.top_level_grid_view.history_navigation_transition_mut()
+                else {
+                    panic!("accepted {extension} must retain its physical owner");
+                };
+                assert_eq!(request.path, destination);
+                assert!(request.dfs_continuation.is_none());
+                let PhysicalHistoryPhase::Preflighting { preflight, .. } = &mut request.phase
+                else {
+                    panic!("accepted {extension} must await preflight");
+                };
+                let (controlled, new_sender) = PhysicalHistoryPreflight::controlled_for_test();
+                *preflight = controlled;
+                assert!(new_sender.send(Err("held before adoption".into())).is_ok());
+            }
+        }
+    }
+}
+
+#[test]
+fn tag_view_open_supersession_owned_ignored_classification_keeps_grid_worker_and_result() {
+    for route in [GridRoute::TagListOrder, GridRoute::PhysicalDfs] {
+        for extension in ["epub", "7z"] {
+            let mut app = setup_app();
+            let root = app.tmp.path().to_owned();
+            let (a, b, _) = fixture(&mut app, &root, route, false);
+            let destination = root.join(format!("ignored.{extension}"));
+            std::fs::write(&destination, b"ignored source").unwrap();
+            app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+            app.settings
+                .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+            let ctx = egui::Context::default();
+            start_grid(&mut app, &ctx, &a, route);
+            let result = receive_grid(&mut app, &b);
+            let pending = app.folder_nav_pending.as_mut().unwrap();
+            let cancel = pending.cancel.clone();
+            let (sender, receiver) = mpsc::channel();
+            pending.rx = receiver;
+            let rows = app.items.clone();
+            let stack = app.tag_view.nav_stack.clone();
+            assert!(matches!(
+                app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                    destination,
+                    false,
+                    OpenRequestOwner::Navigation,
+                    StartupListIntent::ExplicitList,
+                ),
+                FolderOpenOutcome::Classifying
+            ));
+            assert!(app.top_level_grid_view.open_path_classification().is_some());
+            assert_grid_worker_owned(&app, &cancel, &a);
+            assert!(
+                sender.send(result).is_ok(),
+                "classification retired old receiver"
+            );
+            app.settle_open_path_classification_for_test();
+            assert_grid_worker_owned(&app, &cancel, &a);
+            assert_eq!(app.items, rows);
+            assert_eq!(app.tag_view.nav_stack, stack);
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_none()
+            );
+            let result = receive_grid(&mut app, &b);
+            adopt_grid(&mut app, &ctx, result);
+            settle(&mut app, &ctx);
+            assert_destination(&app, route, &a, &b, false);
+        }
+    }
+}
+
+#[test]
+fn tag_view_open_supersession_owned_suffix_directory_retires_grid_only_after_classification() {
+    for route in [GridRoute::TagListOrder, GridRoute::PhysicalDfs] {
+        for extension in ["epub", "7z"] {
+            let mut app = setup_app();
+            let root = app.tmp.path().to_owned();
+            let (a, b, _) = fixture(&mut app, &root, route, false);
+            let destination = root.join(format!("directory.{extension}"));
+            std::fs::create_dir(&destination).unwrap();
+            image::RgbImage::new(2, 2)
+                .save(destination.join("page.png"))
+                .unwrap();
+            app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+            app.settings
+                .set_archive_file_handling(crate::settings::ArchiveFileHandling::Ignore);
+            let ctx = egui::Context::default();
+            start_grid(&mut app, &ctx, &a, route);
+            let result = receive_grid(&mut app, &b);
+            let pending = app.folder_nav_pending.as_mut().unwrap();
+            let cancel = pending.cancel.clone();
+            let (sender, receiver) = mpsc::channel();
+            pending.rx = receiver;
+            assert!(matches!(
+                app.load_folder_or_convert_archive_with_auto_fullscreen_owned(
+                    destination.clone(),
+                    false,
+                    OpenRequestOwner::Navigation,
+                    StartupListIntent::ExplicitList,
+                ),
+                FolderOpenOutcome::Classifying
+            ));
+            assert!(app.top_level_grid_view.open_path_classification().is_some());
+            assert_grid_worker_owned(&app, &cancel, &a);
+            assert!(sender.send(result).is_ok());
+            app.settle_open_path_classification_for_test();
+            assert!(cancel.load(Ordering::Relaxed));
+            assert!(app.folder_nav_pending.is_none());
+            assert_eq!(app.pending_folder_nav_steps, 0);
+            assert!(
+                sender
+                    .send(FolderNavThreadResult {
+                        target: None,
+                        hit_image_folder: false,
+                    })
+                    .is_err()
+            );
+            assert!(app.poll_folder_nav().is_none());
+            settle(&mut app, &ctx);
+            assert_destination(&app, route, &a, &destination, true);
+            assert!(matches!(app.items.as_slice(), [GridItem::Image(path)]
+                if path == &destination.join("page.png")));
+        }
+    }
 }
 
 #[test]

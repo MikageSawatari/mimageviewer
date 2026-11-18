@@ -657,3 +657,64 @@ Smart 由来も既存の transition が残る。この所有境界を使い、�
 - 重い処理は指定の `run-heavy.ps1 -Owner codex-802` 経由の bin check と filter 付き nextest だけ。
   full-test ロックは迂回せず待ち、ロック書込不可時は runner の BelowNormal / 6並列で実行した。
   全件 / test-full / dev・release ビルド / 実アプリ操作 / commit は行っていない。
+
+### r4 ACCEPT 後の全件テストで見つかった分類受付時点の退行 (2026-11-19)
+
+`a740f6525` は検収側の独立レビュー r4 で ACCEPT だったが、検収側の全件テストで既存の
+`accepted_epub_retires_pending_dfs_after_classification_but_ignore_keeps_it` が失敗した。
+
+**原因**: 「拡張子の分類はまだファイルの受付ではない」という見立ては正しかった。
+ただし報告された Physical 経路の直接の取消箇所は claim ではなく、分類受付が
+`retire_replaced_main_list_requests_with_startup_intent(Some(Classification), true)` を呼び、
+共通退役の `GridTraversal` が既存 worker / hydration の移動継続を消す点だった。
+Ignore の判定は分類結果の poll 後なので、ここで退役すると拒否された候補のために旧移動まで失われる。
+
+**修正**:
+
+- 共通退役の Grid 項目は `retained == Classification` の間は実行しない。
+  cold PDF を保持する既存の DirectDocument 項目と同じく、分類結果前は旧移動を保持する。
+- Physical の preflight / lease が受理された既存の native 境界で、`Continuation` でも逆向き退役を行う。
+  既存 `dfs_continuation` がある自身の移動と、明示 open ではない refresh は、この追加退役の対象にしない。
+- 同じ分類受付を共有する Smart と Collection も、準備を受理した native 境界で退役する。
+  Smart の分類完了関数は Ignore / 準備失敗でも `true` を返すため、その戻り値を受理と解釈せず、実際の準備成功後へ置いた。
+- claim の `Admission` 制限は保持する。自身の DFS も `true, Continuation` で claim するため、
+  制限を外すと自身の移動を取り消し得る。分類完了を `Admission` へ戻すこともしない。
+  これにより、後発 activation を分類の継続が退役させない既存の契約も保つ。
+- metadata で実フォルダと分かった Direct 系の分類は、同じ継続呼出し内の既存 install が旧 worker を退役する。
+  この経路専用の stage / owner 分類は追加しない。以前からある EPUB 固有の取消処理も変更しない。
+
+ZIP / PDF は現行の `path_needs_open_classification` の対象外であり、非分類の明示 open として従来どおり受理時に退役する。
+EPUB と変換書庫は分類中に保持し、Ignore なら旧移動を保持、受け付けた続きで退役する。
+新しい pending・bool・stage variant は無い。r3 の ListOrder 拒否規則・DirectNavigation 例外、物理 Grid の範囲外の競合は変更しない。
+§1.804 と、検収側の未コミット `docs/next-release-backlog.md` は変更しない。
+
+**回帰**:
+
+- 既存失敗テストに、Ignore / Ask の両方で分類開始直後の同じ cancel token・受信口・累積2ステップの保持を追加。
+  元の Ignore 後保持 / Ask 後退役の期待は維持する。
+- `tag_view_open_supersession_owned_classified_files_retire_after_classification_zip_pdf_on_admission`:
+  Grid DFS / Tag ListOrder の両方で、EPUB・7z は分類中保持→受理後退役、ZIP / PDF は非分類の受理時退役。
+  実 worker の旧結果を channel に保持し、受信口の存続 / 破棄も検査する。PDF の native enumeration は poll しない。
+- `tag_view_open_supersession_owned_ignored_classification_keeps_grid_worker_and_result`:
+  Ignore の EPUB / 7z に拒否された後、元の実 worker 結果が B へ着地できることを両方の移動で検査する。
+- `tag_view_open_supersession_owned_suffix_directory_retires_grid_only_after_classification`:
+  `.epub` / `.7z` という名前の実フォルダは Ignore でも分類後に採用し、その時点で旧移動を退役する。
+
+**検証記録**:
+
+- 指定 run-heavy 経由の `cargo check -p mimageviewer --bin mimageviewer-core`: **exit 0、24.08s**。
+  `target/802-classification-check.log`。
+- focused nextest: **21件実行 / 21成功 / 失敗0、exit 0** (compile 3m06s、実行3.551s)。
+  報告された既存失敗テスト、上記3件、r1〜r3 の拒否・逆向き退役・DirectNavigation、r2 の物理 Grid 2件、P3、連打拒否、
+  `section1285_classification_handoffs_preserve_later_activation` を含む。
+  `target/802-classification-focused.log`、JUnit控え `target/802-classification-focused-junit.xml`。
+- 拡張した関連 nextest: **1343件実行 / 1343成功 / 失敗0、exit 0** (compile 1.11s、実行110.440s、17606件除外)。
+  nextest の leaky 判定は1件。focused の全21件も含むことを JUnit で確認し、件数を重複加算しない。
+  前回の filter に `accepted_epub|classification|dfs|pdf_enumerate|epub` を追加 (`folder_nav` は前回から含む)。
+  `target/802-classification-related.log`、JUnit控え `target/802-classification-related-junit.xml`。
+- `cargo fmt` (引数なし)、`cargo fmt --check`、`git diff --check` は成功。UI文字列の変更は無い。
+- 実装担当内の別 context (`gpt-6.1-sol` / `xhigh`) で各分類入口・受理境界・自身の継続・refresh を照合した。
+  未解決の指摘は無い。正式な検収側の独立レビューとは別の確認で、Cargo は実装担当だけが実行した。
+- 検収側バックログの未コミット内容は開始時・終了時の SHA256 一致で確認した。
+  重い処理は指定の run-heavy を通す bin check と filter 付き nextest だけ。
+  全件 / test-full / dev・release ビルド / 実アプリ操作 / commit は行っていない。

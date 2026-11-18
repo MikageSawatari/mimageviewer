@@ -5320,6 +5320,21 @@ fn accepted_epub_retires_pending_dfs_after_classification_but_ignore_keeps_it() 
         epub.clone(),
         crate::app::StartupListIntent::ExplicitList,
     ));
+    assert!(app.top_level_grid_view.open_path_classification().is_some());
+    assert!(std::sync::Arc::ptr_eq(
+        &app.folder_nav_pending.as_ref().unwrap().cancel,
+        &cancel,
+    ));
+    assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(app.pending_folder_nav_steps, 2);
+    assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
+    assert!(
+        tx.send(FolderNavThreadResult {
+            target: None,
+            hit_image_folder: false,
+        })
+        .is_ok()
+    );
     app.settle_open_path_classification_for_test();
     assert!(app.folder_nav_pending.is_some());
     assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
@@ -5336,6 +5351,21 @@ fn accepted_epub_retires_pending_dfs_after_classification_but_ignore_keeps_it() 
         epub,
         crate::app::StartupListIntent::ExplicitList,
     ));
+    assert!(app.top_level_grid_view.open_path_classification().is_some());
+    assert!(std::sync::Arc::ptr_eq(
+        &app.folder_nav_pending.as_ref().unwrap().cancel,
+        &cancel,
+    ));
+    assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(app.pending_folder_nav_steps, 2);
+    assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
+    assert!(
+        tx.send(FolderNavThreadResult {
+            target: None,
+            hit_image_folder: false,
+        })
+        .is_ok()
+    );
     app.settle_open_path_classification_for_test();
     assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
     assert!(app.folder_nav_pending.is_none());

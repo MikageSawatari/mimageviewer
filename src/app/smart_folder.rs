@@ -2626,6 +2626,12 @@ impl App {
             restore_intent.replaces_deferred_startup_open()
                 && stage == MainListRequestStage::Admission,
         );
+        if stage == MainListRequestStage::Continuation
+            && restore_intent.replaces_deferred_startup_open()
+        {
+            // A classified open can retire grid traversal only after preparation succeeds.
+            self.retire_main_grid_folder_navigation_for_admission();
+        }
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );

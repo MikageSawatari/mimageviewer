@@ -36262,6 +36262,10 @@ impl App {
             Some(MainListRequestOwner::Physical),
             stage == MainListRequestStage::Admission,
         );
+        if stage == MainListRequestStage::Continuation {
+            // Classification has now accepted this prepared main history request.
+            self.retire_main_grid_folder_navigation_for_admission();
+        }
         let transition = CollectionHistoryTransition {
             request_id: NEXT_HISTORY_ARCHIVE_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
             intent,
@@ -36429,7 +36433,12 @@ impl App {
                 MainListRequestKind::PaneClose if explicit_request => {
                     self.retire_folder_tree_pane_close_navigation();
                 }
-                MainListRequestKind::GridTraversal if explicit_request => {
+                // A suffix candidate may still be refused. Its accepted continuation,
+                // rather than classification admission, owns grid retirement.
+                MainListRequestKind::GridTraversal
+                    if explicit_request
+                        && retained != Some(MainListRequestOwner::Classification) =>
+                {
                     self.retire_main_grid_folder_navigation_for_admission();
                 }
                 MainListRequestKind::UnresolvedOpen => {
@@ -36855,6 +36864,14 @@ impl App {
             && dfs_continuation.is_none()
         {
             self.cancel_pending_folder_nav();
+        }
+        if stage == MainListRequestStage::Continuation
+            && dfs_continuation.is_none()
+            && restore_intent.replaces_deferred_startup_open()
+        {
+            // A suffix candidate is not an open until this prepared phase is accepted.
+            // This retirement does not run for own DFS or refresh continuations.
+            self.retire_main_grid_folder_navigation_for_admission();
         }
         self.retire_direct_document_open_for_history_admission();
         if self.pdf_enumerate_pending.is_none() {
