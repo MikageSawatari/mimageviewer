@@ -13,8 +13,16 @@ const STOPPED: usize = 30;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scene {
     Keyboard,
+    Commands,
     Preferences,
     Outside,
+}
+
+#[derive(Clone, Copy)]
+struct ScrollObservation {
+    viewport: egui::Rect,
+    offset_y: f32,
+    content_height: f32,
 }
 
 fn footer(ui: &mut egui::Ui) {
@@ -27,9 +35,14 @@ fn footer(ui: &mut egui::Ui) {
     });
 }
 
-fn draw(ctx: &egui::Context, state: &mut PreferencesState, scene: Scene) {
+fn draw(
+    ctx: &egui::Context,
+    state: &mut PreferencesState,
+    scene: Scene,
+) -> Option<ScrollObservation> {
     let mut open = true;
-    if scene == Scene::Keyboard {
+    let mut scroll = None;
+    if matches!(scene, Scene::Keyboard | Scene::Commands) {
         let safe = ctx.content_rect().shrink2(egui::vec2(24.0, 32.0));
         let size = egui::vec2(900.0, 640.0).min(safe.size());
         egui::Window::new("操作カスタマイズ")
@@ -52,7 +65,7 @@ fn draw(ctx: &egui::Context, state: &mut PreferencesState, scene: Scene) {
                 ui.allocate_ui_with_layout(panel, egui::Layout::top_down(egui::Align::Min), |ui| {
                     ui.set_max_size(panel);
                     ui.spacing_mut().scroll = pref_panel_scroll_style();
-                    egui::ScrollArea::vertical()
+                    let output = egui::ScrollArea::vertical()
                         .scroll_source(egui::scroll_area::ScrollSource {
                             drag: egui::scroll_area::DragScroll::Always,
                             ..Default::default()
@@ -67,6 +80,11 @@ fn draw(ctx: &egui::Context, state: &mut PreferencesState, scene: Scene) {
                             ui.set_width(ui.available_width());
                             draw_operation_customize_page(ui, state, false);
                         });
+                    scroll = Some(ScrollObservation {
+                        viewport: output.inner_rect,
+                        offset_y: output.state.clamped_offset().y,
+                        content_height: output.content_size.y,
+                    });
                 });
                 footer(ui);
             });
@@ -135,6 +153,7 @@ fn draw(ctx: &egui::Context, state: &mut PreferencesState, scene: Scene) {
             });
     }
     assert!(open);
+    scroll
 }
 
 fn text_rect(shapes: &[ClippedShape], label: &str) -> Option<egui::Rect> {
@@ -191,9 +210,21 @@ fn sample(
     frame: usize,
     pointer: Option<egui::Pos2>,
     stopped: bool,
+    scroll_delta_y: f32,
 ) -> (Value, Vec<ClippedShape>) {
+    let mut input = raw(frame, pointer);
+    if scroll_delta_y != 0.0 {
+        input.events.push(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: egui::vec2(0.0, scroll_delta_y),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+            modifiers: egui::Modifiers::default(),
+        });
+    }
+    let mut scroll = None;
     let start = Instant::now();
-    let mut output = ctx.run_pass(raw(frame, pointer), |ctx| draw(ctx, state, scene));
+    let mut output = ctx.run_pass(input, |ctx| scroll = draw(ctx, state, scene));
     let run_ms = ms(start.elapsed());
     output.textures_delta.clear(); // CPU-only harness: there is no GPU texture consumer.
     let passes = output.platform_output.num_completed_passes;
@@ -229,6 +260,11 @@ fn sample(
         "primitives": primitives.len(), "vertices": vertices, "indices": indices,
         "repaint_delay_ms": (delay != Duration::MAX).then(|| ms(delay)),
         "zero_repaint_delay": delay.is_zero(), "prev_pass_repaint_causes": causes,
+        "accesskit_update": output.platform_output.accesskit_update.is_some(),
+        "scroll_delta_y": scroll_delta_y,
+        "scroll_offset_y": scroll.map(|s| s.offset_y),
+        "scroll_content_height": scroll.map(|s| s.content_height),
+        "scroll_viewport": scroll.map(|s| [s.viewport.min.x, s.viewport.min.y, s.viewport.max.x, s.viewport.max.y]),
         "pointer": pointer.map(|p| [p.x,p.y])}),
         shapes,
     )
@@ -264,15 +300,19 @@ fn state(overrides: bool) -> PreferencesState {
     state
 }
 
-fn case(scene: Scene, overridden: bool) -> Value {
+fn case(scene: Scene, overridden: bool, accessible: bool) -> Value {
+    assert!(scene != Scene::Commands);
     let ctx = egui::Context::default();
+    if accessible {
+        ctx.enable_accesskit();
+    }
     crate::ui_fonts::configure_fonts(&ctx);
     let mut state = state(overridden);
     let initial_settings = serde_json::to_value(&state.settings).unwrap();
     let initial_expanded = state.expanded.clone();
     let mut shapes = Vec::new();
     for frame in 0..WARMUP {
-        shapes = sample(&ctx, &mut state, scene, frame, None, false).1;
+        shapes = sample(&ctx, &mut state, scene, frame, None, false, 0.0).1;
     }
     let labels: Vec<String> = if scene == Scene::Keyboard {
         (13..=24).map(|n| format!("F{n}")).collect()
@@ -357,6 +397,7 @@ fn case(scene: Scene, overridden: bool) -> Value {
             WARMUP + index,
             Some(pointer),
             false,
+            0.0,
         );
         if scene == Scene::Outside {
             assert!(
@@ -398,6 +439,7 @@ fn case(scene: Scene, overridden: bool) -> Value {
                 WARMUP + MEASURED + index,
                 None,
                 true,
+                0.0,
             )
             .0,
         );
@@ -426,12 +468,220 @@ fn case(scene: Scene, overridden: bool) -> Value {
     }
     let moving = &samples[..MEASURED];
     let number = |field: &str| summary(moving.iter().map(|s| s[field].as_f64().unwrap()));
-    json!({"case": match (scene, overridden) {
-        (Scene::Keyboard, false) => "K_default", (Scene::Keyboard, true) => "K_20_overrides",
-        (Scene::Preferences, _) => "P_general_tree_hover", (Scene::Outside, _) => "B_general_outside" },
+    let base_name = match (scene, overridden) {
+        (Scene::Keyboard, false) => "K_default",
+        (Scene::Keyboard, true) => "K_20_overrides",
+        (Scene::Preferences, _) => "P_general_tree_hover",
+        (Scene::Outside, _) => "B_general_outside",
+        (Scene::Commands, _) => unreachable!(),
+    };
+    json!({"case": if accessible { format!("{base_name}_accesskit_on") } else { base_name.to_owned() },
+        "accesskit": accessible,
         "measured_frames": MEASURED, "warmup_frames": WARMUP, "stopped_frames": STOPPED,
         "hover_target_geometry": targets, "verified_hover_frames": verified_hover_frames,
         "distinct_hovered_targets": visited.len(),
+        "cause_note": "prev_pass_repaint_causes is egui's previous-pass list; repaint_delay_ms belongs to this frame",
+        "synthetic_moving_duration_s": MEASURED as f64 / 60.0, "moving_wall_ms": moving_wall_ms,
+        "run_ms": number("run_ms"), "tessellate_ms": number("tessellate_ms"),
+        "shapes": number("shapes"), "primitives": number("primitives"),
+        "vertices": number("vertices"), "indices": number("indices"),
+        "zero_repaint_delay_ratio": moving.iter().filter(|s| s["zero_repaint_delay"] == true).count() as f64 / MEASURED as f64,
+        "samples": samples})
+}
+
+fn command_edit_rects(ctx: &egui::Context, shapes: &[ClippedShape]) -> Vec<egui::Rect> {
+    fn collect(shape: &Shape, clip: egui::Rect, texts: &mut Vec<egui::Rect>) {
+        match shape {
+            Shape::Text(text) if text.galley.text() == "編集" => {
+                let rect = text.visual_bounding_rect().intersect(clip);
+                if rect.is_positive() {
+                    texts.push(rect);
+                }
+            }
+            Shape::Vec(children) => {
+                for child in children {
+                    collect(child, clip, texts);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut texts = Vec::new();
+    for shape in shapes {
+        collect(&shape.shape, shape.clip_rect, &mut texts);
+    }
+    let interactive = ctx.interactive_rects_last_pass();
+    let mut rects: Vec<_> = texts
+        .into_iter()
+        .filter_map(|text| {
+            interactive
+                .iter()
+                .copied()
+                .filter(|r| r.contains(text.center()) && r.width() < 80.0 && r.height() < 40.0)
+                .min_by(|a, b| a.area().total_cmp(&b.area()))
+                .map(|r| r.intersect(text.expand(12.0)))
+        })
+        .collect();
+    rects.sort_by(|a, b| a.center().y.total_cmp(&b.center().y));
+    assert!(
+        rects.len() >= 4,
+        "Commands must show several actual edit buttons"
+    );
+    rects
+}
+
+fn commands_case(overridden: bool, accessible: bool, scrolling: bool) -> Value {
+    let ctx = egui::Context::default();
+    if accessible {
+        ctx.enable_accesskit();
+    }
+    crate::ui_fonts::configure_fonts(&ctx);
+    let mut state = state(overridden);
+    state.operation_tab = OperationCustomizeTab::Commands;
+    let initial_settings = serde_json::to_value(&state.settings).unwrap();
+    let initial_expanded = state.expanded.clone();
+    let mut shapes = Vec::new();
+    let mut last = Value::Null;
+    for frame in 0..WARMUP {
+        (last, shapes) = sample(&ctx, &mut state, Scene::Commands, frame, None, false, 0.0);
+    }
+    let rects = command_edit_rects(&ctx, &shapes);
+    let viewport = &last["scroll_viewport"];
+    let viewport = egui::Rect::from_min_max(
+        egui::pos2(
+            viewport[0].as_f64().unwrap() as f32,
+            viewport[1].as_f64().unwrap() as f32,
+        ),
+        egui::pos2(
+            viewport[2].as_f64().unwrap() as f32,
+            viewport[3].as_f64().unwrap() as f32,
+        ),
+    );
+    let initial_offset = last["scroll_offset_y"].as_f64().unwrap();
+    assert_eq!(initial_offset, 0.0);
+    assert!(last["scroll_content_height"].as_f64().unwrap() > viewport.height() as f64 + 480.0);
+    let targets: Vec<_> = rects.iter().enumerate().map(|(index, r)| {
+        json!({"label": format!("visible_edit_{index}"), "rect": [r.min.x,r.min.y,r.max.x,r.max.y]})
+    }).collect();
+    let mut visited = HashSet::new();
+    let mut verified_hover_frames = 0;
+    let mut scrolled_frames = 0;
+    let mut previous_offset = initial_offset;
+    let mut last_pointer = egui::Pos2::ZERO;
+    let mut samples = Vec::new();
+    let started = Instant::now();
+    for index in 0..MEASURED {
+        let first = rects.first().unwrap().center();
+        let last = rects.last().unwrap().center();
+        let distance = last.y - first.y;
+        assert!(distance > 0.0);
+        let travel = (index as f32 * 2.0) % (distance * 2.0);
+        let offset = travel.min(distance * 2.0 - travel);
+        let pointer = if scrolling {
+            // Keep the pointer over the content while the wheel moves the real ScrollArea.
+            egui::pos2(first.x, viewport.center().y)
+        } else {
+            egui::pos2(first.x, first.y + offset)
+        };
+        assert!(viewport.contains(pointer));
+        let (mut data, painted) = sample(
+            &ctx,
+            &mut state,
+            Scene::Commands,
+            WARMUP + index,
+            Some(pointer),
+            false,
+            if scrolling { -2.0 } else { 0.0 },
+        );
+        assert_eq!(data["accesskit_update"], accessible);
+        assert!(ctx.is_pointer_over_egui());
+        let current_rects = command_edit_rects(&ctx, &painted);
+        let which = current_rects.iter().position(|r| r.contains(pointer));
+        if let Some(which) = which {
+            verified_hover_frames += 1;
+            if !scrolling {
+                visited.insert(which);
+            }
+        }
+        let current_offset = data["scroll_offset_y"].as_f64().unwrap();
+        if scrolling {
+            assert!(
+                current_offset > previous_offset,
+                "every scrolling frame must move the ScrollArea"
+            );
+            assert!(
+                current_offset - previous_offset < 8.0,
+                "scrolling must move only a few points per frame"
+            );
+            scrolled_frames += 1;
+        } else {
+            assert_eq!(
+                current_offset, initial_offset,
+                "hover must not move the ScrollArea"
+            );
+        }
+        data["hover_target"] = json!(
+            which
+                .map(|i| format!("visible_edit_{i}"))
+                .unwrap_or_else(|| "layout_gap".to_owned())
+        );
+        samples.push(data);
+        previous_offset = current_offset;
+        last_pointer = pointer;
+    }
+    let moving_wall_ms = ms(started.elapsed());
+    for index in 0..STOPPED {
+        samples.push(
+            sample(
+                &ctx,
+                &mut state,
+                Scene::Commands,
+                WARMUP + MEASURED + index,
+                None,
+                true,
+                0.0,
+            )
+            .0,
+        );
+    }
+    assert_eq!(ctx.input(|i| i.pointer.hover_pos()), Some(last_pointer));
+    assert_eq!(
+        initial_settings,
+        serde_json::to_value(&state.settings).unwrap()
+    );
+    assert_eq!(initial_expanded, state.expanded);
+    assert_eq!(state.selected, PreferencesPage::General);
+    assert_eq!(state.operation_tab, OperationCustomizeTab::Commands);
+    assert!(state.operation_keyboard_context.is_none());
+    assert!(state.operation_assignment_editor.is_none());
+    assert!(state.command_selected.is_none());
+    assert!(state.command_edit_loaded_for.is_none());
+    assert!(state.command_capture_slot.is_none());
+    assert!(state.command_editor_source_chord.is_none());
+    assert!(state.command_chord_inputs.iter().all(String::is_empty));
+    assert!(state.command_edit_error.is_none() && state.command_edit_notice.is_none());
+    assert!(state.command_filter.is_empty() && state.command_key_filter.is_empty());
+    assert!(state.search_query.is_empty());
+    if scrolling {
+        assert_eq!(scrolled_frames, MEASURED);
+        assert!(previous_offset - initial_offset > 400.0);
+    } else {
+        assert!(
+            visited.len() >= 4,
+            "hover sweep must cross several actual edit buttons"
+        );
+        assert!(verified_hover_frames >= MEASURED / 2);
+    }
+    let moving = &samples[..MEASURED];
+    let number = |field: &str| summary(moving.iter().map(|s| s[field].as_f64().unwrap()));
+    json!({"case": format!("C_{}_accesskit_{}_{}", if overridden {"20_overrides"} else {"default"},
+            if accessible {"on"} else {"off"}, if scrolling {"scroll"} else {"hover"}),
+        "accesskit": accessible, "operation_context": "all", "input": if scrolling {"wheel"} else {"pointer_move"},
+        "measured_frames": MEASURED, "warmup_frames": WARMUP, "stopped_frames": STOPPED,
+        "hover_target_geometry": targets, "verified_hover_frames": verified_hover_frames,
+        "distinct_hovered_targets": if scrolling {Value::Null} else {json!(visited.len())},
+        "scrolled_frames": scrolled_frames, "initial_scroll_offset_y": initial_offset,
+        "final_measured_scroll_offset_y": previous_offset,
         "cause_note": "prev_pass_repaint_causes is egui's previous-pass list; repaint_delay_ms belongs to this frame",
         "synthetic_moving_duration_s": MEASURED as f64 / 60.0, "moving_wall_ms": moving_wall_ms,
         "run_ms": number("run_ms"), "tessellate_ms": number("tessellate_ms"),
@@ -452,14 +702,43 @@ fn headless_preferences_hover_measurement() {
         (Scene::Preferences, false),
         (Scene::Outside, false),
     ] {
-        let result = case(scene, overrides);
+        let result = case(scene, overrides, false);
         println!("HOVER_PERF {}", serde_json::to_string(&result).unwrap());
         cases.push(result);
+    }
+    for overrides in [false, true] {
+        let result = case(Scene::Keyboard, overrides, true);
+        println!("HOVER_PERF {}", serde_json::to_string(&result).unwrap());
+        cases.push(result);
+    }
+    for overrides in [false, true] {
+        for accessible in [false, true] {
+            for scrolling in [false, true] {
+                let result = commands_case(overrides, accessible, scrolling);
+                println!("HOVER_PERF {}", serde_json::to_string(&result).unwrap());
+                cases.push(result);
+            }
+        }
     }
     for overrides in [false, true] {
         let result = pages::hover_measurement::breakdown(&mut state(overrides), WARMUP, MEASURED);
         println!("HOVER_PERF {}", serde_json::to_string(&result).unwrap());
         cases.push(result);
+    }
+    for commands in [false, true] {
+        for overrides in [false, true] {
+            for accessible in [false, true] {
+                let result = pages::hover_measurement::phase_breakdown(
+                    &mut state(overrides),
+                    WARMUP,
+                    MEASURED,
+                    commands,
+                    accessible,
+                );
+                println!("HOVER_PERF {}", serde_json::to_string(&result).unwrap());
+                cases.push(result);
+            }
+        }
     }
     assert!(
         !guard.path().join("settings.db").exists(),
