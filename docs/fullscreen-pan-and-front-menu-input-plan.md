@@ -1,6 +1,6 @@
 # 全画面のパンの制限と前面メニュー中のキー入力 (§1.806・§1.807・§1.810) 設計書
 
-- 状態: WIP・§6.7の最終束縛の裁定待ち（2026-11-19）。対象268件は成功（267件＋fixture修正後の1件の再実行、§6.5）だが、§6.7の経路の検証・実装は未完了。実装前の独立レビュー: 案 B は r4 で ACCEPT、§1.810 を案 C (記録を持たず毎回収める) へ切り替えて r5〜r7 は REVISE、r8 で ACCEPT (§7)。
+- 状態: §6.6・§6.7の裁定①を反映し、実装・対象297件・最終core check成功（2026-11-19）。未コミット、独立実装レビュー／全件gate／実機検収は設計担当の後続工程。再開基点 `ff2abdf5a`。過去の対象268件の結果と今回の検証は§6.5。実装前の独立レビュー: 案 B は r4 で ACCEPT、§1.810 を案 C (記録を持たず毎回収める) へ切り替えて r5〜r7 は REVISE、r8 で ACCEPT (§7)。
 - ブランチ: `fix-fs-pan-input-806-807-810` (作業ツリー `G:\home\mimageviewer-474`、master 605ba335b 起点)。
 - 担当: 設計・検収 = ClaudeCode Opus 5.5 / high、実装 = Codex gpt-6.1-sol / high、独立レビュー = 別の gpt-6.1-sol / xhigh。
 - 元の項目: [next-release-backlog.md](next-release-backlog.md) の §1.806・§1.807・§1.810。どれも §1.474 ([fullscreen-in-page-scroll-plan.md](fullscreen-in-page-scroll-plan.md)) の作業中に見つかった既存の問題。
@@ -91,6 +91,10 @@
 - **一時表示ではない**こと。通常の `fs_pan` を共用したまま別の形を一時的に描く表示では収めない。右 Ctrl の元画像の一時表示 (`original_preview_active`) がこれに当たる:
   元画像の素材も完成素材だが、AI 拡大後の画像と寸法が違うので、原寸表示などでは形が変わる (例: viewport 幅 1000・元画像 400・AI 後 1600・原寸・`pan.x = 1000`)。
   そこで収めると、キーを離して加工後の画像へ戻ったときに元のパンへ戻らない。実装担当は、`fs_pan` を共用する一時表示をほかにも列挙し、同じ条件に入れて §6 に書く。
+  紙めくりの保持素材への束縛（page-turnのheld binding、OFFのCompletingを含む）も一時表示とする。
+  既存の最終束縛が使う**補正前のtransform**で同じ照合を行い、保持中のページが選ばれるならパンを提案も確定もしない。
+  見開きは片側でも保持素材に束縛されるなら表示単位全体を一時表示とする。保持が解けた最初の通常の完成素材のframeで収める。
+  stateを一括で除外せず、このframeで実際に保持素材へ束縛されるかで決める（§6.7の裁定①）。
 
 ### 3.4 収める計算と、描画の中での位置
 
@@ -109,6 +113,9 @@
     「候補の中から補正量が最小のものを採る」部分は共有し、描画側は候補に表示単位の矩形を 1 つ足す点だけが違う、という形にして、規則を 2 か所に書き分けない。
 - 位置は初期配置と同じ 2 段にそろえる (`fs_initial_placement_pan` = 提案、`resolve_fs_initial_placement` = 素材の準備後の確定):
   - 提案は、**既存の経路が最終的に選んだ素材が、そのページ枠へ実際に描く transform**から作る。
+    保持素材への最終束縛を行う経路は、補正前のtransform・painter・素材・occurrence・crop・live条件で先に同じ束縛照合を行う。
+    保持を選ぶ場合は一時表示として提案しない。選ばない場合だけ補正し、そのtransformで以降の既存のprepare／束縛を進める。
+    補正が照合を不成立にして保持を外す順序にはしない。
     素材の候補とlayoutの基準は別である。初期配置要求が無い経路では、既存のページ枠・間隔の整列・layout基準を保ち、
     パン制限のために初期配置用の素材選択ループを広げない。初期配置要求がある場合だけ、既存どおり素材選択後のlayout再計算を行う。
     全ページが完成素材という§3.3の条件を満たさないframe（サムネイルへのfallbackを含む）では提案を作らない。
@@ -123,6 +130,7 @@
   - 収める前のパンが自動の初期配置と一致していた (= 利用者は動かしていない) なら、収めた後の (倍率, パン) を新しい自動の初期配置として記録し直す。クリック送りは使えたままにする。
   - 収める前が既に手動の変形だったなら、自動の初期配置の記録は変えない (手動のまま)。
 - 費用: 各 frame で定数個の矩形の演算 (解決済みの 1〜2 ページと白ページの矩形の和と viewport の比較)。補正が必要な frame では transform を解決し直す。
+  補正前の保持束縛の照合も既存の常駐情報だけを読み、素材の生成・I/O・stateの更新は行わない。
   静止していれば補正が要るのは範囲外になった最初の 1 frame だけだが、連続のリサイズ (形が毎 frame 変わる) やドラッグ (開始位置から毎回パンを作り直す) では複数の frame で要り得る。
   新しい同期 I/O・新しい状態・再描画の要求は足さない。viewer context ごとのフィールドも増えない (`fs_pan`・`fs_automatic_initial_view`・`fullscreen_page_layout` は既に swap される)。
 
@@ -140,6 +148,7 @@
 - ページ送り・半ページ送り: ページを替えたときの既存の初期化・初期配置がそのまま先に効く。初期配置で保つ軸が新しいページで範囲外なら、同じ frame で描画の規則が範囲内へ戻す (§3.3、完成素材の frame)。
 - 別の context: 各 context が自分の描画で自分の `fs_pan` だけを収める。ほかの context の状態には触れない。
 - 右 Ctrl の元画像の一時表示: 収めない (§3.3)。押している間、範囲外の形なら今までどおり画面外に出ることがあるが、離すと元のパンで加工後の画像に戻る。
+- 紙めくりの保持素材を描くframe: 補正前の照合結果で一時表示と判定し、収めない。保持素材を使わない通常の完成素材に戻った最初のframeで、範囲外なら収める。
 - 白ページ付きの単独ページの初期配置: 描画の規則が表示単位で見るので動かない (§3.4)。
 - 実装担当は、パンを書く経路・描く形を変える経路を列挙し、上の一覧に無いものがあれば §6 に足す (変わる動きがあれば、その内容と、通常の使い方の不便に当たるかの判断材料)。
 
@@ -206,8 +215,9 @@
 
 ### 6.1 実装と所有境界
 
-§6.6の停止報告に対する設計担当の裁定①に従って再開した（WIP基点 `6e39c705e`）。
-Center fallbackの幾何は維持したが、最終束縛の扱いについて§6.7で停止した。以下はWIPの実装内容。
+§6.6の裁定①（WIP基点 `6e39c705e`）でCenter fallbackの幾何を維持し、
+§6.7の裁定①（再開基点 `ff2abdf5a`）で保持素材への最終束縛を一時表示として扱う。以下は実装内容。
+実装・指定の対象検証を完了した。未解決の設計判断は無く、コミットは行わない。
 新しいviewer context field、回転の記録、同期I/O、待機・retry・repaintは追加しない。
 
 - `src/displayed_image_transform.rs`: 描画済み `DisplayedPage` に通常見開きの固定間隔と画面上の側を記録する。
@@ -222,15 +232,21 @@ Center fallbackの幾何は維持したが、最終束縛の扱いについて§
   どちらも準備後の素材種別で判定し、不採用の変形をlayout・panへ発行しない。
 - `src/ui_fullscreen/pan_bounds.rs`: 描画の適用領域、候補の比較、確定を集約する。
   `minimum_pan_correction` と `pan_correction_for_minimum_overlap` を入力と共用し、描画だけ表示単位の候補を足す。
+- `page_turn.rs`: 最終束縛の照合を読み取り専用の `page_turn_prepared_held_page` に抽出し、既存の `page_turn_bind_prepared` と描画側の補正前照合で共用する。
+  occurrence・crop、Native拒否後の別素材を復活させない条件まで同じhelperに含め、述語と束縛結果は変えない。
+  通常描画はprepare済み候補を先に組み立てて照合し、見開きは同じ補正前の左右候補を照合する。
+  実際に束縛を行う経路（通常のsubmittedあり／見開きのsubmit_final）だけで照合し、保持を選べば表示単位の提案を作らない。
 - `initial_placement.rs`: 自動配置の比較値の記録入口を共用する。初期配置要求の `origin_automatic` を確定前に捕捉し、
   手動由来なら既存の自動配置値を保持する。パンの書戻しは入力setterを通さない。
 - `in_page_scroll.rs`: 前面メニュー照会を `fs_navigation_front_menu_presented` へ改名し、既存の配送元／配送先照会を共用する。
   detachedの述語・viewportの選び方・ROOT配送は変更しない。
 - テスト: `pan_bounds/{tests,projection_tests}.rs`、`front_popup_input_tests.rs`、`in_page_scroll/{handler_tests,review_regression_tests}.rs`。
   既存 `initial_placement/tests.rs`、`page_turn/{resident_placement_tests,wait_indicator_tests}.rs` は元画像一時表示の明示引数を追加。
+  `page_turn/prepare_boundary_tests/pan_bounds_tests.rs` に保持と通常描画の所有境界の4件を追加し、既存prepare境界fixtureから登録する。
 - 文書: 本書、`display-pipeline.md`、`keymap-spec.md`、`key-customization-impl-plan.md`、`detached-rework-plan.md` §11。
   `fullscreen-page-start-position-plan.md` と `fullscreen-in-page-scroll-plan.md` は後続仕様への参照を追加し、`next-release-backlog.md` の3項目を更新する。
   マニュアル `fullscreen.html` は前面メニュー中のキーと範囲外の表示位置の説明を更新する。
+  §6.7の保持中の一時表示の裁定では追加の利用者向け説明は不要とし、この2箇所の更新を維持する。
 
 §2.2で任された記録先は `DisplayedPage`、§3.4で任された安定方法は次項の丸め残差の許容とした。
 §6.6の裁定に合わせてCenter fallbackのlayout基準を維持する。素材の候補とlayout基準を別に扱う点は§3.4にも明記した。
@@ -256,7 +272,8 @@ clip前AABBから求める。補正後にtransformを再解決する際、layout
 - 一時表示: 右Ctrl元画像は通常の `fs_pan` を共用するため明示的に除外する。編集ツールの元画像／マスク表示は編集モードの除外、
   比較（通常／pin／wipe／diff）は比較の除外、分析・Z・360・3Dは各表示ownerの除外で書き戻さない。
   類似候補の長押しpreview、Checking中の保持画面、navigation previousとsource-reload holdoverは別の描画／Captured／非currentなので書かない。
-  紙めくりは既存のzoom/pan適格性とprepared素材の束縛を維持し、新しい一時panは作らない。
+  紙めくりの保持（OFFのCompletingを含む）は補正前の実際の束縛照合で一時表示と判定する。
+  見開きは片側だけの保持も表示単位全体で除外し、保持が解けた通常の完成素材で収める。state全体の除外や新しい一時panは作らない。
 - context: 確定はmountされたcontextの既存の `fs_pan`・自動配置値だけ。兄弟contextのキャッシュ・要求・panを変更しない。
 
 ### 6.4 前面メニュー中に止める消費者と対象外
@@ -281,7 +298,7 @@ ROOTは従来の `handled = true` を返し、残ったキーを背面一覧へ�
 ### 6.5 検証
 
 対象: pan_bounds・initial_placement・in_page_scroll・front_popup_input_tests・overflow_input_tests、
-navigator_pan_clamp、page_turnのresident_placement_testsとwait_indicator_tests。
+navigator_pan_clamp、page_turnのresident_placement_tests・wait_indicator_tests・prepare_boundary_tests（追加4件を含む）・nonfinal_tests。
 
 - 初回 `cargo check -p mimageviewer --bin mimageviewer-core`: 成功、1分49秒。最新の画像項目の適用領域確認を加える前の差分。
 - 初回の対象nextest: コンパイル失敗（E0502、追加テストのAppTestEnv経由の借用2件）、実行0件。ローカル変数へ取り出して修正した。
@@ -293,7 +310,13 @@ navigator_pan_clamp、page_turnのresident_placement_testsとwait_indicator_test
   残る元画像一時表示テストは、左右で同じテクスチャを使うfixtureが項目識別チェックに拒否されたため、項目ごとに別テクスチャへ修正した。製品コードは変更しない。
 - r6: 上の1件だけを再検証し、1件成功・失敗0（5分26秒コンパイル、2.476秒実行）。nextestはテストごとに別プロセスなので、影響しない267件のr5成功結果を再利用する。対象268件の成功を確認した。
 - r6最終 `cargo check -p mimageviewer --bin mimageviewer-core`: 他担当のfull lock待ちのまま、§6.7の停止時に自分の待機だけを中止した。Cargo未開始。ロックと他担当のプロセスには触れていない。
-- 引数なし `cargo fmt` と `git diff --check`: 成功。停止報告の最後にも同じ整形と差分確認を実施する。
+- `ff2abdf5a`からの再開（§6.7裁定①）:
+  - r7の初回は他担当のfull lock待ちでCargo未開始。fixtureを整理して整形をそろえるため、自分の待機だけを中止して再投入した（実行0件）。
+  - r7b境界4件: **4件成功・失敗0**、exit 0。8分02秒コンパイル、1.568秒実行。full lockが `opus-811-libfull` から `rar803` へ続いたため開始待ちとなり、02:35:48に低優先度・6並列のsandbox fallbackで開始した。
+    完成したresampleable入力があっても最後の束縛で暫定Managed保持素材を描くこと、保持中のpan不変、補正前／後で照合結果が変わること、保持解除の最初の完成frame、左右どちらかだけの保持、Completingでも照合不成立なら通常補正することを確認した。
+  - r8関連回帰: **297件成功・失敗0**、exit 0。コンパイル確認1.82秒、実行62.397秒。従来の対象に `page_turn::prepare_boundary_tests`・`page_turn::nonfinal_tests` を加え、追加4件も同じ差分で再確認した。
+  - r9最終core check: **成功**、exit 0、37.36秒。`depth-771` のfull lock（02:46開始）を待ち、03:09:33に指定runnerのsandbox fallbackで開始した。ソースとfixtureはr7b・r8の成功から変更していない。
+- 最終の引数なし `cargo fmt` と `git diff --check`: **成功**。再開時に変更したRustの4ファイルは整形前後のSHA-256が一致し、r7b・r8・r9の検証対象ソースを維持している。
 - 指定runner `run-heavy.ps1 -Owner codex-806 -WorkDir G:\home\mimageviewer-474 -Command ...` を使用。
 
 実行コマンド（check/nextestは上記runner経由、通常feature）:
@@ -302,6 +325,8 @@ navigator_pan_clamp、page_turnのresident_placement_testsとwait_indicator_test
 cargo check -p mimageviewer --bin mimageviewer-core
 cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen::pan_bounds/) | test(/ui_fullscreen::initial_placement/) | test(/ui_fullscreen::in_page_scroll/) | test(/ui_fullscreen::front_popup_input_tests/) | test(/ui_fullscreen::overflow_input_tests/) | test(/pan_clamp/) | test(/page_material_kind_survives_prepare/) | test(/page_turn::resident_placement_tests/) | test(/page_turn::wait_indicator_tests/)'
 cargo nextest run -p mimageviewer --lib -E 'test(/original_preview_round_trip_keeps_processed_pan_for_single_and_spread/)'
+cargo nextest run -p mimageviewer --lib -E 'test(/page_turn::prepare_boundary_tests::pan_bounds_tests/)'
+cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen::pan_bounds/) | test(/ui_fullscreen::initial_placement/) | test(/ui_fullscreen::in_page_scroll/) | test(/ui_fullscreen::front_popup_input_tests/) | test(/ui_fullscreen::overflow_input_tests/) | test(/pan_clamp/) | test(/page_material_kind_survives_prepare/) | test(/page_turn::resident_placement_tests/) | test(/page_turn::wait_indicator_tests/) | test(/page_turn::prepare_boundary_tests/) | test(/page_turn::nonfinal_tests/)'
 cargo fmt
 git diff --check
 ```
@@ -310,11 +335,13 @@ git diff --check
 `target/806-tests-r2.{stdout,stderr}.log`、`target/806-r3-tests.{stdout,stderr}.log`、
 `target/806-check-r4.{stdout,stderr}.log`、`target/806-r4-tests.{stdout,stderr}.log`、
 `target/806-r5-tests.{stdout,stderr}.log`、`target/806-r6-tests.{stdout,stderr}.log`、
-`target/806-check-r6.{stdout,stderr}.log`。TEMP/TMPはworktree内の `target/806-tmp` を指定。
+`target/806-check-r6.{stdout,stderr}.log`、`target/806-r7-boundary-tests.{stdout,stderr}.log`、
+`target/806-r7b-boundary-tests.{stdout,stderr}.log`、`target/806-r8-related-tests.{stdout,stderr}.log`、
+`target/806-r9-final-check.{stdout,stderr}.log`。TEMP/TMPはworktree内の `target/806-tmp` を指定。
 初回はsandboxによりrunnerのlock書込みができず低優先度・6並列で実行、再実行は他担当のfull lock待ちになった。
 全件gate・build-dev・製品起動・コミットは実施していない。
 
-追加したテスト名（23件）:
+追加したテスト名（27件）:
 
 <!-- 806-test-names -->
 - `rotated_single_is_bounded_in_the_same_frame_with_matching_layout_and_stamp`
@@ -340,6 +367,10 @@ git diff --check
 - `unfocused_rotation_menu_rejects_default_and_remapped_navigation_before_consumption`
 - `rotation_menu_preserves_rotation_shortcuts_and_source_seek_keeps_early_return`
 - `root_navigation_is_unconsumed_for_destination_rotation_and_seek_and_resumes_after_close`
+- `held_single_matches_before_pan_and_bounds_the_first_released_complete_frame`
+- `held_spread_bounds_only_the_first_released_complete_frame`
+- `one_held_spread_page_keeps_the_entire_unit_pan`
+- `completing_without_matching_held_pages_still_bounds_normal_material`
 <!-- /806-test-names -->
 
 既存テストの期待値更新: `fallback_menu_leaves_navigation_arrows_unconsumed_without_moving_or_turning`、
@@ -374,10 +405,11 @@ Centerを含め既存の幾何を維持し、通常の完成素材のパン制�
 最終選択素材の「その枠へ描くtransform」で提案・確定し、暫定素材／部分描画では収めない。
 §5の不変条件は変更せず、§3.4をこの裁定に合わせて明確化した。実装担当は同WIP上で再開し、コミットは行わない。
 
-### 6.7 最終の保持素材への束縛についての停止報告（2026-11-19）
+### 6.7 最終の保持素材への束縛についての停止報告と裁定①（2026-11-19）
 
-裁定①のCenter fallbackは修正したが、「素材のprepare後」が最終選択ではない経路がある。
-以下はコード所見で、パン制限との組み合わせを実行で再現した記録ではない。現行の対象268件は成功するが、この組み合わせの回帰テストはまだ無い。
+以下は停止時WIP（`ff2abdf5a`、行番号も停止時）の所見。これに対する裁定と実装はこの節の末尾に記録する。
+Center fallbackは修正したが、「素材のprepare後」が最終選択ではない経路があった。
+停止時はコード所見で、パン制限との組み合わせを実行で再現した記録ではない。当時の対象268件は成功したが、この組み合わせの回帰テストはまだ無かった。
 
 - 通常描画は `src/ui_fullscreen.rs:45756` からprepare後の素材／transformで補正し、パンと初期配置を確定した後、同 `45842` で `page_turn_bind_prepared` を呼ぶ。
   見開きもprepare後の左右から補正・確定し、同 `52659` の最終束縛が後に残る。
@@ -406,6 +438,17 @@ Centerを含め既存の幾何を維持し、通常の完成素材のパン制�
 再開後の検証には、既存の `page_turn::prepare_boundary_tests`（Center fallbackと初期配置を含む）・
 `page_turn::nonfinal_tests` と、この束縛の前後で完成／暫定・形が変わる境界の回帰を加える。
 最終checkは未開始のまま中止し、コミットせずWIPとして引き渡す。
+
+**裁定①（上記停止後の設計担当決定）**: 保持素材を描く表示は§3.3の一時表示とする。
+既存の最終束縛に使う補正前のtransformで同じ照合を先に行い、保持を選ぶならパンを提案も確定もしない。
+見開きは片側でも保持なら表示単位全体を一時表示とする。stateを一括で除外せず、保持を使わない完成素材のframeでは収める。
+補正によって保持→非保持へ照合結果を変えない順序とし、保持解除後の最初の完成素材で収める。
+WIPは設計担当が `ff2abdf5a` としてコミットし、実装担当はその上で再開した（コミットしない）。
+
+実装は最終束縛の照合helperを共用し、束縛・state・viewportの経路を維持した。初期配置要求の無い経路へ素材選択loopを広げない。
+保持とpanを同時に再選択する案②を採らず、一時表示ではpanを所有しない条件へそろえることで、保持→通常素材の選択と補正を相互依存させない。
+境界の4件と `prepare_boundary_tests`・`nonfinal_tests` の成功結果は§6.5に記録した。
+裁定①どおりの実装と検証を完了し、この停止事項は解消した。
 
 ## 7. 実装前の独立レビュー
 

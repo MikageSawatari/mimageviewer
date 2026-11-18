@@ -45741,7 +45741,7 @@ impl App {
                 }
                 return Some(transform);
             }
-            let Some(mut paint_resource) = self.prepare_fs_paged_paint_payload(
+            let Some(paint_resource) = self.prepare_fs_paged_paint_payload(
                 resource,
                 &transform,
                 &painter,
@@ -45753,10 +45753,28 @@ impl App {
                 using_full_texture = false;
                 continue;
             };
+            let mut page = PreparedPagedPage {
+                crop,
+                occurrence: SpreadPageOccurrence {
+                    idx: page_idx,
+                    role: SpreadPageRole::Navigation,
+                    navigation_anchor_idx: page_idx,
+                },
+                transform,
+                resource: paint_resource,
+                painter: painter.clone(),
+                underlay: bg_style.clone(),
+                spine: None,
+                live: live_eligible
+                    && using_full_texture
+                    && matches!(layout_source, FsPageLayoutSource::CurrentItem),
+            };
             let mut bounded_pan = None;
             if matches!(layout_source, FsPageLayoutSource::CurrentItem)
                 && self.fs_draw_pan_eligible(selected_current, original_preview_active)
-                && paint_resource.page_material_kind() == FullscreenPageMaterialKind::Complete
+                && page.resource.page_material_kind() == FullscreenPageMaterialKind::Complete
+                // Freeze the existing binding choice using the uncorrected view.
+                && (submitted.is_none() || self.page_turn_prepared_held_page(&page).is_none())
                 && normal_zoom_pan(transform).is_some()
             {
                 let correction = draw_pan_correction(std::slice::from_ref(&transform));
@@ -45797,7 +45815,12 @@ impl App {
                         using_full_texture = false;
                         continue;
                     }
-                    paint_resource = prepared;
+                    page.resource = prepared;
+                    page.transform = transform;
+                    page.painter = painter.clone();
+                    page.live = live_eligible
+                        && using_full_texture
+                        && matches!(layout_source, FsPageLayoutSource::CurrentItem);
                 }
             }
             let white = white_companion_override
@@ -45813,7 +45836,7 @@ impl App {
                     selected_current,
                     full_rect,
                     initial_zero_pan_unit,
-                    paint_resource.page_material_kind(),
+                    page.resource.page_material_kind(),
                 );
             }
             if let Some(pan) = bounded_pan {
@@ -45822,22 +45845,6 @@ impl App {
             if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
                 self.observe_raw_presentation(page_idx);
             }
-            let page = PreparedPagedPage {
-                crop,
-                occurrence: SpreadPageOccurrence {
-                    idx: page_idx,
-                    role: SpreadPageRole::Navigation,
-                    navigation_anchor_idx: page_idx,
-                },
-                transform,
-                resource: paint_resource,
-                painter: painter.clone(),
-                underlay: bg_style.clone(),
-                spine: None,
-                live: live_eligible
-                    && using_full_texture
-                    && matches!(layout_source, FsPageLayoutSource::CurrentItem),
-            };
             let page = if submitted.is_some() {
                 self.page_turn_bind_prepared(page)
             } else {
@@ -52417,6 +52424,10 @@ impl App {
                     && [left, right].iter().all(|page| {
                         page.resource.page_material_kind() == FullscreenPageMaterialKind::Complete
                     })
+                    && (!submit_final
+                        || [left, right]
+                            .iter()
+                            .all(|page| self.page_turn_prepared_held_page(page).is_none()))
                 {
                     let correction = draw_pan_correction(&[left.transform, right.transform]);
                     if correction != egui::Vec2::ZERO {

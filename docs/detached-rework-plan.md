@@ -1462,6 +1462,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 [採択設計（案C）](fullscreen-pan-and-front-menu-input-plan.md)に従い、各contextが通常の完成素材を
 描く境界で自身の `fs_pan` と自動初期配置の比較値を確定し、同じlayoutへ最終transformを記録する。
+紙めくりの保持素材を選ぶframe（OFFのCompletingと片側だけの保持を含む）は、補正前の束縛照合で一時表示として除外する。
 見開きの固定間隔と側は描いたページへ記録する。新しいcontext field、detached述語、viewport経路は追加・変更しない。
 キー側は§1.474の配送元／配送先Popup照会をナビゲーションの消費前で共用するだけで、配送は変えない。
 入力時だけの制約を描画の所有境界にも適用する構造的修正であり、回転検出・待機・retry・repaintは追加しない。

@@ -2282,26 +2282,37 @@ impl App {
         Some(old)
     }
 
-    pub(super) fn page_turn_bind_prepared(&self, page: PreparedPagedPage) -> PreparedPagedPage {
-        let Some(old) = self.page_turn_matching_held_page(
+    /// The final binding choice, also queried before proposing a draw-time pan.
+    /// Keep the held-view and material checks in one place: changing pan first
+    /// would otherwise change which immutable presentation owns this frame.
+    pub(super) fn page_turn_prepared_held_page(
+        &self,
+        page: &PreparedPagedPage,
+    ) -> Option<&PreparedPagedPage> {
+        let old = self.page_turn_matching_held_page(
             page.occurrence.idx,
             &page.transform,
             &page.painter,
             &page.underlay,
             page.live,
-        ) else {
-            return page;
-        };
+        )?;
         if old.occurrence != page.occurrence || old.crop != page.crop {
-            return page;
+            return None;
         }
         // Native reuse was already validated by the shared prepare boundary.
         // Do not revive a rejected Native after its ordinary fallback prepared.
         if old.resource.lanczos_output().is_some()
             && old.resource.paint_texture_id() != page.resource.paint_texture_id()
         {
-            return page;
+            return None;
         }
+        Some(old)
+    }
+
+    pub(super) fn page_turn_bind_prepared(&self, page: PreparedPagedPage) -> PreparedPagedPage {
+        let Some(old) = self.page_turn_prepared_held_page(&page) else {
+            return page;
+        };
         PreparedPagedPage {
             painter: page.painter,
             ..old.clone()
