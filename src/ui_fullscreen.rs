@@ -4943,6 +4943,26 @@ use self::draw_icons::*;
 const METADATA_PANEL_WIDTH: f32 = 380.0;
 /// ホバー時トップバーの高さ
 pub(crate) const TOP_BAR_HEIGHT: f32 = 44.0;
+const SLIDESHOW_PROGRESS_RING_RADIUS: f32 = 8.0;
+const SLIDESHOW_PROGRESS_RING_MARGIN: f32 = 4.0;
+
+fn slideshow_progress_ring_center(
+    content_rect: egui::Rect,
+    avoid: Option<egui::Rect>,
+) -> egui::Pos2 {
+    let mut center = egui::pos2(content_rect.right() - 22.0, content_rect.top() + 22.0);
+    let bounds = egui::Rect::from_center_size(
+        center,
+        egui::Vec2::splat(2.0 * (SLIDESHOW_PROGRESS_RING_RADIUS + SLIDESHOW_PROGRESS_RING_MARGIN)),
+    );
+    if let Some(avoid) = avoid
+        && bounds.intersects(avoid)
+    {
+        center.x = avoid.left() - SLIDESHOW_PROGRESS_RING_MARGIN - SLIDESHOW_PROGRESS_RING_RADIUS;
+    }
+    center
+}
+
 /// 静止画フルスクリーン下端の通常ページシークバーの高さ。
 /// 実際の下端 chrome 高は [`StillSeekGeometry`] で一度だけ解決する。
 pub(crate) const FS_SEEK_BAR_HEIGHT: f32 = 38.0;
@@ -28719,7 +28739,9 @@ impl App {
                         if overview_rendered { return; }
                         // Paint foreground controls first so their current rectangle owns
                         // pointer input and mouse-follow suppression on the first frame too.
-                        let depth_export_requested = self.draw_depth_panel(ctx, fs_idx);
+                        let depth_panel = self.draw_depth_panel(ctx, fs_idx);
+                        let depth_export_requested = depth_panel.as_ref().is_some_and(|panel| panel.export_requested);
+                        let depth_panel_rect = depth_panel.map(|panel| panel.rect);
                         let still_seek_geometry =
                             self.still_seek_geometry_for_idx(full_rect, fs_idx, state.is_video);
                         let resolved_fullscreen_media_rect = self.fullscreen_media_rect_with_geometry(
@@ -29523,7 +29545,7 @@ impl App {
                             &state,
                             slideshow_timer_pass,
                         );
-                        self.draw_slideshow_progress_indicator(ui, content_rect, ctx);
+                        self.draw_slideshow_progress_indicator(ui, content_rect, depth_panel_rect, ctx);
                         if !state.is_video {
                             self.draw_compare_pin_indicator(ui, content_rect, ctx);
                         }
@@ -50668,6 +50690,7 @@ impl App {
         &self,
         ui: &egui::Ui,
         content_rect: egui::Rect,
+        depth_panel_rect: Option<egui::Rect>,
         ctx: &egui::Context,
     ) {
         if !self.slideshow_playing {
@@ -50694,8 +50717,8 @@ impl App {
         };
 
         let painter = ui.painter();
-        let center = egui::pos2(content_rect.max.x - 22.0, content_rect.min.y + 22.0);
-        let radius = 8.0;
+        let center = slideshow_progress_ring_center(content_rect, depth_panel_rect);
+        let radius = SLIDESHOW_PROGRESS_RING_RADIUS;
         painter.circle_stroke(
             center,
             radius,

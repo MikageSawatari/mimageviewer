@@ -442,7 +442,7 @@ fn depth_collapsed_wait_indicator_can_use_the_old_panel_body() {
                 ..Default::default()
             },
             |ui| {
-                app.draw_depth_panel(ui.ctx(), 0);
+                let _ = app.draw_depth_panel(ui.ctx(), 0);
                 app.draw_depth_wait_indicator(ui, full, ui.ctx(), ActionSurface::Viewer);
             },
         );

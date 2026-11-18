@@ -1900,7 +1900,10 @@ fn depth_panel_footer_uses_live_keymap_through_app_draw() {
                     ..Default::default()
                 },
                 |ctx| {
-                    assert!(!app.draw_depth_panel(ctx, 0));
+                    assert!(
+                        !app.draw_depth_panel(ctx, 0)
+                            .is_some_and(|panel| panel.export_requested)
+                    );
                 },
             );
             texts.clear();

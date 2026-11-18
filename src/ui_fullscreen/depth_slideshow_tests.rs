@@ -16,6 +16,46 @@ fn install_depth(app: &mut App) {
     );
 }
 
+#[test]
+fn depth_slideshow_progress_ring_ignores_stale_bounds_when_panel_is_not_drawn() {
+    let mut app = crate::app::setup_app_for_test();
+    install_depth(&mut app);
+    let ctx = egui::Context::default();
+    let old = egui::Rect::from_min_size(egui::pos2(688.0, 60.0), egui::vec2(300.0, 400.0));
+    ctx.data_mut(|data| data.insert_temp(app.depth_panel_rect_id(), old));
+    assert_eq!(app.visible_depth_panel_rect(&ctx), Some(old));
+    let panel = app.draw_depth_panel(&ctx, usize::MAX);
+    assert!(panel.is_none());
+    assert_eq!(app.visible_depth_panel_rect(&ctx), Some(old));
+    app.slideshow_playing = true;
+    let content = egui::Rect::from_min_max(egui::pos2(0.0, 44.0), egui::pos2(1000.0, 700.0));
+    let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+        app.draw_slideshow_progress_indicator(
+            ui,
+            content,
+            panel.as_ref().map(|panel| panel.rect),
+            &ctx,
+        );
+    });
+    let centers: Vec<_> = output
+        .shapes
+        .iter()
+        .filter_map(|shape| match &shape.shape {
+            egui::Shape::Circle(circle) => Some(circle.center),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(centers, vec![egui::pos2(978.0, 66.0)]);
+    output.drop_without_applying_deltas();
+    let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+        unreachable!()
+    };
+    state.panel_visible = false;
+    assert_eq!(app.visible_depth_panel_rect(&ctx), None);
+    app.set_fs_exclusive_view(FsExclusiveView::None, "depth_progress_panel_hidden_test");
+    assert_eq!(app.visible_depth_panel_rect(&ctx), None);
+}
+
 fn enter_panorama(app: &mut App) {
     app.set_fs_exclusive_view(FsExclusiveView::None, "panorama_test");
     if let Some(FsCacheEntry::Static { source_dims, .. }) = app.fs_cache.get_mut(&0) {
@@ -278,6 +318,76 @@ fn depth_slideshow_stop_drops_the_context_owned_next_slot() {
 mod gpu_tests {
     use super::*;
     use crate::app::depth_main_window_tests::RootDepthViewer;
+
+    #[test]
+    fn depth_slideshow_progress_ring_actual_draw_avoids_only_the_visible_panel() {
+        fn collect_rings(shape: &egui::Shape, centers: &mut Vec<egui::Pos2>) {
+            match shape {
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect_rings(shape, centers);
+                    }
+                }
+                egui::Shape::Circle(circle)
+                    if circle.radius == 8.0
+                        && circle.stroke
+                            == egui::Stroke::new(1.2, egui::Color32::from_white_alpha(42)) =>
+                {
+                    centers.push(circle.center);
+                }
+                _ => {}
+            }
+        }
+        let _input = crate::key_input::lock_test_input();
+        let mut app = crate::app::setup_app_for_test();
+        let mut viewer = RootDepthViewer::new(&mut app);
+        viewer.ready(&mut app);
+        app.settings.fullscreen_fixed_bar_gap_px = 0;
+        app.settings.slideshow_interval_secs = 3600.0;
+        app.slideshow_playing = true;
+        app.schedule_next_slideshow_from_now();
+        for (locked, visible, collapsed) in [
+            (true, true, false),
+            (true, true, true),
+            (true, false, true),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            app.settings.fullscreen_top_bar_locked = locked;
+            app.settings.depth_parallax.panel_collapsed = collapsed;
+            let FsExclusiveView::Depth(state) = &mut app.fs_exclusive_view else {
+                unreachable!()
+            };
+            state.panel_visible = visible;
+            viewer.frame(&mut app, vec![]);
+            assert!(app.slideshow_playing);
+            assert!(
+                !viewer.callbacks().is_empty(),
+                "the real 3D callback must be submitted"
+            );
+            let mut centers = vec![];
+            for shape in &viewer.shapes {
+                collect_rings(&shape.shape, &mut centers);
+            }
+            assert_eq!(centers.len(), 1, "one actual progress ring: {centers:?}");
+            let center = centers[0];
+            assert_eq!(center.y, if locked { 66.0 } else { 22.0 });
+            let panel = app.visible_depth_panel_rect(&viewer.ctx);
+            assert_eq!(panel.is_some(), visible);
+            if let Some(panel) = panel {
+                assert!(
+                    !egui::Rect::from_center_size(center, egui::Vec2::splat(16.0))
+                        .intersects(panel)
+                );
+                if locked {
+                    assert_eq!(center.x, panel.left() - 12.0);
+                }
+            }
+            if !locked || !visible {
+                assert_eq!(center.x, viewer.size.x - 22.0);
+            }
+        }
+    }
 
     fn assert_panorama_hover_bar_hides_playback() {
         // Test the production HUD directly: Panorama's canvas/resources are a

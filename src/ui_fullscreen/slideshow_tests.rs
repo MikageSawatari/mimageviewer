@@ -3,6 +3,43 @@ use super::*;
 use crate::ring_shortcut::{RingActionId, RingShortcutContext};
 use std::time::{Duration, Instant};
 
+#[test]
+fn slideshow_progress_ring_keeps_default_position_without_panel_overlap() {
+    let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0));
+    let panel = egui::Rect::from_min_size(egui::pos2(688.0, 60.0), egui::vec2(300.0, 400.0));
+    assert_eq!(
+        slideshow_progress_ring_center(full, None),
+        egui::pos2(978.0, 22.0)
+    );
+    assert_eq!(
+        slideshow_progress_ring_center(full, Some(panel)),
+        egui::pos2(978.0, 22.0)
+    );
+    let content = egui::Rect::from_min_max(egui::pos2(0.0, 44.0), full.max);
+    assert_eq!(
+        slideshow_progress_ring_center(content, None),
+        egui::pos2(978.0, 66.0)
+    );
+    let far_panel = panel.translate(egui::vec2(-400.0, 0.0));
+    assert_eq!(
+        slideshow_progress_ring_center(content, Some(far_panel)),
+        egui::pos2(978.0, 66.0)
+    );
+}
+
+#[test]
+fn slideshow_progress_ring_avoids_expanded_and_collapsed_panel_with_locked_top_bar() {
+    let content = egui::Rect::from_min_max(egui::pos2(0.0, 44.0), egui::pos2(1000.0, 700.0));
+    for height in [30.0, 400.0] {
+        let panel = egui::Rect::from_min_size(egui::pos2(688.0, 60.0), egui::vec2(300.0, height));
+        let center = slideshow_progress_ring_center(content, Some(panel));
+        assert_eq!(center, egui::pos2(676.0, 66.0));
+        let ring = egui::Rect::from_center_size(center, egui::Vec2::splat(16.0));
+        assert!(!ring.intersects(panel));
+        assert_eq!(panel.left() - ring.right(), 4.0);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Entry {
     Hud,
