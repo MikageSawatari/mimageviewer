@@ -30125,6 +30125,16 @@ impl App {
     }
 
     #[cfg(test)]
+    /// Pump the actual frame-tail arbiter without inventing another navigation input.
+    /// Shared settle loops call this once per iteration and include the pending owner
+    /// in their idle condition, just as they do for history/ZIP/sidecar preparation.
+    pub(crate) fn poll_direct_navigation_scan_for_test(&mut self, ctx: &egui::Context) {
+        if self.direct_navigation_scan_pending() {
+            self.post_render_main_navigation(ctx, update_phases::MainFrameNavigation::default());
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn poll_history_navigation_transition_for_test(&mut self, ctx: &egui::Context) {
         self.poll_collection_history_transition(ctx);
     }
@@ -30237,8 +30247,10 @@ impl App {
         // Favorites and other direct inputs bypass the _owned load admissions below.
         // Normalize the accepted copy before classification; keep saved records intact.
         let path = crate::path_key::normalize_input_path(&path);
-        if Self::path_needs_open_classification(&path) {
-            let scan_completion = pre_scan.is_some();
+        // A successful directory scan already proves the kind. Reclassifying by suffix
+        // would add another asynchronous owner for the completed scan's fullscreen intent.
+        let classified_kind = pre_scan.as_ref().map(|_| OpenPathKind::Directory);
+        if pre_scan.is_none() && Self::path_needs_open_classification(&path) {
             let continuation = ClassifiedOpenContinuation::DirectNavigation {
                 restore_intent: restore_intent.clone(),
                 pre_scan,
@@ -30258,11 +30270,6 @@ impl App {
             match admission {
                 OpenAdmission::Accepted => {}
                 OpenAdmission::Refused(reason) => {
-                    // A completed grid/pane scan can re-enter suffix classification.
-                    // Refusal here is terminal too, before the classified consumer runs.
-                    if scan_completion {
-                        self.pending_auto_fs_open = false;
-                    }
                     self.show_open_admission_refusal(reason);
                 }
                 OpenAdmission::NotApplicable => {
@@ -30277,7 +30284,7 @@ impl App {
             owner,
             navigation,
             pane_epub_restore,
-            None,
+            classified_kind,
             restore_intent.clone(),
             stage,
         );
@@ -30304,6 +30311,9 @@ impl App {
         });
         let scan_completion = pre_scan.is_some();
         let outcome = match pre_scan {
+            // Classification used to enforce this admission before Smart's early
+            // return below the owned loader. Preserve it when a scan proves Directory.
+            Some(_) if self.document_open_modal_admission_blocked() => FolderOpenOutcome::Ignored,
             Some(scan) => self
                 .load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation_at_stage(
                     path.clone(),

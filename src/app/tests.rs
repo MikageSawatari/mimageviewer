@@ -7699,6 +7699,13 @@ fn phase_b_query_change_discards_old_stream_and_prepare() {
         &old_prepare_cancel,
         &app.search_prepare_cancel_for_test(),
     ));
+    // The empty projection is prepared asynchronously too. Establish its adoption
+    // before observing whether any late result from the cancelled producer reappears.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.items.is_empty() && std::time::Instant::now() < deadline {
+        app.poll_global_search_events(&ctx);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
     for _ in 0..100 {
         app.poll_global_search_events(&ctx);
         std::thread::sleep(std::time::Duration::from_millis(5));

@@ -142,11 +142,11 @@ fn menubar_plain_favorite_uses_existing_direct_navigation_and_history() {
     let mut app = app.borrow_mut();
     assert_eq!(app.current_folder.as_ref(), Some(&origin));
     app.post_render_main_navigation(&egui::Context::default(), navigation(Some(candidate)));
+    settle_menu_navigation(&mut app, Some(&target));
     assert!(
         app.folder_pane_open_pending.is_none(),
         "plain favorite must keep Direct rather than search-exit pane scan"
     );
-    settle_menu_navigation(&mut app, Some(&target));
     app.verify_admitted_user_navigation_for_test(&target, &origin);
     assert_eq!(app.current_folder.as_ref(), Some(&origin));
 }

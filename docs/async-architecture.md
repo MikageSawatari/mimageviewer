@@ -726,6 +726,9 @@ Surfaceもswitch epochを省略しない。Bookmarkはコピー済み入力のna
 | `startup_ops.rs::start_startup_open_path_resolution_owned_with_navigation` | Bookmark（native resolver request ID/target）。alias・page待ちでも同要求をmoveし、取消はexact IDで行う。通常startupはnative startup ownerで共通main要求を新規captureしない |
 | copied detached archive／Bookmark読込 | main資格のないwindow contextへ渡し、native window lease＋request ID（そのwindowの切替epoch相当）を検証。common main headerを新規captureしない。コピー前に元indexを読むDetachedGrid分類は上のRow。main switch sequenceを別windowへpublishしない |
 
+成功したfolder scanの完了は、拡張子にかかわらずDirectoryとしてconsumerへ渡し、分類workerを再度挟まない。
+ツリー・GridFolderCandidate・DirectNavigationの全画面予約が分類の取消・失敗・staleを跨ぐ組み合わせをなくす（§1.805実装レビューP2）。
+
 Surface取得不能時の既存Row fallbackは保持する（main以外にはmain採用資格がない）。
 表にあるRow＋native validatorでは、共通のitems世代を外すこともnative revision/index検証を外すこともしない。
 

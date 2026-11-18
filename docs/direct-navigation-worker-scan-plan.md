@@ -22,8 +22,9 @@ metadata を読む。利用者の perf ログでは `nav/lf_scan` (`pre_scanned=
 
 ### 2.1 consumer (1 か所)
 
-`open_direct_navigation_target_at_stage` → (`path_needs_open_classification` でなければ)
-`open_direct_navigation_target_classified`。`pre_scan` が `Some` なら
+`open_direct_navigation_target_at_stage` → `pre_scan` が `Some` なら確定済みのDirectoryとして、
+`None` なら `path_needs_open_classification` に従って、`open_direct_navigation_target_classified` へ進む。
+`pre_scan` が `Some` なら
 `load_folder_with_scan_owned_outcome_and_effects_classified_with_navigation_at_stage`、`None` なら上記の同期経路。
 
 ### 2.2 `pre_scan = None` でこの consumer に入る producer
@@ -166,6 +167,11 @@ enum DirectoryScanRoute { UiThread, Worker }
 
 ### 4.3 完了 (既存の裁定へ戻す)
 
+- 独立実装レビューP2対応（2026-11-18、設計担当判断）: 成功した `pre_scan = Some` は実ディレクトリの証明なので、
+  `open_direct_navigation_target_at_stage` で拡張子による分類へ再入せず、`classified_kind = Some(Directory)` として
+  consumerへ渡す。ツリー・GridFolderCandidate・DirectNavigationの全完了で、全画面予約が分類要求の寿命を跨ぐ段をなくす。
+  分類入口のRefusedだけで予約を消す以前の処理は撤去する。snapshot・ownerの検証は既存のDirectory読込側に残す。
+  文書modalは、claimより前に戻るSmart分岐も通さないよう、走査済みconsumerの受付で従来の分類入口の拒否を維持する。
 - `poll_folder_pane_open` はそのまま (sidecar 復元中の保留、navigation の stale 取消、`Disconnected` の扱い)。
 - `resolve_main_folder_open_ready` に `DirectNavigation` の腕を足し、`pending_auto_fs_open = auto_fullscreen` を
   設定してから `ResolvedMainFolderOpen { restore_intent, path, scan, collection_owner, epub_restore: None, navigation }`
@@ -271,6 +277,10 @@ enum DirectoryScanRoute { UiThread, Worker }
 12. test-script の要求数が受付時 1 回のまま (取消された受理済み要求も数える)。
 13. 既存テストのうち、`pre_scan = None` の直接移動の直後に同期採用を前提にしていたものは、worker 完了 + 裁定を
     回す helper を通す形に直す (挙動の期待値は変えない)。期待値を変える必要が出たら止めて報告する。
+
+独立実装レビューP3対応（2026-11-18）: 完了helperは `post_render_main_navigation` を通す。
+ready済みの直接移動と同じフレームのお気に入り・アドレス欄・ツリー入力の競合、および
+実DFS workerの結果を実際の `poll_folder_nav` で取り出した後の置換を回帰テストに含める。
 
 ## 6. 文書の更新
 

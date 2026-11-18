@@ -6,6 +6,7 @@ fn session1328_settle(app: &mut App) {
     let ctx = egui::Context::default();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
+        app.poll_direct_navigation_scan_for_test(&ctx);
         app.poll_collection_history_transition(&ctx);
         app.poll_zip_enumerate();
         app.poll_pdf_enumerate();
@@ -13,10 +14,11 @@ fn session1328_settle(app: &mut App) {
         app.poll_reading_history_thumbnail_sources(&ctx);
         app.poll_rating_view();
         app.poll_sidecar_restore(&ctx);
-        if app
-            .top_level_grid_view
-            .history_navigation_transition()
-            .is_none()
+        if !app.direct_navigation_scan_pending()
+            && app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
             && app.subfolder_expansion_pending.is_none()
             && app.subfolder_expansion_install_pending.is_none()
             && app.reading_history_sources_pending.is_empty()

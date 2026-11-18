@@ -8,6 +8,7 @@
 use super::*;
 
 /// Navigation values captured during this root UI pass; never retained by App.
+#[cfg_attr(test, derive(Default))]
 pub(super) struct MainFrameNavigation {
     pub(super) fav_nav: Option<crate::ui_main::LocationJumpTarget>,
     pub(super) toolbar_fav_nav: Option<PathBuf>,

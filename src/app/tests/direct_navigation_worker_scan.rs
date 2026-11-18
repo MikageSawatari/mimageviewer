@@ -8,23 +8,10 @@ impl App {
         let ctx = egui::Context::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while self.direct_navigation_scan_pending() {
-            if let Some(ready) = self.poll_folder_pane_open(&ctx) {
-                if let Some(ready) = self.resolve_main_folder_open_ready(&ctx, ready) {
-                    let owner = ready.collection_owner.map_or(
-                        OpenRequestOwner::Navigation,
-                        OpenRequestOwner::CollectionGridPhysical,
-                    );
-                    self.open_direct_navigation_target_at_stage(
-                        ready.path,
-                        Some(ready.scan),
-                        owner,
-                        ready.navigation,
-                        ready.epub_restore,
-                        ready.restore_intent,
-                        MainListRequestStage::Continuation,
-                    );
-                    self.finish_page_identity_preparation_for_test();
-                }
+            self.poll_sidecar_restore(&ctx);
+            self.poll_direct_navigation_scan_for_test(&ctx);
+            if !self.direct_navigation_scan_pending() {
+                self.finish_page_identity_preparation_for_test();
                 return;
             }
             assert!(
@@ -51,6 +38,242 @@ fn folder(app: &super::phase_c_support::AppTestEnv, name: &str) -> PathBuf {
     let path = app.tmp.path().join(name);
     std::fs::create_dir_all(&path).unwrap();
     path
+}
+
+/// Preserve the actual worker reply, holding it ready without adopting it. Only
+/// the transport is substituted; the following frame still polls the real arbiter.
+fn make_scan_ready(app: &mut App) -> Arc<AtomicBool> {
+    let pending = app.folder_pane_open_pending.as_mut().unwrap();
+    let scan = pending
+        .rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    let cancel = pending.cancel.clone();
+    let (tx, rx) = mpsc::channel();
+    tx.send(scan).unwrap();
+    pending.rx = rx;
+    cancel
+}
+
+#[test]
+fn direct_navigation_worker_ready_scan_yields_to_same_frame_navigation_inputs() {
+    for input in ["favorite", "address", "tree"] {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        let origin = folder(&app, "origin");
+        let a = folder(&app, "a");
+        let b = folder(&app, "b");
+        app.load_folder(origin.clone());
+        app.finish_page_identity_preparation_for_test();
+        open(&mut app, a.clone());
+        let cancel = make_scan_ready(&mut app);
+        let generation = app.items_generation;
+        let mut frame = update_phases::MainFrameNavigation::default();
+        match input {
+            "favorite" => frame.toolbar_fav_nav = Some(b.clone()),
+            "address" => {
+                frame.address_nav = Some(crate::ui_main::AddressBarNav::AddressInput(
+                    crate::ui_main::LocationJumpTarget::Physical(b.clone()),
+                ))
+            }
+            "tree" => frame.folder_pane_nav = Some(b.clone()),
+            _ => unreachable!(),
+        }
+        let ctx = egui::Context::default();
+        app.post_render_main_navigation(&ctx, frame);
+        if input != "tree" {
+            assert!(cancel.load(Ordering::Relaxed), "{input}");
+        }
+        assert_eq!(
+            app.current_folder.as_ref(),
+            Some(&origin),
+            "A must not be installed"
+        );
+        assert_eq!(app.items_generation, generation);
+        assert_eq!(app.folder_pane_open_pending.as_ref().unwrap().path, b);
+        make_scan_ready(&mut app);
+        app.post_render_main_navigation(&ctx, update_phases::MainFrameNavigation::default());
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.current_folder.as_ref(), Some(&b), "{input}");
+        assert_eq!(app.folder_nav_back_stack.len(), 1);
+        assert_eq!(
+            app.folder_nav_back_stack[0].location,
+            FolderNavHistoryTarget::Path(origin)
+        );
+    }
+}
+
+#[test]
+fn direct_navigation_worker_successful_scan_of_classified_suffix_never_reclassifies_or_leaks_fullscreen()
+ {
+    for suffix in ["epub", "7z"] {
+        let mut app = setup_app();
+        app.active_quick_folder_slot = None;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        let origin = folder(&app, "origin");
+        let a = folder(&app, &format!("A.{suffix}"));
+        let b = folder(&app, "B");
+        for path in [&a, &b] {
+            image::RgbImage::new(2, 3)
+                .save(path.join("page.png"))
+                .unwrap();
+        }
+        app.load_folder(origin);
+        app.start_folder_open_scan(
+            a.clone(),
+            FolderOpenScanPurpose::DirectNavigation {
+                restore_intent: StartupListIntent::ClassifyFolder,
+                collection_owner: None,
+                auto_fullscreen: true,
+            },
+        );
+        make_scan_ready(&mut app);
+        let ctx = egui::Context::default();
+        app.post_render_main_navigation(&ctx, update_phases::MainFrameNavigation::default());
+        assert!(
+            app.top_level_grid_view.open_path_classification().is_none(),
+            "{suffix}"
+        );
+        assert_eq!(app.current_folder.as_ref(), Some(&a));
+        app.finish_page_identity_preparation_for_test();
+        assert!(
+            app.fullscreen_idx.is_some(),
+            "the original reservation is consumed by A"
+        );
+        assert!(!app.pending_auto_fs_open);
+        app.close_fullscreen();
+        app.finish_page_identity_preparation_for_test();
+        app.post_render_main_navigation(
+            &ctx,
+            update_phases::MainFrameNavigation {
+                toolbar_fav_nav: Some(b.clone()),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            app.folder_pane_open_pending.as_ref().unwrap().purpose,
+            FolderOpenScanPurpose::DirectNavigation {
+                auto_fullscreen: false,
+                ..
+            }
+        ));
+        app.finish_direct_navigation_scan_for_test();
+        assert_eq!(app.current_folder.as_ref(), Some(&b));
+        assert!(
+            app.fullscreen_idx.is_none(),
+            "B must not inherit A's reservation"
+        );
+    }
+}
+
+#[test]
+fn direct_navigation_worker_admission_after_real_dfs_poll_retires_sequence() {
+    let mut app = setup_app();
+    app.active_quick_folder_slot = None;
+    let a = folder(&app, "a");
+    let b = folder(&app, "b");
+    let c = folder(&app, "c");
+    for path in [&a, &b, &c] {
+        image::RgbImage::new(2, 3)
+            .save(path.join("page.png"))
+            .unwrap();
+    }
+    app.load_folder(a.clone());
+    app.finish_page_identity_preparation_for_test();
+    app.capture_fs_nav_holdover(0);
+    app.start_folder_nav(a.clone(), true, FolderNavMode::Fullscreen);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let result = loop {
+        if let Some(result) = app.poll_folder_nav() {
+            break result;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "actual DFS did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    };
+    assert!(result.target.is_some());
+    assert!(app.folder_nav_pending.is_none());
+    assert!(app.fs_nav_locked_gen.is_some());
+    assert!(app.fs_holdover_tex.is_some());
+    // This is the poll/tail boundary at which a newer higher-priority input wins
+    // instead of applying the old DFS candidate.
+    app.post_render_main_navigation(
+        &egui::Context::default(),
+        update_phases::MainFrameNavigation {
+            toolbar_fav_nav: Some(c.clone()),
+            ..Default::default()
+        },
+    );
+    assert_eq!(app.current_folder.as_ref(), Some(&a));
+    assert!(app.fs_nav_locked_gen.is_none());
+    assert!(app.fs_holdover_tex.is_none());
+    app.finish_direct_navigation_scan_for_test();
+    assert_eq!(app.current_folder.as_ref(), Some(&c));
+}
+
+#[test]
+fn direct_navigation_worker_known_directory_keeps_modal_admission_before_smart_early_return() {
+    let mut app = setup_app();
+    let source = folder(&app, "smart-source");
+    let target = folder(&app, "smart-source/A.epub");
+    image::RgbImage::new(2, 3)
+        .save(target.join("page.png"))
+        .unwrap();
+    let mut definition = crate::settings::SmartFolderDefinition::new("modal admission");
+    definition.rules.push(crate::settings::SmartFolderRule::new(
+        source,
+        true,
+        Default::default(),
+    ));
+    let id = definition.id;
+    app.settings.smart_folders = vec![definition];
+    app.open_smart_folder(id, false);
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while app.top_level_grid_view.smart_folder_session().is_none()
+        || app.smart_folder_transition.is_some()
+        || app.smart_folder_pending.is_some()
+        || app.sidecar_restore_active()
+    {
+        app.poll_smart_folder(&ctx);
+        app.poll_sidecar_restore(&ctx);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Smart fixture did not settle"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(app.smart_physical_target_kind(&target).is_some());
+    let generation = app.items_generation;
+    app.epub_batch_convert = Some(
+        crate::ui_dialogs::epub_batch_convert::EpubBatchPending::completed_for_test(
+            target.join("modal.epub"),
+            Ok(crate::epub_convert::SavedPdf {
+                path: target.join("modal.pdf"),
+                reused_cache: false,
+                user_data_errors: vec![],
+                metadata: Default::default(),
+            }),
+        ),
+    );
+    let scan = folder_scan::scan_directory_with_settings(&target, &app.settings).unwrap();
+    app.pending_auto_fs_open = true;
+    app.open_direct_navigation_target_at_stage(
+        target,
+        Some(scan),
+        OpenRequestOwner::Navigation,
+        None,
+        None,
+        StartupListIntent::ClassifyFolder,
+        MainListRequestStage::Continuation,
+    );
+    assert_eq!(app.items_generation, generation);
+    assert!(app.smart_folder_transition.is_none());
+    assert!(app.top_level_grid_view.open_path_classification().is_none());
+    assert!(!app.pending_auto_fs_open);
 }
 
 #[test]
@@ -512,8 +735,8 @@ fn direct_navigation_worker_completion_refusal_drops_fullscreen_for_direct_and_g
         MainListRequestStage::Continuation,
     );
     assert!(!app.pending_auto_fs_open);
-    // A directory bearing a classified suffix can be refused before the classified
-    // consumer. Its completed-scan reservation must end at that admission boundary too.
+    // A proved directory bypasses suffix classification but still refuses the modal
+    // at the consumer. Its completed-scan reservation must end at that boundary too.
     let target = folder(&app, "classified-folder.epub");
     let scan = folder_scan::scan_directory_with_settings(&target, &app.settings).unwrap();
     app.pending_auto_fs_open = true;

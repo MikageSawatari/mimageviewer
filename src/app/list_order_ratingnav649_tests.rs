@@ -96,6 +96,7 @@ fn apply_open(
 fn settle(app: &mut App, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
+        app.poll_direct_navigation_scan_for_test(ctx);
         app.settle_open_path_classification_for_test();
         app.poll_history_navigation_transition_for_test(ctx);
         app.poll_zip_enumerate();
@@ -103,7 +104,8 @@ fn settle(app: &mut App, ctx: &egui::Context) {
         app.poll_sidecar_restore(ctx);
         app.poll_book_composition_service_for_test(ctx);
         app.poll_book_presentation_permission(ctx);
-        if app.top_level_grid_view.open_path_classification().is_none()
+        if !app.direct_navigation_scan_pending()
+            && app.top_level_grid_view.open_path_classification().is_none()
             && app
                 .top_level_grid_view
                 .history_navigation_transition()
