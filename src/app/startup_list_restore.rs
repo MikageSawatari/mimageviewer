@@ -36,6 +36,18 @@ pub(crate) enum StartupListIntent {
 }
 
 impl StartupListIntent {
+    /// A semantic entry may revisit the very same path (e.g. a favorite click).
+    /// Refresh/resume and internal rematerialization keep the current presentation.
+    pub(super) fn enters_folder_list(&self) -> bool {
+        matches!(
+            self.materialization_intent(),
+            Self::ExplicitList
+                | Self::RestoreList { .. }
+                | Self::ClassifyFolder
+                | Self::PageContinuation
+        )
+    }
+
     pub(super) fn replaces_deferred_startup_open(&self) -> bool {
         !matches!(
             self.materialization_intent(),

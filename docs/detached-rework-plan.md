@@ -1470,6 +1470,25 @@ detachedのコード・述語・viewport経路は変更しない。新しい待�
 症状に応じたdetachedの条件追加ではなく、共通表示方針の調整と計装対象の明確化である。
 詳細は[sidecar非同期復元計画](sidecar-import-async-plan.md)のModal表示猶予・計装の記述を参照。
 
+### 2026-11-18: §1.763 コレクション由来の兄弟移動の入力共有
+
+- 合意: 設計担当 (ClaudeCode Opus) の差分確認と、実装者とは別の独立 Sol / xhigh レビュー
+  (r1 REVISE P2 → r2 ACCEPT、コミット 8fd817815 + 3410164e3) で、既存の述語・要求所有者を共有する
+  構造的修正であり症状パッチではないことに合意した。
+- `has_detached_collection_navigation_origin` に既存 Ctrl+上下の Collection return 判定を抽出し、
+  Ctrl+上下の全画面 handler とページ一覧の受付で共有する (Ctrl+上下の判定は変更しない)。
+  兄弟は ZIP 内 DFS を経由せず、同じ Collection origin / outer request へ渡す。独立物理窓の述語・
+  scope・viewport・host・placement の規則は変えない。
+- 兄弟移動・ページ一覧の兄弟受付は、既存の surface / navigation_scope / return_to と context 所有者
+  (`collection_sibling_navigation_origin_available` / `independent_collection_sibling_navigation_available`)
+  で本の移動由来を判定し、★固定・検索の一時一覧が持つ Collection 帰路を由来とみなさない (r1 P2)。
+  本体の★固定・検索・ローカル絞り込みの優先順は §1.763 前と同じ。
+- Collection の pending と Smart の worker / staged preflight への混在追加入力も既存 owner に集約する。
+  新しい detached 状態や pending owner、guard、delay、retry、repaint、reset は追加しない。
+  OuterGrid の PhysicalSource 起点には既存の物理 owner を捕捉して検証し、mount 中の context だけが既存処理を実行する。
+- 別窓 Collection 本の移動で main と別の別窓の items / generation / pending / lock が変わらない
+  handler 回帰を追加する。実アプリの起動・実機確認は本実装作業では行わない。
+
 ### 2026-11-17: §1.800 S1 の仮想フォルダと親との対応
 
 設計担当の §4S（独立設計レビュー r10 ACCEPT）と実装の独立レビューで、UI の一回限りの

@@ -1,5 +1,28 @@
 # フォルダ履歴の現在地と表示位置 — §1.280 / §1.282 / §1.281
 
+### §1.795 通常フォルダ再訪時の位置復元
+
+`restore_folder_cursor_on_revisit` は既定 ON。OFF は通常の実ディレクトリへの入場時だけ、
+`folder_history` の選択・スクロールと `resume_page_for_container` による一覧選択を使わず、
+現在の可視順の先頭とスクロール0を使う。`select_after_load`、操作結果の選択、hydration refresh cursor
+の優先順位は維持し、OFF の入場では明示選択に履歴スクロールを重ねない。
+保存は `note_ordinary_folder_grid_position` に継続して集約する。ON へ戻すだけで従来どおり使える。
+
+入場と再読み込みは既存 `StartupListIntent` の `materialization_intent` で区別する。
+ExplicitList / RestoreList / ClassifyFolder / PageContinuation は入場、RefreshList / ResumeList /
+PreservePresentation / InternalInstall は従来の位置保持、InternalHydration は内側の意図を使う。
+同じパスへのお気に入り・ツリー・アドレス欄からの明示 open も入場なので、`current_folder` の比較は使わない。
+既存の `SidecarLoadContinuation.source_is_directory` と投影 recipe を参照し、新しい I/O や pending は追加しない。
+対象は `ProjectionRecipe::OrdinaryList` の実ディレクトリ。本棚rootも通常の実ディレクトリ一覧として対象にする。
+`Book`（本棚配下の `CompiledFolder`・本として扱う画像folderを含む）、ZIP/PDF/EPUB/変換書庫、
+合成 view、detached の既存境界、本の全画面再開は変更しない。
+起動の明示カーソルは独立した `restore_last_cursor` の規則で適用するため `known_folders` は変更しない。
+
+簡素化: 専用の再表示や保存時の消去を作らず、次の既存読み込みの復元判定へ設定値を渡す。
+この変更には新たな長時間フローや相互割り込みがないため、専用 modal／取消状態は不要。
+まれな保存失敗は既定で割り切り（既存のログ・通知）とし、新しい回復機構は加えない。
+本棚rootへのOFF適用と本の一覧の除外は、設計担当の停止事項への回答による。
+
 ### 5ch >>661のスクロール境界（2026-10-30）
 
 保存・採用する履歴位置の形式と選択の優先順位は維持する。復元位置はcontextの `GridScrollState` が

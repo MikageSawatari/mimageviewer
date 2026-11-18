@@ -43292,6 +43292,9 @@ impl App {
         if self.is_snapshot_active() {
             return None;
         }
+        // Independent physical viewers retain their own sibling mode above. Only a
+        // Smart-origin display wait shares the tree traversal's Smart request here.
+        let sibling = sibling && !self.smart_folder_book_navigation_available();
         if sibling {
             if self.global_search.active
                 || self.favsearch.active
@@ -43428,10 +43431,8 @@ impl App {
         if self.fs_list_order_navigation_blocks_new_target() {
             return;
         }
-        // A follow-up for the same staged Smart DFS belongs to its typed request. The generic
-        // folder-items sequence blocks unrelated targets until adoption, so admit this input
-        // before consulting that block; sibling/page navigation remains blocked as before.
-        if self.accumulate_staged_smart_fullscreen_ctrl_step(forward) {
+        // Compatible list-origin presses belong to the existing request, even before adoption.
+        if self.accumulate_list_origin_fullscreen_navigation(forward, false) {
             return;
         }
         if self.fs_navigation_sequence_blocks_new_target() {
@@ -43439,12 +43440,6 @@ impl App {
             return;
         }
         if self.fs_nav_is_locked() {
-            if self
-                .top_level_grid_view
-                .accumulate_collection_outer_navigation(true, forward)
-            {
-                return;
-            }
             if let Some((current, mode)) = self.locked_fullscreen_folder_nav_request(false) {
                 // A follow-up accepted during the display-wait window targets the next items
                 // generation. Keep the existing holdover handle, but do not let readiness of
@@ -43470,11 +43465,7 @@ impl App {
         // 経路 (Ctrl+G DrilledInto の global_search_ctrl_nav_fullscreen など) も含めて
         // 確実にカバーするため、Ctrl+↑↓ ハンドラの入口で一括で消す
         // (Codex 第 8/9 P2 指摘)。
-        let detached_collection_origin = self.top_level_grid_view.collection_session().is_none()
-            && matches!(
-                self.top_level_grid_view.return_to(),
-                Some(crate::app::top_level_grid_view::TopLevelGridRestore::Collection(_))
-            );
+        let detached_collection_origin = self.has_detached_collection_navigation_origin();
         if detached_collection_origin
             && self.zip_nav.is_some()
             && self.zip_nav_dfs_fullscreen(Some(ctx), fs_idx, forward)
@@ -43482,12 +43473,12 @@ impl App {
             return;
         }
         if detached_collection_origin
-            && self.start_collection_outer_fullscreen_navigation(
+            && self.start_list_origin_fullscreen_navigation(
                 ctx,
                 fs_idx,
                 forward,
-                false,
                 native_toast,
+                false,
             )
         {
             return;
@@ -43508,12 +43499,12 @@ impl App {
         if matches!(
             self.navigation_scope,
             crate::app::ViewerNavigationScope::CollectionRoot
-        ) && self.start_collection_outer_fullscreen_navigation(
+        ) && self.start_list_origin_fullscreen_navigation(
             ctx,
             fs_idx,
             forward,
-            false,
             native_toast,
+            false,
         ) {
             return;
         }
@@ -43599,19 +43590,7 @@ impl App {
             return;
         }
 
-        if self.start_collection_outer_fullscreen_navigation(
-            ctx,
-            fs_idx,
-            forward,
-            false,
-            native_toast,
-        ) {
-            return;
-        }
-
-        if self.top_level_grid_view.smart_folder().is_some() {
-            self.begin_fs_folder_navigation_sequence(ctx, fs_idx);
-            let _ = self.start_smart_folder_scope_nav(forward, true);
+        if self.start_list_origin_fullscreen_navigation(ctx, fs_idx, forward, native_toast, false) {
             return;
         }
 
@@ -43631,9 +43610,13 @@ impl App {
         forward: bool,
         native_toast: bool,
     ) {
-        if self.fs_list_order_navigation_blocks_new_target()
-            || self.fs_navigation_sequence_blocks_new_target()
-        {
+        if self.fs_list_order_navigation_blocks_new_target() {
+            return;
+        }
+        if self.accumulate_list_origin_fullscreen_navigation(forward, true) {
+            return;
+        }
+        if self.fs_navigation_sequence_blocks_new_target() {
             return;
         }
         if self.fs_nav_is_locked() {
@@ -43647,6 +43630,19 @@ impl App {
         self.slideshow_anchor_idx = None;
         self.continuous_reading_scroll_transition = None;
         self.slideshow_scroll_range_cache = None;
+        // Only an independent collection owner precedes physical viewer routing and
+        // App-shared main-list filters. Main keeps its snapshot/search/filter priority.
+        if self.independent_collection_sibling_navigation_available()
+            && self.start_list_origin_fullscreen_navigation(
+                ctx,
+                fs_idx,
+                forward,
+                native_toast,
+                true,
+            )
+        {
+            return;
+        }
         #[cfg(windows)]
         if self.detached_physical_folder_nav_available() {
             if let Some(cur) = self.effective_folder() {
@@ -43701,6 +43697,9 @@ impl App {
         if self.items_are_subfolder_expansion_view {
             self.cancel_pending_folder_nav();
             self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::SubfolderExpansion, native_toast);
+            return;
+        }
+        if self.start_list_origin_fullscreen_navigation(ctx, fs_idx, forward, native_toast, true) {
             return;
         }
         if self.items_are_smart_folder_view {

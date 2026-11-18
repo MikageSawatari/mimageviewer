@@ -1,5 +1,21 @@
 # §1.257 スマートフォルダの物理子・仮想本ナビゲーション
 
+## §1.763 追補: 本を開いた後の兄弟移動（2026-11-17 利用者決定）
+
+スマートフォルダから開いた Folder / ZIP / PDF / EPUB / 変換書庫では、一覧と全画面の兄弟移動も
+Ctrl+上下と同じ `SmartFolderViewState` / `FolderNavMode::SmartFolder` の順・停止条件・端通知を使う。
+Ctrl+上下は従来の ZIP 内 DFS を先に試し、兄弟移動は ZIP 内 DFS を試さず由来順へ進む。
+Root の一覧そのものは従来どおり兄弟移動を行わない。通常フォルダ・検索・タグ・履歴・★固定等は変更しない。
+
+開始は `start_list_origin_grid_navigation` / `start_list_origin_fullscreen_navigation` に集約し、
+keyboard、ring/gamepad、native video、ページ一覧、stack-refresh の既存入力入口から共有する。
+全画面の追加要求は `accumulate_list_origin_fullscreen_navigation` が generic sequence gate より前で
+既存 Collection pending / Smart worker / staged Smart preflight へ渡す。兄弟と Ctrl+上下の混在も
+同じ owner の加減算と上限を使う。ロック中の display-wait は既存 Smart mode へ解決する。
+
+単純化として、新しい並び・pending・再開状態は作らず、既存 request owner を共有する方式を採った。
+新しい modal は通常ナビゲーションを不便にするため追加しない。まれな失敗は既定の割り切り方針を維持する。
+
 状態（2026-09-20）: **§1.257 本体の利用者実機確認から判明した二件を修正し、独立レビュー・全体自動テスト・確認ビルドが完了。追加分も利用者の実機確認済み**。利用者はスマート一覧の PDF open、Folder→Backspace の位置復帰、画像 Folder 内の Ctrl 上下を確認した。root 直下 PDF からの Ctrl 上下と root scan 中の中央モーダル・入力遮断が追加修正の対象である。下記の本体検証結果と旧 core hash は追加修正前のソースに対するものとして区別する。この開発確認版を配布版とは扱わない。エージェントは GUI と実データを操作していない。
 
 ## 観測と根因

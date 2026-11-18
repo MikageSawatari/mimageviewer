@@ -277,6 +277,7 @@ preferences_policy! {
         auto_fullscreen_image_folders: bool => ("画像フォルダを閲覧表示で開く", |_, _| true, plain, plain);
         fullfeature_media_window: bool => ("動画・音声は別ウィンドウで再生", |_, _| true, plain, plain);
         restore_last_cursor: bool => ("前回のカーソルを復元", |_, _| true, plain, plain);
+        restore_folder_cursor_on_revisit: bool => ("フォルダ再訪時のカーソルを復元", |_, _| true, plain, plain);
         startup_window_state: StartupWindowState => ("起動時のウィンドウ状態", |_, _| true, plain, plain);
         grid_click_selection_mode: GridClickSelectionMode => ("サムネイルのクリック選択", |v, _raw| !matches!(v, GridClickSelectionMode::Unknown), plain, plain);
         grid_open_selected_item_on_click: bool => ("選択中の項目をクリックで開く", |_, _| true, plain, plain);
@@ -1082,6 +1083,7 @@ mod tests {
         settings.auto_fullscreen_image_folders = !settings.auto_fullscreen_image_folders;
         settings.fullfeature_media_window = !settings.fullfeature_media_window;
         settings.restore_last_cursor = !settings.restore_last_cursor;
+        settings.restore_folder_cursor_on_revisit = !settings.restore_folder_cursor_on_revisit;
         settings.preferences_restore_position = !settings.preferences_restore_position;
         settings.notification_duration = NotificationDuration::Long;
         settings.startup_window_state = different_enum(
@@ -2273,13 +2275,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 498);
+        assert_eq!(entries.len(), 499);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            161
+            162
         );
         assert_eq!(
             entries
@@ -2315,7 +2317,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 159);
+        assert_eq!(wire.len(), 160);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -2539,6 +2541,47 @@ mod tests {
             assert_eq!(parsed.issues.len(), 1);
             parsed.apply_to(&mut destination);
             assert_eq!(destination.preferences_restore_position, enabled);
+        }
+    }
+
+    #[test]
+    fn section1795_folder_revisit_default_and_transfer_classification() {
+        assert!(
+            serde_json::from_str::<Settings>("{}")
+                .unwrap()
+                .restore_folder_cursor_on_revisit
+        );
+        for enabled in [false, true] {
+            let source = Settings {
+                restore_folder_cursor_on_revisit: enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let json: Value = serde_json::from_str(&exported.json).unwrap();
+            assert_eq!(
+                json["preferences"]["restore_folder_cursor_on_revisit"],
+                json!(enabled)
+            );
+            let mut destination = Settings {
+                restore_folder_cursor_on_revisit: !enabled,
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.restore_folder_cursor_on_revisit, enabled);
+            parse_preferences(INITIAL_V1)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.restore_folder_cursor_on_revisit, enabled);
+            let parsed = parse_preferences(&document(
+                json!({"restore_folder_cursor_on_revisit": "false"}),
+            ))
+            .unwrap();
+            assert_eq!(parsed.issues.len(), 1);
+            parsed.apply_to(&mut destination);
+            assert_eq!(destination.restore_folder_cursor_on_revisit, enabled);
         }
     }
 

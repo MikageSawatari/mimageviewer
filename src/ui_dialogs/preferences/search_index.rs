@@ -860,6 +860,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["Ctrl", "フォルダ移動", "画像なし"]
     ),
     entry!(
+        "folder/restore-cursor-on-revisit",
+        Folder,
+        "フォルダに入り直したとき、前回のカーソル位置を復元する",
+        ["再訪", "先頭", "スクロール", "復元", "フォルダ移動"]
+    ),
+    entry!(
         "folder/edit-restore",
         Folder,
         "コピー・移動したファイルの編集内容を復元するか確認する",
@@ -2400,5 +2406,21 @@ mod tests {
                 assert!(placed.contains(&anchor));
             }
         }
+    }
+
+    #[test]
+    fn section1795_folder_revisit_search_finds_folder_anchor() {
+        for query in ["フォルダ 再訪", "カーソル 復元", "フォルダ 先頭"] {
+            assert!(
+                search_preferences(query, test_tree_position)
+                    .iter()
+                    .any(|entry| entry.page == PreferencesPage::Folder
+                        && entry.anchor == "folder/restore-cursor-on-revisit"),
+                "{query}"
+            );
+        }
+        assert!(
+            anchors_in_pages_source(PAGES_SOURCE).contains(&"folder/restore-cursor-on-revisit")
+        );
     }
 }

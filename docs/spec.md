@@ -2661,6 +2661,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `startup_folder_mode` | StartupFolderMode | Previous | 起動時に開く場所。`Previous`=最後に明示した復元可能な一覧、`Desktop`=Windows Known Folder API のデスクトップ、`Drives`=ドライブ一覧、`ReadingHistory`=閲覧履歴、`Specific`=指定フォルダ。Previous は一覧を開き、自動 fullscreen は開始しない |
 | `startup_folder_path` | Option\<PathBuf\> | None | `startup_folder_mode = Specific` の指定フォルダ。開けない場合は Desktop、Desktop も取得できない場合は前回フォルダへフォールバックする |
 | `restore_last_cursor` | bool | true | 復元する一覧で選んでいた項目へカーソルを戻すか。**同じ論理場所と ZIP 階層を開いたときだけ**働き、消えたフォルダから祖先へ遡上した場合は復元しない。直接読書中は出発元一覧の hint を保持し、本のページ名を親一覧に保存しない。既存利用者は `serde(default)` で ON になる |
+| `restore_folder_cursor_on_revisit` | bool | true | 通常の実ディレクトリへ入る／入り直すとき、同セッションの一覧位置を復元するか。本棚rootも対象。OFF は履歴の選択・スクロールと読書位置への一覧選択フォールバックを使わず、現在の可視一覧の先頭・スクロール0。既存recipeで `Book` と分類する一覧（製本した本・本として扱う画像folder・ZIP/PDF等）は対象外。明示的な選択と同場所の再読み込み、起動の明示復元、本の全画面再開、合成一覧、detached 一覧は従来どおり。未リリースの新規項目で `serde(default = "default_true")`、移行処理なし |
 | `last_cursor_name` | Option\<String\> | None | `last_folder` と対になる旧 cursor の互換 carrier。新 record が無い旧設定の初回移行に使う。新しい明示一覧の cursor は `startup_list_restore` が所有し、合成一覧・読書中の終了で旧値を転用しない。復元は既存の `select_after_load` (名前でケース無視照合) に乗る |
 | `last_cursor_rows_above` | Option\<u32\> | None | そのカーソルが画面の一番上の行から何行下にあったか。スクロール位置 (pt) を保存しないのは、ウィンドウ幅や列数が変わると同じ pt が別の行を指すため。復元は現在の列数と行高から計算し直す。`None` は「一番上にいた」ではなく**分からない**で、その場合は従来どおり見える最小限だけ動かす |
 | `recent_folders` | Vec\<PathBuf\> | [] | アドレス欄の▼に表示する最近開いたフォルダ履歴。最大 20 件、検索中の一時移動は記録しない。フォルダバー左端の `フォルダ:` ラベルの右クリックメニューからクリアできる |

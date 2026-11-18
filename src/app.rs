@@ -32362,6 +32362,11 @@ impl App {
                 "評価順を読み取れなかったため、名前順で表示しました".to_owned(),
             );
         }
+        if restore_intent.enters_folder_list() {
+            // An accepted new entry retires selection from the previous aggregation.
+            // This load's explicit hints are applied after its worker is installed.
+            self.stack_selection_target = None;
+        }
         if let Some((script_enabled, separator, listing, stack_existing, stack_folder)) =
             stack_async_prep
         {
@@ -32378,7 +32383,13 @@ impl App {
                 script_enabled,
                 false,
                 if restore_intent.imports_sidecars() {
-                    StartupListIntent::InternalInstall
+                    if restore_intent.enters_folder_list() {
+                        // The provisional rows already own adoption, but entry position
+                        // policy must also reach the final, aggregated visible order.
+                        StartupListIntent::InternalHydration(Box::new(restore_intent.clone()))
+                    } else {
+                        StartupListIntent::InternalInstall
+                    }
                 } else {
                     // Keep only the hydration import policy. The first adoption already
                     // consumed the refresh cursor and owns list/history acceptance.
@@ -44424,7 +44435,7 @@ impl App {
             audio_art_prune,
             auto_aspect_seed,
             source_path,
-            source_is_directory: _,
+            source_is_directory,
             mut prepared_subfolder,
             prepared_page_edits: direct_page_edits,
             mut prepared_aggregate,
@@ -44840,7 +44851,18 @@ impl App {
         // ときは履歴より優先する: 深い階層から BS で戻ったとき、最初にフォルダへ入った位置
         // ではなく「今いる位置」にカーソルを合わせるため。指定アイテムが items に見つから
         // なかった場合 (削除等) のみ履歴へフォールバック。
-        let history_state = (!detached_physical)
+        // Use the accepted load's intent and existing directory classification, not path
+        // equality: opening a favorite for the current folder is still an entry. Keep
+        // refresh/resume, books, extracted views and detached lists on their existing policy.
+        let skip_folder_position = !self.settings.restore_folder_cursor_on_revisit
+            && !detached_physical
+            && source_is_directory
+            && matches!(
+                self.projection_recipe,
+                book_materialization::ProjectionRecipe::OrdinaryList
+            )
+            && restore_intent.enters_folder_list();
+        let history_state = (!detached_physical && !skip_folder_position)
             .then(|| self.folder_history.get(&source_path).copied())
             .flatten();
         let refresh_cursor = (!detached_physical)
@@ -44895,6 +44917,7 @@ impl App {
         // 復元する (= 再起動を跨いだ「続きから」)。
         if !restored
             && history_state.is_none()
+            && !skip_folder_position
             && !matches!(
                 self.fs_nav_after_pdf_enumerate
                     .as_ref()
@@ -44910,6 +44933,12 @@ impl App {
                 self.grid_scroll.set_reveal_requested(true);
                 self.redirect_selected_to_visible();
             }
+        }
+        if !restored && skip_folder_position {
+            self.move_grid_cursor(
+                self.current_grid_order().first().copied(),
+                crate::app::GridCursorIntent::Automatic,
+            );
         }
         // A freshly loaded grid must not inherit stale idle-upgrade timing from
         // the previous grid. Scroll history has been restored by this point, so
@@ -45059,8 +45088,7 @@ impl App {
                 let _ = completed.send(());
             }
             MainListAfterHydration::StackSelection { select } => {
-                self.move_grid_cursor(Some(select), crate::app::GridCursorIntent::Automatic);
-                self.grid_scroll.set_reveal_requested(true);
+                self.select_item_after_load(select);
             }
             MainListAfterHydration::DirectMedia {
                 prepared,
@@ -59066,6 +59094,8 @@ impl App {
                     let _ = self.snapshot_navigate_grid(forward);
                 } else if self.items_are_subfolder_expansion_view {
                     self.cancel_pending_folder_nav();
+                } else if self.start_list_origin_grid_navigation(ctx, forward, mode.sibling_only())
+                {
                 } else if let Some(folder) = self.effective_folder() {
                     self.start_folder_nav(folder, forward, mode);
                 }
@@ -59927,8 +59957,7 @@ impl App {
             } else if self.zip_nav_handle_ctrl_updown(true) {
                 // ネスト ZIP 内: ツリーを DFS 前順で次のノードへ (#4 改)。ツリーの端では
                 // false が返り、下の effective_folder 分岐で ZIP を抜けて実フォルダ DFS へ。
-            } else if self.start_collection_outer_grid_navigation(ctx, true) {
-            } else if self.start_smart_folder_scope_nav(true, false) {
+            } else if self.start_list_origin_grid_navigation(ctx, true, false) {
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, true, FolderNavMode::Grid);
             }
@@ -59954,8 +59983,7 @@ impl App {
                 self.cancel_pending_folder_nav();
             } else if self.zip_nav_handle_ctrl_updown(false) {
                 // ネスト ZIP 内: ツリーを DFS 逆前順で前のノードへ (#4 改)。
-            } else if self.start_collection_outer_grid_navigation(ctx, false) {
-            } else if self.start_smart_folder_scope_nav(false, false) {
+            } else if self.start_list_origin_grid_navigation(ctx, false, false) {
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, false, FolderNavMode::Grid);
             }
@@ -59975,6 +60003,7 @@ impl App {
                 self.cancel_pending_folder_nav();
             } else if self.items_are_subfolder_expansion_view || self.items_are_smart_folder_view {
                 self.cancel_pending_folder_nav();
+            } else if self.start_list_origin_grid_navigation(ctx, true, true) {
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, true, FolderNavMode::SiblingGrid);
             }
@@ -59989,6 +60018,7 @@ impl App {
                 self.cancel_pending_folder_nav();
             } else if self.items_are_subfolder_expansion_view || self.items_are_smart_folder_view {
                 self.cancel_pending_folder_nav();
+            } else if self.start_list_origin_grid_navigation(ctx, false, true) {
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, false, FolderNavMode::SiblingGrid);
             }
@@ -76451,6 +76481,7 @@ impl App {
             }
             GridCursorIntent::ExplicitKeep => {
                 self.cancel_rating_membership_restore();
+                self.remember_pending_stack_selection();
                 return;
             }
             GridCursorIntent::Automatic => GridCursorMove::Move,
@@ -76462,6 +76493,9 @@ impl App {
             target,
             movement,
         );
+        if matches!(intent, GridCursorIntent::Explicit(_)) {
+            self.remember_pending_stack_selection();
+        }
     }
 
     /// 親復帰で解決済みの item を選択し、通常の ensure-visible 経路へ渡す。
@@ -76471,6 +76505,7 @@ impl App {
         self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
         self.grid_scroll.set_reveal_requested(true);
         self.redirect_selected_to_visible();
+        self.remember_pending_stack_selection();
     }
 
     /// 選択中の実ファイル / 実フォルダのパス。仮想項目・未選択では `None`。
@@ -83137,6 +83172,7 @@ impl App {
         self.grid_scroll.set_reveal_requested(true);
         self.update_last_selected_image();
         self.redirect_selected_to_visible();
+        self.remember_pending_stack_selection();
     }
 
     // -------------------------------------------------------------------

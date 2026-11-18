@@ -4798,6 +4798,10 @@ pub struct Settings {
     /// 利用者も自動で ON になる。
     #[serde(default = "default_true")]
     pub restore_last_cursor: bool,
+    /// 通常の実フォルダへ入るとき、同セッションの一覧位置を復元する。
+    /// 起動時の明示カーソル、同じ一覧の再読み込み、本の読書位置とは独立。
+    #[serde(default = "default_true")]
+    pub restore_folder_cursor_on_revisit: bool,
     /// 前回終了時に選んでいた項目の**名前**。`last_folder` と対で意味を持つので、
     /// 保存も破棄も `last_folder` を書ける文脈かどうかで決める (`App::on_exit_inner`)。
     /// パスではなく名前なのは、既存の `select_after_load` と同じ照合規則に乗るため。
@@ -7969,6 +7973,7 @@ impl Default for Settings {
             last_folder: None,
             startup_list_restore: Some(StartupListRestore::default()),
             restore_last_cursor: true,
+            restore_folder_cursor_on_revisit: true,
             last_cursor_name: None,
             last_cursor_rows_above: None,
             startup_folder_mode: StartupFolderMode::default(),
