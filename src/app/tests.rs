@@ -9220,7 +9220,7 @@ fn native_video_bookmark_commands_ignore_app_viewport_ime_state() {
     assert_eq!(app.native_video_last_move_client, Some((640, 360)));
 
     app.cursor_last_activity = None;
-    app.handle_native_video_add_bookmark_command(&ctx, fs_idx, 12.5);
+    app.handle_native_video_add_bookmark_command(&ctx, fs_idx, Some(12.5));
     assert!(
         app.cursor_last_activity.is_some(),
         "AddBookmarkAt must reach the App command handler even if another viewport has IME state"

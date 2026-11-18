@@ -11,7 +11,11 @@ fn transcript_saved_media_time_is_used_before_metadata_and_across_track_changes(
             player.info = None;
         }
         let saved_ms = 3000;
-        player.seek(saved_ms as f64 / 1000.0, SeekOrigin::User);
+        player.seek(
+            saved_ms as f64 / 1000.0,
+            SeekPlayback::PreserveIntent,
+            SeekOrigin::User,
+        );
         assert_eq!(player.clock.take_seek_request().unwrap().target_secs, 3.0);
         assert_eq!(player.position(), 3.0);
         assert_eq!(player.clamp_seek_target(-7.0), 0.0);
@@ -33,7 +37,7 @@ fn transcript_nonzero_ts_origin_uses_saved_media_seconds_and_normal_player_clamp
     ] {
         let mut player = VideoPlayer::stream_ready_disconnected_for_test(path.clone());
         player.info = Some(info.clone());
-        player.seek(saved_secs, SeekOrigin::User);
+        player.seek(saved_secs, SeekPlayback::PreserveIntent, SeekOrigin::User);
         let issued = player.clock.take_seek_request().unwrap();
         assert_eq!(issued.target_secs, player.clamp_seek_target(saved_secs));
         assert!((issued.target_secs - expected).abs() < 0.000001);

@@ -5654,7 +5654,11 @@ impl App {
         self.clear_native_video_picker_overlay(ctx);
         self.gamepad.state.require_directional_neutral();
         if let Some(player) = self.fs_video_player(fs_idx) {
-            player.seek(marker.pts, crate::video::SeekOrigin::User);
+            player.seek(
+                marker.pts,
+                crate::video::SeekPlayback::PreserveIntent,
+                crate::video::SeekOrigin::User,
+            );
         }
         #[cfg(windows)]
         {
@@ -8882,8 +8886,11 @@ impl App {
                         if let Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) =
                             self.fs_cache.get(&fs_idx)
                         {
-                            let _ =
-                                player.seek_relative(delta_secs, crate::video::SeekOrigin::User);
+                            let _ = player.seek_relative(
+                                delta_secs,
+                                crate::video::SeekPlayback::PreserveIntent,
+                                crate::video::SeekOrigin::User,
+                            );
                         }
                     }
                 }
@@ -9736,7 +9743,7 @@ impl App {
         }
         let current = self
             .fs_video_player(fs_idx)
-            .map(|player| player.position())
+            .map(|player| player.user_seek_base_secs())
             .unwrap_or(0.0);
         let selected = markers
             .iter()

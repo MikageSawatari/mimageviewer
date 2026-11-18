@@ -1,5 +1,8 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.791: 既存の動画・音楽の相対シークとマーカー移動は `SeekPlayback::PreserveIntent`、
+`VideoSeekStart` は `StartPlayback` を指定する。KeyAction とキー割り当ては変更しない。
+
 §1.796: `FsSpreadStepPrev` / `FsSpreadStepNext` は FsImage / Press、既定なし。
 `ImageSpreadStepPrev/Next` と双方向対応し、リング・ボタン・ジェスチャ・パッドは
 共通 handler を使う。既存見開き調整とは別操作で、読み順固定・保存/通知なし。

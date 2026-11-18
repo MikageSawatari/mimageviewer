@@ -5649,6 +5649,7 @@ impl App {
             | Ev::SetPlaybackSpeed { .. }
             | Ev::CopyFrameToClipboard
             | Ev::FrameStep { .. }
+            | Ev::AddBookmarkCurrent
             | Ev::AddBookmarkAt { .. }
             | Ev::SetPinAt { .. }
             | Ev::JumpMarker { .. }
@@ -6404,7 +6405,11 @@ impl App {
                 if let Some(target_secs) = target_secs
                     && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
                 {
-                    player.seek_with_play_state(target_secs, true, crate::video::SeekOrigin::User);
+                    player.seek_immediate(
+                        target_secs,
+                        crate::video::SeekPlayback::PreserveIntent,
+                        crate::video::SeekOrigin::User,
+                    );
                     self.mark_native_video_hud_activity(ctx);
                     self.apply_loop_mode_to_player(fs_idx);
                 }
@@ -6908,7 +6913,10 @@ impl App {
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::AddBookmarkAt { target_secs } => {
-                self.handle_native_video_add_bookmark_command(ctx, fs_idx, target_secs);
+                self.handle_native_video_add_bookmark_command(ctx, fs_idx, Some(target_secs));
+            }
+            crate::video::NativeVideoOutputEvent::AddBookmarkCurrent => {
+                self.handle_native_video_add_bookmark_command(ctx, fs_idx, None);
             }
             crate::video::NativeVideoOutputEvent::SetPinAt { target_secs } => {
                 self.handle_native_video_set_pin_command(ctx, fs_idx, target_secs);
@@ -7207,7 +7215,11 @@ impl App {
         }
         let did_seek = if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
         {
-            player.seek(target_secs, crate::video::SeekOrigin::User);
+            player.seek(
+                target_secs,
+                crate::video::SeekPlayback::PreserveIntent,
+                crate::video::SeekOrigin::User,
+            );
             self.mark_native_video_hud_activity(ctx);
             true
         } else {
@@ -7272,7 +7284,11 @@ impl App {
                     ],
                 );
             }
-            player.seek(target_secs, crate::video::SeekOrigin::User);
+            player.seek(
+                target_secs,
+                crate::video::SeekPlayback::StartPlayback,
+                crate::video::SeekOrigin::User,
+            );
             player.set_native_tile_overlay(None);
             true
         } else {
@@ -7297,12 +7313,16 @@ impl App {
         }
         let did_seek = if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
         {
-            // `seek(0.0)` は内部で `apply_command(Play)` を発行し autoplay intent を
+            // `StartPlayback` の seek は autoplay intent を
             // 立てるので、追加の `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
             // 旧コードは `if !is_playing() { toggle_play() }` で「念のため再生」を
             // 意図していたが、intent ベースの toggle_play (= 2026-05 修正) では
             // `intent_playing()=true` を見て Pause に反転していたバグ。
-            player.seek(0.0, crate::video::SeekOrigin::User);
+            player.seek(
+                0.0,
+                crate::video::SeekPlayback::StartPlayback,
+                crate::video::SeekOrigin::User,
+            );
             true
         } else {
             false
@@ -7453,7 +7473,7 @@ impl App {
             return;
         }
         // Phase 1: player から必要データを snapshot して borrow を即解放
-        let (path, chapter_starts, pos, serial) = {
+        let (path, chapter_starts, seek_base, pos, serial) = {
             let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
                 return;
             };
@@ -7461,6 +7481,7 @@ impl App {
             (
                 player.path().clone(),
                 crate::video::decoder::boundary_starts_from_chapters(chapters),
+                player.user_seek_base_secs(),
                 player.position_secs(),
                 player.current_seek_serial(),
             )
@@ -7477,10 +7498,10 @@ impl App {
         let target = match eff {
             crate::settings::VideoLoopMode::Off | crate::settings::VideoLoopMode::Full => 0.0,
             crate::settings::VideoLoopMode::Chapter => {
-                crate::settings::start_at(&chapter_starts, pos).unwrap_or(0.0)
+                crate::settings::start_at(&chapter_starts, seek_base).unwrap_or(0.0)
             }
             crate::settings::VideoLoopMode::Bookmark => {
-                crate::settings::start_at(&bookmark_starts, pos).unwrap_or(0.0)
+                crate::settings::start_at(&bookmark_starts, seek_base).unwrap_or(0.0)
             }
         };
         let enabled = !matches!(eff, crate::settings::VideoLoopMode::Off);
@@ -7606,6 +7627,7 @@ impl App {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.seek(
                         seek_to,
+                        crate::video::SeekPlayback::StartPlayback,
                         crate::video::SeekOrigin::Internal(
                             crate::video::InternalContinuation::Loop,
                         ),
@@ -10120,7 +10142,7 @@ impl App {
         let path = player.path().clone();
         let audio_stream_index = player.applied_audio_stream_index();
         let default_audio_stream_index = info.default_audio_stream_index;
-        let initial_time_secs = player.position();
+        let initial_time_secs = player.user_seek_base_secs();
         let duration_secs = info.duration_secs;
         let Some(source_epoch) = player.native_source_epoch() else {
             return false;
@@ -11958,12 +11980,12 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
-        target_secs: f64,
+        target_secs: Option<f64>,
     ) {
         if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
-        self.add_native_video_bookmark(fs_idx, Some(target_secs));
+        self.add_native_video_bookmark(fs_idx, target_secs);
         self.mark_native_video_hud_activity(ctx);
     }
 
@@ -12311,7 +12333,7 @@ impl App {
                 if player.error().is_some() || player.info().is_none() {
                     None
                 } else {
-                    let pts = target_secs.unwrap_or_else(|| player.position());
+                    let pts = target_secs.unwrap_or_else(|| player.user_seek_base_secs());
                     Some((
                         player.path().clone(),
                         finite_video_target_secs(pts, player.duration()),
@@ -12958,7 +12980,11 @@ impl App {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     // `seek(0.0)` 自体が `apply_command(Play)` 経由で autoplay intent
                     // を立てるので、追加 `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
-                    player.seek(0.0, crate::video::SeekOrigin::User);
+                    player.seek(
+                        0.0,
+                        crate::video::SeekPlayback::StartPlayback,
+                        crate::video::SeekOrigin::User,
+                    );
                 }
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
                 NativeVideoKeyOutcome::Action(KeyAction::VideoSeekStart)
@@ -13651,7 +13677,7 @@ impl App {
         let markers = self.collect_video_nav_markers(fs_idx);
         let current = self
             .fs_video_player(fs_idx)
-            .map(|p| p.position())
+            .map(|p| p.user_seek_base_secs())
             .unwrap_or(0.0);
         let target = if next {
             markers
@@ -13668,7 +13694,11 @@ impl App {
         match target {
             Some(marker) => {
                 if let Some(player) = self.fs_video_player(fs_idx) {
-                    player.seek(marker.pts, crate::video::SeekOrigin::User);
+                    player.seek(
+                        marker.pts,
+                        crate::video::SeekPlayback::PreserveIntent,
+                        crate::video::SeekOrigin::User,
+                    );
                 }
                 // CH/BM ループ中ならマーカージャンプ後に loop_target を更新
                 self.apply_loop_mode_to_player(fs_idx);
@@ -13705,7 +13735,11 @@ impl App {
                 // J キーで前のマーカーが見つからない (= 最初のマーカー手前または空) かつ
                 // 既に先頭に居なければ動画先頭へ seek。
                 if let Some(player) = self.fs_video_player(fs_idx) {
-                    player.seek(0.0, crate::video::SeekOrigin::User);
+                    player.seek(
+                        0.0,
+                        crate::video::SeekPlayback::PreserveIntent,
+                        crate::video::SeekOrigin::User,
+                    );
                 }
                 self.apply_loop_mode_to_player(fs_idx);
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
@@ -14717,6 +14751,7 @@ impl App {
             let _ = player.take_native_output();
             player.seek(
                 pos,
+                crate::video::SeekPlayback::StartPlayback,
                 crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Transport),
             );
             if let Some(config) = config {
@@ -15102,9 +15137,11 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn native_video_seek_relative_with_hint(&mut self, fs_idx: usize, delta_secs: f64) {
         let outcome = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => {
-                player.seek_relative(delta_secs, crate::video::SeekOrigin::User)
-            }
+            Some(FsCacheEntry::Video { player, .. }) => player.seek_relative(
+                delta_secs,
+                crate::video::SeekPlayback::PreserveIntent,
+                crate::video::SeekOrigin::User,
+            ),
             _ => return,
         };
         let hint = match outcome {
@@ -17112,6 +17149,287 @@ mod configurable_video_seek_dispatch_tests {
         reset_seek_player(&mut app, idx);
         app.fullscreen_idx = Some(idx);
         (app, idx)
+    }
+
+    #[test]
+    fn paused_seek_handlers_preserve_pause_and_explicit_commands_start() {
+        use crate::video::{NativeVideoOutputEvent as Ev, PlaybackStartOrigin};
+        for route in [
+            "bar",
+            "strip",
+            "relative",
+            "j",
+            "k",
+            "j-start",
+            "w",
+            "hud-start",
+            "tile",
+            "music-bar",
+            "music-relative",
+            "music-start",
+            "music-marker",
+        ] {
+            let (mut app, idx) = setup_seek_app();
+            let ctx = egui::Context::default();
+            app.fullscreen_idx = Some(idx);
+            let path = app.fs_video_player(idx).unwrap().path().clone();
+            if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get_mut(&idx) {
+                player.install_native_ui_probe_for_test();
+            }
+            {
+                let player = app.fs_video_player(idx).unwrap();
+                player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+                player.take_playback_success();
+                player.set_playing_with_origin(false, PlaybackStartOrigin::UserPlay);
+                player.set_position_for_test(10.0);
+            }
+            let expected_play = matches!(route, "w" | "hud-start" | "tile" | "music-start");
+            match route {
+                "bar" => app.handle_native_video_seek_command(&ctx, idx, 12.0),
+                "strip" => {
+                    let worker = crate::video::seek_strip_wave::SeekStripWaveWorker::spawn(
+                        path.clone(),
+                        Some(0),
+                        Some(0),
+                        None,
+                    );
+                    let mut session = VideoSeekStripSession::for_wave_holdover_test(path, worker);
+                    session.owner_fs_idx = idx;
+                    session.items_generation = app.items_generation;
+                    let stamp = session.render_stamp().at_generation(1);
+                    app.video_seek_strip_runtime = VideoSeekStripRuntime::Open(Box::new(session));
+                    assert!(app.seek_strip_event_stamp_is_current(idx, stamp, false));
+                    app.handle_native_video_output_event(
+                        &ctx,
+                        idx,
+                        0,
+                        Ev::CommitSeekStrip {
+                            center: crate::video::seek_strip::SeekStripCenter::Waveform {
+                                center_time_secs: 12.0,
+                            },
+                            stamp,
+                        },
+                    );
+                }
+                "relative" => {
+                    assert!(matches!(
+                        app.dispatch_native_video_key_event(
+                            &ctx,
+                            idx,
+                            native_key(0x27, false, false)
+                        ),
+                        NativeVideoKeyOutcome::FixedAction(
+                            NativeVideoFixedKeyAction::SeekForwardMedium
+                        )
+                    ));
+                }
+                "j" | "k" => {
+                    if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get_mut(&idx) {
+                        player.set_chapters_for_test(&[6.0, 12.0]);
+                    }
+                    app.jump_native_video_marker(idx, route == "k");
+                }
+                "j-start" => app.jump_native_video_marker(idx, false),
+                "w" => {
+                    app.dispatch_native_video_key_event(&ctx, idx, native_key(0x57, false, false));
+                }
+                "hud-start" => {
+                    app.handle_native_video_output_event(&ctx, idx, 0, Ev::SeekToStartAndPlay)
+                }
+                "tile" => app.handle_native_video_tile_seek_command(&ctx, idx, 12.0),
+                "music-bar" => app.music_seek_to(idx, 12.0),
+                "music-relative" => app.music_seek_relative(idx, 2.0),
+                "music-start" => app.music_seek_start(idx),
+                "music-marker" => app.music_marker_jump(idx, false),
+                _ => unreachable!(),
+            }
+            let target = match route {
+                "relative" => 27.0,
+                "j" => 6.0,
+                "j-start" | "w" | "hud-start" | "music-start" | "music-marker" => 0.0,
+                _ => 12.0,
+            };
+            let player = app.fs_video_player(idx).unwrap();
+            assert_eq!(player.position(), target, "{route}");
+            assert_eq!(player.intent_playing(), expected_play, "{route}");
+            assert_eq!(player.current_seek_serial(), 1, "{route}");
+            player.complete_seek_for_test(target);
+            assert_eq!(player.is_playing(), expected_play, "{route}");
+            assert_eq!(
+                player.take_playback_success().is_some(),
+                expected_play,
+                "{route}"
+            );
+            assert!(
+                !app.maybe_start_normalize_scan_for_play_intent(idx) || expected_play,
+                "{route}"
+            );
+        }
+    }
+
+    #[test]
+    fn paused_seek_music_relative_accumulates_coalesced_targets() {
+        let (mut app, idx) = setup_seek_app();
+        for expected in [103.0, 106.0, 109.0] {
+            app.music_seek_relative(idx, 3.0);
+            let player = app.fs_video_player(idx).unwrap();
+            assert_eq!(player.user_seek_base_secs_for_test(), expected);
+            assert!(!player.intent_playing());
+        }
+    }
+
+    #[test]
+    fn paused_seek_marker_after_relative_uses_pending_and_dsp_requested_position() {
+        use crate::video::{PlaybackStartOrigin, SeekOrigin, SeekPlayback};
+        for dsp_wait in [false, true] {
+            for music in [false, true] {
+                let (mut app, idx) = setup_seek_app();
+                let ctx = egui::Context::default();
+                app.settings.video_seek_medium_secs = 5;
+                let path = app.fs_video_player(idx).unwrap().path().clone();
+                if let Some(FsCacheEntry::Video { player, .. }) = app.fs_cache.get_mut(&idx) {
+                    player.set_chapters_for_test(&[12.0, 20.0]);
+                    if dsp_wait {
+                        player.confirm_playback_start_for_test(PlaybackStartOrigin::NewSource);
+                        player.take_playback_success();
+                        player.enable_dsp_acquisition_for_test();
+                    }
+                    player.seek(10.0, SeekPlayback::PreserveIntent, SeekOrigin::User);
+                }
+                app.dispatch_native_video_key_event(&ctx, idx, native_key(0x27, false, false));
+                let player = app.fs_video_player(idx).unwrap();
+                assert_eq!(player.position(), 10.0, "precondition: clock lags request");
+                assert_eq!(player.user_seek_base_secs(), 15.0);
+                assert!(!player.is_playing());
+                if music {
+                    app.video_audio_mode = Some(idx);
+                    app.music_bookmarks_loaded_for = Some(path);
+                    app.music_bookmarks = [12.0, 20.0]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, pts_secs)| crate::video_bookmarks::VideoBookmarkMeta {
+                            id: i as i64 + 1,
+                            pts_secs,
+                            title: None,
+                        })
+                        .collect();
+                    app.music_marker_jump(idx, true);
+                } else {
+                    app.jump_native_video_marker(idx, true);
+                }
+                let player = app.fs_video_player(idx).unwrap();
+                assert_eq!(player.user_seek_base_secs(), 20.0, "{dsp_wait}/{music}");
+                assert!(!player.is_playing());
+                if !dsp_wait {
+                    assert!(!player.intent_playing());
+                    assert_eq!(player.current_seek_serial(), 1, "target remains coalesced");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn paused_seek_marker_requested_position_preserves_epsilon_and_start_tolerance() {
+        use crate::video::{SeekOrigin, SeekPlayback};
+        for (clock, requested, next, markers, expected) in [
+            (10.0, 11.7, true, vec![12.0, 20.0], 20.0),
+            (10.0, 20.0, true, vec![12.0, 20.0, 25.0], 25.0),
+            (10.0, 12.0, false, vec![6.0, 12.0, 20.0], 6.0),
+            (10.0, 0.0, false, vec![6.0, 12.0], 0.0),
+            (0.01, 0.2, false, vec![6.0, 12.0], 0.0),
+        ] {
+            let (mut app, idx) = setup_seek_app();
+            let player = match app.fs_cache.get_mut(&idx).unwrap() {
+                FsCacheEntry::Video { player, .. } => player,
+                _ => unreachable!(),
+            };
+            player.set_chapters_for_test(&markers);
+            player.seek(clock, SeekPlayback::PreserveIntent, SeekOrigin::User);
+            player.seek(requested, SeekPlayback::PreserveIntent, SeekOrigin::User);
+            assert_eq!(player.position(), clock);
+            assert_eq!(player.user_seek_base_secs(), requested);
+            app.jump_native_video_marker(idx, next);
+            let player = app.fs_video_player(idx).unwrap();
+            assert_eq!(
+                player.user_seek_base_secs(),
+                expected,
+                "{clock}/{requested}/{next}"
+            );
+            assert!(!player.intent_playing());
+        }
+    }
+
+    #[test]
+    fn paused_seek_current_bookmarks_and_loop_selection_use_requested_position() {
+        use crate::video::{NativeVideoOutputEvent as Ev, SeekOrigin, SeekPlayback};
+        for music in [false, true] {
+            let (mut app, idx) = setup_seek_app();
+            let ctx = egui::Context::default();
+            let path = app.fs_video_player(idx).unwrap().path().clone();
+            {
+                let player = match app.fs_cache.get_mut(&idx).unwrap() {
+                    FsCacheEntry::Video { player, .. } => player,
+                    _ => unreachable!(),
+                };
+                player.set_chapters_for_test(&[0.0, 12.0, 20.0]);
+                player.seek(10.0, SeekPlayback::PreserveIntent, SeekOrigin::User);
+                player.seek(15.0, SeekPlayback::PreserveIntent, SeekOrigin::User);
+            }
+            app.settings.video_loop_mode = crate::settings::VideoLoopMode::Chapter;
+            if music {
+                app.video_audio_mode = Some(idx);
+                app.music_bookmarks_loaded_for = Some(path.clone());
+                app.music_bookmarks = [0.0, 12.0, 20.0]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, pts_secs)| crate::video_bookmarks::VideoBookmarkMeta {
+                        id: i as i64 + 1,
+                        pts_secs,
+                        title: None,
+                    })
+                    .collect();
+                app.settings.video_loop_mode = crate::settings::VideoLoopMode::Bookmark;
+                app.apply_music_loop_mode(idx);
+            } else {
+                app.apply_loop_mode_to_player(idx);
+            }
+            assert_eq!(app.fs_video_player(idx).unwrap().loop_target_secs(), 12.0);
+            assert_eq!(
+                app.last_loop_pos.get(&idx).unwrap().0,
+                10.0,
+                "runtime baseline stays on the clock"
+            );
+            if music {
+                app.add_music_bookmark_at_current(idx);
+            } else {
+                app.handle_native_video_output_event(&ctx, idx, 0, Ev::AddBookmarkCurrent);
+            }
+            let bookmarks = app
+                .video_bookmark_db
+                .as_ref()
+                .unwrap()
+                .list_marker_entries(&path);
+            assert!(bookmarks.iter().any(|bookmark| bookmark.pts_secs == 15.0));
+            if !music {
+                app.handle_native_video_output_event(
+                    &ctx,
+                    idx,
+                    0,
+                    Ev::AddBookmarkAt { target_secs: 7.0 },
+                );
+                let bookmarks = app
+                    .video_bookmark_db
+                    .as_ref()
+                    .unwrap()
+                    .list_marker_entries(&path);
+                assert!(
+                    bookmarks.iter().any(|bookmark| bookmark.pts_secs == 7.0),
+                    "explicit position remains explicit"
+                );
+            }
+            assert_eq!(app.fs_video_player(idx).unwrap().position(), 10.0);
+            assert!(!app.fs_video_player(idx).unwrap().intent_playing());
+        }
     }
 
     fn reset_seek_player(app: &mut App, idx: usize) {

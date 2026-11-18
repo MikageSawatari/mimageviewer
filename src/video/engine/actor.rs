@@ -353,6 +353,11 @@ impl EngineActor {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_awaiting_playback_start_for_test(&self) -> bool {
+        matches!(self.playback_start, PlaybackStart::AwaitingSuccess { .. })
+    }
+
     pub fn playback_success_is_current(&self, id: u64) -> bool {
         matches!(self.playback_start, PlaybackStart::Established { id: current, .. } if current == id)
     }
@@ -939,6 +944,12 @@ impl EngineActor {
             self.transition_to_playing(anchor);
         } else {
             self.transition_to_paused(anchor.pts_secs);
+            if !self.has_video {
+                // No video presentation or audio consumption follows a paused
+                // audio-only seek. Readiness is its terminal event; retire only
+                // this latch's epoch, never a newer seek's override.
+                self.av_clock.clear_seek_target_override(self.latch.epoch);
+            }
         }
     }
 }

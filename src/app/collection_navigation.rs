@@ -3937,6 +3937,7 @@ impl App {
             {
                 player.seek(
                     0.0,
+                    crate::video::SeekPlayback::StartPlayback,
                     crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
                 );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
@@ -9915,7 +9916,11 @@ mod tests {
                         if let Some(super::super::FsCacheEntry::Video { player, .. }) =
                             app.fs_cache.get(&0)
                         {
-                            player.seek(0.0, crate::video::SeekOrigin::User);
+                            player.seek(
+                                0.0,
+                                crate::video::SeekPlayback::PreserveIntent,
+                                crate::video::SeekOrigin::User,
+                            );
                         }
                     }
                     _ => {}

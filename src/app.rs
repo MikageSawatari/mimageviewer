@@ -54552,7 +54552,11 @@ impl App {
             player.path().display(),
             self.viewer_presentation
         ));
-        player.seek(target, crate::video::SeekOrigin::User);
+        player.seek(
+            target,
+            crate::video::SeekPlayback::StartPlayback,
+            crate::video::SeekOrigin::User,
+        );
         crate::logger::log(format!(
             "[bookmark-open] seek issued path={} after={:.3} serial_after={}",
             player.path().display(),
@@ -72568,6 +72572,7 @@ impl App {
                         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
                             player.seek(
                                 0.0,
+                                crate::video::SeekPlayback::StartPlayback,
                                 crate::video::SeekOrigin::Internal(
                                     crate::video::InternalContinuation::Transport,
                                 ),
@@ -99532,6 +99537,7 @@ impl App {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.seek(
                     0.0,
+                    crate::video::SeekPlayback::StartPlayback,
                     crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
                 );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
@@ -99680,6 +99686,7 @@ impl App {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.seek(
                     0.0,
+                    crate::video::SeekPlayback::StartPlayback,
                     crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
                 );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
@@ -99710,6 +99717,7 @@ impl App {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.seek(
                     0.0,
+                    crate::video::SeekPlayback::StartPlayback,
                     crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
                 );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
@@ -99750,15 +99758,17 @@ impl App {
         let has_bm = !bookmark_starts.is_empty();
         let display_mode = self.settings.video_loop_mode;
         let eff = crate::settings::effective_loop_mode(display_mode, false, has_bm);
-        let (pos, serial) = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => {
-                (player.position_secs(), player.current_seek_serial())
-            }
+        let (seek_base, pos, serial) = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => (
+                player.user_seek_base_secs(),
+                player.position_secs(),
+                player.current_seek_serial(),
+            ),
             _ => return,
         };
         let target = match eff {
             crate::settings::VideoLoopMode::Bookmark => {
-                crate::settings::start_at(&bookmark_starts, pos).unwrap_or(0.0)
+                crate::settings::start_at(&bookmark_starts, seek_base).unwrap_or(0.0)
             }
             // Off / Full / (Chapter は音声で Full に降格) はすべて先頭ループ (target=0.0)。
             _ => 0.0,
@@ -99832,6 +99842,7 @@ impl App {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.seek(
                         seek_to,
+                        crate::video::SeekPlayback::StartPlayback,
                         crate::video::SeekOrigin::Internal(
                             crate::video::InternalContinuation::Loop,
                         ),
@@ -99983,6 +99994,7 @@ impl App {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.seek(
                     0.0,
+                    crate::video::SeekPlayback::StartPlayback,
                     crate::video::SeekOrigin::Internal(crate::video::InternalContinuation::Loop),
                 );
                 player.set_playing_internal(true, crate::video::InternalContinuation::Loop);
@@ -100079,6 +100091,7 @@ impl App {
                 if target_is_video && ignore_resume {
                     player.seek(
                         0.0,
+                        crate::video::SeekPlayback::StartPlayback,
                         crate::video::SeekOrigin::Internal(
                             crate::video::InternalContinuation::Transport,
                         ),
@@ -104909,7 +104922,11 @@ mod now_playing_lifecycle_tests {
                             player(&app).mark_eof_for_test(30.0);
                         }
                         "seek" => {
-                            player(&app).seek(0.0, crate::video::SeekOrigin::User);
+                            player(&app).seek(
+                                0.0,
+                                crate::video::SeekPlayback::PreserveIntent,
+                                crate::video::SeekOrigin::User,
+                            );
                         }
                         "missing" => {
                             app.media_navigation_resolver = None;

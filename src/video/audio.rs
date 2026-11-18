@@ -4921,7 +4921,11 @@ mod tests {
                                 "real EOF loop must seek to zero"
                             );
                         } else if phase == 1 {
-                            player.seek(0.0, crate::video::SeekOrigin::User);
+                            player.seek(
+                                0.0,
+                                crate::video::SeekPlayback::PreserveIntent,
+                                crate::video::SeekOrigin::User,
+                            );
                             assert!(
                                 player.current_seek_serial() > serial,
                                 "user seek to zero must be issued"
