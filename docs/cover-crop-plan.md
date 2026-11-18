@@ -2440,8 +2440,13 @@ P案の本文proof/codec変更やK2内生成を承認したものではなく、
 - `thumb/auto_cover_sample`: `format` (rar / zip / pdf / folder)、`selected` (選んだ枚数)、`read` (読めた枚数)、`skipped_limit` (上限で読まなかった枚数)、
   `bytes` (展開した合計)、`list_ms`・`read_ms`、`outcome` (judged / cancelled / read_failed)。
 - 既存の `thumb/auto_cover_crop` の `reason` に `cancelled` / `read-failed` を足し、`sample_ms` を足す。
-- 初回は `auto_cover_sample` の ms と、同じ要求のタイルの生成時間で費用を見る。2 回目以降 (キャッシュ利用) は `auto_cover_sample` が出ないこと、
-  キャッシュ読みの時間が RAR 以外と同じことで見る。一覧の応答性は既存の可視タイルの first / all-ready の計測 (`analyze_perf.py nav`) で、
+- 初回は `auto_cover_sample` の ms と、同じ要求のタイルの生成時間で費用を見る。2 回目以降は、キャッシュから出す時点では `auto_cover_sample` が出ないこと、
+  キャッシュ読みの時間が RAR 以外と同じことで見る。
+- **訂正 (2026-11-18、サブ PC 確認で判明):** キャッシュから出したタイルは、その後の高画質化の作り直し (idle upgrade、`ThumbLoadOrigin::UpgradeableCache`) で
+  キャッシュを使わずに元から読み直し、自動判定のブロックを通るので、既存の ZIP と同じく `auto_cover_sample` が出る (フォルダを開くたびに可視の本で 1 回ずつ)。
+  v5.3.0 から変わらない既存の動きで、§1.778 の退行ではない。RAR では、自動を ON にした場合に限り、この作り直しで本文の標本も読むようになる (v5.3.0 の作り直しは表紙だけ)。
+  作り直しに表示中の判定結果を渡して標本と判定を省く改善は別件として扱う (番号は未取得)。
+- 一覧の応答性は既存の可視タイルの first / all-ready の計測 (`analyze_perf.py nav`) で、
   自動 ON の RAR のフォルダの初回と 2 回目を比べる。`scripts/analyze_perf.py` に `auto_cover_sample` の集計が要るかは実装時に判断する。
 
 ### 30.8 テスト
