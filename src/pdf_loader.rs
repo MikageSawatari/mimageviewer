@@ -317,9 +317,14 @@ pub(crate) struct EpubReadLease(String);
 impl Drop for EpubReadLease {
     fn drop(&mut self) {
         let (mutex, changed) = epub_pin_coord();
+        let wait = crate::perf::close_nav::Wait::for_close(
+            crate::perf::close_nav::WaitSite::EpubPins,
+            "read_lease_drop",
+        );
         let mut state = mutex
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        wait.acquired();
         let count = state
             .active_reads
             .get_mut(&self.0)
@@ -347,10 +352,15 @@ fn enter_epub_read(key: &str) -> EpubReadLease {
 }
 
 fn try_enter_epub_read(key: &str) -> Option<EpubReadLease> {
+    let wait = crate::perf::close_nav::Wait::for_close(
+        crate::perf::close_nav::WaitSite::EpubPins,
+        "try_enter_read",
+    );
     let mut state = epub_pin_coord()
         .0
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    wait.acquired();
     if state.active_deletions.contains(key) {
         return None;
     }

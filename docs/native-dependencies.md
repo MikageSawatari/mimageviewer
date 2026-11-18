@@ -106,6 +106,21 @@ C:\home\mimageviewer_vendor_backup\
 - `cmake` + Visual Studio 2026 (18) BuildTools + NASM — TurboJPEG / vst3-host ビルド
 - `unzip`, `tar`, `curl` — setup スクリプト群が使う
 
+### Windows SDK FXC (ビルド時の shader コンパイラ)
+
+Windows 向け `build.rs` は動画 native presenter と静止画 NIS / Anime4K VL の
+DXBC を生成するため、Windows 10/11 SDK の x64 `fxc.exe` を必要とする。
+`MIV_FXC_PATH`、`WindowsSdkVerBinPath/x64`、`Program Files (x86)/Windows Kits/10/bin`
+の版別 `x64`、PATH の順に探す。見つからなければビルドを止め、SDK の
+Desktop C++ tools の導入か `MIV_FXC_PATH` の指定を案内する。実行時には FXC を追加配布しない。
+
+動画は従来の naga 27 / SM5.0 / `/O3` のまま。静止画は wgpu-hal と同じ
+naga 30.0.1 (`naga_wgpu` 別名、完全版固定) / SM5.1 / `/Ges` / 既定 O1 で生成する。
+静止画には DEBUG 用の `/Zi /Od` 版も埋め込み、root egui-wgpu と同じ
+`InstanceFlags::from_build_config().with_env()` で選ぶ (`WGPU_DEBUG` を含む)。
+生成物は `OUT_DIR` に置き `include_bytes!` で内包する。Windows 以外では FXC を要求せず WGSL を使う。
+生成契約と wgpu 更新時の検証は [表示パイプライン §2.4.1](display-pipeline.md#241-フルスクリーン静止画の-gpu-lanczos3-縮小標準拡大と選択式拡大) を参照。
+
 ## mimalloc の一時 vendor（§1.666）
 
 `mimalloc` 0.1.52 → `libmimalloc-sys` 0.1.49 の v3 C ソースだけを、上流無改変の

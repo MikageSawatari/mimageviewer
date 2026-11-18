@@ -1530,6 +1530,21 @@ ROOTの配送そのもの、固定矢印、HWND・focus・配置・runtimeの保
 独立実装レビュー r3 (Sol / xhigh、6ba253d26) と設計担当 (ClaudeCode) の双方が、§2 に照らして「症状パッチではなく構造的修正である」ことに合意した
 (描画と入力の読み取り契約の不一致を直す変更で、証拠が無ければ照合不成立にし、未知値の補完や失敗の隠蔽をしない)。
 
+### 2026-11-18: §1.776 B-B のデバイス単位 scaler pipeline 共有（実装前合意）
+
+- 正本は `G:/home/mimageviewer-perf801-notes/design-776b-prebuild.md` 第3版。
+  設計担当 ClaudeCode と独立レビュー（第1回 REVISE の構造的修正への合意、第2回 ACCEPT）、
+  実装担当 Codex の前提確認で、不変なデバイス単位資源を context の可変 cache から切り出す
+  構造的修正であり、症状パッチではないことに合意した。
+- App 所有の `ScalerPipelineStore` から main / detached の `GpuLanczosCache` へ参照を渡す。
+  共有対象は NIS の layout / pipeline 組と Anime4K resampler だけで、context の単一 Arc slot が
+  prepare / encode の両方で同じ資源を保持する。store は park / swap / bundle の対象に入れない。
+- 変更範囲は App のデバイス資源と初回通常 present 後の root 処理、共通 scaler の作成・取得、
+  通常 resolve と既存 prewarm の参照受け渡し。detached の述語・viewport・状態遷移は変更しない。
+  entries / texture / bind group / uniform / 出力 VRAM 会計・破棄は所有 context に残す。
+- 起動時判定と種類別の重複抑止は store の Once、作成状態は種類別 OnceLock に集約する。
+  作成中に需要が来た場合は残りを待つ。表示方式の暫定切替・取消・再試行は追加しない。
+
 ### 2026-11-17: §1.800 S1 の仮想フォルダと親との対応
 
 設計担当の §4S（独立設計レビュー r10 ACCEPT）と実装の独立レビューで、UI の一回限りの

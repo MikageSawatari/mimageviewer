@@ -1221,6 +1221,7 @@ impl FullscreenPaintPayload {
         &self,
         cache: &mut GpuLanczosCache,
         render_state: Option<&egui_wgpu::RenderState>,
+        store: Option<&crate::scaler_pipeline_store::ScalerPipelineStore>,
         logical_scale: f32,
         pixels_per_point: f32,
         visible_region: Option<VisibleRegionRequest>,
@@ -1232,6 +1233,7 @@ impl FullscreenPaintPayload {
             Self::NormalResource(resource) => {
                 let (resource, event) = cache.resolve(
                     render_state,
+                    store,
                     resource,
                     logical_scale,
                     pixels_per_point,
@@ -1879,7 +1881,7 @@ pub(crate) struct LanczosGenerationStats {
 
 /// CPU wall times only: these do not attribute time inside the driver to compilation.
 #[derive(Clone, Copy, Debug, Default, serde::Serialize)]
-struct LanczosCreationTimings {
+pub(crate) struct LanczosCreationTimings {
     #[serde(skip_serializing_if = "Option::is_none")]
     bind_group_layout_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1950,6 +1952,8 @@ struct LanczosGenerationTimings {
     register_texture_ms: f64,
     encode_ms: f64,
     submit_ms: f64,
+    pipeline_source: Option<crate::scaler_pipeline_store::PipelineSource>,
+    pipeline_wait_ms: f64,
 }
 
 impl LanczosGenerationTimings {
@@ -2052,6 +2056,10 @@ impl LanczosGenerationStats {
                 (self.encode_submit_cpu_ms - self.timings.accounted_ms()).into(),
             ),
         ]);
+        if let Some(source) = self.timings.pipeline_source {
+            fields.push(("pipeline_source", source.as_str().into()));
+            fields.push(("pipeline_wait_ms", self.timings.pipeline_wait_ms.into()));
+        }
         if let Some(breakdown) = self.timings.creation_breakdown() {
             fields.push(("resampler_create_breakdown", breakdown));
         }
@@ -2097,7 +2105,8 @@ enum LanczosTargetDecision {
 pub(crate) struct GpuLanczosCache {
     // Keep creation telemetry and lazy pipelines off the App stack.
     resampler: Option<Box<Lanczos3Resampler>>,
-    anime_resampler: Option<Box<Anime4kResampler>>,
+    anime_resampler: Option<Arc<Anime4kResampler>>,
+    nis: Option<Arc<NisPipelineSet>>,
     entries: HashMap<LanczosCacheKey, LanczosCacheEntry>,
     use_clock: u64,
     regeneration_count: u64,
@@ -2215,12 +2224,14 @@ impl GpuLanczosCache {
     pub(crate) fn execute_prewarm(
         &mut self,
         render_state: &egui_wgpu::RenderState,
+        store: Option<&crate::scaler_pipeline_store::ScalerPipelineStore>,
         resource: &FullscreenPaintResource,
         plan: NativePrewarmPlan,
         claim: impl FnOnce(NativeAllocationBytes) -> bool,
     ) -> NativePrewarmExecution {
         self.execute_prewarm_with_policy(
             render_state,
+            store,
             resource,
             plan,
             NativePrewarmPolicy::Ordinary,
@@ -2270,6 +2281,7 @@ impl GpuLanczosCache {
     pub(crate) fn execute_prewarm_with_policy(
         &mut self,
         render_state: &egui_wgpu::RenderState,
+        store: Option<&crate::scaler_pipeline_store::ScalerPipelineStore>,
         resource: &FullscreenPaintResource,
         plan: NativePrewarmPlan,
         policy: NativePrewarmPolicy,
@@ -2317,7 +2329,7 @@ impl GpuLanczosCache {
                     && candidate.generation == plan.key.generation)
         });
         let (output, event) =
-            self.generate_with_source(render_state, resource, plan.key, plan.work, &source);
+            self.generate_with_source(render_state, store, resource, plan.key, plan.work, &source);
         match event {
             Some(LanczosPerfEvent::Generated(stats)) => NativePrewarmExecution::Submitted {
                 output_texture_id: output.paint_texture_id(),
@@ -2330,6 +2342,7 @@ impl GpuLanczosCache {
     pub(crate) fn resolve(
         &mut self,
         render_state: Option<&egui_wgpu::RenderState>,
+        store: Option<&crate::scaler_pipeline_store::ScalerPipelineStore>,
         resource: &FullscreenPaintResource,
         logical_scale: f32,
         pixels_per_point: f32,
@@ -2397,12 +2410,13 @@ impl GpuLanczosCache {
             record_native_lookup(Some(render_state), resource, Some(key), "hit");
             return (resource.clone(), None);
         }
-        self.resolve_key(render_state, resource, key)
+        self.resolve_key(render_state, store, resource, key)
     }
 
     fn resolve_key(
         &mut self,
         render_state: &egui_wgpu::RenderState,
+        store: Option<&crate::scaler_pipeline_store::ScalerPipelineStore>,
         resource: &FullscreenPaintResource,
         key: LanczosCacheKey,
     ) -> (FullscreenPaintResource, Option<LanczosPerfEvent>) {
@@ -2427,12 +2441,78 @@ impl GpuLanczosCache {
             Ok(plan) => plan,
             Err(_) => return (resource.original_resampleable(), None),
         };
-        self.generate(render_state, resource, key, plan)
+        self.generate(render_state, store, resource, key, plan)
+    }
+
+    fn anime_pipeline(
+        &mut self,
+        device: &wgpu::Device,
+        store: Option<&crate::scaler_pipeline_store::ScalerPipelineStore>,
+        timings: &mut LanczosGenerationTimings,
+    ) -> &Arc<Anime4kResampler> {
+        self.anime_resampler.get_or_insert_with(|| {
+            let start = Instant::now();
+            let acquired = store.map(|store| store.get_anime4k(device));
+            let source = acquired
+                .as_ref()
+                .map(|a| a.source)
+                .unwrap_or(crate::scaler_pipeline_store::PipelineSource::Inline);
+            timings.pipeline_wait_ms = acquired.as_ref().map_or(0.0, |a| a.wait_ms);
+            let ready = acquired.and_then(|a| a.value);
+            let source = if ready.is_some() {
+                source
+            } else {
+                crate::scaler_pipeline_store::PipelineSource::Inline
+            };
+            let ready = ready.unwrap_or_else(|| {
+                Arc::new(Anime4kResampler::new(device, STILL_IMAGE_ANIME4K_VARIANT))
+            });
+            timings.resampler_create_ms = start.elapsed().as_secs_f64() * 1000.0;
+            timings.pipeline_source = Some(source);
+            if source == crate::scaler_pipeline_store::PipelineSource::Inline {
+                timings.creation = Some(ResamplerCreationTimings::Anime4k(ready.creation_timings));
+            }
+            ready
+        })
+    }
+
+    fn nis_pipeline_set(
+        &mut self,
+        device: &wgpu::Device,
+        store: Option<&crate::scaler_pipeline_store::ScalerPipelineStore>,
+        timings: &mut LanczosGenerationTimings,
+    ) -> &Arc<NisPipelineSet> {
+        self.nis.get_or_insert_with(|| {
+            let start = Instant::now();
+            let acquired = store.map(|store| store.get_nis(device));
+            let source = acquired
+                .as_ref()
+                .map(|a| a.source)
+                .unwrap_or(crate::scaler_pipeline_store::PipelineSource::Inline);
+            timings.pipeline_wait_ms = acquired.as_ref().map_or(0.0, |a| a.wait_ms);
+            let ready = acquired.and_then(|a| a.value);
+            let source = if ready.is_some() {
+                source
+            } else {
+                crate::scaler_pipeline_store::PipelineSource::Inline
+            };
+            let ready = ready.unwrap_or_else(|| Arc::new(NisPipelineSet::new(device)));
+            timings.pipeline_create_ms = start.elapsed().as_secs_f64() * 1000.0;
+            timings.pipeline_source = Some(source);
+            if source == crate::scaler_pipeline_store::PipelineSource::Inline {
+                timings.branch_creation = Some(LanczosBranchCreationTimings {
+                    branch: LanczosPipelineBranch::Nis,
+                    steps: ready.creation_timings,
+                });
+            }
+            ready
+        })
     }
 
     fn generate(
         &mut self,
         render_state: &egui_wgpu::RenderState,
+        store: Option<&crate::scaler_pipeline_store::ScalerPipelineStore>,
         resource: &FullscreenPaintResource,
         key: LanczosCacheKey,
         plan: LanczosWorkPlan,
@@ -2447,12 +2527,13 @@ impl GpuLanczosCache {
             };
             source_texture.clone()
         };
-        self.generate_with_source(render_state, resource, key, plan, &source_texture)
+        self.generate_with_source(render_state, store, resource, key, plan, &source_texture)
     }
 
     fn generate_with_source(
         &mut self,
         render_state: &egui_wgpu::RenderState,
+        store: Option<&crate::scaler_pipeline_store::ScalerPipelineStore>,
         resource: &FullscreenPaintResource,
         key: LanczosCacheKey,
         plan: LanczosWorkPlan,
@@ -2462,21 +2543,18 @@ impl GpuLanczosCache {
         let mut timings = LanczosGenerationTimings::default();
         let job = match plan {
             LanczosWorkPlan::AnimeUpscale(plan) => {
-                let resampler =
-                    get_or_create_resampler(&mut self.anime_resampler, &mut timings, || {
-                        let resampler = Anime4kResampler::new(
-                            &render_state.device,
-                            STILL_IMAGE_ANIME4K_VARIANT,
-                        );
-                        let creation =
-                            ResamplerCreationTimings::Anime4k(resampler.creation_timings);
-                        (resampler, creation)
-                    });
+                let resampler = self.anime_pipeline(&render_state.device, store, &mut timings);
                 measure_resampler_cpu_ms(&mut timings.prepare_job_ms, || {
                     resampler
                         .prepare_job(&render_state.device, source_texture, plan)
                         .map(LanczosWorkJob::AnimeUpscale)
                 })
+            }
+            LanczosWorkPlan::NisUpscale(plan) => {
+                let pipelines = self.nis_pipeline_set(&render_state.device, store, &mut timings);
+                pipelines
+                    .prepare_job(&render_state.device, source_texture, plan, &mut timings)
+                    .map(LanczosWorkJob::NisUpscale)
             }
             plan => {
                 let resampler = get_or_create_resampler(&mut self.resampler, &mut timings, || {
@@ -2496,14 +2574,7 @@ impl GpuLanczosCache {
                             &mut timings,
                         )
                         .map(LanczosWorkJob::VisibleUpscale),
-                    LanczosWorkPlan::NisUpscale(plan) => resampler
-                        .prepare_nis_upscale_job(
-                            &render_state.device,
-                            source_texture,
-                            plan,
-                            &mut timings,
-                        )
-                        .map(LanczosWorkJob::NisUpscale),
+                    LanczosWorkPlan::NisUpscale(_) => unreachable!(),
                     LanczosWorkPlan::PixelArtUpscale(plan) => resampler
                         .prepare_pixel_aa_job(
                             &render_state.device,
@@ -3373,7 +3444,6 @@ struct Lanczos3Resampler {
     pipeline_layout: wgpu::PipelineLayout,
     downscale: OnceCell<LanczosTwoPassPipelines>,
     visible_upscale: OnceCell<LanczosTwoPassPipelines>,
-    nis: OnceCell<wgpu::RenderPipeline>,
     pixel_art: OnceCell<wgpu::RenderPipeline>,
 }
 
@@ -3400,53 +3470,130 @@ fn get_or_create_pipeline<'a, T>(
     })
 }
 
+fn create_resampler_layouts(
+    device: &wgpu::Device,
+    creation_timings: &mut LanczosCreationTimings,
+) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
+    let bind_group_layout =
+        measure_creation_step(&mut creation_timings.bind_group_layout_ms, || {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            })
+        });
+    let layout = measure_creation_step(&mut creation_timings.pipeline_layout_ms, || {
+        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        })
+    });
+    (bind_group_layout, layout)
+}
+
+pub(crate) struct NisPipelineSet {
+    // Snapshot the actual modules used below; they are dropped after creation.
+    #[cfg(test)]
+    pub(crate) shader_uses_dxbc: bool,
+    pub(crate) creation_timings: LanczosCreationTimings,
+    bind_group_layout: wgpu::BindGroupLayout,
+    _pipeline_layout: wgpu::PipelineLayout,
+    pipeline: wgpu::RenderPipeline,
+}
+
+impl NisPipelineSet {
+    pub(crate) fn new(device: &wgpu::Device) -> Self {
+        #[cfg(test)]
+        crate::test_gpu_group::assert_gpu_test_group();
+        let mut creation_timings = LanczosCreationTimings::default();
+        let (bind_group_layout, layout) = create_resampler_layouts(device, &mut creation_timings);
+        let shaders = measure_creation_step(&mut creation_timings.nis_shader_module_ms, || {
+            crate::gpu_still_shaders::ResamplerShaders::new(
+                device,
+                NIS_UPSCALE_SHADER,
+                Some(crate::gpu_still_shaders::Family::Nis),
+            )
+        });
+        let pipeline = measure_creation_step(&mut creation_timings.nis_upscale_pipeline_ms, || {
+            shaders.create_pipeline(device, &layout, "fs_nis", wgpu::TextureFormat::Rgba8Unorm)
+        });
+        Self {
+            #[cfg(test)]
+            shader_uses_dxbc: shaders.uses_dxbc(),
+            creation_timings,
+            bind_group_layout,
+            _pipeline_layout: layout,
+            pipeline,
+        }
+    }
+    fn prepare_job(
+        self: &Arc<Self>,
+        device: &wgpu::Device,
+        source: &wgpu::Texture,
+        plan: NisUpscalePlan,
+        timings: &mut LanczosGenerationTimings,
+    ) -> Result<NisJob, ()> {
+        if source.format() != wgpu::TextureFormat::Rgba8Unorm
+            || [source.width(), source.height()] != plan.source_size
+        {
+            return Err(());
+        }
+        let started = Instant::now();
+        let source_view = source.create_view(&wgpu::TextureViewDescriptor {
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            ..Default::default()
+        });
+        let output_texture =
+            create_target_texture(device, plan.target_size, wgpu::TextureFormat::Rgba8Unorm);
+        let output_view = output_texture.create_view(&Default::default());
+        let uniform = nis_params_uniform(device, plan);
+        let bind_group = create_bind_group(device, &self.bind_group_layout, &source_view, &uniform);
+        let job = NisJob {
+            pipelines: Arc::clone(self),
+            output_texture,
+            output_view,
+            bind_group,
+            _uniform: uniform,
+        };
+        timings.prepare_job_ms = started.elapsed().as_secs_f64() * 1000.0;
+        Ok(job)
+    }
+}
+
 impl Lanczos3Resampler {
     fn new(device: &wgpu::Device) -> Self {
         #[cfg(test)]
         crate::test_gpu_group::assert_gpu_test_group();
         let mut creation_timings = LanczosCreationTimings::default();
-        let bind_group_layout =
-            measure_creation_step(&mut creation_timings.bind_group_layout_ms, || {
-                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: None,
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                multisampled: false,
-                                sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                                view_dimension: wgpu::TextureViewDimension::D2,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 1,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                })
-            });
-        let layout = measure_creation_step(&mut creation_timings.pipeline_layout_ms, || {
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &[Some(&bind_group_layout)],
-                immediate_size: 0,
-            })
-        });
+        let (bind_group_layout, layout) = create_resampler_layouts(device, &mut creation_timings);
         Self {
             creation_timings,
             bind_group_layout,
             pipeline_layout: layout,
             downscale: OnceCell::new(),
             visible_upscale: OnceCell::new(),
-            nis: OnceCell::new(),
             pixel_art: OnceCell::new(),
         }
     }
@@ -3538,30 +3685,6 @@ impl Lanczos3Resampler {
                 }
             },
         )
-    }
-
-    fn nis_pipelines(
-        &self,
-        device: &wgpu::Device,
-        timings: &mut LanczosGenerationTimings,
-    ) -> &wgpu::RenderPipeline {
-        get_or_create_pipeline(&self.nis, timings, LanczosPipelineBranch::Nis, |steps| {
-            let shader = measure_creation_step(&mut steps.nis_shader_module_ms, || {
-                device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: None,
-                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(NIS_UPSCALE_SHADER)),
-                })
-            });
-            measure_creation_step(&mut steps.nis_upscale_pipeline_ms, || {
-                create_pipeline(
-                    device,
-                    &self.pipeline_layout,
-                    &shader,
-                    "fs_nis",
-                    wgpu::TextureFormat::Rgba8Unorm,
-                )
-            })
-        })
     }
 
     fn pixel_art_pipelines(
@@ -3721,41 +3844,6 @@ impl Lanczos3Resampler {
         Ok(job)
     }
 
-    fn prepare_nis_upscale_job(
-        &self,
-        device: &wgpu::Device,
-        source: &wgpu::Texture,
-        plan: NisUpscalePlan,
-        timings: &mut LanczosGenerationTimings,
-    ) -> Result<NisJob, ()> {
-        if source.format() != wgpu::TextureFormat::Rgba8Unorm
-            || [source.width(), source.height()] != plan.source_size
-        {
-            return Err(());
-        }
-        let ready = self.nis_pipelines(device, timings);
-        let started = Instant::now();
-        let source_view = source.create_view(&wgpu::TextureViewDescriptor {
-            base_mip_level: 0,
-            mip_level_count: Some(1),
-            ..Default::default()
-        });
-        let output_texture =
-            create_target_texture(device, plan.target_size, wgpu::TextureFormat::Rgba8Unorm);
-        let output_view = output_texture.create_view(&Default::default());
-        let uniform = nis_params_uniform(device, plan);
-        let bind_group = create_bind_group(device, &self.bind_group_layout, &source_view, &uniform);
-        let job = NisJob {
-            pipeline: ready.clone(),
-            output_texture,
-            output_view,
-            bind_group,
-            _uniform: uniform,
-        };
-        timings.prepare_job_ms = started.elapsed().as_secs_f64() * 1000.0;
-        Ok(job)
-    }
-
     fn prepare_pixel_aa_job(
         &self,
         device: &wgpu::Device,
@@ -3832,7 +3920,7 @@ struct LanczosJob {
 }
 
 struct NisJob {
-    pipeline: wgpu::RenderPipeline,
+    pipelines: Arc<NisPipelineSet>,
     output_texture: wgpu::Texture,
     output_view: wgpu::TextureView,
     bind_group: wgpu::BindGroup,
@@ -3866,7 +3954,12 @@ impl LanczosJob {
 
 impl NisJob {
     fn encode(&self, encoder: &mut wgpu::CommandEncoder) {
-        encode_lanczos_pass(encoder, &self.output_view, &self.pipeline, &self.bind_group);
+        encode_lanczos_pass(
+            encoder,
+            &self.output_view,
+            &self.pipelines.pipeline,
+            &self.bind_group,
+        );
     }
 }
 
@@ -4072,6 +4165,10 @@ mod prewarm_tests;
 #[path = "gpu_lanczos/measurement_tests.rs"]
 mod measurement_tests;
 
+#[cfg(all(test, windows))]
+#[path = "gpu_lanczos/dxbc_gpu_tests.rs"]
+mod gpu_tests;
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4145,6 +4242,7 @@ mod tests {
                 let (prepared, _) = payload.prepare(
                     &mut cache,
                     None,
+                    None,
                     0.5,
                     1.0,
                     None,
@@ -4160,6 +4258,7 @@ mod tests {
                 assert_eq!(held.capture_presentation(&ctx).page_material_kind(), kind);
                 let (prepared_held, _) = held.prepare(
                     &mut cache,
+                    None,
                     None,
                     2.0,
                     1.0,
@@ -5829,6 +5928,7 @@ mod tests {
         let (prepared, event) = payload.prepare(
             &mut cache,
             None,
+            None,
             1.0,
             2.0,
             None,
@@ -6009,6 +6109,7 @@ mod tests {
             let mut cache = GpuLanczosCache::default();
             let (prepared, event) = cache.resolve(
                 None,
+                None,
                 &original,
                 scale,
                 1.0,
@@ -6070,6 +6171,7 @@ mod tests {
         for first in [true, false] {
             let (prepared, event) = cache.resolve(
                 Some(&render_state),
+                None,
                 &original,
                 2.0,
                 1.0,
@@ -6578,6 +6680,7 @@ mod tests {
         assert!(matches!(
             cache.execute_prewarm_with_policy(
                 &rs,
+                None,
                 &resource,
                 plan,
                 NativePrewarmPolicy::NoRemoval,
@@ -6595,6 +6698,7 @@ mod tests {
         assert!(matches!(
             cache.execute_prewarm_with_policy(
                 &rs,
+                None,
                 &resource,
                 plan,
                 NativePrewarmPolicy::NoRemoval,
@@ -6620,7 +6724,7 @@ mod tests {
             ),
         );
         assert!(matches!(
-            cache.execute_prewarm(&rs, &resource, plan, |_| true),
+            cache.execute_prewarm(&rs, None, &resource, plan, |_| true),
             NativePrewarmExecution::Submitted { .. }
         ));
         assert!(!cache.entries.contains_key(&old));
@@ -6630,6 +6734,7 @@ mod tests {
         assert!(matches!(
             empty.execute_prewarm_with_policy(
                 &rs,
+                None,
                 &resource,
                 plan,
                 NativePrewarmPolicy::NoRemoval,

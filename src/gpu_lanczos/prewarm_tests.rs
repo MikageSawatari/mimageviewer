@@ -267,7 +267,7 @@ fn prewarm_delivery_claim_cache_hit_and_output_lease_use_normal_ownership() {
         NativePrewarmQuery::Unavailable(NativePrewarmUnavailable::MissingBacking)
     ));
     assert!(matches!(
-        cache.execute_prewarm(&rs, &source, expected, |_| panic!(
+        cache.execute_prewarm(&rs, None, &source, expected, |_| panic!(
             "missing backing must not claim"
         )),
         NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::MissingBacking)
@@ -278,7 +278,7 @@ fn prewarm_delivery_claim_cache_hit_and_output_lease_use_normal_ownership() {
         NativePrewarmQuery::Unavailable(NativePrewarmUnavailable::BackingMismatch)
     ));
     assert!(matches!(
-        cache.execute_prewarm(&rs, &source, expected, |_| panic!(
+        cache.execute_prewarm(&rs, None, &source, expected, |_| panic!(
             "wrong backing must not claim"
         )),
         NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::BackingMismatch)
@@ -293,13 +293,13 @@ fn prewarm_delivery_claim_cache_hit_and_output_lease_use_normal_ownership() {
     assert_eq!(cache.use_clock, 0);
     assert!(cache.resampler.is_none());
     assert!(matches!(
-        cache.execute_prewarm(&rs, &source, planned, |_| false),
+        cache.execute_prewarm(&rs, None, &source, planned, |_| false),
         NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::ClaimDenied)
     ));
     assert_eq!(cache.regeneration_count, 0);
     assert!(cache.resampler.is_none());
     let mut claims = 0;
-    let result = cache.execute_prewarm(&rs, &source, planned, |allocation| {
+    let result = cache.execute_prewarm(&rs, None, &source, planned, |allocation| {
         // Taking the renderer write lock here also checks the no-lock callback
         // contract. The closure does not visit App contexts or reenter UI.
         drop(rs.renderer.write());
@@ -323,11 +323,14 @@ fn prewarm_delivery_claim_cache_hit_and_output_lease_use_normal_ownership() {
     };
     assert_eq!(hit_key, planned.key());
     assert!(matches!(
-        cache.execute_prewarm(&rs, &source, planned, |_| panic!("hit must not claim")),
+        cache.execute_prewarm(&rs, None, &source, planned, |_| panic!(
+            "hit must not claim"
+        )),
         NativePrewarmExecution::Hit
     ));
     let (prepared, event) = cache.resolve(
         Some(&rs),
+        None,
         &source,
         0.5,
         1.0,
@@ -367,7 +370,7 @@ fn prewarm_execution_rejects_changed_source_and_freed_backing_before_claim() {
         panic!("delivered source")
     };
     assert!(matches!(
-        cache.execute_prewarm(&rs, &other, planned, |_| panic!(
+        cache.execute_prewarm(&rs, None, &other, planned, |_| panic!(
             "changed source must not claim"
         )),
         NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::SourceChanged)
@@ -376,7 +379,7 @@ fn prewarm_execution_rejects_changed_source_and_freed_backing_before_claim() {
         .write()
         .free_texture(&source.source_texture_id());
     assert!(matches!(
-        cache.execute_prewarm(&rs, &source, planned, |_| panic!(
+        cache.execute_prewarm(&rs, None, &source, planned, |_| panic!(
             "freed backing must not claim"
         )),
         NativePrewarmExecution::Unavailable(NativePrewarmUnavailable::MissingBacking)

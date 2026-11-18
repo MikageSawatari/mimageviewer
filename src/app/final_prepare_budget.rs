@@ -483,6 +483,7 @@ impl App {
             };
             let outcome = self.fs_lanczos_cache.execute_prewarm_with_policy(
                 &render_state,
+                self.scaler_pipeline_store.as_deref(),
                 &resource,
                 plan,
                 if unit.position == FinalUnitPosition::Previous {

@@ -54,7 +54,15 @@ pub fn init() {
 /// 優先順位: `TEST_OVERRIDE` (テスト時) → `DATA_DIR` (本番 OnceLock) →
 /// `default()` (%APPDATA% + mimageviewer)。
 pub fn get() -> PathBuf {
-    if let Ok(guard) = TEST_OVERRIDE.lock() {
+    let wait = crate::perf::close_nav::Wait::for_close(
+        crate::perf::close_nav::WaitSite::DataDirOverride,
+        "get",
+    );
+    if let Ok(guard) = {
+        let result = TEST_OVERRIDE.lock();
+        wait.acquired();
+        result
+    } {
         if let Some(p) = guard.as_ref() {
             return p.clone();
         }

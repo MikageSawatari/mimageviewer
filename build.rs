@@ -1,5 +1,7 @@
 #[path = "config/miv-sound.rs"]
 mod miv_sound_config;
+#[path = "build/still_image_shaders.rs"]
+mod still_image_shaders;
 
 fn main() {
     println!("cargo:rerun-if-changed=config/miv-sound.rs");
@@ -108,6 +110,7 @@ fn main() {
     generate_video_nis_hlsl(fxc.as_deref());
     compile_video_presenter_shaders(fxc.as_deref());
     generate_video_anime4k_shaders(fxc.as_deref());
+    still_image_shaders::generate(fxc.as_deref());
 
     // 先に vendor ファイルの存在チェックをして、cryptic な include_bytes! エラーに
     // 代わって復旧手順付きの明確なメッセージを出す。

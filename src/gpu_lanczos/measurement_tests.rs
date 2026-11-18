@@ -134,6 +134,36 @@ fn regeneration_accounting_counts_layout_pipeline_and_job_phases_once() {
     assert_eq!(fields(actual)["unaccounted_ms"], 8.0);
 }
 
+#[test]
+fn shared_pipeline_source_preserves_wait_as_creation_time_subset() {
+    use crate::scaler_pipeline_store::PipelineSource;
+    for source in [
+        PipelineSource::Prebuilt,
+        PipelineSource::Waited,
+        PipelineSource::Inline,
+    ] {
+        let wait_ms = if source == PipelineSource::Waited {
+            7.0
+        } else {
+            0.0
+        };
+        // Waiting is already inside the measured acquisition phase. Adding it
+        // again would understate unaccounted_ms in both normal and prewarm logs.
+        let mut actual = stats(LanczosGenerationTimings {
+            pipeline_source: Some(source),
+            pipeline_wait_ms: wait_ms,
+            pipeline_create_ms: 9.0,
+            ..Default::default()
+        });
+        actual.encode_submit_cpu_ms = 14.0;
+        let fields = fields(actual);
+        assert_eq!(fields["pipeline_source"], source.as_str());
+        assert_eq!(fields["pipeline_wait_ms"], wait_ms);
+        assert_eq!(fields["unaccounted_ms"], 5.0);
+        assert!(!fields.contains_key("resampler_create_breakdown"));
+    }
+}
+
 fn emit(value: serde_json::Value) {
     println!("MEASURE776 {value}");
 }
@@ -142,6 +172,7 @@ fn headless_gpu() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::
     crate::test_gpu_group::assert_gpu_test_group();
     let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
     descriptor.backends = wgpu::Backends::DX12;
+    descriptor.flags = wgpu::InstanceFlags::from_build_config().with_env();
     descriptor.backend_options.dx12.shader_compiler = wgpu::Dx12Compiler::Fxc;
     let instance = wgpu::Instance::new(descriptor);
     let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -169,6 +200,7 @@ fn headless_gpu() -> Option<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::
     }));
     match pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("measure_776 DX12 FXC"),
+        required_features: crate::gpu_still_shaders::request_passthrough(adapter.features()),
         ..Default::default()
     })) {
         Ok((device, queue)) => Some((instance, adapter, device, queue)),
@@ -219,11 +251,17 @@ fn prepare(
                 .prepare_visible_upscale_job(device, source, plan, timings)
                 .unwrap(),
         ),
-        LanczosWorkPlan::NisUpscale(plan) => LanczosWorkJob::NisUpscale(
-            resampler
-                .prepare_nis_upscale_job(device, source, plan, timings)
-                .unwrap(),
-        ),
+        LanczosWorkPlan::NisUpscale(plan) => {
+            let ready = measure_resampler_cpu_ms(&mut timings.pipeline_create_ms, || {
+                Arc::new(NisPipelineSet::new(device))
+            });
+            timings.branch_creation = Some(LanczosBranchCreationTimings {
+                branch: LanczosPipelineBranch::Nis,
+                steps: ready.creation_timings,
+            });
+            timings.pipeline_source = Some(crate::scaler_pipeline_store::PipelineSource::Inline);
+            LanczosWorkJob::NisUpscale(ready.prepare_job(device, source, plan, timings).unwrap())
+        }
         LanczosWorkPlan::PixelArtUpscale(plan) => LanczosWorkJob::PixelArtUpscale(
             resampler
                 .prepare_pixel_aa_job(device, source, plan, timings)
@@ -527,7 +565,7 @@ fn lazy_776_default_only_then_other_families_through_prewarm_and_resolve() {
                 panic!("first prewarm miss")
             };
             let NativePrewarmExecution::Submitted { stats, .. } =
-                cache.execute_prewarm(&rs, &resource, plan, |_| true)
+                cache.execute_prewarm(&rs, None, &resource, plan, |_| true)
             else {
                 panic!("prewarm submitted")
             };
@@ -535,6 +573,7 @@ fn lazy_776_default_only_then_other_families_through_prewarm_and_resolve() {
         } else {
             let (prepared, event) = cache.resolve(
                 Some(&rs),
+                None,
                 &resource,
                 scale,
                 1.0,
@@ -555,7 +594,7 @@ fn lazy_776_default_only_then_other_families_through_prewarm_and_resolve() {
         );
         let resampler = cache.resampler.as_ref().unwrap();
         assert!(resampler.visible_upscale.get().is_some());
-        assert_eq!(resampler.nis.get().is_some(), index >= 2);
+        assert_eq!(cache.nis.is_some(), index >= 2);
         assert_eq!(resampler.downscale.get().is_some(), index >= 4);
         assert_eq!(resampler.pixel_art.get().is_some(), index >= 6);
         let f = fields(actual);

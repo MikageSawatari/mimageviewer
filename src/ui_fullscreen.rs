@@ -12252,6 +12252,7 @@ impl App {
         let render_state = self.wgpu_render_state.clone();
         let (prepared, perf_event) = self.fs_lanczos_cache.resolve(
             render_state.as_ref(),
+            self.scaler_pipeline_store.as_deref(),
             resource,
             logical_scale,
             pixels_per_point,

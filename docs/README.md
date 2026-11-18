@@ -69,6 +69,7 @@
 | [clipboard-capture-plan.md](clipboard-capture-plan.md) | **設計確定 (第 8 版)・S1 実装中**。クリップボード取り込み。コピーした画像の自動保存と、コピーしたページ HTML の画像を選んで保存する機能。専用 listener、右下の非アクティブ小窓、参照元の規則、ファイル名とスタック、段階と検証 |
 | [container-index-startup-optimization-plan.md](container-index-startup-optimization-plan.md) | コンテナ索引の起動・watch更新に共通するDB直下置換SQLの範囲限定。小規模修正の設計・検証記録 |
 | [ui-responsiveness.md](ui-responsiveness.md) | UI スレッド同期 I/O で UI を止めないための設計方針。**新機能追加前にチェックリスト §4 を必ず見る** |
+| [section801-close-navigation-investigation.md](section801-close-navigation-investigation.md) | §1.801、AI高画質化中に本を閉じた際のpre-scan待ち。同期到達先の棚卸し、型付き小区間とロック取得待ちの計装、fake handler検証。利用者事象の原因は未確定・修正は未実装 |
 | [startup-diagnostics-plan.md](startup-diagnostics-plan.md) | §1.241 常時起動timeline、実PRESENT、5秒Indexer overlay、単一採用、狭いwatchdog。Phase Aと§1.335統合後の初期フォルダPhase Bの境界は§10 |
 | [ai-crash-655-investigation.md](ai-crash-655-investigation.md) | §1.482の調査・確定設計・段階実装。終了印/次回通知、活動中checkpoint、panic/native/device-lost、現役ORT失敗の即時通知と安全なコピー。段A〜D実装済み・実機未確認。段A〜Cは独立ACCEPT、段Dは検証・受入中 |
 | [preferences-layout-guidelines.md](preferences-layout-guidelines.md) | 環境設定 UI のページ構成、配置、レスポンシブレイアウトを触るとき |

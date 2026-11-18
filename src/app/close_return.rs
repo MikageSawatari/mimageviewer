@@ -358,7 +358,11 @@ impl App {
     pub(super) fn resolve_close_return_navigation(
         &self,
     ) -> Option<(crate::ui_main::AddressBarNav, Option<String>)> {
-        if let Some(plan) = self.chosen_zip_list_return() {
+        let _span = CloseNavSpan::new(CloseNavStage::ResolveReturn);
+        if let Some(plan) = {
+            let _span = CloseNavSpan::new(CloseNavStage::ResolveZipReturn);
+            self.chosen_zip_list_return()
+        } {
             return Some((
                 crate::ui_main::AddressBarNav::ZipListReturn(ZipListReturnRequest::PreparedLive(
                     plan,
@@ -371,19 +375,24 @@ impl App {
             // including converted books. Never infer this return from a cache's parent.
             return Some((crate::ui_main::AddressBarNav::EverythingResults, None));
         }
-        if let Some(navigation) = self.collection_grid_parent_navigation() {
+        if let Some(navigation) = {
+            let _span = CloseNavSpan::new(CloseNavStage::ResolveCollectionReturn);
+            self.collection_grid_parent_navigation()
+        } {
             return Some(navigation);
         }
-        if let Some(nav) = self
-            .bookmark_view_back_nav()
-            .or_else(|| self.reading_history_back_nav())
-            .or_else(|| {
-                self.rating_view_parent_nav_available()
-                    .then_some(crate::ui_main::AddressBarNav::RatingViewBack)
-            })
-            .or_else(|| self.subfolder_expansion_back_nav())
-            .or_else(|| self.smart_folder_parent_nav_target())
-        {
+        let special = {
+            let _span = CloseNavSpan::new(CloseNavStage::ResolveSpecialReturn);
+            self.bookmark_view_back_nav()
+                .or_else(|| self.reading_history_back_nav())
+                .or_else(|| {
+                    self.rating_view_parent_nav_available()
+                        .then_some(crate::ui_main::AddressBarNav::RatingViewBack)
+                })
+                .or_else(|| self.subfolder_expansion_back_nav())
+                .or_else(|| self.smart_folder_parent_nav_target())
+        };
+        if let Some(nav) = special {
             return Some((nav, None));
         }
         if self.items_are_smart_folder_view {
@@ -421,6 +430,7 @@ impl App {
                     }
                     Some(nav)
                 } else {
+                    let _span = CloseNavSpan::new(CloseNavStage::RetireNoDestination);
                     self.change_main_context_for_visible_grid(false);
                     None
                 }
