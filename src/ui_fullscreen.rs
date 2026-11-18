@@ -4965,13 +4965,6 @@ fn slideshow_progress_ring_center(
         if content_rect.contains_rect(bounds.translate(left - center)) {
             return left;
         }
-        let below = egui::pos2(
-            center.x,
-            avoid.bottom() + SLIDESHOW_PROGRESS_RING_MARGIN + SLIDESHOW_PROGRESS_RING_RADIUS,
-        );
-        if content_rect.contains_rect(bounds.translate(below - center)) {
-            return below;
-        }
     }
     center
 }

@@ -41,7 +41,7 @@ fn slideshow_progress_ring_avoids_expanded_and_collapsed_panel_with_locked_top_b
 }
 
 #[test]
-fn slideshow_progress_ring_uses_below_panel_when_left_margin_does_not_fit() {
+fn slideshow_progress_ring_keeps_original_position_when_left_margin_does_not_fit() {
     for width in [319.0_f32, 320.0, 321.0, 335.0] {
         let content = egui::Rect::from_min_max(egui::pos2(0.0, 44.0), egui::pos2(width, 700.0));
         let panel_width = 300.0_f32.min(width - 24.0);
@@ -51,12 +51,12 @@ fn slideshow_progress_ring_uses_below_panel_when_left_margin_does_not_fit() {
                 egui::vec2(panel_width, height),
             );
             let center = slideshow_progress_ring_center(content, Some(panel));
-            assert_eq!(center, egui::pos2(width - 22.0, panel.bottom() + 12.0));
+            assert_eq!(center, egui::pos2(width - 22.0, 66.0));
             assert!(content.contains_rect(egui::Rect::from_center_size(
                 center,
                 egui::Vec2::splat(24.0)
             )));
-            assert!(!panel.intersects(egui::Rect::from_center_size(
+            assert!(panel.intersects(egui::Rect::from_center_size(
                 center,
                 egui::Vec2::splat(16.0)
             )));
@@ -81,7 +81,7 @@ fn slideshow_progress_ring_uses_left_when_full_margin_exactly_fits() {
 }
 
 #[test]
-fn slideshow_progress_ring_keeps_original_position_when_neither_side_fits() {
+fn slideshow_progress_ring_keeps_original_position_with_tall_panel_in_narrow_content() {
     for width in [319.0_f32, 320.0, 321.0] {
         let content = egui::Rect::from_min_max(egui::pos2(0.0, 44.0), egui::pos2(width, 700.0));
         let panel =
