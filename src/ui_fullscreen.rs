@@ -36377,10 +36377,12 @@ impl App {
         };
         let page_next = page_next_input.should_navigate();
         let page_prev = page_prev_input.should_navigate();
-        let fixed_jump_next =
-            !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsFixedJumpNext);
-        let fixed_jump_prev =
-            !is_video_fs && self.keymap.consume_action(ctx, KeyAction::FsFixedJumpPrev);
+        let fixed_jump_next = navigation_allowed
+            && !is_video_fs
+            && self.keymap.consume_action(ctx, KeyAction::FsFixedJumpNext);
+        let fixed_jump_prev = navigation_allowed
+            && !is_video_fs
+            && self.keymap.consume_action(ctx, KeyAction::FsFixedJumpPrev);
         let fixed_jump_next_no_rtl = navigation_allowed
             && !is_video_fs
             && !continuous_mode_for_page_keys
@@ -36498,7 +36500,8 @@ impl App {
             !stack_flat_nav,
         );
         // Route the one typed consume result, never re-read the current modifier level.
-        // The fallback menu owns replacement input even outside the scroll surface.
+        // Foreground menus reject navigation before consumption. The replacement
+        // policy itself remains at the existing page-turn routing point.
         let replace_up_down = self.settings.fullscreen_up_down_key_action.normalized()
             == crate::settings::FullscreenUpDownKeyAction::InPageScroll
             && (self.fs_context_menu_idx.is_some() || self.fs_in_page_scroll_surface());
@@ -45579,6 +45582,7 @@ impl App {
             .flatten();
         let input_zoom_pan = zoom_pan;
         let input_live_eligible = live_eligible;
+        let mut selected_provisional = None;
         while let Some(resource) = display_tex.take() {
             zoom_pan = input_zoom_pan;
             live_eligible = input_live_eligible;
@@ -45699,43 +45703,19 @@ impl App {
             let Some(mut transform) = transform else {
                 return None;
             };
-            let mut bounded_pan = None;
-            if matches!(layout_source, FsPageLayoutSource::CurrentItem)
-                && self.fs_draw_pan_eligible(selected_current, original_preview_active)
-                && resource.page_material_kind() == FullscreenPageMaterialKind::Complete
-                && normal_zoom_pan(transform).is_some()
-            {
-                let correction = draw_pan_correction(std::slice::from_ref(&transform));
-                if correction != egui::Vec2::ZERO {
-                    let (zoom, pan) = normal_zoom_pan(transform).expect("normal image placement");
-                    let pan = pan + correction;
-                    bounded_pan = Some(pan);
-                    zoom_pan = Self::fs_zoom_pan_for(zoom, pan);
-                    transform_input.placement = match transform_input.placement {
-                        ResolvedDisplayPlacement::SingletonSpread { side, gap, .. } => {
-                            ResolvedDisplayPlacement::SingletonSpread {
-                                side,
-                                gap,
-                                zoom_pan,
-                            }
-                        }
-                        _ => ResolvedDisplayPlacement::Normal { zoom_pan },
-                    };
-                    transform = resolve_fs_image_transform(transform_input, layout_source_size)?;
-                    live_eligible &= zoom_pan.is_none();
-                }
-            }
-            let painter = ui
-                .painter()
-                .with_clip_rect(canonical_demand::single_clip_rect(
-                    ui.painter().clip_rect(),
-                    full_rect,
-                    zoom_pan,
-                    free_rotation_rad,
-                    content_bbox,
-                    fit_mode,
-                    fit_scale_limits,
-                ));
+            let painter_for = |zoom_pan| {
+                ui.painter()
+                    .with_clip_rect(canonical_demand::single_clip_rect(
+                        ui.painter().clip_rect(),
+                        full_rect,
+                        zoom_pan,
+                        free_rotation_rad,
+                        content_bbox,
+                        fit_mode,
+                        fit_scale_limits,
+                    ))
+            };
+            let mut painter = painter_for(zoom_pan);
             if matches!(layout_source, FsPageLayoutSource::CurrentItem)
                 && self.depth_view_may_continue(page_idx)
                 && self.try_paint_depth(
@@ -45761,9 +45741,7 @@ impl App {
                 }
                 return Some(transform);
             }
-            let white = white_companion_override
-                .or_else(|| white_companion_rect(&transform).map(|rect| (rect, full_rect)));
-            let Some(paint_resource) = self.prepare_fs_paged_paint_payload(
+            let Some(mut paint_resource) = self.prepare_fs_paged_paint_payload(
                 resource,
                 &transform,
                 &painter,
@@ -45775,6 +45753,55 @@ impl App {
                 using_full_texture = false;
                 continue;
             };
+            let mut bounded_pan = None;
+            if matches!(layout_source, FsPageLayoutSource::CurrentItem)
+                && self.fs_draw_pan_eligible(selected_current, original_preview_active)
+                && paint_resource.page_material_kind() == FullscreenPageMaterialKind::Complete
+                && normal_zoom_pan(transform).is_some()
+            {
+                let correction = draw_pan_correction(std::slice::from_ref(&transform));
+                if correction != egui::Vec2::ZERO {
+                    let (zoom, pan) = normal_zoom_pan(transform).expect("normal image placement");
+                    let pan = pan + correction;
+                    bounded_pan = Some(pan);
+                    zoom_pan = Self::fs_zoom_pan_for(zoom, pan);
+                    transform_input.placement = match transform_input.placement {
+                        ResolvedDisplayPlacement::SingletonSpread { side, gap, .. } => {
+                            ResolvedDisplayPlacement::SingletonSpread {
+                                side,
+                                gap,
+                                zoom_pan,
+                            }
+                        }
+                        _ => ResolvedDisplayPlacement::Normal { zoom_pan },
+                    };
+                    transform = resolve_fs_image_transform(transform_input, layout_source_size)?;
+                    live_eligible &= zoom_pan.is_none();
+                    painter = painter_for(zoom_pan);
+                    let Some(prepared) = self.prepare_fs_paged_paint_payload(
+                        resource,
+                        &transform,
+                        &painter,
+                        bg_style,
+                        layout_source,
+                        live_eligible && using_full_texture && submitted.is_some(),
+                    ) else {
+                        display_tex = fallback.take();
+                        using_full_texture = false;
+                        continue;
+                    };
+                    if prepared.page_material_kind() != FullscreenPageMaterialKind::Complete {
+                        // Select the actual provisional material using the original
+                        // frame pan, discarding the complete candidate's proposal.
+                        display_tex = Some(selected_provisional.insert(prepared));
+                        using_full_texture = false;
+                        continue;
+                    }
+                    paint_resource = prepared;
+                }
+            }
+            let white = white_companion_override
+                .or_else(|| white_companion_rect(&transform).map(|rect| (rect, full_rect)));
             let initial_origin_automatic = initial_placement_applied.then(|| {
                 self.fs_initial_placement_request
                     .expect("validated initial placement")
@@ -51785,22 +51812,22 @@ impl App {
                 || (!pass_through
                     && (original_preview_active
                         || !self.colorize_display_requires_final_effect(right_idx))));
-        // Initial placement and draw constraints share actual-material selection.
+        // Preserve the released layout/fallback path without an entry-position request.
         let can_bound_pan = display_override.is_none()
             && captured_placement.is_none()
             && self.fs_draw_pan_eligible(selected_current, original_preview_active);
-        let select_paged_material = display_override.is_none()
+        let select_initial_material = display_override.is_none()
             && captured_placement.is_none()
             && !self.fs_zoom_mode_effective()
             && selected_current
-            && (self.fs_initial_placement_request.is_some() || can_bound_pan);
+            && self.fs_initial_placement_request.is_some();
         let mut left_using_full_texture = left_display_tex.is_some();
         let mut right_using_full_texture = right_display_tex.is_some();
         let mut left_fallback_available =
-            select_paged_material && left_using_full_texture && left_allow_thumbnail;
+            select_initial_material && left_using_full_texture && left_allow_thumbnail;
         let mut right_fallback_available =
-            select_paged_material && right_using_full_texture && right_allow_thumbnail;
-        if select_paged_material {
+            select_initial_material && right_using_full_texture && right_allow_thumbnail;
+        if select_initial_material {
             left_display_tex = self.fs_spread_page_paint_resource(
                 left_idx,
                 left_display_tex.as_ref(),
@@ -51813,8 +51840,7 @@ impl App {
             );
         }
         let input_zoom_pan = zoom_pan;
-        let mut propose_initial_placement = select_paged_material;
-        let mut propose_pan_fit = can_bound_pan;
+        let mut propose_initial_placement = select_initial_material;
         // Each side can select its thumbnail once. An unpaintable partial unit
         // gets one final pass using the unchanged, committed transform.
         'material_selection: loop {
@@ -52056,7 +52082,7 @@ impl App {
                                     let handle = app.fs_spread_page_paint_resource(
                                         idx,
                                         display_tex,
-                                        allow_thumbnail && !select_paged_material,
+                                        allow_thumbnail && !select_initial_material,
                                     )?;
                                     app.resolve_fs_spread_page_payload_transform(
                                         &handle,
@@ -52143,32 +52169,9 @@ impl App {
                         resolved_placement = ResolvedDisplayPlacement::Normal { zoom_pan };
                     }
                 }
-                let (mut spread_rects, mut spread_offsets, _, pages) =
+                let (mut spread_rects, spread_offsets, _, _) =
                     resolve_layout(self, resolved_placement, resolved_zoom_pan);
                 let mut bounded_pan = None;
-                if propose_pan_fit
-                    && [left_display_tex.as_ref(), right_display_tex.as_ref()]
-                        .iter()
-                        .all(|resource| {
-                            resource.is_some_and(|resource| {
-                                resource.page_material_kind()
-                                    == FullscreenPageMaterialKind::Complete
-                            })
-                        })
-                    && let [Some(left), Some(right)] = pages
-                {
-                    let correction = draw_pan_correction(&[left, right]);
-                    if correction != egui::Vec2::ZERO {
-                        let (zoom, pan) = normal_zoom_pan(left).expect("normal spread placement");
-                        let pan = pan + correction;
-                        bounded_pan = Some(pan);
-                        zoom_pan = Self::fs_zoom_pan_for(zoom, pan);
-                        resolved_zoom_pan = zoom_pan;
-                        resolved_placement = ResolvedDisplayPlacement::Normal { zoom_pan };
-                        (spread_rects, spread_offsets, _, _) =
-                            resolve_layout(self, resolved_placement, resolved_zoom_pan);
-                    }
-                }
                 let painter = ui
                     .painter()
                     .with_clip_rect(canonical_demand::spread_clip_rect(
@@ -52182,7 +52185,7 @@ impl App {
                     ));
                 let mut selected_transforms = [None, None];
                 let mut native_materials = [None, None];
-                if select_paged_material {
+                if select_initial_material {
                     // Preflight only paint-only Native leases. Normal inputs always
                     // prepare successfully and must not repeat GPU work while the
                     // other side selects its one existing thumbnail alternative.
@@ -52284,13 +52287,11 @@ impl App {
                             }
                         }
                     }
-                    if (initial_placement_applied || bounded_pan.is_some())
-                        && selected_transforms.iter().any(Option::is_none)
+                    if initial_placement_applied && selected_transforms.iter().any(Option::is_none)
                     {
                         // Preserve partial painting, using only the committed pan.
                         // No Normal material has been prepared yet in this pass.
                         propose_initial_placement = false;
-                        propose_pan_fit = false;
                         continue 'material_selection;
                     }
                 }
@@ -52343,8 +52344,8 @@ impl App {
                         && !color_faithful_rendition_unit
                         && self.settings.page_turn_animation_enabled
                         && self.page_turn_view_eligible(idx)
-                        && (!select_paged_material || (zoom_pan.is_none() && using_full_texture));
-                    let prepared = if select_paged_material {
+                        && (!select_initial_material || (zoom_pan.is_none() && using_full_texture));
+                    let prepared = if select_initial_material {
                         let side = usize::from(idx == right_idx);
                         match (display_tex.as_ref(), selected_transforms[side]) {
                             (Some(handle), Some(transform)) => {
@@ -52402,25 +52403,210 @@ impl App {
                             page.occurrence = *occurrence;
                         }
                         page.spine = Some(spread_rects.spine);
-                        if submit_final && !select_paged_material {
-                            page = self.page_turn_bind_prepared(page);
-                        }
-                        if !select_paged_material {
-                            self.fullscreen_page_layout.push_spread_occurrence(
-                                page.transform,
-                                page.occurrence,
-                                if page.occurrence.idx == left_idx {
-                                    SingletonSpreadPlacement::Left
-                                } else {
-                                    SingletonSpreadPlacement::Right
-                                },
-                                spread_rects.spine.1,
-                            );
-                        }
                         prepared_pages[usize::from(idx == right_idx)] = Some(page);
                     } else {
                         missing_pages[usize::from(idx == right_idx)] =
                             Some((idx, rect, location.as_str()));
+                    }
+                }
+                // Both entry paths select their actual materials first. Without an
+                // initial-placement request the original slots and gap stay the
+                // layout basis, even when a per-page fallback was selected.
+                if can_bound_pan
+                    && let [Some(left), Some(right)] = &prepared_pages
+                    && [left, right].iter().all(|page| {
+                        page.resource.page_material_kind() == FullscreenPageMaterialKind::Complete
+                    })
+                {
+                    let correction = draw_pan_correction(&[left.transform, right.transform]);
+                    if correction != egui::Vec2::ZERO {
+                        let (zoom, pan) =
+                            normal_zoom_pan(left.transform).expect("normal spread placement");
+                        let proposed_pan = pan + correction;
+                        let proposed_zoom_pan = Self::fs_zoom_pan_for(zoom, proposed_pan);
+                        let proposed_placement = ResolvedDisplayPlacement::Normal {
+                            zoom_pan: proposed_zoom_pan,
+                        };
+                        // The layout basis remains the original display candidates,
+                        // including when a paint-only Native needs its thumbnail.
+                        let (proposed_rects, proposed_offsets, _, _) =
+                            resolve_layout(self, proposed_placement, proposed_zoom_pan);
+                        let proposed_painter =
+                            ui.painter()
+                                .with_clip_rect(canonical_demand::spread_clip_rect(
+                                    ui.painter().clip_rect(),
+                                    image_rect,
+                                    proposed_zoom_pan,
+                                    [content_left, content_right],
+                                    fit_mode,
+                                    fit_scale_limits,
+                                    self.fs_zoom_mode_effective(),
+                                ));
+                        let mut proposed_pages = [None, None];
+                        for (
+                            side,
+                            idx,
+                            source_size,
+                            layout_source,
+                            rot,
+                            bbox,
+                            resource,
+                            allow_thumbnail,
+                            location,
+                            rect,
+                            offset,
+                        ) in [
+                            (
+                                0,
+                                left_idx,
+                                left_coordinate_size,
+                                left_page_layout_source,
+                                left_rot,
+                                content_left,
+                                left_display_tex.as_ref(),
+                                left_allow_thumbnail,
+                                left_location.as_str(),
+                                proposed_rects.left_rect,
+                                proposed_offsets.0,
+                            ),
+                            (
+                                1,
+                                right_idx,
+                                right_coordinate_size,
+                                right_page_layout_source,
+                                right_rot,
+                                content_right,
+                                right_display_tex.as_ref(),
+                                right_allow_thumbnail,
+                                right_location.as_str(),
+                                proposed_rects.right_rect,
+                                proposed_offsets.1,
+                            ),
+                        ] {
+                            proposed_pages[side] = self.prepare_fs_spread_page(
+                                &proposed_painter,
+                                image_rect,
+                                rect,
+                                idx,
+                                source_size,
+                                layout_source,
+                                rot,
+                                &bg_style,
+                                location,
+                                resource,
+                                allow_thumbnail,
+                                bbox,
+                                pixels_per_point,
+                                proposed_placement,
+                                offset,
+                                false,
+                            );
+                        }
+                        if proposed_pages.iter().all(|page| {
+                            page.as_ref().is_some_and(|page| {
+                                page.resource.page_material_kind()
+                                    == FullscreenPageMaterialKind::Complete
+                            })
+                        }) {
+                            prepared_pages = proposed_pages;
+                            spread_rects = proposed_rects;
+                            zoom_pan = proposed_zoom_pan;
+                            bounded_pan = Some(proposed_pan);
+                        } else if select_initial_material {
+                            // Only the existing entry-position path reflows after
+                            // selecting a thumbnail. Do not retain either side's
+                            // proposed pan when the complete unit was rejected.
+                            for (side, page) in proposed_pages.into_iter().enumerate() {
+                                match page {
+                                    Some(page)
+                                        if page.resource.page_material_kind()
+                                            == FullscreenPageMaterialKind::Provisional =>
+                                    {
+                                        if side == 0 {
+                                            left_display_tex = Some(page.resource);
+                                            left_using_full_texture = false;
+                                            left_fallback_available = false;
+                                        } else {
+                                            right_display_tex = Some(page.resource);
+                                            right_using_full_texture = false;
+                                            right_fallback_available = false;
+                                        }
+                                    }
+                                    None => propose_initial_placement = false,
+                                    _ => {}
+                                }
+                            }
+                            continue 'material_selection;
+                        } else {
+                            // Discard the proposal for the whole unit. A newly chosen
+                            // provisional fallback still paints in the original slot;
+                            // its sibling retains the original selected transform.
+                            for (
+                                side,
+                                idx,
+                                source_size,
+                                layout_source,
+                                rot,
+                                bbox,
+                                location,
+                                rect,
+                                offset,
+                            ) in [
+                                (
+                                    0,
+                                    left_idx,
+                                    left_coordinate_size,
+                                    left_page_layout_source,
+                                    left_rot,
+                                    content_left,
+                                    left_location.as_str(),
+                                    spread_rects.left_rect,
+                                    spread_offsets.0,
+                                ),
+                                (
+                                    1,
+                                    right_idx,
+                                    right_coordinate_size,
+                                    right_page_layout_source,
+                                    right_rot,
+                                    content_right,
+                                    right_location.as_str(),
+                                    spread_rects.right_rect,
+                                    spread_offsets.1,
+                                ),
+                            ] {
+                                match proposed_pages[side].take() {
+                                    Some(page)
+                                        if page.resource.page_material_kind()
+                                            == FullscreenPageMaterialKind::Provisional =>
+                                    {
+                                        prepared_pages[side] = self.prepare_fs_spread_page(
+                                            &painter,
+                                            image_rect,
+                                            rect,
+                                            idx,
+                                            source_size,
+                                            layout_source,
+                                            rot,
+                                            &bg_style,
+                                            location,
+                                            Some(&page.resource),
+                                            false,
+                                            bbox,
+                                            pixels_per_point,
+                                            resolved_placement,
+                                            offset,
+                                            false,
+                                        );
+                                    }
+                                    None => prepared_pages[side] = None,
+                                    _ => {}
+                                }
+                                if prepared_pages[side].is_none() {
+                                    missing_pages[side] = Some((idx, rect, location));
+                                }
+                            }
+                        }
                     }
                 }
                 let initial_origin_automatic = initial_placement_applied.then(|| {
@@ -52456,10 +52642,19 @@ impl App {
                     }));
                     self.commit_fs_draw_pan(pan, initial_origin_automatic);
                 }
-                if select_paged_material {
+                {
                     for slot in &mut prepared_pages {
                         if let Some(mut page) = slot.take() {
-                            self.observe_raw_presentation(page.occurrence.idx);
+                            if let Some(occurrence) = occurrences
+                                .iter()
+                                .find(|occurrence| occurrence.idx == page.transform.page_idx)
+                            {
+                                page.occurrence = *occurrence;
+                            }
+                            page.spine = Some(spread_rects.spine);
+                            if select_initial_material {
+                                self.observe_raw_presentation(page.occurrence.idx);
+                            }
                             if submit_final {
                                 page = self.page_turn_bind_prepared(page);
                             }

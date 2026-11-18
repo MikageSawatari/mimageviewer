@@ -333,12 +333,15 @@ fn partial_spread_does_not_restrict_pan_and_first_complete_spread_does() {
 #[test]
 fn original_preview_round_trip_keeps_processed_pan_for_single_and_spread() {
     let ctx = egui::Context::default();
+    ctx.input_mut(|input| input.max_texture_side = 4096);
     let pixels = Arc::new(egui::ColorImage::filled([1600, 2400], egui::Color32::WHITE));
-    let processed_texture = ctx.load_texture(
-        "processed-original-round-trip",
-        pixels.clone(),
-        egui::TextureOptions::LINEAR,
-    );
+    let processed_textures = [0, 1].map(|idx| {
+        ctx.load_texture(
+            format!("processed-original-round-trip-{idx}"),
+            pixels.clone(),
+            egui::TextureOptions::LINEAR,
+        )
+    });
     for mode in [SpreadMode::Single, SpreadMode::Ltr] {
         let mut app = app(&ctx, mode);
         app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
@@ -354,7 +357,7 @@ fn original_preview_round_trip_keeps_processed_pan_for_single_and_spread() {
                     Some(crate::page_dims::CanonicalPageDimensions::new(80, 120)),
                     [80, 120],
                     pixels.clone(),
-                    processed_texture.clone(),
+                    processed_textures[idx].clone(),
                     egui::TextureOptions::LINEAR,
                     true,
                 ),
@@ -362,7 +365,7 @@ fn original_preview_round_trip_keeps_processed_pan_for_single_and_spread() {
         }
         let processed: FullscreenPaintPayload = FullscreenPaintResource::resampleable(
             0,
-            processed_texture.clone(),
+            processed_textures[0].clone(),
             crate::gpu_lanczos::FullscreenPaintSourceGeneration {
                 items: app.items_generation,
                 input: app.input_seq,
@@ -698,4 +701,75 @@ fn draw_pan_correction_only_changes_the_mounted_context() {
     app.with_window_context_for_test(child, |owner| {
         assert!(owner.fs_pan.x < 1000.0);
     });
+}
+
+#[test]
+fn center_native_fallback_keeps_the_original_slot_gap_offset_and_pan() {
+    let ctx = egui::Context::default();
+    let mut app = app(&ctx, SpreadMode::Ltr);
+    app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
+    let source = match resource(&app, 0, FullscreenPageMaterialKind::Complete) {
+        FullscreenPaintPayload::NormalResource(source) => source,
+        _ => unreachable!(),
+    };
+    let native = crate::gpu_lanczos::test_native_resource(source, [20, 30]);
+    let native = FullscreenPaintPayload::PresentationMaterial(native.capture_presentation(&ctx));
+    let thumbnail = ctx.load_texture(
+        "center-fallback-thumbnail",
+        egui::ColorImage::filled([8, 12], egui::Color32::WHITE),
+        egui::TextureOptions::LINEAR,
+    );
+    app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
+    app.thumbnails[0] = ThumbnailState::loaded_raster(
+        thumbnail,
+        crate::thumb_loader::ThumbLoadOrigin::SourceGenerated {
+            evaluated_display_px: 12,
+        },
+        false,
+        12,
+        crate::source_coverage::SourceCoverage::FullSource,
+        Some((80, 120)),
+        None,
+    );
+    for pan in [egui::Vec2::ZERO, egui::vec2(2300.0, -1800.0)] {
+        app.fs_pan = pan;
+        // These are the original complete candidate's slot and joint-gap
+        // offset. The thumbnail's own 8x12 layout must not replace this slot.
+        let slot =
+            egui::Rect::from_min_size(egui::pos2(214.0, 140.0) + pan, egui::vec2(80.0, 120.0));
+        let offset = egui::vec2(-3.0, 0.0);
+        frame(&ctx, viewport(), 1.0, |ui| {
+            let page = app
+                .prepare_fs_spread_page(
+                    ui.painter(),
+                    viewport(),
+                    slot,
+                    0,
+                    Some(egui::vec2(80.0, 120.0)),
+                    FsPageLayoutSource::CurrentItem,
+                    Rotation::None,
+                    &FsBgStyle::Solid(egui::Color32::BLACK),
+                    "",
+                    Some(&native),
+                    true,
+                    None,
+                    1.0,
+                    ResolvedDisplayPlacement::Normal {
+                        zoom_pan: Some((1.0, pan)),
+                    },
+                    offset,
+                    false,
+                )
+                .unwrap();
+            assert_eq!(
+                page.resource.page_material_kind(),
+                FullscreenPageMaterialKind::Provisional
+            );
+            assert_eq!(page.transform.texture_size, egui::vec2(8.0, 12.0));
+            assert_eq!(page.transform.paint_rect, slot.translate(offset));
+            assert_eq!(normal_zoom_pan(page.transform).unwrap().1, pan);
+            assert_eq!(app.fs_pan, pan);
+            assert!(app.fs_initial_placement_request.is_none());
+        });
+    }
 }

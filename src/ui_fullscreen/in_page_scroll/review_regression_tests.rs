@@ -499,7 +499,7 @@ fn stale_generation_and_page_skip_geometry_without_loading_metadata() {
 }
 
 #[test]
-fn rotation_popup_keeps_fixed_arrows_at_the_existing_replacement_point() {
+fn rotation_popup_leaves_fixed_arrows_unconsumed_before_the_replacement_point() {
     use crate::settings::FullscreenUpDownKeyAction;
     #[cfg(windows)]
     let _serial = crate::key_input::lock_test_input();
@@ -512,13 +512,13 @@ fn rotation_popup_keeps_fixed_arrows_at_the_existing_replacement_point() {
         app.settings.fullscreen_up_down_key_action = policy;
         seed(&ctx, &mut app);
         egui::Popup::open_id(&ctx, egui::Id::unique("fs_rotation_btn").with("popup"));
+        let pan = app.fs_pan;
         frame(&ctx, tap(egui::Key::ArrowDown), |_, ctx| {
             assert!(fs_rotation_popup_open(ctx));
             let action = guarded_keys(&mut app, ctx);
-            let replaced = policy == FullscreenUpDownKeyAction::InPageScroll;
-            assert_eq!(action.page_nav.is_none(), replaced);
-            assert_eq!(app.fs_pan.y < 0.0, replaced);
-            assert!(!ctx.input(|input| input.events.iter().any(|event| matches!(
+            assert!(action.page_nav.is_none());
+            assert_eq!(app.fs_pan, pan);
+            assert!(ctx.input(|input| input.events.iter().any(|event| matches!(
                 event,
                 egui::Event::Key {
                     key: egui::Key::ArrowDown,

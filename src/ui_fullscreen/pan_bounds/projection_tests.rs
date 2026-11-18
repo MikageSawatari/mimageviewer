@@ -25,7 +25,7 @@ fn layout(
     } else {
         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
     }; 2];
-    let geometry = spread_layout_geometry(
+    let mut geometry = spread_layout_geometry(
         rotated_display_size(sizes[0], rotations[0]),
         rotated_display_size(sizes[1], rotations[1]),
         bounds[0],
@@ -33,9 +33,38 @@ fn layout(
         fit != FullscreenFitMode::Original,
     );
     let gap = quantize_points_to_physical_pixels(gap, dpi);
+    let specified = crate::settings::FullscreenSpecifiedScale {
+        width: crate::settings::SpecifiedScaleAxisSetting::disabled(
+            crate::settings::SpecifiedScaleAxis::PercentTenths(800),
+        ),
+        height: crate::settings::SpecifiedScaleAxisSetting::enabled(
+            crate::settings::SpecifiedScaleAxis::LogicalPixels(800),
+        ),
+    };
     let fit_scale = match fit {
         FullscreenFitMode::Height => viewport.height() / geometry.fit_size.y,
         FullscreenFitMode::Original => physical_pixel_scale(dpi),
+        FullscreenFitMode::SpecifiedScale => {
+            let (specified_geometry, auto) = canonical_demand::spread_auto_layout(
+                [
+                    rotated_display_size(sizes[0], rotations[0]),
+                    rotated_display_size(sizes[1], rotations[1]),
+                ],
+                bounds.map(|bbox| trim.then_some(bbox)),
+                fit,
+                specified,
+                10000,
+                viewport,
+                gap,
+                FullscreenFitScaleLimits {
+                    pixels_per_point: dpi,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            geometry = specified_geometry;
+            auto.scale
+        }
         _ => (viewport.width() - gap) / geometry.fit_size.x,
     };
     let scale = fit_scale * zoom;
@@ -60,7 +89,13 @@ fn layout(
                 rotation: rotations[n],
                 free_rotation_rad: 0.0,
                 content_bbox: trim.then_some(bounds[n]),
-                fit_mode: FullscreenFitInput::Legacy(fit),
+                fit_mode: FullscreenFitInput::from_mode(
+                    fit,
+                    specified,
+                    crate::fullscreen_specified_scale::FullscreenFitBasis::new(sizes[n], sizes[n])
+                        .unwrap(),
+                    10000,
+                ),
                 fit_scale_limits: Default::default(),
                 pixels_per_point: dpi,
                 placement: ResolvedDisplayPlacement::Normal {
@@ -151,7 +186,11 @@ fn spread_gap_projection_matches_final_transforms_and_edge_stop_with_zero_gap_er
             ] {
                 for trim in [false, true] {
                     for rotated in [false, true] {
-                        for fit in [FullscreenFitMode::Height, FullscreenFitMode::Original] {
+                        for fit in [
+                            FullscreenFitMode::Height,
+                            FullscreenFitMode::Original,
+                            FullscreenFitMode::SpecifiedScale,
+                        ] {
                             let pan = egui::vec2(0.6, 0.35);
                             let mut errors = [0.0; 2];
                             let mut stops = [0.0; 2];

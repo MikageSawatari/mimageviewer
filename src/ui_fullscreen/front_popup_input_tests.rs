@@ -17,7 +17,7 @@ fn unfocused_rotation_menu_rejects_default_and_remapped_navigation_before_consum
                 crate::settings::FullscreenUpDownKeyAction::InPageScroll;
         }
         app.keymap = crate::keymap::Keymap::from_ini_str(
-            "[FsImage]\nFsPageNext = F24\nFsFixedJumpNext = F23\n",
+            "[FsImage]\nFsPageNext = F24\nFsFixedJumpNext = F23\nFsFixedJumpPrev = F22\n",
         );
         settle(&mut app, &ctx, rect);
         open_menu(&mut app, &ctx, rect, "fs_rotation_btn");
@@ -36,6 +36,7 @@ fn unfocused_rotation_menu_rejects_default_and_remapped_navigation_before_consum
             (egui::Key::PageDown, false),
             (egui::Key::F24, false),
             (egui::Key::F23, false),
+            (egui::Key::F22, false),
             (egui::Key::Home, false),
             (egui::Key::End, false),
         ] {
@@ -63,6 +64,9 @@ fn unfocused_rotation_menu_rejects_default_and_remapped_navigation_before_consum
                 },
                 |ui| {
                     let ctx = ui.ctx();
+                    // This consumer-only pass does not draw the popup Area, so
+                    // re-present the mouse-opened menu for each independent key.
+                    egui::Popup::open_id(ctx, egui::Id::unique("fs_rotation_btn").with("popup"));
                     assert!(fs_rotation_popup_open(ctx));
                     let result = app.handle_fs_key_input(ctx, 1, false);
                     assert!(result.page_nav.is_none());
@@ -109,6 +113,8 @@ fn rotation_menu_preserves_rotation_shortcuts_and_source_seek_keeps_early_return
                 ..Default::default()
             },
             |ui| {
+                egui::Popup::open_id(ui.ctx(), egui::Id::unique("fs_rotation_btn").with("popup"));
+                assert!(fs_rotation_popup_open(ui.ctx()));
                 ctx.memory_mut(|m| {
                     if let Some(id) = m.focused() {
                         m.surrender_focus(id);
