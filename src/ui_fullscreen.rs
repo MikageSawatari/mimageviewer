@@ -4950,7 +4950,7 @@ fn slideshow_progress_ring_center(
     content_rect: egui::Rect,
     avoid: Option<egui::Rect>,
 ) -> egui::Pos2 {
-    let mut center = egui::pos2(content_rect.right() - 22.0, content_rect.top() + 22.0);
+    let center = egui::pos2(content_rect.right() - 22.0, content_rect.top() + 22.0);
     let bounds = egui::Rect::from_center_size(
         center,
         egui::Vec2::splat(2.0 * (SLIDESHOW_PROGRESS_RING_RADIUS + SLIDESHOW_PROGRESS_RING_MARGIN)),
@@ -4958,7 +4958,20 @@ fn slideshow_progress_ring_center(
     if let Some(avoid) = avoid
         && bounds.intersects(avoid)
     {
-        center.x = avoid.left() - SLIDESHOW_PROGRESS_RING_MARGIN - SLIDESHOW_PROGRESS_RING_RADIUS;
+        let left = egui::pos2(
+            avoid.left() - SLIDESHOW_PROGRESS_RING_MARGIN - SLIDESHOW_PROGRESS_RING_RADIUS,
+            center.y,
+        );
+        if content_rect.contains_rect(bounds.translate(left - center)) {
+            return left;
+        }
+        let below = egui::pos2(
+            center.x,
+            avoid.bottom() + SLIDESHOW_PROGRESS_RING_MARGIN + SLIDESHOW_PROGRESS_RING_RADIUS,
+        );
+        if content_rect.contains_rect(bounds.translate(below - center)) {
+            return below;
+        }
     }
     center
 }
