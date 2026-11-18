@@ -8388,8 +8388,7 @@ impl App {
                     ctx.request_repaint();
                     return None;
                 }
-                RingActionId::ImageSlideshow
-                | RingActionId::ImageZoomMode
+                RingActionId::ImageZoomMode
                 | RingActionId::ImagePixelGrid
                 | RingActionId::ImageComparePin => return None,
                 _ => {}

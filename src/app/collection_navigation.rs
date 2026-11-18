@@ -95,6 +95,17 @@ enum CollectionNavigationAction {
 }
 
 impl CollectionNavigationAction {
+    fn resume_slideshow(&self) -> bool {
+        matches!(
+            self,
+            Self::Slideshow { .. }
+                | Self::OuterFullscreen {
+                    resume_slideshow: true,
+                    ..
+                }
+        )
+    }
+
     fn startup_list_intent(&self) -> super::StartupListIntent {
         match self {
             Self::OuterGrid { .. } => super::StartupListIntent::ExplicitList,
@@ -280,6 +291,7 @@ impl PreparedCollectionPhysicalNavigation {
             self.request.action,
             CollectionNavigationAction::OuterGrid { .. }
         ) {
+            app.notify_depth_slideshow_folder_nav_exit(self.resume_slideshow());
             app.close_fullscreen_for_folder_nav_reopen();
         }
         app.install_collection_navigation_root_with_origin(
@@ -288,6 +300,7 @@ impl PreparedCollectionPhysicalNavigation {
             &self.target,
             false,
             return_to,
+            |_, _| {},
         )
         .expect("prepared immutable physical target cannot reject at install");
         app.commit_collection_grid_source_open(
@@ -353,14 +366,7 @@ impl PreparedCollectionPhysicalNavigation {
     }
 
     fn resume_slideshow(&self) -> bool {
-        matches!(
-            self.request.action,
-            CollectionNavigationAction::Slideshow { .. }
-                | CollectionNavigationAction::OuterFullscreen {
-                    resume_slideshow: true,
-                    ..
-                }
-        )
+        self.request.action.resume_slideshow()
     }
 
     fn continuation(&self) -> Option<super::CollectionArchiveNavigationContinuation> {
@@ -3612,6 +3618,7 @@ impl App {
         prepared: Arc<CollectionPreparedSnapshot>,
         target: &CollectionPreparedNavigationTarget,
         preserve_active_media: bool,
+        before_install: impl FnOnce(&mut Self, &CollectionNavigationRequest),
     ) -> Option<CollectionNavigationRootLanding> {
         let return_to = request
             .navigation
@@ -3623,6 +3630,7 @@ impl App {
             target,
             preserve_active_media,
             return_to,
+            before_install,
         )
     }
 
@@ -3633,9 +3641,25 @@ impl App {
         target: &CollectionPreparedNavigationTarget,
         preserve_active_media: bool,
         return_to: Option<super::top_level_grid_view::TopLevelGridOrigin>,
+        before_install: impl FnOnce(&mut Self, &CollectionNavigationRequest),
     ) -> Option<CollectionNavigationRootLanding> {
-        let page_identity_index =
-            Arc::clone(&request.root_thumbnail_sources.as_ref()?.page_identity_index);
+        let owner = request.root_thumbnail_sources.as_ref()?;
+        let page_identity_index = Arc::clone(&owner.page_identity_index);
+        let prepared_thumbnail_source_identity = owner.identity();
+        let target_idx = prepared
+            .entries
+            .iter()
+            .position(|entry| entry.entry_id == target.entry_id)
+            .or_else(|| {
+                prepared
+                    .entries
+                    .iter()
+                    .position(|entry| entry.source_key == target.source_key)
+            })?;
+        // Keep root preparation refusals above this acceptance boundary. The
+        // caller can now retire its viewer immediately before root mutation.
+        // Neither this hook nor the immutable prepared root can change request.
+        before_install(self, request);
         let same_collection = self
             .top_level_grid_view
             .collection_session()
@@ -3648,11 +3672,6 @@ impl App {
                 return_to,
             );
         }
-        let prepared_thumbnail_source_identity = request
-            .root_thumbnail_sources
-            .as_deref()
-            .map(|owner| owner.identity())
-            .unwrap_or_default();
         // A linked detached viewer and the visible main Grid may intentionally share the same
         // mounted collection context. Moving between entries in an unchanged immutable root must
         // therefore move only the viewer cursor. Reinstalling the identical root bumps the Grid
@@ -3707,18 +3726,7 @@ impl App {
                             .position(|entry| entry.source_key == anchor.primary.source_key)
                     })
             });
-            let target_idx = installed
-                .prepared
-                .entries
-                .iter()
-                .position(|entry| entry.entry_id == target.entry_id)
-                .or_else(|| {
-                    installed
-                        .prepared
-                        .entries
-                        .iter()
-                        .position(|entry| entry.source_key == target.source_key)
-                })?;
+            // Identical immutable presentations preserve the prepared target index.
             if let Some(session) = self.top_level_grid_view.collection_session_mut() {
                 session.wanted_revision = session.wanted_revision.max(prepared.collection_revision);
             }
@@ -3756,16 +3764,6 @@ impl App {
                         .position(|entry| entry.source_key == anchor.primary.source_key)
                 })
         });
-        let target_idx = prepared
-            .entries
-            .iter()
-            .position(|entry| entry.entry_id == target.entry_id)
-            .or_else(|| {
-                prepared
-                    .entries
-                    .iter()
-                    .position(|entry| entry.source_key == target.source_key)
-            })?;
         let old_fs_idx = self.fullscreen_idx;
         let preserved_player = if preserve_active_media {
             old_fs_idx.and_then(|index| self.fs_cache.remove(&index))
@@ -3780,7 +3778,10 @@ impl App {
             (request.action.is_media_eof() && preserved_player.is_some())
                 .then_some(prepared.entries.len())
         });
-        let owner = request.root_thumbnail_sources.take()?;
+        let owner = request
+            .root_thumbnail_sources
+            .take()
+            .expect("root owner validated before acceptance");
         let (thumbnail_sources, reuse_key, page_edits, retained_page_edits) = (
             owner.take_delivery(),
             owner.reuse_key.clone(),
@@ -4009,10 +4010,16 @@ impl App {
         let boundary_plan = self.physical_main_list_boundary_plan(&prepared.token);
         self.adopt_main_list_navigation(prepared.adoption, boundary_plan, |app, boundary| {
             if !matches!(request.action, CollectionNavigationAction::OuterGrid { .. }) {
+                app.notify_depth_slideshow_folder_nav_exit(request.action.resume_slideshow());
                 app.close_fullscreen_for_folder_nav_reopen();
             }
             app.install_collection_navigation_root_with_origin(
-                request, root, target, false, return_to,
+                request,
+                root,
+                target,
+                false,
+                return_to,
+                |_, _| {},
             )
             .expect("prepared immutable outer target cannot reject at install");
             app.commit_collection_grid_source_open(
@@ -4362,12 +4369,6 @@ impl App {
             return;
         }
 
-        if is_outer_target
-            && request.navigation.is_none()
-            && !matches!(action, CollectionNavigationAction::OuterGrid { .. })
-        {
-            self.close_fullscreen_for_folder_nav_reopen();
-        }
         if self.settings.epub_file_handling_ignores_epub()
             && matches!(ready.target.resolved_kind, CollectionResolvedKind::Pdf)
             && ready
@@ -4427,6 +4428,15 @@ impl App {
                 Arc::clone(&prepared),
                 &ready.target,
                 !is_outer_target,
+                |app, request| {
+                    if is_outer_target
+                        && request.navigation.is_none()
+                        && !matches!(action, CollectionNavigationAction::OuterGrid { .. })
+                    {
+                        app.notify_depth_slideshow_folder_nav_exit(action.resume_slideshow());
+                        app.close_fullscreen_for_folder_nav_reopen();
+                    }
+                },
             ) else {
                 self.finish_collection_navigation_without_target(ctx, &action);
                 return;
@@ -5011,6 +5021,9 @@ impl CollectionResolvedKindExt for CollectionResolvedKind {
 mod sibling_navigation_tests;
 
 #[cfg(test)]
+mod depth_slideshow_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::app::{AppTestEnvForTest, setup_app_for_test};
@@ -5279,7 +5292,7 @@ mod tests {
         }
     }
 
-    fn write_single_page_zip(path: &std::path::Path, page: &str) {
+    pub(super) fn write_single_page_zip(path: &std::path::Path, page: &str) {
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
         zip.start_file(page, zip::write::SimpleFileOptions::default())
@@ -6246,7 +6259,7 @@ mod tests {
             .expect("collection actor operation")
     }
 
-    fn navigation_test_lease() -> crate::collection_store::CollectionReadLease {
+    pub(super) fn navigation_test_lease() -> crate::collection_store::CollectionReadLease {
         crate::collection_store::CollectionReadLease::new(
             crate::collection_store::CollectionReadScope::app_global("navigation-test"),
             Instant::now(),
@@ -6293,7 +6306,7 @@ mod tests {
         )
     }
 
-    fn prepared_thumbnail_sources(
+    pub(super) fn prepared_thumbnail_sources(
         sources: CollectionGridThumbnailSources,
     ) -> CollectionGridPreparedThumbnailDelivery {
         super::super::collection_grid::prepare_collection_grid_thumbnail_sources(
@@ -6303,7 +6316,7 @@ mod tests {
         .unwrap()
     }
 
-    fn navigation_sources(
+    pub(super) fn navigation_sources(
         app: &App,
         prepared: &CollectionPreparedSnapshot,
         sources: CollectionGridPreparedThumbnailDelivery,
@@ -7053,6 +7066,7 @@ mod tests {
                 Arc::clone(&installed.prepared),
                 &target,
                 false,
+                |_, _| {}
             )
             .is_some()
         );
@@ -7217,8 +7231,16 @@ mod tests {
         let index = Arc::clone(&app.page_identity_index);
         let target = prepared_target(&prepared.entries[0], CollectionResolvedKind::Image);
         assert!(
-            app.install_collection_navigation_root(&mut request, prepared, &target, false)
-                .is_none()
+            app.install_collection_navigation_root(
+                &mut request,
+                prepared,
+                &target,
+                false,
+                |_, _| {
+                    panic!("a rejected root must not retire its caller's viewer");
+                }
+            )
+            .is_none()
         );
         assert!(matches!(
             app.top_level_grid_view.surface(),
@@ -7789,8 +7811,14 @@ mod tests {
         ));
 
         assert!(
-            app.install_collection_navigation_root(&mut request, prepared, &target, false)
-                .is_some()
+            app.install_collection_navigation_root(
+                &mut request,
+                prepared,
+                &target,
+                false,
+                |_, _| {}
+            )
+            .is_some()
         );
         assert_eq!(
             app.video_thumb_overrides.get("full-video-key"),
@@ -7863,7 +7891,13 @@ mod tests {
         let target = prepared_target(&prepared.entries[1], CollectionResolvedKind::Audio);
 
         let landing = app
-            .install_collection_navigation_root(&mut request, Arc::clone(&prepared), &target, false)
+            .install_collection_navigation_root(
+                &mut request,
+                Arc::clone(&prepared),
+                &target,
+                false,
+                |_, _| {},
+            )
             .expect("unchanged root landing");
 
         assert_eq!(landing.target_idx, 1);
@@ -8109,6 +8143,7 @@ mod tests {
                 Arc::clone(&prepared),
                 &target,
                 false,
+                |_, _| {}
             )
             .is_some()
         );
@@ -8145,6 +8180,7 @@ mod tests {
                 Arc::clone(&prepared),
                 &target,
                 false,
+                |_, _| {}
             )
             .is_some()
         );
@@ -8168,8 +8204,14 @@ mod tests {
         request.root_thumbnail_sources =
             Some(navigation_sources(&app, &prepared, prepared_pin_changed));
         assert!(
-            app.install_collection_navigation_root(&mut request, prepared, &target, false)
-                .is_some()
+            app.install_collection_navigation_root(
+                &mut request,
+                prepared,
+                &target,
+                false,
+                |_, _| {}
+            )
+            .is_some()
         );
         assert!(app.items_generation > sidecar_generation);
         assert_ne!(pin_changed_identity, sidecar_changed_identity);
@@ -8252,7 +8294,13 @@ mod tests {
             .expect("mounted detached navigation origin");
         let target = prepared_target(&prepared.entries[1], CollectionResolvedKind::Audio);
         let landing = app
-            .install_collection_navigation_root(&mut request, Arc::clone(&prepared), &target, false)
+            .install_collection_navigation_root(
+                &mut request,
+                Arc::clone(&prepared),
+                &target,
+                false,
+                |_, _| {},
+            )
             .expect("detached navigation landing");
         app.fullscreen_idx = Some(landing.target_idx);
         let detached_generation = app.items_generation;
@@ -8351,8 +8399,14 @@ mod tests {
         let target = prepared_target(&changed.entries[0], CollectionResolvedKind::Image);
 
         assert!(
-            app.install_collection_navigation_root(&mut request, changed, &target, false)
-                .is_some()
+            app.install_collection_navigation_root(
+                &mut request,
+                changed,
+                &target,
+                false,
+                |_, _| {}
+            )
+            .is_some()
         );
         assert!(app.items_generation > generation);
         assert!(!Arc::ptr_eq(&app.cancel_token, &old_cancel));

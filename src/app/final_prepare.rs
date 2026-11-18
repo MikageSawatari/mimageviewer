@@ -444,7 +444,7 @@ impl App {
         let Some(unit) = demand else {
             return;
         };
-        if !self.page_turn_current_unit_presented() {
+        if !self.next_unit_current_presented() {
             return;
         }
         let mut reclaim_attempted = false;
@@ -492,11 +492,9 @@ impl App {
         current_idx: usize,
         position: FinalUnitPosition,
     ) -> Option<FinalPrepareUnit> {
-        if !self.settings.page_turn_animation_enabled
-            || !self.reading_flow.is_paged()
-            || self.spread_mode.is_split()
+        if !self.next_unit_final_prepare_enabled()
             || self.post_filter_bypassed
-            || self.remote_session_blocks_local_control()
+            || (position != FinalUnitPosition::Next && !self.settings.page_turn_animation_enabled)
         {
             return None;
         }
@@ -513,10 +511,7 @@ impl App {
     }
 
     pub(super) fn speculative_final_unit_is_needed(&self, unit: &FinalPrepareUnit) -> bool {
-        if !self.settings.page_turn_animation_enabled
-            || !self.reading_flow.is_paged()
-            || self.spread_mode.is_split()
-        {
+        if !self.next_unit_final_prepare_enabled() {
             return false;
         }
         let Some(idx) = self.fullscreen_idx else {

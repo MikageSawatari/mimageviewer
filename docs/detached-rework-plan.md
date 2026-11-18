@@ -1489,6 +1489,22 @@ detachedのコード・述語・viewport経路は変更しない。新しい待�
 - 別窓 Collection 本の移動で main と別の別窓の items / generation / pending / lock が変わらない
   handler 回帰を追加する。実アプリの起動・実機確認は本実装作業では行わない。
 
+### 2026-11-18: 3D 写真のままスライドショー（§1.771、設計段階の合意）
+
+3D 中のスライドショーの自動送りを、所有 viewer の描画の後の呼び出しだけで評価する。スライドショーのタイマーを直接呼ぶ 2 か所
+(`render_fullscreen_viewport_with_root_input` の描画後と、汎用の入力処理の wrapper `handle_fs_navigation_with_list_order_operation`) に
+`SlideshowTimerPass { ViewerRender { viewport, visible } | InputOnly }` を足し、描画 closure の中で取った所有 viewport の id と可視性を運ぶ。
+root の `ctx` から可視性を読み直さない。3D でないときは両方で今までどおり評価する。detached の述語・registry・所有者の判定は変えない。
+独立設計レビュー (gpt-6.1-sol / xhigh、第 4 回、基点 `8954ef4a4`) と設計担当 ClaudeCode は、入力の処理と描画後の自動処理を区別し
+所有描画の時点の事実を渡す構造的修正であり、症状パッチではないことに合意した。実装レビューで同じ主張への合意を取り直し、ここに追記する。
+正本は [3D スライドショー設計 §5.7.1](depth-slideshow-plan.md)。
+
+2026-11-18 の実装差分の独立レビュー（Sol / xhigh、§1.771 の実装担当とは別の会話、第 1 回）でも、入力配送と所有描画後の自動処理を
+明示的に分け、可視性を描画 closure の中で捉え、所有者判定を変えず遅延・再試行で症状を隠していない構造的修正であることに合意した
+（判定は第 3 回で ACCEPT）。この合意は viewport 経路の変更範囲についてのもので、実機確認を意味しない。
+実装後の焦点試験はmainの通常全画面childとdetached childで、rootとは異なるminimized値を与え、
+非表示 / 最小化時の休止・復帰後の起算・InputOnlyでの自動送り抑止を検査する。結果は正本§12へ記録する。
+
 ### 2026-11-17: §1.800 S1 の仮想フォルダと親との対応
 
 設計担当の §4S（独立設計レビュー r10 ACCEPT）と実装の独立レビューで、UI の一回限りの

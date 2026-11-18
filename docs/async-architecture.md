@@ -136,6 +136,12 @@ source 切替・OFF・presentation変更・Dropは receiver/cancel と自分の 
 色・深度・readback buffer は既存 VRAM 会計へ渡す。推論は共有 AI runtime の直列契約を維持する。
 状態・入口・実装レビューと検証結果の正本は [3D 設計 §10](depth-parallax-plan.md#10-実装の段階-codex-への委任単位)。
 
+3Dスライドショーの `DepthNextSlot` も同じcontextの `DepthViewState` が1件だけ所有する。
+現ページの処理と素材照合を済ませてから次の要求を出し、現ページの新しい要求を優先する。
+完了結果は既存LRUへ入れ、同じ送り先・素材key・未取消の要求だけを着地へ引き継ぐ。
+停止・3D終了では枠のDropで取り消し、兄弟contextは変更しない。進行中の既存producerだけを
+待つread-only分類と共通登録予算、所有描画後だけのタイマー評価は [§1.771](depth-slideshow-plan.md) に従う。
+
 ## AI 説明文の削除（§1.730）
 
 App の `caption_delete` が Counting / Confirm / Deleting を単独所有し、全 phase を同じ可視 modal にする。

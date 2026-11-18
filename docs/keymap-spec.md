@@ -24,6 +24,9 @@ MainWindow / Fullscreen / DetachedWindow（枠なし全画面を含む）の単�
 その context の状態は変更しない。動画・アニメーション・見開き・連結読み・
 編集・紙めくり中では受け付けない。360度表示からは3Dへ切り替える。
 3D中の360度切替は受け付けない。
+3D中も既存のSキー (`FsSlideshow`)・上部の再生 / 停止ボタン・リングの `ImageSlideshow` を受け付ける。
+上部の「…」は引き続き出さない。360度中のSキーと上部再生ボタンの抑止、リングの従来動作は維持する。
+新しいKeyActionや割当は追加しない。先読みと起算の条件は [§1.771](depth-slideshow-plan.md) を参照。
 F12 の ON / OFF による表示先切替と、main の F11 による MainWindow / Fullscreen 切替では
 3Dを終了し、`FsDepthParallax` の実効キー（既定D）での再開を通知する。
 別ウィンドウの窓内で F11 により通常表示 / 枠なし全画面を切り替えた場合は3Dを継続する。

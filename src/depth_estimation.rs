@@ -113,6 +113,10 @@ impl DepthPending {
         self.cancel.store(true, Ordering::Release);
     }
 
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Acquire)
+    }
+
     /// Nonblocking adoption. A completed reply can still be cancelled before
     /// adoption; check the same token on both sides of that publication boundary.
     pub(crate) fn try_result(

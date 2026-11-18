@@ -1004,7 +1004,15 @@ fn page_turn_merge_master_slideshow_barrier_commits_grid_and_deadline_once() {
             app.begin_page_turn_viewer_frame(ctx, false, None);
             let state = app.prepare_fullscreen_state(ctx, 2, FsPageTurnDecision::normal());
             draw_current(&mut app, ui, ctx);
-            app.sync_slideshow_anchor_for_frame(ctx, 2, &state);
+            app.sync_slideshow_anchor_for_frame(
+                ctx,
+                2,
+                &state,
+                SlideshowTimerPass::ViewerRender {
+                    viewport: ctx.viewport_id(),
+                    visible: true,
+                },
+            );
         });
         assert_eq!(app.slideshow_next_at, deadline);
         assert!(

@@ -130,6 +130,28 @@ pub(super) fn speculative_vram_admitted(
     })
 }
 
+/// Apply the real registration budget to every remaining allocation. Private
+/// handles already registered are in resident_bytes; aliases add no allocation.
+pub(super) fn speculative_vram_allocations_admitted(
+    mut resident_bytes: u64,
+    allocations: impl IntoIterator<Item = ([usize; 2], egui::TextureOptions)>,
+    budget: Option<u64>,
+) -> bool {
+    for (size, options) in allocations {
+        if !speculative_vram_admitted(resident_bytes, size, options, budget) {
+            return false;
+        }
+        let increment = crate::vram_budget::rgba8_texels_to_bytes(
+            crate::vram_budget::texture_size_texels(size, options.mipmap_mode.is_some()),
+        );
+        let Some(total) = resident_bytes.checked_add(increment) else {
+            return false;
+        };
+        resident_bytes = total;
+    }
+    true
+}
+
 impl App {
     pub(super) fn record_final_cpu_admission_denied(
         &mut self,

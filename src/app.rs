@@ -775,7 +775,8 @@ pub(crate) use prepared_edit::{
 };
 mod depth_dialog;
 mod depth_export;
-mod depth_view;
+mod depth_progress;
+pub(crate) mod depth_view;
 pub(crate) use depth_dialog::DepthDialogSurface;
 pub(crate) use depth_view::DepthEntryRequest;
 #[cfg(all(test, windows))]
@@ -37879,6 +37880,9 @@ impl App {
         let boundary_plan = self.physical_main_list_boundary_plan(&token);
         self.adopt_main_list_navigation(adoption, boundary_plan, |app, boundary| {
             if close_fullscreen {
+                let resume_slideshow = matches!(&after_hydration,
+                    Some(MainListAfterHydration::Dfs { continuation, .. }) if continuation.resume_slideshow);
+                app.notify_depth_slideshow_folder_nav_exit(resume_slideshow);
                 app.close_fullscreen_for_folder_nav_reopen();
             }
             if let Some((password, save)) = pdf_password_submission {
@@ -61848,6 +61852,21 @@ impl App {
         )
     }
 
+    /// Call only at an accepted folder navigation's actual close boundary.
+    /// Closing retires Depth, so a later staged reopen cannot notify twice.
+    fn notify_depth_slideshow_folder_nav_exit(&mut self, resume_slideshow: bool) {
+        if !resume_slideshow || !self.fs_exclusive_view.is_depth() {
+            return;
+        }
+        let message = match self.keymap.first_chord_label(KeyAction::FsDepthParallax) {
+            Some(key) => format!(
+                "3D 写真を終了しました: 次のフォルダへ進みました。{key} キーでもう一度使えます"
+            ),
+            None => "3D 写真を終了しました: 次のフォルダへ進みました。上部の 3D ボタンでもう一度使えます".into(),
+        };
+        self.show_feedback_toast(message);
+    }
+
     pub(crate) fn reopen_fullscreen_after_folder_nav_load_with_adoption(
         &mut self,
         ctx: &egui::Context,
@@ -62424,6 +62443,7 @@ impl App {
                 // 新フォルダを読み直す (PDF Critical 予約は open_fullscreen で再取得)。
                 // 注: close_fullscreen は slideshow_playing=false にするが、SlideshowNext は
                 // resume_slideshow フラグ (= reopen 側で再開) で復帰するので問題ない。
+                self.notify_depth_slideshow_folder_nav_exit(resume_slideshow);
                 self.close_fullscreen_for_folder_nav_reopen();
                 let open_outcome = self.load_folder_nav_target_with_search_origin(
                     route,
@@ -89586,7 +89606,7 @@ impl App {
     /// independently budgeted retained CPU entry was evicted. Raw/edit producers
     /// continue to use `fs_page_load_state` and `ensure_fs_page_load` directly.
     pub(crate) fn fs_display_page_load_state(&self, idx: usize) -> FsPageLoadState {
-        if self.page_turn_prefetch_policy_enabled()
+        if self.next_unit_final_prepare_enabled()
             && self.exact_complete_final_composite_texture(idx).is_some()
         {
             FsPageLoadState::DisplayReady(FsPageDisplaySource::ResidentFinalComposite)
@@ -96895,14 +96915,11 @@ impl App {
         // 衝突する機能を停止 (docs/panorama-360-view-plan.md フィードバック対応):
         // 360 中は上バーのみの機能制限モードになるので、他の panel / mode を OFF
         // しておく。これらは 360 OFF 後にユーザーが再度有効化できる。
+        self.stop_slideshow_playback();
         self.close_fs_exclusive_conflicts();
     }
 
     pub(crate) fn close_fs_exclusive_conflicts(&mut self) {
-        self.slideshow_playing = false;
-        self.slideshow_anchor_idx = None;
-        self.continuous_reading_scroll_transition = None;
-        self.slideshow_scroll_range_cache = None;
         self.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::Closed;
         self.cache_current_edit_preview_if_ready();
         self.local_adjust_mode = false;
@@ -108017,5 +108034,418 @@ mod agent_change_ui_tests {
         assert!(!controller.is_ready());
         app.poll_agent_changes();
         assert!(controller.is_ready());
+    }
+}
+
+#[cfg(test)]
+mod depth_slideshow_folder_tests {
+    use super::*;
+
+    fn exit_notice_count(app: &App) -> usize {
+        app.feedback_toasts_for_test
+            .iter()
+            .filter(|(message, _)| {
+                message.starts_with("3D 写真を終了しました: 次のフォルダへ進みました。")
+            })
+            .count()
+    }
+
+    fn write_zip(path: &Path) {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            3,
+            image::Rgba([20, 80, 140, 255]),
+        ))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        zip.start_file("page.png", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        std::io::Write::write_all(&mut zip, png.get_ref()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn install_source(app: &mut AppTestEnvForTest, depth: bool, automatic: bool) -> PathBuf {
+        let source = app.tmp.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        image::RgbaImage::from_pixel(2, 3, image::Rgba([20, 80, 140, 255]))
+            .save(source.join("page.png"))
+            .unwrap();
+        app.active_quick_folder_slot = None;
+        app.current_folder = Some(source.clone());
+        app.install_new_items(vec![GridItem::Image(source.join("page.png"))], vec![None]);
+        app.visible_indices = vec![0];
+        app.fullscreen_idx = Some(0);
+        app.settings.page_turn_animation_enabled = false;
+        app.settings.book_nav_resume = crate::settings::ResumeMode::FromStart;
+        app.settings.default_spread_mode = crate::settings::SpreadMode::Single;
+        app.settings.follow_document_reading_direction = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        app.settings.auto_fullscreen_image_folders = false;
+        app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsDepthParallax = F24\n");
+        if depth {
+            let owner = app.edit_request_owner_context();
+            app.set_fs_exclusive_view(
+                crate::fs_exclusive_view::FsExclusiveView::Depth(
+                    crate::depth_parallax::DepthViewState::new(owner),
+                ),
+                "depth_slideshow_staged_test",
+            );
+        }
+        // Automatic NextFolder pauses playback before its DFS result arrives.
+        // A manual move may instead begin while playback is still running.
+        app.slideshow_playing = !automatic;
+        app.feedback_toasts_for_test.clear();
+        source
+    }
+
+    fn folder_result(
+        path: &Path,
+        automatic: bool,
+        scanned: FolderNavScanResult,
+    ) -> FolderNavResult {
+        FolderNavResult {
+            target: Some(FolderNavTarget {
+                route: FolderNavRoute::FullFeature(path.to_path_buf()),
+                smart_kind: None,
+                scanned,
+            }),
+            hit_image_folder: true,
+            forward: true,
+            mode: if automatic {
+                FolderNavMode::SlideshowNext
+            } else {
+                FolderNavMode::Fullscreen
+            },
+            queued_steps: 0,
+        }
+    }
+
+    fn physical_request(app: &mut App) -> &mut PhysicalHistoryTransition {
+        let Some(HistoryNavigationTransition::Physical(request)) =
+            app.top_level_grid_view.history_navigation_transition_mut()
+        else {
+            panic!("folder traversal must own a staged physical request")
+        };
+        request
+    }
+
+    fn finish_staged_reopen(app: &mut App, ctx: &egui::Context, destination: &Path, playing: bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            app.settle_open_path_classification_for_test();
+            app.poll_history_navigation_transition_for_test(ctx);
+            app.poll_zip_enumerate();
+            app.poll_pdf_enumerate();
+            app.poll_sidecar_restore(ctx);
+            app.poll_book_composition_service_for_test(ctx);
+            app.poll_book_composition_read(ctx);
+            app.poll_book_presentation_permission(ctx);
+            if app.current_folder.as_deref() == Some(destination)
+                && app
+                    .top_level_grid_view
+                    .history_navigation_transition()
+                    .is_none()
+                && app.zip_enumerate_pending.is_none()
+                && app.pdf_enumerate_pending.is_none()
+                && app.fs_nav_after_pdf_enumerate.is_none()
+                && !app.sidecar_restore_active()
+                && app.fullscreen_idx.is_some()
+                && app.slideshow_playing == playing
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "staged folder traversal did not reopen: folder={:?}, fullscreen={:?}, slideshow={}",
+                app.current_folder,
+                app.fullscreen_idx,
+                app.slideshow_playing
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn depth_slideshow_staged_zip_pdf_adoption_notifies_once_and_resumes_two_dimensional_playback()
+    {
+        for extension in ["zip", "pdf"] {
+            for (depth, automatic) in [(true, true), (false, true), (true, false)] {
+                let ctx = egui::Context::default();
+                let mut app = setup_app_for_test();
+                let source = install_source(&mut app, depth, automatic);
+                let target = app.tmp.path().join(format!("target.{extension}"));
+                let _pdf_pool = if extension == "pdf" {
+                    std::fs::write(&target, b"%PDF-1.4\n").unwrap();
+                    Some(crate::pdf_loader::TestPdfEnumeratePool::new(&target))
+                } else {
+                    write_zip(&target);
+                    None
+                };
+                app.apply_folder_nav_result(
+                    &ctx,
+                    folder_result(&target, automatic, FolderNavScanResult::NotNeeded),
+                );
+                app.settle_open_path_classification_for_test();
+                assert_eq!(app.current_folder.as_ref(), Some(&source));
+                assert_eq!(app.fs_exclusive_view.is_depth(), depth);
+                assert_eq!(exit_notice_count(&app), 0, "preflight is not an exit");
+                let request = physical_request(&mut app);
+                let continuation = request.dfs_continuation.as_ref().unwrap();
+                assert!(continuation.fullscreen);
+                assert_eq!(continuation.resume_slideshow, automatic);
+                if let Some(pool) = &_pdf_pool {
+                    // Only the child process reply is substituted. Enqueue,
+                    // preflight, adoption and fullscreen continuation stay real.
+                    pool.take().complete(1);
+                }
+                finish_staged_reopen(&mut app, &ctx, &target, automatic);
+                assert!(!app.fs_exclusive_view.is_depth());
+                assert_eq!(app.fullscreen_idx, Some(0));
+                assert!(if extension == "pdf" {
+                    matches!(app.items.first(), Some(GridItem::PdfPage { .. }))
+                } else {
+                    matches!(app.items.first(), Some(GridItem::ZipImage { .. }))
+                });
+                let expected = usize::from(depth && automatic);
+                assert_eq!(
+                    exit_notice_count(&app),
+                    expected,
+                    "{extension}: depth={depth}, automatic={automatic}"
+                );
+                if expected == 1 {
+                    assert!(app.feedback_toasts_for_test.iter().any(|(message, _)| {
+                        message.contains("次のフォルダへ進みました。F24 キーでもう一度使えます")
+                    }));
+                }
+                app.poll_history_navigation_transition_for_test(&ctx);
+                app.poll_book_composition_service_for_test(&ctx);
+                assert_eq!(
+                    exit_notice_count(&app),
+                    expected,
+                    "completion cannot notify again"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn depth_slideshow_staged_zip_pdf_failure_keeps_depth_without_exit_notice() {
+        for extension in ["zip", "pdf"] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app_for_test();
+            let source = install_source(&mut app, true, true);
+            let target = app.tmp.path().join(format!("failed.{extension}"));
+            let _pdf_pool = if extension == "pdf" {
+                std::fs::write(&target, b"%PDF-1.4\n").unwrap();
+                Some(crate::pdf_loader::TestPdfEnumeratePool::new(&target))
+            } else {
+                std::fs::write(&target, b"invalid ZIP").unwrap();
+                None
+            };
+            app.apply_folder_nav_result(
+                &ctx,
+                folder_result(&target, true, FolderNavScanResult::NotNeeded),
+            );
+            app.settle_open_path_classification_for_test();
+            assert!(matches!(
+                physical_request(&mut app).phase,
+                PhysicalHistoryPhase::Preflighting { .. }
+            ));
+            assert_eq!(exit_notice_count(&app), 0);
+            if let Some(pool) = &_pdf_pool {
+                pool.take()
+                    .fail(crate::pdf_loader::PdfReadError::Other(Arc::new(
+                        std::io::Error::other("injected PDF worker failure"),
+                    )));
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+            {
+                app.poll_history_navigation_transition_for_test(&ctx);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "failed preflight did not terminate"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(
+                app.top_level_grid_view
+                    .history_navigation_transition()
+                    .is_none()
+            );
+            assert_eq!(app.current_folder.as_ref(), Some(&source));
+            assert_eq!(app.fullscreen_idx, Some(0));
+            assert!(app.fs_exclusive_view.is_depth());
+            assert!(
+                !app.slideshow_playing,
+                "failed navigation does not resume playback"
+            );
+            assert!(app.fs_nav_locked_gen.is_none());
+            assert_eq!(
+                exit_notice_count(&app),
+                0,
+                "{extension}: rejected preparation is not an exit"
+            );
+            app.poll_history_navigation_transition_for_test(&ctx);
+            assert_eq!(exit_notice_count(&app), 0);
+        }
+    }
+
+    #[test]
+    fn depth_slideshow_normal_folder_then_staged_inner_zip_has_only_one_exit_notice() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app_for_test();
+        install_source(&mut app, true, true);
+        let folder = app.tmp.path().join("folder-with-inner-book");
+        std::fs::create_dir_all(&folder).unwrap();
+        let target = folder.join("inner.zip");
+        write_zip(&target);
+        let scan = scan_directory_with_settings(&folder, &app.settings).unwrap();
+        app.apply_folder_nav_result(
+            &ctx,
+            folder_result(&folder, true, FolderNavScanResult::Ready(scan)),
+        );
+        assert_eq!(
+            exit_notice_count(&app),
+            1,
+            "the ordinary close owns the first exit"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            app.settle_open_path_classification_for_test();
+            if app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_some()
+            {
+                break;
+            }
+            app.poll_sidecar_restore(&ctx);
+            app.poll_book_composition_service_for_test(&ctx);
+            app.poll_book_composition_read(&ctx);
+            app.poll_book_presentation_permission(&ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "inner ZIP never reached staged preparation"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let continuation = physical_request(&mut app)
+            .dfs_continuation
+            .as_ref()
+            .unwrap();
+        assert!(continuation.fullscreen && continuation.resume_slideshow);
+        assert!(!app.fs_exclusive_view.is_depth());
+        finish_staged_reopen(&mut app, &ctx, &target, true);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(!app.fs_exclusive_view.is_depth());
+        assert_eq!(
+            exit_notice_count(&app),
+            1,
+            "staged adoption must not repeat the ordinary close's notice"
+        );
+    }
+
+    fn settle_reopen(app: &mut App, ctx: &egui::Context) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.fullscreen_idx.is_none() {
+            app.poll_sidecar_restore(ctx);
+            app.poll_open_path_classification(ctx);
+            app.poll_book_composition_service_for_test(ctx);
+            app.poll_book_composition_read(ctx);
+            app.poll_smart_folder(ctx);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the accepted folder result did not finish its existing display continuation"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn depth_slideshow_next_folder_result_notifies_once_and_keeps_two_dimensional_playback() {
+        for (depth, automatic) in [(true, true), (false, true), (true, false)] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app_for_test();
+            let source = app.tmp.path().join("depth-slideshow-source");
+            let destination = app.tmp.path().join("depth-slideshow-destination");
+            std::fs::create_dir_all(&source).unwrap();
+            std::fs::create_dir_all(&destination).unwrap();
+            for folder in [&source, &destination] {
+                image::RgbaImage::from_pixel(4, 6, image::Rgba([20, 80, 140, 255]))
+                    .save(folder.join("page.png"))
+                    .unwrap();
+            }
+            app.current_folder = Some(source.clone());
+            app.items = vec![GridItem::Image(source.join("page.png"))];
+            app.visible_indices = vec![0];
+            app.fullscreen_idx = Some(0);
+            app.settings.page_turn_animation_enabled = false;
+            app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsDepthParallax = F24\n");
+            if depth {
+                let owner = app.edit_request_owner_context();
+                app.set_fs_exclusive_view(
+                    crate::fs_exclusive_view::FsExclusiveView::Depth(
+                        crate::depth_parallax::DepthViewState::new(owner),
+                    ),
+                    "slideshow_folder_test",
+                );
+            }
+            app.slideshow_playing = automatic;
+            app.feedback_toasts_for_test.clear();
+            let make_result = |app: &App| FolderNavResult {
+                target: Some(FolderNavTarget {
+                    route: FolderNavRoute::FullFeature(destination.clone()),
+                    smart_kind: None,
+                    scanned: FolderNavScanResult::Ready(
+                        scan_directory_with_settings(&destination, &app.settings).unwrap(),
+                    ),
+                }),
+                hit_image_folder: true,
+                forward: true,
+                mode: if automatic {
+                    FolderNavMode::SlideshowNext
+                } else {
+                    FolderNavMode::Fullscreen
+                },
+                queued_steps: 0,
+            };
+            let result = make_result(&app);
+            app.apply_folder_nav_result(&ctx, result);
+            settle_reopen(&mut app, &ctx);
+            assert_eq!(app.current_folder.as_deref(), Some(destination.as_path()));
+            assert!(!app.fs_exclusive_view.is_depth());
+            assert!(app.fullscreen_idx.is_some());
+            assert_eq!(app.slideshow_playing, automatic);
+            let expected = usize::from(depth && automatic);
+            let notice_count = |app: &App| {
+                app.feedback_toasts_for_test
+                    .iter()
+                    .filter(|(message, _)| {
+                        message.starts_with("3D 写真を終了しました: 次のフォルダへ進みました。")
+                    })
+                    .count()
+            };
+            assert_eq!(
+                notice_count(&app),
+                expected,
+                "depth={depth}, automatic={automatic}"
+            );
+            if expected == 1 {
+                assert!(app.feedback_toasts_for_test.iter().any(|(message, _)| {
+                    message.contains("次のフォルダへ進みました。F24 キーでもう一度使えます")
+                }));
+            }
+            // A later ordinary 2D result has no Depth owner to retire again.
+            let result = make_result(&app);
+            app.apply_folder_nav_result(&ctx, result);
+            settle_reopen(&mut app, &ctx);
+            assert_eq!(notice_count(&app), expected);
+        }
     }
 }

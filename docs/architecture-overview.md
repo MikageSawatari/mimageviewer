@@ -1,5 +1,14 @@
 # アーキテクチャ概観
 
+## 3Dスライドショーの準備と提示（§1.771）
+
+`app/depth_view.rs` が描画の素材を `DepthViewState.current_material` へ記録し、同じcontextの
+`DepthSettled` と照合して提示・失敗の事実を読む。`depth_parallax.rs` のNext枠は1件だけを所有し、
+完了先は既存LRU、途中の要求は送り先 / key / 未取消を照合して現ページへ引き継ぐ。
+`app/depth_progress.rs` は既存load / edit / final / AI / depthの実producerをread-onlyで分類し、
+未発行や終端を待たない。D3 Nextの有効条件は既存final_prepareへ集約し、独立の生成経路を作らない。
+所有描画の可視性を運ぶ `SlideshowTimerPass` で3Dの起算・送りを制御する。詳細は [設計](depth-slideshow-plan.md)。
+
 ## ローカル文字起こし（T1 区切り3）
 
 VLM worker と同じ exe の ASR 役割が、whisper.cpp v1.9.5 を llama.cpp の ggml 上で使う。
