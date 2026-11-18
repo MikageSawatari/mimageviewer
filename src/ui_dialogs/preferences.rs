@@ -129,6 +129,8 @@ pub(crate) fn draw_fullscreen_specified_scale_max_controls(
 
 mod name_colors;
 
+#[cfg(test)]
+mod hover_perf;
 mod pages;
 mod search_index;
 mod transfer;
@@ -1141,6 +1143,14 @@ pub fn draw_clipboard_capture_html_settings_snapshot_fixture(
     draw_page(ui, &mut state, false);
 }
 
+/// Derived keyboard data lives only as long as its editing dialog. Equality is checked
+/// on use, including direct settings edits/imports; no mutation-specific invalidation.
+struct CommandKeymapCache {
+    source: crate::keymap::KeymapSettings,
+    keymap: crate::keymap::Keymap,
+    conflicts: Vec<crate::keymap::BindingConflict>,
+}
+
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
@@ -1246,6 +1256,7 @@ pub(crate) struct PreferencesState {
     pub book_root_input: String,
     pub startup_folder_path_input: String,
     pub exif_add_tag_input: String,
+    command_keymap_cache: Option<Arc<CommandKeymapCache>>,
     pub command_filter: String,
     pub command_key_filter: String,
     pub command_selected: Option<crate::keymap::KeyAction>,
@@ -1416,6 +1427,23 @@ pub(crate) struct PreferencesState {
 }
 
 impl PreferencesState {
+    fn command_keymap(&mut self) -> Arc<CommandKeymapCache> {
+        if let Some(cache) = &self.command_keymap_cache
+            && cache.source == self.settings.keymap
+        {
+            return Arc::clone(cache);
+        }
+        let keymap = crate::keymap::Keymap::from_settings(&self.settings.keymap);
+        let conflicts = keymap.binding_conflicts();
+        let cache = Arc::new(CommandKeymapCache {
+            source: self.settings.keymap.clone(),
+            keymap,
+            conflicts,
+        });
+        self.command_keymap_cache = Some(Arc::clone(&cache));
+        cache
+    }
+
     fn clear_video_media_memory(&mut self) {
         self.video_media_memory_clear_requested = true;
         self.settings.clear_video_media_memory();
@@ -1831,6 +1859,7 @@ impl PreferencesState {
             command_filter: String::new(),
             command_key_filter: String::new(),
             command_selected: None,
+            command_keymap_cache: None,
             command_edit_loaded_for: None,
             command_chord_inputs: std::array::from_fn(|_| String::new()),
             command_capture_slot: None,
@@ -3405,6 +3434,8 @@ impl App {
             && !vlm_dialog_open
             && self.dialog_escape_pressed(ctx);
 
+        let dialog_started = crate::perf::is_enabled().then(std::time::Instant::now);
+        let mut dialog_page = None;
         egui::Window::new("環境設定")
             .drag_area(egui::WindowDrag::Anywhere)
             .enabled(!transfer_dialog_open && !registration_dialog_open && !vlm_dialog_open)
@@ -3505,6 +3536,9 @@ impl App {
                 let rendered_page = state.selected;
                 let rendered_generation = state.right_panel_scroll_generation;
                 let rendered_results = state.showing_results;
+                if dialog_started.is_some() {
+                    dialog_page = Some((rendered_page, rendered_results));
+                }
                 let mut scroll = egui::ScrollArea::vertical()
                     .scroll_source(egui::scroll_area::ScrollSource {
                         drag: egui::scroll_area::DragScroll::Always,
@@ -3629,6 +3663,26 @@ impl App {
                     }
                 });
             });
+
+        if let Some(started) = dialog_started {
+            let dialog_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let state = self.pref_state.as_ref().unwrap();
+            let (page, search_results) =
+                dialog_page.unwrap_or((state.selected, state.showing_results));
+            crate::perf::event(
+                "ui",
+                "dialog_frame",
+                None,
+                self.input_seq,
+                &[
+                    ("n", self.frame_counter.into()),
+                    ("dialog", "preferences".into()),
+                    ("page", format!("{page:?}").into()),
+                    ("search_results", search_results.into()),
+                    ("dialog_ms", dialog_ms.into()),
+                ],
+            );
+        }
 
         if let Some(state) = self.pref_state.as_ref() {
             self.preferences_right_panel_scroll_sequence = state.right_panel_scroll_generation;
@@ -3855,6 +3909,7 @@ impl App {
         let min_dialog_size = egui::vec2(560.0, 420.0).min(safe_size);
         let dialog_rect = egui::Rect::from_center_size(safe_rect.center(), dialog_size);
 
+        let dialog_started = crate::perf::is_enabled().then(std::time::Instant::now);
         egui::Window::new("操作カスタマイズ")
             .drag_area(egui::WindowDrag::Anywhere)
             .id(egui::Id::unique("operation_customize_dialog_v2"))
@@ -3915,6 +3970,37 @@ impl App {
                     }
                 });
             });
+
+        if let Some(started) = dialog_started {
+            let dialog_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let state = self.operation_customize_state.as_ref().unwrap();
+            let page = match state.operation_tab {
+                OperationCustomizeTab::Settings => format!("{:?}", state.operation_settings_tab),
+                OperationCustomizeTab::Commands | OperationCustomizeTab::Keyboard => {
+                    format!("{:?}", state.operation_keyboard_context)
+                }
+                OperationCustomizeTab::RingShortcut => {
+                    format!("{:?}", state.operation_ring_context)
+                }
+                OperationCustomizeTab::MouseGesture => {
+                    format!("{:?}", state.operation_mouse_gesture_context)
+                }
+                OperationCustomizeTab::Gamepad => format!("{:?}", state.operation_gamepad_context),
+            };
+            crate::perf::event(
+                "ui",
+                "dialog_frame",
+                None,
+                self.input_seq,
+                &[
+                    ("n", self.frame_counter.into()),
+                    ("dialog", "operation_customize".into()),
+                    ("tab", format!("{:?}", state.operation_tab).into()),
+                    ("page", page.into()),
+                    ("dialog_ms", dialog_ms.into()),
+                ],
+            );
+        }
 
         if let Some(state) = self.operation_customize_state.as_mut() {
             draw_operation_assignment_editor_dialog(ctx, state, keyboard_capture_blocked);

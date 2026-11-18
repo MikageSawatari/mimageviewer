@@ -28,6 +28,7 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     nav                 Ctrl+↑↓ ナビの区間別 wall time (DFS / apply / load_folder /
                         start_loading_items / close_fullscreen) を集計
     pre-grid            App::update のグリッド直前区間を要素別に集計
+    dialog-frames       設定ダイアログのページ別 FPS・描画時間と前フレーム update 時間
     collection          コレクション読取 lease を session + request_id で相関し、
                         旧イベントは段別時間・outcome・未相関件数だけを集計
     hitches [--ms N]    遅い update / フレーム間隔と logger・UI・thumb 区間、
@@ -4241,6 +4242,160 @@ def cmd_collection(events: list[dict]) -> None:
     )
 
 
+def analyze_dialog_frames(events: list[dict]) -> dict:
+    """Reference measurements, joined strictly by capture segment and frame n.
+
+    The same-n begin's prev_update_ms belongs to the *previous* App::update.
+    Keep the requested same-frame join, but never call that value current update
+    time. FPS uses begin timestamps only across consecutive same-group frames;
+    observed missing records, page switches and session boundaries break intervals.
+    A close/reopen or idle gap between consecutive n cannot be identified here.
+    """
+    def number(event: dict, field: str) -> float | None:
+        value = event.get(field)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+            return None
+        return float(value)
+
+    segment = 0
+    sessions = resets = 0
+    last_n = None
+    begins: dict[tuple[int, int], list[dict]] = defaultdict(list)
+    dialogs = []
+    malformed = 0
+    partial = 0
+    for event in events:
+        category = (event.get("cat"), event.get("kind"))
+        if category == ("session", "start"):
+            segment += 1
+            sessions += 1
+            last_n = None
+        elif category in (("frame", "begin"), ("ui", "dialog_frame")):
+            n = event.get("n")
+            if type(n) is not int or n < 0:
+                malformed += 1
+                continue
+            if category == ("frame", "begin"):
+                # A truncated/concatenated legacy capture can omit session.start.
+                # Never reuse n across an observed counter restart.
+                if last_n is not None and n < last_n:
+                    segment += 1
+                    resets += 1
+                last_n = n
+                begins[(segment, n)].append(event)
+            else:
+                dialog, page, tab = event.get("dialog"), event.get("page"), event.get("tab", "-")
+                search_results = event.get("search_results", False)
+                if (dialog not in ("preferences", "operation_customize")
+                        or not isinstance(page, str) or not page
+                        or not isinstance(tab, str) or not tab
+                        or type(search_results) is not bool
+                        or (dialog == "operation_customize" and tab == "-")):
+                    malformed += 1
+                    continue
+                dialogs.append((segment, n, (dialog, tab, page, search_results), event))
+                if not sessions:
+                    partial += 1
+
+    groups = {}
+    previous = {}
+    duplicate_dialogs = Counter((seg, n, key) for seg, n, key, _ in dialogs)
+    for seg, n, key, event in dialogs:
+        group = groups.setdefault(key, {
+            "dialog": key[0], "tab": key[1], "page": key[2], "frames": 0,
+            "search_results": key[3],
+            "missing_begin": 0, "ambiguous_begin": 0, "duplicate_dialog": 0,
+            "missing_dialog_ms": 0, "missing_prev_update_ms": 0, "missing_timestamp": 0,
+            "dialog_values": [], "update_values": [], "intervals": [],
+        })
+        group["frames"] += 1
+        dialog_ms = number(event, "dialog_ms")
+        if dialog_ms is None:
+            group["missing_dialog_ms"] += 1
+        else:
+            group["dialog_values"].append(dialog_ms)
+        matches = begins.get((seg, n), [])
+        if len(matches) != 1:
+            group["missing_begin" if not matches else "ambiguous_begin"] += 1
+            previous.pop(key, None)
+            continue
+        begin = matches[0]
+        update_ms = number(begin, "prev_update_ms")
+        if update_ms is None:
+            group["missing_prev_update_ms"] += 1
+        else:
+            group["update_values"].append(update_ms)
+        timestamp = number(begin, "t")
+        if timestamp is None:
+            group["missing_timestamp"] += 1
+            previous.pop(key, None)
+            continue
+        if duplicate_dialogs[(seg, n, key)] != 1:
+            group["duplicate_dialog"] += 1
+            previous.pop(key, None)
+            continue
+        prior = previous.get(key)
+        if prior is not None and prior[0] == seg and prior[1] + 1 == n and prior[2] < timestamp:
+            group["intervals"].append(timestamp - prior[2])
+        previous[key] = (seg, n, timestamp)
+
+    def stats(values: list[float]) -> dict:
+        return {"n": len(values), "median_ms": percentile(values, .5), "p90_ms": percentile(values, .9)}
+
+    rows = []
+    for key, group in sorted(groups.items()):
+        intervals = group.pop("intervals")
+        group["fps_intervals"] = len(intervals)
+        group["fps"] = len(intervals) / sum(intervals) if intervals else None
+        interval_fps = [1.0 / interval for interval in intervals]
+        group["fps_median"] = percentile(interval_fps, .5)
+        group["fps_p90"] = percentile(interval_fps, .9)
+        group["dialog_ms"] = stats(group.pop("dialog_values"))
+        group["lagged_prev_update_ms"] = stats(group.pop("update_values"))
+        rows.append(group)
+    return {
+        "sessions": sessions, "inferred_restarts": resets,
+        "partial_session_frames": partial, "malformed_events": malformed,
+        "evidence_errors": list(getattr(events, "evidence_errors", [])),
+        "drop_reports": sum(1 for event in events if event.get("cat") == "log"
+                            and event.get("kind") in ("records_dropped", "diagnostic_dropped")),
+        "groups": rows,
+    }
+
+
+def cmd_dialog_frames(events: list[dict]) -> None:
+    report = analyze_dialog_frames(events)
+    print(f"dialog frames: sessions={report['sessions']} inferred_restarts={report['inferred_restarts']} "
+          f"partial_session_frames={report['partial_session_frames']} malformed_events={report['malformed_events']}")
+    print("参考値: FPS は同一 session・連続 n の frame.begin 時刻による update 頻度（present FPS ではありません）。")
+    print("FPS は有効区間全体の平均、FPS_interval median/p90 は各有効区間の 1/秒間隔の分位値です。")
+    print("lagged_prev_update_ms = 前フレームの App::update 時間（同一 n の frame.begin と結合）。")
+    print(f"log drop reports={report['drop_reports']} parse errors={len(report['evidence_errors'])}; "
+          "ログ配送の完全性は検証しません。観測できた欠落・ページ切替・session 境界は FPS 区間から除外します。")
+    print("連続 n の間にある未記録の閉じ開き・idle は区別できず、その経過時間も FPS に含まれます。")
+
+    def format_stats(stats: dict) -> str:
+        if not stats["n"]:
+            return "n=0 median=- p90=-"
+        return f"n={stats['n']} median={stats['median_ms']:.3f}ms p90={stats['p90_ms']:.3f}ms"
+
+    for group in report["groups"]:
+        fps = f"{group['fps']:.2f}" if group["fps"] is not None else "-"
+        print(f"{group['dialog']}/tab={group['tab']}/page={group['page']}: "
+              f"search_results={group['search_results']} "
+              f"frames={group['frames']} FPS={fps} intervals={group['fps_intervals']}")
+        fps_median = f"{group['fps_median']:.2f}" if group["fps_median"] is not None else "-"
+        fps_p90 = f"{group['fps_p90']:.2f}" if group["fps_p90"] is not None else "-"
+        print(f"  FPS_interval: median={fps_median} p90={fps_p90}")
+        print(f"  dialog_ms: {format_stats(group['dialog_ms'])}")
+        print(f"  lagged_prev_update_ms: {format_stats(group['lagged_prev_update_ms'])}")
+        print("  " + " ".join(f"{field}={group[field]}" for field in (
+            "missing_begin", "ambiguous_begin", "duplicate_dialog", "missing_dialog_ms",
+            "missing_prev_update_ms", "missing_timestamp")))
+    if not report["groups"]:
+        print("(ui.dialog_frame イベントなし)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="mimageviewer perf_events.jsonl analyzer"
@@ -4279,6 +4434,7 @@ def main() -> None:
     p_startup = subs.add_parser("startup")
     subs.add_parser("memory")
     subs.add_parser("collection")
+    subs.add_parser("dialog-frames", help="設定ダイアログのページ別 FPS・時間の参考集計")
     p_pre_grid = subs.add_parser("pre-grid")
     p_pre_grid.add_argument(
         "--min-ms",
@@ -4453,6 +4609,8 @@ def main() -> None:
         cmd_memory(events)
     elif args.cmd == "collection":
         cmd_collection(events)
+    elif args.cmd == "dialog-frames":
+        cmd_dialog_frames(events)
     elif args.cmd == "pre-grid":
         cmd_pre_grid(events, args.min_ms)
     elif args.cmd == "hitches":
