@@ -377,6 +377,7 @@ fn draw_position_current(
             None,
             FlatCropPaint::WithPage,
             true,
+            false,
         )
         .expect("ready single or split page");
     app.fullscreen_page_layout

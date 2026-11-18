@@ -3,6 +3,163 @@
 use super::*;
 
 #[test]
+fn unfocused_rotation_menu_rejects_default_and_remapped_navigation_before_consumption() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::arm_test_synthetic_input(806807, egui::ViewportId::ROOT);
+    for scroll in [false, true] {
+        let ctx = egui::Context::default();
+        let rect = viewport(640.0);
+        let mut app = sources(&ctx, [160, 320]);
+        if scroll {
+            app.settings.fullscreen_up_down_key_action =
+                crate::settings::FullscreenUpDownKeyAction::InPageScroll;
+        }
+        app.keymap = crate::keymap::Keymap::from_ini_str(
+            "[FsImage]\nFsPageNext = F24\nFsFixedJumpNext = F23\n",
+        );
+        settle(&mut app, &ctx, rect);
+        open_menu(&mut app, &ctx, rect, "fs_rotation_btn");
+        ctx.memory_mut(|memory| {
+            if let Some(id) = memory.focused() {
+                memory.surrender_focus(id);
+            }
+        });
+        for (key, shift) in [
+            (egui::Key::ArrowDown, false),
+            (egui::Key::ArrowUp, false),
+            (egui::Key::ArrowLeft, false),
+            (egui::Key::ArrowRight, false),
+            (egui::Key::ArrowDown, true),
+            (egui::Key::ArrowUp, true),
+            (egui::Key::PageDown, false),
+            (egui::Key::F24, false),
+            (egui::Key::F23, false),
+            (egui::Key::Home, false),
+            (egui::Key::End, false),
+        ] {
+            let pan = app.fs_pan;
+            // Call the actual consumer before egui's menu uses arrows. This
+            // distinguishes handler non-consumption from menu consumption.
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(rect),
+                    focused: true,
+                    events: [true, false]
+                        .into_iter()
+                        .map(|pressed| egui::Event::Key {
+                            key,
+                            physical_key: None,
+                            pressed,
+                            repeat: false,
+                            modifiers: egui::Modifiers {
+                                shift,
+                                ..Default::default()
+                            },
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx();
+                    assert!(fs_rotation_popup_open(ctx));
+                    let result = app.handle_fs_key_input(ctx, 1, false);
+                    assert!(result.page_nav.is_none());
+                    assert!(result.jump_to.is_none());
+                    assert_eq!(app.fs_pan, pan);
+                    assert!(ctx.input(|i| i.events.iter().any(|event| matches!(event,
+                    egui::Event::Key { key: actual, pressed: true, .. } if *actual == key))));
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+    }
+}
+
+#[test]
+fn rotation_menu_preserves_rotation_shortcuts_and_source_seek_keeps_early_return() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::arm_test_synthetic_input(806807, egui::ViewportId::ROOT);
+    let ctx = egui::Context::default();
+    let rect = viewport(640.0);
+    let mut app = sources(&ctx, [160, 320]);
+    settle(&mut app, &ctx, rect);
+    open_menu(&mut app, &ctx, rect, "fs_rotation_btn");
+    for (key, rotation) in [
+        (egui::Key::R, crate::rotation_db::Rotation::Cw90),
+        (egui::Key::L, crate::rotation_db::Rotation::None),
+    ] {
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(rect),
+                focused: true,
+                events: [true, false]
+                    .into_iter()
+                    .map(|pressed| egui::Event::Key {
+                        key,
+                        physical_key: None,
+                        pressed,
+                        repeat: false,
+                        modifiers: egui::Modifiers::NONE,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            |ui| {
+                ctx.memory_mut(|m| {
+                    if let Some(id) = m.focused() {
+                        m.surrender_focus(id);
+                    }
+                });
+                app.handle_fs_key_input(ui.ctx(), 1, false);
+                assert_eq!(app.rotation_cache.get(&1), Some(&rotation));
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+    ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(rect),
+            focused: true,
+            events: [true, false]
+                .into_iter()
+                .map(|pressed| egui::Event::Key {
+                    key: egui::Key::R,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+                .collect(),
+            ..Default::default()
+        },
+        |ui| {
+            egui::Popup::open_id(
+                ui.ctx(),
+                egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup"),
+            );
+            app.handle_fs_key_input(ui.ctx(), 1, false);
+            assert_eq!(
+                app.rotation_cache.get(&1),
+                Some(&crate::rotation_db::Rotation::None)
+            );
+            assert!(ui.ctx().input(|i| i.events.iter().any(|event| matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::R,
+                    pressed: true,
+                    ..
+                }
+            ))));
+        },
+    )
+    .drop_without_applying_deltas();
+}
+
+#[test]
 fn mouse_opened_unfocused_rotation_popup_keeps_page_scroll_keys_unconsumed() {
     #[cfg(windows)]
     let _input = crate::key_input::lock_test_input();

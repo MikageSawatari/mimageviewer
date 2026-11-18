@@ -1,6 +1,64 @@
 use super::handler_tests::{app, frame, full_rect, paint, run_in_viewport, seed, tap};
 use super::*;
 
+#[test]
+fn root_navigation_is_unconsumed_for_destination_rotation_and_seek_and_resumes_after_close() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    crate::key_input::arm_test_synthetic_input(806807, egui::ViewportId::ROOT);
+    for popup in [
+        egui::Id::unique("fs_rotation_btn").with("popup"),
+        egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup"),
+    ] {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx, SpreadMode::Single);
+        app.settings.fullscreen_up_down_key_action =
+            crate::settings::FullscreenUpDownKeyAction::PageTurn;
+        app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsPageNext = F24\n");
+        app.native_video_in_window_active = false;
+        app.settings.video_in_window_mode = false;
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        let destination = app.fullscreen_viewport_id();
+        ctx.set_embed_viewports(false);
+        let keep = |ctx: &egui::Context| {
+            ctx.show_viewport_deferred(destination, Default::default(), |_, _| {});
+        };
+        frame(&ctx, vec![], |_, ctx| keep(ctx));
+        run_in_viewport(&ctx, destination, full_rect(), 1.0, vec![], |ui, ctx| {
+            paint(&mut app, ui, ctx);
+            egui::Popup::open_id(ctx, popup);
+            assert!(ctx.memory(|m| m.focused().is_none()));
+        });
+        let before = app.fs_pan;
+        for key in [egui::Key::ArrowDown, egui::Key::PageDown, egui::Key::F24] {
+            frame(&ctx, tap(key), |_, ctx| {
+                keep(ctx);
+                assert_eq!(
+                    egui::Popup::current_open_id_for(ctx, destination),
+                    Some(popup)
+                );
+                assert!(
+                    app.handle_fullscreen_root_key_input(ctx),
+                    "ROOT must suppress the grid route"
+                );
+                assert_eq!(app.fullscreen_idx, Some(0));
+                assert_eq!(app.fs_pan, before);
+                assert!(ctx.input(|i| i.events.iter().any(|event| matches!(event,
+                    egui::Event::Key { key: actual, pressed: true, .. } if *actual == key))));
+            });
+        }
+        run_in_viewport(&ctx, destination, full_rect(), 1.0, vec![], |_, ctx| {
+            egui::Popup::close_id(ctx, popup)
+        });
+        frame(&ctx, tap(egui::Key::F24), |_, ctx| {
+            keep(ctx);
+            assert!(app.handle_fullscreen_root_key_input(ctx));
+            assert_ne!(app.fullscreen_idx, Some(0));
+        });
+    }
+}
+
 fn guarded_keys(app: &mut App, ctx: &egui::Context) -> FsKeyAction {
     let idx = app.fullscreen_idx.unwrap();
     canonical_demand::with_resident_metadata_only_for_test(|| {

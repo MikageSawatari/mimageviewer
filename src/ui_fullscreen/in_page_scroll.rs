@@ -403,7 +403,7 @@ impl App {
         })
     }
 
-    pub(super) fn fs_page_scroll_front_menu_presented(&mut self, ctx: &egui::Context) -> bool {
+    pub(super) fn fs_navigation_front_menu_presented(&mut self, ctx: &egui::Context) -> bool {
         let viewport = self.fs_page_scroll_destination_viewport();
         // Preserve the ingress viewport's existing front-UI gate as well as
         // checking the fullscreen destination of a ROOT-forwarded key.

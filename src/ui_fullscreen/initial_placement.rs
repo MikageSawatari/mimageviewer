@@ -48,6 +48,13 @@ fn reading_start_pan(
 }
 
 impl App {
+    pub(super) fn record_fs_automatic_initial_view(&mut self, pan: egui::Vec2) {
+        self.fs_automatic_initial_view = Some(FsAutomaticInitialView {
+            zoom: self.fs_zoom,
+            pan,
+        });
+    }
+
     /// Whether the user has moved the view away from its last automatic placement.
     ///
     /// The 2026-08-15 rule deliberately excluded pan: counting a nudge would

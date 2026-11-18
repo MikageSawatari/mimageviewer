@@ -1095,6 +1095,8 @@ pub(crate) fn paint_source_coverage_texture(
 pub(crate) struct DisplayedPage {
     pub(crate) transform: DisplayedImageTransform,
     occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
+    /// Fixed, physically quantized gap and screen side used by the layout producer.
+    pub(crate) spread_gap: Option<(SingletonSpreadPlacement, f32)>,
 }
 
 impl DisplayedPage {
@@ -1102,6 +1104,7 @@ impl DisplayedPage {
         let page_idx = transform.page_idx;
         Self {
             transform,
+            spread_gap: None,
             occurrence: crate::ui_fullscreen::SpreadPageOccurrence {
                 idx: page_idx,
                 role: crate::ui_fullscreen::SpreadPageRole::Navigation,
@@ -1118,6 +1121,7 @@ impl DisplayedPage {
         Self {
             transform,
             occurrence,
+            spread_gap: None,
         }
     }
 
@@ -1176,6 +1180,18 @@ impl FullscreenPageLayout {
     ) {
         self.pages
             .push(DisplayedPage::with_occurrence(transform, occurrence));
+    }
+
+    pub(crate) fn push_spread_occurrence(
+        &mut self,
+        transform: DisplayedImageTransform,
+        occurrence: crate::ui_fullscreen::SpreadPageOccurrence,
+        side: SingletonSpreadPlacement,
+        gap: f32,
+    ) {
+        let mut page = DisplayedPage::with_occurrence(transform, occurrence);
+        page.spread_gap = Some((side, gap));
+        self.pages.push(page);
     }
 
     /// Rebind a paged layout to the role-aware composition that produced it.

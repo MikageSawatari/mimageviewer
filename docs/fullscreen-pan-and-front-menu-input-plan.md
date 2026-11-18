@@ -200,7 +200,152 @@
 
 ## 6. 実装記録
 
-(実装担当が書く: 変えたファイル・設計との差分と理由・§3.4 の収まりの安定の方法・§3.5 と §4.2 で列挙した経路・追加したテスト名。)
+### 6.1 実装と所有境界
+
+案Cを実装中。既定のCenterでの素材fallbackの幾何に確認点を見つけ、§6.6の理由で停止した。
+差分は未完成・未コミット。新しいviewer context field、回転の記録、同期I/O、待機・retry・repaintは追加しない。
+
+- `src/displayed_image_transform.rs`: 描画済み `DisplayedPage` に通常見開きの固定間隔と画面上の側を記録する。
+  `begin`でページとともに退役し、既存のlayoutと一緒にcontext間を移る。
+- `src/ui_fullscreen.rs`: layout producerが最終の物理px間隔を記録し、入力投影は記録だけを読む。
+  単独ページと通常見開きは `spread_projected_gap_correction` を共用する。
+  通常描画は候補ごとに初期配置→パン制限→transformの再解決を行い、準備に成功した素材だけを確定する。
+  見開きは初期配置の既存素材選択を共用し、左右完成後に1組で確定する。Native拒否・fallback・部分描画では不採用の提案を書かない。
+- `src/ui_fullscreen/pan_bounds.rs`: 描画の適用領域、候補の比較、確定を集約する。
+  `minimum_pan_correction` と `pan_correction_for_minimum_overlap` を入力と共用し、描画だけ表示単位の候補を足す。
+- `initial_placement.rs`: 自動配置の比較値の記録入口を共用する。初期配置要求の `origin_automatic` を確定前に捕捉し、
+  手動由来なら既存の自動配置値を保持する。パンの書戻しは入力setterを通さない。
+- `in_page_scroll.rs`: 前面メニュー照会を `fs_navigation_front_menu_presented` へ改名し、既存の配送元／配送先照会を共用する。
+  detachedの述語・viewportの選び方・ROOT配送は変更しない。
+- テスト: `pan_bounds/{tests,projection_tests}.rs`、`front_popup_input_tests.rs`、`in_page_scroll/{handler_tests,review_regression_tests}.rs`。
+  既存 `initial_placement/tests.rs`、`page_turn/{resident_placement_tests,wait_indicator_tests}.rs` は元画像一時表示の明示引数を追加。
+- 文書: 本書、`display-pipeline.md`、`keymap-spec.md`、`key-customization-impl-plan.md`、`detached-rework-plan.md` §11。
+  `fullscreen-page-start-position-plan.md` と `fullscreen-in-page-scroll-plan.md` は後続仕様への参照を追加。
+  マニュアル `fullscreen.html` は前面メニュー中のキーと範囲外の表示位置の説明を更新する。
+
+§2.2で任された記録先は `DisplayedPage`、§3.4で任された安定方法は次項の丸め残差の許容とした。
+現差分では§6.6のCenter fallbackの幾何が既定設定の不変条件に反する可能性があり、設計との差分なしとは扱わない。
+
+### 6.2 収まりの安定
+
+候補は最終transform（サンプラの縦横比のcontain、位置と寸法の整列、左右のgap整列を通したもの）の
+clip前AABBから求める。補正後にtransformを再解決する際、layoutの原点・samplerの原点・左右一体のgap整列の
+丸めが変わるため、描画側だけ各軸の残差が2物理px以下なら補正0とする。それより大きければ候補の補正を全量適用する。
+入力側の48px規則は緩めない。もともと補正0の候補は常に0のままで、範囲内のパンを動かさない。
+同じ入力の連続描画、端ドラッグの入力→描画、DPI 1 / 1.25 / 1.5で再補正が起こらないことを検査する。
+
+### 6.3 パンの書き手・形を変える経路・一時表示の棚卸し
+
+- 書き手: `set_fs_pan_from_input`（通常ドラッグ、Spaceパン、キー拡大、Ctrl/中ボタン/左右ドラッグのズーム、
+  ピンチ、ナビゲータのドラッグ／範囲／中央合わせ、ページ内スクロール）、ホイールの提案とクリック予測、
+  初期配置の確定、open/close・fit/reset・構成変更の初期化、detachedの保存済み変形の復元、context bundleのswapと駐車中reset。
+  連結読みの直交軸ドラッグは `fs_pan` へ直接加算するが、描画制限の対象外。
+- 形の変更: 保存／自由回転（相方の脱落を含む）、ズーム・fit方式と倍率制限・指定スケール、表示トリム／自動トリム到着、
+  分割slice、単ページ／見開き・表紙／補助表紙・片側／白ページ・1ページ送り／位置ずらし・読書方向・間隔、
+  素材の到着／交換（RAW・PDF・AI・final合成・通過rendition・fallback）、viewportのresize/DPI・固定HUD/パネルの予約領域。
+  fit/resetやopen等は既存の初期化が先に効く。それ以外も完成素材のframeで範囲外だけを戻す。§3.5以外の新しい操作制限はない。
+- 一時表示: 右Ctrl元画像は通常の `fs_pan` を共用するため明示的に除外する。編集ツールの元画像／マスク表示は編集モードの除外、
+  比較（通常／pin／wipe／diff）は比較の除外、分析・Z・360・3Dは各表示ownerの除外で書き戻さない。
+  類似候補の長押しpreview、Checking中の保持画面、navigation previousとsource-reload holdoverは別の描画／Captured／非currentなので書かない。
+  紙めくりは既存のzoom/pan適格性とprepared素材の束縛を維持し、新しい一時panは作らない。
+- context: 確定はmountされたcontextの既存の `fs_pan`・自動配置値だけ。兄弟contextのキャッシュ・要求・panを変更しない。
+
+### 6.4 前面メニュー中に止める消費者と対象外
+
+`fs_navigation_front_menu_presented` の同じ判定を、次の消費の前に置く。
+
+- 固定plain/Shiftの4方向矢印（ページ内スクロールへの置換も含む）。
+- `FsPageNext/Prev`、`FsFixedJumpNext/Prev` と `NoRtl`、`FsJumpFirst/Last`。
+- `FsSpreadShiftLeft/Right/Prev/Next`、`FsSpreadStepPrev/Next`、`FsStackJumpNext/Prev`。
+- `FsContinuousScrollForward/Back`、`FsPageScrollUp/Down/Left/Right`、`FsPageNScrollNext/Prev`。
+- `FsCtrlNavNext/Prev`、`FsListOrderNext/Prev`、`FsSiblingNext/Prev`。同じhandlerのmouse-back/forward判定と
+  `VideoPrevFile/NextFile` のファイル移動も同じナビゲーション受付に従う（nativeの回数drainは早期return前を維持）。
+
+対象外: `consume_still_reader_close_key`・`FsClose`・`FsBackToList`は設計の明示除外。
+R/L、fit/構成/方向の設定キー、ズーム・表示owner切替、スライドショーの再生停止、評価・チェック・補正・コピー等は
+ページ／パン／スクロールのナビゲーション要求を消費する入口ではないので、既存のkeymap/所有規則を保つ。
+編集モード・ページ一覧・音声シークは既存の専用handler/早期returnの責務を維持し、native presenterは変更しない。
+overflowの独自パネルは従来の「キーで閉じてから通常操作」の規則を保つ（Slideshowのfocus中の早期returnも維持）。
+配送元シークPopupの早期returnはそのまま。配送先シークPopupはナビゲーションだけを拒否する。
+ROOTは従来の `handled = true` を返し、残ったキーを背面一覧へ配送しない。
+
+### 6.5 検証
+
+対象: pan_bounds・initial_placement・in_page_scroll・front_popup_input_tests・overflow_input_tests、
+navigator_pan_clamp、page_turnのresident_placement_testsとwait_indicator_tests。
+
+- 初回 `cargo check -p mimageviewer --bin mimageviewer-core`: 成功、1分49秒。最新の画像項目の適用領域確認を加える前の差分。
+- 初回の対象nextest: コンパイル失敗（E0502、追加テストのAppTestEnv経由の借用2件）、実行0件。ローカル変数へ取り出して修正したが、再コンパイルは未完了。
+- 再実行は共有runnerの全件テスト枠の終了待ちとなった。§6.6の停止判断後、自分の待機プロセスだけを中止した。Cargo・テストは未開始、実行0件。他担当の全件テストには触れていない。
+- 引数なし `cargo fmt` と `git diff --check`: 成功。テスト成功や完了扱いにはしない。
+- 指定runner `run-heavy.ps1 -Owner codex-806 -WorkDir G:\home\mimageviewer-474 -Command ...` を使用。
+
+実行コマンド（check/nextestは上記runner経由、通常feature）:
+
+```text
+cargo check -p mimageviewer --bin mimageviewer-core
+cargo nextest run -p mimageviewer --lib -E 'test(/ui_fullscreen::pan_bounds/) | test(/ui_fullscreen::initial_placement/) | test(/ui_fullscreen::in_page_scroll/) | test(/ui_fullscreen::front_popup_input_tests/) | test(/ui_fullscreen::overflow_input_tests/) | test(/navigator_pan_clamp/) | test(/page_turn::resident_placement_tests/) | test(/page_turn::wait_indicator_tests/)'
+cargo fmt
+git diff --check
+```
+
+ログ: `target/806-check.{stdout,stderr}.log`、`target/806-tests.{stdout,stderr}.log`、
+`target/806-tests-r2.{stdout,stderr}.log`。TEMP/TMPはworktree内の `target/806-tmp` を指定。
+初回はsandboxによりrunnerのlock書込みができず低優先度・6並列で実行、再実行は他担当のfull lock待ちになった。
+全件gate・build-dev・製品起動・コミットは実施していない。
+  初回はsandboxの警告付き低優先度・6並列。TEMP/TMPはworktreeの `target/806-tmp` を継承するよう指定した。
+- ログ: `target/806-check.{stdout,stderr}.log`、`target/806-tests.{stdout,stderr}.log`、`target/806-tests-r2.{stdout,stderr}.log`。
+- 全件gate・検証用build・製品起動・コミットは指示により実施しない。
+
+追加したテスト名（すべて検証未完了、22件）:
+
+<!-- 806-test-names -->
+- `rotated_single_is_bounded_in_the_same_frame_with_matching_layout_and_stamp`
+- `rotation_keeps_in_range_pan_exactly_and_rebounds_the_rest`
+- `partner_rotation_to_single_restricts_pan_without_a_rotation_history`
+- `automatic_rotation_correction_preserves_clicks_but_manual_pan_stays_manual`
+- `provisional_and_unselected_frames_keep_pan_until_complete_current_material`
+- `partial_spread_does_not_restrict_pan_and_first_complete_spread_does`
+- `original_preview_round_trip_keeps_processed_pan_for_single_and_spread`
+- `white_singleton_reading_start_is_unchanged_on_later_complete_frames_ltr_and_rtl`
+- `half_page_initial_placement_bounds_retained_axis_and_preserves_origin_identity`
+- `tiny_real_pages_and_white_companion_accept_input_candidates`
+- `white_singleton_input_clamp_is_preserved_by_complete_draw_at_small_zoom`
+- `repeated_edge_drag_and_fractional_dpi_draws_are_stationary_after_first_correction`
+- `z_continuous_comparison_and_editing_do_not_bound_the_shared_pan`
+- `rejected_native_discards_pan_proposal_before_provisional_fallback`
+- `draw_pan_correction_only_changes_the_mounted_context`
+- `spread_gap_projection_matches_final_transforms_and_edge_stop_with_zero_gap_error_budget`
+- `width_fit_projection_moves_by_signed_gap_correction_and_reduces_error`
+- `singleton_and_two_page_projection_share_the_fixed_gap_formula`
+- `asymmetric_and_tiny_spreads_keep_input_clamp_results_on_complete_draw`
+- `unfocused_rotation_menu_rejects_default_and_remapped_navigation_before_consumption`
+- `rotation_menu_preserves_rotation_shortcuts_and_source_seek_keeps_early_return`
+- `root_navigation_is_unconsumed_for_destination_rotation_and_seek_and_resumes_after_close`
+<!-- /806-test-names -->
+
+### 6.6 実装担当の停止報告（2026-11-19、設計担当の判断待ち）
+
+既定Centerでのfallbackの幾何が、初期配置要求がある場合と違う。
+
+- HEAD `e851d76a2` の `src/ui_fullscreen.rs:51713` 付近は、初期配置要求がある場合だけ
+  `select_initial_material` を有効にし、コメントでもCenter/capturedの既存fallback幾何の保持を明記している。
+- 既存 `prepare_fs_spread_page`（現差分の `src/ui_fullscreen.rs:52878`）は、Nativeの準備が拒否されても
+  引数のページ枠 `rect` とgap用offsetを保ったまま、サムネイルをその枠へcontainして描く。
+- 現差分は `select_paged_material`（同:51792）を通常の完成素材のパン制限にも広げたため、
+  Native→fallbackで候補を交換してループし直す（同:52271）。その候補からlayout_sizeを取り直す（同:51824）。
+  このためCenterでも見開き全体の枠が再計算される。
+- 例（コード上の計算、実行観測ではない）: 原寸、左右とも1600×2400、左だけ80×120のthumbnailへfallback。
+  従来は左の1600×2400の枠を保ってthumbnailを拡大containするが、現差分では左の枠も80×120になり、
+  組の幅と左右両ページの位置が変わり得る。pan=0でも起こるので、範囲外のパンだけが変わるという§5の条件と両立しない。
+
+選択肢:
+
+1. 推奨: Centerの既存のlayout基準・gap整列を保ち、各fallback候補がその枠へ実際に描くtransformに対して提案・確定する。
+   初期配置要求がある場合だけ、既存どおり素材選択後のlayout再計算を行う。候補素材とlayout基準の区別を設計に明記する。
+2. Centerにも素材選択後のlayout再計算を認める。fallback時のサイズ・相方の位置の変更を許す挙動変更となるため、§5の条件の明示変更が必要。
+
+設計の裁定前に候補の幾何を独自に決めず、未完成差分を保持して停止する。テストの成功、実機再現、修正完了は報告しない。
 
 ## 7. 実装前の独立レビュー
 
