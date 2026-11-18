@@ -98,25 +98,20 @@
   - `folder_nav_mode_same_kind`・`StartupListIntent::folder_navigation`・`history_trigger`・`perf_tag`
   - 端の表示 (一覧は Grid の DFS の端と同じ通知、全画面は既存の `FsBoundaryHint::Edge`)
   - `inflight_fullscreen_folder_nav_mode` (ListOrder は継続対象にしない。§1.444 §4.2 のまま)
-- 一覧の受付の gate (r1 P2-2): 全画面の sequence / 表示待ち lock は一覧には効かないので、一覧用に次の契約を置く。
-  - **一覧の ListOrder は、main の一覧の移動が採用されるまで次の要求を拒否する**。拒否する期間は次の 2 つ:
-    - `folder_nav_pending` がある間
-    - worker の回収後、行き先の採用を待つ間。ZIP / PDF / 変換書庫の `PhysicalHistoryTransition`・staged open・hydration のうち、
-      folder navigation が持ち主の要求が対象。
-  - 拒否は、既存の要求を cancel・再開始せずに return する。拒否はログに残す (全画面の `note_fullscreen_nav_request_dropped` と同じ扱い)。
-  - 「folder navigation が持ち主の要求が採用待ちか」の述語は、既存の要求の持ち主の情報 (`MainListRequestOwner` など) から 1 つ作る。
-    新しい bool や pending は足さない。既存の情報で表せないなら、実装前に止めて報告する。
-    - r2 の補足: `MainListRequestOwner` は保存されない受付引数なので使えない。採用待ちに残る移動モード
-      (`PhysicalHistoryTransition.dfs_continuation` と `MainListAfterHydration::Dfs`) から判定する。
-  - §1.805 の DirectNavigation の走査待ちは拒否の理由にしない。ListOrder の受理 (`start_folder_nav`) の既存の受付点で退役させる (§1.805 の裁定のまま)。
-  - 累積 (`MAX_PENDING_NAV`) には乗せない (§1.444 のまま)。
-  - Grid の Ctrl+↑↓ (物理の DFS) の連打累積は維持する。通常 main open との競合は、実装レビュー r1 の
-    利用者裁定により、同じ受付境界で後勝ちへそろえる (§10 の r1 対応)。
-  - 実装レビュー r1 追補: 一覧の ListOrder と通常 main open は、両方の受付順で後から受理した要求を残す。
-    ListOrder の受理で先の別の明示 main open だけを退役し、通常 open の受理で先の Grid 系移動を退役させる。
-    r2 追補: 前者で共通退役を丸ごと呼ばず、既存の要求型から対象を区別する。移動自身の採用待ち・hydration の継続、
-    同じ一覧の並べ替え・表示条件・監視の更新は退役しない。Grid / SiblingGrid の採用待ち中の再入力と累積は `bed81647e` 前のまま。
-    ListOrder 同士の連打拒否は維持する。追加した Grid の退役は自動 refresh・同じ要求の format 継続では発火させない。
+- 一覧の受付の gate (検収側 r3 の裁定): **タグの一覧の ListOrder は、main の要求がどれか進行中なら拒否する**。
+  - 通常 open、ZIP / PDF / 変換書庫の準備、履歴の戻る / 進む、並べ替え・表示条件・監視の更新、
+    移動自身の採用待ち・hydration を区別しない。全画面の ListOrder は変更しない。
+  - 読むだけの `main_list_request_blocks_grid_list_order` をタグの入口と `start_folder_nav` で共用する。
+    既存の退役処理と同じ一時的な要求集合 `MainListRequestKind::ALL` を使う。保存する field・bool・pending は足さない。
+    既存の退役方針は保持し、表示更新を新しく取り消す処理は追加しない。
+  - 拒否は、既存要求を cancel・再開始せず return し、従来の ListOrder 連打拒否と同じログを残す。
+    押した分は累積 (`MAX_PENDING_NAV`) に乗せない。
+  - 唯一の例外は §1.805 の DirectNavigation の走査待ち。これだけなら受理し、既存の受付点で退役させる。
+    別の要求も同時にあれば拒否する。
+  - 一覧の移動の受理で、他の main open を由来・履歴記録方式・intent から分類して退役する処理は置かない。
+  - 物理 Grid DFS / SiblingGrid の受理と累積は、このブランチより前の挙動へ戻す。
+    先行する通常 ZIP open と物理 Grid DFS の既存の競合は本項の範囲外 (§10 r3)。
+  - 逆向きの、通常の明示 open の受理で先の一覧移動を退役する処理は維持する。
 
 ### 4.2 入口の振り分け
 
@@ -583,4 +578,82 @@ r1 の既存7件、P3 の実経路テスト、ListOrder の連打拒否テスト
   filter は `tag_view|list_order|section1763|section257|favsearch|grid_parent|folder_nav|page_overview|gamepad|close_return|select_after_load|section1795|section1804|section1672|startup_restore|direct_navigation_worker|main_list`。
 - 重い処理はすべて指定の `run-heavy.ps1 -Owner codex-802` 経由の bin check と filter 付き nextest のみ。
   共通ロックを書けないため runner の BelowNormal / 6並列で実行した。
+  全件 / test-full / dev・release ビルド / 実アプリ操作 / commit は行っていない。
+
+### 検収側の独立レビュー r3: 後勝ちの分類をやめて拒否へ寄せる (2026-11-19)
+
+利用者は `622c53e98` の `Replay` 除外による競合を正しい指摘と判断し、受付の規則そのものを変更した。
+`MainHistoryOperation` は履歴の記録方式であり、明示入力の由来ではない。
+r1・r2 の後勝ちの分類が組み合わせごとに漏れたため、CLAUDE.md の「状態の組み合わせを減らす」に従い、
+**タグの一覧の ListOrder は main の要求が進行中なら拒否する**。r1・r2 の記録は履歴として残し、現行仕様は本節と §4.1 とする。
+
+- `retire_explicit_main_opens_for_grid_traversal` と、その手書きの intent / history / owner 分類を全削除。
+  他の利用が無くなった `retire_cold_pdf_candidate` の切り出しも元へ戻した。
+- `MainListRequestKind::ALL` は保存状態を持たない要求集合。既存の退役と読むだけの
+  `main_list_request_blocks_grid_list_order` が同じ集合を使い、タグの入口と共通 start が同じ述語を呼ぶ。
+  活動中かだけを読み、`Replay`・通常 open・同じ移動の継続を分類しない。
+- 集合は pane close / Grid worker / 未解決 startup・activation / close return / tag / 分類 / Physical 履歴 / rating /
+  pane scan / Smart / Collection / subfolder / bookmark / document 準備に加え、hydration・reload・main の外部再走査・現在地の保留更新。
+  通常の ZIP / PDF / 変換書庫は既存の分類・Physical 要求を介して準備・変換中も集合に残る。
+- 退役側は従来と同じ順・retained / explicit 条件で処理する。活動中かで退役処理を省略しない。
+  新たに拒否対象にする表示更新は退役では何もしないため、更新取消や逆向き受付の挙動を広げない。
+  startup の main 所有と pane close の既存条件は、読む側と退役・消費側で共用する小さな述語へ抽出した。
+- 唯一の例外は DirectNavigation の pane scan。他の要求が無ければ ListOrder を受理し、§1.805 の既存の受付点で scan を退役する。
+  他の項目も進行中なら、その項目により拒否される。拒否は cancel・再準備・押下の累積をせず、従来と同じログで終了する。
+- hydration は既存の projected-context 述語を使い、外部再走査は main owner だけを見る。
+  旧フォルダ向けに休止している保留更新を永久に拒否理由にしないよう、更新の消費側と共有した現在の適用先を確認する。
+  常駐する監視 subscription は要求ではなく、走らせ中の再走査・現在地の更新だけが対象。
+
+**物理 Grid DFS / SiblingGrid** の受理では新しい退役を行わず、このブランチより前の挙動へ戻した。
+DirectNavigation scan の退役と従来の累積は維持する。先に受理した通常 ZIP open が後から Grid DFS に勝つ競合は、
+出荷済みの既存の競合として本項の範囲外にする。修正する場合は別項目とする。
+通常の明示 open の受理で進行中の一覧移動を退役する逆向きの helper は維持する。
+全画面の ListOrder、§1.804、別窓の行先述語・viewport は変更しない。
+
+**テストの変更・追加**:
+
+- r1 の `tag_view_open_supersession_grid_acceptance_retires_older_ordinary_zip_preflight` を
+  `tag_view_open_supersession_tag_refuses_older_ordinary_zip_preflight` へ置換。Tag は拒否し、元の ZIP が着地する期待へ変更。
+  物理 Grid が旧 ZIP を退役する arm は、今回の範囲外の競合を修正する期待だったため削除。
+- `tag_view_open_supersession_tag_refuses_back_and_forward_zip_replay_preflight` を追加。
+  履歴キーの availability は変更せず、既存の `FolderHistoryPlan` と typed dispatch で受理済み Replay を作り、
+  戻る・進む両方の ZIP preflight を制御して、ListOrder 拒否後も元の要求が採用されることを検査する。
+- `tag_view_open_supersession_tag_refuses_current_view_order_refresh_and_keeps_new_order` を追加。
+  実 scan を channel で保持し、拒否後の元要求の継続と新しい日付順への採用を検査する。
+- `tag_view_open_supersession_tag_accepts_and_retires_direct_navigation_scan` を追加。
+  DirectNavigation の実 scan を保持し、ListOrder の受理・旧 scan の取消・結果の次の本への採用を検査する。
+- r1 の `ordinary_zip_retires_grid_hydration_tail_only` には、自身の hydration 中の ListOrder 拒否と owner 保持を追加。
+  その後の通常 open による逆向き退役の検査は維持する。ほかの r1 の逆向き・負例、r2 の物理 Grid 2件、P3、連打拒否は維持する。
+  共通 fixture は初回 hydration を完了してからキー受付を検査する。
+
+マニュアル `tags.html` に、一覧では本を開く準備中や一覧の更新中も受け付けない旨を追記した。
+`docs/keymap-spec.md` のタグ一覧の受付契約も同じ規則へ揃えた。
+新しい保存 field・pending・bool、retry・delay・追加 repaint は無い。まれな失敗の回復処理も追加しない。
+
+App-global な `archive_convert` の単純な有無は main の要求ではないため、別窓の変換を拒否理由にしない。
+main のタグ由来の通常変換は既存の分類から Physical 要求を持ち、変換・再 preflight までその所有が続く。
+Smart 由来も既存の transition が残る。この所有境界を使い、変換の由来を新しく分類する helper は設けない。
+
+#### r3 の検証記録
+
+- 指定 run-heavy 経由の `cargo check -p mimageviewer --bin mimageviewer-core` は **exit 0、1m32s** (`target/802-r3-check.log`)。
+- `cargo fmt` (引数なし)、`cargo fmt --check`、`git diff --check` は成功。
+  マニュアル追記後の `python scripts/check_ui_glyphs.py` は危険なグリフ0件。
+- 実装担当内の別 context (`gpt-6.1-sol` / `xhigh`) で、共有集合、退役側の順序と条件、main 所有、
+  DirectNavigation の例外、既存の物理移動への復帰を確認した。App-global な archive 変換を単純な有無で読む点を指摘対応し、未解決の指摘は無い。
+  検収側の独立レビューとは別の確認で、Cargo は実装担当だけが実行する。
+- 初回の focused nextest は **15件中14成功、DirectNavigation の新規1件が準備時点で失敗** (compile 9m22s、実行2.088s)。
+  テストが同期 open wrapper を呼び、走査待ちの入口を通していなかった。
+  既存の §1.805 テストと同じ `open_direct_navigation_target_at_stage(..., DirectoryScanRoute::Worker)` へ修正し、
+  元の本の表示と実 pending の保持も検査する。製品コードの追加変更は無い。
+  `target/802-r3-focused.log`、JUnit控え `target/802-r3-focused-initial-junit.xml`。
+- テスト入口修正後は **15件実行 / 15成功 / 失敗0、exit 0** (compile 2m33s、実行2.071s)。
+  `target/802-r3-focused-retry.log`、JUnit控え `target/802-r3-focused-junit.xml`。
+  r1 の逆向き・負例と今回の拒否 / 例外、r2 の物理 Grid 2件、P3、既存の ListOrder 連打拒否2件を含む。
+- 前回と同じ関連 filter の nextest は **941件実行 / 941成功 / 失敗0、exit 0** (compile 1.15s、実行92.681s、18005件除外)。
+  nextest の leaky 判定は2件。focused の全15件も含むことを JUnit で確認し、件数を重複加算しない。
+  `target/802-r3-related.log`、JUnit控え `target/802-r3-related-junit.xml`。
+  filter は `tag_view|list_order|section1763|section257|favsearch|grid_parent|folder_nav|page_overview|gamepad|close_return|select_after_load|section1795|section1804|section1672|startup_restore|direct_navigation_worker|main_list`。
+- 重い処理は指定の `run-heavy.ps1 -Owner codex-802` 経由の bin check と filter 付き nextest だけ。
+  full-test ロックは迂回せず待ち、ロック書込不可時は runner の BelowNormal / 6並列で実行した。
   全件 / test-full / dev・release ビルド / 実アプリ操作 / commit は行っていない。

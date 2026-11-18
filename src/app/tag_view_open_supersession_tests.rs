@@ -1,4 +1,4 @@
-//! New main-grid destinations supersede older opens in either acceptance order.
+//! Tag ListOrder waits for older main opens; explicit opens supersede Grid navigation.
 //! Channels hold real worker/preflight results at the adoption boundary; no desktop input.
 use super::*;
 use collection_navigation::{PhysicalHistoryPreflight, PhysicalHistoryPreflightPayload};
@@ -50,6 +50,7 @@ fn fixture(
     write_zip(&x);
     app.load_folder(a.clone());
     app.finish_page_identity_preparation_for_test();
+    settle(app, &egui::Context::default());
     app.fullscreen_idx = None;
     if matches!(route, GridRoute::TagListOrder) {
         app.tag_view.active = true;
@@ -213,29 +214,256 @@ fn assert_destination(app: &App, route: GridRoute, a: &Path, destination: &Path,
 }
 
 #[test]
-fn tag_view_open_supersession_grid_acceptance_retires_older_ordinary_zip_preflight() {
-    for route in [GridRoute::TagListOrder, GridRoute::PhysicalDfs] {
+fn tag_view_open_supersession_tag_refuses_older_ordinary_zip_preflight() {
+    let mut app = setup_app();
+    let root = app.tmp.path().to_owned();
+    let (a, _, x) = fixture(&mut app, &root, GridRoute::TagListOrder, false);
+    let ctx = egui::Context::default();
+    let (sender, payload) = ordinary_open(&mut app, &x);
+    let Some(HistoryNavigationTransition::Physical(request)) =
+        app.top_level_grid_view.history_navigation_transition()
+    else {
+        unreachable!()
+    };
+    let request_id = request.request_id;
+    let nav_stack = app.tag_view.nav_stack.clone();
+    assert!(request.dfs_continuation.is_none());
+    assert!(app.route_tag_view_grid_book_navigation(&ctx, true));
+    assert!(app.folder_nav_pending.is_none());
+    assert_eq!(app.pending_folder_nav_steps, 0);
+    assert_eq!(app.effective_folder(), Some(a.clone()));
+    assert_eq!(app.tag_view.nav_stack, nav_stack);
+    assert!(
+        matches!(app.top_level_grid_view.history_navigation_transition(),
+        Some(HistoryNavigationTransition::Physical(request)) if request.request_id == request_id)
+    );
+    assert!(
+        sender.send(Ok(payload)).is_ok(),
+        "old ZIP receiver was retired"
+    );
+    settle(&mut app, &ctx);
+    assert_destination(&app, GridRoute::TagListOrder, &a, &x, true);
+}
+
+#[test]
+fn tag_view_open_supersession_tag_refuses_back_and_forward_zip_replay_preflight() {
+    for direction in [
+        FolderHistoryDirection::Back,
+        FolderHistoryDirection::Forward,
+    ] {
         let mut app = setup_app();
         let root = app.tmp.path().to_owned();
-        let (a, b, x) = fixture(&mut app, &root, route, false);
+        let (a, _, x) = fixture(&mut app, &root, GridRoute::TagListOrder, false);
         let ctx = egui::Context::default();
-        let (old_sender, old_payload) = ordinary_open(&mut app, &x);
-        assert_eq!(app.effective_folder(), Some(a.clone()));
-        start_grid(&mut app, &ctx, &a, route);
-        assert!(
-            old_sender.send(Ok(old_payload)).is_err(),
-            "old ZIP owner survived {route:?}"
+        let target: FolderNavHistoryEntry = FolderNavHistoryTarget::Path(x.clone()).into();
+        match direction {
+            FolderHistoryDirection::Back => app.folder_nav_back_stack = vec![target.clone()],
+            FolderHistoryDirection::Forward => app.folder_nav_forward_stack = vec![target.clone()],
+        }
+        // The merged history input handler intentionally refuses active Tag search.
+        // Exercise its typed acceptance/adoption path with an already captured Replay;
+        // ListOrder must preserve any accepted replay, regardless of its producer.
+        let plan = FolderHistoryPlan::capture(&app, direction, target.clone()).unwrap();
+        let navigation = app.capture_main_list_navigation(
+            MainHistoryOperation::Replay(Box::new(plan)),
+            MainListSourceProof::Row,
         );
+        assert!(app.dispatch_folder_history_entry(target, navigation));
+        app.settle_open_path_classification_for_test();
+        let (sender, payload) = hold_zip_preflight(&mut app, &x);
+        let Some(HistoryNavigationTransition::Physical(request)) =
+            app.top_level_grid_view.history_navigation_transition()
+        else {
+            unreachable!()
+        };
+        let request_id = request.request_id;
+        assert!(matches!(
+            request.navigation.history,
+            MainHistoryOperation::Replay(_)
+        ));
+        assert!(request.dfs_continuation.is_none());
+        let back = app.folder_nav_back_stack.clone();
+        let forward = app.folder_nav_forward_stack.clone();
+        let nav_stack = app.tag_view.nav_stack.clone();
+
+        assert!(app.route_tag_view_grid_book_navigation(&ctx, true));
+        assert!(app.folder_nav_pending.is_none());
+        assert_eq!(app.pending_folder_nav_steps, 0);
+        assert_eq!(app.effective_folder(), Some(a.clone()));
+        assert_eq!(app.tag_view.nav_stack, nav_stack);
+        assert_eq!(app.folder_nav_back_stack, back);
+        assert_eq!(app.folder_nav_forward_stack, forward);
+        assert!(
+            matches!(app.top_level_grid_view.history_navigation_transition(),
+            Some(HistoryNavigationTransition::Physical(request)) if request.request_id == request_id
+                && matches!(request.navigation.history, MainHistoryOperation::Replay(_)))
+        );
+        assert!(
+            sender.send(Ok(payload)).is_ok(),
+            "accepted Replay was retired"
+        );
+        settle(&mut app, &ctx);
+        assert_eq!(app.effective_folder(), Some(x));
+        assert!(app.folder_nav_pending.is_none());
         assert!(
             app.top_level_grid_view
                 .history_navigation_transition()
                 .is_none()
         );
-        let result = receive_grid(&mut app, &b);
-        adopt_grid(&mut app, &ctx, result);
-        settle(&mut app, &ctx);
-        assert_destination(&app, route, &a, &b, false);
+        assert!(app.fullscreen_idx.is_none());
     }
+}
+
+#[test]
+fn tag_view_open_supersession_tag_refuses_current_view_order_refresh_and_keeps_new_order() {
+    let mut app = setup_app();
+    // Keep this folder outside setup_app's compiled-books root, where Numeric is fixed.
+    let root = app.tmp.path().join("library");
+    let (a, _, _) = fixture(&mut app, &root, GridRoute::TagListOrder, false);
+    let ctx = egui::Context::default();
+    for (name, modified_secs) in [("page.png", 1_600_000_000), ("z.png", 1_700_000_000)] {
+        let path = a.join(name);
+        image::RgbImage::new(2, 2).save(&path).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(modified_secs)),
+            )
+            .unwrap();
+    }
+    app.items.push(GridItem::Image(a.join("z.png")));
+    app.visible_indices.push(2);
+    app.image_metas.push(None);
+    app.thumbnails.push(ThumbnailState::Pending);
+    let image_paths = |app: &App| {
+        app.items
+            .iter()
+            .filter_map(|item| match item {
+                GridItem::Image(path) => Some(path.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(image_paths(&app), [a.join("page.png"), a.join("z.png")]);
+    app.settings.sort_order = crate::settings::SortOrder::DateDesc;
+    app.apply_sort_change_reload_without_ui_io();
+    let pending = app
+        .folder_pane_open_pending
+        .as_mut()
+        .expect("sort refresh scan");
+    assert!(matches!(
+        pending.purpose,
+        FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+    ));
+    let scan = pending
+        .rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("real sort scan");
+    assert!(scan.is_ok());
+    let cancel = pending.cancel.clone();
+    let (sender, receiver) = mpsc::channel();
+    pending.rx = receiver;
+    let nav_stack = app.tag_view.nav_stack.clone();
+
+    assert!(app.route_tag_view_grid_book_navigation(&ctx, true));
+    assert!(app.folder_nav_pending.is_none());
+    assert_eq!(app.pending_folder_nav_steps, 0);
+    assert_eq!(app.effective_folder(), Some(a.clone()));
+    assert_eq!(app.tag_view.nav_stack, nav_stack);
+    assert!(!cancel.load(Ordering::Relaxed));
+    assert!(Arc::ptr_eq(
+        &app.folder_pane_open_pending.as_ref().unwrap().cancel,
+        &cancel,
+    ));
+    assert!(
+        sender.send(scan).is_ok(),
+        "sort refresh receiver was retired"
+    );
+    let ready = app
+        .poll_folder_pane_open(&ctx)
+        .expect("held sort scan remains current");
+    #[cfg(windows)]
+    assert!(app.resolve_main_folder_open_ready(&ctx, ready).is_none());
+    #[cfg(not(windows))]
+    match ready.purpose {
+        FolderOpenScanPurpose::CurrentViewOrderRefresh {
+            order,
+            reload_owner,
+        } => {
+            assert!(app.apply_current_view_order_refresh(
+                ready.path,
+                ready.scan.unwrap(),
+                order,
+                *reload_owner,
+            ));
+        }
+        _ => panic!("sort scan purpose changed"),
+    }
+    app.finish_page_identity_preparation_for_test();
+    settle(&mut app, &ctx);
+    assert_eq!(image_paths(&app), [a.join("z.png"), a.join("page.png")]);
+    assert_eq!(app.effective_folder(), Some(a));
+    assert!(app.folder_pane_open_pending.is_none());
+    assert!(app.folder_nav_pending.is_none());
+    assert!(!cancel.load(Ordering::Relaxed));
+}
+
+#[test]
+fn tag_view_open_supersession_tag_accepts_and_retires_direct_navigation_scan() {
+    let mut app = setup_app();
+    let root = app.tmp.path().to_owned();
+    let (a, b, _) = fixture(&mut app, &root, GridRoute::TagListOrder, false);
+    let ctx = egui::Context::default();
+    let target = root.join("independent-folder");
+    std::fs::create_dir_all(&target).unwrap();
+    image::RgbImage::new(2, 2)
+        .save(target.join("page.png"))
+        .unwrap();
+    app.open_direct_navigation_target_at_stage(
+        target.clone(),
+        None,
+        OpenRequestOwner::Navigation,
+        None,
+        None,
+        StartupListIntent::ExplicitList,
+        MainListRequestStage::Admission,
+        DirectoryScanRoute::Worker,
+    );
+    app.settle_open_path_classification_for_test();
+    assert_eq!(app.effective_folder(), Some(a.clone()));
+    assert!(app.direct_navigation_scan_pending());
+    let pending = app
+        .folder_pane_open_pending
+        .as_mut()
+        .expect("direct-navigation scan");
+    assert_eq!(pending.path, target);
+    assert!(matches!(
+        pending.purpose,
+        FolderOpenScanPurpose::DirectNavigation
+    ));
+    let scan = pending
+        .rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("real direct scan");
+    assert!(scan.is_ok());
+    let cancel = pending.cancel.clone();
+    let (sender, receiver) = mpsc::channel();
+    pending.rx = receiver;
+
+    start_grid(&mut app, &ctx, &a, GridRoute::TagListOrder);
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(app.folder_pane_open_pending.is_none());
+    assert!(
+        sender.send(scan).is_err(),
+        "old DirectNavigation receiver survived"
+    );
+    let result = receive_grid(&mut app, &b);
+    adopt_grid(&mut app, &ctx, result);
+    settle(&mut app, &ctx);
+    assert_destination(&app, GridRoute::TagListOrder, &a, &b, false);
 }
 
 #[test]
@@ -414,6 +642,17 @@ fn tag_view_open_supersession_ordinary_zip_retires_grid_hydration_tail_only() {
             .expect("real folder adoption must hydrate before finishing DFS")
             .cancel_for_test();
         let generation = app.items_generation;
+
+        assert!(app.route_tag_view_grid_book_navigation(&ctx, false));
+        assert!(app.folder_nav_pending.is_none());
+        assert_eq!(app.pending_folder_nav_steps, 0);
+        assert!(app.main_list_folder_navigation_adoption_pending());
+        assert_eq!(app.effective_folder(), Some(b.clone()));
+        assert!(Arc::ptr_eq(
+            &app.sidecar_restore.as_ref().unwrap().cancel_for_test(),
+            &hydration_cancel,
+        ));
+        assert!(!hydration_cancel.load(Ordering::Relaxed));
 
         let (sender, payload) = ordinary_open(&mut app, &x);
         assert!(

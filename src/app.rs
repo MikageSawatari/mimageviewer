@@ -1465,6 +1465,48 @@ pub(super) enum MainListRequestOwner {
     Subfolder,
 }
 
+/// One transient inventory for main admission and native retirement. This is not stored
+/// request state. Display work participates in admission without gaining new cancellation.
+#[derive(Clone, Copy)]
+enum MainListRequestKind {
+    PaneClose,
+    GridTraversal,
+    UnresolvedOpen,
+    CloseReturn,
+    Tag,
+    Native(MainListRequestOwner),
+    Bookmark,
+    DirectDocument,
+    Hydration,
+    Reload,
+    ExternalRescan,
+    FolderRefresh,
+}
+
+impl MainListRequestKind {
+    // Preserve the existing retirement order, including unconditional native cleanup.
+    const ALL: [Self; 18] = [
+        Self::PaneClose,
+        Self::GridTraversal,
+        Self::UnresolvedOpen,
+        Self::CloseReturn,
+        Self::Tag,
+        Self::Native(MainListRequestOwner::Classification),
+        Self::Native(MainListRequestOwner::Physical),
+        Self::Native(MainListRequestOwner::Rating),
+        Self::Native(MainListRequestOwner::Pane),
+        Self::Native(MainListRequestOwner::Smart),
+        Self::Native(MainListRequestOwner::Collection),
+        Self::Native(MainListRequestOwner::Subfolder),
+        Self::Bookmark,
+        Self::DirectDocument,
+        Self::Hydration,
+        Self::Reload,
+        Self::ExternalRescan,
+        Self::FolderRefresh,
+    ];
+}
+
 /// Only request acceptance may supersede an unresolved startup/activation target.
 /// Format handoffs retain native cleanup and list intent; this argument is never stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36296,6 +36338,73 @@ impl App {
         }
     }
 
+    /// Read-only companion to native main retirement. Every request blocks tag ListOrder;
+    /// its origin/history policy is irrelevant. DirectNavigation's scan is the sole exception.
+    pub(crate) fn main_list_request_blocks_grid_list_order(&self) -> bool {
+        self.main_folder_history_available()
+            && MainListRequestKind::ALL.into_iter().any(|kind| match kind {
+                MainListRequestKind::PaneClose => self.folder_tree_pane_close_navigation_pending(),
+                MainListRequestKind::GridTraversal => self.folder_nav_pending.is_some(),
+                MainListRequestKind::UnresolvedOpen => self.main_unresolved_open_pending(),
+                MainListRequestKind::CloseReturn => {
+                    self.pending_return_to_parent.has_accepted_request()
+                }
+                MainListRequestKind::Tag => self.tag_view_pending.is_some(),
+                MainListRequestKind::Native(owner) => match owner {
+                    MainListRequestOwner::Classification => self
+                        .top_level_grid_view
+                        .open_path_classification()
+                        .is_some(),
+                    MainListRequestOwner::Physical => self
+                        .top_level_grid_view
+                        .history_navigation_transition()
+                        .is_some(),
+                    MainListRequestOwner::Rating => self.rating_view_pending.is_some(),
+                    MainListRequestOwner::Pane => {
+                        self.folder_pane_open_pending.is_some()
+                            && !self.direct_navigation_scan_pending()
+                    }
+                    MainListRequestOwner::Smart => {
+                        self.smart_folder_opening_pending()
+                            || self.smart_folder_pending.is_some()
+                            || self.smart_folder_prepare_pending.is_some()
+                            || self.smart_folder_confirm_pending.is_some()
+                    }
+                    MainListRequestOwner::Collection => {
+                        self.top_level_grid_view.collection_navigation_pending()
+                    }
+                    MainListRequestOwner::Subfolder => {
+                        self.subfolder_expansion_pending.is_some()
+                            || self.subfolder_expansion_install_pending.is_some()
+                            || self.subfolder_expansion_confirm_pending.is_some()
+                    }
+                },
+                MainListRequestKind::Bookmark => self.bookmark_open_pending.is_some(),
+                MainListRequestKind::DirectDocument => {
+                    self.pdf_enumerate_pending.is_some()
+                        || self.pdf_password_request.is_some()
+                        || self.epub_convert.is_some()
+                        || self.book_deferred_open_wait_active()
+                }
+                MainListRequestKind::Hydration => {
+                    self.sidecar_restore_blocks_projected_context()
+                        || self.zip_enumerate_pending.is_some()
+                }
+                MainListRequestKind::Reload => self.pending_reload,
+                MainListRequestKind::ExternalRescan => self
+                    .external_rescan_pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.owner_context_id == self.viewer_context_main()),
+                MainListRequestKind::FolderRefresh => {
+                    self.folder_refresh_pending.as_ref().is_some_and(|request| {
+                        self.pending_folder_refresh_target().is_some_and(|target| {
+                            crate::folder_tree::path_eq(&target, &request.folder)
+                        })
+                    })
+                }
+            })
+    }
+
     /// Retire unadopted sibling requests after admission succeeds. A phase handoff retains its
     /// native owner; the mounted source, committed cursor and warm verifier remain unchanged.
     pub(super) fn retire_replaced_main_list_requests(
@@ -36313,53 +36422,72 @@ impl App {
         if !self.main_folder_history_available() {
             return;
         }
-        if explicit_request {
-            self.retire_folder_tree_pane_close_navigation();
-            self.retire_main_grid_folder_navigation_for_admission();
-        }
-        self.cancel_unresolved_open_for_navigation(explicit_request);
-        self.retire_close_returns_for_main_admission();
-        // タグ結果の再検索中に子の open 等を受理したら、遅着した root 結果で
-        // 新しい行き先を上書きしない。タグ自身の採用時は poll が既に take 済み。
-        if let Some(pending) = self.tag_view_pending.take() {
-            pending.cancel();
-        }
-        if retained != Some(MainListRequestOwner::Classification) {
-            self.top_level_grid_view.set_open_path_classification(None);
-        }
-        if retained != Some(MainListRequestOwner::Physical) {
-            self.replace_history_navigation_transition(None);
-        }
-        if retained != Some(MainListRequestOwner::Rating)
-            && self
-                .rating_view_pending
-                .as_ref()
-                .is_some_and(|pending| pending.navigation.is_some())
-            && let Some(pending) = self.rating_view_pending.take()
-        {
-            pending.cancel();
-        }
-        if retained != Some(MainListRequestOwner::Pane) || self.direct_navigation_scan_pending() {
-            self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
-        }
-        if retained != Some(MainListRequestOwner::Smart) {
-            self.retire_staged_smart_navigation_for_independent_intent();
-        }
-        if retained != Some(MainListRequestOwner::Collection)
-            && self.top_level_grid_view.collection_navigation_pending()
-        {
-            self.cancel_collection_navigation_intent();
-        }
-        if retained != Some(MainListRequestOwner::Subfolder) {
-            self.cancel_subfolder_expansion_pending();
-        }
-        if retained.is_none() {
-            self.retire_main_bookmark_open_for_surface_switch();
-        }
-        if retained != Some(MainListRequestOwner::Classification) {
-            // A suffix classification is not yet file admission: Ignore may reject it, or
-            // metadata may prove a directory. Its accepted continuation retires cold PDF.
-            self.retire_direct_document_open_for_history_admission();
+        // Iterate the same inventory as the read-only admission query. Do not skip an
+        // inactive entry: native cleanup also retires progress and sibling return owners.
+        for kind in MainListRequestKind::ALL {
+            match kind {
+                MainListRequestKind::PaneClose if explicit_request => {
+                    self.retire_folder_tree_pane_close_navigation();
+                }
+                MainListRequestKind::GridTraversal if explicit_request => {
+                    self.retire_main_grid_folder_navigation_for_admission();
+                }
+                MainListRequestKind::UnresolvedOpen => {
+                    self.cancel_unresolved_open_for_navigation(explicit_request);
+                }
+                MainListRequestKind::CloseReturn => self.retire_close_returns_for_main_admission(),
+                MainListRequestKind::Tag => {
+                    if let Some(pending) = self.tag_view_pending.take() {
+                        pending.cancel();
+                    }
+                }
+                MainListRequestKind::Native(owner) => match owner {
+                    MainListRequestOwner::Classification if retained != Some(owner) => {
+                        self.top_level_grid_view.set_open_path_classification(None);
+                    }
+                    MainListRequestOwner::Physical if retained != Some(owner) => {
+                        self.replace_history_navigation_transition(None);
+                    }
+                    MainListRequestOwner::Rating if retained != Some(owner) => {
+                        if self
+                            .rating_view_pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.navigation.is_some())
+                            && let Some(pending) = self.rating_view_pending.take()
+                        {
+                            pending.cancel();
+                        }
+                    }
+                    MainListRequestOwner::Pane
+                        if retained != Some(owner) || self.direct_navigation_scan_pending() =>
+                    {
+                        self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
+                    }
+                    MainListRequestOwner::Smart if retained != Some(owner) => {
+                        self.retire_staged_smart_navigation_for_independent_intent();
+                    }
+                    MainListRequestOwner::Collection
+                        if retained != Some(owner)
+                            && self.top_level_grid_view.collection_navigation_pending() =>
+                    {
+                        self.cancel_collection_navigation_intent();
+                    }
+                    MainListRequestOwner::Subfolder if retained != Some(owner) => {
+                        self.cancel_subfolder_expansion_pending();
+                    }
+                    _ => {}
+                },
+                MainListRequestKind::Bookmark if retained.is_none() => {
+                    self.retire_main_bookmark_open_for_surface_switch();
+                }
+                MainListRequestKind::DirectDocument
+                    if retained != Some(MainListRequestOwner::Classification) =>
+                {
+                    self.retire_direct_document_open_for_history_admission();
+                }
+                // These entries only block ListOrder. Preserve native retirement policy.
+                _ => {}
+            }
         }
     }
 
@@ -36400,10 +36528,6 @@ impl App {
     /// Retire an unfinished direct owner before admitting a staged request from its visible source.
     fn retire_direct_document_open_for_history_admission(&mut self) {
         self.retire_book_deferred_open();
-        self.retire_cold_pdf_candidate();
-    }
-
-    fn retire_cold_pdf_candidate(&mut self) {
         let Some(mut pending) = self.pdf_enumerate_pending.take() else {
             return;
         };
@@ -47662,6 +47786,15 @@ impl App {
     ///
     /// メイン viewer 中に `load_folder` すると表示が閉じてしまうため、呼び出し側は
     /// `viewer_session_blocks_main_window()` が false のときだけ実行する。
+    fn pending_folder_refresh_target(&self) -> Option<PathBuf> {
+        let request = self.folder_refresh_pending.as_ref()?;
+        if request.cause.is_append_delivery() || self.current_folder_is_book_folder() {
+            self.current_folder.clone()
+        } else {
+            self.current_favorite_target()
+        }
+    }
+
     pub(crate) fn consume_folder_refresh_pending(&mut self, ctx: &egui::Context) {
         if !self.folder_observation_allowed() {
             self.retire_passive_folder_observation();
@@ -47692,11 +47825,7 @@ impl App {
             .folder_refresh_pending
             .as_ref()
             .is_some_and(|request| request.cause.is_append_delivery());
-        let Some(cur) = (if append || self.current_folder_is_book_folder() {
-            self.current_folder.clone()
-        } else {
-            self.current_favorite_target()
-        }) else {
+        let Some(cur) = self.pending_folder_refresh_target() else {
             return;
         };
         let Some(target) = self.folder_refresh_pending.take() else {
@@ -60453,108 +60582,6 @@ impl App {
         // decides whether a replacement request or a terminal finish releases it.
     }
 
-    /// A grid traversal replaces separate explicit opens, not its own adoption tail or a
-    /// same-list refresh. Keep the native request types as the source of this distinction.
-    fn retire_explicit_main_opens_for_grid_traversal(&mut self) {
-        fn explicit_open_intent(intent: &StartupListIntent) -> bool {
-            matches!(
-                intent,
-                StartupListIntent::ExplicitList
-                    | StartupListIntent::ClassifyFolder
-                    | StartupListIntent::PageContinuation
-            )
-        }
-        fn separate_open_navigation(navigation: &MainListNavigation) -> bool {
-            // A normal open inside a search uses Restore, so Direct alone is insufficient.
-            !matches!(
-                navigation.history,
-                MainHistoryOperation::SameLocation | MainHistoryOperation::Replay(_)
-            )
-        }
-        fn main_open_owner(owner: &OpenRequestOwner) -> bool {
-            match owner {
-                OpenRequestOwner::DetachedGridArchive(_) => false,
-                #[cfg(windows)]
-                OpenRequestOwner::Bookmark(bookmark) => bookmark.detached_lease.is_none(),
-                _ => true,
-            }
-        }
-
-        let main = self.viewer_context_main();
-        if self
-            .top_level_grid_view
-            .open_path_classification()
-            .is_some_and(|request| {
-                request.context == main
-                    && request
-                        .navigation
-                        .as_ref()
-                        .is_some_and(separate_open_navigation)
-                    && match request.continuation.as_deref() {
-                        Some(
-                            ClassifiedOpenContinuation::Direct {
-                                owner,
-                                restore_intent,
-                                ..
-                            }
-                            | ClassifiedOpenContinuation::DirectNavigation {
-                                owner,
-                                restore_intent,
-                                ..
-                            }
-                            | ClassifiedOpenContinuation::DirectScan {
-                                owner,
-                                restore_intent,
-                                ..
-                            },
-                        ) => main_open_owner(owner) && explicit_open_intent(restore_intent),
-                        Some(ClassifiedOpenContinuation::SmartGrid { restore_intent, .. }) => {
-                            explicit_open_intent(restore_intent)
-                        }
-                        Some(ClassifiedOpenContinuation::Physical {
-                            dfs_continuation,
-                            restore_intent,
-                            ..
-                        }) => dfs_continuation.is_none() && explicit_open_intent(restore_intent),
-                        _ => false,
-                    }
-            })
-        {
-            self.top_level_grid_view.set_open_path_classification(None);
-        }
-        if matches!(self.top_level_grid_view.history_navigation_transition(),
-            Some(HistoryNavigationTransition::Physical(request))
-                if request.source_context == main
-                    && request.dfs_continuation.is_none()
-                    && separate_open_navigation(&request.navigation)
-                    && explicit_open_intent(&request.restore_intent))
-        {
-            self.replace_history_navigation_transition(None);
-        }
-        if self
-            .folder_pane_open_pending
-            .as_ref()
-            .is_some_and(|request| {
-                matches!(
-                    request.purpose,
-                    FolderOpenScanPurpose::PaneNavigation
-                        | FolderOpenScanPurpose::DirectNavigation
-                        | FolderOpenScanPurpose::JumpToPhysicalFolder { .. }
-                        | FolderOpenScanPurpose::RequiredFullscreenTarget { .. }
-                )
-            })
-        {
-            self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
-        }
-        if self.pdf_enumerate_pending.as_ref().is_some_and(|pending| {
-            main_open_owner(&pending.3)
-                && matches!(&pending.5, PdfOpenPhase::ColdCandidate { restore_intent, .. }
-                    if explicit_open_intent(restore_intent))
-        }) {
-            self.retire_cold_pdf_candidate();
-        }
-    }
-
     /// Retire the old grid request at a successful, explicit main admission.
     /// Hydrated rows remain adopted; only their obsolete navigation tail is removed.
     /// Classification/physical preflights are retired by the existing main arbiter.
@@ -60617,14 +60644,17 @@ impl App {
         if self.viewer_mutation_modal_active() {
             return;
         }
-        if matches!(
-            mode,
-            FolderNavMode::ListOrder {
-                fullscreen: false,
-                ..
-            }
-        ) && (self.folder_nav_pending.is_some()
-            || self.main_list_folder_navigation_adoption_pending())
+        if let FolderNavMode::ListOrder {
+            snapshot,
+            fullscreen: false,
+            ..
+        } = &mode
+            && (if matches!(snapshot.scope, ListOrderScope::Tag { .. }) {
+                self.main_list_request_blocks_grid_list_order()
+            } else {
+                self.folder_nav_pending.is_some()
+                    || self.main_list_folder_navigation_adoption_pending()
+            })
         {
             crate::logger::log(
                 "[grid-nav] refused list-order request while folder navigation awaits adoption",
@@ -60675,9 +60705,7 @@ impl App {
             }
         }
         // 新しい nav 列開始: アキュームレータをリセットしてから spawn
-        if mode.is_grid_traversal() && self.main_folder_history_available() {
-            self.retire_explicit_main_opens_for_grid_traversal();
-        } else if self.direct_navigation_scan_pending() {
+        if self.direct_navigation_scan_pending() {
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
         }
         self.pending_folder_nav_steps = 0;

@@ -1,6 +1,18 @@
 use super::*;
 use miv_startup::{Lane, Outcome, Stage, WatchHandle, WatchSlot, event_span};
 
+fn unresolved_open_owner_is_main(owner: &StartupOpenPathOwner) -> bool {
+    #[cfg(windows)]
+    if matches!(owner, StartupOpenPathOwner::Bookmark(owner)
+        if owner.detached_lease.is_some())
+    {
+        return false;
+    }
+    #[cfg(not(windows))]
+    let _ = owner;
+    true
+}
+
 /// Diagnostics for this existing resolver request, through UI acceptance/refusal.
 /// This is not the lifetime of downstream async enumeration or conversion.
 pub(super) struct InitialNavigationTrace {
@@ -1248,6 +1260,21 @@ impl App {
         }
     }
 
+    /// Include main targets held behind an independently owned resolver without consuming them.
+    pub(super) fn main_unresolved_open_pending(&self) -> bool {
+        if self.startup_open_path.is_some() {
+            return true;
+        }
+        let mut pending = self.startup_open_path_resolve_pending.as_ref();
+        while let Some(request) = pending {
+            if unresolved_open_owner_is_main(&request.owner) {
+                return true;
+            }
+            pending = request.held_resolve_for_activation_admission.as_deref();
+        }
+        false
+    }
+
     /// New Local requests replace unresolved main opens, including a target still waiting for
     /// modal admission. Reloads keep both deferred and resolving targets after Remote returns.
     pub(crate) fn cancel_unresolved_open_for_navigation(&mut self, explicit_request: bool) {
@@ -1266,10 +1293,7 @@ impl App {
     ) -> Option<StartupOpenPathResolvePending> {
         let held = pending.held_resolve_for_activation_admission.take();
         let held = held.and_then(|held| self.retire_unresolved_main_open_pending(*held));
-        #[cfg(windows)]
-        if matches!(&pending.owner, StartupOpenPathOwner::Bookmark(owner)
-            if owner.detached_lease.is_some())
-        {
+        if !unresolved_open_owner_is_main(&pending.owner) {
             pending.held_resolve_for_activation_admission = held.map(Box::new);
             return Some(pending);
         }

@@ -245,8 +245,7 @@ impl App {
             self.cancel_pending_folder_nav();
             return true;
         }
-        if self.folder_nav_pending.is_some() || self.main_list_folder_navigation_adoption_pending()
-        {
+        if self.main_list_request_blocks_grid_list_order() {
             crate::logger::log(
                 "[grid-nav] refused list-order request while folder navigation awaits adoption",
             );
