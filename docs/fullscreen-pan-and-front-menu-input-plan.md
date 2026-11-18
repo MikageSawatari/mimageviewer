@@ -1,6 +1,6 @@
 # 全画面のパンの制限と前面メニュー中のキー入力 (§1.806・§1.807・§1.810) 設計書
 
-- 状態: 独立実装レビューround 3のP2を修正し、対象22件・core check成功（2026-11-19、§6.8、基点 `aa5763c22`）。先行する§6.6・§6.7の裁定①反映と対象297件・core checkの成功履歴は§6.5。未コミット、再レビュー／全件gate／実機検収は設計担当の後続工程。実装前の独立レビュー: 案 B は r4 で ACCEPT、§1.810 を案 C (記録を持たず毎回収める) へ切り替えて r5〜r7 は REVISE、r8 で ACCEPT (§7)。
+- 状態: **実装済み・独立実装レビュー ACCEPT (§8)・本体 lib 全件成功 (18849 件、2026-11-19)**。`fix-fs-pan-input-806-807-810` ブランチで master 未統合・実機未確認。実装前の独立レビュー: 案 B は r4 で ACCEPT、§1.810 を案 C (記録を持たず毎回収める) へ切り替えて r5〜r7 は REVISE、r8 で ACCEPT (§7)。
 - ブランチ: `fix-fs-pan-input-806-807-810` (作業ツリー `G:\home\mimageviewer-474`、master 605ba335b 起点)。
 - 担当: 設計・検収 = ClaudeCode Opus 5.5 / high、実装 = Codex gpt-6.1-sol / high、独立レビュー = 別の gpt-6.1-sol / xhigh。
 - 元の項目: [next-release-backlog.md](next-release-backlog.md) の §1.806・§1.807・§1.810。どれも §1.474 ([fullscreen-in-page-scroll-plan.md](fullscreen-in-page-scroll-plan.md)) の作業中に見つかった既存の問題。
@@ -456,9 +456,9 @@ WIPは設計担当が `ff2abdf5a` としてコミットし、実装担当はそ�
 境界の4件と `prepare_boundary_tests`・`nonfinal_tests` の成功結果は§6.5に記録した。
 裁定①どおりの実装と検証を完了し、この停止事項は解消した。
 
-### 6.8 独立実装レビューround 3のP2: 小さいページと丸め許容（2026-11-19）
+### 6.8 独立実装レビュー r1 の P2: 小さいページと丸め許容（2026-11-19）
 
-別担当Sol / xhighの実装レビューはP1なし・P2 1件でREVISE。設計担当のコミット `aa5763c22` を基点に修正した。
+別担当Sol / xhighの実装レビュー r1 はP1なし・P2 1件でREVISE。設計担当のコミット `aa5763c22` を基点に修正した。
 従来の2物理pxの許容は可視部分の有無を問わず補正を捨てたため、原寸・倍率0.1・1000×10・pan=(301,0)で
 90°回転後に幅1pxの矩形が[601,602]へ出ても、補正(-2,0)を捨てていた。
 
@@ -487,7 +487,21 @@ git diff --check
 共有full lockを待った後、sandbox警告付きの低優先度・6並列で実行した。
 ログは `target/806-r4-snap-tests.{stdout,stderr}.log` と `target/806-review-r4-check.{stdout,stderr}.log`。
 最終の引数なし `cargo fmt` と `git diff --check` も成功。変更したRustの2ファイルは整形前後のSHA-256が一致し、テスト・checkの対象ソースを維持している。
-コミット・lib全件・build-dev・製品起動は行わない。
+コミット・lib全件・build-dev・製品起動は行わない (設計担当が `d8a56f418` としてコミット)。
+
+
+### 6.9 設計担当の全件確認（2026-11-19）
+
+- 本体 lib 全件 (`.\scripts\test-lib-full.ps1`、`run-heavy.ps1 -FullTest` 経由、`d8a56f418`): **18849 件成功・失敗 0・86 件 skip** (1192 秒)。
+- `.\scripts\build-dev.ps1` (`run-heavy.ps1` 経由): 実機確認用の dev-runtime ビルドを作成。製品の起動はしていない。
+
+## 8. 独立実装レビュー
+
+実装担当とは別の Sol / xhigh (read-only) が `git diff e851d76a2 aa5763c22` 以降を確認した。
+
+- r1 (`aa5763c22`): REVISE。P1 なし。P2: 2 物理 px の丸め許容が、回転後に幅 1px で完全に画面外へ出たページの補正 (-2,0) まで捨てる → 許容は表示単位と viewport の正の交差がある場合に限る (§6.8、`d8a56f418`)。
+  detached について「症状パッチではなく構造的修正」であることに合意 (既存の context swap と配送先選択を使い、描画の所有境界で自身のパンを確定する。述語・viewport 配送経路の変更、兄弟 context への書き込み、新しい同期 I/O・待機・retry・追加 repaint は無い)。
+- r2 (`d8a56f418`、同じ担当): **ACCEPT**。P2 は解消、新しい指摘なし。
 
 ## 7. 実装前の独立レビュー
 
