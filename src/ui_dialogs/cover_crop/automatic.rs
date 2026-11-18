@@ -18,6 +18,7 @@ pub(super) enum AutoStop {
     Source(AutoCoverSkip),
     EditPreview,
     PageAspect(PageAspectDecline),
+    ReadFailed,
     AnalysisFailed,
 }
 
@@ -154,8 +155,8 @@ fn stop_text(stop: AutoStop) -> &'static str {
         AutoStop::Source(AutoCoverSkip::FolderDisabled) => {
             "画像フォルダの本は自動の対象にしていません (環境設定で変えられます)"
         }
-        AutoStop::Source(AutoCoverSkip::DirectRar) => "変換前の RAR は自動の対象外です",
         AutoStop::Source(AutoCoverSkip::NestedZip) => "ZIP の中の ZIP は自動の対象外です",
+        AutoStop::ReadFailed => "本文のページを読めませんでした",
         AutoStop::AnalysisFailed => "表紙を解析できませんでした",
         AutoStop::PageAspect(PageAspectDecline::TooFew) => {
             "本文ページの形が決まりません (ページが少ない)"
@@ -307,14 +308,11 @@ mod tests {
                 "画像フォルダの本は自動の対象にしていません (環境設定で変えられます)",
             ),
             (
-                AutoStop::Source(AutoCoverSkip::DirectRar),
-                "変換前の RAR は自動の対象外です",
-            ),
-            (
                 AutoStop::Source(AutoCoverSkip::NestedZip),
                 "ZIP の中の ZIP は自動の対象外です",
             ),
             (AutoStop::AnalysisFailed, "表紙を解析できませんでした"),
+            (AutoStop::ReadFailed, "本文のページを読めませんでした"),
             (
                 AutoStop::PageAspect(PageAspectDecline::TooFew),
                 "本文ページの形が決まりません (ページが少ない)",

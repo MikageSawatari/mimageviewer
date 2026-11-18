@@ -451,3 +451,66 @@ fn evaluation_book_list_binding_parser_keeps_default_and_rejects_invalid_values(
     assert_eq!(parse_binding(Some("ltr")), Ok(ReadingDirection::Ltr));
     assert!(parse_binding(Some("other")).is_err());
 }
+
+#[test]
+fn evaluation_book_list_accepts_real_rar_and_cbr_with_shared_body_sampler() {
+    let temp = temporary();
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata/archives/cover-auto-rar/jacket.rar");
+    let rar = temp.path().join("book.rar");
+    let cbr = temp.path().join("book.cbr");
+    std::fs::copy(&fixture, &rar).unwrap();
+    std::fs::copy(&fixture, &cbr).unwrap();
+    let input = temp.path().join("books.json");
+    list(&input, &[rar.clone(), cbr.clone()]);
+    let options = Options {
+        thumbs: true,
+        rotation_db: Some(temp.path().join("rotations.db")),
+        ..Default::default()
+    };
+    let baseline = temp.path().join("baseline");
+    evaluate(
+        &input,
+        &baseline,
+        false,
+        FallbackConfig::default(),
+        &options,
+    )
+    .unwrap();
+    let baseline = summary(&baseline);
+    assert_eq!(baseline["failed"], 0);
+    assert_eq!(baseline["cropped"], 2);
+    assert_eq!(baseline["algorithms"], json!(["autocrop:v4r"]));
+    for row in baseline["rows"].as_array().unwrap() {
+        assert_eq!(row["kind"], "rar");
+        assert_eq!(row["algorithm"], "autocrop:v4r");
+        assert!(row["page_aspect"].as_f64().unwrap() > 0.0);
+        assert!(!row["current_crop"].is_null());
+        assert_frame(&temp.path().join("baseline"), row, "current_crop", false);
+    }
+
+    let rotations =
+        crate::rotation_db::RotationDb::open_at(options.rotation_db.as_ref().unwrap()).unwrap();
+    for archive in [&rar, &cbr] {
+        for page in 1..=8 {
+            let entry = format!("{page:03}.png");
+            rotations
+                .set_key(
+                    &crate::adjustment_db::zip_entry_key(archive, &entry),
+                    Rotation::Cw90,
+                )
+                .unwrap();
+        }
+    }
+    drop(rotations);
+    let output = temp.path().join("body-rotated");
+    evaluate(&input, &output, false, FallbackConfig::default(), &options).unwrap();
+    let rotated = summary(&output);
+    assert_eq!(rotated["failed"], 0);
+    assert_eq!(rotated["cropped"], 0);
+    for row in rotated["rows"].as_array().unwrap() {
+        assert_eq!(row["rotation"], 0);
+        assert_eq!(row["page_aspect_decline"], "landscape");
+        assert!(row["current_crop"].is_null());
+    }
+}

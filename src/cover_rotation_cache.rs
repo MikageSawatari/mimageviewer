@@ -27,6 +27,9 @@ impl BookCoverId {
         let normal = |path: PathBuf| PathBuf::from(crate::adjustment_db::normalize_path(&path));
         match self {
             Self::Pdf(path) => Self::Pdf(normal(path)),
+            Self::Zip { path, prefix: None } if crate::rar_loader::is_rar_path(&path) => {
+                Self::Archive(normal(path))
+            }
             Self::Zip { path, prefix } => Self::Zip {
                 path: normal(path),
                 prefix: prefix.map(|prefix| prefix.to_lowercase()),
@@ -37,32 +40,35 @@ impl BookCoverId {
     }
     pub(crate) fn from_grid_item(item: &GridItem) -> Option<Self> {
         let path = |p: &Path| PathBuf::from(crate::adjustment_db::normalize_path(p));
-        Some(match item {
-            GridItem::PdfFile(p) | GridItem::PdfPage { pdf_path: p, .. } => Self::Pdf(path(p)),
-            GridItem::ZipFile(p) | GridItem::ZipImage { zip_path: p, .. } => Self::Zip {
-                path: path(p),
-                prefix: None,
-            },
-            GridItem::ZipDir {
-                zip_path,
-                dir_prefix,
-                ..
-            } => Self::Zip {
-                path: path(zip_path),
-                prefix: Some(dir_prefix.to_lowercase()),
-            },
-            GridItem::ConvertibleArchive { path: p, .. } => Self::Archive(path(p)),
-            GridItem::Folder(p) => Self::Folder(path(p)),
-            GridItem::Image(p) => Self::Folder(path(p.parent()?)),
-            GridItem::SearchContainer { path: p, kind, .. } => match kind {
-                crate::grid_item::SearchContainerKind::Folder => Self::Folder(path(p)),
-                crate::grid_item::SearchContainerKind::Zip => Self::Zip {
+        Some(
+            match item {
+                GridItem::PdfFile(p) | GridItem::PdfPage { pdf_path: p, .. } => Self::Pdf(path(p)),
+                GridItem::ZipFile(p) | GridItem::ZipImage { zip_path: p, .. } => Self::Zip {
                     path: path(p),
                     prefix: None,
                 },
-            },
-            _ => return None,
-        })
+                GridItem::ZipDir {
+                    zip_path,
+                    dir_prefix,
+                    ..
+                } => Self::Zip {
+                    path: path(zip_path),
+                    prefix: Some(dir_prefix.to_lowercase()),
+                },
+                GridItem::ConvertibleArchive { path: p, .. } => Self::Archive(path(p)),
+                GridItem::Folder(p) => Self::Folder(path(p)),
+                GridItem::Image(p) => Self::Folder(path(p.parent()?)),
+                GridItem::SearchContainer { path: p, kind, .. } => match kind {
+                    crate::grid_item::SearchContainerKind::Folder => Self::Folder(path(p)),
+                    crate::grid_item::SearchContainerKind::Zip => Self::Zip {
+                        path: path(p),
+                        prefix: None,
+                    },
+                },
+                _ => return None,
+            }
+            .normalized(),
+        )
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -390,9 +396,25 @@ fn row_belongs_to_with_slot(
     else {
         return false;
     };
-    if !["|autocrop:v4:", "|autocrop:v4f:"]
+    if !["|autocrop:v4:", "|autocrop:v4f:", "|autocrop:v4r:"]
         .iter()
         .any(|version| token.starts_with(version))
+    {
+        return false;
+    }
+    let identity = crate::cover_auto_crop::AutoCropIdentity {
+        binding: if token.ends_with(":rtl") {
+            crate::settings::ReadingDirection::Rtl
+        } else {
+            crate::settings::ReadingDirection::Ltr
+        },
+        folders: token.starts_with("|autocrop:v4f:"),
+    };
+    if token
+        != format!(
+            "|autocrop:{}",
+            crate::thumb_loader::auto_token(&header.filename, Some(scope), identity,)
+        )
     {
         return false;
     }
@@ -487,11 +509,40 @@ fn row_belongs_to_with_slot(
     };
     source_paths(hint).any(|path| {
         let full = crate::adjustment_db::normalize_path(path);
+        // Convertible archive writers include their format token. Construct
+        // that exact namespace instead of inventing archivethumb:{filename}.
+        // A retained ZipDir can be the only hint for this same outer archive.
+        if matches!(&hint.book, BookCoverId::Archive(_) | BookCoverId::Zip { prefix: Some(_), .. }) {
+            if let Some(format) = path.extension().and_then(|ext| ext.to_str())
+                .and_then(crate::archive_converter::ArchiveFormat::from_extension)
+            {
+                if [true, false].into_iter().any(|use_full_path| {
+                    (use_full_path || basename_scope(scope, path))
+                        && crate::app::convertible_archive_cache_base_key(path, format, use_full_path)
+                            .is_some_and(|source| {
+                                let key = crate::thumb_loader::representative_cache_key_for_policy_with_auto_in_archive(
+                                    &source, &Default::default(),
+                                    Some(crate::cover_auto_crop::AutoCropIdentity::new(crate::settings::ReadingDirection::Rtl)),
+                                    Some(path),
+                                );
+                                crate::thumb_loader::representative_auto_crop_key_parts(&key)
+                                    .is_some_and(|(expected, _, source_tail)| {
+                                        if source_tail.is_empty() {
+                                            matches_base_or_generation(&base, &expected.to_lowercase().replace('\\', "/"))
+                                        } else {
+                                            matches_derived_source(&base, pin, &source)
+                                        }
+                                    })
+                            })
+                }) {
+                    return true;
+                }
+            }
+        }
         let prefixes: &[&str] = if known_slot && matches!(&hint.book, BookCoverId::Archive(_)) {
-            &[
-                crate::thumb_loader::CACHE_KEY_ARCHIVE,
-                crate::thumb_loader::CACHE_KEY_ZIP,
-            ]
+            &[crate::thumb_loader::CACHE_KEY_ZIP]
+        } else if matches!(&hint.book, BookCoverId::Archive(_)) {
+            &[]
         } else {
             &[prefix]
         };
@@ -637,7 +688,8 @@ fn selected_representative(hint: &SourceHint) -> Option<String> {
                     prefix: Some(_),
                     ..
                 }
-            ) && !hint.aliases.is_empty())
+            ))
+            && !hint.aliases.is_empty()
             && same_path(&resolved_request.path, hint.book.path())
         {
             resolved_request.path = hint.aliases.first()?.clone();
@@ -840,14 +892,15 @@ pub(crate) fn run_invalidation(mut request: InvalidationRequest) -> Invalidation
                     return None;
                 };
                 let mut root = hint.clone();
-                root.book = if hint.aliases.is_empty() {
+                root.book = (if hint.aliases.is_empty() {
                     BookCoverId::Zip {
                         path: path.clone(),
                         prefix: None,
                     }
                 } else {
                     BookCoverId::Archive(path.clone())
-                };
+                })
+                .normalized();
                 root.representative_page_keys.clear();
                 root.selection = None;
                 Some(root)
@@ -1203,6 +1256,286 @@ mod tests {
             prefix: None,
         })
     }
+
+    #[test]
+    fn cover_rotation_archive_rows_use_production_format_builder_for_every_key_shape() {
+        use crate::cover_auto_crop::AutoCropIdentity;
+        use crate::folder_thumb_pins::{FolderPin, FolderPinSource, PinKeyMode};
+        for extension in ["rar", "cbr", "7z", "lzh"] {
+            let source = PathBuf::from(format!("c:/books/book.{extension}"));
+            let format =
+                crate::archive_converter::ArchiveFormat::from_extension(extension).unwrap();
+            for converted in [false, true] {
+                let physical = if converted {
+                    PathBuf::from("c:/cache/converted.zip")
+                } else {
+                    source.clone()
+                };
+                let mut hint = SourceHint::new(BookCoverId::Archive(source.clone()));
+                if converted {
+                    hint.aliases.push(physical.clone());
+                }
+                let cover = crate::adjustment_db::zip_entry_key(&physical, "cover.png");
+                let pin = FolderPin::from(FolderPinSource::ZipEntry {
+                    zip_rel: String::new(),
+                    entry: "cover.png".into(),
+                });
+                let target =
+                    crate::folder_thumb_pins::resolve_pin_target_cascaded_via_with_metadata(
+                        &source,
+                        &pin,
+                        |_| None,
+                        |_| Some((17, 23)),
+                        0,
+                    )
+                    .unwrap();
+                for full in [false, true] {
+                    let base =
+                        crate::app::convertible_archive_cache_base_key(&source, format, full)
+                            .unwrap();
+                    for pinned in [false, true] {
+                        let base = if pinned {
+                            target.pinned_cache_key(&base, PinKeyMode::Exact, None)
+                        } else {
+                            base.clone()
+                        };
+                        for policy in [
+                            crate::file_type_visibility::FileTypeVisibility::default(),
+                            crate::file_type_visibility::FileTypeVisibility {
+                                excluded_extensions: ["gif".into()].into_iter().collect(),
+                                ..Default::default()
+                            },
+                        ] {
+                            for binding in [
+                                crate::settings::ReadingDirection::Rtl,
+                                crate::settings::ReadingDirection::Ltr,
+                            ] {
+                                let key = crate::thumb_loader::representative_cache_key_for_policy_with_auto_in_archive(
+                                    &base, &policy, Some(AutoCropIdentity::new(binding)), Some(&physical),
+                                );
+                                assert!(
+                                    row_belongs_to(
+                                        &hint,
+                                        Path::new("c:/books"),
+                                        &header(&key, &cover)
+                                    ),
+                                    "{key}"
+                                );
+                                assert_eq!(
+                                    row_belongs_to(
+                                        &hint,
+                                        Path::new("c:/elsewhere"),
+                                        &header(&key, &cover)
+                                    ),
+                                    full,
+                                    "{key}"
+                                );
+                                let other = SourceHint::new(BookCoverId::Archive(PathBuf::from(
+                                    format!("c:/books/other.{extension}"),
+                                )));
+                                assert!(!row_belongs_to(
+                                    &other,
+                                    Path::new("c:/books"),
+                                    &header(&key, &cover)
+                                ));
+                                assert_eq!(
+                                    key.contains("|autocrop:v4r:"),
+                                    matches!(format, crate::archive_converter::ArchiveFormat::Rar)
+                                );
+                            }
+                        }
+                    }
+                }
+                assert!(!row_belongs_to(
+                    &hint,
+                    Path::new("c:/books"),
+                    &header(
+                        &format!("archivethumb:book.{extension}|autocrop:v4:rtl"),
+                        &cover,
+                    )
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn cover_rotation_direct_rar_without_parent_or_conversion_rows_deletes_tile_and_zipdirs() {
+        use crate::cover_auto_crop::AutoCropIdentity;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("book.rar");
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("testdata/archives/cover-auto-rar/zipdir.rar"),
+            &path,
+        )
+        .unwrap();
+        let cover = crate::adjustment_db::zip_entry_key(&path, "book/000.png");
+        let changed = crate::adjustment_db::zip_entry_key(&path, "book/001.png");
+        let expected_owner =
+            BookCoverId::Archive(PathBuf::from(crate::adjustment_db::normalize_path(&path)));
+        assert_eq!(
+            BookCoverId::from_grid_item(&GridItem::ZipImage {
+                zip_path: path.clone(),
+                entry_name: "book/001.png".into(),
+            }),
+            Some(expected_owner.clone())
+        );
+        let restored = source_hint_for_existing_page_key(&changed).unwrap();
+        assert_eq!(restored.book, expected_owner);
+        assert!(restored.aliases.is_empty());
+        let mut hint = restored;
+        hint.selection = Some(SelectionHint {
+            request: crate::thumb_loader::LoadRequest {
+                path: path.clone(),
+                auto_cover_crop: Some(AutoCropIdentity::new(
+                    crate::settings::ReadingDirection::Rtl,
+                )),
+                ..Default::default()
+            },
+            pin_db: None,
+        });
+        assert_eq!(
+            selected_representative(&hint).as_deref(),
+            Some(cover.as_str())
+        );
+        let cache = temp.path().join("cache");
+        let cover_only = run_invalidation(request(&cache, &cover, vec![hint.clone()], vec![]));
+        assert!(cover_only.pending_slots.is_empty());
+        let pending = run_invalidation(request(&cache, &changed, vec![hint], vec![]));
+        assert_eq!(
+            pending.pending_slots,
+            vec![AutoCoverSlot::new(expected_owner.clone(), cover.clone())]
+        );
+        assert!(!cache.exists());
+        let parent_db = crate::catalog::CatalogDb::open(&cache, temp.path()).unwrap();
+        let inner_db = crate::catalog::CatalogDb::open(&cache, &path).unwrap();
+        let mut keys = Vec::new();
+        for full in [false, true] {
+            let base = crate::app::convertible_archive_cache_base_key(
+                &path,
+                crate::archive_converter::ArchiveFormat::Rar,
+                full,
+            )
+            .unwrap();
+            for pin in ["", "#pin:historical"] {
+                let key =
+                    crate::thumb_loader::representative_cache_key_for_policy_with_auto_in_archive(
+                        &format!("{base}{pin}"),
+                        &Default::default(),
+                        Some(AutoCropIdentity::new(
+                            crate::settings::ReadingDirection::Rtl,
+                        )),
+                        Some(&path),
+                    );
+                parent_db
+                    .save(
+                        &key,
+                        1,
+                        2,
+                        3,
+                        4,
+                        None,
+                        b"no decode",
+                        &CoverIdentity::Page(cover.clone()),
+                        automatic(),
+                    )
+                    .unwrap();
+                keys.push((false, key));
+            }
+        }
+        for prefix in ["book/", "unheld/other/"] {
+            let key = crate::thumb_loader::representative_cache_key_for_policy_with_auto_in_archive(
+                &crate::grid_item::zipdir_cache_key(prefix),
+                &Default::default(),
+                Some(AutoCropIdentity::new(
+                    crate::settings::ReadingDirection::Rtl,
+                )),
+                Some(&path),
+            );
+            inner_db
+                .save(
+                    &key,
+                    1,
+                    2,
+                    3,
+                    4,
+                    None,
+                    b"no decode",
+                    &CoverIdentity::Page(cover.clone()),
+                    automatic(),
+                )
+                .unwrap();
+            keys.push((true, key));
+        }
+        // No source hint, parent list, converted DB alias or request survives.
+        let done = run_invalidation(request(&cache, &changed, vec![], vec![]));
+        assert!(done.errors.is_empty(), "{:?}", done.errors);
+        assert_eq!(done.deleted_rows.len(), keys.len());
+        for (inner, key) in keys {
+            assert!(
+                if inner { &inner_db } else { &parent_db }
+                    .load_one(&key)
+                    .unwrap()
+                    .is_none(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn cover_rotation_late_rar_memory_with_only_zipdir_hint_uses_outer_writer_key() {
+        use crate::cover_auto_crop::AutoCropIdentity;
+        let source = PathBuf::from("c:/books/book.rar");
+        for converted in [false, true] {
+            let physical = if converted {
+                PathBuf::from("c:/cache/converted.zip")
+            } else {
+                source.clone()
+            };
+            let representative = crate::adjustment_db::zip_entry_key(&physical, "book/cover.png");
+            let mut hint = SourceHint::new(BookCoverId::Zip {
+                path: source.clone(),
+                prefix: Some("book/".into()),
+            });
+            if converted {
+                hint.aliases.push(physical.clone());
+            }
+            let slot = AutoCoverSlot::new(hint.book.clone(), representative.clone());
+            for full in [false, true] {
+                let base = crate::app::convertible_archive_cache_base_key(
+                    &source,
+                    crate::archive_converter::ArchiveFormat::Rar,
+                    full,
+                )
+                .unwrap();
+                let key =
+                    crate::thumb_loader::representative_cache_key_for_policy_with_auto_in_archive(
+                        &format!("{base}#pin:historical"),
+                        &Default::default(),
+                        Some(AutoCropIdentity::new(
+                            crate::settings::ReadingDirection::Rtl,
+                        )),
+                        Some(&physical),
+                    );
+                let other = key.replace("book.rar", "other.rar");
+                let map = Arc::new(RwLock::new(HashMap::from([
+                    (key.clone(), entry(&representative)),
+                    (other.clone(), entry(&representative)),
+                ])));
+                assert_eq!(
+                    remove_invalidated_memory_rows(
+                        Path::new("c:/books"),
+                        &map,
+                        &[slot.clone()],
+                        &[hint.clone()]
+                    ),
+                    1
+                );
+                assert!(!map.read().unwrap().contains_key(&key));
+                assert!(map.read().unwrap().contains_key(&other));
+            }
+        }
+    }
     fn request(
         cache: &Path,
         changed: &str,
@@ -1381,7 +1714,7 @@ mod tests {
             .aliases
             .push(PathBuf::from("c:/cache/generated.zip"));
         let row = header(
-            "archivethumb:book.7z|autocrop:v4:ltr",
+            "archivethumb:7z:book.7z|autocrop:v4:ltr",
             "c:/cache/generated.zip::cover.jpg",
         );
         assert!(row_belongs_to(&archive, Path::new("c:/books"), &row));
@@ -1767,8 +2100,8 @@ mod tests {
             logical_book: BookCoverId::Archive(PathBuf::from("c:/books/book.7z")),
             representative_page_key: representative.into(),
         };
-        let key = "archivethumb:book.7z|types:0123456789abcdef|autocrop:v4:rtl#pin:old";
-        let other = "archivethumb:other.7z|autocrop:v4:rtl";
+        let key = "archivethumb:7z:book.7z|types:0123456789abcdef|autocrop:v4:rtl#pin:old";
+        let other = "archivethumb:7z:other.7z|autocrop:v4:rtl";
         let ordinary = "literal::page|autocrop:v4:rtl";
         let map = Arc::new(RwLock::new(HashMap::from([
             (key.into(), entry(representative)),

@@ -850,6 +850,58 @@ mod tests {
     }
 
     #[test]
+    fn cover_auto_rating_rar_survival_uses_current_v4r_key() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let rar = temp.path().join("book.cbr");
+        std::fs::write(&rar, b"metadata only").unwrap();
+        let db_path = temp.path().join("rating.db");
+        let db = crate::rating_db::RatingDb::open_at(&db_path).unwrap();
+        let mut meta = crate::rating_db::RatingMeta::new(RatingItemKind::ConvertibleArchive)
+            .with_source_path(&rar);
+        meta.archive_format = Some("rar".into());
+        db.set_user_rating(&crate::path_key::normalize_keep_drive(&rar), 3, Some(&meta))
+            .unwrap();
+        drop(db);
+        for binding in [
+            crate::settings::ReadingDirection::Rtl,
+            crate::settings::ReadingDirection::Ltr,
+        ] {
+            let mut options = membership_options(Default::default());
+            options.sidecar_settings = crate::settings::Settings {
+                thumb_cover_auto_crop: true,
+                thumb_cover_auto_crop_binding: binding,
+                ..Default::default()
+            }
+            .thumbnail_source_discovery_snapshot();
+            let prepared =
+                prepare_rating_view(db_path.clone(), 3, options, &AtomicBool::new(false))
+                    .unwrap()
+                    .prepared
+                    .unwrap();
+            let base = crate::app::convertible_archive_cache_base_key(
+                &rar,
+                crate::archive_converter::ArchiveFormat::Rar,
+                true,
+            )
+            .unwrap();
+            let expected = crate::thumb_loader::representative_cache_key_for_policy_with_auto(
+                &base,
+                &Default::default(),
+                Some(crate::cover_auto_crop::AutoCropIdentity::new(binding)),
+            );
+            assert!(expected.contains("|autocrop:v4r:"));
+            assert!(prepared.existing_keys.contains(&expected));
+            assert!(
+                !prepared
+                    .existing_keys
+                    .iter()
+                    .any(|key| key.contains("|autocrop:v4:"))
+            );
+        }
+    }
+
+    #[test]
     fn cover_auto_rating_prepare_uses_binding_snapshot_and_ignores_reading_direction() {
         use crate::settings::ReadingDirection::{Ltr, Rtl};
         let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();

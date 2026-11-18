@@ -1,5 +1,15 @@
 # 非同期・並列アーキテクチャ
 
+## 代表表紙の標本読み取りと中断（§1.778）
+
+直接読むRAR/CBRの自動切り出しも既存thumbnail heavy I/O workerの1仕事で完了させる。
+ZIPと共通の候補選択後、一覧サイズから最大8枚・1枚32MiB・合計64MiBの読む集合を先に決め、1回のprocessing走査で対象だけ展開する。
+各entryでcancelを検査し、別jobでの後追い判定・要求抑止・再試行・待機状態は追加しない。
+低位のZIP entry／画像folder open/read／unrar／判定decode／PDF PageSizes/renderは、データ破損とCancelled/ReadFailedを型で区別して上へ運ぶ。
+Cancelledは既存取消完了へ、ReadFailedは今回用の切らないSourcePixelsから非保存Finalizedへ通し、catalogへ中断を固定しない。
+PDFのHarvestOnCancelは完了済みの結果を保つ。範囲画面の準備threadと評価器も同じsamplerを使い、UIへI/Oを持ち込まない。
+詳細・キー・互換・測定は [表紙計画§30](cover-crop-plan.md) を参照。
+
 ## 一覧 catalog の控えと先頭ページの書き戻し（§1.800 S1）
 
 通常一覧は catalog を開いたときに `load_all` せず、空の `cache_map` で始める。

@@ -1,11 +1,269 @@
 //! Bounded dimension-only sampling for a representative jacket leaf.
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use crate::rotation_db::{Rotation, RotationDb};
 
 pub(crate) const MAX_SAMPLE_PAGES: usize = 8;
 pub(crate) const MAX_SAMPLE_PREFIX_BYTES: u64 = 256 * 1024;
+pub(crate) const MAX_RAR_SAMPLE_ENTRY_BYTES: u64 = 32 * 1024 * 1024;
+pub(crate) const MAX_RAR_SAMPLE_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SampleAbort {
+    Cancelled,
+    ReadFailed(String),
+}
+
+impl std::fmt::Display for SampleAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::ReadFailed(reason) => write!(f, "{reason}"),
+        }
+    }
+}
+
+/// Preserve transient read failures until the caller decides whether to save.
+#[derive(Debug)]
+pub(crate) enum SampleRead {
+    Read(Vec<u8>),
+    Unreadable,
+    Cancelled,
+    ReadFailed(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SampleFailureKind {
+    Data,
+    ReadFailed,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum SampleIoOrigin {
+    Direct,
+    ZipDecoder,
+}
+
+/// Preserve source provenance when a reader synthesizes an error without an
+/// OS code. Real OS errors retain their original raw_os_error and payload.
+#[derive(Debug)]
+struct SourceReadError(std::io::Error);
+
+impl std::fmt::Display for SourceReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for SourceReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+pub(crate) fn source_read_error(error: std::io::Error) -> std::io::Error {
+    if error.raw_os_error().is_some() {
+        error
+    } else {
+        std::io::Error::new(error.kind(), SourceReadError(error))
+    }
+}
+
+pub(crate) fn classify_io_error_at(
+    error: &std::io::Error,
+    origin: SampleIoOrigin,
+) -> SampleFailureKind {
+    use std::io::ErrorKind;
+    if error.raw_os_error().is_some()
+        || error
+            .get_ref()
+            .is_some_and(|error| error.is::<SourceReadError>())
+    {
+        return SampleFailureKind::ReadFailed;
+    }
+    // ZIP exposes decoder/CRC/structure errors as io::Error too. In
+    // particular flate2 uses InvalidInput for malformed Deflate streams.
+    // Only the underlying reader's errors above denote source I/O failure.
+    if matches!(origin, SampleIoOrigin::ZipDecoder) {
+        return SampleFailureKind::Data;
+    }
+    match error.kind() {
+        ErrorKind::InvalidData
+        | ErrorKind::InvalidInput
+        | ErrorKind::UnexpectedEof
+        | ErrorKind::Unsupported => SampleFailureKind::Data,
+        _ => SampleFailureKind::ReadFailed,
+    }
+}
+
+pub(crate) fn classify_io_error(error: &std::io::Error) -> SampleFailureKind {
+    classify_io_error_at(error, SampleIoOrigin::Direct)
+}
+
+pub(crate) fn classify_unrar_error(code: unrar::error::Code) -> SampleFailureKind {
+    match code {
+        unrar::error::Code::BadData
+        | unrar::error::Code::BadArchive
+        | unrar::error::Code::UnknownFormat
+        | unrar::error::Code::BadPassword => SampleFailureKind::Data,
+        _ => SampleFailureKind::ReadFailed,
+    }
+}
+
+pub(crate) fn check_cancel(cancel: Option<&AtomicBool>) -> Result<(), SampleAbort> {
+    if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+        Err(SampleAbort::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+impl SampleRead {
+    pub(crate) fn from_io(result: std::io::Result<Vec<u8>>, cancel: Option<&AtomicBool>) -> Self {
+        Self::from_io_at(result, cancel, SampleIoOrigin::Direct)
+    }
+
+    pub(crate) fn from_io_at(
+        result: std::io::Result<Vec<u8>>,
+        cancel: Option<&AtomicBool>,
+        origin: SampleIoOrigin,
+    ) -> Self {
+        if check_cancel(cancel).is_err() {
+            return Self::Cancelled;
+        }
+        match result {
+            Ok(bytes) => Self::Read(bytes),
+            Err(error) => match classify_io_error_at(&error, origin) {
+                SampleFailureKind::Data => Self::Unreadable,
+                SampleFailureKind::ReadFailed => Self::ReadFailed(error.to_string()),
+            },
+        }
+    }
+
+    pub(crate) fn into_slot(self) -> Result<Option<Vec<u8>>, SampleAbort> {
+        match self {
+            Self::Read(bytes) => Ok(Some(bytes)),
+            Self::Unreadable => Ok(None),
+            Self::Cancelled => Err(SampleAbort::Cancelled),
+            Self::ReadFailed(reason) => Err(SampleAbort::ReadFailed(reason)),
+        }
+    }
+}
+
+pub(crate) type SampleAspect = Result<Result<f64, PageAspectDecline>, SampleAbort>;
+
+#[cfg(test)]
+thread_local! {
+    static CONTAINER_SAMPLE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn container_sample_calls_for_test() -> usize {
+    CONTAINER_SAMPLE_CALLS.with(std::cell::Cell::get)
+}
+
+/// The list is metadata only. Selection is shared by ZIP and direct RAR and
+/// does not change the released ZIP name ordering, scope, or attempt budget.
+pub(crate) fn select_archive_samples(
+    entries: impl IntoIterator<Item = (String, u64)>,
+    leaf_entry: &str,
+    prefix: Option<&str>,
+) -> Vec<(String, u64)> {
+    let prefix = prefix.map(|p| {
+        let p = p.replace('\\', "/");
+        if p.is_empty() {
+            p
+        } else {
+            format!("{}/", p.trim_end_matches('/'))
+        }
+    });
+    let mut names: Vec<_> = entries
+        .into_iter()
+        .filter(|(name, _)| {
+            // Match ZIP's released lowercase_ext rule, including a basename
+            // such as book/.png (Path::extension treats that name differently).
+            let image = name.rfind('.').is_some_and(|dot| {
+                dot >= name.rfind('/').map_or(0, |slash| slash + 1)
+                    && crate::folder_tree::is_recognized_image_ext(
+                        &name[dot + 1..].to_ascii_lowercase(),
+                    )
+            });
+            !name.contains("__MACOSX/")
+                && !name.starts_with('.')
+                && !prefix
+                    .as_ref()
+                    .is_some_and(|prefix| !name.starts_with(prefix))
+                && crate::zip_loader::split_nested_zip_path(name).len() == 1
+                && image
+        })
+        .map(|(name, size)| {
+            (
+                crate::filename_sort::FileNameSortKey::new(&name),
+                name,
+                size,
+            )
+        })
+        .collect();
+    names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let leaf = leaf_entry.replace('\\', "/");
+    let Some(index) = names.iter().position(|(_, name, _)| name == &leaf) else {
+        return Vec::new();
+    };
+    sample_indices(names.len(), index)
+        .into_iter()
+        .map(|index| (names[index].1.clone(), names[index].2))
+        .collect()
+}
+
+#[derive(Default)]
+pub(crate) struct SampleMetrics {
+    pub(crate) selected: usize,
+    pub(crate) read: usize,
+    pub(crate) skipped_limit: usize,
+    pub(crate) bytes: usize,
+    pub(crate) list_ms: f64,
+    pub(crate) read_ms: f64,
+}
+
+impl SampleMetrics {
+    pub(crate) fn emit<T>(&self, path: &Path, format: &str, result: &Result<T, SampleAbort>) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let outcome = match result {
+            Ok(_) => "judged",
+            Err(SampleAbort::Cancelled) => "cancelled",
+            Err(SampleAbort::ReadFailed(_)) => "read_failed",
+        };
+        crate::perf::event(
+            "thumb",
+            "auto_cover_sample",
+            Some(&crate::path_key::normalize_keep_drive(path)),
+            0,
+            &[
+                ("format", format.into()),
+                ("selected", self.selected.into()),
+                ("read", self.read.into()),
+                ("skipped_limit", self.skipped_limit.into()),
+                ("bytes", self.bytes.into()),
+                ("list_ms", self.list_ms.into()),
+                ("read_ms", self.read_ms.into()),
+                ("outcome", outcome.into()),
+            ],
+        );
+    }
+}
+
+/// PageSizes is IPC work: even an InvalidData response is a worker failure,
+/// never evidence about a page's aspect. Do not discard a harvested success.
+pub(crate) fn page_sizes_read_result(
+    result: std::io::Result<Vec<(f32, f32)>>,
+) -> Result<Vec<(f32, f32)>, SampleAbort> {
+    result.map_err(|error| SampleAbort::ReadFailed(error.to_string()))
+}
 
 /// Ephemeral, read-only rotation lookup. Construct and query this handle only
 /// on a sampling worker: opening the DB and reading a key both perform I/O.
@@ -158,8 +416,7 @@ pub(crate) fn page_aspect_from_sizes_with_rotations_report(
     }))
 }
 
-/// Read no more than eight 256 KiB prefixes, without nested archive expansion,
-/// full-entry fallback, page decoding, or direct-RAR reads.
+/// Compatibility helper for callers which only need a best-effort ratio.
 pub(crate) fn sample_zip_page_aspect(
     path: &Path,
     leaf_entry: &str,
@@ -191,20 +448,81 @@ pub(crate) fn sample_zip_pages_with_rotations(
     leaf_entry: &str,
     prefix: Option<&str>,
     logical_zip_path: &Path,
-    mut lookup: impl FnMut(&str) -> Rotation,
+    lookup: impl FnMut(&str) -> Rotation,
 ) -> Result<f64, PageAspectDecline> {
-    if crate::rar_loader::is_rar_path(path)
-        || crate::zip_loader::split_nested_zip_path(leaf_entry).len() > 1
-    {
-        return Err(PageAspectDecline::TooFew);
+    sample_container_pages_with_rotations_cancellable(
+        path,
+        leaf_entry,
+        prefix,
+        logical_zip_path,
+        lookup,
+        None,
+    )
+    .unwrap_or(Err(PageAspectDecline::TooFew))
+}
+
+/// Physical input and viewer page-key identity deliberately remain separate.
+/// ZIP reads bounded prefixes; direct RAR reads a pre-budgeted set in one pass.
+pub(crate) fn sample_container_pages_with_rotations_cancellable(
+    path: &Path,
+    leaf_entry: &str,
+    prefix: Option<&str>,
+    logical_zip_path: &Path,
+    mut lookup: impl FnMut(&str) -> Rotation,
+    cancel: Option<&AtomicBool>,
+) -> SampleAspect {
+    #[cfg(test)]
+    CONTAINER_SAMPLE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let started = Instant::now();
+    let mut metrics = SampleMetrics::default();
+    let result = (|| {
+        check_cancel(cancel)?;
+        let prefixes = if crate::rar_loader::is_rar_path(path) {
+            crate::rar_loader::read_cover_auto_page_samples(
+                path,
+                leaf_entry,
+                prefix,
+                cancel,
+                MAX_RAR_SAMPLE_ENTRY_BYTES,
+                MAX_RAR_SAMPLE_TOTAL_BYTES,
+                &mut metrics,
+            )?
+        } else {
+            crate::zip_loader::read_cover_auto_page_samples(
+                path,
+                leaf_entry,
+                prefix,
+                cancel,
+                &mut metrics,
+            )?
+        };
+        let mut slots = Vec::with_capacity(prefixes.len());
+        for (name, read) in prefixes {
+            check_cancel(cancel)?;
+            let bytes = read.into_slot()?;
+            let dimensions = bytes
+                .as_deref()
+                .and_then(|bytes| dimensions_from_prefix(bytes, &name));
+            slots.push(dimensions.map(|(width, height)| {
+                let key = crate::adjustment_db::zip_entry_key(logical_zip_path, &name);
+                aspect_after_rotation(width, height, lookup(&key))
+            }));
+        }
+        Ok(aspect_from_slots(slots))
+    })();
+    if metrics.read_ms == 0.0 {
+        metrics.read_ms = (started.elapsed().as_secs_f64() * 1000.0 - metrics.list_ms).max(0.0);
     }
-    let prefixes = crate::zip_loader::read_cover_auto_page_prefixes(path, leaf_entry, prefix)
-        .unwrap_or_default();
-    aspect_from_slots(prefixes.into_iter().map(|(name, bytes)| {
-        let (width, height) = dimensions_from_prefix(bytes.as_deref()?, &name)?;
-        let key = crate::adjustment_db::zip_entry_key(logical_zip_path, &name);
-        Some(aspect_after_rotation(width, height, lookup(&key)))
-    }))
+    metrics.emit(
+        path,
+        if crate::rar_loader::is_rar_path(path) {
+            "rar"
+        } else {
+            "zip"
+        },
+        &result,
+    );
+    result
 }
 
 fn dimensions_from_prefix(bytes: &[u8], name: &str) -> Option<(f64, f64)> {
@@ -212,13 +530,36 @@ fn dimensions_from_prefix(bytes: &[u8], name: &str) -> Option<(f64, f64)> {
     (width > 0 && height > 0).then_some((f64::from(width), f64::from(height)))
 }
 
-fn read_folder_prefix(path: &Path) -> Option<Vec<u8>> {
-    let file = std::fs::File::open(path).ok()?;
+fn read_folder_prefix_typed(path: &Path, cancel: Option<&AtomicBool>) -> SampleRead {
+    if check_cancel(cancel).is_err() {
+        return SampleRead::Cancelled;
+    }
+    let opened = std::fs::File::open(path);
+    if check_cancel(cancel).is_err() {
+        return SampleRead::Cancelled;
+    }
+    let file = match opened {
+        Ok(file) => file,
+        // Opening a source always failing is transient, even if an OS happens
+        // to report an error kind also used for malformed stream data.
+        Err(error) => return SampleRead::ReadFailed(error.to_string()),
+    };
     let mut bytes = Vec::new();
-    file.take(MAX_SAMPLE_PREFIX_BYTES)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    Some(bytes)
+    SampleRead::from_io(
+        file.take(MAX_SAMPLE_PREFIX_BYTES)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+            .map_err(source_read_error),
+        cancel,
+    )
+}
+
+#[cfg(test)]
+fn read_folder_prefix(path: &Path) -> Option<Vec<u8>> {
+    read_folder_prefix_typed(path, None)
+        .into_slot()
+        .ok()
+        .flatten()
 }
 
 /// The caller supplies the already enumerated image paths in FileNameSortKey
@@ -237,9 +578,23 @@ pub(crate) fn sample_folder_pages_with_rotations(
     cover: &Path,
     lookup: impl FnMut(&str) -> Rotation,
 ) -> Result<f64, PageAspectDecline> {
-    sample_folder_pages_with_rotations_and_wic(paths, cover, lookup, |path| {
-        crate::thumb_loader::file_orientation_or_wic(None, path)
-    })
+    sample_folder_pages_with_rotations_cancellable(paths, cover, lookup, None)
+        .unwrap_or(Err(PageAspectDecline::TooFew))
+}
+
+pub(crate) fn sample_folder_pages_with_rotations_cancellable(
+    paths: &[PathBuf],
+    cover: &Path,
+    lookup: impl FnMut(&str) -> Rotation,
+    cancel: Option<&AtomicBool>,
+) -> SampleAspect {
+    sample_folder_pages_typed(
+        paths,
+        cover,
+        lookup,
+        |path| crate::thumb_loader::file_orientation_or_wic(None, path),
+        cancel,
+    )
 }
 
 #[cfg(test)]
@@ -254,22 +609,59 @@ fn sample_folder_pages_with_wic(
 fn sample_folder_pages_with_rotations_and_wic(
     paths: &[PathBuf],
     cover: &Path,
+    lookup: impl FnMut(&str) -> Rotation,
+    wic_orientation: impl FnMut(&Path) -> u16,
+) -> Result<f64, PageAspectDecline> {
+    sample_folder_pages_typed(paths, cover, lookup, wic_orientation, None)
+        .unwrap_or(Err(PageAspectDecline::TooFew))
+}
+
+fn sample_folder_pages_typed(
+    paths: &[PathBuf],
+    cover: &Path,
     mut lookup: impl FnMut(&str) -> Rotation,
     mut wic_orientation: impl FnMut(&Path) -> u16,
-) -> Result<f64, PageAspectDecline> {
-    let leaf = paths
-        .iter()
-        .position(|path| crate::path_key::eq_keep_drive(path, cover));
-    let Some(leaf) = leaf else {
-        return Err(PageAspectDecline::TooFew);
-    };
-    aspect_from_slots(sample_indices(paths.len(), leaf).into_iter().map(|index| {
-        let path = &paths[index];
-        let bytes = read_folder_prefix(path)?;
-        let (width, height) = folder_dimensions_from_prefix(&bytes, path, &mut wic_orientation)?;
-        let key = crate::adjustment_db::normalize_path(path);
-        Some(aspect_after_rotation(width, height, lookup(&key)))
-    }))
+    cancel: Option<&AtomicBool>,
+) -> SampleAspect {
+    let mut metrics = SampleMetrics::default();
+    let started = Instant::now();
+    let result = (|| {
+        check_cancel(cancel)?;
+        let leaf = paths
+            .iter()
+            .position(|path| crate::path_key::eq_keep_drive(path, cover));
+        let Some(leaf) = leaf else {
+            return Ok(Err(PageAspectDecline::TooFew));
+        };
+        let indices = sample_indices(paths.len(), leaf);
+        metrics.selected = indices.len();
+        metrics.list_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let mut slots = Vec::with_capacity(indices.len());
+        for index in indices {
+            let path = &paths[index];
+            let bytes = read_folder_prefix_typed(path, cancel).into_slot()?;
+            if let Some(bytes) = &bytes {
+                metrics.read += 1;
+                metrics.bytes += bytes.len();
+            }
+            slots.push(
+                bytes
+                    .as_deref()
+                    .and_then(|bytes| {
+                        folder_dimensions_from_prefix(bytes, path, &mut wic_orientation)
+                    })
+                    .map(|(width, height)| {
+                        let key = crate::adjustment_db::normalize_path(path);
+                        aspect_after_rotation(width, height, lookup(&key))
+                    }),
+            );
+        }
+        check_cancel(cancel)?;
+        Ok(aspect_from_slots(slots))
+    })();
+    metrics.read_ms = (started.elapsed().as_secs_f64() * 1000.0 - metrics.list_ms).max(0.0);
+    metrics.emit(cover, "folder", &result);
+    result
 }
 
 fn folder_dimensions_from_prefix(
@@ -299,6 +691,10 @@ fn folder_dimensions_from_prefix(
 #[cfg(test)]
 #[path = "cover_auto_sample/saved_rotation_tests.rs"]
 mod saved_rotation_tests;
+
+#[cfg(test)]
+#[path = "cover_auto_sample/rar_tests.rs"]
+pub(crate) mod rar_tests;
 
 #[cfg(test)]
 mod tests {
@@ -581,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn folder_prefix_read_is_bounded_and_failed_reads_remain_slots() {
+    fn folder_prefix_read_is_bounded_and_os_failure_aborts() {
         let dir = tempfile::tempdir().unwrap();
         let cover = dir.path().join("0.png");
         let large = dir.path().join("1.png");
@@ -597,8 +993,18 @@ mod tests {
             std::fs::write(&path, png(if i < 6 { 140 } else { 70 }, 100)).unwrap();
             paths.push(path);
         }
-        // Neither the unreadable header nor the failed read may expose the
-        // later landscape run to leading-slot trimming.
+        assert!(matches!(
+            sample_folder_pages_with_rotations_cancellable(
+                &paths,
+                &cover,
+                |_| Rotation::None,
+                None,
+            ),
+            Err(SampleAbort::ReadFailed(_))
+        ));
+        // A data-only failure retains its slot and cannot expose a later
+        // landscape run to leading-slot trimming.
+        std::fs::write(&paths[2], b"unknown header").unwrap();
         assert_eq!(
             sample_folder_pages(&paths, &cover),
             Err(PageAspectDecline::Landscape)

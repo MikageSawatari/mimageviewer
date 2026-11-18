@@ -12,6 +12,15 @@ use crate::archive_converter::{
 use crate::zip_loader::{ZipEnumeration, ZipImageEntry};
 
 const MAX_DIRECT_ENTRY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+#[cfg(test)]
+thread_local! {
+    static SAMPLE_PROCESSING_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn sample_processing_scans_for_test() -> usize {
+    SAMPLE_PROCESSING_SCANS.with(std::cell::Cell::get)
+}
 const DECISION_CACHE_CAPACITY: usize = 32;
 // Volume resolution entries contain only two paths and a small enum. Keep more of them than the
 // full inspection cache so folder navigation and thumbnail workers can reuse probes across a
@@ -172,7 +181,10 @@ fn unrar_io(err: unrar::error::UnrarError) -> io::Error {
     let kind = match err.code {
         unrar::error::Code::MissingPassword => io::ErrorKind::PermissionDenied,
         unrar::error::Code::BadPassword => io::ErrorKind::PermissionDenied,
-        _ => io::ErrorKind::InvalidData,
+        code => match crate::cover_auto_sample::classify_unrar_error(code) {
+            crate::cover_auto_sample::SampleFailureKind::Data => io::ErrorKind::InvalidData,
+            crate::cover_auto_sample::SampleFailureKind::ReadFailed => io::ErrorKind::Other,
+        },
     };
     io::Error::new(kind, format!("RAR: {err}"))
 }
@@ -675,9 +687,165 @@ pub fn read_entry_bytes(path: &Path, wanted: &str) -> io::Result<Vec<u8>> {
     }
 }
 
+/// Select from header metadata, then expand only that fixed set in a single
+/// processing pass. A data error consumes the handle: retain earlier slots and
+/// leave all remaining slots unreadable instead of reopening or retrying.
+pub(crate) fn read_cover_auto_page_samples(
+    path: &Path,
+    leaf: &str,
+    prefix: Option<&str>,
+    cancel: Option<&AtomicBool>,
+    max_entry_bytes: u64,
+    max_total_bytes: u64,
+    metrics: &mut crate::cover_auto_sample::SampleMetrics,
+) -> Result<
+    Vec<(String, crate::cover_auto_sample::SampleRead)>,
+    crate::cover_auto_sample::SampleAbort,
+> {
+    use crate::cover_auto_sample::{
+        SampleAbort, SampleFailureKind, SampleRead, check_cancel, classify_unrar_error,
+        select_archive_samples,
+    };
+    let started = std::time::Instant::now();
+    check_cancel(cancel)?;
+    // The request has already resolved a multipart input to its first volume.
+    // Do not run volume inspection again and introduce another processing pass.
+    let mut listing = unrar::Archive::new(path)
+        .open_for_listing()
+        .map_err(|error| SampleAbort::ReadFailed(error.to_string()))?;
+    let mut entries = Vec::new();
+    let mut seen_names = HashSet::new();
+    loop {
+        check_cancel(cancel)?;
+        let Some(entry) = listing.next() else {
+            break;
+        };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if classify_unrar_error(error.code) == SampleFailureKind::Data => break,
+            Err(error) => return Err(SampleAbort::ReadFailed(error.to_string())),
+        };
+        if entry.is_file() {
+            let name = normalized_entry_name(&entry.filename);
+            if let Some(name) = deduplicated_visible_image_name(&name, &mut seen_names) {
+                entries.push((name, entry.unpacked_size));
+            }
+        }
+    }
+    drop(listing);
+    let selected = select_archive_samples(entries, leaf, prefix);
+    metrics.selected = selected.len();
+    let mut total = 0u64;
+    let mut wanted = std::collections::HashMap::new();
+    let mut samples = Vec::with_capacity(selected.len());
+    for (name, size) in selected {
+        total = total.saturating_add(size);
+        if size <= max_entry_bytes && total <= max_total_bytes {
+            wanted.insert(name.clone(), samples.len());
+        } else {
+            metrics.skipped_limit += 1;
+        }
+        samples.push((name, SampleRead::Unreadable));
+    }
+    metrics.list_ms = started.elapsed().as_secs_f64() * 1000.0;
+    if wanted.is_empty() {
+        return Ok(samples);
+    }
+    let read_started = std::time::Instant::now();
+    let result = (|| {
+        check_cancel(cancel)?;
+        let mut archive = unrar::Archive::new(path)
+            .open_for_processing()
+            .map_err(|error| SampleAbort::ReadFailed(error.to_string()))?;
+        #[cfg(test)]
+        SAMPLE_PROCESSING_SCANS.with(|scans| scans.set(scans.get() + 1));
+        let mut seen_names = HashSet::new();
+        loop {
+            check_cancel(cancel)?;
+            let header = match archive.read_header() {
+                Ok(Some(header)) => header,
+                Ok(None) => break,
+                Err(error) if classify_unrar_error(error.code) == SampleFailureKind::Data => break,
+                Err(error) => return Err(SampleAbort::ReadFailed(error.to_string())),
+            };
+            let entry = header.entry();
+            let name = normalized_entry_name(&entry.filename);
+            let name = entry
+                .is_file()
+                .then(|| deduplicated_visible_image_name(&name, &mut seen_names))
+                .flatten();
+            if let Some(index) = name.as_ref().and_then(|name| wanted.remove(name)) {
+                // Validate the processing header as well: a changing archive
+                // must never make a pre-budgeted read allocate above its limit.
+                if entry.unpacked_size > max_entry_bytes
+                    || (metrics.bytes as u64).saturating_add(entry.unpacked_size) > max_total_bytes
+                {
+                    archive = match header.skip() {
+                        Ok(archive) => archive,
+                        Err(error)
+                            if classify_unrar_error(error.code) == SampleFailureKind::Data =>
+                        {
+                            break;
+                        }
+                        Err(error) => return Err(SampleAbort::ReadFailed(error.to_string())),
+                    };
+                } else {
+                    match header.read() {
+                        Ok((bytes, next)) => {
+                            metrics.read += 1;
+                            metrics.bytes += bytes.len();
+                            samples[index].1 = SampleRead::Read(bytes);
+                            archive = next;
+                        }
+                        Err(error)
+                            if classify_unrar_error(error.code) == SampleFailureKind::Data =>
+                        {
+                            break;
+                        }
+                        Err(error) => return Err(SampleAbort::ReadFailed(error.to_string())),
+                    }
+                }
+            } else {
+                archive = match header.skip() {
+                    Ok(archive) => archive,
+                    Err(error) if classify_unrar_error(error.code) == SampleFailureKind::Data => {
+                        break;
+                    }
+                    Err(error) => return Err(SampleAbort::ReadFailed(error.to_string())),
+                };
+            }
+            if wanted.is_empty() {
+                break;
+            }
+        }
+        check_cancel(cancel)?;
+        Ok(samples)
+    })();
+    metrics.read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrar_read_errors_preserve_data_versus_io_at_the_boundary() {
+        use crate::cover_auto_sample::SampleRead;
+        use unrar::error::{Code, UnrarError, When};
+        for code in [Code::BadData, Code::BadArchive] {
+            assert!(matches!(
+                SampleRead::from_io(Err(unrar_io(UnrarError::from(code, When::Read))), None),
+                SampleRead::Unreadable
+            ));
+        }
+        for code in [Code::EOpen, Code::ERead, Code::ECreate] {
+            assert!(matches!(
+                SampleRead::from_io(Err(unrar_io(UnrarError::from(code, When::Read))), None),
+                SampleRead::ReadFailed(_)
+            ));
+        }
+    }
 
     fn multipart_filename_fixture_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))

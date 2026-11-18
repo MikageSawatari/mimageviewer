@@ -15,8 +15,12 @@ pub(crate) fn decode(
     _thumb_px: u32,
 ) -> Result<DecodedCover, String> {
     if let Some(entry) = zip_entry {
-        let bytes =
-            crate::zip_loader::read_entry_bytes(path, entry).map_err(|error| error.to_string())?;
+        let bytes = if crate::rar_loader::is_rar_path(path) {
+            crate::rar_loader::read_entry_bytes(path, entry)
+        } else {
+            crate::zip_loader::read_entry_bytes(path, entry)
+        }
+        .map_err(|error| error.to_string())?;
         decode_cover_auto_analysis_image(
             crate::image_decode::Source::Bytes {
                 bytes: &bytes,
@@ -25,8 +29,10 @@ pub(crate) fn decode(
             None,
             None,
         )
+        .map_err(|error| error.to_string())
     } else {
         decode_cover_auto_analysis_image(crate::image_decode::Source::Path(path), None, None)
+            .map_err(|error| error.to_string())
     }
 }
 

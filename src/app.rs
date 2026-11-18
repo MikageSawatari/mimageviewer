@@ -39850,7 +39850,12 @@ impl App {
             .iter()
             .filter(|key| key.starts_with("zipdir:"))
             .flat_map(|key| {
-                representative_existing_keys(key, &self.settings.file_type_visibility, auto)
+                representative_existing_keys_in_archive(
+                    key,
+                    &self.settings.file_type_visibility,
+                    auto,
+                    Some(&tree.zip_path),
+                )
             })
             .collect();
         let mut pinned_keys = Vec::new();
@@ -102230,7 +102235,7 @@ fn archive_thumb_format_token(format: crate::archive_converter::ArchiveFormat) -
     }
 }
 
-fn convertible_archive_cache_base_key(
+pub(crate) fn convertible_archive_cache_base_key(
     path: &std::path::Path,
     format: crate::archive_converter::ArchiveFormat,
     use_full_path: bool,
@@ -103685,9 +103690,22 @@ fn representative_existing_keys(
     visibility: &crate::file_type_visibility::FileTypeVisibility,
     auto: Option<crate::cover_auto_crop::AutoCropIdentity>,
 ) -> Vec<String> {
+    representative_existing_keys_in_archive(base, visibility, auto, None)
+}
+
+fn representative_existing_keys_in_archive(
+    base: &str,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+    auto: Option<crate::cover_auto_crop::AutoCropIdentity>,
+    physical_archive: Option<&std::path::Path>,
+) -> Vec<String> {
     let plain = crate::thumb_loader::representative_cache_key_for_policy(base, visibility);
-    let current =
-        crate::thumb_loader::representative_cache_key_for_policy_with_auto(base, visibility, auto);
+    let current = crate::thumb_loader::representative_cache_key_for_policy_with_auto_in_archive(
+        base,
+        visibility,
+        auto,
+        physical_archive,
+    );
     let mut keys = vec![plain.clone()];
     if current != plain {
         keys.push(current);
@@ -103705,8 +103723,16 @@ fn pinned_cache_key_with_auto_crop(
     visibility: &crate::file_type_visibility::FileTypeVisibility,
     auto: Option<crate::cover_auto_crop::AutoCropIdentity>,
 ) -> String {
+    let physical_path = match item {
+        GridItem::ZipFile(path) | GridItem::ZipDir { zip_path: path, .. }
+            if base.starts_with("zipdir:") =>
+        {
+            path
+        }
+        _ => &resolved.abs_path,
+    };
     let mut probe = LoadRequest {
-        path: resolved.abs_path.clone(),
+        path: physical_path.clone(),
         zip_entry: resolved.zip_entry.clone(),
         folder_thumb_provenance: (resolved.kind == crate::folder_thumb_pins::ResolvedKind::Folder)
             .then_some(crate::catalog::FolderThumbProvenance::AutoSelected),

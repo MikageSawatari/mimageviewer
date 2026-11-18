@@ -558,6 +558,14 @@ Smartはsaved aspect samples代入後に照合し、最終Loadedにsamplesを整
 自動keyはv4/v4fへ更新するだけで、本文proofや素材codec/schemaの変更はしない。旧v3/v3fを移行せず、K2のv1互換を保つ。
 親への専用通知は追加せず、次の通常読取が既存catalog revisionで再選択する。子が保存される前、Off/Auto非保存時の別代表/無しは受入れた制約とする。
 ZIP は最大8×256KBの先頭読み、PDF/EPUB は代表と同じ password・`ReadTarget` の `PageSizes` を使う。
+直接読むRAR/CBR（§1.778）は同じthumbnail heavy I/O workerの1仕事の中で、ZIPと共通の選択helperから最大8枚を選ぶ。
+一覧のunpacked_sizeだけで1枚32MiB・合計64MiB以内の集合を決め、1回のopenで対象だけ展開し、entryごとにcancelを確認する。
+範囲画面の準備thread・評価器も同じsamplerを使い、UIのI/O・別jobによる後追い差し替え・待機状態は増やさない。
+`thumb/auto_cover_sample`でformat、selected、read、skipped_limit、bytes、list_ms、read_ms、outcomeを記録する。
+`thumb/auto_cover_crop`にはsample_msとcancelled/read-failedのreasonを含める。キャッシュhit時は標本を読まず、このsample eventも出さない。
+判定したAutomatic素材の保存閾値には標本読み取り・判定用decode・判定の実測時間を加える。閾値や常時保存の形式規則は維持する。
+低位の読み取り境界でデータ破損とOS読取失敗・cancelを分類し、中断はcatalogへ保存しない。
+ReadFailedは切らない画をSourcePixelsで送り、既存の非保存Finalizedで終える。PDFのHarvestOnCancelは完了した結果を捨てない。
 通常のサムネイル生成では cache miss の時だけ判定し、`CacheOnly` や idle の周期起床に解析を足さない。
 設定変更の反映には既存の種類表示変更と同じ一覧読み直しを使い、専用の live rebuild 状態を追加しない。
 

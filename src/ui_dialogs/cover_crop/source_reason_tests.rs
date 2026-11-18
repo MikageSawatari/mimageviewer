@@ -153,12 +153,6 @@ fn cover_crop_archive_exclusions_and_fixed_container_pages_use_worker_types() {
         crate::cover_auto_crop::AutoCropIdentity::new(crate::settings::ReadingDirection::Rtl);
     for (path, entry, reason, text) in [
         (
-            "book.rar",
-            "001.png",
-            AutoCoverSkip::DirectRar,
-            "変換前の RAR は自動の対象外です",
-        ),
-        (
             "book.zip",
             "inner.zip/001.png",
             AutoCoverSkip::NestedZip,
@@ -186,10 +180,11 @@ fn cover_crop_archive_exclusions_and_fixed_container_pages_use_worker_types() {
             format!("自動の判定: 切り出していません。{text}")
         );
     }
-    // A container's own pinned ZIP/PDF page remains eligible, unlike a folder pin.
-    for pdf in [false, true] {
+    // A container's own pinned ZIP/RAR/PDF page remains eligible, unlike a folder pin.
+    for path in ["book.zip", "book.rar", "book.cbr", "book.pdf"] {
+        let pdf = path.ends_with(".pdf");
         let mut request = LoadRequest {
-            path: if pdf { "book.pdf" } else { "book.zip" }.into(),
+            path: path.into(),
             zip_entry: (!pdf).then(|| "001.png".into()),
             pdf_page: pdf.then_some(2),
             cache_key_override: Some(

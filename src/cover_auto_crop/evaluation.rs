@@ -220,13 +220,15 @@ fn load_case(
         let rotations = crate::cover_auto_sample::SampleRotations::from_path_worker(
             mode.rotation_db.as_deref(),
         );
-        let sample = crate::cover_auto_sample::sample_zip_pages_with_rotations(
+        let sample = crate::cover_auto_sample::sample_container_pages_with_rotations_cancellable(
             &decode_path,
             &leaf,
             prefix.as_deref(),
             &zip_path,
             |key| rotations.get(key),
-        );
+            None,
+        )
+        .map_err(|error| error.to_string())?;
         let worker = mode
             .worker
             .then(|| {
@@ -574,7 +576,14 @@ fn evaluate_directory(
         }
     }
     sheet.save(output.join("sheet.png"))?;
-    let summary = json!({"algorithm":"autocrop:v4","decode_mode":mode.name(),"display_px":mode.display_px,"thumb_px":mode.thumb_px,
+    // Manifest cases use ZIP/image input; share production's version selector.
+    let token = crate::thumb_loader::auto_token(
+        "zipthumb:",
+        None,
+        AutoCropIdentity::new(ReadingDirection::Rtl),
+    );
+    let algorithm = format!("autocrop:{}", token.split_once(':').unwrap().0);
+    let summary = json!({"algorithm":algorithm,"decode_mode":mode.name(),"display_px":mode.display_px,"thumb_px":mode.thumb_px,
         "analysis_decode_height":1024,"image_rotation":mode.image_rotation.degrees(),
         "physical_jpeg_reencode_quality":(!mode.image_rotation.is_none() || mode.reencode_input).then_some(95),
         "reencode_input_control":mode.reencode_input,
