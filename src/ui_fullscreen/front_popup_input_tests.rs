@@ -2,6 +2,54 @@
 //! These tests keep the physical foreground stream separate from the painted canvas.
 use super::*;
 
+#[test]
+fn mouse_opened_unfocused_rotation_popup_keeps_page_scroll_keys_unconsumed() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let rect = viewport(640.0);
+    let mut app = sources(&ctx, [160, 320]);
+    app.settings.fullscreen_fit_mode = FullscreenFitMode::Width;
+    app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsPageScrollDown = F24\n");
+    settle(&mut app, &ctx, rect);
+    open_menu(&mut app, &ctx, rect, "fs_rotation_btn");
+    ctx.memory_mut(|memory| {
+        if let Some(focus) = memory.focused() {
+            memory.surrender_focus(focus);
+        }
+    });
+    assert!(app.fs_scroll_layout_matches(&ctx));
+    for key in [egui::Key::K, egui::Key::J, egui::Key::F24] {
+        assert!(ctx.memory(|memory| memory.focused().is_none()));
+        assert!(
+            !app.keyboard_owner_for_pass(&ctx)
+                .blocks_legacy_keymap_shortcuts()
+        );
+        let pan = app.fs_pan;
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            [true, false]
+                .into_iter()
+                .map(|pressed| egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+                .collect(),
+        );
+        assert_eq!(app.fs_pan, pan);
+        assert!(fs_rotation_popup_open(&ctx));
+        assert!(ctx.input(|input| {
+            input.events.iter().any(|event|
+            matches!(event, egui::Event::Key { key: actual, pressed: true, .. } if *actual == key))
+        }));
+    }
+}
+
 fn viewport(width: f32) -> egui::Rect {
     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 614.0))
 }

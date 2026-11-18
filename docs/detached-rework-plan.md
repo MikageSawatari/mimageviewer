@@ -1505,6 +1505,31 @@ root の `ctx` から可視性を読み直さない。3D でないときは両�
 実装後の焦点試験はmainの通常全画面childとdetached childで、rootとは異なるminimized値を与え、
 非表示 / 最小化時の休止・復帰後の起算・InputOnlyでの自動送り抑止を検査する。結果は正本§12へ記録する。
 
+### 2026-11-18: ページ内スクロールの描画済み layout の印（§1.474）
+
+[ページ内スクロール設計 r4 §2.3](fullscreen-in-page-scroll-plan.md)（独立設計レビュー ACCEPT）に沿い、
+context 所有の `FullscreenPageLayout` に描画済み通常画像の表示単位・幾何の印を1つ追加する。
+layout の既存の swap / clear / begin と同じ寿命に置き、別の pending・世代同期・配送状態は作らない。
+キーとホイールは既存の入力配送を通り、所有 context の layout・`fs_pan`・`fs_zoom` だけを読み書きする。
+兄弟 context を失効・変更させず、detached 述語・viewport 経路・HWND は変更しない。
+入力時の実効倍率（`fs_zoom_pan()` が None なら1、Someならその倍率）が所有 layout の描画時と異なる場合は
+消費のみとし、次の描画からスクロールを受け付ける。スクロールを書き込むときは同じ context の `fs_zoom` も
+layout の実効倍率に揃え、見た目の倍率を保つ（設計 §6.9）。raw 倍率の比較で代用しない。
+既存のパン制約は変更せず、待機・再配送・新しい pending 状態を追加しない（設計 §6.8 の B 決定）。
+旧 layout に入力を適用しない照合であり、detached の症状パッチではない。
+
+2026-11-18 r2追補（独立実装レビュー担当 Sol / xhigh の r2 指摘と、設計担当のコード判断に基づく対応）:
+ページ内スクロールの入力照合は、detached runtimeの取得済み自動trim回答を優先する。
+RAWプレビューの描画が既存の画素cacheへ回答を入れてもruntimeへ保存しない場合は、
+入力側も同じload_seq・画素pointerに対応する取得済み回答を読む。`ui_view_trim` の解析・Static限定のruntime保存規則は変更しない。
+`canonical_demand` の画素cache readerだけを共用し、そのcollectorのruntime必須の規則も維持する。
+新Actionの前面メニュー判定は、幾何の入力先と同じviewport IDを使い、eguiの既存のviewport別Popup記憶を読む。
+ROOTの配送そのもの、固定矢印、HWND・focus・配置・runtimeの保存・contextの所有・swapは変更しない。
+実装担当のコード上の判断でも、描画と入力で同じ所有者の取得済み情報を読む照合境界の修正であり、
+新しいdetached状態、時間窓、再試行や症状を隠す保存処理は追加しない。
+独立実装レビュー r3 (Sol / xhigh、6ba253d26) と設計担当 (ClaudeCode) の双方が、§2 に照らして「症状パッチではなく構造的修正である」ことに合意した
+(描画と入力の読み取り契約の不一致を直す変更で、証拠が無ければ照合不成立にし、未知値の補完や失敗の隠蔽をしない)。
+
 ### 2026-11-17: §1.800 S1 の仮想フォルダと親との対応
 
 設計担当の §4S（独立設計レビュー r10 ACCEPT）と実装の独立レビューで、UI の一回限りの

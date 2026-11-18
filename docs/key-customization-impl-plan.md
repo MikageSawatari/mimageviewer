@@ -608,6 +608,20 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 ## 10. 新しいキー操作を追加するとき (保守 runbook)
 
+§1.474: `FsPageNScrollNext` / `FsPageNScrollPrev`（既定 K / J）と
+`FsPageScrollUp` / `Down` / `Left` / `Right`（既定なし）は FsImage / Press / リピート可 /
+SinglePerFrame のキーボード専用操作。通常のページ単位静止画だけで受け付け、面の外や前面 UI
+（fallback 右クリックメニューを含む）所有中は消費しない。面が成立して描画幾何・実効倍率を照合できない場合は
+消費のみ。倍率は raw 値でなく `fs_zoom_pan()` の描画時の値（Noneなら1）を比較し、スクロール書込時は
+`fs_zoom` も layout の実効倍率に揃えて見た目を保つ。同じ frame に Ctrl+ホイール・キー拡大で実効倍率が変わったときもスクロールを持ち越さず、
+次の新しい描画済み layout から受け付ける。N 字 / Z 字は全体の順序設定を選ぶ同じ2操作で、順序切替 Action は追加しない。
+リング・ジェスチャ・マウスボタン・ゲームパッドの候補は増やさない。
+修飾なし ↑↓ は従来の固定ナビゲーション helper の結果だけを設定でページ内スクロールへ置換する。
+Shift+↑↓・←→・スタックジャンプ・動画の既存操作は維持する。固定入力と新 Action の所有規則を
+混同せず、既定 K の編集ツール・J/K の動画操作との文脈分離、ini 往復・生成 default・? ヘルプも確認する。
+詳細は [キー仕様](keymap-spec.md#ページ内スクロールと指定順の移動1474) と
+[設計 §2.5–2.9](fullscreen-in-page-scroll-plan.md) を参照。
+
 §1.672: `GridPhysicalParentFolder` は Grid / Press / 既定未割り当て。
 リング系 `GridPhysicalParentFolder` と対応し、マウスボタン・リング・ジェスチャ・
 ゲームパッドの Grid 候補にも含む。各 dispatcher とフォルダバーは

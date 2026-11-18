@@ -22,6 +22,7 @@ pub(crate) mod canonical_demand;
 mod compare_original;
 mod spread_step;
 use crate::app::spread_shift_owner::retire_spread_step;
+pub(crate) mod in_page_scroll;
 mod initial_placement;
 pub(crate) use initial_placement::{FsAutomaticInitialView, FsInitialPlacementRequest};
 #[cfg(test)]
@@ -6230,6 +6231,7 @@ struct FsOverflowPanelView {
     state: FsOverflowPanelState,
     root_rows: Vec<FsOverflowPanelRow>,
     navigator_corner: FullscreenNavigatorCorner,
+    reading_order: crate::settings::FullscreenNScrollOrder,
     shift: SpreadShiftHudView,
     music_note_color_scheme: crate::music_note_color::MusicNoteColorScheme,
     composition_available: bool,
@@ -6301,6 +6303,7 @@ enum FsOverflowPanelAction {
     Back,
     Activate(FullscreenOverflowItemId),
     SetNavigatorCorner(FullscreenNavigatorCorner),
+    SetReadingOrder(crate::settings::FullscreenNScrollOrder),
     JumpShiftAnchor(usize),
     ClearShift,
     SetShiftMemory(bool),
@@ -6331,6 +6334,7 @@ fn fs_overflow_panel_body_row_count(state: FsOverflowPanelState) -> usize {
         FsOverflowPanelState::Closed => 0,
         FsOverflowPanelState::Root => FullscreenOverflowItemId::fixed_order().len() + 1,
         FsOverflowPanelState::NavigatorPosition => 1 + FullscreenNavigatorCorner::ALL.len(),
+        FsOverflowPanelState::PageReadingOrder => 3,
         FsOverflowPanelState::SpreadAdjustment => 6,
         FsOverflowPanelState::MusicNoteColor => 2,
         // Fixed back row + four 48pt sliders + two 24pt headings + three end rows.
@@ -6713,6 +6717,7 @@ fn draw_fs_overflow_panel_surface(
     let title = match view.state {
         FsOverflowPanelState::Root => "その他の機能",
         FsOverflowPanelState::NavigatorPosition => "ナビゲータ位置",
+        FsOverflowPanelState::PageReadingOrder => "ページ内の読み順",
         FsOverflowPanelState::SpreadAdjustment => "見開きの調整",
         FsOverflowPanelState::MusicNoteColor => "音名の色",
         FsOverflowPanelState::Slideshow => "スライドショー",
@@ -6875,6 +6880,19 @@ fn draw_fs_overflow_panel_surface(
                             .clicked()
                             {
                                 action = Some(FsOverflowPanelAction::SetNavigatorCorner(corner));
+                            }
+                        }
+                    }
+                    FsOverflowPanelState::PageReadingOrder => {
+                        if draw_fs_overflow_panel_row(ui, "reading_order_back", "<  戻る", "", false, true, None).clicked() {
+                            action = Some(FsOverflowPanelAction::Back);
+                        }
+                        use crate::settings::FullscreenNScrollOrder;
+                        for order in [FullscreenNScrollOrder::VerticalFirst, FullscreenNScrollOrder::HorizontalFirst] {
+                            let selected = order == view.reading_order.normalized();
+                            if draw_fs_overflow_panel_row(ui, ("reading_order", order as u8), order.label(),
+                                if selected { "選択中" } else { "" }, selected, true, None).clicked() {
+                                action = Some(FsOverflowPanelAction::SetReadingOrder(order));
                             }
                         }
                     }
@@ -17629,6 +17647,30 @@ fn resolve_spread_display_composition(
     )
 }
 
+fn spread_composition_requires_complete(
+    mode: SpreadMode,
+    final_cover: bool,
+    placement: crate::settings::SingletonSpreadEndpointSettings,
+    page_alone: crate::settings::PageAloneSettings,
+) -> bool {
+    (mode.has_cover() && final_cover)
+        || placement.first
+        || placement.last
+        || (mode.has_cover() && (page_alone.after_cover || page_alone.last))
+}
+
+fn effective_spread_page_alone(
+    mode: SpreadMode,
+    requested: crate::settings::PageAloneSettings,
+    complete: bool,
+) -> crate::settings::PageAloneSettings {
+    if mode.has_cover() && complete {
+        requested
+    } else {
+        Default::default()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct SpreadDisplayUnitsToken {
     items_generation: u64,
@@ -19812,6 +19854,15 @@ struct FsWheelAction {
     input: crate::wheel_input::WheelInput,
     segment: crate::wheel_input::WheelSegment,
     operation: Option<ViewerOperationId>,
+    class: FsWheelInPageClass,
+    scroll_origin: Option<in_page_scroll::FsDrawnUnitStamp>,
+    seek_hover: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum FsWheelInPageClass {
+    InPageScroll(egui::Vec2),
+    Legacy,
 }
 
 /// Pass-local input proposals. Existing recognizers retain gesture ownership;
@@ -20291,6 +20342,7 @@ pub fn draw_spread_shift_hud_snapshot_fixture(ui: &mut egui::Ui, unresolved: boo
         state: FsOverflowPanelState::SpreadAdjustment,
         root_rows: Vec::new(),
         navigator_corner: FullscreenNavigatorCorner::BottomRight,
+        reading_order: Default::default(),
         shift,
         music_note_color_scheme: Default::default(),
         slideshow: Default::default(),
@@ -20313,6 +20365,7 @@ pub fn draw_composition_editor_hud_snapshot_fixture(
         state: FsOverflowPanelState::Root,
         root_rows: Vec::new(),
         navigator_corner: FullscreenNavigatorCorner::BottomRight,
+        reading_order: Default::default(),
         shift: SpreadShiftHudView::default(),
         composition_available: available,
         composition_managed: managed,
@@ -20849,11 +20902,11 @@ impl App {
                 .complete_page_permutation(nav, self.items_generation)
                 .unwrap_or_else(|| self.spread_complete_page_permutation(nav))
         });
-        let page_alone = if complete_proof == Some(true) {
-            requested_page_alone
-        } else {
-            crate::settings::PageAloneSettings::default()
-        };
+        let page_alone = effective_spread_page_alone(
+            self.spread_mode,
+            requested_page_alone,
+            complete_proof == Some(true),
+        );
         if let Some(units) = self.spread_display_units_cache.get_with_source(
             nav,
             self.items_generation,
@@ -21085,6 +21138,53 @@ impl App {
             .unwrap_or_else(|| self.facet_outside_composition(anchor_idx))
     }
 
+    /// Read the ordinary composition from its installed navigation/unit owners.
+    /// Missing topology/complete-list proof is unknown; never build it here.
+    fn peek_spread_display_composition_for_anchor(
+        &self,
+        anchor_idx: usize,
+    ) -> Option<SpreadDisplayComposition> {
+        if !self.spread_mode.is_spread() {
+            return SpreadDisplayComposition::from_navigation_pages(anchor_idx, &[anchor_idx]);
+        }
+        let navigation = &self.viewer_navigation_caches;
+        let cache = &self.spread_display_units_cache;
+        let token = cache.token.as_ref()?;
+        let nav = navigation.nav_indices.as_ref()?;
+        if !self.final_demand_visible_inputs_are_current()
+            || navigation.source != Some((self.items_generation, self.reading_flow))
+            || !Arc::ptr_eq(nav, &token.nav)
+        {
+            return None;
+        }
+        if !nav.contains(&anchor_idx) {
+            self.peek_rotation(anchor_idx)?;
+            return Some(self.facet_outside_composition(anchor_idx));
+        }
+        let final_cover = self.final_cover_spread_enabled_for_current_book();
+        let placement = self.spread_singleton_display_endpoint_settings();
+        let alone = self.page_alone_enabled_for_current_book();
+        let needs_complete =
+            spread_composition_requires_complete(self.spread_mode, final_cover, placement, alone);
+        let eligible = if needs_complete && self.spread_complete_book_context_eligible() {
+            cache.complete_page_permutation?
+        } else {
+            false
+        };
+        let page_alone = effective_spread_page_alone(self.spread_mode, alone, eligible);
+        if token.page_alone != page_alone {
+            return None;
+        }
+        self.spread_display_composition_for_cached_unit(
+            &cache.units,
+            cache.unit_position(anchor_idx)?,
+            anchor_idx,
+            final_cover,
+            placement,
+            eligible,
+        )
+    }
+
     /// A currently shown page may outlive a temporary facet. Keep that one real
     /// page without importing excluded neighbors or automatic endpoint companions.
     fn facet_outside_unit(&self, idx: usize) -> SpreadDisplayUnit {
@@ -21174,14 +21274,12 @@ impl App {
     ) -> (bool, crate::settings::SingletonSpreadEndpointSettings, bool) {
         let final_cover_enabled = self.final_cover_spread_enabled_for_current_book();
         let singleton_placement_enabled = self.spread_singleton_display_endpoint_settings();
-        let eligible = ((self.spread_mode.has_cover() && final_cover_enabled)
-            || singleton_placement_enabled.first
-            || singleton_placement_enabled.last
-            || (self.spread_mode.has_cover() && {
-                let page_alone = self.page_alone_enabled_for_current_book();
-                page_alone.after_cover || page_alone.last
-            }))
-            && self.spread_complete_book_eligible(nav);
+        let eligible = spread_composition_requires_complete(
+            self.spread_mode,
+            final_cover_enabled,
+            singleton_placement_enabled,
+            self.page_alone_enabled_for_current_book(),
+        ) && self.spread_complete_book_eligible(nav);
         (final_cover_enabled, singleton_placement_enabled, eligible)
     }
 
@@ -25449,6 +25547,15 @@ impl App {
     }
 
     fn fs_front_menu_presented(&mut self, ctx: &egui::Context, full_rect: egui::Rect) -> bool {
+        self.fs_front_menu_presented_for_viewport(ctx, full_rect, ctx.viewport_id())
+    }
+
+    fn fs_front_menu_presented_for_viewport(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        viewport: egui::ViewportId,
+    ) -> bool {
         let Some(idx) = self.fullscreen_idx else {
             return false;
         };
@@ -25460,15 +25567,28 @@ impl App {
             self.panorama_state().is_some(),
             self.fs_exclusive_view_active(idx).is_some(),
         );
-        let rotation = fs_rotation_popup_open(ctx);
-        let seek = fs_still_seek_strip_popup_open(ctx);
+        let (rotation, seek, any_popup) = if viewport == ctx.viewport_id() {
+            (
+                fs_rotation_popup_open(ctx),
+                fs_still_seek_strip_popup_open(ctx),
+                egui::Popup::is_any_open(ctx),
+            )
+        } else {
+            let popup = egui::Popup::current_open_id_for(ctx, viewport);
+            (
+                popup == Some(egui::Id::unique("fs_rotation_btn").with("popup")),
+                popup
+                    == Some(egui::Id::unique(FULLSCREEN_STILL_SEEK_STRIP_BUTTON_ID).with("popup")),
+                popup.is_some(),
+            )
+        };
         (self.fullscreen_top_bar_chrome_allowed(idx)
             && ((eligible.image && (self.fit_popup_open || self.spread_popup_open || rotation))
                 || (eligible.panorama && self.panorama_projection_popup_open)))
             || (seek && self.fullscreen_seek_menu_eligible(full_rect, idx))
             || self.fs_context_menu_presented()
             // egui memory is viewport scoped. Known menus above also need their draw gate.
-            || (egui::Popup::is_any_open(ctx) && !rotation && !seek)
+            || (any_popup && !rotation && !seek)
     }
 
     fn fullscreen_top_bar_locked_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
@@ -28848,6 +28968,7 @@ impl App {
                         fs_input_ms = input_t0.elapsed().as_secs_f64() * 1000.0;
 
                         self.retire_fs_initial_placement_request();
+                        self.fullscreen_page_layout.drawn_unit = None;
                         if self.paint_viewer_presentation_interlude(ui, full_rect, ctx, detached, canvas_color) {
                             return;
                         }
@@ -29487,6 +29608,14 @@ impl App {
                             );
                         }
 
+                        if selected_display_unit.is_current()
+                            && checking_mode_surface.is_none()
+                            && display_permission_allowed
+                            && primary_draw.draws_ordinary()
+                            && similar_preview_presentation.is_none()
+                        {
+                            self.record_fs_scroll_drawn_unit(ctx, image_rect, &display_composition, &navigator_texture_sources);
+                        }
                         if presentation_trace_allowed {
                             self.emit_fs_page_turn_ready_for_display_unit(
                             ctx,
@@ -36326,10 +36455,22 @@ impl App {
             !is_video_fs && !fs_music_view_active,
             !stack_flat_nav,
         );
+        // Route the one typed consume result, never re-read the current modifier level.
+        // The fallback menu owns replacement input even outside the scroll surface.
+        let replace_up_down = self.settings.fullscreen_up_down_key_action.normalized()
+            == crate::settings::FullscreenUpDownKeyAction::InPageScroll
+            && (self.fs_context_menu_idx.is_some() || self.fs_in_page_scroll_surface());
+        let plain_scroll = |input: crate::keymap::PageTurnConsumeResult| {
+            replace_up_down
+                && matches!(input, crate::keymap::PageTurnConsumeResult::Trigger(input)
+                if input.chord == Chord::key(KeyName::Up) || input.chord == Chord::key(KeyName::Down))
+        };
+        let scroll_down = plain_scroll(arrow_down_input);
+        let scroll_up = plain_scroll(arrow_up_input);
         let arrow_down = video_file_nav == Some(KeyAction::VideoNextFile)
-            || (arrow_down_input.should_navigate() && !stack_shift_arrow);
+            || (arrow_down_input.should_navigate() && !stack_shift_arrow && !scroll_down);
         let arrow_up = video_file_nav == Some(KeyAction::VideoPrevFile)
-            || (arrow_up_input.should_navigate() && !stack_shift_arrow);
+            || (arrow_up_input.should_navigate() && !stack_shift_arrow && !scroll_up);
         let key_home = self.keymap.consume_action(ctx, KeyAction::FsJumpFirst);
         let key_end = self.keymap.consume_action(ctx, KeyAction::FsJumpLast);
         let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
@@ -37547,6 +37688,33 @@ impl App {
                 crate::app::HistoryTrigger::UserChosen,
             );
         }
+        // Geometry-changing key handlers above have finished. These local input
+        // results expire in this pass, before wheel/click planning starts.
+        if self.fs_context_menu_idx.is_none() && self.fs_in_page_scroll_surface() {
+            if scroll_down {
+                self.apply_fs_page_scroll_key(ctx, KeyAction::FsPageScrollDown);
+            }
+            if scroll_up {
+                self.apply_fs_page_scroll_key(ctx, KeyAction::FsPageScrollUp);
+            }
+            if !owner.blocks_legacy_keymap_shortcuts()
+                && !self.fs_overflow_panel_state.is_open()
+                && !self.fs_page_scroll_front_menu_presented(ctx)
+            {
+                for key_action in [
+                    KeyAction::FsPageScrollUp,
+                    KeyAction::FsPageScrollDown,
+                    KeyAction::FsPageScrollLeft,
+                    KeyAction::FsPageScrollRight,
+                    KeyAction::FsPageNScrollNext,
+                    KeyAction::FsPageNScrollPrev,
+                ] {
+                    if self.keymap.consume_action(ctx, key_action) {
+                        self.apply_fs_page_scroll_key(ctx, key_action);
+                    }
+                }
+            }
+        }
         let nav_next = if vertical_reading {
             (arrow_right && !horizontal_cursor_rtl) || (arrow_left && horizontal_cursor_rtl)
         } else if horizontal_reading {
@@ -38092,6 +38260,15 @@ impl App {
                     true,
                     None,
                 ),
+                FullscreenOverflowItemId::PageReadingOrder => (
+                    item.label().into(),
+                    format!(
+                        "{}  >",
+                        self.settings.fullscreen_n_scroll_order.normalized().label()
+                    ),
+                    true,
+                    None,
+                ),
                 FullscreenOverflowItemId::PageTurnAnimationToggle => (
                     self.keymap.first_chord_bracket_label(
                         item.label(),
@@ -38169,6 +38346,7 @@ impl App {
             state: self.fs_overflow_panel_state,
             root_rows,
             navigator_corner: self.settings.fullscreen_navigator_corner.normalized(),
+            reading_order: self.settings.fullscreen_n_scroll_order.normalized(),
             shift: self.spread_shift_hud_view(),
             music_note_color_scheme: self.settings.music_note_color_scheme,
             composition_available: self.composition_editor_available(),
@@ -38370,6 +38548,7 @@ impl App {
             state: FsOverflowPanelState::MusicNoteColor,
             root_rows: Vec::new(),
             navigator_corner: FullscreenNavigatorCorner::BottomRight,
+            reading_order: Default::default(),
             shift: Default::default(),
             music_note_color_scheme: self.settings.music_note_color_scheme,
             slideshow: FsSlideshowSettings::from_settings(&self.settings),
@@ -38479,6 +38658,9 @@ impl App {
                 FullscreenOverflowItemId::NavigatorPosition => {
                     self.fs_overflow_panel_state = FsOverflowPanelState::NavigatorPosition;
                 }
+                FullscreenOverflowItemId::PageReadingOrder => {
+                    self.fs_overflow_panel_state = FsOverflowPanelState::PageReadingOrder;
+                }
                 FullscreenOverflowItemId::PageTurnAnimationToggle => {
                     self.toggle_page_turn_animation()
                 }
@@ -38499,6 +38681,10 @@ impl App {
             FsOverflowPanelAction::SetNavigatorCorner(corner) => {
                 self.set_fullscreen_navigator_corner(corner);
                 self.fs_overflow_panel_state = FsOverflowPanelState::Root;
+            }
+            FsOverflowPanelAction::SetReadingOrder(order) => {
+                self.settings.fullscreen_n_scroll_order = order.normalized();
+                self.settings.save();
             }
             FsOverflowPanelAction::JumpShiftAnchor(target) => {
                 if view.shift.enabled
@@ -41308,17 +41494,35 @@ impl App {
                     ));
                 }
             }
+            let class = self.fs_wheel_segment_in_page_scroll(wheel, cursor_in_seek_panel);
             if wheel_y.abs() > 0.5 && suppress_egui_wheel {
                 // F12 detached 動画では native presenter child HWND がホイールを
                 // `NavigateItem` / tile 列変更に変換する。親の egui detached viewport にも
                 // 同じ wheel が届く環境があるため、ここでは消費だけして二重ナビを防ぐ。
                 crate::wheel_input::consume_wheel_segment(ctx, segment);
-            } else if wheel_y.abs() > 0.5 && handle_wheel_here {
+            } else if handle_wheel_here && {
+                match class {
+                    FsWheelInPageClass::InPageScroll(delta) => {
+                        delta.is_finite() && delta != egui::Vec2::ZERO
+                    }
+                    FsWheelInPageClass::Legacy => wheel_y.abs() > 0.5,
+                }
+            } {
+                let scroll_origin = if matches!(class, FsWheelInPageClass::InPageScroll(_))
+                    && self.fs_scroll_layout_matches(ctx)
+                {
+                    self.fullscreen_page_layout.drawn_unit.clone()
+                } else {
+                    None
+                };
                 accepted_wheel.push(FsWheelAction {
                     input: wheel,
                     segment,
                     operation: self
                         .page_turn_wheel_navigation_operation(ctx, segment.last_raw_ordinal),
+                    class,
+                    scroll_origin,
+                    seek_hover: cursor_in_seek_panel,
                 });
             }
 
@@ -41406,6 +41610,9 @@ impl App {
     }
 
     fn fs_wheel_action_requests_navigation(&self, action: &FsWheelAction) -> bool {
+        if matches!(action.class, FsWheelInPageClass::InPageScroll(_)) {
+            return false;
+        }
         if self.fs_exclusive_view.is_depth() {
             return !action.input.modifiers.ctrl;
         }
@@ -41454,8 +41661,8 @@ impl App {
         let options = ctx.options(|options| options.input_options);
         ctx.input(|input| crate::wheel_input::remaining_wheel_segments(input, options))
             .into_iter()
-            .filter(|segment| {
-                eligible.iter().any(|accepted| {
+            .filter_map(|segment| {
+                let accepted = eligible.iter().find(|accepted| {
                     match (
                         segment.first_raw_ordinal,
                         segment.last_raw_ordinal,
@@ -41467,18 +41674,27 @@ impl App {
                         }
                         _ => false,
                     }
+                })?;
+                Some(FsWheelAction {
+                    input: segment.input,
+                    segment,
+                    // Preserve ingress attribution and admission even when front UI
+                    // splits a segment or a new layout is painted before dispatch.
+                    operation: eligible
+                        .iter()
+                        .find(|accepted| {
+                            accepted.segment.last_raw_ordinal == segment.last_raw_ordinal
+                        })
+                        .and_then(|accepted| accepted.operation),
+                    class: match accepted.class {
+                        FsWheelInPageClass::InPageScroll(_) => {
+                            FsWheelInPageClass::InPageScroll(segment.input.delta)
+                        }
+                        FsWheelInPageClass::Legacy => FsWheelInPageClass::Legacy,
+                    },
+                    scroll_origin: accepted.scroll_origin.clone(),
+                    seek_hover: accepted.seek_hover,
                 })
-            })
-            .map(|segment| FsWheelAction {
-                input: segment.input,
-                segment,
-                // A bar action may have changed the projected destination by
-                // now. Retain the immutable ingress fact captured by its owner,
-                // rather than attributing this input to the new destination.
-                operation: eligible
-                    .iter()
-                    .find(|accepted| accepted.segment.last_raw_ordinal == segment.last_raw_ordinal)
-                    .and_then(|accepted| accepted.operation),
             })
             .collect()
     }
@@ -41564,6 +41780,21 @@ impl App {
         let mut wheel_actions = accepted_wheel.into_iter().peekable();
         while let Some(wheel_action) = wheel_actions.next() {
             let wheel = wheel_action.input;
+            if let FsWheelInPageClass::InPageScroll(_) = wheel_action.class {
+                if !wheel_navigation_produced
+                    && !suppress_wheel_navigation
+                    && wheel_action.scroll_origin.as_ref().is_some_and(|origin| {
+                        self.fullscreen_page_layout.drawn_unit.as_ref() == Some(origin)
+                    })
+                    && self.fs_context_menu_idx.is_none()
+                    && let FsWheelInPageClass::InPageScroll(delta) =
+                        self.fs_wheel_segment_in_page_scroll(wheel, wheel_action.seek_hover)
+                {
+                    let pan = self.fs_page_scroll_wheel_pan(ctx, self.fs_zoom, self.fs_pan, delta);
+                    self.write_fs_page_scroll_pan(pan);
+                }
+                continue;
+            }
             let wheel_y = wheel.delta.y;
             let modifiers = wheel.modifiers;
             let ctrl_held = modifiers.ctrl;
@@ -41909,7 +42140,7 @@ impl App {
     }
 
     fn propose_fs_wheel_click_transform(
-        &self,
+        &mut self,
         ctx: &egui::Context,
         image_rect: egui::Rect,
         actions: &[FsWheelAction],
@@ -41924,6 +42155,28 @@ impl App {
         if ordinary_zoom {
             let mouse = ctx.input(|input| input.pointer.hover_pos());
             for action in actions {
+                if let FsWheelInPageClass::InPageScroll(delta) = action.class {
+                    if self.fs_context_menu_idx.is_none()
+                        && action.scroll_origin.as_ref().is_some_and(|origin| {
+                            self.fullscreen_page_layout.drawn_unit.as_ref() == Some(origin)
+                        })
+                    {
+                        let next_pan = self.fs_page_scroll_wheel_pan(ctx, zoom, pan, delta);
+                        if next_pan != pan {
+                            zoom = self.fs_page_scroll_drawn_zoom();
+                            pan = next_pan;
+                        }
+                    }
+                    continue;
+                }
+                // Later page-local segments belong to the page we are leaving.
+                if actions
+                    .iter()
+                    .any(|action| matches!(action.class, FsWheelInPageClass::InPageScroll(_)))
+                    && self.fs_wheel_action_requests_navigation(action)
+                {
+                    break;
+                }
                 if action.input.modifiers.ctrl
                     && self
                         .fullscreen_idx
@@ -41984,16 +42237,7 @@ impl App {
             || pan.length_sq() > PAN_EPSILON_SQ;
         // Dedicated media, continuous, zoom-mode and editing surfaces retain
         // their released click/reset policy.
-        let ordinary_still = !is_video
-            && !continuous_active
-            && self.reading_flow.is_paged()
-            && self.fs_zoom_owner() == FsZoomOwner::Image
-            && matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
-            && !self.view_trim_mode
-            && self
-                .fullscreen_idx
-                .and_then(|idx| self.items.get(idx))
-                .is_some_and(GridItem::has_page_data);
+        let ordinary_still = !is_video && !continuous_active && self.fs_in_page_scroll_surface();
         let belongs_to_view = if ordinary_still {
             self.fs_view_has_moved(zoom, pan, rotation)
         } else {
@@ -67327,6 +67571,7 @@ mod tests {
         for state in [
             FsOverflowPanelState::Root,
             FsOverflowPanelState::NavigatorPosition,
+            FsOverflowPanelState::PageReadingOrder,
             FsOverflowPanelState::SpreadAdjustment,
             FsOverflowPanelState::MusicNoteColor,
             FsOverflowPanelState::Slideshow,
@@ -67356,6 +67601,7 @@ mod tests {
                             })
                             .collect(),
                         navigator_corner: FullscreenNavigatorCorner::BottomRight,
+                        reading_order: Default::default(),
                         shift: SpreadShiftHudView {
                             status: "保存した基点が現在の一覧にありません".into(),
                             anchor: "基点: chapter/003.jpg（現在の一覧外）".into(),
@@ -67414,8 +67660,13 @@ mod tests {
                     for _ in 0..3 {
                         (before, clip) = draw(vec![]);
                     }
+                    let body_fits = panel.height() + 0.01
+                        >= FS_OVERFLOW_PANEL_HEADER_HEIGHT
+                            + FS_OVERFLOW_PANEL_PADDING * 2.0
+                            + fs_overflow_panel_body_row_count(state) as f32
+                                * FS_OVERFLOW_PANEL_ROW_HEIGHT;
                     before.assert_height(
-                        if size.y > 400.0 {
+                        if body_fits {
                             HeightExpectation::Fits
                         } else {
                             HeightExpectation::Scrolls
@@ -67440,12 +67691,14 @@ mod tests {
                             (before.content.y - expected_body).abs() <= tolerance,
                             "fixed rows changed height: state={state:?}, spacing={ambient_spacing}, layout={before:?}"
                         );
-                        assert!(
-                            (before.inner.height() - expected_body).abs() <= tolerance,
-                            "body budget counted extra spacing: state={state:?}, spacing={ambient_spacing}, layout={before:?}"
-                        );
+                        if body_fits {
+                            assert!(
+                                (before.inner.height() - expected_body).abs() <= tolerance,
+                                "body budget counted extra spacing: state={state:?}, spacing={ambient_spacing}, layout={before:?}"
+                            );
+                        }
                     }
-                    if size.y < 400.0 {
+                    if !body_fits {
                         let (mut after, mut after_clip) = (before, clip);
                         for frame in 0..40 {
                             (after, after_clip) = draw(if frame == 0 {
@@ -67578,10 +67831,21 @@ mod tests {
                                     disabled_reason: None,
                                 },
                             );
+                            root_rows.insert(
+                                4,
+                                FsOverflowPanelRow {
+                                    item: FullscreenOverflowItemId::PageReadingOrder,
+                                    label: "ページ内の読み順".into(),
+                                    status: "縦優先 (N 字)  >".into(),
+                                    enabled: true,
+                                    disabled_reason: None,
+                                },
+                            );
                             let view = FsOverflowPanelView {
                                 state,
                                 root_rows,
                                 navigator_corner: FullscreenNavigatorCorner::BottomRight,
+                                reading_order: Default::default(),
                                 shift: Default::default(),
                                 composition_available: true,
                                 composition_managed: false,
@@ -67595,7 +67859,7 @@ mod tests {
                 });
             });
         harness.run();
-        if size.y >= 614.0 {
+        if size.y >= 680.0 {
             let (inner, content, offset) = harness.ctx.data(|data| {
                 data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout"))
                     .unwrap()
@@ -67625,9 +67889,8 @@ mod tests {
 
     #[test]
     fn fullscreen_overflow_panel_tall_viewport_keeps_the_production_body_height() {
-        // Ten root rows need a viewport at least 608pt high, including the
-        // toolbar, header, panel padding and outer margins.
-        for size in [egui::vec2(720.0, 614.0), egui::vec2(720.0, 720.0)] {
+        // Eleven root rows need another 48pt for the reading-order entry.
+        for size in [egui::vec2(720.0, 680.0), egui::vec2(720.0, 720.0)] {
             // The shared fixture retains its original Fits assertion; no PNG is
             // needed to detect the 8pt viewport shrink from build_ui's outer frame.
             let _ = fullscreen_overflow_panel_harness(FsOverflowPanelState::Root, size, false);
@@ -67659,7 +67922,7 @@ mod tests {
         snapshot_fullscreen_overflow_panel(
             "fullscreen_overflow_panel_root_tall",
             FsOverflowPanelState::Root,
-            egui::vec2(720.0, 614.0),
+            egui::vec2(720.0, 680.0),
             false,
         );
     }
@@ -67671,6 +67934,16 @@ mod tests {
             FsOverflowPanelState::Root,
             egui::vec2(720.0, 440.0),
             true,
+        );
+    }
+
+    #[test]
+    fn fullscreen_overflow_panel_snapshot_reading_order() {
+        snapshot_fullscreen_overflow_panel(
+            "fullscreen_overflow_panel_reading_order",
+            FsOverflowPanelState::PageReadingOrder,
+            egui::vec2(720.0, 340.0),
+            false,
         );
     }
 
@@ -99054,6 +99327,7 @@ mod music_overflow_tests {
                 state: FsOverflowPanelState::MusicNoteColor,
                 root_rows: Vec::new(),
                 navigator_corner: FullscreenNavigatorCorner::BottomRight,
+                reading_order: Default::default(),
                 shift: Default::default(),
                 music_note_color_scheme: MusicNoteColorScheme::Fifths,
                 slideshow: Default::default(),

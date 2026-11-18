@@ -39,6 +39,12 @@ impl Drop for ResidentCollectionGuard {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn with_resident_metadata_only_for_test<R>(read: impl FnOnce() -> R) -> R {
+    let _guard = ResidentCollectionGuard::enter();
+    read()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct CanonicalViewInputs {
     full_rect: egui::Rect,
@@ -332,7 +338,7 @@ impl App {
         Some(resource)
     }
 
-    fn resident_canonical_trim(
+    pub(super) fn resident_canonical_trim(
         &self,
         idx: usize,
         side: Option<crate::view_trim::ViewTrimSpreadSide>,
@@ -348,7 +354,7 @@ impl App {
         }
     }
 
-    fn resident_canonical_auto_trim(
+    pub(super) fn resident_canonical_auto_trim(
         &self,
         idx: usize,
     ) -> Result<Option<egui::Rect>, CanonicalDemandUnavailable> {
@@ -361,6 +367,13 @@ impl App {
                 .detached_window_runtime_trim_bbox(window, idx)
                 .ok_or(CanonicalDemandUnavailable::AutoTrim);
         }
+        self.resident_pixel_auto_trim(idx)
+    }
+
+    pub(super) fn resident_pixel_auto_trim(
+        &self,
+        idx: usize,
+    ) -> Result<Option<egui::Rect>, CanonicalDemandUnavailable> {
         let (seq, ptr) = match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static {
                 load_seq, pixels, ..

@@ -2061,6 +2061,31 @@ navigation の previous holdover は capture 済みの通常 placement で前の
 source reload 待ちと Z holdover は既存 transform を使う。紙めくりの zoom / pan 適格条件は維持する。
 状態の所有・消去入口と検証範囲は [設計 r4](fullscreen-page-start-position-plan.md) を参照。
 
+#### ページ内スクロールの描画済み幾何 (§1.474)
+
+通常のページ単位静止画は、current の表示単位を最後まで描いた layout だけに
+`FsDrawnUnitStamp` を記録する。印は context 所有の `FullscreenPageLayout` に含め、begin / clear で消す。
+items 世代、画面上の左右順・役割・片側配置を含む実ページと slice、矩形を決める実引数から作る
+`FsScrollGeometryKey` を持つ。白 companion は幾何だけに含める。部分描画、holdover を最終表示した
+frame、Z・比較・分析・360・3D などの経路には印を付けない。
+
+入力時は描画と同じ helper で現在単位の鍵を作り、対象 fullscreen viewport の矩形・DPI を使って照合する。
+同期読み込みや前回値による補完はせず、不一致・幾何未取得・navigation 待ち・紙めくり中は入力を消費するだけで
+持ち越さない。照合するのは raw の `fs_zoom` ではなく、描画へ渡す実効倍率
+（`fs_zoom_pan()` が None なら1、Someならその倍率）と layout の描画時の実効倍率。
+Ctrl+ホイール・キー拡大などで同じ frame に実効倍率が変わった場合も消費のみとし、次の frame の新しい描画済み layout から動かす。
+ページ内スクロールには前 frame の矩形の倍率投影を使わず、既存の手動パン・ズームの clamp は変更しない。
+範囲は clip 前の `paint_quad()` の四隅の外接（白 companion 込み）から求め、はみ出す軸だけ動かす。
+候補を既存の実ページ48px可視 clamp に通し、意図した向きへ進む候補だけを採る。N 字 / Z 字の折り返しも
+主軸の移動と反対端への移動を1候補にまとめ、循環を作らない。
+
+キーは幾何変更キーの後・クリック計画の前に、その context の `fs_pan` へ書く。スクロールを書き込むときは
+`fs_zoom` も layout を描いた実効倍率へ揃える。例えば raw 0.9995 / pan 0 が実効1倍で描かれていた場合は
+1.0を書き、pan を付けたことで描画寸法が変わらないようにする。見た目の倍率と既存の `fs_zoom_pan_for` は変えない。
+ホイールの実適用と同 frame のクリック予測は同じスクロール計算を使う。利用者入力として初期配置要求を退役させるが、
+`fs_automatic_initial_view` は変更しないため、スクロール後のクリック送り / ダブルクリックの規則を保つ。
+detached の入力配送・viewport 経路は変更しない。詳細は [設計 §2・§6.8–6.9](fullscreen-in-page-scroll-plan.md)。
+
 ### 部分矩形 (content bbox) の座標系 — 2026-08-25 に分離
 
 `content_bbox` は**元画像空間**の正規化矩形である。作っているのは

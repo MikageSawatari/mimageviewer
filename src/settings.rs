@@ -1021,6 +1021,7 @@ pub enum FullscreenOverflowItemId {
     SpreadAdjustment,
     NavigatorToggle,
     NavigatorPosition,
+    PageReadingOrder,
     PageTurnAnimationToggle,
     SlideshowSettings,
     ImageAnalysis,
@@ -1035,6 +1036,7 @@ impl FullscreenOverflowItemId {
             Self::SpreadAdjustment,
             Self::NavigatorToggle,
             Self::NavigatorPosition,
+            Self::PageReadingOrder,
             Self::PageTurnAnimationToggle,
             Self::SlideshowSettings,
             Self::ImageAnalysis,
@@ -1049,6 +1051,7 @@ impl FullscreenOverflowItemId {
             Self::SpreadAdjustment => "見開きの調整",
             Self::NavigatorToggle => "ナビゲータ",
             Self::NavigatorPosition => "ナビゲータ位置",
+            Self::PageReadingOrder => "ページ内の読み順",
             Self::PageTurnAnimationToggle => "ページめくりアニメーション",
             Self::SlideshowSettings => "スライドショー",
             Self::ImageAnalysis => "分析ツール",
@@ -3912,6 +3915,99 @@ impl FullscreenHorizontalCursorDirection {
     }
 }
 
+/// 静止画のページ単位表示で修飾なし上下キーが行う操作。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FullscreenUpDownKeyAction {
+    #[default]
+    PageTurn,
+    InPageScroll,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FullscreenUpDownKeyAction {
+    pub fn all() -> &'static [Self] {
+        &[Self::PageTurn, Self::InPageScroll]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::PageTurn => "ページ送り",
+            Self::InPageScroll => "ページ内スクロール",
+            Self::Unknown => unreachable!(),
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::PageTurn,
+            value => value,
+        }
+    }
+}
+
+/// 静止画のページ単位表示で通常ホイールが行う操作。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FullscreenWheelAction {
+    #[default]
+    PageTurn,
+    InPageScroll,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FullscreenWheelAction {
+    pub fn all() -> &'static [Self] {
+        &[Self::PageTurn, Self::InPageScroll]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::PageTurn => "ページ送り",
+            Self::InPageScroll => "ページ内スクロール",
+            Self::Unknown => unreachable!(),
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::PageTurn,
+            value => value,
+        }
+    }
+}
+
+/// ページ内を指定の順で読む操作の優先軸。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FullscreenNScrollOrder {
+    #[default]
+    VerticalFirst,
+    HorizontalFirst,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FullscreenNScrollOrder {
+    pub fn all() -> &'static [Self] {
+        &[Self::VerticalFirst, Self::HorizontalFirst]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::VerticalFirst => "縦優先 (N 字)",
+            Self::HorizontalFirst => "横優先 (Z 字)",
+            Self::Unknown => unreachable!(),
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::VerticalFirst,
+            value => value,
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // FullscreenFitMode (フルスクリーン倍率/フィット基準)
 // -----------------------------------------------------------------------
@@ -5631,6 +5727,15 @@ pub struct Settings {
     /// 静止画フルスクリーンの通常の左右カーソルキーの方向。
     #[serde(default)]
     pub fullscreen_horizontal_cursor_direction: FullscreenHorizontalCursorDirection,
+    /// ページ単位の静止画表示で修飾なし上下キーが行う操作。
+    #[serde(default)]
+    pub fullscreen_up_down_key_action: FullscreenUpDownKeyAction,
+    /// ページ単位の静止画表示で通常ホイールが行う操作。
+    #[serde(default)]
+    pub fullscreen_wheel_action: FullscreenWheelAction,
+    /// ページ内の次へ / 前へスクロールで用いる順序。
+    #[serde(default)]
+    pub fullscreen_n_scroll_order: FullscreenNScrollOrder,
     /// 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。
     #[serde(default = "default_true")]
     pub fullscreen_page_number_overlay: bool,
@@ -8143,6 +8248,9 @@ impl Default for Settings {
             fullscreen_fixed_bar_gap_px: 0,
             fullscreen_seek_direction: FullscreenSeekDirection::default(),
             fullscreen_horizontal_cursor_direction: FullscreenHorizontalCursorDirection::default(),
+            fullscreen_up_down_key_action: FullscreenUpDownKeyAction::default(),
+            fullscreen_wheel_action: FullscreenWheelAction::default(),
+            fullscreen_n_scroll_order: FullscreenNScrollOrder::default(),
             fullscreen_page_number_overlay: true,
             fullscreen_keep_on_app_switch: false,
             fullscreen_cursor_hide_delay_secs: FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
@@ -10481,6 +10589,9 @@ impl Settings {
         };
         self.slideshow_continuous_scroll_percent =
             self.slideshow_continuous_scroll_percent.clamp(1, 100);
+        self.fullscreen_up_down_key_action = self.fullscreen_up_down_key_action.normalized();
+        self.fullscreen_wheel_action = self.fullscreen_wheel_action.normalized();
+        self.fullscreen_n_scroll_order = self.fullscreen_n_scroll_order.normalized();
         self.fullscreen_specified_scale.sanitize();
         self.fullscreen_specified_scale_max_tenths =
             self.fullscreen_specified_scale_max_tenths.clamp(
@@ -15893,6 +16004,77 @@ mod tests {
             }
         }
         assert!(FullscreenHorizontalCursorDirection::Unknown.is_rtl(true, false));
+    }
+
+    #[test]
+    fn fullscreen_in_page_scroll_settings_default_and_round_trip_independently() {
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            settings.fullscreen_up_down_key_action,
+            FullscreenUpDownKeyAction::PageTurn
+        );
+        assert_eq!(
+            settings.fullscreen_wheel_action,
+            FullscreenWheelAction::PageTurn
+        );
+        assert_eq!(
+            settings.fullscreen_n_scroll_order,
+            FullscreenNScrollOrder::VerticalFirst
+        );
+        for up_down in FullscreenUpDownKeyAction::all() {
+            for wheel in FullscreenWheelAction::all() {
+                for order in FullscreenNScrollOrder::all() {
+                    settings.fullscreen_up_down_key_action = *up_down;
+                    settings.fullscreen_wheel_action = *wheel;
+                    settings.fullscreen_n_scroll_order = *order;
+                    let loaded: Settings =
+                        serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+                    assert_eq!(loaded.fullscreen_up_down_key_action, *up_down);
+                    assert_eq!(loaded.fullscreen_wheel_action, *wheel);
+                    assert_eq!(loaded.fullscreen_n_scroll_order, *order);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fullscreen_in_page_scroll_settings_normalize_unknown_to_existing_defaults() {
+        let mut settings: Settings = serde_json::from_str(
+            r#"{
+            "fullscreen_up_down_key_action": "future_action",
+            "fullscreen_wheel_action": "future_action",
+            "fullscreen_n_scroll_order": "future_order"
+        }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            settings.fullscreen_up_down_key_action,
+            FullscreenUpDownKeyAction::Unknown
+        );
+        assert_eq!(
+            settings.fullscreen_wheel_action,
+            FullscreenWheelAction::Unknown
+        );
+        assert_eq!(
+            settings.fullscreen_n_scroll_order,
+            FullscreenNScrollOrder::Unknown
+        );
+        assert_eq!(settings.fullscreen_up_down_key_action.label(), "ページ送り");
+        assert_eq!(settings.fullscreen_wheel_action.label(), "ページ送り");
+        assert_eq!(settings.fullscreen_n_scroll_order.label(), "縦優先 (N 字)");
+        settings.sanitize();
+        assert_eq!(
+            settings.fullscreen_up_down_key_action,
+            FullscreenUpDownKeyAction::PageTurn
+        );
+        assert_eq!(
+            settings.fullscreen_wheel_action,
+            FullscreenWheelAction::PageTurn
+        );
+        assert_eq!(
+            settings.fullscreen_n_scroll_order,
+            FullscreenNScrollOrder::VerticalFirst
+        );
     }
 
     #[test]

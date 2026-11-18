@@ -479,6 +479,12 @@
 # FsZoomIn.2 = NumpadAdd ; 画像を拡大する
 # FsZoomOut.1 = , ; 画像を縮小する
 # FsZoomOut.2 = NumpadSubtract ; 画像を縮小する
+# FsPageNScrollNext = K ; ページ内を指定の順 (N 字 / Z 字) で次へ読み進める
+# FsPageNScrollPrev = J ; ページ内を指定の順 (N 字 / Z 字) で前へ戻る
+# FsPageScrollUp = none ; ページ内を上へスクロールする
+# FsPageScrollDown = none ; ページ内を下へスクロールする
+# FsPageScrollLeft = none ; ページ内を左へスクロールする
+# FsPageScrollRight = none ; ページ内を右へスクロールする
 # FsAiModelNext = U ; AIモデルを次へ切り替える
 # FsAiModelPrev = Shift+U ; AIモデルを前へ切り替える
 # FsAiModelReset = Alt+U ; AIモデルを標準に戻す

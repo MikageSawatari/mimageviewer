@@ -125,6 +125,8 @@ pub enum SyntheticNavigationKey {
     Tab,
     #[cfg(test)]
     Space,
+    #[cfg(test)]
+    K,
 }
 
 impl SyntheticNavigationKey {
@@ -149,6 +151,8 @@ impl SyntheticNavigationKey {
             Self::Tab => "Tab",
             #[cfg(test)]
             Self::Space => "Space",
+            #[cfg(test)]
+            Self::K => "K",
         }
     }
 
@@ -172,6 +176,8 @@ impl SyntheticNavigationKey {
             Self::Tab => PhysicalKeySlot::new(0x09, false),
             #[cfg(test)]
             Self::Space => PhysicalKeySlot::new(0x20, false),
+            #[cfg(test)]
+            Self::K => PhysicalKeySlot::new(0x4B, false),
         }
     }
 
@@ -195,6 +201,8 @@ impl SyntheticNavigationKey {
             Self::Tab => 0x0F,
             #[cfg(test)]
             Self::Space => 0x39,
+            #[cfg(test)]
+            Self::K => 0x25,
         }
     }
 
@@ -218,6 +226,8 @@ impl SyntheticNavigationKey {
             Self::Tab => egui::Key::Tab,
             #[cfg(test)]
             Self::Space => egui::Key::Space,
+            #[cfg(test)]
+            Self::K => egui::Key::K,
         }
     }
 }

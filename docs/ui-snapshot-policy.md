@@ -1,5 +1,21 @@
 # UI スナップショットテスト運用方針
 
+§1.474 のページ内スクロールは、環境設定の3項目を明／暗で描く
+`fullscreen_in_page_scroll_settings_light_default`（540×220、27,932 bytes）と
+`fullscreen_in_page_scroll_settings_dark_enabled`（540×220、29,450 bytes）、
+読み順の小パネル `fullscreen_overflow_panel_reading_order`（720×340、16,461 bytes）を追加した。
+既存の `fullscreen_overflow_panel_root` / `fullscreen_overflow_panel_page_turn_on`（各720×440）と
+`fullscreen_overflow_panel_root_tall`（720×680）は読み順の行を加えて更新した。
+tall は11行すべてを表示し、短い画面の root はスクロールする。
+`preferences_viewer_notice_visibility`（560×360）も、同じ設定ページに3行増えた分の
+スクロールバーの長さだけを更新した。差は右端の30ピクセル（x=544..551、y=42..47）で本文は同一。
+7枚は計285,387 bytes。実装担当が、3項目・説明文・選択表示・戻る・閉じる・tallの全行を実際のPNGで目視し、
+設計担当 (ClaudeCode) も新規3枚と root / root_tall を目視して、欠けや重なりがないことを確認した。
+`UPDATE_SNAPSHOTS=1` は関係するlibの9件だけに指定し、更新後の通常比較も9/9成功。
+integrationの `cargo test --test ui_snapshot -- --test-threads=2` も更新指定なしで259/259成功し、他のPNG変更はない。
+行高・制約時の末尾到達・各選択と保存・キー／ホイールの所有は別のheadless回帰で検査する。
+製品アプリは起動していない。実行結果と全画像の一覧は[設計書 §7](fullscreen-in-page-scroll-plan.md#implementation-record)に記録する。
+
 入力履歴 popup の表示面テーマ追従（2026-11-14、v5.2.0 の退行修正）は、既存の Dark と同じ純粋 fixture に
 `ResolvedTheme::Light` を渡す `search_history_popup_light` を追加する。明るい popup 背景・文字・選択行と
 欠け・重なりがないことを目視した。既存 PNG (`search_history_popup_dark` を含む) は変わらない。

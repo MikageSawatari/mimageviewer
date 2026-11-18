@@ -11,6 +11,7 @@ use crate::keymap::{
 };
 use eframe::egui;
 
+#[derive(Clone, Copy)]
 struct FixedShortcutRow {
     keys: &'static str,
     description: &'static str,
@@ -41,7 +42,7 @@ const FS_IMAGE_FIXED_SHORTCUT_ROWS: &[FixedShortcutRow] = &[
         description: "フルスクリーンを閉じて一覧へ戻る",
     },
     FixedShortcutRow {
-        keys: "← / → / ↑ / ↓ / マウスホイール",
+        keys: "← / → / Shift+↑ / Shift+↓",
         description: "前または次の項目へ移動する",
     },
     FixedShortcutRow {
@@ -442,6 +443,41 @@ impl ShortcutHelpContext {
     }
 }
 
+fn fs_image_input_fixed_rows(
+    surface: bool,
+    up_down: crate::settings::FullscreenUpDownKeyAction,
+    wheel: crate::settings::FullscreenWheelAction,
+) -> Vec<FixedShortcutRow> {
+    let mut fixed_rows = FS_IMAGE_FIXED_SHORTCUT_ROWS.to_vec();
+    fixed_rows.insert(
+        3,
+        FixedShortcutRow {
+            keys: "↑ / ↓",
+            description: if surface
+                && up_down.normalized() == crate::settings::FullscreenUpDownKeyAction::InPageScroll
+            {
+                "ページ内を上下にスクロールする。端で止まり、ページは送らない"
+            } else {
+                "前または次の項目へ移動する（連結読みでは連結方向にスクロール）"
+            },
+        },
+    );
+    fixed_rows.insert(
+        4,
+        FixedShortcutRow {
+            keys: "マウスホイール",
+            description: if surface
+                && wheel.normalized() == crate::settings::FullscreenWheelAction::InPageScroll
+            {
+                "ページ内をスクロールする（Shift・チルトは横）。Alt・シークバー上はページ送り"
+            } else {
+                "前または次の項目へ移動する（連結読みではスクロール）"
+            },
+        },
+    );
+    fixed_rows
+}
+
 impl App {
     pub(crate) fn show_context_shortcuts_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_context_shortcuts_help {
@@ -483,6 +519,15 @@ impl App {
         })
         .collect::<Vec<_>>();
         let mut close_clicked = false;
+        let fixed_rows = if matches!(help_context, ShortcutHelpContext::FsImage) {
+            fs_image_input_fixed_rows(
+                self.fs_in_page_scroll_surface(),
+                self.settings.fullscreen_up_down_key_action,
+                self.settings.fullscreen_wheel_action,
+            )
+        } else {
+            help_context.fixed_rows().to_vec()
+        };
 
         egui::Window::new("ショートカット")
             .drag_area(egui::WindowDrag::Anywhere)
@@ -519,7 +564,7 @@ impl App {
                                 video_touch_available,
                             ),
                         );
-                        draw_fixed_rows(ui, &self.keymap, help_context.fixed_rows());
+                        draw_fixed_rows(ui, &self.keymap, &fixed_rows);
                     });
 
                 ui.add_space(8.0);
@@ -632,7 +677,7 @@ fn draw_fixed_rows(ui: &mut egui::Ui, keymap: &crate::keymap::Keymap, rows: &[Fi
     ui.add_space(10.0);
     ui.label(egui::RichText::new("固定キー").strong());
     ui.add_space(2.0);
-    egui::Grid::new(("context_shortcuts_fixed", rows.as_ptr() as usize))
+    egui::Grid::new("context_shortcuts_fixed")
         .num_columns(2)
         .spacing([18.0, 4.0])
         .striped(true)
@@ -707,6 +752,44 @@ fn draw_supplemental_action_rows(
 mod tests {
     use super::{ShortcutHelpContext, supplemental_action_shortcut_label};
     use crate::keymap::{Chord, KeyAction, Keymap, KeymapSettings, ModKind};
+
+    #[test]
+    fn image_fixed_help_resolves_independent_settings_only_on_the_scroll_surface() {
+        use crate::settings::{FullscreenUpDownKeyAction as Keys, FullscreenWheelAction as Wheel};
+        for surface in [false, true] {
+            for keys in [Keys::PageTurn, Keys::InPageScroll] {
+                for wheel in [Wheel::PageTurn, Wheel::InPageScroll] {
+                    let rows = super::fs_image_input_fixed_rows(surface, keys, wheel);
+                    assert_eq!(
+                        rows[3].description.starts_with("ページ内"),
+                        surface && keys == Keys::InPageScroll
+                    );
+                    assert_eq!(
+                        rows[4].description.starts_with("ページ内"),
+                        surface && wheel == Wheel::InPageScroll
+                    );
+                    assert_eq!(rows[2].keys, super::FS_IMAGE_FIXED_SHORTCUT_ROWS[2].keys);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn image_help_shows_default_n_scroll_and_custom_cardinal_assignment() {
+        let keymap = Keymap::from_ini_str("[FsImage]\nFsPageScrollRight = F24\n");
+        let rows = keymap
+            .command_display_rows_for_active_scopes(crate::keymap::FS_IMAGE_ACTIVE_SCOPES, false);
+        for action in [
+            KeyAction::FsPageNScrollNext,
+            KeyAction::FsPageNScrollPrev,
+            KeyAction::FsPageScrollRight,
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|row| row.spec.action == action && !row.shortcut_labels.is_empty())
+            );
+        }
+    }
 
     #[test]
     fn overview_help_uses_its_own_fixed_navigation_and_exact_executable_rows() {

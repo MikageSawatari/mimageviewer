@@ -53,7 +53,23 @@
 
 ### 1.810 全画面で回転してパンを端まで動かしたあと回転を戻すと、パンの位置が新しい配置の範囲外に残り画面が真っ黒になる — §1.474 のサブ PC 確認から (2026-11-18)
 
-- 状態: **番号の予約のみ**。内容はブランチ `feat-474-page-scroll` (子セッション page-scroll-474) が書く。
+- 状態: **未着手・収録版未定**。§1.474 のサブ PC 確認 (項目 4-7) で、サブ PC 担当が 2 回再現した (観測者: サブ PC 担当、`feat-474-page-scroll` aef62258b の dev-runtime ビルド)。
+  原因と「master でも起きる」はコード読みのみで、master のビルドでの観測は無い。
+- 観測 (サブ PC 担当): 縦長の画像を横幅フィットで全画面にし、R で 90° 回転 → Shift+ホイール (ページ内スクロール) で横の端まで動かす → L で戻すと、
+  画面が真っ黒になり右下のページ番号だけが残った。↓↑・Shift+ホイールでも黒いままで、ダブルクリックで戻った。ログにエラーは無い。
+- 原因 (コード): R / L の回転 (`src/app.rs` の `rotate_image_cw` / `rotate_image_ccw` → `apply_rotation`) は `fs_pan` / `fs_zoom` に触れない。
+  パンを範囲に収める `clamp_fullscreen_pan_from_layout` は入力 (ドラッグ・ズーム・ページ内スクロール) のときにだけ呼ばれ、描画のたびには呼ばれない。
+  そのため、回転で横に長くなった配置の端まで動かしたパンが、回転を戻した後の配置 (幅が画面幅) にそのまま残り、絵が丸ごと画面の外に出る。
+- master でも起きる根拠 (コード): 通常のドラッグも同じ制限 (`set_fs_pan_from_input`、少なくとも 48px を画面内に残す) で横の端まで動かせる。
+  回転・ドラッグ・制限の 3 つは §1.474 で変えていない (master 96ed160a0 との差分で確認)。「R → 横へドラッグで端まで → L」で同じ状態になる見込み (未確認)。
+- ↓↑・Shift+ホイールで戻らないのは §1.474 の設計どおり: 戻した後は横にはみ出していないので横のスクロールは何もせず、↓↑ は制限が横の位置まで直す候補になるので採らない
+  (「ほかの軸を動かさない」規則、`src/ui_fullscreen/in_page_scroll.rs` の `scroll_pan`)。既定の設定の ↓ はページ送りで、ページを替えれば戻る。
+- 直す案 (根本は「回転が変わってもパンの範囲を作り直していない」こと):
+  - 案 A: 表示中のページの回転が変わったら、ページを開いたときと同じ初期配置に戻す。単純だが、今は回転しても倍率と位置を保つので**リリース済みの挙動が変わる**。
+    採るなら着手前に利用者へ相談する。
+  - 案 B: 回転を変えた次の描画で、新しい配置に対してパンを 1 回だけ制限し直す。倍率は保てるが、「次の描画で 1 回」の要求の持ち主を 1 つ作る
+    (表示中のページ・回転・描いた layout の相関を持たせ、別 context に作用しないこと)。
+- §1.806 とは別の問題 (あちらは手動ズームの frame の見開きの間隔の投影)。共通するのは「パンの制限が入力のときにしか効かない」土台だけ。規模は小〜中。
 
 ### 1.808 操作カスタマイズのキーボード図・コマンド一覧の CPU 負荷を減らす — 5ch >>805 (2026-11-18)
 
@@ -82,11 +98,35 @@
 
 ### 1.807 全画面の固定の矢印キーとシークのポップアップ判定が、ROOT 経由のとき全画面ウィンドウ側のポップアップを見ていない — §1.474 のレビューから (2026-11-18)
 
-- 状態: **番号の予約のみ**。内容はブランチ `feat-474-page-scroll` (子セッション page-scroll-474) が書く。
+- 状態: **未着手**。§1.474 の独立実装レビュー r2・r3 (Sol / xhigh のコード読み) で見つかった既存の問題。ROOT 経由の場合は実機での観測は無い。
+  同じウィンドウの中の回転メニューの場合は §1.474 のサブ PC 確認で観測された (下記)。
+- 現象 (コード): 全画面ウィンドウではなく ROOT がキーを受けたとき、`src/ui_fullscreen.rs` の `handle_fullscreen_root_key_input` は ROOT の `ctx` を共通の全画面キー handler に渡す。
+  egui の Popup の記憶は viewport ごとなので、handler の既存の `fs_still_seek_strip_popup_open(ctx)` による早期 return と固定の矢印 (`consume_arrow`) は、
+  全画面ウィンドウ側で開いているシークのポップアップ (やマウスで開いたフォーカスなしの回転ポップアップ) を見ない。ROOT 側の所有判定が遮断しなければ、
+  ポップアップの背後でページ送りなどが進み得る。
+- 同じウィンドウの中でも起きる (回転メニュー): 固定の矢印 (`consume_arrow`) は、同じ viewport で開いている回転メニューも見ない。
+  前面メニューの判定 `fs_front_menu_presented` (回転メニューを含む) は、master ではポインターの受付にしか使われていない。
+  §1.474 のサブ PC 確認 (項目 8-4、観測者: サブ PC 担当) で、上下キーを「ページ内スクロール」にした状態で回転メニューをマウスで開いたまま ↓ を押すと、
+  背後の画像がスクロールし、メニューは開いたまま (0° の項目に枠が付いた) だった。§1.474 の ↓ は既存の固定の矢印の受付を変えず、
+  ページ送りの地点でスクロールに置き換える設計 (§1.474 設計 §2.4) なので、既定の設定の master では同じ操作でページが送られる見込み (コード読みのみ、未確認)。
+  新しい操作 (J / K) は回転メニューで止まる (同じサブ PC 確認の項目 8-2)。
+- §1.474 の新しい操作 (J / K・4 方向) は、配送元と配送先の両方の viewport を照会する形にした
+  (`fs_front_menu_presented_for_viewport`、回帰テスト `root_dispatched_scroll_keys_leave_the_destination_rotation_popup_unconsumed`)。既存の経路は範囲外として変えていない
+  ([§1.474 の設計 §7.8](fullscreen-in-page-scroll-plan.md))。
+- 次に調べること: どの操作で ROOT がキーを受けたまま全画面ウィンドウにポップアップが開くか (フォーカスの移り方) を確かめ、
+  §1.474 と同じ形の handler テストで固定の矢印・シークの早期 return を検証する。同じウィンドウの回転メニューも同じテストで扱う。
+  直すなら同じ helper に寄せる。既定の設定でメニューを開いたまま ↓ でページが送られなくなるのは挙動の変更なので、範囲を決めるときに確かめる。規模は小 / P3。
 
 ### 1.806 手動ズームのフレームで、パンの制限が見開きのページ間隔を倍率に比例させて計算し、固定間隔の実際の描画と合わない — §1.474 の調査から (2026-11-18)
 
-- 状態: **番号の予約のみ**。内容はブランチ `feat-474-page-scroll` (子セッション page-scroll-474) が書く。
+- 状態: **未着手・コード読みのみ** (実機での観測は無い)。§1.474 の実装担当 (Codex) の停止報告から見つかった既存の問題。
+- 現象 (コード): `clamp_fullscreen_pan_from_layout` (`src/ui_fullscreen.rs`) は、手動ズームの frame で前の frame の layout の矩形を倍率の比で投影して
+  パンの制限 (少なくとも 1 ページの 48px を画面内に残す) を計算する。このとき通常の見開きのページ間隔も倍率に比例させるが、実際の描画は間隔を固定するので、
+  投影した端が間隔の差だけずれる (例: 間隔 200・倍率 1→2 で 100pt)。
+- 影響の見立て (未検証): ずれるのはズームした frame の制限の計算だけで、次の frame からは描いた layout で計算し直す。目に見える影響は小さい可能性が高い。
+  §1.474 のページ内スクロールは、同じ frame の倍率変更では投影せず何もしない形にして、この投影を使わない ([設計 §6.8](fullscreen-in-page-scroll-plan.md))。
+- 次に調べること: ページ間隔ありの見開きで Ctrl+ホイールの拡大と同時にパンの端へ当てるテストを作り、ずれが利用者に見える形 (端で止まる位置の跳ね) で出るかを確かめる。
+  直す場合は投影の共有 helper を変えるので、既定設定の手動パン・ズーム全体の回帰を見る。規模は小 / P3。
 
 ### 1.805 お気に入り・アドレス欄・最近開いたフォルダから直接移動すると、フォルダの読み込み (scan_directory_with_settings) を UI スレッドで同期実行して最大約 0.59 秒止まる — お気に入り切り替えのちらつき調査から (2026-11-18)
 
@@ -165,16 +205,16 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 
 ### 1.474 通常のページ表示でページ内スクロールと N 字スクロールを使う — 5ch >>642・767 (2026-10-29 起票、2026-11-12 採用)
 
-- 状態: **未着手・対応方針決定**。収録版は未定。[>>642](https://egg.5ch.io/test/read.cgi/software/1782419551/642) の、画像の端を基準にキーで表示範囲を動かしたい要望を保留側に記録していた。[>>767](https://egg.5ch.io/test/read.cgi/software/1782419551/767) で、縦連結のように次のページを見せず、今のページ内を矢印キーやホイールで動かしたいことと、NeeView のような N 字スクロールの要望が追加された。2026-11-12 の利用者決定で通常バックログへ移す。
-- mIV の現状 (コード確認、実画面試験なし): 通常のページ単位表示では矢印キーとホイールはページ送り。マウスやゲームパッドでパンはできるが、上下左右のキーによるページ内スクロールや端への位置合わせのコマンドはない。`FsContinuousScrollForward` / `Back` は連結用であり、§1.470 のキーによる拡大 / 縮小や §1.726 のページ切替直後の表示位置とも別。
+- 状態: **実装済み・独立実装レビュー r3 で ACCEPT (2026-11-18)・利用者の実機確認前**。収録版は未定。[設計](fullscreen-in-page-scroll-plan.md#2-仕様) と [実装・検証記録 §7](fullscreen-in-page-scroll-plan.md#implementation-record) を参照。[>>642](https://egg.5ch.io/test/read.cgi/software/1782419551/642) の、画像の端を基準にキーで表示範囲を動かしたい要望を保留側に記録していた。[>>767](https://egg.5ch.io/test/read.cgi/software/1782419551/767) で、縦連結のように次のページを見せず、今のページ内を矢印キーやホイールで動かしたいことと、NeeView のような N 字スクロールの要望が追加された。2026-11-12 の利用者決定で通常バックログへ移す。
+- 実装前の現状 (コード確認、実画面試験なし): 通常のページ単位表示では矢印キーとホイールはページ送り。マウスやゲームパッドでパンはできるが、上下左右のキーによるページ内スクロールや端への位置合わせのコマンドはない。`FsContinuousScrollForward` / `Back` は連結用であり、§1.470 のキーによる拡大 / 縮小や §1.726 のページ切替直後の表示位置とも別。
 - 方針: ページ単位表示の修飾なし `↑` / `↓` と通常のホイールを、**それぞれ独立に「ページ送り (既定) / ページ内スクロール」から選択**できるようにする。ページ内スクロールは表示中のページまたは見開きの範囲内で動かし、端で止めてページは送らない。左右キーのページ送り、既存の連結表示、編集やズームなどの入力は変更しない。
-- N 字: 通常スクロールとは別に、前方向・次方向の操作を `KeyAction` として割り当て可能にする。縦の端に着いたら綴じ方向に沿って横へ移り、次の列の反対側の縦端から読む。前方向は逆順。表示中のページ内で完結し、最後の列の端から自動でページは送らない。
+- N 字 / Z 字: 通常スクロールとは別に、指定順の次 / 前の操作を `KeyAction` として追加（既定 K / J）。順序は縦優先（N 字、既定）/ 横優先（Z 字）を環境設定と「…」の共通全体設定で選ぶ。前方向は逆順。1 回85%を進み、表示中のページ内で完結し、終端から自動でページは送らない。4 方向の個別スクロールは既定キーなし、端への位置合わせは今回含めない。
 - 他アプリの調査 (コード・公式資料。実画面試験なし):
   - NeeView: [公式コマンド一覧](https://neelabo.github.io/NeeView/ja-jp/command-list.html) の Type A では左右がページ送り、上下が本の切り替え。4 方向スクロールは割り当て可能だが既定キーなし。[方向スクロールの実装](https://github.com/neelabo/NeeView/blob/686a43362dc4b3c9f2ea014240dbba2d0e9fbcaa/NeeView/MainView/ViewTransformControl.cs#L153-L230) は表示領域の指定割合 (既定 25%) で動かし、移動不能時に別軸へ動かす設定もある。端 / 中央への位置合わせは別コマンド。
   - NeeView の [N 字計算](https://github.com/neelabo/NeeView/blob/686a43362dc4b3c9f2ea014240dbba2d0e9fbcaa/NeeView/PageFrames/NScroll.cs#L84-L104) は縦を優先し、縦端で綴じ方向に横へ進み、反対側の縦端に戻す。Z 字なども選べる。[N 字単体とスクロール＋ページ移動](https://github.com/neelabo/NeeView/blob/686a43362dc4b3c9f2ea014240dbba2d0e9fbcaa/NeeView/PageFrames/PageFrameBox.cs#L1140-L1163) は別経路で、後者 (Type A のホイール) だけが終端でページを送る。
   - Leeyes: [作者配布の 2.6.1 ZIP](http://www3.tokai.or.jp/boxes/leeyes/leeyes261.zip) の `help/keycustom.html` / `muscustom.html` / `setting.html` では、キー・マウスに大小のスクロールを割り当て、移動量や重なり幅を設定できる。端では隣の列 / 行へ折り返すか次のファイルへ進むかを選べ、両方有効なら折り返し優先。
   - ZipPla: [公開フォークの既定キー](https://github.com/himamon/ZipPlaFork/blob/07955f5267e2fb92d6fc6e40fde2507d8fb07b3b/source/ZipPla/ViewerForm.cs#L15850-L15882) は上下がページ送り。左右は拡大鏡モードで [画像内のスクロールを試し](https://github.com/himamon/ZipPlaFork/blob/07955f5267e2fb92d6fc6e40fde2507d8fb07b3b/source/ZipPla/ViewerForm.cs#L8383-L8400)、動けない場合はページを送る。SumatraPDF は [公式マニュアル](https://www.sumatrapdfreader.org/docs/Scrolling-and-zooming#scroll-with-the-keyboard) 上、上下がスクロール、左右は横にはみ出す場合にスクロール、収まる場合にページ送り。
-- 設計・検証: 既存のパン・表示範囲の制限と入力処理に接続し、設定で選んだ文脈以外の固定矢印を変更しない。移動量・長押し・折り返し量、4 方向の個別コマンドや端への位置合わせを含めるかは着手時に決める。通常表示・見開き・回転・画面内に収まる画像、左右の綴じ方向、別ウィンドウ、設定の組み合わせを確認し、入力欄・IME・ダイアログ・編集・連結表示を退行させない。[キー仕様](keymap-spec.md) と [操作カスタマイズ計画](key-customization-impl-plan.md) は実装時に更新する。規模は設計時に見積もる / P3。
+- 設計・検証: [設計 §2・§5 と実装記録 §7](fullscreen-in-page-scroll-plan.md) に範囲・受入条件・定義したテストと実行結果を分けて記録する。描画済み単位・幾何・実効倍率を照合し、不一致は消費のみ。書込時も描いた実効倍率を保ち、既存のパン制約・倍率正規化は変更しない（設計 §6.8・§6.9）。[キー仕様](keymap-spec.md) と [操作カスタマイズ計画](key-customization-impl-plan.md)、表示仕様・マニュアルを更新済み。対象自動検証とsnapshotは成功 (変更7枚は実装担当・設計担当が目視)。独立実装レビューは r1・r2 の REVISE を経て r3 で ACCEPT (設計 §6.10〜§6.12)。本体lib全件・検証用ビルドの結果は設計 §7 に記録し、利用者の実機確認はこの後。
 
 ### 1.781 msedgewebview2.exe の「アプリケーション エラー」(例外 0x80000003) のダイアログがまた出る — 利用者の観測 (2026-11-14)
 
@@ -409,7 +449,6 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 - `cargo nextest run -p mimageviewer --test ui_snapshot -j 1 -E 'test(/search|folder_toolbar/)'`: **16/16成功、exit 0、70.602秒**（`target/acceptance12-snapshots.log`）。`UPDATE_SNAPSHOTS`を解除した通常比較で、既存PNGは変更しない。
 - 全件試験前の独立した`gpt-6.1-sol` / `xhigh`が設計・実装・関連文書と上記の有効な試験結果を確認し、いったんACCEPTとした（全件で見つかった下記回帰の再確認は別途必要）。検索Submitのownerとnative batch、Local履歴permit、ring/gamepad、title採用待ち境界、索引meta引継ぎを確認した。
 
-
 - 指定の本体lib全件1回: `NEXTEST_TEST_THREADS=6`で`./scripts/test-lib-full.ps1`を実行し、**16,291実行、16,285成功（slow 2）、6失敗、71skip、exit 100、1,579.915秒**。`target/test-lib-full/runs/20261104T150450027Z-6a023920/`、run UUID `a9ad3699-ae29-4893-97b9-9c31c5da1939`、開始source ID `f0ee80cff250ccbf84e4d7f8d9a8f4514268e422198932151f0c3ba7bce9ce76`。実行中はRustを変更しなかった（記録文書のみ追記）。この実行を全件成功とは扱わない。
 - 失敗2件は未変更の`agent_ipc::pipe::tests::shutdown_interrupts_an_idle_connected_reader_without_retry`と`agent_ipc::tests::stdio_exe_uses_real_core_fixture_handlers`で、既知の名前付きパイプOS error 5（アクセス拒否）。製品IPCコードは変更しない。
 - 残る4件: `everything_close_return::{escape_and_enter_close_use_the_everything_return_owner, extension_named_image_folder_book_close_returns_results, extension_named_ordinary_directory_close_keeps_its_list}`の3件は、今回加えた一時検索focus予約のRoot全体への投影が未表示Main入力にFullscreenのEnterを所属させた製品回帰。既存surface判定を`keyboard_shortcut_surface`へ抽出し、予約producerとSubmit受付をMain scopeに限定する。detached述語の実装やviewport/window寿命は変更せず、DetachedWindowではMain予約を保持する。独立reviewerと構造的修正で合意し、[detached計画 §11](detached-rework-plan.md)へ記録した。3件の既存テストは変更しない。
@@ -425,8 +464,6 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 
 - 最終snapshot通常比較: `UPDATE_SNAPSHOTS`なし、`cargo nextest run -p mimageviewer --test ui_snapshot -j 1 -E 'test(/search|folder_toolbar/)'`は**16/16成功、exit 0、50.849秒**（compile 1分29秒、run UUID `0990e7e9-4cd6-445c-a6a2-510574957a7f`、`target/acceptance12-snapshots-final.log`）。既存PNG更新なし。最終`git diff --check`も成功。全4件の実機確認・設計担当の検収は未実施。commit・製品起動・確認用buildは行わず、依頼どおり引き継ぐ。
 
-
-
 ##### d83ed8f85の独立レビュー追補2件（2026-11-05、HEAD add448539）
 
 - 開始時`v5-integration` / HEAD `add448539c0e3c688c158344efd61a7c29e65b41`、作業ツリーclean。§1.710〜1.712の製品変更、`config/miv-sound.rs`は対象外。製品起動・commit・`build-dev.ps1`・本体lib全件は実施せず、全件は設計担当へ引き継ぐ。
@@ -435,12 +472,10 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 - 製品修正前の追加回帰`section1708_physical_result_open_retires_search_focus_without_resubmitting`は、実際のEverything結果→物理Folder採用後に旧focus_requestがtrueであるため失敗した（valid red、0.852秒）。同runのSmart2件はFolder非対応の明示書庫用APIをfixtureが呼んでおり10秒でtimeoutしたため、bug redの証拠には数えない。実際のSmart gridのFolder入口へ修正し、通常の親戻りとの対照検査を維持する。ログ`target/acceptance12-followup-boundary-red.log`、run `886f99e7-4157-4636-bf3e-8c5dc56b9c74`、3実行/0成功/3失敗/exit 100。
 - 原因の証拠範囲: 旧予約を新しい`route_pending_search_submit`が受けると`send_everything_search`へ到達し、実IPC再検索を発行するコード経路を確認した。実検索が0件なら旧fixture datasetを置換して空行に至り得るが、今回の既存4件の実行ではその最終段の相関は取れていない。履歴可否の共通化・索引mtime/size・Submit後のnative batch消費をこの空行の原因と断定しない。
 
-
 - 途中関連run: `test(/section1705_|section1708_|everything_close_return|physical_parent_1672|smart_folder|local_search|submitted_search|phase_c_folder_nav_history_tests|phase_c_key_tests|search_bar_focus_recovery|search_ime_commit|pinned_search/)`を4並列で実行し、**602実行/601成功/1失敗、exit 100、177.316秒**（compile 2分39秒、run `e57209b1-4a49-4d6a-b923-2518e3d6cc4a`、`target/acceptance12-followup-related.log`）。Smart履歴・通常親戻りと指定4件は成功。残る追加Everything回帰はMainのEnterをFullscreen専用helperへ送っていたfixture不備で、Main handlerへ訂正した。
 - 独立レビューで、direct viewerの全page openに予約終端を呼ぶ案は広過ぎるため新session入場時に限定し、G drill入口での早期終端は非同期Ready成功採用へ移した。既存routeが変わる成功時だけcaptured SearchOpenOriginを使い、同route再投影・拒否・別source編集を保護する。既存viewerの実0→1 page open、G request/held Ready/拒否/成功/同route新入力保持の回帰を追加した。scope境界への合意とMain/sibling保護は[detached計画 §11](detached-rework-plan.md)にも追記した。
 
 - 最終回帰の初回compileは、新しいG非同期テストからAppのprivate fieldを読んだためE0616・exit 101（実行0件、`target/acceptance12-followup-test-visibility-error.log`）。fieldの公開範囲は変えず、`cfg(test)`の読み取り専用seamでclaimを検査する形へ直した。製品側の状態や期待は変更しない。
-
 
 - 最終関連run: `cargo nextest run -p mimageviewer --lib -j 4 -E 'test(/section1705_|section1708_|everything_close_return|physical_parent_1672|smart_folder|local_search|submitted_search|phase_c_folder_nav_history_tests|phase_c_key_tests|search_bar_focus_recovery|search_ime_commit|pinned_search|global_search_ui/)' --no-fail-fast`は**717/717成功、15,672対象外、exit 0、187.609秒**（compile 2分33秒、run `a18be50c-1462-40d7-b482-efef56095bfc`、`target/acceptance12-followup-final.log`）。指定4件の期待は変更していない。Smart root→実child→history/parentの対照（pinned/temporary）、child pendingの終了、物理Folder/ZIP/PDF/変換からの再Submitなし、Gの非同期成功/拒否/same-route、実viewer page open、別source/widget/viewport/contextを含む。
 - `cargo check -p mimageviewer --bin mimageviewer-core`は**exit 0、1分11秒**（既存警告317、`target/acceptance12-followup-core-check.log`）。最終製品ロジック後の結果で、その後の`cfg(test)`読み取りgetter追加とfixture修正は非test製品を変更しないため再利用する。
