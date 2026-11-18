@@ -24,6 +24,27 @@ Anime4K の取得は `resampler_create_ms`、NIS は `pipeline_create_ms` に含
 AIの `upscale_end` も画素正規化・結果送信の前なので、UI再開時刻だけで推論lock待ちと断定しない。
 候補の到達表、計装条件、headless検証と限界は [調査記録](section801-close-navigation-investigation.md)。原因修正は未実装。
 
+## 直接移動のフォルダ事前走査（§1.805）
+
+main 一覧のお気に入り・アドレス欄 Enter (検索外)・最近開いたフォルダのメニューだけを対象とし、
+拒否判定と owner 受理を済ませてから、既存の folder open worker にフィールドなしの
+`DirectNavigation` を渡す。元 navigation を保持し、完了は通常 nav 裁定から ExplicitList・
+Navigation owner の pre-scan 付き読込へ戻す。走査済みパスの再分類を省く変更は撤回し、
+ツリー・GridFolderCandidate の従来の完了経路を維持する。
+走査待ちは旧一覧を表示し、項目入力を履歴移動待ちと同じ gate で止める。移動入力は後勝ちとし、
+通常 nav 裁定では、拒否された後続でも走査待ちを取り消す (r10、ツリーと同じ規則)。
+裁定を通らない受理された後続も、claim 成功時の owner_context が main のとき、および共通退役
+(retained が Pane の場合も含む) で DirectNavigation を退役する。
+DFS 新規受付と saved-group の既知の拒否判定後の受付では DirectNavigation だけを取り消し、
+ツリーの待ちの扱いは変えない。直接移動の受付では DFS・累積・所有 sequence を退役する。
+Esc・スタック切替キーを止めるのは直接移動の走査待ち専用の停止理由だけとし、他の停止理由は変えない。
+待機表示だけに 500 ms の猶予を置く。対象入口は全画面予約を作らないので、予約の移送・消去は加えない。
+worker の `nav/folder_open_scan` と採用側の `nav/lf_scan` (`pre_scanned=true`) を分けて計測する。
+利用者ログの最大約590 msが調査の起点であり、この変更後の実機計測は未実施。
+一覧フォルダ・親への移動・コレクション物理元・フォルダを開くダイアログ・コンテキストメニューの
+同期走査は維持する。即時全画面close経路・`load_folder` 系・detached も対象外。
+詳細は [設計書](direct-navigation-worker-scan-plan.md) を参照。
+
 ## 本を閉じるときの catalog 全行読み込みの撤去（§1.800 S1）
 
 通常一覧の `resume_loading_items_after_sidecar` は空の控えを作り、画像 BLOB の
@@ -802,6 +823,7 @@ intent sequence で関連する操作を照合する。navigation の再試行�
 | A | 20MP JPEG prefetch 15 枚が UI スレッドで連続 GPU アップロード (1秒に 478ms 占有) | 1 フレーム 1 枚ペーシング、現在ページのみ即時 | `fs_upload_backlog` | [src/app.rs `poll_prefetch`](../src/app.rs) |
 | B | `load_folder` の `read_dir` + per-entry metadata が UI スレッドで 100-200ms | DFS スレッドで事前スキャンして結果を渡す | `ScannedDir` / `load_folder_with_scan` | [src/app.rs `spawn_folder_nav`, `scan_directory`](../src/app.rs) |
 | B' | B で移した `scan_directory` が `p.is_dir()` per-entry 呼びで 970ms | `entry.file_type()` に置換 | - | [src/app.rs](../src/app.rs), [src/folder_tree.rs `sorted_subdirs`](../src/folder_tree.rs) |
+| B'' | お気に入り等の直接移動で UI の同期走査が最大約590 ms（利用者ログ） | main のお気に入り・アドレス欄 Enter・最近開いたフォルダだけを共通 worker へ移し、通常 nav 裁定で pre-scan 採用 | `FolderOpenScanPurpose::DirectNavigation` | [設計書](direct-navigation-worker-scan-plan.md) |
 | D | Ctrl+F / Ctrl+S 検索が UI スレッドで XMP/PNG メタ + SQLite を同期実行 | 検索ごと worker thread、結果 merge | `SearchPending` / `FavSearchPending` | [src/app.rs `execute_search`, `execute_favsearch`](../src/app.rs) |
 | E | `ensure_metadata_loaded` が `open_fullscreen` のたびに AI/EXIF/XMP を UI スレッドで同期読み (20MP JPEG で 100ms+) | 1 worker で 3 パーサーを順次実行、結果をキャッシュ merge | `MetadataLoadPending` | [src/app.rs `start_metadata_load`, `run_metadata_load`](../src/app.rs) |
 

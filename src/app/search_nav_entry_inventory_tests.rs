@@ -893,7 +893,7 @@ fn location_key_case(action: KeyAction, kind: usize) {
     );
     if let Some(candidate) = candidate {
         match (&candidate, key_entry(action)) {
-            (AddressBarNav::Favorite(path), Entry::Favorite) => {
+            (AddressBarNav::WorkerFavorite(path), Entry::Favorite) => {
                 let slot = action.favorite_slot_number().unwrap_or_else(|| {
                     if action == KeyAction::GridFavoritePrev {
                         20

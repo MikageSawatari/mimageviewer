@@ -138,7 +138,11 @@
 
 ### 1.805 お気に入り・アドレス欄・最近開いたフォルダから直接移動すると、フォルダの読み込み (scan_directory_with_settings) を UI スレッドで同期実行して最大約 0.59 秒止まる — お気に入り切り替えのちらつき調査から (2026-11-18)
 
-- 状態: **番号の予約のみ**。内容はブランチ `fix-direct-nav-worker-scan` (作業ツリー `G:\home\mimageviewer-direct-nav-scan`) が書く。
+- 状態: **実装済み (r10)・レビュー待ち** (2026-11-18)。利用者決定で対象入口を当初の範囲へ戻し、拒否された後続もツリーと同じ取消規則にそろえた。master 未 merge。ブランチ `fix-direct-nav-worker-scan` (作業ツリー `G:\home\mimageviewer-direct-nav-scan`)。設計書: [direct-navigation-worker-scan-plan.md](direct-navigation-worker-scan-plan.md)。
+- 観測 (利用者の perf ログ、起点セッションの調査): お気に入り等からの移動で `nav/lf_scan` (`pre_scanned=false`) が最大約 590 ms。
+- 原因 (コード): `open_direct_navigation_target_classified` が `pre_scan` 無しのとき、`load_folder_with_scan_claimed_with_search_origin` の `scan_directory_with_settings` を UI スレッドで実行する。本件でworker化するのはお気に入り・アドレス欄 Enter (検索外)・最近開いたフォルダのメニューだけ。フォルダツリー・DFS・履歴の戻る/進む・検索中のお気に入りは worker 走査済み。
+- 方針: ツリーと同じ `FolderPaneOpenPending` にフィールドなしの `FolderOpenScanPurpose::DirectNavigation` を足し、完了したら ExplicitList・Navigation owner の `pre_scan` 付きで同じ consumer へ戻す。全画面予約の移送・消去と走査済みパスの再分類省略は行わない。通常nav裁定は拒否された後続でも取消し、裁定外の受理済み後続はclaim成功時 (owner_contextがmain) と共通退役 (retained == Paneも含む) で退役。DFS新規受付・saved-group受付で取消すのはDirectNavigationだけ。Esc・スタック切替キーを止めるのも直接移動専用の停止理由だけとする。
+- 範囲外: 一覧フォルダ・親移動・コレクション物理元・フォルダを開くダイアログ・コンテキストメニューの同期走査は維持する。全画面を閉じる即時経路・`load_folder` 系・detached も変更しない (設計書 §7)。
 
 ### 1.804 スタック表示 + 絞り込みのフォルダへ入ると、集約前の一覧で選んだ番号が集約後の一覧に当たり、可視の先頭以外が選ばれることがある — §1.795 のレビューから (2026-11-18)
 

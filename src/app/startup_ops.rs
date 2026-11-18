@@ -1610,6 +1610,7 @@ impl App {
                     super::StartupListIntent::container_open(auto_fullscreen),
                     navigation,
                     MainListRequestStage::Continuation,
+                    super::DirectoryScanRoute::UiThread,
                 ) {
                 FolderOpenOutcome::Loaded
                 | FolderOpenOutcome::Classifying
@@ -1771,12 +1772,13 @@ impl App {
                 classified_kind,
                 None,
                 if select_requested_file {
-                    super::StartupListIntent::PageContinuation
+                super::StartupListIntent::PageContinuation
                 } else {
-                    super::StartupListIntent::container_open(auto_fullscreen)
+                super::StartupListIntent::container_open(auto_fullscreen)
                 },
                 navigation,
                 MainListRequestStage::Continuation,
+                super::DirectoryScanRoute::UiThread,
             );
         if let Some(scan) = scan {
             scan.finish(

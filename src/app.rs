@@ -1473,6 +1473,9 @@ pub(crate) enum MainHistoryOperation {
 /// Native row fields are captured once; Surface ignores row generation, never the switch epoch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MainListNavigation {
+    /// Diagnostic ownership: the scan admission already counted this accepted request.
+    #[cfg(all(windows, feature = "test-script"))]
+    folder_load_recorded: bool,
     /// Viewer adoption is independent of load execution/history continuation.
     viewer_adoption: ViewerOpenAdoption,
     history_before: Box<FolderNavHistorySnapshot>,
@@ -6476,6 +6479,7 @@ const MAX_PENDING_NAV: i32 = 5;
 /// UI スレッドで `scan_directory` (大/遅/ネットワークフォルダで read_dir が数百 ms〜秒) を
 /// 直接走らせないための、`spawn_folder_nav` の DFS pre-scan と同じ方式。
 pub(crate) struct FolderPaneOpenPending {
+    started_at: std::time::Instant,
     /// 開く候補 (= 完了後に通常 nav 優先順位で裁定する実ディレクトリ)。
     path: PathBuf,
     /// 旧 pending を上書き/別 nav 勝利時に立てるキャンセルトークン。
@@ -6521,8 +6525,16 @@ impl CurrentViewOrderSnapshot {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectoryScanRoute {
+    UiThread,
+    Worker,
+}
+
 pub(crate) enum FolderOpenScanPurpose {
     PaneNavigation,
+    /// Main direct open. Admission is complete; completion reuses the pre-scanned install.
+    DirectNavigation,
     /// A grid `Folder` requested while always-new mode is active. The main context
     /// owns this request until the completed scan classifies it as either an image
     /// book (detached) or an ordinary mixed folder (main navigation).
@@ -6559,6 +6571,19 @@ pub(crate) enum FolderOpenScanPurpose {
 }
 
 impl FolderOpenScanPurpose {
+    fn perf_tag(&self) -> &'static str {
+        match self {
+            Self::PaneNavigation => "pane-navigation",
+            Self::DirectNavigation => "direct-navigation",
+            Self::GridFolderCandidate { .. } => "grid-folder-candidate",
+            Self::DetachedFolder => "detached-folder",
+            Self::DetachedImage { .. } => "detached-image",
+            Self::JumpToPhysicalFolder { .. } => "jump-to-physical-folder",
+            Self::RequiredFullscreenTarget { .. } => "required-fullscreen-target",
+            Self::CurrentViewOrderRefresh { .. } => "current-view-order-refresh",
+        }
+    }
+
     #[cfg(windows)]
     fn detached_loading_lease(&self) -> Option<DetachedSessionLease> {
         match self {
@@ -6573,6 +6598,7 @@ impl FolderOpenScanPurpose {
                 navigation_purpose, ..
             } => navigation_purpose.diagnostic_trace(),
             Self::PaneNavigation
+            | Self::DirectNavigation
             | Self::GridFolderCandidate { .. }
             | Self::DetachedFolder
             | Self::DetachedImage { .. }
@@ -6587,6 +6613,7 @@ impl FolderOpenScanPurpose {
                 navigation_purpose, ..
             } => navigation_purpose.take_diagnostic_trace(),
             Self::PaneNavigation
+            | Self::DirectNavigation
             | Self::GridFolderCandidate { .. }
             | Self::DetachedFolder
             | Self::DetachedImage { .. }
@@ -24621,6 +24648,38 @@ impl App {
     ) {
         let _span = CloseNavSpan::new(CloseNavStage::Dispatch);
         match nav {
+            crate::ui_main::AddressBarNav::WorkerFavorite(path) => {
+                if let Some(path) = self.dispatch_favorite_navigation(path) {
+                    self.open_direct_navigation_target_at_stage(
+                        path,
+                        None,
+                        OpenRequestOwner::Navigation,
+                        None,
+                        None,
+                        StartupListIntent::ExplicitList,
+                        MainListRequestStage::Admission,
+                        DirectoryScanRoute::Worker,
+                    );
+                }
+            }
+            crate::ui_main::AddressBarNav::AddressEnterPhysical(path) => {
+                self.dispatch_address_input_with_scan_route(
+                    crate::ui_main::LocationJumpTarget::Physical(path),
+                    DirectoryScanRoute::Worker,
+                );
+            }
+            crate::ui_main::AddressBarNav::RecentFolder(path) => {
+                self.open_direct_navigation_target_at_stage(
+                    path,
+                    None,
+                    OpenRequestOwner::Navigation,
+                    None,
+                    None,
+                    StartupListIntent::ExplicitList,
+                    MainListRequestStage::Admission,
+                    DirectoryScanRoute::Worker,
+                );
+            }
             crate::ui_main::AddressBarNav::Favorite(path) => {
                 if let Some(path) = self.dispatch_favorite_navigation(path) {
                     self.dispatch_main_input_nav_immediate(
@@ -25334,6 +25393,8 @@ impl App {
             history
         };
         MainListNavigation {
+            #[cfg(all(windows, feature = "test-script"))]
+            folder_load_recorded: false,
             viewer_adoption: ViewerOpenAdoption::ContextContinuation,
             history_before: Box::new(self.folder_nav_history_snapshot()),
             source_context: self.projected_viewer_context_id(),
@@ -29905,6 +29966,7 @@ impl App {
                     Some(kind),
                     restore_intent.clone(),
                     MainListRequestStage::Continuation,
+                    DirectoryScanRoute::UiThread,
                 );
             }
             ClassifiedOpenContinuation::BookmarkRow(row) => {
@@ -29979,8 +30041,9 @@ impl App {
                         folder_scan.take(),
                         restore_intent.clone(),
                         candidate.navigation.take(),
-            MainListRequestStage::Continuation,
-        );
+                        MainListRequestStage::Continuation,
+                        DirectoryScanRoute::UiThread,
+                    );
                 if matches!(outcome, FolderOpenOutcome::Loaded)
                     && !self.main_folder_history_available()
                     && let Some(bookmark) = bookmark_owner.as_ref()
@@ -30120,6 +30183,16 @@ impl App {
     }
 
     #[cfg(test)]
+    /// Pump the actual frame-tail arbiter without inventing another navigation input.
+    /// Shared settle loops call this once per iteration and include the pending owner
+    /// in their idle condition, just as they do for history/ZIP/sidecar preparation.
+    pub(crate) fn poll_direct_navigation_scan_for_test(&mut self, ctx: &egui::Context) {
+        if self.direct_navigation_scan_pending() {
+            self.post_render_main_navigation(ctx, update_phases::MainFrameNavigation::default());
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn poll_history_navigation_transition_for_test(&mut self, ctx: &egui::Context) {
         self.poll_collection_history_transition(ctx);
     }
@@ -30215,6 +30288,7 @@ impl App {
             pane_epub_restore,
             restore_intent,
             MainListRequestStage::Admission,
+            DirectoryScanRoute::UiThread,
         );
     }
 
@@ -30228,6 +30302,7 @@ impl App {
 
         restore_intent: crate::app::StartupListIntent,
         stage: MainListRequestStage,
+        scan_route: DirectoryScanRoute,
     ) {
         // Favorites and other direct inputs bypass the _owned load admissions below.
         // Normalize the accepted copy before classification; keep saved records intact.
@@ -30269,6 +30344,7 @@ impl App {
             None,
             restore_intent.clone(),
             stage,
+            scan_route,
         );
     }
 
@@ -30282,6 +30358,7 @@ impl App {
         classified_kind: Option<OpenPathKind>,
         restore_intent: crate::app::StartupListIntent,
         stage: MainListRequestStage,
+        scan_route: DirectoryScanRoute,
     ) {
         let navigation = navigation.or_else(|| {
             self.main_folder_history_available().then(|| {
@@ -30312,8 +30389,9 @@ impl App {
                     None,
                     restore_intent.clone(),
                     navigation,
-            stage,
-        ),
+                    stage,
+                    scan_route,
+                ),
         };
         self.finish_pane_open_restore(
             pane_epub_restore,
@@ -30548,6 +30626,7 @@ impl App {
             restore_intent.clone(),
             None,
             stage,
+            DirectoryScanRoute::UiThread,
         )
     }
 
@@ -30569,6 +30648,7 @@ impl App {
             restore_intent,
             None,
             MainListRequestStage::Admission,
+            DirectoryScanRoute::UiThread,
         )
     }
 
@@ -30607,7 +30687,52 @@ impl App {
             restore_intent,
             navigation,
             MainListRequestStage::Admission,
+            DirectoryScanRoute::UiThread,
         )
+    }
+
+    /// Mirrors the virtual/paged-document returns before the scan in
+    /// load_folder_with_scan_claimed_with_search_origin. No filesystem probes here.
+    fn direct_navigation_uses_worker_scan(
+        &self,
+        path: &Path,
+        classified_kind: Option<OpenPathKind>,
+        pre_scan: &Option<ScannedDir>,
+        owner: &OpenRequestOwner,
+        navigation: &Option<MainListNavigation>,
+        scan_route: DirectoryScanRoute,
+    ) -> bool {
+        scan_route == DirectoryScanRoute::Worker
+            && pre_scan.is_none()
+            && self.main_folder_history_available()
+            && navigation.is_some()
+            && matches!(owner, OpenRequestOwner::Navigation)
+            && (!crate::folder_tree::is_virtual_folder(path)
+                || classified_kind == Some(OpenPathKind::Directory)
+                || self.visible_grid_item_is_folder(path))
+    }
+
+    pub(crate) fn direct_navigation_scan_pending(&self) -> bool {
+        self.main_folder_history_available()
+            && self
+                .folder_pane_open_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    matches!(
+                        pending.purpose,
+                        crate::app::FolderOpenScanPurpose::DirectNavigation
+                    )
+                })
+    }
+
+    pub(crate) fn direct_navigation_scan_elapsed(&self) -> Option<std::time::Duration> {
+        self.direct_navigation_scan_pending().then(|| {
+            self.folder_pane_open_pending
+                .as_ref()
+                .unwrap()
+                .started_at
+                .elapsed()
+        })
     }
 
     fn load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
@@ -30621,6 +30746,7 @@ impl App {
         restore_intent: crate::app::StartupListIntent,
         navigation: Option<MainListNavigation>,
         stage: MainListRequestStage,
+        scan_route: DirectoryScanRoute,
     ) -> FolderOpenOutcome {
         let mut span = CloseNavSpan::new(CloseNavStage::OpenClassified);
         let visibility_source = self.physical_open_visibility_source(&path);
@@ -30859,6 +30985,45 @@ impl App {
             && self.settings.auto_fullscreen_image_folders_enabled()
         {
             self.pending_auto_fs_open = true;
+        }
+        if self.direct_navigation_uses_worker_scan(
+            &path,
+            classified_kind,
+            &pre_scan,
+            &owner,
+            &navigation,
+            scan_route,
+        ) {
+            self.retire_replaced_main_list_requests_with_startup_intent(
+                Some(MainListRequestOwner::Pane),
+                restore_intent.replaces_deferred_startup_open()
+                    && stage == MainListRequestStage::Admission,
+            );
+            if let Some(pending) = self.folder_nav_pending.take() {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+            self.clear_pending_folder_nav_steps();
+            // poll_folder_nav can already have taken the result. The sequence, rather than
+            // the receiver's presence, owns the fullscreen lock and holdover.
+            if matches!(
+                self.fs_holdover_tex.as_ref(),
+                Some(FsHoldover::FolderNavigation(_, _) | FsHoldover::NavigationSequence(_))
+            ) {
+                self.finish_fs_navigation_sequence(FsNavigationSequenceFinish::Superseded);
+            }
+            #[cfg(all(windows, feature = "test-script"))]
+            let navigation = navigation.map(|mut navigation| {
+                self.test_script_record_folder_load_owner(&restore_intent);
+                navigation.folder_load_recorded = true;
+                navigation
+            });
+            self.start_folder_open_scan_with_restore_and_navigation(
+                path,
+                FolderOpenScanPurpose::DirectNavigation,
+                None,
+                navigation,
+            );
+            return FolderOpenOutcome::Classifying;
         }
         self.load_folder_with_scan_claimed(
             path,
@@ -31394,6 +31559,11 @@ impl App {
                     .map(|(context, _)| context),
                 _ => Some(self.projected_viewer_context_id()),
             };
+            if owner_context == Some(self.viewer_context_main())
+                && self.direct_navigation_scan_pending()
+            {
+                self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+            }
             if owner_context == Some(self.projected_viewer_context_id()) {
                 {
                     let _span = CloseNavSpan::new(CloseNavStage::RetireBookOpen);
@@ -31836,7 +32006,10 @@ impl App {
             return FolderOpenOutcome::Ignored;
         }
         #[cfg(all(windows, feature = "test-script"))]
-        if self.open_request_owner_is_current(&path, &owner)
+        if !navigation
+            .as_ref()
+            .is_some_and(|nav| nav.folder_load_recorded)
+            && self.open_request_owner_is_current(&path, &owner)
             && navigation
                 .as_ref()
                 .is_none_or(|navigation| self.main_list_navigation_is_current(navigation))
@@ -31845,6 +32018,7 @@ impl App {
             // the direct load; callers rejected before admission do not count.
             self.test_script_record_folder_load_owner(&restore_intent);
         }
+        // Keep these pre-scan returns aligned with direct_navigation_uses_worker_scan.
         if pre_scan.is_none()
             && crate::folder_tree::is_paged_document_path(&path)
             && classified_kind != Some(OpenPathKind::Directory)
@@ -36115,7 +36289,7 @@ impl App {
         {
             pending.cancel();
         }
-        if retained != Some(MainListRequestOwner::Pane) {
+        if retained != Some(MainListRequestOwner::Pane) || self.direct_navigation_scan_pending() {
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Adopted);
         }
         if retained != Some(MainListRequestOwner::Smart) {
@@ -59092,6 +59266,7 @@ impl App {
         main_has_focus: bool,
         browser_back_count: u32,
         browser_forward_count: u32,
+        block: crate::filename_stack_ui::GridItemInputBlock,
     ) -> Option<crate::ui_main::AddressBarNav> {
         let (mouse_back, mouse_forward) = ctx.input(|input| {
             (
@@ -59109,7 +59284,9 @@ impl App {
                 "grid-mouse",
             );
         }
-        if self.dialog_escape_pressed(ctx) {
+        if block != crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan
+            && self.dialog_escape_pressed(ctx)
+        {
             self.toggle_stack_mode();
             return None;
         }
@@ -59153,9 +59330,10 @@ impl App {
             self.start_batch_convert_to_pdf();
             return None;
         }
-        if self
-            .keymap
-            .consume_action(ctx, KeyAction::GridToggleStackMode)
+        if block != crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan
+            && self
+                .keymap
+                .consume_action(ctx, KeyAction::GridToggleStackMode)
         {
             self.toggle_stack_mode();
             return None;
@@ -59334,12 +59512,13 @@ impl App {
             return self.apply_saved_group_key_action(ctx, action);
         }
 
-        if !self.grid_item_input_allowed() {
+        if let Some(block) = self.grid_item_input_block() {
             return self.handle_stack_refresh_keyboard(
                 ctx,
                 main_has_focus,
                 browser_back_count,
                 browser_forward_count,
+                block,
             );
         }
 
@@ -60242,6 +60421,9 @@ impl App {
             }
         }
         // 新しい nav 列開始: アキュームレータをリセットしてから spawn
+        if self.direct_navigation_scan_pending() {
+            self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
+        }
         self.pending_folder_nav_steps = 0;
         self.pending_folder_nav_mode = mode.clone();
         // Stamp only after admission. The handler's fresh FolderItems sequence starts as
@@ -60988,6 +61170,21 @@ impl App {
         purpose: FolderOpenScanPurpose,
         inherited_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
     ) {
+        self.start_folder_open_scan_with_restore_and_navigation(
+            path,
+            purpose,
+            inherited_restore,
+            None,
+        );
+    }
+
+    fn start_folder_open_scan_with_restore_and_navigation(
+        &mut self,
+        path: PathBuf,
+        purpose: FolderOpenScanPurpose,
+        inherited_restore: Option<crate::ui_dialogs::epub_convert::EpubOpenRestore>,
+        navigation: Option<MainListNavigation>,
+    ) {
         if !matches!(
             purpose,
             FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
@@ -61039,39 +61236,45 @@ impl App {
         );
         debug_assert!(epub_restore.is_none() || previous.is_none());
         epub_restore = epub_restore.or(previous);
-        let navigation = if self.main_folder_history_available()
-            && !matches!(
-                purpose,
-                FolderOpenScanPurpose::DetachedFolder | FolderOpenScanPurpose::DetachedImage { .. }
-            ) {
-            let operation = if matches!(
-                purpose,
-                FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
-            ) {
-                MainHistoryOperation::SameLocation
-            } else if let FolderOpenScanPurpose::JumpToPhysicalFolder { selection, .. } = &purpose {
-                MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView {
-                    selection: selection.clone(),
-                })
+        let navigation = navigation.or_else(|| {
+            if self.main_folder_history_available()
+                && !matches!(
+                    purpose,
+                    FolderOpenScanPurpose::DetachedFolder
+                        | FolderOpenScanPurpose::DetachedImage { .. }
+                )
+            {
+                let operation = if matches!(
+                    purpose,
+                    FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+                ) {
+                    MainHistoryOperation::SameLocation
+                } else if let FolderOpenScanPurpose::JumpToPhysicalFolder { selection, .. } =
+                    &purpose
+                {
+                    MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView {
+                        selection: selection.clone(),
+                    })
+                } else {
+                    MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation)
+                };
+                let proof = if !matches!(
+                    purpose,
+                    FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+                        | FolderOpenScanPurpose::GridFolderCandidate {
+                            collection_owner: Some(_),
+                            ..
+                        }
+                ) {
+                    self.copied_destination_source_proof()
+                } else {
+                    MainListSourceProof::Row
+                };
+                Some(self.capture_main_list_navigation(operation, proof))
             } else {
-                MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation)
-            };
-            let proof = if !matches!(
-                purpose,
-                FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
-                    | FolderOpenScanPurpose::GridFolderCandidate {
-                        collection_owner: Some(_),
-                        ..
-                    }
-            ) {
-                self.copied_destination_source_proof()
-            } else {
-                MainListSourceProof::Row
-            };
-            Some(self.capture_main_list_navigation(operation, proof))
-        } else {
-            None
-        };
+                None
+            }
+        });
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
@@ -61081,23 +61284,58 @@ impl App {
         let include_epub = !self.settings.epub_file_handling_ignores_epub();
         let show_hidden_files = self.settings.show_hidden_files;
         let file_type_visibility = self.settings.file_type_visibility.clone();
+        let perf_seq = self.input_seq;
+        let perf_purpose = purpose.perf_tag();
+        let started_at = std::time::Instant::now();
         std::thread::spawn(move || {
-            if cancel_w.load(Ordering::Relaxed) {
-                return;
+            let scan_started = std::time::Instant::now();
+            let scan = if cancel_w.load(Ordering::Relaxed) {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "folder scan cancelled",
+                ))
+            } else {
+                folder_scan::scan_directory_with_visibility_cancel(
+                    &scan_path,
+                    include_convertible_archives,
+                    include_epub,
+                    show_hidden_files,
+                    &file_type_visibility,
+                    Some(&cancel_w),
+                )
+            };
+            if crate::perf::is_enabled() {
+                let (folders, media, failed) = match &scan {
+                    Ok(scan) => (scan.folders.len(), scan.all_media.len(), false),
+                    Err(_) => (0, 0, true),
+                };
+                crate::perf::event(
+                    "nav",
+                    "folder_open_scan",
+                    None,
+                    perf_seq,
+                    &[
+                        (
+                            "ms",
+                            serde_json::Value::from(scan_started.elapsed().as_secs_f64() * 1000.0),
+                        ),
+                        ("purpose", serde_json::Value::from(perf_purpose)),
+                        ("folders", serde_json::Value::from(folders)),
+                        ("media", serde_json::Value::from(media)),
+                        ("failed", serde_json::Value::from(failed)),
+                        (
+                            "cancelled",
+                            serde_json::Value::from(cancel_w.load(Ordering::Relaxed)),
+                        ),
+                    ],
+                );
             }
-            let scan = folder_scan::scan_directory_with_visibility_cancel(
-                &scan_path,
-                include_convertible_archives,
-                include_epub,
-                show_hidden_files,
-                &file_type_visibility,
-                Some(&cancel_w),
-            );
             if !cancel_w.load(Ordering::Relaxed) {
                 let _ = tx.send(scan);
             }
         });
         self.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            started_at,
             path,
             cancel,
             rx,
@@ -61358,23 +61596,7 @@ impl App {
                 crate::logger::log(format!(
                     "folder open scan failed path={} purpose={} error={error}",
                     ready.path.display(),
-                    match &ready.purpose {
-                        FolderOpenScanPurpose::PaneNavigation => "pane-navigation",
-                        FolderOpenScanPurpose::GridFolderCandidate { .. } => {
-                            "grid-folder-candidate"
-                        }
-                        FolderOpenScanPurpose::DetachedFolder => "detached-folder",
-                        FolderOpenScanPurpose::DetachedImage { .. } => "detached-image",
-                        FolderOpenScanPurpose::JumpToPhysicalFolder { .. } => {
-                            "jump-to-physical-folder"
-                        }
-                        FolderOpenScanPurpose::RequiredFullscreenTarget { .. } => {
-                            "required-fullscreen-target"
-                        }
-                        FolderOpenScanPurpose::CurrentViewOrderRefresh { .. } => {
-                            "current-view-order-refresh"
-                        }
-                    }
+                    ready.purpose.perf_tag()
                 ));
                 self.show_feedback_warning("フォルダを読み取れませんでした".to_string());
                 if matches!(
@@ -61397,6 +61619,14 @@ impl App {
         };
 
         match ready.purpose {
+            FolderOpenScanPurpose::DirectNavigation => Some(ResolvedMainFolderOpen {
+                restore_intent: StartupListIntent::ExplicitList,
+                collection_owner: None,
+                path: ready.path,
+                scan,
+                epub_restore: None,
+                navigation: ready.navigation,
+            }),
             FolderOpenScanPurpose::PaneNavigation => Some(ResolvedMainFolderOpen {
                 restore_intent: StartupListIntent::ExplicitList,
                 path: ready.path,
@@ -61694,6 +61924,13 @@ impl App {
                 } else {
                     DetachedPhysicalFolderOpenPoll::Failed
                 }
+            }
+            FolderOpenScanPurpose::DirectNavigation => {
+                crate::logger::log(format!(
+                    "detached folder scan rejected main-owned direct navigation path={}",
+                    ready.path.display()
+                ));
+                DetachedPhysicalFolderOpenPoll::Failed
             }
             FolderOpenScanPurpose::PaneNavigation => {
                 // active detached viewport はフォルダペインを持たないため通常は到達しない。

@@ -5823,7 +5823,7 @@ impl App {
                 Some(&format!("path={}", target.display())),
             );
             ctx.request_repaint();
-            return Some(AddressBarNav::Favorite(target));
+            return Some(AddressBarNav::WorkerFavorite(target));
         }
         if let Some(definition_id) = smart_folder_target {
             self.bump_input_seq(
@@ -8017,7 +8017,7 @@ impl App {
         }
         self.bump_input_seq(source, Some(&format!("favorite_slot={slot}")));
         ctx.request_repaint();
-        Some(AddressBarNav::Favorite(target))
+        Some(AddressBarNav::WorkerFavorite(target))
     }
 
     fn apply_ring_drive_letter(
@@ -11600,7 +11600,7 @@ mod tests {
             ));
         app.global_search.active = true;
         let nav = app.apply_ring_favorite_slot(&ctx, 1, "test");
-        assert!(matches!(nav, Some(AddressBarNav::Favorite(path)) if path == target));
+        assert!(matches!(nav, Some(AddressBarNav::WorkerFavorite(path)) if path == target));
         assert!(app.global_search.active);
     }
 
@@ -12372,7 +12372,7 @@ mod tests {
                             },
                         )
                         .unwrap();
-                    let crate::ui_main::AddressBarNav::Favorite(path) = nav else {
+                    let crate::ui_main::AddressBarNav::WorkerFavorite(path) = nav else {
                         panic!("favorite confirmation must produce a favorite navigation");
                     };
                     assert!(app.gamepad_favorite_picker.is_none());

@@ -2697,11 +2697,11 @@ fn folder_pane_frame_end_close_does_not_override_toolbar_favorite_navigation() {
         vec![pointer(false), tree_key_event(egui::Key::F)],
     );
     assert!(!app.settings.folder_tree_pane_visible);
+    settle(&mut app, &ctx);
     assert!(
         app.folder_pane_open_pending.is_none(),
         "closing must not start cursor Open({b:?}) after the favorite won"
     );
-    settle(&mut app, &ctx);
     for _ in 0..3 {
         navigation_tree_frame(&mut app, &ctx, &mut frame, vec![]);
     }

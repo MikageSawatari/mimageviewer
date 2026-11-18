@@ -1458,6 +1458,24 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-18: §1.805 main直接移動のworker走査
+
+設計レビューr1で構造的変更としてAGREEした
+[直接移動の設計](direct-navigation-worker-scan-plan.md)に従い、bundle所有の
+`FolderOpenScanPurpose`にmain専用の`DirectNavigation`を追加した。
+対象はmainのお気に入り・アドレス欄Enter (検索外)・最近開いたフォルダのメニューだけ (r10)。
+共通spawnへ呼出元のnavigationを引き継ぎ、purposeはフィールドを持たず、完了はExplicitList・
+Navigation ownerとして戻す。Collection物理元・一覧フォルダ・親移動等の同期走査は維持する。
+全画面予約の移送・消去は加えず、走査済みパスの再分類省略も撤回する。
+既存purposeのcaptureとdetached contextの経路は変更しない。
+`start_folder_nav`受付で取り消すのはmainのDirectNavigationだけで、PaneNavigation・
+detached用purpose・RequiredFullscreenTarget・CurrentViewOrderRefreshには触れない。
+saved-group受付も既知の拒否判定後にDirectNavigationだけを取り消す。
+通常nav裁定は拒否された後続でも取消す。裁定外の受理済み後続は、claim成功時のowner_contextがmainの
+場合と共通退役 (retained == Paneも含む) で退役する。直接移動の待ちだけを専用の停止理由で識別し、
+Esc・スタック切替キーを止める。他の停止理由の挙動は維持する。
+共有pendingの開始時刻は待機表示の500 ms猶予にだけ使い、detachedの競合判定には使わない。
+
 ### 2026-11-18: sidecar復元Modalの共通表示猶予とroot限定の計装
 
 設計担当ClaudeCodeの方針とCodexの前提確認に基づき、共通helperの表示猶予定数

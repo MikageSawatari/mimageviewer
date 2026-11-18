@@ -970,7 +970,7 @@ fn history_pointer_case(
         );
     } else {
         assert!(
-            matches!(&*navigation.borrow(), Some(crate::ui_main::AddressBarNav::Direct(path, _)) if crate::folder_tree::path_eq(path, &targets[index])),
+            matches!(&*navigation.borrow(), Some(crate::ui_main::AddressBarNav::RecentFolder(path)) if crate::folder_tree::path_eq(path, &targets[index])),
             "{diagnostic}: {:?}",
             navigation.borrow()
         );
@@ -1210,23 +1210,20 @@ fn history_pending_grid_case(
             let history_selected = keys.contains(&egui::Key::ArrowDown);
             let expected = if history_selected { &target } else { &current };
             let expected_transport = if history_selected {
-                // Selecting a saved history row keeps its released Direct
-                // transport and explicit-list intent.
+                // Selecting a saved history row is the §1.805 recent-folder
+                // producer (worker scan, explicit-list intent at dispatch).
                 matches!(
                     &nav,
-                    Some(crate::ui_main::AddressBarNav::Direct(
-                        path,
-                        crate::app::StartupListIntent::ExplicitList,
-                    )) if crate::folder_tree::path_eq(path, expected)
+                    Some(crate::ui_main::AddressBarNav::RecentFolder(path))
+                        if crate::folder_tree::path_eq(path, expected)
                 )
             } else {
-                // Enter without a selected history row submits the address
-                // through the typed input dispatcher (which decides search at dispatch).
+                // Enter without a selected history row submits the marked
+                // §1.805 address-Enter physical target (search is decided at dispatch).
                 matches!(
                     &nav,
-                    Some(crate::ui_main::AddressBarNav::AddressInput(
-                        crate::ui_main::LocationJumpTarget::Physical(path),
-                    )) if crate::folder_tree::path_eq(path, expected)
+                    Some(crate::ui_main::AddressBarNav::AddressEnterPhysical(path))
+                        if crate::folder_tree::path_eq(path, expected)
                 )
             };
             assert!(

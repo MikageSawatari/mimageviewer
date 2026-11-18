@@ -82,6 +82,7 @@ fn control_required_scan(
     let (tx, rx) = mpsc::channel();
     let cancel = Arc::new(AtomicBool::new(false));
     app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+        started_at: std::time::Instant::now(),
         navigation: None,
         epub_restore: None,
         path: pending.path,
@@ -796,6 +797,7 @@ fn embedded_similar_move_update_pump_leaves_non_required_scan_for_normal_tail() 
     let (pane_tx, pane_rx) = mpsc::channel();
     let pane_cancel = Arc::new(AtomicBool::new(false));
     app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+        started_at: std::time::Instant::now(),
         navigation: None,
         epub_restore: None,
         path: pane_folder,
@@ -847,6 +849,7 @@ fn embedded_similar_move_update_pump_does_not_consume_a_passive_context_scan() {
     let sibling_page_for_context = sibling_page.clone();
     let sibling = app.push_window_context_for_test(&ctx, 9901, move |context| {
         context.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            started_at: std::time::Instant::now(),
             navigation: None,
             epub_restore: None,
             path: sibling_folder_for_context,
@@ -1230,6 +1233,7 @@ fn detached_required_scan_failure_without_a_page_exits_the_password_wait_owner()
     )))
     .unwrap();
     app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+        started_at: std::time::Instant::now(),
         navigation: None,
         epub_restore: None,
         path: folder.clone(),
@@ -1264,6 +1268,7 @@ fn disconnected_required_scan_uses_the_same_terminal_failure_boundary() {
     let (tx, rx) = mpsc::channel::<std::io::Result<ScannedDir>>();
     drop(tx);
     app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+        started_at: std::time::Instant::now(),
         navigation: None,
         epub_restore: None,
         path: app.tmp.path().join("worker-disconnected"),

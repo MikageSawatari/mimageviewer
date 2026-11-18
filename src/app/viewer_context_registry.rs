@@ -9003,6 +9003,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel();
         (
             FolderPaneOpenPending {
+                started_at: std::time::Instant::now(),
                 navigation: None,
                 epub_restore: None,
                 path: PathBuf::from("c:/trace/pending"),

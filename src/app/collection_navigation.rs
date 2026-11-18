@@ -4315,8 +4315,9 @@ impl App {
                     None,
                     restore_intent.clone(),
                     request.navigation.take(),
-            super::MainListRequestStage::Continuation,
-        );
+                    super::MainListRequestStage::Continuation,
+                    super::DirectoryScanRoute::UiThread,
+                );
             match action {
                 CollectionNavigationAction::OuterFullscreen {
                     resume_slideshow, ..

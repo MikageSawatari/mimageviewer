@@ -8,6 +8,7 @@
 use super::*;
 
 /// Navigation values captured during this root UI pass; never retained by App.
+#[cfg_attr(test, derive(Default))]
 pub(super) struct MainFrameNavigation {
     pub(super) fav_nav: Option<crate::ui_main::LocationJumpTarget>,
     pub(super) toolbar_fav_nav: Option<PathBuf>,
@@ -1268,9 +1269,11 @@ impl App {
             let mut navigate_owner = OpenRequestOwner::Navigation;
             let mut navigate_restore_intent = StartupListIntent::ExplicitList;
             let mut navigate_stage = MainListRequestStage::Admission;
+            let mut navigate_scan_route = DirectoryScanRoute::UiThread;
             let navigate = if let Some(target) = fav_nav {
                 match target {
                     crate::ui_main::LocationJumpTarget::Physical(path) => {
+                        navigate_scan_route = DirectoryScanRoute::Worker;
                         self.dispatch_favorite_navigation(path)
                     }
                     target => {
@@ -1279,9 +1282,25 @@ impl App {
                     }
                 }
             } else if let Some(path) = toolbar_fav_nav {
+                navigate_scan_route = DirectoryScanRoute::Worker;
                 self.dispatch_favorite_navigation(path)
             } else if let Some(nav) = input_nav.or(address_nav) {
                 match nav {
+                    crate::ui_main::AddressBarNav::WorkerFavorite(path) => {
+                        navigate_scan_route = DirectoryScanRoute::Worker;
+                        self.dispatch_favorite_navigation(path)
+                    }
+                    crate::ui_main::AddressBarNav::AddressEnterPhysical(path) => {
+                        self.dispatch_address_input_with_scan_route(
+                            crate::ui_main::LocationJumpTarget::Physical(path),
+                            DirectoryScanRoute::Worker,
+                        );
+                        None
+                    }
+                    crate::ui_main::AddressBarNav::RecentFolder(path) => {
+                        navigate_scan_route = DirectoryScanRoute::Worker;
+                        Some(path)
+                    }
                     crate::ui_main::AddressBarNav::Favorite(path) => {
                         self.dispatch_favorite_navigation(path)
                     }
@@ -1390,6 +1409,21 @@ impl App {
                     } => self
                         .open_grid_container_with_mode(ctx, idx, mode, "grid_context_menu")
                         .and_then(|nav| match nav {
+                            crate::ui_main::AddressBarNav::WorkerFavorite(path) => {
+                                navigate_scan_route = DirectoryScanRoute::Worker;
+                                self.dispatch_favorite_navigation(path)
+                            }
+                            crate::ui_main::AddressBarNav::AddressEnterPhysical(path) => {
+                                self.dispatch_address_input_with_scan_route(
+                                    crate::ui_main::LocationJumpTarget::Physical(path),
+                                    DirectoryScanRoute::Worker,
+                                );
+                                None
+                            }
+                            crate::ui_main::AddressBarNav::RecentFolder(path) => {
+                                navigate_scan_route = DirectoryScanRoute::Worker;
+                                Some(path)
+                            }
                             crate::ui_main::AddressBarNav::Favorite(path) => {
                                 self.dispatch_favorite_navigation(path)
                             }
@@ -1510,8 +1544,15 @@ impl App {
                         scan,
                         purpose,
                         epub_restore,
+                        navigation: ready_navigation,
                     } = ready;
                     match (purpose, scan) {
+                        (FolderOpenScanPurpose::DirectNavigation, Ok(scan)) => {
+                            navigate_restore_intent = StartupListIntent::ExplicitList;
+                            navigate_pre_scan = Some(scan);
+                            navigation = ready_navigation;
+                            Some(path)
+                        }
                         (
                             FolderOpenScanPurpose::JumpToPhysicalFolder { selection, origin },
                             Ok(scan),
@@ -1565,6 +1606,21 @@ impl App {
                 }
             } else {
                 match grid_nav {
+                    Some(crate::ui_main::AddressBarNav::WorkerFavorite(path)) => {
+                        navigate_scan_route = DirectoryScanRoute::Worker;
+                        self.dispatch_favorite_navigation(path)
+                    }
+                    Some(crate::ui_main::AddressBarNav::AddressEnterPhysical(path)) => {
+                        self.dispatch_address_input_with_scan_route(
+                            crate::ui_main::LocationJumpTarget::Physical(path),
+                            DirectoryScanRoute::Worker,
+                        );
+                        None
+                    }
+                    Some(crate::ui_main::AddressBarNav::RecentFolder(path)) => {
+                        navigate_scan_route = DirectoryScanRoute::Worker;
+                        Some(path)
+                    }
                     Some(crate::ui_main::AddressBarNav::Favorite(path)) => {
                         self.dispatch_favorite_navigation(path)
                     }
@@ -1663,6 +1719,7 @@ impl App {
                     pane_epub_restore.take(),
                     navigate_restore_intent,
                     navigate_stage,
+                    navigate_scan_route,
                 );
             }
         }

@@ -2312,6 +2312,7 @@ def cmd_nav(events: list[dict]) -> None:
     # 親区間 → 子区間の階層で表示する
     groups: list[tuple[str, list[str]]] = [
         ("DFS (別スレッド)", ["dfs"]),
+        ("Folder open scan (worker)", ["folder_open_scan"]),
         ("apply_folder_nav_result (UI)", ["apply"]),
         ("load_folder 全体 (UI)", ["load_folder"]),
         ("  load_folder 内訳", ["lf_scan", "lf_sort", "lf_dup_filter", "lf_auto_index"]),

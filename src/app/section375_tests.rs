@@ -7,6 +7,7 @@ use std::time::{Duration, Instant, SystemTime};
 pub(super) fn settle(app: &mut App, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
+        app.poll_direct_navigation_scan_for_test(ctx);
         app.poll_open_path_classification(ctx);
         app.poll_collection_history_transition(ctx);
         app.poll_external_rescan(ctx);
@@ -16,7 +17,8 @@ pub(super) fn settle(app: &mut App, ctx: &egui::Context) {
         if !app.sidecar_restore_active() {
             app.poll_stack_script(ctx);
         }
-        if app.external_rescan_pending.is_none()
+        if !app.direct_navigation_scan_pending()
+            && app.external_rescan_pending.is_none()
             && !app.sidecar_restore_active()
             && app.stack_script_pending.is_none()
             && app

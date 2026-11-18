@@ -19,7 +19,7 @@ fn native_backdrop_gamepad_favorite_each_search_adopts_and_returns_before_search
         let target = app.tmp.path().join("native-favorite");
         std::fs::create_dir(&target).unwrap();
         let nav = confirm_favorite(&mut app, &ctx, &target);
-        assert!(matches!(&nav, AddressBarNav::Favorite(path) if path == &target));
+        assert!(matches!(&nav, AddressBarNav::WorkerFavorite(path) if path == &target));
         assert_terminal_close_is_pending_on_backdrop(&app);
         app.dispatch_native_backdrop_navigation(&ctx, None, false, Some(nav));
         assert_search_active(&app, kind);
@@ -161,6 +161,15 @@ fn native_backdrop_plain_favorite_and_direct_keep_immediate_loader_cleanup() {
         app.dispatch_native_backdrop_navigation(&ctx, None, false, Some(nav));
         assert_eq!(app.pending_folder_nav_steps, 0);
         assert!(matches!(app.pending_folder_nav_mode, FolderNavMode::Grid));
+        if favorite {
+            let pending = app.folder_pane_open_pending.as_ref().unwrap();
+            assert!(matches!(
+                pending.purpose,
+                FolderOpenScanPurpose::DirectNavigation
+            ));
+            assert_eq!(pending.path, target);
+            settle(&mut app, Some(&target));
+        }
         assert_eq!(app.current_folder.as_ref(), Some(&target));
         assert!(app.folder_pane_open_pending.is_none());
         settle(&mut app, Some(&target));
