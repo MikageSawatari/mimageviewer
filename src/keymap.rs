@@ -8314,6 +8314,15 @@ impl Keymap {
     }
 
     pub fn binding_conflicts(&self) -> Vec<BindingConflict> {
+        // Conflicts are warnings about customized bindings; defaults alone never warn.
+        // Check parsed overrides, so invalid/unknown raw settings also take this path.
+        if self.overrides.is_empty() {
+            return Vec::new();
+        }
+        self.binding_conflicts_for_effective_bindings()
+    }
+
+    fn binding_conflicts_for_effective_bindings(&self) -> Vec<BindingConflict> {
         let bindings = self.effective_bindings();
         let mut conflicts = Vec::new();
 
@@ -16438,6 +16447,24 @@ mod tests {
             keymap.compact_action_label("筆", KeyAction::EraseToolBrush),
             "筆"
         );
+    }
+
+    #[test]
+    fn binding_conflicts_default_scan_is_empty_without_fast_path() {
+        let keymap = Keymap::empty();
+        assert!(!keymap.effective_bindings().is_empty());
+        assert!(keymap.binding_conflicts_for_effective_bindings().is_empty());
+        assert!(keymap.binding_conflicts().is_empty());
+        let invalid = Keymap::from_settings(&KeymapSettings {
+            overrides: vec![KeyBindingOverride {
+                action: KeyAction::GridCopyFiles.ini_name().into(),
+                chords: vec!["not a chord".into()],
+            }],
+            ..Default::default()
+        });
+        assert!(invalid.overrides.is_empty());
+        assert!(!invalid.warnings().is_empty());
+        assert!(invalid.binding_conflicts().is_empty());
     }
 
     #[test]

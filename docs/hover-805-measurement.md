@@ -229,3 +229,140 @@ Kの停止中の前pass原因は `tooltip.rs:424` が6回、`:436` が24回。
   指定どおり6本をdepsへ配置し、同じソース/実行体で成功した。これらを製品テストの失敗とは数えない。
 - 製品バイナリ・live UIは起動していない。挙動変更を含まない調査用の計装であり、
   確認用製品バイナリのbuildや全workspace gateは実施していない。コミットもしていない。
+
+## §1.808 修正後
+
+2026-11-18 の利用者指定の5件だけを実装する。行の仮想化、chord→actions 索引、
+repaint の間引きは加えず、表示・入力・保存の仕様と UI 文言を維持する。
+
+- 状態欄の「上書き」は、生の `KeymapSettings.overrides` の action 名を一覧の先頭で
+  一度だけ解析した集合で判定する。chord が不正でも、空配列による解除でも対象とする。
+  解析済み `Keymap.overrides` の有無とは区別する。
+- キーボード図の tooltip は、AccessKit node があるキーでは従来どおり先に本文を作って
+  `on_hover_text` へ渡す。それ以外は表示時の `on_hover_ui` 内で本文を作り、従来と同じ
+  `tooltip_width` と `Label` を使う。vendor/egui は変更しない。
+- 一覧ですでに全行の最大幅を計測した列は、各行で同じ文字幅を再計測しない。
+  ほかの `assignment_values` 呼び出し元は従来の計測を維持する。
+- 競合報告は通常・予約キーとも customized binding が前提なので、解析済み overrides が
+  空なら実効 binding の生成を省く。短絡しない競合走査も既定設定で空になることを検査する。
+- `PreferencesState` が設定値の複製と Keymap・競合一覧を一組として保持する。
+  読み出すたびに `KeymapSettings` 全体を `PartialEq` で比較し、異なるときだけ作り直す。
+  編集・既定復帰・取り込みの各経路に無効化処理は足さない。描画中の借用は `Arc` で保持する。
+
+依存と寿命をソースで確認した。`Keymap::from_settings` は渡された `KeymapSettings` と
+コード内の action / chord / scope / 予約キー定義だけを使い、他の設定・ファイル・実行時の
+グローバル状態を読まない。キャッシュキーには移行用フィールドも含めた設定値全体を使う。
+操作カスタマイズを破棄すると `operation_customize_state = None`、適用時には `take()` した
+`PreferencesState` を消費する。環境設定側も破棄・適用時に編集 state を消費するため、
+ダイアログを閉じた後にこのキャッシュだけを残す所有者や別途の解放処理はない。
+
+同じファイルの `page_command_overview` は別の Commands タブなので変更しない。
+キーボードページから開く割り当て編集ダイアログの毎フレームの読み出しは同じキャッシュを使う。
+単一選択の編集状態表示や、選択変更時に一度だけ動く `ensure_command_editor_loaded` の
+`override_chord_labels` はそのまま残す。ページ冒頭で確保した Keymap の snapshot と、
+ページ内の「すべて既定に戻す」が同じフレームに起きる順序も従来どおりにする。
+`preview_command_editor_conflicts` は編集中の候補を別の設定値として構築する処理なので、
+表示中の設定用キャッシュを使わない。App への適用・取り込み時の構築もイベント単位のため維持する。
+
+### 追加した回帰テスト
+
+`ui_dialogs::preferences::pages::tests`:
+
+- `hover808_raw_override_status_matches_original_helper`:
+  overrides なし・有効 chord・空 chords・不正 chord・未知 action に加え、大文字小文字・空白・重複の判定を旧 helper と照合。
+- `hover808_cache_reuses_unchanged_and_tracks_assignment_reset_and_direct_edits`:
+  未変更時の同一 Arc、適用・個別解除・直接変更・全件既定復帰・移行用フィールド変更後の
+  新規構築との一致、古い snapshot の不変、state 破棄時の解放を検査。
+- `hover808_page_render_refreshes_cache_on_next_frame`:
+  実際の `page_command_settings` を描画し、適用・全件既定復帰・直接変更の次フレームで
+  表示用キャッシュが最新設定と一致することと、未変更フレームの再利用を検査。
+- `hover808_keyboard_tooltip_is_lazy_without_hover_and_accesskit_keeps_descriptions`:
+  AccessKit 無効・非ホバー時の本文構築0回と、有効時の全102キーの説明登録を検査。
+- `hover808_hovered_lazy_tooltip_matches_eager_text`:
+  AccessKit 有効・無効の双方で tooltip の描画本文と構築回数を検査。
+
+`keymap::tests::binding_conflicts_default_scan_is_empty_without_fast_path`:
+既定 keymap の短絡あり・なし双方の空結果と、不正な raw chord の警告保持を検査。
+
+### 最終の自動検証結果
+
+指定の `run-heavy.ps1`、Owner `codex-fix808` を使用。子コマンドで TEMP/TMP を
+このツリーの `target\hover-tmp`、`MSBUILDDISABLENODEREUSE=1` に指定した。
+`dev-runtime`、テストは1 threadで、次の focused filter が全て成功した。
+既存 keymap テストには overrides ありの通常・予約キー競合検査も含む。
+
+| filter | Cargo jobs | 結果 | ログ |
+| --- | ---: | ---: | --- |
+| `keymap::tests::` | 4 | 196 passed / 0 failed | `target/hover-808-keymap.log` |
+| `ui_dialogs::preferences::pages::tests::` | 1 | 32 passed / 0 failed | `target/hover-808-preferences-pages.log` |
+
+計228種類成功、両 runner exit 0。上記には追加6件と、既存の dark snapshot、
+列幅・折り返し・DPI・フォントのレイアウト検査を含む。
+ページ全体の既存回帰を確認する前に、`hover808_` の5件と `command_chords_` の2件も
+Cargo `-j 4` で成功した（`target/hover-808-focused3.log` / `target/hover-808-layout.log`）。
+`cargo fmt`（引数なし）、`cargo fmt --check`、`git diff --check`、
+`python scripts/check_ui_glyphs.py` も成功（危険グリフ0件）。
+最初の compile は追加テストの旧 egui API 名を検出し、`global_style_mut` へ修正した。
+製品コードの compile error や最終テストの失敗はない。
+
+### 同条件の前後比較
+
+正式な修正後データ: `target/hover-808-after-final.json`。
+成功ログ: `target/hover-808-after-final-test.log`。
+前掲と同じヘッドレステスト、`dev-runtime`、Cargo `-j 1`、1 test thread、
+画面・フォント・fixture・warm-up 40 / 移動240 / 停止30フレームで再計測した。
+テストは `1 passed; 0 failed; 18626 filtered out; finished in 5.94s`、runner exit 0。
+runner は前回と同じロック/TEMP 領域の制限を警告して BelowNormal で実行し、
+子コマンド内で TEMP/TMP を上記のツリー内パスへ指定し直した。
+
+初回にも計測本体は成功して `target/hover-808-after.json` を保存したが、
+依頼側が子 scriptblock 末尾に付けた `exit` により runner の結果代入を飛ばし、
+runner の終了表示が初期値 `exit=1` のままになった。その `exit` を除き、
+上書きせず別名へ再計測したのが上記の正式データである。以降の表は正式データを使う。
+
+時間は **中央値 / p90 / 最大**、単位 ms/frame。修正前は `target/hover-805.json`。
+
+| ケース | `run_ms` 修正前 | `run_ms` 修正後 |
+| --- | ---: | ---: |
+| K 既定 | 6.947 / 7.845 / 9.001 | 4.382 / 4.711 / 5.490 |
+| K 20 overrides | 15.672 / 18.551 / 22.244 | 4.327 / 4.707 / 6.674 |
+| P General / 左ツリー移動 | 0.091 / 0.137 / 0.609 | 0.082 / 0.096 / 0.203 |
+| B General / 窓外移動 | 0.083 / 0.130 / 0.227 | 0.074 / 0.109 / 0.237 |
+
+| ケース | `tessellate_ms` 修正前 | `tessellate_ms` 修正後 |
+| --- | ---: | ---: |
+| K 既定 | 0.197 / 0.231 / 0.322 | 0.150 / 0.167 / 0.306 |
+| K 20 overrides | 0.174 / 0.222 / 0.791 | 0.124 / 0.147 / 0.189 |
+| P | 0.025 / 0.031 / 0.168 | 0.023 / 0.027 / 0.102 |
+| B | 0.024 / 0.032 / 0.107 | 0.022 / 0.025 / 0.108 |
+
+K の `run_ms` 中央値は既定で36.9%、20 overridesで72.4%減った。
+P/B は今回変更した経路を通らず、tessellation のアルゴリズムも変更していない。
+他プロセスの負荷を固定していない別時点の測定なので、これらの時間差を本修正の効果とは断定しない。
+実機 CPU 使用率・GPU 使用率・FPS の改善率へ換算することもできない。
+
+内訳は従来と同じ独立 Context / layout であり、全体フレームへ加算する分解値ではない。
+修正後は実際の保持経路を測るため、最初の2段を `keymap_and_conflicts_cache` の1段へ置き換えた。
+warm-up 後の未変更設定を測っており、初回構築や設定変更フレームの費用はこの段の値に含まない。
+
+| 関数 / 経路 | K 既定 修正前 | K 既定 修正後 | K20 修正前 | K20 修正後 |
+| --- | ---: | ---: | ---: | ---: |
+| `from_settings`（内部競合検出込み） | 0.289 / 0.351 / 0.620 | 毎フレーム実行なし | 0.285 / 0.404 / 0.730 | 毎フレーム実行なし |
+| ページの2回目の `binding_conflicts` | 0.278 / 0.435 / 0.802 | 毎フレーム実行なし | 0.223 / 0.433 / 0.725 | 毎フレーム実行なし |
+| 設定比較 + キャッシュ取得 | — | 0.0005 / 0.0007 / 0.0010 | — | 0.0019 / 0.0029 / 0.0131 |
+| `keyboard_chord_picker` | 1.554 / 1.970 / 2.397 | 0.304 / 0.382 / 0.783 | 1.821 / 2.543 / 3.405 | 0.244 / 0.358 / 0.571 |
+| `command_list` | 5.441 / 6.807 / 8.064 | 4.953 / 5.479 / 6.474 | 12.635 / 15.608 / 19.415 | 4.560 / 5.278 / 6.363 |
+
+AccessKit 無効・tooltip を表示していない定常 pass では、呼び出し経路から求めた
+`effective_chords` 呼び出し数は61,223回から一覧の583回へ減る。
+tooltip を表示する場合はそのキーの操作走査が必要で、AccessKit node があるキーは従来どおり先に走査する。
+この計算は allocator の確保回数ではない。
+
+全4ケース・1,080サンプルが引き続き1 pass。修正前とフレームごとに照合し、
+時刻・pointer・hover 対象・キー矩形・shapes / primitives / vertices / indices・
+repaint delay / 即時要求の有無は全て同一だった。各フレームの repaint 原因も同一。
+設定・選択・展開・編集状態の不変と `settings.db` 未保存の harness 検査も成功した。
+観測した範囲では表示・入力・保存の意味が変わる差はなく、コード上もその変更は加えていない。
+製品バイナリは起動せず、lib 全件・build-dev・コミットは利用者指定により実施していない。
+独立レビューは実装・テスト・正式 JSON の統計再計算と前後の描画/repaint 照合を行い、
+最終 ACCEPT、未解決指摘なし。レビュー側でビルド・テストの重複実行はしていない。

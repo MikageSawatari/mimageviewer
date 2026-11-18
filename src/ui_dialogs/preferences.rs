@@ -1143,6 +1143,14 @@ pub fn draw_clipboard_capture_html_settings_snapshot_fixture(
     draw_page(ui, &mut state, false);
 }
 
+/// Derived keyboard data lives only as long as its editing dialog. Equality is checked
+/// on use, including direct settings edits/imports; no mutation-specific invalidation.
+struct CommandKeymapCache {
+    source: crate::keymap::KeymapSettings,
+    keymap: crate::keymap::Keymap,
+    conflicts: Vec<crate::keymap::BindingConflict>,
+}
+
 pub(crate) struct PreferencesState {
     /// 編集用の Settings 一時コピー
     pub settings: Settings,
@@ -1248,6 +1256,7 @@ pub(crate) struct PreferencesState {
     pub book_root_input: String,
     pub startup_folder_path_input: String,
     pub exif_add_tag_input: String,
+    command_keymap_cache: Option<Arc<CommandKeymapCache>>,
     pub command_filter: String,
     pub command_key_filter: String,
     pub command_selected: Option<crate::keymap::KeyAction>,
@@ -1418,6 +1427,23 @@ pub(crate) struct PreferencesState {
 }
 
 impl PreferencesState {
+    fn command_keymap(&mut self) -> Arc<CommandKeymapCache> {
+        if let Some(cache) = &self.command_keymap_cache
+            && cache.source == self.settings.keymap
+        {
+            return Arc::clone(cache);
+        }
+        let keymap = crate::keymap::Keymap::from_settings(&self.settings.keymap);
+        let conflicts = keymap.binding_conflicts();
+        let cache = Arc::new(CommandKeymapCache {
+            source: self.settings.keymap.clone(),
+            keymap,
+            conflicts,
+        });
+        self.command_keymap_cache = Some(Arc::clone(&cache));
+        cache
+    }
+
     fn clear_video_media_memory(&mut self) {
         self.video_media_memory_clear_requested = true;
         self.settings.clear_video_media_memory();
@@ -1833,6 +1859,7 @@ impl PreferencesState {
             command_filter: String::new(),
             command_key_filter: String::new(),
             command_selected: None,
+            command_keymap_cache: None,
             command_edit_loaded_for: None,
             command_chord_inputs: std::array::from_fn(|_| String::new()),
             command_capture_slot: None,
