@@ -1,6 +1,6 @@
 # 直接移動のフォルダ走査を worker へ移す (§1.805)
 
-状態: 設計 r9 (2026-11-18、r8 のレビューの指摘を反映。r8 は r7 の新しい設計レビューの指摘を反映。r7 は 利用者決定で範囲をお気に入り・アドレス欄 Enter・最近開いたフォルダのメニューに戻した版、§3.2。r6 までは r4・r5 の指摘も反映。設計レビュー r1〜r3 の REJECT と統括の「組み合わせを減らす」指示を反映、§3.1)。担当: 設計・検収 = ClaudeCode Opus 5.5、
+状態: 設計 r10 (2026-11-18、拒否された後続の扱いを利用者決定 (A) で確定。r9 は r8 のレビューの指摘を反映。r8 は r7 の新しい設計レビューの指摘を反映。r7 は 利用者決定で範囲をお気に入り・アドレス欄 Enter・最近開いたフォルダのメニューに戻した版、§3.2。r6 までは r4・r5 の指摘も反映。設計レビュー r1〜r3 の REJECT と統括の「組み合わせを減らす」指示を反映、§3.1)。担当: 設計・検収 = ClaudeCode Opus 5.5、
 実装 = Codex GPT-6.1 Sol / high、独立レビュー = GPT-6.1 Sol / xhigh。
 
 ## 1. 問題
@@ -252,7 +252,7 @@ r7: 範囲外の挙動を変えないため、Esc・スタック切替キーを�
 | 新しい入力 | 仕組み |
 | --- | --- |
 | 別の直接移動・ツリーのクリック・検索中の場所ジャンプ | 新しい要求の受付が旧 pending を cancel (既存) |
-| お気に入り・キーの nav・DFS 結果・アドレス欄・コンテキストの nav のうち一覧の判定の外で出るもの | **r8 変更**: 通常 nav 裁定の `higher_priority_than_folder_pane` による事前の cancel は、`DirectNavigation` には適用しない (`PaneNavigation` は従来どおり事前に cancel)。そのフレームでは `DirectNavigation` の完了を poll せず、後続の候補が**受理されたときだけ**退役させる。後続が拒否された場合 (表示対象外の ZIP の指定、snapshot 中など) は走査待ちが残り、後のフレームで採用される。**r9: 受理の判定は既存の受付境界 2 点に集約し、要求の種類を列挙しない**: (1) `claim_open_request_owner_with_startup_intent` が成功したとき (main context。open 系の要求はすべてここを通る。未キャッシュの PDF の `ColdCandidate`・書庫・同期のフォルダ読込を含む。書庫変換・未解決 startup open・競合 bookmark を取り消している既存の受付と同じ位置)、(2) `retire_replaced_main_list_requests` (open 以外の main 要求: 履歴・レーティング・コレクション・合成 surface 等。`retained == Pane` のときも `DirectNavigation` は退役させ、直接移動・ツリーの新しい走査の開始は従来どおり旧 pending を置き換える)。直接移動自身の完了の再入で claim が走るときは、pending は poll で取り出し済みなので自分を消さない。claim 成功の後で拒否される要求 (変換書庫の無視設定など) でも走査待ちは退役する: claim を受理とみなす既存の契約 (書庫変換等の取消) と同じ扱い |
+| お気に入り・キーの nav・DFS 結果・アドレス欄・コンテキストの nav のうち一覧の判定の外で出るもの | **r10 (利用者決定 2026-11-18、案 A)**: ツリーの走査待ちと同じ規則にする。通常 nav 裁定の `higher_priority_than_folder_pane` は `DirectNavigation` も事前に cancel し、後続の操作が拒否されても走査待ちは取り消す (その組み合わせでは元の場所に留まり、押し直しが要る)。`cancel_pending_folder_nav()` 等の既存の取消経路もそのまま `DirectNavigation` を取り消す。r8・r9 で検討した「拒否された後続では残す」は、取消経路を全部整理する必要があり設計レビューのたびに別の経路が見つかったため採らない (CLAUDE.md「設計の簡素化」)。裁定を通らない受理された後続 (未キャッシュの PDF 等) は、既存の受付境界 2 点で退役させる: (1) `claim_open_request_owner_with_startup_intent` の成功時 (main の判定は既存の `owner_context` による。投影中の context だけで判定しない)、(2) `retire_replaced_main_list_requests` (`retained == Pane` のときも `DirectNavigation` は退役)。自分自身の完了の再入では pending は取り出し済みなので消えない |
 | 履歴の戻る/進む、コレクション、レーティング、Quick Folder 切替、Remote 取得等の main 要求 | `retire_replaced_main_list_requests` が `cancel_folder_pane_open` (既存) |
 | **DFS (Ctrl+↑↓ 等) の開始** | **追加 (受付点 1)**: `start_folder_nav` が新しい DFS を受理したとき (既存 DFS への累積は除く)、main の `DirectNavigation` の pending を `cancel_folder_pane_open` で cancel する (r7: ツリーの `PaneNavigation` は従来どおり触れない)。`cancel_pending_folder_nav()` は新しい DFS 用の lock・holdover まで消すので流用しない。detached 用の purpose・`RequiredFullscreenTarget`・`CurrentViewOrderRefresh` 等には触れない |
 | **直接移動の受付 (DFS 実行中)** | **追加 (受付点 2)**: §4.2 の 3 |
@@ -310,8 +310,8 @@ r7: 範囲外の挙動を変えないため、Esc・スタック切替キーを�
 6. 待機表示: 500 ms 未満の走査では「移動先を読み込み中…」を描かず、500 ms を超えたら描く。
 7. stale: 走査中に別の採用で一覧が変わったら、完了しても採用しない。
 8. (r8 で削除: 全画面予約の移送はしない)
-8a. 拒否された後続: お気に入り A の走査中に、拒否される入力 (表示対象外の ZIP をアドレス欄で指定等) を実際の裁定で
-   与えても A の走査待ちは残り、後で A が採用される。ツリーの走査待ちは従来どおり事前に取り消される。
+8a. 拒否された後続 (r10、利用者決定 A): お気に入り A の走査中に、拒否される入力 (表示対象外の ZIP をアドレス欄で指定、
+   Ctrl+F 絞り込み中の Backspace 等) を実際の経路で与えると、A の走査待ちは取り消され、元の場所に留まる (ツリーと同じ)。
 8b. 受理された後続: 実際の裁定で「お気に入り A の走査中 → アドレス欄から未キャッシュの B.pdf を受理 → B の列挙待ちの間に
    A の worker が完了」としても A は採用されず、B が採用される (claim 成功で A が退役)。履歴の戻る (retire 経由) も同様。
 9. 対象外の型 (ZIP/PDF、`.epub`/変換書庫、main 以外の context) は従来の経路のまま。
