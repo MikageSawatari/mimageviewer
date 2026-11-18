@@ -49,6 +49,12 @@ pub(crate) enum StackSelectionTarget {
     Clear,
 }
 
+/// Why the caller is capturing the provisional cursor, independently of its value.
+pub(crate) enum StackSelectionIntent {
+    Current,
+    ExplicitClear,
+}
+
 /// Selection resolved against the exact aggregate candidate being installed.
 pub(crate) enum StackSelection {
     Select(usize),
@@ -1992,20 +1998,23 @@ impl crate::app::App {
 
     /// An explicit cursor or load hint on provisional rows supersedes entry positioning.
     /// Keep identity, never a raw index: grouping can remove rows before this item.
-    pub(crate) fn remember_pending_stack_selection(&mut self) {
+    pub(crate) fn remember_pending_stack_selection(&mut self, intent: StackSelectionIntent) {
         if !self.stack_mode_requested
             || self.stack_view.is_some()
             || self.stack_script_pending.is_none()
         {
             return;
         }
-        self.stack_selection_target = match self.selected {
-            None => Some(StackSelectionTarget::Clear),
-            Some(index) => self
-                .items
-                .get(index)
-                .and_then(GridItem::drag_source_path)
-                .map(|path| StackSelectionTarget::MemberPath(path.to_path_buf())),
+        self.stack_selection_target = match intent {
+            StackSelectionIntent::ExplicitClear => Some(StackSelectionTarget::Clear),
+            // Empty visibility or a hidden load hint can leave no cursor without a
+            // deselection request. Only the caller's explicit intent can create Clear.
+            StackSelectionIntent::Current => self.selected.and_then(|index| {
+                self.items
+                    .get(index)
+                    .and_then(GridItem::drag_source_path)
+                    .map(|path| StackSelectionTarget::MemberPath(path.to_path_buf()))
+            }),
         };
     }
 

@@ -77063,7 +77063,9 @@ impl App {
             }
             GridCursorIntent::ExplicitKeep => {
                 self.cancel_rating_membership_restore();
-                self.remember_pending_stack_selection();
+                self.remember_pending_stack_selection(
+                    crate::filename_stack_ui::StackSelectionIntent::Current,
+                );
                 return;
             }
             GridCursorIntent::Automatic => GridCursorMove::Move,
@@ -77076,7 +77078,11 @@ impl App {
             movement,
         );
         if matches!(intent, GridCursorIntent::Explicit(_)) {
-            self.remember_pending_stack_selection();
+            self.remember_pending_stack_selection(if target.is_none() {
+                crate::filename_stack_ui::StackSelectionIntent::ExplicitClear
+            } else {
+                crate::filename_stack_ui::StackSelectionIntent::Current
+            });
         }
     }
 
@@ -77087,7 +77093,9 @@ impl App {
         self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
         self.grid_scroll.set_reveal_requested(true);
         self.redirect_selected_to_visible();
-        self.remember_pending_stack_selection();
+        self.remember_pending_stack_selection(
+            crate::filename_stack_ui::StackSelectionIntent::Current,
+        );
     }
 
     /// 選択中の実ファイル / 実フォルダのパス。仮想項目・未選択では `None`。
@@ -83772,7 +83780,9 @@ impl App {
         self.grid_scroll.set_reveal_requested(true);
         self.update_last_selected_image();
         self.redirect_selected_to_visible();
-        self.remember_pending_stack_selection();
+        self.remember_pending_stack_selection(
+            crate::filename_stack_ui::StackSelectionIntent::Current,
+        );
     }
 
     // -------------------------------------------------------------------

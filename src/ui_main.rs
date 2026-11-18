@@ -7455,9 +7455,22 @@ impl App {
 
     fn clear_grid_background_selection(&mut self) {
         let mode = self.settings.grid_click_selection_mode;
-        self.apply_explicit_grid_selection(|selected, anchor, checked| {
-            clear_grid_selection_for_background_click(mode, selected, anchor, checked);
-        });
+        let mut target = self.selected;
+        let mut anchor = self.grid_click_selection_anchor;
+        clear_grid_selection_for_background_click(
+            mode,
+            &mut target,
+            &mut anchor,
+            &mut self.checked,
+        );
+        // Explorer background clicks explicitly deselect even if a preceding click
+        // already cleared the cursor. Check mode keeps its existing selection policy.
+        let intent = if mode.normalized() == GridClickSelectionMode::Explorer {
+            crate::app::GridCursorIntent::Explicit(GridCursorMove::Move)
+        } else {
+            crate::app::GridCursorIntent::ExplicitKeep
+        };
+        self.move_grid_cursor(target, intent);
     }
 
     fn select_grid_right_drag_start(
@@ -34045,6 +34058,7 @@ mod grid_reclick_open_tests {
                 app.active_quick_folder_slot = None;
                 app.settings.restore_folder_cursor_on_revisit = restore;
                 app.settings.auto_fullscreen_image_folders = false;
+                app.settings.grid_background_double_click_parent = false;
                 app.settings.stack_script_enabled = false;
                 app.settings.stack_separator = '_';
                 app.settings.sort_order = crate::settings::SortOrder::FileName;
@@ -34079,6 +34093,13 @@ mod grid_reclick_open_tests {
 
             // Drive the actual Explorer background handler with headless pointer events.
             // The harness deliberately does not poll grouping while the click is handled.
+            click_at(&mut harness, egui::pos2(440.0, 170.0));
+            assert_eq!(harness.state().app.selected, None);
+            assert_eq!(
+                harness.state().app.stack_selection_target,
+                Some(StackSelectionTarget::Clear)
+            );
+            // Repeating the same explicit deselection must not turn it into a keep.
             click_at(&mut harness, egui::pos2(440.0, 170.0));
             let app = &mut harness.state_mut().app;
             assert_eq!(app.selected, None);

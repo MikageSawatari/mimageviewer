@@ -214,6 +214,77 @@ fn section1795_off_stack_pending_selection_hidden_by_facet_stays_visible() {
 }
 
 #[test]
+fn section1804_stack_pending_empty_facet_then_reset_selects_final_visible_first() {
+    for restore in [false, true] {
+        let (mut env, folder) = stack_entry_fixture(restore);
+        // No saved position: both policies must select the final visible first row.
+        env.folder_history.remove(&folder);
+        env.settings.facet_filter.exts.clear();
+        env.settings.facet_filter.exts.insert("gif".into());
+        // Facet handlers capture ExplicitKeep before rebuilding the visible rows.
+        let selected = env.selected;
+        env.move_grid_cursor(selected, GridCursorIntent::ExplicitKeep);
+        env.rebuild_visible_indices();
+        assert!(env.current_grid_order().is_empty());
+        assert_eq!(env.selected, None);
+
+        env.settings.facet_filter.exts.clear();
+        env.move_grid_cursor(None, GridCursorIntent::ExplicitKeep);
+        assert!(env.stack_selection_target.is_none());
+        env.rebuild_visible_indices();
+        assert_eq!(env.selected, Some(0));
+        finish_stack_entry(&mut env);
+        assert_eq!(env.current_grid_order(), [0, 1, 2]);
+        assert_eq!(env.selected, Some(0), "restore={restore}");
+        assert_eq!(env.items[0].name(), "a");
+        assert!(!env.folder_history.contains_key(&folder));
+    }
+}
+
+#[test]
+fn section1804_stack_hidden_load_hints_do_not_request_deselection() {
+    for restore in [false, true] {
+        for hint in ["name", "startup"] {
+            let (mut env, folder) = stack_entry_fixture(restore);
+            env.settings.facet_filter.exts.clear();
+            env.settings.facet_filter.exts.insert("gif".into());
+            let intent = match hint {
+                "startup" => StartupListIntent::RestoreList {
+                    target: crate::settings::StartupListTarget::PhysicalList {
+                        logical_path: folder.clone(),
+                        zip_prefix: None,
+                    },
+                    cursor: Some(crate::settings::ListCursorHint {
+                        name: "a_1.jpg".into(),
+                        rows_above: None,
+                    }),
+                },
+                _ => {
+                    env.select_after_load = Some("a_1.jpg".into());
+                    StartupListIntent::ExplicitList
+                }
+            };
+            assert!(env.load_folder_with_scan_owned(
+                folder,
+                None,
+                OpenRequestOwner::Navigation,
+                intent,
+            ));
+            env.finish_page_identity_preparation_for_test();
+            assert!(env.stack_script_pending.is_some());
+            assert_eq!(env.selected, None, "restore={restore}, hint={hint}");
+            assert!(
+                env.stack_selection_target.is_none(),
+                "hidden hint is not an explicit clear: restore={restore}, hint={hint}"
+            );
+            finish_stack_entry(&mut env);
+            assert!(env.current_grid_order().is_empty());
+            assert_eq!(env.selected, None);
+        }
+    }
+}
+
+#[test]
 fn section1795_on_stack_entry_without_history_selects_final_visible_first() {
     let (mut env, folder) = stack_entry_fixture(true);
     // The provisional rows are still this entry, not a departing folder.
