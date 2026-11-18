@@ -49,7 +49,7 @@
 
 ### 1.805 お気に入り・アドレス欄・最近開いたフォルダから直接移動すると、フォルダの読み込み (scan_directory_with_settings) を UI スレッドで同期実行して最大約 0.59 秒止まる — お気に入り切り替えのちらつき調査から (2026-11-18)
 
-- 状態: **実装済み・レビュー待ち**。ブランチ `fix-direct-nav-worker-scan` (作業ツリー `G:\home\mimageviewer-direct-nav-scan`)。設計書: [direct-navigation-worker-scan-plan.md](direct-navigation-worker-scan-plan.md)。
+- 状態: **実装済み・利用者の実機確認待ち** (2026-11-18)。設計レビュー r6・実装レビュー r2 とも ACCEPT (GPT-6.1 Sol xhigh)、本体 lib 全件 18,566 件成功 (b90e0b111)。master 未 merge。ブランチ `fix-direct-nav-worker-scan` (作業ツリー `G:\home\mimageviewer-direct-nav-scan`)。設計書: [direct-navigation-worker-scan-plan.md](direct-navigation-worker-scan-plan.md)。
 - 観測 (利用者の perf ログ、起点セッションの調査): お気に入り等からの移動で `nav/lf_scan` (`pre_scanned=false`) が最大約 590 ms。
 - 原因 (コード): `open_direct_navigation_target_classified` が `pre_scan` 無しのとき、`load_folder_with_scan_claimed_with_search_origin` の `scan_directory_with_settings` を UI スレッドで実行する。対象はお気に入り・アドレス欄 Enter (検索外)・最近開いたフォルダ・親へ・コレクションの物理元。フォルダツリー・DFS・履歴の戻る/進む・検索中のお気に入りは worker 走査済み。
 - 方針: ツリーと同じ `FolderPaneOpenPending` に `FolderOpenScanPurpose::DirectNavigation` を足し、完了したら `pre_scan` 付きで同じ consumer へ戻す。全画面を閉じる即時経路・`load_folder` 系・detached は範囲外 (設計書 §7)。
