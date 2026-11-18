@@ -2898,7 +2898,7 @@ cargo nextest run -p mimageviewer --lib -E 'test(/book_resume_meter_multipart_di
 - 当時の最終`cargo fmt`（引数なし）と`git diff --check`もexit 0。当時実行した集合に未解消の失敗は無いが、
   上記のとおりr1で見つかったfallback/Smart publicationの欠落を覆う回帰は含まれていなかった。
 
-#### 独立実装レビューr1対応（2026-11-19、基点 `e80f78a65`、未コミット）
+#### 独立実装レビューr1対応（2026-11-19、基点 `e80f78a65`、`a3a797ca9` でコミット）
 
 - レビュー結果はREVISE、P2が4件。コード照合でも4件の核心を確認した。
   1. fallbackの自身のsource事実を無条件に消していた。通常Folderのbaseは最初からNoneだが、
@@ -2976,3 +2976,16 @@ cargo nextest run -p mimageviewer --lib -E 'test(/converted_source_factory_/) | 
 - `cargo check -p mimageviewer --bin mimageviewer-core`もexit 0（36.67秒、
   `target/803-r1-core-check.log`）。最終`cargo fmt`（引数なし）と`git diff --check`もexit 0。
   HEADは`e80f78a65`のまま、変更は未コミット。full suite・build-dev・製品起動・commitは指示どおり実施しない。
+
+#### 独立実装レビュー (Sol xhigh、設計レビューと同じ担当、2026-11-19)
+
+- r1 (`e80f78a65` に対して、REVISE、P2 4): 書庫への代替の分岐が自分の読み取り元の事実を消す / Smart の membership の追加で決まった読み取り元を保持素材と照合しない /
+  決め直しの返事ごとに一覧全体を走査する / 全体検索の新しい表が変更の記録を最初から適用し直す → `a3a797ca9` で 4 件とも修正 (上の対応記録)。
+  既存テスト `book_resume_meter_tests.rs` の変更は、本番の順序 (同じフレームで表を追いついてから範囲を投入) と、休眠の context は表示に戻るときに追いつく契約に合わせたもので、期待を弱めていないことを確認した。
+- r2 (`a3a797ca9` に対して、**ACCEPT**、指摘なし)。
+
+#### 設計担当の検証 (2026-11-19、共有ランナー `run-heavy.ps1` 経由)
+
+- 本体 lib 全件 (`test-lib-full.ps1`): `e80f78a65` で 18,849 件成功・0 失敗、`a3a797ca9` で **18,859 件成功・0 失敗** (86 skipped、receipt `target/test-lib-full/b5473e10f7d96264297c339b35f64838284ae3fb3e1511d63fbc4fe318a0c896.json`)。
+- 実機の挙動は未確認 (エージェントは製品を起動しない)。
+- 別件として記録: `Pending` の間に `CacheOnly` で出た素材に付く idle upgrade の対象外の印は、確定後も一致していれば残る (§31.7、既存)。番号は未取得。
