@@ -43624,6 +43624,16 @@ impl App {
                 return;
             }
         };
+        if matches!(recipe, book_materialization::ProjectionRecipe::OrdinaryList)
+            && hydration_intent.enters_folder_list()
+        {
+            // These provisional rows continue the same entry, so consume their departure
+            // boundary without saving folder/session positions. Restore from the record
+            // preceding this entry, not its automatic provisional index. Installation bumps
+            // the generation, leaving real departures from the aggregate writable as usual.
+            // Refresh/InternalInstall and extracted subfolder stacks keep their existing save.
+            self.top_level_grid_view.departed_items_generation = Some(self.items_generation);
+        }
         let mut hydration = self.install_loading_items_inner(
             source_path,
             items,

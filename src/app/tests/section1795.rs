@@ -214,15 +214,159 @@ fn section1795_off_stack_pending_selection_hidden_by_facet_stays_visible() {
 }
 
 #[test]
-fn section1795_on_stack_entry_keeps_legacy_automatic_index_restore() {
+fn section1795_on_stack_entry_without_history_selects_final_visible_first() {
     let (mut env, folder) = stack_entry_fixture(true);
-    // Even without an earlier session record, aggregate installation records the
-    // provisional list's raw index. Keep this existing ON behavior in this fix.
+    // The provisional rows are still this entry, not a departing folder.
     env.folder_history.remove(&folder);
     env.grid_scroll.set_position(125.0);
     finish_stack_entry(&mut env);
-    assert_eq!(env.folder_history[&folder].1, Some(2));
-    assert_position(&env, Some(2), 125.0);
+    assert!(!env.folder_history.contains_key(&folder));
+    assert_position(&env, Some(1), 0.0);
+    assert_eq!(env.items[env.selected.unwrap()].name(), "b_1.png");
+}
+
+#[test]
+fn section1804_stack_reentry_restores_aggregate_history_before_provisional_redirect() {
+    let (mut env, folder) = stack_entry_fixture(true);
+    finish_stack_entry(&mut env);
+    env.move_grid_cursor(Some(1), GridCursorIntent::Explicit(GridCursorMove::Move));
+    env.grid_scroll.set_position(175.0);
+    open(&mut env, &folder);
+    // Aggregate index 1 names b_1.png. On provisional rows it names a hidden JPG,
+    // so visibility redirects it to index 2. That correction must not replace history.
+    assert_eq!(env.folder_history[&folder], (175.0, Some(1)));
+    assert_position(&env, Some(2), 175.0);
+    env.grid_scroll.set_position(250.0);
+    finish_stack_entry(&mut env);
+    assert_eq!(env.folder_history[&folder], (175.0, Some(1)));
+    assert_position(&env, Some(1), 175.0);
+    assert_eq!(env.items[env.selected.unwrap()].name(), "b_1.png");
+
+    // Only provisional departure was consumed; the installed generation still saves
+    // a real departure, including changes made after aggregate adoption.
+    env.move_grid_cursor(Some(2), GridCursorIntent::Explicit(GridCursorMove::Move));
+    env.grid_scroll.set_position(375.0);
+    let other = env.tmp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    open(&mut env, &other);
+    assert_eq!(env.folder_history[&folder], (375.0, Some(2)));
+}
+
+#[test]
+fn section1804_stack_reentry_keeps_existing_unstacked_history_index_semantics() {
+    let (mut env, folder) = stack_entry_fixture(true);
+    // The fixture's previous visit was unstacked: index 2 named b_1.png. History
+    // still stores an index, so applying that record to aggregated rows selects c.
+    assert_eq!(env.folder_history[&folder], (420.0, Some(2)));
+    env.grid_scroll.set_position(125.0);
+    finish_stack_entry(&mut env);
+    assert_eq!(env.folder_history[&folder], (420.0, Some(2)));
+    assert_position(&env, Some(2), 420.0);
+    assert_eq!(env.items[env.selected.unwrap()].name(), "c_1.png");
+}
+
+#[test]
+fn section1804_stack_toggle_keeps_departure_recording_and_selection() {
+    for restore in [false, true] {
+        let (mut env, folder) = stack_entry_fixture(restore);
+        finish_stack_entry(&mut env);
+        env.move_grid_cursor(Some(2), GridCursorIntent::Explicit(GridCursorMove::Move));
+        env.grid_scroll.set_position(175.0);
+        env.toggle_stack_mode();
+        phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut env);
+        env.finish_page_identity_preparation_for_test();
+        assert!(!env.stack_mode_on());
+        assert_eq!(env.folder_history[&folder], (175.0, Some(2)));
+        assert_position(&env, Some(3), 175.0);
+        assert_eq!(env.items[env.selected.unwrap()].name(), "c_1.png");
+
+        env.toggle_stack_mode();
+        phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut env);
+        env.finish_page_identity_preparation_for_test();
+        assert!(env.stack_script_pending.is_some());
+        assert_eq!(env.folder_history[&folder], (175.0, Some(3)));
+        env.grid_scroll.set_position(250.0);
+        finish_stack_entry(&mut env);
+        assert_eq!(env.folder_history[&folder], (250.0, Some(3)));
+        assert_position(&env, Some(2), 250.0);
+        assert_eq!(env.items[env.selected.unwrap()].name(), "c_1.png");
+    }
+}
+
+#[test]
+fn section1804_stack_refresh_keeps_departure_recording_and_selection() {
+    for restore in [false, true] {
+        let (mut env, folder) = stack_entry_fixture(restore);
+        finish_stack_entry(&mut env);
+        env.move_grid_cursor(Some(1), GridCursorIntent::Explicit(GridCursorMove::Move));
+        env.grid_scroll.set_position(175.0);
+        env.reload_current_folder_preserving_override();
+        phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut env);
+        env.finish_page_identity_preparation_for_test();
+        assert!(env.stack_script_pending.is_some());
+        assert_eq!(env.folder_history[&folder], (175.0, Some(1)));
+        assert_position(&env, Some(2), 175.0);
+        env.grid_scroll.set_position(250.0);
+        finish_stack_entry(&mut env);
+        assert_eq!(env.folder_history[&folder], (250.0, Some(2)));
+        assert_position(&env, Some(1), 250.0);
+        assert_eq!(env.items[env.selected.unwrap()].name(), "b_1.png");
+    }
+}
+
+#[test]
+fn section1804_stack_internal_install_keeps_departure_recording() {
+    let (mut env, folder) = stack_entry_fixture(true);
+    assert!(env.load_folder_with_scan_owned(
+        folder.clone(),
+        None,
+        OpenRequestOwner::Navigation,
+        StartupListIntent::InternalInstall,
+    ));
+    env.finish_page_identity_preparation_for_test();
+    env.grid_scroll.set_position(250.0);
+    finish_stack_entry(&mut env);
+    assert_eq!(env.folder_history[&folder], (250.0, Some(2)));
+    assert_position(&env, Some(2), 250.0);
+    assert_eq!(env.items[env.selected.unwrap()].name(), "c_1.png");
+}
+
+#[test]
+fn section1804_subfolder_stack_keeps_session_departure_recording() {
+    let (mut env, folder) = stack_entry_fixture(true);
+    env.cancel_stack_script_pending();
+    env.stack_mode_requested = false;
+    env.start_subfolder_expansion_scan_roots(folder.clone(), vec![folder.clone()]);
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !env.items_are_subfolder_expansion_view || env.sidecar_restore_active() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "subfolder scan did not settle"
+        );
+        env.poll_subfolder_expansion(&ctx);
+        env.finish_page_identity_preparation_for_test();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    env.move_grid_cursor(Some(3), GridCursorIntent::Explicit(GridCursorMove::Move));
+    env.toggle_stack_mode();
+    assert!(env.stack_script_pending.is_some());
+    // The explicit toggle target remains c, while the session departure records
+    // the current provisional position. Neither behavior belongs to folder reentry.
+    env.move_grid_cursor(Some(2), GridCursorIntent::Automatic);
+    env.grid_scroll.set_position(250.0);
+    let selected_key = env.rating_path_key(2);
+    let key = top_level_grid_view::SubfolderExpansionPositionKey::new(&folder, &[folder.clone()]);
+    let history = env.folder_history.clone();
+    finish_stack_entry(&mut env);
+    let saved = env
+        .top_level_grid_view
+        .subfolder_expansion_position(&key)
+        .unwrap();
+    assert_eq!(saved.scroll_offset_y, 250.0);
+    assert_eq!(saved.selected_key, selected_key);
+    assert_eq!(env.folder_history, history);
+    assert!(env.items_are_subfolder_expansion_view);
     assert_eq!(env.items[env.selected.unwrap()].name(), "c_1.png");
 }
 
