@@ -11197,6 +11197,10 @@ impl App {
         if !self.location_navigation_pending() {
             return;
         }
+        if let Some(delay) = self.direct_navigation_wait_overlay_delay() {
+            ctx.request_repaint_after(delay);
+            return;
+        }
         egui::Area::new(egui::Id::unique("location_navigation_wait_overlay"))
             .order(egui::Order::Foreground)
             .interactable(false)

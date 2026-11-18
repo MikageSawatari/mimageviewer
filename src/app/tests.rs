@@ -25,6 +25,8 @@ pub(super) fn backend_window_for_test(
 }
 mod auto_aspect_s1;
 mod book_close_s1;
+#[cfg(windows)]
+mod direct_navigation_worker_scan;
 mod repro742;
 mod section1768;
 
@@ -1171,6 +1173,7 @@ pub(super) fn assert_mixed_path_favorite_direct_navigation(
         ));
     }
     app.settle_open_path_classification_for_test();
+    app.finish_direct_navigation_scan_for_test();
     app.finish_page_identity_preparation_for_test();
     assert_eq!(
         app.current_folder.as_ref().unwrap().as_os_str(),
@@ -21726,6 +21729,7 @@ mod folder_pane_open_nav_tests {
         let (tx, rx) = mpsc::channel();
         tx.send(Ok(empty_scan())).expect("send scan");
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            started_at: std::time::Instant::now(),
             navigation: None,
             epub_restore: None,
             path: target.clone(),
@@ -21763,6 +21767,7 @@ mod folder_pane_open_nav_tests {
         let cancel = Arc::new(AtomicBool::new(false));
 
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            started_at: std::time::Instant::now(),
             navigation: None,
             epub_restore: None,
             path: target,
@@ -21793,6 +21798,7 @@ mod folder_pane_open_nav_tests {
         let (pane_tx, pane_rx) = mpsc::channel();
         let pane_cancel = Arc::new(AtomicBool::new(false));
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            started_at: std::time::Instant::now(),
             navigation: None,
             epub_restore: None,
             path: app.tmp.path().join("exact-pane-target"),
@@ -34519,6 +34525,7 @@ mod phase_c_drill_nav_tests {
                 .expect("the real gamepad path must start folder classification");
             real_pending.cancel.store(true, Ordering::Relaxed);
             app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                started_at: std::time::Instant::now(),
                 navigation: real_pending.navigation,
                 epub_restore: None,
                 path: folder.clone(),
@@ -73861,6 +73868,7 @@ mod still_window_mode_key_tests {
                 .expect("real physical scan must have started");
             real_pending.cancel.store(true, Ordering::Relaxed);
             mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                started_at: std::time::Instant::now(),
                 navigation: None,
                 epub_restore: None,
                 path: first.clone(),
@@ -74055,6 +74063,7 @@ mod still_window_mode_key_tests {
                 .expect("real physical scan must have started");
             real_pending.cancel.store(true, Ordering::Relaxed);
             mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                started_at: std::time::Instant::now(),
                 navigation: None,
                 epub_restore: None,
                 path: folder.clone(),
@@ -74736,6 +74745,7 @@ mod still_window_mode_key_tests {
             context.viewer_presentation = ViewerPresentation::DetachedWindow;
             context.detached_viewer_independent_active = true;
             context.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                started_at: std::time::Instant::now(),
                 navigation: None,
                 epub_restore: None,
                 path: folder,
@@ -76178,6 +76188,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             .expect("the main bundle must own the Folder candidate scan");
         real_pending.cancel.store(true, Ordering::Relaxed);
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            started_at: std::time::Instant::now(),
             navigation: None,
             epub_restore: None,
             path: child.clone(),
@@ -76289,6 +76300,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let real_pending = app.folder_pane_open_pending.take().unwrap();
         real_pending.cancel.store(true, Ordering::Relaxed);
         app.folder_pane_open_pending = Some(FolderPaneOpenPending {
+            started_at: std::time::Instant::now(),
             navigation: None,
             epub_restore: None,
             path: child.clone(),
@@ -76829,6 +76841,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 .expect("real detached image scan must have started");
             real_pending.cancel.store(true, Ordering::Relaxed);
             mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                started_at: std::time::Instant::now(),
                 navigation: None,
                 epub_restore: None,
                 path: folder,
@@ -76884,6 +76897,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 .expect("real physical scan must have started");
             real_pending.cancel.store(true, Ordering::Relaxed);
             mounted.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                started_at: std::time::Instant::now(),
                 navigation: None,
                 epub_restore: None,
                 path: folder.clone(),
@@ -77331,6 +77345,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         fn scan_pending(cancel: Arc<AtomicBool>) -> FolderPaneOpenPending {
             let (_tx, rx) = mpsc::channel::<std::io::Result<ScannedDir>>();
             FolderPaneOpenPending {
+                started_at: std::time::Instant::now(),
                 navigation: None,
                 epub_restore: None,
                 path: PathBuf::from(r"C:\detached"),
@@ -78030,6 +78045,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         install_detached_transition_gap_for_test(&mut app, window_id, |bundle| {
             bundle.current_folder = Some(PathBuf::from(r"C:\books\images"));
             bundle.folder_pane_open_pending = Some(FolderPaneOpenPending {
+                started_at: std::time::Instant::now(),
                 navigation: None,
                 epub_restore: None,
                 path: PathBuf::from(r"C:\books\images"),

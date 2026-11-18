@@ -1,5 +1,18 @@
 # UI スレッドの応答性 (Ctrl+↑↓ 連打が引っかからないために)
 
+## 直接移動のフォルダ事前走査（§1.805）
+
+main 一覧のお気に入り・アドレス欄・最近開いたフォルダ・一覧フォルダ・親への移動・
+コレクション物理元は、拒否判定と owner 受理を済ませてから、既存の folder open worker に
+`DirectNavigation` を渡す。完了は通常 nav 裁定から pre-scan 付きの同じ読込へ戻す。
+走査待ちは旧一覧を表示し、項目入力を履歴移動待ちと同じ gate で止める。移動入力は後勝ちとし、
+DFS との相互取消と saved-group の既知の拒否判定後の取消は受付境界で行う。
+待機表示だけに 500 ms の猶予を置く。全画面予約は要求が所有し、取消・失敗・stale・採用拒否で捨てる。
+worker の `nav/folder_open_scan` と採用側の `nav/lf_scan` (`pre_scanned=true`) を分けて計測する。
+利用者ログの最大約590 msが調査の起点であり、この変更後の実機計測は未実施。
+即時全画面close経路・`load_folder` 系・detached は対象外。
+詳細は [設計書](direct-navigation-worker-scan-plan.md) を参照。
+
 ## 本を閉じるときの catalog 全行読み込みの撤去（§1.800 S1）
 
 通常一覧の `resume_loading_items_after_sidecar` は空の控えを作り、画像 BLOB の
@@ -770,6 +783,7 @@ intent sequence で関連する操作を照合する。navigation の再試行�
 | A | 20MP JPEG prefetch 15 枚が UI スレッドで連続 GPU アップロード (1秒に 478ms 占有) | 1 フレーム 1 枚ペーシング、現在ページのみ即時 | `fs_upload_backlog` | [src/app.rs `poll_prefetch`](../src/app.rs) |
 | B | `load_folder` の `read_dir` + per-entry metadata が UI スレッドで 100-200ms | DFS スレッドで事前スキャンして結果を渡す | `ScannedDir` / `load_folder_with_scan` | [src/app.rs `spawn_folder_nav`, `scan_directory`](../src/app.rs) |
 | B' | B で移した `scan_directory` が `p.is_dir()` per-entry 呼びで 970ms | `entry.file_type()` に置換 | - | [src/app.rs](../src/app.rs), [src/folder_tree.rs `sorted_subdirs`](../src/folder_tree.rs) |
+| B'' | お気に入り等の直接移動で UI の同期走査が最大約590 ms（利用者ログ） | main の直接移動を共通 worker へ移し、通常 nav 裁定で pre-scan 採用 | `FolderOpenScanPurpose::DirectNavigation` | [設計書](direct-navigation-worker-scan-plan.md) |
 | D | Ctrl+F / Ctrl+S 検索が UI スレッドで XMP/PNG メタ + SQLite を同期実行 | 検索ごと worker thread、結果 merge | `SearchPending` / `FavSearchPending` | [src/app.rs `execute_search`, `execute_favsearch`](../src/app.rs) |
 | E | `ensure_metadata_loaded` が `open_fullscreen` のたびに AI/EXIF/XMP を UI スレッドで同期読み (20MP JPEG で 100ms+) | 1 worker で 3 パーサーを順次実行、結果をキャッシュ merge | `MetadataLoadPending` | [src/app.rs `start_metadata_load`, `run_metadata_load`](../src/app.rs) |
 

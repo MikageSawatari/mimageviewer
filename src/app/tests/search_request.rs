@@ -913,6 +913,7 @@ fn search_name_snapshot_preserves_captured_return_origin_and_cancels_old_navigat
         let pane_cancel = Arc::new(AtomicBool::new(false));
         let (_pane_tx, pane_rx) = std::sync::mpsc::channel();
         app.folder_pane_open_pending = Some(super::super::FolderPaneOpenPending {
+            started_at: std::time::Instant::now(),
             navigation: None,
             epub_restore: None,
             path: app.tmp.path().join("not-adopted"),

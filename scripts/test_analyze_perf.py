@@ -2635,5 +2635,17 @@ class PageTurnAnimationTests(unittest.TestCase):
                 self.assertTrue(output.is_file())
 
 
+class FolderOpenScanNavTests(unittest.TestCase):
+    def test_worker_scan_has_its_own_nav_breakdown(self) -> None:
+        from analyze_perf import cmd_nav
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            cmd_nav([{"t": 0.0, "cat": "nav", "kind": "folder_open_scan",
+                      "ms": 590.0, "input_seq": 1805, "purpose": "direct-navigation",
+                      "folders": 1, "media": 3, "failed": False, "cancelled": False}])
+        self.assertIn("folder_open_scan", output.getvalue())
+        self.assertIn("590.0", output.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

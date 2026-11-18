@@ -1510,8 +1510,26 @@ impl App {
                         scan,
                         purpose,
                         epub_restore,
+                        navigation: ready_navigation,
                     } = ready;
                     match (purpose, scan) {
+                        (
+                            FolderOpenScanPurpose::DirectNavigation {
+                                restore_intent,
+                                collection_owner,
+                                auto_fullscreen,
+                            },
+                            Ok(scan),
+                        ) => {
+                            self.pending_auto_fs_open = auto_fullscreen;
+                            navigate_restore_intent = restore_intent;
+                            navigate_pre_scan = Some(scan);
+                            navigation = ready_navigation;
+                            if let Some(owner) = collection_owner {
+                                navigate_owner = OpenRequestOwner::CollectionGridPhysical(owner);
+                            }
+                            Some(path)
+                        }
                         (
                             FolderOpenScanPurpose::JumpToPhysicalFolder { selection, origin },
                             Ok(scan),

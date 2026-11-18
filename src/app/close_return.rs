@@ -183,6 +183,8 @@ impl App {
         }
         Some(CloseReturnOrigin {
             navigation: MainListNavigation {
+                #[cfg(all(windows, feature = "test-script"))]
+                folder_load_recorded: false,
                 viewer_adoption: super::ViewerOpenAdoption::ContextContinuation,
                 history_before: Box::new(self.folder_nav_history_snapshot()),
                 source_context: self.projected_viewer_context_id(),

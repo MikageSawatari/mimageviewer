@@ -86,7 +86,13 @@ mod tests {
             // handle_keyboard publishes this pass's KeyboardOwner before entering
             // its stack allowlist; calling the inner adapter must do the same.
             assert!(!app.shortcuts_blocked_by_text_input(&ctx));
-            app.handle_stack_refresh_keyboard(&ctx, true, 0, 0)
+            app.handle_stack_refresh_keyboard(
+                &ctx,
+                true,
+                0,
+                0,
+                crate::filename_stack_ui::GridItemInputBlock::StackRefresh,
+            )
         } else {
             app.handle_keyboard(&ctx)
         };

@@ -388,7 +388,24 @@ impl App {
             self.show_feedback_warning("復元処理が進行中です".into());
             return None;
         }
-        if self.saved_group_open.is_some() || self.saved_group_other_main_nav_pending() {
+        // The readiness helper remains strict: a previously admitted saved group must
+        // still yield to a later pane scan. Only this admission may replace these scans.
+        let replaceable_scan = self.replaceable_main_folder_scan_pending();
+        let other_pending = if replaceable_scan {
+            self.folder_nav_pending.is_some()
+                || self.smart_folder_transition.is_some()
+                || self.bookmark_open_pending.is_some()
+                || matches!(
+                    self.bookmark_view_state,
+                    Some(super::BookmarkViewState::Opening { .. })
+                )
+                || self.startup_open_path_resolve_pending.is_some()
+                || self.archive_convert.is_some()
+                || self.remote_session_blocks_local_control()
+        } else {
+            self.saved_group_other_main_nav_pending()
+        };
+        if self.saved_group_open.is_some() || other_pending {
             self.show_feedback_warning("別の場所を開く処理が進行中です".into());
             return None;
         }
@@ -411,6 +428,59 @@ impl App {
         {
             self.show_feedback_warning("本棚の更新処理が進行中です".into());
             return None;
+        }
+        // Resolve every already-known refusal before retiring the old scan. Unknown
+        // book/catalog results retain the existing asynchronous admission contract.
+        let known_target = if !replaceable_scan {
+            None
+        } else if action != KeyAction::GridOpenActiveBook
+            && self.book_op_pending.is_none()
+            && !self.book_list_read_failed()
+            && (action == KeyAction::GridBookPrev
+                || action == KeyAction::GridBookNext
+                || action.book_slot_number().is_some())
+        {
+            self.book_shelf.snapshot.as_ref().map(|rows| {
+                book_action_target(rows, action, self.book_action_current_folder().as_ref())
+                    .map(|_| ())
+            })
+        } else if action == KeyAction::GridOpenCollectionTarget
+            || action == KeyAction::GridCollectionPrev
+            || action == KeyAction::GridCollectionNext
+            || action.collection_slot_number().is_some()
+        {
+            let mut requested = self.collection_action_catalog_read_pending();
+            match self.poll_collection_action_catalog(&mut requested) {
+                Ok(Some((ids, target))) => Some({
+                    let target = if action == KeyAction::GridOpenCollectionTarget {
+                        self.settings
+                            .toolbar_collection_target_id
+                            .map(CollectionId::from_uuid)
+                    } else {
+                        target
+                    };
+                    collection_action_target(
+                        &ids,
+                        target,
+                        action,
+                        self.top_level_grid_view
+                            .collection_session()
+                            .map(|session| session.identity.collection_id),
+                    )
+                    .map(|_| ())
+                }),
+                Ok(None) => None,
+                Err(message) => Some(Err(message)),
+            }
+        } else {
+            None
+        };
+        if let Some(Err(message)) = known_target {
+            self.show_feedback_warning(message);
+            return None;
+        }
+        if replaceable_scan {
+            self.cancel_folder_pane_open(super::PaneOpenRestoreExit::Abandoned);
         }
         Some(source)
     }

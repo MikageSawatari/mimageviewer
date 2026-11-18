@@ -65,6 +65,8 @@ fn assert_physical(app: &App, path: &Path, prefix: Option<&str>) {
 }
 
 fn settle_book(app: &mut App) {
+    #[cfg(windows)]
+    app.finish_direct_navigation_scan_for_test();
     phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(app);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while app.zip_enumerate_pending.is_some() {

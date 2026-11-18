@@ -1458,6 +1458,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-18: §1.805 main直接移動のworker走査
+
+設計レビューr1で構造的変更としてAGREEした
+[直接移動の設計](direct-navigation-worker-scan-plan.md)に従い、bundle所有の
+`FolderOpenScanPurpose`にmain専用の`DirectNavigation`を追加した。
+共通spawnへ呼出元のnavigationを引き継ぎ、要求自身がrestore_intent・Collection物理owner・
+全画面予約を所有する。既存purposeのcaptureとdetached contextの経路は変更しない。
+`start_folder_nav`受付で取り消すのはmainのDirectNavigation/PaneNavigationだけで、
+detached用purpose・RequiredFullscreenTarget・CurrentViewOrderRefreshには触れない。
+共有pendingの開始時刻は待機表示の500 ms猶予にだけ使い、detachedの競合判定には使わない。
+
 ### 2026-11-18: sidecar復元Modalの共通表示猶予とroot限定の計装
 
 設計担当ClaudeCodeの方針とCodexの前提確認に基づき、共通helperの表示猶予定数

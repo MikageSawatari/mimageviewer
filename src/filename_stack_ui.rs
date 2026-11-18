@@ -15,6 +15,18 @@
 //! 分割して収集し、grouping と集約/flat の materialize・ページ編集投影は worker で行う。
 //! 受理時に bundle identity、items generation、request sequence、write stamps を照合する。
 
+/// The owner which blocks grid item input; only StackRefresh accepts stack-only keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GridItemInputBlock {
+    BookStructuralOperation,
+    ImageFolderZip,
+    LocationNavigation,
+    StackRefresh,
+}
+
+pub(crate) const DIRECT_NAVIGATION_WAIT_GRACE: std::time::Duration =
+    std::time::Duration::from_millis(500);
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -2253,7 +2265,7 @@ impl crate::app::App {
         }
     }
 
-    pub(crate) fn location_navigation_pending(&self) -> bool {
+    fn other_location_navigation_pending(&self) -> bool {
         self.rating_view_pending
             .as_ref()
             .is_some_and(|pending| pending.navigation.is_some())
@@ -2263,18 +2275,41 @@ impl crate::app::App {
                 .is_some()
     }
 
-    /// The mounted bundle and staged location owner determine whether grid items accept input.
-    /// All grid input owners (key, pointer, touch, ring, gamepad, and menu) use this gate.
-    pub(crate) fn grid_item_input_allowed(&self) -> bool {
-        self.book_structural_op.is_none()
-            && self.image_folder_zip_operation.is_none()
-            && !self.location_navigation_pending()
-            && !matches!(self.stack_return_state.as_ref(),
-            Some(StackReturnState::Refreshing { view })
-                if self.stack_view.as_ref().is_some_and(|current| Arc::ptr_eq(current, view)))
+    pub(crate) fn location_navigation_pending(&self) -> bool {
+        self.other_location_navigation_pending() || self.direct_navigation_scan_pending()
     }
 
-    /// 集約/フラット間の in-memory ビュー切替の共通後始末。`select` を選択し scroll する。
+    /// Grace is visual only: item input is blocked immediately. Existing history/rating
+    /// waits keep their immediate indicator, even if a direct scan is also pending.
+    pub(crate) fn direct_navigation_wait_overlay_delay(&self) -> Option<std::time::Duration> {
+        if self.other_location_navigation_pending() || !self.direct_navigation_scan_pending() {
+            return None;
+        }
+        let elapsed = self.direct_navigation_scan_elapsed()?;
+        (elapsed < DIRECT_NAVIGATION_WAIT_GRACE).then(|| DIRECT_NAVIGATION_WAIT_GRACE - elapsed)
+    }
+
+    pub(crate) fn grid_item_input_block(&self) -> Option<GridItemInputBlock> {
+        if self.book_structural_op.is_some() {
+            Some(GridItemInputBlock::BookStructuralOperation)
+        } else if self.image_folder_zip_operation.is_some() {
+            Some(GridItemInputBlock::ImageFolderZip)
+        } else if self.location_navigation_pending() {
+            Some(GridItemInputBlock::LocationNavigation)
+        } else if matches!(self.stack_return_state.as_ref(), Some(StackReturnState::Refreshing { view })
+            if self.stack_view.as_ref().is_some_and(|current| Arc::ptr_eq(current, view)))
+        {
+            Some(GridItemInputBlock::StackRefresh)
+        } else {
+            None
+        }
+    }
+
+    /// All item input (key, pointer, touch, ring, gamepad and menu) shares this gate.
+    pub(crate) fn grid_item_input_allowed(&self) -> bool {
+        self.grid_item_input_block().is_none()
+    }
+
     fn swap_stack_view_items(
         &mut self,
         prepared: StackPreparedItems,

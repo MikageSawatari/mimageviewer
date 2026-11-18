@@ -4376,6 +4376,50 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn direct_navigation_worker_preserves_collection_physical_owner() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let child = temp.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot =
+            collection_with_sources(&client, &[(child.clone(), CollectionResolvedKind::Folder)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let owner = app.collection_grid_physical_load_owner(0, &child).unwrap();
+        let before = super::super::folder_scan::caller_scan_count_for_test();
+        app.open_direct_navigation_target(
+            child.clone(),
+            None,
+            super::super::OpenRequestOwner::CollectionGridPhysical(owner.clone()),
+            None,
+            None,
+            crate::app::StartupListIntent::ExplicitList,
+        );
+        assert_eq!(
+            super::super::folder_scan::caller_scan_count_for_test(),
+            before
+        );
+        assert!(
+            matches!(&app.folder_pane_open_pending.as_ref().unwrap().purpose,
+            super::super::FolderOpenScanPurpose::DirectNavigation { collection_owner: Some(captured), .. }
+            if captured.stamp == owner.stamp && captured.anchor == owner.anchor)
+        );
+        app.finish_direct_navigation_scan_for_test();
+        assert_eq!(app.current_folder.as_ref(), Some(&child));
+        assert_eq!(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .identity
+                .collection_id,
+            snapshot.collection_id()
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn deleted_collection_child_stays_physical_through_park_resume_and_backspace() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
         let temp = tempfile::tempdir().unwrap();
