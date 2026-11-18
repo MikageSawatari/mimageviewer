@@ -554,40 +554,100 @@ fn tag_list_order_grid_request_supersedes_direct_navigation_scan() {
 #[test]
 fn tag_list_order_folder_then_archive_returns_through_folder_before_results() {
     let mut app = setup_app();
-    let root = app.tmp.path().join("root-row");
-    std::fs::create_dir_all(&root).unwrap();
+    let fixture_root = app.tmp.path().to_path_buf();
+    let (a, root) = fixture(&mut app, &fixture_root, true);
+    // Audio makes this Folder row a traversal stop. With no loose image or video,
+    // the production fullscreen reopen must then open the inner book instead.
+    std::fs::remove_file(root.join("page.png")).unwrap();
+    std::fs::write(root.join("audio.mp3"), b"audio").unwrap();
     let archive = root.join("inner.zip");
-    write_zip(&archive);
-    tag_rows(&mut app, vec![GridItem::Folder(root.clone())]);
-    app.capture_main_folder_list_order(0);
-    app.commit_staged_search_navigation_effects(
-        &root,
-        false,
-        Some(TagViewNavAdmission::ListOrderRow {
-            run: 7,
-            row: root.clone(),
-        }),
-        None,
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image::RgbImage::new(2, 2))
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&archive).unwrap());
+    zip.start_file("001.png", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    std::io::Write::write_all(&mut zip, png.get_ref()).unwrap();
+    zip.finish().unwrap();
+    app.tags_db
+        .as_mut()
+        .unwrap()
+        .set_item_tags(
+            &crate::tags_db::item_key_for_path(&root),
+            ["chosen"],
+            crate::tags_db::source::EDIT,
+        )
+        .unwrap();
+
+    let ctx = egui::Context::default();
+    let run = app.tag_view.run;
+    let snapshot = app.list_order.clone().unwrap();
+    assert_eq!(app.tag_view.nav_stack, vec![a.clone()]);
+    app.handle_fullscreen_list_order_nav_context(&ctx, 0, true, false);
+    assert_request(&app, true, true, 0);
+    assert_eq!(app.tag_view.nav_stack, vec![a.clone()]);
+    let result = receive(&mut app);
+    assert_eq!(result.target.as_ref().unwrap().logical_source(), root);
+    assert_eq!(app.tag_view.nav_stack, vec![a]);
+    app.apply_folder_nav_result(&ctx, result);
+    let reopen_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        settle(&mut app, &ctx);
+        if app.fullscreen_idx.is_some() && app.fs_nav_after_pdf_enumerate.is_none() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < reopen_deadline,
+            "inner ZIP fullscreen did not reopen"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(app.tag_view.nav_stack, vec![root.clone(), archive.clone()]);
+    assert_eq!(app.effective_folder(), Some(archive.clone()));
+    assert!(
+        app.fullscreen_idx.is_some(),
+        "inner ZIP adoption reopens fullscreen"
     );
-    app.commit_staged_search_navigation_effects(
-        &archive,
-        false,
-        Some(TagViewNavAdmission::Descend),
-        None,
-    );
-    assert_eq!(app.tag_view.nav_stack, vec![root.clone(), archive]);
+    assert!(app.fs_nav_after_pdf_enumerate.is_none());
+    assert!(matches!(app.items.first(), Some(GridItem::ZipImage { .. })));
+    assert_eq!(app.list_order_position().unwrap().1, 2);
+    assert!(Arc::ptr_eq(app.list_order.as_ref().unwrap(), &snapshot));
+    assert_eq!(app.tag_view.run, run);
+
+    // Leave fullscreen for the page grid before exercising the tag view's two
+    // book/folder Backspace actions from that grid.
+    app.close_fullscreen();
+    assert!(app.fullscreen_idx.is_none());
     app.tag_view_back();
-    app.finish_page_identity_preparation_for_test();
+    settle(&mut app, &ctx);
     assert_eq!(app.tag_view.nav_stack, vec![root.clone()]);
     assert_eq!(app.effective_folder(), Some(root.clone()));
-    assert_eq!(app.tag_view.run, 7, "first BS does not requery");
+    assert!(!app.items_are_tag_view);
+    assert!(app.items.contains(&GridItem::ZipFile(archive)));
+    assert_eq!(app.tag_view.run, run, "first grid BS does not requery");
     app.tag_view_back();
     assert!(app.tag_view.nav_stack.is_empty());
-    assert_eq!(app.tag_view.run, 8);
+    assert_eq!(app.tag_view.run, run + 1);
     assert_eq!(
         app.select_after_load,
-        Some(AfterLoadSelection::ExactPath(root))
+        Some(AfterLoadSelection::ExactPath(root.clone()))
     );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while app.tag_view_pending.is_some() || app.sidecar_restore_active() {
+        app.poll_tag_view();
+        app.poll_sidecar_restore(&ctx);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tag results did not return"
+        );
+        std::thread::yield_now();
+    }
+    assert!(app.items_are_tag_view);
+    assert!(app.tag_view.nav_stack.is_empty());
+    assert!(matches!(app.items.get(app.selected.unwrap()),
+        Some(GridItem::Folder(path)) if crate::folder_tree::path_eq(path, &root)));
+    assert!(app.list_order_position().is_none());
 }
 
 #[test]

@@ -765,6 +765,8 @@ mod rating_membership_ops;
 pub(crate) mod rating_membership_tests;
 #[cfg(test)]
 mod tag_view_list_order_tests;
+#[cfg(test)]
+mod tag_view_open_supersession_tests;
 mod viewer_context_registry;
 pub(crate) use list_order_navigation::{
     AfterLoadSelection, ListOrderScope, ListOrderSnapshot, TagViewNavAdmission,
@@ -7838,6 +7840,20 @@ pub(crate) enum SearchThreadResult {
 }
 
 impl FolderNavMode {
+    /// Main-list traversal requests share admission with explicit main opens.
+    /// Fullscreen traversals keep their existing sequence/continuation contract.
+    fn is_grid_traversal(&self) -> bool {
+        matches!(
+            self,
+            Self::Grid
+                | Self::SiblingGrid
+                | Self::ListOrder {
+                    fullscreen: false,
+                    ..
+                }
+        )
+    }
+
     /// perf ログに載せる短い識別子。variant 名のみでパスなどを含めず、
     /// ユーザーパスが診断ログに混入しないようにする。
     pub fn perf_tag(&self) -> &'static str {
@@ -31579,6 +31595,12 @@ impl App {
                 _ => Some(self.projected_viewer_context_id()),
             };
             if owner_context == Some(self.viewer_context_main())
+                && explicit_request
+                && stage == MainListRequestStage::Admission
+            {
+                self.retire_main_grid_folder_navigation_for_admission();
+            }
+            if owner_context == Some(self.viewer_context_main())
                 && self.direct_navigation_scan_pending()
             {
                 self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
@@ -36293,6 +36315,7 @@ impl App {
         }
         if explicit_request {
             self.retire_folder_tree_pane_close_navigation();
+            self.retire_main_grid_folder_navigation_for_admission();
         }
         self.cancel_unresolved_open_for_navigation(explicit_request);
         self.retire_close_returns_for_main_admission();
@@ -60426,6 +60449,30 @@ impl App {
         // decides whether a replacement request or a terminal finish releases it.
     }
 
+    /// Retire the old grid request at a successful, explicit main admission.
+    /// Hydrated rows remain adopted; only their obsolete navigation tail is removed.
+    /// Classification/physical preflights are retired by the existing main arbiter.
+    fn retire_main_grid_folder_navigation_for_admission(&mut self) {
+        if !self.main_folder_history_available() {
+            return;
+        }
+        if self
+            .folder_nav_pending
+            .as_ref()
+            .is_some_and(|pending| pending.mode.is_grid_traversal())
+        {
+            self.cancel_inflight_order_dependent_folder_nav();
+        }
+        let owner = self.viewer_context_main();
+        if self
+            .sidecar_restore
+            .as_mut()
+            .is_some_and(|state| state.retire_grid_folder_navigation(owner))
+        {
+            self.clear_pending_folder_nav_steps();
+        }
+    }
+
     pub(crate) fn cancel_pending_folder_nav(&mut self) {
         self.retire_book_deferred_open();
         if let Some(pending) = self.folder_nav_pending.take() {
@@ -60522,7 +60569,11 @@ impl App {
             }
         }
         // 新しい nav 列開始: アキュームレータをリセットしてから spawn
-        if self.direct_navigation_scan_pending() {
+        if mode.is_grid_traversal() && self.main_folder_history_available() {
+            // A new traversal wins over older main opens. Same-mode accumulation has
+            // already returned above, and no new worker exists yet at this boundary.
+            self.retire_replaced_main_list_requests(None);
+        } else if self.direct_navigation_scan_pending() {
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
         }
         self.pending_folder_nav_steps = 0;
@@ -61774,6 +61825,9 @@ impl App {
                         Some(MainListRequestOwner::Pane),
                         false,
                     );
+                    // The destination is now main: retire older grid navigation without
+                    // repeating the startup admission already performed at scan start.
+                    self.retire_main_grid_folder_navigation_for_admission();
                     let scan = if self.top_level_grid_view.smart_folder_session().is_some() {
                         let source_index = self.items.iter().position(|item| {
                             matches!(item, GridItem::Folder(folder)

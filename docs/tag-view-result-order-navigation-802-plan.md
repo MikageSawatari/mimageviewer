@@ -110,7 +110,11 @@
       (`PhysicalHistoryTransition.dfs_continuation` と `MainListAfterHydration::Dfs`) から判定する。
   - §1.805 の DirectNavigation の走査待ちは拒否の理由にしない。ListOrder の受理 (`start_folder_nav`) の既存の受付点で退役させる (§1.805 の裁定のまま)。
   - 累積 (`MAX_PENDING_NAV`) には乗せない (§1.444 のまま)。
-  - 既存の Grid の Ctrl+↑↓ (物理の DFS) の受付は変えない。
+  - Grid の Ctrl+↑↓ (物理の DFS) の連打累積は維持する。通常 main open との競合は、実装レビュー r1 の
+    利用者裁定により、同じ受付境界で後勝ちへそろえる (§10 の r1 対応)。
+  - 実装レビュー r1 追補: 一覧の ListOrder と通常 main open は、両方の受付順で後から受理した要求を残す。
+    ListOrder の受理で先の main open を既存の共通退役へ渡し、通常 open の受理で先の Grid 系移動を退役させる。
+    ListOrder 同士の連打拒否は維持する。追加した Grid の退役は自動 refresh・同じ要求の format 継続では発火させない。
 
 ### 4.2 入口の振り分け
 
@@ -433,3 +437,74 @@ cargo nextest run -p mimageviewer --lib -E "test(/tag_view|list_order|section176
 nextest の leaky 2件の注記は上表のとおり残し、失敗0と区別する。
 重い処理は引き続き指定の run-heavy 経由の絞った nextest のみ追加し、全件 / full gate / dev・release ビルドは行っていない。
 別ブランチ・別作業ツリー・`next-release-backlog.md` に変更は無く、アプリ起動・コミットも行っていない。
+
+### 実装レビュー r1 の P2 / P3 対応 (2026-11-19)
+
+利用者は `c96d81ce3` の独立コードレビュー r1 の2指摘を正しいと判断し、次の修正を指示した。
+直前の `e836ad36f` (§1.804) の変更範囲には触れない。
+
+- **P2 の原因と Grid DFS の照合**: `start_folder_nav` は先行する通常 ZIP 等の main preflight を退役せず、
+  通常 open の受付も `folder_nav_pending` を退役しなかった。物理の Grid DFS も同じ受付を通り、同じ競合があった。
+  先行する通常 open が採用されて後発の移動 worker を消す順と、先行する移動が後発の open を退役させる順の両方を修正する。
+- **受理境界での後勝ち**: 新規の `Grid` / `SiblingGrid` / `ListOrder { fullscreen: false }` は、
+  既存の拒否・同モードの累積判定の後、spawn の前に `retire_replaced_main_list_requests(None)` を使って先の main open を退役する。
+  新 worker はまだ存在しないので、保持用の新 owner・pending・bool は不要。DirectNavigation も同じ受理点で退役する。
+- 通常 main open の共通退役と成功した claim の main / Admission / explicit 受付に、旧 Grid 系 worker の退役を接続した。
+  worker の取消は既存 `cancel_inflight_order_dependent_folder_nav` を使い、分類 / Physical preflight は従来の main owner 退役を使う。
+  採用済み一覧の hydration は維持し、その中の古い `Dfs` (Grid 系) の移動継続だけを外す。
+  自動 refresh / resume / format 継続は `explicit_request == false` のまま、追加した Grid 系の退役 helper を発火させない。
+- **main 行きの確定点**: `GridFolderCandidate` が既存の `!should_detach` により main 行きと確定した後も旧 Grid を退役する。
+  ここは初回 scan で startup の受付が済んでいるので既存の `false` を維持し、main navigation の退役だけを明示した。
+  should_detach の計算・選別、非 main 側、shell / lease / viewport の処理は変更していない。
+- ListOrder 同士の準備 / 採用待ちの拒否、Grid DFS の既存の連打累積、Fullscreen 系の sequence / 継続契約は維持する。
+  source 監査の独立レビューは、refresh を新 open として取り消さない条件と、この限定した main 確定点の処理を確認して事前設計 ACCEPT。
+- **P3**: `tag_list_order_folder_then_archive_returns_through_folder_before_results` は admission 直渡しを撤去した。
+  本 A / stack `[A]` から実際の全画面 ListOrder → worker → Folder 行の採用 → hydration → 内部 ZIP の open / 採用まで通し、
+  `[Folder 行, ZIP]` を検査する。音声 + 有効 PNG 入り ZIP の Folder を用い、FS 再開後に一覧へ戻して BS 2回、
+  run の維持 / 更新・完全パスの選択要求・実際のタグ結果再採用と行選択まで検査する。
+
+変更ファイルは `src/app.rs`、`src/app/sidecar_restore.rs`、`src/app/tag_view_list_order_tests.rs`、
+新規 `src/app/tag_view_open_supersession_tests.rs`、本書。
+§1.804 の StackSelection / スタックカーソル・スクロールの処理、別窓の述語 / viewport は変更しない。
+
+追加した P2 回帰 (実 worker の結果と `PhysicalHistoryPreflight::controlled_for_test` の channel で採用を留める):
+
+- `tag_view_open_supersession_grid_acceptance_retires_older_ordinary_zip_preflight`
+- `tag_view_open_supersession_ordinary_zip_retires_pending_and_completed_grid_workers`
+- `tag_view_open_supersession_ordinary_zip_retires_grid_dfs_staged_zip_adoption`
+- `tag_view_open_supersession_automatic_refresh_claim_and_retirement_keep_grid_worker`
+- `tag_view_open_supersession_refused_ordinary_zip_keeps_grid_worker`
+- `tag_view_open_supersession_ordinary_zip_retires_grid_hydration_tail_only`
+- `tag_view_open_supersession_grid_candidate_main_fallback_retires_grid_worker`
+
+通常 open → Grid、Grid → 通常 open、worker 完了済み / ZIP 採用待ちの両状態を Tag ListOrder と物理 Grid DFS で検査する。
+普通 Folder の Grid DFS は従来 Dfs tail を持たないため、普通 Folder の hydration 内の Dfs 退役は Tag ListOrder で検査する。
+candidate の回帰は未登録の fake lease を使い、実窓を生成しない。受付前に拒否された open と自動 refresh の claim が旧 worker を壊さない負例も含む。
+
+**refresh の検査範囲**: 上の負例は refresh の claim / 共通退役で、今回追加した worker 取消が発火しないことを検査する。
+監視 refresh の全 lifecycle で移動を保持する修正ではない。独立監査と source 照合により、物理 Grid DFS の ZIP が
+staged 採用待ちの間に、元の通常フォルダの監視走査が `RefreshList { automatic_observation: true }` で採用へ進むと、
+既存の claim の history 退役 (`claim_open_request_owner_with_startup_intent` 後段) が Physical transition を外し得ることも見つかった。
+`folder_observation_allowed` は通常の物理一覧では有効で、タグの結果 scope では無効である。
+この既存の監視更新との競合は今回の explicit な通常 open との両順の競合とは分け、範囲外として残す。
+今回の helper はその false 経路では発火せず、この既存挙動を拡大していない。実機での観測は無い。
+
+#### r1 の検証記録
+
+- 初回の絞った nextest は、テスト実行前に rustc が `0xffffffff` で終了した (`target/802-r1-focused.log`、run-heavy exit -1)。
+  Rust の型エラーやテスト失敗の診断は無く、終了原因は特定していない。成功・テスト失敗の件数には数えない。
+- その後の `cargo check -p mimageviewer --bin mimageviewer-core` は **exit 0、34.47s** (`target/802-r1-check.log`)。
+- 同じ絞った nextest を一度再実行し、**8件実行 / 8成功 / 失敗0、exit 0** (compile 9m42s、実行1.875s)。
+  `target/802-r1-focused-retry.log`、JUnit控え `target/802-r1-focused-junit.xml`。
+  新規 P2 の7件と、実経路へ置き換えた P3 の既存1件を含む。
+- 関連 filter の nextest は **934件実行 / 934成功 / 失敗0、exit 0** (compile 2.22s、実行103.100s、18005件除外)。
+  nextest の leaky 判定は2件。`target/802-r1-related.log`、JUnit控え `target/802-r1-related-junit.xml`。
+  filter は `tag_view|list_order|section1763|section257|favsearch|grid_parent|folder_nav|page_overview|gamepad|close_return|select_after_load|section1795|section1804|section1672|startup_restore|direct_navigation_worker|main_list`。
+  新規7件と P3 の既存1件もこの934件に含むため、成功件数を重複加算しない。
+- `cargo fmt` (引数なし)、`cargo fmt --check`、`git diff --check` は成功。UI文字列の変更は無い。
+- 独立コードレビュー (`gpt-6.1-sol` / `xhigh`) は **ACCEPT**。
+  explicit な通常 open の両順、main/context と Grid mode の限定、実 hydration / Fullscreen の保持、
+  P3 の実採用・BS・再検索、refresh の既存事象の切り分けを確認。reviewer は Cargo を実行せず実装担当の証拠を使う。
+- 重い処理は今回も指定の run-heavy 経由の bin check と filter 付き nextest のみ。
+  ロックを書けない場合は既定の BelowNormal / 6並列で絞ったものだけ実行し、full-test ロックがある場合は迂回せず待機した。
+  全件 / full gate / dev・release ビルド / 実アプリ操作 / commit は行っていない。

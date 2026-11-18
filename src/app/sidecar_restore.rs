@@ -816,6 +816,19 @@ fn reuse_proof_apply(
 }
 
 impl SidecarRestoreState {
+    pub(super) fn retire_grid_folder_navigation(&mut self, owner: ViewerContextId) -> bool {
+        if self.common.target_context == owner
+            && let ContinuationOwner::Live(continuation) = &mut self.common.continuation
+            && matches!(&continuation.navigation_after_hydration,
+                Some(super::MainListAfterHydration::Dfs { continuation, .. })
+                    if continuation.mode.is_grid_traversal())
+        {
+            continuation.navigation_after_hydration = None;
+            return true;
+        }
+        false
+    }
+
     pub(super) fn folder_navigation_adoption_pending(&self, owner: ViewerContextId) -> bool {
         self.common.target_context == owner
             && matches!(&self.common.continuation, ContinuationOwner::Live(continuation)
