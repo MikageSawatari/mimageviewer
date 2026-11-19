@@ -6255,18 +6255,31 @@ tools/list 応答の最大 43,915 文字 (検査 `stage2_complete_tool_discovery
 
 - 物理フォルダの基本一覧 (今の `physical_folder`) を、指定のフォルダから深さ優先・**行き掛け順**で並べる。あるフォルダの行の直後にその中の行を置き、
   その後に兄弟の行を続ける。各フォルダの中の順・種類の表示は、そのフォルダを一覧画面で開いたときと同じ (保存済みの並び・種類の表示、
-  お気に入りの保存済みの表示の重ね合わせ `overlay_saved_favorite_view` を**フォルダごとに**決める)。
+  お気に入りの保存済みの表示の重ね合わせを**フォルダごとに**決める)。
+  - フォルダごとの設定は、**要求の始めに読んだ共通の設定 (重ね合わせ前) の写しに、そのフォルダの重ね合わせだけを当てて**作る。前のフォルダの結果を
+    使い回さない (今の `overlay_saved_favorite_view` は該当が無いとき前の重ね合わせを解除しないため、A の並びが保存状態の無い兄弟 B に残る。
+    設計レビュー 1 巡目 P2-3)。保存済みの表示状態の一覧 (`load_all_favorite_view_states`) は要求の中で 1 回だけ読む。
 - 下りるのは `kind = folder` の行だけ。ZIP・PDF・EPUB・書庫は行として返し、中へは下りない (中は `list_folder` でその path を指定して読む)。
   これで rating DB の key (ZIP 内・合成の本) と path の接頭辞の照合が要らない (候補 §3 M1)。
-- **再解析点 (ジャンクション・シンボリックリンク) のフォルダは行として返すが中へは下りない**。循環を作らないため。判定は `symlink_metadata` の属性
-  (フォルダ 1 つにつき 1 回)。
-- 上限: 訪れるフォルダ 1,000 (指定のフォルダを含む)、基本一覧の行の合計 50,000。超えたら途中の結果を返さず `bad_request`
+- **名前を転送する再解析点 (ジャンクション・シンボリックリンク等、`IsReparseTagNameSurrogate` が真のタグ) のフォルダは行として返すが中へは下りない**。
+  循環を作らないため。それ以外の再解析点 (OneDrive 等のクラウドのプレースホルダ) は通常のフォルダとして下りる (設計レビュー 1 巡目 P2-2)。
+  判定は属性に再解析点があるフォルダだけ、タグを読む (`FILE_FLAG_OPEN_REPARSE_POINT` で開き `GetFileInformationByHandleEx(FileAttributeTagInfo)`)。
+  タグを読めないときは下りない側に倒す。ツールの説明に「links/junctions are listed but not entered」の趣旨を書く。
+- 上限 (初期値。下の性能の受け入れ条件で確定する): 訪れるフォルダ 1,000 (指定のフォルダを含む)、基本一覧の行の合計 50,000。超えたら途中の結果を返さず `bad_request`
   (「サブフォルダ込みの対象が多すぎます (フォルダ 1,000・項目 50,000 まで)。max_depth を小さくするか、下のフォルダを指定してください」)。
   途中までの結果と「続きは見ていない」を返す形は採らない (走査の途中状態を cursor に持たせる仕組みが要り、組み合わせが増える)。
+- **性能の受け入れ条件** (設計レビュー 1 巡目 P2-6): 実装後、本体のテスト (debug ビルド、開発機の SSD の一時フォルダ) で、上限付近の木
+  (1,000 フォルダ × 50 ファイル = 50,000 行、★の付いた行を含む) に対し、初回のページ・続きのページ・★順の保存済みの並び・`tagged` 付き・
+  `summarize_folder` の 1 要求の時間を測り、記録する。**1 要求 10 秒以下**を条件とし、超えるなら共有の読み取りを整理した後に上限を下げる
+  (例: 行 20,000)。全ページの取得は既定の limit 100 で 500 回の走査になり得るので、ツールの説明で「大きな木は絞り込みか summarize_folder を使う」
+  と案内する。UNC・ネットワークのフォルダはエージェントが測れないので、実機の確認で見る (未確認として記録)。
 - 期限 (20 秒) と取消は今の `ctx.checkpoint()` をフォルダごとに通す。時間切れは今と同じ `timeout`。
 - rating DB・tags DB は走査全体で 1 回ずつ開く (並べ替え用の `get_many_complete` も、フォルダごとに開き直さない)。io の許可も今と同じく 1 回取る。
-- 1 フォルダの読み取りに失敗したら (権限が無い等)、今の `physical_folder` と同じく全体を `internal` にする (まれな失敗の既定の割り切り。
-  フォルダを飛ばして続ける分岐は作らない)。指定のフォルダの直下が読めないのと同じ扱い。
+- 下のフォルダが**アクセス拒否** (`PermissionDenied`) で読めないときは、通常の使い方でも起こり得る (共有・他の利用者の領域) ので、
+  全体を失敗にした上で、その path を示して範囲を狭める案内を返す: `bad_request`「サブフォルダ <path> を読めません。そのフォルダを含まない範囲
+  (下のフォルダごと、または max_depth) を指定してください」(path は 1,000 文字を超えたら先頭を省く)。フォルダを飛ばして続ける分岐・再試行・
+  途中状態は作らない (設計レビュー 1 巡目 P2-5)。指定のフォルダ自身が読めないときと、それ以外の読み取りの失敗は今と同じ `internal`
+  (まれな失敗の既定の割り切り)。
 
 絞り込み・ページ・cursor:
 
@@ -6280,6 +6293,10 @@ tools/list 応答の最大 43,915 文字 (検査 `stage2_complete_tool_discovery
 
 入力: `path` (必須)、`subresource`、`recursive`、`max_depth`、F と §42 の絞り込み (`min_stars` / `max_stars` / `kinds` / `name_contains` / `extensions` / `tagged`)。
 意味と検査は `list_folder` と同じ (同じ関数で基本一覧を作り、同じ絞り込みを通す)。cursor と limit は無い。許可は「読み取りのみ」以上。
+
+集計の対象は、**絞り込みの後、ページ分けと `too_long` の置き換えの前の論理行** (同じ引数の `list_folder` が全ページで返すはずの行の元)。
+`too_long` の行も、元の `kind`・`rating` で数える。複数の要求をまたぐ一致は、その間に対象 (ファイル・★・タグ) が変わらない場合に限る
+(設計レビュー 1 巡目 P2-4)。
 
 出力:
 
@@ -6313,20 +6330,30 @@ tools/list 応答の最大 43,915 文字 (検査 `stage2_complete_tool_discovery
 - 元の画像より大きくしない (今の縮小の経路のまま)。WebP の画質は今と同じ `settings.thumb_quality`。
 - 1568 は Claude の画像の推奨の長辺の上限に合わせた (公開資料の値。他の AI アプリの受け取れる大きさは未確認で、実機確認で見る)。
 - 許可は今の「縮小画像を AI に見せる」の下 (利用者決定 2026-11-11)。「隠す編集のある画像は返さない」等の検査は今と同じ経路を通る。
-- MCP 側 (`crates/mcp-server`) の検査 (`parse_tool` の丸め、応答の画像のバイト数の検査) も同じ上限に合わせる。
+- 上限は 2 層に分ける (設計レビュー 1 巡目 P3-7):
+  - **wire の絶対の上限**: IPC の base64 の読み取り (`folder_types.rs` の `webp_base64`、今は 256 KiB で拒否) を 1 枚 1 MiB に広げる。
+    凍結した版 3・4 の型 (`tests/v3_wire`) は 256 KiB のまま。core は版 3・4 の接続へ 256 KiB を超える画像を送らない (512 に丸めるので今と同じ)。
+  - **要求ごとの予算**: 接続の版と丸めた後の `long_side` から 1 つの関数で決め (`ThumbnailBudget { max_image_bytes, max_total_bytes, max_images }`)、
+    core の `ThumbnailBuilder` と adapter の応答の検査 (`valid_thumbnail_attachments`) の両方が同じ関数を使う。adapter は自分が送った要求の
+    丸めた後の `long_side` を検査へ渡す。
+  - 「4 枚」は**添付する画像の数**で、`too_large`・`unsupported` 等の画像の無い行は数えない。入力の件数 (1〜20) は今と同じ。
 
 ### H. M7 索引の対象の案内 (`miv_status`)
 
 - `StatusPayload` に `search_scope: Vec<String>` (お気に入りのうち「アイテム索引」(`auto_index_metadata`) が ON の場所の path、お気に入りの順) と
-  `search_scope_truncated: bool` を足す。100 件を超えたら先頭 100 件。古い adapter は未知の欄を捨てる。
-- `search_items` の説明に「Only folders in miv_status search_scope are searched; use list_folder elsewhere.」の趣旨を足す。
-  `list_folder` の説明にも、索引の無い場所で使えることを短く足す。
+  `search_scope_truncated: bool` を足す。100 件を超えたら先頭 100 件。さらに応答全体の文字数 (`mcp_content_chars`) が `MAX_PAGE_CHARS` を
+  超えるなら末尾から落とし、`search_scope_truncated` を true にする。path 自体は切らない (設計レビュー 1 巡目 P2-1。長い path 100 件で 42,260 文字の例)。
+  古い adapter は未知の欄を捨てる。
+- `search_items` の説明に「Searches favorites listed in miv_status search_scope (more exist if search_scope_truncated); use list_folder elsewhere.」の
+  趣旨を足す。`list_folder` の説明にも、索引の無い場所で使えることを短く足す。
 - 渡る情報が増える: どの場所を索引にしているか (お気に入りの path 自体は `list_library` favorites で既に渡る)。設定画面の「AI に見せるもの」、
-  マニュアルの「mIV の状態」の行、privacy の「状態確認では…」に足す。
+  マニュアルの「mIV の状態」の行、privacy の「状態確認では…」に足す。設定画面の「見せないもの」の「mIV の設定」は、渡すもの (許可の設定・
+  検索の対象の場所) を除く趣旨に改める (設計レビュー 1 巡目 P3-8)。
 
 ### I. 説明文と公開文書
 
-- ツールの説明: `list_folder` (recursive・新しい絞り込み・索引の外で使える)、`summarize_folder` (新)、`get_thumbnail` (長辺 1568 と大きいときの上限)、
+- ツールの説明: `list_folder` (recursive・新しい絞り込み・索引の外で使える。再帰は各フォルダの表示の規則・深さ・リンクを除く範囲で、
+  大きな木は絞り込みか要約を使う)、`summarize_folder` (新)、`get_thumbnail` (長辺 1568 と大きいときの上限)、
   `search_items` (H)、`miv_status` (search_scope)。B の 3 の形に揃える。
 - 設定画面 (`ui_dialogs/agent_integration.rs`) の「AI に見せるもの」: 縮小画像の行に「長辺 1568 まで。小さな文字も読める大きさになる」の趣旨、
   状態の行に検索の対象の場所。「見せないもの」の「PDF / ZIP の本文そのもの (ページの画像や文章を直接取り出すこと)」は、
@@ -6345,11 +6372,16 @@ tools/list 応答の最大 43,915 文字 (検査 `stage2_complete_tool_discovery
 - D: 行き掛け順、フォルダごとの並びと種類の表示、ZIP・PDF に下りない、再解析点に下りない、`max_depth`、上限超過の `bad_request`、
   絞り込み付きの複数ページ (ページ間で★を変えても続く。§42 D と同じ)、recursive と ZIP/PDF/subresource の組み合わせの拒否、`max_depth` 単独の拒否、
   cursor の版、args の違う cursor の拒否、rating/tags DB を開く回数 (走査全体で 1 回)。
-- E: 集計の一致 (同じ引数の `list_folder` の全ページを数えた結果と `total`・`kinds`・`stars` が一致)、`folders` の数・200 件と文字数の切り捨て、
+  お気に入りの重ね合わせの A→B→A (保存状態のあるお気に入り A、無い兄弟 B、再び A の配下) で B に A の並びが残らないこと。
+  名前を転送する再解析点 (ジャンクション) に下りないこと (テストで作れる範囲。クラウドのプレースホルダは判定関数の単体の検査)。
+  下のフォルダのアクセス拒否の `bad_request` と path (テストで ACL を変えられない場合は、読み取りの失敗の種類を判定する関数の単体の検査)。
+  D の性能の受け入れ条件の計測と記録。
+- E: 集計の一致 (同じ引数で作った論理行を数えた結果と `total`・`kinds`・`stars` が一致。`too_long` になる行を含む)、`folders` の数・200 件と文字数の切り捨て、
   recursive false の `folders` null、ZIP/PDF の path、許可 (Disabled の拒否)。
 - F: 部分一致 (大文字小文字・日本語)、拡張子の正規化と拒否、`tagged` の true/false と subresource の行、AND、args_digest。
-- G: 版 5 の 1568 と丸め、版 3・4 の接続で 512 に丸め今の上限になること、大きいときの 4 枚・1 MiB・2 MiB と cursor の続き、MCP 側の検査。
-- H: `search_scope` の内容と 100 件、版 3・4 の adapter の型で読めること。
+- G: 版 5 の 1568 と丸め、版 3・4 の接続で 512 に丸め今の上限になること、大きいときの 4 枚・1 MiB・2 MiB と cursor の続き、
+  画像の無い行が 4 枚に数えられないこと、wire の 1 MiB の読み取りと凍結型の 256 KiB、core と adapter が同じ予算の関数を使うこと。
+- H: `search_scope` の内容と 100 件、長い path で文字数による切り捨てと `search_scope_truncated`、版 3・4 の adapter の型で読めること。
 - 公開文書の検査 (`check_site_cards.py`・`check_ui_glyphs.py`) と UI スナップショット。
 - 実機の確認 (サブ PC、恒久登録の miv-test): 実装後に依頼する。Codex CLI に加え、可能なら Claude Desktop で大きめの画像が受け取れるか。
 
@@ -6365,3 +6397,10 @@ tools/list 応答の最大 43,915 文字 (検査 `stage2_complete_tool_discovery
 - 状態の組み合わせ: すべて読み取りで、書き込み・非同期の割り込みは増えない。ページ間の変更は既存の cursor の契約で扱う。
   まれな失敗 (DB が読めない、フォルダが読めない) は既存どおり `internal` (既定の割り切り)。
 - 永続データ: schema・保存内容は変えない (読むだけ)。
+
+### L. 設計レビューの記録
+
+- 1 巡目 (2026-11-20、gpt-6.1-sol / xhigh、thread `01a1f44c-5e12-7693-b0ff-1bd8c2fa3c2c`、設計 `113ca578a`): not ready。P1 なし、P2×6・P3×2。
+  すべて妥当と判断して反映した: search_scope の文字数による切り捨て (H)、名前を転送する再解析点だけ下りない (D)、フォルダごとの重ね合わせを
+  共通の設定から作る (D)、要約の集計の対象を論理行と定義 (E)、下のフォルダのアクセス拒否は path 付きの `bad_request` (D)、性能の受け入れ条件 (D)、
+  縮小画像の上限の 2 層 (G)、公開の説明の範囲と切り捨て (H・I)。
