@@ -176,6 +176,19 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 - 記録 (統括が読み取りで確認): Application ログには 2026-11-13 20:16 に同じ例外の msedgewebview2.exe (157.0.4341.46、オフセット 0x14d30c) の記録が 1 件あり、WER の ReportArchive にも同じ 1 件がある (親プロセスの記録は無い)。11-14 の分は、確認した時点 (12:09) ではまだ記録が無く、落ちたプロセスも残っていなかった。そのとき動いていた WebView2 のブラウザは、Windows の検索・LINE・mIV Sound (`mimageviewer-vst3-host.exe`、`%APPDATA%\mimageviewer\effetune\webview`) の 3 つだけ。
 - 既知の原因 (前例): WebView2 のコントローラを閉じきらずにホストが終わると、残ったブラウザが 0x80000003 で落ちてダイアログが出る ([派生版計画](effetune-fork-plan.md) §5、2026-10-24 にテストで発生)。mIV Sound のホストは「閉じて、その保存領域のブラウザの終了を待つ」形に直してある。このほか WebView2 を使うのは EPUB→PDF 変換の worker (`mimageviewer-epub-pdf.exe`) と、テスト (miv-sound の ctest、lib 全件の WebView2 を使うテスト) で、11-13〜14 は複数のセッションがこれらのテストを並行で回していた。
 - 次にすること: どのプログラムの WebView2 かを特定する。次に出たときに、ダイアログを閉じる前に、落ちたプロセスの親とコマンドライン (`--user-data-dir`) を読めるようにする (例: WER の LocalDumps を msedgewebview2.exe に設定して、ダンプからコマンドラインを読む)。mIV 側 (mIV Sound のホスト・EPUB worker) とテストの終了経路で、閉じきらずに終わる道が残っていないかをコードで洗う。利用者に追加の作業を頼むのは、開発側の手がかりで絞れなかった場合だけ。
+- 調査 (2026-11-20、bugs476 担当。読み取りとコードの照合だけ。製品は起動していない):
+  - 記録: Application ログ (id 1000) の msedgewebview2.exe 0x80000003 は 11-01 以降 2 件。11-13 20:16 (既知) と、**11-19 02:11:45 の新しい 1 件** (157.0.4341.60、障害モジュール msedge.dll、オフセット 0x393ec00、PID 0xE8F0)。WER の Report.wer に親・コマンドラインは無い。11-14 に利用者が見たダイアログの分は、今も記録が無い。
+  - 11-19 02:11 の時点: perf ログでは、00:49 起動の mIV (pid 98624) の最後の記録が 01:18、次の起動は 08:48。native-exception.log にこの間の異常終了の記録は無い。本体 lib 全件の実行記録もこの時刻には無い。**どのプログラムの WebView2 かは、既存の記録からは特定できなかった。**
+  - コード上の「WebView2 を閉じきらずに host が終わる」経路 (前例では host の強制終了でダイアログが出た、派生版計画 §16.1):
+    1. `DspBridge::disable_with_reason` / `remove_plugin` (`src/video/dsp/mod.rs`) は `shutdown_async()` (Shutdown を送るだけ) の直後に slot の `Arc<Bridge>` を落とし、最後の参照なら `Bridge::drop` (`src/video/dsp/bridge.rs`) がすぐ `child.kill()` する。呼ばれるのは mIV Sound / VST の無効化、`EffetuneController::fail`、`DspBridge::drop` (通常の終了も含む)。host がプラグインを解放する前に kill し得る。
+    2. host の親監視 (`crates/vst3-host/src/main.cpp` `start_parent_watchdog`) は、親 (mIV・host を起こしたテスト) が消えると `ExitProcess(0)` で終わり、プラグインを解放しない。mIV の異常終了や、nextest がテストを打ち切ったときに通る。
+    3. 終了 fence の期限切れの `terminate_host_now` (まれ)。
+    4. EPUB worker (`crates/epub-pdf-worker/src/webview.rs`) は `Close()` を呼ぶが browser の終了は待たない。worker は KILL_ON_JOB_CLOSE の Job の中なので、強制終了でもダイアログにはならない見込み (未確認)。
+  - 1 が通常の終了のたびに負けているなら、ダイアログはもっと多く出るはず。実際は 11-01 以降 2 件なので、1 が主因とは言えない。
+- 次の案 (直す前の診断。未実装):
+  - mIV が host を強制終了するとき (`Bridge::drop` の kill の時点で host がまだ生きている場合、`terminate_now`) に、型付きの理由 (`DropAfterShutdownRequest` / `ExitFenceExpired` など)、host の PID、環境 (mIV Sound / ユーザー VST)、Shutdown を送ってからの経過時間、host の子の msedgewebview2.exe の PID をログに残す。次に Application ログの記録が出たら、障害のプロセス ID と照合できる。
+  - EPUB worker は WebView2 の browser の PID (`BrowserProcessId`) を変換の記録に残す。
+  - これで絞れなかったときだけ、利用者に WER の LocalDumps (msedgewebview2.exe、管理者の設定) を相談する。
 - 関連: テストや試作で WebView2 を作るときは閉じてから終了を待つ方針 (派生版計画 §5)、§1.755。規模 / 優先度: 調査から / P3。
 
 ### 1.774 ★固定中に検索を開くと、固定時の一覧が持ち主のないまま残る — サブ PC の確認から (2026-11-12)
