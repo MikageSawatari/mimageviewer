@@ -7,6 +7,9 @@ use crate::book_composition::{
 use crate::book_scope::BookScopeKey;
 use std::io::{Cursor, Write};
 
+#[path = "folder_recursive_tests.rs"]
+mod recursive;
+
 fn settings(change: impl FnOnce(&mut Settings)) {
     crate::settings_db::with_db_result(|db| {
         let mut settings = db.load_into_settings()?;

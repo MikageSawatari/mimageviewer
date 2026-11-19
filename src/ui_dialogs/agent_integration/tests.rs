@@ -305,7 +305,7 @@ fn agent_exposure_all_sixty_four_permission_combinations() {
                             result
                                 .shown
                                 .iter()
-                                .any(|line| line.contains("縮小画像 (補正")),
+                                .any(|line| line.contains("縮小画像 (長辺 1568 まで")),
                             enabled && thumbnails
                         );
                         assert_eq!(result.shown.contains(&"撮影位置 (GPS)"), enabled && gps);
@@ -330,8 +330,16 @@ fn agent_exposure_all_sixty_four_permission_combinations() {
                         );
                         assert!(result.hidden.contains(&"画像・動画・音声の元データ"));
                         assert!(result.hidden.contains(
-                            &"PDF / ZIP の本文そのもの (ページの画像や文章を直接取り出すこと)"
+                            &"PDF / ZIP の元のファイルのデータ (ページの縮小画像は上の設定の範囲で渡す)"
                         ));
+                        assert_eq!(
+                            result
+                                .shown
+                                .iter()
+                                .any(|line| line
+                                    .contains("mIV の状態 (許可の設定・検索の対象の場所")),
+                            enabled
+                        );
                         assert!(result.hidden.iter().any(|line| line.contains("パスワード")));
                         if enabled && !gps {
                             assert!(result.hidden.contains(&"撮影位置 (GPS)"));

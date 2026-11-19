@@ -277,7 +277,7 @@ fn png_file_and_exact_zip_member_do_not_read_catalog_or_create_metadata_stores()
         assert!(!fixture._dir.path().join(db).exists(), "created {db}");
     }
     let clamped = call(&fixture, vec![item(&path, None)], Some(10000));
-    assert_eq!(row(&clamped, 0).dimensions.as_ref().unwrap().width, 512);
+    assert_eq!(row(&clamped, 0).dimensions.as_ref().unwrap().width, 700);
     // Includes directory entries, exact file bytes, and unexpected siblings
     // such as WAL/SHM files, replacement/quarantine files, or new catalogs.
     assert_eq!(inventory(&cache), before);
@@ -566,7 +566,7 @@ fn metadata(name: String) -> ThumbnailItem {
 #[test]
 fn image_and_metadata_budgets_keep_attachments_in_sync_and_cursor_advancing() {
     let args = serde_json::json!(["fixture"]);
-    let mut builder = ThumbnailBuilder::new(7, args.clone(), 0);
+    let mut builder = ThumbnailBuilder::new(7, args.clone(), 0, thumbnail_budget(5, 256));
     for n in 0..4 {
         assert!(
             builder
@@ -592,7 +592,7 @@ fn image_and_metadata_budgets_keep_attachments_in_sync_and_cursor_advancing() {
         response.images.iter().map(|i| i.webp.len()).sum::<usize>(),
         MAX_THUMBNAIL_TOTAL_BYTES
     );
-    let mut oversized = ThumbnailBuilder::new(0, args.clone(), 0);
+    let mut oversized = ThumbnailBuilder::new(0, args.clone(), 0, thumbnail_budget(5, 256));
     assert!(
         oversized
             .push(
@@ -608,7 +608,7 @@ fn image_and_metadata_budgets_keep_attachments_in_sync_and_cursor_advancing() {
         decode_cursor(response.page.cursor.as_deref(), "get_thumbnail", &args, 0).unwrap(),
         1
     );
-    let mut bounded = ThumbnailBuilder::new(0, args.clone(), 0);
+    let mut bounded = ThumbnailBuilder::new(0, args.clone(), 0, thumbnail_budget(5, 256));
     let mut accepted = 0;
     for n in 0..20 {
         if !bounded
@@ -630,7 +630,7 @@ fn image_and_metadata_budgets_keep_attachments_in_sync_and_cursor_advancing() {
         decode_cursor(response.page.cursor.as_deref(), "get_thumbnail", &args, 0).unwrap(),
         accepted
     );
-    let mut too_long = ThumbnailBuilder::new(3, args.clone(), 0);
+    let mut too_long = ThumbnailBuilder::new(3, args.clone(), 0, thumbnail_budget(5, 256));
     assert!(
         too_long
             .push(
@@ -687,5 +687,200 @@ fn continuation_starts_at_input_offset_without_reopening_earlier_sources() {
             .handlers
             .get_thumbnail(inputs, Some(512), Some(cursor), &context(&fixture))
             .is_err()
+    );
+}
+
+#[test]
+fn negotiated_version_clamps_large_images_and_never_upscales_sources() {
+    let fixture = super::super::tests::Fixture::new();
+    let large = fixture._dir.path().join("large.png");
+    let small = fixture._dir.path().join("small.png");
+    std::fs::write(&large, png(1800, 900)).unwrap();
+    std::fs::write(&small, png(40, 20)).unwrap();
+    for (version, requested, expected) in [
+        (5, 1568, 1568),
+        (5, 10000, 1568),
+        (5, 513, 513),
+        (5, 512, 512),
+        (4, 1568, 512),
+        (3, 10000, 512),
+    ] {
+        let mut ctx = context(&fixture);
+        ctx.adapter_protocol_version = version;
+        let Payload::Thumbnails(response) = fixture
+            .handlers
+            .get_thumbnail(
+                vec![item(&large, None), item(&small, None)],
+                Some(requested),
+                None,
+                &ctx,
+            )
+            .unwrap()
+        else {
+            panic!("expected thumbnails");
+        };
+        assert_eq!(
+            row(&response, 0).dimensions.as_ref().unwrap().width,
+            expected
+        );
+        assert_eq!(row(&response, 1).dimensions.as_ref().unwrap().width, 40);
+        for image in &response.images {
+            assert!(image.webp.len() <= thumbnail_budget(version, expected).max_image_bytes);
+        }
+        assert_eq!(
+            fixture
+                .handlers
+                .get_thumbnail(vec![item(&large, None)], Some(255), None, &ctx,)
+                .unwrap_err()
+                .code,
+            ErrorCode::BadRequest
+        );
+    }
+}
+
+#[test]
+fn large_image_count_counts_attachments_only_and_continues_at_input_position() {
+    let fixture = super::super::tests::Fixture::new();
+    let path = fixture._dir.path().join("page.png");
+    std::fs::write(&path, png(600, 300)).unwrap();
+    let absent = item(&fixture._dir.path().join("unsupported.mp4"), None);
+    let image = item(&path, None);
+    let inputs = vec![
+        absent.clone(),
+        image.clone(),
+        absent,
+        image.clone(),
+        image.clone(),
+        image.clone(),
+        image,
+    ];
+    let Payload::Thumbnails(first) = fixture
+        .handlers
+        .get_thumbnail(inputs.clone(), Some(600), None, &context(&fixture))
+        .unwrap()
+    else {
+        panic!("expected thumbnails");
+    };
+    assert_eq!(first.page.items.len(), 6);
+    assert_eq!(first.images.len(), 4);
+    assert_eq!(
+        first
+            .images
+            .iter()
+            .map(|i| i.item_index)
+            .collect::<Vec<_>>(),
+        [1, 3, 4, 5]
+    );
+    assert_eq!(row(&first, 0).status, ThumbnailStatus::Unsupported);
+    assert!(first.page.truncated);
+    let Payload::Thumbnails(next) = fixture
+        .handlers
+        .get_thumbnail(inputs, Some(600), first.page.cursor, &context(&fixture))
+        .unwrap()
+    else {
+        panic!("expected thumbnails");
+    };
+    assert_eq!(next.page.items.len(), 1);
+    assert_eq!(next.images.len(), 1);
+    assert_eq!(next.images[0].item_index, 0);
+    assert!(next.page.cursor.is_none());
+    assert!(!next.page.truncated);
+}
+
+#[test]
+fn per_request_large_byte_limits_and_legacy_byte_limits_preserve_cursor() {
+    let args = serde_json::json!(["large budget"]);
+    let large = thumbnail_budget(5, 1568);
+    assert_eq!(
+        (
+            large.max_image_bytes,
+            large.max_total_bytes,
+            large.max_images
+        ),
+        (1024 * 1024, 2 * 1024 * 1024, 4)
+    );
+    for (version, side) in [(3, 512), (4, 512), (5, 512), (5, 1568)] {
+        let budget = thumbnail_budget(version, side);
+        let max_image_bytes = budget.max_image_bytes;
+        let max_total_bytes = budget.max_total_bytes;
+        let mut page = ThumbnailBuilder::new(3, args.clone(), 0, budget);
+        // Per-image rejection still consumes an input, without an attachment.
+        assert!(
+            page.push(
+                metadata("C:/too-large.png".into()),
+                Some(vec![0; max_image_bytes + 1])
+            )
+            .unwrap()
+        );
+        for n in 0..max_total_bytes / max_image_bytes {
+            assert!(
+                page.push(
+                    metadata(format!("C:/fit-{n}.png")),
+                    Some(vec![0; max_image_bytes])
+                )
+                .unwrap()
+            );
+        }
+        assert!(
+            !page
+                .push(metadata("C:/next.png".into()), Some(vec![0]))
+                .unwrap()
+        );
+        let response = page.response(true).unwrap();
+        assert_eq!(row(&response, 0).status, ThumbnailStatus::TooLarge);
+        assert_eq!(row(&response, 0).dimensions, None);
+        assert_eq!(
+            response.images.iter().map(|i| i.webp.len()).sum::<usize>(),
+            max_total_bytes
+        );
+        assert_eq!(response.images[0].item_index, 1);
+        assert_eq!(
+            decode_cursor(response.page.cursor.as_deref(), "get_thumbnail", &args, 0).unwrap(),
+            3 + response.page.items.len()
+        );
+    }
+}
+
+#[test]
+fn large_count_budget_keeps_nonimage_rows_after_four_attachments() {
+    let args = serde_json::json!(["attachment count"]);
+    let mut page = ThumbnailBuilder::new(0, args.clone(), 0, thumbnail_budget(5, 513));
+    for n in 0..4 {
+        assert!(
+            page.push(metadata(format!("C:/image-{n}.png")), Some(vec![0]))
+                .unwrap()
+        );
+    }
+    for status in [
+        ThumbnailStatus::Unsupported,
+        ThumbnailStatus::HiddenByEdit,
+        ThumbnailStatus::Unavailable,
+    ] {
+        assert!(
+            page.push(
+                unavailable(
+                    &ItemRef {
+                        path: "C:/unavailable".into(),
+                        subresource: None
+                    },
+                    status
+                )
+                .0,
+                None
+            )
+            .unwrap()
+        );
+    }
+    assert!(
+        !page
+            .push(metadata("C:/fifth.png".into()), Some(vec![0]))
+            .unwrap()
+    );
+    let response = page.response(true).unwrap();
+    assert_eq!(response.images.len(), 4);
+    assert_eq!(response.page.items.len(), 7);
+    assert_eq!(
+        decode_cursor(response.page.cursor.as_deref(), "get_thumbnail", &args, 0).unwrap(),
+        7
     );
 }

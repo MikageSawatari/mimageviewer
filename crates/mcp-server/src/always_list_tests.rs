@@ -45,7 +45,7 @@ fn every_permission_combination_has_identical_full_discovery_without_core_querie
         }
     }
     let expected = json!(schema::tools());
-    assert_eq!(expected.as_array().unwrap().len(), 19);
+    assert_eq!(expected.as_array().unwrap().len(), 20);
     for version in VERSIONS {
         let backend = Arc::new(BackendState(
             Mutex::new(PermissionSnapshot::default()),
@@ -191,20 +191,18 @@ fn each_tool_description_names_its_miv_permission() {
         let name = tool["name"].as_str().unwrap();
         let description = tool["description"].as_str().unwrap();
         let prefix = match name {
-            "get_transcript" => {
-                "mImageViewer (mIV) Read permission and transcript sharing required."
-            }
-            "get_thumbnail" => "mImageViewer (mIV) Read permission and thumbnail sharing required.",
-            "open_in_viewer" => "mImageViewer (mIV) Read and Open permission or higher required.",
+            "get_transcript" => "Needs mIV Read + transcript sharing.",
+            "get_thumbnail" => "Needs mIV Read + thumbnail sharing.",
+            "open_in_viewer" => "Needs mIV Read and Open.",
             "create_collection"
             | "rename_collection"
             | "add_to_collection"
             | "remove_from_collection"
             | "add_tags"
             | "remove_tags"
-            | "set_rating" => "mImageViewer (mIV) Organize permission required.",
-            _ => "mImageViewer (mIV) Read permission or higher required.",
+            | "set_rating" => "Needs mIV Organize.",
+            _ => "Needs mIV Read.",
         };
-        assert!(description.starts_with(prefix), "{name}");
+        assert!(description.contains(prefix), "{name}");
     }
 }

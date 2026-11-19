@@ -247,6 +247,8 @@ fn polling_state_is_bounded_to_permission_epoch_and_error_kind() {
                 permission: snapshot,
                 fts_ready: ready,
                 remote_active: ready,
+                search_scope: Vec::new(),
+                search_scope_truncated: false,
             })),
         );
     }
@@ -282,6 +284,8 @@ fn normal_and_perf_emission_gate_quiets_polls_and_keeps_other_requests() {
                 permission: PermissionSnapshot::default(),
                 fts_ready: false,
                 remote_active: false,
+                search_scope: Vec::new(),
+                search_scope_truncated: false,
             }),
         ),
         ("cancel", Payload::Cancelled),

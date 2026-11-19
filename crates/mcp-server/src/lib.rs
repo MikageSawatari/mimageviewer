@@ -59,7 +59,7 @@ enum Event {
     Done(u64, BackendResult),
 }
 enum ActivePhase {
-    Executing(&'static str),
+    Executing(&'static str, u32),
     ReplyQueued,
 }
 struct Active {
@@ -268,7 +268,7 @@ pub fn run_stdio_with_eof<
                 return Err(error);
             }
             Event::Done(done_serial, result) => {
-                let (id, modern, action, control) = {
+                let (id, modern, action, thumbnail_side, control) = {
                     let mut active = owner.lock().unwrap();
                     let Some(call) = active.as_mut().filter(|a| a.serial == done_serial) else {
                         continue;
@@ -277,15 +277,25 @@ pub fn run_stdio_with_eof<
                         active.take();
                         continue;
                     }
-                    let ActivePhase::Executing(action) = call.phase else {
+                    let ActivePhase::Executing(action, thumbnail_side) = call.phase else {
                         continue;
                     };
                     call.phase = ActivePhase::ReplyQueued;
-                    (call.id.clone(), call.modern, action, call.control.clone())
+                    (
+                        call.id.clone(),
+                        call.modern,
+                        action,
+                        thumbnail_side,
+                        call.control.clone(),
+                    )
                 };
                 let mut envelope = Envelope::plain(success(
                     id,
-                    tool_result(action, result.map_err(BackendError::into_agent)),
+                    tool_result_with_side(
+                        action,
+                        result.map_err(BackendError::into_agent),
+                        thumbnail_side,
+                    ),
                     modern,
                 ));
                 envelope.request = Some((done_serial, control));
@@ -479,7 +489,18 @@ fn handle_line(
                                     serial: request_serial,
                                     id,
                                     modern,
-                                    phase: ActivePhase::Executing(action),
+                                    phase: ActivePhase::Executing(
+                                        action,
+                                        match &command {
+                                            Command::GetThumbnail { long_side, .. } => {
+                                                clamp_thumbnail_side(
+                                                    AGENT_PROTOCOL_VERSION,
+                                                    long_side.unwrap_or(DEFAULT_THUMBNAIL_SIDE),
+                                                )
+                                            }
+                                            _ => DEFAULT_THUMBNAIL_SIDE,
+                                        },
+                                    ),
                                     control: control.clone(),
                                 });
                                 let backend = backend.clone();
@@ -620,6 +641,12 @@ struct FolderArgs {
     min_stars: Option<u8>,
     max_stars: Option<u8>,
     kinds: Option<Vec<FolderKind>>,
+    #[serde(default)]
+    recursive: bool,
+    max_depth: Option<u32>,
+    name_contains: Option<String>,
+    extensions: Option<Vec<String>>,
+    tagged: Option<bool>,
     limit: Option<u32>,
     cursor: Option<String>,
 }
@@ -925,7 +952,11 @@ fn parse_tool(params: &Value) -> Result<(&'static str, Command), &'static str> {
                 },
             )
         }
-        Some("list_folder") => {
+        Some("list_folder" | "summarize_folder") => {
+            let summary = params["name"] == "summarize_folder";
+            if summary && (args.get("limit").is_some() || args.get("cursor").is_some()) {
+                return Err("Summary has no limit or cursor");
+            }
             let mut a: FolderArgs = serde_json::from_value(args).map_err(bad)?;
             validate_paging(a.limit, a.cursor.as_deref())?;
             if a.path.is_empty() {
@@ -945,6 +976,54 @@ fn parse_tool(params: &Value) -> Result<(&'static str, Command), &'static str> {
                     return Err("Specify one or more unique row kinds");
                 }
             }
+            if a.max_depth.is_some_and(|depth| !(1..=32).contains(&depth))
+                || (!a.recursive && a.max_depth.is_some())
+            {
+                return Err("max_depth requires recursive and must be 1 to 32");
+            }
+            if a.recursive && a.subresource.is_some() {
+                return Err("Recursive listing requires a physical folder");
+            }
+            if a.name_contains
+                .as_ref()
+                .is_some_and(|name| name.is_empty() || name.chars().count() > 200)
+            {
+                return Err("name_contains must be 1 to 200 characters");
+            }
+            if let Some(extensions) = &mut a.extensions {
+                if extensions.is_empty()
+                    || extensions.len() > 20
+                    || extensions
+                        .iter()
+                        .any(|extension| extension.is_empty() || extension.contains('.'))
+                {
+                    return Err("Specify 1 to 20 unique extensions without dots");
+                }
+                for extension in extensions.iter_mut() {
+                    *extension = extension.to_lowercase();
+                }
+                extensions.sort_unstable();
+                if extensions.windows(2).any(|pair| pair[0] == pair[1]) {
+                    return Err("Specify unique extensions");
+                }
+            }
+            if summary {
+                return Ok((
+                    "summarize_folder",
+                    Command::SummarizeFolder {
+                        path: a.path,
+                        subresource: a.subresource,
+                        min_stars: a.min_stars,
+                        max_stars: a.max_stars,
+                        kinds: a.kinds,
+                        recursive: a.recursive,
+                        max_depth: a.max_depth,
+                        name_contains: a.name_contains,
+                        extensions: a.extensions,
+                        tagged: a.tagged,
+                    },
+                ));
+            }
             (
                 "list_folder",
                 Command::ListFolder {
@@ -953,6 +1032,11 @@ fn parse_tool(params: &Value) -> Result<(&'static str, Command), &'static str> {
                     min_stars: a.min_stars,
                     max_stars: a.max_stars,
                     kinds: a.kinds,
+                    recursive: a.recursive,
+                    max_depth: a.max_depth,
+                    name_contains: a.name_contains,
+                    extensions: a.extensions,
+                    tagged: a.tagged,
                     limit: clamp_limit(a.limit),
                     cursor: a.cursor,
                 },
@@ -980,7 +1064,9 @@ fn parse_tool(params: &Value) -> Result<(&'static str, Command), &'static str> {
                             subresource: item.subresource,
                         })
                         .collect(),
-                    long_side: a.long_side.map(|side| side.min(MAX_THUMBNAIL_SIDE)),
+                    long_side: a
+                        .long_side
+                        .map(|side| clamp_thumbnail_side(AGENT_PROTOCOL_VERSION, side)),
                     cursor: a.cursor,
                 },
             )
@@ -1013,7 +1099,15 @@ fn validate_paging(limit: Option<u32>, cursor: Option<&str>) -> Result<(), &'sta
         Ok(())
     }
 }
+#[cfg(test)]
 fn tool_result(name: &str, result: Result<Payload, AgentError>) -> Value {
+    tool_result_with_side(name, result, DEFAULT_THUMBNAIL_SIDE)
+}
+fn tool_result_with_side(
+    name: &str,
+    result: Result<Payload, AgentError>,
+    thumbnail_side: u32,
+) -> Value {
     let expected = matches!(
         (name, &result),
         ("miv_status", Ok(Payload::Status(_)))
@@ -1027,6 +1121,7 @@ fn tool_result(name: &str, result: Result<Payload, AgentError>) -> Value {
             | ("get_item_info", Ok(Payload::Info(_)))
             | ("get_transcript", Ok(Payload::Transcript(_)))
             | ("list_folder", Ok(Payload::Folder(_)))
+            | ("summarize_folder", Ok(Payload::FolderSummary(_)))
             | ("get_thumbnail", Ok(Payload::Thumbnails(_)))
             | ("open_in_viewer", Ok(Payload::Opened(_)))
             | ("add_tags" | "remove_tags", Ok(Payload::TagWrite(_)))
@@ -1062,17 +1157,22 @@ fn tool_result(name: &str, result: Result<Payload, AgentError>) -> Value {
                 Payload::Info(v) => json!(v),
                 Payload::Transcript(v) => json!(v),
                 Payload::Folder(v) => json!(v),
+                Payload::FolderSummary(v) => json!(v),
                 Payload::Opened(v) => json!(v),
                 Payload::CollectionWrite(v) => json!(v),
                 Payload::TagWrite(v) | Payload::RatingWrite(v) => json!(v),
                 Payload::Thumbnails(v) => {
-                    if !valid_thumbnail_attachments(&v) {
-                        return tool_result(
+                    if !valid_thumbnail_attachments(
+                        &v,
+                        thumbnail_budget(AGENT_PROTOCOL_VERSION, thumbnail_side),
+                    ) {
+                        return tool_result_with_side(
                             name,
                             Err(AgentError::new(
                                 ErrorCode::Internal,
                                 "mIV の縮小画像の応答を確認できませんでした",
                             )),
+                            thumbnail_side,
                         );
                     }
                     images = v.images;
@@ -1118,8 +1218,9 @@ fn tool_result(name: &str, result: Result<Payload, AgentError>) -> Value {
     json!({"content":content,"structuredContent":value,"isError":is_error})
 }
 
-fn valid_thumbnail_attachments(response: &ThumbnailResponse) -> bool {
-    if response.page.items.len() > MAX_THUMBNAIL_ITEMS {
+fn valid_thumbnail_attachments(response: &ThumbnailResponse, budget: ThumbnailBudget) -> bool {
+    if response.page.items.len() > MAX_THUMBNAIL_ITEMS || response.images.len() > budget.max_images
+    {
         return false;
     }
     let mut attachments = response.images.iter();
@@ -1131,12 +1232,12 @@ fn valid_thumbnail_attachments(response: &ThumbnailResponse) -> bool {
             };
             if image.item_index != index
                 || image.webp.is_empty()
-                || image.webp.len() > MAX_THUMBNAIL_IMAGE_BYTES
+                || image.webp.len() > budget.max_image_bytes
             {
                 return false;
             }
             total += image.webp.len();
-            if total > MAX_THUMBNAIL_TOTAL_BYTES {
+            if total > budget.max_total_bytes {
                 return false;
             }
         }

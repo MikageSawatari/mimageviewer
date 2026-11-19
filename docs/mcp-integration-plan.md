@@ -6410,3 +6410,104 @@ tools/list 応答の最大 43,915 文字 (検査 `stage2_complete_tool_discovery
 - 2 巡目 (2026-11-20、同じ thread、設計 `506f56360`): not ready。P2×2・P3×1。タグを読めない再解析点は全体の失敗 (D)、性能の計測の木を 49,999 行に (D)、
   J・K の古い書き方を揃えた。
 - 3 巡目 (2026-11-20、同じ thread、設計 `a5674408c`): **ready**。追加の指摘なし。性能の計測・互換テスト・実機の確認は実装後の受け入れ条件。
+
+### M. 実装の記録 (2026-11-20、検証未完了)
+
+作業ツリー `G:\home\mimageviewer-mcp740`、branch `mcp-tools-740` の未コミット差分。
+公開文書 (`htdocs/`)・永続データの schema・保存形式は変更していない。コミット・製品バイナリの起動は行っていない。
+
+#### 実装上の選択
+
+- wire は protocol 5 / minimum 3。`ListFolder` の追加欄は省略時 default、要約は新命令
+  `SummarizeFolder` / 新応答 `FolderSummary`。出荷済みの `tests/v3_wire` は変更していない。
+- 一覧と要約は `folder_listing` と `FolderFilters` を共有する。深さ優先の行き掛け順で基本一覧を作り、
+  物理行の★を一括付与し、`tagged` が指定された場合だけ全体のタグを読む。未指定の一覧はページのタグだけを読む。
+  要約は `too_long` に変換する前の論理行を数える。
+- rating DB は要求で一度だけ開いて、各フォルダの★順の照会と最終の★付与に同じ接続を渡す。
+  tags DB も必要時に一度だけ開く。テスト専用の開いた回数の計数で両方を検査する。
+- お気に入りの表示状態は要求で一度読み、フォルダごとに共通設定の clone に該当 overlay だけを適用する。
+  直下のフォルダの集計には基本一覧の子孫の index 範囲と一致件数の累積和を使い、path の接頭辞では判定しない。
+- 再解析点属性のあるフォルダだけタグを読み、name-surrogate bit (`0x20000000`) があれば下りない。
+  `FILE_FLAG_OPEN_REPARSE_POINT` / `GetFileInformationByHandleEx(FileAttributeTagInfo)` の失敗は伝播し、
+  `PermissionDenied` は子の path 付き `bad_request`、他は `internal` とする。root 自身の読取失敗は従来の `internal`。
+- cursor は版 5、基本一覧の位置と全体の識別子 digest を保持し、毎要求で再走査する。途中状態・再試行・部分成功は追加していない。
+- `clamp_thumbnail_side` / `thumbnail_budget` を wire crate に置き、core と adapter で共有する。
+  adapter は進行中の要求の長辺を保持して応答の添付を検査する。wire の絶対上限は 1 MiB、
+  要求別の上限は版と長辺で決める。画像の無い行は4画像の枠を使わない。
+- status の検索対象は保存済みのお気に入り順。100件と応答全体の文字数の両方で path 単位に落とす。
+  設定画面は1568・検索対象・元データの説明を反映した。
+
+設計からの仕様上の逸脱はない。参照先 `next-release-backlog.md` の §1.789 は現ツリーでは完了項目の削除により存在しなかったため、
+agent-ipc 冒頭の契約と本書 §4.2・§42・§43 に従った。上限1,000フォルダ・50,000行は設計値のまま。
+性能の受入確認が済んだという意味ではない。
+
+#### B の文字数の実測
+
+`stage2_complete_tool_discovery_fits_final_envelope_budget` と schema の検査で測定。20ツールの JSON 合計 **40,076文字**。
+tools/list 応答の全許可・全対応MCP版・IDの最大は **41,824文字**、余裕512を足して **42,336 / 48,000文字**。
+modern・64文字ASCII IDは40,352文字。最長descriptionは `list_folder` の1,045文字 / UTF-16 units。
+設計時の19ツール42,168文字・最大43,915文字に対し、追加後もそれぞれ2,092文字・2,091文字減った。
+
+| tool | JSON文字数 |
+| --- | ---: |
+| miv_status | 1,322 |
+| search_items | 1,921 |
+| list_tags | 1,286 |
+| items_by_tag | 1,690 |
+| list_collections | 1,249 |
+| get_collection | 1,831 |
+| list_library | 2,035 |
+| get_item_info | 6,360 |
+| get_transcript | 2,367 |
+| list_folder | 3,330 |
+| summarize_folder | 2,824 |
+| get_thumbnail | 2,420 |
+| open_in_viewer | 932 |
+| create_collection | 816 |
+| rename_collection | 938 |
+| add_to_collection | 1,796 |
+| remove_from_collection | 1,763 |
+| add_tags | 1,736 |
+| remove_tags | 1,743 |
+| set_rating | 1,717 |
+
+#### 検証結果と残り
+
+| command | 結果 |
+| --- | --- |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp --no-fail-fast -- --nocapture` | 初回MCPは81成功・6失敗。旧schema/長辺の期待4件を更新。実pipe2件はfixture threadの開始前にOS error 5 |
+| 同上に `--skip real_pipe_cancel_reaches_core_while_stdio_stdout_is_blocked --skip real_pipe_receives_cancel_while_hello_or_tool_response_is_withheld` | **exit 0、IPC 20・凍結互換15・MCP 86成功**。実pipe2件は除外。`target/mcp740-adapter-final.log` |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **exit 101**。依存 `turbojpeg-sys` の CMake → MSBuild が終了コード1。本体Rustの検査前で停止。`target/mcp740-core-check.log` |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/agent/) & not test(stdio_exe_uses_real_core_fixture_handlers)' --no-fail-fast --success-output final` | **exit 101、テスト実行0件**。同じ `turbojpeg-sys` の MSBuild 失敗で compile 停止。`target/mcp740-core-tests.log` |
+| `python scripts/check_ui_glyphs.py` | 成功、危険なglyph 0 |
+| `cargo fmt` (引数なし) / `git diff --check` | 最終整形・空白検査を実行 |
+
+本体の上記2コマンドには runner timeout を設定しておらず、Cargo自身の非ゼロ終了を確認した。
+小さい2 crateのテストは `CARGO_BUILD_JOBS=1` で実行した。本体2コマンドは既存の並列度を変更していない。
+MSBuildの出力はバージョン表示と `Checking Build System` の後で止まり、具体的なアクセス拒否・C1041は出力されていない。
+原因を残存プロセスと断定せず、回避のための設定変更・プロセス停止は行っていない。
+`stdio_exe_uses_real_core_fixture_handlers` は実MCP adapter exeを起動するため、今回の「製品バイナリを起動しない」指示に従い初めから除外した。
+
+**D の性能測定値は未取得**。追加した
+`agent_ipc::folder::tests::recursive::recursive_near_limit_performance_and_over_limit_rejection`
+は debug・SSD一時領域に1,000フォルダ×49ファイル（49,999行、★/タグ各1,000行）を作り、初回・続き・保存した★順・tagged・要約を
+`MCP740_PERF` として出力し、各要求10秒以内、要約49,999行・★3が1,000行、ページのcursor、両上限超過の拒否を検査する。
+初回・続き等は既定limit100で要求し、ページの文字数上限による行数減少も許す。実測の行数もログに残す。
+本体のcompileが依存物で停止したため、所要時間・上限の妥当性・UNC/ネットワークは未確認。
+
+独立コードレビューは GPT-6.1 Sol / xhigh の別contextで実施し、製品コードへの重要な指摘なし（cargo・UI実行の成功証拠とは分ける）。
+compile不能後の追補確認で、長い一時pathでは文字予算により200フォルダ未満になるテストの期待の不備を指摘され、
+実pathの検査と短い合成pathでの200件上限の検査に分けて修正した。
+設計担当に残す確認は、本体のcompileとagent限定回帰、上記性能受入（超過時はDの方針で共有読取整理→上限再判断）、
+実pipe2件、本体lib全件・build-dev、実AIアプリ・UNCでの確認、公開文書の更新。
+UI snapshot は指示どおり設計担当が実行するため **PNG更新なし**。対象候補は
+`agent_integration_window_{disabled,read,open,organize,records}_{light,dark}.png` の10枚。
+差分が出た場合に `UPDATE_SNAPSHOTS=1` で更新・目視確認する。
+
+#### 変更ファイル
+
+- `crates/agent-ipc/src/{lib,folder_types}.rs`、`crates/agent-ipc/tests/v3_compatibility.rs`
+- `crates/mcp-server/src/{lib,schema,tests,always_list_tests,pipe_compatibility_tests}.rs`
+- `src/agent_ipc/{mod,folder,folder_tests,folder_recursive_tests,status,status_tests,thumbnail,thumbnail_tests,compatibility_tests,logging_tests,media_read_tests,read_tests}.rs`
+- `src/ui_dialogs/agent_integration.rs`、`src/ui_dialogs/agent_integration/tests.rs`
+- `docs/mcp-integration-plan.md`（本節）

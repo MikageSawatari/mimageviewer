@@ -284,8 +284,8 @@ fn exposure(draft: PermissionSelection) -> Exposure {
         shown: Vec::new(),
         hidden: vec![
             "画像・動画・音声の元データ",
-            "PDF / ZIP の本文そのもの (ページの画像や文章を直接取り出すこと)",
-            "mIV の設定・PDF のパスワード・リモート接続の暗証番号",
+            "PDF / ZIP の元のファイルのデータ (ページの縮小画像は上の設定の範囲で渡す)",
+            "許可の設定・検索の対象の場所を除く mIV の設定、PDF のパスワード・リモート接続の暗証番号",
         ],
         actions: Vec::new(),
     };
@@ -300,10 +300,11 @@ fn exposure(draft: PermissionSelection) -> Exposure {
     result.shown.extend([
         "ファイルの場所 (絶対パス)・名前・種類・大きさ・寸法・日時",
         "タグ・★・コレクション・本棚・閲覧履歴",
+        "mIV の状態 (許可の設定・検索の対象の場所など)",
         "撮影日時・機種などの EXIF、AI 生成画像の生成情報 (PNG tEXt チャンク・EXIF UserComment)",
     ]);
     if draft.thumbnails {
-        result.shown.push("縮小画像 (補正・編集は反映しない。隠す編集をした画像は渡さない。動画・書庫の代表は渡さない)");
+        result.shown.push("縮小画像 (長辺 1568 まで。小さな文字も読める大きさになる。補正・編集は反映しない。隠す編集をした画像は渡さない。動画・書庫の代表は渡さない)");
     } else {
         result.hidden.push("縮小画像");
     }

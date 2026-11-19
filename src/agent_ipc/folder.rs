@@ -7,6 +7,7 @@ use crate::book_composition::{CompositionProjectionOutcome, CompositionSnapshot}
 use crate::grid_item::GridItem;
 use crate::settings::Settings;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 struct FolderRow {
     item: FolderItem,
@@ -18,6 +19,9 @@ struct FolderFilters {
     min_stars: Option<u8>,
     max_stars: Option<u8>,
     kinds: Option<Vec<FolderKind>>,
+    name_contains: Option<String>,
+    extensions: Option<Vec<String>>,
+    tagged: Option<bool>,
 }
 
 impl FolderFilters {
@@ -48,13 +52,63 @@ impl FolderFilters {
             min_stars,
             max_stars,
             kinds,
+            ..Self::default()
         })
+    }
+
+    fn with_extra(mut self, options: &FolderOptions) -> Result<Self, AgentError> {
+        if options
+            .name_contains
+            .as_ref()
+            .is_some_and(|name| !(1..=200).contains(&name.chars().count()))
+        {
+            return Err(error(
+                ErrorCode::BadRequest,
+                "name_contains は1～200文字で指定してください",
+            ));
+        }
+        self.name_contains = options.name_contains.clone();
+        self.tagged = options.tagged;
+        if let Some(values) = &options.extensions {
+            let mut values = values
+                .iter()
+                .map(|value| value.to_lowercase())
+                .collect::<Vec<_>>();
+            values.sort();
+            if !(1..=20).contains(&values.len())
+                || values
+                    .iter()
+                    .any(|value| value.is_empty() || value.contains('.'))
+                || values.windows(2).any(|pair| pair[0] == pair[1])
+            {
+                return Err(error(
+                    ErrorCode::BadRequest,
+                    "extensions はドットを付けず重複せず1～20個指定してください",
+                ));
+            }
+            self.extensions = Some(values);
+        }
+        Ok(self)
     }
 
     fn matches(&self, item: &FolderItem) -> bool {
         self.kinds
             .as_ref()
             .is_none_or(|kinds| kinds.contains(&item.kind))
+            && self
+                .name_contains
+                .as_ref()
+                .is_none_or(|name| item.name.to_lowercase().contains(&name.to_lowercase()))
+            && self.extensions.as_ref().is_none_or(|extensions| {
+                item.name
+                    .rsplit_once('.')
+                    .is_some_and(|(_, extension)| extensions.contains(&extension.to_lowercase()))
+            })
+            && self.tagged.is_none_or(|tagged| {
+                item.tags
+                    .as_ref()
+                    .is_some_and(|tags| !tags.is_empty() == tagged)
+            })
             && if self.min_stars.is_some() || self.max_stars.is_some() {
                 item.rating.is_some_and(|rating| {
                     rating >= self.min_stars.unwrap_or(0) && rating <= self.max_stars.unwrap_or(5)
@@ -65,6 +119,23 @@ impl FolderFilters {
     }
 }
 
+#[derive(Default)]
+pub(super) struct FolderOptions {
+    pub recursive: bool,
+    pub max_depth: Option<u32>,
+    pub name_contains: Option<String>,
+    pub extensions: Option<Vec<String>>,
+    pub tagged: Option<bool>,
+}
+
+struct FolderListing {
+    items: Vec<FolderItem>,
+    applied: bool,
+    args: serde_json::Value,
+    // Index ranges identify descendants without path prefix guesses.
+    folders: Vec<(FolderSummaryFolder, std::ops::Range<usize>)>,
+}
+
 const AGENT_NESTED_LIMITS: crate::zip_loader::NestedZipLimits =
     crate::zip_loader::NestedZipLimits {
         max_archive_bytes: 64 * 1024 * 1024,
@@ -72,6 +143,7 @@ const AGENT_NESTED_LIMITS: crate::zip_loader::NestedZipLimits =
     };
 
 impl Handlers {
+    #[cfg(test)]
     pub(super) fn list_folder(
         &self,
         path: String,
@@ -83,29 +155,132 @@ impl Handlers {
         cursor: Option<String>,
         ctx: &ReadContext,
     ) -> Result<Payload, AgentError> {
-        ctx.checkpoint()?;
+        self.list_folder_with_options(
+            path,
+            subresource,
+            min_stars,
+            max_stars,
+            kinds,
+            FolderOptions::default(),
+            limit,
+            cursor,
+            ctx,
+        )
+    }
+
+    pub(super) fn list_folder_with_options(
+        &self,
+        path: String,
+        subresource: Option<String>,
+        min_stars: Option<u8>,
+        max_stars: Option<u8>,
+        kinds: Option<Vec<FolderKind>>,
+        options: FolderOptions,
+        limit: Option<u32>,
+        cursor: Option<String>,
+        ctx: &ReadContext,
+    ) -> Result<Payload, AgentError> {
         folder_limit(limit)?;
-        let filters = FolderFilters::new(min_stars, max_stars, kinds)?;
-        let path = input_path::validate(&path)?;
-        let prefix = folder_prefix(subresource.as_deref())?;
-        let mut settings = crate::settings_db::with_db_result(|db| db.load_into_settings())
+        let filters = FolderFilters::new(min_stars, max_stars, kinds)?.with_extra(&options)?;
+        let listing =
+            self.folder_listing(&path, subresource.as_deref(), &options, &filters, ctx)?;
+        let page = folder_page(
+            listing.items,
+            listing.applied,
+            limit,
+            cursor.as_deref(),
+            &listing.args,
+            ctx.granted.1,
+            &filters,
+            |items| {
+                if filters.tagged.is_none() {
+                    enrich_tags(items, ctx)?;
+                }
+                Ok(())
+            },
+        )?;
+        ctx.checkpoint()?;
+        Ok(Payload::Folder(page))
+    }
+
+    pub(super) fn summarize_folder(
+        &self,
+        path: String,
+        subresource: Option<String>,
+        min_stars: Option<u8>,
+        max_stars: Option<u8>,
+        kinds: Option<Vec<FolderKind>>,
+        options: FolderOptions,
+        ctx: &ReadContext,
+    ) -> Result<Payload, AgentError> {
+        let filters = FolderFilters::new(min_stars, max_stars, kinds)?.with_extra(&options)?;
+        let listing =
+            self.folder_listing(&path, subresource.as_deref(), &options, &filters, ctx)?;
+        let summary = summarize_listing(listing, options.recursive, &filters)?;
+        ctx.checkpoint()?;
+        Ok(Payload::FolderSummary(summary))
+    }
+
+    fn folder_listing(
+        &self,
+        input: &str,
+        subresource: Option<&str>,
+        options: &FolderOptions,
+        filters: &FolderFilters,
+        ctx: &ReadContext,
+    ) -> Result<FolderListing, AgentError> {
+        ctx.checkpoint()?;
+        if options
+            .max_depth
+            .is_some_and(|depth| !(1..=32).contains(&depth))
+            || (!options.recursive && options.max_depth.is_some())
+        {
+            return Err(error(
+                ErrorCode::BadRequest,
+                "max_depth はサブフォルダ込みのときだけ1～32で指定してください",
+            ));
+        }
+        let max_depth = options.max_depth.unwrap_or(32);
+        let path = input_path::validate(input)?;
+        let prefix = folder_prefix(subresource)?;
+        let common = crate::settings_db::with_db_result(|db| db.load_into_settings())
             .map_err(|_| internal())?;
         ctx.checkpoint()?;
         let io = crate::io_semaphore::GlobalIoSemaphore::process_shared(
-            settings.indexer_speed_profile.io_permits(),
+            common.indexer_speed_profile.io_permits(),
         );
         let _io = io
             .acquire_cancellable(crate::io_semaphore::IoPriority::Normal, &ctx.cancel)
             .ok_or_else(cancelled)?;
-        overlay_saved_favorite_view(&mut settings, path)?;
-        ctx.checkpoint()?;
         let metadata = std::fs::metadata(path).map_err(|_| internal())?;
-        let (items, applied) = if metadata.is_dir() {
+        if options.recursive && (!metadata.is_dir() || subresource.is_some()) {
+            return Err(error(
+                ErrorCode::BadRequest,
+                "サブフォルダ込みはフォルダのときだけ指定できます",
+            ));
+        }
+        let states = favorite_states(&common)?;
+        let rating_db = optional_ratings()?;
+        let mut folders = Vec::new();
+        let (rows, applied) = if metadata.is_dir() {
             if subresource.is_some() {
                 return Err(bad_folder());
             }
-            (physical_folder(path, &settings, ctx)?, false)
+            let mut walk = FolderWalk {
+                common: &common,
+                states: &states,
+                ratings: rating_db.as_ref(),
+                ctx,
+                max_depth: if options.recursive { max_depth } else { 0 },
+                visited: 0,
+                rows: Vec::new(),
+                folders: Vec::new(),
+            };
+            walk.visit(path, 0)?;
+            folders = walk.folders;
+            (walk.rows, false)
         } else {
+            let settings = folder_settings(&common, &states, path);
             let extension = path
                 .extension()
                 .and_then(|extension| extension.to_str())
@@ -121,7 +296,6 @@ impl Handlers {
                 .readers
                 .book_composition()
                 .ok_or_else(composition_loading)?;
-            // snapshot remains readable after close_admission during shutdown.
             let snapshot = service.snapshot();
             if snapshot.status.is_err() {
                 return Err(composition_loading());
@@ -135,8 +309,10 @@ impl Handlers {
                 archive_folder(path, &prefix, &settings, &snapshot, ctx)?
             }
         };
-        ctx.checkpoint()?;
-        let items = enrich_ratings(items, ctx)?;
+        let mut items = enrich_ratings_with_db(rows, rating_db.as_ref(), ctx)?;
+        if filters.tagged.is_some() {
+            enrich_tags(&mut items, ctx)?;
+        }
         let args = serde_json::json!([
             physical_identity(path),
             prefix
@@ -144,20 +320,59 @@ impl Handlers {
                 .map(|segment| segment.to_lowercase())
                 .collect::<Vec<_>>(),
             filters,
+            options.recursive,
+            max_depth
         ]);
-        let page = folder_page(
+        Ok(FolderListing {
             items,
             applied,
-            limit,
-            cursor.as_deref(),
-            &args,
-            ctx.granted.1,
-            &filters,
-            |items| enrich_tags(items, ctx),
-        )?;
-        ctx.checkpoint()?;
-        Ok(Payload::Folder(page))
+            args,
+            folders,
+        })
     }
+}
+
+fn summarize_listing(
+    listing: FolderListing,
+    recursive: bool,
+    filters: &FolderFilters,
+) -> Result<FolderSummary, AgentError> {
+    let mut summary = FolderSummary {
+        total: 0,
+        kinds: Default::default(),
+        stars: [0; 6],
+        folders: recursive.then(Vec::new),
+        folders_truncated: false,
+        book_composition_applied: listing.applied,
+    };
+    // Prefix counts make each direct child's subtree count constant-time.
+    let mut counts = Vec::with_capacity(listing.items.len() + 1);
+    counts.push(0usize);
+    for item in &listing.items {
+        let matches = filters.matches(item);
+        counts.push(counts.last().unwrap() + usize::from(matches));
+        if matches {
+            summary.total += 1;
+            *summary.kinds.entry(item.kind).or_default() += 1;
+            if let Some(rating) = item.rating {
+                summary.stars[usize::from(rating)] += 1;
+            }
+        }
+    }
+    if let Some(folders) = &mut summary.folders {
+        summary.folders_truncated = listing.folders.len() > 200;
+        for (mut folder, range) in listing.folders.into_iter().take(200) {
+            folder.total = counts[range.end] - counts[range.start];
+            folders.push(folder);
+        }
+    }
+    while mcp_content_chars(&summary).map_err(|_| internal())? > MAX_PAGE_CHARS {
+        if summary.folders.as_mut().and_then(Vec::pop).is_none() {
+            return Err(internal());
+        }
+        summary.folders_truncated = true;
+    }
+    Ok(summary)
 }
 
 fn bad_folder() -> AgentError {
@@ -185,31 +400,180 @@ fn folder_prefix(subresource: Option<&str>) -> Result<Vec<String>, AgentError> {
         .collect())
 }
 
-fn overlay_saved_favorite_view(settings: &mut Settings, path: &Path) -> Result<(), AgentError> {
-    if settings.remember_favorite_view_state
-        && crate::adjustment_db::AdjustmentDb::db_path()
+type FavoriteStates = HashMap<uuid::Uuid, crate::settings::FavoriteViewState>;
+
+fn favorite_states(settings: &Settings) -> Result<FavoriteStates, AgentError> {
+    if !settings.remember_favorite_view_state
+        || !crate::adjustment_db::AdjustmentDb::db_path()
             .try_exists()
             .map_err(|_| internal())?
     {
-        let db = crate::adjustment_db::AdjustmentDb::open_readonly().map_err(|_| internal())?;
-        let states = db.load_all_favorite_view_states();
-        let id = crate::final_composite::active_favorite_default_id_for_path(
-            path,
-            &settings.favorites,
-            None,
-            |id| states.contains_key(&id),
-        );
-        if let Some(id) = id {
-            settings.apply_favorite_view_overlay(id, &states[&id]);
-        }
+        return Ok(HashMap::new());
     }
-    Ok(())
+    Ok(crate::adjustment_db::AdjustmentDb::open_readonly()
+        .map_err(|_| internal())?
+        .load_all_favorite_view_states())
+}
+
+fn folder_settings(common: &Settings, states: &FavoriteStates, path: &Path) -> Settings {
+    let mut settings = common.clone();
+    if let Some(id) = crate::final_composite::active_favorite_default_id_for_path(
+        path,
+        &settings.favorites,
+        None,
+        |id| states.contains_key(&id),
+    ) {
+        settings.apply_favorite_view_overlay(id, &states[&id]);
+    }
+    settings
+}
+
+fn optional_ratings() -> Result<Option<crate::rating_db::RatingDb>, AgentError> {
+    let path = crate::rating_db::RatingDb::db_path();
+    if !path.try_exists().map_err(|_| internal())? {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    DB_OPENS.with(|counts| counts.set((counts.get().0 + 1, counts.get().1)));
+    crate::rating_db::RatingDb::open_readonly(path)
+        .map(Some)
+        .map_err(|_| internal())
+}
+
+#[cfg(test)]
+thread_local! { static DB_OPENS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) }; }
+
+const MAX_RECURSIVE_FOLDERS: usize = 1_000;
+const MAX_RECURSIVE_ROWS: usize = 50_000;
+
+fn traversal_limit() -> AgentError {
+    error(
+        ErrorCode::BadRequest,
+        "サブフォルダ込みの対象が多すぎます (フォルダ 1,000・項目 50,000 まで)。max_depth を小さくするか、下のフォルダを指定してください",
+    )
+}
+
+fn folder_read_error(path: &Path, child: bool, cause: std::io::Error) -> AgentError {
+    if child && cause.kind() == std::io::ErrorKind::PermissionDenied {
+        let path = path.to_string_lossy();
+        let skip = path.chars().count().saturating_sub(1000);
+        let path = path.chars().skip(skip).collect::<String>();
+        error(
+            ErrorCode::BadRequest,
+            &format!(
+                "サブフォルダ {path} を読めません。そのフォルダを含まない範囲 (下のフォルダごと、または max_depth) を指定してください"
+            ),
+        )
+    } else {
+        internal()
+    }
+}
+
+struct FolderWalk<'a> {
+    common: &'a Settings,
+    states: &'a FavoriteStates,
+    ratings: Option<&'a crate::rating_db::RatingDb>,
+    ctx: &'a ReadContext,
+    max_depth: u32,
+    visited: usize,
+    rows: Vec<FolderRow>,
+    folders: Vec<(FolderSummaryFolder, std::ops::Range<usize>)>,
+}
+
+impl FolderWalk<'_> {
+    fn visit(&mut self, path: &Path, depth: u32) -> Result<(), AgentError> {
+        self.ctx.checkpoint()?;
+        self.visited += 1;
+        if self.max_depth > 0 && self.visited > MAX_RECURSIVE_FOLDERS {
+            return Err(traversal_limit());
+        }
+        let settings = folder_settings(self.common, self.states, path);
+        let rows = physical_folder(path, &settings, self.ctx, self.ratings, depth > 0)?;
+        // Count the whole base listing even before descending or filtering it.
+        if self.max_depth > 0 && self.rows.len() + rows.len() > MAX_RECURSIVE_ROWS {
+            return Err(traversal_limit());
+        }
+        for row in rows {
+            let child = (row.item.kind == FolderKind::Folder && depth < self.max_depth)
+                .then(|| PathBuf::from(&row.item.path));
+            let direct =
+                (depth == 0 && row.item.kind == FolderKind::Folder).then(|| FolderSummaryFolder {
+                    path: row.item.path.clone(),
+                    name: row.item.name.clone(),
+                    total: 0,
+                });
+            self.rows.push(row);
+            if self.max_depth > 0 && self.rows.len() > MAX_RECURSIVE_ROWS {
+                return Err(traversal_limit());
+            }
+            let start = self.rows.len();
+            if let Some(child) = child {
+                if enter_folder(&child).map_err(|cause| folder_read_error(&child, true, cause))? {
+                    self.visit(&child, depth + 1)?;
+                }
+            }
+            if let Some(folder) = direct {
+                self.folders.push((folder, start..self.rows.len()));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn enter_folder(path: &Path) -> std::io::Result<bool> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::{
+            fs::{MetadataExt, OpenOptionsExt},
+            io::AsRawHandle,
+        };
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{
+                FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+                FILE_FLAG_OPEN_REPARSE_POINT, FileAttributeTagInfo, GetFileInformationByHandleEx,
+            },
+        };
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0 {
+            return Ok(true);
+        }
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0)
+            .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+            .open(path)?;
+        let mut info = FILE_ATTRIBUTE_TAG_INFO::default();
+        unsafe {
+            GetFileInformationByHandleEx(
+                HANDLE(file.as_raw_handle()),
+                FileAttributeTagInfo,
+                (&raw mut info).cast(),
+                std::mem::size_of_val(&info) as u32,
+            )
+        }
+        .map_err(|cause| std::io::Error::from_raw_os_error(cause.code().0 & 0xffff))?;
+        enter_reparse_tag(Ok(info.ReparseTag))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(!std::fs::symlink_metadata(path)?.file_type().is_symlink())
+    }
+}
+
+fn name_surrogate(tag: u32) -> bool {
+    tag & 0x2000_0000 != 0
+}
+
+fn enter_reparse_tag(tag: std::io::Result<u32>) -> std::io::Result<bool> {
+    tag.map(|tag| !name_surrogate(tag))
 }
 
 fn physical_folder(
     path: &Path,
     settings: &Settings,
     ctx: &ReadContext,
+    ratings: Option<&crate::rating_db::RatingDb>,
+    child: bool,
 ) -> Result<Vec<FolderRow>, AgentError> {
     let scan = crate::app::folder_scan::scan_directory_with_settings_cancel(
         path,
@@ -217,7 +581,7 @@ fn physical_folder(
         Some(&ctx.cancel),
     );
     ctx.checkpoint()?;
-    let scan = scan.map_err(|_| internal())?;
+    let scan = scan.map_err(|cause| folder_read_error(path, child, cause))?;
     let known_metadata = scan
         .precise_stamps
         .iter()
@@ -229,8 +593,8 @@ fn physical_folder(
         settings,
         crate::rating_sort::ListingOrderRequest::from_settings(settings),
         |keys| {
-            crate::rating_db::RatingDb::open_readonly(crate::rating_db::RatingDb::db_path())
-                .map_err(|error| error.to_string())?
+            ratings
+                .ok_or_else(|| "rating DB is absent".to_owned())?
                 .get_many_complete(keys, 0)
                 .map_err(|error| error.to_string())
         },
@@ -503,22 +867,19 @@ fn folder_items(
         .collect()
 }
 
-fn enrich_ratings(rows: Vec<FolderRow>, ctx: &ReadContext) -> Result<Vec<FolderItem>, AgentError> {
+fn enrich_ratings_with_db(
+    rows: Vec<FolderRow>,
+    db: Option<&crate::rating_db::RatingDb>,
+    ctx: &ReadContext,
+) -> Result<Vec<FolderItem>, AgentError> {
     ctx.checkpoint()?;
-    let path = crate::rating_db::RatingDb::db_path();
-    let ratings = if path.try_exists().map_err(|_| internal())? {
-        let db = crate::rating_db::RatingDb::open_readonly(path).map_err(|_| internal())?;
-        let keys = rows
-            .iter()
-            .filter_map(|row| row.rating_key.as_ref())
-            .flat_map(RatingKey::keys)
-            .cloned()
-            .collect::<Vec<_>>();
-        ctx.checkpoint()?;
-        db.get_many(&keys)
-    } else {
-        HashMap::new()
-    };
+    let keys = rows
+        .iter()
+        .filter_map(|row| row.rating_key.as_ref())
+        .flat_map(RatingKey::keys)
+        .cloned()
+        .collect::<Vec<_>>();
+    let ratings = db.map(|db| db.get_many(&keys)).unwrap_or_default();
     ctx.checkpoint()?;
     Ok(rows
         .into_iter()
@@ -532,6 +893,10 @@ fn enrich_ratings(rows: Vec<FolderRow>, ctx: &ReadContext) -> Result<Vec<FolderI
 fn enrich_tags(items: &mut [FolderItem], ctx: &ReadContext) -> Result<(), AgentError> {
     ctx.checkpoint()?;
     let db = optional_tags(&crate::tags_db::TagsDb::db_path())?;
+    #[cfg(test)]
+    if db.is_some() {
+        DB_OPENS.with(|counts| counts.set((counts.get().0, counts.get().1 + 1)));
+    }
     let keys = items
         .iter()
         .filter(|item| item.subresource.is_none())
@@ -567,7 +932,7 @@ fn folder_cursor(
     permission_epoch: u64,
 ) -> String {
     serde_json::to_vec(&FolderCursor {
-        version: 4,
+        version: 5,
         tool: "list_folder".into(),
         args_digest: args_digest.into(),
         listing_digest: listing_digest.into(),
@@ -599,7 +964,7 @@ fn folder_offset(
         .map(|index| u8::from_str_radix(&cursor[index..index + 2], 16).map_err(|_| bad()))
         .collect::<Result<Vec<_>, _>>()?;
     let cursor: FolderCursor = serde_json::from_slice(&bytes).map_err(|_| bad())?;
-    if cursor.version != 4 || cursor.tool != "list_folder" || cursor.args_digest != args {
+    if cursor.version != 5 || cursor.tool != "list_folder" || cursor.args_digest != args {
         return Err(bad());
     }
     if cursor.permission_epoch != permission_epoch {
