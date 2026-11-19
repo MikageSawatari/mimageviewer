@@ -3817,6 +3817,7 @@ impl App {
                         },
                     },
                     restore_intent.clone(),
+                    super::top_level_grid_view::TopLevelGridSurface::SmartFolder(target.clone()),
                 ))
             }
             SmartPhysicalReady::Zip(enumeration) => {

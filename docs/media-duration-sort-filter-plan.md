@@ -391,12 +391,32 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
 | 画像フォルダ／ZIP変換の親一覧採用 | adopt_image_zip_parent_scan (`app/image_folder_zip_operation.rs`) | pendingのExitTemporaryViewと採用時に共通の判定で親のFolderを準備。新しいcatalog読み取りはしない |
 | 外部変更・通常フォルダreconcile | App::start_external_rescan_with_cause (`app.rs`, external-folder-rescan) | 要求時のメモリArc snapshotとscanのfactsでworker内materialize。採用時にUIでcatalogを開かない |
 | 同期load・起動／設定適用等でpre-scanを持たない従来入口 | load_folder_with_scan_claimed_with_search_origin → scan_directory_with_settings | factsはNone。追加catalog I/Oなし。メモリだけで並び、利用者の更新・再選択でcatalog分が入る |
-| Smart/Search/Collectionの物理の子、集約一覧、Remote | 各source ownerの既存scan/materialize | 帰路を保持する子では非対応の長さ順は名前順を要求。Collectionの履歴子／外側ナビも移動先Collectionのidentityをprepareへ渡す。明示移動で一時ビューを終える通常Folderは対象に含む。長さfacetはPCのitemsに対し利用可能。Remoteの候補には出さない |
+| Smart/Search/Collectionの物理の子、集約一覧、Remote | 各source ownerの既存scan/materialize | 帰路を保持する子では非対応の長さ順は名前順を要求。Smartのresident／Offscreenとも移動先targetをSmartFolder surfaceとしてprepareへ渡す。Collectionの履歴子／外側ナビも移動先Collectionのidentityをprepareへ渡す。明示移動で一時ビューを終える通常Folderは対象に含む。長さfacetはPCのitemsに対し利用可能。Remoteの候補には出さない |
 | 製本・画像フォルダ本・ZIP/PDFページ、代表画像探索 | 既存book/page/thumbnail経路 | 固定順と代表画像allowlistを維持。画像専用scanへ長さ取得を追加しない |
 
 `default_cache_dir()`は保持済みdata-dirからのパス組立てだけ。新しいcatalog open/SELECTは上記workerか、既存details-meta workerだけで行う。同期materializeへI/Oを追加していない。
 
 採用前surfaceの一時ビュー台帳: Global (Metadata / Everything)・Favorite・Tagは、`MainListNavigation::exits_temporary_view()` が真ならFolder、検索を保持する物理の子ならSearch。Smartも同じ明示終了判定を使い、sessionが所有する子はSmartを保つ。Collectionを出る明示移動はFolder、Collection owner付きの子・履歴復元・外側ナビは移動先のCollection identityを保つ。固定snapshotは明示移動自体が既存の受付で禁止され、並び替えの投影でもSnapshotを保持する。snapshotの解除・scope判定を変更しない。
+
+**prepareの契約**: `prepare_scanned_folder_listing` / `prepare_scanned_folder_listing_with_cache_keys` / `prepare_physical_listing` は、すべて移動先の `TopLevelGridSurface` を必須引数で受け取る。prepare内で現在のsurface・sessionから推測しない。`physical_duration_sort_surface` は直接load・主preflight・変換後の親採用など、ownerとnavigationから移動先を決める入口だけで使う。推測する旧cache-key wrapperを削除し、明示surfaceを扱っていた実体へ統合した（旧 `_with_sort_surface` を `_with_cache_keys` に一本化）。
+
+prepare呼び出しの全件台帳（本番／テストを区別）:
+
+| 呼び出し元 | 呼ぶprepare | 移動先surfaceの出どころ |
+| --- | --- | --- |
+| `load_folder_with_scan_claimed_with_search_origin` (`app.rs`、本番) | `prepare_scanned_folder_listing_with_cache_keys` | 当該ownerとnavigationを入口で投影したsurface |
+| `adopt_smart_child_ready` (`app/smart_folder.rs`、本番) | `prepare_scanned_folder_listing` | 採用する `SmartFolderViewState target` のclone。resident／Offscreen共通、旧sessionの有無によらない |
+| `adopt_image_zip_parent_scan` (`app/image_folder_zip_operation.rs`、本番) | `prepare_scanned_folder_listing_with_cache_keys` | 受付済みadoption.navigationの明示退出intentを入口で投影したFolder |
+| `commit_physical_history_transition` (`app.rs`、本番) | `prepare_physical_listing` | requestのownerとnavigationを入口で投影したsurface |
+| `adopt_collection_history_child_with_backing` (`app/collection_grid.rs`、本番) | `prepare_physical_listing` | 復元先 `target.root.identity` からCollection |
+| `prepare_collection_outer_physical_adoption` (`app/collection_navigation.rs`、本番) | `prepare_physical_listing` | 移動先 `request.origin.collection_id` からCollection |
+| `prepare_physical_listing` のFolder分岐 (`app.rs`、本番) | `prepare_scanned_folder_listing_with_cache_keys` | 呼び出し元の必須引数をそのまま渡す |
+| `prepare_scanned_folder_listing` (`app.rs`、本番wrapper) | `prepare_scanned_folder_listing_with_cache_keys` | 呼び出し元の必須引数をそのまま渡す。pathからcache-key方式を選ぶだけ |
+| `install_scanned_folder_listing` (`app.rs`、現在は呼出0件のwrapper) | `prepare_scanned_folder_listing_with_cache_keys` | 同じ必須引数を追加し、そのまま渡す。旧「Smart opens enter here」のコメントは現経路と異なるため訂正 |
+| sidecar採用回帰 (`app/sidecar_restore.rs` の `cfg(test) mod tests`) | `prepare_scanned_folder_listing` | テストが採用する物理Folderを明示 |
+| `physical_folder_thumbnail_keys` (`app/collection_grid.rs` の `cfg(test) mod tests`) | `prepare_scanned_folder_listing_with_cache_keys` | テストで既に採用済みの対象surface（Folder／Collection）を明示 |
+| `duration_762_projection_identity_preserves_requested_sort_on_search_physical_child` (`app/tests/duration_762.rs`) | `prepare_scanned_folder_listing` | 保持するGlobal Search surfaceを明示 |
+| `duration_762_physical_preflight_uses_destination_surface_before_adoption` (`app/tests/duration_762.rs`) | `prepare_physical_listing` | fixtureの明示退出先Folder／復元先Collectionを明示 |
 
 ### 11.3 完了・取消の台帳
 
@@ -417,7 +437,7 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
 2. 絞り込みバーには一般の新候補補完が無い（`src/settings.rs:9933`）。長さメニューを旧既定バーにも届けるためsort用とは別のone-time markerを追加。旧既定完全一致だけ補完し、空・順序変更・非表示は保持。NameFilterの既存stashも保持。DB表・schemaは変更なし。
 3. ゲームパッドsort行は左右巡回で（`src/app/gamepad_input.rs:11160` のpicker_row_supports_value_list）、値一覧から同値を選び直す操作は存在しない。巡回の候補制限と変更時のworker経路を接続し、共通handlerへ同値duration要求が届いた場合もworker再読込にする。新キー操作・値一覧は追加しない。
 4. §1.822は着手前にコミット済みで、本書の「既存の問題」を修正済みの記録へ直した。
-5. 物理一覧prepareはsurface採用より前にも走る。destination ownerだけでなくnavigation intentも渡し、`MainListNavigation::exits_temporary_view()` を採用側の検索終了・一時ビュー退役と共有する。ExitTemporaryViewで検索・Smart・Collectionを終える通常フォルダへの移動はFolderとして準備し、まだ表示中のactive flagで名前順に落とさない。検索を保持する物理の子、Smart sessionが所有する子、移動先Collection owner付きの子は対象外のまま。主preflightと画像変換後の親一覧にも同じ投影を渡し、Collection固有の履歴復元／外側ナビは移動先Collection identityを明示する。固定snapshotは既存の受付・scope制約を優先する。元のbook recipeや退去するrating等のsurfaceだけで新しい物理一覧を制限しない。
+5. 物理一覧prepareはsurface採用より前にも走るため、全prepareの必須引数として移動先surfaceを受け取る。prepare内に現在surface・sessionからの推測を残さない。直接load等の入口ではdestination ownerとnavigation intentを投影し、`MainListNavigation::exits_temporary_view()` を採用側の検索終了・一時ビュー退役と共有する。ExitTemporaryViewで検索・Smart・Collectionを終える通常フォルダへの移動はFolderとして準備し、まだ表示中のactive flagで名前順に落とさない。Smartの子の直接移動／履歴復元はresident／Offscreenによらず `SmartFolder(target.clone())` を渡す。検索を保持する物理の子、Smartの子、移動先Collection owner付きの子は対象外のまま。主preflightと画像変換後の親一覧にも入口で決めた投影を渡し、Collection固有の履歴復元／外側ナビは移動先Collection identityを明示する。固定snapshotは既存の受付・scope制約を優先する。元のbook recipeや退去するrating等のsurfaceだけで新しい物理一覧を制限しない。
 6. 既存facet-sort snapshotはtests/ui_snapshot.rsではなくui_main.rsのlib testのsection292_facet_sort_snapshotにある。既存2fixtureを追従させ、指定のintegration側にも共通描画fixtureで通常幅／狭幅を追加した。
 
 7. 走査採用のprojection keyは従来どおり正規化前の要求を識別し、実際の並べ替え要求だけを名前順にする。worker・UI prepare・既存の現在値照合で同じkey契約を保持する。
@@ -476,3 +496,12 @@ PNG更新候補（全て未更新）:
 - この差分のコンパイル・テスト・UIスナップショット更新は利用者の指示で実施しない。設計担当の既報の関連337件・ui_snapshot263件・core check成功はコミット `4c7c7bebc` の証拠であり、この修正後の成功件数ではない。設計担当のメニューテストの `harness.run_steps(3)` 修正を保持する。
 - 共有runner向けの絞ったfilter案: `test(/duration_762/)`。必要に応じ `test(/duration|media_duration_thumbnail|page_count|location_jump|collection_history/)` で既存の近傍取得と入口も検証する。今回のUI描画変更はなく、PNGの更新候補はない。
 - 修正差分の独立静的レビュー (Sol / xhigh) はACCEPT。新fixtureのZIP wrapper自動降下の指摘を明示root materializeへ修正し、追加のpreflightテストも静的確認済み。実行による検証ではない。`cargo fmt` / `cargo fmt --check` / `git diff --check` はいずれもexit 0。git add・commitは行っていない。
+
+### 11.8 Smartの非resident履歴復元とprepare契約の修正 (2026-11-20、未実行)
+
+- 再レビューで、通常FolderからSmart物理子へ履歴復元すると、Offscreen rootの採用前に旧surfaceからFolderと推測し、非対応の長さ順が適用される経路を確認した。`adopt_smart_child_ready` はrootのresident有無によらず移動先 `SmartFolder(target.clone())` をprepareへ渡す。
+- 全prepareの移動先surfaceを必須引数へ揃えた。推測するcache-key wrapperをなくして実体と統合し、二度目の現在状態の推測をしない。新stateや待機・取消の分岐は足さず、既存の準備→採用順を維持する単純化を採った。`install_scanned_folder_listing` は現ソースで呼出0件だが、このwrapperにも同じ必須引数を付けた。実際のSmart直接移動は `begin_staged_smart_drill` → `adopt_smart_child_ready` の経路である。
+- `sidecar_restore.rs` の指摘箇所と `collection_grid.rs::physical_folder_thumbnail_keys` はともに `cfg(test) mod tests` 内と確認し、それぞれテストの移動先を明示した。既存の検索子projectionテストも明示Searchへ更新した。全呼出の移動先の出どころは§11.2、契約は§11.4の5に反映した。
+- 新規 `src/app/tests/duration_762/smart_destination.rs`: `duration_762_offscreen_smart_history_child_uses_destination_name_sort` と `duration_762_resident_smart_child_uses_destination_name_sort`。既存App fixtureと本物の履歴／直接drillのworker・採用経路を使う。stamp一致の既知長さ600秒／30秒、共通DurationAsc、実itemsの `a-long.mp4 → b-short.mp4`、Smart所有状態を検証する。Offscreenテストは採用前のFolder・非resident状態と履歴Back/Forwardのcommitも検査する。固定sleep・実機のキー状態読取は追加しない。
+- 共有runner向けfilter案は `test(/duration_762/)`。必要に応じ既存Smart履歴・drillと、今回引数を更新した `collection_physical_thumbnail` / `collection_physical_load` / `section1339_adoption_precedes_real_sidecar_hydration_and_commits_once` の回帰も確認する。コンパイル・テスト・check・build・testスクリプト・製品起動・PNG更新は利用者の指示で実施しない。既報の関連500件・core check成功は修正前コミット `76ab07779` に対する設計担当の結果である。
+- 本番差分・全呼出台帳・新規2テストの独立静的レビュー (Sol / xhigh) はACCEPT。`cargo fmt` / `cargo fmt --check` / `git diff --check` はすべてexit 0。コンパイル・実行の証拠ではない。git add・commitは行っていない。

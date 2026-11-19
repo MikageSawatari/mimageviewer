@@ -1,6 +1,7 @@
 use super::*;
 use crate::settings::{FacetDurationPreset, FacetSizePreset, GridViewMode, SortOrder};
 
+mod smart_destination;
 mod visible_stages;
 
 fn fixture() -> phase_c_support::AppTestEnv {
@@ -407,6 +408,9 @@ fn duration_762_projection_identity_preserves_requested_sort_on_search_physical_
             path_display: String::new(),
         },
         StartupListIntent::PreservePresentation,
+        top_level_grid_view::TopLevelGridSurface::Search(
+            top_level_grid_view::TopLevelSearchView::Global,
+        ),
     );
     assert_eq!(
         prepared.stack_order_request,

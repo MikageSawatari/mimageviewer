@@ -942,7 +942,7 @@ impl App {
         let now = std::time::Instant::now();
         let sort_surface =
             self.physical_duration_sort_surface(&path, None, Some(&adoption.navigation));
-        let prepared = self.prepare_scanned_folder_listing_with_sort_surface(
+        let prepared = self.prepare_scanned_folder_listing_with_cache_keys(
             path.clone(),
             scan,
             FolderListingMetrics {

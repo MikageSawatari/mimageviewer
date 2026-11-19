@@ -11439,6 +11439,7 @@ mod tests {
             },
             crate::app::StartupListIntent::ExplicitList,
             app.use_full_path_cache_keys(),
+            app.top_level_grid_view.surface().clone(),
         );
         (thumbnail_request_keys(app), prepared.existing_keys)
     }

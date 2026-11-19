@@ -32217,7 +32217,7 @@ impl App {
         let full_keys = use_full_path_cache_keys_for_folder(&path);
         let sort_surface =
             self.physical_duration_sort_surface(&path, Some(&owner), navigation.as_ref());
-        let prepared = self.prepare_scanned_folder_listing_with_sort_surface(
+        let prepared = self.prepare_scanned_folder_listing_with_cache_keys(
             path.clone(),
             scan,
             FolderListingMetrics {
@@ -32316,8 +32316,8 @@ impl App {
         FolderOpenOutcome::Loaded
     }
 
-    /// Shared, already-admitted Folder listing tail. Smart opens enter here only after their
-    /// offscreen scan and visible-adoption checks succeed; this function cannot reject an open.
+    /// Shared, already-admitted Folder listing tail. The request owner supplies the destination
+    /// surface explicitly, independently of the still-mounted source surface/session.
     fn install_scanned_folder_listing(
         &mut self,
         path: PathBuf,
@@ -32326,6 +32326,7 @@ impl App {
         metrics: FolderListingMetrics,
 
         restore_intent: crate::app::StartupListIntent,
+        sort_surface: top_level_grid_view::TopLevelGridSurface,
     ) -> bool {
         let prepared = self.prepare_scanned_folder_listing_with_cache_keys(
             path,
@@ -32333,6 +32334,7 @@ impl App {
             metrics,
             restore_intent,
             self.use_full_path_cache_keys(),
+            sort_surface,
         );
         let logical = match &authority {
             VisibleInstallAuthority::StagedArchive { logical_source }
@@ -32359,6 +32361,7 @@ impl App {
         scan: ScannedDir,
         metrics: FolderListingMetrics,
         restore_intent: StartupListIntent,
+        sort_surface: top_level_grid_view::TopLevelGridSurface,
     ) -> PreparedScannedFolderListing {
         let full_path = use_full_path_cache_keys_for_folder(&path);
         self.prepare_scanned_folder_listing_with_cache_keys(
@@ -32367,30 +32370,13 @@ impl App {
             metrics,
             restore_intent,
             full_path,
+            sort_surface,
         )
     }
 
+    /// The caller owns the destination identity, including offscreen Smart/history loads.
+    /// Never infer it from the still-mounted source surface or session during preparation.
     fn prepare_scanned_folder_listing_with_cache_keys(
-        &mut self,
-        path: PathBuf,
-        scan: ScannedDir,
-        metrics: FolderListingMetrics,
-
-        restore_intent: crate::app::StartupListIntent,
-        use_full_path_cache_keys: bool,
-    ) -> PreparedScannedFolderListing {
-        let surface = self.physical_duration_sort_surface(&path, None, None);
-        self.prepare_scanned_folder_listing_with_sort_surface(
-            path,
-            scan,
-            metrics,
-            restore_intent,
-            use_full_path_cache_keys,
-            surface,
-        )
-    }
-
-    fn prepare_scanned_folder_listing_with_sort_surface(
         &mut self,
         path: PathBuf,
         mut scan: ScannedDir,
@@ -38534,7 +38520,7 @@ impl App {
                 let auto_book = auto_fullscreen
                     && self.settings.auto_fullscreen_image_folders_enabled()
                     && self.scanned_folder_is_image_book(&path, &scan);
-                let mut prepared = self.prepare_scanned_folder_listing_with_sort_surface(
+                let mut prepared = self.prepare_scanned_folder_listing_with_cache_keys(
                     path.clone(),
                     scan,
                     FolderListingMetrics {

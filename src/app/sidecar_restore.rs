@@ -4300,6 +4300,7 @@ mod tests {
                     path_display: child.display().to_string(),
                 },
                 super::super::StartupListIntent::ExplicitList,
+                super::super::top_level_grid_view::TopLevelGridSurface::Folder,
             );
             let visible = app
                 .prepare_visible_install(&child, &prepared.items, None)
