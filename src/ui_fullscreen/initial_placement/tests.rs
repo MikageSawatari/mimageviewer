@@ -78,6 +78,7 @@ fn paint_single(
             None,
             page_turn::FlatCropPaint::WithPage,
             selected_current,
+            false,
         )
         .expect("ready single page paints");
     app.fullscreen_page_layout
@@ -231,6 +232,7 @@ fn paint_prepared_single_in_viewport(
             None,
             page_turn::FlatCropPaint::WithPage,
             true,
+            false,
         )
         .expect("selected page paints");
     app.fullscreen_page_layout
@@ -1410,6 +1412,7 @@ fn initial_placement_r4_actual_passthrough_producer_keeps_request_until_full_arr
                 None,
                 page_turn::FlatCropPaint::WithPage,
                 true,
+                false,
             )
             .expect("actual rendition paints");
         close_to(t.paint_rect.top(), 0.0);
@@ -1484,6 +1487,7 @@ fn initial_placement_rejected_native_uses_fitting_thumbnail_without_committing_c
                 None,
                 page_turn::FlatCropPaint::WithPage,
                 true,
+                false,
             )
             .expect("rejected Native falls back to thumbnail");
         close_to(transform.paint_rect.width(), 150.0);
@@ -1563,6 +1567,7 @@ fn initial_placement_actual_paint_without_material_preserves_request_and_pan() {
                     None,
                     page_turn::FlatCropPaint::WithPage,
                     true,
+                    false,
                 );
                 assert!(t.is_none());
             }
@@ -2372,6 +2377,7 @@ fn paint_submitted_single(
             None,
             page_turn::FlatCropPaint::WithPage,
             true,
+            false,
         )
         .expect("selected single page submits");
     app.fullscreen_page_layout

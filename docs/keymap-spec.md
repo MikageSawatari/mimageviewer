@@ -898,6 +898,12 @@ idx 遷移はすべて +1)。これは「ページ送りをキューに溜めな
 溜まった repeat 分だけナビゲーションが続く余韻を増やさない。
 
 fullscreen のページ送り Action と固定矢印は page-turn 専用の typed consume result を使う。
+前面メニューが配送元または全画面の配送先 viewport にある間は、固定矢印（Shift付きも含む）、
+ページ送り・固定ジャンプ・先頭末尾・見開き位置ずらし／1ページ送り・スタック移動・
+前後の本／フォルダ・連結スクロール・ページ内スクロールを消費前に拒否する。
+同じ viewport のイベントはメニューに残し、ROOT経由では既存の handled により背面一覧へ流さない。
+配送元のシークPopupは従来どおりhandler全体を早期returnする。ほかのメニューでは回転等の
+非ナビゲーション操作を従来どおり処理する。Esc・FsClose・FsBackToListは変更しない。
 result は first keydown / auto-repeat、matched chord、送信元 viewport、処理時点で chord がまだ
 physical held か、または同一 frame の後続 key-up ですでに release 済みかを保持する。first keydown は
 keydown + key-up が同一 frame に届く短い tap でも必ず 1 回発火する。発火させず consume-only にするのは

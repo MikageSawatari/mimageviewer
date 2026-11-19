@@ -55,6 +55,7 @@ fn draw_current_with_initial_placement(
             None,
             FlatCropPaint::WithPage,
             true,
+            false,
         )
         .expect("the selected resident single page paints");
     app.fullscreen_page_layout

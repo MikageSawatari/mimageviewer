@@ -692,7 +692,7 @@ fn shift_arrows_and_horizontal_arrows_keep_page_navigation() {
 }
 
 #[test]
-fn fallback_menu_consumes_replacement_arrows_without_moving_or_turning() {
+fn fallback_menu_leaves_navigation_arrows_unconsumed_without_moving_or_turning() {
     #[cfg(windows)]
     let _serial = crate::key_input::lock_test_input();
     #[cfg(windows)]
@@ -709,8 +709,16 @@ fn fallback_menu_consumes_replacement_arrows_without_moving_or_turning() {
         app.fs_context_menu_idx = Some(0);
         frame(&ctx, tap(egui::Key::ArrowDown), |_, ctx| {
             let action = app.handle_fs_key_input(ctx, 0, false);
-            assert_eq!(action.page_nav.is_none(), in_page);
+            assert!(action.page_nav.is_none());
             assert_eq!(app.fs_pan, Vec2::ZERO);
+            assert!(ctx.input(|input| input.events.iter().any(|event| matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::ArrowDown,
+                    pressed: true,
+                    ..
+                }
+            ))));
         });
     }
 }

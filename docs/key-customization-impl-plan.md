@@ -1,5 +1,10 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.807: 前面メニュー中のナビゲーション拒否は、固定矢印とkeymapの消費前で同じ
+配送元／配送先の判定を使う。Action・既定割当・typedなpage-turn消費契約は変更しない。
+シークPopupの既存の早期return、Esc・FsClose・FsBackToList・回転等の受付も維持する。
+詳細と消費者の一覧は [設計と実装記録](fullscreen-pan-and-front-menu-input-plan.md) を参照。
+
 §1.791: 既存の動画・音楽の相対シークとマーカー移動は `SeekPlayback::PreserveIntent`、
 `VideoSeekStart` は `StartPlayback` を指定する。KeyAction とキー割り当ては変更しない。
 

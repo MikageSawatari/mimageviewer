@@ -3,6 +3,8 @@ use super::*;
 use crate::gpu_lanczos::{FullscreenPaintPayload, FullscreenPaintResource};
 use crate::ui_fullscreen::page_turn_submission_tests::{draw_current, frame, ready_app};
 
+mod pan_bounds_tests;
+
 pub(super) fn normal_source_for_page(
     app: &App,
     page: &PreparedPagedPage,
