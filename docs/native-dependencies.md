@@ -370,6 +370,9 @@ bash scripts/setup-ffmpeg.sh           # BtbN の n7.1 系・最新の版付き 
 bash scripts/setup-ffmpeg.sh check     # 新しい版付きビルドがあるか確認のみ
 ```
 
+`check` は資産名の major・minor・patch（省略時は 0）・コミット数を数値で比較し、手元が新しい場合も `Up to date.` とする。
+取得時も同じ比較で格下げを拒否し、数値が同じで名前が異なる場合や解析不能の場合は失敗する（意図的な入れ直しは `vendor/ffmpeg/VERSION` を削除して再実行）。
+
 - 取得元: [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases)
   の `ffmpeg-n7.1*-win64-lgpl-shared-7.1.zip`
   - ローリング `latest` release の `...-latest-...zip` は使わない。日付付き `autobuild-*`

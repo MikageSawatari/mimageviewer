@@ -154,16 +154,23 @@ try {
     $fixtures = @(
         @{ Name = 'PDFium'; Script = 'scripts/setup-pdfium.sh'; Text = "Latest release: chromium/8100`nNew version available: chromium/8100"; Latest = 'chromium/8100' },
         @{ Name = 'FFmpeg'; Script = 'scripts/setup-ffmpeg.sh'; Text = "Matched asset: ffmpeg-fixture.zip`nUp to date."; Latest = 'ffmpeg-fixture.zip' },
+        @{ Name = 'FFmpeg'; Script = 'scripts/setup-ffmpeg.sh'; Text = "Matched asset: ffmpeg-fixture.zip`nUp to date. Current is newer than the newest published versioned asset: ffmpeg-fixture.zip"; Latest = 'ffmpeg-fixture.zip' },
         @{ Name = 'LibRaw'; Script = 'scripts/setup-libraw.sh'; Text = "Current LibRaw: 0.22.3; latest release: 0.23.0`nNew version available."; Latest = '0.23.0' }
     )
     foreach ($fixture in $fixtures) {
         $setupText = $fixture.Text
         Add-SetupCheck $fixture.Name $fixture.Script 'fixture-missing-version' $knownBash
         Assert-Equal $rows[$rows.Count - 1].Latest $fixture.Latest 'successful setup check parsing'
+        if ($fixture.Name -eq 'FFmpeg') {
+            Assert-Equal $rows[$rows.Count - 1].Notes 'up to date; scripts/setup-ffmpeg.sh check' 'FFmpeg setup summary'
+        }
     }
     $setupCode = 1
     Add-SetupCheck 'PDFium' 'scripts/setup-pdfium.sh' 'vendor/pdfium/VERSION' $knownBash
     Assert-Equal $rows[$rows.Count - 1].Latest 'unavailable' 'query failure after discovery'
+    $setupText = 'Cannot compare versions: current=fixture-current matched=fixture-matched'
+    Add-SetupCheck 'FFmpeg' 'scripts/setup-ffmpeg.sh' 'vendor/ffmpeg/VERSION' $knownBash
+    Assert-Equal $rows[$rows.Count - 1].Notes 'scripts/setup-ffmpeg.sh check failed; check network and gh availability' 'incomparable FFmpeg check fails'
     Write-Output 'Git bash discovery and setup row tests passed'
 } finally {
     $env:ProgramFiles = $oldProgramFiles
