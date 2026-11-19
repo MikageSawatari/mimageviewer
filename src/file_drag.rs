@@ -34,8 +34,8 @@ pub struct DragOutcome {
     pub error: Option<FileDragError>,
     /// ドロップが受理されたか (`SHDoDragDrop` の effect が NONE 以外)。
     /// 非同期転送の完了・成功を示すものではない。
-    /// キャンセル (Esc / 無効ターゲット上で離す) のときは false。呼び出し側が
-    /// 「mIV 自身のウィンドウへ落ちた」判定をするのに使う。
+    /// キャンセル (Esc / 無効ターゲット上で離す) のときは false。受理の診断値であり、
+    /// 自分の窓への落下判定や元ファイルの削除には使わない。
     pub dropped: bool,
 }
 
@@ -205,7 +205,12 @@ pub(crate) fn shell_item_array_for_paths(
 /// OLE モーダル区間はブロックする。非同期 target の転送完了は待たない。
 /// UI スレッドから、かつマウスボタンが押下中に呼ぶこと。
 #[cfg(windows)]
-pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
+pub(crate) fn start_file_drag(
+    hwnd: isize,
+    paths: &[PathBuf],
+    excluded_virtual: bool,
+    shared: &crate::main_drop_target::SharedMainDrop,
+) -> DragOutcome {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Ole::{DROPEFFECT_COPY, IDropSource};
     use windows::Win32::UI::Shell::SHDoDragDrop;
@@ -246,14 +251,19 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
         drag.id,
     ));
     let started_at = std::time::Instant::now();
-    let result = unsafe {
+    let internal = crate::main_drop_target::InternalDrag {
+        paths: paths.to_vec(),
+        excluded_virtual,
+        failed_paths,
+    };
+    let result = with_internal_drag(shared, internal, || unsafe {
         SHDoDragDrop(
             Some(hwnd),
             &drag.data,
             None::<&IDropSource>,
             DROPEFFECT_COPY,
         )
-    };
+    });
     let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     // The target's Start/End state owns lifetime even when the modal result is NONE/error.
     let in_operation = drag.finish_modal();
@@ -289,6 +299,17 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
     }
 }
 
+fn with_internal_drag<R>(
+    shared: &crate::main_drop_target::SharedMainDrop,
+    internal: crate::main_drop_target::InternalDrag,
+    modal: impl FnOnce() -> R,
+) -> R {
+    shared.borrow_mut().internal = Some(internal);
+    let result = modal();
+    shared.borrow_mut().internal = None;
+    result
+}
+
 #[cfg(windows)]
 fn shell_parse_wide_path(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
@@ -304,7 +325,12 @@ fn shell_parse_wide_path(path: &Path) -> Vec<u16> {
 
 /// 非 Windows ビルド用の空実装。他のプラットフォーム分岐に揃えるためのスタブ。
 #[cfg(not(windows))]
-pub fn start_file_drag(_hwnd: isize, _paths: &[PathBuf]) -> DragOutcome {
+pub(crate) fn start_file_drag(
+    _hwnd: isize,
+    _paths: &[PathBuf],
+    _excluded_virtual: bool,
+    _shared: &crate::main_drop_target::SharedMainDrop,
+) -> DragOutcome {
     DragOutcome::not_started()
 }
 
@@ -326,6 +352,7 @@ pub(crate) fn copy_dropped_paths_blocking(
     let attempted = paths.len();
     let request = ShellTransferRequest {
         operation: ShellTransferOperation::Copy,
+        default_move_needs_volume_check: false,
         sources: paths,
         destination,
     };
@@ -346,6 +373,37 @@ mod file_drop_worker_tests {
     use super::copy_dropped_paths_blocking;
     use crate::shell_file_ops::{ShellTransferOperation, ShellTransferOutcome};
     use std::path::PathBuf;
+
+    #[test]
+    fn native_drag_shared_payload_exists_only_inside_modal_call_including_error_return() {
+        use crate::main_drop_target::{InternalDrag, MainDropShared};
+        let shared = std::rc::Rc::new(std::cell::RefCell::new(MainDropShared::default()));
+        for failed in [false, true] {
+            let paths = vec![
+                PathBuf::from(r"C:\all\first"),
+                PathBuf::from(r"C:\all\unresolved"),
+            ];
+            let result = super::with_internal_drag(
+                &shared,
+                InternalDrag {
+                    paths: paths.clone(),
+                    excluded_virtual: true,
+                    failed_paths: 1,
+                },
+                || {
+                    let mut state = shared.borrow_mut(); // No borrow spans the modal call.
+                    let source = state.internal.as_ref().unwrap();
+                    assert_eq!(source.paths, paths);
+                    assert!(source.excluded_virtual);
+                    assert_eq!(source.failed_paths, 1);
+                    state.admission = Ok(());
+                    if failed { Err("modal error") } else { Ok(()) }
+                },
+            );
+            assert_eq!(result.is_err(), failed);
+            assert!(shared.borrow().internal.is_none());
+        }
+    }
 
     #[test]
     fn dropped_paths_worker_preserves_file_folder_order_destination_and_owner() {

@@ -82,6 +82,7 @@ pub(crate) mod depth_preprocess;
 pub mod derived_text;
 pub mod detached_window_geometry;
 pub(crate) mod feedback;
+pub(crate) mod main_drop_target;
 pub mod transcript_db;
 pub(crate) mod transcript_display;
 pub(crate) mod transcript_display_cache;
@@ -473,6 +474,8 @@ mod ui_folder_pane;
 #[doc(hidden)]
 pub use ui_folder_pane::draw_folder_pane_location_snapshot_fixture;
 pub use ui_folder_pane::draw_folder_pane_refresh_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_folder_pane::draw_folder_tree_paste_menu_snapshot_fixture;
 pub mod ui_font_catalog;
 pub mod ui_fonts;
 mod ui_fullscreen;

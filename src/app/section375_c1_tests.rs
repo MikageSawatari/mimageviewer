@@ -287,6 +287,7 @@ fn section1375_c1_organize_scan_before_promote_retains_operation_on_remount() {
             Box::new(crate::ui_dialogs::file_organize::FileOrganizeRunning {
                 request: crate::shell_file_ops::ShellTransferRequest {
                     operation,
+                    default_move_needs_volume_check: false,
                     sources: vec![folder.join("a.jpg")],
                     destination: folder.clone(),
                 },

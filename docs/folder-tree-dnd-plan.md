@@ -2,7 +2,7 @@
 
 2026-11-19〜20 設計 (ClaudeCode)。worktree `G:\home\mimageviewer-treednd464`、branch `treednd-464`、基点 master `ca6686d93`。
 要件の正本は [next-release-backlog.md §1.464・§1.821](next-release-backlog.md)。
-**状態: 設計 r5 (独立レビュー r1〜r4 = REJECT を反映。仕組みを足すより組み合わせを減らした。§13)。実装前の再レビュー待ち。**
+**状態: 設計 r5 (利用者から独立レビュー ACCEPT の報告あり)。A は `6f91f6058`。B は §14・§16 の判断を反映して実装。検証・引き渡しの記録は §15。コンパイル・テストは利用者指示により設計担当へ引き継ぐ。**
 
 要望の要旨 (5ch): >>444 ツリーへファイルをドロップできず、右クリックの貼り付けもできない。>>707 読み終えたファイルを
 `_mita` フォルダへ D&D したい (内部ドラッグで「＋」カーソルなのに何も起きない)。固定先へ送る「ファイル整理先」(v4.4.0 出荷)
@@ -36,6 +36,8 @@
 7. 処理中はモーダルにしない (整理先 §5.1 と同じ判断、§9)。
 
 ## 2. 現状のコード事実
+
+以下は設計時の調査記録。A (`6f91f6058`) と B の更新後の経路・検証状況は §8・§15 を参照する。
 
 | 領域 | 事実 |
 | --- | --- |
@@ -95,8 +97,9 @@ Shift の明示の移動は下げない。要求は `operation` と `default_mov
 (元が消える側には転ばない)。同じボリュームを別の名前 (`D:\` と `C:\MountD\`) で見ている場合、Explorer は既定で移動するが mIV はコピーになる
 (安全側の違いとしてマニュアルに書かない細部。設計書にだけ残す)。送出元は mIV 自身なので、preferred effect や元の許可効果による分岐は無い。
 
-受け付けない場面: 行の上でない / 本棚の配下 / 明示の移動か既定で、先が元の親と同じ (字句。Explorer も同じフォルダへの既定のドロップでは何もしない) /
+受け付けない場面: 行の上でない / 明示の移動か既定で、先が元の親と同じ (字句。Explorer も同じフォルダへの既定のドロップでは何もしない) /
 元フォルダ自身か配下 / §6.4 の述語 / §4.1。
+本棚の配下はドラッグ中の判定に含めず、投入時に拒否する (§6.4・§16)。
 
 ### 4.3 OLE への返答と表示 (r1 P2-6・r2 P2-5)
 
@@ -110,8 +113,8 @@ Shift の明示の移動は下げない。要求は `operation` と `default_mov
 - ツリー行の上では data object へ `CFSTR_DROPDESCRIPTION` を `SetData` する: 予想が移動なら `DROPIMAGE_MOVE` + 「%1 へ移動」、
   コピーなら `DROPIMAGE_COPY` + 「%1 へコピー」、受け付けないなら `DROPIMAGE_NONE`。%1 はフォルダ名。変わったときだけ書く。
   行を離れたら・DragLeave・Drop の後は `DROPIMAGE_INVALID` に戻す (古い説明を残さない)。
-- 説明文のテキストを出すため、`SHDoDragDrop` の前に `IDragSourceHelper2::SetFlags(DSH_ALLOWDROPDESCRIPTIONTEXT)` を同じ data object に対して呼ぶ
-  (画像は作らない。`InitializeFrom*` は呼ばない)。テキストが出ない環境でも、バッジ (type) で移動かコピーかは分かる。
+- 送出側は何も足さない (`IDragSourceHelper2::SetFlags` は helper 自身の設定で data object と結び付かないため使わない。§14)。
+  Shell の generic image のまま、target が書く説明のバッジ (type) で移動かコピーかを示す。テキストが出るかは実機確認で見る。
 
 **出荷条件**: 実機確認 (§10 の 1) で「ツリー行の上の移動が、移動のバッジ (またはカーソル) として見え、コピーの＋だけにはならない」。
 満たさなければ、mIV の一覧からツリーへの**既定と Shift の移動を出荷せず** (どちらもコピーの扱いにする)、統括へ判断を返す。
@@ -128,7 +131,7 @@ mIV 内のドラッグは、ツリーの行以外 (一覧・ツリーの空白) 
 
 - 元の許可効果に COPY があり、`CF_HDROP` があれば COPY。無ければ NONE。修飾キー・preferred effect に関わらずコピー (Shift でもコピー)。
   説明は「%1 へコピー」(drag image は元が用意していれば表示される)。
-- Drop: `CF_HDROP` のパスで `ShellTransferRequest { intent: Explicit(Copy) }` を作り、**COPY を返す**。`PERFORMEDDROPEFFECT` 等は書かない。
+- Drop: `CF_HDROP` のパスで `ShellTransferRequest { operation: Copy, default_move_needs_volume_check: false, ... }` を作り、**COPY を返す**。`PERFORMEDDROPEFFECT` 等は書かない。
   今の一覧への落下 (winit が COPY を返し、mIV が後でコピーする) と同じ約束事で、元に削除を頼まない。元が一時ファイルを Drop 後に消す
   アプリでは、後のコピーが「見つからない」で失敗する (失われるものは無い。一覧への落下も同じ)。
 - 外部からの移動を正しく受けるには、Drop の中で同期に移動する (UI が止まる) か、元が非同期転送に対応している場合だけ完了を後で返す
@@ -175,6 +178,7 @@ App の消費: `update_phases.rs` の今の `dropped_files` の場所で `drops`
 - `pane_rect` (ツリーのパネル全体、ヘッダを含む)、`tree_clip` (ScrollArea の `inner_rect`)。
 - 行ごとに**行全体の rect** (`draw_folder_pane_row` が返す row_rect (`ui_folder_pane.rs:938`) を `tree_clip` で切ったもの) とパス。
   `FolderPaneLabelDisplay` に row_rect も記録する。
+  row_rect は開閉矢印から末尾 widget までを覆い、その左の深さ用インデントは含めない (表示・行高は変えず、インデントは下表の `TreeNonTarget`)。
 - **上に重なるレイヤーとの交差で行を外す**: その pass で見えているレイヤーのうち、ツリーのレイヤーより手前にあるもの (popup・メニュー・モーダル・
   ツールチップ・他の Area) の rect を集め、交差する行は対象外 (行全体を外す。点のサンプリングはしない)。
 - `client_size_px`、DPI (`GetDpiForWindow`)、`pixels_per_point`。
@@ -190,14 +194,16 @@ callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `Get
 
 ### 6.4 受付の述語と投入境界 (r1 P2-4)
 
-副作用の無い述語 `shell_transfer_admission(&self, target) -> Result<(), String>` を 1 つ作り、`admission` と投入時の両方で使う。
-見るもの: `FileOrganizeRequest` が `Hidden` (整理先の選択画面 `Selecting` もモーダルとして拒否、`Running` は消さない)、
+副作用の無い述語 `shell_transfer_admission(&self, ctx) -> Result<(), String>` を 1 つ作り、`admission` と投入時の両方で使う。
+見るもの (本棚の配下は §16 により投入の境界でだけ見る): `FileOrganizeRequest` が `Hidden` (整理先の選択画面 `Selecting` もモーダルとして拒否、`Running` は消さない)、
 `remote_session_blocks_local_control()`、終了要求 (shutdown・tray quit・root close)、`main_hwnd`、`viewer_mutation_modal_active()`、
-`sidecar_restore_active()`、`common_modal_dialog_open`、`folder_pane_disabled()`、先が本棚の配下でないこと。
+`sidecar_restore_active()`、`common_modal_dialog_open`、`folder_pane_disabled()`。本棚パスの解決は含めない。
 
-ツリーへの投入 `submit_shell_transfer(request)` は述語を**もう一度**見て、通ったときだけ `admit_book_append_followup_mutation()`
+ツリーへの投入 `submit_shell_transfer(request)` は述語を**もう一度**見て、次に `book_root_path()` を一回呼んで先が本棚自身・配下でないことを確かめる。
+本棚なら「本棚の中へは移動・コピーできません」と通知して何もしない。通ったときだけ `admit_book_append_followup_mutation()`
 → `transfer_items_async` → `Running`。通らなければ理由を通知して何もしない。整理先は今の `take_for_submission` で `Selecting` を一度消費してから、
 同じ述語 (Selecting の判定を除いた部分) と投入を使う (条件を 2 か所に書かない)。`admission` の計算では `admit_book_append_followup_mutation` を呼ばない。
+行の形・ドラッグ中のバッジ・メニューの有効判定は本棚も通常の行と同じ。本棚の拒否は入力を確定した境界に限るため、既定パスの同期解決を毎 pass に増やさない。
 
 「同時に 1 本」は整理先とツリーへのドロップの間の保証。一覧への落下 (§8) とツリーの貼り付け (§7) は今の Ctrl+V・一覧への落下と同じく並行し得る
 (全操作を横断する排他は作らない)。
@@ -211,7 +217,7 @@ callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `Get
   有効なのは、クリップボードにファイルがある (`IsClipboardFormatAvailable(CF_HDROP)`、メニューを開いたとき 1 回) かつ §6.4 の述語が通るとき。
   無効の理由はツールチップで示す。画像だけのクリップボードは対象外。
 - 実行: 今の Ctrl+V の処理 (`app.rs:64139` 付近の「ファイルなら」の枝) を、貼り付け先のフォルダを引数に取る 1 つの関数に切り出し、
-  Ctrl+V とツリーの両方から呼ぶ: (ツリーは述語を再確認) → `admit_book_append_followup_mutation()` → 先が現在の実フォルダのときだけ
+  Ctrl+V とツリーの両方から呼ぶ: (ツリーは述語を再確認し、`book_root_path()` を一回呼んで本棚自身・配下なら上記文言で拒否) → `admit_book_append_followup_mutation()` → 先が現在の実フォルダのときだけ
   `request_post_operation_selection_for_added_items(folder)` → `invoke_shell_folder_background_verb(hwnd, folder, Paste)` →
   `resync_egui_modifiers_from_os` → 失敗ならログと、**この呼び出しで選択要求を作ったときだけ** `cancel_post_operation_selection`。
   同期なので、間に別の選択要求は入らない。
@@ -219,6 +225,7 @@ callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `Get
   ネットワーク先では OS が諦めるまで UI が止まり得る。整理先を開く同期選択 (file-organize-destinations-plan §13、利用者了承) と同じ既知の例外として
   ui-responsiveness §4 に記録する。転送そのものは Shell が持つ (戻り値は verb 呼び出しの成否)。
 - Ctrl+V 自体の挙動は変えない (関数の切り出しだけ)。
+  Ctrl+V は既存の `current_favorite_target()` が操作時に本棚を除外済みなので、共通貼り付け関数でその解決を繰り返さない。
 
 ## 8. §1.821 一覧へのドロップ (Q5 = フォルダも受ける)
 
@@ -258,13 +265,13 @@ callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `Get
 
 自動テスト (製品バイナリは起動しない):
 
-- 操作の決定 (純関数): 修飾キー × ルートの同じ/別 × 内部/外部 × 外部の許可効果 × 同じ親・自身/配下・本棚配下・`excluded_virtual`・`failed_paths`。UNC・大文字小文字・末尾区切り。
+- 操作の決定 (純関数): 修飾キー × ルートの同じ/別 × 内部/外部 × 外部の許可効果 × 同じ親・自身/配下・`excluded_virtual`・`failed_paths`。UNC・大文字小文字・末尾区切り。本棚は操作確定の境界でのみ拒否する。
 - 既定の解決 (worker): 予告がコピーなら必ずコピー (r3 の反例 `D:\src` → `C:\MountD\dst` で同じボリュームでもコピー)。予告が既定の移動なら、ボリューム一致で移動、不一致・取得失敗でコピー。Shift の移動は下げない。ボリュームの取得は差し替え可能な形にして検査。
 - 当たり判定: 表示済みの pass の番号の形だけを使うこと。「表示は A、次の pass の形は B、present が省略された (番号が進まない) 後の次のフレームの描画前」で A を使う回帰、
   `request_discard` による 2 pass のフレーム (描かれなかった 1 pass 目の形を使わない)、番号の形が無ければ NONE、ppp 1.0/1.5、行全体の rect の端、
   `TreeNonTarget` (インデント・空白・スクロールバー・重なったレイヤーで外した行) が NONE で一覧へ流れないこと、大きさ・DPI 不一致で NONE。
 - vendor egui-wgpu: present が返ったときだけ番号を記録し、Outdated・skip では記録しないこと (既存の `winit_tests.rs` の形で、GPU が要る部分は既存の扱いに合わせる)。
-- 受付の述語: snapshot と投入で同じ述語。Running・Selecting・Remote・終了・モーダル・sidecar・本棚で worker を起動しない。整理先とツリーの両方の入口。snapshot の作成で本への追加の取り消しが失効しないこと。
+- 受付の述語: snapshot と投入で同じ述語。Running・Selecting・Remote・終了・モーダル・sidecar で worker を起動しない。整理先とツリーの両方の入口。snapshot の作成で本への追加の取り消しが失効しないこと。毎 pass の述語・行の形・メニュー有効判定では `book_root_path()` を呼ばず、投入時は一回だけ呼び本棚自身・配下を拒否すること。
 - 外部ドロップの返答: 偽の data object で、ツリー行への外部 Drop が COPY を返し、`PERFORMEDDROPEFFECT` 等を書かないこと。Shift でもコピーの要求になること。
 - 内部ドロップ: `InternalDrag.paths` 全件で要求を作ること (data object の `CF_HDROP` を読まない)。`failed_paths > 0` で受け付けない。
 - 一覧への落下: `GridFiles` が `handle_external_file_drop` に届き、内部ドラッグでは届かないこと。sidecar 復元中は捨てること。
@@ -314,3 +321,94 @@ Q1〜Q5 はすべて回答済み (§0)。残る判断は §4.3 の出荷条件�
 - r4 で直したもの: worker は予告を上げない (下げるだけ)。形の一致の規則 (r4 案) は破棄。
 - r4 (a4f40baec) REJECT: present が省略されるフレーム (Surface Outdated 等) があり、フレームの開始は描画済みの証拠にならない (P1×1)。
 - r5 で直したもの: 描画側 (vendor egui-wgpu) が present の返った pass の番号を記録し、当たり判定はその番号の形だけを使う。推定の仕組み (in_pass・一致規則・追加 repaint) を全部外した。
+
+## 14. B の実装着手と設計照合での停止 (2026-11-20)
+
+基点 `6f91f6058`、未コミットの中間差分。利用者の指示により、コンパイル・テスト・ビルドは一切実行していない。B の fmt・glyph 検査も未実施。
+
+- §4.3 の「同じ data object に対して `IDragSourceHelper2::SetFlags`」は、ローカルの windows 0.61.3 の生成 API と一致しない。`SetFlags(&self, dwflags: u32)` は helper 自身の設定だけで、data object を受け取るのは `InitializeFromWindow` / `InitializeFromBitmap`。独立に作った helper を保持して SetFlags だけ呼んでも、既存 Shell data object と関連付ける処理がない。
+- [Microsoft の仕様](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl/nn-shobjidl-idragsourcehelper2) も SetFlags を InitializeFrom* より前に呼ぶ手順を示す。一方、[DragDropVisuals の `_GetDataObject`](https://github.com/microsoft/Windows-classic-samples/blob/main/Samples/Win7Samples/winui/shell/appplatform/DragDropVisuals/DragDropVisuals.cpp) は Shell item の枝では BindToHandler を使い、独立した SetFlags は使わない。generic Shell image に target の drop description が表示されないと判明したわけではない。
+- 設計担当の判断が必要: 無関係な SetFlags を省き generic Shell image と target description を維持して実機の出荷条件へ進むか、InitializeFrom* を使う設計に改訂するか。後者は現在の「画像は作らない・InitializeFrom* は呼ばない」という採択方針に関わるため、実装者は選ばない。
+
+保存済みのコードは `src/main_drop_target.rs`、`src/app/main_drop.rs` の骨格、`src/file_drag.rs`、`src/shell_file_ops.rs`、`src/app.rs`、`src/folder_pane.rs`、`src/lib.rs`、`vendor/egui-wgpu/src/{presented_pass.rs,lib.rs,winit.rs}` と `PATCHES.md`。型の初期化・既存 literal・呼出接続・native submodule・UI・テストは未完了で、コンパイル可能な完成差分ではない。
+文書の下書きはマニュアル `grid.html` / `tut-file-ops.html`、本書、`file-organize-destinations-plan.md`、`folder-tree-refresh-plan.md`、`keymap-spec.md`、`spec.md`、`ui-responsiveness.md`。残る文書の更新と §10 のテスト追加は設計判断後に続ける。製品バイナリ・実 Shell・実 GUI は起動しておらず、コミットもしていない。
+
+設計担当の判断 (2026-11-20): **無関係な SetFlags を省き、generic Shell image と target の drop description のまま進める** (§4.3 を改訂)。
+`InitializeFrom*` で画像を作る案は採らない。表示の正否は §4.3 の出荷条件 (実機確認) で判断し、満たさなければ移動を出荷しない。
+
+## 15. B の実装の記録 (2026-11-20、`6f91f6058` 上の未コミット差分)
+
+§14 の停止後、利用者から設計担当の決定と続行指示を受領。独立した `IDragSourceHelper2::SetFlags` を除き、generic Shell image と target の drop description を使う。外部からの移動、custom IDropSource、自動展開・自動スクロール・強調表示、貼り付け worker は追加していない。
+
+### 変更ファイルと設計節との対応
+
+| 節 | ファイル | 実装 |
+| --- | --- | --- |
+| §6.2・§10 | `vendor/egui-wgpu/src/{presented_pass.rs,lib.rs,winit.rs,winit_tests.rs}`、`PATCHES.md` | `last_presented_pass` と `present_if_available`。present が返った後だけ viewport ごとの完了 pass 番号を公開。None・未帰還・2 pass・viewport 分離の fake-frame テスト |
+| §4〜6・§10 | `src/main_drop_target.rs`、`src/main_drop_target/{native.rs,tests.rs,native/tests.rs}` | ROOT の STA-bound `IDropTarget`、表示済み形の ring、純粋な操作決定、サイズ・DPI・行／空白の分類、CF_HDROP と表示 helper、説明の変更時更新と INVALID、失敗通知。偽の data object・表示 helper で COM callback を検査 |
+| §4.1・§4.4 | `src/file_drag.rs` | `with_internal_drag` で Shell 解決前の全パス・仮想除外・解決失敗件数を modal 呼び出し中だけ共有。外への COPY と既存 async data object を保持 |
+| §4.2 | `src/shell_file_ops.rs` | 要求に `default_move_needs_volume_check` を追加。`resolve_default_move` は検証前に既定 Move だけボリュームを調べ、異なる／求まらない場合 Copy へ下げる。差し替えた照会関数で回帰を記述 |
+| §6.1〜6.4・§7・§10 | `src/app/{main_drop.rs,main_drop_tests.rs,update_phases.rs}`、`src/app.rs`、`src/lib.rs` | 初回 HWND で登録、pass 末尾の形、共有受付と投入、DropRequest 消費、Ctrl+V と共通の同期貼り付け。旧 `internal_drop_pending` / `cursor_over_window` を撤去 |
+| §6.3・§7・§10 | `src/folder_pane.rs`、`src/ui_folder_pane.rs`、`src/ui_folder_pane_drop_tests.rs` | 行全体と panel の形、インデント除外、前面 layer との交差行除外、行を移動・選択しない右クリック「貼り付け」。形式照会はメニューを開いた時に一回。閉鎖・非表示・無効化でメニューの保持を終える |
+| §6.4・§9 | `src/ui_dialogs/file_organize.rs` | Selecting を一度消費して共通投入へ。完了時に先と各元の親へ `observe_accepted_folder`、現在フォルダの `Notified` 一回を維持 |
+| 型追従 | `src/app/{tests.rs,section375_c1_tests.rs}` | 既存の明示要求に新しい field の false を指定 |
+| §12 | `docs/{README.md,file-drag-drop-design.md,file-organize-destinations-plan.md,folder-tree-refresh-plan.md,keymap-spec.md,spec.md,ui-responsiveness.md}`、本書、`htdocs/mimageviewer/manual/{grid.html,tut-file-ops.html}` | 送受信・共有 owner・同期貼り付けの既知の例外・固定入力と、利用者向け操作説明を更新 |
+
+描画の寿命は入力の `label_display` の退役から分けた。`update_frame` 直後に可視行だけの `CapturedMainDropGeometry` を pass 内のローカル値へ捕捉し、`finish_folder_pane_presentation` 後も保持する。最後に後描画の前面 layer と交差する行を外して公開するため、描画後の hide でも画面に出たツリーが一覧領域に誤分類されず、show は未描画の形を先取りしない。新しい App の pending や永続状態は追加していない。
+
+### 実施した検査と静的レビュー
+
+- `cargo fmt` (引数なし): exit 0。
+- `python scripts/check_ui_glyphs.py`: exit 0、危険なグリフ 0 件。
+- `git diff --check`: exit 0 (Git の LF/CRLF 予告だけ)。
+- 新規のテスト記述は native 側 17 件 (vendor 2 件を含む)、App 側 15 件、UI 側 9 件。**実行はしていない**。
+- 独立した GPT-6.1 Sol / xhigh が API 署名・型・fixture・所有境界を最終静的レビューし、ソースレビューとして ACCEPT (未解決 P1/P2 なし)。§16 の P2 は、設計担当の判断に沿って本棚の判定を操作の境界へ移して解消した。コンパイル・実行の成功を示すレビューではない。
+
+### 設計担当が実行するテスト
+
+以下は **実行候補の filter** であり、成功結果ではない。B ではコンパイル・test・nextest・build・build script を一切実行していない。
+
+- core の追加・直接関連経路と既存ツリー／完了経路の回帰: `-E 'test(/main_drop|folder_tree_drop|native_drag_shared_payload|shell_transfer|file_organize|file_drop|folder_pane|section375_c1/)'`
+- vendor egui-wgpu (`--features winit` の graph): `-E 'test(/presented_pass_/)'`。新規 2 件は GPU 不要の fake-frame 試験。実 Surface acquire の Outdated 等から非 present 経路へ到達することは配置の静的確認だけで、実 GPU での実行証拠ではない。
+
+新たに実 Shell・実 GUI に依存する試験は追加していない。既存 `shell_transfer_real_copy_and_move_file_and_folder` と A の `dropped_paths_worker_real_copy_file_and_folder` は `#[ignore]` のまま、未実行。製品バイナリも起動していない。
+
+### snapshot と実機で残る確認
+
+PNG は変更していない。既存の見た目の照合対象は `folder_pane_location_light` / `folder_pane_location_dark` / `folder_pane_refresh_light` / `folder_pane_refresh_dark`。行の allocation・描画・行高は維持しており、既存 PNG の変更は想定しない。メニューの新規撮影候補は `folder_tree_paste_menu_enabled_light` / `folder_tree_paste_menu_enabled_dark` / `folder_tree_paste_menu_disabled_no_files` / `folder_tree_paste_menu_disabled_admission` (現時点の既存 snapshot 名ではない)。
+移動バッジの出荷条件、drop description のテキスト、Windows の競合・進捗・取消画面、エクスプローラーの Ctrl+Z、実 DPI・リサイズ・スクロール直後の位置、実クリップボードとの貼り付けは §10 の実機確認に残す。コンパイル結果も未確認で、設計担当からのエラー連絡があれば同じセッションで修正する。
+
+## 16. 既定本棚パスの同期 I/O — 投入時の判定へ変更 (2026-11-20)
+
+最終監査で `shell_transfer_target_is_books` → `Settings::books_root_path` → `books::default_books_root` → `capture::default_output_dir` → `pictures_root` → `SHGetKnownFolderPath(FOLDERID_Pictures, KF_FLAG_DEFAULT)` を確認した。`book_root=Some` はメモリ値だけだが、None の既定では存在確認を含む API へ到達するため、新しい毎 pass／行判定から UI の同期 I/O を増やしてしまう。独立レビューでも未解決 P2 とされた。
+
+既存の `BookShelfOwner.snapshot` は本棚を開いた時だけの値で、常用の正本にはできない。`known_folders` も同期解決であり、クリップボードの `DestinationResolution` は初回 pass 後に開始される worker なので、常に解決済みとも扱えない。USERPROFILE の推測先・`KF_FLAG_DONT_VERIFY` への変更・未解決時に黙って対象を許可する回避策は採らない。
+
+利用者へ以下の三案を質問したが、いずれも採らない判断を受領した (末尾)。以下は比較の記録:
+
+1. 推奨: 正規の既定本棚パスを `data_dir::init` 後・egui 構築／GUI worker 開始前に一度解決し、全 books consumer がランタイムの共通値を読む。受付待ちを増やさないが、実行中の Windows「ピクチャ」保存先変更は次回起動で反映する仕様になる。明示 `Settings.book_root` の変更は即時反映を維持する。
+2. 既存の保存先 resolver の結果を共有するよう拡張し、未解決中の転送受付を保留する。ただし整理先にも新しい一時制限が加わる。
+3. この点を設計担当へ戻す。
+
+起動前 pin を選ぶなら変更先は `books` の既定 root owner と `lib.rs` の初期化境界になる。テストは通常の起動を通らず `data_dir` override もあるため、一時パスをプロセス全体へ固定しない扱いも必要になる。この案は不採用で、既定 root owner・起動経路・resolver は変更しない。
+
+設計担当の判断 (2026-11-20): **1〜3 のどれも採らず、本棚の配下の判定を毎 pass の `admission` と行の判定から外す**。
+本棚の配下かどうかは、投入の境界 (`submit_shell_transfer` と、ツリーの「貼り付け」を押した時) でだけ `book_root_path()` を呼んで確かめる
+(今の Ctrl+V・一覧へのドロップが `current_favorite_target()` で操作のときに 1 回呼ぶのと同じ時点・同じ関数。新しい同期 I/O の入口は増えない)。
+ドラッグ中は本棚の行にも移動/コピーのバッジが出るが、落とすと「本棚の中へは移動・コピーできません」と通知して何もしない。
+「貼り付け」の有効/無効の判定にも本棚の判定は入れない (押した時に断る)。起動前の pin・resolver の共有・受付の保留は作らない。
+§4.2 の「受け付けない場面」と §6.4 の述語から「先が本棚の配下」を外し、投入の境界の再確認に移す。
+
+実装では `shell_transfer_admission`・行の形・メニューの有効判定から本棚パスの解決を除去した。`shell_transfer_submission_admission_with` を転送投入とツリーの貼り付けで共有し、既存の `book_root_path()` を操作時に一回だけ呼ぶ。Ctrl+V は既存の確認を保ち、共通の貼り付け処理で重ねて解決しない。起動前の pin・cache・resolver の共有・受付の保留は追加していない。
+
+回帰テストには、未設定の本棚でも pass の受付・形の公開で解決が 0 回、ツリー・整理先・貼り付けの各投入で解決が 1 回となること、本棚自身・配下の拒否では worker・Shell・選択要求・本への追加の取り消し状態に副作用を与えないことを記述した。メニューは本棚の行でも有効になり、押した時に通知して拒否する。いずれも未実行で、設計担当の検証へ引き継ぐ。
+
+## 17. 設計担当の nextest 結果に対する fixture 修正 (2026-11-20)
+
+設計担当より、core の filter `main_drop|folder_tree_drop|native_drag_shared_payload|shell_transfer|file_organize|file_drop|folder_pane|section375_c1|dropped_paths` でコンパイル成功、263 件中 260 件成功・3 件失敗の報告を受領した。設計担当が修正した MouseWheel の `phase` / `source`、`IAgileObject` の import、vendor の `Id::unique` は維持する。
+
+- snapshot を作る二つのテストは `items` が 1 件、`thumbnails` が 0 件の不正な fixture だった。`src/app/tests.rs` の既存 `seed_snapshot_context` を全 OS の共有テスト helper として公開し、`src/app.rs` の test-only 再 export を介して `src/app/main_drop_tests.rs` と `src/ui_folder_pane_drop_tests.rs` で使う。項目・サムネイル・メタデータ・可視 index を揃え、製品の debug assert は変更しない。
+- メニュー退役のテストの exit 2 (行が消える場合) は `FolderPaneState::default()` を空状態と誤認していた。実際は実機のドライブを取得して行を持つため、既存の空行時の閉鎖経路を通らなかった。テストでドライブ候補と選択ドライブを明示的に空にし、行が空であることを確認してから描画する。chrome 非表示・ツリー非表示の二経路は既存の finish 処理が直接閉じるため、フレーム待ちや製品コードの変更は不要。失敗時に exit 番号が分かる assert メッセージも追加した。
+
+修正後は `cargo fmt` (引数なし)・`python scripts/check_ui_glyphs.py`・`git diff --check` がいずれも exit 0 (危険グリフ 0 件、Git の LF/CRLF 予告のみ)。コンパイル・テストは実装者側では実行しておらず、再実行は設計担当へ引き継ぐ。
+独立した GPT-6.1 Sol / xhigh による追補の静的レビューは ACCEPT、未解決 P1/P2 なし。テストの実行成功を示すものではない。

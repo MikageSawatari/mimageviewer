@@ -721,6 +721,7 @@ pub(crate) use archive_inner_book::{
 #[cfg(all(test, windows))]
 mod context_state_tests;
 mod logic_service;
+pub(crate) mod main_drop;
 mod pinned_search;
 pub(crate) mod root_lifecycle;
 mod search_request;
@@ -19451,6 +19452,8 @@ pub struct App {
     /// `ViewportCommand::Visible(false)` を使うと eframe が update を呼ばなくなり
     /// トレイメニューから復帰できなくなるため、Win32 直叩きに切り替えた。
     pub(crate) main_hwnd: Option<isize>,
+    /// ROOT-only OLE snapshots and requests; callbacks never borrow App.
+    pub(crate) main_drop: crate::main_drop_target::SharedMainDrop,
     /// フレーム末尾で実行する native ファイル D&D の予約 (`docs/file-drag-drop-design.md`)。
     pub(crate) pending_native_drag: Option<PendingNativeDrag>,
     /// 直前フレームで native ドラッグ (`SHDoDragDrop`) を実行したか。
@@ -19458,12 +19461,6 @@ pub struct App {
     /// ため、egui のポインタ状態が固着する。このフラグが立っている 1 フレームは
     /// 冒頭でポインタ状態をリセットし、ドラッグ検出もスキップする (§6.1)。
     pub(crate) native_drag_just_finished: bool,
-    /// mIV 自身のドラッグがこの mIV ウィンドウ上へ落とされた (跳ね返り) ことを示す。
-    /// `SHDoDragDrop` 完了時にドロップ座標が mIV ウィンドウ上なら立て、直後フレームの
-    /// `dropped_files` 受け取りで消費する。これで mIV 内 D&D は受け取り扱いにせず、
-    /// 同じフォルダへの無用なコピーを防ぐ。エクスプローラ等からのドロップはこの経路に
-    /// 乗らないので通常どおり受け取れる。
-    pub(crate) internal_drop_pending: bool,
     #[cfg(windows)]
     /// Native fullscreen presenter の HWND を最後に VST bridge owner として同期した値。
     /// set_chain_owner は cross-process IPC なので、毎フレーム送らないための guard。
@@ -21868,9 +21865,9 @@ impl App {
             update_check_last_spawn: None,
             show_update_dialog: false,
             main_hwnd: None,
+            main_drop: Default::default(),
             pending_native_drag: None,
             native_drag_just_finished: false,
-            internal_drop_pending: false,
             #[cfg(windows)]
             native_video_owner_synced_hwnd: 0,
             #[cfg(windows)]
@@ -52536,33 +52533,6 @@ impl App {
         }
     }
 
-    /// 現在のマウスカーソル位置のウィンドウが `hwnd` (= mIV メインウィンドウ) かを返す。
-    /// native ドラッグの落下先が mIV 自身かを `SHDoDragDrop` 完了時に判定するのに使う。
-    #[cfg(windows)]
-    fn cursor_over_window(hwnd: isize) -> bool {
-        use windows::Win32::Foundation::{HWND, POINT};
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GA_ROOT, GetAncestor, GetCursorPos, WindowFromPoint,
-        };
-        unsafe {
-            let mut pt = POINT::default();
-            if GetCursorPos(&mut pt).is_err() {
-                return false;
-            }
-            let under = WindowFromPoint(pt);
-            if under.0.is_null() {
-                return false;
-            }
-            // 子ウィンドウ上に落ちてもルートで比較する。
-            GetAncestor(under, GA_ROOT) == HWND(hwnd as *mut core::ffi::c_void)
-        }
-    }
-
-    #[cfg(not(windows))]
-    fn cursor_over_window(_hwnd: isize) -> bool {
-        false
-    }
-
     /// エクスプローラ等から mIV ウィンドウへドロップされたファイルを、現在表示中の
     /// 実フォルダへコピーする (mIV → 外部 のドラッグ送出と対称の受け取り方向)。
     ///
@@ -53027,6 +52997,8 @@ impl App {
     }
 
     pub(crate) fn book_root_path(&self) -> PathBuf {
+        #[cfg(test)]
+        main_drop::record_books_root_resolution_for_test();
         self.settings.books_root_path()
     }
 
@@ -64062,47 +64034,25 @@ impl App {
             self.handle_clipboard_paste_with(
                 ctx,
                 crate::clipboard_capture::manual_kind,
-                |app, ctx, kind, hwnd, folder| {
-                    match kind {
-                        crate::clipboard_capture::data::ClipboardKind::Image
-                        | crate::clipboard_capture::data::ClipboardKind::Html => {
-                            if !app.clipboard_capture_admission_allowed() {
-                                app.show_feedback_warning_on(
-                                    "一覧画面で Ctrl+V を押すと開けます".into(),
-                                    ActionSurface::MainWindow,
-                                );
-                                return;
-                            }
-                            if let Err(error) = app
-                                .clipboard_capture_service
-                                .manual_capture(kind, folder, ctx)
-                            {
-                                app.show_feedback_warning_on(error, ActionSurface::MainWindow);
-                            }
+                |app, ctx, kind, _hwnd, folder| match kind {
+                    crate::clipboard_capture::data::ClipboardKind::Image
+                    | crate::clipboard_capture::data::ClipboardKind::Html => {
+                        if !app.clipboard_capture_admission_allowed() {
+                            app.show_feedback_warning_on(
+                                "一覧画面で Ctrl+V を押すと開けます".into(),
+                                ActionSurface::MainWindow,
+                            );
+                            return;
                         }
-                        _ => {
-                            if !app.admit_book_append_followup_mutation() {
-                                return;
-                            }
-                            // Keep the Shell's existing added-item selection behavior.
-                            app.request_post_operation_selection_for_added_items(folder.clone());
-                            let result =
-                                crate::native_context_menu::invoke_shell_folder_background_verb(
-                                    hwnd,
-                                    &folder,
-                                    crate::native_context_menu::ShellClipboardVerb::Paste,
-                                );
-                            Self::resync_egui_modifiers_from_os(ctx);
-                            match result {
-                                Ok(()) => ctx.request_repaint(),
-                                Err(error) => {
-                                    crate::logger::log(format!(
-                                        "shell_clipboard: Paste failed: {error}"
-                                    ));
-                                    app.cancel_post_operation_selection("shell_paste_failed");
-                                }
-                            }
+                        if let Err(error) = app
+                            .clipboard_capture_service
+                            .manual_capture(kind, folder, ctx)
+                        {
+                            app.show_feedback_warning_on(error, ActionSurface::MainWindow);
                         }
+                    }
+                    _ => {
+                        app.paste_files_to_folder(ctx, folder);
                     }
                 },
             );
@@ -102823,6 +102773,7 @@ impl eframe::App for App {
         self.poll_image_folder_zip(ctx);
         self.poll_depth_export();
         let main_chrome_drawn = self.update_frame(ui, frame);
+        let main_drop_geometry = self.capture_main_drop_geometry(ctx);
         self.finish_folder_pane_presentation(ctx, main_chrome_drawn);
         self.render_update_after_frame(ctx);
         self.render_update_owner_dialogs(ctx);
@@ -102864,6 +102815,7 @@ impl eframe::App for App {
         if let Some(trace) = first_update_trace {
             trace.finish(miv_startup::Outcome::Ok);
         }
+        self.publish_main_drop_geometry(ctx, main_drop_geometry);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -105651,6 +105603,9 @@ mod clear_history_tests;
 pub(crate) use tests::phase_c_support::{
     AppTestEnv as AppTestEnvForTest, setup_app as setup_app_for_test,
 };
+
+#[cfg(test)]
+pub(crate) use tests::seed_snapshot_context as seed_snapshot_context_for_test;
 
 #[cfg(all(test, windows))]
 mod now_playing_lifecycle_tests {

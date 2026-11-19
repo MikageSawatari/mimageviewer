@@ -89,6 +89,12 @@ fixtureから描く `folder_location_menu_dark`（260×230、10,055 bytes）を�
 並び順・欠損・重複・表示OFFは共通列挙のstateテスト、実フォルダ取得はKnown Folder APIの
 専用テストで分ける。更新指定なしの対象PNG比較は成功。製品起動・実機検収の証拠とはしない。
 
+§1.464 のツリー行の貼り付けメニューは、`folder_tree_paste_menu_dark`（有効・Dark）、
+`folder_tree_paste_menu_light`（有効・Light）、`folder_tree_paste_menu_disabled_dark`（無効・Dark）の
+3枚（各260×130、計14,764 bytes）を追加する。固定のフォルダ行を右クリックし、製品と共通の
+popup rendererで「貼り付け」の文字・明暗・無効表示を描く。有効/無効はfixtureの引数で渡し、
+App・実環境のクリップボード・ファイルシステム・Shellには触れない。PNGは設計担当が生成し、3枚の文字の欠け・重なりと無効の淡色表示を目視確認した。既存PNGの変更はない。
+
 v5受入B（2026-11-04）の登録確認は`agent_registration_confirmation_small_light`
 （1093×614、70,109 bytes）を1枚追加する。実環境・設定ファイル・登録workerを使わない
 固定fixtureで製品と共通の確認Windowを描く。本文・設定path・追加する内容・backupの説明・

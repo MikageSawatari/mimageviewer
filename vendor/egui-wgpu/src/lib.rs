@@ -26,6 +26,8 @@ mod adapter_candidates;
 /// Low-level painting of [`egui`](https://github.com/emilk/egui) on [`wgpu`].
 pub mod atlas_diag;
 mod mipmap;
+#[cfg(feature = "winit")]
+mod presented_pass;
 mod renderer;
 mod startup_diagnostics;
 mod texture_delivery;
@@ -33,6 +35,8 @@ mod texture_delivery;
 mod setup;
 
 pub use mipmap::{MipmapGenerator, mip_chain_texel_count, mip_level_count};
+#[cfg(feature = "winit")]
+pub use presented_pass::last_presented_pass;
 pub use renderer::*;
 pub use setup::{
     EguiDisplayHandle, NativeAdapterCandidatesMethod, NativeAdapterSelectorMethod, WgpuSetup,

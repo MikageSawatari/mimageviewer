@@ -51,6 +51,7 @@
 | pane監視session (新設、pane内所有) | workerが非再帰watchを所有。callbackは登録時のparent keyと登録ticketを付けたdirtyヒントだけ送る | paneが現在session・登録ticket・需要集合を照合して走査要求へ変換。callbackからnodeを変更しない |
 | 一覧の `CurrentFolderWatch` / `ExternalRescanPending` | **ViewerContextBundle所有**。mainのwatch epoch、dirty/cutoff、観測record、generation、source、optionsを既存worker/受理処理が扱う | `poll_external_rescan` の既存owner検証と `accepted_now` が受理を決める。paneへ渡すのは受理後の実親pathだけ。watch / itemsの所有をpaneへ移さない |
 | `folder_pane_open_pending` | ツリーの行を開く能動操作。名前は似ているがnode列挙とは別のviewer-context所有owner | 既存navigation採用処理。自動refreshはこれを作成・取消・再開しない |
+| main の Shell 転送の完了 (§1.464) | 整理先とツリーへのドロップが共有する `FileOrganizeRequest::Running` の確定要求 | `poll_file_organize` が先のフォルダと各元の親へ `observe_accepted_folder(path)` を渡す。path 自身の直下を再確認し、viewer context の状態は変更しない |
 
 一覧→ツリーの橋は `poll_current_folder_watch` の生通知には置かず、**`poll_external_rescan` の `accepted_now == true` の直後**に置く。既存のowner/source/generation/projection/subscription検証を通過し、要求元contextがmainであることを明示する。`Different` のdefer/拒否/失敗は通知しない。`Equal` も、一覧のfilter/投影とツリーのdirectory集合は異なるため確認のヒントを送る。対応するツリー親は列挙した `folder` 自身であり、常に `folder.parent()` を更新するという意味ではない。
 
@@ -59,6 +60,8 @@ mainがpark中にそのownerの受理が行われても、捕捉したmain ident
 `FolderPaneState` はbundle swap対象でなく、`current_folder_watch` 等は `viewer_context_registry.rs` のswap対象である。この区別を維持する。pane同期・監視需要計算・active表示の更新は既存main chrome境界で行い、全contextのmounted serviceへ追加しない。独立readerの受動購読を復活させず、mainの購読を流用/取消しない。detached述語やviewportの変更は本案の範囲外であり、必要になったら実装前にリワーク計画§2/§11の合意へ戻す。
 
 ## 5. nodeの状態と単一の採用境界
+
+§1.464 の転送完了も既存の `observe_accepted_folder` を使う。新しい node や走査 owner を作らず、現在需要がある親だけを再取得する。通常一覧の `Notified` は従来どおり現在地が元の親・先のときだけ一度要求する。
 
 `loaded` / `loading` / `resolved_options` と別のpending配列に、さらに `dirty: bool` を足す方式は避ける。今回触るnode列挙の所有だけを次のtyped stateへ集約する (名称は実装時に調整可)。
 

@@ -1294,7 +1294,8 @@ impl Painter {
             );
         }
 
-        if let Some(output_frame) = output_frame {
+        let presented = crate::presented_pass::present_if_available(
+            &self.context, viewport_id, output_frame, |output_frame| {
             if let Some(window) = window {
                 window.pre_present_notify();
             }
@@ -1306,6 +1307,9 @@ impl Painter {
                 self.config.startup_begin(StartupGpuStage::Present);
             }
             render_state.queue.present(output_frame);
+            start
+        });
+        if let Some(start) = presented {
             if observe {
                 self.config.startup_end(StartupGpuStage::Present, true);
                 if let Some(event) = self.startup_present.returned(viewport_id, startup_tag) {

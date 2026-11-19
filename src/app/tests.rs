@@ -1364,6 +1364,7 @@ mod file_organize_tests {
                             sources: vec![source.join("item.png")],
                             destination: destination.clone(),
                             operation: ShellTransferOperation::Move,
+                            default_move_needs_volume_check: false,
                         },
                         rx,
                     }));
@@ -9953,7 +9954,6 @@ fn metadata_request_bakes_context_identity_across_bundleless_window() {
 ///
 /// `App::snapshot` が App-global だった頃は、2 つ目の context が snapshot を張ると
 /// 1 つ目の退避を**上書きして復元不能**にしていた。
-#[cfg(windows)]
 fn snapshot_test_items(paths: &[&str]) -> Vec<GridItem> {
     paths
         .iter()
@@ -9961,8 +9961,7 @@ fn snapshot_test_items(paths: &[&str]) -> Vec<GridItem> {
         .collect()
 }
 
-#[cfg(windows)]
-fn seed_snapshot_context(app: &mut App, folder: &str, paths: &[&str]) {
+pub(crate) fn seed_snapshot_context(app: &mut App, folder: &str, paths: &[&str]) {
     app.items = snapshot_test_items(paths);
     app.thumbnails = vec![ThumbnailState::Pending; app.items.len()];
     app.image_metas = vec![None; app.items.len()];

@@ -187,6 +187,71 @@ fn folder_location_menu_dark() {
     );
 }
 
+fn snapshot_folder_tree_paste_menu(
+    name: &str,
+    theme: mimageviewer::os_theme::ResolvedTheme,
+    enabled: bool,
+) {
+    let row_rect = std::rc::Rc::new(std::cell::Cell::new(egui::Rect::NOTHING));
+    let drawn_rect = row_rect.clone();
+    snapshot_with_theme_contrast_and_size_with_interaction(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(260.0, 130.0),
+        move |ui| {
+            drawn_rect.set(mimageviewer::draw_folder_tree_paste_menu_snapshot_fixture(
+                ui, enabled,
+            ));
+        },
+        move |harness| {
+            let pos = row_rect.get().center();
+            harness.hover_at(pos);
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.step();
+            }
+            // Keep the snapshot independent of the folder-path hover tooltip.
+            harness.hover_at(egui::pos2(245.0, 115.0));
+            harness.run();
+            let paste = harness.get_by_label("貼り付け");
+            assert_eq!(paste.accesskit_node().is_disabled(), !enabled);
+        },
+    );
+}
+
+#[test]
+fn folder_tree_paste_menu_dark() {
+    snapshot_folder_tree_paste_menu(
+        "folder_tree_paste_menu_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        true,
+    );
+}
+
+#[test]
+fn folder_tree_paste_menu_light() {
+    snapshot_folder_tree_paste_menu(
+        "folder_tree_paste_menu_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        true,
+    );
+}
+
+#[test]
+fn folder_tree_paste_menu_disabled_dark() {
+    snapshot_folder_tree_paste_menu(
+        "folder_tree_paste_menu_disabled_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        false,
+    );
+}
+
 fn agent_integration_snapshot(name: &str, theme: mimageviewer::os_theme::ResolvedTheme, level: u8) {
     snapshot_with_theme_at_size(name, theme, egui::vec2(1000.0, 1150.0), None, move |ui| {
         mimageviewer::draw_agent_integration_snapshot_fixture(ui, level)
