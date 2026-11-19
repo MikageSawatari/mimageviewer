@@ -63,11 +63,15 @@
 - 2026-11-19 の `check-dependency-updates.ps1` で更新があったもの: PDFium (chromium/8138 → 8165)、Rust (1.99.1 → 1.100.0)、mIV Sound の元 EffeTune Mixwright (v0.17.0 → v0.18.1)、普通の crate 67 個 (cargo update の範囲内)。FFmpeg は手元の n7.1.5-16 のほうが新しく、検査スクリプトの比較が名前順のため「新しい版あり」と出た (更新不要、検査の改善候補)。
 - 手順はリリース手順 Phase 2 (6.3・7〜11) と各依存物の記録 (`PATCHES.md` / `MIV-PATCH.md`)。Rust を上げるときは bench と tantivy の生成コードの確認 (Phase 2 9.5)。mIV Sound は派生版の手順 (effetune-fork-plan) と VirusTotal の検査が要る。
 
-### 1.815 窓の閲覧表示で上下 HUD・サムネイルストリップを固定表示していると、ページ内スクロール (上下キー・ホイール・K / J) が動かない — v5.4.0 の実機確認から (2026-11-19)
+### 1.815 窓の閲覧表示で、表示領域の丸めの食い違いによりページ内スクロール (上下キー・ホイール・K / J) が動かない — v5.4.0 の実機確認から (2026-11-19)
 
-- 状態: **調査中 (v5.4.0 の公開を止める、利用者 2026-11-19「こちらを直してからリリースしたいと思います」)**。担当は §1.474 のセッション。
+- 状態: **実装・対象自動検証済み (2026-11-19)、未コミット・master 未取り込み・修正後の実機未確認**。`fix-815-viewport-rounding`、基点 `ffaa17474`。本体 lib 全件と build-dev、コミットは設計担当へ引き継ぐ。v5.4.0 の公開を止める (利用者 2026-11-19「こちらを直してからリリースしたいと思います」)。担当は §1.474 のセッション。
 - 観測 (利用者、インストール版 v5.4.0 の配布ビルド): 窓の閲覧表示で、上下キー・通常のホイールを「ページ内スクロール」にし横幅フィットにしても動かない。Ctrl+ホイールで拡大した後の K / J も動かない。フルスクリーンでは動く。上下の HUD とサムネイルストリップは固定表示。Z の部分拡大ズーム中に K / J が効かないのはマニュアルどおり。
-- 疑い (コード読み、未確認): `apply_fs_page_scroll_key` 先頭の `fs_scroll_layout_matches` の無言の早期 return。固定のバー・ストリップで縮んだ画像領域と、判定に使う領域の食い違い。サブ PC の確認 (scroll474・pan806) は全画面の手順だけだった。
+- 原因 (設計担当の実描画経路のヘッドレス調査、実装担当も回帰テストで再現): `CentralPanel` は `round_ui()` 後の領域を描画するが、入力側2か所が丸め前の `input.content_rect()` を読んでいた。窓 1173.3334×1236.6667 point では描画側が 1173.34375×1236.65625 となり、`fs_scroll_layout_matches` が偽になる。固定 HUD・ストリップの有無に限らない。サブ PC の以前の確認 (scroll474・pan806) は全画面の手順だけだった。
+- 修正: `in_page_scroll.rs` の private helper `rounded_content_rect_for_viewport` で、宛先 viewport の content rect を `Context::content_rect()` と同じ規則で丸める。前面メニュー照会と入力幾何の2か所から共用し、viewport の選択・配送・製品の可視性・幾何一致の条件は変えない。
+- 回帰: `initial_placement/tests/viewport_input.rs` の `fractional_window_viewport_down_scrolls_without_turning_pages`、`fractional_window_viewport_wheel_scrolls_without_turning_pages`、`fractional_window_viewport_default_k_j_scroll_independently_of_page_turn_settings`。実描画経路・横幅フィット・縦長ページで、HUD 固定2通り × 下部バー/ストリップ固定2通り × Single/RtlCover × DPI 1.0/1.25/1.5。K/J は上下キー・ホイールのページ送り設定でも確認する (計96条件)。pan が動き、ページが送られず、描画と入力の幾何が一致することを検査する。
+- 実行 (いずれも `run-heavy.ps1 -Owner codex-815` 経由の範囲限定 nextest): 製品コード未修正では追加3件がすべて pan 不動で失敗 (成功0・失敗3、run ID `235a3f73-8a12-4410-84a8-99b64efbd67f`)。修正後は `test(/viewport_input/) | test(/in_page_scroll/) | test(/front_popup_input_tests/)` の136件すべて成功 (run ID `4f3f7ca6-80e8-4620-8ba8-248c133b8f02`)。ワークスペース全体へ `cargo fmt` 実施。exe 起動なし。
+- 横断調査: 丸め前の `input.content_rect()` を読む製品コードは元の2か所だけ。別候補として `page_overview.rs` の `page_overview_surface_for_viewport` は別 viewport の未丸めの `inner_rect` サイズから layout を作り、`reflow_page_overview_to_surface` が描画キャッシュの viewport 等と厳密比較する。小数の窓で不要な reflow が起きる可能性は未検証で、今回は変更しない (対応は設計担当判断)。紙めくりの `PageTurnUnitBinding::matches_viewport_geometry` は記録・入力とも丸め済みの `ctx.content_rect()` を使用していた。
 
 ### 1.814 全件テスト (test-full) で負荷や実機のキー状態により不安定になるテスト — v5.4.0 向けの取り込み後の全件から (2026-11-18)
 

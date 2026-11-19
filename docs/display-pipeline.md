@@ -2091,6 +2091,9 @@ items 世代、画面上の左右順・役割・片側配置を含む実ペー�
 frame、Z・比較・分析・360・3D などの経路には印を付けない。
 
 入力時は描画と同じ helper で現在単位の鍵を作り、対象 fullscreen viewport の矩形・DPI を使って照合する。
+対象 viewport の content rect は、描画側の `CentralPanel` / `Context::content_rect()` と同じ
+`GuiRounding::round_ui()` で丸めてから使う (§1.815)。前面メニューの宛先矩形も同じ helper を通す。
+丸め前の窓寸法との食い違いを入力境界でなくし、幾何の一致判定に許容誤差や不一致時の補完は加えない。
 同期読み込みや前回値による補完はせず、不一致・幾何未取得・navigation 待ち・紙めくり中は入力を消費するだけで
 持ち越さない。照合するのは raw の `fs_zoom` ではなく、描画へ渡す実効倍率
 （`fs_zoom_pan()` が None なら1、Someならその倍率）と layout の描画時の実効倍率。

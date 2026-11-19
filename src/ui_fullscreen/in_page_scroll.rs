@@ -1,5 +1,6 @@
 //! Page-local scrolling uses the drawn geometry and the normal pan constraint.
 use super::*;
+use egui::emath::GuiRounding;
 use egui::{Rect, Vec2};
 
 #[cfg(test)]
@@ -10,6 +11,13 @@ mod interaction_tests;
 mod overflow_tests;
 #[cfg(test)]
 mod review_regression_tests;
+
+/// 描画側の CentralPanel / `Context::content_rect()` と同じ丸めにする。
+/// 丸めないと、1/32 point の倍数でない窓で記録と入力の viewport が一致しない (§1.815)。
+fn rounded_content_rect_for_viewport(ctx: &egui::Context, viewport: egui::ViewportId) -> Rect {
+    ctx.input_for(viewport, |input| input.content_rect())
+        .round_ui()
+}
 
 /// Remove only the pan used for the actual paint. The App boundary already
 /// checked the painted effective zoom; no rectangle is projected to another scale.
@@ -410,7 +418,7 @@ impl App {
         if viewport != ctx.viewport_id() && self.fs_front_menu_presented(ctx, ctx.content_rect()) {
             return true;
         }
-        let rect = ctx.input_for(viewport, |input| input.content_rect());
+        let rect = rounded_content_rect_for_viewport(ctx, viewport);
         self.fs_front_menu_presented_for_viewport(ctx, rect, viewport)
     }
 
@@ -445,9 +453,8 @@ impl App {
         // ROOT can dispatch keys for another viewport. Read the destination's
         // current size and DPI, never the handler Context's current viewport.
         let target = self.fs_page_scroll_destination_viewport();
-        let (full_rect, ppp) = ctx.input_for(target, |input| {
-            (input.content_rect(), input.pixels_per_point())
-        });
+        let full_rect = rounded_content_rect_for_viewport(ctx, target);
+        let ppp = ctx.input_for(target, |input| input.pixels_per_point());
         if !full_rect.is_finite() || !full_rect.is_positive() {
             return None;
         }
