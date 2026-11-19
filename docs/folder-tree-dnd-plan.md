@@ -2,7 +2,7 @@
 
 2026-11-19〜20 設計 (ClaudeCode)。worktree `G:\home\mimageviewer-treednd464`、branch `treednd-464`、基点 master `ca6686d93`。
 要件の正本は [next-release-backlog.md §1.464・§1.821](next-release-backlog.md)。
-**状態: 設計 r4 (独立レビュー r1〜r3 = REJECT を反映。仕組みを足すより組み合わせを減らした。§13)。実装前の再レビュー待ち。**
+**状態: 設計 r5 (独立レビュー r1〜r4 = REJECT を反映。仕組みを足すより組み合わせを減らした。§13)。実装前の再レビュー待ち。**
 
 要望の要旨 (5ch): >>444 ツリーへファイルをドロップできず、右クリックの貼り付けもできない。>>707 読み終えたファイルを
 `_mita` フォルダへ D&D したい (内部ドラッグで「＋」カーソルなのに何も起きない)。固定先へ送る「ファイル整理先」(v4.4.0 出荷)
@@ -151,15 +151,15 @@ callback は UI スレッドで (a) winit のメッセージ処理の中 (外部
 
 `MainDropShared`:
 
-- `latest: DropGeometry` — App が**各 pass の最後**に、その pass の形 (§6.3) で上書きする。
-- `presented: DropGeometry` — App が **pass の最初で `ctx.current_pass_index() == 0` (新しいフレームの最初の pass) のとき**に `latest` から移す。
-  そのとき `latest` は前のフレームの最後の pass で、次のフレームが始まる前に描画・present されている (同じフレームの 2 pass 目の最初では移さない)。
-- **画面に出ている形は、いつでも `presented` か `latest` のどちらか** (前のフレームの描画前・描画後・次のフレームの pass の途中・eframe が
-  App から戻った後で描画する前のどこで callback が来ても)。そこで callback は**両方の形で同じ行 (同じパス) に当たる点だけ**を `TreeRow` とし、
-  違えば NONE にする (r3 P1-2)。描画の完了時点を知る仕組みや `in_pass` の選び分けは要らない。
-  ツリーが変わった直後 (スクロール・再読み込み) は、変わった位置が 1 フレームの間だけ受け付けられない。外部ドラッグの callback が不一致を見たら
-  `request_repaint` し、次のフレームで 2 つの形が揃う。mIV 内ドラッグ中はフレームが進まないので、そのドラッグの間は不一致の位置を受け付けない
-  (ドラッグを始めたフレームでちょうどツリーが動いた場合だけ)。
+- `geometries: VecDeque<(u64, DropGeometry)>` — App が**各 pass の最後**に、その pass の形 (§6.3) を **pass の番号**
+  (`ctx.cumulative_pass_nr() + 1` = その pass が終わった後の完了 pass 数) 付きで積む。表示済みの番号より古いものは捨てる (残すのは数個)。
+- **表示済みの pass の番号は描画側から受け取る** (r3 P1-2・r4 P1-1): vendor の egui-wgpu (`winit.rs` の `render_state.queue.present(output_frame)` の直後、
+  既存の root present observer と同じ位置) で、ROOT の present が実際に返ったときだけ、`ctx.cumulative_pass_nr_for(ROOT)` (= 描いた最後の pass の番号) を
+  ctx の temp data に記録する。公開 helper `egui_wgpu::last_presented_pass(ctx, viewport) -> Option<u64>` で読む。Surface の `Outdated`・skip・capture だけの
+  ときは記録しない (present していないので)。パッチは `vendor/egui-wgpu/PATCHES.md` に 1 行足す。
+- callback は `last_presented_pass` の番号の形だけを使う。その番号の形が無い (まだ 1 度も描いていない・古すぎる) ときは NONE。
+  画面に出ている形そのものなので、`in_pass` や 2 つの形の一致は要らない。callback から ctx を読むのは `ctx.data` の 1 回だけで、
+  App の pass 中 (mIV 内ドラッグ) でも ctx のロックは他に持たれていない (closure の中で ctx を入れ子に使わない)。
 - `admission: Result<(), String>` — App が毎 pass 書く受付可否 (§6.4 の述語の結果)。
 - `internal: Option<InternalDrag>` — §4.1。`SHDoDragDrop` の前に立て、戻った直後に外す。
 - `drops: Vec<DropRequest>` — target が書く。`GridFiles(paths)` / `TreeTransfer(ShellTransferRequest)`。外部ドラッグなら `request_repaint`。
@@ -179,14 +179,13 @@ App の消費: `update_phases.rs` の今の `dropped_files` の場所で `drops`
   ツールチップ・他の Area) の rect を集め、交差する行は対象外 (行全体を外す。点のサンプリングはしない)。
 - `client_size_px`、DPI (`GetDpiForWindow`)、`pixels_per_point`。
 
-callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `GetClientRect` の大きさと DPI が、`presented`・`latest` のどちらかと違えば、どこでも NONE**。
-点の分類 (両方の形で同じ分類・同じ行になるときだけ。違えば NONE):
+callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `GetClientRect` の大きさと DPI が表示済みの形と違えば、どこでも NONE**。点の分類:
 
 | 分類 | 扱い |
 | --- | --- |
 | `TreeRow(path)` (`tree_clip` 内で、対象の行全体の rect に入る) | §4・§5 |
 | `TreeNonTarget` (`pane_rect` 内でそれ以外: 空白・インデント・スクロールバー・外した行・ヘッダ) | NONE。一覧の経路へ流さない |
-| `ExistingDropArea` (両方の形で `pane_rect` の外) | 外部ドラッグは今の一覧への落下 (COPY、Drop で `GridFiles`)。mIV 内ドラッグは NONE |
+| `ExistingDropArea` (`pane_rect` の外) | 外部ドラッグは今の一覧への落下 (COPY、Drop で `GridFiles`)。mIV 内ドラッグは NONE |
 | 形が無い (ツリー非表示) | `pane_rect` が空なので全部 `ExistingDropArea`。大きさ・DPI 不一致は全部 NONE |
 
 ### 6.4 受付の述語と投入境界 (r1 P2-4)
@@ -257,10 +256,10 @@ callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `Get
 
 - 操作の決定 (純関数): 修飾キー × ルートの同じ/別 × 内部/外部 × 外部の許可効果 × 同じ親・自身/配下・本棚配下・`excluded_virtual`・`failed_paths`。UNC・大文字小文字・末尾区切り。
 - 既定の解決 (worker): 予告がコピーなら必ずコピー (r3 の反例 `D:\src` → `C:\MountD\dst` で同じボリュームでもコピー)。予告が既定の移動なら、ボリューム一致で移動、不一致・取得失敗でコピー。Shift の移動は下げない。ボリュームの取得は差し替え可能な形にして検査。
-- 当たり判定: `presented` と `latest` で同じ行に当たる点だけ `TreeRow`。**表示済みの形で A の位置に、新しい形では B が来る場合は NONE** (A にも B にも入れない)。
-  `request_discard` による 2 pass のフレーム (2 pass 目の最初で `presented` を入れ替えないこと)、pass の外 (App から戻った後・描画の前) の callback、
-  外部ドラッグの不一致で `request_repaint` すること、ppp 1.0/1.5、行全体の rect の端、`TreeNonTarget` (インデント・空白・スクロールバー・重なったレイヤーで外した行)
-  が NONE で一覧へ流れないこと、大きさ・DPI 不一致で NONE。
+- 当たり判定: 表示済みの pass の番号の形だけを使うこと。「表示は A、次の pass の形は B、present が省略された (番号が進まない) 後の次のフレームの描画前」で A を使う回帰、
+  `request_discard` による 2 pass のフレーム (描かれなかった 1 pass 目の形を使わない)、番号の形が無ければ NONE、ppp 1.0/1.5、行全体の rect の端、
+  `TreeNonTarget` (インデント・空白・スクロールバー・重なったレイヤーで外した行) が NONE で一覧へ流れないこと、大きさ・DPI 不一致で NONE。
+- vendor egui-wgpu: present が返ったときだけ番号を記録し、Outdated・skip では記録しないこと (既存の `winit_tests.rs` の形で、GPU が要る部分は既存の扱いに合わせる)。
 - 受付の述語: snapshot と投入で同じ述語。Running・Selecting・Remote・終了・モーダル・sidecar・本棚で worker を起動しない。整理先とツリーの両方の入口。snapshot の作成で本への追加の取り消しが失効しないこと。
 - 外部ドロップの返答: 偽の data object で、ツリー行への外部 Drop が COPY を返し、`PERFORMEDDROPEFFECT` 等を書かないこと。Shift でもコピーの要求になること。
 - 内部ドロップ: `InternalDrag.paths` 全件で要求を作ること (data object の `CF_HDROP` を読まない)。`failed_paths > 0` で受け付けない。
@@ -308,4 +307,6 @@ Q1〜Q5 はすべて回答済み (§0)。残る判断は §4.3 の出荷条件�
   - 自動展開・自動スクロール・行の強調表示をしない。
   - 遮蔽は点ではなく行全体で外す。形はフレームの最初の pass でだけ入れ替える。
 - r3 (b238cc97c) REJECT: 字句の予告がコピーで実行が移動になる反例 (同じボリュームの別名)、App から戻った後・描画前の callback で未表示の形を使う (P1×2)。
-- r4 で直したもの: worker は予告を上げない (下げるだけ)。形は `presented` と `latest` の両方で同じ行に当たる点だけ受け付け、描画の完了時点を知る仕組みを作らない。
+- r4 で直したもの: worker は予告を上げない (下げるだけ)。形の一致の規則 (r4 案) は破棄。
+- r4 (a4f40baec) REJECT: present が省略されるフレーム (Surface Outdated 等) があり、フレームの開始は描画済みの証拠にならない (P1×1)。
+- r5 で直したもの: 描画側 (vendor egui-wgpu) が present の返った pass の番号を記録し、当たり判定はその番号の形だけを使う。推定の仕組み (in_pass・一致規則・追加 repaint) を全部外した。
