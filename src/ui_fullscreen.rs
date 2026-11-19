@@ -28845,6 +28845,10 @@ impl App {
                             }
                         }
                         if overview_rendered { return; }
+                        // Match this frame's drawn material without sampling original-preview
+                        // input again for either page of a spread.
+                        let display_bypassed = self
+                            .fs_display_bypasses_final_pipeline(state.original_preview_active);
                         // Paint foreground controls first so their current rectangle owns
                         // pointer input and mouse-follow suppression on the first frame too.
                         let depth_panel = self.draw_depth_panel(ctx, fs_idx);
@@ -30105,7 +30109,7 @@ impl App {
                                     SpreadPair::Single => {
                                         let mut info = state.top_bar_page_info();
                                         info.ai_upscale_info =
-                                            self.top_bar_ai_upscale_info(fs_idx);
+                                            self.top_bar_ai_upscale_info(fs_idx, display_bypassed);
                                         vec![info]
                                     }
                                     SpreadPair::Double { left, right } => [left, right]
@@ -30114,10 +30118,10 @@ impl App {
                                             if idx == fs_idx {
                                                 let mut info = state.top_bar_page_info();
                                                 info.ai_upscale_info = self
-                                                    .top_bar_ai_upscale_info(idx);
+                                                    .top_bar_ai_upscale_info(idx, display_bypassed);
                                                 info
                                             } else {
-                                                self.cached_top_bar_page_info(idx)
+                                                self.cached_top_bar_page_info(idx, display_bypassed)
                                             }
                                         })
                                         .collect(),
@@ -30368,7 +30372,7 @@ impl App {
 
                         // ── フルスクリーン左下ステータス表示 ──
                         if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
-                            self.draw_fs_ai_status(ui, fs_idx);
+                            self.draw_fs_ai_status(ui, fs_idx, display_bypassed);
                         }
 
                         self.draw_viewer_shared_overlays(ui, full_rect, ctx);
@@ -32899,7 +32903,7 @@ impl App {
         .ok()
     }
 
-    fn cached_top_bar_page_info(&self, idx: usize) -> FsTopBarPageInfo {
+    fn cached_top_bar_page_info(&self, idx: usize, display_bypassed: bool) -> FsTopBarPageInfo {
         let (image_dims, image_downscaled) = match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::RawPreview {
                 developed_dims: [w, h],
@@ -32973,7 +32977,7 @@ impl App {
             },
             ai_upscale_info: None,
         };
-        info.ai_upscale_info = self.top_bar_ai_upscale_info(idx);
+        info.ai_upscale_info = self.top_bar_ai_upscale_info(idx, display_bypassed);
         info
     }
 
@@ -32983,21 +32987,28 @@ impl App {
     fn top_bar_ai_upscale_info(
         &self,
         idx: usize,
+        display_bypassed: bool,
     ) -> Option<(String, crate::app::DisplayedFinalAiState)> {
-        let state = self.displayed_final_ai_state(idx);
+        let state = self.displayed_final_ai_state(idx, display_bypassed);
         if state == crate::app::DisplayedFinalAiState::NotRequested {
             return None;
         }
         let params = self.effective_params(idx);
-        Some((
-            self.ai_request_label(
-                idx,
-                self.effective_denoise_request(params),
-                self.effective_upscale_request(params),
-                false,
-            ),
-            state,
-        ))
+        let stages = match state {
+            crate::app::DisplayedFinalAiState::Applied { stages, .. } => Some(stages),
+            crate::app::DisplayedFinalAiState::Processing
+            | crate::app::DisplayedFinalAiState::Waiting => self
+                .final_ai_prefetch_input_size(idx, params)
+                .map(|size| self.final_ai_stages_in_range(params, size)),
+            _ => None,
+        };
+        let denoise = self
+            .effective_denoise_request(params)
+            .filter(|_| stages.is_none_or(|stages| stages.denoise));
+        let upscale = self
+            .effective_upscale_request(params)
+            .filter(|_| stages.is_none_or(|stages| stages.upscale));
+        Some((self.ai_request_label(idx, denoise, upscale, false), state))
     }
 
     /// フルスクリーンビューポートの ViewportBuilder を構築する。
@@ -54628,6 +54639,21 @@ fn fs_ai_status_bottom_offset(
     seek.min(label)
 }
 
+/// Keep completion fading paused until both AI and its displayed composite finish.
+fn fs_ai_status_activity(
+    job: crate::app::FinalAiJobState,
+    displayed: crate::app::DisplayedFinalAiState,
+    is_loading: bool,
+    has_ai_pending: bool,
+    raw_active: bool,
+) -> (bool, bool, bool) {
+    let is_upscaling = job == crate::app::FinalAiJobState::Running
+        || displayed == crate::app::DisplayedFinalAiState::Processing;
+    let is_upscaled = matches!(displayed, crate::app::DisplayedFinalAiState::Applied { .. });
+    let any_busy = is_loading || has_ai_pending || is_upscaling || raw_active;
+    (is_upscaling, is_upscaled, any_busy)
+}
+
 /// 読み込み中であることは画像左下のラベルが単独で持つ。ここへ同じ行を積むと、この枠が
 /// 同じ条件で同じ位置に出て先発を覆い、二重に描いたうえで読めなくなる。左下ラベルは
 /// PDF 再レンダリングを区別できるうえ、AI が無効でも出るので、担当はあちらにある。
@@ -55246,29 +55272,30 @@ impl App {
     }
 
     /// フルスクリーン左下に AI 処理ステータスを表示する。
-    fn draw_fs_ai_status(&mut self, ui: &mut egui::Ui, fs_idx: usize) {
+    fn draw_fs_ai_status(&mut self, ui: &mut egui::Ui, fs_idx: usize, display_bypassed: bool) {
         let has_ai_pending = !self.final_ai_pending.is_empty();
-        let is_upscaling = self.final_ai_job_state(fs_idx) == crate::app::FinalAiJobState::Running;
-        let is_prefetching_ai = !is_upscaling
-            && self
-                .final_ai_pending
-                .keys()
-                .any(|key| key.edit_key.idx != fs_idx);
-        let is_upscaled = matches!(
-            self.displayed_final_ai_state(fs_idx),
-            crate::app::DisplayedFinalAiState::Applied { .. }
-        );
+        let displayed = self.displayed_final_ai_state(fs_idx, display_bypassed);
+        let job = self.final_ai_job_state(fs_idx);
         let is_loading = self.fs_pending.contains_key(&fs_idx);
         let raw_indicator = self
             .settings
             .fullscreen_prefetch_status_visible
             .then(|| self.raw_prefetch_indicator(fs_idx))
             .flatten();
-        let any_busy = is_loading
-            || has_ai_pending
-            || raw_indicator
+        let (is_upscaling, is_upscaled, any_busy) = fs_ai_status_activity(
+            job,
+            displayed,
+            is_loading,
+            has_ai_pending,
+            raw_indicator
                 .as_ref()
-                .is_some_and(|row| row.active_count > 0);
+                .is_some_and(|row| row.active_count > 0),
+        );
+        let is_prefetching_ai = !is_upscaling
+            && self
+                .final_ai_pending
+                .keys()
+                .any(|key| key.edit_key.idx != fs_idx);
 
         let prefetch_indicator = self.final_ai_prefetch_indicator(fs_idx);
         let content = fs_ai_status_content(
@@ -94022,6 +94049,10 @@ mod tests {
                 crate::app::DisplayedFinalAiState::Applied {
                     width: 28672,
                     height: 36864,
+                    stages: crate::app::FinalAiStages {
+                        denoise: false,
+                        upscale: true,
+                    },
                 },
             )),
             None,
@@ -94053,6 +94084,10 @@ mod tests {
                 D::Applied {
                     width: 4800,
                     height: 6400,
+                    stages: crate::app::FinalAiStages {
+                        denoise: false,
+                        upscale: true,
+                    },
                 },
                 " (AI 処理済み: 漫画 4800×6400)",
             ),
@@ -94064,6 +94099,10 @@ mod tests {
             ),
             (D::NotApplied(R::Failed), " (AI 未適用: 漫画、失敗)"),
             (D::NotApplied(R::Unavailable), " (AI 未適用: 漫画)"),
+            (
+                D::NotApplied(R::OriginalShown),
+                " (AI 未適用: 漫画、元画像を表示中)",
+            ),
             (
                 D::NotApplied(R::Animated),
                 " (AI 未適用: 漫画、アニメーション)",
@@ -94094,6 +94133,10 @@ mod tests {
                     crate::app::DisplayedFinalAiState::Applied {
                         width: 2560,
                         height: 1920,
+                        stages: crate::app::FinalAiStages {
+                            denoise: false,
+                            upscale: true,
+                        },
                     },
                 )),
             },
@@ -94135,21 +94178,272 @@ mod tests {
         right.denoise_model = None;
         app.adjustment_page_params.insert(1, right);
         assert_eq!(
-            app.top_bar_ai_upscale_info(0).unwrap().0,
+            app.top_bar_ai_upscale_info(0, false).unwrap().0,
             format!("{denoise} + 自動")
         );
         app.ai_classify_cache
             .insert(0, crate::ai::ImageCategory::Comic);
         assert_eq!(
-            app.top_bar_ai_upscale_info(0).unwrap().0,
+            app.top_bar_ai_upscale_info(0, false).unwrap().0,
             format!("{denoise} + 漫画")
         );
-        assert!(app.top_bar_ai_upscale_info(1).is_none());
+        assert!(app.top_bar_ai_upscale_info(1, false).is_none());
         // Existing lower-left wording continues to use the current runtime request.
         app.sync_upscale_from_preset(0);
         assert_eq!(
             app.ai_model_label(0, true),
             format!("{denoise} + 自動: 漫画")
+        );
+    }
+
+    #[test]
+    fn spread_top_bar_and_cached_page_share_the_drawn_frame_bypass() {
+        use crate::app::{DisplayedFinalAiState as D, NotAppliedReason as R};
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(std::path::PathBuf::from("C:/hud/left.png")),
+            GridItem::Image(std::path::PathBuf::from("C:/hud/right.png")),
+        ];
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+        app.settings.global_preset.upscale_model = Some("auto".into());
+        app.ai_classify_cache
+            .insert(0, crate::ai::ImageCategory::Comic);
+        let mut right = app.settings.global_preset.clone();
+        right.upscale_model = None;
+        right.denoise_model = Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().into());
+        app.adjustment_page_params.insert(1, right);
+        let labels = [
+            "漫画",
+            crate::ai::ModelKind::DenoiseRealplksr.display_label(),
+        ];
+        // Supply the frame's already observed value. No key or OS observation is
+        // needed for the partner row or the cached-page metadata path.
+        for (original_preview_active, analysis_mode, expected) in [
+            (false, false, D::Waiting),
+            (true, false, D::NotApplied(R::OriginalShown)),
+            (false, true, D::NotApplied(R::OriginalShown)),
+        ] {
+            let mut frame = FsFrameState::overview_shell();
+            frame.original_preview_active = original_preview_active;
+            app.analysis_mode = analysis_mode;
+            let bypass = app.fs_display_bypasses_final_pipeline(frame.original_preview_active);
+            for (idx, label) in labels.into_iter().enumerate() {
+                let primary = app.top_bar_ai_upscale_info(idx, bypass);
+                let cached = app.cached_top_bar_page_info(idx, bypass).ai_upscale_info;
+                assert_eq!(primary, Some((label.to_owned(), expected)));
+                assert_eq!(cached, primary);
+                let displayed = app.displayed_final_ai_state(idx, bypass);
+                assert_eq!(displayed, expected);
+                assert_eq!(
+                    fs_ai_status_activity(
+                        crate::app::FinalAiJobState::Ready,
+                        displayed,
+                        false,
+                        false,
+                        false,
+                    ),
+                    (false, false, false)
+                );
+            }
+        }
+        app.settings.global_preset.upscale_model = None;
+        assert!(app.top_bar_ai_upscale_info(0, true).is_none());
+        assert!(
+            app.cached_top_bar_page_info(0, true)
+                .ai_upscale_info
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn top_bar_ai_label_only_names_the_admitted_and_recorded_stages() {
+        use crate::app::{DisplayedFinalAiState as D, FinalAiStages};
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(std::path::PathBuf::from(
+            "C:/hud/stages.png",
+        ))];
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+        app.settings.global_preset.upscale_model = Some("realesr_general_v3".into());
+        app.settings.global_preset.denoise_model =
+            Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().into());
+        app.settings.ai_upscale_size_limit =
+            Some(crate::ai::upscale::AiProcessSizeLimit::square(1024));
+        app.settings.ai_denoise_size_limit =
+            Some(crate::ai::upscale::AiProcessSizeLimit::square(4096));
+        let denoise = crate::ai::ModelKind::DenoiseRealplksr.display_label();
+        let source = Arc::new(egui::ColorImage::filled([1200, 1600], egui::Color32::WHITE));
+        let source_tex = ctx.load_texture(
+            "hud-stages-source",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
+        );
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                pdf_rerender_failures: Vec::new(),
+                pdf_metadata: None,
+                tex: source_tex,
+                pixels: source,
+                source_dims: Some([1200, 1600]),
+                load_seq: 0,
+                animation: crate::fs_animation::StaticAnimationState::Still,
+            },
+        );
+        let (label, state) = app.top_bar_ai_upscale_info(0, false).unwrap();
+        assert_eq!(state, D::Waiting);
+        assert_eq!(label, denoise);
+        let ai_key = app
+            .final_ai_key_for_pixels(
+                app.current_edit_result_key(0),
+                [1200, 1600],
+                app.effective_params(0),
+            )
+            .unwrap();
+        let pixels = Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::WHITE));
+        app.final_ai_cache.insert(
+            ai_key,
+            crate::app::FinalAiEntry {
+                diagnostic_metadata: None,
+                canonical_dims: None,
+                source_size: [1200, 1600],
+                pixels: pixels.clone(),
+                used_upscale: false,
+            },
+        );
+        let (label, state) = app.top_bar_ai_upscale_info(0, false).unwrap();
+        assert_eq!(state, D::Processing);
+        assert_eq!(label, denoise);
+        let raw = app.fs_cache.remove(&0).unwrap();
+        let (label, state) = app.top_bar_ai_upscale_info(0, false).unwrap();
+        assert_eq!(state, D::Waiting);
+        assert_eq!(label, denoise);
+        app.fs_cache.insert(0, raw);
+        let final_key = app.final_composite_key_for_pixels(
+            app.current_edit_result_key(0),
+            [1200, 1600],
+            app.effective_params(0),
+        );
+        let tex = ctx.load_texture(
+            "hud-stages-final",
+            pixels.clone(),
+            crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
+        );
+        app.bind_display_texture_identity(&tex, final_key.edit_key.item_id);
+        let mut final_entry = crate::app::FinalCompositeEntry::raster(
+            None,
+            [1200, 1600],
+            pixels,
+            tex,
+            crate::app::DISPLAY_IMAGE_TEXTURE_OPTIONS,
+            true,
+        );
+        final_entry.ai_applied = Some(FinalAiStages {
+            denoise: true,
+            upscale: false,
+        });
+        app.final_composite_cache.insert(final_key, final_entry);
+        let (label, state) = app.top_bar_ai_upscale_info(0, false).unwrap();
+        assert_eq!(label, denoise);
+        assert_eq!(
+            state,
+            D::Applied {
+                width: 8,
+                height: 12,
+                stages: FinalAiStages {
+                    denoise: true,
+                    upscale: false
+                }
+            }
+        );
+        // In-range requests cannot put an upscale name on an unupscaled result.
+        app.settings.ai_upscale_size_limit =
+            Some(crate::ai::upscale::AiProcessSizeLimit::square(4096));
+        assert_eq!(app.top_bar_ai_upscale_info(0, false).unwrap().0, denoise);
+        app.fs_cache.remove(&0);
+        assert_eq!(app.top_bar_ai_upscale_info(0, false).unwrap().0, denoise);
+    }
+
+    #[test]
+    fn fs_ai_status_waits_for_composite_before_starting_completion_fade() {
+        use crate::app::{DisplayedFinalAiState as D, FinalAiJobState as J, FinalAiStages};
+        let (processing, complete, busy) =
+            fs_ai_status_activity(J::Ready, D::Processing, false, false, false);
+        assert!(processing && busy);
+        assert!(!complete);
+        let content = fs_ai_status_content(
+            true,
+            false,
+            FsAiStatusSignals {
+                is_upscaling: processing,
+                is_upscaled: complete,
+                is_prefetching_ai: false,
+                erase_complete: false,
+                has_prefetch_indicator: false,
+            },
+        );
+        assert!(content.lines.contains(&FsAiStatusLine::Processing));
+        assert!(!content.lines.contains(&FsAiStatusLine::Complete));
+        let (processing, complete, busy) = fs_ai_status_activity(
+            J::Ready,
+            D::Applied {
+                width: 8,
+                height: 12,
+                stages: FinalAiStages {
+                    denoise: false,
+                    upscale: true,
+                },
+            },
+            false,
+            false,
+            false,
+        );
+        assert!(!processing && !busy && complete);
+        let content = fs_ai_status_content(
+            true,
+            false,
+            FsAiStatusSignals {
+                is_upscaling: processing,
+                is_upscaled: complete,
+                is_prefetching_ai: false,
+                erase_complete: false,
+                has_prefetch_indicator: false,
+            },
+        );
+        assert!(content.lines.contains(&FsAiStatusLine::Complete));
+        assert_eq!(
+            fs_ai_status_activity(
+                J::Ready,
+                D::NotApplied(crate::app::NotAppliedReason::OriginalShown),
+                false,
+                false,
+                false
+            ),
+            (false, false, false)
+        );
+    }
+
+    #[test]
+    fn top_bar_ai_label_reads_retained_pdf_input_size_without_raw_pixels() {
+        let ctx = egui::Context::default();
+        let mut app = crate::app::paged_prefetch_tests::pdf_book(&ctx);
+        app.settings.global_preset.denoise_model =
+            Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().into());
+        app.settings.ai_upscale_size_limit =
+            Some(crate::ai::upscale::AiProcessSizeLimit::square(1));
+        app.settings.ai_denoise_size_limit =
+            Some(crate::ai::upscale::AiProcessSizeLimit::square(4096));
+        crate::app::paged_prefetch_tests::retain_pdf_ai(&mut app, 0);
+        assert!(!app.fs_cache.contains_key(&0));
+        assert_eq!(
+            app.final_ai_job_state(0),
+            crate::app::FinalAiJobState::Ready
+        );
+        let (label, state) = app.top_bar_ai_upscale_info(0, false).unwrap();
+        assert_eq!(state, crate::app::DisplayedFinalAiState::Processing);
+        assert_eq!(
+            label,
+            crate::ai::ModelKind::DenoiseRealplksr.display_label()
         );
     }
 
@@ -94186,7 +94480,7 @@ mod tests {
                 is_upscaling: app.final_ai_job_state(0) == crate::app::FinalAiJobState::Running,
                 is_prefetching_ai: false,
                 is_upscaled: matches!(
-                    app.displayed_final_ai_state(0),
+                    app.displayed_final_ai_state(0, false),
                     crate::app::DisplayedFinalAiState::Applied { .. }
                 ),
                 erase_complete: false,

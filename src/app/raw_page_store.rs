@@ -1122,7 +1122,7 @@ pub(crate) mod tests {
                 texture,
                 texture_options: egui::TextureOptions::LINEAR,
                 complete: true,
-                ai_applied: false,
+                ai_applied: None,
             },
         );
     }

@@ -350,7 +350,7 @@ fn d3_2_legacy_colorize_and_lut_computing_channel_survives_real_park() {
                         state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                         items_generation: owner.items_generation,
                         output_complete: true,
-                        ai_applied: false,
+                        ai_applied: None,
                         nearest_sampler: false,
                         origin: FinalEffectOrigin::LegacyDisplay,
                         gpu_diagnostics: Default::default(),

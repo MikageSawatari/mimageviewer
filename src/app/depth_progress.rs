@@ -495,7 +495,7 @@ mod tests {
                 state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                 items_generation,
                 output_complete: true,
-                ai_applied: false,
+                ai_applied: None,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyDisplay,
                 gpu_diagnostics: Default::default(),

@@ -2496,13 +2496,25 @@ active CentralPanelの `ui.max_rect()` から一度解決した `StillSeekGeomet
 構築し、HUD 描画のために同期ファイル I/O やアーカイブ読み込みを追加しない。AI の表示は
 ページ別の実効補正値、正確に一致する完成済み final composite、共通の AI job 状態から解決し、
 単ページと見開き左右の各行へ同じ規則で表示する。`FinalCompositeEntry::ai_applied` は、
-合成の土台に AI 結果を選んだ時点で記録し、final-effect worker を通る場合も引き継ぐ。
+合成の土台に AI 結果を選んだ時点で、AI なしの `None` または段別の `FinalAiStages` を記録し、
+final-effect worker を通る場合も引き継ぐ。ノイズ除去は AI 入力寸法での対象範囲、
+アップスケールは結果の `used_upscale` から決める。大きさによる段別の対象判定は
+AI key・起動・worker のモデル選択で共通の helper を使い、従来の起動条件を保つ。
 設定上の AI ON と、表示用の完成済み合成へ AI が適用済みであることを区別する。
 AI 要求なしでは AI の括弧を出さない。要求ありでは「AI 処理済み: モデル名 実寸法」
 「AI 処理中: モデル名」「AI 処理待ち: モデル名」「AI 未適用: モデル名」を表示する。
-未適用の理由が分かる場合は「大きさの上限」「失敗」「アニメーション」を添える。
+処理済みのモデル名は合成に記録された段だけを表示する。処理中・処理待ちは入力寸法が
+分かれば対象範囲内の段だけ、まだ分からなければ要求された全段のモデル名を使う。
+未適用は要求された全段のモデル名を使い、理由が分かる場合は「大きさの上限」「失敗」
+「アニメーション」を添える。元画像比較中・分析モード中は、完成済み AI 合成や Ready な
+AI 結果が残っていても「AI 未適用: モデル名、元画像を表示中」とする。表示の迂回は描画と同じ
+`fs_display_bypasses_final_pipeline` で決め、HUD のために OS キー状態を再観測しない。
+見開き描画と同じ `FsFrameState.original_preview_active` の 1 値から迂回 bool を解決し、
+左右の HUD・cached ページ情報・左下へ渡す。AI 状態とモデル名は各ページの idx で解決する。
 処理後寸法は AI 適用済みの完成済み texture の実寸だけを使い、予定寸法は表示しない。
 左下の処理状況も同じ job / 表示状態を使い、先読みの点の完了判定も共通の job 状態から導く。
+左下の「AI 処理中」は job の Running に加え、AI 結果から完成済み合成を待つ Processing も含む。
+その間は busy としてフェードを開始せず、完成後に「AI 処理完了」を表示する。
 job は retained PDF、source pixels、正確な AI key、cache / retained / failed の従来の判定順を保ち、
 要求なしでも source pixels がなければ先読みは未完了のままとする。
 バーが固定・ホバー・popup のいずれでも表示されない

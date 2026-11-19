@@ -1467,7 +1467,7 @@ pub(super) fn build_info_text(
         use crate::app::{DisplayedFinalAiState as D, NotAppliedReason as R};
         let ai = match state {
             D::NotRequested => String::new(),
-            D::Applied { width, height } => format!("(AI 処理済み: {label} {width}×{height})"),
+            D::Applied { width, height, .. } => format!("(AI 処理済み: {label} {width}×{height})"),
             D::Processing => format!("(AI 処理中: {label})"),
             D::Waiting => format!("(AI 処理待ち: {label})"),
             D::NotApplied(reason) => {
@@ -1476,6 +1476,7 @@ pub(super) fn build_info_text(
                     R::Failed => "、失敗",
                     R::Animated => "、アニメーション",
                     R::Unavailable => "",
+                    R::OriginalShown => "、元画像を表示中",
                 };
                 format!("(AI 未適用: {label}{reason})")
             }

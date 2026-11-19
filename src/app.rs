@@ -1,3 +1,4 @@
+pub(crate) use crate::ai::final_pipeline::FinalAiStages;
 mod ai_failure_feedback;
 mod converted_archive_sources;
 #[cfg(test)]
@@ -11673,12 +11674,17 @@ pub(crate) enum NotAppliedReason {
     Failed,
     Unavailable,
     Animated,
+    OriginalShown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DisplayedFinalAiState {
     NotRequested,
-    Applied { width: u32, height: u32 },
+    Applied {
+        width: u32,
+        height: u32,
+        stages: FinalAiStages,
+    },
     Processing,
     Waiting,
     NotApplied(NotAppliedReason),
@@ -11695,7 +11701,7 @@ pub(crate) struct FinalCompositeEntry {
     /// 完成結果が届いたら同じ key を上書きする。
     pub(crate) complete: bool,
     /// The selected base was an AI result, including denoise-only output.
-    pub(crate) ai_applied: bool,
+    pub(crate) ai_applied: Option<FinalAiStages>,
 }
 
 fn normal_raster_material_basis(
@@ -11764,7 +11770,7 @@ impl FinalCompositeEntry {
             texture,
             texture_options,
             complete,
-            ai_applied: false,
+            ai_applied: None,
             display_basis,
         }
     }
@@ -12692,7 +12698,7 @@ pub(crate) struct FinalEffectPending {
     items_generation: u64,
     output_complete: bool,
     /// Selected-input provenance stays with the job through CPU receipt and GPU adoption.
-    ai_applied: bool,
+    ai_applied: Option<FinalAiStages>,
     nearest_sampler: bool,
     /// 非表示ページの先読みとして起動した worker。表示要求時は同じ job を昇格して再利用する。
     origin: final_prepare::FinalEffectOrigin,
@@ -84959,7 +84965,11 @@ impl App {
     }
 
     /// Resolve AI provenance from this page's exact completed displayed material.
-    pub(crate) fn displayed_final_ai_state(&self, idx: usize) -> DisplayedFinalAiState {
+    pub(crate) fn displayed_final_ai_state(
+        &self,
+        idx: usize,
+        display_bypassed: bool,
+    ) -> DisplayedFinalAiState {
         use DisplayedFinalAiState as D;
         use FinalAiJobState as J;
         use NotAppliedReason as R;
@@ -84969,15 +84979,19 @@ impl App {
         {
             return D::NotRequested;
         }
+        if display_bypassed {
+            return D::NotApplied(R::OriginalShown);
+        }
         if self.fs_entry_is_animated(idx) {
             return D::NotApplied(R::Animated);
         }
         if let Some((_, entry)) = self.exact_complete_final_composite_entry(idx) {
-            if entry.ai_applied {
+            if let Some(stages) = entry.ai_applied {
                 let [width, height] = entry.texture.size();
                 return D::Applied {
                     width: width as u32,
                     height: height as u32,
+                    stages,
                 };
             }
             return D::NotApplied(match self.final_ai_job_state(idx) {
@@ -85111,7 +85125,7 @@ impl App {
                 plan,
                 true,
                 true,
-                true,
+                Some(self.final_ai_result_stages(&params, edit_size, entry.used_upscale)),
             ) {
                 return;
             }
@@ -85227,7 +85241,11 @@ impl App {
                             plan,
                             true,
                             true,
-                            true,
+                            Some(self.final_ai_result_stages(
+                                &params,
+                                entry.source_size,
+                                entry.used_upscale,
+                            )),
                         ) {
                             return;
                         }
@@ -85263,10 +85281,19 @@ impl App {
             let (source, used_upscale, adjust_before_effect, ai_applied) = match ai_key {
                 Some(key) => {
                     if let Some(entry) = self.final_ai_cache.get(&key).cloned() {
-                        (entry.pixels, entry.used_upscale, None, true)
+                        (
+                            entry.pixels,
+                            entry.used_upscale,
+                            None,
+                            Some(self.final_ai_result_stages(
+                                &params,
+                                entry.source_size,
+                                entry.used_upscale,
+                            )),
+                        )
                     } else if self.final_ai_failed.contains(&key) {
                         let adjust = (!params.is_color_identity()).then_some(params.clone());
-                        (Arc::clone(&edit_pixels), false, adjust, false)
+                        (Arc::clone(&edit_pixels), false, adjust, None)
                     } else {
                         // AI 結果が到着してから final effect を作る。AI 前の完成 entry を
                         // 同じ key へ入れると Ready 到着後も stale な白黒結果が残る。
@@ -85275,7 +85302,7 @@ impl App {
                 }
                 None => {
                     let adjust = (!params.is_color_identity()).then_some(params.clone());
-                    (Arc::clone(&edit_pixels), false, adjust, false)
+                    (Arc::clone(&edit_pixels), false, adjust, None)
                 }
             };
             let plan = if ai_disabled {
@@ -85418,7 +85445,7 @@ impl App {
 
     /// Query existing exact edit-canvas metadata without producing pixels. Canonical
     /// source dimensions and thumbnail dimensions are not AI input dimensions.
-    fn final_ai_prefetch_input_size(
+    pub(crate) fn final_ai_prefetch_input_size(
         &self,
         idx: usize,
         params: &crate::adjustment::AdjustParams,
@@ -89297,13 +89324,9 @@ impl App {
         size: [usize; 2],
         params: &crate::adjustment::AdjustParams,
     ) -> Option<FinalAiKey> {
-        let [w, h] = size;
-        let w = w as u32;
-        let h = h as u32;
-        let upscale_enabled = self.effective_upscale_request(params).is_some()
-            && crate::ai::upscale::should_process_rect(w, h, self.settings.ai_upscale_limit());
-        let denoise_enabled = self.effective_denoise_request(params).is_some()
-            && crate::ai::upscale::should_process_rect(w, h, self.settings.ai_denoise_limit());
+        let stages = self.final_ai_stages_in_range(params, size);
+        let upscale_enabled = stages.upscale;
+        let denoise_enabled = stages.denoise;
         if !upscale_enabled && !denoise_enabled {
             return None;
         }
@@ -91054,6 +91077,31 @@ impl App {
         }
     }
 
+    pub(crate) fn final_ai_stages_in_range(
+        &self,
+        params: &crate::adjustment::AdjustParams,
+        source_size: [usize; 2],
+    ) -> FinalAiStages {
+        crate::ai::final_pipeline::final_ai_stages_in_range(
+            self.settings.ai_feature_mode,
+            params,
+            source_size,
+            self.settings.ai_upscale_limit(),
+            self.settings.ai_denoise_limit(),
+        )
+    }
+
+    fn final_ai_result_stages(
+        &self,
+        params: &crate::adjustment::AdjustParams,
+        source_size: [usize; 2],
+        used_upscale: bool,
+    ) -> FinalAiStages {
+        let mut stages = self.final_ai_stages_in_range(params, source_size);
+        stages.upscale = used_upscale;
+        stages
+    }
+
     pub(crate) fn effective_upscale_request(
         &self,
         params: &crate::adjustment::AdjustParams,
@@ -91131,23 +91179,11 @@ impl App {
             return true;
         }
 
-        let [w, h] = source_image.size;
-        let w_u32 = w as u32;
-        let h_u32 = h as u32;
         let upscale_request = self.effective_upscale_request(&params);
         let denoise_request = self.effective_denoise_request(&params);
-        let upscale_in_range = upscale_request.is_some()
-            && crate::ai::upscale::should_process_rect(
-                w_u32,
-                h_u32,
-                self.settings.ai_upscale_limit(),
-            );
-        let denoise_in_range = denoise_request.is_some()
-            && crate::ai::upscale::should_process_rect(
-                w_u32,
-                h_u32,
-                self.settings.ai_denoise_limit(),
-            );
+        let stages = self.final_ai_stages_in_range(&params, source_image.size);
+        let upscale_in_range = stages.upscale;
+        let denoise_in_range = stages.denoise;
         if !upscale_in_range && !denoise_in_range {
             return false;
         }
@@ -91828,7 +91864,7 @@ impl App {
         source: Arc<egui::ColorImage>,
         source_size: [usize; 2],
         output_complete: bool,
-        ai_applied: bool,
+        ai_applied: Option<FinalAiStages>,
     ) -> Option<egui::TextureHandle> {
         self.resolve_prepared_edit_for_display(ctx, key.edit_key.idx);
         let reuse_prefetch = self
@@ -91941,7 +91977,7 @@ impl App {
         plan: FinalCompositePlan,
         output_complete: bool,
         prefetch: bool,
-        ai_applied: bool,
+        ai_applied: Option<FinalAiStages>,
     ) -> bool {
         let nearest_sampler = plan.needs_nearest_sampler();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -92081,7 +92117,13 @@ impl App {
         let creative_lut_active = self.creative_lut_requires_final_effect(params);
         if !self.post_filter_bypassed && (params.colorize.is_enabled() || creative_lut_active) {
             return self.start_final_effect_worker(
-                ctx, final_key, params, sharpened, edit_size, complete, true,
+                ctx,
+                final_key,
+                params,
+                sharpened,
+                edit_size,
+                complete,
+                Some(self.final_ai_result_stages(params, edit_size, base_used_upscale)),
             );
         }
 
@@ -92124,7 +92166,7 @@ impl App {
                 pixels: post_filtered,
                 texture: texture.clone(),
                 complete,
-                ai_applied: true,
+                ai_applied: Some(self.final_ai_result_stages(params, edit_size, base_used_upscale)),
             },
         );
         crate::logger::log(format!(
@@ -92295,9 +92337,14 @@ impl App {
         let fc_adjust_ms = t_adjust0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
 
         let (base_pixels, complete, base_used_upscale, ai_applied) = match (ai_key, ai_ready) {
-            (Some(_), Some(entry)) => (entry.pixels, true, entry.used_upscale, true),
+            (Some(_), Some(entry)) => (
+                entry.pixels,
+                true,
+                entry.used_upscale,
+                Some(self.final_ai_result_stages(&params, entry.source_size, entry.used_upscale)),
+            ),
             (Some(key), None) if self.final_ai_failed.contains(&key) => {
-                (Arc::clone(&adjusted), true, false, false)
+                (Arc::clone(&adjusted), true, false, None)
             }
             (Some(key), None) => {
                 // Raster PDF が native 再レンダ待ち/進行中なら、捨てる display-fit 結果へ
@@ -92322,9 +92369,9 @@ impl App {
                     // runtime 初期化失敗 / モデル不在で何も立てずに return する経路)。
                     self.maybe_start_final_ai(idx, key, Arc::clone(&adjusted), params.clone(), true)
                 };
-                (Arc::clone(&adjusted), !ai_will_arrive, false, false)
+                (Arc::clone(&adjusted), !ai_will_arrive, false, None)
             }
-            (None, _) => (Arc::clone(&adjusted), true, false, false),
+            (None, _) => (Arc::clone(&adjusted), true, false, None),
         };
 
         // 最終表示段スマートシャープ: 色調補正 → final AI → **ここ** → post_filter。

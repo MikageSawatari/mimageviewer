@@ -499,7 +499,7 @@ fn paged_prefetch_reconcile_warm_and_poll_preserve_sibling_cache_and_channels() 
                 state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(effect_rx)),
                 items_generation: generation,
                 output_complete: true,
-                ai_applied: false,
+                ai_applied: None,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyPrefetch,
                 gpu_diagnostics: Default::default(),

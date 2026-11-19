@@ -379,7 +379,7 @@ impl App {
         Arc<egui::ColorImage>,
         [usize; 2],
         FinalCompositePlan,
-        bool,
+        Option<FinalAiStages>,
     )> {
         let params = self.effective_params(idx);
         let lut = self.resolved_creative_lut(params);
@@ -395,7 +395,7 @@ impl App {
                     pixels,
                     source_size,
                     build_final_composite_plan_after_ai(params, lut, used_upscale),
-                    true,
+                    Some(self.final_ai_result_stages(params, source_size, used_upscale)),
                 ));
             }
             ResidentFinalPrepareInput::ResidentEdited { key, pixels }
@@ -419,7 +419,7 @@ impl App {
             pixels.clone(),
             pixels.size,
             build_final_composite_plan_without_ai(params, lut),
-            false,
+            None,
         ))
     }
 
@@ -831,7 +831,7 @@ impl App {
         source: Arc<egui::ColorImage>,
         source_size: [usize; 2],
         plan: FinalCompositePlan,
-        ai_applied: bool,
+        ai_applied: Option<FinalAiStages>,
         unit: FinalPrepareUnit,
         reclaim_attempted: &mut bool,
     ) -> bool {

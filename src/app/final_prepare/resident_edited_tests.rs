@@ -349,7 +349,13 @@ fn e3_after_ai_freezes_pre_ai_size_and_never_reapplies_tone() {
     let pixels = after_ai(&mut app, 1);
     app.fs_cache.remove(&1);
     let (key, input, size, plan, ai_applied) = app.final_prepare_plan_from_resident(1).unwrap();
-    assert!(ai_applied);
+    assert_eq!(
+        ai_applied,
+        Some(FinalAiStages {
+            denoise: false,
+            upscale: true
+        })
+    );
     assert!(Arc::ptr_eq(&pixels, &input));
     assert_eq!(size, [12, 18]);
     assert_eq!(
@@ -364,7 +370,7 @@ fn e3_after_ai_freezes_pre_ai_size_and_never_reapplies_tone() {
     assert!(start(&mut app, &ctx, 1));
     assert_eq!(wait_ready(&mut app, 1), key);
     assert_eq!(app.final_effect_pending[&key].source_size, size);
-    assert!(app.final_effect_pending[&key].ai_applied);
+    assert_eq!(app.final_effect_pending[&key].ai_applied, ai_applied);
     app.fullscreen_idx = Some(1);
     begin_registration_frame(&mut app, 1);
     assert!(app.ensure_final_composite_texture(&ctx, 1).is_some());
@@ -373,6 +379,7 @@ fn e3_after_ai_freezes_pre_ai_size_and_never_reapplies_tone() {
             .unwrap()
             .1
             .ai_applied
+            .is_some()
     );
 }
 

@@ -57627,7 +57627,7 @@ mod pipeline_cache_refactor_tests {
                 state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(final_effect_rx)),
                 items_generation,
                 output_complete: true,
-                ai_applied: false,
+                ai_applied: None,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyDisplay,
                 gpu_diagnostics: Default::default(),
@@ -57677,7 +57677,7 @@ mod pipeline_cache_refactor_tests {
             Arc::clone(&source),
             source.size,
             false,
-            false,
+            None,
         );
         assert!(
             first.is_none(),
@@ -57718,7 +57718,7 @@ mod pipeline_cache_refactor_tests {
             Arc::clone(&source),
             source.size,
             true,
-            false,
+            None,
         );
         assert_eq!(
             spawned.map(|texture| texture.id()),
@@ -57741,7 +57741,7 @@ mod pipeline_cache_refactor_tests {
                 state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(prefetch_rx)),
                 items_generation,
                 output_complete: true,
-                ai_applied: false,
+                ai_applied: None,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyPrefetch,
                 gpu_diagnostics: Default::default(),
@@ -57754,7 +57754,7 @@ mod pipeline_cache_refactor_tests {
             Arc::clone(&source),
             source.size,
             true,
-            false,
+            None,
         );
         assert_eq!(
             reused.map(|texture| texture.id()),
@@ -57826,7 +57826,7 @@ mod pipeline_cache_refactor_tests {
                 state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(final_effect_rx)),
                 items_generation,
                 output_complete: true,
-                ai_applied: false,
+                ai_applied: None,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyDisplay,
                 gpu_diagnostics: Default::default(),
@@ -57961,7 +57961,7 @@ mod pipeline_cache_refactor_tests {
                 state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                 items_generation,
                 output_complete: false,
-                ai_applied: false,
+                ai_applied: None,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyDisplay,
                 gpu_diagnostics: Default::default(),
@@ -58011,7 +58011,7 @@ mod pipeline_cache_refactor_tests {
                 state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                 items_generation,
                 output_complete: true,
-                ai_applied: false,
+                ai_applied: None,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyDisplay,
                 gpu_diagnostics: Default::default(),
@@ -62000,7 +62000,7 @@ mod pipeline_cache_refactor_tests {
                 state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(effect_rx)),
                 items_generation,
                 output_complete: true,
-                ai_applied: false,
+                ai_applied: None,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyDisplay,
                 gpu_diagnostics: Default::default(),
@@ -62061,7 +62061,7 @@ mod pipeline_cache_refactor_tests {
                     state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                     items_generation,
                     output_complete: true,
-                    ai_applied: false,
+                    ai_applied: None,
                     nearest_sampler: false,
                     origin: if idx != target_idx {
                         FinalEffectOrigin::LegacyPrefetch
@@ -64334,7 +64334,7 @@ mod pipeline_cache_refactor_tests {
             Arc::clone(&source),
             source.size,
             true,
-            false,
+            None,
         );
 
         let promoted = app
