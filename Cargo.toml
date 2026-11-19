@@ -425,7 +425,6 @@ music-core = { path = "crates/music-core" }
 # vendor/twemoji/svg/*.svg から include_bytes! で exe へ同梱する (Inc 4c、
 # docs/comic-integration-plan.md / docs/archive/comic/stamp-feature-design.md)。
 resvg = "0.45"
-kamadak-exif = "0.6"
 rexif = "0.7"
 rayon = "1.10"
 rusqlite = { version = "0.31", features = ["bundled", "hooks"] }

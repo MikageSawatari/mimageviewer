@@ -1,5 +1,11 @@
 #![allow(non_camel_case_types)]
 
+// turbojpeg-sys is a link-only dependency: build.rs reads its libjpeg-turbo
+// headers and links turbojpeg-static for LibRaw's JPEG decoding. No Rust item
+// is used, so name it here to keep cargo's unused_dependencies lint accurate.
+#[cfg(windows)]
+use turbojpeg_sys as _;
+
 #[cfg(windows)]
 mod windows {
     use std::ffi::{c_char, c_int, c_void};
