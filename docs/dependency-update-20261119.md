@@ -100,7 +100,55 @@ workspace の `rust-version` (MSRV) は変えていない。`cargo update` は M
   - `tools/comic_lab` の `ab_glyph`、`tools/music_lab` の `serde_json`: 使っていない。外した。
   - `crates/libraw-sys` の `turbojpeg-sys`: build.rs がヘッダと `turbojpeg-static.lib` を使う link 専用の依存。
     外さずに `use turbojpeg_sys as _;` で使っていることを示した。
-- bench と tantivy の生成コードの確認 (リリース手順 Phase 2 の 9.5) は下の節。
+- bench と tantivy の生成コードの確認 (リリース手順 Phase 2 の 9.5) は [下の節](#bench-と-tantivy-の生成コード-リリース手順-phase-2-の-95)。
+
+## bench と tantivy の生成コード (リリース手順 Phase 2 の 9.5)
+
+### bench
+
+`cargo build --release --features dev-tools --bin bench_search` (Rust 1.100.0、c01a6ab63 と同じソース) の後、
+run-heavy の全件枠 (ほかの重い実行が終わるのを待ち、新しい実行を止める) の中で `bench_search --docs 50000` を 3 回測った。
+`vendor/bench_baseline.json` と比べ、1 回目だけでも 3 回の最良値でも `OK: 全クエリで回帰なし` (exit 0)。baseline は上書きしていない。
+
+| query | baseline | 1 回目 | 3 回の最良 |
+| --- | ---: | ---: | ---: |
+| en_ai_phrase | 1.35 ms | 1.46 ms (+8.5%) | 1.34 ms (-1.0%) |
+| en_common | 16.85 ms | 14.96 ms (-11.2%) | 14.96 ms (-11.2%) |
+| generic_jp | 25.07 ms | 19.24 ms (-23.3%) | 19.24 ms (-23.3%) |
+| medium_jp | 7.20 ms | 6.41 ms (-11.0%) | 6.41 ms (-11.0%) |
+| medium_jp_3 | 0.74 ms | 0.74 ms (-0.1%) | 0.74 ms (-0.1%) |
+| medium_jp_and | 1.65 ms | 1.73 ms (+4.8%) | 1.63 ms (-1.1%) |
+| rare_jp | 1.03 ms | 0.89 ms (-14.4%) | 0.84 ms (-18.8%) |
+| rare_jp_and | 0.15 ms | 0.14 ms (-7.6%) | 0.14 ms (-7.6%) |
+| super_generic | 0.01 ms | 0.00 ms (-24.2%) | 0.00 ms (-35.5%) |
+| unique_id | 1.12 ms | 1.08 ms (-3.8%) | 1.08 ms (-3.8%) |
+
+結果の JSON とログは `target/dependency-update-20261119/bench_*` (git 管理外)。
+
+### 製品の生成コード
+
+`CARGO_INCREMENTAL=0 CARGO_PROFILE_RELEASE_STRIP=false CARGO_PROFILE_RELEASE_DEBUG=line-tables-only
+cargo build --release -p mimageviewer --bin mimageviewer-core --target-dir target/core-sym --locked` (18 分 43 秒、run-heavy 経由) の
+core を、Codex (gpt-6.1-sol / high、cargo 等は実行させず dumpbin・llvm-pdbutil・python だけ) が前回 (2026-10-28) と同じ方法で照合した。
+core の SHA-256 は `30b71d028be26b4490ddd885a5f6c84c7058bcb7cecf6274cd31e598370e46d2`、PDB は
+`f0060a7e0f3fd2f91bf7d6aa20699769a10a65b27cda53a5152eb97344f6df8e`。PE の RSDS と PDB の GUID
+`464F178C-25B0-CFF1-4C4C-44205044422E` / age 1 が一致。
+
+| 関数 | 命令数 (前回 → 今回) | unpcklps / addps / divps | mulss / addss / divss |
+| --- | ---: | --- | --- |
+| score_out_of_line (Box) | 4 → 4 | 0 / 0 / 0 | 0 / 0 / 0 |
+| score_out_of_line (TermScorer) | 33 → 33 | 0 / 0 / 0 | 1 / 1 / 1 |
+| Intersection::score (Box, Box) | 39 → 39 | 0 / 0 / 0 | 0 / 3 / 0 |
+| Intersection::score (TermScorer, Box) | 72 → 72 | 0 / 0 / 0 | 1 / 4 / 1 |
+| block_wand_intersection | 前回・今回とも製品から除去 | — | — |
+
+pruning → `into_box_scorer` → `intersect_scorers` の経路と、返す vtable (`0x156E34160` / `0x156E34298`) の score slot `+0x98` が
+上の 2 種の `Intersection::score` を指すこと、両 score から helper への call が残ることも、実バイトで照合した (ICF の別名も確認)。
+抽出した 4 関数の命令数と 6 命令の数は設計担当も数え直して一致した。
+左右 2 語の BM25 をまとめる SIMD の展開は無く、§1.424 の防ぎは 1.100.0 でも効いている。
+これは指定の採点経路の証拠であり、全 callee が scalar であることや実行性能の証明ではない。
+証跡は `target/dependency-update-20261119/` (codegen-report.txt・dumpbin-scoring.json・verification.json・functions-1..4.txt・
+routes-1..5.txt と抽出スクリプト。git 管理外)。
 
 ## 通常 crate
 
@@ -151,3 +199,28 @@ major・minor・patch (省略時は 0)・コミット数を数値で比べるよ
 数値が同じで名前が違う・解析できないときは推測せず失敗にする。オフラインのテストは
 `bash scripts/tests/test-setup-ffmpeg.sh` (16 件)、表の判定は `scripts/test-check-dependency-updates.ps1`。
 2026-11-19 の実際の check は `Up to date. Current is newer ...` を出した。
+
+## 検証
+
+どれも設計担当が run-heavy 経由で流した (2026-11-20 の利用者の決定どおり、Codex にはコンパイル・テストを流させていない)。
+製品のバイナリはエージェントが起動していない。
+
+- 本体 lib 全件 (`.\scripts\test-lib-full.ps1`、NEXTEST_TEST_THREADS=12、MSBUILDDISABLENODEREUSE=1):
+  - c01a6ab63 のソース: **19,007 件成功 / 0 失敗 / 88 skipped** (1819.7 秒)。実行中に記録文書だけを書き換えたので、
+    同じソースの再利用の記録は残っていない。
+  - その前の 20c48491d のソース: 19,006 件成功 / 1 失敗 (DXBC 契約テスト。上の wgpu の節で対応) / 88 skipped (1712.9 秒)。
+  - 2026-11-20 00:34 に始めた 1 回目 (20c48491d、当時は同時実行の上限なし) は、途中で PC 全体が固まって中断した。
+    原因は統括が live kernel dump で調べている (テストの実行ファイルの中での NTFS のデッドロック)。12 並列の 2 回は固まらずに完走した。
+- `.\scripts\build-dev.ps1`: 成功。`target\dev-runtime\mimageviewer-core.exe` に 8165 の pdfium.dll のバイト列が入り、8138 のものは入っていないことを照合した。
+- `cargo fmt --check`・FFmpeg の check のテスト・`scripts\test-check-dependency-updates.ps1`・bench・生成コードの照合: 上の各節。
+- 独立レビュー (gpt-6.1-sol / xhigh、read-only): 1 回目 REJECT (P2 wgpu の契約テスト、P3 記録の参照先)、2 回目 ACCEPT。
+- test-full は統括が master で流す (各ブランチでは流さない)。
+
+## 未確認 (実機)
+
+mIV の自動テストは PDF の描画結果の画素も EXR の画素も比べない。利用者の実機で次を見てもらう必要がある。
+
+- PDF: サムネイル (表紙)、ページ送り・見開き・拡大、図形・グラデーション・半透明・クリップの多い PDF、スキャン画像の PDF
+  (CCITT Fax / Flate の修正が入った)、パスワード付き PDF、数百ページの PDF の速いページ送り。
+- EXR (exr 1.74.3 で SIMD の実装が変わった) の表示。
+- 静止画の NIS / Anime4K VL (DX12 の DXBC 経路) が従来どおり表示される。
