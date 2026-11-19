@@ -130,6 +130,8 @@ pub(crate) fn draw_fullscreen_specified_scale_max_controls(
 mod name_colors;
 
 #[cfg(test)]
+mod hover_809;
+#[cfg(test)]
 mod hover_perf;
 mod pages;
 mod search_index;
@@ -1257,6 +1259,9 @@ pub(crate) struct PreferencesState {
     pub startup_folder_path_input: String,
     pub exif_add_tag_input: String,
     command_keymap_cache: Option<Arc<CommandKeymapCache>>,
+    command_overview_cache: Option<pages::CommandRowsCache>,
+    command_list_cache: Option<pages::CommandRowsCache>,
+    keyboard_tooltip_cache: Option<pages::KeyboardTooltipCache>,
     pub command_filter: String,
     pub command_key_filter: String,
     pub command_selected: Option<crate::keymap::KeyAction>,
@@ -1860,6 +1865,9 @@ impl PreferencesState {
             command_key_filter: String::new(),
             command_selected: None,
             command_keymap_cache: None,
+            command_overview_cache: None,
+            command_list_cache: None,
+            keyboard_tooltip_cache: None,
             command_edit_loaded_for: None,
             command_chord_inputs: std::array::from_fn(|_| String::new()),
             command_capture_slot: None,

@@ -2499,24 +2499,211 @@ fn command_filter_controls(ui: &mut egui::Ui, state: &mut PreferencesState) {
     });
 }
 
+/// A dialog owns these derived rows. Compare borrowed inputs before cloning a
+/// new snapshot so pointer movement does not copy settings or rebuild labels.
+pub(super) struct CommandRowsCache {
+    input: CommandRowsInput,
+    rows: Arc<Vec<OperationOverviewRow>>,
+    width: Option<CommandAssignmentWidth>,
+}
+
+struct CommandRowsInput {
+    keymap: Arc<CommandKeymapCache>,
+    raw_source: crate::keymap::KeymapSettings,
+    ring: RingShortcutSettings,
+    context: Option<KeyContext>,
+    filter: String,
+    key_filter: String,
+}
+
+impl CommandRowsInput {
+    fn matches(&self, state: &PreferencesState, keymap: &Arc<CommandKeymapCache>) -> bool {
+        Arc::ptr_eq(&self.keymap, keymap)
+            && self.raw_source == state.settings.keymap
+            && self.ring == state.settings.ring_shortcuts
+            && self.context == state.operation_keyboard_context
+            && self.filter == state.command_filter
+            && self.key_filter == state.command_key_filter
+    }
+
+    fn new(state: &PreferencesState, keymap: &Arc<CommandKeymapCache>) -> Self {
+        Self {
+            keymap: Arc::clone(keymap),
+            raw_source: state.settings.keymap.clone(),
+            ring: state.settings.ring_shortcuts.clone(),
+            context: state.operation_keyboard_context,
+            filter: state.command_filter.clone(),
+            key_filter: state.command_key_filter.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct CommandWidthInput {
+    pixels_per_point: f32,
+    default_font: egui::FontId,
+    monospace_font: egui::FontId,
+    override_text_style: Option<egui::TextStyle>,
+    text_styles: std::collections::BTreeMap<egui::TextStyle, egui::FontId>,
+    definitions: egui::FontDefinitions,
+    options: egui::epaint::text::TextOptions,
+    item_spacing_x: f32,
+    extra_text_line_spacing: f32,
+    valign: egui::Align,
+}
+
+impl CommandWidthInput {
+    fn fonts(ui: &egui::Ui) -> (egui::FontId, egui::FontId) {
+        let style = ui.style();
+        let default = egui::FontSelection::Default.resolve(style);
+        // RichText::monospace sets TextStyle, not FontFamily. Its explicit
+        // style precedes override_text_style, but override_font_id wins both.
+        let monospace = style
+            .override_font_id
+            .clone()
+            .unwrap_or_else(|| egui::TextStyle::Monospace.resolve(style));
+        (default, monospace)
+    }
+
+    fn matches(&self, ui: &egui::Ui) -> bool {
+        let (default_font, monospace_font) = Self::fonts(ui);
+        self.pixels_per_point == ui.ctx().pixels_per_point()
+            && self.default_font == default_font
+            && self.monospace_font == monospace_font
+            && self.override_text_style == ui.style().override_text_style
+            && self.text_styles == ui.style().text_styles
+            && self.item_spacing_x == ui.spacing().item_spacing.x
+            && self.extra_text_line_spacing == ui.spacing().extra_text_line_spacing
+            && self.valign == ui.text_valign()
+            && ui.fonts(|fonts| {
+                self.definitions == *fonts.definitions() && self.options == *fonts.options()
+            })
+    }
+
+    fn new(ui: &egui::Ui) -> Self {
+        let (default_font, monospace_font) = Self::fonts(ui);
+        let (definitions, options) =
+            ui.fonts(|fonts| (fonts.definitions().clone(), *fonts.options()));
+        Self {
+            pixels_per_point: ui.ctx().pixels_per_point(),
+            default_font,
+            monospace_font,
+            override_text_style: ui.style().override_text_style.clone(),
+            text_styles: ui.style().text_styles.clone(),
+            definitions,
+            options,
+            item_spacing_x: ui.spacing().item_spacing.x,
+            extra_text_line_spacing: ui.spacing().extra_text_line_spacing,
+            valign: ui.text_valign(),
+        }
+    }
+}
+
+struct CommandAssignmentWidth {
+    input: CommandWidthInput,
+    value: f32,
+}
+
+fn cached_command_rows(
+    state: &mut PreferencesState,
+    keymap: &Arc<CommandKeymapCache>,
+    overview: bool,
+) -> Arc<Vec<OperationOverviewRow>> {
+    let cached = if overview {
+        &state.command_overview_cache
+    } else {
+        &state.command_list_cache
+    };
+    if let Some(cache) = cached
+        && cache.input.matches(state, keymap)
+    {
+        return Arc::clone(&cache.rows);
+    }
+    #[cfg(test)]
+    COMMAND_ROW_BUILDS.with(|count| count.set(count.get() + 1));
+    // Keep the frame's effective keymap/conflicts snapshot, but read the raw
+    // status from live settings, preserving the existing mid-frame reset behavior.
+    let overridden = raw_overridden_actions(&state.settings.keymap);
+    let conflicted = conflicted_actions(&keymap.conflicts);
+    let rows = Arc::new(if overview {
+        command_overview_rows_with_overrides(state, &keymap.keymap, &conflicted, &overridden)
+    } else {
+        command_list_rows(state, &keymap.keymap, &conflicted, &overridden)
+    });
+    let cache = CommandRowsCache {
+        input: CommandRowsInput::new(state, keymap),
+        rows: Arc::clone(&rows),
+        width: None,
+    };
+    *if overview {
+        &mut state.command_overview_cache
+    } else {
+        &mut state.command_list_cache
+    } = Some(cache);
+    rows
+}
+
+fn cached_command_width(ui: &egui::Ui, state: &mut PreferencesState, overview: bool) -> f32 {
+    let cache = (if overview {
+        &mut state.command_overview_cache
+    } else {
+        &mut state.command_list_cache
+    })
+    .as_mut()
+    .expect("rows prepared before width");
+    if let Some(width) = &cache.width
+        && width.input.matches(ui)
+    {
+        return width.value;
+    }
+    #[cfg(test)]
+    COMMAND_WIDTH_BUILDS.with(|count| count.set(count.get() + 1));
+    let value = cache
+        .rows
+        .iter()
+        .map(|row| {
+            if overview {
+                assignment_summary_width(ui, &row.assignments)
+            } else {
+                assignment_values_width(ui, &row.assignments[0].1)
+            }
+        })
+        .fold(0.0_f32, f32::max);
+    cache.width = Some(CommandAssignmentWidth {
+        input: CommandWidthInput::new(ui),
+        value,
+    });
+    value
+}
+
 pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.small("現在のキーボード、右ドラッグ、マウスボタン、ゲームパッド X リングの割り当てをまとめて確認します。左端の「編集」で割り当て編集ダイアログを開きます。");
     ui.add_space(8.0);
 
-    let keymap = Keymap::from_settings(&state.settings.keymap);
-    let conflicts = keymap.binding_conflicts();
+    #[cfg(test)]
+    let phase_timer = hover_measurement::timer("overview_keymap_conflicts");
+    let keymap = state.command_keymap();
+    let conflicts = &keymap.conflicts;
+    #[cfg(test)]
+    drop(phase_timer);
     command_conflict_summary(ui, state, &conflicts);
 
     ui.add_space(8.0);
     command_filter_controls(ui, state);
 
     ui.add_space(12.0);
-    let conflicted = conflicted_actions(&conflicts);
-    let rows = command_overview_rows(state, &keymap, &conflicted);
-    let assignment_width = rows
-        .iter()
-        .map(|row| assignment_summary_width(ui, &row.assignments))
-        .fold(0.0_f32, f32::max);
+    #[cfg(test)]
+    let phase_timer = hover_measurement::timer("overview_rows");
+    let rows = cached_command_rows(state, &keymap, true);
+    #[cfg(test)]
+    drop(phase_timer);
+    #[cfg(test)]
+    let phase_timer = hover_measurement::timer("overview_width");
+    let assignment_width = cached_command_width(ui, state, true);
+    #[cfg(test)]
+    drop(phase_timer);
+    #[cfg(test)]
+    let phase_timer = hover_measurement::timer("overview_grid");
     egui::Grid::new("operation_command_overview_actions")
         .num_columns(5)
         .spacing([10.0, 4.0])
@@ -2529,28 +2716,31 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
             ui.strong("状態");
             ui.end_row();
 
-            for row in rows {
+            for row in rows.iter() {
                 if ui.small_button("編集").clicked() {
-                    match row.target {
+                    match &row.target {
                         OperationOverviewTarget::Key(action) => {
                             open_operation_assignment_editor(
                                 state,
-                                OperationAssignmentTarget::Key(action),
+                                OperationAssignmentTarget::Key(*action),
                                 OperationAssignmentTab::Keyboard,
                             );
                         }
                         OperationOverviewTarget::Ring { context, action } => {
                             open_operation_assignment_editor(
                                 state,
-                                OperationAssignmentTarget::Ring { context, action },
+                                OperationAssignmentTarget::Ring {
+                                    context: *context,
+                                    action: action.clone(),
+                                },
                                 OperationAssignmentTab::RingPad,
                             );
                         }
                     }
                 }
-                ui.label(row.label).on_hover_text(row.hover);
-                ui.label(row.context);
-                assignment_summary(ui, &row.assignments, assignment_width);
+                command_row_tooltip(ui.label(&row.label), row.hover);
+                ui.label(&row.context);
+                assignment_summary_with_measured_width(ui, &row.assignments, assignment_width);
                 if row.status.is_empty() {
                     ui.label(egui::RichText::new("既定").weak());
                 } else {
@@ -2559,15 +2749,17 @@ pub(super) fn page_command_overview(ui: &mut egui::Ui, state: &mut PreferencesSt
                     } else {
                         ui.visuals().text_color()
                     };
-                    ui.label(egui::RichText::new(row.status).color(color));
+                    ui.label(egui::RichText::new(&row.status).color(color));
                 }
                 ui.end_row();
             }
         });
+    #[cfg(test)]
+    drop(phase_timer);
     ui.small("未設定のリング / マウス操作を追加するときは、上部の各タブまたは編集ダイアログから割り当ててください。");
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum OperationOverviewTarget {
     Key(KeyAction),
     Ring {
@@ -2576,21 +2768,44 @@ enum OperationOverviewTarget {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct OperationOverviewRow {
     label: String,
     context: String,
     assignments: Vec<(&'static str, Vec<String>)>,
     status: String,
     conflicted: bool,
-    hover: String,
+    hover: &'static str,
     target: OperationOverviewTarget,
 }
 
+#[cfg(test)]
 fn command_overview_rows(
     state: &PreferencesState,
     keymap: &Keymap,
     conflicted: &HashSet<KeyAction>,
+) -> Vec<OperationOverviewRow> {
+    // Reference status path used before caching; keep parity coverage against
+    // override_chord_labels rather than deriving its answer from the new set.
+    let overridden = KeyAction::all()
+        .iter()
+        .copied()
+        .filter(|action| {
+            state
+                .settings
+                .keymap
+                .override_chord_labels(*action)
+                .is_some()
+        })
+        .collect();
+    command_overview_rows_with_overrides(state, keymap, conflicted, &overridden)
+}
+
+fn command_overview_rows_with_overrides(
+    state: &PreferencesState,
+    keymap: &Keymap,
+    conflicted: &HashSet<KeyAction>,
+    overridden_actions: &HashSet<KeyAction>,
 ) -> Vec<OperationOverviewRow> {
     let mut rows = Vec::new();
     for &action in KeyAction::all()
@@ -2608,11 +2823,7 @@ fn command_overview_rows(
         if !matches_key_context && !matches_ring_context {
             continue;
         }
-        let overridden = state
-            .settings
-            .keymap
-            .override_chord_labels(action)
-            .is_some();
+        let overridden = overridden_actions.contains(&action);
         let key_labels = keymap.chord_labels(action);
         if !command_action_matches_filter(action, state.command_filter.trim())
             || !command_key_labels_match_filter(&key_labels, state.command_key_filter.trim())
@@ -2668,7 +2879,7 @@ fn command_overview_rows(
             assignments,
             status: status.join(" / "),
             conflicted: is_conflicted,
-            hover: key_action_detail_label(action).to_owned(),
+            hover: key_action_detail_label(action),
             target: OperationOverviewTarget::Key(action),
         });
     }
@@ -2688,7 +2899,7 @@ fn command_overview_rows(
                 continue;
             }
             let label = compact_operation_label(action.label_for_context(context));
-            let hover = ring_action_detail_label(&action, context).to_owned();
+            let hover = ring_action_detail_label(&action, context);
             if !operation_text_matches_filter(
                 &label,
                 &hover,
@@ -3110,13 +3321,25 @@ fn assignment_summary_width(ui: &egui::Ui, groups: &[(&str, Vec<String>)]) -> f3
 }
 
 fn assignment_summary(ui: &mut egui::Ui, groups: &[(&str, Vec<String>)], column_width: f32) {
+    assignment_summary_with_measured_width(
+        ui,
+        groups,
+        column_width.max(assignment_summary_width(ui, groups)),
+    );
+}
+
+fn assignment_summary_with_measured_width(
+    ui: &mut egui::Ui,
+    groups: &[(&str, Vec<String>)],
+    column_width: f32,
+) {
     if groups.iter().all(|(_, values)| values.is_empty()) {
         ui.label(egui::RichText::new("なし").weak());
         return;
     }
 
     ui.vertical(|ui| {
-        ui.set_min_width(column_width.max(assignment_summary_width(ui, groups)));
+        ui.set_min_width(column_width);
         for (label, values) in groups {
             for value in values {
                 ui.horizontal(|ui| {
@@ -3140,7 +3363,6 @@ pub(super) fn page_command_settings(
     ui.add_space(8.0);
 
     let cache = state.command_keymap();
-    let keymap = &cache.keymap;
     let conflicts = &cache.conflicts;
     command_conflict_summary(ui, state, &conflicts);
 
@@ -3157,10 +3379,10 @@ pub(super) fn page_command_settings(
     });
 
     ui.add_space(8.0);
-    keyboard_chord_picker(ui, state, &keymap);
+    keyboard_chord_picker(ui, state, &cache);
 
     ui.add_space(8.0);
-    command_list(ui, state, &keymap, &conflicts);
+    command_list(ui, state, &cache);
 }
 
 pub(super) fn draw_operation_assignment_editor_dialog(
@@ -3917,7 +4139,11 @@ fn close_assignment_editors(state: &mut PreferencesState) {
     state.command_edit_notice = None;
 }
 
-fn keyboard_chord_picker(ui: &mut egui::Ui, state: &mut PreferencesState, keymap: &Keymap) {
+fn keyboard_chord_picker(
+    ui: &mut egui::Ui,
+    state: &mut PreferencesState,
+    keymap: &Arc<CommandKeymapCache>,
+) {
     ui.group(|ui| {
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("キーボード図").strong());
@@ -3959,7 +4185,7 @@ fn keyboard_chord_picker(ui: &mut egui::Ui, state: &mut PreferencesState, keymap
 fn draw_keyboard_picker_rows(
     ui: &mut egui::Ui,
     state: &mut PreferencesState,
-    keymap: &Keymap,
+    keymap: &Arc<CommandKeymapCache>,
     rows: &[&'static [KeyboardPickerCell]],
 ) {
     for row in rows {
@@ -3979,10 +4205,10 @@ fn draw_keyboard_picker_rows(
                             ui.add_sized([width, 24.0], egui::Button::new(label).small());
                         let clicked = response.clicked();
                         keyboard_picker_tooltip(response, || {
-                            keyboard_chord_tooltip(keymap, chord, state.operation_keyboard_context)
+                            cached_keyboard_chord_tooltip(state, keymap, chord)
                         });
                         if clicked {
-                            assign_keyboard_picker_chord(state, keymap, chord);
+                            assign_keyboard_picker_chord(state, &keymap.keymap, chord);
                         }
                     }
                     KeyboardPickerCell::Disabled(label) => {
@@ -4196,9 +4422,9 @@ fn keyboard_picker_label_width(label: &str) -> f32 {
     }
 }
 
-fn keyboard_picker_tooltip(
+fn keyboard_picker_tooltip<T: Into<egui::WidgetText>>(
     response: egui::Response,
-    text: impl FnOnce() -> String,
+    text: impl FnOnce() -> T,
 ) -> egui::Response {
     // on_hover_text also supplies AccessKit descriptions, even before hover.
     if response.ctx.has_accesskit_node(response.id) {
@@ -4212,9 +4438,67 @@ fn keyboard_picker_tooltip(
     }
 }
 
+fn command_row_tooltip(response: egui::Response, text: &'static str) -> egui::Response {
+    keyboard_picker_tooltip(response, || {
+        #[cfg(test)]
+        COMMAND_ROW_TOOLTIP_BUILDS.with(|count| count.set(count.get() + 1));
+        text
+    })
+}
+
+pub(super) struct KeyboardTooltipCache {
+    keymap: Arc<CommandKeymapCache>,
+    context: Option<KeyContext>,
+    modifiers: [bool; 3],
+    text: std::collections::HashMap<Chord, egui::WidgetText>,
+}
+
+fn cached_keyboard_chord_tooltip(
+    state: &mut PreferencesState,
+    keymap: &Arc<CommandKeymapCache>,
+    chord: Chord,
+) -> egui::WidgetText {
+    let modifiers = [
+        state.operation_keyboard_ctrl,
+        state.operation_keyboard_shift,
+        state.operation_keyboard_alt,
+    ];
+    let context = state.operation_keyboard_context;
+    if state.keyboard_tooltip_cache.as_ref().is_none_or(|cache| {
+        !Arc::ptr_eq(&cache.keymap, keymap)
+            || cache.context != context
+            || cache.modifiers != modifiers
+    }) {
+        state.keyboard_tooltip_cache = Some(KeyboardTooltipCache {
+            keymap: Arc::clone(keymap),
+            context,
+            modifiers,
+            text: Default::default(),
+        });
+    }
+    state
+        .keyboard_tooltip_cache
+        .as_mut()
+        .unwrap()
+        .text
+        .entry(chord)
+        .or_insert_with(|| {
+            // Arc-backed RichText lets AccessKit and hover share the same text.
+            // Match WidgetText::Text's default Label format, including its deferred
+            // placeholder color rather than capturing a local style color here.
+            egui::RichText::new(keyboard_chord_tooltip(&keymap.keymap, chord, context))
+                .color(egui::Color32::PLACEHOLDER)
+                .into()
+        })
+        .clone()
+}
+
 #[cfg(test)]
 thread_local! {
     static KEYBOARD_TOOLTIP_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COMMAND_ROW_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COMMAND_WIDTH_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static COMMAND_ROW_TOOLTIP_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn keyboard_chord_tooltip(
@@ -4224,6 +4508,8 @@ fn keyboard_chord_tooltip(
 ) -> String {
     #[cfg(test)]
     KEYBOARD_TOOLTIP_BUILDS.with(|count| count.set(count.get() + 1));
+    #[cfg(test)]
+    let _phase_timer = hover_measurement::timer("key_tooltip_text");
     let mut lines = vec![chord.display_name()];
     let mut matches = Vec::new();
     for &action in KeyAction::all()
@@ -4258,6 +4544,108 @@ pub(super) mod hover_measurement {
     use serde_json::json;
     use std::time::Instant;
 
+    thread_local! {
+        static PHASES: std::cell::RefCell<Option<std::collections::BTreeMap<&'static str, f64>>> = const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) struct Timer(&'static str, Option<Instant>);
+    pub(super) fn timer(name: &'static str) -> Timer {
+        Timer(
+            name,
+            PHASES.with(|p| p.borrow().is_some()).then(Instant::now),
+        )
+    }
+    impl Drop for Timer {
+        fn drop(&mut self) {
+            if let Some(start) = self.1 {
+                PHASES.with(|p| {
+                    if let Some(phases) = p.borrow_mut().as_mut() {
+                        *phases.entry(self.0).or_default() +=
+                            start.elapsed().as_secs_f64() * 1000.0;
+                    }
+                });
+            }
+        }
+    }
+
+    pub(in super::super) fn phase_breakdown(
+        state: &mut PreferencesState,
+        warmup: usize,
+        measured: usize,
+        commands: bool,
+        accesskit: bool,
+    ) -> serde_json::Value {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        if accesskit {
+            ctx.enable_accesskit();
+        }
+        let mut samples = Vec::new();
+        for frame in 0..warmup + measured {
+            PHASES.with(|p| *p.borrow_mut() = Some(Default::default()));
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 640.0),
+                    )),
+                    time: Some(frame as f64 / 60.0),
+                    ..Default::default()
+                },
+                |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            let _page_timer = timer("page_total");
+                            if commands {
+                                page_command_overview(ui, state);
+                            } else {
+                                let start = timer("keyboard_keymap_cache");
+                                let cache = state.command_keymap();
+                                drop(start);
+                                let start = timer("keyboard_picker");
+                                keyboard_chord_picker(ui, state, &cache);
+                                drop(start);
+                                command_list(ui, state, &cache);
+                            }
+                        });
+                    });
+                },
+            );
+            let phases = PHASES.with(|p| p.borrow_mut().take().unwrap());
+            if frame >= warmup {
+                assert_eq!(output.platform_output.num_completed_passes, 1);
+                samples.push(phases);
+            }
+            output.drop_without_applying_deltas();
+        }
+        let mut phases = serde_json::Map::new();
+        for name in [
+            "page_total",
+            "overview_keymap_conflicts",
+            "overview_rows",
+            "overview_width",
+            "overview_grid",
+            "keyboard_keymap_cache",
+            "keyboard_picker",
+            "list_rows",
+            "list_width",
+            "list_grid",
+            "key_tooltip_text",
+        ] {
+            if samples.iter().any(|s| s.contains_key(name)) {
+                phases.insert(
+                    name.into(),
+                    super::super::hover_perf::summary(
+                        samples.iter().map(|s| s.get(name).copied().unwrap_or(0.0)),
+                    ),
+                );
+            }
+        }
+        json!({"case": format!("{}_phases_{}_ak{}", if commands {"C"} else {"K"}, if state.settings.keymap.overrides.is_empty() {"default"} else {"20_overrides"}, accesskit),
+            "kind": "standalone_instrumented_production_page_not_additive_to_dialog", "phase_ms": phases, "measured_frames": measured,
+            "note": "Rows/width include cache lookups; Grid includes row layout and tooltip registration. page_total is the same Context's page interval, added after the before measurement only for after residual shares. key_tooltip_text is nested within keyboard_picker. Missing means no construction in steady frames."})
+    }
+
     pub(in super::super) fn breakdown(
         state: &mut PreferencesState,
         warmup: usize,
@@ -4282,14 +4670,12 @@ pub(super) mod hover_measurement {
                         egui::ScrollArea::vertical().show(ui, |ui| {
                             let start = Instant::now();
                             let cache = state.command_keymap();
-                            let keymap = &cache.keymap;
-                            let conflicts = &cache.conflicts;
                             times[0] = start.elapsed().as_secs_f64() * 1000.0;
                             let start = Instant::now();
-                            keyboard_chord_picker(ui, state, &keymap);
+                            keyboard_chord_picker(ui, state, &cache);
                             times[1] = start.elapsed().as_secs_f64() * 1000.0;
                             let start = Instant::now();
-                            command_list(ui, state, &keymap, &conflicts);
+                            command_list(ui, state, &cache);
                             times[2] = start.elapsed().as_secs_f64() * 1000.0;
                         });
                     });
@@ -4335,14 +4721,14 @@ pub(super) mod hover_measurement {
         assert!(state.command_filter.is_empty() && state.command_key_filter.is_empty());
         json!({"case": if state.settings.keymap.overrides.is_empty() {"K_breakdown_default"} else {"K_breakdown_20_overrides"},
             "kind": "standalone_same_functions_not_additive_to_dialog", "measured_frames": measured,
-            "count_note": "steady unchanged settings, AccessKit off, no hovered key in this standalone layout; calls, not heap allocations",
+            "count_note": "steady unchanged settings and warmed rows/width caches, AccessKit off, no hovered key in this standalone layout; calls, not heap allocations; first construction is outside measured frames",
             "phase_ms": phases, "effective_chords_calls_per_page_frame_calculated": {
                 "assignable_keys": key_count,
                 "filtered_user_facing_actions": filtered_actions,
                 "from_settings_conflict_scan": 0,
                 "second_conflict_scan": 0,
                 "keyboard_tooltip_eager_scans": 0,
-                "command_list_chord_labels": filtered_actions, "total": filtered_actions}})
+                "command_list_chord_labels": 0, "total": 0}})
     }
 }
 
@@ -4579,34 +4965,19 @@ fn raw_overridden_actions(settings: &crate::keymap::KeymapSettings) -> HashSet<K
         .collect()
 }
 
-fn command_list(
-    ui: &mut egui::Ui,
-    state: &mut PreferencesState,
-    keymap: &Keymap,
-    conflicts: &[BindingConflict],
-) {
-    let filter = state.command_filter.trim().to_string();
-    let key_filter = state.command_key_filter.trim().to_string();
-    let conflicted = conflicted_actions(conflicts);
-    let overridden_actions = raw_overridden_actions(&state.settings.keymap);
-    let rows: Vec<_> = KeyAction::all()
-        .iter()
-        .copied()
-        .filter(|action| {
-            action.is_user_facing()
-                && operation_keyboard_context_filter_matches(
-                    state.operation_keyboard_context,
-                    action.context(),
-                )
-                && command_action_matches_filter(*action, &filter)
-        })
-        .map(|action| (action, keymap.chord_labels(action)))
-        .filter(|(_, labels)| command_key_labels_match_filter(labels, &key_filter))
-        .collect();
-    let key_column_width = rows
-        .iter()
-        .map(|(_, labels)| assignment_values_width(ui, labels))
-        .fold(0.0_f32, f32::max);
+fn command_list(ui: &mut egui::Ui, state: &mut PreferencesState, keymap: &Arc<CommandKeymapCache>) {
+    #[cfg(test)]
+    let phase_timer = hover_measurement::timer("list_rows");
+    let rows = cached_command_rows(state, keymap, false);
+    #[cfg(test)]
+    drop(phase_timer);
+    #[cfg(test)]
+    let phase_timer = hover_measurement::timer("list_width");
+    let key_column_width = cached_command_width(ui, state, false);
+    #[cfg(test)]
+    drop(phase_timer);
+    #[cfg(test)]
+    let _grid_timer = hover_measurement::timer("list_grid");
     ui.label(egui::RichText::new("コマンド一覧").strong());
 
     egui::Grid::new("command_settings_actions")
@@ -4621,7 +4992,11 @@ fn command_list(
             ui.strong("状態");
             ui.end_row();
 
-            for (action, labels) in rows {
+            for row in rows.iter() {
+                let OperationOverviewTarget::Key(action) = &row.target else {
+                    unreachable!()
+                };
+                let action = *action;
                 let selected = state.command_selected == Some(action);
                 if ui
                     .selectable_label(selected, if selected { "選択中" } else { "編集" })
@@ -4630,34 +5005,68 @@ fn command_list(
                     open_command_editor_dialog(state, action, None);
                 }
 
-                ui.label(compact_key_action_label(action))
-                    .on_hover_text(action.description());
+                command_row_tooltip(ui.label(&row.label), row.hover);
 
-                assignment_values_with_measured_width(ui, &labels, key_column_width);
+                assignment_values_with_measured_width(ui, &row.assignments[0].1, key_column_width);
 
-                ui.label(key_action_context_label(action));
+                ui.label(&row.context);
 
-                let overridden = overridden_actions.contains(&action);
-                let mut status = Vec::new();
-                if overridden {
-                    status.push("上書き");
-                }
-                if conflicted.contains(&action) {
-                    status.push("競合");
-                }
-                if status.is_empty() {
+                if row.status.is_empty() {
                     ui.label(egui::RichText::new("既定").weak());
                 } else {
-                    let color = if conflicted.contains(&action) {
+                    let color = if row.conflicted {
                         egui::Color32::from_rgb(220, 120, 80)
                     } else {
                         ui.visuals().text_color()
                     };
-                    ui.label(egui::RichText::new(status.join(" / ")).color(color));
+                    ui.label(egui::RichText::new(&row.status).color(color));
                 }
                 ui.end_row();
             }
         });
+}
+
+fn command_list_rows(
+    state: &PreferencesState,
+    keymap: &Keymap,
+    conflicted: &HashSet<KeyAction>,
+    overridden: &HashSet<KeyAction>,
+) -> Vec<OperationOverviewRow> {
+    KeyAction::all()
+        .iter()
+        .copied()
+        .filter(|action| {
+            action.is_user_facing()
+                && operation_keyboard_context_filter_matches(
+                    state.operation_keyboard_context,
+                    action.context(),
+                )
+                && command_action_matches_filter(*action, state.command_filter.trim())
+        })
+        .map(|action| (action, keymap.chord_labels(action)))
+        .filter(|(_, labels)| {
+            command_key_labels_match_filter(labels, state.command_key_filter.trim())
+        })
+        .map(|(action, labels)| {
+            let mut status = Vec::new();
+            if overridden.contains(&action) {
+                status.push("上書き");
+            }
+            let is_conflicted = conflicted.contains(&action);
+            if is_conflicted {
+                status.push("競合");
+            }
+            OperationOverviewRow {
+                label: compact_key_action_label(action),
+                context: key_action_context_label(action).to_owned(),
+                assignments: vec![("キー", labels)],
+                status: status.join(" / "),
+                conflicted: is_conflicted,
+                hover: action.description(),
+                target: OperationOverviewTarget::Key(action),
+            }
+        })
+        .collect()
 }
 
 fn command_editor_for_action(
@@ -12306,12 +12715,13 @@ mod tests {
         operation_assignment_tab_enabled, ring_bindings_for_key_action,
     };
     use crate::app::MAX_TEXTURE_DIM;
-    use crate::keymap::{KeyAction, KeyName, ModKind};
+    use crate::keymap::{Chord, KeyAction, KeyContext, KeyName, ModKind};
     use crate::ring_shortcut::{
-        MouseGestureBinding, MouseGestureDirection, RightDragContext, RingActionId,
+        MouseGestureBinding, MouseGestureDirection, RightDragContext, RightDragMode, RingActionId,
         RingShortcutContext, RingShortcutSettings,
     };
     use eframe::egui;
+    use std::sync::Arc;
 
     #[test]
     fn specified_scale_editor_off_on_restores_pixel_and_percent_values() {
@@ -13106,6 +13516,546 @@ mod tests {
         }
     }
 
+    fn hover811_contexts() -> Vec<Option<KeyContext>> {
+        use KeyContext::*;
+        std::iter::once(None)
+            .chain(
+                [
+                    Global,
+                    Grid,
+                    FsCommon,
+                    FsPageOverview,
+                    Rating,
+                    FsImage,
+                    FsVideo,
+                    Erase,
+                    Conceal,
+                    Crop,
+                    SnsSplit,
+                    Text,
+                    LocalAdjust,
+                ]
+                .into_iter()
+                .map(Some),
+            )
+            .collect()
+    }
+
+    fn hover811_state(overrides: bool) -> PreferencesState {
+        let mut state = zoom_key_editor_state();
+        if overrides {
+            for action in KeyAction::all()
+                .iter()
+                .copied()
+                .filter(|a| a.is_user_facing() && a.default_chords().iter().next().is_some())
+                .take(20)
+            {
+                state
+                    .settings
+                    .keymap
+                    .set_override_chords(action, action.default_chords().iter().collect());
+            }
+        }
+        for &context in RingShortcutContext::all() {
+            state.settings.ring_shortcuts.profile_mut(context).slots[0] =
+                RingActionId::OpenCollection1;
+            state.settings.ring_shortcuts.set_right_drag_mode(
+                super::right_drag_context_for_ring_context(context),
+                RightDragMode::RingShortcut,
+            );
+        }
+        state
+    }
+
+    #[test]
+    fn hover811_rows_match_original_overview_and_list_for_all_contexts_and_filters() {
+        let ctx = egui::Context::default();
+        for overrides in [false, true] {
+            let mut state = hover811_state(overrides);
+            let keymap = state.command_keymap();
+            let conflicted = super::conflicted_actions(&keymap.conflicts);
+            for context in hover811_contexts() {
+                state.operation_keyboard_context = context;
+                for (filter, key_filter) in
+                    [("", ""), ("コピー", ""), ("", "Ctrl+"), ("表示", "F11")]
+                {
+                    state.command_filter = filter.into();
+                    state.command_key_filter = key_filter.into();
+                    let original =
+                        super::command_overview_rows(&state, &keymap.keymap, &conflicted);
+                    let cached = super::cached_command_rows(&mut state, &keymap, true);
+                    assert_eq!(
+                        &*cached, &original,
+                        "overview {overrides}/{context:?}/{filter}/{key_filter}"
+                    );
+                    let cached_list = super::cached_command_rows(&mut state, &keymap, false);
+                    // Reconstruct the previous list's filter, labels and status directly.
+                    let original_list: Vec<_> = KeyAction::all()
+                        .iter()
+                        .copied()
+                        .filter(|action| {
+                            action.is_user_facing()
+                                && super::operation_keyboard_context_filter_matches(
+                                    context,
+                                    action.context(),
+                                )
+                                && super::command_action_matches_filter(*action, filter)
+                        })
+                        .map(|action| (action, keymap.keymap.chord_labels(action)))
+                        .filter(|(_, labels)| {
+                            super::command_key_labels_match_filter(labels, key_filter)
+                        })
+                        .collect();
+                    assert_eq!(cached_list.len(), original_list.len());
+                    let output = ctx.run_ui(Default::default(), |ui| {
+                        let overview_width = original
+                            .iter()
+                            .map(|row| super::assignment_summary_width(ui, &row.assignments))
+                            .fold(0.0_f32, f32::max);
+                        let list_width = original_list
+                            .iter()
+                            .map(|(_, labels)| super::assignment_values_width(ui, labels))
+                            .fold(0.0_f32, f32::max);
+                        for (overview, expected) in [(true, overview_width), (false, list_width)] {
+                            let builds = super::COMMAND_WIDTH_BUILDS.with(|n| n.get());
+                            assert_eq!(
+                                super::cached_command_width(ui, &mut state, overview),
+                                expected,
+                                "width {overview}/{overrides}/{context:?}/{filter}/{key_filter}"
+                            );
+                            assert_eq!(super::COMMAND_WIDTH_BUILDS.with(|n| n.get()), builds + 1);
+                            assert_eq!(
+                                super::cached_command_width(ui, &mut state, overview),
+                                expected
+                            );
+                            assert_eq!(super::COMMAND_WIDTH_BUILDS.with(|n| n.get()), builds + 1);
+                        }
+                    });
+                    output.drop_without_applying_deltas();
+                    for (row, (action, labels)) in cached_list.iter().zip(original_list) {
+                        assert_eq!(row.target, super::OperationOverviewTarget::Key(action));
+                        assert_eq!(row.label, super::compact_key_action_label(action));
+                        assert_eq!(row.context, super::key_action_context_label(action));
+                        assert_eq!(row.assignments, vec![("キー", labels)]);
+                        let mut status = Vec::new();
+                        if state
+                            .settings
+                            .keymap
+                            .override_chord_labels(action)
+                            .is_some()
+                        {
+                            status.push("上書き");
+                        }
+                        if conflicted.contains(&action) {
+                            status.push("競合");
+                        }
+                        assert_eq!(row.status, status.join(" / "));
+                        assert_eq!(row.hover, action.description());
+                    }
+                    for overview in [false, true] {
+                        let first = super::cached_command_rows(&mut state, &keymap, overview);
+                        assert!(Arc::ptr_eq(
+                            &first,
+                            &super::cached_command_rows(&mut state, &keymap, overview)
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hover811_rows_rebuild_for_each_input_and_preserve_mid_frame_snapshot() {
+        for overview in [false, true] {
+            let mut state = hover811_state(false);
+            let mut snapshot = state.command_keymap();
+            let mut rows = super::cached_command_rows(&mut state, &snapshot, overview);
+            let mut change =
+                |state: &mut PreferencesState, snapshot: &Arc<super::super::CommandKeymapCache>| {
+                    let next = super::cached_command_rows(state, snapshot, overview);
+                    assert!(!Arc::ptr_eq(&rows, &next));
+                    assert!(Arc::ptr_eq(
+                        &next,
+                        &super::cached_command_rows(state, snapshot, overview)
+                    ));
+                    rows = next;
+                };
+            state.command_filter = "コピー".into();
+            change(&mut state, &snapshot);
+            state.command_key_filter = "Ctrl+".into();
+            change(&mut state, &snapshot);
+            state.operation_keyboard_context = Some(KeyContext::Grid);
+            change(&mut state, &snapshot);
+            state
+                .settings
+                .ring_shortcuts
+                .profile_mut(RingShortcutContext::Grid)
+                .slots[0] = RingActionId::GridSelectAll;
+            change(&mut state, &snapshot);
+            state.command_chord_inputs = ["F24".into(), "".into(), "".into()];
+            apply_command_editor(&mut state, KeyAction::GridCopyFiles);
+            snapshot = state.command_keymap();
+            change(&mut state, &snapshot);
+            // Reset changes the live status, but the already captured frame
+            // still displays the old effective chords and conflicts.
+            state.command_key_filter.clear();
+            change(&mut state, &snapshot);
+            state.settings.keymap.overrides.clear();
+            change(&mut state, &snapshot);
+            drop(change);
+            let row = rows
+                .iter()
+                .find(|r| r.target == super::OperationOverviewTarget::Key(KeyAction::GridCopyFiles))
+                .unwrap();
+            assert_eq!(row.assignments[0].1, vec!["F24"]);
+            assert!(!row.status.contains("上書き"));
+            let fresh = state.command_keymap();
+            let next = super::cached_command_rows(&mut state, &fresh, overview);
+            assert!(!Arc::ptr_eq(&rows, &next));
+            let row = next
+                .iter()
+                .find(|r| r.target == super::OperationOverviewTarget::Key(KeyAction::GridCopyFiles))
+                .unwrap();
+            assert_eq!(
+                row.assignments[0].1,
+                fresh.keymap.chord_labels(KeyAction::GridCopyFiles)
+            );
+            // Selection and keyboard modifiers do not affect either row table.
+            state.command_selected = Some(KeyAction::GridCopyFiles);
+            state.operation_keyboard_ctrl = true;
+            state.operation_keyboard_shift = true;
+            state.operation_keyboard_alt = true;
+            assert!(Arc::ptr_eq(
+                &next,
+                &super::cached_command_rows(&mut state, &fresh, overview)
+            ));
+            state.settings.keymap.legacy_ini_migration_done = true;
+            let changed = super::cached_command_rows(&mut state, &fresh, overview);
+            assert!(!Arc::ptr_eq(&next, &changed));
+        }
+    }
+
+    #[test]
+    fn hover811_width_reuses_and_tracks_actual_font_selection_spacing_and_alignment() {
+        for overview in [false, true] {
+            let ctx = egui::Context::default();
+            let mut state = hover811_state(true);
+            let snapshot = state.command_keymap();
+            super::COMMAND_WIDTH_BUILDS.with(|n| n.set(0));
+            let output = ctx.run_ui(Default::default(), |ui| {
+                super::cached_command_rows(&mut state, &snapshot, overview);
+                let mut builds = super::COMMAND_WIDTH_BUILDS.with(|n| n.get());
+                fn verify(
+                    ui: &egui::Ui,
+                    state: &mut PreferencesState,
+                    overview: bool,
+                    builds: &mut usize,
+                ) {
+                    let width = super::cached_command_width(ui, state, overview);
+                    *builds += 1;
+                    assert_eq!(super::COMMAND_WIDTH_BUILDS.with(|n| n.get()), *builds);
+                    let rows = if overview {
+                        &state.command_overview_cache
+                    } else {
+                        &state.command_list_cache
+                    };
+                    let expected = rows
+                        .as_ref()
+                        .unwrap()
+                        .rows
+                        .iter()
+                        .map(|row| {
+                            if overview {
+                                super::assignment_summary_width(ui, &row.assignments)
+                            } else {
+                                super::assignment_values_width(ui, &row.assignments[0].1)
+                            }
+                        })
+                        .fold(0.0_f32, f32::max);
+                    assert_eq!(width, expected);
+                    assert_eq!(super::cached_command_width(ui, state, overview), width);
+                    assert_eq!(super::COMMAND_WIDTH_BUILDS.with(|n| n.get()), *builds);
+                }
+                verify(ui, &mut state, overview, &mut builds);
+                ui.style_mut()
+                    .text_styles
+                    .insert(egui::TextStyle::Monospace, egui::FontId::monospace(23.0));
+                verify(ui, &mut state, overview, &mut builds);
+                ui.style_mut().override_text_style = Some(egui::TextStyle::Heading);
+                verify(ui, &mut state, overview, &mut builds);
+                ui.style_mut().override_font_id = Some(egui::FontId::proportional(27.0));
+                verify(ui, &mut state, overview, &mut builds);
+                let input = super::CommandWidthInput::new(ui);
+                assert_eq!(input.default_font, egui::FontId::proportional(27.0));
+                assert_eq!(input.monospace_font, egui::FontId::proportional(27.0));
+                ui.spacing_mut().item_spacing.x += 3.0;
+                verify(ui, &mut state, overview, &mut builds);
+                ui.spacing_mut().extra_text_line_spacing += 2.0;
+                verify(ui, &mut state, overview, &mut builds);
+                let valign = if ui.text_valign() == egui::Align::TOP {
+                    egui::Align::BOTTOM
+                } else {
+                    egui::Align::TOP
+                };
+                ui.style_mut().override_text_valign = Some(valign);
+                verify(ui, &mut state, overview, &mut builds);
+            });
+            output.drop_without_applying_deltas();
+        }
+    }
+
+    #[test]
+    fn hover811_width_tracks_pixels_fonts_definitions_and_text_options_without_rebuilding_rows() {
+        fn frame(
+            ctx: &egui::Context,
+            state: &mut PreferencesState,
+            overview: bool,
+        ) -> (
+            Arc<Vec<super::OperationOverviewRow>>,
+            super::CommandWidthInput,
+        ) {
+            let mut result = None;
+            let output = ctx.run_ui(Default::default(), |ui| {
+                let snapshot = state.command_keymap();
+                let rows = super::cached_command_rows(state, &snapshot, overview);
+                super::cached_command_width(ui, state, overview);
+                let cache = if overview {
+                    &state.command_overview_cache
+                } else {
+                    &state.command_list_cache
+                };
+                result = Some((
+                    rows,
+                    cache
+                        .as_ref()
+                        .unwrap()
+                        .width
+                        .as_ref()
+                        .unwrap()
+                        .input
+                        .clone(),
+                ));
+            });
+            output.drop_without_applying_deltas();
+            result.unwrap()
+        }
+        for overview in [false, true] {
+            let ctx = egui::Context::default();
+            let mut state = hover811_state(false);
+            let (rows, initial) = frame(&ctx, &mut state, overview);
+            let (_, same) = frame(&ctx, &mut state, overview);
+            assert_eq!(initial, same);
+            super::COMMAND_WIDTH_BUILDS.with(|n| n.set(0));
+            ctx.set_pixels_per_point(1.5);
+            let (next_rows, scaled) = frame(&ctx, &mut state, overview);
+            assert!(Arc::ptr_eq(&rows, &next_rows));
+            assert_ne!(same.pixels_per_point, scaled.pixels_per_point);
+            assert_eq!(super::COMMAND_WIDTH_BUILDS.with(|n| n.get()), 1);
+            let mut definitions = scaled.definitions.clone();
+            definitions
+                .families
+                .insert(egui::FontFamily::Name("hover811-extra".into()), vec![]);
+            ctx.set_fonts(definitions);
+            let (next_rows, changed_fonts) = frame(&ctx, &mut state, overview);
+            assert!(Arc::ptr_eq(&rows, &next_rows));
+            assert_ne!(scaled.definitions, changed_fonts.definitions);
+            assert_eq!(super::COMMAND_WIDTH_BUILDS.with(|n| n.get()), 2);
+            ctx.global_style_mut(|style| {
+                style.visuals.text_options.font_hinting = !style.visuals.text_options.font_hinting
+            });
+            let (next_rows, changed_options) = frame(&ctx, &mut state, overview);
+            assert!(Arc::ptr_eq(&rows, &next_rows));
+            assert_ne!(changed_fonts.options, changed_options.options);
+            assert_eq!(super::COMMAND_WIDTH_BUILDS.with(|n| n.get()), 3);
+            frame(&ctx, &mut state, overview);
+            assert_eq!(super::COMMAND_WIDTH_BUILDS.with(|n| n.get()), 3);
+        }
+    }
+
+    #[test]
+    fn hover811_keyboard_tooltip_cache_matches_original_and_invalidates_each_dependency() {
+        let mut state = hover811_state(true);
+        let snapshot = state.command_keymap();
+        let keys: Vec<_> = super::keyboard_picker_main_rows()
+            .into_iter()
+            .chain(super::keyboard_picker_navigation_rows())
+            .chain(super::keyboard_picker_numpad_rows())
+            .flat_map(|row| row.iter())
+            .filter_map(|cell| match cell {
+                super::KeyboardPickerCell::Key(key, _) => Some(*key),
+                _ => None,
+            })
+            .collect();
+        for context in hover811_contexts() {
+            state.operation_keyboard_context = context;
+            for (ctrl, shift, alt) in [
+                (false, false, false),
+                (true, false, false),
+                (true, true, false),
+                (true, true, true),
+                (false, true, true),
+                (false, false, true),
+            ] {
+                state.operation_keyboard_ctrl = ctrl;
+                state.operation_keyboard_shift = shift;
+                state.operation_keyboard_alt = alt;
+                for &key in &keys {
+                    let chord = Chord::new(ctrl, shift, alt, key);
+                    let expected = super::keyboard_chord_tooltip(&snapshot.keymap, chord, context);
+                    let actual = super::cached_keyboard_chord_tooltip(&mut state, &snapshot, chord);
+                    assert_eq!(actual.text(), expected);
+                    super::KEYBOARD_TOOLTIP_BUILDS.with(|n| n.set(0));
+                    assert_eq!(
+                        super::cached_keyboard_chord_tooltip(&mut state, &snapshot, chord).text(),
+                        expected
+                    );
+                    assert_eq!(super::KEYBOARD_TOOLTIP_BUILDS.with(|n| n.get()), 0);
+                }
+                assert_eq!(
+                    state.keyboard_tooltip_cache.as_ref().unwrap().text.len(),
+                    102
+                );
+            }
+        }
+        state.operation_keyboard_ctrl = false;
+        state.operation_keyboard_shift = false;
+        state.operation_keyboard_alt = false;
+        state.operation_keyboard_context = None;
+        let chord = Chord::key(KeyName::F24);
+        super::cached_keyboard_chord_tooltip(&mut state, &snapshot, chord);
+        state.command_chord_inputs = ["F24".into(), "".into(), "".into()];
+        apply_command_editor(&mut state, KeyAction::GridCopyFiles);
+        let changed = state.command_keymap();
+        super::KEYBOARD_TOOLTIP_BUILDS.with(|n| n.set(0));
+        let text = super::cached_keyboard_chord_tooltip(&mut state, &changed, chord);
+        assert!(text.text().contains(KeyAction::GridCopyFiles.description()));
+        assert_eq!(super::KEYBOARD_TOOLTIP_BUILDS.with(|n| n.get()), 1);
+        assert_eq!(state.keyboard_tooltip_cache.as_ref().unwrap().text.len(), 1);
+        state.settings.keymap.overrides.clear();
+        let reset = state.command_keymap();
+        let text = super::cached_keyboard_chord_tooltip(&mut state, &reset, chord);
+        assert_eq!(
+            text.text(),
+            super::keyboard_chord_tooltip(&reset.keymap, chord, None)
+        );
+    }
+
+    #[test]
+    fn hover811_keyboard_tooltip_rebuilds_once_for_each_owner_input_and_keeps_lazy_subset() {
+        let mut state = hover811_state(false);
+        let snapshot = state.command_keymap();
+        let chord = Chord::key(KeyName::F1);
+        super::cached_keyboard_chord_tooltip(&mut state, &snapshot, chord);
+        for input in 0..4 {
+            match input {
+                0 => state.operation_keyboard_ctrl = true,
+                1 => state.operation_keyboard_shift = true,
+                2 => state.operation_keyboard_alt = true,
+                3 => state.operation_keyboard_context = Some(KeyContext::Grid),
+                _ => unreachable!(),
+            }
+            let chord = Chord::new(
+                state.operation_keyboard_ctrl,
+                state.operation_keyboard_shift,
+                state.operation_keyboard_alt,
+                KeyName::F1,
+            );
+            super::KEYBOARD_TOOLTIP_BUILDS.with(|n| n.set(0));
+            super::cached_keyboard_chord_tooltip(&mut state, &snapshot, chord);
+            super::cached_keyboard_chord_tooltip(&mut state, &snapshot, chord);
+            assert_eq!(super::KEYBOARD_TOOLTIP_BUILDS.with(|n| n.get()), 1);
+            assert_eq!(state.keyboard_tooltip_cache.as_ref().unwrap().text.len(), 1);
+        }
+    }
+
+    #[test]
+    fn hover811_cached_keyboard_tooltip_uses_original_label_layout_format() {
+        let mut state = hover811_state(false);
+        let snapshot = state.command_keymap();
+        let chord = Chord::key(KeyName::F1);
+        let expected = super::keyboard_chord_tooltip(&snapshot.keymap, chord, None);
+        let cached = super::cached_keyboard_chord_tooltip(&mut state, &snapshot, chord);
+        for override_font in [None, Some(egui::FontId::monospace(23.0))] {
+            let mut style = egui::Style::default();
+            style.override_font_id = override_font;
+            style.override_text_style = Some(egui::TextStyle::Heading);
+            style.visuals.override_text_color = Some(egui::Color32::RED);
+            for valign in [egui::Align::TOP, egui::Align::Center, egui::Align::BOTTOM] {
+                let original = egui::WidgetText::from(expected.clone()).into_layout_job(
+                    &style,
+                    egui::FontSelection::Default,
+                    valign,
+                );
+                let actual =
+                    cached
+                        .clone()
+                        .into_layout_job(&style, egui::FontSelection::Default, valign);
+                assert_eq!(actual, original);
+            }
+        }
+    }
+
+    #[test]
+    fn hover811_row_tooltips_are_lazy_and_accesskit_preserves_every_description() {
+        for overview in [false, true] {
+            for accessible in [false, true] {
+                let ctx = egui::Context::default();
+                if accessible {
+                    ctx.enable_accesskit();
+                }
+                let mut state = hover811_state(true);
+                let snapshot = state.command_keymap();
+                for frame in 0..2 {
+                    super::COMMAND_ROW_TOOLTIP_BUILDS.with(|n| n.set(0));
+                    let output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(1600.0, 1200.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            if overview {
+                                super::page_command_overview(ui, &mut state);
+                            } else {
+                                super::command_list(ui, &mut state, &snapshot);
+                            }
+                        },
+                    );
+                    let rows = super::cached_command_rows(&mut state, &snapshot, overview);
+                    let builds = super::COMMAND_ROW_TOOLTIP_BUILDS.with(|n| n.get());
+                    if accessible {
+                        // A new Grid first runs an invisible sizing pass, which has
+                        // no AccessKit nodes. Check descriptions in both final
+                        // outputs, and count registrations in the steady visible pass.
+                        if frame == 1 {
+                            assert_eq!(output.platform_output.num_completed_passes, 1);
+                            assert_eq!(builds, rows.len());
+                        }
+                        let update = output.platform_output.accesskit_update.as_ref().unwrap();
+                        for row in rows.iter() {
+                            assert!(
+                                update
+                                    .nodes
+                                    .iter()
+                                    .any(|(_, node)| node.value() == Some(row.label.as_str())
+                                        && node.description() == Some(row.hover)),
+                                "missing description: {} / {}",
+                                row.label,
+                                row.context
+                            );
+                        }
+                    } else {
+                        assert_eq!(builds, 0);
+                        assert!(output.platform_output.accesskit_update.is_none());
+                    }
+                    output.drop_without_applying_deltas();
+                }
+            }
+        }
+    }
+
     #[test]
     fn hover808_raw_override_status_matches_original_helper() {
         use crate::keymap::{KeyBindingOverride, KeymapSettings};
@@ -13337,7 +14287,7 @@ mod tests {
     fn hover808_keyboard_tooltip_is_lazy_without_hover_and_accesskit_keeps_descriptions() {
         let ctx = egui::Context::default();
         let mut state = zoom_key_editor_state();
-        let keymap = crate::keymap::Keymap::empty();
+        let keymap = state.command_keymap();
         for accessible in [false, true] {
             if accessible {
                 ctx.enable_accesskit();
@@ -13357,7 +14307,7 @@ mod tests {
             );
             let builds = super::KEYBOARD_TOOLTIP_BUILDS.with(|count| count.get());
             if accessible {
-                assert_eq!(builds, 102 * output.platform_output.num_completed_passes);
+                assert_eq!(builds, 102);
                 let update = output.platform_output.accesskit_update.as_ref().unwrap();
                 let mut checked = 0;
                 for cell in super::keyboard_picker_main_rows()
@@ -13371,7 +14321,7 @@ mod tests {
                     };
                     let label = label.unwrap_or_else(|| key.display_name());
                     let expected = super::keyboard_chord_tooltip(
-                        &keymap,
+                        &keymap.keymap,
                         crate::keymap::Chord::key(key),
                         None,
                     );
@@ -13521,10 +14471,10 @@ mod tests {
                             egui::TextStyle::Monospace,
                             egui::FontId::monospace(font_size),
                         );
-                        let keymap = crate::keymap::Keymap::from_settings(&state.settings.keymap);
+                        let keymap = state.command_keymap();
                         expected.clear();
                         for (action, _) in command_chord_layout_bindings() {
-                            for value in keymap.chord_labels(action) {
+                            for value in keymap.keymap.chord_labels(action) {
                                 let galley =
                                     egui::WidgetText::from(egui::RichText::new(&value).monospace())
                                         .into_galley(
@@ -13536,7 +14486,7 @@ mod tests {
                                 expected.push((value, galley.size()));
                             }
                         }
-                        super::command_list(ui, state, &keymap, &[]);
+                        super::command_list(ui, state, &keymap);
                     },
                     (state, Vec::<(String, egui::Vec2)>::new(), false),
                 );
@@ -13597,8 +14547,8 @@ mod tests {
                     ui.ctx().request_repaint();
                     return;
                 }
-                let keymap = crate::keymap::Keymap::from_settings(&state.settings.keymap);
-                super::command_list(ui, &mut state, &keymap, &[]);
+                let keymap = state.command_keymap();
+                super::command_list(ui, &mut state, &keymap);
             });
         harness.run();
         harness.snapshot("command_chords_catalog_dark");
