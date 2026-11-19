@@ -657,6 +657,104 @@ mod compare_original_tests {
     }
 
     #[test]
+    fn compare_original_hud_uses_the_drawn_variant_while_preparing_ready_and_released() {
+        use crate::app::{DisplayedFinalAiState as D, FinalAiJobState as J, NotAppliedReason as R};
+        let _serial = crate::key_input::lock_test_input();
+        let _clear = ClearOriginalPreviewSyntheticInput;
+        for mode in [
+            crate::app::CompareViewMode::wipe(0.37),
+            crate::app::CompareViewMode::Diff,
+            crate::app::CompareViewMode::PinnedNormal,
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = ready_app(&ctx, mode);
+            app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+            app.settings.global_preset.upscale_model = Some("realesr_general_v3".into());
+            let ai_key = app
+                .final_ai_key_for_pixels(
+                    app.current_edit_result_key(0),
+                    [2, 2],
+                    app.effective_params(0),
+                )
+                .unwrap();
+            app.final_ai_cache.insert(
+                ai_key,
+                crate::app::FinalAiEntry {
+                    diagnostic_metadata: None,
+                    canonical_dims: None,
+                    source_size: [2, 2],
+                    pixels: Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::WHITE)),
+                    used_upscale: true,
+                },
+            );
+            app.ensure_final_composite_texture(&ctx, 0).unwrap();
+            let baseline = app
+                .top_bar_ai_upscale_info(0, app.fs_display_stage(0, false))
+                .unwrap();
+            assert!(matches!(baseline.1, D::Applied { .. }));
+            assert_eq!(app.final_ai_job_state(0), J::Ready);
+            let tx = controlled_pending(&mut app);
+            let result = result_for(&app);
+            hold(&mut app);
+
+            // The processed comparison stays visible while its original pair is pending.
+            let preparing_visual = app.original_preview_visual_active_for_frame(
+                &ctx,
+                0,
+                false,
+                CompareFramePrimaryDraw::PreparedCompareOnly,
+            );
+            assert!(!preparing_visual);
+            assert_eq!(
+                app.top_bar_ai_upscale_info(0, app.fs_display_stage(0, preparing_visual)),
+                Some(baseline.clone())
+            );
+
+            // Feed the existing completion owner directly, with no worker or real key input.
+            tx.send(Ok(result)).unwrap();
+            app.poll_compare_prepare_pending(&ctx);
+            next_frame(&ctx);
+            assert!(!app.original_preview_active_for_frame(&ctx, 0));
+            let original_visual = app.original_preview_visual_active_for_frame(
+                &ctx,
+                0,
+                false,
+                CompareFramePrimaryDraw::PreparedCompareOnly,
+            );
+            assert!(original_visual);
+            let stage = app.fs_display_stage(0, original_visual);
+            let (label, displayed) = app.top_bar_ai_upscale_info(0, stage).unwrap();
+            assert_eq!(displayed, D::NotApplied(R::OriginalShown));
+            assert_eq!(
+                app.cached_top_bar_page_info(0, stage).ai_upscale_info,
+                Some((label.clone(), displayed))
+            );
+            assert!(
+                build_info_text(None, None, false, Some((&label, displayed)), None)
+                    .ends_with("、元画像を表示中)")
+            );
+            assert_eq!(
+                fs_ai_status_activity(J::Ready, displayed, false, false, false),
+                (false, false, false)
+            );
+
+            release_hold();
+            next_frame(&ctx);
+            let released_visual = app.original_preview_visual_active_for_frame(
+                &ctx,
+                0,
+                false,
+                CompareFramePrimaryDraw::PreparedCompareOnly,
+            );
+            assert!(!released_visual);
+            assert_eq!(
+                app.top_bar_ai_upscale_info(0, app.fs_display_stage(0, released_visual)),
+                Some(baseline)
+            );
+        }
+    }
+
+    #[test]
     fn compare_original_visual_gate_suppresses_edit_overlay_only_for_the_drawn_variant() {
         let _serial = crate::key_input::lock_test_input();
         let _clear = ClearOriginalPreviewSyntheticInput;

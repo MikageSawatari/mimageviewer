@@ -13450,6 +13450,32 @@ impl App {
         }
     }
 
+    /// Classify the existing display selector without starting any producer or
+    /// reading original-preview input. HUD callers supply the drawn frame's value.
+    pub(crate) fn fs_display_stage(
+        &self,
+        idx: usize,
+        original_preview_active: bool,
+    ) -> FsDisplayStage {
+        if self.raw_development_blocked(idx) {
+            FsDisplayStage::RawDevelopmentBlocked
+        } else if matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+            FsDisplayStage::Video
+        } else if self.fs_entry_is_animated(idx) {
+            FsDisplayStage::Animated
+        } else if self.fs_display_bypasses_final_pipeline(original_preview_active) {
+            FsDisplayStage::Original
+        } else if self.erase_mode {
+            FsDisplayStage::Erase
+        } else if self.local_adjust_mode {
+            FsDisplayStage::LocalAdjust
+        } else if self.conceal_mode && !self.conceal_preview_active {
+            FsDisplayStage::Conceal
+        } else {
+            FsDisplayStage::Final
+        }
+    }
+
     fn resolve_fs_processed_material_from_caches(
         &mut self,
         ctx: &egui::Context,
@@ -13457,118 +13483,117 @@ impl App {
         original_preview_active: bool,
         depth_wait: &mut Option<crate::depth_parallax::DepthSourceWait>,
     ) -> Option<FullscreenPaintResource> {
-        if self.raw_development_blocked(idx) {
-            return self.resolve_original_preview_material(idx);
-        }
-        let is_video = matches!(self.items.get(idx), Some(GridItem::Video(_)));
-        if is_video {
-            return None;
-        }
-        if self.fs_entry_is_animated(idx) {
-            return self.source_material_for_idx(idx);
-        }
-        // Z 分析モードは AI / 補正 / 注釈 / 隠蔽 / 消しゴム / 局所補正をすべてバイパスして
-        // **raw 元画像**を表示する (original preview と同じ経路)。分析パネルの色取得・
-        // ヒストグラム・グレースケール/拡大鏡オーバーレイは raw fs_cache を読むので、表示も raw に
-        // 揃えることで「クリックした見た目の色 = 分析値」が一致する (Codex 指摘 + ユーザー要望)。
-        if self.fs_display_bypasses_final_pipeline(original_preview_active) {
-            self.ensure_original_material_for_entry(
-                idx,
-                crate::app::OriginalMaterialEntry::MaterialOnly,
-            );
-            return self.resolve_original_preview_material(idx);
-        }
-
-        if self.erase_mode {
-            if !self.erase_preview_active {
-                return self.ensure_erase_base_material(ctx, idx);
+        match self.fs_display_stage(idx, original_preview_active) {
+            FsDisplayStage::RawDevelopmentBlocked => {
+                return self.resolve_original_preview_material(idx);
             }
-            let preview_tex = self.erase_preview_cache.get(&idx).map(|e| {
-                self.fs_resource_for_accepted_texture(
+            FsDisplayStage::Video => return None,
+            FsDisplayStage::Animated => return self.source_material_for_idx(idx),
+            // Z 分析モードは AI / 補正 / 注釈 / 隠蔽 / 消しゴム / 局所補正をすべてバイパスして
+            // **raw 元画像**を表示する (original preview と同じ経路)。分析パネルの色取得・
+            // ヒストグラム・グレースケール/拡大鏡オーバーレイは raw fs_cache を読むので、表示も raw に
+            // 揃えることで「クリックした見た目の色 = 分析値」が一致する (Codex 指摘 + ユーザー要望)。
+            FsDisplayStage::Original => {
+                self.ensure_original_material_for_entry(
                     idx,
-                    e.texture.clone(),
-                    crate::source_coverage::SourceCoverage::FullSource,
-                    e.display_basis,
-                )
-            });
-            return preview_tex
-                .or_else(|| self.resolve_fs_pre_overlay_material(idx))
-                .or_else(|| self.ensure_erase_base_material(ctx, idx));
-        }
+                    crate::app::OriginalMaterialEntry::MaterialOnly,
+                );
+                return self.resolve_original_preview_material(idx);
+            }
 
-        if self.local_adjust_mode {
-            // 判定は副作用ゼロの `decide_local_adjust_preview_action` に集約 (= unit
-            // test できる)。caller である本関数は OS API 読み・cache lookup・worker
-            // spawn・source texture フォールバックの責務だけを持つ。
-            //
-            // `prepare_fullscreen_state` 経由では ctx がメインビューポートのものになり、
-            // フルスクリーンが OS フォーカスを持つ間は modifier event が届かないため、
-            // `original_preview_active` と同じく OS キー状態を見る (fs_prev_focused
-            // ガードは decide 関数内に集約済み)。
-            self.maybe_start_local_adjust_render(idx);
-            let total_layers = self
-                .local_adjust_page_layers
-                .get(&idx)
-                .map(|layers| layers.len())
-                .unwrap_or(0);
-            let focus_viewport = if self.fullscreen_embedded_still_active() {
-                ctx.viewport_id()
-            } else {
-                self.fullscreen_viewport_id()
-            };
-            let level_permit = crate::keyboard_input::focused_key_state_permit_for_viewport(
-                focus_viewport,
-                self.fs_prev_focused,
-            );
-            let action = decide_local_adjust_preview_action(
-                self.fs_prev_focused,
-                level_permit.is_some_and(ctrl_held_via_os),
-                level_permit.is_some_and(shift_held_via_os),
-                self.local_adjust_show_source,
-                self.local_adjust_preview_to_selected_layer,
-                total_layers > 0,
-                self.selected_local_adjust_layer_idx(idx),
-                total_layers,
-            );
-            match action {
-                LocalAdjustPreviewAction::ShowSource => {
-                    return self.resolve_local_adjust_source_material(ctx, idx);
+            FsDisplayStage::Erase => {
+                if !self.erase_preview_active {
+                    return self.ensure_erase_base_material(ctx, idx);
                 }
-                LocalAdjustPreviewAction::BypassLayer { layer_idx } => {
-                    self.maybe_start_local_adjust_layer_bypass_preview(idx, layer_idx);
-                    if let Some(tex) =
-                        self.current_local_adjust_layer_bypass_material(idx, layer_idx)
-                    {
-                        return Some(tex);
-                    }
-                    return self.resolve_local_adjust_source_material(ctx, idx);
-                }
-                LocalAdjustPreviewAction::PrefixPreview { layer_count } => {
-                    self.maybe_start_local_adjust_prefix_preview(idx, layer_count);
-                    if let Some(tex) =
-                        self.current_local_adjust_prefix_preview_material(idx, layer_count)
-                    {
-                        return Some(tex);
-                    }
-                    return self.resolve_local_adjust_source_material(ctx, idx);
-                }
-                LocalAdjustPreviewAction::FullComposite => {
-                    if let Some(local_adjust_tex) = self.ensure_local_adjust_material(ctx, idx) {
-                        return Some(local_adjust_tex);
-                    }
-                    return self.resolve_local_adjust_source_material(ctx, idx);
-                }
+                let preview_tex = self.erase_preview_cache.get(&idx).map(|e| {
+                    self.fs_resource_for_accepted_texture(
+                        idx,
+                        e.texture.clone(),
+                        crate::source_coverage::SourceCoverage::FullSource,
+                        e.display_basis,
+                    )
+                });
+                return preview_tex
+                    .or_else(|| self.resolve_fs_pre_overlay_material(idx))
+                    .or_else(|| self.ensure_erase_base_material(ctx, idx));
             }
-        }
 
-        if self.conceal_mode && !self.conceal_preview_active {
-            if let Some(local_adjust_tex) = self.ensure_local_adjust_material(ctx, idx) {
-                return Some(local_adjust_tex);
+            FsDisplayStage::LocalAdjust => {
+                // 判定は副作用ゼロの `decide_local_adjust_preview_action` に集約 (= unit
+                // test できる)。caller である本関数は OS API 読み・cache lookup・worker
+                // spawn・source texture フォールバックの責務だけを持つ。
+                //
+                // `prepare_fullscreen_state` 経由では ctx がメインビューポートのものになり、
+                // フルスクリーンが OS フォーカスを持つ間は modifier event が届かないため、
+                // `original_preview_active` と同じく OS キー状態を見る (fs_prev_focused
+                // ガードは decide 関数内に集約済み)。
+                self.maybe_start_local_adjust_render(idx);
+                let total_layers = self
+                    .local_adjust_page_layers
+                    .get(&idx)
+                    .map(|layers| layers.len())
+                    .unwrap_or(0);
+                let focus_viewport = if self.fullscreen_embedded_still_active() {
+                    ctx.viewport_id()
+                } else {
+                    self.fullscreen_viewport_id()
+                };
+                let level_permit = crate::keyboard_input::focused_key_state_permit_for_viewport(
+                    focus_viewport,
+                    self.fs_prev_focused,
+                );
+                let action = decide_local_adjust_preview_action(
+                    self.fs_prev_focused,
+                    level_permit.is_some_and(ctrl_held_via_os),
+                    level_permit.is_some_and(shift_held_via_os),
+                    self.local_adjust_show_source,
+                    self.local_adjust_preview_to_selected_layer,
+                    total_layers > 0,
+                    self.selected_local_adjust_layer_idx(idx),
+                    total_layers,
+                );
+                match action {
+                    LocalAdjustPreviewAction::ShowSource => {
+                        return self.resolve_local_adjust_source_material(ctx, idx);
+                    }
+                    LocalAdjustPreviewAction::BypassLayer { layer_idx } => {
+                        self.maybe_start_local_adjust_layer_bypass_preview(idx, layer_idx);
+                        if let Some(tex) =
+                            self.current_local_adjust_layer_bypass_material(idx, layer_idx)
+                        {
+                            return Some(tex);
+                        }
+                        return self.resolve_local_adjust_source_material(ctx, idx);
+                    }
+                    LocalAdjustPreviewAction::PrefixPreview { layer_count } => {
+                        self.maybe_start_local_adjust_prefix_preview(idx, layer_count);
+                        if let Some(tex) =
+                            self.current_local_adjust_prefix_preview_material(idx, layer_count)
+                        {
+                            return Some(tex);
+                        }
+                        return self.resolve_local_adjust_source_material(ctx, idx);
+                    }
+                    LocalAdjustPreviewAction::FullComposite => {
+                        if let Some(local_adjust_tex) = self.ensure_local_adjust_material(ctx, idx)
+                        {
+                            return Some(local_adjust_tex);
+                        }
+                        return self.resolve_local_adjust_source_material(ctx, idx);
+                    }
+                }
             }
-            if let Some(erase_result_tex) = self.ensure_erase_result_material(ctx, idx) {
-                return Some(erase_result_tex);
+
+            FsDisplayStage::Conceal => {
+                if let Some(local_adjust_tex) = self.ensure_local_adjust_material(ctx, idx) {
+                    return Some(local_adjust_tex);
+                }
+                if let Some(erase_result_tex) = self.ensure_erase_result_material(ctx, idx) {
+                    return Some(erase_result_tex);
+                }
+                return self.resolve_fs_pre_overlay_material(idx);
             }
-            return self.resolve_fs_pre_overlay_material(idx);
+            FsDisplayStage::Final => {}
         }
 
         // comic (テキスト注釈) は最前面 = パイプライン最終段 (D1)。注釈が無ければ
@@ -19067,6 +19092,20 @@ fn spread_shift_direction_for_input(
 }
 
 // ── フルスクリーン状態の中間構造体 ──────────────────────────────────────
+
+/// Mutually exclusive branches of the ordinary fullscreen material selector.
+/// Raw blocking is distinct from Original because only Original ensures source material.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsDisplayStage {
+    RawDevelopmentBlocked,
+    Video,
+    Animated,
+    Original,
+    Erase,
+    LocalAdjust,
+    Conceal,
+    Final,
+}
 
 /// フルスクリーン描画 1 フレーム分の事前計算済み状態。
 struct FsFrameState {
@@ -28845,10 +28884,6 @@ impl App {
                             }
                         }
                         if overview_rendered { return; }
-                        // Match this frame's drawn material without sampling original-preview
-                        // input again for either page of a spread.
-                        let display_bypassed = self
-                            .fs_display_bypasses_final_pipeline(state.original_preview_active);
                         // Paint foreground controls first so their current rectangle owns
                         // pointer input and mouse-follow suppression on the first frame too.
                         let depth_panel = self.draw_depth_panel(ctx, fs_idx);
@@ -29422,6 +29457,10 @@ impl App {
                         let original_preview_visual_active = self.original_preview_visual_active_for_frame(
                             ctx, paint_idx, state.original_preview_active, primary_draw,
                         );
+                        // Reuse the actual drawn original variant, including comparison.
+                        // HUD consumers never sample keys or compare selection themselves.
+                        let display_stage =
+                            self.fs_display_stage(fs_idx, original_preview_visual_active);
                         let edit_canvas_t0 = std::time::Instant::now();
                         if similar_preview_presentation.is_none() {
                         // ── 消しゴムモード: マスク塗り＋オーバーレイ描画 ──
@@ -30109,7 +30148,7 @@ impl App {
                                     SpreadPair::Single => {
                                         let mut info = state.top_bar_page_info();
                                         info.ai_upscale_info =
-                                            self.top_bar_ai_upscale_info(fs_idx, display_bypassed);
+                                            self.top_bar_ai_upscale_info(fs_idx, display_stage);
                                         vec![info]
                                     }
                                     SpreadPair::Double { left, right } => [left, right]
@@ -30118,10 +30157,13 @@ impl App {
                                             if idx == fs_idx {
                                                 let mut info = state.top_bar_page_info();
                                                 info.ai_upscale_info = self
-                                                    .top_bar_ai_upscale_info(idx, display_bypassed);
+                                                    .top_bar_ai_upscale_info(idx, display_stage);
                                                 info
                                             } else {
-                                                self.cached_top_bar_page_info(idx, display_bypassed)
+                                                self.cached_top_bar_page_info(
+                                                    idx,
+                                                    self.fs_display_stage(idx, original_preview_visual_active),
+                                                )
                                             }
                                         })
                                         .collect(),
@@ -30372,7 +30414,7 @@ impl App {
 
                         // ── フルスクリーン左下ステータス表示 ──
                         if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
-                            self.draw_fs_ai_status(ui, fs_idx, display_bypassed);
+                            self.draw_fs_ai_status(ui, fs_idx, display_stage);
                         }
 
                         self.draw_viewer_shared_overlays(ui, full_rect, ctx);
@@ -32903,7 +32945,11 @@ impl App {
         .ok()
     }
 
-    fn cached_top_bar_page_info(&self, idx: usize, display_bypassed: bool) -> FsTopBarPageInfo {
+    fn cached_top_bar_page_info(
+        &self,
+        idx: usize,
+        display_stage: FsDisplayStage,
+    ) -> FsTopBarPageInfo {
         let (image_dims, image_downscaled) = match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::RawPreview {
                 developed_dims: [w, h],
@@ -32977,7 +33023,7 @@ impl App {
             },
             ai_upscale_info: None,
         };
-        info.ai_upscale_info = self.top_bar_ai_upscale_info(idx, display_bypassed);
+        info.ai_upscale_info = self.top_bar_ai_upscale_info(idx, display_stage);
         info
     }
 
@@ -32987,9 +33033,9 @@ impl App {
     fn top_bar_ai_upscale_info(
         &self,
         idx: usize,
-        display_bypassed: bool,
+        display_stage: FsDisplayStage,
     ) -> Option<(String, crate::app::DisplayedFinalAiState)> {
-        let state = self.displayed_final_ai_state(idx, display_bypassed);
+        let state = self.displayed_final_ai_state(idx, display_stage);
         if state == crate::app::DisplayedFinalAiState::NotRequested {
             return None;
         }
@@ -55272,9 +55318,14 @@ impl App {
     }
 
     /// フルスクリーン左下に AI 処理ステータスを表示する。
-    fn draw_fs_ai_status(&mut self, ui: &mut egui::Ui, fs_idx: usize, display_bypassed: bool) {
+    fn draw_fs_ai_status(
+        &mut self,
+        ui: &mut egui::Ui,
+        fs_idx: usize,
+        display_stage: FsDisplayStage,
+    ) {
         let has_ai_pending = !self.final_ai_pending.is_empty();
-        let displayed = self.displayed_final_ai_state(fs_idx, display_bypassed);
+        let displayed = self.displayed_final_ai_state(fs_idx, display_stage);
         let job = self.final_ai_job_state(fs_idx);
         let is_loading = self.fs_pending.contains_key(&fs_idx);
         let raw_indicator = self
@@ -94103,6 +94154,7 @@ mod tests {
                 D::NotApplied(R::OriginalShown),
                 " (AI 未適用: 漫画、元画像を表示中)",
             ),
+            (D::NotApplied(R::EditingShown), " (AI 未適用: 漫画、編集中)"),
             (
                 D::NotApplied(R::Animated),
                 " (AI 未適用: 漫画、アニメーション)",
@@ -94178,16 +94230,23 @@ mod tests {
         right.denoise_model = None;
         app.adjustment_page_params.insert(1, right);
         assert_eq!(
-            app.top_bar_ai_upscale_info(0, false).unwrap().0,
+            app.top_bar_ai_upscale_info(0, app.fs_display_stage(0, false))
+                .unwrap()
+                .0,
             format!("{denoise} + 自動")
         );
         app.ai_classify_cache
             .insert(0, crate::ai::ImageCategory::Comic);
         assert_eq!(
-            app.top_bar_ai_upscale_info(0, false).unwrap().0,
+            app.top_bar_ai_upscale_info(0, app.fs_display_stage(0, false))
+                .unwrap()
+                .0,
             format!("{denoise} + 漫画")
         );
-        assert!(app.top_bar_ai_upscale_info(1, false).is_none());
+        assert!(
+            app.top_bar_ai_upscale_info(1, app.fs_display_stage(1, false))
+                .is_none()
+        );
         // Existing lower-left wording continues to use the current runtime request.
         app.sync_upscale_from_preset(0);
         assert_eq!(
@@ -94197,7 +94256,143 @@ mod tests {
     }
 
     #[test]
-    fn spread_top_bar_and_cached_page_share_the_drawn_frame_bypass() {
+    fn fullscreen_display_stage_preserves_selector_priority_and_tool_preview_branches() {
+        use crate::app::raw_page_store::{RawDevelopBlocked, RawDevelopPhase};
+        use FsDisplayStage as S;
+        let mut app = crate::app::raw_page_store::tests::app_with_raw_and_jpeg();
+        app.analysis_mode = true;
+        app.erase_mode = true;
+        app.local_adjust_mode = true;
+        app.conceal_mode = true;
+        app.conceal_preview_active = false;
+        *app.raw_pages.page(0).unwrap().develop.lock().unwrap() =
+            RawDevelopPhase::Blocked(RawDevelopBlocked::Unsupported);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Animated {
+                frames: Vec::new(),
+                current_frame: 0,
+                frame_pixels: Vec::new(),
+                playback: crate::fs_animation::AnimationPlayback::Paused,
+                load_seq: 0,
+            },
+        );
+        assert_eq!(app.fs_display_stage(0, true), S::RawDevelopmentBlocked);
+        // Keep every lower-priority condition enabled as each higher branch retires.
+        app.items[0] = GridItem::Video(PathBuf::from("stage.mp4"));
+        assert_eq!(app.fs_display_stage(0, true), S::Video);
+        app.items[0] = GridItem::Image(PathBuf::from("stage.png"));
+        assert_eq!(app.fs_display_stage(0, true), S::Animated);
+        app.fs_cache.remove(&0);
+        assert_eq!(app.fs_display_stage(0, false), S::Original);
+        app.analysis_mode = false;
+        assert_eq!(app.fs_display_stage(0, true), S::Original);
+        for preview in [false, true] {
+            app.erase_preview_active = preview;
+            assert_eq!(app.fs_display_stage(0, false), S::Erase);
+        }
+        app.erase_mode = false;
+        assert_eq!(app.fs_display_stage(0, false), S::LocalAdjust);
+        app.local_adjust_mode = false;
+        assert_eq!(app.fs_display_stage(0, false), S::Conceal);
+        app.conceal_preview_active = true;
+        assert_eq!(app.fs_display_stage(0, false), S::Final);
+        app.conceal_mode = false;
+        assert_eq!(app.fs_display_stage(0, false), S::Final);
+    }
+
+    #[test]
+    fn editing_display_does_not_report_ready_ai_as_processing_or_applied() {
+        use crate::app::{DisplayedFinalAiState as D, FinalAiJobState as J, NotAppliedReason as R};
+        for complete in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = setup_navigation_readiness_app(1);
+            app.settings.global_preset.colorize.mode = crate::colorize::ColorizeMode::Disabled;
+            app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+            app.settings.global_preset.upscale_model = Some("realesr_general_v3".into());
+            insert_navigation_original_page(&mut app, &ctx, 0);
+            let key = app
+                .final_ai_key_for_pixels(
+                    app.current_edit_result_key(0),
+                    [2, 2],
+                    app.effective_params(0),
+                )
+                .unwrap();
+            app.final_ai_cache.insert(
+                key,
+                crate::app::FinalAiEntry {
+                    diagnostic_metadata: None,
+                    canonical_dims: None,
+                    source_size: [2, 2],
+                    pixels: Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::WHITE)),
+                    used_upscale: true,
+                },
+            );
+            if complete {
+                app.ensure_final_composite_texture(&ctx, 0).unwrap();
+            }
+            let baseline = app.displayed_final_ai_state(0, app.fs_display_stage(0, false));
+            assert_eq!(matches!(baseline, D::Applied { .. }), complete);
+            assert_eq!(baseline == D::Processing, !complete);
+            assert_eq!(app.final_ai_job_state(0), J::Ready);
+            for (erase, erase_preview, local, conceal, conceal_preview, editing) in [
+                (true, false, false, false, false, true),
+                (true, true, false, false, false, true),
+                (false, false, false, false, false, false),
+                (false, false, true, false, false, true),
+                (false, false, false, true, false, true),
+                (false, false, false, true, true, false),
+                (false, false, false, false, false, false),
+            ] {
+                app.erase_mode = erase;
+                app.erase_preview_active = erase_preview;
+                app.local_adjust_mode = local;
+                app.conceal_mode = conceal;
+                app.conceal_preview_active = conceal_preview;
+                let stage = app.fs_display_stage(0, false);
+                let displayed = app.displayed_final_ai_state(0, stage);
+                let (label, hud_state) = app.top_bar_ai_upscale_info(0, stage).unwrap();
+                assert_eq!(hud_state, displayed);
+                let activity = fs_ai_status_activity(J::Ready, displayed, false, false, false);
+                if editing {
+                    assert_eq!(displayed, D::NotApplied(R::EditingShown));
+                    assert_eq!(activity, (false, false, false));
+                    if local {
+                        for show_source in [false, true] {
+                            for to_selected in [false, true] {
+                                app.local_adjust_show_source = show_source;
+                                app.local_adjust_preview_to_selected_layer = to_selected;
+                                let local_stage = app.fs_display_stage(0, false);
+                                assert_eq!(local_stage, FsDisplayStage::LocalAdjust);
+                                assert_eq!(app.displayed_final_ai_state(0, local_stage), displayed);
+                            }
+                        }
+                    }
+                    assert!(
+                        build_info_text(None, None, false, Some((&label, displayed)), None)
+                            .ends_with("、編集中)")
+                    );
+                    // A real running job retains the existing processing/busy indication.
+                    assert_eq!(
+                        fs_ai_status_activity(J::Running, displayed, false, true, false),
+                        (true, false, true)
+                    );
+                } else {
+                    assert_eq!(displayed, baseline);
+                    assert_eq!(activity, (!complete, complete, !complete));
+                }
+            }
+            app.erase_mode = true;
+            app.settings.global_preset.upscale_model = None;
+            assert_eq!(
+                app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
+                D::NotRequested
+            );
+        }
+    }
+
+    #[test]
+    fn spread_top_bar_and_cached_page_share_the_drawn_frame_stage() {
         use crate::app::{DisplayedFinalAiState as D, NotAppliedReason as R};
         let mut app = crate::app::setup_app_for_test();
         app.items = vec![
@@ -94226,13 +94421,13 @@ mod tests {
             let mut frame = FsFrameState::overview_shell();
             frame.original_preview_active = original_preview_active;
             app.analysis_mode = analysis_mode;
-            let bypass = app.fs_display_bypasses_final_pipeline(frame.original_preview_active);
             for (idx, label) in labels.into_iter().enumerate() {
-                let primary = app.top_bar_ai_upscale_info(idx, bypass);
-                let cached = app.cached_top_bar_page_info(idx, bypass).ai_upscale_info;
+                let stage = app.fs_display_stage(idx, frame.original_preview_active);
+                let primary = app.top_bar_ai_upscale_info(idx, stage);
+                let cached = app.cached_top_bar_page_info(idx, stage).ai_upscale_info;
                 assert_eq!(primary, Some((label.to_owned(), expected)));
                 assert_eq!(cached, primary);
-                let displayed = app.displayed_final_ai_state(idx, bypass);
+                let displayed = app.displayed_final_ai_state(idx, stage);
                 assert_eq!(displayed, expected);
                 assert_eq!(
                     fs_ai_status_activity(
@@ -94247,9 +94442,12 @@ mod tests {
             }
         }
         app.settings.global_preset.upscale_model = None;
-        assert!(app.top_bar_ai_upscale_info(0, true).is_none());
         assert!(
-            app.cached_top_bar_page_info(0, true)
+            app.top_bar_ai_upscale_info(0, app.fs_display_stage(0, true))
+                .is_none()
+        );
+        assert!(
+            app.cached_top_bar_page_info(0, app.fs_display_stage(0, true))
                 .ai_upscale_info
                 .is_none()
         );
@@ -94290,7 +94488,9 @@ mod tests {
                 animation: crate::fs_animation::StaticAnimationState::Still,
             },
         );
-        let (label, state) = app.top_bar_ai_upscale_info(0, false).unwrap();
+        let (label, state) = app
+            .top_bar_ai_upscale_info(0, app.fs_display_stage(0, false))
+            .unwrap();
         assert_eq!(state, D::Waiting);
         assert_eq!(label, denoise);
         let ai_key = app
@@ -94311,11 +94511,15 @@ mod tests {
                 used_upscale: false,
             },
         );
-        let (label, state) = app.top_bar_ai_upscale_info(0, false).unwrap();
+        let (label, state) = app
+            .top_bar_ai_upscale_info(0, app.fs_display_stage(0, false))
+            .unwrap();
         assert_eq!(state, D::Processing);
         assert_eq!(label, denoise);
         let raw = app.fs_cache.remove(&0).unwrap();
-        let (label, state) = app.top_bar_ai_upscale_info(0, false).unwrap();
+        let (label, state) = app
+            .top_bar_ai_upscale_info(0, app.fs_display_stage(0, false))
+            .unwrap();
         assert_eq!(state, D::Waiting);
         assert_eq!(label, denoise);
         app.fs_cache.insert(0, raw);
@@ -94343,7 +94547,9 @@ mod tests {
             upscale: false,
         });
         app.final_composite_cache.insert(final_key, final_entry);
-        let (label, state) = app.top_bar_ai_upscale_info(0, false).unwrap();
+        let (label, state) = app
+            .top_bar_ai_upscale_info(0, app.fs_display_stage(0, false))
+            .unwrap();
         assert_eq!(label, denoise);
         assert_eq!(
             state,
@@ -94359,9 +94565,19 @@ mod tests {
         // In-range requests cannot put an upscale name on an unupscaled result.
         app.settings.ai_upscale_size_limit =
             Some(crate::ai::upscale::AiProcessSizeLimit::square(4096));
-        assert_eq!(app.top_bar_ai_upscale_info(0, false).unwrap().0, denoise);
+        assert_eq!(
+            app.top_bar_ai_upscale_info(0, app.fs_display_stage(0, false))
+                .unwrap()
+                .0,
+            denoise
+        );
         app.fs_cache.remove(&0);
-        assert_eq!(app.top_bar_ai_upscale_info(0, false).unwrap().0, denoise);
+        assert_eq!(
+            app.top_bar_ai_upscale_info(0, app.fs_display_stage(0, false))
+                .unwrap()
+                .0,
+            denoise
+        );
     }
 
     #[test]
@@ -94439,7 +94655,9 @@ mod tests {
             app.final_ai_job_state(0),
             crate::app::FinalAiJobState::Ready
         );
-        let (label, state) = app.top_bar_ai_upscale_info(0, false).unwrap();
+        let (label, state) = app
+            .top_bar_ai_upscale_info(0, app.fs_display_stage(0, false))
+            .unwrap();
         assert_eq!(state, crate::app::DisplayedFinalAiState::Processing);
         assert_eq!(
             label,
@@ -94480,7 +94698,7 @@ mod tests {
                 is_upscaling: app.final_ai_job_state(0) == crate::app::FinalAiJobState::Running,
                 is_prefetching_ai: false,
                 is_upscaled: matches!(
-                    app.displayed_final_ai_state(0, false),
+                    app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
                     crate::app::DisplayedFinalAiState::Applied { .. }
                 ),
                 erase_complete: false,

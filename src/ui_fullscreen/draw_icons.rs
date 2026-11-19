@@ -1477,6 +1477,7 @@ pub(super) fn build_info_text(
                     R::Animated => "、アニメーション",
                     R::Unavailable => "",
                     R::OriginalShown => "、元画像を表示中",
+                    R::EditingShown => "、編集中",
                 };
                 format!("(AI 未適用: {label}{reason})")
             }

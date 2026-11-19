@@ -11675,6 +11675,7 @@ pub(crate) enum NotAppliedReason {
     Unavailable,
     Animated,
     OriginalShown,
+    EditingShown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84968,8 +84969,9 @@ impl App {
     pub(crate) fn displayed_final_ai_state(
         &self,
         idx: usize,
-        display_bypassed: bool,
+        display_stage: crate::ui_fullscreen::FsDisplayStage,
     ) -> DisplayedFinalAiState {
+        use crate::ui_fullscreen::FsDisplayStage as S;
         use DisplayedFinalAiState as D;
         use FinalAiJobState as J;
         use NotAppliedReason as R;
@@ -84979,11 +84981,12 @@ impl App {
         {
             return D::NotRequested;
         }
-        if display_bypassed {
-            return D::NotApplied(R::OriginalShown);
-        }
-        if self.fs_entry_is_animated(idx) {
-            return D::NotApplied(R::Animated);
+        match display_stage {
+            S::RawDevelopmentBlocked | S::Original => return D::NotApplied(R::OriginalShown),
+            S::Erase | S::LocalAdjust | S::Conceal => return D::NotApplied(R::EditingShown),
+            S::Animated => return D::NotApplied(R::Animated),
+            S::Video => return D::NotApplied(R::Unavailable),
+            S::Final => {}
         }
         if let Some((_, entry)) = self.exact_complete_final_composite_entry(idx) {
             if let Some(stages) = entry.ai_applied {

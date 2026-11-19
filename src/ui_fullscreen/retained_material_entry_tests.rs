@@ -308,7 +308,8 @@ fn retained_material_entry_final_metadata_supplies_coordinates_when_cache_has_on
     );
     assert_final_only(&app);
     assert_eq!(
-        app.cached_top_bar_page_info(0, false).image_dims,
+        app.cached_top_bar_page_info(0, app.fs_display_stage(0, false))
+            .image_dims,
         Some((1200, 1800))
     );
     app.open_export_dialog_for_current(&ctx, 0);

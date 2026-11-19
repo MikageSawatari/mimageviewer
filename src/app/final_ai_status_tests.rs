@@ -83,13 +83,13 @@ fn final_ai_status_job_states_preserve_done_or_skipped_and_exact_identity() {
     app.final_ai_pending.insert(old_key, pending());
     assert_job(&app, J::Waiting, false);
     assert_eq!(
-        app.displayed_final_ai_state(0, false),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
         DisplayedFinalAiState::Waiting
     );
     app.final_ai_pending.insert(key, pending());
     assert_job(&app, J::Running, false);
     assert_eq!(
-        app.displayed_final_ai_state(0, false),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
         DisplayedFinalAiState::Processing
     );
     app.final_ai_pending[&key]
@@ -101,7 +101,7 @@ fn final_ai_status_job_states_preserve_done_or_skipped_and_exact_identity() {
     app.final_ai_cache.insert(key, ai_entry());
     assert_job(&app, J::Ready, true);
     assert_eq!(
-        app.displayed_final_ai_state(0, false),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
         DisplayedFinalAiState::Processing
     );
     app.final_ai_cache.remove(&key);
@@ -110,13 +110,13 @@ fn final_ai_status_job_states_preserve_done_or_skipped_and_exact_identity() {
     app.settings.global_preset.upscale_model = None;
     assert_job(&app, J::NotRequested, true);
     assert_eq!(
-        app.displayed_final_ai_state(0, false),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
         DisplayedFinalAiState::NotRequested
     );
     app.fs_cache.remove(&0);
     assert_job(&app, J::SourcePending, false);
     assert_eq!(
-        app.displayed_final_ai_state(0, false),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
         DisplayedFinalAiState::NotRequested
     );
 }
@@ -153,7 +153,7 @@ fn final_ai_status_displayed_uses_completed_provenance_and_actual_texture_dimens
     });
     app.final_composite_cache.insert(final_key, entry);
     assert_eq!(
-        app.displayed_final_ai_state(0, false),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
         D::Applied {
             width: 7,
             height: 9,
@@ -165,7 +165,7 @@ fn final_ai_status_displayed_uses_completed_provenance_and_actual_texture_dimens
     );
     let source = app.fs_cache.remove(&0).unwrap();
     assert_eq!(
-        app.displayed_final_ai_state(0, false),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
         D::Applied {
             width: 7,
             height: 9,
@@ -179,13 +179,19 @@ fn final_ai_status_displayed_uses_completed_provenance_and_actual_texture_dimens
         .get_mut(&final_key)
         .unwrap()
         .complete = false;
-    assert_eq!(app.displayed_final_ai_state(0, false), D::Waiting);
+    assert_eq!(
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
+        D::Waiting
+    );
     let mut entry = app.final_composite_cache.remove(&final_key).unwrap();
     entry.complete = true;
     let mut stale_key = final_key;
     stale_key.params_hash ^= 1;
     app.final_composite_cache.insert(stale_key, entry);
-    assert_eq!(app.displayed_final_ai_state(0, false), D::Waiting);
+    assert_eq!(
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
+        D::Waiting
+    );
     let entry = app.final_composite_cache.remove(&stale_key).unwrap();
     app.final_composite_cache.insert(final_key, entry);
     app.final_composite_cache
@@ -193,7 +199,7 @@ fn final_ai_status_displayed_uses_completed_provenance_and_actual_texture_dimens
         .unwrap()
         .ai_applied = None;
     assert_eq!(
-        app.displayed_final_ai_state(0, false),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
         D::NotApplied(R::Unavailable)
     );
     // Restore the source to let the existing failed-key owner be consulted.
@@ -201,12 +207,12 @@ fn final_ai_status_displayed_uses_completed_provenance_and_actual_texture_dimens
     let key = ai_key(&app);
     app.final_ai_failed.insert(key);
     assert_eq!(
-        app.displayed_final_ai_state(0, false),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
         D::NotApplied(R::Failed)
     );
     app.final_composite_cache.clear();
     assert_eq!(
-        app.displayed_final_ai_state(0, false),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
         D::NotApplied(R::Failed)
     );
 }
@@ -219,7 +225,7 @@ fn final_ai_status_size_limit_animation_and_source_waiting() {
     app.settings.ai_upscale_size_limit = Some(crate::ai::upscale::AiProcessSizeLimit::square(1));
     assert_job(&app, FinalAiJobState::OutOfRange, true);
     assert_eq!(
-        app.displayed_final_ai_state(0, false),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
         D::NotApplied(NotAppliedReason::SizeLimit)
     );
     app.fs_cache.insert(
@@ -233,15 +239,21 @@ fn final_ai_status_size_limit_animation_and_source_waiting() {
         },
     );
     assert_eq!(
-        app.displayed_final_ai_state(0, false),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
         D::NotApplied(NotAppliedReason::Animated)
     );
     app.settings.global_preset.upscale_model = None;
-    assert_eq!(app.displayed_final_ai_state(0, false), D::NotRequested);
+    assert_eq!(
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
+        D::NotRequested
+    );
     app.settings.global_preset.upscale_model = Some("realesr_general_v3".into());
     app.fs_cache.remove(&0);
     assert_job(&app, FinalAiJobState::SourcePending, false);
-    assert_eq!(app.displayed_final_ai_state(0, false), D::Waiting);
+    assert_eq!(
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
+        D::Waiting
+    );
 }
 
 #[test]
@@ -252,25 +264,31 @@ fn final_ai_status_original_display_overrides_ready_and_completed_ai() {
     let key = ai_key(&app);
     app.final_ai_cache.insert(key, ai_entry());
     assert_eq!(app.final_ai_job_state(0), FinalAiJobState::Ready);
-    assert_eq!(app.displayed_final_ai_state(0, false), D::Processing);
+    assert_eq!(
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
+        D::Processing
+    );
     app.analysis_mode = true;
     assert_eq!(
-        app.displayed_final_ai_state(0, true),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, true)),
         D::NotApplied(NotAppliedReason::OriginalShown)
     );
     app.analysis_mode = false;
     let _ = app.ensure_final_composite_texture(&ctx, 0).unwrap();
     assert!(matches!(
-        app.displayed_final_ai_state(0, false),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
         D::Applied { .. }
     ));
     // Original comparison has the same display bypass, with no real key input.
     assert_eq!(
-        app.displayed_final_ai_state(0, true),
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, true)),
         D::NotApplied(NotAppliedReason::OriginalShown)
     );
     app.settings.global_preset.upscale_model = None;
-    assert_eq!(app.displayed_final_ai_state(0, true), D::NotRequested);
+    assert_eq!(
+        app.displayed_final_ai_state(0, app.fs_display_stage(0, true)),
+        D::NotRequested
+    );
 }
 
 #[test]
@@ -379,7 +397,7 @@ fn final_ai_status_composite_records_selected_ai_base_for_sync_and_worker_paths(
                 .is_some()
         );
         assert!(matches!(
-            app.displayed_final_ai_state(0, false),
+            app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
             DisplayedFinalAiState::Applied {
                 width: 8,
                 height: 12,
@@ -441,7 +459,7 @@ fn final_ai_status_denoise_only_result_records_input_range_through_final_effect(
             expected
         );
         assert!(matches!(
-            app.displayed_final_ai_state(0, false),
+            app.displayed_final_ai_state(0, app.fs_display_stage(0, false)),
             DisplayedFinalAiState::Applied {
                 stages: FinalAiStages {
                     denoise: true,
