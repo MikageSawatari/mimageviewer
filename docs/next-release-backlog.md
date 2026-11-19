@@ -84,6 +84,7 @@
 - (b) 上限に近い遅いテスト: `app::search_nav_entry_inventory_tests::search_nav_inventory_{container,everything,metadata,tag}_all_independent_key_inputs` の 4 件が、本体 lib 全件で 203〜210 秒、単独で 60〜87 秒かかり、test-full の負荷で 300 秒の上限を超えた (5093a7d70 の取り込み後)。テストを分けるか、走査の費用を減らすかを検討する。上限を延ばすだけにはしない。
 - (c) 負荷で DB の書き込み待ちが 5 秒を超えるテスト: `folder_thumb_pins::tests::concurrent_refresh_opens_preserve_pin_rows_and_store_revision` が test-full の中で `database is locked` (busy_timeout 超過) で失敗した (822f96595 の取り込み後)。単独の 10 回連続では全部成功。テストのスレッド数・待ちの前提が負荷に耐えるかを見直す。
 - (d) **未対応 (2026-11-19、v5.4.0 のリリース準備で発見)**: `test-lib-full.ps1 -Features test-script` の全件 (4735863b8 の 1 つ前のソース) で `epub_convert::tests::sibling_save_passes_original_stem_to_worker_after_copying_source` が epub_convert.rs:1707 の unwrap で失敗 (`Io: ファイル名、ディレクトリ名、またはボリューム ラベルの構文が間違っています。 (0x8007007B)`)。単独の --stress-count 10 では全部成功。負荷の下でだけ出る。g3・RAR 評価と同じく、テストの外部依存 (一時フォルダ・ワーカーの起動) を疑う。v5.4.0 は止めない。同じ全件中の test-full (既定 feature) では 2 回とも通っている。
+- (e) **未対応 (2026-11-19、v5.4.0 の配布ビルドの全体テストで発見)**: `archive_conversion_failure_diagnostics::locked_zip_publish_reports_plain_message_and_native_error_without_overwrite` が tests/archive_conversion_failure_diagnostics.rs:64 の `read_to_string(logs_dir()/archive-conversion-failure-test.log)` で NotFound (os error 3)。4ac4227ca のソース、21,115 件中この 1 件だけ失敗。単独の --stress-count 20 では全部成功。同じ全件で並行して走る別のテストと、ログの置き場所 (`data_dir::logs_dir`) を共有していないかを疑う。v5.4.0 は止めない。
 
 ### 1.811 操作カスタマイズのコマンド一覧で、描き直すたびに割り当て表・競合・全行の配置と説明文を作り直して 1 フレーム約 75 ms かかる — §1.808 のサブ PC 確認から (2026-11-18)
 
