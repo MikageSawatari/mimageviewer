@@ -695,7 +695,9 @@ fn negotiated_version_clamps_large_images_and_never_upscales_sources() {
     let fixture = super::super::tests::Fixture::new();
     let large = fixture._dir.path().join("large.png");
     let small = fixture._dir.path().join("small.png");
-    std::fs::write(&large, png(1800, 900)).unwrap();
+    // Square source: every expected long side is an exact-aspect fit, so the
+    // aspect-accurate resizer does not round 513 down to an even 2:1 size.
+    std::fs::write(&large, png(1800, 1800)).unwrap();
     std::fs::write(&small, png(40, 20)).unwrap();
     for (version, requested, expected) in [
         (5, 1568, 1568),

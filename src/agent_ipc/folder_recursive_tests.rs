@@ -655,7 +655,7 @@ fn recursive_junction_is_listed_without_entering_the_cycle() {
     let root = f._dir.path().join("junction-tree");
     std::fs::create_dir_all(root.join("child")).unwrap();
     std::fs::write(root.join("child/a.png"), b"x").unwrap();
-    let link = root.join("child/back");
+    let link = root.join("child").join("back");
     let output = std::process::Command::new("cmd.exe")
         .args(["/C", "mklink", "/J"])
         .arg(&link)
