@@ -2,7 +2,7 @@
 
 最終更新: 2026-11-20
 
-状態: 設計第4版。利用者決定 (2026-11-20、§9) と独立レビュー 2 回 (GPT-6.1 Sol / xhigh、どちらも REVISE) を反映。
+状態: 設計第4.1版 (第4版 `44ed23c12` にレビュー 3 回目の P2 2 点を反映)。利用者決定 (2026-11-20、§9) と独立レビュー 2 回 (GPT-6.1 Sol / xhigh、どちらも REVISE) を反映。
 実装未着手。
 
 - 第1版 `2724a5c40`: 自動の並べ直し (A) を推奨。レビュー 1 回目で、再読込の繰り返し・複数選択の消失・
@@ -163,8 +163,11 @@ materialize は、各動画・音声の長さを次の順で決める (先に見
 
 `duration_facts` を作るのは `ScannedDir` を作る **worker** だけ:
 
-- 要求時に UI が `listing_may_sort_by_duration` を判定して worker へ bool で渡す。判定は保守的: 全体の
-  `settings.sort_order` が長さ順、または live を含むお気に入り別の表示状態のどれかが長さ順なら true。
+- 要求時に UI が `listing_may_sort_by_duration` を判定して worker へ bool で渡す。判定は保守的で、次の OR:
+  (a) 共通の並べ替え (お気に入りを適用中は `favorite_view_overlay.common` に退避された値、適用していなければ
+  `settings.sort_order`、`src/settings.rs` 9313 行付近)、(b) 今の live の実効値 (`settings.sort_order`)、
+  (c) 保存済みのお気に入り別の表示状態のどれか、が長さ順なら true。(レビュー 3 回目 P2-1: 「共通 = 長さ順、
+  お気に入り = 名前順」でお気に入りの外へ移る場合を落とさない。)
   false なら catalog を開かない (通常の一覧の費用は増えない)。
 - true のとき、走査の後で動画・音声が 1 件以上あれば、そのフォルダの catalog を read-only で開き
   (`open_existing_read_only_admitted()`、catalog が無ければ空の facts)、新しく足す一括読み取り
@@ -242,15 +245,24 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
 絞り込みの「読み込み完了まで長さ条件を適用しない」(§6) と、読み込み中の表示 (§5.3) の終わりに使う。
 
 - viewer context ごとの details 状態に `duration_scan_proof: Option<DurationScanProof>` を足す
-  (`details_image_dims_state` と同じ bundle で swap)。中身は完了した一覧世代 (`items_generation`)。
-- 立てる: 長さのフィールド要件を含む `AllRequirements` の session が終わったとき。Finished・target が全部
-  メモリで満たされていて即時に終わる場合・計画段階で対象 0 件の場合の、すべての完了経路で立てる。
-  完了経路は実装時に列挙し、検証台帳に残す。
-- 失効: 一覧世代が変わったとき (新しい一覧の install)。選択情報の補助取得 (`VisibleStage`) や他の要件の追加では
-  失効させない。取消・停止では立てない (停止中は未完了)。
-- 有効: `proof.generation == items_generation`。対象は全動画・音声なので、絞り込みの変更で失効させる必要は無い。
-- 実装時に `items_generation` が新しい一覧の install でだけ変わり、同じ一覧内の削除・改名で別の意味に使われて
-  いないかを確かめる。合わなければ同じ意味の既存の一覧世代を使う。
+  (`details_image_dims_state` と同じ bundle で swap。初期化・構造体の列挙・fork 時の所有方針にも機械的に登録する。
+  fork 先は metadata cache が空なので proof も None、元の context は cache と proof を一緒に残す。既存の details
+  状態と同じ配置、`src/app/viewer_context_registry.rs` 3957 / 4858 行付近)。
+- 中身は**取得対象の snapshot**: session の計画を始めた時点の `items_generation` と `items.len()`
+  (レビュー 3 回目 P2-2)。一覧世代は同じ一覧内の削除でも進み、逆に Smart Folder の評価条件の更新は世代を
+  進めずに行を足す (`push_grid_item_pending`、`src/app/smart_folder.rs` 1699 / 1783 行付近) ため、世代だけでは
+  対象の変化を表せない。
+- 立てる: 長さのフィールド要件を含む `AllRequirements` の session が終わり、採用時の (`items_generation`,
+  `items.len()`) が計画開始時と一致するとき。Finished・target が全部メモリで満たされていて即時に終わる場合・
+  計画段階で対象 0 件の場合の、すべての完了経路で立てる。完了経路は実装時に列挙し、検証台帳に残す。
+  一致しなければ立てない。
+- 有効: proof の (`items_generation`, `items.len()`) が今の値と一致すること。対象は全動画・音声なので、
+  絞り込みの変更では失効しない。選択情報の補助取得 (`VisibleStage`) や他の要件の追加でも失効しない。
+  取消・停止では立てない (停止中は未完了)。
+- 取り直し: 長さのフィールド要件が有効で、proof が無効 (対象が変わった) で、details-meta の session が
+  動いていないとき、details-meta の poll が新しい `AllRequirements` session を始める。新しい一覧の install に
+  限らず、削除・追加・復元で対象が変わった場合も同じ規則で取り直す。全部メモリで満たされていれば即時に完了して
+  proof が立つ。印は足さず、この条件だけから導く。停止 (`Cancelled`) の間は取り直さない (利用者の再開を待つ)。
 
 ### 5.3 読み込み中の表示
 
@@ -327,8 +339,12 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
   動画・音声も対象、絞り込みで隠れた動画も対象、最後の Item と Finished の間で要件が消えない、
   `RetryLater` を同じ世代で再試行しない、列・バッジ全 OFF でも完了する、対応外の一覧・長さ順以外では入らない、
   AI facet の既存の挙動が変わらない。
-- proof: 全完了経路 (Finished・即時完了・対象 0 件) で立つ、取消・停止で立たない、補助 `VisibleStage` で消えない、
-  一覧世代の変更で失効、park / mount / drop で兄弟 context 不変。
+- proof: 全完了経路 (Finished・即時完了・対象 0 件) で立つ、計画後に対象が変わった完了では立たない、取消・停止で
+  立たない、補助 `VisibleStage` で消えない、Smart Folder の評価条件更新で行が増えたら失効して取り直す、
+  取得完了後の削除で失効して即時に取り直す、停止中は取り直さない、fork 先は None、park / mount / drop で
+  兄弟 context 不変。
+- `listing_may_sort_by_duration`: 共通 = 長さ順・お気に入り = 名前順でお気に入りの外へ移ると true、
+  共通・live・保存済みお気に入りのどれも長さ順でなければ false。
 - 並べ替えの操作: `listing_sort_capabilities` の一覧種別ごとの結果、メニュー / ツールバーの disabled と理由、
   ゲームパッドが飛ばす、Remote の候補と表示、長さ順の再選択で再読込、評価順の既存の理由が変わらない、
   読み込み中の表示と proof 有効後に消えること。
