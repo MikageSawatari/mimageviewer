@@ -274,8 +274,6 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn book_bookmarks_key (self) -> Option < & 'a BookBookmarkProjectionKey >",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn book_bookmarks (self) -> & 'a [crate :: book_bookmarks :: BookBookmark]",
     "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn book_bookmark_title_editing (self) -> bool",
-    // 1.350 cache deletion invalidates shared source owners without mounting parked contexts.
-    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn invalidate_converted_archive_sources_in_parked_contexts (& mut self)",
     // 1.767 (9044445e6): an independent media window exchanged for a still window
     // rebinds only the mounted reader's own host after its session/output retired;
     // asserts the old binding belongs to the mounted context and never touches siblings.
