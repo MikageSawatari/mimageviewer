@@ -80,6 +80,16 @@ mod compare_original_tests {
         arm_reassigned_original_preview_hold(app, crate::key_input::SyntheticNavigationKey::Home);
     }
 
+    fn release_hold() {
+        // Keep the synthetic source armed: clearing it would sample the real Ctrl key.
+        let later = std::time::Instant::now() + std::time::Duration::from_millis(1);
+        crate::key_input::enqueue_test_synthetic_command(crate::key_input::SyntheticKeyCommand::up(
+            later,
+            crate::key_input::SyntheticNavigationKey::Home,
+        ));
+        crate::key_input::advance_test_synthetic_input(later);
+    }
+
     fn next_frame(ctx: &egui::Context) {
         ctx.run_ui(egui::RawInput::default(), |_| {})
             .drop_without_applying_deltas();
@@ -183,7 +193,7 @@ mod compare_original_tests {
             let original_key = pair.draw_key(true);
             assert_ne!(original_key, key);
             assert!(pair.draw_pixels(true).valid_for_size(pair.target_size));
-            crate::key_input::clear_test_synthetic_input();
+            release_hold();
             next_frame(&ctx);
             assert!(!app.compare_original_for_frame(&ctx, 0));
             assert_eq!(
@@ -280,7 +290,7 @@ mod compare_original_tests {
             app.fs_pending.is_empty(),
             "loupe must not start MaterialOnly on eviction"
         );
-        crate::key_input::clear_test_synthetic_input();
+        release_hold();
         next_frame(&ctx);
         assert!(!app.compare_original_for_frame(&ctx, 0));
         assert_eq!(
@@ -635,7 +645,7 @@ mod compare_original_tests {
             .ensure_compare_prepared_texture(&ctx, ComparePreparedTextureKind::Current, false)
             .unwrap();
         assert_ne!(original.id(), processed.id());
-        crate::key_input::clear_test_synthetic_input();
+        release_hold();
         // A later consumer in the same frame (navigator/indicator) must use the first choice.
         assert_eq!(app.compare_original_for_frame(&ctx, 0), chosen);
         next_frame(&ctx);
@@ -692,7 +702,7 @@ mod compare_original_tests {
         assert!(
             !app.fs_display_bypasses_final_pipeline(app.original_preview_active_for_frame(&ctx, 0))
         );
-        crate::key_input::clear_test_synthetic_input();
+        release_hold();
         next_frame(&ctx);
         assert!(!app.original_preview_visual_active_for_frame(
             &ctx,
