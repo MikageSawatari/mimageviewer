@@ -7899,6 +7899,6 @@ detached の述語・viewport／host／placement の判断経路、bundle の所
 既存の details 遅延取得状態 (`details_lazy_meta` など) と同じ viewer context 単位の状態として 1 つ足した。
 `viewer_context_registry.rs` では、既存の details 状態と同じ構造体・初期化・swap・fork の所有分類へ機械的に登録しただけで、
 fork 先は空、元 context は cache と proof を保持する。detached の述語・viewport／host／placement の判断経路、bundle の所有・交換は変更していない。
-独立レビュー (gpt-6.1-sol / xhigh、2 回) と設計担当 ClaudeCode は、これを既存 details 状態への機械的な追加であり
+独立レビュー (gpt-6.1-sol / xhigh を指定して実行、3 回) と設計担当 ClaudeCode は、これを既存 details 状態への機械的な追加であり
 症状パッチではない構造的変更であることに合意した。正本は [長さ順・長さ絞り込み計画](media-duration-sort-filter-plan.md) §7・§11。
-registry 経由の実際の mount／park／close での proof の振る舞いは、直接の swap・bundle 破棄・fork を検査するテストで確かめ、実機未確認。
+直接の swap・bundle 破棄・fork はテストで確認した。registry 経由の mount／park／close と実機動作は未確認。
