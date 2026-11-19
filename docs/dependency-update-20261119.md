@@ -123,6 +123,20 @@ zcheapstr 1.2.0、zeroize 1.9.2。加わった: multiversion 0.8.1・multiversio
 utf_types 1.0.0。外れた: defmt 1.2.0・defmt-macros 1.2.0・defmt-parser 1.1.0・pulp 0.22.3・pulp-wasm-simd-flag 0.1.1・
 raw-cpuid 11.6.0・reborrow 0.5.5。
 
+### wgpu 30.0.2 と静止画 shader の DXBC 契約
+
+`src/gpu_still_shaders.rs` の契約テスト `still_bytecode_contract_tracks_locked_hal_and_naga` は、wgpu・wgpu-hal・wgpu-core の版を
+固定して、更新時に静止画 NIS / Anime4K VL の DXBC (§1.776 案 B-A) の前提を見直させる。独立レビュー (Sol / xhigh) の指摘で、
+30.0.1 → 30.0.2 の registry のソースを比べた (設計担当)。
+
+- wgpu-hal: 変わったのは `src/metal/surface.rs` だけ。`dx12/` (固定 layout の register 配置・`load_shader`・`compile_fxc`) は同一。
+- wgpu-core: `Global`・`CommandEncoder`・`CommandBuffer` の Send / Sync の明示実装と、map 中に destroy した buffer の解放を drop まで遅らせる修正。shader・passthrough の経路は同一。
+- wgpu: webgpu backend と lib.rs の版表記。
+- 実行時の naga は 30.0.1 のまま (`naga-types` だけ 30.0.2)。ビルド時の `naga_wgpu = "=30.0.1"` も変えない。
+
+したがって DXBC の生成条件は変わらない。テストの期待値を 30.0.2 にし、`build/still_image_shaders.rs` 冒頭と
+`docs/display-pipeline.md` の版の記述を合わせた。WGSL と DXBC の GPU 上の一致テストは既存のものをそのまま使う。
+
 manifest の版の制約を超える更新 (`cargo update --verbose` の「behind latest」) は今回の範囲外。
 
 ## FFmpeg の更新確認の誤表示

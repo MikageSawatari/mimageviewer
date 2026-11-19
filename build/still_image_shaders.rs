@@ -1,4 +1,4 @@
-//! Fixed-layout wgpu-hal 30.0.1 DX12/FXC contract. Video generation is independent.
+//! Fixed-layout wgpu-hal 30.0.2 DX12/FXC contract (DX12 code identical to 30.0.1). Video generation is independent.
 use naga::{ShaderStage, back::hlsl, valid::Validator};
 use naga_wgpu as naga;
 use std::{fmt::Write as _, path::Path};

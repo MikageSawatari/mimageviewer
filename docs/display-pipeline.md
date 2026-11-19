@@ -2405,7 +2405,7 @@ test-script の失敗注入 wrapper を保持する。この feature は明示 p
 通常の WGSL module の検証・コンパイルは変えない。他 backend / feature なし / 他 Anime4K variant は WGSL のまま。
 作成失敗時は従来と同じ wgpu のエラー処理へ進み、WGSL での作り直しや retry は行わない。
 
-生成条件は wgpu-hal 30.0.1 `dx12/device.rs` の固定 layout の register 配置と
+生成条件は wgpu-hal 30.0.2 (DX12 の実装は 30.0.1 と同一、2026-11-19 に照合) `dx12/device.rs` の固定 layout の register 配置と
 `load_shader`、`shader_compilation.rs::compile_fxc` に合わせる。
 NIS は `t0/b0`、VL は `t0..t13/b0`、first-vertex 等の特殊定数は両方 `b1`（すべて space0）。
 sampler/dynamic offset/immediate は使わない。bounds check、loop bounding、zero init、
