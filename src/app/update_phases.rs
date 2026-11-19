@@ -893,6 +893,14 @@ impl App {
         ctx: &egui::Context,
         main_viewer_blocked: bool,
     ) {
+        // Only menu/dialog ownership blocks this entire phase. Text-input
+        // shortcuts retain the per-branch admission and keymap behavior below.
+        if matches!(
+            self.keyboard_owner_for_pass(ctx),
+            crate::keyboard_input::KeyboardOwner::Modal
+        ) {
+            return;
+        }
         // ── F12: 画像・動画ビューア別ウィンドウモード ───────────────
         if !self.address_has_focus
             && !self.search_has_focus

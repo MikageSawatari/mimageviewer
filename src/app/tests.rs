@@ -3,6 +3,26 @@ use super::presentation_transition::{DetachedHostLease, DetachedTargetLease, Pre
 use super::*;
 use crate::ui_dialogs::context_menu::DeleteTarget;
 
+impl App {
+    /// Exercise the ROOT input phases around an injected tree renderer, in update order.
+    pub(crate) fn folder_tree_keyboard_frame_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        render_tree: impl FnOnce(&mut Self),
+    ) -> Option<crate::ui_main::AddressBarNav> {
+        self.input_update_begin(ctx);
+        let navigation = self.input_root_keyboard(ctx).0;
+        assert!(
+            self.folder_pane_open_pending.is_none(),
+            "menu keys must not start a background folder open"
+        );
+        self.input_main_grid_shortcuts(ctx, false);
+        render_tree(self);
+        self.finish_folder_pane_presentation(ctx, true);
+        navigation
+    }
+}
+
 #[cfg(windows)]
 pub(super) fn backend_window_for_test(
     ctx: &egui::Context,

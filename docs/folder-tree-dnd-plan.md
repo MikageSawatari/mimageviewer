@@ -356,12 +356,16 @@ Q1〜Q5 はすべて回答済み (§0)。残る判断は §4.3 の出荷条件�
 
 描画の寿命は入力の `label_display` の退役から分けた。`update_frame` 直後に可視行だけの `CapturedMainDropGeometry` を pass 内のローカル値へ捕捉し、`finish_folder_pane_presentation` 後も保持する。最後に後描画の前面 layer と交差する行を外して公開するため、描画後の hide でも画面に出たツリーが一覧領域に誤分類されず、show は未描画の形を先取りしない。新しい App の pending や永続状態は追加していない。
 
+独立レビュー追補 (2026-11-20、`930bdaa8e` 後、範囲修正は §18): ROOT の `keyboard_ownership_snapshot` はツリーの貼り付けメニューの正確な ID の open／保持済み Esc の所有だけを既存 `KeyboardOwner::Modal` へ統合し、`input_main_grid_shortcuts` 冒頭も Modal だけを拒否する。一般の popup・TextInput の所有、各枝のテキスト入力条件は維持する。
+通常の ROOT 入力→一覧ショートカット→ツリー描画の順で、Esc、矢印→Enter、Ctrl+A／Ctrl+O／F、閉鎖後の再開と先描画 close 時の所有維持を検査する回帰 4 件を記述した (未実行)。
+製品ページのフォルダツリー紹介を移動・コピー・右クリック貼り付けと `manual/grid.html#folder-tree` の案内へ更新した。
+
 ### 実施した検査と静的レビュー
 
 - `cargo fmt` (引数なし): exit 0。
 - `python scripts/check_ui_glyphs.py`: exit 0、危険なグリフ 0 件。
 - `git diff --check`: exit 0 (Git の LF/CRLF 予告だけ)。
-- 新規のテスト記述は native 側 17 件 (vendor 2 件を含む)、App 側 15 件、UI 側 9 件。**実行はしていない**。
+- 新規のテスト記述は native 側 17 件 (vendor 2 件を含む)、App 側 18 件、UI 側 12 件 (§18 までの追補を含む)。**追補の実行はしていない**。
 - 独立した GPT-6.1 Sol / xhigh が API 署名・型・fixture・所有境界を最終静的レビューし、ソースレビューとして ACCEPT (未解決 P1/P2 なし)。§16 の P2 は、設計担当の判断に沿って本棚の判定を操作の境界へ移して解消した。コンパイル・実行の成功を示すレビューではない。
 
 ### 設計担当が実行するテスト
@@ -412,3 +416,35 @@ PNG は変更していない。既存の見た目の照合対象は `folder_pane
 
 修正後は `cargo fmt` (引数なし)・`python scripts/check_ui_glyphs.py`・`git diff --check` がいずれも exit 0 (危険グリフ 0 件、Git の LF/CRLF 予告のみ)。コンパイル・テストは実装者側では実行しておらず、再実行は設計担当へ引き継ぐ。
 独立した GPT-6.1 Sol / xhigh による追補の静的レビューは ACCEPT、未解決 P1/P2 なし。テストの実行成功を示すものではない。
+
+## 18. 貼り付けメニューの入力所有を狭める追補 (2026-11-20)
+
+未コミットの P2 修正案に含めた全 ROOT popup の Modal 化と `shortcuts_blocked_by_text_input` による一覧ショートカットの一括 return は撤回した。`folder_pane_paste_menu_owns_keyboard` は ROOT の貼り付けメニュー ID の `Popup::is_id_open` と既存 `popup_owned_escape_at_pass_start` だけを見る。`keyboard_ownership_snapshot` でこのメニューだけを Modal に加え、`input_main_grid_shortcuts` 冒頭は pass owner が Modal の場合だけ return する。
+
+一覧右クリックの既存経路は `context_menu_idx` → `modal_dialog_block_reason_including_menus` (`grid_context_menu`) → `common_modal_dialog_open` → `any_dialog_open` → `keyboard_ownership_snapshot` の Modal → `shortcuts_blocked_by_text_input` → `handle_keyboard` の return。ツリーのメニューも同じ Modal と後段の return を使う。Menu/ComboBox/補完等のほかの egui popup の分類には触れない。履歴候補は `ui_history_field` の Area と HistoryPopupState であり、従来の TextInput／pending focus／履歴キー claim が所有する。
+
+`input_main_grid_shortcuts` の全枝を `930bdaa8e` と照合した結果:
+
+| 枝 | テキスト入力中の変更前→変更後 | ツリーの貼り付けメニュー表示中 |
+| --- | --- | --- |
+| 保存位置 clear | 個別 focus 条件と keymap 消費条件を維持 | 許可されていた背面処理を Modal で停止 |
+| 最前面切替 | 同上 | 同上 |
+| F12 の表示モード切替 | 同上 | 同上 |
+| Ctrl+F Local 検索 | search_shortcut_availability と pressed_action の条件を維持 | 同上 |
+| 全選択・選択解除 | 個別 focus 条件と keymap 判定を維持 | 同上 |
+| pin・本追加・collection 追加・選択 export | 個別 focus・grid item・viewer 条件と keymap 消費を維持 | 同上 |
+| Ctrl+S Container 検索 | 個別 focus 条件と pressed_action を維持 | 同上 |
+| Everything 検索 | 従来の shortcut_permit と受付・消費を維持 | 同上 |
+| Ctrl+G Metadata 検索 | search_shortcut_availability と pressed_action を維持 | 同上 |
+| Ctrl+T タグ表示 | 個別 focus 条件と pressed_action を維持 | 同上 |
+| T タグ付与 | 個別 focus・grid item 条件と pressed_action を維持 | 同上 |
+| Ctrl+O フォルダ入力 | 個別 focus 条件と pressed_action を維持 | 同上 |
+| 詳細表示・列数 | 個別 focus 条件と pressed_action を維持 | 同上 |
+
+実キーの Ctrl+F は元から `pressed_action` → `pressed_chord` → `keymap_owner_blocks_shortcuts` により TextInput の Focused／FocusRecovery／ImeComposing では拒否される。アドレス・Container・Metadata・タグ等にはさらに検索入口の個別拒否がある。コメントと起動 helper の相互排他試験は「focused 実キーも許可する」証拠にはならない。入力欄がキーを所有しない状態からの Container→Local 切り替えと、入力中の従来の拒否を新しい実キーテストで固定する。PendingFocus の互換動作と履歴による別の予約判定も変更しない。
+
+`ime_focus::record_keyboard_owner` は診断記録だけで変換状態を変えず、ほかの popup の TextInput／FocusedUi 等の分類を維持する。`dialog_enter_pressed` の IME 判定、`dialog_escape_pressed` の IME／既存 pass-start Escape 所有、IME helper は変更していない。`gamepad_dispatch_allowed` 末尾も共通 shortcut 判定を参照するが、追加の拒否はツリーの貼り付けメニューのときだけで、ほかの popup／TextInput／IME には従来の判定が残る。`common_modal_dialog_open` と他 viewport の分岐は変更しない。
+
+追加: `main_drop_unrelated_popup_keeps_text_input_owner_and_ime_dialog_keys`、`main_drop_ctrl_f_keeps_existing_focused_input_rejection_and_unfocused_search_switch`。先描画 close の回帰は `main_drop_tree_paste_menu_keyboard_owner_survives_early_close_and_resumes_next_pass` へ範囲を修正した。
+既存の `history_field_arrows_pick_and_plain_enter_are_exclusive`、`history_field_escape_closes_only_history_and_restores_plain_escape`、`history_field_ime_does_not_navigate_pick_or_dismiss`、`section1756_pending_history_text_and_paste_enter_reach_the_editor_before_submit`、`facade_observes_ime_restoration_after_the_shared_contract_is_refreshed` を履歴・IME の回帰として引き継ぐ。いずれも今回の修正後は実装者側で未実行。
+引数なしの `cargo fmt`、glyph 検査、site cards 検査 (53 件・超過 0)、`git diff --check` は exit 0。追補の独立静的レビューは ACCEPT、未解決 P1/P2 なし。コンパイル・テスト・製品起動・コミットは行っていない。

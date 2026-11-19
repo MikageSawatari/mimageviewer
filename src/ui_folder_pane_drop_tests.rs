@@ -28,6 +28,7 @@ impl TreeDropTest {
             .test_seed_listing(&target, vec![target.join("nested")], false);
         app.folder_pane.set_cursor(root.clone());
         let ctx = egui::Context::default();
+        crate::ime_focus::install_ime_input_policy(&ctx);
         crate::ui_fonts::configure_fonts(&ctx);
         let mut test = Self {
             ctx,
@@ -45,6 +46,14 @@ impl TreeDropTest {
     }
 
     fn frame(&mut self, events: Vec<egui::Event>) {
+        self.frame_with_keyboard_route(events, false);
+    }
+
+    fn keyboard_frame(&mut self, events: Vec<egui::Event>) {
+        self.frame_with_keyboard_route(events, true);
+    }
+
+    fn frame_with_keyboard_route(&mut self, events: Vec<egui::Event>, route_keyboard: bool) {
         let ctx = self.ctx.clone();
         ctx.run_ui(
             egui::RawInput {
@@ -64,24 +73,35 @@ impl TreeDropTest {
                     navigation,
                     ..
                 } = self;
-                *navigation = app.render_folder_pane_tree_with(
-                    ui,
-                    || {
-                        *queries += 1;
-                        *files_available
-                    },
-                    |app, ctx, path| {
-                        app.paste_tree_files_to_folder_with(
-                            ctx,
-                            path,
-                            App::book_root_path,
-                            |_, actual| {
-                                invoked.push(actual.to_owned());
-                                Ok(())
-                            },
-                        );
-                    },
-                );
+                let mut render_tree = |app: &mut App| {
+                    *navigation = app.render_folder_pane_tree_with(
+                        ui,
+                        || {
+                            *queries += 1;
+                            *files_available
+                        },
+                        |app, ctx, path| {
+                            app.paste_tree_files_to_folder_with(
+                                ctx,
+                                path,
+                                App::book_root_path,
+                                |_, actual| {
+                                    invoked.push(actual.to_owned());
+                                    Ok(())
+                                },
+                            );
+                        },
+                    );
+                };
+                if route_keyboard {
+                    assert!(
+                        app.folder_tree_keyboard_frame_for_test(&ctx, render_tree)
+                            .is_none(),
+                        "the menu must not navigate the background grid"
+                    );
+                } else {
+                    render_tree(app);
+                }
             },
         )
         .drop_without_applying_deltas();
@@ -457,4 +477,147 @@ fn folder_tree_drop_disabled_pane_retires_the_menu_but_keeps_visible_panel_geome
         ctx.data(|data| data.get_temp::<FolderPanePasteMenu>(folder_pane_paste_menu_id()))
             .is_none()
     );
+}
+
+fn menu_key_events(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+    [true, false]
+        .into_iter()
+        .map(|pressed| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers,
+        })
+        .collect()
+}
+
+fn seed_menu_grid(test: &mut TreeDropTest) {
+    let first = test.root.join("first.jpg");
+    let second = test.root.join("second.jpg");
+    crate::app::seed_snapshot_context_for_test(
+        &mut test.app,
+        &test.root.to_string_lossy(),
+        &[&first.to_string_lossy(), &second.to_string_lossy()],
+    );
+}
+
+#[test]
+fn folder_tree_drop_menu_escape_uses_normal_keyboard_route_without_changing_background_focus() {
+    for tree_focused in [false, true] {
+        let mut test = TreeDropTest::new();
+        seed_menu_grid(&mut test);
+        if tree_focused {
+            test.app.folder_pane.set_focus_tree();
+        } else {
+            test.app.folder_pane.set_focus_grid();
+        }
+        test.click(test.row().center(), egui::PointerButton::Secondary);
+        assert!(egui::Popup::is_id_open(
+            &test.ctx,
+            folder_pane_paste_menu_id()
+        ));
+        test.keyboard_frame(menu_key_events(egui::Key::Escape, egui::Modifiers::NONE));
+        assert!(!egui::Popup::is_id_open(
+            &test.ctx,
+            folder_pane_paste_menu_id()
+        ));
+        assert_eq!(test.app.folder_pane.has_focus, tree_focused);
+        assert_eq!(test.app.current_folder.as_ref(), Some(&test.root));
+        assert_eq!(test.app.selected, Some(0));
+        assert!(test.app.checked.is_empty());
+        assert!(test.invoked.is_empty());
+        if !tree_focused {
+            // The next Escape belongs to the normal tree-focus command again.
+            test.keyboard_frame(menu_key_events(egui::Key::Escape, egui::Modifiers::NONE));
+            assert!(test.app.folder_pane.has_focus);
+        }
+    }
+}
+
+#[test]
+fn folder_tree_drop_menu_arrows_and_enter_use_normal_keyboard_route_without_opening_tree_folder() {
+    let mut test = TreeDropTest::new();
+    seed_menu_grid(&mut test);
+    test.app.folder_pane.set_focus_tree();
+    test.click(test.row().center(), egui::PointerButton::Secondary);
+    for key in [
+        egui::Key::ArrowRight,
+        egui::Key::ArrowLeft,
+        egui::Key::ArrowUp,
+        egui::Key::ArrowDown,
+    ] {
+        test.keyboard_frame(menu_key_events(key, egui::Modifiers::NONE));
+        assert!(egui::Popup::is_id_open(
+            &test.ctx,
+            folder_pane_paste_menu_id()
+        ));
+        assert!(
+            test.app
+                .folder_pane
+                .visible_rows()
+                .iter()
+                .any(|row| row.path == test.root && row.is_cursor)
+        );
+        assert_eq!(test.app.current_folder.as_ref(), Some(&test.root));
+        assert_eq!(test.app.selected, Some(0));
+        assert!(test.invoked.is_empty());
+    }
+    // egui's menu navigation requests the item focus for the next pass.
+    test.keyboard_frame(vec![]);
+    let focused = test
+        .ctx
+        .memory(|memory| memory.focused())
+        .expect("paste menu item focus");
+    assert_eq!(
+        test.ctx.read_response(focused).unwrap().rect,
+        test.menu_button().0
+    );
+    test.keyboard_frame(menu_key_events(egui::Key::Enter, egui::Modifiers::NONE));
+    assert_eq!(test.invoked, vec![test.target.clone()]);
+    assert_eq!(test.app.current_folder.as_ref(), Some(&test.root));
+    assert_eq!(test.app.selected, Some(0));
+    assert!(!egui::Popup::is_id_open(
+        &test.ctx,
+        folder_pane_paste_menu_id()
+    ));
+}
+
+#[test]
+fn folder_tree_drop_menu_blocks_grid_shortcut_phase_and_resumes_after_escape() {
+    for tree_focused in [false, true] {
+        let mut test = TreeDropTest::new();
+        seed_menu_grid(&mut test);
+        if tree_focused {
+            test.app.folder_pane.set_focus_tree();
+        } else {
+            test.app.folder_pane.set_focus_grid();
+        }
+        test.click(test.row().center(), egui::PointerButton::Secondary);
+        for (key, modifiers) in [
+            (egui::Key::A, egui::Modifiers::CTRL),
+            (egui::Key::O, egui::Modifiers::CTRL),
+            (egui::Key::F, egui::Modifiers::NONE),
+        ] {
+            test.keyboard_frame(menu_key_events(key, modifiers));
+            assert!(
+                test.app.checked.is_empty(),
+                "{key:?} must not select grid items"
+            );
+            assert!(!test.app.show_open_folder_dialog);
+            assert!(test.app.settings.folder_tree_pane_visible);
+            assert_eq!(test.app.folder_pane.has_focus, tree_focused);
+            assert!(egui::Popup::is_id_open(
+                &test.ctx,
+                folder_pane_paste_menu_id()
+            ));
+        }
+        test.keyboard_frame(menu_key_events(egui::Key::Escape, egui::Modifiers::NONE));
+        test.keyboard_frame(menu_key_events(egui::Key::A, egui::Modifiers::CTRL));
+        assert_eq!(
+            test.app.checked.len(),
+            2,
+            "grid shortcuts resume after the menu closes"
+        );
+    }
 }

@@ -5,6 +5,201 @@ use crate::main_drop_target::WindowMetrics;
 use crate::shell_file_ops::{ShellTransferOperation, ShellTransferOutcome};
 use crate::ui_dialogs::file_organize::FileOrganizeSelection;
 
+#[test]
+fn main_drop_tree_paste_menu_keyboard_owner_survives_early_close_and_resumes_next_pass() {
+    let mut app = ready();
+    let ctx = egui::Context::default();
+    crate::ime_focus::install_ime_input_policy(&ctx);
+    let root = app.tmp.path().to_owned();
+    app.current_folder = Some(root.clone());
+    app.settings.folder_tree_pane_visible = true;
+    app.folder_pane = crate::folder_pane::FolderPaneState::test_tree(&root, vec![]);
+    app.folder_pane.set_focus_grid();
+    let popup = crate::ui_folder_pane::folder_pane_paste_menu_id();
+    ctx.run_pass(Default::default(), |ctx| egui::Popup::open_id(ctx, popup))
+        .drop_without_applying_deltas();
+    ctx.run_pass(
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        },
+        |ctx| {
+            // Cover a menu closing before the App collects this pass's owner.
+            egui::Popup::close_id(ctx, popup);
+            app.input_update_begin(ctx);
+            assert_eq!(
+                app.keyboard_owner_for_pass(ctx),
+                crate::keyboard_input::KeyboardOwner::Modal
+            );
+            assert!(app.handle_keyboard(ctx).is_none());
+            app.input_main_grid_shortcuts(ctx, false);
+            assert!(!app.folder_pane.has_focus);
+            assert!(!app.show_open_folder_dialog);
+        },
+    )
+    .drop_without_applying_deltas();
+    ctx.run_pass(
+        egui::RawInput {
+            events: vec![egui::Event::Key {
+                key: egui::Key::O,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::CTRL,
+            }],
+            ..Default::default()
+        },
+        |ctx| {
+            app.input_update_begin(ctx);
+            assert!(matches!(
+                app.keyboard_owner_for_pass(ctx),
+                crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. }
+            ));
+            assert!(app.handle_keyboard(ctx).is_none());
+            app.input_main_grid_shortcuts(ctx, false);
+            assert!(app.show_open_folder_dialog);
+        },
+    )
+    .drop_without_applying_deltas();
+}
+
+#[test]
+fn main_drop_unrelated_popup_keeps_text_input_owner_and_ime_dialog_keys() {
+    use crate::keyboard_input::{KeyboardOwner, TextInputPhase};
+    for composing in [false, true] {
+        for early_close in [false, true] {
+            let app = ready();
+            let ctx = egui::Context::default();
+            crate::ime_focus::install_ime_input_policy(&ctx);
+            let field = egui::Id::unique("main_drop_text_editor");
+            let popup = egui::Id::unique("main_drop_unrelated_completion_or_menu");
+            let mut text = "draft".to_owned();
+            let mut focus = true;
+            ctx.run_ui(Default::default(), |ui| {
+                crate::ime_focus::show_singleline(ui, &mut text, Some(&mut focus), |edit| {
+                    edit.id(field)
+                });
+                egui::Popup::open_id(ui.ctx(), popup);
+            })
+            .drop_without_applying_deltas();
+            let mut events = vec![
+                egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ];
+            if composing {
+                events.insert(
+                    0,
+                    egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "あ".into(),
+                        active_range_chars: None,
+                    }),
+                );
+            }
+            ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                if early_close { egui::Popup::close_id(ui.ctx(), popup); }
+                let owner = app.keyboard_owner_for_pass(ui.ctx());
+                assert!(matches!(owner, KeyboardOwner::TextInput { widget_id, phase: TextInputPhase::Focused | TextInputPhase::FocusRecovery | TextInputPhase::ImeComposing, .. } if widget_id == field));
+                assert!(!crate::ui_folder_pane::folder_pane_paste_menu_owns_keyboard(ui.ctx()));
+                assert_eq!(app.ime_input_active(ui.ctx()), composing);
+                assert_eq!(app.dialog_enter_pressed(ui.ctx()), !composing);
+                // Existing generic popup Escape ownership is unchanged, even after early close.
+                assert!(!app.dialog_escape_pressed(ui.ctx()));
+                crate::ime_focus::show_singleline(ui, &mut text, Some(&mut focus), |edit| edit.id(field));
+            }).drop_without_applying_deltas();
+        }
+    }
+}
+
+#[test]
+fn main_drop_ctrl_f_keeps_existing_focused_input_rejection_and_unfocused_search_switch() {
+    use crate::keyboard_input::{KeyboardOwner, TextInputPhase};
+    for field in ["address", "local", "container", "metadata", "tag", "none"] {
+        let mut app = ready();
+        let ctx = egui::Context::default();
+        app.settings.show_toolbar_search_local = false;
+        app.show_search_bar = field == "local";
+        app.favsearch.active = matches!(field, "address" | "container" | "none");
+        app.global_search.active = field == "metadata";
+        app.tag_view.active = field == "tag";
+        app.address_has_focus = field == "address";
+        app.search_has_focus = field == "local";
+        app.favsearch.has_focus = field == "container";
+        app.global_search.has_focus = field == "metadata";
+        app.tag_view.has_focus = field == "tag";
+        let before = (
+            app.show_search_bar,
+            app.favsearch.active,
+            app.global_search.active,
+            app.tag_view.active,
+        );
+        ctx.run_pass(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::F,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::CTRL,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                app.input_update_begin(ctx);
+                if field != "none" {
+                    assert!(matches!(
+                        app.keyboard_owner_for_pass(ctx),
+                        KeyboardOwner::TextInput {
+                            phase: TextInputPhase::Focused,
+                            ..
+                        }
+                    ));
+                }
+                app.input_main_grid_shortcuts(ctx, false);
+                let after = (
+                    app.show_search_bar,
+                    app.favsearch.active,
+                    app.global_search.active,
+                    app.tag_view.active,
+                );
+                assert_eq!(
+                    after,
+                    if field == "none" {
+                        (true, false, false, false)
+                    } else {
+                        before
+                    },
+                    "{field}"
+                );
+                if field != "none" {
+                    assert!(
+                        ctx.input(|input| input.key_pressed(egui::Key::F)),
+                        "the editor retains Ctrl+F: {field}"
+                    );
+                }
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+}
+
 fn ready() -> AppTestEnvForTest {
     let mut app = setup_app_for_test();
     app.indexer_init.mark_unavailable_if_not_ready();

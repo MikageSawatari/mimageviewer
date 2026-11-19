@@ -244,8 +244,19 @@ struct FolderPanePasteMenu {
     opened_frame: u64,
 }
 
-fn folder_pane_paste_menu_id() -> egui::Id {
+pub(crate) fn folder_pane_paste_menu_id() -> egui::Id {
     egui::Id::unique("folder_pane_paste_menu")
+}
+
+/// The tree context menu owns ROOT input just like the grid's context menu.
+/// Reuse the pre-input Escape owner if this menu closed earlier in the pass.
+pub(crate) fn folder_pane_paste_menu_owns_keyboard(ctx: &egui::Context) -> bool {
+    ctx.viewport_id() == egui::ViewportId::ROOT
+        && (egui::Popup::is_id_open(ctx, folder_pane_paste_menu_id())
+            || crate::keyboard_input::popup_owned_escape_at_pass_start(
+                ctx,
+                folder_pane_paste_menu_id(),
+            ))
 }
 
 fn close_folder_pane_paste_menu(ctx: &egui::Context) {

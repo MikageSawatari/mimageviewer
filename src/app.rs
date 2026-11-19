@@ -23598,6 +23598,9 @@ impl App {
         let shortcut_scope = Some(ShortcutScope::new(viewport, shortcut_surface));
         let modal = if is_root {
             self.any_dialog_open()
+                // Match the grid context menu's ownership without reclassifying
+                // unrelated popups or their focused text editors.
+                || crate::ui_folder_pane::folder_pane_paste_menu_owns_keyboard(ctx)
         } else {
             self.any_modal_dialog_open_for_fullscreen_keys()
         };
