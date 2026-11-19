@@ -508,8 +508,11 @@ fn fullscreen_open_captures_rating_metadata_boundary_in_composition_continuation
         env.visible_indices = vec![0];
         env.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
         env.image_metas = vec![None];
-        let (service, process) =
-            BookCompositionService::spawn_at(env.tmp.path().join("permission"), None).unwrap();
+        let data = env.tmp.path().join("permission");
+        // Exercise the queued continuation before startup; initialized absence
+        // correctly takes the §1.669 synchronous permission shortcut instead.
+        let startup_lease = crate::book_composition::maintenance_at(&data).unwrap();
+        let (service, process) = BookCompositionService::spawn_at(data, None).unwrap();
         env.install_book_composition_runtime(service);
         assert!(
             env.defer_book_composition_fullscreen_open_with_metadata_boundary(
@@ -541,6 +544,7 @@ fn fullscreen_open_captures_rating_metadata_boundary_in_composition_continuation
             }
         );
         assert_eq!(env.fullscreen_idx, None);
+        drop(startup_lease);
         process.shutdown_and_join();
     }
 }

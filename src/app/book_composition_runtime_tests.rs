@@ -1464,6 +1464,10 @@ fn g3_source_terminal_reopen_survives_automatic_projection() {
     let root = env.tmp.path().join("automatic-entry.pdf");
     let scope = install_document(&mut env, &root);
     let data = env.tmp.path().join("automatic-entry-data");
+    // Keep startup incomplete until the source-terminal reopen is owned by
+    // Preparing. Once initialized, an absent row correctly opens immediately
+    // through the §1.669 snapshot shortcut instead of waiting for composition.
+    let startup_lease = crate::book_composition::maintenance_at(&data).unwrap();
     let (service, owner) = runtime(&mut env, &data);
     env.fullscreen_idx = None;
     env.selected = None;
@@ -1478,9 +1482,51 @@ fn g3_source_terminal_reopen_survives_automatic_projection() {
     });
     assert_eq!(outcome, DeferredFsOpenOutcome::WaitingComposition);
     assert!(env.book_deferred_open_wait_active());
+    assert!(matches!(
+        env.book_composition,
+        ViewerBookComposition::Preparing { .. }
+    ));
+    assert_eq!(env.fullscreen_idx, None);
+    assert_eq!(env.selected, None);
+    drop(startup_lease);
     adopt(&mut env, &service, &scope);
     barrier(&service, &scope);
     env.poll_book_composition_read(&egui::Context::default());
+    assert_eq!(current_physical_page(&env), Some(0));
+    assert_eq!(env.selected, env.fullscreen_idx);
+    assert!(!env.book_deferred_open_wait_active());
+    owner.shutdown_and_join();
+}
+
+#[test]
+fn g3_source_terminal_reopen_opens_immediately_after_automatic_startup() {
+    let mut env = setup_app();
+    let root = env.tmp.path().join("automatic-ready-entry.pdf");
+    let scope = install_document(&mut env, &root);
+    let data = env.tmp.path().join("automatic-ready-entry-data");
+    let (service, owner) = runtime(&mut env, &data);
+    // A FIFO round trip proves startup has published the absent-row snapshot.
+    barrier(&service, &scope);
+    env.fullscreen_idx = None;
+    env.selected = None;
+    let outcome = env.open_deferred_fullscreen_after_enumerate(DeferredFsReopen {
+        viewer_adoption: crate::app::ViewerOpenAdoption::ContextContinuation,
+        history_trigger: HistoryTrigger::UserChosen,
+        resume_slideshow: false,
+        target: DeferredFsTarget::None,
+        resume_to_last_page: (false).into(),
+        from_explicit_open: true,
+        preserve_after_password_prompt: true,
+    });
+    assert_eq!(outcome, DeferredFsOpenOutcome::Opened);
+    assert!(matches!(
+        env.book_composition,
+        ViewerBookComposition::Accepted {
+            record: None,
+            layout: crate::book_composition::CompositionProjectionOutcome::Automatic,
+            ..
+        }
+    ));
     assert_eq!(current_physical_page(&env), Some(0));
     assert_eq!(env.selected, env.fullscreen_idx);
     assert!(!env.book_deferred_open_wait_active());
