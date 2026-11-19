@@ -94368,9 +94368,11 @@ mod tests {
                             }
                         }
                     }
-                    assert!(
-                        build_info_text(None, None, false, Some((&label, displayed)), None)
-                            .ends_with("、編集中)")
+                    // Keep parentheses balanced in literals: the source scan in
+                    // `egui_context_closures_do_not_hand_ctx_to_helpers` counts raw parens.
+                    assert_eq!(
+                        build_info_text(None, None, false, Some((&label, displayed)), None),
+                        format!("(AI 未適用: {label}、編集中)")
                     );
                     // A real running job retains the existing processing/busy indication.
                     assert_eq!(
