@@ -76376,10 +76376,9 @@ impl App {
 
         let ai_filter_active = !self.settings.facet_filter.ai_models.is_empty()
             || !self.settings.facet_filter.ai_tools.is_empty();
-        if ai_filter_active && !self.ai_model_facet_ready() {
-            return true;
-        }
-        if ignore != Some(FacetField::AiModel)
+        let ai_filter_ready = ai_filter_active && self.ai_model_facet_ready();
+        if ai_filter_ready
+            && ignore != Some(FacetField::AiModel)
             && !self.settings.facet_filter.ai_models.is_empty()
             && facet_ai_filter_applies(&item)
         {
@@ -76392,7 +76391,8 @@ impl App {
                 return false;
             }
         }
-        if ignore != Some(FacetField::AiTool)
+        if ai_filter_ready
+            && ignore != Some(FacetField::AiTool)
             && !self.settings.facet_filter.ai_tools.is_empty()
             && facet_ai_filter_applies(&item)
         {
