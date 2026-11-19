@@ -862,6 +862,11 @@ impl App {
         self.finish_text_input_submit(ctx, widget);
         self.tag_view.focus_request = false;
         self.tag_view.has_focus = false;
+        if self.tag_view.query != self.tag_view.last_executed
+            || self.tag_view.kind_filter != self.tag_view.last_executed_kind_filter
+        {
+            self.execute_tag_view();
+        }
         true
     }
 

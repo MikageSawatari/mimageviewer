@@ -91618,6 +91618,28 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     #[cfg(windows)]
+    fn section1476_tag_field_waits_only_for_a_source_swap_owned_by_the_mounted_context() {
+        let mut app = setup_app();
+        let video = push_video(&mut app, r"C:\clips\tag-field-swap.mp4");
+        app.fullscreen_idx = None;
+        // The shared stamp (no parked window) while this context is a parked live input:
+        // the established predicate counts it, the tag field does not.
+        app.native_video_parked_live_input_window_id = Some(111);
+        app.native_video_source_swap_pending =
+            Some(source_swap_pending_for_test(&app, video, None));
+        assert!(app.projected_viewer_session_open());
+        assert!(!app.tag_view_edit_waits_for_submit());
+        // The same swap owned by this context's parked window waits for a submit.
+        app.native_video_source_swap_pending =
+            Some(source_swap_pending_for_test(&app, video, Some(111)));
+        assert!(app.tag_view_edit_waits_for_submit());
+        app.native_video_source_swap_pending = None;
+        app.native_video_parked_live_input_window_id = None;
+        assert!(!app.tag_view_edit_waits_for_submit());
+    }
+
+    #[test]
+    #[cfg(windows)]
     fn parked_source_swap_presenter_closed_requests_owner_close_after_poll() {
         let mut app = setup_app();
         let ctx = egui::Context::default();

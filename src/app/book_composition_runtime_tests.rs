@@ -1391,6 +1391,8 @@ fn g3_initial_deferred_entry_waits_for_projection_then_opens_first_visible_real(
         assert!(env.fs_nav_after_pdf_enumerate.is_none());
         assert!(env.book_deferred_open_wait_active());
         assert!(env.fs_nav_deferred_reopen_wait_active());
+        // §1.476: the same context's reopen also defers tag-field searches to a submit.
+        assert!(env.tag_view_edit_waits_for_submit());
         assert_eq!(env.selected, None);
         assert_eq!(env.fullscreen_idx, None);
         adopt(&mut env, &service, &scope);

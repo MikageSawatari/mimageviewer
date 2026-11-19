@@ -595,6 +595,14 @@ mod facet_navigation;
 pub(crate) mod file_type_resume;
 pub(crate) mod page_overview;
 
+/// Which source-swap stamp counts as an open viewer session (see
+/// `App::projected_viewer_session_open_for`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceSwapOwnership {
+    SharedStamp,
+    MountedContext,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewerForegroundThumbnailConsumer {
     Seek,
@@ -24099,6 +24107,13 @@ impl App {
     /// One current-context fact for notice visibility and terminal admission. Empty child
     /// viewport registrations and list-only document preparation are not viewer sessions.
     pub(crate) fn projected_viewer_session_open(&self) -> bool {
+        self.projected_viewer_session_open_for(SourceSwapOwnership::SharedStamp)
+    }
+
+    /// The same session terms, with the source-swap term read either from the shared
+    /// mounted/active stamp (`SharedStamp`, the established notice/terminal predicate) or
+    /// only when the mounted context owns it (`MountedContext`, §1.476 tag-field edits).
+    fn projected_viewer_session_open_for(&self, source_swap: SourceSwapOwnership) -> bool {
         if self.fullscreen_idx.is_some()
             || self.fs_nav_deferred_reopen_wait_active()
             || self
@@ -24117,15 +24132,23 @@ impl App {
                     .is_some_and(|pending| {
                         pending.owner_context_id == self.projected_viewer_context_id()
                     })
-                || self
-                    .native_video_source_swap_pending
-                    .as_ref()
-                    .is_some_and(|pending| pending.parked_live_window_id.is_none())
+                || match source_swap {
+                    SourceSwapOwnership::SharedStamp => self
+                        .native_video_source_swap_pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.parked_live_window_id.is_none()),
+                    SourceSwapOwnership::MountedContext => {
+                        self.current_context_owns_source_swap_pending()
+                    }
+                }
                 || self.video_presentation_transition.is_transitioning()
                 || self.video_presentation_transition.has_pending_effects()
         }
         #[cfg(not(windows))]
-        false
+        {
+            let _ = source_swap;
+            false
+        }
     }
 
     pub(crate) fn archive_convert_deferred_fullscreen_active(&self) -> bool {
@@ -34966,6 +34989,31 @@ impl App {
         ));
     }
 
+    /// §1.476: whether an edit of the tag field must wait for an explicit submit.
+    ///
+    /// A search start retires this context's pending folder navigation and reopen
+    /// (`retire_main_list_requests_for_surface_switch`), and its adoption may close the
+    /// reader. While this context's viewer session is open or reopening (an F12 linked
+    /// window, a deferred reopen), an unfinished word must not start a search. A source
+    /// swap counts only when the mounted context owns it: the shared stamp can belong to
+    /// a parked active media context, which this search neither retires nor closes.
+    pub(crate) fn tag_view_edit_waits_for_submit(&self) -> bool {
+        self.projected_viewer_session_open_for(SourceSwapOwnership::MountedContext)
+    }
+
+    /// Re-run the executed tag search for an automatic refresh (tag rename/merge, cleanup).
+    ///
+    /// The field may hold an unsubmitted word while a reader is open (§1.476). An automatic
+    /// refresh is not a submit, so it searches the executed word and keeps the draft.
+    pub(crate) fn refresh_executed_tag_view(&mut self) {
+        let draft = std::mem::replace(
+            &mut self.tag_view.query,
+            self.tag_view.last_executed.clone(),
+        );
+        self.execute_tag_view();
+        self.tag_view.query = draft;
+    }
+
     pub(crate) fn poll_tag_view(&mut self) {
         if self.sidecar_restore_active() {
             return;
@@ -35183,7 +35231,8 @@ impl App {
             self.settings.details_sort_ascending = ascending;
         }
         self.rebuild_details_order();
-        self.address = format!("タグビュー: {}", self.tag_view.query.trim());
+        // The field may already hold a newer unsubmitted word (§1.476).
+        self.address = format!("タグビュー: {}", self.tag_view.last_executed.trim());
     }
 
     pub(crate) fn set_tag_view_sort(&mut self, sort: crate::tag_view::TagViewSort) {
@@ -39522,8 +39571,7 @@ impl App {
             self.reload_current_rating_view_preserving_sort();
         }
         if self.tag_view.on_results_grid() {
-            self.tag_view.last_executed.clear();
-            self.execute_tag_view();
+            self.refresh_executed_tag_view();
         }
     }
 

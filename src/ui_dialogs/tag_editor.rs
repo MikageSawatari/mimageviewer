@@ -267,8 +267,8 @@ impl App {
                 if self.settings.facet_filter.uses_tag_state() {
                     self.rebuild_visible_indices();
                 }
-                if self.tag_view.active {
-                    self.execute_tag_view();
+                if self.tag_view.on_results_grid() {
+                    self.refresh_executed_tag_view();
                 }
                 self.invalidate_tag_apply_suggestions();
                 self.show_feedback_toast(message);

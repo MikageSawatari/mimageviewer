@@ -1,5 +1,9 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.476: 閲覧中のタグ欄の検索確定は、既存の固定 TextEdit Enter 受付を共用する。
+通常の欄とフォーカス予約からの受付を `submit_tag_search_input` にそろえ、IME・modal の拒否条件と
+egui/native の入力所有を保つ。新しい KeyAction・割当・pending 状態は追加しない。
+
 §1.807: 前面メニュー中のナビゲーション拒否は、固定矢印とkeymapの消費前で同じ
 配送元／配送先の判定を使う。Action・既定割当・typedなpage-turn消費契約は変更しない。
 シークPopupの既存の早期return、Esc・FsClose・FsBackToList・回転等の受付も維持する。

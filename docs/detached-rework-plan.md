@@ -1458,6 +1458,24 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-20 §1.476 タグ欄の検索確定（案 A、実機未確認）
+
+設計担当からの利用者決定に従い、`render_tag_view_bar` の入力変更による検索の受付だけを変更。
+`tag_view_edit_waits_for_submit()` を実行境界で読み、main の閲覧中 (開き直し待ちを含む) は Enter・一覧▼・種類変更で
+確定する。Enter の通常／フォーカス予約経路は既存の `submit_tag_search_input` に集約する。
+閲覧述語の定義・viewport・detached の遷移や ownership は変更しない。
+Codex の判断: 入力途中の結果要求自体を作らず確定点へ揃える構造的修正であり、結果採用の guard・
+delay・retry による症状パッチではない。単一窓の「このタグで探す」と §2.23 の採用規則は維持する。
+設計と採らなかった案は [タグ設計 §5.1](tag-catalog-redesign-plan.md#51-タグビュー-ctrlt--タグツールバーの検索ボタン)。
+独立レビュー r1 (REVISE) の P2: 当初使った `projected_viewer_session_open()` は、別の context の動画の
+source-swap 待ち (`parked_live_window_id == None`) でも真になり、main の入力ごとの検索を止め得た。
+r2 (REVISE) の P2: `fullscreen_idx` だけでは、同じ context の開き直し待ち (deferred reopen) の間に打ち直しで検索が始まり、
+検索開始の退役 (`retire_main_list_requests_for_surface_switch`) が開き直しを取り消す。最終形は、既存の
+`projected_viewer_session_open()` と同じ項目を `projected_viewer_session_open_for(SourceSwapOwnership)` に移し、
+タグ欄だけ source-swap の項目を `current_context_owns_source_swap_pending()` (mount 中の context が持つ場合) で読む。
+既存の述語の結果は変えない (`SharedStamp`)。detached の述語の定義は変更しない。
+handler 回帰は `src/app/tests/tag_applied_at.rs` の `section1476_` 群。F12・複数窓の実機確認は未実施。
+
 ### 2026-11-19: ページ内スクロールの宛先 viewport の矩形を egui と同じ丸めで読む (§1.815)
 
 §1.474 の入力照合が宛先 viewport の content rect を丸める前の `input.content_rect()` で読んでいた。

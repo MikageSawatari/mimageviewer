@@ -553,17 +553,33 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.476 タグビューで検索し直すと、開いていた画像が閉じる — §2.23 の実機確認で利用者が観測 (2026-10-29)
 
-- 状態: **v5.5.0 の目標に入れる (利用者 2026-11-19、進み具合を見て調整。公開の目処は 11-21 土〜11-23 月・祝の夜)**。以前の状態: **未着手** (どのウィンドウ形態で観測したかは未記録。ClaudeCode はこの場面を実アプリで確かめていない)。
+- 状態: **実装済み・実機未確認** (2026-11-20、案 A)。v5.5.0 の目標 (利用者 2026-11-19)。どのウィンドウ形態で当初観測したかは未記録。
 - 内容 (利用者): §2.23 では「検索し直しても、結果に残る画像は開いたまま」としたが、検索し直した時点で閲覧が消えるように見えた。
 - コード確認 (ClaudeCode):
   - 結果を受け取ったときに閲覧を保つ処理は `apply_tag_view_result` にある (`prepare_rating_membership_items_swap` → `finish_rating_membership_viewer_swap`)。これが働くのは、結果が届いた時点で閲覧が開いている場合だけ。
   - 単一ウィンドウでは、閲覧中にタグビューのバーは見えない。検索語を変えるには一覧へ戻る必要がある。閲覧中に「このタグで探す」を選ぶと、`open_tag_view_for_tag` が検索の前に `close_fullscreen` で閲覧を閉じる (F12 の別ウィンドウ・切り替え中は閉じない)。どちらも出荷済みの挙動。
   - そのため単一ウィンドウで「開いたまま」になるのは、「検索中...」の間に画像を開いた場合くらい。§2.23 の保持は、実質 F12 の別ウィンドウ・複数ウィンドウ向けの変更になっている。
 - 未確認: F12・複数ウィンドウで、検索語の変更・並べ替えの変更をしたときに閲覧が保たれるか (§2.23 の実機確認でも未確認の場面)。
-- 進め方:
-  - まず F12・複数ウィンドウで保持が働くかを確かめる。働かなければ、それが不具合の本体。
-  - 単一ウィンドウで「このタグで探す」でも閲覧を続けるか (結果一覧を後ろで入れ替える) は、出荷済みの挙動を変える判断になるので、利用者に相談する。
-  - リリースノートの「結果に残る画像は開いたまま」は、確かめた形態に合わせて書く。
+- 原因候補をコードと headless handler テストで確認: タグ欄は IME preedit を含む入力変更ごとに検索していた。途中の語の結果に閲覧中の画像が無いと §2.23 の採用処理が閉じ、最終の語に含まれても復帰しない。途中の空欄も元のフォルダへ戻す。利用者の実機でこの機序が起きたかは未確認。
+- 決定 (利用者 2026-11-20、統括経由): 案 A。閲覧中は入力だけで検索せず、Enter（IME 変換中は除外）・一覧▼・種類変更で確定する。単一ウィンドウの「このタグで探す」は変更しない。
+- 変更: 既存の閲覧述語で入力ごとの検索を止め、Enter は共通 submit 受付で確定。閲覧無しの逐次検索と、閲覧終了時は未確定語を自動検索しない動作を維持。タグ改名・統合の完了は結果一覧上だけ再検索し、本の中の items を保持する。マニュアルのタグページとタグ設計 §5.1 に反映。
+- 回帰テスト (`app::tests::tag_applied_at`、実 egui イベント／完了受取 handler):
+  - `section1476_tag_bar_ime_composition_keeps_viewer_of_final_result`
+  - `section1476_tag_bar_typing_waits_for_enter_and_searches_once`
+  - `section1476_tag_bar_enter_closes_viewer_excluded_from_result`
+  - `section1476_tag_bar_empty_draft_returns_to_folder_only_on_enter`
+  - `section1476_tag_bar_without_viewer_searches_each_edit_but_not_on_close`
+  - `section1476_tag_bar_menu_and_kind_selection_search_immediately_while_viewing`
+  - `section1476_tag_rename_merge_completion_requeries_results_but_preserves_book_items`
+- 自動検証 (2026-11-20): `CARGO_BUILD_JOBS=6` で `cargo nextest run -p mimageviewer --lib -E 'test(/section1476_|tag_applied_at|search_submit|tag_view/)'`、**81 件成功・0 件失敗・19,021 件対象外、exit 0** (run `bb24ec39-635e-4473-a42a-c37c3bcffcc9`)。§1.476 の上記 7 件を含む。`cargo fmt` (引数なし)・`git diff --check` も exit 0。
+  - 途中の 2 回は 80 件成功・1 件失敗 (exit 1 / 100)。逐次検索テストが未確定の `#ca` に `t` を足して実行済みの `#cat` に戻し、不要な再検索を期待していた。フォーカス再指定だけでは解消せず、入力を実行済み語と異なる `#cax` → `#caxy` へ修正して成功。製品コードの追加修正はしていない。
+- 独立レビュー r1 (gpt-6.1-sol / xhigh、2026-11-20、REVISE) への対応 (設計担当、ビルド・テストは PC 停止の指示で未実行):
+  - P2: 閲覧中の判定を `tag_view_edit_waits_for_submit()` にした。`projected_viewer_session_open()` と同じ項目 (開き直し待ちを含む) を読み、動画の source-swap 待ちだけは mount 中の context が持つ場合に限る (別の context の source-swap 待ちで main の逐次検索が止まる経路)。r2 で、`fullscreen_idx` だけに絞った途中案は同じ context の開き直し待ちを打ち直しで取り消すと指摘され、この形にした。
+  - P2: タグの改名・統合の完了と cleanup 後の自動の再検索は、実行済みの語で検索し、欄の未確定の語を残す (`refresh_executed_tag_view()`)。
+  - P3: 結果のアドレス表示を、欄の語ではなく実行済みの語から作る。
+  - 一覧▼から同じタグを選び直すと検索し直す出荷済みの操作を保つ (実装時に一度外れていたのを戻した)。
+  - 追加テスト: `section1476_automatic_refresh_searches_executed_word_and_keeps_draft_and_viewer`、`section1476_adopted_result_names_its_own_word_not_a_later_draft`、`section1476_tag_field_waits_only_for_a_source_swap_owned_by_the_mounted_context` (`src/app/tests.rs`)、一覧▼の同じタグの再選択 (既存の menu テストに追加)、開き直し待ちの判定 (`book_composition_runtime_tests.rs` の既存テストに 1 行)。
+- 実機で残る確認: F12・複数ウィンドウでの打ち直し／IME／空欄／Enter、一覧▼・種類・並べ替えによる再検索と閲覧保持。更新履歴の文案と全件 gate・確認用 build は設計担当が行う。
 - 関連: §2.23、[タグ設計 §5.1](tag-catalog-redesign-plan.md#51-タグビュー-ctrlt--タグツールバーの検索ボタン)。規模 / 優先度: Small / 次の版のリリース前。
 
 ### 1.650 連結読みでズームすると、画面の中央にあった内容がずれる — §1.470 の独立レビューで判明 (2026-10-29)

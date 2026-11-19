@@ -381,6 +381,7 @@ fn tag_applied_at_snapshot_retires_search_request_columns_and_return_origin() {
 /// is adopted as a result list while the viewer is open.
 #[test]
 fn section1476_tag_bar_ime_composition_keeps_viewer_of_final_result() {
+    let _input = crate::key_input::lock_test_input();
     let mut app = phase_c_support::setup_app();
     let (image, _) = seed(&mut app);
     image::RgbImage::new(2, 3).save(&image).unwrap();
@@ -427,6 +428,9 @@ fn section1476_tag_bar_ime_composition_keeps_viewer_of_final_result() {
             text: "ねこ".into(),
             active_range_chars: None,
         })],
+        // The IME's Enter confirms composition, not the search.
+        vec![tag_bar_key(egui::Key::Enter, true, egui::Modifiers::NONE)],
+        vec![tag_bar_key(egui::Key::Enter, false, egui::Modifiers::NONE)],
         vec![egui::Event::Ime(egui::ImeEvent::Commit("猫".into()))],
     ];
     for events in frames {
@@ -441,13 +445,350 @@ fn section1476_tag_bar_ime_composition_keeps_viewer_of_final_result() {
             },
         );
         let _ = crate::test_ui::headless_paint_output(output);
-        wait_for_tag_result(&mut app);
+        assert!(app.tag_view_pending.is_none());
+        assert_eq!(app.tag_view.last_executed, "#cat");
+        assert_eq!(app.fullscreen_idx, Some(idx));
         trace.push((app.tag_view.query.clone(), app.fullscreen_idx));
     }
+    tag_bar_frame(
+        &mut app,
+        &ctx,
+        vec![tag_bar_key(egui::Key::Enter, true, egui::Modifiers::NONE)],
+    );
+    assert!(app.tag_view_pending.is_some());
+    wait_for_tag_result(&mut app);
     assert_eq!(app.tag_view.last_executed, "猫", "{trace:?}");
     let open = app
         .fullscreen_idx
         .and_then(|idx| app.items.get(idx))
         .and_then(GridItem::drag_source_path);
     assert_eq!(open, Some(image.as_path()), "{trace:?}");
+}
+
+fn tag_bar_key(key: egui::Key, pressed: bool, modifiers: egui::Modifiers) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed,
+        repeat: false,
+        modifiers,
+    }
+}
+
+fn tag_bar_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+    // No native keyboard sampling: the entire input batch is synthetic egui input.
+    crate::key_input::set_test_frame(vec![]);
+    let output = ctx.run_pass(
+        egui::RawInput {
+            events,
+            ..Default::default()
+        },
+        |ctx| {
+            app.update_ime_state(ctx);
+            ctx.root_ui(|root| app.render_tag_view_bar(root));
+        },
+    );
+    let _ = crate::test_ui::headless_paint_output(output);
+}
+
+fn tag_bar_context(app: &mut App) -> egui::Context {
+    let ctx = egui::Context::default();
+    crate::ime_focus::install_ime_input_policy(&ctx);
+    crate::ui_fonts::configure_fonts(&ctx);
+    app.tag_view.focus_request = true;
+    tag_bar_frame(app, &ctx, vec![]);
+    ctx
+}
+
+fn replace_tag_bar_text(app: &mut App, ctx: &egui::Context, text: &str) {
+    app.tag_view.focus_request = true;
+    tag_bar_frame(app, ctx, vec![]);
+    tag_bar_frame(
+        app,
+        ctx,
+        vec![tag_bar_key(egui::Key::A, true, egui::Modifiers::COMMAND)],
+    );
+    tag_bar_frame(
+        app,
+        ctx,
+        vec![tag_bar_key(egui::Key::A, false, egui::Modifiers::COMMAND)],
+    );
+    let events = if text.is_empty() {
+        vec![tag_bar_key(
+            egui::Key::Backspace,
+            true,
+            egui::Modifiers::NONE,
+        )]
+    } else {
+        vec![egui::Event::Text(text.into())]
+    };
+    tag_bar_frame(app, ctx, events);
+    assert_eq!(app.tag_view.query, text);
+}
+
+fn tag_bar_viewer_fixture() -> (crate::app::AppTestEnvForTest, PathBuf) {
+    let mut app = phase_c_support::setup_app();
+    let (image, _) = seed(&mut app);
+    image::RgbImage::new(2, 3).save(&image).unwrap();
+    app.open_tag_view_for_tag("cat");
+    wait_for_tag_result(&mut app);
+    app.open_fullscreen(0, HistoryTrigger::UserChosen);
+    assert!(app.projected_viewer_session_open());
+    (app, image)
+}
+
+#[test]
+fn section1476_tag_bar_typing_waits_for_enter_and_searches_once() {
+    let _input = crate::key_input::lock_test_input();
+    let (mut app, image) = tag_bar_viewer_fixture();
+    let ctx = tag_bar_context(&mut app);
+    let original = app.items.clone();
+    let run = app.tag_view.run;
+    replace_tag_bar_text(&mut app, &ctx, "#ca");
+    assert!(app.tag_view_pending.is_none());
+    assert_eq!(app.items, original);
+    assert_eq!(app.tag_view.run, run);
+    tag_bar_frame(
+        &mut app,
+        &ctx,
+        vec![tag_bar_key(egui::Key::Enter, true, egui::Modifiers::NONE)],
+    );
+    assert!(app.tag_view_pending.is_some());
+    assert_eq!(app.tag_view.run, run + 1);
+    tag_bar_frame(&mut app, &ctx, vec![]);
+    assert_eq!(app.tag_view.run, run + 1);
+    wait_for_tag_result(&mut app);
+    assert_eq!(
+        app.items[app.fullscreen_idx.unwrap()].drag_source_path(),
+        Some(image.as_path())
+    );
+    // Reconfirming an unchanged query must not start another worker.
+    app.tag_view.focus_request = true;
+    tag_bar_frame(
+        &mut app,
+        &ctx,
+        vec![tag_bar_key(egui::Key::Enter, false, egui::Modifiers::NONE)],
+    );
+    tag_bar_frame(
+        &mut app,
+        &ctx,
+        vec![tag_bar_key(egui::Key::Enter, true, egui::Modifiers::NONE)],
+    );
+    assert_eq!(app.tag_view.run, run + 1);
+    assert!(app.tag_view_pending.is_none());
+}
+
+#[test]
+fn section1476_tag_bar_enter_closes_viewer_excluded_from_result() {
+    let _input = crate::key_input::lock_test_input();
+    let (mut app, _) = tag_bar_viewer_fixture();
+    let ctx = tag_bar_context(&mut app);
+    replace_tag_bar_text(&mut app, &ctx, "#absent");
+    assert!(app.tag_view_pending.is_none());
+    assert!(app.projected_viewer_session_open());
+    tag_bar_frame(
+        &mut app,
+        &ctx,
+        vec![tag_bar_key(egui::Key::Enter, true, egui::Modifiers::NONE)],
+    );
+    wait_for_tag_result(&mut app);
+    assert!(app.items.is_empty());
+    assert!(!app.projected_viewer_session_open());
+}
+
+#[test]
+fn section1476_tag_bar_empty_draft_returns_to_folder_only_on_enter() {
+    let _input = crate::key_input::lock_test_input();
+    let (mut app, _) = tag_bar_viewer_fixture();
+    let ctx = tag_bar_context(&mut app);
+    let original = app.items.clone();
+    let saved = app.tag_view.saved_folder.clone();
+    replace_tag_bar_text(&mut app, &ctx, "");
+    assert!(app.tag_view_pending.is_none());
+    assert!(app.items_are_tag_view);
+    assert_eq!(app.items, original);
+    assert!(app.projected_viewer_session_open());
+    tag_bar_frame(
+        &mut app,
+        &ctx,
+        vec![tag_bar_key(egui::Key::Enter, true, egui::Modifiers::NONE)],
+    );
+    assert!(app.tag_view_pending.is_some());
+    wait_for_tag_result(&mut app);
+    assert!(!app.items_are_tag_view);
+    assert_eq!(app.current_folder, saved);
+}
+
+#[test]
+fn section1476_tag_bar_without_viewer_searches_each_edit_but_not_on_close() {
+    let _input = crate::key_input::lock_test_input();
+    let (mut app, _) = tag_bar_viewer_fixture();
+    let ctx = tag_bar_context(&mut app);
+    replace_tag_bar_text(&mut app, &ctx, "#ca");
+    let run = app.tag_view.run;
+    app.close_fullscreen();
+    assert!(!app.projected_viewer_session_open());
+    tag_bar_frame(&mut app, &ctx, vec![]);
+    assert_eq!(app.tag_view.run, run);
+    assert!(app.tag_view_pending.is_none());
+    // Focusing the field must still leave the draft unsearched.
+    app.tag_view.focus_request = true;
+    tag_bar_frame(&mut app, &ctx, vec![]);
+    assert!(ctx.memory(|memory| memory.has_focus(App::tag_search_input_id())));
+    assert_eq!(app.tag_view.run, run);
+    // Each edit must differ from the executed #cat; typing "t" would restore
+    // that same query and correctly skip a redundant search.
+    for (offset, text) in ["x", "y"].into_iter().enumerate() {
+        tag_bar_frame(&mut app, &ctx, vec![egui::Event::Text(text.into())]);
+        assert!(app.tag_view_pending.is_some());
+        assert_eq!(app.tag_view.run, run + offset as u64 + 1);
+        wait_for_tag_result(&mut app);
+    }
+    assert_eq!(app.tag_view.last_executed, "#caxy");
+}
+
+#[test]
+fn section1476_tag_bar_menu_and_kind_selection_search_immediately_while_viewing() {
+    use egui_kittest::kittest::Queryable;
+    let _input = crate::key_input::lock_test_input();
+    let (mut app, image) = tag_bar_viewer_fixture();
+    // Start from a different executed query so the menu selection must search.
+    app.tag_view.query = "#ca".into();
+    app.execute_tag_view();
+    wait_for_tag_result(&mut app);
+    app.tag_view.query = "#unfinished".into();
+    let mut fonts_ready = false;
+    let mut harness = crate::test_ui::builder()
+        .with_size(egui::vec2(1093.0, 614.0))
+        .build_ui_state(
+            move |root, app: &mut crate::app::AppTestEnvForTest| {
+                let ctx = root.ctx().clone();
+                if !fonts_ready {
+                    crate::ime_focus::install_ime_input_policy(&ctx);
+                    crate::ui_fonts::configure_fonts(&ctx);
+                    fonts_ready = true;
+                    ctx.request_repaint();
+                    return;
+                }
+                app.update_ime_state(&ctx);
+                app.render_tag_view_bar(root);
+            },
+            app,
+        );
+    harness.run();
+    let run = harness.state().tag_view.run;
+    harness.get_by_label("一覧▼").click();
+    harness.run();
+    harness.get_by_label("#cat (2)").click();
+    harness.run();
+    assert_eq!(harness.state().tag_view.run, run + 1);
+    assert!(harness.state().tag_view_pending.is_some());
+    wait_for_tag_result(harness.state_mut());
+    assert_eq!(harness.state().tag_view.last_executed, "#cat");
+    // Picking the already executed tag again is the shipped way to search again.
+    harness.get_by_label("一覧▼").click();
+    harness.run();
+    harness.get_by_label("#cat (2)").click();
+    harness.run();
+    assert_eq!(harness.state().tag_view.run, run + 2);
+    wait_for_tag_result(harness.state_mut());
+    harness.get_by_label("種類").click();
+    harness.run();
+    harness.get_by_label("画像").click();
+    harness.run();
+    assert_eq!(harness.state().tag_view.run, run + 3);
+    assert!(harness.state().tag_view_pending.is_some());
+    wait_for_tag_result(harness.state_mut());
+    assert_eq!(
+        harness.state().tag_view.last_executed_kind_filter,
+        TagViewKindFilter::Image
+    );
+    assert_eq!(harness.state().items.len(), 1);
+    assert_eq!(
+        harness.state().items[harness.state().fullscreen_idx.unwrap()].drag_source_path(),
+        Some(image.as_path())
+    );
+}
+
+#[test]
+fn section1476_tag_rename_merge_completion_requeries_results_but_preserves_book_items() {
+    let mut app = phase_c_support::setup_app();
+    let (_, folder) = seed(&mut app);
+    app.open_tag_view_for_tag("cat");
+    wait_for_tag_result(&mut app);
+    let run = app.tag_view.run;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.tag_maintenance_rx = Some(rx);
+    tx.send(Ok("renamed".into())).unwrap();
+    app.poll_tag_maintenance_results();
+    assert!(app.tag_maintenance_rx.is_none());
+    assert!(app.tag_view_pending.is_some());
+    assert_eq!(app.tag_view.run, run + 1);
+    wait_for_tag_result(&mut app);
+
+    app.tag_view.nav_stack.push(folder.clone());
+    app.items_are_tag_view = false;
+    let page = folder.join("page.jpg");
+    app.items = vec![GridItem::Image(page)];
+    app.thumbnails = vec![ThumbnailState::Pending];
+    app.image_metas = vec![None];
+    let original = app.items.clone();
+    let generation = app.items_generation;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.tag_maintenance_rx = Some(rx);
+    tx.send(Ok("merged".into())).unwrap();
+    app.poll_tag_maintenance_results();
+    app.poll_tag_view();
+    assert!(app.tag_maintenance_rx.is_none());
+    assert!(app.tag_view_pending.is_none());
+    assert_eq!(app.tag_view.run, run + 1);
+    assert_eq!(app.items, original);
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.tag_view.nav_stack, [folder]);
+    app.tag_view_back();
+    assert!(app.tag_view_pending.is_some());
+    wait_for_tag_result(&mut app);
+    assert!(app.items_are_tag_view);
+    assert_eq!(app.items.len(), 2);
+}
+
+#[test]
+fn section1476_automatic_refresh_searches_executed_word_and_keeps_draft_and_viewer() {
+    let (mut app, image) = tag_bar_viewer_fixture();
+    // An unsubmitted word stays in the field while the F12-linked reader is open.
+    app.tag_view.query = "#absent".into();
+    for refresh in ["rename", "cleanup"] {
+        let run = app.tag_view.run;
+        if refresh == "rename" {
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.tag_maintenance_rx = Some(rx);
+            tx.send(Ok("renamed".into())).unwrap();
+            app.poll_tag_maintenance_results();
+        } else {
+            app.reload_open_metadata_views_after_cleanup();
+        }
+        assert_eq!(app.tag_view.run, run + 1, "{refresh}");
+        assert_eq!(app.tag_view.last_executed, "#cat", "{refresh}");
+        assert_eq!(app.tag_view.query, "#absent", "{refresh}");
+        wait_for_tag_result(&mut app);
+        let open = app
+            .fullscreen_idx
+            .and_then(|idx| app.items.get(idx))
+            .and_then(GridItem::drag_source_path);
+        assert_eq!(open, Some(image.as_path()), "{refresh}");
+        assert_eq!(app.address, "タグビュー: #cat", "{refresh}");
+    }
+}
+
+#[test]
+fn section1476_adopted_result_names_its_own_word_not_a_later_draft() {
+    let (mut app, _) = tag_bar_viewer_fixture();
+    app.set_tag_view_sort(TagViewSort::AppliedAtDesc);
+    assert!(app.tag_view_pending.is_some());
+    // The draft changes while the executed search is still in flight.
+    app.tag_view.query = "#absent".into();
+    wait_for_tag_result(&mut app);
+    assert!(app.fullscreen_idx.is_some());
+    assert_eq!(app.tag_view.last_executed, "#cat");
+    assert_eq!(app.address, "タグビュー: #cat");
 }
