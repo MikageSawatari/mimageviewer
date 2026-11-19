@@ -185,10 +185,14 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
     3. 終了 fence の期限切れの `terminate_host_now` (まれ)。
     4. EPUB worker (`crates/epub-pdf-worker/src/webview.rs`) は `Close()` を呼ぶが browser の終了は待たない。worker は KILL_ON_JOB_CLOSE の Job の中なので、強制終了でもダイアログにはならない見込み (未確認)。
   - 1 が通常の終了のたびに負けているなら、ダイアログはもっと多く出るはず。実際は 11-01 以降 2 件なので、1 が主因とは言えない。
-- 次の案 (直す前の診断。未実装):
-  - mIV が host を強制終了するとき (`Bridge::drop` の kill の時点で host がまだ生きている場合、`terminate_now`) に、型付きの理由 (`DropAfterShutdownRequest` / `ExitFenceExpired` など)、host の PID、環境 (mIV Sound / ユーザー VST)、Shutdown を送ってからの経過時間、host の子の msedgewebview2.exe の PID をログに残す。次に Application ログの記録が出たら、障害のプロセス ID と照合できる。
-  - EPUB worker は WebView2 の browser の PID (`BrowserProcessId`) を変換の記録に残す。
-  - これで絞れなかったときだけ、利用者に WER の LocalDumps (msedgewebview2.exe、管理者の設定) を相談する。
+- **実装済み (診断のみ、挙動は不変、2026-11-20)**: `Bridge::drop` の kill 直前 (host の生存確認が `Ok(None)` の場合、または確認失敗時) と `terminate_now` の `TerminateProcess` 直前に、`crate::logger::log` で1行を記録する。既に終了した host の Drop と偽 host (`child: None`) は記録しない。kill / TerminateProcess の順序・回数・既存の待機は変えない。
+  - 行の例: `[VST3] host forced termination reason=drop_after_shutdown host_pid=1234 environment=miv_sound shutdown_elapsed_ms=27 webview2=[5678<-1234,5679<-5678]`。
+  - `reason` は enum による `drop_after_shutdown` / `drop_without_shutdown` / `exit_fence_expired`。`environment` は起動時の `miv_sound` / `user_vst`。`shutdown_elapsed_ms` は最初に送信・flush が成功した Shutdown からの経過 ms (送信成功の記録がなければ `none`)。
+  - `webview2` は終了直前の単一 ToolHelp snapshot から得た msedgewebview2.exe の PID と親 PID (`子<-親`)。host の直接の子と孫の2世代を対象とし、ゼロ件は `[]`。取得失敗は `webview2=unavailable(snapshot: <error>)` / `unavailable(process_inventory: <error>)`、Drop の生存確認失敗は同じ行の `try_wait=unavailable(<error>)` に記録し、いずれも終了処理を続ける。
+  - 次の Application ログ (id 1000) の「障害が発生したプロセス ID」を、発生時刻とこの行の `webview2=[...]` の子 PID に照合する。Application ログが16進なら10進へ変換する (例: `0x162E` = `5678`)。snapshot 時点の親子関係の観測であり、単独でクラッシュ原因を断定しない。
+  - 整形・子孫抽出の純粋関数に単体テストを追加 (`video::dsp::bridge::forced_termination::tests` の 6 件)。実装担当 (Codex) は利用者の 2026-11-20 の決まりどおりコンパイル・テストをせず、設計担当が run-heavy で流した: `cargo nextest run -p mimageviewer --lib -E 'test(/forced_termination|webview2_descendants|video::dsp::/)'` **43 件成功**、本体 lib 全件 **19,023 件成功・0 失敗 (slow 5)・88 skip、1,634.6 秒**。
+  - 独立レビュー (gpt-6.1-sol / xhigh、2026-11-20、コード読解のみ): **ACCEPT**、指摘なし。注記: ToolHelp の全プロセス列挙は同期で、所要時間の上限はない (実測なし)。強制終了の時点だけで走る。
+- 残る診断案 (今回の実装対象外): EPUB worker は WebView2 の browser の PID (`BrowserProcessId`) を変換の記録に残す。これで絞れなかったときだけ、利用者に WER の LocalDumps (msedgewebview2.exe、管理者の設定) を相談する。
 - 関連: テストや試作で WebView2 を作るときは閉じてから終了を待つ方針 (派生版計画 §5)、§1.755。規模 / 優先度: 調査から / P3。
 
 ### 1.774 ★固定中に検索を開くと、固定時の一覧が持ち主のないまま残る — サブ PC の確認から (2026-11-12)

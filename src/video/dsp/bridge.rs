@@ -4,9 +4,7 @@
 //! - length-prefixed UTF-8 JSON で制御メッセージを send/recv
 //! - shared memory + 2 本の Windows named event で音声バッファを送受信
 //!
-//! Phase A 移植時はこのモジュールを `src/video/dsp/bridge.rs` にそのまま
-//! コピーするのが目的。なので mIV 本体の依存 (logger, settings 等) を
-//! 持ち込まない。
+//! 強制終了の診断は `forced_termination` に分離し、本体の logger へ記録する。
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -14,6 +12,12 @@ use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[path = "forced_termination.rs"]
+mod forced_termination;
+use forced_termination::HostEnvironment;
+#[cfg(windows)]
+use forced_termination::{ForcedTerminationReason, log_forced_termination};
 
 #[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
@@ -510,6 +514,9 @@ unsafe fn reject_existing_handle(handle: HANDLE, label: &str) -> std::io::Result
 
 /// bridge プロセスのハンドル。stdin/stdout と shared memory リソースを保持する。
 pub struct Bridge {
+    environment: HostEnvironment,
+    /// First successfully flushed Shutdown request; diagnostics only.
+    shutdown_sent_at: std::sync::OnceLock<std::time::Instant>,
     #[cfg(not(test))]
     child: Child,
     #[cfg(test)]
@@ -900,6 +907,8 @@ impl Bridge {
             .ok();
 
         Ok(Self {
+            environment: HostEnvironment::from(environment),
+            shutdown_sent_at: std::sync::OnceLock::new(),
             #[cfg(not(test))]
             child,
             #[cfg(test)]
@@ -1238,6 +1247,13 @@ impl Bridge {
         use std::os::windows::io::AsRawHandle;
         self.abort_state_queries();
         if let Some(child) = self.child() {
+            log_forced_termination(
+                ForcedTerminationReason::ExitFenceExpired,
+                child.id(),
+                self.environment,
+                self.shutdown_elapsed_ms(),
+                None,
+            );
             unsafe {
                 let _ = TerminateProcess(HANDLE(child.as_raw_handle()), 1);
             }
@@ -1676,7 +1692,7 @@ impl Bridge {
     /// `&mut self` を取るので、Drop の自動 kill より先にユーザーが明示的に呼ぶ想定。
     pub fn shutdown(&mut self) -> std::io::Result<()> {
         self.abort_state_queries();
-        let _ = self.send(&Cmd::Shutdown);
+        self.send_shutdown_request();
         if let Some(child) = self.child_mut() {
             let _ = child.wait();
         }
@@ -1688,8 +1704,22 @@ impl Bridge {
     /// Drop 経路で kill される。
     pub fn shutdown_async(&self) -> std::io::Result<()> {
         self.abort_state_queries();
-        let _ = self.send(&Cmd::Shutdown);
+        self.send_shutdown_request();
         Ok(())
+    }
+
+    fn send_shutdown_request(&self) {
+        // Keep the existing ignored send error and do not add any exit wait.
+        if self.send(&Cmd::Shutdown).is_ok() {
+            let _ = self.shutdown_sent_at.set(std::time::Instant::now());
+        }
+    }
+
+    #[cfg(windows)]
+    fn shutdown_elapsed_ms(&self) -> Option<u128> {
+        self.shutdown_sent_at
+            .get()
+            .map(|sent| sent.elapsed().as_millis())
     }
 }
 
@@ -1714,7 +1744,29 @@ impl Drop for Bridge {
             }
             let _ = h.name;
         }
+        let environment = self.environment;
+        let elapsed_ms = self.shutdown_elapsed_ms();
+        let reason = if self.shutdown_sent_at.get().is_some() {
+            ForcedTerminationReason::DropAfterShutdown
+        } else {
+            ForcedTerminationReason::DropWithoutShutdown
+        };
         if let Some(child) = self.child_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    log_forced_termination(reason, child.id(), environment, elapsed_ms, None);
+                }
+                Err(error) => {
+                    log_forced_termination(
+                        reason,
+                        child.id(),
+                        environment,
+                        elapsed_ms,
+                        Some(&error.to_string()),
+                    );
+                }
+            }
             let _ = child.kill();
         }
         if let Some(child) = self.child_mut() {
