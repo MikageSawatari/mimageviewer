@@ -1244,19 +1244,17 @@ Direct / CachedZipの実path、またはsource確定済みUnavailableだけは�
 キャッシュ削除後も保存済みのバーを表示し、Pending／未確定／設定OFFでは非表示。
 分割RARの論理sourceはworkerのheader確認で確定し、描画中のI/Oやファイル名推測はしない。
 
-変換cache管理のDeletedSelected / DeletedMissing / DeletedAll完了は、読込元ownerへ
-変異通知を渡す。旧batchのreceiverを破棄/cancelし、CachedZipだけをPendingへ戻して
-既存range/admission経路で非同期再判定する。Direct / Unavailable、pin rootの来歴、
-保存済み読書位置mapは変更しない。削除結果は件数だけなので全CachedZipを再検証するが、
-source一覧や読込済み画像を一括resetしない。Rows / Errorは変異通知にしない。
-
-同じ変異通知をmounted ownerだけでなく、全AtRest / Retiring bundleと各Smart sessionの
-Visible / Offscreen親payloadにも届ける。parked contextをmountせず、各ownerの解決batchだけを
-cancel/破棄する。history/A-Bの地点record自体はmapを持たず、Smartの親payload復元か通常再列挙へ戻る。
-共有sort metadataや進行中prepareの古いmapは、prepared aggregateの採用/評価条件での行追加の境界でCachedZipを
-Pendingにして既存workerへ渡す。初回/再prepareでもキャッシュ解決を非同期に確かめるため、
-新しいepochや巨大metadataのclone、sort/読書sessionの中断を足さない。
-復帰・context swapというread-only操作を共有ストアの変異通知にしない。
+§1.803では変換cacheの実変更を`ArchiveCacheDb`自身の在メモリ変更列へ記録する。
+各`ConvertedArchiveSources`は表と反映済みrevisionを一緒に所有し、判定poll・prepared採用・
+Smart復元・context mount・snapshot一覧復元で使用前に追いつく。新しい記録があれば、
+候補が既にPendingでもそのownerの旧batchをcancelしreceiverを破棄する。
+Sourceの記録は元書庫と表keyを照合して該当候補を、AllCachedはCachedZipだけをPendingへ戻す。
+利用時刻だけのUPDATEや失敗した書き込みは通知しない。変更列と最大revisionは同じlockで採る。
+Smartの表の統合では両方を同一snapshotへ進め、準備も通常一覧のcache優先resolverを使う。
+AtRest / Retiring / Smart退避への通知配布は撤去し、表とbatchはcontextとともに移動する。
+snapshotの元一覧・固定一覧も素材と表を対で戻す。復帰・swapは共有ストアへ変異を発行しない。
+素材はworkerが実際に読んだ書庫のbindingを運び、CPU画像待ちの後の採用直前・判定確定・
+保持一覧復元で確定sourceと照合する。詳細は[表紙計画§31](cover-crop-plan.md)。
 
 pin root の cascade 結果は `converted_archive_pin_root_states` に root 単位で保持する。root が batch
 候補になるのは、同 generation / 同 `folder_thumb_depth` で未走査か、記録済み archive key にまだ

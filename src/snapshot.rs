@@ -555,6 +555,7 @@ pub struct SnapshotState {
         std::sync::Arc<crate::app::file_type_resume::PreparedPageIdentityIndex>,
     /// snapshot ON 時点の `App.thumbnails` (= GPU texture 状態含む)
     pub saved_thumbnails: Vec<crate::grid_item::ThumbnailState>,
+    pub(crate) saved_converted_archive_sources: crate::app::ConvertedArchiveSources,
     /// snapshot ON 時点の `App.image_metas`。
     /// `saved_items` と位置対応するため、解除時は必ず同時に書き戻す。
     pub saved_image_metas: Vec<Option<(i64, i64)>>,
@@ -582,6 +583,7 @@ pub struct SnapshotState {
     /// 同上、サムネイル状態 (= GPU texture 含む、ロード済みフォルダ代表サムネ保持)。
     /// 子フォルダから BS で戻った際にサムネが Pending に戻らないために必要。
     pub list_view_thumbnails: Vec<crate::grid_item::ThumbnailState>,
+    pub(crate) list_view_converted_archive_sources: crate::app::ConvertedArchiveSources,
     /// 同上、`list_view_items` と位置対応する画像 metadata。
     pub list_view_image_metas: Vec<Option<(i64, i64)>>,
     pub(crate) list_view_page_identity_index:

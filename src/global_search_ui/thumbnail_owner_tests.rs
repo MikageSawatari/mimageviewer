@@ -40,6 +40,7 @@ fn video_folder_pin_fixture(
     (
         SearchMetadataResources {
             thumbnail_owner,
+            archive_cache_db: None,
             pin_db: Some(pins),
             video_pins: video_db.read_source(),
             tags_db_path: None,

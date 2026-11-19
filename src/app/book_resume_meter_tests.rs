@@ -1812,6 +1812,7 @@ fn book_resume_meter_archive_cache_deletion_completion_rechecks_sources() {
             );
             std::thread::yield_now();
         }
+        app.poll_converted_archive_cache_paths(&egui::Context::default());
         assert!(
             !cached.exists(),
             "{action}: the real deletion worker must remove the ZIP"
@@ -2028,7 +2029,7 @@ fn book_resume_meter_smart_parent_cache_delete_backspace_rechecks_stashed_source
 }
 
 #[test]
-fn book_resume_meter_cache_delete_invalidates_parked_source_owner_without_mounting() {
+fn book_resume_meter_cache_delete_catches_up_parked_source_owner_on_mount() {
     use super::ConvertedArchiveSourceState as Source;
     use super::{ConvertedArchiveCachePathsMsg, ConvertedArchiveCachePathsPending};
     use crate::cache_maintenance::{ArchiveMaintTask, spawn_archive};
@@ -2047,6 +2048,21 @@ fn book_resume_meter_cache_delete_invalidates_parked_source_owner_without_mounti
     let direct_key = crate::path_key::normalize_keep_drive(&direct);
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
+    std::fs::write(&cached, b"cached archive").unwrap();
+    app.archive_cache_db
+        .as_ref()
+        .unwrap()
+        .record(
+            &source,
+            1,
+            2,
+            crate::archive_converter::ArchiveFormat::SevenZ,
+            &cached,
+            14,
+            1,
+            false,
+        )
+        .unwrap();
     let parked = app.build_window_context_for_test(1350, |owner| {
         owner.converted_archive_cache_paths.insert(
             key.clone(),
@@ -2094,11 +2110,12 @@ fn book_resume_meter_cache_delete_invalidates_parked_source_owner_without_mounti
     assert_eq!(app.mounted_viewer_context_id(), mounted);
     assert_eq!(app.items_generation, generation);
     assert!(
-        cancel.load(Ordering::Relaxed),
-        "parked batch is cancelled at deletion"
+        !cancel.load(Ordering::Relaxed),
+        "parked source owner stays passive until mount"
     );
     app.with_window_context_for_test(parked, |owner| {
         owner.poll_converted_archive_cache_paths(&egui::Context::default());
+        assert!(cancel.load(Ordering::Relaxed), "mount cancels old replies");
         assert_eq!(
             owner.converted_archive_cache_paths.get(&key),
             Some(&Source::Pending)
@@ -2188,6 +2205,8 @@ fn book_resume_identity_write_retains_exact_page_and_raw_record_together() {
     );
 }
 fn refresh_converted_source(app: &mut AppTestEnv, idx: usize) {
+    // Production polls the source owner before range admission in the same frame.
+    app.poll_converted_archive_cache_paths(&egui::Context::default());
     let scope = std::collections::HashSet::from([idx]);
     app.start_converted_archive_cache_paths_refresh(&scope, (idx, idx + 1), (idx, idx + 1));
     let deadline = Instant::now() + WORKER_TIMEOUT;
@@ -2213,6 +2232,7 @@ fn delete_converted_cache(app: &mut AppTestEnv, source: &Path) {
         assert!(Instant::now() < deadline, "cache deletion did not finish");
         std::thread::yield_now();
     }
+    app.poll_converted_archive_cache_paths(&egui::Context::default());
 }
 
 fn convert_and_record_cache(

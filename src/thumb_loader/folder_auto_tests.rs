@@ -211,6 +211,7 @@ fn cover_auto_pdf_transposed_page_dimensions_continue_detection_with_same_lease(
             input: AutoCoverInput::Container,
         }),
         None,
+        None,
     );
     assert_eq!(done.load(Ordering::Relaxed), 1);
     let messages: Vec<_> = rx.try_iter().collect();

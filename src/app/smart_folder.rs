@@ -243,7 +243,7 @@ pub(crate) struct ReusedSmartFolderMetadata {
     conceal_paths: HashSet<String>,
     comic_paths: HashSet<String>,
     folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPin>,
-    converted_archive_cache_paths: HashMap<String, ConvertedArchiveSourceState>,
+    converted_archive_cache_paths: ConvertedArchiveSources,
 }
 
 /// The already-materialized root grid is moved here while the user is inside a folder, PDF, or
@@ -322,7 +322,7 @@ pub(crate) struct SmartFolderPreparedGrid {
     conceal_pages: HashSet<usize>,
     comic_pages: HashSet<usize>,
     folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPin>,
-    converted_archive_cache_paths: HashMap<String, ConvertedArchiveSourceState>,
+    converted_archive_cache_paths: ConvertedArchiveSources,
     color_cache_map: Option<Arc<std::sync::RwLock<HashMap<String, crate::catalog::CacheEntry>>>>,
     color_catalog: Option<Arc<crate::catalog::CatalogDb>>,
 }
@@ -582,24 +582,6 @@ impl SmartFolderSession {
                 pin_db,
             );
         }
-    }
-
-    pub(in crate::app) fn invalidate_cached_sources(&mut self) {
-        if let Some(grid) = self.phase.parked_root_mut() {
-            ConvertedArchiveSourceState::invalidate_cached_paths(
-                &mut grid.converted_archive_cache_paths,
-            );
-        }
-        if let Some(prepared) = self.phase.offscreen_root_mut()
-            && let Some(metadata) = prepared.metadata.aggregate.as_mut()
-        {
-            ConvertedArchiveSourceState::invalidate_cached_paths(
-                &mut metadata.converted_archive_cache_paths,
-            );
-        }
-        // Shared sort metadata and in-flight prepare replies remain reusable. Their source
-        // maps are revalidated at start_loading_items_inner before publication, so no large
-        // metadata clone, navigation cancellation, or second cache epoch is required.
     }
 
     fn new(
@@ -1760,14 +1742,24 @@ impl App {
             Box::new(retired_index) as RetiredSmartFolderPayload,
             Box::new(source) as RetiredSmartFolderPayload,
         ]);
-        if let Some(mut extra) = aggregate {
-            // Membership prepare can complete after deletion, just like a full prepare.
-            ConvertedArchiveSourceState::invalidate_cached_paths(
-                &mut extra.converted_archive_cache_paths,
-            );
+        if let Some(extra) = aggregate {
             self.folder_pin_map.extend(extra.folder_pin_map);
-            self.converted_archive_cache_paths
-                .extend(extra.converted_archive_cache_paths);
+            let published_archive_keys = extra
+                .converted_archive_cache_paths
+                .iter()
+                .filter(|(_, state)| state.load_path().is_some())
+                .map(|(key, _)| key.clone())
+                .collect();
+            // Reconcile both owners against one log snapshot before combining their rows.
+            // Even an unchanged Pending row can have an obsolete decision in flight.
+            if self.converted_archive_cache_paths.merge_caught_up(
+                extra.converted_archive_cache_paths,
+                self.archive_cache_db.as_deref(),
+            ) && let Some(pending) = self.converted_archive_cache_paths_pending.take()
+            {
+                pending.cancel();
+            }
+            self.reconcile_converted_archive_bindings(&published_archive_keys, HashSet::new());
         }
         if !appended_videos.is_empty() {
             self.spawn_video_thread(
@@ -6192,36 +6184,19 @@ struct SmartFolderPrepareResources {
 
 fn prepared_converted_archive_path(
     path: &Path,
-    mut mtime: i64,
-    mut size: i64,
+    mtime: i64,
+    size: i64,
     db: Option<&crate::archive_cache::ArchiveCacheDb>,
-) -> ConvertedArchiveSourceState {
-    let mut source = path.to_path_buf();
-    let mut logical_source = (!crate::rar_loader::is_rar_path(path)).then(|| source.clone());
-    if crate::rar_loader::is_rar_path(path) {
-        match crate::rar_loader::inspect_for_direct_read(path) {
-            Ok(inspection)
-                if inspection.decision == crate::rar_loader::RarDirectReadDecision::Direct =>
-            {
-                return ConvertedArchiveSourceState::Direct(inspection.resolved_path);
-            }
-            Ok(inspection) => {
-                source = inspection.resolved_path;
-                logical_source = Some(source.clone());
-                if let Ok(metadata) = std::fs::metadata(&source) {
-                    mtime = crate::ui_helpers::mtime_secs(&metadata);
-                    size = metadata.len() as i64;
-                }
-            }
-            Err(_) => {}
-        }
-    }
-    db.and_then(|db| db.peek(&source, mtime, size))
-        .map(|path| ConvertedArchiveSourceState::CachedZip {
-            logical_source: source.clone(),
-            path,
-        })
-        .unwrap_or(ConvertedArchiveSourceState::Unavailable { logical_source })
+    cancel: &AtomicBool,
+) -> Option<ConvertedArchiveSourceState> {
+    let candidate = ConvertedArchiveCandidate {
+        archive_key: crate::path_key::normalize_keep_drive(path),
+        path: path.to_path_buf(),
+        mtime,
+        file_size: size,
+        idx: 0,
+    };
+    resolve_converted_archive_candidate(&candidate, db, cancel, 0)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -6320,7 +6295,7 @@ struct EvaluatedSmartFolderMembership {
     rating_write_generation: u64,
     tags: HashMap<String, Vec<String>>,
     local_adjust: HashSet<String>,
-    converted_archive_paths: HashMap<String, ConvertedArchiveSourceState>,
+    converted_archive_paths: ConvertedArchiveSources,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6501,7 +6476,9 @@ fn evaluate_smart_folder_membership(
     };
     let mut converted_archive_paths = reused_metadata
         .map(|metadata| metadata.converted_archive_cache_paths.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            ConvertedArchiveSources::new(archive_cache_db.map_or(0, |db| db.revision()))
+        });
     if !reuse_metadata {
         for (index, entry) in snapshot.entries.iter().enumerate() {
             if index.is_multiple_of(METADATA_CHUNK_SIZE) && cancel.load(Ordering::Relaxed) {
@@ -6510,12 +6487,15 @@ fn evaluate_smart_folder_membership(
             if entry.kind != SmartFolderEntryKind::Archive {
                 continue;
             }
-            let state = prepared_converted_archive_path(
+            let Some(state) = prepared_converted_archive_path(
                 &entry.path,
                 entry.mtime,
                 entry.file_size.unwrap_or(0),
                 archive_cache_db,
-            );
+                cancel,
+            ) else {
+                return Ok(None);
+            };
             converted_archive_paths
                 .insert(crate::path_key::normalize_keep_drive(&entry.path), state);
         }
@@ -8689,6 +8669,7 @@ impl App {
         self.comic_pages = comic_pages;
         self.folder_pin_map = folder_pin_map;
         self.converted_archive_cache_paths = converted_archive_cache_paths;
+        self.catch_up_converted_archive_sources();
         self.current_color_cache_map = color_cache_map;
         self.current_color_catalog = color_catalog;
         self.thumbnail_pool_catalog = super::ThumbnailPoolCatalog::View(synthetic);
@@ -12071,6 +12052,52 @@ mod tests {
     }
 
     #[test]
+    fn smart_root_source_transfer_retains_revision_and_catches_changes_before_restore() {
+        let mut app = crate::app::setup_app_for_test();
+        let definition_id = install_smart_identity_test_root(&mut app, Default::default());
+        let db = app.archive_cache_db.clone().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let source = files.path().join("book.rar");
+        let key = crate::path_key::normalize_keep_drive(&source);
+        let cached = files.path().join("book.zip");
+        db.record(
+            &source,
+            1,
+            2,
+            crate::archive_converter::ArchiveFormat::Rar,
+            &cached,
+            3,
+            1,
+            false,
+        )
+        .unwrap();
+        app.converted_archive_cache_paths = ConvertedArchiveSources::new(db.revision());
+        app.converted_archive_cache_paths.insert(
+            key.clone(),
+            ConvertedArchiveSourceState::CachedZip {
+                logical_source: source.clone(),
+                path: cached,
+            },
+        );
+        let retained = app.converted_archive_cache_paths.clone();
+        let grid = app.take_visible_smart_folder_grid();
+        assert_eq!(grid.converted_archive_cache_paths, retained);
+        assert!(app.converted_archive_cache_paths.is_empty());
+        park_smart_identity_test_root(&mut app, grid);
+        db.delete_entry(&source).unwrap();
+
+        assert!(app.restore_prepared_smart_folder_session(definition_id, None));
+        assert_eq!(
+            app.converted_archive_cache_paths.synced_revision(),
+            db.revision()
+        );
+        assert_eq!(
+            app.converted_archive_cache_paths.get(&key),
+            Some(&ConvertedArchiveSourceState::Pending)
+        );
+    }
+
+    #[test]
     fn cover_rotation_prepared_smart_root_rechecks_retained_legacy_materials_on_restore() {
         use crate::cover_source_scope::{CoverSourceScope, LoadedCoverIdentity};
         use crate::rotation_db::Rotation;
@@ -12686,6 +12713,153 @@ mod tests {
             assert_eq!(app.items, original_items);
             assert!(Arc::ptr_eq(&app.page_identity_index, &current));
         }
+    }
+
+    fn assert_smart_membership_reconciles_published_source(cached_zip: bool) {
+        use crate::app::{ConvertedArchiveCachePathsMsg, ConvertedArchiveCachePathsPending};
+        use crate::thumb_loader::ConvertedSourceBinding;
+
+        let mut app = crate::app::setup_app_for_test();
+        install_smart_identity_test_root(&mut app, Default::default());
+        let source = PathBuf::from(r"C:\Smart\book.rar");
+        let cached = PathBuf::from(r"C:\Cache\book.zip");
+        let archive_key = crate::path_key::normalize_keep_drive(&source);
+        let direct = ConvertedArchiveSourceState::Direct(source.clone());
+        let converted = ConvertedArchiveSourceState::CachedZip {
+            logical_source: source.clone(),
+            path: cached.clone(),
+        };
+        let (previous, published, stale_read, matching_read) = if cached_zip {
+            (direct, converted, &source, &cached)
+        } else {
+            (converted, direct, &cached, &source)
+        };
+        app.items = vec![
+            GridItem::ConvertibleArchive {
+                path: source.clone(),
+                format: crate::archive_converter::ArchiveFormat::Rar,
+            },
+            GridItem::ZipDir {
+                zip_path: source.clone(),
+                dir_prefix: "chapter/".into(),
+                is_archive: false,
+                representative: Some("chapter/cover.jpg".into()),
+            },
+        ];
+        app.page_identity_index = Arc::new(
+            super::super::file_type_resume::PreparedPageIdentityIndex::prepare(
+                &app.items,
+                None,
+                Default::default(),
+            ),
+        );
+        app.top_level_grid_view
+            .smart_folder_session_mut()
+            .unwrap()
+            .item_rating_masks = Some(vec![[true; 6]; 2]);
+        let ctx = egui::Context::default();
+        let texture = ctx.load_texture(
+            "smart-membership-source-publication",
+            egui::ColorImage::filled([2, 1], egui::Color32::WHITE),
+            Default::default(),
+        );
+        app.thumbnails = [stale_read, matching_read]
+            .into_iter()
+            .map(|read_archive| {
+                let mut thumbnail = ThumbnailState::loaded_raster(
+                    texture.clone(),
+                    crate::thumb_loader::ThumbLoadOrigin::FinalCache,
+                    false,
+                    2,
+                    crate::source_coverage::SourceCoverage::FullSource,
+                    Some((2, 1)),
+                    None,
+                );
+                if let ThumbnailState::Loaded {
+                    converted_source_binding,
+                    ..
+                } = &mut thumbnail
+                {
+                    *converted_source_binding = Some(ConvertedSourceBinding {
+                        archive_key: archive_key.clone(),
+                        read_archive: crate::path_key::normalize_keep_drive(read_archive),
+                    });
+                }
+                thumbnail
+            })
+            .collect();
+        let revision = app.archive_cache_db.as_ref().unwrap().revision();
+        app.converted_archive_cache_paths = ConvertedArchiveSources::new(revision);
+        app.converted_archive_cache_paths
+            .insert(archive_key.clone(), previous);
+        let (mut prepared, pending) = smart_membership_identity_test_result(&app);
+        let mut incoming = ConvertedArchiveSources::new(revision);
+        incoming.insert(archive_key.clone(), published.clone());
+        prepared.prepared.metadata.aggregate = Some(
+            super::super::subfolder_expansion::PreparedAggregateMetadata {
+                adjustment_page_params: HashMap::new(),
+                export_crop_page_settings: HashMap::new(),
+                view_trim_page_overrides: HashMap::new(),
+                mask_pages: HashSet::new(),
+                conceal_pages: HashSet::new(),
+                comic_pages: HashSet::new(),
+                folder_pin_map: HashMap::new(),
+                converted_archive_cache_paths: incoming,
+                catalog: None,
+            },
+        );
+
+        app.install_smart_folder_rating_membership(prepared, pending);
+        assert_eq!(
+            app.converted_archive_cache_paths.get(&archive_key),
+            Some(&published)
+        );
+        let evicted_at_publication = matches!(app.thumbnails[0], ThumbnailState::Evicted);
+        assert!(
+            matches!(&app.thumbnails[1], ThumbnailState::Loaded { tex, .. }
+            if tex.id() == texture.id())
+        );
+
+        // A previously queued equivalent reply sees changed=false. Publication itself
+        // must reconcile retained materials; this reply cannot repair a missed check.
+        let (tx, rx) = mpsc::channel();
+        tx.send(ConvertedArchiveCachePathsMsg::Resolved {
+            archive_key,
+            state: published,
+            idx: 0,
+            ordinal: 1,
+            elapsed_ms: 0.0,
+            input_seq: 0,
+        })
+        .unwrap();
+        app.converted_archive_cache_paths_pending = Some(ConvertedArchiveCachePathsPending {
+            generation: app.items_generation,
+            cascade_depth: app.settings.folder_thumb_depth as usize,
+            cancel: Arc::new(AtomicBool::new(false)),
+            desired_indices: Arc::new(std::sync::RwLock::new(HashSet::from([0]))),
+            rx,
+            pin_archive_dependencies: HashMap::new(),
+        });
+        app.poll_converted_archive_cache_paths(&ctx);
+        assert!(
+            evicted_at_publication,
+            "membership publication kept a stale Loaded material"
+        );
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Evicted));
+        assert!(
+            matches!(&app.thumbnails[1], ThumbnailState::Loaded { tex, .. }
+            if tex.id() == texture.id())
+        );
+    }
+
+    #[test]
+    fn smart_membership_source_publication_reconciles_direct_to_cached_zip() {
+        assert_smart_membership_reconciles_published_source(true);
+    }
+
+    #[test]
+    fn smart_membership_source_publication_reconciles_cached_zip_to_direct() {
+        assert_smart_membership_reconciles_published_source(false);
     }
 
     #[test]
@@ -13769,6 +13943,106 @@ mod tests {
     }
 
     #[test]
+    fn prepared_converted_rar_uses_cached_zip_before_direct_read() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let source = data.path().join("direct.rar");
+        let cached = data.path().join("converted.zip");
+        std::fs::write(&source, crate::rar_loader::direct_read_test_fixture_bytes()).unwrap();
+        std::fs::write(&cached, b"converted cache").unwrap();
+        let meta = std::fs::metadata(&source).unwrap();
+        let mtime = crate::ui_helpers::mtime_secs(&meta);
+        let size = meta.len() as i64;
+        let cancel = AtomicBool::new(false);
+        let direct = prepared_converted_archive_path(&source, mtime, size, None, &cancel).unwrap();
+        assert!(
+            matches!(direct.read_source(), ConvertedArchiveSourceState::Direct(path) if path == &source)
+        );
+
+        let db = crate::archive_cache::ArchiveCacheDb::open().unwrap();
+        db.record(
+            &source,
+            mtime,
+            size,
+            crate::archive_converter::ArchiveFormat::Rar,
+            &cached,
+            15,
+            2,
+            false,
+        )
+        .unwrap();
+        let prepared =
+            prepared_converted_archive_path(&source, mtime, size, Some(&db), &cancel).unwrap();
+        assert!(matches!(
+            prepared.read_source(),
+            ConvertedArchiveSourceState::CachedZip { logical_source, path }
+                if logical_source == &source && path == &cached
+        ));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(
+            prepared_converted_archive_path(&source, mtime, size, Some(&db), &cancel).is_none()
+        );
+    }
+
+    #[test]
+    fn smart_membership_merge_catches_each_source_map_up_from_its_own_revision() {
+        let _data = crate::data_dir::TestDataDirGuard::new();
+        let db = crate::archive_cache::ArchiveCacheDb::open().unwrap();
+        let first = PathBuf::from(r"C:\Books\first.rar");
+        let second = PathBuf::from(r"C:\Books\second.7z");
+        let first_key = crate::path_key::normalize_keep_drive(&first);
+        let second_key = crate::path_key::normalize_keep_drive(&second);
+        let cached = PathBuf::from(r"C:\Cache\first.zip");
+        let mut displayed = ConvertedArchiveSources::new(db.revision());
+        displayed.insert(
+            first_key.clone(),
+            ConvertedArchiveSourceState::Direct(first.clone()),
+        );
+        db.record(
+            &first,
+            1,
+            2,
+            crate::archive_converter::ArchiveFormat::Rar,
+            &cached,
+            3,
+            1,
+            false,
+        )
+        .unwrap();
+        let resolved = ConvertedArchiveSourceState::CachedZip {
+            logical_source: first.clone(),
+            path: cached.clone(),
+        };
+        let mut prepared = ConvertedArchiveSources::new(db.revision());
+        prepared.insert(first_key.clone(), resolved.clone());
+        prepared.insert(
+            second_key.clone(),
+            ConvertedArchiveSourceState::Unavailable {
+                logical_source: Some(second.clone()),
+            },
+        );
+        db.record(
+            &second,
+            4,
+            5,
+            crate::archive_converter::ArchiveFormat::SevenZ,
+            &cached,
+            3,
+            1,
+            false,
+        )
+        .unwrap();
+
+        assert!(displayed.merge_caught_up(prepared, Some(&db)));
+        assert_eq!(displayed.synced_revision(), db.revision());
+        assert_eq!(displayed.get(&first_key), Some(&resolved));
+        assert_eq!(
+            displayed.get(&second_key),
+            Some(&ConvertedArchiveSourceState::Pending)
+        );
+        assert!(!displayed.catch_up(Some(&db)));
+    }
+
+    #[test]
     fn smart_full_prepare_video_seed_upgrades_identity_only_and_then_preserves_the_row() {
         use crate::cover_identity::CoverIdentity;
         use crate::folder_thumb_pins::{FileKind, FolderPinSource};
@@ -14262,6 +14536,14 @@ mod tests {
             ratings_by_path: HashMap::from([(a_key.clone(), 4)]),
             tags_by_path: HashMap::from([(b_key.clone(), vec!["本".into()])]),
             local_adjust_paths: HashSet::from([b_key.clone()]),
+            converted_archive_cache_paths: {
+                let mut sources = ConvertedArchiveSources::new(19);
+                sources.insert(
+                    "c:/books/hidden.rar".into(),
+                    ConvertedArchiveSourceState::Pending,
+                );
+                sources
+            },
             ..ReusedSmartFolderMetadata::default()
         };
         let reused = Arc::new(reused);
@@ -14288,6 +14570,21 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(Arc::ptr_eq(&prepared.resort_metadata, &reused_identity));
+        let filtered_sources = &prepared
+            .metadata
+            .aggregate
+            .as_ref()
+            .unwrap()
+            .converted_archive_cache_paths;
+        assert!(filtered_sources.is_empty());
+        assert_eq!(filtered_sources.synced_revision(), 19);
+        assert_eq!(reused_identity.converted_archive_cache_paths.len(), 1);
+        assert_eq!(
+            reused_identity
+                .converted_archive_cache_paths
+                .synced_revision(),
+            19
+        );
 
         assert!(matches!(
             prepared.items.as_slice(),

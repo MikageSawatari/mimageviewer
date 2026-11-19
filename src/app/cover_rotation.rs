@@ -15,7 +15,8 @@ impl App {
             .zip(&self.thumbnails)
             .enumerate()
             .filter_map(|(idx, (item, thumbnail))| {
-                (legacy_book_cover_needs_reload(item, thumbnail, &self.rotation_page_keys)
+                (self.converted_thumbnail_is_stale(thumbnail)
+                    || legacy_book_cover_needs_reload(item, thumbnail, &self.rotation_page_keys)
                     || matches!(thumbnail, ThumbnailState::Loaded {
                         auto_material: crate::cover_auto_material::AutoMaterial::Automatic(_),
                         cover_cache_stamp, ..
@@ -24,7 +25,22 @@ impl App {
             })
             .collect::<Vec<_>>();
         let changed = !matching.is_empty();
-        self.remove_stale_automatic_cover_memory(&matching);
+        let rotation_stale = matching
+            .iter()
+            .copied()
+            .filter(|&idx| {
+                let thumbnail = &self.thumbnails[idx];
+                legacy_book_cover_needs_reload(
+                    &self.items[idx],
+                    thumbnail,
+                    &self.rotation_page_keys,
+                ) || matches!(thumbnail, ThumbnailState::Loaded {
+                    auto_material: crate::cover_auto_material::AutoMaterial::Automatic(_),
+                    cover_cache_stamp, ..
+                } if !self.cover_rotation_cache.is_current(cover_cache_stamp))
+            })
+            .collect::<Vec<_>>();
+        self.remove_stale_automatic_cover_memory(&rotation_stale);
         for idx in matching {
             self.evict_thumbnail_for_reload(idx);
         }

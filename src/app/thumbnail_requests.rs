@@ -747,6 +747,7 @@ mod diagnostic_projection_tests {
             payload: ThumbMsgPayload::SourcePixels(ThumbPixels {
                 auto_material: crate::cover_auto_material::AutoMaterial::NotAutomatic,
                 cover: crate::cover_identity::CoverIdentity::Legacy,
+                converted_source_binding: None,
                 image: egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]),
                 origin: ThumbLoadOrigin::SourceGenerated {
                     evaluated_display_px: 128,

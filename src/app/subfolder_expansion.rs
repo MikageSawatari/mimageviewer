@@ -497,7 +497,7 @@ pub(crate) struct PreparedAggregateMetadata {
     pub(crate) conceal_pages: HashSet<usize>,
     pub(crate) comic_pages: HashSet<usize>,
     pub(crate) folder_pin_map: HashMap<String, crate::folder_thumb_pins::FolderPin>,
-    pub(crate) converted_archive_cache_paths: HashMap<String, ConvertedArchiveSourceState>,
+    pub(crate) converted_archive_cache_paths: super::ConvertedArchiveSources,
     pub(crate) catalog: Option<PreparedAggregateCatalog>,
 }
 

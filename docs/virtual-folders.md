@@ -1028,7 +1028,7 @@ V1-4b の共通解決では、cache 前の `prepare_load_request_stamp` と cach
 | Folder | None | None | `folderthumb:auto-v3:{sort}:d{depth}:{dirname-or-fullpath}` | 直下画像を優先し、無ければ子フォルダと既存 ZIP/PDF WebP を設定順で選ぶ。詳細は [選定 proof](folder-representative-plan.md) |
 | ZipFile | None | None | `zipthumb:{filename}` | `zip_loader::read_first_image_bytes` で先頭画像 |
 | PdfFile | None | Some(0) | `pdfthumb:{filename}` | PDF ワーカーでページ 0 をレンダリング |
-| ConvertibleArchive | None または Some(entry) | None | `archivethumb:{format}:{filename-or-fullpath}` | 有効な変換キャッシュ ZIP があれば、その ZIP から先頭画像またはピン画像を読む。キャッシュ未作成/失効時は LoadRequest なしでアイコン表示 |
+| ConvertibleArchive | None または Some(entry) | None | `archivethumb:{format}:{filename-or-fullpath}` | workerで確定したDirect RARまたは変換ZIPから先頭画像・ピン画像を読む。Pendingは同じkeyのCacheOnlyで保存済み行を表示し、Unavailableは要求なし。DB変更後はrevisionの追従で決め直す |
 | ZipImage | Some(entry) | None | なし (entry が自動キー) | ZIP からエントリバイト → decode → bytes から EXIF Orientation 適用 |
 | ZipDir | Some(representative) または None (`ZipDirRepresentative`) | None | `zipdir:{dir_prefix}` | 通常は部分木代表 entry を直接読む。ZipDir source pin は `zip_dir_prefix` を worker に渡し、同じ sort で部分木代表を選び直す |
 | PdfPage | None | Some(page) | なし (`pdf_page_cache_key(page)` が自動キー) | PDF ワーカーでそのページをレンダリング |
@@ -1109,8 +1109,8 @@ README の更新履歴で確認できる最新リリース v2.13.0 までの cat
 CachedZipの読書位置バーはopen／保存／復元と同じ実読込pathを参照する。
 キャッシュなしでもworkerが確認した論理sourceを保持し、その場合だけ現在のdata-dirとsourceから
 純粋計算した決定的な変換ZIP keyを参照する。論理sourceが未確定ならNoneで、RARのファイル名から
-先頭volumeを推測しない。Pendingのバーは非表示。cache削除後もサムネイル／pin用sourceの共有失効
-（Smartのstash／prepared再利用、parked context、旧reply取消）は維持する。map entry の欠落を
+先頭volumeを推測しない。Pendingのバーは非表示。cache変更後のサムネイル／pin用sourceは、
+DBの変更記録と各表のrevisionによって追従する（§1.803、[表紙計画§31](cover-crop-plan.md)）。map entry の欠落を
 「未判定」と「判定済みだが読み取り元なし」の兼用 sentinel にしない。`install_new_items` は
 current-folder generation の全候補を I/O なしで先に `Pending` 登録する。実際の判定 batch は
 **現在の可視範囲 + thumbnail keep set + その範囲の container pin 依存先**だけを対象にする。
@@ -1142,6 +1142,28 @@ queue と `requested` も通常の thumbnail 再要求 helper で同時に外す
 同じ終端状態を再通知しても失効しないため、この handoff は `load_folder` や
 `folder_thumb_pin_dirty` を介さず有限回で収束する。
 この経路で `make_load_request` から `archive_cache.db` やファイルシステムを直接触らないこと。
+
+`ConvertedArchiveSources` は表と反映済みrevisionを一体で持つ。在メモリのDB変更記録は、
+成功して行が変わった `record`・各削除・容量掃除・`lookup` 内の条件付き削除だけを元書庫の
+`src_path_key` で記録し、`clear_all` は `AllCached` を記録する。利用時刻の更新は記録しない。
+表は毎フレームの判定poll、prepared metadata採用、Smartの復元、contextのmount、snapshotの
+一覧復元で使用前に追いつく。変更列と最大revisionは一度のlockで採取し、新しい記録があれば
+候補が既にPendingでも旧判定batchを取消す。元書庫と表のキーをDBと同じ正規化で照合して
+該当候補をPendingへ戻す。AllCachedはCachedZipだけを戻す。Smartの表の統合は両方を
+同一snapshotまで追いつかせる。準備中も通常一覧と同じresolverで変換ZIPを優先する。
+休眠contextやSmartの退避一覧への通知配布は行わず、各所有者が自分のrevisionで追いつく。
+snapshotの元一覧・固定一覧も、それぞれ素材と対の表を保存して戻す。
+
+workerが変換対象書庫を実際に読む分岐では、素材に在メモリの
+`ConvertedSourceBinding { archive_key, read_archive }` を付ける。元から読む場合は実読込書庫、
+cache hitは復元済み`CoverIdentity::Page`の最初の`::`より前を使う。PendingのCacheOnlyにも
+論理の候補keyを残す。通常フォルダ代表へのfallbackとLegacyには印を付けない。
+UIはこの印と確定済みの表だけを、結果の採用直前（CPU画像待ちの後）・判定確定・保持一覧復元で
+照合する。不一致だけを既存の退避経路へ送り、同じ書庫に依存するZipDir兄弟もすべて照合する。
+一致するLoadedは保持し、pin依存タイルは従来どおり決定変更時に退避する。
+確定した要求ではworkerもmemory/catalog/pin行の読込書庫を検査し、不一致をmissとして作り直し、
+保存閾値によらず同じ行へ上書きする。Pendingは保存済み行を直ちに表示する動きを維持する。
+bindingはcatalog・worker cache・AutoMaterialに保存せず、schema・key・行形式は変更しない。
 
 pin root の cascade 自体にも generation 内の終端状態を持たせる。未走査 root、または cascade が
 見つけた archive key に `Pending` が残る root だけを次 batch の候補にし、空結果や全 key 終端後は
@@ -1383,7 +1405,7 @@ Folder/ZipFile/PdfFile/ConvertibleArchive のサムネイルはそれぞれ別�
 | Folder | `thumb_loader::resolve_folder_thumb_image` で再帰走査 | cache miss 時に、グリッドのブロック順に揃えてサブフォルダを `folder_thumb_sort` で先に辿り、見つからなければ直接画像を同じ sort で選ぶ。深さは `folder_thumb_depth` |
 | ZipFile | `zip_loader::read_first_image_bytes` | エントリ名の昇順で最初の画像拡張子 |
 | PdfFile | PDF ワーカーでページ 0 を固定取得 | 常に `page_num = 0` |
-| ConvertibleArchive | 変換キャッシュ ZIP に対して `zip_loader::read_first_image_bytes` | 有効な `archive_cache.db` 行がある場合のみ ZIP と同じ。未変換/失効時はアイコン |
+| ConvertibleArchive | 確定したDirect RARまたは変換ZIPに対して`zip_loader`の書庫dispatch | Pendingは保存済み行を先に表示し、確定時に読込書庫のbindingを照合する。Unavailableは新しい要求を作らない |
 
 Folder 自動代表の cache key には自動選定アルゴリズム版・`folder_thumb_sort`・
 `folder_thumb_depth` を含める。キャッシュヒット時は表示速度を優先して毎回の

@@ -67,16 +67,24 @@ impl App {
                 self.folder_thumb_pin_db.as_ref(),
             );
             if let Some(snapshot) = &state.snapshot {
-                for (items, thumbs) in [
-                    (&snapshot.saved_items, &snapshot.saved_thumbnails),
-                    (&snapshot.list_view_items, &snapshot.list_view_thumbnails),
+                for (items, thumbs, sources) in [
+                    (
+                        &snapshot.saved_items,
+                        &snapshot.saved_thumbnails,
+                        &snapshot.saved_converted_archive_sources,
+                    ),
+                    (
+                        &snapshot.list_view_items,
+                        &snapshot.list_view_thumbnails,
+                        &snapshot.list_view_converted_archive_sources,
+                    ),
                 ] {
                     inputs.grid(
                         items,
                         thumbs,
                         None,
                         None,
-                        &state.converted_archive_cache_paths,
+                        sources,
                         &state.thumbnail_pool_catalog,
                         state.current_color_cache_map.as_ref(),
                         &self.settings,
@@ -1929,7 +1937,7 @@ pub(in crate::app) struct ViewerContextBundle {
     external_rescan_pending: Option<ExternalRescanPending>,
     folder_refresh_pending: Option<book_append_refresh::FolderRefreshRequest>,
     folder_pin_map: std::collections::HashMap<String, crate::folder_thumb_pins::FolderPin>,
-    converted_archive_cache_paths: std::collections::HashMap<String, ConvertedArchiveSourceState>,
+    converted_archive_cache_paths: super::ConvertedArchiveSources,
     converted_archive_pin_root_states:
         std::collections::HashMap<String, ConvertedArchivePinRootState>,
     converted_archive_cache_paths_pending: Option<ConvertedArchiveCachePathsPending>,
@@ -3231,7 +3239,7 @@ impl ViewerContextBundle {
             external_rescan_pending: None,
             folder_refresh_pending: None,
             folder_pin_map: std::collections::HashMap::new(),
-            converted_archive_cache_paths: std::collections::HashMap::new(),
+            converted_archive_cache_paths: super::ConvertedArchiveSources::default(),
             converted_archive_pin_root_states: std::collections::HashMap::new(),
             converted_archive_cache_paths_pending: None,
             current_color_cache_map: None,
@@ -4223,6 +4231,7 @@ impl App {
         swap_field!(music_bookmarks);
         swap_field!(music_bookmarks_loaded_for);
         swap_field!(last_loop_pos);
+        self.catch_up_converted_archive_sources();
 
         // 旧実装はここで thumbnail request owner を無条件 clear していた (worker queue が
         // App-global で、swap 後の bookkeeping を信用できなかったため)。detached 窓が 1 枚でも
@@ -4966,6 +4975,9 @@ impl App {
         if let Some((mut snapshot, surface)) = direct_owner {
             self.items = std::mem::take(&mut snapshot.saved_items);
             self.thumbnails = std::mem::take(&mut snapshot.saved_thumbnails);
+            self.converted_archive_cache_paths =
+                std::mem::take(&mut snapshot.saved_converted_archive_sources);
+            self.catch_up_converted_archive_sources();
             self.image_metas = std::mem::take(&mut snapshot.saved_image_metas);
             self.visible_indices = std::mem::take(&mut snapshot.saved_visible_indices);
             self.page_identity_index = snapshot.saved_page_identity_index.clone();
@@ -5462,21 +5474,6 @@ impl App {
 
     pub(in crate::app) fn viewer_context_ids(&self) -> Vec<ViewerContextId> {
         self.viewer_contexts.table.ids()
-    }
-
-    /// A deletion mutates the shared archive ZIP store. Apply the same source-owner transition
-    /// to parked/retiring payloads without mounting them or resetting their viewer state.
-    pub(in crate::app) fn invalidate_converted_archive_sources_in_parked_contexts(&mut self) {
-        for slot in self.viewer_contexts.table.slots.values_mut() {
-            let bundle = match slot {
-                Slot::AtRest(bundle) | Slot::Retiring(bundle) => bundle,
-            };
-            Self::invalidate_converted_archive_source_owner(
-                &mut bundle.converted_archive_cache_paths,
-                &mut bundle.converted_archive_cache_paths_pending,
-                &mut bundle.top_level_grid_view,
-            );
-        }
     }
 
     pub(crate) fn invalidate_removed_epub_generations(
@@ -7839,6 +7836,7 @@ mod tests {
                 saved_viewing_state: app.capture_snapshot_viewing_state(),
                 saved_page_identity_index: app.page_identity_index.clone(),
                 saved_thumbnails: vec![ThumbnailState::Pending],
+                saved_converted_archive_sources: Default::default(),
                 saved_image_metas: vec![None],
                 saved_visible_indices: vec![0],
                 saved_scroll_offset_y: 0.0,
@@ -7847,6 +7845,7 @@ mod tests {
                 list_view_items: vec![basis.clone(), direct],
                 list_view_projection_recipe: app.projection_recipe.clone(),
                 list_view_thumbnails: vec![ThumbnailState::Pending; 2],
+                list_view_converted_archive_sources: Default::default(),
                 list_view_image_metas: vec![None; 2],
                 list_view_page_identity_index: app.page_identity_index.clone(),
                 pre_snapshot_search_origin: None,

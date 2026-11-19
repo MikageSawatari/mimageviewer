@@ -47,6 +47,7 @@ impl FolderThumbnailResources {
 #[derive(Clone, Default)]
 pub(crate) struct SearchMetadataResources {
     pub(crate) thumbnail_owner: super::super::SearchThumbnailOwner,
+    pub(crate) archive_cache_db: Option<Arc<crate::archive_cache::ArchiveCacheDb>>,
     pub(crate) pin_db: Option<Arc<FolderThumbPinDb>>,
     pub(crate) tags_db_path: Option<PathBuf>,
     pub(crate) video_pins: Option<crate::video_pins::VideoPinReadSource>,
@@ -60,7 +61,7 @@ pub(crate) enum SearchMetadataInstall {
 
 pub(crate) struct EverythingMetadata {
     pub(crate) pins: HashMap<String, FolderPin>,
-    pub(crate) converted: HashMap<String, ConvertedArchiveSourceState>,
+    pub(crate) converted: crate::app::ConvertedArchiveSources,
     pub(crate) tags: HashMap<String, Vec<String>>,
     pub(crate) video_pin_blobs: Arc<HashMap<PathBuf, Vec<u8>>>,
     pub(crate) tag_stamp: WriteStamp,
@@ -108,6 +109,16 @@ pub(crate) fn prepare(
     if items.len() != metas.len() {
         return Err("検索結果のメタデータ件数が一致しません。".to_owned());
     }
+    // A fresh table acknowledges only changes preceding its source work.
+    // Changes while preparing remain visible to adoption's ordinary catch-up.
+    let mut converted = crate::app::ConvertedArchiveSources::new(
+        resources
+            .archive_cache_db
+            .as_ref()
+            .map_or(0, |db| db.revision()),
+    );
+    #[cfg(test)]
+    tests::before_source_work();
     let mut tag_stamp = TAG_WRITES.sample();
     let pin_stamp = resources.pin_db.as_ref().map(|db| db.mutation_stamp());
     let video_pin_stamp = resources
@@ -227,7 +238,6 @@ pub(crate) fn prepare(
             }
         }
     }
-    let mut converted = HashMap::new();
     for (item, meta) in items.iter().zip(metas) {
         if let GridItem::ConvertibleArchive { path, .. } = item {
             let state = if meta.is_some() {
@@ -291,6 +301,18 @@ mod tests {
     use crate::folder_thumb_pins::FolderPinSource;
     use crate::page_edit_write_epoch::TestEpochScope;
 
+    thread_local! {
+        static BEFORE_SOURCE_WORK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn before_source_work() {
+        let callback = BEFORE_SOURCE_WORK.with(|slot| slot.borrow_mut().take());
+        if let Some(callback) = callback {
+            callback();
+        }
+    }
+
     fn prepare(
         items: &[GridItem],
         metas: &[Option<(i64, i64)>],
@@ -311,6 +333,109 @@ mod tests {
             SearchMetadataInstall::Prepared(metadata) => metadata,
             SearchMetadataInstall::Existing => panic!("Everything metadata must be prepared"),
         }
+    }
+
+    fn record_converted_source(
+        db: &crate::archive_cache::ArchiveCacheDb,
+        source: &std::path::Path,
+    ) {
+        db.record(
+            source,
+            1,
+            2,
+            ArchiveFormat::Rar,
+            &source.with_extension("zip"),
+            3,
+            1,
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn converted_source_fresh_everything_revision_skips_preexisting_history_on_adoption() {
+        let _epochs = TestEpochScope::fresh();
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let db = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        let pending = data.path().join("pending.rar");
+        let unavailable = data.path().join("unavailable.rar");
+        for source in [&pending, &unavailable, &data.path().join("unrelated.rar")] {
+            record_converted_source(&db, source);
+        }
+        let prepared_at = db.revision();
+        assert!(prepared_at > 0);
+        let resources = SearchMetadataResources {
+            archive_cache_db: Some(Arc::clone(&db)),
+            ..Default::default()
+        };
+        let items = [
+            GridItem::ConvertibleArchive {
+                path: pending.clone(),
+                format: ArchiveFormat::Rar,
+            },
+            GridItem::ConvertibleArchive {
+                path: unavailable.clone(),
+                format: ArchiveFormat::Rar,
+            },
+        ];
+        let mut payload = unpack(prepare(&items, &[Some((1, 2)), None], &resources).unwrap());
+        let pending_key = crate::path_key::normalize_keep_drive(&pending);
+        let unavailable_key = crate::path_key::normalize_keep_drive(&unavailable);
+        let states_before = (*payload.converted).clone();
+        assert_eq!(
+            states_before[&pending_key],
+            ConvertedArchiveSourceState::Pending
+        );
+        assert_eq!(
+            states_before[&unavailable_key],
+            ConvertedArchiveSourceState::Unavailable {
+                logical_source: None,
+            }
+        );
+        // Adoption must not replay history which predates this new source table:
+        // doing so would turn the deliberately unavailable row into Pending.
+        assert!(!payload.converted.catch_up(Some(&db)));
+        assert_eq!(payload.converted.synced_revision(), prepared_at);
+        assert_eq!(*payload.converted, states_before);
+    }
+
+    #[test]
+    fn converted_source_fresh_everything_revision_leaves_during_prepare_changes_for_catch_up() {
+        let _epochs = TestEpochScope::fresh();
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let db = Arc::new(crate::archive_cache::ArchiveCacheDb::open().unwrap());
+        record_converted_source(&db, &data.path().join("earlier.rar"));
+        let source = data.path().join("newly-converted.rar");
+        let resources = SearchMetadataResources {
+            archive_cache_db: Some(Arc::clone(&db)),
+            ..Default::default()
+        };
+        let items = [GridItem::ConvertibleArchive {
+            path: source.clone(),
+            format: ArchiveFormat::Rar,
+        }];
+        let prepared_at = db.revision();
+        let changed_db = Arc::clone(&db);
+        let changed_source = source.clone();
+        BEFORE_SOURCE_WORK.with(|slot| {
+            assert!(
+                slot.borrow_mut()
+                    .replace(Box::new(move || {
+                        record_converted_source(&changed_db, &changed_source);
+                    }))
+                    .is_none()
+            );
+        });
+        let mut payload = unpack(prepare(&items, &[None], &resources).unwrap());
+        assert!(db.revision() > prepared_at);
+        assert_eq!(payload.converted.synced_revision(), prepared_at);
+        assert!(payload.converted.catch_up(Some(&db)));
+        assert_eq!(payload.converted.synced_revision(), db.revision());
+        assert_eq!(
+            payload.converted[&crate::path_key::normalize_keep_drive(&source)],
+            ConvertedArchiveSourceState::Pending
+        );
+        assert!(!payload.converted.catch_up(Some(&db)));
     }
 
     #[test]

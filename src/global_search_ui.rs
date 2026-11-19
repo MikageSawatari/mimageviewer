@@ -75,6 +75,7 @@ impl SearchMetadataResources {
         };
         Self {
             thumbnail_owner,
+            archive_cache_db: app.archive_cache_db.clone(),
             pin_db: app.folder_thumb_pin_db.clone(),
             tags_db_path: app.tags_db.as_ref().map(|db| db.read_path().to_path_buf()),
             video_pins: app.video_pin_db.as_ref().and_then(|db| db.read_source()),
@@ -2662,6 +2663,7 @@ impl App {
                 );
                 self.folder_pin_map = prepared.pins;
                 self.converted_archive_cache_paths = prepared.converted;
+                self.catch_up_converted_archive_sources();
                 (
                     Some(prepared.tags),
                     SearchVideoPins::Prepared(prepared.video_pin_blobs),

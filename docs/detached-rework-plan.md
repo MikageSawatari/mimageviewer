@@ -1458,6 +1458,18 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-19: §1.803 変換書庫source表とrevisionのcontext所有
+
+表紙計画§31の設計担当と独立設計レビューr1〜r3が構造修正として合意した範囲。
+`ViewerContextBundle`は`ConvertedArchiveSources`（表＋反映済みrevision）と既存batchを
+一緒にswapし、mount後にそのcontextだけがDB変更記録へ追いつく。
+管理画面削除時の`invalidate_converted_archive_sources_in_parked_contexts`は撤去した。
+通知配布・休眠contextの直接変更を、共有DBの変更記録と所有者自身の使用前追従へ集約するためで、
+guard・時間窓・追加repaintによる症状パッチではない。viewport/placement/入力の契約は触らない。
+direct-readerの元一覧復元でもsnapshotに対で保存した表を戻して追いつき、素材を照合する。
+回帰は実registry mount/swapでrevisionとbatchの保持、休眠中の変更の一度の反映、旧応答の破棄、
+兄弟contextへの非波及を検査する。実行結果は表紙計画§31.10に記録する。
+
 ### 2026-11-18: §1.805 main直接移動のworker走査
 
 設計レビューr1で構造的変更としてAGREEした

@@ -1,5 +1,11 @@
 mod ai_failure_feedback;
+mod converted_archive_sources;
+#[cfg(test)]
+mod converted_source_tests;
+#[cfg(test)]
+mod converted_source_transition_tests;
 mod cover_rotation;
+pub(crate) use converted_archive_sources::ConvertedArchiveSources;
 mod cover_rotation_cache;
 #[cfg(test)]
 mod cover_rotation_cache_tests;
@@ -6710,14 +6716,6 @@ impl ConvertedArchiveSourceState {
         match self {
             Self::Rar { volume, .. } => Some(volume),
             _ => None,
-        }
-    }
-
-    fn invalidate_cached_paths(paths: &mut HashMap<String, Self>) {
-        for state in paths.values_mut() {
-            if matches!(state.read_source(), Self::CachedZip { .. }) {
-                *state = Self::Pending;
-            }
         }
     }
 
@@ -17340,8 +17338,7 @@ pub struct App {
     /// `Direct` / `CachedZip` / `Unavailable` のいずれかへ 1 件ずつ遷移する。
     /// 親フォルダ上の `ConvertibleArchive` タイルは解決済み読み取り元の先頭画像 /
     /// ピン画像を `archivethumb:` キーで表示する。
-    pub(crate) converted_archive_cache_paths:
-        std::collections::HashMap<String, ConvertedArchiveSourceState>,
+    pub(crate) converted_archive_cache_paths: ConvertedArchiveSources,
     /// Per-pin-root cascade answers for the current items generation.
     /// A resolved root is rescheduled only while one of its archive keys remains `Pending`.
     converted_archive_pin_root_states:
@@ -21065,7 +21062,7 @@ impl App {
             cover_crop_generation: 0,
             folder_pin_map: std::collections::HashMap::new(),
             drive_list_seed_proofs: std::collections::HashMap::new(),
-            converted_archive_cache_paths: std::collections::HashMap::new(),
+            converted_archive_cache_paths: ConvertedArchiveSources::default(),
             converted_archive_pin_root_states: std::collections::HashMap::new(),
             converted_archive_cache_paths_pending: None,
             folder_thumb_pin_dirty: std::collections::HashSet::new(),
@@ -44366,11 +44363,7 @@ impl App {
             }
             self.converted_archive_cache_paths =
                 std::mem::take(&mut metadata.converted_archive_cache_paths);
-            // Prepared/reused metadata can outlive a cache deletion. Publish only sources
-            // revalidated by this installed list's existing asynchronous source owner.
-            ConvertedArchiveSourceState::invalidate_cached_paths(
-                &mut self.converted_archive_cache_paths,
-            );
+            self.catch_up_converted_archive_sources();
             self.folder_pin_map = std::mem::take(&mut metadata.folder_pin_map);
         }
         // 準備 worker が sparse metadata を完成させているため、未登録キーの同期 DB
@@ -45641,7 +45634,9 @@ impl App {
     /// 新しい items generation の変換アーカイブを、判定 I/O を行わず typed state へ登録する。
     fn initialize_converted_archive_cache_paths(&mut self) {
         self.invalidate_converted_archive_pin_root_states();
-        self.converted_archive_cache_paths.clear();
+        self.converted_archive_cache_paths = ConvertedArchiveSources::new(
+            self.archive_cache_db.as_ref().map_or(0, |db| db.revision()),
+        );
         for (idx, item) in self.items.iter().enumerate() {
             let path = match item {
                 GridItem::ConvertibleArchive { path, .. } => path,
@@ -45675,39 +45670,8 @@ impl App {
         }
     }
 
-    /// Cache maintenance changed the shared ZIP store, not the source archives or pins.
-    /// Discard pre-delete replies and recheck cached sources through the existing worker.
-    fn invalidate_converted_archive_cached_sources(&mut self) {
-        Self::invalidate_converted_archive_source_owner(
-            &mut self.converted_archive_cache_paths,
-            &mut self.converted_archive_cache_paths_pending,
-            &mut self.top_level_grid_view,
-        );
-        self.invalidate_converted_archive_sources_in_parked_contexts();
-    }
-
-    fn invalidate_converted_archive_source_owner(
-        paths: &mut HashMap<String, ConvertedArchiveSourceState>,
-        pending: &mut Option<ConvertedArchiveCachePathsPending>,
-        grid: &mut top_level_grid_view::TopLevelGridView,
-    ) {
-        if let Some(pending) = pending.take() {
-            pending.cancel();
-        }
-        ConvertedArchiveSourceState::invalidate_cached_paths(paths);
-        if let Some(session) = grid.smart_folder_session_mut() {
-            session.invalidate_cached_sources();
-        }
-    }
-
-    /// 現在 range の変換アーカイブについて、有効な変換キャッシュ ZIP を
-    /// `make_load_request` から同期参照できる map にまとめる。
-    ///
-    /// SQLite `peek` と cache ZIP の `exists()` は worker で行い、UI スレッドは
-    /// 現在の items から `(path, mtime, size)` を snapshot するだけにする。スクロール中 /
-    /// 毎フレームのサムネ要求で archive_cache.db を叩かないための小さなキャッシュ。
-    /// 親フォルダ上の `ConvertibleArchive` セルに加え、レーティング一覧に復元された
-    /// `ZipDir` が元 RAR/7z/LZH パスを持つケースもここで解決する。
+    /// Resolve the visible/kept archive candidates on the worker. UI admission only
+    /// snapshots listing metadata; SQLite and archive filesystem checks stay off-thread.
     fn start_converted_archive_cache_paths_refresh(
         &mut self,
         candidate_indices: &HashSet<usize>,
@@ -46119,11 +46083,14 @@ impl App {
     }
 
     fn poll_converted_archive_cache_paths(&mut self, ctx: &egui::Context) {
+        self.catch_up_converted_archive_sources();
         // 逐次通知は 1 フレームで数百件届き得るので、一覧の作り直しと repaint 要求は
         // drain の後に 1 回だけ行う。メッセージごとに呼ぶと、候補数 × items の
         // 作り直しが 1 フレームに積まれる。
         let mut rebuild_visible = false;
         let mut request_repaint = false;
+        let mut published_keys = HashSet::new();
+        let mut reload_indices = HashSet::new();
         loop {
             let (generation, cascade_depth, message) = {
                 let Some(pending) = self.converted_archive_cache_paths_pending.as_ref() else {
@@ -46160,6 +46127,13 @@ impl App {
                     cascade_depth,
                     candidates,
                 } => {
+                    // A root is published before dependency messages; keep its missing
+                    // candidates Pending if cancellation drops those later messages.
+                    for candidate in &candidates {
+                        self.converted_archive_cache_paths
+                            .entry(candidate.archive_key.clone())
+                            .or_insert(ConvertedArchiveSourceState::Pending);
+                    }
                     self.converted_archive_pin_root_states.insert(
                         root_key,
                         ConvertedArchivePinRootState::Resolved {
@@ -46211,30 +46185,22 @@ impl App {
                     }
                     self.converted_archive_cache_paths
                         .insert(archive_key.clone(), state);
-                    let mut dependent_indices = self
+                    published_keys.insert(archive_key.clone());
+                    let dependent_indices = self
                         .converted_archive_cache_paths_pending
                         .as_ref()
                         .and_then(|pending| {
                             pending.pin_archive_dependencies.get(&archive_key).cloned()
                         })
                         .unwrap_or_default();
-                    // 判定が付いた候補自身は、cache-only miss 後の判定待ちなど、
-                    // まだ画像が描けていないときだけ組み直す。cache hit で既に描けているサムネイルは、
-                    // 解決後の要求と cache key (`convertible_archive_cache_base_key`) も
-                    // mtime / file_size (アーカイブ自身のもの) も同一なので、作り直しても
-                    // 同じ絵にしかならない。evict は texture を落として `Evicted` に戻すため、
-                    // ここで無条件に組み直すと**表示済みのタイルが 1 回ちらつく**
-                    // (2026-08-19 実機報告)。ピン依存の tile は別で、`Pending` の間は
-                    // ピンなしの自動選択で描かれているので必ず組み直す。
-                    let self_needs_reload = !matches!(
+                    reload_indices.extend(dependent_indices);
+                    // Bound Loaded materials are checked together after draining replies.
+                    // Candidate cache misses and pin dependents retain their existing reload rule.
+                    if !matches!(
                         self.thumbnails.get(idx),
                         Some(ThumbnailState::Loaded { .. })
-                    );
-                    if self_needs_reload && !dependent_indices.contains(&idx) {
-                        dependent_indices.push(idx);
-                    }
-                    for idx in dependent_indices {
-                        self.evict_thumbnail_for_reload(idx);
+                    ) {
+                        reload_indices.insert(idx);
                     }
                     rebuild_visible |= self.settings.facet_filter.has_rollup_edit_filter();
                     request_repaint = true;
@@ -46264,6 +46230,7 @@ impl App {
                 }
             }
         }
+        self.reconcile_converted_archive_bindings(&published_keys, reload_indices);
         if rebuild_visible {
             self.rebuild_visible_indices();
         }
@@ -55975,14 +55942,6 @@ impl App {
             }
         };
         self.archive_cache_maint_pending = None;
-        if matches!(
-            &msg,
-            crate::cache_maintenance::ArchiveMaintResult::DeletedSelected { .. }
-                | crate::cache_maintenance::ArchiveMaintResult::DeletedMissing { .. }
-                | crate::cache_maintenance::ArchiveMaintResult::DeletedAll { .. }
-        ) {
-            self.invalidate_converted_archive_cached_sources();
-        }
         match msg {
             crate::cache_maintenance::ArchiveMaintResult::Rows {
                 entries,
@@ -57106,7 +57065,16 @@ impl App {
                 continue;
             }
             let pixels = msg.into_pixels().expect("owner queues only image messages");
+            // Validate after the CPU-image queue wait, immediately before adoption.
+            if converted_archive_sources::binding_is_stale(
+                pixels.converted_source_binding.as_ref(),
+                &self.converted_archive_cache_paths,
+            ) {
+                self.evict_thumbnail_for_reload(i);
+                continue;
+            }
             let crate::thumb_loader::ThumbPixels {
+                converted_source_binding,
                 cover,
                 auto_material,
                 image: color_image,
@@ -57197,6 +57165,7 @@ impl App {
                 );
                 let cover_cache_stamp = self.automatic_cover_stamp(i, &cover, auto_material);
                 self.thumbnails[i] = ThumbnailState::Loaded {
+                    converted_source_binding,
                     cover: crate::cover_source_scope::LoadedCoverIdentity::from_material(
                         cover, scope,
                     ),
@@ -103465,6 +103434,35 @@ fn make_load_request_with_auto_crop(
     Some(request)
 }
 
+#[cfg(test)]
+pub(crate) fn converted_fallback_request_for_test(
+    item: &GridItem,
+    pins: &HashMap<String, crate::folder_thumb_pins::FolderPin>,
+    sources: &HashMap<String, ConvertedArchiveSourceState>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    visibility: &crate::file_type_visibility::FileTypeVisibility,
+) -> LoadRequest {
+    make_load_request_with_visibility(
+        item,
+        0,
+        7,
+        9,
+        false,
+        None,
+        Some(crate::settings::SortOrder::Numeric),
+        3,
+        pins,
+        sources,
+        None,
+        None,
+        pin_db,
+        None,
+        false,
+        visibility,
+    )
+    .expect("factory fallback fixture must produce a request")
+}
+
 fn make_load_request_with_visibility(
     item: &GridItem,
     idx: usize,
@@ -103522,6 +103520,15 @@ fn make_load_request_with_visibility(
                 }
                 _ => None,
             }
+        },
+        converted_source: match item {
+            GridItem::ConvertibleArchive { path, .. } => {
+                converted_source_request(path, converted_archive_cache_paths)
+            }
+            GridItem::ZipDir { zip_path, .. } => {
+                converted_source_request(zip_path, converted_archive_cache_paths)
+            }
+            _ => None,
         },
         file_type_visibility: visibility.clone(),
         idx,
@@ -104311,6 +104318,18 @@ fn resolve_pin_target_cascaded_with_root_metadata(
 ///   にミラーしているので、worker は通常の cache_hit 経路で動画フレームを取り出せる。
 ///   ここで返す LoadRequest は `path = container` (folder) + `cache_key_override =
 ///   pinned_key` + `mtime/file_size = 動画のもの` (= seed と整合)。
+fn converted_source_request(
+    archive: &Path,
+    sources: &HashMap<String, ConvertedArchiveSourceState>,
+) -> Option<crate::thumb_loader::ConvertedSourceRequest> {
+    let archive_key = crate::path_key::normalize_keep_drive(archive);
+    let state = sources.get(&archive_key)?;
+    Some(crate::thumb_loader::ConvertedSourceRequest {
+        archive_key,
+        expected_archive: state.load_path().map(Path::to_path_buf),
+    })
+}
+
 fn apply_folder_thumb_pin(
     base_req: LoadRequest,
     container: &std::path::Path,
@@ -104463,6 +104482,7 @@ fn apply_folder_thumb_pin(
         // pinned_key 下に書き戻してしまい、video frame が消える。
         return LoadRequest {
             virtual_folder_parent: None,
+            converted_source: None,
             file_type_visibility: base_req.file_type_visibility.clone(),
             cover_scope: None,
             refresh_legacy_cover: false,
@@ -104621,6 +104641,10 @@ fn apply_folder_thumb_pin(
         Some(scope)
     };
     let mut request = LoadRequest {
+        converted_source: converted_source_request(
+            &resolved.abs_path,
+            converted_archive_cache_paths,
+        ),
         virtual_folder_parent: None,
         file_type_visibility: base_req.file_type_visibility.clone(),
         cover_scope,
