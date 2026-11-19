@@ -376,3 +376,78 @@ fn tag_applied_at_snapshot_retires_search_request_columns_and_return_origin() {
     assert!(!app.items_are_tag_view);
     assert!(!app.details_sort_key_visible(DetailsSortKey::AppliedAt));
 }
+
+/// §1.476 reproduction: the tag bar searches on every edit, so an unfinished IME word
+/// is adopted as a result list while the viewer is open.
+#[test]
+fn section1476_tag_bar_ime_composition_keeps_viewer_of_final_result() {
+    let mut app = phase_c_support::setup_app();
+    let (image, _) = seed(&mut app);
+    image::RgbImage::new(2, 3).save(&image).unwrap();
+    let mut db = crate::tags_db::TagsDb::open_at(&crate::data_dir::get().join("tags.db")).unwrap();
+    db.set_item_tags(
+        &crate::tags_db::item_key_for_path(&image),
+        ["cat", "猫"],
+        "test",
+    )
+    .unwrap();
+    drop(db);
+    app.open_tag_view_for_tag("cat");
+    wait_for_tag_result(&mut app);
+    let idx = app
+        .items
+        .iter()
+        .position(|item| item.drag_source_path() == Some(image.as_path()))
+        .unwrap();
+    app.open_fullscreen(idx, HistoryTrigger::UserChosen);
+    assert_eq!(app.fullscreen_idx, Some(idx));
+
+    let ctx = egui::Context::default();
+    crate::ime_focus::install_ime_input_policy(&ctx);
+    crate::ui_fonts::configure_fonts(&ctx);
+    app.tag_view.focus_request = true;
+    let mut trace = Vec::new();
+    let frames: Vec<Vec<egui::Event>> = vec![
+        vec![],
+        vec![egui::Event::Key {
+            key: egui::Key::A,
+            physical_key: Some(egui::Key::A),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        }],
+        vec![
+            egui::Event::Ime(egui::ImeEvent::Enabled),
+            egui::Event::Ime(egui::ImeEvent::Preedit {
+                text: "ね".into(),
+                active_range_chars: None,
+            }),
+        ],
+        vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: "ねこ".into(),
+            active_range_chars: None,
+        })],
+        vec![egui::Event::Ime(egui::ImeEvent::Commit("猫".into()))],
+    ];
+    for events in frames {
+        let output = ctx.run_pass(
+            egui::RawInput {
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                app.update_ime_state(ctx);
+                ctx.root_ui(|root| app.render_tag_view_bar(root));
+            },
+        );
+        let _ = crate::test_ui::headless_paint_output(output);
+        wait_for_tag_result(&mut app);
+        trace.push((app.tag_view.query.clone(), app.fullscreen_idx));
+    }
+    assert_eq!(app.tag_view.last_executed, "猫", "{trace:?}");
+    let open = app
+        .fullscreen_idx
+        .and_then(|idx| app.items.get(idx))
+        .and_then(GridItem::drag_source_path);
+    assert_eq!(open, Some(image.as_path()), "{trace:?}");
+}
