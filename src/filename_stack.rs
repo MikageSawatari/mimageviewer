@@ -36,6 +36,8 @@ pub struct StackMember {
     pub mtime: i64,
     /// ファイルサイズ (バイト)。
     pub size: Option<i64>,
+    /// Complete listing snapshot; comparisons must not reconstruct it from display values.
+    pub(crate) sort_meta: ListingSortMetadata,
     /// 動画か (動画は単独グループに固定する)。
     pub is_video: bool,
 }
@@ -193,8 +195,11 @@ pub fn group_by_keys(media: Vec<StackMember>, keys: &[String], sort: SortOrder) 
         .map(|group| {
             let rep = group.representative();
             let key = sort.name_key(name_of(&rep.path));
-            let metadata =
-                ListingSortMetadata::new(rep.mtime, if group.is_stack() { None } else { rep.size });
+            let metadata = if group.is_stack() {
+                ListingSortMetadata::new(rep.mtime, None)
+            } else {
+                rep.sort_meta
+            };
             (group, key, metadata)
         })
         .collect();
@@ -486,10 +491,11 @@ impl StackView {
                 items.push(GridItem::Image(rep.path.clone()));
             }
             metas.push(Some((rep.mtime, rep.size.unwrap_or(0))));
-            sort_metas.push(ListingSortMetadata::new(
-                rep.mtime,
-                if g.is_stack() { None } else { rep.size },
-            ));
+            sort_metas.push(if g.is_stack() {
+                ListingSortMetadata::new(rep.mtime, None)
+            } else {
+                rep.sort_meta
+            });
         }
         crate::grid_item::arrange_grid_items_with_sort_metadata(
             &mut items,
@@ -519,7 +525,7 @@ impl StackView {
                     GridItem::Image(m.path.clone())
                 });
                 metas.push(Some((m.mtime, m.size.unwrap_or(0))));
-                sort_metas.push(ListingSortMetadata::new(m.mtime, m.size));
+                sort_metas.push(m.sort_meta);
             }
         }
         crate::grid_item::arrange_grid_items_with_sort_metadata(
@@ -703,14 +709,7 @@ fn sort_members(members: &mut [StackMember], sort: SortOrder) {
             (member, key)
         })
         .collect();
-    keyed.sort_by(|(a, ak), (b, bk)| {
-        sort.compare_listing_keys(
-            ak,
-            ListingSortMetadata::new(a.mtime, a.size),
-            bk,
-            ListingSortMetadata::new(b.mtime, b.size),
-        )
-    });
+    keyed.sort_by(|(a, ak), (b, bk)| sort.compare_listing_keys(ak, a.sort_meta, bk, b.sort_meta));
     for (slot, (member, _)) in members.iter_mut().zip(keyed) {
         *slot = member;
     }
@@ -725,6 +724,7 @@ mod tests {
             path: PathBuf::from(format!(r"C:\dl\{name}")),
             mtime: 0,
             size: Some(0),
+            sort_meta: crate::settings::ListingSortMetadata::new(0, Some(0)),
             is_video: false,
         }
     }
@@ -734,6 +734,7 @@ mod tests {
             path: PathBuf::from(format!(r"C:\dl\{folder}\{name}")),
             mtime: 0,
             size: Some(0),
+            sort_meta: crate::settings::ListingSortMetadata::new(0, Some(0)),
             is_video: false,
         }
     }
@@ -743,6 +744,7 @@ mod tests {
             path: PathBuf::from(format!(r"C:\dl\{name}")),
             mtime,
             size: Some(0),
+            sort_meta: crate::settings::ListingSortMetadata::new(mtime, Some(0)),
             is_video: false,
         }
     }
@@ -752,6 +754,7 @@ mod tests {
             path: PathBuf::from(format!(r"C:\dl\{name}")),
             mtime: 0,
             size: Some(0),
+            sort_meta: crate::settings::ListingSortMetadata::new(0, Some(0)),
             is_video: true,
         }
     }
@@ -1082,6 +1085,7 @@ mod tests {
             path: PathBuf::from(format!(r"C:\dl\{name}")),
             mtime: 0,
             size,
+            sort_meta: crate::settings::ListingSortMetadata::new(0, size),
             is_video: false,
         };
         let media = vec![
@@ -1102,6 +1106,72 @@ mod tests {
 
         let desc = group_media(media, '_', SortOrder::SizeDesc);
         assert_eq!(keys(&desc), ["large", "zero", "post", "unknown"]);
+    }
+
+    #[test]
+    fn duration_sort_survives_group_aggregate_flat_and_audio_passthrough() {
+        use crate::settings::ListingDuration;
+        let duration_video = |name: &str, duration| {
+            let mut member = vid(name);
+            member.sort_meta.duration = ListingDuration::Known(duration);
+            member
+        };
+        let media = vec![
+            duration_video("long.mp4", 2000),
+            img("post_p1.jpg"),
+            duration_video("short.mp4", 500),
+            img("post_p0.jpg"),
+        ];
+        for order in [SortOrder::DurationAsc, SortOrder::DurationDesc] {
+            let groups = group_media(media.clone(), '_', order);
+            let expected_videos = if order == SortOrder::DurationAsc {
+                ["short.mp4", "long.mp4"]
+            } else {
+                ["long.mp4", "short.mp4"]
+            };
+            assert_eq!(
+                name_of(&groups[0].representative().path),
+                expected_videos[0]
+            );
+            assert_eq!(
+                name_of(&groups[1].representative().path),
+                expected_videos[1]
+            );
+            assert!(groups[2].is_stack());
+            let mut audio_meta = ListingSortMetadata::new(0, Some(0));
+            audio_meta.duration = ListingDuration::Known(100);
+            let view = StackView::from_groups_with_display_order(
+                PathBuf::from(r"C:\dl"),
+                vec![GridItem::Audio(PathBuf::from(r"C:\dl\song.mp3"))],
+                vec![Some((0, 0))],
+                vec![audio_meta],
+                '_',
+                order,
+                groups,
+                Default::default(),
+            );
+            let expected_prefix = if order == SortOrder::DurationAsc {
+                vec!["song.mp3", "short.mp4", "long.mp4"]
+            } else {
+                vec!["long.mp4", "short.mp4", "song.mp3"]
+            };
+            let (aggregate, _) = view.materialize_aggregated();
+            let (flat, _) = view.materialize_flat();
+            assert_eq!(
+                aggregate[..3].iter().map(item_name).collect::<Vec<_>>(),
+                expected_prefix
+            );
+            assert_eq!(
+                flat[..3].iter().map(item_name).collect::<Vec<_>>(),
+                expected_prefix
+            );
+            assert!(matches!(aggregate[3], GridItem::Stack { .. }));
+            assert_eq!(
+                flat[3..].iter().map(item_name).collect::<Vec<_>>(),
+                ["post_p0.jpg", "post_p1.jpg"]
+            );
+            assert_eq!(view.flat_index_for_aggregated(3), Some(3));
+        }
     }
 
     #[test]

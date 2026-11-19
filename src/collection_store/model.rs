@@ -196,6 +196,7 @@ pub(crate) const fn collection_sort_order_wire_name(sort: SortOrder) -> &'static
         SortOrder::DateDesc => "date_desc",
         SortOrder::SizeAsc => "size_asc",
         SortOrder::SizeDesc => "size_desc",
+        SortOrder::DurationAsc | SortOrder::DurationDesc => "file_name",
         SortOrder::RatingAsc | SortOrder::RatingDesc => {
             panic!("rating order cannot be stored in a collection")
         }

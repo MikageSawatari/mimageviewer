@@ -116,6 +116,7 @@ pub(crate) enum FacetField {
     Tags,
     Date,
     Size,
+    Duration,
     Edits,
 }
 

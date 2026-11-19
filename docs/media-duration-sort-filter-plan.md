@@ -2,8 +2,8 @@
 
 最終更新: 2026-11-20
 
-状態: 設計第4.2版 (第4版 `44ed23c12` にレビュー 3 回目の P2 2 点と 4 回目の P2 1 点を反映)。利用者決定 (2026-11-20、§9) と独立レビュー 2 回 (GPT-6.1 Sol / xhigh、どちらも REVISE) を反映。
-実装未着手。
+状態: 実装済み (未レビュー)。正本は設計第4.2版 `574f1ccd5`（利用者からの引き継ぎ: 独立レビュー5回目で ACCEPT）。
+再起動後の利用者指示により、ビルド・テスト・PNG更新は行っていない。実装・静的確認・未実施事項は §11。
 
 - 第1版 `2724a5c40`: 自動の並べ直し (A) を推奨。レビュー 1 回目で、再読込の繰り返し・複数選択の消失・
   materialize が UI スレッドで走る経路・スタック経路で長さが落ちることなどを指摘された。
@@ -83,8 +83,8 @@ v5.5.0 で入れるもの:
 - 絞り込みバー (`FacetFilter`、`settings.facet_filter` に保存) に長さは無い。サイズ facet はプリセット 4 つ +
   範囲指定で、サイズの無い行は除外する。
 - AI facet が遅延データ facet の前例 (メニューを開くと表示集合全体を取得、読み込み中は進捗と停止)。
-  既存の `passes_facet_filter` は AI 条件が有効で未 Ready のとき **他の facet の判定まで飛ばして** `true` を返す
-  (§8 に既存の問題として記録。長さ facet はこの形を写さない)。
+  着手前に確認した AI 待機中の早期 `return true` は、§1.822 (`b71e60f75`) で修正済み。
+  長さ facet も、待機中に他の facet を素通しにしない。
 - Remote には絞り込みバーが無い。
 - settings の読み込みは、未知の field を無視し、未知の enum 値を `Incompatible` として既定設定 + 保存抑止で
   起動する (DB は書き換えない、`src/settings_db.rs` 3404 / 4075 行付近)。
@@ -316,9 +316,8 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
 - 集約一覧 (Ctrl+G・サブ展開・スマート・レーティング・ブックマーク) と Remote の長さ順。既存 hit の path / stamp から
   親ごとの catalog を worker で読む共通 helper を作れば足せる (親 DB の数だけ open の費用がかかる)。
 - Ctrl+G の検索構文の長さ条件 (索引 schema の変更と再索引)。
-- **既存の問題**: `passes_facet_filter` は AI モデル / 生成ツール条件が有効で未 Ready の間、タグ・日付・サイズ・
-  状態などの他の facet まで判定せず全件を通す (`src/app.rs` 76380 行付近)。v4 系から既存の見込み。
-  本計画では直さず、統括へ報告する。
+- **別件で修正済み**: AI 待機中に他の facet まで素通しにする問題は、先行作業 §1.822 (`b71e60f75`) で修正。
+  本実装はその修正と回帰テストを保持する。
 
 ## 9. 利用者の決定 (2026-11-20、統括経由)
 
@@ -364,3 +363,103 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
   [ui-responsiveness.md](ui-responsiveness.md)、[filename-stack-plan.md](filename-stack-plan.md)、
   [list-size-sort-plan.md](list-size-sort-plan.md) (比較契約の追記)、
   `htdocs/mimageviewer/manual/` の並べ替え・絞り込みのページ、製品ページの機能一覧。
+
+## 11. 実装記録と設計担当への引き渡し
+
+### 11.1 実装範囲
+
+- `src/settings.rs` / `settings_db.rs` / `settings_transfer.rs`: ListingDuration、12種類の一覧順、明示的なCollection・代表画像候補、長さfacetのプリセット・分単位範囲、設定互換と候補補完marker。
+- `src/catalog.rs` / `app/folder_scan.rs` / `app/book_materialization.rs`: read-only一括取得、ScannedDir.duration_facts、source stamp一致時だけの「メモリ → catalog → Missing」。UI側はメモリclosure、外部再走査側はArc snapshot。既知sizeが無ければどちらも照合しない。
+- `src/app.rs` / `app/duration_metadata.rs` / `app/metadata_ops.rs`: 長さの要件とAIのfield要件を分離。全itemsのVideo/Audioを有界WholeListing計画で走査し、隠れた行では長さ以外の取得範囲を広げない。sessionの世代・件数snapshotをpendingが所有し、一致した完了だけでproofを作る。
+- `src/app/viewer_context_registry.rs`: 既存details状態と同じ構造体・初期化・swap・fork列挙へproofを機械的に登録。fork先は空、元contextはcacheとproofを保持。detached述語・viewportの判断は変更していない。
+- `src/filename_stack.rs` / `filename_stack_ui.rs`: 完全なsort metadataをgroup/集約/flatへ運ぶ。スタックcell自体はMissing。関連するstartup・script・外部ツール等のfixture初期化を機械更新。
+- `src/app/listing_sort.rs` / `ui_main.rs` / `app/gamepad_input.rs`: 共通capabilities、disabled理由、読み込み表示、長さfacet、変更／同値再選択時のworker再読込。ゲームパッドの巡回は非対応候補を飛ばす。
+- `src/global_search_ui.rs` / `global_search_ui/everything.rs` / `app/smart_folder.rs` / `app/subfolder_expansion.rs` / `rating_view.rs` / `bookmark_browser.rs` / `remote_ipc/{mod,container}.rs`: 非対応producerの長さ順だけを名前順へ正規化。Remoteの候補・selected・実際の順を揃える。
+- `src/collection_store/model.rs` / `thumb_loader.rs`: 新variantの網羅と既存allowlist外の扱い。`src/ui_dialogs/smart_folder_editor.rs`: 保存できない長さ条件を既存の保存対象外条件の確認に明示。
+- fixtureの機械更新: `src/app/tests.rs` / `app/tests/startup_restore.rs` / `app/similar_navigation_tests.rs` / `filename_stack_script.rs` / `external_tool.rs` / `ui_dialogs/caption_job.rs`。新しい状態回帰は `src/app/tests/duration_762.rs`。
+- `tests/ui_snapshot.rs` / `src/lib.rs`: 実ラベル・既存レイアウトhelperを共用するstateless描画fixtureを追加。PNGは変更していない。
+- 文書: `docs/spec.md` / `details-view-and-filter-plan.md` / `catalog-design.md` / `async-architecture.md` / `ui-responsiveness.md` / `filename-stack-plan.md` / `list-size-sort-plan.md` / 本書。公開文書は `htdocs/mimageviewer/manual/{grid,settings,tut-grid-power}.html` と `htdocs/mimageviewer/index.html`。
+
+### 11.2 物理フォルダへの入口台帳
+
+| 入口 | 走査・採用の経路 | 長さの取り扱い |
+| --- | --- | --- |
+| パスを開く・分類を必要とする直接移動 | App::start_open_path_classification_owned_with_navigation (`app.rs`, open-path-classify) | 要求時の保守的boolを捕捉し、directory scan後にworkerでfactsを読む。UI materializeはメモリ優先 |
+| Ctrl+↑↓・兄弟移動・一覧順移動 | App::spawn_folder_nav (`app.rs`, DFS/兄弟移動worker) | 行き先を決めた後のscanにfactsを付ける。ページ固定・非対応surfaceは要求を正規化 |
+| folder pane・長さ順への変更／同値再選択・更新のworker入口 | App::start_folder_open_scan_with_restore_and_navigation (`app.rs`) | scan後のworker内だけでfactsを読む。メニュー・ツールバー・ゲームパッドの長さ操作はWorkerScanへ合流 |
+| BS・履歴・物理コンテナのpreflight | App::start_physical_history_preflight_with_password (`app/collection_navigation.rs`, physical-history-preflight) | directory分岐のworker scan後にfactsを付ける。準備済みscanはそのfactsを保持 |
+| 外部変更・通常フォルダreconcile | App::start_external_rescan_with_cause (`app.rs`, external-folder-rescan) | 要求時のメモリArc snapshotとscanのfactsでworker内materialize。採用時にUIでcatalogを開かない |
+| 同期load・起動／設定適用等でpre-scanを持たない従来入口 | load_folder_with_scan_claimed_with_search_origin → scan_directory_with_settings | factsはNone。追加catalog I/Oなし。メモリだけで並び、利用者の更新・再選択でcatalog分が入る |
+| Smart/Collectionの物理の子、集約一覧、Remote | 各source ownerの既存scan/materialize | 非対応の長さ順は名前順を要求。長さfacetはPCのitemsに対し利用可能。Remoteの候補には出さない |
+| 製本・画像フォルダ本・ZIP/PDFページ、代表画像探索 | 既存book/page/thumbnail経路 | 固定順と代表画像allowlistを維持。画像専用scanへ長さ取得を追加しない |
+
+`default_cache_dir()`は保持済みdata-dirからのパス組立てだけ。新しいcatalog open/SELECTは上記workerか、既存details-meta workerだけで行う。同期materializeへI/Oを追加していない。
+
+### 11.3 完了・取消の台帳
+
+| 状況 | 処理 |
+| --- | --- |
+| workerのFinished | pendingのsnapshotを取り出し、revision・世代・件数が一致する完了だけでproofを作る |
+| 全targetがメモリで充足 | launch_details_meta_workerのtarget_count==0で共通完了関数へ進む |
+| 計画対象0件 | plan.total==0で同じ完了関数へ進む。空一覧も長さ要件がある場合は完了できる |
+| 取得中の追加・削除・世代交代 | poll先頭で古いsnapshotのsessionをcancel・破棄してNotRequestedへ。旧channel切断を利用者の停止に読み替えない |
+| 完了後の追加・削除 | 世代・件数の不一致からproofが無効となり、pendingなしなら新しいAllRequirementsを計画 |
+| 利用者の停止 | Cancelled中は自動再計画しない。他facetの再構築でも停止を維持し、既存resume操作で再開 |
+| 選択情報等のVisibleStage | 新proofを立てず、既存の有効proofも消さない |
+| facet変更・取得完了 | 長さ条件だけをproofが有効になるまで外す。proof完成時に表示集合を再構築。items順を自動変更しない |
+
+### 11.4 コード照合で補足した点
+
+1. 保存済みお気に入り表示状態はSettingsではなくApp.favorite_view_states (`src/app.rs:18362`) が所有。Settings::listing_may_sort_by_durationへvaluesを渡し、共通overlay・live・保存済みのORを保つ。
+2. 絞り込みバーには一般の新候補補完が無い（`src/settings.rs:9933`）。長さメニューを旧既定バーにも届けるためsort用とは別のone-time markerを追加。旧既定完全一致だけ補完し、空・順序変更・非表示は保持。NameFilterの既存stashも保持。DB表・schemaは変更なし。
+3. ゲームパッドsort行は左右巡回で（`src/app/gamepad_input.rs:11160` のpicker_row_supports_value_list）、値一覧から同値を選び直す操作は存在しない。巡回の候補制限と変更時のworker経路を接続し、共通handlerへ同値duration要求が届いた場合もworker再読込にする。新キー操作・値一覧は追加しない。
+4. §1.822は着手前にコミット済みで、本書の「既存の問題」を修正済みの記録へ直した。
+5. 物理一覧prepareはsurface採用より前にも走る。直接loadは既存destination ownerから並べ替え用surfaceを投影し、元のbook recipeや退去するrating等のsurfaceだけで新しい物理一覧を制限しない。Smart/Search/Collectionの帰路を持つ子は対象外のまま。
+6. 既存facet-sort snapshotはtests/ui_snapshot.rsではなくui_main.rsのlib testのsection292_facet_sort_snapshotにある。既存2fixtureを追従させ、指定のintegration側にも共通描画fixtureで通常幅／狭幅を追加した。
+
+7. 走査採用のprojection keyは従来どおり正規化前の要求を識別し、実際の並べ替え要求だけを名前順にする。worker・UI prepare・既存の現在値照合で同じkey契約を保持する。
+
+### 11.5 追加した主な回帰ソースとrunner向けfilter
+
+**全て未実行。成功件数の記録ではない。**
+
+- app::tests::duration_762 の11件: field要件分離、画面外・絞り込み外、cached/RetryLater/0件完了、Finishedと他facet、追加・削除時の退役、停止→別facet変更→再開、VisibleStage、stamp、空Range、worker再選択、正規化前のprojection identity保持。
+- duration_762_proof_and_cache_follow_mount_park_and_drop_without_sibling_changes / duration_762_fork_keeps_source_proof_and_starts_without_metadata_proof: context境界。
+- duration_762_picker_selected_duration_uses_worker_reload: gamepad handler。
+- duration_762_projection_identity_preserves_requested_sort_on_search_physical_child: 非対応sortでも走査採用の識別値が一致すること。
+- app::folder_scan::duration_tests: stamp・size不明、出どころ優先、worker snapshot同順、非長さ順でreader不呼出、不要時と動画なしのcatalog非作成。
+- video_duration_bulk_read_keeps_source_identity_and_uses_read_only_connection / video_duration_read_does_not_initialize_missing_catalog_or_migrate_old_schema。
+- duration_sort_survives_group_aggregate_flat_and_audio_passthrough / extract_stack_parts_preserves_video_and_audio_duration_snapshots。
+- duration_sort_rounds_milliseconds_and_keeps_all_unknowns_last / duration_presets_boundaries_ranges_and_legacy_json / duration_scan_may_be_needed_by_common_live_or_saved_favorite_sort / duration_sort_wire_and_candidate_allowlists。
+- duration_toolbar_migration_only_extends_untouched_defaults_once / duration_facet_toolbar_migration_respects_name_filter_stash_and_customization / toolbar_duration_markers_survive_settings_db_reload_without_restoring_hidden_options / duration_settings_roundtrip_and_older_reader_preserves_incompatible_db。
+- capabilities・menu・toolbar・gamepad・Remote・rating・bookmarkのテスト名にはduration、book_and_extracted_rows、existing_sort_locksを含めた。§1.822のai_facet_も保持。
+
+設計担当の共有runnerでの提案（この実装セッションでは実行しない）:
+
+```powershell
+$env:CARGO_BUILD_JOBS='6'
+$env:MSBUILDDISABLENODEREUSE='1'
+cargo nextest run -p mimageviewer --lib -E 'test(/duration|book_and_extracted_rows|existing_sort_locks|ai_facet_/)'
+cargo test -p mimageviewer --test ui_snapshot duration_facet_bar
+cargo check -p mimageviewer --bin mimageviewer-core
+```
+
+以降の関連全体gate・確認用buildは設計担当が既存方針で判断する。
+
+PNG更新候補（全て未更新）:
+
+- 既存 tests/snapshots/facet_sort_dark.png / facet_sort_narrow_dark.png
+- 新規 duration_facet_bar_dark.png / duration_facet_bar_narrow_dark.png
+
+後者はtests/ui_snapshot.rs、前者はsection292_facet_sort_snapshotのlib testで更新する。更新と見た目確認も共有runner／設計担当へ引き渡す。
+
+### 11.6 静的確認と未確認
+
+- python scripts/check_ui_glyphs.py: exit 0、危険な字形0件。
+- python scripts/check_site_cards.py: exit 0、53カード・上限超過0件。
+- 新variantのmatch、Settings移送の網羅分解、ScannedDir/StackMember/DetailsMetaPending初期化、proofのcontext登録をgrepとコード読込で照合。独立静的点検で見つかった停止状態と空Rangeの問題も修正し回帰を追加。
+- cargoのビルド・テスト・check・clippy、test/build script、製品起動、PNG生成、git add、commitは未実施。
+- コンパイル、テスト実行結果、snapshot実画像、実機表示・性能は未確認。
+- まれなcatalog読取失敗はログ＋空factsとして継続。既存データを削除・再作成せず、メモリ分と未取得末尾で一覧を出す。
+
+- 最終整形: `cargo fmt` / `cargo fmt --check` とも exit 0。`git diff --check` も exit 0。PNG差分・ステージ済み差分は0件。

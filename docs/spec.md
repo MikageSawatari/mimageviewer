@@ -2666,7 +2666,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `thumb_tooltip_show_full_location` | bool | false | 選択情報に場所をフルパスで表示するか。スマートフィルタの場所表示と同じラベルを使う |
 | `thumb_tooltip_show_reading_history_last_read` | bool | true | 閲覧履歴ビューの選択情報に最終閲覧日時を表示するか |
 | `thumb_tooltip_show_reading_history_progress` | bool | true | 閲覧履歴ビューの選択情報に閲覧位置を表示するか |
-| `sort_order` | SortOrder | FileName | 通常一覧のソート順（FileName / FileNameDesc / Numeric / NumericDesc / DateAsc / DateDesc / SizeAsc / SizeDesc / RatingAsc / RatingDesc）。番号順は記号・空白などの区切りを無視する。サイズ不明は両方向とも同じカテゴリ行の末尾。本として表示中や閲覧履歴では UI を無効化し、文脈ごとのページ順に固定 |
+| `sort_order` | SortOrder | FileName | 通常一覧のソート順（FileName / FileNameDesc / Numeric / NumericDesc / DateAsc / DateDesc / SizeAsc / SizeDesc / DurationAsc / DurationDesc / RatingAsc / RatingDesc）。番号順は記号・空白などの区切りを無視する。サイズ・長さ不明は両方向とも同じカテゴリ行の末尾。長さ順は PC 本体の物理フォルダだけで使え、後着の値では自動整列せず更新・再選択・開き直しで並べ直す。非対応一覧と Remote では長さ順を名前昇順として扱う。本として表示中や閲覧履歴では UI を無効化し、文脈ごとのページ順に固定 |
 | `rating_sort_unrated_position` | RatingSortUnratedPosition | BetweenThreeAndTwo | 評価順での未評価位置。`BelowAll` は評価可能な行の末尾。昇順は降順の逆順 |
 | `subfolder_expansion_max_depth` | u32 | 40 | サブ展開で各走査起点から読む最大階層。0 は起点ディレクトリだけ、1 は起点と直下 1 階層。UI は 0 / 1 / 2 / 3 / 4 / 5 / 10 / 40 を「起点のみ」〜「無制限」として選ばせ、40 は従来どおり reparse point ループ対策を兼ねる実効上限。実行前のダイアログで選んで保存し、次回ダイアログの初期値と走査に適用する。スマートフォルダは参照しない |
 | `subfolder_expansion_filter_kinds` | BTreeSet\<FacetItemKind\> | [] | サブ展開の走査時に snapshot へ入れる種類。空は全種類。UI は Folder / Image / Video / Zip / Pdf だけを表示する |
@@ -2893,6 +2893,9 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `toolbar_facet_filter_items` | Vec\<ToolbarFacetFilterItem\> | 全項目 | スマートフィルタバーに表示するボタンとファイル名欄の並び。空 Vec は全項目を隠すが、適用中条件のチップと `全解除` は表示する。保存時は新しい `NameFilter` を配列から退避し、旧版が未知 variant として読み捨てても並びを失わない形にする |
 | `toolbar_facet_name_filter_index_stash` | Option\<usize\> | None | 保存時に `NameFilter` の位置を退避するダウングレード互換用フィールド。`usize::MAX` は利用者が明示的に非表示にした状態を表す。読込時に `toolbar_facet_filter_items` へ戻して消費し、フィールド自体が無い旧設定では従来の常設入力を維持するため末尾へ追加する |
 | `facet_name_filter_width` | FacetNameFilterWidth | Medium | ファイル名欄の幅。Small=90px / Medium=140px / Large=200px。未知値は Medium へ正規化 |
+| `facet_filter.duration_preset` | Option\<FacetDurationPreset\> | None | 全一覧で使える動画・音声の長さ条件。〜1分 `[0,60)` / 1〜10分 `[60,600)` / 10〜60分 `[600,3600)` / 60分以上、または分単位の最小・最大。全動画・音声の取得完了の proof が有効になるまで長さ条件だけ素通しにし、他の条件は通常判定。完了後は長さが既知で範囲内の動画・音声だけを通す。範囲は逆順を交換、両端未指定は条件なし |
+| `toolbar_sort_duration_options_migrated` | bool | true（旧設定の省略は false） | 旧既定10候補と完全一致する場合だけ長さ順2候補を一度補完する。利用者が変更した並び・非表示は保持。新しい enum を知らない旧版は Incompatible として既定設定・保存抑止で起動し、設定 DB を置換しない |
+| `toolbar_facet_duration_options_migrated` | bool | true（旧設定の省略は false） | 旧既定の絞り込み項目にだけ長さを一度追加する。NameFilter の保存用 stash を考慮して照合し、利用者のカスタマイズは保持 |
 | `toolbar_cols_details_visible` | bool | true | ツールバーの列セクションに `詳細` 切替を表示 |
 | `toolbar_cols_items` | Vec\<usize\> | 1〜20 | ツールバーの列セクションに表示する列数候補。旧既定の 1〜10 全部と完全一致する保存値は、初回読み込み時だけ 11〜20 を補完する。部分集合・並び替え済みの値は維持し、補完後に候補を外しても復活させない。表示方式は判定に影響しない |
 | `toolbar_section_order` | Vec\<ToolbarSectionId\> | [] (=既定順) | ツールバーセクションの並び順 (v2.0.0、ラベルのドラッグで変更)。未登録は既定順で末尾補完、未知の variant は描画前に除外 |

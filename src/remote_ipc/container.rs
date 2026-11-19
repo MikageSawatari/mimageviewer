@@ -2816,6 +2816,7 @@ impl ContainerEngine {
             .load(&settings)
             .map_err(remote_listing_settings_error)?;
         live.apply_to(&mut settings);
+        settings.sort_order = super::remote_sort_order(settings.sort_order);
         Ok(settings)
     }
 
@@ -19943,6 +19944,22 @@ pub(super) mod tests {
                 .all(|entry| entry.kind != RemoteEntryKind::Image),
             "same-stem sidecars must not remain as independent remote tiles"
         );
+    }
+
+    #[test]
+    fn remote_duration_settings_are_normalized_before_physical_materialization() {
+        use crate::settings::SortOrder;
+        for order in [SortOrder::DurationAsc, SortOrder::DurationDesc] {
+            let settings = crate::settings::Settings {
+                sort_order: order,
+                ..Default::default()
+            };
+            let engine = ContainerEngine::new(settings);
+            assert_eq!(
+                engine.settings_for_listing().unwrap().sort_order,
+                SortOrder::FileName
+            );
+        }
     }
 
     #[test]

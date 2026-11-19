@@ -352,6 +352,9 @@ impl App {
         let filter = capture_smart_folder_filter(facet, self.effective_rating_filter());
 
         let mut ignored_conditions = Vec::new();
+        if let Some(preset) = facet.duration_preset.filter(|preset| preset.is_effective()) {
+            ignored_conditions.push(format!("長さ: {}", preset.label()));
+        }
         if !facet.ai_models.is_empty() {
             ignored_conditions.push(format!(
                 "AIモデル: {}",

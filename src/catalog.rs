@@ -235,6 +235,16 @@ pub enum VideoMeta {
     Unreadable,
 }
 
+/// A duration-only catalog row, retaining the exact source identity for listing snapshots.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct VideoDurationFact {
+    pub(crate) filename: String,
+    pub(crate) mtime: i64,
+    pub(crate) file_size: i64,
+    pub(crate) readable: bool,
+    pub(crate) duration_secs: Option<f64>,
+}
+
 /// 保存済みサムネのバイト列からヘッダのみで `(w, h)` を取り出す。
 /// フォーマットは auto-detect (`with_guessed_format`)。これは旧バージョンが JPEG で
 /// 保存していたエントリ ([`decode_thumb_to_color_image`] が "WebP or old JPEG" の
@@ -2427,6 +2437,24 @@ impl CatalogDb {
         .optional()
     }
 
+    /// Read a folder's duration facts in one query without probing or changing its schema.
+    pub(crate) fn load_video_duration_facts(&self) -> rusqlite::Result<Vec<VideoDurationFact>> {
+        let conn = self.phase()?;
+        let mut stmt = conn.prepare(
+            "SELECT filename, mtime, file_size, readable, duration_secs FROM video_meta",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(VideoDurationFact {
+                filename: row.get(0)?,
+                mtime: row.get(1)?,
+                file_size: row.get(2)?,
+                readable: row.get(3)?,
+                duration_secs: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
     pub fn get_video_meta(
         &self,
         filename: &str,
@@ -3288,6 +3316,105 @@ mod tests {
             ThumbnailColumns::CURRENT,
             Some('c'),
         )
+    }
+
+    #[test]
+    fn video_duration_bulk_read_keeps_source_identity_and_uses_read_only_connection() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("media");
+        let writer = CatalogDb::open(temp.path(), &folder).unwrap();
+        writer.phase().unwrap().execute_batch(
+            "INSERT INTO video_meta (filename, mtime, file_size, readable, duration_secs) VALUES
+             ('movie.mp4', 12, 34, 1, 6.25),
+             ('empty.mp3', 0, 0, 1, NULL),
+             ('broken.mp4', 56, 78, 0, NULL);",
+        ).unwrap();
+        let reader = CatalogDb::open_existing_read_only(temp.path(), &folder)
+            .unwrap()
+            .unwrap();
+        let schema_before: i64 = reader
+            .phase()
+            .unwrap()
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        let mut rows = reader.load_video_duration_facts().unwrap();
+        rows.sort_by(|a, b| a.filename.cmp(&b.filename));
+        assert_eq!(
+            rows,
+            vec![
+                VideoDurationFact {
+                    filename: "broken.mp4".into(),
+                    mtime: 56,
+                    file_size: 78,
+                    readable: false,
+                    duration_secs: None
+                },
+                VideoDurationFact {
+                    filename: "empty.mp3".into(),
+                    mtime: 0,
+                    file_size: 0,
+                    readable: true,
+                    duration_secs: None
+                },
+                VideoDurationFact {
+                    filename: "movie.mp4".into(),
+                    mtime: 12,
+                    file_size: 34,
+                    readable: true,
+                    duration_secs: Some(6.25)
+                },
+            ]
+        );
+        assert!(
+            reader
+                .phase()
+                .unwrap()
+                .execute("DELETE FROM video_meta", [])
+                .is_err()
+        );
+        let schema_after: i64 = reader
+            .phase()
+            .unwrap()
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_before, schema_after);
+    }
+
+    #[test]
+    fn video_duration_read_does_not_initialize_missing_catalog_or_migrate_old_schema() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("missing");
+        assert!(
+            CatalogDb::open_existing_read_only(temp.path(), &missing)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!db_path_for(temp.path(), &missing).exists());
+
+        let folder = temp.path().join("old");
+        let writer = CatalogDb::open(temp.path(), &folder).unwrap();
+        writer
+            .phase()
+            .unwrap()
+            .execute("DROP TABLE video_meta", [])
+            .unwrap();
+        let reader = CatalogDb::open_existing_read_only(temp.path(), &folder)
+            .unwrap()
+            .unwrap();
+        assert!(reader.load_video_duration_facts().is_err());
+        let count: i64 = writer
+            .phase()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='video_meta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "read-only duration loading must not migrate the catalog"
+        );
     }
 
     #[test]

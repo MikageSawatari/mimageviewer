@@ -5,6 +5,7 @@
 //! 集約する。ZIP/PDF/変換アーカイブの内部展開や watcher 追従は扱わない。
 
 use super::*;
+use crate::app::listing_sort::without_duration_request;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1100,6 +1101,7 @@ fn sorted_entry_indices_for_request(
     mut progress: Option<&mut dyn FnMut(usize)>,
     chunk_size: usize,
 ) -> Option<Vec<usize>> {
+    let request = without_duration_request(request);
     let total = entries.len();
     if total == 0 {
         report_subfolder_sort_progress(&mut progress, 0);
@@ -1305,10 +1307,11 @@ fn cancelled(cancel: &AtomicBool) -> bool {
 fn prepare_subfolder_expansion(
     mut snapshot: SubfolderExpansionSnapshot,
     show_toast: bool,
-    options: SubfolderExpansionPrepareOptions,
+    mut options: SubfolderExpansionPrepareOptions,
     cancel: &AtomicBool,
     tx: &mpsc::Sender<SubfolderExpansionPrepareEvent>,
 ) -> Result<Option<PreparedSubfolderExpansion>, String> {
+    options.request = without_duration_request(options.request);
     let reused_metadata = options.reused_metadata.as_ref();
     let total = snapshot.entries.len();
     let rating_order = matches!(
@@ -2271,7 +2274,9 @@ impl App {
         {
             crate::rating_sort::ListingOrderRequest::Standard(crate::settings::SortOrder::Numeric)
         } else {
-            crate::rating_sort::ListingOrderRequest::from_settings(&listing_settings)
+            without_duration_request(crate::rating_sort::ListingOrderRequest::from_settings(
+                &listing_settings,
+            ))
         };
         let options = SubfolderExpansionPrepareOptions {
             request,

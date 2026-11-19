@@ -402,12 +402,14 @@ pub(crate) fn extract_stack_parts(
                 path: path.clone(),
                 mtime,
                 size: sort_meta.file_size,
+                sort_meta,
                 is_video: false,
             }),
             GridItem::Video(path) => media.push(StackMember {
                 path: path.clone(),
                 mtime,
                 size: sort_meta.file_size,
+                sort_meta,
                 is_video: true,
             }),
             // 想定外種別は素通し (build_stack_aggregated と同じ防御)。
@@ -3441,6 +3443,7 @@ mod tests {
                 path: path.clone(),
                 mtime: 0,
                 size: Some(1),
+                sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
                 is_video: false,
             })
             .collect();
@@ -3824,6 +3827,7 @@ mod tests {
                         path: path.clone(),
                         mtime: 0,
                         size: Some(1),
+                        sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
                         is_video: false,
                     })
                     .collect(),
@@ -4264,6 +4268,7 @@ mod tests {
             path: PathBuf::from(path),
             mtime: 0,
             size: Some(0),
+            sort_meta: crate::settings::ListingSortMetadata::new(0, Some(0)),
             is_video: false,
         }
     }
@@ -4275,6 +4280,29 @@ mod tests {
         let image_metas = vec![Some((1, 1))];
         let listing_sort_metas = Vec::new();
         let _ = extract_stack_parts(&items, &image_metas, &listing_sort_metas);
+    }
+
+    #[test]
+    fn extract_stack_parts_preserves_video_and_audio_duration_snapshots() {
+        use crate::settings::ListingDuration;
+        let items = vec![
+            GridItem::Video(PathBuf::from(r"C:\root\movie.mp4")),
+            GridItem::Audio(PathBuf::from(r"C:\root\song.mp3")),
+        ];
+        let mut video_meta = ListingSortMetadata::new(7, Some(10));
+        video_meta.duration = ListingDuration::Known(1234);
+        let mut audio_meta = ListingSortMetadata::new(8, Some(11));
+        audio_meta.duration = ListingDuration::Unavailable;
+        let (passthrough, _, passthrough_metas, media) = extract_stack_parts(
+            &items,
+            &[Some((7, 10)), Some((8, 11))],
+            &[video_meta, audio_meta],
+        );
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].sort_meta, video_meta);
+        assert!(media[0].is_video);
+        assert!(matches!(passthrough[0], GridItem::Audio(_)));
+        assert_eq!(passthrough_metas, [audio_meta]);
     }
 
     #[test]

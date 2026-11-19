@@ -9322,6 +9322,90 @@ mod tests {
     }
 
     #[test]
+    fn duration_settings_roundtrip_and_older_reader_preserves_incompatible_db() {
+        #[derive(serde::Deserialize)]
+        enum OldSortOrder {
+            FileName,
+            FileNameDesc,
+            Numeric,
+            NumericDesc,
+            DateAsc,
+            DateDesc,
+            SizeAsc,
+            SizeDesc,
+            RatingAsc,
+            RatingDesc,
+        }
+        for order in [
+            crate::settings::SortOrder::DurationAsc,
+            crate::settings::SortOrder::DurationDesc,
+        ] {
+            let wire = serde_json::to_string(&order).unwrap();
+            let error = match serde_json::from_str::<OldSortOrder>(&wire) {
+                Ok(_) => panic!("old sort enum must reject duration sort"),
+                Err(error) => error,
+            };
+            assert!(matches!(
+                classify_settings_deserialization_error(error),
+                SettingsDbError::Incompatible(_)
+            ));
+        }
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            let mut settings = Settings {
+                sort_order: crate::settings::SortOrder::DurationDesc,
+                ..Default::default()
+            };
+            settings.facet_filter.duration_preset =
+                Some(crate::settings::FacetDurationPreset::Range {
+                    min: Some(1),
+                    max: Some(10),
+                });
+            db.save_full(&settings).unwrap();
+            let loaded = db.load_into_settings().unwrap();
+            assert_eq!(loaded.sort_order, settings.sort_order);
+            assert_eq!(
+                loaded.facet_filter.duration_preset,
+                settings.facet_filter.duration_preset
+            );
+            assert_eq!(loaded.toolbar_sort_items, settings.toolbar_sort_items);
+            assert!(loaded.toolbar_sort_duration_options_migrated);
+            assert!(loaded.toolbar_facet_duration_options_migrated);
+            db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        }
+        // This build's unknown variant exercises the same Incompatible boot path as an old build
+        // reading DurationDesc, without compiling a separate historical executable.
+        let conn = rusqlite::Connection::open(dir.join("settings.db")).unwrap();
+        conn.execute(
+            "UPDATE settings_kv SET value = '\"FutureDurationDesc\"' WHERE key = 'sort_order'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let before_main = std::fs::read(dir.join("settings.db")).unwrap();
+        let before_backup = std::fs::read(dir.join("settings.db.bak1")).unwrap();
+        let outcome = boot_settings_db(dir);
+        assert_eq!(outcome.source, BootSource::IncompatibleSettings);
+        assert!(outcome.db.is_none());
+        assert!(save_suppressed());
+        assert_eq!(std::fs::read(dir.join("settings.db")).unwrap(), before_main);
+        assert_eq!(
+            std::fs::read(dir.join("settings.db.bak1")).unwrap(),
+            before_backup
+        );
+        assert_eq!(
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupted-"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
     fn unknown_remote_video_encoder_is_incompatible_not_corrupted() {
         let dir = tempfile::tempdir().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();

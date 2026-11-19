@@ -5324,6 +5324,7 @@ impl App {
                 self.settings.sort_order
             }
         };
+        let sort_order = self.effective_listing_sort_order(sort_order);
         let thumb_aspect_auto = self.settings.thumb_aspect_auto;
         let thumb_aspect = self.settings.thumb_aspect;
         let spread_mode = self.spread_mode;
@@ -6037,6 +6038,7 @@ impl App {
 
     fn change_ring_picker_value(&mut self, ctx: &egui::Context, row: RingPickerRowId, delta: i32) {
         let ai_mode = self.settings.ai_feature_mode;
+        let sort_capabilities = self.listing_sort_capabilities();
         let Some(picker) = self.ring_picker.as_mut() else {
             return;
         };
@@ -6062,7 +6064,12 @@ impl App {
                 } else {
                     SortOrder::all()
                 };
-                picker.sort_order = cycle_value(options, picker.sort_order, delta);
+                let options = options
+                    .iter()
+                    .copied()
+                    .filter(|order| sort_capabilities.disabled_reason(*order).is_none())
+                    .collect::<Vec<_>>();
+                picker.sort_order = cycle_value(&options, picker.sort_order, delta);
                 mark_picker_dirty(picker, row);
             }
             RingPickerRowId::GridThumbAspect => {
@@ -7540,12 +7547,23 @@ impl App {
     }
 
     fn apply_grid_picker_sort_order(&mut self, sort_order: SortOrder) {
-        if self.settings.sort_order == sort_order {
+        if self
+            .listing_sort_capabilities()
+            .disabled_reason(sort_order)
+            .is_some()
+            || (self.settings.sort_order == sort_order && !sort_order.is_duration())
+        {
             return;
         }
-        self.settings.sort_order = sort_order;
-        self.settings.save();
-        self.apply_sort_change_reload();
+        if self.settings.sort_order != sort_order {
+            self.settings.sort_order = sort_order;
+            self.settings.save();
+        }
+        if sort_order.is_duration() {
+            self.apply_sort_change_reload_without_ui_io();
+        } else {
+            self.apply_sort_change_reload();
+        }
         self.grid_scroll.set_reveal_requested(true);
     }
 
@@ -12404,7 +12422,49 @@ mod tests {
         );
         assert_eq!(
             super::cycle_value(SortOrder::all(), SortOrder::SizeDesc, 1),
+            SortOrder::DurationAsc
+        );
+    }
+
+    #[test]
+    fn duration_762_picker_selected_duration_uses_worker_reload() {
+        use crate::settings::SortOrder;
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        let folder = app.tmp.path().join("picker-duration");
+        std::fs::create_dir(&folder).unwrap();
+        app.current_folder = Some(folder);
+        app.settings.sort_order = SortOrder::DurationAsc;
+        app.apply_grid_picker_sort_order(SortOrder::DurationAsc);
+        let pending = app
+            .folder_pane_open_pending
+            .as_ref()
+            .expect("duration worker reload");
+        pending
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn aggregate_picker_cycle_skips_duration_in_both_directions() {
+        use crate::settings::SortOrder;
+        let mut app = crate::app::setup_app_for_test();
+        app.top_level_grid_view.replace_surface(
+            super::super::top_level_grid_view::TopLevelGridSurface::SubfolderExpansion,
+        );
+        app.items_are_subfolder_expansion_view = true;
+        app.settings.sort_order = SortOrder::SizeDesc;
+        app.ring_picker =
+            Some(app.build_ring_picker_state(crate::ring_shortcut::RingShortcutContext::Grid));
+        let ctx = egui::Context::default();
+        app.change_ring_picker_value(&ctx, RingPickerRowId::GridSortOrder, 1);
+        assert_eq!(
+            app.ring_picker.as_ref().unwrap().sort_order,
             SortOrder::RatingAsc
+        );
+        app.change_ring_picker_value(&ctx, RingPickerRowId::GridSortOrder, -1);
+        assert_eq!(
+            app.ring_picker.as_ref().unwrap().sort_order,
+            SortOrder::SizeDesc
         );
     }
     use super::{

@@ -459,9 +459,33 @@ pub(crate) fn materialize_local_folder_listing_with_order(
     request: crate::rating_sort::ListingOrderRequest,
     read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
 ) -> MaterializedFolderListing {
+    materialize_local_folder_listing_with_order_and_duration(
+        path,
+        scan,
+        settings,
+        request,
+        read_rating,
+        |_, _| None,
+    )
+}
+
+/// Materialization only reads the provided memory/catalog snapshots; no duration I/O.
+/// The memory reader must match the supplied source stamp before returning a value.
+pub(crate) fn materialize_local_folder_listing_with_order_and_duration(
+    path: &std::path::Path,
+    scan: ScannedDir,
+    settings: &crate::settings::Settings,
+    request: crate::rating_sort::ListingOrderRequest,
+    read_rating: impl FnOnce(&[String]) -> Result<crate::rating_db::CompleteRatingFacts, String>,
+    mut read_duration: impl FnMut(
+        &std::path::Path,
+        crate::settings::ListingSortMetadata,
+    ) -> Option<crate::settings::ListingDuration>,
+) -> MaterializedFolderListing {
     let mut scan = scan;
     let precise_stamps = std::mem::take(&mut scan.precise_stamps);
     project_scanned_directory(&mut scan, &settings.file_type_visibility);
+    let duration_facts = scan.duration_facts;
     let mut auxiliary_media = scan.auxiliary_media;
     let mut omitted = scan.omitted;
     let mut folders = Vec::with_capacity(scan.folders.len());
@@ -503,6 +527,23 @@ pub(crate) fn materialize_local_folder_listing_with_order(
             .all(|entry| entry.kind == ScanMediaKind::Image),
         settings.auto_fullscreen_image_folders_enabled(),
     );
+    if media_sort.is_duration() {
+        for entry in &mut all_media {
+            entry.sort_meta.duration = crate::settings::ListingDuration::Missing;
+            if matches!(entry.kind, ScanMediaKind::Video | ScanMediaKind::Audio)
+                && entry.sort_meta.file_size.is_some()
+            {
+                entry.sort_meta.duration = read_duration(&entry.path, entry.sort_meta)
+                    .filter(|value| *value != crate::settings::ListingDuration::Missing)
+                    .or_else(|| {
+                        duration_facts
+                            .as_ref()?
+                            .duration_for(&entry.path, entry.sort_meta)
+                    })
+                    .unwrap_or(crate::settings::ListingDuration::Missing);
+            }
+        }
+    }
     crate::grid_item::sort_folder_block_with_metadata(
         &mut folders,
         &mut metas,

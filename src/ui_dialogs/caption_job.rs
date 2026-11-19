@@ -1072,6 +1072,7 @@ mod tests {
             path: path.into(),
             mtime: 0,
             size: Some(1),
+            sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
             is_video,
         })
         .collect();

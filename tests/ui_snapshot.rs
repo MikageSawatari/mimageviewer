@@ -3667,6 +3667,44 @@ fn cut_item_appearance_dark() {
 }
 
 #[test]
+fn duration_facet_bar_dark() {
+    duration_facet_bar_snapshot("duration_facet_bar_dark", 640.0);
+}
+
+#[test]
+fn duration_facet_bar_narrow_dark() {
+    duration_facet_bar_snapshot("duration_facet_bar_narrow_dark", 320.0);
+}
+
+fn duration_facet_bar_snapshot(name: &str, width: f32) {
+    snapshot_with_theme_contrast_and_size(
+        name,
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        mimageviewer::settings::TextContrast::Standard,
+        egui::vec2(width, 220.0),
+        |ui| {
+            let (duration, sort) = mimageviewer::draw_duration_facet_bar_snapshot_fixture(ui);
+            assert!(
+                ui.clip_rect().contains_rect(duration),
+                "duration facet is clipped: {duration:?}"
+            );
+            assert!(
+                ui.clip_rect().contains_rect(sort),
+                "sort control is clipped: {sort:?}"
+            );
+            assert!(
+                !duration.intersects(sort),
+                "sort overlaps the duration facet"
+            );
+            assert!(
+                (sort.right() - ui.max_rect().right()).abs() < 1.0,
+                "sort must remain aligned to the right: {sort:?}"
+            );
+        },
+    );
+}
+
+#[test]
 fn cut_item_appearance_light() {
     snapshot_with_theme_at_size(
         "cut_item_appearance_light",

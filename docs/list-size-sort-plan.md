@@ -1,5 +1,15 @@
 # 一覧のファイルサイズ順（§2.24）
 
+## 共通比較契約への長さ追加 (§1.762)
+
+`ListingSortMetadata` は mtime・`Option<file_size>` に `ListingDuration` を追加する。
+既存 `new(mtime, size)` は `Missing` を設定し、サイズ順の判定と 0 バイトの区別は変えない。
+長さ順だけ `Known(ミリ秒)` を比較し、`Unavailable` / `Missing` は同一の不明群として
+両方向とも同じカテゴリ行の末尾、同値と不明同士は名前昇順とする。比較は I/O をしない。
+ファイル名スタックは metadata 全体を保持し、集約セルのサイズ・長さは不明のまま。
+`collection_options()` と `folder_thumb_options()` は位置スライスにせず明示 allowlist にし、
+長さ順を含めない。サイズ順の既存の対応範囲は変えない。
+
 最終更新: 2026-09-14
 
 ## 1. 目的と状態

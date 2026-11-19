@@ -674,6 +674,8 @@ preferences_policy! {
         toolbar_sort_size_options_migrated => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         toolbar_sort_name_numeric_desc_options_migrated => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         toolbar_sort_rating_options_migrated => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
+        toolbar_sort_duration_options_migrated => "ツールバー候補の一回限りの補完状態";
+        toolbar_facet_duration_options_migrated => "絞り込みバー候補の一回限りの補完状態";
         toolbar_facet_filter_items => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         toolbar_facet_name_filter_index_stash => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         facet_name_filter_width => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";

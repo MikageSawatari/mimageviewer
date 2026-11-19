@@ -505,6 +505,8 @@ pub use ui_main::draw_cut_item_appearance_snapshot_fixture;
 pub use ui_main::draw_details_icons_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_main::draw_details_name_colors_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_main::draw_duration_facet_bar_snapshot_fixture;
 mod ui_metadata_panel;
 #[doc(hidden)]
 pub use ui_metadata_panel::{
