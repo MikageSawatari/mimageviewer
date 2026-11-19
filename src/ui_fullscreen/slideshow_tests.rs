@@ -3,6 +3,45 @@ use super::*;
 use crate::ring_shortcut::{RingActionId, RingShortcutContext};
 use std::time::{Duration, Instant};
 
+#[test]
+fn slideshow_progress_uses_current_anchor_and_omits_stopped_or_continuous_reading() {
+    let ctx = egui::Context::default();
+    let mut app = page_turn_submission_tests::ready_app(&ctx, SpreadMode::Single);
+    let now = Instant::now();
+    app.settings.slideshow_interval_secs = 4.0;
+    app.slideshow_playing = false;
+    assert!(app.slideshow_progress(now).is_none());
+    app.slideshow_playing = true;
+    app.slideshow_anchor_idx = None;
+    assert_eq!(
+        app.slideshow_progress(now),
+        Some((0.0, Duration::from_millis(100)))
+    );
+    app.slideshow_anchor_idx = app.fullscreen_idx;
+    app.slideshow_next_at = now + Duration::from_secs(2);
+    assert_eq!(
+        app.slideshow_progress(now),
+        Some((0.5, Duration::from_millis(100)))
+    );
+    let (fraction, delay) = app
+        .slideshow_progress(now + Duration::from_millis(1950))
+        .unwrap();
+    assert!((fraction - 0.9875).abs() < 0.00001);
+    assert_eq!(delay, Duration::from_millis(50));
+    assert_eq!(
+        app.slideshow_progress(now + Duration::from_secs(3)),
+        Some((1.0, Duration::ZERO))
+    );
+    app.fullscreen_idx = Some(1);
+    assert_eq!(
+        app.slideshow_progress(now),
+        Some((0.0, Duration::from_millis(100)))
+    );
+    app.reading_flow = ReadingFlow::Vertical;
+    assert!(app.continuous_reading_active_for_idx(1));
+    assert!(app.slideshow_progress(now).is_none());
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Entry {
     Hud,

@@ -337,6 +337,7 @@ mod test_script;
 pub mod ui_depth_export;
 pub mod ui_depth_parallax;
 mod ui_depth_wait;
+mod ui_slideshow_progress;
 #[doc(hidden)]
 pub use ui_depth_wait::draw_depth_wait_indicator_snapshot_fixture;
 mod vram_budget;

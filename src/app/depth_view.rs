@@ -1335,15 +1335,19 @@ impl App {
             .map_or_else(String::new, |status| status.panel_text().to_owned())
     }
 
-    pub(crate) fn draw_depth_panel(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
+    pub(crate) fn draw_depth_panel(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> Option<crate::ui_depth_parallax::DepthPanelResponse> {
         if self.depth_entry_allowed(fs_idx).is_err() {
-            return false;
+            return None;
         }
         let FsExclusiveView::Depth(state) = &self.fs_exclusive_view else {
-            return false;
+            return None;
         };
         if !state.panel_visible {
-            return false;
+            return None;
         }
         let status = self.depth_panel_status();
         let export_enabled = self.depth_export_available(ctx);
@@ -1356,6 +1360,7 @@ impl App {
             &status,
             export_enabled,
             panel_toggle_hint,
+            None,
         );
         ctx.data_mut(|data| data.insert_temp(self.depth_panel_rect_id(), response.rect));
         if response.changed {
@@ -1371,7 +1376,7 @@ impl App {
         if response.close_requested {
             self.set_fs_exclusive_view(FsExclusiveView::None, "depth_panel_close");
         }
-        response.export_requested
+        Some(response)
     }
 
     #[cfg(windows)]

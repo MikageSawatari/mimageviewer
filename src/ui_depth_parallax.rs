@@ -18,6 +18,19 @@ pub struct DepthPanelResponse {
     pub close_rect: egui::Rect,
     pub export_rect: egui::Rect,
     pub scroll: Option<egui::scroll_area::ScrollAreaOutput<()>>,
+    pub slideshow_progress_rect: egui::Rect,
+    slideshow_progress_painter: egui::Painter,
+    slideshow_progress_shape: egui::layers::ShapeIdx,
+}
+
+impl DepthPanelResponse {
+    /// Finalize this pass's paint slot after the viewer synchronizes its anchor.
+    pub fn set_slideshow_progress(&self, progress: Option<f32>) {
+        self.slideshow_progress_painter.set(
+            self.slideshow_progress_shape,
+            crate::ui_slideshow_progress::ring_shape(self.slideshow_progress_rect, progress),
+        );
+    }
 }
 
 /// Draw a fixed right panel. `status` is supplied by the request owner, with no I/O here.
@@ -28,7 +41,7 @@ pub fn draw_depth_parallax_panel(
     status: &str,
     panel_toggle_hint: Option<String>,
 ) -> DepthPanelResponse {
-    draw_depth_parallax_panel_with_export(ctx, settings, status, false, panel_toggle_hint)
+    draw_depth_parallax_panel_with_export(ctx, settings, status, false, panel_toggle_hint, None)
 }
 
 pub fn draw_depth_parallax_panel_with_export(
@@ -37,6 +50,7 @@ pub fn draw_depth_parallax_panel_with_export(
     status: &str,
     export_enabled: bool,
     panel_toggle_hint: Option<String>,
+    slideshow_progress: Option<f32>,
 ) -> DepthPanelResponse {
     let screen = ctx.content_rect();
     let frame = crate::os_theme::dark_popup_frame(ctx);
@@ -101,12 +115,17 @@ pub fn draw_depth_parallax_panel_with_export(
                         let close = ui.button("×").on_hover_text("3D 写真を終了");
                         close_requested = close.clicked();
                         close_rect = close.rect;
-                    });
+                        let side = close.rect.height().min(crate::ui_slideshow_progress::RING_DIAMETER);
+                        let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::hover());
+                        let painter = ui.painter().clone();
+                        let shape = painter.add(crate::ui_slideshow_progress::ring_shape(rect, slideshow_progress));
+                        (painter, shape, rect)
+                    }).inner
                 });
                 if settings.panel_collapsed {
                     return (
                         changed, false, close_requested, header.response.rect,
-                        egui::Rect::NOTHING, close_rect, egui::Rect::NOTHING, false, None,
+                        egui::Rect::NOTHING, close_rect, egui::Rect::NOTHING, false, None, header.inner,
                     );
                 }
                 ui.separator();
@@ -274,6 +293,7 @@ pub fn draw_depth_parallax_panel_with_export(
                     export_rect,
                     export_requested,
                     Some(scroll),
+                    header.inner,
                 )
             })
         });
@@ -287,6 +307,7 @@ pub fn draw_depth_parallax_panel_with_export(
         export_rect,
         export_requested,
         scroll,
+        (slideshow_progress_painter, slideshow_progress_shape, slideshow_progress_rect),
     ) = output.inner.inner;
     DepthPanelResponse {
         changed,
@@ -299,5 +320,8 @@ pub fn draw_depth_parallax_panel_with_export(
         close_rect,
         export_rect,
         scroll,
+        slideshow_progress_painter,
+        slideshow_progress_shape,
+        slideshow_progress_rect,
     }
 }

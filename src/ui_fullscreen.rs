@@ -28847,7 +28847,8 @@ impl App {
                         if overview_rendered { return; }
                         // Paint foreground controls first so their current rectangle owns
                         // pointer input and mouse-follow suppression on the first frame too.
-                        let depth_export_requested = self.draw_depth_panel(ctx, fs_idx);
+                        let depth_panel = self.draw_depth_panel(ctx, fs_idx);
+                        let depth_export_requested = depth_panel.as_ref().is_some_and(|panel| panel.export_requested);
                         let still_seek_geometry =
                             self.still_seek_geometry_for_idx(full_rect, fs_idx, state.is_video);
                         let resolved_fullscreen_media_rect = self.fullscreen_media_rect_with_geometry(
@@ -29661,7 +29662,7 @@ impl App {
                             &state,
                             slideshow_timer_pass,
                         );
-                        self.draw_slideshow_progress_indicator(ui, content_rect, ctx);
+                        self.draw_slideshow_progress_indicator(ui, content_rect, depth_panel.as_ref(), ctx);
                         if !state.is_video {
                             self.draw_compare_pin_indicator(ui, content_rect, ctx);
                         }
@@ -51046,71 +51047,58 @@ impl App {
         ui.ctx().request_repaint();
     }
 
-    fn draw_slideshow_progress_indicator(
-        &self,
-        ui: &egui::Ui,
-        content_rect: egui::Rect,
-        ctx: &egui::Context,
-    ) {
-        if !self.slideshow_playing {
-            return;
-        }
-        if self
-            .fullscreen_idx
-            .is_some_and(|idx| self.continuous_reading_active_for_idx(idx))
+    fn slideshow_progress(&self, now: std::time::Instant) -> Option<(f32, std::time::Duration)> {
+        if !self.slideshow_playing
+            || self
+                .fullscreen_idx
+                .is_some_and(|idx| self.continuous_reading_active_for_idx(idx))
         {
-            return;
+            return None;
         }
-
-        let now = std::time::Instant::now();
-        let interval = self.slideshow_interval_duration();
-        let interval_secs = interval.as_secs_f32().max(0.001);
+        let interval_secs = self.slideshow_interval_duration().as_secs_f32().max(0.001);
         let anchored = self
             .fullscreen_idx
             .is_some_and(|idx| self.slideshow_anchor_idx == Some(idx));
+        let remaining = self.slideshow_next_at.saturating_duration_since(now);
         let progress = if anchored {
-            let remaining = self.slideshow_next_at.saturating_duration_since(now);
             ((interval_secs - remaining.as_secs_f32()) / interval_secs).clamp(0.0, 1.0)
         } else {
             0.0
         };
-
-        let painter = ui.painter();
-        let center = egui::pos2(content_rect.max.x - 22.0, content_rect.min.y + 22.0);
-        let radius = 8.0;
-        painter.circle_stroke(
-            center,
-            radius,
-            egui::Stroke::new(1.2, egui::Color32::from_white_alpha(42)),
-        );
-
-        if progress > 0.0 {
-            let start = -std::f32::consts::FRAC_PI_2;
-            let sweep = std::f32::consts::TAU * progress;
-            let segments = ((36.0 * progress).ceil() as usize).clamp(2, 36);
-            let mut points = Vec::with_capacity(segments + 1);
-            for i in 0..=segments {
-                let t = i as f32 / segments as f32;
-                let angle = start + sweep * t;
-                points.push(egui::pos2(
-                    center.x + radius * angle.cos(),
-                    center.y + radius * angle.sin(),
-                ));
-            }
-            painter.add(egui::Shape::line(
-                points,
-                egui::Stroke::new(2.0, egui::Color32::from_white_alpha(120)),
-            ));
-        }
-
         let repaint = if anchored {
-            self.slideshow_next_at
-                .saturating_duration_since(now)
-                .min(std::time::Duration::from_millis(100))
+            remaining.min(std::time::Duration::from_millis(100))
         } else {
             std::time::Duration::from_millis(100)
         };
-        ctx.request_repaint_after(repaint);
+        Some((progress, repaint))
+    }
+
+    fn draw_slideshow_progress_indicator(
+        &self,
+        ui: &egui::Ui,
+        content_rect: egui::Rect,
+        depth_panel: Option<&crate::ui_depth_parallax::DepthPanelResponse>,
+        ctx: &egui::Context,
+    ) {
+        // Called after anchor synchronization and the current page's Depth receipt.
+        // The panel's same-pass slot starts as Noop, so early render exits paint no ring.
+        let progress = self.slideshow_progress(std::time::Instant::now());
+        if let Some(panel) = depth_panel {
+            panel.set_slideshow_progress(progress.map(|(fraction, _)| fraction));
+        } else if let Some((fraction, _)) = progress {
+            let center = egui::pos2(content_rect.right() - 22.0, content_rect.top() + 22.0);
+            let rect = egui::Rect::from_center_size(
+                center,
+                egui::Vec2::splat(crate::ui_slideshow_progress::RING_DIAMETER),
+            );
+            ui.painter().add(crate::ui_slideshow_progress::ring_shape(
+                rect,
+                Some(fraction),
+            ));
+        }
+        if let Some((_, repaint)) = progress {
+            ctx.request_repaint_after(repaint);
+        }
     }
 
     fn resolve_fs_loupe_page_payload(
