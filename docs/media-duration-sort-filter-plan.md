@@ -2,7 +2,7 @@
 
 最終更新: 2026-11-20
 
-状態: 設計第4.1版 (第4版 `44ed23c12` にレビュー 3 回目の P2 2 点を反映)。利用者決定 (2026-11-20、§9) と独立レビュー 2 回 (GPT-6.1 Sol / xhigh、どちらも REVISE) を反映。
+状態: 設計第4.2版 (第4版 `44ed23c12` にレビュー 3 回目の P2 2 点と 4 回目の P2 1 点を反映)。利用者決定 (2026-11-20、§9) と独立レビュー 2 回 (GPT-6.1 Sol / xhigh、どちらも REVISE) を反映。
 実装未着手。
 
 - 第1版 `2724a5c40`: 自動の並べ直し (A) を推奨。レビュー 1 回目で、再読込の繰り返し・複数選択の消失・
@@ -263,6 +263,11 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
   動いていないとき、details-meta の poll が新しい `AllRequirements` session を始める。新しい一覧の install に
   限らず、削除・追加・復元で対象が変わった場合も同じ規則で取り直す。全部メモリで満たされていれば即時に完了して
   proof が立つ。印は足さず、この条件だけから導く。停止 (`Cancelled`) の間は取り直さない (利用者の再開を待つ)。
+- 動いている session の対象が古くなったとき: 長さのフィールド要件を含む session が動いている間に、その計画開始時の
+  (`items_generation`, `items.len()`) と今の値が違えば、details-meta の poll がその session を取り消して破棄し、
+  状態を `NotRequested` へ戻す (レビュー 4 回目 P2)。その後は上の取り直しの規則で新しい session を始める。
+  この取り消しは通常操作 (削除・追加) による世代交代の処理で、旧 session の channel 切断を `Cancelled` として
+  受けない。利用者の「停止」による `Cancelled` は従来どおり維持する。
 
 ### 5.3 読み込み中の表示
 
@@ -341,8 +346,9 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
   AI facet の既存の挙動が変わらない。
 - proof: 全完了経路 (Finished・即時完了・対象 0 件) で立つ、計画後に対象が変わった完了では立たない、取消・停止で
   立たない、補助 `VisibleStage` で消えない、Smart Folder の評価条件更新で行が増えたら失効して取り直す、
-  取得完了後の削除で失効して即時に取り直す、停止中は取り直さない、fork 先は None、park / mount / drop で
-  兄弟 context 不変。
+  取得完了後の削除で失効して即時に取り直す、取得中の削除 (詳細列・バッジ・AI 要求すべて OFF) で旧 session を
+  取り消して `NotRequested` から取り直し `Cancelled` に落ちない、利用者の停止は `Cancelled` のまま取り直さない、
+  fork 先は None、park / mount / drop で兄弟 context 不変。
 - `listing_may_sort_by_duration`: 共通 = 長さ順・お気に入り = 名前順でお気に入りの外へ移ると true、
   共通・live・保存済みお気に入りのどれも長さ順でなければ false。
 - 並べ替えの操作: `listing_sort_capabilities` の一覧種別ごとの結果、メニュー / ツールバーの disabled と理由、
