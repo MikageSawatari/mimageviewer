@@ -579,6 +579,8 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
   - P3: 結果のアドレス表示を、欄の語ではなく実行済みの語から作る。
   - 一覧▼から同じタグを選び直すと検索し直す出荷済みの操作を保つ (実装時に一度外れていたのを戻した)。
   - 追加テスト: `section1476_automatic_refresh_searches_executed_word_and_keeps_draft_and_viewer`、`section1476_adopted_result_names_its_own_word_not_a_later_draft`、`section1476_tag_field_waits_only_for_a_source_swap_owned_by_the_mounted_context` (`src/app/tests.rs`)、一覧▼の同じタグの再選択 (既存の menu テストに追加)、開き直し待ちの判定 (`book_composition_runtime_tests.rs` の既存テストに 1 行)。
+- 独立レビュー r3 (同じレビュー担当、2026-11-20): **ACCEPT** (コード読解。PC 停止中のためビルドなし)。
+- 最終の自動検証 (設計担当、run-heavy、2026-11-20): 関連 `cargo nextest run -p mimageviewer --lib -E 'test(/section1476_|tag_applied_at|search_submit|tag_view|book_composition_runtime|parked_source_swap/)'` **135 件成功・0 失敗**。本体 lib 全件 `.\scripts\test-lib-full.ps1` **19,017 件成功・0 失敗 (slow 6)・88 skip、1,704.6 秒**。`.\scripts\build-dev.ps1` 成功。実機確認の依頼は `C:\home\mimageviewer-subpc\tag476\`。
 - 実機で残る確認: F12・複数ウィンドウでの打ち直し／IME／空欄／Enter、一覧▼・種類・並べ替えによる再検索と閲覧保持。更新履歴の文案と全件 gate・確認用 build は設計担当が行う。
 - 関連: §2.23、[タグ設計 §5.1](tag-catalog-redesign-plan.md#51-タグビュー-ctrlt--タグツールバーの検索ボタン)。規模 / 優先度: Small / 次の版のリリース前。
 
