@@ -8,7 +8,12 @@ nextest-version = "0.9.143"
 gpu = { max-threads = 2 }
 
 [profile.default]
-test-threads = "num-cpus"
+# 12 of the 24 cores (2026-11-20, user decision). An NTFS kernel deadlock inside a
+# test process (live dump ResourceTimeout-20261120-0103, Driver Verifier active)
+# froze the whole PC during a num-cpus full run; fewer concurrent tests limit how
+# much file I/O piles up behind such a stall. run-heavy.ps1 also sets
+# NEXTEST_TEST_THREADS=12 so branches cut before this change follow it.
+test-threads = 12
 retries = 0
 fail-fast = false
 # Inventory covers workspace targets and all five standalone vendor runs.
