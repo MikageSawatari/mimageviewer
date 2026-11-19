@@ -92156,6 +92156,7 @@ impl App {
         let canonical_dims = self.canonical_source_dimensions(idx);
         let display_basis =
             self.accept_current_producer_display_basis(idx, texture.size(), edit_size, true);
+        let ai_applied = Some(self.final_ai_result_stages(params, edit_size, base_used_upscale));
         self.final_composite_cache.insert(
             final_key,
             FinalCompositeEntry {
@@ -92166,7 +92167,7 @@ impl App {
                 pixels: post_filtered,
                 texture: texture.clone(),
                 complete,
-                ai_applied: Some(self.final_ai_result_stages(params, edit_size, base_used_upscale)),
+                ai_applied,
             },
         );
         crate::logger::log(format!(

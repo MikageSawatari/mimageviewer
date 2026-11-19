@@ -284,7 +284,8 @@ fn final_ai_status_stage_admission_is_shared_with_key_and_worker_selection() {
     let params = app.effective_params(0);
     for (size, expected) in [
         (
-            [1024, 1024],
+            // Limits are exclusive (`should_process_rect`), so stay below 1024.
+            [1000, 1000],
             FinalAiStages {
                 denoise: true,
                 upscale: true,
