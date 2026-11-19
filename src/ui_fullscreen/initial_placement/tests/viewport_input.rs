@@ -44,6 +44,16 @@ fn paint_frame_in_rect(
     rect: egui::Rect,
     events: Vec<egui::Event>,
 ) -> PaintedFrame {
+    paint_frame_in_rect_at_dpi(app, ctx, rect, None, events)
+}
+
+fn paint_frame_in_rect_at_dpi(
+    app: &mut App,
+    ctx: &egui::Context,
+    rect: egui::Rect,
+    native_pixels_per_point: Option<f32>,
+    events: Vec<egui::Event>,
+) -> PaintedFrame {
     app.frame_counter += 1;
     crate::key_input::set_test_frame_for_viewport(ctx.viewport_id(), Vec::new());
     let output = ctx.run_pass(
@@ -55,6 +65,7 @@ fn paint_frame_in_rect(
             viewports: [(
                 egui::ViewportId::ROOT,
                 egui::ViewportInfo {
+                    native_pixels_per_point,
                     focused: Some(true),
                     minimized: Some(false),
                     ..Default::default()
@@ -89,6 +100,162 @@ fn paint_frame_in_rect(
         pan: app.fs_pan,
         request: app.fs_initial_placement_request,
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FractionalViewportScrollInput {
+    Down,
+    Wheel,
+    Ordered,
+}
+
+fn assert_fractional_viewport_scroll(input: FractionalViewportScrollInput) {
+    use crate::settings::{BottomBarLock, FullscreenUpDownKeyAction, FullscreenWheelAction};
+
+    let _serial = crate::key_input::lock_test_input();
+    let _cleanup = TestKeyboardFrameCleanup;
+    // The reported 1760x1855 physical window at 150% DPI. Keep the point
+    // dimensions fractional at every tested DPI, independent of pixel snapping.
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1760.0 / 1.5, 1855.0 / 1.5));
+    for dpi in [1.0, 1.25, 1.5] {
+        for top_locked in [false, true] {
+            for bottom_locked in [false, true] {
+                for mode in [SpreadMode::Single, SpreadMode::RtlCover] {
+                    for page_turn in [false, true] {
+                        if page_turn && !matches!(input, FractionalViewportScrollInput::Ordered) {
+                            continue;
+                        }
+                        let case = format!(
+                            "{input:?}, dpi={dpi}, top={top_locked}, bottom={bottom_locked}, \
+                             mode={mode:?}, page_turn={page_turn}"
+                        );
+                        let ctx = egui::Context::default();
+                        let mut app = app(&ctx, mode, false);
+                        // Both a single page and a real pair must overflow vertically
+                        // under width fit, even in this tall window.
+                        let size = [240, 1020];
+                        let image = Arc::new(egui::ColorImage::filled(size, egui::Color32::WHITE));
+                        for idx in 0..app.items.len() {
+                            let Some(FsCacheEntry::Static {
+                                tex,
+                                pixels,
+                                source_dims,
+                                pdf_metadata,
+                                ..
+                            }) = app.fs_cache.get_mut(&idx)
+                            else {
+                                panic!("fixture must have resident static pages");
+                            };
+                            *tex = ctx.load_texture(
+                                format!("fractional-viewport-{idx}"),
+                                (*image).clone(),
+                                egui::TextureOptions::LINEAR,
+                            );
+                            *pixels = image.clone();
+                            *source_dims = Some(size);
+                            if let Some(metadata) = pdf_metadata {
+                                metadata.layout_dims = (size[0] as u32, size[1] as u32);
+                            }
+                            app.record_page_dims_for_spread(idx, (size[0] as u32, size[1] as u32));
+                        }
+                        // RtlCover's anchor 0 is a cover, so use the following pair.
+                        let anchor = usize::from(mode == SpreadMode::RtlCover);
+                        app.fullscreen_idx = Some(anchor);
+                        app.settings.fullscreen_fit_mode = FullscreenFitMode::Width;
+                        app.settings.fullscreen_top_bar_locked = top_locked;
+                        app.settings.set_still_bottom_lock(if bottom_locked {
+                            BottomBarLock::BarAndStrip
+                        } else {
+                            BottomBarLock::None
+                        });
+                        app.settings.still_seek_strip_visible = bottom_locked;
+                        app.settings.fullscreen_up_down_key_action = if page_turn {
+                            FullscreenUpDownKeyAction::PageTurn
+                        } else {
+                            FullscreenUpDownKeyAction::InPageScroll
+                        };
+                        app.settings.fullscreen_wheel_action = if page_turn {
+                            FullscreenWheelAction::PageTurn
+                        } else {
+                            FullscreenWheelAction::InPageScroll
+                        };
+                        app.request_fs_initial_placement(anchor);
+                        let paint = |app: &mut App, events| {
+                            paint_frame_in_rect_at_dpi(app, &ctx, rect, Some(dpi), events)
+                        };
+                        let before = paint(&mut app, vec![]);
+                        assert_eq!(ctx.pixels_per_point(), dpi, "{case}");
+                        assert_eq!(
+                            before.pages.len(),
+                            if anchor == 0 { 1 } else { 2 },
+                            "{case}"
+                        );
+                        assert!(
+                            before.unit.height() > before.pages[0].viewport_rect.height(),
+                            "{case}"
+                        );
+                        let events = match input {
+                            FractionalViewportScrollInput::Down => {
+                                vec![key_event(egui::Key::ArrowDown, true)]
+                            }
+                            FractionalViewportScrollInput::Wheel => vec![
+                                egui::Event::PointerMoved(before.pages[0].viewport_rect.center()),
+                                egui::Event::MouseWheel {
+                                    unit: egui::MouseWheelUnit::Point,
+                                    delta: egui::vec2(0.0, -120.0),
+                                    modifiers: egui::Modifiers::NONE,
+                                    phase: egui::TouchPhase::Move,
+                                    source: egui::MouseWheelSource::Wheel,
+                                },
+                            ],
+                            FractionalViewportScrollInput::Ordered => {
+                                vec![key_event(egui::Key::K, true)]
+                            }
+                        };
+                        let after = paint(&mut app, events);
+                        assert_eq!(app.fullscreen_idx, Some(anchor), "{case}");
+                        assert!(
+                            after.pan.y < before.pan.y,
+                            "pan must scroll down: {case}, before={:?}, after={:?}",
+                            before.pan,
+                            after.pan
+                        );
+                        assert!(
+                            app.fs_scroll_layout_matches(&ctx),
+                            "paint and input geometry must match: {case}"
+                        );
+                        if matches!(input, FractionalViewportScrollInput::Ordered) {
+                            let back = paint(
+                                &mut app,
+                                vec![
+                                    key_event(egui::Key::K, false),
+                                    key_event(egui::Key::J, true),
+                                ],
+                            );
+                            assert_eq!(app.fullscreen_idx, Some(anchor), "{case}");
+                            assert!(back.pan.y > after.pan.y, "J must scroll back up: {case}");
+                            assert!(app.fs_scroll_layout_matches(&ctx), "{case}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fractional_window_viewport_down_scrolls_without_turning_pages() {
+    assert_fractional_viewport_scroll(FractionalViewportScrollInput::Down);
+}
+
+#[test]
+fn fractional_window_viewport_wheel_scrolls_without_turning_pages() {
+    assert_fractional_viewport_scroll(FractionalViewportScrollInput::Wheel);
+}
+
+#[test]
+fn fractional_window_viewport_default_k_j_scroll_independently_of_page_turn_settings() {
+    assert_fractional_viewport_scroll(FractionalViewportScrollInput::Ordered);
 }
 
 fn assert_unit(frame: &PaintedFrame, count: usize, width: f32, height: f32) {
