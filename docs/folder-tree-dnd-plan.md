@@ -2,7 +2,7 @@
 
 2026-11-19〜20 設計 (ClaudeCode)。worktree `G:\home\mimageviewer-treednd464`、branch `treednd-464`、基点 master `ca6686d93`。
 要件の正本は [next-release-backlog.md §1.464・§1.821](next-release-backlog.md)。
-**状態: 設計 r3 (独立レビュー r1・r2 = REJECT を反映。r3 では仕組みを足すより組み合わせを減らした。§13)。実装前の再レビュー待ち。**
+**状態: 設計 r4 (独立レビュー r1〜r3 = REJECT を反映。仕組みを足すより組み合わせを減らした。§13)。実装前の再レビュー待ち。**
 
 要望の要旨 (5ch): >>444 ツリーへファイルをドロップできず、右クリックの貼り付けもできない。>>707 読み終えたファイルを
 `_mita` フォルダへ D&D したい (内部ドラッグで「＋」カーソルなのに何も起きない)。固定先へ送る「ファイル整理先」(v4.4.0 出荷)
@@ -80,18 +80,20 @@
 | --- | --- |
 | Shift | 移動 (明示) |
 | Ctrl | コピー (明示) |
-| なし | 既定 (`TransferIntent::Default`) |
+| なし | 既定 (ルートの予告で移動かコピー。下の説明) |
 | Ctrl+Shift・Alt | 受け付けない (ショートカット作成はしない) |
 
-既定の解決は **worker で行う**。`ShellTransferRequest` に `intent: Explicit(op) | Default` を持たせ、worker の検証の前に、元と先それぞれの
-ボリュームを `GetVolumePathNameW` → `GetVolumeNameForVolumeMountPointW` (取れなければ `GetVolumePathNameW` の結果。UNC は共有のルート) で求め、
-**全部が先と同じボリュームなら移動、1 件でも違えば (または求められなければ) コピー**に決める (Explorer と同じくボリュームで判定。
-フォルダにマウントした別ボリュームも区別する)。その後は今の検証 (`validate_transfer_request`) と `IFileOperation` へ進む。
+ドラッグ中 (UI スレッド、I/O なし) は、**パスのルート (ドライブ文字、UNC は `\\server\share`) を大文字小文字無視で比べた予告**で表示する:
+元が全部、先と同じルートなら「移動」、1 件でも違えば「コピー」。Drop で、この**予告した操作を要求に入れる** (`ShellTransferRequest.operation`)。
 
-ドラッグ中の表示 (§4.3) は UI スレッドなので I/O をせず、**パスのルート (ドライブ文字、UNC は `\\server\share`) を大文字小文字無視で
-比べた予想**を使う。予想と worker の解決が違うのは、フォルダにマウントした別ボリュームなどの場合 (表示は「移動」、実際はコピー)。
-食い違いは「移動の予想 → 実際はコピー」の向きだけで、元が消える側には転ばない (ルートが違えばボリュームも違うので、
-予想がコピーで実際は移動、は起きない)。送出元は mIV 自身なので、preferred effect や元の許可効果による分岐は無い。
+worker は**予告を上げない** (r3 P1-1)。予告がコピーなら必ずコピー。予告が移動で、それが既定 (修飾キーなし) によるものなら、検証の前に元と先の
+ボリュームを `GetVolumePathNameW` → `GetVolumeNameForVolumeMountPointW` (取れなければ `GetVolumePathNameW` の結果。UNC は共有のルート) で比べ、
+1 件でも違えば (または求められなければ) **コピーに下げる** (フォルダにマウントした別ボリュームで、Explorer と同じくコピーになる)。
+Shift の明示の移動は下げない。要求は `operation` と `default_move_needs_volume_check: bool` を持つ (既定の移動のときだけ true)。
+
+結果として、実行が移動になるのは「予告が移動」のときだけで、表示と実行の食い違いは「予告は移動、実際はコピー」の向きに限られる
+(元が消える側には転ばない)。同じボリュームを別の名前 (`D:\` と `C:\MountD\`) で見ている場合、Explorer は既定で移動するが mIV はコピーになる
+(安全側の違いとしてマニュアルに書かない細部。設計書にだけ残す)。送出元は mIV 自身なので、preferred effect や元の許可効果による分岐は無い。
 
 受け付けない場面: 行の上でない / 本棚の配下 / 明示の移動か既定で、先が元の親と同じ (字句。Explorer も同じフォルダへの既定のドロップでは何もしない) /
 元フォルダ自身か配下 / §6.4 の述語 / §4.1。
@@ -151,10 +153,13 @@ callback は UI スレッドで (a) winit のメッセージ処理の中 (外部
 
 - `latest: DropGeometry` — App が**各 pass の最後**に、その pass の形 (§6.3) で上書きする。
 - `presented: DropGeometry` — App が **pass の最初で `ctx.current_pass_index() == 0` (新しいフレームの最初の pass) のとき**に `latest` から移す。
-  前のフレームの最後の pass は、discard されずに描画・present されたもの (egui はフレームの最後の pass を描く)。同じフレームの 2 pass 目の最初では移さない
-  (r2 P1-1)。
-- `in_pass: bool` — 各 pass の最初に立て、最後に下ろす。callback は `in_pass` なら `presented` (mIV 内ドラッグは pass の中で始まり、画面は前のフレーム)、
-  そうでなければ `latest` (pass の外 = eframe がそのフレームを描き終えた後のメッセージ処理) を使う。どちらも「いま画面に出ている形」。
+  そのとき `latest` は前のフレームの最後の pass で、次のフレームが始まる前に描画・present されている (同じフレームの 2 pass 目の最初では移さない)。
+- **画面に出ている形は、いつでも `presented` か `latest` のどちらか** (前のフレームの描画前・描画後・次のフレームの pass の途中・eframe が
+  App から戻った後で描画する前のどこで callback が来ても)。そこで callback は**両方の形で同じ行 (同じパス) に当たる点だけ**を `TreeRow` とし、
+  違えば NONE にする (r3 P1-2)。描画の完了時点を知る仕組みや `in_pass` の選び分けは要らない。
+  ツリーが変わった直後 (スクロール・再読み込み) は、変わった位置が 1 フレームの間だけ受け付けられない。外部ドラッグの callback が不一致を見たら
+  `request_repaint` し、次のフレームで 2 つの形が揃う。mIV 内ドラッグ中はフレームが進まないので、そのドラッグの間は不一致の位置を受け付けない
+  (ドラッグを始めたフレームでちょうどツリーが動いた場合だけ)。
 - `admission: Result<(), String>` — App が毎 pass 書く受付可否 (§6.4 の述語の結果)。
 - `internal: Option<InternalDrag>` — §4.1。`SHDoDragDrop` の前に立て、戻った直後に外す。
 - `drops: Vec<DropRequest>` — target が書く。`GridFiles(paths)` / `TreeTransfer(ShellTransferRequest)`。外部ドラッグなら `request_repaint`。
@@ -174,13 +179,14 @@ App の消費: `update_phases.rs` の今の `dropped_files` の場所で `drops`
   ツールチップ・他の Area) の rect を集め、交差する行は対象外 (行全体を外す。点のサンプリングはしない)。
 - `client_size_px`、DPI (`GetDpiForWindow`)、`pixels_per_point`。
 
-callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `GetClientRect` の大きさと DPI が形と違えば、どこでも NONE**。点の分類:
+callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `GetClientRect` の大きさと DPI が、`presented`・`latest` のどちらかと違えば、どこでも NONE**。
+点の分類 (両方の形で同じ分類・同じ行になるときだけ。違えば NONE):
 
 | 分類 | 扱い |
 | --- | --- |
 | `TreeRow(path)` (`tree_clip` 内で、対象の行全体の rect に入る) | §4・§5 |
 | `TreeNonTarget` (`pane_rect` 内でそれ以外: 空白・インデント・スクロールバー・外した行・ヘッダ) | NONE。一覧の経路へ流さない |
-| `ExistingDropArea` (`pane_rect` の外) | 外部ドラッグは今の一覧への落下 (COPY、Drop で `GridFiles`)。mIV 内ドラッグは NONE |
+| `ExistingDropArea` (両方の形で `pane_rect` の外) | 外部ドラッグは今の一覧への落下 (COPY、Drop で `GridFiles`)。mIV 内ドラッグは NONE |
 | 形が無い (ツリー非表示) | `pane_rect` が空なので全部 `ExistingDropArea`。大きさ・DPI 不一致は全部 NONE |
 
 ### 6.4 受付の述語と投入境界 (r1 P2-4)
@@ -250,10 +256,11 @@ callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `Get
 自動テスト (製品バイナリは起動しない):
 
 - 操作の決定 (純関数): 修飾キー × ルートの同じ/別 × 内部/外部 × 外部の許可効果 × 同じ親・自身/配下・本棚配下・`excluded_virtual`・`failed_paths`。UNC・大文字小文字・末尾区切り。
-- 既定の解決 (worker): ボリューム一致で移動、不一致・取得失敗でコピー。ボリュームの取得は差し替え可能な形にし、マウントした別ボリューム (ルートは同じ) でコピーになることを検査。表示の予想が「コピー」なのに解決が「移動」になる組み合わせが無いこと。
-- 当たり判定: `latest` / `presented` の選び分け (`in_pass`)。**表示済みの形で A の位置に、次のフレームの新しい形では B が来る場合に、そのフレームの pass の中では A を返す**回帰を、
-  `request_discard` による 2 pass のフレームでも検査する (2 pass 目の最初で `presented` が 1 pass 目の形にならないこと)。ppp 1.0/1.5、行全体の rect の端、
-  `TreeNonTarget` (インデント・空白・スクロールバー・重なったレイヤーで外した行) が NONE で一覧へ流れないこと、大きさ・DPI 不一致で NONE。
+- 既定の解決 (worker): 予告がコピーなら必ずコピー (r3 の反例 `D:\src` → `C:\MountD\dst` で同じボリュームでもコピー)。予告が既定の移動なら、ボリューム一致で移動、不一致・取得失敗でコピー。Shift の移動は下げない。ボリュームの取得は差し替え可能な形にして検査。
+- 当たり判定: `presented` と `latest` で同じ行に当たる点だけ `TreeRow`。**表示済みの形で A の位置に、新しい形では B が来る場合は NONE** (A にも B にも入れない)。
+  `request_discard` による 2 pass のフレーム (2 pass 目の最初で `presented` を入れ替えないこと)、pass の外 (App から戻った後・描画の前) の callback、
+  外部ドラッグの不一致で `request_repaint` すること、ppp 1.0/1.5、行全体の rect の端、`TreeNonTarget` (インデント・空白・スクロールバー・重なったレイヤーで外した行)
+  が NONE で一覧へ流れないこと、大きさ・DPI 不一致で NONE。
 - 受付の述語: snapshot と投入で同じ述語。Running・Selecting・Remote・終了・モーダル・sidecar・本棚で worker を起動しない。整理先とツリーの両方の入口。snapshot の作成で本への追加の取り消しが失効しないこと。
 - 外部ドロップの返答: 偽の data object で、ツリー行への外部 Drop が COPY を返し、`PERFORMEDDROPEFFECT` 等を書かないこと。Shift でもコピーの要求になること。
 - 内部ドロップ: `InternalDrag.paths` 全件で要求を作ること (data object の `CF_HDROP` を読まない)。`failed_paths > 0` で受け付けない。
@@ -300,3 +307,5 @@ Q1〜Q5 はすべて回答済み (§0)。残る判断は §4.3 の出荷条件�
   - custom IDropSource を作らない。表示は target の drop description だけ。表示されなければ移動を出荷しない (§4.3)。
   - 自動展開・自動スクロール・行の強調表示をしない。
   - 遮蔽は点ではなく行全体で外す。形はフレームの最初の pass でだけ入れ替える。
+- r3 (b238cc97c) REJECT: 字句の予告がコピーで実行が移動になる反例 (同じボリュームの別名)、App から戻った後・描画前の callback で未表示の形を使う (P1×2)。
+- r4 で直したもの: worker は予告を上げない (下げるだけ)。形は `presented` と `latest` の両方で同じ行に当たる点だけ受け付け、描画の完了時点を知る仕組みを作らない。
