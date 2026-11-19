@@ -349,15 +349,144 @@ fn target_output(output: PathBuf) -> Result<PathBuf, Box<dyn std::error::Error>>
     // Windows junctions. Never materialize rotated inputs outside target.
     for part in relative.components() {
         current.push(part.as_os_str());
-        if current.exists() {
-            if !current.canonicalize()?.starts_with(&target) {
-                return Err("evaluation output traverses a link outside target".into());
-            }
-        } else {
-            std::fs::create_dir(&current)?;
-        }
+        create_target_output_directory(&current, &target)?;
     }
     Ok(current)
+}
+
+fn create_target_output_directory(
+    directory: &Path,
+    target: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Another evaluation lane may have created this level in the meantime.
+    match std::fs::create_dir(directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    let resolved = directory.canonicalize()?;
+    if !resolved.starts_with(target) {
+        return Err("evaluation output traverses a link outside target".into());
+    }
+    if !resolved.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            "evaluation output must be a directory",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+#[test]
+fn target_output_directory_accepts_new_and_existing_directory()
+-> Result<(), Box<dyn std::error::Error>> {
+    let target = std::env::current_dir()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    let temp = tempfile::Builder::new()
+        .prefix("cover-auto-output-directory-")
+        .tempdir_in(target)?;
+    let root = temp.path().canonicalize()?;
+    let directory = root.join("output");
+    create_target_output_directory(&directory, &root)?;
+    assert!(directory.is_dir());
+    // Deterministically exercise create_dir's AlreadyExists result.
+    create_target_output_directory(&directory, &root)?;
+    assert_eq!(target_output(directory.clone())?, directory);
+    Ok(())
+}
+
+#[test]
+fn target_output_directory_rejects_existing_file() -> Result<(), Box<dyn std::error::Error>> {
+    let target = std::env::current_dir()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    let temp = tempfile::Builder::new()
+        .prefix("cover-auto-output-file-")
+        .tempdir_in(target)?;
+    let root = temp.path().canonicalize()?;
+    let file = root.join("output");
+    std::fs::write(&file, b"preserve")?;
+    assert!(create_target_output_directory(&file, &root).is_err());
+    assert!(target_output(file.clone()).is_err());
+    assert_eq!(std::fs::read(file)?, b"preserve");
+    Ok(())
+}
+
+#[test]
+fn target_output_directory_preserves_other_create_errors() -> Result<(), Box<dyn std::error::Error>>
+{
+    let target = std::env::current_dir()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    let temp = tempfile::Builder::new()
+        .prefix("cover-auto-output-error-")
+        .tempdir_in(target)?;
+    let root = temp.path().canonicalize()?;
+    let error = create_target_output_directory(&root.join("missing/output"), &root).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::NotFound,
+    );
+    Ok(())
+}
+
+#[test]
+fn target_output_directory_rejects_resolved_path_outside_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    let target = std::env::current_dir()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    let temp = tempfile::Builder::new()
+        .prefix("cover-auto-output-boundary-")
+        .tempdir_in(target)?;
+    let root = temp.path();
+    let allowed = root.join("allowed");
+    std::fs::create_dir(&allowed)?;
+    let resolved_allowed = allowed.canonicalize()?;
+    std::fs::create_dir(root.join("outside"))?;
+    // Exercise the post-canonicalize containment check without needing link
+    // creation privileges. Lexically this path is still under allowed.
+    let outside = allowed.join("..").join("outside");
+    assert!(outside.starts_with(&allowed));
+    let error = create_target_output_directory(&outside, &resolved_allowed).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "evaluation output traverses a link outside target",
+    );
+    // The same containment check also applies immediately after creation.
+    let created_outside = allowed.join("..").join("created-outside");
+    let error = create_target_output_directory(&created_outside, &resolved_allowed).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "evaluation output traverses a link outside target",
+    );
+    Ok(())
+}
+
+#[test]
+fn target_output_accepts_concurrent_nested_directory_creation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let target = std::env::current_dir()?.join("target");
+    std::fs::create_dir_all(&target)?;
+    let temp = tempfile::Builder::new()
+        .prefix("cover-auto-output-concurrent-")
+        .tempdir_in(target)?;
+    let output = temp.path().join("output/nested/thumbs");
+    assert!(!output.exists());
+    let barrier = std::sync::Barrier::new(32);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..32)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    target_output(output.clone()).map_err(|error| error.to_string())
+                })
+            })
+            .collect();
+        for handle in handles {
+            let directory = handle.join().unwrap().unwrap();
+            assert_eq!(directory, output.canonicalize().unwrap());
+        }
+    });
+    Ok(())
 }
 
 /// Folder inputs have no ground truth and may contain private images. Use the
