@@ -6411,9 +6411,11 @@ tools/list 応答の最大 43,915 文字 (検査 `stage2_complete_tool_discovery
   J・K の古い書き方を揃えた。
 - 3 巡目 (2026-11-20、同じ thread、設計 `a5674408c`): **ready**。追加の指摘なし。性能の計測・互換テスト・実機の確認は実装後の受け入れ条件。
 
-### M. 実装の記録 (2026-11-20、検証未完了)
+### M. 実装の記録 (2026-11-20)
 
-作業ツリー `G:\home\mimageviewer-mcp740`、branch `mcp-tools-740` の未コミット差分。
+作業ツリー `G:\home\mimageviewer-mcp740`、branch `mcp-tools-740` (実装 2ac61e720)。下の「検証結果と残り」は実装担当のサンドボックスでの記録、
+設計担当がサンドボックスの外で流した結果は末尾の「設計担当の検証」。
+以下は実装時点の記録 (未コミット差分の時点の文言を残す)。
 公開文書 (`htdocs/`)・永続データの schema・保存形式は変更していない。コミット・製品バイナリの起動は行っていない。
 
 #### 実装上の選択
@@ -6504,6 +6506,39 @@ compile不能後の追補確認で、長い一時pathでは文字予算により
 UI snapshot は指示どおり設計担当が実行するため **PNG更新なし**。対象候補は
 `agent_integration_window_{disabled,read,open,organize,records}_{light,dark}.png` の10枚。
 差分が出た場合に `UPDATE_SNAPSHOTS=1` で更新・目視確認する。
+
+#### 設計担当の検証 (2026-11-20、サンドボックスの外・共有の重いジョブ runner 経由)
+
+サンドボックスでは本体が compile できなかったため、設計担当が流した。compile して初めて分かった不備はテスト側だけで、製品コードは変えていない (c8106c286)。
+
+- `Command::ListFolder` を組み立てる既存テスト 3 か所 (`logging_tests`・`media_read_tests`・`tests`) に追加欄の初期化が無かった。
+- ジャンクションのテストで `join("child/back")` を `mklink` が switch と読んだ。`join("child").join("back")` に直した。
+- 長辺 513 の期待: 縦横比を正確に保つ縮小は 2:1 の元画像に 513 を求めると 512×256 を選ぶ (仕様どおり)。期待側の不備なので、正方形の元画像に変えた。
+
+| command | 結果 |
+| --- | --- |
+| `cargo test -p mimageviewer-agent-ipc -p mimageviewer-mcp` (実 pipe 2 件を含む) | **成功**。IPC 20・凍結互換 15・MCP 88 |
+| `cargo check -p mimageviewer --bin mimageviewer-core` | **成功** |
+| `cargo nextest run -p mimageviewer --lib -E 'test(/agent/)'` | **成功、321 件** |
+| `cargo test -p mimageviewer --test ui_snapshot` | 想定どおり設定画面の 10 枚が文言の変更で差分。`UPDATE_SNAPSHOTS=1` で更新し目視確認 (bfe32b44c)。更新後 **261 件成功** |
+| `.\scripts\test-lib-full.ps1` | **PASS、19,032 件成功・88 件 skip** (1,645 秒、nextest 12 本) |
+| `.\scripts\build-dev.ps1` | **成功** (core・remote・EPUB worker・MCP・music-video editor の 5 本)。サブ PC の確認用に渡す |
+
+D の性能 (`recursive_near_limit_performance_and_over_limit_rejection`、debug、1,000 フォルダ × 49 ファイル = 49,999 行、★・タグ各 1,000 行):
+
+| 要求 | 所要時間 | 行 |
+| --- | ---: | --- |
+| 初回 (recursive、limit 100) | 1,055 ms | 83 行 + cursor |
+| 続き | 1,025 ms | 83 行 + cursor |
+| 保存した★順 | 1,330 ms | 83 行 + cursor |
+| `tagged: true` | 1,468 ms | 80 行 + cursor |
+| `summarize_folder` | 1,205 ms | total 49,999 |
+
+受け入れ条件 (各 10 秒以内) を大きく下回るため、D の上限 1,000 フォルダ・50,000 行と「毎要求で再走査」はそのままにする。
+1 ページが 100 行未満なのはページの文字数上限による (設計どおり)。
+
+未確認: UNC / ネットワークフォルダでの再帰の所要時間、実際の AI クライアントが長辺 1568 の画像を受け取って読めるか
+(サブ PC の確認に回す)。
 
 #### 変更ファイル
 
