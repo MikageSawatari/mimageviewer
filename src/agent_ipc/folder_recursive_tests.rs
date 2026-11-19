@@ -51,6 +51,113 @@ fn names(page: &FolderPage) -> Vec<String> {
     rows(page).iter().map(|row| row.name.clone()).collect()
 }
 
+fn cursor_state(cursor: &str) -> FolderCursor {
+    let bytes = (0..cursor.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&cursor[index..index + 2], 16).unwrap())
+        .collect::<Vec<_>>();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn cursor_filter_tree(f: &Fixture) -> PathBuf {
+    let root = f._dir.path().join("cursor-filters");
+    std::fs::create_dir_all(root.join("child/deep")).unwrap();
+    for name in ["child/deep/photo-a.PNG", "child/photo-b.jpg", "photo-c.png"] {
+        std::fs::write(root.join(name), b"x").unwrap();
+    }
+    root
+}
+
+fn cursor_filter_options() -> FolderOptions {
+    FolderOptions {
+        name_contains: Some("photo".into()),
+        extensions: Some(vec!["PNG".into(), "jpg".into()]),
+        ..options()
+    }
+}
+
+#[test]
+fn recursive_cursor_rejects_changed_name_and_extension_filters() {
+    let f = Fixture::new();
+    let root = cursor_filter_tree(&f);
+    let first = recursive_list(&f, &root, cursor_filter_options(), Some(1), None).unwrap();
+    assert_eq!(names(&first), ["photo-a.PNG"]);
+    let cursor = first.cursor.expect("remaining matching rows");
+    for changed in [
+        FolderOptions {
+            name_contains: Some("photo-b".into()),
+            ..cursor_filter_options()
+        },
+        FolderOptions {
+            extensions: Some(vec!["jpg".into()]),
+            ..cursor_filter_options()
+        },
+    ] {
+        assert_eq!(
+            recursive_list(&f, &root, changed, Some(1), Some(cursor.clone()))
+                .unwrap_err()
+                .code,
+            ErrorCode::BadRequest
+        );
+    }
+}
+
+#[test]
+fn recursive_cursor_normalizes_extension_case_order_and_default_max_depth() {
+    let f = Fixture::new();
+    let root = cursor_filter_tree(&f);
+    let first = recursive_list(&f, &root, cursor_filter_options(), Some(1), None).unwrap();
+    let cursor = first.cursor.expect("remaining matching rows");
+    let expected = recursive_list(
+        &f,
+        &root,
+        cursor_filter_options(),
+        Some(1),
+        Some(cursor.clone()),
+    )
+    .unwrap();
+    assert_eq!(names(&expected), ["photo-b.jpg"]);
+    for equivalent in [
+        FolderOptions {
+            extensions: Some(vec!["JPG".into(), "png".into()]),
+            ..cursor_filter_options()
+        },
+        FolderOptions {
+            extensions: Some(vec!["JPG".into(), "png".into()]),
+            max_depth: Some(32),
+            ..cursor_filter_options()
+        },
+    ] {
+        assert_eq!(
+            recursive_list(&f, &root, equivalent, Some(1), Some(cursor.clone())).unwrap(),
+            expected
+        );
+    }
+    // The explicit depth also emits a cursor accepted with the null/default depth.
+    let explicit_depth = recursive_list(
+        &f,
+        &root,
+        FolderOptions {
+            max_depth: Some(32),
+            ..cursor_filter_options()
+        },
+        Some(1),
+        Some(cursor),
+    )
+    .unwrap();
+    assert_eq!(explicit_depth, expected);
+    let last = recursive_list(
+        &f,
+        &root,
+        cursor_filter_options(),
+        Some(1),
+        explicit_depth.cursor,
+    )
+    .unwrap();
+    assert_eq!(names(&last), ["photo-c.png"]);
+    assert!(last.cursor.is_none());
+}
+
 #[test]
 fn recursive_preorder_depth_and_summary_share_filtered_logical_rows() {
     let f = Fixture::new();
@@ -590,12 +697,12 @@ fn recursive_near_limit_performance_and_over_limit_rejection() {
             std::fs::write(folder.join(format!("{file:02}.png")), b"x").unwrap();
         }
         db.set(
-            &crate::adjustment_db::normalize_path(&folder.join("00.png")),
+            &crate::adjustment_db::normalize_path(&folder.join("48.png")),
             3,
         )
         .unwrap();
         tags.set_item_tags(
-            &crate::tags_db::item_key_for_path(&folder.join("00.png")),
+            &crate::tags_db::item_key_for_path(&folder.join("48.png")),
             ["tag"],
             "test",
         )
@@ -615,17 +722,95 @@ fn recursive_near_limit_performance_and_over_limit_rejection() {
         assert!(page.cursor.is_some());
         page
     };
+    let expected_paths = |rated: bool| {
+        let mut paths = Vec::with_capacity(49_999);
+        // Root folder rows precede its media; each child is followed by its media.
+        for index in (1..1000).chain(std::iter::once(0)) {
+            let folder = if index == 0 {
+                root.clone()
+            } else {
+                let folder = root.join(format!("{index:04}"));
+                paths.push(folder.clone());
+                folder
+            };
+            if rated {
+                paths.push(folder.join("48.png"));
+            }
+            for file in 0..if rated { 48 } else { 49 } {
+                paths.push(folder.join(format!("{file:02}.png")));
+            }
+        }
+        assert_eq!(paths.len(), 49_999);
+        paths
+    };
+    let page_paths = |page: &FolderPage| {
+        let items = rows(page);
+        assert_eq!(items.len(), page.items.len(), "no oversized-row markers");
+        items
+            .iter()
+            .map(|row| PathBuf::from(&row.path))
+            .collect::<Vec<_>>()
+    };
+    let name_order = expected_paths(false);
     let first = measured("first", options(), None);
-    measured("continuation", options(), first.cursor);
+    let first_paths = page_paths(&first);
+    assert_eq!(first_paths, name_order[..first.items.len()]);
+    let first_position = cursor_state(first.cursor.as_deref().unwrap());
+    assert_eq!(first_position.version, 5);
+    assert_eq!(first_position.returned, first.items.len());
+    let second = measured("continuation", options(), first.cursor);
+    let second_paths = page_paths(&second);
+    assert_eq!(
+        second_paths,
+        name_order[first.items.len()..first.items.len() + second.items.len()]
+    );
+    let first_set = first_paths.iter().collect::<std::collections::HashSet<_>>();
+    let second_set = second_paths
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(first_set.len(), first_paths.len());
+    assert_eq!(second_set.len(), second_paths.len());
+    assert!(first_set.is_disjoint(&second_set));
+    let second_position = cursor_state(second.cursor.as_deref().unwrap());
+    assert_eq!(
+        second_position.returned,
+        first.items.len() + second.items.len()
+    );
+    assert!(second_position.returned > first_position.returned);
     settings(|s| s.sort_order = crate::settings::SortOrder::RatingDesc);
-    measured("saved-rating-order", options(), None);
-    measured(
+    let rated = measured("saved-rating-order", options(), None);
+    let rating_order = expected_paths(true);
+    let rated_paths = page_paths(&rated);
+    assert_eq!(rated_paths, rating_order[..rated.items.len()]);
+    assert_eq!(first_paths[1], root.join("0001/00.png"));
+    assert_eq!(rated_paths[1], root.join("0001/48.png"));
+    assert_ne!(first_paths[1], rated_paths[1]);
+    assert_eq!(rows(&rated)[1].rating, Some(3));
+    let tagged = measured(
         "tagged",
         FolderOptions {
             tagged: Some(true),
             ..options()
         },
         None,
+    );
+    let tagged_order = rating_order
+        .iter()
+        .filter(|path| path.file_name().unwrap() == "48.png")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(tagged_order.len(), 1000);
+    assert_eq!(page_paths(&tagged), tagged_order[..tagged.items.len()]);
+    for row in rows(&tagged) {
+        assert_eq!(row.name, "48.png");
+        assert_eq!(row.kind, FolderKind::Image);
+        assert_eq!(row.rating, Some(3));
+        assert_eq!(row.tags.as_deref(), Some(&["#tag".to_owned()][..]));
+        assert!(row.subresource.is_none());
+    }
+    assert_eq!(
+        cursor_state(tagged.cursor.as_deref().unwrap()).returned,
+        (tagged.items.len() - 1) * 50 + 2
     );
     let started = Instant::now();
     let result = summary(&f, &root, options()).unwrap();

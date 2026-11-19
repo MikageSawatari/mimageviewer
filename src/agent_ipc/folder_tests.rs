@@ -1191,7 +1191,7 @@ fn folder_page_character_budget_counts_composition_flag_and_advances_oversized_r
 }
 
 #[test]
-fn folder_cursor_version_three_is_rejected_and_epoch_precedes_listing_change() {
+fn folder_cursor_versions_three_and_four_are_rejected_and_epoch_precedes_listing_change() {
     let args = "argument-digest";
     let listing = "listing-digest";
     let cursor = folder_cursor(args, listing, 1, 7);
@@ -1205,18 +1205,21 @@ fn folder_cursor_version_three_is_rejected_and_epoch_precedes_listing_change() {
             .code,
         ErrorCode::PermissionChanged
     );
-    let legacy = serde_json::json!({"version": 3, "tool": "list_folder", "args_digest": args, "listing_digest": listing, "returned": 1});
-    let legacy = serde_json::to_vec(&legacy)
-        .unwrap()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
-    assert_eq!(
-        folder_offset(Some(&legacy), args, listing, 2, 0)
-            .unwrap_err()
-            .code,
-        ErrorCode::BadRequest
-    );
+    for version in [3, 4] {
+        let legacy = serde_json::json!({"version": version, "tool": "list_folder", "args_digest": args, "listing_digest": listing, "returned": 1});
+        let legacy = serde_json::to_vec(&legacy)
+            .unwrap()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        assert_eq!(
+            folder_offset(Some(&legacy), args, listing, 2, 0)
+                .unwrap_err()
+                .code,
+            ErrorCode::BadRequest,
+            "cursor version {version}"
+        );
+    }
 }
 
 #[test]
