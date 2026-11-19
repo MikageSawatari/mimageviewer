@@ -5211,6 +5211,7 @@ mod tests {
                 texture: texture.clone(),
                 texture_options: egui::TextureOptions::LINEAR,
                 complete: true,
+                ai_applied: false,
             },
         );
         let (selected, quality) = app.page_turn_resident_source(0).unwrap();

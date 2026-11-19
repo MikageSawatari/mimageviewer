@@ -808,6 +808,8 @@ mod depth_view_tests;
 #[cfg(all(test, windows))]
 pub(crate) mod detached_media_exchange_tests;
 #[cfg(test)]
+mod final_ai_status_tests;
+#[cfg(test)]
 pub(crate) mod final_prepare_tests;
 #[cfg(windows)]
 mod viewer_session;
@@ -11654,6 +11656,34 @@ impl<'a> IntoIterator for &'a FinalCompositeCache {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FinalAiJobState {
+    NotRequested,
+    SourcePending,
+    OutOfRange,
+    Ready,
+    Running,
+    Failed,
+    Waiting,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NotAppliedReason {
+    SizeLimit,
+    Failed,
+    Unavailable,
+    Animated,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DisplayedFinalAiState {
+    NotRequested,
+    Applied { width: u32, height: u32 },
+    Processing,
+    Waiting,
+    NotApplied(NotAppliedReason),
+}
+
 pub(crate) struct FinalCompositeEntry {
     pub(crate) display_basis: crate::material_display_basis::MaterialDisplayBasis,
     pub(crate) canonical_dims: Option<crate::page_dims::CanonicalPageDimensions>,
@@ -11664,6 +11694,8 @@ pub(crate) struct FinalCompositeEntry {
     /// false は AI 完了待ち中の暫定プレビュー。AI 到着後の再合成中も表示用に保持し、
     /// 完成結果が届いたら同じ key を上書きする。
     pub(crate) complete: bool,
+    /// The selected base was an AI result, including denoise-only output.
+    pub(crate) ai_applied: bool,
 }
 
 fn normal_raster_material_basis(
@@ -11732,6 +11764,7 @@ impl FinalCompositeEntry {
             texture,
             texture_options,
             complete,
+            ai_applied: false,
             display_basis,
         }
     }
@@ -12658,6 +12691,8 @@ pub(crate) struct FinalEffectPending {
     state: final_prepare::FinalEffectState,
     items_generation: u64,
     output_complete: bool,
+    /// Selected-input provenance stays with the job through CPU receipt and GPU adoption.
+    ai_applied: bool,
     nearest_sampler: bool,
     /// 非表示ページの先読みとして起動した worker。表示要求時は同じ job を昇格して再利用する。
     origin: final_prepare::FinalEffectOrigin,
@@ -84877,22 +84912,87 @@ impl App {
     /// `final_ai_key_for_pixels` と同じ判定式を共有するため、skip_px や bg mode の
     /// 整合性は自動で保たれる。
     pub(crate) fn is_idx_final_ai_done_or_skipped(&self, idx: usize) -> bool {
+        matches!(
+            self.final_ai_job_state(idx),
+            FinalAiJobState::NotRequested
+                | FinalAiJobState::OutOfRange
+                | FinalAiJobState::Ready
+                | FinalAiJobState::Failed
+        )
+    }
+
+    /// Read existing job owners without starting work or changing cache lifetime.
+    pub(crate) fn final_ai_job_state(&self, idx: usize) -> FinalAiJobState {
         if self.has_retained_pdf_final_ai_for_current_params(idx) {
-            return true;
+            return FinalAiJobState::Ready;
         }
-        // source pixels が無ければ判定不能 → pending 扱い (= done 数に入れない)
+        // Preserve prefetch's source-first done/skip contract, even without a request.
         let Some(pixels) = self.current_raw_source_pixels(idx) else {
-            return false;
+            return FinalAiJobState::SourcePending;
         };
         let params = self.effective_params(idx);
         let edit_key = self.current_edit_result_key(idx);
         let Some(key) = self.final_ai_key_for_pixels(edit_key, pixels.size, params) else {
-            // AI 不要 (= モデル未設定 or skip_px 超) → done
-            return true;
+            return if self.effective_upscale_request(params).is_none()
+                && self.effective_denoise_request(params).is_none()
+            {
+                FinalAiJobState::NotRequested
+            } else {
+                FinalAiJobState::OutOfRange
+            };
         };
-        self.final_ai_cache.contains_key(&key)
+        if self.final_ai_cache.contains_key(&key)
             || self.has_retained_final_ai(idx, key, pixels.size)
-            || self.final_ai_failed.contains(&key)
+        {
+            FinalAiJobState::Ready
+        } else if self.final_ai_failed.contains(&key) {
+            FinalAiJobState::Failed
+        } else if self
+            .final_ai_pending
+            .get(&key)
+            .is_some_and(|pending| !pending.cancel.load(Ordering::Relaxed))
+        {
+            FinalAiJobState::Running
+        } else {
+            FinalAiJobState::Waiting
+        }
+    }
+
+    /// Resolve AI provenance from this page's exact completed displayed material.
+    pub(crate) fn displayed_final_ai_state(&self, idx: usize) -> DisplayedFinalAiState {
+        use DisplayedFinalAiState as D;
+        use FinalAiJobState as J;
+        use NotAppliedReason as R;
+        let params = self.effective_params(idx);
+        if self.effective_upscale_request(params).is_none()
+            && self.effective_denoise_request(params).is_none()
+        {
+            return D::NotRequested;
+        }
+        if self.fs_entry_is_animated(idx) {
+            return D::NotApplied(R::Animated);
+        }
+        if let Some((_, entry)) = self.exact_complete_final_composite_entry(idx) {
+            if entry.ai_applied {
+                let [width, height] = entry.texture.size();
+                return D::Applied {
+                    width: width as u32,
+                    height: height as u32,
+                };
+            }
+            return D::NotApplied(match self.final_ai_job_state(idx) {
+                J::OutOfRange => R::SizeLimit,
+                J::Failed => R::Failed,
+                _ => R::Unavailable,
+            });
+        }
+        match self.final_ai_job_state(idx) {
+            J::Running | J::Ready => D::Processing,
+            J::Failed => D::NotApplied(R::Failed),
+            J::OutOfRange => D::NotApplied(R::SizeLimit),
+            J::SourcePending | J::Waiting => D::Waiting,
+            J::NotRequested => D::NotRequested,
+        }
     }
 
     /// AI 先読み対象を前後に分けた表示モデルを返す。総 target が 0 なら非表示
@@ -85011,6 +85111,7 @@ impl App {
                 plan,
                 true,
                 true,
+                true,
             ) {
                 return;
             }
@@ -85126,6 +85227,7 @@ impl App {
                             plan,
                             true,
                             true,
+                            true,
                         ) {
                             return;
                         }
@@ -85158,13 +85260,13 @@ impl App {
 
             let ai_key = self.final_ai_key_for_pixels(edit_key, edit_pixels.size, &params);
             let ai_disabled = ai_key.is_none();
-            let (source, used_upscale, adjust_before_effect) = match ai_key {
+            let (source, used_upscale, adjust_before_effect, ai_applied) = match ai_key {
                 Some(key) => {
                     if let Some(entry) = self.final_ai_cache.get(&key).cloned() {
-                        (entry.pixels, entry.used_upscale, None)
+                        (entry.pixels, entry.used_upscale, None, true)
                     } else if self.final_ai_failed.contains(&key) {
                         let adjust = (!params.is_color_identity()).then_some(params.clone());
-                        (Arc::clone(&edit_pixels), false, adjust)
+                        (Arc::clone(&edit_pixels), false, adjust, false)
                     } else {
                         // AI 結果が到着してから final effect を作る。AI 前の完成 entry を
                         // 同じ key へ入れると Ready 到着後も stale な白黒結果が残る。
@@ -85173,7 +85275,7 @@ impl App {
                 }
                 None => {
                     let adjust = (!params.is_color_identity()).then_some(params.clone());
-                    (Arc::clone(&edit_pixels), false, adjust)
+                    (Arc::clone(&edit_pixels), false, adjust, false)
                 }
             };
             let plan = if ai_disabled {
@@ -85196,6 +85298,7 @@ impl App {
                 plan,
                 true,
                 true,
+                ai_applied,
             ) {
                 // 背景 CPU / GPU と完成時 upload を一度に積み上げない。
                 return;
@@ -90951,14 +91054,14 @@ impl App {
         }
     }
 
-    fn effective_upscale_request(
+    pub(crate) fn effective_upscale_request(
         &self,
         params: &crate::adjustment::AdjustParams,
     ) -> Option<Option<crate::ai::ModelKind>> {
         crate::ai::final_pipeline::effective_upscale_request(self.settings.ai_feature_mode, params)
     }
 
-    fn effective_denoise_request(
+    pub(crate) fn effective_denoise_request(
         &self,
         params: &crate::adjustment::AdjustParams,
     ) -> Option<crate::ai::ModelKind> {
@@ -91532,6 +91635,7 @@ impl App {
                             pixels,
                             texture: texture.clone(),
                             complete: pending.output_complete,
+                            ai_applied: pending.ai_applied,
                         },
                     );
                     self.final_composite_cache
@@ -91724,6 +91828,7 @@ impl App {
         source: Arc<egui::ColorImage>,
         source_size: [usize; 2],
         output_complete: bool,
+        ai_applied: bool,
     ) -> Option<egui::TextureHandle> {
         self.resolve_prepared_edit_for_display(ctx, key.edit_key.idx);
         let reuse_prefetch = self
@@ -91794,6 +91899,7 @@ impl App {
             plan,
             output_complete,
             false,
+            ai_applied,
         );
         existing_texture
     }
@@ -91835,6 +91941,7 @@ impl App {
         plan: FinalCompositePlan,
         output_complete: bool,
         prefetch: bool,
+        ai_applied: bool,
     ) -> bool {
         let nearest_sampler = plan.needs_nearest_sampler();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -91898,6 +92005,7 @@ impl App {
                         state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                         items_generation: self.items_generation,
                         output_complete,
+                        ai_applied,
                         nearest_sampler,
                         origin: if prefetch {
                             FinalEffectOrigin::LegacyPrefetch
@@ -91972,8 +92080,9 @@ impl App {
 
         let creative_lut_active = self.creative_lut_requires_final_effect(params);
         if !self.post_filter_bypassed && (params.colorize.is_enabled() || creative_lut_active) {
-            return self
-                .start_final_effect_worker(ctx, final_key, params, sharpened, edit_size, complete);
+            return self.start_final_effect_worker(
+                ctx, final_key, params, sharpened, edit_size, complete, true,
+            );
         }
 
         let t_post0 = perf_on.then(std::time::Instant::now);
@@ -92015,6 +92124,7 @@ impl App {
                 pixels: post_filtered,
                 texture: texture.clone(),
                 complete,
+                ai_applied: true,
             },
         );
         crate::logger::log(format!(
@@ -92184,10 +92294,10 @@ impl App {
         };
         let fc_adjust_ms = t_adjust0.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
 
-        let (base_pixels, complete, base_used_upscale) = match (ai_key, ai_ready) {
-            (Some(_), Some(entry)) => (entry.pixels, true, entry.used_upscale),
+        let (base_pixels, complete, base_used_upscale, ai_applied) = match (ai_key, ai_ready) {
+            (Some(_), Some(entry)) => (entry.pixels, true, entry.used_upscale, true),
             (Some(key), None) if self.final_ai_failed.contains(&key) => {
-                (Arc::clone(&adjusted), true, false)
+                (Arc::clone(&adjusted), true, false, false)
             }
             (Some(key), None) => {
                 // Raster PDF が native 再レンダ待ち/進行中なら、捨てる display-fit 結果へ
@@ -92212,9 +92322,9 @@ impl App {
                     // runtime 初期化失敗 / モデル不在で何も立てずに return する経路)。
                     self.maybe_start_final_ai(idx, key, Arc::clone(&adjusted), params.clone(), true)
                 };
-                (Arc::clone(&adjusted), !ai_will_arrive, false)
+                (Arc::clone(&adjusted), !ai_will_arrive, false, false)
             }
-            (None, _) => (Arc::clone(&adjusted), true, false),
+            (None, _) => (Arc::clone(&adjusted), true, false, false),
         };
 
         // 最終表示段スマートシャープ: 色調補正 → final AI → **ここ** → post_filter。
@@ -92244,6 +92354,7 @@ impl App {
                 sharpened,
                 edit_pixels.size,
                 complete,
+                ai_applied,
             );
         }
 
@@ -92305,6 +92416,7 @@ impl App {
                 pixels: post_filtered,
                 texture: texture.clone(),
                 complete,
+                ai_applied,
             },
         );
         if perf_on {

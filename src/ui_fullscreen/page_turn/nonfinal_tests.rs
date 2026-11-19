@@ -267,6 +267,7 @@ fn resident_incomplete_final_is_displayable_and_does_not_need_completion_at_acce
         final_key,
         crate::app::FinalCompositeEntry {
             complete: false,
+            ai_applied: false,
             ..entry
         },
     );

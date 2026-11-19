@@ -19718,7 +19718,7 @@ struct FsTopBarPageInfo {
     image_downscaled: bool,
     pdf_content_type: Option<PdfPageContentType>,
     /// このページ自身へ適用される AI 処理名と処理後サイズ。
-    ai_upscale_info: Option<(String, u32, u32)>,
+    ai_upscale_info: Option<(String, crate::app::DisplayedFinalAiState)>,
 }
 
 fn top_bar_info_text(
@@ -19732,7 +19732,7 @@ fn top_bar_info_text(
         let ai_info = page
             .ai_upscale_info
             .as_ref()
-            .map(|(label, width, height)| (label.as_str(), *width, *height));
+            .map(|(label, state)| (label.as_str(), *state));
         build_info_text(
             page.image_dims,
             page.image_file_size,
@@ -30105,7 +30105,7 @@ impl App {
                                     SpreadPair::Single => {
                                         let mut info = state.top_bar_page_info();
                                         info.ai_upscale_info =
-                                            self.top_bar_ai_upscale_info(fs_idx, info.image_dims);
+                                            self.top_bar_ai_upscale_info(fs_idx);
                                         vec![info]
                                     }
                                     SpreadPair::Double { left, right } => [left, right]
@@ -30114,7 +30114,7 @@ impl App {
                                             if idx == fs_idx {
                                                 let mut info = state.top_bar_page_info();
                                                 info.ai_upscale_info = self
-                                                    .top_bar_ai_upscale_info(idx, info.image_dims);
+                                                    .top_bar_ai_upscale_info(idx);
                                                 info
                                             } else {
                                                 self.cached_top_bar_page_info(idx)
@@ -32973,7 +32973,7 @@ impl App {
             },
             ai_upscale_info: None,
         };
-        info.ai_upscale_info = self.top_bar_ai_upscale_info(idx, info.image_dims);
+        info.ai_upscale_info = self.top_bar_ai_upscale_info(idx);
         info
     }
 
@@ -32983,72 +32983,21 @@ impl App {
     fn top_bar_ai_upscale_info(
         &self,
         idx: usize,
-        image_dims: Option<(u32, u32)>,
-    ) -> Option<(String, u32, u32)> {
+    ) -> Option<(String, crate::app::DisplayedFinalAiState)> {
+        let state = self.displayed_final_ai_state(idx);
+        if state == crate::app::DisplayedFinalAiState::NotRequested {
+            return None;
+        }
         let params = self.effective_params(idx);
-        let upscale_request = if matches!(
-            self.settings.ai_feature_mode,
-            crate::settings::AiFeatureMode::Disabled
-        ) {
-            None
-        } else {
-            match params.upscale_model_kind() {
-                Some(Some(kind)) if self.settings.ai_feature_mode.allows_upscale_model(kind) => {
-                    Some(Some(kind))
-                }
-                Some(None) => Some(None),
-                _ => None,
-            }
-        };
-        let denoise = self
-            .settings
-            .ai_feature_mode
-            .allows_denoise()
-            .then(|| params.denoise_model_kind())
-            .flatten();
-        if upscale_request.is_none() && denoise.is_none() {
-            return None;
-        }
-
-        let mut labels = Vec::new();
-        if let Some(kind) = denoise {
-            labels.push(kind.display_label().to_string());
-        }
-        if let Some(request) = upscale_request {
-            labels.push(match request {
-                Some(kind) => kind.display_label().to_string(),
-                None => self
-                    .ai_classify_cache
-                    .get(&idx)
-                    .map(|category| category.display_label().to_string())
-                    .unwrap_or_else(|| "自動".to_string()),
-            });
-        }
-
-        let (width, height) = if let Some(texture) = self.current_final_composite_texture(idx) {
-            let size = texture.size_vec2();
-            (size.x as u32, size.y as u32)
-        } else if upscale_request.is_some() {
-            let (width, height) = image_dims?;
-            if !crate::ai::upscale::should_process_rect(
-                width,
-                height,
-                self.settings.ai_upscale_limit(),
-            ) {
-                return None;
-            }
-            let (mut width, mut height) = (width.saturating_mul(4), height.saturating_mul(4));
-            let max_dim = crate::app::MAX_TEXTURE_DIM as u32;
-            if width.max(height) > max_dim {
-                let scale = max_dim as f64 / width.max(height) as f64;
-                width = ((width as f64 * scale).round() as u32).max(1);
-                height = ((height as f64 * scale).round() as u32).max(1);
-            }
-            (width, height)
-        } else {
-            return None;
-        };
-        Some((labels.join(" + "), width, height))
+        Some((
+            self.ai_request_label(
+                idx,
+                self.effective_denoise_request(params),
+                self.effective_upscale_request(params),
+                false,
+            ),
+            state,
+        ))
     }
 
     /// フルスクリーンビューポートの ViewportBuilder を構築する。
@@ -54524,7 +54473,7 @@ impl App {
             let row_ai_info = page
                 .ai_upscale_info
                 .as_ref()
-                .map(|(label, width, height)| (label.as_str(), *width, *height));
+                .map(|(label, state)| (label.as_str(), *state));
             let info_text = top_bar_info_text(page, is_video, video_meta);
             let (path_font_size, info_font_size, row_y) = if two_rows {
                 (
@@ -55249,26 +55198,41 @@ impl App {
     /// 現在有効な AI 処理のモデル名を結合して返す。
     /// `show_auto_prefix` が true の場合、自動選択時に「自動: 」プレフィックスを付ける。
     fn ai_model_label(&self, fs_idx: usize, show_auto_prefix: bool) -> String {
+        self.ai_request_label(
+            fs_idx,
+            self.ai_denoise_model,
+            self.ai_upscale_enabled
+                .then_some(self.ai_upscale_model_override),
+            show_auto_prefix,
+        )
+    }
+
+    fn ai_request_label(
+        &self,
+        idx: usize,
+        denoise: Option<crate::ai::ModelKind>,
+        upscale: Option<Option<crate::ai::ModelKind>>,
+        show_auto_prefix: bool,
+    ) -> String {
         let mut labels = Vec::new();
-        if let Some(denoise_kind) = self.ai_denoise_model {
-            labels.push(denoise_kind.display_label().to_string());
+        if let Some(kind) = denoise {
+            labels.push(kind.display_label().to_string());
         }
-        if self.ai_upscale_enabled {
-            let upscale_label = match self.ai_upscale_model_override {
-                Some(k) => k.display_label().to_string(),
+        if let Some(request) = upscale {
+            labels.push(match request {
+                Some(kind) => kind.display_label().to_string(),
                 None => self
                     .ai_classify_cache
-                    .get(&fs_idx)
-                    .map(|c| {
+                    .get(&idx)
+                    .map(|category| {
                         if show_auto_prefix {
-                            format!("自動: {}", c.display_label())
+                            format!("自動: {}", category.display_label())
                         } else {
-                            c.display_label().to_string()
+                            category.display_label().to_string()
                         }
                     })
                     .unwrap_or_else(|| "自動".to_string()),
-            };
-            labels.push(upscale_label);
+            });
         }
         labels.join(" + ")
     }
@@ -55284,19 +55248,16 @@ impl App {
     /// フルスクリーン左下に AI 処理ステータスを表示する。
     fn draw_fs_ai_status(&mut self, ui: &mut egui::Ui, fs_idx: usize) {
         let has_ai_pending = !self.final_ai_pending.is_empty();
-        let is_upscaling = self
-            .final_ai_pending
-            .keys()
-            .any(|key| key.edit_key.idx == fs_idx);
+        let is_upscaling = self.final_ai_job_state(fs_idx) == crate::app::FinalAiJobState::Running;
         let is_prefetching_ai = !is_upscaling
             && self
                 .final_ai_pending
                 .keys()
                 .any(|key| key.edit_key.idx != fs_idx);
-        let is_upscaled = self
-            .final_ai_cache
-            .keys()
-            .any(|key| key.edit_key.idx == fs_idx);
+        let is_upscaled = matches!(
+            self.displayed_final_ai_state(fs_idx),
+            crate::app::DisplayedFinalAiState::Applied { .. }
+        );
         let is_loading = self.fs_pending.contains_key(&fs_idx);
         let raw_indicator = self
             .settings
@@ -94056,7 +94017,13 @@ mod tests {
             Some((7168, 9216)),
             None,
             true,
-            Some(("漫画", 28672, 36864)),
+            Some((
+                "漫画",
+                crate::app::DisplayedFinalAiState::Applied {
+                    width: 28672,
+                    height: 36864,
+                },
+            )),
             None,
         );
         let ai_end = s.find(')').expect("AI closing paren exists");
@@ -94078,6 +94045,42 @@ mod tests {
     }
 
     #[test]
+    fn info_text_ai_states_use_observed_status_and_only_applied_has_dimensions() {
+        use crate::app::{DisplayedFinalAiState as D, NotAppliedReason as R};
+        for (state, suffix) in [
+            (D::NotRequested, ""),
+            (
+                D::Applied {
+                    width: 4800,
+                    height: 6400,
+                },
+                " (AI 処理済み: 漫画 4800×6400)",
+            ),
+            (D::Processing, " (AI 処理中: 漫画)"),
+            (D::Waiting, " (AI 処理待ち: 漫画)"),
+            (
+                D::NotApplied(R::SizeLimit),
+                " (AI 未適用: 漫画、大きさの上限)",
+            ),
+            (D::NotApplied(R::Failed), " (AI 未適用: 漫画、失敗)"),
+            (D::NotApplied(R::Unavailable), " (AI 未適用: 漫画)"),
+            (
+                D::NotApplied(R::Animated),
+                " (AI 未適用: 漫画、アニメーション)",
+            ),
+        ] {
+            assert_eq!(
+                build_info_text(Some((1200, 1600)), None, false, Some(("漫画", state)), None),
+                format!("1200 × 1600{suffix}")
+            );
+        }
+        assert_eq!(
+            build_info_text(None, None, false, Some(("自動", D::Waiting)), None),
+            "(AI 処理待ち: 自動)"
+        );
+    }
+
+    #[test]
     fn spread_top_bar_keeps_ai_model_for_both_page_rows() {
         let pages = [
             FsTopBarPageInfo {
@@ -94086,7 +94089,13 @@ mod tests {
                 image_file_size: Some(100),
                 image_downscaled: false,
                 pdf_content_type: None,
-                ai_upscale_info: Some(("高速汎用".to_string(), 2560, 1920)),
+                ai_upscale_info: Some((
+                    "高速汎用".to_string(),
+                    crate::app::DisplayedFinalAiState::Applied {
+                        width: 2560,
+                        height: 1920,
+                    },
+                )),
             },
             FsTopBarPageInfo {
                 location_display: "right.png".to_string(),
@@ -94094,7 +94103,10 @@ mod tests {
                 image_file_size: Some(200),
                 image_downscaled: false,
                 pdf_content_type: None,
-                ai_upscale_info: Some(("漫画".to_string(), 3200, 2400)),
+                ai_upscale_info: Some((
+                    "漫画".to_string(),
+                    crate::app::DisplayedFinalAiState::Processing,
+                )),
             },
         ];
 
@@ -94103,7 +94115,85 @@ mod tests {
             .map(|page| top_bar_info_text(page, false, None))
             .collect::<Vec<_>>();
         assert!(rows[0].contains("高速汎用 2560×1920"), "{}", rows[0]);
-        assert!(rows[1].contains("漫画 3200×2400"), "{}", rows[1]);
+        assert!(rows[1].contains("AI 処理中: 漫画"), "{}", rows[1]);
+    }
+
+    #[test]
+    fn top_bar_ai_label_uses_each_pages_effective_request_and_existing_classification() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![
+            GridItem::Image(std::path::PathBuf::from("C:/hud/left.png")),
+            GridItem::Image(std::path::PathBuf::from("C:/hud/right.png")),
+        ];
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+        app.settings.global_preset.upscale_model = Some("auto".into());
+        app.settings.global_preset.denoise_model =
+            Some(crate::ai::ModelKind::DenoiseRealplksr.as_str().into());
+        let denoise = crate::ai::ModelKind::DenoiseRealplksr.display_label();
+        let mut right = app.settings.global_preset.clone();
+        right.upscale_model = None;
+        right.denoise_model = None;
+        app.adjustment_page_params.insert(1, right);
+        assert_eq!(
+            app.top_bar_ai_upscale_info(0).unwrap().0,
+            format!("{denoise} + 自動")
+        );
+        app.ai_classify_cache
+            .insert(0, crate::ai::ImageCategory::Comic);
+        assert_eq!(
+            app.top_bar_ai_upscale_info(0).unwrap().0,
+            format!("{denoise} + 漫画")
+        );
+        assert!(app.top_bar_ai_upscale_info(1).is_none());
+        // Existing lower-left wording continues to use the current runtime request.
+        app.sync_upscale_from_preset(0);
+        assert_eq!(
+            app.ai_model_label(0, true),
+            format!("{denoise} + 自動: 漫画")
+        );
+    }
+
+    #[test]
+    fn fs_ai_status_old_same_idx_cache_does_not_show_complete() {
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(std::path::PathBuf::from(
+            "C:/hud/stale.png",
+        ))];
+        app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+        app.settings.global_preset.upscale_model = Some("realesr_general_v3".into());
+        let mut key = app
+            .final_ai_key_for_pixels(
+                app.current_edit_result_key(0),
+                [4, 6],
+                app.effective_params(0),
+            )
+            .unwrap();
+        key.edit_key.source_gen = key.edit_key.source_gen.wrapping_add(1);
+        app.final_ai_cache.insert(
+            key,
+            crate::app::FinalAiEntry {
+                diagnostic_metadata: None,
+                canonical_dims: None,
+                source_size: [4, 6],
+                pixels: Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::WHITE)),
+                used_upscale: true,
+            },
+        );
+        let content = fs_ai_status_content(
+            true,
+            true,
+            FsAiStatusSignals {
+                is_upscaling: app.final_ai_job_state(0) == crate::app::FinalAiJobState::Running,
+                is_prefetching_ai: false,
+                is_upscaled: matches!(
+                    app.displayed_final_ai_state(0),
+                    crate::app::DisplayedFinalAiState::Applied { .. }
+                ),
+                erase_complete: false,
+                has_prefetch_indicator: false,
+            },
+        );
+        assert!(!content.lines.contains(&FsAiStatusLine::Complete));
     }
 
     #[cfg(windows)]

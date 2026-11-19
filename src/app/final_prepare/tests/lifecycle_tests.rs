@@ -350,6 +350,7 @@ fn d3_2_legacy_colorize_and_lut_computing_channel_survives_real_park() {
                         state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                         items_generation: owner.items_generation,
                         output_complete: true,
+                        ai_applied: false,
                         nearest_sampler: false,
                         origin: FinalEffectOrigin::LegacyDisplay,
                         gpu_diagnostics: Default::default(),
@@ -1098,13 +1099,14 @@ fn back_pressure_protects_previous_unit_material_shared_with_current_cover() {
         .unwrap();
     assert_eq!(previous.pages.len(), 1);
     assert_eq!(previous.pages[0].idx, 0);
-    let (key, pixels, size, plan) = app.final_prepare_plan_from_resident(0).unwrap();
+    let (key, pixels, size, plan, ai_applied) = app.final_prepare_plan_from_resident(0).unwrap();
     assert!(app.spawn_prepared_final_job(
         &ctx,
         key,
         pixels,
         size,
         plan,
+        ai_applied,
         previous.clone(),
         &mut false
     ));

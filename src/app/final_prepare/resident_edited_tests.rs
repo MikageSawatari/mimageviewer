@@ -174,7 +174,7 @@ fn e3_highest_complete_cumulative_stage_needs_no_lower_cache() {
         let pixels = stage(&mut app, &ctx, 1, highest);
         app.fs_cache.remove(&1);
         let key = app.current_edit_result_key(1);
-        let (final_key, input, size, plan) = app.final_prepare_plan_from_resident(1).unwrap();
+        let (final_key, input, size, plan, _) = app.final_prepare_plan_from_resident(1).unwrap();
         assert_eq!(final_key.edit_key, key);
         assert_eq!(size, pixels.size);
         assert!(Arc::ptr_eq(&input, &pixels));
@@ -211,7 +211,7 @@ fn e3_missing_upper_or_unhydrated_local_never_promotes_lower_fallback() {
     app.conceal_cache.clear();
     local_layers(&mut app, 1, false);
     app.local_adjust_cache.clear();
-    let (_, pixels, _, _) = app.final_prepare_plan_from_resident(1).unwrap();
+    let (_, pixels, _, _, _) = app.final_prepare_plan_from_resident(1).unwrap();
     assert!(
         Arc::ptr_eq(&erase, &pixels),
         "hydrated disabled layers need no stage"
@@ -332,7 +332,7 @@ fn e3_previous_uses_the_same_resident_plan_without_starting_edit_producers() {
     assert!(app.local_adjust_pending.is_empty());
     assert!(app.final_effect_pending.is_empty());
     local_layers(&mut app, 1, false);
-    let (key, input, size, _) = app.final_prepare_plan_from_resident(1).unwrap();
+    let (key, input, size, _, _) = app.final_prepare_plan_from_resident(1).unwrap();
     assert_eq!(size, input.size);
     assert!(app.prefetch_previous_final_unit(&ctx));
     assert_eq!(wait_ready(&mut app, 1), key);
@@ -348,7 +348,8 @@ fn e3_after_ai_freezes_pre_ai_size_and_never_reapplies_tone() {
     let mut app = app(&ctx);
     let pixels = after_ai(&mut app, 1);
     app.fs_cache.remove(&1);
-    let (key, input, size, plan) = app.final_prepare_plan_from_resident(1).unwrap();
+    let (key, input, size, plan, ai_applied) = app.final_prepare_plan_from_resident(1).unwrap();
+    assert!(ai_applied);
     assert!(Arc::ptr_eq(&pixels, &input));
     assert_eq!(size, [12, 18]);
     assert_eq!(
@@ -363,7 +364,16 @@ fn e3_after_ai_freezes_pre_ai_size_and_never_reapplies_tone() {
     assert!(start(&mut app, &ctx, 1));
     assert_eq!(wait_ready(&mut app, 1), key);
     assert_eq!(app.final_effect_pending[&key].source_size, size);
-    app.cancel_final_effects_for_idx(1);
+    assert!(app.final_effect_pending[&key].ai_applied);
+    app.fullscreen_idx = Some(1);
+    begin_registration_frame(&mut app, 1);
+    assert!(app.ensure_final_composite_texture(&ctx, 1).is_some());
+    assert!(
+        app.exact_complete_final_composite_entry(1)
+            .unwrap()
+            .1
+            .ai_applied
+    );
 }
 
 #[test]

@@ -209,7 +209,7 @@ fn legacy_prefetch(app: &mut App, ctx: &egui::Context, idx: usize, lut: bool) ->
         app.final_composite_key_for_pixels(app.current_edit_result_key(idx), pixels.size, &params);
     let size = pixels.size;
     let plan = build_final_composite_plan_without_ai(&params, app.resolved_creative_lut(&params));
-    assert!(app.spawn_final_effect_job(ctx, key, pixels, size, plan, true, true));
+    assert!(app.spawn_final_effect_job(ctx, key, pixels, size, plan, true, true, false));
     assert!(matches!(
         app.final_effect_pending[&key].origin,
         FinalEffectOrigin::LegacyPrefetch
@@ -363,6 +363,7 @@ fn d3_4_legacy_computing_display_promotes_original_receiver_without_blocking() {
                 state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                 items_generation,
                 output_complete: true,
+                ai_applied: false,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyPrefetch,
                 gpu_diagnostics: Default::default(),
@@ -427,6 +428,7 @@ fn d3_4_incomplete_legacy_display_keeps_the_ordinary_quality_producer_path() {
                         state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
                         items_generation,
                         output_complete: false,
+                        ai_applied: false,
                         nearest_sampler: false,
                         origin: FinalEffectOrigin::LegacyPrefetch,
                         gpu_diagnostics: Default::default(),

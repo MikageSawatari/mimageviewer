@@ -228,6 +228,7 @@ fn install(
             })),
             items_generation: app.items_generation,
             output_complete: true,
+            ai_applied: false,
             nearest_sampler: input.plan.needs_nearest_sampler(),
             origin: FinalEffectOrigin::Speculative(unit),
             gpu_diagnostics: final_prepare_budget::FinalPrepareGpuDiagnostics::requested("next", 0),

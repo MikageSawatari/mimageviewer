@@ -237,6 +237,7 @@ fn paged_prefetch_retained_cover_becomes_resident_with_zero_inference_budget() {
         FsPageLoadState::DisplayReady(FsPageDisplaySource::RetainedPdfFinalAi)
     );
     assert!(app.is_idx_final_ai_done_or_skipped(0));
+    assert_eq!(app.final_ai_job_state(0), FinalAiJobState::Ready);
     let retained_bytes = app.retained_cross_session_cache_bytes();
     app.prefetch_retained_paged_composites(&ctx, 19);
     assert!(app.final_effect_pending.contains_key(&key));
@@ -498,6 +499,7 @@ fn paged_prefetch_reconcile_warm_and_poll_preserve_sibling_cache_and_channels() 
                 state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(effect_rx)),
                 items_generation: generation,
                 output_complete: true,
+                ai_applied: false,
                 nearest_sampler: false,
                 origin: FinalEffectOrigin::LegacyPrefetch,
                 gpu_diagnostics: Default::default(),

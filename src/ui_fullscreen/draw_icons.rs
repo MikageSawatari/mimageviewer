@@ -1384,7 +1384,7 @@ pub(super) fn draw_fs_bar_info_text(
     image_dims: Option<(u32, u32)>,
     image_file_size: Option<u64>,
     image_downscaled: bool,
-    ai_upscale_info: Option<(&str, u32, u32)>,
+    ai_upscale_info: Option<(&str, crate::app::DisplayedFinalAiState)>,
     pdf_content_type: Option<PdfPageContentType>,
 ) {
     let text = build_info_text(
@@ -1446,7 +1446,7 @@ pub(super) fn build_info_text(
     image_dims: Option<(u32, u32)>,
     image_file_size: Option<u64>,
     image_downscaled: bool,
-    ai_upscale_info: Option<(&str, u32, u32)>,
+    ai_upscale_info: Option<(&str, crate::app::DisplayedFinalAiState)>,
     pdf_content_type: Option<PdfPageContentType>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -1460,16 +1460,37 @@ pub(super) fn build_info_text(
             }
         }
     }
-    if let Some((w, h)) = image_dims {
-        let mut dims_part = if let Some((model_name, ai_w, ai_h)) = ai_upscale_info {
-            // AI アップスケール情報: "11 × 22 (漫画 44×88)"
-            format!("{w} × {h} ({model_name} {ai_w}×{ai_h})")
-        } else {
-            format!("{w} × {h}")
+    let mut dims_part = image_dims
+        .map(|(w, h)| format!("{w} × {h}"))
+        .unwrap_or_default();
+    if let Some((label, state)) = ai_upscale_info {
+        use crate::app::{DisplayedFinalAiState as D, NotAppliedReason as R};
+        let ai = match state {
+            D::NotRequested => String::new(),
+            D::Applied { width, height } => format!("(AI 処理済み: {label} {width}×{height})"),
+            D::Processing => format!("(AI 処理中: {label})"),
+            D::Waiting => format!("(AI 処理待ち: {label})"),
+            D::NotApplied(reason) => {
+                let reason = match reason {
+                    R::SizeLimit => "、大きさの上限",
+                    R::Failed => "、失敗",
+                    R::Animated => "、アニメーション",
+                    R::Unavailable => "",
+                };
+                format!("(AI 未適用: {label}{reason})")
+            }
         };
-        if image_downscaled {
-            dims_part.push_str(DOWNSCALE_MARKER);
+        if !ai.is_empty() {
+            if !dims_part.is_empty() {
+                dims_part.push(' ');
+            }
+            dims_part.push_str(&ai);
         }
+    }
+    if image_downscaled && image_dims.is_some() {
+        dims_part.push_str(DOWNSCALE_MARKER);
+    }
+    if !dims_part.is_empty() {
         parts.push(dims_part);
     }
     if let Some(bytes) = image_file_size {

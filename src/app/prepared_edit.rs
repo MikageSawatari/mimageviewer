@@ -934,6 +934,7 @@ impl App {
                     canonical_dims: input.canonical,
                     source_size: input.source_size,
                     complete: true,
+                    ai_applied: matches!(input.final_input, PreparedFinalInput::AfterAi(_)),
                 },
             );
             self.final_composite_cache
@@ -1593,6 +1594,7 @@ impl App {
                 }),
                 items_generation: self.items_generation,
                 output_complete: true,
+                ai_applied: matches!(input.final_input, PreparedFinalInput::AfterAi(_)),
                 nearest_sampler: input.plan.needs_nearest_sampler(),
                 origin: FinalEffectOrigin::Speculative(unit),
                 gpu_diagnostics: final_prepare_budget::FinalPrepareGpuDiagnostics::requested(

@@ -379,6 +379,7 @@ impl App {
         Arc<egui::ColorImage>,
         [usize; 2],
         FinalCompositePlan,
+        bool,
     )> {
         let params = self.effective_params(idx);
         let lut = self.resolved_creative_lut(params);
@@ -394,6 +395,7 @@ impl App {
                     pixels,
                     source_size,
                     build_final_composite_plan_after_ai(params, lut, used_upscale),
+                    true,
                 ));
             }
             ResidentFinalPrepareInput::ResidentEdited { key, pixels }
@@ -417,6 +419,7 @@ impl App {
             pixels.clone(),
             pixels.size,
             build_final_composite_plan_without_ai(params, lut),
+            false,
         ))
     }
 
@@ -462,7 +465,8 @@ impl App {
             if self.exact_complete_final_composite_entry(idx).is_some() {
                 continue;
             }
-            let Some((key, source, source_size, plan)) = self.final_prepare_plan_from_resident(idx)
+            let Some((key, source, source_size, plan, ai_applied)) =
+                self.final_prepare_plan_from_resident(idx)
             else {
                 continue;
             };
@@ -475,6 +479,7 @@ impl App {
                 source,
                 source_size,
                 plan,
+                ai_applied,
                 unit.clone(),
                 &mut reclaim_attempted,
             ) {
@@ -759,7 +764,8 @@ impl App {
             if self.resident_final_prepare_texture(ctx, page.idx).is_some() {
                 continue;
             }
-            let Some((key, pixels, size, plan)) = self.final_prepare_plan_from_resident(page.idx)
+            let Some((key, pixels, size, plan, ai_applied)) =
+                self.final_prepare_plan_from_resident(page.idx)
             else {
                 continue;
             };
@@ -772,6 +778,7 @@ impl App {
                 pixels,
                 size,
                 plan,
+                ai_applied,
                 unit.clone(),
                 &mut reclaim_attempted,
             ) {
@@ -824,6 +831,7 @@ impl App {
         source: Arc<egui::ColorImage>,
         source_size: [usize; 2],
         plan: FinalCompositePlan,
+        ai_applied: bool,
         unit: FinalPrepareUnit,
         reclaim_attempted: &mut bool,
     ) -> bool {
@@ -861,7 +869,7 @@ impl App {
                 != Some(&unit)
                 || self
                     .final_prepare_plan_from_resident(key.edit_key.idx)
-                    .is_none_or(|(current, _, _, _)| current != key)
+                    .is_none_or(|(current, _, _, _, _)| current != key)
             {
                 return false;
             }
@@ -1046,6 +1054,7 @@ impl App {
                         }),
                         items_generation: self.items_generation,
                         output_complete: true,
+                        ai_applied,
                         nearest_sampler,
                         origin: FinalEffectOrigin::Speculative(unit),
                         gpu_diagnostics:
