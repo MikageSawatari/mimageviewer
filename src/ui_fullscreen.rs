@@ -34607,6 +34607,8 @@ impl App {
                     crate::key_input::SyntheticNavigationKey::Tab => KeyName::Tab,
                     #[cfg(test)]
                     crate::key_input::SyntheticNavigationKey::Space => KeyName::Space,
+                    #[cfg(test)]
+                    crate::key_input::SyntheticNavigationKey::K => KeyName::K,
                 };
                 crate::test_script::KeymapLevelObservation {
                     frame_nr: observation.frame_nr,
