@@ -1,6 +1,6 @@
 # AI 連携 (MCP) ツール拡充の候補 (§1.740)
 
-状態: **候補の洗い出しだけ (2026-11-11)。実装は範囲が決まってから別に行う。** 範囲は利用者と相談して決める
+状態: **案 A を v5.5.0 の目標として設計中 (2026-11-19)。設計は [mcp-integration-plan.md](mcp-integration-plan.md) §43。** 以前の状態: 候補の洗い出しだけ (2026-11-11)。 範囲は利用者と相談して決める
 (利用者決定 2026-11-10、[backlog §1.740](next-release-backlog.md))。
 
 この文書の根拠はすべて **コードと設計書の読み取り** (`crates/mcp-server/src/schema.rs`・`crates/agent-ipc/src/lib.rs`・
