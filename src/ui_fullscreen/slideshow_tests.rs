@@ -4,95 +4,42 @@ use crate::ring_shortcut::{RingActionId, RingShortcutContext};
 use std::time::{Duration, Instant};
 
 #[test]
-fn slideshow_progress_ring_keeps_default_position_without_panel_overlap() {
-    let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 700.0));
-    let panel = egui::Rect::from_min_size(egui::pos2(688.0, 60.0), egui::vec2(300.0, 400.0));
+fn slideshow_progress_uses_current_anchor_and_omits_stopped_or_continuous_reading() {
+    let ctx = egui::Context::default();
+    let mut app = page_turn_submission_tests::ready_app(&ctx, SpreadMode::Single);
+    let now = Instant::now();
+    app.settings.slideshow_interval_secs = 4.0;
+    app.slideshow_playing = false;
+    assert!(app.slideshow_progress(now).is_none());
+    app.slideshow_playing = true;
+    app.slideshow_anchor_idx = None;
     assert_eq!(
-        slideshow_progress_ring_center(full, None),
-        egui::pos2(978.0, 22.0)
+        app.slideshow_progress(now),
+        Some((0.0, Duration::from_millis(100)))
     );
+    app.slideshow_anchor_idx = app.fullscreen_idx;
+    app.slideshow_next_at = now + Duration::from_secs(2);
     assert_eq!(
-        slideshow_progress_ring_center(full, Some(panel)),
-        egui::pos2(978.0, 22.0)
+        app.slideshow_progress(now),
+        Some((0.5, Duration::from_millis(100)))
     );
-    let content = egui::Rect::from_min_max(egui::pos2(0.0, 44.0), full.max);
+    let (fraction, delay) = app
+        .slideshow_progress(now + Duration::from_millis(1950))
+        .unwrap();
+    assert!((fraction - 0.9875).abs() < 0.00001);
+    assert_eq!(delay, Duration::from_millis(50));
     assert_eq!(
-        slideshow_progress_ring_center(content, None),
-        egui::pos2(978.0, 66.0)
+        app.slideshow_progress(now + Duration::from_secs(3)),
+        Some((1.0, Duration::ZERO))
     );
-    let far_panel = panel.translate(egui::vec2(-400.0, 0.0));
+    app.fullscreen_idx = Some(1);
     assert_eq!(
-        slideshow_progress_ring_center(content, Some(far_panel)),
-        egui::pos2(978.0, 66.0)
+        app.slideshow_progress(now),
+        Some((0.0, Duration::from_millis(100)))
     );
-}
-
-#[test]
-fn slideshow_progress_ring_avoids_expanded_and_collapsed_panel_with_locked_top_bar() {
-    let content = egui::Rect::from_min_max(egui::pos2(0.0, 44.0), egui::pos2(1000.0, 700.0));
-    for height in [30.0, 400.0] {
-        let panel = egui::Rect::from_min_size(egui::pos2(688.0, 60.0), egui::vec2(300.0, height));
-        let center = slideshow_progress_ring_center(content, Some(panel));
-        assert_eq!(center, egui::pos2(676.0, 66.0));
-        let ring = egui::Rect::from_center_size(center, egui::Vec2::splat(16.0));
-        assert!(!ring.intersects(panel));
-        assert_eq!(panel.left() - ring.right(), 4.0);
-    }
-}
-
-#[test]
-fn slideshow_progress_ring_keeps_original_position_when_left_margin_does_not_fit() {
-    for width in [319.0_f32, 320.0, 321.0, 335.0] {
-        let content = egui::Rect::from_min_max(egui::pos2(0.0, 44.0), egui::pos2(width, 700.0));
-        let panel_width = 300.0_f32.min(width - 24.0);
-        for height in [30.0, 400.0] {
-            let panel = egui::Rect::from_min_size(
-                egui::pos2(width - panel_width - 12.0, 60.0),
-                egui::vec2(panel_width, height),
-            );
-            let center = slideshow_progress_ring_center(content, Some(panel));
-            assert_eq!(center, egui::pos2(width - 22.0, 66.0));
-            assert!(content.contains_rect(egui::Rect::from_center_size(
-                center,
-                egui::Vec2::splat(24.0)
-            )));
-            assert!(panel.intersects(egui::Rect::from_center_size(
-                center,
-                egui::Vec2::splat(16.0)
-            )));
-        }
-    }
-}
-
-#[test]
-fn slideshow_progress_ring_uses_left_when_full_margin_exactly_fits() {
-    let content = egui::Rect::from_min_max(egui::pos2(0.0, 44.0), egui::pos2(336.0, 700.0));
-    let panel = egui::Rect::from_min_size(egui::pos2(24.0, 60.0), egui::vec2(300.0, 400.0));
-    let center = slideshow_progress_ring_center(content, Some(panel));
-    assert_eq!(center, egui::pos2(12.0, 66.0));
-    assert!(content.contains_rect(egui::Rect::from_center_size(
-        center,
-        egui::Vec2::splat(24.0)
-    )));
-    assert!(!panel.intersects(egui::Rect::from_center_size(
-        center,
-        egui::Vec2::splat(16.0)
-    )));
-}
-
-#[test]
-fn slideshow_progress_ring_keeps_original_position_with_tall_panel_in_narrow_content() {
-    for width in [319.0_f32, 320.0, 321.0] {
-        let content = egui::Rect::from_min_max(egui::pos2(0.0, 44.0), egui::pos2(width, 700.0));
-        let panel =
-            egui::Rect::from_min_size(egui::pos2(12.0, 60.0), egui::vec2(width - 24.0, 620.0));
-        let center = slideshow_progress_ring_center(content, Some(panel));
-        assert_eq!(center, egui::pos2(width - 22.0, 66.0));
-        assert!(panel.intersects(egui::Rect::from_center_size(
-            center,
-            egui::Vec2::splat(16.0)
-        )));
-    }
+    app.reading_flow = ReadingFlow::Vertical;
+    assert!(app.continuous_reading_active_for_idx(1));
+    assert!(app.slideshow_progress(now).is_none());
 }
 
 #[derive(Clone, Copy, Debug)]

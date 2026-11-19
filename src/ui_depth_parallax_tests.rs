@@ -14,6 +14,8 @@ struct State {
     changes: usize,
     toggle_discards: usize,
     inputless_rebuilds: usize,
+    slideshow_progress: Option<f32>,
+    slideshow_progress_after_draw: Option<Option<f32>>,
     panel: Option<super::DepthPanelResponse>,
 }
 
@@ -33,12 +35,17 @@ fn harness_with_initial_collapse(
             |ui, state: &mut State| {
                 if !state.hidden {
                     assert_eq!(ui.ctx().options(|options| options.max_passes.get()), 2);
-                    let panel = super::draw_depth_parallax_panel(
+                    let panel = super::draw_depth_parallax_panel_with_export(
                         ui.ctx(),
                         &mut state.settings,
                         "",
+                        false,
                         Some("I / Tab: パネルを隠す・出す".into()),
+                        state.slideshow_progress,
                     );
+                    if let Some(progress) = state.slideshow_progress_after_draw {
+                        panel.set_slideshow_progress(progress);
+                    }
                     state.close_requested |= panel.close_requested;
                     state.focus_adjustments += usize::from(panel.focus_adjusting);
                     state.changes += usize::from(panel.changed);
@@ -61,6 +68,102 @@ fn harness_with_initial_collapse(
                 ..State::default()
             },
         )
+}
+
+fn progress_circles_in_rect(shapes: &[egui::epaint::ClippedShape], rect: egui::Rect) -> usize {
+    fn count(shape: &egui::Shape, rect: egui::Rect) -> usize {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().map(|shape| count(shape, rect)).sum(),
+            egui::Shape::Circle(circle)
+                if circle.radius > 0.0
+                    && circle.radius <= 9.0
+                    && circle.center.distance(rect.center()) < 0.01 =>
+            {
+                assert!(rect.contains_rect(egui::Rect::from_center_size(
+                    circle.center,
+                    egui::Vec2::splat(circle.radius * 2.0),
+                )));
+                1
+            }
+            _ => 0,
+        }
+    }
+    shapes.iter().map(|shape| count(&shape.shape, rect)).sum()
+}
+
+#[test]
+fn depth_panel_slideshow_progress_stays_inside_header_and_is_not_clickable() {
+    for size in [egui::vec2(1093., 614.), egui::vec2(546.5, 307.)] {
+        for collapsed in [false, true] {
+            for progress in [None, Some(0.65)] {
+                let mut harness = harness_with_initial_collapse(size, false, collapsed);
+                harness.state_mut().slideshow_progress = progress;
+                harness.run();
+                let panel = harness.state().panel.as_ref().unwrap();
+                let rect = panel.slideshow_progress_rect;
+                let title = harness
+                    .get_by_role_and_label(egui::accesskit::Role::Button, "3D 写真")
+                    .rect();
+                assert!(rect.width() > 0. && rect.width() <= 18.);
+                assert!(rect.height() > 0. && rect.height() <= 18.);
+                assert!(panel.header_rect.contains_rect(rect));
+                assert!(rect.left() >= title.right());
+                assert!(rect.right() <= panel.close_rect.left());
+                assert_eq!(
+                    progress_circles_in_rect(&harness.output().shapes, rect),
+                    usize::from(progress.is_some()),
+                );
+
+                harness.hover_at(rect.center());
+                harness.run();
+                assert_ne!(
+                    harness.output().platform_output.cursor_icon,
+                    egui::CursorIcon::PointingHand,
+                );
+                click_at(&mut harness, rect.center());
+                assert_eq!(harness.state().settings.panel_collapsed, collapsed);
+                assert_eq!(harness.state().changes, 0);
+                assert_eq!(harness.state().focus_adjustments, 0);
+                assert!(!harness.state().close_requested);
+                assert!(!harness.state().panel.as_ref().unwrap().export_requested);
+                assert_eq!(
+                    harness
+                        .state()
+                        .panel
+                        .as_ref()
+                        .unwrap()
+                        .slideshow_progress_rect,
+                    rect,
+                    "progress must not move after hover or click",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn depth_panel_slideshow_progress_replaces_the_same_frame_paint_slot() {
+    for collapsed in [false, true] {
+        for (initial, latest) in [
+            (None, Some(0.65)),
+            (Some(0.25), Some(0.65)),
+            (Some(0.65), None),
+        ] {
+            let mut harness =
+                harness_with_initial_collapse(egui::vec2(546.5, 307.), false, collapsed);
+            harness.state_mut().slideshow_progress = initial;
+            harness.state_mut().slideshow_progress_after_draw = Some(latest);
+            harness.run();
+            let panel = harness.state().panel.as_ref().unwrap();
+            assert_eq!(
+                progress_circles_in_rect(&harness.output().shapes, panel.slideshow_progress_rect),
+                usize::from(latest.is_some()),
+                "only the latest progress may remain painted: initial={initial:?}, latest={latest:?}",
+            );
+            assert_eq!(harness.state().changes, 0);
+            assert_eq!(harness.state().settings.panel_collapsed, collapsed);
+        }
+    }
 }
 
 #[test]

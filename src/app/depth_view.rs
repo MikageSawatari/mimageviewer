@@ -1360,6 +1360,7 @@ impl App {
             &status,
             export_enabled,
             panel_toggle_hint,
+            None,
         );
         ctx.data_mut(|data| data.insert_temp(self.depth_panel_rect_id(), response.rect));
         if response.changed {

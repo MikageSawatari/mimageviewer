@@ -70,6 +70,7 @@ fn harness(size: egui::Vec2) -> Harness<'static, State> {
                     "",
                     true,
                     Some("I / Tab: パネルを隠す・出す".into()),
+                    None,
                 );
                 state.panel_export = panel.export_rect;
                 if panel.changed || panel.close_requested || panel.export_requested {
