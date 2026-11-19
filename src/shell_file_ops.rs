@@ -35,16 +35,25 @@ pub fn transfer_items_async(
     let spawn_result = std::thread::Builder::new()
         .name("shell-transfer-worker".into())
         .spawn(move || {
-            let result = validate_transfer_request(request)
-                .and_then(|request| run_transfer_items(hwnd.unwrap_or_default(), request));
+            let result = transfer_items_blocking(hwnd, request);
             let _ = tx.send(result);
             wake_ctx.request_repaint();
         });
     if let Err(e) = spawn_result {
-        let _ = tx_on_spawn_error.send(Err(format!("ファイル整理 worker を開始できません: {e}")));
+        let _ = tx_on_spawn_error.send(Err(format!("移動／コピー worker を開始できません: {e}")));
         wake_on_spawn_error.request_repaint();
     }
     rx
+}
+
+/// Validate the complete request before queuing any Shell operation.
+/// This entry point blocks and must be called on a worker thread.
+pub(crate) fn transfer_items_blocking(
+    hwnd: Option<isize>,
+    request: ShellTransferRequest,
+) -> ShellTransferResult {
+    validate_transfer_request(request)
+        .and_then(|request| run_transfer_items(hwnd.unwrap_or_default(), request))
 }
 
 fn path_has_nul(path: &std::path::Path) -> bool {
@@ -71,28 +80,28 @@ fn validate_transfer_request(
     request: ShellTransferRequest,
 ) -> Result<ShellTransferRequest, String> {
     if request.sources.is_empty() {
-        return Err("整理する対象がありません".into());
+        return Err("移動／コピーする対象がありません".into());
     }
     if !request.destination.is_absolute() || path_has_nul(&request.destination) {
-        return Err("整理先には NUL を含まない絶対パスを指定してください".into());
+        return Err("移動／コピー先には NUL を含まない絶対パスを指定してください".into());
     }
     let destination = std::fs::canonicalize(&request.destination).map_err(|e| {
         format!(
-            "整理先を確認できません: {} ({e})",
+            "移動／コピー先を確認できません: {} ({e})",
             request.destination.display()
         )
     })?;
     if !std::fs::metadata(&destination)
         .map_err(|e| {
             format!(
-                "整理先を確認できません: {} ({e})",
+                "移動／コピー先を確認できません: {} ({e})",
                 request.destination.display()
             )
         })?
         .is_dir()
     {
         return Err(format!(
-            "整理先は実フォルダではありません: {}",
+            "移動／コピー先は実フォルダではありません: {}",
             request.destination.display()
         ));
     }
@@ -176,7 +185,7 @@ fn run_transfer_items(hwnd: isize, request: ShellTransferRequest) -> ShellTransf
             None::<&windows::Win32::System::Com::IBindCtx>,
         )
     }
-    .map_err(|e| format!("整理先を開けません: {e}"))?;
+    .map_err(|e| format!("移動／コピー先を開けません: {e}"))?;
     let op: IFileOperation =
         unsafe { CoCreateInstance(&FileOperation, None::<&IUnknown>, CLSCTX_INPROC_SERVER) }
             .map_err(|e| format!("IFileOperation を作成できません: {e}"))?;

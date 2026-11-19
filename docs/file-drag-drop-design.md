@@ -822,29 +822,19 @@ CLAUDE.md「コード修正時のドキュメント同時更新」に従い、�
 
 ### 11.1 仕様
 
-> ⚠ **v1.1.0 で「フォルダのドロップ受け取り」は一旦無効化した** (同名衝突の無確認
-> 上書き・再帰コピーのデータ破壊リスクのため、Explorer 相当の衝突解決と合わせて将来へ
-> 延期)。現在はドロップされたディレクトリを `file_drag::partition_dropped_paths` で
-> **全て skip** し、ファイルのみコピーする (skip 件数は notice/toast で通知)。以下の
-> 自己再帰ガードや旧フローは、フォルダ再導入時に使う設計として残している。
-
-- エクスプローラ等から mIV ウィンドウへファイルをドロップすると、**現在表示中の実
-  フォルダへコピー** する (送出と対称の「ファイル整理」操作)。フォルダは上記のとおり skip。
+- エクスプローラ等から mIV の一覧へファイルやフォルダをドロップすると、**現在表示中の実
+  フォルダへコピー** する (送出と対称の「ファイル整理」操作)。§1.821 / Q5 によりフォルダも受け付ける。
 - コピー先は `App::current_favorite_target()` — 実ディレクトリ表示中だけ `Some`。
   ZIP / PDF / 変換アーカイブ表示中は `None` で **トーストで拒否**。
-- **検索結果ビュー (Ctrl+G 合成 / Ctrl+S favsearch) も拒否** する。これらは
+- **検索結果ビュー (Ctrl+G 合成 / Ctrl+S favsearch)・タグ表示も拒否** する。これらは
   `current_folder` を直前の実フォルダのまま残すため、`current_favorite_target()` だけ
   だと「直前のフォルダ」へ誤コピーしてしまう。`items_are_global_search_view` /
-  `favsearch.on_results_grid()` を明示的にチェックして拒否する (Codex 第 5 回 P2)。
-- **自己再帰ガード**: ドロップされたディレクトリが表示中フォルダ (= コピー先) の
-  祖先または自身だと、`Copy-Item -Recurse` が生成中のフォルダを再走査して無限増殖
-  する (例: `C:\A\B` 表示中に `C:\A` をドロップ → `C:\A\B\A\B\A...`)。該当ディレクトリは
-  コピー対象から除外する (Codex 第 5 回 P1)。ドライブルート / UNC 共有ルート
-  (`C:\` や `\\server\share`、`Path::file_name()` が `None`) は basename が無く
-  コピー先を一意化できないため、`dest` 自体がルート配下かで判定する (Codex 第 6 回 P1)。
-- 操作は **コピーのみ** (送出と同じ方針)。現行の外部ドロップ受け取りは
-  `Copy-Item -Force` 経路のため、同名既存ファイルは上書きされる。Ctrl+V の
-  クリップボード貼り付けは Windows Shell paste 経路で、衝突確認と進捗 UI は Windows 側に委ねる。
+  `favsearch.on_results_grid()` / `tag_view.on_results_grid()` / `items_are_tag_view` を明示的にチェックして拒否する。
+- **自身・配下へのコピーは要求全体を拒否**: `shell_file_ops::validate_transfer_request` が
+  全件を検証し、実体パスでコピー先が元フォルダ自身またはその配下なら Shell 実行前に拒否する。
+  有効なファイルと無効なフォルダが混在しても一部だけ実行しない。
+- 操作は **コピーのみ**。整理先と同じ STA の `IFileOperation` を使い、同名の衝突・進捗・取消・エラーは
+  Windows の画面へ委ねる。フラグは `FOF_ALLOWUNDO | FOFX_ADDUNDORECORD` で、取り消し履歴は Windows が持つ。
 
 ### 11.2 実装
 
@@ -855,39 +845,24 @@ mIV ウィンドウを OS のドロップターゲットに登録済みで、efr
 - `App::update` で `ctx.input(|i| i.raw.dropped_files)` を読み、`path` のあるものを
   収集 → `handle_external_file_drop`。
 - `handle_external_file_drop`:
-  1. 検索結果ビュー (`items_are_global_search_view` / `favsearch.on_results_grid()`) なら
-     拒否トースト。
-  2. `current_favorite_target()` が `None` (ZIP/PDF 等) なら拒否トースト。
-  3. UI スレッドからは「N 件の項目をコピーしています…」トーストを即出して、検証 +
-     コピー起動 + 完了待ちを `file-drop-validate` worker thread に丸ごと投げる
-     (review #7 対応、`fs::canonicalize` × N が SMB 越しで UI を秒オーダー止めるのを回避)。
+  1. `viewer_mutation_modal_active()` なら拒否し、検索結果・タグ表示も拒否する。
+  2. `current_favorite_target()` が `None` (ZIP/PDF・本棚配下等) なら拒否トースト。
+  3. `admit_book_append_followup_mutation()` が通ったら、検証・Shell 実行を
+     `file-drop-validate` worker に投げ、「N 件の項目をコピーしています…」トーストを出す。
+     owner HWND は `main_hwnd` を渡す。UI スレッドで新しい同期 I/O は行わない。
 - worker (`file-drop-validate`) の処理:
-  1. `file_drag::partition_dropped_paths` で **ディレクトリを全て除外** (v1.1.0 で
-     フォルダ drop 無効化)。`folder_skipped` 件数は後段の notice/toast で通知する。
-     フォルダ再導入時はここで `dir_copy_would_recurse()` の自己再帰除外を併用する。
-  2. 残り 0 件 (= ドロップが全てフォルダ) なら `CopyOutcome::notice` に「フォルダのドロップは
-     現在無効です (N 件をスキップ)。ファイルのみコピーできます」をセットして送る (poll が
-     無音化しないよう notice 経由で必ず通知する)。ファイル + フォルダ混在で `folder_skipped`
-     が残った場合は、コピー完了後の `outcome.notice` に「フォルダ N 件はスキップしました」を補う。
-  3. 残りがあれば `copy_paths_into_folder` を呼んで内部 worker から `CopyOutcome` を受け取り、
-     UI へ転送。`recv()` の `Err` は `CopyOutcome::all_failed(attempted, reason)` で
-     全件失敗扱いに格上げする (Codex P2-1 対応: Disconnected を成功扱いに潰さない)。
-- `file_drag::dir_copy_would_recurse(src, dest)`: 両パスを `canonicalize` 正規化し、
-  コピー先 `dest/basename(src)` が `src` 自身または配下かを小文字化 + コンポーネント
-  単位の前方一致で判定する。純粋判定部 `copy_target_inside_src` はユニットテスト済み。
-  **v1.1.0 現在は未使用** (フォルダ drop を全 skip しているため)、フォルダ再導入用に保持。
-- コピーは `ui_dialogs::context_menu::copy_paths_into_folder` — **ディレクトリは skip し**
-  ファイルのみ `Copy-Item -LiteralPath -Force` (`-Recurse` なし) を `try/catch` で囲って失敗
-  カウントと先頭 5 件のエラーメッセージを stdout の `::FAILED::N` / `::ERR::msg` マーカーで
-  返す。spawn 失敗 /
-  tmp 書き込み失敗 / `powershell` 実行失敗 / 非ゼロ終了 / マーカー欠落はすべて
-  `failed=attempted` で報告する (Codex P2-1 対応: 旧実装は `SilentlyContinue` で全部
-  飲んでいた)。
+  1. ファイル・フォルダ全件を `ShellTransferRequest` (`operation: Copy`) にする。
+  2. `shell_file_ops::transfer_items_blocking` で `validate_transfer_request` → `run_transfer_items` を同期実行する。
+     整理先の `transfer_items_async` もこの入口を使い、検証と実行を重複させない。
+  3. 結果を `CopyOutcome` に写して UI へ送る。成功は通知なし、中断は notice
+     「操作が中断されました。処理済みの項目は元に戻りません」、`Err(msg)` は
+     `CopyOutcome::all_failed(attempted, msg)` で全件失敗として扱う。
+     件別の成否を Shell から受け取らないため、中断時の処理済み件数は報告しない。
 - UI 側の受け取り経路:
   - 完了は `App::drop_copy_pending: Vec<Receiver<CopyOutcome>>` に積まれ、
     `poll_file_drop_pending` が `pending_reload` を立てつつ:
     - `failed > 0` のとき「成功 K / 失敗 N (例: ...)」トーストを出す
-    - `notice = Some(_)` のとき (全件除外等) その文面をトーストで出す
+    - `notice = Some(_)` のとき (中断) その文面をトーストで出す
     - それ以外 (`failed == 0 && notice == None`) は静かに reload のみ
 
 ### 11.3 送出との非干渉

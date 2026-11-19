@@ -226,8 +226,8 @@ callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `Get
   同名のファイルを確認なしに上書きする。
 - 直し方: `handle_external_file_drop` の受付 (検索結果・タグ表示中・ZIP/PDF 表示中・本棚配下の拒否、`admit_book_append_followup_mutation`) と
   `file-drop-validate` worker・`drop_copy_pending` の並行受信はそのまま。worker の中のコピーを、整理先と同じ検証 + `IFileOperation` Copy
-  (`shell_file_ops` の同期の内部関数を worker から呼ぶ。`intent: Explicit(Copy)`) に替える。同名の衝突・進捗・取消・エラーは Windows の画面。
-  結果は今の `CopyOutcome` に写す (中断 → 「中断しました。処理済みの項目は元に戻りません」、失敗 → 全件失敗の通知)。
+  (`shell_file_ops` の同期関数を worker から呼ぶ。`operation: Copy`) に替える。同名の衝突・進捗・取消・エラーは Windows の画面。
+  結果は今の `CopyOutcome` に写す (中断 → 「操作が中断されました。処理済みの項目は元に戻りません」、失敗 → 全件失敗の通知)。
   `copy_paths_into_folder` と PowerShell の経路は削除する。
 - **フォルダも受ける (Q5)**: `partition_dropped_paths` によるフォルダの skip と「フォルダのドロップは現在無効です」の通知をやめる。
   フォルダを自身や配下へコピーする組み合わせは `validate_transfer_request` が全体を拒否する (未使用の `dir_copy_would_recurse` は削除)。
@@ -235,6 +235,10 @@ callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `Get
 - mIV 内のドラッグが一覧に落ちても何もしない (§4.4) のは今と同じ結果。
 - 更新履歴の文案: 「エクスプローラーから一覧へファイルをドロップしたとき、同じ名前のファイルがあると確認せずに上書きしていたのを、
   Windows の確認画面 (置き換え・スキップなど) を出すようにしました。あわせて、一覧へフォルダもドロップできるようにしました。」
+
+実装 A: `shell_file_ops::transfer_items_blocking` に検証と STA 転送を集約し、`transfer_items_async` も共有する。
+`handle_external_file_drop` の worker は `main_hwnd` と全パスを `file_drag::copy_dropped_paths_blocking` へ渡し、結果を `CopyOutcome` に写す。
+旧 PowerShell コピー・フォルダ skip・未使用の再帰判定を削除。既存の受付・並行受信・`pending_reload` は維持する。
 
 ## 9. 長い処理・取り消し・衝突・完了後の更新
 
