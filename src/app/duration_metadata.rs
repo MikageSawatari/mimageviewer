@@ -25,6 +25,7 @@ impl App {
         &self,
         path: &Path,
         owner: Option<&OpenRequestOwner>,
+        navigation: Option<&MainListNavigation>,
     ) -> top_level_grid_view::TopLevelGridSurface {
         use top_level_grid_view::TopLevelGridSurface;
         match owner {
@@ -36,16 +37,33 @@ impl App {
             {
                 TopLevelGridSurface::Folder
             }
-            Some(OpenRequestOwner::CollectionGridPhysical(_)) => {
-                self.top_level_grid_view.surface().clone()
+            Some(OpenRequestOwner::CollectionGridPhysical(collection)) => {
+                TopLevelGridSurface::Collection(top_level_grid_view::CollectionGridIdentity {
+                    collection_id: collection.stamp.collection_id,
+                })
             }
             Some(OpenRequestOwner::MainGridArchive(archive))
                 if archive.collection_grid_owner.is_some() =>
             {
-                self.top_level_grid_view.surface().clone()
+                TopLevelGridSurface::Collection(top_level_grid_view::CollectionGridIdentity {
+                    collection_id: archive
+                        .collection_grid_owner
+                        .as_ref()
+                        .unwrap()
+                        .physical
+                        .stamp
+                        .collection_id,
+                })
+            }
+            // A pinned snapshot cannot be dismissed by an explicit jump. Its scope
+            // admission remains authoritative even when a caller carries that intent.
+            _ if self.is_snapshot_active() => self.top_level_grid_view.surface().clone(),
+            // Prepare precedes adoption: use the same intent that dismisses the
+            // outgoing search/Smart/Collection return owner on successful adoption.
+            _ if navigation.is_some_and(MainListNavigation::exits_temporary_view) => {
+                TopLevelGridSurface::Folder
             }
             _ if self.smart_folder_session_owns_load(path)
-                || self.is_snapshot_active()
                 || self.global_search.active
                 || self.favsearch.active
                 || self.tag_view.active =>

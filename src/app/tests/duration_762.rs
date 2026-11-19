@@ -1,6 +1,8 @@
 use super::*;
 use crate::settings::{FacetDurationPreset, FacetSizePreset, GridViewMode, SortOrder};
 
+mod visible_stages;
+
 fn fixture() -> phase_c_support::AppTestEnv {
     let mut app = setup_media_duration_thumbnail_app();
     app.settings.thumb_show_media_duration = false;
@@ -415,4 +417,190 @@ fn duration_762_projection_identity_preserves_requested_sort_on_search_physical_
         app.current_folder_projection_key(&folder)
     );
     assert_eq!(app.settings.sort_order, SortOrder::DurationDesc);
+}
+
+fn search_duration_navigation_fixture(
+    view: top_level_grid_view::TopLevelSearchView,
+) -> (phase_c_support::AppTestEnv, PathBuf, ScannedDir) {
+    let mut app = fixture();
+    let folder = app.tmp.path().join("duration-destination");
+    std::fs::create_dir(&folder).unwrap();
+    for name in ["a-long.mp4", "b-short.mp4"] {
+        std::fs::write(folder.join(name), b"fixture").unwrap();
+    }
+    app.settings.sort_order = SortOrder::DurationAsc;
+    let scan = folder_scan::scan_directory_with_settings(&folder, &app.settings).unwrap();
+    assert_eq!(scan.all_media.len(), 2);
+    for entry in &scan.all_media {
+        app.details_lazy_meta.insert(
+            crate::adjustment_db::normalize_path(&entry.path),
+            DetailsLazyMeta {
+                source_mtime: entry.mtime,
+                source_size: entry.file_size,
+                media: DetailsMediaMeta::Read(DetailsVideoProbe {
+                    duration_secs: Some(if entry.path.ends_with("a-long.mp4") {
+                        600.0
+                    } else {
+                        30.0
+                    }),
+                    dims: None,
+                    codec: None,
+                }),
+                ..Default::default()
+            },
+        );
+    }
+    app.global_search.active = view == top_level_grid_view::TopLevelSearchView::Global;
+    app.favsearch.active = view == top_level_grid_view::TopLevelSearchView::Favorite;
+    app.tag_view.active = view == top_level_grid_view::TopLevelSearchView::Tag;
+    app.top_level_grid_view
+        .replace_surface(top_level_grid_view::TopLevelGridSurface::Search(view));
+    (app, folder, scan)
+}
+
+#[test]
+fn duration_762_explicit_search_exit_sorts_physical_destination_by_duration() {
+    for view in [
+        top_level_grid_view::TopLevelSearchView::Global,
+        top_level_grid_view::TopLevelSearchView::Favorite,
+        top_level_grid_view::TopLevelSearchView::Tag,
+    ] {
+        let (mut app, folder, scan) = search_duration_navigation_fixture(view);
+        let navigation = app.capture_main_list_navigation(
+            MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView {
+                selection: crate::ui_dialogs::context_menu::JumpToFolderSelection::None,
+            }),
+            MainListSourceProof::Row,
+        );
+        assert!(navigation.exits_temporary_view());
+        assert!(matches!(
+            app.load_folder_with_scan_claimed(
+                folder.clone(),
+                Some(scan),
+                OpenRequestOwner::Navigation,
+                VisibleInstallAuthority::Ordinary,
+                None,
+                Some(OpenPathKind::Directory),
+                StartupListIntent::ExplicitList,
+                Some(navigation),
+                MainListRequestStage::Continuation,
+            ),
+            FolderOpenOutcome::Loaded
+        ));
+        assert_eq!(
+            app.items,
+            vec![
+                GridItem::Video(folder.join("b-short.mp4")),
+                GridItem::Video(folder.join("a-long.mp4")),
+            ],
+            "{view:?} must prepare for the accepted Folder surface"
+        );
+        assert!(!app.global_search.active && !app.favsearch.active && !app.tag_view.active);
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            top_level_grid_view::TopLevelGridSurface::Folder
+        ));
+        assert_eq!(app.settings.sort_order, SortOrder::DurationAsc);
+    }
+}
+
+#[test]
+fn duration_762_retained_search_physical_child_still_sorts_by_name() {
+    for view in [
+        top_level_grid_view::TopLevelSearchView::Global,
+        top_level_grid_view::TopLevelSearchView::Favorite,
+        top_level_grid_view::TopLevelSearchView::Tag,
+    ] {
+        let (mut app, folder, scan) = search_duration_navigation_fixture(view);
+        let navigation = app.capture_main_list_navigation(
+            MainHistoryOperation::Direct(DirectNavigationPurpose::Navigation),
+            MainListSourceProof::Row,
+        );
+        assert!(!navigation.exits_temporary_view());
+        assert!(matches!(
+            app.load_folder_with_scan_claimed(
+                folder.clone(),
+                Some(scan),
+                OpenRequestOwner::Navigation,
+                VisibleInstallAuthority::Ordinary,
+                None,
+                Some(OpenPathKind::Directory),
+                StartupListIntent::ExplicitList,
+                Some(navigation),
+                MainListRequestStage::Continuation,
+            ),
+            FolderOpenOutcome::Loaded
+        ));
+        assert_eq!(
+            app.items,
+            vec![
+                GridItem::Video(folder.join("a-long.mp4")),
+                GridItem::Video(folder.join("b-short.mp4")),
+            ],
+            "{view:?} child must retain the unsupported surface's name order"
+        );
+        assert!(matches!(
+            app.top_level_grid_view.surface(),
+            top_level_grid_view::TopLevelGridSurface::Search(current) if *current == view
+        ));
+        assert!(app.global_search.active || app.favsearch.active || app.tag_view.active);
+        assert_eq!(app.settings.sort_order, SortOrder::DurationAsc);
+    }
+}
+
+#[test]
+fn duration_762_physical_preflight_uses_destination_surface_before_adoption() {
+    for collection_destination in [false, true] {
+        let (mut app, folder, scan) =
+            search_duration_navigation_fixture(top_level_grid_view::TopLevelSearchView::Global);
+        let surface = if collection_destination {
+            // Collection history can restore a child while the source is an ordinary folder.
+            app.global_search.active = false;
+            app.top_level_grid_view
+                .replace_surface(top_level_grid_view::TopLevelGridSurface::Folder);
+            top_level_grid_view::TopLevelGridSurface::Collection(
+                top_level_grid_view::CollectionGridIdentity {
+                    collection_id: crate::collection_store::CollectionId::new(),
+                },
+            )
+        } else {
+            let navigation = app.capture_main_list_navigation(
+                MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView {
+                    selection: crate::ui_dialogs::context_menu::JumpToFolderSelection::None,
+                }),
+                MainListSourceProof::Row,
+            );
+            app.physical_duration_sort_surface(
+                &folder,
+                Some(&OpenRequestOwner::Navigation),
+                Some(&navigation),
+            )
+        };
+        let prepared = app
+            .prepare_physical_listing(
+                folder.clone(),
+                collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan),
+                None,
+                None,
+                StartupListIntent::ExplicitList,
+                false,
+                use_full_path_cache_keys_for_folder(&folder),
+                surface,
+            )
+            .unwrap();
+        let names = prepared
+            .items()
+            .iter()
+            .map(|item| item.name().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            if collection_destination {
+                vec!["a-long.mp4", "b-short.mp4"]
+            } else {
+                vec!["b-short.mp4", "a-long.mp4"]
+            }
+        );
+        assert_eq!(app.settings.sort_order, SortOrder::DurationAsc);
+    }
 }

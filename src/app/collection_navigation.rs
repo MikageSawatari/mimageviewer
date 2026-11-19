@@ -3937,6 +3937,9 @@ impl App {
             restore_intent,
             false,
             super::use_full_path_cache_keys_for_folder(&target.source_path),
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: request.origin.collection_id,
+            }),
         )?;
         let token = match self.prepare_visible_install(
             listing.source_path(),

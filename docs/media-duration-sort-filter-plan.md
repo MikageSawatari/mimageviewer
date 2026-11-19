@@ -384,16 +384,19 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
 
 | 入口 | 走査・採用の経路 | 長さの取り扱い |
 | --- | --- | --- |
-| パスを開く・分類を必要とする直接移動 | App::start_open_path_classification_owned_with_navigation (`app.rs`, open-path-classify) | 要求時の保守的boolを捕捉し、directory scan後にworkerでfactsを読む。UI materializeはメモリ優先 |
+| パスを開く・分類を必要とする直接移動 | App::start_open_path_classification_owned_with_navigation → load_folder_with_scan_claimed_with_search_origin (`app.rs`, open-path-classify) | 要求時の保守的boolを捕捉し、directory scan後にworkerでfactsを読む。UI materializeはメモリ優先。採用時と共通のExitTemporaryView判定で、検索を終える移動先はFolderとして準備 |
 | Ctrl+↑↓・兄弟移動・一覧順移動 | App::spawn_folder_nav (`app.rs`, DFS/兄弟移動worker) | 行き先を決めた後のscanにfactsを付ける。ページ固定・非対応surfaceは要求を正規化 |
-| folder pane・長さ順への変更／同値再選択・更新のworker入口 | App::start_folder_open_scan_with_restore_and_navigation (`app.rs`) | scan後のworker内だけでfactsを読む。メニュー・ツールバー・ゲームパッドの長さ操作はWorkerScanへ合流 |
-| BS・履歴・物理コンテナのpreflight | App::start_physical_history_preflight_with_password (`app/collection_navigation.rs`, physical-history-preflight) | directory分岐のworker scan後にfactsを付ける。準備済みscanはそのfactsを保持 |
+| folder pane・長さ順への変更／同値再選択・更新のworker入口 | App::start_folder_open_scan_with_restore_and_navigation (`app.rs`) | scan後のworker内だけでfactsを読む。メニュー・ツールバー・ゲームパッドの長さ操作はWorkerScanへ合流。採用前のsurfaceはdestination ownerとnavigation intentから決める |
+| BS・履歴・物理コンテナのpreflight | App::start_physical_history_preflight_with_password → commit_physical_history_transition → prepare_physical_listing (`app/collection_navigation.rs`, `app.rs`, physical-history-preflight) | directory分岐のworker scan後にfactsを付ける。準備済みscanはそのfactsを保持。prepareへdestination ownerとnavigation intentから投影したsurfaceを渡す |
+| 画像フォルダ／ZIP変換の親一覧採用 | adopt_image_zip_parent_scan (`app/image_folder_zip_operation.rs`) | pendingのExitTemporaryViewと採用時に共通の判定で親のFolderを準備。新しいcatalog読み取りはしない |
 | 外部変更・通常フォルダreconcile | App::start_external_rescan_with_cause (`app.rs`, external-folder-rescan) | 要求時のメモリArc snapshotとscanのfactsでworker内materialize。採用時にUIでcatalogを開かない |
 | 同期load・起動／設定適用等でpre-scanを持たない従来入口 | load_folder_with_scan_claimed_with_search_origin → scan_directory_with_settings | factsはNone。追加catalog I/Oなし。メモリだけで並び、利用者の更新・再選択でcatalog分が入る |
-| Smart/Collectionの物理の子、集約一覧、Remote | 各source ownerの既存scan/materialize | 非対応の長さ順は名前順を要求。長さfacetはPCのitemsに対し利用可能。Remoteの候補には出さない |
+| Smart/Search/Collectionの物理の子、集約一覧、Remote | 各source ownerの既存scan/materialize | 帰路を保持する子では非対応の長さ順は名前順を要求。Collectionの履歴子／外側ナビも移動先Collectionのidentityをprepareへ渡す。明示移動で一時ビューを終える通常Folderは対象に含む。長さfacetはPCのitemsに対し利用可能。Remoteの候補には出さない |
 | 製本・画像フォルダ本・ZIP/PDFページ、代表画像探索 | 既存book/page/thumbnail経路 | 固定順と代表画像allowlistを維持。画像専用scanへ長さ取得を追加しない |
 
 `default_cache_dir()`は保持済みdata-dirからのパス組立てだけ。新しいcatalog open/SELECTは上記workerか、既存details-meta workerだけで行う。同期materializeへI/Oを追加していない。
+
+採用前surfaceの一時ビュー台帳: Global (Metadata / Everything)・Favorite・Tagは、`MainListNavigation::exits_temporary_view()` が真ならFolder、検索を保持する物理の子ならSearch。Smartも同じ明示終了判定を使い、sessionが所有する子はSmartを保つ。Collectionを出る明示移動はFolder、Collection owner付きの子・履歴復元・外側ナビは移動先のCollection identityを保つ。固定snapshotは明示移動自体が既存の受付で禁止され、並び替えの投影でもSnapshotを保持する。snapshotの解除・scope判定を変更しない。
 
 ### 11.3 完了・取消の台帳
 
@@ -405,7 +408,7 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
 | 取得中の追加・削除・世代交代 | poll先頭で古いsnapshotのsessionをcancel・破棄してNotRequestedへ。旧channel切断を利用者の停止に読み替えない |
 | 完了後の追加・削除 | 世代・件数の不一致からproofが無効となり、pendingなしなら新しいAllRequirementsを計画 |
 | 利用者の停止 | Cancelled中は自動再計画しない。他facetの再構築でも停止を維持し、既存resume操作で再開 |
-| 選択情報等のVisibleStage | 新proofを立てず、既存の有効proofも消さない |
+| 選択情報等のVisibleStage | 新proofを立てず、既存の有効proofも消さない。長さ全件要件があってもproofが有効なら、Readyからスクロール先のページ数・メディア情報のstageを開始できる |
 | facet変更・取得完了 | 長さ条件だけをproofが有効になるまで外す。proof完成時に表示集合を再構築。items順を自動変更しない |
 
 ### 11.4 コード照合で補足した点
@@ -414,7 +417,7 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
 2. 絞り込みバーには一般の新候補補完が無い（`src/settings.rs:9933`）。長さメニューを旧既定バーにも届けるためsort用とは別のone-time markerを追加。旧既定完全一致だけ補完し、空・順序変更・非表示は保持。NameFilterの既存stashも保持。DB表・schemaは変更なし。
 3. ゲームパッドsort行は左右巡回で（`src/app/gamepad_input.rs:11160` のpicker_row_supports_value_list）、値一覧から同値を選び直す操作は存在しない。巡回の候補制限と変更時のworker経路を接続し、共通handlerへ同値duration要求が届いた場合もworker再読込にする。新キー操作・値一覧は追加しない。
 4. §1.822は着手前にコミット済みで、本書の「既存の問題」を修正済みの記録へ直した。
-5. 物理一覧prepareはsurface採用より前にも走る。直接loadは既存destination ownerから並べ替え用surfaceを投影し、元のbook recipeや退去するrating等のsurfaceだけで新しい物理一覧を制限しない。Smart/Search/Collectionの帰路を持つ子は対象外のまま。
+5. 物理一覧prepareはsurface採用より前にも走る。destination ownerだけでなくnavigation intentも渡し、`MainListNavigation::exits_temporary_view()` を採用側の検索終了・一時ビュー退役と共有する。ExitTemporaryViewで検索・Smart・Collectionを終える通常フォルダへの移動はFolderとして準備し、まだ表示中のactive flagで名前順に落とさない。検索を保持する物理の子、Smart sessionが所有する子、移動先Collection owner付きの子は対象外のまま。主preflightと画像変換後の親一覧にも同じ投影を渡し、Collection固有の履歴復元／外側ナビは移動先Collection identityを明示する。固定snapshotは既存の受付・scope制約を優先する。元のbook recipeや退去するrating等のsurfaceだけで新しい物理一覧を制限しない。
 6. 既存facet-sort snapshotはtests/ui_snapshot.rsではなくui_main.rsのlib testのsection292_facet_sort_snapshotにある。既存2fixtureを追従させ、指定のintegration側にも共通描画fixtureで通常幅／狭幅を追加した。
 
 7. 走査採用のprojection keyは従来どおり正規化前の要求を識別し、実際の並べ替え要求だけを名前順にする。worker・UI prepare・既存の現在値照合で同じkey契約を保持する。
@@ -463,3 +466,13 @@ PNG更新候補（全て未更新）:
 - まれなcatalog読取失敗はログ＋空factsとして継続。既存データを削除・再作成せず、メモリ分と未取得末尾で一覧を出す。
 
 - 最終整形: `cargo fmt` / `cargo fmt --check` とも exit 0。`git diff --check` も exit 0。PNG差分・ステージ済み差分は0件。
+
+### 11.7 独立レビュー P2 修正 (2026-11-20、未実行)
+
+- P2-1: `details_lazy_uses_visible_stages` は長さ全件要件の継続中でも、proof有効後は既存のVisibleStageを許可する。開始はpost-grid reconcile／pollのReady分岐を通し、Finished後のReconcilingを経てproofを保持する。完了前はAllRequirementsを保持する。
+- 停止の比較基点はmaster `2954784a4`。Detailsのページ数とAI全件ownerはCancelledから可視stageを開始せず、明示resumeを待つ。長さも同じ全件ownerの停止を維持する。masterのbadge単独（全件要件なし）には、近傍変更で要件を失効させて停止を解除する既存例外があり、この動作も変更しない。選択情報専用の既存分岐も変更しない。
+- P2-2: 一時ビューの終了判定を採用とprepareで共有し、移動先のsort surfaceを直接load・物理preflight・画像変換の親採用へ渡す。Collection固有の2経路とCollection ownerは、出発surfaceではなく移動先identityを使う。入口と一時ビューの台帳は§11.2、設計補足は§11.4の5に反映した。
+- 追加テスト: `duration_762_proven_lengths_allow_post_grid_visible_stage_and_keep_proof_through_finished` / `duration_762_proven_lengths_allow_poll_ready_visible_stage` / `duration_762_cancelled_keeps_visible_stages_stopped_with_or_without_duration_proof` / `duration_762_thumbnail_cancelled_badge_only_scroll_keeps_existing_restart_behavior` / `duration_762_thumbnail_cancelled_duration_owner_stays_stopped_after_scroll` / `duration_762_explicit_search_exit_sorts_physical_destination_by_duration` / `duration_762_retained_search_physical_child_still_sorts_by_name` / `duration_762_physical_preflight_uses_destination_surface_before_adoption`。前5件は `src/app/tests/duration_762/visible_stages.rs`、後3件は `src/app/tests/duration_762.rs`。開始テストはpendingを注入せず、実際の開始判定とwarmなZipTreeのworkerを使う。検索3種は実採用経路で長さと名前が逆順のfixtureを比較する。preflight受け口も、検索終了先Folderと移動先Collectionを比較する。
+- この差分のコンパイル・テスト・UIスナップショット更新は利用者の指示で実施しない。設計担当の既報の関連337件・ui_snapshot263件・core check成功はコミット `4c7c7bebc` の証拠であり、この修正後の成功件数ではない。設計担当のメニューテストの `harness.run_steps(3)` 修正を保持する。
+- 共有runner向けの絞ったfilter案: `test(/duration_762/)`。必要に応じ `test(/duration|media_duration_thumbnail|page_count|location_jump|collection_history/)` で既存の近傍取得と入口も検証する。今回のUI描画変更はなく、PNGの更新候補はない。
+- 修正差分の独立静的レビュー (Sol / xhigh) はACCEPT。新fixtureのZIP wrapper自動降下の指摘を明示root materializeへ修正し、追加のpreflightテストも静的確認済み。実行による検証ではない。`cargo fmt` / `cargo fmt --check` / `git diff --check` はいずれもexit 0。git add・commitは行っていない。

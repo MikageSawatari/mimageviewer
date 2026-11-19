@@ -940,7 +940,9 @@ impl App {
         // A successful directory scan is the classification proof. Suffixes such as .epub
         // do not create a second classifier whose poll would be blocked by this modal.
         let now = std::time::Instant::now();
-        let prepared = self.prepare_scanned_folder_listing_with_cache_keys(
+        let sort_surface =
+            self.physical_duration_sort_surface(&path, None, Some(&adoption.navigation));
+        let prepared = self.prepare_scanned_folder_listing_with_sort_surface(
             path.clone(),
             scan,
             FolderListingMetrics {
@@ -952,6 +954,7 @@ impl App {
             },
             StartupListIntent::ExplicitList,
             use_full_path_cache_keys_for_folder(&path),
+            sort_surface,
         );
         let token = match self.prepare_visible_install(&path, &prepared.items, None) {
             Ok(token) => token,

@@ -2695,6 +2695,7 @@ impl App {
             super::StartupListIntent::ExplicitList,
             false,
             super::use_full_path_cache_keys_for_folder(&path),
+            TopLevelGridSurface::Collection(target.root.identity),
         ) else {
             return false;
         };

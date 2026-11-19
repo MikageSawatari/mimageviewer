@@ -1554,6 +1554,15 @@ pub(crate) struct MainListNavigation {
     selection_after_load: Option<AfterLoadSelection>,
 }
 
+impl MainListNavigation {
+    fn exits_temporary_view(&self) -> bool {
+        matches!(
+            self.history,
+            MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
+        )
+    }
+}
+
 pub(crate) struct MainListAdoption {
     navigation: MainListNavigation,
     destination: FolderNavHistoryEntry,
@@ -25673,11 +25682,9 @@ impl App {
             destination,
             facet_mode,
         } = adoption;
-        let exits_search =
-            matches!(
-                navigation.history,
-                MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
-            ) && (self.global_search.active || self.favsearch.active || self.tag_view.active);
+        let exits_temporary_view = navigation.exits_temporary_view();
+        let exits_search = exits_temporary_view
+            && (self.global_search.active || self.favsearch.active || self.tag_view.active);
         // A search child has the visible child's facet route, while its transparent
         // history location is the pre-search origin. Keep the captured child route
         // for admission; only successful departure records the origin's saved route.
@@ -25776,10 +25783,7 @@ impl App {
             }
         }
         self.select_after_load = navigation.selection_after_load;
-        if matches!(
-            navigation.history,
-            MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
-        ) {
+        if exits_temporary_view {
             self.dismiss_transparent_view_for_admitted_jump();
         }
         let mut hydration = install(self, install_boundary);
@@ -32211,7 +32215,8 @@ impl App {
             return FolderOpenOutcome::Ignored;
         }
         let full_keys = use_full_path_cache_keys_for_folder(&path);
-        let sort_surface = self.physical_duration_sort_surface(&path, Some(&owner));
+        let sort_surface =
+            self.physical_duration_sort_surface(&path, Some(&owner), navigation.as_ref());
         let prepared = self.prepare_scanned_folder_listing_with_sort_surface(
             path.clone(),
             scan,
@@ -32374,7 +32379,7 @@ impl App {
         restore_intent: crate::app::StartupListIntent,
         use_full_path_cache_keys: bool,
     ) -> PreparedScannedFolderListing {
-        let surface = self.physical_duration_sort_surface(&path, None);
+        let surface = self.physical_duration_sort_surface(&path, None, None);
         self.prepare_scanned_folder_listing_with_sort_surface(
             path,
             scan,
@@ -38258,6 +38263,11 @@ impl App {
         let password = pdf_password_submission
             .as_ref()
             .map(|(password, _)| password.clone());
+        let sort_surface = self.physical_duration_sort_surface(
+            &request.path,
+            Some(&owner),
+            Some(&request.navigation),
+        );
         let Some(mut prepared) = self.prepare_physical_listing(
             request.path.clone(),
             payload,
@@ -38266,6 +38276,7 @@ impl App {
             restore_intent.clone(),
             auto_fullscreen,
             full_path,
+            sort_surface,
         ) else {
             return;
         };
@@ -38514,6 +38525,7 @@ impl App {
         restore_intent: StartupListIntent,
         auto_fullscreen: bool,
         full_path_cache_keys: bool,
+        sort_surface: top_level_grid_view::TopLevelGridSurface,
     ) -> Option<PreparedPhysicalListing> {
         let prepared = match payload {
             collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => {
@@ -38522,7 +38534,7 @@ impl App {
                 let auto_book = auto_fullscreen
                     && self.settings.auto_fullscreen_image_folders_enabled()
                     && self.scanned_folder_is_image_book(&path, &scan);
-                let mut prepared = self.prepare_scanned_folder_listing_with_cache_keys(
+                let mut prepared = self.prepare_scanned_folder_listing_with_sort_surface(
                     path.clone(),
                     scan,
                     FolderListingMetrics {
@@ -38534,6 +38546,7 @@ impl App {
                     },
                     restore_intent.clone(),
                     full_path,
+                    sort_surface,
                 );
                 prepared.auto_open_image_folder = auto_book;
                 PreparedPhysicalListing::Folder(prepared)
@@ -73781,7 +73794,7 @@ impl App {
     }
 
     fn details_lazy_uses_visible_stages(&self) -> bool {
-        !self.duration_lengths_wanted()
+        (!self.duration_lengths_wanted() || self.duration_scan_ready())
             && (self.thumbnail_media_metadata_enabled()
                 || self.settings.grid_view_mode == crate::settings::GridViewMode::Details
                     && self.settings.details_show_page_count
