@@ -1458,6 +1458,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-19: ページ内スクロールの宛先 viewport の矩形を egui と同じ丸めで読む (§1.815)
+
+§1.474 の入力照合が宛先 viewport の content rect を丸める前の `input.content_rect()` で読んでいた。
+描画側の `CentralPanel` は egui が `round_ui()` した矩形なので、1/32 point の倍数でない窓では記録と入力が一致しなかった。
+`in_page_scroll.rs` の helper `rounded_content_rect_for_viewport` で `Context::content_rect()` と同じ規則に揃え、
+入力幾何と前面メニュー照会の 2 か所から使う。detached を含む全 viewport に適用されるが、変わるのは矩形の読み方だけで、
+viewport の選択・配送・detached の述語・context の所有と寿命は変えない。一致判定は緩めず、guard・待機・retry・repaint も足さない。
+設計担当と独立レビュー (Sol / xhigh) の双方が、症状パッチではなく構造的修正であることに合意した。
+Windows backend は safe area を設定しないので、描画側 (`viewport_rect()` 起点の root UI) とも一致する。非ゼロの safe area まで一般化はしない (レビュー所見)。
+回帰は実描画経路の `fractional_window_viewport_*` 3 件 (`initial_placement/tests/viewport_input.rs`)。記録はバックログ §1.815。
+
 ### 2026-11-19: §1.803 変換書庫source表とrevisionのcontext所有
 
 表紙計画§31の設計担当と独立設計レビューr1〜r3が構造修正として合意した範囲。
