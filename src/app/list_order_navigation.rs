@@ -26,6 +26,13 @@ pub(crate) struct ListOrderSnapshot {
 pub(crate) enum ListOrderScope {
     Folder,
     Everything { run: u64 },
+    Tag { run: u64 },
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum TagViewNavAdmission {
+    Descend,
+    ListOrderRow { run: u64, row: PathBuf },
 }
 
 impl ListOrderEntry {
@@ -56,6 +63,11 @@ impl App {
         }
         match self.top_level_grid_view.surface() {
             top_level_grid_view::TopLevelGridSurface::Folder => Some(ListOrderScope::Folder),
+            top_level_grid_view::TopLevelGridSurface::Search(
+                top_level_grid_view::TopLevelSearchView::Tag,
+            ) if self.tag_view.active => Some(ListOrderScope::Tag {
+                run: self.tag_view.run,
+            }),
             top_level_grid_view::TopLevelGridSurface::Search(
                 top_level_grid_view::TopLevelSearchView::Global,
             ) if self.global_search.active => match &self.global_search.accepted {
@@ -94,6 +106,11 @@ impl App {
         let Some(entry) = self.items.get(idx).and_then(ListOrderEntry::from_item) else {
             return;
         };
+        if matches!(scope, ListOrderScope::Tag { .. })
+            && (!self.items_are_tag_view || !self.tag_view.nav_stack.is_empty())
+        {
+            return;
+        }
         if self
             .collection_grid_physical_load_owner(idx, &entry.path)
             .is_some()
@@ -107,7 +124,7 @@ impl App {
             .iter()
             .filter_map(|&index| self.items.get(index).and_then(ListOrderEntry::from_item))
             .filter(|entry| match scope {
-                ListOrderScope::Folder => {
+                ListOrderScope::Folder | ListOrderScope::Tag { .. } => {
                     seen.insert(crate::path_key::normalize_keep_drive(&entry.path))
                 }
                 ListOrderScope::Everything { .. } => {
@@ -138,6 +155,15 @@ impl App {
         }
         let current = self.effective_folder()?;
         let position = match snapshot.scope {
+            ListOrderScope::Tag { .. } => {
+                let root = self.tag_view.nav_stack.first()?;
+                snapshot.entries.iter().position(|entry| {
+                    crate::folder_tree::path_eq(&entry.path, root)
+                        && (crate::folder_tree::path_eq(&current, root)
+                            || (entry.kind == ListOrderEntryKind::Folder
+                                && metadata_ops::path_in_subtree_ci(&current, root)))
+                })?
+            }
             ListOrderScope::Folder => snapshot
                 .entries
                 .iter()
@@ -171,6 +197,77 @@ impl App {
             }
         };
         Some((Arc::clone(snapshot), position))
+    }
+
+    pub(crate) fn tag_view_nav_admission(
+        &self,
+        mode: &FolderNavMode,
+        path: &Path,
+    ) -> Option<TagViewNavAdmission> {
+        self.tag_view.active.then(|| match mode {
+            FolderNavMode::ListOrder { snapshot, .. }
+                if matches!(snapshot.scope, ListOrderScope::Tag { .. }) =>
+            {
+                let ListOrderScope::Tag { run } = snapshot.scope else {
+                    unreachable!()
+                };
+                TagViewNavAdmission::ListOrderRow {
+                    run,
+                    row: path.to_path_buf(),
+                }
+            }
+            _ => TagViewNavAdmission::Descend,
+        })
+    }
+
+    /// A traversal owns admission until its destination listing finishes hydration.
+    /// DirectNavigation scans have no DFS continuation and can be superseded normally.
+    pub(crate) fn main_list_folder_navigation_adoption_pending(&self) -> bool {
+        matches!(self.top_level_grid_view.history_navigation_transition(),
+            Some(HistoryNavigationTransition::Physical(request)) if request.dfs_continuation.is_some())
+            || matches!(self.top_level_grid_view.open_path_classification(),
+                Some(request) if matches!(request.continuation.as_deref(),
+                    Some(ClassifiedOpenContinuation::Physical { dfs_continuation: Some(_), .. })))
+            || self.sidecar_restore.as_ref().is_some_and(|state| {
+                state.folder_navigation_adoption_pending(self.viewer_context_main())
+            })
+    }
+
+    pub(crate) fn route_tag_view_grid_book_navigation(
+        &mut self,
+        _ctx: &egui::Context,
+        forward: bool,
+    ) -> bool {
+        if !self.tag_view.active {
+            return false;
+        }
+        if self.tag_view.nav_stack.is_empty() {
+            self.cancel_pending_folder_nav();
+            return true;
+        }
+        if self.main_list_request_blocks_grid_list_order() {
+            crate::logger::log(
+                "[grid-nav] refused list-order request while folder navigation awaits adoption",
+            );
+            return true;
+        }
+        let Some((snapshot, from_index)) = self.list_order_position() else {
+            self.show_feedback_warning("一覧から開いた本で使えます".into());
+            return true;
+        };
+        let current = self
+            .effective_folder()
+            .expect("list-order position has a folder");
+        self.start_folder_nav(
+            current,
+            forward,
+            FolderNavMode::ListOrder {
+                snapshot,
+                from_index,
+                fullscreen: false,
+            },
+        );
+        true
     }
 }
 
@@ -207,6 +304,31 @@ pub(super) fn navigate_list_order(
                 path: entry.path.clone(),
                 hit_image_folder: true,
             });
+        }
+    }
+}
+
+/// One selection request: an ordinary filename or an exact result row, never both.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AfterLoadSelection {
+    Name(String),
+    ExactPath(PathBuf),
+}
+impl From<String> for AfterLoadSelection {
+    fn from(name: String) -> Self {
+        Self::Name(name)
+    }
+}
+impl From<&str> for AfterLoadSelection {
+    fn from(name: &str) -> Self {
+        Self::Name(name.into())
+    }
+}
+impl AfterLoadSelection {
+    pub(crate) fn name(&self) -> Option<&str> {
+        match self {
+            Self::Name(name) => Some(name),
+            Self::ExactPath(_) => None,
         }
     }
 }

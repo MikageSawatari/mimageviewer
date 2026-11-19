@@ -310,7 +310,9 @@ fn close_return_auto_open_zip_pdf_image_folder_and_converted_source_preserve_par
             "{kind}"
         );
         assert_eq!(
-            env.select_after_load.as_deref(),
+            env.select_after_load
+                .as_ref()
+                .and_then(crate::app::AfterLoadSelection::name),
             logical.file_name().and_then(|name| name.to_str()),
             "{kind}"
         );
@@ -332,7 +334,7 @@ struct MainSnapshot {
     bookmark_rows: Vec<(u8, i64)>,
     history: FolderNavHistorySnapshot,
     continuation: String,
-    select_after_load: Option<String>,
+    select_after_load: Option<crate::app::AfterLoadSelection>,
     bookmark_build_pending: bool,
 }
 

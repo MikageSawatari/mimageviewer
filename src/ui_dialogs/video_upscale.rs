@@ -671,7 +671,8 @@ impl App {
         self.select_after_load = output_path
             .file_name()
             .and_then(|name| name.to_str())
-            .map(|name| name.to_owned());
+            .map(|name| name.to_owned())
+            .map(crate::app::AfterLoadSelection::Name);
         self.reload_current_folder_preserving_override();
     }
 }

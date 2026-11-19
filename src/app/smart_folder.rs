@@ -2618,6 +2618,12 @@ impl App {
             restore_intent.replaces_deferred_startup_open()
                 && stage == MainListRequestStage::Admission,
         );
+        if stage == MainListRequestStage::Continuation
+            && restore_intent.replaces_deferred_startup_open()
+        {
+            // A classified open can retire grid traversal only after preparation succeeds.
+            self.retire_main_grid_folder_navigation_for_admission();
+        }
         self.retire_smart_folder_transition(
             crate::ui_dialogs::epub_convert::EpubConvertExit::Superseded,
         );
@@ -3950,7 +3956,7 @@ impl App {
             self.show_feedback_toast("★フィルタ一時解除中 (親へ戻ると復元)".into());
         }
         if let Some(anchor) = effects.select_after_load {
-            self.select_after_load = Some(anchor);
+            self.select_after_load = Some(anchor.into());
         }
         // Smart PDF pages and warm placeholders both become visible at this boundary.
         // Use the same one-time cleanup as ordinary PDF adoption before installing

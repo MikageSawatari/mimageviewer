@@ -45,6 +45,20 @@ pub(crate) enum StackSelectionTarget {
     /// A media member, or a physical passthrough row (folder/archive/document).
     MemberPath(PathBuf),
     GroupKey(String),
+    /// An explicit deselection, distinct from no pending selection request.
+    Clear,
+}
+
+/// Why the caller is capturing the provisional cursor, independently of its value.
+pub(crate) enum StackSelectionIntent {
+    Current,
+    ExplicitClear,
+}
+
+/// Selection resolved against the exact aggregate candidate being installed.
+pub(crate) enum StackSelection {
+    Select(usize),
+    Clear,
 }
 
 /// ユーザー定義スクリプトによるグループ分けを **ワーカーで** 実行する際の保留状態
@@ -1492,16 +1506,20 @@ impl crate::app::App {
             .stack_selection_target
             .take()
             .and_then(|target| match target {
-                StackSelectionTarget::MemberPath(path) => {
-                    view.aggregated_index_for_member_path(&path).or_else(|| {
+                StackSelectionTarget::MemberPath(path) => view
+                    .aggregated_index_for_member_path(&path)
+                    .or_else(|| {
                         prepared.items.iter().position(|item| {
                             item.drag_source_path().is_some_and(|candidate| {
                                 crate::folder_tree::path_eq(candidate, &path)
                             })
                         })
                     })
-                }
-                StackSelectionTarget::GroupKey(key) => view.aggregated_index_for_group_key(&key),
+                    .map(StackSelection::Select),
+                StackSelectionTarget::GroupKey(key) => view
+                    .aggregated_index_for_group_key(&key)
+                    .map(StackSelection::Select),
+                StackSelectionTarget::Clear => Some(StackSelection::Clear),
             });
         self.start_loading_stack_items(
             folder,
@@ -1980,19 +1998,24 @@ impl crate::app::App {
 
     /// An explicit cursor or load hint on provisional rows supersedes entry positioning.
     /// Keep identity, never a raw index: grouping can remove rows before this item.
-    pub(crate) fn remember_pending_stack_selection(&mut self) {
+    pub(crate) fn remember_pending_stack_selection(&mut self, intent: StackSelectionIntent) {
         if !self.stack_mode_requested
             || self.stack_view.is_some()
             || self.stack_script_pending.is_none()
         {
             return;
         }
-        self.stack_selection_target = self.selected.and_then(|index| {
-            self.items
-                .get(index)?
-                .drag_source_path()
-                .map(|path| StackSelectionTarget::MemberPath(path.to_path_buf()))
-        });
+        self.stack_selection_target = match intent {
+            StackSelectionIntent::ExplicitClear => Some(StackSelectionTarget::Clear),
+            // Empty visibility or a hidden load hint can leave no cursor without a
+            // deselection request. Only the caller's explicit intent can create Clear.
+            StackSelectionIntent::Current => self.selected.and_then(|index| {
+                self.items
+                    .get(index)
+                    .and_then(GridItem::drag_source_path)
+                    .map(|path| StackSelectionTarget::MemberPath(path.to_path_buf()))
+            }),
+        };
     }
 
     /// 現在カーソル位置 (selected) のセルの代表画像/動画パス。スタックトグルで被写体を保つため。
@@ -2030,7 +2053,7 @@ impl crate::app::App {
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
         {
-            self.select_after_load = Some(name.to_string());
+            self.select_after_load = Some(name.to_string().into());
         }
         self.stack_mode_requested = !self.stack_mode_requested;
         self.stack_selection_target = if self.stack_mode_requested {

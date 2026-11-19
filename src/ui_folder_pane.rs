@@ -478,22 +478,23 @@ impl App {
         self.folder_pane_visibility_request = Some(FolderPaneVisibilityRequest::Hide);
     }
 
-    /// An explicit main navigation retires the commit, preserving visibility.
-    pub(crate) fn retire_folder_tree_pane_close_navigation(&mut self) {
-        if matches!(
+    pub(crate) fn folder_tree_pane_close_navigation_pending(&self) -> bool {
+        matches!(
             self.folder_pane_visibility_request,
             Some(FolderPaneVisibilityRequest::HideAndNavigate)
-        ) {
+        )
+    }
+
+    /// An explicit main navigation retires the commit, preserving visibility.
+    pub(crate) fn retire_folder_tree_pane_close_navigation(&mut self) {
+        if self.folder_tree_pane_close_navigation_pending() {
             self.folder_pane_visibility_request = Some(FolderPaneVisibilityRequest::Hide);
         }
     }
 
     /// Only the main navigation arbiter may accept the cursor commit.
     pub(crate) fn take_folder_tree_pane_close_navigation(&mut self) -> Option<std::path::PathBuf> {
-        if !matches!(
-            self.folder_pane_visibility_request,
-            Some(FolderPaneVisibilityRequest::HideAndNavigate)
-        ) {
+        if !self.folder_tree_pane_close_navigation_pending() {
             return None;
         }
         self.retire_folder_tree_pane_close_navigation();

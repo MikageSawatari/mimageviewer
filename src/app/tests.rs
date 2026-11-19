@@ -5320,6 +5320,21 @@ fn accepted_epub_retires_pending_dfs_after_classification_but_ignore_keeps_it() 
         epub.clone(),
         crate::app::StartupListIntent::ExplicitList,
     ));
+    assert!(app.top_level_grid_view.open_path_classification().is_some());
+    assert!(std::sync::Arc::ptr_eq(
+        &app.folder_nav_pending.as_ref().unwrap().cancel,
+        &cancel,
+    ));
+    assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(app.pending_folder_nav_steps, 2);
+    assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
+    assert!(
+        tx.send(FolderNavThreadResult {
+            target: None,
+            hit_image_folder: false,
+        })
+        .is_ok()
+    );
     app.settle_open_path_classification_for_test();
     assert!(app.folder_nav_pending.is_some());
     assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
@@ -5336,6 +5351,21 @@ fn accepted_epub_retires_pending_dfs_after_classification_but_ignore_keeps_it() 
         epub,
         crate::app::StartupListIntent::ExplicitList,
     ));
+    assert!(app.top_level_grid_view.open_path_classification().is_some());
+    assert!(std::sync::Arc::ptr_eq(
+        &app.folder_nav_pending.as_ref().unwrap().cancel,
+        &cancel,
+    ));
+    assert!(!cancel.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(app.pending_folder_nav_steps, 2);
+    assert_eq!(app.current_folder.as_deref(), Some(source.as_path()));
+    assert!(
+        tx.send(FolderNavThreadResult {
+            target: None,
+            hit_image_folder: false,
+        })
+        .is_ok()
+    );
     app.settle_open_path_classification_for_test();
     assert!(cancel.load(std::sync::atomic::Ordering::Relaxed));
     assert!(app.folder_nav_pending.is_none());
@@ -24739,7 +24769,12 @@ mod phase_c_folder_nav_history_tests {
             "ESC の戻り先はキャッシュフォルダではなく元 .lzh の親フォルダ"
         );
         // 戻り先で元アーカイブ (.lzh) を選択状態にするヒント。
-        assert_eq!(app.select_after_load.as_deref(), Some("C165_206.LZH"));
+        assert_eq!(
+            app.select_after_load
+                .as_ref()
+                .and_then(crate::app::AfterLoadSelection::name),
+            Some("C165_206.LZH")
+        );
     }
 
     #[test]
@@ -40194,7 +40229,7 @@ mod favorite_adjustment_defaults_tests {
         let source = std::path::PathBuf::from("c:/root");
         app.folder_history.insert(source.clone(), (123.0, Some(0)));
         // ヒント: folderB を選びたい (BS で戻った直後の状態を模擬)
-        app.select_after_load = Some("folderB".to_string());
+        app.select_after_load = Some("folderB".to_string().into());
 
         let restored = app.try_select_after_load();
         assert!(restored, "ヒントが items に存在するなら true を返す");
@@ -40228,7 +40263,7 @@ mod favorite_adjustment_defaults_tests {
         std::fs::write(&book, b"%PDF-1.4\n").unwrap();
 
         app.folder_history.insert(parent.clone(), (321.0, Some(0)));
-        app.select_after_load = Some("book.pdf".to_string());
+        app.select_after_load = Some("book.pdf".to_string().into());
 
         app.start_loading_items(
             parent,
@@ -41268,7 +41303,7 @@ mod favorite_adjustment_defaults_tests {
         app.rebuild_visible_indices();
         app.selected = None;
 
-        app.select_after_load = Some("ghost".to_string());
+        app.select_after_load = Some("ghost".to_string().into());
         let restored = app.try_select_after_load();
         assert!(!restored, "ヒストリにフォールバックさせるため false を返す");
         assert_eq!(app.selected, None, "selected は変更されない");
@@ -41398,10 +41433,12 @@ mod favorite_adjustment_defaults_tests {
         app.thumbnails.push(ThumbnailState::Pending);
         app.selected = Some(0);
 
-        app.select_after_load = Some("new folder".to_string());
+        app.select_after_load = Some("new folder".to_string().into());
         app.preserve_cursor_hint_for_reload();
         assert_eq!(
-            app.select_after_load.as_deref(),
+            app.select_after_load
+                .as_ref()
+                .and_then(crate::app::AfterLoadSelection::name),
             Some("new folder"),
             "操作が置いたヒントを現在の選択で潰してはいけない"
         );
@@ -41409,7 +41446,12 @@ mod favorite_adjustment_defaults_tests {
         // 誰も指定していないときは、これまでどおり今の選択を保つ。
         app.select_after_load = None;
         app.preserve_cursor_hint_for_reload();
-        assert_eq!(app.select_after_load.as_deref(), Some("a.jpg"));
+        assert_eq!(
+            app.select_after_load
+                .as_ref()
+                .and_then(crate::app::AfterLoadSelection::name),
+            Some("a.jpg")
+        );
     }
 
     /// 起きなかった貼り付けの要求を残さない (R-08)。
@@ -43827,7 +43869,12 @@ mod favorite_adjustment_defaults_tests {
             panic!("AddressBarNav::Direct を期待");
         };
         assert_eq!(parent, std::path::PathBuf::from("c:/manga"));
-        assert_eq!(app.select_after_load.as_deref(), Some("book.pdf"));
+        assert_eq!(
+            app.select_after_load
+                .as_ref()
+                .and_then(crate::app::AfterLoadSelection::name),
+            Some("book.pdf")
+        );
         assert!(
             !app.pending_return_to_parent.is_pending(),
             "parent return request should be consumed once it is merged"
@@ -95349,7 +95396,12 @@ mod tag_view_navigation_tests {
             app.tag_view_pending.is_some(),
             "最上位から戻るとタグ検索結果の再構築を開始する"
         );
-        assert_eq!(app.select_after_load.as_deref(), Some("a.zip"));
+        assert_eq!(
+            app.select_after_load,
+            Some(AfterLoadSelection::ExactPath(PathBuf::from(
+                "C:/books/a.zip"
+            )))
+        );
     }
 
     #[test]

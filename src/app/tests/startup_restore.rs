@@ -1875,7 +1875,12 @@ fn section1335_previous_zip_missing_or_recapsed_prefix_rejects_old_same_name_cur
             ""
         };
         assert_physical(&env, &book, Some(prefix));
-        assert_ne!(env.select_after_load.as_deref(), Some("b.png"));
+        assert_ne!(
+            env.select_after_load
+                .as_ref()
+                .and_then(crate::app::AfterLoadSelection::name),
+            Some("b.png")
+        );
         if let Some(selected) = env.selected {
             assert_eq!(
                 env.items[selected].name(),

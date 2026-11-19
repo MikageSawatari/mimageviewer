@@ -94,7 +94,11 @@ impl StartupListIntent {
 
     pub(crate) fn folder_navigation(mode: &FolderNavMode) -> Self {
         match mode {
-            FolderNavMode::Grid | FolderNavMode::SiblingGrid => Self::ExplicitList,
+            FolderNavMode::Grid
+            | FolderNavMode::SiblingGrid
+            | FolderNavMode::ListOrder {
+                fullscreen: false, ..
+            } => Self::ExplicitList,
             FolderNavMode::Favsearch {
                 fullscreen: false, ..
             }
@@ -553,7 +557,7 @@ impl App {
             && same_list_target(requested, &target)
             && let Some(cursor) = cursor
         {
-            self.select_after_load = Some(cursor.name.clone());
+            self.select_after_load = Some(cursor.name.clone().into());
             self.grid_scroll.set_row_anchor(cursor.rows_above);
             self.try_select_after_load();
         }
@@ -574,7 +578,7 @@ impl App {
             && self.settings.restore_last_cursor
             && let Some(cursor) = cursor
         {
-            self.select_after_load = Some(cursor.name);
+            self.select_after_load = Some(cursor.name.into());
             self.grid_scroll.set_row_anchor(cursor.rows_above);
             self.try_select_after_load();
         }

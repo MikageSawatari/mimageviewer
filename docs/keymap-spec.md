@@ -1,5 +1,25 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+**タグビューの本の移動（§1.802）**
+
+メインのタグ結果から開いた本・フォルダでは、一覧の `GridTreeFolderPrev/Next`（既定 Ctrl+↑↓）と
+`GridSiblingFolderPrev/Next`（既定 Ctrl+PageUp/Down）、全画面の `FsCtrlNavPrev/Next` と
+`FsSiblingPrev/Next` が、どちらも本を開いた時点のタグ結果の絞り込み・並べ替え順で前後の本へ移る。
+Tag scope の凍結列を使い、結果一覧そのものでは一覧の両操作とも何もしない。
+結果の画像を直接全画面で見る場合や結果の行を特定できない場合は案内だけで、物理順へは移らない。
+一覧では main の open・履歴移動・一覧更新・hydration などの要求が進行中なら拒否し、累積しない。
+DirectNavigation の走査待ちだけは例外として受理し、既存の経路で退役する。全画面も既存の受付拒否を保つ。
+ページ一覧からも位置が求まる場合だけ同じ移動を受け付け、求まらなければページ一覧を閉じない。
+既存の KeyAction と実効キーを使い、新しい Action・既定キー・固定入力は追加しない。
+
+`FsListOrderPrev/Next`（既定 Ctrl+Shift+↑↓）も Tag scope を使える。全画面専用であること、
+全画面を保つ着地、準備中は拒否して累積しない契約は維持する。独立した別窓・F12 linked の
+一覧順操作と、タグビューのスライドショーの次フォルダ移動は拡張しない。
+一覧の BS でタグ結果へ戻ると再検索し、抜けてきた行を完全なパスで選ぶ。同名の行も取り違えない。
+移動先行へ直接着地した場合は一覧の BS 1 回、Folder 行の中の書庫へ着いた場合は Folder 行を経由する。
+全画面の BS は従来どおりページ一覧へ戻る操作で、その後の一覧の BS と区別する。
+詳細は [タグビューの結果順ナビゲーション設計](tag-view-result-order-navigation-802-plan.md) を参照。
+
 §1.791: 動画・音楽の相対シークとマーカー前後移動は再生／一時停止の意図を維持する。
 engine EOF 後の位置移動と、`VideoSeekStart`（既定 W）の「最初から再生」は再生を始める。
 既存の KeyAction・実効キー・固定矢印のルーティングは維持する。
@@ -1021,9 +1041,9 @@ fullscreen/native側からROOTへの新しい転送は加えない。
 | 既定キーなし (`GridOpenCurrentDriveRoot`) | 現在位置のルートディレクトリへ移動する。通常フォルダ、ZIP/PDF/変換アーカイブ内では `effective_folder()` のドライブ root / UNC share root を対象にする。検索中は成功採用で検索を終了する。★固定中・Everything 取得中は無効 |
 | 既定キーなし (`GridOpenDriveC..Z`) | 対応する `C:\`〜`Z:\` のドライブルートを直接開く |
 | 既定キーなし (`GridSwitchDriveC..Z`) | アクティブな A/B クイックフォルダスロットごとに覚えている、そのドライブの最後の場所へ切り替える。未訪問または最後の場所が存在しない場合は対象ドライブ root へフォールバックする |
-| <kbd>Ctrl</kbd>+<kbd>↑</kbd> | ツリー順で前のフォルダへ (DFS pre-order、画像なしフォルダは skip_limit までスキップ)。Action: `GridTreeFolderPrev`。検索中は前のヒットフォルダへ移動 (`global_search_ctrl_nav` / `favsearch_ctrl_nav`)。★固定 中は snapshot 内の前 entry へ。スマートフォルダでは Folder 内の DFS を維持し、端または root 直下の PDF/ZIP/変換書庫からは一覧表示順の前の Folder/本 entry へ（単体画像・動画は除外） |
-| <kbd>Ctrl</kbd>+<kbd>↓</kbd> | ツリー順で次のフォルダへ (DFS pre-order)。Action: `GridTreeFolderNext`。検索中は次のヒットフォルダへ移動。★固定 中は snapshot 内の次 entry へ。スマートフォルダでは Folder 内の DFS を維持し、端または root 直下の PDF/ZIP/変換書庫からは一覧表示順の次の Folder/本 entry へ（単体画像・動画は除外） |
-| <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。Action: `GridSiblingFolderPrev` / `GridSiblingFolderNext`。コレクション・スマートフォルダから開いた本では Ctrl+↑↓ と同じ由来順を使い、ZIP 内 DFS は飛ばす。ルート一覧そのものでは従来どおり無操作。それ以外は同じ親の直下だけを対象にし、空フォルダも skip せず、子や祖先の兄弟には入らない。検索中は無効。★固定 中は snapshot 内の前/次 image-like entry へ (Folder/Zip/Pdf entry は skip) |
+| <kbd>Ctrl</kbd>+<kbd>↑</kbd> | ツリー順で前のフォルダへ (DFS pre-order、画像なしフォルダは skip_limit までスキップ)。Action: `GridTreeFolderPrev`。検索中は前のヒットフォルダへ移動 (`global_search_ctrl_nav` / `favsearch_ctrl_nav`)。タグ結果から開いた本ではタグ結果順の前の本へ、結果一覧そのものでは何もしない。★固定 中は snapshot 内の前 entry へ。スマートフォルダでは Folder 内の DFS を維持し、端または root 直下の PDF/ZIP/変換書庫からは一覧表示順の前の Folder/本 entry へ（単体画像・動画は除外） |
+| <kbd>Ctrl</kbd>+<kbd>↓</kbd> | ツリー順で次のフォルダへ (DFS pre-order)。Action: `GridTreeFolderNext`。検索中は次のヒットフォルダへ移動。タグ結果から開いた本ではタグ結果順の次の本へ、結果一覧そのものでは何もしない。★固定 中は snapshot 内の次 entry へ。スマートフォルダでは Folder 内の DFS を維持し、端または root 直下の PDF/ZIP/変換書庫からは一覧表示順の次の Folder/本 entry へ（単体画像・動画は除外） |
+| <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。Action: `GridSiblingFolderPrev` / `GridSiblingFolderNext`。タグ結果から開いた本では Ctrl+↑↓ と同じタグ結果順で前 / 次の本へ、結果一覧そのものでは何もしない。コレクション・スマートフォルダから開いた本では Ctrl+↑↓ と同じ由来順を使い、ZIP 内 DFS は飛ばす。ルート一覧そのものでは従来どおり無操作。それ以外は同じ親の直下だけを対象にし、空フォルダも skip せず、子や祖先の兄弟には入らない。ほかの検索中は無効。★固定 中は snapshot 内の前/次 image-like entry へ (Folder/Zip/Pdf entry は skip) |
 | <kbd>Home</kbd> / <kbd>End</kbd> | サムネイル一覧の先頭 / 末尾へ移動する。Action: `GridMoveFirst` / `GridMoveLast` |
 | <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | サムネイル一覧を 1 ページ分前 / 次へ移動する。Action: `GridPagePrev` / `GridPageNext` |
 | <kbd>F1</kbd>〜<kbd>F5</kbd> | レーティング 1〜5。ドライブ一覧中は無効 |
@@ -1123,7 +1143,7 @@ Shift を伴う一覧カーソル移動と Shift+クリックは起点を保持�
 | <kbd>Space</kbd> | (画像) 選択 (チェック) トグル — スライドショー再生中なら停止 / (動画) 再生・一時停止トグル |
 | <kbd>Backspace</kbd> | フルスクリーンを 1 段閉じてグリッドビューへ戻る。Action: `FsBackToList`。ZIP/PDF/変換アーカイブ内のページ、または追加設定 ON の画像のみ通常フォルダでは、そのコンテナ / フォルダのページ一覧 (L2) を表示。ページ直接表示時の Esc/Enter と異なり、選択元の内部一覧への帰還や親への退出は行わない |
 | <kbd>Home</kbd> / <kbd>End</kbd> | フルスクリーン中の先頭 / 末尾の項目へ移動する。Action: `FsJumpFirst` / `FsJumpLast`。動画 native presenter 経路でも App 側へ転送する |
-| <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。同じ親の直下だけを対象にし、移動先に image-like があればフルスクリーンを維持して先頭 image-like を開く。なければ一覧へ戻る。切り離した detached 窓 / always-new 窓では、メイン bundle との境界をまたがないため無効化し案内だけ出す |
+| <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。タグ結果から開いた本では Ctrl+↑↓ と同じ結果順を使う。それ以外は同じ親の直下だけを対象にし、移動先に image-like があればフルスクリーンを維持して先頭 image-like を開く。なければ一覧へ戻る。切り離した detached 窓 / always-new 窓では、メイン bundle との境界をまたがないため無効化し案内だけ出す |
 | マウスホイール | 既定は前 / 次のファイル。通常のページ単位静止画では設定でページ内スクロールへ変更可能。縦/横連結モードでは連結方向へスクロール |
 | マウス戻る / 進む / ホイールクリック | `Settings.ring_shortcuts.mouse_buttons_image` / `mouse_buttons_video` に従い、物理戻る / 進むボタンとホイールクリックを個別に割り当てる。画像フルスクリーンでは Home/End 相当の先頭 / 末尾移動、全画面ズームモードも候補に含む。ウィンドウ最小化は通常フルスクリーン / detached viewer / native video で利用でき、動画は最小化後も再生を継続する。画像 / 動画フルスクリーンのマウスボタン候補では `C:\`〜`Z:\`、お気に入り、本・コレクションの番号/前後移動、閲覧履歴、★一覧などの場所移動系は表示しない。動画の小 / 中 / 大シーク 6 操作は v3.7.0 で一旦候補・実行を抑止したが、次版の検証 build では利用者の明示指示により再公開する。保存済みの割り当ても同じ共有 resolver から実行する。機器によって 1 クリックが複数 producer から届く根因と hold/release 契約は未解決で、時間 debounce や scan 0 の一律破棄は行わない。fresh provenance trace 後に恒久修正する。保存値、キーボード、リング、マウスジェスチャ、ゲームパッド、左右タップのシークと通常ホイールの音量調整は従来どおり。新規環境と既定リセットは戻る / 進むがフォルダ履歴、ホイールクリックは未割り当て。従来どおりを選んだ既存環境は戻る / 進むのみ Ctrl+↑ / Ctrl+↓ 相当。ホイールクリックは 500ms 以内かつドラッグしきい値以下の短クリックだけ発火し、中ボタンドラッグズームとは分離する。全画面ズームモードへ割り当てた場合、Z キー長押し時の照準表示はスキップして現在のカーソル位置でズーム状態へ入る |
 | マウス左クリック | (画像) 未操作の表示では即座にページめくり。LTR では右半分クリックで次 / 左半分クリックで前、RTL では左右反転。利用者の移動・拡大・縮小・回転後は送らない。「読み始め」の自動配置だけでは停止しない / (動画) 再生・一時停止トグル |
@@ -1266,9 +1286,9 @@ keyzoom-1470 の dev-runtime ビルド、JIS 配列): 1200×900 の PNG を画�
 | <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 現在の表示順で、環境設定の「ページジャンプ量」ぶん前 / 次へジャンプ。Action: `FsFixedJumpPrev` / `FsFixedJumpNext`。既定は全ページの 10%。固定ページ数にも切替可。見開き中は最低 2 ページ進む。左右の意味はページ表示の RTL で反転し、「カーソルキー左右の方向」の影響は受けない。動画は対象外 |
 | <kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 縦/横連結モードでは画面単位で連結方向へスクロール。通常のページ単位表示では、環境設定の「ページジャンプ量」ぶん前 / 次へジャンプする。Action: `FsFixedJumpPrevNoRtl` / `FsFixedJumpNextNoRtl`。こちらは PageUp/PageDown へ割り当てる用途のため RTL でも前 / 次の意味を反転しない。修飾なし矢印ナビゲーションは文脈依存の固定入力として残す一方、メタデータパネル・ページジャンプ・Home/End 先頭末尾移動など副作用が明確な操作は KeyAction 化して競合検出対象にする |
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 見開きの「1 ページずらし」(現在の表示ユニット先頭を軸に見開きを 1 ページぶんずらす。空白/欠落ページでの綴じずれ補正。端の no-op は保存しない)。適格な本では既定ONの全体記憶設定に従い、実際の内部アンカーのPageRefを`spread_shift.db`へ保存する。通常一覧と記憶OFFではセッション調整。`spread_db`のmodeは保存し直さない。Single / Split モードでは従来の前 / 次ページ移動。ページ表示が RTL なら左右の意味を反転し、「カーソルキー左右の方向」の影響は受けない。リング / マウス / パッド用の操作候補には、この左右版に加えて PageUp/PageDown と同じく RTL でも前 / 次を反転しない「前 / 次」版を用意する |
-| <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | ツリー順で前 / 次のフォルダへ移動する。Action: `FsCtrlNavPrev` / `FsCtrlNavNext`。スマートフォルダでは Folder 内 DFS の端と root 直下の本から、一覧表示順の Folder/PDF/ZIP/変換書庫へ移る。独立 detached 静止画窓では main の検索・絞り込みを継承せず、窓自身の物理順で通常画像フォルダ / ZIP / CBZ / PDF へ移動する |
-| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 一覧の表示順で前 / 次の本を開く。Action: `FsListOrderPrev` / `FsListOrderNext` (`FsCommon` / Press / `EachPhysicalPress`)。最後に通常フォルダ / Everything 結果一覧から本を開く操作を受け付けた時点の絞り込み・並べ替え順を使い、その一覧の中だけを移動する。Everything は同じ accepted run の本で使用でき、成功採用で検索の帰路基準を移動先行へ揃える。Ctrl+↑↓ の DFS と異なりサブフォルダへは降りない。使える範囲・停止条件は [一覧順ナビゲーション設計](list-order-book-navigation-plan.md) 参照 |
-| <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 同じ親直下の前 / 次の兄弟フォルダへ移動する。Action: `FsSiblingPrev` / `FsSiblingNext`。コレクション・スマートフォルダから開いた本では Ctrl+↑↓ と同じ由来順を使い、ZIP 内 DFS は飛ばす。CollectionRoot の直接画像・動画の全画面も同じ。独立 detached 静止画窓は Ctrl+↑↓ が Collection origin を使う場合は同じ順を使い、それ以外は窓自身の物理兄弟順を使う |
+| <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | ツリー順で前 / 次のフォルダへ移動する。Action: `FsCtrlNavPrev` / `FsCtrlNavNext`。タグ結果から開いた本ではタグ結果順で前 / 次の本へ移る。結果の画像を直接見ているときは案内だけ。スマートフォルダでは Folder 内 DFS の端と root 直下の本から、一覧表示順の Folder/PDF/ZIP/変換書庫へ移る。独立 detached 静止画窓では main の検索・絞り込みを継承せず、窓自身の物理順で通常画像フォルダ / ZIP / CBZ / PDF へ移動する |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 一覧の表示順で前 / 次の本を開く。Action: `FsListOrderPrev` / `FsListOrderNext` (`FsCommon` / Press / `EachPhysicalPress`)。最後に通常フォルダ / Everything / タグ結果一覧から本を開く操作を受け付けた時点の絞り込み・並べ替え順を使い、その一覧の中だけを移動する。Everything・Tag は同じ run の本で使用でき、成功採用で検索の帰路基準を移動先行へ揃える。サブフォルダへは降りない。全画面専用の受付・着地は維持する。使える範囲・停止条件は [一覧順ナビゲーション設計](list-order-book-navigation-plan.md) 参照 |
+| <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 同じ親直下の前 / 次の兄弟フォルダへ移動する。Action: `FsSiblingPrev` / `FsSiblingNext`。タグ結果から開いた本では Ctrl+↑↓ と同じタグ結果順で前 / 次の本へ移る。結果の画像を直接見ているときは案内だけ。コレクション・スマートフォルダから開いた本では Ctrl+↑↓ と同じ由来順を使い、ZIP 内 DFS は飛ばす。CollectionRoot の直接画像・動画の全画面も同じ。独立 detached 静止画窓は Ctrl+↑↓ が Collection origin を使う場合は同じ順を使い、それ以外は窓自身の物理兄弟順を使う |
 | <kbd>0</kbd> 〜 <kbd>7</kbd> | <kbd>1</kbd>〜<kbd>5</kbd>: ページ構成切替 (<kbd>1</kbd>: 単ページ / <kbd>2</kbd>: 見開き 左開き / <kbd>3</kbd>: 見開き 左開き+表紙単独 / <kbd>4</kbd>: 見開き 右開き / <kbd>5</kbd>: 見開き 右開き+表紙単独)。<kbd>6</kbd>: 連結方式をページ単位 → 縦連結 → 横連結で循環。<kbd>7</kbd>: 横方向 左→右 / 右→左を切替。<kbd>0</kbd>: ズーム/フィットをページ全体 → 横幅フィット → 縦幅フィット → 100%原寸 → 指定サイズで循環。余白カットは左パネルの表示トリムで設定する。見開き中は表紙あり/なしを保ったまま左開き / 右開きも連動して切り替える。ZIP の作品区切り表示上でも有効。ホバーバーの表示モード/フィットボタンからも切替可 |
 | 既定キーなし (`FsTogglePageAfterCoverAlone` / `FsToggleLastPageAlone`) | 表紙あり見開きで、表紙の次 / 最終ページを白い相方付きで単独表示する本別設定を切り替える。全体設定に従う状態からは現在の実効値の反対を明示保存する。表紙なし見開き・単ページ・横長分割では値だけ変更し、表示には適用しない |
 
@@ -1545,9 +1565,9 @@ SNS 中の通常 `FsExport` は案内だけを表示し、枠の確定・取消�
 | <kbd>↑</kbd> / <kbd>↓</kbd> | **前 / 次のファイル** (画像と同じ) | Phase 7.H |
 | 修飾なしマウスホイール | 前 / 次のファイル（既定）、または音量調整 | `Settings.ring_shortcuts.video_normal_wheel_action`。動画・音声共通で、操作カスタマイズ「マウスボタン」から選択。パネル・モーダル・ストリップ、360度・拡大表示など既存の入力所有を優先し、KeyAction にはしない |
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 音量を dB フェーダー目盛りの 1/4 幅で上下 | |
-| <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 現在コンテキストの前 / 次フォルダまたは検索結果へ移動 | native presenter 経路でも有効。切り離した detached 窓 / always-new 窓ではメイン一覧を動かさず、案内だけ出す |
-| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 最後に通常フォルダ / Everything 結果一覧から本を開く操作を受け付けた時点の、その一覧の表示順で前 / 次の本を開く | `FsListOrderPrev` / `FsListOrderNext`。native presenter でも同じ handler を使う。別窓・★固定中・保持した一覧に現在の本が無いときや scope 不一致なら案内だけ出し、準備中の追加入力は受け付けない。Everything の帰路は成功採用した行へ揃える。native の repeat 受付は既存 Ctrl+↑↓ と同じく無視 |
-| <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ | コレクション・スマートフォルダから開いた本では Ctrl+↑↓ と同じ由来順（ZIP 内 DFS は飛ばす）。それ以外は同じ親の直下だけを対象にし、空フォルダも skip しない。検索中は無効。detached は Ctrl+↑↓ が Collection origin を使う場合だけ同じ順を使い、それ以外の既存制約は維持する |
+| <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 現在コンテキストの前 / 次フォルダまたは検索結果へ移動 | native presenter 経路でも有効。タグ結果から開いた本はタグ結果順を使い、結果の動画を直接見ている場合は案内だけ。切り離した detached 窓 / always-new 窓ではメイン一覧を動かさず、案内だけ出す |
+| <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 最後に通常フォルダ / Everything / タグ結果一覧から本を開く操作を受け付けた時点の、その一覧の表示順で前 / 次の本を開く | `FsListOrderPrev` / `FsListOrderNext`。native presenter でも同じ handler を使う。別窓・★固定中・保持した一覧に現在の本が無いときや scope 不一致なら案内だけ出し、準備中の追加入力は受け付けない。Everything・タグビューの帰路は成功採用した行へ揃える。native の repeat 受付は既存 Ctrl+↑↓ と同じく無視 |
+| <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ | タグ結果から開いた本では Ctrl+↑↓ と同じ結果順。結果の動画を直接見ている場合は案内だけ。コレクション・スマートフォルダから開いた本では Ctrl+↑↓ と同じ由来順（ZIP 内 DFS は飛ばす）。それ以外は同じ親の直下だけを対象にし、空フォルダも skip しない。ほかの検索中は無効。detached は Ctrl+↑↓ が Collection origin を使う場合だけ同じ順を使い、それ以外の既存制約は維持する |
 | <kbd>M</kbd> | ミュート トグル | |
 | 既定キーなし | 次の再生可能な音声トラックへ循環 | Action: `VideoNextAudioTrack`。`[FsVideo]` で割り当て可能。動画 HUD と動画→音声モード HUD の「音声 N」からも直接選べる。1 本以下では何もしない |
 | <kbd>L</kbd> | ループ再生 トグル | 連続再生 ON 中は無効化し、「連続再生中はループ無効」を表示 |
