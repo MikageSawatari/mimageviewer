@@ -484,8 +484,12 @@
   2. 親は同じテストの実行体 (`std::env::current_exe()`) を子として起動し、`#[ignore]` を付けた雛形作成用のテスト 1 本だけを
      `--exact --ignored` で走らせる。作業用の data_dir と capability は、テストのコードだけが読む環境変数で渡す。
   3. 子は、fixture の `Fresh` と同じ手順 (lock・override・epoch の scope・`AiRuntimeFixture::NotStarted`・settings は `None`) で
-     App を作って drop し、終了する。プロセスが終わるので、drop の後も残る worker や接続もすべて閉じる。
-  4. 親は子の終了コードが 0 であることを確かめる (0 でなければ panic)。作業用の data_dir の直下の `*.db` (`settings.db` を除く) を
+     App を作って drop し、最後に作業フォルダへ完了の印 (`builder-done`) を書いて終了する。
+     プロセスが終わるので、drop の後も残る worker や接続もすべて閉じる。
+     雛形作成用のテストの完全な名前は 1 か所の定数にし、親はその定数で子を起動する。
+  4. 親は、子の終了コードが 0 で、完了の印が在り、複写する DB が 1 個以上あることを確かめる (どれかが欠ければ panic)。
+     libtest は exact の名前が一致しないと 0 件の実行で正常終了するので、終了コードだけでは雛形作成用のテストが走ったことにならない。
+     作業用の data_dir の直下の `*.db` (`settings.db` を除く) を
      1 つずつ rusqlite で開き、`PRAGMA wal_checkpoint(TRUNCATE)` をしてから閉じ、`-wal` が残っていない (または 0 バイト) ことを確かめてから、
      `<鍵>.tmp-<pid>\` の直下へ複写する。複写した DB の名前の一覧を `manifest.txt` に書く。作業用の data_dir は消す。
   5. `<鍵>.tmp-<pid>` を `<鍵>` へ rename する。先に置いたほうが勝ち、負けたほうは自分の tmp を消す。
@@ -503,7 +507,7 @@
 - 保証の範囲: 通常のローカルの cargo のリンクで作られた実行体だけを対象にする。cargo はソースが変われば実行体をリンクし直し、
   大きさか最終更新時刻が変わる。同じ stem・同じ大きさ・同じ最終更新時刻を持つ別の内容の実行体への置き換えは対象外とする。
   実行体の中身のハッシュ (1.7 GB) は遅いので取らない。
-- 置き場所: `<実行体のフォルダ>\app-test-template\<鍵>` (nextest・cargo test とも `target\<profile>\deps\` の下)。
+- 置き場所: `<std::env::current_exe() の親のフォルダ>\app-test-template\<鍵>`。実行体の場所は cargo の版で変わり得るので、決め打ちせず `current_exe()` から求める。
   file stem ごとに分かれるので、feature 違いの別のテスト実行体の雛形とは混ざらない。
 
 ### 10.5 雛形に入れるファイル
@@ -520,10 +524,16 @@
 - (a) 新規作成の起動の契約 (`Fresh`、決定的): 空の data_dir で App を作り、drop の前に、constructor が開く DB の owner がすべて
   在る (`None` になっていない) こと、`spread_db` などの open が成功していることを確かめる。constructor の多くの DB の open は
   失敗を `.ok()` で `None` にするので、新規作成の時だけ失敗する退行は、雛形のテストでは見えない。ここで検出する。
+  - owner が在ることは thread の起動の成功しか意味しない (worker の中で DB を開くもの: `book_bookmarks`・`content_identity`・
+    `auto_aspect_cache`・resume writer など)。そうした owner は、実際の応答で初期化の成功を確かめる
+    (例: content identity の初期の読み込みの成功、bookmarks の `list_all` の成功、auto-aspect の Count の応答、resume writer の読み出しの結果)。
+    `is_busy() == false` のような「止まっている」ことの確認では、失敗して終わった worker と区別できないので使わない。
+    constructor が作る、worker の中で DB を開く owner を列挙して、すべてに対して行う。
 - (b) 雛形と今の経路の比較 (決定的): 同じテストの中で、`Fresh` の App と `Template` の App をそれぞれ作って drop し、2 つの data_dir を比べる。
   - 雛形の `manifest.txt` の DB の集合が、`Fresh` で作られた DB の集合 (`settings.db` を除く) と同じであること
     (雛形に無い DB を constructor が作り直して比較を通ってしまう場合を区別する)。
-  - 各 DB の `sqlite_master` (表・索引・trigger の定義)、`user_version`、すべての表の行が同じであること。
+  - `manifest.txt` に載った各 DB の `sqlite_master` (表・索引・trigger の定義)、`user_version`、すべての表の行が同じであること
+    (`settings.db` は雛形に入れないので比べない。移行の時刻と `book_root` の保存値が違うため)。
     正規化するのは次だけ: `folder_thumb_pin_revision.instance_id` (UUID の形式であること・1 行・revision 0 を別に確かめ、値は比べない)。
     ほかに違う値が出たら、正規化を足す前に、その値がテストごとに違ってよいものかを確かめて記録する。
   - DB でないファイルの名前の集合も比べる。`settings.json.migrated-<時刻>` の時刻の部分だけ正規化する。
@@ -563,6 +573,9 @@
 - 全行の一致 → `instance_id` と移行の退避名の時刻だけを正規化する (P2)。
 - 鍵の保証の範囲を、通常のローカルの cargo のリンクに限ると明記した (P3)。
 - -wal が 0 バイトであることの確認だけ → 子プロセスの終了の後に checkpoint してから複写する (drop の後も接続を持つ worker があるため)。
+- 2 回目のレビュー (ACCEPT WITH CHANGES) で足した点: 新規作成の起動の契約に worker の初期化の成功の確認を足した (P1)。
+  子の終了コードに加えて完了の印と DB が 1 個以上あることを確かめる (P2)。比べる DB を manifest に載ったものに限った (P3)。
+  置き場所を `current_exe()` から求める (P3)。
 
 ### 10.10 計測
 
