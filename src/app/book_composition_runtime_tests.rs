@@ -1538,6 +1538,8 @@ fn g3_source_terminal_reopen_opens_immediately_after_automatic_startup() {
 #[cfg(windows)]
 #[test]
 fn startup_notices_book_wait_escape_and_close_retire_reopen_before_late_completion() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     use super::tests::startup_notices::{WAITING_SESSION_END_ROUTES, end_waiting_viewer};
     for projection in [true, false] {
         for close in [

@@ -456,6 +456,8 @@ fn startup_notices_defer_during_mounted_detached_preparation_without_an_index() 
 #[cfg(windows)]
 #[test]
 fn startup_notices_archive_wait_escape_and_close_keep_work_but_retire_late_reopen() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     use crate::ui_dialogs::archive_convert::{
         ArchiveConvertCompletionPolicy, ArchiveConvertMsg, ArchiveConvertPhase,
         ArchiveConvertProgressShared, ArchiveConvertState, ArchiveScanOutcome,
@@ -768,6 +770,8 @@ fn startup_notices_defer_drawing_modal_and_escape_in_every_viewer_mode() {
 
 #[test]
 fn startup_notices_embedded_viewer_escape_does_not_acknowledge_notice_in_same_pass() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut app = setup_app();
     request_whats_new(&mut app);
     app.items = vec![GridItem::Image(PathBuf::from("notice-test.jpg"))];

@@ -625,6 +625,8 @@ fn saved_position_book_clear_rejects_duplicate_command_and_preferences_requests(
 #[cfg(windows)]
 #[test]
 fn saved_position_clear_music_normalize_modal_blocks_both_commands_like_native() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     use crate::keyboard_input::{KeyboardOwner, ShortcutScope, ShortcutSurface};
     for video_audio_mode in [false, true] {
         for action in ["ClearVideoMediaMemory", "ClearBookResumePositions"] {
@@ -925,6 +927,8 @@ fn saved_position_book_clear_completion_returns_to_native_origin_after_main_rest
 
 #[test]
 fn saved_position_clear_egui_image_and_audio_handlers_respect_keyboard_ownership() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     use crate::keyboard_input::{KeyboardOwner, ShortcutScope, ShortcutSurface, TextInputPhase};
     for audio in [false, true] {
         for blocked in [

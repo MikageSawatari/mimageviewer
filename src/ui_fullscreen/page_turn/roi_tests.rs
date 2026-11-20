@@ -186,6 +186,8 @@ fn warm_unit(app: &mut App, ctx: &egui::Context, gpu: &egui_wgpu::RenderState, a
 
 #[test]
 fn page_turn_actual_native_roi_roundoff_starts_and_completes_ltr_rtl_forward_backward() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     crate::test_gpu_group::assert_gpu_test_group();
     // One headless GPU and two app factories cover both directions and the
     // genuine-partial fallback. No desktop, profile, file, or product launch.

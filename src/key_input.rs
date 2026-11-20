@@ -3361,10 +3361,20 @@ pub fn resolve_synthetic_routing_target()
 /// there would describe the wrong moment whenever messages are drained late,
 /// which is exactly the slow-frame case this timeline exists to reproduce.
 fn physical_key_down_from(slot: PhysicalKeySlot, os_level: impl FnOnce() -> bool) -> bool {
+    #[cfg(test)]
+    assert_test_input_locked();
+
     if let Ok(guard) = state().lock()
         && guard.synthetic.armed
     {
         return guard.synthetic.physical_key_down(slot);
+    }
+    #[cfg(test)]
+    if TEST_KEYBOARD_SOURCE.get() != TestKeyboardSource::InjectedReader {
+        // Do not arm the timeline just to replace the OS level: materialization,
+        // routing, focus and repeat must still require explicit synthetic input.
+        // This scope survives clear/reset, which replace the whole KeyInputState.
+        return false;
     }
     os_level()
 }
@@ -5329,6 +5339,49 @@ fn materialize_test_synthetic_input(
 #[cfg(test)]
 static TEST_INPUT_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TestKeyboardSource {
+    Unlocked,
+    Released,
+    InjectedReader,
+}
+
+#[cfg(test)]
+thread_local! {
+    // A different test's process-global lock must not authorize this thread.
+    // App-driving helper threads take lock_test_input() themselves.
+    static TEST_KEYBOARD_SOURCE: std::cell::Cell<TestKeyboardSource> =
+        const { std::cell::Cell::new(TestKeyboardSource::Unlocked) };
+}
+
+#[cfg(test)]
+fn assert_test_input_locked() {
+    assert!(
+        TEST_KEYBOARD_SOURCE.get() != TestKeyboardSource::Unlocked,
+        "test keyboard read requires lock_test_input() on the thread driving the App; \
+         tests must not read the real keyboard"
+    );
+}
+
+/// Exercise caller-specific OS reader plumbing with an injected reader only.
+/// Keep this private so application tests cannot opt back into the real keyboard.
+#[cfg(test)]
+fn physical_key_down_from_test_reader(
+    slot: PhysicalKeySlot,
+    reader: impl FnOnce() -> bool,
+) -> bool {
+    assert_test_input_locked();
+    struct RestoreSource(TestKeyboardSource);
+    impl Drop for RestoreSource {
+        fn drop(&mut self) {
+            TEST_KEYBOARD_SOURCE.set(self.0);
+        }
+    }
+    let _restore = RestoreSource(TEST_KEYBOARD_SOURCE.replace(TestKeyboardSource::InjectedReader));
+    physical_key_down_from(slot, reader)
+}
+
 /// Drop every piece of process-global key-input state that tests write.
 ///
 /// This is the whole `KeyInputState`, not just the current frame: tests also arm the synthetic
@@ -5360,11 +5413,16 @@ impl Drop for TestInputGuard {
         // Still holding the lock here, so the reset cannot race the next holder. This keeps the
         // state from leaking into tests that read it without taking the lock at all.
         reset_test_input_state();
+        TEST_KEYBOARD_SOURCE.set(TestKeyboardSource::Unlocked);
     }
 }
 
 /// Serialize this test against every other test that shares the process-global key-input state,
 /// and hand it a clean state.
+///
+/// Physical levels default to released on this thread, including after synthetic clear/reset.
+/// Explicit synthetic arming still owns its levels, edges, routing and repeats. A helper thread
+/// that drives the App must acquire its own guard; another thread's guard does not authorize it.
 ///
 /// Recovering from a poisoned lock is correct here because the mutex guards no data (`Mutex<()>`);
 /// it only orders tests, so a panic while it is held cannot leave a broken invariant behind it.
@@ -5383,6 +5441,7 @@ pub(crate) fn lock_test_input() -> TestInputGuard {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     reset_test_input_state();
+    TEST_KEYBOARD_SOURCE.set(TestKeyboardSource::Released);
     TestInputGuard { _serial: serial }
 }
 
@@ -9130,9 +9189,9 @@ mod tests {
         consume_all_key_down_with_result, consume_key_down, consume_key_edges,
         diagnostic_pressed_key_down_any_viewport, enqueue_test_synthetic_command, lock_test_input,
         materialize_test_synthetic_input, physical_key_down, physical_key_down_from,
-        pressed_key_down, register_test_synthetic_target, resolve_synthetic_routing_target,
-        set_test_frame, set_test_frame_for_viewport, set_test_routed_frame,
-        set_test_synthetic_repeat, state,
+        physical_key_down_from_test_reader, pressed_key_down, register_test_synthetic_target,
+        resolve_synthetic_routing_target, set_test_frame, set_test_frame_for_viewport,
+        set_test_routed_frame, set_test_synthetic_repeat, state,
     };
     #[cfg(windows)]
     use super::{
@@ -10983,7 +11042,7 @@ mod tests {
         let _cleanup = ClearSyntheticInput;
 
         let mut consulted = 0_u32;
-        let level = physical_key_down_from(PhysicalKeySlot::new(0x27, true), || {
+        let level = physical_key_down_from_test_reader(PhysicalKeySlot::new(0x27, true), || {
             consulted += 1;
             true
         });
@@ -10993,15 +11052,77 @@ mod tests {
         // Once armed, the timeline replaces the OS source entirely.
         arm_test_synthetic_input(0x403, egui::ViewportId::ROOT);
         let mut armed_consulted = 0_u32;
-        let armed_level = physical_key_down_from(PhysicalKeySlot::new(0x27, true), || {
-            armed_consulted += 1;
-            true
-        });
+        let armed_level =
+            physical_key_down_from_test_reader(PhysicalKeySlot::new(0x27, true), || {
+                armed_consulted += 1;
+                true
+            });
         assert!(!armed_level, "no synthetic key is held yet");
         assert_eq!(
             armed_consulted, 0,
             "an armed timeline must not consult the OS"
         );
+    }
+
+    #[test]
+    fn locked_keyboard_defaults_to_released_even_after_synthetic_clear_and_reset() {
+        let _serial = lock_test_input();
+        let slot = PhysicalKeySlot::new(0x11, false);
+        let released = || {
+            let mut consulted = false;
+            assert!(!physical_key_down_from(slot, || {
+                consulted = true;
+                true
+            }));
+            assert!(
+                !consulted,
+                "the default test keyboard must not consult the OS"
+            );
+            assert!(!physical_key_down(slot));
+        };
+        released();
+        assert!(!materialize_test_synthetic_input(Instant::now(), |_| Some(true)).armed);
+        arm_test_synthetic_input(0x403, egui::ViewportId::ROOT);
+        clear_test_synthetic_input();
+        released();
+        super::reset_test_input_state();
+        released();
+
+        // The plumbing helper's opt-in is scoped, including during unwinding.
+        assert!(physical_key_down_from_test_reader(slot, || true));
+        released();
+        let panic = std::panic::catch_unwind(|| {
+            physical_key_down_from_test_reader(slot, || panic!("injected reader panic"))
+        });
+        assert!(panic.is_err());
+        released();
+    }
+
+    #[test]
+    #[should_panic(expected = "test keyboard read requires lock_test_input()")]
+    fn unlocked_keyboard_read_requires_its_own_test_input_lock() {
+        physical_key_down_from(PhysicalKeySlot::new(0x11, false), || {
+            panic!("an unlocked test must be rejected before consulting the OS")
+        });
+    }
+
+    #[test]
+    fn another_threads_input_lock_does_not_authorize_keyboard_reads() {
+        let _serial = lock_test_input();
+        // Even an armed timeline owned by another test must not hide a missing lock.
+        arm_test_synthetic_input(0x403, egui::ViewportId::ROOT);
+        let panic = std::thread::spawn(|| {
+            std::panic::catch_unwind(|| physical_key_down(PhysicalKeySlot::new(0x11, false)))
+                .expect_err("the helper thread does not own the input lock")
+        })
+        .join()
+        .expect("the helper catches the expected keyboard assertion");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("keyboard assertion has a string panic message");
+        assert!(message.contains("test keyboard read requires lock_test_input()"));
     }
 
     #[test]

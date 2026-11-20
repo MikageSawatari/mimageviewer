@@ -1624,6 +1624,8 @@ fn section1335_failed_ab_switch_preserves_source_then_successful_explicit_switch
 #[test]
 #[cfg(windows)]
 fn section1335_back_to_list_key_rejected_by_modal_then_accepted_updates_record_once() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let (mut env, parent, book) = book_env();
     env.settings.video_in_window_mode = false;
     open_zip(&mut env, &book, true);

@@ -1587,6 +1587,8 @@ fn same_generation_reader_order_change_retires_hidden_position_ranges() {
 
 #[test]
 fn continuous_actual_paint_never_uses_checking_or_hidden_cached_resources() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     for cache in ["raw", "processed", "thumbnail", "holdover"] {
         let data = tempfile::tempdir().unwrap();
         let (service, owner) =

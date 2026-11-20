@@ -62056,6 +62056,8 @@ mod tests {
 
     #[test]
     fn realmachine55_navigator_positionless_release_cancels_without_header_action() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         for panorama in [false, true] {
             let ctx = egui::Context::default();
             let (mut app, image_rect, fs_idx) = if panorama {
@@ -62121,6 +62123,8 @@ mod tests {
 
     #[test]
     fn realmachine55_navigator_positionless_release_retires_only_its_selection() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         for panorama in [false, true] {
             let ctx = egui::Context::default();
             let (mut app, image_rect, fs_idx) = if panorama {
@@ -75575,6 +75579,8 @@ mod tests {
 
     #[test]
     fn navigator_corner_press_never_starts_canvas_interaction_and_release_cleans_owner() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let layout = app.fs_navigator_layout(image_rect).unwrap();
@@ -75636,6 +75642,8 @@ mod tests {
     /// 一度出したナビゲータを消せなかった (§1.63)。閉じるボタンが画面上の出口。
     #[test]
     fn navigator_close_button_clears_the_persisted_visibility() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let layout = app.fs_navigator_layout(image_rect).unwrap();
@@ -75764,6 +75772,8 @@ mod tests {
     /// タッチには副ボタンが無いので、指から届く方に「移動」を置いている。
     #[test]
     fn navigator_primary_drag_moves_the_frame_and_secondary_selects_a_range() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, _) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let layout = app.fs_navigator_layout(image_rect).unwrap();
@@ -77115,6 +77125,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn locked_fullscreen_similar_panel_move_button_admits_the_physical_scan() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, _, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         install_fs_navigator_input_tracking(&ctx);
@@ -77205,6 +77217,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn book_query_demand_follows_panel_and_fullscreen_render_routes() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         use crate::similar_book_query::BookQueryDemandSnapshot;
 
         let (mut app, _, fs_idx) = setup_flat_navigator_input_test();
@@ -77424,6 +77438,7 @@ mod tests {
         spread_mode: crate::settings::SpreadMode,
         pinned_normal: bool,
     ) {
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         configure_similar_preview_layout_mode(&mut app, fs_idx, mode);
@@ -77691,6 +77706,8 @@ mod tests {
 
     #[test]
     fn navigator_ordered_primary_and_secondary_streams_finish_without_stale_drag_owner() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let layout = app.fs_navigator_layout(image_rect).unwrap();
@@ -77757,6 +77774,8 @@ mod tests {
 
     #[test]
     fn navigator_press_inside_then_release_outside_same_frame_finishes_owned_pan() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, _) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let layout = app.fs_navigator_layout(image_rect).unwrap();
@@ -77783,6 +77802,8 @@ mod tests {
 
     #[test]
     fn navigator_selection_release_before_header_click_commits_in_event_order() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, _) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let layout = app.fs_navigator_layout(image_rect).unwrap();
@@ -77824,6 +77845,8 @@ mod tests {
 
     #[test]
     fn reserved_selection_is_consumed_only_by_the_next_original_geometry_frame() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         begin_navigator_preview_for_test(&mut app, &ctx, fs_idx);
@@ -77913,6 +77936,8 @@ mod tests {
 
     #[test]
     fn navigator_wheel_ownership_uses_position_at_each_ordered_event() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, _) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let layout = app.fs_navigator_layout(image_rect).unwrap();
@@ -77973,6 +77998,8 @@ mod tests {
 
     #[test]
     fn navigator_begin_pass_tracking_covers_passive_gaps_and_pointer_gone() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, _) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         install_fs_navigator_input_tracking(&ctx);
@@ -78251,6 +78278,8 @@ mod tests {
 
     #[test]
     fn preview_release_then_navigator_press_is_owned_and_applied_to_original_layout() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         begin_navigator_preview_for_test(&mut app, &ctx, fs_idx);
@@ -78317,6 +78346,8 @@ mod tests {
 
     #[test]
     fn reserved_preview_navigator_input_never_leaks_when_original_layout_is_unavailable() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         begin_navigator_preview_for_test(&mut app, &ctx, fs_idx);
@@ -78377,6 +78408,8 @@ mod tests {
 
     #[test]
     fn preview_navigator_header_and_wheel_actions_are_each_applied_once() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         begin_navigator_preview_for_test(&mut app, &ctx, fs_idx);
@@ -78490,6 +78523,8 @@ mod tests {
 
     #[test]
     fn navigator_zoom_mode_short_press_then_header_preserves_off_center_view_until_next_layout() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         app.fs_zoom_active = true;
@@ -78601,6 +78636,8 @@ mod tests {
 
     #[test]
     fn navigator_center_intent_survives_header_and_park_until_real_layout_consumes_it() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let source_uv = egui::pos2(0.75, 0.35);
@@ -78671,6 +78708,8 @@ mod tests {
 
     #[test]
     fn navigator_pending_center_then_new_pan_uses_the_centered_baseline() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let source_uv = egui::pos2(0.8, 0.4);
@@ -78898,6 +78937,8 @@ mod tests {
 
     #[test]
     fn navigator_double_click_still_centers_the_selected_source_position() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let layout = app.fs_navigator_layout(image_rect).unwrap();
@@ -78941,6 +78982,8 @@ mod tests {
 
     #[test]
     fn navigator_fixed_visible_header_release_respects_focus_event_order() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let run_case = |release_before_focus_loss: bool| {
             let (mut app, image_rect, _) = setup_flat_navigator_input_test();
             let ctx = egui::Context::default();
@@ -78981,6 +79024,8 @@ mod tests {
 
     #[test]
     fn navigator_focus_restore_requires_a_new_press_before_flat_pan_restarts() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, _) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         let layout = app.fs_navigator_layout(image_rect).unwrap();
@@ -79029,6 +79074,8 @@ mod tests {
 
     #[test]
     fn navigator_zoom_mode_same_pass_double_click_keeps_clicked_center_until_real_layout() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, fs_idx) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         app.fs_zoom_active = true;
@@ -79117,6 +79164,8 @@ mod tests {
 
     #[test]
     fn panorama_navigator_header_release_respects_focus_event_order() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let run_case = |release_before_focus_loss: bool| {
             let ctx = egui::Context::default();
             let (mut app, image_rect, _) = setup_panorama_navigator_input_test(&ctx);
@@ -79165,6 +79214,8 @@ mod tests {
 
     #[test]
     fn panorama_navigator_same_pass_double_click_uses_adjudicated_release_position() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         let (mut app, image_rect, fs_idx) = setup_panorama_navigator_input_test(&ctx);
         let layout = app.panorama_navigator_layout(image_rect, fs_idx).unwrap();
@@ -79199,6 +79250,8 @@ mod tests {
 
     #[test]
     fn navigator_consumption_still_updates_side_panel_hover_latches() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (mut app, image_rect, _) = setup_flat_navigator_input_test();
         let ctx = egui::Context::default();
         install_fs_navigator_input_tracking(&ctx);
@@ -79354,6 +79407,8 @@ mod tests {
 
     #[test]
     fn normal_video_wheel_setting_only_replaces_the_unmodified_media_fallback() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = crate::app::setup_app_for_test();
         let video_path = PathBuf::from("c:/test/wheel-video.mp4");
         let audio_path = PathBuf::from("c:/test/wheel-audio.flac");
@@ -80745,6 +80800,8 @@ mod tests {
 
     #[test]
     fn continuous_touch_drag_keeps_terminal_delta_and_next_tap_while_mouse_stays_unchanged() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
             egui::Event::Touch {
                 device_id: egui::TouchDeviceId(41),
@@ -82207,6 +82264,8 @@ mod tests {
 
     #[test]
     fn touch_panel_dismiss_release_clears_suppression_and_next_drags_pan() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         fn touch(phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
             egui::Event::Touch {
                 device_id: egui::TouchDeviceId(31),
@@ -82462,6 +82521,8 @@ mod tests {
 
     #[test]
     fn fullscreen_right_drag_left_cancel_consumes_release_and_keeps_normal_click() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         fn pointer(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
             egui::Event::PointerButton {
                 pos,
@@ -97334,6 +97395,8 @@ mod specified_scale_consumer_tests {
     #[cfg(windows)]
     #[test]
     fn specified_scale_review_real_live_drag_defers_common_save_to_existing_boundary() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         install_fs_navigator_input_tracking(&ctx);
         let mut app = pdf_app(&ctx, 1);
@@ -97449,6 +97512,8 @@ mod specified_scale_consumer_tests {
     #[cfg(windows)]
     #[test]
     fn specified_scale_real_popup_retains_disabled_axes_and_edits_common_cap() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         use crate::settings::{FavoriteEntry, FavoriteViewState, SpecifiedScaleAxisSetting};
         for (favorite, inherited) in [(false, false), (true, false), (true, true)] {
             let ctx = egui::Context::default();
@@ -97820,6 +97885,8 @@ mod specified_scale_consumer_tests {
     #[cfg(windows)]
     #[test]
     fn specified_scale_popup_wheel_does_not_scroll_the_real_metadata_panel() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (ctx, mut app, viewport) = specified_popup_metadata_fixture(egui::vec2(820.0, 400.0));
         let mut frame = 0;
         let mut draw = |app: &mut App, events| {
@@ -98002,6 +98069,8 @@ mod specified_scale_consumer_tests {
     #[cfg(windows)]
     #[test]
     fn specified_scale_overflow_wheel_reaches_real_front_panel_only_inside_its_rect() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         // Keep an exposed metadata body beneath the root menu as its row count changes.
         let tall_height = TOP_BAR_HEIGHT
             + FS_OVERFLOW_PANEL_MARGIN * 2.0
@@ -98095,6 +98164,8 @@ mod specified_scale_consumer_tests {
     #[cfg(windows)]
     #[test]
     fn specified_scale_popup_closing_frame_consumes_wheel_then_restores_back_panel() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         for overflow in [false, true] {
             let (ctx, mut app, viewport) =
                 specified_popup_metadata_fixture(egui::vec2(820.0, 400.0));
@@ -98174,6 +98245,8 @@ mod specified_scale_consumer_tests {
     #[cfg(windows)]
     #[test]
     fn specified_scale_overflow_key_close_owns_wheel_and_forwards_key() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (ctx, mut app, viewport) = specified_popup_metadata_fixture(egui::vec2(820.0, 240.0));
         let mut frame = 0;
         let mut draw = |app: &mut App, events| {
@@ -98253,6 +98326,8 @@ mod specified_scale_consumer_tests {
     #[cfg(windows)]
     #[test]
     fn composition_editor_hud_entry_owns_same_frame_escape_wheel_and_navigator_c9() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         use crate::app::book_materialization::{BookScope, ProjectionRecipe};
         use crate::book_composition::{BookCompositionService, PageDomain};
         let (ctx, mut app, viewport) = specified_popup_metadata_fixture(egui::vec2(820.0, 600.0));
@@ -98387,6 +98462,8 @@ mod specified_scale_consumer_tests {
     #[cfg(windows)]
     #[test]
     fn specified_scale_overflow_wheel_owns_real_pinned_navigator_overlap() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let (ctx, mut app, viewport) = specified_popup_metadata_fixture(egui::vec2(820.0, 240.0));
         app.settings.fullscreen_navigator_visible = true;
         app.settings.fullscreen_navigator_corner = FullscreenNavigatorCorner::TopRight;
@@ -98625,6 +98702,8 @@ mod specified_scale_consumer_tests {
     #[cfg(windows)]
     #[test]
     fn specified_scale_real_hud_rows_route_mode_and_limit_to_existing_handlers() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         install_fs_navigator_input_tracking(&ctx);
         let mut app = pdf_app(&ctx, 1);
@@ -98676,6 +98755,7 @@ mod specified_scale_consumer_tests {
     fn run_text_mode_annotation_ime_enter(same_pass: bool) {
         use comic_core::{AnnotationObject, TextBlock};
 
+        let _input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         install_fs_navigator_input_tracking(&ctx);
         crate::ime_focus::install_ime_input_policy(&ctx);
@@ -98823,6 +98903,7 @@ mod specified_scale_consumer_tests {
         same_pass: bool,
         with_ime: bool,
     ) {
+        let _input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         install_fs_navigator_input_tracking(&ctx);
@@ -99922,6 +100003,8 @@ pub(crate) mod page_turn_submission_tests {
 
     #[test]
     fn page_turn_actual_close_widget_release_wins_before_continuation() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         let mut app = ready_app(&ctx, SpreadMode::Single);
         app.settings.fullscreen_top_bar_locked = true;
@@ -100007,6 +100090,8 @@ pub(crate) mod page_turn_submission_tests {
 
     #[test]
     fn page_turn_actual_completion_rebinds_resized_geometry_before_flat_adoption() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         let mut app = ready_app(&ctx, SpreadMode::Single);
         seed_interrupted_leaf(&ctx, &mut app, 2);
@@ -100052,6 +100137,8 @@ pub(crate) mod page_turn_submission_tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_actual_completion_video_hands_off_both_still_routes() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         for embedded in [false, true] {
             let ctx = egui::Context::default();
             let mut app = ready_app(&ctx, SpreadMode::Single);
@@ -100077,6 +100164,8 @@ pub(crate) mod page_turn_submission_tests {
     #[cfg(windows)]
     #[test]
     fn page_turn_actual_f12_continuation_keeps_existing_video_refusal() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         let mut app = ready_app(&ctx, SpreadMode::Single);
         app.viewer_presentation = ViewerPresentation::DetachedWindow;
@@ -100316,6 +100405,8 @@ pub(crate) mod page_turn_submission_tests {
 
     #[test]
     fn paged_actual_single_and_spread_animate_then_flat_without_partial_unit_receipts() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
             let ctx = egui::Context::default();
             page_turn::install(&ctx);
@@ -100381,6 +100472,8 @@ pub(crate) mod page_turn_submission_tests {
     }
     #[test]
     fn paged_resident_raw_spread_animates_while_normal_pipeline_materializes() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         page_turn::install(&ctx);
         let mut app = ready_app(&ctx, SpreadMode::Ltr);
@@ -100696,6 +100789,8 @@ pub(crate) mod page_turn_submission_tests {
 
     #[test]
     fn paged_deferred_proof_rejects_changed_input_generation() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         page_turn::install(&ctx);
         let mut app = ready_app(&ctx, SpreadMode::Single);
@@ -100738,6 +100833,8 @@ pub(crate) mod page_turn_submission_tests {
 
     #[test]
     fn paged_discarded_outgoing_pass_cannot_become_replayed_curl() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         page_turn::install(&ctx);
         let mut app = ready_app(&ctx, SpreadMode::Single);

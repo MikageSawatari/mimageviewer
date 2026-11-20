@@ -48,6 +48,8 @@ fn crop_binding_is_memory_only_and_quality_independent_but_reference_size_is_con
 
 #[test]
 fn crop_legacy_normal_adoption_preserves_the_pure_acceptance_binding() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let ctx = egui::Context::default();
     let mut app = ready_app(&ctx, SpreadMode::Single);
     let mut legacy = crop();
@@ -388,6 +390,8 @@ fn crop_legacy_accepted_basis_rejects_changed_document_and_owner() {
 #[cfg(windows)]
 #[test]
 fn crop_live_snapshot_preserves_original_preview_suppression() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let ctx = egui::Context::default();
     install(&ctx);
     let mut app = ready_app(&ctx, SpreadMode::Single);
@@ -457,6 +461,8 @@ fn crop_prepared_display_conditions_preserve_tool_and_original_preview_policy() 
 
 #[test]
 fn crop_actual_pair_is_suppressed_and_singleton_spread_keeps_crop() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     for mode in [SpreadMode::Single, SpreadMode::Ltr] {
         let ctx = egui::Context::default();
         install(&ctx);
@@ -508,6 +514,8 @@ fn crop_actual_pair_is_suppressed_and_singleton_spread_keeps_crop() {
 
 #[test]
 fn crop_prepared_mapping_preserves_source_coordinates_through_rotation_trim_and_zoom() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     use crate::rotation_db::Rotation;
     let ctx = egui::Context::default();
     install(&ctx);
@@ -660,6 +668,8 @@ fn crop_held_clone_retains_quality_but_rejects_a_different_prepared_crop() {
 
 #[test]
 fn crop_captured_singleton_retains_capture_time_crop_after_item_index_reuse() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let ctx = egui::Context::default();
     install(&ctx);
     let mut app = ready_app(&ctx, SpreadMode::Single);
