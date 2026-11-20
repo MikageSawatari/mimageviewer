@@ -1102,6 +1102,24 @@ EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定
 
 ### サムネイルの動画・音声長さ取得
 
+長さ順・長さ facet (§1.762) が要求されている間は一覧全体の取得範囲と長さのフィールド要件を
+分離し、全動画・音声を既存 `AllRequirements` session に含める。長さだけの要求で AI・日時・
+画像寸法・ページ数を増やさない。長さ順は物理フォルダだけで有効、facet はどの一覧でも有効。
+要件は最後の Item と Finished の間も維持し、可視近傍の `VisibleStage` に置き換えない。
+画面内 Normal / 画面外 Low の既存 priority と `RetryLater` の同一覧世代での終端を維持する。
+
+`duration_scan_proof` は viewer context の details bundle と同じ所有境界で保持する。
+長さを含む全件 session が Finished・メモリ充足で即時完了・対象 0 件で完了し、計画開始時の
+(`items_generation`, `items.len()`) が現在と一致したときだけ記録する。取得中に対象が変われば
+旧 session を取り消して `NotRequested` へ戻し、新対象を計画する。利用者の停止は `Cancelled` を
+維持し、自動再開しない。完了後の対象変更も proof 不一致から再計画する。選択情報の補助取得は
+proof を消さず、fork 先は None、park / mount は cache と一緒に保持し、兄弟 context を変えない。
+有効な proof まで長さ条件だけを適用せず、完了時に表示集合を再構築する。
+
+一覧の長さ順は materialize 時の snapshot に固定し、長さの取得完了から自動では並べ直さない。
+長さ順の選択・再選択は worker 再走査へ通し、catalog の一括 read-only lookup もそこで行う。
+受理済み一覧の capabilities で非対応の一覧と Remote を名前順へ正規化する。
+
 `poll_details_meta_load` の既存 details-meta worker に統合する。Thumbnail モードの
 `thumb_show_media_duration` が ON なら、現在 viewer の `keep_set_sorted()` (可視 + 先読み) と
 選択情報の対象 1 件から bounded stage を作る。範囲変更は既存 scroll idle gate 後に snapshot を
@@ -1112,7 +1130,7 @@ Thumbnail / Details の切替も同じ取消・revision 更新を通す。Thumbn
 選択項目を取得する。選択変更は画面外・画像等でも待たずに同じ stage へ反映する。
 全件計画中は既存 target の要求項目を合流し、worker 実行中は既存優先キューへ追加する。
 完了後の不足分は選択項目を含む bounded stage とし、全件走査の cursor を巻き戻さない。
-AI ファセットの全件取得は維持し、
+AI ファセットの全件取得は維持し、長さ順・長さ facet の要件が無い場合は
 メディア取得だけ可視近傍に絞る。AI 全件取得後も新しい範囲を同じ staged reconciliation で取得する。
 既存 pending request の `DetailsMetaScanScope::{AllRequirements, VisibleStage}` が走査範囲を所有し、
 完了済み AI scan の後続は可視近傍だけを計画する。初回 AI 要求は進行中の長さ stage を取り消して

@@ -353,6 +353,7 @@ mod tests {
             path: PathBuf::from(format!(r"C:\dl\{name}")),
             mtime,
             size: Some(0),
+            sort_meta: crate::settings::ListingSortMetadata::new(mtime, Some(0)),
             is_video,
         }
     }

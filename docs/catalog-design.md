@@ -400,6 +400,20 @@ crop・policy・pin 経路は identity のまま保持し、変更・解除・�
 
 ### 動画・音声メタデータ (`video_meta`)
 
+#### 一覧の長さ順に使う読み取り (§1.762)
+
+物理フォルダが長さ順になる可能性がある要求だけ、走査 worker が動画・音声の存在を確かめてから
+既存 catalog を read-only admission で開き、`filename, mtime, file_size, readable, duration_secs` を
+1 回の SELECT で読む。schema の初期化・migration・probe は行わず、新しい表も作らない。
+writer の接続 mutex を共有せず、既存の WAL と admission / deletion 境界を使う。
+開けない場合や catalog が無い場合は空の facts として扱い、読み取りの件数と時間を perf に記録する。
+
+materialize は I/O をせず、source stamp が一致するメモリの長さを優先し、次に basename と
+mtime / file_size が完全一致する走査成果を使う。サイズ不明は照合しない。有限・0 以上の秒は
+並べ替えキーだけミリ秒へ丸め、取得済みだが長さが無い値と未取得はどちらも末尾に置く。
+後着のメタデータでは並べ直さず、更新・長さ順の再選択・開き直しで新しい値を採用する。
+通常の並べ替えや UI 同期走査には catalog 読み取りを追加しない。
+
 フォルダ単位の既存 catalog に次のテーブルを追加する。`pdf_meta` / `container_page_meta` と同じ
 追加方式であり、既存テーブル・行・schema version は変更せず、既存行の移行は不要。
 

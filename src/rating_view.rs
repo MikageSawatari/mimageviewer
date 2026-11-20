@@ -27,6 +27,9 @@ impl RatingViewSort {
             Self::Normal(order) if order.is_rating() => {
                 Self::Normal(crate::settings::SortOrder::FileName)
             }
+            Self::Normal(order) => {
+                Self::Normal(crate::app::listing_sort::without_duration_order(order))
+            }
             _ => self,
         }
     }
@@ -457,7 +460,10 @@ pub fn sort_rows(rows: &mut [RatingViewRow], sort: RatingViewSort) {
             cmp_optional_i64_none_last(a.rated_at_ms, b.rated_at_ms, true)
                 .then_with(|| compare_row_names(a, b, crate::settings::SortOrder::FileName))
         }),
-        RatingViewSort::Normal(order) => rows.sort_by(|a, b| compare_row_names(a, b, order)),
+        RatingViewSort::Normal(order) => {
+            let order = crate::app::listing_sort::without_duration_order(order);
+            rows.sort_by(|a, b| compare_row_names(a, b, order));
+        }
     }
 }
 
@@ -1223,7 +1229,7 @@ mod tests {
     }
 
     #[test]
-    fn rating_view_normalizes_its_selected_rating_sort_only() {
+    fn rating_view_normalizes_unsupported_rating_and_duration_sorts() {
         let mut rows = vec![
             RatingViewRow {
                 key: "b".into(),
@@ -1256,6 +1262,21 @@ mod tests {
             rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
             ["a", "b"]
         );
+        for order in [
+            crate::settings::SortOrder::DurationAsc,
+            crate::settings::SortOrder::DurationDesc,
+        ] {
+            assert_eq!(
+                RatingViewSort::Normal(order).normalized_for_rating_view(),
+                RatingViewSort::Normal(crate::settings::SortOrder::FileName)
+            );
+            rows.reverse();
+            sort_rows(&mut rows, RatingViewSort::Normal(order));
+            assert_eq!(
+                rows.iter().map(|row| row.key.as_str()).collect::<Vec<_>>(),
+                ["a", "b"]
+            );
+        }
         sort_rows(
             &mut rows,
             RatingViewSort::RatedAtDesc.normalized_for_rating_view(),

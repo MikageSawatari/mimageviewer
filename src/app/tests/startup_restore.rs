@@ -1140,6 +1140,10 @@ fn section1335_flat_filename_stack_acceptance_never_persists_member_name_as_aggr
                 path: path.clone(),
                 mtime: 0,
                 size: Some(png_bytes().len() as i64),
+                sort_meta: crate::settings::ListingSortMetadata::new(
+                    0,
+                    Some(png_bytes().len() as i64),
+                ),
                 is_video: false,
             })
             .collect(),

@@ -7910,3 +7910,13 @@ detached の述語・viewport／host／placement の判断経路、bundle の所
 独立レビュー (gpt-6.1-sol / xhigh、コミット `e34a28713`) と設計担当 ClaudeCode は、これを既存の復元 batch に値を足す構造的変更であり
 症状パッチではないことに合意した。正本は [文字起こし計画 §8.2](local-asr-transcript-plan.md#82-データの流れ)。
 同じ output 内の F12 往復は実機未確認。
+
+### 動画・音声の長さの取得完了の記録（2026-11-20、§1.762）
+
+長さ順・長さ絞り込みのために、一覧の全動画・音声の長さを取得し終えたことを示す `duration_scan_proof` を、
+既存の details 遅延取得状態 (`details_lazy_meta` など) と同じ viewer context 単位の状態として 1 つ足した。
+`viewer_context_registry.rs` では、既存の details 状態と同じ構造体・初期化・swap・fork の所有分類へ機械的に登録しただけで、
+fork 先は空、元 context は cache と proof を保持する。detached の述語・viewport／host／placement の判断経路、bundle の所有・交換は変更していない。
+独立レビュー (gpt-6.1-sol / xhigh を指定して実行、3 回) と設計担当 ClaudeCode は、これを既存 details 状態への機械的な追加であり
+症状パッチではない構造的変更であることに合意した。正本は [長さ順・長さ絞り込み計画](media-duration-sort-filter-plan.md) §7・§11。
+直接の swap・bundle 破棄・fork はテストで確認した。registry 経由の mount／park／close と実機動作は未確認。

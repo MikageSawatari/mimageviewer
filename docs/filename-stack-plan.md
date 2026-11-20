@@ -7,6 +7,12 @@
 
 ## 実装サマリ (v2.0.0 で実装された最終形)
 
+- **長さ順 (§1.762)**: 物理フォルダの `StackMember` は materialize 済みの完全な
+  `ListingSortMetadata` を保持し、group 比較・集約・flat の各経路へ渡す。mtime / size だけから
+  組み立て直して長さを落とさない。単独の動画・音声は長さ順に並び、集約スタックセル自身と
+  画像は `ListingDuration::Missing`。代表を長さ順で選び直さず、不明は両方向で末尾、同値は名前昇順。
+  非対応のサブ展開などでは共通 capabilities の判定に従い長さ順を使わない。
+
 - **モジュール**: 純ロジック [src/filename_stack.rs](../src/filename_stack.rs) (lib+bin、`StackMember` /
   `StackGroup` / `StackView` + `prefix_of` / `group_media` / `materialize_aggregated` /
   `materialize_flat` / flat-index 写像 / `stack_jump_target`)、App グルー

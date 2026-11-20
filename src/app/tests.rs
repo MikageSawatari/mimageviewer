@@ -10015,6 +10015,7 @@ fn install_snapshot_details_pending(
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
+        duration_scan: None,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -19599,6 +19600,7 @@ mod phase_c_key_tests {
                 path: page,
                 mtime: 0,
                 size: Some(1),
+                sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
                 is_video: false,
             }],
             app.settings.stack_separator,
@@ -21761,6 +21763,7 @@ mod folder_pane_open_nav_tests {
 
     fn empty_scan() -> ScannedDir {
         ScannedDir {
+            duration_facts: None,
             precise_stamps: Default::default(),
             reconcile: None,
             auxiliary_media: Default::default(),
@@ -25798,6 +25801,7 @@ mod phase_c_folder_nav_history_tests {
                 panic!("fixture expected folder preflight");
             };
             let mut scan = crate::app::folder_scan::ScannedDir {
+                duration_facts: None,
                 precise_stamps: Default::default(),
                 reconcile: None,
                 auxiliary_media: Default::default(),
@@ -46337,12 +46341,14 @@ mod favorite_adjustment_defaults_tests {
                 path: p0.clone(),
                 mtime: 0,
                 size: Some(8),
+                sort_meta: crate::settings::ListingSortMetadata::new(0, Some(8)),
                 is_video: false,
             },
             StackMember {
                 path: p1.clone(),
                 mtime: 0,
                 size: Some(8),
+                sort_meta: crate::settings::ListingSortMetadata::new(0, Some(8)),
                 is_video: false,
             },
         ];
@@ -46420,12 +46426,14 @@ mod favorite_adjustment_defaults_tests {
                 path: p0.clone(),
                 mtime: 0,
                 size: Some(8),
+                sort_meta: crate::settings::ListingSortMetadata::new(0, Some(8)),
                 is_video: false,
             },
             StackMember {
                 path: p1.clone(),
                 mtime: 0,
                 size: Some(8),
+                sort_meta: crate::settings::ListingSortMetadata::new(0, Some(8)),
                 is_video: false,
             },
         ];
@@ -53255,18 +53263,21 @@ mod favorite_adjustment_defaults_tests {
                     path: dir.join("post_0.jpg"),
                     mtime: 0,
                     size: Some(1),
+                    sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
                     is_video: false,
                 },
                 StackMember {
                     path: dir.join("post_1.jpg"),
                     mtime: 0,
                     size: Some(1),
+                    sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
                     is_video: false,
                 },
                 StackMember {
                     path: dir.join("solo.jpg"),
                     mtime: 0,
                     size: Some(1),
+                    sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
                     is_video: false,
                 },
             ],
@@ -77214,6 +77225,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let (priority_tx, _priority_rx) = mpsc::channel();
         app.details_meta_pending = Some(DetailsMetaPending {
             scan_scope: DetailsMetaScanScope::AllRequirements,
+            duration_scan: None,
             visible_revision: app.details_lazy_visible_revision,
             selection_target_key: None,
             normal_target_keys: Default::default(),
@@ -94893,18 +94905,21 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 path: dir.join("post_0.jpg"),
                 mtime: 0,
                 size: Some(1),
+                sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
                 is_video: false,
             },
             StackMember {
                 path: dir.join("post_1.jpg"),
                 mtime: 0,
                 size: Some(1),
+                sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
                 is_video: false,
             },
             StackMember {
                 path: dir.join("solo.jpg"),
                 mtime: 0,
                 size: Some(1),
+                sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
                 is_video: false,
             },
         ];
@@ -106941,6 +106956,7 @@ fn details_lazy_session_stays_active_between_consecutive_page_count_jobs() {
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
+        duration_scan: None,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -107349,6 +107365,7 @@ fn leaving_page_count_sort_cancels_full_load_and_returns_to_staged_loading() {
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
+        duration_scan: None,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -107439,6 +107456,7 @@ fn changing_lazy_columns_discards_old_finished_event_and_requeues_new_requiremen
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
+        duration_scan: None,
         visible_revision: old_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -111711,6 +111729,7 @@ fn install_fake_media_duration_pending(app: &mut App) -> Arc<AtomicBool> {
     let (priority_tx, _priority_rx) = mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
+        duration_scan: None,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: app.selection_info_lazy_target_key(),
         normal_target_keys: HashSet::new(),
@@ -111825,6 +111844,92 @@ fn media_duration_thumbnail_ai_ready_stage_requests_new_range_without_reloading_
             .load_video_meta
     );
     assert!(app.details_meta_target_for_idx(2, &near, true).is_none());
+}
+
+#[test]
+fn ai_facet_loading_preserves_other_filters_and_ignore() {
+    use crate::settings::{FacetDatePreset, FacetEditFlag, FacetSizePreset};
+
+    for ai_field in [FacetField::AiModel, FacetField::AiTool] {
+        let mut app = setup_media_duration_thumbnail_app();
+        app.ai_model_facet_requested = true;
+        app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 1 };
+        match ai_field {
+            FacetField::AiModel => app.settings.facet_filter.ai_models.insert("wanted".into()),
+            FacetField::AiTool => app.settings.facet_filter.ai_tools.insert("wanted".into()),
+            _ => unreachable!(),
+        };
+        assert!(!app.ai_model_facet_ready());
+        assert!(app.passes_facet_filter(2, None), "AI alone waits for ready");
+
+        let GridItem::Image(path) = &app.items[2] else {
+            unreachable!();
+        };
+        let tag_key = crate::tags_db::item_key_for_path(path);
+        app.tags_cache.insert(tag_key, vec!["other".into()]);
+        app.settings.facet_filter.tags.insert("wanted".into());
+        assert!(!app.passes_facet_filter(2, None));
+        assert!(app.passes_facet_filter(2, Some(FacetField::Tags)));
+        assert!(!app.passes_facet_filter(2, Some(ai_field)));
+        app.settings.facet_filter.tags.clear();
+
+        app.settings.facet_filter.size_preset = Some(FacetSizePreset::MiB1To10);
+        assert!(!app.passes_facet_filter(2, None));
+        assert!(app.passes_facet_filter(2, Some(FacetField::Size)));
+        app.settings.facet_filter.size_preset = Some(FacetSizePreset::Under1MiB);
+        assert!(app.passes_facet_filter(2, None));
+        app.settings.facet_filter.size_preset = None;
+
+        app.settings.facet_filter.date_preset = Some(FacetDatePreset::Last7Days);
+        assert!(!app.passes_facet_filter(2, None));
+        assert!(app.passes_facet_filter(2, Some(FacetField::Date)));
+        app.settings.facet_filter.date_preset = None;
+
+        app.settings.facet_filter.edits.insert(FacetEditFlag::Mask);
+        assert!(!app.passes_facet_filter(2, None));
+        assert!(app.passes_facet_filter(2, Some(FacetField::Edits)));
+        app.mask_pages.insert(2);
+        assert!(app.passes_facet_filter(2, None));
+    }
+}
+
+#[test]
+fn ai_facet_ready_applies_model_and_tool_filters_and_ignore() {
+    let mut app = setup_media_duration_thumbnail_app();
+    app.ai_model_facet_requested = true;
+    app.settings.facet_filter.ai_models.insert("Model".into());
+    app.settings.facet_filter.ai_tools.insert("Tool".into());
+    let key = app.details_lazy_cache_key(2).unwrap();
+    app.details_lazy_meta.insert(
+        key.clone(),
+        DetailsLazyMeta {
+            source_mtime: 100,
+            source_size: 2048,
+            ai_metadata_checked: true,
+            ai_models: vec!["Other model".into()],
+            ai_tool: Some("Other tool".into()),
+            ..Default::default()
+        },
+    );
+    app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 1 };
+    assert!(!app.ai_model_facet_ready());
+    assert!(app.passes_facet_filter(2, None));
+
+    app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    assert!(app.ai_model_facet_ready());
+    assert!(!app.passes_facet_filter(2, None));
+    assert!(!app.passes_facet_filter(2, Some(FacetField::AiModel)));
+    assert!(!app.passes_facet_filter(2, Some(FacetField::AiTool)));
+
+    app.details_lazy_meta.get_mut(&key).unwrap().ai_tool = Some("Tool".into());
+    assert!(!app.passes_facet_filter(2, None));
+    assert!(app.passes_facet_filter(2, Some(FacetField::AiModel)));
+    app.details_lazy_meta.get_mut(&key).unwrap().ai_tool = Some("Other tool".into());
+    app.details_lazy_meta.get_mut(&key).unwrap().ai_models = vec!["Model".into()];
+    assert!(!app.passes_facet_filter(2, None));
+    assert!(app.passes_facet_filter(2, Some(FacetField::AiTool)));
+    app.details_lazy_meta.get_mut(&key).unwrap().ai_tool = Some("Tool".into());
+    assert!(app.passes_facet_filter(2, None));
 }
 
 #[test]
@@ -115587,3 +115692,5 @@ fn detached_backend_hwnd_reuse_retires_host_claim_and_reseeds_same_handle() {
     drop(old);
     assert!(app.detached_window_manager.host_claim_is_alive(new_claim));
 }
+
+mod duration_762;

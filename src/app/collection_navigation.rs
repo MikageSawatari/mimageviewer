@@ -1226,6 +1226,8 @@ impl App {
         kind: Option<CollectionResolvedKind>,
         password: Option<String>,
     ) -> Result<PhysicalHistoryPreflight, String> {
+        let duration_wanted = self.listing_may_sort_by_duration();
+        let duration_cache_dir = crate::catalog::default_cache_dir();
         let tree_options = crate::folder_tree::FolderTreeOptions::from_settings(&self.settings);
         let show_hidden_files = self.settings.show_hidden_files;
         let archive_cache_db = self.archive_cache_db.clone();
@@ -1286,7 +1288,10 @@ impl App {
                                 &tree_options.file_type_visibility,
                                 Some(worker_cancel.flag()),
                             )
-                            .map(PhysicalHistoryPreflightPayload::Folder)
+                            .map(|mut scan| {
+                                super::folder_scan::collect_folder_duration_facts(&path, &mut scan, &duration_cache_dir, duration_wanted);
+                                PhysicalHistoryPreflightPayload::Folder(scan)
+                            })
                             .map_err(|error| format!("フォルダを読み込めません: {error}"))
                         }
                         CollectionResolvedKind::Zip => {
@@ -3932,6 +3937,9 @@ impl App {
             restore_intent,
             false,
             super::use_full_path_cache_keys_for_folder(&target.source_path),
+            TopLevelGridSurface::Collection(CollectionGridIdentity {
+                collection_id: request.origin.collection_id,
+            }),
         )?;
         let token = match self.prepare_visible_install(
             listing.source_path(),

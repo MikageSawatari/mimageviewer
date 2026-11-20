@@ -1653,6 +1653,93 @@ impl FacetSizePreset {
     }
 }
 
+/// 下限を含み、上限を含まない動画・音声の長さ条件。範囲の入力単位は分。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FacetDurationPreset {
+    Under1Minute,
+    Minutes1To10,
+    Minutes10To60,
+    Over60Minutes,
+    Range { min: Option<u32>, max: Option<u32> },
+}
+
+impl FacetDurationPreset {
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Under1Minute,
+            Self::Minutes1To10,
+            Self::Minutes10To60,
+            Self::Over60Minutes,
+        ]
+    }
+
+    pub fn label(self) -> String {
+        match self.sanitized() {
+            Self::Under1Minute => "〜1分".to_string(),
+            Self::Minutes1To10 => "1〜10分".to_string(),
+            Self::Minutes10To60 => "10〜60分".to_string(),
+            Self::Over60Minutes => "60分以上".to_string(),
+            Self::Range {
+                min: Some(min),
+                max: Some(max),
+            } => format!("{min}〜{max}分未満"),
+            Self::Range {
+                min: Some(min),
+                max: None,
+            } => format!("{min}分以上"),
+            Self::Range {
+                min: None,
+                max: Some(max),
+            } => format!("{max}分未満"),
+            Self::Range {
+                min: None,
+                max: None,
+            } => "範囲指定".to_string(),
+        }
+    }
+
+    pub fn is_effective(self) -> bool {
+        !matches!(
+            self,
+            Self::Range {
+                min: None,
+                max: None
+            }
+        )
+    }
+
+    pub fn range_seconds(self) -> (u64, Option<u64>) {
+        match self.sanitized() {
+            Self::Under1Minute => (0, Some(60)),
+            Self::Minutes1To10 => (60, Some(600)),
+            Self::Minutes10To60 => (600, Some(3600)),
+            Self::Over60Minutes => (3600, None),
+            Self::Range { min, max } => (
+                min.map_or(0, |minutes| u64::from(minutes) * 60),
+                max.map(|minutes| u64::from(minutes) * 60),
+            ),
+        }
+    }
+
+    /// 判定は表示用の秒のまま行い、並べ替え用ミリ秒への丸めを持ち込まない。
+    pub fn matches_seconds(self, seconds: f64) -> bool {
+        let (min, max) = self.range_seconds();
+        seconds.is_finite() && seconds >= min as f64 && max.is_none_or(|max| seconds < max as f64)
+    }
+
+    pub fn sanitized(self) -> Self {
+        match self {
+            Self::Range { mut min, mut max } => {
+                if min.zip(max).is_some_and(|(min, max)| min > max) {
+                    std::mem::swap(&mut min, &mut max);
+                }
+                Self::Range { min, max }
+            }
+            preset => preset,
+        }
+    }
+}
+
 #[derive(
     serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash,
 )]
@@ -1764,6 +1851,8 @@ pub struct FacetFilter {
     #[serde(default)]
     pub size_extended_stash: Option<FacetSizePreset>,
     #[serde(default)]
+    pub duration_preset: Option<FacetDurationPreset>,
+    #[serde(default)]
     pub edits: std::collections::BTreeSet<FacetEditFlag>,
     #[serde(default, alias = "ai_adjustment_include_descendants")]
     pub edit_include_descendants: bool,
@@ -1863,6 +1952,9 @@ impl FacetFilter {
             || self.include_untagged
             || self.date_preset.is_some()
             || self.size_preset.is_some_and(FacetSizePreset::is_effective)
+            || self
+                .duration_preset
+                .is_some_and(FacetDurationPreset::is_effective)
             || !self.edits.is_empty()
     }
 
@@ -2065,6 +2157,7 @@ pub enum ToolbarFacetFilterItem {
     Tags,
     Date,
     Size,
+    Duration,
     Edit,
     Color,
     NameFilter,
@@ -2087,6 +2180,7 @@ impl ToolbarFacetFilterItem {
             Self::Tags,
             Self::Date,
             Self::Size,
+            Self::Duration,
             Self::Edit,
             Self::Color,
             Self::NameFilter,
@@ -2105,6 +2199,7 @@ impl ToolbarFacetFilterItem {
             Self::Tags => "タグ",
             Self::Date => "日付",
             Self::Size => "サイズ",
+            Self::Duration => "長さ",
             Self::Edit => "状態",
             Self::Color => "画像色",
             Self::NameFilter => "ファイル名",
@@ -2199,8 +2294,30 @@ pub enum SortOrder {
     DateDesc,     // 日付順（降順）
     SizeAsc,      // サイズ順（昇順、不明は末尾）
     SizeDesc,     // サイズ順（降順、不明は末尾）
+    DurationAsc,  // 動画・音声の長さ順（昇順、不明は末尾）
+    DurationDesc, // 動画・音声の長さ順（降順、不明は末尾）
     RatingAsc,    // 評価順（低い順）
     RatingDesc,   // 評価順（高い順）
+}
+
+/// 一覧の snapshot に採用した動画・音声の長さ。表示値自体は丸めない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum ListingDuration {
+    Known(u64),
+    Unavailable,
+    #[default]
+    Missing,
+}
+
+impl ListingDuration {
+    pub(crate) fn from_seconds(seconds: Option<f64>) -> Self {
+        match seconds {
+            Some(seconds) if seconds.is_finite() && seconds >= 0.0 => {
+                Self::Known((seconds * 1000.0).round() as u64)
+            }
+            _ => Self::Unavailable,
+        }
+    }
 }
 
 /// 一覧の並び替えだけが使うmetadata snapshot。
@@ -2211,11 +2328,16 @@ pub enum SortOrder {
 pub(crate) struct ListingSortMetadata {
     pub(crate) mtime: i64,
     pub(crate) file_size: Option<i64>,
+    pub(crate) duration: ListingDuration,
 }
 
 impl ListingSortMetadata {
     pub(crate) const fn new(mtime: i64, file_size: Option<i64>) -> Self {
-        Self { mtime, file_size }
+        Self {
+            mtime,
+            file_size,
+            duration: ListingDuration::Missing,
+        }
     }
 }
 
@@ -2230,6 +2352,8 @@ impl SortOrder {
             Self::DateDesc => "日付（新しい順）",
             Self::SizeAsc => "サイズ順（小さい順）",
             Self::SizeDesc => "サイズ順（大きい順）",
+            Self::DurationAsc => "長さ（短い順）",
+            Self::DurationDesc => "長さ（長い順）",
             Self::RatingAsc => "評価（低い順）",
             Self::RatingDesc => "評価（高い順）",
         }
@@ -2245,6 +2369,8 @@ impl SortOrder {
             Self::DateDesc => "日付↓",
             Self::SizeAsc => "サイズ↑",
             Self::SizeDesc => "サイズ↓",
+            Self::DurationAsc => "長さ↑",
+            Self::DurationDesc => "長さ↓",
             Self::RatingAsc => "評価↑",
             Self::RatingDesc => "評価↓",
         }
@@ -2260,6 +2386,12 @@ impl SortOrder {
             Self::DateDesc => "更新日時が新しいものから並び替えます",
             Self::SizeAsc => "ファイルサイズが小さいものから並び替えます（不明は末尾）",
             Self::SizeDesc => "ファイルサイズが大きいものから並び替えます（不明は末尾）",
+            Self::DurationAsc => {
+                "動画・音声の長さが短い順。長さが分からないものは末尾。読み込み後に更新すると並べ直します"
+            }
+            Self::DurationDesc => {
+                "動画・音声の長さが長い順。長さが分からないものは末尾。読み込み後に更新すると並べ直します"
+            }
             Self::RatingAsc => {
                 "評価の低い順。未評価は既定で★2と★3の間、設定で★1より下にもできます。評価を変えても、更新するまで並びは変わりません"
             }
@@ -2279,17 +2411,32 @@ impl SortOrder {
             Self::DateDesc,
             Self::SizeAsc,
             Self::SizeDesc,
+            Self::DurationAsc,
+            Self::DurationDesc,
             Self::RatingAsc,
             Self::RatingDesc,
         ]
     }
 
     pub fn collection_options() -> &'static [Self] {
-        &Self::all()[..8]
+        &[
+            Self::FileName,
+            Self::FileNameDesc,
+            Self::Numeric,
+            Self::NumericDesc,
+            Self::DateAsc,
+            Self::DateDesc,
+            Self::SizeAsc,
+            Self::SizeDesc,
+        ]
     }
 
     pub const fn is_rating(self) -> bool {
         matches!(self, Self::RatingAsc | Self::RatingDesc)
+    }
+
+    pub const fn is_duration(self) -> bool {
+        matches!(self, Self::DurationAsc | Self::DurationDesc)
     }
 
     /// フォルダ代表サムネイルの探索に使える既存4候補。
@@ -2381,6 +2528,10 @@ impl SortOrder {
                 debug_assert!(false, "rating list sort requires complete rating facts");
                 name_a.compare_file_name(name_b)
             }
+            Self::DurationAsc | Self::DurationDesc => {
+                debug_assert!(false, "duration list sort requires compare_listing_keys");
+                name_a.compare_file_name(name_b)
+            }
         }
     }
 
@@ -2411,6 +2562,20 @@ impl SortOrder {
                     (None, None) => Ordering::Equal,
                 };
                 size_order.then_with(name_tie)
+            }
+            Self::DurationAsc | Self::DurationDesc => {
+                let duration_order = match (meta_a.duration, meta_b.duration) {
+                    (ListingDuration::Known(a), ListingDuration::Known(b))
+                        if self == Self::DurationAsc =>
+                    {
+                        a.cmp(&b)
+                    }
+                    (ListingDuration::Known(a), ListingDuration::Known(b)) => b.cmp(&a),
+                    (ListingDuration::Known(_), _) => Ordering::Less,
+                    (_, ListingDuration::Known(_)) => Ordering::Greater,
+                    _ => Ordering::Equal,
+                };
+                duration_order.then_with(name_tie)
             }
             Self::RatingAsc | Self::RatingDesc => {
                 debug_assert!(false, "rating list sort requires complete rating facts");
@@ -5919,10 +6084,16 @@ pub struct Settings {
     /// 既定の8候補だけに評価順を一度追加する。利用者が変更した候補には触れない。
     #[serde(default)]
     pub(crate) toolbar_sort_rating_options_migrated: bool,
+    /// 旧既定10候補だけに長さ順を一度追加する。変更済み候補は保持する。
+    #[serde(default)]
+    pub(crate) toolbar_sort_duration_options_migrated: bool,
     /// スマートフィルタバーに表示するボタン。
     /// 空 Vec は「ボタンを全部隠す」。アクティブ条件のチップと全解除は引き続き表示する。
     #[serde(default = "default_toolbar_facet_filter_items")]
     pub toolbar_facet_filter_items: Vec<ToolbarFacetFilterItem>,
+    /// 旧既定の絞り込みボタンだけに長さを一度追加する。
+    #[serde(default)]
+    pub(crate) toolbar_facet_duration_options_migrated: bool,
     /// `NameFilter` の位置を旧版が無視できる追加フィールドへ退避する保存用キャリア。
     /// `usize::MAX` は明示的な非表示、`None` はこの項目が無かった旧設定を表す。
     /// 実行時の正は `toolbar_facet_filter_items` 側で、保存用 clone だけがこの値を持つ。
@@ -8355,7 +8526,9 @@ impl Default for Settings {
             toolbar_sort_size_options_migrated: true,
             toolbar_sort_name_numeric_desc_options_migrated: true,
             toolbar_sort_rating_options_migrated: true,
+            toolbar_sort_duration_options_migrated: true,
             toolbar_facet_filter_items: default_toolbar_facet_filter_items(),
+            toolbar_facet_duration_options_migrated: true,
             toolbar_facet_name_filter_index_stash: None,
             facet_name_filter_width: FacetNameFilterWidth::default(),
             toolbar_section_order: Vec::new(),
@@ -9006,6 +9179,8 @@ pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
     settings.migrate_toolbar_sort_size_options();
     settings.migrate_toolbar_sort_name_numeric_desc_options();
     settings.migrate_toolbar_sort_rating_options();
+    settings.migrate_toolbar_sort_duration_options();
+    settings.migrate_toolbar_facet_duration_options();
     settings.migrate_toolbar_folder_section();
     settings.sanitize();
 }
@@ -9298,6 +9473,22 @@ pub struct SettingsLoadResult {
 }
 
 impl Settings {
+    /// 走査後のお気に入り投影で長さ順になる可能性を保守的に判定する。
+    /// 保存済みの専用状態は App 所有なので、呼び出し元からメモリ上の値だけを渡す。
+    pub(crate) fn listing_may_sort_by_duration<'a>(
+        &self,
+        favorite_states: impl IntoIterator<Item = &'a FavoriteViewState>,
+    ) -> bool {
+        self.sort_order.is_duration()
+            || self
+                .favorite_view_overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.common.sort_order.is_duration())
+            || favorite_states
+                .into_iter()
+                .any(|state| state.sort_order.is_duration())
+    }
+
     /// Resolve a configurable relative-seek step without rewriting a stored
     /// value merely because a newer build applies a narrower safe range.
     pub fn video_seek_seconds(&self, step: VideoSeekStep) -> f64 {
@@ -9709,9 +9900,70 @@ impl Settings {
             return false;
         }
         if self.toolbar_sort_items == SortOrder::collection_options() {
-            self.toolbar_sort_items = default_toolbar_sort_items();
+            self.toolbar_sort_items
+                .extend([SortOrder::RatingAsc, SortOrder::RatingDesc]);
         }
         self.toolbar_sort_rating_options_migrated = true;
+        true
+    }
+
+    fn migrate_toolbar_sort_duration_options(&mut self) -> bool {
+        if self.toolbar_sort_duration_options_migrated {
+            return false;
+        }
+        const LEGACY_DEFAULT: [SortOrder; 10] = [
+            SortOrder::FileName,
+            SortOrder::FileNameDesc,
+            SortOrder::Numeric,
+            SortOrder::NumericDesc,
+            SortOrder::DateAsc,
+            SortOrder::DateDesc,
+            SortOrder::SizeAsc,
+            SortOrder::SizeDesc,
+            SortOrder::RatingAsc,
+            SortOrder::RatingDesc,
+        ];
+        if self.toolbar_sort_items == LEGACY_DEFAULT {
+            self.toolbar_sort_items = default_toolbar_sort_items();
+        }
+        self.toolbar_sort_duration_options_migrated = true;
+        true
+    }
+
+    fn migrate_toolbar_facet_duration_options(&mut self) -> bool {
+        if self.toolbar_facet_duration_options_migrated {
+            return false;
+        }
+        const LEGACY_DEFAULT: [ToolbarFacetFilterItem; 12] = [
+            ToolbarFacetFilterItem::Kind,
+            ToolbarFacetFilterItem::Ext,
+            ToolbarFacetFilterItem::Place,
+            ToolbarFacetFilterItem::AiModel,
+            ToolbarFacetFilterItem::AiTool,
+            ToolbarFacetFilterItem::Rating,
+            ToolbarFacetFilterItem::Tags,
+            ToolbarFacetFilterItem::Date,
+            ToolbarFacetFilterItem::Size,
+            ToolbarFacetFilterItem::Edit,
+            ToolbarFacetFilterItem::Color,
+            ToolbarFacetFilterItem::NameFilter,
+        ];
+        // 保存用 stash を消費せず、sanitize 後と同じ候補で比較する。
+        // ここで復元を実行すると、後続 sanitize が「非表示」をもう一度復元してしまう。
+        let mut items = self.toolbar_facet_filter_items.clone();
+        if !items.contains(&ToolbarFacetFilterItem::NameFilter) {
+            match self.toolbar_facet_name_filter_index_stash {
+                Some(TOOLBAR_NAME_FILTER_HIDDEN_STASH) => {}
+                Some(index) => {
+                    items.insert(index.min(items.len()), ToolbarFacetFilterItem::NameFilter)
+                }
+                None => items.push(ToolbarFacetFilterItem::NameFilter),
+            }
+        }
+        if items == LEGACY_DEFAULT {
+            self.toolbar_facet_filter_items = default_toolbar_facet_filter_items();
+        }
+        self.toolbar_facet_duration_options_migrated = true;
         true
     }
 
@@ -9787,6 +10039,10 @@ impl Settings {
         let toolbar_sort_name_numeric_desc_options_migrated =
             settings.migrate_toolbar_sort_name_numeric_desc_options();
         let toolbar_sort_rating_options_migrated = settings.migrate_toolbar_sort_rating_options();
+        let toolbar_sort_duration_options_migrated =
+            settings.migrate_toolbar_sort_duration_options();
+        let toolbar_facet_duration_options_migrated =
+            settings.migrate_toolbar_facet_duration_options();
         let toolbar_folder_section_migrated = settings.migrate_toolbar_folder_section();
         settings.sanitize();
         let legacy_keymap_ini_path = data_dir.join("keymap.ini");
@@ -9958,6 +10214,8 @@ impl Settings {
             || toolbar_sort_size_options_migrated
             || toolbar_sort_name_numeric_desc_options_migrated
             || toolbar_sort_rating_options_migrated
+            || toolbar_sort_duration_options_migrated
+            || toolbar_facet_duration_options_migrated
             || toolbar_folder_section_migrated
             || legacy_keymap_import.changed
             || version_marker_changed
@@ -10772,6 +11030,10 @@ impl Settings {
             .facet_filter
             .size_preset
             .map(FacetSizePreset::sanitized);
+        self.facet_filter.duration_preset = self
+            .facet_filter
+            .duration_preset
+            .map(FacetDurationPreset::sanitized);
         // 保存時に退避した種類フィルタの Audio を kinds へ戻す (v2.2.0 ダウングレード互換、
         // `FacetFilter::kind_audio_stash` のコメント参照)。
         self.facet_filter.restore_kind_audio_after_load();
@@ -10957,6 +11219,8 @@ impl Settings {
         self.toolbar_sort_name_numeric_desc_options_migrated =
             src.toolbar_sort_name_numeric_desc_options_migrated;
         self.toolbar_sort_rating_options_migrated = src.toolbar_sort_rating_options_migrated;
+        self.toolbar_sort_duration_options_migrated = src.toolbar_sort_duration_options_migrated;
+        self.toolbar_facet_duration_options_migrated = src.toolbar_facet_duration_options_migrated;
         self.toolbar_facet_filter_items = std::mem::take(&mut src.toolbar_facet_filter_items);
         self.toolbar_facet_name_filter_index_stash =
             src.toolbar_facet_name_filter_index_stash.take();
@@ -18668,6 +18932,264 @@ mod tests {
     }
 
     #[test]
+    fn duration_sort_rounds_milliseconds_and_keeps_all_unknowns_last() {
+        assert_eq!(
+            ListingDuration::from_seconds(Some(1.2346)),
+            ListingDuration::Known(1235)
+        );
+        assert_eq!(
+            ListingDuration::from_seconds(Some(0.0)),
+            ListingDuration::Known(0)
+        );
+        for seconds in [None, Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            assert_eq!(
+                ListingDuration::from_seconds(seconds),
+                ListingDuration::Unavailable
+            );
+        }
+        assert_eq!(
+            ListingSortMetadata::new(0, None).duration,
+            ListingDuration::Missing
+        );
+        let rows = [
+            ("unknown-b", ListingDuration::Missing),
+            ("ten", ListingDuration::Known(10000)),
+            ("zero-b", ListingDuration::Known(0)),
+            ("zero-a", ListingDuration::Known(0)),
+            ("unknown-a", ListingDuration::Unavailable),
+        ];
+        let sorted = |order: SortOrder| {
+            let mut rows = rows;
+            rows.sort_by(|(a_name, a), (b_name, b)| {
+                let a_meta = ListingSortMetadata {
+                    duration: *a,
+                    ..ListingSortMetadata::new(0, None)
+                };
+                let b_meta = ListingSortMetadata {
+                    duration: *b,
+                    ..ListingSortMetadata::new(0, None)
+                };
+                order.compare_listing_keys(
+                    &order.name_key(a_name),
+                    a_meta,
+                    &order.name_key(b_name),
+                    b_meta,
+                )
+            });
+            rows.map(|(name, _)| name)
+        };
+        assert_eq!(
+            sorted(SortOrder::DurationAsc),
+            ["zero-a", "zero-b", "ten", "unknown-a", "unknown-b"]
+        );
+        assert_eq!(
+            sorted(SortOrder::DurationDesc),
+            ["ten", "zero-a", "zero-b", "unknown-a", "unknown-b"]
+        );
+    }
+
+    #[test]
+    fn duration_presets_boundaries_ranges_and_legacy_json() {
+        for (preset, min, max) in [
+            (FacetDurationPreset::Under1Minute, 0, Some(60)),
+            (FacetDurationPreset::Minutes1To10, 60, Some(600)),
+            (FacetDurationPreset::Minutes10To60, 600, Some(3600)),
+            (FacetDurationPreset::Over60Minutes, 3600, None),
+        ] {
+            assert_eq!(preset.range_seconds(), (min, max));
+            assert!(preset.matches_seconds(min as f64));
+            assert!(!preset.matches_seconds(min as f64 - 0.001));
+            if let Some(max) = max {
+                assert!(preset.matches_seconds(max as f64 - 0.001));
+                assert!(!preset.matches_seconds(max as f64));
+            }
+            assert!(!preset.matches_seconds(f64::NAN));
+            assert!(!preset.matches_seconds(f64::INFINITY));
+        }
+        let reversed = FacetDurationPreset::Range {
+            min: Some(10),
+            max: Some(1),
+        };
+        assert_eq!(
+            reversed.sanitized(),
+            FacetDurationPreset::Range {
+                min: Some(1),
+                max: Some(10)
+            }
+        );
+        assert_eq!(reversed.range_seconds(), (60, Some(600)));
+        let empty = FacetDurationPreset::Range {
+            min: None,
+            max: None,
+        };
+        assert!(!empty.is_effective());
+        let mut filter: FacetFilter = serde_json::from_str("{}").unwrap();
+        assert_eq!(filter.duration_preset, None);
+        filter.duration_preset = Some(empty);
+        assert!(!filter.is_active());
+        filter.duration_preset = Some(reversed);
+        assert!(filter.is_active());
+        assert_eq!(
+            serde_json::from_str::<FacetFilter>(&serde_json::to_string(&filter).unwrap()).unwrap(),
+            filter
+        );
+        #[derive(serde::Deserialize)]
+        struct OldFacetFilter {
+            #[serde(default)]
+            size_preset: Option<FacetSizePreset>,
+        }
+        let old = serde_json::from_str::<OldFacetFilter>(&serde_json::to_string(&filter).unwrap())
+            .unwrap();
+        assert_eq!(
+            old.size_preset, None,
+            "old readers ignore the new duration field"
+        );
+        let mut settings = Settings {
+            facet_filter: filter,
+            ..Default::default()
+        };
+        settings.sanitize();
+        assert_eq!(
+            settings.facet_filter.duration_preset,
+            Some(reversed.sanitized())
+        );
+        assert_eq!(
+            FacetDurationPreset::Range {
+                min: None,
+                max: Some(1)
+            }
+            .range_seconds(),
+            (0, Some(60))
+        );
+        assert_eq!(
+            FacetDurationPreset::Range {
+                min: Some(u32::MAX),
+                max: None
+            }
+            .range_seconds(),
+            (u64::from(u32::MAX) * 60, None)
+        );
+    }
+
+    #[test]
+    fn duration_sort_wire_and_candidate_allowlists() {
+        assert_eq!(SortOrder::all().len(), 12);
+        for &order in SortOrder::all() {
+            let wire = serde_json::to_string(&order).unwrap();
+            assert_eq!(serde_json::from_str::<SortOrder>(&wire).unwrap(), order);
+            let settings = Settings {
+                sort_order: order,
+                ..Default::default()
+            };
+            let favorite = FavoriteViewState::from_settings(&settings);
+            let favorite_wire = serde_json::to_string(&favorite).unwrap();
+            assert_eq!(
+                serde_json::from_str::<FavoriteViewState>(&favorite_wire).unwrap(),
+                favorite
+            );
+            if order.is_duration() {
+                assert!(!SortOrder::collection_options().contains(&order));
+                assert!(!SortOrder::folder_thumb_options().contains(&order));
+            }
+        }
+        assert_eq!(
+            serde_json::to_string(&SortOrder::DurationAsc).unwrap(),
+            "\"DurationAsc\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SortOrder::DurationDesc).unwrap(),
+            "\"DurationDesc\""
+        );
+    }
+
+    #[test]
+    fn duration_scan_may_be_needed_by_common_live_or_saved_favorite_sort() {
+        let mut settings = Settings::default();
+        let mut saved = FavoriteViewState::from_settings(&settings);
+        assert!(!settings.listing_may_sort_by_duration([&saved]));
+        saved.sort_order = SortOrder::DurationDesc;
+        assert!(settings.listing_may_sort_by_duration([&saved]));
+        saved.sort_order = SortOrder::FileName;
+        settings.sort_order = SortOrder::DurationAsc;
+        assert!(settings.listing_may_sort_by_duration([&saved]));
+        let common = FavoriteViewState::from_settings(&settings);
+        settings.favorite_view_overlay = Some(FavoriteViewOverlay {
+            favorite_id: Uuid::new_v4(),
+            common,
+        });
+        settings.sort_order = SortOrder::FileName;
+        assert!(settings.listing_may_sort_by_duration([&saved]));
+        settings.favorite_view_overlay = None;
+        assert!(!settings.listing_may_sort_by_duration([&saved]));
+    }
+
+    #[test]
+    fn duration_toolbar_migration_only_extends_untouched_defaults_once() {
+        let legacy = SortOrder::all()
+            .iter()
+            .copied()
+            .filter(|sort| !sort.is_duration())
+            .collect::<Vec<_>>();
+        let mut old: Settings =
+            serde_json::from_value(serde_json::json!({ "toolbar_sort_items": legacy })).unwrap();
+        assert!(old.migrate_toolbar_sort_duration_options());
+        assert_eq!(old.toolbar_sort_items, SortOrder::all());
+        old.toolbar_sort_items.retain(|sort| !sort.is_duration());
+        let mut loaded: Settings =
+            serde_json::from_value(serde_json::to_value(old).unwrap()).unwrap();
+        assert!(!loaded.migrate_toolbar_sort_duration_options());
+        assert_eq!(loaded.toolbar_sort_items, legacy);
+        for items in [
+            vec![],
+            vec![SortOrder::FileName],
+            legacy.into_iter().rev().collect(),
+        ] {
+            let mut custom: Settings =
+                serde_json::from_value(serde_json::json!({ "toolbar_sort_items": items })).unwrap();
+            let before = custom.toolbar_sort_items.clone();
+            assert!(custom.migrate_toolbar_sort_duration_options());
+            assert_eq!(custom.toolbar_sort_items, before);
+        }
+    }
+
+    #[test]
+    fn duration_facet_toolbar_migration_respects_name_filter_stash_and_customization() {
+        let legacy = default_toolbar_facet_filter_items()
+            .into_iter()
+            .filter(|item| *item != ToolbarFacetFilterItem::Duration)
+            .collect::<Vec<_>>();
+        let mut old: Settings =
+            serde_json::from_value(serde_json::json!({ "toolbar_facet_filter_items": legacy }))
+                .unwrap();
+        old.stash_toolbar_name_filter_for_persist();
+        assert!(old.migrate_toolbar_facet_duration_options());
+        old.sanitize();
+        assert_eq!(
+            old.toolbar_facet_filter_items,
+            default_toolbar_facet_filter_items()
+        );
+        old.toolbar_facet_filter_items
+            .retain(|item| *item != ToolbarFacetFilterItem::Duration);
+        assert!(!old.migrate_toolbar_facet_duration_options());
+        assert_eq!(old.toolbar_facet_filter_items, legacy);
+        for items in [
+            vec![],
+            vec![ToolbarFacetFilterItem::Size],
+            legacy.into_iter().rev().collect(),
+        ] {
+            let mut custom = Settings {
+                toolbar_facet_filter_items: items.clone(),
+                toolbar_facet_duration_options_migrated: false,
+                ..Default::default()
+            };
+            custom.stash_toolbar_name_filter_for_persist();
+            assert!(custom.migrate_toolbar_facet_duration_options());
+            custom.sanitize();
+            assert_eq!(custom.toolbar_facet_filter_items, items);
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "size list sort requires compare_listing_keys")]
     fn legacy_name_comparator_rejects_size_sort_in_debug_tests() {
         let a = SortOrder::SizeAsc.name_key("a.jpg");
@@ -18756,7 +19278,7 @@ mod tests {
 
         let current = Settings::default();
         assert!(current.toolbar_sort_name_numeric_desc_options_migrated);
-        assert_eq!(current.toolbar_sort_items.len(), 10);
+        assert_eq!(current.toolbar_sort_items.len(), 12);
     }
 
     #[test]
@@ -18767,7 +19289,9 @@ mod tests {
         }))
         .unwrap();
         assert!(old.migrate_toolbar_sort_rating_options());
-        assert_eq!(old.toolbar_sort_items, SortOrder::all());
+        let mut rating_defaults = canonical.clone();
+        rating_defaults.extend([SortOrder::RatingAsc, SortOrder::RatingDesc]);
+        assert_eq!(old.toolbar_sort_items, rating_defaults);
         assert!(!old.migrate_toolbar_sort_rating_options());
         old.toolbar_sort_items.retain(|sort| !sort.is_rating());
         let mut later_hidden: Settings =
@@ -19243,6 +19767,7 @@ mod tests {
         previous_release.toolbar_sort_items = canonical_six.clone();
         previous_release.toolbar_sort_name_numeric_desc_options_migrated = false;
         previous_release.toolbar_sort_rating_options_migrated = false;
+        previous_release.toolbar_sort_duration_options_migrated = false;
         previous_release.save();
 
         reset_backup_state_for_test();
@@ -19264,6 +19789,7 @@ mod tests {
         let mut old = Settings::default();
         old.toolbar_sort_items = SortOrder::collection_options().to_vec();
         old.toolbar_sort_rating_options_migrated = false;
+        old.toolbar_sort_duration_options_migrated = false;
         old.save();
 
         reset_backup_state_for_test();
@@ -19277,6 +19803,43 @@ mod tests {
         let hidden = Settings::load();
         assert_eq!(hidden.toolbar_sort_items, SortOrder::collection_options());
         assert!(hidden.toolbar_sort_rating_options_migrated);
+    }
+
+    #[test]
+    fn toolbar_duration_markers_survive_settings_db_reload_without_restoring_hidden_options() {
+        let _env = setup_backup_env();
+        let mut old = Settings::default();
+        old.toolbar_sort_items.retain(|sort| !sort.is_duration());
+        old.toolbar_facet_filter_items
+            .retain(|item| *item != ToolbarFacetFilterItem::Duration);
+        old.toolbar_sort_duration_options_migrated = false;
+        old.toolbar_facet_duration_options_migrated = false;
+        old.save();
+
+        reset_backup_state_for_test();
+        let mut loaded = Settings::load();
+        assert_eq!(loaded.toolbar_sort_items, SortOrder::all());
+        assert_eq!(
+            loaded.toolbar_facet_filter_items,
+            default_toolbar_facet_filter_items()
+        );
+        assert!(loaded.toolbar_sort_duration_options_migrated);
+        assert!(loaded.toolbar_facet_duration_options_migrated);
+        loaded.toolbar_sort_items.retain(|sort| !sort.is_duration());
+        loaded
+            .toolbar_facet_filter_items
+            .retain(|item| *item != ToolbarFacetFilterItem::Duration);
+        loaded.save();
+
+        reset_backup_state_for_test();
+        let hidden = Settings::load();
+        assert_eq!(hidden.toolbar_sort_items, loaded.toolbar_sort_items);
+        assert_eq!(
+            hidden.toolbar_facet_filter_items,
+            loaded.toolbar_facet_filter_items
+        );
+        assert!(hidden.toolbar_sort_duration_options_migrated);
+        assert!(hidden.toolbar_facet_duration_options_migrated);
     }
 
     #[test]

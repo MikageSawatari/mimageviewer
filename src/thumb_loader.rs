@@ -689,6 +689,8 @@ pub fn folder_thumb_cache_key(
         | crate::settings::SortOrder::NumericDesc
         | crate::settings::SortOrder::SizeAsc
         | crate::settings::SortOrder::SizeDesc
+        | crate::settings::SortOrder::DurationAsc
+        | crate::settings::SortOrder::DurationDesc
         | crate::settings::SortOrder::RatingAsc
         | crate::settings::SortOrder::RatingDesc => "name",
     };
@@ -6167,6 +6169,8 @@ fn resolve_folder_thumb_image_inner(
             | crate::settings::SortOrder::NumericDesc
             | crate::settings::SortOrder::SizeAsc
             | crate::settings::SortOrder::SizeDesc
+            | crate::settings::SortOrder::DurationAsc
+            | crate::settings::SortOrder::DurationDesc
             | crate::settings::SortOrder::RatingAsc
             | crate::settings::SortOrder::RatingDesc => 0,
         }

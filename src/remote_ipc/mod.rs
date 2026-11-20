@@ -397,8 +397,17 @@ pub(super) fn sort_order_wire_value(order: crate::settings::SortOrder) -> String
 pub(super) fn parse_sort_order_wire(
     value: &str,
 ) -> Result<crate::settings::SortOrder, &'static str> {
-    serde_json::from_value(serde_json::Value::String(value.to_owned()))
-        .map_err(|_| "並び順が正しくありません")
+    let order: crate::settings::SortOrder =
+        serde_json::from_value(serde_json::Value::String(value.to_owned()))
+            .map_err(|_| "並び順が正しくありません")?;
+    if order.is_duration() {
+        return Err("Remoteでは長さ順を使えません");
+    }
+    Ok(order)
+}
+
+pub(super) fn remote_sort_order(order: crate::settings::SortOrder) -> crate::settings::SortOrder {
+    crate::app::listing_sort::without_duration_order(order)
 }
 
 pub(super) fn remote_grid_sort_state(
@@ -406,10 +415,11 @@ pub(super) fn remote_grid_sort_state(
     locked_reason: Option<&str>,
 ) -> mimageviewer_ipc::RemoteGridSortState {
     mimageviewer_ipc::RemoteGridSortState {
-        selected: sort_order_wire_value(selected),
+        selected: sort_order_wire_value(remote_sort_order(selected)),
         options: crate::settings::SortOrder::all()
             .iter()
             .copied()
+            .filter(|order| !order.is_duration())
             .map(|order| mimageviewer_ipc::RemoteGridSortOption {
                 value: sort_order_wire_value(order),
                 label: order.label().to_owned(),
@@ -499,11 +509,12 @@ impl RemoteSortSettingsSource {
     pub(super) fn load(
         &self,
     ) -> Result<crate::settings::SortOrder, crate::settings_db::SettingsDbError> {
-        match self {
+        let order = match self {
             Self::Live => crate::settings_db::with_db_result(|db| db.load_sort_order()),
             #[cfg(test)]
             Self::Snapshot(order) => Ok(*order),
-        }
+        }?;
+        Ok(remote_sort_order(order))
     }
 }
 
@@ -971,8 +982,12 @@ mod adjustment_value_tests {
     #[test]
     fn remote_sort_state_uses_core_values_and_labels() {
         let state = remote_grid_sort_state(crate::settings::SortOrder::DateDesc, None);
-        assert_eq!(state.options.len(), crate::settings::SortOrder::all().len());
-        for (option, order) in state.options.iter().zip(crate::settings::SortOrder::all()) {
+        let options = crate::settings::SortOrder::all()
+            .iter()
+            .filter(|order| !order.is_duration())
+            .collect::<Vec<_>>();
+        assert_eq!(state.options.len(), options.len());
+        for (option, order) in state.options.iter().zip(options) {
             assert_eq!(option.value, sort_order_wire_value(*order));
             assert_eq!(option.label, order.label());
             assert_eq!(option.short_label, order.short_label());
@@ -982,6 +997,26 @@ mod adjustment_value_tests {
             state.selected,
             sort_order_wire_value(crate::settings::SortOrder::DateDesc)
         );
+    }
+
+    #[test]
+    fn remote_duration_sort_is_name_order_and_cannot_be_selected() {
+        use crate::settings::SortOrder;
+        for order in [SortOrder::DurationAsc, SortOrder::DurationDesc] {
+            let state = remote_grid_sort_state(order, None);
+            assert_eq!(state.selected, sort_order_wire_value(SortOrder::FileName));
+            assert!(
+                !state
+                    .options
+                    .iter()
+                    .any(|option| option.value == sort_order_wire_value(order))
+            );
+            assert!(parse_sort_order_wire(&sort_order_wire_value(order)).is_err());
+            assert_eq!(
+                RemoteSortSettingsSource::Snapshot(order).load().unwrap(),
+                SortOrder::FileName
+            );
+        }
     }
 }
 

@@ -446,29 +446,32 @@ pub fn sort_rows(rows: &mut [BookmarkBrowserRow], sort: BookmarkViewSort) {
                 .cmp(&b.created_at_ms)
                 .then_with(|| a.stable_key().cmp(&b.stable_key()))
         }),
-        BookmarkViewSort::Normal(order) => rows.sort_by(|a, b| {
-            let name_a = a.display_name();
-            let name_b = b.display_name();
-            let key_a = order.name_key(&name_a);
-            let key_b = order.name_key(&name_b);
-            let meta_a = crate::grid_item::listing_sort_metadata_for_item(
-                &a.item,
-                crate::settings::ListingSortMetadata::new(
-                    a.image_meta.map(|(mtime, _)| mtime).unwrap_or(0),
-                    a.image_meta.map(|(_, size)| size),
-                ),
-            );
-            let meta_b = crate::grid_item::listing_sort_metadata_for_item(
-                &b.item,
-                crate::settings::ListingSortMetadata::new(
-                    b.image_meta.map(|(mtime, _)| mtime).unwrap_or(0),
-                    b.image_meta.map(|(_, size)| size),
-                ),
-            );
-            order
-                .compare_listing_keys(&key_a, meta_a, &key_b, meta_b)
-                .then_with(|| a.stable_key().cmp(&b.stable_key()))
-        }),
+        BookmarkViewSort::Normal(order) => {
+            let order = crate::app::listing_sort::without_duration_order(order);
+            rows.sort_by(|a, b| {
+                let name_a = a.display_name();
+                let name_b = b.display_name();
+                let key_a = order.name_key(&name_a);
+                let key_b = order.name_key(&name_b);
+                let meta_a = crate::grid_item::listing_sort_metadata_for_item(
+                    &a.item,
+                    crate::settings::ListingSortMetadata::new(
+                        a.image_meta.map(|(mtime, _)| mtime).unwrap_or(0),
+                        a.image_meta.map(|(_, size)| size),
+                    ),
+                );
+                let meta_b = crate::grid_item::listing_sort_metadata_for_item(
+                    &b.item,
+                    crate::settings::ListingSortMetadata::new(
+                        b.image_meta.map(|(mtime, _)| mtime).unwrap_or(0),
+                        b.image_meta.map(|(_, size)| size),
+                    ),
+                );
+                order
+                    .compare_listing_keys(&key_a, meta_a, &key_b, meta_b)
+                    .then_with(|| a.stable_key().cmp(&b.stable_key()))
+            });
+        }
     }
 }
 
@@ -1569,6 +1572,19 @@ mod tests {
             let mut rows = base.clone();
             sort_rows(&mut rows, BookmarkViewSort::Normal(order));
             assert_eq!(ids(&rows), [10, 2], "{order:?}");
+        }
+    }
+
+    #[test]
+    fn unsupported_duration_bookmarks_use_name_order_in_both_directions() {
+        let base = vec![media_row(2, 1, "b"), media_row(1, 1, "a")];
+        for order in [
+            crate::settings::SortOrder::DurationAsc,
+            crate::settings::SortOrder::DurationDesc,
+        ] {
+            let mut rows = base.clone();
+            sort_rows(&mut rows, BookmarkViewSort::Normal(order));
+            assert_eq!(ids(&rows), [1, 2]);
         }
     }
 

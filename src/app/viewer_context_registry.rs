@@ -1,6 +1,63 @@
 use super::*;
 use std::collections::HashMap;
 
+#[cfg(all(test, windows))]
+mod duration_762_context_tests {
+    use super::*;
+
+    #[test]
+    fn duration_762_proof_and_cache_follow_mount_park_and_drop_without_sibling_changes() {
+        let mut app = crate::app::setup_app_for_test();
+        let proof = DurationScanProof {
+            generation: app.items_generation,
+            items_len: app.items.len(),
+        };
+        app.duration_scan_proof = Some(proof);
+        app.details_lazy_meta
+            .insert("source-media".into(), DetailsLazyMeta::default());
+        let mut sibling = ViewerContextBundle::empty();
+        sibling.set_items_generation(app.items_generation.wrapping_add(1));
+        let sibling_proof = DurationScanProof {
+            generation: sibling.items_generation,
+            items_len: sibling.items.len(),
+        };
+        assert_ne!(proof, sibling_proof);
+        sibling.duration_scan_proof = Some(sibling_proof);
+        sibling
+            .details_lazy_meta
+            .insert("sibling-media".into(), DetailsLazyMeta::default());
+        app.swap_viewer_context_bundle(&mut sibling);
+        assert_eq!(app.duration_scan_proof, Some(sibling_proof));
+        assert!(app.details_lazy_meta.contains_key("sibling-media"));
+        assert_eq!(sibling.duration_scan_proof, Some(proof));
+        assert!(sibling.details_lazy_meta.contains_key("source-media"));
+        app.swap_viewer_context_bundle(&mut sibling);
+        drop(sibling);
+        assert_eq!(app.duration_scan_proof, Some(proof));
+        assert!(app.details_lazy_meta.contains_key("source-media"));
+        assert!(!app.details_lazy_meta.contains_key("sibling-media"));
+    }
+
+    #[test]
+    fn duration_762_fork_keeps_source_proof_and_starts_without_metadata_proof() {
+        let mut app = crate::app::setup_app_for_test();
+        let proof = DurationScanProof {
+            generation: app.items_generation,
+            items_len: app.items.len(),
+        };
+        app.duration_scan_proof = Some(proof);
+        app.details_lazy_meta
+            .insert("source-media".into(), DetailsLazyMeta::default());
+        let fork = app.split_current_context_preserving_main_grid();
+        assert_eq!(app.duration_scan_proof, Some(proof));
+        assert!(app.details_lazy_meta.contains_key("source-media"));
+        assert_eq!(fork.duration_scan_proof, None);
+        assert!(fork.details_lazy_meta.is_empty());
+        drop(fork);
+        assert_eq!(app.duration_scan_proof, Some(proof));
+    }
+}
+
 #[cfg(windows)]
 fn clear_independent_zip_list_choices(
     zip_nav: &mut Option<crate::zip_tree::ZipNavState>,
@@ -1871,6 +1928,7 @@ pub(in crate::app) struct ViewerContextBundle {
     details_meta_pending: Option<DetailsMetaPending>,
     details_lazy_visible_revision: u64,
     details_image_dims_state: LazyColumnState,
+    duration_scan_proof: Option<super::DurationScanProof>,
     metadata_cache: std::collections::HashMap<String, Option<crate::png_metadata::AiMetadata>>,
     exif_cache: std::collections::HashMap<String, Option<crate::exif_reader::ExifInfo>>,
     xmp_cache: std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
@@ -3194,6 +3252,7 @@ impl ViewerContextBundle {
             details_meta_pending: None,
             details_lazy_visible_revision: 0,
             details_image_dims_state: LazyColumnState::Disabled,
+            duration_scan_proof: None,
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
@@ -3632,6 +3691,7 @@ impl App {
             details_meta_pending,
             details_lazy_visible_revision,
             details_image_dims_state,
+            duration_scan_proof,
             metadata_cache,
             exif_cache,
             xmp_cache,
@@ -3958,6 +4018,7 @@ impl App {
         swap_field!(details_meta_pending);
         swap_field!(details_lazy_visible_revision);
         swap_field!(details_image_dims_state);
+        swap_field!(duration_scan_proof);
         swap_field!(metadata_cache);
         swap_field!(exif_cache);
         swap_field!(xmp_cache);
@@ -4410,6 +4471,7 @@ impl App {
             details_meta_pending,
             details_lazy_visible_revision,
             details_image_dims_state,
+            duration_scan_proof,
             metadata_cache,
             exif_cache,
             xmp_cache,
@@ -4873,6 +4935,7 @@ impl App {
             details_meta_pending,
             details_lazy_visible_revision,
             details_image_dims_state,
+            duration_scan_proof,
             video_thumb_overrides,
             metadata_cache,
             exif_cache,

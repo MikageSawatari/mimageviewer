@@ -2,6 +2,7 @@
 //! 実フォルダ / 画像 / 動画 / 音声 / アーカイブを収集する flat snapshot view。
 
 use super::*;
+use crate::app::listing_sort::without_duration_request;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -3816,6 +3817,7 @@ impl App {
                         },
                     },
                     restore_intent.clone(),
+                    super::top_level_grid_view::TopLevelGridSurface::SmartFolder(target.clone()),
                 ))
             }
             SmartPhysicalReady::Zip(enumeration) => {
@@ -4152,7 +4154,9 @@ impl App {
         spawn_smart_folder_result_count(
             snapshot,
             matches!(
-                crate::rating_sort::ListingOrderRequest::from_settings(&self.settings),
+                without_duration_request(crate::rating_sort::ListingOrderRequest::from_settings(
+                    &self.settings
+                )),
                 crate::rating_sort::ListingOrderRequest::Rating(_)
             ),
             transition.request_id,
@@ -6020,6 +6024,7 @@ fn build_smart_entry_sort_keys_for_request(
     facts: Option<&crate::rating_db::CompleteRatingFacts>,
     display_order: &crate::settings::GridDisplayOrder,
 ) -> Vec<SmartEntrySortKey> {
+    let request = without_duration_request(request);
     let sort = request.standard_fallback();
     let mut relative_parent_keys =
         HashMap::<PathBuf, Arc<crate::filename_sort::SortNameKey>>::new();
@@ -6080,7 +6085,9 @@ impl SmartFolderPresentation {
     fn current(app: &App, grouping: crate::settings::SubfolderExpansionOrder) -> Self {
         Self {
             file_type_visibility: app.settings.file_type_visibility.clone(),
-            order_request: crate::rating_sort::ListingOrderRequest::from_settings(&app.settings),
+            order_request: without_duration_request(
+                crate::rating_sort::ListingOrderRequest::from_settings(&app.settings),
+            ),
             display: app.settings.grid_display_order.normalized(),
             grouping,
         }
@@ -6095,9 +6102,11 @@ impl SmartFolderPresentation {
     ) -> Self {
         let from_state = |state: &crate::settings::FavoriteViewState| Self {
             file_type_visibility: app.settings.file_type_visibility.clone(),
-            order_request: crate::rating_sort::ListingOrderRequest::from_sort(
-                state.sort_order,
-                app.settings.rating_sort_unrated_position,
+            order_request: without_duration_request(
+                crate::rating_sort::ListingOrderRequest::from_sort(
+                    state.sort_order,
+                    app.settings.rating_sort_unrated_position,
+                ),
             ),
             display: state.grid_display_order.normalized(),
             grouping,
@@ -6149,7 +6158,7 @@ fn compare_smart_entries_for_request(
     b: &SmartFolderEntry,
     bk: &SmartEntrySortKey,
 ) -> std::cmp::Ordering {
-    match request {
+    match without_duration_request(request) {
         crate::rating_sort::ListingOrderRequest::Standard(sort) => {
             compare_smart_entries_within_group(sort, a, ak, b, bk)
         }
@@ -6639,6 +6648,7 @@ fn prepare_smart_folder(
     cancel: &AtomicBool,
     tx: &mpsc::Sender<SmartFolderPrepareEvent>,
 ) -> Result<Option<PreparedSmartFolder>, String> {
+    let request = without_duration_request(request);
     let reuse_metadata = reused_metadata.is_some();
     let reuse_resort_metadata_unchanged = reuse_metadata && removed_paths.is_empty();
     let total = snapshot.entries.len();
@@ -7546,7 +7556,9 @@ pub(crate) fn build_remote_smart_folder_entries(
     )
     .ok_or_else(|| "スマートフォルダの走査が中断されました".to_owned())?;
     let snapshot = scanned.snapshot;
-    let request = crate::rating_sort::ListingOrderRequest::from_settings(settings);
+    let request = without_duration_request(crate::rating_sort::ListingOrderRequest::from_settings(
+        settings,
+    ));
     let rating_order = matches!(request, crate::rating_sort::ListingOrderRequest::Rating(_));
     let load_ratings = rating_order
         || smart_folder_definition_uses_metadata(
@@ -8046,7 +8058,9 @@ impl App {
         match spawn_smart_folder_result_count(
             snapshot,
             matches!(
-                crate::rating_sort::ListingOrderRequest::from_settings(&self.settings),
+                without_duration_request(crate::rating_sort::ListingOrderRequest::from_settings(
+                    &self.settings
+                )),
                 crate::rating_sort::ListingOrderRequest::Rating(_)
             ),
             generation,
@@ -8116,7 +8130,9 @@ impl App {
         };
         match spawn_smart_folder_prepare(
             snapshot,
-            crate::rating_sort::ListingOrderRequest::from_settings(&self.settings),
+            without_duration_request(crate::rating_sort::ListingOrderRequest::from_settings(
+                &self.settings,
+            )),
             self.rating_session_write_generation,
             self.settings.grid_display_order.clone(),
             generation,

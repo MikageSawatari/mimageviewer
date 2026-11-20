@@ -4489,12 +4489,14 @@ mod tests {
                         path: PathBuf::from(format!("{index}-second.jpg")),
                         mtime: 0,
                         size: Some(1),
+                        sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
                         is_video: false,
                     },
                     StackMember {
                         path: PathBuf::from(format!("{index}-first.mp4")),
                         mtime: 0,
                         size: Some(1),
+                        sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
                         is_video: true,
                     },
                 ],
@@ -5500,6 +5502,7 @@ mod tests {
             path: PathBuf::from(path),
             mtime: 0,
             size: Some(1),
+            sort_meta: crate::settings::ListingSortMetadata::new(0, Some(1)),
             is_video,
         };
         let view = StackView::from_groups(

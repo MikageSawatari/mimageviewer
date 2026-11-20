@@ -655,9 +655,12 @@ mod container_type_icon_fixture;
 mod grid_paint;
 #[doc(hidden)]
 pub use container_type_icon_fixture::draw_container_type_icon_snapshot_fixture;
+mod duration_metadata;
+pub(crate) mod listing_sort;
 mod media_metadata_mutation;
 pub(crate) mod metadata_import_refresh;
 mod metadata_ops;
+use duration_metadata::DurationScanProof;
 mod pin_materialization;
 pub(crate) use metadata_ops::{probe_image_dims_from_bytes, tag_item_path};
 
@@ -1561,6 +1564,15 @@ pub(crate) struct MainListNavigation {
     pub(crate) history: MainHistoryOperation,
     pub(crate) destination: MainListRestoreDestination,
     selection_after_load: Option<AfterLoadSelection>,
+}
+
+impl MainListNavigation {
+    fn exits_temporary_view(&self) -> bool {
+        matches!(
+            self.history,
+            MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
+        )
+    }
 }
 
 pub(crate) struct MainListAdoption {
@@ -7443,6 +7455,7 @@ enum DetailsMetaScanScope {
 
 struct DetailsMetaPending {
     scan_scope: DetailsMetaScanScope,
+    duration_scan: Option<DurationScanProof>,
     visible_revision: u64,
     selection_target_key: Option<String>,
     normal_target_keys: HashSet<String>,
@@ -7459,6 +7472,10 @@ enum DetailsMetaPendingPhase {
 }
 
 enum DetailsMetaScanOrder {
+    WholeListing {
+        cursor: usize,
+        len: usize,
+    },
     Explicit {
         indices: Vec<usize>,
         cursor: usize,
@@ -7473,14 +7490,16 @@ enum DetailsMetaScanOrder {
 impl DetailsMetaScanOrder {
     fn scanned(&self) -> usize {
         match self {
-            Self::Explicit { cursor, .. } | Self::CurrentGrid { cursor, .. } => *cursor,
+            Self::Explicit { cursor, .. }
+            | Self::CurrentGrid { cursor, .. }
+            | Self::WholeListing { cursor, .. } => *cursor,
         }
     }
 
     fn len(&self) -> usize {
         match self {
             Self::Explicit { indices, .. } => indices.len(),
-            Self::CurrentGrid { len, .. } => *len,
+            Self::CurrentGrid { len, .. } | Self::WholeListing { len, .. } => *len,
         }
     }
 
@@ -7489,7 +7508,7 @@ impl DetailsMetaScanOrder {
     }
 
     fn is_incremental(&self) -> bool {
-        matches!(self, Self::CurrentGrid { .. })
+        matches!(self, Self::CurrentGrid { .. } | Self::WholeListing { .. })
     }
 }
 
@@ -17324,8 +17343,10 @@ pub struct App {
     /// 詳細遅延メタの走査セッション状態。`details_meta_pending` は個々の worker job を所有し、
     /// この state は連続 job をまたいで Ready になるまでソート/フィルタを無効にする。
     pub(crate) details_image_dims_state: LazyColumnState,
+    duration_scan_proof: Option<DurationScanProof>,
     /// AI モデル/生成ツール facet をユーザーが開いたか、条件が有効なときに遅延メタを読む。
     pub(crate) ai_model_facet_requested: bool,
+    pub(crate) duration_facet_requested: bool,
     /// facet filter の適用元。場所変更時の一時解除 / 復元判定に使う。
     pub(crate) facet_navigation: FacetNavigationState,
     /// facet filter の階層別退避: ZIP/PDF/フォルダなどのコンテナを絞り込みで見つけて
@@ -21136,7 +21157,9 @@ impl App {
             details_meta_pending: None,
             details_lazy_visible_revision: 0,
             details_image_dims_state: LazyColumnState::Disabled,
+            duration_scan_proof: None,
             ai_model_facet_requested: false,
+            duration_facet_requested: false,
             facet_navigation: FacetNavigationState::default(),
             facet_name_input,
             facet_name_has_focus: false,
@@ -25724,11 +25747,9 @@ impl App {
             destination,
             facet_mode,
         } = adoption;
-        let exits_search =
-            matches!(
-                navigation.history,
-                MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
-            ) && (self.global_search.active || self.favsearch.active || self.tag_view.active);
+        let exits_temporary_view = navigation.exits_temporary_view();
+        let exits_search = exits_temporary_view
+            && (self.global_search.active || self.favsearch.active || self.tag_view.active);
         // A search child has the visible child's facet route, while its transparent
         // history location is the pre-search origin. Keep the captured child route
         // for admission; only successful departure records the origin's saved route.
@@ -25827,10 +25848,7 @@ impl App {
             }
         }
         self.select_after_load = navigation.selection_after_load;
-        if matches!(
-            navigation.history,
-            MainHistoryOperation::Direct(DirectNavigationPurpose::ExitTemporaryView { .. })
-        ) {
+        if exits_temporary_view {
             self.dismiss_transparent_view_for_admitted_jump();
         }
         let mut hydration = install(self, install_boundary);
@@ -27880,7 +27898,17 @@ impl App {
             self.favorite_view_state_for_path(&folder)
                 .apply_to_settings(&mut listing_settings);
         }
+        // Retain the requested presentation as the observation identity, even for a fixed/fallback order.
         let projection_key = folder_projection_key(&listing_settings, self.stack_mode_requested);
+        listing_settings.sort_order =
+            self.effective_listing_sort_order(listing_settings.sort_order);
+        let duration_wanted = self.listing_may_sort_by_duration();
+        let duration_snapshot = if listing_settings.sort_order.is_duration() {
+            self.listing_duration_snapshot()
+        } else {
+            Arc::new(folder_scan::FolderDurationSnapshot::new())
+        };
+        let duration_cache_dir = crate::catalog::default_cache_dir();
         let baseline = self
             .folder_observation
             .as_ref()
@@ -27963,6 +27991,12 @@ impl App {
                 )
                 .ok()
                 .map(|mut scan| {
+                    folder_scan::collect_folder_duration_facts(
+                        &worker_folder,
+                        &mut scan,
+                        &duration_cache_dir,
+                        duration_wanted,
+                    );
                     let signature = signature_from_scan(&scan);
                     let mut projection_scan = scan.clone_for_projection();
                     if let Some(previous) = &worker_baseline {
@@ -27970,17 +28004,29 @@ impl App {
                             .rows
                             .preserve_directory_sort_stamps(&mut projection_scan);
                     }
-                    let materialized = folder_scan::materialize_local_folder_listing_with_order(
-                        &worker_folder,
-                        projection_scan,
-                        &listing_settings,
-                        crate::rating_sort::ListingOrderRequest::from_settings(&listing_settings),
-                        |keys| {
-                            crate::rating_db::RatingDb::open_readonly(&rating_path)
-                                .and_then(|db| db.get_many_complete(keys, rating_generation))
-                                .map_err(|error| error.to_string())
-                        },
-                    );
+                    let materialized =
+                        folder_scan::materialize_local_folder_listing_with_order_and_duration(
+                            &worker_folder,
+                            projection_scan,
+                            &listing_settings,
+                            crate::rating_sort::ListingOrderRequest::from_settings(
+                                &listing_settings,
+                            ),
+                            |keys| {
+                                crate::rating_db::RatingDb::open_readonly(&rating_path)
+                                    .and_then(|db| db.get_many_complete(keys, rating_generation))
+                                    .map_err(|error| error.to_string())
+                            },
+                            |path, stamp| {
+                                duration_snapshot
+                                    .get(&(
+                                        crate::adjustment_db::normalize_path(path),
+                                        stamp.mtime,
+                                        stamp.file_size?,
+                                    ))
+                                    .copied()
+                            },
+                        );
                     let equal = worker_baseline.as_ref().is_some_and(|previous| {
                         materialized.row_record.same_remaining_rows(
                             &previous.rows,
@@ -28949,7 +28995,12 @@ impl App {
     }
 
     pub(crate) fn apply_sort_change_reload(&mut self) {
-        self.apply_sort_change_reload_with_physical_mode(PhysicalFolderSortReload::Immediate);
+        let mode = if self.settings.sort_order.is_duration() {
+            PhysicalFolderSortReload::WorkerScan
+        } else {
+            PhysicalFolderSortReload::Immediate
+        };
+        self.apply_sort_change_reload_with_physical_mode(mode);
     }
 
     pub(crate) fn apply_sort_change_reload_without_ui_io(&mut self) {
@@ -29884,6 +29935,8 @@ impl App {
         let include_epub = !self.settings.epub_file_handling_ignores_epub();
         let show_hidden = self.settings.show_hidden_files;
         let file_type_visibility = self.settings.file_type_visibility.clone();
+        let duration_wanted = self.listing_may_sort_by_duration();
+        let duration_cache_dir = crate::catalog::default_cache_dir();
         let (tx, rx) = mpsc::sync_channel(1);
         if std::thread::Builder::new()
             .name("open-path-classify".into())
@@ -29893,7 +29946,7 @@ impl App {
                 }
                 let result = std::fs::metadata(&worker_path).and_then(|metadata| {
                     if metadata.is_dir() {
-                        let scan = folder_scan::scan_directory_with_visibility_cancel(
+                        let mut scan = folder_scan::scan_directory_with_visibility_cancel(
                             &worker_path,
                             include_convertible,
                             include_epub,
@@ -29901,6 +29954,12 @@ impl App {
                             &file_type_visibility,
                             Some(&worker_cancel),
                         )?;
+                        folder_scan::collect_folder_duration_facts(
+                            &worker_path,
+                            &mut scan,
+                            &duration_cache_dir,
+                            duration_wanted,
+                        );
                         Ok(ClassifiedOpenPath {
                             rar_volume_proof: None,
                             kind: OpenPathKind::Directory,
@@ -32221,6 +32280,8 @@ impl App {
             return FolderOpenOutcome::Ignored;
         }
         let full_keys = use_full_path_cache_keys_for_folder(&path);
+        let sort_surface =
+            self.physical_duration_sort_surface(&path, Some(&owner), navigation.as_ref());
         let prepared = self.prepare_scanned_folder_listing_with_cache_keys(
             path.clone(),
             scan,
@@ -32233,6 +32294,7 @@ impl App {
             },
             restore_intent,
             full_keys,
+            sort_surface,
         );
         let token = match {
             let _span = CloseNavSpan::new(CloseNavStage::PrepareInstall);
@@ -32319,8 +32381,8 @@ impl App {
         FolderOpenOutcome::Loaded
     }
 
-    /// Shared, already-admitted Folder listing tail. Smart opens enter here only after their
-    /// offscreen scan and visible-adoption checks succeed; this function cannot reject an open.
+    /// Shared, already-admitted Folder listing tail. The request owner supplies the destination
+    /// surface explicitly, independently of the still-mounted source surface/session.
     fn install_scanned_folder_listing(
         &mut self,
         path: PathBuf,
@@ -32329,6 +32391,7 @@ impl App {
         metrics: FolderListingMetrics,
 
         restore_intent: crate::app::StartupListIntent,
+        sort_surface: top_level_grid_view::TopLevelGridSurface,
     ) -> bool {
         let prepared = self.prepare_scanned_folder_listing_with_cache_keys(
             path,
@@ -32336,6 +32399,7 @@ impl App {
             metrics,
             restore_intent,
             self.use_full_path_cache_keys(),
+            sort_surface,
         );
         let logical = match &authority {
             VisibleInstallAuthority::StagedArchive { logical_source }
@@ -32362,6 +32426,7 @@ impl App {
         scan: ScannedDir,
         metrics: FolderListingMetrics,
         restore_intent: StartupListIntent,
+        sort_surface: top_level_grid_view::TopLevelGridSurface,
     ) -> PreparedScannedFolderListing {
         let full_path = use_full_path_cache_keys_for_folder(&path);
         self.prepare_scanned_folder_listing_with_cache_keys(
@@ -32370,17 +32435,20 @@ impl App {
             metrics,
             restore_intent,
             full_path,
+            sort_surface,
         )
     }
 
+    /// The caller owns the destination identity, including offscreen Smart/history loads.
+    /// Never infer it from the still-mounted source surface or session during preparation.
     fn prepare_scanned_folder_listing_with_cache_keys(
         &mut self,
         path: PathBuf,
         mut scan: ScannedDir,
         metrics: FolderListingMetrics,
-
-        restore_intent: crate::app::StartupListIntent,
+        restore_intent: StartupListIntent,
         use_full_path_cache_keys: bool,
+        sort_surface: top_level_grid_view::TopLevelGridSurface,
     ) -> PreparedScannedFolderListing {
         let _span = CloseNavSpan::new(CloseNavStage::PrepareListing);
         let detached_physical = self.navigation_scope.is_detached_physical();
@@ -32418,10 +32486,15 @@ impl App {
             self.favorite_view_state_for_path(&path)
                 .apply_to_settings(&mut listing_settings);
         }
+        let projection_key = folder_projection_key(&listing_settings, self.stack_mode_requested);
+        listing_settings.sort_order = self.physical_duration_sort_order(
+            listing_settings.sort_order,
+            &sort_surface,
+            scanned_folder_is_image_book,
+        );
         let order_request =
             crate::rating_sort::ListingOrderRequest::from_settings(&listing_settings);
         let rating_generation_before_read = self.rating_session_write_generation;
-        let projection_key = folder_projection_key(&listing_settings, self.stack_mode_requested);
         let worker_prepared = scan.reconcile.take().map(|result| result.materialized);
         let materialized = match worker_prepared {
             Some(listing) => {
@@ -32432,7 +32505,7 @@ impl App {
             }
             None => {
                 let _span = CloseNavSpan::new(CloseNavStage::MaterializeListing);
-                folder_scan::materialize_local_folder_listing_with_order(
+                folder_scan::materialize_local_folder_listing_with_order_and_duration(
                     &path,
                     scan,
                     &listing_settings,
@@ -32445,6 +32518,7 @@ impl App {
                             .get_many_complete(keys, rating_generation_before_read)
                             .map_err(|error| error.to_string())
                     },
+                    |path, stamp| self.listing_duration_for_path(path, stamp),
                 )
             }
         };
@@ -38266,6 +38340,11 @@ impl App {
         let password = pdf_password_submission
             .as_ref()
             .map(|(password, _)| password.clone());
+        let sort_surface = self.physical_duration_sort_surface(
+            &request.path,
+            Some(&owner),
+            Some(&request.navigation),
+        );
         let Some(mut prepared) = self.prepare_physical_listing(
             request.path.clone(),
             payload,
@@ -38274,6 +38353,7 @@ impl App {
             restore_intent.clone(),
             auto_fullscreen,
             full_path,
+            sort_surface,
         ) else {
             return;
         };
@@ -38522,6 +38602,7 @@ impl App {
         restore_intent: StartupListIntent,
         auto_fullscreen: bool,
         full_path_cache_keys: bool,
+        sort_surface: top_level_grid_view::TopLevelGridSurface,
     ) -> Option<PreparedPhysicalListing> {
         let prepared = match payload {
             collection_navigation::PhysicalHistoryPreflightPayload::Folder(scan) => {
@@ -38542,6 +38623,7 @@ impl App {
                     },
                     restore_intent.clone(),
                     full_path,
+                    sort_surface,
                 );
                 prepared.auto_open_image_folder = auto_book;
                 PreparedPhysicalListing::Folder(prepared)
@@ -45921,8 +46003,10 @@ impl App {
         }
         self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
         self.ai_model_facet_requested = self.facet_ai_filter_active();
+        self.duration_facet_requested = self.settings.facet_filter.duration_preset.is_some();
+        self.duration_scan_proof = None;
         self.details_image_dims_state =
-            if self.details_any_lazy_columns_enabled() || self.ai_model_facet_should_load() {
+            if self.details_any_lazy_columns_enabled() || self.whole_listing_meta_scan_wanted() {
                 LazyColumnState::NotRequested
             } else {
                 LazyColumnState::Disabled
@@ -60773,6 +60857,8 @@ impl App {
         }
         let archive_cache_db = self.archive_cache_db.clone();
         let show_hidden_files = self.settings.show_hidden_files;
+        let duration_wanted = self.listing_may_sort_by_duration();
+        let duration_cache_dir = crate::catalog::default_cache_dir();
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
@@ -61006,7 +61092,15 @@ impl App {
                         );
                     }
                     match scan {
-                        Ok(scan) => FolderNavScanResult::Ready(scan),
+                        Ok(mut scan) => {
+                            folder_scan::collect_folder_duration_facts(
+                                &o.path,
+                                &mut scan,
+                                &duration_cache_dir,
+                                duration_wanted,
+                            );
+                            FolderNavScanResult::Ready(scan)
+                        }
                         Err(error) => FolderNavScanResult::Failed(error.to_string()),
                     }
                 } else {
@@ -61571,6 +61665,8 @@ impl App {
         let file_type_visibility = self.settings.file_type_visibility.clone();
         let perf_seq = self.input_seq;
         let perf_purpose = purpose.perf_tag();
+        let duration_wanted = self.listing_may_sort_by_duration();
+        let duration_cache_dir = crate::catalog::default_cache_dir();
         let started_at = std::time::Instant::now();
         std::thread::spawn(move || {
             let scan_started = std::time::Instant::now();
@@ -61589,6 +61685,15 @@ impl App {
                     Some(&cancel_w),
                 )
             };
+            let scan = scan.map(|mut scan| {
+                folder_scan::collect_folder_duration_facts(
+                    &scan_path,
+                    &mut scan,
+                    &duration_cache_dir,
+                    duration_wanted,
+                );
+                scan
+            });
             if crate::perf::is_enabled() {
                 let (folders, media, failed) = match &scan {
                     Ok(scan) => (scan.folders.len(), scan.all_media.len(), false),
@@ -73662,10 +73767,11 @@ impl App {
     }
 
     fn details_lazy_uses_visible_stages(&self) -> bool {
-        self.thumbnail_media_metadata_enabled()
-            || self.settings.grid_view_mode == crate::settings::GridViewMode::Details
-                && self.settings.details_show_page_count
-                && self.settings.details_sort_key != crate::settings::DetailsSortKey::PageCount
+        (!self.duration_lengths_wanted() || self.duration_scan_ready())
+            && (self.thumbnail_media_metadata_enabled()
+                || self.settings.grid_view_mode == crate::settings::GridViewMode::Details
+                    && self.settings.details_show_page_count
+                    && self.settings.details_sort_key != crate::settings::DetailsSortKey::PageCount)
     }
 
     fn details_meta_visible_order(&self) -> Vec<usize> {
@@ -73699,10 +73805,17 @@ impl App {
         })
     }
 
-    fn finish_details_lazy_session(&mut self, failed: usize) {
+    fn finish_details_lazy_session(
+        &mut self,
+        failed: usize,
+        duration_scan: Option<DurationScanProof>,
+    ) {
+        let duration_completed = self.complete_duration_scan(duration_scan);
         self.details_image_dims_state = LazyColumnState::Ready { failed };
         self.prune_details_lazy_meta_cache();
-        if self.facet_ai_filter_active() {
+        if self.facet_ai_filter_active()
+            || (duration_completed && self.settings.facet_filter.duration_preset.is_some())
+        {
             let ready_state = self.details_image_dims_state;
             self.rebuild_visible_indices();
             self.details_image_dims_state = ready_state;
@@ -73741,7 +73854,7 @@ impl App {
             self.details_image_dims_state = LazyColumnState::NotRequested;
             self.start_details_meta_load_for_scope(ctx, DetailsMetaScanScope::VisibleStage);
         } else if let Some(failed) = failed {
-            self.finish_details_lazy_session(failed);
+            self.finish_details_lazy_session(failed, None);
             ctx.request_repaint();
         }
     }
@@ -73752,7 +73865,7 @@ impl App {
         if self.settings.grid_view_mode != crate::settings::GridViewMode::Thumbnail {
             return;
         }
-        if !self.thumbnail_media_metadata_enabled() && self.ai_model_facet_should_load() {
+        if !self.thumbnail_media_metadata_enabled() && self.whole_listing_meta_scan_wanted() {
             return;
         }
         let selected = self.selection_info_lazy_target_idx();
@@ -73782,7 +73895,7 @@ impl App {
         self.details_tag_prewarm_indices = near;
         // AI facets retain their all-grid scan. The existing priority queue handles new visible
         // media in that scan; badge-only stages can discard their old bounded range outright.
-        if !self.ai_model_facet_should_load() {
+        if !self.whole_listing_meta_scan_wanted() {
             self.invalidate_details_meta_requirements();
         }
     }
@@ -73801,6 +73914,24 @@ impl App {
                 &mut details_perf_section,
                 crate::perf::stall::PollPart::DetailsMeta,
             );
+        }
+        if self
+            .details_meta_pending
+            .as_ref()
+            .and_then(|pending| pending.duration_scan)
+            .is_some_and(|scan| scan != self.duration_scan_snapshot())
+        {
+            if let Some(pending) = self.details_meta_pending.take() {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+            self.details_image_dims_state = LazyColumnState::NotRequested;
+        }
+        if self.duration_lengths_wanted()
+            && !self.duration_scan_ready()
+            && self.details_meta_pending.is_none()
+            && !matches!(self.details_image_dims_state, LazyColumnState::Cancelled)
+        {
+            self.details_image_dims_state = LazyColumnState::NotRequested;
         }
         self.refresh_thumbnail_details_stage(ctx);
         if !self.details_lazy_columns_visible() {
@@ -74028,7 +74159,10 @@ impl App {
                         .details_meta_pending
                         .as_ref()
                         .is_some_and(|p| p.visible_revision == self.details_lazy_visible_revision);
-                    self.details_meta_pending = None;
+                    let duration_scan = self
+                        .details_meta_pending
+                        .take()
+                        .and_then(|pending| pending.duration_scan);
                     if revision_matches {
                         if self.details_lazy_uses_visible_stages() {
                             let total = match self.details_image_dims_state {
@@ -74041,7 +74175,7 @@ impl App {
                                 failed,
                             };
                         } else {
-                            self.finish_details_lazy_session(failed);
+                            self.finish_details_lazy_session(failed, duration_scan);
                         }
                     } else {
                         self.details_image_dims_state = LazyColumnState::NotRequested;
@@ -74104,18 +74238,18 @@ impl App {
     }
 
     pub(crate) fn details_lazy_columns_visible(&self) -> bool {
-        if self.items_are_drive_list || self.items.is_empty() {
+        if self.items_are_drive_list || (self.items.is_empty() && !self.duration_lengths_wanted()) {
             return false;
         }
         match self.settings.grid_view_mode {
             crate::settings::GridViewMode::Details => {
                 self.details_any_lazy_columns_enabled()
-                    || self.ai_model_facet_should_load()
+                    || self.whole_listing_meta_scan_wanted()
                     || self.selection_info_lazy_target_idx().is_some()
             }
             crate::settings::GridViewMode::Thumbnail => {
                 self.thumbnail_media_metadata_enabled()
-                    || self.ai_model_facet_should_load()
+                    || self.whole_listing_meta_scan_wanted()
                     || self.selection_info_lazy_target_idx().is_some()
             }
         }
@@ -74160,7 +74294,7 @@ impl App {
     }
 
     fn selection_info_only_lazy_load(&self) -> bool {
-        !self.ai_model_facet_should_load()
+        !self.whole_listing_meta_scan_wanted()
             && match self.settings.grid_view_mode {
                 crate::settings::GridViewMode::Thumbnail => {
                     !self.thumbnail_media_metadata_enabled()
@@ -74298,8 +74432,12 @@ impl App {
             ),
         };
         match self.items.get(idx) {
-            Some(GridItem::Video(_)) => want_duration || want_dims || want_codec,
-            Some(GridItem::Audio(_)) => want_duration || want_codec,
+            Some(GridItem::Video(_)) => {
+                self.duration_lengths_wanted() || want_duration || want_dims || want_codec
+            }
+            Some(GridItem::Audio(_)) => {
+                self.duration_lengths_wanted() || want_duration || want_codec
+            }
             _ => false,
         }
     }
@@ -74573,6 +74711,10 @@ impl App {
 
         let generation = self.items_generation;
         let ai_facet_load = self.ai_model_facet_should_load();
+        let whole_listing_load = self.whole_listing_meta_scan_wanted();
+        let duration_scan = (scan_scope == DetailsMetaScanScope::AllRequirements
+            && self.duration_lengths_wanted())
+        .then(|| self.duration_scan_snapshot());
         let selection_info_only = self.selection_info_only_lazy_load();
         let load_all_page_counts = self.settings.grid_view_mode
             == crate::settings::GridViewMode::Details
@@ -74580,7 +74722,7 @@ impl App {
         let visible_page_count_stage_only = self.settings.grid_view_mode
             == crate::settings::GridViewMode::Details
             && !load_all_page_counts
-            && !ai_facet_load
+            && !whole_listing_load
             && !self.settings.details_show_created
             && !self.settings.details_show_image_dimensions
             && !self.settings.details_show_video_duration
@@ -74597,7 +74739,15 @@ impl App {
             )),
             pdf_passwords: self.pdf_passwords.clone(),
         };
-        let (order, visible_near) = if selection_info_only {
+        let (order, visible_near) = if duration_scan.is_some() {
+            (
+                DetailsMetaScanOrder::WholeListing {
+                    cursor: 0,
+                    len: self.items.len(),
+                },
+                self.details_meta_visible_order().into_iter().collect(),
+            )
+        } else if selection_info_only {
             let order: Vec<usize> = self.selection_info_lazy_target_idx().into_iter().collect();
             let visible_near: HashSet<usize> = order.iter().copied().collect();
             (
@@ -74610,7 +74760,7 @@ impl App {
         } else if visible_page_count_stage_only
             || scan_scope == DetailsMetaScanScope::VisibleStage
             || (self.thumbnail_media_metadata_enabled()
-                && (!ai_facet_load || scan_scope == DetailsMetaScanScope::VisibleStage))
+                && (!whole_listing_load || scan_scope == DetailsMetaScanScope::VisibleStage))
         {
             let order = self.details_meta_visible_order();
             let visible_near: HashSet<usize> = order.iter().copied().collect();
@@ -74634,6 +74784,7 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         self.details_meta_pending = Some(DetailsMetaPending {
             scan_scope,
+            duration_scan,
             visible_revision: self.details_lazy_visible_revision,
             selection_target_key: self.selection_info_lazy_target_key(),
             normal_target_keys: visible_near
@@ -74672,6 +74823,7 @@ impl App {
         }
         let DetailsMetaPending {
             scan_scope,
+            duration_scan,
             visible_revision,
             selection_target_key,
             normal_target_keys,
@@ -74745,6 +74897,14 @@ impl App {
                     *cursor += 1;
                     idx
                 }
+                DetailsMetaScanOrder::WholeListing { cursor, len } => {
+                    if *cursor >= *len {
+                        break;
+                    }
+                    let idx = *cursor;
+                    *cursor += 1;
+                    idx
+                }
                 DetailsMetaScanOrder::CurrentGrid { cursor, len, .. } => {
                     if *cursor >= *len {
                         break;
@@ -74773,10 +74933,13 @@ impl App {
                 );
                 continue;
             }
-            if let Some(target) = self.details_meta_target_for_idx(
+            if let Some(target) = self.details_meta_target_for_idx_with_scope(
                 idx,
                 &plan.visible_near,
                 plan.load_all_page_counts || plan.visible_near.contains(&idx),
+                duration_scan.is_some()
+                    && self.visible_indices.binary_search(&idx).is_err()
+                    && self.selection_info_lazy_target_idx() != Some(idx),
             ) {
                 plan.total += 1;
                 if target.priority >= crate::io_semaphore::IoPriority::Normal {
@@ -74817,6 +74980,7 @@ impl App {
             };
             self.details_meta_pending = Some(DetailsMetaPending {
                 scan_scope,
+                duration_scan,
                 visible_revision,
                 selection_target_key,
                 normal_target_keys,
@@ -74830,6 +74994,7 @@ impl App {
         self.launch_details_meta_worker(
             ctx,
             scan_scope,
+            duration_scan,
             visible_revision,
             selection_target_key,
             cancel,
@@ -74841,6 +75006,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         scan_scope: DetailsMetaScanScope,
+        duration_scan: Option<DurationScanProof>,
         visible_revision: u64,
         selection_target_key: Option<String>,
         cancel: Arc<AtomicBool>,
@@ -74848,7 +75014,7 @@ impl App {
     ) {
         let target_count = plan.visible_targets.len() + plan.background_targets.len();
         if plan.total == 0 || target_count == 0 {
-            self.finish_details_lazy_session(plan.cached_failed);
+            self.finish_details_lazy_session(plan.cached_failed, duration_scan);
             return;
         }
 
@@ -74969,6 +75135,10 @@ impl App {
                     ),
                     ("ai_facet_load", serde_json::Value::from(plan.ai_facet_load)),
                     (
+                        "duration_scan",
+                        serde_json::Value::from(duration_scan.is_some()),
+                    ),
+                    (
                         "grid_mode",
                         serde_json::Value::from(match self.settings.grid_view_mode {
                             crate::settings::GridViewMode::Thumbnail => "thumbnail",
@@ -75002,6 +75172,7 @@ impl App {
 
         self.details_meta_pending = Some(DetailsMetaPending {
             scan_scope,
+            duration_scan,
             visible_revision,
             selection_target_key,
             normal_target_keys,
@@ -75142,6 +75313,16 @@ impl App {
         visible_near: &std::collections::HashSet<usize>,
         allow_page_count: bool,
     ) -> Option<DetailsMetaTarget> {
+        self.details_meta_target_for_idx_with_scope(idx, visible_near, allow_page_count, false)
+    }
+
+    fn details_meta_target_for_idx_with_scope(
+        &self,
+        idx: usize,
+        visible_near: &HashSet<usize>,
+        allow_page_count: bool,
+        duration_only: bool,
+    ) -> Option<DetailsMetaTarget> {
         let item = self.items.get(idx)?.clone();
         let key = self.details_lazy_cache_key(idx)?;
         let source_identity = self.image_metas.get(idx).copied().flatten();
@@ -75152,22 +75333,27 @@ impl App {
             crate::io_semaphore::IoPriority::Low
         };
         let existing_meta = self.details_lazy_meta_for_idx(idx);
-        let load_image_dims = self.lazy_load_image_dims_for_idx(idx)
+        let load_image_dims = !duration_only
+            && self.lazy_load_image_dims_for_idx(idx)
             && existing_meta
                 .is_none_or(|meta| meta.image_dims.is_none() && !meta.image_dims_failed);
         let load_video_meta = self.lazy_load_video_meta_for_idx(idx)
             && (self.settings.grid_view_mode != crate::settings::GridViewMode::Thumbnail
+                || self.duration_lengths_wanted()
                 || visible_near.contains(&idx)
                 || self.selection_info_lazy_target_idx() == Some(idx))
             && existing_meta.is_none_or(|meta| !meta.media.satisfies(self.items_generation));
-        let load_page_count = allow_page_count
+        let load_page_count = !duration_only
+            && allow_page_count
             && self.lazy_load_page_count_for_idx(idx)
             && existing_meta
                 .is_none_or(|meta| !self.details_page_count_meta_satisfies_idx(idx, meta));
-        let load_created_at = self.lazy_load_created_for_idx(idx)
+        let load_created_at = !duration_only
+            && self.lazy_load_created_for_idx(idx)
             && existing_meta
                 .is_none_or(|meta| meta.created_at.is_none() && !meta.created_at_failed);
-        let load_ai_metadata = self.lazy_load_ai_metadata_for_idx(idx)
+        let load_ai_metadata = !duration_only
+            && self.lazy_load_ai_metadata_for_idx(idx)
             && existing_meta.is_none_or(|meta| !meta.ai_metadata_checked);
         let pdf_password_revision = if load_page_count {
             match &item {
@@ -75693,9 +75879,13 @@ impl App {
             );
         }
         self.details_thumb_suppression_applied = false;
-        if self.details_any_lazy_columns_enabled() || self.ai_model_facet_should_load() {
+        if self.details_any_lazy_columns_enabled() || self.whole_listing_meta_scan_wanted() {
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
-            if self.details_meta_pending.is_none() && !self.details_image_dims_state.is_ready() {
+            if self.details_meta_pending.is_none()
+                && !self.details_image_dims_state.is_ready()
+                && !(self.duration_lengths_wanted()
+                    && matches!(self.details_image_dims_state, LazyColumnState::Cancelled))
+            {
                 self.details_image_dims_state = LazyColumnState::NotRequested;
             }
         }
@@ -76363,10 +76553,9 @@ impl App {
 
         let ai_filter_active = !self.settings.facet_filter.ai_models.is_empty()
             || !self.settings.facet_filter.ai_tools.is_empty();
-        if ai_filter_active && !self.ai_model_facet_ready() {
-            return true;
-        }
-        if ignore != Some(FacetField::AiModel)
+        let ai_filter_ready = ai_filter_active && self.ai_model_facet_ready();
+        if ai_filter_ready
+            && ignore != Some(FacetField::AiModel)
             && !self.settings.facet_filter.ai_models.is_empty()
             && facet_ai_filter_applies(&item)
         {
@@ -76379,7 +76568,8 @@ impl App {
                 return false;
             }
         }
-        if ignore != Some(FacetField::AiTool)
+        if ai_filter_ready
+            && ignore != Some(FacetField::AiTool)
             && !self.settings.facet_filter.ai_tools.is_empty()
             && facet_ai_filter_applies(&item)
         {
@@ -76447,6 +76637,18 @@ impl App {
                     return false;
                 }
             }
+        }
+
+        if ignore != Some(FacetField::Duration)
+            && self.duration_scan_ready()
+            && let Some(preset) = self
+                .settings
+                .facet_filter
+                .duration_preset
+                .filter(|preset| preset.is_effective())
+            && !self.duration_matches_preset(idx, preset)
+        {
+            return false;
         }
 
         let edit_flags =

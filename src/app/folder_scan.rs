@@ -499,6 +499,8 @@ pub(crate) fn is_system_metadata_name(name: &str) -> bool {
 /// 複数ウィンドウの grid Folder 候補は worker で生成し、画像本と確定した結果だけを
 /// detached context へ移譲する。
 pub(crate) struct ScannedDir {
+    /// Worker-only, read-only catalog snapshot. Synchronous UI scans leave this absent.
+    pub(crate) duration_facts: Option<FolderDurationFacts>,
     pub(crate) precise_stamps: std::collections::HashMap<u64, Option<(std::time::SystemTime, u64)>>,
     pub(crate) reconcile: Option<FolderScanReconcile>,
     pub(crate) complete_audio_inventory: Option<std::collections::HashSet<String>>,
@@ -513,6 +515,324 @@ pub(crate) struct ScannedDir {
     /// Source-eligible auxiliary candidates retain their original order independently
     /// of the display projection. Image visibility never changes candidate selection.
     pub(crate) auxiliary_media: AuxiliaryMediaCandidates,
+}
+
+/// UI memory copied before dispatching a worker materialization. Keys use the existing
+/// normalized physical path plus the exact source stamp; unknown sizes never match.
+pub(crate) type FolderDurationSnapshot =
+    std::collections::HashMap<(String, i64, i64), crate::settings::ListingDuration>;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FolderDurationFacts {
+    rows: std::collections::HashMap<String, crate::catalog::VideoDurationFact>,
+}
+
+impl FolderDurationFacts {
+    pub(crate) fn duration_for(
+        &self,
+        path: &std::path::Path,
+        stamp: crate::settings::ListingSortMetadata,
+    ) -> Option<crate::settings::ListingDuration> {
+        let size = stamp.file_size?;
+        let row = self.rows.get(path.file_name()?.to_str()?)?;
+        if row.mtime != stamp.mtime || row.file_size != size {
+            return None;
+        }
+        Some(if row.readable {
+            crate::settings::ListingDuration::from_seconds(row.duration_secs)
+        } else {
+            crate::settings::ListingDuration::Unavailable
+        })
+    }
+}
+
+/// Only call from a scan worker. Ordinary scans incur no additional catalog I/O.
+pub(crate) fn collect_folder_duration_facts(
+    path: &std::path::Path,
+    scan: &mut ScannedDir,
+    cache_dir: &std::path::Path,
+    wanted: bool,
+) {
+    scan.duration_facts = None;
+    if !wanted
+        || !scan
+            .all_media
+            .iter()
+            .any(|entry| matches!(entry.kind, ScanMediaKind::Video | ScanMediaKind::Audio))
+    {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let result = crate::catalog::CatalogDb::open_existing_read_only(cache_dir, path)
+        .and_then(|db| db.map(|db| db.load_video_duration_facts()).transpose());
+    let (rows, failed) = match result {
+        Ok(rows) => (rows.unwrap_or_default(), false),
+        Err(error) => {
+            log::warn!("Folder duration catalog read failed: {error}");
+            (Vec::new(), true)
+        }
+    };
+    crate::perf::event(
+        "folder_scan",
+        "duration_facts",
+        None,
+        0,
+        &[
+            ("rows", serde_json::Value::from(rows.len())),
+            (
+                "ms",
+                serde_json::Value::from(started.elapsed().as_secs_f64() * 1000.0),
+            ),
+            ("failed", serde_json::Value::from(failed)),
+        ],
+    );
+    scan.duration_facts = Some(FolderDurationFacts {
+        rows: rows
+            .into_iter()
+            .map(|row| (row.filename.clone(), row))
+            .collect(),
+    });
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+    use crate::settings::{ListingDuration, ListingSortMetadata, SortOrder};
+    use std::path::Path;
+
+    fn fact(name: &str, duration: Option<f64>) -> crate::catalog::VideoDurationFact {
+        crate::catalog::VideoDurationFact {
+            filename: name.into(),
+            mtime: 7,
+            file_size: 10,
+            readable: true,
+            duration_secs: duration,
+        }
+    }
+
+    fn scan() -> ScannedDir {
+        ScannedDir {
+            duration_facts: None,
+            precise_stamps: Default::default(),
+            reconcile: None,
+            complete_audio_inventory: None,
+            folders: Vec::new(),
+            all_media: [
+                ("memory.mp4", ScanMediaKind::Video, Some(10)),
+                ("catalog.mp3", ScanMediaKind::Audio, Some(10)),
+                ("unavailable.mp4", ScanMediaKind::Video, Some(10)),
+                ("stale.mp4", ScanMediaKind::Video, Some(11)),
+                ("unknown.mp4", ScanMediaKind::Video, None),
+                ("image.jpg", ScanMediaKind::Image, Some(10)),
+            ]
+            .into_iter()
+            .map(|(name, kind, size)| ScannedMediaEntry {
+                path: Path::new(r"C:\duration").join(name),
+                kind,
+                mtime: 7,
+                file_size: size.unwrap_or(0),
+                sort_meta: ListingSortMetadata::new(7, size),
+            })
+            .collect(),
+            omitted: Default::default(),
+            auxiliary_media: Default::default(),
+        }
+    }
+
+    #[test]
+    fn duration_facts_match_exact_stamp_and_preserve_known_zero_size() {
+        let mut row = fact("movie.mp4", Some(1.25));
+        row.file_size = 0;
+        let mut facts = FolderDurationFacts::default();
+        facts.rows.insert(row.filename.clone(), row);
+        let path = Path::new(r"C:\duration\movie.mp4");
+        assert_eq!(
+            facts.duration_for(path, ListingSortMetadata::new(7, Some(0))),
+            Some(ListingDuration::Known(1250))
+        );
+        for stamp in [
+            ListingSortMetadata::new(8, Some(0)),
+            ListingSortMetadata::new(7, Some(1)),
+            ListingSortMetadata::new(7, None),
+        ] {
+            assert_eq!(facts.duration_for(path, stamp), None);
+        }
+        for value in [None, Some(-1.0), Some(f64::INFINITY)] {
+            facts.rows.get_mut("movie.mp4").unwrap().duration_secs = value;
+            assert_eq!(
+                facts.duration_for(path, ListingSortMetadata::new(7, Some(0))),
+                Some(ListingDuration::Unavailable)
+            );
+        }
+        let row = facts.rows.get_mut("movie.mp4").unwrap();
+        row.readable = false;
+        row.duration_secs = Some(2.0);
+        assert_eq!(
+            facts.duration_for(path, ListingSortMetadata::new(7, Some(0))),
+            Some(ListingDuration::Unavailable)
+        );
+    }
+
+    #[test]
+    fn materialized_duration_priority_and_worker_snapshot_match() {
+        let mut input = scan();
+        input.duration_facts = Some(FolderDurationFacts {
+            rows: [
+                "memory.mp4",
+                "catalog.mp3",
+                "unavailable.mp4",
+                "stale.mp4",
+                "unknown.mp4",
+                "image.jpg",
+            ]
+            .into_iter()
+            .map(|name| (name.into(), fact(name, Some(1.0))))
+            .collect(),
+        });
+        let settings = crate::settings::Settings::default();
+        let memory: FolderDurationSnapshot = [
+            (
+                (
+                    crate::adjustment_db::normalize_path(
+                        &Path::new(r"C:\duration").join("memory.mp4"),
+                    ),
+                    7,
+                    10,
+                ),
+                ListingDuration::Known(500),
+            ),
+            (
+                (
+                    crate::adjustment_db::normalize_path(
+                        &Path::new(r"C:\duration").join("unavailable.mp4"),
+                    ),
+                    7,
+                    10,
+                ),
+                ListingDuration::Unavailable,
+            ),
+            (
+                (
+                    crate::adjustment_db::normalize_path(
+                        &Path::new(r"C:\duration").join("catalog.mp3"),
+                    ),
+                    7,
+                    10,
+                ),
+                ListingDuration::Missing,
+            ),
+            (
+                (
+                    crate::adjustment_db::normalize_path(
+                        &Path::new(r"C:\duration").join("stale.mp4"),
+                    ),
+                    7,
+                    10,
+                ),
+                ListingDuration::Known(1),
+            ),
+        ]
+        .into();
+        let materialize = |input, memory: &FolderDurationSnapshot| {
+            materialize_local_folder_listing_with_order_and_duration(
+                Path::new(r"C:\duration"),
+                input,
+                &settings,
+                crate::rating_sort::ListingOrderRequest::Standard(SortOrder::DurationAsc),
+                |_| panic!("duration order must not read ratings"),
+                |path, stamp| {
+                    assert_ne!(path.extension().and_then(|v| v.to_str()), Some("jpg"));
+                    let size = stamp.file_size.expect("unknown size must not be looked up");
+                    memory
+                        .get(&(
+                            crate::adjustment_db::normalize_path(path),
+                            stamp.mtime,
+                            size,
+                        ))
+                        .copied()
+                },
+            )
+        };
+        let worker_memory = std::sync::Arc::new(memory.clone());
+        let from_ui = materialize(input.clone_for_projection(), &memory);
+        let from_worker = materialize(input, worker_memory.as_ref());
+        let names = |listing: &MaterializedFolderListing| {
+            listing
+                .items
+                .iter()
+                .map(|item| item.name().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&from_ui), names(&from_worker));
+        assert_eq!(
+            names(&from_ui),
+            [
+                "memory.mp4",
+                "catalog.mp3",
+                "image.jpg",
+                "stale.mp4",
+                "unavailable.mp4",
+                "unknown.mp4"
+            ]
+        );
+        assert_eq!(from_ui.sort_metas, from_worker.sort_metas);
+        let values = from_ui
+            .items
+            .iter()
+            .zip(&from_ui.sort_metas)
+            .map(|(item, meta)| (item.name().into_owned(), meta.duration))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(values["memory.mp4"], ListingDuration::Known(500));
+        assert_eq!(values["catalog.mp3"], ListingDuration::Known(1000));
+        assert_eq!(values["unavailable.mp4"], ListingDuration::Unavailable);
+        for name in ["stale.mp4", "unknown.mp4", "image.jpg"] {
+            assert_eq!(values[name], ListingDuration::Missing);
+        }
+    }
+
+    #[test]
+    fn materialized_duration_without_catalog_uses_memory_and_other_sorts_do_not_read_it() {
+        let settings = crate::settings::Settings::default();
+        let listing = materialize_local_folder_listing_with_order_and_duration(
+            Path::new(r"C:\duration"),
+            scan(),
+            &settings,
+            crate::rating_sort::ListingOrderRequest::Standard(SortOrder::DurationAsc),
+            |_| panic!("duration order must not read ratings"),
+            |path, _| {
+                (path.file_name().unwrap() == "memory.mp4").then_some(ListingDuration::Known(1))
+            },
+        );
+        assert_eq!(listing.items[0].name(), "memory.mp4");
+        assert_eq!(listing.sort_metas[0].duration, ListingDuration::Known(1));
+        materialize_local_folder_listing_with_order_and_duration(
+            Path::new(r"C:\duration"),
+            scan(),
+            &settings,
+            crate::rating_sort::ListingOrderRequest::Standard(SortOrder::FileName),
+            |_| panic!("name order must not read ratings"),
+            |_, _| panic!("name order must not read duration"),
+        );
+    }
+
+    #[test]
+    fn duration_catalog_collection_skips_unwanted_and_empty_media_without_creating_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("media");
+        let cache = temp.path().join("cache");
+        let mut input = scan();
+        collect_folder_duration_facts(&folder, &mut input, &cache, false);
+        assert!(input.duration_facts.is_none());
+        assert!(!cache.exists());
+        input.all_media.clear();
+        collect_folder_duration_facts(&folder, &mut input, &cache, true);
+        assert!(input.duration_facts.is_none());
+        assert!(!cache.exists());
+        let mut input = scan();
+        collect_folder_duration_facts(&folder, &mut input, &cache, true);
+        assert!(input.duration_facts.as_ref().unwrap().rows.is_empty());
+        assert!(!cache.exists(), "a missing catalog must not be created");
+    }
 }
 
 impl std::fmt::Debug for ScannedDir {
@@ -684,6 +1004,7 @@ pub(crate) fn discover_aggregate_video_sidecars_while(
 
 pub(crate) use super::book_materialization::{
     materialize_local_folder_listing, materialize_local_folder_listing_with_order,
+    materialize_local_folder_listing_with_order_and_duration,
 };
 
 #[derive(Clone, Debug)]
@@ -830,6 +1151,7 @@ pub(crate) fn is_image_only_book_contents(
 pub(crate) fn scan_directory(path: &std::path::Path) -> ScannedDir {
     scan_directory_with_convertible_archives(path, true, true, false).unwrap_or_else(|_| {
         ScannedDir {
+            duration_facts: None,
             precise_stamps: Default::default(),
             reconcile: None,
             complete_audio_inventory: None,
@@ -1178,6 +1500,7 @@ where
     let auxiliary_media =
         AuxiliaryMediaCandidates::capture(&all_media, policy, &entry_file_names_ci);
     let mut scan = ScannedDir {
+        duration_facts: None,
         precise_stamps,
         reconcile: None,
         complete_audio_inventory,
@@ -1774,6 +2097,7 @@ impl ScannedDir {
     /// The rescan worker duplicates raw scan input; UI never clones the listing.
     pub(crate) fn clone_for_projection(&self) -> Self {
         Self {
+            duration_facts: self.duration_facts.clone(),
             precise_stamps: self.precise_stamps.clone(),
             reconcile: None,
             complete_audio_inventory: None,
@@ -1936,6 +2260,7 @@ pub(crate) mod signature_tests {
         })
         .collect();
         ScannedDir {
+            duration_facts: None,
             precise_stamps: Default::default(),
             reconcile: None,
             complete_audio_inventory: None,
@@ -2361,6 +2686,7 @@ mod page_count_tests {
         db.set_user_rating(&key("z.jpg"), 5, None).unwrap();
         db.set_user_rating(&key("a.jpg"), 4, None).unwrap();
         let scan = || ScannedDir {
+            duration_facts: None,
             precise_stamps: Default::default(),
             reconcile: None,
             complete_audio_inventory: None,
@@ -2480,6 +2806,7 @@ mod page_count_tests {
             sort_meta: crate::settings::ListingSortMetadata::new(7, known.then_some(file_size)),
         };
         let scan = || ScannedDir {
+            duration_facts: None,
             precise_stamps: Default::default(),
             reconcile: None,
             complete_audio_inventory: None,
