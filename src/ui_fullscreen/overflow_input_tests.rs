@@ -385,9 +385,10 @@ fn detached_overflow_real_mouse_touch_switch_retires_owner_and_preserves_sibling
             assert_ne!(source, destination);
             detached_toggle_frame(&mut app, &ctx, source, vec![egui::Event::PointerGone]);
             assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
-            // フォーカス復帰ガード (`fs_focus_regained_at` / 復帰クリック) は今回触らない既存の仕組みで、
-            // 復帰クリックの判定は実際の OS の前面窓を読むため単体テストでは環境に依存する。
-            // ここでは宛先のフォーカスを保ったまま、切替前の押下の所有が残って抑止しないことだけを見る。
+            // このテストの対象は残留所有 (切替前の押下の所有が新しい窓へ残らないこと) に限る。
+            // フォーカス復帰ガード (`fs_focus_regained_at` / 復帰クリック) は今回変更しない既存の仕組みで、
+            // ここでは検証しない (検査するなら既存の `test_native_focus::scoped()` の shim を使う)。
+            // 宛先のフォーカスは保ったままにする。
             detached_toggle_frame(&mut app, &ctx, destination, vec![]);
             assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
             assert!(!app.fs_front_pointer.is_active());
@@ -403,8 +404,8 @@ fn detached_overflow_real_mouse_touch_switch_retires_owner_and_preserves_sibling
                 press.insert(0, touch(canvas, egui::TouchPhase::Start));
             }
             detached_toggle_frame(&mut app, &ctx, destination, press);
-            // 残留所有の正本は前面の押下所有と一次ボタン抑止。2x2 の素材はパンの余地が無いので
-            // fs_pan では判定しない。
+            // 残留所有の正本は前面の押下所有と一次ボタン抑止。操作対象の 320x160 は 1000x800 の窓より小さく
+            // パンの余地が無いので fs_pan では判定しない (次の操作が実際にパンすることまでは見ない)。
             assert!(
                 !app.fs_primary_suppression.is_active(),
                 "切替後の新しいstreamを残留所有で抑止しない"

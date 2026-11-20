@@ -1469,8 +1469,12 @@ ParkedLive の HUD クリック分類・metadata を既存の source epoch / 所
 行の操作はパネルを閉じてから共通 toggle を呼び、別窓へ開状態を持ち越す組み合わせを作らない。
 新しい App の bool / Option / pending、待機・再試行・一括 reset は追加しない。
 ClaudeCode と独立レビュアー（実装前 r1 ACCEPT、設計メモ §10）は、既存の所有境界で入口を合流させる
-構造的変更であり症状パッチではないことに合意済み。実装後の独立レビューは未実施。
-回帰テストを追加したが、利用者指定によりコンパイル・テスト実行・PNG 再生成・検証用ビルドは未実施。
+構造的変更であり症状パッチではないことに合意済み。実装後の独立レビュー (Sol / xhigh、2026-11-20) も ACCEPT で、
+実装についても同じ判断に同意した。
+検証: 関連テスト (detached_overflow / detached_toggle / native_detached / native_more_popup / fullscreen_overflow /
+overflow_input_tests / still_window_mode_key_tests / f12 等) 693 件成功、スナップショット 4 枚を更新して目視。
+実描画テストは残留所有 (前面の押下所有・一次ボタン抑止) に対象を限り、フォーカス復帰ガードは検証していない (既存の仕組み、変更なし)。
+F12・複数窓の実機確認は未実施。
 
 ### 2026-11-20 §1.476 タグ欄の検索確定（案 A、実機未確認）
 
