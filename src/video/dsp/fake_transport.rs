@@ -60,6 +60,8 @@ impl Bridge {
         };
         (
             Arc::new(Self {
+                environment: HostEnvironment::UserVst,
+                shutdown_sent_at: std::sync::OnceLock::new(),
                 child: None,
                 stdin: Mutex::new(None),
                 fake_commands: Some(commands),

@@ -17353,10 +17353,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             ui.add_space(2.0);
         });
 
+        let tag_selected = clicked_tag.is_some();
         if let Some(tag) = clicked_tag {
             self.tag_view.query = tag;
+            // 一覧▼の選択は同じ語でも検索し直す (出荷済みの再検索の操作)。
             self.tag_view.last_executed.clear();
-            query_changed = true;
         }
 
         if !self.any_dialog_open() && escape_pressed {
@@ -17367,7 +17368,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             self.close_tag_view();
             return;
         }
-        if (query_changed || filter_changed)
+        // 閲覧中は途中の語で結果を置き換えず、明示選択か Enter で確定する。
+        // Enter は共通の submit_tag_search_input が所有する。
+        if (tag_selected
+            || filter_changed
+            || (query_changed && !self.tag_view_edit_waits_for_submit()))
             && (self.tag_view.query != self.tag_view.last_executed
                 || self.tag_view.kind_filter != self.tag_view.last_executed_kind_filter)
         {

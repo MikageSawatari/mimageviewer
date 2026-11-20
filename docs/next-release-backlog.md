@@ -187,6 +187,23 @@ skip sample / pre-skip が適用された音声サンプルと frame PTS の関�
 - 記録 (統括が読み取りで確認): Application ログには 2026-11-13 20:16 に同じ例外の msedgewebview2.exe (157.0.4341.46、オフセット 0x14d30c) の記録が 1 件あり、WER の ReportArchive にも同じ 1 件がある (親プロセスの記録は無い)。11-14 の分は、確認した時点 (12:09) ではまだ記録が無く、落ちたプロセスも残っていなかった。そのとき動いていた WebView2 のブラウザは、Windows の検索・LINE・mIV Sound (`mimageviewer-vst3-host.exe`、`%APPDATA%\mimageviewer\effetune\webview`) の 3 つだけ。
 - 既知の原因 (前例): WebView2 のコントローラを閉じきらずにホストが終わると、残ったブラウザが 0x80000003 で落ちてダイアログが出る ([派生版計画](effetune-fork-plan.md) §5、2026-10-24 にテストで発生)。mIV Sound のホストは「閉じて、その保存領域のブラウザの終了を待つ」形に直してある。このほか WebView2 を使うのは EPUB→PDF 変換の worker (`mimageviewer-epub-pdf.exe`) と、テスト (miv-sound の ctest、lib 全件の WebView2 を使うテスト) で、11-13〜14 は複数のセッションがこれらのテストを並行で回していた。
 - 次にすること: どのプログラムの WebView2 かを特定する。次に出たときに、ダイアログを閉じる前に、落ちたプロセスの親とコマンドライン (`--user-data-dir`) を読めるようにする (例: WER の LocalDumps を msedgewebview2.exe に設定して、ダンプからコマンドラインを読む)。mIV 側 (mIV Sound のホスト・EPUB worker) とテストの終了経路で、閉じきらずに終わる道が残っていないかをコードで洗う。利用者に追加の作業を頼むのは、開発側の手がかりで絞れなかった場合だけ。
+- 調査 (2026-11-20、bugs476 担当。読み取りとコードの照合だけ。製品は起動していない):
+  - 記録: Application ログ (id 1000) の msedgewebview2.exe 0x80000003 は 11-01 以降 2 件。11-13 20:16 (既知) と、**11-19 02:11:45 の新しい 1 件** (157.0.4341.60、障害モジュール msedge.dll、オフセット 0x393ec00、PID 0xE8F0)。WER の Report.wer に親・コマンドラインは無い。11-14 に利用者が見たダイアログの分は、今も記録が無い。
+  - 11-19 02:11 の時点: perf ログでは、00:49 起動の mIV (pid 98624) の最後の記録が 01:18、次の起動は 08:48。native-exception.log にこの間の異常終了の記録は無い。本体 lib 全件の実行記録もこの時刻には無い。**どのプログラムの WebView2 かは、既存の記録からは特定できなかった。**
+  - コード上の「WebView2 を閉じきらずに host が終わる」経路 (前例では host の強制終了でダイアログが出た、派生版計画 §16.1):
+    1. `DspBridge::disable_with_reason` / `remove_plugin` (`src/video/dsp/mod.rs`) は `shutdown_async()` (Shutdown を送るだけ) の直後に slot の `Arc<Bridge>` を落とし、最後の参照なら `Bridge::drop` (`src/video/dsp/bridge.rs`) がすぐ `child.kill()` する。呼ばれるのは mIV Sound / VST の無効化、`EffetuneController::fail`、`DspBridge::drop` (通常の終了も含む)。host がプラグインを解放する前に kill し得る。
+    2. host の親監視 (`crates/vst3-host/src/main.cpp` `start_parent_watchdog`) は、親 (mIV・host を起こしたテスト) が消えると `ExitProcess(0)` で終わり、プラグインを解放しない。mIV の異常終了や、nextest がテストを打ち切ったときに通る。
+    3. 終了 fence の期限切れの `terminate_host_now` (まれ)。
+    4. EPUB worker (`crates/epub-pdf-worker/src/webview.rs`) は `Close()` を呼ぶが browser の終了は待たない。worker は KILL_ON_JOB_CLOSE の Job の中なので、強制終了でもダイアログにはならない見込み (未確認)。
+  - 1 が通常の終了のたびに負けているなら、ダイアログはもっと多く出るはず。実際は 11-01 以降 2 件なので、1 が主因とは言えない。
+- **実装済み (診断のみ、挙動は不変、2026-11-20)**: `Bridge::drop` の kill 直前 (host の生存確認が `Ok(None)` の場合、または確認失敗時) と `terminate_now` の `TerminateProcess` 直前に、`crate::logger::log` で1行を記録する。既に終了した host の Drop と偽 host (`child: None`) は記録しない。kill / TerminateProcess の順序・回数・既存の待機は変えない。
+  - 行の例: `[VST3] host forced termination reason=drop_after_shutdown host_pid=1234 environment=miv_sound shutdown_elapsed_ms=27 webview2=[5678<-1234,5679<-5678]`。
+  - `reason` は enum による `drop_after_shutdown` / `drop_without_shutdown` / `exit_fence_expired`。`environment` は起動時の `miv_sound` / `user_vst`。`shutdown_elapsed_ms` は最初に送信・flush が成功した Shutdown からの経過 ms (送信成功の記録がなければ `none`)。
+  - `webview2` は終了直前の単一 ToolHelp snapshot から得た msedgewebview2.exe の PID と親 PID (`子<-親`)。host の直接の子と孫の2世代を対象とし、ゼロ件は `[]`。取得失敗は `webview2=unavailable(snapshot: <error>)` / `unavailable(process_inventory: <error>)`、Drop の生存確認失敗は同じ行の `try_wait=unavailable(<error>)` に記録し、いずれも終了処理を続ける。
+  - 次の Application ログ (id 1000) の「障害が発生したプロセス ID」を、発生時刻とこの行の `webview2=[...]` の子 PID に照合する。Application ログが16進なら10進へ変換する (例: `0x162E` = `5678`)。snapshot 時点の親子関係の観測であり、単独でクラッシュ原因を断定しない。
+  - 整形・子孫抽出の純粋関数に単体テストを追加 (`video::dsp::bridge::forced_termination::tests` の 6 件)。実装担当 (Codex) は利用者の 2026-11-20 の決まりどおりコンパイル・テストをせず、設計担当が run-heavy で流した: `cargo nextest run -p mimageviewer --lib -E 'test(/forced_termination|webview2_descendants|video::dsp::/)'` **43 件成功**、本体 lib 全件 **19,023 件成功・0 失敗 (slow 5)・88 skip、1,634.6 秒**。
+  - 独立レビュー (gpt-6.1-sol / xhigh、2026-11-20、コード読解のみ): **ACCEPT**、指摘なし。注記: ToolHelp の全プロセス列挙は同期で、所要時間の上限はない (実測なし)。強制終了の時点だけで走る。
+- 残る診断案 (今回の実装対象外): EPUB worker は WebView2 の browser の PID (`BrowserProcessId`) を変換の記録に残す。これで絞れなかったときだけ、利用者に WER の LocalDumps (msedgewebview2.exe、管理者の設定) を相談する。
 - 関連: テストや試作で WebView2 を作るときは閉じてから終了を待つ方針 (派生版計画 §5)、§1.755。規模 / 優先度: 調査から / P3。
 
 ### 1.774 ★固定中に検索を開くと、固定時の一覧が持ち主のないまま残る — サブ PC の確認から (2026-11-12)
@@ -551,17 +568,35 @@ v4.10.0 (2026-10-30 公開) で出荷し、本書から外した項目のうち�
 
 ### 1.476 タグビューで検索し直すと、開いていた画像が閉じる — §2.23 の実機確認で利用者が観測 (2026-10-29)
 
-- 状態: **v5.5.0 の目標に入れる (利用者 2026-11-19、進み具合を見て調整。公開の目処は 11-21 土〜11-23 月・祝の夜)**。以前の状態: **未着手** (どのウィンドウ形態で観測したかは未記録。ClaudeCode はこの場面を実アプリで確かめていない)。
+- 状態: **実装済み・実機未確認** (2026-11-20、案 A)。v5.5.0 の目標 (利用者 2026-11-19)。どのウィンドウ形態で当初観測したかは未記録。
 - 内容 (利用者): §2.23 では「検索し直しても、結果に残る画像は開いたまま」としたが、検索し直した時点で閲覧が消えるように見えた。
 - コード確認 (ClaudeCode):
   - 結果を受け取ったときに閲覧を保つ処理は `apply_tag_view_result` にある (`prepare_rating_membership_items_swap` → `finish_rating_membership_viewer_swap`)。これが働くのは、結果が届いた時点で閲覧が開いている場合だけ。
   - 単一ウィンドウでは、閲覧中にタグビューのバーは見えない。検索語を変えるには一覧へ戻る必要がある。閲覧中に「このタグで探す」を選ぶと、`open_tag_view_for_tag` が検索の前に `close_fullscreen` で閲覧を閉じる (F12 の別ウィンドウ・切り替え中は閉じない)。どちらも出荷済みの挙動。
   - そのため単一ウィンドウで「開いたまま」になるのは、「検索中...」の間に画像を開いた場合くらい。§2.23 の保持は、実質 F12 の別ウィンドウ・複数ウィンドウ向けの変更になっている。
 - 未確認: F12・複数ウィンドウで、検索語の変更・並べ替えの変更をしたときに閲覧が保たれるか (§2.23 の実機確認でも未確認の場面)。
-- 進め方:
-  - まず F12・複数ウィンドウで保持が働くかを確かめる。働かなければ、それが不具合の本体。
-  - 単一ウィンドウで「このタグで探す」でも閲覧を続けるか (結果一覧を後ろで入れ替える) は、出荷済みの挙動を変える判断になるので、利用者に相談する。
-  - リリースノートの「結果に残る画像は開いたまま」は、確かめた形態に合わせて書く。
+- 原因候補をコードと headless handler テストで確認: タグ欄は IME preedit を含む入力変更ごとに検索していた。途中の語の結果に閲覧中の画像が無いと §2.23 の採用処理が閉じ、最終の語に含まれても復帰しない。途中の空欄も元のフォルダへ戻す。利用者の実機でこの機序が起きたかは未確認。
+- 決定 (利用者 2026-11-20、統括経由): 案 A。閲覧中は入力だけで検索せず、Enter（IME 変換中は除外）・一覧▼・種類変更で確定する。単一ウィンドウの「このタグで探す」は変更しない。
+- 変更: 既存の閲覧述語で入力ごとの検索を止め、Enter は共通 submit 受付で確定。閲覧無しの逐次検索と、閲覧終了時は未確定語を自動検索しない動作を維持。タグ改名・統合の完了は結果一覧上だけ再検索し、本の中の items を保持する。マニュアルのタグページとタグ設計 §5.1 に反映。
+- 回帰テスト (`app::tests::tag_applied_at`、実 egui イベント／完了受取 handler):
+  - `section1476_tag_bar_ime_composition_keeps_viewer_of_final_result`
+  - `section1476_tag_bar_typing_waits_for_enter_and_searches_once`
+  - `section1476_tag_bar_enter_closes_viewer_excluded_from_result`
+  - `section1476_tag_bar_empty_draft_returns_to_folder_only_on_enter`
+  - `section1476_tag_bar_without_viewer_searches_each_edit_but_not_on_close`
+  - `section1476_tag_bar_menu_and_kind_selection_search_immediately_while_viewing`
+  - `section1476_tag_rename_merge_completion_requeries_results_but_preserves_book_items`
+- 自動検証 (2026-11-20): `CARGO_BUILD_JOBS=6` で `cargo nextest run -p mimageviewer --lib -E 'test(/section1476_|tag_applied_at|search_submit|tag_view/)'`、**81 件成功・0 件失敗・19,021 件対象外、exit 0** (run `bb24ec39-635e-4473-a42a-c37c3bcffcc9`)。§1.476 の上記 7 件を含む。`cargo fmt` (引数なし)・`git diff --check` も exit 0。
+  - 途中の 2 回は 80 件成功・1 件失敗 (exit 1 / 100)。逐次検索テストが未確定の `#ca` に `t` を足して実行済みの `#cat` に戻し、不要な再検索を期待していた。フォーカス再指定だけでは解消せず、入力を実行済み語と異なる `#cax` → `#caxy` へ修正して成功。製品コードの追加修正はしていない。
+- 独立レビュー r1 (gpt-6.1-sol / xhigh、2026-11-20、REVISE) への対応 (設計担当、ビルド・テストは PC 停止の指示で未実行):
+  - P2: 閲覧中の判定を `tag_view_edit_waits_for_submit()` にした。`projected_viewer_session_open()` と同じ項目 (開き直し待ちを含む) を読み、動画の source-swap 待ちだけは mount 中の context が持つ場合に限る (別の context の source-swap 待ちで main の逐次検索が止まる経路)。r2 で、`fullscreen_idx` だけに絞った途中案は同じ context の開き直し待ちを打ち直しで取り消すと指摘され、この形にした。
+  - P2: タグの改名・統合の完了と cleanup 後の自動の再検索は、実行済みの語で検索し、欄の未確定の語を残す (`refresh_executed_tag_view()`)。
+  - P3: 結果のアドレス表示を、欄の語ではなく実行済みの語から作る。
+  - 一覧▼から同じタグを選び直すと検索し直す出荷済みの操作を保つ (実装時に一度外れていたのを戻した)。
+  - 追加テスト: `section1476_automatic_refresh_searches_executed_word_and_keeps_draft_and_viewer`、`section1476_adopted_result_names_its_own_word_not_a_later_draft`、`section1476_tag_field_waits_only_for_a_source_swap_owned_by_the_mounted_context` (`src/app/tests.rs`)、一覧▼の同じタグの再選択 (既存の menu テストに追加)、開き直し待ちの判定 (`book_composition_runtime_tests.rs` の既存テストに 1 行)。
+- 独立レビュー r3 (同じレビュー担当、2026-11-20): **ACCEPT** (コード読解。PC 停止中のためビルドなし)。
+- 最終の自動検証 (設計担当、run-heavy、2026-11-20): 関連 `cargo nextest run -p mimageviewer --lib -E 'test(/section1476_|tag_applied_at|search_submit|tag_view|book_composition_runtime|parked_source_swap/)'` **135 件成功・0 失敗**。本体 lib 全件 `.\scripts\test-lib-full.ps1` **19,017 件成功・0 失敗 (slow 6)・88 skip、1,704.6 秒**。`.\scripts\build-dev.ps1` 成功。実機確認の依頼は `C:\home\mimageviewer-subpc\tag476\`。
+- 実機で残る確認: F12・複数ウィンドウでの打ち直し／IME／空欄／Enter、一覧▼・種類・並べ替えによる再検索と閲覧保持。更新履歴の文案と全件 gate・確認用 build は設計担当が行う。
 - 関連: §2.23、[タグ設計 §5.1](tag-catalog-redesign-plan.md#51-タグビュー-ctrlt--タグツールバーの検索ボタン)。規模 / 優先度: Small / 次の版のリリース前。
 
 ### 1.650 連結読みでズームすると、画面の中央にあった内容がずれる — §1.470 の独立レビューで判明 (2026-10-29)
