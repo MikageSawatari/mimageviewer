@@ -15475,7 +15475,8 @@ pub(crate) mod phase_c_support {
     /// **フィールドの宣言順がそのまま drop 順** (Rust spec: struct fields are dropped in
     /// declaration order)。`App` を最先頭に置いて supervisor join まで完了させたあとで
     /// AI init terminal wait → `OverrideGuard` (TEST_OVERRIDE クリア) → `TempDir` (削除) → `MutexGuard` (lock 解放)
-    /// の順に片付く。
+    /// → 入力 guard の順に片付く。入力は data-dir lock より先に取得する。同じスレッドの明示的な
+    /// 入力 guard とは scope を共有し、最後の guard まで保持する。
     ///
     /// 2026-05-17 事故ガード: 旧 `setup_app()` は `(App, OverrideGuard, TempDir, MutexGuard)`
     /// のタプル戻りだったが、`let app = setup_app();` の tuple destructure は
@@ -15495,6 +15496,9 @@ pub(crate) mod phase_c_support {
         /// (App には `tmp` フィールドが無いので名前衝突しない)。
         pub tmp: TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
+        // Acquire before the data-dir lock; release after App, cleanup, override and data-dir.
+        #[cfg(windows)]
+        _input: crate::key_input::TestInputGuard,
     }
 
     impl AppTestEnv {
@@ -15614,6 +15618,61 @@ pub(crate) mod phase_c_support {
         assert!(crate::settings::Settings::default().sidecar_backup_enabled);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn app_fixture_input_scope_matches_both_explicit_guard_and_drop_orders() {
+        use crate::key_input::{PhysicalKeySlot, lock_test_input, physical_key_down};
+
+        let slot = PhysicalKeySlot::new(0x11, false);
+        for explicit_first in [false, true] {
+            for fixture_drops_first in [false, true] {
+                let fixture;
+                let explicit;
+                if explicit_first {
+                    explicit = lock_test_input();
+                    fixture = setup_app();
+                } else {
+                    fixture = setup_app();
+                    explicit = lock_test_input();
+                }
+                assert!(!physical_key_down(slot));
+                if fixture_drops_first {
+                    drop(fixture);
+                    assert!(!physical_key_down(slot));
+                    drop(explicit);
+                } else {
+                    drop(explicit);
+                    assert!(!physical_key_down(slot));
+                    drop(fixture);
+                }
+                assert!(std::panic::catch_unwind(|| physical_key_down(slot)).is_err());
+            }
+        }
+
+        // Existing reload tests partially move App before rebuilding it. The
+        // remaining fixture fields must retain input and the data-dir lease.
+        {
+            let fixture = setup_app();
+            drop(fixture.app);
+            assert!(!physical_key_down(slot));
+        }
+        assert!(std::panic::catch_unwind(|| physical_key_down(slot)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn app_fixture_takes_its_keyboard_scope_on_the_app_driving_thread() {
+        std::thread::spawn(|| {
+            let fixture = setup_app();
+            assert!(!crate::key_input::physical_key_down(
+                crate::key_input::PhysicalKeySlot::new(0x11, false),
+            ));
+            drop(fixture);
+        })
+        .join()
+        .expect("the scenario thread constructs and owns its App input scope");
+    }
+
     pub(crate) fn setup_paused_similar_app_with_fixture(
         settings: crate::settings::Settings,
         prepare_data_dir: impl FnOnce(&std::path::Path),
@@ -15646,6 +15705,8 @@ pub(crate) mod phase_c_support {
         settings: Option<crate::settings::Settings>,
         prepare_data_dir: impl FnOnce(&std::path::Path),
     ) -> AppTestEnv {
+        #[cfg(windows)]
+        let input = crate::key_input::lock_test_input();
         let lock = crate::data_dir::test_override_lock();
         let tmp = TempDir::new().expect("tempdir");
         prepare_data_dir(tmp.path());
@@ -15684,6 +15745,8 @@ pub(crate) mod phase_c_support {
             _guard: guard,
             tmp,
             _lock: lock,
+            #[cfg(windows)]
+            _input: input,
         }
     }
 }

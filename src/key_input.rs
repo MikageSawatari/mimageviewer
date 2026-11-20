@@ -5353,6 +5353,10 @@ thread_local! {
     // App-driving helper threads take lock_test_input() themselves.
     static TEST_KEYBOARD_SOURCE: std::cell::Cell<TestKeyboardSource> =
         const { std::cell::Cell::new(TestKeyboardSource::Unlocked) };
+    // Weak ownership lets fixtures and explicit guards share one scope without
+    // keeping it alive after the last guard is gone. Rc also keeps guards !Send.
+    static TEST_INPUT_SCOPE: std::cell::RefCell<std::rc::Weak<TestInputScope>> =
+        std::cell::RefCell::new(std::rc::Weak::new());
 }
 
 #[cfg(test)]
@@ -5401,14 +5405,20 @@ fn reset_test_input_state() {
     drop(retired);
 }
 
-/// Serialization token for one input test. See [`lock_test_input`].
+/// One same-thread lease on an input test's shared scope. See [`lock_test_input`].
 #[cfg(test)]
 pub(crate) struct TestInputGuard {
+    _scope: std::rc::Rc<TestInputScope>,
+}
+
+/// The last lease cleans the state while still holding the real process mutex.
+#[cfg(test)]
+struct TestInputScope {
     _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 #[cfg(test)]
-impl Drop for TestInputGuard {
+impl Drop for TestInputScope {
     fn drop(&mut self) {
         // Still holding the lock here, so the reset cannot race the next holder. This keeps the
         // state from leaking into tests that read it without taking the lock at all.
@@ -5424,25 +5434,35 @@ impl Drop for TestInputGuard {
 /// Explicit synthetic arming still owns its levels, edges, routing and repeats. A helper thread
 /// that drives the App must acquire its own guard; another thread's guard does not authorize it.
 ///
+/// Nested acquisitions on this thread share the current scope without resetting input or taking
+/// the non-recursive process mutex again. This lets an App fixture own a guard whether a test
+/// takes its explicit guard before or after constructing the fixture. The last guard resets and
+/// releases the scope, even when guards are dropped out of acquisition order.
+///
 /// Recovering from a poisoned lock is correct here because the mutex guards no data (`Mutex<()>`);
 /// it only orders tests, so a panic while it is held cannot leave a broken invariant behind it.
 /// Without the recovery, one genuinely failing test turns into N failures — every later test that
 /// takes the lock dies with `PoisonError` instead of running — and the real failure has to be dug
 /// out of the first entry of the log.
 ///
-/// The shared state is reset on acquisition as well as on `Drop` because recovering the lock alone
-/// would not be enough: a test that panicked mid-way can leave edges, HWND registrations or an
-/// armed synthetic timeline behind, and the next test would then fail for a reason that has
+/// The shared state is reset on first acquisition and on the last guard's `Drop` because recovering
+/// the lock alone would not be enough: a test that panicked mid-way can leave edges, HWND registrations
+/// or an armed synthetic timeline behind, and the next test would then fail for a reason that has
 /// nothing to do with it — exactly the confusion the recovery is meant to remove.
 #[cfg(test)]
 pub(crate) fn lock_test_input() -> TestInputGuard {
+    if let Some(scope) = TEST_INPUT_SCOPE.with(|owner| owner.borrow().upgrade()) {
+        return TestInputGuard { _scope: scope };
+    }
     let serial = TEST_INPUT_LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     reset_test_input_state();
+    let scope = std::rc::Rc::new(TestInputScope { _serial: serial });
+    TEST_INPUT_SCOPE.with(|owner| *owner.borrow_mut() = std::rc::Rc::downgrade(&scope));
     TEST_KEYBOARD_SOURCE.set(TestKeyboardSource::Released);
-    TestInputGuard { _serial: serial }
+    TestInputGuard { _scope: scope }
 }
 
 pub fn pressed_key_down<F>(viewport: egui::ViewportId, predicate: F) -> bool
@@ -11104,6 +11124,54 @@ mod tests {
         physical_key_down_from(PhysicalKeySlot::new(0x11, false), || {
             panic!("an unlocked test must be rejected before consulting the OS")
         });
+    }
+
+    #[test]
+    fn nested_input_guards_preserve_synthetic_keys_until_the_last_lease_drops() {
+        for first_guard_drops_first in [false, true] {
+            let first = lock_test_input();
+            arm_test_synthetic_input(0x403, egui::ViewportId::ROOT);
+            let start = Instant::now();
+            enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+                start,
+                SyntheticNavigationKey::Down,
+                SyntheticModifiers::default(),
+            ));
+            materialize_test_synthetic_input(start, |_| Some(true));
+            let slot = PhysicalKeySlot::new(0x28, false);
+            assert!(physical_key_down(slot));
+
+            let second = lock_test_input();
+            assert!(
+                physical_key_down(slot),
+                "nested acquisition must not reset input"
+            );
+            if first_guard_drops_first {
+                drop(first);
+                assert!(
+                    physical_key_down(slot),
+                    "the newer lease still owns the scope"
+                );
+                drop(second);
+            } else {
+                drop(second);
+                assert!(
+                    physical_key_down(slot),
+                    "the original lease still owns the scope"
+                );
+                drop(first);
+            }
+            assert!(
+                std::panic::catch_unwind(|| physical_key_down(slot)).is_err(),
+                "last-lease drop must revoke this thread's keyboard access"
+            );
+
+            let _fresh = lock_test_input();
+            assert!(
+                !physical_key_down(slot),
+                "the next scope starts with released keys"
+            );
+        }
     }
 
     #[test]
