@@ -406,6 +406,11 @@ CLAUDE.md「設計の簡素化」に従い、扱う組み合わせを先に減�
 
 - **費用**: 開発者登録のときに 1 回だけ登録料を払う ("pay a one-time registration fee"、https://developer.chrome.com/docs/webstore/register)。継続の課金の記載は無い。**金額は公式のページに記載が無く未確認** (一般には 5 米ドルと言われている)。登録の画面で確かめる。無料の拡張なら、住所は求められない (購入・追加機能・定期購入を提供するときだけ要る、https://developer.chrome.com/docs/webstore/set-up-account)。
 - **登録**: 日本は登録できる国に入っている。開発者のメールアドレスは登録後に変えられない ("After an account is created, you cannot change its email address.")。公開専用のアドレスを使うことが勧められている。メールの確認と、ストアの「提供元」に出る公開者名が必須。Trader / Non-Trader の自己申告がある (https://developer.chrome.com/docs/webstore/trader-disclosure/)。Google アカウントの 2 段階認証が要るかは、読んだページでは未確認。
+  - **メールアドレスの選び方** (2026-11-20 に利用者から質問、公式のページで確かめた範囲):
+    - Google Workspace のエイリアスは Google アカウントではないので、エイリアスでサインインはできない ("you can't sign in with an email alias address"、https://support.google.com/a/answer/33327)。エイリアス宛のメールは主アカウントの受信箱に届く。
+    - Chrome ウェブストアには、変えられない「開発者のメール」と、入力して確認のリンクで検証する通知用のメール ("enter an email address and then request verification"、https://developer.chrome.com/docs/webstore/set-up-account) がある。開発者のメールがサインインする Google アカウントそのものか、Workspace のアカウントで登録できるか、通知用のメールにエイリアスを使えるかは、読んだページに記載が無く未確認。登録の画面で確かめる。
+    - メールを変えたくなったら、新しいアカウントを作って拡張を移す申請をする ("create a new account and transfer your Chrome Web Store items to it"、https://developer.chrome.com/docs/webstore/register)。
+    - Edge は個人の Microsoft アカウントが必須で、職場・学校のアカウントでは登録できない ("doesn't support registering with a work or school account"、https://learn.microsoft.com/en-us/microsoft-edge/extensions/publish/create-dev-account)。
 - **提出**: ダッシュボードで「Add new item」→ ZIP をアップロード → Store Listing・Privacy・Distribution (必要なら Test instructions) を埋める → 「Submit for Review」 (https://developer.chrome.com/docs/webstore/publish)。審査に通ってから 30 日以内に公開する (過ぎると下書きに戻る)。新しい公開者は、公開できる拡張が 2 つまで。
 - **Privacy タブ** (https://developer.chrome.com/docs/webstore/cws-dashboard-privacy): 単一の目的の説明、権限ごとの理由 (§9.6 の 6 つすべて)、リモートのコードを使わないこと、データの扱いの開示と認証、プライバシーポリシーの URL。ローカルだけで扱うデータでも開示が要る ("even when data is processed or stored locally"、https://developer.chrome.com/docs/webstore/program-policies/user-data-faq)。プライバシーポリシーは mIV の `privacy.html` に拡張の節を設けて指す (§11)。
 - **掲載の素材** (https://developer.chrome.com/docs/webstore/images): 128×128 の PNG のアイコン (ZIP の中にも)、スクリーンショット 1〜5 枚 (1280×800 か 640×400)、詳しい説明文。小さいプロモ画像 (440×280) は任意だが、無いと表示順が後ろになる。
