@@ -106103,6 +106103,8 @@ mod cover_crop_tests;
 #[cfg(test)]
 mod cover_scope_tests;
 #[cfg(test)]
+mod favsearch_typing_frame_tests;
+#[cfg(test)]
 mod folder_pane_refresh_tests;
 #[cfg(test)]
 mod grid_cursor_tests;
