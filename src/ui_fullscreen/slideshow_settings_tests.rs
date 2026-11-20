@@ -9,7 +9,7 @@ fn frame(app: &mut App, ctx: &egui::Context, viewport: egui::Rect, events: Vec<e
         },
         |ctx| {
             let result = app.handle_fs_key_input(ctx, 0, false);
-            assert!(!result.close && matches!(result.page_nav, FsPageNav::None));
+            assert!(!result.close && matches!(result.page_nav.nav, FsPageNav::None));
             ctx.root_ui(|root| {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::NONE)

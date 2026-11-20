@@ -17227,6 +17227,8 @@ mod tests {
             (KeyAction::FsPageScrollDown, None),
             (KeyAction::FsPageScrollLeft, None),
             (KeyAction::FsPageScrollRight, None),
+            (KeyAction::FsPageScrollOrTurnNext, None),
+            (KeyAction::FsPageScrollOrTurnPrev, None),
         ] {
             assert!(KeyAction::all().contains(&action));
             assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));

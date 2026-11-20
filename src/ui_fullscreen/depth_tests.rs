@@ -263,6 +263,11 @@ fn depth_wheel_navigates_and_ctrl_wheel_never_uses_panorama_fov_or_hidden_zoom()
             operation: None,
             class: FsWheelInPageClass::Legacy,
             scroll_origin: None,
+            page_owner: (
+                app.items_generation,
+                app.fullscreen_idx,
+                app.fullscreen_page_slice,
+            ),
             seek_hover: false,
         };
         assert_eq!(app.fs_wheel_action_requests_navigation(&action), !ctrl);

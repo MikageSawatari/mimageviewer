@@ -301,7 +301,7 @@ fn manual_nav_wrap_key_wheel_mouse_and_touch_produce_the_same_wrap_target() {
                     }],
                     ..Default::default()
                 },
-                |ctx| result = app.handle_fs_key_input(ctx, 2, true).page_nav,
+                |ctx| result = app.handle_fs_key_input(ctx, 2, true).page_nav.nav,
             )
             .drop_without_applying_deltas();
             result

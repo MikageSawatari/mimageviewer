@@ -197,7 +197,7 @@ fn timer(app: &mut App, ctx: &egui::Context, pass: SlideshowTimerPass) {
         None,
         None,
         None,
-        FsPageNav::None,
+        FsPageNavRequest::default(),
         None,
         app.fullscreen_idx.unwrap(),
         None,

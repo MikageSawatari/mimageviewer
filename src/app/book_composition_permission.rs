@@ -59,6 +59,8 @@ struct OpenIntent {
     history_trigger: HistoryTrigger,
     materialization: FsOpenMaterialization,
     contract: FsPageLoadContract,
+    /// Belongs to this navigation episode and follows its existing retirement.
+    landing: Option<crate::ui_fullscreen::FsPageLanding>,
     purpose: BookTargetPurpose,
     route: BookTargetRoute,
     // Only a manual endpoint wrap owns an origin. Logical identities survive
@@ -1346,7 +1348,32 @@ impl App {
         resume_notice: Option<BookResumeNotice>,
         viewer_adoption: super::ViewerOpenAdoption,
     ) -> bool {
-        self.defer_book_composition_target_route(
+        self.defer_book_composition_fullscreen_open_with_adoption_and_landing(
+            idx,
+            history_trigger,
+            materialization,
+            contract,
+            purpose,
+            metadata_boundary,
+            resume_notice,
+            viewer_adoption,
+            None,
+        )
+    }
+
+    pub(super) fn defer_book_composition_fullscreen_open_with_adoption_and_landing(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        materialization: FsOpenMaterialization,
+        contract: FsPageLoadContract,
+        purpose: BookTargetPurpose,
+        metadata_boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: super::ViewerOpenAdoption,
+        landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> bool {
+        self.defer_book_composition_target_route_with_landing(
             idx,
             history_trigger,
             materialization,
@@ -1358,6 +1385,7 @@ impl App {
                 viewer_adoption,
             },
             Vec::new(),
+            landing,
         )
     }
     pub(crate) fn defer_book_composition_navigation_open(
@@ -1368,7 +1396,26 @@ impl App {
         contract: FsPageLoadContract,
         purpose: BookTargetPurpose,
     ) -> bool {
-        self.defer_book_composition_target_route(
+        self.defer_book_composition_navigation_open_with_landing(
+            idx,
+            history_trigger,
+            materialization,
+            contract,
+            purpose,
+            None,
+        )
+    }
+
+    pub(crate) fn defer_book_composition_navigation_open_with_landing(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        materialization: FsOpenMaterialization,
+        contract: FsPageLoadContract,
+        purpose: BookTargetPurpose,
+        landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> bool {
+        self.defer_book_composition_target_route_with_landing(
             idx,
             history_trigger,
             materialization,
@@ -1376,6 +1423,7 @@ impl App {
             purpose,
             BookTargetRoute::FullscreenNavigation,
             Vec::new(),
+            landing,
         )
     }
     pub(crate) fn capture_book_navigation_origin(
@@ -1413,6 +1461,23 @@ impl App {
         purpose: BookTargetPurpose,
         navigation_origin: Vec<crate::book_resume_db::ReadingPosition>,
     ) -> bool {
+        self.defer_book_composition_wrapped_navigation_with_landing(
+            idx,
+            contract,
+            purpose,
+            navigation_origin,
+            None,
+        )
+    }
+
+    pub(crate) fn defer_book_composition_wrapped_navigation_with_landing(
+        &mut self,
+        idx: usize,
+        contract: FsPageLoadContract,
+        purpose: BookTargetPurpose,
+        navigation_origin: Vec<crate::book_resume_db::ReadingPosition>,
+        landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> bool {
         let route = if self
             .fullscreen_idx
             .is_some_and(|current| self.continuous_reading_active_for_idx(current))
@@ -1421,7 +1486,7 @@ impl App {
         } else {
             BookTargetRoute::FullscreenNavigation
         };
-        self.defer_book_composition_target_route(
+        self.defer_book_composition_target_route_with_landing(
             idx,
             HistoryTrigger::UserChosen,
             FsOpenMaterialization::Eager,
@@ -1429,6 +1494,7 @@ impl App {
             purpose,
             route,
             navigation_origin,
+            landing,
         )
     }
 
@@ -1757,6 +1823,29 @@ impl App {
         route: BookTargetRoute,
         navigation_origin: Vec<crate::book_resume_db::ReadingPosition>,
     ) -> bool {
+        self.defer_book_composition_target_route_with_landing(
+            idx,
+            history_trigger,
+            materialization,
+            contract,
+            purpose,
+            route,
+            navigation_origin,
+            None,
+        )
+    }
+
+    fn defer_book_composition_target_route_with_landing(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        materialization: FsOpenMaterialization,
+        contract: FsPageLoadContract,
+        purpose: BookTargetPurpose,
+        route: BookTargetRoute,
+        navigation_origin: Vec<crate::book_resume_db::ReadingPosition>,
+        landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> bool {
         let context_id = self.spread_shift_context_id().serial();
         self.book_composition_permission
             .bind(context_id, self.items_generation);
@@ -1778,6 +1867,7 @@ impl App {
             history_trigger,
             materialization,
             contract,
+            landing,
             purpose,
             route: route.clone(),
             navigation_origin,
@@ -1819,12 +1909,13 @@ impl App {
                 && accepted.items_generation == intent.items_generation
                 && accepted.idx == intent.idx
                 && accepted.history_trigger == intent.history_trigger
+                && accepted.landing == intent.landing
             {
                 intent = accepted.clone();
             }
         }
         let demand = intent.presentation_demand(self.book_target_presentation_demand(idx));
-        if matches!(&self.book_composition_permission.open, OpenPermission::Ready { intent: accepted, candidates } | OpenPermission::Resuming { intent: accepted, candidates } if accepted.context_id == intent.context_id && accepted.items_generation == intent.items_generation && accepted.idx == intent.idx && accepted.history_trigger == intent.history_trigger && candidates.iter().map(|candidate| candidate.occurrence()).eq(demand.iter().copied()))
+        if matches!(&self.book_composition_permission.open, OpenPermission::Ready { intent: accepted, candidates } | OpenPermission::Resuming { intent: accepted, candidates } if accepted.context_id == intent.context_id && accepted.items_generation == intent.items_generation && accepted.idx == intent.idx && accepted.history_trigger == intent.history_trigger && accepted.landing == intent.landing && candidates.iter().map(|candidate| candidate.occurrence()).eq(demand.iter().copied()))
         {
             if self.book_composition.is_pending() {
                 return true;
@@ -2177,7 +2268,7 @@ impl App {
                 metadata_boundary,
                 resume_notice,
                 viewer_adoption,
-            } => self.open_fullscreen_with_metadata_boundary_and_adoption(
+            } => self.open_fullscreen_with_metadata_boundary_and_adoption_and_landing(
                 intent.idx,
                 intent.history_trigger,
                 intent.materialization,
@@ -2186,14 +2277,17 @@ impl App {
                 *metadata_boundary,
                 resume_notice.clone(),
                 *viewer_adoption,
+                intent.landing,
             ),
-            BookTargetRoute::FullscreenNavigation => self.complete_book_navigation_target(
-                ctx,
-                intent.idx,
-                intent.history_trigger,
-                intent.contract,
-                intent.purpose,
-            ),
+            BookTargetRoute::FullscreenNavigation => self
+                .complete_book_navigation_target_with_landing(
+                    ctx,
+                    intent.idx,
+                    intent.history_trigger,
+                    intent.contract,
+                    intent.purpose,
+                    intent.landing,
+                ),
             BookTargetRoute::ContinuousSeek => {
                 self.seek_to_continuous_page_with_contract(ctx, intent.idx, intent.contract)
             }
@@ -2218,3 +2312,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/manual_nav_wrap_book.rs"]
 mod manual_nav_wrap_book;
+
+#[cfg(test)]
+#[path = "../ui_fullscreen/in_page_scroll/permission_landing_tests.rs"]
+mod scroll_landing_tests;

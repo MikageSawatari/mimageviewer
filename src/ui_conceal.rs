@@ -626,7 +626,7 @@ impl App {
             page_transition: Default::default(),
             close: false,
             close_to_page_list: false,
-            page_nav: crate::ui_fullscreen::FsPageNav::None,
+            page_nav: crate::ui_fullscreen::FsPageNavRequest::default(),
             ctrl_nav: None,
             list_order_nav: None,
             sibling_nav: None,

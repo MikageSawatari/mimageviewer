@@ -15,6 +15,14 @@
 
 ## 含める経路
 
+§1.823〜§1.826 の環境設定snapshotは、既存の
+`fullscreen_in_page_scroll_settings_snapshot_light_default` /
+`fullscreen_in_page_scroll_settings_snapshot_dark_enabled` と、新規の
+`fullscreen_scroll_then_turn_settings_snapshot_light` /
+`fullscreen_wheel_zoom_settings_snapshot_dark` の4件を含める。
+実snapshotが共有の `LazyRenderer` からdeviceを作るためで、PNGの生成・目視・比較の実施状況とは別の登録である。
+通常のページ描画receipt・wheel handlerのheadlessテストはrendererを作らず、この追加ではgroupへ含めない。
+
 §1.776 B-A の `gpu_lanczos::gpu_tests::still_nis_dxbc_matches_wgsl_pixels` と
 `still_anime4k_vl_dxbc_matches_wgsl_pixels` は `gpu_tests` prefix で自動所属する（Windows 限定、ignore なし）。
 DX12 adapter / device / PASSTHROUGH_SHADERS の欠落は panic で gate を失敗させ、黙って skip しない。

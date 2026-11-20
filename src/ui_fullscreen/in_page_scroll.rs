@@ -4,13 +4,31 @@ use egui::emath::GuiRounding;
 use egui::{Rect, Vec2};
 
 #[cfg(test)]
+mod context_scroll_tests;
+#[cfg(test)]
 mod handler_tests;
 #[cfg(test)]
 mod interaction_tests;
 #[cfg(test)]
+mod landing_tests;
+#[cfg(test)]
+mod navigation_landing_tests;
+#[cfg(test)]
 mod overflow_tests;
 #[cfg(test)]
 mod review_regression_tests;
+#[cfg(test)]
+mod scroll_then_turn_tests;
+#[cfg(test)]
+mod scroll_turn_handler_tests;
+#[cfg(test)]
+mod settings_input_tests;
+#[cfg(test)]
+mod smooth_render_tests;
+#[cfg(test)]
+mod smooth_scroll_tests;
+#[cfg(test)]
+mod wheel_zoom_tests;
 
 /// 描画側の CentralPanel / `Context::content_rect()` と同じ丸めにする。
 /// 丸めないと、1/32 point の倍数でない窓で記録と入力の viewport が一致しない (§1.815)。
@@ -236,6 +254,64 @@ fn ordered_scroll_pan_with_steps(
         candidate
     } else {
         pan
+    }
+}
+
+/// Shared prediction result for a scroll-then-turn input. No edge is retained.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum FsPageScrollOutcome {
+    Blocked,
+    Move(Vec2),
+    Turn,
+}
+
+/// The logical pan is already `to`; this is a paint-only, context-owned effect.
+#[derive(Clone, Debug)]
+pub(crate) struct FsPageScrollAnimation {
+    pub(crate) from: Vec2,
+    pub(crate) to: Vec2,
+    pub(crate) start_time: f64,
+    pub(crate) origin: FsDrawnUnitStamp,
+    pub(crate) viewport: egui::ViewportId,
+}
+
+impl FsPageScrollAnimation {
+    fn pan_at(&self, time: f64) -> Vec2 {
+        let t = ((time - self.start_time) / 0.2).clamp(0.0, 1.0) as f32;
+        let eased = 1.0 - (1.0 - t).powi(3);
+        self.from + (self.to - self.from) * eased
+    }
+}
+
+fn ordered_scroll_outcome(
+    layout: &FullscreenPageLayout,
+    zoom: f32,
+    pan: Vec2,
+    direction: ReadingDirection,
+    order: crate::settings::FullscreenNScrollOrder,
+    next: bool,
+    step_fraction: f32,
+    primary_fraction: Option<f32>,
+    allow_wrap: bool,
+    allow_turn: bool,
+) -> FsPageScrollOutcome {
+    let candidate = ordered_scroll_pan_with_steps(
+        layout,
+        zoom,
+        pan,
+        direction,
+        order,
+        next,
+        step_fraction,
+        primary_fraction,
+        allow_wrap,
+    );
+    if candidate != pan {
+        FsPageScrollOutcome::Move(candidate)
+    } else if allow_turn {
+        FsPageScrollOutcome::Turn
+    } else {
+        FsPageScrollOutcome::Blocked
     }
 }
 
@@ -712,8 +788,206 @@ impl App {
                 scroll_pan(layout, zoom, self.fs_pan, delta)
             }
         };
+        self.write_fs_page_scroll_pan_with_animation(ctx, pan, true);
+    }
+
+    /// Common admission also applies to terminal-load failures: failure replaces
+    /// only the drawn-unit proof, never a paper-turn or navigation barrier.
+    fn fs_scroll_turn_composition(&self) -> Option<SpreadDisplayComposition> {
+        if !self.fs_in_page_scroll_surface()
+            || self.fs_navigation_sequence_blocks_new_target()
+            || self.page_turn_barrier_active()
+        {
+            return None;
+        }
+        self.fs_scroll_input_composition()
+    }
+
+    fn fs_scroll_unit_load_failed(&self, composition: &SpreadDisplayComposition) -> bool {
+        composition
+            .pages_in_screen_order(self.spread_mode)
+            .iter()
+            .any(|page| {
+                self.fs_page_load_state(page.idx) == crate::app::FsPageLoadState::LoadFailed
+            })
+    }
+
+    pub(super) fn fs_page_scroll_or_turn_key(
+        &mut self,
+        ctx: &egui::Context,
+        next: bool,
+        kind: crate::keymap::PageTurnPressKind,
+    ) -> FsPageNavRequest {
+        let Some(composition) = self.fs_scroll_turn_composition() else {
+            return FsPageNavRequest::default();
+        };
+        let allow_turn = kind == crate::keymap::PageTurnPressKind::InitialPress;
+        let outcome = if self.fs_scroll_layout_matches(ctx) {
+            ordered_scroll_outcome(
+                &self.fullscreen_page_layout,
+                self.fs_page_scroll_drawn_zoom(),
+                self.fs_pan,
+                self.spread_mode
+                    .reading_direction()
+                    .unwrap_or(self.reading_direction),
+                self.settings.fullscreen_n_scroll_order,
+                next,
+                self.settings
+                    .fullscreen_n_scroll_step_percent
+                    .clamp(10, 100) as f32
+                    / 100.0,
+                None,
+                true,
+                allow_turn,
+            )
+        } else if allow_turn && self.fs_scroll_unit_load_failed(&composition) {
+            FsPageScrollOutcome::Turn
+        } else {
+            FsPageScrollOutcome::Blocked
+        };
+        match outcome {
+            FsPageScrollOutcome::Move(pan) => {
+                self.write_fs_page_scroll_pan_with_animation(ctx, pan, true);
+                FsPageNavRequest::default()
+            }
+            FsPageScrollOutcome::Turn => FsPageNavRequest {
+                nav: self.spread_page_nav(if next { 1 } else { -1 }),
+                landing: Some(if next {
+                    FsPageLanding::Start
+                } else {
+                    FsPageLanding::End
+                }),
+            },
+            FsPageScrollOutcome::Blocked => FsPageNavRequest::default(),
+        }
+    }
+
+    /// Used unchanged by frame prediction and actual segment application.
+    pub(super) fn fs_page_scroll_or_turn_wheel(
+        &self,
+        ctx: &egui::Context,
+        zoom: f32,
+        pan: Vec2,
+        delta: Vec2,
+        moved_in_frame: bool,
+    ) -> FsPageScrollOutcome {
+        if !pan.is_finite() || !delta.is_finite() || delta.y == 0.0 {
+            return FsPageScrollOutcome::Blocked;
+        }
+        let Some(composition) = self.fs_scroll_turn_composition() else {
+            return FsPageScrollOutcome::Blocked;
+        };
+        let discrete = delta.y.abs() > 0.5;
+        let allow_turn = discrete && !moved_in_frame;
+        let effective_zoom = Self::fs_zoom_pan_for(zoom, pan).map_or(1.0, |(zoom, _)| zoom);
+        if !self.fs_scroll_layout_matches_at_zoom(ctx, effective_zoom) {
+            return if allow_turn && self.fs_scroll_unit_load_failed(&composition) {
+                FsPageScrollOutcome::Turn
+            } else {
+                FsPageScrollOutcome::Blocked
+            };
+        }
+        ordered_scroll_outcome(
+            &self.fullscreen_page_layout,
+            effective_zoom,
+            pan,
+            self.spread_mode
+                .reading_direction()
+                .unwrap_or(self.reading_direction),
+            self.settings.fullscreen_n_scroll_order,
+            delta.y < 0.0,
+            self.settings
+                .fullscreen_n_scroll_step_percent
+                .clamp(10, 100) as f32
+                / 100.0,
+            Some(
+                delta.y.abs() / CONTINUOUS_READING_WHEEL_REFERENCE_DELTA
+                    * self
+                        .settings
+                        .continuous_reading_wheel_scroll_percent
+                        .clamp(1, 100) as f32
+                    / 100.0,
+            ),
+            discrete,
+            allow_turn,
+        )
+    }
+
+    fn fs_page_scroll_animation_matches(
+        &self,
+        ctx: &egui::Context,
+        animation: &FsPageScrollAnimation,
+    ) -> bool {
+        let viewport = self.fs_page_scroll_destination_viewport();
+        let now = ctx.input_for(viewport, |input| input.time);
+        self.settings.fullscreen_smooth_page_scroll
+            && animation.to == self.fs_pan
+            && animation.viewport == viewport
+            && now.is_finite()
+            && now >= animation.start_time
+            && now - animation.start_time < 0.2
+            && self.fullscreen_page_layout.drawn_unit.as_ref() == Some(&animation.origin)
+            && self.fs_scroll_layout_matches(ctx)
+    }
+
+    /// Called once after input and before ordinary-page paint. An unrelated
+    /// context's temporary mount never calls this owner's retirement.
+    pub(super) fn retire_fs_page_scroll_animation(&mut self, ctx: &egui::Context) {
+        let Some(animation) = self.fs_page_scroll_animation.as_ref() else {
+            return;
+        };
+        if self.fs_page_scroll_animation_matches(ctx, animation) {
+            ctx.request_repaint_of(animation.viewport);
+        } else {
+            self.fs_page_scroll_animation = None;
+        }
+    }
+
+    pub(super) fn fs_page_scroll_display_pan(&self, ctx: &egui::Context) -> Vec2 {
+        self.fs_page_scroll_animation
+            .as_ref()
+            .filter(|animation| animation.to == self.fs_pan)
+            .map_or(self.fs_pan, |animation| {
+                animation.pan_at(ctx.input_for(animation.viewport, |input| input.time))
+            })
+    }
+
+    pub(super) fn write_fs_page_scroll_pan_with_animation(
+        &mut self,
+        ctx: &egui::Context,
+        pan: Vec2,
+        smooth_allowed: bool,
+    ) {
+        if pan == self.fs_pan {
+            return;
+        }
+        let from = self
+            .fs_page_scroll_animation
+            .as_ref()
+            .filter(|animation| self.fs_page_scroll_animation_matches(ctx, animation))
+            .map_or(self.fs_pan, |animation| {
+                animation.pan_at(ctx.input_for(animation.viewport, |input| input.time))
+            });
+        let origin = self.fullscreen_page_layout.drawn_unit.clone();
         self.write_fs_page_scroll_pan(pan);
-        ctx.request_repaint();
+        let viewport = self.fs_page_scroll_destination_viewport();
+        let start_time = ctx.input_for(viewport, |input| input.time);
+        self.fs_page_scroll_animation = if smooth_allowed
+            && self.settings.fullscreen_smooth_page_scroll
+            && start_time.is_finite()
+            && from != self.fs_pan
+        {
+            origin.map(|origin| FsPageScrollAnimation {
+                from,
+                to: self.fs_pan,
+                start_time,
+                origin,
+                viewport,
+            })
+        } else {
+            None
+        };
+        ctx.request_repaint_of(viewport);
     }
 
     pub(super) fn fs_page_scroll_drawn_zoom(&self) -> f32 {
@@ -745,17 +1019,24 @@ impl App {
         wheel: crate::wheel_input::WheelInput,
         seek_hover: bool,
     ) -> FsWheelInPageClass {
-        if self.settings.fullscreen_wheel_action.normalized()
-            == crate::settings::FullscreenWheelAction::InPageScroll
-            && !wheel.modifiers.ctrl
-            && !wheel.modifiers.alt
-            && !wheel.modifiers.command
-            && !seek_hover
-            && (self.fs_context_menu_idx.is_some() || self.fs_in_page_scroll_surface())
+        use crate::settings::FullscreenWheelAction;
+        if wheel.modifiers.ctrl
+            || wheel.modifiers.alt
+            || wheel.modifiers.command
+            || seek_hover
+            || !(self.fs_context_menu_idx.is_some() || self.fs_in_page_scroll_surface())
         {
-            FsWheelInPageClass::InPageScroll(wheel.delta)
-        } else {
-            FsWheelInPageClass::Legacy
+            return FsWheelInPageClass::Legacy;
+        }
+        match self.settings.fullscreen_wheel_action.normalized() {
+            FullscreenWheelAction::InPageScroll => FsWheelInPageClass::InPageScroll(wheel.delta),
+            FullscreenWheelAction::ScrollThenPageTurn if wheel.delta.y != 0.0 => {
+                FsWheelInPageClass::ScrollThenPageTurn(wheel.delta)
+            }
+            FullscreenWheelAction::Zoom if !wheel.modifiers.shift => {
+                FsWheelInPageClass::SettingZoom
+            }
+            _ => FsWheelInPageClass::Legacy,
         }
     }
 
@@ -1045,7 +1326,7 @@ mod tests {
         }
     }
 
-    fn asymmetric_spread(trim_right: bool, transpose: bool) -> FullscreenPageLayout {
+    pub(super) fn asymmetric_spread(trim_right: bool, transpose: bool) -> FullscreenPageLayout {
         let center = viewport().center();
         let mut left = Rect::from_min_size(
             center + Vec2::new(-1010.0, -1500.0),

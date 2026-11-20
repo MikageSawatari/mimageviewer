@@ -11634,18 +11634,29 @@ mod fullscreen_in_page_scroll_setting_tests {
         draw_fullscreen_up_down_key_action_setting(ui, &mut settings.fullscreen_up_down_key_action);
         draw_fullscreen_wheel_action_setting(ui, &mut settings.fullscreen_wheel_action);
         draw_fullscreen_n_scroll_order_setting(ui, &mut settings.fullscreen_n_scroll_order);
+        draw_fullscreen_smooth_page_scroll_setting(ui, &mut settings.fullscreen_smooth_page_scroll);
+        ui.add_space(8.0);
+        ui.label("スクロール量 (連結読み・ページ内スクロール)");
+        draw_fullscreen_n_scroll_step_setting(ui, &mut settings.fullscreen_n_scroll_step_percent);
     }
 
-    fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme, enabled: bool) {
+    fn snapshot(
+        name: &str,
+        theme: crate::os_theme::ResolvedTheme,
+        enabled: bool,
+        wheel: FullscreenWheelAction,
+    ) {
         let mut settings = Settings::default();
+        settings.fullscreen_wheel_action = wheel;
         if enabled {
             settings.fullscreen_up_down_key_action = FullscreenUpDownKeyAction::InPageScroll;
-            settings.fullscreen_wheel_action = FullscreenWheelAction::InPageScroll;
             settings.fullscreen_n_scroll_order = FullscreenNScrollOrder::HorizontalFirst;
+            settings.fullscreen_smooth_page_scroll = true;
+            settings.fullscreen_n_scroll_step_percent = 50;
         }
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
-            .with_size(egui::vec2(540.0, 220.0))
+            .with_size(egui::vec2(540.0, 340.0))
             .build_ui(move |root_ui| {
                 crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
                     let ctx = &root_ui.ctx().clone();
@@ -11671,6 +11682,7 @@ mod fullscreen_in_page_scroll_setting_tests {
             "fullscreen_in_page_scroll_settings_light_default",
             crate::os_theme::ResolvedTheme::Light,
             false,
+            FullscreenWheelAction::PageTurn,
         );
     }
 
@@ -11680,6 +11692,27 @@ mod fullscreen_in_page_scroll_setting_tests {
             "fullscreen_in_page_scroll_settings_dark_enabled",
             crate::os_theme::ResolvedTheme::Dark,
             true,
+            FullscreenWheelAction::InPageScroll,
+        );
+    }
+
+    #[test]
+    fn fullscreen_scroll_then_turn_settings_snapshot_light() {
+        snapshot(
+            "fullscreen_scroll_then_turn_settings_light",
+            crate::os_theme::ResolvedTheme::Light,
+            true,
+            FullscreenWheelAction::ScrollThenPageTurn,
+        );
+    }
+
+    #[test]
+    fn fullscreen_wheel_zoom_settings_snapshot_dark() {
+        snapshot(
+            "fullscreen_wheel_zoom_settings_dark",
+            crate::os_theme::ResolvedTheme::Dark,
+            true,
+            FullscreenWheelAction::Zoom,
         );
     }
 
@@ -11688,7 +11721,7 @@ mod fullscreen_in_page_scroll_setting_tests {
         use egui_kittest::kittest::Queryable;
 
         let mut harness = crate::test_ui::builder()
-            .with_size(egui::vec2(540.0, 260.0))
+            .with_size(egui::vec2(540.0, 340.0))
             .build_ui_state(
                 |root_ui, (settings, fonts_ready)| {
                     let ctx = &root_ui.ctx().clone();

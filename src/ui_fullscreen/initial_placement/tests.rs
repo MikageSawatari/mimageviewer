@@ -119,7 +119,7 @@ fn arrival_viewport() -> egui::Rect {
     egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0))
 }
 
-fn thumbnail_arrival_app(
+pub(in crate::ui_fullscreen) fn thumbnail_arrival_app(
     ctx: &egui::Context,
     fit: FullscreenFitMode,
 ) -> crate::app::AppTestEnvForTest {
@@ -148,7 +148,11 @@ fn thumbnail_arrival_app(
     app
 }
 
-fn install_arriving_full(app: &mut App, ctx: &egui::Context, idx: usize) {
+pub(in crate::ui_fullscreen) fn install_arriving_full(
+    app: &mut App,
+    ctx: &egui::Context,
+    idx: usize,
+) {
     let pixels = Arc::new(egui::ColorImage::filled([1500, 2000], egui::Color32::WHITE));
     let texture = ctx.load_texture(
         format!("initial-placement-full-{idx}"),
@@ -171,7 +175,7 @@ fn install_arriving_full(app: &mut App, ctx: &egui::Context, idx: usize) {
 }
 
 /// Use the same selected full/thumbnail producers as ordinary viewport paint.
-fn paint_prepared_single(
+pub(in crate::ui_fullscreen) fn paint_prepared_single(
     app: &mut App,
     ui: &mut egui::Ui,
     ctx: &egui::Context,
@@ -291,7 +295,7 @@ fn composition_switch_cases() -> [(SpreadMode, SpreadMode, ReadingDirection); 8]
     ]
 }
 
-fn composition_switch_app(
+pub(in crate::ui_fullscreen) fn composition_switch_app(
     ctx: &egui::Context,
     mode: SpreadMode,
     landscape: bool,
@@ -339,7 +343,7 @@ fn install_composition_switch_materials(app: &mut App, ctx: &egui::Context, land
     }
 }
 
-fn paint_composition_switch_unit(
+pub(in crate::ui_fullscreen) fn paint_composition_switch_unit(
     app: &mut App,
     ui: &mut egui::Ui,
     ctx: &egui::Context,

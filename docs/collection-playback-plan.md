@@ -186,6 +186,7 @@ collection root の直接登録 media から fullscreen を開いている時は
 - `CollectionNavigationAction::Manual` と `AwaitingManualContinuation` は開始時の `wrap` を保持する。通常pending / native swap待ちのcontinuationとも同じ `wrap` の入力だけを合流し、残りstepの再発行へ保持値を渡す。設定変更後の異なる `wrap` の新入力は旧要求へ合流しない。`AwaitingManualContinuation` では旧queued stepsを破棄し、新delta / wrapと新sequenceで既存continuation payloadを置換する。進行中のnative着地は維持し、`landing_ready` 後に `stamp.target_idx` を起点として新しいManual要求を発行する。
 - splitの同一source内移動と連結読みの現在scroll/layout内の移動は既存処理を維持する。連結読みでitem境界を越える明示移動だけStillImage候補のcollection requestを使う。
 - target commit後は既存 `open_fullscreen_from_fs_navigation` またはnative manual landingを使い、`HistoryTrigger::UserChosen`、cursor / spread / split / presentationを維持する。
+- ページ内の「スクロール＋ページ送り」は `page_landing: Option<FsPageLanding>` を `Manual` 要求と `AwaitingManualContinuation` に保持し、最初の要求を包む各応答待ち状態にも要求ごと運ぶ。これは既存の `ManualMediaNavigationLanding`（Fullscreen / NativeVideoという開き方）とは別の指定である。蓄積は既存の方向・開き方・still_only・display_unit_step・wrapに加えpage_landingも一致する場合だけ行う。不一致は既存の新しい意図の経路へ進み、wrap変更等でstepsを置き換える分岐ではpage_landingも新要求へ置き換える。入場は保持値を着地ありの入口へ渡し、通常送りはNoneを維持する。context・世代・sourceの失効は既存保持者の破棄に従う。詳細は[ページ内移動拡張 §4.4.1の6b](fullscreen-scroll-page-turn-plan.md#441-要求と移動の対応付け-型付きの引数で入場まで運ぶ)を参照（今回のコードは未コンパイル・未実行）。
 - root collection以外、またはcollection childのImage / ZipImage / PdfPage / Video / Audioは既存のcurrent `items`順を使う。child pageをouter direct media列へ混ぜない。
 
 ### 5.2 Ctrl+↑↓

@@ -54,6 +54,7 @@ enum CollectionNavigationAction {
         queued_steps: i32,
         display_unit_step: bool,
         landing: ManualMediaNavigationLanding,
+        page_landing: Option<crate::ui_fullscreen::FsPageLanding>,
         still_only: bool,
         wrap: bool,
     },
@@ -652,6 +653,7 @@ pub(in crate::app) enum CollectionNavigationPending {
     AwaitingManualContinuation {
         steps: i32,
         landing: ManualMediaNavigationLanding,
+        page_landing: Option<crate::ui_fullscreen::FsPageLanding>,
         display_unit_step: bool,
         still_only: bool,
         wrap: bool,
@@ -774,9 +776,29 @@ impl CollectionNavigationPending {
         display_unit_step: bool,
         wrap: bool,
     ) -> bool {
+        self.accumulate_manual_with_landing(
+            delta,
+            landing,
+            still_only,
+            display_unit_step,
+            wrap,
+            None,
+        )
+    }
+
+    pub(crate) fn accumulate_manual_with_landing(
+        &mut self,
+        delta: i32,
+        landing: ManualMediaNavigationLanding,
+        still_only: bool,
+        display_unit_step: bool,
+        wrap: bool,
+        page_landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> bool {
         if let Self::AwaitingManualContinuation {
             steps,
             landing: active_landing,
+            page_landing: active_page_landing,
             display_unit_step: active_display_unit_step,
             still_only: active_still_only,
             wrap: active_wrap,
@@ -784,6 +806,7 @@ impl CollectionNavigationPending {
         } = self
         {
             if *active_landing != landing
+                || *active_page_landing != page_landing
                 || *active_still_only != still_only
                 || *active_display_unit_step != display_unit_step
                 || *active_wrap != wrap
@@ -807,6 +830,7 @@ impl CollectionNavigationPending {
             delta: active,
             queued_steps,
             landing: active_landing,
+            page_landing: active_page_landing,
             still_only: active_still_only,
             display_unit_step: active_display_unit_step,
             wrap: active_wrap,
@@ -816,6 +840,7 @@ impl CollectionNavigationPending {
             return false;
         };
         if *active_landing != landing
+            || *active_page_landing != page_landing
             || *active_still_only != still_only
             || *active_display_unit_step != display_unit_step
             || *active_wrap != wrap
@@ -1862,7 +1887,29 @@ impl App {
         landing: ManualMediaNavigationLanding,
         wrap: bool,
     ) -> bool {
-        self.start_collection_manual_navigation_inner(ctx, fs_idx, delta, landing, false, wrap)
+        self.start_collection_manual_navigation_with_landing(
+            ctx, fs_idx, delta, landing, wrap, None,
+        )
+    }
+
+    pub(crate) fn start_collection_manual_navigation_with_landing(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        delta: i32,
+        landing: ManualMediaNavigationLanding,
+        wrap: bool,
+        page_landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> bool {
+        self.start_collection_manual_navigation_inner(
+            ctx,
+            fs_idx,
+            delta,
+            landing,
+            false,
+            wrap,
+            page_landing,
+        )
     }
 
     pub(crate) fn start_collection_manual_display_unit_navigation(
@@ -1873,7 +1920,29 @@ impl App {
         landing: ManualMediaNavigationLanding,
         wrap: bool,
     ) -> bool {
-        self.start_collection_manual_navigation_inner(ctx, fs_idx, delta, landing, true, wrap)
+        self.start_collection_manual_display_unit_navigation_with_landing(
+            ctx, fs_idx, delta, landing, wrap, None,
+        )
+    }
+
+    pub(crate) fn start_collection_manual_display_unit_navigation_with_landing(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        delta: i32,
+        landing: ManualMediaNavigationLanding,
+        wrap: bool,
+        page_landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> bool {
+        self.start_collection_manual_navigation_inner(
+            ctx,
+            fs_idx,
+            delta,
+            landing,
+            true,
+            wrap,
+            page_landing,
+        )
     }
 
     fn start_collection_manual_navigation_inner(
@@ -1884,6 +1953,7 @@ impl App {
         landing: ManualMediaNavigationLanding,
         display_unit_step: bool,
         wrap: bool,
+        page_landing: Option<crate::ui_fullscreen::FsPageLanding>,
     ) -> bool {
         if delta == 0 {
             return false;
@@ -1910,6 +1980,7 @@ impl App {
                 let accepted = match &mut pending {
                     CollectionNavigationPending::AwaitingManualContinuation {
                         steps,
+                        page_landing: active_page_landing,
                         display_unit_step: active_display_unit_step,
                         still_only: active_still_only,
                         wrap: active_wrap,
@@ -1922,14 +1993,16 @@ impl App {
                         *active_display_unit_step = display_unit_step;
                         *active_still_only = still_only;
                         *active_wrap = wrap;
+                        *active_page_landing = page_landing;
                         true
                     }
-                    _ => pending.accumulate_manual(
+                    _ => pending.accumulate_manual_with_landing(
                         delta,
                         landing,
                         still_only,
                         display_unit_step,
                         wrap,
+                        page_landing,
                     ),
                 };
                 if accepted {
@@ -1963,12 +2036,13 @@ impl App {
             .advance_collection_navigation_sequence();
         if self
             .top_level_grid_view
-            .accumulate_collection_manual_navigation(
+            .accumulate_collection_manual_navigation_with_landing(
                 delta,
                 landing,
                 still_only,
                 display_unit_step,
                 wrap,
+                page_landing,
             )
         {
             if let Some(pending) = self
@@ -1992,6 +2066,7 @@ impl App {
                 queued_steps: 0,
                 display_unit_step,
                 landing,
+                page_landing,
                 still_only,
                 wrap,
             },
@@ -3190,6 +3265,7 @@ impl App {
             CollectionNavigationPending::AwaitingManualContinuation {
                 steps,
                 landing,
+                page_landing,
                 display_unit_step,
                 still_only,
                 wrap,
@@ -3212,6 +3288,7 @@ impl App {
                             CollectionNavigationPending::AwaitingManualContinuation {
                                 steps,
                                 landing,
+                                page_landing,
                                 display_unit_step,
                                 still_only,
                                 wrap,
@@ -3222,20 +3299,22 @@ impl App {
                     let forward = steps > 0;
                     let remaining = steps - if forward { 1 } else { -1 };
                     let started = if display_unit_step {
-                        self.start_collection_manual_display_unit_navigation(
+                        self.start_collection_manual_display_unit_navigation_with_landing(
                             ctx,
                             fs_idx,
                             if forward { 1 } else { -1 },
                             landing,
                             wrap,
+                            page_landing,
                         )
                     } else {
-                        self.start_collection_manual_navigation(
+                        self.start_collection_manual_navigation_with_landing(
                             ctx,
                             fs_idx,
                             if forward { 1 } else { -1 },
                             landing,
                             wrap,
+                            page_landing,
                         )
                     };
                     if started
@@ -4712,13 +4791,20 @@ impl App {
         match action {
             CollectionNavigationAction::Manual {
                 landing,
+                page_landing,
                 queued_steps,
                 display_unit_step,
                 still_only,
                 wrap,
                 ..
             } => {
-                self.open_manual_media_navigation_target(ctx, target_idx, landing, history_trigger);
+                self.open_manual_media_navigation_target_with_landing(
+                    ctx,
+                    target_idx,
+                    landing,
+                    history_trigger,
+                    page_landing,
+                );
                 #[cfg(windows)]
                 let native_landing = matches!(landing, ManualMediaNavigationLanding::NativeVideo);
                 #[cfg(not(windows))]
@@ -4740,6 +4826,7 @@ impl App {
                                 CollectionNavigationPending::AwaitingManualContinuation {
                                     steps: queued_steps,
                                     landing,
+                                    page_landing,
                                     display_unit_step,
                                     still_only,
                                     wrap,
@@ -5038,6 +5125,10 @@ mod tests {
     use crate::app::{AppTestEnvForTest, setup_app_for_test};
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
+
+    mod scroll_landing_tests {
+        include!("../ui_fullscreen/in_page_scroll/collection_scroll_tests.rs");
+    }
 
     fn cancellation_slideshow_request(
         app: &App,
@@ -7189,6 +7280,7 @@ mod tests {
                 queued_steps: 0,
                 display_unit_step: false,
                 landing: ManualMediaNavigationLanding::Fullscreen,
+                page_landing: None,
                 still_only: false,
                 wrap: false,
             },
@@ -7795,6 +7887,7 @@ mod tests {
                 queued_steps: 0,
                 display_unit_step: false,
                 landing: ManualMediaNavigationLanding::Fullscreen,
+                page_landing: None,
                 still_only: false,
                 wrap: false,
             },
@@ -9635,6 +9728,7 @@ mod tests {
                         queued_steps: 0,
                         display_unit_step: true,
                         landing: ManualMediaNavigationLanding::Fullscreen,
+                        page_landing: None,
                         still_only: false,
                         wrap: true,
                     }
@@ -9674,6 +9768,7 @@ mod tests {
                 queued_steps: 0,
                 display_unit_step: true,
                 landing: ManualMediaNavigationLanding::Fullscreen,
+                page_landing: None,
                 still_only: true,
                 wrap,
             };
@@ -9713,6 +9808,7 @@ mod tests {
         let mut pending = CollectionNavigationPending::AwaitingManualContinuation {
             steps: 0,
             landing: ManualMediaNavigationLanding::Fullscreen,
+            page_landing: None,
             display_unit_step: true,
             still_only: true,
             wrap: false,
@@ -9819,6 +9915,7 @@ mod tests {
                 CollectionNavigationPending::AwaitingManualContinuation {
                     steps: 0,
                     landing: ManualMediaNavigationLanding::Fullscreen,
+                    page_landing: None,
                     display_unit_step: false,
                     still_only: false,
                     wrap: true,
@@ -9939,6 +10036,7 @@ mod tests {
                         CollectionNavigationPending::AwaitingManualContinuation {
                             steps: 3,
                             landing: ManualMediaNavigationLanding::NativeVideo,
+                            page_landing: None,
                             display_unit_step: false,
                             still_only: false,
                             wrap: previous_wrap,
@@ -10412,6 +10510,7 @@ mod tests {
                 queued_steps: 0,
                 display_unit_step: false,
                 landing: ManualMediaNavigationLanding::Fullscreen,
+                page_landing: None,
                 still_only: false,
                 wrap: false,
             },
@@ -10552,6 +10651,7 @@ mod tests {
                 queued_steps: 0,
                 display_unit_step: false,
                 landing: ManualMediaNavigationLanding::Fullscreen,
+                page_landing: None,
                 still_only: false,
                 wrap: false,
             },
@@ -11054,6 +11154,7 @@ mod tests {
             queued_steps: 0,
             display_unit_step: false,
             landing: ManualMediaNavigationLanding::Fullscreen,
+            page_landing: None,
             still_only: true,
             wrap: false,
         };

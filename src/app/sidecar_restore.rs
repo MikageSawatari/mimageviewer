@@ -371,6 +371,10 @@ struct Common {
     effects: RestoreEffects,
 }
 
+#[cfg(test)]
+#[path = "../ui_fullscreen/in_page_scroll/sidecar_landing_tests.rs"]
+mod scroll_landing_tests;
+
 struct DeferredFullscreen {
     viewer_adoption: super::ViewerOpenAdoption,
     idx: usize,
@@ -380,6 +384,7 @@ struct DeferredFullscreen {
     load_contract: FsPageLoadContract,
     metadata_boundary: FsMetadataBoundary,
     resume_notice: Option<BookResumeNotice>,
+    landing: Option<crate::ui_fullscreen::FsPageLanding>,
 }
 
 impl DeferredFullscreen {
@@ -894,6 +899,35 @@ impl SidecarRestoreState {
         resume_notice: Option<BookResumeNotice>,
         viewer_adoption: super::ViewerOpenAdoption,
     ) -> bool {
+        self.defer_fullscreen_with_landing(
+            context,
+            generation,
+            idx,
+            trigger,
+            item_key,
+            requested_materialization,
+            load_contract,
+            metadata_boundary,
+            resume_notice,
+            viewer_adoption,
+            None,
+        )
+    }
+
+    pub(crate) fn defer_fullscreen_with_landing(
+        &mut self,
+        context: ViewerContextId,
+        generation: u64,
+        idx: usize,
+        trigger: HistoryTrigger,
+        item_key: String,
+        requested_materialization: FsOpenMaterialization,
+        load_contract: FsPageLoadContract,
+        metadata_boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: super::ViewerOpenAdoption,
+        landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> bool {
         if !self.target_matches(context, generation) {
             return false;
         }
@@ -922,6 +956,7 @@ impl SidecarRestoreState {
             load_contract,
             metadata_boundary,
             resume_notice,
+            landing,
         });
         true
     }
@@ -1490,6 +1525,29 @@ impl App {
         resume_notice: Option<BookResumeNotice>,
         viewer_adoption: super::ViewerOpenAdoption,
     ) -> bool {
+        self.defer_sidecar_restore_fullscreen_with_adoption_and_landing(
+            idx,
+            trigger,
+            requested_materialization,
+            load_contract,
+            metadata_boundary,
+            resume_notice,
+            viewer_adoption,
+            None,
+        )
+    }
+
+    pub(super) fn defer_sidecar_restore_fullscreen_with_adoption_and_landing(
+        &mut self,
+        idx: usize,
+        trigger: HistoryTrigger,
+        requested_materialization: FsOpenMaterialization,
+        load_contract: FsPageLoadContract,
+        metadata_boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: super::ViewerOpenAdoption,
+        landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> bool {
         if self.sidecar_restore.is_none() {
             return false;
         }
@@ -1497,7 +1555,7 @@ impl App {
         let generation = self.items_generation;
         let accepted = if let Some(item_key) = self.items.get(idx).map(GridItem::perf_key) {
             if let Some(state) = self.sidecar_restore.as_mut() {
-                state.defer_fullscreen(
+                state.defer_fullscreen_with_landing(
                     context,
                     generation,
                     idx,
@@ -1508,6 +1566,7 @@ impl App {
                     metadata_boundary,
                     resume_notice,
                     viewer_adoption,
+                    landing,
                 )
             } else {
                 false
@@ -2964,7 +3023,7 @@ impl App {
             }
             if let Some(deferred) = state.common.deferred_fullscreen.take() {
                 if deferred.matches_item(&self.items) {
-                    self.open_fullscreen_with_metadata_boundary_and_adoption(
+                    self.open_fullscreen_with_metadata_boundary_and_adoption_and_landing(
                         deferred.idx,
                         deferred.trigger,
                         deferred.requested_materialization,
@@ -2973,6 +3032,7 @@ impl App {
                         deferred.metadata_boundary,
                         deferred.resume_notice,
                         deferred.viewer_adoption,
+                        deferred.landing,
                     );
                 } else {
                     #[cfg(windows)]
@@ -3023,7 +3083,7 @@ impl App {
                 .get(deferred.idx)
                 .is_some_and(|item| item.perf_key() == deferred.item_key)
             {
-                self.open_fullscreen_with_metadata_boundary_and_adoption(
+                self.open_fullscreen_with_metadata_boundary_and_adoption_and_landing(
                     deferred.idx,
                     deferred.trigger,
                     deferred.requested_materialization,
@@ -3032,6 +3092,7 @@ impl App {
                     deferred.metadata_boundary,
                     deferred.resume_notice,
                     deferred.viewer_adoption,
+                    deferred.landing,
                 );
             } else {
                 deferred_identity_mismatch = true;
@@ -5600,6 +5661,7 @@ mod tests {
             load_contract: FsPageLoadContract::LatestSeek,
             metadata_boundary: FsMetadataBoundary::Manual,
             resume_notice: None,
+            landing: None,
         };
 
         assert_eq!(

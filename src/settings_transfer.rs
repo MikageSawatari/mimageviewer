@@ -3493,6 +3493,11 @@ mod tests {
                 (FULLSCREEN_FIXED_JUMP_MAX).to_string().parse().unwrap(),
             ),
             (
+                "fullscreen_n_scroll_step_percent",
+                (10).to_string().parse().unwrap(),
+                (100).to_string().parse().unwrap(),
+            ),
+            (
                 "continuous_reading_wheel_scroll_percent",
                 (1).to_string().parse().unwrap(),
                 (100).to_string().parse().unwrap(),
@@ -3573,6 +3578,7 @@ mod tests {
                     | "fullscreen_fixed_bar_gap_px"
                     | "fullscreen_jump_percent"
                     | "fullscreen_fixed_jump_count"
+                    | "fullscreen_n_scroll_step_percent"
                     | "continuous_reading_wheel_scroll_percent"
                     | "continuous_reading_key_scroll_percent"
                     | "continuous_reading_gamepad_scroll_percent_per_sec"

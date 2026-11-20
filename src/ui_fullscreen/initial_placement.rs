@@ -3,7 +3,7 @@ use super::*;
 use crate::gpu_lanczos::FullscreenPageMaterialKind;
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FsInitialPlacementKind {

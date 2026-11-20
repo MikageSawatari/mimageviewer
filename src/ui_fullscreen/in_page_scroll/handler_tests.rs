@@ -95,6 +95,12 @@ pub(super) fn paint(
         let screen = composition.pages_in_screen_order(app.spread_mode);
         if let [page] = screen.as_slice() {
             let material = app.resolve_fs_processed_material(ctx, idx, false);
+            let thumbnail = if material.is_none() {
+                app.prepare_fullscreen_state(ctx, idx, FsPageTurnDecision::normal())
+                    .thumb_tex
+            } else {
+                None
+            };
             let payload = app.fullscreen_paint_payload_for_page(idx, material, false);
             let source_size = app.fs_page_coordinate_source_size(idx);
             let rotation = app.get_rotation(idx);
@@ -117,7 +123,7 @@ pub(super) fn paint(
                     None,
                     composition.singleton_placement(),
                     payload.as_ref(),
-                    None,
+                    thumbnail.as_ref(),
                     false,
                     false,
                     false,
@@ -281,6 +287,11 @@ fn action(app: &App, input: crate::wheel_input::WheelInput, ordinal: u32) -> FsW
         operation: None,
         class: app.fs_wheel_segment_in_page_scroll(input, false),
         scroll_origin: app.fullscreen_page_layout.drawn_unit.clone(),
+        page_owner: (
+            app.items_generation,
+            app.fullscreen_idx,
+            app.fullscreen_page_slice,
+        ),
         seek_hover: false,
     }
 }

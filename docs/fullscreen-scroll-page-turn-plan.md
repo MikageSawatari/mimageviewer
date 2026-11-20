@@ -1,7 +1,7 @@
 # スクロール＋ページ送り・ホイールのズーム・N 字 / Z 字の移動量・滑らかな移動 (§1.823〜§1.826)
 
-- 状態: **設計 r3 (2026-11-20)・独立設計レビュー r3 で ACCEPT (P1/P2 なし、P3 3 件を反映済み)・実装中**。ブランチ `scroll-823-826`。
-- 実装停止 (2026-11-20): §4.4.1 の 5 と §4.5 の前提が既存コードで両立しない。途中差分・未接続箇所と再開条件は末尾の「実装記録」を参照。関連仕様・マニュアルの変更も未完成の作業差分であり、実装済みの証拠ではない。
+- 状態: **設計 r3 (2026-11-20)・独立設計レビュー r3 で ACCEPT (P1/P2 なし、P3 3 件を反映済み)・実装とテスト記述を完了、未コンパイル・未実行**。ブランチ `scroll-823-826`。
+- §4.5と§4.4.1の6bの追記に従って再開し、コレクションを含む着地配送、ホイール、補間、回帰テスト、文書を接続した。最終のread-only実装レビューで未解決P1/P2なし。利用者の指示でコンパイル・テスト・snapshotのPNG生成・製品起動は行っていない。停止時の履歴と最新の実装記録は末尾を参照。
 - 要望: 5ch >>826〜829 (2026-11-20)。利用者決定 (2026-11-20) は [バックログ](next-release-backlog.md) の各項目の状態欄。
 - 前提の設計: [ページ内スクロールと N 字スクロール (§1.474)](fullscreen-in-page-scroll-plan.md)。v5.4.0 で出荷済み。
   本書はその仕組み (描いた表示単位の印・入力時の照合・候補 → clamp → 進んだときだけ書く) をそのまま使い、足す分だけを書く。
@@ -200,6 +200,13 @@ r2 の形 (案 B): **着地 `FsPageLanding { Start | End }` を、送りの要�
 5. 紙めくり演出の継続 (`ResolvedPageTurnNavigation`) には足さない: 演出中は §1 の照合が通らず (`page_turn_barrier_active`)、§1.824 は送りを発行しない。
 6. サイドカー復元: 同じ context の復元中は入力自体が遮断される (`sidecar_restore.rs` の入力遮断、レビュー r1 の確認)。4 の field は経路を揃えるためだけ。
 
+6b. **コレクション直下の送り** (2026-11-20 設計担当の決定。実装担当の 2 回目の停止報告: コレクションの直下では、送りが入場の前に専用の非同期の経路
+   `start_collection_manual_display_unit_navigation` へ入り、`CollectionNavigationPending::AwaitingManualContinuation` が応答を待つ間の送りを蓄積し、
+   着地なしの入口で開くため、着地が失われる): 着地を `CollectionNavigationPending` の 1 field として持たせ、**蓄積の一致条件に加える**
+   (`accumulate_manual` が今 `landing` (Fullscreen 等の開き方)・`still_only`・`display_unit_step`・`wrap` と向きの一致で足すのと同じ扱い)。
+   一致すれば歩数を足して同じ着地のまま、違えば既存の「新しい意図」の経路に乗る (着地なしの通常の送りと §1.824 の送りは蓄積されない)。
+   開くときは保持した着地で入場する。新しい置き換え規則は作らず、保持者の既存の規則に従う。蓄積された 2 歩の §1.824 の次への送りは、
+   2 つ先の表示単位の読み始めに着地する。
 7. **保留での分割の側 (既存の問題、範囲外)**: 別画像への `Split` / slice 付きの `Wrap` は、同期の入場の後で呼び出し元が slice を決める。
    本の構成の確認で保留されると、再開は idx だけで開くので、分割の側 (例: 前のページの後半) が失われる (r2 P1、コード読み)。
    これは今の ← / ↑ / ホイールのページ送りでも同じで、§1.824 で新しく生じるものではない。§1.824 の着地は「実際に入った表示単位」の
@@ -216,6 +223,10 @@ r2 の形 (案 B): **着地 `FsPageLanding { Start | End }` を、送りの要�
   印が付かないまま待ち続けないよう、「動かない (端)」として §4.2 / §4.3 の 3 を行う (送る)。着地は送った先で通常どおり決める。
   判定は既存の統合された状態 `fs_page_load_state` の `LoadFailed` を使う (r1 P2: RAW の終端失敗は `FsCacheEntry::Failed` を作らず専用の store に
   記録されるため、`Failed` だけでは止まる)。見開きの片側だけ失敗も含む。
+  この例外が置き換えるのは**「描いた表示単位の印がある」条件だけ**で、照合の他の条件 (面の上・紙めくり演出中でない `page_turn_barrier_active`・
+  ページ送り待ちでない `fs_navigation_sequence_blocks_new_target`・items 世代) は今と同じく要る。演出中・送り待ちの間に失敗が確定しても、その間は消費だけで送らない
+  (2026-11-20 設計担当の決定。実装担当の停止報告: 演出中に失敗すると送りが紙めくりの継続へ保留され、§4.4.1 の 5 で着地を運ばない経路に入るため)。
+  演出・送り待ちが終われば、次の入力で送れる。
 - 本・フォルダの先頭 / 末尾、ループ (端から端への移動)、見開き・横長分割・本の構成・閲覧順は、`spread_page_nav(±1)` が今と同じく決める
   (今の ↓ / → / ホイールのページ送りと同じ結果)。境界で送れない (`Boundary`) ときは今のページ送りと同じ扱い。ループで反対の端へ
   移るときも、次へ = 読み始め・前へ = 読み終わりに着地する。
@@ -444,3 +455,356 @@ helper内のkind引継ぎだけでなく、再openの所有境界から保持す
 
 **停止時の検査結果**: 引数なし `cargo fmt` は終了コード0、`python scripts/check_ui_glyphs.py` は危険グリフ0件、
 `git diff --check` は終了コード0。コンパイル・テスト・snapshot生成・実機検証はすべて未実施。
+
+### 2026-11-20: §4.5追記による再開と、コレクションの保留境界での再停止
+
+前回の停止理由は設計担当が§4.5へ明記した条件で解消し、その決定に従って実装を再開した。
+`LoadFailed` でも共通の面・世代・紙めくりbarrier・ページ送り待ちを通し、紙めくりの継続型は変更していない。
+
+**新たな主要前提の矛盾（コード読み・独立レビューP1）**:
+
+- `fs_in_page_scroll_surface` はコレクション直下の `GridItem::Image` を除外しない。
+  `collection_navigation.rs::collection_root_navigation_origin` も `Root` の `Available Image` を受理する。
+- `handle_fs_navigation_with_render_perf` は手動送りの着地付き `land` より前に、`collection_delta` を
+  `start_collection_manual_display_unit_navigation` へ渡してreturnする。そこで渡すのは既存の
+  `ManualMediaNavigationLanding::Fullscreen` であり、読み始め／読み終わりではない。
+- `CollectionNavigationAction::Manual` → `enqueue_collection_navigation` → actorの `load_collection` の応答待ち
+  (`CollectionNavigationPending::Snapshot { receiver }` 等) は独立の非同期保持者である。
+  `queued_steps`、`accumulate_manual`、`AwaitingManualContinuation` も持つ。
+- 再開は `open_manual_media_navigation_target` → `open_fullscreen_from_fs_navigation` の着地なし入口へ入るため、
+  新操作の `FsPageLanding` を失う。既存の `manual_media_navigation_routes_collection_before_its_display_order_argument`
+  も、画像2件のコレクションでこの専用送りを扱っている（今回そのテストを実行したものではない）。
+
+§4.4.1の「保留は3経路」という前提に含まれない第4の境界であり、`OpenIntent` / `DeferredFullscreen` への
+field追加だけでは補えない。コレクションの既存経路をバイパス・制限する変更はしていない。
+再開には、コレクション要求／応答待ち／送りの蓄積／再開での着地の所有・置換規則を正本へ追補する必要がある。
+設計担当の決定前に、独立した一時指定やフォールバックは足していない。独立レビューもread-onlyで、全体レビューは途中まで。
+
+**この再開で実装した範囲（未コンパイル）**:
+
+- `FsPageNavRequest`、manual分岐だけへの着地引数、固定矢印・クリック・HUD等の丸ごと上書き。
+- 本の構成確認の各 `OpenIntent`、`Explicit` と通常の再開、サイドカーの両再開、入場時の初期配置kindまでの配送。
+  同idxでも後続の通常送りへ古い着地が付かないよう、保留再利用の同一性に着地も含める。
+- ホイール4分類、設定ズームの既存処理への合流、分類変更時・fallbackメニューでの消費、順序付き予測と適用。
+  印なし失敗を受理したsegmentも、受理時のitems世代・idx・sliceを保持して遅延適用先を照合する。
+- 表示専用補間、context bundleでの交換、配送先の時刻・ViewportId、比較による退役、描画pan、ナビゲータ逆算3箇所の限定。
+- 構成変更でanchorが変わる再openも、既存要求の着地kindを引数で継承する接続。
+- 新規テスト41件とsnapshot定義2件（既存2件も拡張）。PNG未生成。
+  実GPUを作る新snapshot2件は `.config/nextest.toml` のgpu groupへ登録した。
+
+**停止時の未完了**: コレクションの着地配送、保留・置換・世代変更・Explicit再開・スライドショー不漏れの通しテスト、
+仮素材→完成素材／設定中央への変更／構成変更の着地kind回帰、補間中の実描画・ナビゲータ逆算の通し回帰、
+文書の最終突合せとLoadFailed条件の追従、全体の独立レビュー。PDFズームfixtureの要求の事前発生も未確認。
+今回の機能差分は未完成で、全§9を満たしたとの報告ではない。
+
+検証担当への対象フィルタ案:
+`in_page_scroll::(settings_input_tests|scroll_then_turn_tests|wheel_zoom_tests|smooth_scroll_tests|context_scroll_tests|landing_tests)::`。
+既存回帰は `in_page_scroll::|initial_placement|fullscreen_in_page_scroll|fullscreen_scroll_then_turn_settings_snapshot|fullscreen_wheel_zoom_settings_snapshot|settings_transfer|search_nav_entry_inventory|spread_step`。
+コンパイル・テスト・ビルド・製品起動・コミットは実施していない。
+
+**今回追加したテスト名（未実行）**:
+
+- scroll_then_turn_tests:
+  - `press_moves_to_edge_then_turns_but_repeat_stays_on_the_page`
+  - `fitting_page_turns_on_press_and_uses_directional_landing`
+  - `wheel_edge_arrival_blocks_same_frame_turn_and_small_segments_never_turn`
+  - `terminal_failure_replaces_only_drawn_proof_and_never_loading_or_new_generation`
+  - `terminal_failure_does_not_bypass_navigation_sequence_or_surface`
+  - `terminal_failure_during_resident_thumbnail_turn_is_consumed_without_continuation`
+  - `fractional_wheel_advances_primary_but_cannot_wrap_to_another_column`
+  - `all_scroll_amounts_finish_n_and_z_in_both_directions_without_repeating_wraps`
+  - `terminal_raw_failure_without_failed_fs_cache_is_still_navigable`
+
+- smooth_scroll_tests:
+  - `default_is_instant_and_smooth_writes_final_pan_before_interpolating_paint`
+  - `repeated_scroll_accumulates_from_logical_target_and_restarts_from_visible_pan`
+  - `trackpad_writer_is_instant_and_retires_an_existing_animation`
+  - `changed_pan_is_used_immediately_and_zoom_rotation_or_disabled_setting_retires`
+  - `equal_geometry_in_a_different_viewport_cannot_retain_animation`
+  - `resized_or_changed_dpi_viewport_retires_without_requiring_a_new_paint`
+  - `interpolation_does_not_request_material_or_pdf_producers`
+
+- context_scroll_tests:
+  - `page_scroll_animation_context_roundtrip_preserves_both_owners`
+  - `sibling_temporary_mount_does_not_retire_the_active_scroll_animation`
+
+- settings_input_tests:
+  - `scroll_extension_settings_missing_fields_keep_released_defaults`
+  - `scroll_extension_settings_roundtrip_and_clamp_only_the_ordered_step`
+  - `scroll_extension_transfer_roundtrips_each_choice_and_preserves_missing_fields`
+  - `scroll_extension_transfer_rejects_invalid_types_ranges_and_unknown_values`
+  - `scroll_or_turn_actions_are_unassigned_image_only_and_ini_roundtrips`
+  - `consumed_scroll_action_reports_egui_press_or_repeat_once_without_hold_reads`
+  - `consumed_scroll_action_respects_keyboard_ownership_before_consuming`
+  - `consumed_scroll_action_reports_native_kind_and_claims_the_egui_twin`
+  - `preferences_n_scroll_amount_and_smooth_checkbox_ok_save_then_key_use_the_new_values`
+  - `preferences_wheel_zoom_ok_save_then_handler_zooms_instead_of_turning`
+  - `preferences_scroll_extension_search_results_jump_to_the_actual_setting_anchors`
+  - `image_help_explains_all_four_wheel_settings_and_assigned_scroll_or_turn_actions`
+
+- wheel_zoom_tests:
+  - `setting_zoom_matches_ctrl_cursor_pivot_clamp_and_actual_painted_transform`
+  - `setting_zoom_pdf_uses_the_same_resolution_demand_as_ctrl_without_a_worker`
+  - `setting_zoom_real_seek_hover_turns_and_seek_drag_preserves_its_owner`
+  - `setting_zoom_real_alt_shift_and_fractional_threshold_keep_existing_meanings`
+  - `setting_zoom_real_fallback_menu_consumes_without_zoom_or_navigation`
+  - `setting_zoom_outside_its_surface_matches_the_legacy_real_handler`
+  - `setting_zoom_prediction_and_same_frame_click_use_the_applied_zoom`
+  - `accepted_setting_zoom_after_alt_media_navigation_is_consumed_without_reinterpretation`
+  - `default_real_wheel_still_turns_pages_without_starting_zoom_or_animation`
+
+- landing_tests:
+  - `manual_navigation_lands_at_the_reading_corner_for_every_unit_and_order`
+  - `same_image_split_landing_preserves_zoom_and_the_fitting_axis`
+
+Snapshot追加: `fullscreen_scroll_then_turn_settings_snapshot_light` / `fullscreen_wheel_zoom_settings_snapshot_dark`。既存 `fullscreen_in_page_scroll_settings_snapshot_light_default` / `fullscreen_in_page_scroll_settings_snapshot_dark_enabled` を拡張。
+
+**今回の変更ファイル（前回WIPコミット以後）**:
+
+- `.config/nextest.toml`
+- `docs/fullscreen-scroll-page-turn-plan.md`
+- `src/app.rs`
+- `src/app/book_composition_permission.rs`
+- `src/app/book_composition_permission_tests.rs`
+- `src/app/sidecar_restore.rs`
+- `src/app/tests.rs`
+- `src/app/viewer_context_registry.rs`
+- `src/keymap.rs`
+- `src/settings_transfer.rs`
+- `src/ui_conceal.rs`
+- `src/ui_crop.rs`
+- `src/ui_dialogs/preferences/pages.rs`
+- `src/ui_erase.rs`
+- `src/ui_fullscreen.rs`
+- `src/ui_fullscreen/depth_slideshow_tests.rs`
+- `src/ui_fullscreen/depth_tests.rs`
+- `src/ui_fullscreen/in_page_scroll.rs`
+- `src/ui_fullscreen/in_page_scroll/context_scroll_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/handler_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/landing_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/scroll_then_turn_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/settings_input_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/smooth_scroll_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/wheel_zoom_tests.rs`
+- `src/ui_fullscreen/initial_placement/tests/viewport_input/canvas_click.rs`
+- `src/ui_fullscreen/manual_nav_wrap_tests.rs`
+- `src/ui_fullscreen/slideshow_settings_tests.rs`
+- `src/ui_fullscreen/spread_step.rs`
+- `src/ui_fullscreen/spread_step_tests.rs`
+- `src/ui_sns_split.rs`
+
+**今回の停止時検査**: 引数なし `cargo fmt` 終了0、`python scripts/check_ui_glyphs.py` 危険グリフ0件、`git diff --check` 終了0。テストは未実行、型の整合・期待値・実機挙動は未確認。
+
+### 2026-11-20: §4.4.1の6bによる再開・実装とテスト記述の完了（未コンパイル・未実行）
+
+設計担当の6bの決定と、同形の保持者は既存の一致・置換・破棄規則に従って接続してよいという利用者の指示に従った。
+下記はコードとテストを記述した記録であり、実行成功の証拠ではない。
+
+**完了した接続**:
+
+- `FsPageNavRequest` をキー・ホイール・固定矢印・クリック・HUDまで運び、通常の送りの上書きで着地も丸ごと取り替える。
+  手動の送りだけが着地を持ち、同じ呼び出しのスライドショーへ漏らさない。
+- `OpenIntent`、`DeferredFullscreen`、構成変更の再open、`Explicit`と通常の再開から、着地付きの入場と初期配置kindまで接続した。
+- コレクションの保持者は `CollectionNavigationAction::Manual` と `CollectionNavigationPending::AwaitingManualContinuation`。
+  requestを保持する他のpending状態は前者を通じて保持する。`page_landing` を各所有者の1 fieldとし、既存の
+  `ManualMediaNavigationLanding`（開き方）とは区別する。蓄積の一致、wrap変更時のsteps置換、queue再開、世代破棄、最終入場へ運ぶ。
+  根拠は§4.4.1の6bであり、今回これ以外の新しい独立した保留状態は足していない。
+- ホイールは4分類を受付・予測・適用で共有し、設定ズームを既存Ctrlズームへ合流させた。分類が変わった入力は消費だけにする。
+  移動済み判定と送りの予測はframe内の順序を保つ。失敗ページの例外は描画印の条件だけに適用する。
+  印なしで受けた遅延入力もitems世代・idx・sliceを保持し、印のOption全体を照合する。途中でサムネイルの印が生じても
+  受理済みの送りをスクロールへ再解釈しない（消費のみ、次の新入力で新しい印を使う）。
+- `fs_pan` を最終位置とする表示専用補間をcontext bundleへ載せた。配送先ViewportIdと入力時刻、1箇所の比較による退役、
+  補間中だけの再描画要求を使う。拡大のROIは既存の毎frameの可視域をそのまま使い、追加の素材producerは作らない。
+  ナビゲータ3箇所は補間ownerが保持するtransform自身のpanを使う。描画から入力までに0.2秒をまたぐ場合も同じ基準で逆算する。
+- 設定のUI編集→OK→保存→実handlerの効果、初期配置の仮素材→完成素材、実描画、別context、保留再開の回帰を記述した。
+  新しいテストはすべて `in_page_scroll` 配下に置いた。private fixtureを使うコレクション／本の構成／サイドカーのテストは
+  その所有moduleからincludeまたはpath指定しており、テストの完全名も所有module側になる。
+- 環境設定snapshotの既存2件を拡張し、新規2件を定義した。新規の実GPU使用snapshot2件をgpu groupへ登録した。
+  headlessな実handler・描画テストはdeviceを作らないためgpu groupへは追加していない。PNGの生成・閲覧・比較は設計担当へ引き継ぐ。
+- キー仕様・表示仕様・context所有・コレクション仕様・UI snapshot方針・マニュアルを最終突合せした。
+  detachedの述語、viewportの配送先選択、HWNDの契約は変更していない。
+
+**設計との差分と理由**: §4.5と6bの追記を含む正本の動作仕様からの変更はない。
+描画印のOption全体の照合、補間期限をまたぐナビゲータの基準、通常APIをNone wrapperとして残す接続は、
+それぞれ受理済み入力の所有、実際に描いたtransform、既存の着地なし呼び出しを維持するための実装上の具体化である。
+§4.4.1の7にある保留時のslice問題は修正対象を広げず、通常の送りとの表示先比較を回帰条件にした。
+
+**独立レビュー**: GPT-6.1 Sol / xhighによるread-onlyの最終実装レビューで未解決P1/P2なし。
+コレクションの着地欠落、補間期限をまたぐナビゲータ、新しい印による遅延ホイール再解釈の指摘は修正後に再確認した。
+型・実行時の整合が確認済みであるとは主張しない。
+
+**追加テスト名（新規12ファイルの75件、すべて未実行）**:
+
+- scroll_then_turn_tests:
+  - `press_moves_to_edge_then_turns_but_repeat_stays_on_the_page`
+  - `fitting_page_turns_on_press_and_uses_directional_landing`
+  - `wheel_edge_arrival_blocks_same_frame_turn_and_small_segments_never_turn`
+  - `terminal_failure_replaces_only_drawn_proof_and_never_loading_or_new_generation`
+  - `terminal_failure_does_not_bypass_navigation_sequence_or_surface`
+  - `terminal_failure_during_resident_thumbnail_turn_is_consumed_without_continuation`
+  - `fractional_wheel_advances_primary_but_cannot_wrap_to_another_column`
+  - `all_scroll_amounts_finish_n_and_z_in_both_directions_without_repeating_wraps`
+  - `terminal_raw_failure_without_failed_fs_cache_is_still_navigable`
+
+- smooth_scroll_tests:
+  - `default_is_instant_and_smooth_writes_final_pan_before_interpolating_paint`
+  - `repeated_scroll_accumulates_from_logical_target_and_restarts_from_visible_pan`
+  - `trackpad_writer_is_instant_and_retires_an_existing_animation`
+  - `changed_pan_is_used_immediately_and_zoom_rotation_or_disabled_setting_retires`
+  - `equal_geometry_in_a_different_viewport_cannot_retain_animation`
+  - `resized_or_changed_dpi_viewport_retires_without_requiring_a_new_paint`
+  - `interpolation_does_not_request_material_or_pdf_producers`
+
+- context_scroll_tests:
+  - `page_scroll_animation_context_roundtrip_preserves_both_owners`
+  - `sibling_temporary_mount_does_not_retire_the_active_scroll_animation`
+  - `landing_kind_and_items_generation_follow_only_their_context_owner`
+
+- settings_input_tests:
+  - `scroll_extension_settings_missing_fields_keep_released_defaults`
+  - `scroll_extension_settings_roundtrip_and_clamp_only_the_ordered_step`
+  - `scroll_extension_transfer_roundtrips_each_choice_and_preserves_missing_fields`
+  - `scroll_extension_transfer_rejects_invalid_types_ranges_and_unknown_values`
+  - `scroll_or_turn_actions_are_unassigned_image_only_and_ini_roundtrips`
+  - `consumed_scroll_action_reports_egui_press_or_repeat_once_without_hold_reads`
+  - `consumed_scroll_action_respects_keyboard_ownership_before_consuming`
+  - `consumed_scroll_action_reports_native_kind_and_claims_the_egui_twin`
+  - `preferences_n_scroll_amount_and_smooth_checkbox_ok_save_then_key_use_the_new_values`
+  - `preferences_wheel_zoom_ok_save_then_handler_zooms_instead_of_turning`
+  - `preferences_scroll_extension_search_results_jump_to_the_actual_setting_anchors`
+  - `image_help_explains_all_four_wheel_settings_and_assigned_scroll_or_turn_actions`
+
+- wheel_zoom_tests:
+  - `setting_zoom_matches_ctrl_cursor_pivot_clamp_and_actual_painted_transform`
+  - `setting_zoom_pdf_uses_the_same_resolution_demand_as_ctrl_without_a_worker`
+  - `setting_zoom_real_seek_hover_turns_and_seek_drag_preserves_its_owner`
+  - `setting_zoom_real_alt_shift_and_fractional_threshold_keep_existing_meanings`
+  - `setting_zoom_real_fallback_menu_consumes_without_zoom_or_navigation`
+  - `setting_zoom_outside_its_surface_matches_the_legacy_real_handler`
+  - `setting_zoom_prediction_and_same_frame_click_use_the_applied_zoom`
+  - `accepted_setting_zoom_after_alt_media_navigation_is_consumed_without_reinterpretation`
+  - `default_real_wheel_still_turns_pages_without_starting_zoom_or_animation`
+  - `setting_zoom_media_items_stay_outside_the_ordinary_image_classifier`
+
+- landing_tests:
+  - `manual_navigation_lands_at_the_reading_corner_for_every_unit_and_order`
+  - `same_image_split_landing_preserves_zoom_and_the_fitting_axis`
+  - `landing_kind_survives_provisional_material_and_center_setting_until_full_arrival`
+  - `changing_global_start_position_retires_only_setting_requests`
+  - `landing_end_survives_composition_reanchor_and_is_consumed_on_the_new_unit`
+  - `manual_pan_retires_provisional_landing_before_full_material_arrives`
+  - `scroll_turn_boundaries_and_wrap_use_the_existing_units_and_directional_arrival`
+
+- navigation_landing_tests:
+  - `a_manual_boundary_does_not_attach_its_landing_to_a_due_slideshow`
+
+- permission_landing_tests:
+  - `permission_navigation_explicit_and_inner_open_resume_with_the_exact_landing`
+  - `permission_replacement_and_generation_retirement_discard_the_old_landing`
+
+- sidecar_landing_tests:
+  - `sidecar_live_and_index_only_resume_with_the_retained_landing`
+  - `sidecar_replacing_an_open_or_its_generation_cannot_retain_a_previous_landing`
+
+- collection_scroll_tests:
+  - `collection_scroll_accumulator_matches_landing_and_direction_in_both_owners`
+  - `collection_scroll_actor_queue_preserves_start_and_end_until_the_final_entry`
+  - `collection_scroll_different_landing_replaces_the_pending_request`
+  - `collection_scroll_wrap_replacement_replaces_the_page_landing_together_with_steps`
+  - `collection_scroll_generation_change_discards_both_request_and_continuation_landing`
+
+- scroll_turn_handler_tests:
+  - `real_wheel_prediction_arrives_at_edge_and_next_frame_turns_with_landing`
+  - `real_deferred_wheel_turn_consumes_later_segments_without_moving_target_page`
+  - `deferred_scroll_turn_drops_old_page_and_generation_and_respects_front_consumption`
+  - `real_scroll_turn_key_consumes_repeat_but_never_turns_until_a_fresh_press`
+  - `scroll_turn_keys_are_left_unconsumed_outside_surface_and_front_ui`
+  - `fixed_arrow_overwrites_the_whole_scroll_turn_request_in_the_same_key_pass`
+  - `click_overwrites_the_whole_scroll_turn_wheel_request_without_landing`
+  - `ordered_step_setting_does_not_change_continuous_page_up_or_page_down`
+  - `failed_page_deferred_turn_is_not_reinterpreted_after_a_thumbnail_receives_a_stamp`
+
+- smooth_render_tests:
+  - `ordinary_single_and_spread_paint_interpolate_without_publishing_intermediate_pan`
+  - `asymmetric_spread_wrap_paint_keeps_final_pan_and_existing_material_producers`
+  - `actual_trackpad_handler_is_instant_for_both_page_scroll_settings`
+  - `navigator_double_click_uses_the_painted_pan_during_scroll_interpolation`
+  - `navigator_range_zoom_uses_the_painted_pan_during_scroll_interpolation`
+  - `navigator_pending_center_draw_uses_the_painted_pan_during_scroll_interpolation`
+  - `navigator_baseline_without_animation_or_with_z_keeps_the_logical_pan`
+  - `actual_pdf_scroll_paint_adds_no_resolution_or_processing_request`
+
+Snapshot新規: `fullscreen_scroll_then_turn_settings_snapshot_light` / `fullscreen_wheel_zoom_settings_snapshot_dark`。
+変更: `fullscreen_in_page_scroll_settings_snapshot_light_default` / `fullscreen_in_page_scroll_settings_snapshot_dark_enabled`。
+既存テストの変更は、転送件数と全field fixture、KeyAction inventory、初期配置kind、typed requestへの置換、
+実handler描画fixtureでの失敗ページのresident thumbnailを使う接続である。元の機能の期待値は維持した。
+
+**今回の変更ファイル（前回WIPコミット以後。最初のWIPに含まれる設定・検索・ヘルプ等は上の履歴を参照）**:
+
+- `.config/nextest.toml`
+- `docs/collection-playback-plan.md`
+- `docs/detached-rework-plan.md`
+- `docs/display-pipeline.md`
+- `docs/fullscreen-scroll-page-turn-plan.md`
+- `docs/gpu-test-groups.md`
+- `docs/key-customization-impl-plan.md`
+- `docs/keymap-spec.md`
+- `docs/spec.md`
+- `docs/ui-snapshot-policy.md`
+- `htdocs/mimageviewer/manual/fullscreen.html`
+- `htdocs/mimageviewer/manual/shortcuts.html`
+- `src/app.rs`
+- `src/app/book_composition_permission.rs`
+- `src/app/book_composition_permission_tests.rs`
+- `src/app/collection_navigation.rs`
+- `src/app/sidecar_restore.rs`
+- `src/app/tests.rs`
+- `src/app/top_level_grid_view.rs`
+- `src/app/viewer_context_registry.rs`
+- `src/keymap.rs`
+- `src/settings_transfer.rs`
+- `src/ui_conceal.rs`
+- `src/ui_crop.rs`
+- `src/ui_dialogs/preferences/pages.rs`
+- `src/ui_erase.rs`
+- `src/ui_fullscreen.rs`
+- `src/ui_fullscreen/depth_slideshow_tests.rs`
+- `src/ui_fullscreen/depth_tests.rs`
+- `src/ui_fullscreen/in_page_scroll.rs`
+- `src/ui_fullscreen/in_page_scroll/collection_scroll_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/context_scroll_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/handler_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/landing_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/navigation_landing_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/permission_landing_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/scroll_then_turn_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/scroll_turn_handler_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/settings_input_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/sidecar_landing_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/smooth_render_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/smooth_scroll_tests.rs`
+- `src/ui_fullscreen/in_page_scroll/wheel_zoom_tests.rs`
+- `src/ui_fullscreen/initial_placement.rs`
+- `src/ui_fullscreen/initial_placement/tests.rs`
+- `src/ui_fullscreen/initial_placement/tests/viewport_input/canvas_click.rs`
+- `src/ui_fullscreen/manual_nav_wrap_tests.rs`
+- `src/ui_fullscreen/page_turn/input_regression_tests.rs`
+- `src/ui_fullscreen/slideshow_settings_tests.rs`
+- `src/ui_fullscreen/spread_step.rs`
+- `src/ui_fullscreen/spread_step_tests.rs`
+- `src/ui_fullscreen/tests/still_seek_menu.rs`
+- `src/ui_sns_split.rs`
+
+**設計担当へ引き継ぐ絞り込み**:
+
+- 新規headless群: `in_page_scroll::(settings_input_tests|scroll_then_turn_tests|wheel_zoom_tests|smooth_scroll_tests|context_scroll_tests|landing_tests|navigation_landing_tests|scroll_turn_handler_tests|smooth_render_tests)::`
+- 保留所有者の通し: `app::(book_composition_permission::scroll_landing_tests|sidecar_restore::scroll_landing_tests|collection_navigation::tests::scroll_landing_tests)::`
+- 既存回帰と設定UI: `in_page_scroll::|initial_placement|fullscreen_in_page_scroll|fullscreen_scroll_then_turn_settings_snapshot|fullscreen_wheel_zoom_settings_snapshot|settings_transfer|search_nav_entry_inventory|spread_step|navigator_zoom_mode|manual_nav_wrap|page_turn::input_regression_tests`
+
+これらは正規表現の案であり、コンパイル後に列挙された完全名へ合わせて選択する。実GPUを使うsnapshotはnextestのgpu groupで行う。
+PNG生成、実機での入力と別ウィンドウ、補間中の負荷・画質は未確認。ビルド・テスト・check・clippy・nextest・
+build-dev・製品起動・コミットは利用者の指示により実施していない。
+
+**最終検査**: 引数なし `cargo fmt` は終了コード0、`python scripts/check_ui_glyphs.py` は危険グリフ0件、
+`git diff --check` は終了コード0。新規12ファイルのテスト関数が75件あることをファイル読取で確認した。
+コンパイル・テスト・snapshot生成・製品起動・コミットは行っていない。
