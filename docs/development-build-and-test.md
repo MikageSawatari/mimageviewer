@@ -258,7 +258,9 @@ fixtureとログは残し、約1.4 GBの空き容量が必要。実画像59.1 GB
 
 `test` / `dev` は `debug`、`bench` は `release`、他は同名の出力先になる。
 出力 root は `cargo metadata --no-deps --format-version 1` の `target_directory` を使う。
-明示する場合は `-TargetDir <path>` を指定できる。
+明示する場合は `-TargetDir <path>` を指定できる。テストは target triple を指定せずに流す前提で、
+`--target` / `CARGO_BUILD_TARGET` を付けた場合の `target/<triple>/<profile>/` には置かない
+(リリース側の `build-output-safety.ps1` も `CARGO_BUILD_TARGET` を拒否している)。
 `test-lib-full.ps1` / `test-focused.ps1` / `test-full.ps1` / `build-dev.ps1` は自分で呼ぶ
 (`test-focused.ps1 -PlanOnly` はコピーしない)。
 

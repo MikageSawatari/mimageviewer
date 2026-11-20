@@ -2099,9 +2099,9 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
   test-lib-full / test-focused / test-full は自分で呼ぶ)。無いと `STATUS_DLL_NOT_FOUND` で落ちる。
   Cargo 1.100 から `target/debug/deps` に置いても効かない
 
-  ```bash
-  cp vendor/ffmpeg/bin/*.dll target/debug/deps/
-  cargo test -p mimageviewer --lib
+  ```powershell
+  .\scripts\setup-test-dlls.ps1
+  .\scripts	est-lib-full.ps1
   ```
 
 - 本体 UI (`app.rs` / `ui_fullscreen.rs` 等) に触れた増分では、絞り込みではなく
