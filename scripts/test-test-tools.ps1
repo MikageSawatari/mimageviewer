@@ -5,6 +5,7 @@ param([switch] $Benchmark)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'test-tools-common.ps1')
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+& (Join-Path $PSScriptRoot 'test-setup-test-dlls.ps1')
 $fixture = Join-Path $repo ('target/test-tools-regression-' + [guid]::NewGuid().ToString('N'))
 [void] [IO.Directory]::CreateDirectory((Join-Path $fixture 'src'))
 [void] [IO.Directory]::CreateDirectory((Join-Path $fixture 'tests'))
@@ -21,6 +22,11 @@ function Run-Script {
     return $result
 }
 function Count-Runs { return @(Get-ChildItem (Join-Path $fixture 'target/test-lib-full/runs') -Directory -ErrorAction SilentlyContinue).Count }
+# Test wrappers now require the same six vendor inputs as the real repository.
+[void] [IO.Directory]::CreateDirectory((Join-Path $fixture 'vendor/ffmpeg/bin'))
+foreach ($dll in @('avcodec-61.dll', 'avformat-61.dll', 'avutil-59.dll', 'avfilter-10.dll', 'swscale-8.dll', 'swresample-5.dll')) {
+    Write-Fixture "vendor/ffmpeg/bin/$dll" 'fake FFmpeg input; tiny crate does not import it'
+}
 Assert-That ((Get-MivTextHash 'abc') -eq 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad') 'SHA-256 known vector mismatch'
 # Observe both flushed pipes before allowing the child to exit, then check capture.
 $streamProbe = Join-Path $fixture 'target/stream-probe'
@@ -324,6 +330,20 @@ try {
 } finally { $locked.Dispose() }
 Write-Host '[test-test-tools] stat cache: identity, warm read avoidance, size/mtime/creation/racy changes, ForceHash, corruption and I/O failures PASS'
 
+# Planning must not stage DLLs; execution must stop before nextest on missing input.
+$missingVendor = Join-Path $fixture 'vendor/ffmpeg/bin/avcodec-61.dll'
+$vendorContent = [IO.File]::ReadAllText($missingVendor)
+[IO.File]::Delete($missingVendor)
+try {
+    $planOnly = Run-Script 'test-focused.ps1' @('-Path', 'src/foo.rs', '-PlanOnly')
+    Assert-That ($planOnly.ExitCode -eq 0 -and $planOnly.StdOut.Contains('Plan only')) 'PlanOnly tried to stage DLLs'
+    $missingFocused = Run-Script 'test-focused.ps1' @('-Path', 'src/foo.rs')
+    Assert-That ($missingFocused.ExitCode -ne 0 -and $missingFocused.StdOut.Contains('bash scripts/setup-ffmpeg.sh')) 'focused tests ignored missing DLL inputs'
+    $missingFull = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
+    Assert-That ($missingFull.ExitCode -ne 0 -and $missingFull.StdErr.Contains('setup-ffmpeg.sh')) 'full library tests swallowed the DLL staging error'
+    Assert-That ((Count-Runs) -eq 0) 'missing DLLs started nextest'
+} finally { [IO.File]::WriteAllText($missingVendor, $vendorContent, $utf8) }
+
 $run1 = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
 Assert-That ($run1.ExitCode -eq 0 -and $run1.StdOut.Contains('MISS')) "initial miss failed: $($run1.StdOut) $($run1.StdErr)"
 $count1 = Count-Runs
@@ -350,9 +370,11 @@ foreach ($probe in @(
         Assert-That ($envHit.ExitCode -eq 0 -and $envHit.StdOut.Contains('HIT') -and (Count-Runs) -eq ($runsBefore + 1)) "environment state was not reusable: $name"
     } finally { [Environment]::SetEnvironmentVariable($name, $before) }
 }
-# Model manually copied DLLs beside the test executable; this tiny crate does
-# not import them, so identity behavior is checked without loading fake DLLs.
+# Legacy deps DLLs are still runtime inputs even though staging now targets
+# the base profile directory. This tiny crate does not import these fake DLLs.
 $nativeDlls = @('avcodec-61.dll', 'avfilter-10.dll', 'avformat-61.dll', 'avutil-59.dll', 'swresample-5.dll', 'swscale-8.dll')
+# Cargo 1.100's build-dir layout no longer creates target/debug/deps.
+[void] [IO.Directory]::CreateDirectory((Join-Path $fixture 'target/debug/deps'))
 foreach ($dll in $nativeDlls) { Write-Fixture "target/debug/deps/$dll" 'native-fixture-v1' }
 $dllBaseline = Run-Script 'test-lib-full.ps1' @('-MinimumTests', '3')
 Assert-That ($dllBaseline.ExitCode -eq 0 -and $dllBaseline.StdOut.Contains('MISS')) 'DLL additions did not invalidate receipt'

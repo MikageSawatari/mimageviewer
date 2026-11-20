@@ -861,6 +861,7 @@ mod diagnostics_tests {
     fn embedded_companion_paths_follow_cargo_out_dir_even_with_injected_target_env() {
         let release_dir = super::build_output_paths::release_inputs_dir_from_out_dir(
             std::path::Path::new(env!("OUT_DIR")),
+            "mimageviewer-launcher",
         )
         .unwrap();
         if let Some(injected) = std::env::var_os("MIV_TEST_EXPECT_INJECTED_TARGET_DIR") {

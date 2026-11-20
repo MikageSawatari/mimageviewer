@@ -323,12 +323,17 @@ function Get-MivEnvironmentId {
     return Get-MivTextHash ($parts -join "`n")
 }
 
+function Get-MivCargoProfileDirectory {
+    param([ValidatePattern('^[A-Za-z0-9_-]+$')] [string] $CargoProfile)
+    switch ($CargoProfile) { 'test' { 'debug' } 'dev' { 'debug' } 'bench' { 'release' } default { $CargoProfile } }
+}
+
 function Get-MivNativeRuntimeId {
     param([string] $RepoRoot, [string] $CargoProfile)
     $meta = Invoke-MivTool 'cargo' @('metadata', '--no-deps', '--format-version', '1') $RepoRoot
     if ($meta.ExitCode -ne 0) { throw "Cannot locate native runtime directory: $($meta.StdErr)" }
     $target = (ConvertFrom-Json $meta.StdOut).target_directory
-    $profileDir = switch ($CargoProfile) { 'test' { 'debug' } 'dev' { 'debug' } 'bench' { 'release' } default { $CargoProfile } }
+    $profileDir = Get-MivCargoProfileDirectory $CargoProfile
     $roots = @($target)
     # Explicit target triples put executables one directory below target_directory.
     if ([IO.Directory]::Exists($target)) { $roots += @(Get-ChildItem -LiteralPath $target -Directory | Select-Object -ExpandProperty FullName) }

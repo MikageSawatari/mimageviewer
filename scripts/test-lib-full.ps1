@@ -13,6 +13,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'test-tools-common.ps1')
 if (-not $RepoRoot) { $RepoRoot = Join-Path $PSScriptRoot '..' }
 $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path.TrimEnd('\', '/')
+& (Join-Path $PSScriptRoot 'setup-test-dlls.ps1') -RepoRoot $RepoRoot -CargoProfile $CargoProfile
 $featureArgs = @(Get-MivFeatureArguments $Features -NoDefaultFeatures:$NoDefaultFeatures)
 $selection = @('-p', 'mimageviewer', '--lib', '-E', 'all()')
 $store = Join-Path $RepoRoot 'target/test-lib-full'

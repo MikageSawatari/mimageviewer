@@ -52,6 +52,7 @@ public static class MivTestErrorMode
 
     Push-Location $repoRoot
     try {
+        & (Join-Path $PSScriptRoot 'setup-test-dlls.ps1') -RepoRoot $repoRoot -CargoProfile test
         # No cargo-test fallback: process isolation is part of this gate.
         & cargo nextest --version
         $gateExit = $LASTEXITCODE
