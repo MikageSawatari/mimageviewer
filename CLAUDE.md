@@ -319,6 +319,13 @@ mIV は Windows 専用。非 Windows でのコンパイル検査は行わず、2
 通常の編集ループで毎回 `cargo test --workspace` を実行しない。まず変更範囲に応じて
 次の最小targetを使い、共有境界を変更したときや最終確認時だけ範囲を広げる。
 
+**テストの段階分け (2026-11-20 利用者決定)**: ブランチでは、変えたモジュール・足したテスト・指示書が
+名指しした関連テストだけを流し、本体 lib 全件をブランチごとに流さない (`test-focused.ps1` が広域の
+exit 2 を返しても、それだけで全件へ広げない)。全件は統括が master への取り込みの後に 1 回、
+リリース前は従来どおり test-full と test-script 版の lib 全件。共有の土台 (App の状態・非同期・
+複数ウィンドウ・vendor の egui 等・テストの共通基盤) を変えるブランチだけは例外で全件を流す。
+詳細は [開発ビルドとテスト](docs/development-build-and-test.md#テストの段階分け-2026-11-20-利用者決定)。
+
 ```powershell
 cargo check -p mimageviewer --bin mimageviewer-core
 .\scripts\test-focused.ps1          # 変更ファイルから選んだテストを nextest で実行
@@ -331,8 +338,9 @@ cargo test -p mimageviewer --test <integration-test-name>
 `cargo test -p mimageviewer --lib` を直接打たない** (2026-10-16)。cargo-nextest でテストを 1 件ずつ
 別プロセスに分けるので約 6〜7 分で終わり (cargo test では App テストが共有ロックで直列になり約 28 分)、
 同じソース・環境・DLL の状態で成功済みなら記録を返して再実行しない。レビュー担当も、同じ状態の
-成功記録があれば全件を再実行しない。`test-focused.ps1` が対応先の無い変更 (スクリプト・Cargo.lock 等) を
-見つけて exit 2 を返したら、`test-lib-full.ps1` に回す。cargo-nextest が無い環境では
+成功記録があれば全件を再実行しない。`test-focused.ps1` が対応先の無い変更を見つけて exit 2 を返したとき、
+全件に回すのは Cargo.lock・build 設定・vendor・テストの共通基盤など共有の土台の変更だけ (`src/app.rs` への機能追加は
+指示書の filter で流す。上の「テストの段階分け」)。cargo-nextest が無い環境では
 `cargo install cargo-nextest --locked` で入れる。経緯と計測は
 [docs/test-speed-report.md](docs/test-speed-report.md)。
 
