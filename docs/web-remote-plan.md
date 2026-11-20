@@ -2095,8 +2095,9 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
   cd crates/remote-web/web && node --test
   ```
 
-- **本体の lib テストは `target/debug/deps` に FFmpeg DLL のコピーが必要。**
-  無いと `STATUS_DLL_NOT_FOUND` で落ちる
+- **本体のテストは `target/debug/` に FFmpeg DLL のコピーが必要** (`.\scripts\setup-test-dlls.ps1`。
+  test-lib-full / test-focused / test-full は自分で呼ぶ)。無いと `STATUS_DLL_NOT_FOUND` で落ちる。
+  Cargo 1.100 から `target/debug/deps` に置いても効かない
 
   ```bash
   cp vendor/ffmpeg/bin/*.dll target/debug/deps/

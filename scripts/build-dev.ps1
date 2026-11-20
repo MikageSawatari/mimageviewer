@@ -300,13 +300,9 @@ try {
         throw "[build-dev] music-video editor was not produced: $musicvideoExe"
     }
 
+    & (Join-Path $PSScriptRoot 'setup-test-dlls.ps1') -RepoRoot $repoRoot -TargetDir $targetDir -CargoProfile dev-runtime
+
     $copies = @(
-        @{ src = 'vendor\ffmpeg\bin\avcodec-61.dll'; dst = 'avcodec-61.dll' }
-        @{ src = 'vendor\ffmpeg\bin\avformat-61.dll'; dst = 'avformat-61.dll' }
-        @{ src = 'vendor\ffmpeg\bin\avutil-59.dll'; dst = 'avutil-59.dll' }
-        @{ src = 'vendor\ffmpeg\bin\avfilter-10.dll'; dst = 'avfilter-10.dll' }
-        @{ src = 'vendor\ffmpeg\bin\swscale-8.dll'; dst = 'swscale-8.dll' }
-        @{ src = 'vendor\ffmpeg\bin\swresample-5.dll'; dst = 'swresample-5.dll' }
         @{ src = 'vendor\vcrt\msvcp140.dll'; dst = 'msvcp140.dll' }
         @{ src = 'vendor\vcrt\msvcp140_1.dll'; dst = 'msvcp140_1.dll' }
         @{ src = 'vendor\vcrt\vcruntime140.dll'; dst = 'vcruntime140.dll' }

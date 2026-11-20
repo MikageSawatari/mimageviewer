@@ -1,9 +1,12 @@
+#[path = "crates/launcher/src/build_output_paths.rs"]
+mod build_output_paths;
 #[path = "config/miv-sound.rs"]
 mod miv_sound_config;
 #[path = "build/still_image_shaders.rs"]
 mod still_image_shaders;
 
 fn main() {
+    println!("cargo:rerun-if-changed=crates/launcher/src/build_output_paths.rs");
     println!("cargo:rerun-if-changed=config/miv-sound.rs");
     println!("cargo:rerun-if-env-changed=MIV_SOUND_CANDIDATE");
     let root = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -17,7 +20,11 @@ fn main() {
             "Invalid mIV Sound candidate ID"
         );
         let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
-        let profile = out.ancestors().nth(3).and_then(|p| p.file_name()).unwrap();
+        let profile_dir = build_output_paths::profile_dir_from_out_dir(&out, "mimageviewer")
+            .unwrap_or_else(|error| {
+                panic!("Cannot resolve candidate profile from OUT_DIR: {error}")
+            });
+        let profile = profile_dir.file_name().unwrap();
         assert!(
             profile == "debug" || profile == "dev-runtime",
             "Candidate inputs are only for development verification; release requires approval"

@@ -244,6 +244,29 @@ fixtureとログは残し、約1.4 GBの空き容量が必要。実画像59.1 GB
 仕様根拠: [nextest JUnit](https://nexte.st/docs/machine-readable/junit/)、
 [filterset](https://nexte.st/docs/filtersets/reference/)。
 
+### テスト前の FFmpeg DLL 配置
+
+新しい worktree・`cargo clean` 後・`cargo test` を直接打つ前には、次を1回実行する。
+`vendor/ffmpeg/bin` の必須6 DLLを Cargo の base output directory (`target/debug/`) へ
+実体コピーする。同じ内容なら書き直さず、不足時はセットアップ案内付きで停止する。
+
+```powershell
+.\scripts\setup-test-dlls.ps1
+# 別 profile のテストでは、その Cargo profile 名を指定する。
+.\scripts\setup-test-dlls.ps1 -CargoProfile dev-runtime
+```
+
+`test` / `dev` は `debug`、`bench` は `release`、他は同名の出力先になる。
+出力 root は `cargo metadata --no-deps --format-version 1` の `target_directory` を使う。
+明示する場合は `-TargetDir <path>` を指定できる。
+`test-lib-full.ps1` / `test-focused.ps1` / `test-full.ps1` / `build-dev.ps1` は自分で呼ぶ
+(`test-focused.ps1 -PlanOnly` はコピーしない)。
+
+Cargo 1.100 ではテスト実行体が `target/debug/deps/` から
+`target/debug/build/<package>/<hash>/out/` へ移った。`deps/` に置く従来の方法では
+実行体の隣にならず、`cargo test` の DLL 解決には効かない。Cargo と nextest が PATH に
+加える base output directory に配置する。スクリプトは `deps/` の既存ファイルに触れない。
+
 ### ビルドキャッシュの容量管理
 
 リリース成果物と検証記録を確保した区切りで、`target`の容量内訳を確認する。
@@ -263,8 +286,8 @@ fixtureとログは残し、約1.4 GBの空き容量が必要。実画像59.1 GB
 `target-portable-test-script`、調査用の入れ子 cargo 出力 3 つ (`codex-v330-p1/debug`、
 `section243-focused-20260915/debug`、`v370-work/debug`)、`mimageviewer-musicvideo` と
 `mimageviewer-xpost` の `target`、統合済み worktree `mimageviewer-dupe` 一式。reparse point は 0 件。
-`dev-runtime`・`release`・検証記録は保持した。`target/debug` を消すとテスト実行体の隣の
-FFmpeg DLL も消えるので、`vendor/ffmpeg/bin/*.dll` を `target/debug/deps/` へ置き直す。
+`dev-runtime`・`release`・検証記録は保持した。`target/debug` を消すとテスト用の
+FFmpeg DLL も消えるので、`.\scripts\setup-test-dlls.ps1` で置き直す (上の配置手順を参照)。
 
 ### dev / test プロファイル
 

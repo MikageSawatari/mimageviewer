@@ -159,7 +159,7 @@ $appDataProcessNames = @(
 )
 # Executables this build actually produces or locks. Everything else keeps running.
 # A prefix match on "mimageviewer*" also catches Cargo's test harnesses, which are named
-# target\debug\deps\mimageviewer-<hash>.exe and live under the repo root - stopping those
+# target\debug\build\mimageviewer\<hash>\out\mimageviewer-<hash>.exe and live under the repo root - stopping those
 # killed another session's `cargo test` during the v2.8.0 release (backlog 5.3).
 $stoppableProcessNames = @(
     'mimageviewer',

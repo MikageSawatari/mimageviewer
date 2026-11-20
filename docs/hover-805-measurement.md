@@ -111,7 +111,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\mikag\AppData\Local
 初回 native build の MSBuild 並列実行で失敗したため、この測定では Cargo の並列数を1に限定する。
 runner 自体は常に通し、ロック制限を迂回しない。一時領域・依存物・成果物はこのツリー内に置く。
 新規 worktree の test exe が `0xc0000135` でテスト0件のまま終了した場合は、
-`vendor/ffmpeg/bin/*.dll` を `target/dev-runtime/deps/` へコピーして同じ runner で実行する。
+`.\scripts\setup-test-dlls.ps1 -CargoProfile dev-runtime` で `target/dev-runtime/` へ置いてから同じ runner で実行する
+(Cargo 1.100 から `deps/` に置いても効かない)。
 
 ## 実行結果
 
