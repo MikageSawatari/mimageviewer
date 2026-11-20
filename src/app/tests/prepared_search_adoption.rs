@@ -549,3 +549,172 @@ fn tag_nonempty_query_zero_results_uses_prepared_index_on_initial_and_repeat() {
         assert_exact_index(&app);
     }
 }
+
+#[cfg(windows)]
+struct SearchSiblingSnapshot {
+    index: Arc<PreparedPageIdentityIndex>,
+    items: Vec<GridItem>,
+    generation: u64,
+    selected: Option<usize>,
+}
+
+#[cfg(windows)]
+fn park_search_sibling(app: &mut App, folder: PathBuf) -> (ViewerContextId, SearchSiblingSnapshot) {
+    // Use the same independent, at-rest window bundle as the sidecar hydration
+    // sibling tests. No native window or viewport is created by this fixture.
+    let window = app.allocate_detached_viewer_window_id();
+    let sibling = app.build_window_context_for_test(window, |owner| {
+        owner.current_folder = Some(folder.clone());
+        owner.install_new_items(
+            ["one.jpg", "two.jpg", "three.jpg"]
+                .map(|name| GridItem::Image(folder.join(name)))
+                .into(),
+            vec![None; 3],
+        );
+        owner.page_identity_index = Arc::new(PreparedPageIdentityIndex::prepare(
+            &owner.items,
+            None,
+            owner.settings.file_type_visibility.clone(),
+        ));
+        owner.selected = Some(1);
+        owner.set_detached_window_binding_for_test(Some(window));
+    });
+    assert_ne!(sibling, app.viewer_context_main());
+    assert_eq!(app.viewer_context_window(sibling), Some(window));
+    assert_eq!(
+        app.viewer_context_residence(sibling),
+        viewer_context_registry::ContextResidence::AtRest
+    );
+    let before = app
+        .with_viewer_context(sibling, |owner| SearchSiblingSnapshot {
+            index: Arc::clone(&owner.page_identity_index),
+            items: owner.items.clone(),
+            generation: owner.items_generation,
+            selected: owner.selected,
+        })
+        .expect("the independent sibling bundle must be retained");
+    assert!(!Arc::ptr_eq(&before.index, &app.page_identity_index));
+    (sibling, before)
+}
+
+#[cfg(windows)]
+fn assert_search_sibling_unchanged(
+    app: &mut App,
+    sibling: ViewerContextId,
+    before: &SearchSiblingSnapshot,
+) {
+    assert_eq!(
+        app.viewer_context_residence(sibling),
+        viewer_context_registry::ContextResidence::AtRest
+    );
+    app.with_viewer_context(sibling, |owner| {
+        assert!(Arc::ptr_eq(&owner.page_identity_index, &before.index));
+        assert_eq!(owner.items, before.items);
+        assert_eq!(owner.items_generation, before.generation);
+        assert_eq!(owner.selected, before.selected);
+    })
+    .expect("search adoption must preserve the sibling bundle");
+    assert_eq!(
+        app.viewer_context_residence(sibling),
+        viewer_context_registry::ContextResidence::AtRest
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn favorite_prepared_adoption_preserves_parked_sibling_context() {
+    let mut app = setup_app_for_test();
+    app.open_favsearch();
+    let sibling_folder = app.tmp.path().join("favorite-sibling");
+    let (sibling, before) = park_search_sibling(&mut app, sibling_folder);
+    let prepared = prepare_favsearch_results(
+        vec![
+            indexed(app.tmp.path().join("alpha"), IndexKind::Folder),
+            indexed(app.tmp.path().join("alpha.pdf"), IndexKind::PdfFile),
+        ],
+        &app.settings,
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let expected_items = prepared.rows.items.clone();
+    let index = Arc::clone(&prepared.rows.page_identity_index);
+    let generation = app.items_generation;
+    app.apply_prepared_favsearch_results(prepared);
+    assert_eq!(app.items, expected_items);
+    assert_ne!(app.items_generation, generation);
+    assert!(Arc::ptr_eq(&app.page_identity_index, &index));
+    assert!(!app.sidecar_restore_active());
+    assert_search_sibling_unchanged(&mut app, sibling, &before);
+    assert!(Arc::ptr_eq(&app.page_identity_index, &index));
+}
+
+#[cfg(windows)]
+#[test]
+fn tag_initial_prepared_adoption_preserves_parked_sibling_context() {
+    let mut app = setup_app_for_test();
+    app.tag_view.active = true;
+    app.tag_view.last_executed = "alpha".into();
+    let sibling_folder = app.tmp.path().join("tag-initial-sibling");
+    let (sibling, before) = park_search_sibling(&mut app, sibling_folder);
+    assert!(
+        !app.items_are_tag_view,
+        "exercise the initial install branch"
+    );
+    let prepared = PreparedTagViewResult::prepare(
+        tag_result(vec![tagged(
+            app.tmp.path().join("alpha.jpg"),
+            TagViewItemKind::Image,
+            11,
+        )]),
+        &app.settings,
+    );
+    let expected_items = prepared.rows.items.clone();
+    let index = Arc::clone(&prepared.rows.page_identity_index);
+    let generation = app.items_generation;
+    app.apply_prepared_tag_view_result(prepared);
+    assert!(app.items_are_tag_view);
+    assert_eq!(app.items, expected_items);
+    assert_ne!(app.items_generation, generation);
+    assert!(Arc::ptr_eq(&app.page_identity_index, &index));
+    assert!(!app.sidecar_restore_active());
+    assert_search_sibling_unchanged(&mut app, sibling, &before);
+    assert!(Arc::ptr_eq(&app.page_identity_index, &index));
+}
+
+#[cfg(windows)]
+#[test]
+fn tag_repeat_prepared_adoption_preserves_parked_sibling_context() {
+    let mut app = setup_app_for_test();
+    app.tag_view.active = true;
+    app.tag_view.last_executed = "alpha".into();
+    let initial = PreparedTagViewResult::prepare(
+        tag_result(vec![tagged(
+            app.tmp.path().join("old.jpg"),
+            TagViewItemKind::Image,
+            10,
+        )]),
+        &app.settings,
+    );
+    app.apply_prepared_tag_view_result(initial);
+    assert!(app.items_are_tag_view, "exercise the repeat install branch");
+    let sibling_folder = app.tmp.path().join("tag-repeat-sibling");
+    let (sibling, before) = park_search_sibling(&mut app, sibling_folder);
+    let prepared = PreparedTagViewResult::prepare(
+        tag_result(vec![
+            tagged(app.tmp.path().join("new.jpg"), TagViewItemKind::Image, 11),
+            tagged(app.tmp.path().join("old.jpg"), TagViewItemKind::Image, 10),
+        ]),
+        &app.settings,
+    );
+    let expected_items = prepared.rows.items.clone();
+    let index = Arc::clone(&prepared.rows.page_identity_index);
+    let generation = app.items_generation;
+    app.apply_prepared_tag_view_result(prepared);
+    assert!(app.items_are_tag_view);
+    assert_eq!(app.items, expected_items);
+    assert_ne!(app.items_generation, generation);
+    assert!(Arc::ptr_eq(&app.page_identity_index, &index));
+    assert!(!app.sidecar_restore_active());
+    assert_search_sibling_unchanged(&mut app, sibling, &before);
+    assert!(Arc::ptr_eq(&app.page_identity_index, &index));
+}
