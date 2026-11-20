@@ -1180,10 +1180,13 @@ fn shutdown_deadline() -> std::time::Instant {
     *DEADLINE.get_or_init(|| std::time::Instant::now() + std::time::Duration::from_secs(2))
 }
 
-fn finish_logs_until(deadline: std::time::Instant) {
+/// Stop both diagnostic writers and report whether they finished successfully
+/// within the shared deadline. Call only after all log producers have stopped.
+pub fn finish_logs_until(deadline: std::time::Instant) -> bool {
     logger::log("logging shutdown requested");
-    let _ = log_writer::shutdown_until(deadline);
-    let _ = miv_startup::shutdown_until(deadline);
+    let logs_saved = log_writer::shutdown_until(deadline);
+    let startup_saved = miv_startup::shutdown_until(deadline);
+    logs_saved && startup_saved
 }
 
 pub fn finish_logs() {
