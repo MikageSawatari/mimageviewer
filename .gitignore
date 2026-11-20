@@ -46,6 +46,8 @@ bench_thumbs.tsv
 /codex-review*.md
 # 内部用ローカルドキュメント (公開リポジトリに載せない: 競合分析・他プロジェクトの欠点記載など)
 /internal/
+# note 記事シリーズの下書き・運用メモ (公開リポジトリに載せない。2026-11-21 利用者指示)
+/docs/note-series/
 # Codex verify / sandbox の一時ディレクトリ (CACHEDIR.TAG のみのスクラッチ)
 /codex_verify_*/
 # Benchmark output (scripts/bench-overnight.ps1)
