@@ -68662,7 +68662,8 @@ mod tests {
                 phase: egui::TouchPhase::Move,
                 source: egui::MouseWheelSource::Unknown,
             });
-            harness.run();
+            // wheelの平滑化を既存のscroll-layout検査と同じ固定フレーム数だけ進める。
+            harness.run_steps(40);
             let after = layout(&harness.ctx);
             after.assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
             let (last, _, _): (egui::Rect, egui::Rect, egui::Rect) = harness.ctx.data(|data| {
