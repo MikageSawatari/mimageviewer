@@ -75,8 +75,9 @@ fn reading_order_overflow_is_global_in_all_image_modes_and_closes_like_existing_
         fs_overflow_panel_body_row_count(FsOverflowPanelState::PageReadingOrder),
         3
     );
+    // §1.830 added the detached viewer toggle row after the fixed items.
     assert_eq!(
         fs_overflow_panel_body_row_count(FsOverflowPanelState::Root),
-        11
+        12
     );
 }
