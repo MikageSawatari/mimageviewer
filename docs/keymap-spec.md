@@ -414,6 +414,11 @@ target作成時に捕捉する。dispatchは保存したsourceをチェック集
 
 ## その他の個別操作
 
+静止画・動画の「その他の機能」の「別ウィンドウ表示」行は、`ToggleDetachedViewerMode` の
+先頭 chord を表示し、F12 と同じ toggle を呼ぶ。割り当てが無ければ括弧を表示しない。
+新しい `KeyAction` や既定キーは追加しない。別ウィンドウ内にも同じ行を表示し、
+毎回新しい窓で開く独立静止画窓では、既存の F12 と同じ理由で行を無効にする。
+
 `FsPageTurnAnimationToggle` は `FsImage` / `Press`、既定キーなしの操作。
 静止画フルスクリーンの「その他の機能」の他のON/OFF行と同様にKeyActionを持ち、
 操作カスタマイズでキーを割り当てられる。HUD行には割り当てた先頭chordを表示する。

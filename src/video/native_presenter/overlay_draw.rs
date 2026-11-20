@@ -4710,6 +4710,8 @@ fn draw_native_more_popup(
     full_rect: egui::Rect,
     button_rect: egui::Rect,
     current: crate::settings::VideoDeinterlaceMode,
+    detached_viewer_on: bool,
+    detached_viewer_shortcut: Option<&str>,
     popup_open: &mut bool,
     popup_rect_out: &mut Option<egui::Rect>,
     commands: &mut Vec<NativeOverlayCommand>,
@@ -4726,9 +4728,17 @@ fn draw_native_more_popup(
             (full_rect.width() - 40.0).clamp(120.0, 360.0),
         )
     });
+    let detached_label = native_label_with_shortcut("別ウィンドウ表示", detached_viewer_shortcut);
+    let detached_font = egui::FontId::proportional(13.0);
+    let detached_label = ctx.fonts_mut(|fonts| {
+        fonts.layout_no_wrap(detached_label, detached_font.clone(), egui::Color32::WHITE)
+    });
     let popup_size = egui::vec2(
-        (note.size().x + 24.0).max(180.0),
-        64.0 + 3.0 * NATIVE_MORE_POPUP_ROW_HEIGHT + 12.0 + note.size().y + 12.0,
+        (note.size().x + 24.0)
+            .max(detached_label.size().x + 72.0)
+            .max(180.0)
+            .min((full_rect.width() - 16.0).max(180.0)),
+        64.0 + 4.0 * NATIVE_MORE_POPUP_ROW_HEIGHT + 12.0 + note.size().y + 12.0,
     );
     let popup_rect = native_panorama_projection_popup_rect(
         full_rect,
@@ -4759,7 +4769,11 @@ fn draw_native_more_popup(
             );
             for (label, y, size) in [
                 ("その他の機能", 16.0, 11.0),
-                ("デインターレース", 46.0, 13.0),
+                (
+                    "デインターレース",
+                    46.0 + NATIVE_MORE_POPUP_ROW_HEIGHT,
+                    13.0,
+                ),
             ] {
                 painter.text(
                     rect.min + egui::vec2(12.0, y),
@@ -4768,6 +4782,44 @@ fn draw_native_more_popup(
                     egui::FontId::proportional(size),
                     ui.visuals().text_color(),
                 );
+            }
+            let detached_rect = native_more_popup_detached_row_rect(rect);
+            let response = ui.interact(
+                detached_rect,
+                egui::Id::unique("native_video_detached_viewer"),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(
+                painter,
+                detached_rect,
+                response.hovered(),
+                detached_viewer_on,
+            );
+            let label_rect = egui::Rect::from_min_max(
+                detached_rect.min + egui::vec2(8.0, 0.0),
+                detached_rect.max - egui::vec2(48.0, 0.0),
+            );
+            painter.with_clip_rect(label_rect).galley(
+                egui::pos2(
+                    label_rect.left(),
+                    detached_rect.center().y - detached_label.size().y / 2.0,
+                ),
+                detached_label.clone(),
+                ui.visuals().text_color(),
+            );
+            painter.text(
+                egui::pos2(detached_rect.right() - 8.0, detached_rect.center().y),
+                egui::Align2::RIGHT_CENTER,
+                if detached_viewer_on { "ON" } else { "OFF" },
+                detached_font.clone(),
+                ui.visuals().text_color(),
+            );
+            if response.hovered() {
+                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            if response.clicked() {
+                commands.push(NativeOverlayCommand::ToggleDetachedViewerMode);
+                *popup_open = false;
             }
             for (row, &mode) in crate::settings::VideoDeinterlaceMode::all()
                 .iter()
@@ -4825,9 +4877,16 @@ fn draw_native_more_popup(
 
 const NATIVE_MORE_POPUP_ROW_HEIGHT: f32 = 32.0;
 
+pub(super) fn native_more_popup_detached_row_rect(rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        rect.min + egui::vec2(4.0, 30.0),
+        egui::vec2(rect.width() - 8.0, NATIVE_MORE_POPUP_ROW_HEIGHT - 4.0),
+    )
+}
+
 pub(super) fn native_more_popup_row_rect(rect: egui::Rect, row: usize) -> egui::Rect {
     egui::Rect::from_min_size(
-        rect.min + egui::vec2(4.0, 64.0 + row as f32 * NATIVE_MORE_POPUP_ROW_HEIGHT),
+        rect.min + egui::vec2(4.0, 64.0 + (row + 1) as f32 * NATIVE_MORE_POPUP_ROW_HEIGHT),
         egui::vec2(rect.width() - 8.0, NATIVE_MORE_POPUP_ROW_HEIGHT - 4.0),
     )
 }
@@ -5339,6 +5398,8 @@ pub(super) fn draw_native_top_bar(
             metadata.map_or(crate::settings::VideoDeinterlaceMode::Auto, |metadata| {
                 metadata.deinterlace_mode
             }),
+            metadata.is_some_and(|metadata| metadata.detached_viewer_on),
+            metadata.and_then(|metadata| metadata.shortcuts.detached_viewer.as_deref()),
             more_popup_open,
             more_popup_rect_out,
             commands,
@@ -8583,6 +8644,7 @@ pub(crate) mod tests {
             d3d11va_supported: true,
             deinterlace_mode: crate::settings::VideoDeinterlaceMode::Auto,
             deinterlace_manual: false,
+            detached_viewer_on: false,
             last_present_path: crate::video::decoder::PresentPathSnapshot::Gpu,
             deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Inactive,
             interlace_detected: false,
@@ -9934,6 +9996,7 @@ pub(crate) mod tests {
         );
         metadata.deinterlace_mode = crate::settings::VideoDeinterlaceMode::On;
         metadata.deinterlace_manual = true;
+        metadata.shortcuts.detached_viewer = Some("F12".into());
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(540.0, 330.0))
             .build_ui(move |root_ui| {

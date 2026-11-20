@@ -1458,6 +1458,20 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-20 §1.830 全画面の「…」から別ウィンドウ表示を切り替える（実装済み・実機未確認）
+
+設計正本は [§1.830 設計メモ](fullscreen-overflow-detached-toggle-830-plan.md)。
+既存 toggle の remote → 音声モード → 所有 source-swap の拒否順を保ち、続く経路選択だけを
+`detached_toggle_route()` へ切り出す。行の ON / OFF と無効理由も同じ分類から導出する。
+静止画の Root 末尾行と native 動画 popup の行を追加し、native command / event・両変換・
+ParkedLive の HUD クリック分類・metadata を既存の source epoch / 所有 context 経路へ接続した。
+`fs_overflow_panel_state` は App 全体の前面状態のまま保持し、context bundle へ移さない。
+行の操作はパネルを閉じてから共通 toggle を呼び、別窓へ開状態を持ち越す組み合わせを作らない。
+新しい App の bool / Option / pending、待機・再試行・一括 reset は追加しない。
+ClaudeCode と独立レビュアー（実装前 r1 ACCEPT、設計メモ §10）は、既存の所有境界で入口を合流させる
+構造的変更であり症状パッチではないことに合意済み。実装後の独立レビューは未実施。
+回帰テストを追加したが、利用者指定によりコンパイル・テスト実行・PNG 再生成・検証用ビルドは未実施。
+
 ### 2026-11-20 §1.476 タグ欄の検索確定（案 A、実機未確認）
 
 設計担当からの利用者決定に従い、`render_tag_view_bar` の入力変更による検索の受付だけを変更。
