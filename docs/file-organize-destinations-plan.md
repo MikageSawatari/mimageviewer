@@ -126,6 +126,10 @@ App が持つ新しい状態は、この機能の一つの request owner（非�
 
 ### 5.2 Shell への直接依頼
 
+§1.464 ではツリーへのドロップも同じ `FileOrganizeRequest::Running` を使う。副作用の無い `shell_transfer_admission` を形の公開と投入時に共有し、整理先は `take_for_submission` で Selecting を一度消費してから `submit_shell_transfer` へ渡す。Remote・終了・HWND・各モーダル・sidecar 復元・ツリー無効を同じ述語で拒否する。本棚自身・配下の判定は投入時に `book_root_path()` を一回呼んで行い、「本棚の中へは移動・コピーできません」と通知して拒否する。毎 pass の述語や行の表示では本棚パスを解決しない。受理したときだけ `admit_book_append_followup_mutation` を呼び、既に Running の要求は消さない。
+
+転送は `shell_file_ops::transfer_items_blocking` に検証と STA 実行を集約し、`transfer_items_async` が呼ぶ。ツリーの既定 Move 要求だけ、検証前にボリュームを調べ、不一致・取得失敗なら Copy へ下げる。予告が Copy または明示 Move の要求は変えない。整理先からの要求は常に明示操作として扱う。
+
 1. 行のボタン／Enter は、worker 投入直前の共通入口一か所へ集約する。そこで request enum が選択中であること、`remote_session_blocks_local_control()` が false、終了要求がないことを確認する。終了判定には既存 `shutdown_requested`、tray の quit request、main/root の close request を使い、新しいフラグは足さない (`src/remote_ipc/ui.rs:977`、`src/tray_integration.rs:120`、`同:223`)。Remote 所有／終了要求なら選択中の要求を破棄して画面を閉じ、実行しなかった理由を通知する。選択中以外からは投入せず、既に実行中の要求を消さない。受理する場合だけ選択中の所有権を一度消費し、捕捉済みの対象・整理先・main owner HWND で実行中へ移す。pointer＋Enter の二回目には消費できる選択要求がない。HWND がなければ同じく通知して開始しない。選択画面を閉じ、独自進捗／取消画面は重ねない。
 2. `shell_file_ops.rs` の既存 async 呼出しの形を拡張する。COM／Shell item の構築、パス検証、重い I/O、`PerformOperations` は STA worker の中だけ。UI から同期 join／待機を行わない。一般化は STA guard 等の必要な共通部分に留め、delete worker の purge／retry を統合しない。
 3. 整理先を実ディレクトリとして確認し、全対象を queue できることを確認してから `CopyItem / MoveItem` を一つの `IFileOperation` に予約し、`PerformOperations` を一回呼ぶ。予約段階で失敗したら実行せず通知する。クリップボードを用いた cut→paste や PowerShell コピーには迂回しない。
@@ -152,6 +156,8 @@ App が持つ新しい状態は、この機能の一つの request owner（非�
 同じ親への移動判定は `canonicalize(source.parent())` と整理先を比較する。junction 本体の置かれた親を、リンク先の親と取り違えない。自己配下判定は従来どおり `canonicalize(source)` を用い、Shell に渡す元パスは選択時のまま維持する。
 
 ### 5.4 完了後はエクスプローラーで移動した場合と同じ扱い
+
+§1.464 では完了の同じ境界で、先のフォルダと各元の親に `folder_pane.observe_accepted_folder(path)` を送り、ツリー直下を再確認する。整理先とツリーへのドロップの両方に適用する。以下の通常一覧の `Notified` 一回と、保持 context を専用に変更しない規則は維持する。
 
 成功、途中取消、部分失敗、channel 終了で実行中の request を非表示へ戻し、必要な終端通知を行う。**完了時に現在表示している実フォルダが、要求した source の親フォルダのいずれか／整理先と一致すれば、既存の外部変更再確認を一回要求するだけ**。一覧を移動済みなら元の場所へ戻さず、無関係な現在地は再確認しない。コピーも同じ扱い。要求元の index／context を完了反映のために保持しない。
 

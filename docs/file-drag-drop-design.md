@@ -9,6 +9,7 @@
 
 **改訂履歴**:
 
+- 2026-11-20: §1.464 は [folder-tree-dnd-plan.md](folder-tree-dnd-plan.md) が正本。ROOT の受け取りを自前 OLE target へ置き換え、表示済み pass の形でツリー行を判定する。内部の移動・コピーは整理先と同じ Shell worker へ送り、外への送出効果は COPY のまま。generic Shell image と target の drop description を使い、独立した SetFlags・InitializeFrom*・custom IDropSource は追加しない。検証の実施状況は正本の実装記録を参照。
 - 2026-07-24: 一覧のクリック選択方式 (チェック方式 / エクスプローラー方式) を追加。
   `handle_cell_interaction` の選択状態遷移だけを共通 helper 化し、
   `drag_started_by(Primary)` と `decide_drag_payload()` の D&D 経路は変更しない。
@@ -235,7 +236,12 @@ where P1: Param<IDataObject>, P2: Param<IDropSource>;
 /// 指定パス群の OLE ドラッグ＆ドロップ (コピー) を開始する。
 /// この関数は SHDoDragDrop が戻る (ドロップ完了 or キャンセル) までブロックする。
 /// UI スレッドから、かつマウスボタンが押下中に呼ぶこと。
-pub fn start_file_drag(hwnd: isize, paths: &[std::path::PathBuf]) -> DragOutcome;
+pub(crate) fn start_file_drag(
+    hwnd: isize,
+    paths: &[std::path::PathBuf],
+    excluded_virtual: bool,
+    shared: &crate::main_drop_target::SharedMainDrop,
+) -> DragOutcome;
 
 /// `start_file_drag` の結果。呼び出し側 (§5.5b) はこれを見て
 /// ポインタリセットの要否・失敗トーストの要否を判断する。
@@ -255,7 +261,7 @@ pub struct DragOutcome {
 }
 // 構築は private コンストラクタ経由: not_started() / failed_before_start(failed,
 // error) / after_modal(failed, error, dropped)。started を取り違えないようにするため。
-// effect の数値はログ、dropped は mIV 自身への落下判定にだけ使う。
+// effect の数値はログ、dropped は drop の受理だけを表す。内部 drop は共有要求で判定する。
 
 /// `start_file_drag` の COM ステップ別エラー。どこで失敗したかを呼び出し側が
 /// 区別できるようにする (主にログの切り分け用)。
@@ -317,6 +323,8 @@ pub enum FileDragError {
    失敗したら `DragOutcome::failed_before_start(failed, FileDragError::BindToHandler(hr))`。
 7. §12 の送出専用 `DragDataObject` で inner を包み、async mode を有効にする。
    設定失敗は `AsyncCapability` の開始前失敗として通知し、黙って同期へ切り替えない。
+   §1.464 では Shell 解決前の全 `paths`、`excluded_virtual`、解決で得た `failed_paths` を
+   `MainDropShared::internal` に置いてから次を呼び、戻った直後に消す。共有状態の借用を COM 呼び出しへ持ち越さない。
    `SHDoDragDrop(Some(HWND(hwnd as *mut _)), &drag.data, None::<&IDropSource>,
    DROPEFFECT_COPY)` を呼ぶ。OLE モーダル区間はブロックする。
 8. 復帰時は成否・effect に関係なく `finish_modal` で InOperation を確認する。
@@ -403,8 +411,8 @@ pub(crate) struct PendingNativeDrag {
 動かなければ `clicked()` のどちらか一方しか発火しない。したがって:
 
 - **ドラッグ送出は modifier の有無に関わらず `drag_started_by(Primary)` で開始する。**
-  mIV は COPY 限定 (§6.4) なので、Ctrl (コピー強制) / Shift (移動強制) を握っていても
-  挙動は変わらない。OS 側がカーソル装飾を変える程度。
+  外部への許可効果は COPY 限定 (§6.4)。mIV のツリー行では OLE から渡される Ctrl / Shift を使い、
+  コピー／移動を決める。既定はルートの字句比較で予告し、worker は既定の Move だけボリュームを確認して必要なら Copy へ下げる。
 - Ctrl+クリック / Shift+クリックによる選択操作は `clicked()` 側のまま不変。drag とは
   co-fire しないので競合しない。
 - 既知のトレードオフ: Ctrl+クリックのつもりでもポインタが egui のドラッグ閾値
@@ -524,7 +532,10 @@ if std::mem::take(&mut self.native_drag_just_finished) {
 if let Some(PendingNativeDrag { paths, post_drag_toast }) = self.pending_native_drag.take() {
     match self.main_hwnd {
         Some(hwnd) => {
-            let outcome = crate::file_drag::start_file_drag(hwnd, &paths); // モーダルブロック
+            let outcome = crate::file_drag::start_file_drag(
+                hwnd, &paths, post_drag_toast.is_some(), &self.main_drop,
+            ); // モーダルブロック
+            self.consume_main_drops(ctx); // 内部 Drop の要求も外部と同じ投入境界へ
 
             // SHDoDragDrop に到達したときだけポインタリセットが要る (§5.1 / §6.1)。
             // 未到達 (paths 全滅・COM 失敗) なら winit が通常どおり WM_LBUTTONUP を
@@ -654,12 +665,13 @@ COM 呼び出しを配送し、source 側に独自 pump・転送完了待ち・�
 呼びたい」等で自前初期化が必要になったら、`Drop` で必ず対応する `OleUninitialize` を
 呼ぶ RAII ガード型に包む (アンバランスを型で防ぐ)。
 
-### 6.4 コピー限定 (移動を許さない)
+### 6.4 外部への送出はコピー限定
 
 `dwOKEffects` を `DROPEFFECT_COPY` のみにする。`DROPEFFECT_MOVE` を含めると、
 ドロップ先がデフォルトで MOVE を選んだ場合に **ユーザーの原本が移動してしまう** 事故に
 なりうる。ユーザー要望も「コピー」なので COPY 限定とする。`DROPEFFECT_LINK`
-(ショートカット作成) を加えるかは任意 — 当面は COPY のみ。
+(ショートカット作成) も加えず COPY のみ。§1.464 の内部移動は target が捕捉済みの全パスで
+`IFileOperation` を実行し、OLE へは COPY を返す。source の復帰 effect で原本を削除しない。
 
 ### 6.5 複数フォルダの同時ドラッグ
 
@@ -688,10 +700,10 @@ touch start から release / cancel まで抑止する。mouse-only frame は従
 
 ### 6.7 eframe の present タイミング
 
-§5.5(b) は「`update()` 末尾でブロックすると、このフレームの絵はまだ present されておらず
-画面には前フレームが残る」想定。eframe 0.33 が `update()` の戻り後にテッセレーション →
-present する順序であれば正しい。ドラッグ中に表示されるのは「ドラッグ開始 1 つ前の
-グリッド」になる — 実用上問題ないが、正確な present 順序は要確認。→ §8 Q6。
+§5.5(b) の `update()` 末尾ではその pass はまだ present されていない。§1.464 の当たり判定は
+`egui_wgpu::last_presented_pass(ctx, ROOT)` と一致する形だけを使う。vendor の `queue.present`
+が返った直後だけ番号を記録し、Surface Outdated・描画省略・capture だけのときは進めない。
+複数 pass のフレームでも、未表示の形やフレーム開始を表示済みの証拠に使わない。
 
 ## 7. テスト計画
 
@@ -822,79 +834,62 @@ CLAUDE.md「コード修正時のドキュメント同時更新」に従い、�
 
 ### 11.1 仕様
 
-> ⚠ **v1.1.0 で「フォルダのドロップ受け取り」は一旦無効化した** (同名衝突の無確認
-> 上書き・再帰コピーのデータ破壊リスクのため、Explorer 相当の衝突解決と合わせて将来へ
-> 延期)。現在はドロップされたディレクトリを `file_drag::partition_dropped_paths` で
-> **全て skip** し、ファイルのみコピーする (skip 件数は notice/toast で通知)。以下の
-> 自己再帰ガードや旧フローは、フォルダ再導入時に使う設計として残している。
-
-- エクスプローラ等から mIV ウィンドウへファイルをドロップすると、**現在表示中の実
-  フォルダへコピー** する (送出と対称の「ファイル整理」操作)。フォルダは上記のとおり skip。
+- エクスプローラ等から mIV の一覧へファイルやフォルダをドロップすると、**現在表示中の実
+  フォルダへコピー** する (送出と対称の「ファイル整理」操作)。§1.821 / Q5 によりフォルダも受け付ける。
 - コピー先は `App::current_favorite_target()` — 実ディレクトリ表示中だけ `Some`。
   ZIP / PDF / 変換アーカイブ表示中は `None` で **トーストで拒否**。
-- **検索結果ビュー (Ctrl+G 合成 / Ctrl+S favsearch) も拒否** する。これらは
+- **検索結果ビュー (Ctrl+G 合成 / Ctrl+S favsearch)・タグ表示も拒否** する。これらは
   `current_folder` を直前の実フォルダのまま残すため、`current_favorite_target()` だけ
   だと「直前のフォルダ」へ誤コピーしてしまう。`items_are_global_search_view` /
-  `favsearch.on_results_grid()` を明示的にチェックして拒否する (Codex 第 5 回 P2)。
-- **自己再帰ガード**: ドロップされたディレクトリが表示中フォルダ (= コピー先) の
-  祖先または自身だと、`Copy-Item -Recurse` が生成中のフォルダを再走査して無限増殖
-  する (例: `C:\A\B` 表示中に `C:\A` をドロップ → `C:\A\B\A\B\A...`)。該当ディレクトリは
-  コピー対象から除外する (Codex 第 5 回 P1)。ドライブルート / UNC 共有ルート
-  (`C:\` や `\\server\share`、`Path::file_name()` が `None`) は basename が無く
-  コピー先を一意化できないため、`dest` 自体がルート配下かで判定する (Codex 第 6 回 P1)。
-- 操作は **コピーのみ** (送出と同じ方針)。現行の外部ドロップ受け取りは
-  `Copy-Item -Force` 経路のため、同名既存ファイルは上書きされる。Ctrl+V の
-  クリップボード貼り付けは Windows Shell paste 経路で、衝突確認と進捗 UI は Windows 側に委ねる。
+  `favsearch.on_results_grid()` / `tag_view.on_results_grid()` / `items_are_tag_view` を明示的にチェックして拒否する。
+- **自身・配下へのコピーは要求全体を拒否**: `shell_file_ops::validate_transfer_request` が
+  全件を検証し、実体パスでコピー先が元フォルダ自身またはその配下なら Shell 実行前に拒否する。
+  有効なファイルと無効なフォルダが混在しても一部だけ実行しない。
+- 操作は **コピーのみ**。整理先と同じ STA の `IFileOperation` を使い、同名の衝突・進捗・取消・エラーは
+  Windows の画面へ委ねる。フラグは `FOF_ALLOWUNDO | FOFX_ADDUNDORECORD` で、取り消し履歴は Windows が持つ。
 
 ### 11.2 実装
 
-送出と違い COM ドラッグソースは不要。winit が `with_drag_and_drop` 既定 true で
-mIV ウィンドウを OS のドロップターゲットに登録済みで、eframe が
-`RawInput.dropped_files` にパスを届ける。よって実装は「それを読んで処理する」だけ。
+ROOT の HWND を得た最初のフレームで、winit が登録した受け取りを `RevokeDragDrop` →
+`RegisterDragDrop` で `main_drop_target` へ置き換える。OLE 初期化・破棄時の解除は winit が担当し、
+他 viewport の登録や経路には触れない。登録失敗はログと通知で終える。
 
-- `App::update` で `ctx.input(|i| i.raw.dropped_files)` を読み、`path` のあるものを
-  収集 → `handle_external_file_drop`。
+- `MainDropShared` は `Rc<RefCell<_>>` で UI STA に置く。各 pass の最後に全ペイン・clip・行全体の形を番号付きで公開し、
+  callback は表示済みの番号の形だけを使う。サイズ／DPI が変わったら NONE。手前のレイヤーと交差した行は全体を外す。
+- `TreeRow` は整理先と共有の受付・`FileOrganizeRequest::Running` へ投入する。`TreeNonTarget` は NONE で、
+  一覧へ流さない。`ExistingDropArea` の外部 drop だけ `GridFiles(paths)` を送り、App が
+  `handle_external_file_drop` を呼ぶ。sidecar 復元中は従来どおり捨てる。
+- 本棚自身・配下かどうかの判定はドラッグ中の形・受付には含めず、転送投入時に既存の `book_root_path()` を一回呼んで拒否する。
+  ツリーの「貼り付け」も有効判定では解決せず、押した時だけ確認する。既定パスの同期解決を毎 pass に増やさない (§1.464 設計 §16)。
+- callback は App・ファイルシステムに触れず、借用を COM 呼び出しやメッセージループ越しに保持しない。
+  内部 drag は `InternalDrag.paths` 全件を使い、仮想項目除外・パス解決失敗があれば拒否する。
 - `handle_external_file_drop`:
-  1. 検索結果ビュー (`items_are_global_search_view` / `favsearch.on_results_grid()`) なら
-     拒否トースト。
-  2. `current_favorite_target()` が `None` (ZIP/PDF 等) なら拒否トースト。
-  3. UI スレッドからは「N 件の項目をコピーしています…」トーストを即出して、検証 +
-     コピー起動 + 完了待ちを `file-drop-validate` worker thread に丸ごと投げる
-     (review #7 対応、`fs::canonicalize` × N が SMB 越しで UI を秒オーダー止めるのを回避)。
+  1. `viewer_mutation_modal_active()` なら拒否し、検索結果・タグ表示も拒否する。
+  2. `current_favorite_target()` が `None` (ZIP/PDF・本棚配下等) なら拒否トースト。
+  3. `admit_book_append_followup_mutation()` が通ったら、検証・Shell 実行を
+     `file-drop-validate` worker に投げ、「N 件の項目をコピーしています…」トーストを出す。
+     owner HWND は `main_hwnd` を渡す。UI スレッドで新しい同期 I/O は行わない。
 - worker (`file-drop-validate`) の処理:
-  1. `file_drag::partition_dropped_paths` で **ディレクトリを全て除外** (v1.1.0 で
-     フォルダ drop 無効化)。`folder_skipped` 件数は後段の notice/toast で通知する。
-     フォルダ再導入時はここで `dir_copy_would_recurse()` の自己再帰除外を併用する。
-  2. 残り 0 件 (= ドロップが全てフォルダ) なら `CopyOutcome::notice` に「フォルダのドロップは
-     現在無効です (N 件をスキップ)。ファイルのみコピーできます」をセットして送る (poll が
-     無音化しないよう notice 経由で必ず通知する)。ファイル + フォルダ混在で `folder_skipped`
-     が残った場合は、コピー完了後の `outcome.notice` に「フォルダ N 件はスキップしました」を補う。
-  3. 残りがあれば `copy_paths_into_folder` を呼んで内部 worker から `CopyOutcome` を受け取り、
-     UI へ転送。`recv()` の `Err` は `CopyOutcome::all_failed(attempted, reason)` で
-     全件失敗扱いに格上げする (Codex P2-1 対応: Disconnected を成功扱いに潰さない)。
-- `file_drag::dir_copy_would_recurse(src, dest)`: 両パスを `canonicalize` 正規化し、
-  コピー先 `dest/basename(src)` が `src` 自身または配下かを小文字化 + コンポーネント
-  単位の前方一致で判定する。純粋判定部 `copy_target_inside_src` はユニットテスト済み。
-  **v1.1.0 現在は未使用** (フォルダ drop を全 skip しているため)、フォルダ再導入用に保持。
-- コピーは `ui_dialogs::context_menu::copy_paths_into_folder` — **ディレクトリは skip し**
-  ファイルのみ `Copy-Item -LiteralPath -Force` (`-Recurse` なし) を `try/catch` で囲って失敗
-  カウントと先頭 5 件のエラーメッセージを stdout の `::FAILED::N` / `::ERR::msg` マーカーで
-  返す。spawn 失敗 /
-  tmp 書き込み失敗 / `powershell` 実行失敗 / 非ゼロ終了 / マーカー欠落はすべて
-  `failed=attempted` で報告する (Codex P2-1 対応: 旧実装は `SilentlyContinue` で全部
-  飲んでいた)。
+  1. ファイル・フォルダ全件を `ShellTransferRequest` (`operation: Copy`) にする。
+  2. `shell_file_ops::transfer_items_blocking` で `validate_transfer_request` → `run_transfer_items` を同期実行する。
+     整理先の `transfer_items_async` もこの入口を使い、検証と実行を重複させない。
+  3. 結果を `CopyOutcome` に写して UI へ送る。成功は通知なし、中断は notice
+     「操作が中断されました。処理済みの項目は元に戻りません」、`Err(msg)` は
+     `CopyOutcome::all_failed(attempted, msg)` で全件失敗として扱う。
+     件別の成否を Shell から受け取らないため、中断時の処理済み件数は報告しない。
 - UI 側の受け取り経路:
   - 完了は `App::drop_copy_pending: Vec<Receiver<CopyOutcome>>` に積まれ、
     `poll_file_drop_pending` が `pending_reload` を立てつつ:
     - `failed > 0` のとき「成功 K / 失敗 N (例: ...)」トーストを出す
-    - `notice = Some(_)` のとき (全件除外等) その文面をトーストで出す
+    - `notice = Some(_)` のとき (中断) その文面をトーストで出す
     - それ以外 (`failed == 0 && notice == None`) は静かに reload のみ
 
 ### 11.3 送出との非干渉
 
-`SHDoDragDrop` (送出) と winit の `RegisterDragDrop` (受け取り) は独立。送出実装は
-受け取りを壊さない (送出追加前から受け取りの下地はあったが、それを読むコードが
-無かっただけ)。
+送出の async wrapper (§12) と ROOT の受け取り owner は独立。`SHDoDragDrop` 前後だけ共有の
+`internal` を設定／解除し、Drop が積んだ要求を復帰直後に消費する。内部 drop はツリー行以外で NONE。
+`internal_drop_pending` / `cursor_over_window` の推定は削除する。外部への COPY・Shell 既定 IDropSource・
+非同期 data object の寿命契約は維持する。
 
 ## 12. §1.288 ドロップ後のコピーの非同期化 — 段1 設計メモ (2026-10-19)
 
@@ -921,12 +916,12 @@ Explorer がコピー完了まで処理するため、`App::update` が戻らな
   別の区間であり、今回 worker 化しない。開始前の大量パス・遅い共有の待ちは残る範囲外の課題。
 - `dwOKEffects` は **`DROPEFFECT_COPY` のみ**。MOVE / LINK は現在許可していない (§6.4)。
 - `effect` の数値はログに出すだけ。`effect != 0` を `DragOutcome.dropped` に変換し、
-  呼び出し側は mIV 自身への落下判定に使う。元ファイル削除やコピー成功通知には使わない。
+  drop の受理だけを表す。§1.464 では内部落下の推定に使わず、元ファイル削除やコピー成功通知にも使わない。
 - `shell_data_object_for_paths` は Copy/Cut、Open With 等でも共用される。
   **非同期対応は `start_file_drag` が送出直前に包む部分に限定**し、共有 helper の戻り値や
   クリップボードの完了通知・所有権には変更を入れない。
 
-不変条件は「既存の Shell データ形式・COPY 限定・ポインタ復旧・自己 drop 除外を保ち、
+不変条件は「既存の Shell データ形式・外への COPY 限定・ポインタ復旧を保ち、
 非同期対応 target へのドロップ後はコピー終了を UI が待たない」。全コピーをモーダルに
 する簡素化は、本件の解消対象を残すので採らない。代わりに **1ドラッグ1個の自己完結した
 COM owner** とし、App の一覧・選択・viewer context に非同期完了を戻さないことで、
@@ -1091,11 +1086,9 @@ eframe の `wgpu_integration::save_and_destroy` → `App::on_exit` / `on_exit_in
 
 ### 12.5 既存入力・effect・完了通知
 
-- **mIV 自身への drop:** winit の `drop_handler.rs` は `CF_HDROP` を同期取得し
-  `DroppedFile` を送るだけで、async interface に QI / Start しない。従ってここは同期経路のまま。
-  `outcome.started` によるポインタ復旧、`outcome.dropped && cursor_over_window(hwnd)` による
-  `internal_drop_pending` の設定、`input_drop_and_activity` の `dropped_files` 到着時の消費を
-  維持する。EndOperation を起点にこのフラグを変更しない。
+- **mIV 自身への drop:** §1.464 で ROOT の自前 target が捕捉済みの全パスから転送要求を作り、
+  async interface の QI / Start はしない。OLE へは COPY を返し、転送は復帰後に Shell worker で行う。
+  ツリー行以外は NONE。`outcome.started` によるポインタ復旧は維持し、旧来の自己落下推定は削除する。
 - **1件:** 件数しきい値で経路を分けず同じラッパーを使う。target が非同期を選ばなくても正常。
 - **Esc / 無効な場所で解放:** 通常は effect=NONE / In=FALSE。自己保持を解除し、従来の
   ポインタ復旧だけ行う。コピー完了待ちや新たな通知は作らない。
@@ -1103,13 +1096,14 @@ eframe の `wgpu_integration::save_and_destroy` → `App::on_exit` / `on_exit_in
   対応 target でも非同期を選ぶ義務はない。UI を強制的に先へ進める回避策は入れない。
 - **effect:** 非同期時の `SHDoDragDrop` 復帰は drop の引き渡しであり、コピー完了ではない。
   `DragOutcome.dropped` は引き続き「drop 受理」の判定。`EndOperation` の結果から
-  `dropped` / `internal_drop_pending` を後で書き換えない。現行トーストも対象除外・開始失敗の
+  `dropped` を後で書き換えない。現行トーストも対象除外・開始失敗の
   通知だけで、コピー成功を宣言していない。
 - **EndOperation の結果:** hr / effects と operation の終端は診断ログに残すが、App の
   選択解除、reload、原本削除、DB 書き込み、成功トーストには利用しない。コピー途中の
   エラー・同名確認・キャンセル UI は実行主体の Explorer が担う。COM 外側の開始設定等の
   失敗は黙って同期へ切り替えず、既存のドラッグ失敗通知へ通す。
-- **MOVE:** 現在は許可しないので、本修正でも COPY 限定を維持する。仮に将来 MOVE を
+- **外への MOVE:** 送出の許可効果は COPY 限定を維持する。§1.464 の内部移動は target が自身で転送し、
+  外部 target の非同期 MOVE 契約を追加しない。仮に将来、外への MOVE を
   許す場合、非同期 optimized move の移動・削除は受け取り側が行い、復帰時 effect を根拠に
   mIV が原本を削除してはいけない。非最適化 move / delete-on-paste は別の source 側責務が
   あり得るため、「非同期 MOVE は常に target が削除する」と全般化しない。最終結果は
@@ -1158,7 +1152,7 @@ Windows COM ユニット / headless integration で確認する:
 | disposable 原本の改名・移動・削除 | Explorer / ファイルシステムの通常の競合処理となり、mIV が別ファイルを代用したり復元したりしない |
 | コピー中の mIV 終了 | mIV の終了が完了する (ハングしない)、Explorer が固まらない。コピー結果は問わない (§12.4 の利用者決定) |
 | 1件・単体フォルダ・日本語 / UNC パス | 従来の送出結果・カーソル・drag image が維持される。非同期選択の有無は件数から決め付けない |
-| mIV 自身へ drop / Esc / 無効 target | 跳ね返りコピーをしない、クリック等が固着しない、自己保持が漏れない |
+| mIV 自身へ drop / Esc / 無効 target | ツリー行への要求だけ転送し、一覧・空白へ跳ね返りコピーをしない。クリック等が固着せず、自己保持が漏れない |
 | 非同期非対応の画像ソフト等 | 従来の CF_HDROP 受け取りが成立し、同期処理であっても破綻しない |
 
 診断にはドラッグごとの識別子、生成 STA thread ID、Set / Start / End、

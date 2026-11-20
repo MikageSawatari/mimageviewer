@@ -230,7 +230,95 @@ fn draw_folder_pane_row(
         }
         (arrow_resp, resp)
     });
-    (drawn.inner.0, drawn.inner.1, drawn.response.rect)
+    // Leading indentation is pane background, not a drop/paste destination.
+    let mut row_rect = drawn.response.rect;
+    row_rect.min.x = drawn.inner.0.rect.left();
+    (drawn.inner.0, drawn.inner.1, row_rect)
+}
+
+#[derive(Clone)]
+struct FolderPanePasteMenu {
+    path: std::path::PathBuf,
+    position: egui::Pos2,
+    files_available: bool,
+    opened_frame: u64,
+}
+
+pub(crate) fn folder_pane_paste_menu_id() -> egui::Id {
+    egui::Id::unique("folder_pane_paste_menu")
+}
+
+/// The tree context menu owns ROOT input just like the grid's context menu.
+/// Reuse the pre-input Escape owner if this menu closed earlier in the pass.
+pub(crate) fn folder_pane_paste_menu_owns_keyboard(ctx: &egui::Context) -> bool {
+    ctx.viewport_id() == egui::ViewportId::ROOT
+        && (egui::Popup::is_id_open(ctx, folder_pane_paste_menu_id())
+            || crate::keyboard_input::popup_owned_escape_at_pass_start(
+                ctx,
+                folder_pane_paste_menu_id(),
+            ))
+}
+
+fn close_folder_pane_paste_menu(ctx: &egui::Context) {
+    let id = folder_pane_paste_menu_id();
+    egui::Popup::close_id(ctx, id);
+    ctx.data_mut(|data| data.remove::<FolderPanePasteMenu>(id));
+}
+
+fn folder_pane_paste_enabled(
+    files_available: bool,
+    admission: Result<(), String>,
+) -> Result<(), String> {
+    admission?;
+    if files_available {
+        Ok(())
+    } else {
+        Err("クリップボードにファイルがありません".to_owned())
+    }
+}
+
+fn show_folder_pane_paste_menu(
+    ui: &mut egui::Ui,
+    menu: &FolderPanePasteMenu,
+    admission: Result<(), String>,
+) -> bool {
+    let popup_id = folder_pane_paste_menu_id();
+    let enabled = folder_pane_paste_enabled(menu.files_available, admission);
+    let visuals = crate::os_theme::popup_visuals_for_ui(ui);
+    let frame = crate::os_theme::popup_frame_with_visuals(ui.ctx(), visuals.clone());
+    let response = egui::Popup::new(popup_id, ui.ctx().clone(), menu.position, ui.layer_id())
+        .kind(egui::PopupKind::Menu)
+        .layout(egui::Layout::top_down_justified(egui::Align::Min))
+        .style(move |style: &mut egui::Style| {
+            style.visuals = visuals.clone();
+            egui::containers::menu::menu_style(style);
+        })
+        .frame(frame)
+        .open_memory(None)
+        .show(|ui| {
+            let response = ui.add_enabled(enabled.is_ok(), egui::Button::new("貼り付け"));
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(
+                    egui::Id::unique("folder_pane_test_paste_button"),
+                    (response.rect, enabled.is_ok()),
+                )
+            });
+            let clicked = response.clicked();
+            if let Err(reason) = &enabled {
+                response.on_disabled_hover_text(reason);
+            }
+            if clicked {
+                ui.close();
+            }
+            clicked
+        });
+    let shown = response.is_some();
+    let selected = response.is_some_and(|response| response.inner);
+    if shown || egui::Popup::is_id_open(ui.ctx(), popup_id) {
+        crate::wheel_input::consume_wheel_input(ui.ctx());
+    }
+    selected
 }
 
 impl App {
@@ -689,6 +777,12 @@ impl App {
         }
         self.apply_folder_tree_pane_visibility_request(ctx);
         self.service_folder_pane_visibility(ctx);
+        if !main_chrome_drawn
+            || !self.settings.folder_tree_pane_visible
+            || self.folder_pane_disabled()
+        {
+            close_folder_pane_paste_menu(ctx);
+        }
     }
 
     pub(crate) fn render_folder_pane(
@@ -697,6 +791,7 @@ impl App {
     ) -> (Option<std::path::PathBuf>, Option<egui::Rect>) {
         let ctx = &root_ui.ctx().clone();
         if !self.settings.folder_tree_pane_visible {
+            close_folder_pane_paste_menu(ctx);
             return (None, None);
         }
 
@@ -726,6 +821,24 @@ impl App {
         );
         if let Some(width_ratio) = changed_ratio {
             self.settings.folder_tree_pane_width_ratio = width_ratio;
+        }
+        // Keep the whole pane a non-target even when no drives/rows have arrived yet.
+        if self
+            .folder_pane
+            .label_display
+            .as_ref()
+            .is_none_or(|display| display.pass != ctx.cumulative_pass_nr())
+        {
+            self.folder_pane.label_display = Some(FolderPaneLabelDisplay {
+                pass: ctx.cumulative_pass_nr(),
+                layer: panel.response.layer_id,
+                pane_rect: panel.response.rect,
+                rect: egui::Rect::NOTHING,
+                rows: Vec::new(),
+            });
+        }
+        if let Some(display) = &mut self.folder_pane.label_display {
+            display.pane_rect = panel.response.rect;
         }
         (nav, Some(panel.response.rect))
     }
@@ -797,10 +910,24 @@ impl App {
     }
 
     fn render_folder_pane_tree(&mut self, ui: &mut egui::Ui) -> Option<std::path::PathBuf> {
+        self.render_folder_pane_tree_with(
+            ui,
+            crate::app::main_drop::clipboard_has_drop_files,
+            |app, ctx, path| app.paste_tree_files_to_folder(ctx, path),
+        )
+    }
+
+    fn render_folder_pane_tree_with(
+        &mut self,
+        ui: &mut egui::Ui,
+        mut clipboard_files: impl FnMut() -> bool,
+        mut paste: impl FnMut(&mut Self, &egui::Context, std::path::PathBuf),
+    ) -> Option<std::path::PathBuf> {
         if ui.ctx().viewport_id() != egui::ViewportId::ROOT {
             return None;
         }
         if self.folder_pane_disabled() {
+            close_folder_pane_paste_menu(ui.ctx());
             self.folder_pane.invalidate_label_display();
         }
         let mut nav = None;
@@ -864,6 +991,7 @@ impl App {
         }
         let rows = self.folder_pane.visible_rows();
         if rows.is_empty() {
+            close_folder_pane_paste_menu(ui.ctx());
             ui.centered_and_justified(|ui| {
                 ui.label("ドライブが見つかりません");
             });
@@ -943,6 +1071,7 @@ impl App {
                 drawn_pitch = row_rect.height() + ui.spacing().item_spacing.y;
                 label_widgets.push(FolderPaneLabelWidgets {
                     path: row.path.clone(),
+                    row_rect,
                     label: resp.id,
                     label_rect: resp.rect,
                     arrow: arrow_resp.id,
@@ -952,6 +1081,33 @@ impl App {
                         egui::Rect::NOTHING
                     },
                 });
+                if ui.is_enabled()
+                    && ui.rect_contains_pointer(row_rect)
+                    && ui
+                        .input(|input| input.pointer.button_clicked(egui::PointerButton::Secondary))
+                {
+                    let frame = ui.ctx().cumulative_frame_nr();
+                    let already_opened = ui
+                        .ctx()
+                        .data(|data| {
+                            data.get_temp::<FolderPanePasteMenu>(folder_pane_paste_menu_id())
+                        })
+                        .is_some_and(|menu| menu.opened_frame == frame);
+                    if !already_opened {
+                        let menu = FolderPanePasteMenu {
+                            path: row.path.clone(),
+                            position: ui
+                                .ctx()
+                                .pointer_hover_pos()
+                                .unwrap_or(row_rect.left_bottom()),
+                            files_available: clipboard_files(),
+                            opened_frame: frame,
+                        };
+                        ui.ctx()
+                            .data_mut(|data| data.insert_temp(folder_pane_paste_menu_id(), menu));
+                        egui::Popup::open_id(ui.ctx(), folder_pane_paste_menu_id());
+                    }
+                }
                 #[cfg(test)]
                 ui.ctx().data_mut(|data| {
                     data.insert_temp(folder_pane_test_row_rect_id(&row.path), row_rect);
@@ -967,6 +1123,7 @@ impl App {
                 if (row.expanded || row.has_children_or_unknown)
                     && arrow_resp.clicked()
                     && !arrow_resp.clicked_by(egui::PointerButton::Primary)
+                    && !arrow_resp.clicked_by(egui::PointerButton::Secondary)
                     && !self
                         .folder_pane
                         .label_pointer_activation_owned(arrow_resp.id)
@@ -976,6 +1133,7 @@ impl App {
                 }
                 if resp.clicked()
                     && !resp.clicked_by(egui::PointerButton::Primary)
+                    && !resp.clicked_by(egui::PointerButton::Secondary)
                     && !self.folder_pane.label_pointer_activation_owned(resp.id)
                 {
                     self.folder_pane.clear_label_click();
@@ -1007,15 +1165,34 @@ impl App {
             cursor_revealed
         });
         for widget in &mut label_widgets {
+            widget.row_rect = widget.row_rect.intersect(output.inner_rect);
             widget.label_rect = widget.label_rect.intersect(output.inner_rect);
             widget.arrow_rect = widget.arrow_rect.intersect(output.inner_rect);
         }
         self.folder_pane.label_display = Some(FolderPaneLabelDisplay {
             pass: ui.ctx().cumulative_pass_nr(),
             layer: ui.layer_id(),
+            pane_rect: ui.clip_rect(),
             rect: output.inner_rect,
             rows: label_widgets,
         });
+        if let Some(menu) = ui
+            .ctx()
+            .data(|data| data.get_temp::<FolderPanePasteMenu>(folder_pane_paste_menu_id()))
+        {
+            let admission = self.shell_transfer_admission(ui.ctx());
+            if show_folder_pane_paste_menu(ui, &menu, admission) {
+                // Recheck at invocation: a menu's enabled state is not an admission ticket.
+                match self.shell_transfer_admission(ui.ctx()) {
+                    Ok(()) => paste(self, &ui.ctx().clone(), menu.path),
+                    Err(reason) => self.show_feedback_warning(reason),
+                }
+            }
+        }
+        if !egui::Popup::is_id_open(ui.ctx(), folder_pane_paste_menu_id()) {
+            ui.ctx()
+                .data_mut(|data| data.remove::<FolderPanePasteMenu>(folder_pane_paste_menu_id()));
+        }
         if output.inner {
             // The new reveal owns this vertical position. Retire the previous
             // drag/animation motion even when the reveal's delta was zero.
@@ -1107,6 +1284,39 @@ impl FolderPaneScrollMemory {
 }
 
 #[doc(hidden)]
+pub fn draw_folder_tree_paste_menu_snapshot_fixture(
+    ui: &mut egui::Ui,
+    enabled: bool,
+) -> egui::Rect {
+    // Only fixed presentation data: no App, clipboard query, filesystem or Shell.
+    let row = folder_pane::FolderPaneRow {
+        path: "C:/Pictures/貼り付け先".into(),
+        depth: 0,
+        expanded: false,
+        loading: false,
+        has_children_or_unknown: true,
+        is_active: false,
+        is_cursor: false,
+        error: None,
+    };
+    let (_, _, row_rect) = draw_folder_pane_row(ui, &row, false);
+    if ui.rect_contains_pointer(row_rect)
+        && ui.input(|input| input.pointer.button_clicked(egui::PointerButton::Secondary))
+    {
+        egui::Popup::open_id(ui.ctx(), folder_pane_paste_menu_id());
+    }
+    let menu = FolderPanePasteMenu {
+        path: row.path,
+        position: row_rect.left_bottom(),
+        files_available: enabled,
+        opened_frame: ui.ctx().cumulative_frame_nr(),
+    };
+    // Use the production popup, including its theme, button and disabled appearance.
+    let _ = show_folder_pane_paste_menu(ui, &menu, Ok(()));
+    row_rect
+}
+
+#[doc(hidden)]
 pub fn draw_folder_pane_location_snapshot_fixture(ui: &mut egui::Ui) {
     for (title, has_focus, cursor) in [
         ("現在地のみ（フォーカスなし）", false, 1),
@@ -1170,6 +1380,10 @@ pub fn draw_folder_pane_refresh_snapshot_fixture(ui: &mut egui::Ui) {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "ui_folder_pane_drop_tests.rs"]
+mod drop_tests;
 
 #[cfg(test)]
 mod tests {

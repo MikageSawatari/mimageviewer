@@ -269,6 +269,16 @@ impl App {
                 if let RawWindowHandle::Win32(h) = wh.as_raw() {
                     let hwnd_raw = h.hwnd.get();
                     self.main_hwnd = Some(hwnd_raw);
+                    if let Err(error) = crate::main_drop_target::register_root_drop_target(
+                        hwnd_raw,
+                        ctx.clone(),
+                        self.main_drop.clone(),
+                    ) {
+                        crate::logger::log(format!("main_drop: registration failed: {error}"));
+                        self.show_feedback_warning(format!(
+                            "ファイルのドロップを受け付けられません\n{error}"
+                        ));
+                    }
                     crate::startup_windows_diag::mark(
                         "app.tray_main_hwnd.capture",
                         hwnd_raw as usize,
@@ -432,32 +442,24 @@ impl App {
     }
 
     pub(super) fn input_drop_and_activity(&mut self, ctx: &egui::Context) {
-        // エクスプローラ等から mIV へドロップされたファイル / フォルダを現在のフォルダへコピーする
-        // (mIV → 外部 のドラッグ送出と対称の受け取り方向)。毎フレーム走るので、
-        // ドロップが無い通常フレームでは空チェックだけで抜ける (Vec を確保しない)。
-        if ctx.input(|i| !i.raw.dropped_files.is_empty()) {
-            if self.sidecar_restore_active() {
-                let count = ctx.input(|i| i.raw.dropped_files.len());
-                self.internal_drop_pending = false;
-                crate::logger::log(format!(
-                    "file_drop: discarded {count} path(s) during sidecar restore"
-                ));
-            // mIV 自身のドラッグが mIV ウィンドウ上へ落ちた跳ね返り (グリッド上での
-            // クリックずれ等) なら受け取らない。フラグの消費は dropped_files が来た
-            // 時点で必ず行う — パスが空に潰れても stale で残さない (Codex P2)。
-            } else if std::mem::take(&mut self.internal_drop_pending) {
-                crate::logger::log("file_drop: ignored (mIV-internal drag bounce-back)");
-            } else {
-                let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
-                    i.raw
-                        .dropped_files
-                        .iter()
-                        .map(|f| f.path().to_path_buf())
-                        .collect()
-                });
-                self.handle_external_file_drop(dropped_paths);
-            }
+        // Other platforms retain their backend's existing grid-file drop producer.
+        #[cfg(not(windows))]
+        if ctx.input(|input| !input.raw.dropped_files.is_empty()) {
+            let paths = ctx.input(|input| {
+                input
+                    .raw
+                    .dropped_files
+                    .iter()
+                    .map(|file| file.path().to_path_buf())
+                    .collect()
+            });
+            self.main_drop
+                .borrow_mut()
+                .drops
+                .push(crate::main_drop_target::DropRequest::GridFiles(paths));
         }
+        self.refresh_main_drop_admission(ctx);
+        self.consume_main_drops(ctx);
 
         // 入力があればバックグラウンドインデクサを一時停止させる。
         // `keys_down` は「今押されている」セットなので、Ctrl や Shift を指で押しっぱなしに
@@ -891,6 +893,14 @@ impl App {
         ctx: &egui::Context,
         main_viewer_blocked: bool,
     ) {
+        // Only menu/dialog ownership blocks this entire phase. Text-input
+        // shortcuts retain the per-branch admission and keymap behavior below.
+        if matches!(
+            self.keyboard_owner_for_pass(ctx),
+            crate::keyboard_input::KeyboardOwner::Modal
+        ) {
+            return;
+        }
         // ── F12: 画像・動画ビューア別ウィンドウモード ───────────────
         if !self.address_has_focus
             && !self.search_has_focus
@@ -1737,16 +1747,18 @@ impl App {
             match self.main_hwnd {
                 Some(hwnd) => {
                     // SHDoDragDrop が戻る (ドロップ完了 or キャンセル) までブロックする。
-                    let outcome = crate::file_drag::start_file_drag(hwnd, &paths);
+                    self.refresh_main_drop_admission(ctx);
+                    let outcome = crate::file_drag::start_file_drag(
+                        hwnd,
+                        &paths,
+                        post_drag_toast.is_some(),
+                        &self.main_drop,
+                    );
+                    self.consume_main_drops(ctx);
                     // SHDoDragDrop に到達したときだけポインタリセットが要る (§6.1)。
                     // 未到達ならフラグを立てない (winit が WM_LBUTTONUP を正常受信)。
                     if outcome.started {
                         self.native_drag_just_finished = true;
-                        // ドロップが成立し、かつ落下先が mIV 自身のウィンドウなら、
-                        // 直後の dropped_files (跳ね返り) を受け取らないよう印を付ける。
-                        if outcome.dropped && Self::cursor_over_window(hwnd) {
-                            self.internal_drop_pending = true;
-                        }
                     }
                     if let Some(err) = &outcome.error {
                         crate::logger::log(format!("file_drag: outcome error: {err:?}"));

@@ -18,6 +18,8 @@ root製品graph・依存切替・eframeの接続は対象外。
 
 ## 差分台帳
 
+- §1.464: `Queue::present` 返却直後だけ pass 番号を Context に保存し、`last_presented_pass` で公開する (capture-only・skip・Outdated は進めない)。
+
 | 項目 | 分類 | 新版への適応 |
 | --- | --- | --- |
 | managed mipmap allocation | (b) | opt-in時だけ全mip鎖とRENDER_ATTACHMENTを確保。通常textureのusageは拡大しない |

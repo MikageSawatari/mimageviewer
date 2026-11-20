@@ -1,7 +1,7 @@
 //! Fixed destinations: one request owner, Shell execution, and external-change refresh only.
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::Ordering, mpsc};
+use std::sync::mpsc;
 
 use crate::app::book_append_refresh::FolderRefreshCause;
 use crate::app::{App, ExternalChangeCheck};
@@ -31,13 +31,10 @@ pub(crate) struct FileOrganizeRunning {
 
 impl FileOrganizeRequest {
     // Consume the selected request once. In particular, a duplicate cannot retire Running.
-    fn take_for_submission(
+    pub(crate) fn take_for_submission(
         &mut self,
         row: usize,
         operation: ShellTransferOperation,
-        remote_owned: bool,
-        closing: bool,
-        owner: Option<isize>,
     ) -> Result<Option<ShellTransferRequest>, &'static str> {
         if !matches!(self, Self::Selecting(_)) {
             return Ok(None);
@@ -50,15 +47,6 @@ impl FileOrganizeRequest {
             destinations,
             ..
         } = *selection;
-        if remote_owned {
-            return Err("リモート接続中のため整理操作を実行しませんでした");
-        }
-        if closing {
-            return Err("終了が要求されたため整理操作を実行しませんでした");
-        }
-        if owner.is_none_or(|hwnd| hwnd == 0) {
-            return Err("整理操作を開始できませんでした");
-        }
         let Some(destination) = destinations.get(row) else {
             return Err("整理先を選び直してください");
         };
@@ -66,6 +54,7 @@ impl FileOrganizeRequest {
             sources,
             destination: destination.path.clone(),
             operation,
+            default_move_needs_volume_check: false,
         }))
     }
 }
@@ -444,37 +433,34 @@ impl App {
         row: usize,
         operation: ShellTransferOperation,
     ) {
-        // The sole admission boundary shared by pointer and Enter. No worker is spawned earlier.
-        let closing = self.shutdown_requested.load(Ordering::SeqCst)
-            || self
-                .tray_controller
-                .as_ref()
-                .is_some_and(|tray| tray.is_quit_requested())
-            || ctx.input(|input| {
-                input
-                    .raw
-                    .viewports
-                    .get(&egui::ViewportId::ROOT)
-                    .is_some_and(|viewport| viewport.close_requested())
-            });
-        match self.file_organize_request.take_for_submission(
+        self.submit_file_organize_with(
+            ctx,
             row,
             operation,
-            self.remote_session_blocks_local_control(),
-            closing,
-            self.main_hwnd,
-        ) {
+            Self::book_root_path,
+            crate::shell_file_ops::transfer_items_async,
+        );
+    }
+
+    pub(crate) fn submit_file_organize_with(
+        &mut self,
+        ctx: &egui::Context,
+        row: usize,
+        operation: ShellTransferOperation,
+        resolve_books_root: impl FnOnce(&Self) -> PathBuf,
+        start: impl FnOnce(
+            Option<isize>,
+            ShellTransferRequest,
+            egui::Context,
+        ) -> mpsc::Receiver<ShellTransferResult>,
+    ) {
+        // Consume Selecting once, then use the same admission and execution owner as tree drops.
+        match self
+            .file_organize_request
+            .take_for_submission(row, operation)
+        {
             Ok(Some(request)) => {
-                if !self.admit_book_append_followup_mutation() {
-                    return;
-                }
-                let rx = crate::shell_file_ops::transfer_items_async(
-                    self.main_hwnd,
-                    request.clone(),
-                    ctx.clone(),
-                );
-                self.file_organize_request =
-                    FileOrganizeRequest::Running(Box::new(FileOrganizeRunning { request, rx }));
+                self.submit_shell_transfer_with(ctx, request, resolve_books_root, start)
             }
             Ok(None) => {}
             Err(message) => self.show_feedback_warning(message.to_owned()),
@@ -514,6 +500,15 @@ impl App {
                 self.show_feedback_warning(format!(
                     "操作を完了できませんでした。フォルダの内容を確認してください\n{message}"
                 ));
+            }
+        }
+        // A completed main transfer is an observation of each affected parent's direct children.
+        let mut observed = HashSet::new();
+        for folder in std::iter::once(request.destination.as_path())
+            .chain(request.sources.iter().filter_map(|source| source.parent()))
+        {
+            if observed.insert(crate::path_key::normalize_keep_drive(folder)) {
+                self.folder_pane.observe_accepted_folder(folder);
             }
         }
         // No removal, metadata migration, retained-list cleanup or viewer invalidation here.
@@ -881,30 +876,26 @@ mod tests {
     }
 
     #[test]
-    fn file_organize_admission_rejects_remote_exit_and_duplicate() {
-        for (remote, closing, owner) in [
-            (true, false, Some(1)),
-            (false, true, Some(1)),
-            (false, false, None),
-        ] {
-            let mut state = selecting();
-            assert!(
-                state
-                    .take_for_submission(0, ShellTransferOperation::Move, remote, closing, owner)
-                    .is_err()
-            );
-            assert!(matches!(state, FileOrganizeRequest::Hidden));
-        }
+    fn file_organize_selection_is_consumed_once_without_retiring_running() {
+        let mut invalid = selecting();
+        assert!(
+            invalid
+                .take_for_submission(99, ShellTransferOperation::Move)
+                .is_err()
+        );
+        assert!(matches!(invalid, FileOrganizeRequest::Hidden));
         let mut state = selecting();
         let request = state
-            .take_for_submission(0, ShellTransferOperation::Copy, false, false, Some(1))
+            .take_for_submission(0, ShellTransferOperation::Copy)
             .unwrap()
             .unwrap();
+        assert!(!request.default_move_needs_volume_check);
+        assert!(matches!(state, FileOrganizeRequest::Hidden));
         let (_tx, rx) = mpsc::channel();
         state = FileOrganizeRequest::Running(Box::new(FileOrganizeRunning { request, rx }));
         assert!(
             state
-                .take_for_submission(0, ShellTransferOperation::Move, true, true, Some(1))
+                .take_for_submission(0, ShellTransferOperation::Move)
                 .unwrap()
                 .is_none()
         );
@@ -917,6 +908,7 @@ mod tests {
             sources: vec![PathBuf::from(r"C:\source\a.jpg")],
             destination: PathBuf::from(r"D:\destination"),
             operation: ShellTransferOperation::Move,
+            default_move_needs_volume_check: false,
         };
         assert!(refresh_matches(Path::new(r"C:\source"), &request));
         assert!(refresh_matches(Path::new(r"D:\destination"), &request));

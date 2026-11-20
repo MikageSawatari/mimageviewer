@@ -565,6 +565,10 @@ sourceのFinalizedが先に届いても画像の採用/破棄まで再enqueueを
 
 ## 4. 新機能追加時のチェックリスト
 
+§1.464 のツリー D&D は ROOT の表示済み pass の形と在メモリの受付情報だけで判定し、callback はファイルシステムに触らない。ボリューム照会・実体パス検証・転送は Shell worker に置く。
+本棚パスの `book_root_path()` は既定で同期の既知フォルダ解決へ到達するため、毎 pass の述語・行の形・「貼り付け」の有効判定には含めない。利用者決定により、転送の投入時とツリーの「貼り付け」を押した時だけ、既存の操作境界と同じ関数を一回呼んで本棚自身・配下を拒否する。起動前 pin・resolver の共有・受付の保留は作らない。Ctrl+V は既存の `current_favorite_target()` で確認済みなので共通貼り付け関数から繰り返さない。
+ツリーの右クリック「貼り付け」は Ctrl+V と同じ関数から Shell の bind / `InvokeCommand` を UI スレッドで同期実行する既知の例外とする。操作した時点のクリップボードを同期に扱い、COM apartment と選択要求の順序を保つため worker 化しない。形式の有無はメニューを開いた時だけ調べる。切断されたネットワーク先では OS が諦めるまで UI が止まり得る。完了待ちを追加せず、転送そのものは Shell が持つ。[設計 §7](folder-tree-dnd-plan.md) を参照。
+
 文字起こし表示（T1区切り3）のDB SELECTと署名取得は単一readerで行い、UI/presenterは不変のsnapshotとArc本文だけを使う。
 再生原点は既存decoderから取得し、描画で再probeしない。nativeとmusicは可変高一覧rendererを共有する。
 Fenwick索引で可視行を探し、その行だけ全文をlayoutする。高さの変更はpass末尾にまとめて採用し、

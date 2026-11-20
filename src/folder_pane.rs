@@ -102,12 +102,14 @@ pub(crate) enum FolderPaneLabelResult {
 pub(crate) struct FolderPaneLabelDisplay {
     pub pass: u64,
     pub layer: egui::LayerId,
+    pub pane_rect: egui::Rect,
     pub rect: egui::Rect,
     pub rows: Vec<FolderPaneLabelWidgets>,
 }
 
 pub(crate) struct FolderPaneLabelWidgets {
     pub path: PathBuf,
+    pub row_rect: egui::Rect,
     pub label: egui::Id,
     pub label_rect: egui::Rect,
     pub arrow: egui::Id,
@@ -2105,6 +2107,7 @@ mod tests {
         state.label_display = Some(FolderPaneLabelDisplay {
             pass: 1,
             layer: egui::LayerId::background(),
+            pane_rect: egui::Rect::NOTHING,
             rect: egui::Rect::NOTHING,
             rows: vec![],
         });
@@ -2185,6 +2188,7 @@ mod tests {
             state.label_display = Some(FolderPaneLabelDisplay {
                 pass: 1,
                 layer: egui::LayerId::background(),
+                pane_rect: egui::Rect::NOTHING,
                 rect: egui::Rect::NOTHING,
                 rows: vec![],
             });

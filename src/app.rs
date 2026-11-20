@@ -730,6 +730,7 @@ pub(crate) use archive_inner_book::{
 #[cfg(all(test, windows))]
 mod context_state_tests;
 mod logic_service;
+pub(crate) mod main_drop;
 mod pinned_search;
 pub(crate) mod root_lifecycle;
 mod search_request;
@@ -19501,6 +19502,8 @@ pub struct App {
     /// `ViewportCommand::Visible(false)` を使うと eframe が update を呼ばなくなり
     /// トレイメニューから復帰できなくなるため、Win32 直叩きに切り替えた。
     pub(crate) main_hwnd: Option<isize>,
+    /// ROOT-only OLE snapshots and requests; callbacks never borrow App.
+    pub(crate) main_drop: crate::main_drop_target::SharedMainDrop,
     /// フレーム末尾で実行する native ファイル D&D の予約 (`docs/file-drag-drop-design.md`)。
     pub(crate) pending_native_drag: Option<PendingNativeDrag>,
     /// 直前フレームで native ドラッグ (`SHDoDragDrop`) を実行したか。
@@ -19508,12 +19511,6 @@ pub struct App {
     /// ため、egui のポインタ状態が固着する。このフラグが立っている 1 フレームは
     /// 冒頭でポインタ状態をリセットし、ドラッグ検出もスキップする (§6.1)。
     pub(crate) native_drag_just_finished: bool,
-    /// mIV 自身のドラッグがこの mIV ウィンドウ上へ落とされた (跳ね返り) ことを示す。
-    /// `SHDoDragDrop` 完了時にドロップ座標が mIV ウィンドウ上なら立て、直後フレームの
-    /// `dropped_files` 受け取りで消費する。これで mIV 内 D&D は受け取り扱いにせず、
-    /// 同じフォルダへの無用なコピーを防ぐ。エクスプローラ等からのドロップはこの経路に
-    /// 乗らないので通常どおり受け取れる。
-    pub(crate) internal_drop_pending: bool,
     #[cfg(windows)]
     /// Native fullscreen presenter の HWND を最後に VST bridge owner として同期した値。
     /// set_chain_owner は cross-process IPC なので、毎フレーム送らないための guard。
@@ -21918,9 +21915,9 @@ impl App {
             update_check_last_spawn: None,
             show_update_dialog: false,
             main_hwnd: None,
+            main_drop: Default::default(),
             pending_native_drag: None,
             native_drag_just_finished: false,
-            internal_drop_pending: false,
             #[cfg(windows)]
             native_video_owner_synced_hwnd: 0,
             #[cfg(windows)]
@@ -23651,6 +23648,9 @@ impl App {
         let shortcut_scope = Some(ShortcutScope::new(viewport, shortcut_surface));
         let modal = if is_root {
             self.any_dialog_open()
+                // Match the grid context menu's ownership without reclassifying
+                // unrelated popups or their focused text editors.
+                || crate::ui_folder_pane::folder_pane_paste_menu_owns_keyboard(ctx)
         } else {
             self.any_modal_dialog_open_for_fullscreen_keys()
         };
@@ -52626,33 +52626,6 @@ impl App {
         }
     }
 
-    /// 現在のマウスカーソル位置のウィンドウが `hwnd` (= mIV メインウィンドウ) かを返す。
-    /// native ドラッグの落下先が mIV 自身かを `SHDoDragDrop` 完了時に判定するのに使う。
-    #[cfg(windows)]
-    fn cursor_over_window(hwnd: isize) -> bool {
-        use windows::Win32::Foundation::{HWND, POINT};
-        use windows::Win32::UI::WindowsAndMessaging::{
-            GA_ROOT, GetAncestor, GetCursorPos, WindowFromPoint,
-        };
-        unsafe {
-            let mut pt = POINT::default();
-            if GetCursorPos(&mut pt).is_err() {
-                return false;
-            }
-            let under = WindowFromPoint(pt);
-            if under.0.is_null() {
-                return false;
-            }
-            // 子ウィンドウ上に落ちてもルートで比較する。
-            GetAncestor(under, GA_ROOT) == HWND(hwnd as *mut core::ffi::c_void)
-        }
-    }
-
-    #[cfg(not(windows))]
-    fn cursor_over_window(_hwnd: isize) -> bool {
-        false
-    }
-
     /// エクスプローラ等から mIV ウィンドウへドロップされたファイルを、現在表示中の
     /// 実フォルダへコピーする (mIV → 外部 のドラッグ送出と対称の受け取り方向)。
     ///
@@ -52661,10 +52634,8 @@ impl App {
     /// まま残すため、それだけだと「直前のフォルダ」へ誤コピーしてしまう。検索結果
     /// 表示中は明示的に拒否する (Codex P2)。
     ///
-    /// **フォルダのドロップ受け取りは v1.1.0 で一旦無効化** — 同名衝突の無確認上書き・
-    /// 再帰コピーのデータ破壊リスクのため、Explorer 相当の衝突解決と合わせて将来へ延期。
-    /// ドロップされたディレクトリは全て skip し (notice で通知)、ファイルのみコピーする。
-    /// 再有効化時の自己再帰ガードは `file_drag::dir_copy_would_recurse` を流用する。
+    /// ファイルとフォルダを受け、同名の衝突と中断は Windows Shell の画面で扱う。
+    /// 自身や配下へのフォルダコピーは worker の共通検証で全体を拒否する。
     ///
     /// 完了時のフォルダ再読み込みは `poll_file_drop_pending` が `pending_reload` を立てて行う。
     pub(crate) fn handle_external_file_drop(&mut self, paths: Vec<PathBuf>) {
@@ -52706,75 +52677,22 @@ impl App {
             self.show_feedback_warning(msg.to_string());
             return;
         };
-        // **review #7 対応**: ドロップ先との自己再帰判定 (per-path `Path::is_dir` +
-        // `fs::canonicalize`×2) は遅いネットワーク共有で 1 path あたり 50-500ms に
-        // なるので、UI スレッドから worker へ全部投げる。UI 側は即座に件数 toast を
-        // 出して return する。Worker 内で検証 → PowerShell 起動 → 完了待ち の順で
-        // 動き、完了を `drop_copy_pending` 経由で `CopyOutcome` 付きで受け取り、
-        // 失敗があればトーストで通知する (review #15)。
+        // パスの検証と Shell 転送は同じ worker で行い、UI は完了だけを受け取る。
         if !self.admit_book_append_followup_mutation() {
             return;
         }
         let n_total = paths.len();
         let (tx, rx) = std::sync::mpsc::channel::<crate::ui_dialogs::context_menu::CopyOutcome>();
-        let dest_for_worker = dest.clone();
+        let hwnd = self.main_hwnd;
         let spawn_result = std::thread::Builder::new()
             .name("file-drop-validate".into())
             .spawn(move || {
-                // フォルダのドロップ受け取りは v1.1.0 で一旦無効化 (同名衝突の無確認
-                // 上書き・再帰コピーのデータ破壊リスクのため、Explorer 相当の衝突解決と
-                // 合わせて将来へ延期)。ディレクトリは skip しファイルのみコピーする。
-                let (to_copy, folder_skipped) =
-                    crate::file_drag::partition_dropped_paths(paths, |p| p.is_dir());
-                if to_copy.is_empty() {
-                    crate::logger::log(format!(
-                        "file_drop: all {folder_skipped} dropped paths are folders; folder drop is disabled"
-                    ));
-                    let notice = if folder_skipped > 0 {
-                        format!(
-                            "フォルダのドロップは現在無効です ({folder_skipped} 件をスキップ)。ファイルのみコピーできます"
-                        )
-                    } else {
-                        "コピー対象がありませんでした".to_string()
-                    };
-                    let _ = tx.send(crate::ui_dialogs::context_menu::CopyOutcome {
-                        attempted: 0,
-                        failed: 0,
-                        first_errors: Vec::new(),
-                        notice: Some(notice),
-                    });
-                    return;
-                }
-                if folder_skipped > 0 {
-                    crate::logger::log(format!(
-                        "file_drop: {folder_skipped} folders skipped (folder drop disabled); copying {} files",
-                        to_copy.len()
-                    ));
-                }
-                let to_copy_attempted = to_copy.len();
-                let copy_rx = crate::ui_dialogs::context_menu::copy_paths_into_folder(
-                    to_copy,
-                    &dest_for_worker,
+                let outcome = crate::file_drag::copy_dropped_paths_blocking(
+                    hwnd,
+                    paths,
+                    dest,
+                    crate::shell_file_ops::transfer_items_blocking,
                 );
-                // copy_paths_into_folder 内 worker から CopyOutcome を受け取って UI へ転送。
-                // **Codex P2-1 対応**: Disconnected (= 内側 worker が outcome を送らずに
-                // 死んだ) を `CopyOutcome::default()` (= failed=0 の成功扱い) に潰さず、
-                // 全件失敗として伝える。実コピーが起きていない可能性が高い局面でも
-                // 「成功 N / 失敗 0」と表示されていた旧バグの修正。
-                let mut outcome = match copy_rx.recv() {
-                    Ok(o) => o,
-                    Err(e) => crate::ui_dialogs::context_menu::CopyOutcome::all_failed(
-                        to_copy_attempted,
-                        format!("copy worker disconnected without sending outcome: {e}"),
-                    ),
-                };
-                // ファイル + フォルダ混在ドロップで、ファイルのコピーは成功したが
-                // フォルダを skip した旨も通知する (copy 側 notice が無いときだけ上書き)。
-                if folder_skipped > 0 && outcome.notice.is_none() {
-                    outcome.notice = Some(format!(
-                        "フォルダ {folder_skipped} 件はスキップしました (フォルダのドロップは現在無効です)"
-                    ));
-                }
                 let _ = tx.send(outcome);
             });
         if let Err(e) = spawn_result {
@@ -52819,8 +52737,7 @@ impl App {
                     };
                     self.show_feedback_warning(toast);
                 } else if let Some(notice) = outcome.notice {
-                    // **Codex P2-2 対応**: 失敗ではないが通知が必要なケース
-                    // (= 全件除外で実コピー未実行 等)。
+                    // 中断など、失敗の件数とは別に通知が必要な結果。
                     crate::logger::log(format!("file_drop: notice: {notice}"));
                     self.show_feedback_warning(notice);
                 }
@@ -53173,6 +53090,8 @@ impl App {
     }
 
     pub(crate) fn book_root_path(&self) -> PathBuf {
+        #[cfg(test)]
+        main_drop::record_books_root_resolution_for_test();
         self.settings.books_root_path()
     }
 
@@ -64208,47 +64127,25 @@ impl App {
             self.handle_clipboard_paste_with(
                 ctx,
                 crate::clipboard_capture::manual_kind,
-                |app, ctx, kind, hwnd, folder| {
-                    match kind {
-                        crate::clipboard_capture::data::ClipboardKind::Image
-                        | crate::clipboard_capture::data::ClipboardKind::Html => {
-                            if !app.clipboard_capture_admission_allowed() {
-                                app.show_feedback_warning_on(
-                                    "一覧画面で Ctrl+V を押すと開けます".into(),
-                                    ActionSurface::MainWindow,
-                                );
-                                return;
-                            }
-                            if let Err(error) = app
-                                .clipboard_capture_service
-                                .manual_capture(kind, folder, ctx)
-                            {
-                                app.show_feedback_warning_on(error, ActionSurface::MainWindow);
-                            }
+                |app, ctx, kind, _hwnd, folder| match kind {
+                    crate::clipboard_capture::data::ClipboardKind::Image
+                    | crate::clipboard_capture::data::ClipboardKind::Html => {
+                        if !app.clipboard_capture_admission_allowed() {
+                            app.show_feedback_warning_on(
+                                "一覧画面で Ctrl+V を押すと開けます".into(),
+                                ActionSurface::MainWindow,
+                            );
+                            return;
                         }
-                        _ => {
-                            if !app.admit_book_append_followup_mutation() {
-                                return;
-                            }
-                            // Keep the Shell's existing added-item selection behavior.
-                            app.request_post_operation_selection_for_added_items(folder.clone());
-                            let result =
-                                crate::native_context_menu::invoke_shell_folder_background_verb(
-                                    hwnd,
-                                    &folder,
-                                    crate::native_context_menu::ShellClipboardVerb::Paste,
-                                );
-                            Self::resync_egui_modifiers_from_os(ctx);
-                            match result {
-                                Ok(()) => ctx.request_repaint(),
-                                Err(error) => {
-                                    crate::logger::log(format!(
-                                        "shell_clipboard: Paste failed: {error}"
-                                    ));
-                                    app.cancel_post_operation_selection("shell_paste_failed");
-                                }
-                            }
+                        if let Err(error) = app
+                            .clipboard_capture_service
+                            .manual_capture(kind, folder, ctx)
+                        {
+                            app.show_feedback_warning_on(error, ActionSurface::MainWindow);
                         }
+                    }
+                    _ => {
+                        app.paste_files_to_folder(ctx, folder);
                     }
                 },
             );
@@ -103090,6 +102987,7 @@ impl eframe::App for App {
         self.poll_image_folder_zip(ctx);
         self.poll_depth_export();
         let main_chrome_drawn = self.update_frame(ui, frame);
+        let main_drop_geometry = self.capture_main_drop_geometry(ctx);
         self.finish_folder_pane_presentation(ctx, main_chrome_drawn);
         self.render_update_after_frame(ctx);
         self.render_update_owner_dialogs(ctx);
@@ -103131,6 +103029,7 @@ impl eframe::App for App {
         if let Some(trace) = first_update_trace {
             trace.finish(miv_startup::Outcome::Ok);
         }
+        self.publish_main_drop_geometry(ctx, main_drop_geometry);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -105918,6 +105817,9 @@ mod clear_history_tests;
 pub(crate) use tests::phase_c_support::{
     AppTestEnv as AppTestEnvForTest, setup_app as setup_app_for_test,
 };
+
+#[cfg(test)]
+pub(crate) use tests::seed_snapshot_context as seed_snapshot_context_for_test;
 
 #[cfg(all(test, windows))]
 mod now_playing_lifecycle_tests {

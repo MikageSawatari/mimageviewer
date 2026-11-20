@@ -12,6 +12,8 @@ pub enum ShellTransferOperation {
 #[derive(Debug, Clone)]
 pub struct ShellTransferRequest {
     pub operation: ShellTransferOperation,
+    /// Only an unmodified, lexically predicted Move may be downgraded by the worker.
+    pub default_move_needs_volume_check: bool,
     pub sources: Vec<PathBuf>,
     pub destination: PathBuf,
 }
@@ -35,16 +37,80 @@ pub fn transfer_items_async(
     let spawn_result = std::thread::Builder::new()
         .name("shell-transfer-worker".into())
         .spawn(move || {
-            let result = validate_transfer_request(request)
-                .and_then(|request| run_transfer_items(hwnd.unwrap_or_default(), request));
+            let result = transfer_items_blocking(hwnd, request);
             let _ = tx.send(result);
             wake_ctx.request_repaint();
         });
     if let Err(e) = spawn_result {
-        let _ = tx_on_spawn_error.send(Err(format!("ファイル整理 worker を開始できません: {e}")));
+        let _ = tx_on_spawn_error.send(Err(format!("移動／コピー worker を開始できません: {e}")));
         wake_on_spawn_error.request_repaint();
     }
     rx
+}
+
+/// Validate the complete request before queuing any Shell operation.
+/// This entry point blocks and must be called on a worker thread.
+pub(crate) fn transfer_items_blocking(
+    hwnd: Option<isize>,
+    request: ShellTransferRequest,
+) -> ShellTransferResult {
+    validate_transfer_request(resolve_default_move(request, volume_identity))
+        .and_then(|request| run_transfer_items(hwnd.unwrap_or_default(), request))
+}
+
+fn resolve_default_move(
+    mut request: ShellTransferRequest,
+    mut volume: impl FnMut(&std::path::Path) -> Option<String>,
+) -> ShellTransferRequest {
+    if request.operation == ShellTransferOperation::Move && request.default_move_needs_volume_check
+    {
+        let destination_volume = volume(&request.destination);
+        let same_volume = destination_volume.as_ref().is_some_and(|destination| {
+            request.sources.iter().all(|source| {
+                volume(source).is_some_and(|source| source.eq_ignore_ascii_case(destination))
+            })
+        });
+        if !same_volume {
+            request.operation = ShellTransferOperation::Copy;
+        }
+    }
+    request.default_move_needs_volume_check = false;
+    request
+}
+
+#[cfg(windows)]
+fn volume_identity(path: &std::path::Path) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::{
+        GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+    };
+    use windows::core::PCWSTR;
+
+    let spelling = crate::path_key::physical_path_spelling(path)?;
+    if let Some(unc) = spelling.strip_prefix("//") {
+        let mut parts = unc.split('/');
+        return Some(format!("//{}/{}", parts.next()?, parts.next()?));
+    }
+    let path = wide_null_path(path);
+    let mut mount = vec![0u16; 32768];
+    unsafe { GetVolumePathNameW(PCWSTR(path.as_ptr()), &mut mount) }.ok()?;
+    let end = mount.iter().position(|&ch| ch == 0)?;
+    let mount_name = String::from_utf16_lossy(&mount[..end]);
+    // Network volumes are identified by their share, rather than a local GUID.
+    if mount_name.starts_with(r"\\") && !mount_name.starts_with(r"\\?\") {
+        return Some(mount_name.trim_end_matches('\\').to_lowercase());
+    }
+    let mut guid = vec![0u16; 32768];
+    if unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(mount.as_ptr()), &mut guid) }.is_ok() {
+        let end = guid.iter().position(|&ch| ch == 0)?;
+        Some(String::from_utf16_lossy(&guid[..end]).to_lowercase())
+    } else {
+        Some(mount_name.to_lowercase())
+    }
+}
+
+#[cfg(not(windows))]
+fn volume_identity(_path: &std::path::Path) -> Option<String> {
+    None
 }
 
 fn path_has_nul(path: &std::path::Path) -> bool {
@@ -71,28 +137,28 @@ fn validate_transfer_request(
     request: ShellTransferRequest,
 ) -> Result<ShellTransferRequest, String> {
     if request.sources.is_empty() {
-        return Err("整理する対象がありません".into());
+        return Err("移動／コピーする対象がありません".into());
     }
     if !request.destination.is_absolute() || path_has_nul(&request.destination) {
-        return Err("整理先には NUL を含まない絶対パスを指定してください".into());
+        return Err("移動／コピー先には NUL を含まない絶対パスを指定してください".into());
     }
     let destination = std::fs::canonicalize(&request.destination).map_err(|e| {
         format!(
-            "整理先を確認できません: {} ({e})",
+            "移動／コピー先を確認できません: {} ({e})",
             request.destination.display()
         )
     })?;
     if !std::fs::metadata(&destination)
         .map_err(|e| {
             format!(
-                "整理先を確認できません: {} ({e})",
+                "移動／コピー先を確認できません: {} ({e})",
                 request.destination.display()
             )
         })?
         .is_dir()
     {
         return Err(format!(
-            "整理先は実フォルダではありません: {}",
+            "移動／コピー先は実フォルダではありません: {}",
             request.destination.display()
         ));
     }
@@ -176,7 +242,7 @@ fn run_transfer_items(hwnd: isize, request: ShellTransferRequest) -> ShellTransf
             None::<&windows::Win32::System::Com::IBindCtx>,
         )
     }
-    .map_err(|e| format!("整理先を開けません: {e}"))?;
+    .map_err(|e| format!("移動／コピー先を開けません: {e}"))?;
     let op: IFileOperation =
         unsafe { CoCreateInstance(&FileOperation, None::<&IUnknown>, CLSCTX_INPROC_SERVER) }
             .map_err(|e| format!("IFileOperation を作成できません: {e}"))?;
@@ -401,8 +467,73 @@ mod transfer_tests {
     ) -> ShellTransferRequest {
         ShellTransferRequest {
             operation,
+            default_move_needs_volume_check: false,
             sources,
             destination,
+        }
+    }
+
+    #[test]
+    fn shell_transfer_default_move_volume_resolution_only_downgrades() {
+        for (operation, check) in [
+            (ShellTransferOperation::Copy, false),
+            (ShellTransferOperation::Copy, true),
+            (ShellTransferOperation::Move, false),
+        ] {
+            let mut input = request(operation, vec![r"D:\src".into()], r"C:\MountD\dst".into());
+            input.default_move_needs_volume_check = check;
+            let resolved = resolve_default_move(input, |_| {
+                panic!("Copy preview and explicit Move must not query volumes")
+            });
+            assert_eq!(resolved.operation, operation);
+            assert!(!resolved.default_move_needs_volume_check);
+        }
+        for (destination, first, second, expected) in [
+            (
+                Some("VOLUME"),
+                Some("volume"),
+                Some("volume"),
+                ShellTransferOperation::Move,
+            ),
+            (
+                Some("volume"),
+                Some("other"),
+                Some("volume"),
+                ShellTransferOperation::Copy,
+            ),
+            (
+                Some("volume"),
+                Some("volume"),
+                Some("other"),
+                ShellTransferOperation::Copy,
+            ),
+            (
+                Some("volume"),
+                Some("volume"),
+                None,
+                ShellTransferOperation::Copy,
+            ),
+            (
+                None,
+                Some("volume"),
+                Some("volume"),
+                ShellTransferOperation::Copy,
+            ),
+        ] {
+            let mut input = request(
+                ShellTransferOperation::Move,
+                vec!["first".into(), "second".into()],
+                "destination".into(),
+            );
+            input.default_move_needs_volume_check = true;
+            let resolved = resolve_default_move(input, |path| match path.to_str().unwrap() {
+                "destination" => destination.map(str::to_owned),
+                "first" => first.map(str::to_owned),
+                "second" => second.map(str::to_owned),
+                _ => unreachable!(),
+            });
+            assert_eq!(resolved.operation, expected);
+            assert!(!resolved.default_move_needs_volume_check);
         }
     }
 

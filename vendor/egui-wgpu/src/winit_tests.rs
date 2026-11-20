@@ -6,6 +6,57 @@ use epaint::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[test]
+fn presented_pass_records_only_after_present_returns_and_not_for_absent_frame() {
+    let ctx = Context::default();
+    let root = ViewportId::ROOT;
+    let output = ctx.run_ui(Default::default(), |_| {});
+    output.drop_without_applying_deltas();
+    assert_eq!(crate::last_presented_pass(&ctx, root), None);
+    assert!(crate::presented_pass::present_if_available(&ctx, root, Some(()), |_| {
+        assert_eq!(crate::last_presented_pass(&ctx, root), None, "not published before present returns");
+    }).is_some());
+    let shown = ctx.cumulative_pass_nr_for(root);
+    assert_eq!(crate::last_presented_pass(&ctx, root), Some(shown));
+    let output = ctx.run_ui(Default::default(), |_| {});
+    output.drop_without_applying_deltas();
+    // Acquire failures return early or provide no output frame for capture-only work.
+    // Neither path can invoke the same presenter boundary with a surface texture.
+    for _ in ["Outdated", "skip", "capture-only"] {
+        assert!(crate::presented_pass::present_if_available(&ctx, root, None::<()>, |_| -> () { panic!("no surface frame") }).is_none());
+        assert_eq!(crate::last_presented_pass(&ctx, root), Some(shown));
+    }
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = crate::presented_pass::present_if_available(&ctx, root, Some(()), |_| -> () { panic!("present did not return") });
+    }));
+    assert!(failed.is_err());
+    assert_eq!(crate::last_presented_pass(&ctx, root), Some(shown));
+}
+
+#[test]
+fn presented_pass_uses_completed_second_pass_and_keeps_viewports_separate() {
+    let ctx = Context::default();
+    let mut passes = 0;
+    let output = ctx.run_ui(Default::default(), |ui| {
+        passes += 1;
+        if passes == 1 { ui.ctx().request_discard("presented pass regression"); }
+    });
+    output.drop_without_applying_deltas();
+    assert_eq!(passes, 2);
+    let _ = crate::presented_pass::present_if_available(&ctx, ViewportId::ROOT, Some(()), |_| {});
+    assert_eq!(crate::last_presented_pass(&ctx, ViewportId::ROOT), Some(ctx.cumulative_pass_nr_for(ViewportId::ROOT)));
+    let child = ViewportId::from_hash_of("presented-pass-child");
+    let mut input = egui::RawInput { viewport_id: child, ..Default::default() };
+    input.viewports.entry(child).or_default().parent = Some(ViewportId::ROOT);
+    let output = ctx.run_ui(input, |_| {});
+    output.drop_without_applying_deltas();
+    assert_eq!(crate::last_presented_pass(&ctx, child), None);
+    let root_shown = crate::last_presented_pass(&ctx, ViewportId::ROOT);
+    let _ = crate::presented_pass::present_if_available(&ctx, child, Some(()), |_| {});
+    assert_eq!(crate::last_presented_pass(&ctx, child), Some(ctx.cumulative_pass_nr_for(child)));
+    assert_eq!(crate::last_presented_pass(&ctx, ViewportId::ROOT), root_shown);
+}
+
 #[cfg(windows)]
 #[test]
 fn surface_size_limit_constrains_initial_safe_unsafe_resize_and_recreate() {

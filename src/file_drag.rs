@@ -34,8 +34,8 @@ pub struct DragOutcome {
     pub error: Option<FileDragError>,
     /// ドロップが受理されたか (`SHDoDragDrop` の effect が NONE 以外)。
     /// 非同期転送の完了・成功を示すものではない。
-    /// キャンセル (Esc / 無効ターゲット上で離す) のときは false。呼び出し側が
-    /// 「mIV 自身のウィンドウへ落ちた」判定をするのに使う。
+    /// キャンセル (Esc / 無効ターゲット上で離す) のときは false。受理の診断値であり、
+    /// 自分の窓への落下判定や元ファイルの削除には使わない。
     pub dropped: bool,
 }
 
@@ -205,7 +205,12 @@ pub(crate) fn shell_item_array_for_paths(
 /// OLE モーダル区間はブロックする。非同期 target の転送完了は待たない。
 /// UI スレッドから、かつマウスボタンが押下中に呼ぶこと。
 #[cfg(windows)]
-pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
+pub(crate) fn start_file_drag(
+    hwnd: isize,
+    paths: &[PathBuf],
+    excluded_virtual: bool,
+    shared: &crate::main_drop_target::SharedMainDrop,
+) -> DragOutcome {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Ole::{DROPEFFECT_COPY, IDropSource};
     use windows::Win32::UI::Shell::SHDoDragDrop;
@@ -246,14 +251,19 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
         drag.id,
     ));
     let started_at = std::time::Instant::now();
-    let result = unsafe {
+    let internal = crate::main_drop_target::InternalDrag {
+        paths: paths.to_vec(),
+        excluded_virtual,
+        failed_paths,
+    };
+    let result = with_internal_drag(shared, internal, || unsafe {
         SHDoDragDrop(
             Some(hwnd),
             &drag.data,
             None::<&IDropSource>,
             DROPEFFECT_COPY,
         )
-    };
+    });
     let elapsed_ms = started_at.elapsed().as_secs_f64() * 1000.0;
     // The target's Start/End state owns lifetime even when the modal result is NONE/error.
     let in_operation = drag.finish_modal();
@@ -289,6 +299,17 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
     }
 }
 
+fn with_internal_drag<R>(
+    shared: &crate::main_drop_target::SharedMainDrop,
+    internal: crate::main_drop_target::InternalDrag,
+    modal: impl FnOnce() -> R,
+) -> R {
+    shared.borrow_mut().internal = Some(internal);
+    let result = modal();
+    shared.borrow_mut().internal = None;
+    result
+}
+
 #[cfg(windows)]
 fn shell_parse_wide_path(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
@@ -304,106 +325,239 @@ fn shell_parse_wide_path(path: &Path) -> Vec<u16> {
 
 /// 非 Windows ビルド用の空実装。他のプラットフォーム分岐に揃えるためのスタブ。
 #[cfg(not(windows))]
-pub fn start_file_drag(_hwnd: isize, _paths: &[PathBuf]) -> DragOutcome {
+pub(crate) fn start_file_drag(
+    _hwnd: isize,
+    _paths: &[PathBuf],
+    _excluded_virtual: bool,
+    _shared: &crate::main_drop_target::SharedMainDrop,
+) -> DragOutcome {
     DragOutcome::not_started()
 }
 
-/// ディレクトリ `src` を `dest` 直下へコピーすると無限再帰になるかを判定する。
-///
-/// `Copy-Item -Recurse` は `src` のツリーを走査しつつ `dest/basename(src)` へ複製する。
-/// コピー先 `dest/basename(src)` が `src` 自身または `src` 配下にあると、生成された
-/// ばかりのフォルダを再び走査対象に拾い `dest/.../basename(src)/...` が無限に増殖する
-/// (例: `C:\A\B` 表示中に `C:\A` をドロップ → `C:\A\B\A\B\A...`)。
-///
-/// 実パスを `canonicalize` で正規化 (失敗時はそのまま) してから判定する。エクスプローラ
-/// → mIV のドロップ受け取り (`App::handle_external_file_drop`) で使う。
-pub fn dir_copy_would_recurse(src: &Path, dest: &Path) -> bool {
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    copy_target_inside_src(&canon(src), &canon(dest))
-}
-
-/// `dir_copy_would_recurse` の純粋判定部 (正規化済みパス前提、ユニットテスト用)。
-/// コピー先が `src` 自身または `src` 配下なら `true`。
-fn copy_target_inside_src(src: &Path, dest: &Path) -> bool {
-    // コピー先パス。通常のディレクトリは `dest/basename(src)`。`src` がルート
-    // (`C:\` や `\\server\share`、`file_name()` == None) のときは basename が無く
-    // コピー先を一意化できないため、`dest` 自体をコピー先領域とみなす — `dest` が
-    // ルート配下 (= 同じドライブ / 共有) なら `Copy-Item -Recurse` は生成中の
-    // フォルダを再走査して無限再帰する。
-    let target = match src.file_name() {
-        Some(name) => dest.join(name),
-        None => dest.to_path_buf(),
-    };
-    // Windows はパス大小無視。両辺を小文字化し、コンポーネント単位で前方一致を見る
-    // (`Path::starts_with` はコンポーネント境界で判定するので `C:\AB` は `C:\A` 配下に
-    // ならない)。
-    let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
-    lower(&target).starts_with(lower(src))
-}
-
-/// 外部ドロップされたパス群を「コピー対象 (ファイル)」と「skip したフォルダ数」に分ける。
-///
-/// **フォルダのドロップ受け取りは v1.1.0 で一旦無効化**したため、ディレクトリは全て
-/// 除外する (同名衝突の無確認上書き・再帰コピーのデータ破壊リスクのため。将来 Explorer
-/// 相当の衝突解決と合わせて再導入する)。`is_dir` を注入可能にしてユニットテストしやすく
-/// する (実利用では `|p| p.is_dir()`)。`App::handle_external_file_drop` の worker で使う。
-pub fn partition_dropped_paths(
+/// 一覧への外部ドロップを worker 上でコピーし、既存の完了通知へ写す。
+/// 全パスをそのまま渡し、検証と実転送は整理先と同じ入口に任せる。
+/// `transfer` は Windows の画面を出さずに worker の境界を検証するため差し替えられる。
+pub(crate) fn copy_dropped_paths_blocking(
+    hwnd: Option<isize>,
     paths: Vec<PathBuf>,
-    mut is_dir: impl FnMut(&Path) -> bool,
-) -> (Vec<PathBuf>, usize) {
-    let mut files = Vec::with_capacity(paths.len());
-    let mut folders_skipped = 0usize;
-    for p in paths {
-        if is_dir(&p) {
-            folders_skipped += 1;
-        } else {
-            files.push(p);
-        }
+    destination: PathBuf,
+    transfer: impl FnOnce(
+        Option<isize>,
+        crate::shell_file_ops::ShellTransferRequest,
+    ) -> crate::shell_file_ops::ShellTransferResult,
+) -> crate::ui_dialogs::context_menu::CopyOutcome {
+    use crate::shell_file_ops::{ShellTransferOperation, ShellTransferRequest};
+    use crate::ui_dialogs::context_menu::CopyOutcome;
+
+    let attempted = paths.len();
+    let request = ShellTransferRequest {
+        operation: ShellTransferOperation::Copy,
+        default_move_needs_volume_check: false,
+        sources: paths,
+        destination,
+    };
+    match transfer(hwnd, request) {
+        Ok(result) => CopyOutcome {
+            attempted,
+            notice: result
+                .aborted
+                .then(|| "操作が中断されました。処理済みの項目は元に戻りません".to_string()),
+            ..CopyOutcome::default()
+        },
+        Err(message) => CopyOutcome::all_failed(attempted, message),
     }
-    (files, folders_skipped)
 }
 
 #[cfg(test)]
-mod partition_dropped_paths_tests {
-    use super::partition_dropped_paths;
+mod file_drop_worker_tests {
+    use super::copy_dropped_paths_blocking;
+    use crate::shell_file_ops::{ShellTransferOperation, ShellTransferOutcome};
     use std::path::PathBuf;
 
     #[test]
-    fn skips_all_directories_keeps_files_in_order() {
-        let paths = vec![
-            PathBuf::from(r"C:\books\a.jpg"),
-            PathBuf::from(r"C:\books\sub"),
-            PathBuf::from(r"C:\books\b.png"),
-            PathBuf::from(r"C:\books\dir2"),
-        ];
-        let dirs = [r"C:\books\sub", r"C:\books\dir2"];
-        let (files, skipped) =
-            partition_dropped_paths(paths, |p| dirs.contains(&p.to_string_lossy().as_ref()));
-        assert_eq!(skipped, 2, "両ディレクトリを skip する");
+    fn native_drag_shared_payload_exists_only_inside_modal_call_including_error_return() {
+        use crate::main_drop_target::{InternalDrag, MainDropShared};
+        let shared = std::rc::Rc::new(std::cell::RefCell::new(MainDropShared::default()));
+        for failed in [false, true] {
+            let paths = vec![
+                PathBuf::from(r"C:\all\first"),
+                PathBuf::from(r"C:\all\unresolved"),
+            ];
+            let result = super::with_internal_drag(
+                &shared,
+                InternalDrag {
+                    paths: paths.clone(),
+                    excluded_virtual: true,
+                    failed_paths: 1,
+                },
+                || {
+                    let mut state = shared.borrow_mut(); // No borrow spans the modal call.
+                    let source = state.internal.as_ref().unwrap();
+                    assert_eq!(source.paths, paths);
+                    assert!(source.excluded_virtual);
+                    assert_eq!(source.failed_paths, 1);
+                    state.admission = Ok(());
+                    if failed { Err("modal error") } else { Ok(()) }
+                },
+            );
+            assert_eq!(result.is_err(), failed);
+            assert!(shared.borrow().internal.is_none());
+        }
+    }
+
+    #[test]
+    fn dropped_paths_worker_preserves_file_folder_order_destination_and_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("file.txt");
+        let folder = temp.path().join("folder");
+        std::fs::write(&file, b"file contents").unwrap();
+        std::fs::create_dir(&folder).unwrap();
+        let paths = vec![file.clone(), folder.clone()];
+        let destination = temp.path().join("destination");
+        let outcome = copy_dropped_paths_blocking(
+            Some(123),
+            paths.clone(),
+            destination.clone(),
+            |hwnd, request| {
+                assert_eq!(hwnd, Some(123));
+                assert_eq!(request.operation, ShellTransferOperation::Copy);
+                assert_eq!(request.sources, paths);
+                assert_eq!(request.destination, destination);
+                Ok(ShellTransferOutcome { aborted: false })
+            },
+        );
+        assert_eq!(outcome.attempted, 2);
+        assert_eq!(outcome.failed, 0);
+        assert!(outcome.first_errors.is_empty());
+        assert!(outcome.notice.is_none());
+        assert_eq!(std::fs::read(&file).unwrap(), b"file contents");
+        assert!(folder.is_dir());
+    }
+
+    #[test]
+    fn dropped_paths_worker_keeps_folder_only_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let outcome = copy_dropped_paths_blocking(
+            None,
+            vec![folder.clone()],
+            temp.path().join("destination"),
+            |hwnd, request| {
+                assert_eq!(hwnd, None);
+                assert_eq!(request.sources, vec![folder]);
+                Ok(ShellTransferOutcome { aborted: false })
+            },
+        );
+        assert_eq!(outcome.attempted, 1);
+        assert_eq!(outcome.failed, 0);
+        assert!(outcome.notice.is_none());
+    }
+
+    #[test]
+    fn dropped_paths_worker_reports_cancellation_without_claiming_failure() {
+        let outcome = copy_dropped_paths_blocking(
+            None,
+            vec![PathBuf::from("file.txt"), PathBuf::from("folder")],
+            PathBuf::from("destination"),
+            |_, _| Ok(ShellTransferOutcome { aborted: true }),
+        );
+        assert_eq!(outcome.attempted, 2);
+        assert_eq!(outcome.failed, 0);
+        assert!(outcome.first_errors.is_empty());
         assert_eq!(
-            files,
-            vec![
-                PathBuf::from(r"C:\books\a.jpg"),
-                PathBuf::from(r"C:\books\b.png"),
-            ],
-            "ファイルだけが順序を保って残る"
+            outcome.notice.as_deref(),
+            Some("操作が中断されました。処理済みの項目は元に戻りません")
         );
     }
 
     #[test]
-    fn all_files_pass_through() {
-        let paths = vec![PathBuf::from("a.jpg"), PathBuf::from("b.png")];
-        let (files, skipped) = partition_dropped_paths(paths.clone(), |_| false);
-        assert_eq!(skipped, 0);
-        assert_eq!(files, paths);
+    fn dropped_paths_worker_preserves_error_as_first_failure() {
+        let outcome = copy_dropped_paths_blocking(
+            None,
+            vec![PathBuf::from("file.txt"), PathBuf::from("folder")],
+            PathBuf::from("destination"),
+            |_, _| Err("Shell transfer failed".into()),
+        );
+        assert_eq!(outcome.attempted, 2);
+        assert_eq!(outcome.failed, 2);
+        assert_eq!(outcome.first_errors, vec!["Shell transfer failed"]);
+        assert!(outcome.notice.is_none());
     }
 
     #[test]
-    fn all_folders_yield_empty_with_count() {
-        let paths = vec![PathBuf::from("d1"), PathBuf::from("d2")];
-        let (files, skipped) = partition_dropped_paths(paths, |_| true);
-        assert!(files.is_empty());
-        assert_eq!(skipped, 2);
+    fn dropped_paths_worker_rejects_whole_request_for_self_or_descendant() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let child = source.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let file = temp.path().join("file.txt");
+        std::fs::write(&file, b"file contents").unwrap();
+        for destination in [source.clone(), child.clone()] {
+            let outcome = copy_dropped_paths_blocking(
+                None,
+                vec![file.clone(), source.clone()],
+                destination.clone(),
+                crate::shell_file_ops::transfer_items_blocking,
+            );
+            assert_eq!(outcome.attempted, 2);
+            assert_eq!(outcome.failed, 2);
+            assert!(outcome.first_errors[0].contains("フォルダ自身またはその配下"));
+            assert!(outcome.notice.is_none());
+            assert!(!destination.join("file.txt").exists());
+        }
+        assert_eq!(std::fs::read(&file).unwrap(), b"file contents");
+    }
+
+    /// Windows may display native progress/error UI; run explicitly on the user's desktop.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Windows Shell UI/environment dependent; uses disposable temp data"]
+    fn dropped_paths_worker_real_copy_file_and_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        let folder = source.join("folder");
+        std::fs::create_dir_all(folder.join("nested")).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let file = source.join("file.txt");
+        std::fs::write(&file, b"file contents").unwrap();
+        std::fs::write(folder.join("nested/child.txt"), b"folder contents").unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_file = file.clone();
+        let worker_folder = folder.clone();
+        let worker_destination = destination.clone();
+        std::thread::Builder::new()
+            .name("file-drop-validate".into())
+            .spawn(move || {
+                let outcome = copy_dropped_paths_blocking(
+                    None,
+                    vec![worker_file, worker_folder],
+                    worker_destination,
+                    crate::shell_file_ops::transfer_items_blocking,
+                );
+                let _ = tx.send(outcome);
+            })
+            .unwrap();
+        let outcome = rx
+            .recv_timeout(std::time::Duration::from_secs(300))
+            .expect("Shell operation did not finish within five minutes");
+        assert_eq!(outcome.attempted, 2);
+        assert_eq!(outcome.failed, 0, "{:?}", outcome.first_errors);
+        assert!(outcome.notice.is_none());
+        assert_eq!(
+            std::fs::read(destination.join("file.txt")).unwrap(),
+            b"file contents"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("folder/nested/child.txt")).unwrap(),
+            b"folder contents"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"file contents");
+        assert_eq!(
+            std::fs::read(folder.join("nested/child.txt")).unwrap(),
+            b"folder contents"
+        );
     }
 }
 
@@ -433,100 +587,5 @@ mod shell_parse_path_tests {
             String::from_utf16(without_nul).unwrap(),
             r"\\server\share\folder\a.jpg"
         );
-    }
-}
-
-#[cfg(all(test, windows))]
-mod recurse_guard_tests {
-    use super::copy_target_inside_src;
-    use std::path::Path;
-
-    #[test]
-    fn dest_under_src_is_recursive() {
-        // C:\A\B 表示中に C:\A をドロップ → コピー先 C:\A\B\A は src 配下。
-        assert!(copy_target_inside_src(
-            Path::new(r"C:\A"),
-            Path::new(r"C:\A\B")
-        ));
-    }
-
-    #[test]
-    fn dropping_folder_onto_itself_is_recursive() {
-        assert!(copy_target_inside_src(
-            Path::new(r"C:\X\sub"),
-            Path::new(r"C:\X\sub")
-        ));
-    }
-
-    #[test]
-    fn dropping_direct_child_back_is_recursive() {
-        // C:\X 表示中にその子 C:\X\sub をドロップ → コピー先が src 自身。
-        assert!(copy_target_inside_src(
-            Path::new(r"C:\X\sub"),
-            Path::new(r"C:\X")
-        ));
-    }
-
-    #[test]
-    fn unrelated_folders_are_safe() {
-        assert!(!copy_target_inside_src(
-            Path::new(r"C:\Y\photos"),
-            Path::new(r"C:\X")
-        ));
-    }
-
-    #[test]
-    fn deeper_descendant_is_safe() {
-        // C:\X 表示中に C:\X\a\sub をドロップ → コピー先 C:\X\sub は src 配下でない。
-        assert!(!copy_target_inside_src(
-            Path::new(r"C:\X\a\sub"),
-            Path::new(r"C:\X")
-        ));
-    }
-
-    #[test]
-    fn case_insensitive_detection() {
-        assert!(copy_target_inside_src(
-            Path::new(r"C:\A"),
-            Path::new(r"c:\a\b")
-        ));
-    }
-
-    #[test]
-    fn component_boundary_prefix_is_safe() {
-        // C:\ABC は C:\A の子ではない (コンポーネント境界)。
-        assert!(!copy_target_inside_src(
-            Path::new(r"C:\A"),
-            Path::new(r"C:\ABC")
-        ));
-    }
-
-    #[test]
-    fn drive_root_into_subdir_is_recursive() {
-        // C:\A 表示中に ドライブルート C:\ をドロップ。file_name() == None でも
-        // dest が src 配下なので拒否されること。
-        assert!(copy_target_inside_src(
-            Path::new(r"C:\"),
-            Path::new(r"C:\A")
-        ));
-    }
-
-    #[test]
-    fn unc_share_root_into_subdir_is_recursive() {
-        // \\server\share 表示中に 共有ルート \\server\share をドロップ。
-        assert!(copy_target_inside_src(
-            Path::new(r"\\server\share"),
-            Path::new(r"\\server\share\A")
-        ));
-    }
-
-    #[test]
-    fn drive_root_into_other_drive_is_safe() {
-        // C:\ を D:\X へ → 別ドライブなので自己再帰しない (巨大コピーではあるが
-        // 再帰ガードの対象外)。
-        assert!(!copy_target_inside_src(
-            Path::new(r"C:\"),
-            Path::new(r"D:\X")
-        ));
     }
 }
