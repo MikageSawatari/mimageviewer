@@ -272,6 +272,8 @@ pub(crate) struct FsPageScrollAnimation {
     pub(crate) to: Vec2,
     pub(crate) start_time: Option<f64>,
     pub(crate) last_painted_pan: Vec2,
+    /// Paired with the pan; absent until an actual unit paint records a sample.
+    pub(crate) last_painted_time: Option<f64>,
     pub(crate) origin: FsDrawnUnitStamp,
     pub(crate) viewport: egui::ViewportId,
 }
@@ -499,6 +501,7 @@ impl App {
                     .and_then(|page| normal_zoom_pan(page.transform))
             {
                 animation.last_painted_pan = pan;
+                animation.last_painted_time = Some(ctx.input(|input| input.time));
             }
         }
     }
@@ -1001,11 +1004,22 @@ impl App {
             return;
         }
         let viewport = self.fs_page_scroll_destination_viewport();
-        let from = self
+        let previous = self
             .fs_page_scroll_animation
             .as_ref()
-            .filter(|animation| self.fs_page_scroll_animation_matches(ctx, animation))
-            .map_or(self.fs_pan, |animation| animation.last_painted_pan);
+            .filter(|animation| self.fs_page_scroll_animation_matches(ctx, animation));
+        let from = previous.map_or(self.fs_pan, |animation| {
+            if animation.start_time.is_some() {
+                animation.last_painted_pan
+            } else {
+                animation.from
+            }
+        });
+        // Reuse a recorded paint sample, not the input pass's clock. A request
+        // that has not painted yet stays unstarted when its target changes.
+        let start_time =
+            previous.and_then(|animation| animation.start_time.and(animation.last_painted_time));
+        let last_painted_time = previous.and_then(|animation| animation.last_painted_time);
         let origin = self.fullscreen_page_layout.drawn_unit.clone();
         self.write_fs_page_scroll_pan(pan);
         self.fs_page_scroll_animation =
@@ -1014,8 +1028,9 @@ impl App {
                 origin.map(|origin| FsPageScrollAnimation {
                     from,
                     to: self.fs_pan,
-                    start_time: None,
+                    start_time,
                     last_painted_pan: from,
+                    last_painted_time,
                     origin,
                     viewport,
                 })

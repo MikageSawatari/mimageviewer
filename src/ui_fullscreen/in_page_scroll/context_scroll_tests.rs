@@ -18,6 +18,7 @@ fn animated_app(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
     assert_eq!(app.fs_pan, animation.to);
     assert_eq!(animation.start_time, None);
     assert_eq!(animation.last_painted_pan, animation.from);
+    assert_eq!(animation.last_painted_time, None);
     app
 }
 
@@ -30,6 +31,7 @@ fn assert_animation(app: &App, expected: &FsPageScrollAnimation) {
     assert_eq!(actual.to, expected.to);
     assert_eq!(actual.start_time, expected.start_time);
     assert_eq!(actual.last_painted_pan, expected.last_painted_pan);
+    assert_eq!(actual.last_painted_time, expected.last_painted_time);
     assert_eq!(actual.origin, expected.origin);
     assert_eq!(actual.viewport, expected.viewport);
     assert_eq!(app.fs_pan, expected.to);
@@ -45,6 +47,7 @@ fn page_scroll_animation_context_roundtrip_preserves_both_owners() {
     child_animation.to = Vec2::new(11.0, -73.0);
     child_animation.start_time = Some(0.031);
     child_animation.last_painted_pan = Vec2::new(11.0, 3.0);
+    child_animation.last_painted_time = Some(0.04);
     child_animation.origin.items_generation += 17;
     child_animation.viewport = egui::ViewportId::from_hash_of("context-scroll-child");
     let child = app.build_window_context_for_test(1823001, |owner| {
@@ -60,6 +63,7 @@ fn page_scroll_animation_context_roundtrip_preserves_both_owners() {
         child_animation.to.y -= 37.0;
         child_animation.start_time = Some(0.05);
         child_animation.last_painted_pan.y -= 13.0;
+        child_animation.last_painted_time = Some(0.06);
         owner.fs_pan = child_animation.to;
         owner.fs_page_scroll_animation = Some(child_animation.clone());
     });
@@ -88,6 +92,7 @@ fn sibling_temporary_mount_does_not_retire_the_active_scroll_animation() {
     }
     let expected = app.fs_page_scroll_animation.clone().unwrap();
     assert!(expected.start_time.is_some());
+    assert!(expected.last_painted_time.is_some());
     assert_ne!(expected.last_painted_pan, expected.from);
     let sibling = app.build_window_context_for_test(1823002, |owner| {
         assert!(owner.fs_page_scroll_animation.is_none());

@@ -1,7 +1,7 @@
 # スクロール＋ページ送り・ホイールのズーム・N 字 / Z 字の移動量・滑らかな移動 (§1.823〜§1.826)
 
-- 状態: **設計 r3 (2026-11-20)・独立設計レビュー r3 で ACCEPT・独立実装レビュー r3 の利用者決定により補間の時刻を描画passへ集約、再検証・再レビュー待ち**。ブランチ `scroll-823-826`。
-- §4.5と§4.4.1の6bに従って着地配送・ホイール・補間を接続した。独立実装レビュー r3 の指摘を受け、入力から補間の時刻読取を撤去し、開始・期限・時刻からの補間を配送先の描画passへ限定した。実装担当はコンパイル・テスト・snapshotのPNG生成・製品起動を行っていない。設計担当からの検証結果、停止時の履歴と最新の実装記録は末尾を参照。
+- 状態: **設計 r3 (2026-11-20)・独立設計レビュー r3 で ACCEPT・独立実装レビュー r4 の連続入力中の停止を修正、再検証・再レビュー待ち**。ブランチ `scroll-823-826`。
+- §4.5と§4.4.1の6bに従って着地配送・ホイール・補間を接続した。r3で補間の時刻読取を配送先の描画passへ集約し、r4では開始済みの目標差し替えに最後の実描画panと時刻を引き継ぎ、毎frame入力中も表示を進めるよう修正した。実装担当はコンパイル・テスト・snapshotのPNG生成・製品起動を行っていない。設計担当からの検証結果、停止時の履歴と最新の実装記録は末尾を参照。
 - 要望: 5ch >>826〜829 (2026-11-20)。利用者決定 (2026-11-20) は [バックログ](next-release-backlog.md) の各項目の状態欄。
 - 前提の設計: [ページ内スクロールと N 字スクロール (§1.474)](fullscreen-in-page-scroll-plan.md)。v5.4.0 で出荷済み。
   本書はその仕組み (描いた表示単位の印・入力時の照合・候補 → clamp → 進んだときだけ書く) をそのまま使い、足す分だけを書く。
@@ -247,12 +247,14 @@ r2 の形 (案 B): **着地 `FsPageLanding { Start | End }` を、送りの要�
 
 - **正本の位置は常に最終位置**: 入力は今と同じく最終の pan を `fs_pan` に即時に書く。照合・端の判定・§1.824 の送り・クリックの判定・
   §1.745・§1.726・保存・他の機能が読むのは今と同じ `fs_pan` で、滑らかにしても**論理は瞬時の設定と同じ**。
-- **見た目だけ補間する**: context 所有の `fs_page_scroll_animation: Option<FsPageScrollAnimation { from, to, start_time: Option<f64>, last_painted_pan, origin: FsDrawnUnitStamp, viewport: ViewportId }>`
+- **見た目だけ補間する**: context 所有の `fs_page_scroll_animation: Option<FsPageScrollAnimation { from, to, start_time: Option<f64>, last_painted_pan, last_painted_time: Option<f64>, origin: FsDrawnUnitStamp, viewport: ViewportId }>`
   を 1 つ持ち、ページ単位の通常静止画の描画 (印を付ける経路) だけが「表示に使う pan」= `from + (to − from)·ease(t)` を読む。
-- **新しい入力は目標を更新するだけ**: 補間中の入力は `fs_pan` (最終位置) から次の位置を決め、`from` = 最後に実際に描画した `last_painted_pan`、
-  `to` = 新しい最終位置、`start_time = None` とする。入力時の照合は印・目標・配送先・幾何を使い、期限は見ない。
-  照合が通らなければ、今と同じく `fs_pan` を起点にする。最後の描画panは同じ補間owner内に保持し、書き込み時はfromで初期化、
-  配送先の実表示単位に印を再設定できた描画で、そのtransformのpanを記録する。入力では時刻を読まず `pan_at` も呼ばない。
+- **新しい入力は目標を更新するだけ**: 補間中の入力は `fs_pan` (最終位置) から次の位置を決める。入力時の照合は印・目標・配送先・幾何を使い、期限は見ない。
+  照合が通る開始済みの補間では、`from = last_painted_pan`、`start_time = last_painted_time` として、最後の実描画の位置と時刻を対で引き継ぐ。
+  次の描画は前の描画から経過した分だけ新しい目標へ進むため、毎frame入力があっても進み具合0へ戻らない。期限は引き継いだ開始時刻から0.2秒とする。
+  未開始 (`start_time = None`) の補間の差し替えではfromを保ち、開始もNoneのままにする。補間がないか照合が通らなければ、`from = fs_pan`、開始Noneの新しい要求にする。
+  最後の描画panと時刻は同じ補間owner内に保持し、配送先の実表示単位に印を再設定できた描画で、そのtransformのpanとそのpassのinput.timeを同じ条件で記録する。
+  まだ実描画の記録がない時刻はNoneで、入力時に0や現在時刻を補わない。入力では時計を読まず、記録済みの値をコピーするだけで、`pan_at` も呼ばない。
   古い移動をキューに溜めない。連打・ホイールの連続でも最終位置は瞬時の設定と同じ。
 - **それ以外の変化では補間を捨てて最終位置で描く**: 失効を書き手ごとに足さず、比較で決める (§1.474 §2.10 と同じ方針)。
   毎 frame、配送先viewportの入力処理の後・描画の前、前frameの印を消す前の1か所で確かめる。
@@ -280,7 +282,7 @@ r2 の形 (案 B): **着地 `FsPageLanding { Start | End }` を、送りの要�
   同じ前提を持つ他の呼び出し元も実装時に列挙して揃える (レビュー r1 の棚卸しでは、ピクセルグリッド・crop・ルーペ・ナビゲータの可視枠・
   layout の hit test は描いた layout から読むので追従する)。
 - **描画の負荷** (r1 P2・r2 P1/P2): 縮小 (全体の出力) は pan に依存しない。拡大の描画 (Lanczos・NIS・アニメ・ピクセルアートの拡大) は可視の ROI を
-  キーに出力を作るので、補間の 0.2 秒の間は、**ドラッグで同じ距離を動かしたときと同じく**毎 frame 可視域を再標本化する (60Hz で約 12 frame、144Hz なら約 29 frame。追加入力では最後の描画位置から、次の配送先描画で開始し直すので、その分だけ延びる)。
+  キーに出力を作るので、補間の 0.2 秒の間は、**ドラッグで同じ距離を動かしたときと同じく**毎 frame 可視域を再標本化する (60Hz で約 12 frame、144Hz なら約 29 frame。開始後の追加入力は最後の描画位置と時刻から再設定し、継続中も目標へ進み続ける)。
   補間のための特別な ROI は作らない。r2 では「開始と最終の可視域の和を 1 回だけ作る」案を検討したが、(a) ページへ clip した後の和は途中の可視域を
   覆わない反例がある (非対称な見開きの折り返し)、(b) 和を広げると 4096² 画素の上限・アニメ拡大の入力上限を超えて補間中だけ別のフィルタ・元画像表示へ
   落ちる、(c) 浮動小数点のキーを補間の間固定する受け渡しが要る、ため採らない。ドラッグと同じ経路なので、新しい組み合わせ (補間中だけの画質・
@@ -360,8 +362,9 @@ r2 の形 (案 B): **着地 `FsPageLanding { Start | End }` を、送りの要�
   補間が残る。矩形・DPI が同じ別 viewport へ移しても捨てる。タッチパッドのホイールは瞬時。補間中のナビゲータのダブルクリック・範囲ズーム・
   描画時の中央指定が、補間なしと同じ位置へ着く。補間が無いとき・Z の transform では、ナビゲータの位置指定は今のコードのまま。
   補間の間に、画像の読み込み・デコード・AI・補正・PDF の再描画の要求が増えない (拡大の可視域の再標本化はドラッグと同じ)。
-  入力だけを繰り返しても開始時刻は未確定のまま、配送先でないpassは開始・期限を消費しない。
-  子viewportの描画後に古いROOTのpassへ戻って遅延ホイールを適用しても、始点は最後の実描画panで、次の配送先描画から開始する。
+  未開始の補間に入力だけを繰り返しても開始時刻は未確定のまま、配送先でないpassは開始・期限を消費しない。
+  子viewportの描画後に古いROOTのpassへ戻って遅延ホイールを適用しても、始点と開始時刻は最後の実描画pan・時刻の対を引き継ぐ。
+  実rendererへ毎frameホイールまたはKを配送し、入力中も表示が毎frame目標方向へ進み、fs_panを追い越さず、入力停止から0.2秒後には到達・退役する。
 - 同じ frame の §1.824 と通常の送り (固定矢印・クリック): 後から書いた送りが勝ち、着地は残らない (`FsPageNavRequest` を丸ごと上書き)。
   `open_fullscreen_from_fs_navigation_with_contract` の保留と `Explicit` の再開でも着地が使われる。分割表示で前の別画像の後半へ戻る送りが同期なら、
   後半の読み終わりへ着地する。構成の確認で保留される Split / Wrap では、通常の送りと同じ idx・slice に入り、その実際の単位へ着地する
@@ -944,3 +947,45 @@ LoadFailedの例外も同じallow_turnの門を通る。Repeatでページを送
   開始時のsnapshot PNG4件は設計担当の差分として維持した。
 - **検証の限界**: read-onlyの独立静的レビューで、入力clock撤去、描画passの所有、実pan記録、型変更箇所と回帰経路を確認した。
   コンパイル・テスト・check・nextest・製品起動・コミットは実装担当では行っていない。新しい回帰も実行結果は設計担当へ引き継ぐ。
+
+### 独立実装レビュー r4: 毎frameのスクロール入力でも表示を進める
+
+- **原因**: 2a5c88b5fは目標更新ごとにstart_timeをNoneへ戻した。各frameの退役判定で現在の描画時刻へ開始を設定し直すため、
+  入力直後の描画は毎回phase 0となり、last_painted_panも動かなかった。利用者決定に従い、開始済みの差し替えへ最後の実描画panと時刻を対で引き継ぐ。
+- **実装**: `FsPageScrollAnimation` に `last_painted_time: Option<f64>` を追加した。未実描画はNoneで、既存last_painted_panと
+  同じ成功条件・同じ位置で、配送先の描画passのinput.timeをSomeとして記録する。
+  入力の照合が通る開始済みownerは、from=last_painted_pan／start_time=last_painted_timeを継ぐ。
+  未開始ownerはfromとNoneを保ち、新規または照合不一致はfs_pan／Noneにする。入力では時計・期限・pan_atを読まない。
+  開始確定直後に実描画記録がまだない場合も時刻はNoneで、0や入力時刻を補わない。lastpan/timeは同じownerに所属し、既存bundleのOptionごとswapされる。
+  期限は引き継いだ時刻から0.2秒であり、開始の確定・期限判定は既存の配送先描画passの1か所のままである。
+- **追加した実renderer回帰**:
+  `ui_fullscreen::in_page_scroll::smooth_render_tests::continuous_actual_scroll_input_advances_each_paint_without_restarting_at_phase_zero`。
+  Single／Ltr／Rtl、Original・zoom2、240×1600のresident素材、N字10%で、端に着かない十分な縦余りを用意する。
+  最初の実K入力と描画で開始後、0.01秒ごとに8frame、実Kキーを実rendererへ配送する。各frameで論理目標の更新と端の手前であること、
+  描画panの厳密な前進、fs_pan未超過、前frameの実描画時刻からの開始、現在の実pan/timeの記録をassertする。
+  入力停止後の中間描画、停止から0.2秒経過後の到達と退役も検査する。新GPU renderer、OS実キー読取、固定待ちは使わない。
+- **旧コードを検出できる理由（静的確認）**: 旧2a5c88b5fの差し替え処理なら、最初の再入力frameでstart_timeが再びNoneとなり、
+  同frameで開始=現在時刻に確定して描画panが前frameと同じになる。上記のstrict progress assertがその場で失敗する。
+  途中で端へ到達して入力が実質途切れるケースを、端の手前・論理目標更新のassertで除外している。旧版へ戻して実行した証拠ではない。
+- **追加した未実描画状態のunit**:
+  `smooth_scroll_tests::retirement_without_a_paint_receipt_does_not_invent_a_retarget_time`。
+  退役判定だけで開始が確定しても実paintの記録がなければlast_painted_timeはNoneで、再入力で架空の時刻を作らないことを確認する。
+- **既存回帰の追従（名称維持）**:
+  - `smooth_render_tests::forwarded_root_scroll_waits_for_first_destination_paint_before_starting_animation`
+  - `smooth_render_tests::forwarded_root_scroll_retargets_from_the_last_actual_destination_paint`
+  - `smooth_render_tests::deferred_child_wheel_uses_last_paint_after_returning_to_an_older_root_clock`
+  - `smooth_render_tests::navigator_baseline_without_animation_or_with_z_keeps_the_logical_pan`（fixture literalのみ）
+  - `smooth_scroll_tests::default_is_instant_and_smooth_writes_final_pan_before_interpolating_paint`
+  - `smooth_scroll_tests::repeated_scroll_accumulates_from_logical_target_and_restarts_from_visible_pan`
+  - `smooth_scroll_tests::input_only_retargeting_neither_starts_nor_expires_the_effect`
+  - `smooth_scroll_tests::non_destination_pass_cannot_start_or_expire_the_effect`
+  - `context_scroll_tests::page_scroll_animation_context_roundtrip_preserves_both_owners`
+  - `context_scroll_tests::sibling_temporary_mount_does_not_retire_the_active_scroll_animation`
+  未開始へのROOT再入力はfrom／Noneの保持、開始済みのROOT・遅延wheelは実描画pan/timeの継承へ追従。
+  ROOT再入力は短間隔11.12と長間隔12.0の両方を残し、後者も入力では期限を消費せず、次の配送先描画で期限切れになることを検査する。
+  既存Single／Ltr／RtlのON／OFFと0.2秒後の到達・退役の実renderer回帰も維持している。
+- **文書と変更ファイル**: `src/ui_fullscreen/in_page_scroll.rs`、同配下の `smooth_render_tests.rs`／`smooth_scroll_tests.rs`／`context_scroll_tests.rs`、
+  本書の§5・§9と本項、`docs/display-pipeline.md`、`docs/detached-rework-plan.md` の所有記録を更新した。
+  detachedの述語・viewportの配送・HWND・context swapの入口・repaint回数は変更していない。開始時のsnapshot PNG4件は維持した。
+- **検証の限界**: read-onlyの独立静的レビューで、pan/timeの記録条件、開始の継承、入力側の時計参照禁止、context所有と連続入力回帰を確認した。
+  実装担当はコンパイル・テスト・check・nextest・製品起動・コミットを行っておらず、修正後の実行結果と実機挙動は設計担当の検証待ち。
