@@ -154,6 +154,32 @@ pub(super) fn ordered_scroll_pan(
     direction: ReadingDirection,
     order: crate::settings::FullscreenNScrollOrder,
     next: bool,
+    step_fraction: f32,
+) -> Vec2 {
+    ordered_scroll_pan_with_steps(
+        layout,
+        zoom,
+        pan,
+        direction,
+        order,
+        next,
+        step_fraction,
+        None,
+        true,
+    )
+}
+
+/// Wheel input changes only the primary step; a discrete segment may wrap.
+fn ordered_scroll_pan_with_steps(
+    layout: &FullscreenPageLayout,
+    zoom: f32,
+    pan: Vec2,
+    direction: ReadingDirection,
+    order: crate::settings::FullscreenNScrollOrder,
+    next: bool,
+    step_fraction: f32,
+    primary_fraction: Option<f32>,
+    allow_wrap: bool,
 ) -> Vec2 {
     if !pan.is_finite() {
         return pan;
@@ -172,12 +198,14 @@ pub(super) fn ordered_scroll_pan(
     };
     let forward = Vec2::new(horizontal_sign, -1.0);
     let signs = forward * if next { 1.0 } else { -1.0 };
-    let steps = geometry.viewport.size() * VERTICAL_READING_PAGE_SCROLL_FRAC;
+    let steps = geometry.viewport.size() * step_fraction;
     let mut target = pan;
     target[primary] = step_axis(
         geometry.axes[primary],
         pan[primary],
-        signs[primary] * steps[primary],
+        signs[primary]
+            * geometry.viewport.size()[primary]
+            * primary_fraction.unwrap_or(step_fraction),
     );
     let candidate = clamp_fullscreen_pan_from_layout(layout, zoom, target);
     if candidate.is_finite()
@@ -185,6 +213,10 @@ pub(super) fn ordered_scroll_pan(
         && candidate[secondary] == pan[secondary]
     {
         return candidate;
+    }
+
+    if !allow_wrap {
+        return pan;
     }
 
     target = pan;
@@ -652,6 +684,10 @@ impl App {
                     .unwrap_or(self.reading_direction),
                 self.settings.fullscreen_n_scroll_order,
                 action == KeyAction::FsPageNScrollNext,
+                self.settings
+                    .fullscreen_n_scroll_step_percent
+                    .clamp(10, 100) as f32
+                    / 100.0,
             ),
             _ => {
                 let viewport = layout
@@ -840,7 +876,7 @@ mod tests {
             app,
             layout,
             1.0,
-            ordered_scroll_pan(layout, 1.0, pan, direction, order, next),
+            ordered_scroll_pan(layout, 1.0, pan, direction, order, next, 0.85),
         )
     }
 

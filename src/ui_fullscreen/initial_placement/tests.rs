@@ -563,6 +563,7 @@ fn initial_placement_composition_request_matches_synchronous_normalize_open() {
             FsInitialPlacementRequest {
                 items_generation: app.items_generation,
                 anchor_idx: 0,
+                kind: FsInitialPlacementKind::Setting,
                 origin_zoom: 1.0,
                 origin_pan: egui::Vec2::ZERO,
                 origin_automatic: true,
@@ -676,6 +677,7 @@ fn initial_placement_composition_switch_deferred_normalize_uses_resumed_open_zoo
             Some(FsInitialPlacementRequest {
                 items_generation: app.items_generation,
                 anchor_idx: 0,
+                kind: FsInitialPlacementKind::Setting,
                 origin_zoom: 1.0,
                 origin_pan: egui::Vec2::ZERO,
                 origin_automatic: true,

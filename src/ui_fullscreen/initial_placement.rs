@@ -5,10 +5,18 @@ use crate::gpu_lanczos::FullscreenPageMaterialKind;
 #[cfg(test)]
 mod tests;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsInitialPlacementKind {
+    Setting,
+    LandingStart,
+    LandingEnd,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FsInitialPlacementRequest {
     pub(crate) items_generation: u64,
     pub(crate) anchor_idx: usize,
+    pub(crate) kind: FsInitialPlacementKind,
     /// Immutable placement basis captured at accepted page entry.
     pub(crate) origin_zoom: f32,
     pub(crate) origin_pan: egui::Vec2,
@@ -47,6 +55,43 @@ fn reading_start_pan(
     pan
 }
 
+/// The last reading corner, preserving the origin on axes that already fit.
+fn reading_end_pan(
+    unit: egui::Rect,
+    viewport: egui::Rect,
+    direction: ReadingDirection,
+    origin_pan: egui::Vec2,
+) -> egui::Vec2 {
+    let mut pan = origin_pan;
+    if unit.height() > viewport.height() {
+        pan.y = viewport.bottom() - unit.bottom();
+    }
+    if unit.width() > viewport.width() {
+        pan.x = match direction {
+            ReadingDirection::Ltr => viewport.right() - unit.right(),
+            ReadingDirection::Rtl => viewport.left() - unit.left(),
+        };
+    }
+    pan
+}
+
+impl FsInitialPlacementKind {
+    fn pan(
+        self,
+        unit: egui::Rect,
+        viewport: egui::Rect,
+        direction: ReadingDirection,
+        origin_pan: egui::Vec2,
+    ) -> egui::Vec2 {
+        match self {
+            Self::Setting | Self::LandingStart => {
+                reading_start_pan(unit, viewport, direction, origin_pan)
+            }
+            Self::LandingEnd => reading_end_pan(unit, viewport, direction, origin_pan),
+        }
+    }
+}
+
 impl App {
     pub(super) fn record_fs_automatic_initial_view(&mut self, pan: egui::Vec2) {
         self.fs_automatic_initial_view = Some(FsAutomaticInitialView {
@@ -61,7 +106,7 @@ impl App {
     /// stop click navigation without a marked way back. On 2026-11-15 the
     /// user reversed that decision after §1.745: a double-click cannot both
     /// reset the view and turn pages. The manual now documents double-click
-    /// reset as the way back. Automatic ReadingStart placement is not a move.
+    /// reset as the way back. Automatic reading-start/end placement is not a move.
     pub(super) fn fs_view_has_moved(&self, zoom: f32, pan: egui::Vec2, free_rotation: f32) -> bool {
         zoom_differs_from_fit(zoom)
             || free_rotation.abs() > TRANSFORM_EPSILON
@@ -76,44 +121,58 @@ impl App {
     }
 
     pub(crate) fn request_fs_initial_placement(&mut self, anchor_idx: usize) {
-        self.fs_initial_placement_request =
-            (self.settings.fullscreen_page_start_position.normalized()
+        self.request_fs_initial_placement_with_kind(anchor_idx, FsInitialPlacementKind::Setting);
+    }
+
+    pub(crate) fn request_fs_initial_placement_with_kind(
+        &mut self,
+        anchor_idx: usize,
+        kind: FsInitialPlacementKind,
+    ) {
+        self.fs_initial_placement_request = (kind != FsInitialPlacementKind::Setting
+            || self.settings.fullscreen_page_start_position.normalized()
                 == crate::settings::FullscreenPageStartPosition::ReadingStart)
-                .then_some(FsInitialPlacementRequest {
-                    items_generation: self.items_generation,
-                    anchor_idx,
-                    origin_zoom: self.fs_zoom,
-                    origin_pan: self.fs_pan,
-                    origin_automatic: !self.fs_view_has_moved(
-                        self.fs_zoom,
-                        self.fs_pan,
-                        self.fs_free_rotation,
-                    ),
-                    applied_zoom: self.fs_zoom,
-                    applied_pan: self.fs_pan,
-                });
+            .then_some(FsInitialPlacementRequest {
+                items_generation: self.items_generation,
+                anchor_idx,
+                kind,
+                origin_zoom: self.fs_zoom,
+                origin_pan: self.fs_pan,
+                origin_automatic: !self.fs_view_has_moved(
+                    self.fs_zoom,
+                    self.fs_pan,
+                    self.fs_free_rotation,
+                ),
+                applied_zoom: self.fs_zoom,
+                applied_pan: self.fs_pan,
+            });
     }
 
     /// Accepted composition changes use the zoom selected by the existing path.
     pub(crate) fn request_fs_initial_placement_after_composition_change(&mut self) {
+        let kind = self
+            .fs_initial_placement_request
+            .map_or(FsInitialPlacementKind::Setting, |request| request.kind);
         if !self.reading_flow.is_paged()
-            || self.settings.fullscreen_page_start_position.normalized()
-                != crate::settings::FullscreenPageStartPosition::ReadingStart
+            || (kind == FsInitialPlacementKind::Setting
+                && self.settings.fullscreen_page_start_position.normalized()
+                    != crate::settings::FullscreenPageStartPosition::ReadingStart)
         {
             return;
         }
         if let Some(anchor_idx) = self.fullscreen_idx {
             self.fs_pan = egui::Vec2::ZERO;
             self.fs_automatic_initial_view = None;
-            self.request_fs_initial_placement(anchor_idx);
+            self.request_fs_initial_placement_with_kind(anchor_idx, kind);
         }
     }
 
     /// Run after this context's input, including on native media's early return.
     pub(super) fn retire_fs_initial_placement_request(&mut self) {
-        if self.fs_initial_placement_request.is_some()
-            && (self.settings.fullscreen_page_start_position.normalized()
-                != crate::settings::FullscreenPageStartPosition::ReadingStart
+        if self.fs_initial_placement_request.is_some_and(|request| {
+            (request.kind == FsInitialPlacementKind::Setting
+                && self.settings.fullscreen_page_start_position.normalized()
+                    != crate::settings::FullscreenPageStartPosition::ReadingStart)
                 || self.fs_zoom_owner() != FsZoomOwner::Image
                 || !self.reading_flow.is_paged()
                 || !matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
@@ -122,8 +181,8 @@ impl App {
                 || !self
                     .fullscreen_idx
                     .and_then(|idx| self.items.get(idx))
-                    .is_some_and(GridItem::has_page_data))
-        {
+                    .is_some_and(GridItem::has_page_data)
+        }) {
             self.clear_fs_initial_placement_request();
         }
     }
@@ -154,14 +213,16 @@ impl App {
         let Some(unit) = zero_pan_unit else {
             return None;
         };
-        Some(reading_start_pan(
-            unit,
-            viewport,
-            self.spread_mode
-                .reading_direction()
-                .unwrap_or(self.reading_direction),
-            request.origin_pan,
-        ))
+        Some(
+            request.kind.pan(
+                unit,
+                viewport,
+                self.spread_mode
+                    .reading_direction()
+                    .unwrap_or(self.reading_direction),
+                request.origin_pan,
+            ),
+        )
     }
 
     /// The sole consumer, after preparation selected the actual paint material.
@@ -189,7 +250,7 @@ impl App {
             pan: if request.origin_automatic {
                 pan
             } else {
-                reading_start_pan(
+                request.kind.pan(
                     zero_pan_unit.expect("validated placement material"),
                     viewport,
                     self.spread_mode

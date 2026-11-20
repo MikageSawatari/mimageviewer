@@ -1259,7 +1259,15 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         "spread/wheel-action",
         SpreadMode,
         "通常のホイール",
-        ["マウスホイール", "ページ送り", "ページ内スクロール"]
+        [
+            "マウスホイール",
+            "ページ送り",
+            "ページ内スクロール",
+            "スクロール＋ページ送り",
+            "ズーム",
+            "拡大",
+            "縮小"
+        ]
     ),
     entry!(
         "spread/n-scroll-order",
@@ -1272,6 +1280,26 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
             "横優先",
             "N 字",
             "Z 字"
+        ]
+    ),
+    entry!(
+        "spread/smooth-page-scroll",
+        SpreadMode,
+        "ページ内のスクロールを滑らかに動かす",
+        ["滑らか", "スムーズ", "N 字", "Z 字", "キー", "ホイール"]
+    ),
+    entry!(
+        "spread/n-scroll-step",
+        SpreadMode,
+        "順に読む操作 (N 字 / Z 字) 1 回",
+        [
+            "ページ内スクロール",
+            "スクロール量",
+            "移動量",
+            "割合",
+            "%",
+            "K",
+            "J"
         ]
     ),
     entry!(

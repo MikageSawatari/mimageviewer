@@ -183,6 +183,8 @@ fn key_entry(action: KeyAction) -> Entry {
         | FsListOrderNext
         | FsSiblingPrev
         | FsSiblingNext
+        | FsPageScrollOrTurnNext
+        | FsPageScrollOrTurnPrev
         | VideoNextFile
         | VideoPrevFile => Entry::ResultNavigation,
         GridHistoryBack | GridHistoryForward => Entry::History,

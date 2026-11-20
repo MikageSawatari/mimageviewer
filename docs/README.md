@@ -214,6 +214,8 @@
 
 | ドキュメント | 内容 |
 | --- | --- |
+| [fullscreen-in-page-scroll-plan.md](fullscreen-in-page-scroll-plan.md) | §1.474 ページ内スクロールと N 字 / Z 字移動の基礎設計・実装記録。描画済み表示単位の照合、入力所有、clamp と循環防止 |
+| [fullscreen-scroll-page-turn-plan.md](fullscreen-scroll-page-turn-plan.md) | §1.823〜§1.826 の拡張設計。滑らかな移動、端からのスクロール＋ページ送りと型付き着地、ホイールのズーム、N 字 / Z 字の移動量設定 |
 | [catalog-design.md](catalog-design.md) | サムネイルキャッシュ DB の設計 |
 | [book-thumb-cover-only-plan.md](book-thumb-cover-only-plan.md) | §1.452 本の中のページは寸法だけ記録し表紙だけ保存する設定、`page_dims` 表、書き戻しの stamp 条件 |
 | [dct-scale-plan.md](dct-scale-plan.md) | TurboJPEG の DCT スケールデコードによるサムネ生成高速化。倍率選択と、圧縮入力サイズによるフォールバック条件 |

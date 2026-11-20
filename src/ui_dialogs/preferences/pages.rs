@@ -11089,7 +11089,13 @@ fn draw_fullscreen_wheel_action_setting(ui: &mut egui::Ui, value: &mut Fullscree
                 ui.selectable_value(value, action, action.label());
             }
         });
-    ui.small("ページ単位の表示で、画像が画面からはみ出す分だけ動かします。ページの端で止まり、次のページへは送りません。");
+    ui.small(match value.normalized() {
+        FullscreenWheelAction::PageTurn => "ページ単位の表示で、前または次のページへ送ります。",
+        FullscreenWheelAction::InPageScroll => "ページ単位の表示で、画像が画面からはみ出す分だけ動かします。ページの端で止まり、次のページへは送りません。",
+        FullscreenWheelAction::ScrollThenPageTurn => "読み順にスクロールし、端でもう一度回すと前または次のページへ送ります。",
+        FullscreenWheelAction::Zoom => "ページ単位の表示で、カーソル位置を基準に拡大・縮小します。シークバー上や Alt+ホイールはページ送りです。",
+        FullscreenWheelAction::Unknown => unreachable!(),
+    });
 }
 
 fn draw_fullscreen_n_scroll_order_setting(ui: &mut egui::Ui, value: &mut FullscreenNScrollOrder) {
@@ -11101,6 +11107,25 @@ fn draw_fullscreen_n_scroll_order_setting(ui: &mut egui::Ui, value: &mut Fullscr
             }
         });
     ui.small("ページ内を順に読み進める操作 (既定 K / J) の順序です。");
+}
+
+fn draw_fullscreen_smooth_page_scroll_setting(ui: &mut egui::Ui, value: &mut bool) {
+    ui.checkbox(value, "ページ内のスクロールを滑らかに動かす");
+    ui.small("ページ内を動かすキー・ホイールに適用します。タッチパッド、連結読み、ドラッグ、ズームには適用しません。");
+}
+
+fn draw_fullscreen_n_scroll_step_setting(ui: &mut egui::Ui, value: &mut u32) {
+    ui.horizontal(|ui| {
+        let label = ui.label("順に読む操作 (N 字 / Z 字) 1 回");
+        ui.add(
+            egui::DragValue::new(value)
+                .range(10..=100u32)
+                .speed(1)
+                .suffix(" %"),
+        )
+        .labelled_by(label.id);
+    });
+    ui.small("ページ内を順に読む操作だけに効きます。");
 }
 
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -11398,6 +11423,12 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/n-scroll-order", |ui, state| {
         draw_fullscreen_n_scroll_order_setting(ui, &mut state.settings.fullscreen_n_scroll_order);
     });
+    anchored(ui, state, "spread/smooth-page-scroll", |ui, state| {
+        draw_fullscreen_smooth_page_scroll_setting(
+            ui,
+            &mut state.settings.fullscreen_smooth_page_scroll,
+        );
+    });
     anchored(ui, state, "spread/top-bar", |ui, state| {
         let s = &mut state.settings;
         ui.checkbox(&mut s.fullscreen_top_bar_locked, "上部情報バーを固定表示");
@@ -11567,6 +11598,13 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             )
             .labelled_by(label.id);
         });
+    });
+    ui.add_space(8.0);
+    anchored(ui, state, "spread/n-scroll-step", |ui, state| {
+        draw_fullscreen_n_scroll_step_setting(
+            ui,
+            &mut state.settings.fullscreen_n_scroll_step_percent,
+        );
     });
     ui.add_space(8.0);
     ui.label(egui::RichText::new("360 度ビュー").strong());

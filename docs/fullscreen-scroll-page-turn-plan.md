@@ -1,6 +1,7 @@
 # スクロール＋ページ送り・ホイールのズーム・N 字 / Z 字の移動量・滑らかな移動 (§1.823〜§1.826)
 
 - 状態: **設計 r3 (2026-11-20)・独立設計レビュー r3 で ACCEPT (P1/P2 なし、P3 3 件を反映済み)・実装中**。ブランチ `scroll-823-826`。
+- 実装停止 (2026-11-20): §4.4.1 の 5 と §4.5 の前提が既存コードで両立しない。途中差分・未接続箇所と再開条件は末尾の「実装記録」を参照。関連仕様・マニュアルの変更も未完成の作業差分であり、実装済みの証拠ではない。
 - 要望: 5ch >>826〜829 (2026-11-20)。利用者決定 (2026-11-20) は [バックログ](next-release-backlog.md) の各項目の状態欄。
 - 前提の設計: [ページ内スクロールと N 字スクロール (§1.474)](fullscreen-in-page-scroll-plan.md)。v5.4.0 で出荷済み。
   本書はその仕組み (描いた表示単位の印・入力時の照合・候補 → clamp → 進んだときだけ書く) をそのまま使い、足す分だけを書く。
@@ -386,3 +387,60 @@ r1 の判断事項の扱い: 補間中の拡大の再標本化は、バックロ
 P1 / P2 なし。P3 3 件を反映した: 再標本化の frame 数はリフレッシュレートと目標の更新で変わる (§5.2)、途中の可視域で既存の画質・上限の切り替えは
 起こり得るが補間用の分岐は足さない (§5.2)、保留付きの Split / Wrap は通常の送りと同じ表示先に入ることを回帰の条件にする (§9)。
 レビュー担当は、slice の消失を既存の問題として切り離す整理を受け入れ、§1.824 が通常の送りより表示先を悪くする追加の経路は見当たらないとした。
+
+## 11. 実装記録
+
+### 2026-11-20: 前提矛盾により停止（未完成・未検証）
+
+利用者指示に従い、コンパイルを伴うコマンド・テスト・ビルド・アプリ起動・コミット・ブランチ操作は実施していない。
+以下はソース読みの結果であり、実行時の再現報告ではない。設計変更や症状パッチは入れていない。
+
+**停止理由**: §4.4.1 の 5 は「紙めくり barrier 中は照合が通らないので新操作は送りを発行せず、
+`ResolvedPageTurnNavigation` に着地を追加しなくてよい」とする。一方、§4.5 は `LoadFailed` なら照合不通でも送りを発行する。
+既存コードではこの2状態が排他的ではない:
+
+1. `src/ui_fullscreen/page_turn/nonfinal_tests.rs` の既存テスト
+   `source_quality_publication_stays_frozen_until_canonical_flat_is_adopted` は、resident thumbnailだけで `Turning` に入る経路を持つ。
+2. `src/app.rs` の既存ロード完了処理は `FsLoadResult::Failed` を `FsCacheEntry::Failed` として採用し、
+   `fs_page_load_state` は `LoadFailed` を返す。
+3. `src/ui_fullscreen/page_turn/binding.rs::PageTurnContent::matches_raw` は `source_gen` を0へ正規化し、
+   読込失敗をbinding失効条件にしない。`page_turn_pre_draw` / `page_turn_view_eligible` / `page_turn_held_resource` にも失敗時退役はない。
+   したがって保持サムネイルによる `Turning` / `Completing` と `LoadFailed` は併存し得る。
+4. そこで§4.5の送りを発行すると、`handle_fs_navigation_with_render_perf` → `page_turn_defer_navigation` →
+   `page_turn_defer_navigation_intent` が継続を保持する。`ResolvedNavigationIntent::Page` はsliceのみで着地を持たず、再開時に着地を失う。
+
+再開には設計担当が、(a) barrier中は失敗時例外より消費のみを優先し、barrier解消後の新操作で送る、
+または (b) 失敗時例外を優先し、紙めくりの継続・再開にも着地を型付きで運ぶ、のどちらかを正本へ明記する必要がある。
+前者は§4.5の適用条件、後者は§4.4.1の5と実装範囲を変えるため、実装担当では選んでいない。
+
+**保持した途中差分**:
+
+- `src/settings.rs` / `src/settings_transfer.rs`: 設定2件、Wheel4値、既定・clamp・転送分類と件数・既存全field変更fixture。
+- `src/keymap.rs` / `docs/keymap.ini.default` / `src/app/search_nav_entry_inventory_tests.rs`: Action2件の登録と分類、
+  消費したedgeの種類を返す `consume_action_press`（既存の入口は維持、OSキー状態の新規読取なし）。
+- `src/ui_dialogs/preferences/pages.rs` / `src/ui_dialogs/preferences/search_index.rs` / `src/ui_dialogs/context_shortcuts.rs`:
+  設定行・検索anchor・説明とヘルプ。snapshotの定義更新・PNG生成は未着手。
+- `src/ui_fullscreen/in_page_scroll.rs`: `ordered_scroll_pan` の移動量引数化、キーの設定値接続、主軸量・折り返し可否を分ける内部helper。
+  ホイール分類・適用・予測・新キーhandler・補間の実装は未着手。
+- `src/ui_fullscreen/initial_placement.rs` / `src/ui_fullscreen/initial_placement/tests.rs`: `kind`、読み終わり、設定の門、
+  要求再作成のkind引継ぎ。送りの要求からの接続は未着手。
+- 文書の作業差分: `docs/keymap-spec.md` / `docs/key-customization-impl-plan.md` / `docs/display-pipeline.md` /
+  `docs/spec.md` / `docs/fullscreen-in-page-scroll-plan.md` / `docs/README.md` / `docs/detached-rework-plan.md`、
+  `htdocs/mimageviewer/manual/fullscreen.html` / `shortcuts.html` / `settings.html`、本書。
+  これらは完成後の仕様の下書きであり、設計判断後の突合せが必要。
+
+**テスト差分**: 新しいテスト関数はまだ追加していない。`all_settings_fields_are_classified` の件数、
+`all_allowed_values_roundtrip_and_all_excluded_fields_preserve` が使うfixture、既存のorderedテストhelperとinventoryを更新した。
+初期配置の既存 `initial_placement_composition_request_matches_synchronous_normalize_open` と
+`initial_placement_composition_switch_deferred_normalize_uses_resumed_open_zoom` のrequest literalへ `Setting` を追加した。
+
+再開後の絞り込み候補は `fullscreen_in_page_scroll|in_page_scroll::|initial_placement|all_settings_fields_are_classified|all_allowed_values_roundtrip|search_nav_entry_inventory`。
+停止理由の追加回帰は、サムネイルでTurningへ入場→同じページのロード失敗を採用→新Press / wheel→保留・再開後の着地、を
+`in_page_scroll` 配下の既存handler / 描画fixtureで覆う。新規テスト・snapshot・gpu group登録は未完了。
+
+**再開時の追加棚卸し**: 構成変更で `normalize_spread_position` が別anchorを通常openする場合、
+`request_fs_initial_placement_after_composition_change` の呼出し前に要求が `Setting` へ置き換わり得る。
+helper内のkind引継ぎだけでなく、再openの所有境界から保持する接続が必要。設計との差分として採用した変更はない。
+
+**停止時の検査結果**: 引数なし `cargo fmt` は終了コード0、`python scripts/check_ui_glyphs.py` は危険グリフ0件、
+`git diff --check` は終了コード0。コンパイル・テスト・snapshot生成・実機検証はすべて未実施。

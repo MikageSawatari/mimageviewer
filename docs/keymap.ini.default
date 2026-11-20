@@ -485,6 +485,8 @@
 # FsPageScrollDown = none ; ページ内を下へスクロールする
 # FsPageScrollLeft = none ; ページ内を左へスクロールする
 # FsPageScrollRight = none ; ページ内を右へスクロールする
+# FsPageScrollOrTurnNext = none ; 順にスクロールし、端でもう一度押すと次のページへ送る
+# FsPageScrollOrTurnPrev = none ; 逆順にスクロールし、端でもう一度押すと前のページへ送る
 # FsAiModelNext = U ; AIモデルを次へ切り替える
 # FsAiModelPrev = Shift+U ; AIモデルを前へ切り替える
 # FsAiModelReset = Alt+U ; AIモデルを標準に戻す

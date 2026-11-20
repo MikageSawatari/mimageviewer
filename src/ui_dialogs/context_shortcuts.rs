@@ -466,12 +466,14 @@ fn fs_image_input_fixed_rows(
         4,
         FixedShortcutRow {
             keys: "マウスホイール",
-            description: if surface
-                && wheel.normalized() == crate::settings::FullscreenWheelAction::InPageScroll
-            {
-                "ページ内をスクロールする（Shift・チルトは横）。Alt・シークバー上はページ送り"
-            } else {
-                "前または次の項目へ移動する（連結読みではスクロール）"
+            description: match (surface, wheel.normalized()) {
+                (true, crate::settings::FullscreenWheelAction::InPageScroll) =>
+                    "ページ内をスクロールする（Shift・チルトは横）。Alt・シークバー上はページ送り",
+                (true, crate::settings::FullscreenWheelAction::ScrollThenPageTurn) =>
+                    "読み順にスクロールし、端でもう一度回すとページ送り。Alt・シークバー上はページ送り",
+                (true, crate::settings::FullscreenWheelAction::Zoom) =>
+                    "カーソル位置を基準にズームする。Shift は操作なし、Alt・シークバー上はページ送り",
+                _ => "前または次の項目へ移動する（連結読みではスクロール）",
             },
         },
     );
