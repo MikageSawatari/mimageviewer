@@ -156,9 +156,9 @@ bash scripts/setup-pdfium.sh check  # 新しいバージョンの有無を確認
 - **ソース**: [bblanchon/pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)
   (毎週月曜に Chromium 最新版から自動ビルド)
 - **アセット**: `pdfium-win-x64.tgz` (V8 なし版、軽量)
-- **現在のバージョン**: `chromium/8138` (`159.0.8138.0`、2026-11-10 更新)。
-  `vendor/pdfium/VERSION` と資産照合・hash は [更新記録](dependency-update-20261110.md) を参照
-  (前回の 8125 は [2026-10-28 の記録](dependency-update-20261028.md))
+- **現在のバージョン**: `chromium/8165` (`160.0.8165.0`、2026-11-19 更新)。
+  `vendor/pdfium/VERSION` と資産照合・hash は [更新記録](dependency-update-20261119.md) を参照
+  (前回の 8138 は [2026-11-10 の記録](dependency-update-20261110.md))
 
 ### リリース前チェック (必須)
 
@@ -369,6 +369,9 @@ PowerShell 版は `ConvertFrom-Json` を使う。
 bash scripts/setup-ffmpeg.sh           # BtbN の n7.1 系・最新の版付き LGPL shared build を取得
 bash scripts/setup-ffmpeg.sh check     # 新しい版付きビルドがあるか確認のみ
 ```
+
+`check` は資産名の major・minor・patch（省略時は 0）・コミット数を数値で比較し、手元が新しい場合も `Up to date.` とする。
+取得時も同じ比較で格下げを拒否し、数値が同じで名前が異なる場合や解析不能の場合は失敗する（意図的な入れ直しは `vendor/ffmpeg/VERSION` を削除して再実行）。
 
 - 取得元: [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases)
   の `ffmpeg-n7.1*-win64-lgpl-shared-7.1.zip`

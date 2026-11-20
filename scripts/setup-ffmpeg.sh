@@ -25,6 +25,53 @@
 #   配布物の「ソフトウェア情報」と installer/readme.txt に LGPL 通知を入れること。
 #   詳細は CLAUDE.md の「FFmpeg ライセンス対応」節を参照。
 
+# Print MAJOR MINOR PATCH COMMITS; a missing PATCH means zero.
+ffmpeg_asset_version() {
+    local asset_pattern='^ffmpeg-n([0-9]+)\.([0-9]+)(\.([0-9]+))?-([0-9]+)-g[0-9a-fA-F]+-win64-lgpl-shared-[0-9]+\.[0-9]+\.zip$'
+    [[ "$1" =~ $asset_pattern ]] || return 1
+    printf '%s %s %s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" \
+        "${BASH_REMATCH[4]:-0}" "${BASH_REMATCH[5]}"
+}
+
+# Compare current to matched. Equal numeric tuples with different names are
+# ambiguous, so only an identical asset name yields "identical".
+compare_ffmpeg_assets() {
+    if [[ "$1" == "$2" ]]; then
+        echo identical
+        return 0
+    fi
+    local current_version matched_version current_part matched_part i
+    local LC_ALL=C
+    local -a current_parts matched_parts
+    current_version=$(ffmpeg_asset_version "$1") || return 1
+    matched_version=$(ffmpeg_asset_version "$2") || return 1
+    read -r -a current_parts <<< "$current_version"
+    read -r -a matched_parts <<< "$matched_version"
+    for i in 0 1 2 3; do
+        # Strip leading zeros, then compare decimal lengths and digits. This
+        # preserves numeric ordering without octal parsing or integer overflow.
+        current_part=${current_parts[i]}
+        matched_part=${matched_parts[i]}
+        current_part=${current_part#"${current_part%%[!0]*}"}
+        matched_part=${matched_part#"${matched_part%%[!0]*}"}
+        if (( ${#current_part} > ${#matched_part} )) ||
+            { (( ${#current_part} == ${#matched_part} )) && [[ "$current_part" > "$matched_part" ]]; }; then
+            echo newer
+            return 0
+        elif (( ${#current_part} < ${#matched_part} )) ||
+            { (( ${#current_part} == ${#matched_part} )) && [[ "$current_part" < "$matched_part" ]]; }; then
+            echo older
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Sourcing exposes only the comparison helpers, without queries or setup.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
 set -euo pipefail
 
 REPO="BtbN/FFmpeg-Builds"
@@ -91,19 +138,33 @@ echo "Matched asset: $matched"
 if [ -f "$VERSION_FILE" ]; then
     current_asset=$(cat "$VERSION_FILE")
     echo "Current: $current_asset"
+    if ! comparison=$(compare_ffmpeg_assets "$current_asset" "$matched"); then
+        echo "Cannot compare versions: current=$current_asset matched=$matched" >&2
+        if [ "${1:-}" != "check" ]; then
+            echo "To reinstall intentionally, delete vendor/ffmpeg/VERSION and run bash scripts/setup-ffmpeg.sh again." >&2
+        fi
+        exit 1
+    fi
 else
     current_asset=""
+    comparison="older"
     echo "Current: (not installed)"
 fi
 
 # ── check モード ──
 if [ "${1:-}" = "check" ]; then
-    if [ "$current_asset" = "$matched" ]; then
-        echo "Up to date."
-    else
-        echo "New version available: $matched (current: ${current_asset:-none})"
-    fi
+    case "$comparison" in
+        identical) echo "Up to date." ;;
+        newer) echo "Up to date. Current is newer than the newest published versioned asset: $matched" ;;
+        older) echo "New version available: $matched (current: ${current_asset:-none})" ;;
+    esac
     exit 0
+fi
+
+if [ "$comparison" = "newer" ]; then
+    echo "Refusing FFmpeg downgrade: current=$current_asset matched=$matched" >&2
+    echo "To reinstall intentionally, delete vendor/ffmpeg/VERSION and run bash scripts/setup-ffmpeg.sh again." >&2
+    exit 1
 fi
 
 # ── ダウンロード ──

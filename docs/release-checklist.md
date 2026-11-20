@@ -280,7 +280,8 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
 8. ONNX Runtime DLL の配置確認（`bash scripts/setup-ort.sh`、ort クレート更新時は必須）
 9. Susie ワーカーの再ビルド（`bash scripts/setup-susie-worker.sh`）
 10. FFmpeg LGPL shared build の更新確認（`bash scripts/setup-ffmpeg.sh check` はローリング資産を除外し、
-    最新の版付き `autobuild-*` 資産と比較する）。バージョンを上げる場合は
+    最新の版付き `autobuild-*` 資産と比較する）。major・minor・patch（省略時は 0）・コミット数を数値で比較し、
+    手元が新しい場合も `Up to date.` とする。取得時も格下げは拒否し、比較不能なら失敗する。バージョンを上げる場合は
     `vendor/ffmpeg/VERSION`・実 DLL の `ProductVersion`・対応ソースを同じ commit に揃え、
     `src/video/ffmpeg_loader.rs` の DLL 名も一致するか確認。LGPL 通知の更新も忘れずに
     ([native-dependencies.md](native-dependencies.md) の「FFmpeg LGPL DLL 管理」節)

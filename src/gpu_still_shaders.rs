@@ -150,7 +150,7 @@ fn passthrough(device: &wgpu::Device, blob: &Bytecode) -> Stage {
     // SAFETY: build.rs compiles trusted WGSL with the exact fixed layout's HAL
     // register/special-constant mapping, SM5.1 and FXC flags. Explicit pipeline
     // layouts and the permanent WGSL/DXBC GPU parity tests enforce this contract.
-    // wgpu-hal 30.0.1 passes dxil bytes unchanged to D3D12 (also accepts DXBC).
+    // wgpu-hal 30.0.2 passes dxil bytes unchanged to D3D12 (also accepts DXBC).
     // Its public API documents DXIL: recheck this implementation on wgpu updates.
     let module = unsafe {
         device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
@@ -189,7 +189,7 @@ mod tests {
             );
             assert_eq!(
                 matches[0]["version"].as_str(),
-                Some("30.0.1"),
+                Some("30.0.2"),
                 "wgpu update: recheck static-image DXBC binding, HLSL Options, FXC and passthrough"
             );
             assert!(
