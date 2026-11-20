@@ -439,6 +439,9 @@ live Settings から引き継ぎ、
 
 通常動画の上部バーは × の左に「…」(その他の機能) を置き、デインターレースの
 自動 / 常に有効 / 無効を再生中・一時停止中に切り替えられる (§1.105 / §1.660)。
+「別ウィンドウ表示」行には現在の ON / OFF と `ToggleDetachedViewerMode` の先頭 chord を表示し、
+別ウィンドウ内も同じ `App::toggle_detached_viewer_mode()` へ合流する (§1.830)。
+command / event は source epoch と所有 context の既存経路を通り、ParkedLive では活性化要求だけになる。
 音声のみシェル・タイル一覧・移動プレビューでは表示しない。popup の実描画 rect は HUD
 region に加え、表示中は HUD を維持し、source 切り替え・タイル入場で閉じる。
 鍵の描画・hit rect は「…」の有無を受け取る共通配置計算を使う。

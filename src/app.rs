@@ -2061,6 +2061,23 @@ pub(crate) enum ViewerPresentation {
     DetachedWindow,
 }
 
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetachedToggleRoute {
+    DisabledByAlwaysNewImages,
+    MediaWindow { target: ViewerPresentation },
+    Preference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DetachedToggleRowState {
+    pub(crate) on: bool,
+    pub(crate) disabled_reason: Option<&'static str>,
+}
+
+#[cfg(windows)]
+const DETACHED_TOGGLE_DISABLED_REASON: &str = "毎回新しいウィンドウで開く設定ではF12切替は無効です";
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum VisibleSelectionPolicy {
     General,
@@ -71179,6 +71196,40 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn detached_toggle_route(&self) -> DetachedToggleRoute {
+        if self.detached_toggle_disabled_by_always_new_images() {
+            DetachedToggleRoute::DisabledByAlwaysNewImages
+        } else if let Some(target) = self.always_new_media_f12_target_presentation() {
+            DetachedToggleRoute::MediaWindow { target }
+        } else {
+            DetachedToggleRoute::Preference
+        }
+    }
+
+    pub(crate) fn detached_toggle_row_state(&self) -> DetachedToggleRowState {
+        #[cfg(windows)]
+        match self.detached_toggle_route() {
+            DetachedToggleRoute::DisabledByAlwaysNewImages => {
+                return DetachedToggleRowState {
+                    on: self.settings.detached_viewer_enabled,
+                    disabled_reason: Some(DETACHED_TOGGLE_DISABLED_REASON),
+                };
+            }
+            DetachedToggleRoute::MediaWindow { target } => {
+                return DetachedToggleRowState {
+                    on: target != ViewerPresentation::DetachedWindow,
+                    disabled_reason: None,
+                };
+            }
+            DetachedToggleRoute::Preference => {}
+        }
+        DetachedToggleRowState {
+            on: self.settings.detached_viewer_enabled,
+            disabled_reason: None,
+        }
+    }
+
+    #[cfg(windows)]
     pub(crate) fn always_new_media_f12_target_presentation(&self) -> Option<ViewerPresentation> {
         // §1.7: フル機能+メディア別窓でも同じ F12 トグル (メディア窓 ⇔ メイン) を使う。
         if !self.settings.effective_media_in_media_window() {
@@ -94254,62 +94305,65 @@ impl App {
         }
         #[cfg(windows)]
         {
-            if self.detached_toggle_disabled_by_always_new_images() {
-                self.show_feedback_warning(
-                    "毎回新しいウィンドウで開く設定ではF12切替は無効です".to_string(),
-                );
-                return;
-            }
-            if let Some(target_presentation) = self.always_new_media_f12_target_presentation() {
-                if target_presentation != self.viewer_presentation
-                    || self.explicit_presentation_is_independent(target_presentation)
-                        != self.detached_viewer_independent_active
-                    || self.video_presentation_transition.is_transitioning()
-                {
-                    // メイン側へ切り替えた場合だけ案内を出す: 「この表示先はビューア内の
-                    // 前後ナビでも維持され、グリッドから開き直すと別ウィンドウへ戻る」
-                    // ことが見えず、設定が壊れたと誤認されるため (実機 FB 2026-07-10)。
-                    // 別ウィンドウへ戻る方向は映像移動が視覚的に自明なので無通知のまま。
-                    // 旧廃止理由 (両ビューポートの二重表示ちらつき、2026-07-02) は
-                    // 面 routing (ActionSurface::Viewer) の単面表示で解消済み。
-                    let announce_main_hint =
-                        !matches!(target_presentation, ViewerPresentation::DetachedWindow);
-                    if self
-                        .fullscreen_idx
-                        .is_some_and(|idx| matches!(self.items.get(idx), Some(GridItem::Video(_))))
+            match self.detached_toggle_route() {
+                DetachedToggleRoute::DisabledByAlwaysNewImages => {
+                    self.show_feedback_warning(DETACHED_TOGGLE_DISABLED_REASON.to_string());
+                    return;
+                }
+                DetachedToggleRoute::MediaWindow {
+                    target: target_presentation,
+                } => {
+                    if target_presentation != self.viewer_presentation
+                        || self.explicit_presentation_is_independent(target_presentation)
+                            != self.detached_viewer_independent_active
+                        || self.video_presentation_transition.is_transitioning()
                     {
-                        // switch はタイルモード / player 未 ready / rect 解決失敗などで
-                        // no-op になり得る。新しい placement 切替要求が実際に発行されたかを
-                        // request_id の変化で観測する (Codex P3)。さらに案内トーストは
-                        // 要求発行時ではなく **切替の確定** (`PlacementSwitched` 適用) 時に
-                        // 出す — presenter 無応答で切り替わらなかったのに「切り替えました」を
-                        // 表示しない (Sol P2)。pending にフラグを焼き、確定側が発火する。
-                        if let Some(request_id) =
-                            self.request_native_video_f12_presentation(target_presentation)
-                            && announce_main_hint
+                        // メイン側へ切り替えた場合だけ案内を出す: 「この表示先はビューア内の
+                        // 前後ナビでも維持され、グリッドから開き直すと別ウィンドウへ戻る」
+                        // ことが見えず、設定が壊れたと誤認されるため (実機 FB 2026-07-10)。
+                        // 別ウィンドウへ戻る方向は映像移動が視覚的に自明なので無通知のまま。
+                        // 旧廃止理由 (両ビューポートの二重表示ちらつき、2026-07-02) は
+                        // 面 routing (ActionSurface::Viewer) の単面表示で解消済み。
+                        let announce_main_hint =
+                            !matches!(target_presentation, ViewerPresentation::DetachedWindow);
+                        if self.fullscreen_idx.is_some_and(|idx| {
+                            matches!(self.items.get(idx), Some(GridItem::Video(_)))
+                        }) {
+                            // switch はタイルモード / player 未 ready / rect 解決失敗などで
+                            // no-op になり得る。新しい placement 切替要求が実際に発行されたかを
+                            // request_id の変化で観測する (Codex P3)。さらに案内トーストは
+                            // 要求発行時ではなく **切替の確定** (`PlacementSwitched` 適用) 時に
+                            // 出す — presenter 無応答で切り替わらなかったのに「切り替えました」を
+                            // 表示しない (Sol P2)。pending にフラグを焼き、確定側が発火する。
+                            if let Some(request_id) =
+                                self.request_native_video_f12_presentation(target_presentation)
+                                && announce_main_hint
+                            {
+                                self.video_presentation_transition
+                                    .set_announce_main_hint(request_id);
+                            }
+                        } else if let Some(idx) = self.fullscreen_idx
+                            && self.viewer_item_supports_egui_detached_viewport(idx)
                         {
-                            self.video_presentation_transition
-                                .set_announce_main_hint(request_id);
-                        }
-                    } else if let Some(idx) = self.fullscreen_idx
-                        && self.viewer_item_supports_egui_detached_viewport(idx)
-                    {
-                        let depth_feedback = self.apply_egui_viewer_presentation_for_current_item(
-                            Some(idx),
-                            target_presentation,
-                            "always_new_media_f12",
-                        );
-                        // egui 経路は同期適用なのでここで即案内する。
-                        if announce_main_hint {
-                            self.show_media_window_main_hint_toast_with_depth_feedback(
-                                depth_feedback,
-                            );
-                        } else if let Some(message) = depth_feedback {
-                            self.show_feedback_toast(message);
+                            let depth_feedback = self
+                                .apply_egui_viewer_presentation_for_current_item(
+                                    Some(idx),
+                                    target_presentation,
+                                    "always_new_media_f12",
+                                );
+                            // egui 経路は同期適用なのでここで即案内する。
+                            if announce_main_hint {
+                                self.show_media_window_main_hint_toast_with_depth_feedback(
+                                    depth_feedback,
+                                );
+                            } else if let Some(message) = depth_feedback {
+                                self.show_feedback_toast(message);
+                            }
                         }
                     }
+                    return;
                 }
-                return;
+                DetachedToggleRoute::Preference => {}
             }
         }
         self.settings.detached_viewer_enabled = !self.settings.detached_viewer_enabled;

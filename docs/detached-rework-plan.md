@@ -1501,6 +1501,24 @@ detached の host viewport でも同じ消費点を通るが、変えたのは�
 設計担当と独立レビュー (Sol / xhigh、実装前と実装後) の双方が、「消費した持ち主の境界で使われない平滑化を終える構造的修正であり、guard・delay・repaint 抑止の症状パッチではない」ことに合意した。
 設計は [wheel-smoothing-tail-plan.md](wheel-smoothing-tail-plan.md)。回帰は `wheel_input.rs`・`wheel_frame_tests.rs` (子 viewport の破棄が root の次 pass を変えない検査を含む)・`in_page_scroll/handler_tests.rs`・`app/tests.rs`・`render_core.rs` の各テスト。実機の F12・複数窓の確認は未実施。
 
+### 2026-11-20 §1.830 全画面の「…」から別ウィンドウ表示を切り替える（実装済み・実機未確認）
+
+設計正本は [§1.830 設計メモ](fullscreen-overflow-detached-toggle-830-plan.md)。
+既存 toggle の remote → 音声モード → 所有 source-swap の拒否順を保ち、続く経路選択だけを
+`detached_toggle_route()` へ切り出す。行の ON / OFF と無効理由も同じ分類から導出する。
+静止画の Root 末尾行と native 動画 popup の行を追加し、native command / event・両変換・
+ParkedLive の HUD クリック分類・metadata を既存の source epoch / 所有 context 経路へ接続した。
+`fs_overflow_panel_state` は App 全体の前面状態のまま保持し、context bundle へ移さない。
+行の操作はパネルを閉じてから共通 toggle を呼び、別窓へ開状態を持ち越す組み合わせを作らない。
+新しい App の bool / Option / pending、待機・再試行・一括 reset は追加しない。
+ClaudeCode と独立レビュアー（実装前 r1 ACCEPT、設計メモ §10）は、既存の所有境界で入口を合流させる
+構造的変更であり症状パッチではないことに合意済み。実装後の独立レビュー (Sol / xhigh、2026-11-20) も ACCEPT で、
+実装についても同じ判断に同意した。
+検証: 関連テスト (detached_overflow / detached_toggle / native_detached / native_more_popup / fullscreen_overflow /
+overflow_input_tests / still_window_mode_key_tests / f12 等) 693 件成功、スナップショット 4 枚を更新して目視。
+実描画テストは残留所有 (前面の押下所有・一次ボタン抑止) に対象を限り、フォーカス復帰ガードは検証していない (既存の仕組み、変更なし)。
+F12・複数窓の実機確認は未実施。
+
 ### 2026-11-20 §1.476 タグ欄の検索確定（案 A、実機未確認）
 
 設計担当からの利用者決定に従い、`render_tag_view_bar` の入力変更による検索の受付だけを変更。

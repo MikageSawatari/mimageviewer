@@ -1027,6 +1027,7 @@ pub enum FullscreenOverflowItemId {
     ImageAnalysis,
     PixelGrid,
     LoupeLock,
+    DetachedViewer,
 }
 
 impl FullscreenOverflowItemId {
@@ -1042,6 +1043,7 @@ impl FullscreenOverflowItemId {
             Self::ImageAnalysis,
             Self::PixelGrid,
             Self::LoupeLock,
+            Self::DetachedViewer,
         ]
     }
 
@@ -1057,6 +1059,7 @@ impl FullscreenOverflowItemId {
             Self::ImageAnalysis => "分析ツール",
             Self::PixelGrid => "ピクセルグリッド",
             Self::LoupeLock => "ルーペ固定",
+            Self::DetachedViewer => "別ウィンドウ表示",
         }
     }
 }

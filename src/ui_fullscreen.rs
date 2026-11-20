@@ -6636,6 +6636,26 @@ fn draw_fs_overflow_panel_row(
     );
     label_job.wrap = egui::text::TextWrapping::truncate_at_width(label_width);
     let label_galley = ui.painter().layout_job(label_job);
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            egui::Id::unique(("fs_overflow_row_test", _id)),
+            (
+                rect,
+                egui::Rect::from_min_size(
+                    egui::pos2(label_left, rect.center().y - label_galley.size().y * 0.5),
+                    label_galley.size(),
+                ),
+                egui::Rect::from_min_size(
+                    egui::pos2(
+                        status_right - status_size.x,
+                        rect.center().y - status_size.y * 0.5,
+                    ),
+                    status_size,
+                ),
+            ),
+        );
+    });
     ui.painter().galley(
         egui::pos2(label_left, rect.center().y - label_galley.size().y * 0.5),
         label_galley,
@@ -38550,6 +38570,18 @@ impl App {
                     true,
                     None,
                 ),
+                FullscreenOverflowItemId::DetachedViewer => {
+                    let state = self.detached_toggle_row_state();
+                    (
+                        self.keymap.first_chord_bracket_label(
+                            item.label(),
+                            KeyAction::ToggleDetachedViewerMode,
+                        ),
+                        if state.on { "ON" } else { "OFF" }.into(),
+                        state.disabled_reason.is_none(),
+                        state.disabled_reason,
+                    )
+                }
             };
             root_rows.push(FsOverflowPanelRow {
                 item,
@@ -38894,6 +38926,10 @@ impl App {
                 }
                 FullscreenOverflowItemId::PixelGrid => self.toggle_fs_pixel_grid(),
                 FullscreenOverflowItemId::LoupeLock => self.toggle_fs_loupe_lock(),
+                FullscreenOverflowItemId::DetachedViewer => {
+                    self.dismiss_fs_overflow_panel();
+                    self.toggle_detached_viewer_mode();
+                }
             },
             FsOverflowPanelAction::SetNavigatorCorner(corner) => {
                 self.set_fullscreen_navigator_corner(corner);
@@ -68624,6 +68660,13 @@ mod tests {
                                     enabled: true,
                                     disabled_reason: None,
                                 },
+                                FsOverflowPanelRow {
+                                    item: FullscreenOverflowItemId::DetachedViewer,
+                                    label: "別ウィンドウ表示 [F12]".into(),
+                                    status: "OFF".into(),
+                                    enabled: true,
+                                    disabled_reason: None,
+                                },
                             ];
                             let mut root_rows = root_rows;
                             root_rows.insert(3, animation_row.clone());
@@ -68675,7 +68718,7 @@ mod tests {
                 });
             });
         harness.run();
-        if size.y >= 680.0 {
+        if size.y >= 720.0 {
             let (inner, content, offset) = harness.ctx.data(|data| {
                 data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout"))
                     .unwrap()
@@ -68705,8 +68748,8 @@ mod tests {
 
     #[test]
     fn fullscreen_overflow_panel_tall_viewport_keeps_the_production_body_height() {
-        // Eleven root rows need another 48pt for the reading-order entry.
-        for size in [egui::vec2(720.0, 680.0), egui::vec2(720.0, 720.0)] {
+        // 構成編集を含む12行は636pt。上バーと余白も含め720ptで収まる。
+        for size in [egui::vec2(720.0, 720.0), egui::vec2(720.0, 800.0)] {
             // The shared fixture retains its original Fits assertion; no PNG is
             // needed to detect the 8pt viewport shrink from build_ui's outer frame.
             let _ = fullscreen_overflow_panel_harness(FsOverflowPanelState::Root, size, false);
@@ -68738,7 +68781,7 @@ mod tests {
         snapshot_fullscreen_overflow_panel(
             "fullscreen_overflow_panel_root_tall",
             FsOverflowPanelState::Root,
-            egui::vec2(720.0, 680.0),
+            egui::vec2(720.0, 720.0),
             false,
         );
     }
@@ -68839,6 +68882,216 @@ mod tests {
             let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
             assert_eq!(stored.page_turn_animation_enabled, enabled);
             assert_eq!(stored.page_turn_animation_duration_ms, duration);
+        }
+    }
+
+    #[test]
+    fn detached_overflow_root_row_follows_keymap_preference_and_disabled_route() {
+        let mut app = crate::app::setup_app_for_test();
+        let row = |app: &mut App| {
+            let view = app.fullscreen_overflow_panel_view(false);
+            assert_eq!(
+                view.root_rows.len(),
+                FullscreenOverflowItemId::fixed_order().len()
+            );
+            assert_eq!(
+                view.root_rows
+                    .iter()
+                    .map(|row| row.item)
+                    .collect::<Vec<_>>(),
+                FullscreenOverflowItemId::fixed_order()
+            );
+            view.root_rows.last().unwrap().clone()
+        };
+        for chord in ["F12", "", "Ctrl+Alt+Shift+F12"] {
+            app.keymap =
+                Keymap::from_ini_str(&format!("[Global]\nToggleDetachedViewerMode = {chord}\n"));
+            for on in [false, true] {
+                app.settings.detached_viewer_enabled = on;
+                let row = row(&mut app);
+                assert_eq!(row.item, FullscreenOverflowItemId::DetachedViewer);
+                assert_eq!(
+                    row.label,
+                    app.keymap.first_chord_bracket_label(
+                        "別ウィンドウ表示",
+                        KeyAction::ToggleDetachedViewerMode
+                    )
+                );
+                if chord.is_empty() {
+                    assert_eq!(row.label, "別ウィンドウ表示");
+                }
+                assert_eq!(row.status, if on { "ON" } else { "OFF" });
+                assert!(row.enabled);
+                assert_eq!(row.disabled_reason, None);
+            }
+        }
+        #[cfg(windows)]
+        {
+            app.items = vec![GridItem::Image(PathBuf::from("overflow-disabled.png"))];
+            app.fullscreen_idx = Some(0);
+            app.settings.detached_viewer_open_images_in_window = true;
+            let row = row(&mut app);
+            assert!(!row.enabled);
+            app.toggle_detached_viewer_mode();
+            assert_eq!(
+                Some(app.fs_feedback_toast.as_ref().unwrap().0.as_str()),
+                row.disabled_reason
+            );
+        }
+    }
+
+    #[test]
+    fn detached_overflow_long_chord_keeps_status_separate() {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let keymap =
+            Keymap::from_ini_str("[Global]\nToggleDetachedViewerMode = Ctrl+Alt+Shift+F12\n");
+        let label = keymap
+            .first_chord_bracket_label("別ウィンドウ表示", KeyAction::ToggleDetachedViewerMode);
+        assert!(label.contains("F12"));
+        for status in ["ON", "OFF"] {
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.set_width(240.0);
+                draw_fs_overflow_panel_row(ui, "detached-long", &label, status, false, true, None);
+            })
+            .drop_without_applying_deltas();
+            let (row, label, status): (egui::Rect, egui::Rect, egui::Rect) = ctx.data(|data| {
+                data.get_temp(egui::Id::unique(("fs_overflow_row_test", "detached-long")))
+                    .unwrap()
+            });
+            assert!(row.contains_rect(label));
+            assert!(row.contains_rect(status));
+            assert!(label.right() + 8.0 <= status.left(), "{label:?} {status:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detached_overflow_activation_closes_panel_and_uses_shared_toggle() {
+        use crate::app::ViewerPresentation;
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.items = vec![GridItem::Image(PathBuf::from("overflow-toggle.png"))];
+        app.fullscreen_idx = Some(0);
+        app.settings.video_in_window_mode = false;
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        for on in [true, false] {
+            app.fs_overflow_panel_state = FsOverflowPanelState::Root;
+            let view = app.fullscreen_overflow_panel_view(false);
+            app.apply_fs_overflow_panel_action(
+                &ctx,
+                &view,
+                false,
+                FsOverflowPanelAction::Activate(FullscreenOverflowItemId::DetachedViewer),
+            );
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+            assert_eq!(app.settings.detached_viewer_enabled, on);
+            assert_eq!(
+                app.viewer_presentation,
+                if on {
+                    ViewerPresentation::DetachedWindow
+                } else {
+                    ViewerPresentation::Fullscreen
+                }
+            );
+            let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+            assert_eq!(stored.detached_viewer_enabled, on);
+        }
+        app.video_audio_mode = Some(0);
+        app.fs_overflow_panel_state = FsOverflowPanelState::Root;
+        let view = app.fullscreen_overflow_panel_view(false);
+        let row = view.root_rows.last().unwrap();
+        assert!(row.enabled && row.disabled_reason.is_none());
+        app.apply_fs_overflow_panel_action(
+            &ctx,
+            &view,
+            false,
+            FsOverflowPanelAction::Activate(FullscreenOverflowItemId::DetachedViewer),
+        );
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+        assert!(!app.settings.detached_viewer_enabled);
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("音声モードを終了してから")
+        );
+    }
+
+    #[test]
+    fn detached_overflow_last_row_scrolls_into_view_below_fixed_header() {
+        use crate::test_ui::scroll_layout::{HeightExpectation, ScrollLayout};
+        assert_eq!(
+            fs_overflow_panel_body_row_count(FsOverflowPanelState::Root),
+            12
+        );
+        assert_eq!(
+            FS_OVERFLOW_PANEL_HEADER_HEIGHT
+                + FS_OVERFLOW_PANEL_PADDING * 2.0
+                + 12.0 * FS_OVERFLOW_PANEL_ROW_HEIGHT,
+            636.0
+        );
+        for size in [egui::vec2(720.0, 680.0), egui::vec2(1093.0, 614.0)] {
+            let mut harness =
+                fullscreen_overflow_panel_harness(FsOverflowPanelState::Root, size, false);
+            let layout = |ctx: &egui::Context| -> ScrollLayout {
+                let (inner, content, offset) = ctx.data(|data| {
+                    data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout"))
+                        .unwrap()
+                });
+                ScrollLayout {
+                    inner,
+                    content,
+                    offset,
+                }
+            };
+            let before = layout(&harness.ctx);
+            let panel = fs_overflow_panel_rect(
+                egui::Rect::from_min_size(egui::Pos2::ZERO, size),
+                FsOverflowPanelState::Root,
+            )
+            .unwrap();
+            let close = harness
+                .ctx
+                .read_response(egui::Id::unique("fs_overflow_panel_close"))
+                .unwrap()
+                .rect;
+            assert!(close.bottom() <= before.inner.top());
+            assert!(panel.contains_rect(close));
+            before.assert_height(
+                HeightExpectation::Scrolls,
+                panel,
+                harness.ctx.pixels_per_point(),
+            );
+            harness.event(egui::Event::PointerMoved(before.inner.center()));
+            harness.event(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -4000.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+            });
+            // wheelの平滑化を既存のscroll-layout検査と同じ固定フレーム数だけ進める。
+            harness.run_steps(40);
+            let after = layout(&harness.ctx);
+            after.assert_scrolled_to_end(before, harness.ctx.pixels_per_point());
+            let (last, _, _): (egui::Rect, egui::Rect, egui::Rect) = harness.ctx.data(|data| {
+                data.get_temp(egui::Id::unique((
+                    "fs_overflow_row_test",
+                    ("fs_overflow_root", FullscreenOverflowItemId::DetachedViewer),
+                )))
+                .unwrap()
+            });
+            assert!(after.inner.expand(1.0).contains_rect(last));
+            assert_eq!(
+                harness
+                    .ctx
+                    .read_response(egui::Id::unique("fs_overflow_panel_close"))
+                    .unwrap()
+                    .rect,
+                close
+            );
         }
     }
 

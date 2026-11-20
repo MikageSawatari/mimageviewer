@@ -3394,6 +3394,8 @@ pub struct NativeOverlayMetadata {
     pub deinterlace_mode: crate::settings::VideoDeinterlaceMode,
     /// 現在値が open 時の設定と異なるか。player から導出する。
     pub deinterlace_manual: bool,
+    /// F12 の共通経路から導出した現在の別ウィンドウ表示。
+    pub detached_viewer_on: bool,
     /// 直近フレームのプレゼン経路 (動的)。
     pub last_present_path: crate::video::decoder::PresentPathSnapshot,
     /// bwdif フィルタの現在状態 (動的)。
@@ -3426,6 +3428,7 @@ pub struct NativeOverlayShortcutLabels {
     pub pin: Option<String>,
     pub perf_overlay: Option<String>,
     pub window_mode: Option<String>,
+    pub detached_viewer: Option<String>,
     pub tile_mode: Option<String>,
     pub bookmark: Option<String>,
     pub capture: Option<String>,
@@ -4913,6 +4916,7 @@ pub enum NativeOverlayCommand {
     CloseFullscreen,
     /// 動画 HUD のトグルボタン: ウィンドウ内再生 ⇔ 全画面 を切り替える。
     ToggleWindowMode,
+    ToggleDetachedViewerMode,
     SetVst3PanelVisible {
         visible: bool,
     },
@@ -16068,6 +16072,7 @@ fn native_hud_multitrack_fixture_metadata() -> NativeOverlayMetadata {
         d3d11va_supported: true,
         deinterlace_mode: crate::settings::VideoDeinterlaceMode::Auto,
         deinterlace_manual: false,
+        detached_viewer_on: false,
         last_present_path: crate::video::decoder::PresentPathSnapshot::Gpu,
         deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Inactive,
         interlace_detected: false,
@@ -19766,6 +19771,62 @@ mod chrome_suppression_interaction_tests {
             )).count(), 1);
             assert!(!overlay.more_popup_open);
             assert!(overlay.last_drawn_more_popup_rect.is_none());
+        }
+    }
+
+    #[test]
+    fn native_more_popup_detached_row_emits_command_closes_and_fits_small_viewport() {
+        for on in [false, true] {
+            for shortcut in [None, Some("F12"), Some("Ctrl+Alt+Shift+F12")] {
+                let (mut overlay, _) = fixture(false);
+                overlay.resize_dimensions(1093, 614);
+                let mut metadata = native_hud_multitrack_fixture_metadata();
+                metadata.detached_viewer_on = on;
+                metadata.shortcuts.detached_viewer = shortcut.map(str::to_owned);
+                overlay.set_metadata(Some(metadata));
+                open_more_popup(&mut overlay);
+                let popup = overlay.last_drawn_more_popup_rect.unwrap();
+                assert!(
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1093.0, 614.0))
+                        .contains_rect(popup)
+                );
+                let item = overlay
+                    .egui_ctx
+                    .read_response(egui::Id::unique("native_video_detached_viewer"))
+                    .unwrap();
+                assert!(popup.contains_rect(item.rect));
+                let deinterlace = overlay
+                    .egui_ctx
+                    .read_response(egui::Id::unique(("native_video_deinterlace_mode", 0usize)))
+                    .unwrap();
+                assert!(item.rect.bottom() < deinterlace.rect.top());
+                let capture = popup.expand(4.0);
+                assert!(overlay.compute_hud_regions().iter().any(|rect| rect.left
+                    == capture.left().round() as i32
+                    && rect.right == capture.right().round() as i32
+                    && rect.top == capture.top().round() as i32
+                    && rect.bottom == capture.bottom().round() as i32));
+                let pos = item.rect.center();
+                pointer(&mut overlay, pos);
+                frame(&mut overlay);
+                button(&mut overlay, pos, true);
+                frame(&mut overlay);
+                button(&mut overlay, pos, false);
+                let output = frame(&mut overlay);
+                assert_eq!(
+                    output
+                        .commands
+                        .iter()
+                        .filter(|command| matches!(
+                            command,
+                            NativeOverlayCommand::ToggleDetachedViewerMode
+                        ))
+                        .count(),
+                    1
+                );
+                assert!(!overlay.more_popup_open);
+                assert!(overlay.last_drawn_more_popup_rect.is_none());
+            }
         }
     }
 

@@ -6,6 +6,17 @@ use crate::keymap::{
     VIDEO_SEEK_STRIP_ACTIONS,
 };
 
+#[cfg(test)]
+thread_local! {
+    static NATIVE_METADATA_FOR_TEST: std::cell::RefCell<Option<crate::video::native_presenter::NativeOverlayMetadata>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn take_native_metadata_for_test()
+-> crate::video::native_presenter::NativeOverlayMetadata {
+    NATIVE_METADATA_FOR_TEST.with(|slot| slot.borrow_mut().take().unwrap())
+}
+
 #[cfg(windows)]
 pub(super) fn native_vst_video_compact(
     vst_available: bool,
@@ -5628,6 +5639,7 @@ impl App {
             | Ev::SetDeinterlaceMode { .. }
             | Ev::CloseFullscreen { .. }
             | Ev::ToggleWindowMode
+            | Ev::ToggleDetachedViewerMode
             | Ev::SetVst3VideoCompact { .. }
             | Ev::Vst3ShowSlotGui { .. }
             | Ev::Vst3HideSlotGui { .. }
@@ -6706,6 +6718,9 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::ToggleWindowMode => {
                 self.toggle_video_window_mode_for_input(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::ToggleDetachedViewerMode => {
+                self.toggle_detached_viewer_mode();
             }
             crate::video::NativeVideoOutputEvent::PlacementReady {
                 request_id,
@@ -8999,6 +9014,9 @@ impl App {
             pin: self.keymap.first_chord_label(KeyAction::VideoPin),
             perf_overlay: self.keymap.first_chord_label(KeyAction::VideoPerfOverlay),
             window_mode: self.keymap.first_chord_label(KeyAction::FsToggleWindowMode),
+            detached_viewer: self
+                .keymap
+                .first_chord_label(KeyAction::ToggleDetachedViewerMode),
             tile_mode: self.keymap.first_chord_label(KeyAction::VideoTileMode),
             bookmark: self.keymap.first_chord_label(KeyAction::VideoBookmark),
             capture: self.keymap.first_chord_label(KeyAction::VideoCapture),
@@ -9626,6 +9644,7 @@ impl App {
                 d3d11va_supported: info.d3d11va_supported,
                 deinterlace_mode: player.deinterlace_mode(),
                 deinterlace_manual: player.deinterlace_manual(),
+                detached_viewer_on: self.detached_toggle_row_state().on,
                 last_present_path,
                 deinterlace_status,
                 interlace_detected,
@@ -9665,6 +9684,7 @@ impl App {
                 d3d11va_supported: false,
                 deinterlace_mode: player.deinterlace_mode(),
                 deinterlace_manual: player.deinterlace_manual(),
+                detached_viewer_on: self.detached_toggle_row_state().on,
                 last_present_path: crate::video::decoder::PresentPathSnapshot::Pending,
                 deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot::Pending,
                 interlace_detected: false,
@@ -9674,6 +9694,8 @@ impl App {
                 shortcut_help,
             }
         };
+        #[cfg(test)]
+        NATIVE_METADATA_FOR_TEST.with(|slot| *slot.borrow_mut() = Some(metadata.clone()));
         player.set_native_metadata(Some(metadata));
         player.set_native_chrome_snapshot(chrome);
     }

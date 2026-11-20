@@ -176,6 +176,262 @@ fn touch(pos: egui::Pos2, phase: egui::TouchPhase) -> egui::Event {
     }
 }
 
+#[cfg(windows)]
+fn detached_toggle_frame(
+    app: &mut App,
+    ctx: &egui::Context,
+    viewport_id: egui::ViewportId,
+    events: Vec<egui::Event>,
+) {
+    detached_toggle_frame_with_focus(app, ctx, viewport_id, true, events);
+}
+
+#[cfg(windows)]
+fn detached_toggle_frame_with_focus(
+    app: &mut App,
+    ctx: &egui::Context,
+    viewport_id: egui::ViewportId,
+    focused: bool,
+    events: Vec<egui::Event>,
+) {
+    app.frame_counter += 1;
+    let time = app.frame_counter as f64 / 60.0;
+    // render_fullscreen_viewport 自身が子 viewport を開く。外側の RawInput だけに
+    // 子のIDと寸法を渡すと、headlessでは埋め込みWindowへのfallbackになり、
+    // 行の描画座標・clip・入力先が1000×800の専用viewportと一致しない。
+    ctx.set_embed_viewports(false);
+    let child_events = std::cell::RefCell::new(events.clone());
+    egui::Context::set_immediate_viewport_renderer(move |ctx, mut child| {
+        let mut raw = egui::RawInput {
+            viewport_id: child.ids.this,
+            screen_rect: Some(viewport()),
+            time: Some(time),
+            focused,
+            events: if child.ids.this == viewport_id {
+                child_events.take()
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        };
+        raw.viewports.insert(
+            child.ids.this,
+            egui::ViewportInfo {
+                parent: Some(child.ids.parent),
+                focused: Some(focused),
+                ..Default::default()
+            },
+        );
+        crate::test_ui::headless_paint_output(ctx.run_ui(raw, |ui| {
+            assert_eq!(ctx.viewport_id(), child.ids.this);
+            assert_eq!(ctx.viewport_rect(), viewport());
+            assert_eq!(ctx.input(|input| input.raw.focused), focused);
+            assert_eq!(ctx.input(|input| input.viewport().focused), Some(focused));
+            (child.viewport_ui_cb)(ui);
+        }))
+        .drop_without_applying_deltas();
+    });
+    crate::test_ui::headless_paint_output(ctx.run_ui(
+        egui::RawInput {
+            screen_rect: Some(viewport()),
+            time: Some(time),
+            focused: true,
+            events: if viewport_id == egui::ViewportId::ROOT {
+                events
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        },
+        |ui| app.render_fullscreen_viewport(ui),
+    ))
+    .drop_without_applying_deltas();
+}
+
+#[cfg(windows)]
+#[test]
+fn detached_overflow_real_mouse_touch_switch_retires_owner_and_preserves_sibling() {
+    use crate::app::ViewerPresentation;
+    let _input = crate::key_input::lock_test_input();
+    for initial_on in [false, true] {
+        for is_touch in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = landscape_sources(&ctx);
+            app.settings.video_in_window_mode = false;
+            app.native_video_in_window_active = false;
+            app.viewer_presentation = ViewerPresentation::Fullscreen;
+            let pixels = Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::RED));
+            let tex = ctx.load_texture(
+                "sibling-830",
+                (*pixels).clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            let sibling = app.build_window_context_for_test(830, |mounted| {
+                mounted.items = vec![GridItem::Image(PathBuf::from("c:/sibling-830.png"))];
+                mounted.items_generation = 830;
+                mounted.fullscreen_idx = Some(0);
+                mounted.fs_cache.insert(
+                    0,
+                    FsCacheEntry::Static {
+                        pdf_rerender_failures: Vec::new(),
+                        pdf_metadata: None,
+                        tex,
+                        pixels,
+                        source_dims: Some([2, 2]),
+                        load_seq: 830,
+                        animation: crate::fs_animation::StaticAnimationState::Still,
+                    },
+                );
+            });
+            let signature = |mounted: &mut App| {
+                let FsCacheEntry::Static { tex, load_seq, .. } = mounted.fs_cache.get(&0).unwrap()
+                else {
+                    unreachable!()
+                };
+                (
+                    mounted
+                        .items
+                        .iter()
+                        .map(GridItem::display_path)
+                        .collect::<Vec<_>>(),
+                    mounted.items_generation,
+                    mounted.fullscreen_idx,
+                    mounted.detached_viewer_window_id(),
+                    mounted.fs_cache.len(),
+                    tex.id(),
+                    *load_seq,
+                )
+            };
+            let before_sibling = app.with_window_context_for_test(sibling, signature);
+            if initial_on {
+                app.toggle_detached_viewer_mode();
+            }
+            let source = app.fullscreen_viewport_id();
+            app.fs_overflow_panel_state = FsOverflowPanelState::Root;
+            for _ in 0..4 {
+                detached_toggle_frame(&mut app, &ctx, source, vec![]);
+            }
+            let (row, _, _): (egui::Rect, egui::Rect, egui::Rect) = ctx.data(|data| {
+                data.get_temp(egui::Id::unique((
+                    "fs_overflow_row_test",
+                    ("fs_overflow_root", FullscreenOverflowItemId::DetachedViewer),
+                )))
+                .unwrap()
+            });
+            let panel = fs_overflow_panel_rect(viewport(), FsOverflowPanelState::Root).unwrap();
+            let (inner, content, offset) = ctx.data(|data| {
+                data.get_temp(egui::Id::unique("fs_overflow_scroll_test_layout"))
+                    .unwrap()
+            });
+            crate::test_ui::scroll_layout::ScrollLayout {
+                inner,
+                content,
+                offset,
+            }
+            .assert_height(
+                crate::test_ui::scroll_layout::HeightExpectation::Fits,
+                panel.intersect(viewport()),
+                ctx.pixels_per_point(),
+            );
+            let clip: egui::Rect = ctx.data(|data| {
+                data.get_temp(egui::Id::unique("fs_overflow_scroll_test_clip"))
+                    .unwrap()
+            });
+            assert!(
+                panel.contains_rect(row),
+                "source={source:?}, panel={panel:?}, row={row:?}, clip={clip:?}"
+            );
+            assert!(
+                clip.contains_rect(row),
+                "実際の行全体がScrollAreaのclip内にある: row={row:?}, clip={clip:?}"
+            );
+            let pos = row.center();
+            detached_toggle_frame(&mut app, &ctx, source, vec![egui::Event::PointerMoved(pos)]);
+            let mut press = vec![
+                egui::Event::PointerMoved(pos),
+                button(pos, egui::PointerButton::Primary, true),
+            ];
+            if is_touch {
+                press.insert(0, touch(pos, egui::TouchPhase::Start));
+            }
+            let pan = app.fs_pan;
+            detached_toggle_frame(&mut app, &ctx, source, press);
+            assert!(app.fs_front_pointer.owns_primary());
+            assert_eq!(app.settings.detached_viewer_enabled, initial_on);
+            let mut release = vec![button(pos, egui::PointerButton::Primary, false)];
+            if is_touch {
+                release.insert(0, touch(pos, egui::TouchPhase::End));
+            }
+            detached_toggle_frame(&mut app, &ctx, source, release);
+            assert_eq!(app.settings.detached_viewer_enabled, !initial_on);
+            assert_eq!(
+                app.viewer_presentation == ViewerPresentation::DetachedWindow,
+                !initial_on
+            );
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+            assert_eq!(
+                app.fullscreen_idx,
+                Some(1),
+                "行のreleaseで背面のページを送らない"
+            );
+            assert_eq!(app.fs_pan, pan);
+            assert!(!app.fs_front_pointer.is_active());
+            assert_eq!(
+                app.with_window_context_for_test(sibling, signature),
+                before_sibling
+            );
+
+            let destination = app.fullscreen_viewport_id();
+            assert_ne!(source, destination);
+            detached_toggle_frame(&mut app, &ctx, source, vec![egui::Event::PointerGone]);
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+            // このテストの対象は残留所有 (切替前の押下の所有が新しい窓へ残らないこと) に限る。
+            // フォーカス復帰ガード (`fs_focus_regained_at` / 復帰クリック) は今回変更しない既存の仕組みで、
+            // ここでは検証しない (検査するなら既存の `test_native_focus::scoped()` の shim を使う)。
+            // 宛先のフォーカスは保ったままにする。
+            detached_toggle_frame(&mut app, &ctx, destination, vec![]);
+            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Closed);
+            assert!(!app.fs_front_pointer.is_active());
+            assert!(!app.fs_primary_suppression.is_active());
+            let canvas = egui::pos2(250.0, 400.0);
+            let edge = |pressed| button(canvas, egui::PointerButton::Primary, pressed);
+            // 時間待ちやガード解除の直書きなしで、次の新しいcanvas streamが抑止されない。
+            for _ in 0..3 {
+                detached_toggle_frame(&mut app, &ctx, destination, vec![]);
+            }
+            let mut press = vec![egui::Event::PointerMoved(canvas), edge(true)];
+            if is_touch {
+                press.insert(0, touch(canvas, egui::TouchPhase::Start));
+            }
+            detached_toggle_frame(&mut app, &ctx, destination, press);
+            // 残留所有の正本は前面の押下所有と一次ボタン抑止。操作対象の 320x160 は 1000x800 の窓より小さく
+            // パンの余地が無いので fs_pan では判定しない (次の操作が実際にパンすることまでは見ない)。
+            assert!(
+                !app.fs_primary_suppression.is_active(),
+                "切替後の新しいstreamを残留所有で抑止しない"
+            );
+            assert!(!app.fs_front_pointer.is_active());
+            let end = canvas + egui::vec2(45.0, 25.0);
+            let mut movement = vec![egui::Event::PointerMoved(end)];
+            if is_touch {
+                movement.insert(0, touch(end, egui::TouchPhase::Move));
+            }
+            detached_toggle_frame(&mut app, &ctx, destination, movement);
+            assert!(!app.fs_primary_suppression.is_active());
+            let mut release = vec![button(end, egui::PointerButton::Primary, false)];
+            if is_touch {
+                release.insert(0, touch(end, egui::TouchPhase::End));
+            }
+            detached_toggle_frame(&mut app, &ctx, destination, release);
+            assert!(!app.fs_front_pointer.is_active());
+            assert_eq!(
+                app.with_window_context_for_test(sibling, signature),
+                before_sibling
+            );
+        }
+    }
+}
+
 fn tap(app: &mut App, ctx: &egui::Context, pos: egui::Pos2) {
     frame(
         app,

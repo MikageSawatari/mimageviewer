@@ -67558,6 +67558,242 @@ mod still_window_mode_key_tests {
         app.items.len() - 1
     }
 
+    #[test]
+    #[cfg(windows)]
+    fn detached_toggle_route_and_row_state_cover_media_intent_and_reopen_gap() {
+        use DetachedToggleRoute as Route;
+        for always_new in [false, true] {
+            for preference in [false, true] {
+                for in_window in [false, true] {
+                    let mut app = setup_app();
+                    let video = push_video(&mut app, r"C:\clips\route.mp4");
+                    app.settings.detached_viewer_open_images_in_window = always_new;
+                    app.settings.fullfeature_media_window = !always_new;
+                    app.settings.detached_viewer_enabled = preference;
+                    app.settings.video_in_window_mode = in_window;
+                    app.fullscreen_idx = Some(video);
+                    for current in [
+                        ViewerPresentation::Fullscreen,
+                        ViewerPresentation::DetachedWindow,
+                    ] {
+                        app.viewer_presentation = current;
+                        let target = if current == ViewerPresentation::DetachedWindow {
+                            app.non_detached_viewer_presentation()
+                        } else {
+                            ViewerPresentation::DetachedWindow
+                        };
+                        assert_eq!(app.detached_toggle_route(), Route::MediaWindow { target });
+                        assert_eq!(
+                            app.detached_toggle_row_state(),
+                            DetachedToggleRowState {
+                                on: current == ViewerPresentation::DetachedWindow,
+                                disabled_reason: None,
+                            }
+                        );
+                    }
+                    // 遷移中は表示元ではなく、遷移先が現在の表示意図。
+                    for target in [
+                        ViewerPresentation::DetachedWindow,
+                        app.non_detached_viewer_presentation(),
+                    ] {
+                        app.viewer_presentation = if target == ViewerPresentation::DetachedWindow {
+                            ViewerPresentation::Fullscreen
+                        } else {
+                            ViewerPresentation::DetachedWindow
+                        };
+                        begin_test_video_presentation_transition(&mut app, target, false);
+                        let next = if target == ViewerPresentation::DetachedWindow {
+                            app.non_detached_viewer_presentation()
+                        } else {
+                            ViewerPresentation::DetachedWindow
+                        };
+                        assert_eq!(
+                            app.detached_toggle_route(),
+                            Route::MediaWindow { target: next }
+                        );
+                        assert_eq!(
+                            app.detached_toggle_row_state().on,
+                            target == ViewerPresentation::DetachedWindow
+                        );
+                    }
+                }
+            }
+        }
+        let mut app = setup_app();
+        push_image(&mut app, r"C:\pics\reopen.jpg");
+        app.fullscreen_idx = Some(0);
+        app.toggle_detached_viewer_mode();
+        let binding = app.detached_viewer_window_id();
+        assert!(binding.is_some());
+        app.fullscreen_idx = None;
+        assert_eq!(app.detached_toggle_route(), Route::Preference);
+        assert!(app.detached_toggle_row_state().on);
+        assert_eq!(app.detached_viewer_window_id(), binding);
+        app.toggle_detached_viewer_mode();
+        assert!(!app.settings.detached_viewer_enabled);
+        assert_eq!(
+            app.viewer_presentation,
+            app.non_detached_viewer_presentation()
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_toggle_route_preserves_disabled_preference_and_media_behavior() {
+        for always_new in [false, true] {
+            let mut app = setup_app();
+            push_image(&mut app, r"C:\pics\route.jpg");
+            app.fullscreen_idx = Some(0);
+            app.settings.detached_viewer_open_images_in_window = always_new;
+            assert_eq!(
+                app.detached_toggle_route(),
+                if always_new {
+                    DetachedToggleRoute::DisabledByAlwaysNewImages
+                } else {
+                    DetachedToggleRoute::Preference
+                }
+            );
+            app.toggle_detached_viewer_mode();
+            assert_eq!(app.settings.detached_viewer_enabled, !always_new);
+            if always_new {
+                assert_eq!(
+                    app.detached_toggle_row_state().disabled_reason,
+                    Some(DETACHED_TOGGLE_DISABLED_REASON)
+                );
+                assert_eq!(
+                    app.fs_feedback_toast.as_ref().unwrap().0,
+                    DETACHED_TOGGLE_DISABLED_REASON
+                );
+            } else {
+                assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+                let stored =
+                    crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+                assert!(stored.detached_viewer_enabled);
+            }
+        }
+        for always_new in [false, true] {
+            let mut app = setup_app();
+            let audio = push_audio(&mut app, r"C:\music\route.flac");
+            app.settings.detached_viewer_open_images_in_window = always_new;
+            app.settings.fullfeature_media_window = !always_new;
+            app.settings.video_in_window_mode = true;
+            app.fullscreen_idx = Some(audio);
+            app.viewer_presentation = ViewerPresentation::DetachedWindow;
+            app.toggle_detached_viewer_mode();
+            assert!(!app.settings.detached_viewer_enabled);
+            assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
+            app.toggle_detached_viewer_mode();
+            assert!(!app.settings.detached_viewer_enabled);
+            assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn native_detached_toggle_event_respects_owner_epoch_audio_and_parked_activation() {
+        use crate::video::NativeVideoOutputEvent as Ev;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let video = push_video(&mut app, r"C:\clips\toggle.mp4");
+        app.fs_cache.insert(
+            video,
+            FsCacheEntry::Video {
+                player: Box::new(
+                    crate::video::VideoPlayer::stream_ready_disconnected_for_test(PathBuf::from(
+                        r"C:\clips\toggle.mp4",
+                    )),
+                ),
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(video);
+        app.viewer_presentation = ViewerPresentation::Fullscreen;
+        for (idx, epoch) in [(video + 1, 0), (video, 99)] {
+            app.handle_native_video_output_event(&ctx, idx, epoch, Ev::ToggleDetachedViewerMode);
+            assert!(!app.settings.detached_viewer_enabled);
+            assert!(!app.video_presentation_transition.is_transitioning());
+        }
+        app.native_video_parked_live_input_window_id = Some(92);
+        app.handle_native_video_output_event(&ctx, video, 0, Ev::ToggleDetachedViewerMode);
+        assert_eq!(app.native_video_parked_live_activation_requests, vec![92]);
+        assert!(!app.settings.detached_viewer_enabled);
+        assert_eq!(app.viewer_presentation, ViewerPresentation::Fullscreen);
+        assert!(!app.video_presentation_transition.is_transitioning());
+        app.native_video_parked_live_input_window_id = None;
+        app.video_audio_mode = Some(video);
+        app.handle_native_video_output_event(&ctx, video, 0, Ev::ToggleDetachedViewerMode);
+        assert_eq!(app.video_audio_mode, Some(video));
+        assert!(!app.settings.detached_viewer_enabled);
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("音声モードを終了してから")
+        );
+        app.video_audio_mode = None;
+        app.handle_native_video_output_event(&ctx, video, 0, Ev::ToggleDetachedViewerMode);
+        assert!(app.settings.detached_viewer_enabled);
+        assert!(app.video_presentation_transition.is_transitioning());
+        assert_eq!(
+            app.video_presentation_transition.target(),
+            ViewerPresentation::DetachedWindow
+        );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detached_toggle_native_metadata_tracks_route_and_keymap_with_and_without_probe() {
+        let mut app = setup_app();
+        let path = app.tmp.path().join("detached-metadata.mp4");
+        let video = push_video(&mut app, path.to_str().unwrap());
+        app.fullscreen_idx = Some(video);
+        for probe in [false, true] {
+            let player = if probe {
+                crate::video::VideoPlayer::stream_ready_disconnected_for_test(path.clone())
+            } else {
+                crate::video::VideoPlayer::disconnected_for_test(path.clone(), 0.0)
+            };
+            app.fs_cache.insert(
+                video,
+                FsCacheEntry::Video {
+                    player: Box::new(player),
+                    load_seq: 0,
+                },
+            );
+            for chord in ["", "Ctrl+Alt+Shift+F12"] {
+                app.keymap = crate::keymap::Keymap::from_ini_str(&format!(
+                    "[Global]\nToggleDetachedViewerMode = {chord}\n"
+                ));
+                for media_route in [false, true] {
+                    app.settings.fullfeature_media_window = media_route;
+                    for on in [false, true] {
+                        app.settings.detached_viewer_enabled = on;
+                        // メディア経路では設定と逆にし、設定の直読みを検出する。
+                        app.viewer_presentation = if !on {
+                            ViewerPresentation::DetachedWindow
+                        } else {
+                            ViewerPresentation::Fullscreen
+                        };
+                        app.sync_native_video_metadata(video);
+                        let metadata = crate::app::native_video::take_native_metadata_for_test();
+                        assert_eq!(metadata.probe_info_available, probe);
+                        assert_eq!(
+                            metadata.detached_viewer_on,
+                            if media_route { !on } else { on }
+                        );
+                        assert_eq!(
+                            metadata.shortcuts.detached_viewer,
+                            app.keymap.first_chord_label(
+                                crate::keymap::KeyAction::ToggleDetachedViewerMode
+                            )
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn install_playing_test_media(app: &mut App, idx: usize, path: PathBuf, position_secs: f64) {
         let player = crate::video::VideoPlayer::disconnected_for_test(path, position_secs);
         player.set_playing(true);

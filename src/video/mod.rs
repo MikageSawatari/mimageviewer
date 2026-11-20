@@ -1242,6 +1242,7 @@ pub enum NativeVideoOutputEvent {
     },
     /// 動画 HUD のトグルボタン: ウィンドウ内再生 ⇔ 全画面 を切り替える。
     ToggleWindowMode,
+    ToggleDetachedViewerMode,
     PlacementReady {
         request_id: u64,
         placement: NativeVideoPlacement,
@@ -5049,6 +5050,7 @@ fn send_native_overlay_command(
         Command::ToggleAudioMode => NativeVideoOutputEvent::ToggleAudioMode,
         Command::CloseFullscreen => NativeVideoOutputEvent::CloseFullscreen { generation },
         Command::ToggleWindowMode => NativeVideoOutputEvent::ToggleWindowMode,
+        Command::ToggleDetachedViewerMode => NativeVideoOutputEvent::ToggleDetachedViewerMode,
         Command::SetVst3PanelVisible { visible } => {
             NativeVideoOutputEvent::SetVst3PanelVisible { visible }
         }
@@ -7687,6 +7689,13 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::ToggleWindowMode,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleDetachedViewerMode => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleDetachedViewerMode,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::SetVst3PanelVisible {
@@ -18149,6 +18158,39 @@ mod tests {
                 &super::PlacementTransitionControl::Retire,
             )
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_detached_toggle_command_conversions_keep_source_epoch() {
+        let fault = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (tx, rx) = super::native_output_event_bus(
+            8,
+            fault,
+            std::sync::Arc::new(super::VideoUiWake::default()),
+        );
+        super::send_native_overlay_command(
+            &tx,
+            41,
+            31,
+            crate::video::native_presenter::NativeOverlayCommand::ToggleDetachedViewerMode,
+        );
+        let events = rx.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].source_epoch, 41);
+        assert!(matches!(
+            events[0].event,
+            super::NativeVideoOutputEvent::ToggleDetachedViewerMode
+        ));
+        // presenter loopはHWND/GPUを必要とする。専用match腕が同じepoch付き送信へ
+        // 接続されることを配線のsource検査で補い、実機の動作検証とは区別する。
+        let source = include_str!("mod.rs");
+        let arm = source.split_once("crate::video::native_presenter::NativeOverlayCommand::ToggleDetachedViewerMode => {")
+            .unwrap().1.split_once("crate::video::native_presenter::NativeOverlayCommand::SetVst3PanelVisible").unwrap().0;
+        assert!(arm.contains("send_native_output_event("));
+        assert!(arm.contains("&ui_event_tx,"));
+        assert!(arm.contains("event_epoch,"));
+        assert!(arm.contains("NativeVideoOutputEvent::ToggleDetachedViewerMode,"));
     }
 
     #[cfg(windows)]
