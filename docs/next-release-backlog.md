@@ -39,6 +39,11 @@
 
 ## 1. 優先候補
 
+### 1.831 本の構成の確認で保留された Split / slice 付きの Wrap が、再開すると slice を失う — §1.823〜1.826 の作業から (2026-11-20)
+
+- 状態: **未着手・原因未確認、収録版未定**。scroll-823 (§1.823〜1.826) の作業中に、範囲外の既存の問題として報告された。通常のページ送りでも同じ形で起きるとのこと (scroll-823 の報告、コードからの見立てで実機未確認)。
+- 内容: 本の構成の表示許可の確認 (book composition permission) で保留になった送りのうち、Split (ページの分割) や slice 付きの Wrap (端で次の本 / ページへ回り込む送り) は、許可が下りて再開するときに slice (表示中のページの片側) の情報を落とす。詳しい経路は scroll-823 の会話と共有ノート scroll-823-826.md を参照し、着手時に再確認する。
+
 ### 1.830 全画面の上部バーの「…」から F12 の別ウィンドウ表示を切り替えられるようにする — 利用者要望 (2026-11-20)
 
 - 状態: **v5.5.0 の目標に入れる (利用者 2026-11-20「比較的軽微なら、次のバージョンに入れたいです」、範囲は「両方に入れる」)、未着手**。
@@ -186,6 +191,7 @@
 - (d) **未対応 (2026-11-19、v5.4.0 のリリース準備で発見)**: `test-lib-full.ps1 -Features test-script` の全件 (4735863b8 の 1 つ前のソース) で `epub_convert::tests::sibling_save_passes_original_stem_to_worker_after_copying_source` が epub_convert.rs:1707 の unwrap で失敗 (`Io: ファイル名、ディレクトリ名、またはボリューム ラベルの構文が間違っています。 (0x8007007B)`)。単独の --stress-count 10 では全部成功。負荷の下でだけ出る。g3・RAR 評価と同じく、テストの外部依存 (一時フォルダ・ワーカーの起動) を疑う。v5.4.0 は止めない。同じ全件中の test-full (既定 feature) では 2 回とも通っている。
 - (e) **未対応 (2026-11-19、v5.4.0 の配布ビルドの全体テストで発見)**: `archive_conversion_failure_diagnostics::locked_zip_publish_reports_plain_message_and_native_error_without_overwrite` が tests/archive_conversion_failure_diagnostics.rs:64 の `read_to_string(logs_dir()/archive-conversion-failure-test.log)` で NotFound (os error 3)。4ac4227ca のソース、21,115 件中この 1 件だけ失敗。単独の --stress-count 20 では全部成功。同じ全件で並行して走る別のテストと、ログの置き場所 (`data_dir::logs_dir`) を共有していないかを疑う。v5.4.0 は止めない。
 - (f) **未対応 (2026-11-19、v5.4.0 の配布ビルドの全体テストで発見)**: `previous_run_diagnostics::tests::diagnostic_device_latch_is_saved_by_normal_maintenance_and_clean_suppresses_notice` が previous_run_diagnostics.rs:1428 の `finish_until(..., 20 秒)` で偽 (0.44 秒で失敗、待ち切れではない)。c636d3410 のソース、21,115 件中この 1 件だけ。単独の --stress-count 20 では全部成功。(e) と合わせ、配布ビルドの全体テストが毎回別の 1 件で落ちたため、v5.4.0 は利用者の了承 (2026-11-19「省いて作る」) で `-SkipRustTests` を使った。根拠: §1.815 より前のソースは 1 回目の配布ビルドで全件成功、§1.815 のブランチは lib 全件 19,007 件成功、落ちた各テストは単独で成功。
+- (g) **未対応 (2026-11-20、v5.5.0 の作業中に発見)**: `ui_fullscreen::page_turn::` のテスト群 (cover / landscape / permission_service など) が、負荷の下でだけ落ちる。master の test-full (03e1cb024 の頃) で `permission_service_regression_tests::permission_service_handlers_pdf_zip_automatic_and_composed_turn_on_receipt` が 580 行の `draw(...)` (めくりのアニメーションが始まらない、zip=true composed=true RtlCover target=1) で失敗。統括が単独 20 回・page_turn 204 件の 5 回並列で流すと全部成功し、次の test-full (39e5e2c6e の前) も成功。scroll-823 の lib 全件の 1 回目でも同じ群が 15 件落ち、単独では 26 件とも成功・2 回目の全件は全部成功 (scroll-823 の報告)。duration-762 の全件にも同じ群の失敗があった (同報告)。未確認の見立て (統括): `seed_outgoing` は今のページの表示許可を待つが、行き先ページの許可 (`book_presentation_target_allowed`、合成本のサービスの別スレッドが返す) は待たないので、返事が遅れると `book_presentation_not_fully_allowed` でめくりが省かれる。
 
 ### 1.809 UI 全般のマウス移動に伴う GPU 負荷を減らせるか確認する — 5ch >>805・810 (2026-11-18)
 
