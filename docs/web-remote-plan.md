@@ -2101,7 +2101,7 @@ Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe `
 
   ```powershell
   .\scripts\setup-test-dlls.ps1
-  .\scripts	est-lib-full.ps1
+  .\scripts\test-lib-full.ps1
   ```
 
 - 本体 UI (`app.rs` / `ui_fullscreen.rs` 等) に触れた増分では、絞り込みではなく
