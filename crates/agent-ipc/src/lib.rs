@@ -28,7 +28,7 @@ pub use read_types::*;
 mod folder_types;
 pub use folder_types::*;
 
-pub const AGENT_PROTOCOL_VERSION: u32 = 4;
+pub const AGENT_PROTOCOL_VERSION: u32 = 5;
 pub const MIN_ADAPTER_PROTOCOL_VERSION: u32 = 3;
 /// Fixed pipe namespace identifier, unrelated to business IPC versions. Never change it.
 pub const AGENT_PIPE_NAMESPACE: &str = "mimageviewer-agent-v3";
@@ -65,9 +65,45 @@ pub const MAX_THUMBNAIL_ITEMS: usize = 20;
 pub const MAX_WRITE_ITEMS: usize = 500;
 pub const MAX_WRITE_TAGS: usize = 10;
 pub const DEFAULT_THUMBNAIL_SIDE: u32 = 256;
-pub const MAX_THUMBNAIL_SIDE: u32 = 512;
+pub const MAX_LEGACY_THUMBNAIL_SIDE: u32 = 512;
+pub const MAX_THUMBNAIL_SIDE: u32 = 1568;
+/// Absolute decoder cap; negotiated request budgets can be smaller.
+pub const MAX_THUMBNAIL_WIRE_IMAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_THUMBNAIL_IMAGE_BYTES: usize = 256 * 1024;
 pub const MAX_THUMBNAIL_TOTAL_BYTES: usize = 1024 * 1024;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThumbnailBudget {
+    pub max_image_bytes: usize,
+    pub max_total_bytes: usize,
+    pub max_images: usize,
+}
+
+/// Clamp only after the caller has validated the minimum side.
+pub fn clamp_thumbnail_side(protocol_version: u32, long_side: u32) -> u32 {
+    long_side.min(if protocol_version >= 5 {
+        MAX_THUMBNAIL_SIDE
+    } else {
+        MAX_LEGACY_THUMBNAIL_SIDE
+    })
+}
+
+/// Shared producer/consumer budget for the negotiated version and request side.
+pub fn thumbnail_budget(protocol_version: u32, clamped_long_side: u32) -> ThumbnailBudget {
+    if protocol_version >= 5 && clamped_long_side > MAX_LEGACY_THUMBNAIL_SIDE {
+        ThumbnailBudget {
+            max_image_bytes: MAX_THUMBNAIL_WIRE_IMAGE_BYTES,
+            max_total_bytes: 2 * 1024 * 1024,
+            max_images: 4,
+        }
+    } else {
+        ThumbnailBudget {
+            max_image_bytes: MAX_THUMBNAIL_IMAGE_BYTES,
+            max_total_bytes: MAX_THUMBNAIL_TOTAL_BYTES,
+            max_images: MAX_THUMBNAIL_ITEMS,
+        }
+    }
+}
+
 /// All non-image budgets count the structured JSON and its escaped text copy.
 pub const MAX_ITEM_CHARS: usize = 12_000;
 pub const MCP_ENVELOPE_RESERVE_CHARS: usize = 2_000;
@@ -156,8 +192,38 @@ pub enum Command {
         max_stars: Option<u8>,
         #[serde(default)]
         kinds: Option<Vec<FolderKind>>,
+        #[serde(default)]
+        recursive: bool,
+        #[serde(default)]
+        max_depth: Option<u32>,
+        #[serde(default)]
+        name_contains: Option<String>,
+        #[serde(default)]
+        extensions: Option<Vec<String>>,
+        #[serde(default)]
+        tagged: Option<bool>,
         limit: Option<u32>,
         cursor: Option<String>,
+    },
+    SummarizeFolder {
+        path: String,
+        subresource: Option<String>,
+        #[serde(default)]
+        min_stars: Option<u8>,
+        #[serde(default)]
+        max_stars: Option<u8>,
+        #[serde(default)]
+        kinds: Option<Vec<FolderKind>>,
+        #[serde(default)]
+        recursive: bool,
+        #[serde(default)]
+        max_depth: Option<u32>,
+        #[serde(default)]
+        name_contains: Option<String>,
+        #[serde(default)]
+        extensions: Option<Vec<String>>,
+        #[serde(default)]
+        tagged: Option<bool>,
     },
     GetThumbnail {
         items: Vec<ItemRef>,
@@ -215,6 +281,7 @@ pub enum Payload {
     Info(InfoPage),
     Transcript(TranscriptReadResult),
     Folder(FolderPage),
+    FolderSummary(FolderSummary),
     Thumbnails(ThumbnailResponse),
     Opened(OpenResult),
     CollectionWrite(CollectionWriteResult),
@@ -355,6 +422,8 @@ pub enum TagChoice {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StatusPayload {
+    pub search_scope: Vec<String>,
+    pub search_scope_truncated: bool,
     pub app_version: String,
     pub permission: PermissionSnapshot,
     pub fts_ready: bool,
@@ -707,7 +776,7 @@ mod tests {
             incomplete["command"].as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<Request>(incomplete).is_err());
         }
-        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 5);
     }
 
     #[test]
@@ -829,7 +898,7 @@ mod tests {
 
     #[test]
     fn collection_write_wire_roundtrips_grouped_input_positions() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 5);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -901,7 +970,7 @@ mod tests {
             .unwrap(),
             permission
         );
-        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 5);
     }
 
     #[test]
@@ -980,7 +1049,7 @@ mod tests {
 
     #[test]
     fn metadata_write_wire_roundtrips_and_full_batch_outcomes_fit_budget() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 5);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -1057,7 +1126,7 @@ mod tests {
 
     #[test]
     fn open_wire_uses_typed_accepted_result_without_changing_protocol_version() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 4);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 5);
         assert_eq!(
             serde_json::to_value(Command::OpenInViewer {
                 path: "C:/猫.png".into(),

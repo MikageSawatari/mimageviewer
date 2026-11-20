@@ -34,6 +34,8 @@ fn immediate(command: Command, ctx: &ReadContext) -> Result<Payload, Command> {
             permission: ctx.granted.0,
             fts_ready: false,
             remote_active: false,
+            search_scope: Vec::new(),
+            search_scope_truncated: false,
         })),
         command => Err(command),
     }

@@ -9,9 +9,9 @@ fn only_exact_hello_sends_business_request_and_other_responses_use_neutral_guida
     };
     let control = CallControl::default();
     for (bytes, accepted) in [
-        (response(Ok(Payload::Hello { version: 4 })), true),
+        (response(Ok(Payload::Hello { version: 5 })), true),
         (response(Ok(Payload::Hello { version: 3 })), false),
-        (response(Ok(Payload::Hello { version: 5 })), false),
+        (response(Ok(Payload::Hello { version: 6 })), false),
         (
             response(Err(AgentError::new(
                 ErrorCode::VersionMismatch,
@@ -42,7 +42,7 @@ fn only_exact_hello_sends_business_request_and_other_responses_use_neutral_guida
                     &mut b,
                     &Response {
                         id: 2,
-                        result: Ok(Payload::Hello { version: 4 }),
+                        result: Ok(Payload::Hello { version: 5 }),
                     },
                 )
                 .unwrap();
@@ -85,7 +85,7 @@ fn cancelled_handshake_never_sends_a_business_request() {
         &mut frame,
         &Response {
             id: 1,
-            result: Ok(Payload::Hello { version: 4 }),
+            result: Ok(Payload::Hello { version: 5 }),
         },
     )
     .unwrap();

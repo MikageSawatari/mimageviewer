@@ -1,6 +1,9 @@
 use super::tests::Fixture;
 use super::*;
 
+#[path = "../../crates/agent-ipc/tests/v3_wire/mod.rs"]
+mod v3_wire;
+
 const V3_HELLO: &[u8] = include_bytes!("../../crates/agent-ipc/tests/v3_wire/hello.frame");
 
 fn handshake(connection: &Arc<Connection>, frame: &[u8]) -> Response {
@@ -36,7 +39,21 @@ fn shipped_v3_hello_frame_negotiates_and_reaches_handler_with_connection_version
     assert!(f.call(&v3, 2, Command::Status).result.is_ok());
     assert_eq!(versions.recv_timeout(Duration::from_secs(10)).unwrap(), 3);
 
-    let v4 = f.connection();
+    let current = f.connection();
+    assert!(f.call(&current, 2, Command::Status).result.is_ok());
+    assert_eq!(versions.recv_timeout(Duration::from_secs(10)).unwrap(), 5);
+    let v4 = Connection::new(f.handlers.clone());
+    assert_eq!(
+        handshake(
+            &v4,
+            &frame(serde_json::json!({
+                "id": 1, "command": { "type": "hello", "version": 4,
+                "client_name": "legacy-v4", "client_version": "1", "request_kind": "tool" }
+            }))
+        )
+        .result,
+        Ok(Payload::Hello { version: 4 })
+    );
     assert!(f.call(&v4, 2, Command::Status).result.is_ok());
     assert_eq!(versions.recv_timeout(Duration::from_secs(10)).unwrap(), 4);
     // No re-Hello can change a connection's version or attribution.
@@ -70,7 +87,7 @@ fn unsupported_hello_is_read_without_business_types_and_never_reaches_handler() 
         now: Arc::new(Instant::now),
         execute: Box::new(|_, _| panic!("unnegotiated request reached business handler")),
     }));
-    for version in [0, 2, 5, u32::MAX] {
+    for version in [0, 2, 6, u32::MAX] {
         let c = Connection::new(f.handlers.clone());
         // These fields cannot deserialize as today's Request. Only the fixed
         // envelope is meaningful until the adapter version has been accepted.
@@ -82,7 +99,7 @@ fn unsupported_hello_is_read_without_business_types_and_never_reaches_handler() 
             })),
         );
         assert_eq!(response.id, 77);
-        assert_eq!(response.result, Ok(Payload::Hello { version: 4 }));
+        assert_eq!(response.result, Ok(Payload::Hello { version: 5 }));
         for command in [
             Command::Status,
             Command::Cancel { request_id: 2 },
@@ -108,7 +125,7 @@ fn unsupported_hello_is_read_without_business_types_and_never_reaches_handler() 
                 &c,
                 3,
                 Command::Hello {
-                    version: 4,
+                    version: 5,
                     client_name: "test".into(),
                     client_version: "1".into(),
                     request_kind: RequestKind::Tool,
@@ -123,6 +140,138 @@ fn unsupported_hello_is_read_without_business_types_and_never_reaches_handler() 
         );
         assert_eq!(f.handlers.active.load(Ordering::Acquire), 0);
         assert!(f.handlers.recent_apps.lock().unwrap().entries().is_empty());
+    }
+}
+
+fn frozen_call(
+    fixture: &Fixture,
+    connection: &Arc<Connection>,
+    id: u64,
+    command: v3_wire::Command,
+    tool: &str,
+) -> serde_json::Value {
+    let mut request = Vec::new();
+    v3_wire::write_frame(&mut request, &v3_wire::Request { id, command }).unwrap();
+    let current: Request = read_frame(&mut request.as_slice()).unwrap().unwrap();
+    let response = fixture.call(connection, current.id, current.command);
+    assert!(response.result.is_ok(), "{tool}: {:?}", response.result);
+    let mut encoded = Vec::new();
+    write_frame(&mut encoded, &response).unwrap();
+    assert!(encoded.len() <= v3_wire::MAX_FRAME_BYTES + 4);
+    let old: v3_wire::Response = v3_wire::read_frame(&mut encoded.as_slice())
+        .unwrap()
+        .unwrap();
+    let output = v3_wire::output::tool_result(tool, old.result);
+    assert_eq!(output["isError"], false, "{tool}: {output}");
+    let tools = v3_wire::schema::tools();
+    let schema = &tools.iter().find(|entry| entry["name"] == tool).unwrap()["outputSchema"];
+    assert!(v3_wire::schema_check::accepts_schema(
+        schema,
+        &output["structuredContent"]
+    ));
+    output
+}
+
+#[test]
+fn frozen_v3_v4_requests_reach_real_handlers_with_old_output_limits() {
+    let fixture = Fixture::new();
+    let folder = fixture._dir.path().join("folder");
+    std::fs::create_dir_all(folder.join("child")).unwrap();
+    let image = folder.join("page.png");
+    image::DynamicImage::new_rgb8(700, 350)
+        .save(&image)
+        .unwrap();
+    image::DynamicImage::new_rgb8(2, 2)
+        .save(folder.join("child/nested.png"))
+        .unwrap();
+    crate::settings_db::with_db_result(|db| {
+        let mut settings = db.load_into_settings()?;
+        settings.agent_show_thumbnails = true;
+        let mut favorite = crate::settings::FavoriteEntry::new("indexed".into(), folder.clone());
+        favorite.auto_index_metadata = true;
+        settings.favorites = vec![favorite];
+        db.save_full(&settings)
+    })
+    .unwrap();
+    // v4 retained these shipped v3 wire request/response families unchanged.
+    for version in [3, 4] {
+        let connection = Connection::new(fixture.handlers.clone());
+        let mut hello = Vec::new();
+        v3_wire::write_frame(
+            &mut hello,
+            &v3_wire::Request {
+                id: 1,
+                command: v3_wire::Command::Hello {
+                    version,
+                    client_name: "frozen".into(),
+                    client_version: "1".into(),
+                    request_kind: v3_wire::RequestKind::Tool,
+                },
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            handshake(&connection, &hello).result,
+            Ok(Payload::Hello { version })
+        );
+        let status = frozen_call(
+            &fixture,
+            &connection,
+            2,
+            v3_wire::Command::Status,
+            "miv_status",
+        );
+        assert!(status["structuredContent"].get("search_scope").is_none());
+        assert!(
+            status["structuredContent"]
+                .get("search_scope_truncated")
+                .is_none()
+        );
+        let listed = frozen_call(
+            &fixture,
+            &connection,
+            3,
+            v3_wire::Command::ListFolder {
+                path: folder.to_string_lossy().into_owned(),
+                subresource: None,
+                min_stars: None,
+                max_stars: None,
+                kinds: None,
+                limit: None,
+                cursor: None,
+            },
+            "list_folder",
+        );
+        let names: Vec<_> = listed["structuredContent"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"child") && names.contains(&"page.png"));
+        let thumbnails = frozen_call(
+            &fixture,
+            &connection,
+            4,
+            v3_wire::Command::GetThumbnail {
+                items: (0..5)
+                    .map(|_| v3_wire::ItemRef {
+                        path: image.to_string_lossy().into_owned(),
+                        subresource: None,
+                    })
+                    .collect(),
+                long_side: Some(1568),
+                cursor: None,
+            },
+            "get_thumbnail",
+        );
+        assert_eq!(thumbnails["content"].as_array().unwrap().len(), 6);
+        for row in thumbnails["structuredContent"]["items"].as_array().unwrap() {
+            assert_eq!(row["dimensions"]["width"], 512);
+            assert_eq!(row["dimensions"]["height"], 256);
+        }
+        assert!(thumbnails["structuredContent"]["cursor"].is_null());
     }
 }
 

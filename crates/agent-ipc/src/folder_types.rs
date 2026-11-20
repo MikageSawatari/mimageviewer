@@ -2,6 +2,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Dimensions, ItemRef, PageRow};
 
+/// Counts filtered logical rows before pagination or oversized-row replacement.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FolderSummary {
+    pub total: usize,
+    pub kinds: std::collections::BTreeMap<FolderKind, usize>,
+    pub stars: [usize; 6],
+    pub folders: Option<Vec<FolderSummaryFolder>>,
+    pub folders_truncated: bool,
+    pub book_composition_applied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FolderSummaryFolder {
+    pub path: String,
+    pub name: String,
+    pub total: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FolderPage {
     pub items: Vec<PageRow<FolderItem>>,
@@ -88,7 +106,7 @@ mod webp_base64 {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
         let encoded = String::deserialize(deserializer)?;
-        let max = crate::MAX_THUMBNAIL_IMAGE_BYTES;
+        let max = crate::MAX_THUMBNAIL_WIRE_IMAGE_BYTES;
         if encoded.len() > max.div_ceil(3) * 4 {
             return Err(D::Error::custom("thumbnail exceeds image byte budget"));
         }
@@ -106,6 +124,67 @@ mod tests {
     use crate::*;
 
     #[test]
+    fn maximum_large_thumbnail_response_fits_the_existing_frame() {
+        let response = ThumbnailResponse {
+            page: ThumbnailPage {
+                items: (0..2)
+                    .map(|_| {
+                        ThumbnailItem {
+                            item: ItemRef {
+                                path: "C:/photo.png".into(),
+                                subresource: None,
+                            },
+                            status: ThumbnailStatus::Ok,
+                            dimensions: Some(Dimensions {
+                                width: 1568,
+                                height: 1568,
+                                unit: DimensionUnit::Pixels,
+                            }),
+                        }
+                        .into()
+                    })
+                    .collect(),
+                cursor: Some("next".into()),
+                truncated: true,
+            },
+            images: (0..2)
+                .map(|item_index| ThumbnailImage {
+                    item_index,
+                    webp: vec![255; MAX_THUMBNAIL_WIRE_IMAGE_BYTES],
+                })
+                .collect(),
+        };
+        let mut frame = vec![];
+        write_frame(&mut frame, &response).unwrap();
+        assert!(frame.len() < MAX_FRAME_BYTES);
+        assert_eq!(
+            read_frame::<_, ThumbnailResponse>(&mut frame.as_slice()).unwrap(),
+            Some(response)
+        );
+    }
+
+    #[test]
+    fn thumbnail_budget_changes_only_for_new_protocol_and_large_request() {
+        for version in [3, 4, 5] {
+            for side in [256, 512, 513, 1568, u32::MAX] {
+                let clamped = clamp_thumbnail_side(version, side);
+                assert_eq!(clamped, side.min(if version == 5 { 1568 } else { 512 }));
+                let budget = thumbnail_budget(version, clamped);
+                let large = version == 5 && clamped > 512;
+                assert_eq!(
+                    budget.max_image_bytes,
+                    if large { 1024 * 1024 } else { 256 * 1024 }
+                );
+                assert_eq!(
+                    budget.max_total_bytes,
+                    if large { 2 * 1024 * 1024 } else { 1024 * 1024 }
+                );
+                assert_eq!(budget.max_images, if large { 4 } else { 20 });
+            }
+        }
+    }
+
+    #[test]
     fn filter_omission_and_null_have_identical_wire_defaults() {
         for base in [
             serde_json::json!({"type":"list_folder","path":"C:/photos"}),
@@ -116,6 +195,10 @@ mod tests {
             if base["type"] == "list_folder" {
                 explicit["min_stars"] = serde_json::Value::Null;
                 explicit["kinds"] = serde_json::Value::Null;
+                explicit["recursive"] = serde_json::json!(false);
+                for key in ["max_depth", "name_contains", "extensions", "tagged"] {
+                    explicit[key] = serde_json::Value::Null;
+                }
             }
             let omitted: Command = serde_json::from_value(base).unwrap();
             let null: Command = serde_json::from_value(explicit).unwrap();
@@ -145,6 +228,11 @@ mod tests {
         };
         for command in [
             Command::ListFolder {
+                recursive: false,
+                max_depth: None,
+                name_contains: None,
+                extensions: None,
+                tagged: None,
                 min_stars: None,
                 max_stars: None,
                 kinds: None,
@@ -213,7 +301,7 @@ mod tests {
         // A decoded overrun can have the same base64 length as the exact cap.
         let oversized = ThumbnailImage {
             item_index: 0,
-            webp: vec![255; MAX_THUMBNAIL_IMAGE_BYTES + 1],
+            webp: vec![255; MAX_THUMBNAIL_WIRE_IMAGE_BYTES + 1],
         };
         assert!(
             serde_json::from_value::<ThumbnailImage>(serde_json::to_value(oversized).unwrap())
@@ -222,7 +310,7 @@ mod tests {
         for webp in [
             serde_json::json!([1, 2, 3]),
             serde_json::json!("?"),
-            serde_json::json!("A".repeat(MAX_THUMBNAIL_IMAGE_BYTES.div_ceil(3) * 4 + 4)),
+            serde_json::json!("A".repeat(MAX_THUMBNAIL_WIRE_IMAGE_BYTES.div_ceil(3) * 4 + 4)),
         ] {
             assert!(
                 serde_json::from_value::<ThumbnailImage>(

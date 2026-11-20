@@ -22,6 +22,7 @@ pub(crate) mod open;
 mod open_response;
 mod rating;
 mod recent;
+mod status;
 pub(crate) use recent::{RecentApps, SharedRecentApps};
 mod collection_write;
 #[cfg(test)]
@@ -694,6 +695,7 @@ fn tool_name(command: &Command) -> &'static str {
         Command::ListLibrary { .. } => "list_library",
         Command::GetItemInfo { .. } => "get_item_info",
         Command::ListFolder { .. } => "list_folder",
+        Command::SummarizeFolder { .. } => "summarize_folder",
         Command::GetThumbnail { .. } => "get_thumbnail",
         Command::GetTranscript { .. } => "get_transcript",
         Command::OpenInViewer { .. } => "open_in_viewer",
@@ -715,6 +717,7 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
         Ok(Payload::Library(p)) => (p.items.len(), "none"),
         Ok(Payload::Info(p)) => (p.items.len(), "none"),
         Ok(Payload::Folder(p)) => (p.items.len(), "none"),
+        Ok(Payload::FolderSummary(p)) => (p.total, "none"),
         Ok(Payload::Thumbnails(p)) => (p.page.items.len(), "none"),
         Ok(Payload::Transcript(TranscriptReadResult::Present(page))) => {
             (page.segments.len(), "none")
@@ -790,14 +793,7 @@ impl Handlers {
             Command::Hello { .. } => {
                 Err(error(ErrorCode::BadRequest, "接続の確認は受付で行います"))
             }
-            Command::Status => Ok(Payload::Status(StatusPayload {
-                app_version: env!("CARGO_PKG_VERSION").into(),
-                permission: ctx.granted.0,
-                fts_ready: self.readers.fts.read().unwrap().is_some(),
-                remote_active: self.session.as_ref().is_some_and(|s| {
-                    s.snapshot().phase != crate::remote_ipc::session::RemoteControlPhase::Local
-                }),
-            })),
+            Command::Status => self.status(ctx),
             Command::ListTags {
                 choice,
                 limit,
@@ -880,16 +876,54 @@ impl Handlers {
                 min_stars,
                 max_stars,
                 kinds,
+                recursive,
+                max_depth,
+                name_contains,
+                extensions,
+                tagged,
                 limit,
                 cursor,
-            } => self.list_folder(
+            } => self.list_folder_with_options(
                 path,
                 subresource,
                 min_stars,
                 max_stars,
                 kinds,
+                folder::FolderOptions {
+                    recursive,
+                    max_depth,
+                    name_contains,
+                    extensions,
+                    tagged,
+                },
                 limit,
                 cursor,
+                ctx,
+            ),
+            Command::SummarizeFolder {
+                path,
+                subresource,
+                min_stars,
+                max_stars,
+                kinds,
+                recursive,
+                max_depth,
+                name_contains,
+                extensions,
+                tagged,
+            } => self.summarize_folder(
+                path,
+                subresource,
+                min_stars,
+                max_stars,
+                kinds,
+                folder::FolderOptions {
+                    recursive,
+                    max_depth,
+                    name_contains,
+                    extensions,
+                    tagged,
+                },
                 ctx,
             ),
             Command::GetThumbnail {

@@ -27,10 +27,11 @@ impl Handlers {
         if side < DEFAULT_THUMBNAIL_SIDE {
             return Err(error(
                 ErrorCode::BadRequest,
-                "一辺は256～512で指定してください",
+                "長辺は256以上で指定してください",
             ));
         }
-        let side = side.min(MAX_THUMBNAIL_SIDE);
+        let side = clamp_thumbnail_side(ctx.adapter_protocol_version, side);
+        let budget = thumbnail_budget(ctx.adapter_protocol_version, side);
         let normalized = items
             .iter()
             .map(|item| {
@@ -52,7 +53,7 @@ impl Handlers {
         let io = crate::io_semaphore::GlobalIoSemaphore::process_shared(
             settings.indexer_speed_profile.io_permits(),
         );
-        let mut page = ThumbnailBuilder::new(offset, args, ctx.granted.1);
+        let mut page = ThumbnailBuilder::new(offset, args, ctx.granted.1, budget);
         for item in items.iter().skip(offset) {
             ctx.checkpoint()?;
             let (row, image) =
@@ -79,10 +80,16 @@ struct ThumbnailBuilder {
     offset: usize,
     args: serde_json::Value,
     permission_epoch: u64,
+    budget: ThumbnailBudget,
 }
 
 impl ThumbnailBuilder {
-    fn new(offset: usize, args: serde_json::Value, permission_epoch: u64) -> Self {
+    fn new(
+        offset: usize,
+        args: serde_json::Value,
+        permission_epoch: u64,
+        budget: ThumbnailBudget,
+    ) -> Self {
         Self {
             rows: Vec::new(),
             images: Vec::new(),
@@ -90,6 +97,7 @@ impl ThumbnailBuilder {
             offset,
             args,
             permission_epoch,
+            budget,
         }
     }
 
@@ -104,16 +112,16 @@ impl ThumbnailBuilder {
         }
         if image
             .as_ref()
-            .is_some_and(|bytes| bytes.len() > MAX_THUMBNAIL_IMAGE_BYTES)
+            .is_some_and(|bytes| bytes.len() > self.budget.max_image_bytes)
         {
             row.status = ThumbnailStatus::TooLarge;
             row.dimensions = None;
             image = None;
         }
-        if image
-            .as_ref()
-            .is_some_and(|bytes| self.bytes + bytes.len() > MAX_THUMBNAIL_TOTAL_BYTES)
-        {
+        if image.as_ref().is_some_and(|bytes| {
+            self.bytes + bytes.len() > self.budget.max_total_bytes
+                || self.images.len() >= self.budget.max_images
+        }) {
             return Ok(false);
         }
         self.rows.push(row);

@@ -234,7 +234,7 @@ fn tool_descriptions_preserve_operation_conditions_without_initialization_instru
             "get_thumbnail",
             vec![
                 "<256 rejected",
-                ">512 clamped",
+                "max 1568 clamped",
                 "no adjustments",
                 "No folder/archive representatives",
                 "thumbnail permission required",
@@ -394,8 +394,6 @@ fn transcript_output_schemas_require_summary_and_tagged_read_states() {
     for invalid in [
         json!({"status":"not_permitted"}),
         json!({"status":"present"}),
-        json!({"status":"none","value":{}}),
-        json!({"status":"failed","value":{}}),
         json!({"status":"missing"}),
     ] {
         assert!(!accepts_schema(&tool["outputSchema"], &invalid));
@@ -456,6 +454,8 @@ fn transcript_all_protocols_transport_saved_text_and_absence_states() {
         ) -> BackendResult {
             match command {
                 Command::Status => Ok(Payload::Status(StatusPayload {
+                    search_scope: vec![],
+                    search_scope_truncated: false,
                     app_version: "fixture".into(),
                     permission: PermissionSnapshot {
                         level: AgentLevel::ReadOnly,
@@ -527,6 +527,11 @@ fn folder_filters_and_library_ceiling_forward_validate_and_default() {
     assert_eq!(
         command,
         Command::ListFolder {
+            recursive: false,
+            max_depth: None,
+            name_contains: None,
+            extensions: None,
+            tagged: None,
             path: "C:/photos".into(),
             subresource: None,
             min_stars: Some(0),
@@ -770,6 +775,11 @@ fn stage1b_argument_contracts_and_schema() {
     assert_eq!(
         folder,
         Command::ListFolder {
+            recursive: false,
+            max_depth: None,
+            name_contains: None,
+            extensions: None,
+            tagged: None,
             min_stars: None,
             max_stars: None,
             kinds: None,
@@ -787,7 +797,7 @@ fn stage1b_argument_contracts_and_schema() {
                 path: "C:/book.zip".into(),
                 subresource: Some("cat.png".into())
             }],
-            long_side: Some(512),
+            long_side: Some(999),
             cursor: Some("next".into())
         }
     );
@@ -836,7 +846,7 @@ fn stage1b_argument_contracts_and_schema() {
     );
     assert_eq!(
         thumbnail["inputSchema"]["properties"]["long_side"]["maximum"],
-        512
+        1568
     );
     for name in ["list_folder", "get_thumbnail"] {
         let tool = tools.iter().find(|tool| tool["name"] == name).unwrap();
@@ -1027,10 +1037,10 @@ fn stage1b_final_budget_exempts_only_image_content_data() {
 
 #[test]
 fn stage1b_attachment_indices_must_match_exactly_the_ok_rows() {
-    assert!(!valid_thumbnail_attachments(&thumbnail_fixture(
-        &[ThumbnailStatus::Unsupported; 21],
-        0
-    )));
+    assert!(!valid_thumbnail_attachments(
+        &thumbnail_fixture(&[ThumbnailStatus::Unsupported; 21], 0),
+        thumbnail_budget(AGENT_PROTOCOL_VERSION, 256)
+    ));
     let fixture = thumbnail_fixture(
         &[
             ThumbnailStatus::Unsupported,
@@ -1040,7 +1050,10 @@ fn stage1b_attachment_indices_must_match_exactly_the_ok_rows() {
         ],
         8,
     );
-    assert!(valid_thumbnail_attachments(&fixture));
+    assert!(valid_thumbnail_attachments(
+        &fixture,
+        thumbnail_budget(AGENT_PROTOCOL_VERSION, 256)
+    ));
     for mutation in 0..6 {
         let mut bad = fixture.clone();
         match mutation {
@@ -1063,16 +1076,25 @@ fn stage1b_attachment_indices_must_match_exactly_the_ok_rows() {
                 bad.images.push(bad.images[0].clone());
             }
         }
-        assert!(!valid_thumbnail_attachments(&bad));
+        assert!(!valid_thumbnail_attachments(
+            &bad,
+            thumbnail_budget(AGENT_PROTOCOL_VERSION, 256)
+        ));
         let result = tool_result("get_thumbnail", Ok(Payload::Thumbnails(bad)));
         assert_eq!(result["isError"], true);
         assert_eq!(result["content"].as_array().unwrap().len(), 1);
     }
     let mut omitted = fixture;
     omitted.page.items[1] = PageRow::too_long(&"oversized item").unwrap();
-    assert!(!valid_thumbnail_attachments(&omitted));
+    assert!(!valid_thumbnail_attachments(
+        &omitted,
+        thumbnail_budget(AGENT_PROTOCOL_VERSION, 256)
+    ));
     omitted.images.remove(0);
-    assert!(valid_thumbnail_attachments(&omitted));
+    assert!(valid_thumbnail_attachments(
+        &omitted,
+        thumbnail_budget(AGENT_PROTOCOL_VERSION, 256)
+    ));
 }
 
 #[test]
@@ -1088,6 +1110,8 @@ fn stage1b_all_protocols_transport_folder_pages_and_webp_blocks() {
         ) -> BackendResult {
             match command {
                 Command::Status => Ok(Payload::Status(StatusPayload {
+                    search_scope: vec![],
+                    search_scope_truncated: false,
                     app_version: "fixture".into(),
                     permission: PermissionSnapshot {
                         level: AgentLevel::ReadOnly,
@@ -1143,7 +1167,7 @@ fn stage1b_all_protocols_transport_folder_pages_and_webp_blocks() {
             assert_eq!(response["id"], id);
             let result = &response["result"];
             match id {
-                1 => assert_eq!(result["tools"].as_array().unwrap().len(), 19),
+                1 => assert_eq!(result["tools"].as_array().unwrap().len(), 20),
                 2 => assert_eq!(
                     result["structuredContent"]["book_composition_applied"],
                     true
@@ -1216,6 +1240,8 @@ impl Backend for Fixture {
     ) -> BackendResult {
         Ok(match command {
             Command::Status => Payload::Status(StatusPayload {
+                search_scope: vec![],
+                search_scope_truncated: false,
                 app_version: "test".into(),
                 permission: PermissionSnapshot {
                     level: if self.disabled {
@@ -2050,6 +2076,8 @@ fn stage2_metadata_tools_transport_typed_commands_and_results_on_all_protocols()
         ) -> BackendResult {
             if command == Command::Status {
                 return Ok(Payload::Status(StatusPayload {
+                    search_scope: vec![],
+                    search_scope_truncated: false,
                     app_version: "fixture".into(),
                     permission: PermissionSnapshot {
                         level: AgentLevel::Organize,
@@ -2252,6 +2280,8 @@ fn tools_list_all_protocols_send_full_discovery_through_the_writer() {
         ) -> BackendResult {
             assert_eq!(command, Command::Status);
             Ok(Payload::Status(StatusPayload {
+                search_scope: vec![],
+                search_scope_truncated: false,
                 app_version: "fixture".into(),
                 permission: PermissionSnapshot {
                     level: AgentLevel::Organize,
@@ -2293,6 +2323,13 @@ fn tools_list_all_protocols_send_full_discovery_through_the_writer() {
 #[test]
 fn stage2_complete_tool_discovery_fits_final_envelope_budget() {
     // 途中の予算assertで止まっても、設計判断に必要な全tool・最大IDの計測値を残す。
+    let mut tool_total = 0;
+    for tool in schema::tools() {
+        let chars = serde_json::to_string(&tool).unwrap().chars().count();
+        tool_total += chars;
+        eprintln!("Tool {}: {chars} chars", tool["name"]);
+    }
+    eprintln!("All serialized tools: {tool_total} chars");
     let maximal = Envelope::tools_list(json!("x".repeat(64)), schema::tools(), true);
     eprintln!(
         "All tools, modern, 64-char ID: {} chars",
@@ -2367,6 +2404,8 @@ fn stage2_all_protocols_refresh_organize_permission_and_return_collection_writes
         ) -> BackendResult {
             if command == Command::Status {
                 return Ok(Payload::Status(StatusPayload {
+                    search_scope: vec![],
+                    search_scope_truncated: false,
                     app_version: "fixture".into(),
                     permission: PermissionSnapshot {
                         level: if self.organize.load(Ordering::Acquire) {
@@ -2431,7 +2470,7 @@ fn stage2_all_protocols_refresh_organize_permission_and_return_collection_writes
             let response = h.receive();
             assert_eq!(response["id"], id);
             let listed = response["result"]["tools"].as_array().unwrap();
-            assert_eq!(listed.len(), 19);
+            assert_eq!(listed.len(), 20);
             for name in [
                 "create_collection",
                 "rename_collection",
@@ -2514,6 +2553,8 @@ fn stage1c_all_protocols_refresh_open_permission_and_transport_accepted_result()
         ) -> BackendResult {
             match command {
                 Command::Status => Ok(Payload::Status(StatusPayload {
+                    search_scope: vec![],
+                    search_scope_truncated: false,
                     app_version: "fixture".into(),
                     permission: PermissionSnapshot {
                         level: if self.permitted.load(Ordering::Acquire) {
@@ -2563,7 +2604,7 @@ fn stage1c_all_protocols_refresh_open_permission_and_transport_accepted_result()
                 tools.iter().any(|tool| tool["name"] == "open_in_viewer"),
                 true
             );
-            assert_eq!(tools.len(), 19);
+            assert_eq!(tools.len(), 20);
         }
         backend.permitted.store(true, Ordering::Release);
         h.send(request(
@@ -2634,7 +2675,7 @@ fn legacy_versions_require_handshake_and_keep_legacy_results() {
         h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         h.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}));
         let r = h.receive();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 19);
+        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 20);
         assert!(r["result"].get("resultType").is_none());
         h.close();
     }
@@ -3209,7 +3250,7 @@ fn cancellation_covers_queue_to_active_handoff_under_one_lock() {
                     serial: 1,
                     id: json!(1),
                     modern: true,
-                    phase: ActivePhase::Executing("miv_status"),
+                    phase: ActivePhase::Executing("miv_status", DEFAULT_THUMBNAIL_SIDE),
                     control: handoff_control,
                 });
             })
@@ -3306,7 +3347,7 @@ fn duplicate_queued_or_active_ids_are_explicitly_rejected() {
                 serial: 1,
                 id: json!(1),
                 modern: true,
-                phase: ActivePhase::Executing("miv_status"),
+                phase: ActivePhase::Executing("miv_status", DEFAULT_THUMBNAIL_SIDE),
                 control: Arc::new(CallControl::default()),
             });
         } else {
@@ -4076,6 +4117,8 @@ fn caption_status_schema_requires_permission_for_all_snapshots() {
                         let result = tool_result(
                             "miv_status",
                             Ok(Payload::Status(StatusPayload {
+                                search_scope: vec![],
+                                search_scope_truncated: false,
                                 app_version: "fixture".into(),
                                 permission: PermissionSnapshot {
                                     level,
@@ -4168,8 +4211,6 @@ fn caption_info_schema_matches_tagged_states_and_preserves_other_fields() {
                         json!({"status":"not_applicable"}),
                         json!({"status":"too_large"}),
                         json!({"status":"present"}),
-                        json!({"status":"none","value":{}}),
-                        json!({"status":"not_permitted","value":{}}),
                     ] {
                         let mut wrong = content.clone();
                         wrong["items"][0][field] = invalid;
@@ -4203,7 +4244,6 @@ fn caption_info_schema_matches_tagged_states_and_preserves_other_fields() {
                         ("visible_text", json!({"text":"plain"})),
                         ("keywords", json!("keyword")),
                         ("created_at", json!("today")),
-                        ("private", json!("extra")),
                     ] {
                         let mut wrong = content.clone();
                         wrong["items"][0]["ai_caption"]["value"][field] = invalid;
@@ -4299,7 +4339,16 @@ fn stage1a_schema_validates_serialized_payloads_and_explicit_absence_markers() {
     );
     let mut forbidden = result["structuredContent"].clone();
     forbidden["items"][0]["workflow_json"] = json!("private");
-    assert!(!accepts_schema(&schema["outputSchema"], &forbidden));
+    // The output schema permits additions; the typed adapter still strips
+    // private/unknown wire fields before building structuredContent.
+    assert!(accepts_schema(&schema["outputSchema"], &forbidden));
+    let typed: InfoPage = serde_json::from_value(forbidden).unwrap();
+    let projected = tool_result("get_item_info", Ok(Payload::Info(typed)));
+    assert!(
+        projected["structuredContent"]["items"][0]
+            .get("workflow_json")
+            .is_none()
+    );
     let virtual_page = ItemPage {
         items: vec![
             Item {
@@ -4410,3 +4459,192 @@ fn pending_disconnect_completion_returns_status_only_for_all_protocols() {
 
 #[path = "always_list_tests.rs"]
 mod always_list_tests;
+
+#[test]
+fn expansion_folder_arguments_forward_normalized_filters_and_reject_invalid_inputs() {
+    let filters = json!({"path":"C:/photos","recursive":true,"max_depth":2,"min_stars":0,"max_stars":4,"kinds":["video","image"],"name_contains":"Cat","extensions":["PNG","jpg"],"tagged":false});
+    for name in ["list_folder", "summarize_folder"] {
+        let (_, command) = parse_tool(&json!({"name":name,"arguments":filters})).unwrap();
+        let wire = serde_json::to_value(command).unwrap();
+        assert_eq!(wire["recursive"], true);
+        assert_eq!(wire["max_depth"], 2);
+        assert_eq!(wire["name_contains"], "Cat");
+        assert_eq!(wire["extensions"], json!(["jpg", "png"]));
+        assert_eq!(wire["kinds"], json!(["image", "video"]));
+        assert_eq!(wire["tagged"], false);
+        for extra in [
+            json!({"recursive":true,"max_depth":0}),
+            json!({"recursive":true,"max_depth":33}),
+            json!({"max_depth":1}),
+            json!({"recursive":true,"subresource":"pages/"}),
+            json!({"name_contains":""}),
+            json!({"name_contains":"a".repeat(201)}),
+            json!({"extensions":[]}),
+            json!({"extensions":[""]}),
+            json!({"extensions":[".png"]}),
+            json!({"extensions":["tar.gz"]}),
+            json!({"extensions":["PNG","png"]}),
+            json!({"extensions":vec!["a";21]}),
+            json!({"recursive":null}),
+            json!({"tagged":"true"}),
+        ] {
+            let mut args = json!({"path":"C:/photos"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(
+                parse_tool(&json!({"name":name,"arguments":args})).is_err(),
+                "{name}: {args}"
+            );
+        }
+        let (_, omitted) =
+            parse_tool(&json!({"name":name,"arguments":{"path":"C:/photos"}})).unwrap();
+        let (_, nulls)=parse_tool(&json!({"name":name,"arguments":{"path":"C:/photos","recursive":false,"max_depth":null,"name_contains":null,"extensions":null,"tagged":null}})).unwrap();
+        assert_eq!(omitted, nulls);
+    }
+    for extra in [
+        json!({"limit":null}),
+        json!({"cursor":null}),
+        json!({"unknown":true}),
+    ] {
+        let mut args = json!({"path":"C:/photos"});
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        assert!(parse_tool(&json!({"name":"summarize_folder","arguments":args})).is_err());
+    }
+}
+
+#[test]
+fn expansion_summary_and_status_outputs_match_schema() {
+    let summary = FolderSummary {
+        total: 3,
+        kinds: std::collections::BTreeMap::from([(FolderKind::Image, 3)]),
+        stars: [0, 1, 1, 1, 0, 0],
+        folders: Some(vec![FolderSummaryFolder {
+            path: "C:/photos/cats".into(),
+            name: "cats".into(),
+            total: 3,
+        }]),
+        folders_truncated: false,
+        book_composition_applied: false,
+    };
+    for folders in [summary.folders.clone(), None] {
+        let mut summary = summary.clone();
+        summary.folders = folders;
+        let result = tool_result("summarize_folder", Ok(Payload::FolderSummary(summary)));
+        let tool = schema::tools()
+            .into_iter()
+            .find(|tool| tool["name"] == "summarize_folder")
+            .unwrap();
+        assert_eq!(result["isError"], false);
+        assert!(accepts_schema(
+            &tool["outputSchema"],
+            &result["structuredContent"]
+        ));
+    }
+    let result = tool_result(
+        "miv_status",
+        Ok(Payload::Status(StatusPayload {
+            app_version: "fixture".into(),
+            permission: PermissionSnapshot::default(),
+            fts_ready: true,
+            remote_active: false,
+            search_scope: vec!["C:/photos".into()],
+            search_scope_truncated: true,
+        })),
+    );
+    assert_eq!(
+        result["structuredContent"]["search_scope"],
+        json!(["C:/photos"])
+    );
+    assert_eq!(result["structuredContent"]["search_scope_truncated"], true);
+    let tool = schema::tools()
+        .into_iter()
+        .find(|tool| tool["name"] == "miv_status")
+        .unwrap();
+    assert!(accepts_schema(
+        &tool["outputSchema"],
+        &result["structuredContent"]
+    ));
+}
+
+#[test]
+fn expansion_thumbnail_attachments_use_the_sent_request_side_budget() {
+    let budget = thumbnail_budget(5, 1568);
+    let mut statuses = vec![ThumbnailStatus::Unsupported; 16];
+    statuses.extend([ThumbnailStatus::Ok; 4]);
+    assert!(valid_thumbnail_attachments(
+        &thumbnail_fixture(&statuses, 512 * 1024),
+        budget
+    ));
+    for (statuses, bytes, valid) in [
+        (vec![ThumbnailStatus::Ok; 4], 512 * 1024, true),
+        (vec![ThumbnailStatus::Ok; 5], 1, false),
+        (vec![ThumbnailStatus::Ok; 2], 1024 * 1024, true),
+        (vec![ThumbnailStatus::Ok; 3], 1024 * 1024, false),
+        (vec![ThumbnailStatus::Ok], 1024 * 1024 + 1, false),
+    ] {
+        let response = thumbnail_fixture(&statuses, bytes);
+        assert_eq!(valid_thumbnail_attachments(&response, budget), valid);
+        let result =
+            tool_result_with_side("get_thumbnail", Ok(Payload::Thumbnails(response)), 1568);
+        assert_eq!(result["isError"], !valid);
+    }
+    let response = thumbnail_fixture(&[ThumbnailStatus::Ok], 256 * 1024 + 1);
+    assert_eq!(
+        tool_result_with_side(
+            "get_thumbnail",
+            Ok(Payload::Thumbnails(response.clone())),
+            512
+        )["isError"],
+        true
+    );
+    assert_eq!(
+        tool_result_with_side("get_thumbnail", Ok(Payload::Thumbnails(response)), 513)["isError"],
+        false
+    );
+    for (requested, expected) in [(512, 512), (1568, 1568), (u32::MAX, 1568)] {
+        let (_,command)=parse_tool(&json!({"name":"get_thumbnail","arguments":{"items":[{"path":"C:/photo.png"}],"long_side":requested}})).unwrap();
+        assert!(
+            matches!(command,Command::GetThumbnail {long_side:Some(side),..} if side==expected)
+        );
+    }
+}
+
+#[test]
+fn expansion_stdio_keeps_thumbnail_request_budget_with_the_active_call() {
+    struct LargeThumbnail;
+    impl Backend for LargeThumbnail {
+        fn call(
+            &self,
+            command: Command,
+            _: &ClientIdentity,
+            _: RequestKind,
+            _: Arc<CallControl>,
+        ) -> BackendResult {
+            assert!(matches!(command, Command::GetThumbnail { .. }));
+            Ok(Payload::Thumbnails(thumbnail_fixture(
+                &[ThumbnailStatus::Ok],
+                256 * 1024 + 1,
+            )))
+        }
+    }
+    let mut h = Harness::new(Arc::new(LargeThumbnail));
+    for (id, side, error) in [
+        (1, 512, true),
+        (2, 1568, false),
+        (3, u32::MAX, false),
+        (4, 256, true),
+    ] {
+        h.send(modern(id,"tools/call",json!({"name":"get_thumbnail","arguments":{"items":[{"path":"C:/photo.png"}],"long_side":side}})));
+        let response = h.receive();
+        assert_eq!(response["id"], id);
+        assert_eq!(response["result"]["isError"], error, "{side}: {response}");
+        assert_eq!(
+            response["result"]["content"].as_array().unwrap().len(),
+            if error { 1 } else { 2 }
+        );
+    }
+    h.close();
+}

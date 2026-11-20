@@ -20,14 +20,14 @@ fn shipped_hello_fixture_has_exact_adapter_bytes() {
     v3_wire::write_frame(&mut bytes, &hello()).unwrap();
     assert_eq!(bytes, include_bytes!("v3_wire/hello.frame"));
     assert_eq!(v3_wire::AGENT_PROTOCOL_VERSION, 3);
-    assert_eq!(current::AGENT_PROTOCOL_VERSION, 4);
+    assert_eq!(current::AGENT_PROTOCOL_VERSION, 5);
     assert_eq!(current::MIN_ADAPTER_PROTOCOL_VERSION, 3);
     for version in [0, 2, 3, 4, 5, u32::MAX] {
         assert_eq!(
             current::supports_adapter_version(version),
-            matches!(version, 3 | 4)
+            matches!(version, 3 | 4 | 5)
         );
-        assert_eq!(current::check_version(version).is_ok(), version == 4);
+        assert_eq!(current::check_version(version).is_ok(), version == 5);
     }
 }
 
@@ -35,6 +35,17 @@ fn shipped_hello_fixture_has_exact_adapter_bytes() {
 fn shipped_output_limits_are_preserved() {
     macro_rules! same {
         ($($name:ident),+ $(,)?) => { $(assert_eq!(current::$name, v3_wire::$name, stringify!($name));)+ };
+    }
+    for version in [3, 4] {
+        assert_eq!(
+            current::clamp_thumbnail_side(version, 1568),
+            v3_wire::MAX_THUMBNAIL_SIDE
+        );
+        let budget =
+            current::thumbnail_budget(version, current::clamp_thumbnail_side(version, 1568));
+        assert_eq!(budget.max_image_bytes, v3_wire::MAX_THUMBNAIL_IMAGE_BYTES);
+        assert_eq!(budget.max_total_bytes, v3_wire::MAX_THUMBNAIL_TOTAL_BYTES);
+        assert_eq!(budget.max_images, v3_wire::MAX_THUMBNAIL_ITEMS);
     }
     same!(
         MAX_FRAME_BYTES,
@@ -46,7 +57,6 @@ fn shipped_output_limits_are_preserved() {
         MAX_WRITE_ITEMS,
         MAX_WRITE_TAGS,
         DEFAULT_THUMBNAIL_SIDE,
-        MAX_THUMBNAIL_SIDE,
         MAX_THUMBNAIL_IMAGE_BYTES,
         MAX_THUMBNAIL_TOTAL_BYTES,
         MAX_ITEM_CHARS,
@@ -60,7 +70,7 @@ fn shipped_output_limits_are_preserved() {
 
 #[cfg(windows)]
 #[test]
-fn pipe_name_is_the_shipped_v3_name_even_with_business_protocol_4() {
+fn pipe_name_is_the_shipped_v3_name_even_with_business_protocol_5() {
     let path = std::path::Path::new("C:/Users/Test/data");
     let name = current::derive_pipe_name(path, "S-1-5-21-123").unwrap();
     assert_eq!(
@@ -69,7 +79,7 @@ fn pipe_name_is_the_shipped_v3_name_even_with_business_protocol_4() {
     );
     assert_eq!(current::AGENT_PIPE_NAMESPACE, "mimageviewer-agent-v3");
     assert!(name.starts_with(r"\\.\pipe\mimageviewer-agent-v3-S-1-5-21-123-"));
-    // Current 4 versus frozen 3 exercises a real business protocol bump.
+    // Current 5 versus frozen 3 exercises a real business protocol bump.
 }
 
 fn payload(kind: &str, data: Value) -> current::Payload {
@@ -110,6 +120,8 @@ fn ok(tool: &str, value: current::Payload) -> Value {
 #[test]
 fn all_shipped_tool_response_families_decode_and_pass_old_structured_output_checks() {
     let status = current::Payload::Status(current::StatusPayload {
+        search_scope: vec![],
+        search_scope_truncated: false,
         app_version: "fixture".into(),
         permission: current::PermissionSnapshot {
             level: current::AgentLevel::Organize,
@@ -467,4 +479,86 @@ fn enums_reachable_by_old_adapters_keep_their_complete_shipped_variant_sets() {
         current::MetadataSkipReason::InvalidPath, current::MetadataSkipReason::NotFound,
         current::MetadataSkipReason::UnsupportedType, current::MetadataSkipReason::UnsupportedSubresource,
         current::MetadataSkipReason::Unavailable);
+}
+
+#[test]
+fn shipped_folder_requests_default_to_nonrecursive_unfiltered_expansion() {
+    let request = v3_wire::Request {
+        id: 17,
+        command: v3_wire::Command::ListFolder {
+            path: "C:/photos".into(),
+            subresource: None,
+            min_stars: Some(0),
+            max_stars: Some(3),
+            kinds: Some(vec![v3_wire::FolderKind::Image]),
+            limit: Some(2),
+            cursor: None,
+        },
+    };
+    let mut frame = vec![];
+    v3_wire::write_frame(&mut frame, &request).unwrap();
+    let decoded: current::Request = current::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    assert!(matches!(
+        decoded.command,
+        current::Command::ListFolder {
+            recursive: false,
+            max_depth: None,
+            name_contains: None,
+            extensions: None,
+            tagged: None,
+            min_stars: Some(0),
+            max_stars: Some(3),
+            limit: Some(2),
+            ..
+        }
+    ));
+    let old: v3_wire::Request =
+        serde_json::from_value(serde_json::to_value(decoded).unwrap()).unwrap();
+    assert_eq!(old, request);
+}
+
+#[test]
+fn new_wire_decoder_accepts_one_mib_but_frozen_adapter_keeps_256_kib_cap() {
+    for bytes in [
+        current::MAX_THUMBNAIL_IMAGE_BYTES,
+        current::MAX_THUMBNAIL_IMAGE_BYTES + 1,
+        current::MAX_THUMBNAIL_WIRE_IMAGE_BYTES,
+        current::MAX_THUMBNAIL_WIRE_IMAGE_BYTES + 1,
+    ] {
+        let image = current::ThumbnailImage {
+            item_index: 0,
+            webp: vec![1; bytes],
+        };
+        let wire = serde_json::to_value(image).unwrap();
+        assert_eq!(
+            serde_json::from_value::<current::ThumbnailImage>(wire.clone()).is_ok(),
+            bytes <= current::MAX_THUMBNAIL_WIRE_IMAGE_BYTES
+        );
+        assert_eq!(
+            serde_json::from_value::<v3_wire::ThumbnailImage>(wire).is_ok(),
+            bytes <= v3_wire::MAX_THUMBNAIL_IMAGE_BYTES
+        );
+    }
+}
+
+#[test]
+fn search_scope_is_discarded_before_old_adapter_structured_output() {
+    let result = ok(
+        "miv_status",
+        current::Payload::Status(current::StatusPayload {
+            app_version: "fixture".into(),
+            permission: current::PermissionSnapshot::default(),
+            fts_ready: true,
+            remote_active: false,
+            search_scope: vec!["C:/private-index".into()],
+            search_scope_truncated: true,
+        }),
+    );
+    assert!(result["structuredContent"].get("search_scope").is_none());
+    assert!(
+        result["structuredContent"]
+            .get("search_scope_truncated")
+            .is_none()
+    );
+    assert!(!result.to_string().contains("private-index"));
 }
