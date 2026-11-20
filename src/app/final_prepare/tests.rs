@@ -163,10 +163,20 @@ pub(crate) fn unit(app: &App, idx: usize) -> FinalPrepareUnit {
 }
 
 pub(crate) fn start(app: &mut App, ctx: &egui::Context, idx: usize) -> bool {
-    let Some((key, pixels, size, plan)) = app.final_prepare_plan_from_resident(idx) else {
+    let Some((key, pixels, size, plan, ai_applied)) = app.final_prepare_plan_from_resident(idx)
+    else {
         return false;
     };
-    app.spawn_prepared_final_job(ctx, key, pixels, size, plan, unit(app, idx), &mut false)
+    app.spawn_prepared_final_job(
+        ctx,
+        key,
+        pixels,
+        size,
+        plan,
+        ai_applied,
+        unit(app, idx),
+        &mut false,
+    )
 }
 
 pub(crate) fn app(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
@@ -656,7 +666,7 @@ fn d3_2_cpu_only_inputs_skip_missing_edit_materialization_and_reuse_completed_ai
         },
     );
     app.fs_cache.remove(&1);
-    let (_, source, _, plan) = app.final_prepare_plan_from_resident(1).unwrap();
+    let (_, source, _, plan, _) = app.final_prepare_plan_from_resident(1).unwrap();
     assert!(Arc::ptr_eq(&source, &pixels));
     assert!(plan.adjust_before_effect.is_none());
     assert!(app.edit_result_cache.is_empty());

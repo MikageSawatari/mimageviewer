@@ -45,7 +45,7 @@ enum PreparedOutput {
 /// Rehydrating an evicted local stage must not apply edits/tone to AI twice.
 enum PreparedFinalInput {
     Edit,
-    AfterAi(Arc<egui::ColorImage>),
+    AfterAi(Arc<egui::ColorImage>, FinalAiStages),
     Completed {
         pixels: Arc<egui::ColorImage>,
         basis: crate::material_display_basis::MaterialDisplayBasis,
@@ -213,7 +213,7 @@ fn output_bytes(input: &PreparedEditInput) -> Option<u64> {
     }
     let final_size = match &input.final_input {
         PreparedFinalInput::Completed { pixels, .. } => pixels.size,
-        PreparedFinalInput::AfterAi(pixels) => {
+        PreparedFinalInput::AfterAi(pixels, _) => {
             crate::post_filter::output_dimensions(pixels.size, input.plan.post_filter)
         }
         PreparedFinalInput::Edit => {
@@ -315,7 +315,7 @@ fn execute(input: &PreparedEditInput, cancel: &Arc<AtomicBool>) -> Result<EditOu
     }
     match &input.final_input {
         PreparedFinalInput::Edit => {}
-        PreparedFinalInput::AfterAi(source)
+        PreparedFinalInput::AfterAi(source, _)
         | PreparedFinalInput::Completed { pixels: source, .. } => pixels = source.clone(),
     }
     if matches!(input.output, PreparedOutput::Final) {
@@ -908,7 +908,7 @@ impl App {
             .final_pixels
             .unwrap_or_else(|| match &input.final_input {
                 PreparedFinalInput::Edit => input.source.clone(),
-                PreparedFinalInput::AfterAi(pixels)
+                PreparedFinalInput::AfterAi(pixels, _)
                 | PreparedFinalInput::Completed { pixels, .. } => pixels.clone(),
             });
         let basis = if let PreparedFinalInput::Completed { basis, .. } = input.final_input {
@@ -934,6 +934,10 @@ impl App {
                     canonical_dims: input.canonical,
                     source_size: input.source_size,
                     complete: true,
+                    ai_applied: match &input.final_input {
+                        PreparedFinalInput::AfterAi(_, stages) => Some(*stages),
+                        _ => None,
+                    },
                 },
             );
             self.final_composite_cache
@@ -1152,7 +1156,10 @@ impl App {
                 basis: entry.display_basis,
             }
         } else if let Some((_, entry)) = ai {
-            PreparedFinalInput::AfterAi(entry.pixels.clone())
+            PreparedFinalInput::AfterAi(
+                entry.pixels.clone(),
+                self.final_ai_result_stages(params, entry.source_size, entry.used_upscale),
+            )
         } else {
             PreparedFinalInput::Edit
         };
@@ -1378,7 +1385,7 @@ impl App {
             PreparedFinalInput::Completed { pixels, .. } => self
                 .exact_complete_final_composite_entry(idx)
                 .is_some_and(|(key, entry)| key == input.key && Arc::ptr_eq(&entry.pixels, pixels)),
-            PreparedFinalInput::AfterAi(pixels) => {
+            PreparedFinalInput::AfterAi(pixels, _) => {
                 self.final_ai_cache.iter().any(|(key, entry)| {
                     key.edit_key == input.key.edit_key
                         && entry.source_size == input.source_size
@@ -1593,6 +1600,10 @@ impl App {
                 }),
                 items_generation: self.items_generation,
                 output_complete: true,
+                ai_applied: match &input.final_input {
+                    PreparedFinalInput::AfterAi(_, stages) => Some(*stages),
+                    _ => None,
+                },
                 nearest_sampler: input.plan.needs_nearest_sampler(),
                 origin: FinalEffectOrigin::Speculative(unit),
                 gpu_diagnostics: final_prepare_budget::FinalPrepareGpuDiagnostics::requested(

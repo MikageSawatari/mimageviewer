@@ -148,6 +148,10 @@ fn install(
             })),
             items_generation: app.items_generation,
             output_complete: true,
+            ai_applied: match &input.final_input {
+                PreparedFinalInput::AfterAi(_, stages) => Some(*stages),
+                _ => None,
+            },
             nearest_sampler: input.plan.needs_nearest_sampler(),
             origin: FinalEffectOrigin::Speculative(unit),
             gpu_diagnostics: final_prepare_budget::FinalPrepareGpuDiagnostics::requested("next", 0),
@@ -546,7 +550,7 @@ fn completed_erase_pixels_are_the_input_and_after_ai_does_not_reapply_adjustment
             },
         );
         let input = app.prepared_edit_input(1).unwrap();
-        assert!(matches!(input.final_input, PreparedFinalInput::AfterAi(_)));
+        assert!(matches!(input.final_input, PreparedFinalInput::AfterAi(..)));
         let cancel = Arc::new(AtomicBool::new(false));
         let FinalCompositeResult::Ready {
             pixels: expected, ..
@@ -568,6 +572,20 @@ fn completed_erase_pixels_are_the_input_and_after_ai_does_not_reapply_adjustment
             output.final_pixels.as_ref().unwrap().as_ref(),
             expected.as_ref()
         );
+        let final_key = install(&mut app, &ctx, input, output);
+        app.resolve_prepared_edit_for_display(&ctx, 1);
+        assert_eq!(
+            app.final_composite_cache[&final_key].ai_applied,
+            Some(FinalAiStages {
+                denoise: false,
+                upscale: used_upscale
+            })
+        );
+        app.final_composite_cache.clear();
+        // Adoption now materializes these stages; each AI variant must start
+        // with the same missing-lower-stage fixture as the original test.
+        app.local_adjust_cache.clear();
+        app.edit_result_cache.clear();
     }
 }
 

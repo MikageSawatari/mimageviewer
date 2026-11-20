@@ -31,6 +31,29 @@ pub(crate) enum FinalAiExecutionError {
     Failed(super::failure::FinalAiFailure),
 }
 
+/// AI stages admitted for the original input canvas. Result provenance overrides
+/// `upscale` with the worker's `used_upscale`; denoise remains the input-range fact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FinalAiStages {
+    pub(crate) denoise: bool,
+    pub(crate) upscale: bool,
+}
+
+pub(crate) fn final_ai_stages_in_range(
+    mode: crate::settings::AiFeatureMode,
+    params: &crate::adjustment::AdjustParams,
+    [width, height]: [usize; 2],
+    upscale_limit: crate::ai::upscale::AiProcessSizeLimit,
+    denoise_limit: crate::ai::upscale::AiProcessSizeLimit,
+) -> FinalAiStages {
+    FinalAiStages {
+        denoise: effective_denoise_request(mode, params).is_some()
+            && crate::ai::upscale::should_process_rect(width as u32, height as u32, denoise_limit),
+        upscale: effective_upscale_request(mode, params).is_some()
+            && crate::ai::upscale::should_process_rect(width as u32, height as u32, upscale_limit),
+    }
+}
+
 pub(crate) fn effective_upscale_request(
     mode: crate::settings::AiFeatureMode,
     params: &crate::adjustment::AdjustParams,
@@ -72,13 +95,11 @@ pub(crate) fn select_final_ai_models(
     denoise_limit: crate::ai::upscale::AiProcessSizeLimit,
     category_override: Option<crate::ai::ImageCategory>,
 ) -> Option<SelectedFinalAiModels> {
-    let [width, height] = source.size;
     let upscale_request = effective_upscale_request(mode, params);
     let denoise_request = effective_denoise_request(mode, params);
-    let upscale_in_range = upscale_request.is_some()
-        && crate::ai::upscale::should_process_rect(width as u32, height as u32, upscale_limit);
-    let denoise_in_range = denoise_request.is_some()
-        && crate::ai::upscale::should_process_rect(width as u32, height as u32, denoise_limit);
+    let stages = final_ai_stages_in_range(mode, params, source.size, upscale_limit, denoise_limit);
+    let upscale_in_range = stages.upscale;
+    let denoise_in_range = stages.denoise;
     if !upscale_in_range && !denoise_in_range {
         return None;
     }

@@ -75,6 +75,7 @@ pub(crate) fn queued_final(app: &mut App, idx: usize) -> FinalCompositeKey {
             state: FinalEffectState::Computing(FinalEffectReceiver::Legacy(rx)),
             items_generation: app.items_generation,
             output_complete: true,
+            ai_applied: None,
             nearest_sampler: false,
             origin: FinalEffectOrigin::LegacyDisplay,
             gpu_diagnostics: Default::default(),
