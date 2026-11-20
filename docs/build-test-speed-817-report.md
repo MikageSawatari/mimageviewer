@@ -451,6 +451,7 @@
 統括の依頼 (利用者の判断「実装し、取り込みは公開後 (推奨)」)。v5.5.0 の公開までは master に入れない。
 ブランチ `app-template-817` (master `9d0d84797` から。計測用の probe `8432031ff` は含めない)。
 §9.4 の 2 点 (古くならない仕組み・新規作成と移行の経路の検査) をここで具体化する。
+初版 (`f23dc4a02`) は実装前の独立レビュー (GPT-6.1 Sol / xhigh) で REJECT になり、指摘を受けて下の形に改めた (10.9)。
 
 ### 10.1 範囲
 
@@ -463,70 +464,108 @@
 
 - `AppDataDirFixture { Template, Fresh }` を `AppTestConfig` の必須のフィールドにする。既定値は持たせない
   (`AiRuntimeFixture` と同じ流儀)。
-- `Template`: constructor を呼ぶ前に、雛形の DB を data_dir へ複写する。
-- `Fresh`: 今と同じ (空の data_dir で constructor を呼ぶ)。
+- `Template`: constructor を呼ぶ前に、雛形の DB を data_dir へ複写する。`Fresh`: 今と同じ (空の data_dir で constructor を呼ぶ)。
 - 入口ごとの既定:
   - `setup_app()`・`setup_app_with_ai_runtime()`・`setup_product_similar_app()`・`setup_app_with_similar_capability()` → `Template`。
-  - `setup_paused_similar_app_with_fixture(settings, prepare_data_dir)` (呼び出し 4 か所、data_dir を前もって用意する入口) → `Fresh`。
-  - `history_parent_1473::setup_with_ai_runtime` → `Template` (settings は `Some(default + book_root)` だが、DB の作り方は settings に依存しない。下の 10.5 (a) で確かめる)。
-  - 初回の起動や DB の新規作成を確かめるテスト用に、`setup_app_with_fresh_data_dir()` (と AI 版) を足し、`Fresh` を明示する。
-- `Template` を指定したのに、constructor を呼ぶ時点の data_dir が空でない (`settings.json` を除く) 場合は、panic でテストを失敗にする
-  (雛形と前もって置いたファイルを混ぜない。黙って `Fresh` へ切り替えない)。
+  - `setup_paused_similar_app_with_fixture(settings, prepare_data_dir)` (data_dir を前もって用意する入口) → `Fresh`。
+  - `history_parent_1473::setup_with_ai_runtime` → `Template`。
+  - 初回の起動・DB の新規作成・起動時の移行を確かめるテスト用に、`Fresh` を明示する入口 (`setup_app_with_fresh_data_dir()` など) を足す。
+- `Template` を指定したのに、constructor を呼ぶ時点の data_dir が空でない (`new_for_test` が書く `settings.json` を除く) 場合は、
+  panic でテストを失敗にする (雛形と前もって置いたファイルを混ぜない。黙って `Fresh` へ切り替えない)。
 - 再読み込み (`replace_app_from_settings`・`app_from_settings_after_drop`) は同じ data_dir で App を作り直すだけなので、変えない。
 
-### 10.3 雛形の作り方・鍵・置き場所
+### 10.3 雛形の作り方: 同じ実行体の子プロセスで作る
 
-- 雛形は、そのテストの実行体自身が、今の constructor の経路で作る (手で作った雛形・リポジトリに置いた雛形は使わない)。
-  手順: 自分の一時フォルダを data_dir にして `Fresh` と同じ手順で App を作り、drop する (OverrideGuard・epoch の scope も fixture と同じ)。
-  その後、data_dir の DB を下の規則で集めて、置き場所へ置く。
+- 同じプロセスの中で雛形用の App を先に作ると、process-global の状態が雛形の作業フォルダに固定される
+  (例: `src/ai/model_manager.rs` の `MODELS_DIR` の `OnceLock` は、最初の `ModelManager::new()` で `<data_dir>\models` に決まり、
+  `OverrideGuard` では戻らない)。そのため、雛形の有無で本来のテストの状態が変わる。これを避けるため、雛形は子プロセスで作る。
+- 手順 (雛形が無いときだけ):
+  1. 親 (App の fixture) が `<置き場所>\<鍵>.tmp-<pid>\` を作り、その下の `data\` を作業用の data_dir にする。
+  2. 親は同じテストの実行体 (`std::env::current_exe()`) を子として起動し、`#[ignore]` を付けた雛形作成用のテスト 1 本だけを
+     `--exact --ignored` で走らせる。作業用の data_dir と capability は、テストのコードだけが読む環境変数で渡す。
+  3. 子は、fixture の `Fresh` と同じ手順 (lock・override・epoch の scope・`AiRuntimeFixture::NotStarted`・settings は `None`) で
+     App を作って drop し、終了する。プロセスが終わるので、drop の後も残る worker や接続もすべて閉じる。
+  4. 親は子の終了コードが 0 であることを確かめる (0 でなければ panic)。作業用の data_dir の直下の `*.db` (`settings.db` を除く) を
+     1 つずつ rusqlite で開き、`PRAGMA wal_checkpoint(TRUNCATE)` をしてから閉じ、`-wal` が残っていない (または 0 バイト) ことを確かめてから、
+     `<鍵>.tmp-<pid>\` の直下へ複写する。複写した DB の名前の一覧を `manifest.txt` に書く。作業用の data_dir は消す。
+  5. `<鍵>.tmp-<pid>` を `<鍵>` へ rename する。先に置いたほうが勝ち、負けたほうは自分の tmp を消す。
+     12 本が同時に始まると最初だけ数本が重複して作るが、どれも同じ手順の結果になる。
+- 雛形を使う側は、毎回 `<鍵>` を計算し、`<鍵>\manifest.txt` が在れば、その一覧の DB を data_dir へ複写する。
+  `OnceLock` で場所を覚えない (鍵から毎回求める)。
+- 公開済みの `<鍵>` は書き換えない・消さない (不変)。実行時の古い鍵の掃除はしない
+  (同じ stem の別の世代が同時に動いていると、使用中の雛形を消し得るため)。1 世代あたり約 0.5 MB の残りは、
+  `cargo clean`・worktree の撤去で消える。必要になったら、テストを止めた状態で消す手順を別に作る。
+
+### 10.4 鍵と置き場所
+
 - 鍵: `<実行体の file stem>` / `<実行体の大きさ>-<最終更新時刻 (ns)>` / `v<雛形の形式の版>-<SimilarFeatureCapability>`。
-  - cargo はソースが変われば実行体をリンクし直すので、同じ鍵なら、同じソース・同じ schema の constructor で作った雛形になる。
-    実行体のハッシュ (1.7 GB) は遅いので取らない。
-  - 形式の版は、雛形の集め方 (10.4) を変えたときに手で上げる定数。
+  形式の版は、雛形の作り方 (10.3) を変えたときに手で上げる定数。
+- 保証の範囲: 通常のローカルの cargo のリンクで作られた実行体だけを対象にする。cargo はソースが変われば実行体をリンクし直し、
+  大きさか最終更新時刻が変わる。同じ stem・同じ大きさ・同じ最終更新時刻を持つ別の内容の実行体への置き換えは対象外とする。
+  実行体の中身のハッシュ (1.7 GB) は遅いので取らない。
 - 置き場所: `<実行体のフォルダ>\app-test-template\<鍵>` (nextest・cargo test とも `target\<profile>\deps\` の下)。
-- 同時に始まったプロセスの扱い: 雛形が無いプロセスは、それぞれ自分で作って `<鍵>.tmp-<pid>` に書き、`<鍵>` へ rename する。
-  先に置いたほうが勝ち、負けたほうは自分の tmp を消す。12 本が同時に始まると最初だけ数本が重複して作るが、どれも同じ内容になる。
-- 1 プロセスで 2 回目以降は、`OnceLock` に覚えた置き場所をそのまま使う (cargo test で 1 プロセスに多数のテストが乗る場合)。
-- 古い鍵の掃除: 新しい雛形を置いたプロセスが、同じ file stem の下の、大きさ・最終更新時刻が違う兄弟を消す。
-  file stem が違う実行体 (feature 違いの別のテスト実行体) の雛形には触らない (同時に動いている別の実行体の雛形を消さないため)。
-  消せなかった残り・落ちたプロセスの tmp は、まれな失敗として割り切る (次の鍵の動作には影響しない)。
+  file stem ごとに分かれるので、feature 違いの別のテスト実行体の雛形とは混ざらない。
 
-### 10.4 雛形に入れるファイル
+### 10.5 雛形に入れるファイル
 
-- 入れる: data_dir の直下の `*.db` (ただし `settings.db` を除く)。
+- 入れる: data_dir の直下の `*.db` (`settings.db` を除く)。`settings.db` は除く (settings DB の既存 DB・JSON からの移行・
+  clean install の分岐を、本来のテストの側に残すため)。
 - 入れない: `settings.db`・`-wal`・`-shm`・`logs\`・`*.json`・そのほかの DB でないファイル (どれも constructor が今と同じく作る)。
-- 雛形の作成時、drop の後に残っている `-wal` がすべて 0 バイトであることを確かめる。0 バイトでない `-wal` があれば、
-  `*.db` だけでは内容が欠けるので、雛形の作成を panic で失敗にする (§9 の計測では、残った `-wal` は 6 個とも 0 バイトだった)。
-- 雛形の作成用の data_dir のフォルダそのものは rename しない (drop の後もファイルを開いたままの worker があると Windows では rename できない)。
-  `*.db` を `<鍵>.tmp-<pid>` へ複写してから、その tmp を rename する。
 - 将来 DB が増えても `*.db` なので自動で入る。DB でない状態ファイルが増えても入らない (今の経路のまま作られる)。
+- 雛形を使ったテストどうしは、`folder_thumb_pin_revision.instance_id` (DB を新しく作るたびの UUID) が同じ値になる。
+  テストごとに data_dir は別なので混ざらない。DB を作り直したときに instance_id が変わることを確かめるテストは `Fresh` にする。
 
-### 10.5 検査
+### 10.6 検査
 
-- (a) 雛形と今の経路の比較 (決定的なテスト 1 本): 同じプロセスで、`Fresh` の App と `Template` の App をそれぞれ作って drop し、
-  2 つの data_dir を比べる。比べるもの: DB のファイルの集合、各 DB の `sqlite_master` (表・索引・trigger の定義)、`user_version`、
-  すべての表の行。DB でないファイルの集合も比べる。settings が `None` と `Some(default + book_root)` の両方で行う。
-  雛形の作り方や constructor がずれたら、ここで落ちる。
-- (b) 鍵の単体テスト: 実行体の大きさ・時刻・capability・形式の版が違えば鍵が違うこと。古い鍵の掃除が同じ file stem の兄弟だけを消すこと。
-- (c) `Template` 指定で data_dir が空でないときに panic すること。
-- (d) 雛形の作成が失敗したとき (0 バイトでない `-wal` など) にテストが失敗すること。
+- (a) 新規作成の起動の契約 (`Fresh`、決定的): 空の data_dir で App を作り、drop の前に、constructor が開く DB の owner がすべて
+  在る (`None` になっていない) こと、`spread_db` などの open が成功していることを確かめる。constructor の多くの DB の open は
+  失敗を `.ok()` で `None` にするので、新規作成の時だけ失敗する退行は、雛形のテストでは見えない。ここで検出する。
+- (b) 雛形と今の経路の比較 (決定的): 同じテストの中で、`Fresh` の App と `Template` の App をそれぞれ作って drop し、2 つの data_dir を比べる。
+  - 雛形の `manifest.txt` の DB の集合が、`Fresh` で作られた DB の集合 (`settings.db` を除く) と同じであること
+    (雛形に無い DB を constructor が作り直して比較を通ってしまう場合を区別する)。
+  - 各 DB の `sqlite_master` (表・索引・trigger の定義)、`user_version`、すべての表の行が同じであること。
+    正規化するのは次だけ: `folder_thumb_pin_revision.instance_id` (UUID の形式であること・1 行・revision 0 を別に確かめ、値は比べない)。
+    ほかに違う値が出たら、正規化を足す前に、その値がテストごとに違ってよいものかを確かめて記録する。
+  - DB でないファイルの名前の集合も比べる。`settings.json.migrated-<時刻>` の時刻の部分だけ正規化する。
+  - settings が `None` と `Some(default + book_root)` の両方で行う。
+- (c) 鍵の単体テスト: 実行体の大きさ・時刻・capability・形式の版が違えば鍵が違うこと。
+- (d) `Template` 指定で data_dir が空でないときに panic すること。子の終了コードが 0 でないとき・`-wal` が残ったときに雛形の作成が失敗すること。
 
-### 10.6 `Fresh` にすべきテストの洗い出し
+### 10.7 `Fresh` にすべきテストの洗い出し
 
-- DB の open の中で、ファイルの有無で分岐するもの (`exists()` で新規作成の時だけ初期の行を入れる、古い形式から移すなど) を列挙する。
-  その分岐を通すことを目的にした App のテストは `Fresh` にする。
+- 次の起動時の初期化・移行の分岐は、雛形を使うと App の起動では通らなくなる (どれも DB のモジュールの単体テストは別に在る)。
+  これらを App の起動として確かめているテストを `Fresh` にする。
+  - `src/folder_thumb_pins.rs:842` 付近: crop 列の追加・revision 行の作成・trigger の導入 (`migration_ran`)
+  - `src/spread_db.rs:764` 付近: marker が無いときの endpoint の移行。移行に失敗したときの read-only の経路 (`:192` 付近)
+  - `src/edit_preview_cache.rs:146` 付近: version による作り直し。`:270` 付近の DB でないキャッシュの削除
+  - `src/video/tile_thumb_cache.rs:134` 付近: 古い表の形式の移行、`:223` 付近の一度だけの無効化
+  - `src/content_identity.rs:686` 付近: 今の schema の検証と、新規作成・upgrade の分岐
+  - `src/book_resume_db.rs:216`・`:454` 付近: identity 列・meter 列の追加
+  - `src/rating_db.rs:299`・`src/adjustment_db.rs:98`・`src/search_index_db.rs:915` 付近: 列・既存の schema に依存する追加と移行
 - data_dir の中のファイル・`user_version`・DB が作られたことを見る App のテストを grep で探す。
 - 雛形を入れた後の本体 lib 全件で落ちたテストを切り分ける。雛形のせいなら、`Fresh` にするか、テストの前提の誤りとして直す
-  (テストの意味を変えないほうを選び、どちらにしたかを記録する)。
+  (テストの意味を変えないほうを選び、どちらにしたかを記録する)。全件で落ちないことだけを `Fresh` の判断の根拠にはしない。
 
-### 10.7 状態の組み合わせ
+### 10.8 状態の組み合わせ・まれな失敗
 
-- 1 プロセスで雛形用の App を 1 回作ってから本来の App を作る形は、cargo test で 1 プロセスに多数の App のテストが順に乗る形と同じ
-  (data_dir を替えて App を作り直す)。process-global の状態の新しい組み合わせは増えない。
-- 雛形の作成は `test_override_lock` を持ったまま行うので、同じプロセスの別の App の fixture とは重ならない。
-- まれな失敗 (雛形の複写・rename の失敗、ディスクの不足など) はテストの失敗にする (割り切り)。再試行・今の経路への切り替えは入れない。
+- 本来のテストのプロセスでは、雛形の有無にかかわらず、最初に作る App が本来のテストの App になる (雛形は子プロセスで作る)。
+  process-global の状態の組み合わせは、今と変わらない。
+- 雛形の作成は `test_override_lock` を持ったまま行う。子プロセスは別のプロセスなので、親の lock・override とは関係しない。
+- まれな失敗 (複写・rename の失敗、ディスクの不足、子の異常終了など) はテストの失敗にする (割り切り)。
+  再試行・今の経路への切り替えは入れない。
 
-### 10.8 計測
+### 10.9 実装前のレビューで改めた点 (初版からの差分)
 
-- 本体 lib 全件を、雛形なし (このブランチの実装前の commit) と雛形あり (実装後) で 1 回ずつ流し、壁時計とテストの件数を比べる。
-  どちらも run-heavy の `-FullTest` (12 並列)。v5.5.0 の作業の全件を優先し、待っている全件があれば先を譲る。
+- 同じプロセスで雛形を作る → 子プロセスで作る (P1: `MODELS_DIR` などの process-global が雛形の作業フォルダに固定される)。
+- drop の後の DB の比較だけ → 新規作成の起動の契約 (10.6 (a)) と、雛形の DB の集合の検査を足した (P1: 新規作成の時だけの失敗が `.ok()` で隠れる)。
+  起動時の初期化・移行の分岐の一覧 (10.7) を足した。
+- 実行時の古い鍵の掃除と `OnceLock` の場所の記憶 → 外した (P2: 同じ stem の別の世代が使用中の雛形を消し得る)。
+- 全行の一致 → `instance_id` と移行の退避名の時刻だけを正規化する (P2)。
+- 鍵の保証の範囲を、通常のローカルの cargo のリンクに限ると明記した (P3)。
+- -wal が 0 バイトであることの確認だけ → 子プロセスの終了の後に checkpoint してから複写する (drop の後も接続を持つ worker があるため)。
+
+### 10.10 計測
+
+- 本体 lib 全件を、雛形なしと雛形ありで比べる。雛形なしは、同じソースの master の全件
+  (統括の `orchestrator/master-lib-full-after-823`、同じ PC・12 並列) の記録を使う。雛形ありは実装後にこのブランチで 1 回流す。
+  条件の違い (流した時刻・ほかの処理の負荷) は報告に書く。どちらも run-heavy の `-FullTest`。v5.5.0 の作業の全件を優先し、待っている全件があれば先を譲る。
