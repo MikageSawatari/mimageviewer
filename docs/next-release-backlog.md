@@ -42,7 +42,10 @@
 ### 1.831 本の構成の確認で保留された Split / slice 付きの Wrap が、再開すると slice を失う — §1.823〜1.826 の作業から (2026-11-20)
 
 - 状態: **未着手・原因未確認、収録版未定**。scroll-823 (§1.823〜1.826) の作業中に、範囲外の既存の問題として報告された。通常のページ送りでも同じ形で起きるとのこと (scroll-823 の報告、コードからの見立てで実機未確認)。
-- 内容: 本の構成の表示許可の確認 (book composition permission) で保留になった送りのうち、Split (ページの分割) や slice 付きの Wrap (端で次の本 / ページへ回り込む送り) は、許可が下りて再開するときに slice (表示中のページの片側) の情報を落とす。詳しい経路は scroll-823 の会話と共有ノート scroll-823-826.md を参照し、着手時に再確認する。
+- 内容: 本の構成の表示許可の確認 (book composition permission) で保留になった送りのうち、Split (ページの分割) や slice 付きの Wrap (端で次の本 / ページへ回り込む送り) は、許可が下りて再開するときに slice (表示中のページの片側) の情報を落とす。
+- 経路 (scroll-823 がブランチ scroll-823-826 の 4645c54fb のコードを読んで確かめたもの、実機未確認): 別画像への `FsPageNav::Split(step)` は、`src/ui_fullscreen.rs` の `handle_fs_navigation_with_render_perf` で `land_still_page_navigation_target[_with_landing]` によって `step.source_idx` へ入る。左右の側は、入場の直後に `if self.fullscreen_idx == Some(step.source_idx) { self.set_fullscreen_page_slice_for_display_unit(step.slice) }` で決める (master も同じ形)。
+- 本の構成の確認 (`src/app/book_composition_permission.rs`) で入場が保留されると、その場では `fullscreen_idx` が変わらないので側は設定されない。保留の保持者 `OpenIntent` は idx・世代・開き方などを持つが slice を持たないので、再開 (`resume_qualified_book_target`) は idx だけで開き、側を失う (例: 前のページの後半へ戻る送りが前半に入る)。slice 付きの `FsPageNav::Wrap` も同じ。
+- 直し方の候補: 保持者に「解決済みの表示先 (idx + slice)」を持たせ、再開で同じく側を確定する。出荷済みの送りの挙動を変えるので §1.824 とは別の項目にした (ブランチの設計書 `docs/fullscreen-scroll-page-turn-plan.md` §4.4.1 の 7、r2 P1)。§1.824 の着地は、実際に入った表示単位に付く。
 
 ### 1.830 全画面の上部バーの「…」から F12 の別ウィンドウ表示を切り替えられるようにする — 利用者要望 (2026-11-20)
 
