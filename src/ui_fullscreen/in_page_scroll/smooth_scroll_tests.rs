@@ -1,18 +1,49 @@
 //! Deterministic egui viewport time, real scroll geometry, no desktop input.
-use super::handler_tests::{app, full_rect, seed};
+use super::handler_tests::{app, full_rect, paint, seed};
 use super::*;
 
 fn timed_frame(ctx: &egui::Context, time: f64, mut body: impl FnMut(&egui::Context)) {
-    let output = ctx.run_pass(
-        egui::RawInput {
-            screen_rect: Some(full_rect()),
-            time: Some(time),
-            focused: true,
+    timed_viewport_frame(ctx, egui::ViewportId::ROOT, time, |ctx| body(ctx));
+}
+
+fn timed_viewport_frame(
+    ctx: &egui::Context,
+    viewport: egui::ViewportId,
+    time: f64,
+    mut body: impl FnMut(&egui::Context),
+) {
+    let mut raw = egui::RawInput {
+        viewport_id: viewport,
+        screen_rect: Some(full_rect()),
+        time: Some(time),
+        focused: true,
+        ..Default::default()
+    };
+    raw.viewports.insert(
+        viewport,
+        egui::ViewportInfo {
+            native_pixels_per_point: Some(1.0),
+            focused: Some(true),
             ..Default::default()
         },
-        |ctx| body(ctx),
     );
+    let output = ctx.run_pass(raw, |ctx| body(ctx));
     crate::test_ui::headless_paint_output(output).drop_without_applying_deltas();
+}
+
+fn timed_paint(ctx: &egui::Context, time: f64, app: &mut App) {
+    timed_frame(ctx, time, |ctx| {
+        // The real renderer retires/starts the effect before clearing the old
+        // layout, then records the pan of the transform that it actually drew.
+        app.retire_fs_page_scroll_animation(ctx);
+        ctx.root_ui(|root| {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::NONE)
+                .show(root, |ui| {
+                    paint(app, ui, ctx);
+                });
+        });
+    });
 }
 
 fn close(actual: Vec2, expected: Vec2) {
@@ -44,17 +75,30 @@ fn default_is_instant_and_smooth_writes_final_pan_before_interpolating_paint() {
         assert_eq!(animation.from, Vec2::ZERO);
         assert_eq!(animation.to, target);
         assert_eq!(animation.viewport, egui::ViewportId::ROOT);
-        assert_eq!(animation.start_time, 2.0);
+        assert_eq!(animation.start_time, None);
+        assert_eq!(animation.last_painted_pan, Vec2::ZERO);
         assert_eq!(app.fs_page_scroll_display_pan(ctx), Vec2::ZERO);
     });
+    timed_paint(&ctx, 2.0, &mut app);
+    assert_eq!(
+        app.fs_page_scroll_animation.as_ref().unwrap().start_time,
+        Some(2.0)
+    );
+    timed_paint(&ctx, 2.1, &mut app);
     timed_frame(&ctx, 2.1, |ctx| {
-        app.retire_fs_page_scroll_animation(ctx);
         assert!(app.fs_page_scroll_animation.is_some());
         assert_eq!(app.fs_pan, target);
         close(app.fs_page_scroll_display_pan(ctx), target * 0.875);
+        close(
+            app.fs_page_scroll_animation
+                .as_ref()
+                .unwrap()
+                .last_painted_pan,
+            target * 0.875,
+        );
     });
+    timed_paint(&ctx, 2.21, &mut app);
     timed_frame(&ctx, 2.21, |ctx| {
-        app.retire_fs_page_scroll_animation(ctx);
         assert!(app.fs_page_scroll_animation.is_none());
         assert_eq!(app.fs_page_scroll_display_pan(ctx), target);
     });
@@ -70,18 +114,41 @@ fn repeated_scroll_accumulates_from_logical_target_and_restarts_from_visible_pan
     timed_frame(&ctx, 1.0, |ctx| {
         app.apply_fs_page_scroll_key(ctx, KeyAction::FsPageScrollDown);
         first = app.fs_pan;
+        assert_eq!(
+            app.fs_page_scroll_animation.as_ref().unwrap().start_time,
+            None
+        );
     });
-    timed_frame(&ctx, 1.1, |ctx| {
-        let visible = app.fs_page_scroll_display_pan(ctx);
-        close(visible, first * 0.875);
+    timed_paint(&ctx, 1.0, &mut app);
+    timed_paint(&ctx, 1.1, &mut app);
+    let visible = app
+        .fs_page_scroll_animation
+        .as_ref()
+        .unwrap()
+        .last_painted_pan;
+    close(visible, first * 0.875);
+    timed_frame(&ctx, 1.15, |ctx| {
         app.apply_fs_page_scroll_key(ctx, KeyAction::FsPageScrollDown);
         close(app.fs_pan, first * 2.0);
         let animation = app.fs_page_scroll_animation.as_ref().unwrap();
         close(animation.from, visible);
         close(animation.to, first * 2.0);
-        assert_eq!(animation.start_time, 1.1);
+        assert_eq!(animation.start_time, None);
+        close(animation.last_painted_pan, visible);
         close(app.fs_page_scroll_display_pan(ctx), visible);
     });
+    timed_paint(&ctx, 1.2, &mut app);
+    assert_eq!(
+        app.fs_page_scroll_animation.as_ref().unwrap().start_time,
+        Some(1.2)
+    );
+    close(
+        app.fs_page_scroll_animation
+            .as_ref()
+            .unwrap()
+            .last_painted_pan,
+        visible,
+    );
 }
 
 #[test]
@@ -93,6 +160,10 @@ fn trackpad_writer_is_instant_and_retires_an_existing_animation() {
     timed_frame(&ctx, 1.0, |ctx| {
         app.apply_fs_page_scroll_key(ctx, KeyAction::FsPageScrollDown);
         assert!(app.fs_page_scroll_animation.is_some());
+        assert_eq!(
+            app.fs_page_scroll_animation.as_ref().unwrap().start_time,
+            None
+        );
     });
     timed_frame(&ctx, 1.05, |ctx| {
         let (zoom, pan) = (app.fs_zoom, app.fs_pan);
@@ -125,7 +196,12 @@ fn changed_pan_is_used_immediately_and_zoom_rotation_or_disabled_setting_retires
                 1 => app.fs_zoom = 2.0,
                 2 => app.fs_free_rotation = 0.1,
                 3 => app.settings.fullscreen_smooth_page_scroll = false,
-                _ => app.fullscreen_idx = None,
+                _ => {
+                    // Closing changes the destination too. Exercise the real
+                    // close owner, rather than an incomplete idx-only teardown.
+                    app.close_fullscreen();
+                    assert!(app.fullscreen_idx.is_none());
+                }
             }
             app.retire_fs_page_scroll_animation(ctx);
             assert!(app.fs_page_scroll_animation.is_none(), "change {change}");
@@ -206,7 +282,7 @@ fn interpolation_does_not_request_material_or_pdf_producers() {
     timed_frame(&ctx, 1.0, |ctx| {
         app.apply_fs_page_scroll_key(ctx, KeyAction::FsPageScrollDown);
     });
-    for time in [1.03, 1.06, 1.09, 1.12, 1.15, 1.18, 1.21] {
+    for time in [1.0, 1.03, 1.06, 1.09, 1.12, 1.15, 1.18, 1.21] {
         timed_frame(&ctx, time, |ctx| {
             app.retire_fs_page_scroll_animation(ctx);
             let _ = app.fs_page_scroll_display_pan(ctx);
@@ -223,4 +299,103 @@ fn interpolation_does_not_request_material_or_pdf_producers() {
             app.final_composite_cache.len()
         )
     );
+    assert!(app.fs_page_scroll_animation.is_none());
+}
+
+#[test]
+fn input_only_retargeting_neither_starts_nor_expires_the_effect() {
+    let ctx = egui::Context::default();
+    let mut app = app(&ctx, SpreadMode::Single);
+    app.settings.fullscreen_smooth_page_scroll = true;
+    app.settings.continuous_reading_key_scroll_percent = 10;
+    seed(&ctx, &mut app);
+    for (time, action) in [
+        (1.0, KeyAction::FsPageScrollDown),
+        (100.0, KeyAction::FsPageScrollDown),
+        (1000.0, KeyAction::FsPageScrollDown),
+    ] {
+        timed_frame(&ctx, time, |ctx| {
+            let before = app.fs_pan;
+            app.apply_fs_page_scroll_key(ctx, action);
+            assert_ne!(app.fs_pan, before);
+            let animation = app.fs_page_scroll_animation.as_ref().unwrap();
+            assert_eq!(animation.start_time, None);
+            assert_eq!(animation.from, Vec2::ZERO);
+            assert_eq!(animation.last_painted_pan, Vec2::ZERO);
+            assert_eq!(animation.to, app.fs_pan);
+        });
+    }
+    let target = app.fs_pan;
+    timed_paint(&ctx, 1001.0, &mut app);
+    assert_eq!(
+        app.fs_page_scroll_animation.as_ref().unwrap().start_time,
+        Some(1001.0)
+    );
+    timed_paint(&ctx, 1001.1, &mut app);
+    let last_painted = app
+        .fs_page_scroll_animation
+        .as_ref()
+        .unwrap()
+        .last_painted_pan;
+    close(last_painted, target * 0.875);
+    // Even a started effect's old deadline is not consumed by input. The new
+    // request starts from the last actual paint, not a never-painted sample.
+    timed_frame(&ctx, 2000.0, |ctx| {
+        app.apply_fs_page_scroll_key(ctx, KeyAction::FsPageScrollUp);
+        let animation = app.fs_page_scroll_animation.as_ref().unwrap();
+        assert_eq!(animation.start_time, None);
+        close(animation.from, last_painted);
+        close(animation.last_painted_pan, last_painted);
+    });
+    let final_pan = app.fs_pan;
+    timed_paint(&ctx, 2001.0, &mut app);
+    assert_eq!(
+        app.fs_page_scroll_animation.as_ref().unwrap().start_time,
+        Some(2001.0)
+    );
+    close(
+        app.fs_page_scroll_animation
+            .as_ref()
+            .unwrap()
+            .last_painted_pan,
+        last_painted,
+    );
+    timed_paint(&ctx, 2001.21, &mut app);
+    assert!(app.fs_page_scroll_animation.is_none());
+    assert_eq!(app.fs_pan, final_pan);
+}
+
+#[test]
+fn non_destination_pass_cannot_start_or_expire_the_effect() {
+    let ctx = egui::Context::default();
+    let mut app = app(&ctx, SpreadMode::Single);
+    app.settings.fullscreen_smooth_page_scroll = true;
+    seed(&ctx, &mut app);
+    timed_frame(&ctx, 1.0, |ctx| {
+        app.apply_fs_page_scroll_key(ctx, KeyAction::FsPageScrollDown);
+    });
+    let target = app.fs_pan;
+    let other = egui::ViewportId::from_hash_of("non-destination-scroll-clock");
+    timed_viewport_frame(&ctx, other, 100.0, |ctx| {
+        app.retire_fs_page_scroll_animation(ctx);
+        let animation = app.fs_page_scroll_animation.as_ref().unwrap();
+        assert_eq!(animation.start_time, None);
+        assert_eq!(animation.last_painted_pan, Vec2::ZERO);
+        assert_eq!(app.fs_page_scroll_display_pan(ctx), target);
+    });
+    timed_paint(&ctx, 200.0, &mut app);
+    assert_eq!(
+        app.fs_page_scroll_animation.as_ref().unwrap().start_time,
+        Some(200.0)
+    );
+    timed_viewport_frame(&ctx, other, 1000.0, |ctx| {
+        app.retire_fs_page_scroll_animation(ctx);
+        let animation = app.fs_page_scroll_animation.as_ref().unwrap();
+        assert_eq!(animation.start_time, Some(200.0));
+        assert_eq!(animation.last_painted_pan, Vec2::ZERO);
+        assert_eq!(app.fs_page_scroll_display_pan(ctx), target);
+    });
+    timed_paint(&ctx, 1000.05, &mut app);
+    assert!(app.fs_page_scroll_animation.is_none());
+    assert_eq!(app.fs_pan, target);
 }

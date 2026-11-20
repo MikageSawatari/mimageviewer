@@ -270,14 +270,18 @@ pub(super) enum FsPageScrollOutcome {
 pub(crate) struct FsPageScrollAnimation {
     pub(crate) from: Vec2,
     pub(crate) to: Vec2,
-    pub(crate) start_time: f64,
+    pub(crate) start_time: Option<f64>,
+    pub(crate) last_painted_pan: Vec2,
     pub(crate) origin: FsDrawnUnitStamp,
     pub(crate) viewport: egui::ViewportId,
 }
 
 impl FsPageScrollAnimation {
     fn pan_at(&self, time: f64) -> Vec2 {
-        let t = ((time - self.start_time) / 0.2).clamp(0.0, 1.0) as f32;
+        let start_time = self
+            .start_time
+            .expect("destination paint starts the animation");
+        let t = ((time - start_time) / 0.2).clamp(0.0, 1.0) as f32;
         let eased = 1.0 - (1.0 - t).powi(3);
         self.from + (self.to - self.from) * eased
     }
@@ -480,6 +484,22 @@ impl App {
                 drawn_zoom,
                 geometry,
             });
+            // Retargeting uses the pan actually submitted by the owning paint,
+            // never a sample of a newer or older input pass's clock.
+            if ctx.viewport_id() == self.fs_page_scroll_destination_viewport()
+                && let Some(animation) = self.fs_page_scroll_animation.as_mut()
+                && animation.viewport == ctx.viewport_id()
+                && animation.to == self.fs_pan
+                && animation.start_time.is_some()
+                && self.fullscreen_page_layout.drawn_unit.as_ref() == Some(&animation.origin)
+                && let Some((_, pan)) = self
+                    .fullscreen_page_layout
+                    .displayed_pages()
+                    .next()
+                    .and_then(|page| normal_zoom_pan(page.transform))
+            {
+                animation.last_painted_pan = pan;
+            }
         }
     }
 
@@ -913,51 +933,61 @@ impl App {
         )
     }
 
-    /// eframe overwrites native RawInput.time with the same integration clock
-    /// for ROOT, deferred and immediate viewports. Sample the current pass:
-    /// a ROOT-forwarded key must not use the destination's previous frame time.
-    fn fs_page_scroll_animation_clock(&self, ctx: &egui::Context) -> (egui::ViewportId, f64) {
-        (
-            self.fs_page_scroll_destination_viewport(),
-            ctx.input(|input| input.time),
-        )
-    }
-
+    /// Input admission is structural. Only the destination paint owns time.
     fn fs_page_scroll_animation_matches(
         &self,
         ctx: &egui::Context,
         animation: &FsPageScrollAnimation,
     ) -> bool {
-        let (viewport, now) = self.fs_page_scroll_animation_clock(ctx);
         self.settings.fullscreen_smooth_page_scroll
             && animation.to == self.fs_pan
-            && animation.viewport == viewport
-            && now.is_finite()
-            && now >= animation.start_time
-            && now - animation.start_time < 0.2
+            && animation.viewport == self.fs_page_scroll_destination_viewport()
             && self.fullscreen_page_layout.drawn_unit.as_ref() == Some(&animation.origin)
             && self.fs_scroll_layout_matches(ctx)
     }
 
-    /// Called once after input and before ordinary-page paint. An unrelated
-    /// context's temporary mount never calls this owner's retirement.
+    /// Called once after input, before the destination paint invalidates its old
+    /// stamp. Other passes neither start nor expire this context-owned effect.
     pub(super) fn retire_fs_page_scroll_animation(&mut self, ctx: &egui::Context) {
+        let viewport = self.fs_page_scroll_destination_viewport();
+        if ctx.viewport_id() != viewport {
+            return;
+        }
         let Some(animation) = self.fs_page_scroll_animation.as_ref() else {
             return;
         };
-        if self.fs_page_scroll_animation_matches(ctx, animation) {
-            ctx.request_repaint_of(animation.viewport);
-        } else {
+        if !self.fs_page_scroll_animation_matches(ctx, animation) {
             self.fs_page_scroll_animation = None;
+            return;
         }
+        let now = ctx.input(|input| input.time);
+        if !now.is_finite() {
+            self.fs_page_scroll_animation = None;
+            return;
+        }
+        let animation = self.fs_page_scroll_animation.as_mut().unwrap();
+        let start_time = *animation.start_time.get_or_insert(now);
+        if now < start_time || now - start_time >= 0.2 {
+            self.fs_page_scroll_animation = None;
+            return;
+        }
+        ctx.request_repaint_of(viewport);
     }
 
     pub(super) fn fs_page_scroll_display_pan(&self, ctx: &egui::Context) -> Vec2 {
         self.fs_page_scroll_animation
             .as_ref()
-            .filter(|animation| animation.to == self.fs_pan)
+            .filter(|animation| {
+                animation.to == self.fs_pan
+                    && animation.viewport == self.fs_page_scroll_destination_viewport()
+                    && animation.viewport == ctx.viewport_id()
+            })
             .map_or(self.fs_pan, |animation| {
-                animation.pan_at(self.fs_page_scroll_animation_clock(ctx).1)
+                if animation.start_time.is_some() {
+                    animation.pan_at(ctx.input(|input| input.time))
+                } else {
+                    animation.from
+                }
             })
     }
 
@@ -970,29 +1000,28 @@ impl App {
         if pan == self.fs_pan {
             return;
         }
-        let (viewport, start_time) = self.fs_page_scroll_animation_clock(ctx);
+        let viewport = self.fs_page_scroll_destination_viewport();
         let from = self
             .fs_page_scroll_animation
             .as_ref()
             .filter(|animation| self.fs_page_scroll_animation_matches(ctx, animation))
-            .map_or(self.fs_pan, |animation| animation.pan_at(start_time));
+            .map_or(self.fs_pan, |animation| animation.last_painted_pan);
         let origin = self.fullscreen_page_layout.drawn_unit.clone();
         self.write_fs_page_scroll_pan(pan);
-        self.fs_page_scroll_animation = if smooth_allowed
-            && self.settings.fullscreen_smooth_page_scroll
-            && start_time.is_finite()
-            && from != self.fs_pan
-        {
-            origin.map(|origin| FsPageScrollAnimation {
-                from,
-                to: self.fs_pan,
-                start_time,
-                origin,
-                viewport,
-            })
-        } else {
-            None
-        };
+        self.fs_page_scroll_animation =
+            if smooth_allowed && self.settings.fullscreen_smooth_page_scroll && from != self.fs_pan
+            {
+                origin.map(|origin| FsPageScrollAnimation {
+                    from,
+                    to: self.fs_pan,
+                    start_time: None,
+                    last_painted_pan: from,
+                    origin,
+                    viewport,
+                })
+            } else {
+                None
+            };
         ctx.request_repaint_of(viewport);
     }
 
