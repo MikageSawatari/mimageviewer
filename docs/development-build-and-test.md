@@ -110,8 +110,9 @@ PID だけの固定名を使わず、原則 `tempfile::TempDir` をテストの�
 実際の runtime / 推論を必要とするテストだけ `setup_app_with_ai_runtime(AiRuntimeFixture::Start)`
 または履歴 fixture の `setup_with_ai_runtime` を使う。`Start` は初期化を前倒しせず、通常の最初の
 Full frame / AI producer から開始する。片付けは App → AI 初期化の terminal 待ち → epoch / override →
-TempDir → 共有 lock の順。Initializing の場合だけ既存 Condvar を待ち、60秒以内に Ready / Failed に
-ならなければテストを失敗させる。製品の App drop は初期化 thread を join しないまま維持する。
+TempDir → 共有 lock の順。Initializing の場合は資源を保持したまま、既存 Condvar で期限なしに
+Ready / Failed を待つ。ハングは nextest の process 単位の timeout（既定60秒×5）で process ごと
+打ち切り、初期化中の TempDir を unwind で削除しない。製品の App drop は初期化 thread を join しないまま維持する。
 
 設定の再読込では `replace_app_from_settings(settings, fixture)` を使う。先に `drop(env.app)` して
 保存済みデータを編集するテストは、部分 move を保ったまま
@@ -119,9 +120,12 @@ TempDir → 共有 lock の順。Initializing の場合だけ既存 Condvar を�
 両方とも旧 owner の待機を保持し、新しい App の owner へ片付けの対象を更新する。
 App 単体の設定読込 helper も policy の引数は必須とし、`Start` の場合は必ず env の待機 lease と組にする。
 
-`app::tests::ai_runtime_fixture` は初回 Full の非初期化、合成 initializer の片付け、再生成時の owner、
-期限切れとソース走査を検査する。直接の製品 constructor 呼出しは、test helper 2か所と製品 GUI 入口
-だけを正確な path / anchor / 件数で許可し、新しい直接呼出しと古くなった例外を失敗にする。
+`app::tests::ai_runtime_fixture` は初回 Full の非初期化、待機内 hook で解放する合成 initializer の
+片付け、再生成時の owner とソース走査を検査する。コメント・文字列を除き、App constructor の
+参照、Self 経由、UFCS、型別名・import alias を検出する。test helper 2か所、製品の constructor
+連鎖と既存の非生成表記だけを正確な path / anchor / 件数で許可し、新しい参照と古い例外を失敗にする。
+補助の監査の限界: マクロ展開、型推論による `let app: App = Default::default();`、別 crate からの呼出し等は
+解析しない。Rust の名前解決を行う検査ではなく、コードレビューを補助する。
 背景: 2026-11-20 の本体 lib 全件の最中の PC の停止で、AI 初期化の DLL の読み込みと TempDir の削除の重なりが第一候補になった (原因は実証していない。経緯は §1.817 の報告)。
 
 ### 長い経過時間を扱う collection テスト

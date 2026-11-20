@@ -12720,32 +12720,25 @@ impl AiRuntimeFixtureCleanup {
     }
 
     fn wait(&mut self) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        self.wait_while(|| std::time::Instant::now() < deadline);
+        self.wait_while(|| {});
     }
 
-    fn wait_while(&mut self, mut keep_waiting: impl FnMut() -> bool) {
-        use crate::ai::runtime::{AiRuntimeInitSnapshot, AiRuntimeInitWait};
+    fn wait_while(&mut self, mut on_wait: impl FnMut()) {
+        use crate::ai::runtime::AiRuntimeInitSnapshot;
         let Some(owner) = &self.owner else {
             return;
         };
         if matches!(owner.snapshot(), AiRuntimeInitSnapshot::Initializing) {
             let wait_hook = &mut self.wait_hook;
-            assert!(
-                !matches!(
-                    owner.wait_terminal_while(|| {
-                        if !keep_waiting() {
-                            return false;
-                        }
-                        if let Some(hook) = wait_hook.take() {
-                            hook();
-                        }
-                        true
-                    }),
-                    AiRuntimeInitWait::Cancelled
-                ),
-                "AI runtime fixture initialization did not terminate within 60 seconds"
-            );
+            // Always keep waiting: unwinding here would delete TempDir while init
+            // still uses it. nextest terminates the whole process if init hangs.
+            let _ = owner.wait_terminal_while(|| {
+                on_wait();
+                if let Some(hook) = wait_hook.take() {
+                    hook();
+                }
+                true
+            });
         }
     }
 }

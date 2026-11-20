@@ -144,8 +144,7 @@ fn drop_fixture_and_assert_cleanup(
     if !hook_ran {
         let _ = release.send(());
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let terminal = owner.wait_terminal_while(|| std::time::Instant::now() < deadline);
+    let terminal = owner.wait_terminal_while(|| true);
     let written = touched.recv_timeout(std::time::Duration::from_secs(1));
     assert!(
         matches!(terminal, AiRuntimeInitWait::Failed(_)),
@@ -227,7 +226,6 @@ fn cleanup_enters_terminal_wait_before_releasing_initializer() {
         if let Some(release) = release.take() {
             release.send(()).unwrap();
         }
-        true
     });
     assert!(release.is_none(), "cleanup must enter the terminal wait");
     assert!(matches!(owner.snapshot(), AiRuntimeInitSnapshot::Failed(_)));
@@ -239,24 +237,183 @@ fn cleanup_enters_terminal_wait_before_releasing_initializer() {
     assert!(env.tmp.path().join("fixture-init-finished").exists());
 }
 
+// Preserve byte offsets/newlines while masking comments and literals. This is
+// only a lexical audit, not Rust name resolution or macro expansion.
+fn rust_code_only(source: &str) -> String {
+    fn literal_end(source: &str, start: usize) -> Option<usize> {
+        let bytes = source.as_bytes();
+        match bytes[start] {
+            b'r' => {
+                let mut quote = start + 1;
+                while bytes.get(quote) == Some(&b'#') {
+                    quote += 1;
+                }
+                if bytes.get(quote) != Some(&b'"') {
+                    return None;
+                }
+                let hashes = &bytes[start + 1..quote];
+                let mut end = quote + 1;
+                while end < bytes.len() {
+                    if bytes[end] == b'"'
+                        && bytes.get(end + 1..end + 1 + hashes.len()) == Some(hashes)
+                    {
+                        return Some(end + 1 + hashes.len());
+                    }
+                    end += 1;
+                }
+                Some(bytes.len())
+            }
+            b'"' => {
+                let mut end = start + 1;
+                while end < bytes.len() {
+                    match bytes[end] {
+                        b'\\' => end = (end + 2).min(bytes.len()),
+                        b'"' => return Some(end + 1),
+                        _ => end += 1,
+                    }
+                }
+                Some(bytes.len())
+            }
+            b'\'' => {
+                // A lifetime/label has no closing quote after one character.
+                let mut end = start + 1;
+                if bytes.get(end) == Some(&b'\\') {
+                    end = (end + 2).min(bytes.len());
+                    while end < bytes.len() && !matches!(bytes[end], b'\'' | b'\n' | b'\r') {
+                        end += 1;
+                    }
+                } else {
+                    end += source[end..].chars().next()?.len_utf8();
+                }
+                (bytes.get(end) == Some(&b'\'')).then_some(end + 1)
+            }
+            _ => None,
+        }
+    }
+
+    let bytes = source.as_bytes();
+    let mut code = bytes.to_vec();
+    let mut at = 0;
+    while at < bytes.len() {
+        let start = at;
+        let end = if bytes[at..].starts_with(b"//") {
+            while at < bytes.len() && bytes[at] != b'\n' {
+                at += 1;
+            }
+            at
+        } else if bytes[at..].starts_with(b"/*") {
+            at += 2;
+            let mut depth = 1;
+            while at < bytes.len() && depth > 0 {
+                if bytes[at..].starts_with(b"/*") {
+                    depth += 1;
+                    at += 2;
+                } else if bytes[at..].starts_with(b"*/") {
+                    depth -= 1;
+                    at += 2;
+                } else {
+                    at += 1;
+                }
+            }
+            at
+        } else if let Some(end) = literal_end(source, at) {
+            end
+        } else {
+            at += 1;
+            continue;
+        };
+        for byte in &mut code[start..end] {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+        at = end;
+    }
+    String::from_utf8(code).expect("mask complete UTF-8 comments and literals")
+}
+
+// Auxiliary audit limits: no macro expansion, inferred Default construction
+// (let app: App = Default::default()), or calls from other crates.
+fn scan_app_constructor_references(source: &str) -> (String, Vec<std::ops::Range<usize>>) {
+    static PATTERNS: std::sync::OnceLock<[regex::Regex; 5]> = std::sync::OnceLock::new();
+    let patterns = PATTERNS.get_or_init(|| {
+        [
+            r"\bApp\s*::\s*(?:new_from_settings\w*|new|default)\b",
+            r"\bSelf\s*::\s*new_from_settings\w*\b",
+            r"<\s*(?:crate\s*::\s*app\s*::\s*)?App\s+as\s+",
+            r"\btype\s+\w+\s*=\s*(?:crate\s*::\s*app\s*::\s*)?App\s*;",
+            r"\buse\s+[^;]*\bApp\s+as\s+\w+",
+        ]
+        .map(|pattern| regex::Regex::new(pattern).expect("App constructor audit pattern"))
+    });
+    let code = rust_code_only(source);
+    let mut references: Vec<_> = patterns
+        .iter()
+        .flat_map(|pattern| pattern.find_iter(&code).map(|found| found.range()))
+        .collect();
+    references.sort_by_key(|reference| reference.start);
+    references.dedup();
+    (code, references)
+}
+
 #[test]
-fn cleanup_deadline_expiry_fails_instead_of_accepting_initializing() {
-    let env = phase_c_support::setup_app_with_ai_runtime(AiRuntimeFixture::Start);
-    let (owner, release, touched) = controlled_initializer(&env);
-    let mut cleanup = AiRuntimeFixtureCleanup::new(&env, AiRuntimeFixture::Start);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        cleanup.wait_while(|| false);
-    }));
-    // Always release and drain, including on a failed assertion in this test.
-    release.send(()).unwrap();
-    cleanup.wait();
-    assert!(result.is_err(), "deadline expiry must fail the test");
-    assert!(matches!(owner.snapshot(), AiRuntimeInitSnapshot::Failed(_)));
-    assert!(
-        touched
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .unwrap()
-    );
+fn app_constructor_scanner_detects_indirect_references_without_comments_or_literals() {
+    let cases = [
+        ("App::new_from_settings(settings);", 1),
+        ("let make = App::new_from_settings;", 1),
+        ("let make = App::new_from_settings_with_load_meta;", 1),
+        ("let make = App::new;", 1),
+        ("let make = App::default;", 1),
+        ("let make = crate::app::App\n::\ndefault;", 1),
+        ("let make = Self::new_from_settings;", 1),
+        ("let make = Self::new_from_settings_with_load_meta;", 1),
+        ("let make = <App as Default>::default;", 1),
+        (
+            "let make = < crate::app::App as std::default::Default >::default;",
+            1,
+        ),
+        ("type FixtureApp = App;", 1),
+        ("type FixtureApp = crate::app::App;", 1),
+        ("use crate::app::App as FixtureApp;", 1),
+        ("use super::App as FixtureApp;", 1),
+        ("use crate::app::{App as FixtureApp, GridItem};", 1),
+        ("App::something_else();", 0),
+        ("App::default_settings();", 0),
+        (
+            "// let make = App::new_from_settings;\nApp::something_else();",
+            0,
+        ),
+        (
+            "/* App::new /* Self::new_from_settings */ App::default */",
+            0,
+        ),
+        (
+            r#"let text = "App::new_from_settings"; App::something_else();"#,
+            0,
+        ),
+        (
+            r##"let text = r#"a quote: " App::new_from_settings "#;"##,
+            0,
+        ),
+        (r#"let quote = '"'; let make = App::new;"#, 1),
+        (r"let slash = '\\'; let make = App::default;", 1),
+        ("let letter = 'あ'; let make = App::new;", 1),
+        ("fn fixture<'a>(_: &'a str) { App::default; }", 1),
+        (
+            "// App::new\nlet make = App::default; // Self::new_from_settings\n",
+            1,
+        ),
+    ];
+    for (source, expected) in cases {
+        let (code, references) = scan_app_constructor_references(source);
+        assert_eq!(references.len(), expected, "{source}");
+        assert_eq!(code.len(), source.len(), "preserve diagnostic byte offsets");
+        assert_eq!(
+            code.bytes().filter(|byte| *byte == b'\n').count(),
+            source.bytes().filter(|byte| *byte == b'\n').count(),
+            "preserve diagnostic lines"
+        );
+    }
 }
 
 // Like ime_focus's raw TextEdit inventory: exact path/anchor/count exemptions,
@@ -277,30 +434,75 @@ fn app_test_constructors_require_explicit_ai_runtime_fixture() {
     let exemptions = [
         (
             "src/app/tests.rs",
-            ["let app = App::", "new_from_settings(settings);"].concat(),
+            "let app = App::new_from_settings(settings);",
             "settings-reload helper applies the mandatory fixture policy immediately",
         ),
         (
             "src/app/tests.rs",
-            [
-                "App::",
-                "new_from_settings_with_load_meta_book_query_repaint_and_similar_capability(",
-            ]
-            .concat(),
+            "App::new_from_settings_with_load_meta_book_query_repaint_and_similar_capability(",
             "AppTestConfig helper applies the mandatory fixture policy immediately",
         ),
         (
             "src/lib.rs",
-            [
-                "app::App::",
-                "new_from_settings_with_load_meta_and_raw_executor(",
-            ]
-            .concat(),
+            "app::App::new_from_settings_with_load_meta_and_raw_executor(",
             "production GUI constructor is outside the test fixture policy",
         ),
+        (
+            "src/app.rs",
+            "Self::new_from_settings(crate::settings::Settings::load())",
+            "production App Default delegates to its settings constructor",
+        ),
+        (
+            "src/app.rs",
+            "Self::new_from_settings_with_load_meta(",
+            "production App constructor delegates with default load metadata",
+        ),
+        (
+            "src/app.rs",
+            "Self::new_from_settings_with_load_meta_and_book_query_repaint(",
+            "production App constructor delegates with a repaint callback",
+        ),
+        (
+            "src/app.rs",
+            "Self::new_from_settings_with_load_meta_and_raw_executor(",
+            "production App constructor delegates with its RAW executor",
+        ),
+        (
+            "src/app.rs",
+            "Self::new_from_settings_with_load_meta_book_query_repaint_and_similar_capability(",
+            "production App constructor delegates with product Similar capability",
+        ),
+        (
+            "src/app/tests.rs",
+            "type Target = App;",
+            "AppTestEnv Deref associated type, not an alternate constructor alias",
+        ),
+        (
+            "src/app/tests/history_parent_1473.rs",
+            "type Target = App;",
+            "CaseEnv Deref associated type, not an alternate constructor alias",
+        ),
+        (
+            "src/app/multiwindow_scenario_tests.rs",
+            "<App as eframe::App>::logic(",
+            "headless driver invokes existing App logic without constructing another App",
+        ),
+        (
+            "src/app/multiwindow_scenario_tests.rs",
+            "<App as eframe::App>::ui(",
+            "headless driver invokes existing App UI without constructing another App",
+        ),
+        (
+            "src/app/similar_navigation_tests.rs",
+            "<App as eframe::App>::logic(",
+            "headless driver invokes existing App logic without constructing another App",
+        ),
+        (
+            "src/app/similar_navigation_tests.rs",
+            "<App as eframe::App>::ui(",
+            "headless driver invokes existing App UI without constructing another App",
+        ),
     ];
-    let pattern =
-        regex::Regex::new(r"\bApp\s*::\s*(?:new_from_settings\w*|new|default)\s*\(").unwrap();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     collect(&root.join("src"), &mut files);
@@ -315,26 +517,27 @@ fn app_test_constructors_require_explicit_ai_runtime_fixture() {
             .to_string_lossy()
             .replace('\\', "/");
         let source = std::fs::read_to_string(&path).expect("read UTF-8 Rust source");
-        for call in pattern.find_iter(&source) {
-            let line_start = source[..call.start()].rfind('\n').map_or(0, |idx| idx + 1);
-            let line_end = source[call.start()..]
+        let (code, references) = scan_app_constructor_references(&source);
+        for reference in references {
+            let line_start = code[..reference.start].rfind('\n').map_or(0, |idx| idx + 1);
+            let line_end = code[reference.start..]
                 .find('\n')
-                .map_or(source.len(), |idx| call.start() + idx);
-            let line = &source[line_start..line_end];
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
+                .map_or(code.len(), |idx| reference.start + idx);
+            let line = &code[line_start..line_end];
             if let Some(idx) = exemptions.iter().position(|(file, anchor, reason)| {
-                *file == relative && line.contains(anchor.as_str()) && !reason.is_empty()
+                *file == relative && line.contains(*anchor) && !reason.is_empty()
             }) {
                 counts[idx] += 1;
             } else {
-                let number = source[..call.start()]
+                let number = source[..reference.start]
                     .bytes()
                     .filter(|b| *b == b'\n')
                     .count()
                     + 1;
-                violations.push(format!("{relative}:{number}: {}", line.trim()));
+                violations.push(format!(
+                    "{relative}:{number}: {}",
+                    source[line_start..line_end].trim()
+                ));
             }
         }
     }
