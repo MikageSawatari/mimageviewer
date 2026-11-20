@@ -86,11 +86,18 @@ pub(super) fn paint(
     let idx = app.fullscreen_idx.unwrap();
     let viewport = app.fullscreen_media_rect(ctx.content_rect(), idx, false);
     let mut painted = None;
+    let mut decision = FsPageTurnDecision::normal();
     ui.scope_builder(egui::UiBuilder::new().max_rect(viewport), |ui| {
         // The page-turn fixture intentionally hardcodes Page/zoom=None for a
         // single page. Exercise the ordinary renderer with this test's live
         // fit, zoom, trim and rotation instead.
-        app.fs_page_turn_decision_for_frame(ctx, idx);
+        decision = app.fs_page_turn_decision_for_frame(ctx, idx);
+        // Ordinary rendering selects the ready target before painting it. That
+        // transition and the submitted receipt below jointly retire navigation.
+        assert!(
+            app.fs_nav_holdover_for_draw().is_none(),
+            "the current-material fixture must not paint an outgoing holdover"
+        );
         let composition = app.spread_display_composition_for_anchor(idx);
         let screen = composition.pages_in_screen_order(app.spread_mode);
         if let [page] = screen.as_slice() {
@@ -153,6 +160,7 @@ pub(super) fn paint(
     });
     let (composition, sources) = painted.unwrap();
     app.record_fs_scroll_drawn_unit(ctx, viewport, &composition, &sources);
+    app.emit_fs_page_turn_ready_for_display_unit(ctx, &composition, decision, &sources);
     assert!(
         app.fullscreen_page_layout.drawn_unit.is_some(),
         "complete current paint records a receipt"

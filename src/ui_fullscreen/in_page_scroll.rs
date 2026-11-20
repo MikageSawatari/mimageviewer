@@ -530,7 +530,7 @@ impl App {
         self.fs_front_menu_presented_for_viewport(ctx, rect, viewport)
     }
 
-    fn fs_page_scroll_destination_viewport(&self) -> egui::ViewportId {
+    pub(super) fn fs_page_scroll_destination_viewport(&self) -> egui::ViewportId {
         if self.fullscreen_embedded_still_active() {
             egui::ViewportId::ROOT
         } else {

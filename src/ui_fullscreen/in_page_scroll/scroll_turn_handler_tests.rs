@@ -213,7 +213,17 @@ fn real_scroll_turn_key_consumes_repeat_but_never_turns_until_a_fresh_press() {
     app.settings.fullscreen_n_scroll_step_percent = 100;
     app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsPageScrollOrTurnNext = F24\n");
     seed(&ctx, &mut app);
-    frame(&ctx, tap(egui::Key::F24), |_, ctx| {
+    let key = |repeat| egui::Event::Key {
+        key: egui::Key::F24,
+        physical_key: Some(egui::Key::F24),
+        pressed: true,
+        repeat,
+        modifiers: egui::Modifiers::NONE,
+    };
+    // Keep this press held: egui derives repeat from keys_down, replacing the
+    // RawInput repeat flag. A preceding tap would make the next event fresh.
+    frame(&ctx, vec![key(false)], |_, ctx| {
+        assert!(ctx.input(|input| input.key_down(egui::Key::F24)));
         let action = app.handle_fs_key_input(ctx, 0, false);
         assert!(action.page_nav.is_none());
         assert!(app.fs_pan.y < 0.0);
@@ -226,24 +236,54 @@ fn real_scroll_turn_key_consumes_repeat_but_never_turns_until_a_fresh_press() {
             }
         ))));
     });
-    let key = |repeat| egui::Event::Key {
-        key: egui::Key::F24,
-        physical_key: Some(egui::Key::F24),
-        pressed: true,
-        repeat,
-        modifiers: egui::Modifiers::NONE,
-    };
+    let edge_pan = app.fs_pan;
     frame(&ctx, vec![key(true)], |_, ctx| {
+        assert!(ctx.input(|input| input.key_down(egui::Key::F24)));
+        assert!(
+            ctx.input(|input| input.events.iter().any(|event| matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::F24,
+                    pressed: true,
+                    repeat: true,
+                    ..
+                }
+            ))),
+            "the real handler receives an egui-derived repeat"
+        );
         assert!(app.handle_fs_key_input(ctx, 0, false).page_nav.is_none());
+        assert_eq!(app.fs_pan, edge_pan);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(
+            !ctx.input(|input| input.events.iter().any(|event| matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::F24,
+                    pressed: true,
+                    ..
+                }
+            ))),
+            "the repeat is consumed even though it cannot turn"
+        );
     });
     let mut release = key(false);
     if let egui::Event::Key { pressed, .. } = &mut release {
         *pressed = false;
     }
     frame(&ctx, vec![release], |_, ctx| {
+        assert!(!ctx.input(|input| input.key_down(egui::Key::F24)));
         assert!(app.handle_fs_key_input(ctx, 0, false).page_nav.is_none());
     });
     frame(&ctx, tap(egui::Key::F24), |_, ctx| {
+        assert!(ctx.input(|input| input.events.iter().any(|event| matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::F24,
+                pressed: true,
+                repeat: false,
+                ..
+            }
+        ))));
         assert_eq!(
             app.handle_fs_key_input(ctx, 0, false).page_nav,
             FsPageNavRequest {

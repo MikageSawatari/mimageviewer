@@ -11656,6 +11656,7 @@ mod fullscreen_in_page_scroll_setting_tests {
         }
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
+            // Include the smooth-scroll and ordered-step rows without cropping.
             .with_size(egui::vec2(540.0, 340.0))
             .build_ui(move |root_ui| {
                 crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
@@ -11668,7 +11669,13 @@ mod fullscreen_in_page_scroll_setting_tests {
                         return;
                     }
                     egui::CentralPanel::default().show(root_ui, |ui| {
+                        let available_bottom = ui.max_rect().bottom();
                         draw(ui, &mut settings);
+                        assert!(
+                            ui.min_rect().bottom() <= available_bottom,
+                            "the scroll settings must fit the 540x340 snapshot fixture: content={:?}, available_bottom={available_bottom}",
+                            ui.min_rect(),
+                        );
                     });
                 });
             });

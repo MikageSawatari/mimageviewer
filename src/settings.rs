@@ -10679,7 +10679,7 @@ impl Settings {
 
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     /// お気に入りの UUID マイグレーションもここで行う。
-    fn sanitize(&mut self) {
+    pub(super) fn sanitize(&mut self) {
         if !self.save_search_input_history {
             self.search_input_history.clear();
         }

@@ -604,7 +604,7 @@ fn pairing_gate_rejects_shift_and_clear_but_preserves_single_page_fallback() {
         env.spread_mode = crate::settings::SpreadMode::Single;
         env.queue_spread_shift_action(2, 1, &mut action);
         assert!(matches!(
-            action.page_nav,
+            action.page_nav.nav,
             crate::ui_fullscreen::FsPageNav::Delta(1)
         ));
         assert_eq!(env.spread_shift, state);
@@ -626,7 +626,7 @@ fn nudge_saves_internal_anchor_instead_of_navigation_target_and_edge_is_noop() {
     let mut action = crate::ui_fullscreen::FsKeyAction::default();
     env.queue_spread_shift_action(2, 1, &mut action);
     assert!(matches!(
-        action.page_nav,
+        action.page_nav.nav,
         crate::ui_fullscreen::FsPageNav::Target(2)
     ));
     assert_eq!(env.spread_shift_anchor_idx(), Some(0));

@@ -1,6 +1,6 @@
 # スクロール＋ページ送り・ホイールのズーム・N 字 / Z 字の移動量・滑らかな移動 (§1.823〜§1.826)
 
-- 状態: **設計 r3 (2026-11-20)・独立設計レビュー r3 で ACCEPT (P1/P2 なし、P3 3 件を反映済み)・実装とテスト記述を完了、未コンパイル・未実行**。ブランチ `scroll-823-826`。
+- 状態: **設計 r3 (2026-11-20)・独立設計レビュー r3 で ACCEPT (P1/P2 なし、P3 3 件を反映済み)・実装とテスト記述を完了、設計担当の関連テスト結果に基づくfixture修正後の再実行待ち**。ブランチ `scroll-823-826`。
 - §4.5と§4.4.1の6bの追記に従って再開し、コレクションを含む着地配送、ホイール、補間、回帰テスト、文書を接続した。最終のread-only実装レビューで未解決P1/P2なし。利用者の指示でコンパイル・テスト・snapshotのPNG生成・製品起動は行っていない。停止時の履歴と最新の実装記録は末尾を参照。
 - 要望: 5ch >>826〜829 (2026-11-20)。利用者決定 (2026-11-20) は [バックログ](next-release-backlog.md) の各項目の状態欄。
 - 前提の設計: [ページ内スクロールと N 字スクロール (§1.474)](fullscreen-in-page-scroll-plan.md)。v5.4.0 で出荷済み。
@@ -808,3 +808,28 @@ build-dev・製品起動・コミットは利用者の指示により実施し�
 **最終検査**: 引数なし `cargo fmt` は終了コード0、`python scripts/check_ui_glyphs.py` は危険グリフ0件、
 `git diff --check` は終了コード0。新規12ファイルのテスト関数が75件あることをファイル読取で確認した。
 コンパイル・テスト・snapshot生成・製品起動・コミットは行っていない。
+
+### 関連1552テストの報告に基づくfixture修正（2026-11-20、再実行待ち）
+
+設計担当からrun-heavy経由の実行結果として1543成功・9失敗の報告を受けた。4件はsnapshotのPNG未生成／既存寸法変更で、
+PNG生成・目視は設計担当が行う。残り5件は製品コードと照合し、いずれもテストの前提・fixtureの誤りと判断して修正した。
+本記録の実行結果は設計担当の報告であり、実装担当がコンパイル・テストを行ったものではない。
+
+| テスト | 判断の根拠と修正 |
+| --- | --- |
+| `manual_navigation_lands_at_the_reading_corner_for_every_unit_and_order` | 実描画fixtureがReady→Presentingの選択と実receiptの完了通知を省略し、描画後もnavigation sequenceが残った。`handler_tests::paint` から通常の `fs_nav_holdover_for_draw` と `emit_fs_page_turn_ready_for_display_unit` を呼ぶ。描画印・入力幾何・barrierの照合assertは維持。 |
+| `scroll_turn_boundaries_and_wrap_use_the_existing_units_and_directional_arrival` | Singleのrouterは端でもDeltaを返し、境界／wrapを後段handlerで解決する。SingleはDelta、見開き・splitは従来のBoundary／Wrapを厳密比較し、routerとの全値比較・最終到着idx／slice／角の検証も維持。 |
+| `consumed_scroll_action_respects_keyboard_ownership_before_consuming` | 直接keymapの既存S3互換gateはModalを遮断せず、App外側がmodalを扱う。直接keymapを遮断するFocusedUiをfixtureへ指定し、未消費→ApplicationShortcutへの所有移行→1回消費を検証。 |
+| `real_scroll_turn_key_consumes_repeat_but_never_turns_until_a_fresh_press` | 初回tapでrelease済みなのにrepeat=trueだけを送っていた。eguiはheld-key集合からrepeatを再計算するためInitialPressになっていた。press-onlyでheldを維持し、実際の正規化後repeat、消費のみ・pan／idx不変、release後の新Pressで着地付き送りを検証。 |
+| `asymmetric_spread_wrap_paint_keeps_final_pan_and_existing_material_producers` | 1000×2200のfixture素材がheadlessのtexture side上限2048を超えた。素材を500×1100／500×350へ半分にし、倍率2で縦長／短いページと描画上のはみ出しを維持。補間の最終pan固定・描画pan・producer不増加のassertは維持。 |
+
+§4.2の製品経路も確認した。`consume_chord_press_input` が消費したedgeのkindを返し、
+`fs_page_scroll_or_turn_key` の `allow_turn` はInitialPressだけ。`ordered_scroll_outcome` は移動できずallow_turn=falseならBlockedで、
+LoadFailedの例外も同じallow_turnの門を通る。Repeatでページを送る分岐はなく、製品の動作変更はしていない。
+
+環境設定snapshotの540×220→540×340は、滑らかな移動の設定・説明、移動量の欄・説明を追加したための意図した変更。
+共有fixtureの高さ340を維持し、描画前の利用可能下端を保存して内容の下端が収まるassertを4件共通で追加した。
+今回変更したファイルは、本書、`src/ui_dialogs/preferences/pages.rs`、`src/ui_fullscreen/in_page_scroll/` 内の
+`handler_tests.rs`、`landing_tests.rs`、`settings_input_tests.rs`、`scroll_turn_handler_tests.rs`、`smooth_render_tests.rs`。
+直前のコンパイルエラー修正の差分は維持した。設計との差分、新しい固定待ち・OSキー状態の読取、assertの緩和はない。
+修正後のテスト成否とsnapshotの実寸・描画は設計担当の再実行・目視待ち。

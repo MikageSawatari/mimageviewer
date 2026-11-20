@@ -83,13 +83,17 @@ fn asymmetric_spread_wrap_paint_keeps_final_pan_and_existing_material_producers(
         let mut app = scroll_app(&ctx, mode);
         app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
         app.settings.fullscreen_smooth_page_scroll = true;
-        install_material(&mut app, &ctx, 0, [1000, 2200]);
-        install_material(&mut app, &ctx, 1, [1000, 700]);
+        // Keep both textures below the headless 2048-side limit while retaining
+        // the tall/short spread and its overflowing painted dimensions.
+        app.fs_zoom = 2.0;
+        install_material(&mut app, &ctx, 0, [500, 1100]);
+        install_material(&mut app, &ctx, 1, [500, 350]);
         seed(&ctx, &mut app);
         let axes = scroll_geometry(&app.fullscreen_page_layout).unwrap().axes;
         let horizontal = if mode == SpreadMode::Ltr { -1.0 } else { 1.0 };
         let start = egui::vec2(axes[0].unwrap().start(horizontal), axes[1].unwrap().min);
-        app.set_fs_pan_from_input(app.fs_zoom, start);
+        let zoom = app.fs_zoom;
+        app.set_fs_pan_from_input(zoom, start);
         seed(&ctx, &mut app);
         let mut target = start;
         let mut before = (0, 0, 0, 0, 0, 0);
@@ -218,7 +222,7 @@ fn navigator_app(ctx: &egui::Context, smooth: bool, late: bool) -> crate::app::A
     }
     if !smooth {
         // The same actually painted geometry, with its own pan as the baseline.
-        app.fs_pan = normal_zoom_pan(
+        let painted_pan = normal_zoom_pan(
             app.fullscreen_page_layout
                 .displayed_pages()
                 .next()
@@ -227,6 +231,7 @@ fn navigator_app(ctx: &egui::Context, smooth: bool, late: bool) -> crate::app::A
         )
         .unwrap()
         .1;
+        app.fs_pan = painted_pan;
         app.fs_page_scroll_animation = None;
     }
     app.settings.fullscreen_navigator_visible = true;

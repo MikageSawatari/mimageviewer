@@ -95,8 +95,8 @@ fn trackpad_writer_is_instant_and_retires_an_existing_animation() {
         assert!(app.fs_page_scroll_animation.is_some());
     });
     timed_frame(&ctx, 1.05, |ctx| {
-        let next =
-            app.fs_page_scroll_wheel_pan(ctx, app.fs_zoom, app.fs_pan, egui::vec2(0.0, -1.0));
+        let (zoom, pan) = (app.fs_zoom, app.fs_pan);
+        let next = app.fs_page_scroll_wheel_pan(ctx, zoom, pan, egui::vec2(0.0, -1.0));
         assert_ne!(next, app.fs_pan);
         app.write_fs_page_scroll_pan_with_animation(ctx, next, false);
         assert_eq!(app.fs_pan, next);

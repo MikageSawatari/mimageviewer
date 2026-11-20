@@ -329,7 +329,18 @@ fn consumed_scroll_action_respects_keyboard_ownership_before_consuming() {
     let ctx = egui::Context::default();
     let keymap = Keymap::from_ini_str("[FsImage]\nFsPageScrollOrTurnNext = F24\n");
     frame(&ctx, vec![key_event(true, false)], |_, ctx| {
-        cache_keyboard_owner(ctx, true);
+        // Modal ownership retains the App's outer admission gate in S3.
+        // This direct keymap call must use an owner blocked by its own gate.
+        let owner = crate::keyboard_input::KeyboardOwner::FocusedUi {
+            viewport: ctx.viewport_id(),
+            widget_id: egui::Id::unique("scroll-action-focused-widget"),
+        };
+        assert!(owner.blocks_legacy_keymap_shortcuts());
+        crate::keyboard_input::cache_keyboard_owner(ctx, owner);
+        assert_eq!(
+            crate::keyboard_input::cached_keyboard_owner(ctx),
+            Some(owner)
+        );
         assert!(
             keymap
                 .consume_action_press(ctx, KeyAction::FsPageScrollOrTurnNext)
@@ -344,6 +355,10 @@ fn consumed_scroll_action_respects_keyboard_ownership_before_consuming() {
             }
         ))));
         cache_keyboard_owner(ctx, false);
+        assert!(matches!(
+            crate::keyboard_input::cached_keyboard_owner(ctx),
+            Some(crate::keyboard_input::KeyboardOwner::ApplicationShortcut { .. })
+        ));
         assert_eq!(
             keymap
                 .consume_action_press(ctx, KeyAction::FsPageScrollOrTurnNext)
@@ -351,6 +366,19 @@ fn consumed_scroll_action_respects_keyboard_ownership_before_consuming() {
                 .kind,
             PageTurnPressKind::InitialPress
         );
+        assert!(
+            keymap
+                .consume_action_press(ctx, KeyAction::FsPageScrollOrTurnNext)
+                .is_none()
+        );
+        assert!(!ctx.input(|input| input.events.iter().any(|event| matches!(
+            event,
+            egui::Event::Key {
+                key: egui::Key::F24,
+                pressed: true,
+                ..
+            }
+        ))));
     });
 }
 

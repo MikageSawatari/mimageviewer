@@ -421,7 +421,11 @@ fn scroll_turn_boundaries_and_wrap_use_the_existing_units_and_directional_arriva
                             FsPageLanding::End
                         })
                     );
-                    if wrap {
+                    if mode == SpreadMode::Single {
+                        // Single-page navigation resolves the boundary/wrap in
+                        // the handler; the router deliberately returns a delta.
+                        assert_eq!(request.nav, FsPageNav::Delta(if next { 1 } else { -1 }));
+                    } else if wrap {
                         assert!(matches!(request.nav, FsPageNav::Wrap(_)));
                     } else {
                         assert!(matches!(request.nav,FsPageNav::Boundary {at_end} if at_end==next));

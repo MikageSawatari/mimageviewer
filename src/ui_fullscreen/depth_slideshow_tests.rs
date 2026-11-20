@@ -517,7 +517,7 @@ mod gpu_tests {
                     full_rect,
                     &[],
                     &mut false,
-                    &mut FsPageNav::None,
+                    &mut FsPageNavRequest::default(),
                     crate::settings::FsSidePanelMode::Hover,
                     &mut false,
                     false,

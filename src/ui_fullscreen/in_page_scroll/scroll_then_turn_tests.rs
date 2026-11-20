@@ -298,7 +298,8 @@ fn fractional_wheel_advances_primary_but_cannot_wrap_to_another_column() {
         assert!(first.y < app.fs_pan.y);
         let geometry = scroll_geometry(&app.fullscreen_page_layout).unwrap();
         let edge = Vec2::new(app.fs_pan.x, geometry.axes[1].unwrap().min);
-        app.set_fs_pan_from_input(app.fs_zoom, edge);
+        let zoom = app.fs_zoom;
+        app.set_fs_pan_from_input(zoom, edge);
         paint(&mut app, ui, ctx);
         assert_eq!(
             app.fs_page_scroll_or_turn_wheel(ctx, app.fs_zoom, edge, forward, false),
