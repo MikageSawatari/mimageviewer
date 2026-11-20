@@ -35,6 +35,8 @@ $buildDevAst = Get-ScriptAst $buildDevPath
 $buildDev = Get-Content -LiteralPath $buildDevPath -Raw -Encoding UTF8
 
 Assert-True ($buildDev.Contains('[switch] $PreserveRuntime')) 'build-dev lacks -PreserveRuntime'
+Assert-True ($buildDev.Contains("& (Join-Path `$PSScriptRoot 'setup-test-dlls.ps1') -RepoRoot `$repoRoot -TargetDir `$targetDir -CargoProfile dev-runtime")) 'build-dev must share FFmpeg staging with the explicit target directory'
+Assert-True (-not $buildDev.Contains("src = 'vendor\ffmpeg\bin\")) 'build-dev still has a separate FFmpeg copy list'
 
 $stopFunctions = @($buildDevAst.FindAll({
     param($node)

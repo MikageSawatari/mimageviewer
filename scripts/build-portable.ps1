@@ -338,7 +338,7 @@ Assert-MivMusicvideoBuildOutputsIdle -OutputPaths @(
 # ---------------------------------------------------------------------------
 $repoPrefix = ($repoRoot.TrimEnd('\') + '\').ToLower()
 # Exact names only. "mimageviewer*" also matches Cargo's test harnesses
-# (target\debug\deps\mimageviewer-<hash>.exe), which live under the repo root and so pass
+# (target\debug\build\mimageviewer\<hash>\out\mimageviewer-<hash>.exe), which live under the repo root and so pass
 # the path check - stopping those killed another session's `cargo test` (backlog 5.3).
 $stoppableProcessNames = @(
     'mimageviewer',

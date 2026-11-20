@@ -10,6 +10,7 @@ mod physical_parent_1672;
 // App and its workers must drop before the override, temporary files and global lock.
 pub(super) struct CaseEnv {
     app: App,
+    pub(super) ai_runtime_cleanup: AiRuntimeFixtureCleanup,
     _epub_pin: Option<crate::pdf_loader::TestEpubPin>,
     pdf_backend: Option<crate::pdf_loader::RemotePdfTestBackend>,
     _epoch: crate::page_edit_write_epoch::TestEpochScope,
@@ -29,6 +30,13 @@ impl std::ops::DerefMut for CaseEnv {
     }
 }
 pub(super) fn setup(portable_layout: bool) -> CaseEnv {
+    setup_with_ai_runtime(portable_layout, AiRuntimeFixture::NotStarted)
+}
+
+pub(super) fn setup_with_ai_runtime(
+    portable_layout: bool,
+    ai_runtime: AiRuntimeFixture,
+) -> CaseEnv {
     let lock = crate::data_dir::test_override_lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let data_dir = tmp.path().join(if portable_layout {
@@ -43,13 +51,16 @@ pub(super) fn setup(portable_layout: bool) -> CaseEnv {
     let mut settings = crate::settings::Settings::default();
     settings.book_root = Some(tmp.path().join("books"));
     let mut app = App::new_for_test(AppTestConfig {
+        ai_runtime,
         data_dir,
         settings: Some(settings),
         similar_feature_capability: crate::similar_index::SimilarFeatureCapability::Enabled,
     });
     app.settings.first_setup_completed = true;
+    let ai_runtime_cleanup = AiRuntimeFixtureCleanup::new(&app, ai_runtime);
     CaseEnv {
         app,
+        ai_runtime_cleanup,
         _epub_pin: None,
         pdf_backend: None,
         _epoch: epoch,

@@ -60,24 +60,6 @@ fn locked_zip_publish_reports_plain_message_and_native_error_without_overwrite()
         "failed conversion must clean its temporary ZIP"
     );
 
-    let log_path = mimageviewer::data_dir::logs_dir().join("archive-conversion-failure-test.log");
-    let log = std::fs::read_to_string(&log_path).unwrap();
-    let publish_line = log
-        .lines()
-        .find(|line| line.contains("failed operation=publish_zip"))
-        .expect("publish failure must use the existing file logger");
-    for expected in [
-        format!("src={src:?}"),
-        format!("tmp={tmp:?}"),
-        format!("dst={dst:?}"),
-        "native_error=Some(5)".to_string(),
-        "PermissionDenied".to_string(),
-    ] {
-        assert!(
-            publish_line.contains(&expected),
-            "missing {expected}: {publish_line}"
-        );
-    }
     drop(held);
 
     // Explicit sibling/batch conversions still refuse an existing destination.
@@ -116,4 +98,31 @@ fn locked_zip_publish_reports_plain_message_and_native_error_without_overwrite()
     std::io::Read::read_to_end(&mut converted.by_name("page.jpg").unwrap(), &mut image).unwrap();
     assert_eq!(image, b"image bytes");
     assert!(!tmp.exists());
+
+    // All producers have finished. A flush request alone does not guarantee
+    // that the asynchronous writer has opened or written the log file.
+    assert!(
+        mimageviewer::finish_logs_until(
+            std::time::Instant::now() + std::time::Duration::from_secs(20)
+        ),
+        "diagnostic writers must finish successfully before reading the log"
+    );
+    let log_path = mimageviewer::data_dir::logs_dir().join("archive-conversion-failure-test.log");
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let publish_line = log
+        .lines()
+        .find(|line| line.contains("failed operation=publish_zip"))
+        .expect("publish failure must use the existing file logger");
+    for expected in [
+        format!("src={src:?}"),
+        format!("tmp={tmp:?}"),
+        format!("dst={dst:?}"),
+        "native_error=Some(5)".to_string(),
+        "PermissionDenied".to_string(),
+    ] {
+        assert!(
+            publish_line.contains(&expected),
+            "missing {expected}: {publish_line}"
+        );
+    }
 }

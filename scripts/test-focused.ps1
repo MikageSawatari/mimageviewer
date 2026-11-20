@@ -29,6 +29,7 @@ try {
     if (-not $plan.Entries.Count) { Write-Host '[test-focused] No changed paths or test selection.'; exit 4 }
     foreach ($entry in $plan.Entries) { Write-Host "[test-focused] $($entry.Path) -> $($entry.Selection -join ' ') -E $($entry.Filter)" }
     if ($PlanOnly) { Write-Host '[test-focused] Plan only; no tests executed.'; exit 0 }
+    & (Join-Path $PSScriptRoot 'setup-test-dlls.ps1') -RepoRoot $RepoRoot -CargoProfile $CargoProfile
     $featureArgs = @(Get-MivFeatureArguments $Features -NoDefaultFeatures:$NoDefaultFeatures)
     foreach ($entry in $plan.Entries) {
         $run = New-MivTestRun $RepoRoot 'test-focused' $NextestProfile

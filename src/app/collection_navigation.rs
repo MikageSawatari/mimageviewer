@@ -10622,7 +10622,10 @@ mod tests {
     #[test]
     fn intent_sequence_rejects_a_fullscreen_index_aba() {
         let _test_epoch_scope = crate::page_edit_write_epoch::TestEpochScope::fresh();
-        let mut app = App::new_from_settings(crate::settings::Settings::default());
+        let mut app = App::from_settings_for_test(
+            crate::settings::Settings::default(),
+            crate::app::tests::AiRuntimeFixture::NotStarted,
+        );
         let collection_id = CollectionId::new();
         app.top_level_grid_view.begin(
             TopLevelGridSurface::Collection(CollectionGridIdentity { collection_id }),

@@ -76,6 +76,8 @@ struct Shared {
     ready: (std::sync::Mutex<bool>, std::sync::Condvar),
     #[cfg(test)]
     after_panic_sink: OnceLock<Arc<std::sync::Barrier>>,
+    #[cfg(test)]
+    device_maintenance_saves: std::sync::atomic::AtomicUsize,
 }
 impl Shared {
     fn new() -> Self {
@@ -93,6 +95,8 @@ impl Shared {
             ready: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
             #[cfg(test)]
             after_panic_sink: OnceLock::new(),
+            #[cfg(test)]
+            device_maintenance_saves: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     fn wake(&self) {
@@ -1067,6 +1071,12 @@ fn writer_sampling_with_setup(
                     // Save only the revision captured before sampling/I/O.
                     // Changes during either operation require another pass.
                     schedule.saved(shared.checkpoint.elapsed_ms(), active, boundary);
+                    #[cfg(test)]
+                    if new_device_event {
+                        shared
+                            .device_maintenance_saves
+                            .fetch_add(1, Ordering::Release);
+                    }
                     continue;
                 }
                 match schedule.wait(now, active) {
@@ -2103,20 +2113,20 @@ mod tests {
         latch.observe(wgpu::DeviceLostReason::Unknown);
         // Only normal maintenance/initialization can consume and save the latch.
         publisher.publish_display(checkpoint::DisplaySnapshot::default());
+        let Owner::Admitted { shared, .. } = &owner.owner else {
+            panic!("fixture admission failed")
+        };
         let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if !device_loss::read_observations(&private, identity)
-                .unwrap()
-                .is_empty()
-            {
-                break;
-            }
+        while shared.device_maintenance_saves.load(Ordering::Acquire) == 0 {
             assert!(
                 Instant::now() < deadline,
                 "normal maintenance must wake idle writer"
             );
             std::thread::yield_now();
         }
+        // Observation append precedes state replacement. Wait for the latter
+        // before opening state.json; idle has no activity/boundary changes to
+        // trigger another replacement, even if the writer wakes spuriously.
         assert_eq!(
             test_support::record(directory.path()).unwrap().state,
             RunState::Running

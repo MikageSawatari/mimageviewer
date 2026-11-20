@@ -100,6 +100,34 @@ PID だけの固定名を使わず、原則 `tempfile::TempDir` をテストの�
 プロセス共有の既定 data_dir だけは終了フックで回収する。
 所有・終了順と PID 使用箇所の監査記録は [テスト用一時領域](test-tempdir-ownership.md) を参照。
 
+### App fixture の AI ランタイム（§1.817）
+
+`AppTestConfig.ai_runtime` は既定値を持たず、`AiRuntimeFixture::NotStarted` / `Start` を
+必ず選ぶ。共通の `setup_app()` と履歴 fixture の `setup()` は `NotStarted` を選び、
+構築直後の同じ owner を Dormant から説明付き Failed へ変える。owner の Arc と、constructor で
+設定した TensorRT lifecycle は保持する。Dormant 以外への適用は fixture の順序違反として panic する。
+
+実際の runtime / 推論を必要とするテストだけ `setup_app_with_ai_runtime(AiRuntimeFixture::Start)`
+または履歴 fixture の `setup_with_ai_runtime` を使う。`Start` は初期化を前倒しせず、通常の最初の
+Full frame / AI producer から開始する。片付けは App → AI 初期化の terminal 待ち → epoch / override →
+TempDir → 共有 lock の順。Initializing の場合は資源を保持したまま、既存 Condvar で期限なしに
+Ready / Failed を待つ。ハングは nextest の process 単位の timeout（既定60秒×5）で process ごと
+打ち切り、初期化中の TempDir を unwind で削除しない。製品の App drop は初期化 thread を join しないまま維持する。
+
+設定の再読込では `replace_app_from_settings(settings, fixture)` を使う。先に `drop(env.app)` して
+保存済みデータを編集するテストは、部分 move を保ったまま
+`env.app = env.ai_runtime_cleanup.app_from_settings_after_drop(settings, fixture)` で再構築する。
+両方とも旧 owner の待機を保持し、新しい App の owner へ片付けの対象を更新する。
+App 単体の設定読込 helper も policy の引数は必須とし、`Start` の場合は必ず env の待機 lease と組にする。
+
+`app::tests::ai_runtime_fixture` は初回 Full の非初期化、待機内 hook で解放する合成 initializer の
+片付け、再生成時の owner とソース走査を検査する。コメント・文字列を除き、App constructor の
+参照、Self 経由、UFCS、型別名・import alias を検出する。test helper 2か所、製品の constructor
+連鎖と既存の非生成表記だけを正確な path / anchor / 件数で許可し、新しい参照と古い例外を失敗にする。
+補助の監査の限界: マクロ展開、型推論による `let app: App = Default::default();`、別 crate からの呼出し等は
+解析しない。Rust の名前解決を行う検査ではなく、コードレビューを補助する。
+背景: 2026-11-20 の本体 lib 全件の最中の PC の停止で、AI 初期化の DLL の読み込みと TempDir の削除の重なりが第一候補になった (原因は実証していない。経緯は §1.817 の報告)。
+
 ### 長い経過時間を扱う collection テスト
 
 Windows の `Instant` は起動直後に大きな時間を引くと underflow するため、過去の
@@ -244,6 +272,31 @@ fixtureとログは残し、約1.4 GBの空き容量が必要。実画像59.1 GB
 仕様根拠: [nextest JUnit](https://nexte.st/docs/machine-readable/junit/)、
 [filterset](https://nexte.st/docs/filtersets/reference/)。
 
+### テスト前の FFmpeg DLL 配置
+
+新しい worktree・`cargo clean` 後・`cargo test` を直接打つ前には、次を1回実行する。
+`vendor/ffmpeg/bin` の必須6 DLLを Cargo の base output directory (`target/debug/`) へ
+実体コピーする。同じ内容なら書き直さず、不足時はセットアップ案内付きで停止する。
+
+```powershell
+.\scripts\setup-test-dlls.ps1
+# 別 profile のテストでは、その Cargo profile 名を指定する。
+.\scripts\setup-test-dlls.ps1 -CargoProfile dev-runtime
+```
+
+`test` / `dev` は `debug`、`bench` は `release`、他は同名の出力先になる。
+出力 root は `cargo metadata --no-deps --format-version 1` の `target_directory` を使う。
+明示する場合は `-TargetDir <path>` を指定できる。テストは target triple を指定せずに流す前提で、
+`--target` / `CARGO_BUILD_TARGET` を付けた場合の `target/<triple>/<profile>/` には置かない
+(リリース側の `build-output-safety.ps1` も `CARGO_BUILD_TARGET` を拒否している)。
+`test-lib-full.ps1` / `test-focused.ps1` / `test-full.ps1` / `build-dev.ps1` は自分で呼ぶ
+(`test-focused.ps1 -PlanOnly` はコピーしない)。
+
+Cargo 1.100 ではテスト実行体が `target/debug/deps/` から
+`target/debug/build/<package>/<hash>/out/` へ移った。`deps/` に置く従来の方法では
+実行体の隣にならず、`cargo test` の DLL 解決には効かない。Cargo と nextest が PATH に
+加える base output directory に配置する。スクリプトは `deps/` の既存ファイルに触れない。
+
 ### ビルドキャッシュの容量管理
 
 リリース成果物と検証記録を確保した区切りで、`target`の容量内訳を確認する。
@@ -263,8 +316,8 @@ fixtureとログは残し、約1.4 GBの空き容量が必要。実画像59.1 GB
 `target-portable-test-script`、調査用の入れ子 cargo 出力 3 つ (`codex-v330-p1/debug`、
 `section243-focused-20260915/debug`、`v370-work/debug`)、`mimageviewer-musicvideo` と
 `mimageviewer-xpost` の `target`、統合済み worktree `mimageviewer-dupe` 一式。reparse point は 0 件。
-`dev-runtime`・`release`・検証記録は保持した。`target/debug` を消すとテスト実行体の隣の
-FFmpeg DLL も消えるので、`vendor/ffmpeg/bin/*.dll` を `target/debug/deps/` へ置き直す。
+`dev-runtime`・`release`・検証記録は保持した。`target/debug` を消すとテスト用の
+FFmpeg DLL も消えるので、`.\scripts\setup-test-dlls.ps1` で置き直す (上の配置手順を参照)。
 
 ### dev / test プロファイル
 

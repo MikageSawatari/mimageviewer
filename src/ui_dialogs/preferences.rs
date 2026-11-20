@@ -10487,7 +10487,10 @@ mod tests {
         let app = crate::app::setup_app_for_test();
         let mut settings = app.settings.clone();
         settings.effetune_pre_limiter_enabled = false;
-        let app = crate::app::App::new_from_settings(settings);
+        let app = crate::app::App::from_settings_for_test(
+            settings,
+            crate::app::tests::AiRuntimeFixture::NotStarted,
+        );
         assert!(!app.local_audio_dsp_chain().effetune.pre_limiter_enabled());
         assert!(
             !app.remote_clockless_audio_processing(1.0)
@@ -10648,9 +10651,12 @@ mod tests {
                 let reloaded = Settings::load();
                 assert_eq!(reloaded.effetune_show_in_taskbar, enabled);
                 assert_eq!(
-                    crate::app::App::new_from_settings(reloaded)
-                        .effetune
-                        .show_in_taskbar(),
+                    crate::app::App::from_settings_for_test(
+                        reloaded,
+                        crate::app::tests::AiRuntimeFixture::NotStarted,
+                    )
+                    .effetune
+                    .show_in_taskbar(),
                     enabled
                 );
             }
@@ -10693,7 +10699,10 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let mut app = crate::app::setup_app_for_test();
         app.settings.effetune_keep_visible_when_minimized = true;
-        let app = crate::app::App::new_from_settings(app.settings.clone());
+        let app = crate::app::App::from_settings_for_test(
+            app.settings.clone(),
+            crate::app::tests::AiRuntimeFixture::NotStarted,
+        );
         assert!(app.effetune.keep_visible_when_minimized());
         let mut harness = crate::test_ui::builder()
             .with_context_setup(crate::ui_fonts::configure_fonts)

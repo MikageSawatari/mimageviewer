@@ -224,3 +224,44 @@ mIV の自動テストは PDF の描画結果の画素も EXR の画素も比べ
   (CCITT Fax / Flate の修正が入った)、パスワード付き PDF、数百ページの PDF の速いページ送り。
 - EXR (exr 1.74.3 で SIMD の実装が変わった) の表示。
 - 静止画の NIS / Anime4K VL (DX12 の DXBC 経路) が従来どおり表示される。
+
+## Cargo 1.100 の build-dir 配置 (取り込み後に判明)
+
+Cargo 1.100 (2026-11-12、CHANGELOG #17354) で中間成果物の配置が変わった。
+旧配置に戻す設定は無い。`rust-toolchain.toml` は 1.100.0 に固定している。
+設計担当が run-heavy で次を確認した。
+
+- テスト実行体は旧 `target\debug\deps\<name>-<hash>.exe` から
+  `target\debug\build\<package>\<hash>\out\<name>-<hash>.exe` へ移った。
+- build script の `OUT_DIR` も旧 `target\<profile>\build\<package>-<hash>\out` から
+  `target\<profile>\build\<package>\<hash>\out` へ移った。実例は
+  `C:\home\mimageviewer\target\debug\build\mimageviewer/30505735908c35d5\out`。
+  観測した hash は16桁 hexで、区切りに `/` が混ざる。
+- `cargo test` は `0xc0000135 STATUS_DLL_NOT_FOUND` で止まった。FFmpeg は import library
+  経由で exe 読み込み時に DLL が必要で、従来の `target\debug\deps\` への手動コピーでは
+  新しい実行体の隣に置けなくなった。`target\debug\` に置くと通ることを確認した。
+- `cargo check -p mimageviewer-launcher` は build script の旧形の照合で
+  `Launcher build cannot resolve inputs from OUT_DIR: OUT_DIR package directory is not mimageviewer-launcher-<hash>`
+  と出て停止した。
+
+nextest は `target\debug` と `deps` を PATH に加える
+([env-vars 文書](https://nexte.st/docs/configuration/env-vars/)) ので、上記の本体 lib 全件は通っていた。
+Cargo が PATH に加える base output directory も `target\debug` であり、テスト用 DLL はそこへ配置する。
+
+ソース確認では、本体 `build.rs` の `MIV_SOUND_CANDIDATE` 分岐も
+`out.ancestors().nth(3)` を profile 名とみなしていた。新配置では package を指すため、
+debug / dev-runtime の候補検証を誤って拒否する。
+
+対応では `build_output_paths.rs` を本体と launcher で共有し、package を明示して
+新しい `<profile_dir>/build/<package>/<nonempty ASCII hex hash>/out` だけを受け付ける。
+絶対パス・親参照なしを維持し、旧形・未知の形は想定形と Cargo 配置変更の可能性を示して停止する。
+launcher の埋込入力は従来どおり profile の親の `release`、候補許可は debug / dev-runtime だけとする。
+
+`scripts/setup-test-dlls.ps1` が FFmpeg の6 DLLを `<target>/<profile-dir>/` へ実体コピーする。
+profile 名の対応は native runtime ID と共通化し、同じ内容なら書かず、1本でも不足なら停止する。
+`deps/` は変更しない。全件 lib・focused・full テストと build-dev から呼び、全件 lib では
+native runtime ID の計算より先に準備する。直接 `cargo test` を打つ場合の手順は
+[開発ビルドとテスト](development-build-and-test.md#テスト前の-ffmpeg-dll-配置) を参照。
+
+この対応のビルド・テスト・整形は設計担当へ引き渡す。実装担当は Cargo・rustc・nextest・
+MSBuild・cmake・cargo fmt を実行せず、製品 exe も起動していない。

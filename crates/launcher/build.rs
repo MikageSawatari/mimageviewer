@@ -19,6 +19,7 @@ use build_const_parser::extract_const;
 mod build_effetune;
 
 fn main() {
+    println!("cargo:rerun-if-changed=src/build_output_paths.rs");
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     // crates/launcher/ → crates/ → workspace root
     let workspace_root = manifest_dir
@@ -36,10 +37,11 @@ fn main() {
             std::process::exit(1);
         });
     let release_dir =
-        build_output_paths::release_inputs_dir_from_out_dir(&out_dir).unwrap_or_else(|error| {
-            eprintln!("Launcher build cannot resolve inputs from OUT_DIR: {error}");
-            std::process::exit(1);
-        });
+        build_output_paths::release_inputs_dir_from_out_dir(&out_dir, "mimageviewer-launcher")
+            .unwrap_or_else(|error| {
+                eprintln!("Launcher build cannot resolve inputs from OUT_DIR: {error}");
+                std::process::exit(1);
+            });
 
     build_effetune::generate(&workspace_root);
 

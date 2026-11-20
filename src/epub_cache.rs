@@ -1127,18 +1127,70 @@ pub fn discard_unrecorded_sibling_file(file: &File, path: &Path) -> Result<(), C
     }
 }
 
+#[cfg(windows)]
+fn sibling_rename_info(destination: &Path) -> io::Result<(Vec<u64>, u32)> {
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+
+    let mut name: Vec<u16> = destination.as_os_str().encode_wide().collect();
+    if name.is_empty() || name.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid sibling destination name",
+        ));
+    }
+    let name_bytes = name.len().checked_mul(size_of::<u16>()).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sibling destination name too long",
+        )
+    })?;
+    let name_bytes = u32::try_from(name_bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sibling destination name too long",
+        )
+    })?;
+    // Keep FileNameLength exclusive of NUL, but include NUL in both the
+    // allocation and the byte count passed to SetFileInformationByHandle.
+    name.push(0);
+    let total = (offset_of!(FILE_RENAME_INFO, FileName) + name.len() * size_of::<u16>())
+        .max(size_of::<FILE_RENAME_INFO>());
+    let total_bytes = u32::try_from(total).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "sibling destination name too long",
+        )
+    })?;
+    let mut storage = vec![0_u64; total.div_ceil(size_of::<u64>())];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = HANDLE::default();
+        (*info).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+    }
+    Ok((storage, total_bytes))
+}
+
 /// Publish the still-open destination temp handle without replacing an existing PDF.
 #[cfg(windows)]
 pub fn publish_sibling_file(file: &File, _temp_path: &Path, destination: &Path) -> io::Result<()> {
-    use std::mem::{offset_of, size_of};
-    use std::os::windows::ffi::OsStrExt as _;
+    use std::mem::size_of;
     use std::os::windows::io::AsRawHandle as _;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO, FILE_RENAME_INFO, FileBasicInfo, FileRenameInfo,
+        FILE_ATTRIBUTE_NORMAL, FILE_BASIC_INFO, FileBasicInfo, FileRenameInfo,
         SetFileInformationByHandle,
     };
 
+    let (storage, total_bytes) = sibling_rename_info(destination)?;
     let handle = HANDLE(file.as_raw_handle());
     // The temp is hidden while in progress; the final PDF must be visible.
     let basic = FILE_BASIC_INFO {
@@ -1154,29 +1206,8 @@ pub fn publish_sibling_file(file: &File, _temp_path: &Path, destination: &Path) 
         )
     }
     .map_err(|error| io::Error::other(error.to_string()))?;
-
-    let name: Vec<u16> = destination.as_os_str().encode_wide().collect();
-    let name_bytes = name.len().checked_mul(size_of::<u16>()).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "sibling destination name too long",
-        )
-    })?;
-    let name_bytes = u32::try_from(name_bytes).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "sibling destination name too long",
-        )
-    })?;
-    let total = offset_of!(FILE_RENAME_INFO, FileName) + name_bytes as usize;
-    let mut storage = vec![0_u64; total.div_ceil(size_of::<u64>())];
-    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     unsafe {
-        (*info).Anonymous.ReplaceIfExists = false;
-        (*info).RootDirectory = HANDLE::default();
-        (*info).FileNameLength = name_bytes;
-        std::ptr::copy_nonoverlapping(name.as_ptr(), (*info).FileName.as_mut_ptr(), name.len());
-        SetFileInformationByHandle(handle, FileRenameInfo, info.cast(), total as u32)
+        SetFileInformationByHandle(handle, FileRenameInfo, storage.as_ptr().cast(), total_bytes)
     }
     .map_err(|error| io::Error::other(error.to_string()))
 }
@@ -2514,6 +2545,90 @@ mod tests {
         discard_unrecorded_sibling_file(&file, reserved.temp_path()).unwrap();
         drop(file);
         db.abandon_sibling_reservation(&reserved).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sibling_rename_info_includes_terminator_in_api_buffer_for_all_length_residues() {
+        use std::mem::{offset_of, size_of};
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows::Win32::Storage::FileSystem::FILE_RENAME_INFO;
+
+        let mut residues = [false; 4];
+        for length in 1..=64 {
+            let name = "本".repeat(length);
+            let destination = Path::new(&name);
+            let expected: Vec<u16> = destination.as_os_str().encode_wide().collect();
+            residues[expected.len() % 4] = true;
+            let (storage, total_bytes) = sibling_rename_info(destination).unwrap();
+            let offset = offset_of!(FILE_RENAME_INFO, FileName);
+            let name_end = offset + expected.len() * size_of::<u16>();
+            assert!(total_bytes as usize <= storage.len() * size_of::<u64>());
+            assert!(
+                name_end + size_of::<u16>() <= total_bytes as usize,
+                "terminator must be inside the API byte count for length {length}"
+            );
+            let info = storage.as_ptr().cast::<FILE_RENAME_INFO>();
+            // The assertions above prove that the whole name plus NUL fits
+            // inside both the allocation and the byte count supplied to Win32.
+            unsafe {
+                assert_eq!((*info).FileNameLength as usize, expected.len() * 2);
+                let actual = std::slice::from_raw_parts(
+                    std::ptr::addr_of!((*info).FileName).cast::<u16>(),
+                    expected.len() + 1,
+                );
+                assert_eq!(&actual[..expected.len()], expected.as_slice());
+                assert_eq!(actual[expected.len()], 0);
+            }
+        }
+        assert_eq!(residues, [true; 4]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sibling_rename_info_rejects_empty_and_embedded_nul_names() {
+        for name in ["", "book\0.pdf"] {
+            let error = sibling_rename_info(Path::new(name)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn sibling_handle_publish_preserves_exact_names_for_all_length_residues() {
+        use std::io::Write as _;
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = EpubCache::open_at(tmp.path()).unwrap();
+        let shelf = tmp.path().join("shelf");
+        fs::create_dir(&shelf).unwrap();
+        let mut expected = Vec::new();
+        let mut residues = [false; 4];
+        for extra in 0..4 {
+            let destination = shelf.join(format!("book{}.pdf", "x".repeat(extra)));
+            residues[destination.as_os_str().encode_wide().count() % 4] = true;
+            let mut reserved = db.reserve_sibling_output(&destination).unwrap();
+            let mut file = reserved.create_file().unwrap();
+            db.mark_sibling_created(&mut reserved, &file).unwrap();
+            file.write_all(b"verified PDF bytes").unwrap();
+            publish_sibling_file(&file, reserved.temp_path(), &destination).unwrap();
+            drop(file);
+            db.finish_sibling_output(&reserved).unwrap();
+            assert_eq!(fs::read(&destination).unwrap(), b"verified PDF bytes");
+            expected.push(destination.file_name().unwrap().to_os_string());
+        }
+        assert_eq!(residues, [true; 4]);
+        let mut actual: Vec<_> = fs::read_dir(&shelf)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        actual.sort();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "published names must have no extra suffix"
+        );
     }
 
     #[cfg(windows)]
