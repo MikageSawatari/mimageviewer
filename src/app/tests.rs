@@ -44,6 +44,7 @@ pub(super) fn backend_window_for_test(
     )
 }
 mod ai_runtime_fixture;
+mod app_data_dir_template;
 mod auto_aspect_s1;
 mod book_close_s1;
 mod close_nav_801;
@@ -12709,6 +12710,13 @@ impl AiRuntimeFixture {
     }
 }
 
+/// Every initial App fixture chooses whether to seed empty database schemas.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AppDataDirFixture {
+    Template,
+    Fresh,
+}
+
 /// Drop after App, but before the epoch, data-dir override and temporary directory.
 /// Retain the original owner even if a test installs a fake owner in the App.
 struct AiRuntimeFixtureCleanup {
@@ -12775,6 +12783,7 @@ impl Drop for AiRuntimeFixtureCleanup {
 /// `TempDir` を差し込む。App 内の全 DB/インデクサ open はその data_dir を参照する。
 struct AppTestConfig {
     ai_runtime: AiRuntimeFixture,
+    data_dir_fixture: AppDataDirFixture,
     /// テスト用データディレクトリ。`data_dir::set_test_override(Some(...))` に設定済みの
     /// パスを渡す。(呼び出し側の `TempDir` が App より長生きする必要あり)
     data_dir: std::path::PathBuf,
@@ -12811,6 +12820,10 @@ impl App {
     /// テスト終了時には `drop(app)` で正しく停止すること (IndexerManager::drop が
     /// supervisor を signal_stop→join で止める)。
     fn new_for_test(config: AppTestConfig) -> Self {
+        if config.data_dir_fixture == AppDataDirFixture::Template {
+            // Check before writing settings so even a pre-existing settings.json is rejected.
+            app_data_dir_template::assert_empty_destination(&config.data_dir);
+        }
         // settings.json をあらかじめ書いておく (App::default 内の Settings::load が拾う)
         if let Some(settings) = &config.settings {
             std::fs::create_dir_all(&config.data_dir).ok();
@@ -12824,6 +12837,12 @@ impl App {
             config.data_dir,
             "data_dir::set_test_override(Some(config.data_dir)) を先に呼ぶこと"
         );
+        if config.data_dir_fixture == AppDataDirFixture::Template {
+            app_data_dir_template::copy_template(
+                &config.data_dir,
+                config.similar_feature_capability,
+            );
+        }
         let mut app =
             App::new_from_settings_with_load_meta_book_query_repaint_and_similar_capability(
                 crate::settings::Settings::load(),
@@ -15397,7 +15416,7 @@ fn clamp_color_image_for_gpu_preserves_premultiplied_alpha() {
 /// 使用者が単一の Mutex で直列化される。
 #[cfg(test)]
 pub(crate) mod phase_c_support {
-    use super::{AiRuntimeFixture, AiRuntimeFixtureCleanup, App, AppTestConfig};
+    use super::{AiRuntimeFixture, AiRuntimeFixtureCleanup, App, AppDataDirFixture, AppTestConfig};
     use tempfile::TempDir;
 
     /// Prove that the last admitted position write has committed before a test
@@ -15566,6 +15585,17 @@ pub(crate) mod phase_c_support {
         setup_app_with_options(
             crate::similar_index::SimilarFeatureCapability::Enabled,
             ai_runtime,
+            AppDataDirFixture::Template,
+            None,
+            |_| {},
+        )
+    }
+
+    pub(crate) fn setup_app_with_fresh_data_dir() -> AppTestEnv {
+        setup_app_with_options(
+            crate::similar_index::SimilarFeatureCapability::Enabled,
+            AiRuntimeFixture::NotStarted,
+            AppDataDirFixture::Fresh,
             None,
             |_| {},
         )
@@ -15591,6 +15621,7 @@ pub(crate) mod phase_c_support {
         setup_app_with_options(
             crate::similar_index::SimilarFeatureCapability::Paused,
             AiRuntimeFixture::NotStarted,
+            AppDataDirFixture::Fresh,
             Some(settings),
             prepare_data_dir,
         )
@@ -15599,12 +15630,19 @@ pub(crate) mod phase_c_support {
     fn setup_app_with_similar_capability(
         capability: crate::similar_index::SimilarFeatureCapability,
     ) -> AppTestEnv {
-        setup_app_with_options(capability, AiRuntimeFixture::NotStarted, None, |_| {})
+        setup_app_with_options(
+            capability,
+            AiRuntimeFixture::NotStarted,
+            AppDataDirFixture::Template,
+            None,
+            |_| {},
+        )
     }
 
-    fn setup_app_with_options(
+    pub(super) fn setup_app_with_options(
         similar_feature_capability: crate::similar_index::SimilarFeatureCapability,
         ai_runtime: AiRuntimeFixture,
+        data_dir_fixture: AppDataDirFixture,
         settings: Option<crate::settings::Settings>,
         prepare_data_dir: impl FnOnce(&std::path::Path),
     ) -> AppTestEnv {
@@ -15615,6 +15653,7 @@ pub(crate) mod phase_c_support {
         let guard = OverrideGuard;
         let config = AppTestConfig {
             ai_runtime,
+            data_dir_fixture,
             data_dir: tmp.path().to_path_buf(),
             settings,
             similar_feature_capability,

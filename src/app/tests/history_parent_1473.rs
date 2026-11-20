@@ -52,6 +52,7 @@ pub(super) fn setup_with_ai_runtime(
     settings.book_root = Some(tmp.path().join("books"));
     let mut app = App::new_for_test(AppTestConfig {
         ai_runtime,
+        data_dir_fixture: AppDataDirFixture::Template,
         data_dir,
         settings: Some(settings),
         similar_feature_capability: crate::similar_index::SimilarFeatureCapability::Enabled,
