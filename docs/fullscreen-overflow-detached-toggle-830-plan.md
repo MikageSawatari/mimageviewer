@@ -1,6 +1,7 @@
 # 全画面の「…」から F12 の別ウィンドウ表示を切り替える (§1.830)
 
-状態: 設計メモ (2026-11-20、設計担当 ClaudeCode Opus 5.5)。実装前の独立レビュー待ち。
+状態: 設計メモ (2026-11-20、設計担当 ClaudeCode Opus 5.5)。実装前の独立レビュー (Sol / xhigh) r1 ACCEPT
+(P3 2 件をこの版に反映: パネル状態の所有の説明、snapshot fixture と 680pt 前提の更新)。
 正本のバックログ: [next-release-backlog.md §1.830](next-release-backlog.md)。
 
 ## 1. 目的と範囲
@@ -76,15 +77,17 @@ toggle の既存の拒否と通知に任せる (表示側で同じ判定を書�
   status = ON/OFF、enabled / disabled_reason = `detached_toggle_row_state()`。
 - `apply_fs_overflow_panel_action` の `Activate(DetachedViewer)`:
   `self.dismiss_fs_overflow_panel(); self.toggle_detached_viewer_mode();`
-  - パネルを先に閉じる理由: パネルの状態は viewer context が所有し (`fs_overflow_panel_state`)、
-    F12 で同じ context の表示先が main 全画面 ⇔ 別ウィンドウへ移る。閉じないと、押した窓とは別の窓に
-    パネルが開いたまま現れる。F12 キーの経路でも「パネルが開いている間の次のキー押下で閉じる」
+  - パネルを先に閉じる理由: `fs_overflow_panel_state` は viewer context の bundle ではなく、前面の
+    fullscreen viewer の一時状態として App 全体に 1 つ置かれている (§11 の §1.396 追補の所有判断)。
+    F12 で表示先が main 全画面 ⇔ 別ウィンドウへ移ると、閉じないかぎり押した窓とは別の窓に
+    パネルが開いたまま現れる。所有境界は移さない。F12 キーの経路でも「パネルが開いている間の次のキー押下で閉じる」
     (`handle_fs_key_input` 冒頭) ので、キーと同じ結果になる。拒否された場合も閉じるのはキーと同じ。
   - ページ一覧 (`PageOverview` 行) と同じ「閉じてから既存の操作を呼ぶ」形で、新しい状態は足さない。
 - 押した pointer stream: クリックは release で確定し、パネルの Area が押下から所有していた入力は
   その frame で終わる。toggle 後に表示先が変わっても、押下中の stream を別 viewport へ持ち越す
-  状態は無い (`fs_front_pointer` / `fs_primary_suppression` は既存の切替経路の扱いのまま)。
-  ここは実装前レビューで確認してもらう論点 (§7)。
+  状態は無い。描画前に捕捉したフレーム入力の所有が release frame まで残って背面へ渡さず、表示先の
+  変更時には旧 viewport の `fs_front_pointer` が既存の handoff で退役する (実装前レビュー r1)。
+  `dismiss_fs_transient_menu_state()` や pause 用の一括 reset へは広げない。
 - 独立静止画窓 (毎回新しい窓): 行は無効で、理由はトーストと同じ文言。keymap-spec の
   「独立静止画窓の F12 は含めない」と一致する。
 
@@ -137,10 +140,19 @@ toggle の既存の拒否と通知に任せる (表示側で同じ判定を書�
   ON/OFF が `settings.detached_viewer_enabled` に従う / 毎回新しい窓の非メディアで無効 + 理由。
 - 状態遷移: 行を押すと `fs_overflow_panel_state == Closed` かつ `toggle_detached_viewer_mode` と同じ結果
   (設定反転・表示先)。別ウィンドウの context から押すと OFF に戻る。兄弟 context の状態は不変。
-- 実描画: パネルを開いて行をクリックした後、旧窓・新窓の次のクリックが抑止されず、別窓にパネルが出ない。
+- 実描画: 実際の行を mouse / touch で操作するフレーム検査。release が背面へ漏れない、切替後に残留した
+  所有による抑止が無い (既存の focus 復帰ガードによる正当な抑止は維持)、別窓にパネルが出ない。
+  兄弟 context の items / cache / binding は不変 (設定と App 共通の前面状態は context 固有データと区別する)。
+- 経路の導出表: メディア別窓設定の両形態、presentation 遷移の往路 / 復路、binding 付き reopen の隙間。
+- snapshot: 実在する静止画 Root の fixture (`snapshot_fullscreen_overflow_panel`、Root の行を手組み) に
+  新しい行を足す。Root は構成編集行を含め 12 行・所要 636pt になるので、高さ 680pt で全行が収まる前提の
+  ケースは 720pt 等へ変え、680pt / 614pt ではスクロールでの到達を検査する。長いカスタム chord でも
+  ラベルと ON/OFF が重ならないこと。native popup の snapshot / 実描画 rect の HUD region も更新する。
 - 音声モード中は既存の警告で拒否 (設定不変)。
 - native: popup の行クリックで `ToggleDetachedViewerMode` command が出て popup が閉じる / metadata の
-  ON/OFF・キー表記 / App の event 処理で toggle が呼ばれる / ParkedLive では活性化要求だけ。
+  ON/OFF・キー表記 (probe 情報あり・なしの両方の生成箇所) / 2 つの command 変換 match (`video/mod.rs` の
+  presenter loop と `Command` からの変換) / App の event 処理で toggle が呼ばれる / stale epoch は落ちる /
+  ParkedLive では活性化要求だけで設定・表示意図を変えない。
 - 1093×614: Root パネルのヘッダと閉じるボタンが ScrollArea の外で見え、末尾の行までスクロールで届く
   (既存の `tests/support/scroll_layout.rs` 系の検査に従う)。native popup が 614 の高さに収まる。
 - 見た目が変わる ui_snapshot があれば更新して目視。UI 文言は `python scripts/check_ui_glyphs.py`。
@@ -150,3 +162,13 @@ toggle の既存の拒否と通知に任せる (表示側で同じ判定を書�
 - マニュアル `htdocs/mimageviewer/manual/fullscreen.html` の「別ウィンドウ表示（F12）」と、動画の上部バーの「…」の説明。
 - `docs/keymap-spec.md` の「その他の個別操作」に行の説明、`docs/video-architecture.md` の HUD overlay 節。
 - `docs/detached-rework-plan.md` §11 に触れた範囲と、構造的修正である判断の記録。
+
+## 10. 実装前レビューの記録
+
+- r1 (gpt-6.1-sol / xhigh、2026-11-20、12e9914bb): **ACCEPT**、P1/P2 なし。
+  「これは症状パッチではなく構造的修正である」に同意 (新しい入口は既存 toggle へ合流、経路分類と表示状態は導出、
+  新しい App の bool / Option・待機・再試行・repaint は無い)。描画中の toggle は、Root パネルがキー処理より前に
+  描画・適用され、F12 キー自身も同じ描画コールバック中で同期実行しているので、現行構造で安全。
+  native は両 enum・2 つの変換 match・ParkedLive の網羅的 HUD 分類・App の通常 handler・metadata の 2 生成箇所を更新する。
+  maintenance・epoch 不一致の例外・VST 離脱の early-match には足さない。
+  非 Windows の行状態は設定値から導出し、Windows 専用の分類を共通描画コードから無条件に参照しない。
