@@ -113094,10 +113094,18 @@ mod background_click_scroll_regression_tests {
     }
 
     fn harness_with_size(app: AppTestEnvForTest, size: egui::Vec2) -> Harness<'static, State> {
+        harness_with_size_and_step_dt(app, size, 0.01)
+    }
+
+    fn harness_with_size_and_step_dt(
+        app: AppTestEnvForTest,
+        size: egui::Vec2,
+        step_dt: f32,
+    ) -> Harness<'static, State> {
         let mut fonts_set = false;
         crate::test_ui::builder()
             .with_size(size)
-            .with_step_dt(0.01)
+            .with_step_dt(step_dt)
             .build_ui_state(
                 move |root_ui, state| {
                     let ctx = &root_ui.ctx().clone();
@@ -113170,6 +113178,74 @@ mod background_click_scroll_regression_tests {
             });
         }
         harness.step();
+    }
+
+    #[test]
+    fn grid_line_wheel_scroll_and_column_limit_stop_repainting_within_three_passes() {
+        use crate::wheel_input::tests::repaint_delay;
+        for ctrl in [false, true] {
+            let mut app = setup_app_for_test();
+            let folder = app.tmp.path().join("wheel-tail-grid");
+            install_items(&mut app, &folder, 240);
+            app.settings.grid_view_mode = crate::settings::GridViewMode::Details;
+            app.settings.grid_cols = crate::settings::MAX_GRID_COLS;
+            let mut harness =
+                harness_with_size_and_step_dt(app, egui::vec2(1200.0, 480.0), 1.0 / 165.0);
+            harness.hover_at(egui::pos2(500.0, 200.0));
+            harness.run_steps(10);
+            assert_ne!(repaint_delay(harness.output()), std::time::Duration::ZERO);
+            let before = harness.state().app.grid_scroll.offset();
+            let row_h = harness.state().app.last_cell_h;
+            let speed = harness.ctx.options(|o| o.input_options.line_scroll_speed);
+            let modifiers = egui::Modifiers {
+                ctrl,
+                ..egui::Modifiers::NONE
+            };
+            // Direct insertion gives exactly one input pass, with no queued pointer event.
+            harness.input_mut().events.push(egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                delta: egui::vec2(0.0, -1.0),
+                modifiers,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
+            });
+            let mut stopped = None;
+            for pass in 1..=3 {
+                if pass > 1 {
+                    assert!(
+                        harness.input_mut().events.is_empty(),
+                        "idle input must be empty"
+                    );
+                }
+                harness.step();
+                if pass == 1 {
+                    assert_eq!(harness.state().wheels_consumed.len(), 1);
+                    assert_eq!(
+                        harness.state().app.settings.grid_cols,
+                        crate::settings::MAX_GRID_COLS
+                    );
+                    let expected = if ctrl {
+                        before
+                    } else {
+                        crate::ui_main::grid_wheel_scroll_offset(before, -speed, row_h)
+                    };
+                    assert_eq!(harness.state().app.grid_scroll.offset(), expected);
+                } else {
+                    harness.ctx.input(|i| {
+                        assert!(i.events.is_empty());
+                        assert_eq!(i.smooth_scroll_delta, egui::Vec2::ZERO);
+                        assert_eq!(i.zoom_delta(), 1.0);
+                    });
+                }
+                if repaint_delay(harness.output()) != std::time::Duration::ZERO {
+                    stopped.get_or_insert(pass);
+                }
+            }
+            assert!(
+                stopped.is_some_and(|passes| passes <= 3),
+                "ctrl={ctrl}, stopped={stopped:?}"
+            );
+        }
     }
 
     fn wheel_breaks_pair(view: crate::settings::GridViewMode) {

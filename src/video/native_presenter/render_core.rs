@@ -1034,10 +1034,14 @@ fn consume_seek_strip_wheel(
         return steps;
     }
     ctx.input_mut(|input| {
+        let before = input.events.len();
         input.smooth_scroll_delta = egui::Vec2::ZERO;
         input
             .events
             .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+        if input.events.len() < before {
+            crate::wheel_input::finish_raw_wheel_consumption(input);
+        }
     });
     steps
 }
@@ -23757,6 +23761,60 @@ let ctx = &root_ui.ctx().clone();
                 });
             (strip.inner, panel_inner_rect, strip_steps, panel_offset)
         }
+    }
+
+    #[test]
+    fn seek_strip_line_wheel_stops_repainting_within_three_passes() {
+        use crate::wheel_input::tests::{repaint_delay, smoothing_input};
+        let ctx = egui::Context::default();
+        let mut stopped = None;
+        let mut steps_seen = Vec::new();
+        for pass in 0..63 {
+            let events = if pass == 0 {
+                vec![egui::Event::PointerMoved(egui::pos2(280.0, 100.0))]
+            } else if pass == 60 {
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -1.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                }]
+            } else {
+                vec![]
+            };
+            let output = ctx.run_ui(smoothing_input(pass, events), |_| {
+                if pass > 60 {
+                    ctx.input(|i| {
+                        assert!(i.events.is_empty());
+                        assert_eq!(i.smooth_scroll_delta, egui::Vec2::ZERO);
+                        assert_eq!(i.zoom_delta(), 1.0);
+                    });
+                }
+                let (_, _, steps, panel_offset) =
+                    HeadlessNativeBatchTarget::draw_regions(&ctx, true);
+                steps_seen.extend(steps);
+                assert_eq!(
+                    panel_offset, 0.0,
+                    "strip wheel cannot scroll the sibling panel"
+                );
+            });
+            if pass == 59 {
+                assert_ne!(repaint_delay(&output), std::time::Duration::ZERO);
+            }
+            if pass >= 60 && repaint_delay(&output) != std::time::Duration::ZERO {
+                stopped.get_or_insert(pass - 60 + 1);
+            }
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            steps_seen,
+            vec![crate::video::seek_strip::SeekStripRangeStep::Wider]
+        );
+        assert!(
+            stopped.is_some_and(|passes| passes <= 3),
+            "stopped={stopped:?}"
+        );
     }
 
     #[test]

@@ -158,6 +158,7 @@ pub(crate) fn consume_wheel_segment(ctx: &egui::Context, segment: WheelSegment) 
         });
         if consumed {
             input.smooth_scroll_delta = egui::Vec2::ZERO;
+            finish_raw_wheel_consumption(input);
         }
     });
 }
@@ -193,15 +194,42 @@ pub(crate) fn consume_remaining_wheel_inputs(
         });
         if consumed {
             input.smooth_scroll_delta = egui::Vec2::ZERO;
+            finish_raw_wheel_consumption(input);
         }
     });
 }
 
-/// Consume all public wheel representations together for this viewport/pass.
-///
-/// Call after the accepting owner has read/applied the input. This does not
-/// terminate egui's internal smoothing tail at a popup lifecycle boundary.
-pub(crate) fn consume_wheel_input(ctx: &egui::Context) {
+/// Call only after removing at least one wheel event in this pass.
+pub(crate) fn finish_raw_wheel_consumption(input: &mut egui::InputState) {
+    // Raw owners do not use the smoothing tail. End it only when no sibling
+    // wheel remains for another owner (including a popup ScrollArea).
+    if !input
+        .events
+        .iter()
+        .any(|event| matches!(event, egui::Event::MouseWheel { .. }))
+    {
+        input.discard_pending_scroll();
+    }
+}
+
+/// Consume the whole stream after a raw-event owner has applied its movement.
+pub(crate) fn consume_raw_wheel_input(ctx: &egui::Context) {
+    ctx.input_mut(|input| {
+        let before = input.events.len();
+        input.smooth_scroll_delta = egui::Vec2::ZERO;
+        input
+            .events
+            .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+        if input.events.len() < before {
+            finish_raw_wheel_consumption(input);
+        }
+    });
+}
+
+/// Suppress passthrough after the front UI has used this pass's wheel.
+pub(crate) fn consume_popup_wheel_input(ctx: &egui::Context) {
+    // Popup ScrollAreas scroll using the tail on later passes; preserve it,
+    // while clearing this pass's delta even when there are no wheel events.
     ctx.input_mut(|input| {
         input.smooth_scroll_delta = egui::Vec2::ZERO;
         input
@@ -211,8 +239,27 @@ pub(crate) fn consume_wheel_input(ctx: &egui::Context) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// Real idle passes must have no PointerMoved events, and a refresh-sized
+    /// dt must leave most of a Line notch queued on its input pass.
+    pub(crate) fn smoothing_input(pass: u32, events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 400.0),
+            )),
+            time: Some(1.0 + f64::from(pass) / 165.0),
+            predicted_dt: 1.0 / 165.0,
+            events,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn repaint_delay(output: &egui::FullOutput) -> std::time::Duration {
+        output.viewport_output[&egui::ViewportId::ROOT].repaint_delay
+    }
 
     fn wheel(
         unit: egui::MouseWheelUnit,
@@ -390,8 +437,8 @@ mod tests {
         );
         assert!(ctx.input(|input| input.smooth_scroll_delta.y > 0.0));
 
-        consume_wheel_input(&ctx);
-        consume_wheel_input(&ctx);
+        consume_popup_wheel_input(&ctx);
+        consume_popup_wheel_input(&ctx);
 
         ctx.input(|input| {
             assert!(remaining_wheel_inputs(input, options()).is_empty());
@@ -546,12 +593,176 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![-4.0, 2.0, -4.0]
         );
-        consume_wheel_input(&ctx);
+        consume_popup_wheel_input(&ctx);
         assert!(
             ctx.input(|input| remaining_wheel_segments(input, options()))
                 .is_empty(),
             "whole-stream front owner leaves no projection to revive from raw identity data"
         );
         ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn raw_wheel_owners_end_scroll_and_zoom_tails_and_accept_fresh_wheel() {
+        for owner in 0..3 {
+            for modifiers in [egui::Modifiers::NONE, egui::Modifiers::CTRL] {
+                let ctx = egui::Context::default();
+                let mut deliveries = 0;
+                for pass in 0..5 {
+                    let events = if pass == 0 || pass == 3 {
+                        vec![wheel(
+                            egui::MouseWheelUnit::Line,
+                            egui::vec2(0.0, -1.0),
+                            modifiers,
+                        )]
+                    } else {
+                        vec![]
+                    };
+                    let output = ctx.run_ui(smoothing_input(pass, events), |_| {
+                        if pass == 0 || pass == 3 {
+                            let options = ctx.options(|o| o.input_options);
+                            let segments = ctx.input(|i| remaining_wheel_segments(i, options));
+                            assert_eq!(segments.len(), 1);
+                            assert_eq!(segments[0].input.delta.y, -options.line_scroll_speed);
+                            deliveries += 1;
+                            match owner {
+                                0 => consume_wheel_segment(&ctx, segments[0]),
+                                1 => consume_remaining_wheel_inputs(&ctx, |_| true),
+                                _ => consume_raw_wheel_input(&ctx),
+                            }
+                        } else {
+                            ctx.input(|i| {
+                                assert_eq!(i.smooth_scroll_delta, egui::Vec2::ZERO);
+                                assert_eq!(i.zoom_delta(), 1.0);
+                                assert!(i.events.is_empty());
+                            });
+                        }
+                    });
+                    output.drop_without_applying_deltas();
+                }
+                assert_eq!(deliveries, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn zero_consumption_preserves_tail_for_rejected_stale_and_empty_raw_owners() {
+        for owner in 0..3 {
+            let ctx = egui::Context::default();
+            let mut stale = None;
+            let output = ctx.run_ui(
+                smoothing_input(
+                    0,
+                    vec![wheel(
+                        egui::MouseWheelUnit::Line,
+                        egui::vec2(0.0, -1.0),
+                        egui::Modifiers::NONE,
+                    )],
+                ),
+                |_| {
+                    let options = ctx.options(|o| o.input_options);
+                    stale = Some(ctx.input(|i| remaining_wheel_segments(i, options))[0]);
+                    consume_remaining_wheel_inputs(&ctx, |_| false);
+                    assert!(ctx.input(|i| i.smooth_scroll_delta.y < 0.0));
+                    // Front UI removes the events without ending its smoothing.
+                    consume_popup_wheel_input(&ctx);
+                },
+            );
+            output.drop_without_applying_deltas();
+            for pass in 1..=2 {
+                let output = ctx.run_ui(smoothing_input(pass, vec![]), |_| {
+                    assert!(ctx.input(|i| i.smooth_scroll_delta.y < 0.0));
+                    match owner {
+                        0 => consume_wheel_segment(&ctx, stale.unwrap()),
+                        1 => consume_remaining_wheel_inputs(&ctx, |_| true),
+                        _ => consume_raw_wheel_input(&ctx),
+                    }
+                });
+                output.drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_raw_routes_preserve_tail_until_the_final_owner_consumes() {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(
+            smoothing_input(
+                0,
+                vec![
+                    wheel(
+                        egui::MouseWheelUnit::Line,
+                        egui::vec2(0.0, -1.0),
+                        egui::Modifiers::NONE,
+                    ),
+                    wheel(
+                        egui::MouseWheelUnit::Line,
+                        egui::vec2(0.0, -1.0),
+                        egui::Modifiers::CTRL,
+                    ),
+                ],
+            ),
+            |_| {
+                consume_remaining_wheel_inputs(&ctx, |wheel| !wheel.modifiers.ctrl);
+                // The music timeline's Ctrl route has not claimed its event yet.
+                assert_eq!(ctx.input(|i| remaining_wheel_inputs(i, options())).len(), 1);
+            },
+        );
+        output.drop_without_applying_deltas();
+        let output = ctx.run_ui(smoothing_input(1, vec![]), |_| {
+            assert_ne!(ctx.input(|i| i.zoom_delta()), 1.0);
+        });
+        output.drop_without_applying_deltas();
+        let output = ctx.run_ui(
+            smoothing_input(
+                2,
+                vec![
+                    wheel(
+                        egui::MouseWheelUnit::Line,
+                        egui::vec2(0.0, -1.0),
+                        egui::Modifiers::NONE,
+                    ),
+                    wheel(
+                        egui::MouseWheelUnit::Line,
+                        egui::vec2(0.0, -1.0),
+                        egui::Modifiers::CTRL,
+                    ),
+                ],
+            ),
+            |_| {
+                consume_remaining_wheel_inputs(&ctx, |wheel| !wheel.modifiers.ctrl);
+                consume_remaining_wheel_inputs(&ctx, |wheel| wheel.modifiers.ctrl);
+            },
+        );
+        output.drop_without_applying_deltas();
+        let output = ctx.run_ui(smoothing_input(3, vec![]), |_| {
+            ctx.input(|i| {
+                assert_eq!(i.smooth_scroll_delta, egui::Vec2::ZERO);
+                assert_eq!(i.zoom_delta(), 1.0);
+            });
+        });
+        output.drop_without_applying_deltas();
+    }
+
+    #[test]
+    fn popup_consumer_clears_current_delta_on_empty_passes_without_ending_tail() {
+        let ctx = egui::Context::default();
+        for pass in 0..4 {
+            let events = if pass == 0 {
+                vec![wheel(
+                    egui::MouseWheelUnit::Line,
+                    egui::vec2(0.0, -1.0),
+                    egui::Modifiers::NONE,
+                )]
+            } else {
+                vec![]
+            };
+            let output = ctx.run_ui(smoothing_input(pass, events), |_| {
+                assert!(ctx.input(|i| i.smooth_scroll_delta.y < 0.0));
+                consume_popup_wheel_input(&ctx);
+                assert_eq!(ctx.input(|i| i.smooth_scroll_delta), egui::Vec2::ZERO);
+            });
+            output.drop_without_applying_deltas();
+        }
     }
 }

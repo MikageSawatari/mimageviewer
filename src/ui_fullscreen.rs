@@ -39042,10 +39042,14 @@ impl App {
 
         if wheel_y.abs() > 0.5 {
             ctx.input_mut(|input| {
+                let before = input.events.len();
                 input.smooth_scroll_delta = egui::Vec2::ZERO;
                 input
                     .events
                     .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+                if input.events.len() < before {
+                    crate::wheel_input::finish_raw_wheel_consumption(input);
+                }
             });
         }
 
@@ -39411,10 +39415,14 @@ impl App {
 
         if wheel_y.abs() > 0.5 {
             ctx.input_mut(|input| {
+                let before = input.events.len();
                 input.smooth_scroll_delta = egui::Vec2::ZERO;
                 input
                     .events
                     .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+                if input.events.len() < before {
+                    crate::wheel_input::finish_raw_wheel_consumption(input);
+                }
             });
         }
 
@@ -54875,7 +54883,7 @@ impl FsHudPopupWheelInput {
 }
 
 fn consume_fs_hud_popup_wheel(ctx: &egui::Context) {
-    crate::wheel_input::consume_wheel_input(ctx);
+    crate::wheel_input::consume_popup_wheel_input(ctx);
 }
 
 fn fs_fit_popup_frame() -> egui::Frame {
@@ -84238,6 +84246,7 @@ mod tests {
                         egui::Pos2::ZERO,
                         egui::vec2(420.0, 300.0),
                     )),
+                    predicted_dt: 1.0 / 165.0,
                     events: std::iter::once(egui::Event::ModifiersChanged(modifiers))
                         .chain(vec![
                             egui::Event::PointerMoved(egui::pos2(220.0, 220.0)),
@@ -84272,6 +84281,24 @@ mod tests {
             )
             .drop_without_applying_deltas();
         assert_eq!(app.music_timeline_row_secs, before);
+        ctx.run_pass(
+            egui::RawInput {
+                predicted_dt: 1.0 / 165.0,
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.input(|input| {
+                    assert!(input.events.is_empty());
+                    assert_eq!(input.smooth_scroll_delta, egui::Vec2::ZERO);
+                    assert_eq!(
+                        input.zoom_delta(),
+                        1.0,
+                        "the raw audio-track popup ends its Ctrl tail"
+                    );
+                })
+            },
+        )
+        .drop_without_applying_deltas();
     }
 
     #[test]
@@ -95778,6 +95805,16 @@ mod specified_scale_consumer_tests {
             events,
             ..Default::default()
         };
+        fit_popup_frame_with_input(ctx, full_rect, raw_input, open, value)
+    }
+
+    fn fit_popup_frame_with_input(
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        raw_input: egui::RawInput,
+        open: &mut bool,
+        value: &mut FullscreenSpecifiedScale,
+    ) -> egui::FullOutput {
         let output = crate::test_ui::headless_paint_output(ctx.run_pass(raw_input, |ctx| {
             ctx.root_ui(|root_ui| {
                 egui::CentralPanel::default()
@@ -96903,6 +96940,67 @@ mod specified_scale_consumer_tests {
                 crate::settings::Settings::load().fullscreen_specified_scale_max_tenths,
                 app.settings.fullscreen_specified_scale_max_tenths
             );
+        }
+    }
+
+    #[test]
+    fn specified_scale_popup_keeps_line_wheel_tail_scrolling_on_empty_passes() {
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(280.0, 320.0));
+        let mut open = true;
+        let mut value = FullscreenSpecifiedScale::default();
+        let offset = || {
+            ctx.data(|data| {
+                data.get_temp::<egui::Vec2>(egui::Id::unique("fs_fit_popup_scroll_offset"))
+                    .unwrap()
+                    .y
+            })
+        };
+        let mut previous = 0.0;
+        for pass in 0..10 {
+            let events = if pass == 5 {
+                let (inner, _, _) = ctx.data(|data| {
+                    data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::unique(
+                        "fs_fit_popup_scroll_layout",
+                    ))
+                    .unwrap()
+                });
+                vec![egui::Event::PointerMoved(inner.center())]
+            } else if pass == 6 {
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -1.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                }]
+            } else {
+                vec![]
+            };
+            let mut raw = crate::wheel_input::tests::smoothing_input(pass, events);
+            raw.screen_rect = Some(rect);
+            let output = fit_popup_frame_with_input(&ctx, rect, raw, &mut open, &mut value);
+            assert!(open);
+            if pass >= 6 {
+                let current = offset();
+                assert!(
+                    current > previous,
+                    "popup must keep scrolling: pass={pass}, previous={previous}, current={current}"
+                );
+                let (inner, _, content) = ctx.data(|data| {
+                    data.get_temp::<(egui::Rect, egui::Rect, egui::Vec2)>(egui::Id::unique(
+                        "fs_fit_popup_scroll_layout",
+                    ))
+                    .unwrap()
+                });
+                assert!(
+                    current < content.y - inner.height(),
+                    "probe must stay away from the end"
+                );
+                previous = current;
+            }
+            output.drop_without_applying_deltas();
         }
     }
 

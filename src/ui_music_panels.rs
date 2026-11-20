@@ -450,7 +450,14 @@ pub(crate) fn draw_music_audio_track_selector(
             None,
         );
         // A popup above the HUD owns wheel input for the entire frame.
+        let before = ui.ctx().input(|input| input.events.len());
         consume_music_popup_wheel(ui.ctx());
+        // This list advances from raw events, unlike the speed popup's ScrollArea.
+        ui.ctx().input_mut(|input| {
+            if input.events.len() < before {
+                crate::wheel_input::finish_raw_wheel_consumption(input);
+            }
+        });
     }
     ui.ctx().data_mut(|data| data.insert_temp(id, open));
     #[cfg(feature = "test-script")]

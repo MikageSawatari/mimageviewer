@@ -316,7 +316,7 @@ fn show_folder_pane_paste_menu(
     let shown = response.is_some();
     let selected = response.is_some_and(|response| response.inner);
     if shown || egui::Popup::is_id_open(ui.ctx(), popup_id) {
-        crate::wheel_input::consume_wheel_input(ui.ctx());
+        crate::wheel_input::consume_popup_wheel_input(ui.ctx());
     }
     selected
 }

@@ -171,6 +171,109 @@ pub(super) fn seed(ctx: &egui::Context, app: &mut App) {
     });
 }
 
+#[test]
+fn line_wheel_in_page_movement_and_edge_stop_repainting_within_three_passes() {
+    use crate::wheel_input::tests::{repaint_delay, smoothing_input};
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    for edge in [false, true] {
+        let ctx = egui::Context::default();
+        page_turn::install(&ctx);
+        let mut app = app(&ctx, SpreadMode::Single);
+        seed(&ctx, &mut app);
+        if edge {
+            frame(&ctx, vec![], |_, ctx| {
+                let zoom = app.fs_zoom;
+                let pan = app.fs_pan;
+                app.fs_pan =
+                    app.fs_page_scroll_wheel_pan(ctx, zoom, pan, Vec2::new(0.0, -100_000.0));
+            });
+            seed(&ctx, &mut app);
+        }
+        let mut before = Vec2::ZERO;
+        let mut after = Vec2::ZERO;
+        let mut stopped = None;
+        // Warm and settle the same production merge/paint path, with empty idle input.
+        for pass in 0..63 {
+            let input_pass = pass == 60;
+            let events = if pass == 0 {
+                vec![egui::Event::PointerMoved(full_rect().center())]
+            } else if input_pass {
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: Vec2::new(0.0, -1.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                }]
+            } else {
+                vec![]
+            };
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
+                smoothing_input(pass, events),
+                |ctx| {
+                    ctx.root_ui(|root| {
+                        egui::CentralPanel::default()
+                            .frame(egui::Frame::NONE)
+                            .show(root, |ui| {
+                                if pass > 60 {
+                                    ctx.input(|i| {
+                                        assert!(i.events.is_empty());
+                                        assert_eq!(i.smooth_scroll_delta, Vec2::ZERO);
+                                        assert_eq!(i.zoom_delta(), 1.0);
+                                    });
+                                }
+                                let expected = if input_pass {
+                                    before = app.fs_pan;
+                                    let speed = ctx.options(|o| o.input_options.line_scroll_speed);
+                                    let zoom = app.fs_zoom;
+                                    Some(app.fs_page_scroll_wheel_pan(
+                                        ctx,
+                                        zoom,
+                                        before,
+                                        Vec2::new(0.0, -speed),
+                                    ))
+                                } else {
+                                    None
+                                };
+                                let (result, _) =
+                                    crate::ui_fullscreen::wheel_frame_tests::actual_merge(
+                                        &mut app, ui, false,
+                                    );
+                                assert!(result.page_nav.is_none());
+                                if let Some(expected) = expected {
+                                    after = app.fs_pan;
+                                    assert_eq!(after, expected, "raw movement is preserved");
+                                }
+                                paint(&mut app, ui, ctx);
+                            });
+                    });
+                },
+            ));
+            if pass == 59 {
+                assert_ne!(
+                    repaint_delay(&output),
+                    std::time::Duration::ZERO,
+                    "fixture must settle before the notch"
+                );
+            }
+            if pass >= 60 && repaint_delay(&output) != std::time::Duration::ZERO {
+                stopped.get_or_insert(pass - 60 + 1);
+            }
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            before == after,
+            edge,
+            "edge={edge}, before={before:?}, after={after:?}"
+        );
+        assert!(
+            stopped.is_some_and(|passes| passes <= 3),
+            "edge={edge}, stopped={stopped:?}"
+        );
+    }
+}
+
 fn painted_unit(app: &App) -> Rect {
     app.fullscreen_page_layout
         .displayed_pages()

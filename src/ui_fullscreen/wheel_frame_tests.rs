@@ -67,7 +67,7 @@ fn collect_actual_merge(
     (result, operation)
 }
 
-fn actual_merge(
+pub(super) fn actual_merge(
     app: &mut App,
     ui: &mut egui::Ui,
     suppress_navigation: bool,
@@ -105,6 +105,84 @@ fn finish(
 fn install(ctx: &egui::Context) {
     page_turn::install(ctx);
     install_fs_navigator_input_tracking(ctx);
+}
+
+#[test]
+fn fullscreen_side_panel_mixed_ctrl_and_plain_line_wheel_preserves_scrollarea_tail() {
+    use crate::wheel_input::tests::smoothing_input;
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    install(&ctx);
+    let mut app = ready_app(&ctx, SpreadMode::Single);
+    app.settings.fullscreen_navigator_visible = false;
+    app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+    app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
+    let full_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+    let panel = metadata_panel_rect(full_rect);
+    let mut previous = 0.0;
+    for pass in 0..14 {
+        let events = if pass == 0 {
+            vec![egui::Event::PointerMoved(panel.center())]
+        } else if pass == 10 {
+            // Both routes must be delivered in this single pass. The last plain
+            // event leaves egui's accumulated smoothing classified as scrolling.
+            [egui::Modifiers::CTRL, egui::Modifiers::NONE]
+                .into_iter()
+                .map(|modifiers| egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -1.0),
+                    modifiers,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        let output = ctx.run_ui(smoothing_input(pass, events), |ui| {
+            if pass > 10 {
+                assert!(ctx.input(|i| i.events.is_empty() && i.smooth_scroll_delta.y < 0.0));
+            }
+            let (result, _) = actual_merge(&mut app, ui, false);
+            assert!(
+                result.page_nav.is_none(),
+                "plain wheel belongs to the side panel"
+            );
+            if pass == 10 {
+                assert_ne!(app.fs_zoom, 1.0, "Ctrl wheel still zooms");
+                let options = ctx.options(|o| o.input_options);
+                let remaining =
+                    ctx.input(|i| crate::wheel_input::remaining_wheel_inputs(i, options));
+                assert_eq!(remaining.len(), 1);
+                assert_eq!(remaining[0].modifiers, egui::Modifiers::NONE);
+            }
+            let mut offset = 0.0;
+            egui::Area::new(egui::Id::unique("mixed_wheel_fullscreen_side_panel"))
+                .fixed_pos(panel.min)
+                .order(egui::Order::Foreground)
+                .show(&ctx, |ui| {
+                    ui.set_min_size(panel.size());
+                    ui.set_max_size(panel.size());
+                    let output = egui::ScrollArea::vertical()
+                        .id_salt("mixed_wheel_fullscreen_side_panel_scroll")
+                        .auto_shrink([false, false])
+                        .max_height(panel.height())
+                        .show(ui, |ui| {
+                            ui.allocate_space(egui::vec2(panel.width() - 24.0, 2000.0));
+                        });
+                    offset = output.state.clamped_offset().y;
+                });
+            if pass > 10 {
+                assert!(
+                    offset > previous,
+                    "remaining plain wheel keeps scrolling: pass={pass}"
+                );
+            }
+            previous = offset;
+        });
+        output.drop_without_applying_deltas();
+    }
 }
 
 #[test]
@@ -447,7 +525,7 @@ fn egui037_wheel_frame_front_owner_consumption_before_final_merge_cannot_revive_
         ],
         |ui| {
             let (mut result, mut operation) = collect_actual_merge(&mut app, ui, false);
-            crate::wheel_input::consume_wheel_input(ui.ctx());
+            crate::wheel_input::consume_popup_wheel_input(ui.ctx());
             let mut proposal = result.deferred.take().unwrap();
             app.claim_fs_wheel_frame_after_ui(&mut proposal);
             let result = app.apply_fs_wheel_frame_proposal(proposal, false, &mut operation);
@@ -1038,6 +1116,72 @@ fn install_immediate_child_input(ctx: &egui::Context, focused: bool, events: Vec
         ctx.run_ui(raw, |ui| (viewport.viewport_ui_cb)(ui))
             .drop_without_applying_deltas();
     });
+}
+
+#[test]
+fn child_raw_wheel_discard_preserves_roots_next_pass_smoothing_baseline() {
+    use crate::wheel_input::tests::smoothing_input;
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let mut next = Vec::new();
+    for with_child in [false, true] {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        let line = |modifiers| egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: egui::vec2(0.0, -1.0),
+            modifiers,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+        };
+        if with_child {
+            install_immediate_child_input(&ctx, true, vec![line(egui::Modifiers::CTRL)]);
+        }
+        let output = ctx.run_ui(
+            smoothing_input(0, vec![line(egui::Modifiers::NONE)]),
+            |_| {
+                if with_child {
+                    ctx.show_viewport_immediate(
+                        egui::ViewportId::from_hash_of("wheel-tail-child"),
+                        egui::ViewportBuilder::default(),
+                        |ui, _| {
+                            actual_merge(&mut app, ui, false);
+                            let options = ctx.options(|o| o.input_options);
+                            assert!(ctx.input(|i| {
+                                crate::wheel_input::remaining_wheel_inputs(i, options).is_empty()
+                            }));
+                        },
+                    );
+                }
+            },
+        );
+        output.drop_without_applying_deltas();
+        if with_child {
+            install_immediate_child_input(&ctx, true, vec![]);
+        }
+        let output = ctx.run_ui(smoothing_input(1, vec![]), |_| {
+            next.push(ctx.input(|i| (i.smooth_scroll_delta, i.zoom_delta())));
+            if with_child {
+                ctx.show_viewport_immediate(
+                    egui::ViewportId::from_hash_of("wheel-tail-child"),
+                    egui::ViewportBuilder::default(),
+                    |_, _| {
+                        ctx.input(|i| {
+                            assert_eq!(i.smooth_scroll_delta, egui::Vec2::ZERO);
+                            assert_eq!(i.zoom_delta(), 1.0);
+                        })
+                    },
+                );
+            }
+        });
+        output.drop_without_applying_deltas();
+    }
+    assert!(
+        next[0].0.y < 0.0,
+        "baseline must contain a pending root tail"
+    );
+    assert_eq!(next[1], next[0], "child discard is viewport-local");
 }
 
 #[test]

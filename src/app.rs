@@ -63617,7 +63617,7 @@ impl App {
                 // An accepted scroll (including Ctrl+wheel at a column limit) ends
                 // the grid click run even when the resulting offset is unchanged.
                 self.grid_click_pairing.end_activation();
-                crate::wheel_input::consume_wheel_input(ctx);
+                crate::wheel_input::consume_raw_wheel_input(ctx);
 
                 if ctrl {
                     // Ctrl+ホイール: 列数を増減（1〜20 の範囲）
@@ -63660,7 +63660,7 @@ impl App {
         if !ctx.any_popup_open() {
             return;
         }
-        crate::wheel_input::consume_wheel_input(ctx);
+        crate::wheel_input::consume_popup_wheel_input(ctx);
     }
 
     /// Path-free diagnostics only at Rating restore/scroll writes; geometry is supplied by its owner.

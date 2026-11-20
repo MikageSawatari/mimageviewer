@@ -177,7 +177,7 @@ pub(crate) fn ratingnav649_pointer_clicks_for_test(
     nav
 }
 use crate::ui_details_icon::{DetailsIconKind, details_icon_kind, draw_details_preview_icon};
-use crate::wheel_input::consume_wheel_input;
+use crate::wheel_input::consume_popup_wheel_input;
 
 #[cfg(windows)]
 fn effetune_toolbar_button(
@@ -2480,7 +2480,7 @@ fn suppress_menu_button_wheel_passthrough(ctx: &egui::Context, response: &egui::
     if egui::Popup::is_id_open(ctx, egui::Popup::default_response_id(response))
         || egui::Popup::is_id_open(ctx, sticky_context_menu_id(response))
     {
-        consume_wheel_input(ctx);
+        consume_popup_wheel_input(ctx);
     }
 }
 
@@ -10680,7 +10680,7 @@ impl App {
                     crate::ui_helpers::set_accessibility_label(&combo.response, "移動先の本");
                     if egui::ComboBox::is_open(ctx, combo.response.id) {
                         transfer_combo_open = true;
-                        consume_wheel_input(ctx);
+                        consume_popup_wheel_input(ctx);
                     }
                     ui.label("へ");
                     let target_valid = target_rows
@@ -12780,7 +12780,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         self.handle_pinned_search_actions(ctx, pinned_actions);
 
         if toolbar_combo_popup_open {
-            consume_wheel_input(ctx);
+            consume_popup_wheel_input(ctx);
         }
 
         if let Some(name) = toolbar_book_target_name {
@@ -13470,7 +13470,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             );
         });
         let _ = output;
-        consume_wheel_input(ui.ctx());
+        consume_popup_wheel_input(ui.ctx());
     }
 
     fn draw_folder_bar_settings_contents(&mut self, ui: &mut egui::Ui) {
@@ -14368,7 +14368,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         });
 
         if sort_popup_open {
-            consume_wheel_input(ctx);
+            consume_popup_wheel_input(ctx);
         }
         if sort_changed {
             self.apply_sort_control_change();
@@ -16725,7 +16725,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         // Submenus use a stack-owned popup id, unlike root menus.
                                         // Contents ran iff this submenu is open; consume after its scroll area.
                                         if response.inner.is_some() {
-                                            consume_wheel_input(ui.ctx());
+                                            consume_popup_wheel_input(ui.ctx());
                                         }
                                     }
                                     crate::known_folders::LocationMenuEntry::Separator => {
