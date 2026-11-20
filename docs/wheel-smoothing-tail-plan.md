@@ -1,0 +1,100 @@
+# ホイール平滑化の残量による空描画を止める (§1.827 候補 F)
+
+2026-11-20 設計メモ。ブランチ `wheel-smoothing-827` (master 03e1cb024 から)。
+計測と原因は、統括の共有ノート `cpu-827-interim.md` と調査ブランチ `cpu-827-investigation` にある。
+
+## 1. 症状と原因
+
+- 観測 (portable-smoke、OS 入力 SendInput、メインPC 165Hz、2026-11-20 18:25〜18:29、承認済み):
+  - 全画面のページ内スクロールでホイールを 1 秒に 15 ノッチ回すと、描画が 165 fps に張り付く。
+  - 端でパンが 0 回の区間でも同じ。ホイールを止めた後も約 0.3 秒続く。
+  - UI スレッドは 1 コアの 43〜48%。
+- 原因 (コード):
+  - egui は Line/Page 単位 (と 8 pt 以上の Point) のホイールを `WheelState::unprocessed_wheel_delta` に積む (`vendor/egui/src/input_state/wheel_state.rs:178`)。
+  - 積んだ分は 0.1 秒で 90% のペースで `smooth_scroll_delta` へ吐き出す (`wheel_state.rs:190-201`)。
+  - 残量が 0.2 を超えている間、`wants_repaint_after` は即時の再描画を返す (`input_state/mod.rs:688`)。この判定は `begin_pass` の直後に行われる (`context.rs:517`)。
+- mIV の多くの持ち主は、生の `Event::MouseWheel` から動きを決める。消費時には、その pass のイベントと `smooth_scroll_delta` だけを消す (`src/wheel_input.rs:141-211`)。
+  - egui 内部の残量は残るので、後続の pass で誰も使わない吐き出しが続き、ノッチごとに約 0.25 秒、リフレッシュレートで描き続ける。
+  - 入力 1 回で 3 フレームなら、15 ノッチ/秒は 45 fps のはず。
+
+## 2. 方針
+
+**生のイベントから動きを決める持ち主が、ホイールを消費したときに、既存の `InputState::discard_pending_scroll()` を呼ぶ。** egui 側の変更はしない。
+
+`discard_pending_scroll()` (`vendor/egui/src/input_state/mod.rs:517-525`) は、残量 `unprocessed_wheel_delta` だけを捨てる。現在の delta・イベント・gesture 状態・modifier は保つ。すでにポップアップを閉じる境界で使われている (`ui_fullscreen.rs:28662`, `30395`, `ui_page_overview.rs:649`)。
+
+### 2.1 検討した案と採否 (CLAUDE.md「状態の組み合わせを減らす」)
+
+| 案 | 内容 | 採否 |
+| --- | --- | --- |
+| a. 3 つの消費関数の中で一律に捨てる | `consume_wheel_segment` / `consume_remaining_wheel_inputs` / `consume_wheel_input` の中で `discard_pending_scroll()` | **不採用**。`consume_wheel_input` はポップアップの持ち主が、ポップアップ内の egui `ScrollArea` が読んだ後に、開いている間は毎 pass 呼ぶ (下表 #2, #3, #7, #10〜#16)。ポップアップの滑らかなスクロールは残量の吐き出しで成り立っているので、一律に捨てると最初の pass の分 (60fps で約 32%) しか動かなくなる。全画面 HUD のポップアップは「開いている間は残量を保ち、閉じるときだけ捨てる」と明示的に作ってある (`ui_fullscreen.rs:30388-30396`) |
+| b. egui にイベントごとの帳簿を足す | 消費したイベントの寄与分だけを残量から差し引く | **不採用**。同じ viewport の同じ時間帯に、生イベントの持ち主とスクロール領域の両方へホイールが届く経路は、通常の操作では見当たらない (§2.2)。帳簿は vendor egui の変更と、線形でない吐き出し (`abs < 1.0` で全量を移す) の扱いを要し、得るものに対して大きい |
+| c. **生イベントの持ち主だけが、消費時に既存の `discard_pending_scroll()` を呼ぶ** | 持ち主ごとに「残量も自分のもの」と宣言する | **採用**。egui は無変更。ポップアップの持ち主は今の「閉じる境界で捨てる」規則のまま |
+
+### 2.2 混ざる経路の確認
+
+`discard_pending_scroll()` は viewport の InputState の残量を丸ごと捨てる。残量に、生イベントの持ち主以外が使うはずの分が入っていると、その分も消える。確認した結果は次のとおり。
+
+- **別の窓 (viewport)**: InputState は viewport ごとに別なので混ざらない。全画面・detached・root はそれぞれ自分の残量だけを捨てる。既存テスト `wheel_frame_tests.rs:1043-1145` は「子 viewport の消費が root の `smooth_scroll_delta` とイベントを変えない」ことを固定しており、これとも両立する。
+- **全画面の HUD ポップアップ**: ポップアップが前面の対象のとき、`FsHudPopupWheelInput::take` がイベントと `smooth_scroll_delta` を先に退避する (`ui_fullscreen.rs:28645`, `38534-38563`)。全画面のホイール処理はイベントを見ないので、捨てる処理も走らない。ポップアップが開いている間は `should_handle_fullscreen_wheel` の `popup_open` (`ui_fullscreen.rs:8419`) で全体が止まる。閉じた境界では既存どおり捨てる。
+- **全画面の左右パネル (文字起こし・情報など)**: パネル上の通常ホイールは、全画面のホイール処理が受け取らない (`ui_fullscreen.rs:8421` の `!cursor_in_panel`)。イベントが残るので、捨てる処理も走らない。Ctrl+ホイールはパネル上でもズームが優先 (既存の仕様)。
+- **一覧 (root) のフォルダツリー**: ポインタがフォルダペイン内なら `process_scroll` 自体が呼ばれない (`app.rs:102573-102588`)。ツリーの ScrollArea は今までどおり残量で滑らかに動く。
+- **一覧の popup / menu**: popup が開いていると `process_scroll` は早期 return する (`app.rs:63596-63606`)。
+- **混ざりうる唯一の経路 (まれ、割り切り)**: フォルダツリーの上で回した直後 (約 0.25 秒以内) にポインタを一覧へ移して回すと、ツリー側に残っていた最後のノッチの残り (最大でそのノッチの約 7 割、時間とともに減る) が捨てられる。逆向き (一覧→ツリー) は、一覧が消費した時点で残量が 0 なので起きない。結果はツリーの位置がわずかに手前で止まるだけで、データには影響しない。CLAUDE.md「まれな失敗は既定で割り切る」とは別種 (失敗ではなく境界の操作) なので、統括に挙げて判断をもらう。
+
+### 2.3 変える呼び出し箇所 (生イベントの持ち主)
+
+| # | 箇所 | 持ち主 | 変更 |
+| --- | --- | --- | --- |
+| 1 | `app.rs:63620` `process_scroll` | 一覧のスクロールと Ctrl+ホイールの列数変更 | 消費したら残量も捨てる |
+| 4 | `ui_fullscreen.rs:41557` | detached の動画で、ホイールの二重処理を防ぐための消費 | 同上 |
+| 5 | `ui_fullscreen.rs:41764` `claim_fs_wheel_frame_after_ui` | 全画面のページ送り・ズーム・ページ内スクロール (後回しの経路) | 同上 |
+| 6 | `ui_fullscreen.rs:41821` `apply_fs_wheel_frame_proposal` | 全画面のページ送り・ズーム・ページ内スクロール (通常の経路) | 同上 |
+| 8 | `ui_fullscreen.rs:60130` | 音楽ビューの Ctrl+ホイール行送り | 同上 |
+| 9 | `ui_helpers.rs:513` `apply_brush_radius_wheel` | 編集時の Shift+ホイールで筆の太さ | 同上 |
+
+実装の形 (案、Sol レビューで決める):
+- 3 つの消費関数に「残量の扱い」を表す引数を足し、呼び出し側が毎回選ぶ。
+  - 例: `enum WheelTail { KeepForScrollArea, DiscardConsumed }`
+  - 捨てるのは、少なくとも 1 件消費したときだけにする。
+- 新しい呼び出し元も、この引数でどちらかを選ばないと書けない。
+- ポップアップの持ち主 (#2, #3, #7, #10〜#16) は `KeepForScrollArea` にして、今の挙動を保つ。
+
+## 3. 挙動の変化
+
+- **全画面の画像と一覧のホイール**: ノッチごとの空描画がなくなる。描画は入力 1 回あたり 3 フレーム (egui の 2 回描画 + 入力イベント) に戻る。動き (パン・ページ送り・ズーム・列数) は、生のイベントから決まるので変わらない。
+- **一覧**: egui の一覧 ScrollArea が、残量で毎 pass わずかに動き、App の値で戻されていた (`ui_main.rs:21727`、`app/grid_scroll.rs:281-285`、`scroll_area.rs:1390-1396`、`ui_main.rs:1884-1893`)。この見えない揺れもなくなる。
+- **要判断: 音楽ビューのタイムライン**:
+  - 通常ホイール (音量・前後の項目) は、全画面のホイール処理 #6 が消費する。タイムラインの egui ScrollArea (`ui_fullscreen.rs:60569`、ホイール有効) は、その後に描かれ、今は消費済みのホイールの残量 (1 ノッチの約 7 割) で少し動く。動くと自動追従が止まる (`ui_music_timeline.rs:822`、`ui_fullscreen.rs:60635-60671`)。
+  - F の後は、通常ホイールでタイムラインは動かなくなる。音量・項目移動だけが起きる。
+  - 公開マニュアルに、中央のタイムラインを通常ホイールで動かす説明はない (`music.html:185` のホイールの記述は左パネルの文字起こし一覧で、パネルなので影響を受けない)。タイムラインはドラッグと Ctrl+ホイールの行送りで動かせる。
+  - 1 回のホイールで音量と表示位置が両方変わる二重処理に見えるが、利用者が使っている挙動なら退行になる。実装前に統括 (利用者) の判断をもらう。
+- **既定の割り切り**: §2.2 のフォルダツリー→一覧の境界の件だけ。
+
+## 4. 不変条件とテスト
+
+- **生イベントの持ち主がホイールを消費した pass の次の pass では**:
+  - `smooth_scroll_delta` が 0 で、残量による即時再描画の要求がない。
+  - 確かめ方: 次の pass の `wants_repaint_after` 相当。描画回数を数えるテストを優先する (下記)。
+- **ポップアップの持ち主 (`KeepForScrollArea`) では**: 次の pass にも残量の吐き出しが届き、ポップアップ内の ScrollArea が動き続ける (今の挙動の固定)。
+- **別 viewport**: 子 viewport の捨てる処理が root の残量を変えない (既存 `wheel_frame_tests.rs:1043-1145` の形を延長)。
+- **テスト案** (状態遷移・handler-level):
+  1. 全画面のページ内スクロールに Line 単位の 1 ノッチを入れ、イベントが無くなってから何 pass で再描画の要求が止まるかを数える。修正前は十数 pass、修正後は 3 pass 以内。
+  2. 一覧の `process_scroll` で同じことを数える。
+  3. 全画面 HUD のポップアップ (例: フィットのポップアップ) と、一覧の整理先サブメニューで、1 ノッチ後も複数 pass にわたって ScrollArea のオフセットが増え続けることを確かめる。既存の `ui_main.rs:36254`, `36356`, `ui_fullscreen.rs:~97185` と同じ形。
+  4. ホイールの持ち主ごとに、動き (パン量・ページ・ズーム・列数) が修正前と同じであること。既存テストが緑であることで確かめる。
+- 計測: portable-smoke で、承認済みの 3 種 (OS 入力 16%・2%・合成キー) を再計測し、ホイール区間の fps と UI スレッドの CPU を比べる。
+
+## 5. detached viewer リワーク中のルールとの関係
+
+- #4 と #5/#6 は detached の host viewport でも走る。
+- 変更は既存の消費点に「残量も捨てる」を足すだけで、detached の述語・viewport の経路・入力の routing は変えない。
+- InputState は viewport ごとなので、捨てる処理が他の viewer context に作用しない。
+- これが症状パッチではなく構造的修正であることについて、ClaudeCode と Sol の双方のレビューで合意を取り、`docs/detached-rework-plan.md` に触れた範囲と理由を記録する。
+  - 根拠: 残量はホイールを消費した持ち主のものなので、持ち主がイベントと一緒に終端する。delay・guard・repaint 抑止ではなく、所有の終端を揃える修正である。
+
+## 6. 範囲外
+
+- egui の「request_repaint 1 回で 2 回描く」(候補 B)、root viewport の occluded 描画 (候補 A)、キーの 3 フレーム (候補 C)、拡大の作り直し (候補 D)。
+- 直接 `smooth_scroll_delta` を 0 にしている箇所 (`ui_fullscreen.rs:7665`, `39045`, `39414`、`ui_music_panels.rs:387`、`render_core.rs:1037`、`ui_dialogs/mod.rs:262`、`app/book_composition_editor.rs:489`、`app/sidecar_restore.rs:1355`)。これらは今の挙動のまま。
+- 永続データの変更はない。
