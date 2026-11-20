@@ -1482,6 +1482,25 @@ detached の述語・viewport の選択／入力配送・HWND の取得／配置
 設計担当と独立設計レビューは、既存の配送と context swap 内の構造的な拡張であり、
 detached の症状パッチではないことに合意した（設計 §10）。実装・検証の記録は同設計書に集約する。
 
+### 2026-11-20: 生イベントのホイールの持ち主が egui の平滑化の残量も終える (§1.827 候補 F)
+
+egui は Line/Page 単位のホイールを内部の残量に積み、約 0.25 秒かけて吐き出す。その間は毎 pass 即時の再描画を要求する。
+mIV の生イベントの持ち主は、イベントとその pass の delta だけを消し、残量を残していた。そのため、ノッチごとにリフレッシュレートで何も変わらない描画が続いていた。
+`wheel_input::finish_raw_wheel_consumption` を新設し、次の持ち主が、ホイールのイベントを実際に取り除き、その pass にホイールが残っていないときだけ、既存の `InputState::discard_pending_scroll()` を呼ぶようにした。
+- 一覧 `process_scroll`
+- 全画面のホイール処理 (通常と後回しの合流、detached 動画の二重処理防止を含む)
+- ナビゲーター
+- 筆の太さ
+- 音楽の Ctrl+ホイール
+- 動画のシーク列とそのメニュー
+- 音声トラックのポップアップ
+
+ポップアップと背面への素通し防止 (`consume_popup_wheel_input`) は、ScrollArea が残量で動くので今のまま保つ。
+detached の host viewport でも同じ消費点を通るが、変えたのは既存の消費点での残量の終え方だけである。detached の述語・viewport の選択・配送・context の所有は変えていない。
+捨てる処理は viewport の InputState 全体に効く。別の viewport には効かず、同じ viewport の別の持ち主へは「ホイールが残っていれば捨てない」で効かせない。
+設計担当と独立レビュー (Sol / xhigh、実装前と実装後) の双方が、「消費した持ち主の境界で使われない平滑化を終える構造的修正であり、guard・delay・repaint 抑止の症状パッチではない」ことに合意した。
+設計は [wheel-smoothing-tail-plan.md](wheel-smoothing-tail-plan.md)。回帰は `wheel_input.rs`・`wheel_frame_tests.rs` (子 viewport の破棄が root の次 pass を変えない検査を含む)・`in_page_scroll/handler_tests.rs`・`app/tests.rs`・`render_core.rs` の各テスト。実機の F12・複数窓の確認は未実施。
+
 ### 2026-11-20 §1.476 タグ欄の検索確定（案 A、実機未確認）
 
 設計担当からの利用者決定に従い、`render_tag_view_bar` の入力変更による検索の受付だけを変更。

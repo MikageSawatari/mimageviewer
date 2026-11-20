@@ -1034,10 +1034,14 @@ fn consume_seek_strip_wheel(
         return steps;
     }
     ctx.input_mut(|input| {
+        let before = input.events.len();
         input.smooth_scroll_delta = egui::Vec2::ZERO;
         input
             .events
             .retain(|event| !matches!(event, egui::Event::MouseWheel { .. }));
+        if input.events.len() < before {
+            crate::wheel_input::finish_raw_wheel_consumption(input);
+        }
     });
     steps
 }
@@ -1897,6 +1901,7 @@ fn draw_native_seek_strip_menu(
                 scroll = (scroll - row_height).max(0.0);
             }
         }
+        crate::wheel_input::consume_remaining_wheel_inputs(ctx, |_| true);
     }
     ctx.data_mut(|data| data.insert_temp(scroll_id, scroll));
 
@@ -2153,6 +2158,7 @@ pub(crate) fn draw_native_audio_track_menu(
                 first = first.saturating_sub(1);
             }
         }
+        crate::wheel_input::consume_remaining_wheel_inputs(ctx, |_| true);
     }
     ctx.data_mut(|data| data.insert_temp(scroll_id, first));
     let mut drawn_rect = anchor;
@@ -23757,6 +23763,248 @@ let ctx = &root_ui.ctx().clone();
                 });
             (strip.inner, panel_inner_rect, strip_steps, panel_offset)
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum NativeWheelMenuFixture {
+        SeekStripScrollable,
+        SeekStripFits,
+        AudioTrack,
+    }
+
+    fn check_native_menu_line_wheel(fixture: NativeWheelMenuFixture, inside: bool) {
+        use crate::wheel_input::tests::{repaint_delay, smoothing_input};
+        use std::time::Duration;
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let size = match fixture {
+            NativeWheelMenuFixture::SeekStripScrollable => egui::vec2(160.0, 120.0),
+            NativeWheelMenuFixture::SeekStripFits => egui::vec2(600.0, 400.0),
+            NativeWheelMenuFixture::AudioTrack => egui::vec2(360.0, 200.0),
+        };
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let button =
+            egui::Rect::from_min_size(full.max - egui::vec2(40.0, 36.0), egui::vec2(28.0, 28.0));
+        let menu_id = super::native_audio_track_menu_id();
+        let rows: Vec<_> = (0..20)
+            .map(|index| crate::video::audio_track_ui::AudioTrackRow {
+                label: format!("{}: Track", index + 1),
+                stream_index: index,
+                ordinal: index + 1,
+                is_current: index == 0,
+                state: crate::video::AudioTrackSelectionDisplayState::Applied,
+            })
+            .collect();
+        let consumes = inside && !matches!(fixture, NativeWheelMenuFixture::SeekStripFits);
+        // At 160x120 the compact menu uses 18pt rows and has room for more
+        // than one step. The audio menu stores its first row as an index.
+        let expected = if consumes {
+            if matches!(fixture, NativeWheelMenuFixture::AudioTrack) {
+                1.0
+            } else {
+                18.0
+            }
+        } else {
+            0.0
+        };
+        let mut open = true;
+        let mut menu_rect: Option<egui::Rect> = None;
+        let mut commands = Vec::new();
+        let mut stopped = None;
+        for pass in 0..63 {
+            let events = if pass == 3 {
+                let rect = menu_rect.expect("menu has completed its sizing passes");
+                // Use the menu padding to avoid tooltip animations in this fixture.
+                let pos = if inside {
+                    rect.min + egui::vec2(1.0, 1.0)
+                } else {
+                    full.min + egui::vec2(1.0, 1.0)
+                };
+                assert_eq!(rect.contains(pos), inside);
+                vec![egui::Event::PointerMoved(pos)]
+            } else if pass == 60 {
+                vec![
+                    egui::Event::Copy,
+                    egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Line,
+                        delta: egui::vec2(0.0, -1.0),
+                        modifiers: egui::Modifiers::NONE,
+                        phase: egui::TouchPhase::Move,
+                        source: egui::MouseWheelSource::Wheel,
+                    },
+                ]
+            } else {
+                vec![]
+            };
+            let mut raw = smoothing_input(pass, events);
+            raw.screen_rect = Some(full);
+            let output = ctx.run_ui(raw, |_| {
+                let before = ctx.input(|input| (input.events.clone(), input.smooth_scroll_delta));
+                if pass > 60 {
+                    assert!(before.0.is_empty(), "idle input must be genuinely empty");
+                    if consumes {
+                        assert_eq!(before.1, egui::Vec2::ZERO);
+                        assert_eq!(ctx.input(|input| input.zoom_delta()), 1.0);
+                    } else {
+                        assert!(before.1.y < 0.0, "unclaimed wheel keeps its smoothing tail");
+                    }
+                }
+                match fixture {
+                    NativeWheelMenuFixture::AudioTrack => super::draw_native_audio_track_menu(
+                        &ctx,
+                        full,
+                        button,
+                        &rows,
+                        menu_id,
+                        &mut open,
+                        &mut menu_rect,
+                        &mut commands,
+                        #[cfg(feature = "test-script")]
+                        None,
+                    ),
+                    _ => super::draw_native_seek_strip_menu(
+                        &ctx,
+                        full,
+                        button,
+                        crate::video::seek_strip_layout::SeekStripView::Hidden,
+                        SeekStripHeight::Large,
+                        SeekStripHeightValues::default(),
+                        crate::settings::VideoSeekPreviewSize::Large,
+                        crate::settings::VideoSeekPreviewSizeValues::default(),
+                        None,
+                        &mut open,
+                        &mut menu_rect,
+                        &mut commands,
+                    ),
+                }
+                assert!(open);
+                let offset = match fixture {
+                    NativeWheelMenuFixture::AudioTrack => ctx
+                        .data(|data| data.get_temp::<usize>(menu_id.with("first_row")).unwrap())
+                        as f32,
+                    _ => ctx.data(|data| {
+                        data.get_temp::<f32>(egui::Id::unique(
+                            "native_video_seek_strip_menu_scroll",
+                        ))
+                        .unwrap()
+                    }),
+                };
+                assert_eq!(
+                    offset,
+                    if pass >= 60 { expected } else { 0.0 },
+                    "one notch moves exactly one row, with no idle movement"
+                );
+                if pass == 60 {
+                    assert!(before.1.y < 0.0);
+                    ctx.input(|input| {
+                        if consumes {
+                            assert_eq!(input.events, vec![egui::Event::Copy]);
+                            assert_eq!(input.smooth_scroll_delta, egui::Vec2::ZERO);
+                        } else {
+                            assert_eq!(input.events, before.0);
+                            assert_eq!(input.smooth_scroll_delta, before.1);
+                        }
+                    });
+                }
+            });
+            if pass == 59 {
+                assert_ne!(
+                    repaint_delay(&output),
+                    Duration::ZERO,
+                    "fixture must settle before the notch"
+                );
+            }
+            if pass >= 60 && repaint_delay(&output) != Duration::ZERO {
+                stopped.get_or_insert(pass - 60 + 1);
+            }
+            output.drop_without_applying_deltas();
+        }
+        assert!(commands.is_empty());
+        if consumes {
+            assert!(
+                stopped.is_some_and(|passes| passes <= 3),
+                "stopped={stopped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn seek_strip_menu_line_wheel_moves_one_row_and_stops_repainting() {
+        check_native_menu_line_wheel(NativeWheelMenuFixture::SeekStripScrollable, true);
+    }
+
+    #[test]
+    fn audio_track_menu_line_wheel_moves_one_row_and_stops_repainting() {
+        check_native_menu_line_wheel(NativeWheelMenuFixture::AudioTrack, true);
+    }
+
+    #[test]
+    fn native_menus_outside_wheel_is_not_consumed() {
+        for fixture in [
+            NativeWheelMenuFixture::SeekStripScrollable,
+            NativeWheelMenuFixture::AudioTrack,
+        ] {
+            check_native_menu_line_wheel(fixture, false);
+        }
+    }
+
+    #[test]
+    fn seek_strip_menu_without_scroll_keeps_wheel() {
+        check_native_menu_line_wheel(NativeWheelMenuFixture::SeekStripFits, true);
+    }
+
+    #[test]
+    fn seek_strip_line_wheel_stops_repainting_within_three_passes() {
+        use crate::wheel_input::tests::{repaint_delay, smoothing_input};
+        let ctx = egui::Context::default();
+        let mut stopped = None;
+        let mut steps_seen = Vec::new();
+        for pass in 0..63 {
+            let events = if pass == 0 {
+                vec![egui::Event::PointerMoved(egui::pos2(280.0, 100.0))]
+            } else if pass == 60 {
+                vec![egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, -1.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Wheel,
+                }]
+            } else {
+                vec![]
+            };
+            let output = ctx.run_ui(smoothing_input(pass, events), |_| {
+                if pass > 60 {
+                    ctx.input(|i| {
+                        assert!(i.events.is_empty());
+                        assert_eq!(i.smooth_scroll_delta, egui::Vec2::ZERO);
+                        assert_eq!(i.zoom_delta(), 1.0);
+                    });
+                }
+                let (_, _, steps, panel_offset) =
+                    HeadlessNativeBatchTarget::draw_regions(&ctx, true);
+                steps_seen.extend(steps);
+                assert_eq!(
+                    panel_offset, 0.0,
+                    "strip wheel cannot scroll the sibling panel"
+                );
+            });
+            if pass == 59 {
+                assert_ne!(repaint_delay(&output), std::time::Duration::ZERO);
+            }
+            if pass >= 60 && repaint_delay(&output) != std::time::Duration::ZERO {
+                stopped.get_or_insert(pass - 60 + 1);
+            }
+            output.drop_without_applying_deltas();
+        }
+        assert_eq!(
+            steps_seen,
+            vec![crate::video::seek_strip::SeekStripRangeStep::Wider]
+        );
+        assert!(
+            stopped.is_some_and(|passes| passes <= 3),
+            "stopped={stopped:?}"
+        );
     }
 
     #[test]

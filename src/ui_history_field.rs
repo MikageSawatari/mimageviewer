@@ -190,7 +190,7 @@ pub(crate) fn take_escape(ctx: &Context, modal: bool) -> bool {
 }
 
 fn consume_wheel(ctx: &Context) {
-    crate::wheel_input::consume_wheel_input(ctx);
+    crate::wheel_input::consume_popup_wheel_input(ctx);
 }
 
 pub(crate) fn show_singleline<'text>(
