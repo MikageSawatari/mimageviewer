@@ -333,6 +333,8 @@ enum ReadingHistoryCommand {
     UpdateMediaProgress(MediaProgressUpdate),
     RemoveKeys(Vec<String>),
     Prune(usize),
+    #[cfg(test)]
+    ReadRecentForTest(mpsc::Sender<Result<Vec<ReadingHistoryEntry>, String>>),
 }
 
 /// DB と閲覧履歴ビューの in-memory 射影へ同じ値を配るための正規化済み更新。
@@ -421,6 +423,14 @@ impl ReadingHistoryWriter {
                             db.remove_keys(&keys).map(|_| ())
                         }
                         ReadingHistoryCommand::Prune(limit) => db.prune(limit).map(|_| ()),
+                        #[cfg(test)]
+                        ReadingHistoryCommand::ReadRecentForTest(reply) => {
+                            let _ = reply.send(
+                                db.list_recent(READING_HISTORY_LIMIT_MAX)
+                                    .map_err(|error| error.to_string()),
+                            );
+                            Ok(())
+                        }
                     };
                     if let Err(e) = result {
                         crate::logger::log(format!("reading-history writer: write failed: {e}"));
@@ -451,6 +461,24 @@ impl ReadingHistoryWriter {
                 self.pending.fetch_sub(1, Ordering::AcqRel);
             }
         }
+    }
+
+    /// Read through the writer's own connection, proving its initialization succeeded.
+    #[cfg(test)]
+    pub(crate) fn read_recent_for_test(
+        &self,
+    ) -> mpsc::Receiver<Result<Vec<ReadingHistoryEntry>, String>> {
+        let (reply, receiver) = mpsc::channel();
+        if let Some(tx) = &self.tx {
+            self.pending.fetch_add(1, Ordering::AcqRel);
+            if tx
+                .send(ReadingHistoryCommand::ReadRecentForTest(reply))
+                .is_err()
+            {
+                self.pending.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        receiver
     }
 
     pub(crate) fn folder_zip_portal(
