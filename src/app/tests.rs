@@ -116185,3 +116185,6 @@ fn detached_backend_hwnd_reuse_retires_host_claim_and_reseeds_same_handle() {
 }
 
 mod duration_762;
+
+#[path = "tests/prepared_search_adoption.rs"]
+mod prepared_search_adoption;

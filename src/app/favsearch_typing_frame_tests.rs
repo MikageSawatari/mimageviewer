@@ -14,6 +14,7 @@ struct Fixture {
     ctx: egui::Context,
     frame: u64,
     field: egui::Id,
+    shortcut_leaks: Vec<KeyAction>,
 }
 
 fn fixture(pinned: bool) -> Fixture {
@@ -66,6 +67,7 @@ fn fixture(pinned: bool) -> Fixture {
         ctx,
         frame: 0,
         field,
+        shortcut_leaks: Vec::new(),
     };
     // Open as the Ctrl+S shortcut does.
     let ctx = fixture.ctx.clone();
@@ -81,6 +83,7 @@ impl Fixture {
         self.frame += 1;
         let app = &mut self.app;
         let ctx = &self.ctx;
+        let shortcut_leaks = &mut self.shortcut_leaks;
         ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
@@ -97,6 +100,12 @@ impl Fixture {
                 app.input_pointer_and_ime(ctx);
                 app.render_search_and_metadata_results(ctx);
                 app.render_other_worker_results(ctx);
+                app.keyboard_owner_for_pass(ctx);
+                for action in [KeyAction::GridRotateCcw, KeyAction::GridPin] {
+                    if app.keymap.pressed_action(ctx, action) {
+                        shortcut_leaks.push(action);
+                    }
+                }
                 let (keyboard_nav, keyboard_nav_from_fullscreen_close, _) =
                     app.input_root_keyboard(ctx);
                 let (toolbar_fav_nav, address_nav) = app.render_toolbar(ui);
@@ -148,7 +157,7 @@ impl Fixture {
         for _ in 0..4 {
             self.run(vec![]);
         }
-        while self.app.favsearch_pending.is_some() {
+        while self.app.favsearch_pending.is_some() || self.app.tag_view_pending.is_some() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "favsearch never finished"
@@ -269,4 +278,164 @@ fn favsearch_typing_frame_unpinned_ime() {
 #[test]
 fn favsearch_typing_frame_pinned_ime() {
     ime_case(true);
+}
+
+fn tag_fixture() -> Fixture {
+    let mut f = fixture(false);
+    let mut db = crate::tags_db::TagsDb::open_at(&crate::data_dir::get().join("tags.db")).unwrap();
+    for (name, tags) in [
+        ("one.jpg", ["alpha", "\u{304b}\u{306a}"]),
+        ("two.jpg", ["alps", "\u{304b}\u{304d}"]),
+    ] {
+        let path = f.app.tmp.path().join(name);
+        image::RgbImage::new(2, 2).save(&path).unwrap();
+        db.set_item_tags(&crate::tags_db::item_key_for_path(&path), tags, "test")
+            .unwrap();
+    }
+    drop(db);
+    f.app.open_tag_view();
+    f.field = App::tag_search_input_id();
+    f.settle();
+    assert!(f.field_focused());
+    f
+}
+
+#[test]
+fn tag_typing_frame_ascii_keeps_focus_on_initial_and_repeated_adoption() {
+    let _input = crate::key_input::lock_test_input();
+    let mut f = tag_fixture();
+    for (letter, query) in [("a", "a"), ("l", "al"), ("p", "alp")] {
+        let was_tag = f.app.items_are_tag_view;
+        f.run(vec![text(letter)]);
+        f.settle();
+        assert_eq!(f.app.tag_view.query, query);
+        assert!(f.field_focused());
+        assert!(!f.app.sidecar_restore_active());
+        assert!(f.app.items_are_tag_view);
+        assert_eq!(
+            was_tag,
+            query != "a",
+            "both initial and repeat branches are exercised"
+        );
+        assert_eq!(f.app.tag_view.result_count, 2);
+    }
+}
+
+#[test]
+fn tag_typing_frame_ime_keeps_composition_across_result_adoptions() {
+    let _input = crate::key_input::lock_test_input();
+    let mut f = tag_fixture();
+    f.run(preedit("\u{304b}"));
+    f.settle();
+    assert_eq!(f.app.tag_view.query, "\u{304b}");
+    assert_eq!(f.app.tag_view.result_count, 2);
+    assert!(f.field_focused());
+    assert!(f.app.items_are_tag_view);
+    f.run(vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+        text: "\u{304b}\u{306a}".into(),
+        active_range_chars: None,
+    })]);
+    f.settle();
+    assert!(f.field_focused());
+    assert_eq!(f.app.tag_view.query, "\u{304b}\u{306a}");
+    assert_eq!(f.app.tag_view.result_count, 1);
+    f.run(vec![egui::Event::Ime(egui::ImeEvent::Commit(
+        "\u{304b}\u{306a}".into(),
+    ))]);
+    f.settle();
+    assert!(f.field_focused());
+    assert_eq!(f.app.tag_view.query, "\u{304b}\u{306a}");
+    assert!(!f.app.sidecar_restore_active());
+}
+
+fn key(key: egui::Key, pressed: bool) -> egui::Event {
+    egui::Event::Key {
+        key,
+        physical_key: Some(key),
+        pressed,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    }
+}
+
+#[test]
+fn favsearch_typing_frame_letters_do_not_trigger_grid_rotation_or_pin() {
+    let _input = crate::key_input::lock_test_input();
+    for pinned in [false, true] {
+        let mut f = fixture(pinned);
+        for (letter, code) in [
+            ("a", egui::Key::A),
+            ("l", egui::Key::L),
+            ("p", egui::Key::P),
+        ] {
+            let (virtual_key, scan_code) = match code {
+                egui::Key::A => (0x41, 0x1e),
+                egui::Key::L => (0x4c, 0x26),
+                egui::Key::P => (0x50, 0x19),
+                _ => unreachable!(),
+            };
+            for pressed in [true, false] {
+                // Inject the same native batch as the backend, without reading
+                // physical key state. Both native and egui copies must stay owned.
+                crate::key_input::set_test_frame(vec![crate::key_input::KeyEdge {
+                    operation_id: crate::key_input::KeyOperationId::unassigned(),
+                    source_hwnd: 0,
+                    source_viewport: egui::ViewportId::ROOT,
+                    virtual_key,
+                    scan_code,
+                    extended: false,
+                    pressed,
+                    repeat: false,
+                    ctrl: false,
+                    shift: false,
+                    alt: false,
+                }]);
+                f.run(if pressed {
+                    vec![key(code, true), text(letter)]
+                } else {
+                    vec![key(code, false)]
+                });
+            }
+            crate::key_input::clear_test_frame();
+            f.settle();
+            assert!(f.field_focused());
+            assert!(
+                f.shortcut_leaks.is_empty(),
+                "grid keymap must not consume editor keys: {:?}",
+                f.shortcut_leaks
+            );
+        }
+        assert_eq!(f.app.favsearch.query, "alp");
+        assert_eq!(f.app.favsearch.results_paths.len(), 2);
+    }
+}
+
+#[test]
+fn favsearch_typing_frame_zero_results_and_empty_query_keep_focus() {
+    let _input = crate::key_input::lock_test_input();
+    for pinned in [false, true] {
+        let mut f = fixture(pinned);
+        for (query, count) in [("absent", 0), ("alp", 2), ("", 0)] {
+            // Select the actual editor's contents, then replace them through TextEdit.
+            f.run(vec![egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: Some(egui::Key::A),
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }]);
+            f.run(vec![key(egui::Key::A, false)]);
+            f.run(if query.is_empty() {
+                vec![key(egui::Key::Backspace, true)]
+            } else {
+                vec![text(query)]
+            });
+            f.run(vec![key(egui::Key::Backspace, false)]);
+            f.settle();
+            assert_eq!(f.app.favsearch.query, query);
+            assert_eq!(f.app.items.len(), count);
+            assert!(f.field_focused());
+            assert!(!f.app.sidecar_restore_active());
+        }
+    }
 }

@@ -675,6 +675,38 @@ spawn/disconnectはUnavailable通知と既存Similar終端処理へ渡し、同�
 初期フォルダの同期loaderはPhase Bまで現状維持。詳しくは
 [startup-diagnostics-plan.md](startup-diagnostics-plan.md) §10を参照。
 
+## Ctrl+S / Ctrl+T の完成検索結果と hydration（案 C）
+
+Ctrl+S の結果採用すべてと、Ctrl+T の非空クエリの初回・再検索は、検索 worker が
+最終採用列と `Arc<PreparedPageIdentityIndex>` を一緒に返す。採否条件は
+`file_type_visibility` と `epub_file_handling` の immutable snapshot であり、採用時に
+一致しなければ列・索引・付随データをまとめて破棄して1行ログを残す。再実行は追加せず、
+既存の検索終了・取消・設定 reload による置換へ任せる。
+
+`PreparedSearchRows` は GridItem・image_metas・動画 slot・条件キー・索引を所有する。
+Ctrl+S の results_paths と Ctrl+T の applied_times も同じ最終列から worker で作る。
+採用側は列を再filter・並べ替えしない。pin lookup、existing_keys、サブフォルダ復帰状態、
+video_thumb_overrides の既存処理はこの列を使う。
+
+初回採用は既存 admission を通った同期 install から hydration に完成索引を渡す。
+即時表示の契約は Favorite / Tag の `ExtractedResult(Search(...))`、完成結果の条件一致、
+sidecar import 不要、logical override なし、`LegacyResumeSource::General` の全条件に限定する。
+索引を公開して旧索引を `retire_smart_folder_payloads` へ退役させ、通常 owner と同じ
+本以外の見開き調整初期化を行い、既存 `resume_loading_items_after_sidecar` tail を同期実行する。
+検索結果は本scopeを持たないため本の復元readは不要で、quiescenceを始めないのでmetadata
+readerの再開も行わない。入力 gate・sanitizer・待機 Modal は変更しない。
+
+Ctrl+T 再検索は items と recipe の設定後に完成索引を直接公開し、viewer identity の転送前に
+利用可能にする。ページ編集準備・動画更新は維持する。空クエリによる検索前一覧への復帰は
+従来経路のまま。Ctrl+S 空クエリだけは空の完成列をその場で用意して即時採用する。
+物理フォルダや検索結果から開く ZIP/PDF の子一覧は、引き続き自身の hydration owner で
+自身の索引を準備する。合成pathだけを条件に一般の非空一覧へ即時経路を広げない。
+
+検索中の入力をmodalにして組み合わせを減らす案は、連続入力を止めるため採らない。
+既存検索 worker 内で完成列と索引を確定し、新しい待機状態・再試行・repaint を追加しない。
+索引準備は `search / page_identity_prepare` に surface・items・ms を記録する。
+まれな失敗は既定のログ・通知方針に従う。
+
 ## 主一覧の移動採用と採用後の復元（§1.339）
 
 `MainListNavigation` がtyped宛先、帰路、要求別source proofと履歴操作を既存の

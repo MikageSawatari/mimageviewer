@@ -35,7 +35,7 @@ fn favorite_search_sidecars_use_full_source_paths_and_the_released_off_setting()
     let cancel = AtomicBool::new(false);
     let mut settings = prepare_settings();
     let prepared = prepare_favsearch_results(entries.clone(), &settings, &cancel).unwrap();
-    assert_eq!(prepared.entries.len(), 2);
+    assert_eq!(prepared.rows.items.len(), 2);
     assert_eq!(prepared.video_thumb_overrides.len(), 2);
     for (entry, cover) in entries.iter().zip(&covers) {
         let key = crate::path_key::normalize_keep_drive(&entry.path);
@@ -44,7 +44,7 @@ fn favorite_search_sidecars_use_full_source_paths_and_the_released_off_setting()
     assert!(!prepared.video_thumb_overrides.contains_key("same"));
     settings.video_thumb_use_sidecar_image = false;
     let prepared = prepare_favsearch_results(entries, &settings, &cancel).unwrap();
-    assert_eq!(prepared.entries.len(), 2);
+    assert_eq!(prepared.rows.items.len(), 2);
     assert!(prepared.video_thumb_overrides.is_empty());
 }
 
