@@ -29144,6 +29144,9 @@ impl App {
                         fs_input_ms = input_t0.elapsed().as_secs_f64() * 1000.0;
 
                         self.retire_fs_initial_placement_request();
+                        // Compare with the previous paint's receipt after input,
+                        // before invalidating it for this frame's new layout.
+                        self.retire_fs_page_scroll_animation(ctx);
                         self.fullscreen_page_layout.drawn_unit = None;
                         if self.paint_viewer_presentation_interlude(ui, full_rect, ctx, detached, canvas_color) {
                             return;
@@ -29217,7 +29220,6 @@ impl App {
 
                         // ── 画像 / 動画描画 ──
                         let media_t0 = std::time::Instant::now();
-                        self.retire_fs_page_scroll_animation(ctx);
                         self.fullscreen_page_layout.clear();
                         let mut single_transform: Option<DisplayedImageTransform> = None;
                         let mut flat_crop = page_turn::FlatCrop::None;

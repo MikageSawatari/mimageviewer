@@ -37,40 +37,159 @@ fn near(actual: Vec2, expected: Vec2) {
     );
 }
 
+#[cfg(windows)]
 #[test]
 fn ordinary_single_and_spread_paint_interpolate_without_publishing_intermediate_pan() {
+    let _serial = crate::key_input::lock_test_input();
+    struct ClearKeyboard;
+    impl Drop for ClearKeyboard {
+        fn drop(&mut self) {
+            crate::key_input::clear_test_frame();
+        }
+    }
+    let _clear = ClearKeyboard;
+
+    // Match the production viewport fixture's root dispatch. Do not perform
+    // page-local input, animation retirement, or paint in the test's order:
+    // the full renderer owns all three and must preserve its previous stamp
+    // until it validates the animation after input.
+    fn render_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> Vec<DisplayedImageTransform> {
+        app.frame_counter += 1;
+        crate::key_input::set_test_frame_for_viewport(egui::ViewportId::ROOT, Vec::new());
+        let output = ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(full_rect()),
+                focused: true,
+                time: Some(time),
+                events,
+                viewports: [(
+                    egui::ViewportId::ROOT,
+                    egui::ViewportInfo {
+                        native_pixels_per_point: Some(1.0),
+                        focused: Some(true),
+                        minimized: Some(false),
+                        ..Default::default()
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| app.render_fullscreen_viewport_with_root_input(ui, None));
+            },
+        );
+        // This only discards recorded egui paint/texture output; it constructs
+        // no renderer, RenderState, device, session, or native application window.
+        crate::test_ui::headless_paint_output(output).drop_without_applying_deltas();
+        let pages: Vec<_> = app
+            .fullscreen_page_layout
+            .displayed_pages()
+            .map(|page| page.transform)
+            .collect();
+        assert!(
+            !pages.is_empty(),
+            "the actual viewport paints resident pages"
+        );
+        assert!(
+            app.fullscreen_page_layout.drawn_unit.is_some(),
+            "the actual renderer republishes the current unit stamp"
+        );
+        assert!(
+            app.fs_scroll_layout_matches(ctx),
+            "the repainted unit remains admissible for the next input"
+        );
+        pages
+    }
+
     for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
-        let ctx = egui::Context::default();
-        let mut app = scroll_app(&ctx, mode);
-        app.fs_zoom = 2.0;
-        app.settings.fullscreen_smooth_page_scroll = true;
-        seed(&ctx, &mut app);
-        let mut target = Vec2::ZERO;
-        timed_ui(&ctx, 1.0, vec![], |ui, ctx| {
-            app.apply_fs_page_scroll_key(ctx, KeyAction::FsPageScrollDown);
-            target = app.fs_pan;
-            assert!(target.y < 0.0);
-            app.retire_fs_page_scroll_animation(ctx);
-            paint(&mut app, ui, ctx);
-            assert_eq!(app.fs_pan, target);
-            for page in app.fullscreen_page_layout.displayed_pages() {
-                near(normal_zoom_pan(page.transform).unwrap().1, Vec2::ZERO);
+        for smooth in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = scroll_app(&ctx, mode);
+            app.fs_zoom = 2.0;
+            app.settings.fullscreen_smooth_page_scroll = smooth;
+            app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+            app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsPageScrollDown = F24\n");
+            let initial = render_frame(&mut app, &ctx, 0.0, vec![]);
+            let expected_pages = if mode.is_spread() { 2 } else { 1 };
+            assert_eq!(initial.len(), expected_pages);
+            let from = app.fs_pan;
+            for page in initial {
+                near(normal_zoom_pan(page).unwrap().1, from);
             }
-        });
-        for time in [1.05, 1.10, 1.15, 1.21] {
-            timed_ui(&ctx, time, vec![], |ui, ctx| {
-                app.retire_fs_page_scroll_animation(ctx);
-                let visible = app.fs_page_scroll_display_pan(ctx);
-                paint(&mut app, ui, ctx);
-                assert_eq!(
-                    app.fs_pan, target,
-                    "paint cannot publish its intermediate transform"
+
+            // One real key action reaches the production keymap and page-local
+            // writer in the same pass as the production retirement and paint.
+            let input_pages = render_frame(
+                &mut app,
+                &ctx,
+                1.0,
+                super::handler_tests::tap(egui::Key::F24),
+            );
+            let to = app.fs_pan;
+            assert!(to.y < from.y, "mode={mode:?} smooth={smooth}");
+            let motion = to - from;
+            assert_eq!(input_pages.len(), expected_pages);
+            for page in input_pages {
+                near(
+                    normal_zoom_pan(page).unwrap().1,
+                    if smooth { from } else { to },
                 );
-                for page in app.fullscreen_page_layout.displayed_pages() {
-                    near(normal_zoom_pan(page.transform).unwrap().1, visible);
+            }
+            if smooth {
+                let animation = app
+                    .fs_page_scroll_animation
+                    .as_ref()
+                    .expect("the actual viewport keeps the newly accepted animation");
+                assert_eq!((animation.from, animation.to), (from, to));
+                assert_eq!(animation.start_time, 1.0);
+            } else {
+                assert!(app.fs_page_scroll_animation.is_none());
+            }
+
+            let mut previous_distance = motion.length();
+            for time in [1.05, 1.10, 1.15, 1.21] {
+                let pages = render_frame(&mut app, &ctx, time, vec![]);
+                assert_eq!(pages.len(), expected_pages);
+                assert_eq!(
+                    app.fs_pan, to,
+                    "the full viewport cannot publish an intermediate pan: {mode:?}, smooth={smooth}, time={time}"
+                );
+                let mut frame_distance: Option<f32> = None;
+                for page in pages {
+                    let painted = normal_zoom_pan(page).unwrap().1;
+                    if smooth && time < 1.2 {
+                        let progress = (painted - from).dot(motion) / motion.length_sq();
+                        assert!(
+                            progress > 0.0 && progress < 1.0,
+                            "a subsequent real frame paints strictly between from/to: {mode:?}, time={time}, pan={painted:?}"
+                        );
+                        near(painted, from + motion * progress);
+                        let distance = (to - painted).length();
+                        assert!(
+                            distance < previous_distance,
+                            "successive real frames approach the logical target"
+                        );
+                        // All pages share this frame's sample. Update the
+                        // previous-frame baseline only after inspecting the unit.
+                        if let Some(expected) = frame_distance {
+                            assert!((distance - expected).abs() < 0.01);
+                        }
+                        frame_distance = Some(distance);
+                    } else {
+                        near(painted, to);
+                    }
                 }
-                assert_eq!(app.fs_page_scroll_animation.is_none(), time >= 1.2);
-            });
+                if let Some(distance) = frame_distance {
+                    previous_distance = distance;
+                }
+                assert_eq!(app.fs_page_scroll_animation.is_some(), smooth && time < 1.2);
+            }
         }
     }
 }
