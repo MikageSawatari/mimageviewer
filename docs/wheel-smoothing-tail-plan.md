@@ -68,8 +68,10 @@
 | `ui_helpers.rs:513` `apply_brush_radius_wheel` | 編集時の Shift+ホイールで筆の太さ |
 | `ui_fullscreen.rs:39031-39050`, `39412-39420` | 平面・パノラマのナビゲーターの大きさ (イベントを直接取り除いている) |
 | `video/native_presenter/render_core.rs:1016-1040` | 動画のシーク列の時間範囲 (同上) |
-| 動画のシーク列メニュー `render_core.rs:1892` と、音声トラックメニュー `render_core.rs:2147` | 生のホイールの射影から 1 行ずつ動かす (ScrollArea ではない)。これらのホイールを取り除いている箇所で捨てる。取り除く箇所は実装担当がコードで特定する |
+| 動画のシーク列メニュー `render_core.rs` `draw_native_seek_strip_menu` と、音声トラックメニュー `draw_native_audio_track_menu` | 生のホイールの射影から 1 行ずつ動かす (ScrollArea ではない)。自身のメニュー矩形内で射影を読む既存の条件の内側で `consume_remaining_wheel_inputs` により消費・終端する。シーク列メニューは `max_scroll > 0` も必要 |
 | `ui_music_panels.rs:453` (音声トラックのポップアップ) | 上の音声トラックメニューを使う。共有の `consume_music_popup_wheel` は再生速度のポップアップ (`ui_music_panels.rs:2806`) も使うので、共有関数は変えず、この呼び出し箇所で捨てる |
+
+実装後の独立レビュー P2 による変更: 上記 native メニューには従来の除去点が無かったため、初回実装では変更しなかった。レビュー後の利用者指示に従い、全 caller の後続処理がその入力に依存しないことを確認して、メニュー自身を raw owner にする。音楽 HUD 側の既存の消費は維持し、メニューが先に消費済みなら実除去数 0 となるため再終端しない。
 
 保つ側 (ポップアップ・素通し防止。今の挙動のまま):
 `app.rs:63663`, `ui_folder_pane.rs:319`, `ui_history_field.rs:193`, `ui_fullscreen.rs:54878`, `ui_main.rs:2483`, `10683`, `12783`, `13473`, `14371`, `16728`。
@@ -134,6 +136,7 @@ Sol の提案に従い、名前で役割を分ける。
   - 捨てた後の新しいホイール。
   - 次の pass の `zoom_delta() == 1.0`。
 - ナビゲーターとシーク列: `HeadlessNativeBatchTarget::draw_regions` (`render_core.rs:23717`) は、本番のシーク列の消費と実際の ScrollArea を組み合わせている。
+- native の両メニュー: 1 Line ノッチでちょうど 1 行動き、空の idle 入力・1/165 秒刻みで 3 pass 以内に即時再描画を終える。矩形外と、シーク列メニューの `max_scroll == 0` ではイベントと当該 delta・残量を保持する。
 - 計測: portable-smoke で承認済みの 3 種 (OS 入力 16%・2%・合成キー) を再計測し、ホイール区間の fps と UI スレッドの CPU を比べる。
 
 ## 5. detached viewer リワーク中のルールとの関係
