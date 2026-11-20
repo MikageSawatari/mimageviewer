@@ -4117,19 +4117,28 @@ pub enum FullscreenWheelAction {
     #[default]
     PageTurn,
     InPageScroll,
+    ScrollThenPageTurn,
+    Zoom,
     #[serde(other)]
     Unknown,
 }
 
 impl FullscreenWheelAction {
     pub fn all() -> &'static [Self] {
-        &[Self::PageTurn, Self::InPageScroll]
+        &[
+            Self::PageTurn,
+            Self::InPageScroll,
+            Self::ScrollThenPageTurn,
+            Self::Zoom,
+        ]
     }
 
     pub fn label(self) -> &'static str {
         match self.normalized() {
             Self::PageTurn => "ページ送り",
             Self::InPageScroll => "ページ内スクロール",
+            Self::ScrollThenPageTurn => "スクロール＋ページ送り",
+            Self::Zoom => "ズーム",
             Self::Unknown => unreachable!(),
         }
     }
@@ -5901,6 +5910,12 @@ pub struct Settings {
     /// ページ内の次へ / 前へスクロールで用いる順序。
     #[serde(default)]
     pub fullscreen_n_scroll_order: FullscreenNScrollOrder,
+    /// ページ内を N 字 / Z 字の順で読む操作 1 回の移動量 (表示領域比 %)。
+    #[serde(default = "default_fullscreen_n_scroll_step_percent")]
+    pub fullscreen_n_scroll_step_percent: u32,
+    /// ページ内スクロールの論理位置は即時に更新し、見た目だけ滑らかに動かす。
+    #[serde(default)]
+    pub fullscreen_smooth_page_scroll: bool,
     /// 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。
     #[serde(default = "default_true")]
     pub fullscreen_page_number_overlay: bool,
@@ -8050,6 +8065,9 @@ fn default_page_turn_animation_duration_ms() -> u32 {
 fn default_continuous_reading_gap_px() -> u32 {
     20
 }
+fn default_fullscreen_n_scroll_step_percent() -> u32 {
+    85
+}
 fn default_continuous_reading_wheel_scroll_percent() -> u32 {
     20
 }
@@ -8422,6 +8440,8 @@ impl Default for Settings {
             fullscreen_up_down_key_action: FullscreenUpDownKeyAction::default(),
             fullscreen_wheel_action: FullscreenWheelAction::default(),
             fullscreen_n_scroll_order: FullscreenNScrollOrder::default(),
+            fullscreen_n_scroll_step_percent: default_fullscreen_n_scroll_step_percent(),
+            fullscreen_smooth_page_scroll: false,
             fullscreen_page_number_overlay: true,
             fullscreen_keep_on_app_switch: false,
             fullscreen_cursor_hide_delay_secs: FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
@@ -10659,7 +10679,7 @@ impl Settings {
 
     /// 読み込んだ設定値を安全範囲に補正する (JSON 手編集で範囲外の値が入った場合の防衛)。
     /// お気に入りの UUID マイグレーションもここで行う。
-    fn sanitize(&mut self) {
+    pub(super) fn sanitize(&mut self) {
         if !self.save_search_input_history {
             self.search_input_history.clear();
         }
@@ -10850,6 +10870,8 @@ impl Settings {
         self.fullscreen_up_down_key_action = self.fullscreen_up_down_key_action.normalized();
         self.fullscreen_wheel_action = self.fullscreen_wheel_action.normalized();
         self.fullscreen_n_scroll_order = self.fullscreen_n_scroll_order.normalized();
+        self.fullscreen_n_scroll_step_percent =
+            self.fullscreen_n_scroll_step_percent.clamp(10, 100);
         self.fullscreen_specified_scale.sanitize();
         self.fullscreen_specified_scale_max_tenths =
             self.fullscreen_specified_scale_max_tenths.clamp(

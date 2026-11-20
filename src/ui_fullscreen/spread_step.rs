@@ -88,7 +88,7 @@ impl App {
             return;
         }
         if !self.spread_mode.is_spread() || !self.reading_flow.is_paged() {
-            action.page_nav = self.spread_page_nav(dir);
+            action.page_nav = self.spread_page_nav(dir).into();
             return;
         }
         if !self.admit_spread_step() || self.fs_navigation_sequence_blocks_new_target() {
@@ -96,7 +96,7 @@ impl App {
         }
         if let Some((target, start)) = self.compute_spread_step(fs_idx, dir) {
             self.set_spread_step(start);
-            action.page_nav = FsPageNav::Target(target);
+            action.page_nav = FsPageNav::Target(target).into();
         }
     }
 
@@ -114,7 +114,7 @@ impl App {
         // Leave ordinary modes on precisely the FsPagePrev/FsPageNext path,
         // including its split slice, wrapping and normal barrier admission.
         if !self.spread_mode.is_spread() || !self.reading_flow.is_paged() {
-            action.page_nav = self.spread_page_nav(dir);
+            action.page_nav = self.spread_page_nav(dir).into();
             return;
         }
         if self.page_turn_barrier_active() {
@@ -126,7 +126,7 @@ impl App {
             return;
         }
         self.queue_spread_step_action(fs_idx, dir, action);
-        if matches!(action.page_nav, FsPageNav::Target(_)) {
+        if matches!(action.page_nav.nav, FsPageNav::Target(_)) {
             self.page_turn_excluded_navigation_with_operation(ctx, "stage1_spread_step", operation);
         }
     }

@@ -2039,10 +2039,36 @@ impl TopLevelGridView {
         display_unit_step: bool,
         wrap: bool,
     ) -> bool {
+        self.accumulate_collection_manual_navigation_with_landing(
+            delta,
+            landing,
+            still_only,
+            display_unit_step,
+            wrap,
+            None,
+        )
+    }
+
+    pub(in crate::app) fn accumulate_collection_manual_navigation_with_landing(
+        &mut self,
+        delta: i32,
+        landing: super::ManualMediaNavigationLanding,
+        still_only: bool,
+        display_unit_step: bool,
+        wrap: bool,
+        page_landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) -> bool {
         self.collection_navigation_pending
             .as_mut()
             .is_some_and(|pending| {
-                pending.accumulate_manual(delta, landing, still_only, display_unit_step, wrap)
+                pending.accumulate_manual_with_landing(
+                    delta,
+                    landing,
+                    still_only,
+                    display_unit_step,
+                    wrap,
+                    page_landing,
+                )
             })
     }
 

@@ -1830,6 +1830,8 @@ pub enum KeyAction {
     FsPageScrollDown,
     FsPageScrollLeft,
     FsPageScrollRight,
+    FsPageScrollOrTurnNext,
+    FsPageScrollOrTurnPrev,
     FsAiModelNext,
     FsAiModelPrev,
     FsAiModelReset,
@@ -2454,6 +2456,8 @@ const ALL_ACTIONS: &[KeyAction] = &[
     KeyAction::FsPageScrollDown,
     KeyAction::FsPageScrollLeft,
     KeyAction::FsPageScrollRight,
+    KeyAction::FsPageScrollOrTurnNext,
+    KeyAction::FsPageScrollOrTurnPrev,
     KeyAction::FsAiModelNext,
     KeyAction::FsAiModelPrev,
     KeyAction::FsAiModelReset,
@@ -4721,6 +4725,8 @@ impl KeyAction {
             FsPageScrollDown => "FsPageScrollDown",
             FsPageScrollLeft => "FsPageScrollLeft",
             FsPageScrollRight => "FsPageScrollRight",
+            FsPageScrollOrTurnNext => "FsPageScrollOrTurnNext",
+            FsPageScrollOrTurnPrev => "FsPageScrollOrTurnPrev",
             FsAiModelNext => "FsAiModelNext",
             FsAiModelPrev => "FsAiModelPrev",
             FsAiModelReset => "FsAiModelReset",
@@ -5510,6 +5516,8 @@ impl KeyAction {
             FsPageScrollDown => "ページ内を下へスクロールする",
             FsPageScrollLeft => "ページ内を左へスクロールする",
             FsPageScrollRight => "ページ内を右へスクロールする",
+            FsPageScrollOrTurnNext => "順にスクロールし、端でもう一度押すと次のページへ送る",
+            FsPageScrollOrTurnPrev => "逆順にスクロールし、端でもう一度押すと前のページへ送る",
             FsAiModelNext => "AIモデルを次へ切り替える",
             FsAiModelPrev => "AIモデルを前へ切り替える",
             FsAiModelReset => "AIモデルを標準に戻す",
@@ -6113,6 +6121,8 @@ impl KeyAction {
             | FsPageScrollDown
             | FsPageScrollLeft
             | FsPageScrollRight
+            | FsPageScrollOrTurnNext
+            | FsPageScrollOrTurnPrev
             | FsAiModelNext
             | FsAiModelPrev
             | FsAiModelReset
@@ -6684,6 +6694,8 @@ impl KeyAction {
             | FsPageScrollDown
             | FsPageScrollLeft
             | FsPageScrollRight
+            | FsPageScrollOrTurnNext
+            | FsPageScrollOrTurnPrev
             | FsAiModelNext
             | FsAiModelPrev
             | FsAiModelReset
@@ -7271,9 +7283,12 @@ impl KeyAction {
             FsZoomOut => ChordList::two(Chord::key(Comma), Chord::key(NumpadSubtract)),
             FsPageNScrollNext => ChordList::one(Chord::key(K)),
             FsPageNScrollPrev => ChordList::one(Chord::key(J)),
-            FsPageScrollUp | FsPageScrollDown | FsPageScrollLeft | FsPageScrollRight => {
-                ChordList::EMPTY
-            }
+            FsPageScrollUp
+            | FsPageScrollDown
+            | FsPageScrollLeft
+            | FsPageScrollRight
+            | FsPageScrollOrTurnNext
+            | FsPageScrollOrTurnPrev => ChordList::EMPTY,
             FsAiModelNext => ChordList::one(Chord::key(U)),
             FsAiModelPrev => ChordList::one(Chord::shift(U)),
             FsAiModelReset => ChordList::one(Chord::alt(U)),
@@ -7522,6 +7537,14 @@ pub(crate) struct DiagnosticChordPressSnapshot {
 pub(crate) enum PageTurnPressKind {
     InitialPress,
     AutoRepeat,
+}
+
+/// The edge consumed by a single-dispatch action, without a later OS key-state read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ActionPressInput {
+    /// Script actions have no physical key operation.
+    pub operation_id: Option<crate::key_input::KeyOperationId>,
+    pub kind: PageTurnPressKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8730,6 +8753,43 @@ impl Keymap {
         );
     }
 
+    /// Consume a press or repeat and preserve its kind from the consumed input itself.
+    /// A frame containing both kinds dispatches once as an initial press.
+    pub(crate) fn consume_action_press(
+        &self,
+        ctx: &egui::Context,
+        action: KeyAction,
+    ) -> Option<ActionPressInput> {
+        debug_assert_eq!(action.trigger(), KeyTrigger::Press);
+        debug_assert_eq!(
+            action.press_multiplicity(),
+            PressMultiplicity::SinglePerFrame
+        );
+        #[cfg(all(windows, feature = "test-script"))]
+        if crate::test_script::consume_pending_action(ctx, action) {
+            return Some(ActionPressInput {
+                operation_id: None,
+                kind: PageTurnPressKind::InitialPress,
+            });
+        }
+        if crate::keyboard_input::keymap_owner_blocks_shortcuts(ctx) {
+            return None;
+        }
+        for chord in self.effective_chords(action) {
+            if let Some(input) = self.consume_chord_press_input(ctx, chord) {
+                #[cfg(windows)]
+                crate::key_debug::record_consumed_action(
+                    action,
+                    action.context(),
+                    chord,
+                    "consume_action_press",
+                );
+                return Some(input);
+            }
+        }
+        None
+    }
+
     pub fn consume_action(&self, ctx: &egui::Context, action: KeyAction) -> bool {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
@@ -9749,6 +9809,75 @@ impl Keymap {
                     && input.key_down(key)
             })
         }
+    }
+
+    fn consume_chord_press_input(
+        &self,
+        ctx: &egui::Context,
+        chord: Chord,
+    ) -> Option<ActionPressInput> {
+        let key_name = chord.key_name()?;
+        let viewport = ctx.viewport_id();
+        #[cfg(windows)]
+        if crate::key_input::is_frame_active(viewport) {
+            if crate::key_input::frame_had_key_down(viewport) {
+                let edges = crate::key_input::consume_key_press_edges_with_result(
+                    viewport,
+                    |edge| chord.matches_key_edge(edge),
+                    |edge| key_name.matches_win32(edge.virtual_key, edge.scan_code, edge.extended),
+                );
+                if edges.matched_count == 0 {
+                    return None;
+                }
+                Self::claim_egui_twin_key_events(ctx, &[chord]);
+                Self::cancel_claimed_tab_focus_traversal(ctx, chord);
+                return Some(ActionPressInput {
+                    operation_id: edges.operation_id,
+                    kind: if edges.had_initial_press {
+                        PageTurnPressKind::InitialPress
+                    } else {
+                        PageTurnPressKind::AutoRepeat
+                    },
+                });
+            }
+            if Self::frame_active_blocks_egui_fallback(chord) {
+                return None;
+            }
+        }
+        if !Self::egui_key_event_fallback_allowed(ctx) {
+            return None;
+        }
+        let egui_key = key_name.egui_twin_key_for_claim()?;
+        let kind = ctx.input_mut(|input| {
+            let mut matched = false;
+            let mut had_initial_press = false;
+            input.events.retain(|event| {
+                if matches!(event, egui::Event::Key { key, pressed: true, modifiers, .. }
+                    if chord.matches_egui(*key, *modifiers))
+                {
+                    matched = true;
+                    had_initial_press |= !matches!(event, egui::Event::Key { repeat: true, .. });
+                    return false;
+                }
+                // A later release belongs to the same consumed physical stream.
+                !(matched
+                    && matches!(event, egui::Event::Key { key, pressed: false, .. }
+                    if *key == egui_key))
+            });
+            matched.then_some(if had_initial_press {
+                PageTurnPressKind::InitialPress
+            } else {
+                PageTurnPressKind::AutoRepeat
+            })
+        })?;
+        Self::cancel_claimed_tab_focus_traversal(ctx, chord);
+        let operation_id = crate::key_input::egui_operation_key_id(ctx, viewport, |edge| {
+            let crate::key_input::KeyOperationEdge::Egui { key, modifiers, .. } = edge else {
+                return false;
+            };
+            chord.matches_egui(key, modifiers)
+        });
+        Some(ActionPressInput { operation_id, kind })
     }
 
     fn consume_chord_inner(&self, ctx: &egui::Context, chord: Chord, allow_repeat: bool) -> bool {
@@ -17098,6 +17227,8 @@ mod tests {
             (KeyAction::FsPageScrollDown, None),
             (KeyAction::FsPageScrollLeft, None),
             (KeyAction::FsPageScrollRight, None),
+            (KeyAction::FsPageScrollOrTurnNext, None),
+            (KeyAction::FsPageScrollOrTurnPrev, None),
         ] {
             assert!(KeyAction::all().contains(&action));
             assert_eq!(KeyAction::parse_ini_name(action.ini_name()), Some(action));

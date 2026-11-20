@@ -226,7 +226,7 @@ fn frame(
             };
             let (page_nav, close) =
                 app.handle_fs_wheel_and_click(ui, ctx, viewport(), &state, false, 0, &mut None);
-            assert!(matches!(page_nav, FsPageNav::None));
+            assert!(page_nav.is_none());
             assert!(!close);
             match mode {
                 Mode::Erase => {

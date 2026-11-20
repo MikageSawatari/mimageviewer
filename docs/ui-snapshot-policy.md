@@ -1,5 +1,16 @@
 # UI スナップショットテスト運用方針
 
+§1.823〜§1.826 の拡張では、環境設定fixtureの定義を更新した。既存の
+`fullscreen_in_page_scroll_settings_light_default` / `fullscreen_in_page_scroll_settings_dark_enabled`
+は540×220から540×340へ拡大し、滑らかな移動と N 字 / Z 字の移動量の行を加える。
+新規に `fullscreen_scroll_then_turn_settings_light` / `fullscreen_wheel_zoom_settings_dark`
+の2定義（各540×340）を加え、ホイールの追加2選択の説明を描く。
+enabled fixtureは滑らかな移動ON・移動量50%・横優先を使い、既定fixtureはOFF・85%・縦優先を保つ。
+**今回のPNGは未生成・未目視で、更新指定なしの比較も未実施**。下記の§1.474の成功記録を今回の証拠として再利用しない。
+4件は実snapshot時にGPU rendererを作るため、nextestの `gpu` group 対象として登録する。
+設定UIからOKを経た反映と実handlerの操作は別のheadless回帰で検査する。実装・検証状況は
+[拡張設計の実装記録](fullscreen-scroll-page-turn-plan.md#11-実装記録)に集約する。
+
 §1.474 のページ内スクロールは、環境設定の3項目を明／暗で描く
 `fullscreen_in_page_scroll_settings_light_default`（540×220、27,932 bytes）と
 `fullscreen_in_page_scroll_settings_dark_enabled`（540×220、29,450 bytes）、

@@ -23,7 +23,7 @@ fn step_target(app: &mut crate::app::AppTestEnvForTest, dir: i32) -> Option<usiz
     let mut action = FsKeyAction::default();
     let idx = app.fullscreen_idx.unwrap();
     app.queue_spread_step_action(idx, dir, &mut action);
-    match action.page_nav {
+    match action.page_nav.nav {
         FsPageNav::Target(idx) => {
             app.fullscreen_idx = Some(idx);
             Some(idx)

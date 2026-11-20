@@ -639,6 +639,21 @@ design doc §4 / §8.6 の実装時ルール。各サイト置換時に必ず確
 
 ## 10. 新しいキー操作を追加するとき (保守 runbook)
 
+§1.824: `FsPageScrollOrTurnNext` / `FsPageScrollOrTurnPrev` は FsImage / Press / リピート可 /
+SinglePerFrame、既定なしのキーボード専用操作。`ini_name`・説明・context・trigger・default・
+`ALL_ACTIONS`・`docs/keymap.ini.default`・検索の操作 inventory を揃える。リング等の候補は増やさない。
+面の外と前面UI所有中は消費せず、面の中で照合できない間は消費のみ。消費した入力の結果から
+Press / Repeat を返す keymap helper を使い、後から実キーの状態を読まない。ページ内を進むときは
+どちらも受け付け、端では新しい Press だけが既存ページ送りを発行する。端へ着いた入力では送らない。
+着地付きの送りは `FsPageNavRequest` を丸ごと運び、後段の上書きで着地だけを残さない。
+読み込み失敗が確定した単位では描画の印を要しないが、面・items 世代・紙めくりと送り待ちの拒否条件は維持する。
+本の構成確認・サイドカー・コレクション直下の非同期送りは、既存保持者に着地を保持して再開する。
+コレクションの同方向蓄積も `page_landing` が一致する場合だけとし、通常送りの着地なしと混ぜない。
+置き換え・破棄は既存保持者の規則に従い、紙めくり継続への着地追加は行わない。
+§1.826 の N 字 / Z 字の量（10〜100%、既定85%）と §1.823 の滑らかな移動（既定OFF）は
+この操作と既存のページ内操作で共用する。ホイールの「スクロール＋ページ送り」「ズーム」は
+設定による固定マウス入力で、KeyAction ではない。詳細は [拡張設計 §2〜5](fullscreen-scroll-page-turn-plan.md)。
+
 §1.474: `FsPageNScrollNext` / `FsPageNScrollPrev`（既定 K / J）と
 `FsPageScrollUp` / `Down` / `Left` / `Right`（既定なし）は FsImage / Press / リピート可 /
 SinglePerFrame のキーボード専用操作。通常のページ単位静止画だけで受け付け、面の外や前面 UI

@@ -25,7 +25,9 @@ use crate::app::spread_shift_owner::retire_spread_step;
 pub(crate) mod in_page_scroll;
 mod initial_placement;
 mod pan_bounds;
-pub(crate) use initial_placement::{FsAutomaticInitialView, FsInitialPlacementRequest};
+pub(crate) use initial_placement::{
+    FsAutomaticInitialView, FsInitialPlacementKind, FsInitialPlacementRequest,
+};
 use pan_bounds::{draw_pan_correction, minimum_pan_correction};
 #[cfg(test)]
 mod continuous_quality_tests;
@@ -8500,8 +8502,12 @@ fn fullscreen_click_nav_base_delta(pos_x: f32, center_x: f32, rtl: bool) -> i32 
     fullscreen_click_nav_delta_for_side(pos_x < center_x, rtl)
 }
 
-fn should_zoom_fullscreen_wheel(ctrl_held: bool, overlay_edit_mode: bool) -> bool {
-    ctrl_held || overlay_edit_mode
+fn should_zoom_fullscreen_wheel(
+    ctrl_held: bool,
+    overlay_edit_mode: bool,
+    class: FsWheelInPageClass,
+) -> bool {
+    ctrl_held || overlay_edit_mode || class == FsWheelInPageClass::SettingZoom
 }
 
 fn should_suppress_egui_wheel_for_native_detached_video(
@@ -14859,6 +14865,44 @@ impl App {
         Self::fs_zoom_pan_for(self.fs_zoom, self.fs_pan)
     }
 
+    /// Only ordinary paint substitutes an animated pan; logical consumers keep
+    /// fs_zoom_pan and its final destination unchanged.
+    fn fs_page_scroll_paint_zoom_pan(
+        &self,
+        ctx: &egui::Context,
+        logical: Option<(f32, egui::Vec2)>,
+    ) -> Option<(f32, egui::Vec2)> {
+        let display_pan = self.fs_page_scroll_display_pan(ctx);
+        if display_pan == self.fs_pan {
+            logical
+        } else {
+            Some((logical.map_or(1.0, |(zoom, _)| zoom), display_pan))
+        }
+    }
+
+    fn fs_navigator_transform_pan(
+        &self,
+        _ctx: &egui::Context,
+        transform: DisplayedImageTransform,
+    ) -> egui::Vec2 {
+        // Input can arrive after the duration elapsed but before this frame's
+        // retirement/paint. Its transform still belongs to the previous paint,
+        // so the live animation owner, not a sample at the input time, selects
+        // the matching basis. Retirement then paints the final pan normally.
+        if self
+            .fs_page_scroll_animation
+            .as_ref()
+            .is_some_and(|animation| {
+                animation.to == self.fs_pan
+                    && animation.viewport == self.fs_page_scroll_destination_viewport()
+            })
+        {
+            normal_zoom_pan(transform).map_or(self.fs_pan, |(_, pan)| pan)
+        } else {
+            self.fs_pan
+        }
+    }
+
     fn fs_zoom_pan_for(zoom: f32, pan: egui::Vec2) -> Option<(f32, egui::Vec2)> {
         if zoom_differs_from_fit(zoom) || pan.length_sq() > PAN_EPSILON_SQ {
             Some((zoom, pan))
@@ -19824,9 +19868,55 @@ pub(crate) enum FsPageNav {
     Split(crate::page_split::PresentationStep),
 }
 
+/// A landing belongs to exactly one navigation request, including deferred opens.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FsPageLanding {
+    Start,
+    End,
+}
+
+impl FsPageLanding {
+    pub(crate) fn initial_placement_kind(self) -> FsInitialPlacementKind {
+        match self {
+            Self::Start => FsInitialPlacementKind::LandingStart,
+            Self::End => FsInitialPlacementKind::LandingEnd,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FsPageNavRequest {
+    pub(crate) nav: FsPageNav,
+    pub(crate) landing: Option<FsPageLanding>,
+}
+
+impl FsPageNavRequest {
+    pub(crate) fn is_none(self) -> bool {
+        self.nav.is_none()
+    }
+}
+
+impl From<FsPageNav> for FsPageNavRequest {
+    fn from(nav: FsPageNav) -> Self {
+        Self { nav, landing: None }
+    }
+}
+
+impl PartialEq<FsPageNav> for FsPageNavRequest {
+    fn eq(&self, other: &FsPageNav) -> bool {
+        self.nav == *other && self.landing.is_none()
+    }
+}
+
+impl PartialEq<FsPageNavRequest> for FsPageNav {
+    fn eq(&self, other: &FsPageNavRequest) -> bool {
+        other == self
+    }
+}
+
 #[derive(Default)]
 struct FsWheelFrameResult {
-    page_nav: FsPageNav,
+    page_nav: FsPageNavRequest,
     close: bool,
     wheel_navigation_produced: bool,
     deferred: Option<FsWheelFrameProposal>,
@@ -19839,7 +19929,7 @@ struct FsWheelFrameProposal {
     music_ctrl_wheel_gate_reached: bool,
     route_music_intervals: bool,
     wheel_input: FsWheelFrameInput,
-    page_nav: FsPageNav,
+    page_nav: FsPageNavRequest,
     canvas_click: FsCanvasClickAction,
     secondary_action: FsSecondaryAction,
     full_rect: egui::Rect,
@@ -19903,12 +19993,15 @@ struct FsWheelAction {
     operation: Option<ViewerOperationId>,
     class: FsWheelInPageClass,
     scroll_origin: Option<in_page_scroll::FsDrawnUnitStamp>,
+    page_owner: (u64, Option<usize>, crate::page_split::PageSlice),
     seek_hover: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum FsWheelInPageClass {
     InPageScroll(egui::Vec2),
+    ScrollThenPageTurn(egui::Vec2),
+    SettingZoom,
     Legacy,
 }
 
@@ -20022,7 +20115,7 @@ pub(crate) struct FsKeyAction {
     /// BS = 階層を 1 段だけ戻す。コンテナページなら `close_fullscreen` を直接呼んで
     /// L2 ページ一覧へ (設定で分岐しない)。
     pub(crate) close_to_page_list: bool,
-    pub(crate) page_nav: FsPageNav,
+    pub(crate) page_nav: FsPageNavRequest,
     pub(crate) ctrl_nav: Option<i32>,
     pub(crate) list_order_nav: Option<bool>,
     pub(crate) sibling_nav: Option<i32>,
@@ -22600,10 +22693,25 @@ impl App {
         anchor_idx: usize,
         slice: crate::page_split::PageSlice,
     ) {
+        self.accept_fullscreen_page_slice_navigation_with_landing(anchor_idx, slice, None);
+    }
+
+    fn accept_fullscreen_page_slice_navigation_with_landing(
+        &mut self,
+        anchor_idx: usize,
+        slice: crate::page_split::PageSlice,
+        landing: Option<FsPageLanding>,
+    ) {
         let changed = self.fullscreen_page_slice != slice;
         self.set_fullscreen_page_slice_for_display_unit(slice);
         if changed {
-            self.request_fs_initial_placement(anchor_idx);
+            self.request_fs_initial_placement_with_kind(
+                anchor_idx,
+                landing.map_or(
+                    FsInitialPlacementKind::Setting,
+                    FsPageLanding::initial_placement_kind,
+                ),
+            );
         }
     }
 
@@ -26161,6 +26269,25 @@ impl App {
         load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
         fs_navigation_perf: &mut Option<FsNavigationPerfRecorder>,
     ) {
+        self.land_still_page_navigation_target_with_landing(
+            ctx,
+            current_idx,
+            target_idx,
+            load_contract,
+            fs_navigation_perf,
+            None,
+        );
+    }
+
+    fn land_still_page_navigation_target_with_landing(
+        &mut self,
+        ctx: &egui::Context,
+        current_idx: usize,
+        target_idx: usize,
+        load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
+        fs_navigation_perf: &mut Option<FsNavigationPerfRecorder>,
+        landing: Option<FsPageLanding>,
+    ) {
         if self.continuous_reading_active_for_idx(current_idx)
             && self.continuous_reading_supported_idx(target_idx)
         {
@@ -26175,12 +26302,13 @@ impl App {
             );
         } else {
             let open_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
-            self.open_fullscreen_from_fs_navigation_with_contract(
+            self.open_fullscreen_from_fs_navigation_with_contract_and_landing(
                 ctx,
                 target_idx,
                 crate::app::HistoryTrigger::UserChosen,
                 load_contract,
                 fs_navigation_perf,
+                landing,
             );
             finish_fs_navigation_perf_span(
                 fs_navigation_perf,
@@ -28006,7 +28134,7 @@ impl App {
         let mut close_fs = false;
         let mut presentation_close_requested = false;
         let mut close_to_page_list = false;
-        let mut page_nav = FsPageNav::None;
+        let mut page_nav = FsPageNavRequest::default();
         let mut ctrl_nav: Option<i32> = None;
         let mut list_order_nav: Option<bool> = None;
         let mut sibling_nav: Option<i32> = None;
@@ -28376,7 +28504,7 @@ impl App {
                         root_action.sibling_nav,
                         root_action.mouse_nav,
                         if continuation_committed {
-                            FsPageNav::None
+                            FsPageNavRequest::default()
                         } else {
                             root_action.page_nav
                         },
@@ -28900,7 +29028,7 @@ impl App {
                         if key_action.close_to_page_list {
                             close_to_page_list = true;
                         }
-                        page_nav = if continuation_committed { FsPageNav::None } else { key_action.page_nav };
+                        page_nav = if continuation_committed { FsPageNavRequest::default() } else { key_action.page_nav };
                         ctrl_nav = key_action.ctrl_nav;
                         list_order_nav = key_action.list_order_nav;
                         sibling_nav = key_action.sibling_nav;
@@ -28975,7 +29103,7 @@ impl App {
                             // Keep no old key/wheel/click result alive across the surface change.
                             wheel_frame_proposal = None;
                             navigation_operation = None;
-                            page_nav = FsPageNav::None;
+                            page_nav = FsPageNavRequest::default();
                             ctrl_nav = None;
                             list_order_nav = None;
                             sibling_nav = None;
@@ -29016,6 +29144,9 @@ impl App {
                         fs_input_ms = input_t0.elapsed().as_secs_f64() * 1000.0;
 
                         self.retire_fs_initial_placement_request();
+                        // Compare with the previous paint's receipt after input,
+                        // before invalidating it for this frame's new layout.
+                        self.retire_fs_page_scroll_animation(ctx);
                         self.fullscreen_page_layout.drawn_unit = None;
                         if self.paint_viewer_presentation_interlude(ui, full_rect, ctx, detached, canvas_color) {
                             return;
@@ -30976,7 +31107,7 @@ impl App {
                 // secondary command can replace that canvas just like the immediate
                 // pointer path above. Spend the old phase once; retain only OS close.
                 navigation_operation = None;
-                page_nav = FsPageNav::None;
+                page_nav = FsPageNavRequest::default();
                 ctrl_nav = None;
                 list_order_nav = None;
                 sibling_nav = None;
@@ -33991,7 +34122,7 @@ impl App {
         // The four shift actions also provide ordinary one-page navigation in
         // Single/Split. Keep that route before the pairing-edit admission gate.
         if !self.spread_mode.is_spread() {
-            action.page_nav = FsPageNav::Delta(dir);
+            action.page_nav = FsPageNav::Delta(dir).into();
             return;
         }
         let rules = self.accepted_spread_shift_rules();
@@ -34016,11 +34147,11 @@ impl App {
                     return;
                 }
                 self.adjust_spread_target = None;
-                action.page_nav = FsPageNav::Target(new_idx);
+                action.page_nav = FsPageNav::Target(new_idx).into();
             }
         } else {
             // Single モード: 1 ページ移動にフォールバック (ユーザー要望)
-            action.page_nav = FsPageNav::Delta(dir);
+            action.page_nav = FsPageNav::Delta(dir).into();
         }
     }
 
@@ -34241,18 +34372,37 @@ impl App {
             let Some(new_idx) = self.poll_and_remap_book_target(ctx, new_idx) else {
                 return;
             };
-            if self.defer_book_composition_navigation_open(
+            let landing =
+                self.fs_initial_placement_request
+                    .and_then(|request| match request.kind {
+                        FsInitialPlacementKind::LandingStart => Some(FsPageLanding::Start),
+                        FsInitialPlacementKind::LandingEnd => Some(FsPageLanding::End),
+                        FsInitialPlacementKind::Setting => None,
+                    });
+            if self.defer_book_composition_navigation_open_with_landing(
                 new_idx,
                 crate::app::HistoryTrigger::UserChosen,
                 FsOpenMaterialization::Eager,
                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
                 crate::app::book_composition_permission::BookTargetPurpose::Explicit,
+                landing,
             ) {
                 ctx.request_repaint();
                 return;
             }
             let cursor_state = self.fullscreen_cursor_state();
-            self.open_fullscreen(new_idx, crate::app::HistoryTrigger::UserChosen);
+            if landing.is_some() {
+                self.open_fullscreen_with_materialization_and_contract_and_landing(
+                    new_idx,
+                    crate::app::HistoryTrigger::UserChosen,
+                    FsOpenMaterialization::Eager,
+                    crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
+                    None,
+                    landing,
+                );
+            } else {
+                self.open_fullscreen(new_idx, crate::app::HistoryTrigger::UserChosen);
+            }
             if self.fullscreen_idx != Some(new_idx) {
                 return;
             }
@@ -35409,7 +35559,7 @@ impl App {
             page_transition: FsKeyPageTransition::Unchanged,
             close: false,
             close_to_page_list: false,
-            page_nav: FsPageNav::None,
+            page_nav: FsPageNavRequest::default(),
             ctrl_nav: None,
             list_order_nav: None,
             sibling_nav: None,
@@ -37768,6 +37918,18 @@ impl App {
                         self.apply_fs_page_scroll_key(ctx, key_action);
                     }
                 }
+                for (key_action, next) in [
+                    (KeyAction::FsPageScrollOrTurnNext, true),
+                    (KeyAction::FsPageScrollOrTurnPrev, false),
+                ] {
+                    if let Some(input) = self.keymap.consume_action_press(ctx, key_action) {
+                        let request = self.fs_page_scroll_or_turn_key(ctx, next, input.kind);
+                        if !request.is_none() {
+                            action.page_nav = request;
+                            *navigation_operation = input.operation_id.map(ViewerOperationId::Key);
+                        }
+                    }
+                }
             }
         }
         let nav_next = if vertical_reading {
@@ -37793,7 +37955,7 @@ impl App {
         // 一部スキップしつつスライドショーを継続できる。フォルダをまたぐ Ctrl+↑↓ や
         // S / Space / Esc は従来どおり停止する。
         if nav_next && !ctrl_d {
-            action.page_nav = self.spread_page_nav(1);
+            action.page_nav = self.spread_page_nav(1).into();
             *navigation_operation = self.page_turn_consumed_key_operation(if arrow_down {
                 arrow_down_input
             } else if arrow_left {
@@ -37803,7 +37965,7 @@ impl App {
             });
         }
         if nav_prev && !ctrl_u {
-            action.page_nav = self.spread_page_nav(-1);
+            action.page_nav = self.spread_page_nav(-1).into();
             *navigation_operation = self.page_turn_consumed_key_operation(if arrow_up {
                 arrow_up_input
             } else if arrow_right {
@@ -37928,11 +38090,11 @@ impl App {
             action.sibling_nav = Some(sibling_nav_delta);
         }
         if page_next {
-            action.page_nav = self.spread_page_nav(1);
+            action.page_nav = self.spread_page_nav(1).into();
             *navigation_operation = self.page_turn_consumed_key_operation(page_next_input);
         }
         if page_prev {
-            action.page_nav = self.spread_page_nav(-1);
+            action.page_nav = self.spread_page_nav(-1).into();
             *navigation_operation = self.page_turn_consumed_key_operation(page_prev_input);
         }
         if fixed_jump_next || fixed_jump_prev {
@@ -39571,7 +39733,7 @@ impl App {
                             let proposed_pan = zoom_preserve_pivot(
                                 target_screen,
                                 image_rect.center(),
-                                self.fs_pan,
+                                self.fs_navigator_transform_pan(ctx, page.main),
                                 old_zoom,
                                 new_zoom,
                             ) + (image_rect.center() - target_screen);
@@ -39667,9 +39829,10 @@ impl App {
                             FsNavigatorGeometryIntent::Center { .. }
                         );
                         let transitioned = self.fs_navigator_adopt_manual_zoom(&layout, image_rect);
-                        let proposed_pan = page
-                            .main
-                            .pan_to_center_source_normalized(source_uv, self.fs_pan);
+                        let proposed_pan = page.main.pan_to_center_source_normalized(
+                            source_uv,
+                            self.fs_navigator_transform_pan(ctx, page.main),
+                        );
                         self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
                         interaction.gesture = FsNavigatorPointerGesture::Idle;
                         interaction.geometry = if transitioned || had_pending_center {
@@ -40070,9 +40233,10 @@ impl App {
                 .iter()
                 .find(|page| page.main.page_idx == page_idx)
         {
-            let proposed_pan = page
-                .main
-                .pan_to_center_source_normalized(source_uv, self.fs_pan);
+            let proposed_pan = page.main.pan_to_center_source_normalized(
+                source_uv,
+                self.fs_navigator_transform_pan(ctx, page.main),
+            );
             self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
             interaction.geometry = FsNavigatorGeometryIntent::None;
             if let FsNavigatorPointerGesture::AwaitingPan { start } = interaction.gesture {
@@ -40346,7 +40510,7 @@ impl App {
             overflow_pointer_input.clone(),
             &overflow_touch_excluded,
         );
-        (result.page_nav, result.close)
+        (result.page_nav.nav, result.close)
     }
 
     fn handle_fs_wheel_and_click_frame(
@@ -40382,7 +40546,7 @@ impl App {
                 .retain(|event| !matches!(event, FsNavigatorInputEvent::MouseWheel { .. }));
             navigator_frame_input.wheel_y = 0.0;
         }
-        let mut page_nav = FsPageNav::None;
+        let mut page_nav = FsPageNavRequest::default();
         // 同じ面の認識器を回す呼び出しが下に複数ある。接触の開始フレームを処理した
         // 呼び出しが所有者を決めるので、**全部で同じ値を使う**。
         let touch_tap_zones = self.fs_touch_tap_zones_enabled();
@@ -41235,7 +41399,7 @@ impl App {
                             left,
                             self.spread_mode.advances_right_to_left(),
                         );
-                        page_nav = self.spread_page_nav(base);
+                        page_nav = self.spread_page_nav(base).into();
                         *navigation_operation = self
                             .page_turn_pointer_navigation_operation(ctx, "touch")
                             .or_else(|| {
@@ -41560,11 +41724,18 @@ impl App {
                     FsWheelInPageClass::InPageScroll(delta) => {
                         delta.is_finite() && delta != egui::Vec2::ZERO
                     }
-                    FsWheelInPageClass::Legacy => wheel_y.abs() > 0.5,
+                    FsWheelInPageClass::ScrollThenPageTurn(delta) => {
+                        delta.is_finite() && delta.y != 0.0
+                    }
+                    FsWheelInPageClass::SettingZoom | FsWheelInPageClass::Legacy => {
+                        wheel_y.abs() > 0.5
+                    }
                 }
             } {
-                let scroll_origin = if matches!(class, FsWheelInPageClass::InPageScroll(_))
-                    && self.fs_scroll_layout_matches(ctx)
+                let scroll_origin = if matches!(
+                    class,
+                    FsWheelInPageClass::InPageScroll(_) | FsWheelInPageClass::ScrollThenPageTurn(_)
+                ) && self.fs_scroll_layout_matches(ctx)
                 {
                     self.fullscreen_page_layout.drawn_unit.clone()
                 } else {
@@ -41577,6 +41748,11 @@ impl App {
                         .page_turn_wheel_navigation_operation(ctx, segment.last_raw_ordinal),
                     class,
                     scroll_origin,
+                    page_owner: (
+                        self.items_generation,
+                        self.fullscreen_idx,
+                        self.fullscreen_page_slice,
+                    ),
                     seek_hover: cursor_in_seek_panel,
                 });
             }
@@ -41595,8 +41771,8 @@ impl App {
         );
         // Preserve the released wheel-before-click classification without mutating
         // a page which an intermediate navigation has already left.
-        let (click_zoom, click_pan) =
-            self.propose_fs_wheel_click_transform(ctx, default_image_rect, &accepted_wheel);
+        let (click_zoom, click_pan, wheel_navigation_produced) =
+            self.predict_fs_wheel_frame(ctx, default_image_rect, &accepted_wheel);
         let canvas_click = self.plan_fs_canvas_click(
             ctx,
             &fs_response,
@@ -41616,12 +41792,9 @@ impl App {
         if let FsCanvasClickAction::DepthFocusAt(pos) = canvas_click {
             self.plan_depth_focus_click(ctx, pos);
         }
-        let wheel_navigation_produced = accepted_wheel
-            .iter()
-            .any(|action| self.fs_wheel_action_requests_navigation(action));
         let close = secondary_action.closes_viewer(self);
         let pointer_nav = match canvas_click {
-            FsCanvasClickAction::PageSide(base) => self.spread_page_nav(base),
+            FsCanvasClickAction::PageSide(base) => self.spread_page_nav(base).into(),
             _ => page_nav,
         };
         let mixed_navigation = accepted_wheel.len() > 1 && wheel_navigation_produced;
@@ -41665,7 +41838,7 @@ impl App {
     }
 
     fn fs_wheel_action_requests_navigation(&self, action: &FsWheelAction) -> bool {
-        if matches!(action.class, FsWheelInPageClass::InPageScroll(_)) {
+        if !matches!(action.class, FsWheelInPageClass::Legacy) {
             return false;
         }
         if self.fs_exclusive_view.is_depth() {
@@ -41688,7 +41861,7 @@ impl App {
         if self.fs_zoom_mode_active() {
             return true;
         }
-        if should_zoom_fullscreen_wheel(ctrl, self.is_overlay_edit_mode_active()) {
+        if should_zoom_fullscreen_wheel(ctrl, self.is_overlay_edit_mode_active(), action.class) {
             return false;
         }
         let unmodified = !action.input.modifiers.shift && !ctrl && !action.input.modifiers.alt;
@@ -41745,9 +41918,14 @@ impl App {
                         FsWheelInPageClass::InPageScroll(_) => {
                             FsWheelInPageClass::InPageScroll(segment.input.delta)
                         }
+                        FsWheelInPageClass::ScrollThenPageTurn(_) => {
+                            FsWheelInPageClass::ScrollThenPageTurn(segment.input.delta)
+                        }
+                        FsWheelInPageClass::SettingZoom => FsWheelInPageClass::SettingZoom,
                         FsWheelInPageClass::Legacy => FsWheelInPageClass::Legacy,
                     },
                     scroll_origin: accepted.scroll_origin.clone(),
+                    page_owner: accepted.page_owner,
                     seek_hover: accepted.seek_hover,
                 })
             })
@@ -41832,6 +42010,7 @@ impl App {
             || secondary_action.executes_before_final_navigation()
             || matches!(canvas_click, FsCanvasClickAction::PageSide(_));
         let mut wheel_navigation_produced = false;
+        let mut page_scroll_moved = false;
         let mut wheel_actions = accepted_wheel.into_iter().peekable();
         while let Some(wheel_action) = wheel_actions.next() {
             let wheel = wheel_action.input;
@@ -41846,8 +42025,72 @@ impl App {
                         self.fs_wheel_segment_in_page_scroll(wheel, wheel_action.seek_hover)
                 {
                     let pan = self.fs_page_scroll_wheel_pan(ctx, self.fs_zoom, self.fs_pan, delta);
-                    self.write_fs_page_scroll_pan(pan);
+                    self.write_fs_page_scroll_pan_with_animation(
+                        ctx,
+                        pan,
+                        wheel.source != egui::MouseWheelSource::Trackpad,
+                    );
                 }
+                continue;
+            }
+            let scroll_turn_navigation =
+                if let FsWheelInPageClass::ScrollThenPageTurn(_) = wheel_action.class {
+                    if wheel_navigation_produced
+                        || suppress_wheel_navigation
+                        || wheel_action.page_owner
+                            != (
+                                self.items_generation,
+                                self.fullscreen_idx,
+                                self.fullscreen_page_slice,
+                            )
+                        || self.fs_context_menu_idx.is_some()
+                        || !matches!(
+                            self.fs_wheel_segment_in_page_scroll(wheel, wheel_action.seek_hover),
+                            FsWheelInPageClass::ScrollThenPageTurn(_)
+                        )
+                    {
+                        continue;
+                    }
+                    // Receipt absence is also an ingress fact. A newly published
+                    // thumbnail receipt must not reinterpret an admitted failure turn
+                    // as a scroll during delayed merge; spend that stale input only.
+                    if wheel_action.scroll_origin != self.fullscreen_page_layout.drawn_unit {
+                        continue;
+                    }
+                    match self.fs_page_scroll_or_turn_wheel(
+                        ctx,
+                        self.fs_zoom,
+                        self.fs_pan,
+                        wheel.delta,
+                        page_scroll_moved,
+                    ) {
+                        in_page_scroll::FsPageScrollOutcome::Move(pan) => {
+                            page_scroll_moved = true;
+                            self.write_fs_page_scroll_pan_with_animation(
+                                ctx,
+                                pan,
+                                wheel.source != egui::MouseWheelSource::Trackpad,
+                            );
+                            continue;
+                        }
+                        in_page_scroll::FsPageScrollOutcome::Blocked => continue,
+                        in_page_scroll::FsPageScrollOutcome::Turn => Some(FsPageNavRequest {
+                            nav: self.spread_page_nav(if wheel.delta.y < 0.0 { 1 } else { -1 }),
+                            landing: Some(if wheel.delta.y < 0.0 {
+                                FsPageLanding::Start
+                            } else {
+                                FsPageLanding::End
+                            }),
+                        }),
+                    }
+                } else {
+                    None
+                };
+            if wheel_action.class == FsWheelInPageClass::SettingZoom
+                && (self.fs_context_menu_idx.is_some()
+                    || self.fs_wheel_segment_in_page_scroll(wheel, wheel_action.seek_hover)
+                        != FsWheelInPageClass::SettingZoom)
+            {
                 continue;
             }
             let wheel_y = wheel.delta.y;
@@ -41885,8 +42128,10 @@ impl App {
                     self.fullscreen_media_rect_with_geometry(full_rect, idx, is_video, geometry)
                 })
                 .unwrap_or(default_image_rect);
-            let mut wheel_navigation = FsPageNav::None;
-            if self.fs_zoom_mode_aiming() || (self.fs_zoom_mode_active() && ctrl_held) {
+            let mut wheel_navigation = scroll_turn_navigation.unwrap_or_default();
+            if scroll_turn_navigation.is_some() {
+                // The shared page-local proposal already resolved this request.
+            } else if self.fs_zoom_mode_aiming() || (self.fs_zoom_mode_active() && ctrl_held) {
                 // ZipPla 準拠: 照準中 (Z 押下中) はホイールで枠サイズ=倍率。ズーム確定後は
                 // Ctrl+ホイールのときだけ倍率変更。
                 crate::modifier_probe::record_modified_action(ctx, "FsWheelZoom", "zoom_mode");
@@ -41894,7 +42139,7 @@ impl App {
             } else if self.fs_zoom_mode_active() {
                 // ZipPla 準拠: ズーム確定中の修飾なしホイールは通常どおり前後ページ移動。
                 let base = if wheel_y < 0.0 { 1 } else { -1 };
-                wheel_navigation = self.spread_page_nav(base);
+                wheel_navigation = self.spread_page_nav(base).into();
                 *navigation_operation = wheel_action.operation;
             } else if self.analysis_mode {
                 // 分析モード: ホイールでズーム
@@ -41922,7 +42167,11 @@ impl App {
                 let delta = self.continuous_reading_wheel_delta_px(default_image_rect, wheel_y);
                 self.scroll_vertical_reading_by(ctx, delta, crate::app::HistoryTrigger::UserChosen);
             } else {
-                if should_zoom_fullscreen_wheel(ctrl_held, self.is_overlay_edit_mode_active()) {
+                if should_zoom_fullscreen_wheel(
+                    ctrl_held,
+                    self.is_overlay_edit_mode_active(),
+                    wheel_action.class,
+                ) {
                     self.clear_fs_initial_placement_request();
                     // 通常モード: Ctrl+ホイールでズーム。
                     // 消しゴム / 隠蔽加工モード中は画像上の修飾なしホイールも
@@ -41964,7 +42213,7 @@ impl App {
                             crate::ring_shortcut::VideoNormalWheelResolvedAction::NavigateDelta(
                                 delta,
                             ),
-                        ) => wheel_navigation = self.spread_page_nav(delta),
+                        ) => wheel_navigation = self.spread_page_nav(delta).into(),
                         Some(crate::ring_shortcut::VideoNormalWheelResolvedAction::VolumeStep(
                             step,
                         )) => {
@@ -41987,7 +42236,7 @@ impl App {
                         }
                         None => {
                             let base = if wheel_y < 0.0 { 1 } else { -1 };
-                            wheel_navigation = self.spread_page_nav(base);
+                            wheel_navigation = self.spread_page_nav(base).into();
                             *navigation_operation = wheel_action.operation;
                         }
                     }
@@ -42013,7 +42262,7 @@ impl App {
                             wheel_action.operation,
                         );
                     }
-                    page_nav = FsPageNav::None;
+                    page_nav = FsPageNavRequest::default();
                 }
             }
         }
@@ -42146,7 +42395,7 @@ impl App {
                 self.fs_overflow_panel_state = FsOverflowPanelState::Closed;
             }
             FsCanvasClickAction::PageSide(base) => {
-                page_nav = self.spread_page_nav(base);
+                page_nav = self.spread_page_nav(base).into();
                 *navigation_operation = input.pointer_navigation_operation;
             }
         }
@@ -42178,7 +42427,7 @@ impl App {
                 // A live return can retain this page until main consumes it.
                 // It still ends this input owner's navigation, just like a
                 // completed viewer or replaced destination/items.
-                page_nav = FsPageNav::None;
+                page_nav = FsPageNavRequest::default();
                 *navigation_operation = None;
             }
         }
@@ -42200,21 +42449,45 @@ impl App {
         image_rect: egui::Rect,
         actions: &[FsWheelAction],
     ) -> (f32, egui::Vec2) {
+        let (zoom, pan, _) = self.predict_fs_wheel_frame(ctx, image_rect, actions);
+        (zoom, pan)
+    }
+
+    /// Ordered simulation is shared by click planning and delayed-merge admission.
+    /// The page-local step itself is the same pure proposal used at application.
+    fn predict_fs_wheel_frame(
+        &mut self,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        actions: &[FsWheelAction],
+    ) -> (f32, egui::Vec2, bool) {
         let mut zoom = self.fs_zoom;
         let mut pan = self.fs_pan;
+        let mut moved = false;
+        let mut navigation = false;
         let ordinary_zoom = !self.fs_zoom_mode_effective()
             && !self.analysis_mode
             && !self
                 .fullscreen_idx
                 .is_some_and(|idx| self.fs_exclusive_view_active(idx).is_some());
-        if ordinary_zoom {
-            let mouse = ctx.input(|input| input.pointer.hover_pos());
-            for action in actions {
-                if let FsWheelInPageClass::InPageScroll(delta) = action.class {
+        let has_local_scroll = actions.iter().any(|action| {
+            matches!(
+                action.class,
+                FsWheelInPageClass::InPageScroll(_) | FsWheelInPageClass::ScrollThenPageTurn(_)
+            )
+        });
+        let mouse = ctx.input(|input| input.pointer.hover_pos());
+        for action in actions {
+            match action.class {
+                FsWheelInPageClass::InPageScroll(delta) => {
                     if self.fs_context_menu_idx.is_none()
                         && action.scroll_origin.as_ref().is_some_and(|origin| {
                             self.fullscreen_page_layout.drawn_unit.as_ref() == Some(origin)
                         })
+                        && matches!(
+                            self.fs_wheel_segment_in_page_scroll(action.input, action.seek_hover),
+                            FsWheelInPageClass::InPageScroll(_)
+                        )
                     {
                         let next_pan = self.fs_page_scroll_wheel_pan(ctx, zoom, pan, delta);
                         if next_pan != pan {
@@ -42224,38 +42497,75 @@ impl App {
                     }
                     continue;
                 }
-                // Later page-local segments belong to the page we are leaving.
-                if actions
-                    .iter()
-                    .any(|action| matches!(action.class, FsWheelInPageClass::InPageScroll(_)))
-                    && self.fs_wheel_action_requests_navigation(action)
-                {
-                    break;
-                }
-                if action.input.modifiers.ctrl
-                    && self
-                        .fullscreen_idx
-                        .is_some_and(|idx| self.fs_music_view_active(idx))
-                {
+                FsWheelInPageClass::ScrollThenPageTurn(delta) => {
+                    if self.fs_context_menu_idx.is_some()
+                        || action.page_owner
+                            != (
+                                self.items_generation,
+                                self.fullscreen_idx,
+                                self.fullscreen_page_slice,
+                            )
+                        || action.scroll_origin != self.fullscreen_page_layout.drawn_unit
+                        || !matches!(
+                            self.fs_wheel_segment_in_page_scroll(action.input, action.seek_hover),
+                            FsWheelInPageClass::ScrollThenPageTurn(_)
+                        )
+                    {
+                        continue;
+                    }
+                    match self.fs_page_scroll_or_turn_wheel(ctx, zoom, pan, delta, moved) {
+                        in_page_scroll::FsPageScrollOutcome::Move(next_pan) => {
+                            moved = true;
+                            zoom = self.fs_page_scroll_drawn_zoom();
+                            pan = next_pan;
+                        }
+                        in_page_scroll::FsPageScrollOutcome::Turn => {
+                            navigation = true;
+                            break;
+                        }
+                        in_page_scroll::FsPageScrollOutcome::Blocked => {}
+                    }
                     continue;
                 }
-                if should_zoom_fullscreen_wheel(
-                    action.input.modifiers.ctrl,
-                    self.is_overlay_edit_mode_active(),
-                ) && Self::apply_wheel_zoom(
-                    &mut zoom,
-                    &mut pan,
-                    action.input.delta.y,
-                    mouse,
-                    image_rect.center(),
-                ) {
-                    pan = clamp_fullscreen_pan_from_layout(&self.fullscreen_page_layout, zoom, pan);
+                FsWheelInPageClass::SettingZoom => {
+                    if self.fs_context_menu_idx.is_some()
+                        || self.fs_wheel_segment_in_page_scroll(action.input, action.seek_hover)
+                            != FsWheelInPageClass::SettingZoom
+                    {
+                        continue;
+                    }
                 }
+                FsWheelInPageClass::Legacy => {}
+            }
+            let requests_navigation = self.fs_wheel_action_requests_navigation(action);
+            navigation |= requests_navigation;
+            if has_local_scroll && requests_navigation {
+                break;
+            }
+            if !ordinary_zoom
+                || (action.input.modifiers.ctrl
+                    && self
+                        .fullscreen_idx
+                        .is_some_and(|idx| self.fs_music_view_active(idx)))
+            {
+                continue;
+            }
+            if should_zoom_fullscreen_wheel(
+                action.input.modifiers.ctrl,
+                self.is_overlay_edit_mode_active(),
+                action.class,
+            ) && Self::apply_wheel_zoom(
+                &mut zoom,
+                &mut pan,
+                action.input.delta.y,
+                mouse,
+                image_rect.center(),
+            ) {
+                pan = clamp_fullscreen_pan_from_layout(&self.fullscreen_page_layout, zoom, pan);
             }
         }
-        (zoom, pan)
+        (zoom, pan, navigation)
     }
-
     fn plan_fs_canvas_click(
         &self,
         _ctx: &egui::Context,
@@ -43121,6 +43431,16 @@ impl App {
         target: usize,
         purpose: Option<crate::app::book_composition_permission::BookTargetPurpose>,
     ) -> Option<usize> {
+        self.admit_book_page_navigation_with_purpose_and_landing(ctx, target, purpose, None)
+    }
+
+    fn admit_book_page_navigation_with_purpose_and_landing(
+        &mut self,
+        ctx: &egui::Context,
+        target: usize,
+        purpose: Option<crate::app::book_composition_permission::BookTargetPurpose>,
+        landing: Option<FsPageLanding>,
+    ) -> Option<usize> {
         // Capture before polling: adopting a new projection can remap pages and
         // change their pairing while this request still owns its original unit.
         let navigation_origin = purpose.map(|_| self.capture_book_navigation_origin());
@@ -43129,11 +43449,12 @@ impl App {
         let purpose =
             purpose.unwrap_or_else(|| self.book_target_navigation_purpose(target, contract));
         let deferred = if let Some(navigation_origin) = navigation_origin {
-            self.defer_book_composition_wrapped_navigation(
+            self.defer_book_composition_wrapped_navigation_with_landing(
                 target,
                 contract,
                 purpose,
                 navigation_origin,
+                landing,
             )
         } else if self
             .fullscreen_idx
@@ -43141,12 +43462,13 @@ impl App {
         {
             self.defer_book_composition_continuous_seek(target, contract, purpose)
         } else {
-            self.defer_book_composition_navigation_open(
+            self.defer_book_composition_navigation_open_with_landing(
                 target,
                 crate::app::HistoryTrigger::UserChosen,
                 FsOpenMaterialization::Eager,
                 contract,
                 purpose,
+                landing,
             )
         };
         if deferred {
@@ -43163,23 +43485,38 @@ impl App {
         contract: crate::fs_page_load_scheduler::FsPageLoadContract,
         purpose: crate::app::book_composition_permission::BookTargetPurpose,
     ) {
+        self.complete_book_navigation_target_with_landing(
+            ctx, target, history, contract, purpose, None,
+        );
+    }
+
+    pub(crate) fn complete_book_navigation_target_with_landing(
+        &mut self,
+        ctx: &egui::Context,
+        target: usize,
+        history: crate::app::HistoryTrigger,
+        contract: crate::fs_page_load_scheduler::FsPageLoadContract,
+        purpose: crate::app::book_composition_permission::BookTargetPurpose,
+        landing: Option<FsPageLanding>,
+    ) {
         use crate::app::book_composition_permission::BookTargetPurpose;
         let Some(target) = self.poll_and_remap_book_target(ctx, target) else {
             return;
         };
         if purpose == BookTargetPurpose::Explicit {
             let mut perf = None;
-            self.open_fullscreen_from_fs_navigation_with_contract(
-                ctx, target, history, contract, &mut perf,
+            self.open_fullscreen_from_fs_navigation_with_contract_and_landing(
+                ctx, target, history, contract, &mut perf, landing,
             );
             return;
         }
-        if self.defer_book_composition_navigation_open(
+        if self.defer_book_composition_navigation_open_with_landing(
             target,
             history,
             FsOpenMaterialization::Eager,
             contract,
             purpose,
+            landing,
         ) {
             return;
         }
@@ -43190,7 +43527,9 @@ impl App {
             self.update_fs_page_turn_burst_after_navigation(ctx, current, Some(target));
         if self.begin_fs_page_navigation_sequence(ctx, current, target, accept_rendition) {
             let mut perf = None;
-            self.land_still_page_navigation_target(ctx, current, target, contract, &mut perf);
+            self.land_still_page_navigation_target_with_landing(
+                ctx, current, target, contract, &mut perf, landing,
+            );
         }
     }
 
@@ -43201,6 +43540,25 @@ impl App {
         history_trigger: crate::app::HistoryTrigger,
         load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
         fs_navigation_perf: &mut Option<FsNavigationPerfRecorder>,
+    ) {
+        self.open_fullscreen_from_fs_navigation_with_contract_and_landing(
+            ctx,
+            idx,
+            history_trigger,
+            load_contract,
+            fs_navigation_perf,
+            None,
+        );
+    }
+
+    pub(crate) fn open_fullscreen_from_fs_navigation_with_contract_and_landing(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        history_trigger: crate::app::HistoryTrigger,
+        load_contract: crate::fs_page_load_scheduler::FsPageLoadContract,
+        fs_navigation_perf: &mut Option<FsNavigationPerfRecorder>,
+        landing: Option<FsPageLanding>,
     ) {
         if self.remote_session_blocks_local_control() {
             crate::logger::log(
@@ -43216,12 +43574,13 @@ impl App {
         } else {
             self.book_target_navigation_purpose(idx, load_contract)
         };
-        if self.defer_book_composition_navigation_open(
+        if self.defer_book_composition_navigation_open_with_landing(
             idx,
             history_trigger,
             FsOpenMaterialization::Eager,
             load_contract,
             purpose,
+            landing,
         ) {
             ctx.request_repaint();
             return;
@@ -43354,12 +43713,13 @@ impl App {
             let open_fullscreen_perf = fs_navigation_perf
                 .as_mut()
                 .map(|perf| &mut perf.open_fullscreen);
-            self.open_fullscreen_with_materialization_and_contract(
+            self.open_fullscreen_with_materialization_and_contract_and_landing(
                 idx,
                 history_trigger,
                 FsOpenMaterialization::Eager,
                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
                 open_fullscreen_perf,
+                landing,
             );
             let restore_cursor_state_perf_t0 = start_fs_navigation_perf_span(fs_navigation_perf);
             self.restore_fullscreen_cursor_state(ctx, cursor_state);
@@ -43434,12 +43794,13 @@ impl App {
         let open_fullscreen_perf = fs_navigation_perf
             .as_mut()
             .map(|perf| &mut perf.open_fullscreen);
-        self.open_fullscreen_with_materialization_and_contract(
+        self.open_fullscreen_with_materialization_and_contract_and_landing(
             idx,
             history_trigger,
             materialization,
             load_contract,
             open_fullscreen_perf,
+            landing,
         );
         // `open_fullscreen` resets cursor idleness for a new fullscreen entry.
         // Fullscreen-internal navigation should keep the mouse cursor state continuous;
@@ -44271,7 +44632,7 @@ impl App {
         ctrl_nav: Option<i32>,
         sibling_nav: Option<i32>,
         mouse_nav: Option<crate::ui_main::AddressBarNav>,
-        page_nav: FsPageNav,
+        page_nav: impl Into<FsPageNavRequest>,
         jump_to: Option<usize>,
         fs_idx: usize,
     ) {
@@ -44301,7 +44662,7 @@ impl App {
         ctrl_nav: Option<i32>,
         sibling_nav: Option<i32>,
         mouse_nav: Option<crate::ui_main::AddressBarNav>,
-        page_nav: FsPageNav,
+        page_nav: impl Into<FsPageNavRequest>,
         jump_to: Option<usize>,
         fs_idx: usize,
         operation: Option<ViewerOperationId>,
@@ -44329,7 +44690,7 @@ impl App {
         ctrl_nav: Option<i32>,
         sibling_nav: Option<i32>,
         mouse_nav: Option<crate::ui_main::AddressBarNav>,
-        page_nav: FsPageNav,
+        page_nav: impl Into<FsPageNavRequest>,
         jump_to: Option<usize>,
         fs_idx: usize,
         list_order_nav: Option<bool>,
@@ -44343,7 +44704,7 @@ impl App {
             ctrl_nav,
             sibling_nav,
             mouse_nav,
-            page_nav,
+            page_nav.into(),
             jump_to,
             fs_idx,
             list_order_nav,
@@ -44361,7 +44722,7 @@ impl App {
         ctrl_nav: Option<i32>,
         sibling_nav: Option<i32>,
         mouse_nav: Option<crate::ui_main::AddressBarNav>,
-        page_nav: FsPageNav,
+        page_nav: FsPageNavRequest,
         jump_to: Option<usize>,
         fs_idx: usize,
         list_order_nav: Option<bool>,
@@ -44369,6 +44730,10 @@ impl App {
         slideshow_timer_pass: SlideshowTimerPass,
         fs_render_perf: &mut Option<FsRenderPerfRecorder>,
     ) {
+        let FsPageNavRequest {
+            nav: page_nav,
+            landing,
+        } = page_nav;
         // Own manual navigation and slideshow timers at their common boundary.
         // Accepted OS close reaches teardown; the independent modal owner is
         // protected earlier by accept_active_detached_window_close.
@@ -44651,12 +45016,13 @@ impl App {
             };
             if jump_to.is_none()
                 && let Some(delta) = collection_delta
-                && self.start_collection_manual_display_unit_navigation(
+                && self.start_collection_manual_display_unit_navigation_with_landing(
                     ctx,
                     fs_idx,
                     delta,
                     crate::app::ManualMediaNavigationLanding::Fullscreen,
                     self.manual_nav_wrap_enabled(),
+                    landing,
                 )
             {
                 self.page_turn_excluded_navigation_with_operation(
@@ -44723,13 +45089,15 @@ impl App {
                             "navigation_wrap",
                             operation,
                         );
-                        self.accept_fullscreen_page_slice_navigation(fs_idx, slice);
+                        self.accept_fullscreen_page_slice_navigation_with_landing(
+                            fs_idx, slice, landing,
+                        );
                         self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
                         self.fs_boundary_hint = None;
                         ctx.request_repaint();
                     }
                 } else if !self.fs_navigation_sequence_blocks_new_target()
-                    && let Some(new_idx) = self.admit_book_page_navigation_with_purpose(
+                    && let Some(new_idx) = self.admit_book_page_navigation_with_purpose_and_landing(
                         ctx,
                         target.idx,
                         Some(if target.forward {
@@ -44737,6 +45105,7 @@ impl App {
                         } else {
                             crate::app::book_composition_permission::BookTargetPurpose::Previous
                         }),
+                        landing,
                     )
                 {
                     let fs_idx = self.fullscreen_idx.unwrap_or(fs_idx);
@@ -44753,12 +45122,13 @@ impl App {
                             "navigation_wrap",
                             operation,
                         );
-                        self.land_still_page_navigation_target(
+                        self.land_still_page_navigation_target_with_landing(
                             ctx,
                             fs_idx,
                             new_idx,
                             crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
                             &mut fs_navigation_perf,
+                            landing,
                         );
                         if self.fullscreen_idx == Some(new_idx)
                             && let Some(slice) = target.slice
@@ -44778,11 +45148,19 @@ impl App {
                             operation,
                         );
                     }
-                    self.accept_fullscreen_page_slice_navigation(fs_idx, step.slice);
+                    self.accept_fullscreen_page_slice_navigation_with_landing(
+                        fs_idx, step.slice, landing,
+                    );
                     self.update_fs_page_turn_burst_after_navigation(ctx, fs_idx, None);
                     ctx.request_repaint();
                 } else if !self.fs_navigation_sequence_blocks_new_target()
-                    && let Some(source_idx) = self.admit_book_page_navigation(ctx, step.source_idx)
+                    && let Some(source_idx) = self
+                        .admit_book_page_navigation_with_purpose_and_landing(
+                            ctx,
+                            step.source_idx,
+                            None,
+                            landing,
+                        )
                 {
                     let fs_idx = self.fullscreen_idx.unwrap_or(fs_idx);
                     let step = crate::page_split::PresentationStep { source_idx, ..step };
@@ -44812,12 +45190,13 @@ impl App {
                             );
                         }
                         let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
-                        self.land_still_page_navigation_target(
+                        self.land_still_page_navigation_target_with_landing(
                             ctx,
                             fs_idx,
                             step.source_idx,
                             crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
                             &mut fs_navigation_perf,
+                            landing,
                         );
                         finish_fs_navigation_perf_span(
                             &mut fs_navigation_perf,
@@ -44859,7 +45238,10 @@ impl App {
                 } else {
                     let moved = new_idx != fs_idx;
                     if (!moved || !self.fs_navigation_sequence_blocks_new_target())
-                        && let Some(new_idx) = self.admit_book_page_navigation(ctx, new_idx)
+                        && let Some(new_idx) = self
+                            .admit_book_page_navigation_with_purpose_and_landing(
+                                ctx, new_idx, None, landing,
+                            )
                     {
                         let fs_idx = self.fullscreen_idx.unwrap_or(fs_idx);
                         let accept_rendition = self.update_fs_page_turn_burst_after_navigation(
@@ -44910,12 +45292,13 @@ impl App {
                                 }
                             }
                             let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
-                            self.land_still_page_navigation_target(
+                            self.land_still_page_navigation_target_with_landing(
                                 ctx,
                                 fs_idx,
                                 new_idx,
                                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
                                 &mut fs_navigation_perf,
+                                landing,
                             );
                             finish_fs_navigation_perf_span(
                                 &mut fs_navigation_perf,
@@ -44988,7 +45371,8 @@ impl App {
                     let new_idx = step.idx;
                     let moved = new_idx != fs_idx;
                     if (!moved || !self.fs_navigation_sequence_blocks_new_target())
-                        && let Some(new_idx) = self.admit_book_page_navigation_with_purpose(
+                        && let Some(new_idx) = self
+                            .admit_book_page_navigation_with_purpose_and_landing(
                             ctx,
                             new_idx,
                             step.wrapped.then_some(if nav_delta > 0 {
@@ -44996,6 +45380,7 @@ impl App {
                             } else {
                                 crate::app::book_composition_permission::BookTargetPurpose::Previous
                             }),
+                            landing,
                         )
                     {
                         let fs_idx = self.fullscreen_idx.unwrap_or(fs_idx);
@@ -45053,12 +45438,13 @@ impl App {
                                 }
                             }
                             let land_perf_t0 = start_fs_navigation_perf_span(&fs_navigation_perf);
-                            self.land_still_page_navigation_target(
+                            self.land_still_page_navigation_target_with_landing(
                                 ctx,
                                 fs_idx,
                                 new_idx,
                                 crate::fs_page_load_scheduler::FsPageLoadContract::Sequential,
                                 &mut fs_navigation_perf,
+                                landing,
                             );
                             finish_fs_navigation_perf_span(
                                 &mut fs_navigation_perf,
@@ -45615,7 +46001,14 @@ impl App {
         let mut fallback = (!is_video && tex.is_some())
             .then_some(thumb_resource.as_ref())
             .flatten();
-        let input_zoom_pan = zoom_pan;
+        let input_zoom_pan = if selected_current
+            && matches!(layout_source, FsPageLayoutSource::CurrentItem)
+            && self.fs_in_page_scroll_surface()
+        {
+            self.fs_page_scroll_paint_zoom_pan(ui.ctx(), zoom_pan)
+        } else {
+            zoom_pan
+        };
         let input_live_eligible = live_eligible;
         let mut selected_provisional = None;
         while let Some(resource) = display_tex.take() {
@@ -51685,7 +52078,16 @@ impl App {
                 [occurrence_for(left_idx), occurrence_for(right_idx)]
             });
         let mut zoom_pan = captured_placement.map_or_else(
-            || self.fs_zoom_pan(),
+            || {
+                if display_override.is_none()
+                    && selected_current
+                    && self.fs_in_page_scroll_surface()
+                {
+                    self.fs_page_scroll_paint_zoom_pan(ctx, self.fs_zoom_pan())
+                } else {
+                    self.fs_zoom_pan()
+                }
+            },
             |placement| match placement {
                 ResolvedDisplayPlacement::Normal { zoom_pan }
                 | ResolvedDisplayPlacement::SingletonSpread { zoom_pan, .. }
@@ -53253,7 +53655,7 @@ impl App {
         full_rect: egui::Rect,
         page_infos: &[FsTopBarPageInfo],
         close_fs: &mut bool,
-        page_nav: &mut FsPageNav,
+        page_nav: &mut FsPageNavRequest,
         side_panel_mode: crate::settings::FsSidePanelMode,
         side_panel_mode_pressed: &mut bool,
         side_panel_visible: bool,
@@ -53461,7 +53863,7 @@ impl App {
             }
         }
         if close_resp.hovered() {
-            *page_nav = FsPageNav::None;
+            *page_nav = FsPageNavRequest::default();
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
@@ -53482,7 +53884,7 @@ impl App {
                 *overflow_request = Some(FsOverflowOpenRequest::Root);
             }
             if overflow_resp.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -53510,7 +53912,7 @@ impl App {
                 *top_bar_lock_pressed = true;
             }
             if lock_resp.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -53544,7 +53946,7 @@ impl App {
                 *window_mode_pressed = true;
             }
             if wm_resp.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -53577,7 +53979,7 @@ impl App {
                 }
             }
             if camera_resp.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -53605,7 +54007,7 @@ impl App {
                 *vst3_pressed = true;
             }
             if vst_resp.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -53633,7 +54035,7 @@ impl App {
                 *tile_pressed = true;
             }
             if tile_resp.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
         } else {
             let play_resp = draw_bar_button(
@@ -53672,7 +54074,7 @@ impl App {
                 *slideshow_pressed = true;
             }
             if play_resp.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
 
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
@@ -53698,7 +54100,7 @@ impl App {
                 keymap.first_chord_bracket_label("左回転", KeyAction::FsRotateCcw)
             ));
             if rotate_resp.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
             let popup = crate::os_theme::dark_menu_popup(&rotate_resp);
             fs_close_menu_on_outside_press(&popup, &rotate_resp);
@@ -53753,7 +54155,7 @@ impl App {
                 *side_panel_mode_pressed = true;
             }
             if info_resp.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -53787,7 +54189,7 @@ impl App {
                 *panorama_projection_popup_open = !*panorama_projection_popup_open;
             }
             if proj_resp.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         } else if *panorama_projection_popup_open {
@@ -53967,7 +54369,7 @@ impl App {
                 *panorama_pressed = true;
             }
             if pano_resp.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -54006,7 +54408,7 @@ impl App {
                 **pressed = true;
             }
             if response.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
@@ -54075,7 +54477,7 @@ impl App {
                 *fit_popup_open = false;
             }
             if spread_resp.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
         } else if *spread_popup_open {
             // 動画モードに切り替わったときは popup を閉じる (表示モードは画像のみ)
@@ -54446,7 +54848,7 @@ impl App {
                 *spread_popup_open = false;
             }
             if mf_resp.hovered() {
-                *page_nav = FsPageNav::None;
+                *page_nav = FsPageNavRequest::default();
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         } else if *fit_popup_open {
@@ -54621,7 +55023,7 @@ impl App {
                     format!("{}\n{}", page.location_display, info_text)
                 };
                 if response.hovered() {
-                    *page_nav = FsPageNav::None;
+                    *page_nav = FsPageNavRequest::default();
                 }
                 let _ = response.hover_tip_dark(full_text);
             }
@@ -67121,7 +67523,7 @@ mod tests {
                         .show(root_ui, |ui| {
                             let keymap = Keymap::default();
                             let mut close = false;
-                            let mut page_nav = FsPageNav::None;
+                            let mut page_nav = FsPageNavRequest::default();
                             let mut side_panel_mode_pressed = false;
                             let mut overflow_request = None;
                             let slideshow_playing = false;
@@ -67370,7 +67772,7 @@ mod tests {
                         .show(root_ui, |ui| {
                             let keymap = Keymap::default();
                             let mut close = false;
-                            let mut page_nav = FsPageNav::None;
+                            let mut page_nav = FsPageNavRequest::default();
                             let mut side_panel_mode_pressed = false;
                             let mut overflow_request = None;
                             let slideshow_playing = false;
@@ -69597,7 +69999,7 @@ mod tests {
                 record_test_spread_layout(&mut app, first_previous_pair);
                 let mut first_action = FsKeyAction::default();
                 app.queue_spread_shift_action(2, dir, &mut first_action);
-                let FsPageNav::Target(first_target_idx) = first_action.page_nav else {
+                let FsPageNav::Target(first_target_idx) = first_action.page_nav.nav else {
                     panic!();
                 };
                 let first_target_pair = app.resolve_spread_pair(first_target_idx);
@@ -69655,7 +70057,7 @@ mod tests {
                 record_test_spread_layout(&mut app, first_target_pair);
                 let mut repeat_action = FsKeyAction::default();
                 app.queue_spread_shift_action(first_target_idx, dir, &mut repeat_action);
-                let FsPageNav::Target(repeat_target_idx) = repeat_action.page_nav else {
+                let FsPageNav::Target(repeat_target_idx) = repeat_action.page_nav.nav else {
                     panic!();
                 };
                 let repeat_target_pages =
@@ -92639,9 +93041,21 @@ mod tests {
 
     #[test]
     fn fullscreen_wheel_zoom_includes_overlay_edit_modes() {
-        assert!(should_zoom_fullscreen_wheel(true, false));
-        assert!(should_zoom_fullscreen_wheel(false, true));
-        assert!(!should_zoom_fullscreen_wheel(false, false));
+        assert!(should_zoom_fullscreen_wheel(
+            true,
+            false,
+            FsWheelInPageClass::Legacy
+        ));
+        assert!(should_zoom_fullscreen_wheel(
+            false,
+            true,
+            FsWheelInPageClass::Legacy
+        ));
+        assert!(!should_zoom_fullscreen_wheel(
+            false,
+            false,
+            FsWheelInPageClass::Legacy
+        ));
     }
 
     #[test]
@@ -95785,7 +96199,7 @@ mod specified_scale_consumer_tests {
                     .show(root_ui, |ui| {
                         let keymap = Keymap::default();
                         let mut close = false;
-                        let mut page_nav = FsPageNav::None;
+                        let mut page_nav = FsPageNavRequest::default();
                         let mut side_panel_mode_pressed = false;
                         let mut overflow_request = None;
                         let slideshow_playing = false;

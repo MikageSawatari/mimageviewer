@@ -212,7 +212,7 @@ fn menu_key_frame(key: egui::Key) -> (FsKeyAction, bool) {
         page_transition: Default::default(),
         close: false,
         close_to_page_list: false,
-        page_nav: FsPageNav::None,
+        page_nav: FsPageNavRequest::default(),
         ctrl_nav: None,
         list_order_nav: None,
         sibling_nav: None,

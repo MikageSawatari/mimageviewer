@@ -389,6 +389,8 @@ preferences_policy! {
         fullscreen_up_down_key_action: FullscreenUpDownKeyAction => ("閲覧表示の上下キー操作", |v, _raw| FullscreenUpDownKeyAction::all().contains(v), plain, plain);
         fullscreen_wheel_action: FullscreenWheelAction => ("閲覧表示の通常ホイール操作", |v, _raw| FullscreenWheelAction::all().contains(v), plain, plain);
         fullscreen_n_scroll_order: FullscreenNScrollOrder => ("ページ内スクロールの読み順", |v, _raw| FullscreenNScrollOrder::all().contains(v), plain, plain);
+        fullscreen_n_scroll_step_percent: u32 => ("N 字 / Z 字の移動量", |v, _raw| (10..=100).contains(v), plain, plain);
+        fullscreen_smooth_page_scroll: bool => ("ページ内のスクロールを滑らかに動かす", |_, _| true, plain, plain);
         fullscreen_page_number_overlay: bool => ("ページ番号を重ねて表示", |_, _| true, plain, plain);
         fullscreen_keep_on_app_switch: bool => ("アプリ切替時に閲覧表示を維持", |_, _| true, plain, plain);
         fullscreen_cursor_hide_delay_secs: f32 => ("閲覧表示のカーソルを隠す時間", |v, _raw| (FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS..=FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS).contains(v) && raw_range(_raw, FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS, FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS), plain, plain);
@@ -1438,6 +1440,13 @@ mod tests {
             &settings.fullscreen_n_scroll_order,
             FullscreenNScrollOrder::all(),
         );
+        settings.fullscreen_n_scroll_step_percent =
+            if settings.fullscreen_n_scroll_step_percent == 100 {
+                10
+            } else {
+                100
+            };
+        settings.fullscreen_smooth_page_scroll = !settings.fullscreen_smooth_page_scroll;
         settings.fullscreen_page_number_overlay = !settings.fullscreen_page_number_overlay;
         settings.fullscreen_keep_on_app_switch = !settings.fullscreen_keep_on_app_switch;
         settings.fullscreen_cursor_hide_delay_secs = if settings.fullscreen_cursor_hide_delay_secs
@@ -2366,13 +2375,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 504);
+        assert_eq!(entries.len(), 506);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            165
+            167
         );
         assert_eq!(
             entries
@@ -2408,7 +2417,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 163);
+        assert_eq!(wire.len(), 165);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -3484,6 +3493,11 @@ mod tests {
                 (FULLSCREEN_FIXED_JUMP_MAX).to_string().parse().unwrap(),
             ),
             (
+                "fullscreen_n_scroll_step_percent",
+                (10).to_string().parse().unwrap(),
+                (100).to_string().parse().unwrap(),
+            ),
+            (
                 "continuous_reading_wheel_scroll_percent",
                 (1).to_string().parse().unwrap(),
                 (100).to_string().parse().unwrap(),
@@ -3564,6 +3578,7 @@ mod tests {
                     | "fullscreen_fixed_bar_gap_px"
                     | "fullscreen_jump_percent"
                     | "fullscreen_fixed_jump_count"
+                    | "fullscreen_n_scroll_step_percent"
                     | "continuous_reading_wheel_scroll_percent"
                     | "continuous_reading_key_scroll_percent"
                     | "continuous_reading_gamepad_scroll_percent_per_sec"

@@ -17946,6 +17946,8 @@ pub struct App {
     pub(crate) fs_pan: egui::Vec2,
     pub(crate) fs_initial_placement_request:
         Option<crate::ui_fullscreen::FsInitialPlacementRequest>,
+    pub(crate) fs_page_scroll_animation:
+        Option<crate::ui_fullscreen::in_page_scroll::FsPageScrollAnimation>,
     pub(crate) fs_automatic_initial_view: Option<crate::ui_fullscreen::FsAutomaticInitialView>,
 
     // ── ZipPla 風 全画面ズームモード (Z キー、v2.0.0) ──────────────
@@ -21387,6 +21389,7 @@ impl App {
             fs_zoom: 1.0,
             fs_pan: egui::Vec2::ZERO,
             fs_initial_placement_request: None,
+            fs_page_scroll_animation: None,
             fs_automatic_initial_view: None,
             fs_zoom_active: false,
             fs_zoom_aiming: false,
@@ -72835,7 +72838,26 @@ impl App {
         load_contract: FsPageLoadContract,
         perf: Option<&mut FsOpenPerfRecorder>,
     ) {
-        self.open_fullscreen_with_metadata_boundary(
+        self.open_fullscreen_with_materialization_and_contract_and_landing(
+            idx,
+            history_trigger,
+            requested_materialization,
+            load_contract,
+            perf,
+            None,
+        );
+    }
+
+    pub(crate) fn open_fullscreen_with_materialization_and_contract_and_landing(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        requested_materialization: FsOpenMaterialization,
+        load_contract: FsPageLoadContract,
+        perf: Option<&mut FsOpenPerfRecorder>,
+        landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) {
+        self.open_fullscreen_with_metadata_boundary_and_adoption_and_landing(
             idx,
             history_trigger,
             requested_materialization,
@@ -72843,6 +72865,8 @@ impl App {
             perf,
             FsMetadataBoundary::Manual,
             None,
+            ViewerOpenAdoption::ContextContinuation,
+            landing,
         );
     }
 
@@ -72887,6 +72911,7 @@ impl App {
             boundary,
             resume_notice,
             ViewerOpenAdoption::ContextContinuation,
+            None,
         );
     }
 
@@ -72900,6 +72925,31 @@ impl App {
         boundary: FsMetadataBoundary,
         resume_notice: Option<BookResumeNotice>,
         viewer_adoption: ViewerOpenAdoption,
+    ) {
+        self.open_fullscreen_with_metadata_boundary_and_adoption_and_landing(
+            idx,
+            history_trigger,
+            requested_materialization,
+            load_contract,
+            perf,
+            boundary,
+            resume_notice,
+            viewer_adoption,
+            None,
+        );
+    }
+
+    fn open_fullscreen_with_metadata_boundary_and_adoption_and_landing(
+        &mut self,
+        idx: usize,
+        history_trigger: HistoryTrigger,
+        requested_materialization: FsOpenMaterialization,
+        load_contract: FsPageLoadContract,
+        perf: Option<&mut FsOpenPerfRecorder>,
+        boundary: FsMetadataBoundary,
+        resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: ViewerOpenAdoption,
+        landing: Option<crate::ui_fullscreen::FsPageLanding>,
     ) {
         #[cfg(windows)]
         let previous = (
@@ -72916,6 +72966,7 @@ impl App {
             boundary,
             resume_notice,
             viewer_adoption,
+            landing,
         );
         #[cfg(windows)]
         {
@@ -72943,6 +72994,7 @@ impl App {
         boundary: FsMetadataBoundary,
         resume_notice: Option<BookResumeNotice>,
         viewer_adoption: ViewerOpenAdoption,
+        landing: Option<crate::ui_fullscreen::FsPageLanding>,
     ) {
         if self.remote_session_blocks_local_control() {
             crate::logger::log("remote_ipc: rejected fullscreen open outside Local phase");
@@ -72959,7 +73011,7 @@ impl App {
         let Some(idx) = self.poll_and_remap_book_target(&composition_ctx, idx) else {
             return;
         };
-        if self.defer_book_composition_fullscreen_open_with_adoption(
+        if self.defer_book_composition_fullscreen_open_with_adoption_and_landing(
             idx,
             history_trigger,
             requested_materialization,
@@ -72968,10 +73020,11 @@ impl App {
             boundary,
             resume_notice.clone(),
             viewer_adoption,
+            landing,
         ) {
             return;
         }
-        if self.defer_sidecar_restore_fullscreen_with_adoption(
+        if self.defer_sidecar_restore_fullscreen_with_adoption_and_landing(
             idx,
             history_trigger,
             requested_materialization,
@@ -72979,6 +73032,7 @@ impl App {
             boundary,
             resume_notice.clone(),
             viewer_adoption,
+            landing,
         ) {
             return;
         }
@@ -73336,7 +73390,18 @@ impl App {
         self.fs_zoom = 1.0;
         self.fs_pan = egui::Vec2::ZERO;
         self.fs_automatic_initial_view = None;
-        self.request_fs_initial_placement(idx);
+        self.request_fs_initial_placement_with_kind(
+            idx,
+            match landing {
+                None => crate::ui_fullscreen::FsInitialPlacementKind::Setting,
+                Some(crate::ui_fullscreen::FsPageLanding::Start) => {
+                    crate::ui_fullscreen::FsInitialPlacementKind::LandingStart
+                }
+                Some(crate::ui_fullscreen::FsPageLanding::End) => {
+                    crate::ui_fullscreen::FsInitialPlacementKind::LandingEnd
+                }
+            },
+        );
         self.fs_pan_drag_start = None;
         self.fs_vertical_scroll = 0.0;
         self.continuous_reading_scroll_transition = None;
@@ -83531,6 +83596,7 @@ impl App {
     ) {
         retire_spread_step(&mut self.spread_step);
         self.clear_fs_initial_placement_request();
+        self.fs_page_scroll_animation = None;
         self.fs_automatic_initial_view = None;
         self.cancel_original_material_entry_intents(None);
         self.pending_fs_page_turn_ready = None;
@@ -100456,6 +100522,23 @@ impl App {
         landing: ManualMediaNavigationLanding,
         history_trigger: HistoryTrigger,
     ) {
+        self.open_manual_media_navigation_target_with_landing(
+            ctx,
+            idx,
+            landing,
+            history_trigger,
+            None,
+        );
+    }
+
+    fn open_manual_media_navigation_target_with_landing(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        landing: ManualMediaNavigationLanding,
+        history_trigger: HistoryTrigger,
+        page_landing: Option<crate::ui_fullscreen::FsPageLanding>,
+    ) {
         match landing {
             ManualMediaNavigationLanding::Fullscreen => {
                 #[cfg(windows)]
@@ -100471,7 +100554,14 @@ impl App {
                     );
                     return;
                 }
-                self.open_fullscreen_from_fs_navigation(ctx, idx, history_trigger);
+                self.open_fullscreen_from_fs_navigation_with_contract_and_landing(
+                    ctx,
+                    idx,
+                    history_trigger,
+                    FsPageLoadContract::Sequential,
+                    &mut None,
+                    page_landing,
+                );
             }
             #[cfg(windows)]
             ManualMediaNavigationLanding::NativeVideo => {

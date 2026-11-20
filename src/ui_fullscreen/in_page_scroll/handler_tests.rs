@@ -86,15 +86,28 @@ pub(super) fn paint(
     let idx = app.fullscreen_idx.unwrap();
     let viewport = app.fullscreen_media_rect(ctx.content_rect(), idx, false);
     let mut painted = None;
+    let mut decision = FsPageTurnDecision::normal();
     ui.scope_builder(egui::UiBuilder::new().max_rect(viewport), |ui| {
         // The page-turn fixture intentionally hardcodes Page/zoom=None for a
         // single page. Exercise the ordinary renderer with this test's live
         // fit, zoom, trim and rotation instead.
-        app.fs_page_turn_decision_for_frame(ctx, idx);
+        decision = app.fs_page_turn_decision_for_frame(ctx, idx);
+        // Ordinary rendering selects the ready target before painting it. That
+        // transition and the submitted receipt below jointly retire navigation.
+        assert!(
+            app.fs_nav_holdover_for_draw().is_none(),
+            "the current-material fixture must not paint an outgoing holdover"
+        );
         let composition = app.spread_display_composition_for_anchor(idx);
         let screen = composition.pages_in_screen_order(app.spread_mode);
         if let [page] = screen.as_slice() {
             let material = app.resolve_fs_processed_material(ctx, idx, false);
+            let thumbnail = if material.is_none() {
+                app.prepare_fullscreen_state(ctx, idx, FsPageTurnDecision::normal())
+                    .thumb_tex
+            } else {
+                None
+            };
             let payload = app.fullscreen_paint_payload_for_page(idx, material, false);
             let source_size = app.fs_page_coordinate_source_size(idx);
             let rotation = app.get_rotation(idx);
@@ -117,7 +130,7 @@ pub(super) fn paint(
                     None,
                     composition.singleton_placement(),
                     payload.as_ref(),
-                    None,
+                    thumbnail.as_ref(),
                     false,
                     false,
                     false,
@@ -147,6 +160,7 @@ pub(super) fn paint(
     });
     let (composition, sources) = painted.unwrap();
     app.record_fs_scroll_drawn_unit(ctx, viewport, &composition, &sources);
+    app.emit_fs_page_turn_ready_for_display_unit(ctx, &composition, decision, &sources);
     assert!(
         app.fullscreen_page_layout.drawn_unit.is_some(),
         "complete current paint records a receipt"
@@ -281,6 +295,11 @@ fn action(app: &App, input: crate::wheel_input::WheelInput, ordinal: u32) -> FsW
         operation: None,
         class: app.fs_wheel_segment_in_page_scroll(input, false),
         scroll_origin: app.fullscreen_page_layout.drawn_unit.clone(),
+        page_owner: (
+            app.items_generation,
+            app.fullscreen_idx,
+            app.fullscreen_page_slice,
+        ),
         seek_hover: false,
     }
 }

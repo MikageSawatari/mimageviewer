@@ -42911,7 +42911,7 @@ mod favorite_adjustment_defaults_tests {
 
             let mut action = crate::ui_fullscreen::FsKeyAction::default();
             app.queue_spread_shift_action(3, -1, &mut action);
-            let FsPageNav::Target(target) = action.page_nav else {
+            let FsPageNav::Target(target) = action.page_nav.nav else {
                 panic!("shift must produce a concrete landing target");
             };
             assert_eq!(target, 2);

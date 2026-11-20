@@ -962,7 +962,7 @@ fn child_key_and_wheel_navigation_start_and_complete_after_outer_root_acceptance
             } else {
                 let mut operation = None;
                 let action = app.handle_fs_key_input_with_operation(ctx, 0, false, &mut operation);
-                (action.page_nav, operation)
+                (action.page_nav.nav, operation)
             };
             assert!(!nav.is_none());
             let fact = app.page_turn_presentation.transaction.facts[0];

@@ -52,7 +52,7 @@ fn paint_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
             let nav = if pointer_nav.is_none() {
                 keys.page_nav
             } else {
-                pointer_nav
+                pointer_nav.into()
             };
             app.handle_fs_navigation(
                 ctx,

@@ -11089,7 +11089,13 @@ fn draw_fullscreen_wheel_action_setting(ui: &mut egui::Ui, value: &mut Fullscree
                 ui.selectable_value(value, action, action.label());
             }
         });
-    ui.small("ページ単位の表示で、画像が画面からはみ出す分だけ動かします。ページの端で止まり、次のページへは送りません。");
+    ui.small(match value.normalized() {
+        FullscreenWheelAction::PageTurn => "ページ単位の表示で、前または次のページへ送ります。",
+        FullscreenWheelAction::InPageScroll => "ページ単位の表示で、画像が画面からはみ出す分だけ動かします。ページの端で止まり、次のページへは送りません。",
+        FullscreenWheelAction::ScrollThenPageTurn => "読み順にスクロールし、端でもう一度回すと前または次のページへ送ります。",
+        FullscreenWheelAction::Zoom => "ページ単位の表示で、カーソル位置を基準に拡大・縮小します。シークバー上や Alt+ホイールはページ送りです。",
+        FullscreenWheelAction::Unknown => unreachable!(),
+    });
 }
 
 fn draw_fullscreen_n_scroll_order_setting(ui: &mut egui::Ui, value: &mut FullscreenNScrollOrder) {
@@ -11101,6 +11107,25 @@ fn draw_fullscreen_n_scroll_order_setting(ui: &mut egui::Ui, value: &mut Fullscr
             }
         });
     ui.small("ページ内を順に読み進める操作 (既定 K / J) の順序です。");
+}
+
+fn draw_fullscreen_smooth_page_scroll_setting(ui: &mut egui::Ui, value: &mut bool) {
+    ui.checkbox(value, "ページ内のスクロールを滑らかに動かす");
+    ui.small("ページ内を動かすキー・ホイールに適用します。タッチパッド、連結読み、ドラッグ、ズームには適用しません。");
+}
+
+fn draw_fullscreen_n_scroll_step_setting(ui: &mut egui::Ui, value: &mut u32) {
+    ui.horizontal(|ui| {
+        let label = ui.label("順に読む操作 (N 字 / Z 字) 1 回");
+        ui.add(
+            egui::DragValue::new(value)
+                .range(10..=100u32)
+                .speed(1)
+                .suffix(" %"),
+        )
+        .labelled_by(label.id);
+    });
+    ui.small("ページ内を順に読む操作だけに効きます。");
 }
 
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -11398,6 +11423,12 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/n-scroll-order", |ui, state| {
         draw_fullscreen_n_scroll_order_setting(ui, &mut state.settings.fullscreen_n_scroll_order);
     });
+    anchored(ui, state, "spread/smooth-page-scroll", |ui, state| {
+        draw_fullscreen_smooth_page_scroll_setting(
+            ui,
+            &mut state.settings.fullscreen_smooth_page_scroll,
+        );
+    });
     anchored(ui, state, "spread/top-bar", |ui, state| {
         let s = &mut state.settings;
         ui.checkbox(&mut s.fullscreen_top_bar_locked, "上部情報バーを固定表示");
@@ -11569,6 +11600,13 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
         });
     });
     ui.add_space(8.0);
+    anchored(ui, state, "spread/n-scroll-step", |ui, state| {
+        draw_fullscreen_n_scroll_step_setting(
+            ui,
+            &mut state.settings.fullscreen_n_scroll_step_percent,
+        );
+    });
+    ui.add_space(8.0);
     ui.label(egui::RichText::new("360 度ビュー").strong());
     anchored(ui, state, "spread/panorama-projection", |ui, state| {
         let s = &mut state.settings;
@@ -11596,18 +11634,30 @@ mod fullscreen_in_page_scroll_setting_tests {
         draw_fullscreen_up_down_key_action_setting(ui, &mut settings.fullscreen_up_down_key_action);
         draw_fullscreen_wheel_action_setting(ui, &mut settings.fullscreen_wheel_action);
         draw_fullscreen_n_scroll_order_setting(ui, &mut settings.fullscreen_n_scroll_order);
+        draw_fullscreen_smooth_page_scroll_setting(ui, &mut settings.fullscreen_smooth_page_scroll);
+        ui.add_space(8.0);
+        ui.label("スクロール量 (連結読み・ページ内スクロール)");
+        draw_fullscreen_n_scroll_step_setting(ui, &mut settings.fullscreen_n_scroll_step_percent);
     }
 
-    fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme, enabled: bool) {
+    fn snapshot(
+        name: &str,
+        theme: crate::os_theme::ResolvedTheme,
+        enabled: bool,
+        wheel: FullscreenWheelAction,
+    ) {
         let mut settings = Settings::default();
+        settings.fullscreen_wheel_action = wheel;
         if enabled {
             settings.fullscreen_up_down_key_action = FullscreenUpDownKeyAction::InPageScroll;
-            settings.fullscreen_wheel_action = FullscreenWheelAction::InPageScroll;
             settings.fullscreen_n_scroll_order = FullscreenNScrollOrder::HorizontalFirst;
+            settings.fullscreen_smooth_page_scroll = true;
+            settings.fullscreen_n_scroll_step_percent = 50;
         }
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
-            .with_size(egui::vec2(540.0, 220.0))
+            // Include the smooth-scroll and ordered-step rows without cropping.
+            .with_size(egui::vec2(540.0, 340.0))
             .build_ui(move |root_ui| {
                 crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
                     let ctx = &root_ui.ctx().clone();
@@ -11619,7 +11669,13 @@ mod fullscreen_in_page_scroll_setting_tests {
                         return;
                     }
                     egui::CentralPanel::default().show(root_ui, |ui| {
+                        let available_bottom = ui.max_rect().bottom();
                         draw(ui, &mut settings);
+                        assert!(
+                            ui.min_rect().bottom() <= available_bottom,
+                            "the scroll settings must fit the 540x340 snapshot fixture: content={:?}, available_bottom={available_bottom}",
+                            ui.min_rect(),
+                        );
                     });
                 });
             });
@@ -11633,6 +11689,7 @@ mod fullscreen_in_page_scroll_setting_tests {
             "fullscreen_in_page_scroll_settings_light_default",
             crate::os_theme::ResolvedTheme::Light,
             false,
+            FullscreenWheelAction::PageTurn,
         );
     }
 
@@ -11642,6 +11699,27 @@ mod fullscreen_in_page_scroll_setting_tests {
             "fullscreen_in_page_scroll_settings_dark_enabled",
             crate::os_theme::ResolvedTheme::Dark,
             true,
+            FullscreenWheelAction::InPageScroll,
+        );
+    }
+
+    #[test]
+    fn fullscreen_scroll_then_turn_settings_snapshot_light() {
+        snapshot(
+            "fullscreen_scroll_then_turn_settings_light",
+            crate::os_theme::ResolvedTheme::Light,
+            true,
+            FullscreenWheelAction::ScrollThenPageTurn,
+        );
+    }
+
+    #[test]
+    fn fullscreen_wheel_zoom_settings_snapshot_dark() {
+        snapshot(
+            "fullscreen_wheel_zoom_settings_dark",
+            crate::os_theme::ResolvedTheme::Dark,
+            true,
+            FullscreenWheelAction::Zoom,
         );
     }
 
@@ -11650,7 +11728,7 @@ mod fullscreen_in_page_scroll_setting_tests {
         use egui_kittest::kittest::Queryable;
 
         let mut harness = crate::test_ui::builder()
-            .with_size(egui::vec2(540.0, 260.0))
+            .with_size(egui::vec2(540.0, 340.0))
             .build_ui_state(
                 |root_ui, (settings, fonts_ready)| {
                     let ctx = &root_ui.ctx().clone();
