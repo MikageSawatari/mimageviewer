@@ -88,79 +88,91 @@ fn assert_corner(app: &App, landing: FsPageLanding, direction: ReadingDirection)
     }
 }
 
-#[test]
-fn manual_navigation_lands_at_the_reading_corner_for_every_unit_and_order() {
-    for mode in [
-        SpreadMode::Single,
-        SpreadMode::Ltr,
-        SpreadMode::Rtl,
-        SpreadMode::SplitLtr,
-        SpreadMode::SplitRtl,
-    ] {
-        for book_direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
-            for order in [
-                FullscreenNScrollOrder::VerticalFirst,
-                FullscreenNScrollOrder::HorizontalFirst,
-            ] {
-                for landing in [FsPageLanding::Start, FsPageLanding::End] {
-                    for overflow in [0, 1, 2] {
-                        let ctx = egui::Context::default();
-                        let width = if overflow == 0 { 240 } else { 900 };
-                        let height = if overflow == 1 { 200 } else { 800 };
-                        let mut app = material_app(
-                            &ctx,
-                            mode,
-                            [width * if mode.is_split() { 2 } else { 1 }, height],
-                        );
-                        app.reading_direction = book_direction;
-                        app.settings.fullscreen_n_scroll_order = order;
-                        let nav = if mode.is_split() {
-                            FsPageNav::Split(crate::page_split::PresentationStep {
-                                source_idx: 2,
-                                slice: crate::page_split::SplitDirection::from_spread_mode(mode)
-                                    .unwrap()
-                                    .second(),
-                            })
-                        } else {
-                            FsPageNav::Target(2)
-                        };
-                        navigate(&mut app, &ctx, nav, Some(landing));
-                        assert_eq!(app.fullscreen_idx, Some(2));
-                        assert_eq!(
-                            app.fs_initial_placement_request.unwrap().kind,
-                            landing.initial_placement_kind()
-                        );
-                        frame(&ctx, vec![], |ui, ctx| {
-                            paint(&mut app, ui, ctx);
-                        });
-                        let unit = painted_unit(&app);
-                        assert_eq!(
-                            unit.width() > full_rect().width(),
-                            overflow != 0,
-                            "{mode:?} {overflow}"
-                        );
-                        assert_eq!(
-                            unit.height() > full_rect().height(),
-                            overflow != 1,
-                            "{mode:?} {overflow}"
-                        );
-                        assert_corner(
-                            &app,
-                            landing,
-                            mode.reading_direction().unwrap_or(book_direction),
-                        );
-                        assert_eq!(app.fs_zoom, 1.0);
-                        assert!(app.fs_initial_placement_request.is_none());
-                        assert!(!app.fs_view_has_moved(
-                            app.fs_zoom,
-                            app.fs_pan,
-                            app.fs_free_rotation
-                        ));
-                    }
+fn assert_manual_navigation_lands_at_the_reading_corner(mode: SpreadMode) {
+    for book_direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+        for order in [
+            FullscreenNScrollOrder::VerticalFirst,
+            FullscreenNScrollOrder::HorizontalFirst,
+        ] {
+            for landing in [FsPageLanding::Start, FsPageLanding::End] {
+                for overflow in [0, 1, 2] {
+                    let ctx = egui::Context::default();
+                    let width = if overflow == 0 { 240 } else { 900 };
+                    let height = if overflow == 1 { 200 } else { 800 };
+                    let mut app = material_app(
+                        &ctx,
+                        mode,
+                        [width * if mode.is_split() { 2 } else { 1 }, height],
+                    );
+                    app.reading_direction = book_direction;
+                    app.settings.fullscreen_n_scroll_order = order;
+                    let nav = if mode.is_split() {
+                        FsPageNav::Split(crate::page_split::PresentationStep {
+                            source_idx: 2,
+                            slice: crate::page_split::SplitDirection::from_spread_mode(mode)
+                                .unwrap()
+                                .second(),
+                        })
+                    } else {
+                        FsPageNav::Target(2)
+                    };
+                    navigate(&mut app, &ctx, nav, Some(landing));
+                    assert_eq!(app.fullscreen_idx, Some(2));
+                    assert_eq!(
+                        app.fs_initial_placement_request.unwrap().kind,
+                        landing.initial_placement_kind()
+                    );
+                    frame(&ctx, vec![], |ui, ctx| {
+                        paint(&mut app, ui, ctx);
+                    });
+                    let unit = painted_unit(&app);
+                    assert_eq!(
+                        unit.width() > full_rect().width(),
+                        overflow != 0,
+                        "{mode:?} {overflow}"
+                    );
+                    assert_eq!(
+                        unit.height() > full_rect().height(),
+                        overflow != 1,
+                        "{mode:?} {overflow}"
+                    );
+                    assert_corner(
+                        &app,
+                        landing,
+                        mode.reading_direction().unwrap_or(book_direction),
+                    );
+                    assert_eq!(app.fs_zoom, 1.0);
+                    assert!(app.fs_initial_placement_request.is_none());
+                    assert!(!app.fs_view_has_moved(app.fs_zoom, app.fs_pan, app.fs_free_rotation));
                 }
             }
         }
     }
+}
+
+#[test]
+fn manual_navigation_lands_at_the_reading_corner_single() {
+    assert_manual_navigation_lands_at_the_reading_corner(SpreadMode::Single);
+}
+
+#[test]
+fn manual_navigation_lands_at_the_reading_corner_ltr() {
+    assert_manual_navigation_lands_at_the_reading_corner(SpreadMode::Ltr);
+}
+
+#[test]
+fn manual_navigation_lands_at_the_reading_corner_rtl() {
+    assert_manual_navigation_lands_at_the_reading_corner(SpreadMode::Rtl);
+}
+
+#[test]
+fn manual_navigation_lands_at_the_reading_corner_split_ltr() {
+    assert_manual_navigation_lands_at_the_reading_corner(SpreadMode::SplitLtr);
+}
+
+#[test]
+fn manual_navigation_lands_at_the_reading_corner_split_rtl() {
+    assert_manual_navigation_lands_at_the_reading_corner(SpreadMode::SplitRtl);
 }
 
 #[test]

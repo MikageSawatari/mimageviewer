@@ -1,7 +1,7 @@
 # スクロール＋ページ送り・ホイールのズーム・N 字 / Z 字の移動量・滑らかな移動 (§1.823〜§1.826)
 
-- 状態: **設計 r3 (2026-11-20)・独立設計レビュー r3 で ACCEPT・独立実装レビュー r4 の連続入力中の停止を修正、再検証・再レビュー待ち**。ブランチ `scroll-823-826`。
-- §4.5と§4.4.1の6bに従って着地配送・ホイール・補間を接続した。r3で補間の時刻読取を配送先の描画passへ集約し、r4では開始済みの目標差し替えに最後の実描画panと時刻を引き継ぎ、毎frame入力中も表示を進めるよう修正した。実装担当はコンパイル・テスト・snapshotのPNG生成・製品起動を行っていない。設計担当からの検証結果、停止時の履歴と最新の実装記録は末尾を参照。
+- 状態: **独立実装レビュー r5 ACCEPT・関連1559件すべて成功（設計担当報告）。着地総当たりテストの5分割後は未実行**。ブランチ `scroll-823-826`。
+- §4.5と§4.4.1の6bに従って着地配送・ホイール・補間を接続し、実装レビュー r1〜r4 の指摘を修正した。r5のP3は、描画が0.2秒以上途切れた後の再入力が瞬時の移動になることを、最終位置・状態は正しいとして記録で閉じた。実装担当はコンパイル・テスト・snapshotのPNG生成・製品起動を行っていない。レビュー経緯と検証結果、テスト分割の記録は末尾を参照。
 - 要望: 5ch >>826〜829 (2026-11-20)。利用者決定 (2026-11-20) は [バックログ](next-release-backlog.md) の各項目の状態欄。
 - 前提の設計: [ページ内スクロールと N 字スクロール (§1.474)](fullscreen-in-page-scroll-plan.md)。v5.4.0 で出荷済み。
   本書はその仕組み (描いた表示単位の印・入力時の照合・候補 → clamp → 進んだときだけ書く) をそのまま使い、足す分だけを書く。
@@ -415,6 +415,8 @@ P1 / P2 なし。P3 3 件を反映した: 再標本化の frame 数はリフレ�
 
 ## 11. 実装記録
 
+以下の件数・実行状況は各時点の記録。着地総当たりテストの名前は現在の5分割後へ更新したが、当時の件数では1本として数えている。
+
 ### 2026-11-20: 前提矛盾により停止（未完成・未検証）
 
 利用者指示に従い、コンパイルを伴うコマンド・テスト・ビルド・アプリ起動・コミット・ブランチ操作は実施していない。
@@ -568,7 +570,11 @@ field追加だけでは補えない。コレクションの既存経路をバイ
   - `default_real_wheel_still_turns_pages_without_starting_zoom_or_animation`
 
 - landing_tests:
-  - `manual_navigation_lands_at_the_reading_corner_for_every_unit_and_order`
+  - `manual_navigation_lands_at_the_reading_corner_single`
+  - `manual_navigation_lands_at_the_reading_corner_ltr`
+  - `manual_navigation_lands_at_the_reading_corner_rtl`
+  - `manual_navigation_lands_at_the_reading_corner_split_ltr`
+  - `manual_navigation_lands_at_the_reading_corner_split_rtl`
   - `same_image_split_landing_preserves_zoom_and_the_fitting_axis`
 
 Snapshot追加: `fullscreen_scroll_then_turn_settings_snapshot_light` / `fullscreen_wheel_zoom_settings_snapshot_dark`。既存 `fullscreen_in_page_scroll_settings_snapshot_light_default` / `fullscreen_in_page_scroll_settings_snapshot_dark_enabled` を拡張。
@@ -701,7 +707,11 @@ Snapshot追加: `fullscreen_scroll_then_turn_settings_snapshot_light` / `fullscr
   - `setting_zoom_media_items_stay_outside_the_ordinary_image_classifier`
 
 - landing_tests:
-  - `manual_navigation_lands_at_the_reading_corner_for_every_unit_and_order`
+  - `manual_navigation_lands_at_the_reading_corner_single`
+  - `manual_navigation_lands_at_the_reading_corner_ltr`
+  - `manual_navigation_lands_at_the_reading_corner_rtl`
+  - `manual_navigation_lands_at_the_reading_corner_split_ltr`
+  - `manual_navigation_lands_at_the_reading_corner_split_rtl`
   - `same_image_split_landing_preserves_zoom_and_the_fitting_axis`
   - `landing_kind_survives_provisional_material_and_center_setting_until_full_arrival`
   - `changing_global_start_position_retires_only_setting_requests`
@@ -831,7 +841,7 @@ PNG生成・目視は設計担当が行う。残り5件は製品コードと照�
 
 | テスト | 判断の根拠と修正 |
 | --- | --- |
-| `manual_navigation_lands_at_the_reading_corner_for_every_unit_and_order` | 実描画fixtureがReady→Presentingの選択と実receiptの完了通知を省略し、描画後もnavigation sequenceが残った。`handler_tests::paint` から通常の `fs_nav_holdover_for_draw` と `emit_fs_page_turn_ready_for_display_unit` を呼ぶ。描画印・入力幾何・barrierの照合assertは維持。 |
+| `manual_navigation_lands_at_the_reading_corner_single` / `manual_navigation_lands_at_the_reading_corner_ltr` / `manual_navigation_lands_at_the_reading_corner_rtl` / `manual_navigation_lands_at_the_reading_corner_split_ltr` / `manual_navigation_lands_at_the_reading_corner_split_rtl`（分割前は1本） | 実描画fixtureがReady→Presentingの選択と実receiptの完了通知を省略し、描画後もnavigation sequenceが残った。`handler_tests::paint` から通常の `fs_nav_holdover_for_draw` と `emit_fs_page_turn_ready_for_display_unit` を呼ぶ。描画印・入力幾何・barrierの照合assertは維持。 |
 | `scroll_turn_boundaries_and_wrap_use_the_existing_units_and_directional_arrival` | Singleのrouterは端でもDeltaを返し、境界／wrapを後段handlerで解決する。SingleはDelta、見開き・splitは従来のBoundary／Wrapを厳密比較し、routerとの全値比較・最終到着idx／slice／角の検証も維持。 |
 | `consumed_scroll_action_respects_keyboard_ownership_before_consuming` | 直接keymapの既存S3互換gateはModalを遮断せず、App外側がmodalを扱う。直接keymapを遮断するFocusedUiをfixtureへ指定し、未消費→ApplicationShortcutへの所有移行→1回消費を検証。 |
 | `real_scroll_turn_key_consumes_repeat_but_never_turns_until_a_fresh_press` | 初回tapでrelease済みなのにrepeat=trueだけを送っていた。eguiはheld-key集合からrepeatを再計算するためInitialPressになっていた。press-onlyでheldを維持し、実際の正規化後repeat、消費のみ・pan／idx不変、release後の新Pressで着地付き送りを検証。 |
@@ -989,3 +999,40 @@ LoadFailedの例外も同じallow_turnの門を通る。Repeatでページを送
   detachedの述語・viewportの配送・HWND・context swapの入口・repaint回数は変更していない。開始時のsnapshot PNG4件は維持した。
 - **検証の限界**: read-onlyの独立静的レビューで、pan/timeの記録条件、開始の継承、入力側の時計参照禁止、context所有と連続入力回帰を確認した。
   実装担当はコンパイル・テスト・check・nextest・製品起動・コミットを行っておらず、修正後の実行結果と実機挙動は設計担当の検証待ち。
+
+### 独立実装レビュー r1〜r5の経緯と受入結果
+
+| 回 | 結果・指摘と対応 | 修正コミット |
+| --- | --- | --- |
+| r1 | REVISE。P1: 補間の退役判定を前frameの描画印の消去前へ移動。P3: 旧版で設定を保存した場合の選択値の書戻し説明を訂正。 | `b64bad909` |
+| r2 | REVISE。P2: ROOT配送時に配送先の古い時刻を使う不具合を、共有clockの現在passの時刻へ変更。その後r3で方式を置換。 | `be8d881a8` |
+| r3 | REVISE。P2: 子の描画後に古いROOTへ戻る遅延適用を受け、時刻の読取を配送先の描画passだけへ限定し、最後の実描画panから再設定。 | `2a5c88b5f` |
+| r4 | REVISE。P2: 毎frame入力でphase 0へ戻る停止を、最後の実描画panと時刻の対を引き継ぐ形へ修正。 | `a6d87842f` |
+| r5 | ACCEPT。P3は下記のとおり記録で閉じ、追加の製品修正はしない。 | 記録のみ |
+
+r5 P3: 補間の途中で描画が0.2秒以上途切れた後に再入力すると、瞬時の移動になる。
+最終位置と状態は正しいため、利用者・設計担当の決定により記録で閉じる。猶予・retry等の製品変更は追加しない。
+関連1559テストすべて成功は設計担当のrun-heavy実行結果の報告であり、実装担当による実行ではない。
+
+### 着地総当たりテストをSpreadMode別の5本へ分割
+
+設計担当の報告では、分割前の1本が148秒かかった。lib全件の負荷下でnextestの打ち切りへ達するリスクを減らすため、
+最外のSpreadModeだけを各テストへ切り出し、共通本体を `assert_manual_navigation_lands_at_the_reading_corner(mode)` にした。
+
+- `manual_navigation_lands_at_the_reading_corner_single`
+- `manual_navigation_lands_at_the_reading_corner_ltr`
+- `manual_navigation_lands_at_the_reading_corner_rtl`
+- `manual_navigation_lands_at_the_reading_corner_split_ltr`
+- `manual_navigation_lands_at_the_reading_corner_split_rtl`
+
+各24通り（本の向き2 × 読み順2 × 着地2 × はみ出し3）、合計120通りを維持する。
+App生成・素材寸法・navigation・描画・assertの本体は変えず、fixtureの共有化や検査の削減はしていない。
+本書の既存テスト名の記載も5本へ更新した。分割後の所要時間・実行結果は未確認。
+
+同種の長時間化候補（ソース確認のみ・未計測、今回は分割しない）:
+
+- `landing_tests::scroll_turn_boundaries_and_wrap_use_the_existing_units_and_directional_arrival`
+
+変更ファイルは `src/ui_fullscreen/in_page_scroll/landing_tests.rs` と本書のみ。製品コードは変更していない。
+開始時に存在したsnapshot PNG4件（うち2件はステージ済み）は維持した。
+実装担当はコンパイル・テスト・check・nextest・製品起動・コミットを行っていない。
