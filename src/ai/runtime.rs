@@ -247,6 +247,27 @@ impl AiRuntimeInitOwner {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_dormant_for_test(&self, message: &str) {
+        let mut state = self.state.lock().unwrap();
+        assert!(
+            matches!(*state, AiRuntimeInitState::Dormant),
+            "App fixture policy must be applied before AI runtime initialization"
+        );
+        *state = AiRuntimeInitState::Failed(Arc::new(AiError::Ort(message.to_owned())));
+        drop(state);
+        self.changed.notify_all();
+    }
+
+    /// Exercise fixture teardown without loading native DLLs or models.
+    #[cfg(test)]
+    pub(crate) fn start_for_test(
+        self: &Arc<Self>,
+        initialize: impl FnOnce() -> Result<AiRuntime, AiError> + Send + 'static,
+    ) -> bool {
+        self.start_with("ai-runtime-fixture-test", initialize, || {})
+    }
+
+    #[cfg(test)]
     pub(crate) fn failed_for_test(message: &str) -> Arc<Self> {
         let owner = Self::new();
         *owner.state.lock().unwrap() =

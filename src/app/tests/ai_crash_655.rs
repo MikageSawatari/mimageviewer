@@ -157,7 +157,11 @@ fn ai_crash_655_headless_zip_navigation() {
         .parse()
         .unwrap();
     assert!((32..=1536).contains(&width));
-    let mut env = phase_c_support::setup_app();
+    let mut env = phase_c_support::setup_app_with_ai_runtime(if case == "off" {
+        AiRuntimeFixture::NotStarted
+    } else {
+        AiRuntimeFixture::Start
+    });
     assert_eq!(crate::data_dir::get(), env.tmp.path());
     #[cfg(windows)]
     unsafe {

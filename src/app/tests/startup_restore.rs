@@ -96,7 +96,7 @@ fn restart_previous(env: &mut phase_c_support::AppTestEnv) {
 fn restart_previous_from_saved_settings(env: &mut phase_c_support::AppTestEnv) {
     // Keep AppTestEnv's data-dir guard alive across App::drop and replacement.
     let saved = crate::settings::Settings::load();
-    env.app = App::new_from_settings(saved);
+    env.replace_app_from_settings(saved, AiRuntimeFixture::NotStarted);
     env.open_default_startup_target();
     settle_book(env);
     let ctx = egui::Context::default();
@@ -1763,7 +1763,9 @@ fn section1335_first_app_startup_migrates_missing_record_and_second_startup_keep
                 }),
             })
         );
-        env.app = App::new_from_settings(first_load);
+        env.app = env
+            .ai_runtime_cleanup
+            .app_from_settings_after_drop(first_load, AiRuntimeFixture::NotStarted);
         // There was no preceding explicit load in this App lifetime.
         env.open_default_startup_target();
         settle_book(&mut env);
@@ -1783,7 +1785,9 @@ fn section1335_first_app_startup_migrates_missing_record_and_second_startup_keep
             second_load.startup_list_restore, adopted,
             "the released compatibility path cannot remigrate over the new list owner"
         );
-        env.app = App::new_from_settings(second_load);
+        env.app = env
+            .ai_runtime_cleanup
+            .app_from_settings_after_drop(second_load, AiRuntimeFixture::NotStarted);
         env.open_default_startup_target();
         settle_book(&mut env);
         assert_eq!(env.current_folder.as_ref(), Some(&legacy_path));
@@ -1866,7 +1870,10 @@ fn section1335_previous_zip_missing_or_recapsed_prefix_rejects_old_same_name_cur
         } else {
             write_zip(&book, &["a.png", "b.png"]);
         }
-        env.app = App::new_from_settings(crate::settings::Settings::load());
+        env.app = env.ai_runtime_cleanup.app_from_settings_after_drop(
+            crate::settings::Settings::load(),
+            AiRuntimeFixture::NotStarted,
+        );
         env.open_default_startup_target();
         settle_book(&mut env);
         let prefix = if collapse_changed {
@@ -2186,7 +2193,7 @@ fn section1335_departing_same_items_page_open_captures_list_cursor_before_page_n
         env.on_exit_inner();
         let saved = crate::settings::Settings::load();
         assert_eq!(saved.startup_list_restore, departure);
-        env.app = App::new_from_settings(saved);
+        env.replace_app_from_settings(saved, AiRuntimeFixture::NotStarted);
         env.open_default_startup_target();
         settle_book(&mut env);
         assert_eq!(env.current_folder.as_ref(), Some(&target));
@@ -2315,7 +2322,9 @@ fn section1335_synthetic_install_captures_changed_physical_departure_without_man
         drop(env.app);
         let saved = crate::settings::Settings::load();
         assert_eq!(saved.startup_list_restore, expected);
-        env.app = App::new_from_settings(saved);
+        env.app = env
+            .ai_runtime_cleanup
+            .app_from_settings_after_drop(saved, AiRuntimeFixture::NotStarted);
         env.open_default_startup_target();
         settle_book(&mut env);
         assert_eq!(env.current_folder.as_ref(), Some(&folder));
@@ -2346,7 +2355,10 @@ fn section1335_startup_cursor_rows_survive_grid_page_acceptance_before_first_scr
     env.settings.startup_list_restore = expected.clone();
     env.settings.save();
     drop(env.app);
-    env.app = App::new_from_settings(crate::settings::Settings::load());
+    env.app = env.ai_runtime_cleanup.app_from_settings_after_drop(
+        crate::settings::Settings::load(),
+        AiRuntimeFixture::NotStarted,
+    );
     env.open_default_startup_target();
     settle_book(&mut env);
     assert_eq!(env.items[env.selected.unwrap()].name(), names[12]);
@@ -2365,7 +2377,9 @@ fn section1335_startup_cursor_rows_survive_grid_page_acceptance_before_first_scr
     drop(env.app);
     let saved = crate::settings::Settings::load();
     assert_eq!(saved.startup_list_restore, expected);
-    env.app = App::new_from_settings(saved);
+    env.app = env
+        .ai_runtime_cleanup
+        .app_from_settings_after_drop(saved, AiRuntimeFixture::NotStarted);
     env.open_default_startup_target();
     settle_book(&mut env);
     assert!(env.fullscreen_idx.is_none());
@@ -2784,7 +2798,9 @@ fn section1335_bookshelf_compiled_folder_direct_read_and_explicit_list_restart_d
         drop(env.app);
         let saved = crate::settings::Settings::load();
         assert_eq!(saved.startup_list_restore, departure);
-        env.app = App::new_from_settings(saved);
+        env.app = env
+            .ai_runtime_cleanup
+            .app_from_settings_after_drop(saved, AiRuntimeFixture::NotStarted);
         env.open_default_startup_target();
         settle_book(&mut env);
         let expected = if direct { &root } else { &child };

@@ -23,6 +23,7 @@ pub(super) fn backend_window_for_test(
         },
     )
 }
+mod ai_runtime_fixture;
 mod auto_aspect_s1;
 mod book_close_s1;
 mod close_nav_801;
@@ -12668,11 +12669,99 @@ fn main_window_title_preserves_real_path_and_indexing_suffix() {
     assert_eq!(main_window_title(None, false), "mimageviewer");
 }
 
+/// Every App fixture explicitly chooses whether native AI initialization is allowed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AiRuntimeFixture {
+    NotStarted,
+    Start,
+}
+
+impl AiRuntimeFixture {
+    const NOT_STARTED_MESSAGE: &str =
+        "App test fixture does not start the AI runtime; use AiRuntimeFixture::Start";
+
+    fn configure(self, app: &App) {
+        if self == Self::NotStarted {
+            // Preserve the owner and its already configured TRT lifecycle.
+            app.ai_runtime_init
+                .fail_dormant_for_test(Self::NOT_STARTED_MESSAGE);
+        }
+    }
+}
+
+/// Drop after App, but before the epoch, data-dir override and temporary directory.
+/// Retain the original owner even if a test installs a fake owner in the App.
+struct AiRuntimeFixtureCleanup {
+    owner: Option<Arc<crate::ai::runtime::AiRuntimeInitOwner>>,
+    // Teardown regressions release their initializer only from the actual wait.
+    wait_hook: Option<Box<dyn FnOnce()>>,
+}
+
+impl AiRuntimeFixtureCleanup {
+    fn new(app: &App, fixture: AiRuntimeFixture) -> Self {
+        Self {
+            owner: (fixture == AiRuntimeFixture::Start).then(|| Arc::clone(&app.ai_runtime_init)),
+            wait_hook: None,
+        }
+    }
+
+    /// Reload tests may deliberately drop only env.app before editing persisted data.
+    /// A whole-env method cannot borrow that partially moved env. Keep the old wait
+    /// lease in this separate field, then bind it to the newly constructed App.
+    fn app_from_settings_after_drop(
+        &mut self,
+        settings: crate::settings::Settings,
+        fixture: AiRuntimeFixture,
+    ) -> App {
+        self.wait();
+        let app = App::from_settings_for_test(settings, fixture);
+        *self = Self::new(&app, fixture);
+        app
+    }
+
+    fn wait(&mut self) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        self.wait_while(|| std::time::Instant::now() < deadline);
+    }
+
+    fn wait_while(&mut self, mut keep_waiting: impl FnMut() -> bool) {
+        use crate::ai::runtime::{AiRuntimeInitSnapshot, AiRuntimeInitWait};
+        let Some(owner) = &self.owner else {
+            return;
+        };
+        if matches!(owner.snapshot(), AiRuntimeInitSnapshot::Initializing) {
+            let wait_hook = &mut self.wait_hook;
+            assert!(
+                !matches!(
+                    owner.wait_terminal_while(|| {
+                        if !keep_waiting() {
+                            return false;
+                        }
+                        if let Some(hook) = wait_hook.take() {
+                            hook();
+                        }
+                        true
+                    }),
+                    AiRuntimeInitWait::Cancelled
+                ),
+                "AI runtime fixture initialization did not terminate within 60 seconds"
+            );
+        }
+    }
+}
+
+impl Drop for AiRuntimeFixtureCleanup {
+    fn drop(&mut self) {
+        self.wait();
+    }
+}
+
 /// `App::new_for_test` に渡すテスト設定。
 ///
 /// Phase C では実プロセスの `data_dir::init` を経由せず、`set_test_override` で
 /// `TempDir` を差し込む。App 内の全 DB/インデクサ open はその data_dir を参照する。
 struct AppTestConfig {
+    ai_runtime: AiRuntimeFixture,
     /// テスト用データディレクトリ。`data_dir::set_test_override(Some(...))` に設定済みの
     /// パスを渡す。(呼び出し側の `TempDir` が App より長生きする必要あり)
     data_dir: std::path::PathBuf,
@@ -12685,6 +12774,16 @@ struct AppTestConfig {
 }
 
 impl App {
+    /// Settings-reload tests must apply the same explicit policy immediately.
+    pub(crate) fn from_settings_for_test(
+        settings: crate::settings::Settings,
+        ai_runtime: AiRuntimeFixture,
+    ) -> Self {
+        let app = App::new_from_settings(settings);
+        ai_runtime.configure(&app);
+        app
+    }
+
     /// テスト用コンストラクタ。本番の `App::default` と同じ DB/indexer open 経路を
     /// 通すが、以下が異なる:
     ///
@@ -12693,6 +12792,7 @@ impl App {
     /// 3. 名前索引 supervisor の初期 spawn は行わない
     ///    (呼び出し側が `spawn_initial_name_index_supervisors()` を明示的に呼ぶ)
     /// 4. 初期サイズ / font / theme は設定しない (テスト側で Context を用意する想定)
+    /// 5. `config.ai_runtime` で AI 初期化の許可を明示する
     ///
     /// 注意: Tantivy / SQLite / notify-rs などの実スレッドは通常どおり起動するので、
     /// テスト終了時には `drop(app)` で正しく停止すること (IndexerManager::drop が
@@ -12719,6 +12819,7 @@ impl App {
                 config.similar_feature_capability,
                 Arc::new(crate::raw::RawDevelopExecutor::new(1).unwrap()),
             );
+        config.ai_runtime.configure(&app);
         // 起動時 purge-retry worker はテストハーネスでは既定オフにする。本番の既定は true
         // (app.rs:9667) だが、テストで有効だと `App::update` を回す並列テストがこの worker を
         // spawn し、プロセスグローバルの data_dir override 経由で別テストの rating.db 等を
@@ -15283,7 +15384,7 @@ fn clamp_color_image_for_gpu_preserves_premultiplied_alpha() {
 /// 使用者が単一の Mutex で直列化される。
 #[cfg(test)]
 pub(crate) mod phase_c_support {
-    use super::{App, AppTestConfig};
+    use super::{AiRuntimeFixture, AiRuntimeFixtureCleanup, App, AppTestConfig};
     use tempfile::TempDir;
 
     /// Prove that the last admitted position write has committed before a test
@@ -15341,7 +15442,7 @@ pub(crate) mod phase_c_support {
     ///
     /// **フィールドの宣言順がそのまま drop 順** (Rust spec: struct fields are dropped in
     /// declaration order)。`App` を最先頭に置いて supervisor join まで完了させたあとで
-    /// `OverrideGuard` (TEST_OVERRIDE クリア) → `TempDir` (削除) → `MutexGuard` (lock 解放)
+    /// AI init terminal wait → `OverrideGuard` (TEST_OVERRIDE クリア) → `TempDir` (削除) → `MutexGuard` (lock 解放)
     /// の順に片付く。
     ///
     /// 2026-05-17 事故ガード: 旧 `setup_app()` は `(App, OverrideGuard, TempDir, MutexGuard)`
@@ -15354,6 +15455,7 @@ pub(crate) mod phase_c_support {
     /// 二重防御として drop 順自体を fix している。
     pub(crate) struct AppTestEnv {
         pub app: App,
+        pub(super) ai_runtime_cleanup: AiRuntimeFixtureCleanup,
         // Keep the epoch scope alive through App::drop and its worker joins.
         _epoch_scope: Option<crate::page_edit_write_epoch::TestEpochScope>,
         _guard: OverrideGuard,
@@ -15361,6 +15463,22 @@ pub(crate) mod phase_c_support {
         /// (App には `tmp` フィールドが無いので名前衝突しない)。
         pub tmp: TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl AppTestEnv {
+        pub(crate) fn replace_app_from_settings(
+            &mut self,
+            settings: crate::settings::Settings,
+            ai_runtime: AiRuntimeFixture,
+        ) {
+            let app = App::from_settings_for_test(settings, ai_runtime);
+            let cleanup = AiRuntimeFixtureCleanup::new(&app, ai_runtime);
+            let old_app = std::mem::replace(&mut self.app, app);
+            drop(old_app);
+            // The old owner must finish before its lease is replaced. Track the new
+            // App's owner even when the preceding fixture used NotStarted.
+            self.ai_runtime_cleanup = cleanup;
+        }
     }
 
     /// `app.foo()` / `app.field` / `&mut app` を `App` への deref coercion で
@@ -15431,6 +15549,15 @@ pub(crate) mod phase_c_support {
         setup_app_with_similar_capability(crate::similar_index::SimilarFeatureCapability::Enabled)
     }
 
+    pub(crate) fn setup_app_with_ai_runtime(ai_runtime: AiRuntimeFixture) -> AppTestEnv {
+        setup_app_with_options(
+            crate::similar_index::SimilarFeatureCapability::Enabled,
+            ai_runtime,
+            None,
+            |_| {},
+        )
+    }
+
     pub(crate) fn setup_product_similar_app() -> AppTestEnv {
         setup_app_with_similar_capability(crate::similar_index::PRODUCT_SIMILAR_FEATURE_CAPABILITY)
     }
@@ -15450,6 +15577,7 @@ pub(crate) mod phase_c_support {
     ) -> AppTestEnv {
         setup_app_with_options(
             crate::similar_index::SimilarFeatureCapability::Paused,
+            AiRuntimeFixture::NotStarted,
             Some(settings),
             prepare_data_dir,
         )
@@ -15458,11 +15586,12 @@ pub(crate) mod phase_c_support {
     fn setup_app_with_similar_capability(
         capability: crate::similar_index::SimilarFeatureCapability,
     ) -> AppTestEnv {
-        setup_app_with_options(capability, None, |_| {})
+        setup_app_with_options(capability, AiRuntimeFixture::NotStarted, None, |_| {})
     }
 
     fn setup_app_with_options(
         similar_feature_capability: crate::similar_index::SimilarFeatureCapability,
+        ai_runtime: AiRuntimeFixture,
         settings: Option<crate::settings::Settings>,
         prepare_data_dir: impl FnOnce(&std::path::Path),
     ) -> AppTestEnv {
@@ -15472,6 +15601,7 @@ pub(crate) mod phase_c_support {
         crate::data_dir::set_test_override(Some(tmp.path().to_path_buf()));
         let guard = OverrideGuard;
         let config = AppTestConfig {
+            ai_runtime,
             data_dir: tmp.path().to_path_buf(),
             settings,
             similar_feature_capability,
@@ -15494,8 +15624,10 @@ pub(crate) mod phase_c_support {
         // 作るテストが実データを書き換える。テストが実利用のフォルダへ触れないよう、ここで
         // 一緒に temp dir へ向ける。
         app.settings.book_root = Some(tmp.path().join("books"));
+        let ai_runtime_cleanup = AiRuntimeFixtureCleanup::new(&app, ai_runtime);
         AppTestEnv {
             app,
+            ai_runtime_cleanup,
             _epoch_scope: epoch_scope,
             _guard: guard,
             tmp,
@@ -21888,7 +22020,10 @@ mod quick_folder_restart_tests {
         env.settings.startup_list_restore = None;
         env.settings.save();
         drop(env.app);
-        env.app = App::new_from_settings(crate::settings::Settings::load());
+        env.app = env.ai_runtime_cleanup.app_from_settings_after_drop(
+            crate::settings::Settings::load(),
+            AiRuntimeFixture::NotStarted,
+        );
         assert_eq!(env.active_quick_folder_slot, None);
         let before = env.quick_folder_workspaces.clone();
 
@@ -21921,7 +22056,9 @@ mod quick_folder_restart_tests {
         let saved = crate::settings::Settings::load();
         assert_eq!(saved.active_quick_folder_slot, None);
         assert_eq!(saved.last_folder.as_ref(), Some(&pdf));
-        env.app = App::new_from_settings(saved);
+        env.app = env
+            .ai_runtime_cleanup
+            .app_from_settings_after_drop(saved, AiRuntimeFixture::NotStarted);
         assert_eq!(env.active_quick_folder_slot, None);
 
         // A later successful open must still have no workspace owner.
@@ -21968,7 +22105,9 @@ mod quick_folder_restart_tests {
         let saved = crate::settings::Settings::load();
         assert_eq!(saved.active_quick_folder_slot, active);
         assert_eq!(saved.last_folder.as_ref(), Some(previous));
-        env.app = App::new_from_settings(saved);
+        env.app = env
+            .ai_runtime_cleanup
+            .app_from_settings_after_drop(saved, AiRuntimeFixture::NotStarted);
         // Constructor must restore ownership before the first startup open.
         assert_eq!(env.active_quick_folder_slot, active);
         env.open_default_startup_target();
@@ -62639,7 +62778,13 @@ mod pipeline_cache_refactor_tests {
         let current = push_image(&mut app, r"C:\missing\current.png");
         let mut far = current;
         for n in 0..40 {
-            far = push_image(&mut app, &format!(r"C:\missingar{n}.png"));
+            far = push_image(
+                &mut app,
+                &format!(
+                    r"C:\missing
+ar{n}.png"
+                ),
+            );
         }
         let order: Vec<usize> = (0..=far).collect();
         app.visible_indices = order.clone();
@@ -112496,7 +112641,9 @@ fn section1335_direct_zip_exit_restart_keeps_explicit_parent_list() {
         Some(&book),
         "probe: current released write"
     );
-    env.app = App::new_from_settings(saved);
+    env.app = env
+        .ai_runtime_cleanup
+        .app_from_settings_after_drop(saved, AiRuntimeFixture::NotStarted);
     env.open_default_startup_target();
     phase_c_folder_nav_history_tests::finish_staged_physical_history_for_test(&mut env);
     assert!(
