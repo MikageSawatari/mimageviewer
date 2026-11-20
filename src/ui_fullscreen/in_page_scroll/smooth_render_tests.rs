@@ -627,3 +627,277 @@ fn actual_pdf_scroll_paint_adds_no_resolution_or_processing_request() {
         )
     );
 }
+
+#[cfg(windows)]
+struct ForwardedScrollClockViewer {
+    ctx: egui::Context,
+    app: crate::app::AppTestEnvForTest,
+    destination: egui::ViewportId,
+    child_time: std::rc::Rc<std::cell::Cell<f64>>,
+}
+
+#[cfg(windows)]
+impl ForwardedScrollClockViewer {
+    fn new(mode: SpreadMode) -> Self {
+        let ctx = egui::Context::default();
+        let mut app = scroll_app(&ctx, mode);
+        app.native_video_in_window_active = false;
+        app.settings.video_in_window_mode = false;
+        app.viewer_presentation = crate::app::ViewerPresentation::Fullscreen;
+        // The headless integration already owns this viewport. Avoid the
+        // production first-show path; no native window is created or activated.
+        app.fs_viewport_shown = true;
+        app.fs_viewport_presentation = Some(crate::app::ViewerPresentation::Fullscreen);
+        app.fs_zoom = 2.0;
+        app.settings.fullscreen_smooth_page_scroll = true;
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+        app.keymap = crate::keymap::Keymap::from_ini_str("[FsImage]\nFsPageScrollDown = F24\n");
+        let destination = app.fullscreen_viewport_id();
+        assert_ne!(destination, egui::ViewportId::ROOT);
+        let child_time = std::rc::Rc::new(std::cell::Cell::new(10.0));
+        let current_child_time = child_time.clone();
+        ctx.set_embed_viewports(false);
+        // Same nested immediate-pass fixture as wheel_frame_tests. This callback
+        // runs egui only; it never constructs a GPU renderer, device or HWND.
+        egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+            assert_eq!(viewport.ids.this, destination);
+            crate::key_input::set_test_frame_for_viewport(destination, Vec::new());
+            let output = ctx.run_pass(
+                egui::RawInput {
+                    viewport_id: destination,
+                    screen_rect: Some(full_rect()),
+                    focused: true,
+                    time: Some(current_child_time.get()),
+                    viewports: [(
+                        destination,
+                        egui::ViewportInfo {
+                            parent: Some(viewport.ids.parent),
+                            native_pixels_per_point: Some(1.0),
+                            focused: Some(true),
+                            minimized: Some(false),
+                            ..Default::default()
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                },
+                |ctx| ctx.root_ui(|ui| (viewport.viewport_ui_cb)(ui)),
+            );
+            crate::test_ui::headless_paint_output(output).drop_without_applying_deltas();
+        });
+        Self {
+            ctx,
+            app,
+            destination,
+            child_time,
+        }
+    }
+
+    fn root_raw(&self, time: f64, events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(full_rect()),
+            focused: true,
+            time: Some(time),
+            events,
+            viewports: [(
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    native_pixels_per_point: Some(1.0),
+                    focused: Some(true),
+                    minimized: Some(false),
+                    ..Default::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn paint_destination(&mut self, time: f64) -> Vec<DisplayedImageTransform> {
+        self.child_time.set(time);
+        self.app.frame_counter += 1;
+        crate::key_input::set_test_frame_for_viewport(egui::ViewportId::ROOT, Vec::new());
+        let raw = self.root_raw(time, vec![]);
+        let output = self.ctx.run_pass(raw, |ctx| {
+            ctx.root_ui(|ui| self.app.render_fullscreen_viewport(ui));
+        });
+        crate::test_ui::headless_paint_output(output).drop_without_applying_deltas();
+        assert_eq!(
+            self.ctx.input_for(self.destination, |input| input.time),
+            time
+        );
+        assert!(self.app.fullscreen_page_layout.drawn_unit.is_some());
+        assert!(self.app.fs_scroll_layout_matches(&self.ctx));
+        let pages: Vec<_> = self
+            .app
+            .fullscreen_page_layout
+            .displayed_pages()
+            .map(|page| page.transform)
+            .collect();
+        assert_eq!(
+            pages.len(),
+            if self.app.spread_mode.is_spread() {
+                2
+            } else {
+                1
+            }
+        );
+        pages
+    }
+
+    fn press_on_root(&mut self, time: f64, stale_destination_time: f64) {
+        self.app.frame_counter += 1;
+        crate::key_input::set_test_frame_for_viewport(egui::ViewportId::ROOT, Vec::new());
+        let raw = self.root_raw(time, super::handler_tests::tap(egui::Key::F24));
+        let output = self.ctx.run_pass(raw, |ctx| {
+            // Keep the last child input/geometry resident without drawing it.
+            ctx.show_viewport_deferred(self.destination, Default::default(), |_, _| {});
+            assert_eq!(ctx.viewport_id(), egui::ViewportId::ROOT);
+            assert_eq!(ctx.input(|input| input.time), time);
+            assert_eq!(
+                ctx.input_for(self.destination, |input| input.time),
+                stale_destination_time
+            );
+            assert!(time > stale_destination_time);
+            assert!(self.app.fs_scroll_layout_matches(ctx));
+            assert!(self.app.handle_fullscreen_root_key_input(ctx));
+            assert!(!ctx.input(|input| input.events.iter().any(|event| matches!(
+                event,
+                egui::Event::Key {
+                    key: egui::Key::F24,
+                    pressed: true,
+                    ..
+                }
+            ))));
+            assert_eq!(
+                ctx.input_for(self.destination, |input| input.time),
+                stale_destination_time,
+                "root forwarding does not update the destination's cached input"
+            );
+        });
+        crate::test_ui::headless_paint_output(output).drop_without_applying_deltas();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn forwarded_root_scroll_starts_at_current_time_and_paints_in_the_destination() {
+    // Immediate viewport callbacks are thread-local. Isolate this RawInput-only
+    // integration from every other test's callback without an actual window.
+    std::thread::spawn(|| {
+        let _serial = crate::key_input::lock_test_input();
+        struct ClearKeyboard;
+        impl Drop for ClearKeyboard {
+            fn drop(&mut self) {
+                crate::key_input::clear_test_frame();
+            }
+        }
+        let _clear = ClearKeyboard;
+        crate::key_input::arm_test_synthetic_input(1823801, egui::ViewportId::ROOT);
+        for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
+            let mut viewer = ForwardedScrollClockViewer::new(mode);
+            viewer.paint_destination(10.0);
+            let from = viewer.app.fs_pan;
+            viewer.press_on_root(11.0, 10.0);
+            let to = viewer.app.fs_pan;
+            assert!(to.y < from.y);
+            let animation = viewer.app.fs_page_scroll_animation.as_ref().unwrap();
+            assert_eq!(animation.viewport, viewer.destination);
+            assert_eq!(
+                animation.start_time, 11.0,
+                "the cached destination time is still 10"
+            );
+            assert_eq!((animation.from, animation.to), (from, to));
+            for page in viewer.paint_destination(11.05) {
+                let pan = normal_zoom_pan(page).unwrap().1;
+                let progress = (pan - from).dot(to - from) / (to - from).length_sq();
+                assert!(
+                    progress > 0.0 && progress < 1.0,
+                    "first child repaint must be intermediate: {mode:?}, pan={pan:?}"
+                );
+                near(pan, from + (to - from) * 0.578125);
+            }
+            assert_eq!(viewer.app.fs_pan, to);
+            assert_eq!(
+                viewer
+                    .app
+                    .fs_page_scroll_animation
+                    .as_ref()
+                    .unwrap()
+                    .start_time,
+                11.0
+            );
+            for page in viewer.paint_destination(11.21) {
+                near(normal_zoom_pan(page).unwrap().1, to);
+            }
+            assert_eq!(viewer.app.fs_pan, to);
+            assert!(viewer.app.fs_page_scroll_animation.is_none());
+        }
+    })
+    .join()
+    .expect("headless forwarded-scroll clock test completes");
+}
+
+#[cfg(windows)]
+#[test]
+fn forwarded_root_scroll_retargets_from_current_time_instead_of_cached_child_time() {
+    std::thread::spawn(|| {
+        let _serial = crate::key_input::lock_test_input();
+        struct ClearKeyboard;
+        impl Drop for ClearKeyboard {
+            fn drop(&mut self) {
+                crate::key_input::clear_test_frame();
+            }
+        }
+        let _clear = ClearKeyboard;
+        crate::key_input::arm_test_synthetic_input(1823802, egui::ViewportId::ROOT);
+        for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
+            let mut viewer = ForwardedScrollClockViewer::new(mode);
+            viewer.paint_destination(10.0);
+            let from = viewer.app.fs_pan;
+            viewer.press_on_root(11.0, 10.0);
+            let first_to = viewer.app.fs_pan;
+            viewer.paint_destination(11.05);
+            viewer.press_on_root(11.10, 11.05);
+            let second_to = viewer.app.fs_pan;
+            assert!(second_to.y < first_to.y);
+            let current_from = from + (first_to - from) * 0.875;
+            let stale_from = from + (first_to - from) * 0.578125;
+            let animation = viewer.app.fs_page_scroll_animation.as_ref().unwrap();
+            assert_eq!(animation.start_time, 11.10);
+            assert_eq!(animation.viewport, viewer.destination);
+            assert_eq!(animation.to, second_to);
+            near(animation.from, current_from);
+            assert!(
+                (animation.from - stale_from).length() > 1.0,
+                "the new origin samples ROOT 11.10, not the child's cached 11.05"
+            );
+            for page in viewer.paint_destination(11.15) {
+                let pan = normal_zoom_pan(page).unwrap().1;
+                let progress = (pan - current_from).dot(second_to - current_from)
+                    / (second_to - current_from).length_sq();
+                assert!(progress > 0.0 && progress < 1.0);
+                near(pan, current_from + (second_to - current_from) * 0.578125);
+            }
+            assert_eq!(viewer.app.fs_pan, second_to);
+            assert_eq!(
+                viewer
+                    .app
+                    .fs_page_scroll_animation
+                    .as_ref()
+                    .unwrap()
+                    .start_time,
+                11.10
+            );
+            for page in viewer.paint_destination(11.31) {
+                near(normal_zoom_pan(page).unwrap().1, second_to);
+            }
+            assert!(viewer.app.fs_page_scroll_animation.is_none());
+            assert_eq!(viewer.app.fs_pan, second_to);
+        }
+    })
+    .join()
+    .expect("headless forwarded-scroll retarget test completes");
+}

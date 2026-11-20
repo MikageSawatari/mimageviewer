@@ -913,13 +913,22 @@ impl App {
         )
     }
 
+    /// eframe overwrites native RawInput.time with the same integration clock
+    /// for ROOT, deferred and immediate viewports. Sample the current pass:
+    /// a ROOT-forwarded key must not use the destination's previous frame time.
+    fn fs_page_scroll_animation_clock(&self, ctx: &egui::Context) -> (egui::ViewportId, f64) {
+        (
+            self.fs_page_scroll_destination_viewport(),
+            ctx.input(|input| input.time),
+        )
+    }
+
     fn fs_page_scroll_animation_matches(
         &self,
         ctx: &egui::Context,
         animation: &FsPageScrollAnimation,
     ) -> bool {
-        let viewport = self.fs_page_scroll_destination_viewport();
-        let now = ctx.input_for(viewport, |input| input.time);
+        let (viewport, now) = self.fs_page_scroll_animation_clock(ctx);
         self.settings.fullscreen_smooth_page_scroll
             && animation.to == self.fs_pan
             && animation.viewport == viewport
@@ -948,7 +957,7 @@ impl App {
             .as_ref()
             .filter(|animation| animation.to == self.fs_pan)
             .map_or(self.fs_pan, |animation| {
-                animation.pan_at(ctx.input_for(animation.viewport, |input| input.time))
+                animation.pan_at(self.fs_page_scroll_animation_clock(ctx).1)
             })
     }
 
@@ -961,17 +970,14 @@ impl App {
         if pan == self.fs_pan {
             return;
         }
+        let (viewport, start_time) = self.fs_page_scroll_animation_clock(ctx);
         let from = self
             .fs_page_scroll_animation
             .as_ref()
             .filter(|animation| self.fs_page_scroll_animation_matches(ctx, animation))
-            .map_or(self.fs_pan, |animation| {
-                animation.pan_at(ctx.input_for(animation.viewport, |input| input.time))
-            });
+            .map_or(self.fs_pan, |animation| animation.pan_at(start_time));
         let origin = self.fullscreen_page_layout.drawn_unit.clone();
         self.write_fs_page_scroll_pan(pan);
-        let viewport = self.fs_page_scroll_destination_viewport();
-        let start_time = ctx.input_for(viewport, |input| input.time);
         self.fs_page_scroll_animation = if smooth_allowed
             && self.settings.fullscreen_smooth_page_scroll
             && start_time.is_finite()

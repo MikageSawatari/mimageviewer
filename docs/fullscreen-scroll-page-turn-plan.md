@@ -1,7 +1,7 @@
 # スクロール＋ページ送り・ホイールのズーム・N 字 / Z 字の移動量・滑らかな移動 (§1.823〜§1.826)
 
-- 状態: **設計 r3 (2026-11-20)・独立設計レビュー r3 で ACCEPT (P1/P2 なし、P3 3 件を反映済み)・独立実装レビュー r1 の P1/P3 を修正、再検証・再レビュー待ち**。ブランチ `scroll-823-826`。
-- §4.5と§4.4.1の6bに従って着地配送・ホイール・補間を接続した後、独立実装レビュー r1 で見つかった補間退役の順序を修正し、実frame描画関数を通る回帰へ置き換えた。実装担当はコンパイル・テスト・snapshotのPNG生成・製品起動を行っていない。設計担当からの検証結果、停止時の履歴と最新の実装記録は末尾を参照。
+- 状態: **設計 r3 (2026-11-20)・独立設計レビュー r3 で ACCEPT (P1/P2 なし、P3 3 件を反映済み)・独立実装レビュー r2 の P2 を修正、再検証・再レビュー待ち**。ブランチ `scroll-823-826`。
+- §4.5と§4.4.1の6bに従って着地配送・ホイール・補間を接続した。独立実装レビュー r2 は r1 の補間退役順の修正を確認し、新たに指摘されたROOT配送時の時刻を共有clockの現在sampleへ修正した。実装担当はコンパイル・テスト・snapshotのPNG生成・製品起動を行っていない。設計担当からの検証結果、停止時の履歴と最新の実装記録は末尾を参照。
 - 要望: 5ch >>826〜829 (2026-11-20)。利用者決定 (2026-11-20) は [バックログ](next-release-backlog.md) の各項目の状態欄。
 - 前提の設計: [ページ内スクロールと N 字スクロール (§1.474)](fullscreen-in-page-scroll-plan.md)。v5.4.0 で出荷済み。
   本書はその仕組み (描いた表示単位の印・入力時の照合・候補 → clamp → 進んだときだけ書く) をそのまま使い、足す分だけを書く。
@@ -263,7 +263,11 @@ r2 の形 (案 B): **着地 `FsPageLanding { Start | End }` を、送りの要�
   経過時間で捨てる (0.2 秒以内に戻れば残りの補間が続くが、最終位置は同じで、照合が通る同じ表示単位の描画なので害はない)。
   利用者の切り替えを検出する退役の処理を新しく足さない。
 - 補間は**配送先の `ViewportId`** も持ち、今の配送先と違えば捨てる (r2 P2: 幾何の入力の鍵の viewport は矩形なので、同じ矩形・DPI の別 viewport を区別できない)。
-- 時刻は配送先 viewport の egui の入力時刻を使う (テストで決定的に進められる)。補間中だけ、その viewport の再描画を要求する。
+- 時刻は**処理中の viewport の現在の egui 入力時刻**を使う (テストで決定的に進められる)。eframeのnative実装はROOT・通常の子・即時viewportの
+  `RawInput.time` を、appごとに共通の `EpiIntegration.beginning.elapsed()` で設定しており、同じ時計のsampleである。
+  ROOTでキーを処理するとき、配送先の `input_for(viewport).time` は前回描画の古い値なので使わない。
+  配送先の `ViewportId` と現在時刻の取得は1つのhelperへまとめ、開始時刻・追加入力の `from = pan_at(now)`・期限判定・描画の補間を同じ基準にそろえる。
+  配送先で描くときもそのframeの現在sampleを使う。補間中だけ、従来どおり配送先viewportの再描画を要求する。
 - **描いた transform から pan を逆算する入力** (r1 P1): ナビゲータの位置指定 (`pan_to_center_source_normalized` を使うダブルクリック・範囲ズーム・
   描画時の保留中央指定) は、渡す pan が transform の描画の pan と同じことを前提にしている。補間中は `fs_pan` (最終位置) と描画の pan が違うので、
   これらは、**補間が有効なときだけ**、その transform 自身の描画 pan (`normal_zoom_pan(transform)` の pan) を基準に計算する (r2 P3: 補間が無いときは
@@ -857,3 +861,31 @@ LoadFailedの例外も同じallow_turnの門を通る。Repeatでページを送
 - **変更ファイル**: `src/ui_fullscreen.rs`、`src/ui_fullscreen/in_page_scroll/smooth_render_tests.rs`、本書。
   開始時に存在した環境設定snapshotのPNG4件は設計担当の差分として維持した。
   コンパイル・テスト・check・nextest・製品起動・コミットは実施しておらず、修正後の実行結果と独立実装レビューの再受入は設計担当へ引き継ぐ。
+
+### 独立実装レビュー r2: ROOT配送時の補間clockの修正（P2）
+
+- **原因と選んだ方式**: ROOTでキーを処理するとき、配送先の `ctx.input_for(viewport).time` は前回描画の値である。
+  配送先の最終描画10秒・ROOT入力11秒では開始が10秒になり、直後の描画で0.2秒の期限が過ぎていた。
+  方式(b)として、処理中viewportの現在の `ctx.input(|input| input.time)` を共通clockのsampleとして使う。
+- **同じclockである根拠（コード読み）**: `vendor/eframe/src/native/epi_integration.rs:218` は `EpiIntegration` がappごとに1つと明記し、
+  222行の `beginning` を所有する。wgpuのROOT／通常の子は `wgpu_integration.rs:922` でその `beginning.elapsed()` を
+  RawInput.timeへ設定する。即時viewportも543行で同じInstantをcaptureし、1715行でそれを使う。
+  Glowも `glow_integration.rs:796`、486→2371行で同じ構造である。`epi_integration.rs:546` の入力準備でも同じclockを設定し、
+  `src/app.rs:103167` のraw_input_hookは時刻を変更しない。`vendor/egui/src/input_state/mod.rs:375` は渡されたtimeを採用する。
+  egui-winit内部のviewport別のstart_timeを比較する方式ではない。
+- **変更**: `in_page_scroll.rs` の `fs_page_scroll_animation_clock` へ既存の配送先ViewportIdと現在時刻の取得を集約した。
+  writerの開始時刻と既存補間の `from = pan_at(now)`、退役時の期限判定、描画panのsamplingを同じ基準へそろえた。
+  start_timeはf64のままで、新しい保留状態は足していない。退役はr1修正後の描画印消去前の1か所を維持する。
+  detachedの述語・viewportの配送・HWND・context swap・repaint回数・期限は変更せず、猶予・retry・固定待ちは追加していない。
+- **追加テスト（Windows headless、未実行）**:
+  - `ui_fullscreen::in_page_scroll::smooth_render_tests::forwarded_root_scroll_starts_at_current_time_and_paints_in_the_destination`
+  - `ui_fullscreen::in_page_scroll::smooth_render_tests::forwarded_root_scroll_retargets_from_current_time_instead_of_cached_child_time`
+  既存handler fixtureのresident素材と既存の即時viewport用RawInput callbackの構造を使い、callbackを別threadへ隔離する。
+  実 `handle_fullscreen_root_key_input` → 実 `render_fullscreen_viewport` → 別viewportの描画を通し、Single／Ltr／Rtlで検査する。
+  配送先最終描画10秒のままROOTで11秒に入力し、11.05秒の配送先描画がfrom/toの厳密中間、11.21秒がtoで退役することをassertする。
+  再入力は配送先のcached時刻11.05とROOTの現在時刻11.10の違いを保持し、fromが旧補間の11.10時点 (ease=0.875) であって
+  11.05時点 (ease=0.578125) ではないこと、再設定から0.2秒後にtoへ到達・退役することをassertする。
+  実GPU renderer・native windowを作らないheadlessのため、gpu test-groupへの追加は不要。実機のHWND配送の確認とは区別する。
+- **変更ファイルと検証の限界**: `src/ui_fullscreen/in_page_scroll.rs`、`src/ui_fullscreen/in_page_scroll/smooth_render_tests.rs`、本書の§5と本項。
+  開始時に存在したsnapshotのPNG4件は維持した。実装担当はコンパイル・テスト・check・nextest・製品起動・コミットを行っていない。
+  修正後のテスト成否と実機の入力・描画は設計担当の検証待ち。
