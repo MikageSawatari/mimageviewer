@@ -933,4 +933,15 @@ verdict と終了コードの対応、`release-record.md` の中身が `summary.
   試験用の観測 (`src/app/release_checks.rs` の `search_done` / `search_searching`) と台本 (`release-checks.rhai` の `search`) はそれを見ていない。
   台本は完了の印の直後の空の一覧を読み取った (証拠: 台本の読み取りは 4.046 秒で 0 件、同じ回の seed の記録は 4.108 秒で 3 件)。
   起きるのは誤った SKIPPED だけで、誤った PASS にはならない。メイン PC では worker が速く、表に出ていなかったと見ている (未確認)。
-- ここまでで、サブ PC での置き場所・前面・Python・FFmpeg・seed の起動と正常終了は成立した。直し方は統括・利用者の判断待ち。
+- ここまでで、サブ PC での置き場所・前面・Python・FFmpeg・seed の起動と正常終了は成立した。
+
+**検索の完了判定の修正 (2026-11-22、`30dbcfc43`)**
+統括の判断: 待ち時間の上乗せではなく、製品の完了条件をそのまま観測に出して台本が待つ。v5.5.0 は流し直さず、v5.5.1 の ReleaseChecks で代える。
+
+- `reconcile_completed_drill` の前提を `GlobalSearchState::metadata_results_settled()` に切り出し (挙動不変)、観測の `search_results_settled` として出した。
+  台本の `search()` と seed の記録はそれを待つ。perf の 2 ケースも同じ `search()` を通る。View の準備要求 (`in_flight`) は含めない
+  (一覧の中身ではなく表示の準備のため)。ほかに検索の完了を `done` だけで見る台本・解析は無かった。
+- テストは hold で `Done` の後・最後の `RatedBatch` の前を作り、settled が偽で一覧が空、採用後に真で埋まることを確かめる。
+  Sol / xhigh の独立レビューは ACCEPT (製品の条件が前と同じ意味であることを含む)。
+- 診断 artifact は、配布ビルドの入力 `aa6f06685` にこの修正を載せた `c54ecfd7e` から作る (`C:\miv-relcheck\root`、detached)。
+  違いは test-script feature の中の観測と台本、それに製品の完了条件の関数への切り出し。配布物には切り出しを含まない。
