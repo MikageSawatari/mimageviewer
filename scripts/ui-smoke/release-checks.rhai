@@ -63,7 +63,7 @@ fn search(term, expected_hits) {
     release_check_text(term);
     for attempt in 0..1800 {
         let state = release_check_observe();
-        if state.search_query == term && state.search_done && !state.search_searching
+        if state.search_query == term && state.search_results_settled && !state.search_searching
             && state.interaction_ready {
             return #{ ctrl_g_receipt: true, text_receipt: true, completed: true,
                 start_t: before.perf_t, end_t: state.perf_t, expected_query: term, actual_query: state.search_query,

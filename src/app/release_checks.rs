@@ -181,6 +181,7 @@ impl App {
                 "search_active":self.global_search.active,"search_focused":self.global_search.has_focus,
                 "search_query":self.global_search.draft(),"search_done":self.global_search.done,
                 "search_searching":self.global_search.is_searching(),
+                "search_results_settled":self.global_search.metadata_results_settled(),
                 "search_hits":self.global_search.all_hits.iter().map(|h|h.path.clone()).collect::<Vec<_>>(),
                 "is_fullscreen":snapshot.is_fullscreen,"cache_policy_off":matches!(self.settings.cache_policy,crate::settings::CachePolicy::Off),
                 "ai_pending":self.ai_upscale_pending.len()+self.final_ai_pending.len(),"ai_ready":self.ai_upscale_cache.len()+self.final_ai_cache.len(),
@@ -319,6 +320,53 @@ pub(crate) fn record_tray_hide(app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_checks_search_observation_waits_for_rated_batch_adoption() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let paths: Vec<_> = (0..3)
+            .map(|n| app.tmp.path().join(format!("search-hit-{n}.png")))
+            .collect();
+        let hits = paths
+            .iter()
+            .map(|path| crate::global_search::GlobalHit {
+                kind: crate::fts_index::IndexKind::Image,
+                path: path.to_string_lossy().into_owned(),
+                score: 1.0,
+                stars: 0,
+                mtime: 0,
+                file_size: Some(1),
+            })
+            .collect();
+        app.items_are_global_search_view = false;
+        app.global_search.active = true;
+        app.global_search.metadata_draft = "needle".into();
+        app.global_search.last_executed = "needle".into();
+        app.global_search.hold_metadata_rated_batch_for_test(hits);
+        app.global_search.done = true;
+        let before = app.release_check_observation(&ctx).value;
+        assert_eq!(before["search_done"], true);
+        assert_eq!(before["search_searching"], false);
+        assert_eq!(before["search_results_settled"], false);
+        assert_eq!(before["search_hits"], json!([]));
+        app.poll_search_page_edit_prepare(&ctx);
+        assert_eq!(
+            app.release_check_observation(&ctx).value["search_results_settled"],
+            false
+        );
+        app.release_search_ready_for_test();
+        app.poll_search_page_edit_prepare(&ctx);
+        let after = app.release_check_observation(&ctx).value;
+        assert_eq!(after["search_done"], true);
+        assert_eq!(after["search_results_settled"], true);
+        let expected: Vec<_> = paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(after["search_hits"], json!(expected));
+    }
 
     #[test]
     fn section1741_release_search_image_observation_captures_parent_and_request_keys() {

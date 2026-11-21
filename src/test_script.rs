@@ -7017,6 +7017,71 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn release_checks_search_recipe_waits_for_settled_hit_list() {
+        // Exercise the real search helper with Done preceding the final RatedBatch.
+        // The additional observations independently test query/search/UI readiness.
+        let state = Arc::new(Mutex::new((false, 0_usize)));
+        let sleeps = Arc::new(AtomicUsize::new(0));
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let mut engine = build_engine(bridge);
+        let count = Arc::clone(&sleeps);
+        engine.register_fn("sleep", move |_: rhai::INT| {
+            count.fetch_add(1, AtomicOrdering::Relaxed);
+        });
+        engine.register_fn(
+            "tap_key",
+            |key: ImmutableString, modifiers: ImmutableString| {
+                assert_eq!(key.as_str(), "G");
+                assert_eq!(modifiers.as_str(), "ctrl");
+            },
+        );
+        let s = Arc::clone(&state);
+        engine.register_fn("release_check_text", move |term: ImmutableString| {
+            assert_eq!(term.as_str(), "needle");
+            s.lock().unwrap().0 = true;
+        });
+        let s = Arc::clone(&state);
+        engine.register_fn("release_check_observe", move || {
+            let mut s = s.lock().unwrap();
+            if s.0 {
+                s.1 += 1;
+            }
+            let stage = s.1;
+            super::release_checks::to_dynamic(&serde_json::json!({
+                "focused":true,"perf_t":stage as f64,"search_active":true,"search_focused":true,
+                "search_done":true,"search_results_settled":stage != 1,
+                "search_query":if stage == 2 {"old-query"} else {"needle"},
+                "search_searching":stage == 3,"interaction_ready":stage != 4,
+                "search_hits":if stage >= 5 {vec!["C:/fixture/hit.png"]} else {vec![]}
+            }))
+        });
+        let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
+            .replace("__SEARCH_HITS__", "[]")
+            .replace("__CACHE_PATHS__", "[]")
+            .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__LOAD_PATHS__", "[]")
+            .replace("__INCLUDE_FIRST_AI__", "false")
+            .replace("__RUNNER_PID__", "202");
+        let helpers = source.split("\nrelease_check_begin(").next().unwrap();
+        let evidence = engine
+            .eval::<Map>(&format!(
+                "{helpers}\nsearch(\"needle\", [\"C:/fixture/hit.png\"])"
+            ))
+            .unwrap();
+        assert_eq!(state.lock().unwrap().1, 5);
+        assert_eq!(sleeps.load(AtomicOrdering::Relaxed), 4);
+        assert!(evidence["completed"].clone().cast::<bool>());
+        assert_eq!(evidence["end_t"].clone().cast::<rhai::FLOAT>(), 5.0);
+        let hits = evidence["actual_hits"].clone().cast::<rhai::Array>();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].clone().cast::<ImmutableString>().as_str(),
+            "C:/fixture/hit.png"
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn release_checks_seed_waits_for_pin_refresh_before_opening_parent() {
         // Execute the real seed branch/helpers with deterministic observations.
         // No capture, DB, window, input or measured idle interval is involved.
@@ -7042,7 +7107,7 @@ mod tests {
                 "items_generation":1,"loading_complete":true,"index_settled":true,
                 "interaction_ready":ready,"focused":true,"perf_t":1.0,
                 "search_active":true,"search_focused":true,"search_query":"needle",
-                "search_done":true,"search_searching":false,"search_hits":[]});
+                "search_done":true,"search_results_settled":true,"search_searching":false,"search_hits":[]});
             super::release_checks::to_dynamic(&value)
         });
         let s = Arc::clone(&state);
@@ -7124,7 +7189,7 @@ mod tests {
                     "current_folder_path":s.0,"items_generation":s.1,"perf_t":s.2,
                     "loading_complete":true,"index_settled":true,"interaction_ready":true,"focused":true,
                     "search_active":true,"search_focused":true,"search_query":"needle",
-                    "search_done":true,"search_searching":false,"search_hits":[]}))
+                    "search_done":true,"search_results_settled":true,"search_searching":false,"search_hits":[]}))
             });
             let s = Arc::clone(&state);
             engine.register_fn("release_check_open", move |path: ImmutableString| {

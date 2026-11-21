@@ -568,6 +568,14 @@ fn evidence(bridge: &RunnerBridge, directory: &str, script: Map) -> Result<(), S
     }
     write_json(&directory.join("case-evidence.json"), &value)
 }
+fn search_seed_evidence(observation: &Value) -> Option<Value> {
+    (observation["search_results_settled"] == true && observation["search_searching"] == false)
+        .then(|| {
+            json!({"seed_kind":"search","normal_producer":true,"completed":true,
+            "actual_hits":observation["search_hits"]})
+        })
+}
+
 pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
     engine.register_fn(
         "release_check_begin",
@@ -626,7 +634,11 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
                 if targets.is_empty() || targets.iter().any(|t|t["catalog_absent"] != false) { return Err(rhai_error("environment: normal cache seed missing kept target")); }
                 trace("seed",json!({"seed_kind":"cache","normal_producer":true,"saved_cache":true,"folder_path":o.value["current_folder_path"],"targets":targets,"key":targets[0]["key"]}));
             }
-            "search" if o.value["search_done"] == true && o.value["search_searching"] == false => trace("seed",json!({"seed_kind":"search","normal_producer":true,"completed":true,"actual_hits":o.value["search_hits"]})),
+            "search" => {
+                let evidence = search_seed_evidence(&o.value)
+                    .ok_or_else(|| rhai_error("environment: unknown or unprepared seed"))?;
+                trace("seed", evidence);
+            }
             _ => return Err(rhai_error("environment: unknown or unprepared seed")),
         }
         Ok(())
@@ -904,6 +916,27 @@ fn protocol_ai_trace(proof: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_checks_search_seed_evidence_requires_settled_results() {
+        let mut observation = json!({"search_done":true,"search_searching":false,
+            "search_results_settled":false,"search_hits":[]});
+        assert!(search_seed_evidence(&observation).is_none());
+        observation["search_results_settled"] = json!(true);
+        observation["search_hits"] = json!(["C:/fixture/a.png", "C:/fixture/b.png"]);
+        let evidence = search_seed_evidence(&observation).unwrap();
+        assert_eq!(evidence["seed_kind"], "search");
+        assert_eq!(evidence["completed"], true);
+        assert_eq!(evidence["actual_hits"], observation["search_hits"]);
+        observation["search_searching"] = json!(true);
+        assert!(search_seed_evidence(&observation).is_none());
+        observation
+            .as_object_mut()
+            .unwrap()
+            .remove("search_results_settled");
+        observation["search_searching"] = json!(false);
+        assert!(search_seed_evidence(&observation).is_none());
+    }
 
     fn parent_observation(cache_dir: &Path, source: &Path) -> Observation {
         let request_key = crate::path_key::normalize_keep_drive(source);
