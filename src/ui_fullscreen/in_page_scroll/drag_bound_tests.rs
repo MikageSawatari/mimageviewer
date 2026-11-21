@@ -1,6 +1,6 @@
 //! Pure geometry contracts for §1.834 (including the r5–r9 counterexamples).
 //! These resolved-layout fixtures do not stand in for the real-renderer tests.
-use super::drag_bound::bounded_drag_pan;
+use super::drag_bound::{bounded_drag_pan, round_drag_bound_delta};
 use super::tests::{asymmetric_spread, close, layout_from_pages, page_input, single, viewport};
 use super::*;
 use crate::rotation_db::Rotation;
@@ -330,7 +330,17 @@ fn r6_newly_visible_page_is_reached_in_one_input_or_split_straight_inputs() {
         let proposed = start + (target - start) * (step as f32 / 20.0);
         cur = bounded_drag_pan(&layout, cur, proposed);
     }
-    close(cur, target);
+    // The final step starts at -506.6: trunc(-3.4) advances only 3 points.
+    // Logical pan differs by 0.4px, but the next texel-aligned paint is equal.
+    close(cur, egui::vec2(-509.6, 700.0));
+    assert!((cur - target).abs().max_elem() < 1.0);
+    let once = drawn_at(&layout, target, 1.0, RectPixelFit::Texels);
+    let split = drawn_at(&layout, cur, 1.0, RectPixelFit::Texels);
+    for (once, split) in once.displayed_pages().zip(split.displayed_pages()) {
+        assert_eq!(once.transform.paint_rect, split.transform.paint_rect);
+        assert_eq!(once.transform.paint_quad(), split.transform.paint_quad());
+        assert_eq!(once.transform.uv_rect, split.transform.uv_rect);
+    }
 }
 
 #[test]
@@ -453,32 +463,59 @@ fn r9_short_trim_visibility_box_rounds_inward_and_retains_one_pixel() {
 
 #[test]
 fn one_two_and_three_physical_pixel_overflow_has_no_dead_band_at_either_edge() {
-    for overflow in [1.0, 2.0, 3.0] {
-        for axis in 0..2 {
-            let mut size = Vec2::splat(1000.0);
-            size[axis] += overflow;
-            let rect = Rect::from_min_size(viewport().min, size);
-            let layout = layout_from_pages(&[DisplayedImageTransform::from_resolved_rect(
-                page_input(0, rect, 1.0, Vec2::ZERO),
-                rect,
-            )
-            .unwrap()]);
-            let mut far = Vec2::ZERO;
-            far[axis] = -100.0;
-            let mut edge = Vec2::ZERO;
-            edge[axis] = -overflow;
-            close(bounded_drag_pan(&layout, Vec2::ZERO, far), edge);
-            let mut before_edge = edge;
-            before_edge[axis] += 1.0;
-            close(bounded_drag_pan(&layout, before_edge, far), edge);
-            far[axis] = 100.0;
-            close(bounded_drag_pan(&layout, edge, far), Vec2::ZERO);
-            let mut before_other_edge = Vec2::ZERO;
-            before_other_edge[axis] = -1.0;
-            close(
-                bounded_drag_pan(&layout, before_other_edge, far),
-                Vec2::ZERO,
-            );
+    for dpi in [1.0, 1.25, 1.5] {
+        let pixel = physical_pixel_scale(dpi);
+        let viewport = Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(1000.0 / dpi));
+        for overflow_px in [1.0, 2.0, 3.0] {
+            for axis in 0..2 {
+                let mut size = Vec2::splat(1000.0);
+                size[axis] += overflow_px;
+                let rect = Rect::from_min_size(viewport.min, size / dpi);
+                let mut input = page_input(0, rect, 1.0, Vec2::ZERO);
+                input.viewport_rect = viewport;
+                input.source_size = size;
+                input.texture_size = size;
+                input.pixels_per_point = dpi;
+                let layout =
+                    layout_from_pages(&[
+                        DisplayedImageTransform::from_resolved_rect(input, rect).unwrap()
+                    ]);
+                let mut far = Vec2::ZERO;
+                far[axis] = -100.0;
+                let mut edge = Vec2::ZERO;
+                edge[axis] = -overflow_px * pixel;
+                close(bounded_drag_pan(&layout, Vec2::ZERO, far), edge);
+                let mut before_edge = edge;
+                before_edge[axis] += pixel;
+                close(bounded_drag_pan(&layout, before_edge, far), edge);
+                far[axis] = 100.0;
+                close(bounded_drag_pan(&layout, edge, far), Vec2::ZERO);
+                let mut before_other_edge = Vec2::ZERO;
+                before_other_edge[axis] = -pixel;
+                close(
+                    bounded_drag_pan(&layout, before_other_edge, far),
+                    Vec2::ZERO,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn physical_pixel_rounding_preserves_fractions_and_repairs_integer_residue() {
+    for dpi in [1.0, 1.25, 1.5] {
+        let pixel = physical_pixel_scale(dpi);
+        for round in [f32::trunc as fn(f32) -> f32, f32::ceil, f32::floor] {
+            for integer in [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0] {
+                for residue in [-0.0005, 0.0005] {
+                    let actual = round_drag_bound_delta((integer + residue) * pixel, pixel, round);
+                    close(Vec2::splat(actual), Vec2::splat(integer * pixel));
+                }
+            }
+            for fraction in [-3.4_f32, -1.75, -1.002, 1.002, 1.75, 3.4] {
+                let actual = round_drag_bound_delta(fraction * pixel, pixel, round);
+                close(Vec2::splat(actual), Vec2::splat(round(fraction) * pixel));
+            }
         }
     }
 }

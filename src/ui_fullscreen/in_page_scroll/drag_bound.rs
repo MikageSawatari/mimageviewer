@@ -1,6 +1,22 @@
 //! Canvas-only drag bounds from the owning display unit's painted geometry.
 use super::*;
 
+/// Treat only arithmetic residue near an integer as a whole physical pixel.
+pub(super) fn round_drag_bound_delta(
+    delta: f32,
+    pixel: f32,
+    round: impl FnOnce(f32) -> f32,
+) -> f32 {
+    let pixels = delta / pixel;
+    let integer = pixels.round();
+    let pixels = if (pixels - integer).abs() <= 1.0e-3 {
+        integer
+    } else {
+        pixels
+    };
+    round(pixels) * pixel
+}
+
 pub(super) fn bounded_drag_pan(layout: &FullscreenPageLayout, cur: Vec2, proposed: Vec2) -> Vec2 {
     if !cur.is_finite() || !proposed.is_finite() {
         return cur;
@@ -34,8 +50,10 @@ pub(super) fn bounded_drag_pan(layout: &FullscreenPageLayout, cur: Vec2, propose
     let mut candidate = cur;
     for axis in 0..2 {
         if unit.size()[axis] > viewport.size()[axis] {
-            let min = cur[axis] + ((viewport.max[axis] - unit.max[axis]) / pixel).trunc() * pixel;
-            let max = cur[axis] + ((viewport.min[axis] - unit.min[axis]) / pixel).trunc() * pixel;
+            let min = cur[axis]
+                + round_drag_bound_delta(viewport.max[axis] - unit.max[axis], pixel, f32::trunc);
+            let max = cur[axis]
+                + round_drag_bound_delta(viewport.min[axis] - unit.min[axis], pixel, f32::trunc);
             candidate[axis] = proposed[axis].clamp(min.min(cur[axis]), max.max(cur[axis]));
         }
     }
@@ -68,13 +86,16 @@ pub(super) fn bounded_drag_pan(layout: &FullscreenPageLayout, cur: Vec2, propose
             }
         }
         // Round into the visibility box, including boxes not containing cur.
-        let min =
-            cur + Vec2::new((bounds.min.x / pixel).ceil(), (bounds.min.y / pixel).ceil()) * pixel;
+        let min = cur
+            + Vec2::new(
+                round_drag_bound_delta(bounds.min.x, pixel, f32::ceil),
+                round_drag_bound_delta(bounds.min.y, pixel, f32::ceil),
+            );
         let max = cur
             + Vec2::new(
-                (bounds.max.x / pixel).floor(),
-                (bounds.max.y / pixel).floor(),
-            ) * pixel;
+                round_drag_bound_delta(bounds.max.x, pixel, f32::floor),
+                round_drag_bound_delta(bounds.max.y, pixel, f32::floor),
+            );
         let allowed = Rect::from_min_max(min.to_pos2(), max.to_pos2()).intersect(movement);
         // A zero-width axis is valid: unrequested axes must remain unchanged.
         if allowed.min.x <= allowed.max.x && allowed.min.y <= allowed.max.y {
@@ -89,29 +110,43 @@ pub(super) fn bounded_drag_pan(layout: &FullscreenPageLayout, cur: Vec2, propose
 }
 
 impl App {
-    pub(crate) fn fs_bounded_drag_pan_surface(&self, ctx: &egui::Context) -> bool {
+    pub(crate) fn fs_bounded_drag_pan_surface(&self, layout_matches: bool) -> bool {
         self.fs_in_page_scroll_surface()
             && !(self.adjustment_mode.is_open()
                 && self.settings.fullscreen_left_panel_tab
                     != crate::settings::FullscreenLeftPanelTab::Bookmarks)
             // A stale receipt must wait for a matching paint, not fall through
             // to the unrestricted writer because an old page was tilted.
-            && (!self.fs_scroll_layout_matches(ctx)
+            && (!layout_matches
                 || self
                     .fullscreen_page_layout
                     .displayed_pages()
                     .all(|page| !crate::displayed_image_transform::free_rotation_is_applied(page.transform.free_rotation_rad)))
     }
 
-    pub(crate) fn apply_fs_bounded_drag_pan(&mut self, ctx: &egui::Context, proposed: Vec2) {
+    /// Return whether this drag belongs to the bounded reader, including waits.
+    pub(crate) fn apply_fs_bounded_drag_pan(
+        &mut self,
+        ctx: &egui::Context,
+        proposed: Vec2,
+    ) -> bool {
+        // Check the static domain before building the geometry key.
+        if !self.fs_bounded_drag_pan_surface(false) {
+            return false;
+        }
+        let layout_matches = self.fs_scroll_layout_matches(ctx);
+        if !self.fs_bounded_drag_pan_surface(layout_matches) {
+            return false;
+        }
         self.clear_fs_initial_placement_request();
-        if !self.fs_scroll_layout_matches(ctx) {
-            return;
+        if !layout_matches {
+            return true;
         }
         let pan = bounded_drag_pan(&self.fullscreen_page_layout, self.fs_pan, proposed);
         if pan != self.fs_pan {
             self.fs_zoom = self.fs_page_scroll_drawn_zoom();
             self.fs_pan = pan;
         }
+        true
     }
 }

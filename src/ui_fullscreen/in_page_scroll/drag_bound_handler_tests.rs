@@ -275,21 +275,21 @@ fn drag_bound_surface_uses_painted_rotation_and_matching_receipt() {
     app.fs_free_rotation = 0.2;
     seed(&ctx, &mut app);
     frame(&ctx, vec![], |_, ctx| {
-        assert!(!app.fs_bounded_drag_pan_surface(ctx))
+        assert!(!app.fs_bounded_drag_pan_surface(app.fs_scroll_layout_matches(ctx)))
     });
     app.spread_mode = SpreadMode::Ltr;
     seed(&ctx, &mut app);
     frame(&ctx, vec![], |_, ctx| {
-        assert!(app.fs_bounded_drag_pan_surface(ctx))
+        assert!(app.fs_bounded_drag_pan_surface(app.fs_scroll_layout_matches(ctx)))
     });
     app.spread_mode = SpreadMode::Single;
     seed(&ctx, &mut app);
     frame(&ctx, vec![], |_, ctx| {
-        assert!(!app.fs_bounded_drag_pan_surface(ctx))
+        assert!(!app.fs_bounded_drag_pan_surface(app.fs_scroll_layout_matches(ctx)))
     });
     app.fullscreen_page_layout.drawn_unit = None;
     frame(&ctx, vec![], |_, ctx| {
-        assert!(app.fs_bounded_drag_pan_surface(ctx))
+        assert!(app.fs_bounded_drag_pan_surface(app.fs_scroll_layout_matches(ctx)))
     });
 }
 
@@ -323,7 +323,7 @@ fn drag_bound_surface_matches_the_actual_paint_rotation_threshold() {
         );
         frame(&ctx, vec![], |_, ctx| {
             assert_eq!(
-                app.fs_bounded_drag_pan_surface(ctx),
+                app.fs_bounded_drag_pan_surface(app.fs_scroll_layout_matches(ctx)),
                 !rotated,
                 "angle={angle}"
             );
@@ -358,7 +358,7 @@ fn drag_bound_bookmarks_tab_keeps_the_reading_boundary_active() {
     app.settings.fullscreen_left_panel_tab = crate::settings::FullscreenLeftPanelTab::Bookmarks;
     app.adjustment_mode = crate::ui_helpers::MetadataPanelOpenState::ByTouchHandle;
     frame(&ctx, vec![], |_, ctx| {
-        assert!(app.fs_bounded_drag_pan_surface(ctx))
+        assert!(app.fs_bounded_drag_pan_surface(app.fs_scroll_layout_matches(ctx)))
     });
     let before = app.fs_pan;
     drag(&mut app, &ctx, Vec2::new(80.0, 40.0));
@@ -372,7 +372,7 @@ fn drag_bound_view_trim_editing_keeps_the_existing_pointer_owner() {
         let (ctx, mut app) = prepared(bound, FullscreenFitMode::Width, 3.0);
         app.view_trim_mode = true;
         frame(&ctx, vec![], |_, ctx| {
-            assert!(!app.fs_bounded_drag_pan_surface(ctx))
+            assert!(!app.fs_bounded_drag_pan_surface(app.fs_scroll_layout_matches(ctx)))
         });
         let expected = clamp_fullscreen_pan_from_layout(
             &app.fullscreen_page_layout,
@@ -400,7 +400,7 @@ fn drag_bound_saved_quarter_rotation_and_upright_spread_with_retained_tilt_are_b
         }
         seed(&ctx, &mut app);
         frame(&ctx, vec![], |_, ctx| {
-            assert!(app.fs_bounded_drag_pan_surface(ctx))
+            assert!(app.fs_bounded_drag_pan_surface(app.fs_scroll_layout_matches(ctx)))
         });
         let geometry = scroll_geometry(&app.fullscreen_page_layout).unwrap();
         let delta = Vec2::splat(-10000.0);
@@ -421,13 +421,19 @@ pub(super) fn render_frame(
     dpi: f32,
     events: Vec<egui::Event>,
 ) -> Vec<DisplayedImageTransform> {
+    assert!(
+        app.fs_prev_focused && app.fs_focus_regained_at.is_none(),
+        "full-render drag fixtures must start already focused, without a focus-regain gesture"
+    );
     app.frame_counter += 1;
     crate::key_input::set_test_frame_for_viewport(ctx.viewport_id(), Vec::new());
     let output = ctx.run_pass(
         egui::RawInput {
             screen_rect: Some(rect),
             focused: true,
-            time: Some(app.frame_counter as f64 / 60.0),
+            // Use egui's previous time + predicted_dt, just like frame() and
+            // run_in_viewport(). Mixing f64 frame_counter/60 with that f32
+            // duration can otherwise move time backwards by a fraction of ns.
             events,
             viewports: [(
                 egui::ViewportId::ROOT,
@@ -474,6 +480,10 @@ fn drag_bound_fractional_zoom_dpi_edges_settle_after_real_repaint() {
             app.settings.fullscreen_bound_drag_pan = true;
             app.settings.fullscreen_fit_mode = FullscreenFitMode::Width;
             app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+            // This suite drags in an already focused viewer. App's default
+            // false would model a focus-regain click, which production owns
+            // for 300 ms using Instant and suppresses through its release.
+            app.fs_prev_focused = true;
             app.fs_zoom = 2.317;
             let rect = Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(1000.0, 800.0));
             render_frame(&mut app, &ctx, rect, dpi, vec![]);
@@ -504,6 +514,10 @@ fn drag_bound_fractional_zoom_dpi_edges_settle_after_real_repaint() {
                     .unwrap();
                 samples.push((app.fs_pan, unit));
             }
+            assert!(
+                app.fs_pan_drag_start.is_some(),
+                "the actual fractional-zoom canvas must own the drag: dpi={dpi}, mode={mode:?}, samples={samples:?}"
+            );
             for pair in samples[3..].windows(2) {
                 assert_eq!(pair[0], pair[1], "dpi={dpi}, mode={mode:?} must settle");
             }
@@ -515,8 +529,25 @@ fn drag_bound_fractional_zoom_dpi_edges_settle_after_real_repaint() {
                 .unwrap()
                 .transform
                 .viewport_rect;
-            assert!((unit.right() - viewport.right()).abs() * dpi <= 2.01);
-            assert!((unit.bottom() - viewport.bottom()).abs() * dpi <= 2.01);
+            let right_residual_px = (unit.right() - viewport.right()) * dpi;
+            let bottom_residual_px = (unit.bottom() - viewport.bottom()) * dpi;
+            let pages: Vec<_> = app
+                .fullscreen_page_layout
+                .displayed_pages()
+                .map(|page| page.transform)
+                .collect();
+            assert!(
+                right_residual_px.abs() <= 2.01,
+                "right residual={right_residual_px}px, bottom residual={bottom_residual_px}px, dpi={dpi}, mode={mode:?}, viewport={viewport:?}, unit={unit:?}, pan={:?}, drag_start={:?}, suppression={:?}, samples={samples:?}, pages={pages:?}",
+                app.fs_pan,
+                app.fs_pan_drag_start,
+                app.fs_primary_suppression
+            );
+            assert!(
+                bottom_residual_px.abs() <= 2.01,
+                "bottom residual={bottom_residual_px}px, right residual={right_residual_px}px, dpi={dpi}, mode={mode:?}, viewport={viewport:?}, unit={unit:?}, pan={:?}, samples={samples:?}, pages={pages:?}",
+                app.fs_pan
+            );
         }
     }
 }
@@ -532,6 +563,7 @@ fn drag_bound_odd_width_spread_settles_at_painted_edge() {
     app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
     app.settings.spread_page_gap_px = 0;
     app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+    app.fs_prev_focused = true;
     install_material(&mut app, &ctx, 0, [1000, 1500]);
     install_material(&mut app, &ctx, 1, [1001, 1500]);
     let rect = Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(1000.0));
@@ -566,10 +598,144 @@ fn drag_bound_odd_width_spread_settles_at_painted_edge() {
             .fold(f32::NEG_INFINITY, f32::max);
         samples.push((app.fs_pan, edge));
     }
+    assert!(
+        app.fs_pan_drag_start.is_some(),
+        "the actual odd-width spread canvas must own the drag: samples={samples:?}"
+    );
     for pair in samples[3..].windows(2) {
         assert_eq!(pair[0], pair[1]);
     }
-    assert!((samples.last().unwrap().1 - initial[0].viewport_rect.right()).abs() <= 2.01);
+    let right_residual_px = samples.last().unwrap().1 - initial[0].viewport_rect.right();
+    let pages: Vec<_> = app
+        .fullscreen_page_layout
+        .displayed_pages()
+        .map(|page| page.transform)
+        .collect();
+    assert!(
+        right_residual_px.abs() <= 2.01,
+        "right residual={right_residual_px}px, viewport={:?}, pan={:?}, drag_start={:?}, suppression={:?}, initial={initial:?}, samples={samples:?}, pages={pages:?}",
+        initial[0].viewport_rect,
+        app.fs_pan,
+        app.fs_pan_drag_start,
+        app.fs_primary_suppression
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn drag_bound_tiny_overflow_crosses_both_actual_painted_edges_and_returns() {
+    let _serial = crate::key_input::lock_test_input();
+    let _cleanup = KeyboardCleanup;
+    for dpi in [1.0, 1.25, 1.5] {
+        // At 1.5 DPI, 1000/1.5 points is rounded by egui's 1/32-point
+        // layout grid to 999.984375 physical pixels. Use 1002 physical
+        // pixels (668 points) so both viewport and image lie on the true
+        // integer grid; the overflow itself is still exactly 1/2/3 pixels.
+        let viewport_px = if dpi == 1.5 { 1002 } else { 1000 };
+        for overflow_px in [1, 2, 3] {
+            for axis in 0..2 {
+                let ctx = egui::Context::default();
+                let mut app = scroll_app(&ctx, SpreadMode::Single);
+                app.settings.fullscreen_bound_drag_pan = true;
+                app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
+                app.settings.fullscreen_side_panel_mode =
+                    crate::settings::FsSidePanelMode::ClickToShow;
+                app.fs_prev_focused = true;
+                let mut size = [viewport_px; 2];
+                size[axis] += overflow_px;
+                install_material(&mut app, &ctx, 0, size);
+                let rect =
+                    Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(viewport_px as f32 / dpi));
+                let initial = render_frame(&mut app, &ctx, rect, dpi, vec![]);
+                assert_eq!(initial.len(), 1);
+                let viewport = initial[0].viewport_rect;
+                let initial_unit = initial[0].paint_rect;
+                assert!(
+                    (viewport.size()[axis] * dpi - viewport_px as f32).abs() < 1.0e-3,
+                    "integer viewport: dpi={dpi}, axis={axis}, viewport={viewport:?}"
+                );
+                assert!(
+                    (initial_unit.size()[axis] * dpi - size[axis] as f32).abs() < 1.0e-3,
+                    "integer image: dpi={dpi}, axis={axis}, page={:?}",
+                    initial[0]
+                );
+                let min_pan = viewport.max[axis] - initial_unit.max[axis];
+                let max_pan = viewport.min[axis] - initial_unit.min[axis];
+                assert!(
+                    ((max_pan - min_pan) * dpi - overflow_px as f32).abs() < 1.0e-3,
+                    "initial physical travel: dpi={dpi}, axis={axis}, min={min_pan}, max={max_pan}, viewport={viewport:?}, unit={initial_unit:?}"
+                );
+                let mut end_pans = Vec::new();
+                for sign in [-1.0, 1.0, -1.0] {
+                    render_frame(
+                        &mut app,
+                        &ctx,
+                        rect,
+                        dpi,
+                        vec![egui::Event::PointerMoved(origin())],
+                    );
+                    render_frame(&mut app, &ctx, rect, dpi, vec![button(origin(), true)]);
+                    let mut delta = Vec2::ZERO;
+                    delta[axis] = sign * 10000.0;
+                    let end = origin() + delta;
+                    let mut samples = Vec::new();
+                    for _ in 0..10 {
+                        let pages = render_frame(
+                            &mut app,
+                            &ctx,
+                            rect,
+                            dpi,
+                            vec![egui::Event::PointerMoved(end)],
+                        );
+                        assert_eq!(pages.len(), 1);
+                        assert!(app.fs_scroll_layout_matches(&ctx));
+                        samples.push((app.fs_pan, pages[0].paint_rect));
+                    }
+                    assert!(
+                        app.fs_pan_drag_start.is_some(),
+                        "the actual canvas must own the tiny-range drag"
+                    );
+                    for pair in samples[3..].windows(2) {
+                        assert_eq!(
+                            pair[0], pair[1],
+                            "tiny edge must settle: dpi={dpi}, overflow={overflow_px}, axis={axis}, sign={sign}, samples={samples:?}"
+                        );
+                    }
+                    let (pan, unit) = samples.last().copied().unwrap();
+                    let expected_pan = if sign < 0.0 { min_pan } else { max_pan };
+                    let edge_error_px = if sign < 0.0 {
+                        (unit.max[axis] - viewport.max[axis]) * dpi
+                    } else {
+                        (unit.min[axis] - viewport.min[axis]) * dpi
+                    };
+                    assert!(
+                        (pan[axis] - expected_pan).abs() * dpi < 1.0e-3,
+                        "tiny pan: dpi={dpi}, overflow={overflow_px}, axis={axis}, sign={sign}, expected={expected_pan}, samples={samples:?}"
+                    );
+                    assert!(
+                        edge_error_px.abs() < 1.0e-3,
+                        "tiny edge gap={edge_error_px}px: dpi={dpi}, overflow={overflow_px}, axis={axis}, sign={sign}, viewport={viewport:?}, samples={samples:?}"
+                    );
+                    assert_eq!(pan[1 - axis], 0.0);
+                    render_frame(&mut app, &ctx, rect, dpi, vec![button(end, false)]);
+                    assert_eq!(
+                        app.fs_pan, pan,
+                        "release must retain the tiny-range endpoint"
+                    );
+                    end_pans.push(pan);
+                }
+                assert!(
+                    ((end_pans[1][axis] - end_pans[0][axis]) * dpi - overflow_px as f32).abs()
+                        < 1.0e-3,
+                    "the entire tiny physical range must remain usable: dpi={dpi}, overflow={overflow_px}, axis={axis}, endpoints={end_pans:?}"
+                );
+                assert_eq!(
+                    end_pans[0], end_pans[2],
+                    "returning to the same edge must not drift"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -599,6 +765,7 @@ fn drag_bound_blank_companion_drag_is_gradual_and_survives_actual_draw_correctio
         app.settings.fullscreen_bound_drag_pan = true;
         app.settings.fullscreen_fit_mode = FullscreenFitMode::Width;
         app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+        app.fs_prev_focused = true;
         app.fs_zoom = 4.0;
         for idx in 0..app.items.len() {
             install_material(&mut app, &ctx, idx, [80, 120]);
@@ -641,12 +808,28 @@ fn drag_bound_blank_companion_drag_is_gradual_and_survives_actual_draw_correctio
             vec![button(origin(), true)],
         );
         let inward = Vec2::new(-side_sign * 10.0, 0.0);
+        // Centering the white slot leaves it fully visible. Moving 10 points
+        // toward the real page stays within both the unit edge and that white
+        // element's minimum-visible box; this expected movement is intentional.
+        close(
+            drag_bound::bounded_drag_pan(&app.fullscreen_page_layout, pan, pan + inward),
+            pan + inward,
+        );
         render_frame(
             &mut app,
             &ctx,
             full_rect(),
             1.0,
             vec![egui::Event::PointerMoved(origin() + inward)],
+        );
+        assert!(
+            app.fs_pan_drag_start.is_some(),
+            "actual canvas must own the white-slot drag: side={page_side:?}, pan={:?}, expected={:?}, focused={}, focus_regained={:?}, suppression={:?}, initial={initial:?}, white={white:?}",
+            app.fs_pan,
+            pan + inward,
+            app.fs_prev_focused,
+            app.fs_focus_regained_at,
+            app.fs_primary_suppression
         );
         close(app.fs_pan, pan + inward);
         render_frame(
@@ -764,6 +947,7 @@ fn drag_bound_provisional_to_complete_material_waits_for_new_paint_then_resumes(
     app.settings.fullscreen_navigator_visible = false;
     app.settings.fullscreen_bound_drag_pan = true;
     app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+    app.fs_prev_focused = true;
     app.window_visible = true;
     app.fs_zoom = 2.0;
     // Hold loader ingress while the test owns material completion.

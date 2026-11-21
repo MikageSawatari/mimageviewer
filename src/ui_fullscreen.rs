@@ -42437,11 +42437,9 @@ impl App {
                     && let Some(proposed_pan) =
                         input.total_drag_delta.map(|delta| start_pan + delta)
                 {
-                    if self.settings.fullscreen_bound_drag_pan
-                        && self.fs_bounded_drag_pan_surface(ctx)
-                    {
-                        self.apply_fs_bounded_drag_pan(ctx, proposed_pan);
-                    } else {
+                    let bounded = self.settings.fullscreen_bound_drag_pan
+                        && self.apply_fs_bounded_drag_pan(ctx, proposed_pan);
+                    if !bounded {
                         self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
                     }
                 }

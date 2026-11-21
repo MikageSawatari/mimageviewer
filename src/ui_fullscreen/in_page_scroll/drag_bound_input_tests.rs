@@ -478,7 +478,7 @@ fn drag_bound_setting_preserves_free_rotated_single_page_canvas_drags() {
         let page = app.fullscreen_page_layout.displayed_pages().next().unwrap();
         assert!(page.transform.free_rotation_rad.abs() > f32::EPSILON);
         frame(&ctx, vec![], |_, ctx| {
-            assert!(!app.fs_bounded_drag_pan_surface(ctx));
+            assert!(!app.fs_bounded_drag_pan_surface(app.fs_scroll_layout_matches(ctx)));
         });
         drag(&mut app, &ctx, Vec2::new(160.0, 80.0));
         assert_ne!(app.fs_pan, Vec2::ZERO);
@@ -497,7 +497,7 @@ fn drag_bound_setting_preserves_free_rotated_single_page_canvas_drags() {
                 .all(|page| { page.transform.free_rotation_rad.abs() <= f32::EPSILON })
         );
         frame(&ctx, vec![], |_, ctx| {
-            assert!(app.fs_bounded_drag_pan_surface(ctx));
+            assert!(app.fs_bounded_drag_pan_surface(app.fs_scroll_layout_matches(ctx)));
         });
 
         app.spread_mode = SpreadMode::Single;
@@ -513,7 +513,7 @@ fn drag_bound_setting_preserves_free_rotated_single_page_canvas_drags() {
                 > f32::EPSILON
         );
         frame(&ctx, vec![], |_, ctx| {
-            assert!(!app.fs_bounded_drag_pan_surface(ctx));
+            assert!(!app.fs_bounded_drag_pan_surface(app.fs_scroll_layout_matches(ctx)));
         });
         let before = app.fs_pan;
         drag(&mut app, &ctx, Vec2::new(-80.0, 40.0));
