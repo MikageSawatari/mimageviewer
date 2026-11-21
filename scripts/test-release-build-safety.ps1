@@ -311,6 +311,7 @@ public static class MivFakeCargo
         // the stage log and failure indices checked below.
         if (args.Length > 0 && args[0] == "metadata")
         {
+            Console.OutputEncoding = new System.Text.UTF8Encoding(false);
             Console.WriteLine(Environment.GetEnvironmentVariable("MIV_FAKE_CARGO_METADATA"));
             return 0;
         }
