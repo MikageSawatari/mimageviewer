@@ -113,6 +113,7 @@ pub(crate) fn frame(
                 &ctx,
                 viewport(),
                 StillSeekGeometry::bar_only(),
+                false,
                 true,
                 None,
             );
@@ -415,6 +416,114 @@ fn section1840_panel_short_tap_does_not_open_viewer_context_menu() {
         assert!(
             app.fs_context_menu_idx.is_none(),
             "panel must own the menu: {mode:?}"
+        );
+    }
+}
+
+fn lock_only_metadata_panel(app: &mut App) {
+    app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+    app.settings.fullscreen_chrome_suppression.info = false;
+    app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::Closed;
+    app.fs_info_panel.hover_active = false;
+    app.fs_info_panel.locked = true;
+    assert!(!app.metadata_panel_click_shown());
+    assert!(!app.fullscreen_tag_picker_open);
+    assert!(app.still_info_panel_lock_effective_for_idx(0, false));
+}
+
+#[test]
+fn section1840_lock_only_metadata_panel_short_tap_stays_open() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for mode in modes() {
+        let ctx = egui::Context::default();
+        let mut app = ready(mode.clone());
+        lock_only_metadata_panel(&mut app);
+        // Inside the drawn panel, away from the right-edge summon strip.
+        let pos = metadata_panel_rect(viewport()).center();
+        press(&mut app, &ctx, pos);
+        let facts = input_frame(&mut app, &ctx, 0.02, vec![right(pos, false)]);
+        assert_eq!(facts.short_tap_at, Some(pos), "{mode:?}: {facts:?}");
+        assert_eq!(facts.egui_click_at, Some(pos));
+        assert!(
+            facts.continued && !facts.close_requested,
+            "{mode:?}: {facts:?}"
+        );
+        assert!(!app.fs_info_panel.hover_active);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.fs_context_menu_idx.is_none());
+    }
+}
+
+#[test]
+fn section1840_lock_only_metadata_panel_left_click_does_not_turn_page() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for locked in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = ready(RightDragMode::Disabled);
+        lock_only_metadata_panel(&mut app);
+        app.fs_info_panel.locked = locked;
+        let pos = metadata_panel_rect(viewport()).center();
+        let mut action = FsCanvasClickAction::None;
+        for pass in 0..3 {
+            let mut events = vec![egui::Event::PointerMoved(pos)];
+            if pass > 0 {
+                events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: pass == 1,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(viewport()),
+                    time: Some(pass as f64 * 0.02),
+                    focused: true,
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.capture_fs_front_pointer_input(&ctx, viewport());
+                    let response = ui.interact(
+                        viewport(),
+                        egui::Id::unique("section1840_lock_only_canvas"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    app.fs_front_pointer.accept_backing_click(&response, false);
+                    if pass == 2 {
+                        assert!(
+                            response.clicked(),
+                            "the real canvas click must reach its handler"
+                        );
+                    }
+                    action = app.plan_fs_canvas_click(
+                        &ctx,
+                        &response,
+                        viewport(),
+                        StillSeekGeometry::bar_only(),
+                        false,
+                        false,
+                        false,
+                        true,
+                        None,
+                        false,
+                        1.0,
+                        egui::Vec2::ZERO,
+                    );
+                },
+            )
+            .drop_without_applying_deltas();
+        }
+        assert!(!app.fs_info_panel.hover_active);
+        assert!(
+            if locked {
+                matches!(action, FsCanvasClickAction::None)
+            } else {
+                matches!(action, FsCanvasClickAction::PageSide(_))
+            },
+            "only the lock makes this panel visible: locked={locked}"
         );
     }
 }

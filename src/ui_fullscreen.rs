@@ -25869,6 +25869,18 @@ impl App {
             && self.still_info_panel_eligible_for_idx(fs_idx, is_video)
     }
 
+    /// Use the draw owner's visibility with the effective (mode-gated) lock.
+    /// Wheel and click admission must agree even when only the lock shows the panel.
+    fn fullscreen_info_panel_visible_for_idx(&self, fs_idx: Option<usize>, is_video: bool) -> bool {
+        let mut panel_state = self.fs_info_panel;
+        panel_state.locked =
+            fs_idx.is_some_and(|idx| self.still_info_panel_lock_effective_for_idx(idx, is_video));
+        panel_state.visible(
+            self.settings.fullscreen_side_panel_mode,
+            self.fullscreen_tag_picker_open,
+        )
+    }
+
     fn still_info_panel_eligible_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
         still_info_panel_lock_effective(
             true,
@@ -40966,16 +40978,8 @@ impl App {
         // **「パネルが出ているか」をここで綴り直さない** (backlog §1.158)。描画側と別の式に
         // すると、ロックだけで出ているパネルの上でホイールが画像へ抜ける (実機報告
         // 2026-09-02)。答えは `FullscreenInfoPanelState` が 1 か所で出す。
-        let has_right_panel = {
-            let mut panel_state = self.fs_info_panel;
-            panel_state.locked = panel_fs_idx.is_some_and(|idx| {
-                self.still_info_panel_lock_effective_for_idx(idx, state.is_video)
-            });
-            panel_state.visible(
-                self.settings.fullscreen_side_panel_mode,
-                self.fullscreen_tag_picker_open,
-            )
-        };
+        let has_right_panel =
+            self.fullscreen_info_panel_visible_for_idx(panel_fs_idx, state.is_video);
         let music_modal_open = music_view_active
             && (self.music_bookmark_modal_open()
                 || panel_fs_idx.is_some_and(|idx| self.music_normalize_modal_active(idx)));
@@ -41911,6 +41915,7 @@ impl App {
             ctx,
             full_rect,
             seek_geometry,
+            state.is_video,
             side_panel_chrome_enabled,
             navigator_exclusion,
         );
@@ -42818,6 +42823,7 @@ impl App {
                 _ctx,
                 full_rect,
                 seek_geometry,
+                is_video,
                 side_panel_chrome_enabled,
                 navigator_exclusion,
             )
@@ -42841,12 +42847,12 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
         seek_geometry: StillSeekGeometry,
+        is_video: bool,
         chrome_enabled: bool,
         navigator_exclusion: Option<egui::Rect>,
     ) -> FullscreenSidePanelClickChrome {
-        let has_right_panel = self.metadata_panel_click_shown()
-            || self.fs_info_panel.hover_active
-            || self.fullscreen_tag_picker_open;
+        let has_right_panel =
+            self.fullscreen_info_panel_visible_for_idx(self.fullscreen_idx, is_video);
         FullscreenSidePanelClickChrome {
             panels: fullscreen_side_panel_rects_with_seek_height(
                 full_rect,

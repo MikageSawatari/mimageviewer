@@ -110,6 +110,38 @@ fn install(ctx: &egui::Context) {
 }
 
 #[test]
+fn section1840_lock_only_metadata_panel_wheel_stays_with_panel() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    for locked in [false, true] {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.settings.fullscreen_navigator_visible = false;
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+        app.settings.fullscreen_chrome_suppression.info = false;
+        app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::Closed;
+        app.fs_info_panel.hover_active = false;
+        app.fs_info_panel.locked = locked;
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+        let pos = metadata_panel_rect(full).center();
+        frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                wheel(-120.0, egui::Modifiers::NONE),
+            ],
+            |ui| {
+                let (result, _) = actual_merge(&mut app, ui, false);
+                assert!(!app.fs_info_panel.hover_active);
+                assert_eq!(result.page_nav.is_none(), locked, "locked={locked}");
+                assert_eq!(result.wheel_navigation_produced, !locked, "locked={locked}");
+            },
+        );
+    }
+}
+
+#[test]
 fn fullscreen_side_panel_mixed_ctrl_and_plain_line_wheel_preserves_scrollarea_tail() {
     use crate::wheel_input::tests::smoothing_input;
     #[cfg(windows)]

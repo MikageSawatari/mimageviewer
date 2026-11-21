@@ -1655,7 +1655,12 @@ egui 音楽ビューも同じ mode と App runtime を使う。3 面とも Click
 静止画の左クリックと右クリック短押しは `FullscreenSidePanelClickChrome::contains_pointer` で
 左右パネル・呼び出し帯・ナビゲータ除外・Depth パネルの当たり判定を共有する。
 `App::fs_side_panel_click_chrome` が入力時の可視状態とシーク領域高から矩形を作り、遅延する
-wheel/click proposal にもその幾何を保持する。左クリックの既存の除外範囲は維持する。
+wheel/click proposal にもその幾何を保持する。右情報パネルの可視性は
+`App::fullscreen_info_panel_visible_for_idx` が有効なロックを反映して
+`FullscreenInfoPanelState::visible` から取得し、ホイールとクリックで共有する。
+ロックだけで表示している右パネルもクリックを受け持ち、左クリックで背面のページを送らない。
+左補正パネルは `adjustment_mode.is_open()` が表示状態の正本で、別のロックはない。
+これ以外の左クリックの除外範囲は維持する。
 右は egui の `released_buttons_with_click_counts` のクリック成立情報を対応する release に結び付け、
 `apply_fs_secondary_input` で確定した ShortTap（コマンドなし）だけをパネルへ渡す。
 終了予定の判定も同じ条件を使い、raw input は消費しないので後段のタグメニューが開ける。
