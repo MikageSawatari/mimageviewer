@@ -4,8 +4,8 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::folder_pane::{
-    self, FolderPaneCommand, FolderPaneCursorScroll, FolderPaneLabelDisplay, FolderPaneLabelResult,
-    FolderPaneLabelWidgets, FolderPaneListingOptions, FolderPaneTreeKey,
+    self, FolderPaneActivation, FolderPaneCommand, FolderPaneCursorScroll, FolderPaneLabelDisplay,
+    FolderPaneLabelResult, FolderPaneLabelWidgets, FolderPaneListingOptions, FolderPaneTreeKey,
 };
 use crate::ui_main::AddressBarNav;
 
@@ -788,7 +788,7 @@ impl App {
     pub(crate) fn render_folder_pane(
         &mut self,
         root_ui: &mut egui::Ui,
-    ) -> (Option<std::path::PathBuf>, Option<egui::Rect>) {
+    ) -> (Option<FolderPaneActivation>, Option<egui::Rect>) {
         let ctx = &root_ui.ctx().clone();
         if !self.settings.folder_tree_pane_visible {
             close_folder_pane_paste_menu(ctx);
@@ -909,7 +909,19 @@ impl App {
         self.folder_pane.set_branch_expanded(path, expanded);
     }
 
-    fn render_folder_pane_tree(&mut self, ui: &mut egui::Ui) -> Option<std::path::PathBuf> {
+    fn folder_pane_name_activation(&self, path: std::path::PathBuf) -> FolderPaneActivation {
+        if self
+            .folder_pane
+            .active_path()
+            .is_some_and(|active| crate::folder_tree::path_eq(active, &path))
+        {
+            FolderPaneActivation::RefreshActive(path)
+        } else {
+            FolderPaneActivation::Open(path)
+        }
+    }
+
+    fn render_folder_pane_tree(&mut self, ui: &mut egui::Ui) -> Option<FolderPaneActivation> {
         self.render_folder_pane_tree_with(
             ui,
             crate::app::main_drop::clipboard_has_drop_files,
@@ -922,7 +934,7 @@ impl App {
         ui: &mut egui::Ui,
         mut clipboard_files: impl FnMut() -> bool,
         mut paste: impl FnMut(&mut Self, &egui::Context, std::path::PathBuf),
-    ) -> Option<std::path::PathBuf> {
+    ) -> Option<FolderPaneActivation> {
         if ui.ctx().viewport_id() != egui::ViewportId::ROOT {
             return None;
         }
@@ -948,11 +960,7 @@ impl App {
                     self.folder_pane.set_cursor(path.clone());
                     // The last name activation replaces even an earlier move
                     // candidate when it selects the current location.
-                    nav = self
-                        .folder_pane
-                        .active_path()
-                        .is_none_or(|active| !crate::folder_tree::path_eq(active, &path))
-                        .then_some(path);
+                    nav = Some(self.folder_pane_name_activation(path));
                     pointer_row_clicked = true;
                     self.folder_pane.cursor_scroll = FolderPaneCursorScroll::Idle;
                 }
@@ -1139,11 +1147,7 @@ impl App {
                     self.folder_pane.clear_label_click();
                     self.folder_pane.set_focus_tree();
                     self.folder_pane.set_cursor(row.path.clone());
-                    nav = self
-                        .folder_pane
-                        .active_path()
-                        .is_none_or(|active| !crate::folder_tree::path_eq(active, &row.path))
-                        .then(|| row.path.clone());
+                    nav = Some(self.folder_pane_name_activation(row.path.clone()));
                 }
                 if cursor_scroll != FolderPaneCursorScroll::Idle && row.is_cursor {
                     cursor_drawn = true;

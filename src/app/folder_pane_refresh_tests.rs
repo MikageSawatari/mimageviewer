@@ -6,6 +6,9 @@ use std::time::SystemTime;
 #[path = "folder_pane_reclick_tests.rs"]
 mod reclick;
 
+#[path = "folder_pane_reclick_stage2_tests.rs"]
+mod reclick_stage2;
+
 // These UI fixtures represent the main pane after startup admission. The
 // headless App constructor never drives NotStarted into a terminal indexer
 // outcome, so explicitly select the no-indexer outcome at fixture creation.
@@ -1446,8 +1449,11 @@ fn ordered_other_then_active_clears_navigation(accesskit: bool) {
                     .any(|row| row.path == a && row.is_cursor)
             );
             assert_eq!(
-                folder_pane_nav, None,
-                "the last single click on the active row retires B's candidate"
+                folder_pane_nav,
+                Some(crate::folder_pane::FolderPaneActivation::RefreshActive(
+                    a.clone()
+                )),
+                "the last single click on the active row replaces B's candidate with A's refresh"
             );
             let grid_nav = app.render_grid(ui);
             app.post_render_main_navigation(

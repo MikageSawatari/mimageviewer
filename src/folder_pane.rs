@@ -49,6 +49,13 @@ pub(crate) enum FolderPaneCommand {
     Open(PathBuf),
 }
 
+/// The last name activation in one pass replaces every earlier name activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FolderPaneActivation {
+    Open(PathBuf),
+    RefreshActive(PathBuf),
+}
+
 /// The sole owner of an ordered primary-pointer gesture in the tree.
 #[derive(Debug, Default)]
 enum FolderPaneLabelGesture {
@@ -799,6 +806,19 @@ impl FolderPaneState {
                 }
             }
             self.ensure_node(pair[1].clone());
+        }
+    }
+
+    /// Recheck only the existing displayed demand. Keep cached rows and every
+    /// presentation/input owner intact, including a pending double-click gesture.
+    pub(crate) fn recheck_displayed(&mut self) {
+        let paths: Vec<_> = self
+            .demand
+            .iter()
+            .filter_map(|key| self.nodes.get(key).map(|node| node.path.clone()))
+            .collect();
+        for path in paths {
+            self.request_recheck(&path);
         }
     }
 

@@ -642,6 +642,7 @@ pub(crate) mod book_preferred_rating;
 use book_preferred_rating::{ContainerRatingTarget, ContainerRatingToast};
 #[cfg(test)]
 mod book_preferred_rating_tests;
+mod folder_pane_reclick;
 pub(crate) mod folder_scan;
 #[cfg(test)]
 mod media_resume_meter_tests;

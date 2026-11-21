@@ -250,6 +250,7 @@ fn reclick_single_scenario(mtime: bool, order: crate::settings::SortOrder) {
     let tree_gate = app.folder_pane.test_hold_next_scan(a.clone());
     #[cfg(all(windows, feature = "test-script"))]
     let loads = app.test_script_folder_load_requests;
+    let caller_scans = folder_scan::caller_scan_count_for_test();
     // Put both edges in one real pass: the intent is captured at arbitration,
     // after the same production drawing/input phases as all other tree tests.
     navigation_tree_frame_height_before_navigation(
@@ -277,6 +278,11 @@ fn reclick_single_scenario(mtime: bool, order: crate::settings::SortOrder) {
     );
     reclick_refresh_id(&app, &a);
     assert_eq!(
+        folder_scan::caller_scan_count_for_test(),
+        caller_scans,
+        "reclick must not enumerate the directory on the input thread"
+    );
+    assert_eq!(
         reclick_physical_request(&app).restore_intent,
         expected_intent
     );
@@ -301,6 +307,7 @@ fn reclick_single_scenario(mtime: bool, order: crate::settings::SortOrder) {
     // Release the existing tree worker and let both production adoption paths finish.
     drop(tree_gate);
     settle(&mut app, &ctx);
+    assert_eq!(folder_scan::caller_scan_count_for_test(), caller_scans);
     assert_eq!(app.selected_real_file_path(), Some(selected_path));
     assert_eq!(app.grid_scroll.row_anchor(), Some(1));
     settle_navigation_tree_scans(&mut app, &ctx, &mut frame, 600.0);
