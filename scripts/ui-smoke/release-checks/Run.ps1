@@ -17,6 +17,7 @@ $preflight=Invoke-ReleaseCheckPreflight {
 if($FromKit){
     . (Join-Path $scripts 'relcheck-kit\KitSupport.ps1')
     $script:expectedFingerprint=Assert-ReleaseCheckKit $repo
+    Assert-ReleaseCheckKitRunRoot $repo
     $env:PYTHONDONTWRITEBYTECODE='1'
 }
 Assert-ReleaseCheckPaths $repo $exe $data $run

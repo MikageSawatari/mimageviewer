@@ -19,6 +19,7 @@ $null = Assert-ExactPath $SleepEvidencePath (Join-Path $OutputDirectory 'complet
 if($FromKit){
     . (Join-Path $scripts 'relcheck-kit\KitSupport.ps1')
     $expectedFingerprint=Get-ReleaseCheckKitExpectedFingerprint $repo
+    Assert-ReleaseCheckKitRunRoot $repo
     $env:PYTHONDONTWRITEBYTECODE='1'
 }else{$expectedFingerprint=Get-MivSourceFingerprint $repo}
 Assert-ReleaseCheckArtifact $repo -ExpectedSourceFingerprint $expectedFingerprint

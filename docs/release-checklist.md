@@ -329,20 +329,28 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
 9.6. **perf smoke** (正規手順は idle 5ケースと合わせた ReleaseChecks suite。毎リリース実施。
    **2026-11-21 から、公開前にサブ PC で流す**。利用者決定: メイン PC では build 直後に計測が急に始まり、
    その間 PC に触れなくなるため):
-   1. **メイン PC で診断 portable とキットを作る** (計測も起動もしない)。配布ビルドの入力と同じコミットで作る。
-      作業ツリーの `scripts/` と、指紋の対象のソースがコミット済みで clean であること (違えばキット作成が止まる)。
+   1. **メイン PC で診断 portable とキットを作る** (計測も起動もしない)。診断 portable は、
+      **専用の worktree `C:\miv-relcheck\root`** を配布ビルドの入力と同じコミットに合わせて、その中でビルドする。
+      試験用ビルドは「証拠フォルダがビルドした repository root の下にあること」を確かめるので、サブ PC でもキットを
+      **同じ path `C:\miv-relcheck\root`** に置く必要がある (サブ PC には C: しか無く、`C:\home\mimageviewer` は別の用途で使用中)。
       ```powershell
+      git -C C:\miv-relcheck\root checkout --detach <配布ビルドの入力のコミット>
+      cd C:\miv-relcheck\root
       .\scripts\prepare-portable-smoke.ps1 -TestScript
       .\scripts\relcheck-kit\New-ReleaseCheckKit.ps1
       ```
-      エージェントは 1 行目を `run-heavy.ps1` 経由で流す (約 7.5 分)。キットは
-      `C:\home\mimageviewer-subpc\relcheck\relcheck-<artifact の HEAD 先頭 9 桁>-<UTC 日時>\` にでき、
-      最後に表示される `Kit manifest SHA-256` を依頼文とリリース記録に写す。
-      別の worktree (例: タグの detached worktree) の artifact を使うときは `-ArtifactRepo <その root>` を付ける。
+      エージェントは 3 行目を `run-heavy.ps1` 経由で流す (初回や大きな更新の後は全ビルド、以後は差分)。
+      この worktree の `vendor\` は実体コピー (junction 禁止)。vendor の中身が変わった版では、ビルドのエラーが示すフォルダを
+      `C:\home\mimageviewer\vendor\` からコピーし直す。worktree が無ければ
+      `git worktree add --detach C:\miv-relcheck\root <コミット>` で作り、[git-workflow.md](git-workflow.md) の決まりどおり vendor を実体コピーする。
+      キットは `C:\home\mimageviewer-subpc\relcheck\relcheck-<artifact の HEAD 先頭 9 桁>-<UTC 日時>\` にでき、
+      最後に表示される `Kit manifest SHA-256` と `Run root on the sub-PC` を依頼文とリリース記録に写す。
+      `scripts/` と指紋の対象のソースがコミット済みで clean でなければ、キット作成は止まる。
    2. **統括がサブ PC 担当へ依頼する**。依頼文は [サブ PC の ReleaseChecks 依頼の雛形](subpc-release-checks-brief.md) から作る。
       ほかのサブ PC 依頼・夜間試験の時間枠 (01:00〜07:00) と重ねない。メイン PC 側では RDP の接続を切らず、
       RDP の窓を最小化しない (サブ PC の画面描画と前面の判定が成り立たなくなる)。メイン PC の作業は続けてよい。
-   3. **サブ PC 担当が流す** (雛形の手順): キットをローカルへコピー → `Test-SubPcEnvironment.ps1` (mIV を起動せず、
+   3. **サブ PC 担当が流す** (雛形の手順): キットをサブ PC の `C:\miv-relcheck\root` へコピー (前のキットがあれば名前を変えて退避。
+      違う path に置くと、事前確認と本番は mIV を起動する前に止まる) → `Test-SubPcEnvironment.ps1` (mIV を起動せず、
       使い捨ての窓で前面の条件を確かめる) が READY なら、**ターミナル パネルから**
       `.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -FromKit -InteractiveApproved` → run フォルダをメイン PC の
       `C:\home\mimageviewer-subpc\relcheck\<kit-id>-results\` へ戻す。所要はコピーを除き約 10 分。

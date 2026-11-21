@@ -9,7 +9,7 @@ $ErrorActionPreference='Stop'
 Set-StrictMode -Version 2
 . (Join-Path $PSScriptRoot 'KitSupport.ps1')
 $scriptsRepo=(Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
-$ArtifactRepo=(Resolve-Path -LiteralPath $ArtifactRepo).Path
+$ArtifactRepo=[IO.Path]::GetFullPath((Resolve-Path -LiteralPath $ArtifactRepo).Path).TrimEnd('\','/')
 . (Join-Path $scriptsRepo 'scripts\ui-smoke\release-checks\Support.ps1')
 
 function Get-KitGitOutput {
@@ -56,6 +56,7 @@ try{
         (Join-Path $package 'mimageviewer-mcp.exe') (Join-Path $package 'mimageviewer-musicvideo.exe')
 }catch{throw ('Invalid diagnostic package; rebuild with prepare-portable-smoke.ps1 -TestScript. '+$_.Exception.Message)}
 $artifactManifest=Get-Content -LiteralPath (Join-Path $package '.test-script-build.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+Assert-ReleaseCheckDiagnosticBuildRoot (Join-Path $package 'mimageviewer.exe') $ArtifactRepo
 if(-not $FfmpegPath){$FfmpegPath=(Get-Command ffmpeg.exe -ErrorAction Stop).Source}
 $FfmpegPath=(Resolve-Path -LiteralPath $FfmpegPath).Path
 Assert-ReleaseCheckKitNoReparsePath $FfmpegPath
@@ -86,7 +87,7 @@ $recordPath=Join-Path $kitRoot 'source-fingerprint-records.txt'
 if((Get-FileHash -LiteralPath $recordPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $fingerprint){throw 'Source records changed while preparing kit.'}
 $kit=[ordered]@{
     schema_version=1;kit_id=$kitId;created_utc=[DateTime]::UtcNow.ToString('o');scripts_source_head=$scriptsHead
-    artifact=@{source_head=$artifactHead;source_fingerprint_sha256=$fingerprint;manifest=$artifactManifest}
+    artifact=@{source_head=$artifactHead;source_fingerprint_sha256=$fingerprint;manifest=$artifactManifest;build_root=$ArtifactRepo}
     ffmpeg=@{version=[string]$ffmpegVersion[0];sha256=(Get-FileHash -LiteralPath (Join-Path $tools 'ffmpeg.exe') -Algorithm SHA256).Hash.ToLowerInvariant()}
     files=@(Get-ReleaseCheckKitFileRecords $kitRoot)
 }
@@ -97,3 +98,4 @@ $digest=(Get-FileHash -LiteralPath $json -Algorithm SHA256).Hash.ToLowerInvarian
 $null=Assert-ReleaseCheckKit $kitRoot
 Write-Host "Kit: $kitRoot"
 Write-Host "Kit manifest SHA-256: $digest"
+Write-Host "Run root on the sub-PC: $ArtifactRepo"

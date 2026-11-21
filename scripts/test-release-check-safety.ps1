@@ -17,6 +17,27 @@ function Get-TestAst {
     return $ast
 }
 $repo=Split-Path $PSScriptRoot -Parent
+& {
+    # Inspect wrappers as text only: they must never launch from this test.
+    $expected=[ordered]@{
+        'Run-SubPcProbe.cmd'='powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Test-SubPcEnvironment.ps1"'
+        'Run-SubPcSuite.cmd'='powershell -NoProfile -ExecutionPolicy Bypass -File "%CD%\scripts\ui-smoke.ps1" -Scenario ReleaseChecks -FromKit -InteractiveApproved'
+    }
+    foreach($entry in $expected.GetEnumerator()){
+        $path=Join-Path $PSScriptRoot ('relcheck-kit\'+$entry.Key)
+        Assert-True (Test-Path -LiteralPath $path -PathType Leaf) "Wrapper missing: $($entry.Key)"
+        Assert-True (@([IO.File]::ReadAllBytes($path) | Where-Object {$_ -gt 127}).Count -eq 0) "Non-ASCII wrapper: $($entry.Key)"
+        $text=[IO.File]::ReadAllText($path)
+        $lines=@($text -split '\r?\n' | ForEach-Object {$_.Trim()} | Where-Object {$_})
+        Assert-True ($lines[0] -ceq '@echo off' -and $lines[1] -ceq 'setlocal') "Wrapper initialization changed: $($entry.Key)"
+        Assert-True ($text.Contains('cd /d "%~dp0..\.."')) "Wrapper does not enter its quoted kit root: $($entry.Key)"
+        $calls=@($lines | Where-Object {$_ -match '^powershell(?:\.exe)?\s'})
+        Assert-True ($calls.Count -eq 1 -and $calls[0] -ceq $entry.Value) "Wrapper calls unexpected script/options: $($entry.Key)"
+        Assert-True (-not $text.Contains('%*') -and $text -notmatch '%[1-9]') "Wrapper accepts external arguments: $($entry.Key)"
+        Assert-True ($text.Contains('set "relcheck_exit=%ERRORLEVEL%"') -and $text.Contains('echo EXIT=%relcheck_exit%') -and
+            $text.Contains('exit /b %relcheck_exit%')) "Wrapper does not display/return the captured exit code: $($entry.Key)"
+    }
+}
 Assert-True (Test-ReleaseCheckContinueAfterAnalysis 'perf-cached' 1) 'Cached performance FAIL prevented independent uncached evidence.'
 Assert-True (Test-ReleaseCheckContinueAfterAnalysis 'perf-uncached' 0) 'Successful case prevented continuation.'
 foreach($case in @('static-foreground','tray-close-after-loading','perf-uncached')){
@@ -426,7 +447,7 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
             $build[$entry.Key+'_sha256']=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
         }
         Write-FakeFile (Join-Path $root 'target\portable-smoke-package\.test-script-build.json') ($build|ConvertTo-Json -Depth 5)
-        $manifest=[ordered]@{schema_version=1;kit_id='relcheck-fake';scripts_source_head=('b'*40);artifact=@{source_head=('a'*40);source_fingerprint_sha256=$fingerprint;manifest=$build};ffmpeg=@{};files=@()}
+        $manifest=[ordered]@{schema_version=1;kit_id='relcheck-fake';scripts_source_head=('b'*40);artifact=@{source_head=('a'*40);source_fingerprint_sha256=$fingerprint;manifest=$build;build_root=$root};ffmpeg=@{};files=@()}
         Seal-FakeKit $root $manifest
         return $root
     }
@@ -461,6 +482,35 @@ Path(sys.argv[3]).write_text(release_record(summary), encoding='utf-8')
         $root=New-FakeKit 'valid'
         $fingerprint=Assert-ReleaseCheckKit $root
         Assert-True ($fingerprint.Length -eq 64) 'Valid fake kit rejected.'
+        Assert-ReleaseCheckKitRunRoot $root
+        Assert-ReleaseCheckKitRunRoot ($root.ToUpperInvariant()+'\')
+        $stored=New-FakeKit 'different-build-root'
+        $storedManifest=Get-Content -LiteralPath (Join-Path $stored 'release-check-kit.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+        $requiredRoot=Join-Path $testRoot 'required-run-root'
+        $storedManifest.artifact.build_root=$requiredRoot
+        Seal-FakeKit $stored $storedManifest
+        $null=Assert-ReleaseCheckKit $stored # storage/Receive may use another root
+        $message=''
+        try{Assert-ReleaseCheckKitRunRoot $stored}catch{$message=$_.Exception.Message}
+        Assert-True ($message -ceq "Kit must be placed at $requiredRoot (the diagnostic build validates evidence paths against its build root); current root is $stored.") 'Run-root mismatch did not explain the required/current roots.'
+        foreach($invalidRoot in @($null,'','  ','relative-root','C:relative-root','\drive-relative-root')){
+            if($null -eq $invalidRoot){$storedManifest.artifact.PSObject.Properties.Remove('build_root')}
+            else{$storedManifest.artifact | Add-Member -MemberType NoteProperty -Name build_root -Value $invalidRoot -Force}
+            Seal-FakeKit $stored $storedManifest
+            Assert-Throws {Read-ReleaseCheckKitManifest $stored} 'Missing/invalid build_root was accepted.'
+        }
+        $embeddedFile=Join-Path $testRoot 'embedded-root.bin'
+        $embeddedRoot='G:\'+[char]0x30C6+'\build-root'
+        [byte[]]$payload=@(0,255)+[Text.Encoding]::UTF8.GetBytes($embeddedRoot)+@(0,254)
+        [IO.File]::WriteAllBytes($embeddedFile,$payload)
+        Assert-ReleaseCheckDiagnosticBuildRoot $embeddedFile $embeddedRoot
+        $message=''
+        try{Assert-ReleaseCheckDiagnosticBuildRoot $embeddedFile 'G:\different-root'}catch{$message=$_.Exception.Message}
+        Assert-True ($message -ceq 'diagnostic exe does not embed the recorded build root') 'Missing embedded build root was accepted or lost its reason.'
+        $support=Get-TestAst (Join-Path $PSScriptRoot 'relcheck-kit\KitSupport.ps1')
+        $embedding=$support.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Assert-ReleaseCheckDiagnosticBuildRoot'},$true)
+        $reads=@($embedding.FindAll({param($n)$n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Member.Extent.Text -eq 'ReadAllBytes'},$true))
+        Assert-True ($reads.Count -eq 1) 'Embedded build-root check reads the executable more than once.'
         & {
             $hashPaths=New-Object 'Collections.Generic.List[string]'
             function Get-ChildItem {throw 'Light kit validation enumerated the tree.'}
@@ -686,6 +736,10 @@ Path(sys.argv[3]).write_text(release_record(summary), encoding='utf-8')
             $build=Get-Content -LiteralPath $buildPath -Encoding UTF8 -Raw | ConvertFrom-Json
             $build.source_head=[string](Invoke-FixtureGit $artifactRepo @('rev-parse','HEAD'))
             $build.source_fingerprint_sha256=Get-MivSourceFingerprint $artifactRepo
+            $corePath=Join-Path $artifactRepo 'target\portable-smoke-package\mimageviewer.exe'
+            $coreText='fake diagnostic core; embedded root: '+$artifactRepo
+            Write-FakeFile $corePath $coreText
+            $build.core_sha256=(Get-FileHash -LiteralPath $corePath -Algorithm SHA256).Hash.ToLowerInvariant()
             Write-FakeFile $buildPath ($build|ConvertTo-Json -Depth 5)
             $fakeFfmpeg=Join-Path $testRoot 'fake-tools\ffmpeg.ps1'
             Write-FakeFile $fakeFfmpeg 'param([switch]$version) "ffmpeg fake test version"; $global:LASTEXITCODE=0'
@@ -696,7 +750,23 @@ Path(sys.argv[3]).write_text(release_record(summary), encoding='utf-8')
             Assert-True ($creation.code -eq 0) ('Fixture kit creation failed: '+$creation.text)
             $kits=@(Get-ChildItem -LiteralPath $outputRoot -Directory)
             Assert-True ($kits.Count -eq 1 -and (Assert-ReleaseCheckKit $kits[0].FullName) -eq $build.source_fingerprint_sha256) 'Created fixture kit did not self-verify.'
+            $createdManifest=Read-ReleaseCheckKitManifest $kits[0].FullName
+            Assert-True ($createdManifest.artifact.build_root -ceq ([IO.Path]::GetFullPath($artifactRepo).TrimEnd('\')) -and
+                $creation.text.Contains("Run root on the sub-PC: $artifactRepo")) 'Kit creation did not record/display the normalized artifact build root.'
+            Assert-Throws {Assert-ReleaseCheckKitRunRoot $kits[0].FullName} 'Stored kit incorrectly accepted its storage root as the run root.'
+            Assert-ReleaseCheckDiagnosticBuildRoot (Join-Path $kits[0].FullName 'target\portable-smoke-package\mimageviewer.exe') $createdManifest.artifact.build_root
             Assert-True (Test-Path -LiteralPath (Join-Path $kits[0].FullName 'tools\ffmpeg\test.dll')) 'Kit creation lost companion FFmpeg DLL.'
+            # Even a hash-consistent package must embed the recorded source root.
+            Write-FakeFile $corePath 'fake core without a build root'
+            $build.core_sha256=(Get-FileHash -LiteralPath $corePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-FakeFile $buildPath ($build|ConvertTo-Json -Depth 5)
+            $noRootOutput=Join-Path $testRoot 'rejected-embedded-root'
+            $creation=Invoke-KitSafetyChild @('-File',$creator,'-ArtifactRepo',$artifactRepo,'-OutputRoot',$noRootOutput,'-FfmpegPath',$fakeFfmpeg)
+            Assert-True ($creation.code -ne 0 -and $creation.text.Contains('diagnostic exe does not embed the recorded build root') -and
+                -not (Test-Path -LiteralPath $noRootOutput)) 'Kit creation accepted a core without the recorded build root.'
+            Write-FakeFile $corePath $coreText
+            $build.core_sha256=(Get-FileHash -LiteralPath $corePath -Algorithm SHA256).Hash.ToLowerInvariant()
+            Write-FakeFile $buildPath ($build|ConvertTo-Json -Depth 5)
             # scripts/build-portable.ps1 is outside the product fingerprint list:
             # this independent gate must reject an uncommitted imported helper.
             Add-Content -LiteralPath (Join-Path $artifactRepo 'scripts\build-portable.ps1') -Encoding ASCII -Value '# uncommitted imported helper'
@@ -755,6 +825,17 @@ Path(sys.argv[3]).write_text(release_record(summary), encoding='utf-8')
             foreach($call in $pythonCalls){Assert-True ($call.Extent.StartOffset -gt $assignments[0].Extent.StartOffset) "Python starts before bytecode policy: $relative"}
         }
         $probe=Get-TestAst (Join-Path $PSScriptRoot 'relcheck-kit\Test-SubPcEnvironment.ps1')
+        foreach($relative in @('ui-smoke\release-checks\Run.ps1','ui-smoke\release-checks\Sampler.ps1','relcheck-kit\Test-SubPcEnvironment.ps1')){
+            $ast=Get-TestAst (Join-Path $PSScriptRoot $relative)
+            $checks=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Assert-ReleaseCheckKitRunRoot'},$true))
+            Assert-True ($checks.Count -eq 1) "Run-root assertion missing: $relative"
+            $launchesBeforeCheck=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and
+                $n.GetCommandName() -in @('Initialize-ReleaseCheckNative','Start-Process','New-ReleaseCheckForegroundProbeChild') -and
+                $n.Extent.StartOffset -lt $checks[0].Extent.EndOffset},$true))
+            Assert-True ($launchesBeforeCheck.Count -eq 0) "Run-root assertion follows desktop/native work: $relative"
+        }
+        $probeEmbedding=@($probe.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Assert-ReleaseCheckDiagnosticBuildRoot'},$true))
+        Assert-True ($probeEmbedding.Count -eq 1) 'Environment probe does not check the embedded diagnostic build root.'
         $receiver=Get-TestAst (Join-Path $PSScriptRoot 'relcheck-kit\Receive-ReleaseCheckResult.ps1')
         $renderCalls=@($receiver.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.Extent.Text.StartsWith('& $python ')},$true))
         Assert-True ($renderCalls.Count -eq 1 -and $renderCalls[0].Extent.Text.Contains('-I -B -c $recordCheck')) 'Receiver Python is not isolated with bytecode disabled.'

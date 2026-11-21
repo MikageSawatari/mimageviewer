@@ -60,6 +60,13 @@ function Read-ReleaseCheckKitManifest {
     }
     $kit=Get-Content -LiteralPath $jsonPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     if($kit.schema_version -ne 1){throw 'Unsupported kit schema.'}
+    $buildRoot=$kit.artifact.PSObject.Properties['build_root']
+    if($null -eq $buildRoot -or $buildRoot.Value -isnot [string] -or
+        [string]::IsNullOrWhiteSpace($buildRoot.Value) -or
+        $buildRoot.Value -notmatch '^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/][^\\/]+(?:[\\/]|$))'){
+        throw 'Kit artifact.build_root must be a nonempty absolute path; recreate the kit.'
+    }
+    $null=[IO.Path]::GetFullPath($buildRoot.Value)
     $fingerprint=[string]$kit.artifact.source_fingerprint_sha256
     if($fingerprint -cnotmatch '\A[0-9a-f]{64}\z' -or $fingerprint -cne
         (Get-FileHash -LiteralPath (Join-Path $root 'source-fingerprint-records.txt') -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()){
@@ -81,6 +88,44 @@ function Read-ReleaseCheckKitManifest {
         throw 'Kit artifact manifest content mismatch.'
     }
     return $kit
+}
+
+function Assert-ReleaseCheckKitRunRoot {
+    param([string]$KitRoot)
+    $root=[IO.Path]::GetFullPath($KitRoot).TrimEnd('\','/')
+    $kit=Read-ReleaseCheckKitManifest $root
+    $buildRoot=[IO.Path]::GetFullPath($kit.artifact.build_root).TrimEnd('\','/')
+    if(-not $root.Equals($buildRoot,[StringComparison]::OrdinalIgnoreCase)){
+        throw "Kit must be placed at $buildRoot (the diagnostic build validates evidence paths against its build root); current root is $root."
+    }
+}
+
+function Assert-ReleaseCheckDiagnosticBuildRoot {
+    param([string]$ExePath,[string]$BuildRoot)
+    Assert-ReleaseCheckKitNoReparsePath $ExePath
+    if(-not ('MivReleaseCheckKitBytes' -as [type])){
+        # Search raw bytes in native code; PowerShell per-byte loops are too slow
+        # for a diagnostic core. The executable is read once, never launched.
+        Add-Type @'
+public static class MivReleaseCheckKitBytes {
+    public static bool Contains(byte[] bytes, byte[] needle) {
+        if (needle.Length == 0) return false;
+        for (int offset = 0; offset <= bytes.Length - needle.Length; offset++) {
+            if (bytes[offset] != needle[0]) continue;
+            int n = 1;
+            while (n < needle.Length && bytes[offset + n] == needle[n]) n++;
+            if (n == needle.Length) return true;
+        }
+        return false;
+    }
+}
+'@
+    }
+    $bytes=[IO.File]::ReadAllBytes($ExePath)
+    $needle=[Text.Encoding]::UTF8.GetBytes($BuildRoot)
+    if(-not [MivReleaseCheckKitBytes]::Contains($bytes,$needle)){
+        throw 'diagnostic exe does not embed the recorded build root'
+    }
 }
 
 function Get-ReleaseCheckKitExpectedFingerprint {

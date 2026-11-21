@@ -834,6 +834,29 @@ sampler は測定準備の 35 秒の待ちの中で動くので、kit モード�
 既定の出力先は `C:\home\mimageviewer-subpc\relcheck\relcheck-<artifact の HEAD 先頭 9 桁>-<UTC 日時>\`。
 scripts と artifact のコミットは別にできる (例: 公開済みタグの artifact を、後から足した scripts で流す)。その場合は両方が記録に出る。
 
+### キットを置く場所 (ビルドした root と同じ path)
+
+試験用ビルド (`test-script`) は、`--test-evidence-dir` が「**ビルドしたときの repository root** の
+`target\ui-smoke\runs\<run>\<case>`」であることを確かめる (`src/test_script/release_checks.rs` の `isolated_context` が
+`env!("CARGO_MANIFEST_DIR")` を `evidence_path::validate_directory` に渡す)。そのため診断 artifact は、
+ビルドした場所と同じ絶対 path の root に置かれたときだけ動く。違う path では seed-profile が
+`evidence directory must be below <ビルドした root>\target\ui-smoke\runs` で exit 2 になる
+(2026-11-21 の初回実行で、サブ PC 担当が観測。下の「実行記録」)。
+
+対処 (製品コードは変えない):
+
+- 診断 portable は、両方の PC に作れる中立の path の専用 worktree **`C:\miv-relcheck\root`** でビルドする。
+  サブ PC は C: しか無く、`C:\home\mimageviewer` はサブ PC 担当の作業フォルダとして使用中なので、メイン PC の
+  repository と同じ path は使えない (2026-11-21、サブ PC 担当の回答)。
+- キットの json に `artifact.build_root` (ビルドした root) を記録し、作成時に exe へその path が埋め込まれていることを確かめる。
+- サブ PC ではキットを `build_root` と同じ path に置く。`Run.ps1 -FromKit`・sampler・`Test-SubPcEnvironment.ps1` は
+  キットの root が `build_root` と一致しなければ、mIV を起動する前に止まる (`Assert-ReleaseCheckKitRunRoot`)。
+  メイン PC の保管場所 (`C:\home\mimageviewer-subpc\relcheck\<kit-id>\`) と結果の受け取りには、この一致を求めない。
+
+検討して採らなかった案: 試験用ビルドの検査を「実行中の exe の場所から root を求める」形に変える
+(`validate_layout` は既に exe の位置から `target` を求めている)。キットをどこにでも置けるようになり、専用 worktree も要らなくなるが、
+試験用の安全検査を変える Rust の変更で、公開済みの版 (v5.5.0 のタグのソース) には使えない。必要になったら別項目で検討する。
+
 ### サブ PC: 事前確認と本番
 
 `Test-SubPcEnvironment.ps1` は mIV を起動せず、キット照合・Python 3.10 以上・キットの FFmpeg・入力 desktop の一致 (`CheckDesktop`) を確かめ、

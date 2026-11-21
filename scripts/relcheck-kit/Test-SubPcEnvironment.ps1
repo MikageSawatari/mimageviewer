@@ -93,6 +93,9 @@ function Get-ProbeForeground {
 }
 try{
     $null=Assert-ReleaseCheckKit $kitRoot
+    Assert-ReleaseCheckKitRunRoot $kitRoot
+    $kit=Read-ReleaseCheckKitManifest $kitRoot
+    Assert-ReleaseCheckDiagnosticBuildRoot (Join-Path $kitRoot 'target\portable-smoke-package\mimageviewer.exe') $kit.artifact.build_root
     $report.kit_valid=$true
     $env:PYTHONDONTWRITEBYTECODE='1'
     try{
