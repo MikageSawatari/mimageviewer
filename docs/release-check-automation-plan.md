@@ -945,3 +945,14 @@ verdict と終了コードの対応、`release-record.md` の中身が `summary.
   Sol / xhigh の独立レビューは ACCEPT (製品の条件が前と同じ意味であることを含む)。
 - 診断 artifact は、配布ビルドの入力 `aa6f06685` にこの修正を載せた `c54ecfd7e` から作る (`C:\miv-relcheck\root`、detached)。
   違いは test-script feature の中の観測と台本、それに製品の完了条件の関数への切り出し。配布物には切り出しを含まない。
+
+**3 回目 (2026-11-22 07:07、キット `relcheck-c54ecfd7e-20261121-171651`、artifact `c54ecfd7e`、scripts `30dbcfc43`)**
+利用者の了承 2026-11-21 22:33 (事前確認 1 回と本番 1 回、再試行なし)。夜間試験の時間枠を避けて 07:00 以降に送った。
+
+- 事前確認: READY (exit 0)。前面化は 1 回目で成功 (272 ms)。
+- 本番: SKIPPED (exit 2、約 3 分)。seed-profile・seed-perf-cached は PASS (検索の 3 件も入り、上の修正が効いた)。static-foreground が
+  `static actual requested pixels outside 374±8 regression range [366,382]` (実要求 256) で環境不成立になり、後の 6 ケースは走っていない。
+  戻った run `release-checks-20261121-220921-45d79cbd` は `Receive-ReleaseCheckResult.ps1` で SKIPPED / exit 2 と照合。
+- 原因 (設計担当がコードで確認): 374 は 150% DPI (144) で、窓 1328×900・7 列・縦長 3:4 のセル 187×249 論理 px × 1.5 から来る値
+  (上の §1.198 の節)。サブ PC は 96 DPI なので 249 になり、`compute_display_px` の下限 256 に切り上げられた。
+  DPI に依存する判定は static の前面・背面の 2 ケースだけ。直し方は統括の判断待ち。
