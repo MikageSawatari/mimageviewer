@@ -1,140 +1,320 @@
-# §1.835 絞り込みの変更で一覧を読み直さない — 自動更新の判定 key から facet を外す (設計)
+# §1.835 絞り込みの変更で一覧を読み直さない — 自動更新の判定 key から facet を外し、AI の絞り込みを一覧全体の取得の証明へ移す (設計)
 
-- 状態: 設計 r2 (2026-11-21)。r1 の独立レビュー (Sol xhigh) は REVISE・構造的修正には AGREE。r2 で AI の要件 (§4.2)・参照の誤り・テストの赤の位置を直した。v5.5.1 で直す (利用者決定)。
-- 書いた人: 設計担当 ClaudeCode。根拠はコードと、サブ PC 担当の観測ログ (`C:\home\mimageviewer-subpc\duration-762\results\`、リポジトリ外)。行番号は master `ebfa00b91`。
+- 状態: 設計 r3 (2026-11-21)。
+  - r1・r2 の独立レビュー (Sol xhigh) は、どちらも REVISE。構造的修正であることには、どちらも AGREE。
+  - r2 の指摘 (AI の取得の対象と、完了の資格) を受けて、利用者が案 A を選んだ (統括経由、「AI も直して v5.5.1」)。
+  - r3 では、AI の絞り込みを、長さと同じ「一覧全体の走査 + 取得の証明」に乗せる (§4.2)。
+  - v5.5.1 で直す。
+- 書いた人: 設計担当 ClaudeCode。
+- 根拠: コードと、サブ PC 担当の観測ログ (`C:\home\mimageviewer-subpc\duration-762\results\`、リポジトリ外)。
+- 行番号: master `ebfa00b91` の時点。
 
 ## 1. 観測と原因
 
-- 観測 (サブ PC 担当、2026-11-21): 長さの範囲指定で数字を 1 文字打つと、その値で絞り込まれてメニューが閉じた。2 文字目以降は一覧に届き、Enter で選択中の動画が開いた。絞り込みや並べ替えを変えるたびに、ログに `auto-refresh: folder content changed (…), reloading` が出た (17 回)。ファイルは変わっていない (SHA-256 で照合)。
+- 観測 (サブ PC 担当、2026-11-21):
+  - 長さの範囲指定で数字を 1 文字打つと、その値で絞り込まれてメニューが閉じた。
+  - 2 文字目以降は一覧に届き、Enter で選択中の動画が開いた。
+  - 絞り込みや並べ替えを変えるたびに、ログに `auto-refresh: folder content changed (…), reloading` が出た (17 回)。
+  - ファイルは変わっていない (SHA-256 で照合)。
 - 経路 (コード):
-  1. 絞り込みを変えると `settings.facet_filter` が変わる。
+  1. 絞り込みを変えると、`settings.facet_filter` が変わる。
   2. 監視の点検 (`src/app.rs:27774-27788`) は、`current_folder_projection_key` が監視作成時の key と違うと、監視を作り直して `start_external_rescan` を呼ぶ。
-  3. key を作る `folder_projection_key_with_presentation` (`src/app.rs:5076`) の材料に `"facet": settings.facet_filter` がある。
-  4. `start_external_rescan` は baseline を同じ key の観測に限る (`src/app.rs:27985-27993`)。baseline が無いので結果は「一致」にならず、`auto-refresh … reloading` から全体を読み直す。
-  5. 読み直しの sidecar restore 中はモーダル扱い (`modal_dialog_block_reason_filtered` の `"sidecar_restore"`) になる。`note_main_chrome_pointer_block_transition` が `egui::Popup::close_all` を呼んでメニューを閉じ、キーを保留する。
-- 長さとサイズの範囲指定 (チェック + DragValue。DragValue は編集中も 1 文字ごとに値を更新する) では、1 文字目でメニューが閉じる。ほかの絞り込みも変えるたびにフォルダ全体を読み直しているが、1 回選んで閉じる項目なので目立たない。
-- 所有: key の行は `a73ea3750` (2026-10-14、§1.375 R10) から。サイズの範囲指定は v5.4.0 でも同じ経路を通る (コードからの推論、実機未確認)。
+  3. key を作る `folder_projection_key_with_presentation` (`src/app.rs:5076`) の材料に、`"facet": settings.facet_filter` がある。
+  4. `start_external_rescan` は、baseline を同じ key の観測に限る (`src/app.rs:27985-27993`)。baseline が無いので結果は「一致」にならず、`auto-refresh … reloading` から全体を読み直す。
+  5. 読み直しの sidecar restore 中は、モーダル扱い (`modal_dialog_block_reason_filtered` の `"sidecar_restore"`) になる。`note_main_chrome_pointer_block_transition` が `egui::Popup::close_all` を呼んでメニューを閉じ、キーを保留する。
+- 長さとサイズの範囲指定は、チェック + DragValue でできている。DragValue は編集中も 1 文字ごとに値を更新するので、1 文字目でメニューが閉じる。
+- ほかの絞り込みも、変えるたびにフォルダ全体を読み直している。1 回選んで閉じる項目なので目立たない。
+- 所有:
+  - key の行は `a73ea3750` (2026-10-14、§1.375 R10) から。
+  - サイズの範囲指定は、v5.4.0 でも同じ経路を通る (コードからの推論、実機未確認)。
 
 ## 2. 守るべき不変条件
 
-自動更新の観測 (`FolderObservation`) は、走査・materialize が作った物理行の記録 (`FolderRowRecord`) と、その行を作った投影条件を対で持つ。key は「この行の記録を作った条件」を識別するためのもので、条件が変われば旧記録を比較に使えない。
+自動更新の観測 (`FolderObservation`) は、次の 2 つを対で持つ。
 
-- §1.375 の記録の契約 (`docs/section375-operation-reconcile-plan.md` §3.1・§8.1) で、行の記録の境界は「種類採否・同名 winner・補助画像・既存 rating sort と表示 block 順まで」。facet と details は「items 配列ではなく既存 visible_indices / details_order の投影を保持する」(同 §8.1)。
+- 走査・materialize が作った物理行の記録 (`FolderRowRecord`)
+- その行を作った投影条件
+
+key は「この行の記録を作った条件」を識別するためのもの。条件が変われば、旧記録を比較に使えない。
+
+- §1.375 の記録の契約 (`docs/section375-operation-reconcile-plan.md` §3.1・§8.1) では、行の記録の境界は「種類採否・同名 winner・補助画像・既存 rating sort と表示 block 順まで」。
+- facet と details は、「items 配列ではなく既存 visible_indices / details_order の投影を保持する」(同 §8.1)。
 - つまり facet は行の記録の外にあり、行を作る条件ではない。
+
+facet の判定に要るデータの取得 (長さ・AI メタデータなど) は、facet の変更や候補の集合の変化に依らず、要件の持ち主が要件と完了の証明で決める (§4.2)。
 
 ## 3. 違反を作っている箇所
 
-key に facet が入っているので、行を作る条件が同じでも key が変わる。そのため、facet の変更が「行を作る条件の変更」として扱われ、ファイルの変更が無いのに全体の読み直しが走る。
+key に facet が入っているので、行を作る条件が同じでも key が変わる。そのため facet の変更が「行を作る条件の変更」として扱われ、ファイルの変更が無いのに全体の読み直しが走る。
 
-- 行を作る側は facet を読まない (`src/app/book_materialization.rs`・`src/app/folder_scan.rs`・`src/grid_item.rs`・`src/rating_sort.rs` に `facet` の参照 0 件)。facet は `rebuild_visible_indices` → `passes_facet_filter` (`src/app.rs:75759`・`:76668`) だけで効く。
-- 同じく表示だけの絞り込みである評価フィルタ (`settings.rating_filter`) は、元から key に無い。facet の中でも、`name_query` と `place_keys` は `#[serde(skip)]` のため、元から key に入っていない。(どちらも key に無いという事実だけで、それが正しく動くことの実証ではない。)
-- §1.375 計画 §3.3 は「sort／facet変更で旧要求を拒否する」と書いている。facet を入れた理由は書かれていない。行の記録の契約 (§2) とは食い違っている。
+- 行を作る側は facet を読まない。`src/app/book_materialization.rs`・`src/app/folder_scan.rs`・`src/grid_item.rs`・`src/rating_sort.rs` に `facet` の参照は 0 件。
+- facet は、`rebuild_visible_indices` → `passes_facet_filter` (`src/app.rs:75759`・`:76668`) だけで効く。
+- 同じく表示だけの絞り込みである評価フィルタ (`settings.rating_filter`) は、元から key に無い。
+- facet の中でも、`name_query` と `place_keys` は `#[serde(skip)]` のため、元から key に入っていない。
+  - これは key に無いという事実を述べているだけで、それで正しく動くことの実証ではない。
+- §1.375 計画 §3.3 は「sort／facet変更で旧要求を拒否する」と書いているが、facet を入れた理由は書かれていない。行の記録の契約 (§2) とは食い違っている。
+
+読み直しが、AI の絞り込みの取得不足を隠していた (§4.2.1)。
 
 ## 4. 修正
 
-- `folder_projection_key_with_presentation` の材料から `"facet"` を外す。外した理由のコメントも書く。
-- §4.2 の AI の要件を、読み直しに頼らず要件の持ち主で立てる (r2 で追加)。
-- 外す理由のコメント: facet は行の記録の後の表示投影 (visible_indices) で、`rebuild_visible_indices` が今の設定で作り直す。行の記録の key に入れると、facet の変更でファイルが変わっていないのに全体を読み直す。
-- 残すもの: `sort`・`order` (grid_display_order = 表示 block 順)・`visibility` (種類採否)・同名本・skip 系・`autofs`・`books`。いずれも行の記録の境界の内側。stack 関係は生の `FolderRowRecord` の条件ではないが、記録から決定的に作る group 表示の条件で、保持される group 表示に要る (`src/app/filename_stack_ui.rs:187`・`:1319`)。key は「行の記録と、そこから決定的に作る group の条件」を識別する。
-- key を使う箇所は全部同じ関数を通る。関数を変えれば、全箇所で一律に意味が変わる。
-  - 監視の作り直し: `src/app.rs:27774`
-  - 再走査の baseline: `src/app.rs:27973`
-  - worker の一致判定: `src/app.rs:28101`
-  - 結果を捨てるかの判定 `proof_valid`: `src/app.rs:28219`
-  - 一致の採用: `src/app.rs:28342`
-  - 観測の作成: `src/app.rs:28349`・`:32560` ほか
-  - テスト用の補助 (`#[cfg(test)]`、製品経路ではない): `src/app.rs:28408`・`:28440`
-  - detached の fork: `src/app/viewer_context_registry.rs:5159`
-- 呼び出し側は変えない。
+修正は 2 つ。
+
+- `folder_projection_key_with_presentation` の材料から `"facet"` を外す。外した理由をコメントに書く。
+  - 理由: facet は、行の記録の後の表示投影 (visible_indices) で、`rebuild_visible_indices` が今の設定で作り直す。行の記録の key に入れると、ファイルが変わっていないのに facet の変更で全体を読み直す。
+- AI モデル・ツールの絞り込みの取得を、長さと同じ「一覧全体の走査 + 取得の証明」へ移す (§4.2)。
+  - key から facet を外すと表に出る既存の欠陥で、同時に直さないと退行になる。
+
+key に残すもの:
+
+- `sort`
+- `order` (grid_display_order = 表示 block 順)
+- `visibility` (種類採否)
+- 同名本・skip 系・`autofs`・`books`
+- stack 関係
+  - 生の `FolderRowRecord` の条件ではないが、記録から決定的に作る group 表示の条件で、保持される group 表示に要る (`src/app/filename_stack_ui.rs:187`・`:1319`)。
+  - したがって key は「行の記録と、そこから決定的に作る group の条件」を識別する。
+
+`sort` から上の項目は、いずれも行の記録の境界の内側。
+
+key を使う箇所は、全部同じ関数を通る。関数を変えれば、全箇所で一律に意味が変わる。呼び出し側は変えない。
+
+- 監視の作り直し: `src/app.rs:27774`
+- 再走査の baseline: `src/app.rs:27973`
+- worker の一致判定: `src/app.rs:28101`
+- 結果を捨てるかの判定 `proof_valid`: `src/app.rs:28219`
+- 一致の採用: `src/app.rs:28342`
+- 観測の作成: `src/app.rs:28349`・`:32560` ほか
+- テスト用の補助 (`#[cfg(test)]`、製品経路ではない): `src/app.rs:28408`・`:28440`
+- detached の fork: `src/app/viewer_context_registry.rs:5159`
 
 ### 4.1 facet を変えた後に受理される旧要求
 
 外すと、facet の変更前に始まった再走査の結果を、変更後に受理することになる (`proof_valid`)。
 
-- 一致 (Equal) の場合: items をそのまま保つ。visible_indices は facet の変更時に今の設定で作り直してある。
-- 不一致 (Different) の場合: 通常の load で install し、visible_indices は今の facet で作り直す。
+- 一致 (Equal) の場合: items をそのまま保つ。visible_indices は、facet の変更時に今の設定で作り直してある。
+- 不一致 (Different) の場合: `MaterializedFolderListing` を通常の load で install し、visible_indices は今の facet で作り直す (`src/app.rs:44985`)。
+  - `MaterializedFolderListing` は、古い facet や visible_indices を持たない (`folder_scan.rs:897`、r1 レビューで照合)。
 
-実装時に、Different の load が要求時の facet を持ち込まないことをコードで確かめる。
+### 4.2 AI の絞り込みの取得を「一覧全体の走査 + 取得の証明」へ移す (r3)
 
-### 4.2 読み直しのついでに立っていた取得の要件
+#### 4.2.1 今の欠陥 (r1・r2 レビュー、ClaudeCode がコードで確認)
 
-これまでの読み直しは、一覧の採用時 (`src/app.rs:46066-46067`) に、facet に要るデータの取得の要件を今の facet から立て直していた。
+AI モデル・ツールの絞り込み (以下 AI facet) は、取得の範囲と完了の資格が、絞り込みの結果に依存している。
 
-```
-ai_model_facet_requested = facet_ai_filter_active()
-duration_facet_requested = duration_preset.is_some()
-```
+- 走査の範囲: 長さの要件が無いとき、AI facet の全体取得は `DetailsMetaScanOrder::CurrentGrid` で、既に絞り込まれた `current_grid_order()` だけを走査する (`src/app.rs:74931-74938`)。
+- 完了の資格: `ai_model_facet_ready()` (`src/app.rs:74631`) は、次のときに真。
+  - context で 1 つの `details_image_dims_state` が `Ready` か `Reconciling`
+  - または `VisibleStage` の取得中
 
-読み直しが無くなると、メニューを経ない facet の適用では、この立て直しが無くなる。facet ごとの状況 (r1 レビューの照合と ClaudeCode の確認):
+  どの行の集合について取得したかは持たない。
+- 判定: ready のとき、AI の値が無い画像は「該当なし」で除外する (`src/app.rs:76713-76736`)。
 
-- 長さ: 読み直しに頼らない。details meta の poll (`src/app.rs:74086-74092`) が、`duration_lengths_wanted()` (preset を含む) かつ `duration_scan_ready()` でないとき状態を `NotRequested` に戻し、全体の取得を立て直す。
-- ブックマーク: 頼らない。`rebuild_visible_indices` から `ensure_bookmark_presence_loaded` (`src/app.rs:75866` → `:54202`)。
-- 編集の roll-up: 頼らない。変換書庫の分類の入口 (`src/app.rs:58446`・`:58691`)。
-- **AI モデル: 頼っている (r1 P2)**。
-  - `ai_model_facet_should_load()` は要否を返すだけで、`request_ai_model_facet_load` (`src/app.rs:74606`) を通らないと、取得の要件が無効にならない (`invalidate_details_meta_requirements`)。
-  - details の状態が既に `Ready` (表示範囲の段階取得の完了など) なら、全件の取得は始まらない (`src/app.rs:76039`・`:74127`)。
-  - 到達例: 親で AI facet を設定 → 子フォルダへ移動して退避 → 子で寸法の取得が完了 → 退避バッジで復元 (`restore_facet_filter_suppression`、`src/app.rs:79264`)。
-  - その結果、未取得の画像が非該当として消える。今は読み直しが要件を立て直しているので出ない。
+その結果、候補の集合が増えると、増えた画像は未取得のまま消える。
 
-修正:
-- AI にも長さと同じ形を与える。details meta の要件の持ち主 (長さの立て直しと同じ poll) で、`facet_ai_filter_active()` で要件が有効なのに `ai_model_facet_requested` が立っていなければ、既存の `request_ai_model_facet_load()` を呼ぶ。
-- この形は、一覧の採用時の規則 (`requested = facet_ai_filter_active()`) を facet の変更の時点にも及ぼすだけで、新しい状態は足さない。
-- facet を変える入口 (メニュー・復元・お気に入り・スマートフォルダ・設定の取り込み) を個別に直さず、要件の持ち主 1 か所で受ける。
-- 実装時に、長さの poll と同じ境界で順序が成り立つかを確かめる。要件を立てた同じ poll で取得を始めるか、次の poll か。
-- 同じ確認を、facet を変えるほかの経路でも行う。facet を変える全入口を列挙し、AI・長さ・ブックマーク・roll-up のそれぞれで、読み直しなしで取得が始まることをテストで押さえる (§7)。
+今は、facet の変更ごとの全体の読み直しが、要件と状態を立て直している (`src/app.rs:46064-46072`)。そのため、facet の変更では表に出ていない。
+
+- 例 1 (r2): サイズで画像 B を除外 → AI メニューで A を取得 → AI 条件を選択 → サイズを解除。key から facet を外すと、B が消える。
+- 例 2 (r1): 親で AI 条件 → 子フォルダへ移動して退避 → 子で寸法の取得が完了 → 退避バッジで復元 (`restore_facet_filter_suppression`)。未取得の行が消える。
+  - 復元は描画中に `rebuild_visible_indices()` まで進む。そのため、poll で要求を立て直しても、既に絞られた集合を走査し直すだけになる (r2 P2-1)。
+- 例 3 (既存の不具合、コードからの推論・実機未確認): 評価フィルタは元から key に無い。そのため v5.5.0 でも、「評価で B を除外 → AI 条件 → 評価を解除」で B が消えるはず。
+- `ai_model_facet_requested` が真でも、今の候補の集合について取得済みであることは示さない (r2 P2-2)。
+
+#### 4.2.2 直し方: 長さ (§1.762) と同じ形にする
+
+長さは、すでに「一覧全体の走査 + 取得の証明」を持つ (`docs/media-duration-sort-filter-plan.md` §5)。
+
+- 対象: 表示集合・絞り込み・可視範囲に依らず、`items` 全体 (`DetailsMetaScanOrder::WholeListing`、`src/app.rs:74899-74905`)。
+- 完了: `DurationScanProof { generation, items_len }` (`src/app/duration_metadata.rs:6`) が context ごとに立つ。
+- 判定: 証明が今の一覧と一致するまでは、長さ条件を適用しない (分からない行は表示したまま)。
+
+AI facet も、この形に乗せる。
+
+- 持ち主は、今と同じ details meta (`poll_details_meta_load` / `start_details_meta_load_for_scope` / `finish_details_lazy_session`) のまま。
+- 新しい worker や owner は作らない。
+
+手順:
+
+1. **証明を、一覧全体の要件の証明に広げる。**
+   - `DurationScanProof` を、何の要件について全体を取得し終えたかを持つ証明に置き換える。名前は実装で決める。例: `ListingMetaScanProof { generation, items_len, duration: bool, ai: bool }`。
+   - 走査の開始時に、要件の snapshot を取る (`duration = duration_lengths_wanted()`、`ai = ai_model_facet_should_load()`)。
+   - 完了時に証明を保存する。同じ `generation` / `items_len` の証明が既にあれば、要件は和をとる (取得済みの要件を、後の走査で失わない)。
+   - 一覧の採用で `None` に戻す規則 (`src/app.rs:46068`) は、今のまま。
+2. **判定を証明から導く。**
+   - `duration_scan_ready()`: 証明が一致し、`duration` が真。
+   - `ai_model_facet_ready()`: 証明が一致し、`ai` が真。
+   - `details_image_dims_state` の `Ready` / `Reconciling` / `VisibleStage` から AI の完了を推すのをやめる。
+   - 呼び出し側 (判定 `:76713`、AI メニュー `src/ui_main.rs:14715`・`:14764`) は、この判定を使うだけで変えない。
+3. **走査の範囲を、要件から決める。**
+   - `AllRequirements` で `whole_listing_meta_scan_wanted()` (AI facet か長さ) が真なら、`WholeListing` で走査する。今は長さのときだけ。
+   - AI facet の `CurrentGrid` の分岐は無くなる。
+4. **画面外の行で取るものを、要件に揃える。**
+   - 今の `details_meta_target_for_idx_with_scope` の `duration_only` 引数は、「表示集合の外の行は長さだけ取る」という意味。
+   - これを「表示集合の外の行は、一覧全体の要件のフィールドだけ取る」に一般化する。
+     - 長さが要件なら、動画・音声の長さ
+     - AI が要件なら、AI メタデータ (`lazy_load_ai_metadata_for_idx`)
+   - 作成日時・寸法・ページ数は、今と同じく表示集合の中だけで取る。
+5. **立て直しを、要件の持ち主 1 か所で行う。**
+   - poll の長さの立て直し (`src/app.rs:74086-74092`) を、「一覧全体の要件のうち、証明が満たしていないものがある」に一般化する。条件は、取得中でないこと、`Cancelled` でないこと。
+   - 取得中の走査は、次のどちらかで取消して始め直す。
+     - 走査の証明の snapshot が、今の一覧と食い違う (`:74076-74080`)。
+     - 走査が今の要件を含まない (取得中に AI facet が有効になった)。この条件は今回足す。
+   - facet を変える入口は個別に直さない (メニュー・退避からの復元・お気に入り・スマートフォルダ・設定の取り込み・評価フィルタ)。
+6. **完了時の作り直しを揃える。**
+   - `finish_details_lazy_session` は今、AI facet が有効なら常に表示集合を作り直す (`:73972-73979`)。
+   - これを、証明で AI か長さの判定が新たに使えるようになったときに作り直す形に揃える。今の長さの `duration_completed` と同じ形。
+
+#### 4.2.3 これで閉じる経路
+
+- 例 1・3: 走査は items 全体なので、ほかの絞り込みや評価フィルタで外れていた画像も取得済みになる。解除しても消えない。
+- 例 2: 復元の時点で、証明に `ai` が無い。
+  - そのため AI 条件は適用されず、行は消えない。
+  - poll が全体の走査を始め、完了で作り直す。
+- `requested` は「メニューを開いた」の印のまま。完了の資格には使わない。
+
+#### 4.2.4 変わる挙動と費用
+
+- AI facet を使う間は、ほかの絞り込みで外れている画像の AI メタデータも、一覧の世代ごとに 1 回は読む (cache の当たりは読まない)。
+  - 今の「facet を変えるたびにフォルダ全体を読み直す」が無くなるので、合計では軽くなるはず (未計測)。
+- AI facet の読み込み中の表示は、表示集合ではなく、一覧全体の進み具合になる。
+- 取得の停止 (`Cancelled`) は、長さと AI で同じ走査を止める。
+  - 止めている間は、AI 条件も長さ条件も適用しない (分からない行は表示したまま)。
+  - 長さの既存の挙動と同じ。
+- 利用者の判断: 案 A として、上の費用を含めて選ばれた (統括経由、2026-11-21)。
+
+#### 4.2.5 ほかの facet の要件 (r1 の照合のまま)
+
+いずれも、読み直しに頼っていない。
+
+- 長さ: 上の証明。
+- ブックマーク: `rebuild_visible_indices` → `ensure_bookmark_presence_loaded` (`src/app.rs:75866` → `:54202`)。
+- 編集の roll-up: 変換書庫の分類の入口 (`src/app.rs:58446`・`:58691`)。
 
 ### 4.3 detached / 複数 context
 
-- `viewer_context_registry.rs:5159` の fork は `folder_projection_key(&self.settings, …)` を呼ぶだけで、コードは変えない。
-- facet は App 共有の `settings` にあり、context ごとの値ではない。外すと、context 間で key が facet によって食い違うことが無くなるだけ。
+- `viewer_context_registry.rs:5159` の fork は、`folder_projection_key(&self.settings, …)` を呼ぶだけ。コードは変えない。
+- facet は App 共有の `settings` にあり、context ごとの値ではない。外しても、context 間で key が facet によって食い違うことが無くなるだけ。
+- 一覧全体の要件の証明 (§4.2) は、今の `duration_scan_proof` と同じ、viewer context ごとの状態として持つ。
+  - `viewer_context_registry.rs` では、既存の登録 (構造体・初期化・swap・fork) の型を置き換えるだけで、所有の分類は変えない。
+  - fork 先は空、元 context は証明を保持する (§1.762 と同じ)。
 - detached の述語・viewport の選択・配送・HWND・placement・bundle の所有と交換は触らない。
 
 ## 5. 採らなかった案
 
-- 範囲指定の DragValue を「確定時だけ値を反映」(`update_while_editing(false)` など) にする案。メニューは閉じなくなるが、facet を変えるたびに全体を読み直すこと自体は残り、大きいフォルダで毎回の読み直しの費用が残る。原因の key を直さずに入口の 1 つだけを避ける症状対処なので、採らない。
-- facet の変更時だけ監視の作り直しを抑える分岐を足す案。key の意味 (行の記録の条件) を直さずに、例外を増やすだけなので採らない。
+- **範囲指定の DragValue を「確定時だけ値を反映」(`update_while_editing(false)` など) にする案。**
+  - メニューは閉じなくなるが、facet を変えるたびに全体を読み直すこと自体は残る。大きいフォルダでは、毎回の読み直しの費用も残る。
+  - 原因の key を直さずに、入口の 1 つだけを避ける症状対処。
+- **facet の変更時だけ、監視の作り直しを抑える分岐を足す案。** key の意味 (行の記録の条件) を直さずに、例外を増やすだけ。
+- **AI facet が有効なときだけ、key に facet を残す案。**
+  - AI の取得不足を、読み直しで隠し続けるだけ。
+  - AI 条件と範囲指定を一緒に使うと、範囲指定の件も残る。
+- **AI の取得を「どの候補の集合について取得したか」で記録し、集合が増えたら追加で取る案。**
+  - 集合の記録と比較という状態が増える。
+  - 長さと同じく全体を取るなら、集合を記録しなくてよい。
+- **poll で `request_ai_model_facet_load()` を呼び直すだけの案 (r2)。** 既に絞られた集合を走査し直すだけで、取得の対象が絞り込みに依存したまま残る (r2 P2-1・P2-2)。
 
-## 6. 状態の組み合わせ・まれな失敗
+## 6. 状態の組み合わせを減らす検討・まれな失敗
 
-- 状態は増やさない (key の材料が 1 つ減るだけ)。
-- まれな失敗は既定の割り切り方針による。新しい失敗経路は無い。
+CLAUDE.md「設計の簡素化」に沿って、組み合わせそのものを減らせるかを先に検討した。
+
+- **採った: 1 つの所有者・1 つの証明にまとめる。**
+  - 今の AI の完了は、次の組み合わせで決まっている。
+    - `details_image_dims_state` の 3 つの状態 (`Ready`・`Reconciling`・`VisibleStage` の取得中)
+    - 走査範囲 (`CurrentGrid`) と表示集合
+  - r3 では、長さと AI が同じ証明・同じ全体走査を使う。AI の完了は「証明が一致し、`ai` を含む」の 1 つになる。
+  - 表示集合・可視範囲の stage・評価フィルタとの組み合わせを考えなくてよくなる。
+- **採った: 確定の時点を 1 つにする。** facet を変える入口ごとに要求を立てず、details meta の poll 1 か所で、要件と証明を照らし合わせる。
+- **採った: 既存機能と同じ経路に揃える。**
+  - 長さ (§1.762) の全体走査・証明・停止と再開・「分からない間は適用しない」に、AI をそのまま乗せる。
+  - 新しい規則は作らない。
+- **採らなかった: 取得中はモーダルにする。**
+  - 一覧全体の AI メタデータの取得は、数千件だと長くかかる。その間の閲覧を止めるのは、通常の使い方の退行になる。
+  - 長さの取得も非モーダル。
+- **採らなかった: facet の変更で一覧を閉じて作り直す。** それが今の全体の読み直しで、今回の不具合そのもの。
+- 状態の数:
+  - key の材料は 1 つ減る。
+  - 証明は既存の型を置き換えるだけで、App や context の状態は増えない。
+- まれな失敗:
+  - 既定の割り切り方針による (ログ + 通知)。新しい失敗経路は無い。
+  - 取得の失敗・取消は、既存の長さの扱い (`RetryLater`・`Cancelled`) と同じ。
 
 ## 7. テスト (実装の前に赤で足す)
 
 本物のフレーム (`HeadlessEpiIntegration::update`) で確かめる。
 
-- `src/app/tests/typing/` の道具 (§1.832) は `probe::fields()` (`ime_focus` 経由の TextEdit) を前提にしている。DragValue の中の TextEdit は `ime_focus` を通らない (`vendor/egui/src/widgets/drag_value.rs:560`)。
-- そのため、道具の共通部分 (フレームの回し方・完了の保持と解放) が使えるなら使い、欄の特定は実ウィジェットの response から行う。
+- `src/app/tests/typing/` の道具 (§1.832) は、`probe::fields()` (`ime_focus` 経由の TextEdit) を前提にしている。DragValue の中の TextEdit は、`ime_focus` を通らない (`vendor/egui/src/widgets/drag_value.rs:560`)。
+- そのため、道具の共通部分 (フレームの回し方、完了の保持と解放) が使えるなら使い、欄の特定は実ウィジェットの response から行う。
 - 道具に乗せられない部分は、理由をテストのコメントに書く。
 
-進め方:
-- 監視・初回 hydration・長さの取得を先に終わらせる。
-- 実際にクリックして編集モードへ入り、`Event::Text("2")`・`Event::Text("5")` を別フレームで送る。
-- 各フレームで、モーダル・popup・focus・generation を観測する。
-- 修正前は「範囲指定」の選択や下限のチェックでも key が変わる。そのため、最初の文字より前に赤になることがある。各段階ごとに検査する。
+コミットは次の順に分ける。設計担当が各コミットでテストを流し、赤・緑を記録する。
 
-1. 長さの範囲指定: メニューを開き、「範囲指定」を選び、下限にチェックを入れて DragValue に 1 文字ずつ「2」「5」と打つ。各文字の後で次を確かめる:
-   - 裏の処理が落ち着くまでフレームを回してから見る
-   - メニューが開いたまま
-   - 欄にフォーカスがあり、文字が欄に入っている (最後に 25)
-   - `items_generation` が進まない
-   - 再走査が「不一致 → 読み直し」に進まない
-   - sidecar restore のモーダル扱いに入らない
-   - キーが一覧へ届かない (選択が動かない・何も開かない)
-2. サイズの範囲指定: 1 と同じ。
-3. 4 区切りの絞り込み (長さ・サイズ) と拡張子の絞り込みを変えても、`items_generation` が進まず、結果 (visible_indices) が今までどおり。「範囲指定」の選択と下限・上限のチェックでも、メニューが閉じない。
-3a. 取得の要件 (§4.2): メニューを経ない facet の適用 (退避からの復元を必ず含む) で、AI モデルの facet の全件取得が読み直しなしで始まり、未取得の画像が非該当として消えない。r1 の到達例を再現する。長さの preset の復元でも、長さの全件取得が始まる。
-4. 自動更新が今までどおり働く:
-   - facet を入れたまま、ファイルを足す・消すと、通知で読み直されて結果に反映される
-   - facet の変更前に始まった再走査の結果 (Equal / Different) を変更後に受理しても、visible_indices が今の facet と一致する
-   - 完了の配送を保持し、facet を変えてから解放すると決定的に試せる
-5. 既存テストは弱めない。`section375_tests.rs`・`egui037_connection_tests.rs:850`・`tests/duration_762.rs:421` の key 一致の検査は、そのまま通るはず。
+1. テストだけ
+2. key から facet を外す
+3. AI の証明 (§4.2)
 
-赤の確認: 1・2・3 は修正前に赤 (メニューが閉じる、または generation が進む)、修正後に緑であること。3a は、key だけを外した段階で赤になり (AI)、§4.2 の修正で緑になることを確かめる。
+| # | テスト | v5.5.0 (テストだけ) | key だけ | r3 全部 |
+| --- | --- | --- | --- | --- |
+| T1 | 長さの範囲指定に 1 文字ずつ打つ | 赤の見込み | 緑 | 緑 |
+| T2 | サイズの範囲指定に 1 文字ずつ打つ | 赤の見込み | 緑 | 緑 |
+| T3 | 4 区切り・範囲指定の選択・チェック・拡張子で読み直さない | 赤の見込み | 緑 | 緑 |
+| T4 | AI 条件のまま、ほかの条件 (サイズ) を緩める | 緑の見込み (読み直しが隠す) | 赤の見込み | 緑 |
+| T5 | AI 条件のまま、評価フィルタを解除する | 赤の見込み (既存の不具合) | 赤の見込み | 緑 |
+| T6 | 退避からの復元で AI 条件が戻る (r1 の例) | 実測で記録 | 赤の見込み | 緑 |
+| T7 | 長さ preset の復元、メニューを経ない適用 | 実測で記録 | 実測で記録 | 緑 |
+| T8 | 自動更新が今までどおり働く | 緑 | 緑 | 緑 |
+
+各テストの中身:
+
+- **T1** (長さの範囲指定):
+  - 監視・初回 hydration・長さの取得を、先に終わらせる。
+  - メニューを開き、「範囲指定」を選び、下限にチェックを入れる。
+  - 実際にクリックして DragValue の編集モードへ入り、`Event::Text("2")`・`Event::Text("5")` を別フレームで送る。
+  - 各段階 (「範囲指定」の選択、チェック、各文字) の後で、裏の処理が落ち着くまでフレームを回し、次を確かめる。
+    - メニューが開いたまま
+    - 欄にフォーカスがあり、文字が欄に入っている (最後に 25)
+    - `items_generation` が進まない
+    - 再走査が「不一致 → 読み直し」に進まない
+    - sidecar restore のモーダル扱いに入らない
+    - キーが一覧へ届かない (選択が動かない、何も開かない)
+  - 修正前は、「範囲指定」の選択やチェックで先に赤になることがある。
+- **T2**: T1 と同じことを、サイズの範囲指定で行う。
+- **T3**: 長さ・サイズの 4 区切りと拡張子を切り替える。`items_generation` が進まず、visible_indices が期待どおりであることを確かめる。
+- **T4** (AI 条件 + ほかの条件の解除):
+  - AI 条件とサイズ条件を付け、サイズの外に、AI 条件に合う画像 B を置く。
+  - AI の取得を完了させてからサイズを解除し、B が表示されることを確かめる。
+  - 取得が要るなら、読み直し (`items_generation` の前進) なしで取得されること。
+  - 取得が終わる前も、B は表示されたままであること (分からない行を消さない)。
+- **T5**: T4 と同じことを、評価フィルタの解除で行う。
+- **T6** (退避からの復元):
+  - 親で AI 条件を付け、子へ移動して退避し、子で寸法など AI 以外の取得を完了させてから復元する。
+  - 未取得の画像が消えないこと。
+  - 全体の走査が始まり、完了後に AI 条件が効くこと。
+- **T7**: 長さ preset の復元でも、全体の走査が始まり、完了後に効くこと。メニューを開かずに適用した場合も同じ。
+- **T8** (自動更新):
+  - facet を入れたまま、ファイルを足す・消すと、通知で読み直されて結果に反映されること。
+  - facet の変更前に始まった再走査の結果 (Equal / Different) を、変更後に受理しても、visible_indices が今の facet と一致すること。完了の配送を保持し、facet を変えてから解放すると決定的に試せる。
+
+追加の検査:
+
+- 証明について:
+  - 取得中に AI facet が有効になったら、走査を始め直す。
+  - 長さだけの証明の後に AI が要件になったら、全体を取り直す (cache の当たりは読まない)。
+  - 要件の和をとる。
+  - 一覧の採用で消える。
+- 画面外の行について:
+  - 長さだけの要求で、AI・作成日時・寸法・ページ数を取らない (`media-duration-sort-filter-plan.md` §5.1 の既存の検査を弱めない)。
+  - AI だけの要求で、画面外の行は AI メタデータだけを取る。
+- context について: 証明の swap・fork・bundle の破棄。§1.762 の `viewer_context_registry.rs` の検査の型を置き換える。
+
+既存のテストは弱めない。
+
+- `section375_tests.rs`・`egui037_connection_tests.rs:850`・`tests/duration_762.rs:421` の key 一致の検査は、そのまま通るはず。
+- AI facet の既存のテストで、`CurrentGrid` や `Ready` からの推論に依存するものは、指示書に列挙したうえで書き換える。弱めない。
 
 ## 8. 文書
 
-- `docs/section375-operation-reconcile-plan.md` §3.3 の「sort／facet変更で旧要求を拒否する」を「sort 変更で」に直し、facet を外した理由 (§2・§3) を足す。
-- `docs/detached-rework-plan.md` §11 に、触れた範囲と判断理由を記録する。
-- `docs/async-architecture.md` / `docs/architecture-overview.md` に key の材料を書いた所があれば揃える。
-- マニュアル: 挙動の説明は変わらない (範囲指定は元から「数字を入れる」説明)。確かめて、要らなければ触らない。
+- `docs/section375-operation-reconcile-plan.md` §3.3: 「sort／facet変更で旧要求を拒否する」を「sort 変更で」に直し、facet を外した理由 (§2・§3) を足す。
+- `docs/media-duration-sort-filter-plan.md` §5.1・§5.2: AI facet は「表示集合全体」、証明は長さだけ、と書いてある。AI も同じ証明に乗ったことに揃える。
+- `docs/detached-rework-plan.md` §11: 触れた範囲と判断理由、統括と独立レビューの合意を記録する。
+- `docs/async-architecture.md` / `docs/architecture-overview.md`: key の材料や AI facet の取得を書いた所があれば揃える。
+- マニュアル: AI の絞り込みの読み込み中の説明 (件数の母数) を確かめ、要れば直す。範囲指定の説明は変わらない。
