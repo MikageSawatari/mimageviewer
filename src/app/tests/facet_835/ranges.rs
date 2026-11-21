@@ -481,7 +481,8 @@ fn facet_835_color_tolerance_number_editor_owns_left_in_real_frames() {
                 && node.labelled_by().iter().any(|label| {
                     h.nodes
                         .iter()
-                        .any(|(id, node)| id == label && node.label() == Some("許容範囲"))
+                        // egui exposes a Role::Label's text as its value.
+                        .any(|(id, node)| id == label && node.value() == Some("許容範囲"))
                 })
         })
         .map(|(id, _)| widget_id(*id))
