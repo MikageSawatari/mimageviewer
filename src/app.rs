@@ -661,7 +661,7 @@ pub(crate) mod listing_sort;
 mod media_metadata_mutation;
 pub(crate) mod metadata_import_refresh;
 mod metadata_ops;
-use duration_metadata::DurationScanProof;
+use duration_metadata::{ListingMetaRequirements, ListingMetaScanProof};
 mod pin_materialization;
 pub(crate) use metadata_ops::{probe_image_dims_from_bytes, tag_item_path};
 
@@ -5079,11 +5079,13 @@ fn folder_projection_key_with_presentation(
     presentation: Option<&crate::settings::FavoriteViewState>,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
+    // Facets project visible_indices after physical rows have been recorded.
+    // rebuild_visible_indices applies the current facets; including them here
+    // would reload an unchanged listing on every filter edit.
     let value = serde_json::json!({
         "sort": presentation.map_or(settings.sort_order, |state| state.sort_order),
         "order": presentation.map_or(&settings.grid_display_order, |state| &state.grid_display_order),
         "visibility": settings.file_type_visibility,
-        "facet": settings.facet_filter,
         "same_name_folder_book": settings.same_name_folder_book,
         "archive": settings.skip_archive_if_zip_exists,
         "epub": settings.skip_epub_if_pdf_exists,
@@ -7473,7 +7475,9 @@ enum DetailsMetaScanScope {
 
 struct DetailsMetaPending {
     scan_scope: DetailsMetaScanScope,
-    duration_scan: Option<DurationScanProof>,
+    // Whole-listing work carries the requirements it must finish; a bounded
+    // VisibleStage cannot publish a whole-listing qualification of its own.
+    listing_meta_scan: Option<ListingMetaScanProof>,
     visible_revision: u64,
     selection_target_key: Option<String>,
     normal_target_keys: HashSet<String>,
@@ -17393,9 +17397,10 @@ pub struct App {
     /// 詳細遅延列の対象集合 revision。フィルタ変更で進め、古い worker 完了時に再要求する。
     details_lazy_visible_revision: u64,
     /// 詳細遅延メタの走査セッション状態。`details_meta_pending` は個々の worker job を所有し、
-    /// この state は連続 job をまたいで Ready になるまでソート/フィルタを無効にする。
+    /// この state は連続 job をまたぐ詳細列の取得状態。長さ/AI の条件の資格は下の証明で判定する。
     pub(crate) details_image_dims_state: LazyColumnState,
-    duration_scan_proof: Option<DurationScanProof>,
+    /// 同じ一覧で全体取得が完了した要件。段階取得や停止では失効させない。
+    listing_meta_scan_proof: Option<ListingMetaScanProof>,
     /// AI モデル/生成ツール facet をユーザーが開いたか、条件が有効なときに遅延メタを読む。
     pub(crate) ai_model_facet_requested: bool,
     pub(crate) duration_facet_requested: bool,
@@ -21211,7 +21216,7 @@ impl App {
             details_meta_pending: None,
             details_lazy_visible_revision: 0,
             details_image_dims_state: LazyColumnState::Disabled,
-            duration_scan_proof: None,
+            listing_meta_scan_proof: None,
             ai_model_facet_requested: false,
             duration_facet_requested: false,
             facet_navigation: FacetNavigationState::default(),
@@ -46065,7 +46070,7 @@ impl App {
         self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
         self.ai_model_facet_requested = self.facet_ai_filter_active();
         self.duration_facet_requested = self.settings.facet_filter.duration_preset.is_some();
-        self.duration_scan_proof = None;
+        self.listing_meta_scan_proof = None;
         self.details_image_dims_state =
             if self.details_any_lazy_columns_enabled() || self.whole_listing_meta_scan_wanted() {
                 LazyColumnState::NotRequested
@@ -73924,7 +73929,7 @@ impl App {
     }
 
     fn details_lazy_uses_visible_stages(&self) -> bool {
-        (!self.duration_lengths_wanted() || self.duration_scan_ready())
+        self.unproven_listing_meta_requirements().is_empty()
             && (self.thumbnail_media_metadata_enabled()
                 || self.settings.grid_view_mode == crate::settings::GridViewMode::Details
                     && self.settings.details_show_page_count
@@ -73965,17 +73970,15 @@ impl App {
     fn finish_details_lazy_session(
         &mut self,
         failed: usize,
-        duration_scan: Option<DurationScanProof>,
+        listing_meta_scan: Option<ListingMetaScanProof>,
     ) {
-        let duration_completed = self.complete_duration_scan(duration_scan);
+        let completed = self.complete_listing_meta_scan(listing_meta_scan);
         self.details_image_dims_state = LazyColumnState::Ready { failed };
         self.prune_details_lazy_meta_cache();
-        if self.facet_ai_filter_active()
-            || (duration_completed && self.settings.facet_filter.duration_preset.is_some())
+        if (completed.ai && self.facet_ai_filter_active())
+            || (completed.duration && self.settings.facet_filter.duration_preset.is_some())
         {
-            let ready_state = self.details_image_dims_state;
             self.rebuild_visible_indices();
-            self.details_image_dims_state = ready_state;
         }
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
             && matches!(
@@ -74050,7 +74053,7 @@ impl App {
             }
         }
         self.details_tag_prewarm_indices = near;
-        // AI facets retain their all-grid scan. The existing priority queue handles new visible
+        // Whole-listing requirements retain their scan. The priority queue handles new visible
         // media in that scan; badge-only stages can discard their old bounded range outright.
         if !self.whole_listing_meta_scan_wanted() {
             self.invalidate_details_meta_requirements();
@@ -74072,19 +74075,22 @@ impl App {
                 crate::perf::stall::PollPart::DetailsMeta,
             );
         }
-        if self
-            .details_meta_pending
-            .as_ref()
-            .and_then(|pending| pending.duration_scan)
-            .is_some_and(|scan| scan != self.duration_scan_snapshot())
-        {
+        let unproven = self.unproven_listing_meta_requirements();
+        if self.details_meta_pending.as_ref().is_some_and(|pending| {
+            pending
+                .listing_meta_scan
+                .is_some_and(|scan| !scan.matches(self))
+                || !pending.listing_meta_scan.map_or_else(
+                    || unproven.is_empty(),
+                    |scan| scan.requirements.contains(unproven),
+                )
+        }) {
             if let Some(pending) = self.details_meta_pending.take() {
                 pending.cancel.store(true, Ordering::Relaxed);
             }
             self.details_image_dims_state = LazyColumnState::NotRequested;
         }
-        if self.duration_lengths_wanted()
-            && !self.duration_scan_ready()
+        if !unproven.is_empty()
             && self.details_meta_pending.is_none()
             && !matches!(self.details_image_dims_state, LazyColumnState::Cancelled)
         {
@@ -74316,12 +74322,12 @@ impl App {
                         .details_meta_pending
                         .as_ref()
                         .is_some_and(|p| p.visible_revision == self.details_lazy_visible_revision);
-                    let duration_scan = self
+                    let listing_meta_scan = self
                         .details_meta_pending
                         .take()
-                        .and_then(|pending| pending.duration_scan);
+                        .and_then(|pending| pending.listing_meta_scan);
                     if revision_matches {
-                        if self.details_lazy_uses_visible_stages() {
+                        if listing_meta_scan.is_none() && self.details_lazy_uses_visible_stages() {
                             let total = match self.details_image_dims_state {
                                 LazyColumnState::Loading { total, .. } => total,
                                 _ => 0,
@@ -74332,7 +74338,7 @@ impl App {
                                 failed,
                             };
                         } else {
-                            self.finish_details_lazy_session(failed, duration_scan);
+                            self.finish_details_lazy_session(failed, listing_meta_scan);
                         }
                     } else {
                         self.details_image_dims_state = LazyColumnState::NotRequested;
@@ -74395,7 +74401,9 @@ impl App {
     }
 
     pub(crate) fn details_lazy_columns_visible(&self) -> bool {
-        if self.items_are_drive_list || (self.items.is_empty() && !self.duration_lengths_wanted()) {
+        if self.items_are_drive_list
+            || (self.items.is_empty() && !self.whole_listing_meta_scan_wanted())
+        {
             return false;
         }
         match self.settings.grid_view_mode {
@@ -74606,8 +74614,11 @@ impl App {
     pub(crate) fn request_ai_model_facet_load(&mut self) {
         if !self.ai_model_facet_requested {
             self.ai_model_facet_requested = true;
-            // A media-only stage cannot stand in for the initial all-item AI scan.
-            self.invalidate_details_meta_requirements();
+            // Opening a menu must not resume another stopped requirement when
+            // this listing's AI metadata is already proven.
+            if !self.ai_model_facet_ready() {
+                self.invalidate_details_meta_requirements();
+            }
         }
     }
 
@@ -74629,15 +74640,8 @@ impl App {
     }
 
     pub(crate) fn ai_model_facet_ready(&self) -> bool {
-        self.details_image_dims_state.is_ready()
-            || matches!(
-                self.details_image_dims_state,
-                LazyColumnState::Reconciling { .. }
-            )
-            || self
-                .details_meta_pending
-                .as_ref()
-                .is_some_and(|pending| pending.scan_scope == DetailsMetaScanScope::VisibleStage)
+        self.listing_meta_scan_proof
+            .is_some_and(|proof| proof.matches(self) && proof.requirements.ai)
     }
 
     pub(crate) fn details_created_text(&self, idx: usize) -> String {
@@ -74865,13 +74869,22 @@ impl App {
         if self.details_meta_pending.is_some() {
             return;
         }
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::job(
+            "details-meta-session",
+            match scan_scope {
+                DetailsMetaScanScope::AllRequirements => "all",
+                DetailsMetaScanScope::VisibleStage => "visible",
+            },
+            crate::ime_focus::typing_probe::Outcome::Started,
+        );
 
         let generation = self.items_generation;
         let ai_facet_load = self.ai_model_facet_should_load();
         let whole_listing_load = self.whole_listing_meta_scan_wanted();
-        let duration_scan = (scan_scope == DetailsMetaScanScope::AllRequirements
-            && self.duration_lengths_wanted())
-        .then(|| self.duration_scan_snapshot());
+        let listing_meta_scan = (scan_scope == DetailsMetaScanScope::AllRequirements
+            && whole_listing_load)
+            .then(|| self.listing_meta_scan_snapshot());
         let selection_info_only = self.selection_info_only_lazy_load();
         let load_all_page_counts = self.settings.grid_view_mode
             == crate::settings::GridViewMode::Details
@@ -74896,7 +74909,7 @@ impl App {
             )),
             pdf_passwords: self.pdf_passwords.clone(),
         };
-        let (order, visible_near) = if duration_scan.is_some() {
+        let (order, visible_near) = if listing_meta_scan.is_some() {
             (
                 DetailsMetaScanOrder::WholeListing {
                     cursor: 0,
@@ -74941,7 +74954,7 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         self.details_meta_pending = Some(DetailsMetaPending {
             scan_scope,
-            duration_scan,
+            listing_meta_scan,
             visible_revision: self.details_lazy_visible_revision,
             selection_target_key: self.selection_info_lazy_target_key(),
             normal_target_keys: visible_near
@@ -74980,7 +74993,7 @@ impl App {
         }
         let DetailsMetaPending {
             scan_scope,
-            duration_scan,
+            listing_meta_scan,
             visible_revision,
             selection_target_key,
             normal_target_keys,
@@ -74990,6 +75003,10 @@ impl App {
         let DetailsMetaPendingPhase::Planning(mut plan) = phase else {
             unreachable!();
         };
+        let requirements = listing_meta_scan.map_or_else(
+            || self.listing_meta_requirements(),
+            |scan| scan.requirements.union(self.listing_meta_requirements()),
+        );
 
         let order_stale = matches!(
             plan.order,
@@ -75010,9 +75027,13 @@ impl App {
         // cursor has passed. Merge fields without restarting a whole-grid/AI scan.
         if let Some(selected) = self.selection_info_lazy_target_idx() {
             plan.visible_near.insert(selected);
-            if let Some(target) =
-                self.details_meta_target_for_idx(selected, &plan.visible_near, true)
-            {
+            if let Some(target) = self.details_meta_target_for_idx_with_requirements(
+                selected,
+                &plan.visible_near,
+                true,
+                false,
+                requirements,
+            ) {
                 if let Some(existing) = plan
                     .visible_targets
                     .iter_mut()
@@ -75074,11 +75095,22 @@ impl App {
                 }
             };
 
-            if queued_visible.contains(&idx) || !self.details_item_requires_lazy_meta(idx) {
+            let media = matches!(
+                self.items.get(idx),
+                Some(GridItem::Video(_) | GridItem::Audio(_))
+            );
+            let ai = self.details_item_supports_ai_metadata(idx);
+            if queued_visible.contains(&idx)
+                || !(self.details_item_requires_lazy_meta(idx)
+                    || (requirements.duration && media)
+                    || (requirements.ai && ai))
+            {
                 continue;
             }
             if let Some(meta) = self.details_lazy_meta_for_idx(idx)
                 && self.details_lazy_meta_satisfies_idx(idx, meta)
+                && (!requirements.duration || !media || meta.media.satisfies(self.items_generation))
+                && (!requirements.ai || !ai || meta.ai_metadata_checked)
             {
                 plan.total += 1;
                 plan.cached_done += 1;
@@ -75090,13 +75122,14 @@ impl App {
                 );
                 continue;
             }
-            if let Some(target) = self.details_meta_target_for_idx_with_scope(
+            if let Some(target) = self.details_meta_target_for_idx_with_requirements(
                 idx,
                 &plan.visible_near,
                 plan.load_all_page_counts || plan.visible_near.contains(&idx),
-                duration_scan.is_some()
+                listing_meta_scan.is_some()
                     && self.visible_indices.binary_search(&idx).is_err()
                     && self.selection_info_lazy_target_idx() != Some(idx),
+                requirements,
             ) {
                 plan.total += 1;
                 if target.priority >= crate::io_semaphore::IoPriority::Normal {
@@ -75137,7 +75170,7 @@ impl App {
             };
             self.details_meta_pending = Some(DetailsMetaPending {
                 scan_scope,
-                duration_scan,
+                listing_meta_scan,
                 visible_revision,
                 selection_target_key,
                 normal_target_keys,
@@ -75151,7 +75184,7 @@ impl App {
         self.launch_details_meta_worker(
             ctx,
             scan_scope,
-            duration_scan,
+            listing_meta_scan,
             visible_revision,
             selection_target_key,
             cancel,
@@ -75163,7 +75196,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         scan_scope: DetailsMetaScanScope,
-        duration_scan: Option<DurationScanProof>,
+        listing_meta_scan: Option<ListingMetaScanProof>,
         visible_revision: u64,
         selection_target_key: Option<String>,
         cancel: Arc<AtomicBool>,
@@ -75171,7 +75204,7 @@ impl App {
     ) {
         let target_count = plan.visible_targets.len() + plan.background_targets.len();
         if plan.total == 0 || target_count == 0 {
-            self.finish_details_lazy_session(plan.cached_failed, duration_scan);
+            self.finish_details_lazy_session(plan.cached_failed, listing_meta_scan);
             return;
         }
 
@@ -75292,8 +75325,8 @@ impl App {
                     ),
                     ("ai_facet_load", serde_json::Value::from(plan.ai_facet_load)),
                     (
-                        "duration_scan",
-                        serde_json::Value::from(duration_scan.is_some()),
+                        "listing_meta_scan",
+                        serde_json::Value::from(listing_meta_scan.is_some()),
                     ),
                     (
                         "grid_mode",
@@ -75329,7 +75362,7 @@ impl App {
 
         self.details_meta_pending = Some(DetailsMetaPending {
             scan_scope,
-            duration_scan,
+            listing_meta_scan,
             visible_revision,
             selection_target_key,
             normal_target_keys,
@@ -75470,7 +75503,17 @@ impl App {
         visible_near: &std::collections::HashSet<usize>,
         allow_page_count: bool,
     ) -> Option<DetailsMetaTarget> {
-        self.details_meta_target_for_idx_with_scope(idx, visible_near, allow_page_count, false)
+        // Planning, selection and priority updates share the same filtered-row
+        // boundary. Selection-info targets retain their existing field exception.
+        let whole_listing_only = !self.active_listing_meta_requirements().is_empty()
+            && self.visible_indices.binary_search(&idx).is_err()
+            && self.selection_info_lazy_target_idx() != Some(idx);
+        self.details_meta_target_for_idx_with_scope(
+            idx,
+            visible_near,
+            allow_page_count,
+            whole_listing_only,
+        )
     }
 
     fn details_meta_target_for_idx_with_scope(
@@ -75478,7 +75521,24 @@ impl App {
         idx: usize,
         visible_near: &HashSet<usize>,
         allow_page_count: bool,
-        duration_only: bool,
+        whole_listing_only: bool,
+    ) -> Option<DetailsMetaTarget> {
+        self.details_meta_target_for_idx_with_requirements(
+            idx,
+            visible_near,
+            allow_page_count,
+            whole_listing_only,
+            self.active_listing_meta_requirements(),
+        )
+    }
+
+    fn details_meta_target_for_idx_with_requirements(
+        &self,
+        idx: usize,
+        visible_near: &HashSet<usize>,
+        allow_page_count: bool,
+        whole_listing_only: bool,
+        requirements: ListingMetaRequirements,
     ) -> Option<DetailsMetaTarget> {
         let item = self.items.get(idx)?.clone();
         let key = self.details_lazy_cache_key(idx)?;
@@ -75490,27 +75550,29 @@ impl App {
             crate::io_semaphore::IoPriority::Low
         };
         let existing_meta = self.details_lazy_meta_for_idx(idx);
-        let load_image_dims = !duration_only
+        let load_image_dims = !whole_listing_only
             && self.lazy_load_image_dims_for_idx(idx)
             && existing_meta
                 .is_none_or(|meta| meta.image_dims.is_none() && !meta.image_dims_failed);
-        let load_video_meta = self.lazy_load_video_meta_for_idx(idx)
+        let duration =
+            requirements.duration && matches!(&item, GridItem::Video(_) | GridItem::Audio(_));
+        let load_video_meta = (duration || self.lazy_load_video_meta_for_idx(idx))
+            && (!whole_listing_only || requirements.duration)
             && (self.settings.grid_view_mode != crate::settings::GridViewMode::Thumbnail
-                || self.duration_lengths_wanted()
+                || requirements.duration
                 || visible_near.contains(&idx)
                 || self.selection_info_lazy_target_idx() == Some(idx))
             && existing_meta.is_none_or(|meta| !meta.media.satisfies(self.items_generation));
-        let load_page_count = !duration_only
+        let load_page_count = !whole_listing_only
             && allow_page_count
             && self.lazy_load_page_count_for_idx(idx)
             && existing_meta
                 .is_none_or(|meta| !self.details_page_count_meta_satisfies_idx(idx, meta));
-        let load_created_at = !duration_only
+        let load_created_at = !whole_listing_only
             && self.lazy_load_created_for_idx(idx)
             && existing_meta
                 .is_none_or(|meta| meta.created_at.is_none() && !meta.created_at_failed);
-        let load_ai_metadata = !duration_only
-            && self.lazy_load_ai_metadata_for_idx(idx)
+        let load_ai_metadata = (requirements.ai && self.details_item_supports_ai_metadata(idx))
             && existing_meta.is_none_or(|meta| !meta.ai_metadata_checked);
         let pdf_password_revision = if load_page_count {
             match &item {
@@ -75902,6 +75964,13 @@ impl App {
         let smart_rating_membership = self.smart_folder_rating_membership_flags();
         let mut smart_rule_total = 0;
         let mut smart_rule_search_matches = 0;
+        // A listing-wide proof does not qualify ordinary fields for newly
+        // visible rows. Detect them in this existing projection walk; pending
+        // work is already invalidated by its visible revision, and a user stop
+        // must remain stopped.
+        let check_added_meta =
+            self.details_meta_pending.is_none() && self.details_image_dims_state.is_ready();
+        let mut added_meta_needed = false;
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
             if !self.direct_media_basis_allows_index(i) {
@@ -75960,6 +76029,16 @@ impl App {
             if !self.passes_color_filter_for_scope(i, color_scope_signature) {
                 continue;
             }
+            if check_added_meta
+                && !added_meta_needed
+                && self.visible_indices.binary_search(&i).is_err()
+                && self.details_item_requires_lazy_meta(i)
+                && self
+                    .details_lazy_meta_for_idx(i)
+                    .is_none_or(|meta| !self.details_lazy_meta_satisfies_idx(i, meta))
+            {
+                added_meta_needed = true;
+            }
             result.push(i);
         }
         if smart_rating_membership.is_some()
@@ -75969,6 +76048,11 @@ impl App {
             session.rating_rule_search_match_count = smart_rule_search_matches;
         }
         self.visible_indices = result;
+        if added_meta_needed {
+            // Adopt the qualification with the projection, before a picker can
+            // recursively rebuild it. Cache and listing proof remain intact.
+            self.details_image_dims_state = LazyColumnState::NotRequested;
+        }
         if self
             .ring_picker
             .as_ref()
@@ -76040,8 +76124,7 @@ impl App {
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
             if self.details_meta_pending.is_none()
                 && !self.details_image_dims_state.is_ready()
-                && !(self.duration_lengths_wanted()
-                    && matches!(self.details_image_dims_state, LazyColumnState::Cancelled))
+                && !matches!(self.details_image_dims_state, LazyColumnState::Cancelled)
             {
                 self.details_image_dims_state = LazyColumnState::NotRequested;
             }

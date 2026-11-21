@@ -8,32 +8,40 @@ mod duration_762_context_tests {
     #[test]
     fn duration_762_proof_and_cache_follow_mount_park_and_drop_without_sibling_changes() {
         let mut app = crate::app::setup_app_for_test();
-        let proof = DurationScanProof {
+        let proof = ListingMetaScanProof {
             generation: app.items_generation,
             items_len: app.items.len(),
+            requirements: ListingMetaRequirements {
+                duration: true,
+                ai: true,
+            },
         };
-        app.duration_scan_proof = Some(proof);
+        app.listing_meta_scan_proof = Some(proof);
         app.details_lazy_meta
             .insert("source-media".into(), DetailsLazyMeta::default());
         let mut sibling = ViewerContextBundle::empty();
         sibling.set_items_generation(app.items_generation.wrapping_add(1));
-        let sibling_proof = DurationScanProof {
+        let sibling_proof = ListingMetaScanProof {
             generation: sibling.items_generation,
             items_len: sibling.items.len(),
+            requirements: ListingMetaRequirements {
+                duration: true,
+                ai: true,
+            },
         };
         assert_ne!(proof, sibling_proof);
-        sibling.duration_scan_proof = Some(sibling_proof);
+        sibling.listing_meta_scan_proof = Some(sibling_proof);
         sibling
             .details_lazy_meta
             .insert("sibling-media".into(), DetailsLazyMeta::default());
         app.swap_viewer_context_bundle(&mut sibling);
-        assert_eq!(app.duration_scan_proof, Some(sibling_proof));
+        assert_eq!(app.listing_meta_scan_proof, Some(sibling_proof));
         assert!(app.details_lazy_meta.contains_key("sibling-media"));
-        assert_eq!(sibling.duration_scan_proof, Some(proof));
+        assert_eq!(sibling.listing_meta_scan_proof, Some(proof));
         assert!(sibling.details_lazy_meta.contains_key("source-media"));
         app.swap_viewer_context_bundle(&mut sibling);
         drop(sibling);
-        assert_eq!(app.duration_scan_proof, Some(proof));
+        assert_eq!(app.listing_meta_scan_proof, Some(proof));
         assert!(app.details_lazy_meta.contains_key("source-media"));
         assert!(!app.details_lazy_meta.contains_key("sibling-media"));
     }
@@ -41,20 +49,69 @@ mod duration_762_context_tests {
     #[test]
     fn duration_762_fork_keeps_source_proof_and_starts_without_metadata_proof() {
         let mut app = crate::app::setup_app_for_test();
-        let proof = DurationScanProof {
+        let proof = ListingMetaScanProof {
             generation: app.items_generation,
             items_len: app.items.len(),
+            requirements: ListingMetaRequirements {
+                duration: true,
+                ai: true,
+            },
         };
-        app.duration_scan_proof = Some(proof);
+        app.listing_meta_scan_proof = Some(proof);
         app.details_lazy_meta
             .insert("source-media".into(), DetailsLazyMeta::default());
         let fork = app.split_current_context_preserving_main_grid();
-        assert_eq!(app.duration_scan_proof, Some(proof));
+        assert_eq!(app.listing_meta_scan_proof, Some(proof));
         assert!(app.details_lazy_meta.contains_key("source-media"));
-        assert_eq!(fork.duration_scan_proof, None);
+        assert_eq!(fork.listing_meta_scan_proof, None);
         assert!(fork.details_lazy_meta.is_empty());
         drop(fork);
-        assert_eq!(app.duration_scan_proof, Some(proof));
+        assert_eq!(app.listing_meta_scan_proof, Some(proof));
+    }
+
+    #[test]
+    fn facet_835_context_reproof_and_bundle_drop_keep_sibling_requirements() {
+        let mut app = crate::app::setup_app_for_test();
+        app.duration_facet_requested = true;
+        app.ai_model_facet_requested = true;
+        let source_proof = app.listing_meta_scan_snapshot();
+        assert!(source_proof.requirements.duration && source_proof.requirements.ai);
+        app.complete_listing_meta_scan(Some(source_proof));
+
+        let mut sibling = ViewerContextBundle::empty();
+        sibling.set_items_generation(app.items_generation.wrapping_add(1));
+        let sibling_proof = ListingMetaScanProof {
+            generation: sibling.items_generation,
+            items_len: sibling.items.len(),
+            requirements: source_proof.requirements,
+        };
+        sibling.listing_meta_scan_proof = Some(sibling_proof);
+        app.swap_viewer_context_bundle(&mut sibling);
+        assert_eq!(sibling.listing_meta_scan_proof, Some(source_proof));
+
+        app.bump_items_generation();
+        assert!(!app.duration_scan_ready() && !app.ai_model_facet_ready());
+        let replacement_proof = app.listing_meta_scan_snapshot();
+        assert_ne!(replacement_proof, sibling_proof);
+        assert_eq!(
+            app.complete_listing_meta_scan(Some(replacement_proof)),
+            source_proof.requirements
+        );
+        assert!(app.duration_scan_ready() && app.ai_model_facet_ready());
+        assert_eq!(sibling.listing_meta_scan_proof, Some(source_proof));
+
+        app.swap_viewer_context_bundle(&mut sibling);
+        assert_eq!(app.listing_meta_scan_proof, Some(source_proof));
+        assert_eq!(sibling.listing_meta_scan_proof, Some(replacement_proof));
+        drop(sibling);
+        assert_eq!(app.listing_meta_scan_proof, Some(source_proof));
+        assert!(app.duration_scan_ready() && app.ai_model_facet_ready());
+
+        let fork = app.split_current_context_preserving_main_grid();
+        assert!(fork.listing_meta_scan_proof.is_none());
+        assert_eq!(app.listing_meta_scan_proof, Some(source_proof));
+        drop(fork);
+        assert!(app.duration_scan_ready() && app.ai_model_facet_ready());
     }
 }
 
@@ -1928,7 +1985,7 @@ pub(in crate::app) struct ViewerContextBundle {
     details_meta_pending: Option<DetailsMetaPending>,
     details_lazy_visible_revision: u64,
     details_image_dims_state: LazyColumnState,
-    duration_scan_proof: Option<super::DurationScanProof>,
+    listing_meta_scan_proof: Option<super::ListingMetaScanProof>,
     metadata_cache: std::collections::HashMap<String, Option<crate::png_metadata::AiMetadata>>,
     exif_cache: std::collections::HashMap<String, Option<crate::exif_reader::ExifInfo>>,
     xmp_cache: std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
@@ -3253,7 +3310,7 @@ impl ViewerContextBundle {
             details_meta_pending: None,
             details_lazy_visible_revision: 0,
             details_image_dims_state: LazyColumnState::Disabled,
-            duration_scan_proof: None,
+            listing_meta_scan_proof: None,
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
@@ -3693,7 +3750,7 @@ impl App {
             details_meta_pending,
             details_lazy_visible_revision,
             details_image_dims_state,
-            duration_scan_proof,
+            listing_meta_scan_proof,
             metadata_cache,
             exif_cache,
             xmp_cache,
@@ -4021,7 +4078,7 @@ impl App {
         swap_field!(details_meta_pending);
         swap_field!(details_lazy_visible_revision);
         swap_field!(details_image_dims_state);
-        swap_field!(duration_scan_proof);
+        swap_field!(listing_meta_scan_proof);
         swap_field!(metadata_cache);
         swap_field!(exif_cache);
         swap_field!(xmp_cache);
@@ -4475,7 +4532,7 @@ impl App {
             details_meta_pending,
             details_lazy_visible_revision,
             details_image_dims_state,
-            duration_scan_proof,
+            listing_meta_scan_proof,
             metadata_cache,
             exif_cache,
             xmp_cache,
@@ -4941,7 +4998,7 @@ impl App {
             details_meta_pending,
             details_lazy_visible_revision,
             details_image_dims_state,
-            duration_scan_proof,
+            listing_meta_scan_proof,
             video_thumb_overrides,
             metadata_cache,
             exif_cache,

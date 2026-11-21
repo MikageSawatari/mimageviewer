@@ -138,8 +138,11 @@ sidecar hard purgeの結果を比較基準へ反映する必要はなく、sidec
 
 既存 `poll_current_folder_watch` → `check_external_folder_changes(Notified)` → `start_external_rescan` の
 ownerでworkerがscan・行投影・signature生成／比較を行う。UIで全行比較・snapshot clone・追加I/Oをしない。
-元context／exact source／items generation／走査・並び・フィルタ条件と捕捉した前回記録の有効性を
-採用直前に確認する。Delete記録更新・source切替・sort／facet変更で旧要求を拒否する。
+元context／exact source／items generation／走査・並び・種類採否など行記録の条件と捕捉した前回記録の有効性を
+採用直前に確認する。Delete記録更新・source切替・sort変更で旧要求を拒否する。
+facetは行記録を作った後の`visible_indices`の表示投影なので、投影keyに含めない (§1.835)。
+facet変更をまたぐ旧要求も受理し、一致なら既に作り直した表示集合を保持、不一致なら通常一覧採用で
+現在のfacetを適用する。facet変更だけで監視の作り直し・全体reloadを起こさない。
 thumbnail採用や別context／RemoteのDB書込みだけで新しい比較revision／reload条件を作らない。
 
 - 一致: 観測signature／親mtime／取り込んだcutoffだけを元ownerで進める。

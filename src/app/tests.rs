@@ -10021,7 +10021,7 @@ fn install_snapshot_details_pending(
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
-        duration_scan: None,
+        listing_meta_scan: None,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -77715,7 +77715,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let (priority_tx, _priority_rx) = mpsc::channel();
         app.details_meta_pending = Some(DetailsMetaPending {
             scan_scope: DetailsMetaScanScope::AllRequirements,
-            duration_scan: None,
+            listing_meta_scan: None,
             visible_revision: app.details_lazy_visible_revision,
             selection_target_key: None,
             normal_target_keys: Default::default(),
@@ -107484,7 +107484,7 @@ fn details_lazy_session_stays_active_between_consecutive_page_count_jobs() {
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
-        duration_scan: None,
+        listing_meta_scan: None,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -107893,7 +107893,7 @@ fn leaving_page_count_sort_cancels_full_load_and_returns_to_staged_loading() {
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
-        duration_scan: None,
+        listing_meta_scan: None,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -107984,7 +107984,7 @@ fn changing_lazy_columns_discards_old_finished_event_and_requeues_new_requiremen
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
-        duration_scan: None,
+        listing_meta_scan: None,
         visible_revision: old_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -112259,7 +112259,9 @@ fn install_fake_media_duration_pending(app: &mut App) -> Arc<AtomicBool> {
     let (priority_tx, _priority_rx) = mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
-        duration_scan: None,
+        listing_meta_scan: app
+            .whole_listing_meta_scan_wanted()
+            .then(|| app.listing_meta_scan_snapshot()),
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: app.selection_info_lazy_target_key(),
         normal_target_keys: HashSet::new(),
@@ -112364,6 +112366,9 @@ fn media_duration_thumbnail_ai_ready_stage_requests_new_range_without_reloading_
             ..Default::default()
         },
     );
+    let scan = app.listing_meta_scan_snapshot();
+    app.complete_listing_meta_scan(Some(scan));
+    assert!(app.ai_model_facet_ready());
     app.refresh_thumbnail_details_stage(&egui::Context::default());
     assert!(app.details_lazy_uses_visible_stages());
     assert!(app.details_visible_stage_needs_load());
@@ -112446,6 +112451,9 @@ fn ai_facet_ready_applies_model_and_tool_filters_and_ignore() {
     assert!(app.passes_facet_filter(2, None));
 
     app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    assert!(!app.ai_model_facet_ready(), "Ready alone cannot prove AI");
+    let scan = app.listing_meta_scan_snapshot();
+    app.complete_listing_meta_scan(Some(scan));
     assert!(app.ai_model_facet_ready());
     assert!(!app.passes_facet_filter(2, None));
     assert!(!app.passes_facet_filter(2, Some(FacetField::AiModel)));
@@ -112489,6 +112497,9 @@ fn media_duration_thumbnail_completed_ai_scan_followup_is_bounded() {
     }
     app.keep_set = HashSet::from([media_idx]);
     app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    let scan = app.listing_meta_scan_snapshot();
+    app.complete_listing_meta_scan(Some(scan));
+    assert!(app.ai_model_facet_ready());
     app.last_prefetch_scroll_at = Some(std::time::Instant::now() - PREFETCH_IDLE_THRESHOLD);
     let ctx = egui::Context::default();
     app.refresh_thumbnail_details_stage(&ctx);
@@ -112539,8 +112550,11 @@ fn media_duration_preference_off_cancels_ai_pending_and_preserves_other_requirem
 fn media_duration_video_only_stage_preserves_ready_ai_choices_and_count_cache() {
     let mut app = setup_media_duration_thumbnail_app();
     app.ai_model_facet_requested = true;
+    let scan = app.listing_meta_scan_snapshot();
+    app.complete_listing_meta_scan(Some(scan));
     let _cancel = install_fake_media_duration_pending(&mut app);
     app.details_meta_pending.as_mut().unwrap().scan_scope = DetailsMetaScanScope::VisibleStage;
+    app.details_meta_pending.as_mut().unwrap().listing_meta_scan = None;
     app.facet_ai_model_counts_cache = Some(std::collections::BTreeMap::from([("Model".into(), 3)]));
     app.facet_ai_tool_counts_cache = Some(std::collections::BTreeMap::from([("Tool".into(), 3)]));
     assert!(app.ai_model_facet_ready());
@@ -112608,6 +112622,7 @@ fn media_duration_running_stage_yields_to_first_all_item_ai_request() {
     let mut app = setup_media_duration_thumbnail_app();
     let cancel = install_fake_media_duration_pending(&mut app);
     app.details_meta_pending.as_mut().unwrap().scan_scope = DetailsMetaScanScope::VisibleStage;
+    app.details_meta_pending.as_mut().unwrap().listing_meta_scan = None;
     assert!(!app.ai_model_facet_requested);
     app.request_ai_model_facet_load();
     assert!(cancel.load(Ordering::Relaxed));
@@ -112636,6 +112651,7 @@ fn media_duration_mode_switch_discards_queued_thumbnail_completion_and_plans_all
     let (old_tx, old_rx) = mpsc::channel();
     if let Some(pending) = app.details_meta_pending.as_mut() {
         pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+        pending.listing_meta_scan = None;
         let DetailsMetaPendingPhase::Loading { rx, .. } = &mut pending.phase else {
             panic!("expected worker receiver");
         };
@@ -112712,6 +112728,7 @@ fn media_duration_timeout_retries_after_other_folder_and_reopen() {
     let (tx, rx) = mpsc::channel();
     let pending = app.details_meta_pending.as_mut().unwrap();
     pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+    pending.listing_meta_scan = None;
     pending.normal_target_keys = HashSet::from([key.clone()]);
     let DetailsMetaPendingPhase::Loading { rx: receiver, .. } = &mut pending.phase else {
         panic!("expected worker receiver");
@@ -112966,6 +112983,7 @@ fn selection_info_lazy_mode_switch_preserves_dedicated_duration_with_page_count_
     let (old_tx, old_rx) = mpsc::channel();
     let pending = app.details_meta_pending.as_mut().unwrap();
     pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+    pending.listing_meta_scan = None;
     let DetailsMetaPendingPhase::Loading { rx, .. } = &mut pending.phase else {
         unreachable!()
     };
@@ -112992,6 +113010,8 @@ fn selection_info_lazy_mode_switch_preserves_dedicated_duration_with_page_count_
             .is_err()
     );
     let ctx = egui::Context::default();
+    // Acquire AI for the listing before testing the later selected-only stage.
+    app.ai_model_facet_requested = true;
     app.poll_details_meta_load(&ctx);
     assert_eq!(
         app.details_meta_pending
@@ -113010,9 +113030,9 @@ fn selection_info_lazy_mode_switch_preserves_dedicated_duration_with_page_count_
         assert!(app.details_image_dims_state.is_ready());
     };
     await_ready(&mut app);
+    assert!(app.ai_model_facet_ready());
     assert_eq!(app.details_video_duration_sort_value(1), Some(65000));
     // A selected-only follow-up after full completion is bounded and keeps ready AI facets.
-    app.ai_model_facet_requested = true;
     app.selected = Some(2);
     app.poll_details_meta_load(&ctx);
     assert_eq!(

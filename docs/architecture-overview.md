@@ -264,10 +264,20 @@ sourceの種類採否と派生動画判定後、producer既存のsort／走査�
 同じViewerContextBundleで所有する。既存rescan workerで種類採否・同名除去・順序を投影して
 前回記録と比較し、一致なら一覧install・世代更新・install起因のthumbnail再要求を省く。
 採用時はcontext／exact source／一覧世代／投影条件／記録revisionを照合する。
+投影keyは行記録と決定的なgroup表示の条件を識別し、後段の表示投影であるfacetを含めない (§1.835)。
+facet変更をまたぐEqualは現表示を保持し、Differentの通常一覧採用は現在のfacetで表示集合を作る。
 forkはimmutableな行記録だけを継承し、購読・dirty・要求を共有しない。
 自動originは既存RefreshList intentからhydrationまで運び、sidecar取込だけを外す。
 明示GridReload／通常openは従来の取込とreloadを行う。
 契約と受入記録は [§1.375 R10](section375-operation-reconcile-plan.md)。
+
+長さ・AIモデル／生成ツールの絞り込みに必要なメタデータは、既存details-meta ownerが`items`全体を
+走査する。context所有の`listing_meta_scan_proof`は一覧世代・件数と、完了した長さ／AIの要件を保持し、
+一致する証明が満たす条件だけを適用する。停止は未証明要件の取得を止め、有効な証明を保持する。
+通常列の充足は全体証明と区別する。表示集合の拡大で新たな行の通常列が必要なら、既存rebuild内で検出し、
+停止とpendingの既存契約を守って予算付きAllRequirementsで補充する。追加の状態やownerは持たない。
+fork先は空、元contextはcacheと証明を保持し、所有分類・viewport経路は変えない。
+詳細は [§1.835設計](facet-projection-key-835-plan.md) と [長さ取得の契約](media-duration-sort-filter-plan.md#5-未取得の長さ)。
 
 
 検索索引の所有判定は `metadata_ownership`、metadata の構成変更は

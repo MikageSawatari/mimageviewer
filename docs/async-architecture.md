@@ -1137,21 +1137,35 @@ Critical 同士は既存レーンを共有するため、前面描画に対す�
 
 EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定ロックで直列化する。backfill / stage-0 は worker 上で来歴確認から SQLite 更新まで保持する。復元は候補分岐時の未固定元状態を保持し、対象範囲lease内でコピー前に再照合して、編集行コピーと台帳昇格まで保持する。範囲外の本の固定は待たせない。rename / purge / restore copy の共通 STORES 更新は EPUB キーを含み得る対象パス範囲だけ lease を保持し、PDF・画像の exact key は待たせない。UI のピン要求作成では EPUB の stat をせず、worker で世代 stamp を解決する。元 EPUB が消えたピン要求は worker で通常のフォルダ代表要求へ戻る。ドライブ一覧の cache-only worker は seed の EPUB 出所と世代を比較する。
 
-### サムネイルの動画・音声長さ取得
+### 一覧全体の長さ・AIメタデータ取得
 
-長さ順・長さ facet (§1.762) が要求されている間は一覧全体の取得範囲と長さのフィールド要件を
-分離し、全動画・音声を既存 `AllRequirements` session に含める。長さだけの要求で AI・日時・
-画像寸法・ページ数を増やさない。長さ順は物理フォルダだけで有効、facet はどの一覧でも有効。
-要件は最後の Item と Finished の間も維持し、可視近傍の `VisibleStage` に置き換えない。
+長さ順・長さ facet (§1.762) とAI facet (§1.835) は一覧全体の取得範囲とフィールド要件を分離し、
+既存 `AllRequirements` session の `WholeListing` で`items`全体を走査する。
+表示集合の外では`ListingMetaRequirements { duration, ai }`に含まれるフィールドだけを取得する。
+長さだけの要求で AI・日時・画像寸法・ページ数を増やさず、AIだけの要求で動画probeを増やさない。
+表示集合内の既存要件と選択情報の対象の例外は保つ。長さ順は物理フォルダだけで有効、facet はどの一覧でも有効。
+要件は最後の Item と Finished の間も維持し、未充足要件がある間は可視近傍の `VisibleStage` に置き換えない。
 画面内 Normal / 画面外 Low の既存 priority と `RetryLater` の同一覧世代での終端を維持する。
 
-`duration_scan_proof` は viewer context の details bundle と同じ所有境界で保持する。
-長さを含む全件 session が Finished・メモリ充足で即時完了・対象 0 件で完了し、計画開始時の
-(`items_generation`, `items.len()`) が現在と一致したときだけ記録する。取得中に対象が変われば
-旧 session を取り消して `NotRequested` へ戻し、新対象を計画する。利用者の停止は `Cancelled` を
-維持し、自動再開しない。完了後の対象変更も proof 不一致から再計画する。選択情報の補助取得は
-proof を消さず、fork 先は None、park / mount は cache と一緒に保持し、兄弟 context を変えない。
-有効な proof まで長さ条件だけを適用せず、完了時に表示集合を再構築する。
+`listing_meta_scan_proof: Option<ListingMetaScanProof>` は viewer context の details bundle と同じ所有境界で保持する。
+証明は計画開始時の一覧世代・件数・要件snapshotを持つ。全件sessionがFinished・メモリ充足で即時完了・
+対象0件で完了し、(`items_generation`, `items.len()`)が現在と一致したときだけ記録する。
+計画中に要件が減っても取得フィールドは開始時snapshotを維持し、現在の未充足要件が空でも
+snapshotを持つ全体FinishedはReconcilingへ回さず、完了helperで証明を立てる。
+同じ一覧の既存証明とは要件の和をとり、長さ／AIの取得済み要件を失わない。
+取得中に対象が変わるか、未充足要件を取得中のsnapshotが含まなければ旧sessionを取り消して
+`NotRequested`へ戻し、再計画する。段階取得は未充足要件が無くなってから許し、全体走査の
+Finishedのsnapshotを証明へ渡す。利用者の停止は`Cancelled`を維持し、自動再開しない。
+停止と選択情報の補助取得は有効な証明を消さない。AIメニューの初回要求も、有効なAI証明があれば
+requestedの印だけを立て、停止状態を無効化しない。一覧installで証明を破棄し、対象変更は証明不一致から再計画する。
+fork先はNone、park / mountはcacheと一緒に保持し、兄弟contextを変えない。
+長さ／AIそれぞれが証明されるまでその条件だけを適用せず、証明によって判定可能になった完了時に表示集合を再構築する。
+
+全体proofは通常列の完了を示さない。表示集合の拡大で新たな行の通常列が未充足なら、既存rebuild走査内の
+local boolで検出し、pending無し・非Cancelledの場合だけNotRequestedから既存の予算付きAllRequirementsへ戻す。
+proof・cacheを保持し、pendingは既存の表示revision失効、停止は利用者の再開へ従う。縮小や完了後の
+rebuildでは不要な再開を立てず、通常列の完了時には既存rebuild_details_orderで並べ替える。
+追加のApp状態・owner・UI全走査・I/Oは作らない (採用追補は[§1.835 §4.2.2-10](facet-projection-key-835-plan.md))。
 
 一覧の長さ順は materialize 時の snapshot に固定し、長さの取得完了から自動では並べ直さない。
 長さ順の選択・再選択は worker 再走査へ通し、catalog の一括 read-only lookup もそこで行う。

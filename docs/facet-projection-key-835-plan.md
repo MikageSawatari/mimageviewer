@@ -138,6 +138,9 @@ AI facet も、この形に乗せる。
 1. **証明を、一覧全体の要件の証明に広げる。**
    - `DurationScanProof` を、何の要件について全体を取得し終えたかを持つ証明に置き換える。名前は実装で決める。例: `ListingMetaScanProof { generation, items_len, duration: bool, ai: bool }`。
    - 走査の開始時に、要件の snapshot を取る (`duration = duration_lengths_wanted()`、`ai = ai_model_facet_should_load()`)。
+   - 実装は`ListingMetaScanProof { generation, items_len, requirements: ListingMetaRequirements { duration, ai } }`。
+     取得中に要件が減っても、plannerのskip・cache判定・target・選択対象は開始時のsnapshotが約束した
+     フィールドで作る。現在の要件だけへ縮小して、未取得のフィールドを証明することはしない。
    - 完了時に証明を保存する。同じ `generation` / `items_len` の証明が既にあれば、要件は和をとる (取得済みの要件を、後の走査で失わない)。
    - 一覧の採用で `None` に戻す規則 (`src/app.rs:46068`) は、今のまま。
 2. **判定を証明から導く。**
@@ -171,7 +174,9 @@ AI facet も、この形に乗せる。
    - これを、証明で AI か長さの判定が新たに使えるようになったときに作り直す形に揃える。今の長さの `duration_completed` と同じ形。
 7. **段階取得を許すのは、全体の要件がすべて証明されてから (r3 P2-1)。**
    - `details_lazy_uses_visible_stages()` (`src/app.rs:73926`) は今、長さの証明だけを見る (`!duration_lengths_wanted() || duration_scan_ready()`)。これを「未充足の要件が無い」に一般化する。
-   - これで、全体走査の `Finished` (`src/app.rs:74313-74336`) は、未充足の要件がある間は `Reconciling` に入らず、全体走査の snapshot を必ず `finish_details_lazy_session` へ渡して証明を立てる。
+   - snapshotを持つ全体走査の `Finished` (`src/app.rs:74313-74336`) は、必ず`finish_details_lazy_session`へ渡して証明を立てる。
+     取得中の要件縮小で現在の未充足要件が空になっても`Reconciling`へ入れてsnapshotを落とさない。
+     即時完了と非同期Finishedのどちらも、同じ開始時snapshotで完了する。
    - 今のままだと、AI だけを要求していてサムネイルの長さ表示か詳細のページ数列が有効な場合、`Reconciling` に入って snapshot を捨てる。post-grid の完了 (`:74014`) も snapshot なしなので、AI の証明が立たず、再走査を繰り返す。
    - 証明が立った後は、既存の VisibleStage と post-grid の完了をそのまま許す。
 8. **空の一覧**: 取得の受付 `details_lazy_columns_visible()` (`src/app.rs:74397-74399`) は、空の一覧では長さの要件だけを例外にしている。これを一覧全体の要件に揃え、空の一覧でも AI の証明が即時に立つようにする。全件 cache の当たりのときの即時完了 (`launch_details_meta_worker` の `plan.total == 0`) も、証明を立てる。
@@ -183,6 +188,19 @@ AI facet も、この形に乗せる。
      3. 長さの取得を始めて、停止する。
      4. AI のメニューを初めて開く。
    - 長さの `request_duration_facet_load` (`src/app/duration_metadata.rs:140`) と同じく、有効な AI の証明があれば `requested` だけを立て、取得の状態を無効にしない。
+10. **表示集合の拡大で、新たな表示行の通常列を補充する (静的レビューP2の採用追補)。**
+    - 全体proofが示すのは長さ／AIの取得で、通常列 (寸法・作成日時・動画列等) の完了ではない。
+      非表示中にAIだけ取得した行も、サイズ・評価条件の解除で表示対象へ入れば通常列が必要になる。
+    - `rebuild_visible_indices_impl`の既存の表示集合走査内で、新たに表示対象へ入る行について既存helperで
+      表示集合フィールドの未充足を判定し、関数内のlocal boolにまとめる。追加のApp状態・ownerは作らない。
+    - 未充足があり、pendingが無く、`Cancelled`でなければ`NotRequested`へ戻す。
+      既存pollから予算付き`AllRequirements`を開始し、通常列を可視近傍だけの`VisibleStage`へ移さない。
+    - 有効な全体proofとcacheを保持し、cache hitのフィールドを読み直さない。pendingがある場合は
+      既存の表示revisionによる失効経路へ任せる。停止中は`Cancelled`を保持し、利用者の再開後に補充する。
+    - UIに新たな全走査・I/Oを追加しない。表示集合が減るだけの変更では`Ready`を保持し、完了時のrebuildも
+      新たな表示行が無ければ再開を立てず、finish→rebuild→再開を循環させない。
+    - 通常列の取得完了後の並べ替えは既存`rebuild_details_order`を使う。
+      設計担当がこの取得資格の追補を採用し、実workerによる回帰テストとともに実装した。
 
 #### 4.2.3 これで閉じる経路
 
@@ -284,7 +302,7 @@ CLAUDE.md「設計の簡素化」に沿って、組み合わせそのものを�
 | T5 | AI 条件のまま、評価フィルタを解除する | 赤の見込み (既存の不具合) | 赤の見込み | 緑 |
 | T6 | 退避からの復元で AI 条件が戻る (r1 の例) | 実測で記録 | 赤の見込み | 緑 |
 | T7 | 長さ preset の復元、メニューを経ない適用 | 実測で記録 | 実測で記録 | 緑 |
-| T8 | 自動更新が今までどおり働く | 緑 | 緑 | 緑 |
+| T8 | 自動更新が今までどおり働く | 通知による追加・削除は緑。facet変更をまたぐ旧Equal / Differentの受理は赤 (§10.1) | 緑の見込み | 緑の見込み |
 
 各テストの中身:
 
@@ -342,6 +360,42 @@ CLAUDE.md「設計の簡素化」に沿って、組み合わせそのものを�
 - `section375_tests.rs`・`egui037_connection_tests.rs:850`・`tests/duration_762.rs:421` の key 一致の検査は、そのまま通るはず。
 - AI facet の既存のテストで、`CurrentGrid` や `Ready` からの推論に依存するものは、指示書に列挙したうえで書き換える。弱めない。
 
+段階3で移行した既存テスト (検査内容と関連assertionは維持):
+
+- **型・fieldの置換 (§4.2.2-1)**:
+  `details_lazy_session_stays_active_between_consecutive_page_count_jobs`、
+  `leaving_page_count_sort_cancels_full_load_and_returns_to_staged_loading`、
+  `changing_lazy_columns_discards_old_finished_event_and_requeues_new_requirements`。
+- **AI完了のfixtureを証明へ移行 (§4.2.2-2・7)**:
+  `media_duration_thumbnail_ai_ready_stage_requests_new_range_without_reloading_ai`、
+  `ai_facet_ready_applies_model_and_tool_filters_and_ignore`、
+  `media_duration_thumbnail_completed_ai_scan_followup_is_bounded`、
+  `media_duration_video_only_stage_preserves_ready_ai_choices_and_count_cache`、
+  `selection_info_lazy_mode_switch_preserves_dedicated_duration_with_page_count_only`。
+  Readyだけでは資格を与えず、最後のテストは実AI取得の証明を先行させる。
+- **VisibleStageに全体snapshotを持たせない (§4.2.2-1・5)**:
+  `media_duration_running_stage_yields_to_first_all_item_ai_request`、
+  `media_duration_mode_switch_discards_queued_thumbnail_completion_and_plans_all_rows`、
+  `media_duration_timeout_retries_after_other_folder_and_reopen`。
+  上記の`media_duration_video_only_stage_preserves_ready_ai_choices_and_count_cache`と
+  `selection_info_lazy_mode_switch_preserves_dedicated_duration_with_page_count_only`も同じ修正を含む。
+- **§1.762の型・fieldの置換 (§4.2.2-1)**:
+  `duration_762_planner_scans_media_hidden_by_filters`、
+  `duration_762_cached_retry_later_and_zero_target_completions_prove_the_snapshot`、
+  `duration_762_membership_change_retires_old_session_and_reproves_cached_targets`、
+  `duration_762_user_stop_waits_for_resume_and_visible_stage_keeps_proof`、
+  `duration_762_proven_lengths_allow_post_grid_visible_stage_and_keep_proof_through_finished`、
+  `duration_762_proven_lengths_allow_poll_ready_visible_stage`、
+  `duration_762_cancelled_keeps_visible_stages_stopped_with_or_without_duration_proof`、
+  `duration_762_thumbnail_cancelled_duration_owner_stays_stopped_after_scroll`。
+- **contextの型・両要件の保持 (§4.3)**:
+  `duration_762_proof_and_cache_follow_mount_park_and_drop_without_sibling_changes`、
+  `duration_762_fork_keeps_source_proof_and_starts_without_metadata_proof`。
+
+補助の`install_snapshot_details_pending`・`install_context_details_meta_pending`・
+`install_fake_media_duration_pending`・長さテストの`pending`・`finish_warm_visible_stage`も同じ契約へ揃えた。
+AIを要求しない通常列の`CurrentGrid`の検査は維持する。
+
 ## 8. 文書
 
 - `docs/section375-operation-reconcile-plan.md` §3.3: 「sort／facet変更で旧要求を拒否する」を「sort 変更で」に直し、facet を外した理由 (§2・§3) を足す。
@@ -350,39 +404,65 @@ CLAUDE.md「設計の簡素化」に沿って、組み合わせそのものを�
 - `docs/async-architecture.md` / `docs/architecture-overview.md`: key の材料や AI facet の取得を書いた所があれば揃える。
 - マニュアル: AI の絞り込みの読み込み中の説明 (件数の母数) を確かめ、要れば直す。範囲指定の説明は変わらない。
 
-## 9. 段階 3 で書くテスト (段階 1 の引き継ぎ)
+## 9. 段階 3 の追加テスト (実装済み・自動検証待ち)
 
-段階 1 は現行 API で観測できる契約を `src/app/tests/facet_835.rs` と配下に追加する。
-製品コード・既存テストの期待値は変更せず、cargo による実行もしない。以下は新しい証明型と
-要件 snapshot の形が決まってから書く。`#[ignore]` や仮の型・製品 API は追加しない。
+段階1の21本に加え、統合証明と要件snapshotの契約を`src/app/tests/facet_835/proof.rs`へ12本、
+表示集合の拡大後の通常列取得を`src/app/tests/facet_835/visible_requirements.rs`へ7本追加した。
+context所有の1本を含め、`facet_835_`で始まるテストは計41本になった。
+以下のテスト名は共通の`facet_835_`を省略する。`#[ignore]`や仮の型・製品APIは追加していない。
+段階2・3のcargo実行と結果の記録は設計担当が行う。この実装作業では実行しておらず、実機も未確認。
 
-- **証明の要件の和 (§4.2.2-1)**: 同じ generation / items_len で、長さ→AI、AI→長さの
-  各完了が先の要件を保持する。異なる generation / items_len の証明とは和をとらない。
-  現行 `DurationScanProof` には AI 要件を表す欄が無い。
-- **要件 snapshot と資格 (§4.2.2-2・5)**: 要件追加時の取消・再走査の挙動は段階 1 で
-  検査する。段階 3 では、旧 snapshot の Finished が新しい AI 要件を証明しないこと、
-  長さだけの証明 / AI だけの証明 / 両方の証明を区別した未充足要件の差集合も検査する。
-- **一覧採用での破棄 (§4.2.2-1)**: 段階 1 は既存 ready API で採用後の無効化を検査する。
-  段階 3 では統合証明自体が None になることと、旧一覧の遅着 Finished を検査する。
-- **context 所有 (§4.3)**: `viewer_context_registry.rs` の §1.762 の型依存テストを統合証明へ
-  置き換え、長さと AI の要件を含めた swap、fork 先は空・元は保持、bundle 破棄で兄弟を
-  失効させないことを検査する。段階 1 では既存の context テストを変更しない。
-- **段階取得との共存 (§4.2.2-7)**: AI だけ + サムネイルの長さ表示、および AI だけ + 詳細の
-  ページ数列の 2 経路で、実 worker の Finished を保持・解放し、全体の snapshot が証明へ
-  渡ったことを検査する。Ready / Reconciling だけを見て代用しない。証明成立後の本物の
-  VisibleStage が取消されずに完了し、既存の証明を上書きしないことも検査する。
-- **即時完了 (§4.2.2-8)**: 空一覧と全件 cache hit は段階 1 で既存の取得・ready API から
-  検査する。段階 3 では即時完了の統合証明に AI 要件が入ることを直接検査する。
-- **停止と資格 (§4.2.4・§4.2.2-9)**: 長さの証明を保った AI の停止・再開、および
-  requested 偽の実 AI 取得→長さの停止→両 AI メニューの初回 open は段階 1 で検査する。
-  段階 3 では両方の順序で部分証明そのものの保持と、停止中の未証明要件だけが不適用に
-  なることを確認する (まれな I/O 失敗ごとの回復テストは追加しない)。
+- **証明の要件の和 (§4.2.2-1)**: `proof_unions_same_listing_requirements_in_both_orders`と
+  `proof_does_not_union_different_generations_or_lengths`で、長さ→AI・AI→長さの和と、
+  一覧世代／件数が異なる証明との分離を検査する。
+- **要件snapshotと資格 (§4.2.2-2・5)**: `unproven_requirements_distinguish_partial_and_complete_proofs`で
+  長さだけ／AIだけ／両方の証明から未充足要件を求める。
+  `old_requirement_snapshot_finished_cannot_prove_new_ai`は実workerのFinishedを保持し、
+  AIの要件追加後に解放して旧snapshotではAIを証明できないことを検査する。
+- **要件縮小時のsnapshot保持 (§4.2.2-1・7)**:
+  `ai_requirement_removed_mid_plan_still_reads_uncached_later_slice`で、計画中にAI要件が空へ縮小しても
+  後続sliceの未cache画像を開始時snapshotどおり実取得することを検査する。
+  `ai_requirement_removed_before_real_finished_keeps_snapshot_out_of_reconciling`で、現在の未充足要件が
+  空でも全体走査の実FinishedをReconcilingへ落とさず、snapshotから直ちに証明を立てることを検査する。
+- **一覧採用での破棄 (§4.2.2-1)**: `adoption_discards_proof_and_rejects_old_real_finished`で、
+  install時の証明のNone化と、旧一覧の実workerから遅着したFinishedの拒否を検査する。
+- **context所有 (§4.3)**: `viewer_context_registry.rs`の§1.762のswap／forkテストを統合証明へ置き換えた。
+  長さとAIの両要件を運び、fork先は空・元は保持する。
+  `facet_835_context_reproof_and_bundle_drop_keep_sibling_requirements`も追加し、
+  一方のcontextの再証明・bundle破棄・forkとfork先の破棄で、兄弟や元contextの証明を変えないことを検査する。
+- **段階取得との共存 (§4.2.2-7)**: `ai_only_thumbnail_badge_real_finished_publishes_snapshot`と
+  `ai_only_page_count_real_finished_then_visible_stage_preserves_proof`で、AIだけ＋サムネイルの長さ表示、
+  AIだけ＋詳細のページ数列の両経路を検査する。実workerのFinishedを保持・解放し、snapshotが証明へ
+  渡ることと、成立後の実VisibleStageが取消されず完了して既存証明を保つことを検査する。
+- **即時完了 (§4.2.2-8)**: `empty_and_all_cache_completion_store_ai_in_integrated_proof`で、
+  空一覧と全件cache hitの即時完了にAI要件の証明が入ることを直接検査する。
+- **停止と資格 (§4.2.4・§4.2.2-9)**: `duration_proof_survives_ai_stop_resume_and_only_unproven_ai_is_ignored`と
+  `ai_proof_survives_duration_stop_resume_and_only_unproven_lengths_are_ignored`で、両方の順序の部分証明保持、
+  停止中は未証明条件だけが不適用になること、再開後の要件の和を検査する。
+  requested偽の実AI取得→長さの停止→両AIメニューの初回openは段階1のテストを維持する。
+  まれなI/O失敗ごとの回復テストは追加しない。
+- **表示集合の拡大後の通常列 (§4.2.2-10)**: `visible_requirements.rs`の
+  `size_expansion_acquires_hidden_columns_and_sorts_without_reload`、
+  `rating_expansion_acquires_hidden_columns_and_sorts_without_reload`、
+  `name_clear_expansion_acquires_hidden_columns_through_common_owner`で、サイズ・評価・名前条件の解除を検査する。
+  全体AI取得後も非表示行Bの寸法・作成日時は未取得であることを先に確認し、解除後に実workerがBを取得し、
+  画像面積降順を[B, A]へ並べ直すこと、一覧世代と全体proofを保持することを検査する。
+- **通常列補充の停止・縮小・完了 (§4.2.2-10)**:
+  `cancelled_expansion_keeps_proof_and_waits_for_explicit_resume`で停止中の証明保持と明示再開を、
+  `narrowing_ready_projection_does_not_start_metadata_session`で縮小時のReady保持を、
+  `finished_ai_projection_does_not_cycle_metadata_session_starts`で完了によるrebuildが再開を循環させないことを検査する。
+  `details-meta-session`の実Started記録を数え、完了後の繰り返しpoll／rebuildで開始数が増えないことも確認する。
+- **補充中の表示集合拡大 (§4.2.2-10)**:
+  `pending_expansion_uses_revision_replacement_without_double_start`で実workerのFinishedを保持して解除し、
+  既存の表示revisionで元pendingを退役して一度だけ置換すること、重複開始を拒否し通常列の取得・再ソートまで進むことを検査する。
 
-段階 1 の source inspection で分かった設計表との相違:
+証明を直接設定するのは純粋な証明演算の3本だけ。取得・完了テストは実PNGメタデータworkerのItem／Finishedを使い、
+Loadingのreceiverを中継して実Finishedの配送を保持・解放する。ページ数のVisibleStageはメモリ上のZipTreeを使う。
 
-- T8 の通知による追加・削除は現行でも緑の見込み。一方、facet 変更をまたぐ旧 Equal /
-  Different の**受理**は、現行 `proof_valid` が facet を含む key を照合して拒否するため、
-  テストだけの段階では赤の見込み。§7 の T8 一行全体を「緑」とする予測とは異なる。
+段階1の観測方法と結果の補足:
+
+- T8の通知による追加・削除は緑、facet変更をまたぐ旧Equal / Differentの受理は赤だった (§10.1)。
+  段階1の`proof_valid`がfacetを含むkeyを照合して拒否していたためで、§7の表もこの実測へ揃えた。
 - `restore_facet_filter_suppression()` 自体は settings と名前欄の runtime を戻すだけ。
   復元バッジの呼び出し側が直後に `rebuild_visible_indices()` を呼ぶ。T6/T7 はこの両方を
   実行し、poll より前の投影も検査する。

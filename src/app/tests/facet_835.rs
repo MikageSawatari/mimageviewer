@@ -1,4 +1,4 @@
-//! §1.835 stage 1: contracts, including intentionally red tests on v5.5.0.
+//! §1.835 contracts: stage 1 regressions and stage 3 listing-proof ownership.
 #![cfg(windows)]
 
 use super::phase_c_support::{AppTestEnv, setup_app};
@@ -12,8 +12,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 mod acquisition;
+mod proof;
 mod ranges;
 mod refresh;
+mod visible_requirements;
 
 const DEADLINE: Duration = Duration::from_secs(20);
 

@@ -60,8 +60,9 @@ fn pending(
     let cancel = Arc::new(AtomicBool::new(false));
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: scope,
-        duration_scan: (scope == DetailsMetaScanScope::AllRequirements)
-            .then(|| app.duration_scan_snapshot()),
+        listing_meta_scan: (scope == DetailsMetaScanScope::AllRequirements
+            && app.whole_listing_meta_scan_wanted())
+        .then(|| app.listing_meta_scan_snapshot()),
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: app.selection_info_lazy_target_key(),
         normal_target_keys: Default::default(),
@@ -125,7 +126,7 @@ fn duration_762_planner_scans_media_hidden_by_filters() {
     app.search_filter = Some(HashSet::from([0]).into());
     app.start_details_meta_load(&egui::Context::default());
     let pending = app.details_meta_pending.as_ref().unwrap();
-    assert!(pending.duration_scan.is_some());
+    assert!(pending.listing_meta_scan.is_some());
     let DetailsMetaPendingPhase::Planning(plan) = &pending.phase else {
         panic!("bounded planning");
     };
@@ -160,7 +161,7 @@ fn duration_762_cached_retry_later_and_zero_target_completions_prove_the_snapsho
     assert!(!app.duration_scan_ready());
     app.start_details_meta_load(&egui::Context::default());
     assert!(app.duration_scan_ready());
-    assert_eq!(app.duration_scan_proof.unwrap().items_len, 0);
+    assert_eq!(app.listing_meta_scan_proof.unwrap().items_len, 0);
 }
 
 #[test]
@@ -218,7 +219,7 @@ fn duration_762_membership_change_retires_old_session_and_reproves_cached_target
             .is_err()
     );
     assert!(app.duration_scan_ready());
-    assert_eq!(app.duration_scan_proof.unwrap().items_len, 6);
+    assert_eq!(app.listing_meta_scan_proof.unwrap().items_len, 6);
     assert!(matches!(
         app.details_image_dims_state,
         LazyColumnState::Ready { .. }
@@ -232,7 +233,7 @@ fn duration_762_membership_change_retires_old_session_and_reproves_cached_target
     assert!(cancel.load(Ordering::Relaxed));
     assert!(app.duration_scan_ready());
     assert_eq!(
-        app.duration_scan_proof.unwrap().generation,
+        app.listing_meta_scan_proof.unwrap().generation,
         app.items_generation
     );
 }
@@ -256,7 +257,7 @@ fn duration_762_user_stop_waits_for_resume_and_visible_stage_keeps_proof() {
     app.resume_details_meta_loading();
     app.poll_details_meta_load(&egui::Context::default());
     assert!(app.duration_scan_ready());
-    let proof = app.duration_scan_proof;
+    let proof = app.listing_meta_scan_proof;
     let (_, tx) = pending(&mut app, DetailsMetaScanScope::VisibleStage);
     tx.send(DetailsMetaEvent::Finished {
         generation: app.items_generation,
@@ -264,7 +265,7 @@ fn duration_762_user_stop_waits_for_resume_and_visible_stage_keeps_proof() {
     })
     .unwrap();
     app.poll_details_meta_load(&egui::Context::default());
-    assert_eq!(app.duration_scan_proof, proof);
+    assert_eq!(app.listing_meta_scan_proof, proof);
     assert!(app.duration_scan_ready());
 }
 
