@@ -295,6 +295,8 @@ mod overview_viewer_chrome_tests {
     }
 
     fn fixture(mode: Mode, test: impl FnOnce(&mut App, &egui::Context)) {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         ctx.options_mut(|options| options.max_passes = 1.try_into().unwrap());

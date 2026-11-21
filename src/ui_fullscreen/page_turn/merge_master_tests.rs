@@ -295,6 +295,7 @@ fn page_turn_merge_master_coverless_tail_builder_preserves_vacant_leaf_motion() 
 fn page_turn_merge_master_explicit_singletons_project_without_automatic_cover_proof() {
     use crate::page_turn_animation::project_prepared;
 
+    let _input = crate::key_input::lock_test_input();
     for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
         for cover in [false, true] {
             for reordered_hidden in [false, true] {
@@ -507,6 +508,7 @@ fn page_turn_merge_master_cached_incoming_requires_every_presentation_permission
 
 #[test]
 fn page_turn_merge_master_alone_first_middle_last_follow_one_endpoint_policy() {
+    let _input = crate::key_input::lock_test_input();
     for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
         for cover in [false, true] {
             for animation in [false, true] {

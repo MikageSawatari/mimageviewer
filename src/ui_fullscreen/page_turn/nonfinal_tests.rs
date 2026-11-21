@@ -5,6 +5,8 @@ use crate::ui_fullscreen::page_turn_submission_tests::{draw_current, frame, read
 
 #[test]
 fn d3_first_offer_selects_registered_exact_finals_and_keeps_unregistered_pair_page_resident() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
         for registered_pair in [false, true] {
             let ctx = egui::Context::default();
@@ -734,6 +736,8 @@ fn arm_presenting_navigation(app: &mut App, composition: &SpreadDisplayCompositi
 
 #[test]
 fn resampleable_quality_upgrade_retains_single_and_spread_sources_and_accepts_held_receipts() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     for mode in [SpreadMode::Single, SpreadMode::Ltr, SpreadMode::Rtl] {
         for invalidate_edit in [false, true] {
             let ctx = egui::Context::default();

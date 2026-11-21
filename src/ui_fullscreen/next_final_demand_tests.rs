@@ -2,6 +2,8 @@ use super::*;
 
 #[test]
 fn d3_viewport_entry_adopts_before_its_first_selector() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let ctx = egui::Context::default();
     let mut app =
         crate::ui_fullscreen::page_turn_submission_tests::ready_app(&ctx, SpreadMode::Single);

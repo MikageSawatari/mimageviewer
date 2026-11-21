@@ -195,6 +195,8 @@ fn terminal_failure_does_not_bypass_navigation_sequence_or_surface() {
 
 #[test]
 fn terminal_failure_during_resident_thumbnail_turn_is_consumed_without_continuation() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     use crate::ui_fullscreen::page_turn_submission_tests::{
         draw_current, frame as turn_frame, install_presentation, offer_texture_for_test, ready_app,
     };
