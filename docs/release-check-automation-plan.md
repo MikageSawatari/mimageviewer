@@ -896,4 +896,18 @@ verdict と終了コードの対応、`release-record.md` の中身が `summary.
 
 ### 実行記録
 
-(初回の結果をここに記録する)
+実行時の観測は、どれもサブ PC 担当 (Remote Control の「mImageViewer 実機確認」セッション) の報告による。
+メイン PC 側で確かめたのは、戻ったファイルの中身と照合スクリプトの結果。
+
+**1 回目 (2026-11-21、キット `relcheck-36d603f3e-20261121-072741`、artifact v5.5.0 `36d603f3e`、scripts `6cdca2e7f`)**
+利用者の了承 2026-11-21 19:51 (事前確認 1 回と本番 1 回、再試行なし)。
+
+- 事前確認: READY (exit 0)。RDP セッション、画面 1920×1080、96 dpi、GPU は Microsoft Remote Display Adapter / NVIDIA GeForce RTX 4060 Ti、
+  CPU i5-13600T、Python 3.13.5、キットの FFmpeg 9.0.2。ターミナル パネルから流し、子の窓は 1 回目の試行で前面になり、runner の窓へも前面が戻った。
+  → サブ PC の RDP セッションでも、ターミナル パネルから流せば前面の条件は成り立つ。
+- 本番: SKIPPED (exit 2、約 1 分)。seed-profile が `error: evidence directory must be below G:\home\mimageviewer-relcheck-v550\target\ui-smoke\runs`
+  で exit 2 になり、7 ケースは走っていない。原因は上の「キットを置く場所」(キットを `C:\miv-relcheck\<kit-id>` に置いていた)。
+- 戻った run `release-checks-20261121-105500-f3e36aec` を、そのキットの `Receive-ReleaseCheckResult.ps1` で照合: `Verdict: SKIPPED`、exit 2
+  (キット・summary・記録の対応は成立)。
+- 手順との違い: ターミナル パネルのツールでは `$LASTEXITCODE` を打てず、担当が終了コードを表示する wrapper をキットの外に置いて流した。
+  → キットに `Run-SubPcProbe.cmd` / `Run-SubPcSuite.cmd` を入れた。
