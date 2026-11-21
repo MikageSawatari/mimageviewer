@@ -307,6 +307,13 @@ public static class MivFakeCargo
 
     public static int Main(string[] args)
     {
+        // DLL staging needs metadata, but only test-gate children belong in
+        // the stage log and failure indices checked below.
+        if (args.Length > 0 && args[0] == "metadata")
+        {
+            Console.WriteLine(Environment.GetEnvironmentVariable("MIV_FAKE_CARGO_METADATA"));
+            return 0;
+        }
         string log = Environment.GetEnvironmentVariable("MIV_FAKE_CARGO_LOG");
         int call = File.Exists(log) ? File.ReadAllLines(log).Length + 1 : 1;
         uint mode = GetErrorMode();
@@ -356,6 +363,9 @@ if (-not $resolvedCargo.Equals($expectedCargo, [System.StringComparison]::Ordina
 Write-Host "[stub-runner] cargo=$resolvedCargo"
 
 $env:MIV_FAKE_CARGO_LOG = $CargoLog
+$env:MIV_FAKE_CARGO_METADATA = @{
+    target_directory = [System.IO.Path]::GetFullPath((Join-Path $stubDir 'target'))
+} | ConvertTo-Json -Compress
 $env:MIV_FAKE_CARGO_FAIL_CALL = $FailCall.ToString()
 $env:MIV_FAKE_CARGO_FAIL_CODE = $FailCode.ToString()
 if ($SuppressCrashDialogs) {
