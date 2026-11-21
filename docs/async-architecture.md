@@ -1155,15 +1155,17 @@ snapshotを持つ全体FinishedはReconcilingへ回さず、完了helperで証�
 同じ一覧の既存証明とは要件の和をとり、長さ／AIの取得済み要件を失わない。
 取得中に対象が変わるか、未充足要件を取得中のsnapshotが含まなければ旧sessionを取り消して
 `NotRequested`へ戻し、再計画する。段階取得は未充足要件が無くなってから許し、全体走査の
-Finishedのsnapshotを証明へ渡す。利用者の停止は`Cancelled`を維持し、自動再開しない。
+Finishedのsnapshotを証明へ渡す。全体要件がある間、利用者の停止は`Cancelled`を維持し、自動再開しない。
 停止と選択情報の補助取得は有効な証明を消さない。AIメニューの初回要求も、有効なAI証明があれば
 requestedの印だけを立て、停止状態を無効化しない。一覧installで証明を破棄し、対象変更は証明不一致から再計画する。
 fork先はNone、park / mountはcacheと一緒に保持し、兄弟contextを変えない。
 長さ／AIそれぞれが証明されるまでその条件だけを適用せず、証明によって判定可能になった完了時に表示集合を再構築する。
 
 全体proofは通常列の完了を示さない。表示集合の拡大で新たな行の通常列が未充足なら、既存rebuild走査内の
-local boolで検出し、pending無し・非Cancelledの場合だけNotRequestedから既存の予算付きAllRequirementsへ戻す。
-proof・cacheを保持し、pendingは既存の表示revision失効、停止は利用者の再開へ従う。縮小や完了後の
+local boolと昇順の旧集合を進むカーソルで線形に検出し、pending無し・ReadyからNotRequestedへ戻して
+既存の予算付きAllRequirementsを使う。proof・cacheを保持し、pendingは既存の表示revision失効へ従う。
+全体要件がある停止中は利用者の再開を待つ。全体要件が無く通常列だけの一覧は、評価・サイズ等の再投影で
+CancelledからNotRequestedへ戻り自動再開する従来の挙動を保つ。Readyからの縮小や完了後の
 rebuildでは不要な再開を立てず、通常列の完了時には既存rebuild_details_orderで並べ替える。
 追加のApp状態・owner・UI全走査・I/Oは作らない (採用追補は[§1.835 §4.2.2-10](facet-projection-key-835-plan.md))。
 

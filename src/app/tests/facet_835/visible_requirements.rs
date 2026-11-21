@@ -259,6 +259,128 @@ fn facet_835_name_clear_expansion_acquires_hidden_columns_through_common_owner()
 }
 
 #[test]
+fn facet_835_ordinary_columns_resume_after_cancelled_rating_or_size_projection_change() {
+    for restriction in [Restriction::Rating, Restriction::Size] {
+        let mut env = setup_app();
+        configure(&mut env);
+        env.settings.write_rating_to_xmp = false;
+        env.settings.grid_view_mode = GridViewMode::Details;
+        env.settings.details_show_image_dimensions = true;
+        env.settings.details_sort_key = crate::settings::DetailsSortKey::ImageDimensions;
+        env.settings.details_sort_ascending = false;
+        let mut items = Vec::new();
+        let mut metas = Vec::new();
+        for (name, dims) in [("A.png", (7, 5)), ("B.png", (13, 11))] {
+            let path = env.tmp.path().join(name);
+            std::fs::write(&path, png_with_dimensions("wanted", dims.0, dims.1)).unwrap();
+            if name == "B.png" {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_len(2 * 1024 * 1024)
+                    .unwrap();
+            }
+            metas.push(crate::catalog::media_source_identity(&path));
+            items.push(GridItem::Image(path));
+        }
+        env.install_new_items(items, metas);
+        match restriction {
+            Restriction::Rating => {
+                assert!(env.set_rating(0, 5));
+                env.settings.rating_filter = [false, false, false, false, false, true];
+            }
+            Restriction::Size => {
+                env.settings.facet_filter.size_preset = Some(FacetSizePreset::Under1MiB);
+            }
+            _ => unreachable!(),
+        }
+        env.rebuild_visible_indices();
+        env.selected = None;
+        env.details_tag_prewarm_indices = vec![0];
+        let generation = env.items_generation;
+        let ctx = egui::Context::default();
+        let _observations = probe::Session::new();
+        assert_eq!(env.visible_indices, [0]);
+        assert!(!env.whole_listing_meta_scan_wanted());
+        assert!(env.listing_meta_requirements().is_empty());
+        assert!(env.listing_meta_scan_proof.is_none());
+
+        env.start_details_meta_load(&ctx);
+        let deadline = Instant::now() + DEADLINE;
+        while env
+            .details_meta_pending
+            .as_ref()
+            .is_some_and(|pending| matches!(pending.phase, DetailsMetaPendingPhase::Planning(_)))
+        {
+            env.advance_details_meta_target_plan(&ctx);
+            assert!(Instant::now() < deadline, "ordinary column planner stalled");
+        }
+        let pending = env
+            .details_meta_pending
+            .as_ref()
+            .expect("real dimensions worker");
+        assert!(matches!(
+            pending.phase,
+            DetailsMetaPendingPhase::Loading { .. }
+        ));
+        assert!(pending.listing_meta_scan.is_none());
+        let cancel = Arc::clone(&pending.cancel);
+        assert_eq!(session_starts(), 1);
+        // Do not poll the receiver: even a fast worker's results remain unread,
+        // so stopping cannot accidentally leave the resumed targets cached.
+        env.cancel_details_meta_loading();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert_eq!(env.details_image_dims_state, LazyColumnState::Cancelled);
+        assert!(env.details_meta_pending.is_none());
+        assert!(env.details_lazy_meta_for_idx(0).is_none());
+
+        match restriction {
+            Restriction::Rating => env.settings.rating_filter = [true; 6],
+            Restriction::Size => env.settings.facet_filter.size_preset = None,
+            _ => unreachable!(),
+        }
+        env.rebuild_visible_indices();
+        assert_eq!(env.visible_indices, [0, 1]);
+        assert_eq!(env.details_image_dims_state, LazyColumnState::NotRequested);
+        assert!(env.details_meta_pending.is_none());
+        assert_eq!(session_starts(), 1, "rebuild leaves starting to poll");
+
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            env.poll_details_meta_load(&ctx);
+            assert_eq!(env.items_generation, generation);
+            assert!(!env.whole_listing_meta_scan_wanted());
+            assert!(env.listing_meta_scan_proof.is_none());
+            if env.details_meta_pending.is_none() && env.details_image_dims_state.is_ready() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "ordinary columns did not resume");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            session_starts(),
+            2,
+            "poll automatically resumed ordinary columns"
+        );
+        for (idx, dims) in [(0, (7, 5)), (1, (13, 11))] {
+            let meta = env.details_lazy_meta_for_idx(idx).expect("real dimensions");
+            assert_eq!(meta.image_dims, Some(dims));
+            assert!(!meta.image_dims_failed);
+            assert!(
+                !meta.ai_metadata_checked,
+                "ordinary columns did not acquire AI"
+            );
+        }
+        assert_eq!(
+            env.details_order,
+            [1, 0],
+            "real dimensions determine sorting"
+        );
+    }
+}
+
+#[test]
 fn facet_835_cancelled_expansion_keeps_proof_and_waits_for_explicit_resume() {
     let mut fixture = Fixture::new(Restriction::Size, false);
     fixture.acquire_visible_columns();

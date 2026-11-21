@@ -458,6 +458,116 @@ fn facet_835_custom_days_types_each_character_and_owns_left() {
 }
 
 #[test]
+fn facet_835_color_tolerance_number_editor_owns_left_in_real_frames() {
+    // Real media rows keep a meaningful list selection while the color menu
+    // exercises its numeric editor; these rows are not color-scan candidates.
+    let (mut h, _) = media_fixture();
+    let generation = h.env.items_generation;
+    let selected = h.env.selected;
+    assert!(selected.is_some());
+    h.env.settings.toolbar_facet_filter_items = vec![ToolbarFacetFilterItem::Color];
+    h.tick(Vec::new());
+    h.tick(Vec::new());
+    h.stage = "color: open 画像色".into();
+    h.open_menu("画像色");
+    h.settle();
+    // The Slider rail and label have separate ids. Locate the actual internal
+    // DragValue via its AccessKit role and label, then click that response.
+    let fields: Vec<_> = h
+        .nodes
+        .iter()
+        .filter(|(_, node)| {
+            node.role() == egui::Role::SpinButton
+                && node.labelled_by().iter().any(|label| {
+                    h.nodes
+                        .iter()
+                        .any(|(id, node)| id == label && node.label() == Some("許容範囲"))
+                })
+        })
+        .map(|(id, _)| widget_id(*id))
+        .collect();
+    assert_eq!(
+        fields.len(),
+        1,
+        "tolerance number field: {}",
+        h.diagnostic()
+    );
+    let field = fields[0];
+    h.click(field);
+    let check = |h: &Harness, draft: &str, caret: usize| {
+        let diagnostic = h.diagnostic();
+        assert!(
+            egui::Popup::is_any_open(&h.ctx),
+            "menu closed: {diagnostic}"
+        );
+        assert!(
+            h.response(field).focused,
+            "number field lost focus: {diagnostic}"
+        );
+        assert!(
+            h.env.color_filter.input_has_focus,
+            "color owner: {diagnostic}"
+        );
+        assert_eq!(h.env.selected, selected, "grid selection: {diagnostic}");
+        assert_eq!(
+            h.env.items_generation, generation,
+            "listing reloaded: {diagnostic}"
+        );
+        assert!(
+            !h.env.projected_viewer_session_open(),
+            "item opened: {diagnostic}"
+        );
+        let node = &h
+            .nodes
+            .iter()
+            .find(|(id, _)| widget_id(*id) == field)
+            .unwrap()
+            .1;
+        assert_eq!(node.value(), Some(draft), "drawn draft: {diagnostic}");
+        let cursor = egui::TextEdit::load_state(&h.ctx, field)
+            .and_then(|state| state.cursor.char_range())
+            .unwrap()
+            .as_sorted_char_range();
+        assert_eq!(
+            (cursor.start.0, cursor.end.0),
+            (caret, caret),
+            "caret: {diagnostic}"
+        );
+        assert_eq!(
+            h.env.color_filter.tolerance,
+            draft.parse::<f32>().unwrap().clamp(
+                crate::color_search::MIN_TOLERANCE,
+                crate::color_search::MAX_TOLERANCE
+            ),
+            "tolerance value: {diagnostic}"
+        );
+    };
+    let mut draft = String::new();
+    for character in ['2', '5'] {
+        draft.push(character);
+        h.stage = format!("color tolerance: Event::Text({character:?})");
+        h.tick(vec![egui::Event::Text(character.to_string())]);
+        check(&h, &draft, draft.len());
+        h.until(Harness::idle, |h| check(h, &draft, draft.len()));
+    }
+    h.stage = "color tolerance: Left stays in number editor".into();
+    h.tick(vec![key(egui::Key::ArrowLeft, true, egui::Modifiers::NONE)]);
+    assert!(
+        matches!(h.env.keyboard_owner_for_pass(&h.ctx),
+        crate::keyboard_input::KeyboardOwner::TextInput { widget_id, .. } if widget_id == field),
+        "tolerance number owns Left: {}",
+        h.diagnostic()
+    );
+    check(&h, &draft, 1);
+    h.tick(vec![key(
+        egui::Key::ArrowLeft,
+        false,
+        egui::Modifiers::NONE,
+    )]);
+    h.until(Harness::idle, |h| check(h, &draft, 1));
+}
+
+#[test]
 fn facet_835_t3_duration_presets_only_project_visible_rows() {
     let (mut h, _) = media_fixture();
     let generation = h.env.items_generation;

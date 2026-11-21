@@ -15672,16 +15672,17 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
     fn draw_image_color_tolerance(&mut self, ui: &mut egui::Ui) -> bool {
         let mut tolerance = self.color_filter.tolerance;
-        if ui
-            .add(
-                egui::Slider::new(
-                    &mut tolerance,
-                    crate::color_search::MIN_TOLERANCE..=crate::color_search::MAX_TOLERANCE,
-                )
-                .text("許容範囲"),
+        let response = ui.add(
+            egui::Slider::new(
+                &mut tolerance,
+                crate::color_search::MIN_TOLERANCE..=crate::color_search::MAX_TOLERANCE,
             )
-            .changed()
-        {
+            .text("許容範囲"),
+        );
+        // Slider returns its inner DragValue's id while the number has focus
+        // (also on focus transitions). Use the same owner as the RGB/HSL fields.
+        self.color_filter.input_has_focus |= response.has_focus();
+        if response.changed() {
             self.color_filter.tolerance = tolerance;
             self.activate_image_color_filter_from_ui();
             return true;

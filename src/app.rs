@@ -75966,11 +75966,15 @@ impl App {
         let mut smart_rule_search_matches = 0;
         // A listing-wide proof does not qualify ordinary fields for newly
         // visible rows. Detect them in this existing projection walk; pending
-        // work is already invalidated by its visible revision, and a user stop
-        // must remain stopped.
+        // work is already invalidated by its visible revision. Whole-listing
+        // requirements keep a user stop; ordinary columns keep their existing
+        // projection-change restart below.
         let check_added_meta =
             self.details_meta_pending.is_none() && self.details_image_dims_state.is_ready();
         let mut added_meta_needed = false;
+        // Both sets are ascending item indices. Advance once through the old
+        // projection instead of searching it again for every accepted row.
+        let mut old_visible_cursor = 0;
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
             if !self.direct_media_basis_allows_index(i) {
@@ -76029,15 +76033,22 @@ impl App {
             if !self.passes_color_filter_for_scope(i, color_scope_signature) {
                 continue;
             }
-            if check_added_meta
-                && !added_meta_needed
-                && self.visible_indices.binary_search(&i).is_err()
-                && self.details_item_requires_lazy_meta(i)
-                && self
-                    .details_lazy_meta_for_idx(i)
-                    .is_none_or(|meta| !self.details_lazy_meta_satisfies_idx(i, meta))
-            {
-                added_meta_needed = true;
+            if check_added_meta && !added_meta_needed {
+                while self
+                    .visible_indices
+                    .get(old_visible_cursor)
+                    .is_some_and(|&old| old < i)
+                {
+                    old_visible_cursor += 1;
+                }
+                if self.visible_indices.get(old_visible_cursor) != Some(&i)
+                    && self.details_item_requires_lazy_meta(i)
+                    && self
+                        .details_lazy_meta_for_idx(i)
+                        .is_none_or(|meta| !self.details_lazy_meta_satisfies_idx(i, meta))
+                {
+                    added_meta_needed = true;
+                }
             }
             result.push(i);
         }
@@ -76124,7 +76135,8 @@ impl App {
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
             if self.details_meta_pending.is_none()
                 && !self.details_image_dims_state.is_ready()
-                && !matches!(self.details_image_dims_state, LazyColumnState::Cancelled)
+                && !(self.whole_listing_meta_scan_wanted()
+                    && matches!(self.details_image_dims_state, LazyColumnState::Cancelled))
             {
                 self.details_image_dims_state = LazyColumnState::NotRequested;
             }

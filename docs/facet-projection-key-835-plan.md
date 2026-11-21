@@ -74,6 +74,13 @@ key に facet が入っているので、行を作る条件が同じでも key �
 登録後は既存の TextInput 所有と共通ゲートが働く。共通の所有判定、キー割り当て、
 detached の述語や viewport 経路は変更していない。色の R/G/B・H/S/L は既存の
 `color_filter.input_has_focus` から TextInput 所有へ渡り一覧のゲートで止まることをソースで確認し、変更しない。
+画像色の「許容範囲」も同じ受け口へ登録した。Sliderは数値欄のfocus取得・保持・喪失時に
+内側のDragValueのresponse idを返す (`vendor/egui/src/widgets/slider.rs` の `add_contents`) ため、
+返されたresponseの`has_focus()`で既存の色入力の所有を通知できる。
+facetバーの数値欄は13宣言箇所（上下限・開始終了の展開を数えると18欄）を再点検した。
+年/月/日・サイズ・長さ・日数の6宣言はhelper登録、RGB/HSL・許容範囲の7宣言は色入力の所有へ接続済み。
+一覧上のメニュー・ツールバーにもほかの編集可能な数値欄は見つからなかった。
+同じファイルの本の並べ替えダイアログのサムネサイズSliderは別のモーダル所有であり、今回の対象外。
 
 key に残すもの:
 
@@ -202,11 +209,14 @@ AI facet も、この形に乗せる。
     - 全体proofが示すのは長さ／AIの取得で、通常列 (寸法・作成日時・動画列等) の完了ではない。
       非表示中にAIだけ取得した行も、サイズ・評価条件の解除で表示対象へ入れば通常列が必要になる。
     - `rebuild_visible_indices_impl`の既存の表示集合走査内で、新たに表示対象へ入る行について既存helperで
-      表示集合フィールドの未充足を判定し、関数内のlocal boolにまとめる。追加のApp状態・ownerは作らない。
-    - 未充足があり、pendingが無く、`Cancelled`でなければ`NotRequested`へ戻す。
+      表示集合フィールドの未充足を判定し、関数内のlocal boolにまとめる。昇順の旧集合はlocalな単調カーソルで
+      照合し、追加処理を`O(N + V)`に収める（Nは一覧件数、Vは旧表示件数）。追加のApp状態・ownerは作らない。
+    - 未充足があり、pendingが無く、`Ready`なら`NotRequested`へ戻す。
       既存pollから予算付き`AllRequirements`を開始し、通常列を可視近傍だけの`VisibleStage`へ移さない。
     - 有効な全体proofとcacheを保持し、cache hitのフィールドを読み直さない。pendingがある場合は
-      既存の表示revisionによる失効経路へ任せる。停止中は`Cancelled`を保持し、利用者の再開後に補充する。
+      既存の表示revisionによる失効経路へ任せる。全体要件がある停止中は`Cancelled`を保持し、利用者の再開後に補充する。
+      全体要件が無く通常列だけの一覧は、従来どおり評価・サイズ等の再投影で`NotRequested`へ戻り自動再開する。
+      保持条件は`whole_listing_meta_scan_wanted() && Cancelled`で、全体proofの有無には依存しない。
     - UIに新たな全走査・I/Oを追加しない。表示集合が減るだけの変更では`Ready`を保持し、完了時のrebuildも
       新たな表示行が無ければ再開を立てず、finish→rebuild→再開を循環させない。
     - 通常列の取得完了後の並べ替えは既存`rebuild_details_order`を使う。
@@ -228,6 +238,8 @@ AI facet も、この形に乗せる。
   - 今の「facet を変えるたびにフォルダ全体を読み直す」が無くなるので、合計では軽くなるはず (未計測)。
 - AI facet の読み込み中の表示は、表示集合ではなく、一覧全体の進み具合になる。
 - 取得の停止 (`Cancelled`) は、長さと AI で同じ走査を止める (r3 P2-3 で訂正)。
+  - 再投影時の停止保持は、長さかAIの全体要件がある場合に限る。全体要件が無い通常列だけの一覧では、
+    評価・サイズ等を変更すると`NotRequested`へ戻る従来の自動再開を維持する。
   - 止めている間も、有効な証明と、その条件の適用は保つ。
   - 適用しないのは、未証明の要件の条件だけ (分からない行は表示したまま)。例: 長さを取得済みでページ数の VisibleStage を止めても、長さ条件は効いたまま。
   - 長さの既存の停止の契約 (`src/app.rs:74363`、`src/app/tests/duration_762/visible_stages.rs:129`) と同じ。
@@ -335,6 +347,9 @@ CLAUDE.md「設計の簡素化」に沿って、組み合わせそのものを�
   `facet_835_custom_days_types_each_character_and_owns_left` で、年・日数を実クリックで編集し、
   Text を別フレームで1文字ずつ送る。入力途中のdraft、値、フォーカス、左矢印による欄内カーソル移動、
   TextInput所有、一覧選択と世代の保持、メニュー維持、読み直し・項目open・sidecar modalの不発を検査する。
+- **Sliderの数値入力**: `facet_835_color_tolerance_number_editor_owns_left_in_real_frames`で、
+  画像色メニューの許容範囲の内側の数値欄を実クリックし、1文字ずつの入力と左矢印による実カーソル移動、
+  TextInput所有・一覧選択・世代・メニューの保持を実フレームで検査する。
 - **T3**: 長さ・サイズの 4 区切りと拡張子を切り替える。`items_generation` が進まず、visible_indices が期待どおりであることを確かめる。
 - **T4** (AI 条件 + ほかの条件の解除):
   - AI 条件とサイズ条件を付け、サイズの外に、AI 条件に合う画像 B を置く。
@@ -423,8 +438,9 @@ AIを要求しない通常列の`CurrentGrid`の検査は維持する。
 ## 9. 段階 3 の追加テスト (実装済み・自動検証待ち)
 
 段階1の21本に加え、統合証明と要件snapshotの契約を`src/app/tests/facet_835/proof.rs`へ12本、
-表示集合の拡大後の通常列取得を`src/app/tests/facet_835/visible_requirements.rs`へ7本追加した。
-context所有の1本と同型の日付入力の2本 (§7) を含め、`facet_835_`で始まるテストは計43本になった。
+表示集合の拡大後の通常列取得と停止後の再開を`src/app/tests/facet_835/visible_requirements.rs`へ8本追加した。
+context所有の1本と同型の日付入力の2本・許容範囲の数値入力の1本 (§7) を含め、
+`facet_835_`で始まるテストは計45本になった。
 以下のテスト名は共通の`facet_835_`を省略する。`#[ignore]`や仮の型・製品APIは追加していない。
 段階2・3のcargo実行と結果の記録は設計担当が行う。この実装作業では実行しておらず、実機も未確認。
 
@@ -467,6 +483,8 @@ context所有の1本と同型の日付入力の2本 (§7) を含め、`facet_835
   全体AI取得後も非表示行Bの寸法・作成日時は未取得であることを先に確認し、解除後に実workerがBを取得し、
   画像面積降順を[B, A]へ並べ直すこと、一覧世代と全体proofを保持することを検査する。
 - **通常列補充の停止・縮小・完了 (§4.2.2-10)**:
+  `ordinary_columns_resume_after_cancelled_rating_or_size_projection_change`で、全体要件が無い詳細表示における
+  寸法の実取得を停止し、評価・サイズの両入口で再投影後にpollだけで自動再開・実取得・再ソートが完了することを検査する。
   `cancelled_expansion_keeps_proof_and_waits_for_explicit_resume`で停止中の証明保持と明示再開を、
   `narrowing_ready_projection_does_not_start_metadata_session`で縮小時のReady保持を、
   `finished_ai_projection_does_not_cycle_metadata_session_starts`で完了によるrebuildが再開を循環させないことを検査する。
