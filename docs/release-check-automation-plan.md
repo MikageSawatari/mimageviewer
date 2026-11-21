@@ -911,3 +911,12 @@ verdict と終了コードの対応、`release-record.md` の中身が `summary.
   (キット・summary・記録の対応は成立)。
 - 手順との違い: ターミナル パネルのツールでは `$LASTEXITCODE` を打てず、担当が終了コードを表示する wrapper をキットの外に置いて流した。
   → キットに `Run-SubPcProbe.cmd` / `Run-SubPcSuite.cmd` を入れた。
+
+**2 回目 (2026-11-21、キット `relcheck-36d603f3e-20261121-112513`、`C:\miv-relcheck\root` に配置、scripts `8911483c8`)**
+利用者の了承 2026-11-21 22:11 (事前確認 1 回と本番 1 回、再試行なし)。
+
+- 事前確認: NOT_READY (exit 2)。キット・Python・FFmpeg・desktop の照合はすべて成立。子の窓への `SetForegroundWindow` が 20 秒 (180 回) 通らず、
+  前面は pid 988 (dwm) の class `Ghost` の窓のままだった。サブ PC 担当の見立て: 応答しなくなった「設定」アプリ (SystemSettings、Responding=False) の
+  身代わりの Ghost 窓が前面に居座った (確かめてはいない)。本番は流していない。
+- 事前確認が、mIV を起動する前に前面の不成立を見つけて止めた (設計どおり)。前面を奪う窓が残っているときは、その窓を閉じるかどうかを
+  利用者が決めてから流し直す。エージェントが利用者の起動したアプリを閉じない。
