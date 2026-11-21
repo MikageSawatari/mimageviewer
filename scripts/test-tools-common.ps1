@@ -435,6 +435,7 @@ $script:MivTypingProductPaths = @(
     'src/app/pinned_search.rs',
     'src/app/update_phases.rs',
     'src/app/main_chrome.rs',
+    'src/app/facet_name_filter.rs',
     'src/ui_main.rs',
     'src/ui_pinned_search.rs',
     'src/ui_toolbar_layout.rs',
@@ -447,6 +448,7 @@ $script:MivTypingProductPaths = @(
     'src/indexer_manager.rs',
     'src/search_index_db.rs',
     'src/tag_view.rs',
+    'src/tags_db.rs',
     'src/ui_dialogs/tag_apply.rs',
     'src/ui_dialogs/tag_editor.rs',
     'src/ui_dialogs/collections.rs',
@@ -490,9 +492,9 @@ function Get-MivFocusedPlan {
             if ($seen.Add('typing-1832')) {
                 $entries.Add([pscustomobject]@{ Path = $path; Selection = @('-p', 'mimageviewer', '--lib'); Filter = $typingFilter })
             }
-            # The probe module has no tests of its own; all typing sources select
-            # the common family rather than a possibly empty per-file module.
-            if ($path -match '^src/app/tests/typing/') { continue }
+            # The probe and facet debounce/cache module have no inline tests.
+            # Their coverage belongs to the common typing family.
+            if ($path -match '^src/app/tests/typing/|^src/app/facet_name_filter\.rs$') { continue }
         }
         if ($path -match '(^|/)(Cargo\.(toml|lock)|build\.rs)$|^src/(lib|main|app)\.rs$|^src/app/tests\.rs$|^(\.cargo/|\.config/|vendor/|tests/(support|snapshots)/)') {
             $broad.Add($path); continue

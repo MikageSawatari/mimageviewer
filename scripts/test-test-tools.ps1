@@ -459,6 +459,10 @@ foreach ($typingPath in $script:MivTypingProductPaths) {
     Assert-That ($typingEntries.Count -eq 1 -and ($typingEntries[0].Selection -join ' ') -eq '-p mimageviewer --lib') "typing selection missing: $typingPath"
 }
 $typingBroad = Get-MivFocusedPlan $fixture @('src/app.rs')
+$typingFacet = Get-MivFocusedPlan $fixture @('src/app/facet_name_filter.rs', 'src/tags_db.rs')
+Assert-That (@($typingFacet.Entries | Where-Object { $_.Filter -eq $typingFilter }).Count -eq 1) 'facet debounce/cache and tag DB must select typing exactly once'
+$typingFacetOnly = Get-MivFocusedPlan $fixture @('src/app/facet_name_filter.rs')
+Assert-That ($typingFacetOnly.Entries.Count -eq 1 -and $typingFacetOnly.Entries[0].Filter -eq $typingFilter) 'facet module without inline tests selected an empty per-file filter'
 Assert-That ($typingBroad.BroadPaths -contains 'src/app.rs') 'typing selection weakened a broad path'
 $typingBroadRun = Run-Script 'test-focused.ps1' @('-Path', 'src/app.rs', '-PlanOnly')
 Assert-That ($typingBroadRun.ExitCode -eq 2) 'typing selection changed broad exit code'

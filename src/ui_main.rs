@@ -14914,12 +14914,26 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             .as_ref()
                             .is_none_or(|(key, _)| *key != query_key);
                         if cache_stale {
+                            #[cfg(test)]
+                            crate::ime_focus::typing_probe::job(
+                                "facet-tag",
+                                &self.facet_tag_search_query,
+                                crate::ime_focus::typing_probe::Outcome::Started,
+                            );
                             let summaries = self
                                 .tags_db
                                 .as_ref()
                                 .map(|db| db.find_by_prefix(&self.facet_tag_search_query, 50))
                                 .unwrap_or_default();
                             self.facet_tag_suggestion_cache = Some((query_key.clone(), summaries));
+                            #[cfg(test)]
+                            crate::ime_focus::typing_probe::job(
+                                "facet-tag",
+                                &self.facet_tag_search_query,
+                                crate::ime_focus::typing_probe::Outcome::Delivered(
+                                    self.facet_tag_suggestion_cache.as_ref().unwrap().1.len(),
+                                ),
+                            );
                         }
                         if let Some((_, summaries)) = self.facet_tag_suggestion_cache.as_ref() {
                             for summary in summaries {
@@ -15033,6 +15047,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         );
                     }
                 });
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::target("facet-tag-menu", &menu_response);
         suppress_menu_button_wheel_passthrough(ui.ctx(), &menu_response);
         changed
     }

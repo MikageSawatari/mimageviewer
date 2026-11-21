@@ -78,6 +78,18 @@ const INPUT_TESTS: &[Entry] = &[
         1,
         "typing_smart_folder_editor_rule",
     ),
+    tested(
+        "src/ui_main.rs",
+        "&mut self.facet_name_input",
+        1,
+        "typing_facet_name_ascii",
+    ),
+    tested(
+        "src/ui_main.rs",
+        "&mut self.facet_tag_search_query",
+        1,
+        "typing_facet_tag_suggestions_ascii",
+    ),
 ];
 
 const EXEMPTIONS: &[Entry] = &[
@@ -383,18 +395,6 @@ const EXEMPTIONS: &[Entry] = &[
     ),
     exempt(
         "src/ui_main.rs",
-        "&mut self.facet_name_input",
-        1,
-        "ファセットの名前フィルタ。今回の検索バー群とは別の入力面",
-    ),
-    exempt(
-        "src/ui_main.rs",
-        "&mut self.facet_tag_search_query",
-        1,
-        "ファセットメニュー内のタグ候補。今回のタグ付与画面とは別の入力面",
-    ),
-    exempt(
-        "src/ui_main.rs",
         "&mut path,",
         1,
         "アドレス欄レイアウトのsnapshot fixture",
@@ -562,6 +562,66 @@ fn code_only(source: &str) -> String {
     String::from_utf8(result).expect("blanked source remains UTF-8")
 }
 
+/// Flatten Rust use trees before resolving names. Braces belong to the tree,
+/// never to an alias. Tokenize `as` separately from identifiers such as `basic`.
+fn use_leaves(
+    tokens: &[&str],
+    cursor: &mut usize,
+    mut path: Vec<String>,
+    leaves: &mut Vec<(Vec<String>, String)>,
+) {
+    while tokens.get(*cursor) == Some(&"::") {
+        *cursor += 1;
+    }
+    loop {
+        let token = *tokens.get(*cursor).expect("incomplete use tree");
+        if token == "{" {
+            *cursor += 1;
+            while tokens.get(*cursor) != Some(&"}") {
+                use_leaves(tokens, cursor, path.clone(), leaves);
+                match tokens.get(*cursor) {
+                    Some(&",") => *cursor += 1,
+                    Some(&"}") => {}
+                    other => panic!("unsupported use tree near {other:?}: {tokens:?}"),
+                }
+            }
+            *cursor += 1;
+            return;
+        }
+        assert!(
+            token == "*"
+                || token
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+            "unsupported use token: {token}"
+        );
+        path.push(token.to_owned());
+        *cursor += 1;
+        if tokens.get(*cursor) == Some(&"::") {
+            *cursor += 1;
+        } else {
+            break;
+        }
+    }
+    let alias = if tokens.get(*cursor) == Some(&"as") {
+        *cursor += 1;
+        let alias = tokens
+            .get(*cursor)
+            .expect("missing import alias")
+            .to_string();
+        *cursor += 1;
+        Some(alias)
+    } else {
+        None
+    };
+    let last = path.last().expect("use leaf").clone();
+    if last == "self" && path.len() > 1 {
+        path.pop();
+    }
+    let alias = alias.unwrap_or_else(|| path.last().unwrap().clone());
+    leaves.push((path, alias));
+}
+
 fn call_lines(source: &str) -> Vec<usize> {
     let code = code_only(source);
     let helpers = [
@@ -573,38 +633,44 @@ fn call_lines(source: &str) -> Vec<usize> {
     let mut modules: HashSet<String> = ["ime_focus".to_owned(), "super".to_owned()].into();
     let mut imported = HashSet::new();
     let mut names: BTreeSet<String> = helpers.iter().map(|name| (*name).to_owned()).collect();
+    let mut leaves = Vec::new();
+    let token_pattern = regex::Regex::new(r"[A-Za-z_][A-Za-z0-9_]*|::|[{},*]").unwrap();
     for import in regex::Regex::new(r"\buse\s+([^;]+);")
         .unwrap()
         .captures_iter(&code)
     {
-        let compact: String = import[1].chars().filter(|c| !c.is_whitespace()).collect();
-        let Some((_, suffix)) = compact.split_once("ime_focus") else {
-            continue;
-        };
-        if let Some(alias) = suffix.strip_prefix("as") {
-            modules.insert(alias.into());
+        let tokens: Vec<_> = token_pattern
+            .find_iter(&import[1])
+            .map(|m| m.as_str())
+            .collect();
+        let mut cursor = 0;
+        use_leaves(&tokens, &mut cursor, Vec::new(), &mut leaves);
+        assert_eq!(cursor, tokens.len(), "unparsed import: {}", &import[1]);
+    }
+    // Resolve to a fixed point: imports may refer to earlier/later module or
+    // function aliases, including re-aliases and nested `super::{...}` trees.
+    loop {
+        let before = modules.len() + imported.len();
+        for (path, alias) in &leaves {
+            let last = path.last().unwrap();
+            let parent = path.iter().rev().nth(1);
+            if last == "ime_focus" || modules.contains(last) {
+                modules.insert(alias.clone());
+            } else if parent.is_some_and(|parent| modules.contains(parent)) {
+                if last == "*" && parent.is_none_or(|parent| parent != "super") {
+                    imported.extend(helpers.iter().map(|name| (*name).to_owned()));
+                } else if helpers.contains(&last.as_str()) || imported.contains(last) {
+                    imported.insert(alias.clone());
+                }
+            } else if imported.contains(last) {
+                imported.insert(alias.clone());
+            }
         }
-        if suffix.is_empty() {
-            continue;
-        }
-        let Some(items) = suffix.strip_prefix("::") else {
-            continue;
-        };
-        for item in items.trim_matches(['{', '}']).split(',') {
-            if item == "*" {
-                imported.extend(helpers.iter().map(|name| (*name).to_owned()));
-                continue;
-            }
-            let (name, alias) = item.split_once("as").unwrap_or((item, item));
-            if name == "self" {
-                modules.insert(alias.into());
-            }
-            if helpers.contains(&name) {
-                imported.insert(alias.to_owned());
-                names.insert(alias.to_owned());
-            }
+        if modules.len() + imported.len() == before {
+            break;
         }
     }
+    names.extend(imported.iter().cloned());
     let pattern = format!(
         r"\b(?P<path>(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*)(?P<name>{})\s*\(",
         names.into_iter().collect::<Vec<_>>().join("|")
@@ -654,6 +720,27 @@ fn typing_inventory_detects_qualified_imported_and_multiline_helpers() {
         let example = r#"ime_focus::add_singleline(ui, draft, None, configure)"#;
     "###;
     assert_eq!(call_lines(source).len(), 8);
+}
+
+#[test]
+fn typing_inventory_detects_grouped_and_chained_aliases() {
+    for source in [
+        "use crate::{ime_focus as focus}; focus::add_singleline(ui, draft, None, configure);",
+        "use crate::ime_focus as focus; use focus::add_singleline as field; field(ui, draft, None, configure);",
+        "use super::{ime_focus as focus}; use focus::{show_singleline as field}; field(ui, draft, None, configure);",
+        "use super::{self as focus}; use focus::add_singleline as field; field(ui, draft, None, configure);",
+        "use field as renamed; use focus::add_singleline as field; use crate::{ime_focus as focus}; renamed(ui, draft, None, configure);",
+        "use crate::{ime_focus::{self as focus, add_singleline as field}}; field(ui, draft, None, configure);",
+        "use crate::ime_focus as focus; use focus::*; add_singleline(ui, draft, None, configure);",
+        "use crate::ime_focus as focus; mod nested { use super::focus as repair; repair::add_singleline(ui, draft, None, configure); }",
+        "use crate::ime_focus::add_singleline as field; mod nested { use super::field as renamed; renamed(ui, draft, None, configure); }",
+    ] {
+        assert_eq!(
+            call_lines(source).len(),
+            1,
+            "missed use tree / alias: {source}"
+        );
+    }
 }
 
 #[test]

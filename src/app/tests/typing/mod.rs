@@ -7,6 +7,7 @@ use crate::ime_focus::typing_probe::{self as probe, Outcome};
 use std::time::{Duration, Instant};
 
 mod dialogs;
+mod facets;
 mod inventory;
 mod search;
 
@@ -115,6 +116,14 @@ trait Adapter {
         true
     }
     fn opening_frame(&self) -> u64;
+    fn opening_button(&self) -> Option<&'static str> {
+        None
+    }
+    /// A composition postpones this producer until Commit; return its actual deadline.
+    fn ime_deferred_deadline(&self, _app: &App) -> Option<Instant> {
+        None
+    }
+    fn check_ime_deferred(&self, _app: &App, _query: &str) {}
     fn job(&self) -> Option<&'static str> {
         None
     }
@@ -220,6 +229,14 @@ impl<A: Adapter> Harness<A> {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+        let opening_pointer = harness.adapter.opening_button().map(|name| {
+            let center = probe::target_rect(name)
+                .expect("enabled opening button")
+                .center();
+            harness.tick(vec![egui::Event::PointerMoved(center)]);
+            harness.tick(vec![pointer(center, true)]);
+            center
+        });
         harness.stage = "open field".into();
         harness.opening_start = Some(harness.frame + 1);
         let shortcut = harness.adapter.opening_shortcut();
@@ -228,7 +245,11 @@ impl<A: Adapter> Harness<A> {
             harness.tick_with_open_action(vec![key(code, true, ctrl)], Some(action));
         } else {
             harness.adapter.open(&mut harness.env, &harness.ctx);
-            harness.tick(Vec::new());
+            harness.tick(
+                opening_pointer
+                    .map(|center| vec![pointer(center, false)])
+                    .unwrap_or_default(),
+            );
         }
         // Keep the actual input sequence identical in measurement and typing
         // runs. Its release/clear frames do not define field readiness.
@@ -538,36 +559,87 @@ impl<A: Adapter> Harness<A> {
         self.adapter.check_idle(&self.env);
     }
 
+    fn result_progress(&self, since: usize) -> (bool, bool) {
+        let Some(field) = self.adapter.job() else {
+            return (true, true);
+        };
+        let expected = self.adapter.outcome(&self.expected);
+        let jobs = probe::jobs();
+        let relevant: Vec<_> = jobs
+            .iter()
+            .skip(since)
+            .filter(|job| job.field == field && job.query == self.expected)
+            .collect();
+        let started = relevant
+            .iter()
+            .position(|job| job.outcome == Outcome::Started);
+        let completed = started.is_some_and(|start| {
+            relevant
+                .iter()
+                .skip(start + 1)
+                .any(|job| job.outcome == expected)
+        });
+        (
+            started.is_some(),
+            completed && self.adapter.adopted(&self.env, &self.expected, expected),
+        )
+    }
+
     fn wait_result(&mut self, since: usize) {
         let Some(field) = self.adapter.job() else {
             self.assert_field();
             return;
         };
         let expected = self.adapter.outcome(&self.expected);
+        if self.composition_start.is_some()
+            && let Some(original_deadline) = self.adapter.ime_deferred_deadline(&self.env)
+        {
+            // Exercise the product's actual 150 ms boundary while composing.
+            // Elapsing it is not a result: the deadline must be renewed, the
+            // old applied query retained, and no delivery may have occurred.
+            let timeout = Instant::now() + DEADLINE;
+            loop {
+                self.assert_field();
+                self.adapter.check_ime_deferred(&self.env, &self.expected);
+                let (started, complete) = self.result_progress(since);
+                assert!(
+                    started && !complete,
+                    "IME deferred producer: {}",
+                    self.diagnostic()
+                );
+                if Instant::now() >= original_deadline {
+                    // Observe a real App update at/after the expired boundary,
+                    // even if the runner was descheduled between earlier ticks.
+                    self.tick(Vec::new());
+                    self.adapter.check_ime_deferred(&self.env, &self.expected);
+                    assert!(
+                        self.adapter
+                            .ime_deferred_deadline(&self.env)
+                            .is_some_and(|deadline| deadline > original_deadline),
+                        "IME did not renew debounce: {}",
+                        self.diagnostic()
+                    );
+                    return;
+                }
+                assert!(
+                    Instant::now() < timeout,
+                    "IME debounce deadline: {}",
+                    self.diagnostic()
+                );
+                std::thread::sleep(Duration::from_millis(1));
+                self.tick(Vec::new());
+            }
+        }
         let deadline = Instant::now() + DEADLINE;
         loop {
             self.assert_field();
-            let jobs = probe::jobs();
-            let relevant: Vec<_> = jobs
-                .iter()
-                .skip(since)
-                .filter(|job| job.field == field && job.query == self.expected)
-                .collect();
-            let started = relevant
-                .iter()
-                .position(|job| job.outcome == Outcome::Started);
-            let completed = started.is_some_and(|start| {
-                relevant
-                    .iter()
-                    .skip(start + 1)
-                    .any(|job| job.outcome == expected)
-            });
-            if completed && self.adapter.adopted(&self.env, &self.expected, expected) {
+            let (started, complete) = self.result_progress(since);
+            if complete {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "result deadline (wanted {expected:?}, started={started:?}): {}",
+                "result deadline ({field}, wanted {expected:?}, started={started:?}): {}",
                 self.diagnostic()
             );
             // Pacing only: neither elapsed time nor a frame count means success.
@@ -654,7 +726,7 @@ fn key(key: egui::Key, pressed: bool, modifiers: egui::Modifiers) -> egui::Event
     }
 }
 
-/// Run with nextest --no-capture to obtain all 14 opening measurements in one
+/// Run with nextest --no-capture to obtain all 16 opening measurements in one
 /// process. Capture every mismatch before failing, including earlier readiness
 /// and any loss of readiness through frame 9.
 #[test]
@@ -662,6 +734,7 @@ fn typing_opening_readiness_measurement() {
     let mut failures = Vec::new();
     search::measure_openings(&mut failures);
     dialogs::measure_openings(&mut failures);
+    facets::measure_openings(&mut failures);
     assert!(
         failures.is_empty(),
         "opening readiness changed (all measurements printed above): {failures:?}"

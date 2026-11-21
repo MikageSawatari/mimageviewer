@@ -157,7 +157,8 @@ IMM32 の 2 経路と未対応範囲の正本は [src/ime_focus.rs](../src/ime_f
 - 打つたびに検索や候補更新が走る欄は、`src/app/tests/typing/` にadapterと
   `typing_` で始まるテストを足す。本物のAppフレームへ1字ずつ送り、空欄からの入力、
   結果あり／0件、必要なIME入力、処理の開始と結果の採用を確かめる。
-  短い入力を仕様上拒否する欄では、拒否という結果の到着を検査する。
+  短い入力を仕様上拒否する欄では、拒否通知だけで完了にせず、その語の一覧投影の採用まで検査する。
+  IME中に適用を延期する欄は、未確定中の延期と確定後の結果採用を分けて確かめる。
 - `typing/inventory.rs` の `INPUT_TESTS` に呼び出し位置のanchor、件数、実在するテスト名を
   登録する。描画・入力・結果採用のファイルは `scripts/test-tools-common.ps1` の
   `MivTypingProductPaths` 配列にも足す。

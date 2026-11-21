@@ -36,6 +36,8 @@ pub(crate) enum Outcome {
     Started,
     Delivered(usize),
     Rejected,
+    /// Worker notification only; the rejected query has not adopted its list yet.
+    RejectionNotified,
 }
 
 #[derive(Clone, Debug)]
@@ -54,6 +56,19 @@ struct Observations {
     focus_events: Vec<FocusEvent>,
     jobs: Vec<Job>,
     actions: Vec<(crate::keymap::KeyAction, &'static str)>,
+    hold_metadata_ready: bool,
+    targets: Vec<(&'static str, egui::Rect, bool)>,
+}
+
+pub(crate) fn hold_next_metadata_ready() {
+    OBSERVATIONS.with_borrow_mut(|slot| slot.as_mut().unwrap().hold_metadata_ready = true);
+}
+
+pub(crate) fn take_hold_metadata_ready() -> bool {
+    OBSERVATIONS.with_borrow_mut(|slot| {
+        slot.as_mut()
+            .is_some_and(|observations| std::mem::take(&mut observations.hold_metadata_ready))
+    })
 }
 
 thread_local! {
@@ -85,8 +100,31 @@ pub(crate) fn begin_frame() {
             observations.fields.clear();
             observations.gates.clear();
             observations.focus_events.clear();
+            observations.targets.clear();
         }
     });
+}
+
+pub(crate) fn target(name: &'static str, response: &egui::Response) {
+    OBSERVATIONS.with_borrow_mut(|slot| {
+        if let Some(observations) = slot {
+            observations
+                .targets
+                .push((name, response.rect, response.enabled()));
+        }
+    });
+}
+
+pub(crate) fn target_rect(name: &str) -> Option<egui::Rect> {
+    OBSERVATIONS.with_borrow(|slot| {
+        slot.as_ref().and_then(|o| {
+            o.targets
+                .iter()
+                .rev()
+                .find(|(label, _, enabled)| *label == name && *enabled)
+                .map(|(_, rect, _)| *rect)
+        })
+    })
 }
 
 pub(crate) fn field(response: &egui::Response, site: &'static std::panic::Location<'static>) {

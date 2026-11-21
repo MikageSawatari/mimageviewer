@@ -80,21 +80,23 @@ impl Adapter for SearchBar {
                     && app.global_search.done
                     && match outcome {
                         Outcome::Rejected => {
-                            app.global_search.reject_message.as_deref()
-                                == Some(
-                                    crate::global_search::RejectReason::TooShort(vec![
-                                        query.to_lowercase(),
-                                    ])
-                                    .as_user_message()
-                                    .as_str(),
-                                )
+                            app.items_are_global_search_view
+                                && app.items.is_empty()
+                                && app.global_search.reject_message.as_deref()
+                                    == Some(
+                                        crate::global_search::RejectReason::TooShort(vec![
+                                            query.to_lowercase(),
+                                        ])
+                                        .as_user_message()
+                                        .as_str(),
+                                    )
                         }
                         Outcome::Delivered(count) => {
                             app.global_search.reject_message.is_none()
                                 && app.items_are_global_search_view
                                 && app.items.len() == count
                         }
-                        Outcome::Started => false,
+                        Outcome::Started | Outcome::RejectionNotified => false,
                     }
             }
             _ => true,
@@ -257,6 +259,58 @@ fn ime_case(kind: Kind, pinned: bool) {
     // Keep every nonempty preedit a prefix that has a matching fixture row.
     // The physical Process presses consumed by Windows IME are not sent.
     harness(kind, pinned, false).compose_ime(&["k", "か", "かな"], "かな");
+}
+
+#[test]
+fn typing_ctrl_g_rejection_waits_for_projection_adoption() {
+    for pinned in [false, true] {
+        let mut h = harness(Kind::Metadata, pinned, false);
+        let since = probe::jobs().len();
+        probe::hold_next_metadata_ready();
+        h.stage = "type rejected 'a', hold real projection".into();
+        h.expected = "a".into();
+        h.tick(vec![
+            key(egui::Key::A, true, egui::Modifiers::NONE),
+            egui::Event::Text("a".into()),
+        ]);
+        h.tick(vec![key(egui::Key::A, false, egui::Modifiers::NONE)]);
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let notified = probe::jobs().iter().skip(since).any(|job| {
+                job.field == "metadata"
+                    && job.query == "a"
+                    && job.outcome == Outcome::RejectionNotified
+            });
+            if notified && h.env.search_ready_is_held_for_test() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "rejected projection was not held: {}",
+                h.diagnostic()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+            h.tick(Vec::new());
+        }
+        assert!(h.env.global_search.done && h.env.global_search.reject_message.is_some());
+        assert_eq!(
+            h.result_progress(since),
+            (true, false),
+            "notification must not finish typing wait: {}",
+            h.diagnostic()
+        );
+        assert!(
+            !probe::jobs()
+                .iter()
+                .skip(since)
+                .any(|job| job.field == "metadata"
+                    && job.query == "a"
+                    && job.outcome == Outcome::Rejected)
+        );
+        h.env.release_search_ready_for_test();
+        h.wait_result(since);
+        assert!(h.result_progress(since).1);
+    }
 }
 
 #[test]

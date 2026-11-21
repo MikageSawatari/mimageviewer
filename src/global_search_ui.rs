@@ -3252,6 +3252,10 @@ impl App {
             &self.global_search.last_executed,
             crate::ime_focus::typing_probe::Outcome::Started,
         );
+        #[cfg(test)]
+        if crate::ime_focus::typing_probe::take_hold_metadata_ready() {
+            self.hold_next_search_ready_for_test();
+        }
         // items を空にして "検索中" 表示に切り替え
         self.rebuild_items_from_global_search();
     }
@@ -3370,7 +3374,7 @@ impl App {
                             crate::ime_focus::typing_probe::job(
                                 "metadata",
                                 &self.global_search.last_executed,
-                                crate::ime_focus::typing_probe::Outcome::Rejected,
+                                crate::ime_focus::typing_probe::Outcome::RejectionNotified,
                             );
                             self.global_search.reject_message = Some(r.as_user_message());
                         }
@@ -3704,16 +3708,17 @@ impl App {
                             app.install_prepared_page_edits(prepared.page_edits);
                             app.accept_search_projection(&wish, metadata_applied);
                             #[cfg(test)]
-                            if matches!(wish.source, SearchProjection::Metadata)
-                                && wish.done
-                                && app.global_search.reject_message.is_none()
-                            {
+                            if matches!(wish.source, SearchProjection::Metadata) && wish.done {
                                 crate::ime_focus::typing_probe::job(
                                     "metadata",
                                     &wish.query,
-                                    crate::ime_focus::typing_probe::Outcome::Delivered(
-                                        app.items.len(),
-                                    ),
+                                    if app.global_search.reject_message.is_some() {
+                                        crate::ime_focus::typing_probe::Outcome::Rejected
+                                    } else {
+                                        crate::ime_focus::typing_probe::Outcome::Delivered(
+                                            app.items.len(),
+                                        )
+                                    },
                                 );
                             }
                             if let Some(viewer) = viewer {
