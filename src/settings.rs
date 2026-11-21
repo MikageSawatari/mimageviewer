@@ -5919,6 +5919,9 @@ pub struct Settings {
     /// ページ内スクロールの論理位置は即時に更新し、見た目だけ滑らかに動かす。
     #[serde(default)]
     pub fullscreen_smooth_page_scroll: bool,
+    /// Bound reading-canvas drags to the painted display unit.
+    #[serde(default)]
+    pub fullscreen_bound_drag_pan: bool,
     /// 静止画フルスクリーン右下に現在ページ / 総ページ数を常時表示する。
     #[serde(default = "default_true")]
     pub fullscreen_page_number_overlay: bool,
@@ -8445,6 +8448,7 @@ impl Default for Settings {
             fullscreen_n_scroll_order: FullscreenNScrollOrder::default(),
             fullscreen_n_scroll_step_percent: default_fullscreen_n_scroll_step_percent(),
             fullscreen_smooth_page_scroll: false,
+            fullscreen_bound_drag_pan: false,
             fullscreen_page_number_overlay: true,
             fullscreen_keep_on_app_switch: false,
             fullscreen_cursor_hide_delay_secs: FULLSCREEN_CURSOR_HIDE_DELAY_DEFAULT_SECS,
@@ -16293,6 +16297,22 @@ mod tests {
             }
         }
         assert!(FullscreenHorizontalCursorDirection::Unknown.is_rtl(true, false));
+    }
+
+    #[test]
+    fn fullscreen_bound_drag_pan_default_missing_key_and_roundtrip() {
+        assert!(!Settings::default().fullscreen_bound_drag_pan);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!missing.fullscreen_bound_drag_pan);
+        for enabled in [false, true] {
+            let settings = Settings {
+                fullscreen_bound_drag_pan: enabled,
+                ..Settings::default()
+            };
+            let loaded: Settings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(loaded.fullscreen_bound_drag_pan, enabled);
+        }
     }
 
     #[test]

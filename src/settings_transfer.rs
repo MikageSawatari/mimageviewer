@@ -391,6 +391,7 @@ preferences_policy! {
         fullscreen_n_scroll_order: FullscreenNScrollOrder => ("ページ内スクロールの読み順", |v, _raw| FullscreenNScrollOrder::all().contains(v), plain, plain);
         fullscreen_n_scroll_step_percent: u32 => ("N 字 / Z 字の移動量", |v, _raw| (10..=100).contains(v), plain, plain);
         fullscreen_smooth_page_scroll: bool => ("ページ内のスクロールを滑らかに動かす", |_, _| true, plain, plain);
+        fullscreen_bound_drag_pan: bool => ("閲覧時のドラッグ移動を画像の端までに制限する", |_, _| true, plain, plain);
         fullscreen_page_number_overlay: bool => ("ページ番号を重ねて表示", |_, _| true, plain, plain);
         fullscreen_keep_on_app_switch: bool => ("アプリ切替時に閲覧表示を維持", |_, _| true, plain, plain);
         fullscreen_cursor_hide_delay_secs: f32 => ("閲覧表示のカーソルを隠す時間", |v, _raw| (FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS..=FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS).contains(v) && raw_range(_raw, FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS, FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS), plain, plain);
@@ -1447,6 +1448,7 @@ mod tests {
                 100
             };
         settings.fullscreen_smooth_page_scroll = !settings.fullscreen_smooth_page_scroll;
+        settings.fullscreen_bound_drag_pan = !settings.fullscreen_bound_drag_pan;
         settings.fullscreen_page_number_overlay = !settings.fullscreen_page_number_overlay;
         settings.fullscreen_keep_on_app_switch = !settings.fullscreen_keep_on_app_switch;
         settings.fullscreen_cursor_hide_delay_secs = if settings.fullscreen_cursor_hide_delay_secs
@@ -2373,15 +2375,49 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_bound_drag_pan_transfer_roundtrip_missing_and_invalid_preserve_values() {
+        for enabled in [false, true] {
+            let source = Settings {
+                fullscreen_bound_drag_pan: enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let mut destination = Settings {
+                fullscreen_bound_drag_pan: !enabled,
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.fullscreen_bound_drag_pan, enabled);
+            parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.fullscreen_bound_drag_pan, enabled);
+            for invalid in [json!("true"), json!(1), Value::Null] {
+                let report = parse_preferences(&document(json!({
+                    "fullscreen_bound_drag_pan": invalid
+                })))
+                .unwrap()
+                .apply_to(&mut destination);
+                assert_eq!(report.accepted_count, 0);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.fullscreen_bound_drag_pan, enabled);
+            }
+        }
+    }
+
+    #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 506);
+        assert_eq!(entries.len(), 507);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            167
+            168
         );
         assert_eq!(
             entries
@@ -2417,7 +2453,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 165);
+        assert_eq!(wire.len(), 166);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

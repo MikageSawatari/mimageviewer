@@ -5,6 +5,13 @@ use egui::{Rect, Vec2};
 
 #[cfg(test)]
 mod context_scroll_tests;
+mod drag_bound;
+#[cfg(test)]
+mod drag_bound_handler_tests;
+#[cfg(test)]
+mod drag_bound_input_tests;
+#[cfg(test)]
+mod drag_bound_tests;
 #[cfg(test)]
 mod handler_tests;
 #[cfg(test)]
@@ -1125,11 +1132,16 @@ mod tests {
     use crate::rotation_db::Rotation;
     use crate::settings::FullscreenNScrollOrder::{HorizontalFirst, VerticalFirst};
 
-    fn viewport() -> Rect {
+    pub(super) fn viewport() -> Rect {
         Rect::from_min_size(egui::pos2(30.0, 50.0), Vec2::splat(1000.0))
     }
 
-    fn page_input(idx: usize, rect: Rect, zoom: f32, pan: Vec2) -> DisplayedImageTransformInput {
+    pub(super) fn page_input(
+        idx: usize,
+        rect: Rect,
+        zoom: f32,
+        pan: Vec2,
+    ) -> DisplayedImageTransformInput {
         DisplayedImageTransformInput {
             page_idx: idx,
             viewport_rect: viewport(),
@@ -1148,7 +1160,7 @@ mod tests {
         }
     }
 
-    fn layout_from_pages(pages: &[DisplayedImageTransform]) -> FullscreenPageLayout {
+    pub(super) fn layout_from_pages(pages: &[DisplayedImageTransform]) -> FullscreenPageLayout {
         let mut layout = FullscreenPageLayout::default();
         layout.begin(if pages.len() == 1 {
             FullscreenPageLayoutKind::Single
@@ -1161,7 +1173,7 @@ mod tests {
         layout
     }
 
-    fn single(size: Vec2) -> FullscreenPageLayout {
+    pub(super) fn single(size: Vec2) -> FullscreenPageLayout {
         let rect = Rect::from_center_size(viewport().center(), size);
         layout_from_pages(&[DisplayedImageTransform::from_resolved_rect(
             page_input(0, rect, 1.0, Vec2::ZERO),
@@ -1170,7 +1182,7 @@ mod tests {
         .unwrap()])
     }
 
-    fn close(actual: Vec2, expected: Vec2) {
+    pub(super) fn close(actual: Vec2, expected: Vec2) {
         assert!(
             (actual - expected).abs().max_elem() < 0.001,
             "actual={actual:?}, expected={expected:?}"

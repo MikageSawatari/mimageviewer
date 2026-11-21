@@ -1289,6 +1289,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["滑らか", "スムーズ", "N 字", "Z 字", "キー", "ホイール"]
     ),
     entry!(
+        "spread/bound-drag-pan",
+        SpreadMode,
+        "閲覧時のドラッグ移動を画像の端までに制限する",
+        ["ドラッグ", "パン", "移動", "端", "制限", "余白"]
+    ),
+    entry!(
         "spread/n-scroll-step",
         SpreadMode,
         "順に読む操作 (N 字 / Z 字) 1 回",
@@ -2302,6 +2308,17 @@ mod tests {
                 .into_iter()
                 .find(|entry| entry.anchor == anchor)
                 .expect("ページ内スクロール設定が検索できる");
+            assert_eq!(entry.page, PreferencesPage::SpreadMode);
+        }
+    }
+
+    #[test]
+    fn fullscreen_bound_drag_pan_setting_is_searchable() {
+        for query in ["ドラッグ", "パン", "移動", "端", "制限", "余白"] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "spread/bound-drag-pan")
+                .expect("閲覧時のドラッグ移動制限が検索できる");
             assert_eq!(entry.page, PreferencesPage::SpreadMode);
         }
     }
