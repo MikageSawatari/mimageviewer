@@ -3,6 +3,10 @@
 //! Composition, helper focus contracts and retries belong to egui-ime.
 //! Keyboard ownership, diagnostic records and logging remain in this crate.
 
+#[cfg(test)]
+#[path = "app/tests/typing/probes.rs"]
+pub(crate) mod typing_probe;
+
 use egui_ime::TextInputDiagnosticKeyPolicy;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -495,6 +499,7 @@ pub(crate) fn ime_input_active(ctx: &egui::Context) -> bool {
 /// 二重化する一方、本アプリの文字入力は folder path、tag、bookmark name 等の補助用途であるため
 /// 採用しない。ただし、このような focus / key routing の不具合は本アプリ側の責務であり、
 /// IMM32 の範囲で修正する。「完全な IME には TSF が必要」を未修正の理由にしてはならない。
+#[cfg_attr(test, track_caller)]
 pub(crate) fn show_singleline<'text>(
     ui: &mut egui::Ui,
     text: &'text mut dyn egui::TextBuffer,
@@ -503,6 +508,8 @@ pub(crate) fn show_singleline<'text>(
 ) -> egui::widgets::text_edit::TextEditOutput {
     begin_pass_diagnostics(ui.ctx());
     let output = egui_ime::show_singleline(ui, text, focus_request, configure);
+    #[cfg(test)]
+    typing_probe::field(&output.response, std::panic::Location::caller());
     observe_helper_widget(ui.ctx(), output.response.id);
     output
 }
@@ -537,6 +544,7 @@ pub(crate) fn end_text_input(ctx: &egui::Context, id: egui::Id) {
     egui_ime::end_text_input(ctx, id);
 }
 
+#[cfg_attr(test, track_caller)]
 pub(crate) fn add_singleline<'text>(
     ui: &mut egui::Ui,
     text: &'text mut dyn egui::TextBuffer,
@@ -545,11 +553,14 @@ pub(crate) fn add_singleline<'text>(
 ) -> egui::Response {
     begin_pass_diagnostics(ui.ctx());
     let response = egui_ime::add_singleline(ui, text, focus_request, configure);
+    #[cfg(test)]
+    typing_probe::field(&response, std::panic::Location::caller());
     observe_helper_widget(ui.ctx(), response.id);
     response
 }
 
 /// Keep password-field diagnostic details redacted while recording ownership.
+#[cfg_attr(test, track_caller)]
 pub(crate) fn add_singleline_sensitive<'text>(
     ui: &mut egui::Ui,
     text: &'text mut dyn egui::TextBuffer,
@@ -558,10 +569,13 @@ pub(crate) fn add_singleline_sensitive<'text>(
 ) -> egui::Response {
     begin_pass_diagnostics(ui.ctx());
     let response = egui_ime::add_singleline_sensitive(ui, text, focus_request, configure);
+    #[cfg(test)]
+    typing_probe::field(&response, std::panic::Location::caller());
     observe_helper_widget(ui.ctx(), response.id);
     response
 }
 
+#[cfg_attr(test, track_caller)]
 pub(crate) fn add_sized_singleline<'text>(
     ui: &mut egui::Ui,
     size: egui::Vec2,
@@ -571,6 +585,8 @@ pub(crate) fn add_sized_singleline<'text>(
 ) -> egui::Response {
     begin_pass_diagnostics(ui.ctx());
     let response = egui_ime::add_sized_singleline(ui, size, text, focus_request, configure);
+    #[cfg(test)]
+    typing_probe::field(&response, std::panic::Location::caller());
     observe_helper_widget(ui.ctx(), response.id);
     response
 }

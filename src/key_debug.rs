@@ -136,6 +136,8 @@ pub fn record_consumed_action(
     chord: Chord,
     source: &'static str,
 ) {
+    #[cfg(test)]
+    crate::ime_focus::typing_probe::action(action, source);
     if !enabled() {
         return;
     }
@@ -149,6 +151,8 @@ pub fn record_pressed_action(
     chord: Chord,
     source: &'static str,
 ) {
+    #[cfg(test)]
+    crate::ime_focus::typing_probe::action(action, source);
     if !enabled() {
         return;
     }

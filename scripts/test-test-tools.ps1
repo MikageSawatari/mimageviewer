@@ -450,6 +450,49 @@ $zero = Run-Script 'test-focused.ps1' @('-Path', 'src/missing_module.rs')
 Assert-That ($zero.ExitCode -eq 4) "zero-match did not return nextest exit 4: $($zero.StdOut) $($zero.StdErr)"
 $broad = Run-Script 'test-focused.ps1' @('-Path', 'src/app/tests.rs')
 Assert-That ($broad.ExitCode -eq 2 -and $broad.StdOut.Contains('test-lib-full.ps1')) 'cross-cutting tests did not require a deliberate full/filter choice'
+# Typing selection is additive. Broad/shared paths still require the same
+# deliberate full/filter choice, even when a typing entry is available.
+$typingFilter = 'test(/(^|::)typing_/)'
+foreach ($typingPath in $script:MivTypingProductPaths) {
+    $typingPlan = Get-MivFocusedPlan $fixture @($typingPath)
+    $typingEntries = @($typingPlan.Entries | Where-Object { $_.Filter -eq $typingFilter })
+    Assert-That ($typingEntries.Count -eq 1 -and ($typingEntries[0].Selection -join ' ') -eq '-p mimageviewer --lib') "typing selection missing: $typingPath"
+}
+$typingBroad = Get-MivFocusedPlan $fixture @('src/app.rs')
+Assert-That ($typingBroad.BroadPaths -contains 'src/app.rs') 'typing selection weakened a broad path'
+$typingBroadRun = Run-Script 'test-focused.ps1' @('-Path', 'src/app.rs', '-PlanOnly')
+Assert-That ($typingBroadRun.ExitCode -eq 2) 'typing selection changed broad exit code'
+$typingFamily = Get-MivFocusedPlan $fixture @('src/app/tests/typing/mod.rs', 'src/app/tests/typing/probes.rs')
+Assert-That ($typingFamily.Entries.Count -eq 1 -and $typingFamily.Entries[0].Filter -eq $typingFilter) 'typing paths selected an empty per-file filter or duplicated the family'
+$typingProbePath = 'src/typing_inventory_probe.rs'
+foreach ($source in @(
+    'crate::ime_focus::add_singleline(ui, draft, None, configure);',
+    'ime_focus::show_singleline(ui, draft, None, configure);',
+    'super::add_sized_singleline(ui, size, draft, None, configure);',
+    "use crate::ime_focus::{add_singleline};`nadd_singleline(`nui, draft, None, configure);",
+    'use crate::ime_focus::show_singleline as field; field(ui, draft, None, configure);'
+)) {
+    Write-Fixture $typingProbePath $source
+    $typingPlan = Get-MivFocusedPlan $fixture @($typingProbePath, 'src/keymap.rs')
+    Assert-That (@($typingPlan.Entries | Where-Object { $_.Filter -eq $typingFilter }).Count -eq 1) 'helper caller or alias did not select typing exactly once'
+}
+Write-Fixture $typingProbePath '// no helper call or import'
+$typingNegative = Get-MivFocusedPlan $fixture @($typingProbePath)
+Assert-That (@($typingNegative.Entries | Where-Object { $_.Filter -eq $typingFilter }).Count -eq 0) 'unrelated source selected typing'
+[IO.File]::Delete((Join-Path $fixture $typingProbePath))
+# Parse the exact regular-expression filterset with real nextest in the tiny
+# fixture; no application crate or main workspace is built by this regression.
+Write-Fixture $typingProbePath '#[test] fn typing_plan_probe() {}'
+$typingLibPath = Join-Path $fixture 'src/lib.rs'
+$typingLibBefore = [IO.File]::ReadAllText($typingLibPath, [Text.Encoding]::UTF8)
+try {
+    [IO.File]::AppendAllText($typingLibPath, "`nmod typing_inventory_probe;`n", $utf8)
+    $typingRun = Run-Script 'test-focused.ps1' @('-Path', 'src/app/tests/typing/probes.rs')
+    Assert-That ($typingRun.ExitCode -eq 0 -and $typingRun.StdOut.Contains('PASS: 1 tests')) 'typing regex filterset did not run the tiny fixture test'
+} finally {
+    [IO.File]::WriteAllText($typingLibPath, $typingLibBefore, $utf8)
+    [IO.File]::Delete((Join-Path $fixture $typingProbePath))
+}
 $docs = Run-Script 'test-focused.ps1' @('-Path', 'docs/example.md')
 Assert-That ($docs.ExitCode -eq 2 -and $docs.StdOut.Contains('docs/example.md')) 'unmapped documentation was silently dropped'
 # Use a PS entry script for array arguments (powershell.exe -File does not bind

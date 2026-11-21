@@ -8209,6 +8209,11 @@ impl Keymap {
         let mut consumed = false;
         for chord in chords.iter().copied() {
             if self.consume_chord_no_repeat(ctx, chord) {
+                #[cfg(test)]
+                crate::ime_focus::typing_probe::action(
+                    KeyAction::HelpShowContextShortcuts,
+                    "context_help",
+                );
                 consumed = true;
             }
         }
@@ -8604,6 +8609,8 @@ impl Keymap {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
         if crate::test_script::consume_pending_action(ctx, action) {
+            #[cfg(test)]
+            crate::ime_focus::typing_probe::action(action, "test-script");
             return 1;
         }
         if action.press_multiplicity() == PressMultiplicity::SinglePerFrame {
@@ -8643,6 +8650,8 @@ impl Keymap {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
         if crate::test_script::consume_pending_action(ctx, action) {
+            #[cfg(test)]
+            crate::ime_focus::typing_probe::action(action, "test-script");
             return PageTurnConsumeResult::ScriptAction {
                 action,
                 viewport: ctx.viewport_id(),
@@ -8767,6 +8776,8 @@ impl Keymap {
         );
         #[cfg(all(windows, feature = "test-script"))]
         if crate::test_script::consume_pending_action(ctx, action) {
+            #[cfg(test)]
+            crate::ime_focus::typing_probe::action(action, "test-script");
             return Some(ActionPressInput {
                 operation_id: None,
                 kind: PageTurnPressKind::InitialPress,
@@ -8794,6 +8805,8 @@ impl Keymap {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
         if crate::test_script::consume_pending_action(ctx, action) {
+            #[cfg(test)]
+            crate::ime_focus::typing_probe::action(action, "test-script");
             return true;
         }
         if let Some(chords) = self.overrides.get(&action) {
@@ -8854,6 +8867,8 @@ impl Keymap {
                 }
                 #[cfg(all(windows, feature = "test-script"))]
                 if crate::test_script::consume_pending_action(ctx, action) {
+                    #[cfg(test)]
+                    crate::ime_focus::typing_probe::action(action, "test-script");
                     return true;
                 }
                 self.effective_chords(action).into_iter().any(|chord| {
@@ -8896,14 +8911,19 @@ impl Keymap {
             return false;
         }
         self.effective_chords(action).into_iter().any(|chord| {
-            matches!(
+            let consumed = matches!(
                 chord,
                 Chord::Key {
                     alt: true,
                     ctrl: false,
                     ..
                 }
-            ) && self.consume_owned_chord(ctx, chord, true)
+            ) && self.consume_owned_chord(ctx, chord, true);
+            #[cfg(test)]
+            if consumed {
+                crate::ime_focus::typing_probe::action(action, "text_input_history");
+            }
+            consumed
         })
     }
 
@@ -8911,6 +8931,8 @@ impl Keymap {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
         if crate::test_script::consume_pending_action(ctx, action) {
+            #[cfg(test)]
+            crate::ime_focus::typing_probe::action(action, "test-script");
             return true;
         }
         if let Some(chords) = self.overrides.get(&action) {
@@ -8947,6 +8969,8 @@ impl Keymap {
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         #[cfg(all(windows, feature = "test-script"))]
         if crate::test_script::peek_pending_action(ctx, action) {
+            #[cfg(test)]
+            crate::ime_focus::typing_probe::action(action, "test-script");
             return true;
         }
         if let Some(chords) = self.overrides.get(&action) {
@@ -9271,6 +9295,14 @@ impl Keymap {
         shift: bool,
         alt: bool,
     ) -> bool {
+        #[cfg(test)]
+        if self
+            .effective_chords(action)
+            .into_iter()
+            .any(|chord| chord.matches_vk_parts(virtual_key, ctrl, shift, alt))
+        {
+            crate::ime_focus::typing_probe::action(action, "native_parts_match");
+        }
         debug_assert_eq!(action.trigger(), KeyTrigger::Press);
         if let Some(chords) = self.overrides.get(&action) {
             return chords

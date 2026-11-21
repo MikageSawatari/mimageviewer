@@ -2077,6 +2077,11 @@ impl App {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn typing_collection_new_name_for_test(&self) -> &str {
+        &self.collection_ui.manager_new_name
+    }
+
     pub(crate) fn open_collection_manager(&mut self, selected: Option<CollectionId>) {
         self.collection_ui.show_manager = true;
         if self.collection_ui.operation.is_idle()

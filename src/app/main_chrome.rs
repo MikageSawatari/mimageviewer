@@ -19,6 +19,11 @@ impl App {
 
     /// Hold background chrome input without dimming the whole main window.
     pub(crate) fn gate_main_chrome(&self, ui: &mut egui::Ui) {
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::chrome_gate(
+            ui.ctx(),
+            self.modal_dialog_block_reason_including_menus(false),
+        );
         if self.main_chrome_pointer_blocked() {
             // Disable at full alpha, then restore the style so genuinely disabled
             // child controls keep their own disabled appearance.

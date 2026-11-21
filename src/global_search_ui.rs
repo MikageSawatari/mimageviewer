@@ -3246,6 +3246,12 @@ impl App {
             Some(wake),
         );
         self.global_search.pending = Some(SearchProducer::Metadata(handle));
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::job(
+            "metadata",
+            &self.global_search.last_executed,
+            crate::ime_focus::typing_probe::Outcome::Started,
+        );
         // items を空にして "検索中" 表示に切り替え
         self.rebuild_items_from_global_search();
     }
@@ -3360,6 +3366,12 @@ impl App {
                     self.global_search.truncated = truncated;
                     match reason {
                         DoneReason::RejectedQuery(r) => {
+                            #[cfg(test)]
+                            crate::ime_focus::typing_probe::job(
+                                "metadata",
+                                &self.global_search.last_executed,
+                                crate::ime_focus::typing_probe::Outcome::Rejected,
+                            );
                             self.global_search.reject_message = Some(r.as_user_message());
                         }
                         DoneReason::Cancelled => {
@@ -3691,6 +3703,19 @@ impl App {
                             );
                             app.install_prepared_page_edits(prepared.page_edits);
                             app.accept_search_projection(&wish, metadata_applied);
+                            #[cfg(test)]
+                            if matches!(wish.source, SearchProjection::Metadata)
+                                && wish.done
+                                && app.global_search.reject_message.is_none()
+                            {
+                                crate::ime_focus::typing_probe::job(
+                                    "metadata",
+                                    &wish.query,
+                                    crate::ime_focus::typing_probe::Outcome::Delivered(
+                                        app.items.len(),
+                                    ),
+                                );
+                            }
                             if let Some(viewer) = viewer {
                                 app.finish_rating_membership_viewer_swap(viewer);
                             }
