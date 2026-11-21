@@ -53,6 +53,8 @@ mod direct_navigation_worker_scan;
 mod repro742;
 mod section1768;
 mod section1795;
+#[cfg(windows)]
+mod sort_hold_838;
 
 pub(crate) fn assert_cache_book_cover_only_worker_catalog_contract(
     app: &mut App,
