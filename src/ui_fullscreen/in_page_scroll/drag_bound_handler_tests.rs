@@ -294,6 +294,65 @@ fn drag_bound_surface_uses_painted_rotation_and_matching_receipt() {
 }
 
 #[test]
+fn drag_bound_surface_matches_the_actual_paint_rotation_threshold() {
+    for (angle, rotated) in [
+        (0.0, false),
+        (1.0e-6, false),
+        (2.0e-6, true),
+        (0.0005, true),
+    ] {
+        let (ctx, mut app) = prepared(true, FullscreenFitMode::Width, 3.0);
+        app.fs_free_rotation = angle;
+        seed(&ctx, &mut app);
+        let page = app
+            .fullscreen_page_layout
+            .displayed_pages()
+            .next()
+            .unwrap()
+            .transform;
+        let unrotated = [
+            page.paint_rect.left_top(),
+            page.paint_rect.right_top(),
+            page.paint_rect.right_bottom(),
+            page.paint_rect.left_bottom(),
+        ];
+        assert_eq!(
+            page.paint_quad().positions != unrotated,
+            rotated,
+            "angle={angle}"
+        );
+        frame(&ctx, vec![], |_, ctx| {
+            assert_eq!(
+                app.fs_bounded_drag_pan_surface(ctx),
+                !rotated,
+                "angle={angle}"
+            );
+        });
+    }
+}
+
+#[test]
+fn drag_bound_small_painted_free_rotation_keeps_the_legacy_drag() {
+    for angle in [-0.0005, 0.0005] {
+        let outcomes = [false, true].map(|bound| {
+            let (ctx, mut app) = prepared(bound, FullscreenFitMode::Width, 3.0);
+            app.fs_free_rotation = angle;
+            seed(&ctx, &mut app);
+            let delta = Vec2::new(900.0, -1800.0);
+            let expected = clamp_fullscreen_pan_from_layout(
+                &app.fullscreen_page_layout,
+                app.fs_zoom,
+                app.fs_pan + delta,
+            );
+            drag(&mut app, &ctx, delta);
+            close(app.fs_pan, expected);
+            (app.fs_zoom, app.fs_pan)
+        });
+        assert_eq!(outcomes[0], outcomes[1]);
+    }
+}
+
+#[test]
 fn drag_bound_bookmarks_tab_keeps_the_reading_boundary_active() {
     let (ctx, mut app) = prepared(true, FullscreenFitMode::Page, 1.0);
     app.settings.fullscreen_left_panel_tab = crate::settings::FullscreenLeftPanelTab::Bookmarks;

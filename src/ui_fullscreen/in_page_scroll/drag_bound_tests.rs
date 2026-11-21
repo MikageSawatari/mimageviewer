@@ -382,6 +382,27 @@ fn r8_interpolated_drawn_pan_uses_current_origin_for_visibility_rounding() {
 }
 
 #[test]
+fn visibility_quotient_roundoff_cannot_exclude_current_pan_on_an_unrequested_axis() {
+    for dpi in [1.0, 1.25, 1.5] {
+        let viewport = Rect::from_min_size(egui::Pos2::ZERO, Vec2::splat(1000.0));
+        let rect = Rect::from_min_max(egui::pos2(-2000.0, -1000.0), egui::pos2(25.6, 2000.0));
+        let mut input = page_input(0, rect, 1.0, Vec2::ZERO);
+        input.viewport_rect = viewport;
+        input.pixels_per_point = dpi;
+        let page = DisplayedImageTransform::from_resolved_rect(input, rect).unwrap();
+        let overlap = page.paint_rect.right();
+        let reference = minimum_pan_overlap(page.paint_rect, viewport).x;
+        assert_eq!(overlap, 25.6);
+        assert!((overlap / reference) * reference > overlap);
+        let layout = layout_from_pages(&[page]);
+        close(
+            bounded_drag_pan(&layout, Vec2::ZERO, egui::vec2(0.0, -100.0)),
+            egui::vec2(0.0, -100.0),
+        );
+    }
+}
+
+#[test]
 fn interpolated_drawn_pan_cannot_reverse_requested_axis_or_move_an_unrequested_axis() {
     let layout = drawn_at(
         &single(Vec2::splat(3000.0)),

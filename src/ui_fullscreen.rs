@@ -3808,21 +3808,48 @@ fn frozen_white_companion(
     })
 }
 
+fn minimum_pan_overlap(image_rect: egui::Rect, viewport_rect: egui::Rect) -> egui::Vec2 {
+    egui::vec2(
+        FS_PAN_MIN_VISIBLE_PX
+            .min(image_rect.width())
+            .min(viewport_rect.width()),
+        FS_PAN_MIN_VISIBLE_PX
+            .min(image_rect.height())
+            .min(viewport_rect.height()),
+    )
+}
+
+/// Translation ranges which retain the requested overlap on both axes.
+fn pan_translation_bounds_for_overlap(
+    image_rect: egui::Rect,
+    viewport_rect: egui::Rect,
+    overlap: egui::Vec2,
+) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(
+            viewport_rect.left() + overlap.x - image_rect.right(),
+            viewport_rect.top() + overlap.y - image_rect.bottom(),
+        ),
+        egui::pos2(
+            viewport_rect.right() - overlap.x - image_rect.left(),
+            viewport_rect.bottom() - overlap.y - image_rect.top(),
+        ),
+    )
+}
+
 fn pan_correction_for_minimum_overlap(
     image_rect: egui::Rect,
     viewport_rect: egui::Rect,
 ) -> egui::Vec2 {
-    let overlap_x = FS_PAN_MIN_VISIBLE_PX
-        .min(image_rect.width())
-        .min(viewport_rect.width());
-    let overlap_y = FS_PAN_MIN_VISIBLE_PX
-        .min(image_rect.height())
-        .min(viewport_rect.height());
-    let min_x = viewport_rect.left() + overlap_x - image_rect.right();
-    let max_x = viewport_rect.right() - overlap_x - image_rect.left();
-    let min_y = viewport_rect.top() + overlap_y - image_rect.bottom();
-    let max_y = viewport_rect.bottom() - overlap_y - image_rect.top();
-    egui::vec2(0.0_f32.clamp(min_x, max_x), 0.0_f32.clamp(min_y, max_y))
+    let bounds = pan_translation_bounds_for_overlap(
+        image_rect,
+        viewport_rect,
+        minimum_pan_overlap(image_rect, viewport_rect),
+    );
+    egui::vec2(
+        0.0_f32.clamp(bounds.left(), bounds.right()),
+        0.0_f32.clamp(bounds.top(), bounds.bottom()),
+    )
 }
 
 /// Clamp a proposed normal-view pan against the resolved page geometry from the previous frame.
@@ -15400,7 +15427,7 @@ impl App {
         painted
     }
 
-    /// 利用者入力から通常表示の pan を変更する唯一の入口。
+    /// Shared input writer, except for the opt-in canvas drag boundary.
     ///
     /// Z ズームと連結読みはそれぞれ専用制約を持つため、このクランプを適用しない。
     fn set_fs_pan_from_input(&mut self, proposed_zoom: f32, proposed_pan: egui::Vec2) {
@@ -42410,7 +42437,13 @@ impl App {
                     && let Some(proposed_pan) =
                         input.total_drag_delta.map(|delta| start_pan + delta)
                 {
-                    self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
+                    if self.settings.fullscreen_bound_drag_pan
+                        && self.fs_bounded_drag_pan_surface(ctx)
+                    {
+                        self.apply_fs_bounded_drag_pan(ctx, proposed_pan);
+                    } else {
+                        self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
+                    }
                 }
             }
             if primary_released {

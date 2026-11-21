@@ -177,59 +177,126 @@ fn touch(id: u64, phase: egui::TouchPhase, pos: egui::Pos2) -> egui::Event {
     }
 }
 
+fn pinch_pointer_frame(
+    app: &mut App,
+    ctx: &egui::Context,
+    events: Vec<egui::Event>,
+    expected_owner: crate::touch_input::TouchOwner,
+    expected_active: bool,
+) {
+    frame(ctx, events, |ui, ctx| {
+        let state = app.prepare_fullscreen_state(ctx, 0, FsPageTurnDecision::normal());
+        let (nav, close) =
+            app.handle_fs_wheel_and_click(ui, ctx, full_rect(), &state, false, 0, &mut None);
+        assert!(nav.is_none());
+        assert!(!close);
+        // The production handler above owns the first drive and its commands.
+        // Replaying the same frame is read-only and proves this was recognized
+        // as a pinch rather than falling through to ordinary canvas dragging.
+        let observed = crate::touch_correlation::drive_egui_touch_input(
+            ctx,
+            crate::touch_correlation::TouchSurface::StillFullscreen,
+            crate::touch_input::TapZoneGeometry {
+                surface: full_rect(),
+                excluded: Vec::new(),
+                behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                    accepts_pinch: true,
+                    tap_zones: true,
+                },
+            },
+            ctx.cumulative_frame_nr(),
+            true,
+        );
+        assert!(
+            observed.commands().is_empty(),
+            "the handler must own the first drive"
+        );
+        assert_eq!(observed.owner(), expected_owner);
+        assert_eq!(observed.is_active(), expected_active);
+    });
+}
+
 #[test]
 fn drag_bound_setting_preserves_two_finger_pan_through_the_real_touch_recognizer() {
     #[cfg(windows)]
     let _serial = crate::key_input::lock_test_input();
-    let outcomes = [false, true].map(|bound| {
-        let ctx = egui::Context::default();
-        let mut app = ready(&ctx, bound);
-        let left = egui::pos2(250.0, 180.0);
-        let right = egui::pos2(350.0, 180.0);
-        let delta = Vec2::new(60.0, 35.0);
-        pointer_frame(&mut app, &ctx, vec![]);
-        for events in [
-            vec![
-                touch(1, egui::TouchPhase::Start, left),
-                egui::Event::PointerMoved(left),
-                button(left, true),
-            ],
-            vec![touch(2, egui::TouchPhase::Start, right)],
-            vec![
-                touch(1, egui::TouchPhase::Move, left + delta),
-                touch(2, egui::TouchPhase::Move, right + delta),
-                egui::Event::PointerMoved(left + delta),
-            ],
-        ] {
-            assert!(pointer_frame(&mut app, &ctx, events).is_none());
-        }
-        assert_ne!(
-            app.fs_pan,
-            Vec2::ZERO,
-            "raw two-contact input must reach pan"
-        );
-        assert!(
-            (app.fs_zoom - 2.0).abs() < 0.0001,
-            "translation keeps contact spacing"
-        );
-        let moved = result(&app);
-        pointer_frame(
-            &mut app,
-            &ctx,
-            vec![
-                touch(1, egui::TouchPhase::End, left + delta),
-                touch(2, egui::TouchPhase::End, right + delta),
-                button(left + delta, false),
-            ],
-        );
-        assert_eq!(
-            result(&app),
-            moved,
-            "ending a pinch cannot add canvas movement"
-        );
-        moved
+    crate::touch_correlation::with_gestures_disabled(false, || {
+        assert!(!crate::touch_correlation::touch_gestures_disabled());
+        let outcomes = [false, true].map(|bound| {
+            let ctx = egui::Context::default();
+            let mut app = ready(&ctx, bound);
+            let left = egui::pos2(250.0, 180.0);
+            let right = egui::pos2(350.0, 180.0);
+            let delta = Vec2::new(60.0, 35.0);
+            pointer_frame(&mut app, &ctx, vec![]);
+            for (index, events) in [
+                vec![
+                    touch(1, egui::TouchPhase::Start, left),
+                    egui::Event::PointerMoved(left),
+                    button(left, true),
+                ],
+                vec![touch(2, egui::TouchPhase::Start, right)],
+                vec![
+                    touch(1, egui::TouchPhase::Move, left + delta),
+                    // egui-winit promotes only the first contact, immediately
+                    // after its raw Touch event. Interleaving another Touch here
+                    // makes the correlation ambiguous and discards all commands.
+                    egui::Event::PointerMoved(left + delta),
+                    touch(2, egui::TouchPhase::Move, right + delta),
+                ],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                pinch_pointer_frame(
+                    &mut app,
+                    &ctx,
+                    events,
+                    if index == 0 {
+                        crate::touch_input::TouchOwner::Undecided
+                    } else {
+                        crate::touch_input::TouchOwner::Pinch
+                    },
+                    true,
+                );
+            }
+            assert_ne!(
+                app.fs_pan,
+                Vec2::ZERO,
+                "raw two-contact input must reach pan"
+            );
+            assert!(
+                (app.fs_pan - delta).length() < 0.0001,
+                "two-contact translation must move by the full requested delta"
+            );
+            assert!(
+                (app.fs_zoom - 2.0).abs() < 0.0001,
+                "translation keeps contact spacing"
+            );
+            let moved = result(&app);
+            pinch_pointer_frame(
+                &mut app,
+                &ctx,
+                vec![
+                    // End the secondary first so only the primary's terminal
+                    // event has the backend's release/PointerGone signature.
+                    touch(2, egui::TouchPhase::End, right + delta),
+                    touch(1, egui::TouchPhase::End, left + delta),
+                    button(left + delta, false),
+                    egui::Event::PointerGone,
+                ],
+                crate::touch_input::TouchOwner::Pinch,
+                false,
+            );
+            assert_eq!(
+                result(&app),
+                moved,
+                "ending a pinch cannot add canvas movement"
+            );
+            moved
+        });
+        assert_eq!(outcomes[0], outcomes[1]);
     });
-    assert_eq!(outcomes[0], outcomes[1]);
 }
 
 #[derive(Clone, Copy, Debug)]
