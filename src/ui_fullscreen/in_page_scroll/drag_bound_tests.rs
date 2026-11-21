@@ -1,6 +1,8 @@
 //! Pure geometry contracts for §1.834 (including the r5–r9 counterexamples).
 //! These resolved-layout fixtures do not stand in for the real-renderer tests.
-use super::drag_bound::{bounded_drag_pan, round_drag_bound_delta};
+use super::drag_bound::{
+    bounded_drag_pan, inward_drag_visibility_bounds, trunc_drag_bound_edge_delta,
+};
 use super::tests::{asymmetric_spread, close, layout_from_pages, page_input, single, viewport};
 use super::*;
 use crate::rotation_db::Rotation;
@@ -431,8 +433,7 @@ fn interpolated_drawn_pan_cannot_reverse_requested_axis_or_move_an_unrequested_a
     );
 }
 
-#[test]
-fn r9_short_trim_visibility_box_rounds_inward_and_retains_one_pixel() {
+fn short_trimmed_spread() -> FullscreenPageLayout {
     let left = Rect::from_min_max(egui::pos2(-480.0, -950.0), egui::pos2(520.0, 2050.0));
     let right = Rect::from_min_max(egui::pos2(540.0, 50.0), egui::pos2(1540.0, 1050.0));
     let mut right_input = page_input(1, right, 1.0, Vec2::ZERO);
@@ -453,12 +454,62 @@ fn r9_short_trim_visibility_box_rounds_inward_and_retains_one_pixel() {
         .paint_rect;
     close(painted_right.min.to_vec2(), egui::vec2(540.0, 538.0));
     close(painted_right.max.to_vec2(), egui::vec2(1540.0, 562.0));
+    template
+}
+
+#[test]
+fn r9_short_trim_visibility_box_rounds_inward_and_retains_one_pixel() {
+    let template = short_trimmed_spread();
     let cur = egui::vec2(-489.0, 1000.0);
     let layout = drawn_at(&template, cur, 1.0, RectPixelFit::Proportional);
     close(
         bounded_drag_pan(&layout, cur, egui::vec2(-510.0, 512.0)),
         egui::vec2(-489.0, 512.0),
     );
+}
+
+#[test]
+fn r2_near_integer_visibility_box_keeps_positive_overlap_in_both_directions() {
+    let layout = short_trimmed_spread();
+    for page in layout.displayed_pages() {
+        assert_eq!(normal_zoom_pan(page.transform).unwrap().1, Vec2::ZERO);
+    }
+    let visibility = |pan: Vec2| {
+        layout
+            .displayed_pages()
+            .map(|page| {
+                let rect = page.transform.paint_rect.translate(pan);
+                let reference = minimum_pan_overlap(rect, viewport());
+                let overlap = viewport().max.min(rect.max) - viewport().min.max(rect.min);
+                (overlap.x / reference.x).min(overlap.y / reference.y)
+            })
+            .fold(f32::NEG_INFINITY, f32::max)
+    };
+    for sign in [1.0, -1.0] {
+        let cur = egui::vec2(-489.99951171875, sign * 1000.0);
+        let proposed = egui::vec2(-510.0, sign * 512.0);
+        let before = visibility(cur);
+        assert!(before > 0.0, "the left page starts with positive overlap");
+        let actual = bounded_drag_pan(&layout, cur, proposed);
+        // Right-page limits are -488.000244 (floor -489), or its mirrored
+        // +488.000244 (ceil +489). Both lie outside the requested y interval.
+        assert_eq!(actual, egui::vec2(cur.x, proposed.y));
+        let after = visibility(actual);
+        assert!(
+            after >= before && after > 0.0,
+            "sign={sign}, before={before}, after={after}, pan={actual:?}"
+        );
+        assert!(
+            layout.displayed_pages().any(|page| {
+                page.transform
+                    .paint_rect
+                    .translate(actual)
+                    .intersect(viewport())
+                    .is_positive()
+            }),
+            "some element must overlap the viewport on both axes"
+        );
+    }
 }
 
 #[test]
@@ -505,17 +556,27 @@ fn one_two_and_three_physical_pixel_overflow_has_no_dead_band_at_either_edge() {
 fn physical_pixel_rounding_preserves_fractions_and_repairs_integer_residue() {
     for dpi in [1.0, 1.25, 1.5] {
         let pixel = physical_pixel_scale(dpi);
-        for round in [f32::trunc as fn(f32) -> f32, f32::ceil, f32::floor] {
-            for integer in [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0] {
-                for residue in [-0.0005, 0.0005] {
-                    let actual = round_drag_bound_delta((integer + residue) * pixel, pixel, round);
-                    close(Vec2::splat(actual), Vec2::splat(integer * pixel));
-                }
+        for integer in [-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0] {
+            for residue in [-0.0005, 0.0005] {
+                let actual = trunc_drag_bound_edge_delta((integer + residue) * pixel, pixel);
+                close(Vec2::splat(actual), Vec2::splat(integer * pixel));
             }
-            for fraction in [-3.4_f32, -1.75, -1.002, 1.002, 1.75, 3.4] {
-                let actual = round_drag_bound_delta(fraction * pixel, pixel, round);
-                close(Vec2::splat(actual), Vec2::splat(round(fraction) * pixel));
-            }
+            // Visibility limits keep their fractions: ceil(n + .0005) is
+            // n + 1, while floor(n + 3 - .0005) is n + 2.
+            let bounds = Rect::from_min_max(
+                egui::pos2((integer + 0.0005) * pixel, (integer + 0.0005) * pixel),
+                egui::pos2(
+                    (integer + 3.0 - 0.0005) * pixel,
+                    (integer + 3.0 - 0.0005) * pixel,
+                ),
+            );
+            let inward = inward_drag_visibility_bounds(bounds, pixel);
+            close(inward.min.to_vec2(), Vec2::splat((integer + 1.0) * pixel));
+            close(inward.max.to_vec2(), Vec2::splat((integer + 2.0) * pixel));
+        }
+        for fraction in [-3.4_f32, -1.75, -1.002, 1.002, 1.75, 3.4] {
+            let actual = trunc_drag_bound_edge_delta(fraction * pixel, pixel);
+            close(Vec2::splat(actual), Vec2::splat(fraction.trunc() * pixel));
         }
     }
 }

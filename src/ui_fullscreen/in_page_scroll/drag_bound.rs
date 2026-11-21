@@ -1,12 +1,8 @@
 //! Canvas-only drag bounds from the owning display unit's painted geometry.
 use super::*;
 
-/// Treat only arithmetic residue near an integer as a whole physical pixel.
-pub(super) fn round_drag_bound_delta(
-    delta: f32,
-    pixel: f32,
-    round: impl FnOnce(f32) -> f32,
-) -> f32 {
+/// Snap the unit edge's integer residue before truncating toward zero.
+pub(super) fn trunc_drag_bound_edge_delta(delta: f32, pixel: f32) -> f32 {
     let pixels = delta / pixel;
     let integer = pixels.round();
     let pixels = if (pixels - integer).abs() <= 1.0e-3 {
@@ -14,7 +10,21 @@ pub(super) fn round_drag_bound_delta(
     } else {
         pixels
     };
-    round(pixels) * pixel
+    pixels.trunc() * pixel
+}
+
+/// Never expand a visibility box, even near an integer physical pixel.
+pub(super) fn inward_drag_visibility_bounds(bounds: Rect, pixel: f32) -> Rect {
+    Rect::from_min_max(
+        egui::pos2(
+            (bounds.min.x / pixel).ceil() * pixel,
+            (bounds.min.y / pixel).ceil() * pixel,
+        ),
+        egui::pos2(
+            (bounds.max.x / pixel).floor() * pixel,
+            (bounds.max.y / pixel).floor() * pixel,
+        ),
+    )
 }
 
 pub(super) fn bounded_drag_pan(layout: &FullscreenPageLayout, cur: Vec2, proposed: Vec2) -> Vec2 {
@@ -50,10 +60,10 @@ pub(super) fn bounded_drag_pan(layout: &FullscreenPageLayout, cur: Vec2, propose
     let mut candidate = cur;
     for axis in 0..2 {
         if unit.size()[axis] > viewport.size()[axis] {
-            let min = cur[axis]
-                + round_drag_bound_delta(viewport.max[axis] - unit.max[axis], pixel, f32::trunc);
-            let max = cur[axis]
-                + round_drag_bound_delta(viewport.min[axis] - unit.min[axis], pixel, f32::trunc);
+            let min =
+                cur[axis] + trunc_drag_bound_edge_delta(viewport.max[axis] - unit.max[axis], pixel);
+            let max =
+                cur[axis] + trunc_drag_bound_edge_delta(viewport.min[axis] - unit.min[axis], pixel);
             candidate[axis] = proposed[axis].clamp(min.min(cur[axis]), max.max(cur[axis]));
         }
     }
@@ -86,16 +96,9 @@ pub(super) fn bounded_drag_pan(layout: &FullscreenPageLayout, cur: Vec2, propose
             }
         }
         // Round into the visibility box, including boxes not containing cur.
-        let min = cur
-            + Vec2::new(
-                round_drag_bound_delta(bounds.min.x, pixel, f32::ceil),
-                round_drag_bound_delta(bounds.min.y, pixel, f32::ceil),
-            );
-        let max = cur
-            + Vec2::new(
-                round_drag_bound_delta(bounds.max.x, pixel, f32::floor),
-                round_drag_bound_delta(bounds.max.y, pixel, f32::floor),
-            );
+        let bounds = inward_drag_visibility_bounds(bounds, pixel);
+        let min = cur + bounds.min.to_vec2();
+        let max = cur + bounds.max.to_vec2();
         let allowed = Rect::from_min_max(min.to_pos2(), max.to_pos2()).intersect(movement);
         // A zero-width axis is valid: unrequested axes must remain unchanged.
         if allowed.min.x <= allowed.max.x && allowed.min.y <= allowed.max.y {
