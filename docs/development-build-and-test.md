@@ -16,11 +16,14 @@
 | 自動操作用の使い捨て環境を準備 | `.\scripts\prepare-portable-smoke.ps1 -TestScript` | 診断portableを別出力先でbuildし、固定sandboxへ配置。起動はしない |
 | 了承済みのリリース前実アプリ検証 | `.\scripts\ui-smoke.ps1 -Scenario <対象> -InteractiveApproved` | [実行確認](interactive-release-verification.md)後だけ。通常の開発反復・test-fullへ自動連結しない |
 | 毎リリースのidle／perf正規確認 | `.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved` | 2026-10-11採用。利用者がPowerShellで実行。隔離seed＋5 idle＋cached／uncached perf、全結果は `target/ui-smoke/runs/<run-id>/` |
+| サブPCでbuildせずidle／perf確認 | `.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -FromKit -InteractiveApproved` | 2026-11-21決定。メインPCで検証済みキットを作成してローカルへコピー。Python 3.10以上、git／cargo不要。[作成・環境確認・結果受け取り](release-check-automation-plan.md#relcheck-subpc-kit) |
 | リリース前の自動テスト一式 | `.\scripts\test-full.ps1` | nextestでworkspace 全体 + テストを持つ補助 bin + 除外された vendor 4 crate の lib test、cargo testでworkspace doctest |
 | 承認済みの standalone eframe窓試験 | `.\scripts\test-live-windows.ps1 -InteractiveApproved` | 利用者が隔離 desktop/session で実行する ignored live 試験1件。自動 gate には接続しない |
 | 配布成果物を生成 | `.\scripts\build-dist.ps1` | 全体テスト、clean、release、installer、portable |
 
 ReleaseChecksは非対話テストではなく、desktopを使う了承済み検証枠で実行する。
+次回から公開前の正規計測はサブPCのキット経路で行う。以下のbuild／PATH FFmpegの説明はrepository経路のもの。
+kitモードは同梱FFmpegを使い、`-SkipBuild` の有無によらずbuildせず、全ファイルとソース指紋記録を照合する。
 他アプリ窓を最小化し、build待ちを含め終了までPCに触れない。seed込み約5〜8分＋初回build、
 FFmpeg CLIがPATHに必要。同一ソースの診断artifactが検証できる場合だけ `-SkipBuild` を追加する。
 `prepare-portable-smoke.ps1 -TestScript` は事前buildのみで起動しない。

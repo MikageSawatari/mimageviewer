@@ -10,6 +10,7 @@ param(
     [string]$ThresholdPath = "",
     [string]$OutputDirectory = "",
     [switch]$PortableSmoke,
+    [switch]$FromKit,
     [switch]$InteractiveApproved,
     [datetime]$ExpectedStartTimeUtc,
     [string]$SleepEvidencePath = "",
@@ -38,10 +39,10 @@ if ($PortableSmoke) {
         -Scenario $Scenario -TargetKey $TargetKey -ProcessId $ProcessId `
         -ExpectedStartTimeUtc $ExpectedStartTimeUtc -SleepEvidencePath $SleepEvidencePath `
         -OutputDirectory $OutputDirectory -RootHwnd $RootHwnd -BackgroundHwnd $BackgroundHwnd `
-        -BackgroundProcessId $BackgroundProcessId -CaseId $CaseId -InteractiveApproved
+        -BackgroundProcessId $BackgroundProcessId -CaseId $CaseId -InteractiveApproved -FromKit:$FromKit
     exit $LASTEXITCODE
 }
-if ($InteractiveApproved -or $PSBoundParameters.ContainsKey('ExpectedStartTimeUtc') -or
+if ($InteractiveApproved -or $FromKit -or $PSBoundParameters.ContainsKey('ExpectedStartTimeUtc') -or
     $PSBoundParameters.ContainsKey('SleepEvidencePath') -or $PSBoundParameters.ContainsKey('RootHwnd') -or
     $PSBoundParameters.ContainsKey('BackgroundHwnd') -or $PSBoundParameters.ContainsKey('BackgroundProcessId') -or $PSBoundParameters.ContainsKey('CaseId')) {
     [Console]::Error.WriteLine('ReleaseChecks execution options require -PortableSmoke; they do not authorize normal-profile launch.')

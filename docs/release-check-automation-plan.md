@@ -1,6 +1,8 @@
 # リリース前 idle health / perf smoke 自動化計画
 
-**現行状態（2026-10-11）: 利用者がReleaseChecks suiteを毎リリースの正規手順として採用。**
+**現行状態（2026-11-21）: 毎リリースのReleaseChecks suiteを、次回から公開前にサブPCのキットで実行する。**
+ソース・git・cargoの無いサブPC向けの作成・事前確認・結果受け取りは [§11](#relcheck-subpc-kit)。
+以下のrepository経路も維持する。2026-10-11には利用者がsuiteを毎リリースの正規手順として採用した。
 `45a2be935` の了承済み確認runはPASS_WITH_WARNINGS／exit 0（PASS 7、警告付きPASS 2）。
 採用証跡・foreground再試行と残す手動範囲は [§10](#10-phase-4-確認と正規手順の採用2026-10-11) に記録する。
 以下の設計・blocker修正時の「未実行／利用者待ち」は各時点の履歴であり、現在の採用状態ではない。
@@ -19,7 +21,7 @@ v4.4.0 / v4.5.0 の [検証記録](release-verification-records.md) は過去の
 
 ## 1. 目的・境界・簡素化
 
-採用済みの入口は次の一つ。利用者がrepository rootのPowerShellで実行する。
+repository経路の入口は次のとおり。利用者がrepository rootのPowerShellで実行する。
 
 ```powershell
 .\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved
@@ -770,3 +772,75 @@ UI／I/O変更版の実データ、実タイトルバー[×]／tray復帰、変�
 手動確認は§7のまま。AI／GPU変更版は `-IncludeFirstAi` を明示し、未実施を記録する。
 閾値・証跡必須条件は緩和しない。foreground失敗や段別内訳不足を隠さず、FAIL／SKIPPED／警告を残す。
 エージェントの明示実行了承、normal-profile起動禁止、使い捨てportableと実設定保護も維持する。
+
+<a id="relcheck-subpc-kit"></a>
+
+## 11. サブPC向けキット（2026-11-21）
+
+メインPCで診断portableを準備し、計測をサブPCへ移す。サブPCにはWindows、Python 3.10以上が必要。
+git・cargo・ソースツリー・PATH上のFFmpegは不要。キットはローカルディスクへ丸ごとコピーして使い、
+`\\tsclient\C\...` の共有上では計測しない。メインPCとサブPCではGPU・画面・RDP条件が違うため数値を比較しない。
+判定の閾値・7ケース・タイムアウト・seed復元・marker／exe／PID／HWND／foreground照合は従来と同じ。
+
+### メインPC: 作成（計測・起動なし）
+
+```powershell
+# 必要なら先に診断portableをbuild。これはキット作成とは別の操作。
+.\scripts\prepare-portable-smoke.ps1 -TestScript
+.\scripts\relcheck-kit\New-ReleaseCheckKit.ps1
+# 別worktreeの診断artifactを使う場合:
+.\scripts\relcheck-kit\New-ReleaseCheckKit.ps1 -ArtifactRepo C:\home\release-worktree -FfmpegPath C:\tools\ffmpeg\ffmpeg.exe
+```
+
+既定出力は `C:\home\mimageviewer-subpc\relcheck\relcheck-<artifact HEAD先頭9桁>-<UTC日時>`。
+作成側の `scripts/` とartifact側の指紋対象ソースはコミット済み・cleanを要求する。
+`ArtifactRepo` の実ソース指紋とpackage manifest、5本のexe hashを照合し、古ければ作成を拒否する。
+作成スクリプト自身はbuildもmIV起動もしない。ffmpegは既定ではPATHから探し、`-version`だけを実行する。
+
+キットには `scripts/`、`target/portable-smoke-package/`（data除外）、FFmpeg CLIと同じフォルダのDLL、
+`source-fingerprint-records.txt`、`release-check-kit.json` とそのSHA-256を格納する。
+recordsはLF結合のUTF-8 BOMなし・末尾改行なし。そのバイト列のhashが診断artifactのソース指紋に一致する。
+JSONにはscriptsとartifactそれぞれのHEAD、artifact manifest、全ファイルの相対path・hash・sizeを記録する。
+reparse pointは拒否し、コピー途中の失敗は停止する。部分キットの自動再開・修復はしない。
+
+### サブPC: 環境確認と計測
+
+コピーしたキットrootで実行する。環境確認も使い捨ての窓を2つ表示して前面を切り替えるので、
+エージェント実行では、その前面試験についても実行了承を得る。mIV・キー入力・マウス入力は使わない。
+子の前面取得と、子からrunnerへの `AllowSetForegroundWindow` 後の親窓の前面取得を確認する。
+子は30秒で自動終了し、親も自身の子PIDだけを後始末する。Python・FFmpeg・desktop成立・RDP・画面・DPI・CPU・GPU・OSをJSONへ記録する。
+
+```powershell
+.\scripts\relcheck-kit\Test-SubPcEnvironment.ps1
+# READY=exit 0、NOT_READY=exit 2。理由とJSONを確認してから、了承済みsuiteを実行。
+.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -FromKit -InteractiveApproved
+```
+
+環境JSONの既定は `target/ui-smoke/env-probe.json`。不変キットの照合対象外に置くため、
+当初指定の `target/relcheck-env/env-probe.json` から変更した。`-OutputPath` は任意指定できるが、
+キット内なら `target/ui-smoke/` に置く。それ以外へ追加したファイルはキット照合で拒否される。
+
+`-FromKit` はReleaseChecks専用で、`-SkipBuild` の有無によらずbuildしない。
+最初のpreflightでキットJSON自身のhash・全ファイル・records・package manifest・exeを照合し、
+prepare後にもキットを再検証する。samplerもキット照合から期待指紋を取得する。
+キットroot直下の `.git` は拒否する。repoモードは従来どおり照合の各時点で実ソース指紋を計算する。
+runtime出力 `target/portable-smoke/` と `target/ui-smoke/`、`__pycache__/`、`*.pyc` はhash一覧から除外する。
+kitモードは `PYTHONDONTWRITEBYTECODE=1` で動かし、FFmpegは検証済みの同梱exeだけを使う。
+
+全ファイル照合は欠け・余分・改変の検出であり、外部署名ではない。作成時に表示したキットpathとJSONのhashも
+引き継ぎ記録に残す。結果にはexecution mode、kit ID／manifest hash／scripts HEAD／artifact HEAD、画面とRDPを記録する。
+過去のexecution mode未記録データはrepoモードとして読める。kit情報欠落や未知modeは環境不成立。
+
+### メインPC: 結果の受け取り（読み取りだけ）
+
+サブPCの `target/ui-smoke/runs/<run-id>/` 全体をメインPCへ戻し、作成時のキットを指定する。
+
+```powershell
+.\scripts\relcheck-kit\Receive-ReleaseCheckResult.ps1 -Kit C:\home\mimageviewer-subpc\relcheck\relcheck-<id> -Result C:\home\returned-run
+```
+
+キット自身とsuite-inputのkit ID／manifest hash／core hash／ソース指紋を照合し、不一致はexit 1。
+一致時はsummaryのverdictとexit code、release-recordのpathを表示し、summaryの0／1／2をそのまま返す。
+再解析・再実行・正本への追記はしない。
+
+今回の実装確認は非対話の偽キット／解析／構文確認だけ。実キット作成とサブPCでの前面試験・suiteの実走は未実施。

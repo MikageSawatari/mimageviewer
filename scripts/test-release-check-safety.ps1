@@ -1,5 +1,6 @@
 # Noninteractive safety regressions: fake processes and argument parsing only.
-# No apps, helpers, foreground operations, builds or real process commands run.
+# No mIV, desktop probes, foreground operations or builds run. Child shells only
+# exercise argument guards, fake-package copying and read-only result validation.
 [CmdletBinding()]
 param()
 $ErrorActionPreference='Stop'
@@ -237,7 +238,9 @@ Assert-True ($cases.Count -eq 1 -and $cases[0].verdict -eq 'FAIL' -and $cases[0]
     $cases=New-Object 'Collections.Generic.List[object]'
     $script:fakeArchived=New-Object 'Collections.Generic.List[string]'
     function Assert-NoSmokeProcess {}
-    function Assert-ReleaseCheckArtifact {param($Repo)}
+    $FromKit=$false
+    function Get-MivSourceFingerprint {param($Repo) 'fake-source-fingerprint'}
+    function Assert-ReleaseCheckArtifact {param($Repo,$ExpectedSourceFingerprint)}
     function New-Item {param($ItemType,$Path)}
     function Get-Command {param($Name,$ErrorAction) [pscustomobject]@{Source='fake-python'}}
     function Invoke-UiSmokeCapturedProcess {
@@ -390,4 +393,187 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
     Assert-True ($report.verdict -eq 'SKIPPED' -and $report.environment_errors -contains 'fake lost runner background') 'Lost background condition was erased by successful clock proof.'
     Assert-True ($report.sleep_start_unix_ms -eq 1 -and $report.sleep_end_unix_ms -eq 2 -and $script:fakeClockConverted -and $report.evidence.clock.included) 'Window failure discarded independent UTC/sleep/clock evidence.'
 }
-Write-Host 'release-check safety: PASS (approval, path, exact PID/start time, lifetime windows and clock routing; no applications/process commands)'
+& {
+    . (Join-Path $PSScriptRoot 'relcheck-kit\KitSupport.ps1')
+    $testRoot=Join-Path ([IO.Path]::GetTempPath()) ('miv-kit-safety-'+[Guid]::NewGuid().ToString('N'))
+    $utf8=New-Object Text.UTF8Encoding($false)
+    function Write-FakeFile {
+        param([string]$Path,[string]$Text)
+        New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force | Out-Null
+        [IO.File]::WriteAllText($Path,$Text,$utf8)
+    }
+    function Seal-FakeKit {
+        param([string]$Root,$Manifest)
+        $Manifest.files=@(Get-ReleaseCheckKitFileRecords $Root)
+        $json=Join-Path $Root 'release-check-kit.json'
+        Write-FakeFile $json ($Manifest|ConvertTo-Json -Depth 20)
+        Write-FakeFile (Join-Path $Root 'release-check-kit.sha256') ((Get-FileHash -LiteralPath $json -Algorithm SHA256).Hash.ToLowerInvariant()+"`n")
+    }
+    function New-FakeKit {
+        param([string]$Name)
+        $root=Join-Path $testRoot $Name
+        Write-FakeFile (Join-Path $root 'scripts\fake.ps1') '# fake ASCII script'
+        Write-FakeFile (Join-Path $root 'tools\ffmpeg\ffmpeg.exe') 'fake ffmpeg; never execute'
+        Write-FakeFile (Join-Path $root 'source-fingerprint-records.txt') "src/fake.rs`t012345"
+        $fingerprint=(Get-FileHash -LiteralPath (Join-Path $root 'source-fingerprint-records.txt') -Algorithm SHA256).Hash.ToLowerInvariant()
+        $build=[ordered]@{schema_version=1;artifact_flavor='portable-test-script';cargo_profile='release';features=@('portable','test-script');source_head=('a'*40);source_fingerprint_sha256=$fingerprint}
+        foreach($entry in ([ordered]@{core='mimageviewer.exe';remote='mimageviewer-remote.exe';epub_worker='mimageviewer-epub-pdf.exe';mcp='mimageviewer-mcp.exe';musicvideo='mimageviewer-musicvideo.exe'}).GetEnumerator()){
+            $file=Join-Path $root ('target\portable-smoke-package\'+$entry.Value)
+            Write-FakeFile $file ('fake '+$entry.Key)
+            $build[$entry.Key+'_sha256']=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+        Write-FakeFile (Join-Path $root 'target\portable-smoke-package\.test-script-build.json') ($build|ConvertTo-Json -Depth 5)
+        $manifest=[ordered]@{schema_version=1;kit_id='relcheck-fake';scripts_source_head=('b'*40);artifact=@{source_head=('a'*40);source_fingerprint_sha256=$fingerprint;manifest=$build};ffmpeg=@{};files=@()}
+        Seal-FakeKit $root $manifest
+        return $root
+    }
+    function Invoke-FakeResultReceiver {
+        param([string]$KitPath,[string]$ResultPath)
+        $result=Invoke-KitSafetyChild @('-File',(Join-Path $PSScriptRoot 'relcheck-kit\Receive-ReleaseCheckResult.ps1'),'-Kit',$KitPath,'-Result',$ResultPath)
+        return $result.code
+    }
+    function Invoke-KitSafetyChild {
+        param([string[]]$Arguments)
+        # Expected child stderr must not become a terminating PS5 NativeCommandError.
+        $ErrorActionPreference='Continue'
+        $output=& powershell -NoProfile -ExecutionPolicy Bypass @Arguments 2>&1
+        return [pscustomobject]@{code=$LASTEXITCODE;text=($output -join ' ')}
+    }
+    try{
+        $root=New-FakeKit 'valid'
+        $fingerprint=Assert-ReleaseCheckKit $root
+        Assert-True ($fingerprint.Length -eq 64) 'Valid fake kit rejected.'
+        foreach($relative in @('scripts\__pycache__\x.pyc','scripts\nested\extra.pyc','target\ui-smoke\runs\fake\result.json','target\portable-smoke\data\fake.db')){
+            Write-FakeFile (Join-Path $root $relative) 'runtime output'
+        }
+        Assert-True ((Assert-ReleaseCheckKit $root) -eq $fingerprint) 'Runtime/Python outputs invalidated kit.'
+        # Successful kit preparation also needs no Cargo.toml or build script.
+        $prepare=Join-Path $root 'scripts\prepare-portable-smoke.ps1'
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'prepare-portable-smoke.ps1') -Destination $prepare
+        $manifest=Get-Content -LiteralPath (Join-Path $root 'release-check-kit.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+        Seal-FakeKit $root $manifest
+        foreach($prepareArgs in @(@('-FromKit','-TestScript'),@('-FromKit','-TestScript','-SkipBuild'))){
+            $child=Invoke-KitSafetyChild (@('-File',$prepare)+$prepareArgs)
+            Assert-True ($child.code -eq 0) ('Kit preparation attempted build/version lookup: '+$child.text)
+            $marker=Get-Content -LiteralPath (Join-Path $root 'target\portable-smoke\data\.disposable-smoke-data') -Raw -Encoding ASCII
+            Assert-True ($marker.Trim() -eq 'mimageviewer-disposable-smoke-v1;test-script=true') 'Kit preparation lost isolation marker.'
+            $null=Assert-ReleaseCheckKit $root
+        }
+        # Exercise the real kit-only preflight branches without desktop/native work.
+        foreach($relative in @('Run.ps1','Sampler.ps1')){
+            $ast=Get-TestAst (Join-Path $PSScriptRoot ('ui-smoke\release-checks\'+$relative))
+            $kitBranches=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.IfStatementAst] -and
+                $n.Clauses[0].Item1.Extent.Text -eq '$FromKit' -and
+                $n.Clauses[0].Item2.Extent.Text.Contains('Assert-ReleaseCheckKit $repo')},$true))
+            Assert-True ($kitBranches.Count -ge 1) "Kit preflight missing: $relative"
+            & {
+                $FromKit=$true;$repo=$root;$scripts=$PSScriptRoot
+                function Get-MivSourceFingerprint {throw 'Kit preflight invoked git/source fingerprinting.'}
+                $oldBytecode=$env:PYTHONDONTWRITEBYTECODE
+                try{
+                    . ([scriptblock]::Create($kitBranches[0].Clauses[0].Item2.Extent.Text.TrimStart('{').TrimEnd('}')))
+                    Assert-True ($expectedFingerprint -eq $fingerprint -and $env:PYTHONDONTWRITEBYTECODE -eq '1') 'Kit preflight lost verified fingerprint/bytecode policy.'
+                }finally{$env:PYTHONDONTWRITEBYTECODE=$oldBytecode}
+            }
+        }
+        Import-ReleaseCheckFunctions (Join-Path $PSScriptRoot 'relcheck-kit\New-ReleaseCheckKit.ps1') @('Copy-KitTree')
+        $source=Join-Path $testRoot 'copy-source';$destination=Join-Path $testRoot 'copy-scripts'
+        Write-FakeFile (Join-Path $source 'keep.ps1') '# keep'
+        Write-FakeFile (Join-Path $source '__pycache__\ignore.pyc') 'ignore'
+        Write-FakeFile (Join-Path $source 'nested\ignore.pyc') 'ignore'
+        Write-FakeFile (Join-Path $source 'data\ignore.db') 'package user data'
+        Copy-KitTree $source $destination -Scripts
+        Assert-True ((Test-Path -LiteralPath (Join-Path $destination 'keep.ps1')) -and -not (Test-Path -LiteralPath (Join-Path $destination '__pycache__')) -and -not (Test-Path -LiteralPath (Join-Path $destination 'nested\ignore.pyc'))) 'Script copy included bytecode or lost scripts.'
+        $destination=Join-Path $testRoot 'copy-package'
+        Copy-KitTree $source $destination -Package
+        Assert-True (-not (Test-Path -LiteralPath (Join-Path $destination 'data')) -and (Test-Path -LiteralPath (Join-Path $destination 'keep.ps1'))) 'Package copy included user data or lost payload.'
+        # The source-cleanliness path list is derived from the same AST as fingerprinting.
+        $ast=Get-TestAst (Join-Path $PSScriptRoot 'build-portable.ps1')
+        $function=$ast.Find({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-MivSourceFingerprintRecords'},$true)
+        $assignments=@($function.FindAll({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$sourcePaths'},$true))
+        Assert-True ($assignments.Count -eq 1) 'Cannot derive fingerprint source path list.'
+        $sourcePaths=@(& ([scriptblock]::Create($assignments[0].Right.Extent.Text)))
+        Assert-True ($sourcePaths.Count -gt 0 -and $sourcePaths -contains 'Cargo.toml' -and $sourcePaths -contains 'vendor/twemoji') 'Fingerprint source path AST extraction failed.'
+        foreach($mutation in @('byte','missing','extra','records','digest','package-fingerprint','git','exe')){
+            $root=New-FakeKit $mutation
+            $manifest=Get-Content -LiteralPath (Join-Path $root 'release-check-kit.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+            switch($mutation){
+                'byte' {Write-FakeFile (Join-Path $root 'scripts\fake.ps1') '! fake ASCII script'}
+                'missing' {Remove-Item -LiteralPath (Join-Path $root 'scripts\fake.ps1')}
+                'extra' {Write-FakeFile (Join-Path $root 'extra.txt') 'extra'}
+                'records' {
+                    Write-FakeFile (Join-Path $root 'source-fingerprint-records.txt') 'altered records'
+                    Seal-FakeKit $root $manifest # isolate records-to-fingerprint validation
+                }
+                'digest' {Write-FakeFile (Join-Path $root 'release-check-kit.sha256') ('0'*64)}
+                'package-fingerprint' {
+                    $path=Join-Path $root 'target\portable-smoke-package\.test-script-build.json'
+                    $build=Get-Content -LiteralPath $path -Encoding UTF8 -Raw | ConvertFrom-Json
+                    $build.source_fingerprint_sha256='0'*64
+                    Write-FakeFile $path ($build|ConvertTo-Json -Depth 5)
+                    Seal-FakeKit $root $manifest
+                }
+                'git' {New-Item -ItemType Directory -Path (Join-Path $root '.git') | Out-Null}
+                'exe' {
+                    Write-FakeFile (Join-Path $root 'target\portable-smoke-package\mimageviewer.exe') 'altered executable'
+                    Seal-FakeKit $root $manifest # manifest hashes must still match binaries
+                }
+            }
+            Assert-Throws {Assert-ReleaseCheckKit $root} "Kit mutation accepted: $mutation"
+        }
+        $root=New-FakeKit 'receiver'
+        $result=Join-Path $testRoot 'returned-run'
+        $manifest=Get-Content -LiteralPath (Join-Path $root 'release-check-kit.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+        $meta=[ordered]@{execution_mode='kit';kit=@{kit_id=$manifest.kit_id;kit_manifest_sha256=(Get-Content -LiteralPath (Join-Path $root 'release-check-kit.sha256') -Raw).Trim()};exe_sha256=$manifest.artifact.manifest.core_sha256;artifact=@{source_fingerprint_sha256=$manifest.artifact.source_fingerprint_sha256}}
+        Write-FakeFile (Join-Path $result 'suite-input.json') (@{metadata=$meta}|ConvertTo-Json -Depth 10)
+        foreach($code in @(0,1,2)){
+            Write-FakeFile (Join-Path $result 'summary.json') (@{verdict=@('PASS','FAIL','SKIPPED')[$code];exit_code=$code}|ConvertTo-Json)
+            Assert-True ((Invoke-FakeResultReceiver $root $result) -eq $code) "Receiver lost summary exit code $code"
+        }
+        Write-FakeFile (Join-Path $result 'summary.json') '{"verdict":"PASS","exit_code":0}'
+        $meta.kit.kit_id='wrong-kit'
+        Write-FakeFile (Join-Path $result 'suite-input.json') (@{metadata=$meta}|ConvertTo-Json -Depth 10)
+        Assert-True ((Invoke-FakeResultReceiver $root $result) -eq 1) 'Receiver accepted wrong kit ID.'
+        $meta.kit.kit_id=$manifest.kit_id;$meta.exe_sha256='0'*64
+        Write-FakeFile (Join-Path $result 'suite-input.json') (@{metadata=$meta}|ConvertTo-Json -Depth 10)
+        Assert-True ((Invoke-FakeResultReceiver $root $result) -eq 1) 'Receiver accepted wrong exe hash.'
+
+        # Only invalid argument combinations are run; guards precede all UI/build work.
+        $child=Invoke-KitSafetyChild @('-File',(Join-Path $PSScriptRoot 'ui-smoke.ps1'),'-Scenario','MultiWindowPdf','-FromKit','-InteractiveApproved')
+        Assert-True ($child.code -eq 2 -and $child.text -like '*FromKit is valid only*') 'FromKit reached a non-ReleaseChecks scenario.'
+        foreach($args in @(@('-FromKit'),@('-FromKit','-TestScript'))){
+            # A copied prepare script has no kit JSON and no build script.
+            $prepare=Join-Path $testRoot 'no-kit\scripts\prepare-portable-smoke.ps1'
+            New-Item -ItemType Directory -Path (Split-Path -Parent $prepare) -Force | Out-Null
+            Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'prepare-portable-smoke.ps1') -Destination $prepare -Force
+            $child=Invoke-KitSafetyChild (@('-File',$prepare)+$args)
+            Assert-True ($child.code -eq 1 -and $child.text -match '(requires -TestScript|kit manifest missing)') 'Invalid kit prepare passed its early guard.'
+        }
+        $ast=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1')
+        $calls=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Assert-ReleaseCheckArtifact'},$true))
+        Assert-True ($calls.Count -eq 3) 'Artifact call inventory changed; review all paths.'
+        foreach($call in $calls){
+            $parameters=@($call.CommandElements | Where-Object {$_ -is [Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'ExpectedSourceFingerprint'})
+            Assert-True ($parameters.Count -eq 1) 'Artifact call lacks explicit fingerprint.'
+        }
+        $sampler=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Sampler.ps1')
+        $calls=@($sampler.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Assert-ReleaseCheckArtifact'},$true))
+        Assert-True ($calls.Count -eq 1 -and $calls[0].Extent.Text.Contains('-ExpectedSourceFingerprint')) 'Sampler lost explicit fingerprint.'
+        $runnerText=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1') -Encoding UTF8 -Raw
+        $healthText=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'check-idle-health.ps1') -Encoding UTF8 -Raw
+        Assert-True ($runnerText.Contains("if(`$FromKit){`$samplerArgs+='-FromKit'}") -and $healthText.Contains('-FromKit:$FromKit')) 'Kit mode did not reach the idle sampler.'
+        Assert-Throws {Assert-ReleaseCheckArtifact 'unused' -ExpectedSourceFingerprint ''} 'Empty fingerprint accepted.'
+        foreach($relative in @('relcheck-kit\KitSupport.ps1','relcheck-kit\New-ReleaseCheckKit.ps1','relcheck-kit\Receive-ReleaseCheckResult.ps1','relcheck-kit\Test-SubPcEnvironment.ps1','relcheck-kit\ForegroundProbeChild.ps1','prepare-portable-smoke.ps1','ui-smoke.ps1','ui-smoke\release-checks\Run.ps1','ui-smoke\release-checks\Support.ps1','ui-smoke\release-checks\Sampler.ps1','check-idle-health.ps1','test-release-check-safety.ps1')){
+            $path=Join-Path $PSScriptRoot $relative
+            $null=Get-TestAst $path
+            Assert-True (@([IO.File]::ReadAllBytes($path) | Where-Object {$_ -gt 127}).Count -eq 0) "Non-ASCII PowerShell: $relative"
+        }
+    }finally{
+        # Remove only our resolved GUID tree; never recurse through reparse points.
+        $full=[IO.Path]::GetFullPath($testRoot)
+        $prefix=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')+'\'
+        Assert-True ($full.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase) -and (Split-Path -Leaf $full) -match '^miv-kit-safety-[0-9a-f]{32}$') 'Unsafe test cleanup path.'
+        if(Test-Path -LiteralPath $full){$null=Get-ReleaseCheckKitFileRecords $full;Remove-Item -LiteralPath $full -Recurse -Force}
+    }
+}
+Write-Host 'release-check safety: PASS (approval, kit hashes, argument guards, returned results, exact PID/HWND, lifetime and clock routing; no application or desktop interaction)'

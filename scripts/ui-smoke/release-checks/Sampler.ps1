@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param([string]$Scenario, [string]$TargetKey, [int]$ProcessId,
     [datetime]$ExpectedStartTimeUtc, [string]$SleepEvidencePath, [string]$OutputDirectory,
-    [long]$RootHwnd, [long]$BackgroundHwnd, [int]$BackgroundProcessId, [string]$CaseId, [switch]$InteractiveApproved)
+    [long]$RootHwnd, [long]$BackgroundHwnd, [int]$BackgroundProcessId, [string]$CaseId, [switch]$InteractiveApproved, [switch]$FromKit)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 if (-not $InteractiveApproved -or $ProcessId -le 0) { exit 2 }
@@ -16,7 +16,12 @@ $data = Join-Path $repo 'target\portable-smoke\data'
 $preflight=Invoke-ReleaseCheckPreflight {
 Assert-ReleaseCheckPaths $repo $exe $data $OutputDirectory
 $null = Assert-ExactPath $SleepEvidencePath (Join-Path $OutputDirectory 'completion.json') 'release-sleep-evidence'
-Assert-ReleaseCheckArtifact $repo
+if($FromKit){
+    . (Join-Path $scripts 'relcheck-kit\KitSupport.ps1')
+    $expectedFingerprint=Assert-ReleaseCheckKit $repo
+    $env:PYTHONDONTWRITEBYTECODE='1'
+}else{$expectedFingerprint=Get-MivSourceFingerprint $repo}
+Assert-ReleaseCheckArtifact $repo -ExpectedSourceFingerprint $expectedFingerprint
 Initialize-ReleaseCheckNative
 }
 if($preflight.exit_code -ne 0){

@@ -1061,6 +1061,14 @@ def summarize_suite(cases: list[dict], metadata: dict | None = None) -> dict:
         result["environment_errors"].append("run metadata must be an object")
         metadata = {}
     result["metadata"] = metadata or {}
+    mode = result["metadata"].get("execution_mode", "repo")
+    if mode not in ("repo", "kit"):
+        result["environment_errors"].append("invalid execution_mode: expected repo or kit")
+    if mode == "kit":
+        kit = result["metadata"].get("kit")
+        for field in ("kit_id", "kit_manifest_sha256", "scripts_source_head", "artifact_source_head"):
+            if not isinstance(kit, dict) or not isinstance(kit.get(field), str) or not kit[field].strip():
+                result["environment_errors"].append(f"required kit metadata missing: {field}")
     result["cases"] = cases
     for field in ("source", "exe_sha256", "fixture_version", "environment", "run_path", "approval_scope", "thresholds_version"):
         if not result["metadata"].get(field):
@@ -1110,6 +1118,23 @@ def release_record(result: dict) -> str:
              f"release + portable,test-script、fixture {meta.get('fixture_version', '未記録')}。",
              f"  環境 {meta.get('environment', '未記録')}、run {meta.get('run_path', '未記録')}、"
              f"了承範囲 {meta.get('approval_scope', '未記録')}、閾値 {meta.get('thresholds_version', '未記録')}。"]
+    environment = meta.get("environment")
+    environment = environment if isinstance(environment, dict) else {}
+    screen = environment.get("primary_screen", "未記録")
+    remote_session = environment.get("remote_session")
+    remote = "はい" if remote_session is True else "いいえ" if remote_session is False else "未記録"
+    if meta.get("execution_mode", "repo") == "kit":
+        kit = meta.get("kit")
+        kit = kit if isinstance(kit, dict) else {}
+        lines.append(f"  実行: サブ PC のキット {kit.get('kit_id', '未記録')} "
+                     f"(kit manifest {str(kit.get('kit_manifest_sha256', '未記録'))[:12]}、"
+                     f"scripts {str(kit.get('scripts_source_head', '未記録'))[:9]}、"
+                     f"artifact {str(kit.get('artifact_source_head', '未記録'))[:9]})。"
+                     f"画面 {screen}、RDP セッション {remote}。"
+                     "数値はサブ PC の記録どうしでだけ比べ、メイン PC の記録とは比べない (GPU・画面・RDP が違う)。")
+    else:
+        detail = f" (画面 {screen}、RDP セッション {remote})" if environment.get("primary_screen") else ""
+        lines.append(f"  実行: repository{detail}。")
     for case in result.get("cases", []):
         lines.append(f"- **{case.get('case_id', '?')}**: {case.get('verdict', 'SKIPPED')}。")
         metrics = case.get("metrics") if isinstance(case.get("metrics"), dict) else {}

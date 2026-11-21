@@ -1,6 +1,6 @@
 # Sequential, disposable suite; never uses process-name activation or global instance IPC.
 [CmdletBinding()]
-param([switch]$InteractiveApproved, [switch]$SkipBuild, [switch]$IncludeFirstAi,
+param([switch]$InteractiveApproved, [switch]$SkipBuild, [switch]$IncludeFirstAi, [switch]$FromKit,
     [ValidateRange(30,3600)][int]$TimeoutSeconds=360)
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version 2
@@ -14,6 +14,11 @@ $smoke=Join-Path $repo 'target\portable-smoke'
 $exe=Join-Path $smoke 'mimageviewer.exe'; $data=Join-Path $smoke 'data'
 $run=Join-Path $repo ('target\ui-smoke\runs\release-checks-'+[DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')+'-'+[Guid]::NewGuid().ToString('N').Substring(0,8))
 $preflight=Invoke-ReleaseCheckPreflight {
+if($FromKit){
+    . (Join-Path $scripts 'relcheck-kit\KitSupport.ps1')
+    $script:expectedFingerprint=Assert-ReleaseCheckKit $repo
+    $env:PYTHONDONTWRITEBYTECODE='1'
+}
 Assert-ReleaseCheckPaths $repo $exe $data $run
 Initialize-ReleaseCheckNative
 # Read-only preflight happens before prepare/build/fixture generation.
@@ -31,6 +36,11 @@ $lock=$preflight.value
 $cases=New-Object 'Collections.Generic.List[object]'
 $owned=$null; $ownedStart=$null; $background=$null; $activeDir=$null
 $metadata=[ordered]@{suite='ReleaseChecks'; include_first_ai=[bool]$IncludeFirstAi; run_directory=$run; approval_scope='5 idle + 2 perf + stopped-profile seed sessions'; started_utc=[DateTime]::UtcNow.ToString('o'); os=[Environment]::OSVersion.VersionString; window_size=@(1328,900); dpi_by_case=@{}; cpu_names=@(); gpu_names=@()}
+$metadata.execution_mode=if($FromKit){'kit'}else{'repo'}
+if($FromKit){
+    $kit=Get-Content -LiteralPath (Join-Path $repo 'release-check-kit.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+    $metadata.kit=@{kit_id=$kit.kit_id;kit_manifest_sha256=(Get-Content -LiteralPath (Join-Path $repo 'release-check-kit.sha256') -Encoding ASCII -Raw).Trim();scripts_source_head=$kit.scripts_source_head;artifact_source_head=$kit.artifact.source_head}
+}
 
 function Assert-NoSmokeProcess {
     foreach($p in (Get-Process -ErrorAction Stop)) {
@@ -91,7 +101,7 @@ function Restore-ReleaseSeed {
     $null=Assert-ExactPath $data (Join-Path $repo 'target\portable-smoke\data') 'release-restore'
     Remove-Item -LiteralPath $data -Recurse -Force
     Copy-Item -LiteralPath $Seed -Destination $data -Recurse
-    Assert-ReleaseCheckArtifact $repo
+    Assert-ReleaseCheckArtifact $repo -ExpectedSourceFingerprint $(if($FromKit){$script:expectedFingerprint}else{Get-MivSourceFingerprint $repo})
 }
 function Complete-ReleaseSession {
     param([string]$CaseId,[string]$Directory)
@@ -115,7 +125,7 @@ function Complete-ReleaseSession {
 function Invoke-ReleaseSession {
     param([string]$CaseId,[string]$Overlay,[bool]$Idle)
     Assert-NoSmokeProcess
-    Assert-ReleaseCheckArtifact $repo
+    Assert-ReleaseCheckArtifact $repo -ExpectedSourceFingerprint $(if($FromKit){$script:expectedFingerprint}else{Get-MivSourceFingerprint $repo})
     $dir=Join-Path $run $CaseId
     New-Item -ItemType Directory -Path $dir | Out-Null
     $cacheProof=Invoke-UiSmokeCapturedProcess (Get-Command python -ErrorAction Stop).Source @(
@@ -188,6 +198,7 @@ function Invoke-ReleaseSession {
             }
             $scenario=if($CaseId.StartsWith('tray-')){'tray-residency'}else{$CaseId}
             $samplerArgs=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $scripts 'check-idle-health.ps1'),'-PortableSmoke','-InteractiveApproved','-SkipPrompt','-Scenario',$scenario,'-CaseId',$CaseId,'-ProcessId',[string]$script:owned.Id,'-ExpectedStartTimeUtc',$script:ownedStart.ToString('o'),'-SleepEvidencePath',(Join-Path $dir 'completion.json'),'-OutputDirectory',$dir,'-RootHwnd',[string]$r.root_hwnd,'-BackgroundHwnd',[string]$backgroundHwnd)
+            if($FromKit){$samplerArgs+='-FromKit'}
             if($backgroundHwnd -ne 0){$samplerArgs+=@('-BackgroundProcessId',[string]$PID)}
             if($CaseId -eq 'video-pin-background'){$samplerArgs+=@('-TargetKey',[string]$r.target_key)}
             # Separate host preserves the suite even when the sampler exits.
@@ -212,13 +223,22 @@ try {
     Assert-NoSmokeProcess
     $metadata.cpu_names=@(Get-CimInstance Win32_Processor -ErrorAction Stop | ForEach-Object {$_.Name})
     $metadata.gpu_names=@(Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object {$_.Name})
+    Add-Type -AssemblyName System.Windows.Forms
+    $screen=[Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $metadata.remote_session=[MivReleaseCheckNative]::GetSystemMetrics(0x1000) -ne 0
+    $metadata.primary_screen=('{0}x{1}' -f $screen.Width,$screen.Height)
     $prepare=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $scripts 'prepare-portable-smoke.ps1'),'-TestScript')
+    if($FromKit){$prepare+='-FromKit'}
     if($SkipBuild){$prepare+='-SkipBuild'}
     $prepareProcess=Start-Process -FilePath ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -ArgumentList (Join-NativeArguments $prepare) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run 'prepare.stdout.log') -RedirectStandardError (Join-Path $run 'prepare.stderr.log')
     $null=$prepareProcess.Handle  # cache the handle so ExitCode is available after exit
     $prepareProcess.WaitForExit()
     if($prepareProcess.ExitCode -ne 0){throw 'Portable preparation failed.'}
-    Assert-ReleaseCheckArtifact $repo
+    if($FromKit){
+        . (Join-Path $scripts 'relcheck-kit\KitSupport.ps1')
+        $null=Assert-ReleaseCheckKit $repo
+    }
+    Assert-ReleaseCheckArtifact $repo -ExpectedSourceFingerprint $(if($FromKit){$script:expectedFingerprint}else{Get-MivSourceFingerprint $repo})
     $metadata.artifact=Get-Content -LiteralPath (Join-Path $smoke '.test-script-build.json') -Encoding UTF8 -Raw | ConvertFrom-Json
     $metadata.source=$metadata.artifact.source_head+'/'+$metadata.artifact.source_fingerprint_sha256
     $metadata.exe_sha256=$metadata.artifact.core_sha256
@@ -226,7 +246,7 @@ try {
     $metadata.thresholds_version=(Get-FileHash -LiteralPath (Join-Path $scripts 'idle_health_thresholds.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     Copy-Item -LiteralPath (Join-Path $smoke '.test-script-build.json') -Destination (Join-Path $run 'test-script-build.json')
     $fixture=Join-Path $run 'fixture'
-    $ffmpeg=(Get-Command ffmpeg.exe -ErrorAction Stop).Source
+    $ffmpeg=if($FromKit){Join-Path $repo 'tools\ffmpeg\ffmpeg.exe'}else{(Get-Command ffmpeg.exe -ErrorAction Stop).Source}
     & python (Join-Path $scripts 'ui-smoke\generate_release_checks_fixture.py') --output $fixture --ffmpeg $ffmpeg
     if($LASTEXITCODE -ne 0){throw 'Fixture generation failed.'}
     & python (Join-Path $scripts 'ui-smoke\generate_release_checks_fixture.py') --output $fixture --verify
@@ -288,7 +308,7 @@ try {
     if($script:background){$script:background.Close();$script:background.Dispose()}
     $lock.Dispose()
 }
-$metadata.environment=@{os=$metadata.os;cpu=$metadata.cpu_names;gpu=$metadata.gpu_names;window_size=$metadata.window_size;dpi_by_case=$metadata.dpi_by_case}
+$metadata.environment=@{os=$metadata.os;cpu=$metadata.cpu_names;gpu=$metadata.gpu_names;window_size=$metadata.window_size;dpi_by_case=$metadata.dpi_by_case;remote_session=$metadata['remote_session'];primary_screen=$metadata['primary_screen']}
 Write-ReleaseCheckJson (Join-Path $run 'suite-input.json') @{metadata=$metadata;cases=@($cases.ToArray())}
 & python (Join-Path $scripts 'release_check_analysis.py') summary (Join-Path $run 'suite-input.json') --json-out (Join-Path $run 'summary.json') --markdown-out (Join-Path $run 'release-record.md')
 Write-Host "ReleaseChecks evidence: $run"

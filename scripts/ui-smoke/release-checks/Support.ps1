@@ -64,13 +64,14 @@ function Assert-ReleaseCheckPaths {
 }
 
 function Assert-ReleaseCheckArtifact {
-    param([string]$RepoRoot)
+    param([string]$RepoRoot,[string]$ExpectedSourceFingerprint)
+    if([string]::IsNullOrWhiteSpace($ExpectedSourceFingerprint)){throw 'Expected source fingerprint is required.'}
     $smoke = Join-Path $RepoRoot 'target\portable-smoke'
     Assert-NoReparsePath $smoke $RepoRoot 'release-artifact'
     Assert-NoReparseTree $smoke 'release-artifact'
     $marker = Join-Path $smoke 'data\.disposable-smoke-data'
     if ((Get-Content -LiteralPath $marker -Encoding ASCII -Raw).Trim() -ne 'mimageviewer-disposable-smoke-v1;test-script=true') { throw 'Disposable test-script marker mismatch.' }
-    Assert-SmokeBuildManifest (Join-Path $smoke '.test-script-build.json') (Get-MivSourceFingerprint $RepoRoot) `
+    Assert-SmokeBuildManifest (Join-Path $smoke '.test-script-build.json') $ExpectedSourceFingerprint `
         (Join-Path $smoke 'mimageviewer.exe') (Join-Path $smoke 'mimageviewer-remote.exe') (Join-Path $smoke 'mimageviewer-epub-pdf.exe') `
         (Join-Path $smoke 'mimageviewer-mcp.exe') (Join-Path $smoke 'mimageviewer-musicvideo.exe')
 }
@@ -111,9 +112,12 @@ public static class MivReleaseCheckNative {
  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr w);
  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr w);
  [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr w);
+ [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
+ [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
+ [DllImport("user32.dll")] public static extern bool AllowSetForegroundWindow(uint pid);
  public delegate bool EnumProc(IntPtr w,IntPtr p);
  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc c,IntPtr p);
- [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr w,StringBuilder b,int n);
+ [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr w,StringBuilder b,int n);
  [StructLayout(LayoutKind.Sequential)] public struct Rect { public int L,T,R,B; }
  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr w,out Rect r);
  public static int[] Counts(uint pid){int total=0,visible=0;EnumWindows((w,p)=>{uint id;GetWindowThreadProcessId(w,out id);if(id==pid){total++;if(IsWindowVisible(w)){var b=new StringBuilder(256);GetClassName(w,b,256);Rect r;var c=b.ToString();if(c!="IME"&&c!="MSCTFIME UI"&&c!="Winit Thread Event Target"&&GetWindowRect(w,out r)&&r.R-r.L>=64&&r.B-r.T>=64)visible++;}}return true;},IntPtr.Zero);return new[]{total,visible};}

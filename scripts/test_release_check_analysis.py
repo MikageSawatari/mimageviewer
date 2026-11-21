@@ -1382,6 +1382,40 @@ class CliTests(unittest.TestCase):
             self.assertEqual(json.loads((path / "summary.json").read_text(encoding="utf-8"))["schema_version"], 1)
             self.assertIn("synthetic", (path / "release-record.md").read_text(encoding="utf-8"))
 
+    def test_execution_mode_records_and_validation(self):
+        cases = [finish(report(c)) for c in REQUIRED_CASES]
+        meta = metadata()
+        legacy = summarize_suite(cases, meta)
+        self.assertEqual(legacy["exit_code"], 0)
+        self.assertIn("  実行: repository。", release_record(legacy))
+        meta["execution_mode"] = "repo"
+        meta["environment"] = {"primary_screen": "1920x1080", "remote_session": False}
+        self.assertIn("  実行: repository (画面 1920x1080、RDP セッション いいえ)。",
+                      release_record(summarize_suite(cases, meta)))
+        meta["execution_mode"] = "kit"
+        meta["environment"]["remote_session"] = True
+        meta["kit"] = {"kit_id": "relcheck-test", "kit_manifest_sha256": "a" * 64,
+                       "scripts_source_head": "b" * 40, "artifact_source_head": "c" * 40}
+        result = summarize_suite(cases, meta)
+        self.assertEqual(result["exit_code"], 0)
+        line = release_record(result).splitlines()[3]
+        self.assertEqual(line, "  実行: サブ PC のキット relcheck-test (kit manifest aaaaaaaaaaaa、"
+                         "scripts bbbbbbbbb、artifact ccccccccc)。画面 1920x1080、RDP セッション はい。"
+                         "数値はサブ PC の記録どうしでだけ比べ、メイン PC の記録とは比べない (GPU・画面・RDP が違う)。")
+        for field in meta["kit"]:
+            with self.subTest(missing=field):
+                invalid = {**meta, "kit": {k: v for k, v in meta["kit"].items() if k != field}}
+                result = summarize_suite(cases, invalid)
+                self.assertEqual(result["exit_code"], 2)
+                self.assertIn(f"required kit metadata missing: {field}", result["environment_errors"])
+        for kit in (None, "invalid", {}):
+            with self.subTest(kit=kit):
+                self.assertEqual(summarize_suite(cases, {**meta, "kit": kit})["exit_code"], 2)
+        meta["execution_mode"] = "unknown"
+        result = summarize_suite(cases, meta)
+        self.assertEqual(result["exit_code"], 2)
+        self.assertIn("invalid execution_mode: expected repo or kit", result["environment_errors"])
+
     def test_metadata_missing_or_requested_ai_absent_prohibits_suite_pass(self):
         cases = [finish(report(c)) for c in REQUIRED_CASES]
         self.assertEqual(summarize_suite(cases)["verdict"], "SKIPPED")
