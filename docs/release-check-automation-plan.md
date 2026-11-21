@@ -780,7 +780,8 @@ UI／I/O変更版の実データ、実タイトルバー[×]／tray復帰、変�
 利用者決定 (2026-11-21): 次回から、公開前に ReleaseChecks をサブ PC で流す。メイン PC では診断 portable の
 build (約 7.5 分) の直後に計測が急に始まり、その間 PC に触れなくなるため。運用の手順は
 [リリース手順チェックリスト](release-checklist.md) 9.6、サブ PC への依頼文は [雛形](subpc-release-checks-brief.md)。
-本節はキットの仕組みと、照合で何を担保しているかの正本。
+本節はキットの仕組みと、照合で何を担保しているかの正本。サブ PC で流すことは手順の決定であって常設の実行了承ではなく、
+毎回の了承は [実行確認](interactive-release-verification.md) の「サブ PC のキットで流す ReleaseChecks」に従う。
 
 ### 簡素化の検討
 
@@ -857,7 +858,7 @@ suite と同じ前面の操作を使い捨ての窓 2 つで再現する: runner
 ```
 
 キットが作成時のままであること、`suite-input.json` と `summary.json` の kit ID・manifest hash・core hash・指紋がキットと一致すること、
-verdict と終了コードの対応、`release-record.md` があることを確かめる。終了コードは summary の 0 (PASS / PASS_WITH_WARNINGS)・
+verdict と終了コードの対応、`release-record.md` の中身が `summary.json` から生成し直したものと一致すること (別 run の記録の取り違え) を確かめる。終了コードは summary の 0 (PASS / PASS_WITH_WARNINGS)・
 1 (FAIL)・2 (SKIPPED) をそのまま返し、受け取りの不成立 (キット違い・JSON の欠け) は 3。再解析・再実行はしない。
 
 ### 数値の扱い

@@ -132,8 +132,9 @@ try{
     # Match the GUI suite launch: no console, and no STARTUPINFO SW_HIDE that
     # could suppress the Form's first ShowWindow.
     $child=Start-Process -FilePath $probeExe -ArgumentList (Join-NativeArguments $arguments) -PassThru
-    $null=$child.Handle
+    # One launch-time deadline covers both HWND publication and foreground.
     $clock=[Diagnostics.Stopwatch]::StartNew()
+    $null=$child.Handle
     $windowPath=$readyPath+'.window'
     while(-not $child.HasExited -and -not (Test-Path -LiteralPath $windowPath -PathType Leaf) -and $clock.Elapsed.TotalSeconds -lt 20){
         Start-Sleep -Milliseconds 100;$child.Refresh()
@@ -145,7 +146,6 @@ try{
     $null=[MivReleaseCheckNative]::GetWindowThreadProcessId($childHwnd,[ref]$windowOwner)
     if($windowReady.pid -ne $child.Id -or $childHwnd -eq [IntPtr]::Zero -or $windowOwner -ne $child.Id){throw 'Child Form HWND owner mismatch.'}
     $report.child_pid=$child.Id;$report.child_hwnd=$childHwnd.ToInt64()
-    $clock.Restart()
     while(-not $child.HasExited -and -not $report.child_foreground -and $clock.Elapsed.TotalSeconds -le 20){
         $report.child_foreground_attempts++
         $report.child_set_foreground_return=[MivReleaseCheckNative]::SetForegroundWindow($childHwnd)

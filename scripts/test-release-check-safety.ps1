@@ -435,6 +435,21 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
         $result=Invoke-KitSafetyChild @('-File',(Join-Path $PSScriptRoot 'relcheck-kit\Receive-ReleaseCheckResult.ps1'),'-Kit',$KitPath,'-Result',$ResultPath)
         return $result.code
     }
+    function Write-FakeReleaseRecord {
+        param([string]$KitPath,[string]$ResultPath,[string]$SummaryPath)
+        if(-not $SummaryPath){$SummaryPath=Join-Path $ResultPath 'summary.json'}
+        $generate=@'
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from release_check_analysis import release_record
+summary = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
+Path(sys.argv[3]).write_text(release_record(summary), encoding='utf-8')
+'@
+        & python -I -B -c $generate (Join-Path $KitPath 'scripts') $SummaryPath (Join-Path $ResultPath 'release-record.md')
+        Assert-True ($LASTEXITCODE -eq 0) 'Could not generate fixture release record.'
+    }
     function Invoke-KitSafetyChild {
         param([string[]]$Arguments)
         # Expected child stderr must not become a terminating PS5 NativeCommandError.
@@ -560,15 +575,50 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
         $root=New-FakeKit 'receiver'
         $result=Join-Path $testRoot 'returned-run'
         $manifest=Get-Content -LiteralPath (Join-Path $root 'release-check-kit.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+        foreach($name in @('release_check_analysis.py','analyze_perf.py')){
+            Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $root ('scripts\'+$name))
+        }
+        Seal-FakeKit $root $manifest
         $meta=[ordered]@{execution_mode='kit';kit=@{kit_id=$manifest.kit_id;kit_manifest_sha256=(Get-Content -LiteralPath (Join-Path $root 'release-check-kit.sha256') -Raw).Trim();scripts_source_head=$manifest.scripts_source_head;artifact_source_head=$manifest.artifact.source_head};exe_sha256=$manifest.artifact.manifest.core_sha256;source=($manifest.artifact.manifest.source_head+'/'+$manifest.artifact.source_fingerprint_sha256);run_path='C:\sub-pc\kit\target\ui-smoke\runs\fake';artifact=@{source_fingerprint_sha256=$manifest.artifact.source_fingerprint_sha256}}
         Write-FakeFile (Join-Path $result 'suite-input.json') (@{metadata=$meta}|ConvertTo-Json -Depth 10)
-        Write-FakeFile (Join-Path $result 'release-record.md') 'fake release record'
         foreach($entry in (@{PASS=0;PASS_WITH_WARNINGS=0;FAIL=1;SKIPPED=2}).GetEnumerator()){
             Write-FakeFile (Join-Path $result 'summary.json') (@{verdict=$entry.Key;exit_code=$entry.Value;metadata=$meta}|ConvertTo-Json -Depth 10)
+            Write-FakeReleaseRecord $root $result
             Assert-True ((Invoke-FakeResultReceiver $root $result) -eq $entry.Value) "Receiver lost verified summary verdict $($entry.Key)"
         }
         $validSummary=@{verdict='PASS';exit_code=0;metadata=$meta}|ConvertTo-Json -Depth 10
         $validSuite=@{metadata=$meta}|ConvertTo-Json -Depth 10
+        Write-FakeFile (Join-Path $result 'summary.json') $validSummary
+        Write-FakeReleaseRecord $root $result
+        $recordPath=Join-Path $result 'release-record.md'
+        $validRecord=[IO.File]::ReadAllText($recordPath)
+        foreach($record in @($validRecord.Replace("`r`n","`n"),$validRecord.Replace("`r`n","`n").Replace("`n","`r`n"))){
+            Write-FakeFile $recordPath $record
+            $before=(Get-FileHash -LiteralPath $recordPath -Algorithm SHA256).Hash
+            Assert-True ((Invoke-FakeResultReceiver $root $result) -eq 0) 'Receiver rejected matching release record/newline normalization.'
+            Assert-True ((Get-FileHash -LiteralPath $recordPath -Algorithm SHA256).Hash -eq $before) 'Receiver rewrote the release record.'
+        }
+        $otherSummary=$validSummary|ConvertFrom-Json
+        $otherSummary.metadata.run_path='C:\sub-pc\kit\target\ui-smoke\runs\other'
+        $otherSummaryPath=Join-Path $testRoot 'other-run-summary.json'
+        Write-FakeFile $otherSummaryPath ($otherSummary|ConvertTo-Json -Depth 10)
+        Write-FakeReleaseRecord $root $result $otherSummaryPath
+        Assert-True ((Invoke-FakeResultReceiver $root $result) -eq 3) 'Receiver accepted another run release record.'
+        Write-FakeFile $recordPath ('+'+$validRecord.Substring(1))
+        Assert-True ((Invoke-FakeResultReceiver $root $result) -eq 3) 'Receiver accepted a one-character release record change.'
+        Write-FakeFile $recordPath 'fake release record'
+        Assert-True ((Invoke-FakeResultReceiver $root $result) -eq 3) 'Receiver accepted an arbitrary release record.'
+        Write-FakeFile $recordPath $validRecord
+        $invalidRendering=$validSummary|ConvertFrom-Json
+        $invalidRendering | Add-Member -MemberType NoteProperty -Name cases -Value @(1)
+        Write-FakeFile (Join-Path $result 'summary.json') ($invalidRendering|ConvertTo-Json -Depth 10)
+        Assert-True ((Invoke-FakeResultReceiver $root $result) -eq 3) 'Receiver accepted a release_record generation failure.'
+        Write-FakeFile (Join-Path $result 'summary.json') $validSummary
+        $noPython=Join-Path $testRoot 'receive-without-python.ps1'
+        Write-FakeFile $noPython 'param($Receiver,$Kit,$Result) $env:PATH=""; & $Receiver -Kit $Kit -Result $Result; exit $LASTEXITCODE'
+        $missingPython=Invoke-KitSafetyChild @('-File',$noPython,'-Receiver',(Join-Path $PSScriptRoot 'relcheck-kit\Receive-ReleaseCheckResult.ps1'),'-Kit',$root,'-Result',$result)
+        Assert-True ($missingPython.code -eq 3) 'Receiver did not classify missing Python as validation failure.'
+        $null=Assert-ReleaseCheckKit $root # isolated imports did not create bytecode
         foreach($field in @('execution_mode','kit_id','kit_manifest_sha256','scripts_source_head','artifact_source_head','exe_sha256','source','run_path')){
             foreach($which in @('summary-only','both')){
                 $summary=$validSummary|ConvertFrom-Json
@@ -705,6 +755,12 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
             foreach($call in $pythonCalls){Assert-True ($call.Extent.StartOffset -gt $assignments[0].Extent.StartOffset) "Python starts before bytecode policy: $relative"}
         }
         $probe=Get-TestAst (Join-Path $PSScriptRoot 'relcheck-kit\Test-SubPcEnvironment.ps1')
+        $receiver=Get-TestAst (Join-Path $PSScriptRoot 'relcheck-kit\Receive-ReleaseCheckResult.ps1')
+        $renderCalls=@($receiver.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.Extent.Text.StartsWith('& $python ')},$true))
+        Assert-True ($renderCalls.Count -eq 1 -and $renderCalls[0].Extent.Text.Contains('-I -B -c $recordCheck')) 'Receiver Python is not isolated with bytecode disabled.'
+        $bytecodePolicy=@($receiver.FindAll({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and $n.Left.Extent.Text -eq '$env:PYTHONDONTWRITEBYTECODE'},$true))
+        Assert-True ($bytecodePolicy.Count -eq 1 -and $bytecodePolicy[0].Right.Extent.Text -eq "'1'" -and
+            $bytecodePolicy[0].Extent.StartOffset -lt $renderCalls[0].Extent.StartOffset) 'Receiver Python bytecode environment policy is missing or late.'
         $launches=@($probe.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Start-Process'},$true))
         Assert-True ($launches.Count -eq 1 -and -not ($launches[0].CommandElements | Where-Object {$_ -is [Management.Automation.Language.CommandParameterAst] -and $_.ParameterName -eq 'WindowStyle'})) 'Foreground child launch still uses STARTUPINFO WindowStyle.'
         $transitions=@($probe.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Set-ReleaseCheckBackgroundForeground'},$true))
@@ -741,6 +797,17 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
         Assert-True ($focusLoops.Count -eq 1 -and $focusLoops[0].Condition.Extent.Text.Contains('$clock.Elapsed.TotalSeconds -le 20') -and
             $focusLoops[0].Body.Extent.Text.Contains('Start-Sleep -Milliseconds 100') -and
             $focusLoops[0].Body.Extent.Text.Contains('Get-ReleaseCheckWindowSample $child.Id')) 'Child foreground acquisition is not a 20-second/100ms exact-window loop.'
+        $windowLoops=@($probe.FindAll({param($n)$n -is [Management.Automation.Language.WhileStatementAst] -and
+            $n.Condition.Extent.Text.Contains('$windowPath')},$true))
+        Assert-True ($windowLoops.Count -eq 1 -and $windowLoops[0].Condition.Extent.Text.Contains('$clock.Elapsed.TotalSeconds -lt 20')) 'HWND publication does not use the foreground deadline.'
+        $clockStarts=@($probe.FindAll({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and
+            $n.Left.Extent.Text -eq '$clock'},$true))
+        Assert-True ($clockStarts.Count -eq 1 -and $clockStarts[0].Extent.StartOffset -gt $launches[0].Extent.EndOffset -and
+            $clockStarts[0].Extent.EndOffset -lt $windowLoops[0].Extent.StartOffset) 'Foreground clock does not start directly after child launch.'
+        $earlyResets=@($probe.FindAll({param($n)$n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
+            $n.Expression.Extent.Text -eq '$clock' -and $n.Member.Extent.Text -in @('Restart','Reset','Start') -and
+            $n.Extent.StartOffset -gt $clockStarts[0].Extent.StartOffset -and $n.Extent.StartOffset -lt $focusLoops[0].Extent.EndOffset},$true))
+        Assert-True ($earlyResets.Count -eq 0) 'HWND publication resets the launch-time foreground deadline.'
         $elapsed=@($probe.FindAll({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and
             $n.Left.Extent.Text -eq '$report.child_foreground_elapsed_ms'},$true))
         Assert-True ($elapsed.Count -eq 1) 'Foreground elapsed time is not recorded.'
@@ -770,6 +837,19 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
             & ([scriptblock]::Create($elapsed[0].Extent.Text))
             Assert-True (-not $report.child_foreground -and $report.child_foreground_attempts -eq 2 -and
                 $report.child_foreground_elapsed_ms -eq 22000) 'Foreground loop ignored its deadline or accepted another HWND.'
+            # Spend 18 seconds waiting for .window, then use only the remaining
+            # launch-time budget for foreground. No native/window work runs.
+            $windowPath='fake-window-ready'
+            function Test-Path {param($LiteralPath,$PathType) Assert-True ($LiteralPath -eq $windowPath) 'Unexpected HWND publication path.';return $script:probeFakeMs -ge 18000}
+            $script:probeFakeMs=0;$script:probeFakeSleepStep=6000;$script:probeFakeSleeps=0;$script:probeFakeSamples=0
+            & ([scriptblock]::Create($windowLoops[0].Extent.Text))
+            Assert-True ($script:probeFakeMs -eq 18000 -and $script:probeFakeSleeps -eq 3) 'HWND wait fixture did not consume 18 seconds.'
+            $script:probeFakeSleepStep=1000
+            $report=@{child_foreground=$false;child_foreground_attempts=0}
+            & ([scriptblock]::Create($focusLoops[0].Extent.Text))
+            & ([scriptblock]::Create($elapsed[0].Extent.Text))
+            Assert-True (-not $report.child_foreground -and $report.child_foreground_attempts -eq 3 -and
+                $report.child_foreground_elapsed_ms -eq 21000) 'HWND waiting granted another 20 seconds instead of sharing the foreground deadline.'
         }
         & {
             # Execute only the real cleanup block with fake handles/processes.

@@ -3,8 +3,8 @@
 リリース前の性能チェック ReleaseChecks をサブ PC で流すときの依頼文の雛形 (2026-11-21〜)。
 統括はリリースごとに `<...>` を埋めて `C:\home\mimageviewer-subpc\relcheck\<kit-id>-brief.md` に置き、
 `python scripts/write_utf8_bom.py <そのファイル>` で BOM を付けてから、サブ PC 担当 (Remote Control の
-「mImageViewer 実機確認」セッション) へ SendMessage で場所を伝える。依頼を送る前に、利用者へ一言伝える
-([リリース手順チェックリスト](release-checklist.md) 9.6)。
+「mImageViewer 実機確認」セッション) へ SendMessage で場所を伝える。依頼を送る前に、キット・事前確認と本番・見込み時間を利用者へ示して
+了承をもらい、その範囲を依頼文に書く ([実行確認](interactive-release-verification.md) の「サブ PC のキットで流す ReleaseChecks」)。
 
 手順の背景とキットの仕組みは [自動化計画 §11](release-check-automation-plan.md#relcheck-subpc-kit)。
 サブ PC 担当の一般の決まりは [subpc-test-brief.md](subpc-test-brief.md)。
@@ -42,6 +42,7 @@ mIV の窓を前面にできずに止まることがメイン PC で分かって
 出ますが、クリックしないでください。
 
 キット: `<kit-id>` (メイン PC のソース `<artifact のコミット>`、scripts `<scripts のコミット>`)。
+利用者の了承 (<日時>): このキットで、事前確認 1 回と本番 1 回を流す。再試行はしない。
 キットの manifest の SHA-256: `<release-check-kit.sha256 の値>`。
 
 ## 0. 最初に返してほしいこと
@@ -66,7 +67,8 @@ Get-Content C:\miv-relcheck\<kit-id>\release-check-kit.sha256
 cd C:\miv-relcheck\<kit-id>
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\relcheck-kit\Test-SubPcEnvironment.ps1
 ```
-使い捨ての小さな窓が 2 つ出て、前面が切り替わり、30 秒以内に閉じます。最後の行が `READY` か `NOT_READY` です。
+使い捨ての小さな窓が 2 つ出て、前面が切り替わり、30 秒以内に閉じます。`READY:` か `NOT_READY:` で始まる行が結果で、
+終了コード (`$LASTEXITCODE`) は READY = 0、NOT_READY = 2 です。
 `target\ui-smoke\env-probe.json` の中身を結果に付けてください。
 **`NOT_READY` なら本番へ進まず**、そのまま結果を返してください。回避の工夫 (別の起動方法・設定の変更) はしないでください。
 

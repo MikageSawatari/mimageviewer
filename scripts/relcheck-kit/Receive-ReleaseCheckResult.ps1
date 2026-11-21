@@ -35,6 +35,28 @@ try{
         $summary.verdict -cnotin @('PASS','PASS_WITH_WARNINGS','FAIL','SKIPPED') -or
         $summary.exit_code -isnot [int] -or $summary.exit_code -ne $codes[$summary.verdict]){throw 'Invalid summary verdict/exit code.'}
     if(-not (Test-Path -LiteralPath (Join-Path $Result 'release-record.md') -PathType Leaf)){throw 'release-record.md is missing.'}
+    $python=(Get-Command python -ErrorAction Stop).Source
+    $env:PYTHONDONTWRITEBYTECODE='1'
+    # -I ignores PYTHON* variables, so -B also enforces the bytecode policy.
+    # Render in memory and compare in Python to avoid console encoding changes.
+    $recordCheck=@'
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from release_check_analysis import release_record
+
+summary = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8-sig'))
+expected = release_record(summary)
+actual = Path(sys.argv[3]).read_text(encoding='utf-8')
+def normalize(text):
+    return text.replace('\r\n', '\n').replace('\r', '\n')
+if normalize(actual) != normalize(expected):
+    raise ValueError('release-record.md does not match summary.json.')
+'@
+    & $python -I -B -c $recordCheck (Join-Path $Kit 'scripts') (Join-Path $Result 'summary.json') (Join-Path $Result 'release-record.md')
+    if($LASTEXITCODE -ne 0){throw 'Release record generation/validation failed.'}
     Write-Host "Verdict: $($summary.verdict); exit code: $($summary.exit_code)"
     Write-Host ('Release record: '+(Join-Path $Result 'release-record.md'))
     exit $summary.exit_code
