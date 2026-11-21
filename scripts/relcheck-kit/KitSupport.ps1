@@ -24,6 +24,10 @@ function Get-ReleaseCheckKitFileRecords {
     while($pending.Count){
         $item=$pending.Pop()
         if($item.Attributes -band [IO.FileAttributes]::ReparsePoint){throw "Kit contains a reparse point: $($item.FullName)"}
+        if(($item.PSIsContainer -and $item.Name -eq '__pycache__') -or
+            (-not $item.PSIsContainer -and $item.Name -like '*.pyc')){
+            throw "Kit contains extra Python bytecode (__pycache__ / *.pyc): $($item.FullName)"
+        }
         if($item.PSIsContainer){
             foreach($child in (Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop)){$pending.Push($child)}
             continue
@@ -31,8 +35,7 @@ function Get-ReleaseCheckKitFileRecords {
         $relative=$item.FullName.Substring($root.Length+1).Replace('\','/')
         # Still inspect excluded trees for reparse points; never follow links.
         if($relative -in @('release-check-kit.json','release-check-kit.sha256') -or
-            $relative -match '^(target/portable-smoke/|target/ui-smoke/)' -or
-            $relative -match '(^|/)__pycache__/' -or $relative -like '*.pyc'){continue}
+            $relative -match '^(target/portable-smoke/|target/ui-smoke/)'){continue}
         $files.Add($relative,[pscustomobject][ordered]@{path=$relative;sha256=(Get-FileHash -LiteralPath $item.FullName -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant();size=$item.Length})
     }
     [string[]]$paths=@($files.Keys)
@@ -40,13 +43,15 @@ function Get-ReleaseCheckKitFileRecords {
     foreach($path in $paths){$files[$path]}
 }
 
-function Assert-ReleaseCheckKit {
-    param([Alias('Kit')][string]$KitRoot)
+function Read-ReleaseCheckKitManifest {
+    param([string]$KitRoot)
     $root=[IO.Path]::GetFullPath($KitRoot).TrimEnd('\','/')
     Assert-ReleaseCheckKitNoReparsePath $root
     if(Test-Path -LiteralPath (Join-Path $root '.git')){throw 'FromKit refuses a repository root (.git exists).'}
-    # Enumerate first, so even the two manifest files cannot be reparse points.
-    $actual=@(Get-ReleaseCheckKitFileRecords $root)
+    # Bounded sampler validation: inspect only manifest/record paths, never the tree.
+    foreach($relative in @('release-check-kit.json','release-check-kit.sha256','source-fingerprint-records.txt','target\portable-smoke-package\.test-script-build.json')){
+        Assert-ReleaseCheckKitNoReparsePath (Join-Path $root $relative)
+    }
     $jsonPath=Join-Path $root 'release-check-kit.json'
     $digest=Get-Content -LiteralPath (Join-Path $root 'release-check-kit.sha256') -Encoding ASCII -Raw -ErrorAction Stop
     if($digest -cnotmatch '\A[0-9a-f]{64}(\r?\n)?\z' -or
@@ -55,13 +60,6 @@ function Assert-ReleaseCheckKit {
     }
     $kit=Get-Content -LiteralPath $jsonPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
     if($kit.schema_version -ne 1){throw 'Unsupported kit schema.'}
-    $expected=@($kit.files)
-    if($expected.Count -ne $actual.Count){throw 'Kit file count mismatch (missing or extra files).'}
-    for($i=0;$i -lt $actual.Count;$i++){
-        if($expected[$i].path -cne $actual[$i].path -or $expected[$i].sha256 -cne $actual[$i].sha256 -or
-            $expected[$i].size -ne $actual[$i].size){throw "Kit file mismatch: $($actual[$i].path)"}
-    }
-    if(@($actual | Where-Object {$_.path -ceq 'tools/ffmpeg/ffmpeg.exe'}).Count -ne 1){throw 'Kit ffmpeg.exe missing.'}
     $fingerprint=[string]$kit.artifact.source_fingerprint_sha256
     if($fingerprint -cnotmatch '\A[0-9a-f]{64}\z' -or $fingerprint -cne
         (Get-FileHash -LiteralPath (Join-Path $root 'source-fingerprint-records.txt') -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()){
@@ -79,11 +77,39 @@ function Assert-ReleaseCheckKit {
     foreach($field in @('source_head','source_fingerprint_sha256','core_sha256','remote_sha256','epub_worker_sha256','mcp_sha256','musicvideo_sha256')){
         if([string]::IsNullOrWhiteSpace([string]$manifest.$field) -or $manifest.$field -cne $recorded.$field){throw "Kit artifact manifest mismatch: $field"}
     }
+    if(($manifest | ConvertTo-Json -Depth 20 -Compress) -cne ($recorded | ConvertTo-Json -Depth 20 -Compress)){
+        throw 'Kit artifact manifest content mismatch.'
+    }
+    return $kit
+}
+
+function Get-ReleaseCheckKitExpectedFingerprint {
+    param([string]$KitRoot)
+    $kit=Read-ReleaseCheckKitManifest $KitRoot
+    return [string]$kit.artifact.source_fingerprint_sha256
+}
+
+function Assert-ReleaseCheckKit {
+    param([Alias('Kit')][string]$KitRoot)
+    $root=[IO.Path]::GetFullPath($KitRoot).TrimEnd('\','/')
+    Assert-ReleaseCheckKitNoReparsePath $root
+    if(Test-Path -LiteralPath (Join-Path $root '.git')){throw 'FromKit refuses a repository root (.git exists).'}
+    $actual=@(Get-ReleaseCheckKitFileRecords $root)
+    $kit=Read-ReleaseCheckKitManifest $root
+    $expected=@($kit.files)
+    if($expected.Count -ne $actual.Count){throw 'Kit file count mismatch (missing or extra files).'}
+    for($i=0;$i -lt $actual.Count;$i++){
+        if($expected[$i].path -cne $actual[$i].path -or $expected[$i].sha256 -cne $actual[$i].sha256 -or
+            $expected[$i].size -ne $actual[$i].size){throw "Kit file mismatch: $($actual[$i].path)"}
+    }
+    if(@($actual | Where-Object {$_.path -ceq 'tools/ffmpeg/ffmpeg.exe'}).Count -ne 1){throw 'Kit ffmpeg.exe missing.'}
+    $package=Join-Path $root 'target\portable-smoke-package'
+    $manifest=$kit.artifact.manifest
     $executables=[ordered]@{core='mimageviewer.exe';remote='mimageviewer-remote.exe';epub_worker='mimageviewer-epub-pdf.exe';mcp='mimageviewer-mcp.exe';musicvideo='mimageviewer-musicvideo.exe'}
     foreach($entry in $executables.GetEnumerator()){
         if($manifest.($entry.Key+'_sha256') -cne (Get-FileHash -LiteralPath (Join-Path $package $entry.Value) -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()){
             throw "Kit executable hash mismatch: $($entry.Value)"
         }
     }
-    return $fingerprint
+    return [string]$kit.artifact.source_fingerprint_sha256
 }

@@ -30,6 +30,10 @@ command lineに`--perf-log`があるという事実だけではPASSにしない�
 
 ### 正規手順: ReleaseChecks suite（2026-10-11採用、毎リリース）
 
+2026-11-21 から、公開前にサブ PC のキットで流す (`-FromKit`。手順は [リリース手順チェックリスト](release-checklist.md) 9.6、
+仕組みは [自動化計画 §11](release-check-automation-plan.md#relcheck-subpc-kit))。判定の条件と閾値は下記と同じ。
+サブ PC の数値はメイン PC の記録と比べない。以下はメイン PC の repository root で流す場合。
+
 利用者がrepository rootのPowerShellで実行する:
 
 ```powershell

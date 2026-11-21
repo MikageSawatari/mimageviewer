@@ -286,6 +286,11 @@ always-active guidance.
 - The canonical release idle/perf procedure is the user-run PowerShell command
   `scripts/ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved`; see
   `docs/release-checklist.md` Phase 2 9.6/9.7 and `docs/release-check-automation-plan.md`.
+  Since 2026-11-21 (user decision) it runs before publication on the sub-PC from
+  a verified kit (`scripts/relcheck-kit/New-ReleaseCheckKit.ps1` on the main PC,
+  `ui-smoke.ps1 -Scenario ReleaseChecks -FromKit -InteractiveApproved` on the
+  sub-PC, `Receive-ReleaseCheckResult.ps1` back on the main PC); the main-PC
+  command is the fallback when the sub-PC is unavailable.
   Minimize other application windows before starting and leave the PC untouched
   through build and run. Adoption does not grant agent launch approval or relax
   disposable-portable and real-settings protection; manual scripts remain the

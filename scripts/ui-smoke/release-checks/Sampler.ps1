@@ -18,7 +18,7 @@ Assert-ReleaseCheckPaths $repo $exe $data $OutputDirectory
 $null = Assert-ExactPath $SleepEvidencePath (Join-Path $OutputDirectory 'completion.json') 'release-sleep-evidence'
 if($FromKit){
     . (Join-Path $scripts 'relcheck-kit\KitSupport.ps1')
-    $expectedFingerprint=Assert-ReleaseCheckKit $repo
+    $expectedFingerprint=Get-ReleaseCheckKitExpectedFingerprint $repo
     $env:PYTHONDONTWRITEBYTECODE='1'
 }else{$expectedFingerprint=Get-MivSourceFingerprint $repo}
 Assert-ReleaseCheckArtifact $repo -ExpectedSourceFingerprint $expectedFingerprint

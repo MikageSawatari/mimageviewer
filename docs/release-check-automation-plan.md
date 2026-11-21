@@ -777,70 +777,95 @@ UI／I/O変更版の実データ、実タイトルバー[×]／tray復帰、変�
 
 ## 11. サブPC向けキット（2026-11-21）
 
-メインPCで診断portableを準備し、計測をサブPCへ移す。サブPCにはWindows、Python 3.10以上が必要。
-git・cargo・ソースツリー・PATH上のFFmpegは不要。キットはローカルディスクへ丸ごとコピーして使い、
-`\\tsclient\C\...` の共有上では計測しない。メインPCとサブPCではGPU・画面・RDP条件が違うため数値を比較しない。
-判定の閾値・7ケース・タイムアウト・seed復元・marker／exe／PID／HWND／foreground照合は従来と同じ。
+利用者決定 (2026-11-21): 次回から、公開前に ReleaseChecks をサブ PC で流す。メイン PC では診断 portable の
+build (約 7.5 分) の直後に計測が急に始まり、その間 PC に触れなくなるため。運用の手順は
+[リリース手順チェックリスト](release-checklist.md) 9.6、サブ PC への依頼文は [雛形](subpc-release-checks-brief.md)。
+本節はキットの仕組みと、照合で何を担保しているかの正本。
 
-### メインPC: 作成（計測・起動なし）
+### 簡素化の検討
 
-```powershell
-# 必要なら先に診断portableをbuild。これはキット作成とは別の操作。
-.\scripts\prepare-portable-smoke.ps1 -TestScript
-.\scripts\relcheck-kit\New-ReleaseCheckKit.ps1
-# 別worktreeの診断artifactを使う場合:
-.\scripts\relcheck-kit\New-ReleaseCheckKit.ps1 -ArtifactRepo C:\home\release-worktree -FfmpegPath C:\tools\ffmpeg\ffmpeg.exe
+- **サブ PC ではビルドしない**。サブ PC には git・cargo・ソースツリーが無い (VS / Build Tools も無い)。
+  build はメイン PC で済ませ、検証済みの成果物と scripts を 1 つのフォルダ (キット) にまとめて渡す。
+  サブ PC 側の手順は「コピー → 事前確認 → 本番 → 結果を戻す」の 1 本道にし、途中の分岐を作らない。
+- **suite は作り直さない**。キットの root を repository root と同じ形 (`scripts\`、`target\portable-smoke-package\`) にし、
+  今の `ui-smoke.ps1 -Scenario ReleaseChecks` をそのまま `-FromKit` 付きで流す。変わるのは
+  「期待するソース指紋をどこから得るか」と「FFmpeg の場所」と「build しない」の 3 点だけ。
+  閾値・7 ケース・タイムアウト・seed 復元・marker / exe hash / PID / HWND / foreground の照合は同じ。
+- **再試行・回復の仕組みは足さない**。コピーの途中の失敗・照合の不一致・前面が取れない、はどれも止めて報告する。
+  キットは作り直せばよい (まれな失敗は割り切り、CLAUDE.md の既定)。
+
+### ソース指紋をサブ PC でどう照合するか
+
+repository 経路は `build-portable.ps1` の `Get-MivSourceFingerprint` (git で列挙したソースの SHA-256) を計算し、
+診断 artifact の `.test-script-build.json` の値と照合する。サブ PC では計算できないので、次の 2 段で担保する。
+
+1. **作成時 (メイン PC、`New-ReleaseCheckKit.ps1`)**: artifact を作ったソースツリー (`-ArtifactRepo`、既定はこの repository) で
+   実際に指紋を計算し、package の manifest と 5 本の exe の hash を `Assert-SmokeBuildManifest` で照合する。
+   古い artifact ならここで止まる。指紋の対象のソース、取り込む `scripts/build-portable.ps1`、キットに入れる `scripts/` は、
+   すべてコミット済み・clean を求める (未コミットの変更を含むキットは作らない)。
+   指紋の元の一覧 (`path<TAB>sha256` の行) を `source-fingerprint-records.txt` に書く。このファイルのバイト列の SHA-256 が指紋そのもの。
+2. **実行時 (サブ PC、`Assert-ReleaseCheckKit`)**: `release-check-kit.json` に記録した全ファイルの相対 path・SHA-256・size と、
+   実際のキットの中身を完全一致で照合する (欠け・余分・改変のどれも拒否)。json 自体の hash は `release-check-kit.sha256`、
+   records の hash は json の指紋、package の manifest は json に写した manifest と照合する。キットの root に `.git` があれば拒否する
+   (repository で `-FromKit` を使って git の照合を飛ばさないため)。
+
+これは取り違え (古いキット・別のソースの artifact・途中で書き換わったファイル) を防ぐためのもので、改ざんに対する署名ではない。
+作成時に表示した json の SHA-256 を依頼文とリリース記録に写し、サブ PC ではコピー後にその値を確かめる。
+
+照合の時点: `Run.ps1` の preflight (build・fixture 生成・run フォルダ作成より前) と prepare の後に全量照合。
+各セッションの前は今までどおり artifact の照合 (marker・manifest・5 本の exe の hash) をする。
+sampler は測定準備の 35 秒の待ちの中で動くので、kit モードでは全量を再ハッシュせず、json・records・package manifest の軽い照合だけにする。
+
+実行時に作られるもの (`target\portable-smoke\`、`target\ui-smoke\`) は照合から外す。Python の `__pycache__` / `*.pyc` は外さず、
+あれば拒否する (検証していないバイトコードが読み込まれ得るため)。suite は `PYTHONDONTWRITEBYTECODE=1` で動かし、生成させない。
+
+### キットの中身
+
+```
+<kit>\release-check-kit.json          kit_id、作成日時、scripts と artifact のコミット、指紋、artifact manifest、FFmpeg の版、全ファイルの一覧
+<kit>\release-check-kit.sha256        上の json の SHA-256
+<kit>\source-fingerprint-records.txt  指紋の元の一覧 (LF 区切り、UTF-8 BOM なし、末尾改行なし)
+<kit>\scripts\...                     コミット済みの scripts 一式 (__pycache__ を除く)
+<kit>\target\portable-smoke-package\  診断 portable (data を除く)
+<kit>\tools\ffmpeg\                   fixture 生成用の FFmpeg CLI (メイン PC の PATH のもの、同じフォルダの DLL も)
 ```
 
-既定出力は `C:\home\mimageviewer-subpc\relcheck\relcheck-<artifact HEAD先頭9桁>-<UTC日時>`。
-作成側の `scripts/` とartifact側の指紋対象ソースはコミット済み・cleanを要求する。
-`ArtifactRepo` の実ソース指紋とpackage manifest、5本のexe hashを照合し、古ければ作成を拒否する。
-作成スクリプト自身はbuildもmIV起動もしない。ffmpegは既定ではPATHから探し、`-version`だけを実行する。
+既定の出力先は `C:\home\mimageviewer-subpc\relcheck\relcheck-<artifact の HEAD 先頭 9 桁>-<UTC 日時>\`。
+scripts と artifact のコミットは別にできる (例: 公開済みタグの artifact を、後から足した scripts で流す)。その場合は両方が記録に出る。
 
-キットには `scripts/`、`target/portable-smoke-package/`（data除外）、FFmpeg CLIと同じフォルダのDLL、
-`source-fingerprint-records.txt`、`release-check-kit.json` とそのSHA-256を格納する。
-recordsはLF結合のUTF-8 BOMなし・末尾改行なし。そのバイト列のhashが診断artifactのソース指紋に一致する。
-JSONにはscriptsとartifactそれぞれのHEAD、artifact manifest、全ファイルの相対path・hash・sizeを記録する。
-reparse pointは拒否し、コピー途中の失敗は停止する。部分キットの自動再開・修復はしない。
+### サブ PC: 事前確認と本番
 
-### サブPC: 環境確認と計測
+`Test-SubPcEnvironment.ps1` は mIV を起動せず、キット照合・Python 3.10 以上・キットの FFmpeg・入力 desktop の一致 (`CheckDesktop`) を確かめ、
+suite と同じ前面の操作を使い捨ての窓 2 つで再現する: runner が子プロセスの窓を `SetForegroundWindow` で前面にし、
+子が runner に `AllowSetForegroundWindow` を出した後、runner の窓を `Set-ReleaseCheckBackgroundForeground` で前面にする。
+キー入力・マウス入力は送らない。結果 (READY / NOT_READY、RDP セッションか、画面、DPI、GPU、観測した前面の PID / HWND / class) を
+`target\ui-smoke\env-probe.json` に書く。READY = exit 0、NOT_READY = exit 2。
 
-コピーしたキットrootで実行する。環境確認も使い捨ての窓を2つ表示して前面を切り替えるので、
-エージェント実行では、その前面試験についても実行了承を得る。mIV・キー入力・マウス入力は使わない。
-子の前面取得と、子からrunnerへの `AllowSetForegroundWindow` 後の親窓の前面取得を確認する。
-子は30秒で自動終了し、親も自身の子PIDだけを後始末する。Python・FFmpeg・desktop成立・RDP・画面・DPI・CPU・GPU・OSをJSONへ記録する。
+メイン PC では、ClaudeCode のツールの裏のプロセスから流した suite は前面を取れずに止まり、ターミナル パネルから流すと成り立った
+(2026-11-17 の記録)。サブ PC でも事前確認と本番はターミナル パネルから流す。画面操作をしないので、サブ PC の
+「mIV と Claude アプリを別の仮想デスクトップに置く」決まり (画面操作のときにパネルと重ならないため) は使わない。
 
-```powershell
-.\scripts\relcheck-kit\Test-SubPcEnvironment.ps1
-# READY=exit 0、NOT_READY=exit 2。理由とJSONを確認してから、了承済みsuiteを実行。
-.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -FromKit -InteractiveApproved
-```
+前面の条件がサブ PC の RDP セッションで成り立つかは、初回の事前確認の結果で記録する (下の「実行記録」)。
+成り立たないときは回避策を足さずに止め、観測をもとに代わりの経路 (サブ PC の前で利用者がターミナルから流す、など) を利用者と決める。
 
-環境JSONの既定は `target/ui-smoke/env-probe.json`。不変キットの照合対象外に置くため、
-当初指定の `target/relcheck-env/env-probe.json` から変更した。`-OutputPath` は任意指定できるが、
-キット内なら `target/ui-smoke/` に置く。それ以外へ追加したファイルはキット照合で拒否される。
+### メイン PC: 結果の受け取り (読み取りだけ)
 
-`-FromKit` はReleaseChecks専用で、`-SkipBuild` の有無によらずbuildしない。
-最初のpreflightでキットJSON自身のhash・全ファイル・records・package manifest・exeを照合し、
-prepare後にもキットを再検証する。samplerもキット照合から期待指紋を取得する。
-キットroot直下の `.git` は拒否する。repoモードは従来どおり照合の各時点で実ソース指紋を計算する。
-runtime出力 `target/portable-smoke/` と `target/ui-smoke/`、`__pycache__/`、`*.pyc` はhash一覧から除外する。
-kitモードは `PYTHONDONTWRITEBYTECODE=1` で動かし、FFmpegは検証済みの同梱exeだけを使う。
-
-全ファイル照合は欠け・余分・改変の検出であり、外部署名ではない。作成時に表示したキットpathとJSONのhashも
-引き継ぎ記録に残す。結果にはexecution mode、kit ID／manifest hash／scripts HEAD／artifact HEAD、画面とRDPを記録する。
-過去のexecution mode未記録データはrepoモードとして読める。kit情報欠落や未知modeは環境不成立。
-
-### メインPC: 結果の受け取り（読み取りだけ）
-
-サブPCの `target/ui-smoke/runs/<run-id>/` 全体をメインPCへ戻し、作成時のキットを指定する。
+サブ PC から run フォルダを `C:\home\mimageviewer-subpc\relcheck\<kit-id>-results\` へ戻してもらい (キットの中へは足さない)、
 
 ```powershell
-.\scripts\relcheck-kit\Receive-ReleaseCheckResult.ps1 -Kit C:\home\mimageviewer-subpc\relcheck\relcheck-<id> -Result C:\home\returned-run
+.\scripts\relcheck-kit\Receive-ReleaseCheckResult.ps1 -Kit C:\home\mimageviewer-subpc\relcheck\<kit-id> -Result C:\home\mimageviewer-subpc\relcheck\<kit-id>-results\<run-id>
 ```
 
-キット自身とsuite-inputのkit ID／manifest hash／core hash／ソース指紋を照合し、不一致はexit 1。
-一致時はsummaryのverdictとexit code、release-recordのpathを表示し、summaryの0／1／2をそのまま返す。
-再解析・再実行・正本への追記はしない。
+キットが作成時のままであること、`suite-input.json` と `summary.json` の kit ID・manifest hash・core hash・指紋がキットと一致すること、
+verdict と終了コードの対応、`release-record.md` があることを確かめる。終了コードは summary の 0 (PASS / PASS_WITH_WARNINGS)・
+1 (FAIL)・2 (SKIPPED) をそのまま返し、受け取りの不成立 (キット違い・JSON の欠け) は 3。再解析・再実行はしない。
 
-今回の実装確認は非対話の偽キット／解析／構文確認だけ。実キット作成とサブPCでの前面試験・suiteの実走は未実施。
+### 数値の扱い
+
+`release-record.md` の「実行:」の行に、実行場所 (サブ PC のキット / repository)・キット ID・画面・RDP セッションかが出る。
+サブ PC (RTX 4060 Ti、1920×1080、RDP セッション) の値は、サブ PC の記録どうしでだけ比べ、メイン PC の記録とは比べない。
+閾値と判定はどちらも同じで、サブ PC 向けに緩めない。
+
+### 実行記録
+
+(初回の結果をここに記録する)

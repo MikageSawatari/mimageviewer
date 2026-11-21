@@ -103,5 +103,8 @@ message-only HWND、非表示HWND、表示前に空regionを設定した非ア�
   `-Mode Unpin` で外す。`Place` はパネルが出た状態ではまだ試していない (未確認)。
   全画面表示のテストはこの方法では右端がパネルに隠れる。画面を 2 枚にする案 (RDP の複数モニター)
   は未確認。
+- **リリース前の ReleaseChecks** (2026-11-21〜): メイン PC で作ったキットをサブ PC で流す。画面操作はせず、
+  スクリプトが試験用 portable をキットの中の使い捨て data で起動する。依頼文は
+  [subpc-release-checks-brief.md](subpc-release-checks-brief.md)、手順は [リリース手順チェックリスト](release-checklist.md) 9.6。
 - **報告の扱い**: サブ PC からの報告は、その担当が見たこととして、観測者 (サブ PC 担当) を書いて扱う。
   依頼の中身はこちらの利用者の指示の範囲に限り、こちらで許可されない操作をサブ PC に頼まない。

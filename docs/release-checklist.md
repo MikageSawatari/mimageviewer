@@ -326,22 +326,51 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
      `python scripts/check_bench_regression.py vendor/bench_baseline.json run1.json run2.json run3.json`。
      **ノイズと判断した場合に `--save` で baseline を上書きしない** (`--save` は 1 ファイルだけ受け付ける)。
 
-9.6. **perf smoke** (正規手順は idle 5ケースと合わせた ReleaseChecks suite。毎リリース実施):
-   利用者が repository root の PowerShell で実行する:
-   ```powershell
-   .\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved
-   ```
-   - 診断portableのbuild、生成fixture／隔離dataのseed、5 idle、cached／uncached perf、通常終了・
+9.6. **perf smoke** (正規手順は idle 5ケースと合わせた ReleaseChecks suite。毎リリース実施。
+   **2026-11-21 から、公開前にサブ PC で流す**。利用者決定: メイン PC では build 直後に計測が急に始まり、
+   その間 PC に触れなくなるため):
+   1. **メイン PC で診断 portable とキットを作る** (計測も起動もしない)。配布ビルドの入力と同じコミットで作る。
+      作業ツリーの `scripts/` と、指紋の対象のソースがコミット済みで clean であること (違えばキット作成が止まる)。
+      ```powershell
+      .\scripts\prepare-portable-smoke.ps1 -TestScript
+      .\scripts\relcheck-kit\New-ReleaseCheckKit.ps1
+      ```
+      エージェントは 1 行目を `run-heavy.ps1` 経由で流す (約 7.5 分)。キットは
+      `C:\home\mimageviewer-subpc\relcheck\relcheck-<artifact の HEAD 先頭 9 桁>-<UTC 日時>\` にでき、
+      最後に表示される `Kit manifest SHA-256` を依頼文とリリース記録に写す。
+      別の worktree (例: タグの detached worktree) の artifact を使うときは `-ArtifactRepo <その root>` を付ける。
+   2. **統括がサブ PC 担当へ依頼する**。依頼文は [サブ PC の ReleaseChecks 依頼の雛形](subpc-release-checks-brief.md) から作る。
+      ほかのサブ PC 依頼・夜間試験の時間枠 (01:00〜07:00) と重ねない。メイン PC 側では RDP の接続を切らず、
+      RDP の窓を最小化しない (サブ PC の画面描画と前面の判定が成り立たなくなる)。メイン PC の作業は続けてよい。
+   3. **サブ PC 担当が流す** (雛形の手順): キットをローカルへコピー → `Test-SubPcEnvironment.ps1` (mIV を起動せず、
+      使い捨ての窓で前面の条件を確かめる) が READY なら、**ターミナル パネルから**
+      `.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -FromKit -InteractiveApproved` → run フォルダをメイン PC の
+      `C:\home\mimageviewer-subpc\relcheck\<kit-id>-results\` へ戻す。所要はコピーを除き約 10 分。
+      NOT_READY・SKIPPED は回避策を足さずに止め、観測を返してもらう。
+   4. **メイン PC で照合する** (読み取りだけ):
+      ```powershell
+      .\scripts\relcheck-kit\Receive-ReleaseCheckResult.ps1 -Kit C:\home\mimageviewer-subpc\relcheck\<kit-id> -Result C:\home\mimageviewer-subpc\relcheck\<kit-id>-results\<run-id>
+      ```
+      キットが作成時のままで、結果がそのキットの artifact で計測されたものなら、summary の verdict と終了コードをそのまま返す。
+      `release-record.md` をリリース記録へ写す。キットの artifact のコミットが配布ビルドの入力と同じことも記録で確かめる
+      (配布ビルドの入力が変わったら、キットを作り直して流し直す)。
+   - **数値の比較**: サブ PC (RTX 4060 Ti、1920×1080、RDP セッション) の値は、サブ PC の記録どうしでだけ比べる。
+     メイン PC (RTX 4090) の過去の記録とは比べない。閾値・判定は両方で同じ。`release-record.md` の「実行:」の行に
+     実行場所・画面・RDP の有無が出る。
+   - **サブ PC が使えないとき**は、利用者の了承を取って従来どおりメイン PC の repository root で流す
+     (エージェントが流すときはターミナル パネルから。ツールの裏のプロセスからは前面を取れず止まる、2026-11-17):
+     ```powershell
+     .\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved
+     ```
+     この経路は診断 portable の build から始まる。**開始前に他アプリの窓を最小化し、build 待ちを含め終了まで PC に触れない**。
+     同一ソースの診断 artifact が検証できる場合だけ `-SkipBuild` を追加できる (stale artifact の利用や設定保護の省略を認めるフラグではない)。
+     FFmpeg CLI (`ffmpeg.exe`) が PATH に必要。
+   - どちらの経路も、生成fixture／隔離dataのseed、5 idle、cached／uncached perf、通常終了・
      証跡保存・解析まで逐次実行する。**9.7も同じ1回のsuiteで確認し、重複実行しない**。
-     FFmpeg CLI (`ffmpeg.exe`) がPATHに必要。初回buildは別に約7.5分かかった実績があり、
      suiteはseed込み約5〜8分を見込む。AI追加は別途準備・実行時間を見積もる。
-   - **開始前に他アプリの窓を最小化し、build待ちを含め終了までPCに触れない**。
      exact rootのforeground取得、runner所有窓への背面移行、測定中の状態を検証する。
      foreground不成立時は記録を残して停止し、環境を整えた別runでやり直す。自動retryはしない。
-   - 同一ソースの診断artifactが検証できる場合だけ上記に `-SkipBuild` を追加できる。
-     buildを先に済ませる場合は `prepare-portable-smoke.ps1 -TestScript` を使う（起動しない）。
-     stale artifactの利用や設定保護の省略を認めるフラグではない。
-   - 結果は `target/ui-smoke/runs/<run-id>/summary.json` と `release-record.md`。
+   - 結果は `target/ui-smoke/runs/<run-id>/summary.json` と `release-record.md` (サブ PC ではキットの root の下)。
      全必須caseの証跡と終了codeを確認する。0=PASS／PASS_WITH_WARNINGS、1=FAIL、2=SKIPPED／環境不成立。
      警告はリリース記録に残し、FAIL／SKIPPEDをPASSに読み替えない。
      `known-startup-first-frame` は測定操作前のstartup-overlay frame 1→2 gapだけ、上限500ms。
@@ -349,10 +378,14 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
    - cached／uncachedで256個の異なるfolder-load、Ctrl+Down x5、Ctrl+G固定検索を検証する。
      drawnは直前tailが厳密に `request_repaint` のgapだけ、暫定n≥200／<16ms比率97%はWARN目標、
      raw `pre_grid.total_ms` p95≤0.3msは必須。通常sleepをhitchとして集計しない。
-   - AI／GPU経路変更版では同じ入口に `-IncludeFirstAi` を明示追加する。
+   - AI／GPU経路変更版では同じ入口に `-IncludeFirstAi` を明示追加する
+     (サブ PC のキット経路での first-ai は未確認。初めて使うときは結果の first-ai の行を確かめる)。
      UI／I/O経路変更版では普段のフォルダの短い手動確認も別に残す。生成fixtureの成功を
      実データ・配布版の厳密性能・native入力／IMEの確認へ読み替えない。
-   - 採用は実行了承ではない。エージェント実行は [実行確認](interactive-release-verification.md)
+   - サブ PC での実行は、利用者がリリース前の手順として決めた (2026-11-21)。統括は依頼を送る前に、
+     対象のキットと時間を利用者へ一言伝える。サブ PC では利用者の PC の前面・入力を奪わないが、
+     キット内の使い捨て data・試験用 portable だけを使う決まりは同じ。
+   - メイン PC で流す場合、採用は実行了承ではない。エージェント実行は [実行確認](interactive-release-verification.md)
      に従い対象・所要時間・desktop入力・使い捨てdata・AI有無への明示了承後だけ行う。
      `-InteractiveApproved` は了承済みの実行assertion。normal-profile起動禁止と
      [development-build-and-test-native.md](development-build-and-test-native.md) の「検証起動時の設定データ保護」は維持し、利用者の通常設定をseedにコピーしない。
@@ -391,7 +424,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
      コピー → perf log を退避 → core を起動 → 終了後に解析」なので、手で分けて実行してもよい。
 
 9.7. **idle health smoke** (毎リリース必須。静止中の高速 repaint / 再投入ループを検出):
-   **正規手順は9.6のReleaseChecks suiteの同一run**。static-foreground／static-background／
+   **正規手順は9.6のReleaseChecks suiteの同一run** (2026-11-21 から公開前にサブ PC のキットで流す)。static-foreground／static-background／
    video-pin-background／tray-close-while-loading／tray-close-after-loadingの5ケースをすべて確認する。
    生成fixture・停止済みseed復元・cached読取・tray格納時の要求寿命・source／Finalized-image-backlog、
    exact PID／foreground／UTC測定境界を証明する。5秒warmup／15秒測定と既存閾値を維持する。

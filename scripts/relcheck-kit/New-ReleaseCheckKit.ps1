@@ -11,7 +11,6 @@ Set-StrictMode -Version 2
 $scriptsRepo=(Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..')).Path
 $ArtifactRepo=(Resolve-Path -LiteralPath $ArtifactRepo).Path
 . (Join-Path $scriptsRepo 'scripts\ui-smoke\release-checks\Support.ps1')
-Import-ReleaseCheckFunctions (Join-Path $ArtifactRepo 'scripts\build-portable.ps1') @('Get-MivOrdinalUniquePaths','Get-MivSourceFingerprintRecords','Get-MivSourceFingerprint','Assert-SmokeBuildManifest','Get-NormalizedPath')
 
 function Get-KitGitOutput {
     param([string]$Root,[string[]]$GitArguments)
@@ -36,6 +35,8 @@ function Copy-KitTree {
 
 if(@(Get-KitGitOutput $scriptsRepo @('status','--porcelain','--untracked-files=all','--','scripts')).Count){throw 'Kit scripts must be committed and clean.'}
 $scriptsHead=[string](Get-KitGitOutput $scriptsRepo @('rev-parse','HEAD'))
+if(@(Get-KitGitOutput $ArtifactRepo @('status','--porcelain','--untracked-files=all','--','scripts/build-portable.ps1')).Count){throw 'Artifact scripts/build-portable.ps1 must be committed and clean.'}
+Import-ReleaseCheckFunctions (Join-Path $ArtifactRepo 'scripts\build-portable.ps1') @('Get-MivOrdinalUniquePaths','Get-MivSourceFingerprintRecords','Get-MivSourceFingerprint','Assert-SmokeBuildManifest','Get-NormalizedPath')
 # Reuse the fingerprint function's exact source path list rather than a second list.
 $tokens=$null;$errors=$null
 $ast=[Management.Automation.Language.Parser]::ParseFile((Join-Path $ArtifactRepo 'scripts\build-portable.ps1'),[ref]$tokens,[ref]$errors)

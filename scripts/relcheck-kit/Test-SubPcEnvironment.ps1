@@ -10,8 +10,80 @@ $OutputPath=[IO.Path]::GetFullPath($OutputPath)
 . (Join-Path $PSScriptRoot '..\ui-smoke\release-checks\Support.ps1')
 Import-ReleaseCheckFunctions (Join-Path $kitRoot 'scripts\ui-smoke.ps1') @('Join-NativeArguments','Quote-NativeArgument')
 $reasons=New-Object 'Collections.Generic.List[string]'
-$report=[ordered]@{created_utc=[DateTime]::UtcNow.ToString('o');status='NOT_READY';reasons=@();kit_valid=$false;python_valid=$false;ffmpeg_valid=$false;desktop_valid=$false;environment=@{};child_foreground=$false;runner_foreground_after_grant=$false}
-$child=$null;$form=$null
+$report=[ordered]@{created_utc=[DateTime]::UtcNow.ToString('o');status='NOT_READY';reasons=@();kit_valid=$false;python_valid=$false;ffmpeg_valid=$false;desktop_valid=$false;environment=@{};child_foreground=$false;child_foreground_attempts=0;child_foreground_elapsed_ms=0;runner_foreground_after_grant=$false}
+$child=$null;$form=$null;$childHwnd=[IntPtr]::Zero
+function New-ReleaseCheckForegroundProbeChild {
+    param([string]$OutputPath)
+    # Compile a GUI-subsystem peer, just like the suite's mIV process. It has
+    # no console/Terminal window that could compete with the Form for foreground.
+    $source=@'
+using System;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Windows.Forms;
+
+public static class MivReleaseCheckForegroundProbeChild {
+    [DllImport("user32.dll")]
+    static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    static extern bool AllowSetForegroundWindow(uint processId);
+
+    static void Publish(string path, string json) {
+        File.WriteAllText(path + ".pending", json, new UTF8Encoding(false));
+        File.Move(path + ".pending", path);
+    }
+
+    [STAThread]
+    public static int Main(string[] args) {
+        int runnerPid;
+        if (args.Length != 2 || !int.TryParse(args[0], out runnerPid) || runnerPid <= 0)
+            return 2;
+        string readyPath = args[1];
+        string pid = Process.GetCurrentProcess().Id.ToString(CultureInfo.InvariantCulture);
+        string runner = runnerPid.ToString(CultureInfo.InvariantCulture);
+        var clock = Stopwatch.StartNew();
+        // I/O errors terminate the child instead of displaying a WinForms error dialog.
+        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
+        using (var form = new Form())
+        using (var timer = new Timer()) {
+            form.Text = "mIV relcheck foreground probe";
+            form.Width = 480;
+            form.Height = 160;
+            bool published = false;
+            form.Shown += delegate {
+                string hwnd = form.Handle.ToInt64().ToString(CultureInfo.InvariantCulture);
+                Publish(readyPath + ".window", "{\"pid\":" + pid + ",\"root_hwnd\":" + hwnd + "}");
+            };
+            timer.Interval = 100;
+            timer.Tick += delegate {
+                if (clock.Elapsed.TotalSeconds >= 30) {
+                    form.Close();
+                    return;
+                }
+                if (!published && GetForegroundWindow() == form.Handle) {
+                    bool granted = AllowSetForegroundWindow((uint)runnerPid);
+                    string hwnd = form.Handle.ToInt64().ToString(CultureInfo.InvariantCulture);
+                    Publish(readyPath, "{\"pid\":" + pid + ",\"root_hwnd\":" + hwnd +
+                        ",\"background_foreground_grant\":{\"granted\":" + (granted ? "true" : "false") +
+                        ",\"app_pid\":" + pid + ",\"root_hwnd\":" + hwnd + ",\"runner_pid\":" + runner + "}}");
+                    published = true;
+                }
+            };
+            timer.Start();
+            Application.Run(form);
+        }
+        return 0;
+    }
+}
+'@
+    try{
+        Add-Type -TypeDefinition $source -ReferencedAssemblies @('System.dll','System.Windows.Forms.dll','System.Drawing.dll') -OutputType WindowsApplication -OutputAssembly $OutputPath -ErrorAction Stop
+    }catch{throw ('Foreground probe child compilation failed: '+$_.Exception.Message)}
+}
+
 function Get-ProbeForeground {
     $hwnd=[MivReleaseCheckNative]::GetForegroundWindow();[uint32]$owner=0
     $null=[MivReleaseCheckNative]::GetWindowThreadProcessId($hwnd,[ref]$owner)
@@ -22,6 +94,7 @@ function Get-ProbeForeground {
 try{
     $null=Assert-ReleaseCheckKit $kitRoot
     $report.kit_valid=$true
+    $env:PYTHONDONTWRITEBYTECODE='1'
     try{
         $python=(Get-Command python -ErrorAction Stop).Source
         $version=@(& $python -c 'import sys; print(sys.version); sys.exit(0 if sys.version_info >= (3, 10) else 2)')
@@ -53,21 +126,40 @@ try{
     Assert-ReleaseCheckKitNoReparsePath $probeRoot
     New-Item -ItemType Directory -Path $probeRoot -Force | Out-Null
     $readyPath=Join-Path $probeRoot 'child-ready.json'
-    $arguments=@('-NoProfile','-STA','-ExecutionPolicy','Bypass','-File',(Join-Path $PSScriptRoot 'ForegroundProbeChild.ps1'),'-RunnerPid',[string]$PID,'-ReadyPath',$readyPath)
-    $child=Start-Process -FilePath (Get-Command powershell.exe -ErrorAction Stop).Source -ArgumentList (Join-NativeArguments $arguments) -WindowStyle Hidden -PassThru
+    $probeExe=Join-Path $probeRoot 'probe-child.exe'
+    $null=New-ReleaseCheckForegroundProbeChild $probeExe
+    $arguments=@([string]$PID,$readyPath)
+    # Match the GUI suite launch: no console, and no STARTUPINFO SW_HIDE that
+    # could suppress the Form's first ShowWindow.
+    $child=Start-Process -FilePath $probeExe -ArgumentList (Join-NativeArguments $arguments) -PassThru
     $null=$child.Handle
     $clock=[Diagnostics.Stopwatch]::StartNew()
-    while(-not $child.HasExited -and $child.MainWindowHandle -eq [IntPtr]::Zero -and $clock.Elapsed.TotalSeconds -lt 20){
+    $windowPath=$readyPath+'.window'
+    while(-not $child.HasExited -and -not (Test-Path -LiteralPath $windowPath -PathType Leaf) -and $clock.Elapsed.TotalSeconds -lt 20){
         Start-Sleep -Milliseconds 100;$child.Refresh()
     }
-    if($child.HasExited -or $child.MainWindowHandle -eq [IntPtr]::Zero){throw 'Child window unavailable within 20 seconds.'}
-    $childHwnd=$child.MainWindowHandle
+    if($child.HasExited -or -not (Test-Path -LiteralPath $windowPath -PathType Leaf)){throw 'Child Form HWND unavailable within 20 seconds.'}
+    $windowReady=Get-Content -LiteralPath $windowPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $childHwnd=[IntPtr][long]$windowReady.root_hwnd
+    [uint32]$windowOwner=0
+    $null=[MivReleaseCheckNative]::GetWindowThreadProcessId($childHwnd,[ref]$windowOwner)
+    if($windowReady.pid -ne $child.Id -or $childHwnd -eq [IntPtr]::Zero -or $windowOwner -ne $child.Id){throw 'Child Form HWND owner mismatch.'}
     $report.child_pid=$child.Id;$report.child_hwnd=$childHwnd.ToInt64()
-    $report.child_set_foreground_return=[MivReleaseCheckNative]::SetForegroundWindow($childHwnd)
-    $observed=Get-ProbeForeground
-    $report.child_foreground_observed=$observed
-    $report.child_foreground=($observed.pid -eq $child.Id -and $observed.hwnd -eq $childHwnd.ToInt64())
-    if(-not $report.child_foreground){$reasons.Add('Exact child PID/HWND did not become foreground.')}
+    $clock.Restart()
+    while(-not $child.HasExited -and -not $report.child_foreground -and $clock.Elapsed.TotalSeconds -le 20){
+        $report.child_foreground_attempts++
+        $report.child_set_foreground_return=[MivReleaseCheckNative]::SetForegroundWindow($childHwnd)
+        $observed=Get-ReleaseCheckWindowSample $child.Id
+        $report.child_foreground_observed=$observed
+        $report.child_foreground=($observed.foreground_pid -eq $child.Id -and $observed.foreground_hwnd -eq $childHwnd.ToInt64())
+        if($report.child_foreground){break}
+        Start-Sleep -Milliseconds 100;$child.Refresh()
+    }
+    $report.child_foreground_elapsed_ms=$clock.Elapsed.TotalMilliseconds
+    if(-not $report.child_foreground){
+        $report.child_foreground_failure_observed=Get-ProbeForeground
+        $reasons.Add('Exact child PID/HWND did not become foreground within 20 seconds.')
+    }
     $clock.Restart()
     while(-not (Test-Path -LiteralPath $readyPath -PathType Leaf) -and -not $child.HasExited -and $clock.Elapsed.TotalSeconds -lt 20){
         Start-Sleep -Milliseconds 100;$child.Refresh()
@@ -81,13 +173,14 @@ try{
         $ready.background_foreground_grant.runner_pid -ne $PID -or -not $ready.background_foreground_grant.granted){throw 'Invalid child foreground grant.'}
     $form=New-Object Windows.Forms.Form
     $form.Text='mIV relcheck runner foreground probe';$form.Width=480;$form.Height=160
-    $form.Show()
-    $report.runner_set_foreground_return=[MivReleaseCheckNative]::SetForegroundWindow($form.Handle)
-    [Windows.Forms.Application]::DoEvents()
-    $observed=Get-ProbeForeground
-    $report.runner_foreground_observed=$observed
-    $report.runner_foreground_after_grant=($observed.pid -eq $PID -and $observed.hwnd -eq $form.Handle.ToInt64())
-    if(-not $report.runner_foreground_after_grant){$reasons.Add('Runner PID/HWND did not become foreground after child grant.')}
+    try{
+        $observed=Set-ReleaseCheckBackgroundForeground $ready $child.Id $form $PID
+        $report.runner_foreground_observed=$observed
+        $report.runner_foreground_after_grant=$true
+    }catch{
+        $report.runner_foreground_failure_observed=Get-ProbeForeground
+        throw
+    }
     }
 }catch{$reasons.Add($_.Exception.Message)}
 finally{
@@ -95,7 +188,12 @@ finally{
     if($child){
         $child.Refresh()
         if(-not $child.HasExited){
-            $null=$child.CloseMainWindow()
+            # Close only the published Form, never a console/Terminal HWND.
+            if($childHwnd -ne [IntPtr]::Zero){
+                [uint32]$closeOwner=0
+                $null=[MivReleaseCheckNative]::GetWindowThreadProcessId($childHwnd,[ref]$closeOwner)
+                if($closeOwner -eq $child.Id){$null=[MivReleaseCheckNative]::PostMessage($childHwnd,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)}
+            }
             if(-not $child.WaitForExit(5000)){Stop-Process -Id $child.Id -Force -ErrorAction Stop;$child.WaitForExit()}
         }
         $child.Dispose()
