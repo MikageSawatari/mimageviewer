@@ -35165,6 +35165,12 @@ impl App {
         if let Some(pending) = self.tag_view_pending.take() {
             pending.cancel();
         }
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::job(
+            "tag-view",
+            &self.tag_view.last_executed,
+            crate::ime_focus::typing_probe::Outcome::Started,
+        );
         let data_dir = crate::data_dir::get();
         let query = self.tag_view.query.clone();
         let kind_filter = self.tag_view.kind_filter;
@@ -35390,6 +35396,12 @@ impl App {
         self.rebuild_details_order();
         // The field may already hold a newer unsubmitted word (§1.476).
         self.update_tag_view_address();
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::job(
+            "tag-view",
+            &self.tag_view.last_executed,
+            crate::ime_focus::typing_probe::Outcome::Delivered(self.tag_view.result_count),
+        );
     }
 
     pub(crate) fn set_tag_view_sort(&mut self, sort: crate::tag_view::TagViewSort) {
@@ -35654,6 +35666,12 @@ impl App {
             .ok();
 
         self.favsearch_pending = Some(FavSearchPending { cancel, rx });
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::job(
+            "container",
+            &self.favsearch.last_executed,
+            crate::ime_focus::typing_probe::Outcome::Started,
+        );
     }
 
     /// お気に入り検索の結果をポーリングする。
@@ -35771,6 +35789,12 @@ impl App {
             Some(page_identity_index),
         );
         self.update_favsearch_address();
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::job(
+            "container",
+            &self.favsearch.last_executed,
+            crate::ime_focus::typing_probe::Outcome::Delivered(self.favsearch.results_paths.len()),
+        );
     }
 
     /// メニュー操作で閲覧履歴を開く。

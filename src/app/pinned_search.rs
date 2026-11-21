@@ -1108,6 +1108,14 @@ impl App {
             Kind::Container => self.favsearch.focus_request = true,
             Kind::Metadata | Kind::Everything => self.global_search.focus_request = true,
         }
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::focus_event(
+            ctx,
+            "request pinned focus",
+            kind.input_id(),
+            true,
+            self.edit_owner(kind),
+        );
         ctx.request_repaint();
     }
     pub(crate) fn open_search_shortcut(&mut self, ctx: &egui::Context, kind: Kind) {
@@ -1489,6 +1497,14 @@ impl App {
             _ => false,
         };
         let enter = self.dialog_enter_pressed(ui.ctx());
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::focus_event(
+            ui.ctx(),
+            "draw pinned begin",
+            kind.input_id(),
+            focus,
+            self.edit_owner(kind),
+        );
         let drag = self.settings.toolbar_section_drag_enabled;
         let focus_pending = self.history_input_focus_pending(ui.ctx(), kind.input_id());
         let draft = match kind {
@@ -1512,6 +1528,14 @@ impl App {
             focus_pending,
         );
         let focused = response.inner.input.has_focus();
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::focus_event(
+            ui.ctx(),
+            "draw pinned end",
+            kind.input_id(),
+            focus,
+            self.edit_owner(kind),
+        );
         match kind {
             Kind::Local => self.search_has_focus = focused,
             Kind::Container => self.favsearch.has_focus = focused,

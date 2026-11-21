@@ -429,6 +429,52 @@ function Get-MivChangedPaths {
     return @(($changed + $new).Split([char]0) | Where-Object { $_ } | Sort-Object -Unique)
 }
 
+# Add a field's drawing/input/result-adoption files here when adding a typing adapter.
+$script:MivTypingProductPaths = @(
+    'src/app.rs',
+    'src/app/pinned_search.rs',
+    'src/app/update_phases.rs',
+    'src/app/main_chrome.rs',
+    'src/app/facet_name_filter.rs',
+    'src/ui_main.rs',
+    'src/ui_pinned_search.rs',
+    'src/ui_toolbar_layout.rs',
+    'src/ui_history_field.rs',
+    'src/global_search_ui.rs',
+    'src/global_search_ui/everything.rs',
+    'src/global_search_ui/everything/ui.rs',
+    'src/global_search_ui/everything/shortcut.rs',
+    'src/global_search.rs',
+    'src/indexer_manager.rs',
+    'src/search_index_db.rs',
+    'src/tag_view.rs',
+    'src/tags_db.rs',
+    'src/ui_dialogs/tag_apply.rs',
+    'src/ui_dialogs/tag_editor.rs',
+    'src/ui_dialogs/collections.rs',
+    'src/ui_dialogs/smart_folder_editor.rs',
+    'src/ime_focus.rs',
+    'src/egui_focus_policy.rs',
+    'src/keyboard_input.rs',
+    'src/key_input.rs',
+    'src/keymap.rs',
+    'src/key_debug.rs'
+)
+
+function Test-MivTypingSource {
+    param([string] $Path, [string] $Absolute)
+    if ($script:MivTypingProductPaths -contains $Path -or
+        $Path -match '^src/app/tests/typing/|^crates/egui-ime/') { return $true }
+    if ($Path -match '\.rs$' -and [IO.File]::Exists($Absolute)) {
+        $text = [IO.File]::ReadAllText($Absolute, [Text.Encoding]::UTF8)
+        # Conservative for new callers: qualified/super/bare helper calls and
+        # imported aliases. Comments may select extra tests but never hide a caller.
+        return ($text -match '\b(show_singleline|add_singleline|add_singleline_sensitive|add_sized_singleline)\s*\(' -or
+            $text -match '(?s)\buse\s+[^;]*\bime_focus\b[^;]*;')
+    }
+    return $false
+}
+
 function Get-MivFocusedPlan {
     param([string] $RepoRoot, [string[]] $Paths)
     $meta = Invoke-MivTool 'cargo' @('metadata', '--no-deps', '--format-version', '1') $RepoRoot
@@ -441,6 +487,15 @@ function Get-MivFocusedPlan {
         $path = $original.Replace('\', '/') -replace '^\./', ''
         $absolute = [IO.Path]::GetFullPath((Join-Path $RepoRoot $path))
         if (-not $absolute.StartsWith(($RepoRoot.TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar), [StringComparison]::OrdinalIgnoreCase)) { throw "Path outside repository: $original" }
+        if (Test-MivTypingSource $path $absolute) {
+            $typingFilter = 'test(/(^|::)typing_/)'
+            if ($seen.Add('typing-1832')) {
+                $entries.Add([pscustomobject]@{ Path = $path; Selection = @('-p', 'mimageviewer', '--lib'); Filter = $typingFilter })
+            }
+            # The probe and facet debounce/cache module have no inline tests.
+            # Their coverage belongs to the common typing family.
+            if ($path -match '^src/app/tests/typing/|^src/app/facet_name_filter\.rs$') { continue }
+        }
         if ($path -match '(^|/)(Cargo\.(toml|lock)|build\.rs)$|^src/(lib|main|app)\.rs$|^src/app/tests\.rs$|^(\.cargo/|\.config/|vendor/|tests/(support|snapshots)/)') {
             $broad.Add($path); continue
         }

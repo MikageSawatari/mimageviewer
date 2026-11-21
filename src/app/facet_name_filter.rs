@@ -16,6 +16,12 @@ pub(super) struct FacetNameCacheResult {
 
 impl App {
     pub(crate) fn schedule_facet_name_filter_update(&mut self) {
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::job(
+            "facet-name",
+            &self.facet_name_input,
+            crate::ime_focus::typing_probe::Outcome::Started,
+        );
         if self.facet_name_input == self.settings.facet_filter.name_query {
             self.facet_name_debounce_deadline = None;
         } else {
@@ -97,6 +103,12 @@ impl App {
             });
         match spawn {
             Ok(_) => {
+                #[cfg(test)]
+                crate::ime_focus::typing_probe::job(
+                    "facet-name-cache",
+                    &generation.to_string(),
+                    crate::ime_focus::typing_probe::Outcome::Started,
+                );
                 self.facet_name_cache_pending = Some(FacetNameCachePending {
                     generation,
                     started_at,
@@ -125,6 +137,8 @@ impl App {
             self.color_filter.applied_scope_signature = None;
         }
         self.rebuild_visible_indices();
+        #[cfg(test)]
+        self.record_facet_name_adoption_for_typing();
         if color_scope_changed {
             self.ensure_color_scan_for_current_scope(ctx);
         }
@@ -208,6 +222,17 @@ impl App {
                     self.color_filter.applied_scope_signature = None;
                 }
                 self.rebuild_visible_indices();
+                #[cfg(test)]
+                {
+                    crate::ime_focus::typing_probe::job(
+                        "facet-name-cache",
+                        &result.generation.to_string(),
+                        crate::ime_focus::typing_probe::Outcome::Delivered(
+                            self.facet_name_cache.len(),
+                        ),
+                    );
+                    self.record_facet_name_adoption_for_typing();
+                }
                 if color_scope_changed {
                     self.ensure_color_scan_for_current_scope(ctx);
                 }
@@ -247,5 +272,19 @@ impl App {
                 crate::search_query::MatchMode::And,
             )
         })
+    }
+
+    #[cfg(test)]
+    fn record_facet_name_adoption_for_typing(&self) {
+        if !self.facet_name_tokens.is_empty()
+            && self.facet_name_cache_generation == Some(self.items_generation)
+            && self.facet_name_cache.len() == self.items.len()
+        {
+            crate::ime_focus::typing_probe::job(
+                "facet-name",
+                &self.settings.facet_filter.name_query,
+                crate::ime_focus::typing_probe::Outcome::Delivered(self.visible_indices.len()),
+            );
+        }
     }
 }

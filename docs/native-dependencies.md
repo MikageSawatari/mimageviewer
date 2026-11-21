@@ -399,6 +399,10 @@ bash scripts/setup-ffmpeg.sh check     # 新しい版付きビルドがあるか
   パスは VS のエディションによって変わる: `Microsoft Visual Studio\<バージョン>\<エディション>\VC\Tools\Llvm\x64\bin\libclang.dll` を `find`/`Get-ChildItem -Recurse` で探して使う。
   登録後は **PowerShell を開き直す** (現セッションだけ反映するなら `$env:LIBCLANG_PATH = "..."`)。
   未設定だと `cargo build` が `Cannot find clang: 'clang.dll', 'libclang.dll'` で失敗する。
+- 新しい worktree で初めて並列ビルドするとき、`ffmpeg-sys-the-third` のビルドスクリプトが libclang の stack overflow
+  (`thread 'main' has overflowed its stack`) か `0xc0000005` で落ちることがある。観測は 2026-10-25 (infra-1427-512) と
+  2026-11-21 (typing-832) の 2 回で、原因はまだ分かっていない。`cargo test --no-run -p ffmpeg-sys-the-third` で
+  ffmpeg-sys だけを先にビルドしてから、もう一度流すと通る (重いビルドは共有 runner 経由で流す)。
 
 ### バージョンを上げる場合
 

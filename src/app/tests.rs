@@ -971,6 +971,10 @@ mod everything_close_return;
 mod everything_select_1691;
 
 #[cfg(windows)]
+#[path = "tests/typing/mod.rs"]
+mod typing;
+
+#[cfg(windows)]
 #[path = "tests/ctrl_down_close_1678.rs"]
 mod ctrl_down_close_1678;
 

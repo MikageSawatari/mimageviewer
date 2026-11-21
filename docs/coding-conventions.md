@@ -152,6 +152,20 @@ pointer 入力や他 widget への正当な focus 移動を優先する。
 raw TextEdit は理由付き allowlist を検査する unit test で禁止している。TSF を採用しない理由、
 IMM32 の 2 経路と未対応範囲の正本は [src/ime_focus.rs](../src/ime_focus.rs) の helper doc comment を参照。
 
+**新しい1行の欄を足すとき（§1.832）**:
+
+- 打つたびに検索や候補更新が走る欄は、`src/app/tests/typing/` にadapterと
+  `typing_` で始まるテストを足す。本物のAppフレームへ1字ずつ送り、空欄からの入力、
+  結果あり／0件、必要なIME入力、処理の開始と結果の採用を確かめる。
+  短い入力を仕様上拒否する欄では、拒否通知だけで完了にせず、その語の一覧投影の採用まで検査する。
+  IME中に適用を延期する欄は、未確定中の延期と確定後の結果採用を分けて確かめる。
+- `typing/inventory.rs` の `INPUT_TESTS` に呼び出し位置のanchor、件数、実在するテスト名を
+  登録する。描画・入力・結果採用のファイルは `scripts/test-tools-common.ps1` の
+  `MivTypingProductPaths` 配列にも足す。
+- 入力中にそのような処理をしない設定欄やパスワード欄などは、同じファイルの
+  `EXEMPTIONS` に短く具体的な理由を付けて登録する。1つの呼び出しを二重に登録しない。
+  詳細は [開発テスト文書の「1字ずつ入力するテスト」](development-build-and-test.md) を参照。
+
 **ビューポート別のイベントキュー**:
 egui の `show_viewport_immediate` は独立したイベントキューを持つ。メインビューポートと
 フルスクリーンビューポートは別キュー。plugin は `memory.begin_pass` より前に各 RawInput を

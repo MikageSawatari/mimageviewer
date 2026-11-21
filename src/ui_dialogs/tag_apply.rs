@@ -319,6 +319,12 @@ impl App {
     fn cached_tag_apply_suggestions(&mut self, normalized_input: &str) -> Vec<TagChoice> {
         let cache_key = crate::tags_db::normalize_tag_key(normalized_input);
         if self.tag_apply_suggestion_key.as_deref() != Some(cache_key.as_str()) {
+            #[cfg(test)]
+            crate::ime_focus::typing_probe::job(
+                "tag-apply",
+                normalized_input,
+                crate::ime_focus::typing_probe::Outcome::Started,
+            );
             let suggestions = tag_suggestions(self, normalized_input);
             self.tag_apply_suggestions = suggestions
                 .iter()
@@ -333,6 +339,14 @@ impl App {
                 })
                 .collect();
             self.tag_apply_suggestion_key = Some(cache_key);
+            #[cfg(test)]
+            crate::ime_focus::typing_probe::job(
+                "tag-apply",
+                normalized_input,
+                crate::ime_focus::typing_probe::Outcome::Delivered(
+                    self.tag_apply_suggestions.len(),
+                ),
+            );
         }
         self.tag_apply_suggestions
             .iter()
