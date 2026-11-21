@@ -102,6 +102,10 @@ function Assert-ReleaseCheckKitRunRoot {
 
 function Assert-ReleaseCheckDiagnosticBuildRoot {
     param([string]$ExePath,[string]$BuildRoot)
+    # Substring evidence only: a package built in "<root>-x" also contains "<root>".
+    # That needs a hand-copied package from another worktree; the suite then stops
+    # at its own evidence-path check without measuring. Accepted, no extra mechanism
+    # (see docs/release-check-automation-plan.md section 11).
     Assert-ReleaseCheckKitNoReparsePath $ExePath
     if(-not ('MivReleaseCheckKitBytes' -as [type])){
         # Search raw bytes in native code; PowerShell per-byte loops are too slow

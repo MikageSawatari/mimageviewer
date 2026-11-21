@@ -849,6 +849,10 @@ scripts と artifact のコミットは別にできる (例: 公開済みタグ�
   サブ PC は C: しか無く、`C:\home\mimageviewer` はサブ PC 担当の作業フォルダとして使用中なので、メイン PC の
   repository と同じ path は使えない (2026-11-21、サブ PC 担当の回答)。
 - キットの json に `artifact.build_root` (ビルドした root) を記録し、作成時に exe へその path が埋め込まれていることを確かめる。
+  この検査は exe のバイト列への部分一致で、`...\root` と `...\root-v550` のような前方一致の取り違えは見分けない
+  (独立レビューの指摘)。起きるのは、別の worktree でビルドした package を手でコピーして持ち込んだときだけで、そのときも
+  本番が証拠フォルダの検査で止まるだけで誤った計測にはならないので、仕組みは足さない (まれな失敗は割り切り)。
+  手順では、診断 portable を別の worktree からコピーしないことを決まりにする。
 - サブ PC ではキットを `build_root` と同じ path に置く。`Run.ps1 -FromKit`・sampler・`Test-SubPcEnvironment.ps1` は
   キットの root が `build_root` と一致しなければ、mIV を起動する前に止まる (`Assert-ReleaseCheckKitRunRoot`)。
   メイン PC の保管場所 (`C:\home\mimageviewer-subpc\relcheck\<kit-id>\`) と結果の受け取りには、この一致を求めない。

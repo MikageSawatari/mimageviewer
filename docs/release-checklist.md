@@ -333,19 +333,27 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
       **専用の worktree `C:\miv-relcheck\root`** を配布ビルドの入力と同じコミットに合わせて、その中でビルドする。
       試験用ビルドは「証拠フォルダがビルドした repository root の下にあること」を確かめるので、サブ PC でもキットを
       **同じ path `C:\miv-relcheck\root`** に置く必要がある (サブ PC には C: しか無く、`C:\home\mimageviewer` は別の用途で使用中)。
+      (a) 専用 worktree を用意する。無ければ `git worktree add --detach C:\miv-relcheck\root <コミット>` で作り、
+      [git-workflow.md](git-workflow.md) の決まりどおり vendor を実体コピーする (junction 禁止)。既にあれば、コミットを合わせる。
+      vendor の中身が変わった版では、ビルドのエラーが示すフォルダを `C:\home\mimageviewer\vendor\` からコピーし直す。
       ```powershell
       git -C C:\miv-relcheck\root checkout --detach <配布ビルドの入力のコミット>
+      ```
+      (b) 専用 worktree の中で診断 portable をビルドする (エージェントは `run-heavy.ps1` 経由。初回や大きな更新の後は全ビルド、以後は差分)。
+      ```powershell
       cd C:\miv-relcheck\root
       .\scripts\prepare-portable-smoke.ps1 -TestScript
-      .\scripts\relcheck-kit\New-ReleaseCheckKit.ps1
       ```
-      エージェントは 3 行目を `run-heavy.ps1` 経由で流す (初回や大きな更新の後は全ビルド、以後は差分)。
-      この worktree の `vendor\` は実体コピー (junction 禁止)。vendor の中身が変わった版では、ビルドのエラーが示すフォルダを
-      `C:\home\mimageviewer\vendor\` からコピーし直す。worktree が無ければ
-      `git worktree add --detach C:\miv-relcheck\root <コミット>` で作り、[git-workflow.md](git-workflow.md) の決まりどおり vendor を実体コピーする。
+      (c) キットは、**キットのスクリプトを持つ repository (通常は `C:\home\mimageviewer`) から**作る。専用 worktree のコミットが
+      キットのスクリプトより古い版 (v5.5.0 以前のタグなど) でも同じ手順で済む。
+      ```powershell
+      cd C:\home\mimageviewer
+      .\scripts\relcheck-kit\New-ReleaseCheckKit.ps1 -ArtifactRepo C:\miv-relcheck\root
+      ```
       キットは `C:\home\mimageviewer-subpc\relcheck\relcheck-<artifact の HEAD 先頭 9 桁>-<UTC 日時>\` にでき、
       最後に表示される `Kit manifest SHA-256` と `Run root on the sub-PC` を依頼文とリリース記録に写す。
-      `scripts/` と指紋の対象のソースがコミット済みで clean でなければ、キット作成は止まる。
+      呼び出す側の `scripts/`、専用 worktree の指紋の対象のソースと `scripts/build-portable.ps1` が、コミット済みで clean でなければ止まる。
+      診断 portable を別の worktree からコピーして持ち込まない (ビルドした root が違うと、本番が証拠フォルダの検査で止まる)。
    2. **統括がサブ PC 担当へ依頼する**。依頼文は [サブ PC の ReleaseChecks 依頼の雛形](subpc-release-checks-brief.md) から作る。
       ほかのサブ PC 依頼・夜間試験の時間枠 (01:00〜07:00) と重ねない。メイン PC 側では RDP の接続を切らず、
       RDP の窓を最小化しない (サブ PC の画面描画と前面の判定が成り立たなくなる)。メイン PC の作業は続けてよい。
