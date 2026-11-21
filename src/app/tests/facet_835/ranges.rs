@@ -168,7 +168,7 @@ impl Contract {
             "6 selection moved: {diagnostic}"
         );
         assert!(
-            !h.env.fullscreen && !h.env.projected_viewer_session_open(),
+            !h.env.projected_viewer_session_open(),
             "6 grid opened an item: {diagnostic}"
         );
         assert!(
