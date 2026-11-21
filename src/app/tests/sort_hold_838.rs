@@ -22,6 +22,17 @@ struct HeldScan {
     cancel: Arc<AtomicBool>,
 }
 
+/// The watch re-registers when sort/stack projection changes. Its independent
+/// scan must not win this input test's scheduling race and adopt another list
+/// while the explicit sort/navigation reply is held. Keep the real worker's
+/// receiver, exactly as scroll_661 holds an observation's receive boundary.
+/// Restoring that receiver lets the production owner validate/adopt/drop it.
+struct HeldObservation {
+    cancel: Arc<AtomicBool>,
+    worker_rx: mpsc::Receiver<Option<ExternalRescanResult>>,
+    _keep_empty_receiver_connected: mpsc::Sender<Option<ExternalRescanResult>>,
+}
+
 impl HeldScan {
     fn capture(app: &mut App) -> Self {
         let pending = app
@@ -118,6 +129,8 @@ struct Harness {
     ctx: egui::Context,
     owner: Arc<Mutex<Option<KeyboardOwner>>>,
     painted_text: Vec<String>,
+    hold_observation_delivery: bool,
+    observation: Option<HeldObservation>,
 }
 
 impl Harness {
@@ -136,6 +149,7 @@ impl Harness {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         crate::ime_focus::install_ime_input_policy(&ctx);
+        crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
         let owner = Arc::new(Mutex::new(None));
         let observed = owner.clone();
         ctx.on_end_pass(
@@ -150,6 +164,8 @@ impl Harness {
             ctx,
             owner,
             painted_text: Vec::new(),
+            hold_observation_delivery: false,
+            observation: None,
         };
         h.settle();
         assert_eq!(h.names(), ["C.png", "B.png", "Z.wav"]);
@@ -157,10 +173,31 @@ impl Harness {
         h.env.move_grid_cursor(Some(0), GridCursorIntent::Automatic);
         h.tick(vec![]);
         h.assert_grid_owner();
+        h.hold_observation_delivery = true;
         h
     }
 
     fn tick(&mut self, events: Vec<egui::Event>) {
+        if self.hold_observation_delivery {
+            // Start the same passive work that this frame's service will start,
+            // so its receive boundary is held before App can poll a fast reply.
+            // No request, proof, settings, cancel token or result is fabricated.
+            self.env.poll_current_folder_watch(&self.ctx);
+            if let Some(pending) = self.env.external_rescan_pending.as_mut()
+                && pending.cause.is_passive_observation()
+                && self
+                    .observation
+                    .as_ref()
+                    .is_none_or(|held| !Arc::ptr_eq(&held.cancel, &pending.cancel))
+            {
+                let (tx, rx) = mpsc::channel();
+                self.observation = Some(HeldObservation {
+                    cancel: pending.cancel.clone(),
+                    worker_rx: std::mem::replace(&mut pending.rx, rx),
+                    _keep_empty_receiver_connected: tx,
+                });
+            }
+        }
         let modifiers = events
             .iter()
             .find_map(|event| match event {
@@ -208,14 +245,36 @@ impl Harness {
     }
 
     fn settle(&mut self) {
+        // First let the explicit owner adopt, with passive replies still held.
+        // Releasing them sooner would reproduce the fixture's competing adoption.
+        self.until(|h| h.env.folder_pane_open_pending.is_none() && !h.env.sidecar_restore_active());
+        if let Some(held) = self.observation.take()
+            && let Some(pending) = self.env.external_rescan_pending.as_mut()
+            && Arc::ptr_eq(&held.cancel, &pending.cancel)
+        {
+            pending.rx = held.worker_rx;
+        }
+        let hold_observation_delivery =
+            std::mem::replace(&mut self.hold_observation_delivery, false);
         self.until(|h| {
             h.env.items.len() == 3
                 && !h.env.sidecar_restore_active()
                 && h.env.folder_pane_open_pending.is_none()
                 && h.env.folder_refresh_pending.is_none()
                 && h.env.external_rescan_pending.is_none()
+                && h.env.details_meta_pending.is_none()
+                && !h.env.main_chrome_pointer_blocked()
+                && h.env.current_folder_watch.as_ref().is_some_and(|watch| {
+                    watch.registration.is_none()
+                        && watch.dirty.is_empty()
+                        && watch.debounce_until.is_none()
+                })
+                && matches!(*h.owner.lock().unwrap(),
+                    Some(KeyboardOwner::ApplicationShortcut { scope })
+                        if scope.surface == ShortcutSurface::Main)
         });
         self.tick(vec![]);
+        self.hold_observation_delivery = hold_observation_delivery;
     }
 
     fn names(&self) -> Vec<String> {
@@ -228,7 +287,7 @@ impl Harness {
 
     fn diagnostic(&self) -> String {
         format!(
-            "rows={:?} selected={:?} generation={} owner={:?} focus={:?} tree={} popup={} restore={} block={:?}",
+            "rows={:?} selected={:?} generation={} owner={:?} focus={:?} tree={} popup={} restore={} block={:?} sort_scan={} observation={} history_wait={}",
             self.names(),
             self.env.selected,
             self.env.items_generation,
@@ -237,7 +296,10 @@ impl Harness {
             self.env.folder_pane_blocks_grid_keyboard(),
             self.ctx.any_popup_open(),
             self.env.sidecar_restore_active(),
-            self.env.grid_item_input_block()
+            self.env.grid_item_input_block(),
+            self.env.folder_pane_open_pending.is_some(),
+            self.env.external_rescan_pending.is_some(),
+            self.env.location_navigation_pending(),
         )
     }
 
@@ -346,11 +408,19 @@ fn sort_hold_838_arrow_keys_do_not_move_old_selection() {
     assert_eq!(h.env.selected, Some(1));
     h.press(egui::Key::ArrowLeft, egui::Modifiers::NONE);
     assert_eq!(h.env.selected, Some(0));
-    let _held = request_sort(&mut h.env, SortOrder::DurationAsc);
+    let held = request_sort(&mut h.env, SortOrder::DurationAsc);
     let generation = h.env.items_generation;
     h.assert_grid_owner();
     h.press(egui::Key::ArrowRight, egui::Modifiers::NONE);
     h.assert_grid_owner();
+    assert!(Arc::ptr_eq(
+        &h.env
+            .folder_pane_open_pending
+            .as_ref()
+            .expect("same sort wait")
+            .cancel,
+        &held.cancel,
+    ));
     assert_eq!(
         h.env.selected,
         Some(0),
@@ -365,7 +435,13 @@ fn sort_hold_838_enter_does_not_open_old_item() {
     let _held = request_sort(&mut h.env, SortOrder::DurationAsc);
     let generation = h.env.items_generation;
     h.assert_grid_owner();
-    h.press(egui::Key::Enter, egui::Modifiers::NONE);
+    // Inspect the actual open in its key-down frame, before a release frame
+    // can enter the fullscreen lifecycle and obscure the input contract.
+    h.tick(vec![key_event(
+        egui::Key::Enter,
+        true,
+        egui::Modifiers::NONE,
+    )]);
     assert!(h.env.fullscreen_idx.is_none(), "old image must not open");
     assert!(!h.env.projected_viewer_session_open());
     assert_eq!(h.env.items_generation, generation);
@@ -396,9 +472,20 @@ fn sort_hold_838_history_back_replaces_sort_wait() {
     let back = h.env.tmp.path().join("back");
     std::fs::create_dir(&back).unwrap();
     h.env.folder_nav_back_stack = vec![FolderNavHistoryTarget::Path(back.clone()).into()];
+    assert!(
+        h.env
+            .keymap
+            .effective_chords(crate::keymap::KeyAction::GridHistoryBack)
+            .contains(&crate::keymap::Chord::alt(crate::keymap::KeyName::Left))
+    );
     let held = request_sort(&mut h.env, SortOrder::DurationAsc);
     h.press(egui::Key::ArrowLeft, egui::Modifiers::ALT);
     held.assert_retired();
+    assert!(
+        h.env.location_navigation_pending() || h.env.current_folder.as_ref() == Some(&back),
+        "Back was admitted: {}",
+        h.diagnostic()
+    );
     h.until(|h| h.env.current_folder.as_ref() == Some(&back) && !h.env.sidecar_restore_active());
     assert!(h.env.grid_item_input_allowed());
 }

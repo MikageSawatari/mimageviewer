@@ -156,7 +156,15 @@ fn sort_hold_838_left_stick_still_moves_folder_tree_during_sort_wait() {
     h.env.folder_pane.set_focus_tree();
     assert_eq!(h.env.folder_pane.cursor_nav_target_if_moved(), Some(leaf));
     let selected = h.env.selected;
+    // Restore ends the physical session and requires a neutral crossing. The
+    // analog gate reads physical axes (already changed by drain), so the first
+    // non-neutral event cannot itself release that gate. A real neutral poll
+    // also clears left_stick_next_step; no elapsed-time sleep is needed.
+    h.pad(&[]);
+    assert!(!h.env.gamepad.state.directional_neutral_required());
+    assert!(h.env.folder_pane_blocks_grid_keyboard());
     let _held = request_sort(&mut h.env, SortOrder::DurationAsc);
+    assert!(h.env.folder_pane_blocks_grid_keyboard());
     h.pad(&[PadEvent::AxisChanged(PadAxis::LeftX, -0.9)]);
     h.pad(&[PadEvent::AxisChanged(PadAxis::LeftX, 0.0)]);
     // Left on an unexpanded leaf moves to its parent, which is the active folder.

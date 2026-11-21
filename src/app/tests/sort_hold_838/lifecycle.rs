@@ -219,6 +219,11 @@ fn sort_hold_838_direct_navigation_replacement_inherits_gate() {
     assert!(!h.env.grid_item_input_allowed());
     h.tick(vec![]);
     assert_eq!(h.env.items_generation, generation);
+    assert!(h.env.direct_navigation_scan_pending(), "{}", h.diagnostic());
+    assert!(Arc::ptr_eq(
+        &h.env.folder_pane_open_pending.as_ref().unwrap().cancel,
+        &direct.cancel,
+    ));
     direct.release();
     h.until(|h| {
         h.env.current_folder.as_ref() == Some(&destination) && !h.env.sidecar_restore_active()
@@ -244,7 +249,11 @@ fn sort_hold_838_detached_sort_wait_does_not_block_main_grid() {
     assert!(h.env.folder_pane_open_pending.is_none());
     assert!(h.env.grid_item_input_allowed());
     h.assert_grid_owner();
+    let main_generation = h.env.items_generation;
     h.press(egui::Key::ArrowRight, egui::Modifiers::NONE);
+    h.assert_grid_owner();
+    assert!(h.env.folder_pane_open_pending.is_none());
+    assert_eq!(h.env.items_generation, main_generation);
     assert_eq!(h.env.selected, Some(1));
     h.env
         .with_viewer_context(id, |app| {
