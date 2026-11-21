@@ -349,3 +349,47 @@ CLAUDE.md「設計の簡素化」に沿って、組み合わせそのものを�
 - `docs/detached-rework-plan.md` §11: 触れた範囲と判断理由、統括と独立レビューの合意を記録する。
 - `docs/async-architecture.md` / `docs/architecture-overview.md`: key の材料や AI facet の取得を書いた所があれば揃える。
 - マニュアル: AI の絞り込みの読み込み中の説明 (件数の母数) を確かめ、要れば直す。範囲指定の説明は変わらない。
+
+## 9. 段階 3 で書くテスト (段階 1 の引き継ぎ)
+
+段階 1 は現行 API で観測できる契約を `src/app/tests/facet_835.rs` と配下に追加する。
+製品コード・既存テストの期待値は変更せず、cargo による実行もしない。以下は新しい証明型と
+要件 snapshot の形が決まってから書く。`#[ignore]` や仮の型・製品 API は追加しない。
+
+- **証明の要件の和 (§4.2.2-1)**: 同じ generation / items_len で、長さ→AI、AI→長さの
+  各完了が先の要件を保持する。異なる generation / items_len の証明とは和をとらない。
+  現行 `DurationScanProof` には AI 要件を表す欄が無い。
+- **要件 snapshot と資格 (§4.2.2-2・5)**: 要件追加時の取消・再走査の挙動は段階 1 で
+  検査する。段階 3 では、旧 snapshot の Finished が新しい AI 要件を証明しないこと、
+  長さだけの証明 / AI だけの証明 / 両方の証明を区別した未充足要件の差集合も検査する。
+- **一覧採用での破棄 (§4.2.2-1)**: 段階 1 は既存 ready API で採用後の無効化を検査する。
+  段階 3 では統合証明自体が None になることと、旧一覧の遅着 Finished を検査する。
+- **context 所有 (§4.3)**: `viewer_context_registry.rs` の §1.762 の型依存テストを統合証明へ
+  置き換え、長さと AI の要件を含めた swap、fork 先は空・元は保持、bundle 破棄で兄弟を
+  失効させないことを検査する。段階 1 では既存の context テストを変更しない。
+- **段階取得との共存 (§4.2.2-7)**: AI だけ + サムネイルの長さ表示、および AI だけ + 詳細の
+  ページ数列の 2 経路で、実 worker の Finished を保持・解放し、全体の snapshot が証明へ
+  渡ったことを検査する。Ready / Reconciling だけを見て代用しない。証明成立後の本物の
+  VisibleStage が取消されずに完了し、既存の証明を上書きしないことも検査する。
+- **即時完了 (§4.2.2-8)**: 空一覧と全件 cache hit は段階 1 で既存の取得・ready API から
+  検査する。段階 3 では即時完了の統合証明に AI 要件が入ることを直接検査する。
+- **停止と資格 (§4.2.4・§4.2.2-9)**: 長さの証明を保った AI の停止・再開、および
+  requested 偽の実 AI 取得→長さの停止→両 AI メニューの初回 open は段階 1 で検査する。
+  段階 3 では両方の順序で部分証明そのものの保持と、停止中の未証明要件だけが不適用に
+  なることを確認する (まれな I/O 失敗ごとの回復テストは追加しない)。
+
+段階 1 の source inspection で分かった設計表との相違:
+
+- T8 の通知による追加・削除は現行でも緑の見込み。一方、facet 変更をまたぐ旧 Equal /
+  Different の**受理**は、現行 `proof_valid` が facet を含む key を照合して拒否するため、
+  テストだけの段階では赤の見込み。§7 の T8 一行全体を「緑」とする予測とは異なる。
+- `restore_facet_filter_suppression()` 自体は settings と名前欄の runtime を戻すだけ。
+  復元バッジの呼び出し側が直後に `rebuild_visible_indices()` を呼ぶ。T6/T7 はこの両方を
+  実行し、poll より前の投影も検査する。
+- 既存の app AI facet テストは主に `DetailsLazyMeta` / Ready を直接設定している。
+  T4〜T6 はそれを使わず、既存 `agent_ipc/item_info_tests.rs` と同じ parameters text chunk の
+  PNG を作り、本物の details meta worker の取得結果から取得済み / 未取得を区別する。
+- T1/T2 の選択・チェック時点は編集モードへ入る前なので、欄の表示・有効状態・値を検査する。
+  実クリックによる編集開始後は focus・TextEdit cursor・描画された draft も毎フレーム検査する。
+  `DragValue` の numeric accessibility 値は入力処理前の値を報告するため、当該フレームの
+  文字列は内部 TextEdit が出す value で確かめる。
