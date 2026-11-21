@@ -3,6 +3,9 @@ use super::*;
 use crate::folder_pane::{FolderPaneCursorScroll, FolderPaneState};
 use std::time::SystemTime;
 
+#[path = "folder_pane_reclick_tests.rs"]
+mod reclick;
+
 // These UI fixtures represent the main pane after startup admission. The
 // headless App constructor never drives NotStarted into a terminal indexer
 // outcome, so explicitly select the no-indexer outcome at fixture creation.
