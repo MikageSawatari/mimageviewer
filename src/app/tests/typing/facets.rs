@@ -83,6 +83,9 @@ impl Adapter for Facet {
                 }),
         }
     }
+    fn defers_results_during_ime(&self) -> bool {
+        matches!(self, Self::Name)
+    }
     fn ime_deferred_deadline(&self, app: &App) -> Option<Instant> {
         matches!(self, Self::Name)
             .then_some(app.facet_name_debounce_deadline)
@@ -165,6 +168,57 @@ fn typing_facet_name_ime_defers_until_commit() {
     let mut h = harness(Facet::Name, false);
     h.compose_ime(&["k", "か", "かな"], "かな");
     assert_cache_adopted(&h);
+}
+
+#[test]
+#[expect(deprecated, reason = "Exercise the real Windows IME Enabled event")]
+fn typing_facet_name_ime_missing_deadline_rejects_early_adoption() {
+    let mut h = harness(Facet::Name, false);
+    h.stage = "IME Preedit with synthetic early adoption and missing deadline".into();
+    h.composition_start = Some(0);
+    h.tick(vec![egui::Event::Ime(egui::ImeEvent::Enabled)]);
+    let since = probe::jobs().len();
+    h.expected = "alp".into();
+    h.tick(vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+        text: h.expected.clone(),
+        active_range_chars: None,
+    })]);
+    assert!(h.env.facet_name_debounce_deadline.is_some());
+
+    // Test-only counterexample: preserve a real focused, composing TextEdit,
+    // but make App look as if this preedit was already applied and delivered.
+    // No production frame phase or producer is replaced/modified.
+    h.env.settings.facet_filter.name_query = h.expected.clone();
+    h.env.facet_name_tokens = crate::search_query::parse(&h.expected);
+    h.env.facet_name_cache = h
+        .env
+        .items
+        .iter()
+        .map(|item| item.name().to_lowercase().into_boxed_str())
+        .collect();
+    h.env.facet_name_cache_generation = Some(h.env.items_generation);
+    h.env.visible_indices = vec![0, 1];
+    h.env.facet_name_debounce_deadline = None;
+    probe::job("facet-name", &h.expected, Outcome::Delivered(2));
+    h.assert_field();
+    assert!(h.adapter.defers_results_during_ime());
+    assert_eq!(
+        h.result_progress(since),
+        (true, true),
+        "ordinary result waiting would accept this counterexample"
+    );
+
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| h.wait_result(since)))
+        .expect_err("missing deadline must fail instead of accepting early adoption");
+    let message = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| failure.downcast_ref::<&str>().copied())
+        .expect("string panic payload");
+    assert!(
+        message.contains("missing IME deferral deadline"),
+        "must fail at the deadline check, not an unrelated invariant: {message}"
+    );
 }
 #[test]
 fn typing_facet_tag_suggestions_ascii() {

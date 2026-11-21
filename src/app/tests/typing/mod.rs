@@ -119,7 +119,11 @@ trait Adapter {
     fn opening_button(&self) -> Option<&'static str> {
         None
     }
-    /// A composition postpones this producer until Commit; return its actual deadline.
+    /// Expected product policy, independent of the observed debounce state.
+    fn defers_results_during_ime(&self) -> bool {
+        false
+    }
+    /// Observed state only. None is a violation when IME deferral is expected.
     fn ime_deferred_deadline(&self, _app: &App) -> Option<Instant> {
         None
     }
@@ -585,22 +589,27 @@ impl<A: Adapter> Harness<A> {
         )
     }
 
+    fn assert_ime_deferral(&self) -> Instant {
+        let deadline = self
+            .adapter
+            .ime_deferred_deadline(&self.env)
+            .unwrap_or_else(|| panic!("missing IME deferral deadline: {}", self.diagnostic()));
+        self.adapter.check_ime_deferred(&self.env, &self.expected);
+        deadline
+    }
+
     fn wait_result(&mut self, since: usize) {
-        let Some(field) = self.adapter.job() else {
-            self.assert_field();
-            return;
-        };
-        let expected = self.adapter.outcome(&self.expected);
-        if self.composition_start.is_some()
-            && let Some(original_deadline) = self.adapter.ime_deferred_deadline(&self.env)
-        {
+        if self.composition_start.is_some() && self.adapter.defers_results_during_ime() {
+            // Policy selects this branch. Losing the deadline, including after
+            // an erroneous early adoption, must never opt out of the check.
+            let original_deadline = self.assert_ime_deferral();
             // Exercise the product's actual 150 ms boundary while composing.
             // Elapsing it is not a result: the deadline must be renewed, the
             // old applied query retained, and no delivery may have occurred.
             let timeout = Instant::now() + DEADLINE;
             loop {
                 self.assert_field();
-                self.adapter.check_ime_deferred(&self.env, &self.expected);
+                let _ = self.assert_ime_deferral();
                 let (started, complete) = self.result_progress(since);
                 assert!(
                     started && !complete,
@@ -611,11 +620,9 @@ impl<A: Adapter> Harness<A> {
                     // Observe a real App update at/after the expired boundary,
                     // even if the runner was descheduled between earlier ticks.
                     self.tick(Vec::new());
-                    self.adapter.check_ime_deferred(&self.env, &self.expected);
+                    let renewed_deadline = self.assert_ime_deferral();
                     assert!(
-                        self.adapter
-                            .ime_deferred_deadline(&self.env)
-                            .is_some_and(|deadline| deadline > original_deadline),
+                        renewed_deadline > original_deadline,
                         "IME did not renew debounce: {}",
                         self.diagnostic()
                     );
@@ -630,6 +637,11 @@ impl<A: Adapter> Harness<A> {
                 self.tick(Vec::new());
             }
         }
+        let Some(field) = self.adapter.job() else {
+            self.assert_field();
+            return;
+        };
+        let expected = self.adapter.outcome(&self.expected);
         let deadline = Instant::now() + DEADLINE;
         loop {
             self.assert_field();
