@@ -309,11 +309,15 @@ impl App {
         result: Result<(), FolderPaneReclickRejection>,
         started: std::time::Instant,
     ) {
-        if let Err(reason) = result {
-            crate::logger::log(format!(
+        match result {
+            Ok(()) => crate::logger::log(format!(
+                "folder pane reclick accepted path={}",
+                path.display()
+            )),
+            Err(reason) => crate::logger::log(format!(
                 "folder pane reclick refused: {reason:?} path={}",
                 path.display()
-            ));
+            )),
         }
         if crate::perf::is_enabled() {
             crate::perf::event(

@@ -730,6 +730,10 @@ fn sidecar_tree_frame(
             app.poll_book_bookmark_service_responses();
             app.poll_spread_shift_service();
             app.service_update_registered_writers(ctx);
+            // App::ui services the mounted HistoryTransition owner in
+            // render_update_before_frame, before update_frame's input begin.
+            // render_other_worker_results below does not poll this producer.
+            app.poll_history_navigation_transition_for_test(ctx);
             app.input_update_begin(ctx);
             app.service_edit_completions(ctx, std::time::Instant::now());
             app.service_initial_worker_results(ctx, &mut None);

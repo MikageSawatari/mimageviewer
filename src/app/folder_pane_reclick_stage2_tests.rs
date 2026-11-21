@@ -70,7 +70,7 @@ fn reclick_stage2_no_refresh(app: &App, generation: u64) {
     assert_eq!(app.items_generation, generation);
 }
 
-fn reclick_stage2_sidecar_scenario(clicks: usize, across: bool) {
+fn reclick_stage2_sidecar_fixture() -> (AppTestEnvForTest, egui::Context, PathBuf) {
     let (mut app, ctx, _, a, _) = reclick_stage2_fixture();
     // This file did not belong to the installed list. Its adjustment is present
     // only in the sidecar, so the reclick's real install must start recovery.
@@ -87,8 +87,92 @@ fn reclick_stage2_sidecar_scenario(clicks: usize, across: bool) {
     );
     assert!(sidecar.flush_blocking());
     app.settings.sidecar_backup_enabled = true;
+    assert!(
+        app.current_folder_last_mtime.is_some(),
+        "GridReload must use its worker branch"
+    );
+    assert!(app.current_list_refresh_intent().imports_sidecars());
+    assert!(app.sidecar_restore.is_none());
+    let key = crate::adjustment_db::normalize_path(&a.join("external.png"));
+    assert!(
+        app.adjustment_db
+            .as_ref()
+            .unwrap()
+            .get_page_params(&key)
+            .is_none()
+    );
+    (app, ctx, a)
+}
+
+fn reclick_stage2_wait_for_sidecar(
+    app: &mut App,
+    ctx: &egui::Context,
+    relay: &std::rc::Rc<sidecar_restore::SidecarCheckingRelay>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app.sidecar_restore.is_none() {
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_some(),
+            "the explicit refresh must adopt into real sidecar restoration"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the explicit refresh preflight must finish"
+        );
+        sidecar_tree_frame(app, ctx, 10.02, vec![], Some(relay.clone()));
+        std::thread::yield_now();
+    }
+    assert!(
+        app.top_level_grid_view
+            .history_navigation_transition()
+            .is_none()
+    );
+    while !relay.captured() {
+        assert!(
+            Instant::now() < deadline,
+            "the real checking worker must reach its relay"
+        );
+        sidecar_tree_frame(app, ctx, 10.03, vec![], None);
+        std::thread::yield_now();
+    }
+}
+
+fn reclick_stage2_assert_sidecar_imported(app: &App, folder: &Path) {
+    let key = crate::adjustment_db::normalize_path(&folder.join("external.png"));
+    let params = app
+        .adjustment_db
+        .as_ref()
+        .unwrap()
+        .get_page_params(&key)
+        .expect("the real sidecar import must restore the external file's adjustment");
+    assert_eq!(params.brightness, 12.0);
+    assert!(app.adjusted_page_keys.contains(&key));
+}
+
+#[test]
+fn folder_pane_reclick_grid_reload_control_starts_same_location_sidecar_restore() {
+    let (mut app, ctx, a) = reclick_stage2_sidecar_fixture();
+    let imports = sidecar_restore::import_starts_for_test();
+    let relay = sidecar_restore::SidecarCheckingRelay::new();
+    let history = app.folder_nav_history_snapshot();
+    app.reload_top_level_grid(&ctx);
+    reclick_stage2_refresh_request(&app, &a);
+    reclick_stage2_wait_for_sidecar(&mut app, &ctx, &relay);
+    assert_eq!(sidecar_restore::import_starts_for_test(), imports + 1);
+    assert!(app.sidecar_restore_blocks_projected_context());
+    finish_sidecar_tree(&mut app, &ctx, &relay, 10.20);
+    reclick_stage2_assert_sidecar_imported(&app, &a);
+    assert_eq!(app.current_folder.as_ref(), Some(&a));
+    assert_eq!(app.folder_nav_history_snapshot(), history);
+}
+
+fn reclick_stage2_sidecar_scenario(clicks: usize, across: bool) {
+    let (mut app, ctx, a) = reclick_stage2_sidecar_fixture();
     let pos = visible_label_click_rect(&ctx, &a).center();
     let history = app.folder_nav_history_snapshot();
+    let imports = sidecar_restore::import_starts_for_test();
     #[cfg(all(windows, feature = "test-script"))]
     let loads = app.test_script_folder_load_requests;
     let relay = sidecar_restore::SidecarCheckingRelay::new();
@@ -103,23 +187,8 @@ fn reclick_stage2_sidecar_scenario(clicks: usize, across: bool) {
     reclick_stage2_refresh_request(&app, &a);
     assert!(app.folder_pane_open_pending.is_none());
     assert_label_expanded(&app, &a, true);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while app.sidecar_restore.is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "the reclick refresh must start real sidecar restoration"
-        );
-        sidecar_tree_frame(&mut app, &ctx, 10.02, vec![], Some(relay.clone()));
-        std::thread::yield_now();
-    }
-    while !relay.captured() {
-        assert!(
-            Instant::now() < deadline,
-            "the real checking worker must reach its relay"
-        );
-        sidecar_tree_frame(&mut app, &ctx, 10.03, vec![], None);
-        std::thread::yield_now();
-    }
+    reclick_stage2_wait_for_sidecar(&mut app, &ctx, &relay);
+    assert_eq!(sidecar_restore::import_starts_for_test(), imports + 1);
     assert!(app.sidecar_restore_blocks_projected_context());
     assert!(ctx.input(|input| input.pointer.latest_pos().is_none()));
     let state = app.sidecar_restore.as_ref().unwrap();
@@ -196,6 +265,8 @@ fn reclick_stage2_sidecar_scenario(clicks: usize, across: bool) {
         assert_eq!(app.items_generation, generation);
     }
     finish_sidecar_tree(&mut app, &ctx, &relay, 10.20);
+    reclick_stage2_assert_sidecar_imported(&app, &a);
+    assert_eq!(sidecar_restore::import_starts_for_test(), imports + 1);
     assert_eq!(app.current_folder.as_ref(), Some(&a));
     assert_eq!(app.folder_nav_history_snapshot(), history);
     assert!(
