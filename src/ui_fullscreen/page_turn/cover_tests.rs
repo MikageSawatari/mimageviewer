@@ -179,6 +179,8 @@ fn page_turn_paged_prefetch_single_size_change_and_media_keep_real_navigation() 
 
 #[test]
 fn page_turn_paged_prefetch_retained_cover_before_accept_starts_and_finishes() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
         let ctx = egui::Context::default();
         let mut app = crate::app::paged_prefetch_tests::pdf_book(&ctx);
@@ -488,6 +490,8 @@ fn navigate(
 
 #[test]
 fn page_turn_reported_cover_first_pair_eight_routes_start_and_complete() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut routes = 0;
     for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
         for side in [false, true] {
@@ -524,6 +528,8 @@ fn page_turn_reported_cover_first_pair_eight_routes_start_and_complete() {
 
 #[test]
 fn page_turn_reported_twelve_page_tail_remains_pair_with_or_without_supplement() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
         for side in [false, true] {
             for supplement in [false, true] {
@@ -549,6 +555,8 @@ fn page_turn_reported_twelve_page_tail_remains_pair_with_or_without_supplement()
 
 #[test]
 fn page_turn_tail_singleton_and_supplement_sixteen_routes_start_and_complete() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut routes = 0;
     for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
         for side in [false, true] {
@@ -604,6 +612,8 @@ fn page_turn_tail_singleton_and_supplement_sixteen_routes_start_and_complete() {
 
 #[test]
 fn page_turn_supplemented_landscape_and_forced_last_preserve_builder_roles() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
         for landscape in [false, true] {
             for forced_last in [false, true] {
@@ -685,6 +695,8 @@ fn page_turn_supplemented_landscape_and_forced_last_preserve_builder_roles() {
 
 #[test]
 fn page_turn_two_page_book_reuses_cover_texture_without_reusing_occurrence() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
         let ctx = egui::Context::default();
         let mut app = book(&ctx, mode, 2, false, false, true);
@@ -715,6 +727,8 @@ fn page_turn_two_page_book_reuses_cover_texture_without_reusing_occurrence() {
 
 #[test]
 fn page_turn_white_automatic_companions_turn_both_ways_without_real_blank_pages() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
         for after_cover in [false, true] {
             let ctx = egui::Context::default();
@@ -871,6 +885,8 @@ fn page_turn_endpoint_override_keeps_saved_global_and_book_values_and_other_read
 
 #[test]
 fn page_turn_cover_cancel_to_off_repaints_saved_center_before_completing() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
         let ctx = egui::Context::default();
         let mut app = book(&ctx, mode, 12, false, false, false);
@@ -1009,6 +1025,8 @@ fn page_turn_cover_cancel_to_off_repaints_saved_center_before_completing() {
 
 #[test]
 fn page_turn_cover_setting_change_retires_old_flat_evidence_and_commits_continuation_once() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     for mode in [SpreadMode::LtrCover, SpreadMode::RtlCover] {
         for change_after_output in [false, true] {
             for final_enabled in [false, true] {

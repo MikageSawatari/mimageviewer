@@ -300,6 +300,8 @@ fn depth_entry_stops_edit_tools_with_its_own_reason() {
 
 #[test]
 fn depth_none_viewer_pass_retires_owner_before_deferred_or_closed_early_return() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let ctx = egui::Context::default();
     let mut app = crate::app::setup_app_for_test();
     install_depth(&mut app);

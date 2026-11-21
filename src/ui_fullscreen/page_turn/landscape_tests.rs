@@ -195,6 +195,8 @@ fn started_and_finished(ctx: &egui::Context, app: &mut App, from: usize, to: usi
 
 #[test]
 fn page_turn_reported_landscape_mid_book_all_five_boundaries_complete_in_both_directions() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut completed = 0;
     for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
         for side in [false, true] {
@@ -218,6 +220,8 @@ fn page_turn_reported_landscape_mid_book_all_five_boundaries_complete_in_both_di
 
 #[test]
 fn page_turn_rotated_portrait_and_landscape_follow_normal_composition_and_complete() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut completed = 0;
     use crate::rotation_db::Rotation::*;
     for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
@@ -276,6 +280,8 @@ fn page_turn_landscape_faces_aggregate_into_one_physical_visibility_receipt() {
 
 #[test]
 fn page_turn_single_portrait_landscape_eight_routes_start_and_complete() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut completed = 0;
     for reading_direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
         let ctx = egui::Context::default();
@@ -291,6 +297,8 @@ fn page_turn_single_portrait_landscape_eight_routes_start_and_complete() {
 
 #[test]
 fn page_turn_duration_preferences_change_cancels_through_existing_flat_completion() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     use crate::ui_fullscreen::page_turn_submission_tests::seed_leaf;
     let ctx = egui::Context::default();
     let mut app = ready_app(&ctx, SpreadMode::Single);
@@ -321,6 +329,8 @@ fn page_turn_duration_preferences_change_cancels_through_existing_flat_completio
 
 #[test]
 fn page_turn_shape_gutter_difference_with_current_content_starts_and_completes() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut completed = 0;
     for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
         for (from, to, forward) in [(2, 4, true), (4, 2, false), (4, 5, true), (5, 4, false)] {
@@ -354,6 +364,8 @@ fn page_turn_shape_gutter_difference_with_current_content_starts_and_completes()
 
 #[test]
 fn page_turn_gap_setting_change_before_repaint_skips_stale_outgoing_at_acceptance() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut skipped = 0;
     for mode in [SpreadMode::Ltr, SpreadMode::Rtl] {
         for (a, b) in [(0, 2), (2, 4), (4, 5)] {

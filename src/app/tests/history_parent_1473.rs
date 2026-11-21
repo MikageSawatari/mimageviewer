@@ -17,6 +17,9 @@ pub(super) struct CaseEnv {
     _guard: super::phase_c_support::OverrideGuard,
     tmp: tempfile::TempDir,
     _lock: std::sync::MutexGuard<'static, ()>,
+    // Match phase_c_support: input first on acquisition, last on field drop.
+    #[cfg(windows)]
+    _input: crate::key_input::TestInputGuard,
 }
 impl std::ops::Deref for CaseEnv {
     type Target = App;
@@ -37,6 +40,8 @@ pub(super) fn setup_with_ai_runtime(
     portable_layout: bool,
     ai_runtime: AiRuntimeFixture,
 ) -> CaseEnv {
+    #[cfg(windows)]
+    let input = crate::key_input::lock_test_input();
     let lock = crate::data_dir::test_override_lock();
     let tmp = tempfile::TempDir::new().unwrap();
     let data_dir = tmp.path().join(if portable_layout {
@@ -68,7 +73,28 @@ pub(super) fn setup_with_ai_runtime(
         _guard: guard,
         tmp,
         _lock: lock,
+        #[cfg(windows)]
+        _input: input,
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn history_fixture_owns_input_through_nested_guard_and_partial_app_drop() {
+    use crate::key_input::{PhysicalKeySlot, lock_test_input, physical_key_down};
+
+    let slot = PhysicalKeySlot::new(0x11, false);
+    {
+        let explicit = lock_test_input();
+        let fixture = setup(false);
+        drop(explicit);
+        assert!(!physical_key_down(slot));
+        let nested = lock_test_input();
+        drop(fixture.app);
+        drop(nested);
+        assert!(!physical_key_down(slot));
+    }
+    assert!(std::panic::catch_unwind(|| physical_key_down(slot)).is_err());
 }
 
 #[derive(Clone, Copy, Debug)]

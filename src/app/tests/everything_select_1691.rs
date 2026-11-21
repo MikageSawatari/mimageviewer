@@ -18,10 +18,14 @@ struct Frames {
     /// The field's own galley and where it was painted in the latest pass.
     painted: Option<(egui::Pos2, std::sync::Arc<egui::Galley>)>,
     labels: Vec<(String, egui::Rect)>,
+    #[cfg(windows)]
+    _input: crate::key_input::TestInputGuard,
 }
 
 impl Frames {
     fn new(query: &'static str, ppp: f32) -> Self {
+        #[cfg(windows)]
+        let input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         // EpiIntegration supplies real time, but these tests exercise only
@@ -40,6 +44,8 @@ impl Frames {
             copied: Vec::new(),
             painted: None,
             labels: Vec::new(),
+            #[cfg(windows)]
+            _input: input,
         }
     }
 
@@ -200,6 +206,8 @@ impl Bar {
 
 /// Open the Everything field through the product entry with `query` as its draft.
 fn open(bar: Bar, query: &'static str, ppp: f32) -> (AppTestEnv, Frames, egui::Rect) {
+    // Acquire input before the App's data-dir lease, like other App-driving tests.
+    let mut frames = Frames::new(query, ppp);
     let mut env = setup_app();
     env.initialized = true;
     env.settings.update_check_enabled = false;
@@ -207,7 +215,6 @@ fn open(bar: Bar, query: &'static str, ppp: f32) -> (AppTestEnv, Frames, egui::R
     env.indexer_init = IndexerInit::Unavailable;
     env.settings.show_toolbar_search_everything = bar.pinned;
     env.settings.toolbar_section_drag_enabled = bar.drag;
-    let mut frames = Frames::new(query, ppp);
     frames.idle(&mut env, 3);
     env.open_everything_search();
     assert!(

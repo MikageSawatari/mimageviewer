@@ -200,6 +200,8 @@ fn measured_offer(source_size: [usize; 2], output_size: [u32; 2], old_bytes: u64
 
 #[test]
 fn demand_matched_native_materials_survive_eviction_through_real_next_frame_draw() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let ctx = egui::Context::default();
     install(&ctx);
     let mut app = ready_app(&ctx, SpreadMode::Ltr);
@@ -346,6 +348,8 @@ fn measured_native_pin_acceptance_survives_preparation_duration() {
 
 #[test]
 fn real_offer_and_prepared_pin_boundaries_admit_equality_and_reject_excess() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     for prepared in [false, true] {
         for margin in [-1_i64, 0, 1] {
             let ctx = egui::Context::default();
@@ -454,6 +458,8 @@ fn real_offer_and_prepared_pin_boundaries_admit_equality_and_reject_excess() {
 
 #[test]
 fn prepared_pin_recheck_rejects_output_that_exceeds_budget_after_input_release() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let ctx = egui::Context::default();
     install(&ctx);
     let budget =

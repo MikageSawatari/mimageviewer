@@ -98,6 +98,8 @@ fn realmachine50_equal_rect_replacement_keeps_keys_on_owning_hwnd() {
 
 #[test]
 fn headless_fullscreen_focus_records_request_only_for_foreign_foreground() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     for foreign in [false, true] {
         let foreground = 11;
         let target = if foreign { 22 } else { foreground };
