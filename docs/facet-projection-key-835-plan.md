@@ -65,6 +65,16 @@ key に facet が入っているので、行を作る条件が同じでも key �
 - AI モデル・ツールの絞り込みの取得を、長さと同じ「一覧全体の走査 + 取得の証明」へ移す (§4.2)。
   - key から facet を外すと表に出る既存の欠陥で、同時に直さないと退行になる。
 
+§7 T1・T2 のキー所有について、サイズ・長さの範囲欄と、同じ facet バーの同型の欄である
+日付の範囲の年・月・日および「日数を指定」を、既存の `ime_focus::track_drag_value_focus` に登録した。
+メニューが閉じなくなって初めて表に出る同じ入力所有の欠落なので、今回の修正範囲に含める。
+未登録の DragValue は `KeyboardOwner::FocusedUi` になり、一覧用の
+`blocks_legacy_main_shortcuts` では止まらない。描画前の `handle_keyboard` が
+`key_pressed(ArrowLeft)` を読んで一覧カーソルを動かしていた。
+登録後は既存の TextInput 所有と共通ゲートが働く。共通の所有判定、キー割り当て、
+detached の述語や viewport 経路は変更していない。色の R/G/B・H/S/L は既存の
+`color_filter.input_has_focus` から TextInput 所有へ渡り一覧のゲートで止まることをソースで確認し、変更しない。
+
 key に残すもの:
 
 - `sort`
@@ -318,7 +328,13 @@ CLAUDE.md「設計の簡素化」に沿って、組み合わせそのものを�
     - sidecar restore のモーダル扱いに入らない
     - キーが一覧へ届かない (選択が動かない、何も開かない)
   - 修正前は、「範囲指定」の選択やチェックで先に赤になることがある。
+  - 左矢印では、一覧の選択と編集中のフォーカスの保持に加え、当該欄が TextInput owner であることと、
+    欄の実カーソルが移動したことも確かめる。Enter も一覧の項目を開かず欄で確定することを検査する。
 - **T2**: T1 と同じことを、サイズの範囲指定で行う。
+- **同型の日付入力**: `facet_835_date_range_year_types_each_character_and_owns_left` と
+  `facet_835_custom_days_types_each_character_and_owns_left` で、年・日数を実クリックで編集し、
+  Text を別フレームで1文字ずつ送る。入力途中のdraft、値、フォーカス、左矢印による欄内カーソル移動、
+  TextInput所有、一覧選択と世代の保持、メニュー維持、読み直し・項目open・sidecar modalの不発を検査する。
 - **T3**: 長さ・サイズの 4 区切りと拡張子を切り替える。`items_generation` が進まず、visible_indices が期待どおりであることを確かめる。
 - **T4** (AI 条件 + ほかの条件の解除):
   - AI 条件とサイズ条件を付け、サイズの外に、AI 条件に合う画像 B を置く。
@@ -408,7 +424,7 @@ AIを要求しない通常列の`CurrentGrid`の検査は維持する。
 
 段階1の21本に加え、統合証明と要件snapshotの契約を`src/app/tests/facet_835/proof.rs`へ12本、
 表示集合の拡大後の通常列取得を`src/app/tests/facet_835/visible_requirements.rs`へ7本追加した。
-context所有の1本を含め、`facet_835_`で始まるテストは計41本になった。
+context所有の1本と同型の日付入力の2本 (§7) を含め、`facet_835_`で始まるテストは計43本になった。
 以下のテスト名は共通の`facet_835_`を省略する。`#[ignore]`や仮の型・製品APIは追加していない。
 段階2・3のcargo実行と結果の記録は設計担当が行う。この実装作業では実行しておらず、実機も未確認。
 
@@ -441,6 +457,9 @@ context所有の1本を含め、`facet_835_`で始まるテストは計41本に�
   停止中は未証明条件だけが不適用になること、再開後の要件の和を検査する。
   requested偽の実AI取得→長さの停止→両AIメニューの初回openは段階1のテストを維持する。
   まれなI/O失敗ごとの回復テストは追加しない。
+  AI条件が証明済みなら音声も非該当として除外する既存仕様を保つ (`facet_ai_filter_applies`)。
+  両条件を適用した結果が空になる場合も、`ignore = AiModel` / `Duration` の候補判定で、
+  長さとAIの効き方を独立に検査する。音声がAI条件を素通りするというテストの誤った前提を訂正した。
 - **表示集合の拡大後の通常列 (§4.2.2-10)**: `visible_requirements.rs`の
   `size_expansion_acquires_hidden_columns_and_sorts_without_reload`、
   `rating_expansion_acquires_hidden_columns_and_sorts_without_reload`、

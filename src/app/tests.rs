@@ -112350,6 +112350,10 @@ fn media_duration_badge_reads_memory_without_changing_details_format() {
 #[test]
 fn media_duration_thumbnail_ai_ready_stage_requests_new_range_without_reloading_ai() {
     let mut app = setup_media_duration_thumbnail_app();
+    // Target construction distinguishes projected rows from whole-listing-only
+    // rows, so establish the real projection before requesting AI metadata.
+    app.rebuild_visible_indices();
+    assert_eq!(app.visible_indices, [0, 1, 2, 3, 4]);
     app.ai_model_facet_requested = true;
     app.keep_set = HashSet::from([4]);
     app.details_tag_prewarm_indices = vec![0, 1];

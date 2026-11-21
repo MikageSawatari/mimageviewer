@@ -672,7 +672,13 @@ fn facet_835_duration_proof_survives_ai_stop_resume_and_only_unproven_ai_is_igno
     assert_eq!(complete.generation, partial.generation);
     assert_eq!(complete.items_len, partial.items_len);
     assert!(app.unproven_listing_meta_requirements().is_empty());
-    assert_eq!(app.visible_indices, [3]);
+    assert!(
+        app.visible_indices.is_empty(),
+        "proven AI excludes audio; proven lengths exclude images"
+    );
+    assert!(app.passes_facet_filter(3, Some(FacetField::AiModel)));
+    assert!(!app.passes_facet_filter(4, Some(FacetField::AiModel)));
+    assert!(app.passes_facet_filter(0, Some(FacetField::Duration)));
     assert!(!app.passes_facet_filter(2, Some(FacetField::Duration)));
 }
 
@@ -689,7 +695,7 @@ fn facet_835_ai_proof_survives_duration_stop_resume_and_only_unproven_lengths_ar
         !app.ai_model_facet_requested,
         "direct application did not open a menu"
     );
-    assert_eq!(app.visible_indices, [0, 1, 3, 4]);
+    assert_eq!(app.visible_indices, [0, 1]);
 
     app.settings.facet_filter.duration_preset = Some(FacetDurationPreset::Under1Minute);
     app.rebuild_visible_indices();
@@ -711,9 +717,11 @@ fn facet_835_ai_proof_survives_duration_stop_resume_and_only_unproven_lengths_ar
         assert_eq!(app.unproven_listing_meta_requirements(), LENGTHS);
         assert_eq!(
             app.visible_indices,
-            [0, 1, 3, 4],
-            "AI still excludes C; unproved lengths do not hide media or images"
+            [0, 1],
+            "proven AI excludes C and audio; unproved lengths do not hide matching images"
         );
+        assert!(app.passes_facet_filter(3, Some(FacetField::AiModel)));
+        assert!(app.passes_facet_filter(4, Some(FacetField::AiModel)));
     }
     cache_lengths(&mut app);
     app.resume_details_meta_loading();
@@ -725,5 +733,12 @@ fn facet_835_ai_proof_survives_duration_stop_resume_and_only_unproven_lengths_ar
     assert_eq!(complete.generation, partial.generation);
     assert_eq!(complete.items_len, partial.items_len);
     assert!(app.unproven_listing_meta_requirements().is_empty());
-    assert_eq!(app.visible_indices, [3]);
+    assert!(
+        app.visible_indices.is_empty(),
+        "proven AI excludes audio; newly proven lengths exclude images"
+    );
+    assert!(app.passes_facet_filter(3, Some(FacetField::AiModel)));
+    assert!(!app.passes_facet_filter(4, Some(FacetField::AiModel)));
+    assert!(app.passes_facet_filter(0, Some(FacetField::Duration)));
+    assert!(!app.passes_facet_filter(2, Some(FacetField::Duration)));
 }

@@ -455,8 +455,8 @@ fn facet_835_ai_menus_preserve_stopped_unproven_duration_after_direct_ai_acquisi
         );
         assert_eq!(
             h.visible_names(),
-            ["A.png", "B.png", "clip.wav"],
-            "proven AI condition remains effective; unproved lengths leave media visible"
+            ["A.png", "B.png"],
+            "proven AI excludes non-AI media even while lengths are unproved"
         );
         assert_eq!(h.env.items_generation, generation);
     }
