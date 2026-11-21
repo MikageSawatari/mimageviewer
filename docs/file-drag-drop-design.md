@@ -9,6 +9,7 @@
 
 **改訂履歴**:
 
+- 2026-11-21: §1.844 (v5.6.0)。§1.836 のサブ PC 確認で、一覧の空白・ツリーの非行領域が「＋ コピー」のままだったため、受け側が拒否した decision はすべて明示の禁止画像 (`DROPIMAGE_NONE`) を書く。判定・effect・転送は変更しない。§12.3.1。
 - 2026-11-21: §1.836。`BHID_DataObject` の `SetData(DropDescription)` が E_NOTIMPL を返すことを実 Shell 回帰で再現したため、送出 wrapper が説明の値を所有する。転送と OLE effect は変更しない。契約と未検証範囲は §12.3.1。
 - 2026-11-20: §1.464 は [folder-tree-dnd-plan.md](folder-tree-dnd-plan.md) が正本。ROOT の受け取りを自前 OLE target へ置き換え、表示済み pass の形でツリー行を判定する。内部の移動・コピーは整理先と同じ Shell worker へ送り、外への送出効果は COPY のまま。generic Shell image と target の drop description を使い、独立した SetFlags・InitializeFrom*・custom IDropSource は追加しない。検証の実施状況は正本の実装記録を参照。
 - 2026-07-24: 一覧のクリック選択方式 (チェック方式 / エクスプローラー方式) を追加。
@@ -1049,15 +1050,30 @@ FALSE の所有権指定だけが拒否理由だとは断定せず、TRUE なら
 - Performed DropEffect の入力検証・inner への委譲・HRESULT/fRelease・async 完了の契約は変更しない。
   mIV → Explorer の target による説明書込みも外側が受け、Explorer 等 → mIV は元の外部 object へ従来どおり書く。
 
-受け側の判定・本番 writer は変更しない。Move は `DROPIMAGE_MOVE` と「%1 へ移動」、Copy は
-`DROPIMAGE_COPY` と「%1 へコピー」。一覧の空白・同じ一覧・ツリー空白・hit なしは
-INVALID と effect NONE により既定の非受付表示へ戻し、元フォルダ自身・同じ親等の行上の拒否は
-NONE の禁止画像にする。DragLeave は INVALID に戻す。成功後の `update_drag_window` と、
+受理・拒否の判定と本番 writer は維持する。Move は `DROPIMAGE_MOVE` と「%1 へ移動」、Copy は
+`DROPIMAGE_COPY` と「%1 へコピー」。§1.844 (v5.6.0) では**拒否した decision はすべて明示的な
+`Description::None` (`DROPIMAGE_NONE`)** とする。一覧の空白・同じ一覧・ツリーの非行領域・
+hit なし・パス形式を持たない外部 source も、この禁止画像を要求する。
+`Description::Invalid` (`DROPIMAGE_INVALID`) は受理した外部一覧ドロップ (`Decision::Grid`) と、
+DragLeave / finish_session (Drop 後や次の DragEnter による前 session の終了を含む) のリセットだけに残す。
+成功後の `update_drag_window` と、
 説明が変わったときだけ一度書込み・失敗をログする `DragSession::describe` も維持する。
 画像の意味は [DROPIMAGETYPE の仕様](https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/ne-shlobj_core-dropimagetype) による。
 SHDoDragDrop の COPY 限定、target の COPY/NONE、実転送・競合・更新経路は変更しない。
 
-追加回帰は `drag_data_object_drop_description_` と `main_drop_shell_description_` で選択できる。
+§1.844 の根拠 (§1.836 のサブ PC 確認。観測者: **サブ PC テスター、RDP 越し、build `833e7c7b5`**):
+ツリー行では「→ dst2 へ移動」「＋ dst2 へコピー」が Ctrl・行変更に追従し、実転送とも一致した。
+元の親やフォルダ自身等の拒否行では禁止画像が出て、`drop description failed` は 0 行だった。
+一方、内部 drag の一覧空白・ツリーのヘッダー帯ではコピーの＋が残り、行から一覧空白に移ると
+移動先の説明が「＋ コピー」へ変わった。離しても何も起きない点は正しかった。
+2 個目の mIV を外部 source とした場合もツリー非行領域はコピーの＋になり、受信側一覧への
+受理されたドロップはコピー表示・コピー結果とも正しかった。
+このため、初期設計の「INVALID と effect NONE なら禁止画像になる」という推測は撤回する。
+この観測では INVALID が Shell のコピー既定画像に戻り、明示的な NONE の行だけが禁止画像になった。
+`SHDoDragDrop done effect=1` は転送しなかった drag を含む全件で報告されたが、今回その返値や effect は変更しない。
+
+追加回帰は `drag_data_object_drop_description_`、`main_drop_shell_description_`、§1.844 の
+`main_drop_nodrop_` で選択できる。
 TRUE/FALSE の所有権、保存前委譲、独立した GetData 結果と置換、不正入力、
 drag ごとの分離、Performed 完了、実 Shell object と fake visuals による非受付・DragLeave を記述した。
 初回の独立した GPT-6.1 Sol / xhigh の設計・完了時の静的レビューは ACCEPT だったが、
@@ -1067,8 +1083,13 @@ drag ごとの分離、Performed 完了、実 Shell object と fake visuals に�
 正確な破壊箇所は未確定だが、この結果を受けた設計担当の判断で列挙拡張と当該テスト、専用 mock 拡張を撤去した。
 静的 ACCEPT はこの実行失敗を否定する根拠にはしない。実装者は cargo fmt と静的検査だけを行い、
 撤去後のコンパイル・テスト実行は共有 runner に引き継ぐ。
-generic Shell image での実表示 (移動・コピー・NG-2、外向きの Explorer) は、この headless 回帰の成功だけでは
-確認できず、実機検証に残る。
+§1.844 では handler / session レベルと native callback で、拒否した一覧・ツリー非行領域・hit なし・
+パスのない外部 source が NONE と effect NONE、行→一覧が Transfer→None、受理した外部一覧が
+INVALID と COPY、離脱時が INVALID となることを記述した。実装者は実行していない。
+明示的な禁止画像に変えた一覧空白・ツリー非行領域の実表示と、外向き Explorer は実機確認に残る。
+既定 source / helper が後から DropDescription を書き直すかは、mIV のソースだけでは確定できない。
+wrapper は最後の SetData を保存し、DragSession は自分が要求した説明の変化だけを検出する。
+上書きを想定した再適用・追加の状態や effect の変更は、§1.844 には含めない。
 
 ### 12.4 寿命と async 状態の単一 owner
 
