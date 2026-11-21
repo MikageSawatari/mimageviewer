@@ -100,6 +100,26 @@ impl Drop for Sta {
     }
 }
 
+/// Use the production source object on an STA, without a drag loop or window.
+pub(crate) fn with_shell_drag_data_object(
+    paths: &[std::path::PathBuf],
+    check: impl FnOnce(&IDataObject),
+) {
+    let _sta = Sta::new();
+    let (inner, failed) = crate::file_drag::shell_data_object_for_paths(paths).unwrap();
+    assert_eq!(failed, 0);
+    let drag = DragDataObject::new(inner).unwrap();
+    struct FinishModal<'a>(&'a DragDataObject);
+    impl Drop for FinishModal<'_> {
+        fn drop(&mut self) {
+            // Break the Armed self-reference even when a RED assertion unwinds.
+            let _ = self.0.finish_modal();
+        }
+    }
+    let _finish = FinishModal(&drag);
+    check(&drag.data);
+}
+
 fn format() -> FORMATETC {
     FORMATETC {
         cfFormat: CF_HDROP.0,

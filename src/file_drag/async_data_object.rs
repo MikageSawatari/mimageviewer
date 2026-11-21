@@ -321,4 +321,4 @@ impl IDataObject_Impl for AsyncDataObject_Impl {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

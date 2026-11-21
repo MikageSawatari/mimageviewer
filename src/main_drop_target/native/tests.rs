@@ -6,6 +6,82 @@ use windows::Win32::System::Com::{
 };
 use windows::core::{BOOL, HRESULT, Interface};
 
+#[test]
+fn main_drop_shell_description_move_copy_invalid_round_trip_and_replace() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = [
+        temp.path().join("first.txt"),
+        temp.path().join("日本語.txt"),
+    ];
+    for path in &paths {
+        std::fs::write(path, b"disposable drop description test").unwrap();
+    }
+    let move_dir = temp.path().join("dst2");
+    let copy_dir = temp.path().join("コピー先");
+    for dir in [&move_dir, &copy_dir] {
+        std::fs::create_dir(dir).unwrap();
+    }
+
+    crate::file_drag::with_shell_drag_data_object(&paths, |data| {
+        // SHDoDragDrop and IDropTargetHelper receive this outer object, not its inner
+        // Shell IDataObject. Exercise the real target writer and read the same object.
+        let target_data = OleData(data.clone());
+        let cf = unsafe { RegisterClipboardFormatW(CFSTR_DROPDESCRIPTION) } as u16;
+        assert_ne!(cf, 0);
+        for (description, image, message, insert) in [
+            (
+                Description::Transfer(ShellTransferOperation::Move, move_dir.clone()),
+                DROPIMAGE_MOVE,
+                "%1 へ移動",
+                "dst2",
+            ),
+            (
+                Description::Transfer(ShellTransferOperation::Copy, copy_dir.clone()),
+                DROPIMAGE_COPY,
+                "%1 へコピー",
+                "コピー先",
+            ),
+            (Description::Invalid, DROPIMAGE_INVALID, "", ""),
+            (
+                Description::Transfer(ShellTransferOperation::Move, copy_dir.clone()),
+                DROPIMAGE_MOVE,
+                "%1 へ移動",
+                "コピー先",
+            ),
+        ] {
+            let result = target_data.set_description(&description);
+            assert!(
+                result.is_ok(),
+                "production SetData(DropDescription) must accept {description:?}: {result:?}"
+            );
+            let medium = Medium(
+                unsafe { data.GetData(&format(cf)) }.unwrap_or_else(|error| {
+                    panic!("GetData(DropDescription) after {description:?}: {error}")
+                }),
+            );
+            assert_eq!(medium.0.tymed, TYMED_HGLOBAL.0 as u32);
+            let global = unsafe { medium.0.u.hGlobal };
+            assert!(unsafe { GlobalSize(global) } >= std::mem::size_of::<DROPDESCRIPTION>());
+            let ptr = unsafe { GlobalLock(global) };
+            assert!(!ptr.is_null());
+            let actual = unsafe { ptr.cast::<DROPDESCRIPTION>().read_unaligned() };
+            let _ = unsafe { GlobalUnlock(global) };
+            // DROPDESCRIPTION is packed: copy fields by value, never borrow them.
+            let (actual_type, actual_message, actual_insert) =
+                (actual.r#type, actual.szMessage, actual.szInsert);
+            assert_eq!(actual_type, image, "{description:?}");
+            // Compare every UTF-16 unit, including NUL termination and cleared tails.
+            // Invalid must clear the old message/insert; subsequent writes replace it.
+            for (actual, expected) in [(actual_message, message), (actual_insert, insert)] {
+                let mut wide = [0u16; 260];
+                let units: Vec<u16> = expected.encode_utf16().collect();
+                wide[..units.len()].copy_from_slice(&units);
+                assert_eq!(actual, wide, "{description:?}: expected {expected:?}");
+            }
+        }
+    });
+}
+
 #[derive(Default)]
 struct Observed {
     queries: Cell<usize>,
