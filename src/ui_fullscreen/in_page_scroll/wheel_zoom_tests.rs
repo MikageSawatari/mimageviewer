@@ -491,3 +491,48 @@ fn setting_zoom_media_items_stay_outside_the_ordinary_image_classifier() {
         );
     }
 }
+
+/// §1.842: after the cursor auto-hides, its last hover position is stale for
+/// passive hover UI, but a wheel turned there is real input at that position.
+/// The seek bar must keep its page-turn meaning for both the v5.5.0 Zoom
+/// setting and the v5.4.0 InPageScroll setting.
+#[test]
+fn section1842_seek_bar_wheel_after_cursor_auto_hide_still_turns_the_page() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    for setting in [
+        FullscreenWheelAction::Zoom,
+        FullscreenWheelAction::InPageScroll,
+    ] {
+        for delta in [-40.0, -120.0] {
+            let ctx = egui::Context::default();
+            let mut app = app(&ctx, SpreadMode::Single);
+            app.settings.fullscreen_wheel_action = setting;
+            seed(&ctx, &mut app);
+            let geometry = app.still_seek_geometry_for_idx(full_rect(), 0, false);
+            let pointer = geometry.panel_rect(full_rect()).center();
+            frame(&ctx, vec![egui::Event::PointerMoved(pointer)], |ui, ctx| {
+                assert_eq!(pointer_handler(&mut app, ui, ctx), FsPageNav::None);
+            });
+            // The pointer stays still until the idle timer hides it.
+            app.cursor_hide_reason = Some(crate::ui_fullscreen::FsCursorHide::Idle);
+            let before = (app.fs_zoom, app.fs_pan);
+            frame(
+                &ctx,
+                vec![wheel_event(Vec2::new(0.0, delta), egui::Modifiers::NONE)],
+                |ui, ctx| {
+                    assert_eq!(
+                        pointer_handler(&mut app, ui, ctx),
+                        FsPageNav::Delta(1),
+                        "{setting:?} delta={delta}"
+                    );
+                    assert_eq!(
+                        (app.fs_zoom, app.fs_pan),
+                        before,
+                        "{setting:?} delta={delta}"
+                    );
+                },
+            );
+        }
+    }
+}
