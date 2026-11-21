@@ -890,3 +890,49 @@ focused の指定順は `src/ui_folder_pane.rs`、`src/app/folder_pane_refresh_t
 | 引数なし `cargo fmt`、`cargo fmt --check`、`git diff --check` | **各exit0** | `tree-click-p2-fmt.log` / `tree-click-p2-fmt-check.log`、終了時diff検査 |
 
 検証済み Rust 2ファイルの SHA-256 は `target/tree-click-p2-source-hashes.json` に保存し、検証後に同一であることを確認した。新規3件はすべて修正前失敗→修正後成功。本体lib全件・`build-dev.ps1`・`ui_snapshot`・製品起動・コミットは指定により実施せず、backlog は変更していない。独立再レビュー・全体検証と最終受入は設計担当へ引き継ぐ。
+
+## 14. §1.828 現在地のフォルダ名を再クリックして一覧とツリーを更新する (2026-11-21 設計、ClaudeCode)
+
+5ch >>838 の要望 (backlog §1.828)。エクスプローラー等で中身を変えた後に、左ツリーで今開いているフォルダの名前をもう一度クリックして、一覧とツリーを更新したい。v5.6.0 に入れる (利用者決定 2026-11-21)。
+
+現状 (master `b5eff67e4`): `src/ui_folder_pane.rs::render_folder_pane_tree_with` の `FolderPaneLabelResult::Single` は、行が `folder_pane.active_path()` と同じなら移動を出さず、focus と cursor だけを更新する (名前部品の非ポインタ活性化も同じ)。一覧の明示更新は `src/app/top_level_grid_view.rs::reload_top_level_grid` (GridReload) と、ツールバーの ⟳ (`src/ui_main.rs::reload_from_sort_control`。再生時間の並びでは `apply_sort_change_reload_without_ui_io`、それ以外は `reload_top_level_grid`)。どちらもツリー表示中は破壊的な `reload_for_active` も呼ぶ。
+
+### 14.1 何を更新とするか
+
+- **対象**: §12.5 の持ち主が確定した名前の 1 回クリック (`FolderPaneLabelResult::Single`。マウス・タッチのタップ) と、名前部品の非ポインタ活性化 (キーボード・AccessKit) のうち、行が `active_path()` と同じもの。▶ / ▼ (`Arrow`)・ダブルクリックの開閉 (`Toggle`)・ツリーのキー (↑↓←→・Enter) は対象外で、今と同じ。
+- **受け付ける条件 (適用時点で判定)**: メイン一覧が、そのパスの実フォルダを通常の一覧として表示していること。既存の `App::is_physical_folder_listing()` (detached physical・ZIP 内・PDF 内・surface が Folder 以外を除外し、通常フォルダ scan が現フォルダへ公開した marker を要求する) が真、`current_folder` が行のパスと同一 (`folder_tree::path_eq`)、`archive_source_override` なし、抽出 surface なし。満たさないとき (検索結果・タグ・★・履歴・しおり・コレクション・スマートフォルダ・ZIP / PDF / 変換アーカイブの中・初回の読み込み中で marker がまだ前のフォルダ) は今と同じく focus と cursor だけを更新し、一覧もツリーも更新しない。ZIP / PDF の表示中はツリーの現在地が親の実フォルダになる (§1.694) が、親フォルダの再クリックを「その ZIP の更新」にも「親フォルダを開く」にもしない。更新の対象を「表示中の一覧と同じ実フォルダ」に限り、別の場所を開く通常操作と混ぜない。
+- **一覧の更新**: ツールバー ⟳ と同じ一覧側の経路を使う (再生時間の並びでは `apply_sort_change_reload_without_ui_io`、それ以外は `reload_top_level_grid` の一覧部分)。通常の実フォルダでは `reload_current_physical_list` の `RefreshList` 復元 (カーソルと表示位置の anchor)・同一場所の受理・サイドカーの扱い・失敗の通知がそのまま働く。新しい復元規則・通知・文言は作らない。`reload_top_level_grid` は、一覧部分とツリー部分を typed な引数 (例: `FolderPaneTreeRefresh::{Reset, Recheck}`) で分け、GridReload と ⟳ は今の `Reset` のまま変えない。
+- **ツリーの更新**: ↻ と GridReload が使う破壊的な `reload_for_active` は使わない。`FolderPaneState` に「現在の需要集合 (§5.1、選択 root と表示中の展開親) の各 node へ既存の `request_recheck` をかける」処理 (例: `recheck_displayed`) を足す。`Running` は `FollowUp::Recheck` に合流、`Queued` はそのまま、ほかは `Queued` になる (§5 の既存 typed state。新しい状態は足さない)。走査は既存の `folder-pane-scan` worker、結果の採用・消えた子孫の整理・cursor と scroll の修復は §5.2・§7 の既存の受理境界が行う。label の表示表・ジェスチャ・展開集合・cursor・scroll には触れない (`invalidate_label_display` / `clear_label_click` を呼ばない)。
+  - 破壊的な reload を使わない理由: (1) `invalidate_label_display` → `clear_label_click` がジェスチャを消し、現在行のダブルクリックによる開閉 (§1.769) を壊す。(2) 現在行の 1 回クリックは ↻ より気軽で回数も多い。押すたびに手で開いた枝が閉じ、cursor と scroll が現在地へ戻るのは不便。全部を作り直したいときは ↻ が残っている。(3) 非破壊の再照合は既知の行を残したまま取り直すので、走査中に行が消えて並びが動かない。
+
+### 14.2 ダブルクリック・連打との共存
+
+- §12.5 の持ち主はそのまま使う。同じジェスチャの 1 回目だけが `Single` になり、2 回目以降は `Toggle` か何も出さない。現在行のダブルクリック = 更新 1 回 + 開閉 1 回 + 移動なし。トリプルクリックも更新 1 回 + 開閉 1 回。ツリーの更新はジェスチャを消さないので、2 回目の押下を続きとして受け取れる。1 回目の更新でサイドカー復元が始まった場合は、§12.5 の「続きを受け取ってよい条件」が既に扱っている (復元中も続きの開閉だけは受け付ける)。
+- egui と持ち主がジェスチャの続きと認めない再クリック (間隔が `max_double_click_delay` を超える、位置が 6pt を超える) は、そのつど新しい `Single` で、更新も 1 回ずつ出る。⟳ を続けて押すのと同じ意味にそろえ、一覧の更新を合流する仕組みは足さない。古い結果が新しい一覧へ混ざらないことは、既存の一覧要求の所有 (同一場所の要求の置き換えと受理の照合) に任せ、テストで確かめる。ツリー側は §5 の `FollowUp` の合流で、同じ親の worker を重ねて起こさない。
+- タッチのタップは名前なら `Single` なので、現在行のタップも更新 1 回。ダブルタップで開閉しないのは今と同じ。
+
+### 14.3 適用する場所とタイミング
+
+- `Single` (と非ポインタ活性化) の適用点で、現在地と同じなら移動の代わりに「現在地の更新要求」を作る。`render_folder_pane_tree` / `render_folder_pane` の戻り値の `Option<PathBuf>` を、移動と更新を排他に表す typed な 1 つの値 (例: `FolderPaneActivation::{Open(PathBuf), RefreshActive(PathBuf)}`) にする。同じ pass で最後の名前の活性化が勝つ今の規則 (現在地を選んだ活性化が先の移動候補も打ち消す) を、そのまま 1 つの値の上書きで表す。`Option` を 2 つ並べない。
+- 実行は ⟳ と同じく main chrome の描画の中で、ペインを描いた直後 (`render_folder_pane` の呼び出し元) に行う。移動の裁定 (`src/app/update_phases.rs` の優先順位) には入れない。移動 (`Open`) の扱いは今のまま。実行時に 14.1 の受付条件を再確認する。加えて、ペインの移動が保留中 (`folder_pane_open_pending` が main の移動) なら更新しない。保留中の移動とペイン自身の更新を競わせず、今と同じく保留中の移動を進める。
+- ★固定・モーダル・`main_chrome_pointer_blocked` は、`Single` の適用点の既存の確認がそのまま効く。
+
+### 14.4 状態の組み合わせを減らす検討 (CLAUDE.md「設計の簡素化」)
+
+- **採用**: 新しい状態・pending・世代・タイマーを持たない。一覧は既存の明示更新 (⟳)、ツリーは既存の再照合 (§5 の typed scan state と `FollowUp`)、クリックの判定は §12.5 の `Single` をそのまま使う。実行のタイミングも ⟳ と同じ描画の中にそろえる。
+- **不採用**: (a) 同じパスの移動を出し直す: 移動の受理・履歴・同一場所判定を通り、意味が「開く」になる (backlog の指示)。読み込み中なら pending の取消とやり直しも起きる。(b) ↻ と同じ `reload_for_active`: ダブルクリックを壊し、展開を失う。(c) ダブルクリックの判定を待ってから更新する: 状態が増え、更新が 0.3 秒遅れる。(d) 更新中の再クリックを合流する pending: ⟳ と意味が分かれ、状態が増える。(e) 更新中をモーダルにする: 通常の再読み込みは既存どおり非モーダルで、ここだけ変える理由がない。(f) Enter でも更新する: キー操作の意味を変える。キーでの更新には既存の GridReload がある。
+- まれな失敗は既定の割り切り方針による (一覧の更新とツリーの走査の既存の失敗表示のまま。書き込み・永続化はない)。
+
+### 14.5 確かめること (§12.3 の handler-level test の形)
+
+1. 現在行の 1 回クリック: 一覧の同一場所の更新が 1 回始まり (履歴は増えない、UI スレッドで走査しない)、ツリーの需要 node が再確認になる。展開集合・cursor・scroll・ジェスチャは変わらない。外部で足したファイルとサブフォルダ、消したサブフォルダが、worker の完了後に一覧とツリーへ反映される。
+2. 現在行のダブルクリック: 更新 1 回・開閉 1 回・移動なし。トリプルクリック: 更新 1 回・開閉 1 回。
+3. 間隔が delay を超える 2 回の再クリック: 更新 2 回で、最後の結果だけが採用される。
+4. 更新中に別の行 B をクリック: B への移動が通常どおり進み、A の更新結果は B の一覧に採用されない。ツリーは新しい需要に従う。
+5. 受付外: 検索結果・タグ・★一覧・ZIP / PDF 内の一覧 (ツリーの現在地は親フォルダ)・初回の読み込み中・ペインの移動の保留中・★固定・モーダル中は更新しない (今の挙動)。
+6. ▶ / ▼・← → キー・Enter・現在地以外の行のクリック: 今と同じ (更新しない、移動は今のまま)。
+7. 現在地のフォルダが外部で消えている: 一覧は既存の失敗の扱い、ツリーは既存の不在の整理。
+8. タッチのタップの現在行: 更新 1 回、ダブルタップで開閉しない。
+9. GridReload と ⟳ は今どおりツリーを `Reset` する (退行がない)。
+
+UI 文言とキー操作の追加はない (マウスの固定操作の意味を足すだけなので、`docs/keymap-spec.md` のフォルダツリーペインのマウス行と `docs/spec.md` を更新する)。
