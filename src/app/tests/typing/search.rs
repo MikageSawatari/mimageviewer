@@ -321,17 +321,14 @@ fn typing_everything_bars_ime() {
 }
 
 #[test]
-#[ignore = "§1.832: favsearch-typing-investigation の取り込み待ち"]
 fn typing_ctrl_s_pinned_ascii() {
     ascii_case(Kind::Container, true, false);
 }
 #[test]
-#[ignore = "§1.832: favsearch-typing-investigation の取り込み待ち"]
 fn typing_ctrl_s_temporary_ascii() {
     ascii_case(Kind::Container, false, false);
 }
 #[test]
-#[ignore = "§1.832: favsearch-typing-investigation の取り込み待ち"]
 fn typing_ctrl_s_bars_zero() {
     for pinned in [false, true] {
         // Zero hits alone do not trigger the known hydration/focus defect.
@@ -342,7 +339,6 @@ fn typing_ctrl_s_bars_zero() {
     }
 }
 #[test]
-#[ignore = "§1.832: favsearch-typing-investigation の取り込み待ち"]
 fn typing_ctrl_s_bars_ime() {
     for pinned in [false, true] {
         ime_case(Kind::Container, pinned);
@@ -430,12 +426,10 @@ pub(super) fn measure_openings(failures: &mut Vec<String>) {
 }
 
 #[test]
-#[ignore = "§1.832: favsearch-typing-investigation の取り込み待ち"]
 fn typing_ctrl_t_ascii() {
     tag_harness(false).type_text("alp");
 }
 #[test]
-#[ignore = "§1.832: favsearch-typing-investigation の取り込み待ち"]
 fn typing_ctrl_t_zero() {
     // Keep the known-red trigger in this ignored regression as well. The
     // second, independent fixture still verifies zero hits from an empty field.
@@ -443,7 +437,6 @@ fn typing_ctrl_t_zero() {
     tag_harness(true).type_text("rzz");
 }
 #[test]
-#[ignore = "§1.832: favsearch-typing-investigation の取り込み待ち"]
 fn typing_ctrl_t_ime() {
     tag_harness(false).compose_ime(&["k", "か", "かな"], "かな");
 }
