@@ -100,6 +100,12 @@ if(-not ('MivReleaseCheckNative' -as [type])){
     Add-Type @'
 using System.Text.RegularExpressions;
 public static class MivReleaseCheckNative {
+ public static int GeometryDpi=96;
+ public static int[] WorkArea=new[]{0,0,1920,1040};
+ public static int[] ClientSize=new[]{1420,900};
+ public static int[] DesktopGeometry(){return new[]{GeometryDpi,WorkArea[0],WorkArea[1],WorkArea[2],WorkArea[3]};}
+ public static int[] OuterSize(int w,int h,uint dpi){return new[]{(int)(w*dpi/96)+16,(int)(h*dpi/96)+39};}
+ public static int[] WindowGeometry(System.IntPtr h){return new[]{GeometryDpi,ClientSize[0],ClientSize[1],60,40,60+ClientSize[0]+16,40+ClientSize[1]+39};}
  public static uint BackgroundOwner=202;
  public static bool ActivationSucceeds=true;
  public static int ActivationCalls=0;
@@ -113,6 +119,103 @@ public static class MivReleaseCheckNative {
  public static string[] Arguments(string s) {var m=Regex.Matches(s,"\"([^\"]*)\"|([^ ]+)");var a=new string[m.Count];for(int i=0;i<a.Length;i++)a[i]=m[i].Groups[1].Success?m[i].Groups[1].Value:m[i].Groups[2].Value;return a;}
 }
 '@
+}
+& {
+    # Pure/fake geometry gates: no native desktop reads or window creation.
+    $runAst=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1')
+    $launchArguments=@($runAst.FindAll({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $n.Left.Extent.Text -eq '$arguments' -and $n.Right.Extent.Text.Contains("'--window-size'")},$true))
+    $windowMetadata=@($runAst.FindAll({param($n)$n -is [Management.Automation.Language.AssignmentStatementAst] -and
+        $n.Left.Extent.Text -eq '$metadata.window_size[$CaseId]'},$true))
+    Assert-True ($launchArguments.Count -eq 1 -and $windowMetadata.Count -eq 1) 'Case launch/metadata geometry statements missing.'
+    foreach($dpi in @(96,144)){
+        $foreground=Get-ReleaseCheckCaseGeometry 'static-foreground' $dpi
+        $background=Get-ReleaseCheckCaseGeometry 'static-background' $dpi
+        $seed=Get-ReleaseCheckCaseGeometry 'seed-profile' $dpi
+        $expected=if($dpi -eq 96){'1420,900/5'}else{'1328,900/7'}
+        Assert-True ($foreground.window_size.Count -eq 2 -and $foreground.window_size[0] -is [int] -and $foreground.window_size[1] -is [int]) 'Selected window size is not a flat pair of integers.'
+        Assert-True ((($foreground.window_size -join ',')+'/'+$foreground.grid_cols) -eq $expected) 'Wrong calibrated static row.'
+        # Evaluate the actual runner expressions, without running its launch.
+        $geometry=$foreground;$dir=Join-Path ([IO.Path]::GetTempPath()) 'fake geometry case'
+        $data=Join-Path $dir 'data';$scriptPath=Join-Path $dir 'scenario.rhai'
+        $CaseId='static-foreground';$metadata=@{window_size=@{}}
+        . ([scriptblock]::Create($launchArguments[0].Extent.Text))
+        . ([scriptblock]::Create($windowMetadata[0].Extent.Text))
+        $sizeIndex=[array]::IndexOf($arguments,'--window-size')
+        $expectedSize=if($dpi -eq 96){'1420x900'}else{'1328x900'}
+        Assert-True ($sizeIndex -ge 0 -and $arguments[$sizeIndex+1] -is [string] -and $arguments[$sizeIndex+1] -eq $expectedSize) 'Runner did not emit one exact window-size argument.'
+        $storedSize=$metadata.window_size[$CaseId]
+        Assert-True ($storedSize.Count -eq 2 -and $storedSize[0] -is [int] -and $storedSize[1] -is [int] -and ($storedSize -join 'x') -eq $expectedSize) 'Runner metadata window size is not a flat logical pair.'
+        Assert-True (($seed|ConvertTo-Json -Compress) -eq ($foreground|ConvertTo-Json -Compress)) 'Static seed uses another geometry.'
+        $other=Get-ReleaseCheckCaseGeometry 'perf-cached' $dpi
+        Assert-True (($other.window_size -join ',') -eq '1328,900' -and $other.grid_cols -eq 7) 'Nonstatic geometry changed.'
+        $tray=Get-ReleaseCheckCaseGeometry 'tray-close-while-loading' $dpi
+        Assert-True (($tray.window_size -join ',') -eq '1328,900' -and $tray.grid_cols -eq 10) 'Tray geometry changed.'
+        [MivReleaseCheckNative]::GeometryDpi=$dpi
+        [MivReleaseCheckNative]::WorkArea=@(0,0,3840,2120)
+        $preflight=Get-ReleaseCheckGeometryPreflight
+        Assert-True ($preflight.static_geometry.dpi -eq $dpi) 'Preflight lost selected DPI.'
+        Assert-ReleaseCheckGeometryEnvironment $foreground $background @(0,0,3840,2120) $preflight.outer_size
+        Assert-Throws {Assert-ReleaseCheckGeometryEnvironment $foreground $background @(0,0,1000,2000) $preflight.outer_size} 'Too-narrow work area accepted.'
+        Assert-Throws {Assert-ReleaseCheckGeometryEnvironment $foreground $background @(0,0,4000,800) $preflight.outer_size} 'Taskbar-reduced work area accepted.'
+        $background.window_size=@(1200,900)
+        Assert-Throws {Assert-ReleaseCheckGeometryEnvironment $foreground $background @(0,0,3840,2120) $preflight.outer_size} 'Different foreground/background planned sizes accepted.'
+        $physical=@($foreground.window_size | ForEach-Object {[int][Math]::Round($_*$dpi/96.0)})
+        $expectedPhysical=if($dpi -eq 96){'1420x900'}else{'1992x1350'}
+        Assert-True ($physical.Count -eq 2 -and $physical[0] -is [int] -and $physical[1] -is [int] -and ($physical -join 'x') -eq $expectedPhysical) 'Physical window size is not a flat converted pair.'
+        $actual=[pscustomobject]@{dpi=$dpi;client_size=$physical}
+        Assert-ReleaseCheckWindowGeometry $actual $foreground
+        # Comma binds tighter than subtraction in PowerShell; isolate arithmetic.
+        $actual.client_size=@(($physical[0]-1),$physical[1])
+        Assert-Throws {Assert-ReleaseCheckWindowGeometry $actual $foreground} 'Different actual background size accepted.'
+        $actual.client_size=$physical;$actual.dpi=120
+        Assert-Throws {Assert-ReleaseCheckWindowGeometry $actual $foreground} 'Actual DPI different from fixture accepted.'
+    }
+    [MivReleaseCheckNative]::GeometryDpi=120
+    $unsupported=Invoke-ReleaseCheckPreflight {Get-ReleaseCheckGeometryPreflight}
+    Assert-True ($unsupported.exit_code -eq 2 -and $unsupported.environment_error -like '*Unsupported*DPI*') 'Unknown DPI did not skip before launch.'
+    [MivReleaseCheckNative]::GeometryDpi=96;[MivReleaseCheckNative]::WorkArea=@(0,0,1920,900)
+    $tooSmall=Invoke-ReleaseCheckPreflight {Get-ReleaseCheckGeometryPreflight}
+    Assert-True ($tooSmall.exit_code -eq 2 -and $tooSmall.environment_error -like '*does not fit*') 'Insufficient physical work area did not skip before launch.'
+    [MivReleaseCheckNative]::WorkArea=@(0,0,1920,1040)
+    $observed=Get-ReleaseCheckWindowGeometry 101 888
+    Assert-True (($observed.client_size -join ',') -eq '1420,900' -and $observed.pid -eq 101 -and $observed.root_hwnd -eq 888) 'Native client geometry lost exact root identity.'
+    Assert-Throws {Get-ReleaseCheckWindowGeometry 102 888} 'Another PID supplied window geometry.'
+    foreach($relative in @('ui-smoke\release-checks\Run.ps1','relcheck-kit\Test-SubPcEnvironment.ps1')){
+        $ast=Get-TestAst (Join-Path $PSScriptRoot $relative)
+        $gates=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-ReleaseCheckGeometryPreflight'},$true))
+        Assert-True ($gates.Count -eq 1) "Shared geometry preflight missing: $relative"
+        $effects=@($ast.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -in @('Start-Process','New-ReleaseCheckForegroundProbeChild','New-Item','Open-UiSmokeRunnerLock')},$true))
+        foreach($effect in $effects){Assert-True ($gates[0].Extent.StartOffset -lt $effect.Extent.StartOffset) "Geometry preflight follows side effects: $relative"}
+    }
+    $runner=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1') -Encoding UTF8 -Raw
+    Assert-True ($runner.Contains("(`$geometry.window_size -join 'x')") -and -not $runner.Contains("'--window-size','1328x900'")) 'Launch dimensions do not use selected geometry.'
+    Assert-True ($runner.Contains('--dpi $metadata.static_geometry.dpi') -and $runner.Contains('$metadata.window_size[$CaseId]')) 'Fixture DPI/per-case metadata do not use selected geometry.'
+    $sampler=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Sampler.ps1') -Encoding UTF8 -Raw
+    Assert-True ($sampler.Contains('Get-ReleaseCheckWindowSample $ProcessId -RootHwnd $sampleRoot') -and $sampler.Contains('Assert-ReleaseCheckWindowGeometry $sample.window_geometry $script:windowPlan')) 'Static background geometry is not validated throughout sampling.'
+    $samplerAst=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Sampler.ps1')
+    $checks=@($samplerAst.FindAll({param($n)$n -is [Management.Automation.Language.IfStatementAst] -and
+        $n.Clauses[0].Item1.Extent.Text -eq "`$Scenario -like 'static-*'" -and
+        $n.Clauses[0].Item2.Extent.Text.Contains('Assert-ReleaseCheckWindowGeometry')},$true))
+    Assert-True ($checks.Count -eq 1) 'Sampler geometry-validation block missing.'
+    $script:windowPlan=Get-ReleaseCheckCaseGeometry 'static-background' 96
+    foreach($Scenario in @('static-foreground','static-background')){
+        $report=@{environment_errors=@()}
+        $samples=@([pscustomobject]@{window_geometry=[pscustomobject]@{dpi=96;client_size=@(1420,900)}},
+                   [pscustomobject]@{window_geometry=[pscustomobject]@{dpi=96;client_size=@(1420,900)}})
+        & ([scriptblock]::Create($checks[0].Extent.Text))
+        Assert-True ($report.environment_errors.Count -eq 0) 'Matching native sample geometry rejected.'
+        $samples[1].window_geometry.client_size=@(1328,900)
+        & ([scriptblock]::Create($checks[0].Extent.Text))
+        Assert-True (($report.environment_errors -join ' ') -like '*client size differs*') 'Resize after foreground/background readiness accepted.'
+    }
+    # Compile the real native declarations without invoking any imported API.
+    $support=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Support.ps1')
+    $native=@($support.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Initialize-ReleaseCheckNative'},$true))[0]
+    $compile=@($native.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Add-Type'},$true))[0]
+    $source=$compile.CommandElements[1].Value.Replace('MivReleaseCheckNative','MivReleaseCheckGeometryCompilationOnly')
+    Assert-True ($source.Contains('SetThreadDpiAwarenessContext') -and $source.Contains('AdjustWindowRectExForDpi') -and $source.Contains('GetClientRect')) 'Physical geometry native declarations missing.'
+    Add-Type -TypeDefinition $source
 }
 $start=[datetime]'2026-10-09T00:00:00Z'
 $fake=[pscustomobject]@{Id=101;Path=$exe;StartTime=$start;HasExited=$false}
@@ -349,6 +452,7 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
     $thresholds=[pscustomobject]@{warmup_seconds=0;measure_seconds=0.3;max_cpu_core_ratio=0.02;target_cpu_core_ratio=0.01;max_app_log_growth_bytes=100;max_perf_log_growth_bytes=100}
     $report=[ordered]@{failures=@();environment_errors=@();warnings=@();verdict='SKIPPED';exit_code=2}
     $ProcessId=101;$Scenario='tray-residency';$TargetKey='';$RootHwnd=1001;$BackgroundHwnd=0;$BackgroundProcessId=0
+    $script:windowPlan=Get-ReleaseCheckCaseGeometry 'static-background' 96
     $perf='fake-perf';$app='fake-app';$reportPath='fake-report';$OutputDirectory='fake-output';$SleepEvidencePath='fake-completion';$scripts='fake-scripts';$ExpectedStartTimeUtc=[datetime]'2026-10-09T00:00:00Z'
     $script:fakeCpuCounter=0;$script:fakeProcessQueries=0
     $script:fakeWmiWindows=New-Object 'Collections.Generic.List[object]'
@@ -403,7 +507,7 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
     $report=[ordered]@{failures=@();environment_errors=@();warnings=@();verdict='SKIPPED';exit_code=2}
     $script:fakeMeasured.HasExited=$false;$Scenario='static-background'
     $thresholds.max_cpu_core_ratio=100;$thresholds.target_cpu_core_ratio=100
-    function Get-ReleaseCheckWindowSample {param($ProcessId) [pscustomobject]@{unix_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();foreground_pid=101;foreground_hwnd=1001;total=1;visible=1}}
+    function Get-ReleaseCheckWindowSample {param($ProcessId,$RootHwnd) [pscustomobject]@{unix_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();foreground_pid=101;foreground_hwnd=1001;total=1;visible=1;window_geometry=[pscustomobject]@{dpi=96;client_size=@(1420,900)}}}
     function Assert-ReleaseCheckWindowSamples {param($Samples,$Scenario,$ProcessId,$RootHwnd,$BackgroundHwnd,$BackgroundProcessId) throw 'fake lost runner background'}
     function Get-Content {
         param($LiteralPath,$Encoding,[switch]$Raw)
@@ -625,7 +729,7 @@ Path(sys.argv[3]).write_text(release_record(summary), encoding='utf-8')
         $root=New-FakeKit 'receiver'
         $result=Join-Path $testRoot 'returned-run'
         $manifest=Get-Content -LiteralPath (Join-Path $root 'release-check-kit.json') -Encoding UTF8 -Raw | ConvertFrom-Json
-        foreach($name in @('release_check_analysis.py','analyze_perf.py')){
+        foreach($name in @('release_check_analysis.py','analyze_perf.py','release_check_geometry.py','release_check_geometry.json')){
             Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $root ('scripts\'+$name))
         }
         Seal-FakeKit $root $manifest

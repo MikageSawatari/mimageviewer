@@ -24,6 +24,7 @@ Assert-ReleaseCheckPaths $repo $exe $data $run
 Initialize-ReleaseCheckNative
 # Read-only preflight happens before prepare/build/fixture generation.
 [MivReleaseCheckNative]::CheckDesktop()
+$script:geometryPreflight=Get-ReleaseCheckGeometryPreflight
 Assert-NoReparsePath (Join-Path $repo 'target') $repo 'release-lock'
 New-Item -ItemType Directory -Path (Join-Path $repo 'target\ui-smoke') -Force | Out-Null
 Open-UiSmokeRunnerLock (Join-Path $repo 'target\ui-smoke\runner.lock')
@@ -36,7 +37,7 @@ if($preflight.exit_code -ne 0){
 $lock=$preflight.value
 $cases=New-Object 'Collections.Generic.List[object]'
 $owned=$null; $ownedStart=$null; $background=$null; $activeDir=$null
-$metadata=[ordered]@{suite='ReleaseChecks'; include_first_ai=[bool]$IncludeFirstAi; run_directory=$run; approval_scope='5 idle + 2 perf + stopped-profile seed sessions'; started_utc=[DateTime]::UtcNow.ToString('o'); os=[Environment]::OSVersion.VersionString; window_size=@(1328,900); dpi_by_case=@{}; cpu_names=@(); gpu_names=@()}
+$metadata=[ordered]@{suite='ReleaseChecks'; include_first_ai=[bool]$IncludeFirstAi; run_directory=$run; approval_scope='5 idle + 2 perf + stopped-profile seed sessions'; started_utc=[DateTime]::UtcNow.ToString('o'); os=[Environment]::OSVersion.VersionString; window_size=@{}; dpi_by_case=@{}; window_geometry_by_case=@{}; static_geometry=$script:geometryPreflight.static_geometry; geometry_preflight=$script:geometryPreflight; cpu_names=@(); gpu_names=@()}
 $metadata.execution_mode=if($FromKit){'kit'}else{'repo'}
 if($FromKit){
     $kit=Get-Content -LiteralPath (Join-Path $repo 'release-check-kit.json') -Encoding UTF8 -Raw | ConvertFrom-Json
@@ -161,8 +162,18 @@ function Invoke-ReleaseSession {
     # Perf measures the real initial many-folder startup shape. Other roots
     # remain untouched until the recipe opens them after indexing settles.
     $sessionOverlay.startup_folder_path=if($seedRecipe.Count -eq 1){$seedRecipe[0].startup_path}elseif($CaseId -like 'perf-*'){$many}else{$m.paths.static}
+    $geometry=Get-ReleaseCheckCaseGeometry $CaseId $script:geometryPreflight.static_geometry.dpi
+    # Fixture overlays and native launch must use the same selected table row.
+    if($CaseId -in @('static-foreground','static-background','seed-profile')){
+        if(($sessionOverlay.window_size -join ',') -ne ($geometry.window_size -join ',') -or $sessionOverlay.grid_cols -ne $geometry.grid_cols){throw 'Static overlay differs from the selected DPI geometry.'}
+    }
+    $sessionOverlay.window_size=$geometry.window_size
+    # first-ai reuses the static overlay, but retains its original nonstatic size/columns.
+    if($CaseId -eq 'first-ai'){$sessionOverlay.grid_cols=$geometry.grid_cols}
+    $metadata.window_size[$CaseId]=@($geometry.window_size)
+    Write-ReleaseCheckJson (Join-Path $dir 'window-plan.json') $geometry
     Write-ReleaseCheckJson (Join-Path $dir 'settings-override.json') $sessionOverlay
-    $arguments=@('--data-dir',$data,'--perf-log','--test-script',$scriptPath,'--test-evidence-dir',$dir,'--settings-override',(Join-Path $dir 'settings-override.json'),'--window-size','1328x900')
+    $arguments=@('--data-dir',$data,'--perf-log','--test-script',$scriptPath,'--test-evidence-dir',$dir,'--settings-override',(Join-Path $dir 'settings-override.json'),'--window-size',($geometry.window_size -join 'x'))
     Clear-ReleaseLogs
     $script:owned=Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $arguments) -WorkingDirectory $smoke -PassThru
     $script:activeDir=$dir # only a successfully launched session owns app logs
@@ -177,6 +188,12 @@ function Invoke-ReleaseSession {
             $null=[MivReleaseCheckNative]::SetForegroundWindow($script:owned.MainWindowHandle)
             $fg=Get-ReleaseCheckWindowSample $script:owned.Id
             $focusAcquired=$fg.foreground_pid -eq $script:owned.Id -and $fg.foreground_hwnd -eq $script:owned.MainWindowHandle.ToInt64()
+            if($focusAcquired){
+                $actual=Get-ReleaseCheckWindowGeometry $script:owned.Id $script:owned.MainWindowHandle.ToInt64()
+                Assert-ReleaseCheckWindowGeometry $actual $geometry
+                $metadata.dpi_by_case[$CaseId]=$actual.dpi
+                $metadata.window_geometry_by_case[$CaseId]=$actual
+            }
         }
         if(-not $focusAcquired -and $focusTimer.Elapsed.TotalSeconds -gt 20){throw 'Exact root foreground unavailable within 20 seconds.'}
         if($Idle -and (Test-Path -LiteralPath $ready -PathType Leaf)){
@@ -185,7 +202,12 @@ function Invoke-ReleaseSession {
             [uint32]$hwndPid=0
             $null=[MivReleaseCheckNative]::GetWindowThreadProcessId([IntPtr][long]$r.root_hwnd,[ref]$hwndPid)
             if($hwndPid -ne $script:owned.Id){throw 'Ready root HWND owner mismatch.'}
-            $metadata.dpi_by_case[$CaseId]=[MivReleaseCheckNative]::GetDpiForWindow([IntPtr][long]$r.root_hwnd)
+            if($CaseId -like 'static-*'){
+                $actual=Get-ReleaseCheckWindowGeometry $script:owned.Id ([long]$r.root_hwnd)
+                Assert-ReleaseCheckWindowGeometry $actual $geometry
+                $metadata.dpi_by_case[$CaseId]=$actual.dpi
+                $metadata.window_geometry_by_case[$CaseId]=$actual
+            }
             $backgroundHwnd=0
             if($CaseId.Contains('background')){
                 Add-Type -AssemblyName System.Windows.Forms
@@ -248,12 +270,13 @@ try {
     Copy-Item -LiteralPath (Join-Path $smoke '.test-script-build.json') -Destination (Join-Path $run 'test-script-build.json')
     $fixture=Join-Path $run 'fixture'
     $ffmpeg=if($FromKit){Join-Path $repo 'tools\ffmpeg\ffmpeg.exe'}else{(Get-Command ffmpeg.exe -ErrorAction Stop).Source}
-    & python (Join-Path $scripts 'ui-smoke\generate_release_checks_fixture.py') --output $fixture --ffmpeg $ffmpeg
+    & python (Join-Path $scripts 'ui-smoke\generate_release_checks_fixture.py') --output $fixture --ffmpeg $ffmpeg --dpi $metadata.static_geometry.dpi
     if($LASTEXITCODE -ne 0){throw 'Fixture generation failed.'}
     & python (Join-Path $scripts 'ui-smoke\generate_release_checks_fixture.py') --output $fixture --verify
     if($LASTEXITCODE -ne 0){throw 'Generated fixture integrity check failed.'}
     $fixtureManifest=Join-Path $fixture 'fixture-manifest.json'
     $m=Get-Content -LiteralPath $fixtureManifest -Encoding UTF8 -Raw | ConvertFrom-Json
+    if($m.static.dpi -ne $metadata.static_geometry.dpi -or ($m.static.window_size -join ',') -ne ($metadata.static_geometry.window_size -join ',') -or $m.static.grid_cols -ne $metadata.static_geometry.grid_cols){throw 'Fixture static geometry differs from preflight.'}
     $metadata.fixture_manifest=$fixtureManifest
     $metadata.fixture_version=$m.recipe_version
     # Seed each geometry in a normal session, retaining the same isolated data.
@@ -309,7 +332,7 @@ try {
     if($script:background){$script:background.Close();$script:background.Dispose()}
     $lock.Dispose()
 }
-$metadata.environment=@{os=$metadata.os;cpu=$metadata.cpu_names;gpu=$metadata.gpu_names;window_size=$metadata.window_size;dpi_by_case=$metadata.dpi_by_case;remote_session=$metadata['remote_session'];primary_screen=$metadata['primary_screen']}
+$metadata.environment=@{os=$metadata.os;cpu=$metadata.cpu_names;gpu=$metadata.gpu_names;window_size=$metadata.window_size;dpi_by_case=$metadata.dpi_by_case;static_geometry=$metadata.static_geometry;geometry_preflight=$metadata.geometry_preflight;remote_session=$metadata['remote_session'];primary_screen=$metadata['primary_screen']}
 Write-ReleaseCheckJson (Join-Path $run 'suite-input.json') @{metadata=$metadata;cases=@($cases.ToArray())}
 & python (Join-Path $scripts 'release_check_analysis.py') summary (Join-Path $run 'suite-input.json') --json-out (Join-Path $run 'summary.json') --markdown-out (Join-Path $run 'release-record.md')
 Write-Host "ReleaseChecks evidence: $run"

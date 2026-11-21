@@ -121,6 +121,33 @@ public static class MivReleaseCheckNative {
  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern int GetClassName(IntPtr w,StringBuilder b,int n);
  [StructLayout(LayoutKind.Sequential)] public struct Rect { public int L,T,R,B; }
  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr w,out Rect r);
+ [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr w,out Rect r);
+ [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
+ [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern bool SystemParametersInfo(uint action,uint param,out Rect r,uint flags);
+ [DllImport("user32.dll")] static extern bool AdjustWindowRectExForDpi(ref Rect r,uint style,bool menu,uint exStyle,uint dpi);
+ // Query physical pixels without inheriting the PowerShell host's DPI virtualization.
+ // The system DPI selects the fixture; GetDpiForWindow later proves the actual DPI.
+ public static int[] DesktopGeometry(){
+   var previous=SetThreadDpiAwarenessContext(new IntPtr(-4));
+   if(previous==IntPtr.Zero)throw new Exception("Per-monitor DPI context unavailable");
+   try{Rect r;if(!SystemParametersInfo(0x30,0,out r,0))throw new Exception("Primary work area unavailable");return new[]{(int)GetDpiForSystem(),r.L,r.T,r.R,r.B};}
+   finally{SetThreadDpiAwarenessContext(previous);}
+ }
+ public static int[] OuterSize(int width,int height,uint dpi){
+   // Winit 0.30's normal decorated, resizable root: WS_OVERLAPPEDWINDOW |
+   // WS_CLIPSIBLINGS; WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES | WS_EX_APPWINDOW.
+   // Visibility/clipping flags do not add nonclient space. There is no menu.
+   // --window-size is logical client size, not decorated physical window size.
+   var r=new Rect{R=(int)Math.Round(width*dpi/96.0),B=(int)Math.Round(height*dpi/96.0)};
+   if(!AdjustWindowRectExForDpi(ref r,0x04CF0000,false,0x00040110,dpi))throw new Exception("Decorated window size unavailable");
+   return new[]{r.R-r.L,r.B-r.T};
+ }
+ public static int[] WindowGeometry(IntPtr hwnd){
+   var previous=SetThreadDpiAwarenessContext(new IntPtr(-4));
+   if(previous==IntPtr.Zero)throw new Exception("Per-monitor DPI context unavailable");
+   try{Rect c,r;if(!GetClientRect(hwnd,out c)||!GetWindowRect(hwnd,out r))throw new Exception("Root window geometry unavailable");return new[]{(int)GetDpiForWindow(hwnd),c.R-c.L,c.B-c.T,r.L,r.T,r.R,r.B};}
+   finally{SetThreadDpiAwarenessContext(previous);}
+ }
  public static int[] Counts(uint pid){int total=0,visible=0;EnumWindows((w,p)=>{uint id;GetWindowThreadProcessId(w,out id);if(id==pid){total++;if(IsWindowVisible(w)){var b=new StringBuilder(256);GetClassName(w,b,256);Rect r;var c=b.ToString();if(c!="IME"&&c!="MSCTFIME UI"&&c!="Winit Thread Event Target"&&GetWindowRect(w,out r)&&r.R-r.L>=64&&r.B-r.T>=64)visible++;}}return true;},IntPtr.Zero);return new[]{total,visible};}
  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
  [DllImport("user32.dll")] public static extern IntPtr GetThreadDesktop(uint t);
@@ -134,11 +161,67 @@ public static class MivReleaseCheckNative {
 }
 
 function Get-ReleaseCheckWindowSample {
-    param([int]$AppPid)
+    param([int]$AppPid,[long]$RootHwnd=0)
     $h = [MivReleaseCheckNative]::GetForegroundWindow(); [uint32]$owner = 0
     $null = [MivReleaseCheckNative]::GetWindowThreadProcessId($h, [ref]$owner)
     $counts = [MivReleaseCheckNative]::Counts([uint32]$AppPid)
-    return [pscustomobject]@{ unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); foreground_pid = $owner; foreground_hwnd = $h.ToInt64(); total = $counts[0]; visible = $counts[1] }
+    $sample=[pscustomobject]@{ unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); foreground_pid = $owner; foreground_hwnd = $h.ToInt64(); total = $counts[0]; visible = $counts[1] }
+    if($RootHwnd -ne 0){$sample | Add-Member -MemberType NoteProperty -Name window_geometry -Value (Get-ReleaseCheckWindowGeometry $AppPid $RootHwnd)}
+    return $sample
+}
+
+function Get-ReleaseCheckCaseGeometry {
+    param([string]$CaseId,[int]$Dpi)
+    $table=Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\..\release_check_geometry.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+    if($table.schema_version -ne 1){throw 'Unknown release-check geometry schema.'}
+    $rows=@($table.static_rows | Where-Object {$_.dpi -eq $Dpi})
+    if($rows.Count -ne 1){throw "Unsupported ReleaseChecks DPI: $Dpi."}
+    $row=if($CaseId -in @('static-foreground','static-background','seed-profile')){$rows[0]}else{$table.default}
+    $columns=if($CaseId -like 'tray-*'){10}else{[int]$row.grid_cols}
+    return [pscustomobject]@{dpi=$Dpi;window_size=@($row.window_size);grid_cols=$columns}
+}
+
+function Assert-ReleaseCheckGeometryEnvironment {
+    param($ForegroundGeometry,$BackgroundGeometry,[int[]]$WorkArea,[int[]]$OuterSize)
+    $expected=Get-ReleaseCheckCaseGeometry 'static-foreground' $ForegroundGeometry.dpi
+    foreach($row in @($ForegroundGeometry,$BackgroundGeometry)){
+        if($row.dpi -ne $expected.dpi -or $row.grid_cols -ne $expected.grid_cols -or
+            ($row.window_size -join ',') -ne ($expected.window_size -join ',')){
+            throw 'Static foreground/background geometry must match the selected DPI table row.'
+        }
+    }
+    if($WorkArea.Count -ne 4 -or $OuterSize.Count -ne 2 -or $OuterSize[0] -le 0 -or $OuterSize[1] -le 0 -or
+        $OuterSize[0] -gt ($WorkArea[2]-$WorkArea[0]) -or $OuterSize[1] -gt ($WorkArea[3]-$WorkArea[1])){
+        throw "Selected static decorated window ($($OuterSize -join 'x') physical px) does not fit the primary work area ($($WorkArea -join ','))."
+    }
+}
+
+function Get-ReleaseCheckGeometryPreflight {
+    $desktop=[MivReleaseCheckNative]::DesktopGeometry()
+    $foreground=Get-ReleaseCheckCaseGeometry 'static-foreground' $desktop[0]
+    $background=Get-ReleaseCheckCaseGeometry 'static-background' $desktop[0]
+    $workArea=@($desktop[1..4])
+    $outer=[MivReleaseCheckNative]::OuterSize($foreground.window_size[0],$foreground.window_size[1],$desktop[0])
+    Assert-ReleaseCheckGeometryEnvironment $foreground $background $workArea $outer
+    return [pscustomobject]@{static_geometry=$foreground;work_area=$workArea;outer_size=@($outer)}
+}
+
+function Get-ReleaseCheckWindowGeometry {
+    param([int]$AppPid,[long]$RootHwnd)
+    [uint32]$owner=0
+    $null=[MivReleaseCheckNative]::GetWindowThreadProcessId([IntPtr]$RootHwnd,[ref]$owner)
+    if($RootHwnd -le 0 -or $owner -ne $AppPid){throw 'Geometry root HWND owner mismatch.'}
+    $native=[MivReleaseCheckNative]::WindowGeometry([IntPtr]$RootHwnd)
+    return [pscustomobject]@{pid=$AppPid;root_hwnd=$RootHwnd;dpi=$native[0];client_size=@($native[1..2]);window_rect=@($native[3..6])}
+}
+
+function Assert-ReleaseCheckWindowGeometry {
+    param($Actual,$Expected)
+    $physical=@($Expected.window_size | ForEach-Object {[int][Math]::Round($_*$Expected.dpi/96.0)})
+    if($Actual.dpi -ne $Expected.dpi){throw 'Actual window DPI differs from the fixture DPI.'}
+    if(($Actual.client_size -join ',') -ne ($physical -join ',')){
+        throw 'Actual window client size differs from the selected case geometry.'
+    }
 }
 
 function Assert-ReleaseCheckBackgroundTransitionForeground {

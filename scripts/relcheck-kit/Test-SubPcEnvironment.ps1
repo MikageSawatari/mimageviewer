@@ -112,13 +112,16 @@ try{
         $report.ffmpeg_valid=$true
     }catch{$reasons.Add($_.Exception.Message)}
     Initialize-ReleaseCheckNative
+    # The same read-only geometry gate as the suite, before either probe Form.
+    $report.geometry_preflight=Get-ReleaseCheckGeometryPreflight
     try{[MivReleaseCheckNative]::CheckDesktop();$report.desktop_valid=$true}
     catch{$reasons.Add($_.Exception.Message)}
     Add-Type -AssemblyName System.Windows.Forms
     $screen=[Windows.Forms.Screen]::PrimaryScreen.Bounds
     $report.environment=@{
         remote_session=([MivReleaseCheckNative]::GetSystemMetrics(0x1000) -ne 0);session_name=$env:SESSIONNAME
-        primary_screen=('{0}x{1}' -f $screen.Width,$screen.Height);system_dpi=[MivReleaseCheckNative]::GetDpiForSystem()
+        primary_screen=('{0}x{1}' -f $screen.Width,$screen.Height);system_dpi=$report.geometry_preflight.static_geometry.dpi
+        static_geometry=$report.geometry_preflight.static_geometry;work_area=$report.geometry_preflight.work_area;static_outer_size=$report.geometry_preflight.outer_size
         gpu_names=@(Get-CimInstance Win32_VideoController | ForEach-Object {$_.Name})
         cpu_names=@(Get-CimInstance Win32_Processor | ForEach-Object {$_.Name})
         os=(Get-CimInstance Win32_OperatingSystem).Caption
