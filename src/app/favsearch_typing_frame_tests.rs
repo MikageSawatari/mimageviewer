@@ -475,7 +475,8 @@ impl Fixture {
 fn tag_fixture_with_origin_pages() -> Fixture {
     let f = tag_fixture();
     let origin = f.app.tmp.path().join("origin");
-    for name in ["o1.png", "o2.png"] {
+    // Three pages, so the restored folder is told apart from the two tag results.
+    for name in ["o1.png", "o2.png", "o3.png"] {
         image::RgbImage::new(2, 2).save(origin.join(name)).unwrap();
     }
     f
@@ -519,8 +520,11 @@ fn tag_typing_frame_ascii_empty_field_keeps_tag_view_and_focus() {
     // Esc closes the tag view and returns to the previous folder, as before.
     f.run(vec![key(egui::Key::Escape, true)]);
     f.run(vec![key(egui::Key::Escape, false)]);
-    f.settle_physical(2);
     assert!(!f.app.tag_view.active);
+    // The return goes through the history transition, which this harness's
+    // phases do not poll; drive it with the shared helper.
+    f.app.finish_history_restore_preparation_for_test();
+    f.settle_physical(3);
     assert!(!f.app.items_are_tag_view);
     assert_eq!(
         f.app
