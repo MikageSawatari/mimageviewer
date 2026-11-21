@@ -1458,7 +1458,7 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
-### 2026-11-21: 絞り込みの変更で一覧を読み直さない・AI の絞り込みを一覧全体の取得の証明へ (§1.835、実装済み・自動検証は設計担当が実施・実機未確認)
+### 2026-11-21: 絞り込みの変更で一覧を読み直さない・AI の絞り込みを一覧全体の取得の証明へ (§1.835、実装済み・自動検証済み・実機未確認)
 
 **変更の内容**
 
@@ -1493,8 +1493,13 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 - 正本は [facet-projection-key-835-plan.md](facet-projection-key-835-plan.md)。
 - 段階2はkeyからfacetだけを除外し、段階3は既存details-meta ownerへ統合証明・要件snapshotを接続した。
   要件の和・未証明条件の不適用・停止時の有効証明保持・AIメニューの停止保持を同じ契約とする。
-- 段階1の21本は設計担当の実行で緑5・赤16 (正本§10.1)。段階2・3の自動検証は設計担当が行う。
-  この記録の更新時点では未実行であり、registry経由のmount／park／closeと実機動作も未確認。
+- 段階1の21本は設計担当の実行で緑5・赤16 (正本§10.1)。
+- 段階3の関連テストと lib 全件は、設計担当の実行で緑 (正本§10.3・§10.4)。lib 全件は 5498fd963 で 19418 本。
+- 独立実装レビュー (gpt-6.1-sol / xhigh): 1 回目は REVISE (P2 2 件・P3 1 件)。修正後の再レビューで「VERDICT: ACCEPT」「STRUCTURAL: AGREE」。
+  - 1 回目の言葉: 「registryの製品差分は型・名前の置換で、所有分類・detached述語・viewport／host／placement／bundle交換の変更はありません。」
+  - 再レビューの言葉: 「所有境界と既存機構に沿う構造的修正という判断も維持します。」
+- fork 先の証明が空であることは registry のテスト (`viewer_context_registry.rs:66`・`:111`) で検査する。
+- 実機動作は未確認 (サブ PC の確認を予定)。
 - 静的レビューのP2は設計担当が正本§4.2.2-10の追補として採用し、表示集合の拡大時に新たな行の
   通常列を既存の予算付きAllRequirementsで補充する形へ実装した。全体proof・cache・停止状態を保持し、
   追加のcontext状態・owner・UI全走査・I/Oや、detachedの述語・viewport経路の変更は加えない。
