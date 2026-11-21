@@ -13327,7 +13327,12 @@ impl App {
         }
     }
 
-    fn original_preview_active_for_frame(&self, ctx: &egui::Context, idx: usize) -> bool {
+    /// Share the frame-cached selection with pre-draw AI prefetch admission.
+    pub(crate) fn original_preview_active_for_frame(
+        &self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> bool {
         matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
             && self
                 .original_preview_frame_observation(ctx, idx)
@@ -95385,6 +95390,42 @@ mod tests {
                 .0,
             denoise
         );
+    }
+
+    #[test]
+    fn section1839_failed_source_is_terminal_in_ai_hud_and_status() {
+        use crate::app::{DisplayedFinalAiState as D, FinalAiJobState as J, NotAppliedReason as R};
+        for requested in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let path = app.tmp.path().join("section1839-failed.png");
+            app.items.push(GridItem::Image(path));
+            app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+            app.settings.global_preset.upscale_model =
+                requested.then(|| "realesr_general_v3".to_owned());
+            app.settings.global_preset.denoise_model = None;
+            app.fs_cache.insert(0, FsCacheEntry::Failed);
+            let stage = app.fs_display_stage(0, false);
+            let displayed = app.displayed_final_ai_state(0, stage);
+            assert_eq!(app.final_ai_job_state(0), J::Failed);
+            assert_eq!(
+                displayed,
+                if requested {
+                    D::NotApplied(R::Failed)
+                } else {
+                    D::NotRequested
+                }
+            );
+            assert_eq!(
+                app.top_bar_ai_upscale_info(0, stage)
+                    .map(|(_, state)| state),
+                requested.then_some(D::NotApplied(R::Failed))
+            );
+            assert_eq!(
+                fs_ai_status_activity(J::Failed, displayed, false, false, false),
+                (false, false, false),
+                "a failed source is neither AI processing nor completed"
+            );
+        }
     }
 
     #[test]
