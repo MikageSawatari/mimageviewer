@@ -59,6 +59,8 @@ mod prepared_edit_entry_tests;
 #[cfg(test)]
 mod retained_material_entry_tests;
 #[cfg(test)]
+pub(crate) mod side_panel_secondary_input_tests;
+#[cfg(test)]
 mod slideshow_settings_tests;
 #[cfg(test)]
 mod slideshow_tests;
