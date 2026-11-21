@@ -35090,12 +35090,13 @@ impl App {
         let initial_demand = self
             .spread_display_composition_for_anchor(fs_idx)
             .presentation_demand(self.spread_mode, self.fullscreen_page_slice);
-        let target_load_allowed = self.page_overview.session().is_none()
-            && !self.continuous_reading_active_for_idx(fs_idx)
-            && matches!(self.book_presentation_target_allowed(&initial_demand),
+        let target_load_allowed = self.paged_viewer_materialization_allowed(
+            matches!(self.book_presentation_target_allowed(&initial_demand),
                 crate::book_composition::PresentationDecision::Allowed(ref allowed)
                     if initial_demand.iter().zip(allowed).any(|(occurrence, allowed)|
-                        occurrence.item_index == fs_idx && *allowed));
+                        occurrence.item_index == fs_idx && *allowed)),
+            self.continuous_reading_active_for_idx(fs_idx),
+        );
         let stop_page_needs_load = matches!(
             self.fs_display_page_load_state(fs_idx),
             FsPageLoadState::NeedsLoad
@@ -35148,9 +35149,8 @@ impl App {
         // Resolve permission in the actual drawing context after its pre-draw input commit.
         let presentation = self.resolve_book_fullscreen_presentation(fs_idx);
         let paint_idx = presentation.paint_idx;
-        let target_allowed = self.page_overview.session().is_none()
-            && presentation.allowed
-            && !presentation.continuous;
+        let target_allowed = self
+            .paged_viewer_materialization_allowed(presentation.allowed, presentation.continuous);
         if target_allowed {
             if paint_idx != fs_idx {
                 self.ensure_fs_page_turn_target_load(page_turn_decision, paint_idx);
@@ -47465,6 +47465,41 @@ impl App {
             demand,
             identities,
         })
+    }
+
+    /// The paged draw owns load/resolve only while its ordinary material surface is active.
+    fn paged_viewer_materialization_allowed(&self, allowed: bool, continuous: bool) -> bool {
+        self.page_overview.session().is_none() && allowed && !continuous
+    }
+
+    /// Read the pages the paged draw can materialize without starting permission requests.
+    /// Missing permission-free occurrences become allowed when the draw retains its demand;
+    /// existing Checking/Hidden decisions must already suspend the pre-draw Waiting gate.
+    pub(crate) fn paged_draw_materialization_demand(
+        &mut self,
+        anchor_idx: usize,
+    ) -> Vec<crate::book_composition::PresentationOccurrence> {
+        if !self.reading_flow.is_paged() {
+            return Vec::new();
+        }
+        let base = self.spread_display_composition_for_anchor(anchor_idx);
+        let demand = base.presentation_demand(self.spread_mode, self.fullscreen_page_slice);
+        let permitted = match self.book_presentation_target_allowed(&demand) {
+            crate::book_composition::PresentationDecision::Allowed(allowed) => {
+                base.permitted_projection(self.spread_mode, &allowed)
+            }
+            crate::book_composition::PresentationDecision::Checking
+            | crate::book_composition::PresentationDecision::Hidden => None,
+        };
+        if !self.paged_viewer_materialization_allowed(
+            permitted.is_some(),
+            self.continuous_reading_active_for_idx(anchor_idx),
+        ) {
+            return Vec::new();
+        }
+        permitted
+            .unwrap()
+            .presentation_demand(self.spread_mode, self.fullscreen_page_slice)
     }
 
     fn resolve_book_fullscreen_presentation(&mut self, anchor_idx: usize) -> FsBookPresentation {

@@ -282,6 +282,104 @@ fn section1839_ready_display_allows_neighbor_prefetch() {
 }
 
 #[test]
+fn section1839_overview_waiting_display_allows_neighbor_prefetch() {
+    use crate::page_overview::{
+        PageOverviewDirection, PageOverviewProjection, PageOverviewStamp, PageOverviewState,
+    };
+    let ctx = egui::Context::default();
+    let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+    let identity = file_type_resume::PreparedPageIdentityIndex::prepare(
+        &app.items,
+        None,
+        app.settings.file_type_visibility.clone(),
+    );
+    let projection = Arc::new(
+        PageOverviewProjection::new(
+            Arc::clone(identity.overview_metadata()),
+            Arc::new(vec![0, 1]),
+        )
+        .unwrap(),
+    );
+    let stamp = PageOverviewStamp {
+        context_serial: app.projected_viewer_context_id().serial(),
+        items_generation: app.items_generation,
+        reader_order_revision: Arc::as_ptr(&projection) as usize as u64,
+        incarnation: 1,
+    };
+    app.page_overview = PageOverviewState::open(
+        projection,
+        stamp,
+        1,
+        5,
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 660.0)),
+        PageOverviewDirection::LeftToRight,
+    )
+    .unwrap();
+    assert!(app.page_overview.session().is_some());
+    assert_eq!(
+        app.displayed_final_ai_state(1, app.fs_display_stage(1, false)),
+        DisplayedFinalAiState::Waiting
+    );
+
+    app.prefetch_final_ai(&ctx, 1);
+
+    section1839_assert_neighbor_source_requested(&app);
+}
+
+#[test]
+fn section1839_disallowed_waiting_display_allows_neighbor_prefetch() {
+    let ctx = egui::Context::default();
+    let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+    let demand = app.book_target_presentation_demand(1);
+    app.install_hidden_presentation_for_test(&demand);
+    assert_eq!(
+        app.book_presentation_allowed(&demand),
+        crate::book_composition::PresentationDecision::Hidden
+    );
+    assert_eq!(
+        app.displayed_final_ai_state(1, app.fs_display_stage(1, false)),
+        DisplayedFinalAiState::Waiting
+    );
+
+    app.prefetch_final_ai(&ctx, 1);
+
+    section1839_assert_neighbor_source_requested(&app);
+}
+
+#[test]
+fn section1839_display_ensure_resolves_waiting_before_neighbor_prefetch() {
+    let ctx = egui::Context::default();
+    let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+    let model = crate::ai::ModelKind::UpscaleRealEsrGeneralV3;
+    assert!(app.ai_model_manager.model_path(model).is_none());
+    // Exercise the production model-unavailable terminal without native ORT initialization.
+    app.ai_runtime_init = crate::ai::runtime::AiRuntimeInitOwner::ready_for_test(Arc::new(
+        crate::ai::runtime::AiRuntime::empty_for_test(),
+    ));
+
+    app.prefetch_final_ai(&ctx, 1);
+    assert_no_source_demand(&app);
+    assert!(app.final_ai_failed.is_empty());
+
+    let params = app.effective_params(1).clone();
+    let key = app
+        .final_ai_key_for_pixels(app.current_edit_result_key(1), [4, 6], &params)
+        .unwrap();
+    let _ = app.ensure_final_composite_texture(&ctx, 1);
+    assert!(app.final_ai_failed.contains(&key));
+    assert!(app.final_ai_pending.is_empty());
+    assert_ne!(
+        app.displayed_final_ai_state(1, app.fs_display_stage(1, false)),
+        DisplayedFinalAiState::Waiting
+    );
+    assert!(!app.fs_pending.contains_key(&0));
+
+    app.prefetch_final_ai(&ctx, 1);
+
+    section1839_assert_neighbor_source_requested(&app);
+}
+
+#[test]
 fn section1839_animated_display_allows_neighbor_prefetch() {
     let ctx = egui::Context::default();
     let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
@@ -832,6 +930,57 @@ fn material_demand_revision_retained_display_waits_for_effect_without_original_f
         );
         assert_no_source_demand(&app);
         assert!(app.final_ai_pending.is_empty());
+    }
+}
+
+#[test]
+fn section1839_retained_pdf_pending_effect_does_not_repeat_lookup() {
+    for lut in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = pdf_book(&ctx);
+        configure_final_effect(&mut app, &ctx, lut);
+        let final_key = retain_pdf_ai(&mut app, 0);
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.settings.page_turn_animation_enabled = false;
+        app.viewer_navigation_caches.invalidate();
+        assert!(app.ensure_final_composite_texture(&ctx, 0).is_none());
+        let params = app.effective_params(0).clone();
+        let ai_key = app
+            .final_ai_key_for_pixels(final_key.edit_key, [4, 6], &params)
+            .unwrap();
+        let pixels = Arc::clone(&app.final_ai_cache[&ai_key].pixels);
+        let after_hydration = app.retained_final_ai_clock;
+        let cancel = Arc::clone(&app.final_effect_pending[&final_key].cancel);
+        assert!(matches!(
+            app.final_effect_pending[&final_key].origin,
+            FinalEffectOrigin::LegacyDisplay
+        ));
+        // Keep the actual result receiver alive, but defer its observation until after
+        // the repeated ensures. A fast CPU worker must not turn this into a cache-hit test.
+        let (held_tx, held_rx) = mpsc::channel();
+        let computing = std::mem::replace(
+            &mut app.final_effect_pending.get_mut(&final_key).unwrap().state,
+            FinalEffectState::Computing(FinalEffectReceiver::Legacy(held_rx)),
+        );
+
+        for _ in 0..2 {
+            assert!(app.ensure_final_composite_texture(&ctx, 0).is_none());
+            assert_eq!(app.retained_final_ai_clock, after_hydration);
+            assert!(Arc::ptr_eq(&pixels, &app.final_ai_cache[&ai_key].pixels));
+            assert!(Arc::ptr_eq(
+                &cancel,
+                &app.final_effect_pending[&final_key].cancel
+            ));
+            assert!(!cancel.load(Ordering::Relaxed));
+            assert_no_source_demand(&app);
+        }
+
+        app.final_effect_pending.get_mut(&final_key).unwrap().state = computing;
+        drop(held_tx);
+        complete_pending_composites(&mut app, &ctx);
+        assert!(app.final_composite_cache[&final_key].complete);
+        assert_no_source_demand(&app);
     }
 }
 
