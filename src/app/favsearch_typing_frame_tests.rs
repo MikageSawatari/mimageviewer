@@ -100,6 +100,10 @@ impl Fixture {
                 app.input_pointer_and_ime(ctx);
                 app.render_search_and_metadata_results(ctx);
                 app.render_other_worker_results(ctx);
+                let hydrating_before_bars = app.sidecar_restore_active();
+                if hydrating_before_bars {
+                    eprintln!("  hydration owner present before the bars are drawn");
+                }
                 app.keyboard_owner_for_pass(ctx);
                 for action in [KeyAction::GridRotateCcw, KeyAction::GridPin] {
                     if app.keymap.pressed_action(ctx, action) {
@@ -135,8 +139,14 @@ impl Fixture {
         )
         .drop_without_applying_deltas();
         eprintln!(
-            "frame {:>3}: query={:?} last_executed={:?} pending={} focused={:?} field_focus={} has_focus={} active={} items={} results={} hydrating={} surface={:?}",
+            "frame {:>3}: tag_query={:?} tag_view={} folder={:?} query={:?} last_executed={:?} pending={} focused={:?} field_focus={} has_focus={} active={} items={} results={} hydrating={} surface={:?}",
             self.frame,
+            self.app.tag_view.query,
+            self.app.items_are_tag_view,
+            self.app
+                .current_folder
+                .as_deref()
+                .and_then(|p| p.file_name()),
             self.app.favsearch.query,
             self.app.favsearch.last_executed,
             self.app.favsearch_pending.is_some(),
@@ -438,4 +448,115 @@ fn favsearch_typing_frame_zero_results_and_empty_query_keep_focus() {
             assert!(!f.app.sidecar_restore_active());
         }
     }
+}
+
+impl Fixture {
+    /// Draw frames until the restored physical list has `count` items and its hydration ended.
+    fn settle_physical(&mut self, count: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        self.settle();
+        while self.app.items.len() != count || self.app.sidecar_restore_active() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the previous list never came back: items={} hydrating={}",
+                self.app.items.len(),
+                self.app.sidecar_restore_active()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            self.run(vec![]);
+        }
+        for _ in 0..6 {
+            self.run(vec![]);
+        }
+    }
+}
+
+/// Ctrl+T with a non-empty origin folder, as the user opens it from a normal list.
+fn tag_fixture_with_origin_pages() -> Fixture {
+    let f = tag_fixture();
+    let origin = f.app.tmp.path().join("origin");
+    for name in ["o1.png", "o2.png"] {
+        image::RgbImage::new(2, 2).save(origin.join(name)).unwrap();
+    }
+    f
+}
+
+/// Clearing the field after a result keeps the tag view on an empty result list
+/// (as Ctrl+S does). The previous folder comes back only when the view closes.
+fn assert_empty_tag_result_list(f: &Fixture) {
+    assert_eq!(f.app.tag_view.query, "");
+    assert!(f.app.tag_view.active);
+    assert!(f.app.items_are_tag_view, "the tag result surface stays");
+    assert_eq!(f.app.items.len(), 0, "an empty field shows an empty list");
+    assert!(!f.app.sidecar_restore_active());
+    assert!(
+        f.field_focused(),
+        "the field keeps focus when the field is cleared"
+    );
+}
+
+#[test]
+fn tag_typing_frame_ascii_empty_field_keeps_tag_view_and_focus() {
+    let _input = crate::key_input::lock_test_input();
+    let mut f = tag_fixture_with_origin_pages();
+    f.run(vec![text("a")]);
+    f.settle();
+    assert!(f.app.items_are_tag_view);
+    assert_eq!(f.app.tag_view.result_count, 2);
+    f.run(vec![key(egui::Key::Backspace, true)]);
+    f.run(vec![key(egui::Key::Backspace, false)]);
+    f.settle();
+    assert_empty_tag_result_list(&f);
+    // Typing again searches again.
+    f.run(vec![text("a")]);
+    f.settle();
+    f.run(vec![text("l")]);
+    f.settle();
+    assert_eq!(f.app.tag_view.query, "al");
+    assert!(f.field_focused());
+    assert!(f.app.items_are_tag_view);
+    assert_eq!(f.app.tag_view.result_count, 2);
+    // Esc closes the tag view and returns to the previous folder, as before.
+    f.run(vec![key(egui::Key::Escape, true)]);
+    f.run(vec![key(egui::Key::Escape, false)]);
+    f.settle_physical(2);
+    assert!(!f.app.tag_view.active);
+    assert!(!f.app.items_are_tag_view);
+    assert_eq!(
+        f.app
+            .current_folder
+            .as_deref()
+            .and_then(|path| path.file_name()),
+        Some(std::ffi::OsStr::new("origin"))
+    );
+}
+
+#[test]
+fn tag_typing_frame_ime_empty_composition_keeps_tag_view_and_focus() {
+    let _input = crate::key_input::lock_test_input();
+    let mut f = tag_fixture_with_origin_pages();
+    f.run(preedit("\u{304b}"));
+    f.settle();
+    assert!(f.app.items_are_tag_view);
+    assert_eq!(f.app.tag_view.result_count, 2);
+    // Deleting the composition back to nothing.
+    f.run(vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+        text: String::new(),
+        active_range_chars: None,
+    })]);
+    f.settle();
+    assert_empty_tag_result_list(&f);
+    f.run(vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+        text: "\u{304b}".into(),
+        active_range_chars: None,
+    })]);
+    f.settle();
+    f.run(vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+        text: "\u{304b}\u{306a}".into(),
+        active_range_chars: None,
+    })]);
+    f.settle();
+    assert_eq!(f.app.tag_view.query, "\u{304b}\u{306a}");
+    assert!(f.field_focused());
+    assert_eq!(f.app.tag_view.result_count, 1);
 }
