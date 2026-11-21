@@ -7962,6 +7962,25 @@ impl FullscreenSidePanelRects {
     }
 }
 
+/// Input-time chrome geometry, retained with a deferred wheel/click proposal.
+#[derive(Clone, Copy, Debug, Default)]
+struct FullscreenSidePanelClickChrome {
+    panels: FullscreenSidePanelRects,
+    navigator_exclusion: Option<egui::Rect>,
+    depth_panel: Option<egui::Rect>,
+}
+
+impl FullscreenSidePanelClickChrome {
+    /// Shared by canvas primary clicks and confirmed secondary short taps.
+    /// The navigator excludes ordinary side panels, but not the Depth panel,
+    /// preserving the existing primary-click policy.
+    fn contains_pointer(self, pos: egui::Pos2) -> bool {
+        (fullscreen_edge_hover_allowed(pos, self.navigator_exclusion)
+            && self.panels.iter().any(|rect| rect.contains(pos)))
+            || self.depth_panel.is_some_and(|rect| rect.contains(pos))
+    }
+}
+
 fn fullscreen_side_panel_rects(
     full_rect: egui::Rect,
     chrome_enabled: bool,
@@ -19979,6 +19998,7 @@ struct FsWheelFrameProposal {
     page_nav: FsPageNavRequest,
     canvas_click: FsCanvasClickAction,
     secondary_action: FsSecondaryAction,
+    side_panel_click_chrome: FullscreenSidePanelClickChrome,
     full_rect: egui::Rect,
     default_image_rect: egui::Rect,
     primary_suppression: FullscreenPrimarySuppressionDecision,
@@ -20059,11 +20079,13 @@ enum FsSecondaryAction {
     ShortTap {
         context: crate::ring_shortcut::RightDragContext,
         pos: egui::Pos2,
+        egui_click: bool,
     },
     LongPress(egui::Pos2),
     Recognized {
         context: crate::ring_shortcut::RightDragContext,
         pos: egui::Pos2,
+        egui_click: bool,
         recognition: crate::ring_shortcut::RightDragRecognition,
     },
 }
@@ -20075,6 +20097,25 @@ enum FsSecondaryInputOutcome {
 }
 
 impl FsSecondaryAction {
+    fn short_tap_owned_by_side_panel(&self, chrome: FullscreenSidePanelClickChrome) -> bool {
+        match self {
+            Self::ShortTap {
+                pos, egui_click, ..
+            }
+            | Self::Recognized {
+                pos,
+                egui_click,
+                recognition:
+                    crate::ring_shortcut::RightDragRecognition {
+                        outcome: crate::ring_shortcut::MouseFlickOutcome::ShortTap,
+                        command: None,
+                    },
+                ..
+            } => *egui_click && chrome.contains_pointer(*pos),
+            _ => false,
+        }
+    }
+
     fn executes_before_final_navigation(&self) -> bool {
         matches!(
             self,
@@ -20088,7 +20129,10 @@ impl FsSecondaryAction {
         )
     }
 
-    fn closes_viewer(&self, app: &App) -> bool {
+    fn closes_viewer(&self, app: &App, chrome: FullscreenSidePanelClickChrome) -> bool {
+        if self.short_tap_owned_by_side_panel(chrome) {
+            return false;
+        }
         let context = match self {
             Self::ShortTap { context, .. } => *context,
             Self::Recognized {
@@ -41863,7 +41907,14 @@ impl App {
         if let FsCanvasClickAction::DepthFocusAt(pos) = canvas_click {
             self.plan_depth_focus_click(ctx, pos);
         }
-        let close = secondary_action.closes_viewer(self);
+        let side_panel_click_chrome = self.fs_side_panel_click_chrome(
+            ctx,
+            full_rect,
+            seek_geometry,
+            side_panel_chrome_enabled,
+            navigator_exclusion,
+        );
+        let close = secondary_action.closes_viewer(self, side_panel_click_chrome);
         let pointer_nav = match canvas_click {
             FsCanvasClickAction::PageSide(base) => self.spread_page_nav(base).into(),
             _ => page_nav,
@@ -41879,6 +41930,7 @@ impl App {
             page_nav,
             canvas_click,
             secondary_action,
+            side_panel_click_chrome,
             full_rect,
             default_image_rect,
             primary_suppression,
@@ -42032,6 +42084,7 @@ impl App {
             mut page_nav,
             canvas_click,
             secondary_action,
+            side_panel_click_chrome,
             full_rect,
             default_image_rect,
             primary_suppression,
@@ -42074,7 +42127,7 @@ impl App {
             }
         };
         let suppress_intermediate_navigation = suppress_wheel_navigation
-            || secondary_action.closes_viewer(self)
+            || secondary_action.closes_viewer(self, side_panel_click_chrome)
             // This existing command owner can change the page, context, mode,
             // or input admission. Preserve its order before the single final
             // navigation as a whole, including future command actions.
@@ -42491,7 +42544,7 @@ impl App {
         // must run this egui block instead — otherwise right-click (close) and the right-drag
         // ring shortcut do nothing (実機 FB 2026-07). The context is `current_right_drag_context()`
         // = VideoFullscreen (item is Video), so it shows the video ring, not the image ring.
-        match self.apply_fs_secondary_input(ctx, secondary_action) {
+        match self.apply_fs_secondary_input(ctx, secondary_action, side_panel_click_chrome) {
             FsSecondaryInputOutcome::Continue => {}
             FsSecondaryInputOutcome::CloseRequested => close = true,
             FsSecondaryInputOutcome::ViewerReplaced => {
@@ -42760,24 +42813,16 @@ impl App {
         let Some(pos) = depth_focus_pos.or_else(|| response.interact_pointer_pos()) else {
             return FsCanvasClickAction::None;
         };
-        let has_right_panel = self.metadata_panel_click_shown()
-            || self.fs_info_panel.hover_active
-            || self.fullscreen_tag_picker_open;
-        let in_side_panel = fullscreen_side_panel_contains_pointer_with_seek_height(
-            full_rect,
-            pos,
-            side_panel_chrome_enabled,
-            self.settings.fullscreen_side_panel_mode,
-            has_right_panel,
-            self.adjustment_mode.is_open(),
-            navigator_exclusion,
-            seek_geometry.total_height,
-        );
-        if in_side_panel
+        if self
+            .fs_side_panel_click_chrome(
+                _ctx,
+                full_rect,
+                seek_geometry,
+                side_panel_chrome_enabled,
+                navigator_exclusion,
+            )
+            .contains_pointer(pos)
             || (seek_panel_interactive && seek_geometry.panel_rect(full_rect).contains(pos))
-            || self
-                .visible_depth_panel_rect(_ctx)
-                .is_some_and(|rect| rect.contains(pos))
         {
             FsCanvasClickAction::None
         } else if depth_focus_pos.is_some() {
@@ -42788,6 +42833,31 @@ impl App {
                 full_rect.center().x,
                 self.spread_mode.advances_right_to_left(),
             ))
+        }
+    }
+
+    fn fs_side_panel_click_chrome(
+        &self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        seek_geometry: StillSeekGeometry,
+        chrome_enabled: bool,
+        navigator_exclusion: Option<egui::Rect>,
+    ) -> FullscreenSidePanelClickChrome {
+        let has_right_panel = self.metadata_panel_click_shown()
+            || self.fs_info_panel.hover_active
+            || self.fullscreen_tag_picker_open;
+        FullscreenSidePanelClickChrome {
+            panels: fullscreen_side_panel_rects_with_seek_height(
+                full_rect,
+                chrome_enabled,
+                self.settings.fullscreen_side_panel_mode,
+                has_right_panel,
+                self.adjustment_mode.is_open(),
+                seek_geometry.total_height,
+            ),
+            navigator_exclusion,
+            depth_panel: self.visible_depth_panel_rect(ctx),
         }
     }
 
@@ -42926,7 +42996,14 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         action: FsSecondaryAction,
+        side_panel_click_chrome: FullscreenSidePanelClickChrome,
     ) -> FsSecondaryInputOutcome {
+        // Keep the viewer's wider short-tap tolerance unless egui classified
+        // this exact release as a click that a side-panel widget can receive.
+        // Leave raw input intact so the panel's later context_menu sees it.
+        if action.short_tap_owned_by_side_panel(side_panel_click_chrome) {
+            return FsSecondaryInputOutcome::Continue;
+        }
         let short_click_outcome = |close| {
             if close {
                 FsSecondaryInputOutcome::CloseRequested
@@ -42943,13 +43020,14 @@ impl App {
                 }
                 FsSecondaryInputOutcome::Continue
             }
-            FsSecondaryAction::ShortTap { context, pos } => short_click_outcome(
+            FsSecondaryAction::ShortTap { context, pos, .. } => short_click_outcome(
                 self.apply_viewer_short_right_click_action(context, self.fullscreen_idx, pos),
             ),
             FsSecondaryAction::Recognized {
                 context,
                 pos,
                 recognition,
+                ..
             } => {
                 if let Some(command) = recognition.command {
                     let destination = self.page_turn_destination();

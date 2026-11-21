@@ -1652,6 +1652,16 @@ egui 音楽ビューも同じ mode と App runtime を使う。3 面とも Click
 補正編集、表示トリム、分析、比較 wipe、360、ズーム、アニメ中など描画抑止中は、非表示の
 右パネル矩形や ClickToShow の最端帯も入力を奪わない。
 
+静止画の左クリックと右クリック短押しは `FullscreenSidePanelClickChrome::contains_pointer` で
+左右パネル・呼び出し帯・ナビゲータ除外・Depth パネルの当たり判定を共有する。
+`App::fs_side_panel_click_chrome` が入力時の可視状態とシーク領域高から矩形を作り、遅延する
+wheel/click proposal にもその幾何を保持する。左クリックの既存の除外範囲は維持する。
+右は egui の `released_buttons_with_click_counts` のクリック成立情報を対応する release に結び付け、
+`apply_fs_secondary_input` で確定した ShortTap（コマンドなし）だけをパネルへ渡す。
+終了予定の判定も同じ条件を使い、raw input は消費しないので後段のタグメニューが開ける。
+egui の距離・時間制限でクリックにならなかった短押し、リング / ジェスチャ、無効モードの長押し、
+native 動画の入力経路は従来どおりとする。
+
 ### 2.2.2 動画フルスクリーンとタイルモード
 
 `GridItem::Video` は画像ロードワーカーを使わず、`App::start_fs_load` の動画分岐で

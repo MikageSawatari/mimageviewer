@@ -109,7 +109,14 @@ pub(crate) fn frame(
                 FsSecondaryAction::LongPress(_) => facts.long_press = true,
                 FsSecondaryAction::None => {}
             }
-            let outcome = app.apply_fs_secondary_input(&ctx, action);
+            let chrome = app.fs_side_panel_click_chrome(
+                &ctx,
+                viewport(),
+                StillSeekGeometry::bar_only(),
+                true,
+                None,
+            );
+            let outcome = app.apply_fs_secondary_input(&ctx, action, chrome);
             facts.close_requested = matches!(outcome, FsSecondaryInputOutcome::CloseRequested);
             facts.continued = matches!(outcome, FsSecondaryInputOutcome::Continue);
             if facts.continued {
@@ -341,4 +348,73 @@ fn section1840_disabled_panel_long_press_keeps_fullscreen_context_menu() {
     );
     assert_eq!(app.fs_context_menu_idx, Some(0));
     assert_eq!(app.fs_context_menu_pos, pos);
+}
+
+#[test]
+fn section1840_batched_taps_use_the_matching_egui_release_click() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for mode in modes() {
+        for final_is_click in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.options_mut(|o| o.input_options.max_click_dist = 6.0);
+            let mut app = ready(mode.clone());
+            let pos = metadata_panel_rect(viewport()).center();
+            let moved = pos - egui::vec2(12.0, 0.0);
+            press(&mut app, &ctx, pos);
+            let mut events = Vec::new();
+            if final_is_click {
+                events.extend([
+                    egui::Event::PointerMoved(moved),
+                    egui::Event::PointerMoved(pos),
+                ]);
+            }
+            events.extend([right(pos, false), right(pos, true)]);
+            if !final_is_click {
+                events.extend([
+                    egui::Event::PointerMoved(moved),
+                    egui::Event::PointerMoved(pos),
+                ]);
+            }
+            events.push(right(pos, false));
+            let facts = input_frame(&mut app, &ctx, 0.02, events);
+            assert_eq!(facts.short_tap_at, Some(pos), "{mode:?}: {facts:?}");
+            // There is an egui click at this same coordinate either way. Only
+            // the release that produced the final short tap may own its action.
+            assert_eq!(facts.egui_click_at, Some(pos));
+            assert_eq!(
+                facts.close_requested, !final_is_click,
+                "{mode:?}, final_is_click={final_is_click}: {facts:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn section1840_panel_short_tap_does_not_open_viewer_context_menu() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for mode in modes() {
+        let ctx = egui::Context::default();
+        let mut app = ready(mode.clone());
+        app.settings
+            .ring_shortcuts
+            .set_viewer_short_right_click_action(
+                RightDragContext::ImageFullscreen,
+                ViewerShortRightClickAction::ContextMenu,
+            );
+        let pos = metadata_panel_rect(viewport()).center();
+        press(&mut app, &ctx, pos);
+        let facts = input_frame(&mut app, &ctx, 0.02, vec![right(pos, false)]);
+        assert_eq!(facts.short_tap_at, Some(pos));
+        assert_eq!(facts.egui_click_at, Some(pos));
+        assert!(
+            facts.continued && !facts.close_requested,
+            "{mode:?}: {facts:?}"
+        );
+        assert!(
+            app.fs_context_menu_idx.is_none(),
+            "panel must own the menu: {mode:?}"
+        );
+    }
 }

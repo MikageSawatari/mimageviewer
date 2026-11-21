@@ -83,9 +83,22 @@ impl App {
             .owns_release(egui::PointerButton::Secondary)
             && ctx.input(|i| i.pointer.secondary_released());
         let secondary_events: Vec<_> = ctx.input(|i| {
+            let mut releases = i.pointer.released_buttons_with_click_counts();
             i.pointer
                 .button_events()
-                .filter(|event| match event {
+                .map(|event| {
+                    // Both iterators follow the same canonical release order.
+                    // Pair before filtering buttons/owners: a frame-wide click
+                    // flag could belong to another tap, even at the same point.
+                    let egui_click = match event {
+                        egui::PointerButtonEvent::Released { .. } => {
+                            releases.next().is_some_and(|(_, click)| click.is_some())
+                        }
+                        egui::PointerButtonEvent::Pressed { .. } => false,
+                    };
+                    (event, egui_click)
+                })
+                .filter(|(event, _)| match event {
                     egui::PointerButtonEvent::Pressed { button, .. } => {
                         *button == egui::PointerButton::Secondary
                     }
@@ -132,10 +145,11 @@ impl App {
         );
         let now = std::time::Instant::now();
         let mut passive_press_outcome = FullscreenSecondaryPressOutcome::None;
+        let mut passive_egui_click = false;
         // Process the canonical button edges in order. A positionless terminal
         // cancels the old hold, while a later real press can own a new hold in
         // this same frame. Neither fallback nor later motion supplies an Up point.
-        for event in &secondary_events {
+        for (event, egui_click) in &secondary_events {
             let (pressed, released, pos) = match *event {
                 egui::PointerButtonEvent::Pressed { pos, .. } => (true, false, pos),
                 egui::PointerButtonEvent::Released { pos: Some(pos), .. } => (false, true, pos),
@@ -160,6 +174,7 @@ impl App {
                     | FullscreenSecondaryPressOutcome::LongPress(_)
             ) {
                 passive_press_outcome = outcome;
+                passive_egui_click = *egui_click;
             }
         }
         let passive_secondary_pos = fullscreen_pointer_pos_or(
@@ -294,7 +309,7 @@ impl App {
                         return FsSecondaryAction::None;
                     }
                     let mut action = FsSecondaryAction::None;
-                    for event in &secondary_events {
+                    for (event, egui_click) in &secondary_events {
                         match *event {
                             egui::PointerButtonEvent::Pressed { pos, .. } => {
                                 self.start_mouse_ring_flick(
@@ -321,6 +336,7 @@ impl App {
                                     action = FsSecondaryAction::Recognized {
                                         context: right_drag_context,
                                         pos,
+                                        egui_click: *egui_click,
                                         recognition,
                                     };
                                 }
@@ -349,7 +365,7 @@ impl App {
                         return FsSecondaryAction::None;
                     }
                     let mut action = FsSecondaryAction::None;
-                    for event in &secondary_events {
+                    for (event, egui_click) in &secondary_events {
                         match *event {
                             egui::PointerButtonEvent::Pressed { pos, .. } => {
                                 self.start_mouse_gesture(
@@ -376,6 +392,7 @@ impl App {
                                     action = FsSecondaryAction::Recognized {
                                         context: right_drag_context,
                                         pos,
+                                        egui_click: *egui_click,
                                         recognition,
                                     };
                                 }
@@ -412,6 +429,7 @@ impl App {
                             return FsSecondaryAction::ShortTap {
                                 context: right_drag_context,
                                 pos,
+                                egui_click: passive_egui_click,
                             };
                         }
                         FullscreenSecondaryPressOutcome::LongPress(pos) => {
@@ -445,7 +463,8 @@ impl App {
             front,
         );
         matches!(
-            self.apply_fs_secondary_input(ctx, action),
+            // Page overview has no ordinary fullscreen side-panel chrome.
+            self.apply_fs_secondary_input(ctx, action, FullscreenSidePanelClickChrome::default()),
             FsSecondaryInputOutcome::CloseRequested
         )
     }

@@ -681,6 +681,7 @@ fn recognized_command(
     FsSecondaryAction::Recognized {
         context: RightDragContext::ImageFullscreen,
         pos: egui::pos2(300.0, 200.0),
+        egui_click: false,
         recognition: RightDragRecognition::command(command),
     }
 }
@@ -816,6 +817,7 @@ fn egui037_wheel_frame_recognized_close_terminates_final_wheel_without_reopening
                     FsSecondaryAction::Recognized {
                         context: RightDragContext::ImageFullscreen,
                         pos: egui::pos2(300.0, 200.0),
+                        egui_click: false,
                         recognition: RightDragRecognition::command(
                             RightDragCommand::ViewerShortRightClick {
                                 context: RightDragContext::ImageFullscreen,
@@ -879,6 +881,7 @@ fn egui037_wheel_frame_recognition_without_command_does_not_block_ordered_delive
                 proposal.secondary_action = FsSecondaryAction::Recognized {
                     context: RightDragContext::ImageFullscreen,
                     pos: egui::pos2(300.0, 200.0),
+                    egui_click: false,
                     recognition: RightDragRecognition::outcome(outcome),
                 };
                 app.claim_fs_wheel_frame_after_ui(&mut proposal);
@@ -957,6 +960,7 @@ fn egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_own
                         FsSecondaryAction::Recognized {
                             context: RightDragContext::ImageFullscreen,
                             pos: egui::pos2(300.0, 200.0),
+                            egui_click: false,
                             recognition: RightDragRecognition::command(
                                 RightDragCommand::ViewerShortRightClick {
                                     context: RightDragContext::ImageFullscreen,
