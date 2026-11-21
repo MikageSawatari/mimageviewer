@@ -393,3 +393,39 @@ CLAUDE.md「設計の簡素化」に沿って、組み合わせそのものを�
   実クリックによる編集開始後は focus・TextEdit cursor・描画された draft も毎フレーム検査する。
   `DragValue` の numeric accessibility 値は入力処理前の値を報告するため、当該フレームの
   文字列は内部 TextEdit が出す value で確かめる。
+
+## 10. 実行結果の記録
+
+テストは設計担当 ClaudeCode が共有の実行口 (run-heavy) で流した。実機では確かめていない。
+
+### 10.1 段階 1: テストだけ (製品コードは v5.5.0 相当、fc14804bf、2026-11-21)
+
+`cargo nextest run -p mimageviewer --lib -E 'test(/facet_835_/)'`: 21 本中、緑 5・赤 16。
+
+| テスト (`facet_835_` を省略) | 結果 | 失敗の内容 |
+| --- | --- | --- |
+| `t1_duration_range_types_each_character_in_real_frames` | 赤 | 「範囲指定」を選んだ段階でメニューが閉じた (`1 menu closed`、generation=2) |
+| `t2_size_range_types_each_character_in_real_frames` | 赤 | 同上 (サイズ) |
+| `t3_duration_presets_only_project_visible_rows` | 赤 | 区切りの選択で一覧の世代が 1 → 2 |
+| `t3_size_presets_only_project_visible_rows` | 赤 | 同上 |
+| `t3_extension_changes_only_project_visible_rows` | 赤 | 拡張子の選択で一覧の世代が 1 → 2 |
+| `t4_size_relaxation_final_result_and_no_transient_omission` | 赤 | サイズの解除後、取得中のフレームで B が消えた |
+| `t4_size_relaxation_does_not_reload_listing` | 赤 | 世代が 3 → 4 (読み直しで取得している) |
+| `t5_rating_relaxation_keeps_matching_image_without_reload` | 赤 | 評価フィルタの解除後、条件に合う B が出ない (既存の不具合をテストで再現) |
+| `t6_restore_ai_after_child_dimensions_does_not_hide_unread_images` | 赤 | 復元の直後、未取得なのに AI 条件が適用されて 3 件とも消えた |
+| `t7_restored_duration_preset_acquires_without_menu` | 緑 | |
+| `t7_direct_duration_preset_acquires_without_menu` | 緑 | |
+| `t8_notifications_add_and_delete_with_active_facet` | 緑 | |
+| `t8_equal_started_before_facet_change_is_accepted` | 赤 | facet の変更をまたいだ Equal が拒否された |
+| `t8_different_started_before_facet_change_uses_current_facet` | 赤 | 同じく Different が拒否・先送りされた |
+| `duration_completion_cannot_stand_in_for_ai_completion` | 赤 | 長さだけの完了で AI 条件が適用された |
+| `ai_becoming_required_restarts_inflight_duration_scan` | 赤 | 取得中に AI が要件になっても、走査を始め直さない |
+| `ai_only_plan_reads_hidden_images_without_unrelated_fields` | 赤 | AI の走査が `current_grid_order` の外を読まない |
+| `ai_cached_completion_and_empty_listing_are_ready` | 緑 | |
+| `ai_menus_preserve_stopped_unproven_duration_after_direct_ai_acquisition` | 赤 | AI メニューを初めて開くと、停止した走査が動き出した (`Cancelled` → `Loading`) |
+| `duration_only_hidden_targets_do_not_acquire_ai_or_other_columns` | 緑 | |
+| `stopping_and_resuming_ai_keeps_proven_duration_filter` | 赤 | 長さ条件で隠れた画像の AI を取得しない |
+
+- T1・T2 は、サブ PC 担当が観測した「メニューが閉じる」をテストで再現している。1 文字目より前の「範囲指定」の選択で閉じる。
+- T5 は、設計 §4.2.1 の例 3 (評価フィルタ、v5.5.0 にもある不具合) をテストで再現している。
+- 緑の 5 本は、既存の長さの契約と通知の経路で、修正後も緑のままであること。
