@@ -1275,6 +1275,8 @@ impl App {
                     Err(FolderPaneReclickRejection::HigherPriorityNavigation)
                 } else if grid_nav.is_some() {
                     Err(FolderPaneReclickRejection::GridNavigation)
+                } else if close_cursor_nav.is_some() {
+                    Err(FolderPaneReclickRejection::CloseCursorNavigation)
                 } else {
                     before_poll
                         .and_then(|()| {

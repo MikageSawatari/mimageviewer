@@ -38,6 +38,7 @@ pub(super) enum FolderPaneReclickRejection {
     PendingNavigation(ReclickNavigationOwner),
     HigherPriorityNavigation,
     GridNavigation,
+    CloseCursorNavigation,
     RequestUnavailable,
     WorkerAdmissionFailed,
 }

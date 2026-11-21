@@ -486,8 +486,118 @@ fn folder_pane_reclick_after_delay_replaces_pending_refresh_and_rejects_old_resu
 }
 
 #[test]
-fn folder_pane_reclick_after_delay_replaces_ready_same_location_refresh() {
+fn folder_pane_reclick_arbitration_only_replaces_ready_same_location_refresh() {
+    // Unit coverage of arbitration: navigation_tree_frame deliberately omits
+    // the root's pre-input history poll. A ready still owned by the arbiter may
+    // be replaced; production may already have installed it before input.
     reclick_supersede_scenario(true);
+}
+
+fn reclick_production_frame(
+    app: &mut App,
+    ctx: &egui::Context,
+    frame: &mut u64,
+    events: Vec<egui::Event>,
+) {
+    *frame += 1;
+    // This helper services HistoryTransition before input_update_begin, as
+    // App::ui does, and drains any real hydration started by that installation.
+    sidecar_tree_frame(app, ctx, *frame as f64 / 60.0, events, None);
+}
+
+#[test]
+fn folder_pane_reclick_production_order_installs_ready_then_refreshes_latest_with_selection() {
+    let ReclickFixture {
+        mut app,
+        ctx,
+        mut frame,
+        a,
+        pos,
+        ..
+    } = reclick_fixture();
+    let selected = a.join("60.jpg");
+    app.selected = app
+        .items
+        .iter()
+        .position(|item| item.drag_source_path() == Some(selected.as_path()));
+    assert_eq!(app.selected_real_file_path(), Some(selected.clone()));
+    let history = app.folder_nav_history_snapshot();
+    let generation = app.items_generation;
+    let old_only = a.join("00-old-only.jpg");
+    let latest = a.join("01-latest.jpg");
+    std::fs::write(&old_only, b"first observation").unwrap();
+    for pressed in [true, false] {
+        reclick_production_frame(
+            &mut app,
+            &ctx,
+            &mut frame,
+            vec![egui::Event::PointerMoved(pos), primary_event(pos, pressed)],
+        );
+    }
+    reclick_refresh_id(&app, &a);
+    let (worker, sender) = reclick_hold_preflight(&mut app);
+    let old_result = reclick_worker_result(worker);
+    std::fs::remove_file(&old_only).unwrap();
+    std::fs::write(&latest, b"second observation").unwrap();
+    assert!(sender.send(Ok(old_result)).is_ok());
+
+    // A ready already available to the root poll is allowed to install before
+    // the next gesture. Do not impose the arbitration-only non-installation
+    // assertion here. Finish its normal hydration before starting a fresh click.
+    reclick_production_frame(&mut app, &ctx, &mut frame, vec![]);
+    assert!(app.items_generation > generation);
+    assert!(reclick_contains(&app, &old_only));
+    assert!(!reclick_contains(&app, &latest));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app
+        .top_level_grid_view
+        .history_navigation_transition()
+        .is_some()
+        || app.sidecar_restore_active()
+    {
+        reclick_production_frame(&mut app, &ctx, &mut frame, vec![]);
+        assert!(
+            Instant::now() < deadline,
+            "old refresh hydration did not finish"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(app.selected_real_file_path(), Some(selected.clone()));
+    assert_eq!(app.folder_nav_history_snapshot(), history);
+    // The last hydration frame was drawn while the restore still blocked the
+    // main chrome, so its labels have no hit-test witness. Draw one ordinary
+    // frame after the restore ends, as the next repaint does, before pressing.
+    reclick_production_frame(&mut app, &ctx, &mut frame, vec![]);
+    frame += (ctx.options(|o| o.input_options.max_double_click_delay) * 60.0).ceil() as u64 + 2;
+    let pos = visible_label_click_rect(&ctx, &a).center();
+    let installed_generation = app.items_generation;
+    for pressed in [true, false] {
+        reclick_production_frame(
+            &mut app,
+            &ctx,
+            &mut frame,
+            vec![egui::Event::PointerMoved(pos), primary_event(pos, pressed)],
+        );
+    }
+    reclick_refresh_id(&app, &a);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while app
+        .top_level_grid_view
+        .history_navigation_transition()
+        .is_some()
+        || app.sidecar_restore_active()
+    {
+        reclick_production_frame(&mut app, &ctx, &mut frame, vec![]);
+        assert!(Instant::now() < deadline, "latest refresh did not finish");
+        std::thread::yield_now();
+    }
+    assert!(app.items_generation > installed_generation);
+    assert!(reclick_contains(&app, &latest));
+    assert!(!reclick_contains(&app, &old_only));
+    assert_eq!(app.selected_real_file_path(), Some(selected));
+    assert_eq!(app.folder_nav_history_snapshot(), history);
+    assert_eq!(app.current_folder.as_ref(), Some(&a));
+    assert_label_expanded(&app, &a, true);
 }
 
 #[test]
@@ -1050,6 +1160,122 @@ fn folder_pane_reclick_arrows_and_enter_do_not_refresh_current_listing() {
     finish_label_navigation(&mut app, &ctx, &a);
     assert_eq!(app.current_folder.as_ref(), Some(&a));
     assert_eq!(app.folder_nav_history_snapshot(), history);
+}
+
+#[test]
+fn folder_pane_reclick_f_close_cursor_navigation_beats_current_name_then_other_arrow() {
+    reclick_close_scenario(true, false);
+}
+
+#[test]
+fn folder_pane_reclick_y_close_cursor_navigation_beats_current_name_then_other_arrow() {
+    reclick_close_scenario(true, true);
+}
+
+#[test]
+fn folder_pane_reclick_f_close_without_cursor_navigation_keeps_refresh() {
+    reclick_close_scenario(false, false);
+}
+
+#[test]
+fn folder_pane_reclick_y_close_without_cursor_navigation_keeps_refresh() {
+    reclick_close_scenario(false, true);
+}
+
+fn reclick_close_scenario(move_cursor: bool, gamepad_y: bool) {
+    let ReclickFixture {
+        mut app,
+        ctx,
+        mut frame,
+        a,
+        b,
+        pos,
+        ..
+    } = reclick_fixture();
+    let history = app.folder_nav_history_snapshot();
+    let generation = app.items_generation;
+    let added = a.join("added-before-close.jpg");
+    std::fs::write(&added, b"external addition").unwrap();
+    let mut events = vec![
+        egui::Event::PointerMoved(pos),
+        primary_event(pos, true),
+        primary_event(pos, false),
+    ];
+    if move_cursor {
+        let arrow = app
+            .folder_pane
+            .label_display
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .find(|row| row.path == b)
+            .unwrap()
+            .arrow_rect
+            .center();
+        assert_label_expanded(&app, &b, true);
+        events.extend([
+            egui::Event::PointerMoved(arrow),
+            primary_event(arrow, true),
+            primary_event(arrow, false),
+        ]);
+    }
+    if !gamepad_y {
+        events.push(tree_key_event(egui::Key::F));
+    }
+    navigation_tree_frame_height_before_navigation(
+        &mut app,
+        &ctx,
+        &mut frame,
+        events,
+        600.0,
+        |app| {
+            if gamepad_y {
+                // The accepted grid Y-tap handler queues this same request.
+                // Keep native gamepad/foreground admission outside this fixture;
+                // the name and arrow above use actual ordered pointer edges.
+                app.request_folder_tree_pane_toggle(
+                    crate::ui_folder_pane::FolderPaneToggleKind::CommitCursorOnClose,
+                );
+            }
+            assert!(app.folder_tree_pane_close_navigation_pending());
+            assert_eq!(
+                app.folder_pane.cursor_nav_target_if_moved(),
+                move_cursor.then(|| b.clone())
+            );
+        },
+    );
+    assert!(!app.settings.folder_tree_pane_visible);
+    assert_eq!(app.current_folder.as_ref(), Some(&a));
+    assert_eq!(app.folder_nav_history_snapshot(), history);
+    assert_eq!(app.items_generation, generation);
+    if move_cursor {
+        assert_label_expanded(&app, &b, false);
+        assert!(
+            app.top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+        );
+        assert_eq!(
+            app.folder_pane_open_pending
+                .as_ref()
+                .expect("closing must keep B's cursor navigation instead of refreshing A")
+                .path,
+            b
+        );
+        finish_label_navigation(&mut app, &ctx, &b);
+        assert!(reclick_contains(&app, &b.join("only-b.jpg")));
+        assert!(!reclick_contains(&app, &added));
+    } else {
+        // HideAndNavigate with the cursor still at A produces no close target.
+        // It closes the pane and retains the independent same-location refresh.
+        reclick_refresh_id(&app, &a);
+        assert!(app.folder_pane_open_pending.is_none());
+        settle(&mut app, &ctx);
+        assert!(reclick_contains(&app, &added));
+        assert_eq!(app.current_folder.as_ref(), Some(&a));
+        assert_eq!(app.folder_nav_history_snapshot(), history);
+    }
 }
 
 #[test]

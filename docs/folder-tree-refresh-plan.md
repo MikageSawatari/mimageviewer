@@ -919,7 +919,7 @@ focused の指定順は `src/ui_folder_pane.rs`、`src/app/folder_pane_refresh_t
 ### 14.3 適用する場所とタイミング (r1 P2-2)
 
 - `Single` (と非ポインタ活性化) の適用点で、現在地と同じなら移動の代わりに「現在地の更新要求」を作る。`render_folder_pane_tree` / `render_folder_pane` の戻り値の `Option<PathBuf>` を、移動と更新を排他に表す typed な 1 つの値 (例: `FolderPaneActivation::{Open(PathBuf), RefreshActive(PathBuf)}`) にする。同じ pass で最後の名前の活性化が勝つ今の規則 (現在地を選んだ活性化が先の移動候補も打ち消す) を、そのまま 1 つの値の上書きで表す。`Option` を 2 つ並べない。
-- この値を `MainFrameNavigation::folder_pane_nav` の位置のまま、`src/app/update_phases.rs` の既存の移動の裁定へ渡す。`Open` の扱い (`replace_ready_folder_pane_open` など) は今のまま。`RefreshActive` は、その pass の移動候補 (`higher_priority_than_folder_pane` に入るもの、`folder_nav_wins`、`grid_nav`) がどれか 1 つでもあれば捨てる。**`grid_nav` に負けるのは `RefreshActive` だけ**で、`Open` が `grid_nav` より先という今の順序は変えない (r2 P3-5)。
+- この値を `MainFrameNavigation::folder_pane_nav` の位置のまま、`src/app/update_phases.rs` の既存の移動の裁定へ渡す。`Open` の扱い (`replace_ready_folder_pane_open` など) は今のまま。`RefreshActive` は、その pass の移動候補 (`higher_priority_than_folder_pane` に入るもの、`folder_nav_wins`、`grid_nav`、F / Y で閉じるときのカーソルへの移動 `close_cursor_nav`) がどれか 1 つでもあれば捨てる (`close_cursor_nav` は実装レビュー r1 P2 で追加。同じ pass に「現在行 A の名前の Single → 別の行 B の ▶ / ▼ のクリック」と F / Y の閉じる要求が届くと、カーソルは B へ動いて閉じるときの移動先は B になる。実装前は現在行の Single が候補を作らないので B へ移動していた。更新を先に受け付けると、この移動が消える)。**`grid_nav` に負けるのは `RefreshActive` だけ**で、`Open` が `grid_nav` より先という今の順序は変えない (r2 P3-5)。
 - **受付の判定は、移動の候補を先に確定してから行う (r2 P2-1)**。裁定は `RefreshActive` の分岐より前に `poll_folder_pane_open` を呼び、完了した移動を pending から取り出してローカルの ready (`folder_pane_open_ready`) へ移す。受付条件 3 は「poll の前に保留中だった要求」と「この pass のローカルの ready」の両方を移動として数える。移動があれば `RefreshActive` を候補から取り除き、何も無かった pass と同じ流れで既存の ready の適用へ進める (`RefreshActive` の分岐で処理を終えて ready を捨てない)。受付条件を満たさず捨てた `RefreshActive` は、後続の候補 (`close_cursor_nav` の合成、ready の適用、`grid_nav`) を遮らない。高優先度の実際の移動による既存の `cancel_folder_pane_open(Abandoned)` は今のまま。`RefreshActive` 自身はペインの保留中の移動を取り消さない。
 - 勝ち残った `RefreshActive` に 14.1 の受付条件 (1〜4) を確かめ、満たせば一覧の更新とツリーの再照合を行う。
 - ★固定・モーダル・`main_chrome_pointer_blocked` は `Single` の適用点でも確かめる (今のまま)。更新の開始が後段の裁定へ移るので、裁定でも受付条件 4 で確かめ直す。
@@ -960,6 +960,12 @@ UI 文言とキー操作の追加はない (マウスの固定操作の意味を
   4. P3: 置き換えてよい更新の判別の field を具体化 (受付条件 3)。
   5. P3: 読書の判定の土台 (`MountedContext`)・スタックの切替の準備中・EPUB の一括変換中、`grid_nav` に負けるのは `RefreshActive` だけ (受付条件 2、14.3)。
 - r3 (2026-11-21、同じ担当、`1b7fd33e3`): **ACCEPT**。r2 の 5 件は閉じ、新たな P1 / P2 なし。集約スタックの割り切りも妥当。実装時の確認点 (P3): (1) 型を変えるとき、未受付・拒否された `RefreshActive` が、今の `folder_pane_nav.is_some()` による別要求の取消 (`cancel_saved_group_open_for_other_nav` など) を起こさないこと。pending から ready へ移った後も同一場所の更新の例外を適用し、「前の更新の ready は置き換え可、B への移動の ready は継続」を対照テストにする。(2) スタックの準備中の判定を `open_pending()` だけにしない (フラット読書への移行しか数えない)。切替と集約への復帰の準備中は拒否し、準備が終わった集約一覧は受け付ける。
+
+- 実装レビュー r1 (2026-11-21、同じ担当、`32e763288`、関連テスト 272 件成功の結果を再利用): **REVISE、P2 1 件・P3 2 件**。B→現在地 A の期待の変更・再クリックがあった pass だけの受付判定・受付 / 拒否のログ・非破壊の再照合・同期の load へ落ちないこと・detached の述語と viewport を変えていないことは妥当。設計担当が 3 件とも採用した。
+  1. P2: 受け付けた `RefreshActive` が、同じ pass の F / Y の閉じるときの移動 (`close_cursor_nav`) を消す → `close_cursor_nav` も移動候補として優先し、worker を起こす前に更新を捨てる (14.3 に追記、回帰テストを追加)。
+  2. P3: 「ready になった古い更新を置き換える」テストが、本番の順序 (入力の前に history transition を poll する) を通っていない → 裁定だけの検査と、本番の順序の検査 (入力の前に poll し、再クリックの後の最終結果・選択・履歴を確かめる) に分ける。
+  3. P3: マニュアルの「一覧の選択と表示位置はそのまま残ります」が、集約スタックの既存の制約 (14.1) より強い → 「最新の情報に更新」と同じ引き継ぎ方、という書き方に改める。
+  - 対応後の関連テスト (folder_pane・direct_navigation_worker_scan・main_chrome・ui_folder_pane の lib 294 件、ui_snapshot の folder_pane 4 件) は全件成功。本番の順序の検査は初回 293/294 で、2 回目の再クリックが受け付けられなかった。計装で調べた結果は、受付の判定は成功、押下の当たり判定 (前の frame の widget) が空だった。直前の frame がサイドカー復元の終わる前に描かれ、名前の部品が操作を受け付けない描き方だったため。テストが「復元の終わった直後、まだ再描画していない frame」に移動と押下を同時に送っていたのが原因で、製品の受付や更新の経路の問題ではない。復元の後に通常の frame を 1 枚描いてから押すようにテストを直した。
 
 ### 14.7 実装中に戻された設計判断 (2026-11-21、ClaudeCode)
 
