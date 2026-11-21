@@ -35,6 +35,7 @@ fn collect_actual_merge(
     suppress_navigation: bool,
 ) -> (FsWheelFrameResult, Option<ViewerOperationId>) {
     let ctx = ui.ctx().clone();
+    let cursor_active = ctx.input(fullscreen_cursor_active);
     // Exact operation identities are a contract of the enabled presentation
     // ingress. Mixed deliveries have several facts, so the existing one-input
     // animation budget declines an effect while navigation admission stays live.
@@ -49,6 +50,7 @@ fn collect_actual_merge(
     let result = app.handle_fs_wheel_and_click_frame(
         ui,
         &ctx,
+        cursor_active,
         ui.max_rect(),
         &state,
         StillSeekGeometry::bar_only(),

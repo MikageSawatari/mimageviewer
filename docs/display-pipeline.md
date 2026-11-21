@@ -1731,6 +1731,7 @@ pointer activity は `ZoomAiming` を解除せず、照準前から `Idle` だ�
 補正パネル edge hover / panel 内判定など、passive hover 由来の状態遷移では
 `!cursor_hidden` で gate する。マウス操作または固定 UI 表示が戻ったら
 `CursorVisible(true)` で復帰する。
+この stale 規則は受動ホバーに適用し、Idle 非表示を解除するフレームのホイール / クリックはそのフレームで捕捉した pointer activity に従って現在位置へ配送する（ZoomAiming 中の扱いは維持する）。
 
 #### 2.2.2 右パネルへの動的状態反映
 

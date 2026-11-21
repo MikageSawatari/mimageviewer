@@ -8403,6 +8403,23 @@ fn still_passive_side_panel_hover_enabled(cursor_hidden: bool, touch_chrome_latc
     !cursor_hidden && !touch_chrome_latched
 }
 
+fn fullscreen_cursor_active(input: &egui::InputState) -> bool {
+    input.pointer.delta() != egui::Vec2::ZERO
+        || input.pointer.any_pressed()
+        || input.pointer.any_click()
+        || input.smooth_scroll_delta != egui::Vec2::ZERO
+}
+
+/// Whether this frame's pointer input can use the last hover position.
+/// Activity releases Idle, but never the derived ZoomAiming hide reason.
+fn fullscreen_pointer_position_live(current: Option<FsCursorHide>, cursor_active: bool) -> bool {
+    match current {
+        None => true,
+        Some(FsCursorHide::Idle) => cursor_active,
+        Some(FsCursorHide::ZoomAiming) => false,
+    }
+}
+
 fn next_fullscreen_cursor_hide_reason(
     current: Option<FsCursorHide>,
     zoom_aiming: bool,
@@ -8420,7 +8437,10 @@ fn next_fullscreen_cursor_hide_reason(
     // is cleared by any activity. Aiming needs no carried-over copy of that fact. The
     // caller restarts the idle countdown on activity, so a hide that predates aiming is
     // re-derived here through `idle_hide_ready` when the pointer really did stay still.
-    if clean && ((matches!(current, Some(FsCursorHide::Idle)) && !cursor_active) || idle_hide_ready)
+    if clean
+        && ((matches!(current, Some(FsCursorHide::Idle))
+            && !fullscreen_pointer_position_live(current, cursor_active))
+            || idle_hide_ready)
     {
         Some(FsCursorHide::Idle)
     } else {
@@ -28688,12 +28708,7 @@ impl App {
                 if self.cursor_last_activity.is_none() {
                     self.cursor_last_activity = Some(std::time::Instant::now());
                 }
-                let cursor_active = ctx.input(|i| {
-                    i.pointer.delta() != egui::Vec2::ZERO
-                        || i.pointer.any_pressed()
-                        || i.pointer.any_click()
-                        || i.smooth_scroll_delta != egui::Vec2::ZERO
-                });
+                let cursor_active = ctx.input(fullscreen_cursor_active);
                 // Do not mutate cursor visibility here. Z aiming is updated below by
                 // handle_fs_key_input, after which one owner resolves pointer activity,
                 // idle latching, and ZoomAiming together for this frame.
@@ -29076,6 +29091,7 @@ impl App {
                         let mut wheel_result = self.handle_fs_wheel_and_click_frame(
                             ui,
                             ctx,
+                            cursor_active,
                             full_rect,
                             &state,
                             still_seek_geometry,
@@ -40532,6 +40548,7 @@ impl App {
         music_front_pointer_owned: bool,
         navigation_operation: &mut Option<ViewerOperationId>,
     ) -> (FsPageNav, bool) {
+        let cursor_active = ctx.input(fullscreen_cursor_active);
         let (overflow_pointer_input, overflow_touch_excluded) =
             self.capture_fs_front_pointer_input(ctx, full_rect);
         let primary_suppression =
@@ -40539,6 +40556,7 @@ impl App {
         let result = self.handle_fs_wheel_and_click_frame(
             ui,
             ctx,
+            cursor_active,
             full_rect,
             state,
             seek_geometry,
@@ -40561,6 +40579,7 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
+        cursor_active: bool,
         full_rect: egui::Rect,
         state: &FsFrameState,
         seek_geometry: StillSeekGeometry,
@@ -40925,14 +40944,15 @@ impl App {
                 panel_fs_idx
                     .is_some_and(|idx| self.still_info_panel_lock_effective_for_idx(idx, false)),
             );
-        // When the OS cursor is hidden, egui still exposes the last hover position.
-        // Treat that position as stale and block passive hover side effects until a
-        // real input event revives the cursor.
-        let passive_hover_enabled = !self.cursor_hidden();
+        // Route this frame's input with the same Idle-release rule as cursor visibility.
+        // Use activity captured before UI can consume scroll; passive hover stays gated
+        // by cursor_hidden above, and ZoomAiming keeps its own wheel behavior.
+        let pointer_position_live =
+            fullscreen_pointer_position_live(self.cursor_hide_reason, cursor_active);
         // ZipPla ズーム中 (照準含む) は左右パネルを抑止しているので、当たり判定でもパネル領域を
         // 無効化する。さもないと右ホバー帯 / ピン留めメタデータ等でホイール (倍率変更) や
         // クリック (ページ送り) が奪われる (Codex P2)。
-        let cursor_in_seek_panel = passive_hover_enabled
+        let cursor_in_seek_panel = pointer_position_live
             && ctx.input(|i| {
                 i.pointer
                     .hover_pos()
@@ -40947,7 +40967,7 @@ impl App {
                         .is_some_and(|rect| rect.contains(point))
                 });
         let cursor_in_panel = cursor_in_depth_panel
-            || passive_hover_enabled
+            || pointer_position_live
                 && !self.fs_zoom_mode_effective()
                 && ctx.input(|i| {
                     i.pointer
@@ -65997,6 +66017,36 @@ mod tests {
                 pointer_pos: Some(pos),
             })
         );
+    }
+
+    #[test]
+    fn section1842_pointer_position_liveness_shares_the_idle_release_rule() {
+        for (current, cursor_active, live) in [
+            (None, false, true),
+            (None, true, true),
+            (Some(FsCursorHide::Idle), false, false),
+            (Some(FsCursorHide::Idle), true, true),
+            (Some(FsCursorHide::ZoomAiming), false, false),
+            (Some(FsCursorHide::ZoomAiming), true, false),
+        ] {
+            assert_eq!(
+                fullscreen_pointer_position_live(current, cursor_active),
+                live,
+                "current={current:?} cursor_active={cursor_active}"
+            );
+            let zoom_aiming = current == Some(FsCursorHide::ZoomAiming);
+            assert_eq!(
+                next_fullscreen_cursor_hide_reason(
+                    current,
+                    zoom_aiming,
+                    cursor_active,
+                    true,
+                    false
+                ),
+                if live { None } else { current },
+                "visibility must use the same rule: {current:?} cursor_active={cursor_active}"
+            );
+        }
     }
 
     fn setup_zoom_cursor_app() -> crate::app::AppTestEnvForTest {
