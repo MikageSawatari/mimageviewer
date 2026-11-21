@@ -133,19 +133,22 @@ public static class MivReleaseCheckNative {
    try{Rect r;if(!SystemParametersInfo(0x30,0,out r,0))throw new Exception("Primary work area unavailable");return new[]{(int)GetDpiForSystem(),r.L,r.T,r.R,r.B};}
    finally{SetThreadDpiAwarenessContext(previous);}
  }
- public static int[] OuterSize(int width,int height,uint dpi){
+ public static int[] OuterRect(int width,int height,uint dpi,int logicalX,int logicalY){
    // Winit 0.30's normal decorated, resizable root: WS_OVERLAPPEDWINDOW |
    // WS_CLIPSIBLINGS; WS_EX_WINDOWEDGE | WS_EX_ACCEPTFILES | WS_EX_APPWINDOW.
    // Visibility/clipping flags do not add nonclient space. There is no menu.
    // --window-size is logical client size, not decorated physical window size.
    var r=new Rect{R=(int)Math.Round(width*dpi/96.0),B=(int)Math.Round(height*dpi/96.0)};
    if(!AdjustWindowRectExForDpi(ref r,0x04CF0000,false,0x00040110,dpi))throw new Exception("Decorated window size unavailable");
-   return new[]{r.R-r.L,r.B-r.T};
+   // egui-winit passes a LogicalPosition to winit, which sets the OUTER origin.
+   // AdjustWindowRectExForDpi supplies the extent, not an offset from that origin.
+   int x=(int)Math.Round(logicalX*dpi/96.0),y=(int)Math.Round(logicalY*dpi/96.0);
+   return new[]{x,y,x+r.R-r.L,y+r.B-r.T};
  }
  public static int[] WindowGeometry(IntPtr hwnd){
    var previous=SetThreadDpiAwarenessContext(new IntPtr(-4));
    if(previous==IntPtr.Zero)throw new Exception("Per-monitor DPI context unavailable");
-   try{Rect c,r;if(!GetClientRect(hwnd,out c)||!GetWindowRect(hwnd,out r))throw new Exception("Root window geometry unavailable");return new[]{(int)GetDpiForWindow(hwnd),c.R-c.L,c.B-c.T,r.L,r.T,r.R,r.B};}
+   try{Rect c,r,area;if(!GetClientRect(hwnd,out c)||!GetWindowRect(hwnd,out r)||!SystemParametersInfo(0x30,0,out area,0))throw new Exception("Root window geometry/work area unavailable");return new[]{(int)GetDpiForWindow(hwnd),c.R-c.L,c.B-c.T,r.L,r.T,r.R,r.B,area.L,area.T,area.R,area.B};}
    finally{SetThreadDpiAwarenessContext(previous);}
  }
  public static int[] Counts(uint pid){int total=0,visible=0;EnumWindows((w,p)=>{uint id;GetWindowThreadProcessId(w,out id);if(id==pid){total++;if(IsWindowVisible(w)){var b=new StringBuilder(256);GetClassName(w,b,256);Rect r;var c=b.ToString();if(c!="IME"&&c!="MSCTFIME UI"&&c!="Winit Thread Event Target"&&GetWindowRect(w,out r)&&r.R-r.L>=64&&r.B-r.T>=64)visible++;}}return true;},IntPtr.Zero);return new[]{total,visible};}
@@ -182,7 +185,7 @@ function Get-ReleaseCheckCaseGeometry {
 }
 
 function Assert-ReleaseCheckGeometryEnvironment {
-    param($ForegroundGeometry,$BackgroundGeometry,[int[]]$WorkArea,[int[]]$OuterSize)
+    param($ForegroundGeometry,$BackgroundGeometry,[int[]]$WorkArea,[int[]]$OuterRect)
     $expected=Get-ReleaseCheckCaseGeometry 'static-foreground' $ForegroundGeometry.dpi
     foreach($row in @($ForegroundGeometry,$BackgroundGeometry)){
         if($row.dpi -ne $expected.dpi -or $row.grid_cols -ne $expected.grid_cols -or
@@ -190,9 +193,18 @@ function Assert-ReleaseCheckGeometryEnvironment {
             throw 'Static foreground/background geometry must match the selected DPI table row.'
         }
     }
-    if($WorkArea.Count -ne 4 -or $OuterSize.Count -ne 2 -or $OuterSize[0] -le 0 -or $OuterSize[1] -le 0 -or
-        $OuterSize[0] -gt ($WorkArea[2]-$WorkArea[0]) -or $OuterSize[1] -gt ($WorkArea[3]-$WorkArea[1])){
-        throw "Selected static decorated window ($($OuterSize -join 'x') physical px) does not fit the primary work area ($($WorkArea -join ','))."
+    Assert-ReleaseCheckRectInWorkArea $OuterRect $WorkArea 'Selected static decorated window'
+}
+
+function Assert-ReleaseCheckRectInWorkArea {
+    param([int[]]$WindowRect,[int[]]$WorkArea,[string]$Label='Actual window')
+    # Both rectangles are physical screen coordinates, including nonzero origins.
+    if($WorkArea.Count -ne 4 -or $WindowRect.Count -ne 4 -or
+        $WorkArea[2] -le $WorkArea[0] -or $WorkArea[3] -le $WorkArea[1] -or
+        $WindowRect[2] -le $WindowRect[0] -or $WindowRect[3] -le $WindowRect[1] -or
+        $WindowRect[0] -lt $WorkArea[0] -or $WindowRect[1] -lt $WorkArea[1] -or
+        $WindowRect[2] -gt $WorkArea[2] -or $WindowRect[3] -gt $WorkArea[3]){
+        throw "$Label ($($WindowRect -join ',') physical px) does not fit the primary work area ($($WorkArea -join ','))."
     }
 }
 
@@ -201,9 +213,15 @@ function Get-ReleaseCheckGeometryPreflight {
     $foreground=Get-ReleaseCheckCaseGeometry 'static-foreground' $desktop[0]
     $background=Get-ReleaseCheckCaseGeometry 'static-background' $desktop[0]
     $workArea=@($desktop[1..4])
-    $outer=[MivReleaseCheckNative]::OuterSize($foreground.window_size[0],$foreground.window_size[1],$desktop[0])
+    # Mirror src/lib.rs --window-size -> with_position(pos2(60.0,40.0)).
+    # The kit has no product sources, so its fixed logical OUTER origin is kept
+    # once in the shared table. It is absolute, not relative to the work area.
+    $table=Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\..\release_check_geometry.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+    $position=@($table.startup_position)
+    if($position.Count -ne 2 -or $position[0] -isnot [int] -or $position[1] -isnot [int]){throw 'Invalid fixed startup position in geometry table.'}
+    $outer=[MivReleaseCheckNative]::OuterRect($foreground.window_size[0],$foreground.window_size[1],$desktop[0],$position[0],$position[1])
     Assert-ReleaseCheckGeometryEnvironment $foreground $background $workArea $outer
-    return [pscustomobject]@{static_geometry=$foreground;work_area=$workArea;outer_size=@($outer)}
+    return [pscustomobject]@{static_geometry=$foreground;startup_position=$position;work_area=$workArea;outer_rect=@($outer);outer_size=@(($outer[2]-$outer[0]),($outer[3]-$outer[1]))}
 }
 
 function Get-ReleaseCheckWindowGeometry {
@@ -212,7 +230,7 @@ function Get-ReleaseCheckWindowGeometry {
     $null=[MivReleaseCheckNative]::GetWindowThreadProcessId([IntPtr]$RootHwnd,[ref]$owner)
     if($RootHwnd -le 0 -or $owner -ne $AppPid){throw 'Geometry root HWND owner mismatch.'}
     $native=[MivReleaseCheckNative]::WindowGeometry([IntPtr]$RootHwnd)
-    return [pscustomobject]@{pid=$AppPid;root_hwnd=$RootHwnd;dpi=$native[0];client_size=@($native[1..2]);window_rect=@($native[3..6])}
+    return [pscustomobject]@{pid=$AppPid;root_hwnd=$RootHwnd;dpi=$native[0];client_size=@($native[1..2]);window_rect=@($native[3..6]);work_area=@($native[7..10])}
 }
 
 function Assert-ReleaseCheckWindowGeometry {
@@ -222,6 +240,7 @@ function Assert-ReleaseCheckWindowGeometry {
     if(($Actual.client_size -join ',') -ne ($physical -join ',')){
         throw 'Actual window client size differs from the selected case geometry.'
     }
+    Assert-ReleaseCheckRectInWorkArea $Actual.window_rect $Actual.work_area
 }
 
 function Assert-ReleaseCheckBackgroundTransitionForeground {

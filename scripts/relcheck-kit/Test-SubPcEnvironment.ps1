@@ -122,6 +122,7 @@ try{
         remote_session=([MivReleaseCheckNative]::GetSystemMetrics(0x1000) -ne 0);session_name=$env:SESSIONNAME
         primary_screen=('{0}x{1}' -f $screen.Width,$screen.Height);system_dpi=$report.geometry_preflight.static_geometry.dpi
         static_geometry=$report.geometry_preflight.static_geometry;work_area=$report.geometry_preflight.work_area;static_outer_size=$report.geometry_preflight.outer_size
+        startup_position=$report.geometry_preflight.startup_position;static_outer_rect=$report.geometry_preflight.outer_rect
         gpu_names=@(Get-CimInstance Win32_VideoController | ForEach-Object {$_.Name})
         cpu_names=@(Get-CimInstance Win32_Processor | ForEach-Object {$_.Name})
         os=(Get-CimInstance Win32_OperatingSystem).Caption

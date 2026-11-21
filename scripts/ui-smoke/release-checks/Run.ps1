@@ -190,9 +190,9 @@ function Invoke-ReleaseSession {
             $focusAcquired=$fg.foreground_pid -eq $script:owned.Id -and $fg.foreground_hwnd -eq $script:owned.MainWindowHandle.ToInt64()
             if($focusAcquired){
                 $actual=Get-ReleaseCheckWindowGeometry $script:owned.Id $script:owned.MainWindowHandle.ToInt64()
-                Assert-ReleaseCheckWindowGeometry $actual $geometry
                 $metadata.dpi_by_case[$CaseId]=$actual.dpi
                 $metadata.window_geometry_by_case[$CaseId]=$actual
+                Assert-ReleaseCheckWindowGeometry $actual $geometry
             }
         }
         if(-not $focusAcquired -and $focusTimer.Elapsed.TotalSeconds -gt 20){throw 'Exact root foreground unavailable within 20 seconds.'}
@@ -204,9 +204,9 @@ function Invoke-ReleaseSession {
             if($hwndPid -ne $script:owned.Id){throw 'Ready root HWND owner mismatch.'}
             if($CaseId -like 'static-*'){
                 $actual=Get-ReleaseCheckWindowGeometry $script:owned.Id ([long]$r.root_hwnd)
-                Assert-ReleaseCheckWindowGeometry $actual $geometry
                 $metadata.dpi_by_case[$CaseId]=$actual.dpi
                 $metadata.window_geometry_by_case[$CaseId]=$actual
+                Assert-ReleaseCheckWindowGeometry $actual $geometry
             }
             $backgroundHwnd=0
             if($CaseId.Contains('background')){

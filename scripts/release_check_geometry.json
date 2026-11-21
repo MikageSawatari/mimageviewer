@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "startup_position": [60, 40],
   "default": {
     "window_size": [1328, 900],
     "grid_cols": 7

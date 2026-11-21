@@ -104,8 +104,8 @@ public static class MivReleaseCheckNative {
  public static int[] WorkArea=new[]{0,0,1920,1040};
  public static int[] ClientSize=new[]{1420,900};
  public static int[] DesktopGeometry(){return new[]{GeometryDpi,WorkArea[0],WorkArea[1],WorkArea[2],WorkArea[3]};}
- public static int[] OuterSize(int w,int h,uint dpi){return new[]{(int)(w*dpi/96)+16,(int)(h*dpi/96)+39};}
- public static int[] WindowGeometry(System.IntPtr h){return new[]{GeometryDpi,ClientSize[0],ClientSize[1],60,40,60+ClientSize[0]+16,40+ClientSize[1]+39};}
+ public static int[] OuterRect(int w,int h,uint dpi,int logicalX,int logicalY){int x=(int)System.Math.Round(logicalX*dpi/96.0),y=(int)System.Math.Round(logicalY*dpi/96.0);return new[]{x,y,x+(int)(w*dpi/96)+16,y+(int)(h*dpi/96)+39};}
+ public static int[] WindowGeometry(System.IntPtr h){return new[]{GeometryDpi,ClientSize[0],ClientSize[1],60,40,60+ClientSize[0]+16,40+ClientSize[1]+39,WorkArea[0],WorkArea[1],WorkArea[2],WorkArea[3]};}
  public static uint BackgroundOwner=202;
  public static bool ActivationSucceeds=true;
  public static int ActivationCalls=0;
@@ -155,15 +155,18 @@ public static class MivReleaseCheckNative {
         [MivReleaseCheckNative]::WorkArea=@(0,0,3840,2120)
         $preflight=Get-ReleaseCheckGeometryPreflight
         Assert-True ($preflight.static_geometry.dpi -eq $dpi) 'Preflight lost selected DPI.'
-        Assert-ReleaseCheckGeometryEnvironment $foreground $background @(0,0,3840,2120) $preflight.outer_size
-        Assert-Throws {Assert-ReleaseCheckGeometryEnvironment $foreground $background @(0,0,1000,2000) $preflight.outer_size} 'Too-narrow work area accepted.'
-        Assert-Throws {Assert-ReleaseCheckGeometryEnvironment $foreground $background @(0,0,4000,800) $preflight.outer_size} 'Taskbar-reduced work area accepted.'
+        Assert-True (($preflight.startup_position -join ',') -eq '60,40') 'Fixed logical outer position differs from src/lib.rs.'
+        $expectedOrigin=if($dpi -eq 96){'60,40'}else{'90,60'}
+        Assert-True (($preflight.outer_rect[0..1] -join ',') -eq $expectedOrigin) 'Logical startup position was not converted to physical screen coordinates.'
+        Assert-ReleaseCheckGeometryEnvironment $foreground $background @(0,0,3840,2120) $preflight.outer_rect
+        Assert-Throws {Assert-ReleaseCheckGeometryEnvironment $foreground $background @(0,0,1000,2000) $preflight.outer_rect} 'Too-narrow work area accepted.'
+        Assert-Throws {Assert-ReleaseCheckGeometryEnvironment $foreground $background @(0,0,4000,800) $preflight.outer_rect} 'Taskbar-reduced work area accepted.'
         $background.window_size=@(1200,900)
-        Assert-Throws {Assert-ReleaseCheckGeometryEnvironment $foreground $background @(0,0,3840,2120) $preflight.outer_size} 'Different foreground/background planned sizes accepted.'
+        Assert-Throws {Assert-ReleaseCheckGeometryEnvironment $foreground $background @(0,0,3840,2120) $preflight.outer_rect} 'Different foreground/background planned sizes accepted.'
         $physical=@($foreground.window_size | ForEach-Object {[int][Math]::Round($_*$dpi/96.0)})
         $expectedPhysical=if($dpi -eq 96){'1420x900'}else{'1992x1350'}
         Assert-True ($physical.Count -eq 2 -and $physical[0] -is [int] -and $physical[1] -is [int] -and ($physical -join 'x') -eq $expectedPhysical) 'Physical window size is not a flat converted pair.'
-        $actual=[pscustomobject]@{dpi=$dpi;client_size=$physical}
+        $actual=[pscustomobject]@{dpi=$dpi;client_size=$physical;window_rect=$preflight.outer_rect;work_area=$preflight.work_area}
         Assert-ReleaseCheckWindowGeometry $actual $foreground
         # Comma binds tighter than subtraction in PowerShell; isolate arithmetic.
         $actual.client_size=@(($physical[0]-1),$physical[1])
@@ -178,8 +181,37 @@ public static class MivReleaseCheckNative {
     $tooSmall=Invoke-ReleaseCheckPreflight {Get-ReleaseCheckGeometryPreflight}
     Assert-True ($tooSmall.exit_code -eq 2 -and $tooSmall.environment_error -like '*does not fit*') 'Insufficient physical work area did not skip before launch.'
     [MivReleaseCheckNative]::WorkArea=@(0,0,1920,1040)
+    $positioned=Get-ReleaseCheckGeometryPreflight
+    Assert-True (($positioned.outer_rect -join ',') -eq '60,40,1496,979' -and ($positioned.outer_size -join ',') -eq '1436,939') 'Fake decorated rectangle/extent changed.'
+    # The extent fits 1920x960, but the fixed y=40 puts its bottom at 979.
+    [MivReleaseCheckNative]::WorkArea=@(0,0,1920,960)
+    Assert-True ($positioned.outer_size[0] -le 1920 -and $positioned.outer_size[1] -le 960) 'Position regression no longer exercises a size-only false positive.'
+    $outsideAtStartup=Invoke-ReleaseCheckPreflight {Get-ReleaseCheckGeometryPreflight}
+    Assert-True ($outsideAtStartup.exit_code -eq 2 -and $outsideAtStartup.environment_error -like '*does not fit*') 'Fixed startup position outside work area was accepted.'
+    foreach($area in @(@(50,30,1920,1040),@(-100,-50,1820,990))){
+        [MivReleaseCheckNative]::WorkArea=$area
+        $shifted=Get-ReleaseCheckGeometryPreflight
+        Assert-True (($shifted.outer_rect -join ',') -eq '60,40,1496,979' -and ($shifted.work_area -join ',') -eq ($area -join ',')) 'Startup origin was incorrectly made relative to the work area.'
+    }
+    foreach($area in @(@(61,0,1920,1040),@(0,41,1920,1040))){
+        [MivReleaseCheckNative]::WorkArea=$area
+        $shifted=Invoke-ReleaseCheckPreflight {Get-ReleaseCheckGeometryPreflight}
+        Assert-True ($shifted.exit_code -eq 2) 'Fixed window outside a shifted work-area origin was accepted.'
+    }
+    [MivReleaseCheckNative]::WorkArea=@(0,0,1920,1040)
     $observed=Get-ReleaseCheckWindowGeometry 101 888
     Assert-True (($observed.client_size -join ',') -eq '1420,900' -and $observed.pid -eq 101 -and $observed.root_hwnd -eq 888) 'Native client geometry lost exact root identity.'
+    Assert-True (($observed.window_rect -join ',') -eq '60,40,1496,979' -and ($observed.work_area -join ',') -eq '0,0,1920,1040') 'Actual window/work-area evidence lost physical coordinates.'
+    $expected=Get-ReleaseCheckCaseGeometry 'static-foreground' 96
+    Assert-ReleaseCheckWindowGeometry $observed $expected
+    foreach($rect in @(@(-1,40,1435,979),@(60,-1,1496,938),@(500,40,1936,979),@(60,110,1496,1049))){
+        $observed.window_rect=$rect
+        Assert-Throws {Assert-ReleaseCheckWindowGeometry $observed $expected} 'Actual window crossing a work-area edge was accepted.'
+    }
+    $observed.window_rect=@(60,40,1496,979);$observed.work_area=@(50,30,1920,1040)
+    Assert-ReleaseCheckWindowGeometry $observed $expected
+    $observed.work_area=@(61,30,1920,1040)
+    Assert-Throws {Assert-ReleaseCheckWindowGeometry $observed $expected} 'Actual window left of a shifted work-area origin was accepted.'
     Assert-Throws {Get-ReleaseCheckWindowGeometry 102 888} 'Another PID supplied window geometry.'
     foreach($relative in @('ui-smoke\release-checks\Run.ps1','relcheck-kit\Test-SubPcEnvironment.ps1')){
         $ast=Get-TestAst (Join-Path $PSScriptRoot $relative)
@@ -201,13 +233,21 @@ public static class MivReleaseCheckNative {
     $script:windowPlan=Get-ReleaseCheckCaseGeometry 'static-background' 96
     foreach($Scenario in @('static-foreground','static-background')){
         $report=@{environment_errors=@()}
-        $samples=@([pscustomobject]@{window_geometry=[pscustomobject]@{dpi=96;client_size=@(1420,900)}},
-                   [pscustomobject]@{window_geometry=[pscustomobject]@{dpi=96;client_size=@(1420,900)}})
+        $samples=@([pscustomobject]@{window_geometry=[pscustomobject]@{dpi=96;client_size=@(1420,900);window_rect=@(60,40,1496,979);work_area=@(0,0,1920,1040)}},
+                   [pscustomobject]@{window_geometry=[pscustomobject]@{dpi=96;client_size=@(1420,900);window_rect=@(60,40,1496,979);work_area=@(0,0,1920,1040)}})
         & ([scriptblock]::Create($checks[0].Extent.Text))
         Assert-True ($report.environment_errors.Count -eq 0) 'Matching native sample geometry rejected.'
         $samples[1].window_geometry.client_size=@(1328,900)
         & ([scriptblock]::Create($checks[0].Extent.Text))
         Assert-True (($report.environment_errors -join ' ') -like '*client size differs*') 'Resize after foreground/background readiness accepted.'
+        $report=@{environment_errors=@()};$samples[1].window_geometry.client_size=@(1420,900)
+        $samples[1].window_geometry.window_rect=@(60,110,1496,1049)
+        & ([scriptblock]::Create($checks[0].Extent.Text))
+        Assert-True (($report.environment_errors -join ' ') -like '*does not fit*') 'Window leaving work area during foreground/background sampling was accepted.'
+        $report=@{environment_errors=@()};$samples[1].window_geometry.window_rect=@(60,40,1496,979)
+        $samples[1].window_geometry.work_area=@(0,0,1920,960)
+        & ([scriptblock]::Create($checks[0].Extent.Text))
+        Assert-True (($report.environment_errors -join ' ') -like '*does not fit*') 'A changed work area was ignored during sampling.'
     }
     # Compile the real native declarations without invoking any imported API.
     $support=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Support.ps1')
@@ -507,7 +547,7 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
     $report=[ordered]@{failures=@();environment_errors=@();warnings=@();verdict='SKIPPED';exit_code=2}
     $script:fakeMeasured.HasExited=$false;$Scenario='static-background'
     $thresholds.max_cpu_core_ratio=100;$thresholds.target_cpu_core_ratio=100
-    function Get-ReleaseCheckWindowSample {param($ProcessId,$RootHwnd) [pscustomobject]@{unix_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();foreground_pid=101;foreground_hwnd=1001;total=1;visible=1;window_geometry=[pscustomobject]@{dpi=96;client_size=@(1420,900)}}}
+    function Get-ReleaseCheckWindowSample {param($ProcessId,$RootHwnd) [pscustomobject]@{unix_ms=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();foreground_pid=101;foreground_hwnd=1001;total=1;visible=1;window_geometry=[pscustomobject]@{dpi=96;client_size=@(1420,900);window_rect=@(60,40,1496,979);work_area=@(0,0,1920,1040)}}}
     function Assert-ReleaseCheckWindowSamples {param($Samples,$Scenario,$ProcessId,$RootHwnd,$BackgroundHwnd,$BackgroundProcessId) throw 'fake lost runner background'}
     function Get-Content {
         param($LiteralPath,$Encoding,[switch]$Raw)

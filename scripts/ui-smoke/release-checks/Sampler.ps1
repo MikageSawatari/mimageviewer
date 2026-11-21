@@ -99,7 +99,8 @@ try {
     try { Assert-ReleaseCheckWindowSamples $samples $Scenario $ProcessId $RootHwnd $BackgroundHwnd $BackgroundProcessId }
     catch { $report.environment_errors += $_.Exception.Message }
     # Reuse the existing samples: prove that covering the static root did not
-    # resize it, and that its DPI still matches fixture generation throughout.
+    # resize it, that its DPI still matches fixture generation, and that its
+    # physical outer rectangle stays inside the current primary work area.
     if($Scenario -like 'static-*'){
         foreach($sample in $samples){
             try { Assert-ReleaseCheckWindowGeometry $sample.window_geometry $script:windowPlan }
