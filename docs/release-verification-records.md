@@ -18,14 +18,14 @@
 - **依存物**: `check-dependency-updates.ps1` で PDFium・FFmpeg・LibRaw・ONNX Runtime・Rust・egui は最新。普通の crate 7 個と EffeTune Mixwright v0.19.0 は今回は上げない。
 - **CI 相当**: `cargo fmt --check` 成功。push 後の CI (main `36d603f3e`) は成功。
 - **自動テスト**: master `575633638` の lib 全件 19,324 件成功、test-script の lib 全件 19,480 件成功。配布ビルドの全体テスト 21,448 件成功 (1 回目は mIV のインストール版が起動中で開始前に停止、2 回目は全体テストの後に `test-release-build-safety.ps1` が 78681129f 由来の偽 cargo の不足で失敗し `febf32a8f` / `e0506e420` で修正 (Codex 実装、Sol xhigh レビューの P2 を対応、もう 1 件の P2 は配布に使わない計測用の検査で次版)、3 回目で全段通過)。
-- **ReleaseChecks (9.6 / 9.7)**: **実施していない** (統括の手順漏れ。公開後に判明)。bench (9.5) は検索の索引・照会を変えていないため省略。
+- **ReleaseChecks (9.6 / 9.7)**: **実施していない** (統括の手順漏れ。公開後に判明)。公開後に流し始めたが、ビルドの後に計測が急に始まる形を避けたいという利用者の判断で、ビルドの途中で止めた (計測は未開始)。利用者決定 (2026-11-21): v5.5.0 では流さず、ReleaseChecks をサブ PC で流せるようにしてから、次回から公開前にサブ PC で行う。bench (9.5) は検索の索引・照会を変えていないため省略。
 - **panic.log**: 54 件 17 種すべて disposition あり。製品ページのカード 53 件は上限内。
 - **署名・成果物**: `build-dist.ps1 -SkipVst3Bridge` (署名あり)。単体exe・setup.exe・ポータブル版の mimageviewer.exe を `signtool verify /pa` で確認 (exit 0、Open Source Developer Taku Sano、timestamp あり)。全 PE / VC runtime gate 通過。sha256: 単体exe `aafc41f6e4f4be866df9308f3bf5a4ebfc311f2710f00bf3a6ed6d2b25956b43` (609,343,576 B)・setup.exe `10ea7e997426330d30fcfd7024393d85f6ff0bb5644f6806df215836e61a0b4a` (273,477,592 B)・Vector zip `656ba3b0eb6ae9333b5fd86ff37f57d57ad6eeab5a674e0cd73766b975e41bba`・ポータブル zip `4e2ff2d69540ba4a92d8100744cbccaa747f8feba0d9555b212a073dbc528829`。
 - **VirusTotal**: 省略。VST3 host と mIV Sound は v5.4.0 から変更なし (再署名のみ)。
 - **実機確認 (利用者、インストール版)**: 問題なし (2026-11-21)。
 - **サブ PC の確認 (観測者はサブ PC 担当、master `120ff61fb` の build-dev)**: Ctrl+S / Ctrl+T (v5.4.0・修正前は入力できず、修正後は英字・IME とも入力できた)・§1.823〜1.826 (軽微 2)・§1.476 (軽微 2、v5.4.0 から)・§1.762 (軽微 2: 範囲指定で 1 文字目でメニューが閉じる件は既知の問題に掲載し更新履歴から文言を外した)・§1.816 PDF / NIS / Anime4K (問題なし)・§1.462 (軽微 2、以前から)。§1.464 の確認は公開後に届き、ツリーへのドラッグが移動でも「＋ コピー」と表示される件を §1.834 として v5.5.1 で直す (利用者決定、既知の問題に掲載)。§1.830・§1.740 は公開後に確認。
 - **公開 (2026-11-21 15:12)**: GitHub Release v5.5.0 (latest)、資産 4 点のサイズが手元と一致、`releases/latest/download/` の 3 点は 200・サイズ一致。mikage.to 反映 26 ファイル (サーバ側 SHA-256 一致、verify-site 405/406 = `.htaccess` の 403 のみ)。
-- **MS Store**: v5.5.0 を申請するかは利用者の判断待ち。
+- **Vector・MS Store**: v5.5.0 は申請しない (利用者決定 2026-11-21: 3 連休中で、連休中に次の版も出す予定のため)。
 
 ## v5.4.0 (2026-11-19)
 
