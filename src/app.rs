@@ -595,6 +595,7 @@ mod facet_name_filter;
 mod facet_navigation;
 pub(crate) mod file_type_resume;
 pub(crate) mod page_overview;
+pub(crate) mod prepared_search;
 
 /// Which source-swap stamp counts as an open viewer session (see
 /// `App::projected_viewer_session_open_for`).
@@ -7667,18 +7668,25 @@ pub(crate) struct DetailsVideoProbe {
 /// 大規模お気に入りツリーでは 10〜100ms 級のブロックになり得る。さらにその後に
 /// 走る `start_loading_items` が数百ms の UI ブロック源になるので、DB 問い合わせ
 /// だけでもバックグラウンドに退避する。
-#[derive(Default)]
 pub(crate) struct FavSearchPreparedResults {
-    entries: Vec<crate::search_index_db::IndexEntry>,
+    rows: prepared_search::PreparedSearchRows,
+    results_paths: Vec<PathBuf>,
     video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
 }
 
 /// Prepare source provenance on the existing DB worker, before UI adoption.
 fn prepare_favsearch_results(
-    entries: Vec<crate::search_index_db::IndexEntry>,
+    mut entries: Vec<crate::search_index_db::IndexEntry>,
     settings: &crate::settings::Settings,
     cancel: &AtomicBool,
 ) -> Option<FavSearchPreparedResults> {
+    entries.retain(|entry| {
+        entry.kind == crate::search_index_db::IndexKind::Folder
+            || (settings
+                .file_type_visibility
+                .allows_physical_file(&entry.path)
+                && !settings.epub_file_handling_ignores_path(&entry.path))
+    });
     let videos = entries
         .iter()
         .filter(|entry| entry.kind == crate::search_index_db::IndexKind::VideoFile)
@@ -7703,8 +7711,35 @@ fn prepare_favsearch_results(
     if cancel.load(Ordering::Relaxed) {
         return None;
     }
+    let mut items: Vec<GridItem> = Vec::with_capacity(entries.len());
+    let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(entries.len());
+    let mut video_items: Vec<(usize, PathBuf, u64)> = Vec::new();
+    for e in &entries {
+        let item = match e.kind {
+            crate::search_index_db::IndexKind::Folder => GridItem::Folder(e.path.clone()),
+            crate::search_index_db::IndexKind::ZipFile => GridItem::ZipFile(e.path.clone()),
+            crate::search_index_db::IndexKind::PdfFile => GridItem::PdfFile(e.path.clone()),
+            crate::search_index_db::IndexKind::VideoFile => GridItem::Video(e.path.clone()),
+        };
+        let idx = items.len();
+        if matches!(item, GridItem::Video(_)) {
+            image_metas.push(Some((e.mtime, 0)));
+            video_items.push((idx, e.path.clone(), 0));
+        } else {
+            image_metas.push(Some((e.mtime, 0)));
+        }
+        items.push(item);
+    }
+
     Some(FavSearchPreparedResults {
-        entries,
+        results_paths: entries.into_iter().map(|entry| entry.path).collect(),
+        rows: prepared_search::PreparedSearchRows::prepare(
+            items,
+            image_metas,
+            video_items,
+            settings,
+            "favorite",
+        ),
         video_thumb_overrides: sidecars.by_video_path,
     })
 }
@@ -25994,10 +26029,26 @@ impl App {
     }
 
     fn hydrate_installed_main_list(&mut self, hydration: MainListHydration) {
-        if let Some((continuation, prepared)) = hydration
-            && let Err(continuation) = self.begin_sidecar_restore(continuation, prepared)
-        {
-            self.cancel_unprepared_sidecar_display(continuation);
+        self.hydrate_installed_main_list_with_search_index(hydration, None);
+    }
+
+    fn hydrate_installed_main_list_with_search_index(
+        &mut self,
+        hydration: MainListHydration,
+        prepared_search_index: Option<Arc<file_type_resume::PreparedPageIdentityIndex>>,
+    ) {
+        if let Some((continuation, prepared)) = hydration {
+            let result = match prepared_search_index {
+                Some(index) => self.begin_sidecar_restore_with_search_index(
+                    continuation,
+                    prepared,
+                    Some(index),
+                ),
+                None => self.begin_sidecar_restore(continuation, prepared),
+            };
+            if let Err(continuation) = result {
+                self.cancel_unprepared_sidecar_display(continuation);
+            }
         }
     }
 
@@ -35163,7 +35214,7 @@ impl App {
                 if result.query == self.tag_view.last_executed
                     && result.kind_filter == self.tag_view.last_executed_kind_filter
                 {
-                    self.apply_tag_view_result(result);
+                    self.apply_prepared_tag_view_result(result);
                 }
             }
             Ok(Err(msg)) => {
@@ -35177,72 +35228,44 @@ impl App {
         }
     }
 
-    fn apply_tag_view_result(&mut self, mut result: crate::tag_view::TagViewResult) {
+    #[cfg(test)]
+    fn apply_tag_view_result(&mut self, result: crate::tag_view::TagViewResult) {
+        self.apply_prepared_tag_view_result(crate::tag_view::PreparedTagViewResult::prepare(
+            result,
+            &self.settings,
+        ));
+    }
+
+    fn apply_prepared_tag_view_result(&mut self, result: crate::tag_view::PreparedTagViewResult) {
+        if !result.rows.conditions.matches(&self.settings) {
+            crate::logger::log("tag search result discarded: row conditions changed");
+            return;
+        }
         if !self.items_are_tag_view {
             self.reset_details_sort_to_toolbar();
         }
         let retained_applied_at_sort = (self.items_are_tag_view
             && self.settings.details_sort_key == crate::settings::DetailsSortKey::AppliedAt)
             .then_some(self.settings.details_sort_ascending);
-        let applied_times = result
-            .entries
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .applied_at_ms
-                    .map(|time| (crate::tags_db::item_key_for_path(&entry.path), time))
-            })
-            .collect();
-        self.video_thumb_overrides = std::mem::take(&mut result.video_thumb_overrides);
-        result.entries.retain(|entry| {
-            entry.kind != crate::tag_view::TagViewItemKind::PdfFile
-                || !self.settings.epub_file_handling_ignores_path(&entry.path)
-        });
         self.tag_view.summaries = result.summaries;
         self.tag_view.truncated = result.truncated;
-        self.tag_view.result_count = result.entries.len();
-
-        if result.query.trim().is_empty() {
-            if self.items_are_tag_view {
-                if let Some(saved) = self.tag_view.saved_folder.clone() {
-                    let restore_state = self.tag_view_subfolder_restore.take();
-                    self.suppress_nav_record_for_search_restore = true;
-                    if self.restore_subfolder_expansion_for_synthetic_path_with_state(
-                        &saved,
-                        restore_state,
-                    ) {
-                        self.suppress_nav_record_for_search_restore = false;
-                    } else {
-                        self.load_folder(saved);
-                    }
-                }
-            }
+        self.tag_view.result_count = result.rows.items.len();
+        self.video_thumb_overrides = result.video_thumb_overrides;
+        // Opening an empty field leaves the current list alone. Once showing
+        // tag results, clearing it adopts the prepared empty list through the
+        // same replacement below; only closing the tag view restores its origin.
+        if result.query.trim().is_empty() && !self.items_are_tag_view {
             return;
         }
 
-        let mut items: Vec<GridItem> = Vec::with_capacity(result.entries.len());
-        let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(result.entries.len());
-        let mut video_items: Vec<(usize, PathBuf, u64)> = Vec::new();
-        for entry in result.entries {
-            let idx = items.len();
-            let item = match entry.kind {
-                crate::tag_view::TagViewItemKind::Folder => GridItem::Folder(entry.path.clone()),
-                crate::tag_view::TagViewItemKind::Image => GridItem::Image(entry.path.clone()),
-                crate::tag_view::TagViewItemKind::Video => GridItem::Video(entry.path.clone()),
-                crate::tag_view::TagViewItemKind::Audio => GridItem::Audio(entry.path.clone()),
-                crate::tag_view::TagViewItemKind::ZipFile => GridItem::ZipFile(entry.path.clone()),
-                crate::tag_view::TagViewItemKind::PdfFile => GridItem::PdfFile(entry.path.clone()),
-                crate::tag_view::TagViewItemKind::Archive(format) => GridItem::ConvertibleArchive {
-                    path: entry.path.clone(),
-                    format,
-                },
-            };
-            if matches!(item, GridItem::Video(_)) {
-                video_items.push((idx, entry.path.clone(), entry.file_size.max(0) as u64));
-            }
-            image_metas.push(Some((entry.mtime, entry.file_size)));
-            items.push(item);
-        }
+        let applied_times = result.applied_times;
+        let prepared_search::PreparedSearchRows {
+            items,
+            image_metas,
+            video_items,
+            page_identity_index,
+            ..
+        } = result.rows;
 
         let pin_map_for_existing: std::collections::HashMap<
             String,
@@ -35308,6 +35331,7 @@ impl App {
                     top_level_grid_view::TopLevelSearchView::Tag,
                 ),
             );
+            self.publish_prepared_search_page_identity_index(page_identity_index);
             self.invalidate_idx_state_and_queues();
             self.restart_thumbnail_workers_after_metadata_pin_refresh();
             self.search_filter = None;
@@ -35340,10 +35364,6 @@ impl App {
                     Arc::new(pin_blobs),
                 );
             }
-            self.prepare_current_listing_page_identity_index(
-                self.settings.file_type_visibility.clone(),
-                None,
-            );
             self.prepare_page_edits_for_current_virtual_items();
             self.finish_rating_membership_viewer_swap(viewer);
         } else {
@@ -35357,6 +35377,7 @@ impl App {
                 existing_keys,
                 video_items,
                 None,
+                Some(page_identity_index),
             );
         }
         self.items_are_tag_view = true;
@@ -35368,7 +35389,7 @@ impl App {
         }
         self.rebuild_details_order();
         // The field may already hold a newer unsubmitted word (§1.476).
-        self.address = format!("タグビュー: {}", self.tag_view.last_executed.trim());
+        self.update_tag_view_address();
     }
 
     pub(crate) fn set_tag_view_sort(&mut self, sort: crate::tag_view::TagViewSort) {
@@ -35661,45 +35682,33 @@ impl App {
 
     /// SQLite 検索結果を `start_loading_items` に流し込む共通処理。
     fn apply_favsearch_results(&mut self, entries: Vec<crate::search_index_db::IndexEntry>) {
-        self.apply_prepared_favsearch_results(FavSearchPreparedResults {
-            entries,
-            ..Default::default()
-        });
+        // Production uses this synchronous entry only for the empty submission.
+        if let Some(prepared) =
+            prepare_favsearch_results(entries, &self.settings, &AtomicBool::new(false))
+        {
+            self.apply_prepared_favsearch_results(prepared);
+        }
     }
 
     fn apply_prepared_favsearch_results(&mut self, prepared: FavSearchPreparedResults) {
+        if !prepared.rows.conditions.matches(&self.settings) {
+            crate::logger::log("favorite search result discarded: row conditions changed");
+            return;
+        }
         let FavSearchPreparedResults {
-            entries: mut results,
+            rows,
+            results_paths,
             video_thumb_overrides,
         } = prepared;
+        let prepared_search::PreparedSearchRows {
+            items,
+            image_metas,
+            video_items,
+            page_identity_index,
+            ..
+        } = rows;
+        self.favsearch.results_paths = results_paths;
         self.video_thumb_overrides = video_thumb_overrides;
-        results.retain(|entry| {
-            entry.kind == crate::search_index_db::IndexKind::Folder
-                || self
-                    .settings
-                    .file_type_visibility
-                    .allows_physical_file(&entry.path)
-        });
-        let mut items: Vec<GridItem> = Vec::with_capacity(results.len());
-        let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(results.len());
-        let mut video_items: Vec<(usize, PathBuf, u64)> = Vec::new();
-        for e in &results {
-            let item = match e.kind {
-                crate::search_index_db::IndexKind::Folder => GridItem::Folder(e.path.clone()),
-                crate::search_index_db::IndexKind::ZipFile => GridItem::ZipFile(e.path.clone()),
-                crate::search_index_db::IndexKind::PdfFile => GridItem::PdfFile(e.path.clone()),
-                crate::search_index_db::IndexKind::VideoFile => GridItem::Video(e.path.clone()),
-            };
-            let idx = items.len();
-            if matches!(item, GridItem::Video(_)) {
-                image_metas.push(Some((e.mtime, 0)));
-                video_items.push((idx, e.path.clone(), 0));
-            } else {
-                image_metas.push(Some((e.mtime, 0)));
-            }
-            items.push(item);
-        }
-        self.favsearch.results_paths = results.iter().map(|e| e.path.clone()).collect();
 
         let synthetic = search_results_synthetic_path();
         // pinned 形式の cache 行も保護対象に入れる (Codex Phase B P2 指摘、load_folder と同様)。
@@ -35759,6 +35768,7 @@ impl App {
             existing_keys,
             video_items,
             None,
+            Some(page_identity_index),
         );
         self.update_favsearch_address();
     }
@@ -39850,6 +39860,7 @@ impl App {
                 None,
                 None,
                 None,
+                None,
                 VisibleInstallAuthority::Rating {
                     stars: self.rating_view_stars,
                 },
@@ -40801,6 +40812,7 @@ impl App {
                     Vec::new(),
                     std::collections::HashSet::new(),
                     Vec::new(),
+                    None,
                     None,
                     None,
                     None,
@@ -43957,6 +43969,7 @@ impl App {
             None,
             None,
             None,
+            None,
             VisibleInstallAuthority::Ordinary,
         );
     }
@@ -43970,6 +43983,7 @@ impl App {
         catalog_existing_keys: std::collections::HashSet<String>,
         video_items: Vec<(usize, PathBuf, u64)>,
         folder_signature: Option<crate::app::folder_scan::FolderScanSignature>,
+        prepared_search_index: Option<Arc<file_type_resume::PreparedPageIdentityIndex>>,
     ) {
         self.start_loading_items_inner(
             source_path,
@@ -43983,6 +43997,7 @@ impl App {
             None,
             None,
             None,
+            prepared_search_index,
             VisibleInstallAuthority::Projection {
                 recipe: book_materialization::ProjectionRecipe::ExtractedResult(surface),
             },
@@ -44080,6 +44095,7 @@ impl App {
             video_items,
             None,
             Some(metadata),
+            None,
             None,
             None,
             None,
@@ -44299,6 +44315,7 @@ impl App {
             std::collections::HashMap<String, Vec<String>>,
         )>,
         prepared_folder_rating: Option<(std::collections::HashMap<usize, u8>, u64, f64)>,
+        prepared_search_index: Option<Arc<file_type_resume::PreparedPageIdentityIndex>>,
         authority: VisibleInstallAuthority<'_>,
     ) {
         let logical = match &authority {
@@ -44345,7 +44362,7 @@ impl App {
             prepared_visible,
             None,
         );
-        self.hydrate_installed_main_list(hydration);
+        self.hydrate_installed_main_list_with_search_index(hydration, prepared_search_index);
     }
 
     fn install_loading_items_inner(
@@ -106102,6 +106119,8 @@ mod cover_auto_tests;
 mod cover_crop_tests;
 #[cfg(test)]
 mod cover_scope_tests;
+#[cfg(test)]
+mod favsearch_typing_frame_tests;
 #[cfg(test)]
 mod folder_pane_refresh_tests;
 #[cfg(test)]

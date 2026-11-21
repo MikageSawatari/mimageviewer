@@ -1711,6 +1711,25 @@ impl App {
         continuation: SidecarLoadContinuation,
         has_prepared_aggregate: bool,
     ) -> Result<(), SidecarLoadContinuation> {
+        self.begin_sidecar_restore_with_search_index(continuation, has_prepared_aggregate, None)
+    }
+
+    pub(super) fn publish_prepared_search_page_identity_index(
+        &mut self,
+        index: Arc<super::file_type_resume::PreparedPageIdentityIndex>,
+    ) {
+        let previous = std::mem::replace(&mut self.page_identity_index, index);
+        self.retire_smart_folder_payloads([
+            Box::new(previous) as smart_folder::RetiredSmartFolderPayload
+        ]);
+    }
+
+    pub(super) fn begin_sidecar_restore_with_search_index(
+        &mut self,
+        continuation: SidecarLoadContinuation,
+        has_prepared_aggregate: bool,
+        prepared_search_index: Option<Arc<super::file_type_resume::PreparedPageIdentityIndex>>,
+    ) -> Result<(), SidecarLoadContinuation> {
         let restore_sidecar = self
             .sidecar_restore_eligible(&continuation.source_path, has_prepared_aggregate)
             && continuation.restore_intent.imports_sidecars();
@@ -1724,6 +1743,40 @@ impl App {
                     .to_string(),
             );
             return Err(continuation);
+        }
+
+        // Only matching, fully prepared Ctrl+S / Ctrl+T result adoptions
+        // supply an index. Physical hydration and every other projection keep
+        // their existing owner, admission and sidecar gates.
+        if let Some(index) = prepared_search_index
+            && !restore_sidecar
+            && self.archive_source_override.is_none()
+            && matches!(
+                self.projection_recipe,
+                super::book_materialization::ProjectionRecipe::ExtractedResult(
+                    super::book_materialization::ExtractedSurface::Search(
+                        super::top_level_grid_view::TopLevelSearchView::Favorite
+                            | super::top_level_grid_view::TopLevelSearchView::Tag
+                    )
+                )
+            )
+            && matches!(
+                super::file_type_resume::LegacyResumeSource::from_recipe(&self.projection_recipe),
+                super::file_type_resume::LegacyResumeSource::General
+            )
+        {
+            self.publish_prepared_search_page_identity_index(index);
+            // Keep the normal owner's non-book initialization (including shift
+            // availability). Search results have no book scope, so this admits no read.
+            let request_id = self.next_sidecar_restore_request_id();
+            let book_restore = self.begin_book_shift_restore(request_id);
+            debug_assert!(book_restore.is_none());
+            self.resume_loading_items_after_sidecar(
+                continuation,
+                &SidecarModalObservation::default(),
+            );
+            self.spread_shift.finish_fenced_book_resume();
+            return Ok(());
         }
 
         // An empty non-import list has no identities or provenance to discover.
