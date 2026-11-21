@@ -174,6 +174,7 @@ AI facet も、この形に乗せる。
    - これで、全体走査の `Finished` (`src/app.rs:74313-74336`) は、未充足の要件がある間は `Reconciling` に入らず、全体走査の snapshot を必ず `finish_details_lazy_session` へ渡して証明を立てる。
    - 今のままだと、AI だけを要求していてサムネイルの長さ表示か詳細のページ数列が有効な場合、`Reconciling` に入って snapshot を捨てる。post-grid の完了 (`:74014`) も snapshot なしなので、AI の証明が立たず、再走査を繰り返す。
    - 証明が立った後は、既存の VisibleStage と post-grid の完了をそのまま許す。
+8. **空の一覧**: 取得の受付 `details_lazy_columns_visible()` (`src/app.rs:74397-74399`) は、空の一覧では長さの要件だけを例外にしている。これを一覧全体の要件に揃え、空の一覧でも AI の証明が即時に立つようにする。全件 cache の当たりのときの即時完了 (`launch_details_meta_worker` の `plan.total == 0`) も、証明を立てる。
 9. **AI メニューの要求は、証明があれば印だけ立てる (r4 P2)。**
    - `request_ai_model_facet_load()` (`src/app.rs:74606`) は今、`requested` が偽なら、証明を確かめずに `invalidate_details_meta_requirements()` を呼ぶ。これは `Cancelled` も `NotRequested` に変える (`:74379`)。
    - AI のメニュー (`src/ui_main.rs:14713`・`:14762`) は表示のたびにこれを呼ぶ。そのため、次の順で、停止した長さの走査が、利用者の再開なしに動き出す。
@@ -182,7 +183,6 @@ AI facet も、この形に乗せる。
      3. 長さの取得を始めて、停止する。
      4. AI のメニューを初めて開く。
    - 長さの `request_duration_facet_load` (`src/app/duration_metadata.rs:140`) と同じく、有効な AI の証明があれば `requested` だけを立て、取得の状態を無効にしない。
-8. **空の一覧**: 取得の受付 `details_lazy_columns_visible()` (`src/app.rs:74397-74399`) は、空の一覧では長さの要件だけを例外にしている。これを一覧全体の要件に揃え、空の一覧でも AI の証明が即時に立つようにする。全件 cache の当たりのときの即時完了 (`launch_details_meta_worker` の `plan.total == 0`) も、証明を立てる。
 
 #### 4.2.3 これで閉じる経路
 
