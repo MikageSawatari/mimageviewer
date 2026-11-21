@@ -16,6 +16,7 @@ use windows::Win32::System::Ole::{CF_HDROP, ReleaseStgMedium};
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP, SHCreateStdEnumFmtEtc};
 use windows::core::{GUID, IUnknown, IUnknown_Vtbl};
 
+mod drop_description;
 mod shell_drop_probe;
 
 static CAPTURE_LIFECYCLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

@@ -82,6 +82,102 @@ fn main_drop_shell_description_move_copy_invalid_round_trip_and_replace() {
     });
 }
 
+#[test]
+fn main_drop_shell_description_rejected_places_and_dragleave_clear_transfer_image() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source-folder");
+    let destination = temp.path().join("dst2");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(source.join("disposable.txt"), b"test").unwrap();
+    crate::file_drag::with_shell_drag_data_object(std::slice::from_ref(&source), |data| {
+        let mut fixture = fixture(
+            Some(InternalDrag {
+                paths: vec![source.clone()],
+                excluded_virtual: false,
+                failed_paths: 0,
+            }),
+            false,
+        );
+        fixture.data = data.clone();
+        *fixture.hit.borrow_mut() = Some(Hit::TreeRow(destination.clone()));
+        let image = || {
+            let cf = unsafe { RegisterClipboardFormatW(CFSTR_DROPDESCRIPTION) } as u16;
+            let medium = Medium(unsafe { data.GetData(&format(cf)).unwrap() });
+            let global = unsafe { medium.0.u.hGlobal };
+            let ptr = unsafe { GlobalLock(global) };
+            assert!(!ptr.is_null());
+            let value = unsafe { ptr.cast::<DROPDESCRIPTION>().read_unaligned() };
+            let _ = unsafe { GlobalUnlock(global) };
+            value.r#type
+        };
+        let mut output = DROPEFFECT_COPY;
+        unsafe {
+            fixture
+                .target
+                .DragEnter(data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+        }
+        .unwrap();
+        assert_eq!(output, DROPEFFECT_COPY);
+        assert_eq!(image(), DROPIMAGE_MOVE);
+        for (hit, keys, expected_effect, expected_image) in [
+            (
+                Some(Hit::TreeRow(destination.clone())),
+                CONTROL,
+                DROPEFFECT_COPY,
+                DROPIMAGE_COPY,
+            ),
+            // Internal grid blank / same list: use the default for effect NONE.
+            (
+                Some(Hit::ExistingDropArea),
+                0,
+                DROPEFFECT_NONE,
+                DROPIMAGE_INVALID,
+            ),
+            // Dropping the folder onto itself or into its current parent is rejected.
+            (
+                Some(Hit::TreeRow(source.clone())),
+                0,
+                DROPEFFECT_NONE,
+                DROPIMAGE_NONE,
+            ),
+            (
+                Some(Hit::TreeRow(temp.path().to_path_buf())),
+                0,
+                DROPEFFECT_NONE,
+                DROPIMAGE_NONE,
+            ),
+            (
+                Some(Hit::TreeNonTarget),
+                0,
+                DROPEFFECT_NONE,
+                DROPIMAGE_INVALID,
+            ),
+            (None, 0, DROPEFFECT_NONE, DROPIMAGE_INVALID),
+            (
+                Some(Hit::TreeRow(destination.clone())),
+                SHIFT,
+                DROPEFFECT_COPY,
+                DROPIMAGE_MOVE,
+            ),
+        ] {
+            *fixture.hit.borrow_mut() = hit;
+            unsafe {
+                fixture
+                    .target
+                    .DragOver(MODIFIERKEYS_FLAGS(keys), point(), &mut output)
+            }
+            .unwrap();
+            assert_eq!(output, expected_effect);
+            assert_eq!(image(), expected_image);
+        }
+        unsafe { fixture.target.DragLeave() }.unwrap();
+        assert_eq!(image(), DROPIMAGE_INVALID);
+        assert!(fixture.shared.borrow().drops.is_empty());
+        assert_eq!(fixture.observed.visual.borrow().last(), Some(&("leave", 0)));
+    });
+}
+
 #[derive(Default)]
 struct Observed {
     queries: Cell<usize>,
