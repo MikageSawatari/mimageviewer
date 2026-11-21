@@ -2,18 +2,25 @@
 //! Keep this object apartment-bound: the inner Shell object is used only on the UI STA.
 
 use std::cell::RefCell;
+use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use windows::Win32::Foundation::{E_UNEXPECTED, S_OK};
+use windows::Win32::Foundation::{
+    DV_E_DVASPECT, DV_E_LINDEX, DV_E_STGMEDIUM, DV_E_TYMED, E_INVALIDARG, E_UNEXPECTED, S_OK,
+};
 use windows::Win32::System::Com::{
     DVASPECT_CONTENT, FORMATETC, IAdviseSink, IBindCtx, IDataObject, IDataObject_Impl,
-    IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, TYMED_HGLOBAL,
+    IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0, TYMED_HGLOBAL,
 };
 use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
-use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
+use windows::Win32::System::Ole::ReleaseStgMedium;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Shell::{
-    CFSTR_PERFORMEDDROPEFFECT, IDataObjectAsyncCapability, IDataObjectAsyncCapability_Impl,
+    CFSTR_DROPDESCRIPTION, CFSTR_PERFORMEDDROPEFFECT, DROPDESCRIPTION, IDataObjectAsyncCapability,
+    IDataObjectAsyncCapability_Impl,
 };
 use windows::core::{BOOL, HRESULT, IUnknownImpl, Interface, Ref, Result};
 
@@ -32,7 +39,8 @@ impl DragDataObject {
         let id = NEXT_DRAG_ID.fetch_add(1, Ordering::Relaxed);
         let performed_format =
             unsafe { RegisterClipboardFormatW(CFSTR_PERFORMEDDROPEFFECT) } as u16;
-        if performed_format == 0 {
+        let description_format = unsafe { RegisterClipboardFormatW(CFSTR_DROPDESCRIPTION) } as u16;
+        if performed_format == 0 || description_format == 0 {
             return Err(windows::core::Error::from_win32());
         }
         let data: IDataObject = AsyncDataObject {
@@ -40,6 +48,8 @@ impl DragDataObject {
             state: RefCell::new(AsyncState::Disabled),
             id,
             performed_format,
+            description_format,
+            description: RefCell::new(None),
         }
         .into();
         let capability: IDataObjectAsyncCapability = data.cast()?;
@@ -85,6 +95,41 @@ struct AsyncDataObject {
     state: RefCell<AsyncState>,
     id: u64,
     performed_format: u16,
+    description_format: u16,
+    // §1.836: the object given to SHDoDragDrop owns the target's description.
+    // The inner BHID_DataObject refuses SetData(DropDescription).
+    description: RefCell<Option<DROPDESCRIPTION>>,
+}
+
+fn validate_description_format(format: &FORMATETC) -> Result<()> {
+    if format.dwAspect != DVASPECT_CONTENT.0 {
+        return Err(DV_E_DVASPECT.into());
+    }
+    if format.lindex != -1 {
+        return Err(DV_E_LINDEX.into());
+    }
+    if format.tymed & TYMED_HGLOBAL.0 as u32 == 0 {
+        return Err(DV_E_TYMED.into());
+    }
+    Ok(())
+}
+
+fn description_medium(value: DROPDESCRIPTION) -> Result<STGMEDIUM> {
+    let global = unsafe { GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<DROPDESCRIPTION>()) }?;
+    let mut medium = STGMEDIUM {
+        tymed: TYMED_HGLOBAL.0 as u32,
+        u: STGMEDIUM_0 { hGlobal: global },
+        pUnkForRelease: ManuallyDrop::new(None),
+    };
+    let ptr = unsafe { GlobalLock(global) };
+    if ptr.is_null() {
+        let error = windows::core::Error::from_win32();
+        unsafe { ReleaseStgMedium(&mut medium) };
+        return Err(error);
+    }
+    unsafe { ptr.cast::<DROPDESCRIPTION>().write_unaligned(value) };
+    let _ = unsafe { GlobalUnlock(global) };
+    Ok(medium)
 }
 
 impl Drop for AsyncDataObject {
@@ -96,6 +141,42 @@ impl Drop for AsyncDataObject {
 }
 
 impl AsyncDataObject_Impl {
+    fn is_description(&self, format: *const FORMATETC) -> bool {
+        unsafe { format.as_ref() }.is_some_and(|f| f.cfFormat == self.description_format)
+    }
+
+    fn set_description(
+        &self,
+        format: *const FORMATETC,
+        medium: *const STGMEDIUM,
+        release: BOOL,
+    ) -> Result<()> {
+        let format = unsafe { format.as_ref() }.ok_or(E_INVALIDARG)?;
+        validate_description_format(format)?;
+        let input = unsafe { medium.as_ref() }.ok_or(E_INVALIDARG)?;
+        if input.tymed != TYMED_HGLOBAL.0 as u32 {
+            return Err(DV_E_TYMED.into());
+        }
+        let global = unsafe { input.u.hGlobal };
+        if unsafe { GlobalSize(global) } < std::mem::size_of::<DROPDESCRIPTION>() {
+            return Err(DV_E_STGMEDIUM.into());
+        }
+        let ptr = unsafe { GlobalLock(global) };
+        if ptr.is_null() {
+            return Err(windows::core::Error::from_win32());
+        }
+        let value = unsafe { ptr.cast::<DROPDESCRIPTION>().read_unaligned() };
+        let _ = unsafe { GlobalUnlock(global) };
+        *self.description.borrow_mut() = Some(value);
+        if release.as_bool() {
+            // Transfer only on success. Do not Clone/AddRef or mutate caller storage.
+            // pUnkForRelease may reenter COM: publish and end the borrow first.
+            let mut owned = unsafe { medium.read() };
+            unsafe { ReleaseStgMedium(&mut owned) };
+        }
+        Ok(())
+    }
+
     /// Both COM entry points hold a call reference throughout delegation/completion.
     /// Recheck state after delegation: the inner object may have reentered EndOperation.
     fn complete_running(&self, result: HRESULT, effects: u32, via: &str) -> bool {
@@ -254,14 +335,21 @@ impl IDataObjectAsyncCapability_Impl for AsyncDataObject_Impl {
     }
 }
 
-// Do not borrow async state across delegation. No App reference, viewer invalidation,
-// extra data rendering, shutdown join, or clipboard completion behavior belongs here.
+// Do not borrow state across delegation. Only the fixed-size DropDescription is copied;
+// no App reference, viewer invalidation, file rendering, or shutdown join belongs here.
 // Result<T> methods normalize successful HRESULTs to S_OK in windows-rs's generated
-// vtable; the two HRESULT-returning methods preserve the inner success code exactly.
+// vtable; delegated HRESULT-returning methods preserve the inner success code exactly.
 impl IDataObject_Impl for AsyncDataObject_Impl {
     fn GetData(&self, format: *const FORMATETC) -> Result<STGMEDIUM> {
         #[cfg(test)]
         tests::observe_lifecycle_event("get_data", self.id);
+        if self.is_description(format) {
+            let value = *self.description.borrow();
+            if let Some(value) = value {
+                validate_description_format(unsafe { &*format })?;
+                return description_medium(value);
+            }
+        }
         unsafe { self.inner.GetData(format) }
     }
 
@@ -270,6 +358,10 @@ impl IDataObject_Impl for AsyncDataObject_Impl {
     }
 
     fn QueryGetData(&self, format: *const FORMATETC) -> HRESULT {
+        if self.is_description(format) && self.description.borrow().is_some() {
+            return validate_description_format(unsafe { &*format })
+                .map_or_else(|error| error.code(), |_| S_OK);
+        }
         unsafe { self.inner.QueryGetData(format) }
     }
 
@@ -284,11 +376,14 @@ impl IDataObject_Impl for AsyncDataObject_Impl {
         release: BOOL,
     ) -> Result<()> {
         let _call_ref = self.to_interface::<IDataObject>();
+        #[cfg(test)]
+        tests::observe_set_data(self.id, format, medium, release);
+        if self.is_description(format) {
+            return self.set_description(format, medium, release);
+        }
         // fRelease can destroy the HGLOBAL inside SetData: read only before delegation.
         // Logical Performed DropEffect can arrive before copying; it is not terminal.
         let effect = self.performed_effect(format, medium);
-        #[cfg(test)]
-        tests::observe_set_data(self.id, format, medium, release);
         let result = unsafe { self.inner.SetData(format, medium, release.as_bool()) };
         if let Some(effect) = effect {
             // The SDK's notification completes the outer owner even if the inner
@@ -321,4 +416,4 @@ impl IDataObject_Impl for AsyncDataObject_Impl {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

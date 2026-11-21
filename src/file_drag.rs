@@ -19,6 +19,9 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 mod async_data_object;
 
+#[cfg(all(windows, test))]
+pub(crate) use async_data_object::tests::with_shell_drag_data_object;
+
 /// `start_file_drag` の結果。呼び出し側はこれを見て、ポインタリセットの要否・
 /// 失敗トーストの要否を判断する (`docs/file-drag-drop-design.md` §5.1)。
 #[derive(Debug, Clone)]

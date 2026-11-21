@@ -9,6 +9,7 @@
 
 **改訂履歴**:
 
+- 2026-11-21: §1.836。`BHID_DataObject` の `SetData(DropDescription)` が E_NOTIMPL を返すことを実 Shell 回帰で再現したため、送出 wrapper が説明の値を所有する。転送と OLE effect は変更しない。契約と未検証範囲は §12.3.1。
 - 2026-11-20: §1.464 は [folder-tree-dnd-plan.md](folder-tree-dnd-plan.md) が正本。ROOT の受け取りを自前 OLE target へ置き換え、表示済み pass の形でツリー行を判定する。内部の移動・コピーは整理先と同じ Shell worker へ送り、外への送出効果は COPY のまま。generic Shell image と target の drop description を使い、独立した SetFlags・InitializeFrom*・custom IDropSource は追加しない。検証の実施状況は正本の実装記録を参照。
 - 2026-07-24: 一覧のクリック選択方式 (チェック方式 / エクスプローラー方式) を追加。
   `handle_cell_interaction` の選択状態遷移だけを共通 helper 化し、
@@ -929,8 +930,9 @@ COM owner** とし、App の一覧・選択・viewer context に非同期完了�
 
 ### 12.2 案2を採用する根拠と確認範囲
 
-**採用: Shell 実体を保持し、`IDataObject` 9メソッドを委譲するラッパーに
+**採用: Shell 実体を保持し、`IDataObject` 9メソッドを基本として委譲するラッパーに
 `IDataObjectAsyncCapability` を実装する (依頼の案2)。** 案1の QI 成功だけでは不十分だった。
+§1.836 では DropDescription だけを外側で所有する例外を追加した (§12.3.1)。
 
 製品の起動・デスクトップ入力・実コピーを伴わない調査用 COM プローブを、この環境で実行した。
 環境は Windows `10.0.26300.0`。Windows PowerShell の `Add-Type` による C# P/Invoke で
@@ -987,7 +989,8 @@ Windows の標準 COM marshaling を利用する。`Send` / `Sync` の unsafe �
 
 Explorer が worker から正しく marshal した interface を呼ぶと、外側への
 `GetData` / `SetData` / `StartOperation` / `EndOperation` 等は **mIV の UI STA** で
-実行され、同じ STA 上の inner へ委譲される。`InOperation` は通常 mIV が
+実行され、Shell のファイル形式は同じ STA 上の inner へ委譲される
+(§1.836 の DropDescription は §12.3.1 の外側 owner が扱う)。`InOperation` は通常 mIV が
 `SHDoDragDrop` 復帰直後に問い合わせる。target が他スレッドから問い合わせる場合も同じ
 marshaling 境界を通る。非同期というのは **target のコピー処理**を別スレッドへ移す契約であり、
 source の `GetData` が worker 上で実行されるという意味ではない。
@@ -1007,16 +1010,65 @@ windows 0.61.3 の生成 vtable は `Result<T>` 型の実装成功を `S_OK` に
 
 | メソッド | 必要な成功コードと委譲契約 |
 | --- | --- |
-| QueryGetData / GetCanonicalFormatEtc | 生の HRESULT を保持。`S_FALSE` / `DATA_S_SAMEFORMATETC` も丸めず試験する |
-| GetData / GetDataHere / SetData | 有効な出力・所有権を伴う成功を `S_OK` として返す。失敗コードは保持 |
-| EnumFormatEtc / EnumDAdvise | 成功時は inner の列挙 interface をそのまま返し `S_OK`。列挙子自身の Next の `S_FALSE` はラップせず保持 |
+| QueryGetData / GetCanonicalFormatEtc | 委譲時は生の HRESULT を保持。`S_FALSE` / `DATA_S_SAMEFORMATETC` も丸めず試験する。保存済み DropDescription の QueryGetData は外側で判定 |
+| GetData / GetDataHere / SetData | 有効な出力・所有権を伴う成功を `S_OK` として返す。失敗コードは保持。DropDescription の SetData と保存後の GetData は外側で処理 |
+| EnumFormatEtc / EnumDAdvise | inner の列挙 interface をそのまま返し `S_OK`。DropDescription の保存後も列挙を拡張しない。Next の `S_FALSE` を維持 |
 | DAdvise / DUnadvise | 成功時の接続番号・解除を保ち `S_OK`。失敗コードは保持 |
 
 データを事前コピーしたり、全ファイルの
-内容をメモリへ読み込んだりしない。`SetData` が inner で未対応でも成功へ変換しない。
+内容をメモリへ読み込んだりしない。委譲する形式は `SetData` が inner で未対応でも成功へ変換しない。
+§1.836 の DropDescription は固定長の説明値だけを外側でコピーし、inner へ委譲しない。
 外側の COM メソッドは App / egui / viewer を参照せず、追加の I/O は行わない。
 inner 呼び出しが STA を再入し得るため、状態の `RefCell` borrow を委譲や COM Release、
 ログ出力をまたいで保持しない。
+
+### 12.3.1 DropDescription の外側所有 (§1.836、2026-11-21)
+
+サブ PC の実機報告では、ツリーへの実転送は正しく移動する一方、移動先と非受付の場所のいずれも
+コピーの＋が残り、受け側に `SetData(DropDescription)` の E_NOTIMPL が記録された。
+設計担当は `d8e7a0249` の実 Shell 回帰をメイン PC の共有 runner で実行し、最初の Move の
+本番 `OleData::set_description` が同じ E_NOTIMPL になることを確認した。
+FALSE の所有権指定だけが拒否理由だとは断定せず、TRUE なら受理するという未文書化の挙動には依存しない。
+
+`SHDoDragDrop` と `IDropTargetHelper` が受け取るのは `DragDataObject.data` の**外側**である。
+説明の正本はこの COM object ごとの `Option<DROPDESCRIPTION>` 一つとし、async state とは独立させる。
+追加 worker・待機・rollback/resume は不要で、同じ STA の短い値コピーだけで完結させる。
+
+- SetData は DropDescription のみを捕捉する。CONTENT、lindex=-1、HGLOBAL を含む FORMATETC と、
+  実 medium の HGLOBAL・構造体以上のサイズを確認して値をコピーする。不正ならエラーにし、前の値と呼出元の所有権を保つ。
+- 成功時、FALSE は medium を解放しない。TRUE は保存値の borrow を閉じた後、入力構造体の bit-copy に
+  `ReleaseStgMedium` を一度だけ呼ぶ (`pUnkForRelease` も尊重)。入力構造体自体は変更しない。
+  解放 callback の再入中も SetData の call reference が外側 object を保持する。
+  所有権は [IDataObject::SetData の契約](https://learn.microsoft.com/en-us/windows/win32/api/objidl/nf-objidl-idataobject-setdata) に従う。
+- GetData / QueryGetData は保存前には従来どおり inner へ委譲する。保存後は有効な要求を外側で処理し、
+  GetData は呼出しごとに新しい HGLOBAL を返す。古い取得結果と兄弟 drag は、後の説明変更に影響されない。
+- EnumFormatEtc は説明の保存前後・direction に関係なく inner への単純委譲を保ち、意図的に拡張しない。
+  SHDoDragDrop の drag window と IDropTargetHelper は既知の DropDescription を GetData / QueryGetData で読むため、
+  外側の保存値を取得できる。列挙を必要とする具体的な consumer は確認されておらず、そのためだけの
+  列挙子再構成・`ptd` の所有権管理は追加しない。
+- Performed DropEffect の入力検証・inner への委譲・HRESULT/fRelease・async 完了の契約は変更しない。
+  mIV → Explorer の target による説明書込みも外側が受け、Explorer 等 → mIV は元の外部 object へ従来どおり書く。
+
+受け側の判定・本番 writer は変更しない。Move は `DROPIMAGE_MOVE` と「%1 へ移動」、Copy は
+`DROPIMAGE_COPY` と「%1 へコピー」。一覧の空白・同じ一覧・ツリー空白・hit なしは
+INVALID と effect NONE により既定の非受付表示へ戻し、元フォルダ自身・同じ親等の行上の拒否は
+NONE の禁止画像にする。DragLeave は INVALID に戻す。成功後の `update_drag_window` と、
+説明が変わったときだけ一度書込み・失敗をログする `DragSession::describe` も維持する。
+画像の意味は [DROPIMAGETYPE の仕様](https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/ne-shlobj_core-dropimagetype) による。
+SHDoDragDrop の COPY 限定、target の COPY/NONE、実転送・競合・更新経路は変更しない。
+
+追加回帰は `drag_data_object_drop_description_` と `main_drop_shell_description_` で選択できる。
+TRUE/FALSE の所有権、保存前委譲、独立した GetData 結果と置換、不正入力、
+drag ごとの分離、Performed 完了、実 Shell object と fake visuals による非受付・DragLeave を記述した。
+初回の独立した GPT-6.1 Sol / xhigh の設計・完了時の静的レビューは ACCEPT だったが、
+設計担当によるメイン PC の共有 runner 実行では、filter `test(/file_drag::|main_drop_target::|shell_file_ops/)` の
+53 件中 52 件が成功 (元の RED を含む)、形式列挙テスト 1 件が `0xc0000374` (heap corruption) で ABORT した。
+列挙子を再構成してから `ptd` を解放する実装、またはそのテスト fake の所有権の前提が安全でなかった。
+正確な破壊箇所は未確定だが、この結果を受けた設計担当の判断で列挙拡張と当該テスト、専用 mock 拡張を撤去した。
+静的 ACCEPT はこの実行失敗を否定する根拠にはしない。実装者は cargo fmt と静的検査だけを行い、
+撤去後のコンパイル・テスト実行は共有 runner に引き継ぐ。
+generic Shell image での実表示 (移動・コピー・NG-2、外向きの Explorer) は、この headless 回帰の成功だけでは
+確認できず、実機検証に残る。
 
 ### 12.4 寿命と async 状態の単一 owner
 
