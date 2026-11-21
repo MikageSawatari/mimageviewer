@@ -4087,7 +4087,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer"
-version = "5.5.0"
+version = "5.5.1"
 dependencies = [
  "ab_glyph",
  "base64 0.22.1",
@@ -4174,7 +4174,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-agent-ipc"
-version = "5.5.0"
+version = "5.5.1"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -4185,7 +4185,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-ipc"
-version = "5.5.0"
+version = "5.5.1"
 dependencies = [
  "argon2",
  "getrandom 0.3.4",
@@ -4196,7 +4196,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-launcher"
-version = "5.5.0"
+version = "5.5.1"
 dependencies = [
  "fs4",
  "miv-startup",
@@ -4208,7 +4208,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-mcp"
-version = "5.5.0"
+version = "5.5.1"
 dependencies = [
  "base64 0.22.1",
  "mimageviewer-agent-ipc",
@@ -4220,7 +4220,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-remote"
-version = "5.5.0"
+version = "5.5.1"
 dependencies = [
  "argon2",
  "fast_image_resize",
