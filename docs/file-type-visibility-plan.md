@@ -1013,7 +1013,7 @@ bf509352d8240b6d14c368a8fb4511e6ee64e156）の実装・設計を承認したこ�
   context/source/items generationを照合して採用する。mapは各`ViewerContextBundle`で所有する。
   除外済みidentityや未同定の旧rawから同じindexの別ページへ復元しない。
 - **検索結果の hydration 例外（案 C）**: Ctrl+S の全結果採用（空クエリの空列を含む）と
-  Ctrl+T 非空クエリの初回・再検索は、最終列・索引・採否条件キーを検索workerから一体で運ぶ。
+  Ctrl+T の初回・再検索は、最終列・索引・採否条件キーを検索workerから一体で運ぶ。
   キーは `file_type_visibility` と `epub_file_handling`。採用時の不一致は全体破棄・1行ログのみで、
   再検索は起動しない。採用側で列を変更しない。
   初回は通常 admission 後、Favorite / Tag の ExtractedResult、sidecar不要、logical overrideなし、
@@ -1021,7 +1021,9 @@ bf509352d8240b6d14c368a8fb4511e6ee64e156）の実装・設計を承認したこ�
   旧索引は通常の退役経路へ渡し、本以外の見開き調整初期化も維持する。
   Tag再検索はitems/recipeの設定後、viewer引き継ぎより前に完成索引を公開する。
   入力gate・sanitizer・Modal、物理一覧のhydration、ZIP/PDF子自身の索引準備は変更しない。
-  Tag空クエリの復帰も従来どおり。詳しくは[async-architecture.md](async-architecture.md)を参照。
+  Tag結果一覧で欄を空にした場合も同じ条件照合・再検索採用で空の列と索引を公開する。
+  初回や子の一覧での空欄は一覧を変えない。帰り先は維持し、Esc / × で閉じたときに戻る。
+  検証は設計担当が関連テストを実行予定。詳しくは[async-architecture.md](async-architecture.md)を参照。
 - Collectionのroot・別窓、ファイル束のgrouped/flat、検索結果は、各準備workerが
   最終行順とidentity mapを対で運ぶ。ZIP階層の切り替えは既存hydration ownerの
   `IndexOnly`を使い、CurrentListingとSnapshotListViewの公開先を型で区別する。

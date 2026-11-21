@@ -35237,8 +35237,7 @@ impl App {
     }
 
     fn apply_prepared_tag_view_result(&mut self, result: crate::tag_view::PreparedTagViewResult) {
-        // Empty submissions restore the previous list through the existing path.
-        if !result.query.trim().is_empty() && !result.rows.conditions.matches(&self.settings) {
+        if !result.rows.conditions.matches(&self.settings) {
             crate::logger::log("tag search result discarded: row conditions changed");
             return;
         }
@@ -35252,21 +35251,10 @@ impl App {
         self.tag_view.truncated = result.truncated;
         self.tag_view.result_count = result.rows.items.len();
         self.video_thumb_overrides = result.video_thumb_overrides;
-        if result.query.trim().is_empty() {
-            if self.items_are_tag_view {
-                if let Some(saved) = self.tag_view.saved_folder.clone() {
-                    let restore_state = self.tag_view_subfolder_restore.take();
-                    self.suppress_nav_record_for_search_restore = true;
-                    if self.restore_subfolder_expansion_for_synthetic_path_with_state(
-                        &saved,
-                        restore_state,
-                    ) {
-                        self.suppress_nav_record_for_search_restore = false;
-                    } else {
-                        self.load_folder(saved);
-                    }
-                }
-            }
+        // Opening an empty field leaves the current list alone. Once showing
+        // tag results, clearing it adopts the prepared empty list through the
+        // same replacement below; only closing the tag view restores its origin.
+        if result.query.trim().is_empty() && !self.items_are_tag_view {
             return;
         }
 
@@ -35401,7 +35389,7 @@ impl App {
         }
         self.rebuild_details_order();
         // The field may already hold a newer unsubmitted word (§1.476).
-        self.address = format!("タグビュー: {}", self.tag_view.last_executed.trim());
+        self.update_tag_view_address();
     }
 
     pub(crate) fn set_tag_view_sort(&mut self, sort: crate::tag_view::TagViewSort) {

@@ -677,7 +677,7 @@ spawn/disconnectはUnavailable通知と既存Similar終端処理へ渡し、同�
 
 ## Ctrl+S / Ctrl+T の完成検索結果と hydration（案 C）
 
-Ctrl+S の結果採用すべてと、Ctrl+T の非空クエリの初回・再検索は、検索 worker が
+Ctrl+S の結果採用すべてと、Ctrl+T の初回・再検索は、検索 worker が
 最終採用列と `Arc<PreparedPageIdentityIndex>` を一緒に返す。採否条件は
 `file_type_visibility` と `epub_file_handling` の immutable snapshot であり、採用時に
 一致しなければ列・索引・付随データをまとめて破棄して1行ログを残す。再実行は追加せず、
@@ -697,8 +697,12 @@ sidecar import 不要、logical override なし、`LegacyResumeSource::General` 
 readerの再開も行わない。入力 gate・sanitizer・待機 Modal は変更しない。
 
 Ctrl+T 再検索は items と recipe の設定後に完成索引を直接公開し、viewer identity の転送前に
-利用可能にする。ページ編集準備・動画更新は維持する。空クエリによる検索前一覧への復帰は
-従来経路のまま。Ctrl+S 空クエリだけは空の完成列をその場で用意して即時採用する。
+利用可能にする。ページ編集準備・動画更新は維持する。タグ結果一覧で欄を空にした場合も、
+条件キーを照合して空の完成列・索引を同じ再検索経路で即時採用し、タグビューと入力を保つ。
+開いた直後や子の一覧を表示中（`items_are_tag_view == false`）の空欄は一覧を変えない。
+検索前のフォルダ・サブフォルダ展開の帰り先は空欄で消費せず、Esc / × で閉じたときに復元する。
+空クエリでも一覧▼用のタグsummaries取得は維持し、候補検索・実パス分類は行わない。
+Ctrl+S 空クエリだけは空の完成列をその場で用意して即時採用する。
 物理フォルダや検索結果から開く ZIP/PDF の子一覧は、引き続き自身の hydration owner で
 自身の索引を準備する。合成pathだけを条件に一般の非空一覧へ即時経路を広げない。
 
@@ -706,6 +710,7 @@ Ctrl+T 再検索は items と recipe の設定後に完成索引を直接公開�
 既存検索 worker 内で完成列と索引を確定し、新しい待機状態・再試行・repaint を追加しない。
 索引準備は `search / page_identity_prepare` に surface・items・ms を記録する。
 まれな失敗は既定のログ・通知方針に従う。
+検証は設計担当が関連テストを実行予定。実機・性能測定は未確認。
 
 ## 主一覧の移動採用と採用後の復元（§1.339）
 

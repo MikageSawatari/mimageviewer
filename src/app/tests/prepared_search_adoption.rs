@@ -718,3 +718,285 @@ fn tag_repeat_prepared_adoption_preserves_parked_sibling_context() {
     assert_search_sibling_unchanged(&mut app, sibling, &before);
     assert!(Arc::ptr_eq(&app.page_identity_index, &index));
 }
+
+fn empty_tag_result(settings: &crate::settings::Settings) -> PreparedTagViewResult {
+    let mut result = tag_result(Vec::new());
+    result.query.clear();
+    PreparedTagViewResult::prepare(result, settings)
+}
+
+fn finish_tag_search(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.tag_view_pending.is_some() {
+        app.poll_tag_view();
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(app.tag_view.reject_message.is_none());
+    assert!(!app.sidecar_restore_active());
+}
+
+#[test]
+fn tag_initial_empty_search_preserves_current_listing_and_origin() {
+    let mut app = setup_app_for_test();
+    let folder = app.tmp.path().join("initial-empty");
+    std::fs::create_dir(&folder).unwrap();
+    let items = vec![
+        GridItem::Image(folder.join("one.jpg")),
+        GridItem::Image(folder.join("two.jpg")),
+    ];
+    app.current_folder = Some(folder.clone());
+    app.install_new_items(items.clone(), vec![None; 2]);
+    app.selected = Some(1);
+    let generation = app.items_generation;
+    let index = Arc::clone(&app.page_identity_index);
+    app.open_tag_view();
+    finish_tag_search(&mut app);
+    assert!(!app.items_are_tag_view);
+    assert_eq!(app.items, items);
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.selected, Some(1));
+    assert!(Arc::ptr_eq(&app.page_identity_index, &index));
+    assert_eq!(app.current_folder.as_ref(), Some(&folder));
+    assert_eq!(app.tag_view.saved_folder.as_ref(), Some(&folder));
+}
+
+#[test]
+fn tag_empty_completion_preserves_opened_child_listing() {
+    let mut app = setup_app_for_test();
+    let child = app.tmp.path().join("child");
+    app.tag_view.active = true;
+    app.tag_view.nav_stack.push(child.clone());
+    app.current_folder = Some(child.clone());
+    let items = vec![GridItem::Image(child.join("page.jpg"))];
+    app.install_new_items(items.clone(), vec![None]);
+    app.selected = Some(0);
+    let generation = app.items_generation;
+    let index = Arc::clone(&app.page_identity_index);
+    let prepared = empty_tag_result(&app.settings);
+    app.apply_prepared_tag_view_result(prepared);
+    assert!(!app.items_are_tag_view);
+    assert_eq!(app.items, items);
+    assert_eq!(app.current_folder.as_ref(), Some(&child));
+    assert_eq!(app.tag_view.nav_stack, [child]);
+    assert_eq!(app.items_generation, generation);
+    assert_eq!(app.selected, Some(0));
+    assert!(Arc::ptr_eq(&app.page_identity_index, &index));
+    assert!(!app.sidecar_restore_active());
+}
+
+#[cfg(windows)]
+#[test]
+fn tag_empty_prepared_adoption_preserves_parked_sibling_context_and_origin() {
+    let mut app = setup_app_for_test();
+    let origin = app.tmp.path().join("origin");
+    app.tag_view.active = true;
+    app.tag_view.saved_folder = Some(origin.clone());
+    app.tag_view.last_executed = "alpha".into();
+    let initial = PreparedTagViewResult::prepare(
+        tag_result(vec![tagged(
+            app.tmp.path().join("old.jpg"),
+            TagViewItemKind::Image,
+            10,
+        )]),
+        &app.settings,
+    );
+    app.apply_prepared_tag_view_result(initial);
+    assert!(app.items_are_tag_view);
+    assert!(!app.tag_view_applied_times.is_empty());
+    let sibling_folder = app.tmp.path().join("tag-empty-sibling");
+    let (sibling, before) = park_search_sibling(&mut app, sibling_folder);
+    let prepared = empty_tag_result(&app.settings);
+    let index = Arc::clone(&prepared.rows.page_identity_index);
+    let generation = app.items_generation;
+    app.tag_view.last_executed.clear();
+    app.apply_prepared_tag_view_result(prepared);
+    assert!(app.tag_view.active);
+    assert!(app.items_are_tag_view);
+    assert!(app.items.is_empty());
+    assert_ne!(app.items_generation, generation);
+    assert!(Arc::ptr_eq(&app.page_identity_index, &index));
+    assert_eq!(app.tag_view.result_count, 0);
+    assert!(app.tag_view_applied_times.is_empty());
+    assert_eq!(app.address, "タグビュー");
+    assert_eq!(app.tag_view.saved_folder.as_ref(), Some(&origin));
+    assert!(!app.sidecar_restore_active());
+    assert_search_sibling_unchanged(&mut app, sibling, &before);
+    assert!(Arc::ptr_eq(&app.page_identity_index, &index));
+}
+
+#[test]
+fn tag_empty_prepared_condition_mismatch_preserves_current_results() {
+    for change_epub in [false, true] {
+        let mut app = setup_app_for_test();
+        app.tag_view.active = true;
+        let initial = PreparedTagViewResult::prepare(
+            tag_result(vec![tagged(
+                app.tmp.path().join("old.jpg"),
+                TagViewItemKind::Image,
+                10,
+            )]),
+            &app.settings,
+        );
+        app.apply_prepared_tag_view_result(initial);
+        let items = app.items.clone();
+        let generation = app.items_generation;
+        let index = Arc::clone(&app.page_identity_index);
+        let applied_times = app.tag_view_applied_times.clone();
+        let prepared = empty_tag_result(&app.settings);
+        if change_epub {
+            app.settings.epub_file_handling = crate::settings::EpubFileHandling::Ignore;
+        } else {
+            app.settings
+                .file_type_visibility
+                .excluded_extensions
+                .insert("png".into());
+        }
+        app.apply_prepared_tag_view_result(prepared);
+        assert_eq!(app.items, items);
+        assert_eq!(app.items_generation, generation);
+        assert!(Arc::ptr_eq(&app.page_identity_index, &index));
+        assert_eq!(app.tag_view_applied_times, applied_times);
+        assert_eq!(app.tag_view.result_count, 1);
+        assert!(app.tag_view_pending.is_none());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn tag_empty_results_escape_and_close_button_restore_saved_folder_and_expansion() {
+    use crate::app::subfolder_expansion::{
+        SubfolderExpansionDiag, SubfolderExpansionEntry, SubfolderExpansionEntryKind,
+        SubfolderExpansionSnapshot,
+    };
+    use egui_kittest::kittest::Queryable;
+    let _input = crate::key_input::lock_test_input();
+    for expanded in [false, true] {
+        for escape in [false, true] {
+            let mut app = setup_app_for_test();
+            let root = app.tmp.path().join("origin");
+            let folder = if expanded {
+                root.join("child")
+            } else {
+                root.clone()
+            };
+            std::fs::create_dir_all(&folder).unwrap();
+            let original = ["one.png", "two.png"].map(|name| folder.join(name));
+            for path in &original {
+                image::RgbImage::new(2, 2).save(path).unwrap();
+            }
+            let saved = if expanded {
+                subfolder_expansion_synthetic_path()
+            } else {
+                folder.clone()
+            };
+            app.current_folder = Some(saved.clone());
+            app.install_new_items(
+                original.iter().cloned().map(GridItem::Image).collect(),
+                vec![None; 2],
+            );
+            if expanded {
+                app.items_are_subfolder_expansion_view = true;
+                app.subfolder_expansion_root = Some(root.clone());
+                app.subfolder_expansion_roots = vec![folder.clone()];
+                app.subfolder_expansion_saved_folder = Some(root.clone());
+                app.subfolder_expansion_snapshot = Some(SubfolderExpansionSnapshot {
+                    file_type_visibility: Default::default(),
+                    root: root.clone(),
+                    roots: vec![folder.clone()],
+                    scan_filter: Default::default(),
+                    entries: original
+                        .iter()
+                        .map(|path| SubfolderExpansionEntry {
+                            path: path.clone(),
+                            kind: SubfolderExpansionEntryKind::Image,
+                            mtime: 1,
+                            file_size: 10,
+                        })
+                        .collect::<Vec<_>>()
+                        .into(),
+                    video_thumb_overrides: Default::default(),
+                    diag: SubfolderExpansionDiag::default(),
+                    stack_rating_source: Default::default(),
+                    stack_order_request: crate::rating_sort::ListingOrderRequest::Standard(
+                        crate::settings::SortOrder::FileName,
+                    ),
+                });
+            }
+            app.tag_view.active = true;
+            app.tag_view.saved_folder = Some(saved.clone());
+            app.tag_view.last_executed = "alpha".into();
+            let initial = PreparedTagViewResult::prepare(
+                tag_result(vec![tagged(
+                    folder.join("hit.jpg"),
+                    TagViewItemKind::Image,
+                    10,
+                )]),
+                &app.settings,
+            );
+            app.apply_prepared_tag_view_result(initial);
+            let restore = app.tag_view_subfolder_restore.clone();
+            assert_eq!(restore.is_some(), expanded);
+            let empty = empty_tag_result(&app.settings);
+            app.tag_view.last_executed.clear();
+            app.apply_prepared_tag_view_result(empty);
+            assert!(app.items_are_tag_view);
+            assert!(app.items.is_empty());
+            assert_eq!(app.tag_view.saved_folder.as_ref(), Some(&saved));
+            if let Some(before) = restore.as_ref() {
+                let after = app
+                    .tag_view_subfolder_restore
+                    .as_ref()
+                    .expect("clearing the field keeps the expansion origin");
+                assert_eq!(after.root, before.root);
+                assert_eq!(after.roots, before.roots);
+                assert_eq!(after.saved_folder, before.saved_folder);
+                assert_eq!(after.removed_paths, before.removed_paths);
+                assert!(Arc::ptr_eq(
+                    &after.snapshot.as_ref().unwrap().entries,
+                    &before.snapshot.as_ref().unwrap().entries
+                ));
+            }
+            assert!(!app.suppress_nav_record_for_search_restore);
+            assert!(!app.sidecar_restore_active());
+            let mut fonts_ready = false;
+            let mut harness = crate::test_ui::builder()
+                .with_size(egui::vec2(1600.0, 700.0))
+                .build_ui_state(
+                    move |root, app: &mut AppTestEnvForTest| {
+                        let ctx = root.ctx().clone();
+                        if !fonts_ready {
+                            crate::ime_focus::install_ime_input_policy(&ctx);
+                            crate::ui_fonts::configure_fonts(&ctx);
+                            fonts_ready = true;
+                            ctx.request_repaint();
+                            return;
+                        }
+                        app.update_ime_state(&ctx);
+                        app.render_tag_view_bar(root);
+                    },
+                    app,
+                );
+            harness.run();
+            if escape {
+                harness.key_press(egui::Key::Escape);
+            } else {
+                harness.get_by_label("×").click();
+            }
+            harness.run();
+            let app = harness.state_mut();
+            app.finish_history_restore_preparation_for_test();
+            assert!(!app.tag_view.active);
+            assert!(!app.items_are_tag_view);
+            assert_eq!(app.items_are_subfolder_expansion_view, expanded);
+            assert_eq!(app.current_folder.as_ref(), Some(&saved));
+            assert_eq!(app.items.len(), original.len());
+            assert!(original.iter().all(|path| {
+                app.items
+                    .iter()
+                    .any(|item| matches!(item, GridItem::Image(found) if found == path))
+            }));
+            assert!(!app.suppress_nav_record_for_search_restore);
+        }
+    }
+}

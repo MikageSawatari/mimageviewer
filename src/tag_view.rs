@@ -1234,6 +1234,52 @@ mod tests {
         assert_eq!(TagViewKindFilter::Audio.label(), "音声");
     }
     #[test]
+    fn empty_tag_worker_returns_prepared_empty_rows_and_browser_summaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = crate::tags_db::TagsDb::open_at(&temp.path().join("tags.db")).unwrap();
+        db.set_item_tags(
+            &crate::tags_db::item_key_for_path(&temp.path().join("absent.jpg")),
+            ["alpha"],
+            "test",
+        )
+        .unwrap();
+        drop(db);
+        let settings = crate::settings::Settings::default();
+        let pending = spawn_tag_view_search(
+            temp.path().to_path_buf(),
+            " \t".into(),
+            TagViewKindFilter::All,
+            settings.clone(),
+        );
+        let result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(result.rows.items.is_empty());
+        assert!(result.rows.image_metas.is_empty());
+        assert!(result.rows.video_items.is_empty());
+        assert!(result.applied_times.is_empty());
+        assert!(result.video_thumb_overrides.is_empty());
+        assert!(!result.truncated);
+        assert!(result.rows.conditions.matches(&settings));
+        assert_eq!(
+            *result.rows.page_identity_index,
+            crate::app::file_type_resume::PreparedPageIdentityIndex::prepare_for_source(
+                &[],
+                None,
+                settings.file_type_visibility,
+                crate::app::file_type_resume::LegacyResumeSource::General,
+            )
+        );
+        assert_eq!(
+            result.summaries.len(),
+            1,
+            "empty input keeps the tag browser usable"
+        );
+    }
+
+    #[test]
     fn audio_sidecar_is_prepared_by_tag_worker_without_omitting_explicit_rows() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("data");

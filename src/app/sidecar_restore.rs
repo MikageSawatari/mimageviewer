@@ -1745,7 +1745,7 @@ impl App {
             return Err(continuation);
         }
 
-        // Only matching, fully prepared Ctrl+S / nonempty Ctrl+T adoptions
+        // Only matching, fully prepared Ctrl+S / Ctrl+T result adoptions
         // supply an index. Physical hydration and every other projection keep
         // their existing owner, admission and sidecar gates.
         if let Some(index) = prepared_search_index
