@@ -85,7 +85,7 @@ fixture generator は既存 PNG generator と同梱 FFmpeg を使い、次を作
 
 | fixture | 構成・成立証拠 |
 | --- | --- |
-| static | 884×444 の byte-distinct 画像を含む画像フォルダ。窓 1328×900 / 7 列 / 明示的 Portrait3x4（auto=false）を出発点に、実要求が 374px 付近になる条件を記録する。DPI で変わるので設定値だけで成立としない |
+| static | 884×444 の byte-distinct 画像を含む画像フォルダ。明示的 Portrait3x4（auto=false）。窓・列数は DPI の表 `scripts/release_check_geometry.json` から選ぶ (144 DPI: 1328×900 / 7 列、96 DPI: 1420×900 / 5 列、2026-11-22〜)。実要求が 374px 付近になる条件を記録する。DPI で変わるので設定値だけで成立としない |
 | many-folders | 512 サブフォルダ、各 4 画像以上、keep 範囲だけでも 8 枚の upload 予算を超える配置。相異なる画像で生成し、初期 `lf_scan` とフォルダ代表サムネの負荷を持つ。枚数だけでは backlog 発生の証拠にせず、tray は§4の実観測を必須にする |
 | cached / uncached | 同じ構成の別 subtree。cached は正常ロード・保存・終了後の cache 読取を確認。uncached は準備時に開かず、当該キーの cache が無いことと初回 `from_cache=false` を確認。tray 用はさらに保存省略・close直前の cache 不在・格納後 source 再生成を必須にする（§4） |
 | video-pin | 640×360 の短い無音生成動画を child folder の代表に正常 pin 経路で固定。保存完了して App を再起動し、親のタイルが cache から読み直されたことを確認する。動画再生は始めない |
@@ -598,6 +598,8 @@ static-foreground は実 requested_px=281 と lifetime coverage 不足で SKIPPE
   fixture の static 前面・背面と seed-static を明示的 Portrait3x4 に揃える。
   281px から期待値を作り直すと整数decode回帰の条件を失うため、374±8 の実要求証明と
   request ID / key / generation の相関は維持する。違うDPI等で範囲外なら引き続き環境不成立。
+  2026-11-22: サブ PC (96 DPI) で実要求 256 になったため、static と seed-static の窓・列数を DPI の表から選ぶ形にした (§11 の 3 回目)。
+  表に無い DPI、作業領域に収まらない窓、前面と背面の大きさの不一致は、mIV の起動前に環境不成立にする。
 - seed-profile は seed-static overlay で全 cache を通常 producer から作る。復元 profile に残る
   Always が runtime へ漏れないよう、static / video-pin / perf には Auto を明示する。
   tray 2ケースは既存の Off / 10列 / Landscape16x9 を維持し、perf も既存の7列 / Landscape16x9。
@@ -955,4 +957,21 @@ verdict と終了コードの対応、`release-record.md` の中身が `summary.
   戻った run `release-checks-20261121-220921-45d79cbd` は `Receive-ReleaseCheckResult.ps1` で SKIPPED / exit 2 と照合。
 - 原因 (設計担当がコードで確認): 374 は 150% DPI (144) で、窓 1328×900・7 列・縦長 3:4 のセル 187×249 論理 px × 1.5 から来る値
   (上の §1.198 の節)。サブ PC は 96 DPI なので 249 になり、`compute_display_px` の下限 256 に切り上げられた。
-  DPI に依存する判定は static の前面・背面の 2 ケースだけ。直し方は統括の判断待ち。
+  DPI に依存する判定は static の前面・背面の 2 ケースだけ。
+
+**static の窓・列数を DPI の表から選ぶ修正 (2026-11-22、`ba843eaec` + `8f580f973`)**
+統括の判断: 374±8 の判定と 884×444 の画像を使う条件は変えず、表に無い DPI は今どおり環境不成立。製品コードに触れない。
+
+- 表 `scripts/release_check_geometry.json` (読むのは `release_check_geometry.py`・fixture の生成・Run.ps1・Support.ps1・解析):
+  144 DPI は 1328×900・7 列 (今までと同じ)、96 DPI は 1420×900・5 列。96 DPI の値の根拠: `compute_cell_size` の avail_w は
+  CentralPanel の左右の余白 8 論理 px ずつを引いた幅で、スクロールバーの配置前に計算される。floor((1420 − 16) / 5) = 280、
+  高さ round(280 × 4/3) = 373 → 要求 373 px。144 DPI の 1328 幅・7 列で 187 → 374 になるのと同じ計算。
+- 事前確認 (`Test-SubPcEnvironment.ps1`) と Run.ps1 の preflight で、mIV の起動前に次を確かめ、外れたら環境不成立:
+  表に DPI があること、製品が `--window-size` のときに窓を置く位置 (論理 60,40、`src/lib.rs`) と装飾込みの外形の矩形が
+  作業領域 (タスクバーを除く) に収まること、static の前面と背面が表の同じ行を使うこと。
+  実行時と背面化の後 (Sampler.ps1) も、実際の窓の DPI・client size・矩形を照合する。
+- Sol / xhigh の独立レビュー: 1 回目は起動位置を考慮していない P2 で REVISE、直した後は ACCEPT。
+- 診断 artifact は作り直していない。source fingerprint の対象 (`src`・`crates`・`vendor`・`assets`・`Cargo.*` 等) に `scripts/` は入らず、
+  台本と fixture の生成は実行時にキットの `scripts\` から読むので、作り直しても `c54ecfd7e` と同じになるため。
+  キットだけを作り直した: `relcheck-c54ecfd7e-20261121-225440` (manifest SHA-256 `bd459b91b993811938f7e97a6894909308e6ed64fd9c567d65fe190b0ef38c3f`、
+  scripts `8f580f973`、artifact `c54ecfd7e`)。流し直しは利用者の了承待ち。
