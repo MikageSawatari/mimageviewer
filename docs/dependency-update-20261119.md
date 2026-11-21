@@ -222,7 +222,9 @@ mIV の自動テストは PDF の描画結果の画素も EXR の画素も比べ
 
 - PDF: サムネイル (表紙)、ページ送り・見開き・拡大、図形・グラデーション・半透明・クリップの多い PDF、スキャン画像の PDF
   (CCITT Fax / Flate の修正が入った)、パスワード付き PDF、数百ページの PDF の速いページ送り。
-- EXR (exr 1.74.3 で SIMD の実装が変わった) の表示。
+- EXR (exr 1.74.3 で SIMD の実装が変わった) の表示。mIV は EXR を対応形式に入れていない
+  (`src/folder_tree.rs` の `SUPPORTED_EXTENSIONS` に無い) ので、利用者には影響しない
+  (exr crate は `image` の既定の機能として入っているだけ。2026-11-21 に設計担当がコードで確認)。
 - 静止画の NIS / Anime4K VL (DX12 の DXBC 経路) が従来どおり表示される。
 
 ## Cargo 1.100 の build-dir 配置 (取り込み後に判明)

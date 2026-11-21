@@ -15479,7 +15479,8 @@ pub(crate) mod phase_c_support {
     /// **フィールドの宣言順がそのまま drop 順** (Rust spec: struct fields are dropped in
     /// declaration order)。`App` を最先頭に置いて supervisor join まで完了させたあとで
     /// AI init terminal wait → `OverrideGuard` (TEST_OVERRIDE クリア) → `TempDir` (削除) → `MutexGuard` (lock 解放)
-    /// の順に片付く。
+    /// → 入力 guard の順に片付く。入力は data-dir lock より先に取得する。同じスレッドの明示的な
+    /// 入力 guard とは scope を共有し、最後の guard まで保持する。
     ///
     /// 2026-05-17 事故ガード: 旧 `setup_app()` は `(App, OverrideGuard, TempDir, MutexGuard)`
     /// のタプル戻りだったが、`let app = setup_app();` の tuple destructure は
@@ -15499,6 +15500,9 @@ pub(crate) mod phase_c_support {
         /// (App には `tmp` フィールドが無いので名前衝突しない)。
         pub tmp: TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
+        // Acquire before the data-dir lock; release after App, cleanup, override and data-dir.
+        #[cfg(windows)]
+        _input: crate::key_input::TestInputGuard,
     }
 
     impl AppTestEnv {
@@ -15618,6 +15622,61 @@ pub(crate) mod phase_c_support {
         assert!(crate::settings::Settings::default().sidecar_backup_enabled);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn app_fixture_input_scope_matches_both_explicit_guard_and_drop_orders() {
+        use crate::key_input::{PhysicalKeySlot, lock_test_input, physical_key_down};
+
+        let slot = PhysicalKeySlot::new(0x11, false);
+        for explicit_first in [false, true] {
+            for fixture_drops_first in [false, true] {
+                let fixture;
+                let explicit;
+                if explicit_first {
+                    explicit = lock_test_input();
+                    fixture = setup_app();
+                } else {
+                    fixture = setup_app();
+                    explicit = lock_test_input();
+                }
+                assert!(!physical_key_down(slot));
+                if fixture_drops_first {
+                    drop(fixture);
+                    assert!(!physical_key_down(slot));
+                    drop(explicit);
+                } else {
+                    drop(explicit);
+                    assert!(!physical_key_down(slot));
+                    drop(fixture);
+                }
+                assert!(std::panic::catch_unwind(|| physical_key_down(slot)).is_err());
+            }
+        }
+
+        // Existing reload tests partially move App before rebuilding it. The
+        // remaining fixture fields must retain input and the data-dir lease.
+        {
+            let fixture = setup_app();
+            drop(fixture.app);
+            assert!(!physical_key_down(slot));
+        }
+        assert!(std::panic::catch_unwind(|| physical_key_down(slot)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn app_fixture_takes_its_keyboard_scope_on_the_app_driving_thread() {
+        std::thread::spawn(|| {
+            let fixture = setup_app();
+            assert!(!crate::key_input::physical_key_down(
+                crate::key_input::PhysicalKeySlot::new(0x11, false),
+            ));
+            drop(fixture);
+        })
+        .join()
+        .expect("the scenario thread constructs and owns its App input scope");
+    }
+
     pub(crate) fn setup_paused_similar_app_with_fixture(
         settings: crate::settings::Settings,
         prepare_data_dir: impl FnOnce(&std::path::Path),
@@ -15650,6 +15709,8 @@ pub(crate) mod phase_c_support {
         settings: Option<crate::settings::Settings>,
         prepare_data_dir: impl FnOnce(&std::path::Path),
     ) -> AppTestEnv {
+        #[cfg(windows)]
+        let input = crate::key_input::lock_test_input();
         let lock = crate::data_dir::test_override_lock();
         let tmp = TempDir::new().expect("tempdir");
         prepare_data_dir(tmp.path());
@@ -15688,6 +15749,8 @@ pub(crate) mod phase_c_support {
             _guard: guard,
             tmp,
             _lock: lock,
+            #[cfg(windows)]
+            _input: input,
         }
     }
 }
@@ -27358,6 +27421,8 @@ mod phase_c_folder_nav_history_tests {
 
     #[test]
     fn section1339_reported_rating_zip_fullscreen_bs_toolbar_back_forward() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         app.active_quick_folder_slot = None;
         let parent = app.tmp.path().join("facet-rated");
@@ -44124,6 +44189,8 @@ mod favorite_adjustment_defaults_tests {
     #[cfg(windows)]
     #[test]
     fn embedded_container_close_request_allows_parent_return_to_be_consumed() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let tmp = TempDir::new().expect("tempdir");
         let book = tmp.path().join("book.pdf");
         std::fs::write(&book, b"%PDF-1.4\n").expect("write test pdf placeholder");
@@ -71878,6 +71945,8 @@ mod still_window_mode_key_tests {
 
     #[test]
     fn still_image_root_f11_toggles_window_mode_without_closing_fullscreen() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
@@ -71905,6 +71974,8 @@ mod still_window_mode_key_tests {
 
     #[test]
     fn still_image_window_mode_follows_keymap_override() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
@@ -72046,6 +72117,8 @@ mod still_window_mode_key_tests {
     }
     #[test]
     fn still_image_root_f11_repeat_is_ignored() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
@@ -87565,6 +87638,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn detached_viewer_root_key_input_is_left_for_main_window() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
@@ -95159,6 +95234,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn still_image_root_f12_toggles_detached_viewer_mode_without_closing_fullscreen() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
@@ -95179,6 +95256,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn still_image_root_f12_repeat_is_ignored() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
@@ -95195,6 +95274,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn still_image_root_f12_is_ignored_during_overlay_edit_mode() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
@@ -95215,6 +95296,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn fullscreen_shift_right_large_jump_respects_rtl_direction() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         for i in 0..30 {
@@ -95249,6 +95332,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn fullscreen_plain_right_can_follow_seek_bar_instead_of_rtl_page_direction() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         for (cursor_direction, expected_delta) in [
             (
                 crate::settings::FullscreenHorizontalCursorDirection::FollowPage,
@@ -95286,6 +95371,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn fullscreen_shift_left_large_jump_respects_rtl_direction() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         for i in 0..30 {
@@ -95359,6 +95446,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn stack_flat_fullscreen_shift_down_jumps_to_next_stack_head() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         install_flat_stack_view(&mut app);
@@ -95384,6 +95473,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn stack_flat_fullscreen_shift_up_jumps_to_previous_stack_head() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         install_flat_stack_view(&mut app);
@@ -95404,6 +95495,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn still_image_root_backspace_closes_to_grid() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let idx = push_image(&mut app, r"C:\pics\a.jpg");
@@ -95429,6 +95522,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn direct_rar_root_backspace_returns_to_page_list() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let rar = PathBuf::from(r"C:\books\direct.rar");
@@ -95461,6 +95556,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn still_image_fullscreen_shift_fkey_rates_converted_archive_root_source_key() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let cache = PathBuf::from(r"C:\cache\converted\nested_rar_test.zip");
@@ -95497,6 +95594,8 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
 
     #[test]
     fn still_image_fullscreen_shift_fkey_rates_collapsed_converted_child_literal_key() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let mut app = setup_app();
         let ctx = egui::Context::default();
         let cache = PathBuf::from(r"C:\cache\converted\nested_rar_test.zip");
@@ -105955,6 +106054,8 @@ fn assert_fullscreen_tab_round_trip(app: &mut App, idx: usize) {
 
 #[test]
 fn fullscreen_i_key_toggles_side_panel_mode() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();
     app.items
@@ -105983,6 +106084,8 @@ fn fullscreen_i_key_toggles_side_panel_mode() {
 
 #[test]
 fn plain_a_has_no_bookmark_panel_fullscreen_action() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();
     app.items
@@ -106700,6 +106803,8 @@ fn ime_alt_focus_loss_keeps_bookmark_editor_ownership_and_blocks_panel_toggle() 
 
 #[test]
 fn still_seek_strip_toggle_key_uses_shared_setting_and_obeys_keymap() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();
     app.items.push(GridItem::Image(PathBuf::new()));
@@ -106746,6 +106851,8 @@ fn still_seek_strip_toggle_key_uses_shared_setting_and_obeys_keymap() {
 
 #[test]
 fn fullscreen_i_and_tab_return_to_hover_once_and_ignore_same_press_repeat() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();
     app.items.push(GridItem::Image(PathBuf::new()));
@@ -106778,6 +106885,8 @@ fn fullscreen_i_and_tab_return_to_hover_once_and_ignore_same_press_repeat() {
 
 #[test]
 fn music_fullscreen_i_key_toggles_side_panel_mode() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();
     app.items
@@ -106806,6 +106915,8 @@ fn music_fullscreen_i_key_toggles_side_panel_mode() {
 
 #[test]
 fn music_fullscreen_i_and_tab_return_to_hover_without_repeat_retoggle() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let mut app = phase_c_support::setup_app();
     let idx = app.items.len();
     app.items.push(GridItem::Audio(PathBuf::new()));
@@ -111666,6 +111777,8 @@ mod sns_split_p2_transition_tests {
 
     #[test]
     fn sns_split_key_entry_shows_rotation_reason_and_does_not_enter() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         use crate::rotation_db::Rotation;
         use crate::ui_sns_split::SNS_SPLIT_ROTATION_DISABLED_REASON;
 
@@ -116189,3 +116302,6 @@ fn detached_backend_hwnd_reuse_retires_host_claim_and_reseeds_same_handle() {
 }
 
 mod duration_762;
+
+#[path = "tests/prepared_search_adoption.rs"]
+mod prepared_search_adoption;

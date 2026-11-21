@@ -597,7 +597,7 @@ fn section1476_tag_bar_enter_closes_viewer_excluded_from_result() {
 }
 
 #[test]
-fn section1476_tag_bar_empty_draft_returns_to_folder_only_on_enter() {
+fn section1476_tag_bar_empty_draft_installs_empty_results_only_on_enter() {
     let _input = crate::key_input::lock_test_input();
     let (mut app, _) = tag_bar_viewer_fixture();
     let ctx = tag_bar_context(&mut app);
@@ -615,8 +615,13 @@ fn section1476_tag_bar_empty_draft_returns_to_folder_only_on_enter() {
     );
     assert!(app.tag_view_pending.is_some());
     wait_for_tag_result(&mut app);
-    assert!(!app.items_are_tag_view);
-    assert_eq!(app.current_folder, saved);
+    assert!(app.items_are_tag_view);
+    assert!(app.items.is_empty());
+    assert!(!app.projected_viewer_session_open());
+    assert_eq!(app.tag_view.result_count, 0);
+    assert_eq!(app.tag_view.saved_folder, saved);
+    assert_eq!(app.address, "タグビュー");
+    assert!(!app.sidecar_restore_active());
 }
 
 #[test]

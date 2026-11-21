@@ -100,6 +100,19 @@ PID だけの固定名を使わず、原則 `tempfile::TempDir` をテストの�
 プロセス共有の既定 data_dir だけは終了フックで回収する。
 所有・終了順と PID 使用箇所の監査記録は [テスト用一時領域](test-tempdir-ownership.md) を参照。
 
+### App fixture の入力所有（§1.814）
+
+Windows の `phase_c_support::setup_app_with_options` と履歴の `setup_with_ai_runtime` は、
+data-dir lock より先に `lock_test_input()` を取得する。戻り値の `AppTestEnv` / `CaseEnv` は
+入力 guard を最後のフィールドに持ち、App、AI 後処理、override、TempDir、data-dir lock の後で解放する。
+fixture に `Drop` は実装せず、既存の App の部分 move・設定再読込でも残りのフィールドが lease を保持する。
+
+同じスレッドの入力 guard は一つの scope を共有する。明示 guard が fixture 作成の前後どちらにあっても
+実 mutex を取り直さず、synthetic / frame 状態も reset しない。最後の guard の破棄だけが reset・解放する。
+App を駆動する子スレッドはその中で fixture を生成する。入力 guard はスレッドを移動できず、
+親が保持したまま子の取得・終了を待つことはできない。fixture を使わない入力テストは従来どおり
+自分で guard を保持する。物理キー入口の未取得 panic は維持し、実キーボードへは戻さない。
+
 ### App fixture の AI ランタイム（§1.817）
 
 `AppTestConfig.ai_runtime` は既定値を持たず、`AiRuntimeFixture::NotStarted` / `Start` を

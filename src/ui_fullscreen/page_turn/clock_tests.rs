@@ -263,6 +263,8 @@ fn discarded_output_replay_and_late_cancelled_or_mismatched_hooks_cannot_set_ori
 
 #[test]
 fn missing_source_at_accept_is_instant_and_late_source_does_not_restart() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
     let accepted_at = Instant::now();
     let clock = TestClock::at(accepted_at);
     let ctx = egui::Context::default();

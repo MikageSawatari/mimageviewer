@@ -256,14 +256,14 @@ impl TagViewState {
 
 pub(crate) struct TagViewPending {
     cancel: Arc<AtomicBool>,
-    rx: mpsc::Receiver<Result<TagViewResult, String>>,
+    rx: mpsc::Receiver<Result<PreparedTagViewResult, String>>,
 }
 
 impl TagViewPending {
     #[cfg(test)]
     pub(crate) fn for_test(
         cancel: Arc<AtomicBool>,
-        rx: mpsc::Receiver<Result<TagViewResult, String>>,
+        rx: mpsc::Receiver<Result<PreparedTagViewResult, String>>,
     ) -> Self {
         Self { cancel, rx }
     }
@@ -272,7 +272,7 @@ impl TagViewPending {
         self.cancel.store(true, Ordering::Relaxed);
     }
 
-    pub fn try_recv(&self) -> Result<Result<TagViewResult, String>, mpsc::TryRecvError> {
+    pub fn try_recv(&self) -> Result<Result<PreparedTagViewResult, String>, mpsc::TryRecvError> {
         self.rx.try_recv()
     }
 }
@@ -285,6 +285,78 @@ pub(crate) struct TagViewResult {
     pub entries: Vec<TagViewEntry>,
     pub truncated: bool,
     pub(crate) video_thumb_overrides: std::collections::HashMap<String, PathBuf>,
+}
+
+/// Worker completion: adoption must not filter or reorder these rows.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedTagViewResult {
+    pub(crate) query: String,
+    pub(crate) kind_filter: TagViewKindFilter,
+    pub(crate) summaries: Vec<TagSummary>,
+    pub(crate) truncated: bool,
+    pub(crate) video_thumb_overrides: HashMap<String, PathBuf>,
+    pub(crate) applied_times: HashMap<String, i64>,
+    pub(crate) rows: crate::app::prepared_search::PreparedSearchRows,
+}
+
+impl PreparedTagViewResult {
+    pub(crate) fn prepare(mut result: TagViewResult, settings: &crate::settings::Settings) -> Self {
+        // The DB worker already projects file-type visibility; the EPUB setting is
+        // independent. Finish membership here, before preparing integer slots.
+        result.entries.retain(|entry| {
+            entry.kind != TagViewItemKind::PdfFile
+                || !settings.epub_file_handling_ignores_path(&entry.path)
+        });
+        let applied_times = result
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .applied_at_ms
+                    .map(|time| (crate::tags_db::item_key_for_path(&entry.path), time))
+            })
+            .collect();
+        let mut items = Vec::with_capacity(result.entries.len());
+        let mut image_metas = Vec::with_capacity(result.entries.len());
+        let mut video_items = Vec::new();
+        for entry in result.entries {
+            let idx = items.len();
+            let item = match entry.kind {
+                TagViewItemKind::Folder => crate::grid_item::GridItem::Folder(entry.path.clone()),
+                TagViewItemKind::Image => crate::grid_item::GridItem::Image(entry.path.clone()),
+                TagViewItemKind::Video => crate::grid_item::GridItem::Video(entry.path.clone()),
+                TagViewItemKind::Audio => crate::grid_item::GridItem::Audio(entry.path.clone()),
+                TagViewItemKind::ZipFile => crate::grid_item::GridItem::ZipFile(entry.path.clone()),
+                TagViewItemKind::PdfFile => crate::grid_item::GridItem::PdfFile(entry.path.clone()),
+                TagViewItemKind::Archive(format) => {
+                    crate::grid_item::GridItem::ConvertibleArchive {
+                        path: entry.path.clone(),
+                        format,
+                    }
+                }
+            };
+            if matches!(item, crate::grid_item::GridItem::Video(_)) {
+                video_items.push((idx, entry.path, entry.file_size.max(0) as u64));
+            }
+            image_metas.push(Some((entry.mtime, entry.file_size)));
+            items.push(item);
+        }
+        Self {
+            query: result.query,
+            kind_filter: result.kind_filter,
+            summaries: result.summaries,
+            truncated: result.truncated,
+            video_thumb_overrides: result.video_thumb_overrides,
+            applied_times,
+            rows: crate::app::prepared_search::PreparedSearchRows::prepare(
+                items,
+                image_metas,
+                video_items,
+                settings,
+                "tag",
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -358,7 +430,7 @@ pub(crate) fn spawn_tag_view_search(
                     ));
                 }
                 result.video_thumb_overrides = sidecars.by_video_path;
-                Ok(result)
+                Ok(PreparedTagViewResult::prepare(result, &settings))
             });
             if !cancel_worker.load(Ordering::Relaxed) {
                 let _ = tx.send(result);
@@ -1162,6 +1234,52 @@ mod tests {
         assert_eq!(TagViewKindFilter::Audio.label(), "音声");
     }
     #[test]
+    fn empty_tag_worker_returns_prepared_empty_rows_and_browser_summaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut db = crate::tags_db::TagsDb::open_at(&temp.path().join("tags.db")).unwrap();
+        db.set_item_tags(
+            &crate::tags_db::item_key_for_path(&temp.path().join("absent.jpg")),
+            ["alpha"],
+            "test",
+        )
+        .unwrap();
+        drop(db);
+        let settings = crate::settings::Settings::default();
+        let pending = spawn_tag_view_search(
+            temp.path().to_path_buf(),
+            " \t".into(),
+            TagViewKindFilter::All,
+            settings.clone(),
+        );
+        let result = pending
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(result.rows.items.is_empty());
+        assert!(result.rows.image_metas.is_empty());
+        assert!(result.rows.video_items.is_empty());
+        assert!(result.applied_times.is_empty());
+        assert!(result.video_thumb_overrides.is_empty());
+        assert!(!result.truncated);
+        assert!(result.rows.conditions.matches(&settings));
+        assert_eq!(
+            *result.rows.page_identity_index,
+            crate::app::file_type_resume::PreparedPageIdentityIndex::prepare_for_source(
+                &[],
+                None,
+                settings.file_type_visibility,
+                crate::app::file_type_resume::LegacyResumeSource::General,
+            )
+        );
+        assert_eq!(
+            result.summaries.len(),
+            1,
+            "empty input keeps the tag browser usable"
+        );
+    }
+
+    #[test]
     fn audio_sidecar_is_prepared_by_tag_worker_without_omitting_explicit_rows() {
         let temp = tempfile::tempdir().unwrap();
         let data_dir = temp.path().join("data");
@@ -1199,7 +1317,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(
-                result.entries.len(),
+                result.rows.items.len(),
                 2,
                 "aggregate source discovery must keep explicit image results"
             );

@@ -204,6 +204,7 @@ fn plain_folder_spread_extracted_surfaces_keep_single_and_stored_flow() {
             Default::default(),
             Vec::new(),
             None,
+            None,
         );
         app.finish_page_identity_preparation_for_test();
         assert_eq!(app.spread_mode, Mode::Single);

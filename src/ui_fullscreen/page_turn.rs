@@ -4610,6 +4610,8 @@ mod tests {
     }
     #[test]
     fn touch_end_inherits_start_identity_and_original_destination() {
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let ctx = egui::Context::default();
         install(&ctx);
         let mut app = crate::app::setup_app_for_test();
@@ -5448,6 +5450,8 @@ mod tests {
     #[test]
     fn specified_legacy_catalog_without_source_dimensions_completes_and_accepts_next_page() {
         use crate::ui_fullscreen::page_turn_submission_tests::frame;
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
         let origin = Instant::now();
         let clock = super::clock_tests::TestClock::at(origin);
         let ctx = egui::Context::default();

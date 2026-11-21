@@ -979,6 +979,21 @@ dispatch 可否とは別の状態遷移であり、取消後の unfocused pass �
 しない。WM_APPCOMMAND、Browser Back/Forward pending、pointer Extra1/Extra2 など keyboard edge 以外の
 入力はこの ownership 証拠を共有しないため、従来どおり処理時点の focus を要求する。
 
+### テストの現在レベル入力（§1.814）
+
+物理キーの現在レベルに到達するテストは、App を動かすスレッドで `lock_test_input()` を取り、
+判定が終わるまで guard を保持する。実キーボードは読まない。既定は全キー解放で、押下は既存の
+synthetic API で明示する。clear / reset 後も解放の既定値を保ち、timeline は自動で有効にしない。
+ロック無しの読み取りは、別テストがロックを持つ場合も panic する。子スレッドで App を動かすなら
+そのスレッド内で取得する。OS reader の配線自体を検査する場合だけ、`key_input` 内の private な
+`physical_key_down_from_test_reader` へ偽の reader を明示的に注入する。実 OS を読む例外は設けない。
+共通の `phase_c_support::AppTestEnv`（`AppTestEnvForTest` も同じ型）と履歴の `CaseEnv` は、
+生成したスレッドで入力 guard を取得し、App の破棄・後処理が終わるまで保持する。同じスレッドの
+明示 guard とは scope を共有するため、fixture の前後どちらで取得しても再ロックや reset は起きない。
+最後の guard の破棄で初めて reset・解放する。App を駆動する子スレッドは自身で fixture を作り、
+親はその間入力 guard を保持しない。取得順は入力 → data-dir lock、fixture の解放順はその逆とする。
+固定 Ctrl+V の transition bit の直接読取は別経路として残る（§1.814 (g) の残件）。
+
 ## 固定入力 / KeyAction 対象外の整理
 
 代表サムネの手動範囲（§1.764）は利用者決定により、本のタイルと本の中のページ一覧の
