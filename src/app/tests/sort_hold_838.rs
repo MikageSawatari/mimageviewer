@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 mod gamepad;
 mod lifecycle;
+mod watch_849;
 mod worker_849;
 
 const DEADLINE: Duration = Duration::from_secs(30);

@@ -1,6 +1,6 @@
 # 長さ以外の並べ替えも worker で走査する (§1.849)
 
-- 状態: 実装レビュー r1 の P2/P3 修正・独立ソース再レビュー完了 (2026-11-22)。修正後の実行検証は設計担当へ引き継ぎ。v5.6.0 で直す (利用者決定、統括経由)。
+- 状態: master 取り込み後の部分2を実装。修正後の実行検証は設計担当へ引き継ぎ (§8.4)。v5.6.0 で直す (利用者決定、統括経由)。
 - 利用者の言葉: 「長さの件、v5.6.0 で直すことにしたいと思います。修正お願いします。」
   - その前に、統括が変わる動きを説明している。小さいフォルダでも数フレームは前の並びが残り、そのあいだのキーは止まる。
 - 枝: `sort-worker-849` (master d190b67cc から)。
@@ -284,3 +284,84 @@ test(/section1795_off_refresh_and_sort_preserve_current_position/)
   - 本の構成のメニュー: ImageFolder は画像フォルダ → ZIP の既存の経路、CompiledFolder は既存の対象外の方針になる。旧分類で使えていた編集機能を失う変更ではない。
   - 読書位置・見開き・トリム・ページ編集のキーは変わらない。通常の操作で作ったデータが読めなくなる経路は見つからなかった (レビュー担当、コードから)。
 - 実機の確認は未実施 (サブ PC の依頼文を用意、送るのは統括)。
+
+### 8.4 master 取り込み後の修正
+
+2026-11-22、`sort-worker-849` を master `219edde21` へ fast-forward した作業ツリーで実施。§1.849 は `2fde2724d` で master 入り済み。以下は §8.2〜8.3 の分類変更を見直す後追い記録であり、先行記録は当時の判断として残す。
+
+#### 部分1: §1.418 の先送りを維持して、再走査の資格だけを判定する
+
+- 統括の報告: master の本体 lib 全件で `book_preferred_loaded_extension_named_folders_do_not_write_or_record_undo` が失敗。本優先評価のテスト・仕様は名前による分類を §1.418 へ先送りしており、§1.849 で recipe を directory に分類し直す変更はこの決定に踏み込んでいた。
+- `src/app/book_materialization.rs` の `for_scanned_directory` / `for_physical_scope` と専用テストを撤去。`src/app.rs` の recipe 採用時の `folder_signature.is_some()` 分岐と `physical_page_order_locked_with_books_root` の分割も撤去した。`for_physical` と `physical_page_order_locked` は分類変更前の `76aaa4617` とテキスト一致を確認。既存の本優先評価テストは編集していない。
+- `src/app/top_level_grid_view.rs` の `current_sort_reload_is_physical_directory()` は、非空かつ全行 `PdfPage` を除外し、Document recipe の除外は空の一覧だけに限定する。Document recipe でも非 `PdfPage` 行があれば物理の一覧として走査する。観測レコード・拡張子・UI I/O・新しい状態は使わない。
+- 通常の文書行とキャッシュからの仮行は、ともに `document_page_item` が `PdfPage` を作る。通常・prepared・Smart の文書経路を確認し、本の構成は既存行を並べ替え/部分列にするので、実文書の一覧に非 `PdfPage` を混ぜる producer は見つからなかった。
+- **空の `.epub` / `.pdf` 名の実ディレクトリは Document 分類のため再走査しない。並べ替える行がなく表示は同じであり、§1.418 の先送り範囲として扱う。**
+
+| テスト | 変更と理由 |
+| --- | --- |
+| `sort_worker_849_scanned_directory_recipe_keeps_book_policy_without_container_scope` | 撤去した directory 専用分類関数の検査なので削除。分類変更自体を取り消すためであり、本優先評価の期待を弱める変更ではない |
+| `sort_worker_849_container_named_directories_still_scan` | 空一覧から、画像1枚を持つ `.zip` / `.rar` / `.epub` / `.pdf` 名の実ディレクトリへ変更。走査の待ち・完了後の場所の確認は維持し、空の assert を画像行の完全一致へ置き換えた |
+| `sort_worker_849_empty_container_named_directories_keep_deferred_document_policy` | 追加。空の `.epub` / `.pdf` は pending・世代・通知を変えず除外されることを検査し、空の `.zip` / `.rar` は従来どおり worker 採用まで検査する。全ケースで場所と空行の assert を維持 |
+| `sort_worker_849_snapshot_child_zip_return_unpin_keeps_directory_reload` | 変更なしで維持。非空の `.epub` 名の実ディレクトリ→固定→子 ZIP→戻る→解除→表示順変更の回帰 |
+| `book_preferred_loaded_extension_named_folders_do_not_write_or_record_undo` | 変更なし。名前による従来の ArchiveRootMismatch / DocumentMismatch、DB/Undo 無変更の期待を維持 |
+
+上記の残存する4テスト名は nextest の `test(/名前/)` filter にそのまま使える。独立 `gpt-6.1-sol` / `xhigh` の read-only レビューは部分1 **ACCEPT / STRUCTURAL: AGREE**。実行検証は未実施。
+
+#### 部分2: 同じフォルダの並べ替え待ち中は、監視の再構築と先送り要求の消費を待たせる
+
+部分1は統括が `bb8fbfe2d` にコミット済み。以下はその上の未コミット差分。
+
+**確認した前提と、利用者が認めた追加範囲。**
+
+- `folder_projection_key_with_presentation` は sort/order を含み、毎フレームの `service_folder_watch` → `ensure_current_folder_watch` は鍵が違えば監視を作り直し、直後に `start_external_rescan(..., UNIX_EPOCH)` を呼ぶ。案Aが対象にする重複経路はソースと一致する。サブ PC 担当による `77773f47a` の約14〜15秒という観測の内訳・修正後の所要時間は、この担当では実測していない。
+- 監視登録用の初回走査が並べ替え開始時にまだ進行中だと、旧結果は `poll_external_rescan` で projection key の不一致として破棄され、既存 `folder_refresh_pending` へ保持される。旧 `consume_folder_refresh_pending` は並べ替え待ちを見ず、外部変更通知なしでも次の走査を開始できた。
+- この追加経路を報告して一度停止した後、利用者が、監視の再構築だけでなく同じフォルダの先送り要求の消費も待たせる範囲を明示的に了承した。新しい状態を追加する案ではない。
+
+**変更箇所。**
+
+- `src/app.rs` に `current_view_order_refresh_scans_folder(&Path)` を設け、既存 `folder_pane_open_pending` の purpose が `CurrentViewOrderRefresh` か、path が引数のフォルダと同じかを導出する。共通の述語はこの1か所で、新しい bool・sentinel・状態は持たない。
+- `ensure_current_folder_watch` は、今の watch の一致確認後、旧 watch の破棄/再登録の前で共通述語を見る。同じフォルダの並べ替え待ちなら旧 watch を保持し、新規登録用の確認走査を始めない。watch がまだ無い場合も、並べ替え待ちの間の登録を待たせる。
+- `consume_folder_refresh_pending` は、既存の delete/Undo/modal/検索等の gate と対象フォルダの解決後、要求を `take` する前で共通述語を見る。先送り要求の folder も現在の対象と一致する場合だけ return し、要求・cause・receipt をそのまま残す。他フォルダの古い要求を捨てる既存の扱いは変えない。
+- 採用・取消・切断・エラー・移動で既存の並べ替え pending が消えれば、共通述語は false になり、次フレームの既存サービスで登録と消費が再開する。並べ替え→並べ替えの置換では、新しい待ちが終わるまで継続する。再開専用の latch や callback はない。
+- sort/order を含む watch key、`FolderRescanProof`、dirty/cutoff/epoch、既存の同一要求の合流は変更していない。採用後は従来どおり裏の確認走査が始まる。先送り要求がその走査へ合流して `restart_requested` が立つ場合も既存どおりで、待ちの後にもう一度走査され得る。
+
+**通知・能動操作との境界。**
+
+- 古い監視の `collect` → debounce → `check_external_folder_changes(Notified)` は引き続き動かす。この入口を同じ述語で追加抑止する変更は採っていない。実際の外部変更との重なりは、利用者が認めた既定の割り切りで扱う。focus/tray の Resumed、既存 rescan の通知による restart、削除完了・Append observation の直接配送も今回の2境界の外であり、変更していない。
+- 並べ替えより前から走っていた確認走査そのものも中止しない。旧結果の破棄から先送りされた次の走査だけを、並べ替えの待ちが終わるまで開始しない。
+- `folder_refresh_pending` には External だけでなく Operation (保存/出力/削除等の後続更新)、BookAppend、BookAppendExternal (追記の一般配送・Undo 後の更新等) が入る。これらも同じフォルダなら待たせる。ファイルの作成/削除、Append/Undo/Delete の worker 終端は要求の消費を待たずに進むため、循環待ちは見つからなかった。削除の成功行除去や直接の Operation 配送は変更していない。
+- この間は既存の並べ替え待ち表示・項目入力 gate が続く。要求は失われず、採用後に新しいファイル状態を裏の再走査で反映する。receipt は待ちの間はそのまま残し、従来からある通常の並べ替え採用による Undo revision の失効後は、consume の既存 `book_append_operation_is_live` 判定で BookAppendExternal に切り替えて一般更新を配送する。receipt の復活や、無言の配送破棄は加えていない。
+
+**追加テスト (10件、実行未実施)。**
+
+既存 §1.838 の `Harness` / `HeldScan` と、実 worker の応答を受信境界だけで保留する形を使う。proof/result を作り物へ差し替えない。`src/app/tests/sort_hold_838.rs` に module を登録し、テスト本体は `src/app/tests/sort_hold_838/watch_849.rs` に追加した。
+
+| テスト名 (nextest filter に使用可能) | 検査内容 |
+| --- | --- |
+| `sort_worker_849_watch_rebuild_waits_for_sort_adoption` | 名前・日付・長さの待ち中は旧 epoch/key を保ち外部走査を始めず、実採用後の次の watch poll で今の key と採用済み世代の走査を作る |
+| `sort_worker_849_missing_watch_registration_waits_for_sort` | watch が無い場合も並べ替え中の初回登録を待たせ、採用後に登録/確認走査を開始 |
+| `sort_worker_849_deferred_refresh_causes_survive_sort_adoption` | External/Operation/BookAppendExternal の要求・cause を保留し、採用後に消費・配送する |
+| `sort_worker_849_watch_and_refresh_follow_latest_sort_replacement` | 名前→日付の置換で旧応答を退役し、最新の並べ替え採用まで watch/要求を保持 |
+| `sort_worker_849_watch_and_refresh_resume_after_navigation_replacement` | 直接移動によって sort purpose が置き換わった後、登録と要求の消費を再開 |
+| `sort_worker_849_watch_and_refresh_resume_after_sort_cancel` | 既存の取消経路の後に、現在の key で登録・消費を再開 |
+| `sort_worker_849_watch_and_refresh_resume_after_sort_disconnect` | 既存の受信切断による終端の後も登録・消費を再開 |
+| `sort_worker_849_sort_wait_does_not_retain_other_folder_request` | 共通述語/消費 gate は同じフォルダだけに作用し、他フォルダの古い要求は従来どおり破棄 |
+| `sort_worker_849_queued_append_receipt_survives_sort_wait` | 既存 builder で作った有効な receipt の内容を保持し、採用後は既存の一般更新への切替で配送する。fixture の出力書込みは旧 watch を退役してから行い、新しい watch を登録/settle した後に並べ替えを開始 |
+| `sort_worker_849_inflight_registration_scan_defers_retry_until_sort_adoption` | 実際の監視登録用初回走査の応答を保留→並べ替え開始→旧結果破棄→既存先送り要求へ保持、を通す。待ち中は再走査せず、採用後に現在 key の走査へ配送 |
+
+まとめて選ぶ filter は `test(/sort_hold_838::watch_849/)`。既存の入力・lifecycle 回帰は `test(/sort_hold_838/)` で選べる。既存テストの assert の削除・弱体化はしていない。
+
+独立した `gpt-6.1-sol` / `xhigh` の設計・最終ソースレビューは **ACCEPT / STRUCTURAL: AGREE**、未解決指摘なし。製品コードの2境界・原因別の配送・追加テストの API/型/借用を確認した。reviewer は cargo/fmt/ビルド/テスト/編集/git mutation を実行していない。
+
+部分1・部分2の `cargo fmt` (引数なし) と `git diff --check` は成功。ビルド・テスト・check は利用者指示により共有実行口へ引き継ぐ。git の commit/reset/stash/checkout/merge は修正担当では未実行。
+
+#### 8.4 のテストの実行と独立レビュー (設計担当がまとめた)
+
+- 部分 2 の判断 (設計担当): 実装担当が見つけた追加の経路 (監視登録用の初回走査の旧結果が破棄され、`folder_refresh_pending` から次の走査が始まる) を受け、「並べ替えの読み直しが同じフォルダを走査している間は、同じフォルダの全体の走査をもう 1 本始めない」を原則に、監視の作り直しと先送りの要求の消費の両方を待たせる範囲へ広げた。
+- テスト (設計担当が run-heavy で nextest を実行):
+  - `e6801c20b`: 関連 filter (前回の filter に、監視・外部の再走査・先送りの更新・本の追記・本優先の評価を足したもの) で 1635 本すべて成功。
+  - `e6801c20b`: 分類に触れたので、統括の指示で本体 lib の全件を枝で 1 回流し、19703 本すべて成功 (`test-lib-full.ps1`)。
+- 独立レビュー (設計レビューと同じ Sol / xhigh の会話):
+  - r3 (`e6801c20b`、部分 1・2): ACCEPT / STRUCTURAL: AGREE。指摘なし。レビュー担当の言葉: 「部分2は時間による遅延ではなく、既存の走査 owner に基づいて重複開始を避ける対処です。」
+  - レビュー担当の補足: 前回 (r2) の承認では §1.418 の先送りの確認が足りなかった。待ち時間の改善は、採用の後の確認の走査が残るので、実測が別に要る。
+- 実機の確認: 未実施。待ちの秒数はサブ PC で測り直す (依頼文 `C:\home\mimageviewer-subpc\sort849\brief-r2.md`)。

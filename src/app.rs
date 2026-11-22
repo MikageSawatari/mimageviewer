@@ -13661,22 +13661,7 @@ pub(crate) fn physical_page_order_locked(
     source_path: &Path,
     items: &[GridItem],
 ) -> bool {
-    physical_page_order_locked_with_books_root(
-        settings,
-        &settings.books_root_path(),
-        source_path,
-        items,
-    )
-}
-
-/// Pure policy half for callers that already resolved the configured books root.
-pub(crate) fn physical_page_order_locked_with_books_root(
-    settings: &crate::settings::Settings,
-    books_root: &Path,
-    source_path: &Path,
-    items: &[GridItem],
-) -> bool {
-    crate::books::is_direct_book_folder(books_root, source_path)
+    crate::books::is_direct_book_folder(&settings.books_root_path(), source_path)
         || crate::folder_tree::is_open_as_container(source_path)
         || settings.auto_fullscreen_image_folders_enabled()
             && !items.is_empty()
@@ -27770,6 +27755,19 @@ impl App {
         }
     }
 
+    /// The existing sort request owns this folder's scan until it is adopted or retired.
+    /// Background refresh callers share this predicate; no independent wait state is needed.
+    fn current_view_order_refresh_scans_folder(&self, folder: &Path) -> bool {
+        self.folder_pane_open_pending
+            .as_ref()
+            .is_some_and(|pending| {
+                matches!(
+                    pending.purpose,
+                    FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+                ) && crate::folder_tree::path_eq(&pending.path, folder)
+            })
+    }
+
     fn ensure_current_folder_watch(&mut self, ctx: &egui::Context) {
         if !self.folder_observation_allowed() {
             self.retire_passive_folder_observation();
@@ -27792,6 +27790,11 @@ impl App {
             .as_ref()
             .is_some_and(|watch| watch.folder == folder && watch.projection_key == projection_key)
         {
+            return;
+        }
+        if self.current_view_order_refresh_scans_folder(&folder) {
+            // Re-registering starts a full confirmation scan. Keep the old watch
+            // until the sort request ends, then the next frame uses the current key.
             return;
         }
         self.current_folder_watch = None;
@@ -44780,13 +44783,6 @@ impl App {
                     book_materialization::ExtractedSurface::Rating,
                 )
             }
-            _ if folder_signature.is_some() => {
-                book_materialization::ProjectionRecipe::for_scanned_directory(
-                    &self.settings,
-                    &source_path,
-                    &items,
-                )
-            }
             _ => book_materialization::ProjectionRecipe::for_physical(
                 &self.settings,
                 &source_path,
@@ -48050,6 +48046,16 @@ impl App {
         let Some(cur) = self.pending_folder_refresh_target() else {
             return;
         };
+        if self.current_view_order_refresh_scans_folder(&cur)
+            && self
+                .folder_refresh_pending
+                .as_ref()
+                .is_some_and(|request| crate::folder_tree::path_eq(&request.folder, &cur))
+        {
+            // Retain the complete request/cause, including Append delivery, while
+            // the sort scan owns this folder. Normal consumption resumes afterward.
+            return;
+        }
         let Some(target) = self.folder_refresh_pending.take() else {
             return;
         };

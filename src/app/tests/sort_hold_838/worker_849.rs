@@ -274,11 +274,39 @@ fn sort_worker_849_container_named_directories_still_scan() {
         configure(&mut app);
         let folder = app.tmp.path().join(name);
         std::fs::create_dir(&folder).unwrap();
-        // Exercise an empty directory too: it must not be mistaken for empty pages.
+        let page = folder.join("page.png");
+        image::RgbImage::new(8, 6).save(&page).unwrap();
         app.load_folder_with_scan(folder.clone(), Some(scan_directory(&folder)));
         app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.items, [GridItem::Image(page.clone())]);
         let held = request_sort(&mut app, SortOrder::FileName);
         adopt(&mut app, held);
+        assert_eq!(app.current_folder.as_ref(), Some(&folder));
+        assert_eq!(app.items, [GridItem::Image(page)]);
+    }
+}
+
+#[test]
+fn sort_worker_849_empty_container_named_directories_keep_deferred_document_policy() {
+    for name in ["book.zip", "book.rar", "book.epub", "book.pdf"] {
+        let mut app = setup_app();
+        configure(&mut app);
+        let folder = app.tmp.path().join(name);
+        std::fs::create_dir(&folder).unwrap();
+        app.load_folder_with_scan(folder.clone(), Some(scan_directory(&folder)));
+        app.finish_page_identity_preparation_for_test();
+        if matches!(name, "book.epub" | "book.pdf") {
+            let generation = app.items_generation;
+            let feedback_before = app.feedback_toasts_for_test.clone();
+            app.settings.sort_order = SortOrder::FileName;
+            app.apply_sort_change_reload();
+            assert!(app.folder_pane_open_pending.is_none());
+            assert_eq!(app.items_generation, generation);
+            assert_eq!(app.feedback_toasts_for_test, feedback_before);
+        } else {
+            let held = request_sort(&mut app, SortOrder::FileName);
+            adopt(&mut app, held);
+        }
         assert_eq!(app.current_folder.as_ref(), Some(&folder));
         assert!(app.items.is_empty());
     }
