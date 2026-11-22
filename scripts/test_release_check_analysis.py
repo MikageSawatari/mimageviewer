@@ -1467,6 +1467,19 @@ class SuiteGeometryTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_ready_root_replacement_failure_remains_fail_in_summary_and_record(self):
+        cases = [finish(report(case_id)) for case_id in REQUIRED_CASES]
+        case = next(value for value in cases if value["case_id"] == "static-background")
+        reason = "Ready root HWND differs from published root: expected 888, reported 777."
+        case["failures"].append(reason)
+        case["evidence"]["root_identity"] = {
+            "pid": PID, "published_root_hwnd": 888, "ready_root_hwnd": 777}
+        finish(case)
+        result = summarize_suite(cases, metadata())
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn(reason, release_record(result))
+
     def test_environment_foreground_failure_preserves_raw_process_exit_and_record_reason(self):
         cases = [finish(report(case_id)) for case_id in REQUIRED_CASES]
         case = cases[0]

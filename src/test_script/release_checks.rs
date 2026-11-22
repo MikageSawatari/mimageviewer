@@ -137,6 +137,58 @@ fn unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[derive(Debug, serde::Serialize)]
+struct RootWindowRecord {
+    schema_version: u32,
+    pid: u32,
+    root_hwnd: u64,
+    unix_ms: u64,
+}
+
+impl RootWindowRecord {
+    fn new(selection: &TestScriptActionSelection, pid: u32, unix_ms: u64) -> Result<Self, String> {
+        let root_hwnd = match selection {
+            TestScriptActionSelection::Targeted(TestScriptWindowIdentity::Root {
+                context_serial: 0,
+                hwnd,
+                ..
+            }) if *hwnd > 0 => *hwnd,
+            _ => {
+                return Err(
+                    "environment: root publication requires the selected Root context 0 owner with a positive HWND"
+                        .into(),
+                );
+            }
+        };
+        if pid == 0 || unix_ms == 0 {
+            return Err("environment: invalid root publication pid or timestamp".into());
+        }
+        Ok(Self {
+            schema_version: 1,
+            pid,
+            root_hwnd,
+            unix_ms,
+        })
+    }
+}
+
+fn publish_root(bridge: &RunnerBridge, state: &Mutex<Option<Session>>) -> Result<(), String> {
+    let directory = state
+        .lock()
+        .map_err(|_| "environment: release session poisoned")?
+        .as_ref()
+        .ok_or("environment: root publication requires an active release session")?
+        .directory
+        .clone();
+    // select_root already selected and logged this exact owner. Publication is
+    // worker-only I/O: no new HWND discovery, snapshot request, focus or UI wake.
+    let record = RootWindowRecord::new(&bridge.action_selection()?, std::process::id(), unix_ms())?;
+    write_json(
+        &directory.join("root-window.json"),
+        &serde_json::to_value(record).map_err(|error| error.to_string())?,
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 enum ForegroundWaitKind {
     #[serde(rename = "exact-root-foreground")]
@@ -706,6 +758,13 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
     );
     let b = bridge.clone();
     engine.register_fn(
+        "release_check_publish_root",
+        move || -> Result<(), Box<EvalAltResult>> {
+            publish_root(&b, session()).map_err(rhai_error)
+        },
+    );
+    let b = bridge.clone();
+    engine.register_fn(
         "release_check_observe",
         move || -> Result<Dynamic, Box<EvalAltResult>> {
             request(&b, Operation::Observe)
@@ -1037,6 +1096,126 @@ fn protocol_ai_trace(proof: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn root_window_test_bridge(
+        selection: TestScriptActionSelection,
+    ) -> (RunnerBridge, mpsc::Receiver<UiCommand>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            RunnerBridge {
+                gamepad: super::super::gamepad_input::WorkerState::default(),
+                tx,
+                snapshot: Arc::new(RwLock::new(super::super::TestScriptSnapshot::default())),
+                interrupt: Arc::new(super::super::InterruptState::default()),
+                wake: Arc::new(|| panic!("root publication must not wake the UI")),
+                next_hold_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                action_selection: Arc::new(Mutex::new(selection)),
+                pointer_regions: super::super::pointer_input::new_shared_catalog(),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn root_window_record_requires_the_selected_root_context_and_valid_boundaries() {
+        let selected = |context_serial, hwnd| {
+            TestScriptActionSelection::Targeted(TestScriptWindowIdentity::Root {
+                context_serial,
+                hwnd,
+                backend_token: 23,
+            })
+        };
+        let record = RootWindowRecord::new(&selected(0, 0x4a11), 42, 1700000000000).unwrap();
+        assert_eq!(
+            serde_json::to_value(record).unwrap(),
+            json!({"schema_version":1,"pid":42,"root_hwnd":0x4a11,
+                "unix_ms":1700000000000_u64})
+        );
+        for selection in [
+            TestScriptActionSelection::LegacyImplicit,
+            selected(1, 0x4a11),
+            selected(0, 0),
+            TestScriptActionSelection::Targeted(TestScriptWindowIdentity::MainFullscreen {
+                context_serial: 0,
+                viewport_id: egui::ViewportId::ROOT,
+                hwnd: 0x4a11,
+                backend_token: 23,
+            }),
+        ] {
+            assert!(RootWindowRecord::new(&selection, 42, 100).is_err());
+        }
+        assert!(RootWindowRecord::new(&selected(0, 0x4a11), 0, 100).is_err());
+        assert!(RootWindowRecord::new(&selected(0, 0x4a11), 42, 0).is_err());
+    }
+
+    #[test]
+    fn root_window_publication_is_atomic_and_uses_selected_identity_without_ui() {
+        let selection = TestScriptActionSelection::Targeted(TestScriptWindowIdentity::Root {
+            context_serial: 0,
+            hwnd: 0x4a11,
+            backend_token: 23,
+        });
+        let (bridge, rx) = root_window_test_bridge(selection.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let state = Mutex::new(Some(Session {
+            directory: directory.path().to_path_buf(),
+            ..Default::default()
+        }));
+        // A stalled UI snapshot writer cannot delay publication of the owner
+        // already selected by select_root. No alternate cached HWND is needed.
+        let _writer = bridge.snapshot.write().unwrap();
+        let before = unix_ms();
+        publish_root(&bridge, &state).unwrap();
+        let after = unix_ms();
+        let path = directory.path().join("root-window.json");
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["pid"], std::process::id());
+        assert_eq!(value["root_hwnd"], 0x4a11);
+        assert!((before..=after).contains(&value["unix_ms"].as_u64().unwrap()));
+        assert_eq!(value.as_object().unwrap().len(), 4);
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(bridge.action_selection().unwrap(), selection);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn root_window_publication_rejects_missing_session_and_invalid_selection_without_output() {
+        let (bridge, rx) = root_window_test_bridge(TestScriptActionSelection::LegacyImplicit);
+        assert!(
+            publish_root(&bridge, &Mutex::new(None))
+                .unwrap_err()
+                .contains("active release session")
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let state = Mutex::new(Some(Session {
+            directory: directory.path().to_path_buf(),
+            ..Default::default()
+        }));
+        assert!(publish_root(&bridge, &state).is_err());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn root_window_registered_api_requires_a_session_without_ui_requests() {
+        let (bridge, rx) = root_window_test_bridge(TestScriptActionSelection::Targeted(
+            TestScriptWindowIdentity::Root {
+                context_serial: 0,
+                hwnd: 0x4a11,
+                backend_token: 23,
+            },
+        ));
+        let mut engine = Engine::new();
+        register(&mut engine, bridge.clone());
+        let _writer = bridge.snapshot.write().unwrap();
+        let error = engine
+            .eval::<()>("release_check_publish_root()")
+            .unwrap_err();
+        assert!(error.to_string().contains("active release session"));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
 
     #[test]
     fn foreground_wait_failure_publishes_typed_record_and_still_fails() {

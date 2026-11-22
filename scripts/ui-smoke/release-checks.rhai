@@ -83,6 +83,7 @@ release_check_begin(CASE_ID, CASE_DIRECTORY);
 // This passive startup wait adds no repaint or input to the measured idle window.
 wait_until(|s| root_selectable(s), 30000);
 select_root();
+release_check_publish_root();
 for attempt in 0..1800 {
     let state = release_check_observe();
     if state.index_settled && state.interaction_ready { break; }

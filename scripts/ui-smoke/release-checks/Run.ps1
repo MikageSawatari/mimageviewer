@@ -189,31 +189,28 @@ function Invoke-ReleaseSession {
     $script:ownedStart=$script:owned.StartTime.ToUniversalTime()
     Write-ReleaseCheckJson (Join-Path $dir 'process.json') @{pid=$script:owned.Id;start_time_utc=$script:ownedStart.ToString('o');exe=$exe;data_dir=$data}
     $foregroundTimeline=New-ReleaseCheckForegroundTimeline $dir $script:owned.Id
+    $rootWindow=Join-Path $dir 'root-window.json';$publishedRoot=[long]0
     $timer=[Diagnostics.Stopwatch]::StartNew(); $focusTimer=[Diagnostics.Stopwatch]::StartNew(); $ready=Join-Path $dir 'ready.json';$focusAcquired=$false
     while(-not $script:owned.HasExited){
-        Write-ReleaseCheckForegroundTimeline $foregroundTimeline $script:owned.MainWindowHandle.ToInt64()
         if(-not (Test-OwnedReleaseProcessAlive)){break}
+        if($publishedRoot -eq 0){$publishedRoot=Read-ReleaseCheckRootWindow $rootWindow $script:owned.Id}
+        Write-ReleaseCheckForegroundTimeline $foregroundTimeline $publishedRoot
         if($timer.Elapsed.TotalSeconds -gt $TimeoutSeconds){throw "$CaseId session deadline exceeded."}
-        if(-not $focusAcquired -and $focusTimer.Elapsed.TotalSeconds -le 20 -and $script:owned.MainWindowHandle -ne [IntPtr]::Zero){
-            $null=[MivReleaseCheckNative]::SetForegroundWindow($script:owned.MainWindowHandle)
-            $fg=Get-ReleaseCheckWindowSample $script:owned.Id
-            $focusAcquired=$fg.foreground_pid -eq $script:owned.Id -and $fg.foreground_hwnd -eq $script:owned.MainWindowHandle.ToInt64()
+        if(-not $focusAcquired -and $focusTimer.Elapsed.TotalSeconds -le 20 -and $publishedRoot -ne 0){
+            $focusAcquired=Invoke-ReleaseCheckInitialForeground $script:owned.Id $publishedRoot
             if($focusAcquired){
-                $actual=Get-ReleaseCheckWindowGeometry $script:owned.Id $script:owned.MainWindowHandle.ToInt64()
+                $actual=Get-ReleaseCheckWindowGeometry $script:owned.Id $publishedRoot
                 $metadata.dpi_by_case[$CaseId]=$actual.dpi
                 $metadata.window_geometry_by_case[$CaseId]=$actual
                 Assert-ReleaseCheckWindowGeometry $actual $geometry
             }
         }
         if(-not $focusAcquired -and $focusTimer.Elapsed.TotalSeconds -gt 20){throw 'Exact root foreground unavailable within 20 seconds.'}
-        if($Idle -and (Test-Path -LiteralPath $ready -PathType Leaf)){
+        if($Idle -and $publishedRoot -ne 0 -and (Test-Path -LiteralPath $ready -PathType Leaf)){
             $r=Get-Content -LiteralPath $ready -Encoding UTF8 -Raw | ConvertFrom-Json
-            if($r.pid -ne $script:owned.Id){throw 'Ready PID mismatch.'}
-            [uint32]$hwndPid=0
-            $null=[MivReleaseCheckNative]::GetWindowThreadProcessId([IntPtr][long]$r.root_hwnd,[ref]$hwndPid)
-            if($hwndPid -ne $script:owned.Id){throw 'Ready root HWND owner mismatch.'}
+            Assert-ReleaseCheckReadyRoot $r $script:owned.Id $publishedRoot $CaseId $dir
             if($CaseId -like 'static-*'){
-                $actual=Get-ReleaseCheckWindowGeometry $script:owned.Id ([long]$r.root_hwnd)
+                $actual=Get-ReleaseCheckWindowGeometry $script:owned.Id $publishedRoot
                 $metadata.dpi_by_case[$CaseId]=$actual.dpi
                 $metadata.window_geometry_by_case[$CaseId]=$actual
                 Assert-ReleaseCheckWindowGeometry $actual $geometry
@@ -227,10 +224,10 @@ function Invoke-ReleaseSession {
                 $backgroundHwnd=$foregroundProof.foreground_hwnd
                 Write-ReleaseCheckJson (Join-Path $dir 'background-ready.json') $foregroundProof
             } elseif($CaseId -eq 'static-foreground'){
-                $null=[MivReleaseCheckNative]::SetForegroundWindow([IntPtr][long]$r.root_hwnd)
+                $null=[MivReleaseCheckNative]::SetForegroundWindow([IntPtr]$publishedRoot)
             }
             $scenario=if($CaseId.StartsWith('tray-')){'tray-residency'}else{$CaseId}
-            $samplerArgs=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $scripts 'check-idle-health.ps1'),'-PortableSmoke','-InteractiveApproved','-SkipPrompt','-Scenario',$scenario,'-CaseId',$CaseId,'-ProcessId',[string]$script:owned.Id,'-ExpectedStartTimeUtc',$script:ownedStart.ToString('o'),'-SleepEvidencePath',(Join-Path $dir 'completion.json'),'-OutputDirectory',$dir,'-RootHwnd',[string]$r.root_hwnd,'-BackgroundHwnd',[string]$backgroundHwnd)
+            $samplerArgs=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $scripts 'check-idle-health.ps1'),'-PortableSmoke','-InteractiveApproved','-SkipPrompt','-Scenario',$scenario,'-CaseId',$CaseId,'-ProcessId',[string]$script:owned.Id,'-ExpectedStartTimeUtc',$script:ownedStart.ToString('o'),'-SleepEvidencePath',(Join-Path $dir 'completion.json'),'-OutputDirectory',$dir,'-RootHwnd',[string]$publishedRoot,'-BackgroundHwnd',[string]$backgroundHwnd)
             if($FromKit){$samplerArgs+='-FromKit'}
             if($backgroundHwnd -ne 0){$samplerArgs+=@('-BackgroundProcessId',[string]$PID)}
             if($CaseId -eq 'video-pin-background'){$samplerArgs+=@('-TargetKey',[string]$r.target_key)}
@@ -337,7 +334,7 @@ try {
         if(-not (Test-ReleaseCheckContinueAfterAnalysis $id $verdictExit)){break}
     }
 }catch{
-    $cases.Add([ordered]@{case_id='suite-preparation';verdict='SKIPPED';exit_code=2;environment_errors=@($_.Exception.Message);failures=@();warnings=@()})
+    $cases.Add((New-ReleaseCheckRunnerErrorResult $_))
 }finally{
     try{Stop-OwnedReleaseProcess}catch{$cases.Add([ordered]@{case_id='cleanup';verdict='SKIPPED';exit_code=2;environment_errors=@($_.Exception.Message)})}
     if($script:activeDir){try{Save-ReleaseLogs $script:activeDir}catch{$cases.Add([ordered]@{case_id='archive';verdict='SKIPPED';exit_code=2;environment_errors=@($_.Exception.Message)})}}

@@ -13,6 +13,69 @@ function Invoke-ReleaseCheckPreflight {
     catch { return [pscustomobject]@{exit_code=2;value=$null;environment_error=$_.Exception.Message} }
 }
 
+function Assert-ReleaseCheckPublishedRootOwner {
+    param([int]$AppPid,[long]$RootHwnd)
+    [uint32]$owner=0
+    if($RootHwnd -le 0){throw 'Published root HWND is missing.'}
+    $null=[MivReleaseCheckNative]::GetWindowThreadProcessId([IntPtr]$RootHwnd,[ref]$owner)
+    if($AppPid -le 0 -or $owner -ne $AppPid){throw 'Published root HWND owner PID mismatch.'}
+}
+
+function Read-ReleaseCheckRootWindow {
+    param([string]$Path,[int]$AppPid)
+    if(-not (Test-Path -LiteralPath $Path -PathType Leaf)){return [long]0}
+    $record=Get-Content -LiteralPath $Path -Encoding UTF8 -Raw | ConvertFrom-Json
+    foreach($name in @('schema_version','pid','root_hwnd','unix_ms')){
+        if(($record.$name -isnot [int] -and $record.$name -isnot [long]) -or $record.$name -le 0){throw "Invalid published root field: $name"}
+    }
+    if($record.schema_version -ne 1 -or $record.pid -ne $AppPid){throw 'Published root schema/PID mismatch.'}
+    Assert-ReleaseCheckPublishedRootOwner $AppPid ([long]$record.root_hwnd)
+    return [long]$record.root_hwnd
+}
+
+function Invoke-ReleaseCheckInitialForeground {
+    param([int]$AppPid,[long]$RootHwnd)
+    # The existing focus budget/loop owns this call. Publication absence must
+    # never cause enumeration or activation of another same-process window.
+    if($RootHwnd -eq 0){return $false}
+    Assert-ReleaseCheckPublishedRootOwner $AppPid $RootHwnd
+    $null=[MivReleaseCheckNative]::SetForegroundWindow([IntPtr]$RootHwnd)
+    $sample=Get-ReleaseCheckWindowSample $AppPid
+    return $sample.foreground_pid -eq $AppPid -and $sample.foreground_hwnd -eq $RootHwnd
+}
+
+function Assert-ReleaseCheckReadyRoot {
+    param($Ready,[int]$AppPid,[long]$RootHwnd,[string]$CaseId,[string]$Directory)
+    if($RootHwnd -le 0){throw 'Ready received without a published root.'}
+    $property=$Ready.PSObject.Properties['root_hwnd']
+    $reportedRoot=if($null -eq $property){$null}else{$property.Value}
+    if(($reportedRoot -isnot [int] -and $reportedRoot -isnot [long]) -or $reportedRoot -ne $RootHwnd){
+        $mismatchException=New-Object System.InvalidOperationException -ArgumentList "Ready root HWND differs from published root: expected $RootHwnd, reported $reportedRoot."
+        $mismatchException.Data['release_check_product_failure']=$true
+        $mismatchException.Data['case_id']=$CaseId
+        $mismatchException.Data['directory']=$Directory
+        $mismatchException.Data['root_identity']=@{pid=$AppPid;published_root_hwnd=$RootHwnd;ready_root_hwnd=$reportedRoot}
+        throw $mismatchException
+    }
+    if($Ready.pid -ne $AppPid){throw 'Ready PID mismatch.'}
+    Assert-ReleaseCheckPublishedRootOwner $AppPid $RootHwnd
+}
+
+function New-ReleaseCheckRunnerErrorResult {
+    param($ErrorRecord)
+    $exception=$ErrorRecord.Exception
+    $product=$exception.Data['release_check_product_failure'] -eq $true
+    if($product){
+        $directory=[string]$exception.Data['directory']
+        return [ordered]@{schema_version=1;case_id=$exception.Data['case_id'];verdict='FAIL';exit_code=1
+            failures=@($exception.Message);environment_errors=@();warnings=@()
+            evidence=@{root_identity=$exception.Data['root_identity'];failure_artifacts=@{
+                directory=$directory;root_window=(Join-Path $directory 'root-window.json');ready=(Join-Path $directory 'ready.json')
+                foreground_timeline=(Join-Path $directory 'foreground-timeline.jsonl')}}}
+    }
+    return [ordered]@{case_id='suite-preparation';verdict='SKIPPED';exit_code=2;environment_errors=@($exception.Message);failures=@();warnings=@()}
+}
+
 function New-ReleaseCheckProcessExitResult {
     param([string]$CaseId,[int]$ProcessExitCode,[int]$ProcessId,[string]$Directory,[string]$ForegroundRecordingError)
     if($ProcessExitCode -eq 0){return $null}
@@ -57,6 +120,7 @@ function New-ReleaseCheckProcessExitResult {
             failure_artifacts=@{directory=$Directory;perf_log=(Join-Path $Directory 'perf_events.jsonl')
                 app_log=(Join-Path $Directory 'mimageviewer.log');process=(Join-Path $Directory 'process.json')
                 case_evidence=(Join-Path $Directory 'case-evidence.json')
+                root_window=(Join-Path $Directory 'root-window.json')
                 foreground_timeline=(Join-Path $Directory 'foreground-timeline.jsonl')
                 foreground_wait_failure=(Join-Path $Directory 'foreground-wait-failure.json')}}
     }

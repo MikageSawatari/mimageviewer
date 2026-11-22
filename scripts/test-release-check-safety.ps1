@@ -101,7 +101,8 @@ if(-not ('MivReleaseCheckNative' -as [type])){
 using System.Text.RegularExpressions;
 public static class MivReleaseCheckNative {
  public static object ForegroundSample;
- public static object CaptureForeground(uint app,long root){return ForegroundSample;}
+ public static long CapturedRootHwnd;
+ public static object CaptureForeground(uint app,long root){CapturedRootHwnd=root;return ForegroundSample;}
  public static int GeometryDpi=96;
  public static int[] WorkArea=new[]{0,0,1920,1040};
  public static int[] ClientSize=new[]{1420,900};
@@ -109,6 +110,7 @@ public static class MivReleaseCheckNative {
  public static int[] OuterRect(int w,int h,uint dpi,int logicalX,int logicalY){int x=(int)System.Math.Round(logicalX*dpi/96.0),y=(int)System.Math.Round(logicalY*dpi/96.0);return new[]{x,y,x+(int)(w*dpi/96)+16,y+(int)(h*dpi/96)+39};}
  public static int[] WindowGeometry(System.IntPtr h){return new[]{GeometryDpi,ClientSize[0],ClientSize[1],60,40,60+ClientSize[0]+16,40+ClientSize[1]+39,WorkArea[0],WorkArea[1],WorkArea[2],WorkArea[3]};}
  public static uint BackgroundOwner=202;
+ public static uint PublishedRootOwner=101;
  public static bool ActivationSucceeds=true;
  public static int ActivationCalls=0;
  public static long PostedCloseHwnd=0;
@@ -116,11 +118,84 @@ public static class MivReleaseCheckNative {
  public static long ForegroundHwnd=888;
  public static uint ForegroundOwner=101;
  public static System.IntPtr GetForegroundWindow(){return new System.IntPtr(ForegroundHwnd);}
- public static uint GetWindowThreadProcessId(System.IntPtr h,out uint p){p=h.ToInt64()==999?BackgroundOwner:(h.ToInt64()==ForegroundHwnd?ForegroundOwner:0);return 1;}
+ public static uint GetWindowThreadProcessId(System.IntPtr h,out uint p){p=h.ToInt64()==999?BackgroundOwner:(h.ToInt64()==ForegroundHwnd?ForegroundOwner:(h.ToInt64()==888?PublishedRootOwner:0));return 1;}
  public static bool SetForegroundWindow(System.IntPtr h){ActivationCalls++;if(ActivationSucceeds){ForegroundHwnd=h.ToInt64();ForegroundOwner=BackgroundOwner;}return ActivationSucceeds;}
  public static string[] Arguments(string s) {var m=Regex.Matches(s,"\"([^\"]*)\"|([^ ]+)");var a=new string[m.Count];for(int i=0;i<a.Length;i++)a[i]=m[i].Groups[1].Success?m[i].Groups[1].Value:m[i].Groups[2].Value;return a;}
 }
 '@
+}
+& {
+    # Publication and foreground proof only; the native calls below are fakes.
+    $temporaryBase=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+    $temporary=Join-Path $temporaryBase ('miv-root-window-safety-'+[Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $temporary | Out-Null
+    $path=Join-Path $temporary 'root-window.json'
+    function Get-ReleaseCheckWindowSample {
+        param($AppPid)
+        return [pscustomobject]@{foreground_pid=[MivReleaseCheckNative]::ForegroundOwner;foreground_hwnd=[MivReleaseCheckNative]::ForegroundHwnd}
+    }
+    try{
+        [MivReleaseCheckNative]::ActivationCalls=0
+        $unpublished=Read-ReleaseCheckRootWindow $path 101
+        Assert-True ($unpublished -eq 0 -and -not (Invoke-ReleaseCheckInitialForeground 101 $unpublished)) 'Unpublished root was treated as focusable.'
+        Assert-True ([MivReleaseCheckNative]::ActivationCalls -eq 0) 'Missing root publication activated a window.'
+        $record=[ordered]@{schema_version=1;pid=101;root_hwnd=888;unix_ms=1700000000000}
+        Write-ReleaseCheckJson $path $record
+        # The same process has a foreground event target, but published root is 888.
+        [MivReleaseCheckNative]::ForegroundHwnd=777;[MivReleaseCheckNative]::ForegroundOwner=101
+        [MivReleaseCheckNative]::BackgroundOwner=101
+        $published=Read-ReleaseCheckRootWindow $path 101
+        Assert-True ($published -eq 888 -and (Invoke-ReleaseCheckInitialForeground 101 $published)) 'Published root could not be acquired exactly.'
+        Assert-True ([MivReleaseCheckNative]::ActivationCalls -eq 1 -and [MivReleaseCheckNative]::ForegroundHwnd -eq 888) 'Event target replaced published root during activation.'
+        [MivReleaseCheckNative]::ActivationCalls=0
+        foreach($mutation in @(@{name='pid';value=102},@{name='schema_version';value=2},@{name='root_hwnd';value=0},@{name='root_hwnd';value='888'},@{name='unix_ms';value=0})){
+            $bad=[ordered]@{schema_version=1;pid=101;root_hwnd=888;unix_ms=1700000000000}
+            $bad[$mutation.name]=$mutation.value
+            Write-ReleaseCheckJson $path $bad
+            Assert-Throws {$root=Read-ReleaseCheckRootWindow $path 101;Invoke-ReleaseCheckInitialForeground 101 $root} 'Invalid root publication progressed to foreground acquisition.'
+            Assert-True ([MivReleaseCheckNative]::ActivationCalls -eq 0) 'Invalid root publication activated a window.'
+        }
+        Write-ReleaseCheckJson $path $record
+        [MivReleaseCheckNative]::ForegroundHwnd=777;[MivReleaseCheckNative]::PublishedRootOwner=303
+        Assert-Throws {Read-ReleaseCheckRootWindow $path 101} 'Published HWND with a foreign owner was accepted.'
+        Assert-Throws {Invoke-ReleaseCheckInitialForeground 101 888} 'Owner mismatch reached activation.'
+        Assert-True ([MivReleaseCheckNative]::ActivationCalls -eq 0) 'Owner mismatch activated a window.'
+        [MivReleaseCheckNative]::PublishedRootOwner=101;[MivReleaseCheckNative]::ActivationSucceeds=$false
+        Assert-True (-not (Invoke-ReleaseCheckInitialForeground 101 888)) 'Same-process foreground event target counted as root.'
+        [MivReleaseCheckNative]::ActivationSucceeds=$true;[MivReleaseCheckNative]::ForegroundHwnd=888
+        $ready=[pscustomobject]@{pid=101;root_hwnd=888}
+        Assert-ReleaseCheckReadyRoot $ready 101 888 'static-background' $temporary
+        $run=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1')
+        $suiteTry=@($run.EndBlock.Statements | Where-Object {$_ -is [Management.Automation.Language.TryStatementAst]})[-1]
+        $catchBody=($suiteTry.CatchClauses[0].Body.Statements | ForEach-Object {$_.Extent.Text}) -join "`n"
+        foreach($badReady in @([pscustomobject]@{pid=101;root_hwnd=777},[pscustomobject]@{pid=101})){
+            $cases=New-Object 'Collections.Generic.List[object]'
+            try{Assert-ReleaseCheckReadyRoot $badReady 101 888 'static-background' $temporary;throw 'Mismatch unexpectedly accepted.'}
+            catch{& ([scriptblock]::Create($catchBody))}
+            Assert-True ($cases.Count -eq 1 -and $cases[0].case_id -eq 'static-background' -and $cases[0].verdict -eq 'FAIL' -and $cases[0].exit_code -eq 1) 'Ready root replacement was hidden as SKIPPED.'
+            Assert-True ($cases[0].evidence.root_identity.published_root_hwnd -eq 888 -and $cases[0].failures[0] -like '*differs from published root*') 'Root mismatch evidence lost the published identity.'
+        }
+        foreach($relative in @('Run.ps1','Support.ps1','Sampler.ps1')){
+            $text=Get-Content -LiteralPath (Join-Path $PSScriptRoot ('ui-smoke\release-checks\'+$relative)) -Encoding UTF8 -Raw
+            Assert-True (-not $text.Contains('MainWindowHandle')) "ReleaseChecks still uses a guessed root: $relative"
+        }
+        $session=@($run.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-ReleaseSession'},$true))[0]
+        $focus=@($session.FindAll({param($n)$n -is [Management.Automation.Language.IfStatementAst] -and $n.Clauses[0].Item2.Extent.Text.Contains('$focusAcquired=Invoke-ReleaseCheckInitialForeground')},$true))
+        Assert-True ($focus.Count -eq 1 -and $focus[0].Clauses[0].Item1.Extent.Text.Contains('$publishedRoot -ne 0') -and $focus[0].Clauses[0].Item1.Extent.Text.Contains('$focusTimer.Elapsed.TotalSeconds -le 20')) 'Focus is not gated by publication within the original deadline.'
+        $body=$session.Body.Extent.Text
+        Assert-True ($body.Contains('Read-ReleaseCheckRootWindow $rootWindow $script:owned.Id') -and $body.Contains('Write-ReleaseCheckForegroundTimeline $foregroundTimeline $publishedRoot') -and
+            $body.Contains('Assert-ReleaseCheckReadyRoot $r $script:owned.Id $publishedRoot') -and $body.Contains("'-RootHwnd',[string]`$publishedRoot")) 'Published root is not routed to timeline, ready validation and sampler.'
+        $geometry=@($session.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-ReleaseCheckWindowGeometry'},$true))
+        Assert-True ($geometry.Count -eq 2) 'Root geometry proof disappeared.'
+        foreach($call in $geometry){Assert-True ($call.Extent.Text.EndsWith('$publishedRoot')) 'Geometry proof uses a different root identity.'}
+    }finally{
+        [MivReleaseCheckNative]::ForegroundHwnd=888;[MivReleaseCheckNative]::ForegroundOwner=101
+        [MivReleaseCheckNative]::PublishedRootOwner=101;[MivReleaseCheckNative]::BackgroundOwner=202
+        [MivReleaseCheckNative]::ActivationSucceeds=$true;[MivReleaseCheckNative]::ActivationCalls=0
+        $resolved=[IO.Path]::GetFullPath($temporary)
+        if(-not $resolved.StartsWith($temporaryBase+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Unsafe root publication test cleanup path.'}
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+    }
 }
 & {
     # Pure/fake geometry gates: no native desktop reads or window creation.
@@ -277,6 +352,19 @@ public static class MivReleaseCheckNative {
         }
     }
     try{
+        $publicationDirectory=Join-Path $temporary 'publication'
+        New-Item -ItemType Directory -Path $publicationDirectory | Out-Null
+        $publicationTimeline=New-ReleaseCheckForegroundTimeline $publicationDirectory 101
+        [MivReleaseCheckNative]::ForegroundSample=New-FakeForegroundRecord 500
+        [MivReleaseCheckNative]::ForegroundSample.root_hwnd=0
+        [MivReleaseCheckNative]::ForegroundSample.root_pid=0
+        [MivReleaseCheckNative]::ForegroundSample.root_alive=$false
+        Write-ReleaseCheckForegroundTimeline $publicationTimeline 0
+        Assert-True ([MivReleaseCheckNative]::CapturedRootHwnd -eq 0) 'Recorder guessed a root before publication.'
+        [MivReleaseCheckNative]::ForegroundSample=New-FakeForegroundRecord 1000
+        Write-ReleaseCheckForegroundTimeline $publicationTimeline 888
+        $publicationRows=@(Get-Content -LiteralPath $publicationTimeline.path -Encoding UTF8 | ForEach-Object {$_ | ConvertFrom-Json})
+        Assert-True (($publicationRows.root_hwnd -join ',') -eq '0,888' -and $publicationTimeline.root_hwnd -eq 888 -and [MivReleaseCheckNative]::CapturedRootHwnd -eq 888) 'Timeline did not switch from unknown to the published root.'
         $timeline=New-ReleaseCheckForegroundTimeline $temporary 101
         [MivReleaseCheckNative]::ForegroundSample=New-FakeForegroundRecord 1000
         Write-ReleaseCheckForegroundTimeline $timeline 888
@@ -323,7 +411,11 @@ public static class MivReleaseCheckNative {
         $finalCalls=@($completion.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Write-ReleaseCheckForegroundTimeline'},$true))
         Assert-True ($calls.Count -eq 1 -and $finalCalls.Count -eq 1 -and $finalCalls[0].Extent.Text.Contains('-Force') -and $session.Body.Extent.Text.Contains('Complete-ReleaseSession $CaseId $dir $foregroundTimeline')) 'Session foreground sampling/final boundary missing.'
         $focusCalls=@($session.FindAll({param($n)$n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Member.Extent.Text -eq 'SetForegroundWindow'},$true))
-        Assert-True ($focusCalls.Count -eq 2) 'Foreground instrumentation added an activation/reacquisition path.'
+        Assert-True ($focusCalls.Count -eq 1) 'Foreground instrumentation added an activation/reacquisition path.'
+        $supportAst=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Support.ps1')
+        $initial=@($supportAst.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-ReleaseCheckInitialForeground'},$true))[0]
+        $initialCalls=@($initial.FindAll({param($n)$n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Member.Extent.Text -eq 'SetForegroundWindow'},$true))
+        Assert-True ($initialCalls.Count -eq 1) 'Initial focus helper added retries.'
         $samplerLoops=@($session.FindAll({param($n)$n -is [Management.Automation.Language.WhileStatementAst] -and $n.Condition.Extent.Text -eq '-not $sampler.HasExited'},$true))
         Assert-True ($samplerLoops.Count -eq 1 -and -not $samplerLoops[0].Body.Extent.Text.Contains('Write-ReleaseCheckForegroundTimeline')) 'Foreground instrumentation entered the sampler measurement loop.'
         $support=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Support.ps1') -Encoding UTF8 -Raw

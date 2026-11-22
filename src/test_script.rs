@@ -7393,6 +7393,25 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn root_window_recipe_publishes_after_selection_before_initial_observation() {
+        let source = include_str!("../scripts/ui-smoke/release-checks.rhai");
+        let after_selection = source.split_once("\nselect_root();").unwrap().1;
+        let publication = "release_check_publish_root();";
+        assert!(after_selection.trim_start().starts_with(publication));
+        let after_publication = after_selection
+            .trim_start()
+            .strip_prefix(publication)
+            .unwrap();
+        assert!(
+            after_publication
+                .trim_start()
+                .starts_with("for attempt in 0..1800 {")
+        );
+        assert_eq!(source.matches(publication).count(), 1);
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn release_checks_bootstrap_waits_for_published_root_without_waking_it() {
         let owner = root_identity(0, 0x4a11);
         let root = window_snapshot(owner.clone(), 1, 0, "static.png");
@@ -7406,12 +7425,23 @@ mod tests {
         let selection = Arc::clone(&bridge.action_selection);
         let wake_count = Arc::clone(&wakes);
         let mut engine = build_engine(bridge);
-        // Stub only the isolated-filesystem setup. The actual recipe wait,
-        // serializer and select_root execute; no native window is created.
+        // Stub the isolated-filesystem setup and its new evidence writer. The
+        // actual recipe wait, serializer and select_root still execute.
         engine.register_fn(
             "release_check_begin",
             |_: ImmutableString, _: ImmutableString| {},
         );
+        let publication = Arc::new(Mutex::new(None));
+        let recorded_publication = Arc::clone(&publication);
+        let published_selection = Arc::clone(&selection);
+        let publication_wakes = Arc::clone(&wakes);
+        engine.register_fn("release_check_publish_root", move || {
+            *recorded_publication.lock().unwrap() = Some((
+                published_selection.lock().unwrap().clone(),
+                Instant::now(),
+                publication_wakes.load(AtomicOrdering::Relaxed),
+            ));
+        });
         let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
             .replace("__SEARCH_HITS__", "[]")
             .replace("__CACHE_PATHS__", "[]")
@@ -7423,19 +7453,25 @@ mod tests {
         let publisher = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             assert_eq!(wake_count.load(AtomicOrdering::Relaxed), 0);
+            let ready_at = Instant::now();
             published.write().unwrap().windows = vec![root];
+            ready_at
         });
-        let selected = engine
-            .eval::<Map>(bootstrap)
+        engine
+            .eval::<()>(bootstrap)
             .expect("release root bootstrap");
+        let ready_at = publisher.join().unwrap();
+        let (published_owner, published_at, publication_wakes) = publication
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("root publication");
         assert_eq!(
-            selected["target_mode"]
-                .clone_cast::<ImmutableString>()
-                .as_str(),
-            "targeted"
+            published_owner,
+            TestScriptActionSelection::Targeted(owner.clone())
         );
-        assert!(selected["current"].clone_cast::<bool>());
-        publisher.join().unwrap();
+        assert!(published_at >= ready_at);
+        assert_eq!(publication_wakes, 2);
         assert_eq!(
             *selection.lock().unwrap(),
             TestScriptActionSelection::Targeted(owner.clone())

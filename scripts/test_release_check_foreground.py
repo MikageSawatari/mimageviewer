@@ -135,6 +135,17 @@ class ForegroundClassificationTests(unittest.TestCase):
         rows[1]["root_hung"] = True
         self.assert_failure(rows)
 
+    def test_unpublished_root_prefix_is_excluded_only_when_wait_is_fully_known(self):
+        unpublished = row(1000, root_hwnd=0, root_pid=0, root_alive=False,
+                          root_visible=False, foreground_pid=PID)
+        rows = [unpublished, *timeline()]
+        result = self.classify(rows)
+        self.assertTrue(result["environment"])
+        self.assertEqual(result["details"]["coverage_start_unix_ms"], 1900)
+        self.assertEqual(result["details"]["selected_row_count"], 4)
+        # Publication before a wait is required evidence, not inferred backwards.
+        self.assert_failure(rows, failure(wait_start_unix_ms=1500), reason="ownership mismatch")
+
     def test_schema_and_strict_timestamp_order(self):
         for rows in ([row(2000), row(2000), row(4000)],
                      [row(3000), row(2000), row(4000)],
