@@ -1066,8 +1066,8 @@ root の `focused` が偽のままになる原因は mIV 自身のこともあ�
 サブ PC 担当は本番のあいだ、シェルの命令を流さず、ターミナル パネルを読むだけにした。
 
 - 事前確認: READY (exit 0)。前面化は 1 回目で成功 (179 ms)。
-- 本番: **PASS_WITH_WARNINGS** (exit 0)。11 ケースの内訳は次のとおり。
-  - seed の 2 つと 2 つの stopped seed: PASS。
+- 本番: **PASS_WITH_WARNINGS** (exit 0)。9 ケースの内訳は次のとおり。
+  - seed-profile・seed-perf-cached: PASS。
   - static-foreground: PASS (要求 373 px、CPU 0.0031 コア、frames 0)。
   - static-background: PASS (CPU 0.0052 コア、frames 0)。
   - video-pin-background: PASS (CPU 0.0010 コア)。
