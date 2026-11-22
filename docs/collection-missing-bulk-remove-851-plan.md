@@ -219,7 +219,7 @@ Missing の文言:
   2. 確認ダイアログで「外す」が確定し、`submit_collection_remove` で actor へ送る直前。
   検査は **stamp の `ViewerContextId` の context で**、不変参照だけで評価する。`with_viewer_context` は
   closure の前後で評価の反映・ページ編集の reconciliation・メタデータ表示の更新 (pending を消費して可視一覧を
-  作り直す) を行うので使わない (r3 レビュー P1 相当の P2 で前提の誤りを訂正)。代わりに既存の
+  作り直す) を行うので使わない (r3 レビュー P2 で前提の誤りを訂正)。代わりに既存の
   `with_viewer_context_ref` と `ContextRef` を使い、`collection_grid_request_stamp_is_current` の判定
   (stamp の一致・Root・`installed_items_generation == items_generation`) を、`App` と `ContextRef` の両方から
   呼べる共通の純関数に切り出す。context が存在しなければ拒否する。
