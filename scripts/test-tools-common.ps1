@@ -236,7 +236,7 @@ function Get-MivSourceManifestId {
     param([string] $RepoRoot, $Cache)
     $trackedAndNew = Invoke-MivGit $RepoRoot @('ls-files', '-z', '--cached', '--others', '--exclude-standard')
     # Include ignored native inputs and optional real fixtures, but no build outputs.
-    $ignoredInputs = Invoke-MivGit $RepoRoot @('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', '.cargo', '.config', 'src', 'tests', 'scripts', 'crates', 'vendor', 'testdata', 'testimage', 'test_images', 'assets', 'resources')
+    $ignoredInputs = Invoke-MivGit $RepoRoot @('ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--', '.cargo', '.config', 'src', 'tests', 'scripts', 'crates', 'vendor', 'testdata', 'testimage', 'test_images', 'assets', 'resources', 'htdocs/mimageviewer/manual')
     $paths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
     foreach ($path in ($trackedAndNew + $ignoredInputs).Split([char]0)) {
         if (-not $path) { continue }
@@ -495,6 +495,14 @@ function Get-MivFocusedPlan {
             # The probe and facet debounce/cache module have no inline tests.
             # Their coverage belongs to the common typing family.
             if ($path -match '^src/app/tests/typing/|^src/app/facet_name_filter\.rs$') { continue }
+        }
+        # The bundled manual is a build/test input of the standalone MCP crate.
+        if ($path -cmatch '^htdocs/mimageviewer/manual/(sound/)?(?!changelog\.html$)[^/]+\.html$') {
+            $selection = @('-p', 'mimageviewer-mcp')
+            if ($seen.Add('-p|mimageviewer-mcp|all()')) {
+                $entries.Add([pscustomobject]@{ Path = $path; Selection = $selection; Filter = 'all()' })
+            }
+            continue
         }
         if ($path -match '(^|/)(Cargo\.(toml|lock)|build\.rs)$|^src/(lib|main|app)\.rs$|^src/app/tests\.rs$|^(\.cargo/|\.config/|vendor/|tests/(support|snapshots)/)') {
             $broad.Add($path); continue

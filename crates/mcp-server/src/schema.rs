@@ -4,7 +4,7 @@ use mimageviewer_agent_ipc::{
 };
 use serde_json::{Value, json};
 
-const TOOL_NAMES: [&str; 20] = [
+const TOOL_NAMES: [&str; 22] = [
     "miv_status",
     "search_items",
     "list_tags",
@@ -25,6 +25,8 @@ const TOOL_NAMES: [&str; 20] = [
     "add_tags",
     "remove_tags",
     "set_rating",
+    "search_help",
+    "get_help",
 ];
 fn metadata_write(name: &str) -> bool {
     matches!(name, "add_tags" | "remove_tags" | "set_rating")
@@ -307,6 +309,14 @@ fn replace_schema(value: &mut Value, repeated: &Value, reference: &Value) {
 }
 fn output(name: &str) -> Value {
     match name {
+        "search_help" => object(
+            json!({"app_version":string(),"results":{"type":"array","items":object(json!({"id":string(),"title":string(),"heading":string(),"snippet":string()}),&["id","title","heading","snippet"])}}),
+            &["app_version", "results"],
+        ),
+        "get_help" => object(
+            json!({"app_version":string(),"id":string(),"title":string(),"heading":string(),"part":unsigned(),"parts":unsigned(),"text":string(),"pages":{"type":"array","items":object(json!({"id":string(),"title":string()}),&["id","title"])},"sections":{"type":"array","items":object(json!({"id":string(),"heading":string(),"parts":unsigned()}),&["id","heading","parts"])}}),
+            &["app_version"],
+        ),
         "add_tags" | "remove_tags" | "set_rating" => object(
             json!({"outcomes":metadata_outcomes(name == "set_rating")}),
             &["outcomes"],
@@ -472,6 +482,8 @@ fn output(name: &str) -> Value {
 pub fn tools() -> Vec<Value> {
     TOOL_NAMES.into_iter().map(|name| {
         let description=match name {
+            "search_help"=>"Search the bundled mImageViewer (mIV) manual (whitespace AND, ASCII case-insensitive). Works offline with integration disabled.",
+            "get_help"=>"Read the bundled mImageViewer (mIV) manual: omit id for pages, page id for sections, section id for text; part starts at 1. Works offline with integration disabled.",
             "miv_status"=>"Read mImageViewer (mIV) version, AI permissions, index readiness, search_scope paths (favorites with item indexing enabled; search_scope_truncated means more exist) and Remote activity.",
             "search_items"=>"Search mImageViewer (mIV)'s index (Ctrl+G syntax): paths/names/kinds/tags/ratings; AI captions and transcripts require their respective mIV permissions. Searches favorites listed in miv_status search_scope (more exist if search_scope_truncated); use list_folder elsewhere.",
             "list_tags"=>"List mImageViewer (mIV) tags/counts: pinned/recent/frequent/all.",
@@ -494,7 +506,9 @@ pub fn tools() -> Vec<Value> {
             "get_transcript"=>"Read a saved mImageViewer (mIV) video/audio transcript; transcript permission required. start_secs: media seconds, the playback time displayed by mIV; segments ending after start_secs. Cursor: same item; omit start_secs or repeat initial value; rev/epoch changes invalidate it. Whole segments; oversized text cut at UTF-8 boundary, text.truncated=true, then next segment. Missing/unpublished: none; old saved row remains readable while generating. States: present/none/failed/not_applicable. No generate/search/open.",
             _=>unreachable!(),
         };
-        let required = if write(name) {
+        let required = if matches!(name, "search_help" | "get_help") {
+            ""
+        } else if write(name) {
             "Needs mIV Organize."
         } else if name == "open_in_viewer" {
             "Needs mIV Read and Open."
@@ -507,6 +521,8 @@ pub fn tools() -> Vec<Value> {
         };
         let description = format!("{description} {required}");
         let input=match name {
+            "search_help"=>object(json!({"query":{"type":"string","minLength":1},"limit":{"type":["integer","null"],"minimum":1,"maximum":30,"default":10}}),&["query"]),
+            "get_help"=>object(json!({"id":nullable_string(),"part":{"type":["integer","null"],"minimum":1,"default":1}}),&[]),
             "add_tags"|"remove_tags"=>object(json!({"items":{"type":"array","minItems":1,"maxItems":MAX_WRITE_ITEMS,"items":object(json!({"path":string()}),&["path"])},"tags":{"type":"array","minItems":1,"maxItems":MAX_WRITE_TAGS,"items":string()}}),&["items","tags"]),
             "set_rating"=>object(json!({"items":{"type":"array","minItems":1,"maxItems":MAX_WRITE_ITEMS,"items":object(json!({"path":string(),"subresource":nullable_string()}),&["path"])},"stars":{"type":"integer","minimum":0,"maximum":5}}),&["items","stars"]),
             "create_collection"=>object(json!({"name":collection_text()}),&["name"]),
@@ -698,7 +714,7 @@ mod tests {
     #[test]
     fn tools_have_precise_annotation_contracts() {
         let tools = tools();
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 22);
         for tool in &tools {
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
             assert_eq!(tool["outputSchema"]["type"], "object");

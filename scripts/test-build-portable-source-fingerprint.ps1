@@ -84,6 +84,24 @@ if ($records.Where({ $_.StartsWith($eguiCargoPrefix, [System.StringComparison]::
     throw 'vendor/egui/Cargo.toml is missing from the portable source fingerprint'
 }
 
+$manualInputs = @(Get-ChildItem -LiteralPath (Join-Path $repoRoot 'htdocs\mimageviewer\manual'), (Join-Path $repoRoot 'htdocs\mimageviewer\manual\sound') -Filter '*.html' -File |
+    Where-Object { $_.Name -cne 'changelog.html' })
+foreach ($manual in $manualInputs) {
+    $relative = $manual.FullName.Substring($repoRoot.Length + 1).Replace('\', '/') + "`t"
+    if ($records.Where({ $_.StartsWith($relative, [StringComparison]::Ordinal) }).Count -ne 1) {
+        throw "bundled help missing from portable fingerprint: $relative"
+    }
+}
+$manualProbe = Join-Path $repoRoot ('htdocs\mimageviewer\manual\.miv-help-probe-' + [Guid]::NewGuid().ToString('N') + '.html')
+try {
+    [IO.File]::WriteAllText($manualProbe, '<main class="content"><h1>Probe</h1></main>')
+    if ((Get-MivSourceFingerprint $repoRoot) -eq $fingerprint) {
+        throw 'a bundled help change did not invalidate portable reuse'
+    }
+} finally {
+    if (Test-Path -LiteralPath $manualProbe) { Remove-Item -LiteralPath $manualProbe -Force }
+}
+
 $eguiProbe = Join-Path $repoRoot ("vendor\egui\.miv-source-fingerprint-{0}.tmp" -f [Guid]::NewGuid().ToString('N'))
 try {
     [System.IO.File]::WriteAllText(

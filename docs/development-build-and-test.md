@@ -35,6 +35,13 @@ fallback／診断として残す。[正規手順と採用証跡](release-check-a
 `--test <name>` を使う。`mimageviewer-core` bin は `mimageviewer::run()` を呼ぶだけなので、
 通常は bin 単独のテストを選ぶ必要はない。
 
+MCP の同梱ヘルプ (§1.843 A) は `htdocs/mimageviewer/manual/*.html` と
+`manual/sound/*.html` (`changelog.html` を除く) からビルド時に生成する。
+この HTML の変更も `test-focused.ps1` は `mimageviewer-mcp` の対象に選ぶ。
+本文の抽出・検索・取得・応答予算の検査は同 crate の `help::tests`、本体への接続を使わない
+各 MCP 版の検査は `tests::help_transport_tests`。成功記録のソース ID と診断 portable の
+fingerprint も同梱 HTML を含むので、ヘルプだけを変更した場合も古い成果物を再利用しない。
+
 `test-script`のApp連携やnative診断の回帰はfeatureなしの全体gateだけでは実行されない。
 この領域を変更した場合は、対象テストを上記feature付きで追加実行する。backendの実Window
 witnessは`cargo test --manifest-path vendor/eframe/Cargo.toml --no-default-features --features wgpu,miv-test-script-window-witness --lib`

@@ -160,7 +160,7 @@ Write-Fixture 'src/foo.rs' $foo
 Write-Fixture 'tests/sample.rs' '#[test] fn integration() { assert_eq!(4 + 4, 8); }'
 Write-Fixture 'helper/Cargo.toml' "[package]`nname = `"miv-test-helper`"`nversion = `"0.0.0`"`nedition = `"2021`"`n"
 Write-Fixture 'helper/src/lib.rs' '#[test] fn helper() { assert_eq!(5 + 5, 10); }'
-Write-Fixture '.gitignore' "target/`nvendor/`n"
+Write-Fixture '.gitignore' "target/`nvendor/`nhtdocs/mimageviewer/manual/ignored.html`n"
 Write-Fixture '.cargo/config.toml' @'
 [env]
 FFMPEG_DIR = { value = "unused-fixture-directory" }
@@ -183,6 +183,15 @@ $stagedId = Get-MivSourceId $fixture
 Write-Fixture 'src/foo.rs' $foo
 Assert-That ((Get-MivSourceId $fixture) -ne $stagedId) 'worktree contents behind a staged edit were not detected'
 Assert-That ((Get-MivSourceId $fixture) -eq $id1) 'fingerprint depends on staging instead of tested bytes'
+[void] [IO.Directory]::CreateDirectory((Join-Path $fixture 'htdocs/mimageviewer/manual'))
+Write-Fixture 'htdocs/mimageviewer/manual/index.html' '<main class="content"><h1>Help</h1></main>'
+$manualSourceId = Get-MivSourceId $fixture
+Write-Fixture 'htdocs/mimageviewer/manual/index.html' '<main class="content"><h1>Updated help</h1></main>'
+Assert-That ((Get-MivSourceId $fixture) -ne $manualSourceId) 'bundled help did not invalidate the success receipt'
+Remove-Item -LiteralPath (Join-Path $fixture 'htdocs/mimageviewer/manual/index.html')
+Write-Fixture 'htdocs/mimageviewer/manual/ignored.html' '<main class="content"><h1>Ignored help input</h1></main>'
+Assert-That ((Get-MivSourceId $fixture) -ne $id1) 'ignored bundled help did not invalidate the success receipt'
+Remove-Item -LiteralPath (Join-Path $fixture 'htdocs/mimageviewer/manual/ignored.html')
 [void] (Invoke-MivGit $fixture @('add', '--', 'src/foo.rs'))
 $indexBefore = (Get-FileHash -LiteralPath $index).Hash
 $unicodeName = 'src/' + [char]0x8A66 + [char]0x9A13 + '.rs'
@@ -446,6 +455,8 @@ $integration = Run-Script 'test-focused.ps1' @('-Path', 'tests/sample.rs')
 Assert-That ($integration.ExitCode -eq 0 -and $integration.StdOut.Contains('--test sample') -and $integration.StdOut.Contains('PASS: 1 tests')) 'integration target selection failed'
 $crate = Run-Script 'test-focused.ps1' @('-Path', 'helper/src/lib.rs')
 Assert-That ($crate.ExitCode -eq 0 -and $crate.StdOut.Contains('-p miv-test-helper') -and $crate.StdOut.Contains('PASS: 1 tests')) "workspace crate selection failed: $($crate.StdOut)"
+$manualPlan = Get-MivFocusedPlan $fixture @('htdocs/mimageviewer/manual/index.html', 'htdocs/mimageviewer/manual/sound/index.html')
+Assert-That ($manualPlan.BroadPaths.Count -eq 0 -and $manualPlan.Entries.Count -eq 1 -and ($manualPlan.Entries[0].Selection -join ' ') -eq '-p mimageviewer-mcp' -and $manualPlan.Entries[0].Filter -eq 'all()') 'bundled manual did not select MCP tests'
 $zero = Run-Script 'test-focused.ps1' @('-Path', 'src/missing_module.rs')
 Assert-That ($zero.ExitCode -eq 4) "zero-match did not return nextest exit 4: $($zero.StdOut) $($zero.StdErr)"
 $broad = Run-Script 'test-focused.ps1' @('-Path', 'src/app/tests.rs')
