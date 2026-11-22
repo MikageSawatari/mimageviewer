@@ -289,3 +289,29 @@ mod tests {
         assert!(u128::from(created) <= now);
     }
 }
+
+#[cfg(test)]
+mod frame_diag_scope_tests {
+    use egui_wgpu::frame_diag::*;
+    use std::time::Instant;
+
+    // §1.827 instrumentation: the ROOT scope closes on every exit (Sol design review round 2 P2-5).
+    #[test]
+    fn unfinished_root_scope_closes_and_discards_its_paint() {
+        let scope = begin_root_pass(Instant::now());
+        assert!(root_pass_active());
+        record_root_paint(PaintStages {
+            meshes: 1,
+            ..Default::default()
+        });
+        drop(scope); // logic-only pass or early return
+        assert!(!root_pass_active());
+        // Outside a scope the painter does not record, and nothing leaks into the next one.
+        record_root_paint(PaintStages::default());
+        let scope = begin_root_pass(Instant::now());
+        scope.finish(RootPass::default());
+        let pass = take_root_pass().unwrap();
+        assert!(pass.paint.is_none());
+        assert!(!root_pass_active());
+    }
+}

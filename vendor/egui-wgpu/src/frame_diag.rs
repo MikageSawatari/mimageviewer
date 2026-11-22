@@ -102,7 +102,8 @@ pub fn root_pass_active() -> bool {
     ROOT_ACTIVE.load(Ordering::Relaxed)
 }
 
-fn record_root_paint(stages: PaintStages) {
+/// Used by the painter (and the app's tests); ignored outside a recorded ROOT operation.
+pub fn record_root_paint(stages: PaintStages) {
     if root_pass_active() {
         *PAINT.lock().unwrap() = Some(stages);
     }
@@ -170,26 +171,3 @@ impl Drop for PaintClock {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unfinished_root_scope_closes_and_discards_its_paint() {
-        let scope = begin_root_pass(Instant::now());
-        assert!(root_pass_active());
-        record_root_paint(PaintStages {
-            meshes: 1,
-            ..Default::default()
-        });
-        drop(scope); // logic-only pass or early return
-        assert!(!root_pass_active());
-        // Outside a scope the painter does not record, and nothing leaks into the next one.
-        record_root_paint(PaintStages::default());
-        let scope = begin_root_pass(Instant::now());
-        scope.finish(RootPass::default());
-        let pass = take_root_pass().unwrap();
-        assert!(pass.paint.is_none());
-        assert!(!root_pass_active());
-    }
-}
