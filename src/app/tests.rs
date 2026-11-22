@@ -87956,10 +87956,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_viewport_recreate_after_hide = true;
         set_detached_host_for_test(&mut app, 42, 0x1234, true);
         app.begin_active_detached_session(42, DetachedSource::Image);
+        let close_lease = App::detached_session_lease(42);
+        let close_owner = app
+            .capture_detached_close_owner(close_lease, ViewerCloseCause::User)
+            .unwrap();
 
         app.finalize_closed_active_detached_viewport(
             &ctx,
             App::detached_image_window_viewport_id(42),
+            close_owner,
         );
 
         assert!(
@@ -110719,19 +110724,29 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
         !body.contains("self.active_viewer_context_id()"),
         "terminal owner must not retarget the supplied id"
     );
+    let compact = body
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .replace(",)", ")");
+    assert!(compact.contains("self.viewer_context_window(id)"));
+    assert!(compact.contains("Self::detached_session_lease(window_id),cause)"));
+    assert!(
+        compact.contains("self.close_and_retire_context_with_close_owner(id,reason,close_owner,")
+    );
     let body = body.as_str();
     let transfer = body
         .find("self.transfer_terminal_close_return(id, cause);")
         .expect("teardown前の帰還移譲がない");
     let retire = body
-        .find("self.close_and_retire_context(")
+        .find("self.close_and_retire_context_with_close_owner(")
         .expect("typed cause ownerがretire seamを通っていない");
     assert!(
         transfer < retire,
         "帰還の所有値はviewer teardownより前に移譲する"
     );
     let terminal_closure = body
-        .split_once("self.close_and_retire_context(")
+        .split_once("self.close_and_retire_context_with_close_owner(")
         .expect("共有 seam が close-and-retire owner を通っていない")
         .1
         .split_once("|app| {")
@@ -110762,7 +110777,9 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
     }
 
     // 残余 context の回収も同じ terminal close seam を通る。
-    let production_seams = src.matches("close_and_retire_context(").count();
+    let production_seams = src
+        .matches("close_and_retire_context_with_close_owner(")
+        .count();
     assert_eq!(
         production_seams, 2,
         "close_and_retire_context の呼び出しが {production_seams} 箇所ある。 増えた側も terminal effects を完遂しているか確認し、この検査を更新すること"
@@ -116049,6 +116066,9 @@ mod ring_saved_group_fullscreen_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_mounted_detached_session_for_test(173301, DetachedSource::Image);
+        let close_owner = app
+            .projected_detached_close_owner(ViewerCloseCause::User)
+            .unwrap();
         let source = app
             .smart_folder_source_lease()
             .expect("linked F12 retains main source");
@@ -116070,6 +116090,7 @@ mod ring_saved_group_fullscreen_tests {
         app.finalize_closed_active_detached_viewport(
             &ctx,
             App::detached_image_window_viewport_id(173301),
+            close_owner,
         );
         assert!(app.active_detached_session.is_none());
         assert_eq!(app.detached_viewer_window_id(), None);

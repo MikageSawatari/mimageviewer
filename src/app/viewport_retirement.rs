@@ -64,12 +64,16 @@ impl App {
         if self.active_detached_context_is_at_rest() {
             return Some(self.close_current_active_viewer_context(ctx));
         }
+        let close_owner = self.capture_detached_close_owner(
+            Self::detached_session_lease(window_id),
+            super::ViewerCloseCause::User,
+        );
         self.transfer_terminal_close_return(
             self.projected_viewer_context_id(),
             super::ViewerCloseCause::User,
         );
         self.begin_active_detached_session_close(reason);
-        self.finish_active_detached_session_close(reason);
+        self.finish_active_detached_session_close_owned(close_owner, reason);
         if let Err(error) = self.close_fullscreen_to_completion(ctx) {
             crate::logger::log(format!(
                 "detached_close_terminal_failed window_id={window_id} error={error:?}"

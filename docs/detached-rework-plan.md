@@ -1493,6 +1493,13 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 段階2の追加修正では、カーソルを明示要求に保ちつつ履歴スクロールと操作結果のチェック付与を復元する（[実装計画の追加記録](browser-to-miv-impl-plan.md)）。既存の復元 owner の効果を分ける変更で、sync を抑止する分岐、App の追加フラグ、HWND／placement の変更はない。activation 受付から連動窓の sync・close までを一本で通すテストを追加し、元の characterization の各不一致点で要求画像が維持されることを assert する。今回のビルド・テストは引き継ぎ待ち。
 
+**段階3の実装引き継ぎ (2026-11-22、検証・独立レビュー待ち)**
+
+- 合意した構造のまま、用途を runtime の生成時だけ設定し、終了前の window lease・用途・型付き理由を `DetachedCloseOwner` に捕捉する。active の入力・描画前と passive の一括終了前の値を teardown／finalizer に運び、削除後の runtime の有無から方針を推測しない。
+- §2-1・2: HWND 同定・geometry・再生成条件は変更しない。§2-3: App の detached field は増やさず、用途は runtime、終了はローカルな所有値に置く。§2-4: 保存は既存 runtime 除去の一か所に保ち、BrowserView だけを除く。§2-5: lease と型付き理由で決め、時間窓を追加しない。
+- §2-6・7: 新しい症状に対する補修は行わない。native 動画の F12 の理由も型で運ぶため、計画の範囲表以外では既存 transition effect と native 消費側だけを更新した。順序や待ちは不変。§2-8: 既存テストを維持し、Normal／BrowserView の表・早期除去・passive・F11・F12・sibling の回帰テストを追加した。
+- F12 の拒否は共通入口で切替対象 lease の用途から行い、メニューも同じ判定を使う。位置保存と focus の所有境界の変更であり、症状パッチではない。Normal の保存・既存の idle focus・F11・F12 は維持する。実行結果と独立レビューの合意は未取得で、設計担当へ引き継ぐ。
+
 ### 2026-11-21: 絞り込みの変更で一覧を読み直さない・AI の絞り込みを一覧全体の取得の証明へ (§1.835、実装済み・自動検証済み・実機未確認)
 
 **変更の内容**

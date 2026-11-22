@@ -569,6 +569,8 @@ mod archive_inner_book_s3;
 pub(crate) mod book_resume_meter;
 #[cfg(test)]
 mod book_resume_meter_tests;
+#[cfg(all(test, windows))]
+mod browser818_close_tests;
 mod cache_ops;
 mod color_filter;
 mod content_identity_detection;
@@ -578,11 +580,15 @@ mod detached_activation;
 #[cfg(windows)]
 pub(crate) mod detached_activation_gesture;
 #[cfg(windows)]
+mod detached_close;
+#[cfg(windows)]
 mod detached_page_overview;
 #[cfg(windows)]
 mod detached_placement;
 #[cfg(windows)]
 mod detached_window_manager;
+#[cfg(windows)]
+pub(crate) use detached_close::{DetachedCloseFocus, DetachedCloseOwner};
 mod epub_saved_metadata;
 #[cfg(windows)]
 pub(crate) use detached_activation::{
@@ -3551,13 +3557,26 @@ impl App {
         window_id: u64,
         reason: &'static str,
     ) -> Option<DetachedWindowRuntime> {
-        self.remove_detached_window_runtime_inner(window_id, reason)
+        let owner = self.capture_detached_close_owner(
+            Self::detached_session_lease(window_id),
+            ViewerCloseCause::Replaced,
+        );
+        self.remove_detached_window_runtime_inner(window_id, reason, owner)
+    }
+
+    pub(crate) fn remove_detached_window_runtime_owned(
+        &mut self,
+        owner: DetachedCloseOwner,
+        reason: &'static str,
+    ) -> Option<DetachedWindowRuntime> {
+        self.remove_detached_window_runtime_inner(owner.lease.window_id, reason, Some(owner))
     }
 
     fn remove_detached_window_runtime_inner(
         &mut self,
         window_id: u64,
         reason: &'static str,
+        owner: Option<DetachedCloseOwner>,
     ) -> Option<DetachedWindowRuntime> {
         let _ = self.capture_detached_window_placement_at_decision(window_id, reason);
         self.detached_window_manager
@@ -3567,9 +3586,10 @@ impl App {
         self.cancel_detached_right_drag_owner(window_id, reason);
         let runtime = self.detached_window_manager.remove(window_id);
         if let Some(runtime) = runtime.as_ref() {
-            if let Some(placement) = runtime
-                .placement
-                .filter(|placement| Self::detached_window_runtime_placement_is_usable(*placement))
+            if owner.is_some_and(|owner| owner.policy().save_placement)
+                && let Some(placement) = runtime.placement.filter(|placement| {
+                    Self::detached_window_runtime_placement_is_usable(*placement)
+                })
             {
                 self.settings.detached_viewer_window_physical_placement = Some(placement);
                 self.log_detached_image_window_debug(format!(
@@ -3650,6 +3670,33 @@ impl App {
         window_id: u64,
         reason: &'static str,
     ) {
+        let owner = self.capture_detached_close_owner(
+            Self::detached_session_lease(window_id),
+            ViewerCloseCause::Replaced,
+        );
+        self.retire_terminal_detached_viewport_identity_inner(window_id, reason, owner);
+    }
+
+    #[cfg(windows)]
+    fn retire_terminal_detached_viewport_identity_owned(
+        &mut self,
+        owner: DetachedCloseOwner,
+        reason: &'static str,
+    ) {
+        self.retire_terminal_detached_viewport_identity_inner(
+            owner.lease.window_id,
+            reason,
+            Some(owner),
+        );
+    }
+
+    #[cfg(windows)]
+    fn retire_terminal_detached_viewport_identity_inner(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+        owner: Option<DetachedCloseOwner>,
+    ) {
         self.detached_window_manager
             .transfer_viewport_retirement(window_id);
         if self.detached_window_state(window_id).is_some()
@@ -3675,7 +3722,11 @@ impl App {
             self.detached_viewer_recreate_on_next_render = false;
         }
 
-        self.remove_detached_window_runtime(window_id, reason);
+        if let Some(owner) = owner {
+            self.remove_detached_window_runtime_owned(owner, reason);
+        } else {
+            self.remove_detached_window_runtime(window_id, reason);
+        }
     }
 }
 
@@ -65578,6 +65629,28 @@ impl App {
     #[cfg(windows)]
     #[track_caller]
     pub(crate) fn finish_active_detached_session_close(&mut self, reason: &'static str) {
+        let owner = self.active_detached_session.and_then(|session| {
+            self.capture_detached_close_owner(
+                Self::detached_session_lease(session.window_id),
+                ViewerCloseCause::Replaced,
+            )
+        });
+        self.finish_active_detached_session_close_owned(owner, reason);
+    }
+
+    #[cfg(windows)]
+    #[track_caller]
+    pub(crate) fn finish_active_detached_session_close_owned(
+        &mut self,
+        owner: Option<DetachedCloseOwner>,
+        reason: &'static str,
+    ) {
+        if owner.is_some_and(|owner| {
+            self.active_detached_session
+                .is_some_and(|session| session.window_id != owner.lease.window_id)
+        }) {
+            return;
+        }
         let previous = self.active_detached_session;
         // Retire output while the session and binding still identify its owner. The
         // mounted context may be a sibling of the active at-rest context being closed.
@@ -65586,7 +65659,11 @@ impl App {
                 "session_finish window_id={} reason={reason}",
                 session.window_id
             ));
-            self.retire_terminal_detached_viewport_identity(session.window_id, reason);
+            if let Some(owner) = owner {
+                self.retire_terminal_detached_viewport_identity_owned(owner, reason);
+            } else {
+                self.retire_terminal_detached_viewport_identity(session.window_id, reason);
+            }
             "clear"
         } else {
             "clear_none"
@@ -65621,14 +65698,31 @@ impl App {
         lease: DetachedSessionLease,
         reason: &'static str,
     ) -> bool {
+        self.close_active_detached_session_exact_with_cause(
+            lease,
+            reason,
+            ViewerCloseCause::Replaced,
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn close_active_detached_session_exact_with_cause(
+        &mut self,
+        lease: DetachedSessionLease,
+        reason: &'static str,
+        cause: ViewerCloseCause,
+    ) -> bool {
         if self
             .active_detached_session
             .is_none_or(|session| session.window_id != lease.window_id)
         {
             return false;
         }
-        self.begin_active_detached_session_close(reason);
-        self.finish_active_detached_session_close(reason);
+        let owner = self.capture_detached_close_owner(lease, cause);
+        if let Some(owner) = owner {
+            self.begin_detached_close_owner(owner, reason);
+        }
+        self.finish_active_detached_session_close_owned(owner, reason);
         true
     }
 
@@ -66064,15 +66158,21 @@ impl App {
         cause: ViewerCloseCause,
     ) -> Option<ClosedBookmarkSummary> {
         let summary_before = self.with_viewer_context_ref(id, ClosedBookmarkSummary::read)?;
+        let close_owner = self.viewer_context_window(id).and_then(|window_id| {
+            self.capture_detached_close_owner(Self::detached_session_lease(window_id), cause)
+        });
         self.transfer_terminal_close_return(id, cause);
 
         // book context の明示 close = detached セッション終了 (§3.7 closing)。desired set から
         // 外す前に closing を立て、teardown 後に finish して backstop が窓を復活させない。
-        self.begin_active_detached_session_close(reason);
+        if let Some(owner) = close_owner {
+            self.begin_detached_close_owner(owner, reason);
+        }
         let mut terminal_failed = false;
-        let result = self.close_and_retire_context(
+        let result = self.close_and_retire_context_with_close_owner(
             id,
             reason,
+            close_owner,
             |app| {
                 // この closure を抜けた直後に context は retire される。遷移中に
                 // `close_fullscreen` を呼ぶと `TerminalClose` を出して戻るだけなので、
@@ -66090,7 +66190,9 @@ impl App {
             },
             |context| ClosedBookmarkSummary::read(context.as_ref()),
         );
-        self.finish_active_detached_session_close(reason);
+        if let Some(owner) = close_owner {
+            self.finish_active_detached_session_close_owned(Some(owner), reason);
+        }
         if terminal_failed {
             crate::logger::log(format!(
                 "active_viewer_context_terminal_close_failed id={id:?} reason={reason}"
@@ -66154,6 +66256,14 @@ impl App {
         ctx: &egui::Context,
         cause: ViewerCloseCause,
     ) -> Result<bool, LocalViewerCloseFailure> {
+        let close_owners = self
+            .detached_window_manager
+            .ids()
+            .into_iter()
+            .filter_map(|id| {
+                self.capture_detached_close_owner(Self::detached_session_lease(id), cause)
+            })
+            .collect::<Vec<_>>();
         self.retire_close_return_owners(cause);
         self.close_local_composition_editor(CompositionEditorCloseReason::OwnerClosed);
         let had_detached = self.fullscreen_viewport_binding.is_some()
@@ -66227,7 +66337,14 @@ impl App {
                 self.clear_detached_window_hwnd_for_window_id(window_id);
             }
             self.begin_active_detached_session_close("mode_change_close_all_active");
-            self.finish_active_detached_session_close("mode_change_close_all_active");
+            let owner = active_window_id
+                .and_then(|id| {
+                    close_owners
+                        .iter()
+                        .find(|owner| owner.lease.window_id == id)
+                })
+                .copied();
+            self.finish_active_detached_session_close_owned(owner, "mode_change_close_all_active");
             // Viewport flags are App-global and can still describe the detached
             // context retired above. End only the projected reader, including its
             // index-less waits; do not cancel main's unrelated list-only request.
@@ -66251,10 +66368,11 @@ impl App {
             );
             self.clear_detached_window_hwnd_for_window_id(*id);
         }
-        if let Err(error) = self.teardown_paused_media_bundles_with_cause(
+        if let Err(error) = self.teardown_paused_media_bundles_with_close_owners(
             &passive_ids,
             "mode_change_close_all_passive",
             cause,
+            &close_owners,
         ) {
             close_failure.get_or_insert(error);
         }
@@ -66263,9 +66381,18 @@ impl App {
         // every local viewer owner.
         for id in self.other_viewer_context_ids() {
             let mut terminal_failed = false;
-            let result = self.close_and_retire_context(
+            let owner = self
+                .viewer_context_window(id)
+                .and_then(|window_id| {
+                    close_owners
+                        .iter()
+                        .find(|owner| owner.lease.window_id == window_id)
+                })
+                .copied();
+            let result = self.close_and_retire_context_with_close_owner(
                 id,
                 "mode_change_close_all_remaining_context",
+                owner,
                 |app| {
                     terminal_failed = app.close_fullscreen_to_completion(ctx).is_err();
                 },
@@ -66294,7 +66421,15 @@ impl App {
                     "mode_change_close_all_runtime",
                 );
             }
-            self.remove_detached_window_runtime(id, "mode_change_close_all_runtime");
+            if let Some(owner) = close_owners
+                .iter()
+                .find(|owner| owner.lease.window_id == id)
+                .copied()
+            {
+                self.remove_detached_window_runtime_owned(owner, "mode_change_close_all_runtime");
+            } else {
+                self.remove_detached_window_runtime(id, "mode_change_close_all_runtime");
+            }
         }
 
         let previous_session = self.active_detached_session;
@@ -66328,7 +66463,16 @@ impl App {
         self.detached_viewer_recreate_on_next_render = false;
         self.clear_detached_viewer_host_hwnd();
         self.clear_detached_viewer_borderless_fullscreen_state("mode_change_close_all");
-        self.focus_main_after_detached_window_close_if_idle(ctx, "mode_change_close_all");
+        if close_owners.is_empty() {
+            // Legacy output without a runtime has no per-window purpose to change
+            // the existing bulk-close focus path.
+            self.focus_main_after_detached_window_close_if_idle(ctx, "mode_change_close_all");
+        } else if let Some(owner) = close_owners
+            .iter()
+            .find(|owner| owner.policy().main_focus == DetachedCloseFocus::Existing)
+        {
+            self.focus_main_after_detached_close_if_idle(ctx, *owner, "mode_change_close_all");
+        }
         ctx.request_repaint();
         self.log_detached_image_window_debug(format!(
             "mode_change_close_all end active_context={} session={:?} fs_idx={:?} \
@@ -67044,6 +67188,23 @@ impl App {
         reason: &'static str,
         cause: ViewerCloseCause,
     ) -> Result<(), LocalViewerCloseFailure> {
+        let owners = window_ids
+            .iter()
+            .filter_map(|id| {
+                self.capture_detached_close_owner(Self::detached_session_lease(*id), cause)
+            })
+            .collect::<Vec<_>>();
+        self.teardown_paused_media_bundles_with_close_owners(window_ids, reason, cause, &owners)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn teardown_paused_media_bundles_with_close_owners(
+        &mut self,
+        window_ids: &[u64],
+        reason: &'static str,
+        cause: ViewerCloseCause,
+        owners: &[DetachedCloseOwner],
+    ) -> Result<(), LocalViewerCloseFailure> {
         for &window_id in window_ids {
             if let Some((id, _)) = self.locate_window_context(window_id) {
                 self.transfer_terminal_close_return(id, cause);
@@ -67077,7 +67238,11 @@ impl App {
             let Some((id, _)) = self.locate_window_context(window_id) else {
                 continue;
             };
-            match self.retire_context(id, reason, |mut context| {
+            let close_owner = owners
+                .iter()
+                .find(|owner| owner.lease.window_id == window_id)
+                .copied();
+            match self.retire_context_with_close_owner(id, reason, close_owner, |mut context| {
                 let plan =
                     viewer_context_media_teardown_plan(id, context.as_ref(), clear_generation);
                 context.clear_normalize_state();
@@ -67965,6 +68130,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         viewport_id: egui::ViewportId,
+        owner: DetachedCloseOwner,
     ) {
         self.log_detached_image_window_debug(format!(
             "active_close_finalize begin viewport={viewport_id:?} fs_idx={:?} shown={} \
@@ -67976,28 +68142,19 @@ impl App {
             self.detached_viewer_host_debug_state()
         ));
         crate::dwm_transitions::disable_transitions_for_thread_windows();
-        let closing_window_id = self
-            .active_detached_session
-            .map(|session| session.window_id)
-            .or(self.detached_viewer_window_id());
         // active detached viewport の teardown 完了 = セッション終了 (§3.7 finish)。
         // terminal close が明示的に宣言され、session が finish 済みまたは Closing のとき
         // だけ呼ばれる。internal reopen (folder-nav / PDF・ZIP 列挙 / scan / password) 中は
         // detached_active_window_alive_wanted() が true なので呼ばれず、session を維持する。
-        if self.active_detached_session.is_some() {
-            self.finish_active_detached_session_close("active_close_finalize");
-        } else if let Some(window_id) = closing_window_id {
-            self.retire_terminal_detached_viewport_identity(
-                window_id,
-                "active_close_finalize_legacy",
-            );
+        if self
+            .active_detached_session
+            .is_some_and(|session| session.window_id == owner.lease.window_id)
+        {
+            self.finish_active_detached_session_close_owned(Some(owner), "active_close_finalize");
         } else {
-            self.fs_viewport_shown = false;
-            self.fs_viewport_presentation = None;
-            self.fs_viewport_recreate_after_hide = false;
-            self.detached_viewer_recreate_on_next_render = false;
+            self.retire_terminal_detached_viewport_identity_owned(owner, "active_close_finalize");
         }
-        self.focus_main_after_detached_window_close_if_idle(ctx, "active_close_finalize");
+        self.focus_main_after_detached_close_if_idle(ctx, owner, "active_close_finalize");
         self.log_detached_image_window_debug(format!(
             "active_close_finalize end viewport={viewport_id:?} shown={} presentation={:?} \
              recreate_after_hide={} host={}",
@@ -69762,6 +69919,7 @@ impl App {
                 let close_viewport_id = (app.fs_viewport_shown
                     && app.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow))
                 .then(|| app.fullscreen_viewport_id());
+                let close_owner = app.projected_detached_close_owner(ViewerCloseCause::User);
                 app.poll_retained_shift_readoption(ctx);
                 app.service_final_prepare_before_lookup(ctx);
                 // 前面の viewer への入力は、この context の polling / 描画より前に配る。
@@ -69900,8 +70058,9 @@ impl App {
                 let detached_viewport_finalized = if app.fullscreen_idx.is_none()
                     && !app.detached_active_window_alive_wanted()
                     && let Some(viewport_id) = close_viewport_id
+                    && let Some(owner) = close_owner
                 {
-                    app.finalize_closed_active_detached_viewport(ctx, viewport_id);
+                    app.finalize_closed_active_detached_viewport(ctx, viewport_id, owner);
                     true
                 } else {
                     false
@@ -71308,6 +71467,13 @@ impl App {
     }
 
     pub(crate) fn detached_toggle_row_state(&self) -> DetachedToggleRowState {
+        #[cfg(windows)]
+        if self.browser_view_blocks_detached_toggle() {
+            return DetachedToggleRowState {
+                on: self.settings.detached_viewer_enabled,
+                disabled_reason: Some(detached_close::BROWSER_VIEW_TOGGLE_DISABLED_REASON),
+            };
+        }
         #[cfg(windows)]
         match self.detached_toggle_route() {
             DetachedToggleRoute::DisabledByAlwaysNewImages => {
@@ -83419,6 +83585,8 @@ impl App {
         if self.viewer_mutation_modal_active() {
             return;
         }
+        #[cfg(windows)]
+        let close_owner = self.projected_detached_close_owner(ViewerCloseCause::User);
         self.finish_fullscreen_navigation_for_true_close();
         if self.projected_viewer_context_id() == self.viewer_context_main() {
             // One accepted close owns one frozen destination. Later refreshes
@@ -83459,8 +83627,13 @@ impl App {
         // 内部 close とは別経路なので、ここでは確実に session を畳んでよい。
         #[cfg(windows)]
         {
-            self.begin_active_detached_session_close("handle_fullscreen_close_request");
-            self.finish_active_detached_session_close("handle_fullscreen_close_request");
+            if let Some(owner) = close_owner {
+                self.begin_detached_close_owner(owner, "handle_fullscreen_close_request");
+            }
+            self.finish_active_detached_session_close_owned(
+                close_owner,
+                "handle_fullscreen_close_request",
+            );
         }
         self.close_fullscreen();
     }
@@ -94426,6 +94599,7 @@ impl App {
             );
             return None;
         }
+        let close_owner = self.projected_detached_close_owner(ViewerCloseCause::DetachedToggle);
         if self.viewer_presentation != target_presentation {
             self.fs_front_pointer = Default::default();
         }
@@ -94464,8 +94638,10 @@ impl App {
                 reason,
             );
         } else {
-            self.begin_active_detached_session_close(reason);
-            self.finish_active_detached_session_close(reason);
+            if let Some(owner) = close_owner {
+                self.begin_detached_close_owner(owner, reason);
+                self.finish_detached_close_owner(owner, reason);
+            }
         }
         self.log_detached_image_window_debug(format!(
             "apply_egui_viewer_presentation idx={idx:?} target={target_presentation:?} \
@@ -94508,6 +94684,11 @@ impl App {
     }
 
     pub(crate) fn toggle_detached_viewer_mode(&mut self) {
+        #[cfg(windows)]
+        if self.browser_view_blocks_detached_toggle() {
+            self.show_feedback_warning(self.browser_view_detached_toggle_warning());
+            return;
+        }
         if self.remote_session_blocks_local_control() {
             crate::logger::log(
                 "remote_ipc: rejected detached presentation open outside Local phase",

@@ -341,6 +341,15 @@ active renderer 内で早期 teardown が起きる経路も、`render_fullscreen
 
 新しい BrowserView がなくても、Normal の終了・F11・F12 が従来どおりで、方針が用途と終了理由だけから決まること。
 
+**段階3の実装記録 (2026-11-22、ビルド・テスト・独立レビューは引き継ぎ待ち)**
+
+- 用途は `DetachedWindowRuntime` の private field と生成専用 API に置いた。既存の暗黙生成は `Normal`。既存 runtime の park・resume・host 再登録・F11 は用途を変更しない。`BrowserView` の製品側 producer はまだ追加していない。
+- `app/detached_close.rs` の `DetachedCloseOwner` が window lease・用途・`ViewerCloseCause` を保持し、同じ場所の純粋な表で保存・focus の方針を決める。Esc／OS close／context close／passive 一括終了／設定・Remote・終了の一括 close で、削除前に窓ごとの値を捕捉する。active renderer も入力・描画前の値を finalizer に渡す。finalizer は削除後の runtime から用途を推定しない。
+- 位置保存は既存の runtime 除去の一か所だけで方針を適用する。focus は既存の idle 判定の直前で方針を適用する。設定変更・Remote・終了の一括 close にも既存の focus 経路があり、`BrowserView` でもそれを維持する。ブラウザ窓への置換では両用途とも focus を送らない。
+- F12 は共通入口とメニューで同じ対象 lease の判定を使う。警告のキー名は実効 `ToggleDetachedViewerMode` から得る。native 動画の F12 にも型付き理由を運ぶため、範囲表に加えて `presentation_transition.rs` の既存 `CloseDetachedSession` effect と `native_video.rs` の消費側を更新した。effect の順序・待ち・host 操作は変更しない。
+- `browser818_close_tests.rs` の 10 テストと、transition reducer の `browser818_close_policy_native_retirement_carries_typed_f12_reason` を追加した。GPU を生成しない CPU／egui／fake host のテスト。既存のテストは削除・弱化せず、finalizer の引数と close seam の source 検査を新しい所有値に対応させた。filter は `browser818_close_policy|browser818_toggle`。`Normal` の保存・focus・F11 往復・F12 往復も同じテストで検査する。
+- App の detached 用 field・時間窓・placement の保存先・永続設定の変更はない。cargo は最後の `cargo fmt` 以外実行せず、コンパイル・テスト・UI glyph 検査は設計担当へ引き継ぐ。
+
 ### 段階4：BrowserOverlay の表示先・seed・前面化
 
 **範囲**
