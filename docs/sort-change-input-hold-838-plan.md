@@ -133,6 +133,10 @@
 - 独立設計レビュー (gpt-6.1-sol / xhigh、read-only、同じセッションで 3 回、2026-11-22)。
   - r1: REVISE (P2 3 件・P3 1 件)。r2: REVISE (P2 1 件、アイテム評価の確定経路)。**r3: VERDICT: ACCEPT / STRUCTURAL: AGREE。**
   - レビュー担当の言葉 (r1): 「purpose由来のゲートは症状パッチではありません。実際の要求寿命を入力許可へ接続する修正で、新しい待機状態や競合吸収用の時間窓を増やしません。」
+- 独立実装レビュー (gpt-6.1-sol / xhigh、read-only、設計レビューと同じセッションで 2 回、2026-11-22)。
+  - r1 (`61a224e47`): REVISE / STRUCTURAL: AGREE。P2 1 件: 並べ替えの待ちが直接移動に置き換わると、開いたままの Grid ピッカーから旧一覧へアイテム評価を書ける (判定が `view_order_refresh_scan_pending()` だけだった)。
+  - `c05bef37b` で、Grid のピッカーのアイテム評価を共有ゲート (`grid_item_input_allowed()`) で判定するよう直した。直接移動への置き換え後の 4 本を足した。
+  - **r2 (`c05bef37b`): VERDICT: ACCEPT / STRUCTURAL: AGREE。** レビュー担当の言葉: 「構造的修正への合意を維持します。」 追加 4 本が修正前に赤になることは、コードから判断したもので、実行では確かめていない。
 - detached の述語・viewport の経路には触れない (`main_folder_history_available()` を条件にする。r1 のレビューで確認)。そのため `docs/detached-rework-plan.md` §11 への記録の対象にしない。
 
 ## 8. 実行結果の記録
@@ -167,3 +171,8 @@
 - 項目の右クリックメニューは既存の所有判定で閉じるため、追加の処理は不要。Immediate・sidecar restore・detached の述語 / viewport・pending の採用 / 置き換え / 終了処理は変更していない。
 - 段階 1 の 28 本の本文・assert は変更していない。新 API の許可判定を全 variant で検査する `sort_hold_838_only_order_refresh_allows_item_independent_controls` を追加し、既存の `direct_navigation_worker_block_reason_keeps_non_item_shortcuts_available` の対象へ新しい variant を追加した。段階 3 へ回したテストは無い。
 - `cargo fmt` (引数なし) と `python scripts/check_ui_glyphs.py` は成功 (危険なグリフ 0 件)。利用者の指示に従い、ビルド・テスト・型検証と検証バイナリの作成は実行していない。元の 28 本と追加分は緑の見込みで、実行結果は未取得。
+- 実行結果 (設計担当が共有の実行口で実行、2026-11-22)。
+  - `61a224e47`: 関連 filter (`sort_hold_838_|direct_navigation|ring_picker|gamepad|stack_refresh|wait_overlay|location_navigation|sidecar_restore|context_menu|current_view_order|item_rating|picker`) の 581 本が緑。
+  - `c05bef37b` (レビュー P2 対応): 同じ filter の 585 本が緑 (`sort_hold_838_` は 33 本)。
+  - 本体 lib の全件は、ブランチでは流していない (テストの段階分けの方針。共有の土台は変えていない)。
+- 実機は未確認。サブ PC での確認は §1.835 とまとめて依頼する (統括が順番を決める)。
