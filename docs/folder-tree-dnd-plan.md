@@ -112,7 +112,9 @@ Shift の明示の移動は下げない。要求は `operation` と `default_mov
 - mIV の target は `IDropTargetHelper` (`CLSID_DragDropHelper`) の DragEnter/Over/Leave/Drop を呼ぶ (自分の窓の上に drag image を描かせる)。
 - ツリー行の上では data object へ `CFSTR_DROPDESCRIPTION` を `SetData` する: 予想が移動なら `DROPIMAGE_MOVE` + 「%1 へ移動」、
   コピーなら `DROPIMAGE_COPY` + 「%1 へコピー」、受け付けないなら `DROPIMAGE_NONE`。%1 はフォルダ名。変わったときだけ書く。
-  行を離れたら・DragLeave・Drop の後は `DROPIMAGE_INVALID` に戻す (古い説明を残さない)。
+  行を離れて落とせない場所 (一覧の空白・ツリーの行以外・同じ一覧など) へ動いたら `DROPIMAGE_NONE` (§1.844。`INVALID` では
+  Shell の既定の「＋ コピー」が出ることを §1.836 のサブ PC 確認で観測)。`DROPIMAGE_INVALID` は、受け付ける外部からの一覧への
+  ドロップと、DragLeave・Drop の後のリセット (古い説明を残さない) だけに使う。正本の詳細は file-drag-drop-design §12.3.1。
 - 送出側は何も足さない (`IDragSourceHelper2::SetFlags` は helper 自身の設定で data object と結び付かないため使わない。§14)。
   Shell の generic image のまま、target が書く説明のバッジ (type) で移動かコピーかを示す。テキストが出るかは実機確認で見る。
 
