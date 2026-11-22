@@ -4154,6 +4154,55 @@ impl FullscreenWheelAction {
     }
 }
 
+/// 静止画のホイールズームで用いる、1 段ごとの倍率の刻み。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FullscreenWheelZoomStep {
+    #[default]
+    Standard,
+    Percent5,
+    Percent10,
+    Percent20,
+    Percent30,
+    Percent50,
+    Percent100,
+    #[serde(other)]
+    Unknown,
+}
+
+impl FullscreenWheelZoomStep {
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Standard,
+            Self::Percent5,
+            Self::Percent10,
+            Self::Percent20,
+            Self::Percent30,
+            Self::Percent50,
+            Self::Percent100,
+        ]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self.normalized() {
+            Self::Standard => "標準（約 14%）",
+            Self::Percent5 => "5%",
+            Self::Percent10 => "10%",
+            Self::Percent20 => "20%",
+            Self::Percent30 => "30%",
+            Self::Percent50 => "50%",
+            Self::Percent100 => "100%（2 倍）",
+            Self::Unknown => unreachable!(),
+        }
+    }
+
+    pub fn normalized(self) -> Self {
+        match self {
+            Self::Unknown => Self::Standard,
+            value => value,
+        }
+    }
+}
+
 /// ページ内を指定の順で読む操作の優先軸。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum FullscreenNScrollOrder {
@@ -5910,6 +5959,9 @@ pub struct Settings {
     /// ページ単位の静止画表示で通常ホイールが行う操作。
     #[serde(default)]
     pub fullscreen_wheel_action: FullscreenWheelAction,
+    /// 静止画をホイールで拡大・縮小するときの倍率の刻み。
+    #[serde(default)]
+    pub fullscreen_wheel_zoom_step: FullscreenWheelZoomStep,
     /// ページ内の次へ / 前へスクロールで用いる順序。
     #[serde(default)]
     pub fullscreen_n_scroll_order: FullscreenNScrollOrder,
@@ -8448,6 +8500,7 @@ impl Default for Settings {
             fullscreen_horizontal_cursor_direction: FullscreenHorizontalCursorDirection::default(),
             fullscreen_up_down_key_action: FullscreenUpDownKeyAction::default(),
             fullscreen_wheel_action: FullscreenWheelAction::default(),
+            fullscreen_wheel_zoom_step: FullscreenWheelZoomStep::default(),
             fullscreen_n_scroll_order: FullscreenNScrollOrder::default(),
             fullscreen_n_scroll_step_percent: default_fullscreen_n_scroll_step_percent(),
             fullscreen_n_scroll_wrap_step_percent: None,
@@ -10890,6 +10943,7 @@ impl Settings {
             self.slideshow_continuous_scroll_percent.clamp(1, 100);
         self.fullscreen_up_down_key_action = self.fullscreen_up_down_key_action.normalized();
         self.fullscreen_wheel_action = self.fullscreen_wheel_action.normalized();
+        self.fullscreen_wheel_zoom_step = self.fullscreen_wheel_zoom_step.normalized();
         self.fullscreen_n_scroll_order = self.fullscreen_n_scroll_order.normalized();
         self.fullscreen_n_scroll_step_percent =
             self.fullscreen_n_scroll_step_percent.clamp(10, 100);
@@ -16314,6 +16368,78 @@ mod tests {
             }
         }
         assert!(FullscreenHorizontalCursorDirection::Unknown.is_rtl(true, false));
+    }
+
+    #[test]
+    fn section1856_wheel_zoom_step_default_missing_key_and_roundtrip() {
+        assert_eq!(
+            Settings::default().fullscreen_wheel_zoom_step,
+            FullscreenWheelZoomStep::Standard
+        );
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            missing.fullscreen_wheel_zoom_step,
+            FullscreenWheelZoomStep::Standard
+        );
+        let choices = [
+            (
+                FullscreenWheelZoomStep::Standard,
+                "Standard",
+                "標準（約 14%）",
+            ),
+            (FullscreenWheelZoomStep::Percent5, "Percent5", "5%"),
+            (FullscreenWheelZoomStep::Percent10, "Percent10", "10%"),
+            (FullscreenWheelZoomStep::Percent20, "Percent20", "20%"),
+            (FullscreenWheelZoomStep::Percent30, "Percent30", "30%"),
+            (FullscreenWheelZoomStep::Percent50, "Percent50", "50%"),
+            (
+                FullscreenWheelZoomStep::Percent100,
+                "Percent100",
+                "100%（2 倍）",
+            ),
+        ];
+        assert_eq!(
+            FullscreenWheelZoomStep::all(),
+            &choices.map(|(step, _, _)| step)
+        );
+        for (step, wire, label) in choices {
+            let settings = Settings {
+                fullscreen_wheel_zoom_step: step,
+                ..Settings::default()
+            };
+            let value = serde_json::to_value(&settings).unwrap();
+            assert_eq!(value["fullscreen_wheel_zoom_step"], wire);
+            let loaded: Settings = serde_json::from_value(value).unwrap();
+            assert_eq!(loaded.fullscreen_wheel_zoom_step, step);
+            assert_eq!(step.label(), label);
+        }
+    }
+
+    #[test]
+    fn section1856_wheel_zoom_step_unknown_means_standard() {
+        for wire in ["Unknown", "FutureStep"] {
+            let mut settings: Settings = serde_json::from_value(serde_json::json!({
+                "fullscreen_wheel_zoom_step": wire
+            }))
+            .unwrap();
+            assert_eq!(
+                settings.fullscreen_wheel_zoom_step,
+                FullscreenWheelZoomStep::Unknown
+            );
+            assert_eq!(
+                settings.fullscreen_wheel_zoom_step.normalized(),
+                FullscreenWheelZoomStep::Standard
+            );
+            assert_eq!(
+                settings.fullscreen_wheel_zoom_step.label(),
+                "標準（約 14%）"
+            );
+            settings.sanitize();
+            assert_eq!(
+                settings.fullscreen_wheel_zoom_step,
+                FullscreenWheelZoomStep::Standard
+            );
+        }
     }
 
     #[test]

@@ -4,7 +4,159 @@ use super::handler_tests::{
     app, deferred_wheel_proposal, frame, full_rect, paint, seed, wheel_event,
 };
 use super::*;
-use crate::settings::FullscreenWheelAction;
+use crate::settings::{FullscreenWheelAction, FullscreenWheelZoomStep};
+
+fn section1856_zoom(wheel_y: f32, step: FullscreenWheelZoomStep) -> f32 {
+    let mut zoom = 1.0;
+    App::apply_wheel_zoom(
+        &mut zoom,
+        &mut Vec2::ZERO,
+        wheel_y,
+        step,
+        None,
+        egui::Pos2::ZERO,
+    );
+    zoom
+}
+
+#[test]
+fn section1856_standard_matches_legacy_factor_bit_for_bit() {
+    for delta in [
+        -120.0, -40.0, -30.0, -20.0, -0.25, 0.0, 0.25, 20.0, 30.0, 40.0, 120.0,
+    ] {
+        let legacy = 1.1_f32.powf(delta / WHEEL_SENSITIVITY);
+        for step in [
+            FullscreenWheelZoomStep::Standard,
+            FullscreenWheelZoomStep::Unknown,
+        ] {
+            assert_eq!(
+                section1856_zoom(delta, step).to_bits(),
+                legacy.to_bits(),
+                "{step:?}, {delta}"
+            );
+        }
+    }
+}
+
+#[test]
+fn section1856_percent_steps_match_one_native_notch() {
+    // Lock the premise shared with native wheel projection, without changing egui's input options.
+    assert_eq!(
+        egui::InputOptions::default().line_scroll_speed,
+        WHEEL_ZOOM_POINTS_PER_NOTCH
+    );
+    for (step, factor) in [
+        (FullscreenWheelZoomStep::Percent5, 1.05_f32),
+        (FullscreenWheelZoomStep::Percent10, 1.10),
+        (FullscreenWheelZoomStep::Percent20, 1.20),
+        (FullscreenWheelZoomStep::Percent30, 1.30),
+        (FullscreenWheelZoomStep::Percent50, 1.50),
+        (FullscreenWheelZoomStep::Percent100, 2.0),
+    ] {
+        assert_eq!(
+            section1856_zoom(WHEEL_ZOOM_POINTS_PER_NOTCH, step),
+            factor,
+            "{step:?}"
+        );
+        let out = section1856_zoom(-WHEEL_ZOOM_POINTS_PER_NOTCH, step);
+        assert!((out - factor.recip()).abs() < 1e-6, "{step:?}");
+    }
+}
+
+#[test]
+fn section1856_zoom_is_symmetric_fractional_and_unquantized() {
+    for &step in FullscreenWheelZoomStep::all() {
+        let notch = section1856_zoom(WHEEL_ZOOM_POINTS_PER_NOTCH, step);
+        let half = section1856_zoom(WHEEL_ZOOM_POINTS_PER_NOTCH / 2.0, step);
+        assert!((half - notch.sqrt()).abs() < 1e-6, "{step:?}");
+        assert!(
+            section1856_zoom(0.25, step) > 1.0,
+            "{step:?}: tiny input must survive"
+        );
+        for delta in [0.25, 20.0, 40.0, 120.0] {
+            let up = section1856_zoom(delta, step);
+            let down = section1856_zoom(-delta, step);
+            assert!((up * down - 1.0).abs() < 1e-6, "{step:?}, {delta}");
+            let mut zoom = up;
+            App::apply_wheel_zoom(
+                &mut zoom,
+                &mut Vec2::ZERO,
+                -delta,
+                step,
+                None,
+                egui::Pos2::ZERO,
+            );
+            assert!((zoom - 1.0).abs() < 1e-6, "{step:?}, {delta}");
+        }
+        let combined = section1856_zoom(10.0 + 20.0 + 50.0, step);
+        let mut separate = 1.0;
+        for delta in [10.0, 20.0, 50.0] {
+            App::apply_wheel_zoom(
+                &mut separate,
+                &mut Vec2::ZERO,
+                delta,
+                step,
+                None,
+                egui::Pos2::ZERO,
+            );
+        }
+        assert!((combined - separate).abs() < 2e-6, "{step:?}");
+    }
+}
+
+#[test]
+fn section1856_zoom_clamps_and_preserves_cursor_pivot() {
+    let center = egui::pos2(300.0, 200.0);
+    let mouse = egui::pos2(120.0, 90.0);
+    let original_pan = Vec2::new(30.0, -20.0);
+    for &step in FullscreenWheelZoomStep::all() {
+        for (old_zoom, delta, clamped) in [
+            (1.0, WHEEL_ZOOM_POINTS_PER_NOTCH, None),
+            (1.0, -WHEEL_ZOOM_POINTS_PER_NOTCH, None),
+            (49.9, 120.0, Some(ZOOM_MAX)),
+            (0.101, -120.0, Some(ZOOM_MIN)),
+        ] {
+            let mut zoom = old_zoom;
+            let mut pan = original_pan;
+            let image_point = (mouse - center - pan) / old_zoom;
+            assert!(App::apply_wheel_zoom(
+                &mut zoom,
+                &mut pan,
+                delta,
+                step,
+                Some(mouse),
+                center
+            ));
+            if let Some(limit) = clamped {
+                assert_eq!(zoom, limit, "{step:?}");
+            }
+            assert!(
+                ((mouse - center - pan) / zoom - image_point).length() < 0.001,
+                "{step:?}: pivot moved"
+            );
+        }
+        for (limit, delta) in [(ZOOM_MAX, 120.0), (ZOOM_MIN, -120.0)] {
+            let mut zoom = limit;
+            let mut pan = original_pan;
+            assert!(!App::apply_wheel_zoom(
+                &mut zoom,
+                &mut pan,
+                delta,
+                step,
+                Some(mouse),
+                center
+            ));
+            assert_eq!(zoom, limit);
+            assert_eq!(pan, original_pan);
+        }
+        let mut zoom = 1.0;
+        let mut pan = original_pan;
+        assert!(App::apply_wheel_zoom(
+            &mut zoom, &mut pan, 40.0, step, None, center
+        ));
+        assert_eq!(pan, original_pan);
+    }
+}
 
 fn pointer_handler(app: &mut App, ui: &mut egui::Ui, ctx: &egui::Context) -> FsPageNav {
     let idx = app.fullscreen_idx.unwrap();
@@ -37,6 +189,121 @@ fn action(app: &App, input: crate::wheel_input::WheelInput) -> FsWheelAction {
             app.fullscreen_page_slice,
         ),
         seek_hover: false,
+    }
+}
+
+#[test]
+fn section1856_selected_step_reaches_analysis_and_edit_wheel_routes() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    for surface in ["analysis", "erase", "conceal"] {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx, SpreadMode::Single);
+        app.settings.fullscreen_wheel_action = FullscreenWheelAction::PageTurn;
+        app.settings.fullscreen_wheel_zoom_step = FullscreenWheelZoomStep::Percent50;
+        seed(&ctx, &mut app);
+        match surface {
+            "analysis" => app.analysis_mode = true,
+            "erase" => app.erase_mode = true,
+            "conceal" => app.conceal_mode = true,
+            _ => unreachable!("surface={surface}"),
+        }
+        assert_eq!(
+            app.is_overlay_edit_mode_active(),
+            surface != "analysis",
+            "surface={surface}: wheel route setup"
+        );
+        app.analysis_zoom = 1.0;
+        app.fs_zoom = 1.0;
+        for (delta, expected) in [(40.0, 1.5), (-40.0, 1.0)] {
+            frame(
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(full_rect().center()),
+                    wheel_event(Vec2::new(0.0, delta), egui::Modifiers::NONE),
+                ],
+                |ui, ctx| {
+                    let state = app.prepare_fullscreen_state(ctx, 0, FsPageTurnDecision::normal());
+                    let (navigation, close) = app.handle_fs_wheel_and_click(
+                        ui,
+                        ctx,
+                        full_rect(),
+                        &state,
+                        false,
+                        0,
+                        &mut None,
+                    );
+                    assert!(
+                        navigation.is_none(),
+                        "surface={surface}, delta={delta}: navigation={navigation:?}"
+                    );
+                    assert!(!close, "surface={surface}, delta={delta}: viewer closed");
+                    let zoom = if surface == "analysis" {
+                        app.analysis_zoom
+                    } else {
+                        app.fs_zoom
+                    };
+                    assert!(
+                        (zoom - expected).abs() < 1e-6,
+                        "surface={surface}, delta={delta}: {zoom}"
+                    );
+                    assert_eq!(
+                        app.fullscreen_idx,
+                        Some(0),
+                        "surface={surface}, delta={delta}"
+                    );
+                    if surface == "analysis" {
+                        assert_eq!(app.fs_zoom, 1.0, "surface={surface}, delta={delta}");
+                    } else {
+                        assert_eq!(app.analysis_zoom, 1.0, "surface={surface}, delta={delta}");
+                    }
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn section1856_fractional_same_frame_wheel_and_prediction_use_selected_step() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    for mode in [SpreadMode::Single, SpreadMode::Ltr] {
+        for (setting, modifiers) in [
+            (FullscreenWheelAction::Zoom, egui::Modifiers::NONE),
+            (FullscreenWheelAction::PageTurn, egui::Modifiers::CTRL),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = app(&ctx, mode);
+            app.settings.fullscreen_wheel_action = setting;
+            app.settings.fullscreen_wheel_zoom_step = FullscreenWheelZoomStep::Percent50;
+            app.fs_zoom = 1.0;
+            app.fs_pan = Vec2::ZERO;
+            seed(&ctx, &mut app);
+            let pointer = egui::pos2(450.0, 200.0);
+            frame(
+                &ctx,
+                vec![
+                    egui::Event::PointerMoved(pointer),
+                    wheel_event(Vec2::new(0.0, 10.0), modifiers),
+                    wheel_event(Vec2::new(0.0, 10.0), modifiers),
+                ],
+                |ui, ctx| {
+                    let options = ctx.options(|options| options.input_options);
+                    let projected = ctx
+                        .input(|input| crate::wheel_input::remaining_wheel_inputs(input, options));
+                    assert_eq!(projected.len(), 1, "same-frame events must accumulate");
+                    assert_eq!(projected[0].delta.y, 20.0);
+                    let accepted = action(&app, projected[0]);
+                    let viewport = app.fullscreen_media_rect(full_rect(), 0, false);
+                    let predicted =
+                        app.propose_fs_wheel_click_transform(ctx, viewport, &[accepted]);
+                    assert!((predicted.0 - 1.5_f32.sqrt()).abs() < 1e-6);
+                    assert_eq!((app.fs_zoom, app.fs_pan), (1.0, Vec2::ZERO));
+                    assert!(pointer_handler(&mut app, ui, ctx).is_none());
+                    assert_eq!((app.fs_zoom, app.fs_pan), predicted);
+                },
+            );
+        }
     }
 }
 
@@ -87,6 +354,7 @@ fn setting_zoom_matches_ctrl_cursor_pivot_clamp_and_actual_painted_transform() {
                         &mut expected_zoom,
                         &mut expected_pan,
                         delta,
+                        crate::settings::FullscreenWheelZoomStep::Standard,
                         Some(pointer),
                         viewport.center(),
                     );

@@ -1275,6 +1275,7 @@ fn egui037_wheel_frame_actual_immediate_child_keeps_zoom_anchor_and_root_wheel()
                         &mut expected.0,
                         &mut expected.1,
                         120.0,
+                        crate::settings::FullscreenWheelZoomStep::Standard,
                         Some(child_pointer),
                         image_rect.center(),
                     );

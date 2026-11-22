@@ -394,6 +394,7 @@ preferences_policy! {
         fullscreen_horizontal_cursor_direction: FullscreenHorizontalCursorDirection => ("閲覧表示の横カーソル方向", |v, _raw| !matches!(v, FullscreenHorizontalCursorDirection::Unknown), plain, plain);
         fullscreen_up_down_key_action: FullscreenUpDownKeyAction => ("閲覧表示の上下キー操作", |v, _raw| FullscreenUpDownKeyAction::all().contains(v), plain, plain);
         fullscreen_wheel_action: FullscreenWheelAction => ("閲覧表示の通常ホイール操作", |v, _raw| FullscreenWheelAction::all().contains(v), plain, plain);
+        fullscreen_wheel_zoom_step: FullscreenWheelZoomStep => ("ホイールでの拡大・縮小の刻み", |v, _raw| FullscreenWheelZoomStep::all().contains(v), plain, plain);
         fullscreen_n_scroll_order: FullscreenNScrollOrder => ("ページ内スクロールの読み順", |v, _raw| FullscreenNScrollOrder::all().contains(v), plain, plain);
         fullscreen_n_scroll_step_percent: u32 => ("N 字 / Z 字の移動量", |v, _raw| (10..=100).contains(v), plain, plain);
         fullscreen_n_scroll_wrap_step_percent: Option<u32> => ("N 字 / Z 字の列・段替えの移動量", |v, _raw| v.is_none_or(|v| (10..=100).contains(&v)), plain, plain);
@@ -1444,6 +1445,10 @@ mod tests {
             &settings.fullscreen_wheel_action,
             FullscreenWheelAction::all(),
         );
+        settings.fullscreen_wheel_zoom_step = different_enum(
+            &settings.fullscreen_wheel_zoom_step,
+            FullscreenWheelZoomStep::all(),
+        );
         settings.fullscreen_n_scroll_order = different_enum(
             &settings.fullscreen_n_scroll_order,
             FullscreenNScrollOrder::all(),
@@ -2388,6 +2393,55 @@ mod tests {
     }
 
     #[test]
+    fn section1856_wheel_zoom_step_transfer_roundtrip_missing_and_invalid_preserve_values() {
+        for &step in FullscreenWheelZoomStep::all() {
+            let source = Settings {
+                fullscreen_wheel_zoom_step: step,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            assert!(exported.issues.is_empty());
+            let mut destination = Settings {
+                fullscreen_wheel_zoom_step: different_enum(&step, FullscreenWheelZoomStep::all()),
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert!(
+                report
+                    .changed_fields
+                    .iter()
+                    .any(|label| label == "ホイールでの拡大・縮小の刻み")
+            );
+            assert_eq!(destination.fullscreen_wheel_zoom_step, step);
+            let report = parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.accepted_count, 0);
+            assert_eq!(destination.fullscreen_wheel_zoom_step, step);
+            // Transfer follows the existing enum policy: invalid imports leave the destination intact.
+            for invalid in [
+                json!("FutureStep"),
+                json!("Unknown"),
+                json!(true),
+                json!(50),
+                Value::Null,
+            ] {
+                let report = parse_preferences(&document(json!({
+                    "fullscreen_wheel_zoom_step": invalid
+                })))
+                .unwrap()
+                .apply_to(&mut destination);
+                assert_eq!(report.accepted_count, 0);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.fullscreen_wheel_zoom_step, step);
+            }
+        }
+    }
+
+    #[test]
     fn fullscreen_bound_drag_pan_transfer_roundtrip_missing_and_invalid_preserve_values() {
         for enabled in [false, true] {
             let source = Settings {
@@ -2424,13 +2478,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 508);
+        assert_eq!(entries.len(), 509);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            169
+            170
         );
         assert_eq!(
             entries
@@ -2466,7 +2520,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 167);
+        assert_eq!(wire.len(), 168);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

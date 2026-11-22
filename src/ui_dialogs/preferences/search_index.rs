@@ -1270,6 +1270,26 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "spread/wheel-zoom-step",
+        SpreadMode,
+        "ホイールでの拡大・縮小の刻み",
+        [
+            "ホイール",
+            "拡大",
+            "縮小",
+            "刻み",
+            "倍率",
+            "ズーム",
+            "Ctrl",
+            "5%",
+            "10%",
+            "20%",
+            "30%",
+            "50%",
+            "100%"
+        ]
+    ),
+    entry!(
         "spread/n-scroll-order",
         SpreadMode,
         "N 字スクロールの順序",
@@ -2328,6 +2348,25 @@ mod tests {
                 .into_iter()
                 .find(|entry| entry.anchor == anchor)
                 .expect("ページ内スクロール設定が検索できる");
+            assert_eq!(entry.page, PreferencesPage::SpreadMode);
+        }
+    }
+
+    #[test]
+    fn section1856_wheel_zoom_step_setting_is_searchable() {
+        for query in [
+            "ホイール",
+            "拡大",
+            "縮小",
+            "刻み",
+            "倍率",
+            "ズーム",
+            "ホイール 倍率",
+        ] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "spread/wheel-zoom-step")
+                .expect("ホイールズームの刻みが検索できる");
             assert_eq!(entry.page, PreferencesPage::SpreadMode);
         }
     }

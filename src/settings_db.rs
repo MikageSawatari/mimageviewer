@@ -5102,6 +5102,68 @@ mod tests {
     }
 
     #[test]
+    fn section1856_full_settings_payload_and_db_without_zoom_step_use_standard() {
+        use crate::settings::{FullscreenWheelAction, FullscreenWheelZoomStep};
+
+        let source = Settings {
+            fullscreen_wheel_zoom_step: FullscreenWheelZoomStep::Percent100,
+            fullscreen_wheel_action: FullscreenWheelAction::Zoom,
+            fullscreen_n_scroll_step_percent: 50,
+            grid_cols: 7,
+            show_hidden_files: true,
+            ..Settings::default()
+        };
+        let assert_missing_step = |loaded: &Settings| {
+            assert_eq!(
+                loaded.fullscreen_wheel_zoom_step,
+                FullscreenWheelZoomStep::Standard
+            );
+            assert_eq!(
+                loaded.fullscreen_wheel_action,
+                source.fullscreen_wheel_action
+            );
+            assert_eq!(
+                loaded.fullscreen_n_scroll_step_percent,
+                source.fullscreen_n_scroll_step_percent
+            );
+            assert_eq!(loaded.grid_cols, source.grid_cols);
+            assert_eq!(loaded.show_hidden_files, source.show_hidden_files);
+        };
+
+        let mut payload = serde_json::to_value(&source).unwrap();
+        assert_eq!(
+            payload
+                .as_object_mut()
+                .unwrap()
+                .remove("fullscreen_wheel_zoom_step"),
+            Some(Value::String("Percent100".into()))
+        );
+        // build_settings_from_db uses this same from_value path for its reconstructed payload.
+        let loaded: Settings = serde_json::from_value(payload).unwrap();
+        assert_missing_step(&loaded);
+
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&source).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().fullscreen_wheel_zoom_step,
+            source.fullscreen_wheel_zoom_step
+        );
+        let removed = db
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'fullscreen_wheel_zoom_step'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_missing_step(&db.load_into_settings().unwrap());
+    }
+
+    #[test]
     fn effetune_editor_rect_round_trips_with_the_normal_full_save() {
         let dir = TempDir::new().unwrap();
         let db = SettingsDb::create_new(dir.path()).unwrap();

@@ -18,9 +18,10 @@ use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode,
     FullscreenHorizontalCursorDirection, FullscreenJumpMode, FullscreenNScrollOrder,
     FullscreenPageStartPosition, FullscreenSeekDirection, FullscreenUpDownKeyAction,
-    FullscreenWheelAction, GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow,
-    SortOrder, SpreadMode, StartupFolderMode, StartupWindowState, TextContrast,
-    UI_FONT_VERTICAL_ADJUST_MAX, UI_FONT_VERTICAL_ADJUST_MIN, UiFontSelection, UiTheme,
+    FullscreenWheelAction, FullscreenWheelZoomStep, GridItemDisplayKind, Parallelism,
+    ReadingDirection, ReadingFlow, SortOrder, SpreadMode, StartupFolderMode, StartupWindowState,
+    TextContrast, UI_FONT_VERTICAL_ADJUST_MAX, UI_FONT_VERTICAL_ADJUST_MIN, UiFontSelection,
+    UiTheme,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
@@ -11098,6 +11099,17 @@ fn draw_fullscreen_wheel_action_setting(ui: &mut egui::Ui, value: &mut Fullscree
     });
 }
 
+fn draw_fullscreen_wheel_zoom_step_setting(ui: &mut egui::Ui, value: &mut FullscreenWheelZoomStep) {
+    egui::ComboBox::from_label("ホイールでの拡大・縮小の刻み")
+        .selected_text(value.label())
+        .show_ui(ui, |ui| {
+            for &step in FullscreenWheelZoomStep::all() {
+                ui.selectable_value(value, step, step.label());
+            }
+        });
+    ui.small("静止画のホイールズーム（通常のホイールがズーム・Ctrl+ホイール・編集中）で、1 段ごとに拡大する倍率です。縮小はその逆の倍率です。Z ズーム・動画・キー・中ボタンドラッグ・タッチ・ゲームパッド・360 度には適用しません。");
+}
+
 fn draw_fullscreen_n_scroll_order_setting(ui: &mut egui::Ui, value: &mut FullscreenNScrollOrder) {
     egui::ComboBox::from_label("N 字スクロールの順序")
         .selected_text(value.label())
@@ -11454,6 +11466,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/wheel-action", |ui, state| {
         draw_fullscreen_wheel_action_setting(ui, &mut state.settings.fullscreen_wheel_action);
     });
+    anchored(ui, state, "spread/wheel-zoom-step", |ui, state| {
+        draw_fullscreen_wheel_zoom_step_setting(ui, &mut state.settings.fullscreen_wheel_zoom_step);
+    });
     anchored(ui, state, "spread/n-scroll-order", |ui, state| {
         draw_fullscreen_n_scroll_order_setting(ui, &mut state.settings.fullscreen_n_scroll_order);
     });
@@ -11673,6 +11688,7 @@ mod fullscreen_in_page_scroll_setting_tests {
     fn draw(ui: &mut egui::Ui, settings: &mut Settings) {
         draw_fullscreen_up_down_key_action_setting(ui, &mut settings.fullscreen_up_down_key_action);
         draw_fullscreen_wheel_action_setting(ui, &mut settings.fullscreen_wheel_action);
+        draw_fullscreen_wheel_zoom_step_setting(ui, &mut settings.fullscreen_wheel_zoom_step);
         draw_fullscreen_n_scroll_order_setting(ui, &mut settings.fullscreen_n_scroll_order);
         draw_fullscreen_smooth_page_scroll_setting(ui, &mut settings.fullscreen_smooth_page_scroll);
         draw_fullscreen_bound_drag_pan_setting(ui, &mut settings.fullscreen_bound_drag_pan);
@@ -11690,6 +11706,9 @@ mod fullscreen_in_page_scroll_setting_tests {
     ) {
         let mut settings = Settings::default();
         settings.fullscreen_wheel_action = wheel;
+        if wheel == FullscreenWheelAction::Zoom {
+            settings.fullscreen_wheel_zoom_step = FullscreenWheelZoomStep::Percent50;
+        }
         if enabled {
             settings.fullscreen_up_down_key_action = FullscreenUpDownKeyAction::InPageScroll;
             settings.fullscreen_n_scroll_order = FullscreenNScrollOrder::HorizontalFirst;
@@ -11700,8 +11719,8 @@ mod fullscreen_in_page_scroll_setting_tests {
         }
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
-            // Include the drag-bound explanation and all scroll rows without cropping.
-            .with_size(egui::vec2(540.0, 540.0))
+            // Include wheel zoom steps, drag bounds and all scroll rows without cropping.
+            .with_size(egui::vec2(540.0, 660.0))
             .build_ui(move |root_ui| {
                 crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
                     let ctx = &root_ui.ctx().clone();
@@ -11717,7 +11736,7 @@ mod fullscreen_in_page_scroll_setting_tests {
                         draw(ui, &mut settings);
                         assert!(
                             ui.min_rect().bottom() <= available_bottom,
-                            "the scroll settings must fit the 540x540 snapshot fixture: content={:?}, available_bottom={available_bottom}",
+                            "the scroll settings must fit the 540x660 snapshot fixture: content={:?}, available_bottom={available_bottom}",
                             ui.min_rect(),
                         );
                     });
