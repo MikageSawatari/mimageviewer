@@ -992,3 +992,33 @@ verdict と終了コードの対応、`release-record.md` の中身が `summary.
   ところが台本の `fail("environment: ...")` は、test-script の runtime では ScriptFailure (exit 1) になる。
   Rhai から EnvironmentFailure (exit 2) を出す手段が無く、`Support.ps1` の `New-ReleaseCheckProcessExitResult` は exit 1 を FAIL にする。
   そのため、環境の不成立が FAIL として数えられた。製品の不具合を示す記録ではない。
+
+**前面の窓の記録と、前面の待ちの失敗の分類 (2026-11-22、`9a7b711b4`)**
+統括の判断: 環境不成立 (exit 2) にするのは、失敗した時点の前面が mIV 以外のプロセスだと runner の記録で示せる場合だけ。
+root の `focused` が偽のままになる原因は mIV 自身のこともある (mIV の別の窓・popup・ダイアログが前面を取った、mIV が応答しなくなった)。
+何でも環境不成立にすると、製品の退行が SKIPPED に隠れる。分け方は台本の文言ではなく runner の証拠で決める。前面の取り直しはしない。
+
+- 台本の前面の待ち (`focused()` と、Ctrl+G の後に検索欄がフォーカスを得る待ち) は、失敗すると test-script の関数が
+  `foreground-wait-failure.json` (pid・root の HWND・待ちの種類・待ちの開始と失敗の unix ms) を書き、今までどおり ScriptFailure (exit 1) で終わる。
+  前面に依存しない 3 か所 (検索の完了・索引の完了・perf の開始フォルダの照合) は、記録があっても FAIL のまま
+  (文言の `environment:` も外した。前面が他のプロセスでも、これらが終わらないのは前面のせいではないため)。
+- runner は各セッションの主ループで `foreground-timeline.jsonl` に前面の窓を書く (変化したときと 500 ms ごと)。1 行に、前面の HWND・pid・
+  exe 名・class、mIV の子孫プロセスか、Ghost 窓なら元の窓 (`HungWindowFromGhostWindow`) の pid・exe 名、mIV の root の生存・可視・最小化・
+  応答 (`IsHungAppWindow`)。窓のタイトルは取らない (公開される記録に利用者の他アプリのタイトルを載せないため。`GetWindowText` は
+  WM_GETTEXT を送るので使わない)。測定区間 (sampler の内側) では書かない。
+- 分類は `scripts/release_check_foreground.py` の 1 か所だけ。process exit 1 で `foreground-wait-failure.json` があるときに限って判定し、
+  次の全部が成り立つときだけ SKIPPED (exit 2) にする:
+  - 記録の pid と root の HWND が、試験対象の mIV と一致する。
+  - 待ちの開始より前と失敗より後の行で区間の両端を挟み、行の間隔がどこも 1500 ms 以下。
+  - その区間の全部の行で、前面が mIV の pid でも、その子孫でも、root でもない。Ghost 窓なら持ち主が dwm で、元の窓が mIV・子孫・root でない。
+  - 全部の行で mIV の root が生きていて、見えていて、最小化でなく、応答している。
+  - どれか 1 つでも外れる、記録が読めない、前面の持ち主を特定できない、のどれでも FAIL (exit 1)。
+  判定の理由・区間・行数・前面の exe 名と class は、そのケースの失敗の文として `release-record.md` にそのまま出る。
+  実プロセスの exit 1 も証拠に残す。
+- runner が最初の前面を 20 秒取れない場合 (`Exact root foreground unavailable within 20 seconds.`) は、今までどおり suite-preparation の
+  SKIPPED。今回は変えていない。
+- サブ PC での手順: 本番のあいだ、サブ PC 担当は待機の命令 (ファイルの有無を一定間隔で見る等) も流さない。終わりはターミナル パネルの
+  表示を 1 回読むだけにする (4 回目で前面を奪ったのがこの命令だという証拠は無く、見立て)。
+- Sol / xhigh の独立レビュー: 指摘なしで ACCEPT (製品の退行を SKIPPED に隠さない観点を含む)。
+- 診断 artifact は `src/` に触れたので作り直した: `aa6f06685` + `30dbcfc43` + `9a7b711b4` の `src/` の変更 = `99c0eea48`
+  (`C:\miv-relcheck\root`、detached)。配布物との違いは test-script feature の中の観測・記録・台本と、製品の完了条件の関数への切り出し (挙動不変)。
