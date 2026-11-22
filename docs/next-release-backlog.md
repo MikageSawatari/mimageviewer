@@ -39,6 +39,10 @@
 
 ## 1. 優先候補
 
+### 1.852 ui-smoke・page-turn-smoke も MainWindowHandle で mIV の窓を前面化している — ReleaseChecks の修正から (2026-11-22)
+
+- 状態: **未着手、収録版未定 (試験側、製品は変わらない)**。ReleaseChecks では、runner が `Process.MainWindowHandle` で mIV の root を選び、winit の内部の窓 (Winit Thread Event Target、見えていて持ち主なし) を取り違えていた。mIV が test-script から知らせる root の HWND を使うよう直した (relcheck-subpc の `3f60030ce`、master 取り込み 67f3c0435)。`scripts/ui-smoke.ps1` (1916 行付近) と `scripts/page-turn-smoke.ps1` (174 行付近) に同じ書き方が残っている。同じ形で直す。
+
 ### 1.851 コレクションで、元が見つからなくなった項目をまとめて外せない (1 件ずつになる) — X の投稿 (2026-11-22)
 
 - 状態: **実装済み (ブランチ claude/coll-missing-851-072ced、実装レビュー Codex xhigh ACCEPT、関連テスト・ui_snapshot 成功、build-dev 済み、実機は未確認)、v5.6.0 候補 (修正量が少なければ入れる、利用者希望 2026-11-22)**。設計は [collection-missing-bulk-remove-851-plan.md](collection-missing-bulk-remove-851-plan.md)。X の利用者の投稿 (利用者が貼ったもの): フォルダ名を変えたあと、コレクションから存在しなくなった項目を外す作業で、1 件ずつしか削除できない気がする。
