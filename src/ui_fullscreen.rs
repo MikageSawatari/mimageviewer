@@ -42462,6 +42462,15 @@ impl App {
             if pointer_in_seek_panel {
                 // 下部シークバー上の入力はバー側のウィジェットに任せる。
             } else if mods.ctrl && !is_spread_double && self.reading_flow.is_paged() {
+                if self.settings.fullscreen_bound_drag_pan
+                    && self.fs_bounded_drag_pan_surface(false)
+                    && primary_down
+                    && let Some(total_delta) = input.total_drag_delta
+                    && let Some((_, origin_pan)) = self.fs_pan_drag_start.as_mut()
+                {
+                    // Resume from the current pan after the Ctrl-owned frames (§8.6).
+                    *origin_pan = self.fs_pan - total_delta;
+                }
                 // Ctrl+ドラッグ → 回転
                 if primary_pressed {
                     if let Some(pos) = pointer_pos {

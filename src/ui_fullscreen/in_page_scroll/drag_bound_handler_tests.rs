@@ -403,6 +403,117 @@ fn bound_drag_wheel_zoom_at(app: &mut App, ctx: &egui::Context, pivot: egui::Pos
     );
 }
 
+fn assert_drag_bound_held_ctrl_zoom(
+    bound: bool,
+    pivot_total: Vec2,
+    zoom_pan: Vec2,
+    resumed_pan: Vec2,
+) {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    let _cleanup = KeyboardCleanup;
+    let (ctx, mut app) = prepared(bound, FullscreenFitMode::Page, 1.0);
+    close(app.fs_pan, Vec2::ZERO);
+    press(&mut app, &ctx);
+    let first_total = Vec2::new(80.0, 40.0);
+    move_bound_drag_to(&mut app, &ctx, first_total);
+    let before_ctrl = if bound { Vec2::ZERO } else { first_total };
+    close(app.fs_pan, before_ctrl);
+    close(bound_drag_origin_pan(&app), before_ctrl - first_total);
+    let press_pos = app.fs_pan_drag_start.unwrap().0;
+
+    pointer_frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::ModifiersChanged(egui::Modifiers::CTRL)],
+    );
+    move_bound_drag_to(&mut app, &ctx, pivot_total);
+    close(app.fs_pan, before_ctrl);
+    close(
+        bound_drag_origin_pan(&app),
+        if bound {
+            before_ctrl - pivot_total
+        } else {
+            Vec2::ZERO
+        },
+    );
+    assert_eq!(app.fs_pan_drag_start.unwrap().0, press_pos);
+    assert!(
+        app.fs_rotation_drag_start.is_none(),
+        "Ctrl added after press cannot start rotation"
+    );
+    assert_eq!(app.fs_free_rotation, 0.0);
+
+    bound_drag_wheel_zoom_at(&mut app, &ctx, origin() + pivot_total, 4.0);
+    assert!((app.fs_zoom - 4.0).abs() < 0.0001);
+    close(app.fs_pan, zoom_pan);
+    close(
+        bound_drag_origin_pan(&app),
+        if bound {
+            zoom_pan - pivot_total
+        } else {
+            Vec2::ZERO
+        },
+    );
+    assert_eq!(app.fs_pan_drag_start.unwrap().0, press_pos);
+    assert!(app.fs_rotation_drag_start.is_none());
+    assert_eq!(app.fs_free_rotation, 0.0);
+    seed(&ctx, &mut app);
+    assert!(app.fs_scroll_layout_matches(&ctx));
+    pointer_frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+    );
+    close(app.fs_pan, resumed_pan);
+    move_bound_drag_to(&mut app, &ctx, pivot_total + Vec2::new(30.0, 20.0));
+    close(app.fs_pan, resumed_pan + Vec2::new(30.0, 20.0));
+    pointer_frame(
+        &mut app,
+        &ctx,
+        vec![button(
+            origin() + pivot_total + Vec2::new(30.0, 20.0),
+            false,
+        )],
+    );
+    assert!(app.fs_pan_drag_start.is_none());
+}
+
+#[test]
+fn drag_bound_r4_ctrl_return_to_press_preserves_center_zoom_and_resumes_from_current_pan() {
+    assert_drag_bound_held_ctrl_zoom(true, Vec2::ZERO, Vec2::ZERO, Vec2::ZERO);
+}
+
+#[test]
+fn drag_bound_ctrl_offcenter_zoom_preserves_pan_and_resumes_from_current_pan() {
+    // With cur=0 and pivot offset (60,30), 4x zoom gives -3 * offset.
+    assert_drag_bound_held_ctrl_zoom(
+        true,
+        Vec2::new(60.0, 30.0),
+        Vec2::new(-180.0, -90.0),
+        Vec2::new(-180.0, -90.0),
+    );
+}
+
+#[test]
+fn drag_bound_off_ctrl_return_to_press_keeps_legacy_absolute_drag_origin() {
+    // OFF accepts (80,40) before Ctrl: centered 4x zoom makes (320,160).
+    // Returning to the press still proposes the unchanged origin plus zero.
+    assert_drag_bound_held_ctrl_zoom(false, Vec2::ZERO, Vec2::new(320.0, 160.0), Vec2::ZERO);
+}
+
+#[test]
+fn drag_bound_off_ctrl_offcenter_zoom_keeps_legacy_absolute_drag_origin() {
+    // 4*(80,40) - 3*(60,30) = (140,70); OFF resumes at cumulative (60,30).
+    assert_drag_bound_held_ctrl_zoom(
+        false,
+        Vec2::new(60.0, 30.0),
+        Vec2::new(140.0, 70.0),
+        Vec2::new(60.0, 30.0),
+    );
+}
+
 #[test]
 fn drag_bound_held_center_pivot_zoom_crosses_fitted_and_overflow_rules_in_both_directions() {
     #[cfg(windows)]
