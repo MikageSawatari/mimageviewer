@@ -4,7 +4,9 @@ use super::*;
 use crate::keymap::{
     KeyContext, KeyTrigger, Keymap, KeymapSettings, PageTurnPressKind, PressMultiplicity,
 };
-use crate::settings::{FullscreenNScrollOrder, FullscreenWheelAction, Settings};
+use crate::settings::{
+    FullscreenNScrollOrder, FullscreenWheelAction, FullscreenWheelZoomStep, Settings,
+};
 use crate::settings_transfer::{export_preferences, parse_preferences};
 use egui_kittest::kittest::Queryable;
 use serde_json::{Value, json};
@@ -825,6 +827,108 @@ fn preferences_wheel_zoom_ok_save_then_handler_zooms_instead_of_turning() {
 }
 
 #[test]
+fn section1856_preferences_step_ok_save_then_wheel_and_ctrl_wheel_use_saved_factor() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    let _clear = ClearKeyboard;
+    use crate::ui_dialogs::preferences::{PreferencesOpenRequest, PreferencesPage};
+
+    for (step, factor) in [
+        (FullscreenWheelZoomStep::Percent50, 1.5),
+        (
+            FullscreenWheelZoomStep::Standard,
+            1.1_f32.powf(40.0 / WHEEL_SENSITIVITY),
+        ),
+    ] {
+        for (wheel, modifiers) in [
+            (FullscreenWheelAction::Zoom, egui::Modifiers::NONE),
+            (FullscreenWheelAction::PageTurn, egui::Modifiers::CTRL),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = app(&ctx, SpreadMode::Single);
+            app.settings.fullscreen_wheel_action = FullscreenWheelAction::PageTurn;
+            app.settings.fullscreen_wheel_zoom_step = FullscreenWheelZoomStep::Percent10;
+            app.open_preferences_request(PreferencesOpenRequest {
+                page: PreferencesPage::SpreadMode,
+                anchor: Some("spread/wheel-zoom-step"),
+            });
+            {
+                let mut harness = preferences_harness(&mut app);
+                harness.run_steps(5);
+                harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+                select_combo(&mut harness, "通常のホイール", wheel.label());
+                select_combo(&mut harness, "ホイールでの拡大・縮小の刻み", step.label());
+                let draft = &harness.state().pref_state.as_ref().unwrap().settings;
+                assert_eq!(draft.fullscreen_wheel_zoom_step, step);
+                assert_eq!(draft.fullscreen_wheel_action, wheel);
+                assert_eq!(
+                    harness.state().settings.fullscreen_wheel_zoom_step,
+                    FullscreenWheelZoomStep::Percent10
+                );
+                harness.get_by_label("  OK  ").click();
+                harness.run_steps(3);
+                assert!(!harness.state().show_preferences);
+            }
+            let persisted = crate::settings_db::SettingsDb::open(app.tmp.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap();
+            assert_eq!(persisted.fullscreen_wheel_zoom_step, step);
+            assert_eq!(persisted.fullscreen_wheel_action, wheel);
+            assert_eq!(app.settings.fullscreen_wheel_zoom_step, step);
+            assert_eq!(app.settings.fullscreen_wheel_action, wheel);
+            app.fs_zoom = 1.0;
+            app.fs_pan = Vec2::ZERO;
+            for (notch, expected) in [(1.0, factor), (-1.0, 1.0)] {
+                seed(&ctx, &mut app);
+                frame(
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(full_rect().center()),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Line,
+                            delta: Vec2::new(0.0, notch),
+                            modifiers,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Wheel,
+                        },
+                    ],
+                    |ui, ctx| {
+                        let state =
+                            app.prepare_fullscreen_state(ctx, 0, FsPageTurnDecision::normal());
+                        let (navigation, close) = app.handle_fs_wheel_and_click(
+                            ui,
+                            ctx,
+                            full_rect(),
+                            &state,
+                            false,
+                            0,
+                            &mut None,
+                        );
+                        assert!(navigation.is_none());
+                        assert!(!close);
+                        assert_eq!(app.fullscreen_idx, Some(0));
+                        assert!(
+                            (app.fs_zoom - expected).abs() < 1e-6,
+                            "{step:?}, {wheel:?}, notch={notch}: {} != {expected}",
+                            app.fs_zoom
+                        );
+                        if notch > 0.0 {
+                            assert_eq!(
+                                app.fs_zoom.to_bits(),
+                                factor.to_bits(),
+                                "one native notch, {step:?}, {wheel:?}"
+                            );
+                        }
+                    },
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn preferences_scroll_extension_search_results_jump_to_the_actual_setting_anchors() {
     #[cfg(windows)]
     let _serial = crate::key_input::lock_test_input();
@@ -838,6 +942,7 @@ fn preferences_scroll_extension_search_results_jump_to_the_actual_setting_anchor
     harness.run_steps(3);
     for (query, anchor) in [
         ("ホイール ズーム", "spread/wheel-action"),
+        ("ホイール 刻み", "spread/wheel-zoom-step"),
         ("スクロール＋ページ送り", "spread/wheel-action"),
         ("滑らか", "spread/smooth-page-scroll"),
         ("N 字 移動量", "spread/n-scroll-step"),

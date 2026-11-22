@@ -649,7 +649,7 @@ mod media_resume_meter_tests;
 pub(crate) use folder_scan::OmittedFolderEntryCounts;
 mod gamepad_input;
 mod grid_scroll;
-pub(crate) use gamepad_input::{RightDragGuide, draw_right_drag_guide};
+pub(crate) use gamepad_input::{GridSelectionEdge, RightDragGuide, draw_right_drag_guide};
 pub(crate) use grid_scroll::{
     GRID_SCROLL_MIN_VIEWPORT_H, GridAspectLayout, GridScrollGeometry, GridScrollState,
 };

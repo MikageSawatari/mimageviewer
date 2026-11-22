@@ -394,6 +394,7 @@ preferences_policy! {
         fullscreen_horizontal_cursor_direction: FullscreenHorizontalCursorDirection => ("閲覧表示の横カーソル方向", |v, _raw| !matches!(v, FullscreenHorizontalCursorDirection::Unknown), plain, plain);
         fullscreen_up_down_key_action: FullscreenUpDownKeyAction => ("閲覧表示の上下キー操作", |v, _raw| FullscreenUpDownKeyAction::all().contains(v), plain, plain);
         fullscreen_wheel_action: FullscreenWheelAction => ("閲覧表示の通常ホイール操作", |v, _raw| FullscreenWheelAction::all().contains(v), plain, plain);
+        fullscreen_wheel_zoom_step: FullscreenWheelZoomStep => ("ホイールでの拡大・縮小の刻み", |v, _raw| FullscreenWheelZoomStep::all().contains(v), plain, plain);
         fullscreen_n_scroll_order: FullscreenNScrollOrder => ("ページ内スクロールの読み順", |v, _raw| FullscreenNScrollOrder::all().contains(v), plain, plain);
         fullscreen_n_scroll_step_percent: u32 => ("N 字 / Z 字の移動量", |v, _raw| (10..=100).contains(v), plain, plain);
         fullscreen_n_scroll_wrap_step_percent: Option<u32> => ("N 字 / Z 字の列・段替えの移動量", |v, _raw| v.is_none_or(|v| (10..=100).contains(&v)), plain, plain);
@@ -444,6 +445,7 @@ preferences_policy! {
         active_quick_folder_slot => "利用中の A/B ワークスペース。登録先・履歴と一組の利用状態";
         raw_develop_parallelism => "CPU/メモリ/速度に依存する RAW 現像 worker 数の tuning";
         show_facet_sort => "環境設定外のツールバーで管理するソート区画の表示状態";
+        show_grid_edge_buttons => "環境設定外で管理するツールバーの表示状態";
         toolbar_folder_section_migrated => "ツールバー配置の一度だけの内部移行記録";
         effetune_pre_limiter_enabled => "移行先の EffeTune/VST 導入状態と音声処理構成に依存する微調整";
         effetune_auto_open_on_video => "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
@@ -1444,6 +1446,10 @@ mod tests {
             &settings.fullscreen_wheel_action,
             FullscreenWheelAction::all(),
         );
+        settings.fullscreen_wheel_zoom_step = different_enum(
+            &settings.fullscreen_wheel_zoom_step,
+            FullscreenWheelZoomStep::all(),
+        );
         settings.fullscreen_n_scroll_order = different_enum(
             &settings.fullscreen_n_scroll_order,
             FullscreenNScrollOrder::all(),
@@ -2388,6 +2394,55 @@ mod tests {
     }
 
     #[test]
+    fn section1856_wheel_zoom_step_transfer_roundtrip_missing_and_invalid_preserve_values() {
+        for &step in FullscreenWheelZoomStep::all() {
+            let source = Settings {
+                fullscreen_wheel_zoom_step: step,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            assert!(exported.issues.is_empty());
+            let mut destination = Settings {
+                fullscreen_wheel_zoom_step: different_enum(&step, FullscreenWheelZoomStep::all()),
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert!(
+                report
+                    .changed_fields
+                    .iter()
+                    .any(|label| label == "ホイールでの拡大・縮小の刻み")
+            );
+            assert_eq!(destination.fullscreen_wheel_zoom_step, step);
+            let report = parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.accepted_count, 0);
+            assert_eq!(destination.fullscreen_wheel_zoom_step, step);
+            // Transfer follows the existing enum policy: invalid imports leave the destination intact.
+            for invalid in [
+                json!("FutureStep"),
+                json!("Unknown"),
+                json!(true),
+                json!(50),
+                Value::Null,
+            ] {
+                let report = parse_preferences(&document(json!({
+                    "fullscreen_wheel_zoom_step": invalid
+                })))
+                .unwrap()
+                .apply_to(&mut destination);
+                assert_eq!(report.accepted_count, 0);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.fullscreen_wheel_zoom_step, step);
+            }
+        }
+    }
+
+    #[test]
     fn fullscreen_bound_drag_pan_transfer_roundtrip_missing_and_invalid_preserve_values() {
         for enabled in [false, true] {
             let source = Settings {
@@ -2424,20 +2479,20 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 508);
+        assert_eq!(entries.len(), 510);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            169
+            170
         );
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            339
+            340
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2452,6 +2507,7 @@ mod tests {
             "show_toolbar_search_metadata",
             "show_toolbar_search_everything",
             "show_toolbar_physical_parent_button",
+            "show_grid_edge_buttons",
         ] {
             assert!(
                 entries
@@ -2466,7 +2522,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 167);
+        assert_eq!(wire.len(), 168);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -3073,6 +3129,28 @@ mod tests {
             "Dark"
         );
         assert_eq!(settings.ui_theme, UiTheme::Light);
+    }
+
+    #[test]
+    fn section1855_grid_edge_buttons_are_excluded_from_transfer() {
+        for visible in [false, true] {
+            let mut source = Settings::default();
+            source.show_grid_edge_buttons = visible;
+            let exported = export_preferences(&source).unwrap();
+            let mut document: Value = serde_json::from_str(&exported.json).unwrap();
+            assert!(
+                document["preferences"]
+                    .get("show_grid_edge_buttons")
+                    .is_none()
+            );
+            // An injected key must also leave the destination's local toolbar state alone.
+            document["preferences"]["show_grid_edge_buttons"] = serde_json::json!(visible);
+            let mut destination = Settings::default();
+            destination.show_grid_edge_buttons = !visible;
+            let parsed = parse_preferences(&document.to_string()).unwrap();
+            parsed.apply_to(&mut destination);
+            assert_eq!(destination.show_grid_edge_buttons, !visible);
+        }
     }
 
     #[test]

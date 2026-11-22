@@ -6215,6 +6215,8 @@ fn paint_still_seek_preview(
 }
 /// ホイール感度（raw_scroll_delta の除数）
 const WHEEL_SENSITIVITY: f32 = 30.0;
+// Native egui projects one Line wheel notch to 40 logical points (InputOptions).
+const WHEEL_ZOOM_POINTS_PER_NOTCH: f32 = 40.0;
 
 pub(crate) fn metadata_panel_rect_with_seek_height(
     full_rect: egui::Rect,
@@ -15934,10 +15936,29 @@ impl App {
         zoom: &mut f32,
         pan: &mut egui::Vec2,
         wheel_y: f32,
+        step: crate::settings::FullscreenWheelZoomStep,
         mouse: Option<egui::Pos2>,
         rect_center: egui::Pos2,
     ) -> bool {
-        let factor = 1.1_f32.powf(wheel_y / WHEEL_SENSITIVITY);
+        use crate::settings::FullscreenWheelZoomStep;
+        let factor = match step.normalized() {
+            // Preserve the legacy expression, including its f32 rounding.
+            FullscreenWheelZoomStep::Standard => 1.1_f32.powf(wheel_y / WHEEL_SENSITIVITY),
+            step => {
+                let percent = match step {
+                    FullscreenWheelZoomStep::Percent5 => 5.0,
+                    FullscreenWheelZoomStep::Percent10 => 10.0,
+                    FullscreenWheelZoomStep::Percent20 => 20.0,
+                    FullscreenWheelZoomStep::Percent30 => 30.0,
+                    FullscreenWheelZoomStep::Percent50 => 50.0,
+                    FullscreenWheelZoomStep::Percent100 => 100.0,
+                    FullscreenWheelZoomStep::Standard | FullscreenWheelZoomStep::Unknown => {
+                        unreachable!()
+                    }
+                };
+                (1.0_f32 + percent / 100.0).powf(wheel_y / WHEEL_ZOOM_POINTS_PER_NOTCH)
+            }
+        };
         let old_zoom = *zoom;
         *zoom = (old_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
         if let Some(mouse) = mouse {
@@ -42306,6 +42327,7 @@ impl App {
                     &mut self.analysis_zoom,
                     &mut self.analysis_pan,
                     wheel_y,
+                    self.settings.fullscreen_wheel_zoom_step,
                     mouse,
                     image_rect.center(),
                 );
@@ -42341,6 +42363,7 @@ impl App {
                         &mut proposed_zoom,
                         &mut proposed_pan,
                         wheel_y,
+                        self.settings.fullscreen_wheel_zoom_step,
                         mouse,
                         default_image_rect.center(),
                     );
@@ -42743,6 +42766,7 @@ impl App {
                 &mut zoom,
                 &mut pan,
                 action.input.delta.y,
+                self.settings.fullscreen_wheel_zoom_step,
                 mouse,
                 image_rect.center(),
             ) {
@@ -74037,6 +74061,7 @@ mod tests {
                         &mut zoom,
                         &mut pan,
                         -WHEEL_SENSITIVITY,
+                        crate::settings::FullscreenWheelZoomStep::Standard,
                         Some(egui::Pos2::ZERO),
                         egui::Pos2::ZERO
                     ));
