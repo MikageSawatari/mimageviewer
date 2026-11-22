@@ -364,7 +364,23 @@ fn sort_worker_849_everything_physical_child_sorts_and_preserves_selected_name()
     else {
         panic!("Everything retained")
     };
-    assert_eq!(after, &position);
+    assert!(matches!(
+        (after, &position),
+        (
+            crate::global_search_ui::EverythingPosition::PhysicalChild {
+                logical_source,
+                return_anchor,
+                route,
+            },
+            crate::global_search_ui::EverythingPosition::PhysicalChild {
+                logical_source: expected_source,
+                return_anchor: expected_anchor,
+                route: expected_route,
+            },
+        ) if logical_source == expected_source
+            && return_anchor == expected_anchor
+            && route == expected_route
+    ));
     assert_eq!(
         h.env.top_level_grid_view.surface(),
         &TopLevelGridSurface::Search(TopLevelSearchView::Global)
