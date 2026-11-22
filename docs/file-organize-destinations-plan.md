@@ -144,7 +144,10 @@ App が持つ新しい状態は、この機能の一つの request owner（非�
 分類は中断ありまたは cancel HRESULT (`0x80270000` / `0x800704C7`) なら Interrupted、実行成功かつ中断なしなら Completed、それ以外は Failed。
 中断照会失敗を false にしない。別の実行失敗が中断と併発したら元の HRESULT も表示する。
 `PostMoveItem / PostCopyItem` sink が元の parsing name・先フォルダ・新名・HRESULT・作成後の parsing name を記録し、常に S_OK を返す。
-処理済みは S_OK / COPYENGINE_S_ALREADY_DONE、その他の成功コードは skipped、失敗 HRESULT は failed に数える。
+失敗 HRESULT は failed、成功 HRESULT かつ作成後 item が非 null なら processed、成功かつ null なら skipped に数える。
+名前取得の成否ではなく callback の item の有無を使い、詳細上限を超えても全件に適用する。
+設計担当の Windows 11 / NTFS 実 Shell 観測 (2026-11-22) では完了した Move が `0x00270008` と作成後 item を返した。
+最初の失敗 HRESULT は `first_failed_hresult` として結果と終端ログに残す。
 callback 全件を集計し、詳細は50件と省略数まで `shell_transfer:` の開始／項目別／終端ログに残す。
 共通 id、requested/resolved 操作、source 件数、先、実行 HRESULT、中断照会結果、各件数の形式は
 [Shell 終端契約](folder-tree-dnd-plan.md#81-1858-a-shell-転送名前変更の終端契約) を正本とする。
@@ -192,6 +195,8 @@ Windows の処理が始まった後は Remote 接続や終了要求を理由に�
 「操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください」、なしなら
 「操作が中断されました。移動・コピーした項目はありません」。失敗は
 「操作を完了できませんでした。フォルダの内容を確認してください」に、処理済みありならその旨を続け、次行に元の HRESULT と中断照会状態を併記する。
+中断で失敗項目がある場合は2行目に `失敗した項目: {n} 件 (Shell: 0x{hr:08X})` (最初の失敗 HRESULT) を追加する。
+Failed の理由行は最初の項目失敗 HRESULT が実行 HRESULT と異なる場合に `、項目: 0xHHHHHHHH` を末尾へ追加する。
 abort は利用者取消と断定しない。[Microsoft Learn: GetAnyOperationsAborted](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifileoperation-getanyoperationsaborted) は利用者またはシステムによる中断を含む。
 再走査の読取失敗は既存処理に任せ (`src/app.rs:22203`)、専用の再試行、途中状態保存、再起動後の再開を作らない。
 

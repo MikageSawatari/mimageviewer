@@ -885,6 +885,10 @@ ROOT の HWND を得た最初のフレームで、winit が登録した受け取
      `CopyOutcome::all_failed(attempted, msg)` で扱う。
      実行後は成功・失敗にかかわらず中断状態を照会し、両結果を別々に保持する。
      sink の処理済み／失敗／skip を全件集計、詳細は50件まで `shell_transfer:` へ記録する。
+     失敗 HRESULT は failed、成功かつ作成後 item が非 null なら processed、成功かつ null なら skipped。
+     詳細上限を超えても同じ規則を使い、最初の失敗 HRESULT は結果と終端ログへ保持する。
+     中断で失敗項目があれば2行目に `失敗した項目: {n} 件 (Shell: 0x{hr:08X})` を追加する。
+     Failed の理由行は最初の項目失敗 HRESULT が実行 HRESULT と異なる場合に `、項目: 0xHHHHHHHH` を末尾へ追加する。
      callback 件数を要求件数へ当てはめて成功数を推測せず、実行後の結果は notice にする。再試行しない。
 - UI 側の受け取り経路:
   - 完了は `App::drop_copy_pending: Vec<Receiver<CopyOutcome>>` に積まれ、

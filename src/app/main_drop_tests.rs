@@ -478,7 +478,7 @@ fn main_drop_production_grid_routing_reaches_existing_search_refusal() {
 
 #[test]
 fn main_drop_858_completed_transfers_observe_each_parent_and_notify_current_folder_once() {
-    for terminal in 0..6 {
+    for terminal in 0..8 {
         let mut app = ready();
         let ctx = egui::Context::default();
         let root = app.tmp.path().join("tree");
@@ -525,6 +525,20 @@ fn main_drop_858_completed_transfers_observe_each_parent_and_notify_current_fold
                 Err(0x80004005u32 as i32),
                 0,
             )),
+            6 | 7 => {
+                let mut outcome = ShellTransferOutcome::test_outcome(
+                    if terminal == 6 {
+                        0
+                    } else {
+                        0x80070005u32 as i32
+                    },
+                    Ok(terminal == 6),
+                    0,
+                );
+                outcome.counts.failed = 1;
+                outcome.counts.first_failed_hresult = Some(0x80270027u32 as i32);
+                Ok(outcome)
+            }
             _ => Err("fake transfer failure".into()),
         })
         .unwrap();
@@ -545,6 +559,12 @@ fn main_drop_858_completed_transfers_observe_each_parent_and_notify_current_fold
             ),
             5 => Some(
                 "操作を完了できませんでした。フォルダの内容を確認してください\nShell: 0x00000000、中断状態: 照会失敗 0x80004005",
+            ),
+            6 => Some(
+                "操作が中断されました。移動・コピーした項目はありません\n失敗した項目: 1 件 (Shell: 0x80270027)",
+            ),
+            7 => Some(
+                "操作を完了できませんでした。フォルダの内容を確認してください\nShell: 0x80070005、中断状態: 中断なし、項目: 0x80270027",
             ),
             _ => unreachable!(),
         };

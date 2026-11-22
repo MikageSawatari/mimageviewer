@@ -30,6 +30,7 @@ pub struct ShellItemCounts {
     pub processed: usize,
     pub failed: usize,
     pub skipped: usize,
+    pub first_failed_hresult: Option<i32>,
 }
 
 // Store signed HRESULT bits so worker results remain usable on non-Windows builds.
@@ -97,12 +98,27 @@ impl ShellTransferOutcome {
                 message
             }
         };
+        if classification == ShellOperationClassification::Interrupted
+            && self.counts.failed > 0
+            && let Some(hr) = self.counts.first_failed_hresult
+        {
+            message.push_str(&format!(
+                "\n失敗した項目: {} 件 (Shell: 0x{hr:08X})",
+                self.counts.failed,
+            ));
+        }
         if classification == ShellOperationClassification::Failed
             || (self.perform_hresult < 0 && !is_cancel_hresult(self.perform_hresult))
             || self.abort_query.is_err()
         {
             message.push('\n');
             message.push_str(&self.short_reason());
+            if classification == ShellOperationClassification::Failed
+                && let Some(hr) = self.counts.first_failed_hresult
+                && hr != self.perform_hresult
+            {
+                message.push_str(&format!("、項目: 0x{hr:08X}"));
+            }
         }
         Some(message)
     }
@@ -145,21 +161,22 @@ struct ShellItemResults {
 }
 
 impl ShellItemResults {
-    fn count(&mut self, hresult: i32) {
-        // Only S_OK and ALREADY_DONE establish completed work. Dialog decisions,
-        // merge/ignore, pending and unknown success codes do not establish it.
-        // windows 0.61.3 UI::Shell constants; Microsoft SDK sherrors.h:
-        // https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/um/sherrors.h
-        // https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-itransfersource-moveitem
-        match hresult {
-            0 | 0x0027000A => self.counts.processed += 1, // COPYENGINE_S_ALREADY_DONE
-            hr if hr < 0 => self.counts.failed += 1,
-            _ => self.counts.skipped += 1,
+    fn count(&mut self, hresult: i32, has_created: bool) {
+        // Windows 11/NTFS probe (2026-11-22): a completed same-volume move returns
+        // COPYENGINE_S_DONT_PROCESS_CHILDREN (0x00270008) with a created item.
+        // Count the callback's item presence, independently of parsing-name lookup.
+        // https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifileoperationprogresssink-postmoveitem
+        if hresult < 0 {
+            self.counts.failed += 1;
+            self.counts.first_failed_hresult.get_or_insert(hresult);
+        } else if has_created {
+            self.counts.processed += 1;
+        } else {
+            self.counts.skipped += 1;
         }
     }
 
     fn record(&mut self, item: ShellItemResult) {
-        self.count(item.hresult);
         if self.details.len() < SHELL_ITEM_DETAIL_LIMIT {
             self.details.push(item);
         }
@@ -222,8 +239,12 @@ impl ShellOperationLog {
             Ok(value) => format!("Ok({value})"),
             Err(hr) => format!("Err(0x{hr:08X})"),
         };
+        let first_failed = match outcome.counts.first_failed_hresult {
+            Some(hr) => format!("0x{hr:08X}"),
+            None => "None".to_owned(),
+        };
         crate::logger::log(format!(
-            "{prefix}: end id={id} classification={:?} perform=0x{:08X} abort={abort} processed={} failed={} skipped={}",
+            "{prefix}: end id={id} classification={:?} perform=0x{:08X} abort={abort} processed={} failed={} skipped={} first_failed_hresult={first_failed}",
             outcome.classification(),
             outcome.perform_hresult,
             outcome.counts.processed,
@@ -296,6 +317,7 @@ impl ShellResultSink_Impl {
         hr: windows::core::HRESULT,
         created: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
     ) {
+        let has_created = created.as_ref().is_some();
         {
             let Ok(mut items) = self.items.lock() else {
                 crate::logger::log(format!(
@@ -308,8 +330,8 @@ impl ShellResultSink_Impl {
                 ));
                 return;
             };
+            items.count(hr.0, has_created);
             if items.details.len() >= SHELL_ITEM_DETAIL_LIMIT {
-                items.count(hr.0);
                 return;
             }
         }
@@ -1062,31 +1084,62 @@ mod transfer_tests {
 
     #[test]
     fn shell_op_858_counts_only_completed_items_and_bounds_detail() {
-        let mut items = ShellItemResults::default();
-        for hr in [0, 0x0027000A] {
-            items.record(callback_item(hr));
-        }
         for hr in [
-            1, 0x00270001, 0x00270003, 0x00270004, 0x00270005, 0x00270006, 0x00270008, 0x0027000B,
-            0x0027000C, 0x0027000D, 0x0027000E, 0x0027000F, 0x00270010, 0x00270011, 0x0027FFFF,
+            0, 1, 0x00270001, 0x00270003, 0x00270004, 0x00270005, 0x00270006, 0x00270008,
+            0x0027000A, 0x0027000B, 0x0027000C, 0x0027000D, 0x0027000E, 0x0027000F, 0x00270010,
+            0x00270011, 0x0027FFFF,
         ] {
-            items.record(callback_item(hr));
+            for has_created in [false, true] {
+                let mut items = ShellItemResults::default();
+                // Item presence must count even when its parsing name is unavailable.
+                items.count(hr, has_created);
+                items.record(callback_item(hr));
+                assert_eq!(
+                    items.counts,
+                    ShellItemCounts {
+                        processed: usize::from(has_created),
+                        skipped: usize::from(!has_created),
+                        ..Default::default()
+                    },
+                    "hr=0x{hr:08X}, created={has_created}"
+                );
+            }
         }
-        items.record(callback_item(0x80070005u32 as i32));
+        let failure = 0x80270027u32 as i32;
+        for has_created in [false, true] {
+            let mut items = ShellItemResults::default();
+            items.count(failure, has_created);
+            items.record(callback_item(failure));
+            assert_eq!(
+                items.counts,
+                ShellItemCounts {
+                    failed: 1,
+                    first_failed_hresult: Some(failure),
+                    ..Default::default()
+                }
+            );
+        }
+        let mut items = ShellItemResults::default();
+        for _ in 0..SHELL_ITEM_DETAIL_LIMIT {
+            items.count(0, true);
+            items.record(callback_item(0));
+        }
+        // The count-only path must retain item presence and the first failure too.
+        items.count(0x00270008, true);
+        items.count(0, false);
+        items.count(failure, false);
+        items.count(0x80070005u32 as i32, true);
         assert_eq!(
             items.counts,
             ShellItemCounts {
-                processed: 2,
-                failed: 1,
-                skipped: 15
+                processed: SHELL_ITEM_DETAIL_LIMIT + 1,
+                skipped: 1,
+                failed: 2,
+                first_failed_hresult: Some(failure),
             }
         );
-        for _ in 0..100 {
-            items.record(callback_item(0));
-        }
-        assert_eq!(items.counts.processed, 102);
         assert_eq!(items.details.len(), SHELL_ITEM_DETAIL_LIMIT);
-        assert_eq!(items.omitted(), 68);
+        assert_eq!(items.omitted(), 4);
         let skipped = ShellTransferOutcome {
             perform_hresult: 0,
             abort_query: Ok(true),
@@ -1099,6 +1152,54 @@ mod transfer_tests {
             skipped.notice(false).as_deref(),
             Some("操作が中断されました。移動・コピーした項目はありません")
         );
+    }
+
+    #[test]
+    fn shell_op_858_item_failure_notices_keep_first_hresult() {
+        let failure = 0x80270027u32 as i32;
+        let other_failure = 0x80070005u32 as i32;
+        for rename in [false, true] {
+            for processed in [0, 1] {
+                let mut outcome = ShellTransferOutcome::test_outcome(0, Ok(true), processed);
+                outcome.counts.failed = 2;
+                outcome.counts.first_failed_hresult = Some(failure);
+                let headline = if processed > 0 {
+                    "操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください"
+                } else if rename {
+                    "名前の変更は中断されました"
+                } else {
+                    "操作が中断されました。移動・コピーした項目はありません"
+                };
+                assert_eq!(
+                    outcome.notice(rename).unwrap(),
+                    format!("{headline}\n失敗した項目: 2 件 (Shell: 0x80270027)")
+                );
+                outcome.perform_hresult = other_failure;
+                let message = outcome.notice(rename).unwrap();
+                assert_eq!(
+                    message.lines().nth(1),
+                    Some("失敗した項目: 2 件 (Shell: 0x80270027)")
+                );
+                assert_eq!(
+                    message.lines().nth(2),
+                    Some("Shell: 0x80070005、中断状態: 中断あり")
+                );
+                outcome.abort_query = Ok(false);
+                let message = outcome.notice(rename).unwrap();
+                assert!(
+                    message.ends_with("Shell: 0x80070005、中断状態: 中断なし、項目: 0x80270027")
+                );
+                outcome.perform_hresult = failure;
+                let message = outcome.notice(rename).unwrap();
+                assert!(message.ends_with("Shell: 0x80270027、中断状態: 中断なし"));
+                assert!(!message.contains("、項目:"));
+                outcome.perform_hresult = 0;
+                outcome.abort_query = Err(other_failure);
+                assert!(outcome.notice(rename).unwrap().ends_with(
+                    "Shell: 0x00000000、中断状態: 照会失敗 0x80070005、項目: 0x80270027"
+                ));
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -1132,6 +1233,56 @@ mod transfer_tests {
     }
 
     #[cfg(windows)]
+    #[windows::core::implement(windows::Win32::UI::Shell::IShellItem)]
+    struct ShellOp858CreatedItem;
+
+    #[cfg(windows)]
+    #[allow(non_snake_case)]
+    impl windows::Win32::UI::Shell::IShellItem_Impl for ShellOp858CreatedItem_Impl {
+        fn BindToHandler(
+            &self,
+            _: windows::core::Ref<windows::Win32::System::Com::IBindCtx>,
+            _: *const windows::core::GUID,
+            _: *const windows::core::GUID,
+            _: *mut *mut core::ffi::c_void,
+        ) -> windows::core::Result<()> {
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_NOTIMPL,
+            ))
+        }
+        fn GetParent(&self) -> windows::core::Result<windows::Win32::UI::Shell::IShellItem> {
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_NOTIMPL,
+            ))
+        }
+        fn GetDisplayName(
+            &self,
+            _: windows::Win32::UI::Shell::SIGDN,
+        ) -> windows::core::Result<windows::core::PWSTR> {
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_NOTIMPL,
+            ))
+        }
+        fn GetAttributes(
+            &self,
+            _: windows::Win32::System::SystemServices::SFGAO_FLAGS,
+        ) -> windows::core::Result<windows::Win32::System::SystemServices::SFGAO_FLAGS> {
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_NOTIMPL,
+            ))
+        }
+        fn Compare(
+            &self,
+            _: windows::core::Ref<windows::Win32::UI::Shell::IShellItem>,
+            _: u32,
+        ) -> windows::core::Result<i32> {
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_NOTIMPL,
+            ))
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
     fn shell_op_858_sink_records_failures_without_stopping_later_items() {
         use windows::Win32::UI::Shell::{IFileOperationProgressSink, IShellItem};
@@ -1143,6 +1294,7 @@ mod transfer_tests {
         }
         .into();
         let none = None::<&IShellItem>;
+        let created: IShellItem = ShellOp858CreatedItem.into();
         let failure = HRESULT(0x80070005u32 as i32);
         unsafe {
             sink.PostMoveItem(0, none, none, PCWSTR::null(), failure, none)
@@ -1153,26 +1305,59 @@ mod transfer_tests {
                 .unwrap();
             sink.PostCopyItem(0, none, none, PCWSTR::null(), HRESULT(0), none)
                 .unwrap();
+            sink.PostCopyItem(0, none, none, PCWSTR::null(), HRESULT(0), &created)
+                .unwrap();
+            sink.PostMoveItem(0, none, none, PCWSTR::null(), HRESULT(0x00270008), &created)
+                .unwrap();
+            sink.PostRenameItem(0, none, PCWSTR::null(), HRESULT(0x00270008), &created)
+                .unwrap();
         }
-        let items = items.lock().unwrap();
+        let recorded = items.lock().unwrap();
         assert_eq!(
-            items.counts,
+            recorded.counts,
             ShellItemCounts {
-                processed: 1,
+                processed: 3,
                 failed: 3,
-                skipped: 0
+                skipped: 1,
+                first_failed_hresult: Some(failure.0),
             }
         );
         assert_eq!(
-            items
+            recorded
                 .details
                 .iter()
                 .map(|item| item.kind)
                 .collect::<Vec<_>>(),
-            ["Move", "Copy", "Rename", "Copy"]
+            ["Move", "Copy", "Rename", "Copy", "Copy", "Move", "Rename"]
         );
-        assert_eq!(items.details[2].destination.as_deref(), Some(r"C:\source"));
-        assert_eq!(items.details[0].hresult, failure.0);
+        assert_eq!(
+            recorded.details[2].destination.as_deref(),
+            Some(r"C:\source")
+        );
+        assert_eq!(recorded.details[0].hresult, failure.0);
+        drop(recorded);
+        for _ in 7..SHELL_ITEM_DETAIL_LIMIT {
+            unsafe { sink.PostCopyItem(0, none, none, PCWSTR::null(), HRESULT(0), none) }.unwrap();
+        }
+        unsafe {
+            sink.PostMoveItem(0, none, none, PCWSTR::null(), HRESULT(0x00270008), &created)
+                .unwrap();
+            sink.PostRenameItem(
+                0,
+                none,
+                PCWSTR::null(),
+                HRESULT(0x80004005u32 as i32),
+                &created,
+            )
+            .unwrap();
+        }
+        let recorded = items.lock().unwrap();
+        assert_eq!(recorded.counts.processed, 4);
+        assert_eq!(recorded.counts.failed, 4);
+        assert_eq!(recorded.counts.skipped, 44);
+        assert_eq!(recorded.counts.first_failed_hresult, Some(failure.0));
+        assert_eq!(recorded.details.len(), SHELL_ITEM_DETAIL_LIMIT);
+        assert_eq!(recorded.omitted(), 2);
     }
 
     fn request(
@@ -1494,16 +1679,18 @@ mod transfer_tests {
         .join()
         .unwrap()
         .unwrap();
-        assert_ne!(
+        // Windows 11/NTFS with suppressed UI: perform=S_OK, abort=Ok(true),
+        // with one failed folder callback. The item failure is not the perform HR.
+        assert_eq!(
             outcome.classification(),
-            ShellOperationClassification::Completed
+            ShellOperationClassification::Interrupted
         );
-        assert!(outcome.perform_hresult < 0, "{outcome:?}");
-        assert!(
-            outcome.abort_query.is_ok(),
-            "abort query must run after PerformOperations fails: {outcome:?}"
-        );
+        assert_eq!(outcome.abort_query, Ok(true));
         assert!(outcome.counts.failed > 0);
+        assert_eq!(outcome.counts.processed, 0);
+        let notice = outcome.notice(false).unwrap();
+        assert!(notice.contains("移動・コピーした項目はありません"));
+        assert!(notice.lines().nth(1).unwrap().starts_with("失敗した項目: "));
         assert!(folder.is_dir());
         assert!(!destination.join("source").exists());
         let canonical_folder = std::fs::canonicalize(&folder).unwrap();
@@ -1562,6 +1749,7 @@ mod transfer_tests {
                 "file and folder callbacks: {result:?}"
             );
             assert_eq!(result.counts.failed, 0);
+            assert_eq!(result.counts.skipped, 0);
             assert_eq!(
                 std::fs::read(destination.join("file.txt")).unwrap(),
                 b"file contents"

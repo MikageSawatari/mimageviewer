@@ -270,7 +270,12 @@ Interrupted と別の実行失敗が同時にある場合、その HRESULT も�
 `MoveItem / CopyItem / RenameItem` に同じ操作の `IFileOperationProgressSink` を渡す。Advise の登録・解除状態を増やさず、
 `PostMoveItem / PostCopyItem / PostRenameItem` で操作種別、元の parsing name、先フォルダ、新名、HRESULT、作成後の parsing name を記録する。
 callback は失敗の HRESULT を受けても常に S_OK を返す。フォルダの子の callback も全件集計し、詳細は先頭50件と省略数に限定する。
-処理済みは `S_OK` と `COPYENGINE_S_ALREADY_DONE` のみ。ignore、merge、pending、dialog decision 等と未知の成功コードは skipped に数える。
+失敗 HRESULT は failed、成功 HRESULT かつ callback の作成後 item (`psiNewlyCreated`) が非 null なら processed、成功かつ null なら skipped に数える。
+parsing name の取得成否ではなく item の有無を使い、詳細上限を超えた callback と名前変更も同じ規則で数える。
+最初の失敗 HRESULT は詳細上限に関係なく `first_failed_hresult` に保持する。
+2026-11-22 設計担当の Windows 11 / NTFS 実 Shell 観測では、完了した同一ボリューム Move が
+`COPYENGINE_S_DONT_PROCESS_CHILDREN` (`0x00270008`) と作成後 item を返したため、成功コードの列挙で処理済みを判定しない。
+また、使用中フォルダの Move は試験用 UI 抑止時に実行 HRESULT が S_OK、中断照会が `Ok(true)`、項目 callback が失敗だった。
 この件数は callback の件数であり、要求した source 件数とは限らない。まれな記録失敗はログで終え、回復機構は作らない。
 
 ログ形式 (`prefix` は `shell_transfer` / `shell_rename`、id はプロセス内共通の連番、文字列は Debug 表記):
@@ -279,7 +284,7 @@ callback は失敗の HRESULT を受けても常に S_OK を返す。フォル�
 {prefix}: start id={id} requested={Copy|Move|Rename} resolved={Copy|Move|Rename} sources={count} destination={path:?}
 {prefix}: item id={id} kind={Copy|Move|Rename} source={Option<String>:?} destination={Option<String>:?} new_name={Option<String>:?} hr=0x{HRESULT:08X} created={Option<String>:?}
 {prefix}: item id={id} ... and {omitted} more
-{prefix}: end id={id} classification={Completed|Interrupted|Failed} perform=0x{HRESULT:08X} abort={Ok(true)|Ok(false)|Err(0xHHHHHHHH)} processed={count} failed={count} skipped={count}
+{prefix}: end id={id} classification={Completed|Interrupted|Failed} perform=0x{HRESULT:08X} abort={Ok(true)|Ok(false)|Err(0xHHHHHHHH)} processed={count} failed={count} skipped={count} first_failed_hresult={0xHHHHHHHH|None}
 ```
 
 開始行は全件予約後、実行直前に出す。requested は volume check 前、resolved は後の操作。名前変更は両方 Rename、先は元の親。
@@ -287,9 +292,11 @@ callback は失敗の HRESULT を受けても常に S_OK を返す。フォル�
 
 - Interrupted、処理済みあり: 「操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください」
 - Interrupted、処理済みなし: 「操作が中断されました。移動・コピーした項目はありません」(名前変更: 「名前の変更は中断されました」)
+- Interrupted、失敗項目あり: 2行目に `失敗した項目: {n} 件 (Shell: 0x{hr:08X})` (最初の失敗 HRESULT) を追加する。
 - Failed: 「操作を完了できませんでした。フォルダの内容を確認してください」。処理済みありなら同じ行に「一部の項目は処理済みです」を続ける。
   次行は `Shell: 0xHHHHHHHH、中断状態: 中断あり / 中断なし / 照会失敗 0xHHHHHHHH`。
-  Interrupted でも非 cancel の実行失敗または照会失敗があれば、この理由行を併記する。
+  最初の項目失敗 HRESULT が実行 HRESULT と異なる場合は `、項目: 0xHHHHHHHH` を理由行の末尾へ追加する。
+  Interrupted でも非 cancel の実行失敗または照会失敗があれば、この理由行を併記する (項目失敗行があればその後)。
 
 整理先・ツリーは全結果で従来の tree observe + 現在実フォルダの再確認、外部から一覧へのコピーは全結果で従来の `pending_reload` を維持する。
 実行後の結果を「全要求が成功／失敗」と推測して `CopyOutcome` の要求件数へ当てはめず、共通 notice で知らせる。

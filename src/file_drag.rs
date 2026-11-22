@@ -533,6 +533,34 @@ mod file_drop_worker_tests {
     }
 
     #[test]
+    fn dropped_paths_858_item_failure_notice_is_preserved() {
+        for (perform, aborted, expected) in [
+            (
+                0,
+                true,
+                "操作が中断されました。移動・コピーした項目はありません\n失敗した項目: 1 件 (Shell: 0x80270027)",
+            ),
+            (
+                0x80070005u32 as i32,
+                false,
+                "操作を完了できませんでした。フォルダの内容を確認してください\nShell: 0x80070005、中断状態: 中断なし、項目: 0x80270027",
+            ),
+        ] {
+            let mut shell = ShellTransferOutcome::test_outcome(perform, Ok(aborted), 0);
+            shell.counts.failed = 1;
+            shell.counts.first_failed_hresult = Some(0x80270027u32 as i32);
+            let outcome = copy_dropped_paths_blocking(
+                None,
+                vec!["folder".into()],
+                "destination".into(),
+                |_, _| Ok(shell),
+            );
+            assert_eq!(outcome.notice.as_deref(), Some(expected));
+            assert_eq!(outcome.failed, 0);
+        }
+    }
+
+    #[test]
     fn dropped_paths_worker_preserves_error_as_first_failure() {
         let outcome = copy_dropped_paths_blocking(
             None,
