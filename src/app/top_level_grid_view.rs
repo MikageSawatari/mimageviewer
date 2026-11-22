@@ -1548,20 +1548,18 @@ impl super::App {
             && self.zip_enumerate_pending.is_none()
             && self.pdf_enumerate_pending.is_none()
             && self.zip_nav.is_none()
-            // A directory scan record proves a directory even if the legacy
-            // book recipe classified its .epub/.pdf spelling as a Document.
-            && !(self.folder_observation.is_none()
-                && matches!(
-                    self.projection_recipe,
-                    super::book_materialization::ProjectionRecipe::Book(
-                        super::book_materialization::BookScope::Document(_)
-                    )
-                ))
+            && !matches!(
+                self.projection_recipe,
+                super::book_materialization::ProjectionRecipe::Book(
+                    super::book_materialization::BookScope::Document(_)
+                )
+            )
             && !self.items.first().is_some_and(|item| {
                 matches!(item, crate::grid_item::GridItem::PdfPage { .. })
-                    && self.items.iter().all(|item| {
-                        matches!(item, crate::grid_item::GridItem::PdfPage { .. })
-                    })
+                    && self
+                        .items
+                        .iter()
+                        .all(|item| matches!(item, crate::grid_item::GridItem::PdfPage { .. }))
             })
     }
 

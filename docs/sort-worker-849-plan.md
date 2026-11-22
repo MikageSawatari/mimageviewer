@@ -1,6 +1,6 @@
 # 長さ以外の並べ替えも worker で走査する (§1.849)
 
-- 状態: 実装・独立ソースレビュー完了 (2026-11-22)。実行検証は設計担当へ引き継ぎ。v5.6.0 で直す (利用者決定、統括経由)。
+- 状態: 実装レビュー r1 の P2/P3 修正・独立ソース再レビュー完了 (2026-11-22)。修正後の実行検証は設計担当へ引き継ぎ。v5.6.0 で直す (利用者決定、統括経由)。
 - 利用者の言葉: 「長さの件、v5.6.0 で直すことにしたいと思います。修正お願いします。」
   - その前に、統括が変わる動きを説明している。小さいフォルダでも数フレームは前の並びが残り、そのあいだのキーは止まる。
 - 枝: `sort-worker-849` (master d190b67cc から)。
@@ -123,7 +123,7 @@
 
 - 新しい待機状態・入力ゲート・選択復元処理は追加していない。既存 `preserve_cursor_hint_for_reload()` を採用時に使う。
 - `grid_sort_lock_reason()` は走査判定に使っていない。タグの物理子の FixedOrder は、変換後の内容更新を妨げない。
-- 実ディレクトリの `.epub` / `.pdf` 名を既存の book recipe が Document と分類することがあるため、recipe だけで除外しない。受理済み directory scan の既存 `folder_observation` があれば物理ディレクトリとして扱う。非空の実ページ列は `PdfPage` 行で除外し、空の文書列も既存の Document recipe と scan owner の不在で除外する。述語に拡張子判定・新しい状態・I/O はない。
+- 初回実装では `.epub` / `.pdf` 名の実ディレクトリを誤分類する既存 recipe を `folder_observation` の有無で補っていた。この方法は実装レビュー r1 の P2 で不十分と判明し、下記の r1 対応で撤去した。非空の実ページ列の `PdfPage` 行による除外は維持。
 - `zip_nav`・検索・タグ・評価・ブックマーク・Smart・サブフォルダ展開の先行分岐、§1.838 の製品ゲート/表示、detached の述語/viewport は変更していない。
 
 #### `reload_from_sort_control` の分岐を残す理由
@@ -225,3 +225,46 @@ test(/section1795_off_refresh_and_sort_preserve_current_position/)
 - ビルド・テスト・check は利用者指示により一切実行していない。確認用バイナリも同じ指示により作っていない。共有実行口での自動検証と実機確認は未実施。
 - 独立レビュー: 実装と別 context の `gpt-6.1-sol` / `xhigh`、read-only のソース検査。初回の追加テストにあった非 Copy 値の move を `.clone()` に修正し、main 採用後の兄弟不変検査を追加した最終差分に **ACCEPT / STRUCTURAL: AGREE**。未解決指摘なし。reviewer も cargo/build/test/check を実行していない。
 - git の commit/reset/stash/checkout は実行していない。まれな失敗は従来の worker の通知/終了処理をそのまま使い、回復機構を追加していない。
+
+#### 実装レビュー r1 対応 (2026-11-22、76aaa4617 上の差分)
+
+統括からの実装レビュー結果は **REVISE / STRUCTURAL: AGREE**。76aaa4617 の関連 782 本成功は統括の報告であり、以下の修正後の実行結果ではない。
+
+**P2: 案(a)、一覧採用時の既存 recipe の分類を正す。**
+
+- `src/app.rs` の `install_loading_items_inner` で、受理済みディレクトリ走査から渡された既存の `folder_signature` を根拠に `ProjectionRecipe::for_scanned_directory` を使う。明示された抽出結果等の `VisibleInstallAuthority::Projection` / Rating は従来どおり優先する。
+- `src/app/book_materialization.rs` の新しい directory 用入口は、既存と同じ Book/Ordinary 判定と動画・音声の除外を保ち、Book の source scope だけを `ImageFolder` / `CompiledFolder` として確定する。実ディレクトリを拡張子で Document/Archive に分類しない。通常の文書/書庫の `for_physical` による分類は従来どおり。
+- Book/Ordinary の判定条件を複製しないため、`src/app.rs` の `physical_page_order_locked` の条件式を純粋な `physical_page_order_locked_with_books_root` へ抽出し、既存の入口は wrapper とした。recipe の両入口は共通 helper で books root を一回だけ解決し、同じパスを policy と scope の決定に使う。既定 root が Windows Shell の既知フォルダ照会を使うことも確認し、追加の照会を行わない形にした。新たな stat / is_dir / read_dir 等の UI I/O はない。
+- `src/app/top_level_grid_view.rs` の述語は、正しく生成された既存 Document recipe とページ行で文書を除外する。`folder_observation` の有無は一切使わない。新しい bool・sentinel・App/bundle/snapshot field は追加していない。
+- 案(b)の観測の複製は採らない。受動観測の破棄と一覧分類の寿命は異なり、帰路ごとに観測を保存する形では同じ依存が残る。分類を作る時点で既存 recipe を正せば、既存の保存・復元がそのまま正しい分類を運ぶ。
+
+**ほかの保存・復元経路のソース確認。**
+
+| 経路 | 分類の扱いと確認結果 |
+| --- | --- |
+| Snapshot 固定→子→一覧復帰→解除 | `activate_snapshot` が `saved_projection_recipe` を保存し、`snapshot_return_to_list_view` は固定一覧用 recipe、`deactivate_snapshot` は元の recipe を items と対で復元する。観測が子 ZIP で消えても、正しい元 recipe は残る。指定の経路を回帰に追加 |
+| Snapshot の DirectMedia 基底復元・viewer context への保存列移譲 | 既存の `saved_projection_recipe` と items を一緒に運ぶ。recipe の分類を作り直さず、受動観測の有無にも依存しないため同じ修正が効く。これらの経路・detached 述語/viewport は変更していない |
+| Global 検索から戻る | `close_global_search` → `restore_view_return_origin` → `dispatch_main_list_restore_destination`。保存 rows の直接復元ではなく、物理の戻り先は既存 navigation で再走査・再採用するため修正した directory 分類境界を通る |
+| お気に入り検索から戻る | `close_favsearch` → 同じ `restore_view_return_origin`。物理の戻り先は同じ再走査・採用境界を通る |
+| タグ検索から戻る | `close_tag_view` → 同じ `restore_view_return_origin`。物理子・戻り先とも同じ directory 分類が使われる |
+| 閲覧履歴から戻る | `exit_reading_history_root` → `dispatch_main_list_restore_destination` → `dispatch_owned_folder_history_destination`。物理の戻り先は `start_physical_navigation_owned` で再走査・再採用される |
+| Stack の再採用 | 初回の受理済み directory 列の recipe を既存の Stack 要求・`VisibleInstallAuthority::Projection` が運ぶ。追加の分類状態や観測の復元は不要 |
+
+検索・お気に入り検索・閲覧履歴では、Snapshot と同じ「保存 rows を戻すが観測は戻さない」処理は見つからなかった。再採用後の分類も観測の寿命から独立している。
+
+**P3: 走査失敗通知も検出する。**
+
+- `src/app/tests/sort_hold_838/worker_849.rs` のドライブ一覧と ZIP 列挙待ちのテストで、環境設定の適用前後の `feedback_toasts_for_test` 全体が同じであることを追加した。既存の pending/rows/世代/場所、ZIP owner/cancel の assert も維持。
+- これにより、旧 Immediate が合成パスの同期走査に失敗し、rows を保持したまま「フォルダを読み取れませんでした」等の通知だけを出す場合も失敗する。`FeedbackKind` の既存 Eq/Debug を確認し、製品型への derive は追加していない。
+
+**追加・補強したテスト名。**
+
+| 種別 | テスト名 | 内容 |
+| --- | --- | --- |
+| 追加 | `sort_worker_849_snapshot_child_zip_return_unpin_keeps_directory_reload` | `.epub` 名の実ディレクトリを読み込み、固定→実際の子 ZIP 列挙→一覧復帰→解除で観測が無いまま rows/recipe が復元されること、その後の表示順変更が worker を開始し完了採用することを検査 |
+| 追加 | `sort_worker_849_scanned_directory_recipe_keeps_book_policy_without_container_scope` | 空/ZIP行/画像/音声の directory 列を純粋関数で比較し、既存の Book/Ordinary 方針を保った directory scope、通常の文書 scope、CompiledFolder scope を検査 |
+| 補強 | `sort_worker_849_drive_list_preferences_do_not_scan_or_replace_rows` | 環境設定適用による通知全体の無変更を追加 |
+| 補強 | `sort_worker_849_zip_enumeration_preferences_leave_owner_and_use_latest_order` | 同じ通知全体の無変更を追加 |
+
+- 独立した `gpt-6.1-sol` / `xhigh` に案(a)の設計と最終の affected paths を read-only で再レビューしてもらい、**ACCEPT / STRUCTURAL: AGREE**、未解決指摘なし。reviewer は cargo・fmt・編集・git mutation を実行していない。
+- 修正担当は `cargo fmt` のみ実施。ビルド・テスト・check・確認用ビルドは利用者指示により未実施で、共有実行口へ引き継ぐ。git の commit/reset/stash/checkout は実行していない。

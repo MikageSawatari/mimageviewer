@@ -141,7 +141,12 @@ fn sort_worker_849_zip_enumeration_preferences_leave_owner_and_use_latest_order(
     let cancel = pending.cancel.clone();
     let (tx, rx) = mpsc::channel();
     pending.rx = rx;
+    let feedback_before = app.feedback_toasts_for_test.clone();
     preferences_display_order(&mut app);
+    assert_eq!(
+        app.feedback_toasts_for_test, feedback_before,
+        "preferences must not attempt a synchronous directory scan of the ZIP"
+    );
     assert!(app.folder_pane_open_pending.is_none());
     assert!(Arc::ptr_eq(
         &app.zip_enumerate_pending.as_ref().unwrap().cancel,
@@ -169,7 +174,12 @@ fn sort_worker_849_drive_list_preferences_do_not_scan_or_replace_rows() {
     let rows = app.items.clone();
     let generation = app.items_generation;
     let folder = app.current_folder.clone();
+    let feedback_before = app.feedback_toasts_for_test.clone();
     preferences_display_order(&mut app);
+    assert_eq!(
+        app.feedback_toasts_for_test, feedback_before,
+        "preferences must not attempt a synchronous scan of the synthetic drive-list path"
+    );
     assert!(app.folder_pane_open_pending.is_none());
     assert_eq!(app.items, rows);
     assert_eq!(app.items_generation, generation);
@@ -272,6 +282,81 @@ fn sort_worker_849_container_named_directories_still_scan() {
         assert_eq!(app.current_folder.as_ref(), Some(&folder));
         assert!(app.items.is_empty());
     }
+}
+
+#[test]
+fn sort_worker_849_snapshot_child_zip_return_unpin_keeps_directory_reload() {
+    let mut app = setup_app();
+    configure(&mut app);
+    app.settings.auto_fullscreen_zip_pdf = false;
+    let folder = app.tmp.path().join("snapshot-source.epub");
+    std::fs::create_dir(&folder).unwrap();
+    let child = folder.join("child.zip");
+    write_zip(&child);
+    app.load_folder_with_scan(folder.clone(), Some(scan_directory(&folder)));
+    app.finish_page_identity_preparation_for_test();
+    let source_rows = app.items.clone();
+    let source_recipe = app.projection_recipe.clone();
+    assert!(app.folder_observation.is_some());
+    assert_eq!(names(&app), ["child.zip"]);
+
+    app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
+    app.finish_page_identity_preparation_for_test();
+    assert!(app.is_snapshot_active());
+    assert!(app.snapshot_navigate_grid(true));
+    let ctx = egui::Context::default();
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        app.settle_open_path_classification_for_test();
+        app.poll_collection_history_transition(&ctx);
+        app.poll_zip_enumerate();
+        app.poll_sidecar_restore(&ctx);
+        app.poll_book_composition_service_for_test(&ctx);
+        if app.current_folder.as_ref() == Some(&child)
+            && app.zip_nav.is_some()
+            && app.zip_enumerate_pending.is_none()
+            && app
+                .top_level_grid_view
+                .history_navigation_transition()
+                .is_none()
+            && !app.sidecar_restore_active()
+            && !app.book_composition.is_pending()
+            && !app.book_composition_permission.pending()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "snapshot child ZIP did not settle"
+        );
+        std::thread::yield_now();
+    }
+    assert!(
+        app.items
+            .iter()
+            .any(|item| matches!(item, GridItem::ZipImage { .. }))
+    );
+    assert!(app.folder_observation.is_none());
+    assert!(app.snapshot_return_to_list_view());
+    app.finish_page_identity_preparation_for_test();
+    assert!(app.zip_nav.is_none());
+    app.deactivate_snapshot();
+    app.finish_page_identity_preparation_for_test();
+    assert!(!app.is_snapshot_active());
+    assert_eq!(app.current_folder.as_ref(), Some(&folder));
+    assert_eq!(app.items, source_rows);
+    assert_eq!(app.projection_recipe, source_recipe);
+    assert!(
+        app.folder_observation.is_none(),
+        "classification must survive without an observation"
+    );
+
+    preferences_display_order(&mut app);
+    assert!(app.view_order_refresh_scan_pending());
+    let held = HeldScan::capture(&mut app);
+    adopt(&mut app, held);
+    assert_eq!(app.items, source_rows);
+    assert_eq!(app.current_folder.as_ref(), Some(&folder));
 }
 
 #[test]

@@ -791,32 +791,63 @@ pub(crate) enum ProjectionRecipe {
 }
 
 impl ProjectionRecipe {
+    /// An accepted directory scan proves the source kind independently of its
+    /// spelling. Keep the existing book/page-order policy, but never classify
+    /// directory rows as archive entries or document pages. This recipe travels
+    /// with retained rows even when their passive observation has been retired.
+    pub(crate) fn for_scanned_directory(
+        settings: &crate::settings::Settings,
+        path: &Path,
+        items: &[GridItem],
+    ) -> Self {
+        Self::for_physical_scope(settings, path, items, |books_root| {
+            if crate::books::is_direct_book_folder(books_root, path) {
+                BookScope::CompiledFolder(path.to_path_buf())
+            } else {
+                BookScope::ImageFolder(path.to_path_buf())
+            }
+        })
+    }
+
     pub(crate) fn for_physical(
         settings: &crate::settings::Settings,
         path: &Path,
         logical: &Path,
         items: &[GridItem],
     ) -> Self {
-        if !super::physical_page_order_locked(settings, path, items)
+        Self::for_physical_scope(settings, path, items, |books_root| {
+            if crate::folder_tree::is_paged_document_path(logical) {
+                BookScope::Document(logical.to_path_buf())
+            } else if crate::folder_tree::is_open_as_container(path) {
+                BookScope::Archive {
+                    logical_root: logical.to_path_buf(),
+                    prefix: Vec::new(),
+                }
+            } else if crate::books::is_direct_book_folder(books_root, path) {
+                BookScope::CompiledFolder(path.to_path_buf())
+            } else {
+                BookScope::ImageFolder(path.to_path_buf())
+            }
+        })
+    }
+
+    fn for_physical_scope(
+        settings: &crate::settings::Settings,
+        path: &Path,
+        items: &[GridItem],
+        scope: impl FnOnce(&Path) -> BookScope,
+    ) -> Self {
+        // Resolve once: the default root may ask the Windows Shell for Pictures.
+        // Both the book policy and the source scope use this same prepared path.
+        let books_root = settings.books_root_path();
+        if !super::physical_page_order_locked_with_books_root(settings, &books_root, path, items)
             || items
                 .iter()
                 .any(|item| matches!(item, GridItem::Video(_) | GridItem::Audio(_)))
         {
             return Self::OrdinaryList;
         }
-        let scope = if crate::folder_tree::is_paged_document_path(logical) {
-            BookScope::Document(logical.to_path_buf())
-        } else if crate::folder_tree::is_open_as_container(path) {
-            BookScope::Archive {
-                logical_root: logical.to_path_buf(),
-                prefix: Vec::new(),
-            }
-        } else if crate::books::is_direct_book_folder(&settings.books_root_path(), path) {
-            BookScope::CompiledFolder(path.to_path_buf())
-        } else {
-            BookScope::ImageFolder(path.to_path_buf())
-        };
-        Self::Book(scope)
+        Self::Book(scope(&books_root))
     }
 
     pub(crate) fn extracted_surface(&self) -> Option<ExtractedSurface> {
@@ -1030,6 +1061,45 @@ mod tests {
                 matches!(item, GridItem::PdfPage { pdf_path, page_num, .. } if pdf_path == logical && *page_num == i as u32)
             );
         }
+    }
+
+    #[test]
+    fn sort_worker_849_scanned_directory_recipe_keeps_book_policy_without_container_scope() {
+        let settings = crate::settings::Settings::default();
+        for name in ["book.epub", "book.pdf", "book.zip", "book.rar", "ordinary"] {
+            let folder = Path::new("C:/source").join(name);
+            for rows in [
+                Vec::new(),
+                vec![GridItem::ZipFile(folder.join("child.zip"))],
+                vec![GridItem::Image(folder.join("page.png"))],
+                vec![GridItem::Audio(folder.join("clip.wav"))],
+            ] {
+                let original = ProjectionRecipe::for_physical(&settings, &folder, &folder, &rows);
+                let directory = ProjectionRecipe::for_scanned_directory(&settings, &folder, &rows);
+                assert_eq!(
+                    matches!(directory, ProjectionRecipe::Book(_)),
+                    matches!(original, ProjectionRecipe::Book(_)),
+                    "the existing book/page-order policy must not change"
+                );
+                assert!(matches!(
+                    directory,
+                    ProjectionRecipe::OrdinaryList
+                        | ProjectionRecipe::Book(BookScope::ImageFolder(_))
+                ));
+                // Without a directory scan, actual documents/archives keep their source scope.
+                if name == "book.epub" || name == "book.pdf" {
+                    assert_eq!(
+                        ProjectionRecipe::for_physical(&settings, &folder, &folder, &[]),
+                        ProjectionRecipe::Book(BookScope::Document(folder.clone()))
+                    );
+                }
+            }
+        }
+        let compiled = settings.books_root_path().join("compiled");
+        assert_eq!(
+            ProjectionRecipe::for_scanned_directory(&settings, &compiled, &[]),
+            ProjectionRecipe::Book(BookScope::CompiledFolder(compiled))
+        );
     }
 
     #[test]
