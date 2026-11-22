@@ -8028,3 +8028,37 @@ fork 先は空、元 context は cache と proof を保持する。detached の�
 独立レビュー (gpt-6.1-sol / xhigh を指定して実行、3 回) と設計担当 ClaudeCode は、これを既存 details 状態への機械的な追加であり
 症状パッチではない構造的変更であることに合意した。正本は [長さ順・長さ絞り込み計画](media-duration-sort-filter-plan.md) §7・§11。
 直接の swap・bundle 破棄・fork はテストで確認した。registry 経由の mount／park／close と実機動作は未確認。
+
+### 復元の開始時の入力の除去を、root の入力の関門の後へ揃える（2026-11-22、§1.828 NG-1）
+
+**変更の内容**
+
+- 今開いているフォルダの名前を速くダブルクリックすると、枝が開閉しないことがあった (サブ PC 担当の観測)。
+  - 再クリックの更新の結果は `render_update_before_frame` で反映され、サイドカー復元が root の入力の関門 (`input_update_begin`) の前に始まる。
+  - 開始処理はその場で ROOT の入力から押下を取り除いていた。
+  - そのため、関門の `begin_folder_pane_label_input` が、押下の消えたイベントと押下の残る `pointer_button_targets()` を照合して食い違い、ジェスチャを消していた。
+- root の関門を pass 番号付きの型 (`RootInputGate`) で記録する。
+- 開始時のその場での除去をしていた 3 か所 (サイドカー復元のハイドレーション・ページの識別の準備・見開きのずらしの retained shift) を `sanitize_input_for_started_sidecar_restore` に集約した。
+- ROOT の viewport の入力の除去だけを、関門の前なら pass 番号付きの要求として関門まで待たせる。関門は、ツリーの名前の認識の後に実行する。
+
+**detached に触れる範囲**
+
+- 見開きのずらしの retained shift は `with_viewer_context` の中で開始するので、detached の viewer context が mounted な状態でも通る。
+- 判定の述語 (`sidecar_restore_blocks_projected_context`)・CancelClose の値・mounted な context が持つジェスチャの終了は、今までどおり開始の時点・開始時の context で行う。
+- 関門へ渡す要求は ROOT の viewport の入力の除去だけで、context の操作を持ち越さない。
+- ROOT 以外の viewport・関門の後・pass の外 (logic) は、今までどおりその場で除去する。
+- 変えないもの: detached の述語・viewport の選択・配送・HWND・placement・bundle の所有と交換。
+
+**合意**
+
+- 独立レビュー (gpt-6.1-sol / xhigh、read-only、コミット `0574848c2`): 「STRUCTURAL: AGREE」「VERDICT: ACCEPT」。
+  - レビュー担当の言葉: 「「同じ root pass で認識→除去」という順序を所有境界で保証する構造的修正です。」
+- 実装の途中で、実装担当 (Codex gpt-6.1-sol / high) が指摘して止まった。「処理全体を関門へ遅らせると、retained shift で開始時と別の context を操作し得る」。そこで、context のジェスチャはその場、viewport の入力だけ延期、という分け方にした。
+- 統括 ClaudeCode が方針に合意した (2026-11-22)。
+- 設計担当 ClaudeCode (worktree `mimageviewer-tree828`) も同意する。
+  - 理由: 症状を消す guard・遅延・再試行ではない。`input_update_begin` の設計の順序を、開始時のその場での除去が先回りしていた生成元を直すもの。
+- 検証:
+  - 3 か所それぞれで関門の前と後に始まる場合、子 viewport、pass の外、古い要求の破棄、開始元の context の unmount をテストした。
+  - NG-1 のダブル・トリプルクリックは、本番の repaint context を設定してテストした。
+  - 修正前の挙動では、関門の前の新テスト 7 件がすべて失敗した。
+  - 実機は未確認。正本は [フォルダツリーの更新の計画](folder-tree-refresh-plan.md) §14.9。
