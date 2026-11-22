@@ -261,6 +261,92 @@ fn browser818_capture_file_destination_errors_do_not_allow_unknown_paths() {
 
 #[cfg(windows)]
 #[test]
+fn browser818_capture_file_destination_rejects_raw_dot_components_before_junction_resolution() {
+    use std::os::windows::process::CommandExt;
+    use std::path::{Component, Prefix};
+
+    let fixture = tempfile::tempdir().unwrap();
+    let host = fixture.path().join("browser-host");
+    std::fs::create_dir(&host).unwrap();
+    std::fs::write(host.join("keep"), b"user image").unwrap();
+    let alias = fixture.path().join("alias");
+    // All paths are owned by this TempDir; /J requires no symlink privilege.
+    let output = std::process::Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&alias)
+        .arg(&host)
+        .creation_flags(0x08000000)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    let canonical = std::fs::canonicalize(fixture.path()).unwrap();
+    let has_verbatim_prefix = matches!(
+        canonical.components().next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _))
+    );
+    let results: Vec<_> = [
+        r"\missing\..\alias\new",
+        r"\missing\..\alias\.\new",
+        r"\alias\.\new",
+    ]
+    .into_iter()
+    .map(|suffix| {
+        // OsString::push preserves the raw spelling. PathBuf::join would erase
+        // the very dot components whose admission this regression must test.
+        let mut raw = canonical.as_os_str().to_os_string();
+        raw.push(suffix);
+        let raw = PathBuf::from(raw);
+        let absolute = std::path::absolute(&raw).unwrap();
+        let retains_dot = absolute
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir));
+        let destination_result = is_browser_host_destination(&raw, &host);
+        let host_result = is_browser_host_destination(&host, &raw);
+        // Model the later save operation. Whether join normalizes the dots or keeps
+        // them, the month folder must never be judged outside the managed host
+        // directory: either the dots are rejected or the alias resolves inside it.
+        let month_result = is_browser_host_destination(&raw.join("2026-11"), &host);
+        (
+            raw,
+            retains_dot,
+            destination_result,
+            host_result,
+            month_result,
+        )
+    })
+    .collect();
+    let direct_alias_result = is_browser_host_destination(&alias.join("new"), &host);
+    let mut ordinary_raw = fixture.path().as_os_str().to_os_string();
+    ordinary_raw.push(r"\missing\..\alias\new");
+    let ordinary_result = is_browser_host_destination(Path::new(&ordinary_raw), &host);
+    let missing_exists = fixture.path().join("missing").exists();
+    let preserved = std::fs::read(host.join("keep"));
+
+    // Remove only the junction, before TempDir's recursive cleanup or assertions.
+    std::fs::remove_dir(&alias).unwrap();
+    assert!(has_verbatim_prefix);
+    for (raw, retains_dot, destination_result, host_result, month_result) in results {
+        assert!(retains_dot, "fixture lost its raw dot component: {raw:?}");
+        assert!(
+            destination_result.is_err(),
+            "{raw:?}: {destination_result:?}"
+        );
+        assert!(host_result.is_err(), "{raw:?}: {host_result:?}");
+        assert!(
+            !matches!(month_result, Ok(false)),
+            "{raw:?}: {month_result:?}"
+        );
+    }
+    assert!(direct_alias_result.unwrap());
+    assert!(ordinary_result.unwrap());
+    assert!(!missing_exists);
+    assert_eq!(preserved.unwrap(), b"user image");
+}
+
+#[cfg(windows)]
+#[test]
 fn browser818_capture_file_destination_rejects_device_namespaces() {
     let fixture = tempfile::tempdir().unwrap();
     let host = fixture.path().join("browser-host");

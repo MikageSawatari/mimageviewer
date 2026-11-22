@@ -129,7 +129,10 @@ launcher が未起動と判断して core を起動しても、その後 core �
 clipboard の保存・公開処理と既存テストは本体に残し、HTML 取り込みも同じ crate を使う。
 `CaptureOrigin::from_browser_urls` はページ URL と最終 URL を受け取り、既存の MOTW 境界で無害化する。
 §0 の共通判定は `is_browser_host_destination(destination, browser_host_dir)`。
-worker 上で既存の祖先 (junction・短縮名を含む) を解決し、未作成の末尾・`..`・区切り・Windows の大文字小文字を扱う。
+worker 上で既存の祖先 (junction・短縮名を含む) を解決し、未作成の末尾・区切り・Windows の大文字小文字を扱う。
+独立レビュー P1 対応: `absolute` 後に `.` / `..` の component が残る入力は、祖先を解決する前にエラーにする。
+verbatim パスの未作成部分を文字列操作で戻して junction を解決し損ねる経路をなくし、保存時の `join` と食い違う入力を受け付けない。
+回帰は `join("..")` で入力を組み立てず、生の verbatim 文字列と実際の junction を使う。
 判定不能はエラーで返し、許可とみなさない。ディレクトリは作らず、比較後の別プロセスによる祖先の置換を防ぐ保証は持たない。
 この段階では呼出元を接続しない。新規テストは `browser818_capture_file` filter。
 ビルド・テストは実装担当では未実行 (設計担当の共有実行枠へ引き渡す)。既存の永続形式は変えず、移行は不要。

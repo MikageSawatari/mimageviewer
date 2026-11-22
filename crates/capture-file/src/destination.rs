@@ -9,7 +9,9 @@ use std::path::{Component, Path, PathBuf};
 ///
 /// The caller supplies its actual host directory; this crate never reads profile settings
 /// or environment variables. Existing ancestors are resolved (including junctions and
-/// short names), then missing suffixes are normalized without creating directories.
+/// short names), then missing suffixes are appended without creating directories.
+/// Dot components left by `absolute` are rejected before resolving any ancestor:
+/// appending a month to a verbatim path can otherwise normalize it differently.
 /// Windows comparison is ordinal and case insensitive, at component boundaries.
 ///
 /// This performs filesystem I/O: call on a worker, before publication or saving. An
@@ -39,6 +41,12 @@ fn resolved_destination(path: &Path) -> Result<PathBuf, String> {
         return Err("capture destination is empty".into());
     }
     let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+    if absolute
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err("capture destination contains unresolved dot components".into());
+    }
     require_filesystem_namespace(&absolute)?;
     let mut ancestor = absolute.as_path();
     let mut suffix = Vec::<OsString>::new();
@@ -54,8 +62,6 @@ fn resolved_destination(path: &Path) -> Result<PathBuf, String> {
                 }
                 match ancestor.components().next_back() {
                     Some(Component::Normal(name)) => suffix.push(name.to_os_string()),
-                    Some(Component::ParentDir) => suffix.push(OsString::from("..")),
-                    Some(Component::CurDir) => {}
                     _ => return Err(error.to_string()),
                 }
                 ancestor = ancestor.parent().ok_or_else(|| error.to_string())?;
@@ -72,16 +78,7 @@ fn resolved_destination(path: &Path) -> Result<PathBuf, String> {
     }
     let mut resolved = ordinary_path(&canonical)?;
     for component in suffix.into_iter().rev() {
-        if component == OsStr::new("..") {
-            if matches!(
-                resolved.components().next_back(),
-                Some(Component::Normal(_))
-            ) {
-                resolved.pop();
-            }
-        } else {
-            resolved.push(component);
-        }
+        resolved.push(component);
     }
     Ok(resolved)
 }
