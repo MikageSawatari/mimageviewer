@@ -15,7 +15,7 @@
 ## v5.5.1 (2026-11-22)
 
 - **対象**: §1.836 だけ (一覧からフォルダツリーへのドラッグで、移動のときも「＋ コピー」と表示される件。v5.5.0 の §1.464 の不具合)。配布ビルドの入力・タグ v5.5.1・main はどれも master `aa6f06685`。利用者決定 (2026-11-21): v5.5.1 は §1.836 だけ。更新履歴は利用者承認済み (短縮版なし)。既知の問題からツリーのドラッグの節を外した。
-- **CI 相当**: push 後の CI (main `aa6f06685`): 結果待ち。
+- **CI 相当**: push 後の CI (main `aa6f06685`) は成功。
 - **自動テスト**: `aa6f06685` の lib 全件 19,381 件成功、test-script の lib 全件 19,537 件成功。配布ビルドの全体テストは 3 回目で 21,505 件成功。2 回目は `app::tests::still_window_mode_key_tests::remote_acquire_cancels_archive_open_before_direct_or_converted_completion` と `remote_acquire_cancels_main_epub_modal_before_published_completion` の 2 件が失敗した。同じソースの lib 全件 2 本では通っているので、負荷で落ちるテストと判断して流し直した (§1.847)。1 回目は、別の worktree の dev core が起動中だったため、開始前に止まった。
 - **署名・成果物**: 3 回目の `build-dist.ps1 -SkipVst3Bridge` は、ポータブル版の署名で `No certificates were found` になり止まった (SimplySign のセッション切れの見込み、未確認)。利用者が SimplySign にログインし直した後、同じソースで `-SkipRustTests` を付けて署名とパッケージだけをやり直した (09:46 完了、全 PE / VC runtime gate 通過)。単体exe・setup.exe・ポータブル版の mimageviewer.exe を `signtool verify /pa /v` で確認した (Open Source Developer Taku Sano、RFC3161 timestamp あり)。sha256: 単体exe `3b093217c71f496b8b894f3f065cb157eb680fa88cc9fd70b1ccd02e74f2f607` (609,352,280 B)・setup.exe `5bad37b45ccf45bba5b1a0d998f82c9e71dda1a8c360f5532b1d71dc14829cc0` (273,499,168 B)・Vector zip `2191f55d164c1e3f08067c3e4cbea0644466279a6963c311ef107f7ccfa4c91c`・ポータブル zip `21d74db11c66632e01ef56bad88f68e9d99ccc29f9a7c619862c86aeed3d9b0d` (325,018,408 B)。
 - **VirusTotal**: 省略。VST3 host と mIV Sound は v5.4.0 から変更なし (再署名のみ)。
