@@ -907,3 +907,9 @@ Start-Process -FilePath .\target\release\mimageviewer.exe
 ### 段階 6 の実装 (2026-11-22、`25e5e464d`・`469145a42`) — ACCEPT
 
 1 回目 REVISE (P1: 月のフォルダの junction を介して管理領域へ保存できる、P2: 画像リンクの対象の形式と host の対応形式が食い違う、P3: 空行)。月のフォルダにも共有の判定をかけ、形式の表を `mimageviewer-capture-file` に 1 つにして解消、2 回目 ACCEPT。`build-release.ps1 -PreserveRuntime` (署名なし) 成功、host 15 件・共有部品 15 件・launcher 24 件 (段階 5 の分を含む)・本体 `runtime_cleanup` 23 件・`clipboard_capture` 123 件成功。`test-build-portable-source-fingerprint.ps1` は PowerShell 7 が無く未実行。
+
+### 段階 8 の実装 (2026-11-22、`0fde63262`・`94dba1c31`) — ACCEPT
+
+- 独立レビュー (GPT-6.1 Sol / xhigh、read-only、本体の段階のレビューとは別の担当): 第 1 回 REVISE、P2 1 件 = DNR の一時規則が `TAB_ID_NONE` だけで、許可済みの origin の Web の service worker が同じ URL へ GET すると Referer が書き換わり得る (Chrome の文書と Chromium のコードからの指摘、実ブラウザでの再現ではない)。`initiatorDomains: [runtime.id]` で自拡張の起点に限定し、Web 起点が一致しないことをテストで固定 (`94dba1c31`)。第 2 回 ACCEPT。
+- 設計担当の再実行: `node --test browser-extension/tests/worker.test.cjs` 66 passed、`scripts/test-package-browser-extension.ps1` PASS (Chrome `fpppoodelfkddekjahhmalmmfdhbpdma`・Edge `dlcbdkekoppppebnhhncghhglkkccdhk` と一致)。
+- 未確認: 実際の Chrome / Edge での動作 (許可の画面・Cookie・redirect・DNR の適用・位置)。v5.6.0 に入れるかの判定はこの段階を待たない (統括 2026-11-22)。
