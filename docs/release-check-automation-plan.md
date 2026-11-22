@@ -975,3 +975,20 @@ verdict と終了コードの対応、`release-record.md` の中身が `summary.
   台本と fixture の生成は実行時にキットの `scripts\` から読むので、作り直しても `c54ecfd7e` と同じになるため。
   キットだけを作り直した: `relcheck-c54ecfd7e-20261121-225440` (manifest SHA-256 `bd459b91b993811938f7e97a6894909308e6ed64fd9c567d65fe190b0ef38c3f`、
   scripts `8f580f973`、artifact `c54ecfd7e`)。流し直しは利用者の了承待ち。
+
+**4 回目 (2026-11-22 09:23、キット `relcheck-c54ecfd7e-20261121-225440`、artifact `c54ecfd7e`、scripts `8f580f973`)**
+利用者の了承 2026-11-22 09:20 頃 (「ReleaseCheckをサブPCで実行をお願いします。」、事前確認 1 回と本番 1 回)。
+
+- 事前確認: READY (exit 0)。96 DPI の行 (1420×900・5 列) を選び、装飾込みの外形 [60,40,1496,979] は作業領域 [0,0,1920,1032] に収まった。
+  前面化は 1 回目で成功 (275 ms)。
+- 本番: FAIL (exit 1、約 1.5 分)。seed-profile の台本が `environment: exact root foreground was not acquired` で止まり、
+  7 ケースは走っていない。戻った run `release-checks-20261122-002308-42a02bd8` は `Receive-ReleaseCheckResult.ps1` で FAIL / exit 1 と照合。
+- 表の修正は効いていた: seed の static の overlay は `display_px = 373` (3 回目は 256)。窓の client 1420×900・DPI 96 も表どおり。
+- ログから分かること (mIV のログ): 1.51 秒の focus 要求の時点では前面 (`has_focus=true`)。runner も前面を確かめてから先へ進んだ。
+  video-pin の操作は 3.68 秒まで進み、続く `search()` の最初の `focused()` で、root の `focused` が 20 秒間偽のままだった。
+  その間に前面を取った窓は、mIV のログにも runner の記録にも残っていない (seed のあいだ runner は前面を記録しない)。
+  サブ PC 担当が並行して動かしていたのは、ファイルの有無を 15 秒ごとに見る待機の命令だけ (3 回目も同じで、そのときは seed が通った)。
+- 試験側の問題 (設計担当がコードで確認): 上の「foreground と無操作区間」の節は、前面が取れないときを SKIPPED (環境不成立) と決めている。
+  ところが台本の `fail("environment: ...")` は、test-script の runtime では ScriptFailure (exit 1) になる。
+  Rhai から EnvironmentFailure (exit 2) を出す手段が無く、`Support.ps1` の `New-ReleaseCheckProcessExitResult` は exit 1 を FAIL にする。
+  そのため、環境の不成立が FAIL として数えられた。製品の不具合を示す記録ではない。
