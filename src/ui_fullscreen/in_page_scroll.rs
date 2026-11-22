@@ -19,6 +19,8 @@ mod interaction_tests;
 #[cfg(test)]
 mod landing_tests;
 #[cfg(test)]
+mod n_scroll_report_850_tests;
+#[cfg(test)]
 mod navigation_landing_tests;
 #[cfg(test)]
 mod overflow_tests;
