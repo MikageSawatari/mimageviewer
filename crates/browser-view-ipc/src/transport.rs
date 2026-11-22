@@ -1,4 +1,4 @@
-//! One connection, no reconnect/retry. Every pending I/O retains its buffer/OVERLAPPED
+//! Each client uses one connection, no reconnect/retry. Pending I/O retains its buffer/OVERLAPPED
 //! until cancellation has completed. Stop participates in connect, read AND write.
 use std::{
     io::{self, Read, Write},
@@ -17,7 +17,7 @@ use windows::{
             Pipes::{
                 ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
                 GetNamedPipeServerProcessId, NAMED_PIPE_MODE, PIPE_READMODE_BYTE,
-                PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+                PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
             },
             Threading::{
                 CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
@@ -29,6 +29,16 @@ use windows::{
 };
 
 const IO_TIMEOUT_MS: u32 = 5_000;
+
+fn windows_io_error(error: windows::core::Error) -> io::Error {
+    // Retain Win32 disconnect codes both at I/O start and at overlapped completion.
+    let code = error.code().0 as u32;
+    if code & 0xffff_0000 == 0x8007_0000 {
+        io::Error::from_raw_os_error((code & 0xffff) as i32)
+    } else {
+        io::Error::other(error)
+    }
+}
 struct OwnedHandle(HANDLE);
 // Windows kernel handles are usable on the worker thread; this owner closes exactly once.
 unsafe impl Send for OwnedHandle {}
@@ -66,6 +76,85 @@ pub struct Stream {
     handle: OwnedHandle,
     stop: Option<Arc<Stop>>,
 }
+
+/// Retain a listening instance while each connected instance owns its reply/EOF wait.
+/// The successor is created before handing off the previous handle, so the pipe name
+/// stays owned throughout the handoff (FIRST_PIPE_INSTANCE is only used once).
+pub struct Server {
+    name: String,
+    pending: Stream,
+    stop: Arc<Stop>,
+}
+impl Server {
+    pub fn new(
+        name: &str,
+        stop: Arc<Stop>,
+        security: Option<&SECURITY_ATTRIBUTES>,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            name: name.to_owned(),
+            pending: Stream::server(name, stop.clone(), security)?,
+            stop,
+        })
+    }
+
+    fn accept(&mut self, security: Option<&SECURITY_ATTRIBUTES>) -> io::Result<Stream> {
+        self.pending.connect()?;
+        let next = Stream::create_server(&self.name, self.stop.clone(), security, false)?;
+        Ok(std::mem::replace(&mut self.pending, next))
+    }
+
+    /// Security must stay valid for this call. Each peer has its own worker; an open
+    /// peer cannot hold up accept. Stop cancels every peer and joins them before return.
+    pub fn run(
+        mut self,
+        security: Option<&SECURITY_ATTRIBUTES>,
+        deliver: impl Fn(crate::Request) -> bool + Send + Sync + 'static,
+        log: impl Fn(io::Error) + Send + Sync + 'static,
+    ) -> io::Result<()> {
+        let deliver = Arc::new(deliver);
+        let log = Arc::new(log);
+        let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
+        let result = (|| {
+            while !self.stop.is_set() {
+                // Reap completed connections rather than retaining their handles forever.
+                for index in (0..workers.len()).rev() {
+                    if workers[index].is_finished() {
+                        let _ = workers.swap_remove(index).join();
+                    }
+                }
+                let mut pipe = match self.accept(security) {
+                    Ok(pipe) => pipe,
+                    Err(_) if self.stop.is_set() => break,
+                    Err(error) => return Err(error),
+                };
+                let deliver = deliver.clone();
+                let log = log.clone();
+                let stop = self.stop.clone();
+                workers.push(
+                    std::thread::Builder::new()
+                        .name("miv-browser-view-peer".into())
+                        .spawn(move || {
+                            if let Err(error) = pipe.serve_until_closed(|request| deliver(request))
+                            {
+                                if !stop.is_set() {
+                                    log(error);
+                                }
+                            }
+                        })?,
+                );
+            }
+            Ok(())
+        })();
+        // Also retire existing peers on an accept/spawn failure. No detached read survives.
+        self.stop.signal();
+        for worker in workers {
+            let _ = worker.join();
+        }
+        result
+    }
+}
+
 impl Stream {
     /// The caller owns a current-user-only descriptor for the duration of this call.
     pub fn server(
@@ -73,12 +162,26 @@ impl Stream {
         stop: Arc<Stop>,
         security: Option<&SECURITY_ATTRIBUTES>,
     ) -> io::Result<Self> {
+        Self::create_server(name, stop, security, true)
+    }
+    fn create_server(
+        name: &str,
+        stop: Arc<Stop>,
+        security: Option<&SECURITY_ATTRIBUTES>,
+        first: bool,
+    ) -> io::Result<Self> {
         let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
         let handle = unsafe {
             CreateNamedPipeW(
                 PCWSTR(name.as_ptr()),
                 FILE_FLAGS_AND_ATTRIBUTES(
-                    PIPE_ACCESS_DUPLEX.0 | FILE_FLAG_OVERLAPPED.0 | FILE_FLAG_FIRST_PIPE_INSTANCE.0,
+                    PIPE_ACCESS_DUPLEX.0
+                        | FILE_FLAG_OVERLAPPED.0
+                        | if first {
+                            FILE_FLAG_FIRST_PIPE_INSTANCE.0
+                        } else {
+                            0
+                        },
                 ),
                 NAMED_PIPE_MODE(
                     PIPE_TYPE_BYTE.0
@@ -86,7 +189,7 @@ impl Stream {
                         | PIPE_WAIT.0
                         | PIPE_REJECT_REMOTE_CLIENTS.0,
                 ),
-                1,
+                PIPE_UNLIMITED_INSTANCES,
                 65536,
                 65536,
                 0,
@@ -132,7 +235,7 @@ impl Stream {
     ) -> io::Result<usize> {
         if let Err(error) = started {
             if error.code() != ERROR_IO_PENDING.to_hresult() {
-                return Err(io::Error::other(error));
+                return Err(windows_io_error(error));
             }
         }
         let mut events = Vec::with_capacity(2);
@@ -159,7 +262,7 @@ impl Stream {
         }
         let mut count = 0;
         unsafe { GetOverlappedResult(self.handle.0, op, &mut count, false) }
-            .map_err(io::Error::other)?;
+            .map_err(windows_io_error)?;
         Ok(count as usize)
     }
     pub fn connect(&self) -> io::Result<()> {
@@ -183,7 +286,41 @@ impl Stream {
             let _ = DisconnectNamedPipe(self.handle.0);
         }
     }
-    fn operation(&self, read: Option<&mut [u8]>, write: Option<&[u8]>) -> io::Result<usize> {
+    /// A successful write only put the reply into the pipe buffer. The client closes
+    /// after reading the entire reply; do not discard those bytes via DisconnectNamedPipe.
+    /// This wait has no timeout. Stop participates in every read, including new reads
+    /// after unexpected trailing client bytes, and cancels the pending OVERLAPPED.
+    pub fn wait_for_client_close(&self) -> io::Result<()> {
+        use windows::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_PIPE_NOT_CONNECTED};
+        let mut trailing = [0; 256];
+        loop {
+            match self.operation(Some(&mut trailing), None, INFINITE) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(error)
+                    if matches!(error.raw_os_error(), Some(code)
+                    if code == ERROR_BROKEN_PIPE.0 as i32 || code == ERROR_PIPE_NOT_CONNECTED.0 as i32) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    pub fn serve_until_closed(
+        &mut self,
+        deliver: impl FnOnce(crate::Request) -> bool,
+    ) -> io::Result<()> {
+        let result = crate::serve(self, deliver).and_then(|()| self.wait_for_client_close());
+        self.disconnect();
+        result
+    }
+    fn operation(
+        &self,
+        read: Option<&mut [u8]>,
+        write: Option<&[u8]>,
+        timeout: u32,
+    ) -> io::Result<usize> {
         self.check_stop()?;
         let event = OwnedHandle::event()?;
         let mut op = OVERLAPPED {
@@ -196,17 +333,17 @@ impl Stream {
                 None => WriteFile(self.handle.0, write, None, Some(&mut op)),
             }
         };
-        self.complete(started, &mut op, IO_TIMEOUT_MS)
+        self.complete(started, &mut op, timeout)
     }
 }
 impl Read for Stream {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        self.operation(Some(bytes), None)
+        self.operation(Some(bytes), None, IO_TIMEOUT_MS)
     }
 }
 impl Write for Stream {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.operation(None, Some(bytes))
+        self.operation(None, Some(bytes), IO_TIMEOUT_MS)
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
@@ -226,6 +363,10 @@ impl crate::Connection for Stream {
         allow_foreground(pid)
     }
 }
+
+#[cfg(test)]
+#[path = "transport_terminal_tests.rs"]
+mod terminal_tests;
 
 #[cfg(test)]
 mod tests {

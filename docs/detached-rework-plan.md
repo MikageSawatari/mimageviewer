@@ -1528,6 +1528,12 @@ P1 修正の再検証は設計担当から190件中189件成功・activation 回
 - listener の寿命は ActivationListener の service owner に置き、接続・読込・書込の全待ちを永続 stop event で解除する。これは transport の停止所有であり、detached の競合を隠す待ち・時間窓を追加するものではない (§2-5)。PID／許可は注入でき、テストから desktop は変えない。
 - HWND 同定・viewport 経路・再生成条件・用途・placement 保存先は変更しない (§2-1・2・4)。段階2〜4で合意した要求の型へ入口を繋ぐ構造変更であり、症状 guard は足さない (§2-6・7)。既存テストを維持し、新規19件と通常の起動・MCP・名前空間の回帰を引き継ぐ (§2-8)。cargo は最後の fmt 以外実行しない。実装に対する構造合意は再レビュー待ち。
 
+**段階5の独立レビュー P1 修正 (2026-11-22、再検証・再レビュー待ち)**
+
+`6c07dc523` の独立レビューは、既存の受付 owner に要求を合流させる構造には合意、応答を即座の切断で破棄し得る通信終端の P1 で REVISE。応答後は stop で解除可能な overlapped read で client の close を待ち、その後に切断する。終了待ちに期限や FlushFileBuffers は使わない。
+
+単一 instance の受付 loop を EOF 待ちで塞がないよう、次の待受を確保してから接続を worker に引き渡す transport owner に集約した。接続ごとの reader／reply／close はその worker が持ち、共通 stop で native operation を解除し、全 worker を join してから listener を終える。既存の DACL と要求受付 callback を使い、App field・viewport／HWND の同定・用途・placement・activation event は変更しない。実 pipe の遅延読込・次の受付・client close・stop の回帰を追加し、既存テストを維持する。通信終端の所有境界の修正であり、detached の時間窓や症状 guard ではない。今回のビルド・テスト・P1 再レビューは引き継ぎ待ち。
+
 ### 2026-11-21: 絞り込みの変更で一覧を読み直さない・AI の絞り込みを一覧全体の取得の証明へ (§1.835、実装済み・自動検証済み・実機未確認)
 
 **変更の内容**

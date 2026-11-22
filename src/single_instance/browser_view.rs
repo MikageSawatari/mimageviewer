@@ -69,33 +69,26 @@ impl Listener {
                 let run = || -> std::io::Result<()> {
                     let mut security = crate::remote_ipc::current_user_pipe_security()?;
                     let attributes = security.attributes();
-                    let mut pipe = ipc::transport::Stream::server(
+                    let server = ipc::transport::Server::new(
                         &process_names().browser_view_pipe,
                         worker_stop.clone(),
                         Some(&attributes),
                     )?;
-                    while !worker_stop.is_set() {
-                        if pipe.connect().is_err() {
-                            break;
-                        }
-                        let result = ipc::serve(&mut pipe, |request| {
+                    let receive_stop = worker_stop.clone();
+                    server.run(
+                        Some(&attributes),
+                        move |request| {
                             let received = activation(request, remote.as_ref());
-                            if worker_stop.is_set() || tx.send(received).is_err() {
+                            if receive_stop.is_set() || tx.send(received).is_err() {
                                 return false;
                             }
                             ctx.request_repaint();
                             true
-                        });
-                        if let Err(error) = result {
-                            if !worker_stop.is_set() {
-                                crate::logger::log(format!(
-                                    "browser_view: connection failed: {error}"
-                                ));
-                            }
-                        }
-                        pipe.disconnect();
-                    }
-                    Ok(())
+                        },
+                        |error| {
+                            crate::logger::log(format!("browser_view: connection failed: {error}"))
+                        },
+                    )
                 };
                 if let Err(error) = run() {
                     crate::logger::log(format!("browser_view: listener failed: {error}"));

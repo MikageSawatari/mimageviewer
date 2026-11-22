@@ -500,6 +500,15 @@ launcher、core の双方で同じ要求を配送でき、版不一致を launch
 
 新規 filter は3 package の `browser818_ipc|browser818_cli`。通常の回帰は launcher の `tests::gpu_option`／`tests::gpu_options`／`mcp_launch::tests`、本体の `tests::gpu_startup_values_never_become_core_open_paths`／`tests::source_close_probe_values_never_become_startup_open_paths`／`single_instance::tests`／`browser818_open_owner` を用いる。既存テストは削除・弱化していない。
 
+**段階5の独立レビュー P1 修正 (2026-11-22、再検証・再レビュー待ち)**
+
+- `6c07dc523` の独立レビューは構造に合意、通信終端の P1 で REVISE。`serve` の応答 write の完了は client の読了を意味せず、直後の `DisconnectNamedPipe` が未読応答を破棄し、配送済みでも launcher が失敗と判断する競合があった。
+- `Stream::serve_until_closed` で、応答書込後は `wait_for_client_close` の overlapped read で client の EOF／ERROR_BROKEN_PIPE／ERROR_PIPE_NOT_CONNECTED を待ってから切断する。start／completion の Win32 error code を保って分類する。終了待ちは INFINITE と永続 stop event を使い、期限・追加 ack・FlushFileBuffers は設けない。request read／reply write の既存 I/O timeout は変更しない。
+- 旧 listener は1 instance・1 loop だったため、そこで EOF を待つだけでは居座る peer が次の受付を塞ぐ。transport の `Server` が接続済み instance を引き渡す前に次の待受 instance を確保し、接続ごとの worker に reply と EOF の寿命を持たせた。FIRST_PIPE_INSTANCE は最初だけ、後続も同じ DACL／PIPE_UNLIMITED_INSTANCES を使い、待受名の所有を切らさない。完了 worker は順次回収し、停止と accept／spawn エラーでは共通 stop を signal して全 worker を join する。App の field は増やさない。
+- `single_instance/browser_view.rs` の listener はこの `Server::run` に既存の activation callback とログを渡す。wire・CLI・launcher／core の client・既存の open-path／activation event は変更しない。
+- 実 pipe の回帰を3件追加した。`browser818_ipc_delayed_reply_read_keeps_complete_response_and_accepts_other_peers` は PeekNamedPipe で応答が書かれたことだけを確認し、未読応答を保持したまま別 peer の要求を完了してから元の応答を検査する。Queued と VersionMismatch を検査し、client close 後の次の接続も通す。`browser818_ipc_client_close_releases_reply_wait_without_stop` は stop 無しの client close が終端を解放すること、`browser818_ipc_stop_joins_reply_waiters_with_clients_still_open` は client を開いたまま stop で全 peer と accept が終了することを検査する。desktop／前面化の操作はしない。
+- 共有 crate の新旧テスト filter は `browser818_ipc|browser818_cli`。本体は `single_instance::browser_view::tests|single_instance::tests`、launcher は既存の `browser818_ipc|browser818_cli` を引き継ぐ。今回のビルド・テストは未実行、cargo は最後の fmt のみ。再実行と P1 の再レビューは設計担当へ引き継ぐ。
+
 ### 段階6：中継 exe と同梱経路
 
 **範囲**
