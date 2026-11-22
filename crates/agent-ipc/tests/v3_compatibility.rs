@@ -129,6 +129,8 @@ fn all_shipped_tool_response_families_decode_and_pass_old_structured_output_chec
             gps: true,
             ai_captions: true,
             transcripts: true,
+            current_view: true,
+            settings: true,
         },
         fts_ready: true,
         remote_active: false,

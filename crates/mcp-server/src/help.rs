@@ -3,6 +3,9 @@ use mimageviewer_agent_ipc::{ErrorCode, MAX_PAGE_CHARS, mcp_content_chars};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+pub(super) const MAX_HELP_QUERY_CHARS: usize = 200;
+pub(super) const MAX_HELP_QUERY_TERMS: usize = 8;
+
 struct HelpPage {
     id: &'static str,
     title: &'static str,
@@ -43,13 +46,20 @@ pub fn call(name: &str, args: Value) -> Result<Value, &'static str> {
         "search_help" => {
             let args: SearchArgs =
                 serde_json::from_value(args).map_err(|_| "Invalid tool arguments")?;
+            if args.query.chars().take(MAX_HELP_QUERY_CHARS + 1).count() > MAX_HELP_QUERY_CHARS {
+                return Err("Help query must be at most 200 characters");
+            }
             let terms = args
                 .query
                 .split_whitespace()
+                .take(MAX_HELP_QUERY_TERMS + 1)
                 .map(str::to_ascii_lowercase)
                 .collect::<Vec<_>>();
             if terms.is_empty() {
                 return Err("Specify a nonempty help query");
+            }
+            if terms.len() > MAX_HELP_QUERY_TERMS {
+                return Err("Specify at most 8 help query terms");
             }
             let limit = args.limit.unwrap_or(10);
             if limit == 0 {

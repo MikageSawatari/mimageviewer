@@ -343,6 +343,51 @@ fn help_part_retrieval_and_invalid_arguments() {
     }
 }
 
+#[test]
+fn help_search_bounds_query_characters_and_whitespace_terms_before_search() {
+    let tool = schema::tools()
+        .into_iter()
+        .find(|t| t["name"] == "search_help")
+        .unwrap();
+    let query_schema = &tool["inputSchema"]["properties"]["query"];
+    assert_eq!(query_schema["maxLength"], MAX_HELP_QUERY_CHARS);
+    assert_eq!(
+        query_schema["pattern"],
+        format!("^\\s*\\S+(\\s+\\S+){{0,{}}}\\s*$", MAX_HELP_QUERY_TERMS - 1)
+    );
+    for scalar in ["a", "猫", "𠮷"] {
+        let boundary = json!({"query":scalar.repeat(MAX_HELP_QUERY_CHARS)});
+        assert!(crate::tests::accepts_schema(
+            &tool["inputSchema"],
+            &boundary
+        ));
+        assert!(call("search_help", boundary).is_ok());
+        let over = json!({"query":scalar.repeat(MAX_HELP_QUERY_CHARS + 1)});
+        assert!(!crate::tests::accepts_schema(&tool["inputSchema"], &over));
+        assert_eq!(
+            call("search_help", over).unwrap_err(),
+            "Help query must be at most 200 characters"
+        );
+    }
+    for separator in [" ", "\t", "\n", "　", "\u{85}"] {
+        let eight = vec!["の"; MAX_HELP_QUERY_TERMS].join(separator);
+        assert!(call("search_help", json!({"query":eight})).is_ok());
+        let nine = vec!["の"; MAX_HELP_QUERY_TERMS + 1].join(separator);
+        assert_eq!(
+            call("search_help", json!({"query":nine})).unwrap_err(),
+            "Specify at most 8 help query terms"
+        );
+    }
+    // Both boundaries at once: seven short words and a final long word.
+    let boundary = format!("{}{}", "a ".repeat(7), "a".repeat(186));
+    assert_eq!(boundary.chars().count(), MAX_HELP_QUERY_CHARS);
+    assert!(call("search_help", json!({"query":boundary})).is_ok());
+    assert_eq!(
+        call("search_help", json!({"query":"a ".repeat(200_000)})).unwrap_err(),
+        "Help query must be at most 200 characters"
+    );
+}
+
 fn assert_final_budget(name: &str, result: &Value) -> usize {
     let content = &result["structuredContent"];
     assert_eq!(content["app_version"], env!("CARGO_PKG_VERSION"));
@@ -478,7 +523,7 @@ fn help_tool_definitions_stay_short() {
         total += chars;
     }
     assert!(
-        total <= 1_300,
+        total <= 1_360,
         "Leave room for the other five stage-1 tools: {total}"
     );
     assert!(crate::INSTRUCTIONS.contains("call search_help/get_help first"));

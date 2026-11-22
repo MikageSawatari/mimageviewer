@@ -521,7 +521,7 @@ pub fn tools() -> Vec<Value> {
         };
         let description = format!("{description} {required}");
         let input=match name {
-            "search_help"=>object(json!({"query":{"type":"string","minLength":1},"limit":{"type":["integer","null"],"minimum":1,"maximum":30,"default":10}}),&["query"]),
+            "search_help"=>object(json!({"query":{"type":"string","minLength":1,"maxLength":crate::help::MAX_HELP_QUERY_CHARS,"pattern":format!("^\\s*\\S+(\\s+\\S+){{0,{}}}\\s*$",crate::help::MAX_HELP_QUERY_TERMS-1)},"limit":{"type":["integer","null"],"minimum":1,"maximum":30,"default":10}}),&["query"]),
             "get_help"=>object(json!({"id":nullable_string(),"part":{"type":["integer","null"],"minimum":1,"default":1}}),&[]),
             "add_tags"|"remove_tags"=>object(json!({"items":{"type":"array","minItems":1,"maxItems":MAX_WRITE_ITEMS,"items":object(json!({"path":string()}),&["path"])},"tags":{"type":"array","minItems":1,"maxItems":MAX_WRITE_TAGS,"items":string()}}),&["items","tags"]),
             "set_rating"=>object(json!({"items":{"type":"array","minItems":1,"maxItems":MAX_WRITE_ITEMS,"items":object(json!({"path":string(),"subresource":nullable_string()}),&["path"])},"stars":{"type":"integer","minimum":0,"maximum":5}}),&["items","stars"]),
