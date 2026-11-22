@@ -4256,6 +4256,65 @@ mod tests {
         }
     }
 
+    /// §1.851 follow-up: the File menu "最新の情報に更新" (`reload_top_level_grid`) on the
+    /// collection root reclassifies sources in both directions, even though the actor revision
+    /// does not change, and the "remove all missing" count follows it.
+    #[test]
+    fn collection_reload_reclassifies_missing_and_restored_sources_at_same_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let folder = temp.path().join("album");
+        let renamed = temp.path().join("album-renamed");
+        std::fs::create_dir(&folder).unwrap();
+        let image = folder.join("a.png");
+        std::fs::write(&image, b"png").unwrap();
+        let snapshot =
+            collection_with_sources(&client, &[(image.clone(), CollectionResolvedKind::Image)]);
+        let revision = snapshot.revision();
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert_eq!(app.items, vec![GridItem::Image(image.clone())]);
+        assert_eq!(app.collection_grid_missing_removal().count(), Some(0));
+
+        let ctx = egui::Context::default();
+        let assert_revision = |app: &App| {
+            assert_eq!(
+                app.top_level_grid_view
+                    .collection_session()
+                    .unwrap()
+                    .prepared()
+                    .unwrap()
+                    .collection_revision,
+                revision
+            );
+        };
+
+        std::fs::rename(&folder, &renamed).unwrap();
+        let generation = app.items_generation;
+        app.reload_top_level_grid(&ctx);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert_ne!(app.items_generation, generation);
+        assert_revision(&app);
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::CollectionPlaceholder {
+                reason: crate::grid_item::CollectionPlaceholderReason::Missing,
+                ..
+            }]
+        ));
+        assert_eq!(app.collection_grid_missing_removal().count(), Some(1));
+
+        std::fs::rename(&renamed, &folder).unwrap();
+        let generation = app.items_generation;
+        app.reload_top_level_grid(&ctx);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert_ne!(app.items_generation, generation);
+        assert_revision(&app);
+        assert_eq!(app.items, vec![GridItem::Image(image)]);
+        assert_eq!(app.collection_grid_missing_removal().count(), Some(0));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
     #[test]
     fn collection_missing_removal_availability_rejects_retained_stale_and_busy_listings() {
         let temp = tempfile::tempdir().unwrap();
