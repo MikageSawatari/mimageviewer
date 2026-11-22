@@ -6047,8 +6047,22 @@ impl App {
         }
     }
 
+    fn picker_item_rating_input_allowed(&self, context: RingShortcutContext) -> bool {
+        match context {
+            RingShortcutContext::Grid => self.grid_item_input_allowed(),
+            RingShortcutContext::ImageFullscreen | RingShortcutContext::VideoFullscreen => {
+                !self.view_order_refresh_scan_pending()
+            }
+        }
+    }
+
     fn change_ring_picker_value(&mut self, ctx: &egui::Context, row: RingPickerRowId, delta: i32) {
-        if row == RingPickerRowId::ItemRating && self.view_order_refresh_scan_pending() {
+        if row == RingPickerRowId::ItemRating
+            && self
+                .ring_picker
+                .as_ref()
+                .is_some_and(|picker| !self.picker_item_rating_input_allowed(picker.context))
+        {
             return;
         }
         let ai_mode = self.settings.ai_feature_mode;
@@ -6577,7 +6591,12 @@ impl App {
         row: RingPickerRowId,
         index: usize,
     ) {
-        if row == RingPickerRowId::ItemRating && self.view_order_refresh_scan_pending() {
+        if row == RingPickerRowId::ItemRating
+            && self
+                .ring_picker
+                .as_ref()
+                .is_some_and(|picker| !self.picker_item_rating_input_allowed(picker.context))
+        {
             return;
         }
         let ai_mode = self.settings.ai_feature_mode;
@@ -7306,9 +7325,9 @@ impl App {
     ) {
         let item_rating_dirty = picker.dirty_rows.contains(&RingPickerRowId::ItemRating);
         // A pre-wait preview may already have durable receipts. Preserve its dirty
-        // row and Undo bookkeeping below, but never submit a new item write during
-        // the order-refresh wait (including a physical session's terminal).
-        if item_rating_dirty && !self.view_order_refresh_scan_pending() {
+        // row and Undo bookkeeping below, but never submit a new Grid item write
+        // while the shared gate blocks it (including a physical session's terminal).
+        if item_rating_dirty && self.picker_item_rating_input_allowed(picker.context) {
             let (_, error) = self.apply_picker_item_rating_targets(picker, picker.item_rating);
             if let Some(error) = error {
                 self.report_rating_write_error(&error);

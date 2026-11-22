@@ -162,6 +162,7 @@
 - キーは直接移動の走査と同じ許可一覧へ接続し、Esc のスタック切り替えと `GridToggleStackMode` を止める。
 - ゲームパッドの項目非依存操作は `GridItemInputBlock::item_independent_controls_allowed()` へ集約し、新しい variant のときだけ例外を認める。ツリーの左スティック・ピッカーを開く操作・アイテム評価以外のプレビューを維持する。
 - アイテム評価の左右操作・値一覧の選択は draft / dirty の変更前に止める。確定時は新しい item 評価の書込みだけを止め、成功済みプレビューの記録・Undo・ピッカー終了処理を維持する。
+- 実装レビュー P2 対応: 開いたままの Grid ピッカーのアイテム評価は、直接移動への引き継ぎ後や本の構成操作など他の variant でも共有ゲートに従って入口・確定の両方で止める。非 Grid の判定と項目非依存操作の許可一覧は変更しない。
 - 待機表示は既存の Area と 500ms の猶予を共有し、並べ替えだけの待ちには「並べ替え中…」を表示する。既存の直接移動・履歴・評価一覧の表示条件は維持する。
 - 項目の右クリックメニューは既存の所有判定で閉じるため、追加の処理は不要。Immediate・sidecar restore・detached の述語 / viewport・pending の採用 / 置き換え / 終了処理は変更していない。
 - 段階 1 の 28 本の本文・assert は変更していない。新 API の許可判定を全 variant で検査する `sort_hold_838_only_order_refresh_allows_item_independent_controls` を追加し、既存の `direct_navigation_worker_block_reason_keeps_non_item_shortcuts_available` の対象へ新しい variant を追加した。段階 3 へ回したテストは無い。

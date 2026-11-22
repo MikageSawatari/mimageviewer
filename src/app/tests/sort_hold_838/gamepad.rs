@@ -326,3 +326,127 @@ fn sort_hold_838_pre_wait_rating_preview_confirm_preserves_undo() {
 fn sort_hold_838_pre_wait_rating_preview_session_end_preserves_undo() {
     earlier_preview_remains_undoable(true);
 }
+
+fn direct_replacement_blocks_item_rating(list: bool, session_end: bool) {
+    let mut h = Harness::images();
+    let sort = request_sort(&mut h.env, SortOrder::DurationAsc);
+    h.open_picker(); // Opened under the refresh-only exception, before replacement.
+    h.picker_row(3); // ItemRating
+    let before = h.env.ring_picker.as_ref().unwrap().clone();
+    assert_eq!(before.context, RingShortcutContext::Grid);
+    assert_eq!(
+        before.original.item_rating_records.len(),
+        1,
+        "eligible item"
+    );
+    let key = before.original.item_rating_records[0].path_key.clone();
+    let rating = h.env.rating_db.as_ref().unwrap().get(&key);
+    let write_generation = h.env.rating_session_write_generation;
+    let undo = h.env.meta_undo.undo_len();
+    let source = h.env.current_folder.clone();
+    let rows = h.env.items.clone();
+    let generation = h.env.items_generation;
+    let destination = h.env.tmp.path().join("rating-direct-destination");
+    std::fs::create_dir(&destination).unwrap();
+    h.env.open_direct_navigation_target_at_stage(
+        destination,
+        None,
+        OpenRequestOwner::Navigation,
+        None,
+        None,
+        StartupListIntent::ExplicitList,
+        MainListRequestStage::Admission,
+        DirectoryScanRoute::Worker,
+    );
+    let direct = HeldScan::capture(&mut h.env);
+    sort.assert_retired();
+    assert!(h.env.direct_navigation_scan_pending());
+    assert!(!h.env.view_order_refresh_scan_pending());
+    assert!(!h.env.grid_item_input_allowed());
+    let retained = h
+        .env
+        .ring_picker
+        .as_ref()
+        .expect("direct admission keeps picker");
+    assert_eq!(retained.context, before.context);
+    assert_eq!(retained.owner, before.owner);
+    assert_eq!(retained.anchor, before.anchor);
+
+    if list {
+        h.tap_pad(PadButton::South);
+        assert!(h.env.ring_picker.as_ref().unwrap().drill.is_some());
+        h.tap_pad(PadButton::DPadDown);
+        assert_ne!(
+            h.env
+                .ring_picker
+                .as_ref()
+                .unwrap()
+                .drill
+                .as_ref()
+                .unwrap()
+                .selected,
+            usize::from(before.item_rating),
+            "the list must actually select a different candidate",
+        );
+        h.tap_pad(PadButton::South);
+    } else {
+        h.tap_pad(PadButton::DPadRight);
+    }
+    let after_input = h.env.ring_picker.as_ref().unwrap().clone();
+    let rating_after_input = h.env.rating_db.as_ref().unwrap().get(&key);
+    if session_end {
+        h.pad(&[PadEvent::Disconnected]);
+    } else {
+        h.tap_pad(PadButton::East);
+    }
+    assert!(
+        h.env.ring_picker.is_none(),
+        "ordinary terminal must still close picker"
+    );
+    assert!(h.env.direct_navigation_scan_pending());
+    assert!(!direct.cancel.load(Ordering::Relaxed));
+    assert_eq!(h.env.current_folder, source);
+    assert_eq!(h.env.items, rows);
+    assert_eq!(h.env.items_generation, generation);
+    // Keep both terminals reachable before checking the draft: in the reviewed
+    // implementation preview is blocked, but finalize writes the changed draft.
+    assert_eq!(
+        h.env.rating_db.as_ref().unwrap().get(&key),
+        rating,
+        "direct-wait confirmation cannot write an old-list rating"
+    );
+    assert_eq!(
+        rating_after_input, rating,
+        "direct-wait preview cannot write"
+    );
+    assert_eq!(
+        after_input.item_rating, before.item_rating,
+        "blocked draft must stay unchanged"
+    );
+    assert_eq!(
+        after_input.dirty_rows, before.dirty_rows,
+        "blocked row must not become dirty"
+    );
+    assert_eq!(h.env.rating_session_write_generation, write_generation);
+    assert_eq!(h.env.meta_undo.undo_len(), undo);
+}
+
+#[test]
+fn sort_hold_838_direct_replacement_item_rating_direction_and_confirm_do_not_write() {
+    direct_replacement_blocks_item_rating(false, false);
+}
+
+#[test]
+fn sort_hold_838_direct_replacement_item_rating_direction_and_session_end_do_not_write() {
+    direct_replacement_blocks_item_rating(false, true);
+}
+
+#[test]
+fn sort_hold_838_direct_replacement_item_rating_list_and_confirm_do_not_write() {
+    direct_replacement_blocks_item_rating(true, false);
+}
+
+#[test]
+fn sort_hold_838_direct_replacement_item_rating_list_and_session_end_do_not_write() {
+    direct_replacement_blocks_item_rating(true, true);
+}
