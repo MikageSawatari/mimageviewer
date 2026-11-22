@@ -1041,3 +1041,22 @@ root の `focused` が偽のままになる原因は mIV 自身のこともあ�
   同じ取り違えの影響を受けうる。
 - 前面が mIV の中で root から別の窓へ移った理由は、まだ分からない (mIV のログに前面の操作の記録は無い)。4 回目の seed の失敗と
   同じ原因かも分からない (4 回目には前面の記録が無い)。
+
+**runner の root の特定の修正 (2026-11-22、`3f60030ce`)**
+統括の判断: runner の root は、試験対象の mIV が test-script から知らせる HWND を使う。メイン PC で mIV の窓を出す試験はまだしない。
+
+- 見立て (設計担当がコードで確認。前面化の宛先そのものの記録は無く、推定): winit 0.30.13 はスレッドの event target 窓を
+  `WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|WS_EX_LAYERED|WS_EX_TOOLWINDOW` で作り、style を `WS_VISIBLE|WS_POPUP` にする。持ち主は無い。
+  .NET Framework の `Process.MainWindowHandle` は、持ち主が無く見えている最初の top-level 窓を選び、`Refresh()` のたびに選び直す。
+  そのため、この窓を返すことがある。runner は前面を確かめるまで `SetForegroundWindow(MainWindowHandle)` を繰り返すので、
+  event target 窓へ前面化を要求していた時間がありえる。winit の `focus_window` / `force_window_active` は本物の窓を対象にしていて、
+  mIV のコードにこの窓へ前面を動かす処理は見当たらない (製品側の原因は見つかっていない)。4 回目の seed の失敗も同じ経路だった可能性があるが、
+  記録が無く確かめられない。
+- 修正: 台本が `select_root()` の直後 (最初の索引待ちより前) に `release_check_publish_root()` で `root-window.json` (pid・root の HWND) を
+  原子的に書く。値は test-script が選んだ root (context 0) の identity から取る。runner は、これが出るまで前面化をしない。
+  出たら pid と HWND の持ち主を照合し、その HWND だけを前面化・幾何の照合・前面の記録・sampler に使う。
+  ready.json の root と食い違えば FAIL (試験対象が root を取り替えた場合を環境不成立に隠さない)。ReleaseChecks の経路から `MainWindowHandle` は無くなった。
+  公開前の記録の行は root=0 で、分類では SKIPPED の材料にならない。
+- 同じ使い方は `scripts/ui-smoke.ps1` (1916 行付近) と `scripts/page-turn-smoke.ps1` (174 行付近) にも残っている。ReleaseChecks の範囲外なので直していない。
+- Sol / xhigh の独立レビュー: 指摘なしで ACCEPT。前面化の宛先そのものは旧記録では直接証明できない、という注記つき。
+- 診断 artifact を作り直した: `99c0eea48` + `3f60030ce` の `src/` の変更 = `fd6f3abf4` (`C:\miv-relcheck\root`、detached)。
