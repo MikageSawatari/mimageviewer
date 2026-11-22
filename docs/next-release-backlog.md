@@ -122,19 +122,6 @@
 - 状態: **未着手、収録版未定 (テストの組み方、製品の挙動は変わらない見込み)**。観測 (統括、v5.5.1 の build-dist の test-full、aa6f06685): `app::tests::still_window_mode_key_tests::remote_acquire_cancels_archive_open_before_direct_or_converted_completion` と `remote_acquire_cancels_main_epub_modal_before_published_completion` が、取得を始めた直後の 1 回の poll の後で `AcquiringRemote` (期待は `RemoteActive`) になり落ちた。同じソースの lib 全件 2 本 (既定・test-script) では通っている。
 - 推論 (コードから、未確認): 取得の完了 (`src/remote_ipc/ui.rs` の acquire barrier) は、本の位置の書き込み担当 (`spread_shift_service` の `is_ready()`・`book_resume_writer` の watermark) などの準備を待つ。テストはそれが 1 回目の poll までに終わる前提。製品は次のフレームで完了する。`docs/egui-0.37-stage1a-verification.md` に同型の `remote_acquire_retires_startup_resolves_and_rejects_new_activations` の記録がある。直し方は、テストが barrier の待ち対象の準備完了を観測してから取得する形 (回数や時間の待ちにしない)。
 
-### 1.846 漫画の翻訳 (TASlation の取り込み) — 利用者要望 (2026-11-22)
-
-- 状態: **検討前、収録版未定**。利用者: 「今後のバージョンで、この翻訳機能を取り込みたい。MIT ライセンスで、日本の法律上も問題はなさそうに見える」。対象は https://github.com/tamachi955/taslation (README.ja.md)。
-- 概要 (README と LICENSE から、統括のサブエージェントが 2026-11-22 に読んだ範囲): 自分で購入した漫画を自分の PC で読みながら翻訳する Windows 向けツール。ほかのビューアの画面をキャプチャし、吹き出しを読み取り、訳文をページに重ねて表示する。完全ローカル (インストール・更新時だけ通信)。20 言語へ翻訳。ページ画像の保存・ビューアの自動操作・キャプチャ保護の解除はしないと明記。Python 製と推測 (pyproject.toml がある、本文に明記なし)。NVIDIA GPU 6GB 推奨、ディスク約 7.5GB。コードは MIT (`Copyright (c) 2026 TASlation contributors`)。228 commits、スター 0、リリースは未確認 (新しいリポジトリ)。
-- 処理の流れ: OCR はモデル 3 つで読み、食い違ったら多数に近い読みを採る (モデル名は README に無い) → 文字消しは白い吹き出しは塗りつぶし、絵の上は LaMa で補完 → 翻訳は PLaMo 3 Translate 2B (前のページの文脈と用語の辞書を渡す)、一部の言語は Qwen3.5 4B → 訳文の組版。
-- mIV に取り込む場合の論点 (統括、未検討):
-  1. **モデルのライセンスはコードと別**: OCR 3 モデルの重みは CC BY-NC-SA 4.0 (各自がインストール時に同意して取得)。PLaMo 3 Translate 2B は PLaMo Community License (2026-11-09 改定、条件は未読)。Qwen3.5 4B は Apache-2.0。LaMa は README に記載なし。全体は `docs/THIRD_PARTY.md` (未読)。mIV の追加モデルの配布 (GitHub Release の別タグ) に載せられるか、利用者が取得元から入れる形にするかを、ライセンスごとに確かめる。
-  2. **LaMa は 2026-06-21 に消しゴムでライセンス都合により見送り済み** (メモ project_high_quality_eraser_abandoned)。同じ理由が翻訳の文字消しにも当たるか確かめ、当たるなら既存の MI-GAN か塗りつぶしだけで足りるかを見る。
-  3. **画面のキャプチャは不要**: mIV は自分で開いたページの画像を持っているので、キャプチャの経路は取り込まない。DRM 付きストアの公式ビューワからの中継 (2026-11-11 見送り、メモ project_drm_store_relay_declined) には広げない。
-  4. **実装の形**: mIV は Rust + ONNX Runtime (DirectML / TensorRT)。Python の処理をそのまま同梱するか、モデルを ONNX で動かして処理の流れを Rust で組み直すか。MIT なので組み直す場合も著作権表示を残す。
-  5. **法律**: README は日本では著作権法 30 条 (私的使用のための複製) と 47 条の 6 (その目的での翻訳) を根拠にしている。他国の概要は `docs/LEGAL.ja.md` (未読)。訳文を画像として保存・書き出しする機能を付けるかで扱いが変わり得る。
-  6. **公開文書**: 通信 (モデルの取得)・端末内のデータ (訳文・用語辞書のキャッシュ) が増えるので、製品ページの「安心して使えます」と `privacy.html` の確認が要る。
-
 ### 1.849 通常の並べ替えの変更で、物理フォルダを UI スレッドで同期に走査する — §1.838 の設計から (2026-11-22)
 
 - 状態: **v5.6.0 で直す (利用者決定 2026-11-22「長さの件、v5.6.0 で直すことにしたいと思います。修正お願いします。」)。ブランチ sort-worker-849 で実装済み (77773f47a、設計 r3・実装レビュー r2 とも Sol xhigh ACCEPT、関連テスト 1399 本成功、本体 lib 全件と実機は未確認)。サブ PC の依頼文は `C:\home\mimageviewer-subpc\sort849\brief.md` (未送信)**。設計は `docs/sort-worker-849-plan.md`。あわせて、`.epub` などの名前の実ディレクトリを、名前ではなく走査の結果でフォルダとして分類するようにした (自動更新・本優先の評価・本の構成のメニューの扱いが、普通のフォルダと同じになる。詳細は設計 §8.3)。長さ以外の並べ替えも worker の走査 (`CurrentViewOrderRefresh`) に一本化し、§1.838 のゲートと「並べ替え中…」に乗せる。あわせて、長さ→名前で選択が同じ番号の別の項目へ移る件 (サブ PC 担当の観測、range835 の確認の気-1、v5.4.0 から) も直す。観測 (サブ PC 担当、master 0e1b617b0): `\\tsclient` 越しの 3004 件で「名前↑」へ戻すと約 7 秒止まる (`SLOW FRAME 7048.5ms pre_grid=7043.4ms`)。ほかの 11 か所の UI スレッドでの走査は範囲外 (別項目として報告する)。以下は当初の記録。原因 (コードから、duration-762 の調べ、未計測): 長さ順以外の並べ替えは `PhysicalFolderSortReload::Immediate` を通る。そのため、UI スレッドで同期に走査と採用をする (`src/app.rs` の `apply_sort_change_reload*`)。これは `docs/ui-responsiveness.md` の規約から外れている。ネットワーク共有や大きなフォルダでは、並べ替えの変更で画面が止まり得る。worker で走査する形 (長さ順と同じ `WorkerScan`) へ寄せれば、§1.838 のゲートにそのまま乗る。詳細は `docs/sort-change-input-hold-838-plan.md` §2.1 (ブランチ range-filter-835)。
