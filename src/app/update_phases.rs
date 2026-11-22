@@ -1994,6 +1994,7 @@ impl App {
         self.frame_counter = self.frame_counter.wrapping_add(1);
         #[cfg(windows)]
         self.log_main_flash_probe("update_begin", "after_frame_counter_increment");
+        egui_wgpu::frame_diag::set_enabled(crate::perf::is_enabled());
         if crate::perf::is_enabled() {
             let frame_begin_now = std::time::Instant::now();
             if let Some(prev_begin) = self.perf_last_frame_begin {
@@ -2167,6 +2168,77 @@ impl App {
                     ),
                 ],
             );
+            // §1.827: the previous ROOT pass after App::update returned (eframe/egui-wgpu).
+            if let Some(pass) = egui_wgpu::frame_diag::take_root_pass() {
+                let begin = egui_wgpu::frame_diag::root_pass_begin();
+                let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+                let idle_ms = pass
+                    .end
+                    .zip(begin)
+                    .map(|(end, begin)| ms(begin.saturating_duration_since(end)));
+                let pre_update_ms =
+                    begin.map(|begin| ms(frame_begin_now.saturating_duration_since(begin)));
+                let paint = pass.paint.unwrap_or_default();
+                crate::perf::event(
+                    "frame",
+                    "root_outside",
+                    None,
+                    self.input_seq,
+                    &[
+                        ("n", serde_json::Value::from(self.frame_counter)),
+                        ("prev_update_ms", serde_json::Value::from(prev_update_ms)),
+                        ("prev_outside_ms", serde_json::Value::from(prev_outside_ms)),
+                        ("run_ui_ms", serde_json::Value::from(pass.run_ui_ms)),
+                        (
+                            "egui_pass_ms",
+                            serde_json::Value::from((pass.run_ui_ms - prev_update_ms).max(0.0)),
+                        ),
+                        ("finalize_ms", serde_json::Value::from(pass.finalize_ms)),
+                        ("platform_ms", serde_json::Value::from(pass.platform_ms)),
+                        ("tessellate_ms", serde_json::Value::from(pass.tessellate_ms)),
+                        ("paint_ms", serde_json::Value::from(pass.paint_ms)),
+                        (
+                            "viewport_out_ms",
+                            serde_json::Value::from(pass.viewport_out_ms),
+                        ),
+                        ("idle_ms", serde_json::Value::from(idle_ms)),
+                        ("pre_update_ms", serde_json::Value::from(pre_update_ms)),
+                        (
+                            "accesskit_nodes",
+                            serde_json::Value::from(pass.accesskit_nodes.map(|n| n as i64)),
+                        ),
+                        ("shapes", serde_json::Value::from(pass.shapes as i64)),
+                        (
+                            "clipped_primitives",
+                            serde_json::Value::from(pass.clipped_primitives as i64),
+                        ),
+                        ("gpu_painted", serde_json::Value::from(pass.paint.is_some())),
+                        (
+                            "gpu_textures_ms",
+                            serde_json::Value::from(paint.textures_ms),
+                        ),
+                        ("gpu_buffers_ms", serde_json::Value::from(paint.buffers_ms)),
+                        ("gpu_acquire_ms", serde_json::Value::from(paint.acquire_ms)),
+                        ("gpu_encode_ms", serde_json::Value::from(paint.encode_ms)),
+                        ("gpu_submit_ms", serde_json::Value::from(paint.submit_ms)),
+                        ("gpu_release_ms", serde_json::Value::from(paint.release_ms)),
+                        ("gpu_present_ms", serde_json::Value::from(paint.present_ms)),
+                        ("gpu_presented", serde_json::Value::from(paint.presented)),
+                        ("meshes", serde_json::Value::from(paint.meshes as i64)),
+                        ("vertices", serde_json::Value::from(paint.vertices as i64)),
+                        ("indices", serde_json::Value::from(paint.indices as i64)),
+                        ("delta_set", serde_json::Value::from(paint.delta_set as i64)),
+                        (
+                            "delta_free",
+                            serde_json::Value::from(paint.delta_free as i64),
+                        ),
+                        (
+                            "delta_bytes",
+                            serde_json::Value::from(paint.delta_bytes as i64),
+                        ),
+                    ],
+                );
+            }
             // 起動時間計測: 最初の update() 呼び出し = winit が初回描画に入った瞬間。
             // `total_ms` に main() 入口からの累計経過を載せる。creator_exit との差分が
             // wgpu パイプライン構築 + winit 初期描画準備の時間になる。

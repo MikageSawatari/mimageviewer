@@ -979,6 +979,9 @@ impl Painter {
             PaintOutcome::RenderStateAbsent,
         );
         let mut vsync_sec = 0.0;
+        // mIV §1.827: ROOT paint stage diagnostics (off unless the app's perf log is on).
+        let mut diag_clock = (viewport_id == ViewportId::ROOT && crate::frame_diag::enabled())
+            .then(|| crate::frame_diag::PaintClock::start(clipped_primitives, textures_delta));
 
         // If the previous frame produced `CurrentSurfaceTexture::Lost`, the action match
         // below set `needs_recreate`. Recreate the surface now, before re-borrowing
@@ -1011,6 +1014,9 @@ impl Painter {
         let Some(mut delivery) = delivery else {
             return vsync_sec;
         };
+        if let Some(clock) = &mut diag_clock {
+            clock.stages.textures_ms = clock.lap();
+        }
         let render_state = delivery.render_state;
         probe.outcome = PaintOutcome::SurfaceAbsent;
 
@@ -1053,6 +1059,9 @@ impl Painter {
 
         // update_buffers may have queued new writes after the last mipmap submission.
         delivery.queue_needs_submit = true;
+        if let Some(clock) = &mut diag_clock {
+            clock.stages.buffers_ms = clock.lap();
+        }
         if observe {
             self.config.startup_end(StartupGpuStage::Buffers, true);
         }
@@ -1088,6 +1097,9 @@ impl Painter {
             vsync_sec += start.elapsed().as_secs_f32();
             output_frame
         };
+        if let Some(clock) = &mut diag_clock {
+            clock.stages.acquire_ms = clock.lap();
+        }
 
         // `None` when there is no frame to present to. A capture is rendered to its own
         // texture and copied back to the cpu, so it is served even then — that is how a hidden
@@ -1252,6 +1264,9 @@ impl Painter {
             profiling::scope!("CommandEncoder::finish");
             encoder.finish()
         };
+        if let Some(clock) = &mut diag_clock {
+            clock.stages.encode_ms = clock.lap();
+        }
 
         if observe {
             self.config.startup_end(StartupGpuStage::Encode, true);
@@ -1270,6 +1285,9 @@ impl Painter {
             }
             vsync_sec += start.elapsed().as_secs_f32();
         };
+        if let Some(clock) = &mut diag_clock {
+            clock.stages.submit_ms = clock.lap();
+        }
 
         probe.outcome = if output_frame.is_some() {
             PaintOutcome::Submitted
@@ -1278,6 +1296,9 @@ impl Painter {
         };
         // Complete frees after the real submission; early exits use the same owner.
         drop(delivery);
+        if let Some(clock) = &mut diag_clock {
+            clock.stages.release_ms = clock.lap();
+        }
 
         if let Some(capture_buffer) = capture_buffer
             && let Some(screen_capture_state) = &mut self.screen_capture_state
@@ -1317,6 +1338,10 @@ impl Painter {
                 }
             }
             vsync_sec += start.elapsed().as_secs_f32();
+        }
+        if let Some(clock) = &mut diag_clock {
+            clock.stages.present_ms = clock.lap();
+            clock.stages.presented = presented.is_some();
         }
 
         vsync_sec

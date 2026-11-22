@@ -827,6 +827,18 @@ impl WgpuWinitRunning<'_> {
 
         let mut frame_timer = crate::stopwatch::Stopwatch::new();
         frame_timer.start();
+        // mIV §1.827: ROOT pass diagnostics (off unless the app's perf log is on).
+        let diag_on = viewport_id == ViewportId::ROOT && egui_wgpu::frame_diag::enabled();
+        let mut diag = egui_wgpu::frame_diag::RootPass::default();
+        let mut diag_lap = std::time::Instant::now();
+        if diag_on {
+            egui_wgpu::frame_diag::mark_root_pass_begin(diag_lap);
+        }
+        let mut diag_mark = |slot: &mut f64| {
+            let now = std::time::Instant::now();
+            *slot = now.duration_since(diag_lap).as_secs_f64() * 1000.0;
+            diag_lap = now;
+        };
 
         let (viewport_ui_cb, raw_input, show_ui) = {
             profiling::scope!("Prepare");
@@ -1021,6 +1033,8 @@ impl WgpuWinitRunning<'_> {
         let producing_root_frame = integration
             .egui_ctx
             .cumulative_frame_nr_for(ViewportId::ROOT);
+        let mut diag_ignored = 0.0;
+        diag_mark(&mut diag_ignored);
         let mut full_output = {
             #[cfg(all(target_os = "windows", feature = "miv-test-script-window-witness"))]
             let _window_witness_scope = crate::miv_test_script_window_witness::enter_native_window(
@@ -1036,6 +1050,7 @@ impl WgpuWinitRunning<'_> {
                 raw_input.expect("a Full UI pass takes its viewport's input"),
             )
         };
+        diag_mark(&mut diag.run_ui_ms);
         finalize_native_wgpu_root_output(
             app.as_mut(),
             &integration.egui_ctx,
@@ -1060,6 +1075,15 @@ impl WgpuWinitRunning<'_> {
         );
         let startup_tag = (viewport_id == ViewportId::ROOT)
             .then(|| egui_wgpu::take_root_startup_frame_tag(&integration.egui_ctx));
+        diag_mark(&mut diag.finalize_ms);
+        if diag_on {
+            diag.accesskit_nodes = full_output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .map(|update| update.nodes.len());
+            diag.shapes = full_output.shapes.len();
+        }
 
         // ------------------------------------------------------------
 
@@ -1115,6 +1139,7 @@ impl WgpuWinitRunning<'_> {
                         event_loop,
                     },
                 );
+                diag_mark(&mut diag.platform_ms);
                 let paint = super::frame_output::PassDecision::for_viewport(
                     PassMode::Full,
                     info,
@@ -1129,6 +1154,8 @@ impl WgpuWinitRunning<'_> {
                     pending_deltas,
                     |painter, pending_deltas| {
                         let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
+                        diag_mark(&mut diag.tessellate_ms);
+                        diag.clipped_primitives = clipped_primitives.len();
 
                         let screenshot_commands = take_screenshot_requests(&mut *actions_requested);
                         #[cfg(all(
@@ -1174,6 +1201,7 @@ impl WgpuWinitRunning<'_> {
                         actions_requested
                             .retain(|action| !matches!(action, ActionRequested::PaintWhileHidden));
                         integration.post_rendering(window);
+                        diag_mark(&mut diag.paint_ms);
                         vsync_secs
                     },
                     |painter, pending_deltas| painter.apply_textures_delta(pending_deltas),
@@ -1194,6 +1222,7 @@ impl WgpuWinitRunning<'_> {
             painter,
             viewport_from_window,
         );
+        diag_mark(&mut diag.viewport_out_ms);
 
         let window = viewport_from_window
             .get(&window_id)
@@ -1219,6 +1248,11 @@ impl WgpuWinitRunning<'_> {
             app.as_mut(),
             shared,
         );
+        if diag_on {
+            diag.paint = egui_wgpu::frame_diag::take_root_paint();
+            diag.end = Some(std::time::Instant::now());
+            egui_wgpu::frame_diag::record_root_pass(diag);
+        }
 
         if integration.should_close() {
             Ok(EventResult::CloseRequested)
