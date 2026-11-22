@@ -491,3 +491,83 @@ fn setting_zoom_media_items_stay_outside_the_ordinary_image_classifier() {
         );
     }
 }
+
+/// §1.842: after the cursor auto-hides, its last hover position is stale for
+/// passive hover UI, but a wheel turned there is real input at that position.
+/// The seek bar must keep its page-turn meaning for both the v5.5.0 Zoom
+/// setting and the v5.4.0 InPageScroll setting.
+#[test]
+fn section1842_seek_bar_wheel_after_cursor_auto_hide_still_turns_the_page() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    for setting in [
+        FullscreenWheelAction::Zoom,
+        FullscreenWheelAction::InPageScroll,
+    ] {
+        for delta in [-40.0, -120.0] {
+            let ctx = egui::Context::default();
+            let mut app = app(&ctx, SpreadMode::Single);
+            app.settings.fullscreen_wheel_action = setting;
+            seed(&ctx, &mut app);
+            let geometry = app.still_seek_geometry_for_idx(full_rect(), 0, false);
+            let pointer = geometry.panel_rect(full_rect()).center();
+            frame(&ctx, vec![egui::Event::PointerMoved(pointer)], |ui, ctx| {
+                assert_eq!(pointer_handler(&mut app, ui, ctx), FsPageNav::None);
+            });
+            // The pointer stays still until the idle timer hides it.
+            app.cursor_hide_reason = Some(crate::ui_fullscreen::FsCursorHide::Idle);
+            let before = (app.fs_zoom, app.fs_pan);
+            frame(
+                &ctx,
+                vec![wheel_event(Vec2::new(0.0, delta), egui::Modifiers::NONE)],
+                |ui, ctx| {
+                    assert_eq!(
+                        pointer_handler(&mut app, ui, ctx),
+                        FsPageNav::Delta(1),
+                        "{setting:?} delta={delta}"
+                    );
+                    assert_eq!(
+                        (app.fs_zoom, app.fs_pan),
+                        before,
+                        "{setting:?} delta={delta}"
+                    );
+                },
+            );
+        }
+    }
+}
+
+#[test]
+fn section1842_idle_without_pointer_activity_keeps_passive_panel_hover_suppressed() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    for hidden in [false, true] {
+        for right_edge in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = app(&ctx, SpreadMode::Single);
+            app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+            seed(&ctx, &mut app);
+            let pointer = egui::pos2(if right_edge { 599.0 } else { 1.0 }, 200.0);
+            frame(&ctx, vec![egui::Event::PointerMoved(pointer)], |_, _| {});
+            app.cursor_hide_reason = hidden.then_some(FsCursorHide::Idle);
+            let before = (app.fs_zoom, app.fs_pan);
+            frame(&ctx, vec![], |ui, ctx| {
+                assert_eq!(ctx.input(|input| input.pointer.hover_pos()), Some(pointer));
+                assert!(!ctx.input(fullscreen_cursor_active));
+                assert_eq!(pointer_handler(&mut app, ui, ctx), FsPageNav::None);
+                assert_eq!(
+                    app.adjustment_mode.is_open(),
+                    !hidden && !right_edge,
+                    "hidden={hidden} right_edge={right_edge}"
+                );
+                assert_eq!(
+                    app.fs_info_panel.hover_active,
+                    !hidden && right_edge,
+                    "hidden={hidden} right_edge={right_edge}"
+                );
+                assert_eq!(app.cursor_hide_reason, hidden.then_some(FsCursorHide::Idle));
+                assert_eq!((app.fs_zoom, app.fs_pan), before);
+            });
+        }
+    }
+}

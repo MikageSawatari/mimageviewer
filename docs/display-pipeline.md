@@ -1652,6 +1652,21 @@ egui 音楽ビューも同じ mode と App runtime を使う。3 面とも Click
 補正編集、表示トリム、分析、比較 wipe、360、ズーム、アニメ中など描画抑止中は、非表示の
 右パネル矩形や ClickToShow の最端帯も入力を奪わない。
 
+静止画の左クリックと右クリック短押しは `FullscreenSidePanelClickChrome::contains_pointer` で
+左右パネル・呼び出し帯・ナビゲータ除外・Depth パネルの当たり判定を共有する。
+`App::fs_side_panel_click_chrome` が入力時の可視状態とシーク領域高から矩形を作り、遅延する
+wheel/click proposal にもその幾何を保持する。右情報パネルの可視性は
+`App::fullscreen_info_panel_visible_for_idx` が有効なロックを反映して
+`FullscreenInfoPanelState::visible` から取得し、ホイールとクリックで共有する。
+ロックだけで表示している右パネルもクリックを受け持ち、左クリックで背面のページを送らない。
+左補正パネルは `adjustment_mode.is_open()` が表示状態の正本で、別のロックはない。
+これ以外の左クリックの除外範囲は維持する。
+右は egui の `released_buttons_with_click_counts` のクリック成立情報を対応する release に結び付け、
+`apply_fs_secondary_input` で確定した ShortTap（コマンドなし）だけをパネルへ渡す。
+終了予定の判定も同じ条件を使い、raw input は消費しないので後段のタグメニューが開ける。
+egui の距離・時間制限でクリックにならなかった短押し、リング / ジェスチャ、無効モードの長押し、
+native 動画の入力経路は従来どおりとする。
+
 ### 2.2.2 動画フルスクリーンとタイルモード
 
 `GridItem::Video` は画像ロードワーカーを使わず、`App::start_fs_load` の動画分岐で
@@ -1731,6 +1746,7 @@ pointer activity は `ZoomAiming` を解除せず、照準前から `Idle` だ�
 補正パネル edge hover / panel 内判定など、passive hover 由来の状態遷移では
 `!cursor_hidden` で gate する。マウス操作または固定 UI 表示が戻ったら
 `CursorVisible(true)` で復帰する。
+この stale 規則は受動ホバーに適用し、Idle 非表示を解除するフレームのホイール / クリックはそのフレームで捕捉した pointer activity に従って現在位置へ配送する（ZoomAiming 中の扱いは維持する）。
 
 #### 2.2.2 右パネルへの動的状態反映
 

@@ -1544,7 +1544,28 @@ pending 中は追加ホイール入力を捨て、queue も delta 累積もし�
   `final_ai_cache` 挿入を防ぐ)。
 - **同時起動ポリシー**: 先読みは `prefetch_final_ai` が `has_uncancelled_final_ai_pending`
   で gate するため、未キャンセル pending がある間は新しい先読みを enqueue しない
-  (= キューに先読みが溜まりすぎない)。display ジョブはこの gate の対象外で即 enqueue。
+  (= キューに先読みが溜まりすぎない)。さらに先読みはフレーム内の描画より前に走るため、
+  ページ単位表示で draw が素材生成を所有する場合だけ、表示されるページの
+  `DisplayedFinalAiState::Waiting` があれば隣接ページの AI 入力要求・起動を待つ。
+  所有条件は `paged_viewer_materialization_allowed`（overview session なし・表示許可あり・
+  連結読みではない）で draw の target load / material resolve と共有する。
+  prefetch は `paged_draw_materialization_demand` で既存の book permission と同じ
+  `permitted_projection` を読み、許可後の表示ページだけを判定する。overview 中や表示不許可では
+  draw が Waiting を進めないため、新しい gate を適用せず従来どおり先読みする。
+  素材生成を所有する draw は source の `NeedsLoad` を要求し、`LoadPending` / `UploadPending` は
+  既存 loader / upload の回収、素材到着後の AI 待ちは final ensure で進む。
+  `LoadFailed` は `final_ai_job_state` が `Failed` と
+  判定するため、壊れたページを表示し続けても隣接先読みを永久に止めない。
+  `original_preview_active_for_frame` の描画と同じ観測値を `fs_display_stage` に渡し、
+  `displayed_final_ai_state` で判定する。元画像・アニメーション・編集中など AI を起動しない
+  表示段はこの待機を作らない。display ジョブはこの gate の対象外で即 enqueue。
+  連結読みは draw が keep-set の一部だけを処理し、残りは先読みが供給するため、この新しい
+  gate を適用しない。従来の動作を維持し、連結読みで U を押した際の起動順は今回の対象外。
+- **保持結果の復元**: 通常画像・PDF とも、同じ key が live `final_ai_cache` にあれば
+  retained lookup を繰り返さない。復元済み entry を維持し、再描画だけで保持 LRU の clock・
+  hit ログ・retained hit に伴うキャンセルを反復させない。
+  PDF 専用の `restore_retained_pdf_final_ai_composite` も live AI entry を再利用し、
+  カラー化 / Creative LUT の同じ effect が pending の間はその既存 worker を維持する。
 
 > 注: fullscreen session をまたぐ final AI pixels は `retained_final_ai_cache` で
 > 枚数 + MiB の LRU 管理を行う。これは CPU 側の推論結果保持で、表示中の

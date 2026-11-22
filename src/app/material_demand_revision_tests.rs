@@ -21,6 +21,7 @@ fn completed_neighbor(ctx: &egui::Context) -> (AppTestEnvForTest, FinalComposite
     let (mut app, keys) = warm_final_pair(ctx);
     evict_pair_cpu(&mut app);
     single_neighbor(&mut app);
+    section1839_skip_display_ai_for_neighbor_test(&mut app, 1);
     let key = keys[1];
     app.final_composite_cache
         .get_mut(&key)
@@ -41,6 +42,413 @@ fn assert_no_source_demand(app: &App) {
     assert!(app.current_raw_source_pixels(0).is_none());
     assert!(app.edit_result_cache.is_empty());
     assert!(app.local_adjust_pending.is_empty());
+}
+
+fn section1839_skip_display_ai_for_neighbor_test(app: &mut App, idx: usize) {
+    // These older fixtures exercise neighbor work, so the displayed page must
+    // satisfy the restored current-done contract without seeding extra caches.
+    let mut params = app.effective_params(idx).clone();
+    params.upscale_model = None;
+    params.denoise_model = None;
+    app.adjustment_page_params.insert(idx, params);
+    assert_eq!(
+        app.displayed_final_ai_state(idx, app.fs_display_stage(idx, false)),
+        DisplayedFinalAiState::NotRequested
+    );
+}
+
+fn section1839_single_neighbor_with_waiting_display(ctx: &egui::Context) -> AppTestEnvForTest {
+    let mut app = setup_app_for_test();
+    let neighbor_path = app.tmp.path().join("section1839-neighbor.png");
+    let current_path = app.tmp.path().join("section1839-current.png");
+    app.items.push(GridItem::Image(neighbor_path));
+    app.items.push(GridItem::Image(current_path));
+    app.visible_indices = vec![0, 1];
+    app.details_order = vec![0, 1];
+    app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+    app.settings.global_preset.upscale_model = Some(
+        crate::ai::ModelKind::UpscaleRealEsrGeneralV3
+            .as_str()
+            .into(),
+    );
+    single_neighbor(&mut app);
+    let pixels = Arc::new(egui::ColorImage::filled([4, 6], egui::Color32::WHITE));
+    let tex = ctx.load_texture(
+        "section1839-current-source",
+        Arc::clone(&pixels),
+        DISPLAY_IMAGE_TEXTURE_OPTIONS,
+    );
+    app.fs_cache.insert(
+        1,
+        FsCacheEntry::Static {
+            pdf_rerender_failures: Vec::new(),
+            pdf_metadata: None,
+            tex,
+            pixels,
+            source_dims: Some([4, 6]),
+            load_seq: 0,
+            animation: crate::fs_animation::StaticAnimationState::Still,
+        },
+    );
+    assert!(app.current_raw_source_pixels(1).is_some());
+    assert_eq!(app.final_ai_job_state(1), FinalAiJobState::Waiting);
+    assert_eq!(
+        app.displayed_final_ai_state(1, app.fs_display_stage(1, false)),
+        DisplayedFinalAiState::Waiting
+    );
+    app
+}
+
+fn section1839_make_display_ai_ready(app: &mut App) {
+    let params = app.effective_params(1).clone();
+    let key = app
+        .final_ai_key_for_pixels(app.current_edit_result_key(1), [4, 6], &params)
+        .unwrap();
+    app.final_ai_cache.insert(
+        key,
+        FinalAiEntry {
+            diagnostic_metadata: None,
+            canonical_dims: None,
+            source_size: [4, 6],
+            pixels: Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::WHITE)),
+            used_upscale: true,
+        },
+    );
+    assert_eq!(app.final_ai_job_state(1), FinalAiJobState::Ready);
+}
+
+fn section1839_assert_neighbor_source_requested(app: &App) {
+    // The standard fixture deliberately does not start a native AI runtime.
+    // Requesting its missing input proves that the neighbor was admitted.
+    assert_eq!(
+        app.fs_pending.get(&0).map(|pending| pending.purpose),
+        Some(FsLoadPurpose::Original {
+            entry: OriginalMaterialEntry::MaterialOnly,
+        })
+    );
+}
+
+#[test]
+fn section1839_waiting_display_does_not_start_neighbor_prefetch() {
+    let ctx = egui::Context::default();
+    let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+    assert!(app.final_ai_pending.is_empty());
+    assert!(app.final_ai_failed.is_empty());
+    assert!(app.final_ai_cache.is_empty());
+
+    app.prefetch_final_ai(&ctx, 1);
+
+    assert_no_source_demand(&app);
+    assert!(app.final_ai_pending.is_empty());
+    assert!(app.final_ai_failed.is_empty());
+    assert!(app.final_ai_cache.is_empty());
+    assert!(app.final_effect_pending.is_empty());
+}
+
+#[test]
+fn section1839_source_pending_display_does_not_start_neighbor_prefetch() {
+    for upload_pending in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+        app.fs_cache.remove(&1);
+        let (tx, rx) = mpsc::channel();
+        if upload_pending {
+            let generation = app.items_generation;
+            app.fs_upload_backlog.push_for_generation(
+                generation,
+                FsUploadResult::new(
+                    1,
+                    FsLoadResult::Static {
+                        ci: egui::ColorImage::filled([4, 6], egui::Color32::WHITE),
+                        source_dims: [4, 6],
+                        animation: crate::fs_animation::StaticAnimationState::Still,
+                    },
+                    0,
+                    FsLoadPurpose::Display,
+                ),
+            );
+        } else {
+            app.fs_pending.insert(
+                1,
+                FsPendingValue::new(
+                    Arc::new(AtomicBool::new(false)),
+                    rx,
+                    0,
+                    FsLoadPurpose::Display,
+                ),
+            );
+        }
+        assert_eq!(
+            app.fs_page_load_state(1),
+            if upload_pending {
+                FsPageLoadState::UploadPending
+            } else {
+                FsPageLoadState::LoadPending
+            }
+        );
+        assert_eq!(app.final_ai_job_state(1), FinalAiJobState::SourcePending);
+        assert_eq!(
+            app.displayed_final_ai_state(1, app.fs_display_stage(1, false)),
+            DisplayedFinalAiState::Waiting
+        );
+
+        app.prefetch_final_ai(&ctx, 1);
+
+        assert!(!app.fs_pending.contains_key(&0));
+        assert!(!app.fs_upload_backlog_contains(0));
+        assert!(app.current_raw_source_pixels(0).is_none());
+        assert!(app.edit_result_cache.is_empty());
+        assert!(app.local_adjust_pending.is_empty());
+        assert!(app.final_ai_pending.is_empty());
+        assert!(app.final_ai_failed.is_empty());
+        assert_eq!(app.fs_pending.contains_key(&1), !upload_pending);
+        assert_eq!(app.fs_upload_backlog_contains(1), upload_pending);
+        drop(tx);
+    }
+}
+
+#[test]
+fn section1839_failed_display_source_allows_neighbor_prefetch() {
+    let ctx = egui::Context::default();
+    let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+    app.fs_cache.insert(1, FsCacheEntry::Failed);
+    assert_eq!(app.fs_page_load_state(1), FsPageLoadState::LoadFailed);
+    assert_eq!(app.final_ai_job_state(1), FinalAiJobState::Failed);
+    assert_eq!(
+        app.displayed_final_ai_state(1, app.fs_display_stage(1, false)),
+        DisplayedFinalAiState::NotApplied(NotAppliedReason::Failed)
+    );
+
+    app.prefetch_final_ai(&ctx, 1);
+
+    section1839_assert_neighbor_source_requested(&app);
+}
+
+#[test]
+fn section1839_waiting_spread_partner_blocks_neighbor_prefetch() {
+    let ctx = egui::Context::default();
+    let mut app = pdf_book(&ctx);
+    retain_pdf_ai(&mut app, 19);
+    assert_eq!(app.final_ai_job_state(19), FinalAiJobState::Ready);
+    assert_eq!(app.displayed_spread_partner(19), Some(20));
+    assert_eq!(
+        app.displayed_final_ai_state(20, app.fs_display_stage(20, false)),
+        DisplayedFinalAiState::Waiting
+    );
+    assert!(app.ai_prefetch_targets(19).contains(&21));
+    app.fs_cache.remove(&21);
+
+    app.prefetch_final_ai(&ctx, 19);
+
+    assert!(app.fs_pending.is_empty());
+    assert!(app.edit_result_cache.is_empty());
+    assert!(app.final_ai_pending.is_empty());
+    assert!(app.final_ai_failed.is_empty());
+}
+
+#[test]
+fn section1839_continuous_reading_does_not_apply_display_waiting_gate() {
+    for flow in [
+        crate::settings::ReadingFlow::Vertical,
+        crate::settings::ReadingFlow::Horizontal,
+    ] {
+        for contains_current in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+            app.reading_flow = flow;
+            app.fs_vertical_cache_keep_set.insert(0);
+            if contains_current {
+                app.fs_vertical_cache_keep_set.insert(1);
+            }
+
+            app.prefetch_final_ai(&ctx, 1);
+
+            section1839_assert_neighbor_source_requested(&app);
+            assert!(app.final_ai_pending.is_empty());
+            assert!(app.final_ai_failed.is_empty());
+        }
+    }
+}
+
+#[test]
+fn section1839_ready_display_allows_neighbor_prefetch() {
+    let ctx = egui::Context::default();
+    let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+    section1839_make_display_ai_ready(&mut app);
+
+    app.prefetch_final_ai(&ctx, 1);
+
+    section1839_assert_neighbor_source_requested(&app);
+}
+
+#[test]
+fn section1839_overview_waiting_display_allows_neighbor_prefetch() {
+    use crate::page_overview::{
+        PageOverviewDirection, PageOverviewProjection, PageOverviewStamp, PageOverviewState,
+    };
+    let ctx = egui::Context::default();
+    let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+    let identity = file_type_resume::PreparedPageIdentityIndex::prepare(
+        &app.items,
+        None,
+        app.settings.file_type_visibility.clone(),
+    );
+    let projection = Arc::new(
+        PageOverviewProjection::new(
+            Arc::clone(identity.overview_metadata()),
+            Arc::new(vec![0, 1]),
+        )
+        .unwrap(),
+    );
+    let stamp = PageOverviewStamp {
+        context_serial: app.projected_viewer_context_id().serial(),
+        items_generation: app.items_generation,
+        reader_order_revision: Arc::as_ptr(&projection) as usize as u64,
+        incarnation: 1,
+    };
+    app.page_overview = PageOverviewState::open(
+        projection,
+        stamp,
+        1,
+        5,
+        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 660.0)),
+        PageOverviewDirection::LeftToRight,
+    )
+    .unwrap();
+    assert!(app.page_overview.session().is_some());
+    assert_eq!(
+        app.displayed_final_ai_state(1, app.fs_display_stage(1, false)),
+        DisplayedFinalAiState::Waiting
+    );
+
+    app.prefetch_final_ai(&ctx, 1);
+
+    section1839_assert_neighbor_source_requested(&app);
+}
+
+#[test]
+fn section1839_disallowed_waiting_display_allows_neighbor_prefetch() {
+    let ctx = egui::Context::default();
+    let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+    let demand = app.book_target_presentation_demand(1);
+    app.install_hidden_presentation_for_test(&demand);
+    assert_eq!(
+        app.book_presentation_allowed(&demand),
+        crate::book_composition::PresentationDecision::Hidden
+    );
+    assert_eq!(
+        app.displayed_final_ai_state(1, app.fs_display_stage(1, false)),
+        DisplayedFinalAiState::Waiting
+    );
+
+    app.prefetch_final_ai(&ctx, 1);
+
+    section1839_assert_neighbor_source_requested(&app);
+}
+
+#[test]
+fn section1839_display_ensure_resolves_waiting_before_neighbor_prefetch() {
+    let ctx = egui::Context::default();
+    let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+    let model = crate::ai::ModelKind::UpscaleRealEsrGeneralV3;
+    assert!(app.ai_model_manager.model_path(model).is_none());
+    // Exercise the production model-unavailable terminal without native ORT initialization.
+    app.ai_runtime_init = crate::ai::runtime::AiRuntimeInitOwner::ready_for_test(Arc::new(
+        crate::ai::runtime::AiRuntime::empty_for_test(),
+    ));
+
+    app.prefetch_final_ai(&ctx, 1);
+    assert_no_source_demand(&app);
+    assert!(app.final_ai_failed.is_empty());
+
+    let params = app.effective_params(1).clone();
+    let key = app
+        .final_ai_key_for_pixels(app.current_edit_result_key(1), [4, 6], &params)
+        .unwrap();
+    let _ = app.ensure_final_composite_texture(&ctx, 1);
+    assert!(app.final_ai_failed.contains(&key));
+    assert!(app.final_ai_pending.is_empty());
+    assert_ne!(
+        app.displayed_final_ai_state(1, app.fs_display_stage(1, false)),
+        DisplayedFinalAiState::Waiting
+    );
+    assert!(!app.fs_pending.contains_key(&0));
+
+    app.prefetch_final_ai(&ctx, 1);
+
+    section1839_assert_neighbor_source_requested(&app);
+}
+
+#[test]
+fn section1839_animated_display_allows_neighbor_prefetch() {
+    let ctx = egui::Context::default();
+    let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+    app.fs_cache.insert(
+        1,
+        FsCacheEntry::Animated {
+            frames: Vec::new(),
+            current_frame: 0,
+            frame_pixels: Vec::new(),
+            playback: crate::fs_animation::AnimationPlayback::Paused,
+            load_seq: 0,
+        },
+    );
+    let stage = app.fs_display_stage(1, false);
+    assert_eq!(stage, crate::ui_fullscreen::FsDisplayStage::Animated);
+    assert_eq!(
+        app.displayed_final_ai_state(1, stage),
+        DisplayedFinalAiState::NotApplied(NotAppliedReason::Animated)
+    );
+
+    app.prefetch_final_ai(&ctx, 1);
+
+    section1839_assert_neighbor_source_requested(&app);
+}
+
+#[test]
+fn section1839_original_display_allows_neighbor_prefetch() {
+    let ctx = egui::Context::default();
+    let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+    app.analysis_mode = true;
+    let stage = app.fs_display_stage(1, false);
+    assert_eq!(stage, crate::ui_fullscreen::FsDisplayStage::Original);
+    assert_eq!(
+        app.displayed_final_ai_state(1, stage),
+        DisplayedFinalAiState::NotApplied(NotAppliedReason::OriginalShown)
+    );
+
+    app.prefetch_final_ai(&ctx, 1);
+
+    section1839_assert_neighbor_source_requested(&app);
+}
+
+#[test]
+fn section1839_resident_retained_neighbor_is_not_rehydrated() {
+    let ctx = egui::Context::default();
+    let mut app = section1839_single_neighbor_with_waiting_display(&ctx);
+    section1839_make_display_ai_ready(&mut app);
+    let params = app.effective_params(0).clone();
+    let key = app
+        .final_ai_key_for_pixels(app.current_edit_result_key(0), [4, 6], &params)
+        .unwrap();
+    let pixels = Arc::new(egui::ColorImage::filled([8, 12], egui::Color32::WHITE));
+    assert!(app.insert_retained_final_ai(0, key, [4, 6], Arc::clone(&pixels)));
+    let before_hydration = app.retained_final_ai_clock;
+
+    app.prefetch_final_ai(&ctx, 1);
+
+    assert!(Arc::ptr_eq(&pixels, &app.final_ai_cache[&key].pixels));
+    let after_hydration = app.retained_final_ai_clock;
+    assert!(after_hydration > before_hydration);
+    assert_no_source_demand(&app);
+
+    app.prefetch_final_ai(&ctx, 1);
+
+    assert_eq!(app.retained_final_ai_clock, after_hydration);
+    assert!(Arc::ptr_eq(&pixels, &app.final_ai_cache[&key].pixels));
+    assert_no_source_demand(&app);
+    assert!(app.final_ai_pending.is_empty());
+    assert!(app.final_ai_failed.is_empty());
 }
 
 #[test]
@@ -90,6 +498,7 @@ fn material_demand_revision_matching_retained_pdf_restores_ai_without_original()
     let mut app = pdf_book(&ctx);
     let final_key = retain_pdf_ai(&mut app, 0);
     single_neighbor(&mut app);
+    section1839_skip_display_ai_for_neighbor_test(&mut app, 1);
     let params = app.effective_params(0).clone();
     let ai_key = app
         .final_ai_key_for_pixels(final_key.edit_key, [4, 6], &params)
@@ -100,6 +509,12 @@ fn material_demand_revision_matching_retained_pdf_restores_ai_without_original()
     assert_eq!(app.final_ai_cache[&ai_key].source_size, [4, 6]);
     assert_eq!(app.final_ai_cache[&ai_key].pixels.size, [8, 12]);
     assert!(app.final_ai_pending.is_empty());
+    let pixels = Arc::clone(&app.final_ai_cache[&ai_key].pixels);
+    let after_hydration = app.retained_final_ai_clock;
+    app.prefetch_final_ai(&ctx, 1);
+    assert_eq!(app.retained_final_ai_clock, after_hydration);
+    assert!(Arc::ptr_eq(&pixels, &app.final_ai_cache[&ai_key].pixels));
+    assert_no_source_demand(&app);
 }
 
 #[test]
@@ -119,6 +534,7 @@ fn material_demand_revision_matching_retained_image_restores_ai_without_original
             .into(),
     );
     single_neighbor(&mut app);
+    section1839_skip_display_ai_for_neighbor_test(&mut app, 1);
     let params = app.effective_params(0).clone();
     let key = app
         .final_ai_key_for_pixels(app.current_edit_result_key(0), [4, 6], &params)
@@ -244,6 +660,7 @@ fn material_demand_revision_zero_ai_window_preserves_displayed_spread_partner() 
     assert_eq!(app.displayed_spread_partner(19), Some(20));
     assert!(app.ai_prefetch_targets(19).contains(&20));
     let key = retain_pdf_ai(&mut app, 20);
+    section1839_skip_display_ai_for_neighbor_test(&mut app, 19);
     app.prefetch_final_ai(&ctx, 19);
     assert!(!app.fs_pending.contains_key(&20));
     assert!(!app.fs_upload_backlog_contains(20));
@@ -291,6 +708,7 @@ fn material_demand_revision_completed_colorize_and_lut_effects_do_not_hydrate() 
         assert!(app.final_composite_cache[&key].complete);
         evict_pair_cpu(&mut app);
         single_neighbor(&mut app);
+        section1839_skip_display_ai_for_neighbor_test(&mut app, 1);
         let pixels = Arc::clone(&app.final_composite_cache[&key].pixels);
         app.prefetch_final_effects(&ctx, 1, None);
         app.prefetch_final_ai(&ctx, 1);
@@ -403,6 +821,7 @@ fn material_demand_revision_native_pdf_ai_target_precedes_fit_size_rejection() {
             .into(),
     );
     app.settings.ai_upscale_size_limit = Some(crate::ai::upscale::AiProcessSizeLimit::square(1024));
+    section1839_skip_display_ai_for_neighbor_test(&mut app, 1);
     let GridItem::PdfPage { content_type, .. } = &mut app.items[0] else {
         panic!("PDF fixture");
     };
@@ -511,6 +930,57 @@ fn material_demand_revision_retained_display_waits_for_effect_without_original_f
         );
         assert_no_source_demand(&app);
         assert!(app.final_ai_pending.is_empty());
+    }
+}
+
+#[test]
+fn section1839_retained_pdf_pending_effect_does_not_repeat_lookup() {
+    for lut in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = pdf_book(&ctx);
+        configure_final_effect(&mut app, &ctx, lut);
+        let final_key = retain_pdf_ai(&mut app, 0);
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = crate::settings::SpreadMode::Single;
+        app.settings.page_turn_animation_enabled = false;
+        app.viewer_navigation_caches.invalidate();
+        assert!(app.ensure_final_composite_texture(&ctx, 0).is_none());
+        let params = app.effective_params(0).clone();
+        let ai_key = app
+            .final_ai_key_for_pixels(final_key.edit_key, [4, 6], &params)
+            .unwrap();
+        let pixels = Arc::clone(&app.final_ai_cache[&ai_key].pixels);
+        let after_hydration = app.retained_final_ai_clock;
+        let cancel = Arc::clone(&app.final_effect_pending[&final_key].cancel);
+        assert!(matches!(
+            app.final_effect_pending[&final_key].origin,
+            FinalEffectOrigin::LegacyDisplay
+        ));
+        // Keep the actual result receiver alive, but defer its observation until after
+        // the repeated ensures. A fast CPU worker must not turn this into a cache-hit test.
+        let (held_tx, held_rx) = mpsc::channel();
+        let computing = std::mem::replace(
+            &mut app.final_effect_pending.get_mut(&final_key).unwrap().state,
+            FinalEffectState::Computing(FinalEffectReceiver::Legacy(held_rx)),
+        );
+
+        for _ in 0..2 {
+            assert!(app.ensure_final_composite_texture(&ctx, 0).is_none());
+            assert_eq!(app.retained_final_ai_clock, after_hydration);
+            assert!(Arc::ptr_eq(&pixels, &app.final_ai_cache[&ai_key].pixels));
+            assert!(Arc::ptr_eq(
+                &cancel,
+                &app.final_effect_pending[&final_key].cancel
+            ));
+            assert!(!cancel.load(Ordering::Relaxed));
+            assert_no_source_demand(&app);
+        }
+
+        app.final_effect_pending.get_mut(&final_key).unwrap().state = computing;
+        drop(held_tx);
+        complete_pending_composites(&mut app, &ctx);
+        assert!(app.final_composite_cache[&final_key].complete);
+        assert_no_source_demand(&app);
     }
 }
 

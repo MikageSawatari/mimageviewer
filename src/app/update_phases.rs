@@ -2208,9 +2208,9 @@ impl App {
                 } else {
                     self.evict_adjustment_cache(fs_idx);
                 }
-                // AI 先読み (新パイプライン v1.1.0)。現在ページの final_ai が完了 / 不要
-                // のときだけ隣接ページを起動するため、毎フレーム呼んでも spawn の競合を
-                // 起こさない (= 内部で has_uncancelled_final_ai_pending を gate に使う)。
+                // AI 先読み (新パイプライン v1.1.0)。ページ単位表示では表示対象の Waiting
+                // を優先し、全モードで未キャンセル pending があれば新規 AI を起動しない。
+                // 連結読みは描画の処理数が限られるため、従来の先読み producer を維持する。
                 // Pipeline P1 リファクタで dead code 化していた旧 `prefetch_ai_upscale` の
                 // 後継 (= ページ送り時 AI を待たされる退行を直す)。
                 if page_turn_decision.admits_non_target_full_resolution_work() {

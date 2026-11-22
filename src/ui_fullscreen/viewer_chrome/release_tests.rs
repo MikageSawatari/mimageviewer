@@ -73,7 +73,11 @@ fn native_frame(
         }
         assert_eq!(
             matches!(
-                app.apply_fs_secondary_input(ctx, action),
+                app.apply_fs_secondary_input(
+                    ctx,
+                    action,
+                    FullscreenSidePanelClickChrome::default()
+                ),
                 FsSecondaryInputOutcome::CloseRequested
             ),
             matches!(expected, ExpectedSecondaryAction::ShortTapAt(_)),

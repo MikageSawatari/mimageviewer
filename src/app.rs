@@ -85240,7 +85240,12 @@ impl App {
         }
         // Preserve prefetch's source-first done/skip contract, even without a request.
         let Some(pixels) = self.current_raw_source_pixels(idx) else {
-            return FinalAiJobState::SourcePending;
+            // A terminal source failure cannot produce AI; do not leave it waiting forever.
+            return if self.fs_page_load_state(idx) == FsPageLoadState::LoadFailed {
+                FinalAiJobState::Failed
+            } else {
+                FinalAiJobState::SourcePending
+            };
         };
         let params = self.effective_params(idx);
         let edit_key = self.current_edit_result_key(idx);
@@ -85670,10 +85675,30 @@ impl App {
         if self.reading_flow.is_paged() {
             self.prefetch_final_effects(ctx, current_idx, None);
         }
-        // 現在ページの AI が走っている間 (= cancel されていない pending あり) は
-        // 先読みしない。旧設計 `current_done && empty` 条件と同等。
+        // 未キャンセルの AI がある間は、新しい先読みを起動しない。
         if self.has_uncancelled_final_ai_pending() {
             return;
+        }
+        // ページ単位表示の先読みは描画より先に走るため、表示側がまだ AI を要求して
+        // いない Waiting も優先する。pending だけでは U 直後に隣接ページが先行する。
+        // overview 中や表示不許可なら draw は素材生成しないため、Waiting gate も適用しない。
+        // 素材生成を所有する draw なら NeedsLoad を要求し、LoadPending / UploadPending は
+        // 既存 loader / upload の完了回収で終わる。LoadFailed は状態 owner が終端にする。
+        // 素材到着後の Waiting は同じ draw の final ensure が開始または不要と確定する。
+        // 連結読みの draw は処理数を制限するため、この gate を適用せず従来どおり先読みする。
+        let display_demand = self.paged_draw_materialization_demand(current_idx);
+        if !display_demand.is_empty() {
+            let original_preview_active = self.original_preview_active_for_frame(ctx, current_idx);
+            // 見開き描画も同じ値を使う。idx ごとに読むと単一の frame sample を上書きする。
+            if display_demand.into_iter().any(|page| {
+                let idx = page.item_index;
+                self.displayed_final_ai_state(
+                    idx,
+                    self.fs_display_stage(idx, original_preview_active),
+                ) == DisplayedFinalAiState::Waiting
+            }) {
+                return;
+            }
         }
         let targets = self.ai_prefetch_targets(current_idx);
         for idx in targets {
@@ -85689,11 +85714,14 @@ impl App {
             {
                 continue;
             }
-            if let Some((key, size)) = self.retained_final_ai_matches_current(idx, &params)
-                && let Some(entry) = self.lookup_retained_final_ai(idx, key, size)
-            {
-                self.final_ai_cache.insert(key, entry);
-                continue;
+            if let Some((key, size)) = self.retained_final_ai_matches_current(idx, &params) {
+                if self.final_ai_cache.contains_key(&key) {
+                    continue;
+                }
+                if let Some(entry) = self.lookup_retained_final_ai(idx, key, size) {
+                    self.final_ai_cache.insert(key, entry);
+                    continue;
+                }
             }
             // Raster PDF の現行 display-fit 結果が AI 用 native 入力と異なるページは、
             // 現行結果に AI 先読みを流しても native 再レンダで捨てられる。
@@ -92529,9 +92557,16 @@ impl App {
                 return Some(entry.texture.clone());
             }
         }
-        let (ai_key, entry, edit_size) =
-            self.lookup_retained_pdf_final_ai(idx, "restore_final_composite")?;
-        self.final_ai_cache.insert(ai_key, entry.clone());
+        // While the display effect is pending, its hydrated AI input is already live.
+        // Repeated ensures must not touch retained LRU/logging again for the same key.
+        let entry = if let Some(entry) = self.final_ai_cache.get(&ai_key).cloned() {
+            entry
+        } else {
+            let (_, entry, _) =
+                self.lookup_retained_pdf_final_ai(idx, "restore_final_composite")?;
+            self.final_ai_cache.insert(ai_key, entry.clone());
+            entry
+        };
         self.build_final_composite_texture_from_base(
             ctx,
             idx,
