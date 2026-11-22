@@ -707,7 +707,9 @@ fn missing_source_is_removable(
             }
         }
     }
-    Ok(has_directory_ancestor)
+    // Every component, including the registered source itself, exists now: the source came back
+    // after classification. Only a proven missing component below a reachable directory qualifies.
+    Ok(false)
 }
 
 fn grid_item_for_prepared_source(
@@ -1057,6 +1059,35 @@ mod tests {
             assert!(
                 !io.calls
                     .contains(&(PathBuf::from(missing), MissingSourceProbe::Metadata))
+            );
+        }
+    }
+
+    #[test]
+    fn removable_missing_rejects_sources_that_reappeared_after_classification() {
+        // Classified Missing, but by the time the ancestors are probed the source exists again
+        // (as a folder or as a file). Neither may be offered for bulk removal.
+        for leaf_is_directory in [true, false] {
+            let mut io = MissingSourceIo::default();
+            io.set(
+                r"C:\parent\back",
+                MissingSourceProbe::SymlinkMetadata,
+                Ok(leaf_is_directory),
+            );
+            io.set(
+                r"C:\parent\back",
+                MissingSourceProbe::Metadata,
+                Ok(leaf_is_directory),
+            );
+            assert!(
+                !missing_source_is_removable(
+                    Path::new(r"C:\parent\back"),
+                    &mut HashMap::new(),
+                    &mut || true,
+                    &mut |path, probe| io.probe(path, probe),
+                )
+                .unwrap(),
+                "leaf_is_directory={leaf_is_directory}"
             );
         }
     }

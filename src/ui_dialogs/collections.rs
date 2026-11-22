@@ -7205,7 +7205,14 @@ mod tests {
                 entry_ids: entries.iter().map(|entry| entry.entry_id).collect(),
             };
             // Keep the DB revision unchanged, but replace the originating surface.
-            let other = create_collection(&mut app, "Other surface");
+            // Create through the actor so the manager selection (already settled on the
+            // fixture collection) is not part of this test's preconditions.
+            let other = client
+                .create_collection("Other surface".into())
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
             app.open_collection_grid(other.collection_id(), None);
             wait_for_collection_grid(&mut app, other.collection_id());
             app.open_collection_grid(target.stamp.collection_id, None);
@@ -7473,13 +7480,17 @@ mod tests {
         let mut harness = crate::test_ui::builder()
             .with_context_setup(|ctx| {
                 crate::ui_fonts::configure_fonts(ctx);
-                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
             })
             .with_size(egui::vec2(1093.0, 614.0))
             .build_ui(move |ui| {
-                let _ = draw_collection_remove_confirm(ui.ctx(), 7, &kind, false, false);
+                // The harness applies its default (dark) theme after context setup, so the Light
+                // theme must be applied inside the frame, like the other collection snapshots.
+                let ctx = ui.ctx().clone();
+                crate::os_theme::apply_resolved(&ctx, crate::os_theme::ResolvedTheme::Light);
+                let _ = draw_collection_remove_confirm(&ctx, 7, &kind, false, false);
             });
         harness.run();
+        assert!(!harness.ctx.global_style().visuals.dark_mode);
         harness.snapshot("collection_missing_remove_confirm_small_light");
     }
 
