@@ -1060,3 +1060,23 @@ root の `focused` が偽のままになる原因は mIV 自身のこともあ�
 - 同じ使い方は `scripts/ui-smoke.ps1` (1916 行付近) と `scripts/page-turn-smoke.ps1` (174 行付近) にも残っている。ReleaseChecks の範囲外なので直していない。
 - Sol / xhigh の独立レビュー: 指摘なしで ACCEPT。前面化の宛先そのものは旧記録では直接証明できない、という注記つき。
 - 診断 artifact を作り直した: `99c0eea48` + `3f60030ce` の `src/` の変更 = `fd6f3abf4` (`C:\miv-relcheck\root`、detached)。
+
+**6 回目 (2026-11-22 13:28、キット `relcheck-fd6f3abf4-20261122-035048`、artifact `fd6f3abf4`、scripts `e908d672f`)**
+利用者の了承 2026-11-22 12:57 頃 (「サブPCは今何かのテストを進めているようです。空き次第ReleaseCheckも流して問題ありません。」、事前確認 1 回と本番 1 回)。
+サブ PC 担当は本番のあいだ、シェルの命令を流さず、ターミナル パネルを読むだけにした。
+
+- 事前確認: READY (exit 0)。前面化は 1 回目で成功 (179 ms)。
+- 本番: **PASS_WITH_WARNINGS** (exit 0)。11 ケースの内訳は次のとおり。
+  - seed の 2 つと 2 つの stopped seed: PASS。
+  - static-foreground: PASS (要求 373 px、CPU 0.0031 コア、frames 0)。
+  - static-background: PASS (CPU 0.0052 コア、frames 0)。
+  - video-pin-background: PASS (CPU 0.0010 コア)。
+  - tray の 2 つ: PASS (frames 4)。
+  - perf-cached・perf-uncached: PASS_WITH_WARNINGS。読み込み 256/256、Ctrl+Down 5/5、unexplained 0。
+  - 警告は 2 つで、どちらも判定を変えない WARN。1 つは起動の最初の frame の gap (461・451 ms、上限 500 ms、利用者了承 2026-10-11)。
+    もう 1 つは drawn <16 ms の割合 0% (p95 32〜33 ms)。後者は RDP の描画の間隔によると見ている (確かめてはいない)。
+  - 戻った run `release-checks-20261122-042738-1a29230b` は `Receive-ReleaseCheckResult.ps1` で PASS_WITH_WARNINGS / exit 0 と照合。
+- 前面の記録 (設計担当が戻ったファイルで確認): 9 ケースとも、記録の root の列は `root-window.json` で知らされた HWND (公開前の行は 0)。
+  前面は `claude.exe` か mIV の root (`Window Class`) だけで、`Winit Thread Event Target` が前面になった行は 1 つも無い。
+  5 回目までの「runner が MainWindowHandle で内部の窓へ前面化を要求した」という見立てと矛盾しない (直接の証明ではない)。
+- サブ PC の数値は、サブ PC の記録どうしでだけ比べる (RTX 4060 Ti、1920×1080、96 DPI、RDP)。
