@@ -1309,6 +1309,26 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "spread/n-scroll-wrap-step",
+        SpreadMode,
+        "列 / 段を替えるときは別の移動量にする",
+        [
+            "列",
+            "段",
+            "折り返し",
+            "重なり",
+            "N 字",
+            "Z 字",
+            "ページ内スクロール",
+            "スクロール量",
+            "移動量",
+            "割合",
+            "%",
+            "K",
+            "J"
+        ]
+    ),
+    entry!(
         "spread/top-bar",
         SpreadMode,
         "上部情報バーを固定表示",

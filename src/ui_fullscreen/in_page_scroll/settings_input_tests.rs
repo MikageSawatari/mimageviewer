@@ -32,6 +32,7 @@ fn transfer_document(preferences: Value) -> String {
 fn scroll_extension_settings_missing_fields_keep_released_defaults() {
     for settings in [Settings::default(), serde_json::from_str("{}").unwrap()] {
         assert_eq!(settings.fullscreen_n_scroll_step_percent, 85);
+        assert_eq!(settings.fullscreen_n_scroll_wrap_step_percent, None);
         assert!(!settings.fullscreen_smooth_page_scroll);
         assert_eq!(
             settings.fullscreen_wheel_action,
@@ -106,6 +107,42 @@ fn scroll_extension_settings_roundtrip_and_clamp_only_the_ordered_step() {
                 assert_eq!(loaded.continuous_reading_key_scroll_percent, 16);
             }
         }
+    }
+}
+
+#[test]
+fn n_scroll_wrap_settings_load_clamps_some_and_preserves_missing() {
+    for (input, expected) in [
+        (json!(5), Some(10)),
+        (json!(150), Some(100)),
+        (json!(85), Some(85)),
+        (Value::Null, None),
+    ] {
+        let mut settings: Settings = serde_json::from_value(json!({
+            "fullscreen_n_scroll_step_percent": 15,
+            "fullscreen_n_scroll_wrap_step_percent": input,
+        }))
+        .unwrap();
+        settings.sanitize();
+        assert_eq!(settings.fullscreen_n_scroll_wrap_step_percent, expected);
+        assert_eq!(
+            settings.fullscreen_n_scroll_fractions(),
+            (0.15, expected.unwrap_or(15) as f32 / 100.0)
+        );
+        let loaded: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.fullscreen_n_scroll_wrap_step_percent, expected);
+    }
+    let mut missing: Settings = serde_json::from_str("{}").unwrap();
+    missing.sanitize();
+    assert_eq!(missing.fullscreen_n_scroll_wrap_step_percent, None);
+    for reading in [5, 15, 150] {
+        missing.fullscreen_n_scroll_step_percent = reading;
+        let resolved = reading.clamp(10, 100) as f32 / 100.0;
+        assert_eq!(
+            missing.fullscreen_n_scroll_fractions(),
+            (resolved, resolved)
+        );
     }
 }
 
@@ -481,6 +518,159 @@ fn preferences_harness(app: &mut App) -> egui_kittest::Harness<'_, &mut App> {
 }
 
 #[test]
+fn preferences_n_scroll_wrap_ok_saves_and_cancel_discards_the_draft() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    let _clear = ClearKeyboard;
+    use crate::ui_dialogs::preferences::{PreferencesOpenRequest, PreferencesPage};
+    let mut app = crate::app::setup_app_for_test();
+    app.settings.fullscreen_n_scroll_step_percent = 15;
+    app.open_preferences_request(PreferencesOpenRequest {
+        page: PreferencesPage::SpreadMode,
+        anchor: Some("spread/n-scroll-wrap-step"),
+    });
+    let label = "列 / 段を替えるときは別の移動量にする";
+    {
+        let mut harness = preferences_harness(&mut app);
+        harness.run_steps(5);
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .scroll_to_me();
+        harness.run_steps(3);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run_steps(2);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .fullscreen_n_scroll_wrap_step_percent,
+            Some(15)
+        );
+        assert_eq!(
+            harness
+                .state()
+                .settings
+                .fullscreen_n_scroll_wrap_step_percent,
+            None
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::SpinButton, label)
+            .focus();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.event(egui::Event::Text("85".into()));
+        harness.run_steps(2);
+        harness
+            .get_by_label("ページ内を順に読む操作だけに効きます。")
+            .click();
+        harness.run_steps(2);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .fullscreen_n_scroll_wrap_step_percent,
+            Some(85)
+        );
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+    }
+    let persisted = crate::settings_db::SettingsDb::open(app.tmp.path())
+        .unwrap()
+        .load_into_settings()
+        .unwrap();
+    assert_eq!(persisted.fullscreen_n_scroll_wrap_step_percent, Some(85));
+    assert_eq!(app.settings.fullscreen_n_scroll_wrap_step_percent, Some(85));
+    app.open_preferences_request(PreferencesOpenRequest {
+        page: PreferencesPage::SpreadMode,
+        anchor: Some("spread/n-scroll-wrap-step"),
+    });
+    {
+        let mut harness = preferences_harness(&mut app);
+        harness.run_steps(5);
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .scroll_to_me();
+        harness.run_steps(3);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run_steps(2);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .fullscreen_n_scroll_wrap_step_percent,
+            None
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        assert!(harness.state().show_preferences_discard_confirm);
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert_eq!(
+            harness
+                .state()
+                .settings
+                .fullscreen_n_scroll_wrap_step_percent,
+            Some(85)
+        );
+    }
+    let persisted = crate::settings_db::SettingsDb::open(app.tmp.path())
+        .unwrap()
+        .load_into_settings()
+        .unwrap();
+    assert_eq!(persisted.fullscreen_n_scroll_wrap_step_percent, Some(85));
+    app.open_preferences_request(PreferencesOpenRequest {
+        page: PreferencesPage::SpreadMode,
+        anchor: Some("spread/n-scroll-wrap-step"),
+    });
+    {
+        let mut harness = preferences_harness(&mut app);
+        harness.run_steps(5);
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .scroll_to_me();
+        harness.run_steps(3);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run_steps(2);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert_eq!(
+            harness
+                .state()
+                .settings
+                .fullscreen_n_scroll_wrap_step_percent,
+            None
+        );
+    }
+    let persisted = crate::settings_db::SettingsDb::open(app.tmp.path())
+        .unwrap()
+        .load_into_settings()
+        .unwrap();
+    assert_eq!(persisted.fullscreen_n_scroll_wrap_step_percent, None);
+}
+
+#[test]
 fn preferences_n_scroll_amount_and_smooth_checkbox_ok_save_then_key_use_the_new_values() {
     #[cfg(windows)]
     let _serial = crate::key_input::lock_test_input();
@@ -512,7 +702,9 @@ fn preferences_n_scroll_amount_and_smooth_checkbox_ok_save_then_key_use_the_new_
         harness.run_steps(2);
         harness
             .get_by(|node| {
-                node.min_numeric_value() == Some(10.0) && node.max_numeric_value() == Some(100.0)
+                node.min_numeric_value() == Some(10.0)
+                    && node.max_numeric_value() == Some(100.0)
+                    && !node.is_disabled()
             })
             .focus();
         harness.run_steps(2);
@@ -649,6 +841,7 @@ fn preferences_scroll_extension_search_results_jump_to_the_actual_setting_anchor
         ("スクロール＋ページ送り", "spread/wheel-action"),
         ("滑らか", "spread/smooth-page-scroll"),
         ("N 字 移動量", "spread/n-scroll-step"),
+        ("折り返し 重なり", "spread/n-scroll-wrap-step"),
     ] {
         let state = harness.state_mut().pref_state.as_mut().unwrap();
         state.search_query = query.into();

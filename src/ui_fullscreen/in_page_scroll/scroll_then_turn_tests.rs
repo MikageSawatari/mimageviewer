@@ -344,7 +344,17 @@ fn all_scroll_amounts_finish_n_and_z_in_both_directions_without_repeating_wraps(
                         let mut stopped = false;
                         for _ in 0..1500 {
                             let outcome = ordered_scroll_outcome(
-                                &layout, 1.0, pan, direction, order, next, fraction, None, true,
+                                &layout,
+                                1.0,
+                                pan,
+                                direction,
+                                order,
+                                next,
+                                OrderedScrollSteps {
+                                    primary: fraction,
+                                    wrap: fraction,
+                                },
+                                true,
                                 true,
                             );
                             let FsPageScrollOutcome::Move(candidate) = outcome else {

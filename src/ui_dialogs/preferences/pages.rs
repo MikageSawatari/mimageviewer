@@ -11133,6 +11133,35 @@ fn draw_fullscreen_n_scroll_step_setting(ui: &mut egui::Ui, value: &mut u32) {
     ui.small("ページ内を順に読む操作だけに効きます。");
 }
 
+fn draw_fullscreen_n_scroll_wrap_step_setting(ui: &mut egui::Ui, settings: &mut Settings) {
+    ui.horizontal(|ui| {
+        let mut separate = settings.fullscreen_n_scroll_wrap_step_percent.is_some();
+        let label = ui.checkbox(&mut separate, "列 / 段を替えるときは別の移動量にする");
+        if label.changed() {
+            settings.fullscreen_n_scroll_wrap_step_percent =
+                separate.then_some(settings.fullscreen_n_scroll_step_percent.clamp(10, 100));
+        }
+        let mut resolved = settings
+            .fullscreen_n_scroll_wrap_step_percent
+            .unwrap_or(settings.fullscreen_n_scroll_step_percent)
+            .clamp(10, 100);
+        if ui
+            .add_enabled(
+                separate,
+                egui::DragValue::new(&mut resolved)
+                    .range(10..=100u32)
+                    .speed(1)
+                    .suffix(" %"),
+            )
+            .labelled_by(label.id)
+            .changed()
+        {
+            settings.fullscreen_n_scroll_wrap_step_percent = Some(resolved);
+        }
+    });
+    ui.small("N 字では次の列へ、Z 字では次の段へ移るときの量です。100% は表示領域 1 つ分で、端に近いときは残りの分だけ動きます。");
+}
+
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
     anchored(ui, state, "spread/chrome-suppression", |ui, state| {
         crate::ui_helpers::draw_fullscreen_chrome_suppression_setting(
@@ -11614,6 +11643,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             &mut state.settings.fullscreen_n_scroll_step_percent,
         );
     });
+    anchored(ui, state, "spread/n-scroll-wrap-step", |ui, state| {
+        draw_fullscreen_n_scroll_wrap_step_setting(ui, &mut state.settings);
+    });
     ui.add_space(8.0);
     ui.label(egui::RichText::new("360 度ビュー").strong());
     anchored(ui, state, "spread/panorama-projection", |ui, state| {
@@ -11647,6 +11679,7 @@ mod fullscreen_in_page_scroll_setting_tests {
         ui.add_space(8.0);
         ui.label("スクロール量 (連結読み・ページ内スクロール)");
         draw_fullscreen_n_scroll_step_setting(ui, &mut settings.fullscreen_n_scroll_step_percent);
+        draw_fullscreen_n_scroll_wrap_step_setting(ui, settings);
     }
 
     fn snapshot(
@@ -11663,11 +11696,12 @@ mod fullscreen_in_page_scroll_setting_tests {
             settings.fullscreen_smooth_page_scroll = true;
             settings.fullscreen_bound_drag_pan = true;
             settings.fullscreen_n_scroll_step_percent = 50;
+            settings.fullscreen_n_scroll_wrap_step_percent = Some(100);
         }
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
             // Include the drag-bound explanation and all scroll rows without cropping.
-            .with_size(egui::vec2(540.0, 440.0))
+            .with_size(egui::vec2(540.0, 540.0))
             .build_ui(move |root_ui| {
                 crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
                     let ctx = &root_ui.ctx().clone();
@@ -11683,7 +11717,7 @@ mod fullscreen_in_page_scroll_setting_tests {
                         draw(ui, &mut settings);
                         assert!(
                             ui.min_rect().bottom() <= available_bottom,
-                            "the scroll settings must fit the 540x440 snapshot fixture: content={:?}, available_bottom={available_bottom}",
+                            "the scroll settings must fit the 540x540 snapshot fixture: content={:?}, available_bottom={available_bottom}",
                             ui.min_rect(),
                         );
                     });
@@ -11730,6 +11764,64 @@ mod fullscreen_in_page_scroll_setting_tests {
             crate::os_theme::ResolvedTheme::Dark,
             true,
             FullscreenWheelAction::Zoom,
+        );
+    }
+
+    #[test]
+    fn fullscreen_n_scroll_wrap_row_tracks_reading_and_discards_override_when_unchecked() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(540.0, 160.0))
+            .build_ui_state(
+                |root, settings| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        draw_fullscreen_n_scroll_wrap_step_setting(ui, settings)
+                    });
+                },
+                Settings {
+                    fullscreen_n_scroll_step_percent: 15,
+                    ..Settings::default()
+                },
+            );
+        let numeric = |node: &egui_kittest::kittest::AccessKitNode<'_>| {
+            node.min_numeric_value() == Some(10.0) && node.max_numeric_value() == Some(100.0)
+        };
+        let label = "列 / 段を替えるときは別の移動量にする";
+        harness.run();
+        assert!(harness.get_by(numeric).accesskit_node().is_disabled());
+        assert_eq!(
+            harness.get_by(numeric).accesskit_node().numeric_value(),
+            Some(15.0)
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().fullscreen_n_scroll_wrap_step_percent,
+            Some(15)
+        );
+        assert!(!harness.get_by(numeric).accesskit_node().is_disabled());
+        harness.state_mut().fullscreen_n_scroll_wrap_step_percent = Some(100);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run();
+        assert_eq!(harness.state().fullscreen_n_scroll_wrap_step_percent, None);
+        harness.state_mut().fullscreen_n_scroll_step_percent = 50;
+        harness.run();
+        assert_eq!(
+            harness.get_by(numeric).accesskit_node().numeric_value(),
+            Some(50.0)
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().fullscreen_n_scroll_wrap_step_percent,
+            Some(50)
         );
     }
 

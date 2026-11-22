@@ -18,6 +18,12 @@ const FORMAT: &str = "mimageviewer.preferences";
 pub const MAX_PREFERENCES_BYTES: usize = 1024 * 1024;
 const INVALID_ITEM: &str = "型、選択肢、範囲、または必須項目が正しくありません";
 
+// Null means "use the reading step" only for this explicitly named item.
+// Do not infer null acceptance from an item's Rust type.
+fn accepts_null(key: &str) -> bool {
+    key == "fullscreen_n_scroll_wrap_step_percent"
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferIssue {
     pub field: String,
@@ -199,7 +205,7 @@ macro_rules! preferences_policy {
             let mut map = Map::new(); let mut issues = Vec::new();
             for accepted in snapshot.values { match accepted {
                 $( Accepted::$field(value) => match serde_json::to_value(&value) {
-                    Ok(raw) if validated::<$ty>(&raw, $check).is_some() => { map.insert(stringify!($field).into(), raw); },
+                    Ok(raw) if (!raw.is_null() || accepts_null(stringify!($field))) && validated::<$ty>(&raw, $check).is_some() => { map.insert(stringify!($field).into(), raw); },
                     _ => issues.push(issue($label)),
                 }, )*
                 Accepted::StillChrome(value) => {
@@ -223,7 +229,7 @@ macro_rules! preferences_policy {
                 result.issues.push(issue("同名のフォルダと本"));
             }
             for (key, raw) in &items { match key.as_str() {
-                $( stringify!($field) => match validated::<$ty>(raw, $check) {
+                $( stringify!($field) => match (!raw.is_null() || accepts_null(key)).then(|| validated::<$ty>(raw, $check)).flatten() {
                     Some(value) => result.accepted.push(Accepted::$field(value)),
                     None => result.issues.push(issue($label)),
                 }, )*
@@ -390,6 +396,7 @@ preferences_policy! {
         fullscreen_wheel_action: FullscreenWheelAction => ("閲覧表示の通常ホイール操作", |v, _raw| FullscreenWheelAction::all().contains(v), plain, plain);
         fullscreen_n_scroll_order: FullscreenNScrollOrder => ("ページ内スクロールの読み順", |v, _raw| FullscreenNScrollOrder::all().contains(v), plain, plain);
         fullscreen_n_scroll_step_percent: u32 => ("N 字 / Z 字の移動量", |v, _raw| (10..=100).contains(v), plain, plain);
+        fullscreen_n_scroll_wrap_step_percent: Option<u32> => ("N 字 / Z 字の列・段替えの移動量", |v, _raw| v.is_none_or(|v| (10..=100).contains(&v)), plain, plain);
         fullscreen_smooth_page_scroll: bool => ("ページ内のスクロールを滑らかに動かす", |_, _| true, plain, plain);
         fullscreen_bound_drag_pan: bool => ("閲覧時のドラッグ移動を画像の端までに制限する", |_, _| true, plain, plain);
         fullscreen_page_number_overlay: bool => ("ページ番号を重ねて表示", |_, _| true, plain, plain);
@@ -1447,6 +1454,12 @@ mod tests {
             } else {
                 100
             };
+        settings.fullscreen_n_scroll_wrap_step_percent =
+            if settings.fullscreen_n_scroll_wrap_step_percent == Some(100) {
+                Some(10)
+            } else {
+                Some(100)
+            };
         settings.fullscreen_smooth_page_scroll = !settings.fullscreen_smooth_page_scroll;
         settings.fullscreen_bound_drag_pan = !settings.fullscreen_bound_drag_pan;
         settings.fullscreen_page_number_overlay = !settings.fullscreen_page_number_overlay;
@@ -2411,13 +2424,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 507);
+        assert_eq!(entries.len(), 508);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            168
+            169
         );
         assert_eq!(
             entries
@@ -2453,7 +2466,7 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        assert_eq!(wire.len(), 166);
+        assert_eq!(wire.len(), 167);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -3443,9 +3456,79 @@ mod tests {
     }
 
     #[test]
+    fn n_scroll_wrap_transfer_distinguishes_null_from_missing() {
+        let mut destination = Settings {
+            fullscreen_n_scroll_wrap_step_percent: Some(85),
+            ..Settings::default()
+        };
+        let report = parse_preferences(&document(json!({})))
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert_eq!(destination.fullscreen_n_scroll_wrap_step_percent, Some(85));
+        let report = parse_preferences(&document(
+            json!({"fullscreen_n_scroll_wrap_step_percent": null}),
+        ))
+        .unwrap()
+        .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert_eq!(report.accepted_count, 1);
+        assert_eq!(destination.fullscreen_n_scroll_wrap_step_percent, None);
+    }
+
+    #[test]
+    fn n_scroll_wrap_transfer_roundtrips_endpoints_and_none() {
+        for wrap in [None, Some(10), Some(100)] {
+            let source = Settings {
+                fullscreen_n_scroll_wrap_step_percent: wrap,
+                ..Settings::default()
+            };
+            let export = export_preferences(&source).unwrap();
+            assert!(export.issues.is_empty());
+            let raw: Value = serde_json::from_str(&export.json).unwrap();
+            assert_eq!(
+                raw["preferences"]["fullscreen_n_scroll_wrap_step_percent"],
+                json!(wrap)
+            );
+            let mut destination = Settings {
+                fullscreen_n_scroll_wrap_step_percent: Some(85),
+                ..Settings::default()
+            };
+            let report = parse_preferences(&export.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.fullscreen_n_scroll_wrap_step_percent, wrap);
+        }
+    }
+
+    #[test]
+    fn n_scroll_wrap_transfer_rejects_invalid_values_without_changing_current_value() {
+        for invalid in [json!(9), json!(101), json!(50.5), json!("85")] {
+            let mut destination = Settings {
+                fullscreen_n_scroll_wrap_step_percent: Some(85),
+                ..Settings::default()
+            };
+            let report = parse_preferences(&document(
+                json!({"fullscreen_n_scroll_wrap_step_percent": invalid}),
+            ))
+            .unwrap()
+            .apply_to(&mut destination);
+            assert_eq!(report.accepted_count, 0);
+            assert_eq!(report.issues.len(), 1);
+            assert_eq!(destination.fullscreen_n_scroll_wrap_step_percent, Some(85));
+        }
+    }
+
+    #[test]
     fn null_is_rejected_for_every_logical_item() {
         for key in wire_keys() {
             let parsed = parse_preferences(&document(json!({key: null}))).unwrap();
+            if key == "fullscreen_n_scroll_wrap_step_percent" {
+                assert_eq!(parsed.accepted.len(), 1, "{key}");
+                assert!(parsed.issues.is_empty(), "{key}");
+                continue;
+            }
             assert_eq!(parsed.accepted.len(), 0, "{key}");
             assert_eq!(parsed.issues.len(), 1, "{key}");
         }
@@ -3533,6 +3616,7 @@ mod tests {
                 (10).to_string().parse().unwrap(),
                 (100).to_string().parse().unwrap(),
             ),
+            ("fullscreen_n_scroll_wrap_step_percent", 10.0, 100.0),
             (
                 "continuous_reading_wheel_scroll_percent",
                 (1).to_string().parse().unwrap(),
@@ -3615,6 +3699,7 @@ mod tests {
                     | "fullscreen_jump_percent"
                     | "fullscreen_fixed_jump_count"
                     | "fullscreen_n_scroll_step_percent"
+                    | "fullscreen_n_scroll_wrap_step_percent"
                     | "continuous_reading_wheel_scroll_percent"
                     | "continuous_reading_key_scroll_percent"
                     | "continuous_reading_gamepad_scroll_percent_per_sec"

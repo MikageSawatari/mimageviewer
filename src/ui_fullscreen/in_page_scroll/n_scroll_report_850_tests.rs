@@ -76,8 +76,7 @@ fn walk(
     direction: ReadingDirection,
     order: crate::settings::FullscreenNScrollOrder,
     next: bool,
-    step: f32,
-    primary_fraction: Option<f32>,
+    steps: OrderedScrollSteps,
 ) -> Walk {
     let geometry = scroll_geometry(layout).expect("zoomed spread overflows");
     let primary = if order == HorizontalFirst { 0 } else { 1 };
@@ -99,17 +98,8 @@ fn walk(
         ..Walk::default()
     };
     for _ in 0..1000 {
-        let result = ordered_scroll_pan_with_steps(
-            layout,
-            zoom,
-            pan,
-            direction,
-            order,
-            next,
-            step,
-            primary_fraction,
-            true,
-        );
+        let result =
+            ordered_scroll_pan_with_steps(layout, zoom, pan, direction, order, next, steps, true);
         if result == pan {
             // A stop is legal only at the far corner: every overflowing axis
             // at its reading-end edge (no early stop after the expected wraps).
@@ -193,8 +183,10 @@ fn report_850_conditions_are_the_shared_step_not_a_loop() {
                                     direction,
                                     VerticalFirst,
                                     next,
-                                    step,
-                                    primary_fraction,
+                                    OrderedScrollSteps {
+                                        primary: primary_fraction.unwrap_or(step),
+                                        wrap: step,
+                                    },
                                 );
                                 assert_eq!(
                                     walk.wraps,
@@ -250,8 +242,10 @@ fn report_850_matches_one_n_at_150_20_and_repeats_at_150_15_and_200_20() {
         ReadingDirection::Rtl,
         VerticalFirst,
         true,
-        0.20,
-        None,
+        OrderedScrollSteps {
+            primary: 0.20,
+            wrap: 0.20,
+        },
     );
     let tail = *walk.wrap_moves.last().unwrap() * VIEWPORT.x;
     assert!(tail > 0.0 && tail < 20.0, "tail column moves {tail} px");
@@ -270,8 +264,10 @@ fn report_850_z_order_rows_follow_the_same_rule() {
             ReadingDirection::Rtl,
             HorizontalFirst,
             true,
-            step,
-            None,
+            OrderedScrollSteps {
+                primary: step,
+                wrap: step,
+            },
         );
         let overflow_y = VIEWPORT.y * 2.0 - VIEWPORT.y;
         assert_eq!(
@@ -279,5 +275,102 @@ fn report_850_z_order_rows_follow_the_same_rule() {
             (overflow_y / (VIEWPORT.y * step)).ceil() as usize,
             "step={step}"
         );
+    }
+}
+
+#[test]
+fn report_850_independent_wrap_gives_two_columns_with_fifteen_percent_reading() {
+    let mut app = crate::app::setup_app_for_test();
+    let ratio = std::f32::consts::SQRT_2;
+    for zoom in [1.5, 2.0] {
+        let layout = zoomed_spread(ratio, zoom, 0.0);
+        for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+            for next in [true, false] {
+                let result = walk(
+                    &mut app,
+                    &layout,
+                    zoom,
+                    direction,
+                    VerticalFirst,
+                    next,
+                    OrderedScrollSteps {
+                        primary: 0.15,
+                        wrap: 1.0,
+                    },
+                );
+                assert_eq!(result.wraps + 1, 2, "zoom={zoom} {direction:?} next={next}");
+            }
+        }
+    }
+}
+
+#[test]
+fn report_850_default_and_explicit_reading_wrap_have_identical_walks() {
+    let mut app = crate::app::setup_app_for_test();
+    for zoom in [1.5, 2.0] {
+        let layout = zoomed_spread(std::f32::consts::SQRT_2, zoom, 0.0);
+        for order in [VerticalFirst, HorizontalFirst] {
+            for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+                for next in [true, false] {
+                    for reading in [15, 85, 100] {
+                        // Keys use the reading step; wheels keep their own primary amount.
+                        for wheel in [false, true] {
+                            let mut settings = crate::settings::Settings::default();
+                            settings.fullscreen_n_scroll_step_percent = reading;
+                            let mut steps = OrderedScrollSteps::from_settings(&settings);
+                            if wheel {
+                                steps.primary = 0.20;
+                            }
+                            let inherited =
+                                walk(&mut app, &layout, zoom, direction, order, next, steps);
+                            settings.fullscreen_n_scroll_wrap_step_percent = Some(reading);
+                            let mut steps = OrderedScrollSteps::from_settings(&settings);
+                            if wheel {
+                                steps.primary = 0.20;
+                            }
+                            let explicit =
+                                walk(&mut app, &layout, zoom, direction, order, next, steps);
+                            assert_eq!(inherited.pans, explicit.pans);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn report_850_independent_small_and_large_wrap_walks_preserve_invariants() {
+    let mut app = crate::app::setup_app_for_test();
+    for zoom in [1.5, 2.0] {
+        let layout = zoomed_spread(1.4, zoom, 20.0);
+        for order in [VerticalFirst, HorizontalFirst] {
+            let secondary = if order == VerticalFirst { 0 } else { 1 };
+            let geometry = scroll_geometry(&layout).unwrap();
+            let range = geometry.axes[secondary].unwrap();
+            for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+                for next in [true, false] {
+                    for wrap in [0.10, 1.0] {
+                        let result = walk(
+                            &mut app,
+                            &layout,
+                            zoom,
+                            direction,
+                            order,
+                            next,
+                            OrderedScrollSteps {
+                                primary: 0.15,
+                                wrap,
+                            },
+                        );
+                        assert_eq!(
+                            result.wraps,
+                            ((range.max - range.min) / (VIEWPORT[secondary] * wrap)).ceil()
+                                as usize
+                        );
+                    }
+                }
+            }
+        }
     }
 }
