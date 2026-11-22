@@ -29,6 +29,8 @@ mod folder_types;
 pub use folder_types::*;
 mod settings_types;
 pub use settings_types::*;
+mod favorite_types;
+pub use favorite_types::*;
 
 pub const AGENT_PROTOCOL_VERSION: u32 = 6;
 pub const MIN_ADAPTER_PROTOCOL_VERSION: u32 = 3;
@@ -148,6 +150,12 @@ pub enum Command {
     },
     SetSettings {
         changes: serde_json::Map<String, serde_json::Value>,
+    },
+    SetFavorite {
+        path: String,
+        name: Option<String>,
+        item_index: Option<bool>,
+        container_index: Option<bool>,
     },
     SearchItems {
         query: String,
@@ -288,6 +296,7 @@ pub enum Payload {
     ViewState(ViewState),
     Settings(SettingsPage),
     SettingsWrite(SettingsWriteResult),
+    FavoriteWrite(FavoriteWriteResult),
     Items(ItemPage),
     Tags(TagPage),
     Collections(CollectionPage),

@@ -1170,7 +1170,7 @@ fn stage1b_all_protocols_transport_folder_pages_and_webp_blocks() {
             assert_eq!(response["id"], id);
             let result = &response["result"];
             match id {
-                1 => assert_eq!(result["tools"].as_array().unwrap().len(), 25),
+                1 => assert_eq!(result["tools"].as_array().unwrap().len(), 26),
                 2 => assert_eq!(
                     result["structuredContent"]["book_composition_applied"],
                     true
@@ -2495,7 +2495,7 @@ fn stage2_all_protocols_refresh_organize_permission_and_return_collection_writes
             let response = h.receive();
             assert_eq!(response["id"], id);
             let listed = response["result"]["tools"].as_array().unwrap();
-            assert_eq!(listed.len(), 25);
+            assert_eq!(listed.len(), 26);
             for name in [
                 "create_collection",
                 "rename_collection",
@@ -2629,7 +2629,7 @@ fn stage1c_all_protocols_refresh_open_permission_and_transport_accepted_result()
                 tools.iter().any(|tool| tool["name"] == "open_in_viewer"),
                 true
             );
-            assert_eq!(tools.len(), 25);
+            assert_eq!(tools.len(), 26);
         }
         backend.permitted.store(true, Ordering::Release);
         h.send(request(
@@ -2700,7 +2700,7 @@ fn legacy_versions_require_handshake_and_keep_legacy_results() {
         h.send(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         h.send(json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}));
         let r = h.receive();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 25);
+        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 26);
         assert!(r["result"].get("resultType").is_none());
         h.close();
     }
@@ -4683,5 +4683,7 @@ fn expansion_stdio_keeps_thumbnail_request_budget_with_the_active_call() {
     h.close();
 }
 
+#[path = "favorite_tests.rs"]
+mod favorite_tests;
 #[path = "settings_tests.rs"]
 mod settings_tests;

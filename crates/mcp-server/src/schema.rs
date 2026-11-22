@@ -33,7 +33,9 @@ fn metadata_write(name: &str) -> bool {
     matches!(name, "add_tags" | "remove_tags" | "set_rating")
 }
 fn write(name: &str) -> bool {
-    collection_write(name) || metadata_write(name) || name == "set_settings"
+    collection_write(name)
+        || metadata_write(name)
+        || matches!(name, "set_settings" | "set_favorite")
 }
 fn collection_write(name: &str) -> bool {
     matches!(
@@ -313,6 +315,7 @@ fn output(name: &str) -> Value {
         "get_view_state" => json!({"required":["view","folder","fullscreen","item","search"]}),
         "get_settings" => json!({"required":["items","page","pages","more"]}),
         "set_settings" => json!({"required":["changed","unchanged"]}),
+        "set_favorite" => json!({"required":["added","before","after"]}),
         // Help has several success shapes. Keep the common version contract in
         // discovery; typed retrieval tests check the full payload shapes.
         "search_help" | "get_help" => json!({"required":["app_version"]}),
@@ -564,6 +567,10 @@ pub fn tools() -> Vec<Value> {
     let settings: Vec<Value> = serde_json::from_str(include_str!("settings_tools.json"))
         .expect("embedded settings tool definitions");
     tools.extend(settings);
+    tools.push(
+        serde_json::from_str(include_str!("favorite_tool.json"))
+            .expect("embedded favorite tool definition"),
+    );
     tools
 }
 #[cfg(test)]
@@ -572,7 +579,7 @@ mod tests {
 
     #[test]
     fn stage1_draft_tool_definitions_fit_discovery_budget() {
-        // Planning data only: these two tools are not registered or callable.
+        // Planning data only: the remaining tool is not registered or callable.
         // Broad success objects avoid inventing payload field names where the
         // design specifies values but not their enclosing JSON keys.
         let drafts: Vec<Value> =
@@ -582,10 +589,10 @@ mod tests {
                 .iter()
                 .map(|t| t["name"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["stack_script", "set_favorite"]
+            ["stack_script"]
         );
         let mut planned = tools();
-        assert_eq!(planned.len(), 25);
+        assert_eq!(planned.len(), 26);
         let mut added_chars = 0;
         for tool in planned
             .iter()
@@ -598,6 +605,7 @@ mod tests {
                             | "get_view_state"
                             | "get_settings"
                             | "set_settings"
+                            | "set_favorite"
                     )
                 )
             })
@@ -811,7 +819,7 @@ mod tests {
     #[test]
     fn tools_have_precise_annotation_contracts() {
         let tools = tools();
-        assert_eq!(tools.len(), 25);
+        assert_eq!(tools.len(), 26);
         for tool in &tools {
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
             assert_eq!(tool["outputSchema"]["type"], "object");

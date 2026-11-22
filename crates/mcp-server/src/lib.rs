@@ -714,6 +714,14 @@ struct SettingsWriteArgs {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct FavoriteWriteArgs {
+    path: String,
+    name: Option<String>,
+    item_index: Option<bool>,
+    container_index: Option<bool>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct OpenArgs {
     path: String,
 }
@@ -904,6 +912,21 @@ fn parse_tool(params: &Value) -> Result<(&'static str, Command), &'static str> {
                 return Err("Specify between 1 and 32 settings changes");
             }
             ("set_settings", Command::SetSettings { changes: a.changes })
+        }
+        Some("set_favorite") => {
+            let a: FavoriteWriteArgs = serde_json::from_value(args).map_err(bad)?;
+            if a.path.is_empty() {
+                return Err("Specify a nonempty absolute path");
+            }
+            (
+                "set_favorite",
+                Command::SetFavorite {
+                    path: a.path,
+                    name: a.name,
+                    item_index: a.item_index,
+                    container_index: a.container_index,
+                },
+            )
         }
         Some("open_in_viewer") => {
             let a: OpenArgs = serde_json::from_value(args).map_err(bad)?;
@@ -1206,6 +1229,7 @@ fn tool_result_with_side(
             | ("get_view_state", Ok(Payload::ViewState(_)))
             | ("get_settings", Ok(Payload::Settings(_)))
             | ("set_settings", Ok(Payload::SettingsWrite(_)))
+            | ("set_favorite", Ok(Payload::FavoriteWrite(_)))
             | (
                 "search_items" | "items_by_tag" | "get_collection",
                 Ok(Payload::Items(_))
@@ -1248,6 +1272,7 @@ fn tool_result_with_side(
                 Payload::ViewState(v) => json!(v),
                 Payload::Settings(v) => json!(v),
                 Payload::SettingsWrite(v) => json!(v),
+                Payload::FavoriteWrite(v) => json!(v),
                 Payload::Items(v) => json!(v),
                 Payload::Tags(v) => json!(v),
                 Payload::Collections(v) => json!(v),

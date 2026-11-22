@@ -67,6 +67,7 @@ pub(crate) enum UiRequestKind {
         changes: serde_json::Map<String, serde_json::Value>,
         client_name: String,
     },
+    SetFavorite(super::favorite::PreparedFavorite),
     TagWrite(super::metadata_write::PreparedTags),
     RatingWrite(super::metadata_write::PreparedRatings),
 }
@@ -202,8 +203,8 @@ impl OpenController {
         client_name: String,
         dispatch: Arc<UiRequestDispatch>,
     ) -> Result<UiOpenOutcome, AgentError> {
-        self.dispatch_request(&ctx.cancel, dispatch, UI_REPLY_TIMEOUT, || {
-            if let mimageviewer_agent_ipc::Command::SetSettings { changes } = command {
+        self.dispatch_request(&ctx.cancel, dispatch, UI_REPLY_TIMEOUT, || match command {
+            mimageviewer_agent_ipc::Command::SetSettings { changes } => {
                 if changes.is_empty() || changes.len() > mimageviewer_agent_ipc::MAX_SETTINGS_KEYS {
                     return Err(super::error(
                         mimageviewer_agent_ipc::ErrorCode::BadRequest,
@@ -218,8 +219,18 @@ impl OpenController {
                     changes,
                     client_name,
                 })
-            } else {
-                super::metadata_write::prepare(command, ctx, client_name).map(UiRequestKind::from)
+            }
+            mimageviewer_agent_ipc::Command::SetFavorite {
+                path,
+                name,
+                item_index,
+                container_index,
+            } => {
+                super::favorite::prepare(path, name, item_index, container_index, client_name, ctx)
+                    .map(UiRequestKind::SetFavorite)
+            }
+            other => {
+                super::metadata_write::prepare(other, ctx, client_name).map(UiRequestKind::from)
             }
         })
     }
@@ -304,6 +315,19 @@ impl OpenController {
             Arc::new(UiRequestDispatch::pending()),
             UI_REPLY_TIMEOUT,
             || Ok(kind),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_favorite_for_test(
+        self: &Arc<Self>,
+        favorite: super::favorite::PreparedFavorite,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        self.dispatch_request(
+            &AtomicBool::new(false),
+            Arc::new(UiRequestDispatch::pending()),
+            UI_REPLY_TIMEOUT,
+            || Ok(UiRequestKind::SetFavorite(favorite)),
         )
     }
 

@@ -91,7 +91,36 @@ fn frozen_v5_adapter_never_registers_new_settings_commands() {
     for tool in v5_wire::schema::tools() {
         assert!(!matches!(
             tool["name"].as_str(),
-            Some("get_settings" | "set_settings")
+            Some("get_settings" | "set_settings" | "set_favorite")
         ));
     }
+}
+
+#[test]
+fn favorite_commands_and_payloads_are_only_decodable_by_v6_types() {
+    let command = current::Command::SetFavorite {
+        path: "C:/pics".into(),
+        name: None,
+        item_index: Some(true),
+        container_index: None,
+    };
+    let value = serde_json::to_value(&command).unwrap();
+    assert!(serde_json::from_value::<v5_wire::Command>(value).is_err());
+    let payload = current::Payload::FavoriteWrite(current::FavoriteWriteResult {
+        path: "C:/pics".into(),
+        name: "pics".into(),
+        added: false,
+        before: Some(current::FavoriteIndexState {
+            item_index: false,
+            container_index: false,
+        }),
+        after: current::FavoriteIndexState {
+            item_index: true,
+            container_index: false,
+        },
+        message: None,
+    });
+    assert!(
+        serde_json::from_value::<v5_wire::Payload>(serde_json::to_value(payload).unwrap()).is_err()
+    );
 }

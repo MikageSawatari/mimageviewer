@@ -183,18 +183,13 @@ impl App {
         Ok(response)
     }
 
-    pub(crate) fn agent_set_settings(
-        &mut self,
-        changes: &Map<String, Value>,
-        client_name: &str,
-        ctx: &egui::Context,
-    ) -> Result<SettingsWriteResult, AgentError> {
+    pub(super) fn admit_agent_settings_write(&self) -> Result<(), AgentError> {
         self.agent_settings_permission()?;
         if self.modal_dialog_block_reason().is_some() || self.pref_state.is_some() {
             return Err(AgentError::new(ErrorCode::Busy, DIALOG_BUSY));
         }
-        // This is the existing local admission boundary, not a lock around App
-        // callbacks, persistence, or publication. The root UI owns this frame.
+        // Linearize admission only; commits and notifications must not hold
+        // Remote's session lock. The root UI owns the rest of this frame.
         if self
             .remote_session_handle()
             .is_some_and(|session| session.with_local_composition_admission(|| ()).is_err())
@@ -204,6 +199,16 @@ impl App {
                 "リモート操作中は設定を変更できません",
             ));
         }
+        Ok(())
+    }
+
+    pub(crate) fn agent_set_settings(
+        &mut self,
+        changes: &Map<String, Value>,
+        client_name: &str,
+        ctx: &egui::Context,
+    ) -> Result<SettingsWriteResult, AgentError> {
+        self.admit_agent_settings_write()?;
         if changes.is_empty() || changes.len() > MAX_SETTINGS_KEYS {
             return Err(bad("設定は 1～32 項目で指定してください"));
         }

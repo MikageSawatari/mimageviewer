@@ -771,6 +771,7 @@ use book_structural_op::BookStructuralOp;
 mod startup_list_restore;
 pub(crate) mod top_level_grid_view;
 pub(crate) use startup_list_restore::StartupListIntent;
+mod agent_favorite;
 pub(crate) mod agent_rating_write;
 mod agent_settings;
 mod agent_view_state;

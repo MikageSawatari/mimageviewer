@@ -36,7 +36,7 @@ fn only_open_activates_and_every_ui_request_wakes_without_desktop_input() {
     }
 }
 
-fn prepared_ui_requests() -> [UiRequestKind; 7] {
+fn prepared_ui_requests() -> [UiRequestKind; 8] {
     use super::super::metadata_write::{PreparedRatings, PreparedTags};
     [
         UiRequestKind::Open(ActivationOpenPath::received("C:\\fixture.jpg".into(), None)),
@@ -69,6 +69,14 @@ fn prepared_ui_requests() -> [UiRequestKind; 7] {
             changes: serde_json::Map::new(),
             client_name: "fixture".into(),
         },
+        UiRequestKind::SetFavorite(super::super::favorite::PreparedFavorite {
+            path: "C:/favorite".into(),
+            name: None,
+            item_index: None,
+            container_index: None,
+            default_books_root: "C:/books".into(),
+            client_name: "fixture".into(),
+        }),
     ]
 }
 

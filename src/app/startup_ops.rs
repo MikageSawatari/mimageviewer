@@ -187,6 +187,15 @@ impl App {
                 continue;
             }
             match &request.kind {
+                crate::agent_ipc::open::UiRequestKind::SetFavorite(favorite) => {
+                    let outcome = match self.agent_set_favorite(favorite) {
+                        Ok(result) => crate::agent_ipc::open::UiOpenOutcome::Written(Ok(
+                            mimageviewer_agent_ipc::Payload::FavoriteWrite(result),
+                        )),
+                        Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                    };
+                    request.complete(outcome);
+                }
                 crate::agent_ipc::open::UiRequestKind::GetSettings { query, keys, page } => {
                     let outcome =
                         match self.agent_get_settings(query.as_deref(), keys.as_deref(), *page) {
