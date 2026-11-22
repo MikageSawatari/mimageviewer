@@ -1,0 +1,101 @@
+{
+  "extName": {
+    "message": "View in mIV - mImageViewer companion"
+  },
+  "extDescription": {
+    "message": "Open the image you right-click in mImageViewer on this PC, in a window placed over the browser page."
+  },
+  "menuOpen": {
+    "message": "View in mIV"
+  },
+  "badgeBusy": {
+    "message": "..."
+  },
+  "badgeSuccess": {
+    "message": "OK"
+  },
+  "badgeError": {
+    "message": "!"
+  },
+  "busy": {
+    "message": "An image is being processed. Please wait before trying another image."
+  },
+  "success": {
+    "message": "The image was handed to mIV."
+  },
+  "interrupted": {
+    "message": "Image processing was interrupted. Select View in mIV again if needed."
+  },
+  "state_failed": {
+    "message": "The processing state could not be recorded. Image processing has ended."
+  },
+  "permission_failed": {
+    "message": "Site permissions could not be checked."
+  },
+  "permission_denied": {
+    "message": "Access to the image site was not granted. Allow access to that site to open the image."
+  },
+  "invalid_url": {
+    "message": "This image or page address is not supported. Choose an HTTP or HTTPS image."
+  },
+  "position_failed": {
+    "message": "The browser viewing area could not be measured."
+  },
+  "rule_failed": {
+    "message": "Preparing or finishing the image request failed."
+  },
+  "fetch_failed": {
+    "message": "The image could not be retrieved. Check site permissions and the image address."
+  },
+  "too_large": {
+    "message": "The image is too large to send to mIV."
+  },
+  "unregistered": {
+    "message": "Browser integration is not registered. Enable browser integration in mIV preferences."
+  },
+  "native_failed": {
+    "message": "A reply from mIV could not be confirmed. Any saved image remains in the browser viewing folder."
+  },
+  "context_failed": {
+    "message": "Right-click position recording could not be prepared. Reopen the page if placement is inaccurate."
+  },
+  "host_invalid_origin": {
+    "message": "This extension is not authorized for browser integration. Install the official extension and register integration again."
+  },
+  "host_unsupported_version": {
+    "message": "The extension and mIV versions are incompatible. Update both and restart mIV."
+  },
+  "host_invalid_request": {
+    "message": "The information needed to hand over the image was invalid."
+  },
+  "host_message_too_large": {
+    "message": "mIV could not accept the image because the message was too large."
+  },
+  "host_invalid_image": {
+    "message": "The retrieved data was not a supported image format."
+  },
+  "host_invalid_url": {
+    "message": "mIV could not accept the image or page address."
+  },
+  "host_invalid_placement": {
+    "message": "mIV could not accept the browser placement information."
+  },
+  "host_registration_missing": {
+    "message": "Register browser integration again in mIV preferences."
+  },
+  "host_launcher_missing": {
+    "message": "mIV could not be found. Reinstall mIV or unregister browser integration."
+  },
+  "host_invalid_destination": {
+    "message": "The image destination cannot be used. Check the destination in mIV preferences."
+  },
+  "host_save_failed": {
+    "message": "The image could not be saved. Check the destination and available space."
+  },
+  "host_motw_failed": {
+    "message": "The image was saved, but its security information could not be written. It remains in the browser viewing folder."
+  },
+  "host_launch_failed": {
+    "message": "The image was saved but could not be handed to mIV. Restart mIV. The image remains in the browser viewing folder."
+  }
+}

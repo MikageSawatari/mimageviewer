@@ -775,6 +775,23 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
 
 製品用 manifest と二つの ZIP を再現可能に生成でき、試作専用コード・権限・診断本文を含まないこと。
 
+**段階8の実装引き継ぎ（2026-11-22）**
+
+- 製品拡張の版は `0.2.0`。ソースの manifest は Chrome の公開鍵を持ち、Edge 用は ZIP 内の key だけを変える。提供されたアイコンと `store-keys.json` は変更しない。鍵・テスト・この文書は ZIP に入れない。
+- 要求は同期の latch で一件に制限し、`permissions.request` を最初の await より前に呼んでから session storage に記録する。画像 origin の許可があれば取得でき、ページ origin が無いときは右クリック記録を使わない。画像リンクの拡張子集合は Rust の共有表と Node テストで照合する。
+- session rule は固定 ID `818` を専用に所有し、正規表現でエスケープした最初の URL の完全一致、GET、`xmlhttprequest`、`TAB_ID_NONE` に限定。取得の成否にかかわらず消し、削除が失敗した場合も送信せず終了する。Cookie を含む一回の fetch、既定の redirect、`response.url`、宣言サイズ／stream／JSON UTF-8 長の検査を持つ。
+- 起き直した worker は専用の残存規則と要求を消して中断を一回通知する。再取得・再送・時刻期限は持たない。native の13種類の失敗は、それぞれ別の ja/en の説明に対応する。API の失敗や未知の応答も badge/title で知らせる。画像の内容や診断本文はログに出さない。
+- `context.js` は ISOLATED の上位フレームで直前一件の座標と geometry だけを保持する。記録の有効性と位置換算は段階6の host が所有し、JS へ重複して実装しない。登録は単一 ID、登録・更新イベントは直列に処理する。インストール／起動／許可追加時の既存タブ注入と、同一 document への二重 listener 防止を持つ。
+- API 契約は Chrome の一次資料（[permissions](https://developer.chrome.com/docs/extensions/reference/api/permissions)、[DNR](https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest)、[scripting](https://developer.chrome.com/docs/extensions/reference/api/scripting)）でも確認した。Node のモックと ZIP 検査を、実 Chrome／Edge の許可 UI・Cookie・redirect・座標精度の証拠とはしない。ストアへの提出・公開と実機検証は別工程。
+- Node v22.16.0 の64テストは全件成功（`target/browser-extension/worker-tests.tap` に全テスト名と結果）。通常の `node --test` はこの実行環境で子プロセスの spawn が EPERM となったため、`--experimental-test-isolation=none` を付けて同じテストを実行した。PowerShell の package テストも成功（`target/browser-extension/package-test-results.txt`）。最終ソースの二つの ZIP は `target/browser-extension/` に生成済みで、対応するテスト生成物とバイト一致。Chrome ID は `fpppoodelfkddekjahhmalmmfdhbpdma`、Edge ID は `dlcbdkekoppppebnhhncghhglkkccdhk`。Rust・cargo・実登録・ブラウザ・mIV は実行していない。
+
+**段階8の独立レビュー P2 修正（2026-11-22、再レビュー待ち）**
+
+- `TAB_ID_NONE` だけでは Web の service worker の要求も含む。`exactRule` へ実行中の `chrome.runtime.id` を渡し、`initiatorDomains: [extensionId]` を追加した。URL完全一致・GET・resource type・タブ条件は維持し、Chrome／Edge の ID を製品コードへ固定しない。
+- 根拠となる Chrome の公式資料は、[拡張のネットワーク取得と独立した origin](https://developer.chrome.com/docs/extensions/develop/concepts/network-requests#extension-origin)、[拡張 origin の `chrome-extension://<ID>` 形式](https://developer.chrome.com/docs/extensions/how-to/web-platform/origin-trials#register-your-extension)、[initiator は要求の起点 origin](https://developer.chrome.com/docs/extensions/reference/api/webRequest#event-onBeforeRequest)、[DNR の initiatorDomains は要求先ではなく起点のドメインを照合する](https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest#property-RuleCondition-initiatorDomains)。これらの仕様の照合に基づき、拡張 service worker の fetch の起点の host が拡張 ID と一致すると判断した。DNR の[service worker との関係](https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest#interactions-with-service-workers)にも fetch が対象となることが明記されている。実ブラウザでの再現・適用確認とは区別する。
+- 条件オブジェクトの小さな matcher をテストに置き、同じ URL・GET・tabId=-1 でも Web 起点を除外すること、従来の条件だけなら一致すること、別拡張・起点なしも除外することを検査した。実際の click→fetch の規則も、提供された Chrome／Edge の両 ID で検査する。
+- Node は通常コマンドが環境の child spawn EPERM で開始できず、`--experimental-test-isolation=none` で66件すべて成功。ZIP検査も成功（両 ID・権限・locales・収録内容・再現性・ソース不変）。生成物はこの worktree の `target/browser-extension/package-test-c466e32f6d5a41a2a24b407083e67df6` 内だけ。Rust・cargo・コミット・実ブラウザ起動は行っていない。
+
 ### 段階9：公開文書と最終検証の引き渡し
 
 **範囲**
@@ -952,3 +969,9 @@ Start-Process -FilePath .\target\release\mimageviewer.exe
 - 実装担当が新設した英語のマニュアル `en/manual/browser-integration.html` は、サイトに英語のマニュアルが無く孤立するため設計担当が外した。privacy.html の英語の節は日本語のマニュアルへリンクする。
 - `python scripts/test_public_privacy_scope.py` は 9 件中 2 件失敗だが、master でも同じ 2 件が失敗する既存の失敗 (今回の変更によるものではない)。`python scripts/check_site_cards.py` 53 cards ok。
 - 独立レビューは段階 7 の第 2 回・第 3 回と合わせて実施し、第 3 回で ACCEPT。
+
+### 段階 8 の実装 (2026-11-22、`0fde63262`・`94dba1c31`) — ACCEPT
+
+- 独立レビュー (GPT-6.1 Sol / xhigh、read-only、本体の段階のレビューとは別の担当): 第 1 回 REVISE、P2 1 件 = DNR の一時規則が `TAB_ID_NONE` だけで、許可済みの origin の Web の service worker が同じ URL へ GET すると Referer が書き換わり得る (Chrome の文書と Chromium のコードからの指摘、実ブラウザでの再現ではない)。`initiatorDomains: [runtime.id]` で自拡張の起点に限定し、Web 起点が一致しないことをテストで固定 (`94dba1c31`)。第 2 回 ACCEPT。
+- 設計担当の再実行: `node --test browser-extension/tests/worker.test.cjs` 66 passed、`scripts/test-package-browser-extension.ps1` PASS (Chrome `fpppoodelfkddekjahhmalmmfdhbpdma`・Edge `dlcbdkekoppppebnhhncghhglkkccdhk` と一致)。
+- 未確認: 実際の Chrome / Edge での動作 (許可の画面・Cookie・redirect・DNR の適用・位置)。v5.6.0 に入れるかの判定はこの段階を待たない (統括 2026-11-22)。
