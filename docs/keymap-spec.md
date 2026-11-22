@@ -1,5 +1,13 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+§1.851: コレクションメニューと、コレクション直下の見つからない項目の右クリックに
+「見つからない項目をすべて外す…」を置く。件数とパスを確認してから登録をまとめて外す管理操作のため、
+`MenuCommandId::CollectionsRemoveMissingCurrent` は `action: None` とし、KeyAction・既定キーは追加しない。
+参照解除の確認ダイアログは、既存の `dialog_enter_pressed` / `dialog_escape_pressed` を通して
+Enter で「外す」、Escape で「キャンセル」を受ける。IME 変換中とメニューを選んだ同じフレームの
+Enter は確定に使わない。ダイアログの確定・取消入力なので keymap の対象外とする。
+詳細は [見つからない項目の一括解除設計](collection-missing-bulk-remove-851-plan.md) を参照。
+
 §1.476: main の閲覧中のタグ欄は、既存の固定 Enter 確定（`submit_tag_search_input`）で検索する。
 IME 変換中は検索せず、変換確定後の Enter で確定する。TextEdit の確定操作なので KeyAction は追加しない。
 一覧▼のタグ選択と種類変更も確定とし、閲覧無しの入力ごとの検索は維持する。

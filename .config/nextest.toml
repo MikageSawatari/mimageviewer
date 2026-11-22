@@ -137,7 +137,7 @@ filter = '''
     | test(=ui_dialogs::about::tests::miv_sound_credits_snapshot_light_and_narrow_dark)
     | test(=ui_dialogs::caption_delete::tests::caption_delete_confirmation_snapshot)
     | test(=ui_dialogs::caption_job::tests::caption_job_progress_snapshot)
-    | test(/^ui_dialogs::collections::tests::(collection_grid_remove_confirm_light_snapshot|collection_manager_import_preview_light_snapshot|collection_manager_populated_dark_snapshot|collection_reorder_dark_snapshot)$/)
+    | test(/^ui_dialogs::collections::tests::(collection_grid_remove_confirm_light_snapshot|collection_missing_remove_confirm_small_light_snapshot|collection_manager_import_preview_light_snapshot|collection_manager_populated_dark_snapshot|collection_reorder_dark_snapshot)$/)
     | test(=ui_dialogs::context_menu::delete_confirm_tests::delete_confirm_modal_blocks_background_pointer_action)
     | test(/^ui_dialogs::depth_addon::tests::(depth_addon_confirm_snapshot|depth_addon_preferences_snapshot)$/)
     | test(/^ui_dialogs::favorites_editor::tests::(favorites_full_outcomes_and_maintenance_snapshot_dark|similar_index_progress_snapshot_dark)$/)
