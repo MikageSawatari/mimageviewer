@@ -103,6 +103,7 @@
 - **1 回の利用者の操作で 1 枚だけ**。一覧の一括取得・巡回・自動取得は作らない (クローラーとみなされる形を最初から持たない)。
 - **mIV から外へ送らない・共有しない**。保存先は利用者の PC だけ。
 - 拡張機能をストアに出すなら、説明文に「X・pixiv 製ではない」旨と、サイト名を宣伝に使わないことを守る (§11)。
+  - 2026-11-22 に改めた: 拡張はどのサイトにも同じ規則で動く (§13 Q18) ので、説明文には特定のサイト名を出さず、「各ウェブサイトの運営者とは関係のない、個人が開発したもの」と書く。サイト名を使わなければ、登録商標のガイドラインの併記の求め (上) にも当たらない。
 
 ### 4.3 Chrome ウェブストアと拡張機能の配布
 
@@ -445,12 +446,15 @@ CLAUDE.md「設計の簡素化」に従い、扱う組み合わせを先に減�
     - Edge は個人の Microsoft アカウントが必須で、職場・学校のアカウントでは登録できない ("doesn't support registering with a work or school account"、https://learn.microsoft.com/en-us/microsoft-edge/extensions/publish/create-dev-account)。
 - **進め方** (2026-11-20 利用者と確認): 連絡先のメールは、利用者がドメインのエイリアスを用意済み。まずスパイク (§9.9) と実装を開発者モード (パッケージ化されていない拡張の読み込み) で確かめ、公開できる内容で動いてからストアの準備を進める。開発者モードの拡張は利用者自身の確認にだけ使い、配布には使わない (§4.3)。
   - **拡張の ID**: native messaging の manifest の `allowed_origins` には、拡張の ID を `chrome-extension://<ID>/` の形で並べる。ワイルドカードは使えない ("allowed_origins values can't contain wildcards"、https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging)。開発中とストアで同じ ID にするには、ZIP を公開せずにダッシュボードへアップロードし、「Package」タブの「View public key」で出る公開鍵を manifest の `key` に入れる (https://developer.chrome.com/docs/extensions/reference/manifest/key)。そのため、ストアのアカウントは提出の直前ではなく、開発者モードの確認の途中 (ID を固定したくなった時点) で作るとよい。ID を固定しない間は、開発用の ID を `allowed_origins` に足して確かめる。Edge のストアの ID は Chrome と別になる。
+- **利用者の決定 (2026-11-22、ストアの下準備のセッション [store-prep-818] で利用者が回答)**: 登録には公開専用の新しい Gmail を使う (開発者のメールは後から変えられないので、製品名を入れない名前にする)。公開者名は `Mikage Sawatari`。Trader の申告は Non-Trader (無料・広告なし・課金なしの個人の配布)。Edge アドオンにも Chrome と同時に出す。
+- **ID を固定するための雛形** (2026-11-22 決定): MV3 の manifest (名前と要約は `_locales` の ja / en、`version` 0.1.0、mIV のアイコンを縮小したもの、空の service worker、**権限なし**) だけの ZIP をダッシュボードへアップロードし、審査には出さない。権限は提出する版で入れる。雛形はリポジトリに入れず、共有メモの場所で作る。製品の拡張のソースはリポジトリの `browser-extension/` に置き (Chrome と Edge で 1 つ)、実装のときにダッシュボードの公開鍵を `key` に入れて作る。
+- **Edge の ID** (未確認): Edge が manifest の `key` を守るか、公開の前に Edge の ID を知る方法は、公式のページに記載が無い。Partner Center へ ZIP を上げた後に ID が分かるかを利用者に見てもらう。分からなければ、Edge の ID は Edge で公開した後に分かり、それを `allowed_origins` に足した mIV を後から出すことになる。そのときは「Chrome と同時」の決定と両立しないので、利用者に順序を相談する (Edge の拡張を先に公開して ID を得てから mIV を出す、または Edge を 1 版遅らせる)。
 - **提出**: ダッシュボードで「Add new item」→ ZIP をアップロード → Store Listing・Privacy・Distribution (必要なら Test instructions) を埋める → 「Submit for Review」 (https://developer.chrome.com/docs/webstore/publish)。審査に通ってから 30 日以内に公開する (過ぎると下書きに戻る)。新しい公開者は、公開できる拡張が 2 つまで。
 - **Privacy タブ** (https://developer.chrome.com/docs/webstore/cws-dashboard-privacy): 単一の目的の説明、権限ごとの理由 (§9.6 の宣言する権限と任意の host 権限のすべて)、リモートのコードを使わないこと、データの扱いの開示と認証、プライバシーポリシーの URL。ローカルだけで扱うデータでも開示が要る ("even when data is processed or stored locally"、https://developer.chrome.com/docs/webstore/program-policies/user-data-faq)。プライバシーポリシーは mIV の `privacy.html` に拡張の節を設けて指す (§11)。
 - **掲載の素材** (https://developer.chrome.com/docs/webstore/images): 128×128 の PNG のアイコン (ZIP の中にも)、スクリーンショット 1〜5 枚 (1280×800 か 640×400)、詳しい説明文。小さいプロモ画像 (440×280) は任意だが、無いと表示順が後ろになる。
 - **審査の期間**: 多くは数日、長いと数週間 ("within a few days, but it can take up to a few weeks"、https://developer.chrome.com/docs/webstore/review-process)。新しい開発者・新しい拡張・強い権限は長くなりやすく、`downloads` は強い権限の例として挙がっている (2026-11-22 に `downloads` は使わない形に改めた。代わりに任意の広い host 権限の宣言がある、§9.6)。**更新も毎回同じ審査を通る**。
 
-**Microsoft Edge アドオン** (Edge の利用者向け。Edge は Chrome ウェブストアからも入れられるが、Edge の場合も考えて両方に出すかは公開の準備で決める)
+**Microsoft Edge アドオン** (Edge の利用者向け。Edge は Chrome ウェブストアからも入れられるが、2026-11-22 に利用者が Chrome と同時に両方へ出すと決めた。上の「利用者の決定」)
 
 - **費用**: 無料 ("There is no registration fee"、https://learn.microsoft.com/en-us/microsoft-edge/extensions/publish/create-dev-account)。Microsoft アカウントを主な所有者とする Partner Center の開発者アカウントが要る。個人のアカウントを選ぶ (会社から個人へは変えられない)。
 - **提出**: Partner Center で新しい拡張を作り、ZIP・公開範囲 (公開 / 非表示)・プロパティ・プライバシー・掲載情報を埋めて提出 (https://learn.microsoft.com/en-us/microsoft-edge/extensions/publish/publish-extension)。説明文は 250〜10,000 字、ロゴ (最小 128×128) が必須。審査は最大 7 営業日。
@@ -500,7 +504,7 @@ CLAUDE.md「設計の簡素化」に従い、扱う組み合わせを先に減�
   - 拡張がタブから読むのは、窓の位置と大きさ、直前の右クリックの座標だけで、ページの内容は読まないこと (§9.2-2、§9.3)。許可したサイトのページでは、右クリックの座標を記録する小さなスクリプトが動くこと (記録は通常はそのページの中に置くだけで、「mIV で見る」を選んだときだけ位置の計算のために PC の中の中継 exe へ渡す)。拡張は、画像の中身と、右クリックした画像の URL・転送を追った後の URL・ページの URL・窓と右クリックの座標を、PC の中だけで中継 exe へ渡すこと (開発者へは送らない)。取得のときに、ページや画像の参照元の方針とは関係なく、ページの origin (ホスト名まで) を参照元として画像のサーバーへ送ること。拡張が設定するのは最初の URL への要求だけで、転送先への要求の参照元は Chrome に従うこと (§9.2-3)。
   - 製品ページの「安心して使えます」の本文 (ネットワークは更新確認と「ご自分で選んだ機能」、[index.html:1252](../htdocs/mimageviewer/index.html)) は一般的な表現のままで偽にならない。リンク先の通信の一覧 (`privacy.html`) は上のとおり更新する。
   - マニュアル: 拡張の入れ方、mIV 側の登録・解除、使えるのは既定のデータフォルダの mIV だけであること (Q5)、「ブラウザ閲覧」フォルダと場所▼、重ねて開く窓の動き (位置はずれ得る・追従しない・メインの一覧が移る・開いている F12 の窓は閉じて作り直す・閉じるときに mIV はメインへフォーカスを送らない (閉じた後にどの窓が前に来るかは Windows の動作による)・この窓が開いている間は F12 の切り替えを使えない)、編集が画像ごとに残る範囲 (補正パネルで「このページ」を選んだ補正は「補」の印で分かる、U や標準を選んだままの補正は標準を変える)、★固定の範囲の注意、拡張がバッジで示す失敗 (処理中・未登録・版のずれ・launcher が見つからない・サイトの許可を断った) とその直し方。初めてのサイトでは Chrome の許可の確認が出ること。サイトによっては Shift+右クリックでブラウザのメニューを出すこと (§9.9)。
-  - 拡張のストア掲載ページのプライバシーの開示は「開発者へ収集・送信しない」と範囲を明示する。X・pixiv 製ではない旨を書き、サイト名やロゴを宣伝・アイコンに使わない。
+  - 拡張のストア掲載ページのプライバシーの開示は「開発者へ収集・送信しない」と範囲を明示する。特定のサイト名は出さず、各ウェブサイトの運営者とは関係のない個人の開発物であることを書く (§4.2)。サイト名やロゴを宣伝・アイコンに使わない。
 - どちらの段も、外部ダウンローダの名前・URL・使用例を公開文書とコミットメッセージに書かない ([public-wording-policies.md](public-wording-policies.md))。機能の説明は「ブラウザで見ている画像を mIV で開く」とし、「サイトから画像を集める」「一括で保存する」とは書かない。
 
 ## 12. 範囲外
