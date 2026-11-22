@@ -45,7 +45,7 @@ v5.5.0 で入れるもの:
   入り swap される (`src/app/viewer_context_registry.rs`)。`ai_model_facet_requested` は App 全体の bool で、
   一覧の install 時に `facet_ai_filter_active()` へ戻る (`src/app.rs` 45833 行付近)。
 - details-meta の要件は、詳細表示の遅延列・サムネイルの長さバッジ/再生位置メーター (可視+近傍の段階取得、
-  `VisibleStage`)・AI facet (表示集合全体、`AllRequirements`)・選択情報。`ai_model_facet_should_load()` は
+  `VisibleStage`)・AI facet (一覧の`items`全体、`AllRequirements`、§1.835で拡張)・選択情報。`ai_model_facet_should_load()` は
   走査範囲だけでなく、AI メタデータ・作成日時・画像寸法・ページ数のフィールド選択にも使われている
   (`src/app.rs` 74228〜74320 行付近)。thumbnail 表示の target 生成には可視範囲の制限がある (75171 行付近)。
 - readiness は context ごとの 1 つの `LazyColumnState`。`Ready` は失敗件数だけを持ち、どの範囲・フィールドで
@@ -82,7 +82,7 @@ v5.5.0 で入れるもの:
   **どの一覧でも使える。** 本計画はこれを変えない。
 - 絞り込みバー (`FacetFilter`、`settings.facet_filter` に保存) に長さは無い。サイズ facet はプリセット 4 つ +
   範囲指定で、サイズの無い行は除外する。
-- AI facet が遅延データ facet の前例 (メニューを開くと表示集合全体を取得、読み込み中は進捗と停止)。
+- AI facet が遅延データ facet の前例 (メニューを開くと一覧全体を取得、読み込み中は進捗と停止。§1.835で表示集合から拡張)。
   着手前に確認した AI 待機中の早期 `return true` は、§1.822 (`b71e60f75`) で修正済み。
   長さ facet も、待機中に他の facet を素通しにしない。
 - Remote には絞り込みバーが無い。
@@ -223,16 +223,25 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
 
 - 走査範囲の述語と、フィールドの要件を分ける (レビュー 2 回目 P2-2)。
   - `whole_listing_meta_scan_wanted()`: 一覧全体の取得が要るか。AI facet (既存の `ai_model_facet_should_load()`)・
-    長さ facet・長さ順のどれか。走査範囲 (`AllRequirements`) と、サムネイル表示で可視範囲の stage に
-    置き換えないこと (`refresh_thumbnail_details_stage` の早期 return) だけに使う。
-  - AI のフィールド要件は既存の `ai_model_facet_should_load()` のまま。長さだけの要求で AI 解析・作成日時・
-    画像寸法・ページ数を取らない。
+    長さ facet・長さ順のどれか。`AllRequirements`はこのとき`WholeListing`で走査する (§1.835)。
+    長さとAIの要件を`ListingMetaRequirements { duration, ai }`へまとめ、開始時のsnapshotを完了まで運ぶ。
+  - AI のフィールド要件は既存の `ai_model_facet_should_load()` のまま。
   - 長さのフィールド要件 `duration_lengths_wanted()`: 長さ facet の要求・有効、または長さ順が使える一覧で
     長さ順が選ばれていること。**継続条件**であり、「Missing がある間だけ」にしない (最後の Item と Finished の間で
     要件が消えて worker が取り消されるのを防ぐ、レビュー 1 回目 P2-5)。
 - 長さの対象は、その一覧の**全動画・音声** (`items` の Video / Audio。表示集合・絞り込み・可視範囲に依らない)。
   thumbnail 表示の target 生成の可視範囲制限も、長さの要件があるときは動画・音声に適用しない。
   項目ごとの未充足は「その動画・音声のメモリに、source stamp が一致する長さ (Known / Unavailable) が無い」。
+- AI facetも表示集合・評価フィルタ・可視範囲に依らず`items`全体を対象にする。`visible_indices`の外では
+  全体要件のフィールドだけを取得する (長さが要件なら動画・音声の長さ、AIが要件ならAIメタデータ)。
+  長さだけの要求でAI・作成日時・画像寸法・ページ数を増やさず、AIだけの要求で動画probeを増やさない。
+  表示集合内の既存要件と、選択情報の対象の例外は維持する。
+- 表示集合の拡大で新たに現れる行の通常列が未充足なら、既存rebuild走査内で昇順の旧集合と線形に照合し、
+  pending無し・`Ready`から`NotRequested`へ戻して既存の予算付き`AllRequirements`を使う (§1.835 §4.2.2-10)。
+  全体proofは通常列の完了を示さないが、補充の間も有効なproofとcacheは保持する。
+  全体要件がある停止中は自動再開しない。全体要件が無く通常列だけの一覧では、評価・サイズ等の再投影で
+  `Cancelled`から`NotRequested`へ戻る従来の自動再開を維持する。
+  pendingの失効は既存revision経路を使う。Readyからの表示集合の縮小と完了後のrebuildでは不要な再開を立てない。
 - 可視行は Normal、画面外は Low の既存 priority。`RetryLater` は既存どおり同じ一覧世代の終端として扱い、
   同じ世代で再試行しない。catalog にある分は cache hit で probe しない。
 - 並べ替えのために読んだ長さは catalog に残るので、次に開いたとき (worker 走査の入口) と利用者の更新で並びに入る。
@@ -241,39 +250,49 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
 
 ### 5.2 「全部読み終えた」の証拠
 
-`LazyColumnState::Ready` は範囲を持たないので、長さについての完了を別に記録する (レビュー 2 回目 P2-3)。
-絞り込みの「読み込み完了まで長さ条件を適用しない」(§6) と、読み込み中の表示 (§5.3) の終わりに使う。
+`LazyColumnState::Ready` は範囲を持たないので、全体走査の完了を別に記録する (レビュー 2 回目 P2-3、
+§1.835で長さとAIへ統合)。長さとAIは、それぞれの有効な証明ができるまでその条件だけを適用しない。
+読み込み中の表示 (§5.3) の終わりにも使い、Ready / Reconciling / VisibleStageからAIの完了を推さない。
 
-- viewer context ごとの details 状態に `duration_scan_proof: Option<DurationScanProof>` を足す
+- viewer context ごとの details 状態に `listing_meta_scan_proof: Option<ListingMetaScanProof>` を持つ
   (`details_image_dims_state` と同じ bundle で swap。初期化・構造体の列挙・fork 時の所有方針にも機械的に登録する。
   fork 先は metadata cache が空なので proof も None、元の context は cache と proof を一緒に残す。既存の details
   状態と同じ配置、`src/app/viewer_context_registry.rs` 3957 / 4858 行付近)。
-- 中身は**取得対象の snapshot**: session の計画を始めた時点の `items_generation` と `items.len()`
-  (レビュー 3 回目 P2-2)。一覧世代は同じ一覧内の削除でも進み、逆に Smart Folder の評価条件の更新は世代を
+- 中身は**取得対象と要件の snapshot**: `ListingMetaScanProof { generation, items_len, requirements }`。
+  `requirements`は`ListingMetaRequirements { duration, ai }`で、sessionの計画を始めた時点の
+  `items_generation`、`items.len()`、長さとAIのフィールド要件を記録する (レビュー 3 回目 P2-2)。
+  計画中に現在の要件が減っても、skip・cache判定・target・選択対象は開始時snapshotのフィールドを維持する。
+  一覧世代は同じ一覧内の削除でも進み、逆に Smart Folder の評価条件の更新は世代を
   進めずに行を足す (`push_grid_item_pending`、`src/app/smart_folder.rs` 1699 / 1783 行付近) ため、世代だけでは
   対象の変化を表せない。
-- 立てる: 長さのフィールド要件を含む `AllRequirements` の session が終わり、採用時の (`items_generation`,
+- 立てる: 全体要件を含む `AllRequirements` の session が終わり、採用時の (`items_generation`,
   `items.len()`) が計画開始時と一致するとき。Finished・target が全部メモリで満たされていて即時に終わる場合・
   計画段階で対象 0 件の場合の、すべての完了経路で立てる。完了経路は実装時に列挙し、検証台帳に残す。
-  一致しなければ立てない。
-- 有効: proof の (`items_generation`, `items.len()`) が今の値と一致すること。対象は全動画・音声なので、
-  絞り込みの変更では失効しない。選択情報の補助取得 (`VisibleStage`) や他の要件の追加でも失効しない。
-  取消・停止では立てない (停止中は未完了)。
-- 取り直し: 長さのフィールド要件が有効で、proof が無効 (対象が変わった) で、details-meta の session が
+  一致しなければ立てない。同じ世代・件数の既存proofがあれば、要件は和をとり、先に取得した要件を保持する。
+- 有効: proof の (`generation`, `items_len`) が今の (`items_generation`, `items.len()`) と一致すること。
+  `duration_scan_ready()`はその証明に`duration`、`ai_model_facet_ready()`は`ai`があることも確認する。
+  絞り込みの変更、選択情報の補助取得 (`VisibleStage`)、他の要件の追加では既存proofを失効させない。
+  一覧のinstallでNoneに戻す。取消・停止では新しいproofを立てず、有効な既存proofは保持する。
+- 取り直し: 現在の全体要件から、有効なproofが満たす分を引いた「未充足要件」があり、details-meta の session が
   動いていないとき、details-meta の poll が新しい `AllRequirements` session を始める。新しい一覧の install に
   限らず、削除・追加・復元で対象が変わった場合も同じ規則で取り直す。全部メモリで満たされていれば即時に完了して
   proof が立つ。印は足さず、この条件だけから導く。停止 (`Cancelled`) の間は取り直さない (利用者の再開を待つ)。
-- 動いている session の対象が古くなったとき: 長さのフィールド要件を含む session が動いている間に、その計画開始時の
-  (`items_generation`, `items.len()`) と今の値が違えば、details-meta の poll がその session を取り消して破棄し、
+- 動いている session の対象が古くなったとき: 全体走査の計画開始時の (`items_generation`, `items.len()`) と今の値が
+  違うか、未充足要件を取得中のsnapshotが含まなければ、details-meta の poll がその session を取り消して破棄し、
   状態を `NotRequested` へ戻す (レビュー 4 回目 P2)。その後は上の取り直しの規則で新しい session を始める。
   この取り消しは通常操作 (削除・追加) による世代交代の処理で、旧 session の channel 切断を `Cancelled` として
   受けない。利用者の「停止」による `Cancelled` は従来どおり維持する。
+- 段階取得 (`VisibleStage` / post-grid) は未充足要件が無くなってから許す。全体走査のFinishedはsnapshotを
+  完了helperへ渡して証明を立てる。要件縮小で未充足要件が空でも、このFinishedをReconcilingへ回さない。
+  成立後の段階取得は既存proofを上書きせず、取消を繰り返さない。
+- AIメニューを初めて開いて`ai_model_facet_requested`を立てる場合も、有効なAIのproofがあれば取得状態を
+  無効化しない。これにより停止中の未証明の長さ取得を自動再開しない。
 
 ### 5.3 読み込み中の表示
 
 - 長さ順の並べ替え項目 (ツールバーのボタン・メニューの選択中の項目) の tooltip と、ツールバーの短いラベルの
   後ろに「長さを読み込み中 n/m」を出す。値は既存の `LazyColumnState::Loading { done, total }` (長さの要件を
-  含む session のとき)。`duration_scan_proof` が有効になったら消す。
+  含む session のとき)。`duration_scan_ready()` が真になったら消す。
 - 読み終えたときの通知は出さない。説明文 (§4.3) とマニュアルに、読み込み後に更新で並べ直せることを書く。
 
 ## 6. 絞り込み (長さ facet)
@@ -286,12 +305,12 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
   (フォルダ・書庫・画像・スタック) は落とす (サイズ facet がサイズの無い行を落とすのと同じ)。
 - 取得: 長さメニューを開いたとき (`duration_facet_requested`)、または長さ条件が有効なとき、§5.1 の要件で
   全動画・音声を取得する。
-- **`duration_scan_proof` が有効になるまで、長さ条件だけを適用しない** (未取得のものも表示する。利用者の決定)。
-  他の facet は通常どおり判定する (AI facet の早期 `return true` は写さない)。proof が立ったら
+- **`duration_scan_ready()` が真になるまで、長さ条件だけを適用しない** (未取得のものも表示する。利用者の決定)。
+  他の facet はそれぞれの条件で判定する。長さのproofが新たに立ったら
   `rebuild_visible_indices`。
 - メニュー: 読み込み中は「長さを読み込み中 n/m」と停止 / 再開 (AI facet と同じ)。proof 有効後は各候補の件数。
 - すべての一覧 (Ctrl+G・コレクション等を含む) で使える。集約一覧で動画が多いと取得に時間がかかるが、
-  取消でき、その間は長さ条件だけが素通しになる。
+  取消でき、停止中も証明済みの条件は保ち、未証明の条件だけを素通しにする。
 - Remote には絞り込みバーが無いので変更しない。
 
 ## 7. 変更しないもの・互換
@@ -304,7 +323,7 @@ group 比較・集約表示・flat 表示の全経路でそれを使う。mtime�
     toolbar の補完によって長さ順を使っていない利用者もこの境界に入る (利用者決定で許容、§9 の 6)。
   - `FacetFilter.duration_preset` は旧版が無視する。
   - 新旧の wire (serde 文字列) と、旧版相当の enum で読んだとき DB を書き換えないことを試験する。
-- detached viewer: viewer context の bundle に `duration_scan_proof` の swap field を 1 つ足す (既存の
+- detached viewer: viewer context の bundle に `listing_meta_scan_proof` の swap field を持つ (§1.835で長さとAIを統合。既存の
   `details_image_dims_state` と同じ扱いの機械的な追加)。detached 述語・viewport 経路には触れない見込み。
   触れた場合は CLAUDE.md の合意手続に従い [detached-rework-plan.md](detached-rework-plan.md) §11 に記録する。
   park / mount / drop で兄弟 context の状態が変わらないことを試験する。

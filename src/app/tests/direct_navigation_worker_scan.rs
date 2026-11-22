@@ -758,6 +758,7 @@ fn direct_navigation_worker_block_reason_keeps_non_item_shortcuts_available() {
     use crate::filename_stack_ui::GridItemInputBlock;
     for block in [
         GridItemInputBlock::DirectNavigationScan,
+        GridItemInputBlock::ViewOrderRefreshScan,
         GridItemInputBlock::LocationNavigation,
         GridItemInputBlock::BookStructuralOperation,
         GridItemInputBlock::ImageFolderZip,

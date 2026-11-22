@@ -1458,6 +1458,53 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-21: 絞り込みの変更で一覧を読み直さない・AI の絞り込みを一覧全体の取得の証明へ (§1.835、実装済み・自動検証済み・実機未確認)
+
+**変更の内容**
+
+- 自動更新の判定 key (`folder_projection_key_with_presentation`) から facet を外す。
+  - facet は行の記録の後の表示投影で、行を作る条件ではない。
+  - それでも key に入っていたので、facet を変えるたびにフォルダ全体の読み直しが走り、範囲指定のメニューが 1 文字目で閉じていた。
+- 読み直しが隠していた、AI モデル・ツールの絞り込みの取得不足も同時に直す。
+  - 修正前は、絞り込み後の一覧だけを取得し、完了を一覧全体で 1 つの状態から推していた。
+  - 長さ (§1.762) と同じ「一覧全体の走査 + 取得の証明」へ移した。
+- 評価フィルタの解除で未取得の画像が消える既存の不具合も段階1テストで再現し、同じ修正対象とした。
+
+**detached に触れる範囲**
+
+- `viewer_context_registry.rs:5159` の fork は key を計算し直すだけで、コードは変えない。変わるのは関数の意味だけ。
+- §1.762 で登録した `duration_scan_proof` を、`listing_meta_scan_proof: Option<ListingMetaScanProof>`へ置き換えた。
+  - 証明は`generation`・`items_len`・`ListingMetaRequirements { duration, ai }`を持つ。
+  - 既存の登録 (構造体・初期化・swap・fork) の型と名前を揃え、所有の分類は変えない。
+  - fork 先は空、元 context が保持する。
+- 変えないもの: detached の述語・viewport の選択・配送・HWND・placement・bundle の所有と交換。
+
+**合意**
+
+- 独立設計レビュー (gpt-6.1-sol / xhigh、read-only) を 5 回受けた。
+  - r1〜r5 のすべてで「STRUCTURAL: AGREE」、r5 で「VERDICT: ACCEPT」。
+  - レビュー担当の言葉 (r1): 「キーから不要な facet を除く変更自体は、誤った失効条件の生成元を直す構造的修正であり、症状パッチではないことに同意します。」
+  - r3 では、証明を metadata cache と同じ context に置き、swap で移し、fork 先を空にする方針も、症状パッチに当たらないとした。
+- 統括 ClaudeCode も合意した (2026-11-21)。判断は「案 A は誤った失効条件と取得の持ち主の食い違いを根本で直すもの」。
+- 設計担当 ClaudeCode (worktree `range-filter-835`) も同意する。
+
+**参照**
+
+- 正本は [facet-projection-key-835-plan.md](facet-projection-key-835-plan.md)。
+- 段階2はkeyからfacetだけを除外し、段階3は既存details-meta ownerへ統合証明・要件snapshotを接続した。
+  要件の和・未証明条件の不適用・停止時の有効証明保持・AIメニューの停止保持を同じ契約とする。
+- 段階1の21本は設計担当の実行で緑5・赤16 (正本§10.1)。
+- 段階3の関連テストと lib 全件は、設計担当の実行で緑 (正本§10.3・§10.4)。lib 全件は 5498fd963 で 19418 本。
+- 独立実装レビュー (gpt-6.1-sol / xhigh): 1 回目は REVISE (P2 2 件・P3 1 件)。修正後の再レビューで「VERDICT: ACCEPT」「STRUCTURAL: AGREE」。
+  - 1 回目の言葉: 「registryの製品差分は型・名前の置換で、所有分類・detached述語・viewport／host／placement／bundle交換の変更はありません。」
+  - 再レビューの言葉: 「所有境界と既存機構に沿う構造的修正という判断も維持します。」
+- fork 先の証明が空であることは registry のテスト (`viewer_context_registry.rs:66`・`:111`) で検査する。
+- 実機動作は未確認 (サブ PC の確認を予定)。
+- 静的レビューのP2は設計担当が正本§4.2.2-10の追補として採用し、表示集合の拡大時に新たな行の
+  通常列を既存の予算付きAllRequirementsで補充する形へ実装した。全体proof・cache・停止状態を保持し、
+  追加のcontext状態・owner・UI全走査・I/Oや、detachedの述語・viewport経路の変更は加えない。
+- 収録版は v5.6.0 (利用者決定)。
+
 ### 2026-11-20: ページ内スクロールの拡張（§1.823〜§1.826）
 
 補間のbundle追加・swapと型付き着地の配送を追加した。**検証は未実施**。
