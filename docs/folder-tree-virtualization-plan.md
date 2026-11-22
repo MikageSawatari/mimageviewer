@@ -77,12 +77,20 @@ UI スレッドの CPU は 1 コアに対する割合。perf イベント `frame
 行の中身 (`draw_folder_pane_row`)、path 単位の `scope_id`、ヒット情報の記録、右クリック・
 非 primary の起動・D&D の行情報は、描画した行について今と同じ処理をする。
 
-- **行 pitch**: 今と同じく、前回描画で実測した pitch (`FolderPaneScrollMemory::pitch`) を使う。
-  記録が無い初回は `FOLDER_PANE_ROW_HEIGHT + item_spacing.y` を使う。行は `set_height(24)` で
-  24pt 以上になるのでこれは下限で、初回の見積もりが実際より小さくても描く行数が多めになるだけで
-  可視域に穴は空かない。実測 pitch が変わった次フレームから新しい pitch で配置する (今の
-  「pitch が変わったら現在地を再表示」もそのまま)。`request_discard` による同一フレームの
-  作り直しは使わない (§1.828 のパス番号に依存する入力の関門と組み合わせが増えるため)。
+- **行の高さをその pass の範囲計算の前に確定する** (Sol 設計レビュー P1-1): 前回の実測 pitch を配置に使うと、
+  pitch が変わった pass で自動スクロールの座標と行の位置がずれ、行の実高が小さくなった場合に下端まで描けない。
+  そこで、行の部品が要る高さを、描く前にその pass のフォントと spacing から求める
+  `folder_pane_row_height(ui) = max(FOLDER_PANE_ROW_HEIGHT, 矢印 (16pt strong の行高 + button_padding.y × 2),
+  名前の行高, spinner (interact_size.y), "!" の行高)`。`draw_folder_pane_row` はこの高さを受け取り、
+  `set_height` / `add_sized` / `allocate_exact_size` をすべてこの高さで行う。部品はこの高さに収まるように
+  求めてあるので、行の割り当ては全行 (loading / error を含む) で同じ高さになる。
+  `pitch = row_height + item_spacing.y` を、描画範囲・全体の高さ・reveal の矩形・保存する
+  `FolderPaneScrollMemory::pitch` のすべてに使う (1 つの値)。24pt に切り詰めることはしない。
+  描いた行の実高が `row_height` と違えば debug_assert で落とし、テストで固定する。
+  `request_discard` による同一フレームの作り直しは使わない (§1.828 のパス番号に依存する入力の関門と
+  組み合わせが増えるため)。
+- **内容の原点**: `show_rows` の callback の Ui は描画範囲の先頭行が原点になる。内容の原点を
+  `ui.max_rect().top() - range.start × pitch` とし、論理行 i の矩形は `原点 + i × pitch` から作る。
 - **全体の高さ** は `rows.len() * pitch - spacing` で、スクロールバーの長さと位置は今と同じになる。
 
 ### 4.2 現在地への自動スクロールを論理行の位置から
@@ -92,6 +100,27 @@ UI スレッドの CPU は 1 コアに対する割合。perf イベント `frame
 する (`scroll_to_me` も内部では同じ `scroll_to_rect(self.rect)`)。発火条件 (`Requested`・paths の変化・
 pitch の変化・`FollowingRefresh` の扱い・ポインタ操作で `Idle` に戻す) は今と同じ。`cursor_drawn` は
 「論理行に現在地がある」の意味になる (今も全行を回すので同じ意味)。
+
+### 4.2b 同じ pass で描画範囲の外へ出た行への AccessKit 要求 (Sol 設計レビュー P1-2)
+
+今は、行の非 primary の起動 (AccessKit の Click 要求、または egui の focus を持つ部品への Enter / Space) を、
+描画中の `resp.clicked() && !clicked_by(Primary) && !clicked_by(Secondary)` で受けている。仮想化すると、
+同じ pass のポインタ結果 (`take_label_results` の矢印など) で上の枝が開き、要求先の行が描画範囲の外へ
+押し出されたとき、その行の `Response` が作られず、要求が消える
+(既存 `folder_pane_label_pointer_arrow_preserves_other_row_accesskit_activation` の契約)。
+
+- 描画の前、`take_label_results` を適用した直後に、**前 pass の `label_display` (この pass の入力の関門が使う
+  ものと同じ) の label / arrow の ID → path** を使って、この pass の AccessKit の `Click` 要求を裁定する。
+  裁定の中身は今の描画中の分岐と同じ (label: ジェスチャの解除・ツリーへの focus・カーソル・起動、
+  arrow: 論理行で開閉できる行なら開閉)。`label_pointer_activation_owned` による重複の抑止、
+  `main_chrome_pointer_blocked` 系の条件、ポインタ結果 → AccessKit の適用順も今と同じにする。
+- 裁定した ID はこの pass の集合に入れ、描画中の分岐はその ID を飛ばす (二重に起動しない)。描画中の分岐は、
+  egui の focus を持つ描画中の行への Enter / Space (AccessKit の要求でない起動) のために残す。
+- `ScrollIntoView` の要求も同じく前 pass の ID → path で受け、論理行の index から §4.2 と同じ形で
+  スクロールする。egui の `Focus` 要求は描かれた部品にだけ効く (egui の仕様)。描画範囲の外へ出た行への
+  `Focus` は効かないが、ツリーの操作は egui の focus を使わないので、操作の結果は変わらない。
+- 前 pass の表示が無い・古い (入力の関門が `DisplayNotFresh` などで捨てる) ときは、その pass の
+  AccessKit 要求も描画中の分岐だけで受ける (今と同じ)。
 
 ### 4.3 データ側の全件処理 (計測で決める)
 
@@ -113,6 +142,9 @@ pitch の変化・`FollowingRefresh` の扱い・ポインタ操作で `Idle` �
 採らないもの: `visible_rows()` の結果をフレームをまたいで持つ (§6)、`sync_folder_pane_state` の 2 回呼びを
 1 回にまとめる (キー処理と描画の間で状態が変わり得るので、順序の検討が別に要る)。仮想化と上の 3 つの後に
 全件処理がまだ目立つ場合は、数字を付けて報告し、別の段階で扱う。
+仮想化後の計測には、定常状態に加えて「多数の枝を開いてから畳んだ状態 (論理行より cached node が多い。
+`has_pending()` は全 node を走査する)」と「走査の完了結果を採用するフレーム (`poll_pending` が
+`reconcile_demand` を追加で呼ぶ)」を入れる (Sol 設計レビュー P3-7)。
 
 
 ## 5. 仮想化しても変えない 5 つ
@@ -120,7 +152,7 @@ pitch の変化・`FollowingRefresh` の扱い・ポインタ操作で `Idle` �
 | 守るもの | 今の持ち主 | 仮想化後 |
 | --- | --- | --- |
 | §1.828 の入力の関門の順序 | `begin_folder_pane_label_input` (前パスの `label_display` を使う) → `take_label_results` → 描画 → `label_display` の公開 → `finish_folder_pane_presentation` | 順序と各段の条件は変えない。変わるのは `label_display.rows` に入る行が「描画した行」に限られることだけ。ポインタが当たり得るのは可視の行だけなので、ヒット判定の結果は同じ |
-| 単 / ダブルクリック・右クリック・D&D のヒット情報と path 単位の ID | 行ごとの `scope_id(("folder_pane_row", normalize_keep_drive(path)))`、`FolderPaneLabelWidgets`、`DropGeometry` (可視域と交わる行だけ採用済み) | 同じ ID・同じ矩形で記録する。描く行 ⊇ 可視域と交わる行 (§4.1 の範囲と pitch の下限) なので、D&D の行一覧は今と同じ |
+| 単 / ダブルクリック・右クリック・D&D のヒット情報と path 単位の ID | 行ごとの `scope_id(("folder_pane_row", normalize_keep_drive(path)))`、`FolderPaneLabelWidgets`、`DropGeometry` (可視域と交わる行だけ採用済み)、AccessKit の Click は描画中の `resp.clicked()` | 同じ ID・同じ矩形で記録する。描く行 ⊇ 可視域と交わる行 (§4.1 の範囲と全行同じ行高) なので、D&D の行一覧は今と同じ。AccessKit の Click / ScrollIntoView は前 pass の ID → path で描画前に裁定する (§4.2b)。貼り付けメニューは path と画面上の位置を自分で持つので、元の行が描かれなくても保たれる |
 | 現在地への自動スクロール | 行の `Response::scroll_to_me` | 論理行 index の矩形へ `scroll_to_rect` (§4.2)。画面外の現在地も表示できる |
 | キーボードで辿る全論理行 | `handle_tree_key` → `move_cursor` が `visible_rows()` (データ) を使う | 変えない (描画に依存しない) |
 | 折りたたみ前後の位置 | `FolderPaneScrollMemory::restore` (先頭行の path と行内の位置を、新しい一覧の index × pitch へ移す) | 変えない。全体の高さが行数 × pitch なので、restore の座標系も今と同じ |
@@ -136,13 +168,16 @@ pitch の変化・`FollowingRefresh` の扱い・ポインタ操作で `Idle` �
 
 ## 7. 変わること・退行の確認
 
-- 画面外の行は AccessKit のツリーに出なくなる (仮想化した一覧として通常の形)。§2.2 の停止を解消する中心の
-  効果でもある。mIV のツリー操作は独自のカーソル (`handle_tree_key`) で、AccessKit のノードには依存しない。
-  スクリーンリーダーで画面外の行を読み上げ順に辿る使い方は、可視の範囲だけになる。
-- Tab で egui のフォーカスを行の部品へ移したまま、その行を画面外へスクロールすると、egui の
-  フォーカスが外れる (描かれなかった部品のフォーカスは egui が外す)。ツリーの通常操作では
-  egui のフォーカスを使わない。
+- 画面外の行は AccessKit のツリーに出なくなる。§2.2 の停止を解消する中心の効果でもある。
+  mIV のツリー操作は独自のカーソル (`handle_tree_key`) で、AccessKit のノードには依存しない。
+  **スクリーンリーダー等で画面外の行を読み上げ順に辿る使い方は、可視の範囲だけになる。これは既存の挙動の
+  縮小なので、利用者の判断を得る (Sol 設計レビュー P1-3、統括経由で照会中)。** 全行のノードを残す案は、
+  4 万ノードの受け渡しによる数十秒の停止と毎フレーム約 18 ms をそのまま残す。
+- 本番では Tab による egui の focus 移動を無効にしている (`src/egui_focus_policy.rs`)。AccessKit の `Focus`
+  要求などで行の部品が egui の focus を得たまま、その行が描画範囲の外へ出ると、egui は focus を外す
+  (描かれなかった部品の focus は egui が外す)。ツリーの操作は egui の focus を使わないので、操作の結果は変わらない。
 - 上の 2 点以外に、通常の操作が遅くなる・できなくなる変更は無い見込み。
+- 細かな違い: ツールチップは描いた行にだけ付く (ポインタが当たるのは可視の行だけなので、見え方は同じ)。
 
 ## 8. detached・複数ウィンドウ
 
@@ -171,7 +206,20 @@ detached の述語・viewport の選択や配送には触れない。
    が、その行の path で結果を出すこと。D&D の行一覧 (`main_drop_geometry`) が可視行と一致すること。
 7. **データ側の同値性**: 隠しフォルダが `membership` にだけある場合に、`reveal_active` が今と同じ所で止まること。
    大文字小文字・区切り文字の違う現在地・カーソルでも、`is_active` / `is_cursor` が今と同じになること。
-8. 既存の §1.828 の入力の関門・ツリーのテスト一式 (`folder_pane`、`ui_folder_pane`、`folder_pane_refresh_tests` 系、
+8. **行の高さ** (P1-1): 24pt を超える行の実高、loading / error 行を含めて全行の割り当てが `row_height` と一致すること。
+   pitch の増減 (`pixels_per_point` やフォントの変更) の前後で、描画範囲が表示域を覆い、現在地の reveal が
+   新しい座標で中央に来ること。末尾の半端なページ、表示高ゼロ・1 行未満でも panic せず描くこと。
+   paths と pitch が同時に変わる pass の restore / reveal。
+9. **同じ pass で範囲外へ出た行への AccessKit 要求** (P1-2): 前 pass で見えていた行 B への `Click` と、その上の
+   枝 A を開くポインタ入力 (子を大量に挿入して B を描画範囲の外へ押し出す) を同じ pass に入れても、B が起動
+   されること。B が描かれる場合に二重に起動しないこと。`ScrollIntoView` も同じ形で効くこと。
+10. **自動スクロールと手の入力の取り合い**: `FollowingRefresh` 中に、ツリーの内側 / 外側でのホイール、慣性の
+    停止 (今の `Idle` への戻し条件) が今と同じになること。ゲームパッドの上下で可視の境界を越えると reveal すること
+    (`handle_tree_key` 共通)。
+11. **貼り付けメニュー**: メニューを開いた元の行がスクロールで描かれなくなっても、メニューが同じ path と位置で
+    残り、貼り付け先がその path になること。
+12. テストは本番の focus policy (`egui_focus_policy`) を入れた Context で行う (P3-8)。
+13. 既存の §1.828 の入力の関門・ツリーのテスト一式 (`folder_pane`、`ui_folder_pane`、`folder_pane_refresh_tests` 系、
    `ui_folder_pane_drop_tests`、`main_chrome` の r6 系) が通ること。画面外の行の矩形や AccessKit ノードを直接見て
    いるテストは、可視の行を見る形に直す (検査の意味は変えない)。
 
@@ -186,6 +234,17 @@ update の外の区間を測るために、perf ログが有効なときだけ�
 記録する区間は、egui の pass、platform output (accesskit の受け渡し)、tessellate、GPU の textures / buffers / acquire /
 encode / submit / release / present、イベント待ち。数は accesskit のノード、shape、mesh、頂点、index、texture delta。
 perf ログが無効なら記録しない。
+
+区間の意味 (Sol 設計レビュー P2-4・P2-5・P3-6 で直した):
+- `run_ui_ms` は `integration.update` 全体 (この operation のすべての egui pass、retry、App の logic と UI を含む)。
+  App の時間を引いた「egui だけ」の値は出さない (pass の数と App の区間が対応しないため)。
+- `paint_ms` は tessellate の後から post_rendering まで。GPU の各段 (`gpu_*`) はその内訳で、足し合わせる
+  独立の項目ではない。どれも CPU 側の経過時間。
+- `between_root_ops_ms` は前の ROOT operation の終わりから今の operation の入口まで。イベント待ちのほかに、
+  ほかの viewport の処理や logic だけの pass を含む。
+- painter は、eframe が始めた ROOT operation の中でだけ記録する (`begin_root_pass` 〜 `finish_root_pass`)。
+  別のフレームの記録を取り込まない。paint しなかった operation は `gpu_painted=false`。
+- perf ログが無効なら、有効フラグを読むだけで時計を読まない。
 
 **提案**: この計装は製品に残す。利用者の perf ログにも、update の外の内訳が出るようになる。
 計測専用の切り替え (`MIV_TREE827_NO_ACCESSKIT`) と headless の計測テストは master に入れない。
