@@ -5,7 +5,9 @@
 //! Services never consume UI events; input/render and presentation ACKs stay
 //! with their viewport. See docs/egui-0.37-stage1b-verification.md for ownership
 //! and the future logic/ui connections. No scheduling or mount owner is added.
+use super::folder_pane_reclick::FolderPaneReclickRejection;
 use super::*;
+use crate::folder_pane::FolderPaneActivation;
 
 /// Navigation values captured during this root UI pass; never retained by App.
 #[cfg_attr(test, derive(Default))]
@@ -19,7 +21,7 @@ pub(super) struct MainFrameNavigation {
     pub(super) address_nav: Option<crate::ui_main::AddressBarNav>,
     pub(super) open_folder_nav: Option<PathBuf>,
     pub(super) context_nav: Option<crate::ui_dialogs::context_menu::ContextMenuAction>,
-    pub(super) folder_pane_nav: Option<PathBuf>,
+    pub(super) folder_pane_nav: Option<FolderPaneActivation>,
     pub(super) grid_nav: Option<crate::ui_main::AddressBarNav>,
 }
 
@@ -1215,7 +1217,7 @@ impl App {
             || address_nav.is_some()
             || open_folder_nav.is_some()
             || context_nav.is_some()
-            || folder_pane_nav.is_some()
+            || matches!(&folder_pane_nav, Some(FolderPaneActivation::Open(_)))
             || grid_nav.is_some()
         {
             self.cancel_saved_group_open_for_other_nav();
@@ -1245,15 +1247,16 @@ impl App {
             || address_nav.is_some()
             || open_folder_nav.is_some()
             || context_nav.is_some();
-        // Every other admitted navigation keeps its existing priority. Closing
-        // with F/Y contributes a candidate only when none of them owns this pass.
-        let folder_pane_nav = folder_pane_nav.or_else(|| {
-            if !higher_priority_than_folder_pane && grid_nav.is_none() {
-                close_cursor_nav
-            } else {
-                None
-            }
-        });
+        // Remember admission before poll removes a pending move, including one
+        // which fails/cancels here. A same-location refresh is replaceable both
+        // while pending and after it becomes the local ready value below.
+        let reclick_before_poll = match &folder_pane_nav {
+            Some(FolderPaneActivation::RefreshActive(path)) => Some((
+                std::time::Instant::now(),
+                self.folder_pane_reclick_admission(path, None),
+            )),
+            _ => None,
+        };
         if higher_priority_than_folder_pane {
             self.cancel_folder_pane_open(PaneOpenRestoreExit::Abandoned);
         }
@@ -1263,6 +1266,50 @@ impl App {
         } else {
             self.poll_folder_pane_open(ctx)
         };
+
+        let folder_pane_nav = match folder_pane_nav {
+            Some(FolderPaneActivation::RefreshActive(path)) => {
+                let (started, before_poll) =
+                    reclick_before_poll.expect("refresh admission snapshot");
+                let result = if higher_priority_than_folder_pane {
+                    Err(FolderPaneReclickRejection::HigherPriorityNavigation)
+                } else if grid_nav.is_some() {
+                    Err(FolderPaneReclickRejection::GridNavigation)
+                } else if close_cursor_nav.is_some() {
+                    Err(FolderPaneReclickRejection::CloseCursorNavigation)
+                } else {
+                    before_poll
+                        .and_then(|()| {
+                            self.folder_pane_reclick_admission(
+                                &path,
+                                folder_pane_open_ready.as_ref(),
+                            )
+                        })
+                        .and_then(|()| self.start_folder_pane_reclick_refresh(&path))
+                };
+                self.trace_folder_pane_reclick(&path, result, started);
+                if result.is_ok() {
+                    if let Some(mut ready) = folder_pane_open_ready.take() {
+                        ready.finish_diagnostic("ready_replaced");
+                    }
+                    // This activation owns the pane's slot only after successful
+                    // admission. No refused activation may mask a ready or close.
+                    Some(FolderPaneActivation::RefreshActive(path))
+                } else {
+                    None
+                }
+            }
+            other => other,
+        };
+        // Rejected reclicks behave exactly like no activation. Preserve the
+        // existing close composition and Open > grid navigation priority.
+        let folder_pane_nav = folder_pane_nav.or_else(|| {
+            if !higher_priority_than_folder_pane && grid_nav.is_none() {
+                close_cursor_nav.map(FolderPaneActivation::Open)
+            } else {
+                None
+            }
+        });
 
         if folder_nav_wins {
             // folder_nav 勝利: モードに応じて load_folder / close+load+open_fullscreen /
@@ -1523,12 +1570,14 @@ impl App {
                             | crate::ui_main::AddressBarNav::SavedGroupReady(_) => None,
                         }),
                 }
-            } else if let Some(p) = folder_pane_nav {
+            } else if let Some(activation) = folder_pane_nav {
                 // フォルダツリーペインのクリック/Enter ナビは worker で scan_directory を
                 // 済ませてから開く (UI スレッドの read_dir が大/遅/ネットワークフォルダで
                 // 固まるのを防ぐ)。同期 load はせず、完了後に通常 nav 優先順位で裁定する。
                 // 対象は実ディレクトリ前提。
-                self.replace_ready_folder_pane_open(p, folder_pane_open_ready.take());
+                if let FolderPaneActivation::Open(path) = activation {
+                    self.replace_ready_folder_pane_open(path, folder_pane_open_ready.take());
+                }
                 None
             } else if let Some(ready) = folder_pane_open_ready.take() {
                 // Main resolution admits candidates before handing their accepted scan back.
@@ -2295,7 +2344,7 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         pre_grid_perf: &mut Option<PreGridPerfRecorder>,
-    ) -> (Option<PathBuf>, Option<egui::Rect>) {
+    ) -> (Option<FolderPaneActivation>, Option<egui::Rect>) {
         // ── 検索バー ─────────────────────────────────────────────────
         self.render_search_bar(ui);
         mark_pre_grid_perf(pre_grid_perf, PreGridPerfStage::SearchBar);

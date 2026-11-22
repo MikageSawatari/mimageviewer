@@ -890,3 +890,116 @@ focused の指定順は `src/ui_folder_pane.rs`、`src/app/folder_pane_refresh_t
 | 引数なし `cargo fmt`、`cargo fmt --check`、`git diff --check` | **各exit0** | `tree-click-p2-fmt.log` / `tree-click-p2-fmt-check.log`、終了時diff検査 |
 
 検証済み Rust 2ファイルの SHA-256 は `target/tree-click-p2-source-hashes.json` に保存し、検証後に同一であることを確認した。新規3件はすべて修正前失敗→修正後成功。本体lib全件・`build-dev.ps1`・`ui_snapshot`・製品起動・コミットは指定により実施せず、backlog は変更していない。独立再レビュー・全体検証と最終受入は設計担当へ引き継ぐ。
+
+## 14. §1.828 現在地のフォルダ名を再クリックして一覧とツリーを更新する (2026-11-21 設計、ClaudeCode)
+
+5ch >>838 の要望 (backlog §1.828)。エクスプローラー等で中身を変えた後に、左ツリーで今開いているフォルダの名前をもう一度クリックして、一覧とツリーを更新したい。v5.6.0 に入れる (利用者決定 2026-11-21)。r3 は設計レビュー r1 (REVISE、P2 4 件)・r2 (REVISE、P2 3 件・P3 2 件) を反映した版 (14.6)。
+
+現状 (master `b5eff67e4`): `src/ui_folder_pane.rs::render_folder_pane_tree_with` の `FolderPaneLabelResult::Single` は、行が `folder_pane.active_path()` と同じなら移動を出さず、focus と cursor だけを更新する (名前部品の非ポインタ活性化も同じ)。一覧の明示更新は `src/app/top_level_grid_view.rs::reload_top_level_grid` (GridReload) と、ツールバーの ⟳ (`src/ui_main.rs::reload_from_sort_control`。再生時間の並びでは `apply_sort_change_reload_without_ui_io`、それ以外は `reload_top_level_grid`)。`reload_top_level_grid` はツリー表示中なら破壊的な `reload_for_active` も呼ぶ (再生時間の並びの ⟳ は呼ばない)。
+
+### 14.1 何を更新とするか
+
+- **対象**: §12.5 の持ち主が確定した名前の 1 回クリック (`FolderPaneLabelResult::Single`。マウス・タッチのタップ) と、名前部品の非ポインタ活性化 (キーボード・AccessKit) のうち、行が `active_path()` と同じもの。▶ / ▼ (`Arrow`)・ダブルクリックの開閉 (`Toggle`)・ツリーのキー (↑↓←→・Enter) は対象外で、今と同じ。
+- **受け付ける条件 (裁定の時点で判定。満たさなければ今と同じく focus と cursor だけ)**:
+  1. メイン一覧が、そのパスの実フォルダを通常の一覧として表示している。既存の `App::is_physical_folder_listing()` (detached physical・ZIP 内・PDF 内・surface が Folder 以外を除外し、通常フォルダ scan が現フォルダへ公開した marker を要求する) が真、`current_folder` が行のパスと同一 (`folder_tree::path_eq`)、`archive_source_override` なし、抽出 surface なし。ZIP / PDF の表示中はツリーの現在地が親の実フォルダになる (§1.694) が、親フォルダの再クリックを「その ZIP の更新」にも「親フォルダを開く」にもしない。検索結果・タグ・★・履歴・しおり・コレクション・スマートフォルダ・初回の読み込み中 (marker がまだ前のフォルダ) も対象外。
+  2. **main 所有の読書・投影がない**: main の読書とその再開待ち (全画面、F12 の linked 窓が main の一覧を読んでいる間、全画面の開き直し待ちなど)、ファイル名スタックのフラット投影 (`stack_showing_flat`)、スタックの切替の準備中 (`StackPreparePending`、集約へ戻る準備を含む) は更新しない。一覧の更新は viewer の終了境界を通り、読書窓を閉じ得るため (r1 P2-4)。読書の判定は `projected_viewer_session_open_for(SourceSwapOwnership::MountedContext)` を土台にする (引数なしの版は共有の source-swap を数え、兄弟の独立窓だけでも真になるので使わない。r2 P3-5)。兄弟の独立窓が開いているだけなら対象に含める。ファイル名スタックの集約表示 (通常の一覧) は対象に含める。EPUB の一括変換中 (`epub_batch_convert`) は更新しない (一括変換の完了専用の例外は新しい入口へ移さない)。detached の述語は読むだけで、変更しない (CLAUDE.md の detached リワーク中のルール)。
+  3. **保留中の移動がない**: main の別の場所への移動が保留中なら更新しない (履歴の physical / collection transition、open path の分類、ペインの移動 `folder_pane_open_pending` の main 側、`folder_nav_pending` (DFS・兄弟移動)、評価一覧の移動、スマートフォルダの切替、しおりを開く途中、起動時のパス解決、アーカイブ変換など。実装は既存の判定 (`location_navigation_pending`・`saved_group_other_main_nav_pending` など) を読み、owner を列挙して 1 つの関数にまとめる)。更新の要求は同じ owner の transition を置き換えるので、保留中の移動を消してしまうため (r1 P2-2)。**例外: 保留中のものが同じフォルダの同一場所の更新 (前の再クリック・⟳ など) なら、置き換えてよい** (後から外部で変えた中身を拾うため)。判別は owner ごとに既存の field で行う (r2 P3-4)。physical の transition は、同じ `path`・`navigation.history` が `SameLocation`・`restore_intent` が通常の RefreshList・`intent` が `Navigation { replay: None, auto_fullscreen: false }`・`dfs_continuation` なし、をすべて満たすものだけを更新とみなす (path と SameLocation だけでは、同じ場所への明示の入場と区別できない)。再生時間の並びの ⟳ は `FolderOpenScanPurpose::CurrentViewOrderRefresh` の `path`・`reload_owner`・`navigation`、分類中は `OpenPathClassification` の `continuation` と `navigation` で見る。置き換えてよい更新が 1 件あっても、別の owner の移動が保留中なら更新しない。
+  4. **裁定の時点でモーダルがない**: `!main_chrome_pointer_blocked()` を、要求の作成・古い要求の退役より前に確かめる (r2 P2-2)。ツリーの描画の後・裁定の前に Delete の処理があり、同じ pass で削除の確認が始まり得る。新しい入口 (`start_physical_history_transition_classified_at_stage`) 自体は共通モーダルを見ない。
+- **一覧の更新 (r1 P2-1・P2-3)**: すべての並びで、`current_list_refresh_intent()` (RefreshList、カーソルと表示位置の anchor) を運ぶ worker の更新に一本化する。既存の `reload_current_physical_list_with_intent` の mtime 有りの分岐と同じく、`physical_open_intent` / `capture_physical_open_navigation` で作った要求を `start_physical_history_transition_classified_at_stage(.., Some(OpenPathKind::Directory), restore_intent, navigation, .., MainListRequestStage::Admission)` へ渡す (physical preflight の worker が走査し、再生時間の情報も集める)。`current_folder_last_mtime` には依存しない。同期の `load_folder_or_convert_archive_with_auto_fullscreen_owned` (UI スレッドの `scan_directory_with_settings`) へは落とさない。要求を作れなければ更新しない (ログのみ)。⟳・GridReload の経路と `reload_top_level_grid` は変更しない。
+  - **集約スタックの一覧での復元は、既存の再読み込みと同じ制約のまま** (r2 P2-3): 集約表示では、カーソルの名前がグループのキーで、仮の実ファイル一覧の復元で消費され、最終の集約へは `InternalInstall` で届く。選択より前に新しいグループが増えると、番号での復元になり得る。これは GridReload・⟳ にも今ある制約で、この項目では直さない (直すには、グループ / メンバーの復元情報と anchor を要求の所有物として最終の集約の採用まで運ぶ変更が要る。別の backlog 項目として統括へ報告する)。14.5 の「選択と表示位置が保たれる」は集約でない通常の一覧についての受入条件とし、集約スタックでは「GridReload と同じ結果になる」ことを確かめる。
+- **ツリーの更新**: ↻ と GridReload が使う破壊的な `reload_for_active` は使わない。`FolderPaneState` に「現在の需要集合 (§5.1、選択 root と表示中の展開親) の各 node へ既存の `request_recheck` をかける」処理 (例: `recheck_displayed`) を足す。`Running` は `FollowUp::Recheck` に合流、`Queued` はそのまま、ほかは `Queued` になる (§5 の既存 typed state。新しい状態は足さない)。走査は既存の `folder-pane-scan` worker、結果の採用・消えた子孫の整理・cursor と scroll の修復は §5.2・§7 の既存の受理境界が行う。label の表示表・ジェスチャ・展開集合・cursor・scroll には触れない (`invalidate_label_display` / `clear_label_click` を呼ばない)。一覧の更新を受け付けたときだけ呼ぶ。
+  - 破壊的な reload を使わない理由: (1) `invalidate_label_display` → `clear_label_click` がジェスチャを消し、現在行のダブルクリックによる開閉 (§1.769) を壊す。(2) 現在行の 1 回クリックは ↻ より気軽で回数も多い。押すたびに手で開いた枝が閉じ、cursor と scroll が現在地へ戻るのは不便。全部を作り直したいときは ↻ が残っている。(3) 非破壊の再照合は既知の行を残したまま取り直すので、走査中に行が消えて並びが動かない。
+
+### 14.2 ダブルクリック・連打との共存
+
+- §12.5 の持ち主はそのまま使う。同じジェスチャの 1 回目だけが `Single` になり、2 回目以降は `Toggle` か何も出さない。現在行のダブルクリック = 更新 1 回 + 開閉 1 回 + 移動なし。トリプルクリックも更新 1 回 + 開閉 1 回。ツリーの更新はジェスチャを消さないので、2 回目の押下を続きとして受け取れる。1 回目の更新でサイドカー復元が始まった場合は、§12.5 の「続きを受け取ってよい条件」が既に扱っている (復元中も続きの開閉だけは受け付ける)。
+- egui と持ち主がジェスチャの続きと認めない再クリック (間隔が `max_double_click_delay` を超える、位置が 6pt を超える) は、そのつど新しい `Single` で、更新も 1 回ずつ出る。前の更新がまだ保留中なら、14.1 の 3 の例外で同一場所の更新どうしとして置き換える。古い結果が新しい一覧へ混ざらないことは、既存の一覧要求の所有 (要求の置き換えと受理の照合) に任せ、テストで確かめる。ツリー側は §5 の `FollowUp` の合流で、同じ親の worker を重ねて起こさない。
+- タッチのタップは名前なら `Single` なので、現在行のタップも更新 1 回。ダブルタップで開閉しないのは今と同じ。
+
+### 14.3 適用する場所とタイミング (r1 P2-2)
+
+- `Single` (と非ポインタ活性化) の適用点で、現在地と同じなら移動の代わりに「現在地の更新要求」を作る。`render_folder_pane_tree` / `render_folder_pane` の戻り値の `Option<PathBuf>` を、移動と更新を排他に表す typed な 1 つの値 (例: `FolderPaneActivation::{Open(PathBuf), RefreshActive(PathBuf)}`) にする。同じ pass で最後の名前の活性化が勝つ今の規則 (現在地を選んだ活性化が先の移動候補も打ち消す) を、そのまま 1 つの値の上書きで表す。`Option` を 2 つ並べない。
+- この値を `MainFrameNavigation::folder_pane_nav` の位置のまま、`src/app/update_phases.rs` の既存の移動の裁定へ渡す。`Open` の扱い (`replace_ready_folder_pane_open` など) は今のまま。`RefreshActive` は、その pass の移動候補 (`higher_priority_than_folder_pane` に入るもの、`folder_nav_wins`、`grid_nav`、F / Y で閉じるときのカーソルへの移動 `close_cursor_nav`) がどれか 1 つでもあれば捨てる (`close_cursor_nav` は実装レビュー r1 P2 で追加。同じ pass に「現在行 A の名前の Single → 別の行 B の ▶ / ▼ のクリック」と F / Y の閉じる要求が届くと、カーソルは B へ動いて閉じるときの移動先は B になる。実装前は現在行の Single が候補を作らないので B へ移動していた。更新を先に受け付けると、この移動が消える)。**`grid_nav` に負けるのは `RefreshActive` だけ**で、`Open` が `grid_nav` より先という今の順序は変えない (r2 P3-5)。
+- **受付の判定は、移動の候補を先に確定してから行う (r2 P2-1)**。裁定は `RefreshActive` の分岐より前に `poll_folder_pane_open` を呼び、完了した移動を pending から取り出してローカルの ready (`folder_pane_open_ready`) へ移す。受付条件 3 は「poll の前に保留中だった要求」と「この pass のローカルの ready」の両方を移動として数える。移動があれば `RefreshActive` を候補から取り除き、何も無かった pass と同じ流れで既存の ready の適用へ進める (`RefreshActive` の分岐で処理を終えて ready を捨てない)。受付条件を満たさず捨てた `RefreshActive` は、後続の候補 (`close_cursor_nav` の合成、ready の適用、`grid_nav`) を遮らない。高優先度の実際の移動による既存の `cancel_folder_pane_open(Abandoned)` は今のまま。`RefreshActive` 自身はペインの保留中の移動を取り消さない。
+- 勝ち残った `RefreshActive` に 14.1 の受付条件 (1〜4) を確かめ、満たせば一覧の更新とツリーの再照合を行う。
+- ★固定・モーダル・`main_chrome_pointer_blocked` は `Single` の適用点でも確かめる (今のまま)。更新の開始が後段の裁定へ移るので、裁定でも受付条件 4 で確かめ直す。
+
+### 14.4 状態の組み合わせを減らす検討 (CLAUDE.md「設計の簡素化」)
+
+- **採用**: 新しい状態・pending・世代・タイマーを持たない。一覧は既存の physical の更新要求 (worker の走査と RefreshList の復元)、ツリーは既存の再照合 (§5 の typed scan state と `FollowUp`)、クリックの判定は §12.5 の `Single`、裁定は既存の移動の優先順位をそのまま使う。保留中の移動・読書・投影・モーダルの間は受け付けないことで、「更新と移動の競合」「更新で読書窓が閉じる」組み合わせを作らない。
+- **不採用**: (a) 同じパスの移動を出し直す: 移動の受理・履歴・同一場所判定を通り、意味が「開く」になる (backlog の指示)。読み込み中なら pending の取消とやり直しも起きる。(b) ↻ と同じ `reload_for_active`: ダブルクリックを壊し、展開を失う。(c) ダブルクリックの判定を待ってから更新する: 状態が増え、更新が 0.3 秒遅れる。(d) 更新中の再クリックを捨てる: 1 回目の更新が始まった後に外部で変えた中身を拾えない。同一場所の更新どうしは置き換える。(e) 更新中をモーダルにする: 通常の再読み込みは既存どおり非モーダルで、ここだけ変える理由がない。(f) Enter でも更新する: キー操作の意味を変える。キーでの更新には既存の GridReload がある。(g) ⟳ と同じ関数を呼ぶ (r1 の前の案): mtime が無いと UI スレッドで走査し、再生時間の並びでは RefreshList の復元にならず、保留中の移動も置き換える。
+- まれな失敗は既定の割り切り方針による (一覧の更新とツリーの走査の既存の失敗表示のまま。書き込み・永続化はない)。
+
+### 14.5 確かめること (§12.3 の handler-level test の形)
+
+1. 現在行の 1 回クリック: 一覧の同一場所の更新が worker で 1 回始まり (履歴は増えない、UI スレッドで走査しない。mtime が無い状態でも worker)、ツリーの需要 node が再確認になる。展開集合・cursor・scroll・ジェスチャは変わらない。外部で足したファイルとサブフォルダ、消したサブフォルダが、worker の完了後に一覧とツリーへ反映される。集約でない通常の一覧では、RefreshList の復元で、選択より前に項目が増減しても選択と表示位置が保たれる (名前の並びと再生時間の並びの両方)。集約スタックの一覧では、GridReload と同じ結果になる (14.1 の制約)。
+2. 現在行のダブルクリック: 更新 1 回・開閉 1 回・移動なし。トリプルクリック: 更新 1 回・開閉 1 回。**再クリックの更新から実際のサイドカー復元が始まる fixture** でも、ダブル / トリプルクリックが同じ結果になる。
+3. 間隔が delay を超える 2 回の再クリック: 2 回目が保留中の 1 回目を置き換え、最後の結果だけが採用される。
+4. 更新中に別の行 B をクリック: B への移動が通常どおり進み、A の更新結果は B の一覧に採用されない。ツリーは新しい需要に従う。
+5. 保留中の移動 (B への履歴移動・ペインの移動・DFS 移動など) の間に A を再クリック: 更新しない。B への移動は消えない。**B へのペインの移動の完了 (ready) と A の再クリックが同じ pass に届いた場合**も、B の ready が適用される。同じ場所への明示の入場 (更新ではない SameLocation の要求) が保留中のときも置き換えない。
+6. 受付外: 検索結果・タグ・★一覧・ZIP / PDF 内の一覧 (ツリーの現在地は親フォルダ)・初回の読み込み中・main の全画面・F12 の linked 窓・フラット投影とスタックの切替の準備中・EPUB の一括変換中・★固定・モーダル中は更新しない (今の挙動)。**現在行の `Single` と Delete (削除の確認の開始) が同じ pass に届いた場合**も更新しない。集約スタックの一覧と、独立窓が開いているだけの場合は更新する。
+7. 同じ pass の移動候補 (優先度の高い候補・`grid_nav`) と重なったら、更新は捨てられ、その移動が進む。`Open` と `grid_nav` の順序は今のまま。
+8. ▶ / ▼・← → キー・Enter・現在地以外の行のクリック: 今と同じ (更新しない、移動は今のまま)。
+9. 現在地のフォルダが外部で消えている: 一覧は既存の失敗の扱い、ツリーは既存の不在の整理。
+10. タッチのタップの現在行: 更新 1 回、ダブルタップで開閉しない。
+11. GridReload・⟳ (名前の並び・再生時間の並び) の挙動は今のまま (退行がない)。
+
+UI 文言とキー操作の追加はない (マウスの固定操作の意味を足すだけなので、`docs/keymap-spec.md` のフォルダツリーペインのマウス行と `docs/spec.md` を更新する)。
+
+### 14.6 設計レビューの記録
+
+- r1 (2026-11-21、gpt-6.1-sol / xhigh / read-only、`cd44d2ec5`): **REVISE、P2 4 件**。§12.5 の持ち主と需要集合全体の非破壊の再照合には構造上の問題なし。設計担当がコードで確かめて 4 件とも採用し、本節を r2 に改めた。
+  1. ⟳ の `reload_current_physical_list` は mtime が無いと UI スレッドの同期読み込みへ落ちる (`current_folder_last_mtime` は metadata の失敗で None になり得る) → 14.1 の一覧の更新を、mtime に依存しない worker の更新に一本化。
+  2. 更新の要求は同じ owner の保留中の transition を置き換え、B への移動を消す → 裁定へ渡し、保留中の移動を優先 (14.1 の 3、14.3)。同一場所の更新どうしは置き換え可。
+  3. 再生時間の並びの ⟳ は RefreshList の anchor 復元を通らず、ツリーも Reset しない → 全ての並びで RefreshList の worker 更新に一本化。`reload_top_level_grid` にツリーの引数を足さない。14.5 の 11 を訂正。
+  4. `is_physical_folder_listing` は main の読書・フラット投影を見ず、F12 の linked 窓で読書窓を閉じ得る → 14.1 の 2 を追加。
+- r2 (2026-11-21、同じ担当、`2ba7d2119`): **REVISE、P2 3 件・P3 2 件**。r1 の P2-1・P2-3・P2-4 は解消。設計担当が 5 件とも採用し、r3 に改めた。
+  1. P2: 裁定は先に `poll_folder_pane_open` で完了した移動を ready へ移すので、受付条件 3 から「保留なし」に見え、`RefreshActive` の分岐で ready を失う → 14.3 に、ready も移動として数え、捨てた更新が後続を遮らない順序を追加。
+  2. P2: 更新の開始が裁定へ移ったので、描画後の Delete が始めたモーダルを見落とす → 受付条件 4。
+  3. P2: 集約スタックでは RefreshList の選択・anchor が最終の集約へ届かない (既存の再読み込みにもある制約) → この項目では直さず、受入条件を「GridReload と同じ」に改め、別項目として報告する (14.1)。
+  4. P3: 置き換えてよい更新の判別の field を具体化 (受付条件 3)。
+  5. P3: 読書の判定の土台 (`MountedContext`)・スタックの切替の準備中・EPUB の一括変換中、`grid_nav` に負けるのは `RefreshActive` だけ (受付条件 2、14.3)。
+- r3 (2026-11-21、同じ担当、`1b7fd33e3`): **ACCEPT**。r2 の 5 件は閉じ、新たな P1 / P2 なし。集約スタックの割り切りも妥当。実装時の確認点 (P3): (1) 型を変えるとき、未受付・拒否された `RefreshActive` が、今の `folder_pane_nav.is_some()` による別要求の取消 (`cancel_saved_group_open_for_other_nav` など) を起こさないこと。pending から ready へ移った後も同一場所の更新の例外を適用し、「前の更新の ready は置き換え可、B への移動の ready は継続」を対照テストにする。(2) スタックの準備中の判定を `open_pending()` だけにしない (フラット読書への移行しか数えない)。切替と集約への復帰の準備中は拒否し、準備が終わった集約一覧は受け付ける。
+
+- 実装レビュー r1 (2026-11-21、同じ担当、`32e763288`、関連テスト 272 件成功の結果を再利用): **REVISE、P2 1 件・P3 2 件**。B→現在地 A の期待の変更・再クリックがあった pass だけの受付判定・受付 / 拒否のログ・非破壊の再照合・同期の load へ落ちないこと・detached の述語と viewport を変えていないことは妥当。設計担当が 3 件とも採用した。
+  1. P2: 受け付けた `RefreshActive` が、同じ pass の F / Y の閉じるときの移動 (`close_cursor_nav`) を消す → `close_cursor_nav` も移動候補として優先し、worker を起こす前に更新を捨てる (14.3 に追記、回帰テストを追加)。
+  2. P3: 「ready になった古い更新を置き換える」テストが、本番の順序 (入力の前に history transition を poll する) を通っていない → 裁定だけの検査と、本番の順序の検査 (入力の前に poll し、再クリックの後の最終結果・選択・履歴を確かめる) に分ける。
+  3. P3: マニュアルの「一覧の選択と表示位置はそのまま残ります」が、集約スタックの既存の制約 (14.1) より強い → 「最新の情報に更新」と同じ引き継ぎ方、という書き方に改める。
+  - 対応後の関連テスト (folder_pane・direct_navigation_worker_scan・main_chrome・ui_folder_pane の lib 294 件、ui_snapshot の folder_pane 4 件) は全件成功。本番の順序の検査は初回 293/294 で、2 回目の再クリックが受け付けられなかった。計装で調べた結果は、受付の判定は成功、押下の当たり判定 (前の frame の widget) が空だった。直前の frame がサイドカー復元の終わる前に描かれ、名前の部品が操作を受け付けない描き方だったため。テストが「復元の終わった直後、まだ再描画していない frame」に移動と押下を同時に送っていたのが原因で、製品の受付や更新の経路の問題ではない。復元の後に通常の frame を 1 枚描いてから押すようにテストを直した。
+- 実装レビュー r2 (2026-11-22、同じ担当、`e101f323c`、関連テスト lib 294 件・snapshot 4 件の成功結果を再利用): **ACCEPT**、追加の P1 / P2 / P3 なし。テストに通常の frame を足した判断は、復元の完了時に再描画を要求する製品の挙動 (`src/app/sidecar_restore.rs`) を再現するもので、製品の問題を隠すものではない、との判断。
+
+### 14.7 実装中に戻された設計判断 (2026-11-21、ClaudeCode)
+
+上の実装記録の停止理由 2 件は、設計担当がコードで確かめた (`src/app/collection_navigation.rs` の `start_physical_history_preflight`、`src/app.rs` の `pdf_open_direction_policy` と `PhysicalHistoryIntent`)。次のとおり決めた。
+
+1. **共通 preflight の入口にある `spread.db` の読み取りは、この項目では変えない。** 「文書の読む向きに従う」設定 (`follow_document_reading_direction`、既定 OFF) が ON のとき、worker を起こす前に、開いている `spread.db` へ SELECT が 3 回走る。これは physical の transition すべて (通常フォルダの ⟳・GridReload、履歴の戻る / 進むなど) が今も通っている既存の費用で、再クリックだけの新しい I/O ではない。ディレクトリの走査 (`read_dir`・分類・再生時間の情報) は worker で行う。14.1 の「UI スレッドで走査しない」は「ディレクトリの走査をしない、同期の `load_folder_*` へ落とさない」の意味に改める。フォルダには要らない読み取りを worker へ移す変更は、共通 preflight の全利用者に関わるので別の backlog 項目の候補として統括へ報告する。再クリックの入口に回避の分岐は足さない。
+2. **置き換えてよい更新は `Navigation` の更新だけのまま (受付条件 3 を変えない)。** ★一覧から入った実フォルダ (`PhysicalHistoryIntent::Rating`) など、ほかの owner の同一場所の更新が保留中の間の再クリックは、更新しない (保留中の更新がそのまま完了する)。1 回目の再クリックの更新は、その owner の今の ⟳ と同じ要求で受け付ける。例外を owner ごとに広げると、判別する field の組が owner の数だけ増える。失うのは「保留中の更新が終わる前に外部でさらに変えた分を、その場の再クリックで拾う」ことだけで、終わってからもう一度クリックすれば拾える。テスト: ★一覧から入った実フォルダで、1 回目の再クリックが受け付けられ、保留中の 2 回目は拒否され、1 回目が完了する。
+
+### 14.8 実装記録 (2026-11-21、実装担当 Codex gpt-6.1-sol / high の報告)
+
+2026-11-21、段階2の製品コードとテスト追加を完了。初回の停止理由2件は§14.7で設計担当が裁定し、その決定どおり再開した。独立 Sol / xhigh の最終静的レビューは **ACCEPT、未解決findingなし**。コンパイル・自動テスト・整形・実機確認は未実施であり、この記録は実行結果の成功を示すものではない。
+
+- `src/folder_pane.rs`: `FolderPaneActivation::{Open, RefreshActive}` と、現在の需要 node だけへ既存 `request_recheck` を渡す `recheck_displayed` を追加。cache・label表示表・gesture・展開集合・cursor・scrollには触れない。Runningは既存FollowUpへ合流し、走査と結果採用は既存ownerに任せる。
+- `src/ui_folder_pane.rs`: 名前のSingleと非pointer活性化を共通のtyped候補へ変換。同passの最後の名前の活性化で候補を上書きし、Arrow / Toggle / ツリーのキー処理は従来どおり。
+- `src/app/update_phases.rs`: `MainFrameNavigation::folder_pane_nav`と`render_main_bars`を新型へ追随。拒否したRefreshActiveをsaved-group取消に使わず、poll前の保留とpoll後のlocal readyを照合する。高優先移動・grid候補があれば更新を捨て、拒否後は既存のclose / ready / grid裁定へ進む。Open > gridの既存順序は維持。
+- `src/app/folder_pane_reclick.rs`（`app.rs`でmodule登録）: `folder_pane_reclick_admission`に在メモリの受付条件とownerごとの保留判定を集約。`start_folder_pane_reclick_refresh`はcurrent owner・RefreshListを捕捉し、mtimeに依存せず既存physical preflightを投入する。成功受付時だけツリーの再照合を要求し、要求作成不可は型付き理由でログに残す。受付・拒否理由と所要時間は`folder_pane/reclick`のperf eventへ記録する。
+- 数える保留owner: physical / collection履歴transition、open-path分類、main側pane pending / local ready、DFS・兄弟移動、rating移動、smart-folder切替・走査・準備・確認、collection移動、サブ展開の走査・install・確認、bookmarkの準備・Opening、main起動パス・resolver、archive変換、PDF / ZIP列挙・password・EPUB変換、saved-group、close return、tag準備、bookの遅延open・permission。mainの読書・再開、flat投影、全stack準備、EPUB一括変換と共通modalも受付外。受動観測の採用は既存owner / generation照合へ任せ、独立readerのbundle所有は変えない。
+- 置換例外は同じpathの通常Navigation更新に限定。physicalはSameLocation・通常RefreshList・Navigation（replayなし、auto_fullscreen=false）・DFSなしを照合。分類のcontinuationとnavigation、CurrentViewOrderRefreshのreload_ownerとnavigationも照合する。Rating等の別ownerは初回を現在ownerの更新として受理するが、その保留中の再クリックは拒否し元要求を完了させる（§14.7）。
+- `reload_top_level_grid` / `reload_current_physical_list` / ⟳ / GridReload / 共通preflightは変更していない。§14.7で認められた文書policyの既存DB読取を回避する分岐も追加していない。ディレクトリ列挙・分類・再生時間情報は既存workerへ渡し、同期の`load_folder_*`へのfallbackはない。
+
+テスト追加と追随:
+
+- `src/app/folder_pane_reclick_stage2_tests.rs`に14件: 再クリック更新から実sidecar復元が始まるdouble / triple / 復元跨ぎtriple、同pass address / grid競合とOpen優先、現在folderの外部削除、集約の選択・anchor・offsetがGridReloadと同じこと、初期stack準備・集約への復帰準備、linked reader拒否・独立reader存続中のmain更新、RatingPhysicalの初回受付・delay超の2回目拒否・初回結果採用、touch double tapの各Single更新と開閉なし。
+- `src/folder_pane/refresh_tests.rs`に1件: 需要のRunning / Queued / Settledを再照合し、非需要node・cache・展開集合・cursor / scroll・label表・gesture・pass結果を変えず、Runningの取消tokenも保つ。
+- 段階1の26件の期待は維持。設計担当の`unclamped_offset()`修正を残し、single共通scenarioへ既存`folder_scan::caller_scan_count_for_test`の前後比較を追加した。名前順・mtime=None・再生時間順の3ケースについて、入力threadのdirectory scanが受付からworker結果採用まで増えないことを直接検査する。新しい製品test hookは足していない。
+- `folder_pane_refresh_tests.rs`で追加moduleを登録。既存のB→現在地Aのpointer / AccessKit回帰2件は、Bへの移動を出さない不変条件を維持し、新仕様の戻り値を`None`から`RefreshActive(A)`へ変更。`main_chrome.rs` / `tests/direct_navigation_worker_scan.rs` / `ui_folder_pane_drop_tests.rs`の比較・注入・保持型もtyped activationへ追随した。
+- `test(/folder_pane_reclick/)`の対象は計41件（段階1の26、段階2の14、tree unitの1）。本作業では実行していない。段階1の15成功 / 11失敗という共有runnerの記録は、製品実装前の赤テストの証拠であり、今回の成功結果としては扱わない。
+
+初回停止の経緯と解消:
+
+1. 共通preflightのworker spawn前に、設定ON時は実フォルダでもspread.dbのmode / flow / directionの3 SELECTへ到達することを確認して停止した。§14.7により既存の共通費用として維持し、今回の要件はdirectory走査のworker化と同期loadへの非到達と確定した。
+2. RatingPhysicalはFolder surfaceだが既存の更新intentがRatingなので、Navigation限定の置換例外に合わないことを確認して停止した。§14.7により初回は現在ownerで受理、保留中の再クリックは拒否する仕様と確定し、そのまま実装して追加テストにした。
+
+§14.7を含む採択設計からの差はない。新しいpending・世代・タイマー・retry・追加repaint・同期fallback・機能制限による回避は追加していない。UI文言、keymap、spec、マニュアル、backlog、detached述語/viewport実装は変更していない。
+
+禁止事項に従い、cargo / rustc / テスト / ビルド / 整形 / 製品起動 / git変更操作は未実施。再開後はread-onlyのgit操作も行っていない。ソースのAPI・型追随・所有・優先順位は静的に照合したが、コンパイル・cfg(test-script) / Windows分岐・sidecar / stack / window fixture成立・既存回帰・実機応答性は共有runnerと設計担当の検収待ち。既存DB読取を共通preflightのworkerへ移す案は別backlog候補として統括へ引き継ぎ、ここでは実装しない。

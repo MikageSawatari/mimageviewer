@@ -3,6 +3,12 @@ use super::*;
 use crate::folder_pane::{FolderPaneCursorScroll, FolderPaneState};
 use std::time::SystemTime;
 
+#[path = "folder_pane_reclick_tests.rs"]
+mod reclick;
+
+#[path = "folder_pane_reclick_stage2_tests.rs"]
+mod reclick_stage2;
+
 // These UI fixtures represent the main pane after startup admission. The
 // headless App constructor never drives NotStarted into a terminal indexer
 // outcome, so explicitly select the no-indexer outcome at fixture creation.
@@ -724,6 +730,10 @@ fn sidecar_tree_frame(
             app.poll_book_bookmark_service_responses();
             app.poll_spread_shift_service();
             app.service_update_registered_writers(ctx);
+            // App::ui services the mounted HistoryTransition owner in
+            // render_update_before_frame, before update_frame's input begin.
+            // render_other_worker_results below does not poll this producer.
+            app.poll_history_navigation_transition_for_test(ctx);
             app.input_update_begin(ctx);
             app.service_edit_completions(ctx, std::time::Instant::now());
             app.service_initial_worker_results(ctx, &mut None);
@@ -1443,8 +1453,11 @@ fn ordered_other_then_active_clears_navigation(accesskit: bool) {
                     .any(|row| row.path == a && row.is_cursor)
             );
             assert_eq!(
-                folder_pane_nav, None,
-                "the last single click on the active row retires B's candidate"
+                folder_pane_nav,
+                Some(crate::folder_pane::FolderPaneActivation::RefreshActive(
+                    a.clone()
+                )),
+                "the last single click on the active row replaces B's candidate with A's refresh"
             );
             let grid_nav = app.render_grid(ui);
             app.post_render_main_navigation(

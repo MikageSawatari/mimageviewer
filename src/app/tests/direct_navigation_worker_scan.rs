@@ -78,7 +78,10 @@ fn direct_navigation_worker_ready_scan_yields_to_same_frame_navigation_inputs() 
                     b.clone(),
                 ))
             }
-            "tree" => frame.folder_pane_nav = Some(b.clone()),
+            "tree" => {
+                frame.folder_pane_nav =
+                    Some(crate::folder_pane::FolderPaneActivation::Open(b.clone()));
+            }
             _ => unreachable!(),
         }
         let ctx = egui::Context::default();

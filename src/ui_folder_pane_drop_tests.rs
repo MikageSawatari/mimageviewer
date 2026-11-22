@@ -9,7 +9,7 @@ struct TreeDropTest {
     queries: usize,
     files_available: bool,
     invoked: Vec<PathBuf>,
-    navigation: Option<PathBuf>,
+    navigation: Option<FolderPaneActivation>,
 }
 
 impl TreeDropTest {
