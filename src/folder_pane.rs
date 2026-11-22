@@ -335,8 +335,38 @@ pub(crate) struct FolderPaneRow {
 #[derive(Debug, Clone)]
 struct CachedListing {
     children: Vec<PathBuf>,
+    child_keys: HashSet<String>,
     membership: HashSet<String>,
     options: FolderPaneListingOptions,
+}
+
+impl CachedListing {
+    fn new(
+        children: Vec<PathBuf>,
+        membership: HashSet<String>,
+        options: FolderPaneListingOptions,
+    ) -> Self {
+        let child_keys = children.iter().map(|child| key_for(child)).collect();
+        Self {
+            children,
+            child_keys,
+            membership,
+            options,
+        }
+    }
+}
+
+/// One index shared by the tree's egui temp data and its lifecycle owner.
+/// Only drawing adds IDs; display suspension, drive changes and reload clear it.
+#[derive(Clone, Default)]
+pub(crate) struct FolderPaneRowIds(
+    pub(crate) Arc<std::sync::Mutex<HashMap<egui::accesskit::NodeId, Arc<PathBuf>>>>,
+);
+
+impl FolderPaneRowIds {
+    fn clear(&self) {
+        self.0.lock().unwrap().clear();
+    }
 }
 
 struct FolderPaneNode {
@@ -484,6 +514,7 @@ pub(crate) struct FolderPaneState {
     listing_options: FolderPaneListingOptions,
     last_drive_refresh: Option<std::time::Instant>,
     label_gesture: FolderPaneLabelGesture,
+    pub(crate) row_ids: FolderPaneRowIds,
     pub(crate) label_display: Option<FolderPaneLabelDisplay>,
     label_input: FolderPaneLabelInputPass,
     // Latest ROOT input.time (also set by direct state tests), never read by
@@ -519,6 +550,7 @@ impl Default for FolderPaneState {
             listing_options: FolderPaneListingOptions::default(),
             last_drive_refresh: None,
             label_gesture: FolderPaneLabelGesture::Idle,
+            row_ids: FolderPaneRowIds::default(),
             label_diagnostic_time: None,
             #[cfg(test)]
             last_gesture_reset: None,
@@ -614,6 +646,15 @@ impl FolderPaneState {
 
     #[track_caller]
     pub(crate) fn invalidate_label_display(&mut self, reason: FolderPaneGestureReset) {
+        if matches!(
+            reason,
+            FolderPaneGestureReset::SuspendDisplay
+                | FolderPaneGestureReset::SelectedDriveRemoved
+                | FolderPaneGestureReset::SelectDrive
+                | FolderPaneGestureReset::ReloadForActive
+        ) {
+            self.row_ids.clear();
+        }
         self.clear_label_click(reason);
         self.label_display = None;
         self.label_input.results.clear();
@@ -934,6 +975,12 @@ impl FolderPaneState {
         self.selection.position().cursor.as_deref()
     }
 
+    fn clear_row_ids_on_drive_change(&self, drive: Option<&Path>) {
+        if self.selected_drive().map(key_for) != drive.map(key_for) {
+            self.row_ids.clear();
+        }
+    }
+
     fn resolve_follow_position(&mut self) {
         let drive = self
             .active_path
@@ -942,6 +989,7 @@ impl FolderPaneState {
             .or_else(|| self.selection.position().drive.clone())
             .or_else(|| self.drives.first().cloned());
         let cursor = self.active_path.clone().or_else(|| drive.clone());
+        self.clear_row_ids_on_drive_change(drive.as_deref());
         self.selection = FolderPaneSelection::FollowActive(FolderPanePosition { drive, cursor });
     }
     pub(crate) fn drives(&self) -> &[PathBuf] {
@@ -1170,11 +1218,7 @@ impl FolderPaneState {
                     }
                     break;
                 }
-                if !cache
-                    .children
-                    .iter()
-                    .any(|child| crate::folder_tree::path_eq(child, &pair[1]))
-                {
+                if !cache.child_keys.contains(&key_for(&pair[1])) {
                     break;
                 }
             }
@@ -1239,11 +1283,7 @@ impl FolderPaneState {
                 return false;
             }
             if let Some(cache) = self.nodes.get(&key).and_then(|node| node.cache.as_ref()) {
-                if !cache
-                    .children
-                    .iter()
-                    .any(|child| crate::folder_tree::path_eq(child, &pair[1]))
-                {
+                if !cache.child_keys.contains(&key_for(&pair[1])) {
                     return false;
                 }
             } else if !self.auto_expanded.contains(&key_for(&pair[1]))
@@ -1473,11 +1513,28 @@ impl FolderPaneState {
     }
 
     pub(crate) fn visible_rows(&self) -> Vec<FolderPaneRow> {
+        self.visible_rows_indexed().0
+    }
+
+    /// Reuse DFS's normalized-key deduplication table as this draw's row index.
+    /// Keys move into the table once; focus/accessibility lookups need no second
+    /// normalization of the logical rows and no cache across passes.
+    pub(crate) fn visible_rows_indexed(&self) -> (Vec<FolderPaneRow>, HashMap<String, usize>) {
         let mut rows = Vec::new();
+        let mut row_indices = HashMap::new();
         if let Some(root) = self.selected_drive() {
-            self.push_visible_rows(root, 0, &mut rows, &mut HashSet::new());
+            let active = self.active_path.as_deref().map(key_for);
+            let cursor = self.cursor_path().map(key_for);
+            self.push_visible_rows(
+                root,
+                0,
+                &mut rows,
+                &mut row_indices,
+                active.as_deref(),
+                cursor.as_deref(),
+            );
         }
-        rows
+        (rows, row_indices)
     }
 
     pub(crate) fn set_cursor(&mut self, path: PathBuf) {
@@ -1486,6 +1543,7 @@ impl FolderPaneState {
             .filter(|root| path_is_same_or_descendant(&path, root))
             .map(Path::to_path_buf)
             .or_else(|| root_of_path(&path));
+        self.clear_row_ids_on_drive_change(drive.as_deref());
         self.selection = FolderPaneSelection::Explicit(FolderPanePosition {
             drive,
             cursor: Some(path),
@@ -1576,17 +1634,24 @@ impl FolderPaneState {
         path: &Path,
         depth: usize,
         rows: &mut Vec<FolderPaneRow>,
-        seen: &mut HashSet<String>,
+        row_indices: &mut HashMap<String, usize>,
+        active: Option<&str>,
+        cursor: Option<&str>,
     ) {
         if depth > 64 {
             return;
         }
         let key = key_for(path);
-        if !seen.insert(key.clone()) {
-            return;
-        }
         let expanded = self.is_expanded_key(&key);
         let node = self.nodes.get(&key);
+        let is_active = active == Some(key.as_str());
+        let is_cursor = cursor == Some(key.as_str());
+        match row_indices.entry(key) {
+            std::collections::hash_map::Entry::Occupied(_) => return,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(rows.len());
+            }
+        }
         let loading =
             node.is_some_and(|node| matches!(node.scan, NodeScan::Queued | NodeScan::Running(..)));
         let error = node.and_then(|node| match &node.scan {
@@ -1601,18 +1666,13 @@ impl FolderPaneState {
             expanded,
             loading,
             has_children_or_unknown,
-            is_active: self
-                .active_path
-                .as_ref()
-                .is_some_and(|active| crate::folder_tree::path_eq(active, path)),
-            is_cursor: self
-                .cursor_path()
-                .is_some_and(|cursor| crate::folder_tree::path_eq(cursor, path)),
+            is_active,
+            is_cursor,
             error,
         });
         if expanded && let Some(node) = node {
             for child in node.children() {
-                self.push_visible_rows(child, depth + 1, rows, seen);
+                self.push_visible_rows(child, depth + 1, rows, row_indices, active, cursor);
             }
         }
     }
@@ -1788,14 +1848,14 @@ fn scan_real_subfolders_inner(
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
     }
-    Ok(CachedListing {
-        children: keyed_dirs.into_iter().map(|(path, _, _)| path).collect(),
+    Ok(CachedListing::new(
+        keyed_dirs.into_iter().map(|(path, _, _)| path).collect(),
         membership,
-        options: FolderPaneListingOptions {
+        FolderPaneListingOptions {
             sort_order,
             show_hidden_files,
         },
-    })
+    ))
 }
 
 fn emit_folder_pane_scan_perf(
@@ -1941,19 +2001,12 @@ impl FolderPaneState {
                     .find(|ancestor| ancestor.parent() == Some(path))
                     .unwrap();
                 let children = vec![child.to_path_buf()];
-                Ok(CachedListing {
-                    membership: children.iter().map(|child| key_for(child)).collect(),
-                    children,
-                    options,
-                })
+                let membership = children.iter().map(|child| key_for(child)).collect();
+                Ok(CachedListing::new(children, membership, options))
             } else if path_is_same_or_descendant(path, &root) {
                 scan_complete_listing(path, options, Some(cancel)).map_err(|err| err.to_string())
             } else {
-                Ok(CachedListing {
-                    children: vec![],
-                    membership: HashSet::new(),
-                    options,
-                })
+                Ok(CachedListing::new(vec![], HashSet::new(), options))
             }
         }));
     }
@@ -2006,11 +2059,8 @@ impl FolderPaneState {
         expanded: bool,
     ) {
         let key = key_for(path);
-        let cache = CachedListing {
-            membership: children.iter().map(|child| key_for(child)).collect(),
-            children,
-            options: self.listing_options,
-        };
+        let membership = children.iter().map(|child| key_for(child)).collect();
+        let cache = CachedListing::new(children, membership, self.listing_options);
         self.nodes.insert(
             key.clone(),
             FolderPaneNode {
@@ -2970,6 +3020,126 @@ mod tests {
 
     fn p(s: &str) -> PathBuf {
         PathBuf::from(s)
+    }
+
+    #[test]
+    fn virtual_tree_row_flags_keep_case_and_separator_equivalence() {
+        let root = p(r"C:\Data");
+        let child = root.join("Pictures");
+        let mut state = FolderPaneState::test_tree(&root, vec![child.clone()]);
+        state.active_path = Some(p("c:/data/PICTURES"));
+        state.set_cursor(p("C:/DATA/pictures"));
+        let rows = state.visible_rows();
+        assert_eq!(
+            rows.iter().map(|row| &row.path).collect::<Vec<_>>(),
+            vec![&root, &child]
+        );
+        for row in rows {
+            assert_eq!(
+                row.is_active,
+                crate::folder_tree::path_eq(&row.path, state.active_path().unwrap())
+            );
+            assert_eq!(
+                row.is_cursor,
+                crate::folder_tree::path_eq(&row.path, state.cursor_path().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_tree_row_index_reuses_normalized_identity_and_first_duplicate() {
+        let root = p(r"C:\Data");
+        let first = root.join("Pictures");
+        let duplicate = p("c:/DATA/PICTURES");
+        let state = FolderPaneState::test_tree(&root, vec![first.clone(), duplicate]);
+        let (rows, indices) = state.visible_rows_indexed();
+        assert_eq!(
+            rows.iter().map(|row| &row.path).collect::<Vec<_>>(),
+            vec![&root, &first]
+        );
+        assert_eq!(indices.len(), rows.len());
+        assert_eq!(indices.get(&key_for(&p("C:/data/pictures"))), Some(&1));
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(indices.get(&key_for(&row.path)), Some(&index));
+        }
+    }
+
+    #[test]
+    fn virtual_tree_hidden_membership_does_not_reveal_or_reach_hidden_children() {
+        let root = p(r"C:\");
+        let hidden = root.join("hidden");
+        let active = hidden.join("active");
+        let mut state = FolderPaneState::test_tree(&root, vec![]);
+        state.nodes.get_mut(&key_for(&root)).unwrap().cache = Some(CachedListing::new(
+            vec![],
+            [key_for(&hidden)].into_iter().collect(),
+            state.listing_options,
+        ));
+        state.active_path = Some(active);
+        state.reveal_active(false);
+        assert!(!state.nodes.contains_key(&key_for(&hidden)));
+        assert!(!state.reachable(&hidden));
+        let cache = state.nodes[&key_for(&root)].cache.as_ref().unwrap();
+        assert!(cache.membership.contains(&key_for(&hidden)));
+        assert!(!cache.child_keys.contains(&key_for(&hidden)));
+    }
+
+    #[test]
+    fn virtual_tree_row_id_index_lifetime_ignores_freshness_and_logical_removal() {
+        for reset in [
+            FolderPaneGestureReset::DisplayNotFresh,
+            FolderPaneGestureReset::PaneDisabled,
+            FolderPaneGestureReset::SuspendDisplay,
+            FolderPaneGestureReset::SelectDrive,
+            FolderPaneGestureReset::SelectedDriveRemoved,
+            FolderPaneGestureReset::ReloadForActive,
+        ] {
+            let mut state = FolderPaneState::test_tree(&p(r"C:\"), vec![]);
+            let id = egui::Id::unique("row lifetime").accesskit_id();
+            state
+                .row_ids
+                .0
+                .lock()
+                .unwrap()
+                .insert(id, Arc::new(p(r"C:\child")));
+            state.test_seed_listing(&p("C:/"), vec![], true);
+            assert!(state.row_ids.0.lock().unwrap().contains_key(&id));
+            state.invalidate_label_display(reset);
+            let retained = matches!(
+                reset,
+                FolderPaneGestureReset::DisplayNotFresh | FolderPaneGestureReset::PaneDisabled
+            );
+            assert_eq!(
+                state.row_ids.0.lock().unwrap().contains_key(&id),
+                retained,
+                "{reset:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_tree_row_id_index_clears_on_explicit_and_followed_drive_changes() {
+        let mut state = FolderPaneState::test_tree(&p(r"C:\"), vec![]);
+        let id = egui::Id::unique("drive lifetime").accesskit_id();
+        state
+            .row_ids
+            .0
+            .lock()
+            .unwrap()
+            .insert(id, Arc::new(p(r"C:\child")));
+        state.set_cursor(p("c:/CHILD"));
+        assert!(state.row_ids.0.lock().unwrap().contains_key(&id));
+        state.set_cursor(p(r"D:\child"));
+        assert!(state.row_ids.0.lock().unwrap().is_empty());
+        state
+            .row_ids
+            .0
+            .lock()
+            .unwrap()
+            .insert(id, Arc::new(p(r"D:\child")));
+        state.active_path = Some(p(r"C:\child"));
+        state.resolve_follow_position();
+        assert!(state.row_ids.0.lock().unwrap().is_empty());
     }
 
     #[test]

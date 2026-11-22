@@ -1,0 +1,396 @@
+# フォルダツリーの見える行だけを組み立てる (§1.827 ツリー仮想化)
+
+状態: 設計 (Sol xhigh の実装前レビュー 4 回、P1 なし。P1-3 は利用者の判断で受け入れ)。対象ブランチ `tree-virtualize-827` (master ef847a1cc から)。
+
+## 1. 観測と出どころ
+
+- 報告者 (5ch >>833・857・858・867) の観測: 直下約 6,000・配下約 3 万フォルダの場所の下で画像を
+  スクロールすると重くちらつく。ツリーを非表示にすると症状が出なくなる (報告者が確認)。
+  報告者側の集計で `folder_pane_ms` 中央値が約 0.15 ms → 約 57 ms、`main_galleys` が約 95 → 約 7,100。
+  原ログは受領していない。
+- 開発側の計測: §2 (今の master、使い捨ての合成ツリー)。
+
+## 2. 今の master の計測
+
+計測はすべて開発側の使い捨てデータ。実行したのは portable-smoke のコピー (`--data-dir target\portable-smoke\data`) と、cargo test 内の headless App で、利用者のデータは使っていない。
+合成ツリーは `scripts/tree827/New-LargeFolderTree.ps1` で作った。`book\A\02` の下に 6,000 フォルダ (各 5 子フォルダ、合計 36,000) を置き、そのうち 1 つを画像フォルダにした (重い場合)。軽い場合は `book\A\01` の下に 20 フォルダを置いた。どちらも画像は同じ 8 枚。
+
+### 2.1 headless (debug profile、`src/app/folder_pane_perf827_tests.rs`、計測専用で master に入れない)
+
+ROOT の 1 pass で `render_folder_pane` を呼び、50 pass の中央値を取った。
+
+| 直下の行 | 組み立てた行 | galley | render_folder_pane | visible_rows() 1 回 |
+| ---: | ---: | ---: | ---: | ---: |
+| 100 | 106 | 111 | 4.5 ms | 0.22 ms |
+| 1,000 | 1,006 | 1,011 | 48 ms | 2.2 ms |
+| 3,000 | 3,006 | 3,011 | 166 ms | 7.0 ms |
+| 6,000 | 6,006 | 6,011 | 294 ms | 13.4 ms |
+
+組み立てる行と galley は論理行と同数で、時間も行数に比例する。`visible_rows()` は 1 フレームに 3 回呼ばれる。
+tessellate は 0.14 ms、shape は 118 で、行数に関係なく小さかった。画面外の行の塗りは clip で落ちている。
+
+### 2.2 実アプリ (portable-smoke、release、test-script の合成キー入力、2026-11-22 20:02〜20:09)
+
+UI スレッドの CPU は 1 コアに対する割合。perf イベント `frame/root_outside` は、§3 の計装で今回足したもの。
+
+| 条件 | 全画面スクロール中の main fps | UI スレッド | folder_pane_ms | App::update | accesskit の受け渡し (platform) | accesskit ノード | 初回の最大停止 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 重い・そのまま | 16 | 96% | 36.6 | 40.8 | 18.1 ms/フレーム | 42,830 | **45.6 s** |
+| 重い・accesskit 無効 (計測用の切り替え) | 26 | 91% | 30.1 | 34.5 | 0 | — | なし |
+| 重い・自作 UIA クライアントあり | 15 | 95% | 37.3 | 41.7 | 18.3 | 42,830 | **37.4 s** |
+| 軽い・そのまま | 153 | 65% | 0.7 | 4.1 | 0.2 | 970 | なし |
+| 軽い・accesskit 無効 | 162 | 60% | 0.6 | 4.2 | 0 | — | なし |
+| 軽い・UIA クライアントあり | 156 | 61% | 0.7 | 4.1 | 0.2 | 970 | なし |
+
+- **このメイン PC では、自作のクライアントを付けなくても accesskit が有効になった** (起動から 4 フレーム目。どのクライアントかは特定していない)。
+- **初回の長い停止**: ツリーが最初に全行を出したフレームで、accesskit の更新 (42,830 ノード) を OS 側の adapter へ渡す区間 (`platform_ms`) が 45.6 s / 37.4 s かかった。その間、UI スレッドは CPU を 93% 使い続けていた (mIV の外の待ちではない)。利用者のメイン PC の停止 (update の外で 70 s / 118 s、統括のログ確認) と同じ形。
+- 毎フレームの費用は、ツリー全行の UI 組み立て (約 30〜37 ms) と accesskit の受け渡し (約 18 ms) の 2 つ。tessellate (0.13 ms)、GPU の encode / submit / present (各 0.1〜0.3 ms)、頂点数 (約 8,000)、texture delta (スクロール中 0) は、重い場合も軽い場合も小さく、ほぼ同じだった。
+- GPU の 3D 使用率 (システム全体) は、重い・そのまま・スクロール中で平均 19.6%。DWM の CPU は権限の都合で読めなかった。
+- 結論: 遅さの原因は、全論理行の UI 組み立てと、行数に比例する accesskit ノードの 2 つ。描画量でも GPU でもない。仮想化は両方を可視行の数まで減らす。
+
+
+## 3. 原因の構造 (コード)
+
+`App::render_folder_pane` は main chrome の描画のたびに呼ばれ、全画面表示中も root viewport は
+毎フレーム描画されるため、画像のスクロール中もフレームごとにツリー全体を処理する。
+
+0. **accesskit のノードも全論理行**: egui は描いた部品ごとに accesskit のノードを作る。
+   UIA のクライアントが接続していると (このメイン PC では常時)、全行ぶんのノード (6,000 行で約 4.3 万) を毎フレーム OS 側の adapter へ渡す。
+   ノードが大きく変わったフレームでは、その処理が数十秒かかった (§2.2)。
+1. **UI 構築が全論理行**: `render_folder_pane_tree_with` が `ScrollArea::show` の中で全 `rows` を
+   回し、行ごとに `scope_builder`・`horizontal`・矢印 `Button`・名前 `Label` (truncate のため文字配置)・
+   ツールチップ用の `path.display().to_string()`・ヒット情報を作る。画面外の行も egui の
+   レイアウトを通る (クリップで描画が省かれるのは塗りだけ)。
+2. **データ側の全件処理が 1 フレームに複数回**: `visible_rows()` は全論理行を DFS で作り直し、
+   行ごとに `key_for` (小文字化した String)・`seen` への挿入・`path_eq` 2 回 (各 2 回の正規化) と
+   `PathBuf` の複製を行う。1 フレームに `handle_folder_pane_keyboard` → `sync_folder_pane_state`
+   → `reconcile_demand`、`render_folder_pane` → `sync_folder_pane_state` → `reconcile_demand`、
+   描画本体の 3 回呼ばれる。描画では全パスを `Arc<[PathBuf]>` に複製し、前フレームと比較する。
+   `reveal_active` / `reachable` は祖先ごとに子一覧を `path_eq` で線形に探す。
+
+## 4. 方針
+
+### 4.1 描画の仮想化 (中心)
+
+`ScrollArea::show` を `ScrollArea::show_rows(ui, pitch - item_spacing.y, rows.len(), ..)` に替え、
+可視範囲 (egui の計算は `floor(top / pitch)` 〜 `ceil(bottom / pitch) + 1`) の行だけを組み立てる。
+行の中身 (`draw_folder_pane_row`)、path 単位の `scope_id`、ヒット情報の記録、右クリック・
+非 primary の起動・D&D の行情報は、描画した行について今と同じ処理をする。
+
+- **行の高さをその pass の範囲計算の前に確定する** (Sol 設計レビュー P1-1): 前回の実測 pitch を配置に使うと、
+  pitch が変わった pass で自動スクロールの座標と行の位置がずれ、行の実高が小さくなった場合に下端まで描けない。
+  そこで、行の部品が要る高さを、描く前にその pass のフォントと spacing から求める
+  `folder_pane_row_height(ui) = max(FOLDER_PANE_ROW_HEIGHT, interact_size.y, 矢印 (16pt の文字の行高。
+  frame(false) のボタンは padding を付けない)、名前の行高、"!" の行高)`。式は vendored egui の実際の寸法規則に
+  合わせる。文字の行高は `round_to_pixels(現 pixels_per_point).round_ui()`、固定高と `interact_size.y` は
+  `round_ui()` してから最大を取る。文字レイアウトの物理 pixel 丸めと Ui の 1/32 pt 丸めを区別し、
+  最大値全体を物理 pixel に丸めて fractional な Ui 最小高を縮めない。実装時にテストで実高と一致することを
+  確かめる (2 回目 P3-6)。`draw_folder_pane_row` はこの高さを受け取り、horizontal の `set_height` と
+  矢印の `add_sized` に使う。矢印の枠を行と同じ高さにし、小さい枠の中央配置からの下方向への拡張を避ける。
+  ラベルの `allocate_exact_size` は master と同じ `FOLDER_PANE_ROW_HEIGHT` (24 pt) を指定して行内で中央配置し、
+  選択背景とラベルの clip 寸法を変えない。spinner と `!` は従来どおり。部品は行全体の高さに収まるように
+  求めてあるので、行の割り当ては全行 (loading / error を含む) で同じ高さになる。
+  `pitch = row_height + item_spacing.y` を、描画範囲・全体の高さ・reveal の矩形・保存する
+  `FolderPaneScrollMemory::pitch` のすべてに使う (1 つの値)。行全体の高さを24ptに切り詰めることはしない。
+  描いた行の実高が `row_height` と違えば debug_assert で落とし、テストで固定する。
+  `request_discard` による同一フレームの作り直しは使わない (§1.828 のパス番号に依存する入力の関門と
+  組み合わせが増えるため)。
+- **内容の原点**: `show_rows` の callback の Ui は描画範囲の先頭行が原点になる。内容の原点を
+  `ui.max_rect().top() - range.start × pitch` とし、論理行 i の矩形は `原点 + i × pitch` から作る。
+- **全体の高さ** は `rows.len() * pitch - spacing` で、スクロールバーの長さと位置は今と同じになる。
+
+### 4.2 現在地への自動スクロールを論理行の位置から
+
+今は現在地 (操作カーソル) の行の `Response` に `scroll_to_me` している。仮想化すると画面外の行は
+`Response` を持たないので、**論理行の index から行の矩形を計算して `ui.scroll_to_rect(rect, Center)`**
+する (`scroll_to_me` も内部では同じ `scroll_to_rect(self.rect)`)。発火条件 (`Requested`・paths の変化・
+pitch の変化・`FollowingRefresh` の扱い・ポインタ操作で `Idle` に戻す) は今と同じ。`cursor_drawn` は
+「論理行に現在地がある」の意味になる (今も全行を回すので同じ意味)。
+
+### 4.2b 同じ pass で描画範囲の外へ出た行への AccessKit 要求 (Sol 設計レビュー P1-2)
+
+今は、行の非 primary の起動 (AccessKit の Click 要求、または egui の focus を持つ部品への Enter / Space) を、
+描画中の `resp.clicked() && !clicked_by(Primary) && !clicked_by(Secondary)` で受けている。仮想化すると、
+同じ pass のポインタ結果 (`take_label_results` の矢印など) で上の枝が開き、要求先の行が描画範囲の外へ
+押し出されたとき、その行の `Response` が作られず、要求が消える
+(既存 `folder_pane_label_pointer_arrow_preserves_other_row_accesskit_activation` の契約)。
+
+**採る形: 要求の宛先の行も描く** (Sol 設計レビュー 2 回目の P1・P2 を受けて、事前裁定の案から変更)。
+事前に裁定する案は、egui の `Response` が持つ条件 (modal layer の `allows_interaction`、`ui.is_enabled()`、
+focus を持つ部品への Enter / Space、行順の適用、ID ごとに 1 回、ScrollIntoView の ScrollArea 内での発行と消費)
+を作り直すことになり、組み合わせが増える。CLAUDE.md の「状態の組み合わせを減らす」に従い、裁定は作り直さない。
+
+- 描く行 = 可視範囲の行 ∪ **この pass に AccessKit の要求 (Click・ScrollIntoView など、種類を問わない) が
+  届いている部品を持つ行** ∪ **egui の focus を持つ部品の行**。
+- 部品 ID → path の対応は、**行の部品 ID の索引** (`FolderPaneRowIds`: ID → path の表。ツリーの描画だけが書き、
+  egui の temp data に置く) から引く。行を描くたびに、行の外側の `scope_builder` の生成から終了までの間に egui へ
+  登録された部品の ID を、行の Ui・矢印・名前の部品・中の文字・spinner・"!"、tooltip の Ui と Label を含め、
+  その行の path で登録する (4 回目の P2-1)。tree layer は明示した row scope ID の `WidgetRects::order` から
+  行末までの追加分を取る。tooltip layer は行を描いた後、この pass の `TooltipPassState::widget_tooltips` から
+  `Tooltip::tooltip_id(owner, ordinal)` で引き、親 layer 順に回収する。省略された Label の自動 tooltip と
+  入れ子も同じ経路で拾う。過去の空 layer を行ごとに列挙しない (独立実装レビュー P2-2)。
+  AccessKit の要求先の ID は egui の `Id::accesskit_id()` と同じ値。
+  **最後に描いた行だけを使う形にはしない** (3 回目の P2): 要求はイベントの待ち行列を経て届くので、B が見えている
+  間に出た要求が、B が範囲外になった後の pass に届くことがある。
+  **論理行から消えた path の項目も捨てない** (4 回目の P2-2): 畳んで再び開いた後に、待っていた要求が届くことがある。
+  表を捨てるのは、ペインを隠したとき (`suspend_display`)、ドライブを切り替えたとき、ツリーを再読み込みしたときだけ
+  だけ。入力の関門が表示の新しさで捨てる場合 (`DisplayNotFresh` など、`invalidate_label_display` の他の呼び出し)
+  では索引を消さない (5 回目の P3)。表の項目数は「その間に描いたことのある path の数 × 1 行が取り得る
+  部品 ID の数 (loading / error の形を含む)」で、O(描いた行数 × C)。描く行の数・AccessKit のノード数の上限とは別。
+- 引いた path は、`take_label_results` を適用した後の論理行 (`visible_rows()`) の中にあるときだけ描く。
+  畳まれた・消えた行は描かない (今も論理行に無い行は描かれないので、起動されない)。
+- 追加の行は、論理行の index から求めた本来の位置 (内容の原点 + index × pitch) に、可視範囲の行と合わせて
+  **論理行の順** に描く。ポインタは clip の外に当たらないので、追加の行がポインタ入力を受けることはない。
+  `label_widgets` にも入れるが、D&D の行一覧は既に可視域と交差させて使うので変わらない。
+- これで、要求の受け付け・modal の判定・Enter / Space・行順・ID ごとに 1 回・ScrollIntoView の発行と消費は、
+  すべて今と同じ egui の `Response` の処理を通る。描画中の非 primary の分岐も今のまま残す。
+- 組み立てる行の数 = 可視範囲の行数 + (要求の宛先の行 ∪ focus の行) のうち可視範囲に無いものの数。
+  要求の宛先は通常 0〜数行。AccessKit のノード数もこの描く行の数に比例する (3 回目の P3)。
+
+### 4.3 データ側の全件処理 (計測で決める)
+
+仮想化した後も、毎フレームの全論理行の処理が残る (§3 の 2)。headless の debug では、
+`visible_rows()` 1 回が描画全体の約 5% で、1 フレームに 3 回呼ばれる。release ではおよそ数 ms と見込む
+(仮想化後に実測する)。意味を変えずに 1 回あたりの費用を下げる、次の 3 つを入れる。
+
+1. **`push_visible_rows` の正規化を 1 回にする**: 現在地とカーソルの key を `visible_rows()` の入口で 1 回だけ
+   作り、各行は自分の key (すでに作っている) と比べる。`path_eq(a, b)` は定義上
+   `normalize_keep_drive(a) == normalize_keep_drive(b)` で、`key_for` も同じ関数なので、結果は同じ。
+   DFS の重複除外は key を移動して入れる「key → 論理行 index」の表にし、描画ではこの表を要求／focus の
+   対象 key だけ引くためにも使う (`visible_rows_indexed`)。focus が残る pass に全パスを再正規化しない。
+   表はその DFS の結果だけに属し、frame をまたぐ cache は足さない (独立実装レビュー P2-1)。
+2. **`reveal_active` / `reachable` の線形探索をやめる**: 祖先ごとに `cache.children.iter().any(path_eq)` で
+   「表示する子に含まれるか」を探している。`CachedListing` に、表示する子の key の集合 `child_keys` を足し、
+   `children` と同じ 1 つの構築関数 (worker 側の走査と test 用の seed) で作る。`membership` (隠しフォルダも
+   含む全ディレクトリ) とは意味が違うので、代わりには使わない。
+3. **描画のスクロール記録を、変わったときだけ作り直す**: 毎フレーム全パスを `Arc<[PathBuf]>` に複製してから
+   比べていたのを、前回の記録と行のパスをその場で比べ、違うときだけ複製する。
+
+採らないもの: `visible_rows()` の結果をフレームをまたいで持つ (§6)、`sync_folder_pane_state` の 2 回呼びを
+1 回にまとめる (キー処理と描画の間で状態が変わり得るので、順序の検討が別に要る)。仮想化と上の 3 つの後に
+全件処理がまだ目立つ場合は、数字を付けて報告し、別の段階で扱う。
+仮想化後の計測には、定常状態に加えて「多数の枝を開いてから畳んだ状態 (論理行より cached node が多い。
+`has_pending()` は全 node を走査する)」と「走査の完了結果を採用するフレーム (`poll_pending` が
+`reconcile_demand` を追加で呼ぶ)」を入れる (Sol 設計レビュー P3-7)。
+
+
+## 5. 仮想化しても変えない 5 つ
+
+| 守るもの | 今の持ち主 | 仮想化後 |
+| --- | --- | --- |
+| §1.828 の入力の関門の順序 | `begin_folder_pane_label_input` (前パスの `label_display` を使う) → `take_label_results` → 描画 → `label_display` の公開 → `finish_folder_pane_presentation` | 順序と各段の条件は変えない。変わるのは `label_display.rows` に入る行が「描画した行」に限られることだけ。ポインタが当たり得るのは可視の行だけなので、ヒット判定の結果は同じ |
+| 単 / ダブルクリック・右クリック・D&D のヒット情報と path 単位の ID | 行ごとの `scope_id(("folder_pane_row", normalize_keep_drive(path)))`、`FolderPaneLabelWidgets`、`DropGeometry` (可視域と交わる行だけ採用済み)、AccessKit の Click は描画中の `resp.clicked()` | 同じ ID・同じ矩形で記録する。描く行 ⊇ 可視域と交わる行 (§4.1 の範囲と全行同じ行高) なので、D&D の行一覧は今と同じ。AccessKit の要求の宛先と egui の focus の行は、範囲の外でも本来の位置に描き、今と同じ `Response` で受ける (§4.2b)。貼り付けメニューは path と画面上の位置を自分で持つので、元の行が描かれなくても保たれる |
+| 現在地への自動スクロール | 行の `Response::scroll_to_me` | 論理行 index の矩形へ `scroll_to_rect` (§4.2)。画面外の現在地も表示できる |
+| キーボードで辿る全論理行 | `handle_tree_key` → `move_cursor` が `visible_rows()` (データ) を使う | 変えない (描画に依存しない) |
+| 折りたたみ前後の位置 | `FolderPaneScrollMemory::restore` (先頭行の path と行内の位置を、新しい一覧の index × pitch へ移す) | 変えない。全体の高さが行数 × pitch なので、restore の座標系も今と同じ |
+
+## 6. 状態の組み合わせを減らす検討
+
+- `visible_rows()` の結果をフレームをまたいでキャッシュし、変更のたびに無効化する案は採らない。
+  行の内容は nodes・展開集合・現在地・カーソル・ドライブ・走査状態に依存し、書き手が多い。
+  無効化の漏れという新しい組み合わせを作るより、1 回あたりの費用を下げる (§4.3)。
+- `request_discard` は使わない (§4.1)。
+- 新しい状態は足さない。仮想化は「どの行を組み立てるか」を描画のその場で決めるだけで、
+  行 pitch とスクロール位置の記録は既存の `FolderPaneScrollMemory` を使う。
+
+## 7. 変わること・退行の確認
+
+- 画面外の行は AccessKit のツリーに出なくなる。§2.2 の停止を解消する中心の効果でもある。
+  mIV のツリー操作は独自のカーソル (`handle_tree_key`) で、AccessKit のノードには依存しない。
+  **スクリーンリーダー等で画面外の行を読み上げ順に辿る使い方は、可視の範囲だけになる。Sol 設計レビュー P1-3
+  (既存の挙動の縮小) には、利用者の判断 (2026-11-22) により受け入れ** (統括経由)。条件は、矢印キー・マウス・
+  タッチ・D&D では今までどおり全部の行に届くこと (§5・§10 のテストで固定する)。全行のノードを残す案は、
+  4 万ノードの受け渡しによる数十秒の停止と毎フレーム約 18 ms をそのまま残すため採らない。
+  利用者向けの説明 (2 行):
+  > 大量のフォルダがあるとき、ツリーは画面に見えている行だけを作るようにします。
+  > 読み上げソフトなどから画面外の行を直接たどることはできなくなりますが、矢印キーでの移動はこれまでどおり全部の行に届きます。
+  マニュアル・製品ページに読み上げの説明は無いので、公開文書は変えない。
+- 本番では Tab による egui の focus 移動を無効にしている (`src/egui_focus_policy.rs`)。AccessKit の `Focus`
+  要求などで行の部品が egui の focus を得た場合、その行は範囲の外へ出ても毎 pass 描くので (§4.2b)、focus は
+  今と同じく保たれる。focus が終わるのは、行が論理行から消えたとき (畳む・削除)、ペインが無効・非表示になった
+  とき、egui の通常の focus 移動のときで、今と同じ。画面外の行は AccessKit のノードに出ないが、要求の宛先の行と
+  focus の行は例外として出る。
+- 上の 2 点以外に、通常の操作が遅くなる・できなくなる変更は無い見込み。
+- 細かな違い: ツールチップは描いた行にだけ付く (ポインタが当たるのは可視の行だけなので、見え方は同じ)。
+
+## 8. detached・複数ウィンドウ
+
+ツリーは root viewport だけで描画する (`render_folder_pane_tree_with` の先頭で ROOT 以外は戻る)。
+detached の述語・viewport の選択や配送には触れない。
+
+## 9. まれな失敗
+
+対象外 (ディスク・DB に書かない描画の変更)。
+
+## 10. テスト
+
+新しい回帰テスト (すべて headless、使い捨てデータ):
+
+1. **組み立てる行の上限**: 6,000 行の木で、要求も focus も無い pass では `label_display.rows` が
+   「表示域の高さ ÷ pitch + 3」以下であること。要求・focus がある pass では「それ + 重複を除いた要求先と focus の行」。
+   accesskit を有効にした pass で、出力の `accesskit_update` のノード数が行数に比例しない
+   (例: 1,000 行と 6,000 行で同程度) こと。
+2. **初回の pitch の下限**: スクロール記録が無い最初の pass でも、描いた行が表示域の下端まで届くこと。
+3. **画面外の現在地への自動スクロール**: 6,000 行で `set_cursor(5000 行目)` → 数 pass 後にその行が描かれ、
+   表示域の中央付近にあること。アクティブなフォルダが画面外にあるときも、開いた直後に同じく表示されること。
+4. **キーボードで辿る**: 表示域の最終行から Down を押し続けると、毎回カーソル行が描かれて表示域に入ること。
+   Up で先頭まで戻れること。論理行の順序が仮想化の前後で変わらないこと (`visible_rows()` との突き合わせ)。
+5. **折りたたみ前後の位置**: 中ほどまでスクロールした状態で、表示域より上の枝を畳む・開くと、先頭の path と
+   行内の位置が保たれること (既存の `actual_folder_pane_deep_scroll_anchor_...` を大きな木で)。
+6. **ヒット情報**: スクロール後の可視行への単クリック・ダブルクリック・矢印・右クリック (貼り付けメニューの path)
+   が、その行の path で結果を出すこと。D&D の行一覧 (`main_drop_geometry`) が可視行と一致すること。
+7. **データ側の同値性**: 隠しフォルダが `membership` にだけある場合に、`reveal_active` が今と同じ所で止まること。
+   大文字小文字・区切り文字の違う現在地・カーソルでも、`is_active` / `is_cursor` が今と同じになること。
+8. **行の高さ** (P1-1): 24pt を超える行の実高、loading / error 行を含めて全行の割り当てが `row_height` と一致すること。
+   pitch の増減 (`pixels_per_point` やフォントの変更) の前後で、描画範囲が表示域を覆い、現在地の reveal が
+   新しい座標で中央に来ること。末尾の半端なページ、表示高ゼロ・1 行未満でも panic せず描くこと。
+   paths と pitch が同時に変わる pass の restore / reveal。
+9. **待ち行列に残った要求**: B の部品 ID を取る → B を範囲外へ動かす pass を 1 回 → そのあとで B への Click /
+   ScrollIntoView / Focus を届ける。B が起動・表示・focus されること。中の文字の部品・tooltip の Label への要求も同じ。
+   「B の親を畳む → 再び開く (B は範囲外) → 待っていた B への Click を届ける」でも B が起動されること。
+9b. **同じ pass で範囲外へ出た行への AccessKit 要求と focus** (P1-2 と 2 回目の指摘): 前 pass で見えていた行 B への
+   `Click` と、その上の枝 A を開くポインタ入力 (子を大量に挿入して B を描画範囲の外へ押し出す) を同じ pass に
+   入れても、B が起動されること。B が egui の focus を持つ場合の Space も同じ。親 A を畳んで B が論理行から
+   消えた場合は起動されないこと (今と同じ)。上の行への Space と下の行への Click が同じ pass に届いたとき、
+   今と同じ行順で適用されること。`ScrollIntoView` が範囲外の行でも効き、既存の `Requested` との優先が今と同じこと。
+   egui の modal が開いているとき・ペインが無効のときは起動されないこと。
+10. **自動スクロールと手の入力の取り合い**: `FollowingRefresh` 中に、ツリーの内側 / 外側でのホイール、慣性の
+    停止 (今の `Idle` への戻し条件) が今と同じになること。ゲームパッドの上下で可視の境界を越えると reveal すること
+    (`handle_tree_key` 共通)。
+11. **貼り付けメニュー**: メニューを開いた元の行がスクロールで描かれなくなっても、メニューが同じ path と位置で
+    残り、貼り付け先がその path になること。
+12. テストは本番の focus policy (`egui_focus_policy`) を入れた Context で行う (P3-8)。
+13. 既存の §1.828 の入力の関門・ツリーのテスト一式 (`folder_pane`、`ui_folder_pane`、`folder_pane_refresh_tests` 系、
+   `ui_folder_pane_drop_tests`、`main_chrome` の r6 系) が通ること。画面外の行の矩形や AccessKit ノードを直接見て
+   いるテストは、可視の行を見る形に直す (検査の意味は変えない)。
+
+性能の比較 (同じ合成ツリー・同じ手順で仮想化の前後):
+headless (`perf827` の計測、master に入れない) の行数・galley・時間と、portable-smoke の
+`folder_pane_ms`・`App::update`・`platform_ms`・accesskit ノード・初回の最大停止・スクロール中の fps と UI スレッド。
+
+## 11. 計装 (`frame/root_outside`)
+
+update の外の区間を測るために、perf ログが有効なときだけ動く型付きの計装を足した。
+`egui_wgpu::frame_diag` が ROOT の pass と GPU の各段の時間・数を持ち、App が次のフレームで perf イベントに出す。
+記録する区間は、egui の pass、platform output (accesskit の受け渡し)、tessellate、GPU の textures / buffers / acquire /
+encode / submit / release / present、イベント待ち。数は accesskit のノード、shape、mesh、頂点、index、texture delta。
+perf ログが無効なら記録しない。
+
+区間の意味 (Sol 設計レビュー P2-4・P2-5・P3-6 で直した):
+- `run_ui_ms` は `integration.update` 全体 (この operation のすべての egui pass、retry、App の logic と UI を含む)。
+  App の時間を引いた「egui だけ」の値は出さない (pass の数と App の区間が対応しないため)。
+- `paint_ms` は tessellate の後から post_rendering まで。GPU の各段 (`gpu_*`) はその内訳で、足し合わせる
+  独立の項目ではない。どれも CPU 側の経過時間。
+- `between_root_ops_ms` は前の ROOT operation の終わりから今の operation の入口まで。イベント待ちのほかに、
+  ほかの viewport の処理や logic だけの pass を含む。
+- painter は、eframe が始めた ROOT operation の中でだけ記録する (`begin_root_pass` が返す scope 〜 `finish`)。
+  logic だけの pass や途中の return では scope の Drop が記録を捨てて閉じる (Sol 設計レビュー 2 回目 P2-5)。
+  別のフレームの記録を取り込まない。paint しなかった operation は `gpu_painted=false`。
+- perf ログが無効なら、有効フラグを読むだけで時計を読まない。
+
+**提案**: この計装は製品に残す。利用者の perf ログにも、update の外の内訳が出るようになる。
+計測専用の切り替え (`MIV_TREE827_NO_ACCESSKIT`) と headless の計測テストは master に入れない。
+
+## 12. 実装引き渡し (2026-11-22)
+
+`tree-virtualize-827` に §4.1〜4.3 の実装と headless 回帰テストを追加。ビルド・テスト・性能再計測は
+実装担当では実行せず、設計担当の共有 runner で確認する。成功結果の記録ではない。
+
+- `folder_pane_row_height` は現 pass のフォントと spacing から高さを決め、`show_rows`・行の割り当て・
+  論理行の reveal・保存 pitch に同じ値を渡す。frameless Button の余白なし・theme の Body font fallback は
+  vendored egui の `theme/default_style.rs` / `widget_style/mod.rs` で確認した。
+- 可視行・AccessKit の全 action の宛先行・focus 行を論理順に併合する。reveal もカーソルの論理順の位置で発行し、
+  後続行の ScrollIntoView との既存の順序を保つ。行を描く前後の全 layer の登録件数差から索引へ追加する。
+- `FolderPaneRowIds` は egui temp data と `FolderPaneState` が同じ表を共有する。
+  状態側の suspend / drive switch / reload が Context を受け取らないため、共有した表そのものをその境界で消す。
+  新たな invalidation flag / generation は足さず、DisplayNotFresh / PaneDisabled・論理行の除去では保持する。
+  追従によるドライブ変更と `set_cursor` によるドライブ変更も同じ寿命境界へ接続した。
+- `CachedListing::new` を production scanner と全 test constructor で共用し、表示対象の `child_keys` と
+  隠しフォルダを含む `membership` を分ける。行の active / cursor の正規化は入口で一度だけ行い、
+  スクロール記録の paths Arc は全パスが一致する pass で再利用する。
+- §10 の大規模木・初回下端・画面外 reveal・キー／ゲームパッド・anchor・ヒット／D&D・行高変更・遅着要求・
+  同 pass の挿入／除去・focus／行順／modal／無効化・貼り付け menu の回帰を `ui_folder_pane` に追加。
+  データ側の同値性と索引寿命は `folder_pane` に追加した。wheel / inertia は既存の
+  `folder_pane_open_*wheel*` と `folder_pane_drag_inertia_then_arrow_reveal_stays_visible` を継続使用する。
+- 既存の deep-scroll anchor テストを 6,000 行へ拡張し、anchor と req40 系のヒット先選択は、
+  画面外行の矩形を要求せず、その pass の `label_display.rows` から選ぶ。
+  `folder_pane_refresh_tests` の Context と新しい UI テストには本番の Tab focus policy を入れる。
+
+共有 runner での確認対象は §10 全体。§4.3 の畳んだ後／完了結果の採用 pass を含む性能比較、
+ビルド、既存回帰一式、追加テストの実行結果は未取得。
+
+共有 runner 初回結果 (利用者提供): 413 実行、206 成功、207 失敗。206 件は文字の生の行高
+25.65625 pt と実割当 26 pt の不一致。`epaint/src/text/text_layout.rs:1094` の物理 pixel 丸めと
+`text_layout_types.rs:1063` の GUI 丸めを行高計算へ反映した。debug assert は維持する。
+残る中央位置の失敗は、倍率変更 fixture の `set_pixels_per_point(1.5)` が zoom を変更し、
+`egui/src/context.rs:486–496` で最初の pass の screen_rect を 300 pt → 200 pt に縮める経路と整合する。
+fixture は `ViewportInfo::native_pixels_per_point` を入力し、論理 viewport を一定にしたまま DPI を変更する。
+行高テストは既定／製品フォント、ppp 1 / 1.25 / 1.3 / 1.5 / 2、3 種の文字サイズ・fractional な
+interact_size、通常／loading／error 行へ拡張した。この修正後のビルド・テストは実装担当では未実行。
+
+共有 runner 再実行結果 (利用者提供): 413 実行、411 成功、2 失敗。行高の不一致は解消。
+残る gamepad テストは delivered 軸だけを更新していたが、本番 `stick_pair` は physical 軸を読む。
+fixture を `set_axis` (両方の軸状態を設定) に変更し、neutral poll で repeat をリセットしてから Y 入力を配る。
+Y=-1 → Down、Y=+1 → Up と既存の本番ルートは変更しない。
+D&D 検査の追加 pass は RawInput.time を省略し、egui が f32 の predicted_dt を f64 へ変換して加算していた。
+次の frame ordinal / 60.0 と微小な逆行を起こすため、geometry-only pass を含む fixture 全 pass を
+単一の f64 clock を持つ input helper へ統一した。本番コードは変更せず、この修正後の実行は共有 runner 待ち。
+
+その後の関連テストは 454/454 成功 (利用者提供)。UI snapshot の location light / dark 2 件では、
+選択背景の指定高まで行全体の高さに変えていたため、master より約2 px高くなっていた。
+矢印とラベルの指定サイズを従来の24 ptへ戻し、horizontal の set_height と仮想化の pitch は維持した。
+5倍率の行高テストは行全体の等高検査を維持し、ラベルだけ24 ptを期待する。snapshot PNG は更新せず、
+この修正後の実行結果は共有 runner 待ち。
+
+続く利用者提供結果では、矢印24 pt・horizontal が row_height の組合せで 27 != 26 の assert が212件、
+folder-tree snapshot が7件失敗。利用者指定により最終の組み立てを horizontal と矢印の枠は row_height、
+ラベルだけ24 ptとする。初期版の snapshot 差分が選択背景だけだったという利用者の実行証拠に基づく。
+単一の丸め済み max 式と固定 pitch を維持し、行別の自然高へは移行しない。名前の new_child は親の高さを
+広げないが、spinner と `!` も含めた予測高を horizontal と矢印で確保するため、全行を等高にできる。
+5倍率・両フォント設定・通常／loading／error の検査は、行全体と矢印が row_height、ラベルが24 ptの等値を検査する。
+debug assert と snapshot PNG は変更せず、この組み立てでのビルド・テストは共有 runner 待ち。
+
+## 13. 独立実装レビューへの対応
+
+対象実装は `0927c027b`。関連454/454成功・tree snapshot7/7画素一致は利用者提供結果。
+独立レビュー (Sol xhigh) は P1なし。以下の修正後のビルド・テストは実装担当では実行せず、共有 runner 待ち。
+
+- **P2-1**: DFS の重複除外表を key → index にして、その正規化済み key を extra-row 解決でも再利用。
+  key の複製は増やさず、`normalize_keep_drive` の同値性と最初の重複行を採用する規則を維持した。
+  focus を持つ6,000行の UI テストに構造検査を加え、解決処理が対象 key だけを列挙し、全論理行の
+  再正規化／索引走査をしないことを固定。データ側では case／separator 違いの重複と index を検査する。
+- **P2-2**: tree の scope 登録位置からその行の部品を回収し、tooltip は現在 pass の registry だけから回収。
+  `WidgetRects::order/get_layer` (`widget_rect.rs:143/153`)、明示 scope ID (`ui.rs:255`)、
+  tooltip Area ID (`tooltip.rs:156/227`、`popup.rs:622`)、pass ごとの registry clear (`pass_state.rs:285`)
+  を確認した。処理量は描画行の部品数＋現在 pass の tooltip 部品／layer 数で、過去 layer 数に依存しない。
+  既存の tooltip-index テストを維持・強化し、全 current tooltip widget の帰属を検査。
+  別ケースで両 pass buffer に空になった過去 layer を1,000個残し、長い名前の省略 tooltip も検査する。
+- **P3-1**: 追加／並べ替え後の anchor 矩形を temp data から読む前に、更新後の label_display.rows に
+  anchor が可視行として存在することを assert。
+- **P3-2**: gamepad の上下それぞれで、カーソルを保持したまま viewport を先頭へ移し、次の対象行が
+  label_display.rows に無いことを確認してから入力する。論理カーソル更新と画面外からの中央 reveal を検査。
+
+追加テストは `virtual_tree_focus_resolves_extra_rows_from_precomputed_key_index`、
+`virtual_tree_row_index_reuses_normalized_identity_and_first_duplicate`、
+`virtual_tree_widget_index_ignores_historical_tooltip_layers`。行の描画寸法・snapshot PNG・入力裁定・索引の寿命は変更しない。
+
+
+## 12. 改修前後の計測 (2026-11-22、開発側、使い捨ての合成データ)
+
+条件は §2 と同じ (portable-smoke・release・test-script の合成キー入力、`--data-dir target\portable-smoke\data`)。
+改修前は master 相当 (20:02〜20:09)、改修後は 81b764b65 (23:08〜23:13)。「accesskit 無効」は計測専用の切り替えで、製品には入れない。
+
+| 条件 | 全画面スクロール中の fps | folder_pane_ms | App::update | accesskit の受け渡し | ノード | 初回の最大停止 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 重い・そのまま | 16 → **73** | 36.6 → **3.3** | 40.8 → **8.8** | 18.1 → **0.1** ms | 42,830 → **320** | 45.6 s → **なし** |
+| 重い・accesskit 無効 | 26 → **119** | 30.1 → **2.2** | 34.5 → **5.7** | 0 → 0 | — | なし → なし |
+| 重い・自作 UIA クライアントあり | 15 → **109** | 37.3 → **2.4** | 41.7 → **6.2** | 18.3 → **0.1** ms | 42,830 → **320** | 37.4 s → **なし** |
+| 軽い・そのまま | 153 → 149 | 0.7 → 0.3 | 4.1 → 4.0 | 0.2 → 0.1 | 970 → 320 | なし |
+| 軽い・accesskit 無効 | 162 → 157 | 0.6 → 0.2 | 4.2 → 3.9 | 0 | — | なし |
+| 軽い・UIA クライアントあり | 156 → 151 | 0.7 → 0.3 | 4.1 → 3.9 | 0.2 → 0.1 | 970 → 320 | なし |
+
+- headless (debug、6,000 行): 組み立てた行 6,006 → 35、galley 6,011 → 40、`render_folder_pane` 294 → 22.8 ms。
+- tessellate・GPU の encode / submit / present・頂点数は前後で変わらず小さい (各 0.1〜1 ms、頂点約 8,000)。
+- 残り: 重い場所の folder_pane は 2〜3 ms で、軽い場所 (0.2〜0.3 ms) より多い。ほとんどがデータ側の全論理行の
+  処理 (`visible_rows()` を 1 フレームに 3 回) で、§4.3 の削減の後も残る。重い・そのままの 73 fps は
+  同じ条件の UIA ありの 109 fps より低く、計測ごとのばらつきを含む。全行処理の削減は別の段階で扱う。

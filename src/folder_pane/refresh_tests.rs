@@ -9,11 +9,8 @@ fn synthetic_tree(root: &Path, children: Vec<PathBuf>) -> FolderPaneState {
     state
 }
 fn listing(options: FolderPaneListingOptions, children: Vec<PathBuf>) -> CachedListing {
-    CachedListing {
-        membership: children.iter().map(|path| key_for(path)).collect(),
-        children,
-        options,
-    }
+    let membership = children.iter().map(|path| key_for(path)).collect();
+    CachedListing::new(children, membership, options)
 }
 
 #[test]
@@ -504,11 +501,11 @@ fn hidden_membership_preserves_cached_branch_but_retires_its_running_scan() {
     state.test_seed_listing(&hidden, vec![hidden.join("kept")], true);
     let child_tx = pending(&mut state, &hidden);
     let tx = pending(&mut state, &root);
-    tx.send(Ok(CachedListing {
-        children: vec![],
-        membership: [key_for(&hidden)].into_iter().collect(),
-        options: state.listing_options,
-    }))
+    tx.send(Ok(CachedListing::new(
+        vec![],
+        [key_for(&hidden)].into_iter().collect(),
+        state.listing_options,
+    )))
     .unwrap();
     state.poll_pending();
     assert_eq!(state.test_children(&hidden), vec![hidden.join("kept")]);
