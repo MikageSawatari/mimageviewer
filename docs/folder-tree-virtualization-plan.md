@@ -82,11 +82,16 @@ UI スレッドの CPU は 1 コアに対する割合。perf イベント `frame
   そこで、行の部品が要る高さを、描く前にその pass のフォントと spacing から求める
   `folder_pane_row_height(ui) = max(FOLDER_PANE_ROW_HEIGHT, interact_size.y, 矢印 (16pt の文字の行高。
   frame(false) のボタンは padding を付けない)、名前の行高、"!" の行高)`。式は vendored egui の実際の寸法規則に
-  合わせ、実装時にテストで実高と一致することを確かめる (2 回目 P3-6)。`draw_folder_pane_row` はこの高さを受け取り、
-  `set_height` / `add_sized` / `allocate_exact_size` をすべてこの高さで行う。部品はこの高さに収まるように
+  合わせる。文字の行高は `round_to_pixels(現 pixels_per_point).round_ui()`、固定高と `interact_size.y` は
+  `round_ui()` してから最大を取る。文字レイアウトの物理 pixel 丸めと Ui の 1/32 pt 丸めを区別し、
+  最大値全体を物理 pixel に丸めて fractional な Ui 最小高を縮めない。実装時にテストで実高と一致することを
+  確かめる (2 回目 P3-6)。`draw_folder_pane_row` はこの高さを受け取り、horizontal の `set_height` と
+  矢印の `add_sized` に使う。矢印の枠を行と同じ高さにし、小さい枠の中央配置からの下方向への拡張を避ける。
+  ラベルの `allocate_exact_size` は master と同じ `FOLDER_PANE_ROW_HEIGHT` (24 pt) を指定して行内で中央配置し、
+  選択背景とラベルの clip 寸法を変えない。spinner と `!` は従来どおり。部品は行全体の高さに収まるように
   求めてあるので、行の割り当ては全行 (loading / error を含む) で同じ高さになる。
   `pitch = row_height + item_spacing.y` を、描画範囲・全体の高さ・reveal の矩形・保存する
-  `FolderPaneScrollMemory::pitch` のすべてに使う (1 つの値)。24pt に切り詰めることはしない。
+  `FolderPaneScrollMemory::pitch` のすべてに使う (1 つの値)。行全体の高さを24ptに切り詰めることはしない。
   描いた行の実高が `row_height` と違えば debug_assert で落とし、テストで固定する。
   `request_discard` による同一フレームの作り直しは使わない (§1.828 のパス番号に依存する入力の関門と
   組み合わせが増えるため)。
@@ -280,4 +285,63 @@ perf ログが無効なら記録しない。
 
 **提案**: この計装は製品に残す。利用者の perf ログにも、update の外の内訳が出るようになる。
 計測専用の切り替え (`MIV_TREE827_NO_ACCESSKIT`) と headless の計測テストは master に入れない。
+
+## 12. 実装引き渡し (2026-11-22)
+
+`tree-virtualize-827` に §4.1〜4.3 の実装と headless 回帰テストを追加。ビルド・テスト・性能再計測は
+実装担当では実行せず、設計担当の共有 runner で確認する。成功結果の記録ではない。
+
+- `folder_pane_row_height` は現 pass のフォントと spacing から高さを決め、`show_rows`・行の割り当て・
+  論理行の reveal・保存 pitch に同じ値を渡す。frameless Button の余白なし・theme の Body font fallback は
+  vendored egui の `theme/default_style.rs` / `widget_style/mod.rs` で確認した。
+- 可視行・AccessKit の全 action の宛先行・focus 行を論理順に併合する。reveal もカーソルの論理順の位置で発行し、
+  後続行の ScrollIntoView との既存の順序を保つ。行を描く前後の全 layer の登録件数差から索引へ追加する。
+- `FolderPaneRowIds` は egui temp data と `FolderPaneState` が同じ表を共有する。
+  状態側の suspend / drive switch / reload が Context を受け取らないため、共有した表そのものをその境界で消す。
+  新たな invalidation flag / generation は足さず、DisplayNotFresh / PaneDisabled・論理行の除去では保持する。
+  追従によるドライブ変更と `set_cursor` によるドライブ変更も同じ寿命境界へ接続した。
+- `CachedListing::new` を production scanner と全 test constructor で共用し、表示対象の `child_keys` と
+  隠しフォルダを含む `membership` を分ける。行の active / cursor の正規化は入口で一度だけ行い、
+  スクロール記録の paths Arc は全パスが一致する pass で再利用する。
+- §10 の大規模木・初回下端・画面外 reveal・キー／ゲームパッド・anchor・ヒット／D&D・行高変更・遅着要求・
+  同 pass の挿入／除去・focus／行順／modal／無効化・貼り付け menu の回帰を `ui_folder_pane` に追加。
+  データ側の同値性と索引寿命は `folder_pane` に追加した。wheel / inertia は既存の
+  `folder_pane_open_*wheel*` と `folder_pane_drag_inertia_then_arrow_reveal_stays_visible` を継続使用する。
+- 既存の deep-scroll anchor テストを 6,000 行へ拡張し、anchor と req40 系のヒット先選択は、
+  画面外行の矩形を要求せず、その pass の `label_display.rows` から選ぶ。
+  `folder_pane_refresh_tests` の Context と新しい UI テストには本番の Tab focus policy を入れる。
+
+共有 runner での確認対象は §10 全体。§4.3 の畳んだ後／完了結果の採用 pass を含む性能比較、
+ビルド、既存回帰一式、追加テストの実行結果は未取得。
+
+共有 runner 初回結果 (利用者提供): 413 実行、206 成功、207 失敗。206 件は文字の生の行高
+25.65625 pt と実割当 26 pt の不一致。`epaint/src/text/text_layout.rs:1094` の物理 pixel 丸めと
+`text_layout_types.rs:1063` の GUI 丸めを行高計算へ反映した。debug assert は維持する。
+残る中央位置の失敗は、倍率変更 fixture の `set_pixels_per_point(1.5)` が zoom を変更し、
+`egui/src/context.rs:486–496` で最初の pass の screen_rect を 300 pt → 200 pt に縮める経路と整合する。
+fixture は `ViewportInfo::native_pixels_per_point` を入力し、論理 viewport を一定にしたまま DPI を変更する。
+行高テストは既定／製品フォント、ppp 1 / 1.25 / 1.3 / 1.5 / 2、3 種の文字サイズ・fractional な
+interact_size、通常／loading／error 行へ拡張した。この修正後のビルド・テストは実装担当では未実行。
+
+共有 runner 再実行結果 (利用者提供): 413 実行、411 成功、2 失敗。行高の不一致は解消。
+残る gamepad テストは delivered 軸だけを更新していたが、本番 `stick_pair` は physical 軸を読む。
+fixture を `set_axis` (両方の軸状態を設定) に変更し、neutral poll で repeat をリセットしてから Y 入力を配る。
+Y=-1 → Down、Y=+1 → Up と既存の本番ルートは変更しない。
+D&D 検査の追加 pass は RawInput.time を省略し、egui が f32 の predicted_dt を f64 へ変換して加算していた。
+次の frame ordinal / 60.0 と微小な逆行を起こすため、geometry-only pass を含む fixture 全 pass を
+単一の f64 clock を持つ input helper へ統一した。本番コードは変更せず、この修正後の実行は共有 runner 待ち。
+
+その後の関連テストは 454/454 成功 (利用者提供)。UI snapshot の location light / dark 2 件では、
+選択背景の指定高まで行全体の高さに変えていたため、master より約2 px高くなっていた。
+矢印とラベルの指定サイズを従来の24 ptへ戻し、horizontal の set_height と仮想化の pitch は維持した。
+5倍率の行高テストは行全体の等高検査を維持し、ラベルだけ24 ptを期待する。snapshot PNG は更新せず、
+この修正後の実行結果は共有 runner 待ち。
+
+続く利用者提供結果では、矢印24 pt・horizontal が row_height の組合せで 27 != 26 の assert が212件、
+folder-tree snapshot が7件失敗。利用者指定により最終の組み立てを horizontal と矢印の枠は row_height、
+ラベルだけ24 ptとする。初期版の snapshot 差分が選択背景だけだったという利用者の実行証拠に基づく。
+単一の丸め済み max 式と固定 pitch を維持し、行別の自然高へは移行しない。名前の new_child は親の高さを
+広げないが、spinner と `!` も含めた予測高を horizontal と矢印で確保するため、全行を等高にできる。
+5倍率・両フォント設定・通常／loading／error の検査は、行全体と矢印が row_height、ラベルが24 ptの等値を検査する。
+debug assert と snapshot PNG は変更せず、この組み立てでのビルド・テストは共有 runner 待ち。
 
