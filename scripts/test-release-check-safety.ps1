@@ -100,6 +100,8 @@ if(-not ('MivReleaseCheckNative' -as [type])){
     Add-Type @'
 using System.Text.RegularExpressions;
 public static class MivReleaseCheckNative {
+ public static object ForegroundSample;
+ public static object CaptureForeground(uint app,long root){return ForegroundSample;}
  public static int GeometryDpi=96;
  public static int[] WorkArea=new[]{0,0,1920,1040};
  public static int[] ClientSize=new[]{1420,900};
@@ -256,6 +258,86 @@ public static class MivReleaseCheckNative {
     $source=$compile.CommandElements[1].Value.Replace('MivReleaseCheckNative','MivReleaseCheckGeometryCompilationOnly')
     Assert-True ($source.Contains('SetThreadDpiAwarenessContext') -and $source.Contains('AdjustWindowRectExForDpi') -and $source.Contains('GetClientRect')) 'Physical geometry native declarations missing.'
     Add-Type -TypeDefinition $source
+}
+& {
+    # Saved foreground evidence only: the native capture is a fake and the
+    # classifier reads synthetic files. No desktop or app is touched.
+    $temporaryBase=[IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
+    $temporary=Join-Path $temporaryBase ('miv-foreground-safety-'+[Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $temporary | Out-Null
+    $utf8=New-Object Text.UTF8Encoding($false)
+    function New-FakeForegroundRecord {
+        param([long]$Time)
+        return [pscustomobject][ordered]@{
+            schema_version=1;unix_ms=$Time;app_pid=101;root_hwnd=888;root_pid=101
+            root_alive=$true;root_visible=$true;root_minimized=$false;root_hung=$false
+            foreground_hwnd=999;foreground_pid=202;foreground_process_name='other.exe';foreground_class='OtherClass'
+            foreground_descendant=$false;ownership_resolved=$true
+            ghost_original_hwnd=0;ghost_original_pid=0;ghost_original_descendant=$null;ghost_original_process_name=''
+        }
+    }
+    try{
+        $timeline=New-ReleaseCheckForegroundTimeline $temporary 101
+        [MivReleaseCheckNative]::ForegroundSample=New-FakeForegroundRecord 1000
+        Write-ReleaseCheckForegroundTimeline $timeline 888
+        [MivReleaseCheckNative]::ForegroundSample=New-FakeForegroundRecord 1400
+        Write-ReleaseCheckForegroundTimeline $timeline 777
+        Assert-True ($timeline.root_hwnd -eq 888) 'Foreground recorder followed a replacement root.'
+        Assert-True (@(Get-Content -LiteralPath $timeline.path).Count -eq 1) 'Unchanged foreground emitted before the heartbeat.'
+        [MivReleaseCheckNative]::ForegroundSample=New-FakeForegroundRecord 1500
+        Write-ReleaseCheckForegroundTimeline $timeline
+        [MivReleaseCheckNative]::ForegroundSample=New-FakeForegroundRecord 2000
+        Write-ReleaseCheckForegroundTimeline $timeline
+        [MivReleaseCheckNative]::ForegroundSample=New-FakeForegroundRecord 2100
+        [MivReleaseCheckNative]::ForegroundSample.foreground_class='ChangedClass'
+        Write-ReleaseCheckForegroundTimeline $timeline
+        [MivReleaseCheckNative]::ForegroundSample=New-FakeForegroundRecord 2200
+        [MivReleaseCheckNative]::ForegroundSample.foreground_class='ChangedClass'
+        Write-ReleaseCheckForegroundTimeline $timeline -Force
+        $rows=@(Get-Content -LiteralPath $timeline.path -Encoding UTF8 | ForEach-Object {$_ | ConvertFrom-Json})
+        Assert-True (($rows.unix_ms -join ',') -eq '1000,1500,2000,2100,2200') 'Foreground change/heartbeat/final evidence cadence changed.'
+        $failurePath=Join-Path $temporary 'foreground-wait-failure.json'
+        $failure=@{schema_version=1;pid=101;root_hwnd=888;wait_kind='exact-root-foreground';wait_start_unix_ms=1500;failure_unix_ms=2100}
+        Write-ReleaseCheckJson $failurePath $failure
+        $result=New-ReleaseCheckProcessExitResult 'seed-profile' 1 101 $temporary
+        Assert-True ($result.verdict -eq 'SKIPPED' -and $result.exit_code -eq 2 -and $result.evidence.process.process_exit_code -eq 1) 'External typed wait did not preserve raw exit 1 and classify SKIPPED/2.'
+        Assert-True (($result.environment_errors -join ' ') -like '*other.exe*pid=202*1500*' -or ($result.environment_errors -join ' ') -like '*1500*other.exe*pid=202*') 'Foreground classification reason lost interval/identity.'
+        $result=New-ReleaseCheckProcessExitResult 'seed-profile' 1 101 $temporary -ForegroundRecordingError 'fake append failure'
+        Assert-True ($result.verdict -eq 'FAIL' -and $result.exit_code -eq 1) 'Failed foreground recording hid process exit 1.'
+        # A same-PID popup is a potential product regression, not an environment excuse.
+        $bad=New-FakeForegroundRecord 2000;$bad.foreground_pid=101;$bad.foreground_hwnd=12345
+        $lines=@((New-FakeForegroundRecord 1000),$bad,(New-FakeForegroundRecord 2200)) | ForEach-Object {$_ | ConvertTo-Json -Compress}
+        [IO.File]::WriteAllText($timeline.path,($lines -join "`n")+"`n",$utf8)
+        $result=New-ReleaseCheckProcessExitResult 'seed-profile' 1 101 $temporary
+        Assert-True ($result.verdict -eq 'FAIL' -and $result.exit_code -eq 1 -and ($result.failures -join ' ') -like '*application or descendant*') 'Same-PID foreground wait was hidden as SKIPPED.'
+        [IO.File]::WriteAllText($failurePath,'not json',$utf8)
+        $result=New-ReleaseCheckProcessExitResult 'seed-profile' 1 101 $temporary
+        Assert-True ($result.verdict -eq 'FAIL' -and $result.exit_code -eq 1) 'Unreadable typed failure was hidden as SKIPPED.'
+        Remove-Item -LiteralPath $failurePath
+        $result=New-ReleaseCheckProcessExitResult 'seed-profile' 1 101 $temporary
+        Assert-True ($result.verdict -eq 'FAIL' -and $result.failures[0].StartsWith('seed-profile application exit code 1; foreground timeline rows=')) 'Untyped script failure changed classification or lost saved foreground evidence.'
+        $runAst=Get-TestAst (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1')
+        $session=@($runAst.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-ReleaseSession'},$true))[0]
+        $calls=@($session.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Write-ReleaseCheckForegroundTimeline'},$true))
+        $completion=@($runAst.FindAll({param($n)$n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Complete-ReleaseSession'},$true))[0]
+        $finalCalls=@($completion.FindAll({param($n)$n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Write-ReleaseCheckForegroundTimeline'},$true))
+        Assert-True ($calls.Count -eq 1 -and $finalCalls.Count -eq 1 -and $finalCalls[0].Extent.Text.Contains('-Force') -and $session.Body.Extent.Text.Contains('Complete-ReleaseSession $CaseId $dir $foregroundTimeline')) 'Session foreground sampling/final boundary missing.'
+        $focusCalls=@($session.FindAll({param($n)$n -is [Management.Automation.Language.InvokeMemberExpressionAst] -and $n.Member.Extent.Text -eq 'SetForegroundWindow'},$true))
+        Assert-True ($focusCalls.Count -eq 2) 'Foreground instrumentation added an activation/reacquisition path.'
+        $samplerLoops=@($session.FindAll({param($n)$n -is [Management.Automation.Language.WhileStatementAst] -and $n.Condition.Extent.Text -eq '-not $sampler.HasExited'},$true))
+        Assert-True ($samplerLoops.Count -eq 1 -and -not $samplerLoops[0].Body.Extent.Text.Contains('Write-ReleaseCheckForegroundTimeline')) 'Foreground instrumentation entered the sampler measurement loop.'
+        $support=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Support.ps1') -Encoding UTF8 -Raw
+        Assert-True (-not $support.Contains('GetWindowText') -and $support.Contains('HungWindowFromGhostWindow') -and $support.Contains('IsHungAppWindow') -and $support.Contains('Process32FirstW') -and $support.Contains('GetProcessTimes')) 'Foreground capture uses unsafe messages or lacks native ownership/health evidence.'
+        $script=Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ui-smoke\release-checks.rhai') -Encoding UTF8 -Raw
+        Assert-True (($script.Split(@('release_check_foreground_wait_failure('),[StringSplitOptions]::None).Count-1) -eq 2 -and -not $script.Contains('environment:')) 'Foreground wait allowlist/non-foreground failure messages changed.'
+        Assert-True ($script.Contains('release_check_foreground_wait_failure("exact-root-foreground", wait_start)') -and
+            $script.Contains('release_check_foreground_wait_failure("ctrl-g-search-focus", wait_start)') -and
+            $script.Contains('for attempt in 0..200') -and $script.Contains('for attempt in 0..300')) 'Foreground wait kinds or original wait bounds changed.'
+    }finally{
+        $resolved=[IO.Path]::GetFullPath($temporary)
+        if(-not $resolved.StartsWith($temporaryBase+'\',[StringComparison]::OrdinalIgnoreCase)){throw 'Unsafe foreground test cleanup path.'}
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+    }
 }
 $start=[datetime]'2026-10-09T00:00:00Z'
 $fake=[pscustomobject]@{Id=101;Path=$exe;StartTime=$start;HasExited=$false}

@@ -137,6 +137,117 @@ fn unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+enum ForegroundWaitKind {
+    #[serde(rename = "exact-root-foreground")]
+    ExactRootForeground,
+    #[serde(rename = "ctrl-g-search-focus")]
+    CtrlGSearchFocus,
+}
+
+impl ForegroundWaitKind {
+    fn parse(kind: &str) -> Result<Self, String> {
+        match kind {
+            "exact-root-foreground" => Ok(Self::ExactRootForeground),
+            "ctrl-g-search-focus" => Ok(Self::CtrlGSearchFocus),
+            _ => Err("unsupported foreground wait kind".into()),
+        }
+    }
+
+    fn failure_message(self) -> &'static str {
+        match self {
+            Self::ExactRootForeground => "exact root foreground was not acquired",
+            Self::CtrlGSearchFocus => "Ctrl+G search did not focus",
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ForegroundWaitFailure {
+    schema_version: u32,
+    pid: u32,
+    root_hwnd: u64,
+    wait_kind: ForegroundWaitKind,
+    wait_start_unix_ms: u64,
+    failure_unix_ms: u64,
+}
+
+impl ForegroundWaitFailure {
+    fn new(
+        pid: u32,
+        root_hwnd: u64,
+        kind: &str,
+        wait_start_unix_ms: rhai::INT,
+        failure_unix_ms: u64,
+    ) -> Result<Self, String> {
+        let wait_kind = ForegroundWaitKind::parse(kind)?;
+        let wait_start_unix_ms = u64::try_from(wait_start_unix_ms)
+            .map_err(|_| "invalid foreground wait start timestamp".to_string())?;
+        if pid == 0
+            || root_hwnd == 0
+            || wait_start_unix_ms == 0
+            || failure_unix_ms < wait_start_unix_ms
+        {
+            return Err("invalid foreground wait identity or timestamp interval".into());
+        }
+        Ok(Self {
+            schema_version: 1,
+            pid,
+            root_hwnd,
+            wait_kind,
+            wait_start_unix_ms,
+            failure_unix_ms,
+        })
+    }
+}
+
+fn fail_foreground_wait(directory: &Path, failure: &ForegroundWaitFailure) -> Result<(), String> {
+    write_json(
+        &directory.join("foreground-wait-failure.json"),
+        &serde_json::to_value(failure).map_err(|error| error.to_string())?,
+    )?;
+    // Evidence refines the external runner's classification, never the script outcome.
+    Err(failure.wait_kind.failure_message().into())
+}
+
+fn foreground_wait_failure(
+    bridge: &RunnerBridge,
+    kind: &str,
+    wait_start_unix_ms: rhai::INT,
+) -> Result<(), String> {
+    // Capture the failure boundary before reading cached identity or writing evidence.
+    // A failed wait must not issue Observe, request focus, or wait on a UI writer.
+    let failure_unix_ms = unix_ms();
+    let root_hwnd = bridge
+        .snapshot
+        .try_read()
+        .map_err(|_| "foreground wait cached root snapshot unavailable".to_string())?
+        .windows
+        .iter()
+        .find_map(|window| match window.identity.as_ref() {
+            Some(TestScriptWindowIdentity::Root { hwnd, .. }) if window.role == "root" => {
+                Some(*hwnd)
+            }
+            _ => None,
+        })
+        .ok_or("foreground wait cached root identity unavailable")?;
+    let failure = ForegroundWaitFailure::new(
+        std::process::id(),
+        root_hwnd,
+        kind,
+        wait_start_unix_ms,
+        failure_unix_ms,
+    )?;
+    let directory = session()
+        .try_lock()
+        .map_err(|_| "foreground wait release session unavailable".to_string())?
+        .as_ref()
+        .ok_or("foreground wait requires an active release session")?
+        .directory
+        .clone();
+    fail_foreground_wait(&directory, &failure)
+}
+
 // Every ancestor is checked: canonicalize alone would hide a junction escape.
 fn plain_path(path: &Path) -> Result<PathBuf, String> {
     for ancestor in path.ancestors() {
@@ -577,6 +688,16 @@ fn search_seed_evidence(observation: &Value) -> Option<Value> {
 }
 
 pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
+    engine.register_fn("release_check_foreground_wait_start", || -> rhai::INT {
+        unix_ms() as rhai::INT
+    });
+    let b = bridge.clone();
+    engine.register_fn(
+        "release_check_foreground_wait_failure",
+        move |kind: ImmutableString, start: rhai::INT| -> Result<(), Box<EvalAltResult>> {
+            foreground_wait_failure(&b, kind.as_str(), start).map_err(rhai_error)
+        },
+    );
     engine.register_fn(
         "release_check_begin",
         |id: ImmutableString, dir: ImmutableString| -> Result<(), Box<EvalAltResult>> {
@@ -916,6 +1037,105 @@ fn protocol_ai_trace(proof: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn foreground_wait_failure_publishes_typed_record_and_still_fails() {
+        for kind in ["exact-root-foreground", "ctrl-g-search-focus"] {
+            let directory = tempfile::tempdir().unwrap();
+            let failure =
+                ForegroundWaitFailure::new(42, 0x1234, kind, 1700000000000, 1700000020000).unwrap();
+            let error = fail_foreground_wait(directory.path(), &failure).unwrap_err();
+            assert_eq!(error, failure.wait_kind.failure_message());
+            assert!(matches!(
+                *rhai_error(error),
+                EvalAltResult::ErrorRuntime(..)
+            ));
+            let path = directory.path().join("foreground-wait-failure.json");
+            let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                value,
+                json!({"schema_version":1,"pid":42,"root_hwnd":0x1234,
+                    "wait_kind":kind,"wait_start_unix_ms":1700000000000_u64,
+                    "failure_unix_ms":1700000020000_u64})
+            );
+            assert!(!path.with_extension("json.tmp").exists());
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn foreground_wait_failure_rejects_untyped_kinds_and_invalid_boundaries() {
+        for kind in [
+            "",
+            "EXACT-ROOT-FOREGROUND",
+            "Ctrl+G search did not focus",
+            "initial-index-settle",
+            "fixture-search-settle",
+            "perf-folder-mismatch",
+        ] {
+            assert!(ForegroundWaitFailure::new(42, 1234, kind, 100, 200).is_err());
+        }
+        for (pid, hwnd, start, end) in [
+            (0, 1234, 100, 200),
+            (42, 0, 100, 200),
+            (42, 1234, -1, 200),
+            (42, 1234, 0, 200),
+            (42, 1234, 201, 200),
+        ] {
+            assert!(
+                ForegroundWaitFailure::new(pid, hwnd, "exact-root-foreground", start, end).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn foreground_wait_failure_write_error_does_not_report_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let failure =
+            ForegroundWaitFailure::new(42, 1234, "exact-root-foreground", 100, 200).unwrap();
+        assert!(fail_foreground_wait(&missing, &failure).is_err());
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn foreground_wait_failure_registered_api_uses_only_available_cached_identity() {
+        let (tx, rx) = mpsc::channel();
+        let bridge = RunnerBridge {
+            gamepad: super::super::gamepad_input::WorkerState::default(),
+            tx,
+            snapshot: Arc::new(RwLock::new(super::super::TestScriptSnapshot::default())),
+            interrupt: Arc::new(super::super::InterruptState::default()),
+            wake: Arc::new(|| panic!("foreground failure must not wake the UI")),
+            next_hold_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            action_selection: Arc::new(Mutex::new(TestScriptActionSelection::LegacyImplicit)),
+            pointer_regions: super::super::pointer_input::new_shared_catalog(),
+        };
+        let mut engine = Engine::new();
+        register(&mut engine, bridge.clone());
+        let start = engine
+            .eval::<rhai::INT>("release_check_foreground_wait_start()")
+            .unwrap();
+        assert!(start > 0);
+        let script =
+            format!("release_check_foreground_wait_failure(\"exact-root-foreground\", {start})");
+        let missing = engine.eval::<()>(&script).unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("cached root identity unavailable")
+        );
+        // A writer held by a stalled UI cannot delay this timeout path.
+        let _writer = bridge.snapshot.write().unwrap();
+        let unavailable = engine.eval::<()>(&script).unwrap_err();
+        assert!(
+            unavailable
+                .to_string()
+                .contains("cached root snapshot unavailable")
+        );
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
 
     #[test]
     fn release_checks_search_seed_evidence_requires_settled_results() {

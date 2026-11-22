@@ -14,22 +14,51 @@ function Invoke-ReleaseCheckPreflight {
 }
 
 function New-ReleaseCheckProcessExitResult {
-    param([string]$CaseId,[int]$ProcessExitCode,[int]$ProcessId,[string]$Directory)
+    param([string]$CaseId,[int]$ProcessExitCode,[int]$ProcessId,[string]$Directory,[string]$ForegroundRecordingError)
     if($ProcessExitCode -eq 0){return $null}
     # The runtime assigns 1 to ScriptFailure and 2 to EnvironmentFailure.
     # Unknown nonzero exits are also failures; retain the original process code.
     $environment=$ProcessExitCode -eq 2
     $message="$CaseId application exit code $ProcessExitCode"
+    $foregroundDecision=$null
+    if($ProcessExitCode -eq 1 -and (Test-Path -LiteralPath (Join-Path $Directory 'foreground-wait-failure.json') -PathType Leaf)){
+        # The typed record only nominates a wait. The Python classifier is the
+        # sole owner of the evidence rules; the runtime remains ScriptFailure.
+        try{
+            if($ForegroundRecordingError){throw ('Foreground recording failed: '+$ForegroundRecordingError)}
+            $python=(Get-Command python -ErrorAction Stop).Source
+            $json=@(& $python -B (Join-Path $PSScriptRoot '..\..\release_check_foreground.py') --directory $Directory --expected-pid $ProcessId --case-id $CaseId)
+            if($LASTEXITCODE -ne 0){throw 'Foreground classification command failed.'}
+            $foregroundDecision=($json -join "`n") | ConvertFrom-Json
+            if($foregroundDecision.schema_version -ne 1 -or $foregroundDecision.case_id -ne $CaseId -or $foregroundDecision.environment -isnot [bool] -or
+                [string]::IsNullOrWhiteSpace([string]$foregroundDecision.summary)){throw 'Invalid foreground classification response.'}
+            $environment=$foregroundDecision.environment
+            $message+='; '+$foregroundDecision.summary
+        }catch{
+            $environment=$false
+            $message+='; foreground wait evidence unavailable: '+$_.Exception.Message
+        }
+    }elseif(Test-Path -LiteralPath (Join-Path $Directory 'foreground-timeline.jsonl') -PathType Leaf){
+        # Untyped failures keep their existing verdict. Include the saved final
+        # observation for diagnosis only; never infer an environment excuse.
+        try{
+            $lines=@(Get-Content -LiteralPath (Join-Path $Directory 'foreground-timeline.jsonl') -Encoding UTF8)
+            if(-not $lines.Count){throw 'empty timeline'}
+            $message+='; foreground timeline rows='+$lines.Count+'; latest snapshot='+$lines[-1]
+        }catch{$message+='; foreground timeline unreadable: '+$_.Exception.Message}
+    }
     $failureMessages=@();$environmentMessages=@()
     if($environment){$environmentMessages+=@($message)}else{$failureMessages+=@($message)}
     return [ordered]@{
         schema_version=1;case_id=$CaseId;verdict=$(if($environment){'SKIPPED'}else{'FAIL'})
         exit_code=$(if($environment){2}else{1})
         failures=$failureMessages;environment_errors=$environmentMessages;warnings=@()
-        evidence=@{process=@{pid=$ProcessId;process_exited=$true;process_exit_code=$ProcessExitCode}
+        evidence=@{process=@{pid=$ProcessId;process_exited=$true;process_exit_code=$ProcessExitCode};foreground_wait_classification=$foregroundDecision
             failure_artifacts=@{directory=$Directory;perf_log=(Join-Path $Directory 'perf_events.jsonl')
                 app_log=(Join-Path $Directory 'mimageviewer.log');process=(Join-Path $Directory 'process.json')
-                case_evidence=(Join-Path $Directory 'case-evidence.json')}}
+                case_evidence=(Join-Path $Directory 'case-evidence.json')
+                foreground_timeline=(Join-Path $Directory 'foreground-timeline.jsonl')
+                foreground_wait_failure=(Join-Path $Directory 'foreground-wait-failure.json')}}
     }
 }
 
@@ -112,6 +141,10 @@ public static class MivReleaseCheckNative {
  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr w);
  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern bool PostMessage(IntPtr w,uint message,IntPtr wParam,IntPtr lParam);
  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr w);
+ [DllImport("user32.dll")] static extern bool IsWindow(IntPtr w);
+ [DllImport("user32.dll")] static extern bool IsIconic(IntPtr w);
+ [DllImport("user32.dll")] static extern bool IsHungAppWindow(IntPtr w);
+ [DllImport("user32.dll",ExactSpelling=true)] static extern IntPtr HungWindowFromGhostWindow(IntPtr w);
  [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr w);
  [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
  [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
@@ -151,6 +184,83 @@ public static class MivReleaseCheckNative {
    try{Rect c,r,area;if(!GetClientRect(hwnd,out c)||!GetWindowRect(hwnd,out r)||!SystemParametersInfo(0x30,0,out area,0))throw new Exception("Root window geometry/work area unavailable");return new[]{(int)GetDpiForWindow(hwnd),c.R-c.L,c.B-c.T,r.L,r.T,r.R,r.B,area.L,area.T,area.R,area.B};}
    finally{SetThreadDpiAwarenessContext(previous);}
  }
+ [StructLayout(LayoutKind.Sequential,CharSet=CharSet.Unicode)] struct ProcessEntry {
+   public uint size,usage,pid; public UIntPtr heap; public uint module,threads,parent;
+   public int priority;public uint flags;
+   [MarshalAs(UnmanagedType.ByValTStr,SizeConst=260)] public string exe;
+ }
+ [DllImport("kernel32.dll",SetLastError=true)] static extern IntPtr CreateToolhelp32Snapshot(uint flags,uint pid);
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,ExactSpelling=true,SetLastError=true)] static extern bool Process32FirstW(IntPtr snapshot,ref ProcessEntry entry);
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,ExactSpelling=true,SetLastError=true)] static extern bool Process32NextW(IntPtr snapshot,ref ProcessEntry entry);
+ [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
+ [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(uint access,bool inherit,uint pid);
+ [DllImport("kernel32.dll")] static extern bool GetProcessTimes(IntPtr h,out long creation,out long exit,out long kernel,out long user);
+ static long? ProcessStart(uint pid){
+   var h=OpenProcess(0x1000,false,pid);if(h==IntPtr.Zero)return null;
+   try{long c,e,k,u;return GetProcessTimes(h,out c,out e,out k,out u)?(long?)c:null;}
+   finally{CloseHandle(h);}
+ }
+ static System.Collections.Generic.Dictionary<uint,ProcessEntry> Processes(){
+   var h=CreateToolhelp32Snapshot(2,0);if(h==new IntPtr(-1))return null;
+   try{var result=new System.Collections.Generic.Dictionary<uint,ProcessEntry>();var e=new ProcessEntry();e.size=(uint)Marshal.SizeOf(e);
+     if(!Process32FirstW(h,ref e))return null;
+     do{result[e.pid]=e;}while(Process32NextW(h,ref e));
+     return Marshal.GetLastWin32Error()==18?result:null;
+   }finally{CloseHandle(h);}
+ }
+ static bool? Descendant(uint candidate,uint app,System.Collections.Generic.Dictionary<uint,ProcessEntry> processes){
+   if(processes==null)return null;
+   var appStart=ProcessStart(app);if(!appStart.HasValue)return null;
+   var seen=new System.Collections.Generic.HashSet<uint>();
+   while(candidate!=0){if(candidate==app)return true;ProcessEntry e;
+     if(!seen.Add(candidate)||!processes.TryGetValue(candidate,out e))return null;
+     if(e.parent==app)return true;
+     var childStart=ProcessStart(candidate);if(!childStart.HasValue)return null;
+     // A process already alive before this held app process cannot descend from
+     // it. Stop before protected system ancestors whose times may be unreadable.
+     if(childStart.Value<appStart.Value)return false;
+     if(e.parent!=0){
+       // A recycled parent PID must not turn an orphaned mIV descendant into
+       // apparently unrelated foreground evidence. Unknown ancestry stays FAIL.
+       var parentStart=ProcessStart(e.parent);
+       if(!parentStart.HasValue||parentStart.Value>childStart.Value)return null;
+     }
+     candidate=e.parent;
+   }return false;
+ }
+ static string ProcessName(uint pid,System.Collections.Generic.Dictionary<uint,ProcessEntry> processes){
+   ProcessEntry e;return processes!=null&&processes.TryGetValue(pid,out e)?System.IO.Path.GetFileName(e.exe):"";
+ }
+ public class ForegroundRecord {
+   public int schema_version=1; public long unix_ms,root_hwnd,foreground_hwnd,ghost_original_hwnd;
+   public uint app_pid,root_pid,foreground_pid,ghost_original_pid;
+   public bool root_alive,root_visible,root_minimized,root_hung,ownership_resolved;
+   public bool? foreground_descendant,ghost_original_descendant;
+   public string foreground_process_name="",foreground_class="",ghost_original_process_name="";
+ }
+ public static ForegroundRecord CaptureForeground(uint app,long root){
+   var r=new ForegroundRecord();r.unix_ms=DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();r.app_pid=app;r.root_hwnd=root;
+   var window=new IntPtr(root);r.root_alive=root!=0&&IsWindow(window);
+   GetWindowThreadProcessId(window,out r.root_pid);
+   if(r.root_alive){r.root_visible=IsWindowVisible(window);r.root_minimized=IsIconic(window);r.root_hung=IsHungAppWindow(window);}
+   var fg=GetForegroundWindow();r.foreground_hwnd=fg.ToInt64();GetWindowThreadProcessId(fg,out r.foreground_pid);
+   var name=new StringBuilder(256);GetClassName(fg,name,name.Capacity);r.foreground_class=name.ToString();
+   var processes=Processes();r.foreground_process_name=ProcessName(r.foreground_pid,processes);
+   r.foreground_descendant=Descendant(r.foreground_pid,app,processes);
+   r.ownership_resolved=fg!=IntPtr.Zero&&r.foreground_pid!=0&&r.foreground_process_name!=""&&r.foreground_class!=""&&r.foreground_descendant.HasValue;
+   if(r.foreground_class=="Ghost"){
+     // Undocumented on some Windows versions: unavailable resolution is evidence
+     // failure, never permission to classify a possibly hung mIV as external.
+     try{var original=HungWindowFromGhostWindow(fg);r.ghost_original_hwnd=original.ToInt64();
+       GetWindowThreadProcessId(original,out r.ghost_original_pid);
+       r.ghost_original_process_name=ProcessName(r.ghost_original_pid,processes);
+       r.ghost_original_descendant=Descendant(r.ghost_original_pid,app,processes);
+     }catch(EntryPointNotFoundException){r.ownership_resolved=false;}
+   }
+   uint current;GetWindowThreadProcessId(fg,out current);
+   if(GetForegroundWindow()!=fg||current!=r.foreground_pid)r.ownership_resolved=false;
+   return r;
+ }
  public static int[] Counts(uint pid){int total=0,visible=0;EnumWindows((w,p)=>{uint id;GetWindowThreadProcessId(w,out id);if(id==pid){total++;if(IsWindowVisible(w)){var b=new StringBuilder(256);GetClassName(w,b,256);Rect r;var c=b.ToString();if(c!="IME"&&c!="MSCTFIME UI"&&c!="Winit Thread Event Target"&&GetWindowRect(w,out r)&&r.R-r.L>=64&&r.B-r.T>=64)visible++;}}return true;},IntPtr.Zero);return new[]{total,visible};}
  [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
  [DllImport("user32.dll")] public static extern IntPtr GetThreadDesktop(uint t);
@@ -161,6 +271,29 @@ public static class MivReleaseCheckNative {
  public static void CheckDesktop(){var p=OpenInputDesktop(0,false,1);try{if(DesktopName(p)!=DesktopName(GetThreadDesktop(GetCurrentThreadId()))||GetForegroundWindow()==IntPtr.Zero)throw new Exception("Input desktop unavailable/mismatched");}finally{if(p!=IntPtr.Zero)CloseDesktop(p);}}
 }
 '@
+}
+
+function New-ReleaseCheckForegroundTimeline {
+    param([string]$Directory,[int]$AppPid)
+    return [pscustomobject]@{path=(Join-Path $Directory 'foreground-timeline.jsonl');app_pid=$AppPid;root_hwnd=[long]0;last_unix_ms=[long]0;last_signature=''}
+}
+
+function Write-ReleaseCheckForegroundTimeline {
+    param($Timeline,[long]$RootHwnd=0,[switch]$Force)
+    # Follow only the first root identity. A replacement/destruction must remain
+    # visible in the evidence, rather than silently following another app window.
+    if($Timeline.root_hwnd -eq 0 -and $RootHwnd -ne 0){$Timeline.root_hwnd=$RootHwnd}
+    $record=[MivReleaseCheckNative]::CaptureForeground([uint32]$Timeline.app_pid,$Timeline.root_hwnd)
+    $signature=$record | Select-Object * -ExcludeProperty unix_ms | ConvertTo-Json -Depth 6 -Compress
+    # Called by the existing outer loop only, never the sampler measurement loop.
+    # Heartbeat at 500ms plus every observed change, allowing for the existing
+    # identity query's latency. The classifier refuses gaps over 1500ms; a stall
+    # is never filled in or retried to make the coverage appear continuous.
+    if($record.unix_ms -gt $Timeline.last_unix_ms -and ($Force -or $signature -ne $Timeline.last_signature -or $record.unix_ms-$Timeline.last_unix_ms -ge 500)){
+        $line=ConvertTo-Json -InputObject $record -Depth 6 -Compress
+        [IO.File]::AppendAllText($Timeline.path,$line+"`n",(New-Object Text.UTF8Encoding($false)))
+        $Timeline.last_signature=$signature;$Timeline.last_unix_ms=$record.unix_ms
+    }
 }
 
 function Get-ReleaseCheckWindowSample {

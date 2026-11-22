@@ -44,20 +44,22 @@ fn settled(path) {
         + " loading_complete=" + last.loading_complete + " index_settled=" + last.index_settled);
 }
 fn focused() {
+    let wait_start = release_check_foreground_wait_start();
     for attempt in 0..200 {
         if release_check_observe().focused { return; }
         sleep(100);
     }
-    fail("environment: exact root foreground was not acquired");
+    release_check_foreground_wait_failure("exact-root-foreground", wait_start);
 }
 fn search(term, expected_hits) {
     focused();
     let before = release_check_observe();
+    let wait_start = release_check_foreground_wait_start();
     tap_key("G", "ctrl");
     for attempt in 0..300 {
         let state = release_check_observe();
         if state.search_active && state.search_focused { break; }
-        if attempt == 299 { fail("environment: Ctrl+G search did not focus"); }
+        if attempt == 299 { release_check_foreground_wait_failure("ctrl-g-search-focus", wait_start); }
         sleep(100);
     }
     release_check_text(term);
@@ -71,7 +73,7 @@ fn search(term, expected_hits) {
         }
         sleep(100);
     }
-    fail("environment: fixture search did not settle");
+    fail("fixture search did not settle");
 }
 
 
@@ -84,7 +86,7 @@ select_root();
 for attempt in 0..1800 {
     let state = release_check_observe();
     if state.index_settled && state.interaction_ready { break; }
-    if attempt == 1799 { fail("environment: initial index scans did not settle"); }
+    if attempt == 1799 { fail("initial index scans did not settle"); }
     sleep(100);
 }
 let evidence = #{ case_id: CASE_ID, pid: release_check_observe().pid };
@@ -115,7 +117,7 @@ if CASE_ID == "seed-profile" || CASE_ID == "seed-perf-cached" {
 } else if CASE_ID.starts_with("perf-") {
     // Preserve the initial startup lf_scan; do not turn it into a second open.
     if comparable_path(release_check_observe().current_folder_path) != comparable_path(MANY_PATH) {
-        fail("environment: initial perf folder does not match generated many-folder fixture");
+        fail("initial perf folder does not match generated many-folder fixture");
     }
     settled(MANY_PATH);
     evidence.folder_open = #{ completed: true };

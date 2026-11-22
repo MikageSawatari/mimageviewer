@@ -7082,6 +7082,87 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn release_checks_foreground_wait_recipe_uses_typed_timeouts_without_reactivation() {
+        let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
+            .replace("__SEARCH_HITS__", "[]")
+            .replace("__CACHE_PATHS__", "[]")
+            .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__LOAD_PATHS__", "[]")
+            .replace("__INCLUDE_FIRST_AI__", "false")
+            .replace("__RUNNER_PID__", "202");
+        let helpers = source.split("\nrelease_check_begin(").next().unwrap();
+        for (search_focus, expression, kind, expected_observations, expected_sleeps) in [
+            (false, "focused()", "exact-root-foreground", 200, 200),
+            (
+                true,
+                "search(\"needle\", [])",
+                "ctrl-g-search-focus",
+                302,
+                299,
+            ),
+        ] {
+            // Execute the actual helpers with fake clocks, observations and input.
+            // No session, evidence file, native window or UI command is involved.
+            let observations = Arc::new(AtomicUsize::new(0));
+            let sleeps = Arc::new(AtomicUsize::new(0));
+            let keys = Arc::new(AtomicUsize::new(0));
+            let failures = Arc::new(Mutex::new(Vec::new()));
+            let (bridge, rx, wakes) = runner_bridge(ready_snapshot());
+            let mut engine = build_engine(bridge);
+            engine.register_fn("release_check_foreground_wait_start", || -> rhai::INT {
+                1234
+            });
+            let count = Arc::clone(&observations);
+            engine.register_fn("release_check_observe", move || {
+                count.fetch_add(1, AtomicOrdering::Relaxed);
+                super::release_checks::to_dynamic(&serde_json::json!({
+                    "focused":search_focus,"perf_t":1.0,
+                    "search_active":false,"search_focused":false
+                }))
+            });
+            let count = Arc::clone(&sleeps);
+            engine.register_fn("sleep", move |duration: rhai::INT| {
+                assert_eq!(duration, 100);
+                count.fetch_add(1, AtomicOrdering::Relaxed);
+            });
+            let count = Arc::clone(&keys);
+            engine.register_fn(
+                "tap_key",
+                move |key: ImmutableString, modifiers: ImmutableString| {
+                    assert_eq!(key.as_str(), "G");
+                    assert_eq!(modifiers.as_str(), "ctrl");
+                    count.fetch_add(1, AtomicOrdering::Relaxed);
+                },
+            );
+            let recorded = Arc::clone(&failures);
+            engine.register_fn(
+                "release_check_foreground_wait_failure",
+                move |kind: ImmutableString, start: rhai::INT| -> Result<(), Box<EvalAltResult>> {
+                    recorded.lock().unwrap().push((kind.to_string(), start));
+                    Err(rhai_error("typed foreground wait timeout"))
+                },
+            );
+            let error = engine
+                .eval::<()>(&format!("{helpers}\n{expression}"))
+                .unwrap_err();
+            assert!(error.to_string().contains("typed foreground wait timeout"));
+            assert_eq!(
+                observations.load(AtomicOrdering::Relaxed),
+                expected_observations
+            );
+            assert_eq!(sleeps.load(AtomicOrdering::Relaxed), expected_sleeps);
+            assert_eq!(
+                keys.load(AtomicOrdering::Relaxed),
+                usize::from(search_focus)
+            );
+            assert_eq!(*failures.lock().unwrap(), vec![(kind.to_string(), 1234)]);
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(wakes.load(AtomicOrdering::Relaxed), 0);
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn release_checks_seed_waits_for_pin_refresh_before_opening_parent() {
         // Execute the real seed branch/helpers with deterministic observations.
         // No capture, DB, window, input or measured idle interval is involved.

@@ -106,13 +106,21 @@ function Restore-ReleaseSeed {
     Assert-ReleaseCheckArtifact $repo -ExpectedSourceFingerprint $(if($FromKit){$script:expectedFingerprint}else{Get-MivSourceFingerprint $repo})
 }
 function Complete-ReleaseSession {
-    param([string]$CaseId,[string]$Directory)
+    param([string]$CaseId,[string]$Directory,$ForegroundTimeline=$null)
     $script:owned.WaitForExit();$exitCode=$script:owned.ExitCode
     $processPid=$script:owned.Id;$script:owned=$null
-    $exitResult=New-ReleaseCheckProcessExitResult $CaseId $exitCode $processPid $Directory
-    # Record the process verdict before any fallible archive/evidence operation.
-    # A later environment error cannot erase ScriptFailure or a crash.
+    $foregroundRecordingError=$null
+    if($null -ne $ForegroundTimeline){
+        # Bracket the typed failure even when the last normal loop saw exit.
+        # Preserve the known process verdict before stopping on recording I/O.
+        try{Write-ReleaseCheckForegroundTimeline $ForegroundTimeline -Force}
+        catch{$foregroundRecordingError=$_.Exception.Message}
+    }
+    $exitResult=New-ReleaseCheckProcessExitResult $CaseId $exitCode $processPid $Directory -ForegroundRecordingError $foregroundRecordingError
+    # Record the case verdict before an evidence/archive error can escape.
+    # A later environment error cannot erase an established FAIL or a crash.
     if($null -ne $exitResult){$cases.Add($exitResult)}
+    if($foregroundRecordingError){throw ('Foreground timeline recording failed: '+$foregroundRecordingError)}
     Save-ReleaseLogs $Directory
     $script:activeDir=$null # archived session no longer owns the restored logs
     if($null -eq $exitResult){
@@ -180,8 +188,10 @@ function Invoke-ReleaseSession {
     $null=$script:owned.Handle  # cache the handle so ExitCode is available after exit
     $script:ownedStart=$script:owned.StartTime.ToUniversalTime()
     Write-ReleaseCheckJson (Join-Path $dir 'process.json') @{pid=$script:owned.Id;start_time_utc=$script:ownedStart.ToString('o');exe=$exe;data_dir=$data}
+    $foregroundTimeline=New-ReleaseCheckForegroundTimeline $dir $script:owned.Id
     $timer=[Diagnostics.Stopwatch]::StartNew(); $focusTimer=[Diagnostics.Stopwatch]::StartNew(); $ready=Join-Path $dir 'ready.json';$focusAcquired=$false
     while(-not $script:owned.HasExited){
+        Write-ReleaseCheckForegroundTimeline $foregroundTimeline $script:owned.MainWindowHandle.ToInt64()
         if(-not (Test-OwnedReleaseProcessAlive)){break}
         if($timer.Elapsed.TotalSeconds -gt $TimeoutSeconds){throw "$CaseId session deadline exceeded."}
         if(-not $focusAcquired -and $focusTimer.Elapsed.TotalSeconds -le 20 -and $script:owned.MainWindowHandle -ne [IntPtr]::Zero){
@@ -239,7 +249,9 @@ function Invoke-ReleaseSession {
         }
         Start-Sleep -Milliseconds 100
     }
-    return Complete-ReleaseSession $CaseId $dir
+    # If shutdown already destroyed root before the post-failure sample, the
+    # classifier conservatively keeps FAIL rather than guessing lost foreground.
+    return Complete-ReleaseSession $CaseId $dir $foregroundTimeline
 }
 try {
     New-Item -ItemType Directory -Path $run | Out-Null

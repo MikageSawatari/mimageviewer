@@ -1467,6 +1467,23 @@ class SuiteGeometryTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
+    def test_environment_foreground_failure_preserves_raw_process_exit_and_record_reason(self):
+        cases = [finish(report(case_id)) for case_id in REQUIRED_CASES]
+        case = cases[0]
+        reason = ("external foreground persisted throughout the healthy application wait; "
+                  "rows=4, selected=4, wait=2000..4000; "
+                  "foreground=Code.exe (pid=99, class=Chrome_WidgetWin_1)")
+        case["environment_errors"].append(reason)
+        case["evidence"]["process"] = {"process_exit_code": 1}
+        finish(case)
+        self.assertEqual(case["exit_code"], 2)
+        result = summarize_suite(cases, metadata())
+        self.assertEqual(result["exit_code"], 2)
+        self.assertFalse(any("invalid case verdict/exit_code" in message
+                             for message in result["environment_errors"]))
+        self.assertEqual(result["cases"][0]["evidence"]["process"]["process_exit_code"], 1)
+        self.assertIn(reason, release_record(result))
+
     def test_missing_and_malformed_log_retained(self):
         with test_directory() as path:
             self.assertTrue(load_events_strict(path / "absent")[1])
