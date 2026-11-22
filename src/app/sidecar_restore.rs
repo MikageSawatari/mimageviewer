@@ -11,6 +11,10 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 #[path = "browser818_selection_tests.rs"]
 mod browser818_selection_tests;
 
+#[cfg(all(test, windows))]
+#[path = "browser818_activation_tests.rs"]
+mod browser818_activation_tests;
+
 #[cfg(test)]
 thread_local! {
     static IMPORT_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };

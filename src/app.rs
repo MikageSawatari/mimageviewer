@@ -45643,11 +45643,15 @@ impl App {
         let refresh_cursor = (!detached_physical)
             .then(|| self.take_hydration_refresh_cursor(&mut restore_intent))
             .flatten();
-        // たった今の操作が作った項目があれば、そこへ移すのが最優先。名前ヒント
-        // (`select_after_load`) も履歴も、そちらは「表示の都合」で決まる復元なので譲る。
+        // 操作結果のチェックは明示 open とも両立する。カーソルだけは明示 open に譲り、
+        // それがなければ操作結果を名前ヒント・履歴より優先する。
         let from_explicit_open = explicit_selection.is_some();
-        let from_operation =
-            !from_explicit_open && !detached_physical && self.apply_post_operation_selection();
+        let from_operation = !detached_physical
+            && if from_explicit_open {
+                self.apply_post_operation_checks().is_some()
+            } else {
+                self.apply_post_operation_selection()
+            };
         let restored = if let Some(idx) = explicit_selection {
             // An exact open is the selection owner until publication. Consume a general
             // name hint without applying it, so it cannot escape into the next folder.
@@ -45672,11 +45676,10 @@ impl App {
                         restored
                     }))
         };
-        // 追加された項目を見せるのが目的なので、操作由来のときは履歴のスクロール位置へ
-        // 戻さない (戻すと、選んだばかりの項目が画面外にある状態になる)。
+        // 操作結果がカーソルを持つときだけ履歴のスクロールへ戻さない。
+        // 明示 open は従来の履歴位置を保ち、要求画像が範囲外なら既存の reveal で見せる。
         if restored
-            && !from_explicit_open
-            && !from_operation
+            && (from_explicit_open || !from_operation)
             && let Some((scroll, _)) = history_state
         {
             // BS / direct-page close は select_after_load で選択対象を更新するが、
@@ -77767,10 +77770,18 @@ impl App {
     /// items を入れ替えた後の 1 か所からだけ呼ぶ。判断は
     /// [`crate::post_operation_selection::decide`] が持ち、ここは適用だけを行う。
     fn apply_post_operation_selection(&mut self) -> bool {
-        use crate::post_operation_selection as pos;
-        let Some(mut request) = self.post_operation_selection.take() else {
+        let Some(cursor) = self.apply_post_operation_checks() else {
             return false;
         };
+        self.select_item_after_load(cursor);
+        true
+    }
+
+    /// Apply operation-owned checkmarks and acknowledge the outputs independently
+    /// of cursor ownership. The caller may give the cursor to an explicit open.
+    fn apply_post_operation_checks(&mut self) -> Option<usize> {
+        use crate::post_operation_selection as pos;
+        let mut request = self.post_operation_selection.take()?;
         let visible = self.visible_real_file_paths();
         let now = std::time::Instant::now();
         let step = pos::decide(&request, self.current_folder.as_deref(), &visible, now);
@@ -77778,22 +77789,19 @@ impl App {
             if matches!(step, pos::Step::Wait) {
                 self.post_operation_selection = Some(request);
             }
-            return false;
+            return None;
         };
-        let Some(plan) = pos::plan_selection(&indices) else {
-            return false;
-        };
+        let plan = pos::plan_selection(&indices)?;
         crate::logger::log(format!(
-            "post_operation_selection: {} item(s) added, cursor -> {}",
+            "post_operation_selection: {} item(s) added, operation_cursor={}",
             indices.len(),
             plan.cursor
         ));
         self.checked.clear();
         self.checked.extend(plan.checked.iter().copied());
-        self.select_item_after_load(plan.cursor);
         request.record_applied(&visible, &indices, now);
         self.post_operation_selection = Some(request);
-        true
+        Some(plan.cursor)
     }
 
     /// 操作の結果へ選択を移す要求を積む。`folder` は適用先の実フォルダ。
@@ -77816,7 +77824,7 @@ impl App {
     /// 差分で拾う要求は「呼ぶ**前**の一覧」が要るので、Shell を呼ぶより先に積むしかない。
     /// その代わり、呼び出しがその場で失敗したら**必ずここを通す** — 残したままだと、
     /// 続く 10 秒の間に起きた**無関係なファイル追加**を貼り付け結果として選んでしまう
-    /// (R-08)。成功後の取り下げは適用側 (`apply_post_operation_selection`) が持つ。
+    /// (R-08)。成功後の適用記録は `apply_post_operation_checks` が持つ。
     pub(crate) fn cancel_post_operation_selection(&mut self, reason: &str) {
         if self.post_operation_selection.take().is_some() {
             crate::logger::log(format!(

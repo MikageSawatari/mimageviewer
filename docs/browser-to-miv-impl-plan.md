@@ -268,6 +268,13 @@ ActivationOpenPath::received
 - 明示要求が既存の fullscreen hydration action を置き換える場合は、古い action を退役させる。DirectMedia も close の取消対象に含める。モーダル中の受付、warm 表示、復元 worker、連動 sync の実行条件や順序を遅らせる仕組みは追加しない。App の新しい pending／detached フラグ、時刻による有効期限、回復処理、永続データ変更はない。
 - 新規テストは `browser818_open_owner`／`browser818_selection`。既存テストの owner 構築・期待値は相関 ID を保持する形へ追従し、シナリオ・アサーションの意味を維持する。cargo 実行は指示に従い最後の `cargo fmt` のみ。設計担当が新規 filter と上記既存 filter を共有実行枠で検証する。
 
+**段階2の退行修正 (2026-11-22、設計担当の指示に基づく追加実装・検証待ち)**
+
+- `af98859b9` の新規20件・既存158件の成功は設計担当から報告済み。追加の読み取り監査で、明示 open が履歴スクロールの適用と操作結果の自動チェックまで省く差を発見した。設計担当は、どちらも選択所有の修正に必須ではない副作用として除去すると決定した。
+- 明示対象は引き続きカーソルを所有するが、履歴のスクロールは従来の復元設定に従い適用する。そこから既存の reveal／行アンカーだけで要求画像を見せる。新しい配置規則・時間窓・待機は作らない。
+- 操作結果の判定・チェック付与・適用記録を `apply_post_operation_checks` に分ける。明示 open があればチェックだけを適用し、なければ従来の `apply_post_operation_selection` が操作結果へカーソルも移す。単枚ではチェックせず、複数枚はチェックする既存規則を維持する。
+- `target/browser818-repro/repro_tests.rs` の修正前 characterization と同じ activation → 実際に作られた hydration owner の待機 → F12 連動窓 → sync → close を、修正後の期待値で一本通しにしたテストを追加。通常全画面、履歴位置で可視／範囲外、行アンカー、操作結果との重なり、明示 open がない操作、単枚の各テストも追加する。filter は `browser818_selection`。今回も cargo は最後の `cargo fmt` のみで、ビルド・テストは設計担当へ引き継ぐ。
+
 ### 段階3：窓の用途、終了方針、F12 の共通拒否
 
 **範囲**

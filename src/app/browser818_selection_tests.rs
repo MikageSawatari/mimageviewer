@@ -4,20 +4,24 @@ use crate::app::external_open::{ViewerOpenIntent, ViewerOpenRequest};
 use crate::app::tests::phase_c_support::{AppTestEnv, setup_app};
 
 fn fixture() -> (AppTestEnv, PathBuf, Receiver<ThumbMsg>) {
+    fixture_with_names(&["a.png", "b.png"])
+}
+
+fn fixture_with_names(names: &[&str]) -> (AppTestEnv, PathBuf, Receiver<ThumbMsg>) {
     let mut app = setup_app();
     let folder = app.tmp.path().join("browser818-selection");
     std::fs::create_dir(&folder).unwrap();
-    for name in ["a.png", "b.png"] {
+    for name in names {
         image::RgbaImage::new(2, 2).save(folder.join(name)).unwrap();
     }
     app.current_folder = Some(folder.clone());
-    app.items = vec![
-        GridItem::Image(folder.join("a.png")),
-        GridItem::Image(folder.join("b.png")),
-    ];
-    app.thumbnails = vec![ThumbnailState::Pending; 2];
-    app.image_metas = vec![None; 2];
-    app.visible_indices = vec![0, 1];
+    app.items = names
+        .iter()
+        .map(|name| GridItem::Image(folder.join(name)))
+        .collect();
+    app.thumbnails = vec![ThumbnailState::Pending; names.len()];
+    app.image_metas = vec![None; names.len()];
+    app.visible_indices = (0..names.len()).collect();
     app.selected = Some(0);
     app.folder_history.insert(folder.clone(), (123.0, Some(0)));
     app.select_after_load = Some("a.png".into());
@@ -30,7 +34,7 @@ fn fixture() -> (AppTestEnv, PathBuf, Receiver<ThumbMsg>) {
             app.settings.file_type_visibility.clone(),
         ),
     );
-    for idx in 0..2 {
+    for idx in 0..names.len() {
         app.adjustment_page_params
             .insert(idx, crate::adjustment::AdjustParams::default());
     }
@@ -132,6 +136,158 @@ fn browser818_selection_hydration_preserves_exact_selection_before_publication()
         assert_eq!(app.selected, Some(1));
         assert!(app.select_after_load.is_none());
     }
+}
+
+fn scroll_fixture() -> (AppTestEnv, PathBuf, Receiver<ThumbMsg>) {
+    let (mut app, folder, rx) = fixture_with_names(&[
+        "a.png", "b.png", "c.png", "d.png", "e.png", "f.png", "g.png", "h.png",
+    ]);
+    app.settings.restore_folder_cursor_on_revisit = true;
+    app.folder_history.insert(folder.clone(), (100.0, Some(0)));
+    (app, folder, rx)
+}
+
+fn resolve_scroll_layout(app: &mut App) {
+    let geometry = crate::app::grid_scroll::GridScrollGeometry::new(1, 100.0, 300.0, 800.0);
+    let position = app.selected.and_then(|idx| {
+        app.visible_indices
+            .iter()
+            .position(|visible| *visible == idx)
+    });
+    let reveal = app.grid_scroll.reveal_requested();
+    assert!(
+        reveal,
+        "the accepted open/operation must use the existing reveal request"
+    );
+    app.grid_scroll.set_reveal_requested(false);
+    app.grid_scroll
+        .resolve_layout(geometry, reveal, position, true);
+}
+
+fn assert_explicit_history_scroll(requested: usize, anchor: Option<u32>, expected: f32) {
+    let (mut app, _folder, _rx) = scroll_fixture();
+    app.grid_scroll.set_row_anchor(anchor);
+    request_open(&mut app, requested, ViewerOpenRequest::preferences());
+    // Check hydration itself before final-open alignment could conceal a reset.
+    let state = app.sidecar_restore.take().unwrap();
+    let selection = app.sidecar_restore_explicit_selection(&state.common);
+    assert_eq!(selection, Some(requested));
+    let continuation = state.common.continuation.take_live().unwrap();
+    app.resume_loading_items_after_sidecar(
+        continuation,
+        &state.common.modal_observation,
+        selection,
+    );
+    assert_eq!(app.fullscreen_idx, None);
+    assert_eq!(app.selected, Some(requested));
+    assert_eq!(
+        app.grid_scroll.offset(),
+        100.0,
+        "history scroll is restored independently of its cursor"
+    );
+    resolve_scroll_layout(&mut app);
+    assert_eq!(app.grid_scroll.offset(), expected);
+    assert_eq!(app.selected, Some(requested));
+    if anchor.is_some() {
+        assert_eq!(
+            app.grid_scroll.row_anchor(),
+            None,
+            "existing reveal consumes the anchor once"
+        );
+    }
+}
+
+#[test]
+fn browser818_selection_history_scroll_kept_when_requested_image_is_visible() {
+    assert_explicit_history_scroll(2, None, 100.0);
+}
+
+#[test]
+fn browser818_selection_history_scroll_reveals_requested_image_outside_view() {
+    assert_explicit_history_scroll(6, None, 400.0);
+}
+
+#[test]
+fn browser818_selection_history_scroll_uses_existing_row_anchor() {
+    assert_explicit_history_scroll(6, Some(1), 500.0);
+}
+
+#[test]
+fn browser818_selection_pending_operation_checks_keep_explicit_cursor_and_history_scroll() {
+    for request in [ViewerOpenRequest::preferences(), overlay()] {
+        let (mut app, folder, _rx) = scroll_fixture();
+        app.checked.insert(7);
+        app.request_post_operation_selection(
+            folder.clone(),
+            crate::post_operation_selection::ExpectedOutputs::Known(vec![
+                folder.join("a.png"),
+                folder.join("c.png"),
+            ]),
+        );
+        request_open(&mut app, 5, request);
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.selected, Some(5));
+        assert_eq!(app.fullscreen_idx, Some(5));
+        assert_eq!(
+            app.checked,
+            [0, 2].into_iter().collect::<std::collections::HashSet<_>>()
+        );
+        assert_eq!(app.grid_scroll.offset(), 100.0);
+        assert!(app.post_operation_selection.as_ref().unwrap().has_applied());
+        assert_eq!(
+            app.grid_click_selection_anchor
+                .and_then(|anchor| anchor.index_for_generation(app.items_generation)),
+            Some(5)
+        );
+        resolve_scroll_layout(&mut app);
+        assert_eq!(app.grid_scroll.offset(), 300.0);
+        assert_eq!(
+            app.checked,
+            [0, 2].into_iter().collect::<std::collections::HashSet<_>>()
+        );
+    }
+}
+
+#[test]
+fn browser818_selection_operation_without_explicit_open_keeps_cursor_and_reveal() {
+    let (mut app, folder, _rx) = scroll_fixture();
+    app.request_post_operation_selection(
+        folder.clone(),
+        crate::post_operation_selection::ExpectedOutputs::Known(vec![
+            folder.join("f.png"),
+            folder.join("g.png"),
+        ]),
+    );
+    app.finish_page_identity_preparation_for_test();
+    assert_eq!(app.selected, Some(5));
+    assert_eq!(
+        app.checked,
+        [5, 6].into_iter().collect::<std::collections::HashSet<_>>()
+    );
+    assert_eq!(
+        app.grid_scroll.offset(),
+        0.0,
+        "operation-owned cursor retains its existing scroll policy"
+    );
+    resolve_scroll_layout(&mut app);
+    assert_eq!(app.grid_scroll.offset(), 300.0);
+}
+
+#[test]
+fn browser818_selection_single_output_still_has_no_checkmark_with_explicit_open() {
+    let (mut app, folder, _rx) = fixture();
+    app.settings.restore_folder_cursor_on_revisit = true;
+    app.checked.insert(1);
+    app.request_post_operation_selection(
+        folder.clone(),
+        crate::post_operation_selection::ExpectedOutputs::Known(vec![folder.join("a.png")]),
+    );
+    request_open(&mut app, 1, ViewerOpenRequest::preferences());
+    app.finish_page_identity_preparation_for_test();
+    assert_eq!(app.selected, Some(1));
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert!(app.checked.is_empty());
+    assert!(app.post_operation_selection.as_ref().unwrap().has_applied());
 }
 
 #[test]

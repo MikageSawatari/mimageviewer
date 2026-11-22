@@ -1490,6 +1490,8 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 - 履歴を適用してから連動 sync を止める症状パッチではなく、復元 owner の context・世代・item identity 検証後に明示対象を選択の正本とする。取消・close・error・対象消失は既存の要求退役へ合流する。DirectMedia の close 取消も同じ owner の処理に含めた。
 - linked F12 の選択／表示／sync stamp、同一パスの相関、待機の取消・置換、sibling の generation／cancel／channel／cache／window binding の回帰テストを追加。既存 detached テストは削除・弱化しない (§2-8)。ビルド・テストは設計担当の共有実行枠へ引き継ぐ。窓の用途・終了方針・overlay の表示分岐は段階3・4で実装する。
 
+段階2の追加修正では、カーソルを明示要求に保ちつつ履歴スクロールと操作結果のチェック付与を復元する（[実装計画の追加記録](browser-to-miv-impl-plan.md)）。既存の復元 owner の効果を分ける変更で、sync を抑止する分岐、App の追加フラグ、HWND／placement の変更はない。activation 受付から連動窓の sync・close までを一本で通すテストを追加し、元の characterization の各不一致点で要求画像が維持されることを assert する。今回のビルド・テストは引き継ぎ待ち。
+
 ### 2026-11-21: 絞り込みの変更で一覧を読み直さない・AI の絞り込みを一覧全体の取得の証明へ (§1.835、実装済み・自動検証済み・実機未確認)
 
 **変更の内容**
