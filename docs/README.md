@@ -89,7 +89,7 @@
 | [folder-tree-refresh-plan.md](folder-tree-refresh-plan.md) | §1.686 外部変更とツリー再照合。§9.5の一覧受理通知＋再参加を採用し、展開枝監視は見送り。typed node所有・完全membership・表示中断/復帰・scroll保持と§10の検証記録 |
 | [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 名前付きコレクションの初期仕様案と、その後の利用者判断の記録。現在の操作仕様はマニュアル、実装状態は実装計画 §23 を参照 |
 | [collection-implementation-plan.md](collection-implementation-plan.md) | コレクションの保存・管理UI・一覧・再生・Remoteを触るとき。actorと各画面の所有境界、出荷前修正の実装・検収台帳 |
-| [collection-missing-bulk-remove-851-plan.md](collection-missing-bulk-remove-851-plan.md) | §1.851 見つからない登録をまとめて外す操作。対象の判定 (ドライブ / 共有のルート)、準備結果での計算、メニューと確認、複数 context・Remote の扱い |
+| [collection-missing-bulk-remove-851-plan.md](collection-missing-bulk-remove-851-plan.md) | §1.851 見つからない登録の一括解除。対象判定・全登録の件数・メニューと右クリック・確認・origin context の受付検査 |
 | [collection-return-investigation.md](collection-return-investigation.md) | 2026-10-30 X投稿の「本から戻ると違う場所」。v4.10.0相当のheadless試験で帰り先・選択を保ったスクロールずれを再現。>>661との関係と20件の証跡 |
 | [folder-history-location-plan.md](folder-history-location-plan.md) | **Stage B 実装・自動 gate 完了**。§1.280 / §1.281 / §1.282 の Rating・Collection子の表示位置とフォルダ履歴、A/B・detached の所有境界、Rating 一覧ソート保存の設計・検証台帳。実アプリ smoke は未実行 |
 | [file-type-visibility-plan.md](file-type-visibility-plan.md) | **実装済み・独立レビュー指摘修正と自動検証済み（利用者決定2026-10-08/09、実機確認待ち）**。§1.345の全体ファイル種類設定、全一覧producer・代表画像・本判定・Remoteの共通ポリシー、旧変換cache通知、本内ブックマークのcontext所有と検証記録。§1.339の履歴再入場facet退避の独立した根治設計。bf509352dの独立レビュー承認を記録 |

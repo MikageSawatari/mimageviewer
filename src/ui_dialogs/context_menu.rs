@@ -442,6 +442,7 @@ struct NativeGridContextMenuTarget {
     explorer_folder: Option<PathBuf>,
     folder_command_target: Option<PathBuf>,
     collection_root_delete: crate::app::collection_grid::CollectionRootDeleteResolution,
+    collection_missing_removal: crate::app::collection_grid::CollectionMissingRemovalAvailability,
 }
 
 #[derive(Debug)]
@@ -1461,6 +1462,15 @@ impl crate::app::App {
         };
         let collection_root_delete = self
             .collection_root_delete_resolution((!is_folder_context).then_some(idx), has_checked);
+        let collection_missing_removal = if surface == ContextMenuSurface::Grid
+            && !is_folder_context
+            && !has_checked
+            && matches!(&item, GridItem::CollectionPlaceholder { .. })
+        {
+            self.collection_grid_missing_removal()
+        } else {
+            crate::app::collection_grid::CollectionMissingRemovalAvailability::NotOffered
+        };
         NativeGridContextMenuTarget {
             shell_paths,
             real_paths,
@@ -1491,6 +1501,7 @@ impl crate::app::App {
             explorer_folder,
             folder_command_target,
             collection_root_delete,
+            collection_missing_removal,
         }
     }
 
@@ -1598,6 +1609,14 @@ impl crate::app::App {
                 crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot => {
                     crate::context_menu_model::CollectionReferenceAvailability::NotCollectionRoot
                 }
+            },
+            collection_missing_removal: match &target.collection_missing_removal {
+                crate::app::collection_grid::CollectionMissingRemovalAvailability::NotOffered =>
+                    crate::context_menu_model::CollectionMissingRemovalAvailability::NotOffered,
+                crate::app::collection_grid::CollectionMissingRemovalAvailability::Ready { entries, .. } =>
+                    crate::context_menu_model::CollectionMissingRemovalAvailability::Ready { count: entries.len() },
+                crate::app::collection_grid::CollectionMissingRemovalAvailability::Unavailable { count, reason } =>
+                    crate::context_menu_model::CollectionMissingRemovalAvailability::Unavailable { count: *count, reason },
             },
             collection_jump: self.collection_jump_action_state(target),
             view,
@@ -2225,6 +2244,16 @@ impl crate::app::App {
             MenuCommand::RemoveFromCollection => {
                 if let Some(request) = target.collection_root_delete.ready_target().cloned() {
                     self.request_collection_grid_remove(request);
+                }
+                None
+            }
+            MenuCommand::RemoveMissingFromCollection => {
+                if let crate::app::collection_grid::CollectionMissingRemovalAvailability::Ready {
+                    target,
+                    entries,
+                } = &target.collection_missing_removal
+                {
+                    self.request_collection_grid_missing_remove(*target, entries.clone());
                 }
                 None
             }
@@ -4727,6 +4756,8 @@ mod delete_confirm_tests {
             folder_command_target: None,
             collection_root_delete:
                 crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot,
+            collection_missing_removal:
+                crate::app::collection_grid::CollectionMissingRemovalAvailability::NotOffered,
         }
     }
 
@@ -5058,6 +5089,79 @@ mod delete_confirm_tests {
             classify_checked_file_operation_selection(3, 2),
             CheckedFileOperationSelection::Mixed
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn collection_missing_menu_captures_entries_and_dispatches_the_captured_request() {
+        use crate::app::collection_grid::CollectionMissingRemovalAvailability;
+        use crate::app::top_level_grid_view::CollectionGridLoadState;
+        use egui_kittest::kittest::Queryable;
+        use std::sync::Arc;
+
+        let mut app = crate::app::setup_app_for_test();
+        let missing = app.tmp.path().join("removed-image.jpg");
+        crate::app::tests::install_collection_item_for_detached_plan(
+            &mut app,
+            &missing,
+            crate::collection_store::CollectionResolvedKind::Image,
+        );
+        app.collection_ui.set_read_phase_for_test(false);
+        let target = app.context_menu_target(
+            0,
+            app.items[0].clone(),
+            false,
+            false,
+            None,
+            ContextMenuSurface::Grid,
+            None,
+        );
+        let CollectionMissingRemovalAvailability::Ready {
+            target: captured_target,
+            entries,
+        } = &target.collection_missing_removal
+        else {
+            panic!("a missing source below an existing directory must be offered");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_path, missing);
+        assert_eq!(
+            *captured_target,
+            app.collection_grid_content_target().unwrap()
+        );
+        let session = app.top_level_grid_view.collection_session_mut().unwrap();
+        let prepared = session.prepared().unwrap();
+        assert!(Arc::ptr_eq(entries, &prepared.removable_missing));
+        // Keep the visit identity valid while changing the newly offered preparation.
+        // Dispatch must use the immutable entries captured when the menu opened.
+        let CollectionGridLoadState::Ready(installed) = &mut session.load else {
+            panic!("ready fixture");
+        };
+        Arc::make_mut(&mut Arc::make_mut(installed).prepared).removable_missing = Arc::from([]);
+        assert_eq!(app.collection_grid_missing_removal().count(), Some(0));
+        let nodes = app.context_menu_nodes(&egui::Context::default(), &target, false);
+        assert!(nodes.iter().any(|node| matches!(node, MenuNode::Item {
+            command: MenuCommand::RemoveMissingFromCollection, label, enabled: true, ..
+        } if label == "見つからない項目をすべて外す… (1件)")));
+        app.dispatch_native_grid_context_command(
+            &egui::Context::default(),
+            MenuCommand::RemoveMissingFromCollection,
+            &target,
+        );
+        assert!(app.collection_operation_modal_visible());
+        let render_app = std::rc::Rc::new(std::cell::RefCell::new(app));
+        let ui_app = std::rc::Rc::clone(&render_app);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_ui(move |ui| ui_app.borrow_mut().show_collection_manager(ui.ctx()));
+        harness.step();
+        harness.get_by_label("見つからない項目をすべて外す");
+        harness.get_by_label("見つからない 1 件の参照をコレクションから外します。");
+        harness.get_by_label(&missing.display().to_string());
+        harness.get_by_label("キャンセル").click();
+        harness.step();
+        assert!(!render_app.borrow().collection_operation_modal_visible());
     }
 
     #[test]
@@ -5486,6 +5590,8 @@ mod delete_confirm_tests {
             folder_command_target: None,
             collection_root_delete:
                 crate::app::collection_grid::CollectionRootDeleteResolution::NotCollectionRoot,
+            collection_missing_removal:
+                crate::app::collection_grid::CollectionMissingRemovalAvailability::NotOffered,
         };
 
         let items = app.context_menu_nodes(&egui::Context::default(), &target, false);

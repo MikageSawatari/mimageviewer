@@ -2,6 +2,8 @@
 
 ## 1. 目的と正本
 
+§1.851: 見つからない登録の一括解除、受付・stamp 検査・確認の契約は [専用設計](collection-missing-bulk-remove-851-plan.md) を参照。
+
 §1.668（2026-11-01、案C）: PC root一覧のgeneric thumbnailはCollection間でdrive/UNC保持の
 実親catalogを共有する。cold/history/navigation/warm設置は同じcontext-owned poolを使い、
 可視要求の共通受付で元GridItemの親とcache-dir epochを固定する。全件prepareにcatalog I/Oを

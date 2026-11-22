@@ -2770,6 +2770,23 @@ impl ContextAsyncOwner {
 
 #[cfg(windows)]
 impl<'a> ContextRef<'a> {
+    pub(in crate::app) fn collection_grid_request_stamp_is_current(
+        self,
+        context_id: ViewerContextId,
+        stamp: top_level_grid_view::CollectionGridRequestStamp,
+    ) -> bool {
+        let view = match self.source {
+            ContextRefSource::Mounted(app) => &app.top_level_grid_view,
+            ContextRefSource::AtRest(bundle) => &bundle.top_level_grid_view,
+        };
+        super::collection_grid::collection_grid_request_stamp_matches(
+            context_id,
+            view,
+            self.items_generation(),
+            stamp,
+        )
+    }
+
     pub(in crate::app) fn grid_scroll(self) -> &'a super::GridScrollState {
         match self.source {
             ContextRefSource::Mounted(app) => &app.grid_scroll,

@@ -81,6 +81,7 @@ pub enum ContextMenuItemId {
     OpenExternalToolSettings,
     MoveToRecycleBin,
     RemoveFromCollection,
+    RemoveMissingFromCollection,
     RemoveReadingHistory,
     Deselect,
     CreateMusicVideo,
@@ -125,6 +126,7 @@ impl ContextMenuItemId {
         Self::OpenExternalToolSettings,
         Self::MoveToRecycleBin,
         Self::RemoveFromCollection,
+        Self::RemoveMissingFromCollection,
         Self::RemoveReadingHistory,
         Self::Deselect,
         Self::CreateMusicVideo,
@@ -170,6 +172,7 @@ impl ContextMenuItemId {
             Self::OpenExternalToolSettings => "OpenExternalToolSettings",
             Self::MoveToRecycleBin => "MoveToRecycleBin",
             Self::RemoveFromCollection => "RemoveFromCollection",
+            Self::RemoveMissingFromCollection => "RemoveMissingFromCollection",
             Self::RemoveReadingHistory => "RemoveReadingHistory",
             Self::Deselect => "Deselect",
             Self::SearchByName => "SearchByName",
@@ -232,6 +235,7 @@ impl ContextMenuItemId {
             Self::OpenExternalToolSettings => "外部ツールの設定…",
             Self::MoveToRecycleBin => "ゴミ箱へ移動 (タグ・評価も整理)",
             Self::RemoveFromCollection => "コレクションから外す",
+            Self::RemoveMissingFromCollection => "見つからない項目をすべて外す…",
             Self::RemoveReadingHistory => "履歴から削除",
             Self::Deselect => "選択解除",
             Self::SearchByName => "名前で検索",
@@ -277,6 +281,7 @@ impl ContextMenuItemId {
             MenuCommand::OpenExternalToolSettings => Self::OpenExternalToolSettings,
             MenuCommand::MoveToRecycleBin => Self::MoveToRecycleBin,
             MenuCommand::RemoveFromCollection => Self::RemoveFromCollection,
+            MenuCommand::RemoveMissingFromCollection => Self::RemoveMissingFromCollection,
             MenuCommand::Deselect => Self::Deselect,
             MenuCommand::RemoveReadingHistory => Self::RemoveReadingHistory,
             MenuCommand::SearchByNameEverything => Self::SearchByNameEverything,
@@ -458,6 +463,7 @@ pub(crate) enum ContextMenuPreviewScenario {
     GridStack,
     GridCheckedRealFiles,
     GridCollectionItem,
+    GridCollectionPlaceholder,
     FullscreenImage,
     FullscreenVideo,
     GridAudio,
@@ -475,6 +481,7 @@ impl ContextMenuPreviewScenario {
         Self::GridStack,
         Self::GridCheckedRealFiles,
         Self::GridCollectionItem,
+        Self::GridCollectionPlaceholder,
         Self::FullscreenImage,
         Self::FullscreenVideo,
         Self::GridAudio,
@@ -494,6 +501,7 @@ impl ContextMenuPreviewScenario {
             Self::GridStack => "一覧：スタック",
             Self::GridCheckedRealFiles => "一覧：複数の実ファイルを選択",
             Self::GridCollectionItem => "一覧：コレクションの項目",
+            Self::GridCollectionPlaceholder => "一覧：コレクションの見つからない項目",
             Self::FullscreenImage => "フルスクリーン：画像",
             Self::FullscreenVideo => "フルスクリーン：動画",
             Self::GridAudio => "一覧：音声ファイル",
@@ -522,6 +530,10 @@ impl ContextMenuPreviewScenario {
             Self::GridCheckedRealFiles | Self::GridCollectionItem => {
                 (ContextMenuItemKind::Image, ContextMenuSurface::Grid)
             }
+            Self::GridCollectionPlaceholder => (
+                ContextMenuItemKind::CollectionPlaceholder,
+                ContextMenuSurface::Grid,
+            ),
             Self::FullscreenImage => (ContextMenuItemKind::Image, ContextMenuSurface::Fullscreen),
             Self::FullscreenVideo => (ContextMenuItemKind::Video, ContextMenuSurface::Fullscreen),
             Self::GridAudio => (ContextMenuItemKind::Audio, ContextMenuSurface::Grid),
@@ -529,7 +541,10 @@ impl ContextMenuPreviewScenario {
         };
         let is_folder_context = self == Self::GridFolderBackground;
         let has_checked = self == Self::GridCheckedRealFiles;
-        let collection_reference = if self == Self::GridCollectionItem {
+        let collection_reference = if matches!(
+            self,
+            Self::GridCollectionItem | Self::GridCollectionPlaceholder
+        ) {
             CollectionReferenceAvailability::Ready
         } else {
             CollectionReferenceAvailability::NotCollectionRoot
@@ -585,6 +600,11 @@ impl ContextMenuPreviewScenario {
             can_paste_edit_bundle: true,
             has_explorer_folder: true,
             collection_reference,
+            collection_missing_removal: if self == Self::GridCollectionPlaceholder {
+                CollectionMissingRemovalAvailability::Ready { count: 2 }
+            } else {
+                CollectionMissingRemovalAvailability::NotOffered
+            },
             collection_jump: None,
             search_by_name: (surface == ContextMenuSurface::Grid
                 && !is_folder_context
@@ -886,6 +906,7 @@ pub enum MenuCommand {
     OpenExternalToolSettings,
     MoveToRecycleBin,
     RemoveFromCollection,
+    RemoveMissingFromCollection,
     Deselect,
     RemoveReadingHistory,
     SearchByNameEverything,
@@ -1044,6 +1065,8 @@ pub struct ContextMenuInput {
     pub has_explorer_folder: bool,
     /// Collection root の参照解除権限。元ファイル操作は独立した対象を持つ。
     pub collection_reference: CollectionReferenceAvailability,
+    /// Prepared snapshot の全登録を対象にした、見つからない参照の一括解除。
+    pub collection_missing_removal: CollectionMissingRemovalAvailability,
     /// Collection root の元の場所への移動。参照解除とは別の可否を持つ。
     pub collection_jump: Option<ContextMenuActionState>,
     /// Shared App entry predicate admits the item; each destination keeps its own reason.
@@ -1087,6 +1110,39 @@ impl CollectionReferenceAvailability {
                 disabled_reason: Some(reason.clone()),
             }),
         }
+    }
+}
+
+/// App が確定した受付結果の、描画に必要な情報だけを保持する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollectionMissingRemovalAvailability {
+    NotOffered,
+    Ready {
+        count: usize,
+    },
+    Unavailable {
+        count: Option<usize>,
+        reason: &'static str,
+    },
+}
+
+impl CollectionMissingRemovalAvailability {
+    fn remove_node(self) -> Option<MenuNode> {
+        let (count, enabled, disabled_reason) = match self {
+            Self::NotOffered => return None,
+            Self::Ready { count } => (Some(count), true, None),
+            Self::Unavailable { count, reason } => (count, false, Some(reason.to_owned())),
+        };
+        let label = match count {
+            Some(count) => format!("見つからない項目をすべて外す… ({count}件)"),
+            None => "見つからない項目をすべて外す…".to_owned(),
+        };
+        Some(MenuNode::Item {
+            command: MenuCommand::RemoveMissingFromCollection,
+            label,
+            enabled,
+            disabled_reason,
+        })
     }
 }
 
@@ -1910,7 +1966,13 @@ pub fn build_context_menu(input: &ContextMenuInput) -> Vec<MenuNode> {
             .collection_reference
             .remove_node("コレクションから外す")
         {
-            push_group(&mut nodes, [remove]);
+            let mut removals = vec![remove];
+            if input.kind == ContextMenuItemKind::CollectionPlaceholder
+                && let Some(missing) = input.collection_missing_removal.remove_node()
+            {
+                removals.push(missing);
+            }
+            push_group(&mut nodes, removals);
         }
     }
 
@@ -2192,6 +2254,7 @@ mod tests {
             can_paste_edit_bundle: false,
             has_explorer_folder: false,
             collection_reference: CollectionReferenceAvailability::NotCollectionRoot,
+            collection_missing_removal: CollectionMissingRemovalAvailability::NotOffered,
             collection_jump: None,
             search_by_name: None,
             view: ContextMenuViewFlags::default(),
@@ -3692,6 +3755,92 @@ mod tests {
         placeholder.collection_reference = CollectionReferenceAvailability::NotCollectionRoot;
         assert!(
             command_state(&build_context_menu(&placeholder), MenuCommand::JumpToFolder).is_none()
+        );
+    }
+
+    #[test]
+    fn collection_missing_removal_is_only_offered_for_single_root_placeholder() {
+        let mut placeholder = input(
+            ContextMenuItemKind::CollectionPlaceholder,
+            ContextMenuSurface::Grid,
+        );
+        placeholder.collection_reference = CollectionReferenceAvailability::Ready;
+        placeholder.collection_missing_removal =
+            CollectionMissingRemovalAvailability::Ready { count: 12 };
+        let nodes = build_context_menu(&placeholder);
+        let (label, enabled, reason) =
+            command_state(&nodes, MenuCommand::RemoveMissingFromCollection).unwrap();
+        assert_eq!(label, "見つからない項目をすべて外す… (12件)");
+        assert!(enabled);
+        assert!(reason.is_none());
+        let shape = menu_shape(&nodes);
+        let remove = shape
+            .iter()
+            .position(|name| name == "RemoveFromCollection")
+            .unwrap();
+        assert_eq!(shape[remove + 1], "RemoveMissingFromCollection");
+
+        for case in 0..5 {
+            let mut excluded = placeholder.clone();
+            match case {
+                0 => excluded.has_checked = true,
+                1 => excluded.kind = ContextMenuItemKind::Image,
+                2 => excluded.surface = ContextMenuSurface::Fullscreen,
+                3 => {
+                    excluded.collection_reference =
+                        CollectionReferenceAvailability::NotCollectionRoot
+                }
+                4 => excluded.is_folder_context = true,
+                _ => unreachable!(),
+            }
+            assert!(
+                command_state(
+                    &build_context_menu(&excluded),
+                    MenuCommand::RemoveMissingFromCollection
+                )
+                .is_none(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn collection_missing_removal_keeps_unavailable_count_and_reason() {
+        let mut placeholder = input(
+            ContextMenuItemKind::CollectionPlaceholder,
+            ContextMenuSurface::Grid,
+        );
+        placeholder.collection_reference =
+            CollectionReferenceAvailability::Unavailable("一覧を更新中".into());
+        for (count, reason, expected_label) in [
+            (None, "一覧を更新中", "見つからない項目をすべて外す…"),
+            (
+                Some(0),
+                "見つからない項目はありません",
+                "見つからない項目をすべて外す… (0件)",
+            ),
+            (
+                Some(3),
+                "コレクションを現在編集できません",
+                "見つからない項目をすべて外す… (3件)",
+            ),
+        ] {
+            placeholder.collection_missing_removal =
+                CollectionMissingRemovalAvailability::Unavailable { count, reason };
+            let nodes = build_context_menu(&placeholder);
+            let (label, enabled, actual_reason) =
+                command_state(&nodes, MenuCommand::RemoveMissingFromCollection).unwrap();
+            assert_eq!(label, expected_label);
+            assert!(!enabled);
+            assert_eq!(actual_reason.as_deref(), Some(reason));
+        }
+        placeholder.collection_missing_removal = CollectionMissingRemovalAvailability::NotOffered;
+        assert!(
+            command_state(
+                &build_context_menu(&placeholder),
+                MenuCommand::RemoveMissingFromCollection
+            )
+            .is_none()
         );
     }
 

@@ -8934,6 +8934,9 @@ impl App {
         let collection_reorder_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::CollectionsReorderCurrent);
+        let collection_remove_missing_menu_label = self
+            .keymap
+            .menu_command_label(MenuCommandId::CollectionsRemoveMissingCurrent);
         let collection_manage_menu_label = self
             .keymap
             .menu_command_label(MenuCommandId::CollectionsManage);
@@ -9587,6 +9590,23 @@ impl App {
                                                     current_order.unwrap().content,
                                                     crate::ui_dialogs::collections::CollectionGridSnapshotAction::OpenReorder,
                                                 );
+                                                ui.close();
+                                            }
+                                        }
+                                        MenuCommandId::CollectionsRemoveMissingCurrent => {
+                                            let availability = self.collection_grid_missing_removal();
+                                            let label = match availability.count() {
+                                                Some(count) => format!("{collection_remove_missing_menu_label} ({count}件)"),
+                                                None => collection_remove_missing_menu_label.clone(),
+                                            };
+                                            let response = ui.add_enabled(
+                                                availability.disabled_reason().is_none(),
+                                                egui::Button::new(label),
+                                            ).on_disabled_hover_text(availability.disabled_reason().unwrap_or_default());
+                                            if response.clicked() {
+                                                if let crate::app::collection_grid::CollectionMissingRemovalAvailability::Ready { target, entries } = availability {
+                                                    self.request_collection_grid_missing_remove(target, entries);
+                                                }
                                                 ui.close();
                                             }
                                         }

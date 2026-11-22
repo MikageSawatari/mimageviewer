@@ -2276,6 +2276,7 @@ mod tests {
 
     fn prepared(entries: Vec<PreparedCollectionEntry>) -> CollectionPreparedSnapshot {
         CollectionPreparedSnapshot {
+            removable_missing: Arc::from([]),
             registered_total: entries.len(),
             collection_id: CollectionId::new(),
             collection_revision: 1,
