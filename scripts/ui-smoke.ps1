@@ -36,7 +36,8 @@ param(
     [ValidatePattern('^[0-9]+x[0-9]+$')]
     [string] $Idle198WindowSize = '1328x900',
     [switch] $InteractiveApproved,
-    [switch] $IncludeFirstAi
+    [switch] $IncludeFirstAi,
+    [switch] $FromKit
 )
 
 if (-not $InteractiveApproved) {
@@ -48,8 +49,12 @@ if ($IncludeFirstAi -and $Scenario -ne 'ReleaseChecks') {
     [Console]::Error.WriteLine('[ui-smoke] IncludeFirstAi is valid only for ReleaseChecks.')
     exit 2
 }
+if ($FromKit -and $Scenario -ne 'ReleaseChecks') {
+    [Console]::Error.WriteLine('[ui-smoke] FromKit is valid only for ReleaseChecks.')
+    exit 2
+}
 if ($Scenario -eq 'ReleaseChecks') {
-    $suiteArgs = @{ InteractiveApproved = $true; SkipBuild = $SkipBuild; IncludeFirstAi = $IncludeFirstAi }
+    $suiteArgs = @{ InteractiveApproved = $true; SkipBuild = $SkipBuild; IncludeFirstAi = $IncludeFirstAi; FromKit = $FromKit }
     if ($PSBoundParameters.ContainsKey('TimeoutSeconds')) { $suiteArgs.TimeoutSeconds = $TimeoutSeconds }
     & (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Run.ps1') @suiteArgs
     exit $LASTEXITCODE

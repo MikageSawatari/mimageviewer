@@ -1,6 +1,6 @@
 # Sequential, disposable suite; never uses process-name activation or global instance IPC.
 [CmdletBinding()]
-param([switch]$InteractiveApproved, [switch]$SkipBuild, [switch]$IncludeFirstAi,
+param([switch]$InteractiveApproved, [switch]$SkipBuild, [switch]$IncludeFirstAi, [switch]$FromKit,
     [ValidateRange(30,3600)][int]$TimeoutSeconds=360)
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version 2
@@ -14,10 +14,17 @@ $smoke=Join-Path $repo 'target\portable-smoke'
 $exe=Join-Path $smoke 'mimageviewer.exe'; $data=Join-Path $smoke 'data'
 $run=Join-Path $repo ('target\ui-smoke\runs\release-checks-'+[DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')+'-'+[Guid]::NewGuid().ToString('N').Substring(0,8))
 $preflight=Invoke-ReleaseCheckPreflight {
+if($FromKit){
+    . (Join-Path $scripts 'relcheck-kit\KitSupport.ps1')
+    $script:expectedFingerprint=Assert-ReleaseCheckKit $repo
+    Assert-ReleaseCheckKitRunRoot $repo
+    $env:PYTHONDONTWRITEBYTECODE='1'
+}
 Assert-ReleaseCheckPaths $repo $exe $data $run
 Initialize-ReleaseCheckNative
 # Read-only preflight happens before prepare/build/fixture generation.
 [MivReleaseCheckNative]::CheckDesktop()
+$script:geometryPreflight=Get-ReleaseCheckGeometryPreflight
 Assert-NoReparsePath (Join-Path $repo 'target') $repo 'release-lock'
 New-Item -ItemType Directory -Path (Join-Path $repo 'target\ui-smoke') -Force | Out-Null
 Open-UiSmokeRunnerLock (Join-Path $repo 'target\ui-smoke\runner.lock')
@@ -30,7 +37,12 @@ if($preflight.exit_code -ne 0){
 $lock=$preflight.value
 $cases=New-Object 'Collections.Generic.List[object]'
 $owned=$null; $ownedStart=$null; $background=$null; $activeDir=$null
-$metadata=[ordered]@{suite='ReleaseChecks'; include_first_ai=[bool]$IncludeFirstAi; run_directory=$run; approval_scope='5 idle + 2 perf + stopped-profile seed sessions'; started_utc=[DateTime]::UtcNow.ToString('o'); os=[Environment]::OSVersion.VersionString; window_size=@(1328,900); dpi_by_case=@{}; cpu_names=@(); gpu_names=@()}
+$metadata=[ordered]@{suite='ReleaseChecks'; include_first_ai=[bool]$IncludeFirstAi; run_directory=$run; approval_scope='5 idle + 2 perf + stopped-profile seed sessions'; started_utc=[DateTime]::UtcNow.ToString('o'); os=[Environment]::OSVersion.VersionString; window_size=@{}; dpi_by_case=@{}; window_geometry_by_case=@{}; static_geometry=$script:geometryPreflight.static_geometry; geometry_preflight=$script:geometryPreflight; cpu_names=@(); gpu_names=@()}
+$metadata.execution_mode=if($FromKit){'kit'}else{'repo'}
+if($FromKit){
+    $kit=Get-Content -LiteralPath (Join-Path $repo 'release-check-kit.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+    $metadata.kit=@{kit_id=$kit.kit_id;kit_manifest_sha256=(Get-Content -LiteralPath (Join-Path $repo 'release-check-kit.sha256') -Encoding ASCII -Raw).Trim();scripts_source_head=$kit.scripts_source_head;artifact_source_head=$kit.artifact.source_head}
+}
 
 function Assert-NoSmokeProcess {
     foreach($p in (Get-Process -ErrorAction Stop)) {
@@ -91,16 +103,24 @@ function Restore-ReleaseSeed {
     $null=Assert-ExactPath $data (Join-Path $repo 'target\portable-smoke\data') 'release-restore'
     Remove-Item -LiteralPath $data -Recurse -Force
     Copy-Item -LiteralPath $Seed -Destination $data -Recurse
-    Assert-ReleaseCheckArtifact $repo
+    Assert-ReleaseCheckArtifact $repo -ExpectedSourceFingerprint $(if($FromKit){$script:expectedFingerprint}else{Get-MivSourceFingerprint $repo})
 }
 function Complete-ReleaseSession {
-    param([string]$CaseId,[string]$Directory)
+    param([string]$CaseId,[string]$Directory,$ForegroundTimeline=$null)
     $script:owned.WaitForExit();$exitCode=$script:owned.ExitCode
     $processPid=$script:owned.Id;$script:owned=$null
-    $exitResult=New-ReleaseCheckProcessExitResult $CaseId $exitCode $processPid $Directory
-    # Record the process verdict before any fallible archive/evidence operation.
-    # A later environment error cannot erase ScriptFailure or a crash.
+    $foregroundRecordingError=$null
+    if($null -ne $ForegroundTimeline){
+        # Bracket the typed failure even when the last normal loop saw exit.
+        # Preserve the known process verdict before stopping on recording I/O.
+        try{Write-ReleaseCheckForegroundTimeline $ForegroundTimeline -Force}
+        catch{$foregroundRecordingError=$_.Exception.Message}
+    }
+    $exitResult=New-ReleaseCheckProcessExitResult $CaseId $exitCode $processPid $Directory -ForegroundRecordingError $foregroundRecordingError
+    # Record the case verdict before an evidence/archive error can escape.
+    # A later environment error cannot erase an established FAIL or a crash.
     if($null -ne $exitResult){$cases.Add($exitResult)}
+    if($foregroundRecordingError){throw ('Foreground timeline recording failed: '+$foregroundRecordingError)}
     Save-ReleaseLogs $Directory
     $script:activeDir=$null # archived session no longer owns the restored logs
     if($null -eq $exitResult){
@@ -115,7 +135,7 @@ function Complete-ReleaseSession {
 function Invoke-ReleaseSession {
     param([string]$CaseId,[string]$Overlay,[bool]$Idle)
     Assert-NoSmokeProcess
-    Assert-ReleaseCheckArtifact $repo
+    Assert-ReleaseCheckArtifact $repo -ExpectedSourceFingerprint $(if($FromKit){$script:expectedFingerprint}else{Get-MivSourceFingerprint $repo})
     $dir=Join-Path $run $CaseId
     New-Item -ItemType Directory -Path $dir | Out-Null
     $cacheProof=Invoke-UiSmokeCapturedProcess (Get-Command python -ErrorAction Stop).Source @(
@@ -150,31 +170,51 @@ function Invoke-ReleaseSession {
     # Perf measures the real initial many-folder startup shape. Other roots
     # remain untouched until the recipe opens them after indexing settles.
     $sessionOverlay.startup_folder_path=if($seedRecipe.Count -eq 1){$seedRecipe[0].startup_path}elseif($CaseId -like 'perf-*'){$many}else{$m.paths.static}
+    $geometry=Get-ReleaseCheckCaseGeometry $CaseId $script:geometryPreflight.static_geometry.dpi
+    # Fixture overlays and native launch must use the same selected table row.
+    if($CaseId -in @('static-foreground','static-background','seed-profile')){
+        if(($sessionOverlay.window_size -join ',') -ne ($geometry.window_size -join ',') -or $sessionOverlay.grid_cols -ne $geometry.grid_cols){throw 'Static overlay differs from the selected DPI geometry.'}
+    }
+    $sessionOverlay.window_size=$geometry.window_size
+    # first-ai reuses the static overlay, but retains its original nonstatic size/columns.
+    if($CaseId -eq 'first-ai'){$sessionOverlay.grid_cols=$geometry.grid_cols}
+    $metadata.window_size[$CaseId]=@($geometry.window_size)
+    Write-ReleaseCheckJson (Join-Path $dir 'window-plan.json') $geometry
     Write-ReleaseCheckJson (Join-Path $dir 'settings-override.json') $sessionOverlay
-    $arguments=@('--data-dir',$data,'--perf-log','--test-script',$scriptPath,'--test-evidence-dir',$dir,'--settings-override',(Join-Path $dir 'settings-override.json'),'--window-size','1328x900')
+    $arguments=@('--data-dir',$data,'--perf-log','--test-script',$scriptPath,'--test-evidence-dir',$dir,'--settings-override',(Join-Path $dir 'settings-override.json'),'--window-size',($geometry.window_size -join 'x'))
     Clear-ReleaseLogs
     $script:owned=Start-Process -FilePath $exe -ArgumentList (Join-NativeArguments $arguments) -WorkingDirectory $smoke -PassThru
     $script:activeDir=$dir # only a successfully launched session owns app logs
     $null=$script:owned.Handle  # cache the handle so ExitCode is available after exit
     $script:ownedStart=$script:owned.StartTime.ToUniversalTime()
     Write-ReleaseCheckJson (Join-Path $dir 'process.json') @{pid=$script:owned.Id;start_time_utc=$script:ownedStart.ToString('o');exe=$exe;data_dir=$data}
+    $foregroundTimeline=New-ReleaseCheckForegroundTimeline $dir $script:owned.Id
+    $rootWindow=Join-Path $dir 'root-window.json';$publishedRoot=[long]0
     $timer=[Diagnostics.Stopwatch]::StartNew(); $focusTimer=[Diagnostics.Stopwatch]::StartNew(); $ready=Join-Path $dir 'ready.json';$focusAcquired=$false
     while(-not $script:owned.HasExited){
         if(-not (Test-OwnedReleaseProcessAlive)){break}
+        if($publishedRoot -eq 0){$publishedRoot=Read-ReleaseCheckRootWindow $rootWindow $script:owned.Id}
+        Write-ReleaseCheckForegroundTimeline $foregroundTimeline $publishedRoot
         if($timer.Elapsed.TotalSeconds -gt $TimeoutSeconds){throw "$CaseId session deadline exceeded."}
-        if(-not $focusAcquired -and $focusTimer.Elapsed.TotalSeconds -le 20 -and $script:owned.MainWindowHandle -ne [IntPtr]::Zero){
-            $null=[MivReleaseCheckNative]::SetForegroundWindow($script:owned.MainWindowHandle)
-            $fg=Get-ReleaseCheckWindowSample $script:owned.Id
-            $focusAcquired=$fg.foreground_pid -eq $script:owned.Id -and $fg.foreground_hwnd -eq $script:owned.MainWindowHandle.ToInt64()
+        if(-not $focusAcquired -and $focusTimer.Elapsed.TotalSeconds -le 20 -and $publishedRoot -ne 0){
+            $focusAcquired=Invoke-ReleaseCheckInitialForeground $script:owned.Id $publishedRoot
+            if($focusAcquired){
+                $actual=Get-ReleaseCheckWindowGeometry $script:owned.Id $publishedRoot
+                $metadata.dpi_by_case[$CaseId]=$actual.dpi
+                $metadata.window_geometry_by_case[$CaseId]=$actual
+                Assert-ReleaseCheckWindowGeometry $actual $geometry
+            }
         }
         if(-not $focusAcquired -and $focusTimer.Elapsed.TotalSeconds -gt 20){throw 'Exact root foreground unavailable within 20 seconds.'}
-        if($Idle -and (Test-Path -LiteralPath $ready -PathType Leaf)){
+        if($Idle -and $publishedRoot -ne 0 -and (Test-Path -LiteralPath $ready -PathType Leaf)){
             $r=Get-Content -LiteralPath $ready -Encoding UTF8 -Raw | ConvertFrom-Json
-            if($r.pid -ne $script:owned.Id){throw 'Ready PID mismatch.'}
-            [uint32]$hwndPid=0
-            $null=[MivReleaseCheckNative]::GetWindowThreadProcessId([IntPtr][long]$r.root_hwnd,[ref]$hwndPid)
-            if($hwndPid -ne $script:owned.Id){throw 'Ready root HWND owner mismatch.'}
-            $metadata.dpi_by_case[$CaseId]=[MivReleaseCheckNative]::GetDpiForWindow([IntPtr][long]$r.root_hwnd)
+            Assert-ReleaseCheckReadyRoot $r $script:owned.Id $publishedRoot $CaseId $dir
+            if($CaseId -like 'static-*'){
+                $actual=Get-ReleaseCheckWindowGeometry $script:owned.Id $publishedRoot
+                $metadata.dpi_by_case[$CaseId]=$actual.dpi
+                $metadata.window_geometry_by_case[$CaseId]=$actual
+                Assert-ReleaseCheckWindowGeometry $actual $geometry
+            }
             $backgroundHwnd=0
             if($CaseId.Contains('background')){
                 Add-Type -AssemblyName System.Windows.Forms
@@ -184,10 +224,11 @@ function Invoke-ReleaseSession {
                 $backgroundHwnd=$foregroundProof.foreground_hwnd
                 Write-ReleaseCheckJson (Join-Path $dir 'background-ready.json') $foregroundProof
             } elseif($CaseId -eq 'static-foreground'){
-                $null=[MivReleaseCheckNative]::SetForegroundWindow([IntPtr][long]$r.root_hwnd)
+                $null=[MivReleaseCheckNative]::SetForegroundWindow([IntPtr]$publishedRoot)
             }
             $scenario=if($CaseId.StartsWith('tray-')){'tray-residency'}else{$CaseId}
-            $samplerArgs=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $scripts 'check-idle-health.ps1'),'-PortableSmoke','-InteractiveApproved','-SkipPrompt','-Scenario',$scenario,'-CaseId',$CaseId,'-ProcessId',[string]$script:owned.Id,'-ExpectedStartTimeUtc',$script:ownedStart.ToString('o'),'-SleepEvidencePath',(Join-Path $dir 'completion.json'),'-OutputDirectory',$dir,'-RootHwnd',[string]$r.root_hwnd,'-BackgroundHwnd',[string]$backgroundHwnd)
+            $samplerArgs=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $scripts 'check-idle-health.ps1'),'-PortableSmoke','-InteractiveApproved','-SkipPrompt','-Scenario',$scenario,'-CaseId',$CaseId,'-ProcessId',[string]$script:owned.Id,'-ExpectedStartTimeUtc',$script:ownedStart.ToString('o'),'-SleepEvidencePath',(Join-Path $dir 'completion.json'),'-OutputDirectory',$dir,'-RootHwnd',[string]$publishedRoot,'-BackgroundHwnd',[string]$backgroundHwnd)
+            if($FromKit){$samplerArgs+='-FromKit'}
             if($backgroundHwnd -ne 0){$samplerArgs+=@('-BackgroundProcessId',[string]$PID)}
             if($CaseId -eq 'video-pin-background'){$samplerArgs+=@('-TargetKey',[string]$r.target_key)}
             # Separate host preserves the suite even when the sampler exits.
@@ -205,20 +246,31 @@ function Invoke-ReleaseSession {
         }
         Start-Sleep -Milliseconds 100
     }
-    return Complete-ReleaseSession $CaseId $dir
+    # If shutdown already destroyed root before the post-failure sample, the
+    # classifier conservatively keeps FAIL rather than guessing lost foreground.
+    return Complete-ReleaseSession $CaseId $dir $foregroundTimeline
 }
 try {
     New-Item -ItemType Directory -Path $run | Out-Null
     Assert-NoSmokeProcess
     $metadata.cpu_names=@(Get-CimInstance Win32_Processor -ErrorAction Stop | ForEach-Object {$_.Name})
     $metadata.gpu_names=@(Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object {$_.Name})
+    Add-Type -AssemblyName System.Windows.Forms
+    $screen=[Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $metadata.remote_session=[MivReleaseCheckNative]::GetSystemMetrics(0x1000) -ne 0
+    $metadata.primary_screen=('{0}x{1}' -f $screen.Width,$screen.Height)
     $prepare=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',(Join-Path $scripts 'prepare-portable-smoke.ps1'),'-TestScript')
+    if($FromKit){$prepare+='-FromKit'}
     if($SkipBuild){$prepare+='-SkipBuild'}
     $prepareProcess=Start-Process -FilePath ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) -ArgumentList (Join-NativeArguments $prepare) -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $run 'prepare.stdout.log') -RedirectStandardError (Join-Path $run 'prepare.stderr.log')
     $null=$prepareProcess.Handle  # cache the handle so ExitCode is available after exit
     $prepareProcess.WaitForExit()
     if($prepareProcess.ExitCode -ne 0){throw 'Portable preparation failed.'}
-    Assert-ReleaseCheckArtifact $repo
+    if($FromKit){
+        . (Join-Path $scripts 'relcheck-kit\KitSupport.ps1')
+        $null=Assert-ReleaseCheckKit $repo
+    }
+    Assert-ReleaseCheckArtifact $repo -ExpectedSourceFingerprint $(if($FromKit){$script:expectedFingerprint}else{Get-MivSourceFingerprint $repo})
     $metadata.artifact=Get-Content -LiteralPath (Join-Path $smoke '.test-script-build.json') -Encoding UTF8 -Raw | ConvertFrom-Json
     $metadata.source=$metadata.artifact.source_head+'/'+$metadata.artifact.source_fingerprint_sha256
     $metadata.exe_sha256=$metadata.artifact.core_sha256
@@ -226,13 +278,14 @@ try {
     $metadata.thresholds_version=(Get-FileHash -LiteralPath (Join-Path $scripts 'idle_health_thresholds.json') -Algorithm SHA256).Hash.ToLowerInvariant()
     Copy-Item -LiteralPath (Join-Path $smoke '.test-script-build.json') -Destination (Join-Path $run 'test-script-build.json')
     $fixture=Join-Path $run 'fixture'
-    $ffmpeg=(Get-Command ffmpeg.exe -ErrorAction Stop).Source
-    & python (Join-Path $scripts 'ui-smoke\generate_release_checks_fixture.py') --output $fixture --ffmpeg $ffmpeg
+    $ffmpeg=if($FromKit){Join-Path $repo 'tools\ffmpeg\ffmpeg.exe'}else{(Get-Command ffmpeg.exe -ErrorAction Stop).Source}
+    & python (Join-Path $scripts 'ui-smoke\generate_release_checks_fixture.py') --output $fixture --ffmpeg $ffmpeg --dpi $metadata.static_geometry.dpi
     if($LASTEXITCODE -ne 0){throw 'Fixture generation failed.'}
     & python (Join-Path $scripts 'ui-smoke\generate_release_checks_fixture.py') --output $fixture --verify
     if($LASTEXITCODE -ne 0){throw 'Generated fixture integrity check failed.'}
     $fixtureManifest=Join-Path $fixture 'fixture-manifest.json'
     $m=Get-Content -LiteralPath $fixtureManifest -Encoding UTF8 -Raw | ConvertFrom-Json
+    if($m.static.dpi -ne $metadata.static_geometry.dpi -or ($m.static.window_size -join ',') -ne ($metadata.static_geometry.window_size -join ',') -or $m.static.grid_cols -ne $metadata.static_geometry.grid_cols){throw 'Fixture static geometry differs from preflight.'}
     $metadata.fixture_manifest=$fixtureManifest
     $metadata.fixture_version=$m.recipe_version
     # Seed each geometry in a normal session, retaining the same isolated data.
@@ -281,14 +334,14 @@ try {
         if(-not (Test-ReleaseCheckContinueAfterAnalysis $id $verdictExit)){break}
     }
 }catch{
-    $cases.Add([ordered]@{case_id='suite-preparation';verdict='SKIPPED';exit_code=2;environment_errors=@($_.Exception.Message);failures=@();warnings=@()})
+    $cases.Add((New-ReleaseCheckRunnerErrorResult $_))
 }finally{
     try{Stop-OwnedReleaseProcess}catch{$cases.Add([ordered]@{case_id='cleanup';verdict='SKIPPED';exit_code=2;environment_errors=@($_.Exception.Message)})}
     if($script:activeDir){try{Save-ReleaseLogs $script:activeDir}catch{$cases.Add([ordered]@{case_id='archive';verdict='SKIPPED';exit_code=2;environment_errors=@($_.Exception.Message)})}}
     if($script:background){$script:background.Close();$script:background.Dispose()}
     $lock.Dispose()
 }
-$metadata.environment=@{os=$metadata.os;cpu=$metadata.cpu_names;gpu=$metadata.gpu_names;window_size=$metadata.window_size;dpi_by_case=$metadata.dpi_by_case}
+$metadata.environment=@{os=$metadata.os;cpu=$metadata.cpu_names;gpu=$metadata.gpu_names;window_size=$metadata.window_size;dpi_by_case=$metadata.dpi_by_case;static_geometry=$metadata.static_geometry;geometry_preflight=$metadata.geometry_preflight;remote_session=$metadata['remote_session'];primary_screen=$metadata['primary_screen']}
 Write-ReleaseCheckJson (Join-Path $run 'suite-input.json') @{metadata=$metadata;cases=@($cases.ToArray())}
 & python (Join-Path $scripts 'release_check_analysis.py') summary (Join-Path $run 'suite-input.json') --json-out (Join-Path $run 'summary.json') --markdown-out (Join-Path $run 'release-record.md')
 Write-Host "ReleaseChecks evidence: $run"

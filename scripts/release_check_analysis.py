@@ -13,6 +13,7 @@ from collections import Counter
 from pathlib import Path
 
 from analyze_perf import PerfEvents, analyze_idle_health, percentile, validate_delivery
+from release_check_geometry import case_geometry, static_geometry
 
 REQUIRED_CASES = (
     "static-foreground", "static-background", "video-pin-background",
@@ -1055,16 +1056,76 @@ def analyze_idle_case(events: list[dict], sampler: dict, evidence: dict,
     return finish(result)
 
 
+def validate_suite_geometry(metadata: dict, errors: list[str]) -> None:
+    """New fixture runs must prove native geometry, without rewriting old records."""
+    if "static_geometry" not in metadata and metadata.get("fixture_version") != "release-checks-v5":
+        return
+    selected = metadata.get("static_geometry")
+    try:
+        if not isinstance(selected, dict) or not uint(selected.get("dpi"), positive=True):
+            raise ValueError("missing/invalid static_geometry")
+        expected = static_geometry(selected["dpi"])
+    except (TypeError, ValueError) as exc:
+        errors.append(f"invalid static geometry: {exc}")
+        return
+    if selected != expected:
+        errors.append("static_geometry does not match the registered DPI/window/column row")
+    maps = {}
+    for field in ("window_size", "dpi_by_case", "window_geometry_by_case"):
+        value = metadata.get(field)
+        if not isinstance(value, dict):
+            errors.append(f"missing/invalid geometry metadata: {field}")
+            value = {}
+        maps[field] = value
+    case_ids = set(REQUIRED_CASES)
+    for value in maps.values():
+        case_ids.update(value)
+    for case_id in sorted(case_ids):
+        # Seed/static and nonstatic layouts come from the runner's shared table.
+        logical = case_geometry(case_id, expected["dpi"])["window_size"]
+        if maps["window_size"].get(case_id) != logical:
+            errors.append(f"window_size does not match expected geometry: {case_id}")
+        dpi = maps["dpi_by_case"].get(case_id)
+        if type(dpi) is not int or dpi != expected["dpi"]:
+            errors.append(f"DPI does not match selected static geometry: {case_id}")
+        native = maps["window_geometry_by_case"].get(case_id)
+        if not isinstance(native, dict):
+            errors.append(f"missing/invalid native window geometry: {case_id}")
+            continue
+        if type(native.get("dpi")) is not int or native["dpi"] != expected["dpi"]:
+            errors.append(f"native DPI does not match selected static geometry: {case_id}")
+        physical = [round(size * expected["dpi"] / 96) for size in logical]
+        client = native.get("client_size")
+        if (not isinstance(client, list) or len(client) != 2
+                or not all(uint(size, positive=True) for size in client) or client != physical):
+            errors.append(f"native client_size does not match logical size and DPI: {case_id}")
+        rect = native.get("window_rect")
+        if (not isinstance(rect, list) or len(rect) != 4 or not all(type(n) is int for n in rect)
+                or rect[2] <= rect[0] or rect[3] <= rect[1]
+                or not uint(native.get("root_hwnd"), positive=True)
+                or not uint(native.get("pid"), positive=True)):
+            errors.append(f"invalid native window identity/rectangle: {case_id}")
+
+
 def summarize_suite(cases: list[dict], metadata: dict | None = None) -> dict:
     result = report("release-checks")
     if metadata is not None and not isinstance(metadata, dict):
         result["environment_errors"].append("run metadata must be an object")
         metadata = {}
     result["metadata"] = metadata or {}
+    mode = result["metadata"].get("execution_mode", "repo")
+    if mode not in ("repo", "kit"):
+        result["environment_errors"].append("invalid execution_mode: expected repo or kit")
+    if mode == "kit":
+        kit = result["metadata"].get("kit")
+        for field in ("kit_id", "kit_manifest_sha256", "scripts_source_head", "artifact_source_head"):
+            if not isinstance(kit, dict) or not isinstance(kit.get(field), str) or not kit[field].strip():
+                result["environment_errors"].append(f"required kit metadata missing: {field}")
     result["cases"] = cases
     for field in ("source", "exe_sha256", "fixture_version", "environment", "run_path", "approval_scope", "thresholds_version"):
         if not result["metadata"].get(field):
             result["environment_errors"].append(f"required run metadata missing: {field}")
+    validate_suite_geometry(result["metadata"], result["environment_errors"])
     ids = [c.get("case_id") for c in cases]
     for case_id in REQUIRED_CASES:
         if ids.count(case_id) != 1:
@@ -1110,6 +1171,29 @@ def release_record(result: dict) -> str:
              f"release + portable,test-script、fixture {meta.get('fixture_version', '未記録')}。",
              f"  環境 {meta.get('environment', '未記録')}、run {meta.get('run_path', '未記録')}、"
              f"了承範囲 {meta.get('approval_scope', '未記録')}、閾値 {meta.get('thresholds_version', '未記録')}。"]
+    environment = meta.get("environment")
+    environment = environment if isinstance(environment, dict) else {}
+    screen = environment.get("primary_screen", "未記録")
+    remote_session = environment.get("remote_session")
+    remote = "はい" if remote_session is True else "いいえ" if remote_session is False else "未記録"
+    if meta.get("execution_mode", "repo") == "kit":
+        kit = meta.get("kit")
+        kit = kit if isinstance(kit, dict) else {}
+        lines.append(f"  実行: サブ PC のキット {kit.get('kit_id', '未記録')} "
+                     f"(kit manifest {str(kit.get('kit_manifest_sha256', '未記録'))[:12]}、"
+                     f"scripts {str(kit.get('scripts_source_head', '未記録'))[:9]}、"
+                     f"artifact {str(kit.get('artifact_source_head', '未記録'))[:9]})。"
+                     f"画面 {screen}、RDP セッション {remote}。"
+                     "数値はサブ PC の記録どうしでだけ比べ、メイン PC の記録とは比べない (GPU・画面・RDP が違う)。")
+    else:
+        detail = f" (画面 {screen}、RDP セッション {remote})" if environment.get("primary_screen") else ""
+        lines.append(f"  実行: repository{detail}。")
+    geometry = meta.get("static_geometry")
+    if isinstance(geometry, dict):
+        size = geometry.get("window_size")
+        if isinstance(size, list) and len(size) == 2:
+            lines[-1] += (f"静止画条件 DPI {geometry.get('dpi', '未記録')}、"
+                          f"窓 {size[0]}×{size[1]} 論理 px、{geometry.get('grid_cols', '未記録')} 列。")
     for case in result.get("cases", []):
         lines.append(f"- **{case.get('case_id', '?')}**: {case.get('verdict', 'SKIPPED')}。")
         metrics = case.get("metrics") if isinstance(case.get("metrics"), dict) else {}

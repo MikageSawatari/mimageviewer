@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param([string]$Scenario, [string]$TargetKey, [int]$ProcessId,
     [datetime]$ExpectedStartTimeUtc, [string]$SleepEvidencePath, [string]$OutputDirectory,
-    [long]$RootHwnd, [long]$BackgroundHwnd, [int]$BackgroundProcessId, [string]$CaseId, [switch]$InteractiveApproved)
+    [long]$RootHwnd, [long]$BackgroundHwnd, [int]$BackgroundProcessId, [string]$CaseId, [switch]$InteractiveApproved, [switch]$FromKit)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 if (-not $InteractiveApproved -or $ProcessId -le 0) { exit 2 }
@@ -16,8 +16,17 @@ $data = Join-Path $repo 'target\portable-smoke\data'
 $preflight=Invoke-ReleaseCheckPreflight {
 Assert-ReleaseCheckPaths $repo $exe $data $OutputDirectory
 $null = Assert-ExactPath $SleepEvidencePath (Join-Path $OutputDirectory 'completion.json') 'release-sleep-evidence'
-Assert-ReleaseCheckArtifact $repo
+if($FromKit){
+    . (Join-Path $scripts 'relcheck-kit\KitSupport.ps1')
+    $expectedFingerprint=Get-ReleaseCheckKitExpectedFingerprint $repo
+    Assert-ReleaseCheckKitRunRoot $repo
+    $env:PYTHONDONTWRITEBYTECODE='1'
+}else{$expectedFingerprint=Get-MivSourceFingerprint $repo}
+Assert-ReleaseCheckArtifact $repo -ExpectedSourceFingerprint $expectedFingerprint
 Initialize-ReleaseCheckNative
+$script:windowPlan=Get-Content -LiteralPath (Join-Path $OutputDirectory 'window-plan.json') -Encoding UTF8 -Raw | ConvertFrom-Json
+$selected=Get-ReleaseCheckCaseGeometry $CaseId $script:windowPlan.dpi
+if(($selected.window_size -join ',') -ne ($script:windowPlan.window_size -join ',')){throw 'Sampler window plan differs from the selected DPI table row.'}
 }
 if($preflight.exit_code -ne 0){
     [Console]::Error.WriteLine(('ReleaseChecks sampler SKIPPED: '+$preflight.environment_error))
@@ -50,7 +59,8 @@ try {
     $startCpu = $p.TotalProcessorTime.TotalSeconds
     $startApp = Get-FileLength $app; $startPerf = Get-FileLength $perf
     $samples = New-Object 'Collections.Generic.List[object]'
-    $samples.Add((Get-ReleaseCheckWindowSample $ProcessId))
+    $sampleRoot=if($Scenario -like 'static-*'){$RootHwnd}else{0}
+    $samples.Add((Get-ReleaseCheckWindowSample $ProcessId -RootHwnd $sampleRoot))
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $startUtc = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     while ($clock.Elapsed.TotalSeconds -lt [double]$thresholds.measure_seconds) {
@@ -60,7 +70,7 @@ try {
         if ($remainingMs -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(250, [Math]::Ceiling($remainingMs))) }
         $p.Refresh()
         if ($p.HasExited) { throw 'Owned measured process exited during measurement.' }
-        $samples.Add((Get-ReleaseCheckWindowSample $ProcessId))
+        $samples.Add((Get-ReleaseCheckWindowSample $ProcessId -RootHwnd $sampleRoot))
         if ('System.Windows.Forms.Application' -as [type]) { [Windows.Forms.Application]::DoEvents() }
     }
     $endUtc = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); $clock.Stop()
@@ -88,6 +98,15 @@ try {
     # lifetime verdict and still collect the real worker completion boundaries.
     try { Assert-ReleaseCheckWindowSamples $samples $Scenario $ProcessId $RootHwnd $BackgroundHwnd $BackgroundProcessId }
     catch { $report.environment_errors += $_.Exception.Message }
+    # Reuse the existing samples: prove that covering the static root did not
+    # resize it, that its DPI still matches fixture generation, and that its
+    # physical outer rectangle stays inside the current primary work area.
+    if($Scenario -like 'static-*'){
+        foreach($sample in $samples){
+            try { Assert-ReleaseCheckWindowGeometry $sample.window_geometry $script:windowPlan }
+            catch { $report.environment_errors += $_.Exception.Message;break }
+        }
+    }
     # The real worker boundary, not notification arrival, closes the clock window.
     $wait = [Diagnostics.Stopwatch]::StartNew()
     while (-not (Test-Path -LiteralPath $SleepEvidencePath -PathType Leaf)) {

@@ -61,6 +61,88 @@ class ReleaseChecksFixtureTests(unittest.TestCase):
         with patch.object(fixture, "FOLDER_COUNT", 2), patch.object(fixture, "TRAY_FOLDER_COUNT", 2):
             return fixture.verify_fixture(self.output, allowed_root=self.root)
 
+    def test_shared_geometry_selects_exact_dpi_rows_and_preserves_other_cases(self):
+        for dpi, size, cols in ((96, [1420, 900], 5), (144, [1328, 900], 7)):
+            expected = {"dpi": dpi, "window_size": size, "grid_cols": cols}
+            self.assertEqual(fixture.static_geometry(dpi), expected)
+            for case in ("static-foreground", "static-background", "seed-profile"):
+                self.assertEqual(fixture.case_geometry(case, dpi), expected)
+            for case in ("perf-cached", "perf-uncached", "seed-perf-cached",
+                         "video-pin-background", "first-ai"):
+                self.assertEqual(fixture.case_geometry(case, dpi),
+                                 {"dpi": dpi, "window_size": [1328, 900], "grid_cols": 7})
+            for case in ("tray-close-while-loading", "tray-close-after-loading"):
+                self.assertEqual(fixture.case_geometry(case, dpi),
+                                 {"dpi": dpi, "window_size": [1328, 900], "grid_cols": 10})
+        changed = fixture.static_geometry(96)
+        changed["window_size"][0] = 1
+        self.assertEqual(fixture.static_geometry(96)["window_size"], [1420, 900])
+
+    def test_unknown_dpi_refused_before_fixture_filesystem_checks(self):
+        for dpi in (120, 192, 0, None, "96", 96.0, True):
+            with self.subTest(dpi=dpi):
+                with self.assertRaisesRegex(ValueError, "unsupported release-check DPI"):
+                    fixture.static_geometry(dpi)
+                with self.assertRaisesRegex(ValueError, "unsupported release-check DPI"):
+                    fixture.case_geometry("perf-cached", dpi)
+                with patch.object(fixture, "isolated_path") as isolate:
+                    with self.assertRaisesRegex(ValueError, "unsupported release-check DPI"):
+                        self.generate_small(dpi=dpi)
+                    isolate.assert_not_called()
+                self.assertFalse(self.output.exists())
+
+    def test_dpi_recipe_and_every_overlay_use_exact_shared_geometry(self):
+        original_output = self.output
+        for dpi in (96, 144):
+            self.output = original_output.parent / f"fixture-{dpi}"
+            with self.subTest(dpi=dpi), patch.object(fixture, "fixture_png", return_value=b"test-image"):
+                manifest = self.generate_small(dpi=dpi)
+                self.assertEqual(self.verify_small(), manifest)
+                self.assertEqual(manifest["recipe_version"], "release-checks-v5")
+                self.assertEqual(manifest["static"], fixture.static_recipe(dpi))
+                self.assertEqual(manifest["static"]["dpi"], dpi)
+                self.assertEqual(manifest["static"]["requested_px_target"], 374)
+                self.assertEqual(manifest["static"]["requested_px_tolerance"], 8)
+                for case, file in manifest["overlays"].items():
+                    geometry = fixture.case_geometry("seed-profile" if case == "seed-static" else case, dpi)
+                    overlay = json.loads(Path(file).read_text(encoding="utf-8"))
+                    self.assertEqual(overlay["window_size"], geometry["window_size"], case)
+                    self.assertEqual(overlay["grid_cols"], geometry["grid_cols"], case)
+                seed = json.loads(Path(manifest["overlays"]["seed-static"]).read_text(encoding="utf-8"))
+                for case in ("static-foreground", "static-background"):
+                    runtime = json.loads(Path(manifest["overlays"][case]).read_text(encoding="utf-8"))
+                    for field in ("window_size", "grid_cols", "thumb_aspect", "thumb_aspect_auto"):
+                        self.assertEqual(seed[field], runtime[field])
+
+    def test_manifest_dpi_and_rehashed_overlay_geometry_drift_are_rejected(self):
+        with patch.object(fixture, "fixture_png", return_value=b"test-image"):
+            manifest = self.generate_small(dpi=96)
+        path = self.output / "fixture-manifest.json"
+        for dpi in (120, None):
+            changed = json.loads(json.dumps(manifest))
+            changed["static"]["dpi"] = dpi
+            path.write_text(json.dumps(changed), encoding="utf-8")
+            with self.subTest(dpi=dpi), self.assertRaisesRegex(ValueError, "unsupported release-check DPI"):
+                self.verify_small()
+        changed = json.loads(json.dumps(manifest))
+        changed["static"] = fixture.static_recipe(144)
+        path.write_text(json.dumps(changed), encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "settings overlay"):
+            self.verify_small()
+        for field, value in (("window_size", [1328, 900]), ("grid_cols", 7)):
+            changed = json.loads(json.dumps(manifest))
+            overlay = Path(changed["overlays"]["static-foreground"])
+            original = overlay.read_text(encoding="utf-8")
+            payload = json.loads(original)
+            payload[field] = value
+            overlay.write_text(json.dumps(payload), encoding="utf-8")
+            entry = next(item for item in changed["files"] if item["path"] == str(overlay))
+            entry.update(sha256=fixture.sha256(overlay), size_bytes=overlay.stat().st_size)
+            path.write_text(json.dumps(changed), encoding="utf-8")
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "settings overlay"):
+                self.verify_small()
+            overlay.write_text(original, encoding="utf-8")
+
     def test_wide_png_pixels_metadata_and_crc_are_deterministic(self):
         first = fixture.fixture_png(256, fixture.SEARCH_TERM)
         self.assertEqual(first, fixture.fixture_png(256, fixture.SEARCH_TERM))

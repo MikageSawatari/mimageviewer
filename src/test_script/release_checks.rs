@@ -137,6 +137,169 @@ fn unix_ms() -> u64 {
         .as_millis() as u64
 }
 
+#[derive(Debug, serde::Serialize)]
+struct RootWindowRecord {
+    schema_version: u32,
+    pid: u32,
+    root_hwnd: u64,
+    unix_ms: u64,
+}
+
+impl RootWindowRecord {
+    fn new(selection: &TestScriptActionSelection, pid: u32, unix_ms: u64) -> Result<Self, String> {
+        let root_hwnd = match selection {
+            TestScriptActionSelection::Targeted(TestScriptWindowIdentity::Root {
+                context_serial: 0,
+                hwnd,
+                ..
+            }) if *hwnd > 0 => *hwnd,
+            _ => {
+                return Err(
+                    "environment: root publication requires the selected Root context 0 owner with a positive HWND"
+                        .into(),
+                );
+            }
+        };
+        if pid == 0 || unix_ms == 0 {
+            return Err("environment: invalid root publication pid or timestamp".into());
+        }
+        Ok(Self {
+            schema_version: 1,
+            pid,
+            root_hwnd,
+            unix_ms,
+        })
+    }
+}
+
+fn publish_root(bridge: &RunnerBridge, state: &Mutex<Option<Session>>) -> Result<(), String> {
+    let directory = state
+        .lock()
+        .map_err(|_| "environment: release session poisoned")?
+        .as_ref()
+        .ok_or("environment: root publication requires an active release session")?
+        .directory
+        .clone();
+    // select_root already selected and logged this exact owner. Publication is
+    // worker-only I/O: no new HWND discovery, snapshot request, focus or UI wake.
+    let record = RootWindowRecord::new(&bridge.action_selection()?, std::process::id(), unix_ms())?;
+    write_json(
+        &directory.join("root-window.json"),
+        &serde_json::to_value(record).map_err(|error| error.to_string())?,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+enum ForegroundWaitKind {
+    #[serde(rename = "exact-root-foreground")]
+    ExactRootForeground,
+    #[serde(rename = "ctrl-g-search-focus")]
+    CtrlGSearchFocus,
+}
+
+impl ForegroundWaitKind {
+    fn parse(kind: &str) -> Result<Self, String> {
+        match kind {
+            "exact-root-foreground" => Ok(Self::ExactRootForeground),
+            "ctrl-g-search-focus" => Ok(Self::CtrlGSearchFocus),
+            _ => Err("unsupported foreground wait kind".into()),
+        }
+    }
+
+    fn failure_message(self) -> &'static str {
+        match self {
+            Self::ExactRootForeground => "exact root foreground was not acquired",
+            Self::CtrlGSearchFocus => "Ctrl+G search did not focus",
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ForegroundWaitFailure {
+    schema_version: u32,
+    pid: u32,
+    root_hwnd: u64,
+    wait_kind: ForegroundWaitKind,
+    wait_start_unix_ms: u64,
+    failure_unix_ms: u64,
+}
+
+impl ForegroundWaitFailure {
+    fn new(
+        pid: u32,
+        root_hwnd: u64,
+        kind: &str,
+        wait_start_unix_ms: rhai::INT,
+        failure_unix_ms: u64,
+    ) -> Result<Self, String> {
+        let wait_kind = ForegroundWaitKind::parse(kind)?;
+        let wait_start_unix_ms = u64::try_from(wait_start_unix_ms)
+            .map_err(|_| "invalid foreground wait start timestamp".to_string())?;
+        if pid == 0
+            || root_hwnd == 0
+            || wait_start_unix_ms == 0
+            || failure_unix_ms < wait_start_unix_ms
+        {
+            return Err("invalid foreground wait identity or timestamp interval".into());
+        }
+        Ok(Self {
+            schema_version: 1,
+            pid,
+            root_hwnd,
+            wait_kind,
+            wait_start_unix_ms,
+            failure_unix_ms,
+        })
+    }
+}
+
+fn fail_foreground_wait(directory: &Path, failure: &ForegroundWaitFailure) -> Result<(), String> {
+    write_json(
+        &directory.join("foreground-wait-failure.json"),
+        &serde_json::to_value(failure).map_err(|error| error.to_string())?,
+    )?;
+    // Evidence refines the external runner's classification, never the script outcome.
+    Err(failure.wait_kind.failure_message().into())
+}
+
+fn foreground_wait_failure(
+    bridge: &RunnerBridge,
+    kind: &str,
+    wait_start_unix_ms: rhai::INT,
+) -> Result<(), String> {
+    // Capture the failure boundary before reading cached identity or writing evidence.
+    // A failed wait must not issue Observe, request focus, or wait on a UI writer.
+    let failure_unix_ms = unix_ms();
+    let root_hwnd = bridge
+        .snapshot
+        .try_read()
+        .map_err(|_| "foreground wait cached root snapshot unavailable".to_string())?
+        .windows
+        .iter()
+        .find_map(|window| match window.identity.as_ref() {
+            Some(TestScriptWindowIdentity::Root { hwnd, .. }) if window.role == "root" => {
+                Some(*hwnd)
+            }
+            _ => None,
+        })
+        .ok_or("foreground wait cached root identity unavailable")?;
+    let failure = ForegroundWaitFailure::new(
+        std::process::id(),
+        root_hwnd,
+        kind,
+        wait_start_unix_ms,
+        failure_unix_ms,
+    )?;
+    let directory = session()
+        .try_lock()
+        .map_err(|_| "foreground wait release session unavailable".to_string())?
+        .as_ref()
+        .ok_or("foreground wait requires an active release session")?
+        .directory
+        .clone();
+    fail_foreground_wait(&directory, &failure)
+}
+
 // Every ancestor is checked: canonicalize alone would hide a junction escape.
 fn plain_path(path: &Path) -> Result<PathBuf, String> {
     for ancestor in path.ancestors() {
@@ -568,11 +731,36 @@ fn evidence(bridge: &RunnerBridge, directory: &str, script: Map) -> Result<(), S
     }
     write_json(&directory.join("case-evidence.json"), &value)
 }
+fn search_seed_evidence(observation: &Value) -> Option<Value> {
+    (observation["search_results_settled"] == true && observation["search_searching"] == false)
+        .then(|| {
+            json!({"seed_kind":"search","normal_producer":true,"completed":true,
+            "actual_hits":observation["search_hits"]})
+        })
+}
+
 pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
+    engine.register_fn("release_check_foreground_wait_start", || -> rhai::INT {
+        unix_ms() as rhai::INT
+    });
+    let b = bridge.clone();
+    engine.register_fn(
+        "release_check_foreground_wait_failure",
+        move |kind: ImmutableString, start: rhai::INT| -> Result<(), Box<EvalAltResult>> {
+            foreground_wait_failure(&b, kind.as_str(), start).map_err(rhai_error)
+        },
+    );
     engine.register_fn(
         "release_check_begin",
         |id: ImmutableString, dir: ImmutableString| -> Result<(), Box<EvalAltResult>> {
             begin(id.to_string(), PathBuf::from(dir.as_str())).map_err(rhai_error)
+        },
+    );
+    let b = bridge.clone();
+    engine.register_fn(
+        "release_check_publish_root",
+        move || -> Result<(), Box<EvalAltResult>> {
+            publish_root(&b, session()).map_err(rhai_error)
         },
     );
     let b = bridge.clone();
@@ -626,7 +814,11 @@ pub(super) fn register(engine: &mut Engine, bridge: RunnerBridge) {
                 if targets.is_empty() || targets.iter().any(|t|t["catalog_absent"] != false) { return Err(rhai_error("environment: normal cache seed missing kept target")); }
                 trace("seed",json!({"seed_kind":"cache","normal_producer":true,"saved_cache":true,"folder_path":o.value["current_folder_path"],"targets":targets,"key":targets[0]["key"]}));
             }
-            "search" if o.value["search_done"] == true && o.value["search_searching"] == false => trace("seed",json!({"seed_kind":"search","normal_producer":true,"completed":true,"actual_hits":o.value["search_hits"]})),
+            "search" => {
+                let evidence = search_seed_evidence(&o.value)
+                    .ok_or_else(|| rhai_error("environment: unknown or unprepared seed"))?;
+                trace("seed", evidence);
+            }
             _ => return Err(rhai_error("environment: unknown or unprepared seed")),
         }
         Ok(())
@@ -904,6 +1096,246 @@ fn protocol_ai_trace(proof: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn root_window_test_bridge(
+        selection: TestScriptActionSelection,
+    ) -> (RunnerBridge, mpsc::Receiver<UiCommand>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            RunnerBridge {
+                gamepad: super::super::gamepad_input::WorkerState::default(),
+                tx,
+                snapshot: Arc::new(RwLock::new(super::super::TestScriptSnapshot::default())),
+                interrupt: Arc::new(super::super::InterruptState::default()),
+                wake: Arc::new(|| panic!("root publication must not wake the UI")),
+                next_hold_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                action_selection: Arc::new(Mutex::new(selection)),
+                pointer_regions: super::super::pointer_input::new_shared_catalog(),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn root_window_record_requires_the_selected_root_context_and_valid_boundaries() {
+        let selected = |context_serial, hwnd| {
+            TestScriptActionSelection::Targeted(TestScriptWindowIdentity::Root {
+                context_serial,
+                hwnd,
+                backend_token: 23,
+            })
+        };
+        let record = RootWindowRecord::new(&selected(0, 0x4a11), 42, 1700000000000).unwrap();
+        assert_eq!(
+            serde_json::to_value(record).unwrap(),
+            json!({"schema_version":1,"pid":42,"root_hwnd":0x4a11,
+                "unix_ms":1700000000000_u64})
+        );
+        for selection in [
+            TestScriptActionSelection::LegacyImplicit,
+            selected(1, 0x4a11),
+            selected(0, 0),
+            TestScriptActionSelection::Targeted(TestScriptWindowIdentity::MainFullscreen {
+                context_serial: 0,
+                viewport_id: egui::ViewportId::ROOT,
+                hwnd: 0x4a11,
+                backend_token: 23,
+            }),
+        ] {
+            assert!(RootWindowRecord::new(&selection, 42, 100).is_err());
+        }
+        assert!(RootWindowRecord::new(&selected(0, 0x4a11), 0, 100).is_err());
+        assert!(RootWindowRecord::new(&selected(0, 0x4a11), 42, 0).is_err());
+    }
+
+    #[test]
+    fn root_window_publication_is_atomic_and_uses_selected_identity_without_ui() {
+        let selection = TestScriptActionSelection::Targeted(TestScriptWindowIdentity::Root {
+            context_serial: 0,
+            hwnd: 0x4a11,
+            backend_token: 23,
+        });
+        let (bridge, rx) = root_window_test_bridge(selection.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let state = Mutex::new(Some(Session {
+            directory: directory.path().to_path_buf(),
+            ..Default::default()
+        }));
+        // A stalled UI snapshot writer cannot delay publication of the owner
+        // already selected by select_root. No alternate cached HWND is needed.
+        let _writer = bridge.snapshot.write().unwrap();
+        let before = unix_ms();
+        publish_root(&bridge, &state).unwrap();
+        let after = unix_ms();
+        let path = directory.path().join("root-window.json");
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["pid"], std::process::id());
+        assert_eq!(value["root_hwnd"], 0x4a11);
+        assert!((before..=after).contains(&value["unix_ms"].as_u64().unwrap()));
+        assert_eq!(value.as_object().unwrap().len(), 4);
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(bridge.action_selection().unwrap(), selection);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn root_window_publication_rejects_missing_session_and_invalid_selection_without_output() {
+        let (bridge, rx) = root_window_test_bridge(TestScriptActionSelection::LegacyImplicit);
+        assert!(
+            publish_root(&bridge, &Mutex::new(None))
+                .unwrap_err()
+                .contains("active release session")
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let state = Mutex::new(Some(Session {
+            directory: directory.path().to_path_buf(),
+            ..Default::default()
+        }));
+        assert!(publish_root(&bridge, &state).is_err());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn root_window_registered_api_requires_a_session_without_ui_requests() {
+        let (bridge, rx) = root_window_test_bridge(TestScriptActionSelection::Targeted(
+            TestScriptWindowIdentity::Root {
+                context_serial: 0,
+                hwnd: 0x4a11,
+                backend_token: 23,
+            },
+        ));
+        let mut engine = Engine::new();
+        register(&mut engine, bridge.clone());
+        let _writer = bridge.snapshot.write().unwrap();
+        let error = engine
+            .eval::<()>("release_check_publish_root()")
+            .unwrap_err();
+        assert!(error.to_string().contains("active release session"));
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn foreground_wait_failure_publishes_typed_record_and_still_fails() {
+        for kind in ["exact-root-foreground", "ctrl-g-search-focus"] {
+            let directory = tempfile::tempdir().unwrap();
+            let failure =
+                ForegroundWaitFailure::new(42, 0x1234, kind, 1700000000000, 1700000020000).unwrap();
+            let error = fail_foreground_wait(directory.path(), &failure).unwrap_err();
+            assert_eq!(error, failure.wait_kind.failure_message());
+            assert!(matches!(
+                *rhai_error(error),
+                EvalAltResult::ErrorRuntime(..)
+            ));
+            let path = directory.path().join("foreground-wait-failure.json");
+            let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                value,
+                json!({"schema_version":1,"pid":42,"root_hwnd":0x1234,
+                    "wait_kind":kind,"wait_start_unix_ms":1700000000000_u64,
+                    "failure_unix_ms":1700000020000_u64})
+            );
+            assert!(!path.with_extension("json.tmp").exists());
+            assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn foreground_wait_failure_rejects_untyped_kinds_and_invalid_boundaries() {
+        for kind in [
+            "",
+            "EXACT-ROOT-FOREGROUND",
+            "Ctrl+G search did not focus",
+            "initial-index-settle",
+            "fixture-search-settle",
+            "perf-folder-mismatch",
+        ] {
+            assert!(ForegroundWaitFailure::new(42, 1234, kind, 100, 200).is_err());
+        }
+        for (pid, hwnd, start, end) in [
+            (0, 1234, 100, 200),
+            (42, 0, 100, 200),
+            (42, 1234, -1, 200),
+            (42, 1234, 0, 200),
+            (42, 1234, 201, 200),
+        ] {
+            assert!(
+                ForegroundWaitFailure::new(pid, hwnd, "exact-root-foreground", start, end).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn foreground_wait_failure_write_error_does_not_report_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        let failure =
+            ForegroundWaitFailure::new(42, 1234, "exact-root-foreground", 100, 200).unwrap();
+        assert!(fail_foreground_wait(&missing, &failure).is_err());
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn foreground_wait_failure_registered_api_uses_only_available_cached_identity() {
+        let (tx, rx) = mpsc::channel();
+        let bridge = RunnerBridge {
+            gamepad: super::super::gamepad_input::WorkerState::default(),
+            tx,
+            snapshot: Arc::new(RwLock::new(super::super::TestScriptSnapshot::default())),
+            interrupt: Arc::new(super::super::InterruptState::default()),
+            wake: Arc::new(|| panic!("foreground failure must not wake the UI")),
+            next_hold_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            action_selection: Arc::new(Mutex::new(TestScriptActionSelection::LegacyImplicit)),
+            pointer_regions: super::super::pointer_input::new_shared_catalog(),
+        };
+        let mut engine = Engine::new();
+        register(&mut engine, bridge.clone());
+        let start = engine
+            .eval::<rhai::INT>("release_check_foreground_wait_start()")
+            .unwrap();
+        assert!(start > 0);
+        let script =
+            format!("release_check_foreground_wait_failure(\"exact-root-foreground\", {start})");
+        let missing = engine.eval::<()>(&script).unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains("cached root identity unavailable")
+        );
+        // A writer held by a stalled UI cannot delay this timeout path.
+        let _writer = bridge.snapshot.write().unwrap();
+        let unavailable = engine.eval::<()>(&script).unwrap_err();
+        assert!(
+            unavailable
+                .to_string()
+                .contains("cached root snapshot unavailable")
+        );
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn release_checks_search_seed_evidence_requires_settled_results() {
+        let mut observation = json!({"search_done":true,"search_searching":false,
+            "search_results_settled":false,"search_hits":[]});
+        assert!(search_seed_evidence(&observation).is_none());
+        observation["search_results_settled"] = json!(true);
+        observation["search_hits"] = json!(["C:/fixture/a.png", "C:/fixture/b.png"]);
+        let evidence = search_seed_evidence(&observation).unwrap();
+        assert_eq!(evidence["seed_kind"], "search");
+        assert_eq!(evidence["completed"], true);
+        assert_eq!(evidence["actual_hits"], observation["search_hits"]);
+        observation["search_searching"] = json!(true);
+        assert!(search_seed_evidence(&observation).is_none());
+        observation
+            .as_object_mut()
+            .unwrap()
+            .remove("search_results_settled");
+        observation["search_searching"] = json!(false);
+        assert!(search_seed_evidence(&observation).is_none());
+    }
 
     fn parent_observation(cache_dir: &Path, source: &Path) -> Observation {
         let request_key = crate::path_key::normalize_keep_drive(source);

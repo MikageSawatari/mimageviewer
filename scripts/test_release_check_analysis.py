@@ -1339,7 +1339,164 @@ class DeliveryTests(unittest.TestCase):
             self.assertTrue(load_events_strict(log)[1])
 
 
+class SuiteGeometryTests(unittest.TestCase):
+    @staticmethod
+    def geometry_metadata(dpi: int) -> dict:
+        meta = metadata()
+        size, columns = ([1420, 900], 5) if dpi == 96 else ([1328, 900], 7)
+        meta.update(fixture_version="release-checks-v5",
+                    static_geometry={"dpi": dpi, "window_size": size, "grid_cols": columns},
+                    window_size={}, dpi_by_case={}, window_geometry_by_case={})
+        for i, case_id in enumerate((*REQUIRED_CASES, "seed-profile")):
+            logical = size[:] if case_id in ("seed-profile", "static-foreground", "static-background") else [1328, 900]
+            physical = [round(value * dpi / 96) for value in logical]
+            meta["window_size"][case_id] = logical
+            meta["dpi_by_case"][case_id] = dpi
+            meta["window_geometry_by_case"][case_id] = {
+                "dpi": dpi, "client_size": physical,
+                "window_rect": [0, 0, physical[0] + 16, physical[1] + 39],
+                "root_hwnd": 123 + i, "pid": PID + i}
+        return meta
+
+    @staticmethod
+    def summarize(meta: dict) -> dict:
+        return summarize_suite([finish(report(c)) for c in REQUIRED_CASES], meta)
+
+    def test_registered_96_and_144_dpi_rows_with_native_evidence_pass(self):
+        for dpi in (96, 144):
+            with self.subTest(dpi=dpi):
+                result = self.summarize(self.geometry_metadata(dpi))
+                self.assertEqual(result["environment_errors"], [])
+                self.assertEqual(result["verdict"], "PASS")
+
+    def test_v5_requires_geometry_but_historical_metadata_remains_compatible(self):
+        self.assertEqual(self.summarize(metadata())["verdict"], "PASS")
+        meta = metadata()
+        meta["fixture_version"] = "release-checks-v5"
+        result = self.summarize(meta)
+        self.assertEqual(result["verdict"], "SKIPPED")
+        self.assertTrue(any("static geometry" in e for e in result["environment_errors"]))
+        for field in ("window_size", "dpi_by_case", "window_geometry_by_case"):
+            with self.subTest(missing=field):
+                meta = self.geometry_metadata(96)
+                del meta[field]
+                result = self.summarize(meta)
+                self.assertIn(f"missing/invalid geometry metadata: {field}", result["environment_errors"])
+
+    def test_unknown_dpi_and_wrong_registered_row_are_environment_errors(self):
+        for dpi in (120, 0, True, "96"):
+            with self.subTest(dpi=dpi):
+                meta = self.geometry_metadata(96)
+                meta["static_geometry"]["dpi"] = dpi
+                result = self.summarize(meta)
+                self.assertEqual(result["verdict"], "SKIPPED")
+                self.assertTrue(any("static geometry" in e for e in result["environment_errors"]))
+        for field, value in (("window_size", [1328, 900]), ("grid_cols", 7)):
+            with self.subTest(field=field):
+                meta = self.geometry_metadata(96)
+                meta["static_geometry"][field] = value
+                result = self.summarize(meta)
+                self.assertIn("static_geometry does not match the registered DPI/window/column row",
+                              result["environment_errors"])
+
+    def test_foreground_background_must_use_same_registered_logical_size(self):
+        for dpi in (96, 144):
+            for case_id in ("static-foreground", "static-background"):
+                with self.subTest(dpi=dpi, case_id=case_id):
+                    meta = self.geometry_metadata(dpi)
+                    meta["window_size"][case_id] = [1328, 900] if dpi == 96 else [1420, 900]
+                    result = self.summarize(meta)
+                    self.assertEqual(result["verdict"], "SKIPPED")
+                    self.assertIn(f"window_size does not match expected geometry: {case_id}",
+                                  result["environment_errors"])
+
+    def test_dpi_and_native_client_mismatches_are_environment_errors(self):
+        case_id = "static-background"
+        for dpi in (96, 144):
+            for source in ("dpi_by_case", "native_dpi", "native_client"):
+                with self.subTest(dpi=dpi, source=source):
+                    meta = self.geometry_metadata(dpi)
+                    if source == "dpi_by_case":
+                        meta[source][case_id] = 144 if dpi == 96 else 96
+                    elif source == "native_dpi":
+                        meta["window_geometry_by_case"][case_id]["dpi"] = 144 if dpi == 96 else 96
+                    else:
+                        meta["window_geometry_by_case"][case_id]["client_size"][0] -= 1
+                    result = self.summarize(meta)
+                    self.assertEqual(result["verdict"], "SKIPPED")
+                    self.assertTrue(any(case_id in e for e in result["environment_errors"]))
+
+    def test_native_evidence_requires_complete_identity_and_rectangle(self):
+        case_id = "static-foreground"
+        for field, value in (("pid", 0), ("root_hwnd", None), ("window_rect", [0, 0, 0, 10]),
+                             ("window_rect", [0, 0, 20]), ("client_size", [True, 900])):
+            with self.subTest(field=field, value=value):
+                meta = self.geometry_metadata(96)
+                meta["window_geometry_by_case"][case_id][field] = value
+                self.assertEqual(self.summarize(meta)["verdict"], "SKIPPED")
+        meta = self.geometry_metadata(96)
+        del meta["window_geometry_by_case"][case_id]
+        self.assertIn(f"missing/invalid native window geometry: {case_id}",
+                      self.summarize(meta)["environment_errors"])
+
+    def test_seed_and_nonstatic_geometry_are_checked_when_recorded(self):
+        for case_id in ("seed-profile", "perf-cached", "video-pin-background"):
+            with self.subTest(case_id=case_id):
+                meta = self.geometry_metadata(96)
+                meta["window_size"][case_id] = [1000, 900]
+                result = self.summarize(meta)
+                self.assertIn(f"window_size does not match expected geometry: {case_id}",
+                              result["environment_errors"])
+        meta = self.geometry_metadata(96)
+        for field in ("window_size", "dpi_by_case", "window_geometry_by_case"):
+            del meta[field]["seed-profile"]
+        self.assertEqual(self.summarize(meta)["verdict"], "PASS")
+
+    def test_release_record_execution_line_includes_selected_static_row(self):
+        for dpi, size, columns in ((96, "1420×900", 5), (144, "1328×900", 7)):
+            for mode in ("repo", "kit"):
+                with self.subTest(dpi=dpi, mode=mode):
+                    meta = self.geometry_metadata(dpi)
+                    meta["execution_mode"] = mode
+                    meta["kit"] = {field: "synthetic" for field in
+                                   ("kit_id", "kit_manifest_sha256", "scripts_source_head", "artifact_source_head")}
+                    line = release_record(self.summarize(meta)).splitlines()[3]
+                    self.assertIn(f"静止画条件 DPI {dpi}、窓 {size} 論理 px、{columns} 列。", line)
+                    self.assertIn("実行:", line)
+        self.assertEqual(release_record(self.summarize(metadata())).splitlines()[3], "  実行: repository。")
+
+
 class CliTests(unittest.TestCase):
+    def test_ready_root_replacement_failure_remains_fail_in_summary_and_record(self):
+        cases = [finish(report(case_id)) for case_id in REQUIRED_CASES]
+        case = next(value for value in cases if value["case_id"] == "static-background")
+        reason = "Ready root HWND differs from published root: expected 888, reported 777."
+        case["failures"].append(reason)
+        case["evidence"]["root_identity"] = {
+            "pid": PID, "published_root_hwnd": 888, "ready_root_hwnd": 777}
+        finish(case)
+        result = summarize_suite(cases, metadata())
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn(reason, release_record(result))
+
+    def test_environment_foreground_failure_preserves_raw_process_exit_and_record_reason(self):
+        cases = [finish(report(case_id)) for case_id in REQUIRED_CASES]
+        case = cases[0]
+        reason = ("external foreground persisted throughout the healthy application wait; "
+                  "rows=4, selected=4, wait=2000..4000; "
+                  "foreground=Code.exe (pid=99, class=Chrome_WidgetWin_1)")
+        case["environment_errors"].append(reason)
+        case["evidence"]["process"] = {"process_exit_code": 1}
+        finish(case)
+        self.assertEqual(case["exit_code"], 2)
+        result = summarize_suite(cases, metadata())
+        self.assertEqual(result["exit_code"], 2)
+        self.assertFalse(any("invalid case verdict/exit_code" in message
+                             for message in result["environment_errors"]))
+        self.assertEqual(result["cases"][0]["evidence"]["process"]["process_exit_code"], 1)
+        self.assertIn(reason, release_record(result))
+
     def test_missing_and_malformed_log_retained(self):
         with test_directory() as path:
             self.assertTrue(load_events_strict(path / "absent")[1])
@@ -1381,6 +1538,40 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(json.loads((path / "summary.json").read_text(encoding="utf-8"))["schema_version"], 1)
             self.assertIn("synthetic", (path / "release-record.md").read_text(encoding="utf-8"))
+
+    def test_execution_mode_records_and_validation(self):
+        cases = [finish(report(c)) for c in REQUIRED_CASES]
+        meta = metadata()
+        legacy = summarize_suite(cases, meta)
+        self.assertEqual(legacy["exit_code"], 0)
+        self.assertIn("  実行: repository。", release_record(legacy))
+        meta["execution_mode"] = "repo"
+        meta["environment"] = {"primary_screen": "1920x1080", "remote_session": False}
+        self.assertIn("  実行: repository (画面 1920x1080、RDP セッション いいえ)。",
+                      release_record(summarize_suite(cases, meta)))
+        meta["execution_mode"] = "kit"
+        meta["environment"]["remote_session"] = True
+        meta["kit"] = {"kit_id": "relcheck-test", "kit_manifest_sha256": "a" * 64,
+                       "scripts_source_head": "b" * 40, "artifact_source_head": "c" * 40}
+        result = summarize_suite(cases, meta)
+        self.assertEqual(result["exit_code"], 0)
+        line = release_record(result).splitlines()[3]
+        self.assertEqual(line, "  実行: サブ PC のキット relcheck-test (kit manifest aaaaaaaaaaaa、"
+                         "scripts bbbbbbbbb、artifact ccccccccc)。画面 1920x1080、RDP セッション はい。"
+                         "数値はサブ PC の記録どうしでだけ比べ、メイン PC の記録とは比べない (GPU・画面・RDP が違う)。")
+        for field in meta["kit"]:
+            with self.subTest(missing=field):
+                invalid = {**meta, "kit": {k: v for k, v in meta["kit"].items() if k != field}}
+                result = summarize_suite(cases, invalid)
+                self.assertEqual(result["exit_code"], 2)
+                self.assertIn(f"required kit metadata missing: {field}", result["environment_errors"])
+        for kit in (None, "invalid", {}):
+            with self.subTest(kit=kit):
+                self.assertEqual(summarize_suite(cases, {**meta, "kit": kit})["exit_code"], 2)
+        meta["execution_mode"] = "unknown"
+        result = summarize_suite(cases, meta)
+        self.assertEqual(result["exit_code"], 2)
+        self.assertIn("invalid execution_mode: expected repo or kit", result["environment_errors"])
 
     def test_metadata_missing_or_requested_ai_absent_prohibits_suite_pass(self):
         cases = [finish(report(c)) for c in REQUIRED_CASES]
