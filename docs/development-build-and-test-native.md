@@ -100,6 +100,11 @@ message-only HWND、非表示HWND、表示前に空regionを設定した非ア�
   テストデータは今までどおり依頼ごとに分ける (例: `C:\range835-test\data`)。上書きの前に、前の依頼の mIV が終わっていることを
   確かめる。同じ場所で中身だけ差し替えても、承認は出直さなかった (2026-11-22、tree828diag の回、観測者はサブ PC 担当)。
   ノート PC (サブ PC2) でも同じ規則にする。
+- **承認待ちは利用者に見える側で出す (2026-11-22)**: 承認の画面は Claude アプリのいる仮想デスクトップに出るため、
+  mIV のデスクトップのままだと利用者が気づかない (サブ PC2 で実際に気づかれないまま待っていた)。`request_access` と
+  `AskUserQuestion` の直前に毎回、Claude アプリのデスクトップへ切り替え、PushNotification を送り、音 (`Alarm08.wav`) を鳴らす。
+  承認の後は mIV のデスクトップへ戻り、隠れ具合 (`cloaked`) を確かめてから操作を再開する。手順の正本はサブ PC 担当が書いた
+  `C:\home\mimageviewer-subpc\tools\approval-desktop-procedure.md` (リポジトリの外)。サブ PC とサブ PC2 の両方で使う。
 - **Claude アプリの窓が操作の邪魔をする (2026-11-03 調査)**: Windows 版 Claude デスクトップアプリは画面操作中、
   自分の窓を画面の端のパネルに縮めて最前面に固定し、画面写真を撮る瞬間だけ写らないようにする
   (GitHub anthropics/claude-code の issue 95580・106102・103735 の報告。公式の回避設定は無い)。
