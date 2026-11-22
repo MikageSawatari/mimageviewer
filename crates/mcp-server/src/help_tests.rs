@@ -351,9 +351,12 @@ fn help_search_bounds_query_characters_and_whitespace_terms_before_search() {
         .unwrap();
     let query_schema = &tool["inputSchema"]["properties"]["query"];
     assert_eq!(query_schema["maxLength"], MAX_HELP_QUERY_CHARS);
-    assert_eq!(
-        query_schema["pattern"],
-        format!("^\\s*\\S+(\\s+\\S+){{0,{}}}\\s*$", MAX_HELP_QUERY_TERMS - 1)
+    assert!(query_schema.get("pattern").is_none());
+    assert!(
+        tool["description"]
+            .as_str()
+            .unwrap()
+            .contains("Max 8 terms.")
     );
     for scalar in ["a", "猫", "𠮷"] {
         let boundary = json!({"query":scalar.repeat(MAX_HELP_QUERY_CHARS)});
@@ -378,6 +381,15 @@ fn help_search_bounds_query_characters_and_whitespace_terms_before_search() {
             "Specify at most 8 help query terms"
         );
     }
+    // FEFF is not Rust whitespace; U+0085 above is. Leave term splitting to
+    // the runtime instead of a schema regex with a different Unicode set.
+    assert!(
+        call(
+            "search_help",
+            json!({"query": vec!["a"; MAX_HELP_QUERY_TERMS + 1].join("\u{feff}")})
+        )
+        .is_ok()
+    );
     // Both boundaries at once: seven short words and a final long word.
     let boundary = format!("{}{}", "a ".repeat(7), "a".repeat(186));
     assert_eq!(boundary.chars().count(), MAX_HELP_QUERY_CHARS);

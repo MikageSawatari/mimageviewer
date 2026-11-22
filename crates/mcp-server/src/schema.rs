@@ -480,7 +480,7 @@ pub fn tools() -> Vec<Value> {
     TOOL_NAMES.into_iter().map(|name| {
         let description=match name {
             "get_view_state"=>"Read mImageViewer (mIV) main/F12 state; during switches the target item may differ from the display.",
-            "search_help"=>"Search mImageViewer (mIV) help offline.",
+            "search_help"=>"Search mImageViewer (mIV) help offline. Max 8 terms.",
             "get_help"=>"Read mImageViewer (mIV) help offline.",
             "miv_status"=>"Read mImageViewer (mIV) version, AI permissions, index readiness, search_scope paths (favorites with item indexing enabled; search_scope_truncated means more exist) and Remote activity.",
             "search_items"=>"Search mImageViewer (mIV)'s index (Ctrl+G syntax): paths/names/kinds/tags/ratings; AI captions and transcripts require their respective mIV permissions. Searches favorites listed in miv_status search_scope (more exist if search_scope_truncated); use list_folder elsewhere.",
@@ -521,7 +521,7 @@ pub fn tools() -> Vec<Value> {
         };
         let description = format!("{description} {required}");
         let input=match name {
-            "search_help"=>object(json!({"query":{"type":"string","minLength":1,"maxLength":crate::help::MAX_HELP_QUERY_CHARS,"pattern":format!("^\\s*\\S+(\\s+\\S+){{0,{}}}\\s*$",crate::help::MAX_HELP_QUERY_TERMS-1)},"limit":{"type":["integer","null"],"minimum":1,"maximum":30,"default":10}}),&["query"]),
+            "search_help"=>object(json!({"query":{"type":"string","minLength":1,"maxLength":crate::help::MAX_HELP_QUERY_CHARS},"limit":{"type":["integer","null"],"minimum":1,"maximum":30,"default":10}}),&["query"]),
             "get_help"=>object(json!({"id":nullable_string(),"part":{"type":["integer","null"],"minimum":1,"default":1}}),&[]),
             "add_tags"|"remove_tags"=>object(json!({"items":{"type":"array","minItems":1,"maxItems":MAX_WRITE_ITEMS,"items":object(json!({"path":string()}),&["path"])},"tags":{"type":"array","minItems":1,"maxItems":MAX_WRITE_TAGS,"items":string()}}),&["items","tags"]),
             "set_rating"=>object(json!({"items":{"type":"array","minItems":1,"maxItems":MAX_WRITE_ITEMS,"items":object(json!({"path":string(),"subresource":nullable_string()}),&["path"])},"stars":{"type":"integer","minimum":0,"maximum":5}}),&["items","stars"]),
