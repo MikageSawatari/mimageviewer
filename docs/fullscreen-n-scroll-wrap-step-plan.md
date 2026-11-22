@@ -1,6 +1,6 @@
 # N 字 / Z 字で、読み進める量と列 / 段を替える量を別々に決める (§1.850)
 
-- 状態: **設計 ACCEPT (独立設計レビュー r2、2026-11-22)。実装は統括の合図を待つ (未着手)**。収録予定 v5.6.0 (利用者の希望、2026-11-22)。
+- 状態: **実装済み・独立実装レビュー ACCEPT・関連テスト成功 (2026-11-22)。実機確認は未実施 (サブ PC の依頼文を用意済み、送付は統括の判断待ち)**。設計は独立設計レビュー r2 で ACCEPT。収録予定 v5.6.0 (利用者の希望、2026-11-22)。
 - 要望: 5ch [>>857](https://egg.5ch.io/test/read.cgi/software/1782419551/857) (正本は [保留バックログ §1.850](backlog-on-hold.md))。
   報告者の意図 (重なりを別々にしたい、という読み取り) は**未確認**。そのため本書は、既定と既存の値を変えない追加設定として作る。
 - 前提の設計: [ページ内スクロールと N 字スクロール (§1.474)](fullscreen-in-page-scroll-plan.md)、
@@ -283,3 +283,15 @@ N 字で縦が画面に収まり、横だけはみ出すページでは、K は�
 
 指摘なし。r1 の 5 件は解消、新たな問題なし。終端・折り返しの検査は次 / 前・N 字 / Z 字の符号に対して正しく、早期停止・途中の折り返し・
 主軸の戻し忘れを検出できる、との判断。38 件成功は提示した実行記録を使い、レビュー担当は再実行していない。
+
+## 8. 実装記録
+
+- 2026-11-22、統括の合図 (相談点 2・3 は設計どおり、1 は利用者の作業) で実装。master 0e1b617b0 を取り込んだ上 (154fe95b4) に、
+  Codex GPT-6.1 Sol / high (session 01a200f2、cargo は実行させない) が実装し、テスト内の trait import 漏れ 1 件を設計担当が直した (ac70a5620)。
+- 関連テスト (run-heavy 経由、設計担当が実行): `cargo nextest run -p mimageviewer --lib --no-fail-fast -E 'test(/in_page_scroll|settings_transfer|n_scroll|search_index|viewer_notice_visibility|preferences::tests/)'`
+  → 504 件中 500 件成功、4 件は新しい行が加わった環境設定の snapshot (`fullscreen_in_page_scroll_setting_tests` の 4 枚)。
+  `UPDATE_SNAPSHOTS=1` で更新し、4 枚を目視で確認 (新しい行だけが加わり、他の部分の変化なし)。更新後、その 4 件と同じ画面の
+  `preferences_viewer_notice_visibility_snapshot`・`fullscreen_manual_nav_wrap_setting_*` を含む 11 件が成功。`check_ui_glyphs.py` 違反なし。
+- 独立実装レビュー r1 (GPT-6.1 Sol / xhigh、read-only、別 session 01a2011f): **ACCEPT、指摘なし**。`None` で旧動作を保つこと、副軸だけへの適用、
+  設定・転送・環境設定・文書の整合、テストが量の無視や主軸への誤適用を検出できることを確認 (テストは再実行せず、上の結果を使用)。
+- 未実施: 本体 lib 全件 (ブランチでは流さない規則。master 取り込み後に統括)、実機確認。
