@@ -50,19 +50,25 @@
   junction / ディレクトリの symlink / フォルダへのマウントがあり、その接続先が外れている場合も `NotFound` になる。
   これらは一時的に接続されていないものとして扱い、対象から外す。マニュアルの「一時的に読めない項目も
   登録行を残す」と食い違わないようにするため。
-- 判定 (`missing_source_is_removable(path)`、prepare worker 内):
-  1. `path` 自身から親へ順にたどり、`std::fs::symlink_metadata` (リンクをたどらない) が成功する最初のパスを
-     「最も近い実在の祖先」N とする。`NotFound` なら 1 つ上へ進む。`NotFound` 以外のエラーで止まったら**対象外**。
-     親が無くなる (ドライブ・共有そのものが無い、相対パス) まで見つからなければ**対象外**。
+- 判定 (`missing_source_is_removable(path, cache)`、prepare worker 内):
+  0. `path` が絶対パス (`Prefix` + `RootDir` を持つ) でなければ、I/O をせずに**対象外** (r2 レビュー P3。
+     本番の登録は絶対の drive / UNC パスだけだが、判定側でも拒否する)。
+  1. ルートから `path` 自身まで、上から順に各パス P (ルート、1 段下、…、`path`) を調べ、
+     `std::fs::symlink_metadata` (リンクをたどらない) で状態を得る。
+     - 成功 → 次の段へ進む (最後の段 = `path` 自身まで成功したら、N = `path`)。
+     - `NotFound` → 1 つ上の段を「最も近い実在の祖先」N として止まる。ルート自身が `NotFound` なら**対象外**。
+     - `NotFound` 以外のエラー → **対象外**。
   2. N に対して `std::fs::metadata` (リンクをたどる) が成功し、`is_dir()` のときだけ**対象**。
+- 上から調べる理由 (r2 レビュー P2): 下から調べると、つながらない共有の下の a.jpg・b.jpg… のように登録パスが
+  それぞれ違うとき、葉ごとにネットワーク照会が増える。上から調べてパスごとの結果を覚えておけば、ルートや途中の
+  フォルダが到達不能と分かった後は、同じ祖先を持つ別の項目は I/O なしで対象外になる。
 - この判定で区別できるもの:
   - フォルダ名の変更・移動・削除 (報告の場面): N は変更前の親など実在の普通のフォルダで、対象になる。
-  - 外したドライブ・つながらない共有: N が見つからないので対象外。
-  - 接続先が外れた junction / symlink / マウント: N はそのリンク自身 (`symlink_metadata` は成功する) で、
-    リンク先をたどる `metadata` が失敗するので対象外。登録した項目そのものが外れたリンクの場合も同じ。
+  - 外したドライブ・つながらない共有: ルートが `NotFound` かほかのエラーになるので対象外。
+  - 接続先が外れた junction / symlink / マウント: そのリンク自身は `symlink_metadata` で成功し、その下の段が
+    `NotFound` になるので N はリンク自身になる。リンク先をたどる `metadata` が失敗するので対象外。
+    登録した項目そのものが外れたリンクの場合は N = `path` で、同じく対象外。
   - 接続先が生きている junction の下でフォルダ名を変えた場合: N は実在するので対象になる。
-  - 上位のリンクが外れていれば、その下のパスは `symlink_metadata` でも見つからないので、N は必ずリンク自身か
-    それより上になる。途中の祖先を 1 つずつ調べ直す必要はない。
 - 表示の分類 (「見つかりません」の表示、テキスト書き出し、Remote の状態、登録時の分類) は**変えない**。
   `inspect_collection_source` も変えない (変えると、テキスト取り込みで外したドライブ上のパスを登録できなく
   なる等、既存の挙動が変わるため)。
@@ -95,10 +101,13 @@ pub(crate) struct CollectionPreparedSnapshot {
 }
 ```
 
-- 判定は分類ループの中で Missing の項目にだけ行う。調べたパスごとの結果 (`symlink_metadata` の成否・
-  `metadata` の結果) は準備 1 回の中の `HashMap<PathBuf, _>` に覚え、同じフォルダの下の多数の項目や、
-  つながらない共有での時間待ちを繰り返さない。各 I/O の前に `keep_running()` を見て取り消しに従う。
+- 判定は分類ループの中で Missing の項目にだけ行う。調べたパスごとの結果 (`symlink_metadata` の結果:
+  実在 / `NotFound` / その他のエラー、と N に対する `metadata` の結果) は準備 1 回の中の
+  `HashMap<PathBuf, _>` に覚える。上から調べるので、到達不能と分かったルート・祖先の下の別の項目は、
+  キャッシュを見るだけで I/O をしない。各 I/O の前に `keep_running()` を見て取り消しに従う。
   判定の I/O は関数を注入できる形にし、テストで実ファイルなしに回数と結果を検査できるようにする。
+- 既存の分類 (`inspect_collection_source`) の照会 (項目ごとに 1 回) は今と同じで、増えるのは Missing の項目の
+  判定分だけ。到達不能な共有の下に多数の登録があっても、判定で増える照会はルート (と到達できる祖先) ごとに 1 回。
 - 本番の `CollectionPreparedSnapshot` の構築は prepare.rs の 1 か所だけ。表示用の射影
   (`prepare_collection_grid_install` の書庫射影、`project_collection_display_snapshot`) は `entries` だけを
   差し替えるので、このフィールドはそのまま残る。ナビゲーション・履歴・Remote の準備も同じ関数を通るので、
@@ -162,8 +171,8 @@ pub(crate) struct CollectionPreparedSnapshot {
   native 描画と egui 描画は同じモデルを見るので両方に出る。
 - 取り込みの寿命は既存の契約に従う: native は開いた時点の target を保持し、egui は毎フレーム target を
   作り直す。どちらも既存の context / items 世代の検査 (`context_menu.rs` の世代確認) で、一覧が更新されたら
-  メニューを閉じる。古い target が送られても、送信時の stamp 検査と expected_revision の Conflict で何も
-  消えない。新しい追従状態は足さない。
+  メニューを閉じる。それでも古い target が届いた場合は、§4.4 の受付時と送信前の stamp 検査で actor へ
+  送らない。新しい追従状態は足さない。
 
 ### 4.3 確認ダイアログ
 
@@ -199,6 +208,18 @@ Missing の文言:
 - 選んだ時点の `CollectionGridContentTarget` (stamp + expected_revision) と `removable_missing` の entry_id 群から
   `CollectionGridRemoveTarget` を作り、`request_collection_grid_remove` へ渡す (新しい経路は作らない)。
   sample_paths は同じ `removable_missing` の先頭から取る。
+- **stamp の検査 (r2 レビュー P2 で前提の誤りを訂正)**: 現行の `request_collection_grid_remove` と
+  `submit_collection_remove` は stamp を検査せずに actor へ送る。stamp を見るのは成功後の UI 適用だけで、
+  context / surface を開き直しても DB の revision が同じなら Conflict にならない。そこで Grid 起点の「外す」
+  (新しいコマンドと既存の選択からの「外す」の両方) に、次の 2 か所で origin context の検査を入れる。
+  1. `request_collection_grid_remove` の受付時 (確認ダイアログを開く前)。
+  2. 確認ダイアログで「外す」が確定し、`submit_collection_remove` で actor へ送る直前。
+  検査は `collection_grid_request_stamp_is_current(stamp)` を **stamp の `ViewerContextId` の context で**評価する
+  (投影中の context ならそのまま、そうでなければ `apply_collection_grid_remove_success` と同じ
+  `with_viewer_context` の経路で読み取る。読み取りだけで、その context の状態は変えない)。
+  古ければ actor へ送らず、ダイアログを閉じて「コレクションの一覧が変わったため、外していません。もう一度
+  選んでください」と通知する。既存のインポートの確認 (`PreviewImport`) が確定前に同じ検査をしている形に揃える。
+  既存の「外す」にとっては、古い要求を送らなくなるだけで、通常の操作は変わらない。
 - 結果の適用、他の context への反映、Conflict の扱いは既存の「外す」と同じ (§5)。
 - `apply_collection_grid_remove_success_in_current_context` は表示 entry ごとに `removed.contains()` を呼ぶため、
   大量に外すと UI スレッドで二次の計算量になる (r1 レビュー P2)。削除 ID を一度だけ `HashSet` にしてから
@@ -231,12 +252,16 @@ Missing の文言:
   ドライブ・共有ごと無い → 対象外 / 最も近い実在の祖先が外れたリンク (`symlink_metadata` 成功・`metadata`
   失敗) → 対象外 / 登録項目そのものが外れたリンク → 対象外 / 途中で `NotFound` 以外のエラー → 対象外 /
   相対パス → 対象外 / Unsupported・AccessError → 対象外 / 並びが effective order / 同じ祖先の I/O が準備 1 回で
-  1 回だけ / 取り消しで止まる。
+  1 回だけ / ルートや祖先が到達不能と分かった後、同じ祖先を持つ別の項目では I/O をしない /
+  相対パス (実在する相対の祖先があっても) → I/O なしで対象外 / 取り消しで止まる。
 - 実ファイルでの判定 (一時フォルダ): フォルダ名を変えた後の登録 → 対象。接続先を消した junction の下の登録 →
   対象外 (junction は `mklink /J` 相当を std で作れないので、作れない環境ではテストを skip せず、注入版の
   テストで覆う。実ファイル版は作れる場合だけでよい)。
 - 射影: `project_collection_display_snapshot` と書庫射影の後も `removable_missing` が残る (隠れた種類の
   Missing も含む)。
+- stamp の検査: revision は同じで surface generation だけ古い target (一覧を開き直した後の右クリックの残り、
+  別 context の stamp) を、受付時・確定時のどちらでも actor へ送らないこと。投影中でない origin context の
+  stamp を正しく評価し、その context の状態を変えないこと。既存の選択からの「外す」も同じ。
 - 受付 helper: §4.1 の 1〜5 の各分岐。特に旧 installed を保持した `RequestNeeded` / `Preparing` / `Failed`、
   `wanted_revision > accepted_revision` で件数なし・無効になること。トップメニューと右クリックが同じ結果を出すこと。
 - 成功の適用: 表示から隠れた削除対象を含めて外したとき、残る checked / cursor が保たれ、兄弟 context に
