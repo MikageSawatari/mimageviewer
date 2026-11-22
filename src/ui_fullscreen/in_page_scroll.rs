@@ -19,6 +19,8 @@ mod interaction_tests;
 #[cfg(test)]
 mod landing_tests;
 #[cfg(test)]
+mod n_scroll_report_850_tests;
+#[cfg(test)]
 mod navigation_landing_tests;
 #[cfg(test)]
 mod overflow_tests;
@@ -179,19 +181,24 @@ pub(super) fn ordered_scroll_pan(
     direction: ReadingDirection,
     order: crate::settings::FullscreenNScrollOrder,
     next: bool,
-    step_fraction: f32,
+    steps: OrderedScrollSteps,
 ) -> Vec2 {
-    ordered_scroll_pan_with_steps(
-        layout,
-        zoom,
-        pan,
-        direction,
-        order,
-        next,
-        step_fraction,
-        None,
-        true,
-    )
+    ordered_scroll_pan_with_steps(layout, zoom, pan, direction, order, next, steps, true)
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct OrderedScrollSteps {
+    /// One reading step, as a fraction of the primary viewport axis.
+    primary: f32,
+    /// One column/row change, as a fraction of the secondary viewport axis.
+    wrap: f32,
+}
+
+impl OrderedScrollSteps {
+    fn from_settings(settings: &crate::settings::Settings) -> Self {
+        let (primary, wrap) = settings.fullscreen_n_scroll_fractions();
+        Self { primary, wrap }
+    }
 }
 
 /// Wheel input changes only the primary step; a discrete segment may wrap.
@@ -202,8 +209,7 @@ fn ordered_scroll_pan_with_steps(
     direction: ReadingDirection,
     order: crate::settings::FullscreenNScrollOrder,
     next: bool,
-    step_fraction: f32,
-    primary_fraction: Option<f32>,
+    steps: OrderedScrollSteps,
     allow_wrap: bool,
 ) -> Vec2 {
     if !pan.is_finite() {
@@ -223,14 +229,11 @@ fn ordered_scroll_pan_with_steps(
     };
     let forward = Vec2::new(horizontal_sign, -1.0);
     let signs = forward * if next { 1.0 } else { -1.0 };
-    let steps = geometry.viewport.size() * step_fraction;
     let mut target = pan;
     target[primary] = step_axis(
         geometry.axes[primary],
         pan[primary],
-        signs[primary]
-            * geometry.viewport.size()[primary]
-            * primary_fraction.unwrap_or(step_fraction),
+        signs[primary] * geometry.viewport.size()[primary] * steps.primary,
     );
     let candidate = clamp_fullscreen_pan_from_layout(layout, zoom, target);
     if candidate.is_finite()
@@ -248,7 +251,7 @@ fn ordered_scroll_pan_with_steps(
     target[secondary] = step_axis(
         geometry.axes[secondary],
         pan[secondary],
-        signs[secondary] * steps[secondary],
+        signs[secondary] * geometry.viewport.size()[secondary] * steps.wrap,
     );
     if target[secondary] == pan[secondary] {
         return pan;
@@ -303,22 +306,12 @@ fn ordered_scroll_outcome(
     direction: ReadingDirection,
     order: crate::settings::FullscreenNScrollOrder,
     next: bool,
-    step_fraction: f32,
-    primary_fraction: Option<f32>,
+    steps: OrderedScrollSteps,
     allow_wrap: bool,
     allow_turn: bool,
 ) -> FsPageScrollOutcome {
-    let candidate = ordered_scroll_pan_with_steps(
-        layout,
-        zoom,
-        pan,
-        direction,
-        order,
-        next,
-        step_fraction,
-        primary_fraction,
-        allow_wrap,
-    );
+    let candidate =
+        ordered_scroll_pan_with_steps(layout, zoom, pan, direction, order, next, steps, allow_wrap);
     if candidate != pan {
         FsPageScrollOutcome::Move(candidate)
     } else if allow_turn {
@@ -790,10 +783,7 @@ impl App {
                     .unwrap_or(self.reading_direction),
                 self.settings.fullscreen_n_scroll_order,
                 action == KeyAction::FsPageNScrollNext,
-                self.settings
-                    .fullscreen_n_scroll_step_percent
-                    .clamp(10, 100) as f32
-                    / 100.0,
+                OrderedScrollSteps::from_settings(&self.settings),
             ),
             _ => {
                 let viewport = layout
@@ -862,11 +852,7 @@ impl App {
                     .unwrap_or(self.reading_direction),
                 self.settings.fullscreen_n_scroll_order,
                 next,
-                self.settings
-                    .fullscreen_n_scroll_step_percent
-                    .clamp(10, 100) as f32
-                    / 100.0,
-                None,
+                OrderedScrollSteps::from_settings(&self.settings),
                 true,
                 allow_turn,
             )
@@ -926,18 +912,15 @@ impl App {
                 .unwrap_or(self.reading_direction),
             self.settings.fullscreen_n_scroll_order,
             delta.y < 0.0,
-            self.settings
-                .fullscreen_n_scroll_step_percent
-                .clamp(10, 100) as f32
-                / 100.0,
-            Some(
-                delta.y.abs() / CONTINUOUS_READING_WHEEL_REFERENCE_DELTA
+            OrderedScrollSteps {
+                primary: delta.y.abs() / CONTINUOUS_READING_WHEEL_REFERENCE_DELTA
                     * self
                         .settings
                         .continuous_reading_wheel_scroll_percent
                         .clamp(1, 100) as f32
                     / 100.0,
-            ),
+                wrap: self.settings.fullscreen_n_scroll_fractions().1,
+            },
             discrete,
             allow_turn,
         )
@@ -1219,7 +1202,18 @@ mod tests {
             app,
             layout,
             1.0,
-            ordered_scroll_pan(layout, 1.0, pan, direction, order, next, 0.85),
+            ordered_scroll_pan(
+                layout,
+                1.0,
+                pan,
+                direction,
+                order,
+                next,
+                OrderedScrollSteps {
+                    primary: 0.85,
+                    wrap: 0.85,
+                },
+            ),
         )
     }
 
@@ -1338,6 +1332,168 @@ mod tests {
                     );
                     let end = signs * 1000.0;
                     close(ordered(&mut app, &layout, end, direction, order, next), end);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_different_primary_and_wrap_steps_follow_n_and_z_in_both_directions() {
+        let layout = single(Vec2::splat(3000.0));
+        for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+            let horizontal = if direction == ReadingDirection::Ltr {
+                -1.0
+            } else {
+                1.0
+            };
+            for order in [VerticalFirst, HorizontalFirst] {
+                let primary = if order == VerticalFirst { 1 } else { 0 };
+                let secondary = 1 - primary;
+                for next in [true, false] {
+                    let signs = Vec2::new(horizontal, -1.0) * if next { 1.0 } else { -1.0 };
+                    let start = -signs * 1000.0;
+                    for wrap in [0.1, 1.0] {
+                        let steps = OrderedScrollSteps {
+                            primary: 0.15,
+                            wrap,
+                        };
+                        let mut expected = start;
+                        expected[primary] += signs[primary] * 150.0;
+                        close(
+                            ordered_scroll_pan_with_steps(
+                                &layout, 1.0, start, direction, order, next, steps, true,
+                            ),
+                            expected,
+                        );
+                        let mut edge = start;
+                        edge[primary] = signs[primary] * 1000.0;
+                        expected = start;
+                        expected[secondary] += signs[secondary] * 1000.0 * wrap;
+                        close(
+                            ordered_scroll_pan_with_steps(
+                                &layout, 1.0, edge, direction, order, next, steps, true,
+                            ),
+                            expected,
+                        );
+                        let end = signs * 1000.0;
+                        assert_eq!(
+                            ordered_scroll_outcome(
+                                &layout, 1.0, end, direction, order, next, steps, true, true
+                            ),
+                            FsPageScrollOutcome::Turn
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_no_primary_overflow_uses_the_independent_wrap_step() {
+        for order in [VerticalFirst, HorizontalFirst] {
+            let secondary = if order == VerticalFirst { 0 } else { 1 };
+            let mut size = Vec2::splat(800.0);
+            size[secondary] = 3000.0;
+            let layout = single(size);
+            for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+                for next in [true, false] {
+                    let mut expected = Vec2::ZERO;
+                    let sign = if secondary == 0 && direction == ReadingDirection::Rtl {
+                        1.0
+                    } else {
+                        -1.0
+                    };
+                    expected[secondary] = sign * if next { 1.0 } else { -1.0 } * 1000.0;
+                    close(
+                        ordered_scroll_pan_with_steps(
+                            &layout,
+                            1.0,
+                            Vec2::ZERO,
+                            direction,
+                            order,
+                            next,
+                            OrderedScrollSteps {
+                                primary: 0.15,
+                                wrap: 1.0,
+                            },
+                            true,
+                        ),
+                        expected,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn asymmetric_original_spread_with_independent_wrap_never_repeats_positions() {
+        let mut app = crate::app::setup_app_for_test();
+        for trim in [false, true] {
+            for transpose in [false, true] {
+                let layout = asymmetric_spread(trim, transpose);
+                let order = if transpose {
+                    HorizontalFirst
+                } else {
+                    VerticalFirst
+                };
+                let primary = if transpose { 0 } else { 1 };
+                let secondary = 1 - primary;
+                let geometry = scroll_geometry(&layout).unwrap();
+                app.fullscreen_page_layout = layout.clone();
+                for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+                    for next in [true, false] {
+                        let horizontal = if direction == ReadingDirection::Ltr {
+                            -1.0
+                        } else {
+                            1.0
+                        };
+                        let signs = Vec2::new(horizontal, -1.0) * if next { 1.0 } else { -1.0 };
+                        for wrap in [0.1, 1.0] {
+                            let mut pan = Vec2::new(
+                                geometry.axes[0].unwrap().start(signs.x),
+                                geometry.axes[1].unwrap().start(signs.y),
+                            );
+                            let mut seen = vec![pan];
+                            let mut stopped = false;
+                            for _ in 0..1500 {
+                                let result = ordered_scroll_pan_with_steps(
+                                    &layout,
+                                    1.0,
+                                    pan,
+                                    direction,
+                                    order,
+                                    next,
+                                    OrderedScrollSteps {
+                                        primary: 0.15,
+                                        wrap,
+                                    },
+                                    true,
+                                );
+                                if result == pan {
+                                    stopped = true;
+                                    break;
+                                }
+                                assert!(
+                                    (result[secondary] - pan[secondary]) * signs[secondary] >= 0.0
+                                );
+                                if (result[primary] - pan[primary]) * signs[primary] < 0.0 {
+                                    assert!(
+                                        (result[secondary] - pan[secondary]) * signs[secondary]
+                                            > 0.0
+                                    );
+                                }
+                                app.set_fs_pan_from_input(1.0, result);
+                                assert_eq!(app.fs_pan, result);
+                                assert!(!seen.contains(&result));
+                                seen.push(result);
+                                pan = result;
+                            }
+                            assert!(
+                                stopped,
+                                "trim={trim} transpose={transpose} {direction:?} next={next} wrap={wrap}"
+                            );
+                        }
+                    }
                 }
             }
         }

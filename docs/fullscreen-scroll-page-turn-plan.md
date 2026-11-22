@@ -30,6 +30,8 @@
 
 ## 2. §1.826 N 字 / Z 字の移動量
 
+列 / 段を替える量を別に決める追加設定は [§1.850 の設計](fullscreen-n-scroll-wrap-step-plan.md) を参照（未設定なら本節の動きのまま）。
+
 - 設定 `fullscreen_n_scroll_step_percent: u32` (表示領域の幅 / 高さに対する %)。既定 **85**、範囲 **10〜100**。
   範囲外は読み込み時に clamp (既存の `continuous_reading_*_percent` と同じ扱い)。serde default。転送は同じ分類 (`(10..=100).contains`)。
   未リリースの新設定なので migration は不要。

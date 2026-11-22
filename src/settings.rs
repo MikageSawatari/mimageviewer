@@ -5916,6 +5916,9 @@ pub struct Settings {
     /// ページ内を N 字 / Z 字の順で読む操作 1 回の移動量 (表示領域比 %)。
     #[serde(default = "default_fullscreen_n_scroll_step_percent")]
     pub fullscreen_n_scroll_step_percent: u32,
+    /// None uses the reading step for column/row changes as well.
+    #[serde(default)]
+    pub fullscreen_n_scroll_wrap_step_percent: Option<u32>,
     /// ページ内スクロールの論理位置は即時に更新し、見た目だけ滑らかに動かす。
     #[serde(default)]
     pub fullscreen_smooth_page_scroll: bool,
@@ -8447,6 +8450,7 @@ impl Default for Settings {
             fullscreen_wheel_action: FullscreenWheelAction::default(),
             fullscreen_n_scroll_order: FullscreenNScrollOrder::default(),
             fullscreen_n_scroll_step_percent: default_fullscreen_n_scroll_step_percent(),
+            fullscreen_n_scroll_wrap_step_percent: None,
             fullscreen_smooth_page_scroll: false,
             fullscreen_bound_drag_pan: false,
             fullscreen_page_number_overlay: true,
@@ -9156,6 +9160,16 @@ pub(crate) fn legacy_json_family_presence(data_dir: &Path) -> crate::settings_db
 // を使うので、`data_dir::get()` 経由のパス計算は不要になった。
 
 impl Settings {
+    /// Resolve reading and column/row steps together, including unsanitized drafts.
+    pub(crate) fn fullscreen_n_scroll_fractions(&self) -> (f32, f32) {
+        let reading = self.fullscreen_n_scroll_step_percent.clamp(10, 100);
+        let wrap = self
+            .fullscreen_n_scroll_wrap_step_percent
+            .unwrap_or(reading)
+            .clamp(10, 100);
+        (reading as f32 / 100.0, wrap as f32 / 100.0)
+    }
+
     /// Released values do not say whether the book's list was ever shown. Preserve that first
     /// destination once; subsequent loads must never project the changing legacy carrier again.
     pub(crate) fn migrate_startup_list_restore(&mut self) -> bool {
@@ -10879,6 +10893,9 @@ impl Settings {
         self.fullscreen_n_scroll_order = self.fullscreen_n_scroll_order.normalized();
         self.fullscreen_n_scroll_step_percent =
             self.fullscreen_n_scroll_step_percent.clamp(10, 100);
+        self.fullscreen_n_scroll_wrap_step_percent = self
+            .fullscreen_n_scroll_wrap_step_percent
+            .map(|percent| percent.clamp(10, 100));
         self.fullscreen_specified_scale.sanitize();
         self.fullscreen_specified_scale_max_tenths =
             self.fullscreen_specified_scale_max_tenths.clamp(
