@@ -77,7 +77,7 @@
 
 ### 1.849 通常の並べ替えの変更で、物理フォルダを UI スレッドで同期に走査する — §1.838 の設計から (2026-11-22)
 
-- 状態: **未着手、収録版未定**。原因 (コードから、duration-762 の調べ、未計測): 長さ順以外の並べ替えは `PhysicalFolderSortReload::Immediate` を通る。そのため、UI スレッドで同期に走査と採用をする (`src/app.rs` の `apply_sort_change_reload*`)。これは `docs/ui-responsiveness.md` の規約から外れている。ネットワーク共有や大きなフォルダでは、並べ替えの変更で画面が止まり得る。worker で走査する形 (長さ順と同じ `WorkerScan`) へ寄せれば、§1.838 のゲートにそのまま乗る。詳細は `docs/sort-change-input-hold-838-plan.md` §2.1 (ブランチ range-filter-835)。
+- 状態: **v5.6.0 で直す (利用者決定 2026-11-22「長さの件、v5.6.0 で直すことにしたいと思います。修正お願いします。」)。ブランチ sort-worker-849 で実装済み (77773f47a、設計 r3・実装レビュー r2 とも Sol xhigh ACCEPT、関連テスト 1399 本成功、本体 lib 全件と実機は未確認)。サブ PC の依頼文は `C:\home\mimageviewer-subpc\sort849\brief.md` (未送信)**。設計は `docs/sort-worker-849-plan.md`。あわせて、`.epub` などの名前の実ディレクトリを、名前ではなく走査の結果でフォルダとして分類するようにした (自動更新・本優先の評価・本の構成のメニューの扱いが、普通のフォルダと同じになる。詳細は設計 §8.3)。長さ以外の並べ替えも worker の走査 (`CurrentViewOrderRefresh`) に一本化し、§1.838 のゲートと「並べ替え中…」に乗せる。あわせて、長さ→名前で選択が同じ番号の別の項目へ移る件 (サブ PC 担当の観測、range835 の確認の気-1、v5.4.0 から) も直す。観測 (サブ PC 担当、master 0e1b617b0): `\\tsclient` 越しの 3004 件で「名前↑」へ戻すと約 7 秒止まる (`SLOW FRAME 7048.5ms pre_grid=7043.4ms`)。ほかの 11 か所の UI スレッドでの走査は範囲外 (別項目として報告する)。以下は当初の記録。原因 (コードから、duration-762 の調べ、未計測): 長さ順以外の並べ替えは `PhysicalFolderSortReload::Immediate` を通る。そのため、UI スレッドで同期に走査と採用をする (`src/app.rs` の `apply_sort_change_reload*`)。これは `docs/ui-responsiveness.md` の規約から外れている。ネットワーク共有や大きなフォルダでは、並べ替えの変更で画面が止まり得る。worker で走査する形 (長さ順と同じ `WorkerScan`) へ寄せれば、§1.838 のゲートにそのまま乗る。詳細は `docs/sort-change-input-hold-838-plan.md` §2.1 (ブランチ range-filter-835)。
 
 ### 1.848 タグ・レーティングの一覧の並べ替えでも、待ちの間のキーが前の順で効く — §1.838 の設計レビューから (2026-11-22)
 

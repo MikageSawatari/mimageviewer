@@ -227,7 +227,7 @@ impl App {
                 if self.items_are_reading_history_view {
                     self.enter_reading_history();
                 } else {
-                    self.apply_sort_change_reload_without_ui_io();
+                    self.apply_sort_change_reload();
                 }
             }
         }

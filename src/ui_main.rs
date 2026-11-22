@@ -8802,11 +8802,7 @@ impl App {
     }
 
     fn apply_sort_control_change(&mut self) {
-        if self.settings.sort_order.is_duration() {
-            self.apply_sort_change_reload_without_ui_io();
-        } else {
-            self.apply_sort_change_reload();
-        }
+        self.apply_sort_change_reload();
     }
 
     fn reload_from_sort_control(&mut self, ctx: &egui::Context) {
@@ -8815,7 +8811,7 @@ impl App {
         if self.settings.sort_order.is_duration()
             && self.listing_sort_capabilities().duration_allowed
         {
-            self.apply_sort_change_reload_without_ui_io();
+            self.apply_sort_change_reload();
         } else {
             self.reload_top_level_grid(ctx);
         }

@@ -367,7 +367,7 @@ impl App {
         // 反映する。`apply_sort_change_reload` は現在のビュー種別 (通常フォルダ /
         // サブフォルダ展開 / 検索 / タグ / レーティング) を保ったまま並べ直すので、
         // 検索ビュー等から変換しても現フォルダへ強制復帰しない。閲覧履歴ビューは
-        // `apply_sort_change_reload` が扱わない (合成パスへ load_folder してしまう) ので
+        // `apply_sort_change_reload` が読み直さない合成一覧なので
         // 明示的に開き直す。
         // Collection root は元アーカイブへの明示参照を維持し、生成した ZIP を自動登録しない。
         // Collection 内の実フォルダへ入っている場合は通常フォルダと同じく再読込する。

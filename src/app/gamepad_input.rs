@@ -7600,11 +7600,7 @@ impl App {
             self.settings.sort_order = sort_order;
             self.settings.save();
         }
-        if sort_order.is_duration() {
-            self.apply_sort_change_reload_without_ui_io();
-        } else {
-            self.apply_sort_change_reload();
-        }
+        self.apply_sort_change_reload();
         self.grid_scroll.set_reveal_requested(true);
     }
 

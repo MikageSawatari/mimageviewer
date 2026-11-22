@@ -614,7 +614,7 @@ fn folder_pane_reclick_same_pass_ready_order_refresh_is_replaced() {
     // This is the existing duration-sort refresh used by the toolbar's reload.
     // Its result becomes the arbiter's local folder_pane_open_ready, exactly as
     // B's result does in the contrasting ready-navigation regression below.
-    app.apply_sort_change_reload_without_ui_io();
+    app.apply_sort_change_reload();
     let pending = app.folder_pane_open_pending.as_mut().unwrap();
     assert_eq!(pending.path, a);
     assert!(matches!(
