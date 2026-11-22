@@ -1539,6 +1539,32 @@ impl super::App {
         }
     }
 
+    /// Sort/settings reloads may only scan a physical directory. Enumeration owns
+    /// unfinished containers; accepted document pages keep their fixed page order.
+    /// Derive this from the source owners, never from the backing path's extension
+    /// (a real directory can itself be named `book.epub` or `book.rar`).
+    pub(super) fn current_sort_reload_is_physical_directory(&self) -> bool {
+        self.current_grid_reload_is_physical()
+            && self.zip_enumerate_pending.is_none()
+            && self.pdf_enumerate_pending.is_none()
+            && self.zip_nav.is_none()
+            // A directory scan record proves a directory even if the legacy
+            // book recipe classified its .epub/.pdf spelling as a Document.
+            && !(self.folder_observation.is_none()
+                && matches!(
+                    self.projection_recipe,
+                    super::book_materialization::ProjectionRecipe::Book(
+                        super::book_materialization::BookScope::Document(_)
+                    )
+                ))
+            && !self.items.first().is_some_and(|item| {
+                matches!(item, crate::grid_item::GridItem::PdfPage { .. })
+                    && self.items.iter().all(|item| {
+                        matches!(item, crate::grid_item::GridItem::PdfPage { .. })
+                    })
+            })
+    }
+
     /// 現在の最上位一覧を、その surface が所有する再入場経路で更新する。
     pub(crate) fn reload_top_level_grid(&mut self, ctx: &egui::Context) {
         let surface = self.top_level_grid_view.surface().clone();

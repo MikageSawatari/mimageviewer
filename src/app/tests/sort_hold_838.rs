@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 mod gamepad;
 mod lifecycle;
+mod worker_849;
 
 const DEADLINE: Duration = Duration::from_secs(30);
 
@@ -69,21 +70,20 @@ impl HeldScan {
 }
 
 fn request_sort(app: &mut App, order: SortOrder) -> HeldScan {
-    assert!(order.is_duration());
     app.settings.sort_order = order;
     // This is the public common path called by apply_sort_control_change.
     app.apply_sort_change_reload();
     let pending = app
         .folder_pane_open_pending
         .as_ref()
-        .expect("duration worker scan");
+        .expect("sort worker scan");
     match &pending.purpose {
         FolderOpenScanPurpose::CurrentViewOrderRefresh {
             order: snapshot, ..
         } => {
             assert!(snapshot.matches(&app.settings));
         }
-        _ => panic!("duration sort must use CurrentViewOrderRefresh"),
+        _ => panic!("sort must use CurrentViewOrderRefresh"),
     }
     HeldScan::capture(app)
 }

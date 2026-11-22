@@ -197,8 +197,17 @@ fn sort_hold_838_sort_replacement_keeps_gate_until_latest_adoption() {
 
 #[test]
 fn sort_hold_838_direct_navigation_replacement_inherits_gate() {
+    direct_navigation_replacement(SortOrder::DurationAsc);
+}
+
+#[test]
+fn sort_worker_849_navigation_replaces_non_duration_wait() {
+    direct_navigation_replacement(SortOrder::FileName);
+}
+
+fn direct_navigation_replacement(order: SortOrder) {
     let mut h = Harness::images();
-    let held = request_sort(&mut h.env, SortOrder::DurationAsc);
+    let held = request_sort(&mut h.env, order);
     let sort_blocked = !h.env.grid_item_input_allowed();
     let destination = h.env.tmp.path().join("direct-destination");
     std::fs::create_dir(&destination).unwrap();
@@ -273,9 +282,50 @@ fn sort_hold_838_detached_sort_wait_does_not_block_main_grid() {
 
 #[test]
 fn sort_hold_838_main_sort_wait_does_not_block_independent_context() {
+    main_sort_wait_does_not_block_independent_context(SortOrder::DurationAsc);
+}
+
+#[test]
+fn sort_worker_849_main_wait_leaves_sibling_context_unchanged() {
+    main_sort_wait_does_not_block_independent_context(SortOrder::FileName);
+
+    let mut h = Harness::images();
+    let id = independent_context(&mut h, 184908);
+    let sibling = h
+        .env
+        .with_viewer_context(id, |app| {
+            (
+                app.items.clone(),
+                app.items_generation,
+                app.current_folder.clone(),
+                app.selected,
+                app.grid_scroll.offset(),
+                app.cancel_token.clone(),
+            )
+        })
+        .unwrap();
+    let held = request_sort(&mut h.env, SortOrder::FileName);
+    held.release();
+    h.settle();
+    assert_eq!(h.names(), ["B.png", "C.png", "Z.wav"]);
+    h.env
+        .with_viewer_context(id, |app| {
+            assert_eq!(app.items, sibling.0);
+            assert_eq!(app.items_generation, sibling.1);
+            assert_eq!(app.current_folder, sibling.2);
+            assert_eq!(app.selected, sibling.3);
+            assert_eq!(app.grid_scroll.offset(), sibling.4);
+            assert!(Arc::ptr_eq(&app.cancel_token, &sibling.5));
+            assert!(!sibling.5.load(Ordering::Relaxed));
+            assert!(app.folder_pane_open_pending.is_none());
+        })
+        .unwrap();
+}
+
+fn main_sort_wait_does_not_block_independent_context(order: SortOrder) {
     let mut h = Harness::images();
     let id = independent_context(&mut h, 183808);
-    let held = request_sort(&mut h.env, SortOrder::DurationAsc);
+    let held = request_sort(&mut h.env, order);
     let main_generation = h.env.items_generation;
     let main_selected = h.env.selected;
     h.env
@@ -310,4 +360,28 @@ fn sort_hold_838_main_sort_wait_does_not_block_independent_context() {
     assert_eq!(h.env.selected, main_selected);
     assert!(!held.cancel.load(Ordering::Relaxed));
     assert!(h.env.folder_pane_open_pending.is_some());
+}
+
+#[test]
+fn sort_worker_849_name_date_name_replaces_wait_without_adopting_old_results() {
+    let mut h = Harness::images();
+    let rows = h.env.items.clone();
+    let generation = h.env.items_generation;
+    let name = request_sort(&mut h.env, SortOrder::FileName);
+    assert!(!h.env.grid_item_input_allowed());
+    let date = request_sort(&mut h.env, SortOrder::DateAsc);
+    name.assert_retired();
+    assert!(!h.env.grid_item_input_allowed());
+    let last = request_sort(&mut h.env, SortOrder::FileName);
+    date.assert_retired();
+    assert!(!h.env.grid_item_input_allowed());
+    h.tick(vec![]);
+    assert_eq!(h.env.items, rows);
+    assert_eq!(h.env.items_generation, generation);
+    last.release();
+    h.settle();
+    assert_eq!(h.names(), ["B.png", "C.png", "Z.wav"]);
+    assert_eq!(h.env.selected, Some(1));
+    assert!(h.env.grid_item_input_allowed());
+    assert!(h.env.items_generation > generation);
 }

@@ -1,6 +1,6 @@
 # 長さ以外の並べ替えも worker で走査する (§1.849)
 
-- 状態: 設計 (2026-11-22)。v5.6.0 で直す (利用者決定、統括経由)。
+- 状態: 実装・独立ソースレビュー完了 (2026-11-22)。実行検証は設計担当へ引き継ぎ。v5.6.0 で直す (利用者決定、統括経由)。
 - 利用者の言葉: 「長さの件、v5.6.0 で直すことにしたいと思います。修正お願いします。」
   - その前に、統括が変わる動きを説明している。小さいフォルダでも数フレームは前の並びが残り、そのあいだのキーは止まる。
 - 枝: `sort-worker-849` (master d190b67cc から)。
@@ -98,6 +98,130 @@
 - r2 (c5d719926): REVISE / STRUCTURAL: AGREE。P2: `surface == Folder` だけでは合成の一覧から入った物理の子を外してしまう。P2: `FixedOrder` で一律に何もしないと、タグから入った子フォルダの一括変換後の読み直しも止まる。→ dde3cd92c で反映 (判定の土台を `current_grid_reload_is_physical()` にした)。
 - r3 (dde3cd92c): ACCEPT / STRUCTURAL: AGREE。指摘なし。レビュー担当の言葉: 「既存 worker への統一は構造的修正です。」
 
-### 8.2 実装
+### 8.2 実装 (2026-11-22、sort-worker-849 / 2a38c942f 上の未コミット差分)
 
-(実装・レビューの後に書く)
+#### 変更ファイルと設計の対応
+
+| ファイル | 変更 | 設計 |
+| --- | --- | --- |
+| `src/app.rs` | `PhysicalFolderSortReload` と Immediate を撤去し、`apply_sort_change_reload` へ統一。物理ディレクトリは常に `CurrentViewOrderRefresh`。可視性変更と favorite overlay の旧 API 呼び出しも改名 | §2.1、§2.4、§2.5 |
+| `src/app/top_level_grid_view.rs` | `current_sort_reload_is_physical_directory()` を追加。既存 `current_grid_reload_is_physical()` に列挙待ち・ZIP owner・文書ページの除外を集約 | §2.4 |
+| `src/ui_main.rs` | `apply_sort_control_change` の長さ分岐を撤去。`reload_from_sort_control` の呼び先を改名 (分岐を残す理由は後述) | §2.2 |
+| `src/app/gamepad_input.rs` | `apply_grid_picker_sort_order` の長さ分岐を撤去 | §2.2 |
+| `src/ui_dialogs/epub_batch_convert.rs` | 旧 `without_ui_io` API の呼び出しを統一 API に改名 | §2.1 |
+| `src/ui_dialogs/batch_convert.rs` | 読み直さない合成一覧についての既存コメントを現実装に合わせる。完了処理自体は既存の共通呼び出しを維持 | §2.3、§2.4 |
+| `src/app/tests.rs` | 旧 mode 引数を外し、評価一覧の物理子・リング所有窓の同期完了前提を worker 採用後の検査へ変更 | §3、§7 |
+| `src/app/tests/sort_hold_838.rs` | 既存 `request_sort` helper を全ソートで使える形にし、`worker_849` module を登録 | §7 |
+| `src/app/tests/sort_hold_838/worker_849.rs` | 共通 worker、入力停止、選択、環境設定、変換、合成一覧、物理子の回帰を追加 | §7 |
+| `src/app/tests/sort_hold_838/gamepad.rs` | 実際のパッド dispatch / ピッカーによる長さ以外の並べ替えを追加 | §7 |
+| `src/app/tests/sort_hold_838/lifecycle.rs` | 連続置換・移動置換・兄弟 context の回帰を追加。既存の移動・兄弟入力テストの本体を order 引数付き helper に共用 | §7 |
+| `src/app/folder_pane_reclick_tests.rs` | 旧 API 呼び出しの改名だけ | §2.1 |
+| `src/app/tag_view_open_supersession_tests.rs` | 旧 API 呼び出しの改名だけ | §2.1 |
+| `src/app/tests/search_request.rs` | 旧 API 呼び出しの改名だけ | §2.1 |
+| `src/app/tests/section1795.rs` | 旧 API 呼び出しの改名だけ。既存の worker 完了待ちと assert を維持 | §2.1 |
+| `docs/sort-worker-849-plan.md` | 本記録 | §8 |
+
+- 新しい待機状態・入力ゲート・選択復元処理は追加していない。既存 `preserve_cursor_hint_for_reload()` を採用時に使う。
+- `grid_sort_lock_reason()` は走査判定に使っていない。タグの物理子の FixedOrder は、変換後の内容更新を妨げない。
+- 実ディレクトリの `.epub` / `.pdf` 名を既存の book recipe が Document と分類することがあるため、recipe だけで除外しない。受理済み directory scan の既存 `folder_observation` があれば物理ディレクトリとして扱う。非空の実ページ列は `PdfPage` 行で除外し、空の文書列も既存の Document recipe と scan owner の不在で除外する。述語に拡張子判定・新しい状態・I/O はない。
+- `zip_nav`・検索・タグ・評価・ブックマーク・Smart・サブフォルダ展開の先行分岐、§1.838 の製品ゲート/表示、detached の述語/viewport は変更していない。
+
+#### `reload_from_sort_control` の分岐を残す理由
+
+この関数はソートの選択変更だけでなく、同じ順の再選択や「最新の情報に更新」も扱う。
+長さ順で capabilities が許す場合は、取得済みの長さを使って再ソートする共通 API へ送る。
+それ以外の `reload_top_level_grid(ctx)` は、検索の再検索・履歴やコレクション等の更新を各 owner へ送り、
+物理一覧でも `current_list_refresh_intent()` の RefreshList と既存 staged transition を使う。
+これを `apply_sort_change_reload` の PreservePresentation に置き換えると、合成一覧の更新が無操作になり、
+物理一覧でも一般更新の意図を変えてしまう。今回はこの分岐を残し、旧 API の名前だけを統一した。
+独立レビューもこの判断に同意。
+
+#### ZIP 列挙完了時の設定の確認 (ソースから)
+
+- `poll_zip_enumerate` → `finalize_zip_enumerate` → `prepare_zip_grid_with_nav` は、完了採用時の `self.settings` を参照する。
+- 通常の一覧は `materialize_zip_grid(..., &self.settings.grid_display_order, ...)` へ渡す。
+- 本の指定階層 (`book_nav`) と rating の指定 ZIP 内階層も `materialize_archive_level(..., Some(&self.settings.grid_display_order))` を使う。
+- したがって列挙待ちの間の設定変更は、待ちを置き換えずに完了後の一覧へ反映される。通常 ZIP の実列挙応答を受信境界で保留し、環境設定の適用後に同じ owner で採用する回帰を追加した。実行結果は未取得。
+- 環境設定の表示順/未評価位置変更後と、一括変換の完了後に、同期で新しい一覧ができることを必要とする製品の後続処理は見つからなかった。パッドの reveal は既存の採用時の選択復元で再要求される。
+
+#### 追加テスト (15 件、実行未実施)
+
+以下はそのまま nextest の `test(/名前/)` の filter に使える。
+
+| テスト名 | 検査する内容 |
+| --- | --- |
+| `sort_worker_849_non_duration_wait_blocks_keys_and_clicks` | 名前・日付・サイズで共通 pending ができ、旧 rows へのキー/クリック/Enter を止める |
+| `sort_worker_849_duration_to_name_preserves_selected_name` | 長さ→名前の採用後も名前で同じ項目を選ぶ |
+| `sort_worker_849_name_to_date_preserves_selected_name` | 名前→日付で番号が変わっても同じ項目を選ぶ |
+| `sort_worker_849_preferences_display_order_uses_worker` | 実際の環境設定の適用から待ちを作り、採用後のカテゴリ順と選択を検査 |
+| `sort_worker_849_picker_name_change_uses_same_worker_wait` | 実際のパッド入力による非長さ順ピッカーの変更、待ち、採用後の順と選択 |
+| `sort_worker_849_batch_conversion_adopts_zip_and_removes_same_name_source` | バッチ完了通知から worker を開始し、生成 ZIP の追加と同名の元アーカイブの除外を検査 |
+| `sort_worker_849_zip_enumeration_preferences_leave_owner_and_use_latest_order` | ZIP 列挙待ちで環境設定を変更しても directory scan を始めず、同じ列挙 owner が最新設定で採用する |
+| `sort_worker_849_drive_list_preferences_do_not_scan_or_replace_rows` | ドライブ一覧で設定を変更しても rows/世代/場所を差し替えず、走査しない |
+| `sort_worker_849_collection_physical_source_sorts_and_preserves_selected_name` | Collection PhysicalSource を worker で並べ替え、親 anchor と選択名を維持 |
+| `sort_worker_849_everything_physical_child_sorts_and_preserves_selected_name` | Everything 物理子を worker で並べ替え、検索 position と選択名を維持 |
+| `sort_worker_849_tag_physical_child_conversion_refreshes_despite_fixed_sort` | FixedOrder のタグ物理子でも変換後に ZIP を採用し、同名の元を除外 |
+| `sort_worker_849_container_named_directories_still_scan` | `.zip` / `.rar` / `.epub` / `.pdf` という空の実ディレクトリも worker で走査する |
+| `sort_worker_849_name_date_name_replaces_wait_without_adopting_old_results` | 名前→日付→名前の置換で入力停止を維持し、古い応答を採用しない |
+| `sort_worker_849_navigation_replaces_non_duration_wait` | 非長さ順の待ちを実際の直接移動で置換し、入力ゲートを引き継ぐ |
+| `sort_worker_849_main_wait_leaves_sibling_context_unchanged` | 兄弟の入力を妨げず、main の採用後も兄弟の rows/世代/場所/選択/scroll/cancel token を変えない |
+
+#### 同期完了前提を書き換えた既存テスト
+
+assert は削除・弱体化していない。
+
+| テスト名 | 書き換えと理由 |
+| --- | --- |
+| `mutation_refresh_rating_child_sort_immediate_keeps_parent_and_back_forward` | 共通 helper で worker 完了を待ち、既存の順・親/帰路・履歴・兄弟不変の assert を行う。§3 の「長さ以外も完了まで旧一覧が残る」に対応。名称の immediate は旧経路の回帰名として維持 |
+| `a_ring_sort_order_reloads_the_window_the_ring_was_opened_in` | 所有 context へ要求が配送された後、worker 完了と既存の identity 準備を待ってから、同じ一覧件数・他窓不変の assert を行う。§3 のパッド並べ替えの非同期化に対応 |
+
+`mutation_refresh_rating_child_sort_worker_keeps_parent_and_back_forward` は同じ helper の mode 引数を外しただけで、従来どおり完了後の同じ assert を行う。
+`sort_hold_838_direct_navigation_replacement_inherits_gate` と `sort_hold_838_main_sort_wait_does_not_block_independent_context` は、既存の DurationAsc ケースをそのまま helper へ移し、新規の非長さケースと共用した。
+そのほかの既存テストの変更は、撤去した `apply_sort_change_reload_without_ui_io` の呼び出し名の置換だけである。
+
+設計担当向けの filter (この担当はコマンドを実行していない):
+
+```text
+test(/sort_worker_849/)
+test(/sort_hold_838/)
+test(/duration_762/)
+test(/mutation_refresh_rating_child_sort_immediate_keeps_parent_and_back_forward/)
+test(/mutation_refresh_rating_child_sort_worker_keeps_parent_and_back_forward/)
+test(/mutation_refresh_rating_child_stale_sort_owner_keeps_selection_hint/)
+test(/a_ring_sort_order_reloads_the_window_the_ring_was_opened_in/)
+test(/folder_pane_reclick_same_pass_ready_order_refresh_is_replaced/)
+test(/tag_view_open_supersession_tag_refuses_current_view_order_refresh_and_keeps_new_order/)
+test(/tag_view_open_supersession_sibling_edge_keeps_real_current_view_order_refresh/)
+test(/search_name_snapshot_retires_completed_search_before_prefill_sort_and_enter/)
+test(/section1795_off_refresh_and_sort_preserve_current_position/)
+```
+
+#### 範囲外の `DirectoryScanRoute::UiThread` 棚卸し (読み取りのみ)
+
+行番号は本実装差分のもの。製品から使用される 11 か所に加え、テストからだけ使う wrapper の定義にも literal が 1 個あり、単純な rg は 12 個となる。
+途中でこの 12 個を設計との相違と判断して一時停止したが、caller の監査で製品使用は設計どおり 11 か所と判明し、報告を訂正して再開した。
+また、`UiThread` の指定があっても `pre_scan=Some` やファイル専用の継続なら物理ディレクトリの UI 走査は起きない。
+
+| ファイル:行 | 関数 | どの操作から来るか | UI スレッドで物理走査するか |
+| --- | --- | --- | --- |
+| `src/app.rs:30190` | `poll_open_path_classification` (DirectNavigation 継続) | お気に入り・アドレス・元の場所への移動等のパス分類完了 | しない。directory は分類 worker の `folder_scan` を `pre_scan` に渡す |
+| `src/app.rs:30266` | `poll_open_path_classification` (Direct 継続) | 共通 loader から開く EPUB/変換書庫等のパス分類完了 | しない。directory は同じく worker の走査結果を渡す |
+| `src/app.rs:30512` | `open_direct_navigation_target` | 右クリックの「元の場所へ」の ArchiveContainer 移動 | `pre_scan` があれば回避。EPUB/RAR 等は分類 worker。未走査の通常 directory へ届けば同期走査可能 |
+| `src/app.rs:30853` | `load_folder_or_convert_archive_with_auto_fullscreen_owned_at_stage` | 通常の読み直し、全画面終了後の Direct/CollectionSource、前回一覧の復元、コンテナを開く操作等 | する。`pre_scan=None` の通常 directory は UI で走査。分類対象のパスは先に worker へ |
+| `src/app.rs:30875` | `load_folder_or_convert_archive_with_auto_fullscreen_classified` | 別窓で変換アーカイブを開く操作 | しない。製品 caller は分類済み File。directory は別の FolderCandidate 経路 |
+| `src/app/collection_navigation.rs:4406` | `commit_collection_navigation` | コレクションの archive entry への移動、外側/DFS/全画面の継続 | しない。`Some(File)` 固定の archive 継続 |
+| `src/app/location_jump.rs:71` | `dispatch_address_input` | AddressInput・特殊なお気に入りの場所などの移動 | 検索外 Physical は同期走査候補。検索内は worker、合成一覧は別入口。通常の AddressEnterPhysical は別の Worker 指定 |
+| `src/app/location_jump.rs:106` | `dispatch_location_jump` | メニュー・キー・全画面終了後等の LocationJump | 検索外 Physical は同期走査候補。検索内の物理移動は worker。BooksRoot 等は専用入口 |
+| `src/app/startup_ops.rs:1637` | `apply_startup_open_path_resolve_result` (RAR fallback) | 起動・activation・agent・bookmark の RAR 解決で volume proof がない場合 | しない。File/RAR が条件で、分類 worker へ渡す |
+| `src/app/startup_ops.rs:1805` | `apply_startup_open_path_resolve_result` (通常完了) | 起動・activation・agent・bookmark の解決済み target を開く操作 | する。`pre_scan=None` で resolution が Directory の場合。ファイルは文書/書庫/変換へ分岐 |
+| `src/app/update_phases.rs:1329` | `post_render_main_navigation` | navigation 調停の既定 route。Direct/CollectionSource/一部 Favorite/フォルダを開く操作等 | 未走査 Physical は同期走査候補。folder-pane 完了は `pre_scan` で回避。お気に入り/recent/address-enter 等には Worker 上書きの枝もある |
+
+別記: `src/app.rs:30914` の `load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation` は、定義以外の caller が `src/app/tests.rs:3958` だけの wrapper。製品から使う 11 入口には含めない。
+共通の実同期走査点は `src/app.rs:32307` 付近の `pre_scan=None` → `scan_directory_with_settings`。上記の経路・実装は変更していない。
+
+#### 検証と独立レビュー
+
+- 実施: `cargo fmt` (引数なし、成功)、`git diff --check` (問題なし)、撤去した enum/API 名の `src/` 全体検索 (残存なし)。
+- ビルド・テスト・check は利用者指示により一切実行していない。確認用バイナリも同じ指示により作っていない。共有実行口での自動検証と実機確認は未実施。
+- 独立レビュー: 実装と別 context の `gpt-6.1-sol` / `xhigh`、read-only のソース検査。初回の追加テストにあった非 Copy 値の move を `.clone()` に修正し、main 採用後の兄弟不変検査を追加した最終差分に **ACCEPT / STRUCTURAL: AGREE**。未解決指摘なし。reviewer も cargo/build/test/check を実行していない。
+- git の commit/reset/stash/checkout は実行していない。まれな失敗は従来の worker の通知/終了処理をそのまま使い、回復機構を追加していない。

@@ -3408,7 +3408,7 @@ fn mutation_refresh_resolve_order_scan(app: &mut App, ready: FolderPaneOpenReady
     }
 }
 
-fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) {
+fn mutation_refresh_assert_rating_sort() {
     let mut app = mutation_refresh_rating_sort_fixture();
     let location = app.folder_nav_current_target();
     let chain = app.rating_view_nav_stack.clone();
@@ -3431,24 +3431,19 @@ fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) 
         (id, generation, cancel.unwrap())
     };
     app.settings.sort_order = SortOrder::FileNameDesc;
-    match physical_mode {
-        PhysicalFolderSortReload::Immediate => app.apply_sort_change_reload(),
-        PhysicalFolderSortReload::WorkerScan => {
-            app.apply_sort_change_reload_without_ui_io();
-            let ready = mutation_refresh_wait_for_order_scan(&mut app);
-            let FolderOpenScanPurpose::CurrentViewOrderRefresh {
-                ref reload_owner, ..
-            } = ready.purpose
-            else {
-                panic!("unexpected scan purpose")
-            };
-            assert!(matches!(
-                reload_owner.as_ref(),
-                OpenRequestOwner::RatingPhysical(_)
-            ));
-            mutation_refresh_resolve_order_scan(&mut app, ready);
-        }
-    }
+    app.apply_sort_change_reload();
+    let ready = mutation_refresh_wait_for_order_scan(&mut app);
+    let FolderOpenScanPurpose::CurrentViewOrderRefresh {
+        ref reload_owner, ..
+    } = ready.purpose
+    else {
+        panic!("unexpected scan purpose")
+    };
+    assert!(matches!(
+        reload_owner.as_ref(),
+        OpenRequestOwner::RatingPhysical(_)
+    ));
+    mutation_refresh_resolve_order_scan(&mut app, ready);
     assert_eq!(app.items[0].name(), "b.png", "changed order was adopted");
     assert_eq!(app.items[1].name(), "a.png");
     assert_eq!(app.folder_nav_current_target(), location);
@@ -3506,19 +3501,19 @@ fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) 
 
 #[test]
 fn mutation_refresh_rating_child_sort_immediate_keeps_parent_and_back_forward() {
-    mutation_refresh_assert_rating_sort(PhysicalFolderSortReload::Immediate);
+    mutation_refresh_assert_rating_sort();
 }
 
 #[test]
 fn mutation_refresh_rating_child_sort_worker_keeps_parent_and_back_forward() {
-    mutation_refresh_assert_rating_sort(PhysicalFolderSortReload::WorkerScan);
+    mutation_refresh_assert_rating_sort();
 }
 
 #[test]
 fn mutation_refresh_rating_child_stale_sort_owner_keeps_selection_hint() {
     let mut app = mutation_refresh_rating_sort_fixture();
     app.settings.sort_order = SortOrder::FileNameDesc;
-    app.apply_sort_change_reload_without_ui_io();
+    app.apply_sort_change_reload();
     let ready = mutation_refresh_wait_for_order_scan(&mut app);
     let FolderOpenScanPurpose::CurrentViewOrderRefresh {
         ref order,
@@ -109906,8 +109901,8 @@ mod ring_picker_owner_tests {
 
     /// 一覧側の行も同じ所有者で確定する。並べ替えは**開いた窓の一覧**を組み直す。
     ///
-    /// `apply_sort_change_reload` は最後に `load_folder` へ落ちる。所有 context を mount した
-    /// まま `load_folder` を通しても、その context の一覧が組み上がって戻ることを固定する
+    /// `apply_sort_change_reload` の worker を所有 context で採用する。要求と完了の
+    /// 間に mount を跨いでも、その context の一覧が組み上がることを固定する
     /// (`with_viewer_context` を跨いだ再読込は 2026-09-03 に一度取りこぼした経緯がある)。
     #[test]
     #[cfg(windows)]
@@ -109945,6 +109940,9 @@ mod ring_picker_owner_tests {
             crate::settings::SortOrder::DateDesc,
             "並べ替えの設定自体は App 共通"
         );
+        let ready = mutation_refresh_wait_for_order_scan(&mut app);
+        mutation_refresh_resolve_order_scan(&mut app, ready);
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(
             app.items.len(),
             2,

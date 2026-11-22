@@ -6729,12 +6729,6 @@ impl FolderOpenScanPurpose {
     }
 }
 
-#[derive(Clone, Copy)]
-enum PhysicalFolderSortReload {
-    Immediate,
-    WorkerScan,
-}
-
 /// folder open scan の完了候補。`purpose` に応じて main nav の優先順位で裁定するか、
 /// mounted detached bundle 内で対象画像を開く。
 pub(crate) struct FolderPaneOpenReady {
@@ -29065,29 +29059,13 @@ impl App {
         ) && self.zip_nav.is_none()
             && !self.grid_is_pdf_pages()
         {
-            self.apply_sort_change_reload_without_ui_io();
+            self.apply_sort_change_reload();
         } else {
             self.reload_top_level_grid(ctx);
         }
     }
 
     pub(crate) fn apply_sort_change_reload(&mut self) {
-        let mode = if self.settings.sort_order.is_duration() {
-            PhysicalFolderSortReload::WorkerScan
-        } else {
-            PhysicalFolderSortReload::Immediate
-        };
-        self.apply_sort_change_reload_with_physical_mode(mode);
-    }
-
-    pub(crate) fn apply_sort_change_reload_without_ui_io(&mut self) {
-        self.apply_sort_change_reload_with_physical_mode(PhysicalFolderSortReload::WorkerScan);
-    }
-
-    fn apply_sort_change_reload_with_physical_mode(
-        &mut self,
-        physical_mode: PhysicalFolderSortReload,
-    ) {
         if self.collection_grid_root_order().is_some() {
             return;
         }
@@ -29154,46 +29132,20 @@ impl App {
             }
             return;
         }
+        if !self.current_sort_reload_is_physical_directory() {
+            return;
+        }
         if let Some(path) = self.current_folder.clone() {
-            let previous_history = self.folder_history.remove(&path);
-            match physical_mode {
-                PhysicalFolderSortReload::Immediate => {
-                    let owner = self.current_folder_reload_owner(&path);
-                    let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
-                        path.clone(),
-                        false,
-                        owner,
-                        crate::app::StartupListIntent::PreservePresentation,
-                    );
-                    if !matches!(outcome, FolderOpenOutcome::Loaded)
-                        && let Some(history) = previous_history
-                    {
-                        self.folder_history.insert(path, history);
-                    }
-                }
-                PhysicalFolderSortReload::WorkerScan => {
-                    // PDF は enumerate 順固定で全項目が同じ Image カテゴリなので、
-                    // sort / category order のどちらも materialize 結果を変えない。
-                    // ファイル path を directory scan worker へ渡してエラーにしない。
-                    if crate::folder_tree::is_paged_document_path(&path)
-                        && self
-                            .items
-                            .iter()
-                            .all(|item| matches!(item, GridItem::PdfPage { .. }))
-                    {
-                        return;
-                    }
-                    let order = CurrentViewOrderSnapshot::from_settings(&self.settings);
-                    let reload_owner = Box::new(self.current_folder_reload_owner(&path));
-                    self.start_folder_open_scan(
-                        path,
-                        FolderOpenScanPurpose::CurrentViewOrderRefresh {
-                            order,
-                            reload_owner,
-                        },
-                    );
-                }
-            }
+            self.folder_history.remove(&path);
+            let order = CurrentViewOrderSnapshot::from_settings(&self.settings);
+            let reload_owner = Box::new(self.current_folder_reload_owner(&path));
+            self.start_folder_open_scan(
+                path,
+                FolderOpenScanPurpose::CurrentViewOrderRefresh {
+                    order,
+                    reload_owner,
+                },
+            );
         }
     }
 
@@ -95931,7 +95883,7 @@ impl App {
         if previous.sort_order != current.sort_order
             || previous.grid_display_order != current.grid_display_order
         {
-            self.apply_sort_change_reload_without_ui_io();
+            self.apply_sort_change_reload();
         }
     }
 

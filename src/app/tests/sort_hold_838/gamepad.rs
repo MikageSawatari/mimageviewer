@@ -145,6 +145,29 @@ fn sort_hold_838_picker_can_open_during_sort_wait() {
 }
 
 #[test]
+fn sort_worker_849_picker_name_change_uses_same_worker_wait() {
+    let mut h = Harness::images();
+    h.open_picker();
+    h.picker_row(1);
+    // FileNameDesc -> Numeric is a real non-duration picker edit.
+    let rows = h.env.items.clone();
+    let generation = h.env.items_generation;
+    h.pad(&[PadEvent::ButtonPressed(PadButton::DPadRight)]);
+    assert_eq!(h.env.settings.sort_order, SortOrder::Numeric);
+    let held = HeldScan::capture(&mut h.env);
+    assert!(h.env.view_order_refresh_scan_pending());
+    assert!(!h.env.grid_item_input_allowed());
+    h.pad(&[PadEvent::ButtonReleased(PadButton::DPadRight)]);
+    assert_eq!(h.env.items, rows);
+    assert_eq!(h.env.items_generation, generation);
+    held.release();
+    h.settle();
+    assert_eq!(h.names(), ["B.png", "C.png", "Z.wav"]);
+    assert_eq!(h.env.selected, Some(1));
+    assert!(h.env.grid_item_input_allowed());
+}
+
+#[test]
 fn sort_hold_838_left_stick_still_moves_folder_tree_during_sort_wait() {
     let mut h = Harness::images();
     let folder = h.env.current_folder.clone().unwrap();
