@@ -2821,12 +2821,17 @@ root の既存 process-global poll 区間で完了を回収するので、環境
 まれな失敗はログと通知で割り切る。保存失敗でも登録を巻き戻さず、通常の設定・画像・使用中の世代を破棄しない。
 
 通常のプロセス終了は root lifecycle の他の owner と同じ継続へ接続する。登録 owner が
-消費した `RootCloseIntent` を一つ保持し、準備・登録・解除・保存先操作・部分保存の終端まで
+消費した `RootCloseIntent` を一つ保持し、登録を更新し得る準備・登録・解除・保存先操作・部分保存の終端まで
 CancelClose して、live Settings の採用と保存後に共通の root 終了へ一度だけ戻す。
 worker 完了済みでも root 未回収なら待機対象で、Quit を後の普通の Close で格下げしない。
 トレイ退避は登録を待たず従来どおり行う。描画しない LogicOnly も同じ receipt poll を行う。
 最終 `on_exit_inner` は迂回経路への fence として既発行 worker の結果を回収し、live へ採用してから
 従来の全体保存へ進む。ここでは新しい登録・部分保存・再試行は始めない。
+準備の `PreparationEffect::ReadOnly` / `MayUpdateRegistration` は worker 発行時の設定から確定する。
+OFF の読み取り準備は終了継続を保持せず、最終 fence でも receiver を捨てて待たない。
+復元モーダルが拒否した普通の Close は root の境界で継続を渡さず、後で再発行しない。
+最終 fence は ChooseFolder の picker も受け取り得る。受付迂回と picker の組み合わせは
+まれな終了の割り切り対象とし、新たな取消・回復の仕組みは追加しない。
 
 ## ブラウザ表示 pipe と一回の中継処理（§1.818 段階5〜6）
 

@@ -704,6 +704,14 @@ portable・明示 `--data-dir`・launcher 不明の起動は、既存登録も�
 - GPU group の新しい handler-level 回帰で、worker 完了・root 未回収と worker 未完了の各状態から、実際の root Close／Quit、採用、部分保存、再開された Close、終了保存まで通す。登録・解除・保存先更新・picker を注入し、終了後の実DBと注入した登録結果の一致を検査する。保存中の追加 Close、トレイ退避、受付を迂回した on_exit、準備中／error／channel切断も検査する。実レジストリ・desktop は触れない。
 - P2 のUI注意を「★固定中は、ブラウザ閲覧の保存先が固定の範囲の外にあると、ブラウザからの画像を開けません。」へ修正。段階9のマニュアルは既に範囲外の条件を明記しているため変更しない。UI文言の glyph 検査と4件のsnapshot再生成・目視は設計担当へ引き渡す。cargo は最後の fmt のみ、今回のビルド・テストは未実行。
 
+**段階7・9の独立レビュー2回目の修正（2026-11-22、検証・再レビュー待ち）**
+
+- 起動時準備の影響を `PreparationEffect::{ReadOnly, MayUpdateRegistration}` で区別し、Running は worker 発行時の設定から確定した影響と receiver を一緒に持つ。OFF の準備は root の終了継続を持たず、最終 fence でも受信せず破棄する。未発行時は受付時の設定で判定し、ON の起動時更新は従来どおり待つ。後で live の設定が変わっても実行中 worker の分類は変えない。
+- `root_lifecycle` の `sidecar_rejected` 判定を登録 owner へ継続を渡す前に適用する。根拠は `sidecar_restore` の「通常 Close は復元中の入力として拒否し、後で再生しない／明示 Quit は終了経路」の区別。settings-family も終了の適格性と処理中 phase を確認してから継続を保持する（`settings_family_deferred_root_close`・`SettingsFamilyOperationState::defer_root_close`）。登録側も不適格な要求を保持しない。他の参加者の動作は変更しない。
+- 保留した準備 worker の OFF / ON から実際の Close を入れる回帰と、OFF の最終 fence が応答なしで戻る回帰を追加。復元が先に終わり登録が後に完了する場面では、拒否された Close は再発行されず、明示 Quit は待って再開することを別々の回帰で検査する。GPU を使う回帰は既存 `gpu_tests` 内。睡眠・時間窓・再試行は追加しない。
+- 最終 fence は ChooseFolder の同期 picker も受け取る。受付を迂回した終了と picker の組み合わせは、まれな終了の割り切りとして扱い、追加の取消や回復の仕組みは設けない。worker が短い registry／FS 操作だけという前提にはしない。
+- 段階9の範囲と公開チェックは、日本語マニュアル、および privacy.html の日本語・英語の両方の節へ統一。英語マニュアルの新設・存在は要求しない。ビルド・Rustテストは設計担当へ引き継ぎ、cargo は最後の fmt のみ実行する。
+
 ### 段階8：製品の拡張とストア別 ZIP
 
 **範囲**
@@ -781,17 +789,17 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
 - `docs/detached-rework-plan.md` §11
 - 開発ビルド・テスト文書、`CLAUDE.md` の同梱本数・ビルド順
 - `docs/release-checklist.md`
-- 日本語・英語マニュアルの新規ブラウザ連携ページ、目次・設定案内
-  - ページは `htdocs/mimageviewer/manual/browser-integration.html` (英語版も同じ名前)、拡張の入れ方の節の id は `install-extension`。環境設定の「拡張の入れ方 (マニュアル)」のリンクがこの 2 つを指す (`src/ui_dialogs/preferences/browser_integration.rs` の定数、2026-11-22 統括の決定)。ストアの URL は本体に書かず、この節だけに書く。ストアでの公開前は、この節に「公開準備中」と書く (本体の画面には書かない。公開後に古い文言が残るため)
-- `htdocs/mimageviewer/privacy.html`
-- 製品ページ日本語・英語
+- 日本語マニュアルの新規ブラウザ連携ページ、目次・設定案内（英語マニュアルは作らない）
+  - ページは `htdocs/mimageviewer/manual/browser-integration.html`、拡張の入れ方の節の id は `install-extension`。環境設定の「拡張の入れ方 (マニュアル)」のリンクがこのページの節を指す (`src/ui_dialogs/preferences/browser_integration.rs` の定数、2026-11-22 統括の決定)。ストアの URL は本体に書かず、この節だけに書く。ストアでの公開前は、この節に「公開準備中」と書く (本体の画面には書かない。公開後に古い文言が残るため)
+- `htdocs/mimageviewer/privacy.html` の日本語・英語の両方の節
+- 既存の製品ページ（日本語。紹介カードは拡張公開時まで追加しない）
 - 配布 readme
 
 **記載内容**
 
 **公開の順序（2026-11-22 統括・利用者の決定）**：本体を先に公開し、拡張のストア公開は後にする。本体公開時のマニュアルは「公開準備中」としてストア URL を載せず、privacy は本体が作る登録・中継ファイル・画像と削除範囲を先に説明する。以下の拡張の通信の開示は、拡張の公開前に満たす最終要件として保持する。製品ページの新しい紹介カードは拡張公開時まで追加しない。
 
-設計書 §11 に従い、一回の画像取得、Cookie、常に送るページ origin、redirect、座標記録、PC 内への受け渡し、MOTW、保存後失敗時の残存、登録・解除を両言語で説明します。
+設計書 §11 に従い、一回の画像取得、Cookie、常に送るページ origin、redirect、座標記録、PC 内への受け渡し、MOTW、保存後失敗時の残存、登録・解除を privacy の日本語・英語の両方の節で説明します。マニュアルは日本語だけを対象とします。
 
 窓のモード差、メイン一覧の移動、F12 制限、F11、位置の限界、★固定、ページ個別補正と U の書込先の違いも記載します。閉じた後のブラウザへの復帰は保証しません。
 
@@ -811,7 +819,7 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
 
 | 検証の種類 | 今回の状態と引き渡し |
 |---|---|
-| 文書の自動・静的確認 | 変更／新規HTML 5件の要素対応、ID重複、相対リンク・アンカー・CSS、日英の公開待ちと未公開ストアURL不在を確認。`git diff --check` 成功。サイトマップを既存generatorで再生成し `--check` 成功（新規2URL）。製品ページは HEAD と差分なし、変更ファイルは文書のみ |
+| 文書の自動・静的確認 | 初回編集時にHTML 5件・新規2URLを確認した記録は英語ページ除外前のもの。現在の公開確認は日本語マニュアルと privacy の日本語・英語の両方の節が対象で、英語マニュアルの存在は要求しない。英語ページ除外後のサイトマップは `--check` 成功（219URL）。今回の修正で公開HTML・製品ページは変更しない |
 | 既存privacyの自動検査 | `python scripts/test_public_privacy_scope.py` は9件中7件成功・2件失敗。`test_all_pages_scope_assurances_including_metadata` の privacy の既存「確認では」と、`test_sfz_storage_and_learning_match_hardware_facts` の既存SFZパスの件数不一致。HEAD の privacy をメモリ内で同じ無変更のsuiteへ渡して同じ2失敗となることを確認。今回の変更による新規失敗ではなく、範囲外としてテスト・既存SFZの説明は変更しない |
 | 製品コードの自動検証 | cargo・Rustテスト・スナップショット・検証バイナリ作成は今回実行しない。段階1〜6の受け入れや段階8のNode/ZIP検査は、それぞれのソースと担当の記録を再利用し、この文書変更の新規成功として数えない |
 | 独立レビュー | 段階7はレビュー中、段階9の文書は未レビュー。今回の実装担当のコード照合は独立レビューの代用ではない |

@@ -71,9 +71,26 @@ pub(crate) trait Backend: Send + Sync {
     fn perform(&self, prepared: Prepared, action: Action) -> Result<Completion, String>;
     fn persist(&self, selection: &Selection) -> Result<(), String>;
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreparationEffect {
+    ReadOnly,
+    MayUpdateRegistration,
+}
+impl PreparationEffect {
+    fn from_selection(selection: &Selection) -> Self {
+        if selection.enabled {
+            Self::MayUpdateRegistration
+        } else {
+            Self::ReadOnly
+        }
+    }
+}
 pub(crate) enum PreparationTask {
     NotStarted,
-    Running(mpsc::Receiver<Preparation>),
+    Running {
+        effect: PreparationEffect,
+        rx: mpsc::Receiver<Preparation>,
+    },
 }
 pub(crate) enum BrowserIntegrationState {
     Unavailable {
@@ -138,15 +155,25 @@ impl Default for BrowserIntegration {
     }
 }
 impl BrowserIntegration {
-    fn has_pending_work(&self) -> bool {
-        matches!(
-            self.state,
-            BrowserIntegrationState::Preparing(_) | BrowserIntegrationState::Processing { .. }
-        )
+    fn has_pending_work(&self, unstarted_effect: PreparationEffect) -> bool {
+        match &self.state {
+            BrowserIntegrationState::Preparing(PreparationTask::NotStarted) => {
+                unstarted_effect == PreparationEffect::MayUpdateRegistration
+            }
+            BrowserIntegrationState::Preparing(PreparationTask::Running { effect, .. }) => {
+                *effect == PreparationEffect::MayUpdateRegistration
+            }
+            BrowserIntegrationState::Processing { .. } => true,
+            _ => false,
+        }
     }
 
-    fn defer_root_close(&mut self, intent: RootCloseIntent) -> bool {
-        if !self.has_pending_work() {
+    fn defer_root_close(
+        &mut self,
+        intent: RootCloseIntent,
+        unstarted_effect: PreparationEffect,
+    ) -> bool {
+        if !self.has_pending_work(unstarted_effect) {
             return false;
         }
         if self.close != Some(RootCloseIntent::ApplicationQuit) {
@@ -156,16 +183,21 @@ impl BrowserIntegration {
     }
 
     fn take_ready_close(&mut self) -> Option<RootCloseIntent> {
-        if self.has_pending_work() {
+        // A close retained before preparation starts was admitted only for an
+        // enabled startup. Once started, the captured effect is authoritative.
+        if self.has_pending_work(PreparationEffect::MayUpdateRegistration) {
             return None;
         }
         self.close.take()
     }
 
-    /// Last process-exit fence, before any final Settings save. Normal Close
-    /// remains asynchronous; only an exit which bypassed its admission reaches
-    /// this with a live worker. Receive its result, never redo its filesystem or
-    /// registry work on the UI thread. This mirrors the settings-family fence.
+    /// Last process-exit fence, before any final Settings save. Read-only
+    /// preparation is discarded. A registration-changing worker reaches this
+    /// only if exit bypassed normal asynchronous admission. Receive its result;
+    /// never redo its filesystem or registry work on the UI thread. ChooseFolder
+    /// is also received here, so a
+    /// bypassed admission can wait for its picker; that rare exit is deliberately
+    /// left to the coarse failure policy, without another cancellation protocol.
     pub(crate) fn finish_for_exit(&mut self, settings: &mut crate::settings::Settings) {
         self.close = None;
         let state = std::mem::replace(
@@ -175,7 +207,10 @@ impl BrowserIntegration {
             },
         );
         match state {
-            BrowserIntegrationState::Preparing(PreparationTask::Running(rx)) => match rx.recv() {
+            BrowserIntegrationState::Preparing(PreparationTask::Running {
+                effect: PreparationEffect::MayUpdateRegistration,
+                rx,
+            }) => match rx.recv() {
                 Ok(preparation) => match preparation.ready {
                     Ok(prepared) => {
                         if let Some(message) = prepared.message {
@@ -186,6 +221,10 @@ impl BrowserIntegration {
                 },
                 Err(error) => crate::logger::log(format!("browser_registration: {error}")),
             },
+            BrowserIntegrationState::Preparing(PreparationTask::Running {
+                effect: PreparationEffect::ReadOnly,
+                ..
+            }) => {} // No registration effect to fence; drop the receiver without waiting.
             BrowserIntegrationState::Processing { rx, .. } => match rx.recv() {
                 Ok(Ok(completion)) => {
                     if let Some(selection) = completion.selection {
@@ -253,6 +292,7 @@ impl BrowserIntegration {
             BrowserIntegrationState::Preparing(PreparationTask::NotStarted)
         ) {
             let selection = Selection::from_settings(settings);
+            let effect = PreparationEffect::from_selection(&selection);
             let backend = self.backend.clone();
             let repaint = ctx.clone();
             let (tx, rx) = mpsc::channel();
@@ -264,7 +304,8 @@ impl BrowserIntegration {
                     repaint.request_repaint_of(egui::ViewportId::ROOT);
                 }) {
                 Ok(_) => {
-                    self.state = BrowserIntegrationState::Preparing(PreparationTask::Running(rx))
+                    self.state =
+                        BrowserIntegrationState::Preparing(PreparationTask::Running { effect, rx })
                 }
                 Err(error) => {
                     let reason = format!("連携の準備を開始できませんでした: {error}");
@@ -276,7 +317,8 @@ impl BrowserIntegration {
                 }
             }
         }
-        if let BrowserIntegrationState::Preparing(PreparationTask::Running(rx)) = &self.state {
+        if let BrowserIntegrationState::Preparing(PreparationTask::Running { rx, .. }) = &self.state
+        {
             let result = match rx.try_recv() {
                 Ok(result) => Some(result),
                 Err(mpsc::TryRecvError::Disconnected) => Some(Preparation {
@@ -450,7 +492,8 @@ impl crate::app::App {
         {
             return false;
         }
-        let deferred = self.browser_integration.defer_root_close(intent);
+        let effect = PreparationEffect::from_selection(&Selection::from_settings(&self.settings));
+        let deferred = self.browser_integration.defer_root_close(intent, effect);
         if deferred {
             ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::CancelClose);
             // The receipt may already be queued and its worker's repaint may

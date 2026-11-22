@@ -128,10 +128,13 @@ UI の待機・busy loop・常時 repaint は追加しない。登録結果を l
 worker の2キー transaction で保存し、UI から同期の全体設定保存を新たに呼ばない。
 
 通常の終了は root の既存継続で非同期に待ち、結果を採用・保存してから再開する。
+OFF の読み取り準備は通常終了・最終 fence の待機対象にせず、ON の起動時更新だけを待つ。
 フォルダ picker も同じ worker が持つため、終了受付で一律に同期受信する方式は採らない。
 通常の受付を迂回した最終 on_exit だけは、既発行 worker の receiver を回収して live Settings を
 確定する。既存の終了保存より前の所有境界の fence であり、描画中に registry／FS の同期作業を
 移す例外ではない。通常のポーリングや描画に待機・時間窓・再試行は追加しない。
+この最終 fence は ChooseFolder の picker も同期受信し得る。受付迂回との組み合わせは
+まれな終了の割り切りとして扱い、追加の仕組みは設けない。
 
 native messaging の受信・画像保存・MOTW・launcher の終了待ちは別プロセスの中継 exe、
 専用 pipe の接続・通信は listener / peer worker が担う。App は保存済みファイルを既存の

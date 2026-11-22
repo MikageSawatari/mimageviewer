@@ -592,7 +592,10 @@ fn browser818_registration_preparing_and_unavailable_never_admit_or_retry_operat
     let mut settings = crate::settings::Settings::default();
     assert!(!owner.submit(Action::Remove, &ctx));
     let (tx, rx) = mpsc::channel();
-    owner.state = BrowserIntegrationState::Preparing(PreparationTask::Running(rx));
+    owner.state = BrowserIntegrationState::Preparing(PreparationTask::Running {
+        effect: PreparationEffect::ReadOnly,
+        rx,
+    });
     assert!(owner.poll(&mut settings, &ctx).is_none());
     tx.send(Preparation {
         default_output: Some(ready.env.default_output.clone()),
@@ -626,9 +629,18 @@ fn browser818_registration_close_continuation_spans_action_and_persistence() {
     };
     let mut settings = crate::settings::Settings::default();
     assert!(owner.submit(Action::Apply(selection.clone()), &ctx));
-    assert!(owner.defer_root_close(RootCloseIntent::WindowClose));
-    assert!(owner.defer_root_close(RootCloseIntent::ApplicationQuit));
-    assert!(owner.defer_root_close(RootCloseIntent::WindowClose));
+    assert!(owner.defer_root_close(
+        RootCloseIntent::WindowClose,
+        PreparationEffect::MayUpdateRegistration
+    ));
+    assert!(owner.defer_root_close(
+        RootCloseIntent::ApplicationQuit,
+        PreparationEffect::MayUpdateRegistration
+    ));
+    assert!(owner.defer_root_close(
+        RootCloseIntent::WindowClose,
+        PreparationEffect::MayUpdateRegistration
+    ));
     assert_eq!(owner.take_ready_close(), None);
     await_worker(&mut owner);
     assert!(matches!(
@@ -650,18 +662,29 @@ fn browser818_registration_close_continuation_spans_action_and_persistence() {
 #[test]
 fn browser818_registration_close_continuation_covers_startup_preparation() {
     let root = tempfile::tempdir().unwrap();
-    let ready = prepared(environment(root.path()));
+    let mut ready = prepared(environment(root.path()));
+    ready.selection.enabled = true;
     let mut owner = service(ready, Arc::new(FakeBackend::default()));
     owner.state = BrowserIntegrationState::Preparing(PreparationTask::NotStarted);
-    assert!(owner.defer_root_close(RootCloseIntent::ApplicationQuit));
+    assert!(owner.defer_root_close(
+        RootCloseIntent::ApplicationQuit,
+        PreparationEffect::MayUpdateRegistration
+    ));
     assert_eq!(owner.take_ready_close(), None);
     let ctx = egui::Context::default();
     let mut settings = crate::settings::Settings::default();
+    settings.browser_integration_enabled = true;
     // Inject the startup worker's channel at the next phase boundary. A rejected
     // Close must not permanently disable an otherwise available integration.
     let (tx, rx) = mpsc::channel();
-    owner.state = BrowserIntegrationState::Preparing(PreparationTask::Running(rx));
-    assert!(owner.defer_root_close(RootCloseIntent::ApplicationQuit));
+    owner.state = BrowserIntegrationState::Preparing(PreparationTask::Running {
+        effect: PreparationEffect::MayUpdateRegistration,
+        rx,
+    });
+    assert!(owner.defer_root_close(
+        RootCloseIntent::ApplicationQuit,
+        PreparationEffect::MayUpdateRegistration
+    ));
     assert!(owner.poll(&mut settings, &ctx).is_none());
     tx.send(Preparation {
         default_output: None,
@@ -675,6 +698,41 @@ fn browser818_registration_close_continuation_covers_startup_preparation() {
         Some(RootCloseIntent::ApplicationQuit)
     );
     assert_eq!(owner.take_ready_close(), None);
+}
+
+#[test]
+fn browser818_registration_readonly_preparation_does_not_wait_at_exit() {
+    let root = tempfile::tempdir().unwrap();
+    let ready = prepared(environment(root.path()));
+    let mut owner = service(ready, Arc::new(FakeBackend::default()));
+    owner.state = BrowserIntegrationState::Preparing(PreparationTask::NotStarted);
+    assert!(!owner.defer_root_close(RootCloseIntent::WindowClose, PreparationEffect::ReadOnly));
+    assert!(!owner.defer_root_close(
+        RootCloseIntent::ApplicationQuit,
+        PreparationEffect::ReadOnly
+    ));
+    let (preparation_tx, preparation_rx) = mpsc::channel();
+    owner.state = BrowserIntegrationState::Preparing(PreparationTask::Running {
+        effect: PreparationEffect::ReadOnly,
+        rx: preparation_rx,
+    });
+    // The live setting cannot reclassify a worker that captured OFF at submission.
+    assert!(!owner.defer_root_close(
+        RootCloseIntent::ApplicationQuit,
+        PreparationEffect::MayUpdateRegistration
+    ));
+    assert_eq!(owner.close, None);
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let exit = std::thread::spawn(move || {
+        owner.finish_for_exit(&mut crate::settings::Settings::default());
+        finished_tx.send(()).unwrap();
+    });
+    // Keep the preparation's sender alive and send no result. Only dropping its
+    // receiver can finish; the timeout is a failure watchdog, not ordering sleep.
+    let finished = finished_rx.recv_timeout(std::time::Duration::from_secs(10));
+    drop(preparation_tx);
+    exit.join().unwrap();
+    finished.unwrap();
 }
 
 #[test]
@@ -696,7 +754,10 @@ fn browser818_registration_error_or_disconnect_retires_only_its_close_continuati
         };
         let mut settings = crate::settings::Settings::default();
         settings.browser_integration_enabled = true;
-        assert!(owner.defer_root_close(RootCloseIntent::ApplicationQuit));
+        assert!(owner.defer_root_close(
+            RootCloseIntent::ApplicationQuit,
+            PreparationEffect::MayUpdateRegistration
+        ));
         assert!(matches!(
             owner.poll(&mut settings, &egui::Context::default()),
             Some(Event::Failed(_))
@@ -733,6 +794,199 @@ fn browser818_registration_uninstaller_owns_only_matching_manifest_and_does_not_
 
 mod gpu_tests {
     use super::*;
+
+    struct StartupBackend {
+        ready: Prepared,
+        entered: mpsc::Sender<()>,
+        proceed: Mutex<mpsc::Receiver<()>>,
+        completed: mpsc::Sender<()>,
+    }
+    impl Backend for StartupBackend {
+        fn prepare(&self, selection: Selection) -> Preparation {
+            self.entered.send(()).unwrap();
+            // Failure watchdog only: normal ordering is the explicit permit,
+            // including its being withheld through OFF's final exit callback.
+            self.proceed
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let mut ready = self.ready.clone();
+            ready.registered = selection.enabled;
+            ready.selection = selection;
+            self.completed.send(()).unwrap();
+            Preparation {
+                default_output: Some(ready.env.default_output.clone()),
+                ready: Ok(ready),
+            }
+        }
+        fn perform(&self, _: Prepared, _: Action) -> Result<Completion, String> {
+            panic!("only startup preparation is used")
+        }
+        fn persist(&self, _: &Selection) -> Result<(), String> {
+            panic!("startup preparation does not change the saved selection")
+        }
+    }
+
+    fn await_preparation(owner: &mut BrowserIntegration) {
+        let previous = std::mem::replace(
+            &mut owner.state,
+            BrowserIntegrationState::Unavailable {
+                reason: "test observation".into(),
+            },
+        );
+        let BrowserIntegrationState::Preparing(PreparationTask::Running { effect, rx }) = previous
+        else {
+            panic!("expected a startup worker")
+        };
+        let result = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        tx.send(result).ok().unwrap();
+        owner.state = BrowserIntegrationState::Preparing(PreparationTask::Running { effect, rx });
+    }
+
+    #[test]
+    fn browser818_registration_startup_close_waits_only_for_enabled_update() {
+        for enabled in [false, true] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            app.settings.minimize_to_tray_on_close = false;
+            app.settings.browser_integration_enabled = enabled;
+            let ready = prepared(environment(app.tmp.path()));
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (proceed_tx, proceed_rx) = mpsc::channel();
+            let (completed_tx, completed_rx) = mpsc::channel();
+            app.browser_integration = BrowserIntegration {
+                state: BrowserIntegrationState::Preparing(PreparationTask::NotStarted),
+                default_output: None,
+                backend: Arc::new(StartupBackend {
+                    ready,
+                    entered: entered_tx,
+                    proceed: Mutex::new(proceed_rx),
+                    completed: completed_tx,
+                }),
+                close: None,
+            };
+            let ctx = egui::Context::default();
+            app.poll_browser_integration(&ctx);
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let expected_effect = if enabled {
+                PreparationEffect::MayUpdateRegistration
+            } else {
+                PreparationEffect::ReadOnly
+            };
+            assert!(matches!(&app.browser_integration.state,
+                BrowserIntegrationState::Preparing(PreparationTask::Running { effect, .. })
+                if *effect == expected_effect));
+            let mut backend = eframe::HeadlessEpiIntegration::new(ctx);
+            let (output, _) = backend.update_logic_only(&mut app.app, close_input());
+            assert_eq!(backend.should_close(), !enabled);
+            assert_eq!(
+                output
+                    .viewport_commands
+                    .get(&egui::ViewportId::ROOT)
+                    .is_some_and(|commands| commands.contains(&egui::ViewportCommand::CancelClose)),
+                enabled
+            );
+            if enabled {
+                assert_eq!(
+                    app.browser_integration.close,
+                    Some(RootCloseIntent::WindowClose)
+                );
+                proceed_tx.send(()).unwrap();
+                await_preparation(&mut app.browser_integration);
+                let (output, _) = backend.update_logic_only(&mut app.app, Default::default());
+                assert!(
+                    output.viewport_commands[&egui::ViewportId::ROOT]
+                        .contains(&egui::ViewportCommand::Close)
+                );
+                backend.update_logic_only(&mut app.app, close_input());
+                assert!(backend.should_close());
+                eframe::App::on_exit(&mut app.app, None);
+            } else {
+                assert_eq!(app.browser_integration.close, None);
+                // Final exit must return while the read-only worker is held.
+                eframe::App::on_exit(&mut app.app, None);
+                proceed_tx.send(()).unwrap();
+            }
+            completed_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+    }
+
+    fn registration_completion_after_restore(explicit_quit: bool) {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.settings.minimize_to_tray_on_close = false;
+        let ready = prepared(environment(app.tmp.path()));
+        let mut completed = ready.clone();
+        completed.selection.enabled = true;
+        completed.registered = true;
+        let target = completed.selection.clone();
+        app.browser_integration = service(ready.clone(), Arc::new(FakeBackend::default()));
+        let (tx, rx) = mpsc::channel();
+        app.browser_integration.state = BrowserIntegrationState::Processing {
+            prepared: ready,
+            kind: JobKind::Action(Action::Apply(target.clone())),
+            rx,
+        };
+        let folder = app.tmp.path().join("restore");
+        app.activate_sidecar_restore_modal_for_test(folder);
+        app.shutdown_requested
+            .store(explicit_quit, std::sync::atomic::Ordering::SeqCst);
+        let mut backend = eframe::HeadlessEpiIntegration::new(egui::Context::default());
+        let (output, _) = backend.update_logic_only(&mut app.app, close_input());
+        assert!(!backend.should_close());
+        assert!(
+            output.viewport_commands[&egui::ViewportId::ROOT]
+                .contains(&egui::ViewportCommand::CancelClose)
+        );
+        assert_eq!(
+            app.browser_integration.close,
+            explicit_quit.then_some(RootCloseIntent::ApplicationQuit)
+        );
+        // The discarded restore reaches its terminal before registration replies.
+        assert!(!app.sidecar_restore_active());
+        tx.send(Ok(Completion {
+            prepared: completed,
+            selection: Some(target.clone()),
+        }))
+        .unwrap();
+        backend.update_logic_only(&mut app.app, Default::default());
+        await_worker(&mut app.browser_integration);
+        let (output, _) = backend.update_logic_only(&mut app.app, Default::default());
+        assert_eq!(Selection::from_settings(&app.settings), target);
+        assert_eq!(
+            output
+                .viewport_commands
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|commands| commands.contains(&egui::ViewportCommand::Close)),
+            explicit_quit
+        );
+        assert!(!backend.should_close());
+        assert_eq!(app.browser_integration.close, None);
+        let (output, _) = backend.update_logic_only(&mut app.app, Default::default());
+        assert!(
+            !output
+                .viewport_commands
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|commands| commands.contains(&egui::ViewportCommand::Close))
+        );
+        // Only a new delivery (or the explicit Quit's reissued delivery) closes.
+        backend.update_logic_only(&mut app.app, close_input());
+        assert!(backend.should_close());
+    }
+
+    #[test]
+    fn browser818_registration_restore_rejected_close_is_not_replayed() {
+        registration_completion_after_restore(false);
+    }
+
+    #[test]
+    fn browser818_registration_explicit_quit_waits_and_resumes_after_restore() {
+        registration_completion_after_restore(true);
+    }
 
     struct LifecycleBackend {
         entered: mpsc::Sender<&'static str>,
