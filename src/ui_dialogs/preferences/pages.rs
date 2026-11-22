@@ -11120,7 +11120,7 @@ fn draw_fullscreen_bound_drag_pan_setting(ui: &mut egui::Ui, value: &mut bool) {
 }
 
 fn draw_fullscreen_n_scroll_step_setting(ui: &mut egui::Ui, value: &mut u32) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let label = ui.label("順に読む操作 (N 字 / Z 字) 1 回");
         ui.add(
             egui::DragValue::new(value)
@@ -11134,7 +11134,7 @@ fn draw_fullscreen_n_scroll_step_setting(ui: &mut egui::Ui, value: &mut u32) {
 }
 
 fn draw_fullscreen_n_scroll_wrap_step_setting(ui: &mut egui::Ui, settings: &mut Settings) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let mut separate = settings.fullscreen_n_scroll_wrap_step_percent.is_some();
         let label = ui.checkbox(&mut separate, "列 / 段を替えるときは別の移動量にする");
         if label.changed() {
@@ -11823,6 +11823,116 @@ mod fullscreen_in_page_scroll_setting_tests {
             harness.state().fullscreen_n_scroll_wrap_step_percent,
             Some(50)
         );
+    }
+
+    #[test]
+    fn fullscreen_n_scroll_narrow_controls_remain_visible_and_clickable() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+
+        let reading_label = "順に読む操作 (N 字 / Z 字) 1 回";
+        let wrap_label = "列 / 段を替えるときは別の移動量にする";
+        for width in [220.0, 280.0, 360.0] {
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(width, 400.0))
+                .build_ui_state(
+                    |root, (settings, visible)| {
+                        egui::CentralPanel::default().show(root, |ui| {
+                            ui.spacing_mut().scroll = super::super::pref_panel_scroll_style();
+                            egui::ScrollArea::vertical()
+                                .scroll_source(egui::scroll_area::ScrollSource {
+                                    drag: egui::scroll_area::DragScroll::Always,
+                                    ..Default::default()
+                                })
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                                )
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    // Capture the viewport before any row can expand max_rect.
+                                    *visible = ui.max_rect().intersect(ui.clip_rect());
+                                    // Match the separate search-anchor scopes in the dialog.
+                                    ui.scope(|ui| {
+                                        draw_fullscreen_n_scroll_step_setting(
+                                            ui,
+                                            &mut settings.fullscreen_n_scroll_step_percent,
+                                        );
+                                    });
+                                    ui.scope(|ui| {
+                                        draw_fullscreen_n_scroll_wrap_step_setting(ui, settings);
+                                    });
+                                });
+                        });
+                    },
+                    (
+                        Settings {
+                            fullscreen_n_scroll_step_percent: 15,
+                            fullscreen_n_scroll_wrap_step_percent: Some(85),
+                            ..Settings::default()
+                        },
+                        egui::Rect::NOTHING,
+                    ),
+                );
+            harness.run();
+            for expected in [Some(85), None, Some(15)] {
+                assert_eq!(
+                    harness.state().0.fullscreen_n_scroll_wrap_step_percent,
+                    expected
+                );
+                let visible = harness.state().1;
+                let checkbox =
+                    harness.get_by_role_and_label(egui::accesskit::Role::CheckBox, wrap_label);
+                assert!(
+                    visible.contains_rect(checkbox.rect()),
+                    "{width}: checkbox; visible={visible:?}, rect={:?}",
+                    checkbox.rect()
+                );
+                let reading =
+                    harness.get_by_role_and_label(egui::accesskit::Role::Label, reading_label);
+                assert!(
+                    visible.contains_rect(reading.rect()),
+                    "{width}: reading label; visible={visible:?}, rect={:?}",
+                    reading.rect()
+                );
+                for (label, value, disabled) in [
+                    (reading.accesskit_node().id(), 15, false),
+                    (
+                        checkbox.accesskit_node().id(),
+                        expected.unwrap_or(15),
+                        expected.is_none(),
+                    ),
+                ] {
+                    let control = harness.get_by(|node| {
+                        node.role() == egui::accesskit::Role::SpinButton
+                            && node.numeric_value() == Some(value as f64)
+                            && node.labelled_by().any(|node| node.id() == label)
+                    });
+                    assert_eq!(control.accesskit_node().is_disabled(), disabled);
+                    assert!(
+                        visible.contains_rect(control.rect()),
+                        "{width}: DragValue {value}; visible={visible:?}, rect={:?}",
+                        control.rect()
+                    );
+                }
+                for description in [
+                    "ページ内を順に読む操作だけに効きます。",
+                    "N 字では次の列へ、Z 字では次の段へ移るときの量です。100% は表示領域 1 つ分で、端に近いときは残りの分だけ動きます。",
+                ] {
+                    let label =
+                        harness.get_by_role_and_label(egui::accesskit::Role::Label, description);
+                    assert!(
+                        visible.contains_rect(label.rect()),
+                        "{width}: {description}; visible={visible:?}, rect={:?}",
+                        label.rect()
+                    );
+                }
+                if expected != Some(15) {
+                    checkbox.click();
+                    harness.run();
+                }
+            }
+        }
     }
 
     #[test]
