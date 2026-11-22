@@ -1,6 +1,6 @@
 # §1.818 段 2「mIV で見る」製品実装の計画
 
-ステータス: **実装前の計画 (2026-11-22)**。設計書 [browser-to-miv-plan.md](browser-to-miv-plan.md) (独立レビュー第 11 回 ACCEPT) を正本とし、この文書はコードを追って確定した実装の段階・差し込み口・テストをまとめる。
+ステータス: **実装前の計画 (2026-11-22)。独立レビュー第 13 回で ACCEPT、凍結の決まりの構造的変更に合意 (§6)**。設計書 [browser-to-miv-plan.md](browser-to-miv-plan.md) (独立レビュー第 11 回 ACCEPT) を正本とし、この文書はコードを追って確定した実装の段階・差し込み口・テストをまとめる。
 作成: 実装担当 GPT-6.1 Sol / high (read-only の調査、2026-11-22) の計画案を、設計担当 ClaudeCode Opus 5.5 / high が §0 の判断を足して採用した。独立レビュー (GPT-6.1 Sol / xhigh) の記録は §6。
 作業ブランチ: `browser-818-impl` (worktree `G:\home\mimageviewer-browser818-impl`)。
 
@@ -750,3 +750,7 @@ Start-Process -FilePath .\target\release\mimageviewer.exe
 | 2 | P2 | トレイ復帰を root だけにすると、保持中の窓の可視性の復帰まで失う | 段階 4: 可視性の復帰は全部既存どおり行い、focus / raise だけを方針で分ける (保持中の viewport は既存の `focus=false` の経路) |
 | 3 | P2 | 別の管理者で昇格したときに残るものの説明が不正確 (HKCU も `{userappdata}` も実行アカウントを指す) | §0: 自動で消せるのは実行したアカウントのものだけと定義し、残るもの・拡張の知らせ・「アンインストールの前に解除する」案内を書いた |
 | 4 | P3 | 拡張の権限の数 (設計書は宣言 6 つ + 任意の host 権限) | 段階 8 を訂正 |
+
+### 第 13 回 (2026-11-22、同じ担当を継続、対象 `b5387eb55`) — ACCEPT
+
+第 12 回の 4 件はすべて解消し、新しい指摘は無し。段階 4 も構造的変更として合意 (段階 2〜5 すべて合意)。合意は [detached-rework-plan.md](detached-rework-plan.md) §11 に記録した。
