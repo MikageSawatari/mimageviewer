@@ -1484,6 +1484,12 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 - 設計担当 ClaudeCode も、段階 2〜5 は症状パッチではなく、所有の境界を型で表す構造的な変更であることに同意する (2026-11-22)。
 - 各段階の実装の完了時に、実装が計画どおりかを独立レビューで確かめ、ここに結果を足す。
 
+**段階2の実装引き継ぎ (2026-11-22、検証・独立レビュー待ち)**
+
+- 要求の相関 ID・表示意図・明示選択を `external_open.rs` の型に置き、既存の startup／navigation／sidecar／composition owner で表示の確定境界まで運ぶ。App の追加フラグ、時間窓、HWND／geometry／placement の判定変更はない (§2-1〜5)。独立 context への既存 handoff は要求を保持し、routing origin だけを変更する。
+- 履歴を適用してから連動 sync を止める症状パッチではなく、復元 owner の context・世代・item identity 検証後に明示対象を選択の正本とする。取消・close・error・対象消失は既存の要求退役へ合流する。DirectMedia の close 取消も同じ owner の処理に含めた。
+- linked F12 の選択／表示／sync stamp、同一パスの相関、待機の取消・置換、sibling の generation／cancel／channel／cache／window binding の回帰テストを追加。既存 detached テストは削除・弱化しない (§2-8)。ビルド・テストは設計担当の共有実行枠へ引き継ぐ。窓の用途・終了方針・overlay の表示分岐は段階3・4で実装する。
+
 ### 2026-11-21: 絞り込みの変更で一覧を読み直さない・AI の絞り込みを一覧全体の取得の証明へ (§1.835、実装済み・自動検証済み・実機未確認)
 
 **変更の内容**

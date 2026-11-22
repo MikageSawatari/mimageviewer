@@ -259,6 +259,15 @@ ActivationOpenPath::received
 
 ブラウザの producer がまだなくても、通常の二重起動に対する選択回帰が直り、意図が全待機経路を通ること。
 
+**段階2の実装記録 (2026-11-22、ビルド・テスト・独立レビューは引き継ぎ待ち)**
+
+- `app/external_open.rs` に `ViewerOpenIntent`、相関 ID を持つ `ViewerOpenRequest`、パスと要求を持つ `ExplicitOpenPath` を追加。既存の `ViewerOpenAdoption` をここへ移し、要求・routing origin・明示選択の方針を運ぶ variant を追加した。`MainNew` と `ContextContinuation` の既存の入口は維持する。
+- 通常 activation と Agent は受信時に Preferences の要求を作る。初回起動も要求全体を保持し、Remote 取得時の再保留、文書モーダル／EPUB 削除中の再キューで同じ ID と意図を保持する。`StartupOpenPathSource` の受付規則は変えない。
+- 一覧の navigation → sidecar／composition → fullscreen → `prepare_viewer_presentation_open` まで、既存の adoption 値で運ぶ。materialized physical context への handoff は routing origin だけを continuation に変え、要求を保持する。BrowserOverlay の製品 producer、表示先の変更、配置の適用はまだ追加しない。
+- sidecar 完了で context・items generation・item key を検証した明示対象を、同じターンの hydration に渡し、履歴・名前ヒント・読書位置より先に選択する。RequiredFullscreen はその continuation の exact target、composition 待ちは既存 owner の context・generation・candidate identity から選択権を確認する。最終 open でも待機の検証後・表示公開前に選択を一致させる。
+- 明示要求が既存の fullscreen hydration action を置き換える場合は、古い action を退役させる。DirectMedia も close の取消対象に含める。モーダル中の受付、warm 表示、復元 worker、連動 sync の実行条件や順序を遅らせる仕組みは追加しない。App の新しい pending／detached フラグ、時刻による有効期限、回復処理、永続データ変更はない。
+- 新規テストは `browser818_open_owner`／`browser818_selection`。既存テストの owner 構築・期待値は相関 ID を保持する形へ追従し、シナリオ・アサーションの意味を維持する。cargo 実行は指示に従い最後の `cargo fmt` のみ。設計担当が新規 filter と上記既存 filter を共有実行枠で検証する。
+
 ### 段階3：窓の用途、終了方針、F12 の共通拒否
 
 **範囲**

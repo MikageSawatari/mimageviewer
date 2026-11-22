@@ -767,11 +767,15 @@ fn realmachine50_forwarded_warm_pdf_keeps_main_origin_without_delaying_cached_ro
                 "realmachine50_warm_pdf_before_verification",
             );
         });
+    let request = crate::app::ViewerOpenRequest::preferences();
     env.activation_open_path_tx
-        .send(crate::single_instance::ActivationOpenPath::received(
-            pdf.clone(),
-            env.remote_session_handle(),
-        ))
+        .send(
+            crate::single_instance::ActivationOpenPath::received_with_request(
+                pdf.clone(),
+                env.remote_session_handle(),
+                request,
+            ),
+        )
         .unwrap();
     env.poll_activation_open_paths(&ctx);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
@@ -805,7 +809,7 @@ fn realmachine50_forwarded_warm_pdf_keeps_main_origin_without_delaying_cached_ro
             .as_ref()
             .unwrap()
             .viewer_adoption,
-        StartupOpenPathOwner::Activation.viewer_open_adoption()
+        StartupOpenPathOwner::Activation(request).viewer_open_adoption()
     );
     assert_eq!(env.active_detached_window_id(), Some(old_window));
     assert_eq!(env.locate_window_context(old_window).unwrap().0, old);

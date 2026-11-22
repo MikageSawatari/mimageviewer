@@ -476,7 +476,11 @@ fn depth_linked_independent_open_retires_before_publishing_the_new_session_flag(
         app.settings.detached_viewer_open_images_in_window = true;
         let render = isolate_depth_renderer(&mut app);
         let own = tracked_depth(&mut app, ready);
-        app.prepare_viewer_presentation_open(0, false);
+        app.prepare_viewer_presentation_open(
+            0,
+            false,
+            crate::app::ViewerOpenAdoption::ContextContinuation,
+        );
         assert_eq!(app.viewer_presentation, ViewerPresentation::DetachedWindow);
         assert!(app.detached_viewer_independent_active);
         assert!(matches!(app.fs_exclusive_view, FsExclusiveView::None));

@@ -1341,7 +1341,8 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     #[cfg(windows)]
     let dcomp_presenter_config = dcomp_presenter_test::parse_config();
     let perf_log_path = parse_perf_log_path_arg();
-    let startup_open_path = parse_startup_open_path_arg();
+    let startup_open_path = parse_startup_open_path_arg()
+        .map(|path| app::ExplicitOpenPath::new(path, app::ViewerOpenRequest::preferences()));
     arguments_trace.finish(miv_startup::Outcome::Ok);
 
     // --pdf-worker モード: GUI なしで PDFium ワーカープロセスとして起動
@@ -2179,7 +2180,7 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
             );
             emit_startup("app_default", Some(t));
             if let Some(path) = startup_open_path.clone() {
-                app.set_startup_open_path(path);
+                app.set_startup_open_request(path);
             }
             if let Some(config) = play_test_config.clone() {
                 app.configure_play_test(config);

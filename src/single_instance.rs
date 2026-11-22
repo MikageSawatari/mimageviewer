@@ -628,6 +628,7 @@ fn read_pipe_exact(handle: windows::Win32::Foundation::HANDLE, len: usize) -> Op
 /// Pipe request with the Remote owner observed when the path was received.
 pub(crate) struct ActivationOpenPath {
     pub(crate) path: std::path::PathBuf,
+    pub(crate) request: crate::app::ViewerOpenRequest,
     pub(crate) remote_owned_at_receive: bool,
     pub(crate) acquisition_sequence_at_receive: Option<u64>,
     pub(crate) received_at: std::time::Instant,
@@ -638,9 +639,22 @@ impl ActivationOpenPath {
         path: std::path::PathBuf,
         remote_session: Option<&crate::remote_ipc::session::SessionHandle>,
     ) -> Self {
+        Self::received_with_request(
+            path,
+            remote_session,
+            crate::app::ViewerOpenRequest::preferences(),
+        )
+    }
+
+    pub(crate) fn received_with_request(
+        path: std::path::PathBuf,
+        remote_session: Option<&crate::remote_ipc::session::SessionHandle>,
+        request: crate::app::ViewerOpenRequest,
+    ) -> Self {
         let snapshot = remote_session.map(crate::remote_ipc::session::SessionHandle::snapshot);
         Self {
             path,
+            request,
             remote_owned_at_receive: snapshot
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.phase.blocks_local_control()),

@@ -793,8 +793,10 @@ Surfaceもswitch epochを省略しない。Bookmarkはコピー済み入力のna
 | Snapshot cache-only分類／採用 | Snapshot row証明（既存snapshot generation + key/kind/target）。viewerの画像metadata世代ではなく、採用時に読むsnapshot自身を検証する。元RARはtyped source、ZIPは既存ArchivePreflightingのbackingとし、成功採用まで同じ証明を保持 |
 | `global_search_ui.rs::capture_search_view_adoption` | Row（search viewのprepare snapshotとsurvivor等）。**prepare要求の送信前**にcaptureし、非同期準備から採用まで保持。結果からのcopied-path openとは別owner |
 | `subfolder_expansion.rs::capture_subfolder_expansion_adoption` | 初回／root-only scanはSurface（copied roots・除去path）。現snapshotの再install/除去/reused metadata・snapshot付きrestoreはRow（現items/cache由来のprepare snapshot）。scan→prepare→installは元証明をmove |
-| `startup_ops.rs::start_startup_open_path_resolution_owned_with_navigation` | Bookmark（native resolver request ID/target）。alias・page待ちでも同要求をmoveし、取消はexact IDで行う。通常startupはnative startup ownerで共通main要求を新規captureしない |
+| `startup_ops.rs::start_startup_open_path_resolution_owned_with_navigation` → `start_startup_open_request_with_navigation` | Bookmark（native resolver request ID/target）。alias・page待ちでも同要求をmoveし、取消はexact IDで行う。通常startupはnative startup ownerで共通main要求を新規captureしない |
 | copied detached archive／Bookmark読込 | main資格のないwindow contextへ渡し、native window lease＋request ID（そのwindowの切替epoch相当）を検証。common main headerを新規captureしない。コピー前に元indexを読むDetachedGrid分類は上のRow。main switch sequenceを別windowへpublishしない |
+
+§1.818 の初回起動・activation・Agent の表示意図と相関 ID は `ExplicitOpenPath` → `StartupOpenPathOwner` → 既存の `ViewerOpenAdoption` で運ぶ。sidecar／composition の待機 owner が context・世代・対象 identity を検証し、有効な明示ファイル要求がある間は履歴より先に選択を所有する。要求の取消は同じ continuation を退役させ、別の pending フラグは作らない。
 
 §1.805 r10では、走査済みパスの再分類を省く変更を撤回し、ツリー・GridFolderCandidateの完了経路を維持する。
 DirectNavigationの対象は分類の要らない名前に限り、完了の再入で再分類は起きない。

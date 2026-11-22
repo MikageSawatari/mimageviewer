@@ -734,12 +734,14 @@ pub(crate) use archive_inner_book::{
 };
 #[cfg(all(test, windows))]
 mod context_state_tests;
+pub(crate) mod external_open;
 mod logic_service;
 pub(crate) mod main_drop;
 mod pinned_search;
 pub(crate) mod root_lifecycle;
 mod search_request;
 mod startup_ops;
+pub(crate) use external_open::{ExplicitOpenPath, ViewerOpenAdoption, ViewerOpenRequest};
 mod subfolder_expansion;
 mod update_phases;
 pub(crate) use close_return::{
@@ -4313,15 +4315,6 @@ pub(crate) struct DeferredFsReopen {
     pub preserve_after_password_prompt: bool,
 }
 
-/// Captured by the semantic request owner, never inferred from a load stage or
-/// the session that happens to be mounted when an asynchronous result arrives.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ViewerOpenAdoption {
-    MainNew,
-    #[default]
-    ContextContinuation,
-}
-
 impl DeferredFsReopen {
     fn zip_dfs_continuation(&self) -> Option<book_composition_permission::BookDfsContinuation> {
         match &self.target {
@@ -4642,22 +4635,24 @@ pub(crate) enum StartupOpenPathSource {
 /// 後続の bookmark request を変更できないようにする。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StartupOpenPathOwner {
-    InitialStartup,
-    Activation,
+    InitialStartup(ViewerOpenRequest),
+    Activation(ViewerOpenRequest),
     Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
 }
 
 impl StartupOpenPathOwner {
     fn viewer_open_adoption(&self) -> ViewerOpenAdoption {
         match self {
-            Self::InitialStartup | Self::Activation => ViewerOpenAdoption::MainNew,
+            Self::InitialStartup(request) | Self::Activation(request) => {
+                ViewerOpenAdoption::requested(*request)
+            }
             Self::Bookmark(_) => ViewerOpenAdoption::ContextContinuation,
         }
     }
     fn source(&self) -> StartupOpenPathSource {
         match self {
-            Self::InitialStartup => StartupOpenPathSource::InitialStartup,
-            Self::Activation => StartupOpenPathSource::Activation,
+            Self::InitialStartup(_) => StartupOpenPathSource::InitialStartup,
+            Self::Activation(_) => StartupOpenPathSource::Activation,
             Self::Bookmark(_) => StartupOpenPathSource::Bookmark,
         }
     }
@@ -4669,7 +4664,7 @@ impl StartupOpenPathOwner {
     fn open_request_owner(&self) -> OpenRequestOwner {
         match self {
             Self::Bookmark(owner) => OpenRequestOwner::Bookmark(owner.clone()),
-            Self::InitialStartup | Self::Activation => OpenRequestOwner::Navigation,
+            Self::InitialStartup(_) | Self::Activation(_) => OpenRequestOwner::Navigation,
         }
     }
 }
@@ -18119,7 +18114,7 @@ pub struct App {
     pub(crate) initialized: bool,
     /// ショートカット D&D / SendTo / CLI で指定された起動時の開く対象。
     /// `Settings` には保存せず、初回 update で通常の起動復元より優先して消費する。
-    pub(crate) startup_open_path: Option<PathBuf>,
+    pub(crate) startup_open_path: Option<ExplicitOpenPath>,
     /// 起動引数 / 2 重起動 activation で渡されたパスを UI スレッド外で解決中。
     pub(crate) startup_open_path_resolve_pending: Option<StartupOpenPathResolvePending>,
 
@@ -45150,6 +45145,7 @@ impl App {
         &mut self,
         mut continuation: sidecar_restore::SidecarLoadContinuation,
         modal_observation: &SidecarModalObservation,
+        explicit_selection: Option<usize>,
     ) {
         if matches!(
             continuation.navigation_after_hydration,
@@ -45192,6 +45188,20 @@ impl App {
                 return;
             }
         }
+        // The restore owner has already qualified any deferred index by context,
+        // generation and item key. RequiredFullscreen owns an exact identity instead.
+        let explicit_selection = explicit_selection
+            .or_else(|| self.composition_explicit_open_selection())
+            .or_else(|| match &continuation.navigation_after_hydration {
+                Some(MainListAfterHydration::RequiredFullscreen {
+                    target,
+                    viewer_adoption,
+                    ..
+                }) if viewer_adoption.owns_file_selection() => {
+                    self.resolve_snapshot_target_idx(target)
+                }
+                _ => None,
+            });
         let sidecar_restore::SidecarLoadContinuation {
             viewer_adoption,
             mut restore_intent,
@@ -45635,8 +45645,17 @@ impl App {
             .flatten();
         // たった今の操作が作った項目があれば、そこへ移すのが最優先。名前ヒント
         // (`select_after_load`) も履歴も、そちらは「表示の都合」で決まる復元なので譲る。
-        let from_operation = !detached_physical && self.apply_post_operation_selection();
-        let restored = if from_operation {
+        let from_explicit_open = explicit_selection.is_some();
+        let from_operation =
+            !from_explicit_open && !detached_physical && self.apply_post_operation_selection();
+        let restored = if let Some(idx) = explicit_selection {
+            // An exact open is the selection owner until publication. Consume a general
+            // name hint without applying it, so it cannot escape into the next folder.
+            self.select_after_load.take();
+            self.move_grid_cursor(Some(idx), GridCursorIntent::Automatic);
+            self.grid_scroll.set_reveal_requested(true);
+            true
+        } else if from_operation {
             // Both requests belong to this accepted load. An operation-winning cursor must
             // consume the lower-priority name hint too, so it cannot leak into the next load.
             self.select_after_load.take();
@@ -45656,6 +45675,7 @@ impl App {
         // 追加された項目を見せるのが目的なので、操作由来のときは履歴のスクロール位置へ
         // 戻さない (戻すと、選んだばかりの項目が画面外にある状態になる)。
         if restored
+            && !from_explicit_open
             && !from_operation
             && let Some((scroll, _)) = history_state
         {
@@ -70575,6 +70595,7 @@ impl App {
         &mut self,
         idx: usize,
         resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: ViewerOpenAdoption,
     ) -> bool {
         if self.active_detached_context_is_at_rest()
             || !matches!(self.navigation_scope, ViewerNavigationScope::Main)
@@ -70620,10 +70641,11 @@ impl App {
                         detached.page_path_key(index).as_deref() == Some(requested_page.as_str())
                     })
                     .expect("fork retains requested page identity");
-                detached.open_fullscreen_with_resume_notice(
+                detached.open_fullscreen_with_adoption(
                     idx,
                     crate::app::HistoryTrigger::UserChosen,
                     resume_notice,
+                    viewer_adoption.context_continuation(),
                 );
                 detached
                     .active_detached_session
@@ -72537,7 +72559,19 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn prepare_viewer_presentation_open(&mut self, idx: usize, entering_native_video: bool) {
+    fn prepare_viewer_presentation_open(
+        &mut self,
+        idx: usize,
+        entering_native_video: bool,
+        viewer_adoption: ViewerOpenAdoption,
+    ) {
+        if let Some(request) = viewer_adoption.request() {
+            self.log_detached_image_window_debug(format!(
+                "presentation_open request_id={} intent={:?} idx={idx}",
+                request.id(),
+                request.intent
+            ));
+        }
         let entering_media =
             entering_native_video || matches!(self.items.get(idx), Some(GridItem::Audio(_)));
         if entering_media {
@@ -73173,8 +73207,12 @@ impl App {
                 return;
             }
         };
+        if viewer_adoption.owns_file_selection() {
+            self.move_grid_cursor(Some(idx), GridCursorIntent::Automatic);
+            self.grid_scroll.set_reveal_requested(true);
+        }
         #[cfg(windows)]
-        if viewer_adoption == ViewerOpenAdoption::MainNew {
+        if viewer_adoption.is_main_new() {
             if !self.prepare_detached_context_for_grid_open(&composition_ctx, idx) {
                 return;
             }
@@ -73188,6 +73226,7 @@ impl App {
             && self.route_materialized_physical_still_open_to_active_context(
                 idx,
                 resume_notice.clone(),
+                viewer_adoption,
             );
         #[cfg(windows)]
         finish_fs_open_perf_span(
@@ -73386,7 +73425,11 @@ impl App {
         #[cfg(windows)]
         let prepare_presentation_perf_t0 = start_fs_open_perf_span(&perf);
         #[cfg(windows)]
-        self.prepare_viewer_presentation_open(idx, entering_native_video_fullscreen);
+        self.prepare_viewer_presentation_open(
+            idx,
+            entering_native_video_fullscreen,
+            viewer_adoption,
+        );
         #[cfg(windows)]
         finish_fs_open_perf_span(
             &mut perf,
