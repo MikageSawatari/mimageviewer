@@ -40,20 +40,29 @@
 ### 3.1 対象にする項目
 
 一覧の準備で `CollectionSourcePreparation::Missing` (元パスの `metadata` が `NotFound`) と分類され、かつ
-**そのパスのドライブ / 共有のルートが存在する**項目だけ。
+**「最も近い実在の祖先」が、リンク先までたどって実在するフォルダである**項目だけ (r1 レビュー P1 で、
+ドライブ / 共有のルートだけを見る案から改めた)。
 
 - 未対応 (`Unsupported`)、読み取れない (`AccessError`) は入れない。
-- ルートが存在しない項目は入れない。Windows では、外したドライブ上のパス (`ERROR_PATH_NOT_FOUND`) や、
-  つながらない共有も `NotFound` に分類され得る (Rust 標準の対応表は未確認、安全側に倒す)。
-  マニュアルの「一時的に読めない項目も登録行を残す」と食い違わないよう、これらは一時的に接続されて
-  いないものとして扱う。
-- ルートは `Path::components()` の先頭の `Prefix` + `RootDir`:
-  - `Prefix::Disk` (`D:`) → `D:\`
-  - `Prefix::UNC(server, share)` → `\\server\share\`
-  - `VerbatimDisk` / `VerbatimUNC` も同様に組み立てる。
-  - `Verbatim` / `DeviceNS`、Prefix の無いパス、`RootDir` の無いパスは**対象外** (安全側)。
-- ルートの存在確認は `std::fs::metadata(root)` が成功して `is_dir()` のときだけ「存在する」。エラーは
-  すべて「存在しない」。
+- Windows では、外したドライブ・つながらない共有も `NotFound` になる。Rust 1.100 の対応表は
+  `ERROR_FILE_NOT_FOUND` (2)・`ERROR_PATH_NOT_FOUND` (3)・`ERROR_INVALID_DRIVE` (15)・`ERROR_BAD_NETPATH` (53)・
+  `ERROR_BAD_NET_NAME` (67) を `NotFound` にする (r1 レビューが std の実装で確認)。さらに、登録パスの途中に
+  junction / ディレクトリの symlink / フォルダへのマウントがあり、その接続先が外れている場合も `NotFound` になる。
+  これらは一時的に接続されていないものとして扱い、対象から外す。マニュアルの「一時的に読めない項目も
+  登録行を残す」と食い違わないようにするため。
+- 判定 (`missing_source_is_removable(path)`、prepare worker 内):
+  1. `path` 自身から親へ順にたどり、`std::fs::symlink_metadata` (リンクをたどらない) が成功する最初のパスを
+     「最も近い実在の祖先」N とする。`NotFound` なら 1 つ上へ進む。`NotFound` 以外のエラーで止まったら**対象外**。
+     親が無くなる (ドライブ・共有そのものが無い、相対パス) まで見つからなければ**対象外**。
+  2. N に対して `std::fs::metadata` (リンクをたどる) が成功し、`is_dir()` のときだけ**対象**。
+- この判定で区別できるもの:
+  - フォルダ名の変更・移動・削除 (報告の場面): N は変更前の親など実在の普通のフォルダで、対象になる。
+  - 外したドライブ・つながらない共有: N が見つからないので対象外。
+  - 接続先が外れた junction / symlink / マウント: N はそのリンク自身 (`symlink_metadata` は成功する) で、
+    リンク先をたどる `metadata` が失敗するので対象外。登録した項目そのものが外れたリンクの場合も同じ。
+  - 接続先が生きている junction の下でフォルダ名を変えた場合: N は実在するので対象になる。
+  - 上位のリンクが外れていれば、その下のパスは `symlink_metadata` でも見つからないので、N は必ずリンク自身か
+    それより上になる。途中の祖先を 1 つずつ調べ直す必要はない。
 - 表示の分類 (「見つかりません」の表示、テキスト書き出し、Remote の状態、登録時の分類) は**変えない**。
   `inspect_collection_source` も変えない (変えると、テキスト取り込みで外したドライブ上のパスを登録できなく
   なる等、既存の挙動が変わるため)。
@@ -80,20 +89,21 @@ pub(crate) struct CollectionRemovableMissingEntry {
 
 pub(crate) struct CollectionPreparedSnapshot {
     // 既存フィールドはそのまま
-    /// 全登録 (表示の絞り込み前) のうち、Missing かつドライブ / 共有のルートが存在する項目。
+    /// 全登録 (表示の絞り込み前) のうち、Missing かつ §3.1 の判定で対象になった項目。
     /// 並びは effective order。表示の絞り込み (project_collection_display_snapshot 等) では変えない。
     pub(crate) removable_missing: Arc<[CollectionRemovableMissingEntry]>,
 }
 ```
 
-- ルートの存在確認は、分類ループの中で Missing の項目にだけ行い、ルートごとに 1 回だけ (準備 1 回の中の
-  `HashMap<PathBuf, bool>`)。つながらない共有でルートの確認が時間待ちになっても、ルートごとに 1 回で済む。
-  各確認の前に `keep_running()` を見て取り消しに従う。
+- 判定は分類ループの中で Missing の項目にだけ行う。調べたパスごとの結果 (`symlink_metadata` の成否・
+  `metadata` の結果) は準備 1 回の中の `HashMap<PathBuf, _>` に覚え、同じフォルダの下の多数の項目や、
+  つながらない共有での時間待ちを繰り返さない。各 I/O の前に `keep_running()` を見て取り消しに従う。
+  判定の I/O は関数を注入できる形にし、テストで実ファイルなしに回数と結果を検査できるようにする。
 - 本番の `CollectionPreparedSnapshot` の構築は prepare.rs の 1 か所だけ。表示用の射影
   (`prepare_collection_grid_install` の書庫射影、`project_collection_display_snapshot`) は `entries` だけを
   差し替えるので、このフィールドはそのまま残る。ナビゲーション・履歴・Remote の準備も同じ関数を通るので、
   どの経路で準備した snapshot も同じ値を持つ。
-- Remote もこの関数を使うため計算はするが、使わない (Missing の項目のルートを 1 回ずつ見るだけ)。Remote の
+- Remote もこの関数を使うため計算はするが、使わない (Missing の項目について §3.1 の I/O を行うだけ)。Remote の
   通信内容・状態は変えない。
 - 準備結果の再利用 (`CollectionPrepareReuseKey`) は revision が同じ間は再利用する。外部での変更 (フォルダ名を
   戻す、ドライブを抜き差しする) は、既存どおり明示的な更新や開き直しで再評価する (マニュアルの既存の記述どおり)。
@@ -108,18 +118,34 @@ pub(crate) struct CollectionPreparedSnapshot {
 ラベル「見つからない項目をすべて外す…」、`action: None`)。並びは「現在のコレクションを並べ替え…」の後。
 保存済みのメニュー配置には `resolve_menu_commands_for_parent` が末尾へ自動で補う (既存の仕組み)。
 
+受付の判定は 1 つの helper `collection_grid_missing_removal(&self) -> CollectionMissingRemovalAvailability`
+にまとめ、トップメニューと右クリック (§4.2) が共有する。判定は既存の並べ替えの受付
+(`collection_grid_root_order`) と同じ条件をとる (r1 レビュー P2: `collection_grid_content_target()` が Ok でも、
+`prepared()` は更新中・失敗中に旧い installed を返し得るため、それだけでは最新と言えない)。
+
+1. コレクション直下でない → `NotOffered` (トップメニューでは無効、理由「コレクション直下を開くと使用できます」)。
+2. load が `Deleted` / `Failed`、`collection_grid_refresh_waits_for_viewer()`、load が `Ready` / `Empty` 以外
+   (`RequestNeeded` / `Snapshot` / `Preparing` で旧 installed を保持している場合を含む)、
+   `wanted_revision > accepted_revision`、`collection_grid_content_target()` が Err、
+   prepared の `collection_id` が stamp と違う → `Unavailable { count: None, reason }` (件数なし)。
+3. `collection_ui.can_edit()` が false、または `collection_ui.operation` が idle でない →
+   `Unavailable { count: Some(N), reason: "コレクションを現在編集できません" }`。
+4. N = 0 → `Unavailable { count: Some(0), reason: "見つからない項目はありません" }`。
+5. それ以外 → `Ready { target: CollectionGridContentTarget, entries: Arc<[CollectionRemovableMissingEntry]> }`
+   (prepared の `removable_missing` の Arc を共有するだけで、コピーしない)。
+
 表示:
 
 | 状態 | 表示 | 有効 | ホバー |
 | --- | --- | --- | --- |
-| 現在の一覧がコレクション直下で、準備済み・最新 (`collection_grid_content_target()` が Ok)、N ≥ 1 | 見つからない項目をすべて外す… (N件) | 有効 | — |
-| 同上で N = 0 | 見つからない項目をすべて外す… (0件) | 無効 | 見つからない項目はありません |
-| コレクション直下でない / 準備中 / 更新中 (`collection_grid_content_target()` が Err) | 見つからない項目をすべて外す… (件数なし) | 無効 | Err の理由文 (既存のインポート・エクスポートと同じ文言) |
-| `collection_ui.can_edit()` が false、または別の操作中 | 件数は出す | 無効 | コレクションを現在編集できません |
+| `Ready` | 見つからない項目をすべて外す… (N件) | 有効 | — |
+| `Unavailable { count: Some(0) }` | 見つからない項目をすべて外す… (0件) | 無効 | 見つからない項目はありません |
+| `Unavailable { count: Some(N) }` (編集不可) | 見つからない項目をすべて外す… (N件) | 無効 | コレクションを現在編集できません |
+| `Unavailable { count: None }` / `NotOffered` | 見つからない項目をすべて外す… (件数なし) | 無効 | 理由文 (並べ替えの受付と同じ区分の文言) |
 
-- 件数は `session.prepared().removable_missing.len()` を読むだけ。メニューを開いてもディスクを読まない。
-- 件数が出せない間 (準備中・更新中) は件数を付けず無効にし、理由をホバーに出す。準備が終わると次のフレームから
-  件数付きで出る。
+- 件数は prepared の `removable_missing.len()` を読むだけ。メニューを開いてもディスクを読まない。
+- 件数が出せない間 (準備中・更新中・旧い表示を保持中) は件数を付けず無効にし、理由をホバーに出す。
+  準備が終わると次のフレームから件数付きで出る。
 
 ### 4.2 見つからない項目の右クリック
 
@@ -130,9 +156,14 @@ pub(crate) struct CollectionPreparedSnapshot {
 - チェックありのメニュー、実在する項目のメニュー、フルスクリーン、コレクションの子 (実フォルダ) には出さない。
 - `context_menu_model` に `MenuCommand::RemoveMissingFromCollection` を足し、`ContextMenuInput` に
   `collection_missing_removal: CollectionMissingRemovalAvailability` (`NotOffered` / `Ready { count }` /
-  `Unavailable { count: Option<usize>, reason }`) を足す。値は右クリックの時点で
-  `NativeGridContextMenuTarget` に取り込み、選んだときはその時点の対象 (stamp + revision + entry_ids) を使う
-  (既存の `collection_root_delete` と同じ取り込み方)。native 描画と egui 描画は同じモデルを見るので両方に出る。
+  `Unavailable { count: Option<usize>, reason }`) を足す。値は §4.1 の helper の結果を
+  `NativeGridContextMenuTarget` に取り込む (既存の `collection_root_delete` と同じ取り込み方)。選んだときは
+  取り込んだ `Ready` の target (stamp + revision) と entries (immutable な `Arc`) を使う。
+  native 描画と egui 描画は同じモデルを見るので両方に出る。
+- 取り込みの寿命は既存の契約に従う: native は開いた時点の target を保持し、egui は毎フレーム target を
+  作り直す。どちらも既存の context / items 世代の検査 (`context_menu.rs` の世代確認) で、一覧が更新されたら
+  メニューを閉じる。古い target が送られても、送信時の stamp 検査と expected_revision の Conflict で何も
+  消えない。新しい追従状態は足さない。
 
 ### 4.3 確認ダイアログ
 
@@ -153,8 +184,13 @@ Missing の文言:
 - 本文: 見つからない N 件の参照をコレクションから外します。
 - パス: 先頭最大 5 件を 1 行ずつ (長いパスは省略表示し、ホバーで全体)。6 件以上なら「ほか M 件」。
 - 注記: 外すのは登録だけです。元のファイルやフォルダは削除・変更しません。
-- 注記: ドライブや共有フォルダにつながっていない項目、読み取れない項目、未対応の項目は外しません。
-- ボタン: 外す / キャンセル (既存と同じ。Enter / Escape も既存の modal と同じ扱い)
+- 注記: つながっていないドライブ・共有フォルダ・リンク先にある項目、読み取れない項目、未対応の項目は外しません。
+- ボタン: 外す / キャンセル
+- キー: 現行の `ConfirmRemove` はボタンのクリックしか受けない (r1 レビュー P3 で前提の誤りを訂正)。
+  Missing でも既存の選択からの「外す」でも、`self.dialog_enter_pressed(ctx)` で「外す」、
+  `self.dialog_escape_pressed(ctx)` で「キャンセル」を受ける (closure の前でローカル変数に取る)。
+  IME 変換中の Enter で確定しないこと、メニューを選んだのと同じフレームの Enter で即時確定しないことを
+  テストする (既存の modal / input gate を使う)。
 
 1093×614 logical points でもボタンまで見えること (最大 5 行のパスで高さを抑える)。
 
@@ -164,6 +200,9 @@ Missing の文言:
   `CollectionGridRemoveTarget` を作り、`request_collection_grid_remove` へ渡す (新しい経路は作らない)。
   sample_paths は同じ `removable_missing` の先頭から取る。
 - 結果の適用、他の context への反映、Conflict の扱いは既存の「外す」と同じ (§5)。
+- `apply_collection_grid_remove_success_in_current_context` は表示 entry ごとに `removed.contains()` を呼ぶため、
+  大量に外すと UI スレッドで二次の計算量になる (r1 レビュー P2)。削除 ID を一度だけ `HashSet` にしてから
+  走査する形に直す (既存の「外す」にも効く。挙動は変えない)。
 - 0 件では送らない (メニューが無効なので届かない。届いた場合も何もしない)。
 
 ## 5. 複数ウィンドウ・Remote・所有境界
@@ -188,13 +227,22 @@ Missing の文言:
 
 ## 6. テスト
 
-- `prepare.rs`: Missing でルートあり → 対象 / ルートなし (存在しないドライブ文字・存在しない UNC) → 対象外 /
-  Unsupported・AccessError → 対象外 / 並びが effective order / ルートの確認がルートごとに 1 回 (確認関数を
-  注入できる形にして数える) / 取り消しで止まる。
-- ルートの組み立て: Disk・UNC・VerbatimDisk・VerbatimUNC・Verbatim・DeviceNS・相対パス。
+- `prepare.rs` (I/O を注入した判定関数): 親が実在の普通のフォルダ → 対象 / 祖先をいくつか上がって実在 → 対象 /
+  ドライブ・共有ごと無い → 対象外 / 最も近い実在の祖先が外れたリンク (`symlink_metadata` 成功・`metadata`
+  失敗) → 対象外 / 登録項目そのものが外れたリンク → 対象外 / 途中で `NotFound` 以外のエラー → 対象外 /
+  相対パス → 対象外 / Unsupported・AccessError → 対象外 / 並びが effective order / 同じ祖先の I/O が準備 1 回で
+  1 回だけ / 取り消しで止まる。
+- 実ファイルでの判定 (一時フォルダ): フォルダ名を変えた後の登録 → 対象。接続先を消した junction の下の登録 →
+  対象外 (junction は `mklink /J` 相当を std で作れないので、作れない環境ではテストを skip せず、注入版の
+  テストで覆う。実ファイル版は作れる場合だけでよい)。
 - 射影: `project_collection_display_snapshot` と書庫射影の後も `removable_missing` が残る (隠れた種類の
   Missing も含む)。
-- メニューの状態: §4.1 の 4 行それぞれ (件数・有効・ホバー)。
+- 受付 helper: §4.1 の 1〜5 の各分岐。特に旧 installed を保持した `RequestNeeded` / `Preparing` / `Failed`、
+  `wanted_revision > accepted_revision` で件数なし・無効になること。トップメニューと右クリックが同じ結果を出すこと。
+- 成功の適用: 表示から隠れた削除対象を含めて外したとき、残る checked / cursor が保たれ、兄弟 context に
+  触らないこと。大量件数 (例: 1 万件) でも線形であること (HashSet 化)。
+- 確認ダイアログのキー: Enter で外す、Escape で閉じる、IME 変換中の Enter とメニュー選択と同じフレームの
+  Enter では確定しない。
 - 右クリック: placeholder の単独メニューにだけ出る / チェックあり・実在項目・フルスクリーン・子では出ない。
 - 送信: 選ぶと `ConfirmRemove { kind: Missing }` に正しい entry_ids・sample_paths・stamp・revision が入る。
   確定で `remove_entries` に全件が渡り、元ファイルが残る。revision が古いと Conflict で何も消えない。
@@ -214,7 +262,7 @@ Missing の文言:
 
 ## 8. 修正量の見込み
 
-小〜中。`prepare.rs` (フィールド + ルート判定 + テスト)、`keymap.rs` (メニュー 1 項目)、`ui_main.rs` (メニュー描画)、
+小〜中。`prepare.rs` (フィールド + 祖先の判定 + テスト)、`keymap.rs` (メニュー 1 項目)、`ui_main.rs` (メニュー描画)、
 `context_menu_model.rs` + `ui_dialogs/context_menu.rs` (右クリック 1 項目)、`ui_dialogs/collections.rs`
-(確認ダイアログの種類)、テストのフィクスチャで `CollectionPreparedSnapshot` を直接組み立てている数か所。
+(確認ダイアログの種類とキー)、`app/collection_grid.rs` (受付 helper・成功適用の HashSet 化)、テストのフィクスチャで `CollectionPreparedSnapshot` を直接組み立てている数か所。
 永続データのスキーマは変えない (マイグレーション不要)。
