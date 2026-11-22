@@ -166,8 +166,14 @@ impl App {
         match pending.rx.try_recv() {
             Ok(Ok(outcome)) => {
                 self.clear_rename_dialog_state();
-                if outcome.aborted {
-                    self.show_feedback_toast("名前の変更をキャンセルしました".to_owned());
+                if let Some(notice) = outcome.operation.notice(true) {
+                    if outcome.operation.classification()
+                        == crate::shell_file_ops::ShellOperationClassification::Interrupted
+                    {
+                        self.show_feedback_toast(notice);
+                    } else {
+                        self.report_rename_worker_warning(&notice);
+                    }
                     return;
                 }
                 // Keep all post-rename cleanup unchanged: each path-keyed

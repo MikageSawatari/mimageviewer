@@ -9,6 +9,8 @@
 
 **改訂履歴**:
 
+- 2026-11-22: §1.858 A 実行後は中断状態を常時照会し、HRESULT・項目別ログと共通通知を保持する。自動再試行なし。
+
 - 2026-11-21: §1.844 (v5.6.0)。§1.836 のサブ PC 確認で、一覧の空白・ツリーの非行領域が「＋ コピー」のままだったため、受け側が拒否した decision はすべて明示の禁止画像 (`DROPIMAGE_NONE`) を書く。判定・effect・転送は変更しない。§12.3.1。
 - 2026-11-21: §1.836。`BHID_DataObject` の `SetData(DropDescription)` が E_NOTIMPL を返すことを実 Shell 回帰で再現したため、送出 wrapper が説明の値を所有する。転送と OLE effect は変更しない。契約と未検証範囲は §12.3.1。
 - 2026-11-20: §1.464 は [folder-tree-dnd-plan.md](folder-tree-dnd-plan.md) が正本。ROOT の受け取りを自前 OLE target へ置き換え、表示済み pass の形でツリー行を判定する。内部の移動・コピーは整理先と同じ Shell worker へ送り、外への送出効果は COPY のまま。generic Shell image と target の drop description を使い、独立した SetFlags・InitializeFrom*・custom IDropSource は追加しない。検証の実施状況は正本の実装記録を参照。
@@ -875,15 +877,20 @@ ROOT の HWND を得た最初のフレームで、winit が登録した受け取
   1. ファイル・フォルダ全件を `ShellTransferRequest` (`operation: Copy`) にする。
   2. `shell_file_ops::transfer_items_blocking` で `validate_transfer_request` → `run_transfer_items` を同期実行する。
      整理先の `transfer_items_async` もこの入口を使い、検証と実行を重複させない。
-  3. 結果を `CopyOutcome` に写して UI へ送る。成功は通知なし、中断は notice
-     「操作が中断されました。処理済みの項目は元に戻りません」、`Err(msg)` は
-     `CopyOutcome::all_failed(attempted, msg)` で全件失敗として扱う。
-     件別の成否を Shell から受け取らないため、中断時の処理済み件数は報告しない。
+  3. 結果を `CopyOutcome` に写して UI へ送る。Completed は通知なし、Interrupted / Failed は
+     [Shell 終端契約](folder-tree-dnd-plan.md#81-1858-a-shell-転送名前変更の終端契約) の共通 notice。
+     中断は処理済みありなら「操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください」、
+     なしなら「操作が中断されました。移動・コピーした項目はありません」。Failed はフォルダの確認を促し、
+     元の HRESULT と中断照会結果を次行へ出す。実行前の `Err(msg)` だけ従来どおり
+     `CopyOutcome::all_failed(attempted, msg)` で扱う。
+     実行後は成功・失敗にかかわらず中断状態を照会し、両結果を別々に保持する。
+     sink の処理済み／失敗／skip を全件集計、詳細は50件まで `shell_transfer:` へ記録する。
+     callback 件数を要求件数へ当てはめて成功数を推測せず、実行後の結果は notice にする。再試行しない。
 - UI 側の受け取り経路:
   - 完了は `App::drop_copy_pending: Vec<Receiver<CopyOutcome>>` に積まれ、
     `poll_file_drop_pending` が `pending_reload` を立てつつ:
     - `failed > 0` のとき「成功 K / 失敗 N (例: ...)」トーストを出す
-    - `notice = Some(_)` のとき (中断) その文面をトーストで出す
+    - `notice = Some(_)` のとき (実行後の中断・失敗) その文面をトーストで出す
     - それ以外 (`failed == 0 && notice == None`) は静かに reload のみ
 
 ### 11.3 送出との非干渉

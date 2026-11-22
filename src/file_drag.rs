@@ -362,9 +362,7 @@ pub(crate) fn copy_dropped_paths_blocking(
     match transfer(hwnd, request) {
         Ok(result) => CopyOutcome {
             attempted,
-            notice: result
-                .aborted
-                .then(|| "操作が中断されました。処理済みの項目は元に戻りません".to_string()),
+            notice: result.notice(false),
             ..CopyOutcome::default()
         },
         Err(message) => CopyOutcome::all_failed(attempted, message),
@@ -426,7 +424,7 @@ mod file_drop_worker_tests {
                 assert_eq!(request.operation, ShellTransferOperation::Copy);
                 assert_eq!(request.sources, paths);
                 assert_eq!(request.destination, destination);
-                Ok(ShellTransferOutcome { aborted: false })
+                Ok(ShellTransferOutcome::test_outcome(0, Ok(false), 0))
             },
         );
         assert_eq!(outcome.attempted, 2);
@@ -449,7 +447,7 @@ mod file_drop_worker_tests {
             |hwnd, request| {
                 assert_eq!(hwnd, None);
                 assert_eq!(request.sources, vec![folder]);
-                Ok(ShellTransferOutcome { aborted: false })
+                Ok(ShellTransferOutcome::test_outcome(0, Ok(false), 0))
             },
         );
         assert_eq!(outcome.attempted, 1);
@@ -463,15 +461,75 @@ mod file_drop_worker_tests {
             None,
             vec![PathBuf::from("file.txt"), PathBuf::from("folder")],
             PathBuf::from("destination"),
-            |_, _| Ok(ShellTransferOutcome { aborted: true }),
+            |_, _| Ok(ShellTransferOutcome::test_outcome(0, Ok(true), 0)),
         );
         assert_eq!(outcome.attempted, 2);
         assert_eq!(outcome.failed, 0);
         assert!(outcome.first_errors.is_empty());
         assert_eq!(
             outcome.notice.as_deref(),
-            Some("操作が中断されました。処理済みの項目は元に戻りません")
+            Some("操作が中断されました。移動・コピーした項目はありません")
         );
+    }
+
+    #[test]
+    fn dropped_paths_858_worker_uses_shared_interrupted_and_failed_notices() {
+        for (perform, abort, processed, expected) in [
+            (
+                0,
+                Ok(true),
+                0,
+                "操作が中断されました。移動・コピーした項目はありません",
+            ),
+            (
+                0,
+                Ok(true),
+                1,
+                "操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください",
+            ),
+            (
+                0x800704C7u32 as i32,
+                Ok(false),
+                0,
+                "操作が中断されました。移動・コピーした項目はありません",
+            ),
+            (
+                0x80070005u32 as i32,
+                Ok(false),
+                0,
+                "操作を完了できませんでした。フォルダの内容を確認してください\nShell: 0x80070005、中断状態: 中断なし",
+            ),
+            (
+                0x80070005u32 as i32,
+                Ok(false),
+                1,
+                "操作を完了できませんでした。フォルダの内容を確認してください。一部の項目は処理済みです\nShell: 0x80070005、中断状態: 中断なし",
+            ),
+            (
+                0,
+                Err(0x80004005u32 as i32),
+                0,
+                "操作を完了できませんでした。フォルダの内容を確認してください\nShell: 0x00000000、中断状態: 照会失敗 0x80004005",
+            ),
+        ] {
+            let outcome = copy_dropped_paths_blocking(
+                None,
+                vec!["file.txt".into(), "folder".into()],
+                "destination".into(),
+                |_, _| {
+                    Ok(ShellTransferOutcome::test_outcome(
+                        perform, abort, processed,
+                    ))
+                },
+            );
+            assert_eq!(outcome.attempted, 2);
+            assert_eq!(outcome.notice.as_deref(), Some(expected));
+            assert_eq!(
+                outcome.failed, 0,
+                "Shell callback counts include descendants, not requested-source failures"
+            );
+            assert!(outcome.first_errors.is_empty());
+        }
     }
 
     #[test]

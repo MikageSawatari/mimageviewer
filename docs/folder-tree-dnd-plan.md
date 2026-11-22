@@ -4,6 +4,8 @@
 要件の正本は [next-release-backlog.md §1.464・§1.821](next-release-backlog.md)。
 **状態: 設計 r5 (利用者から独立レビュー ACCEPT の報告あり)。A は `6f91f6058`。B は §14・§16 の判断を反映して実装。検証・引き渡しの記録は §15。コンパイル・テストは利用者指示により設計担当へ引き継ぐ。**
 
+- 2026-11-22: §1.858 A 中断状態の常時照会、元の HRESULT と項目別ログ、処理済み件数による通知を追加。
+
 要望の要旨 (5ch): >>444 ツリーへファイルをドロップできず、右クリックの貼り付けもできない。>>707 読み終えたファイルを
 `_mita` フォルダへ D&D したい (内部ドラッグで「＋」カーソルなのに何も起きない)。固定先へ送る「ファイル整理先」(v4.4.0 出荷)
 はこの要望の代替扱いにしない (backlog の記録)。
@@ -236,7 +238,7 @@ callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `Get
 - 直し方: `handle_external_file_drop` の受付 (検索結果・タグ表示中・ZIP/PDF 表示中・本棚配下の拒否、`admit_book_append_followup_mutation`) と
   `file-drop-validate` worker・`drop_copy_pending` の並行受信はそのまま。worker の中のコピーを、整理先と同じ検証 + `IFileOperation` Copy
   (`shell_file_ops` の同期関数を worker から呼ぶ。`operation: Copy`) に替える。同名の衝突・進捗・取消・エラーは Windows の画面。
-  結果は今の `CopyOutcome` に写す (中断 → 「操作が中断されました。処理済みの項目は元に戻りません」、失敗 → 全件失敗の通知)。
+  結果は `CopyOutcome` に写す (実行後の中断・失敗は §8.1 の共通 notice、実行前の `Err` は従来の全件失敗通知)。
   `copy_paths_into_folder` と PowerShell の経路は削除する。
 - **フォルダも受ける (Q5)**: `partition_dropped_paths` によるフォルダの skip と「フォルダのドロップは現在無効です」の通知をやめる。
   フォルダを自身や配下へコピーする組み合わせは `validate_transfer_request` が全体を拒否する (未使用の `dir_copy_would_recurse` は削除)。
@@ -248,6 +250,49 @@ callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `Get
 実装 A: `shell_file_ops::transfer_items_blocking` に検証と STA 転送を集約し、`transfer_items_async` も共有する。
 `handle_external_file_drop` の worker は `main_hwnd` と全パスを `file_drag::copy_dropped_paths_blocking` へ渡し、結果を `CopyOutcome` に写す。
 旧 PowerShell コピー・フォルダ skip・未使用の再帰判定を削除。既存の受付・並行受信・`pending_reload` は維持する。
+
+### 8.1 §1.858 A Shell 転送・名前変更の終端契約
+
+予約が全件成功したら `PerformOperations` を一回実行し、成功・失敗にかかわらず直後に `GetAnyOperationsAborted` を必ず呼ぶ。
+実行の元の HRESULT と、中断照会の `Result<bool, HRESULT>` は独立して保持する。照会失敗を false にせず、実行のエラーも上書きしない。
+検証・COM 構築・項目生成・予約の失敗は従来どおり `Err(String)` で実行しない。
+
+| 分類 | 条件 (上から優先) |
+| --- | --- |
+| Interrupted | 中断照会が `Ok(true)`、または実行 HRESULT が `0x80270000` / `0x800704C7` |
+| Completed | 実行が成功 HRESULT かつ中断照会が `Ok(false)` |
+| Failed | 上記以外 (中断照会失敗も含む) |
+
+Interrupted と別の実行失敗が同時にある場合、その HRESULT も表示する。中断の原因は利用者・Shell の画面・システムのいずれとも断定しない。
+名前変更の新旧パスの事後確認と移行は Completed の場合だけ行う。操作、予約の時機、検証、通常の
+`FOF_ALLOWUNDO | FOFX_ADDUNDORECORD` は維持し、自動再試行・rollback は追加しない。
+
+`MoveItem / CopyItem / RenameItem` に同じ操作の `IFileOperationProgressSink` を渡す。Advise の登録・解除状態を増やさず、
+`PostMoveItem / PostCopyItem / PostRenameItem` で操作種別、元の parsing name、先フォルダ、新名、HRESULT、作成後の parsing name を記録する。
+callback は失敗の HRESULT を受けても常に S_OK を返す。フォルダの子の callback も全件集計し、詳細は先頭50件と省略数に限定する。
+処理済みは `S_OK` と `COPYENGINE_S_ALREADY_DONE` のみ。ignore、merge、pending、dialog decision 等と未知の成功コードは skipped に数える。
+この件数は callback の件数であり、要求した source 件数とは限らない。まれな記録失敗はログで終え、回復機構は作らない。
+
+ログ形式 (`prefix` は `shell_transfer` / `shell_rename`、id はプロセス内共通の連番、文字列は Debug 表記):
+
+```text
+{prefix}: start id={id} requested={Copy|Move|Rename} resolved={Copy|Move|Rename} sources={count} destination={path:?}
+{prefix}: item id={id} kind={Copy|Move|Rename} source={Option<String>:?} destination={Option<String>:?} new_name={Option<String>:?} hr=0x{HRESULT:08X} created={Option<String>:?}
+{prefix}: item id={id} ... and {omitted} more
+{prefix}: end id={id} classification={Completed|Interrupted|Failed} perform=0x{HRESULT:08X} abort={Ok(true)|Ok(false)|Err(0xHHHHHHHH)} processed={count} failed={count} skipped={count}
+```
+
+開始行は全件予約後、実行直前に出す。requested は volume check 前、resolved は後の操作。名前変更は両方 Rename、先は元の親。
+詳細と終端は中断照会後に出す。UI は以下の短い共通通知を使う (Completed は通知なし)。
+
+- Interrupted、処理済みあり: 「操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください」
+- Interrupted、処理済みなし: 「操作が中断されました。移動・コピーした項目はありません」(名前変更: 「名前の変更は中断されました」)
+- Failed: 「操作を完了できませんでした。フォルダの内容を確認してください」。処理済みありなら同じ行に「一部の項目は処理済みです」を続ける。
+  次行は `Shell: 0xHHHHHHHH、中断状態: 中断あり / 中断なし / 照会失敗 0xHHHHHHHH`。
+  Interrupted でも非 cancel の実行失敗または照会失敗があれば、この理由行を併記する。
+
+整理先・ツリーは全結果で従来の tree observe + 現在実フォルダの再確認、外部から一覧へのコピーは全結果で従来の `pending_reload` を維持する。
+実行後の結果を「全要求が成功／失敗」と推測して `CopyOutcome` の要求件数へ当てはめず、共通 notice で知らせる。
 
 ## 9. 長い処理・取り消し・衝突・完了後の更新
 
