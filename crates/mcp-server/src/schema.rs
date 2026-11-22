@@ -4,7 +4,7 @@ use mimageviewer_agent_ipc::{
 };
 use serde_json::{Value, json};
 
-const TOOL_NAMES: [&str; 22] = [
+const TOOL_NAMES: [&str; 23] = [
     "miv_status",
     "search_items",
     "list_tags",
@@ -27,6 +27,7 @@ const TOOL_NAMES: [&str; 22] = [
     "set_rating",
     "search_help",
     "get_help",
+    "get_view_state",
 ];
 fn metadata_write(name: &str) -> bool {
     matches!(name, "add_tags" | "remove_tags" | "set_rating")
@@ -309,6 +310,7 @@ fn replace_schema(value: &mut Value, repeated: &Value, reference: &Value) {
 }
 fn output(name: &str) -> Value {
     match name {
+        "get_view_state" => json!({"required":["view","folder","fullscreen","item","search"]}),
         // Help has several success shapes. Keep the common version contract in
         // discovery; typed retrieval tests check the full payload shapes.
         "search_help" | "get_help" => json!({"required":["app_version"]}),
@@ -333,7 +335,7 @@ fn output(name: &str) -> Value {
             &["status", "message"],
         ),
         "miv_status" => object(
-            json!({"app_version":string(),"permission":object(json!({"level":{"enum":["disabled","read_only","read_and_open","organize"]},"thumbnails":{"type":"boolean"},"gps":{"type":"boolean"},"ai_captions":{"type":"boolean"},"transcripts":{"type":"boolean"}}),&["level","thumbnails","gps","ai_captions","transcripts"]),"fts_ready":{"type":"boolean"},"remote_active":{"type":"boolean"},"search_scope":{"type":"array","maxItems":100,"items":string()},"search_scope_truncated":{"type":"boolean"}}),
+            json!({"app_version":string(),"permission":object(json!({"level":{"enum":["disabled","read_only","read_and_open","organize"]},"thumbnails":{"type":"boolean"},"gps":{"type":"boolean"},"ai_captions":{"type":"boolean"},"transcripts":{"type":"boolean"},"current_view":{"type":"boolean"},"settings":{"type":"boolean"}}),&["level","thumbnails","gps","ai_captions","transcripts","current_view","settings"]),"fts_ready":{"type":"boolean"},"remote_active":{"type":"boolean"},"search_scope":{"type":"array","maxItems":100,"items":string()},"search_scope_truncated":{"type":"boolean"}}),
             &[
                 "app_version",
                 "permission",
@@ -375,7 +377,7 @@ fn output(name: &str) -> Value {
         "list_library" => page(
             "items",
             object(
-                json!({"path":string(),"subresource":nullable_string(),"name":string(),"kind":kind(),"id":nullable_string(),"page":nullable(json!({"type":"integer","minimum":0,"maximum":4294967295_u64})),"added_at":nullable(integer()),"last_read_at":nullable(integer()),"rated_at":nullable(integer()),"rating":{"type":["integer","null"],"minimum":0,"maximum":5}}),
+                json!({"path":string(),"subresource":nullable_string(),"name":string(),"kind":kind(),"id":nullable_string(),"page":nullable(json!({"type":"integer","minimum":0,"maximum":4294967295_u64})),"added_at":nullable(integer()),"last_read_at":nullable(integer()),"rated_at":nullable(integer()),"item_index":{"type":"boolean"},"container_index":{"type":"boolean"},"rating":{"type":["integer","null"],"minimum":0,"maximum":5}}),
                 &[
                     "path",
                     "subresource",
@@ -477,6 +479,7 @@ fn output(name: &str) -> Value {
 pub fn tools() -> Vec<Value> {
     TOOL_NAMES.into_iter().map(|name| {
         let description=match name {
+            "get_view_state"=>"Read mImageViewer (mIV) main/F12 state; during switches the target item may differ from the display.",
             "search_help"=>"Search mImageViewer (mIV) help offline.",
             "get_help"=>"Read mImageViewer (mIV) help offline.",
             "miv_status"=>"Read mImageViewer (mIV) version, AI permissions, index readiness, search_scope paths (favorites with item indexing enabled; search_scope_truncated means more exist) and Remote activity.",
@@ -503,6 +506,8 @@ pub fn tools() -> Vec<Value> {
         };
         let required = if matches!(name, "search_help" | "get_help") {
             ""
+        } else if name == "get_view_state" {
+            "Needs mIV Read + current-view sharing."
         } else if write(name) {
             "Needs mIV Organize."
         } else if name == "open_in_viewer" {
@@ -560,7 +565,7 @@ mod tests {
 
     #[test]
     fn stage1_draft_tool_definitions_fit_discovery_budget() {
-        // Planning data only: these five tools are not registered or callable.
+        // Planning data only: these four tools are not registered or callable.
         // Broad success objects avoid inventing payload field names where the
         // design specifies values but not their enclosing JSON keys.
         let drafts: Vec<Value> =
@@ -571,7 +576,6 @@ mod tests {
                 .map(|t| t["name"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             [
-                "get_view_state",
                 "get_settings",
                 "set_settings",
                 "stack_script",
@@ -579,11 +583,16 @@ mod tests {
             ]
         );
         let mut planned = tools();
-        assert_eq!(planned.len(), 22);
+        assert_eq!(planned.len(), 23);
         let mut added_chars = 0;
         for tool in planned
             .iter()
-            .filter(|t| matches!(t["name"].as_str(), Some("search_help" | "get_help")))
+            .filter(|t| {
+                matches!(
+                    t["name"].as_str(),
+                    Some("search_help" | "get_help" | "get_view_state")
+                )
+            })
             .chain(drafts.iter())
         {
             let chars = serde_json::to_string(tool).unwrap().chars().count();
@@ -794,7 +803,7 @@ mod tests {
     #[test]
     fn tools_have_precise_annotation_contracts() {
         let tools = tools();
-        assert_eq!(tools.len(), 22);
+        assert_eq!(tools.len(), 23);
         for tool in &tools {
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
             assert_eq!(tool["outputSchema"]["type"], "object");

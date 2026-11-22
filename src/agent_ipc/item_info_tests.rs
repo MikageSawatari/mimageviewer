@@ -3,6 +3,9 @@ use std::io::Write;
 
 fn permission(gps: bool) -> PermissionSnapshot {
     PermissionSnapshot {
+        current_view: false,
+        settings: false,
+
         level: AgentLevel::ReadOnly,
         thumbnails: false,
         gps,

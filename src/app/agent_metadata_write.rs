@@ -233,7 +233,9 @@ impl App {
                     outcomes: grouped(&states),
                 })
             }
-            UiRequestKind::Open(_) => unreachable!("open uses the existing activation resolver"),
+            UiRequestKind::Open(_) | UiRequestKind::GetViewState { .. } => {
+                unreachable!("non-write requests have their own UI handler")
+            }
         };
         UiOpenOutcome::Written(Ok(result))
     }

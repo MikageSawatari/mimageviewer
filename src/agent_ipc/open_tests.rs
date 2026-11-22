@@ -36,7 +36,7 @@ fn only_open_activates_and_every_ui_request_wakes_without_desktop_input() {
     }
 }
 
-fn prepared_ui_requests() -> [UiRequestKind; 4] {
+fn prepared_ui_requests() -> [UiRequestKind; 5] {
     use super::super::metadata_write::{PreparedRatings, PreparedTags};
     [
         UiRequestKind::Open(ActivationOpenPath::received("C:\\fixture.jpg".into(), None)),
@@ -57,6 +57,9 @@ fn prepared_ui_requests() -> [UiRequestKind; 4] {
             stars: 3,
             client_name: "fixture".into(),
         }),
+        UiRequestKind::GetViewState {
+            default_books_root: "C:/books".into(),
+        },
     ]
 }
 

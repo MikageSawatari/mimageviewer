@@ -856,6 +856,10 @@ fn parse_tool(params: &Value) -> Result<(&'static str, Command), &'static str> {
             let _: EmptyArgs = serde_json::from_value(args).map_err(bad)?;
             ("miv_status", Command::Status)
         }
+        Some("get_view_state") => {
+            let _: EmptyArgs = serde_json::from_value(args).map_err(bad)?;
+            ("get_view_state", Command::GetViewState)
+        }
         Some("open_in_viewer") => {
             let a: OpenArgs = serde_json::from_value(args).map_err(bad)?;
             if a.path.is_empty() {
@@ -1154,6 +1158,7 @@ fn tool_result_with_side(
     let expected = matches!(
         (name, &result),
         ("miv_status", Ok(Payload::Status(_)))
+            | ("get_view_state", Ok(Payload::ViewState(_)))
             | (
                 "search_items" | "items_by_tag" | "get_collection",
                 Ok(Payload::Items(_))
@@ -1193,6 +1198,7 @@ fn tool_result_with_side(
         Ok(payload) if expected => (
             match payload {
                 Payload::Status(v) => json!(v),
+                Payload::ViewState(v) => json!(v),
                 Payload::Items(v) => json!(v),
                 Payload::Tags(v) => json!(v),
                 Payload::Collections(v) => json!(v),

@@ -187,6 +187,13 @@ impl App {
                 continue;
             }
             match &request.kind {
+                crate::agent_ipc::open::UiRequestKind::GetViewState { default_books_root } => {
+                    let outcome = match self.agent_view_state(default_books_root) {
+                        Ok(state) => crate::agent_ipc::open::UiOpenOutcome::Read(state),
+                        Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                    };
+                    request.complete(outcome);
+                }
                 crate::agent_ipc::open::UiRequestKind::TagWrite(_)
                 | crate::agent_ipc::open::UiRequestKind::RatingWrite(_) => {
                     let outcome = self.admit_agent_metadata_write(&request.kind);

@@ -15,6 +15,8 @@ struct PermissionSelection {
     gps: bool,
     ai_captions: bool,
     transcripts: bool,
+    current_view: bool,
+    settings: bool,
 }
 
 impl From<&Settings> for PermissionSelection {
@@ -25,6 +27,8 @@ impl From<&Settings> for PermissionSelection {
             gps: s.agent_show_gps,
             ai_captions: s.agent_show_ai_captions,
             transcripts: s.agent_show_transcripts,
+            current_view: s.agent_show_current_view,
+            settings: s.agent_allow_settings,
         }
     }
 }
@@ -669,6 +673,8 @@ impl App {
         candidate.agent_show_gps = permission.gps;
         candidate.agent_show_ai_captions = permission.ai_captions;
         candidate.agent_show_transcripts = permission.transcripts;
+        candidate.agent_show_current_view = permission.current_view;
+        candidate.agent_allow_settings = permission.settings;
         if candidate.save_checked() {
             self.settings = candidate;
         } else {
@@ -946,6 +952,9 @@ pub fn draw_agent_registration_snapshot_fixture(ui: &mut egui::Ui) {
 /// No environment capture, filesystem access, process enumeration, or workers.
 pub fn draw_agent_integration_snapshot_fixture(ui: &mut egui::Ui, level: u8) {
     let mut settings = PermissionSelection {
+        current_view: false,
+        settings: false,
+
         level: AgentLevel::Disabled,
         thumbnails: false,
         gps: false,

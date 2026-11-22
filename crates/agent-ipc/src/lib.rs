@@ -28,7 +28,7 @@ pub use read_types::*;
 mod folder_types;
 pub use folder_types::*;
 
-pub const AGENT_PROTOCOL_VERSION: u32 = 5;
+pub const AGENT_PROTOCOL_VERSION: u32 = 6;
 pub const MIN_ADAPTER_PROTOCOL_VERSION: u32 = 3;
 /// Fixed pipe namespace identifier, unrelated to business IPC versions. Never change it.
 pub const AGENT_PIPE_NAMESPACE: &str = "mimageviewer-agent-v3";
@@ -138,6 +138,7 @@ pub enum Command {
         request_kind: RequestKind,
     },
     Status,
+    GetViewState,
     SearchItems {
         query: String,
         kind: Option<ItemKind>,
@@ -274,6 +275,7 @@ pub struct Response {
 pub enum Payload {
     Hello { version: u32 },
     Status(StatusPayload),
+    ViewState(ViewState),
     Items(ItemPage),
     Tags(TagPage),
     Collections(CollectionPage),
@@ -411,6 +413,56 @@ pub struct PermissionSnapshot {
     pub ai_captions: bool,
     #[serde(default)]
     pub transcripts: bool,
+    #[serde(default)]
+    pub current_view: bool,
+    #[serde(default)]
+    pub settings: bool,
+}
+
+/// Snapshot of the logical target in the main viewer context, not render state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ViewState {
+    pub view: ViewKind,
+    pub folder: Option<String>,
+    pub fullscreen: bool,
+    pub item: Option<ViewItem>,
+    pub search: ViewSearch,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewKind {
+    Folder,
+    SearchResults,
+    Tag,
+    ReadingHistory,
+    Bookmark,
+    Rating,
+    SmartFolder,
+    SubfolderExpansion,
+    DriveList,
+    Other,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ViewItem {
+    pub path: String,
+    pub subresource: Option<String>,
+    pub name: String,
+    pub kind: ItemKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ViewSearch {
+    pub item_index: bool,
+    pub favorite: Option<ViewFavorite>,
+    pub favorite_root: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ViewFavorite {
+    pub path: String,
+    pub name: String,
 }
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -776,7 +828,7 @@ mod tests {
             incomplete["command"].as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<Request>(incomplete).is_err());
         }
-        assert_eq!(AGENT_PROTOCOL_VERSION, 5);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 6);
     }
 
     #[test]
@@ -789,6 +841,7 @@ mod tests {
                 request_kind: RequestKind::Tool,
             },
             Command::Status,
+            Command::GetViewState,
             Command::ListTags {
                 choice: TagChoice::Pinned,
                 limit: Some(17),
@@ -887,6 +940,9 @@ mod tests {
         assert_eq!(
             PermissionSnapshot::default(),
             PermissionSnapshot {
+                current_view: false,
+                settings: false,
+
                 level: AgentLevel::Disabled,
                 thumbnails: false,
                 gps: false,
@@ -898,7 +954,7 @@ mod tests {
 
     #[test]
     fn collection_write_wire_roundtrips_grouped_input_positions() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 5);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 6);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -970,7 +1026,7 @@ mod tests {
             .unwrap(),
             permission
         );
-        assert_eq!(AGENT_PROTOCOL_VERSION, 5);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 6);
     }
 
     #[test]
@@ -1049,7 +1105,7 @@ mod tests {
 
     #[test]
     fn metadata_write_wire_roundtrips_and_full_batch_outcomes_fit_budget() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 5);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 6);
         let reference = ItemRef {
             path: "C:/本.zip".into(),
             subresource: Some("001.png".into()),
@@ -1126,7 +1182,7 @@ mod tests {
 
     #[test]
     fn open_wire_uses_typed_accepted_result_without_changing_protocol_version() {
-        assert_eq!(AGENT_PROTOCOL_VERSION, 5);
+        assert_eq!(AGENT_PROTOCOL_VERSION, 6);
         assert_eq!(
             serde_json::to_value(Command::OpenInViewer {
                 path: "C:/猫.png".into(),

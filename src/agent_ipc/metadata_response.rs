@@ -79,7 +79,9 @@ pub(super) fn respond(
     let (value, policy) = match value {
         Ok(open::UiOpenOutcome::Written(result)) => (result, ReplyPolicy::AcceptedOperation),
         Ok(open::UiOpenOutcome::Refused(error)) | Err(error) => (Err(error), ReplyPolicy::Rejected),
-        Ok(open::UiOpenOutcome::Admitted) => (Err(failed()), ReplyPolicy::Rejected),
+        Ok(open::UiOpenOutcome::Admitted | open::UiOpenOutcome::Read(_)) => {
+            (Err(failed()), ReplyPolicy::Rejected)
+        }
     };
     connection.record(client.as_ref(), tool, started, &value);
     let reply = Reply {

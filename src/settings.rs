@@ -6003,6 +6003,14 @@ pub struct Settings {
     #[serde(default)]
     pub agent_show_transcripts: bool,
 
+    /// AI アプリへ main context の現在地と閲覧対象を渡す。既定 OFF。
+    #[serde(default)]
+    pub agent_show_current_view: bool,
+
+    /// AI アプリに設定の確認と変更を許可する。既定 OFF。
+    #[serde(default)]
+    pub agent_allow_settings: bool,
+
     /// ラベル、ボタン、メニュー、ダイアログ、フルスクリーン HUD の文字コントラスト。
     #[serde(default)]
     pub text_contrast: TextContrast,
@@ -8467,6 +8475,8 @@ impl Default for Settings {
             agent_show_gps: false,
             agent_show_ai_captions: false,
             agent_show_transcripts: false,
+            agent_show_current_view: false,
+            agent_allow_settings: false,
             text_contrast: TextContrast::default(),
             notification_duration: NotificationDuration::default(),
             ui_scale_factor: default_ui_scale_factor(),

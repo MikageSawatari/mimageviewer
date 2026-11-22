@@ -294,6 +294,8 @@ mod immediate_agent_permission_tests {
             app.settings.agent_show_gps = true;
             app.settings.agent_show_ai_captions = true;
             app.settings.agent_show_transcripts = true;
+            app.settings.agent_show_current_view = true;
+            app.settings.agent_allow_settings = true;
             assert!(app.settings.save_checked());
             if apply {
                 app.apply_preferences_dialog(&egui::Context::default());
@@ -308,11 +310,38 @@ mod immediate_agent_permission_tests {
             assert!(app.settings.agent_show_thumbnails && app.settings.agent_show_gps);
             assert!(app.settings.agent_show_ai_captions);
             assert!(app.settings.agent_show_transcripts);
+            assert!(app.settings.agent_show_current_view && app.settings.agent_allow_settings);
             let (saved, _) =
                 crate::settings_db::with_db_result(|db| db.load_agent_permission()).unwrap();
             assert_eq!(saved.level, crate::settings::AgentLevel::Organize);
             assert!(saved.thumbnails && saved.gps && saved.ai_captions && saved.transcripts);
+            assert!(saved.current_view && saved.settings);
         }
+    }
+
+    #[test]
+    fn preferences_ok_does_not_revive_new_agent_permissions_from_stale_draft() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.agent_level = crate::settings::AgentLevel::ReadOnly;
+        app.settings.agent_show_current_view = true;
+        app.settings.agent_allow_settings = true;
+        assert!(app.settings.save_checked());
+        app.open_preferences_page(PreferencesPage::General);
+        app.ensure_preferences_state();
+        assert!(
+            app.pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .agent_allow_settings
+        );
+        app.settings.agent_show_current_view = false;
+        app.settings.agent_allow_settings = false;
+        assert!(app.settings.save_checked());
+        app.apply_preferences_dialog(&egui::Context::default());
+        assert!(!app.settings.agent_show_current_view && !app.settings.agent_allow_settings);
+        let loaded = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert!(!loaded.agent_show_current_view && !loaded.agent_allow_settings);
     }
 }
 
@@ -2506,6 +2535,8 @@ pub(crate) fn prepare_preferences_settings_for_commit(
     edited.agent_show_gps = live.agent_show_gps;
     edited.agent_show_ai_captions = live.agent_show_ai_captions;
     edited.agent_show_transcripts = live.agent_show_transcripts;
+    edited.agent_show_current_view = live.agent_show_current_view;
+    edited.agent_allow_settings = live.agent_allow_settings;
     edited.remote_service_enabled = live.remote_service_enabled;
     edited.route_preferences_view_state(standard_view_state, active_view_state);
 

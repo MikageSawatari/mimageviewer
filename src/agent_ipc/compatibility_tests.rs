@@ -3,8 +3,134 @@ use super::*;
 
 #[path = "../../crates/agent-ipc/tests/v3_wire/mod.rs"]
 mod v3_wire;
+#[path = "../../crates/agent-ipc/tests/v5_wire/mod.rs"]
+mod v5_wire;
 
 const V3_HELLO: &[u8] = include_bytes!("../../crates/agent-ipc/tests/v3_wire/hello.frame");
+const V5_HELLO: &[u8] = include_bytes!("../../crates/agent-ipc/tests/v5_wire/hello.frame");
+
+fn frozen_v5_call(
+    fixture: &Fixture,
+    connection: &Arc<Connection>,
+    id: u64,
+    command: v5_wire::Command,
+    tool: &str,
+) -> serde_json::Value {
+    let mut bytes = Vec::new();
+    v5_wire::write_frame(&mut bytes, &v5_wire::Request { id, command }).unwrap();
+    let current: Request = read_frame(&mut bytes.as_slice()).unwrap().unwrap();
+    let response = fixture.call(connection, current.id, current.command);
+    assert!(response.result.is_ok(), "{tool}: {:?}", response.result);
+    let mut encoded = Vec::new();
+    write_frame(&mut encoded, &response).unwrap();
+    let old: v5_wire::Response = v5_wire::read_frame(&mut encoded.as_slice())
+        .unwrap()
+        .unwrap();
+    let result = v5_wire::output::tool_result_with_side(tool, old.result, 1568);
+    assert_eq!(result["isError"], false, "{tool}: {result}");
+    let tools = v5_wire::schema::tools();
+    assert!(v5_wire::schema_check::accepts_schema(
+        &tools.iter().find(|t| t["name"] == tool).unwrap()["outputSchema"],
+        &result["structuredContent"]
+    ));
+    assert!(
+        v5_wire::mcp_content_chars(&result["structuredContent"]).unwrap()
+            <= v5_wire::MAX_PAGE_CHARS
+    );
+    result
+}
+
+#[test]
+fn frozen_v5_adapter_reaches_v6_handlers_and_drops_only_additive_fields() {
+    let fixture = Fixture::new();
+    let folder = fixture._dir.path().join("v5-folder");
+    std::fs::create_dir_all(folder.join("child")).unwrap();
+    let image = folder.join("large.png");
+    image::DynamicImage::new_rgb8(1700, 850)
+        .save(&image)
+        .unwrap();
+    crate::settings_db::with_db_result(|db| {
+        let mut settings = db.load_into_settings()?;
+        settings.agent_show_current_view = true;
+        settings.agent_allow_settings = true;
+        settings.agent_show_thumbnails = true;
+        let mut favorite =
+            crate::settings::FavoriteEntry::new("v5 favorite".into(), folder.clone());
+        favorite.auto_index_metadata = true;
+        favorite.auto_index_structure = true;
+        settings.favorites = vec![favorite];
+        db.save_full(&settings)
+    })
+    .unwrap();
+    let connection = Connection::new(fixture.handlers.clone());
+    assert_eq!(
+        handshake(&connection, V5_HELLO).result,
+        Ok(Payload::Hello { version: 5 })
+    );
+    let status = frozen_v5_call(
+        &fixture,
+        &connection,
+        2,
+        v5_wire::Command::Status,
+        "miv_status",
+    );
+    assert!(
+        status["structuredContent"]["permission"]
+            .get("current_view")
+            .is_none()
+    );
+    assert!(
+        status["structuredContent"]["permission"]
+            .get("settings")
+            .is_none()
+    );
+    assert_eq!(
+        status["structuredContent"]["search_scope"][0],
+        folder.to_string_lossy().as_ref()
+    );
+    let library = frozen_v5_call(
+        &fixture,
+        &connection,
+        3,
+        v5_wire::Command::ListLibrary {
+            kind: v5_wire::LibraryKind::Favorites,
+            stars: None,
+            max_stars: None,
+            limit: None,
+            cursor: None,
+        },
+        "list_library",
+    );
+    assert!(
+        library["structuredContent"]["items"][0]
+            .get("item_index")
+            .is_none()
+    );
+    assert!(
+        library["structuredContent"]["items"][0]
+            .get("container_index")
+            .is_none()
+    );
+    let thumbnails = frozen_v5_call(
+        &fixture,
+        &connection,
+        4,
+        v5_wire::Command::GetThumbnail {
+            items: vec![v5_wire::ItemRef {
+                path: image.to_string_lossy().into_owned(),
+                subresource: None,
+            }],
+            long_side: Some(1568),
+            cursor: None,
+        },
+        "get_thumbnail",
+    );
+    assert_eq!(
+        thumbnails["structuredContent"]["items"][0]["dimensions"]["width"],
+        1568
+    );
+    assert_eq!(thumbnails["content"][1]["type"], "image");
+}
 
 fn handshake(connection: &Arc<Connection>, frame: &[u8]) -> Response {
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -41,7 +167,10 @@ fn shipped_v3_hello_frame_negotiates_and_reaches_handler_with_connection_version
 
     let current = f.connection();
     assert!(f.call(&current, 2, Command::Status).result.is_ok());
-    assert_eq!(versions.recv_timeout(Duration::from_secs(10)).unwrap(), 5);
+    assert_eq!(
+        versions.recv_timeout(Duration::from_secs(10)).unwrap(),
+        AGENT_PROTOCOL_VERSION
+    );
     let v4 = Connection::new(f.handlers.clone());
     assert_eq!(
         handshake(
@@ -87,7 +216,7 @@ fn unsupported_hello_is_read_without_business_types_and_never_reaches_handler() 
         now: Arc::new(Instant::now),
         execute: Box::new(|_, _| panic!("unnegotiated request reached business handler")),
     }));
-    for version in [0, 2, 6, u32::MAX] {
+    for version in [0, 2, AGENT_PROTOCOL_VERSION + 1, u32::MAX] {
         let c = Connection::new(f.handlers.clone());
         // These fields cannot deserialize as today's Request. Only the fixed
         // envelope is meaningful until the adapter version has been accepted.
@@ -99,7 +228,12 @@ fn unsupported_hello_is_read_without_business_types_and_never_reaches_handler() 
             })),
         );
         assert_eq!(response.id, 77);
-        assert_eq!(response.result, Ok(Payload::Hello { version: 5 }));
+        assert_eq!(
+            response.result,
+            Ok(Payload::Hello {
+                version: AGENT_PROTOCOL_VERSION
+            })
+        );
         for command in [
             Command::Status,
             Command::Cancel { request_id: 2 },
@@ -125,7 +259,7 @@ fn unsupported_hello_is_read_without_business_types_and_never_reaches_handler() 
                 &c,
                 3,
                 Command::Hello {
-                    version: 5,
+                    version: AGENT_PROTOCOL_VERSION,
                     client_name: "test".into(),
                     client_version: "1".into(),
                     request_kind: RequestKind::Tool,

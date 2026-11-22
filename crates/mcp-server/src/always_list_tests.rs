@@ -45,7 +45,7 @@ fn every_permission_combination_has_identical_full_discovery_without_core_querie
         }
     }
     let expected = json!(schema::tools());
-    assert_eq!(expected.as_array().unwrap().len(), 22);
+    assert_eq!(expected.as_array().unwrap().len(), 23);
     for version in VERSIONS {
         let backend = Arc::new(BackendState(
             Mutex::new(PermissionSnapshot::default()),
@@ -59,8 +59,11 @@ fn every_permission_combination_has_identical_full_discovery_without_core_querie
             AgentLevel::ReadAndOpen,
             AgentLevel::Organize,
         ] {
-            for bits in 0..16 {
+            for bits in 0..64 {
                 *backend.0.lock().unwrap() = PermissionSnapshot {
+                    current_view: bits & 16 != 0,
+                    settings: bits & 32 != 0,
+
                     level,
                     thumbnails: bits & 1 != 0,
                     gps: bits & 2 != 0,
@@ -192,6 +195,7 @@ fn each_tool_description_names_its_miv_permission() {
         let description = tool["description"].as_str().unwrap();
         let prefix = match name {
             "search_help" | "get_help" => "help offline.",
+            "get_view_state" => "Needs mIV Read + current-view sharing.",
             "get_transcript" => "Needs mIV Read + transcript sharing.",
             "get_thumbnail" => "Needs mIV Read + thumbnail sharing.",
             "open_in_viewer" => "Needs mIV Read and Open.",

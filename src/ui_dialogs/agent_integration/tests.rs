@@ -50,6 +50,9 @@ fn exposure_descriptions_are_left_aligned_without_justification_and_still_wrap()
             crate::ui_fonts::configure_fonts(&ctx);
             crate::os_theme::apply_resolved(&ctx, theme);
             let settings = PermissionSelection {
+                current_view: false,
+                settings: false,
+
                 level: AgentLevel::Organize,
                 thumbnails: true,
                 gps: true,
@@ -160,6 +163,9 @@ fn caption_and_transcript_descriptions_are_indented_wrapping_paragraphs() {
             draw_images(
                 ui,
                 &mut PermissionSelection {
+                    current_view: false,
+                    settings: false,
+
                     level: AgentLevel::ReadOnly,
                     thumbnails: false,
                     gps: false,
@@ -290,6 +296,9 @@ fn agent_exposure_all_sixty_four_permission_combinations() {
                 for ai_captions in [false, true] {
                     for transcripts in [false, true] {
                         let result = exposure(PermissionSelection {
+                            current_view: false,
+                            settings: false,
+
                             level,
                             thumbnails,
                             gps,
@@ -2240,6 +2249,9 @@ fn agent_integration_immediate_permissions_commit_snapshot_and_epoch() {
     let mut previous = read();
     for selection in [
         PermissionSelection {
+            current_view: false,
+            settings: false,
+
             level: AgentLevel::Organize,
             thumbnails: false,
             gps: false,
@@ -2247,6 +2259,9 @@ fn agent_integration_immediate_permissions_commit_snapshot_and_epoch() {
             transcripts: false,
         },
         PermissionSelection {
+            current_view: false,
+            settings: false,
+
             level: AgentLevel::Organize,
             thumbnails: true,
             gps: false,
@@ -2254,6 +2269,9 @@ fn agent_integration_immediate_permissions_commit_snapshot_and_epoch() {
             transcripts: false,
         },
         PermissionSelection {
+            current_view: false,
+            settings: false,
+
             level: AgentLevel::Organize,
             thumbnails: true,
             gps: true,
@@ -2261,6 +2279,9 @@ fn agent_integration_immediate_permissions_commit_snapshot_and_epoch() {
             transcripts: false,
         },
         PermissionSelection {
+            current_view: false,
+            settings: false,
+
             level: AgentLevel::Organize,
             thumbnails: true,
             gps: true,
@@ -2268,6 +2289,9 @@ fn agent_integration_immediate_permissions_commit_snapshot_and_epoch() {
             transcripts: false,
         },
         PermissionSelection {
+            current_view: false,
+            settings: false,
+
             level: AgentLevel::Organize,
             thumbnails: true,
             gps: true,
@@ -2275,6 +2299,9 @@ fn agent_integration_immediate_permissions_commit_snapshot_and_epoch() {
             transcripts: true,
         },
         PermissionSelection {
+            current_view: false,
+            settings: false,
+
             level: AgentLevel::Organize,
             thumbnails: true,
             gps: true,
@@ -2282,6 +2309,9 @@ fn agent_integration_immediate_permissions_commit_snapshot_and_epoch() {
             transcripts: false,
         },
         PermissionSelection {
+            current_view: false,
+            settings: false,
+
             level: AgentLevel::ReadOnly,
             thumbnails: true,
             gps: true,
@@ -2299,6 +2329,33 @@ fn agent_integration_immediate_permissions_commit_snapshot_and_epoch() {
         assert_eq!(current.0.transcripts, selection.transcripts);
         assert_ne!(current.1, previous.1);
         previous = current;
+    }
+}
+
+#[test]
+fn agent_integration_guide_permissions_commit_and_survive_existing_control_edits() {
+    let mut app = crate::app::setup_app_for_test();
+    assert!(app.settings.save_checked());
+    let mut selection = PermissionSelection::from(&app.settings);
+    selection.level = AgentLevel::ReadOnly;
+    for (view, settings) in [(true, false), (true, true), (false, true), (false, false)] {
+        let before = crate::settings_db::with_db_result(|db| db.load_agent_permission()).unwrap();
+        selection.current_view = view;
+        selection.settings = settings;
+        app.commit_agent_permissions(selection);
+        assert_eq!(PermissionSelection::from(&app.settings), selection);
+        let saved = crate::settings_db::with_db_result(|db| db.load_agent_permission()).unwrap();
+        assert_eq!(saved.0.current_view, view);
+        assert_eq!(saved.0.settings, settings);
+        assert_ne!(saved.1, before.1);
+        let loaded = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert_eq!(loaded.agent_show_current_view, view);
+        assert_eq!(loaded.agent_allow_settings, settings);
+        selection = PermissionSelection::from(&app.settings);
+        selection.thumbnails = !selection.thumbnails;
+        app.commit_agent_permissions(selection);
+        assert_eq!(app.settings.agent_show_current_view, view);
+        assert_eq!(app.settings.agent_allow_settings, settings);
     }
 }
 
