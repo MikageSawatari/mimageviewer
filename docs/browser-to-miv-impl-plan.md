@@ -10,7 +10,8 @@
   - `HKCU\Software\Google\Chrome\NativeMessagingHosts\<host 名>` と `HKCU\Software\Microsoft\Edge\NativeMessagingHosts\<host 名>`。既定値が mIV の manifest (`{userappdata}\mimageviewer\browser-host\<host 名>.json`) を指すときだけ消す。
   - `{userappdata}\mimageviewer\browser-host\` のフォルダ。
   - 「ブラウザ閲覧」フォルダの画像と、ブラウザに入れた拡張は残す。保存先を `{userappdata}\mimageviewer` の下にした利用者が設定の削除を選んだ場合に画像が消えるのは、クリップボード取り込みの保存先と同じ扱いとし、特別な保護は足さない。
-  - インストーラは管理者権限で動く (`PrivilegesRequired=admin`)。別の管理者アカウントで昇格した場合に HKCU が利用者のものにならない場合は、まれな失敗として割り切る (残ったキーは存在しない manifest を指すだけで、拡張が「未登録」を示す)。
+  - **保存先と管理の場所を重ねない** (独立レビュー第 12 回 P1): 「ブラウザ閲覧」の保存先の基底は、`browser-host\` のフォルダ (とその下) にできない。環境設定で保存先を選ぶとき、登録・更新で host の設定を作るとき、中継 exe が保存するときの 3 か所で同じ判定 (共有部品の 1 つの関数) を使い、当たれば理由を示して断る。これで `browser-host\` を無条件に消しても画像は巻き込まない。回帰テストを足す (段階 1 の共有部品・段階 6・段階 7)。
+  - **自動で消せる範囲は、アンインストーラを実行したアカウントのものだけ** (独立レビュー第 12 回 P2): インストーラは管理者権限で動く (`PrivilegesRequired=admin`)。`HKCU` と `{userappdata}` は、どちらも実行したアカウントを指す (https://jrsoftware.org/inno-setup/documentation/topic_consts.htm#userappdata)。標準ユーザーが別の管理者の資格情報で昇格した場合、mIV を使っていたアカウントのキー・manifest・中継 exe・その設定は残る。残った中継 exe は、launcher が無いので「mIV が見つからない」を返し、拡張がそれを知らせる (§9.7 の既存の動き、ファイルは消えない)。この経路は通常の操作で起こり得るので、マニュアルとアンインストールの案内に「アンインストールの前に、mIV の環境設定でブラウザ連携を解除する」と書く。拡張の知らせの文言も「mIV が見つかりません。mIV を入れ直すか、連携を解除してください」とし、何を直せばよいかが分かる形にする。既存の設定の削除 (`DelTree`) も同じく実行したアカウントにだけ効く既存の動きで、変えない。
 - **Q4 (画像を包むリンク先が画像ファイルのとき)**: 計画案どおり、HTTP(S) の `linkUrl` が既存の HTML 取り込みと同じ画像拡張子の判定に当たるときは `linkUrl` を取得し、その origin も許可の要求に含める。失敗しても `srcUrl` で取り直さない (1 回の取得)。試作では確かめていないので、実装後の実機確認の項目にする。
 - **native host 名**: `to.mikage.mimageviewer`。コード・manifest・レジストリ・説明書で同じ名前を使う。
 - **公開鍵**: Chrome と Edge の公開鍵は、設計担当が段階 8 の指示で渡す (共有メモの `store-prep-818/` にある)。
@@ -359,7 +360,7 @@ F12 設定 OFF でも BrowserView の連動窓である間は、実 session・ru
 
 `sync_after_restore` は保持中のメディア面の復帰も行います。そのまま呼ぶと BrowserOverlay 以外の窓を前に出す余地があります。
 
-既存の復帰 owner に「通常の前面復帰／BrowserOverlay の可視性復帰」という型付き方針を渡し、BrowserOverlay では root の可視性・内部状態だけを復帰し、最終 focus を新しい窓に限定します。`window_visible` を直接反転するだけの処理や、別の復帰フラグは作りません。
+既存の復帰 owner に「通常の前面復帰／BrowserOverlay の復帰」という型付き方針を渡します。**可視性の復帰は方針によらず既存どおり全部行います** (root、保持中の viewport の復帰 [tray_integration.rs:389](../src/tray_integration.rs:389)、全 context の native presenter の可視性 [app.rs:67130](../src/app.rs:67130))。方針で変えるのは focus / raise だけで、BrowserOverlay では保持中の viewport を既存の `focus=false` の経路 ([tray_integration.rs:98](../src/tray_integration.rs:98)) で戻し、最終の focus を新しい窓に限定します。`window_visible` を直接反転するだけの処理や、別の復帰フラグは作りません (独立レビュー第 12 回 P2 で、root だけを戻す当初案から改めた)。
 
 **テスト**
 
@@ -593,7 +594,7 @@ portable・明示 `--data-dir`・launcher 不明の起動は、既存登録も�
 
 **製品仕様**
 
-MV3、ソースは一つ。権限は設計書の七つと任意 HTTP(S) host 権限だけにします。`downloads` と `declarativeNetRequestFeedback` は入れません。
+MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`contextMenus`・`nativeMessaging`・`storage`・`activeTab`・`scripting`・`declarativeNetRequestWithHostAccess`) と、任意の HTTP(S) host 権限だけにします。`downloads` と `declarativeNetRequestFeedback` は入れません。
 
 - 同じ worker 内の連続クリックを同期の受付 latch で防ぎ、要求を `storage.session` に保持。
 - `permissions.request` は user gesture 内、最初の await より前。
@@ -694,7 +695,7 @@ MV3、ソースは一つ。権限は設計書の七つと任意 HTTP(S) host 権
    現在の `sync_detached_viewer_to_selected` は設定 OFF で戻ります。初回要求の分岐だけでは連動を維持できません。runtime／session の linked 所有を使う範囲を段階4に含めます。
 
 3. **トレイ復帰は可視性だけの操作ではない**  
-   `sync_after_restore` に既存メディア面の復帰があります。BrowserOverlay の focus 方針を、復帰 owner に渡す必要があります。
+   `sync_after_restore` に既存メディア面の復帰があります。BrowserOverlay の focus 方針を、復帰 owner に渡す必要があります。可視性の復帰はそのまま全部行い、focus / raise だけを方針で分けます (段階 4)。
 
 4. **版照合には transport 応答が必要**  
    新 pipe を一方向の書き捨てにすると、launcher は版不一致を判断できません。版照合と channel 配送までの応答を設けます。App の受付結果は返しません。
@@ -737,4 +738,15 @@ Start-Process -FilePath .\target\release\mimageviewer.exe
 この起動は通常の `%APPDATA%\mimageviewer` を使い、実設定・データを更新し得ます。利用者にはインストール版・トレイ常駐版を先に終了してもらいます。エージェント自身は通常 profile の製品を起動せず、ブラウザ登録を伴う実機確認は、具体的なシナリオとデータ範囲を定めた別の検証工程へ引き渡します。
 ## 6. 独立レビューの記録
 
-(未実施)
+### 第 12 回 (2026-11-22、GPT-6.1 Sol / xhigh、read-only、設計書のレビューと同じ担当を継続、対象 `a1dc9b237`) — REVISE
+
+計画のコードの追跡 (通常の 2 重起動でも選択が戻る経路、連動窓の種の差し込み口と複数ウィンドウの 2 経路、Esc で runtime が先に消えること、core の起動競合の経路) は妥当とされた。段階の順序・コミットの単位も成立。§4 の補足 (materialized の経路、F12 OFF での連動の維持、transport の応答) は設計書の範囲内の具体化。§0 の Q4・host 名・受付の順序も妥当。
+
+凍結の決まりの構造的変更の合意: 段階 2 = 合意、段階 3 = 合意、段階 4 = 不合意 (トレイ復帰で root だけを戻す部分が、前面化を避けるために既存の可視性の復帰まで抑えている)、段階 5 = 合意。
+
+| # | 重大度 | 指摘 | 対応 |
+| --- | --- | --- | --- |
+| 1 | P1 | `browser-host` を無条件に消すと、そこを保存先にした画像を巻き込む | §0: 保存先の基底を `browser-host\` の下にできない不変条件を足し、3 か所で同じ判定を使う。回帰テストを段階 1・6・7 に |
+| 2 | P2 | トレイ復帰を root だけにすると、保持中の窓の可視性の復帰まで失う | 段階 4: 可視性の復帰は全部既存どおり行い、focus / raise だけを方針で分ける (保持中の viewport は既存の `focus=false` の経路) |
+| 3 | P2 | 別の管理者で昇格したときに残るものの説明が不正確 (HKCU も `{userappdata}` も実行アカウントを指す) | §0: 自動で消せるのは実行したアカウントのものだけと定義し、残るもの・拡張の知らせ・「アンインストールの前に解除する」案内を書いた |
+| 4 | P3 | 拡張の権限の数 (設計書は宣言 6 つ + 任意の host 権限) | 段階 8 を訂正 |
