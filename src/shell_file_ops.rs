@@ -94,6 +94,9 @@ impl ShellTransferOutcome {
             ShellOperationClassification::Interrupted if rename => {
                 "名前の変更は中断されました".to_owned()
             }
+            ShellOperationClassification::Interrupted if self.counts.merged > 0 => {
+                "操作が中断されました。フォルダの内容を確認してください".to_owned()
+            }
             ShellOperationClassification::Interrupted => {
                 "操作が中断されました。移動・コピーした項目はありません".to_owned()
             }
@@ -1374,6 +1377,31 @@ mod transfer_tests {
     }
 
     #[test]
+    fn shell_op_858_merged_interruption_notice_checks_folder() {
+        let failure = 0x80270027u32 as i32;
+        for rename in [false, true] {
+            for processed in [0, 1] {
+                let mut outcome = ShellTransferOutcome::test_outcome(0, Ok(true), processed);
+                outcome.counts.merged = 1;
+                let headline = if processed > 0 {
+                    "操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください"
+                } else if rename {
+                    "名前の変更は中断されました"
+                } else {
+                    "操作が中断されました。フォルダの内容を確認してください"
+                };
+                assert_eq!(outcome.notice(rename).as_deref(), Some(headline));
+                outcome.counts.failed = 1;
+                outcome.counts.first_failed_hresult = Some(failure);
+                assert_eq!(
+                    outcome.notice(rename).unwrap(),
+                    format!("{headline}\n失敗した項目: 1 件 (Shell: 0x80270027)")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn shell_op_858_merge_parent_then_child_cancel_has_no_processed_items() {
         for parent_hr in [COPYENGINE_NOT_HANDLED, COPYENGINE_MERGE] {
             for kind in ["Move", "Copy"] {
@@ -1412,7 +1440,7 @@ mod transfer_tests {
                     };
                     assert_eq!(
                         outcome.notice(false).as_deref(),
-                        Some("操作が中断されました。移動・コピーした項目はありません")
+                        Some("操作が中断されました。フォルダの内容を確認してください")
                     );
                 }
             }
@@ -2079,24 +2107,28 @@ mod transfer_tests {
         use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
         use windows::Win32::UI::Shell::{FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT};
 
-        for (case, operation, locked) in [
-            ("a-move", ShellTransferOperation::Move, false),
-            ("b-locked-move", ShellTransferOperation::Move, true),
-            ("c-copy", ShellTransferOperation::Copy, false),
+        for (case, operation, locked, empty) in [
+            ("a-move", ShellTransferOperation::Move, false, false),
+            ("b-locked-move", ShellTransferOperation::Move, true, false),
+            ("c-copy", ShellTransferOperation::Copy, false, false),
+            ("d-empty-move", ShellTransferOperation::Move, false, true),
         ] {
             let temp = tempfile::Builder::new()
                 .prefix("miv-shell-op-858-merge-")
                 .tempdir_in(std::env::temp_dir())
                 .unwrap();
-            let source_folder = temp.path().join("src/m");
+            let folder_name = if empty { "e" } else { "m" };
+            let source_folder = temp.path().join("src").join(folder_name);
             let destination = temp.path().join("dst");
-            let destination_folder = destination.join("m");
+            let destination_folder = destination.join(folder_name);
             std::fs::create_dir_all(&source_folder).unwrap();
             std::fs::create_dir_all(&destination_folder).unwrap();
             let source_file = source_folder.join("a.txt");
             let destination_file = destination_folder.join("a.txt");
             let existing_file = destination_folder.join("b.txt");
-            std::fs::write(&source_file, b"a contents").unwrap();
+            if !empty {
+                std::fs::write(&source_file, b"a contents").unwrap();
+            }
             std::fs::write(&existing_file, b"b contents").unwrap();
             let held = locked.then(|| {
                 std::fs::OpenOptions::new()
@@ -2145,7 +2177,21 @@ mod transfer_tests {
                 b"b contents",
                 "{case}"
             );
-            if locked {
+            if empty {
+                let source_exists = source_folder.try_exists().unwrap();
+                eprintln!(
+                    "shell_op_858_merge: case={case} source_folder_state={}",
+                    if source_exists {
+                        "still_exists"
+                    } else {
+                        "removed"
+                    }
+                );
+                if source_exists {
+                    assert!(source_folder.is_dir(), "{case}");
+                }
+                assert_eq!(outcome.counts.failed, 0, "{case}: {outcome:?}");
+            } else if locked {
                 assert_eq!(
                     std::fs::read(&source_file).unwrap(),
                     b"a contents",
