@@ -2377,7 +2377,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 506);
+        assert_eq!(entries.len(), 508);
         assert_eq!(
             entries
                 .iter()
@@ -2390,7 +2390,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            339
+            341
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2419,6 +2419,18 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
+        for key in ["agent_show_current_view", "agent_allow_settings"] {
+            assert!(
+                entries
+                    .iter()
+                    .any(|(field, reason)| *field == key && reason.is_some()),
+                "AI permissions must remain excluded: {key}"
+            );
+            assert!(
+                !wire.contains(&key),
+                "AI permissions must not become writable: {key}"
+            );
+        }
         assert_eq!(wire.len(), 165);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();

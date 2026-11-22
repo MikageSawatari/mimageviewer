@@ -6,6 +6,9 @@ use crate::app::tests::phase_c_support::{AppTestEnv, setup_app};
 fn fixture() -> AppTestEnv {
     let mut app = setup_app();
     app.initialized = true;
+    // Match the existing agent-write fixtures: startup is terminal without
+    // starting background indexers, so the startup overlay is inactive.
+    app.indexer_init = IndexerInit::Unavailable;
     app.settings.agent_level = AgentLevel::ReadOnly;
     app.settings.agent_show_current_view = true;
     app.settings.book_root = Some(app.tmp.path().join("books"));
@@ -220,14 +223,21 @@ fn agent_view_state_queued_read_rechecks_live_permission_without_activation() {
 #[test]
 fn agent_view_state_refuses_startup_and_keeps_absent_targets_explicit() {
     let mut app = fixture();
-    app.initialized = false;
-    assert_eq!(
-        app.agent_view_state(Path::new("C:/books"))
-            .unwrap_err()
-            .code,
-        ErrorCode::NotReady
-    );
+    for (initialized, indexer_init) in [
+        (false, IndexerInit::Unavailable),
+        (true, IndexerInit::NotStarted),
+    ] {
+        app.initialized = initialized;
+        app.indexer_init = indexer_init;
+        assert_eq!(
+            app.agent_view_state(Path::new("C:/books"))
+                .unwrap_err()
+                .code,
+            ErrorCode::NotReady
+        );
+    }
     app.initialized = true;
+    app.indexer_init = IndexerInit::Unavailable;
     app.current_folder = None;
     app.items.clear();
     app.selected = None;
