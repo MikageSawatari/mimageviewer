@@ -12,6 +12,12 @@ pub(crate) enum ViewerOpenIntent {
     },
 }
 
+impl ViewerOpenIntent {
+    pub(crate) fn is_browser_overlay(self) -> bool {
+        matches!(self, Self::BrowserOverlay { .. })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ViewerOpenRequest {
     id: u64,

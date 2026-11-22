@@ -571,6 +571,8 @@ pub(crate) mod book_resume_meter;
 mod book_resume_meter_tests;
 #[cfg(all(test, windows))]
 mod browser818_close_tests;
+#[cfg(windows)]
+mod browser_presentation;
 mod cache_ops;
 mod color_filter;
 mod content_identity_detection;
@@ -581,6 +583,10 @@ mod detached_activation;
 pub(crate) mod detached_activation_gesture;
 #[cfg(windows)]
 mod detached_close;
+#[cfg(windows)]
+use browser_presentation::DetachedWindowSeed;
+#[cfg(all(test, windows))]
+mod browser818_presentation_tests;
 #[cfg(windows)]
 mod detached_page_overview;
 #[cfg(windows)]
@@ -747,7 +753,9 @@ mod pinned_search;
 pub(crate) mod root_lifecycle;
 mod search_request;
 mod startup_ops;
-pub(crate) use external_open::{ExplicitOpenPath, ViewerOpenAdoption, ViewerOpenRequest};
+pub(crate) use external_open::{
+    ExplicitOpenPath, ViewerOpenAdoption, ViewerOpenIntent, ViewerOpenRequest,
+};
 mod subfolder_expansion;
 mod update_phases;
 pub(crate) use close_return::{
@@ -65891,6 +65899,11 @@ impl App {
 
     #[cfg(windows)]
     fn ensure_detached_viewer_window_id(&mut self) -> u64 {
+        self.ensure_detached_viewer_window_id_with_seed(DetachedWindowSeed::normal(None))
+    }
+
+    #[cfg(windows)]
+    fn ensure_detached_viewer_window_id_with_seed(&mut self, seed: DetachedWindowSeed) -> u64 {
         // The registry owns both the private build reservation and the published binding.
         // Content reload/close and context swaps cannot erase or replace this identity.
         if let Some(id) = self.detached_viewer_window_id() {
@@ -65905,6 +65918,7 @@ impl App {
             self.ensure_mounted_detached_session_binding(id);
         }
         self.last_active_detached_window_id = Some(id);
+        self.install_detached_window_seed(id, !self.detached_viewer_independent_active, seed);
         self.transition_detached_window_state(
             id,
             DetachedWindowState::Opening,
@@ -68351,6 +68365,24 @@ impl App {
         address: PathBuf,
         initialize: impl FnOnce(&mut Self, u64) -> DetachedLoadingContextInit,
     ) -> Option<u64> {
+        self.start_active_detached_loading_context_with_seed(
+            ctx,
+            DetachedWindowSeed::normal(placement_seed),
+            source,
+            address,
+            initialize,
+        )
+    }
+
+    #[cfg(windows)]
+    fn start_active_detached_loading_context_with_seed(
+        &mut self,
+        ctx: &egui::Context,
+        seed: DetachedWindowSeed,
+        source: DetachedSource,
+        address: PathBuf,
+        initialize: impl FnOnce(&mut Self, u64) -> DetachedLoadingContextInit,
+    ) -> Option<u64> {
         let mut initialize = Some(initialize);
         let mut allocated_window_id = None;
         let built =
@@ -68368,16 +68400,15 @@ impl App {
                     true,
                     "detached_loading_binding",
                 );
+                app.install_detached_window_seed(window_id, false, seed);
                 app.update_detached_window_runtime_flags(
                     window_id,
                     false,
                     "detached_loading_binding",
                 );
                 app.last_active_detached_window_id = Some(window_id);
-                let seed = placement_seed.unwrap_or_else(|| app.detached_viewer_window_placement());
-                app.set_detached_window_runtime_placement(
+                app.ensure_detached_window_runtime_placement(
                     window_id,
-                    seed,
                     "start_active_detached_loading_context",
                 );
                 app.transition_detached_window_state(
@@ -70766,10 +70797,11 @@ impl App {
             || self.detached_viewer_folder_nav_reuse_window_once
             || !self.fs_open_intent_from_grid
             || !self.detached_still_open_is_independent(idx)
-            || !matches!(
-                self.effective_viewer_presentation_for_open(idx),
-                ViewerPresentation::DetachedWindow
-            )
+            || (!Self::browser_overlay_adoption(viewer_adoption)
+                && !matches!(
+                    self.effective_viewer_presentation_for_open(idx),
+                    ViewerPresentation::DetachedWindow
+                ))
         {
             return false;
         }
@@ -70790,7 +70822,11 @@ impl App {
         let requested_page = self
             .page_path_key(idx)
             .expect("admitted physical page has an identity");
-        let detached_id = self.fork_materialized_still_context(&physical_context, idx);
+        let detached_id = self.fork_materialized_still_context_with_seed(
+            &physical_context,
+            idx,
+            DetachedWindowSeed::for_adoption(viewer_adoption),
+        );
         self.log_detached_image_window_debug(format!(
             "materialized_physical_context_promoted idx={idx} main_items={} active_context=true",
             self.items.len()
@@ -71572,7 +71608,7 @@ impl App {
     #[cfg(windows)]
     fn requested_viewer_presentation_for_open(&self, idx: usize) -> ViewerPresentation {
         if self.viewer_session_is_detached()
-            && self.detached_viewer_independent_active
+            && (self.detached_viewer_independent_active || self.browser_linked_viewer_session())
             && self.viewer_item_supports_detached_still(idx)
         {
             ViewerPresentation::DetachedWindow
@@ -72267,7 +72303,9 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn sync_detached_viewer_to_selected(&mut self, ctx: &egui::Context) {
-        if !self.settings.detached_viewer_enabled || !self.viewer_session_is_detached() {
+        if (!self.settings.detached_viewer_enabled && !self.browser_linked_viewer_session())
+            || !self.viewer_session_is_detached()
+        {
             return;
         }
         if self.detached_viewer_independent_still_session() {
@@ -72746,17 +72784,30 @@ impl App {
         if entering_media {
             self.close_parked_live_media_windows_for_new_media("new_media_open");
         }
-        let presentation = self.resolve_viewer_presentation_for_open(idx, entering_media);
+        let browser_overlay = Self::browser_overlay_adoption(viewer_adoption)
+            && self.viewer_item_supports_detached_still(idx);
+        let presentation = if browser_overlay {
+            self.fs_media_open_forced_presentation = None;
+            ViewerPresentation::DetachedWindow
+        } else {
+            self.resolve_viewer_presentation_for_open(idx, entering_media)
+        };
         let detached_still = matches!(presentation, ViewerPresentation::DetachedWindow)
             && self.viewer_item_supports_detached_still(idx);
         let independent_detached_still = presentation == ViewerPresentation::DetachedWindow
-            && if self.detached_viewer_window_id().is_some() {
+            && if browser_overlay {
+                self.settings.detached_viewer_open_images_in_window
+            } else if self.detached_viewer_window_id().is_some() {
                 self.detached_viewer_independent_active
             } else {
                 self.new_detached_open_is_independent(idx)
             };
         let focus_detached_from_grid = matches!(presentation, ViewerPresentation::DetachedWindow)
-            && self.fs_open_intent_from_grid;
+            && (self.fs_open_intent_from_grid || browser_overlay);
+        if browser_overlay {
+            self.detached_viewer_no_activate_once = false;
+            self.clear_pending_main_foreground_reclaim();
+        }
         self.log_detached_image_window_debug(format!(
             "prepare_viewer_presentation_open_begin idx={idx} entering_video={entering_native_video} \
              item_kind={} resolved={presentation:?} detached_still={detached_still} \
@@ -72787,11 +72838,13 @@ impl App {
         );
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
-        if detached_still && !independent_detached_still {
+        if detached_still && !independent_detached_still && !browser_overlay {
             let _ = self.take_parked_fullfeature_linked_still_for_grid_open(idx, presentation);
         }
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
-            let id = self.ensure_detached_viewer_window_id();
+            let id = self.ensure_detached_viewer_window_id_with_seed(
+                DetachedWindowSeed::for_adoption(viewer_adoption),
+            );
             if self.viewer_context_residence(self.projected_viewer_context_id())
                 == ContextResidence::Building
             {
@@ -73376,13 +73429,25 @@ impl App {
                 return;
             }
         };
+        // Browser replacement closes the old reader, whose normal teardown restores
+        // its cursor. Finish that handoff before the new explicit request commits
+        // selection; there must be only one selection owner at publication.
+        #[cfg(windows)]
+        if viewer_adoption.is_main_new()
+            && Self::browser_overlay_adoption(viewer_adoption)
+            && !self.prepare_browser_overlay_open(&composition_ctx, idx)
+        {
+            return;
+        }
         if viewer_adoption.owns_file_selection() {
             self.move_grid_cursor(Some(idx), GridCursorIntent::Automatic);
             self.grid_scroll.set_reveal_requested(true);
         }
         #[cfg(windows)]
         if viewer_adoption.is_main_new() {
-            if !self.prepare_detached_context_for_grid_open(&composition_ctx, idx) {
+            if !Self::browser_overlay_adoption(viewer_adoption)
+                && !self.prepare_detached_context_for_grid_open(&composition_ctx, idx)
+            {
                 return;
             }
             self.fs_open_intent_from_grid = true;

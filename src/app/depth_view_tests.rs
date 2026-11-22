@@ -3,6 +3,48 @@ use super::*;
 use crate::depth_parallax::{DepthEntryBlock, DepthViewState};
 use crate::fs_exclusive_view::{ExclusiveViewKind, FsExclusiveView};
 
+#[cfg(windows)]
+mod gpu_tests {
+    use super::*;
+
+    #[test]
+    fn browser818_presentation_replacement_retires_old_depth_without_starting_new_depth_or_upscale()
+    {
+        for ready in [false, true] {
+            let ctx = egui::Context::default();
+            let mut app = setup_app_for_test();
+            install_pages(&mut app, &ctx);
+            let render = isolate_depth_renderer(&mut app);
+            app.settings.detached_viewer_open_images_in_window = false;
+            app.settings.detached_viewer_enabled = true;
+            app.viewer_presentation = ViewerPresentation::DetachedWindow;
+            app.begin_mounted_detached_session_for_test(818_410, DetachedSource::Image);
+            let own = tracked_depth(&mut app, ready);
+            let mut sibling_evidence = None;
+            let sibling = app.build_window_context_for_test(818_411, |owner| {
+                sibling_evidence = Some(tracked_depth(owner, !ready));
+            });
+            let sibling_evidence = sibling_evidence.unwrap();
+            let placement = app.default_detached_viewer_window_placement();
+            let adoption = ViewerOpenAdoption::requested(ViewerOpenRequest::new(
+                ViewerOpenIntent::BrowserOverlay { placement },
+            ));
+            app.open_fullscreen_with_adoption(2, HistoryTrigger::UserChosen, None, adoption);
+            assert!(app.browser_linked_viewer_session());
+            assert_ne!(app.detached_viewer_window_id(), Some(818_410));
+            assert!(matches!(app.fs_exclusive_view, FsExclusiveView::None));
+            app.sync_upscale_from_preset(2);
+            assert!(!app.ai_upscale_enabled);
+            assert!(app.ai_upscale_pending.is_empty());
+            assert_depth_retired_with_sibling_slot(&render, &own, &sibling_evidence);
+            app.with_viewer_context(sibling, |owner| {
+                assert_depth_owner_live(owner, &sibling_evidence)
+            })
+            .unwrap();
+        }
+    }
+}
+
 #[test]
 fn depth_wait_status_is_shared_with_panel_and_its_gate_never_owns_lifetime() {
     use crate::ai::runtime::AiRuntimeInitSnapshot;

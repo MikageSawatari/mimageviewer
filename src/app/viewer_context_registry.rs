@@ -6260,6 +6260,29 @@ impl App {
         )
     }
 
+    pub(in crate::app) fn fork_materialized_still_context_with_seed(
+        &mut self,
+        physical_context: &Path,
+        idx: usize,
+        seed: super::DetachedWindowSeed,
+    ) -> ViewerContextId {
+        let id = self.fork_materialized_still_context(physical_context, idx);
+        if seed.placement.is_some()
+            || seed.purpose == super::detached_window_manager::DetachedWindowPurpose::BrowserView
+        {
+            self.with_viewer_context(id, |app| {
+                app.commit_viewer_session(
+                    super::ViewerPresentation::DetachedWindow,
+                    true,
+                    "browser_materialized_binding",
+                );
+                app.ensure_detached_viewer_window_id_with_seed(seed);
+            })
+            .expect("new materialized context must mount for its creation seed");
+        }
+        id
+    }
+
     pub(in crate::app) fn retire_context<D>(
         &mut self,
         id: ViewerContextId,

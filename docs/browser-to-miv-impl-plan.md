@@ -415,6 +415,19 @@ F12 設定 OFF でも BrowserView の連動窓である間は、実 session・ru
 
 注入した型付き要求で、モード別の窓、位置、終了、前面化が一通り成立すること。実機の z-order は別途未確認として残します。
 
+**段階4の実装記録 (2026-11-22、ビルド・テスト・独立レビュー待ち)**
+
+- `browser_presentation.rs` の `DetachedWindowSeed` が用途と任意の位置を一組で渡す。linked は window ID 確保直後、loading は flags／通常 seed 設定前、materialized は fork 先の新しい binding で生成値を適用する。通常の呼び口を残し、Normal と既存 seed を渡す。不適切な位置は既存の検査と設定済み位置／既定位置への扱いを使う。
+- フル機能では受理済みの main-new open の境界で既存 linked を `BrowserReplacement` で終了し、新しい BrowserView を作る。独立した既存窓は通常の park／ParkedLive handoff を通す。複数ウィンドウの通常画像の activation は従来どおりメインの親フォルダ復元後に materialized fork を通す。loading は既存の入口を種付きの共通入口へ集約し、BrowserView の種も受け取れる形にした。loading の BrowserView はその共通入口へ注入して検査する。隠された拡張子の DirectMedia は既存の復元経路を維持する。
+- F12 OFF でも BrowserView＋linked の実 runtime／binding に基づいて画像送りと一覧同期を保つ。保存設定は変更しない。新しい BrowserView は F11 を継承せず枠付きで生成する。独立窓の編集制限は既存のまま。
+- Remote の両拒否・構成エディタの drain は、件数へ畳む前に拒否された BrowserOverlay の意図を保持する。★固定は解決 owner から同じ拒否時 main 前面化へ渡す。文書モーダル保留・SidecarRestore 破棄・旧要求の置換には前面化を足さない。
+- `MainRestorePolicy` を既存の main 復帰と App の復帰 owner に渡す。通常は Activate の wrapper を通り、BrowserOverlay は PreserveForeground。root・全 retained viewport・全 context の native presenter の可視性を復帰し、旧メディアの focus／raise のみ省く。配置待ちの旧 show request も focus だけを退役させ、表示・最大化・placement の要求は残す。新しい窓だけが既存の配置完了後の show／focus を所有する。
+- 非前面化での保存済み WINDOWPLACEMENT 復帰にも方針を渡すため、範囲表に加えて `tray.rs` の既存復帰 helper を更新した。通常の showCmd は変更しない。Win32 の実際の z-order・最小化／最大化からの非前面化復帰は実機未確認。
+- `browser818_presentation_tests.rs` の CPU／egui テスト16件と、`depth_view_tests::gpu_tests` の3D回帰1件を追加した。後者は既存 nextest の gpu_tests グループ規則に該当する。既存テストの削除・期待値緩和はない。cargo は最後の fmt 以外実行せず、コンパイルと実行結果は設計担当へ引き継ぐ。
+- App の detached 用 field、時間窓、位置の保存先、永続設定は追加していない。拡張・pipe・host の producer は段階5以後のまま。
+
+段階4の選択引き継ぎ修正: 設計担当の182件実行で181件成功、linked置換の選択テスト1件が失敗した。実装が明示対象を選択してから旧窓を終了していたため、Manual close の `restore_grid_cursor_to_fullscreen_item` が旧画像へ戻していた。テストの期待は正しく、実装の順序違反である。BrowserOverlay の main-new に限り、既存の置換／終了を済ませてから明示選択を一度確定する順序へ修正した。通常要求の順序と利用者closeのカーソル復元は変更しない。元のassertを維持し、同期後の選択・表示・stamp・leaseを強化したほか、旧MainWindow／Fullscreen／BrowserViewの終了も検査する回帰を追加した。修正後のビルド・テストは引き継ぎ待ち。
+
 ### 段階5：新しい pipe と launcher／core の引数
 
 **範囲**

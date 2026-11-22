@@ -320,8 +320,15 @@ impl App {
             return;
         }
         if precheck == Some(ActivationOpenRefusal::CompositionEditor) {
-            let rejected = self.activation_open_path_rx.try_iter().count();
+            let requests = self.activation_open_path_rx.try_iter().collect::<Vec<_>>();
+            let rejected = requests.len();
             if rejected != 0 {
+                if let Some(request) = requests
+                    .iter()
+                    .find(|request| request.request.intent.is_browser_overlay())
+                {
+                    self.foreground_browser_open_refusal(request.request.intent, ctx);
+                }
                 crate::logger::log(format!(
                     "composition editor: rejected {rejected} activation request(s)"
                 ));
@@ -342,7 +349,14 @@ impl App {
             .iter()
             .filter(|request| request.rejected_for_remote(current_acquisition_sequence))
             .count();
-        self.notify_rejected_remote_activation_paths(rejected, ctx);
+        let rejected_browser = requests
+            .iter()
+            .find(|request| {
+                request.rejected_for_remote(current_acquisition_sequence)
+                    && request.request.intent.is_browser_overlay()
+            })
+            .map(|request| request.request.intent);
+        self.notify_rejected_remote_activation_paths(rejected, rejected_browser, ctx);
         let paths: Vec<_> = requests
             .into_iter()
             .filter(|request| !request.rejected_for_remote(current_acquisition_sequence))
@@ -388,12 +402,24 @@ impl App {
         for request in deferred {
             let _ = self.activation_open_path_tx.send(request);
         }
-        self.notify_rejected_remote_activation_paths(rejected.len(), ctx);
+        let rejected_browser = rejected
+            .iter()
+            .find(|request| request.request.intent.is_browser_overlay())
+            .map(|request| request.request.intent);
+        self.notify_rejected_remote_activation_paths(rejected.len(), rejected_browser, ctx);
     }
 
     #[cfg(windows)]
-    fn notify_rejected_remote_activation_paths(&mut self, rejected: usize, ctx: &egui::Context) {
+    fn notify_rejected_remote_activation_paths(
+        &mut self,
+        rejected: usize,
+        browser_overlay: Option<ViewerOpenIntent>,
+        ctx: &egui::Context,
+    ) {
         if rejected != 0 {
+            if let Some(intent) = browser_overlay {
+                self.foreground_browser_open_refusal(intent, ctx);
+            }
             crate::logger::log(format!(
                 "single_instance: rejected {rejected} activation open request(s) during Remote ownership"
             ));
@@ -453,6 +479,8 @@ impl App {
                 requested.display()
             ));
             if matches!(source, StartupOpenPathSource::Activation) {
+                #[cfg(windows)]
+                self.foreground_browser_open_refusal(open_request.intent, ctx);
                 self.show_feedback_warning(
                     "リモート閲覧中のため、二重起動で渡されたパスを開けません".to_string(),
                 );
@@ -460,6 +488,8 @@ impl App {
             return StartupOpenAdmission::Refused(ActivationOpenRefusal::Remote);
         }
         if self.composition_editor_modal_active() {
+            #[cfg(windows)]
+            self.foreground_browser_open_refusal(open_request.intent, ctx);
             crate::logger::log("composition editor: rejected path open");
             self.show_feedback_warning("本の構成を編集中のため、別の本を開けません".into());
             return StartupOpenAdmission::Refused(ActivationOpenRefusal::CompositionEditor);
@@ -973,6 +1003,10 @@ impl App {
                         resolution.path.display()
                     ));
                     self.resume_activation_held_open(held, held_duration);
+                    #[cfg(windows)]
+                    if let Some(request) = owner.viewer_open_adoption().request() {
+                        self.foreground_browser_open_refusal(request.intent, ctx);
+                    }
                     self.show_snapshot_out_of_scope_open_feedback();
                     return;
                 }

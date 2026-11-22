@@ -591,6 +591,19 @@ impl DetachedWindowManager {
         }
     }
 
+    /// A newly accepted foreground owner supersedes only the old focus intent,
+    /// retaining visibility, maximization and host placement work.
+    pub(super) fn relinquish_pending_show_focus(&mut self, window_id: u64) {
+        if let Some(runtime) = self.runtimes.get_mut(&window_id)
+            && let HostPlacement::Unplaced {
+                show_request: Some(request),
+                ..
+            } = &mut runtime.host_placement
+        {
+            request.focus = false;
+        }
+    }
+
     /// Re-enter the same typed placement owner for an intentional geometry
     /// transition, preserving a root-side request already waiting on this host.
     pub(super) fn mark_host_unplaced(&mut self, window_id: u64, awaiting_unzoom: bool) {

@@ -1501,6 +1501,15 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 - §2-6・7: 新しい症状に対する補修は行わない。native 動画の F12 の理由も型で運ぶため、計画の範囲表以外では既存 transition effect と native 消費側だけを更新した。順序や待ちは不変。§2-8: 既存テストを維持し、Normal／BrowserView の表・早期除去・passive・F11・F12・sibling の回帰テストを追加した。
 - F12 の拒否は共通入口で切替対象 lease の用途から行い、メニューも同じ判定を使う。位置保存と focus の所有境界の変更であり、症状パッチではない。Normal の保存・既存の idle focus・F11・F12 は維持する。実行結果と独立レビューの合意は未取得で、設計担当へ引き継ぐ。
 
+**段階4の実装引き継ぎ (2026-11-22、検証・独立レビュー待ち)**
+
+- 合意済みの用途・位置の組を linked／loading／materialized の生成境界へ渡す。linked の置換は `BrowserReplacement`、独立窓は既存の park／fork／loading を使う。F12 OFF の連動は実 runtime の BrowserView＋linked 所有で維持し、設定は反転しない。
+- §2-1・2: HWND の同定は従来の lease のまま、再生成は受理済み要求による明示置換だけ。§2-3・4: App の field・位置の保存先を追加せず、用途は runtime、seed はローカル生成値に置く。§2-5: 要求の意図・context・window identity で分岐し、時間窓は追加しない。
+- トレイ復帰は第12回レビュー後の形を維持する。可視性は root・retained viewport・全 native presenter で既存どおり戻し、型付き方針で focus／raise だけを分ける。旧配置待ち show の focus だけも新しい受付へ所有を渡し、可視性・最大化・配置待ちは捨てない。`tray.rs` の保存済み位置の復帰にも同じ方針を渡した。
+- §2-6・7・8: 実機症状への補修や別機能の警告整理は行わない。既存テストは維持し、通常要求／F12 OFF／生成経路／拒否の前面化／旧窓・sibling／3D退役を検査する回帰を追加した。GPU を作るテストは gpu_tests 配下に置いた。表示・focus の所有境界を型で表す変更で、症状パッチではない。実行結果・独立レビューの判断は未取得。
+
+段階4のテスト失敗に対する修正では、BrowserOverlay の旧reader終了が選択を旧画像へ戻した後、新しい明示要求が選択を確定する順序に直した。close側のカーソル復元を止めるguardや二重の選択書き戻しは加えない。表示公開前の所有引き継ぎを修正するもので、通常要求・利用者closeの動作、Appのfield、時間窓、viewport同定・位置保存は変更しない。失敗したassertを維持・強化し、旧MainWindow／Fullscreen／BrowserViewの終了と後続syncを検査する回帰を追加した。設計担当から修正前の182件中181件成功・1件失敗の報告があり、今回の再検証は引き継ぎ待ち。
+
 ### 2026-11-21: 絞り込みの変更で一覧を読み直さない・AI の絞り込みを一覧全体の取得の証明へ (§1.835、実装済み・自動検証済み・実機未確認)
 
 **変更の内容**

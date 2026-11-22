@@ -381,6 +381,17 @@ impl App {
     /// トレイスレッドの OpenRequested 経路と、外部 ShowWindow 検出経路 (アクティベーション
     /// リスナー等) の両方から呼ばれる。
     pub(crate) fn sync_after_restore(&mut self, ctx: &egui::Context) {
+        self.sync_after_restore_with_policy(
+            ctx,
+            crate::window_activation::MainRestorePolicy::Activate,
+        );
+    }
+
+    pub(crate) fn sync_after_restore_with_policy(
+        &mut self,
+        ctx: &egui::Context,
+        policy: crate::window_activation::MainRestorePolicy,
+    ) {
         if self.window_visible {
             return;
         }
@@ -406,7 +417,9 @@ impl App {
         let restored_presenters = 0;
         // Transport state was never changed. Restore the retained surface and let the existing
         // focus path bring it forward without synthesizing Play or recreating the session.
-        self.restore_media_surface_after_tray(ctx);
+        if policy.requests_focus() {
+            self.restore_media_surface_after_tray(ctx);
+        }
         crate::logger::log(format!(
             "tray: App state synced after restore; \
              restored_viewports={restored_viewports} routed_presenters={restored_presenters}"
