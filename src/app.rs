@@ -13661,22 +13661,7 @@ pub(crate) fn physical_page_order_locked(
     source_path: &Path,
     items: &[GridItem],
 ) -> bool {
-    physical_page_order_locked_with_books_root(
-        settings,
-        &settings.books_root_path(),
-        source_path,
-        items,
-    )
-}
-
-/// Pure policy half for callers that already resolved the configured books root.
-pub(crate) fn physical_page_order_locked_with_books_root(
-    settings: &crate::settings::Settings,
-    books_root: &Path,
-    source_path: &Path,
-    items: &[GridItem],
-) -> bool {
-    crate::books::is_direct_book_folder(books_root, source_path)
+    crate::books::is_direct_book_folder(&settings.books_root_path(), source_path)
         || crate::folder_tree::is_open_as_container(source_path)
         || settings.auto_fullscreen_image_folders_enabled()
             && !items.is_empty()
@@ -44778,13 +44763,6 @@ impl App {
             VisibleInstallAuthority::Rating { .. } => {
                 book_materialization::ProjectionRecipe::ExtractedResult(
                     book_materialization::ExtractedSurface::Rating,
-                )
-            }
-            _ if folder_signature.is_some() => {
-                book_materialization::ProjectionRecipe::for_scanned_directory(
-                    &self.settings,
-                    &source_path,
-                    &items,
                 )
             }
             _ => book_materialization::ProjectionRecipe::for_physical(

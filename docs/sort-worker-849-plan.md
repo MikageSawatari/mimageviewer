@@ -1,6 +1,6 @@
 # 長さ以外の並べ替えも worker で走査する (§1.849)
 
-- 状態: 実装レビュー r1 の P2/P3 修正・独立ソース再レビュー完了 (2026-11-22)。修正後の実行検証は設計担当へ引き継ぎ。v5.6.0 で直す (利用者決定、統括経由)。
+- 状態: master 取り込み後の修正中。§8.4 の部分1を実装、部分2は追加経路の扱いを設計担当へ確認中。v5.6.0 で直す (利用者決定、統括経由)。
 - 利用者の言葉: 「長さの件、v5.6.0 で直すことにしたいと思います。修正お願いします。」
   - その前に、統括が変わる動きを説明している。小さいフォルダでも数フレームは前の並びが残り、そのあいだのキーは止まる。
 - 枝: `sort-worker-849` (master d190b67cc から)。
@@ -284,3 +284,34 @@ test(/section1795_off_refresh_and_sort_preserve_current_position/)
   - 本の構成のメニュー: ImageFolder は画像フォルダ → ZIP の既存の経路、CompiledFolder は既存の対象外の方針になる。旧分類で使えていた編集機能を失う変更ではない。
   - 読書位置・見開き・トリム・ページ編集のキーは変わらない。通常の操作で作ったデータが読めなくなる経路は見つからなかった (レビュー担当、コードから)。
 - 実機の確認は未実施 (サブ PC の依頼文を用意、送るのは統括)。
+
+### 8.4 master 取り込み後の修正
+
+2026-11-22、`sort-worker-849` を master `219edde21` へ fast-forward した作業ツリーで実施。§1.849 は `2fde2724d` で master 入り済み。以下は §8.2〜8.3 の分類変更を見直す後追い記録であり、先行記録は当時の判断として残す。
+
+#### 部分1: §1.418 の先送りを維持して、再走査の資格だけを判定する
+
+- 統括の報告: master の本体 lib 全件で `book_preferred_loaded_extension_named_folders_do_not_write_or_record_undo` が失敗。本優先評価のテスト・仕様は名前による分類を §1.418 へ先送りしており、§1.849 で recipe を directory に分類し直す変更はこの決定に踏み込んでいた。
+- `src/app/book_materialization.rs` の `for_scanned_directory` / `for_physical_scope` と専用テストを撤去。`src/app.rs` の recipe 採用時の `folder_signature.is_some()` 分岐と `physical_page_order_locked_with_books_root` の分割も撤去した。`for_physical` と `physical_page_order_locked` は分類変更前の `76aaa4617` とテキスト一致を確認。既存の本優先評価テストは編集していない。
+- `src/app/top_level_grid_view.rs` の `current_sort_reload_is_physical_directory()` は、非空かつ全行 `PdfPage` を除外し、Document recipe の除外は空の一覧だけに限定する。Document recipe でも非 `PdfPage` 行があれば物理の一覧として走査する。観測レコード・拡張子・UI I/O・新しい状態は使わない。
+- 通常の文書行とキャッシュからの仮行は、ともに `document_page_item` が `PdfPage` を作る。通常・prepared・Smart の文書経路を確認し、本の構成は既存行を並べ替え/部分列にするので、実文書の一覧に非 `PdfPage` を混ぜる producer は見つからなかった。
+- **空の `.epub` / `.pdf` 名の実ディレクトリは Document 分類のため再走査しない。並べ替える行がなく表示は同じであり、§1.418 の先送り範囲として扱う。**
+
+| テスト | 変更と理由 |
+| --- | --- |
+| `sort_worker_849_scanned_directory_recipe_keeps_book_policy_without_container_scope` | 撤去した directory 専用分類関数の検査なので削除。分類変更自体を取り消すためであり、本優先評価の期待を弱める変更ではない |
+| `sort_worker_849_container_named_directories_still_scan` | 空一覧から、画像1枚を持つ `.zip` / `.rar` / `.epub` / `.pdf` 名の実ディレクトリへ変更。走査の待ち・完了後の場所の確認は維持し、空の assert を画像行の完全一致へ置き換えた |
+| `sort_worker_849_empty_container_named_directories_keep_deferred_document_policy` | 追加。空の `.epub` / `.pdf` は pending・世代・通知を変えず除外されることを検査し、空の `.zip` / `.rar` は従来どおり worker 採用まで検査する。全ケースで場所と空行の assert を維持 |
+| `sort_worker_849_snapshot_child_zip_return_unpin_keeps_directory_reload` | 変更なしで維持。非空の `.epub` 名の実ディレクトリ→固定→子 ZIP→戻る→解除→表示順変更の回帰 |
+| `book_preferred_loaded_extension_named_folders_do_not_write_or_record_undo` | 変更なし。名前による従来の ArchiveRootMismatch / DocumentMismatch、DB/Undo 無変更の期待を維持 |
+
+上記の残存する4テスト名は nextest の `test(/名前/)` filter にそのまま使える。独立 `gpt-6.1-sol` / `xhigh` の read-only レビューは部分1 **ACCEPT / STRUCTURAL: AGREE**。実行検証は未実施。
+
+#### 部分2: 監視の再構築と外部走査の経路調査 (実装前の確認)
+
+- `folder_projection_key_with_presentation` は sort/order を含み、毎フレームの `service_folder_watch` → `ensure_current_folder_watch` は鍵が違えば監視を作り直し、直後に `start_external_rescan(..., UNIX_EPOCH)` を呼ぶ。案Aが対象にする重複経路はソースと一致する。サブ PC 担当による `77773f47a` の約14〜15秒という観測の内訳は、この担当では実測していない。
+- 古い監視の `collect` → debounce → `check_external_folder_changes(Notified)` から外部の再走査が始まる経路もある。実際の外部変更との重なりは、利用者指定の既定の割り切り対象である。
+- 追加の経路を発見: 監視登録用の初回走査が並べ替え開始時にまだ進行中だと、旧結果は `poll_external_rescan` で projection key の不一致として破棄され、既存 `folder_refresh_pending` へ保持される。`consume_folder_refresh_pending` は並べ替え待ちを見ないため、次の走査を並べ替え待ち中にも開始できる。外部変更通知なしでも成立し、単に「まれな外部変更」とは扱えない。
+- この追加経路を受け、利用者の停止条件に従って部分2の編集を開始せず報告した。「同じフォルダの並べ替え待ち中は、既存の先送り要求の消費も待たせる」まで範囲を広げるか、案Aだけに留めて残る経路を記録するかを確認中。新しい状態を追加する案ではない。
+
+部分1の `cargo fmt` (引数なし) と `git diff --check` は成功。ビルド・テスト・check は利用者指示により未実行。git の commit/reset/stash/checkout/merge も未実行。部分2の製品コード・テストは追加範囲の回答待ちで未変更。
