@@ -92,4 +92,12 @@
 
 ## 8. 記録
 
+### 8.1 設計レビュー (Sol / xhigh、2026-11-22)
+
+- r1 (93f276a61): REVISE / STRUCTURAL: AGREE。P2: ZIP の列挙中や合成の一覧でも物理フォルダの分岐に届く。P3: 一括変換の内容と、長さ以外の lifecycle の検証が足りない。→ c5d719926 で反映。
+- r2 (c5d719926): REVISE / STRUCTURAL: AGREE。P2: `surface == Folder` だけでは合成の一覧から入った物理の子を外してしまう。P2: `FixedOrder` で一律に何もしないと、タグから入った子フォルダの一括変換後の読み直しも止まる。→ dde3cd92c で反映 (判定の土台を `current_grid_reload_is_physical()` にした)。
+- r3 (dde3cd92c): ACCEPT / STRUCTURAL: AGREE。指摘なし。レビュー担当の言葉: 「既存 worker への統一は構造的修正です。」
+
+### 8.2 実装
+
 (実装・レビューの後に書く)
