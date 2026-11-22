@@ -71,6 +71,7 @@ fn prepared_ui_requests() -> [UiRequestKind; 8] {
         },
         UiRequestKind::SetFavorite(super::super::favorite::PreparedFavorite {
             path: "C:/favorite".into(),
+            folder_check: Ok(()),
             name: None,
             item_index: None,
             container_index: None,

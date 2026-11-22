@@ -30,6 +30,7 @@ fn request(app: &AppTestEnv, folder: &str) -> PreparedFavorite {
     std::fs::create_dir_all(&path).unwrap();
     PreparedFavorite {
         path,
+        folder_check: Ok(()),
         name: None,
         item_index: None,
         container_index: None,
@@ -257,6 +258,72 @@ fn agent_favorite_noop_skips_save_records_and_notice_even_when_name_is_supplied(
             toast
         );
         assert_no_publication(&app);
+    }
+}
+
+#[test]
+fn agent_favorite_missing_folder_uses_live_registration_to_allow_off_or_refuse_new() {
+    let ctx = egui::Context::default();
+    for registered_at_commit in [true, false] {
+        let mut app = fixture(&ctx);
+        let mut prepared = request(&app, "disconnected");
+        std::fs::remove_dir(&prepared.path).unwrap();
+        prepared.folder_check = Err(AgentError::new(
+            ErrorCode::BadRequest,
+            "指定されたフォルダを確認できません",
+        ));
+        prepared.item_index = Some(false);
+        prepared.container_index = Some(false);
+        let mut original = FavoriteEntry::new("利用者の名前".into(), prepared.path.clone());
+        original.auto_index_metadata = true;
+        original.auto_index_structure = true;
+        original.auto_index_thumbs = true;
+        original.auto_index_similar = true;
+        // Deliberately change registration after queuing, in both directions.
+        if !registered_at_commit {
+            app.settings.favorites.push(original.clone());
+        }
+        assert!(app.settings.save_checked());
+        let controller = OpenController::new(None);
+        app.install_agent_open(controller.clone(), &ctx);
+        let (ready, queued) = mpsc::channel();
+        controller.set_enqueue_observer(ready);
+        let worker = std::thread::spawn(move || controller.execute_favorite_for_test(prepared));
+        queued.recv_timeout(Duration::from_secs(10)).unwrap();
+        if registered_at_commit {
+            app.settings.favorites.push(original.clone());
+        } else {
+            app.settings.favorites.clear();
+        }
+        assert!(app.settings.save_checked());
+        let generation = crate::settings::save_generation();
+        app.poll_agent_open_requests(&ctx);
+        let outcome = worker.join().unwrap().unwrap();
+        if registered_at_commit {
+            let UiOpenOutcome::Written(Ok(Payload::FavoriteWrite(result))) = outcome else {
+                panic!("expected a favorite response");
+            };
+            assert!(!result.added);
+            assert_eq!(result.before, Some(state(&original)));
+            assert!(!result.after.item_index && !result.after.container_index);
+            original.auto_index_metadata = false;
+            original.auto_index_structure = false;
+            assert_favorite_eq(&app.settings.favorites[0], &original);
+            assert_favorite_eq(&Settings::load().favorites[0], &original);
+            assert_final_budget(&result);
+            let ui = app.agent_changes.as_ref().unwrap();
+            assert_eq!(ui.controller.records().lock().unwrap().entries().len(), 1);
+            assert!(ui.notices.try_recv().unwrap().contains("オフ"));
+        } else {
+            let UiOpenOutcome::Refused(error) = outcome else {
+                panic!("expected a new registration refusal");
+            };
+            assert_eq!(error.code, ErrorCode::BadRequest);
+            assert!(app.settings.favorites.is_empty());
+            assert!(Settings::load().favorites.is_empty());
+            assert_eq!(crate::settings::save_generation(), generation);
+            assert_no_publication(&app);
+        }
     }
 }
 

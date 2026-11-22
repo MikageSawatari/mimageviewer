@@ -64,6 +64,7 @@ impl App {
                 Some(state(favorite)),
             )
         } else {
+            request.folder_check.clone()?;
             // Match the dialog's physical target range. Book-library locations
             // have their own owner; this check is lexical and performs no I/O.
             let books_root = self

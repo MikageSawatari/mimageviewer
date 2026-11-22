@@ -105,21 +105,12 @@ fn favorite_settings_flag_refuses_before_path_worker_and_grant_changes_epoch() {
 
 #[cfg(windows)]
 #[test]
-fn favorite_path_worker_rejects_relative_missing_and_file_targets_without_ui_queue() {
+fn favorite_path_worker_rejects_relative_targets_without_ui_queue() {
     let fixture = Fixture::new();
     save_settings_access(true);
     let ui = fixture.handlers.open.install(egui::Context::default());
     let connection = fixture.connection();
-    let file = fixture._dir.path().join("favorite-file.png");
-    let archive = fixture._dir.path().join("favorite-file.zip");
-    std::fs::write(&file, b"headless fixture; no decoding").unwrap();
-    std::fs::write(&archive, b"PK headless fixture; no extraction").unwrap();
-    for path in [
-        PathBuf::from("relative"),
-        fixture._dir.path().join("favorite-missing"),
-        file,
-        archive,
-    ] {
+    for path in [PathBuf::from("relative")] {
         let (worker, replies) = start(&connection, command(&path));
         let reply = finish(worker, &replies);
         assert!(matches!(reply.policy, ReplyPolicy::Rejected));
@@ -128,6 +119,36 @@ fn favorite_path_worker_rejects_relative_missing_and_file_targets_without_ui_que
             ui.try_recv().is_err(),
             "invalid physical folder must not reach UI"
         );
+        assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn favorite_path_worker_passes_unavailable_folder_results_to_ui_for_live_registration_check() {
+    let fixture = Fixture::new();
+    save_settings_access(true);
+    let ui = fixture.handlers.open.install(egui::Context::default());
+    let connection = fixture.connection();
+    let file = fixture._dir.path().join("favorite-file.png");
+    let archive = fixture._dir.path().join("favorite-file.zip");
+    std::fs::write(&file, b"headless fixture; no decoding").unwrap();
+    std::fs::write(&archive, b"PK headless fixture; no extraction").unwrap();
+    for path in [fixture._dir.path().join("favorite-missing"), file, archive] {
+        let (worker, replies) = start(&connection, command(&path));
+        let request = ui.recv_timeout(Duration::from_secs(10)).unwrap();
+        let UiRequestKind::SetFavorite(prepared) = &request.kind else {
+            panic!("expected a favorite request");
+        };
+        assert!(crate::folder_tree::path_eq(&prepared.path, &path));
+        let error = prepared.folder_check.clone().unwrap_err();
+        assert_eq!(error.code, ErrorCode::BadRequest);
+        assert!(request.try_claim());
+        // UI refuses a new registration with this error; existing registrations
+        // ignore it and can switch their indexes off (covered by App regression).
+        request.complete(UiOpenOutcome::Refused(error));
+        let reply = finish(worker, &replies);
+        assert_eq!(reply.wire().result.unwrap_err().code, ErrorCode::BadRequest);
         assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 0);
     }
 }
@@ -150,6 +171,7 @@ fn favorite_read_only_worker_prepares_flags_and_claim_preserves_actual_result_af
     let request = ui.recv_timeout(Duration::from_secs(10)).unwrap();
     match &request.kind {
         UiRequestKind::SetFavorite(prepared) => {
+            assert!(prepared.folder_check.is_ok());
             assert_eq!(prepared.path, crate::path_key::normalize_input_path(&path));
             assert_eq!(prepared.name.as_deref(), Some("requested name"));
             assert_eq!(prepared.item_index, None);
