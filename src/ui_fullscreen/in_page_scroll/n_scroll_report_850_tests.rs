@@ -111,6 +111,16 @@ fn walk(
             true,
         );
         if result == pan {
+            // A stop is legal only at the far corner: every overflowing axis
+            // at its reading-end edge (no early stop after the expected wraps).
+            for axis in 0..2 {
+                if let Some(range) = geometry.axes[axis] {
+                    assert!(
+                        (pan[axis] - range.start(-signs[axis])).abs() < 0.01,
+                        "stopped before the end corner on axis {axis}: {pan:?}"
+                    );
+                }
+            }
             return walk;
         }
         // The accepted pan is what the normal input writer keeps.
@@ -124,6 +134,16 @@ fn walk(
             assert!(
                 secondary_move > 0.0,
                 "a wrap must advance to a new column/row"
+            );
+            // A wrap starts the new column/row at its reading-start edge.
+            let range = geometry.axes[primary].expect("zoomed spread overflows both axes");
+            assert!(
+                (pan[primary] - range.start(-signs[primary])).abs() < 0.01,
+                "wrap taken before the primary end: {pan:?}"
+            );
+            assert!(
+                (result[primary] - range.start(signs[primary])).abs() < 0.01,
+                "wrap must reset the primary axis: {result:?}"
             );
             walk.wraps += 1;
             walk.wrap_moves.push(secondary_move / VIEWPORT[secondary]);
