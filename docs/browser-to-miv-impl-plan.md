@@ -886,3 +886,7 @@ Start-Process -FilePath .\target\release\mimageviewer.exe
 ### 段階 5 の実装 (2026-11-22、`6c07dc523`・`fb20fbbe5`・`201f8fdb6`) — ACCEPT
 
 1 回目 REVISE (P1: 応答の直後の `DisconnectNamedPipe` が未読の応答を捨てる)、2 回目 REVISE (P2: 接続を保持するクライアントに worker と資源の上限が無い)、3 回目 ACCEPT。凍結の決まりの構造的変更 (実装) は毎回合意。IPC 17 件 (3 回連続)・本体 lib 127 件成功。launcher のテストは段階 6 の release の後。レビューの補足: 製品の launcher は `ERROR_PIPE_BUSY` で待たずに再起動の案内で終わる。ふだんの 1 件ずつの送信では、受理の前に次の instance を作るので当たらない。
+
+### 段階 6 の実装 (2026-11-22、`25e5e464d`・`469145a42`) — ACCEPT
+
+1 回目 REVISE (P1: 月のフォルダの junction を介して管理領域へ保存できる、P2: 画像リンクの対象の形式と host の対応形式が食い違う、P3: 空行)。月のフォルダにも共有の判定をかけ、形式の表を `mimageviewer-capture-file` に 1 つにして解消、2 回目 ACCEPT。`build-release.ps1 -PreserveRuntime` (署名なし) 成功、host 15 件・共有部品 15 件・launcher 24 件 (段階 5 の分を含む)・本体 `runtime_cleanup` 23 件・`clipboard_capture` 123 件成功。`test-build-portable-source-fingerprint.ps1` は PowerShell 7 が無く未実行。
