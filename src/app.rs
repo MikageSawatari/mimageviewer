@@ -31006,6 +31006,29 @@ impl App {
         })
     }
 
+    pub(crate) fn view_order_refresh_scan_pending(&self) -> bool {
+        self.main_folder_history_available()
+            && self
+                .folder_pane_open_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    matches!(
+                        pending.purpose,
+                        FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+                    )
+                })
+    }
+
+    pub(crate) fn view_order_refresh_scan_elapsed(&self) -> Option<std::time::Duration> {
+        self.view_order_refresh_scan_pending().then(|| {
+            self.folder_pane_open_pending
+                .as_ref()
+                .unwrap()
+                .started_at
+                .elapsed()
+        })
+    }
+
     fn load_folder_or_convert_archive_with_auto_fullscreen_classified_with_navigation_at_stage(
         &mut self,
         path: PathBuf,
@@ -59658,8 +59681,11 @@ impl App {
                 "grid-mouse",
             );
         }
-        if block != crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan
-            && self.dialog_escape_pressed(ctx)
+        if !matches!(
+            block,
+            crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan
+                | crate::filename_stack_ui::GridItemInputBlock::ViewOrderRefreshScan
+        ) && self.dialog_escape_pressed(ctx)
         {
             self.toggle_stack_mode();
             return None;
@@ -59704,10 +59730,13 @@ impl App {
             self.start_batch_convert_to_pdf();
             return None;
         }
-        if block != crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan
-            && self
-                .keymap
-                .consume_action(ctx, KeyAction::GridToggleStackMode)
+        if !matches!(
+            block,
+            crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan
+                | crate::filename_stack_ui::GridItemInputBlock::ViewOrderRefreshScan
+        ) && self
+            .keymap
+            .consume_action(ctx, KeyAction::GridToggleStackMode)
         {
             self.toggle_stack_mode();
             return None;

@@ -401,6 +401,25 @@ fn write_wav(path: &Path) {
 }
 
 #[test]
+fn sort_hold_838_only_order_refresh_allows_item_independent_controls() {
+    use crate::filename_stack_ui::GridItemInputBlock;
+    for (block, allowed) in [
+        (GridItemInputBlock::BookStructuralOperation, false),
+        (GridItemInputBlock::ImageFolderZip, false),
+        (GridItemInputBlock::LocationNavigation, false),
+        (GridItemInputBlock::DirectNavigationScan, false),
+        (GridItemInputBlock::ViewOrderRefreshScan, true),
+        (GridItemInputBlock::StackRefresh, false),
+    ] {
+        assert_eq!(
+            block.item_independent_controls_allowed(),
+            allowed,
+            "{block:?}"
+        );
+    }
+}
+
+#[test]
 fn sort_hold_838_arrow_keys_do_not_move_old_selection() {
     let mut h = Harness::images();
     // Positive control: the same key really operates the visible list.

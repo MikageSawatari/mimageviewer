@@ -11437,15 +11437,21 @@ impl App {
             });
     }
 
-    /// Keep the source grid visible while a location is prepared offscreen.
+    /// Keep the source grid visible while a location or its new order is prepared offscreen.
     fn render_location_navigation_wait_overlay(&self, ctx: &egui::Context) {
-        if !self.location_navigation_pending() {
+        let location_pending = self.location_navigation_pending();
+        if !location_pending && !self.view_order_refresh_scan_pending() {
             return;
         }
         if let Some(delay) = self.direct_navigation_wait_overlay_delay() {
             ctx.request_repaint_after(delay);
             return;
         }
+        let message = if location_pending {
+            "移動先を読み込み中…"
+        } else {
+            "並べ替え中…"
+        };
         egui::Area::new(egui::Id::unique("location_navigation_wait_overlay"))
             .order(egui::Order::Foreground)
             .interactable(false)
@@ -11456,10 +11462,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(
-                                egui::RichText::new("移動先を読み込み中…")
-                                    .color(PROGRESS_LABEL_COLOR),
-                            );
+                            ui.label(egui::RichText::new(message).color(PROGRESS_LABEL_COLOR));
                         });
                     });
             });
