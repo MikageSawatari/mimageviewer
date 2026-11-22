@@ -1513,7 +1513,15 @@ impl FolderPaneState {
     }
 
     pub(crate) fn visible_rows(&self) -> Vec<FolderPaneRow> {
+        self.visible_rows_indexed().0
+    }
+
+    /// Reuse DFS's normalized-key deduplication table as this draw's row index.
+    /// Keys move into the table once; focus/accessibility lookups need no second
+    /// normalization of the logical rows and no cache across passes.
+    pub(crate) fn visible_rows_indexed(&self) -> (Vec<FolderPaneRow>, HashMap<String, usize>) {
         let mut rows = Vec::new();
+        let mut row_indices = HashMap::new();
         if let Some(root) = self.selected_drive() {
             let active = self.active_path.as_deref().map(key_for);
             let cursor = self.cursor_path().map(key_for);
@@ -1521,12 +1529,12 @@ impl FolderPaneState {
                 root,
                 0,
                 &mut rows,
-                &mut HashSet::new(),
+                &mut row_indices,
                 active.as_deref(),
                 cursor.as_deref(),
             );
         }
-        rows
+        (rows, row_indices)
     }
 
     pub(crate) fn set_cursor(&mut self, path: PathBuf) {
@@ -1626,7 +1634,7 @@ impl FolderPaneState {
         path: &Path,
         depth: usize,
         rows: &mut Vec<FolderPaneRow>,
-        seen: &mut HashSet<String>,
+        row_indices: &mut HashMap<String, usize>,
         active: Option<&str>,
         cursor: Option<&str>,
     ) {
@@ -1638,8 +1646,11 @@ impl FolderPaneState {
         let node = self.nodes.get(&key);
         let is_active = active == Some(key.as_str());
         let is_cursor = cursor == Some(key.as_str());
-        if !seen.insert(key) {
-            return;
+        match row_indices.entry(key) {
+            std::collections::hash_map::Entry::Occupied(_) => return,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(rows.len());
+            }
         }
         let loading =
             node.is_some_and(|node| matches!(node.scan, NodeScan::Queued | NodeScan::Running(..)));
@@ -1661,7 +1672,7 @@ impl FolderPaneState {
         });
         if expanded && let Some(node) = node {
             for child in node.children() {
-                self.push_visible_rows(child, depth + 1, rows, seen, active, cursor);
+                self.push_visible_rows(child, depth + 1, rows, row_indices, active, cursor);
             }
         }
     }
@@ -3032,6 +3043,24 @@ mod tests {
                 row.is_cursor,
                 crate::folder_tree::path_eq(&row.path, state.cursor_path().unwrap())
             );
+        }
+    }
+
+    #[test]
+    fn virtual_tree_row_index_reuses_normalized_identity_and_first_duplicate() {
+        let root = p(r"C:\Data");
+        let first = root.join("Pictures");
+        let duplicate = p("c:/DATA/PICTURES");
+        let state = FolderPaneState::test_tree(&root, vec![first.clone(), duplicate]);
+        let (rows, indices) = state.visible_rows_indexed();
+        assert_eq!(
+            rows.iter().map(|row| &row.path).collect::<Vec<_>>(),
+            vec![&root, &first]
+        );
+        assert_eq!(indices.len(), rows.len());
+        assert_eq!(indices.get(&key_for(&p("C:/data/pictures"))), Some(&1));
+        for (index, row) in rows.iter().enumerate() {
+            assert_eq!(indices.get(&key_for(&row.path)), Some(&index));
         }
     }
 

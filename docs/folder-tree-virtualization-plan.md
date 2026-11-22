@@ -124,9 +124,12 @@ focus を持つ部品への Enter / Space、行順の適用、ID ごとに 1 回
   届いている部品を持つ行** ∪ **egui の focus を持つ部品の行**。
 - 部品 ID → path の対応は、**行の部品 ID の索引** (`FolderPaneRowIds`: ID → path の表。ツリーの描画だけが書き、
   egui の temp data に置く) から引く。行を描くたびに、行の外側の `scope_builder` の生成から終了までの間に egui へ
-  登録された部品の ID を、**すべての layer について** (`ctx.viewport(|v| v.this_pass.widgets)` の layer ごとの件数の
-  前後差。行の Ui・矢印・名前の部品・中の文字・spinner・"!"、行が出す tooltip の layer の Ui と Label を含む)、その行の
-  path で登録する (4 回目の P2-1)。AccessKit の要求先の ID は egui の `Id::accesskit_id()` と同じ値。
+  登録された部品の ID を、行の Ui・矢印・名前の部品・中の文字・spinner・"!"、tooltip の Ui と Label を含め、
+  その行の path で登録する (4 回目の P2-1)。tree layer は明示した row scope ID の `WidgetRects::order` から
+  行末までの追加分を取る。tooltip layer は行を描いた後、この pass の `TooltipPassState::widget_tooltips` から
+  `Tooltip::tooltip_id(owner, ordinal)` で引き、親 layer 順に回収する。省略された Label の自動 tooltip と
+  入れ子も同じ経路で拾う。過去の空 layer を行ごとに列挙しない (独立実装レビュー P2-2)。
+  AccessKit の要求先の ID は egui の `Id::accesskit_id()` と同じ値。
   **最後に描いた行だけを使う形にはしない** (3 回目の P2): 要求はイベントの待ち行列を経て届くので、B が見えている
   間に出た要求が、B が範囲外になった後の pass に届くことがある。
   **論理行から消えた path の項目も捨てない** (4 回目の P2-2): 畳んで再び開いた後に、待っていた要求が届くことがある。
@@ -153,7 +156,9 @@ focus を持つ部品への Enter / Space、行順の適用、ID ごとに 1 回
 1. **`push_visible_rows` の正規化を 1 回にする**: 現在地とカーソルの key を `visible_rows()` の入口で 1 回だけ
    作り、各行は自分の key (すでに作っている) と比べる。`path_eq(a, b)` は定義上
    `normalize_keep_drive(a) == normalize_keep_drive(b)` で、`key_for` も同じ関数なので、結果は同じ。
-   `seen` への挿入は key の複製をやめ、移動にする。
+   DFS の重複除外は key を移動して入れる「key → 論理行 index」の表にし、描画ではこの表を要求／focus の
+   対象 key だけ引くためにも使う (`visible_rows_indexed`)。focus が残る pass に全パスを再正規化しない。
+   表はその DFS の結果だけに属し、frame をまたぐ cache は足さない (独立実装レビュー P2-1)。
 2. **`reveal_active` / `reachable` の線形探索をやめる**: 祖先ごとに `cache.children.iter().any(path_eq)` で
    「表示する子に含まれるか」を探している。`CachedListing` に、表示する子の key の集合 `child_keys` を足し、
    `children` と同じ 1 つの構築関数 (worker 側の走査と test 用の seed) で作る。`membership` (隠しフォルダも
@@ -344,4 +349,28 @@ folder-tree snapshot が7件失敗。利用者指定により最終の組み立�
 広げないが、spinner と `!` も含めた予測高を horizontal と矢印で確保するため、全行を等高にできる。
 5倍率・両フォント設定・通常／loading／error の検査は、行全体と矢印が row_height、ラベルが24 ptの等値を検査する。
 debug assert と snapshot PNG は変更せず、この組み立てでのビルド・テストは共有 runner 待ち。
+
+## 13. 独立実装レビューへの対応
+
+対象実装は `0927c027b`。関連454/454成功・tree snapshot7/7画素一致は利用者提供結果。
+独立レビュー (Sol xhigh) は P1なし。以下の修正後のビルド・テストは実装担当では実行せず、共有 runner 待ち。
+
+- **P2-1**: DFS の重複除外表を key → index にして、その正規化済み key を extra-row 解決でも再利用。
+  key の複製は増やさず、`normalize_keep_drive` の同値性と最初の重複行を採用する規則を維持した。
+  focus を持つ6,000行の UI テストに構造検査を加え、解決処理が対象 key だけを列挙し、全論理行の
+  再正規化／索引走査をしないことを固定。データ側では case／separator 違いの重複と index を検査する。
+- **P2-2**: tree の scope 登録位置からその行の部品を回収し、tooltip は現在 pass の registry だけから回収。
+  `WidgetRects::order/get_layer` (`widget_rect.rs:143/153`)、明示 scope ID (`ui.rs:255`)、
+  tooltip Area ID (`tooltip.rs:156/227`、`popup.rs:622`)、pass ごとの registry clear (`pass_state.rs:285`)
+  を確認した。処理量は描画行の部品数＋現在 pass の tooltip 部品／layer 数で、過去 layer 数に依存しない。
+  既存の tooltip-index テストを維持・強化し、全 current tooltip widget の帰属を検査。
+  別ケースで両 pass buffer に空になった過去 layer を1,000個残し、長い名前の省略 tooltip も検査する。
+- **P3-1**: 追加／並べ替え後の anchor 矩形を temp data から読む前に、更新後の label_display.rows に
+  anchor が可視行として存在することを assert。
+- **P3-2**: gamepad の上下それぞれで、カーソルを保持したまま viewport を先頭へ移し、次の対象行が
+  label_display.rows に無いことを確認してから入力する。論理カーソル更新と画面外からの中央 reveal を検査。
+
+追加テストは `virtual_tree_focus_resolves_extra_rows_from_precomputed_key_index`、
+`virtual_tree_row_index_reuses_normalized_identity_and_first_duplicate`、
+`virtual_tree_widget_index_ignores_historical_tooltip_layers`。行の描画寸法・snapshot PNG・入力裁定・索引の寿命は変更しない。
 

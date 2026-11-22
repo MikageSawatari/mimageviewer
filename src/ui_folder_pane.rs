@@ -211,32 +211,78 @@ fn folder_pane_row_ids_id() -> egui::Id {
     egui::Id::unique("folder_pane_row_ids")
 }
 
-/// Snapshot counts before creating the row scope, including tooltip layers.
-fn folder_pane_widget_counts(
-    ctx: &egui::Context,
-) -> std::collections::HashMap<egui::LayerId, usize> {
-    ctx.viewport(|viewport| {
-        viewport
-            .this_pass
-            .widgets
-            .layers()
-            .map(|(layer, widgets)| (*layer, widgets.len()))
-            .collect()
-    })
+fn folder_pane_extra_row_indices(
+    row_indices: &std::collections::HashMap<String, usize>,
+    requested_paths: &std::collections::HashSet<String>,
+) -> Vec<usize> {
+    requested_paths
+        .iter()
+        .filter_map(|key| row_indices.get(key).copied())
+        .collect()
 }
 
+/// An explicit scope_id is also the scope Ui's widget ID (egui ui.rs). Its
+/// registration precedes every child, so its order marks this row's suffix in
+/// the tree layer. No lookup enumerates historical layers.
 fn register_folder_pane_row_ids(
     ctx: &egui::Context,
     index: &folder_pane::FolderPaneRowIds,
-    before: &std::collections::HashMap<egui::LayerId, usize>,
+    scope_id: egui::Id,
     path: &std::path::Path,
 ) {
     let path = std::sync::Arc::new(path.to_path_buf());
     ctx.viewport(|viewport| {
+        let widgets = &viewport.this_pass.widgets;
+        let (layer, start) = widgets
+            .order(scope_id)
+            .expect("folder row scope is registered");
         let mut index = index.0.lock().unwrap();
-        for (layer, widgets) in viewport.this_pass.widgets.layers() {
-            for widget in &widgets[before.get(layer).copied().unwrap_or(0)..] {
-                index.insert(widget.id.accesskit_id(), path.clone());
+        for widget in widgets.get_layer(layer).skip(start) {
+            index.insert(widget.id.accesskit_id(), path.clone());
+        }
+    });
+}
+
+/// TooltipPassState is cleared each pass, unlike WidgetRects' layer storage.
+/// Tooltip::show derives each Area layer with Tooltip::tooltip_id(owner, ordinal).
+/// Traverse these current-pass layers from the tree, including nested tooltips
+/// and Label's automatic elision tooltip, after all tree IDs have been indexed.
+fn register_folder_pane_tooltip_ids(
+    ctx: &egui::Context,
+    index: &folder_pane::FolderPaneRowIds,
+    tree_layer: egui::LayerId,
+) {
+    ctx.viewport(|viewport| {
+        let widgets = &viewport.this_pass.widgets;
+        let mut children: std::collections::HashMap<_, Vec<_>> = std::collections::HashMap::new();
+        for (&owner, state) in &viewport.this_pass.tooltips.widget_tooltips {
+            if let Some(widget) = widgets.get(owner) {
+                children
+                    .entry(widget.layer_id)
+                    .or_default()
+                    .push((owner, state.tooltip_count));
+            }
+        }
+        let mut layers = vec![tree_layer];
+        let mut index = index.0.lock().unwrap();
+        while let Some(layer) = layers.pop() {
+            let Some(owners) = children.remove(&layer) else {
+                continue;
+            };
+            for (owner, count) in owners {
+                let Some(path) = index.get(&owner.accesskit_id()).cloned() else {
+                    continue;
+                };
+                for ordinal in 0..count {
+                    let tooltip_layer = egui::LayerId::new(
+                        egui::Order::Tooltip,
+                        egui::Tooltip::tooltip_id(owner, ordinal),
+                    );
+                    for widget in widgets.get_layer(tooltip_layer) {
+                        index.insert(widget.id.accesskit_id(), path.clone());
+                    }
+                    layers.push(tooltip_layer);
+                }
             }
         }
     });
@@ -1235,7 +1281,7 @@ impl App {
                 }
             }
         }
-        let rows = self.folder_pane.visible_rows();
+        let (rows, row_indices) = self.folder_pane.visible_rows_indexed();
         if rows.is_empty() {
             close_folder_pane_paste_menu(ui.ctx());
             ui.centered_and_justified(|ui| {
@@ -1317,18 +1363,7 @@ impl App {
                     .collect()
             })
         };
-        let extra_rows: Vec<_> = if requested_paths.is_empty() {
-            Vec::new()
-        } else {
-            rows.iter()
-                .enumerate()
-                .filter_map(|(i, row)| {
-                    requested_paths
-                        .contains(&crate::path_key::normalize_keep_drive(&row.path))
-                        .then_some(i)
-                })
-                .collect()
-        };
+        let extra_rows = folder_pane_extra_row_indices(&row_indices, &requested_paths);
         let mut scroll = egui::ScrollArea::vertical()
             // Commit a one-shot reveal in this layout, with no absolute native
             // animation target left alive across later cache replacements.
@@ -1378,7 +1413,6 @@ impl App {
                         "folder_pane_row",
                         crate::path_key::normalize_keep_drive(&row.path),
                     ));
-                    let before = folder_pane_widget_counts(ui.ctx());
                     let (arrow_resp, resp, row_rect) = ui
                         .scope_builder(
                             egui::UiBuilder::new()
@@ -1394,7 +1428,7 @@ impl App {
                             },
                         )
                         .inner;
-                    register_folder_pane_row_ids(ui.ctx(), &row_ids, &before, &row.path);
+                    register_folder_pane_row_ids(ui.ctx(), &row_ids, row_id, &row.path);
                     label_widgets.push(FolderPaneLabelWidgets {
                         path: row.path.clone(),
                         row_rect,
@@ -1493,6 +1527,7 @@ impl App {
             }
             cursor_revealed
         });
+        register_folder_pane_tooltip_ids(ui.ctx(), &row_ids, ui.layer_id());
         for widget in &mut label_widgets {
             widget.row_rect = widget.row_rect.intersect(output.inner_rect);
             widget.label_rect = widget.label_rect.intersect(output.inner_rect);
@@ -1917,6 +1952,17 @@ mod tests {
             .folder_pane
             .test_seed_listing(&root, added, true);
         h.run_steps(2);
+        assert!(
+            app.borrow()
+                .folder_pane
+                .label_display
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .any(|row| row.path == anchor && row.row_rect.is_positive()),
+            "anchor must be drawn in the updated pass before reading its temp rect"
+        );
         assert!((rect(&h.ctx, &anchor).top() - target.top()).abs() < 0.1);
         let mut reversed = children.clone();
         reversed.reverse();
@@ -1924,6 +1970,17 @@ mod tests {
             .folder_pane
             .test_seed_listing(&root, reversed, true);
         h.run_steps(2);
+        assert!(
+            app.borrow()
+                .folder_pane
+                .label_display
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .any(|row| row.path == anchor && row.row_rect.is_positive()),
+            "reordered anchor must be drawn before reading its temp rect"
+        );
         assert!((rect(&h.ctx, &anchor).top() - target.top()).abs() < 0.1);
         app.borrow_mut()
             .folder_pane
@@ -2276,12 +2333,33 @@ mod tests {
     fn virtual_tree_gamepad_up_down_reveal_across_the_visible_boundary() {
         let mut test = VirtualTreeTest::new(6000);
         test.settle();
-        let start = test.display().rows.last().unwrap().path.clone();
+        let start = test.paths[3000].clone();
         let logical = test.app.folder_pane.visible_rows();
         let index = logical.iter().position(|row| row.path == start).unwrap();
         test.app.folder_pane.set_cursor(start.clone());
         test.settle();
         for (y, expected) in [(-1.0, logical[index + 1].path.clone()), (1.0, start)] {
+            let cursor = test
+                .app
+                .folder_pane
+                .visible_rows()
+                .into_iter()
+                .find(|row| row.is_cursor)
+                .unwrap()
+                .path;
+            test.scroll_to(0);
+            assert!(
+                test.app
+                    .folder_pane
+                    .visible_rows()
+                    .iter()
+                    .any(|row| row.is_cursor && row.path == cursor),
+                "scroll must keep the cursor"
+            );
+            assert!(
+                !test.display().rows.iter().any(|row| row.path == expected),
+                "the next gamepad target must be outside this pass's draw set"
+            );
             test.pad_y = Some(y);
             test.frame(vec![]);
             test.settle();
@@ -2422,6 +2500,46 @@ mod tests {
     }
 
     #[test]
+    fn virtual_tree_focus_resolves_extra_rows_from_precomputed_key_index() {
+        let mut test = VirtualTreeTest::new(6000);
+        test.settle();
+        let target = test.paths[7].clone();
+        let id = test.row(&target).label;
+        test.frame(vec![VirtualTreeTest::action(
+            id,
+            egui::accesskit::Action::Focus,
+        )]);
+        test.scroll_to(3000);
+        test.frame(vec![]);
+        assert_eq!(test.ctx.memory(|memory| memory.focused()), Some(id));
+        assert_eq!(test.row(&target).label, id);
+        assert!(
+            !test.row(&target).row_rect.is_positive(),
+            "the focused row must be an off-screen extra, not a visible row"
+        );
+        test.assert_bound(1);
+
+        // Structural cost contract: extra-row resolution accepts only keys and
+        // the prebuilt index, iterates the requests, and cannot normalize paths
+        // or enumerate the logical-row index just because focus stays active.
+        let source = include_str!("ui_folder_pane.rs").replace("\r\n", "\n");
+        let resolver = source
+            .split_once("\nfn folder_pane_extra_row_indices(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        let resolver: String = resolver.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(resolver.contains("requested_paths.iter()"));
+        assert!(resolver.contains("row_indices.get(key)"));
+        assert!(!resolver.contains("normalize_keep_drive"));
+        assert!(!resolver.contains("row_indices.iter()"));
+        assert!(!resolver.contains("row_indices.keys()"));
+        assert!(!resolver.contains("row_indices.values()"));
+    }
+
+    #[test]
     fn virtual_tree_delayed_accesskit_actions_and_focus_draw_only_target_extras() {
         for action in [
             egui::accesskit::Action::Click,
@@ -2518,10 +2636,55 @@ mod tests {
         test.assert_bound(1);
     }
 
-    #[test]
-    fn virtual_tree_noninteractive_child_ids_and_tooltip_layers_are_indexed() {
+    fn virtual_tree_tooltip_index_scenario(historical_layers: usize, long_name: bool) {
         let mut test = VirtualTreeTest::new(6000);
+        if long_name {
+            test.paths[2] = test.root.join("very-long-elided-name-".repeat(20));
+            test.app
+                .folder_pane
+                .test_seed_listing(&test.root, test.paths.clone(), true);
+        }
+        if historical_layers > 0 {
+            // Seed both pass buffers. WidgetRects::clear retains these layer
+            // keys even after their widgets disappear from later passes.
+            for _ in 0..2 {
+                let ctx = test.ctx.clone();
+                let input = test.input(vec![]);
+                ctx.run_ui(input, |ui| {
+                    for i in 0..historical_layers {
+                        let id = egui::Id::unique(("historical_folder_tooltip", i));
+                        let mut old = ui.new_child(
+                            egui::UiBuilder::new()
+                                .scope_id(id)
+                                .layer_id(egui::LayerId::new(egui::Order::Tooltip, id)),
+                        );
+                        old.label("historical tooltip");
+                    }
+                })
+                .drop_without_applying_deltas();
+            }
+        }
         test.settle();
+        assert!(
+            test.ctx
+                .viewport(|viewport| viewport.prev_pass.widgets.layer_ids().len())
+                >= historical_layers
+        );
+        if historical_layers > 0 {
+            let old_layer = egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::unique(("historical_folder_tooltip", 0_usize)),
+            );
+            assert!(
+                test.ctx.viewport(|viewport| viewport
+                    .prev_pass
+                    .widgets
+                    .get_layer(old_layer)
+                    .next()
+                    .is_none()),
+                "historical layers must be retained but empty"
+            );
+        }
         let target = test.paths[2].clone();
         let pos = test.row(&target).label_rect.center();
         test.frame(vec![egui::Event::PointerMoved(pos)]);
@@ -2540,6 +2703,25 @@ mod tests {
             .ctx
             .data(|data| data.get_temp::<folder_pane::FolderPaneRowIds>(folder_pane_row_ids_id()))
             .unwrap();
+        // This fixture has only the hovered row's active tooltip layers.
+        // Check every widget on every such layer, not merely a minimum count;
+        // this includes automatic elision and any nested tooltip contents.
+        let tooltip_ids: Vec<_> = widgets
+            .iter()
+            .filter_map(|(layer, id)| (layer.order == egui::Order::Tooltip).then_some(*id))
+            .collect();
+        assert!(!tooltip_ids.is_empty());
+        {
+            let index = index.0.lock().unwrap();
+            for id in tooltip_ids {
+                assert!(
+                    index
+                        .get(&id.accesskit_id())
+                        .is_some_and(|path| **path == target),
+                    "every current tooltip widget must belong to the hovered row: {id:?}"
+                );
+            }
+        }
         let ids: Vec<_> = {
             let index = index.0.lock().unwrap();
             widgets
@@ -2570,6 +2752,32 @@ mod tests {
             test.row(&target);
             test.assert_bound(1);
         }
+    }
+
+    #[test]
+    fn virtual_tree_noninteractive_child_ids_and_tooltip_layers_are_indexed() {
+        virtual_tree_tooltip_index_scenario(0, false);
+    }
+
+    #[test]
+    fn virtual_tree_widget_index_ignores_historical_tooltip_layers() {
+        virtual_tree_tooltip_index_scenario(1000, true);
+        let source = include_str!("ui_folder_pane.rs").replace("\r\n", "\n");
+        let registration = source
+            .split_once("\nfn register_folder_pane_row_ids(")
+            .unwrap()
+            .1
+            .split_once("/// Pure row drawing")
+            .unwrap()
+            .0;
+        let registration: String = registration
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(!registration.contains(".layers()"));
+        assert!(!registration.contains(".layer_ids()"));
+        assert!(registration.contains("tooltips.widget_tooltips"));
+        assert!(registration.contains("Tooltip::tooltip_id(owner,ordinal)"));
     }
 
     #[test]
