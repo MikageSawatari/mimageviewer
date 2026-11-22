@@ -283,6 +283,101 @@ fn injected(_settings: &Settings) -> AgentIntegrationState {
 }
 
 #[test]
+fn agent_exposure_guide_permissions_follow_checks_at_every_level() {
+    for level in [
+        AgentLevel::Disabled,
+        AgentLevel::ReadOnly,
+        AgentLevel::ReadAndOpen,
+        AgentLevel::Organize,
+    ] {
+        for current_view in [false, true] {
+            for settings in [false, true] {
+                let mut selection = PermissionSelection::from(&Settings::default());
+                selection.level = level;
+                selection.current_view = current_view;
+                selection.settings = settings;
+                let result = exposure(selection);
+                assert!(
+                    result
+                        .shown
+                        .contains(&"使い方の説明 (マニュアルと同じ内容)")
+                );
+                assert!(result.hidden.iter().any(|line| line.contains("暗証番号")));
+                if level == AgentLevel::Disabled {
+                    assert_eq!(result.shown.len(), 1);
+                    assert_eq!(result.actions, ["なし"]);
+                    assert!(
+                        result
+                            .hidden
+                            .iter()
+                            .any(|line| line.contains("mIV の中の情報すべて"))
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    result.shown.contains(&"今開いている場所と表示中の項目"),
+                    current_view
+                );
+                assert_eq!(
+                    result.hidden.contains(&"今開いている場所と表示中の項目"),
+                    !current_view
+                );
+                assert_eq!(result.hidden.contains(&"環境設定の項目と値"), !settings);
+                assert_eq!(
+                    result
+                        .shown
+                        .iter()
+                        .any(|line| line.contains("外部ツールの実行ファイルと引数")),
+                    settings
+                );
+                for prefix in [
+                    "環境設定の変更",
+                    "外部ツールの登録",
+                    "スクリプト設定のオン・オフ",
+                    "お気に入りへの登録",
+                ] {
+                    assert_eq!(
+                        result.actions.iter().any(|line| line.starts_with(prefix)),
+                        settings
+                    );
+                }
+                assert!(
+                    result.shown.iter().any(
+                        |line| line.contains("許可の状態は渡しますが、AI からは変えられません")
+                    )
+                );
+                assert!(
+                    !result
+                        .shown
+                        .iter()
+                        .any(|line| line.contains("スクリプトの本文"))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn agent_guide_checkboxes_start_off_and_change_the_permission_selection() {
+    let mut harness = crate::test_ui::builder()
+        .with_size(egui::vec2(900.0, 1000.0))
+        .with_context_setup(crate::ui_fonts::configure_fonts)
+        .build_ui_state(draw_images, PermissionSelection::from(&Settings::default()));
+    harness.run();
+    assert!(!harness.state().current_view);
+    assert!(!harness.state().settings);
+    for label in [
+        "今開いている場所を AI に見せる",
+        "設定の確認と変更を AI に任せる",
+    ] {
+        harness.get_by_label(label).click();
+        harness.run();
+    }
+    assert!(harness.state().current_view);
+    assert!(harness.state().settings);
+}
+
+#[test]
 fn agent_exposure_all_sixty_four_permission_combinations() {
     let mut count = 0;
     for level in [
@@ -1475,6 +1570,8 @@ fn agent_integration_footer_close_stays_visible_after_scroll_and_preserves_saved
             app.settings.agent_show_gps = true;
             app.settings.agent_show_ai_captions = true;
             app.settings.agent_show_transcripts = true;
+            app.settings.agent_show_current_view = true;
+            app.settings.agent_allow_settings = true;
             assert!(app.settings.save_checked());
             app.open_agent_integration_dialog();
             app.agent_integration_dialog = Some(injected(&app.settings));

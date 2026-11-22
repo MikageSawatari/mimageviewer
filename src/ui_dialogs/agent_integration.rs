@@ -273,6 +273,18 @@ fn draw_images(ui: &mut egui::Ui, settings: &mut PermissionSelection) {
             ).wrap());
         });
     });
+    ui.checkbox(&mut settings.current_view, "今開いている場所を AI に見せる");
+    ui.checkbox(&mut settings.settings, "設定の確認と変更を AI に任せる");
+    ui.scope(|ui| {
+        ui.spacing_mut().indent = ui.spacing().icon_width + ui.spacing().icon_spacing;
+        ui.indent("settings_description", |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(concat!(
+                "環境設定の項目 (外部ツールの登録やスクリプト設定のオン・オフを含む) の確認と変更、",
+                "お気に入りへの登録と索引の切り替えを、確認なしで行います。",
+                "外部ツールは登録までで、実行するのはあなたが mIV で選んだときだけです。",
+            )).weak()).wrap());
+        });
+    });
     ui.add_space(8.0);
 }
 
@@ -285,19 +297,18 @@ struct Exposure {
 
 fn exposure(draft: PermissionSelection) -> Exposure {
     let mut result = Exposure {
-        shown: Vec::new(),
+        shown: vec!["使い方の説明 (マニュアルと同じ内容)"],
         hidden: vec![
             "画像・動画・音声の元データ",
             "PDF / ZIP の元のファイルのデータ (ページの縮小画像は上の設定の範囲で渡す)",
-            "許可の設定・検索の対象の場所を除く mIV の設定、PDF のパスワード・リモート接続の暗証番号",
+            "PDF のパスワード・リモート接続の暗証番号",
         ],
         actions: Vec::new(),
     };
     if draft.level == AgentLevel::Disabled {
-        result.shown.push("なし (AI 連携は無効です)");
         result
             .hidden
-            .push("ファイルの情報・縮小画像・撮影位置・AI 説明文・文字起こしを含む、すべての情報");
+            .push("ファイルやライブラリの情報、今開いている場所、環境設定の内容を含む、mIV の中の情報すべて (AI 連携は無効です)");
         result.actions.push("なし");
         return result;
     }
@@ -305,6 +316,7 @@ fn exposure(draft: PermissionSelection) -> Exposure {
         "ファイルの場所 (絶対パス)・名前・種類・大きさ・寸法・日時",
         "タグ・★・コレクション・本棚・閲覧履歴",
         "mIV の状態 (許可の設定・検索の対象の場所など)",
+        "AI 連携の許可の状態は渡しますが、AI からは変えられません",
         "撮影日時・機種などの EXIF、AI 生成画像の生成情報 (PNG tEXt チャンク・EXIF UserComment)",
     ]);
     if draft.thumbnails {
@@ -329,6 +341,22 @@ fn exposure(draft: PermissionSelection) -> Exposure {
     } else {
         result.hidden.push("文字起こし");
     }
+    if draft.current_view {
+        result.shown.push("今開いている場所と表示中の項目");
+    } else {
+        result.hidden.push("今開いている場所と表示中の項目");
+    }
+    if draft.settings {
+        result.shown.push("環境設定の項目と値 (起動時のフォルダや保存先などの場所、外部ツールの実行ファイルと引数を含む)");
+        result.actions.extend([
+            "環境設定の変更 (確認なし。環境設定の画面で変えたときと同じ結果になります)",
+            "外部ツールの登録・変更・削除 (実行はしません)",
+            "スクリプト設定のオン・オフ (本文の読み書きはできません)",
+            "お気に入りへの登録、索引の切り替え (確認なし)",
+        ]);
+    } else {
+        result.hidden.push("環境設定の項目と値");
+    }
     result.actions.push("情報の読み取り・検索");
     if draft.level >= AgentLevel::ReadAndOpen {
         result.actions.push("mIV の画面で開く (表示が切り替わる)");
@@ -338,6 +366,7 @@ fn exposure(draft: PermissionSelection) -> Exposure {
             .actions
             .push("タグ・★・コレクションの変更 (確認なし。1 回 500 件まで)");
     }
+    result.actions.push("AI 連携の許可とリモート接続の暗証番号は変えられません。ツールバーの表示・キー割り当てなど、環境設定の外で変える設定や、フォントの変更・LUT の一覧の編集など一部の項目は、まだ変えられません");
     result
 }
 
@@ -367,7 +396,7 @@ fn draw_exposure(ui: &mut egui::Ui, settings: &PermissionSelection) {
     ui.label("この情報は、お使いの AI アプリ (Claude / ChatGPT) の提供元へ送られます。各社のプライバシーポリシーに従って扱われます。mIV の開発者には送られません。");
     ui.colored_label(
         ui.visuals().warn_fg_color,
-        "許可の範囲の中の操作は、AI アプリの確認なしで実行されます。ここで選ぶ範囲が唯一の上限です。",
+        "許可の範囲とチェックで許した操作は、AI アプリの確認なしで実行されます。ここで選ぶ範囲とチェックが上限です。",
     );
     ui.add_space(12.0);
 }
@@ -703,7 +732,7 @@ fn draw_body(
 ) {
     let label = ui.label(egui::RichText::new("許可の範囲").strong());
     draw_permission(ui, settings).labelled_by(label.id);
-    ui.label(egui::RichText::new("縮小画像・撮影位置・AI 説明文・文字起こし").strong());
+    ui.label(egui::RichText::new("AI に渡す情報・任せる操作").strong());
     draw_images(ui, settings);
     ui.label(egui::RichText::new("AI に見せる範囲").strong());
     draw_exposure(ui, settings);
@@ -971,6 +1000,8 @@ pub fn draw_agent_integration_snapshot_fixture(ui: &mut egui::Ui, level: u8) {
     settings.gps = level >= 2;
     settings.ai_captions = level >= 2;
     settings.transcripts = level >= 2;
+    settings.current_view = level >= 2;
+    settings.settings = level >= 2;
     let command = backend::RegistrationCommand {
         command: r"C:\mImageViewer\mimageviewer-mcp.exe".into(),
         args: vec!["--data-dir".into(), r"C:\mImageViewer\data".into()],

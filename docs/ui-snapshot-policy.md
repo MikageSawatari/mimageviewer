@@ -1,5 +1,13 @@
 # UI スナップショットテスト運用方針
 
+§1.843 の AI 連携は、既存の `agent_integration_window_{disabled,read,open,organize,records}_{light,dark}`
+の10枚を更新対象にする。新しい許可2つと補足、3区画の表示、確認なしで実行する範囲の説明を追加した。
+disabled / read は新しいチェックをOFF、open / organize / records はONにして描く。
+新しいPNGや登録確認画面の更新は不要。1093×614 / 1366×728、100% / 200%の閉じる操作と末尾への
+スクロールの検査は、既存のheadlessテストで全許可ONを扱う。
+**PNGは未更新・未目視、Cargo検査は未実行**。設計担当が更新指定ありで生成して差分を確認し、
+更新指定なしで通常比較する。以前の成功記録をこの変更の証拠に流用しない。
+
 §1.823〜§1.826 の拡張では、環境設定fixtureの定義を更新した。既存の
 `fullscreen_in_page_scroll_settings_light_default` / `fullscreen_in_page_scroll_settings_dark_enabled`
 は540×220から540×340へ拡大し、滑らかな移動と N 字 / Z 字の移動量の行を加える。
