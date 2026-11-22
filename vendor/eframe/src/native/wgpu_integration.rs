@@ -833,9 +833,8 @@ impl WgpuWinitRunning<'_> {
         // The painter records only inside this operation (begin..finish), so a
         // record never belongs to another frame. No clock is read while off.
         let mut diag_lap = diag_on.then(std::time::Instant::now);
-        if let Some(begin) = diag_lap {
-            egui_wgpu::frame_diag::begin_root_pass(begin);
-        }
+        // Dropped unfinished on a logic-only pass or any early return.
+        let diag_scope = diag_lap.map(egui_wgpu::frame_diag::begin_root_pass);
         let mut diag_mark = |slot: &mut f64| {
             if let Some(lap) = &mut diag_lap {
                 let now = std::time::Instant::now();
@@ -1254,9 +1253,9 @@ impl WgpuWinitRunning<'_> {
             app.as_mut(),
             shared,
         );
-        if diag_on {
+        if let Some(scope) = diag_scope {
             diag.end = Some(std::time::Instant::now());
-            egui_wgpu::frame_diag::finish_root_pass(diag);
+            scope.finish(diag);
         }
 
         if integration.should_close() {

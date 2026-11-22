@@ -63,11 +63,38 @@ static ROOT_BEGIN: Mutex<Option<Instant>> = Mutex::new(None);
 /// True only between `begin_root_pass` and `finish_root_pass` of one eframe ROOT operation.
 static ROOT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// One eframe ROOT operation being recorded. Every exit closes it: `finish` publishes
+/// the record; dropping it unfinished (a logic-only pass, an early return) discards it.
+#[must_use]
+pub struct RootPassScope {
+    finished: bool,
+}
+
 /// Start one ROOT operation's record; drops any paint record not owned by it.
-pub fn begin_root_pass(at: Instant) {
+pub fn begin_root_pass(at: Instant) -> RootPassScope {
     *PAINT.lock().unwrap() = None;
     *ROOT_BEGIN.lock().unwrap() = Some(at);
     ROOT_ACTIVE.store(true, Ordering::Relaxed);
+    RootPassScope { finished: false }
+}
+
+impl RootPassScope {
+    /// Close the operation: attach its own paint record (None when it did not paint).
+    pub fn finish(mut self, mut pass: RootPass) {
+        self.finished = true;
+        ROOT_ACTIVE.store(false, Ordering::Relaxed);
+        pass.paint = PAINT.lock().unwrap().take();
+        *ROOT.lock().unwrap() = Some(pass);
+    }
+}
+
+impl Drop for RootPassScope {
+    fn drop(&mut self) {
+        if !self.finished {
+            ROOT_ACTIVE.store(false, Ordering::Relaxed);
+            *PAINT.lock().unwrap() = None;
+        }
+    }
 }
 
 /// Whether the painter may record its stages (inside a recorded ROOT operation).
@@ -81,12 +108,6 @@ fn record_root_paint(stages: PaintStages) {
     }
 }
 
-/// Close the ROOT operation: attach its own paint record (None when it did not paint).
-pub fn finish_root_pass(mut pass: RootPass) {
-    ROOT_ACTIVE.store(false, Ordering::Relaxed);
-    pass.paint = PAINT.lock().unwrap().take();
-    *ROOT.lock().unwrap() = Some(pass);
-}
 
 /// The previous completed ROOT pass (taken once).
 pub fn take_root_pass() -> Option<RootPass> {
@@ -146,5 +167,29 @@ impl PaintClock {
 impl Drop for PaintClock {
     fn drop(&mut self) {
         record_root_paint(self.stages);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unfinished_root_scope_closes_and_discards_its_paint() {
+        let scope = begin_root_pass(Instant::now());
+        assert!(root_pass_active());
+        record_root_paint(PaintStages {
+            meshes: 1,
+            ..Default::default()
+        });
+        drop(scope); // logic-only pass or early return
+        assert!(!root_pass_active());
+        // Outside a scope the painter does not record, and nothing leaks into the next one.
+        record_root_paint(PaintStages::default());
+        let scope = begin_root_pass(Instant::now());
+        scope.finish(RootPass::default());
+        let pass = take_root_pass().unwrap();
+        assert!(pass.paint.is_none());
+        assert!(!root_pass_active());
     }
 }
