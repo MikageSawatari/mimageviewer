@@ -69,6 +69,7 @@ impl App {
             snapshot.book_order_deferred = self.accept_book_order_root_close(ctx, intent);
             snapshot.process_deferred = self.accept_settings_family_root_close(ctx, intent);
             snapshot.process_deferred |= self.accept_composition_editor_root_close(ctx);
+            snapshot.process_deferred |= self.accept_browser_integration_root_close(ctx, intent);
             snapshot.zip_deferred = self.accept_image_folder_zip_root_close(ctx, intent);
             if sidecar_rejected {
                 ctx.send_viewport_cmd_to(
@@ -139,6 +140,7 @@ impl App {
         self.poll_composition_editor_save_receipts(ctx);
         self.resume_composition_editor_root_close(ctx);
         self.service_settings_family_operation(ctx);
+        self.poll_browser_integration(ctx);
         self.service_image_folder_zip_exit(ctx);
         self.service_discarded_sidecar_restore(ctx);
     }

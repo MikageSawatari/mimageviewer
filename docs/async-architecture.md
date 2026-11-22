@@ -2820,6 +2820,14 @@ root の既存 process-global poll 区間で完了を回収するので、環境
 登録の結果を live Settings へ採用してから別 worker で2項目を永続化する。この間も同じ owner の処理中状態を保つ。全体設定の古い snapshot は保存しない。設定ファイルから取り込んだ新規2項目も、OK 時に同じ owner を通す（既存の他項目の適用は維持）。
 まれな失敗はログと通知で割り切る。保存失敗でも登録を巻き戻さず、通常の設定・画像・使用中の世代を破棄しない。
 
+通常のプロセス終了は root lifecycle の他の owner と同じ継続へ接続する。登録 owner が
+消費した `RootCloseIntent` を一つ保持し、準備・登録・解除・保存先操作・部分保存の終端まで
+CancelClose して、live Settings の採用と保存後に共通の root 終了へ一度だけ戻す。
+worker 完了済みでも root 未回収なら待機対象で、Quit を後の普通の Close で格下げしない。
+トレイ退避は登録を待たず従来どおり行う。描画しない LogicOnly も同じ receipt poll を行う。
+最終 `on_exit_inner` は迂回経路への fence として既発行 worker の結果を回収し、live へ採用してから
+従来の全体保存へ進む。ここでは新しい登録・部分保存・再試行は始めない。
+
 ## ブラウザ表示 pipe と一回の中継処理（§1.818 段階5〜6）
 
 `ActivationListener` が browser listener と stop event を所有し、接続・読取・書込・応答後の EOF 待ちを

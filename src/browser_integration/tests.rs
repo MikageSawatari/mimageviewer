@@ -495,8 +495,9 @@ fn prepared(env: Environment) -> Prepared {
         message: None,
     }
 }
-fn service(ready: Prepared, backend: Arc<FakeBackend>) -> BrowserIntegration {
+fn service(ready: Prepared, backend: Arc<dyn Backend>) -> BrowserIntegration {
     BrowserIntegration {
+        close: None,
         default_output: Some(ready.env.default_output.clone()),
         state: BrowserIntegrationState::Available(ready),
         backend,
@@ -612,6 +613,104 @@ fn browser818_registration_preparing_and_unavailable_never_admit_or_retry_operat
 }
 
 #[test]
+fn browser818_registration_close_continuation_spans_action_and_persistence() {
+    let root = tempfile::tempdir().unwrap();
+    let mut owner = service(
+        prepared(environment(root.path())),
+        Arc::new(FakeBackend::default()),
+    );
+    let ctx = egui::Context::default();
+    let selection = Selection {
+        enabled: true,
+        output_dir: None,
+    };
+    let mut settings = crate::settings::Settings::default();
+    assert!(owner.submit(Action::Apply(selection.clone()), &ctx));
+    assert!(owner.defer_root_close(RootCloseIntent::WindowClose));
+    assert!(owner.defer_root_close(RootCloseIntent::ApplicationQuit));
+    assert!(owner.defer_root_close(RootCloseIntent::WindowClose));
+    assert_eq!(owner.take_ready_close(), None);
+    await_worker(&mut owner);
+    assert!(matches!(
+        owner.poll(&mut settings, &ctx),
+        Some(Event::Changed(_, None))
+    ));
+    assert_eq!(Selection::from_settings(&settings), selection);
+    assert_eq!(owner.take_ready_close(), None);
+    assert!(!owner.submit(Action::Remove, &ctx));
+    await_worker(&mut owner);
+    assert!(owner.poll(&mut settings, &ctx).is_none());
+    assert_eq!(
+        owner.take_ready_close(),
+        Some(RootCloseIntent::ApplicationQuit)
+    );
+    assert_eq!(owner.take_ready_close(), None);
+}
+
+#[test]
+fn browser818_registration_close_continuation_covers_startup_preparation() {
+    let root = tempfile::tempdir().unwrap();
+    let ready = prepared(environment(root.path()));
+    let mut owner = service(ready, Arc::new(FakeBackend::default()));
+    owner.state = BrowserIntegrationState::Preparing(PreparationTask::NotStarted);
+    assert!(owner.defer_root_close(RootCloseIntent::ApplicationQuit));
+    assert_eq!(owner.take_ready_close(), None);
+    let ctx = egui::Context::default();
+    let mut settings = crate::settings::Settings::default();
+    // Inject the startup worker's channel at the next phase boundary. A rejected
+    // Close must not permanently disable an otherwise available integration.
+    let (tx, rx) = mpsc::channel();
+    owner.state = BrowserIntegrationState::Preparing(PreparationTask::Running(rx));
+    assert!(owner.defer_root_close(RootCloseIntent::ApplicationQuit));
+    assert!(owner.poll(&mut settings, &ctx).is_none());
+    tx.send(Preparation {
+        default_output: None,
+        ready: Err("injected startup failure".into()),
+    })
+    .ok()
+    .unwrap();
+    assert!(owner.poll(&mut settings, &ctx).is_none());
+    assert_eq!(
+        owner.take_ready_close(),
+        Some(RootCloseIntent::ApplicationQuit)
+    );
+    assert_eq!(owner.take_ready_close(), None);
+}
+
+#[test]
+fn browser818_registration_error_or_disconnect_retires_only_its_close_continuation() {
+    let root = tempfile::tempdir().unwrap();
+    for disconnected in [false, true] {
+        let mut ready = prepared(environment(root.path()));
+        ready.selection.enabled = true;
+        let mut owner = service(ready.clone(), Arc::new(FakeBackend::default()));
+        let (tx, rx) = mpsc::channel();
+        if !disconnected {
+            tx.send(Err("injected action failure".into())).unwrap();
+        }
+        drop(tx);
+        owner.state = BrowserIntegrationState::Processing {
+            prepared: ready,
+            kind: JobKind::Action(Action::Remove),
+            rx,
+        };
+        let mut settings = crate::settings::Settings::default();
+        settings.browser_integration_enabled = true;
+        assert!(owner.defer_root_close(RootCloseIntent::ApplicationQuit));
+        assert!(matches!(
+            owner.poll(&mut settings, &egui::Context::default()),
+            Some(Event::Failed(_))
+        ));
+        assert!(settings.browser_integration_enabled);
+        assert_eq!(
+            owner.take_ready_close(),
+            Some(RootCloseIntent::ApplicationQuit)
+        );
+        assert_eq!(owner.take_ready_close(), None);
+    }
+}
+
+#[test]
 fn browser818_registration_uninstaller_owns_only_matching_manifest_and_does_not_follow_links() {
     let script = include_str!("../../installer/mimageviewer.iss");
     for key in REGISTRY_KEYS {
@@ -634,6 +733,271 @@ fn browser818_registration_uninstaller_owns_only_matching_manifest_and_does_not_
 
 mod gpu_tests {
     use super::*;
+
+    struct LifecycleBackend {
+        entered: mpsc::Sender<&'static str>,
+        proceed: Mutex<mpsc::Receiver<()>>,
+        registration: Mutex<Selection>,
+        picked: Selection,
+    }
+    impl Backend for LifecycleBackend {
+        fn prepare(&self, _: Selection) -> Preparation {
+            panic!("the lifecycle fixture already prepared its isolated environment")
+        }
+        fn perform(&self, mut prepared: Prepared, action: Action) -> Result<Completion, String> {
+            self.entered.send("action").unwrap();
+            self.proceed.lock().unwrap().recv().unwrap();
+            let selection = match action {
+                Action::Apply(selection) => selection,
+                Action::Remove => Selection {
+                    enabled: false,
+                    ..prepared.selection.clone()
+                },
+                Action::ChooseFolder => self.picked.clone(),
+                Action::OpenFolder(_) => panic!("not a registration change"),
+            };
+            *self.registration.lock().unwrap() = selection.clone();
+            prepared.selection = selection.clone();
+            prepared.registered = selection.enabled;
+            Ok(Completion {
+                prepared,
+                selection: Some(selection),
+            })
+        }
+        fn persist(&self, selection: &Selection) -> Result<(), String> {
+            self.entered.send("persist").unwrap();
+            self.proceed.lock().unwrap().recv().unwrap();
+            crate::settings::save_browser_integration_worker(
+                selection.enabled,
+                &selection.output_dir,
+            )
+        }
+    }
+
+    fn close_input() -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .entry(egui::ViewportId::ROOT)
+            .or_default()
+            .events
+            .push(egui::ViewportEvent::Close);
+        input
+    }
+
+    fn saved_selection() -> Selection {
+        Selection::from_settings(
+            &crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap(),
+        )
+    }
+
+    fn registration_close_round_trip(completed_before_close: bool) {
+        // Each row uses actual worker completions and the real two-key DB save;
+        // registry effects are an injected value, never the user's registration.
+        for operation in ["enable", "remove", "destination", "picker"] {
+            let mut app = crate::app::tests::phase_c_support::setup_app();
+            app.settings.minimize_to_tray_on_close = false;
+            let initial = Selection {
+                enabled: operation != "enable",
+                output_dir: Some(app.tmp.path().join("old-images")),
+            };
+            let target = Selection {
+                enabled: operation != "remove",
+                output_dir: if matches!(operation, "destination" | "picker") {
+                    Some(app.tmp.path().join("new-images"))
+                } else {
+                    initial.output_dir.clone()
+                },
+            };
+            initial.apply(&mut app.settings);
+            assert!(app.settings.save_checked());
+            assert_eq!(saved_selection(), initial);
+            let mut ready = prepared(environment(app.tmp.path()));
+            ready.selection = initial.clone();
+            ready.registered = initial.enabled;
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (proceed_tx, proceed_rx) = mpsc::channel();
+            let registration = Arc::new(LifecycleBackend {
+                entered: entered_tx,
+                proceed: Mutex::new(proceed_rx),
+                registration: Mutex::new(initial.clone()),
+                picked: target.clone(),
+            });
+            app.browser_integration = service(ready, registration.clone());
+            let ctx = egui::Context::default();
+            let action = match operation {
+                "remove" => Action::Remove,
+                "picker" => Action::ChooseFolder,
+                _ => Action::Apply(target.clone()),
+            };
+            assert!(app.browser_integration.submit(action, &ctx));
+            assert_eq!(
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap(),
+                "action"
+            );
+            if completed_before_close {
+                proceed_tx.send(()).unwrap();
+                await_worker(&mut app.browser_integration);
+                assert_eq!(*registration.registration.lock().unwrap(), target);
+                assert_eq!(Selection::from_settings(&app.settings), initial);
+            }
+            // Exercise both explicit Quit and ordinary non-tray Close.
+            let intent = if operation == "remove" {
+                app.shutdown_requested
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                RootCloseIntent::ApplicationQuit
+            } else {
+                RootCloseIntent::WindowClose
+            };
+            let mut backend = eframe::HeadlessEpiIntegration::new(ctx);
+            let (output, _) = backend.update_logic_only(&mut app.app, close_input());
+            assert!(!backend.should_close());
+            assert!(
+                output.viewport_commands[&egui::ViewportId::ROOT]
+                    .contains(&egui::ViewportCommand::CancelClose)
+            );
+            assert_eq!(app.browser_integration.close, Some(intent));
+            assert!(
+                !app.browser_integration
+                    .submit(Action::Remove, &egui::Context::default())
+            );
+            if !completed_before_close {
+                assert_eq!(Selection::from_settings(&app.settings), initial);
+                proceed_tx.send(()).unwrap();
+                await_worker(&mut app.browser_integration);
+                let (output, _) = backend.update_logic_only(&mut app.app, Default::default());
+                assert!(
+                    !output
+                        .viewport_commands
+                        .get(&egui::ViewportId::ROOT)
+                        .is_some_and(|commands| commands.contains(&egui::ViewportCommand::Close))
+                );
+            }
+            assert_eq!(
+                entered_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .unwrap(),
+                "persist"
+            );
+            assert_eq!(Selection::from_settings(&app.settings), target);
+            assert_eq!(
+                saved_selection(),
+                initial,
+                "the save worker is deliberately held"
+            );
+            let (_, _) = backend.update_logic_only(&mut app.app, close_input());
+            assert!(
+                !backend.should_close(),
+                "an additional Close cannot skip persistence"
+            );
+            proceed_tx.send(()).unwrap();
+            await_worker(&mut app.browser_integration);
+            let (output, _) = backend.update_logic_only(&mut app.app, Default::default());
+            assert!(
+                !backend.should_close(),
+                "the resumed Close is the next delivery"
+            );
+            assert_eq!(
+                output.viewport_commands[&egui::ViewportId::ROOT]
+                    .iter()
+                    .filter(|command| matches!(command, egui::ViewportCommand::Close))
+                    .count(),
+                1
+            );
+            assert_eq!(app.browser_integration.close, None);
+            assert_eq!(saved_selection(), target);
+            backend.update_logic_only(&mut app.app, close_input());
+            assert!(backend.should_close());
+            eframe::App::on_exit(&mut app.app, None);
+            assert_eq!(
+                saved_selection(),
+                target,
+                "exit must not overwrite the result with old settings"
+            );
+            assert_eq!(*registration.registration.lock().unwrap(), target);
+        }
+    }
+
+    #[test]
+    fn browser818_registration_completed_worker_unpolled_quit_saves_matching_database() {
+        registration_close_round_trip(true);
+    }
+
+    #[test]
+    fn browser818_registration_inflight_worker_close_waits_for_adoption_and_database() {
+        registration_close_round_trip(false);
+    }
+
+    #[test]
+    fn browser818_registration_exit_fence_adopts_unpolled_result_before_final_save() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.settings.browser_integration_enabled = false;
+        assert!(app.settings.save_checked());
+        let fake = Arc::new(FakeBackend::default());
+        app.browser_integration = service(prepared(environment(app.tmp.path())), fake.clone());
+        let target = Selection {
+            enabled: true,
+            output_dir: Some(app.tmp.path().join("images")),
+        };
+        assert!(
+            app.browser_integration
+                .submit(Action::Apply(target.clone()), &egui::Context::default())
+        );
+        await_worker(&mut app.browser_integration);
+        assert!(!app.settings.browser_integration_enabled);
+        eframe::App::on_exit(&mut app.app, None);
+        assert_eq!(saved_selection(), target);
+        assert!(
+            fake.persisted.lock().unwrap().is_empty(),
+            "the final full save owns persistence"
+        );
+    }
+
+    #[test]
+    fn browser818_registration_tray_hide_keeps_operation_without_a_quit_continuation() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.settings.minimize_to_tray_on_close = true;
+        app.tray_controller = Some(crate::tray::TrayController::controller_for_test());
+        let mut ready = prepared(environment(app.tmp.path()));
+        ready.selection.enabled = true;
+        app.settings.browser_integration_enabled = true;
+        let mut completed = ready.clone();
+        completed.selection.enabled = false;
+        let target = completed.selection.clone();
+        let fake = Arc::new(FakeBackend::default());
+        app.browser_integration = service(ready.clone(), fake);
+        let (tx, rx) = mpsc::channel();
+        app.browser_integration.state = BrowserIntegrationState::Processing {
+            prepared: ready,
+            kind: JobKind::Action(Action::Remove),
+            rx,
+        };
+        let ctx = egui::Context::default();
+        let mut backend = eframe::HeadlessEpiIntegration::new(ctx.clone());
+        backend.update_logic_only(&mut app.app, close_input());
+        assert!(!backend.should_close());
+        assert!(!app.window_visible);
+        assert_eq!(app.browser_integration.close, None);
+        tx.send(Ok(Completion {
+            prepared: completed,
+            selection: Some(target.clone()),
+        }))
+        .unwrap();
+        app.poll_browser_integration(&ctx);
+        await_worker(&mut app.browser_integration);
+        let mut output = ctx.run_pass(Default::default(), |ctx| app.poll_browser_integration(ctx));
+        output.textures_delta.clear(); // assertions must not double-panic on drop
+        assert!(
+            !output
+                .viewport_output
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|viewport| viewport.commands.contains(&egui::ViewportCommand::Close))
+        );
+        assert_eq!(app.browser_integration.close, None);
+        assert_eq!(Selection::from_settings(&app.settings), target);
+    }
     #[test]
     fn browser818_registration_root_collects_completion_after_preferences_close() {
         let mut app = crate::app::tests::phase_c_support::setup_app();

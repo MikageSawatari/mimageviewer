@@ -2,6 +2,7 @@
 pub(crate) mod backend;
 #[cfg(test)]
 mod tests;
+use crate::app::root_lifecycle::RootCloseIntent;
 use eframe::egui;
 use std::{
     path::PathBuf,
@@ -116,6 +117,9 @@ pub(crate) struct BrowserIntegration {
     state: BrowserIntegrationState,
     default_output: Option<PathBuf>,
     backend: Arc<dyn Backend>,
+    // One consumed root-close continuation, owned here like the other lifecycle
+    // participants. It is independent of the registration/persistence phase.
+    close: Option<RootCloseIntent>,
 }
 impl Default for BrowserIntegration {
     fn default() -> Self {
@@ -129,10 +133,75 @@ impl Default for BrowserIntegration {
             },
             default_output: None,
             backend: Arc::new(backend::NativeBackend),
+            close: None,
         }
     }
 }
 impl BrowserIntegration {
+    fn has_pending_work(&self) -> bool {
+        matches!(
+            self.state,
+            BrowserIntegrationState::Preparing(_) | BrowserIntegrationState::Processing { .. }
+        )
+    }
+
+    fn defer_root_close(&mut self, intent: RootCloseIntent) -> bool {
+        if !self.has_pending_work() {
+            return false;
+        }
+        if self.close != Some(RootCloseIntent::ApplicationQuit) {
+            self.close = Some(intent);
+        }
+        true
+    }
+
+    fn take_ready_close(&mut self) -> Option<RootCloseIntent> {
+        if self.has_pending_work() {
+            return None;
+        }
+        self.close.take()
+    }
+
+    /// Last process-exit fence, before any final Settings save. Normal Close
+    /// remains asynchronous; only an exit which bypassed its admission reaches
+    /// this with a live worker. Receive its result, never redo its filesystem or
+    /// registry work on the UI thread. This mirrors the settings-family fence.
+    pub(crate) fn finish_for_exit(&mut self, settings: &mut crate::settings::Settings) {
+        self.close = None;
+        let state = std::mem::replace(
+            &mut self.state,
+            BrowserIntegrationState::Unavailable {
+                reason: "終了しています。".into(),
+            },
+        );
+        match state {
+            BrowserIntegrationState::Preparing(PreparationTask::Running(rx)) => match rx.recv() {
+                Ok(preparation) => match preparation.ready {
+                    Ok(prepared) => {
+                        if let Some(message) = prepared.message {
+                            crate::logger::log(format!("browser_registration: {message}"));
+                        }
+                    }
+                    Err(error) => crate::logger::log(format!("browser_registration: {error}")),
+                },
+                Err(error) => crate::logger::log(format!("browser_registration: {error}")),
+            },
+            BrowserIntegrationState::Processing { rx, .. } => match rx.recv() {
+                Ok(Ok(completion)) => {
+                    if let Some(selection) = completion.selection {
+                        selection.apply(settings);
+                    }
+                    // An already-running partial save has also completed here.
+                    // Do not start another one: the caller's final full save
+                    // includes the adopted selection and all other live values.
+                }
+                Ok(Err(error)) => crate::logger::log(format!("browser_registration: {error}")),
+                Err(error) => crate::logger::log(format!("browser_registration: {error}")),
+            },
+            _ => {}
+        }
+    }
+
     fn pending_selection(&self) -> Option<Selection> {
         match &self.state {
             BrowserIntegrationState::Processing {
@@ -314,6 +383,9 @@ impl BrowserIntegration {
         }
     }
     pub fn submit(&mut self, action: Action, ctx: &egui::Context) -> bool {
+        if self.close.is_some() {
+            return false;
+        }
         let BrowserIntegrationState::Available(prepared) = &self.state else {
             return false;
         };
@@ -366,6 +438,28 @@ impl BrowserIntegration {
 }
 
 impl crate::app::App {
+    pub(crate) fn accept_browser_integration_root_close(
+        &mut self,
+        ctx: &egui::Context,
+        intent: RootCloseIntent,
+    ) -> bool {
+        if matches!(intent, RootCloseIntent::TrayHide)
+            || (matches!(intent, RootCloseIntent::WindowClose)
+                && self.settings.minimize_to_tray_on_close
+                && self.tray_controller.is_some())
+        {
+            return false;
+        }
+        let deferred = self.browser_integration.defer_root_close(intent);
+        if deferred {
+            ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::CancelClose);
+            // The receipt may already be queued and its worker's repaint may
+            // have been consumed. Schedule adoption, not a timed/busy wait.
+            ctx.request_repaint();
+        }
+        deferred
+    }
+
     pub(crate) fn poll_browser_integration(&mut self, ctx: &egui::Context) {
         let pending_selection = self.browser_integration.pending_selection();
         let draft_before = match (&self.browser_integration.state, self.pref_state.as_ref()) {
@@ -417,6 +511,9 @@ impl crate::app::App {
         }
         if let Some(preferences) = self.pref_state.as_mut() {
             preferences.browser_integration_view = self.browser_integration.view(&self.settings);
+        }
+        if let Some(intent) = self.browser_integration.take_ready_close() {
+            self.resume_root_lifecycle_close(ctx, intent);
         }
     }
     pub(crate) fn submit_browser_integration_preferences(&mut self, ctx: &egui::Context) {

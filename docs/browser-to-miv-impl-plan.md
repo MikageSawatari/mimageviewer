@@ -695,6 +695,15 @@ portable・明示 `--data-dir`・launcher 不明の起動は、既存登録も�
 - installer は usPostUninstall で自己 manifest を指す HKCU だけを解除し、管理フォルダを reparse point をたどらず削除する。画像の保存先と拡張は対象外。実行アカウント以外の登録は残る旨を UI に表示する。
 - UI の新規文言あり。`check_ui_glyphs.py` と Rust の各 filter、4件の snapshot の生成・目視・通常比較、Inno のビルドは設計担当へ引き継ぐ。cargo は最後の fmt のみとし、コンパイル・テスト・実登録・製品起動は行わない。
 
+**段階7の独立レビュー修正（P1・P2、2026-11-22、検証・再レビュー待ち）**
+
+- P1 の不変条件は、通常終了が「登録処理の完了 → root が結果を live Settings へ採用 → 2キー保存の終端」より先へ進まないこと。従来は画面寿命から独立した poll だけで、終了受付との接続がなく、worker 完了済み・root 未回収から古い enabled を終了保存し得た。
+- `root_lifecycle::accept_root_lifecycle_request` に他の後片付け owner と同じ参加口を足した。`BrowserIntegration` が `Option<RootCloseIntent>` の一つの消費済み継続を持ち、準備／登録／解除／保存先更新／保存中は CancelClose。追加の登録操作は受け付けない。既存の worker 完了 repaint と非blocking poll で進み、保存まで終わってから継続を一度だけ取り出し、`resume_root_lifecycle_close` へ戻す。Quit は普通の Close で格下げしない。App の bool、時間窓、再試行は足さない。
+- フォルダ picker も同じ worker の Action なので、通常終了で receiver を同期受信する案は採らなかった。未完了の picker を含め UI を止めず、既存の終了継続に乗せる。トレイ退避はプロセス終了ではないため、その場で従来どおり退避し、登録は継続する。LogicOnly の service にも同じ poll を接続する。
+- `on_exit_inner` の最初に最終 fence を置く。通常の終了受付を迂回してここへ来た場合だけ、既に発行した worker の receiver を受け取り、結果を live に採用し、既に進んでいる部分保存の終端を確かめる。その後の既存の終了保存が新しい値を含む。ここで registry／ファイル操作のやり直しや、新たな部分保存は行わない。描画中の同期I/Oではなく、終了時の Settings-family／sidecar 等と同じ最終所有境界での結果回収であり、通常の描画・入力には待ちを持ち込まない。
+- GPU group の新しい handler-level 回帰で、worker 完了・root 未回収と worker 未完了の各状態から、実際の root Close／Quit、採用、部分保存、再開された Close、終了保存まで通す。登録・解除・保存先更新・picker を注入し、終了後の実DBと注入した登録結果の一致を検査する。保存中の追加 Close、トレイ退避、受付を迂回した on_exit、準備中／error／channel切断も検査する。実レジストリ・desktop は触れない。
+- P2 のUI注意を「★固定中は、ブラウザ閲覧の保存先が固定の範囲の外にあると、ブラウザからの画像を開けません。」へ修正。段階9のマニュアルは既に範囲外の条件を明記しているため変更しない。UI文言の glyph 検査と4件のsnapshot再生成・目視は設計担当へ引き渡す。cargo は最後の fmt のみ、今回のビルド・テストは未実行。
+
 ### 段階8：製品の拡張とストア別 ZIP
 
 **範囲**

@@ -20,6 +20,7 @@ impl App {
         self.poll_composition_editor_save_receipts(ctx);
         self.resume_composition_editor_root_close(ctx);
         self.service_settings_family_operation(ctx);
+        self.poll_browser_integration(ctx);
         self.service_image_folder_zip_exit(ctx);
         self.service_discarded_sidecar_restore(ctx);
         self.poll_spread_shift_service();
