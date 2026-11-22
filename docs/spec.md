@@ -2927,6 +2927,7 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `show_toolbar_rating` | bool | true | ツールバーにレーティング（★）フィルタを表示 |
 | `show_toolbar_cols` / `show_toolbar_aspect` / `show_toolbar_sort` | bool | true（ソートの生成・リセット既定は false、旧設定の省略は true） | ツールバーに列 / 比率 / ソートセクションを表示 (v2.0.0)。空き領域右クリックで切替。項目が無くてもセクションのラベルは残す |
 | `show_facet_sort` | bool | true（旧設定の省略は false） | 絞り込みバー右側の独立したソートドロップダウン。上部表示とは独立、ソート状態と候補は共通。生成・リセット既定は ON、上部ソートは OFF。旧設定の省略時は OFF を維持する |
+| `show_grid_edge_buttons` | bool | false（欠落時も false） | 「先頭」「末尾」ボタンは既定で非表示。ツールバー表示メニュー、上部ソート区画のメニュー、ボタン自体、絞り込みバーの「ソート:」ラベルの右クリックで切替。絞り込みバーのソート枠を描くときは「ソート:」の左、それ以外は表示中の上部ソート区画のラベル後・プルダウン前に置き、同時表示しない。両方非表示ならボタンも非表示。Home/End と同じ現在の絞り込み・表示順の端へ選択を移して見える位置へスクロールし、Shift 範囲拡張はしない。「ツールバーを既定に戻す」で非表示。他のツールバー表示フラグと同様、環境設定の転送対象外 |
 | `show_toolbar_facet_filter` | bool | true | ツールバー下のスマートフィルタ（絞り込みバー）を表示 |
 | `toolbar_facet_filter_items` | Vec\<ToolbarFacetFilterItem\> | 全項目 | スマートフィルタバーに表示するボタンとファイル名欄の並び。空 Vec は全項目を隠すが、適用中条件のチップと `全解除` は表示する。保存時は新しい `NameFilter` を配列から退避し、旧版が未知 variant として読み捨てても並びを失わない形にする |
 | `toolbar_facet_name_filter_index_stash` | Option\<usize\> | None | 保存時に `NameFilter` の位置を退避するダウングレード互換用フィールド。`usize::MAX` は利用者が明示的に非表示にした状態を表す。読込時に `toolbar_facet_filter_items` へ戻して消費し、フィールド自体が無い旧設定では従来の常設入力を維持するため末尾へ追加する |
