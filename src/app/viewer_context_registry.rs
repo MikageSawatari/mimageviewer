@@ -6277,10 +6277,49 @@ impl App {
         )
     }
 
+    pub(in crate::app) fn fork_materialized_still_context_with_seed(
+        &mut self,
+        physical_context: &Path,
+        idx: usize,
+        seed: super::DetachedWindowSeed,
+    ) -> ViewerContextId {
+        let id = self.fork_materialized_still_context(physical_context, idx);
+        if seed.placement.is_some()
+            || seed.purpose == super::detached_window_manager::DetachedWindowPurpose::BrowserView
+        {
+            self.with_viewer_context(id, |app| {
+                app.commit_viewer_session(
+                    super::ViewerPresentation::DetachedWindow,
+                    true,
+                    "browser_materialized_binding",
+                );
+                app.ensure_detached_viewer_window_id_with_seed(seed);
+            })
+            .expect("new materialized context must mount for its creation seed");
+        }
+        id
+    }
+
     pub(in crate::app) fn retire_context<D>(
         &mut self,
         id: ViewerContextId,
         _reason: &'static str,
+        digest: impl FnOnce(ContextMut<'_>) -> D,
+    ) -> Result<D, RetireError> {
+        let close_owner = self.viewer_context_window(id).and_then(|window_id| {
+            self.capture_detached_close_owner(
+                Self::detached_session_lease(window_id),
+                ViewerCloseCause::Replaced,
+            )
+        });
+        self.retire_context_with_close_owner(id, _reason, close_owner, digest)
+    }
+
+    pub(in crate::app) fn retire_context_with_close_owner<D>(
+        &mut self,
+        id: ViewerContextId,
+        _reason: &'static str,
+        close_owner: Option<super::DetachedCloseOwner>,
         digest: impl FnOnce(ContextMut<'_>) -> D,
     ) -> Result<D, RetireError> {
         let reason = _reason;
@@ -6303,7 +6342,7 @@ impl App {
         self.cancel_rating_membership_restore_for_context(id);
         if retiring_window == self.active_detached_window_id() {
             self.begin_active_detached_session_close(reason);
-            self.finish_active_detached_session_close(reason);
+            self.finish_active_detached_session_close_owned(close_owner, reason);
         }
         let value = {
             let payload = self.viewer_contexts.table.retiring_slot_mut(id).unwrap();
@@ -6342,9 +6381,26 @@ impl App {
         finish: impl FnOnce(&mut Self),
         digest: impl FnOnce(ContextMut<'_>) -> D,
     ) -> Result<D, RetireContextError> {
+        let owner = self.viewer_context_window(id).and_then(|window_id| {
+            self.capture_detached_close_owner(
+                Self::detached_session_lease(window_id),
+                ViewerCloseCause::Replaced,
+            )
+        });
+        self.close_and_retire_context_with_close_owner(id, reason, owner, finish, digest)
+    }
+
+    pub(in crate::app) fn close_and_retire_context_with_close_owner<D>(
+        &mut self,
+        id: ViewerContextId,
+        reason: &'static str,
+        owner: Option<super::DetachedCloseOwner>,
+        finish: impl FnOnce(&mut Self),
+        digest: impl FnOnce(ContextMut<'_>) -> D,
+    ) -> Result<D, RetireContextError> {
         self.with_viewer_context_state(id, finish)
             .map_err(RetireContextError::Mount)?;
-        self.retire_context(id, reason, digest)
+        self.retire_context_with_close_owner(id, reason, owner, digest)
             .map_err(RetireContextError::Retire)
     }
 

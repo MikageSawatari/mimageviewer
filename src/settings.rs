@@ -5643,6 +5643,11 @@ pub struct Settings {
     #[serde(default)]
     pub clipboard_capture_output_dir: Option<PathBuf>,
 
+    #[serde(default)]
+    pub browser_integration_enabled: bool,
+    #[serde(default)]
+    pub browser_view_output_dir: Option<PathBuf>,
+
     // ── キャプチャ保存 ──────────────────────────────────────────
     /// Ctrl+S キャプチャ保存先。None のときは OS の Pictures/mimageviewer を使う。
     #[serde(default)]
@@ -8436,6 +8441,8 @@ impl Default for Settings {
             clipboard_capture_html_enabled: false,
             clipboard_capture_min_short_side_px: default_clipboard_capture_min_short_side_px(),
             clipboard_capture_output_dir: None,
+            browser_integration_enabled: false,
+            browser_view_output_dir: None,
             capture_output_dir: None,
             capture_format: crate::capture::CaptureFormat::default(),
             bake_stage_book: crate::bake_stage::BakeStage::default(),
@@ -8854,6 +8861,39 @@ static MAIN_UNREADABLE_THIS_SESSION: AtomicBool = AtomicBool::new(false);
 /// 項目)。これは本仕組み以前からある挙動で、先送りの判定としては正しく働く
 /// (上書き後の live 値こそが保存すべき値になるため)。
 static SAVE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+// Serializes the user-save backup claim together with the write. Browser saves
+// only hold this during persistence, never during registration, picking or copy.
+static SETTINGS_WRITE_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Worker-only partial save, after root has adopted the registration result.
+/// Retains the ordinary first-user-save backup and save-suppression policy.
+pub(crate) fn save_browser_integration_worker(
+    enabled: bool,
+    output: &Option<PathBuf>,
+) -> Result<(), String> {
+    let _write = SETTINGS_WRITE_GATE
+        .lock()
+        .map_err(|_| "設定の書き込みを開始できません。")?;
+    if MAIN_UNREADABLE_THIS_SESSION.load(Ordering::Relaxed) || crate::settings_db::save_suppressed()
+    {
+        return Err("設定の保存が抑止されています。".into());
+    }
+    let data_dir = crate::data_dir::get();
+    let rotate = !BACKUP_DONE_THIS_SESSION.swap(true, Ordering::Relaxed);
+    crate::settings_db::with_db_result(|db| {
+        if rotate && let Err(error) = db.rotate_backups(&data_dir) {
+            settings_diag_log(&format!(
+                "settings: rotate_backups failed (continuing with browser save): {error}"
+            ));
+        }
+        db.save_browser_integration(enabled, output)
+    })
+    .map_err(|e| e.to_string())?;
+    // SAVE_GENERATION certifies a *full* Settings save. A two-key write must not
+    // make existing deferred writers mistake unrelated dirty fields for saved.
+    Ok(())
+}
 
 /// 直近までに成功した `Settings::save()` の世代。詳細は [`SAVE_GENERATION`]。
 pub(crate) fn save_generation() -> u64 {
@@ -11515,6 +11555,10 @@ impl Settings {
     /// [`SAVE_GENERATION`] を進める唯一の場所。抑止による早期 return も、DB エラーも、
     /// 同じ返り値 1 本を通るので「書けていないのに世代が進む」経路を作れない。
     fn save_internal(&self, allow_rotation: bool) -> bool {
+        let Ok(_write) = SETTINGS_WRITE_GATE.lock() else {
+            settings_diag_log("settings: write gate poisoned");
+            return false;
+        };
         let landed = self.save_internal_attempt(allow_rotation);
         if landed {
             SAVE_GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -11632,6 +11676,60 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn browser818_registration_partial_worker_keeps_full_save_stamp_and_first_backup() {
+        let guard = crate::settings_db::DataDirOverrideGuard::new();
+        reset_backup_state_for_test();
+        let db =
+            std::sync::Arc::new(crate::settings_db::SettingsDb::create_new(guard.path()).unwrap());
+        let initial = Settings::default();
+        db.save_full(&initial).unwrap();
+        crate::settings_db::set_global_db(guard.path(), Some(db.clone()));
+        let mut full = initial.clone();
+        full.browser_integration_enabled = true;
+        full.browser_view_output_dir = Some(guard.path().join("images"));
+        full.clipboard_capture_min_short_side_px = 420;
+        let output = full.browser_view_output_dir.clone();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let before = save_generation();
+        let start = barrier.clone();
+        let full_writer = std::thread::spawn(move || {
+            start.wait();
+            full.save_checked()
+        });
+        let start = barrier.clone();
+        let partial_writer = std::thread::spawn(move || {
+            start.wait();
+            save_browser_integration_worker(true, &output)
+        });
+        barrier.wait();
+        assert!(full_writer.join().unwrap());
+        partial_writer.join().unwrap().unwrap();
+        assert_eq!(save_generation(), before + 1); // The partial write is not a full-save receipt.
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.browser_integration_enabled);
+        assert_eq!(loaded.clipboard_capture_min_short_side_px, 420);
+        let backup = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            guard.path().join("settings.db.bak1"),
+            backup.path().join("settings.db"),
+        )
+        .unwrap();
+        let backed_up = crate::settings_db::SettingsDb::open(backup.path())
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert!(!backed_up.browser_integration_enabled);
+        assert_eq!(
+            backed_up.clipboard_capture_min_short_side_px,
+            initial.clipboard_capture_min_short_side_px
+        );
+        crate::settings_db::set_save_suppressed(true);
+        assert!(save_browser_integration_worker(false, &None).is_err());
+        assert_eq!(save_generation(), before + 1);
+        crate::settings_db::set_save_suppressed(false);
+        reset_backup_state_for_test();
+    }
     #[test]
     fn physical_parent_button_defaults_off_and_survives_settings_roundtrip() {
         assert!(!Settings::default().show_toolbar_physical_parent_button);

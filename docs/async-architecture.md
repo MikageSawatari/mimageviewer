@@ -793,8 +793,10 @@ Surfaceもswitch epochを省略しない。Bookmarkはコピー済み入力のna
 | Snapshot cache-only分類／採用 | Snapshot row証明（既存snapshot generation + key/kind/target）。viewerの画像metadata世代ではなく、採用時に読むsnapshot自身を検証する。元RARはtyped source、ZIPは既存ArchivePreflightingのbackingとし、成功採用まで同じ証明を保持 |
 | `global_search_ui.rs::capture_search_view_adoption` | Row（search viewのprepare snapshotとsurvivor等）。**prepare要求の送信前**にcaptureし、非同期準備から採用まで保持。結果からのcopied-path openとは別owner |
 | `subfolder_expansion.rs::capture_subfolder_expansion_adoption` | 初回／root-only scanはSurface（copied roots・除去path）。現snapshotの再install/除去/reused metadata・snapshot付きrestoreはRow（現items/cache由来のprepare snapshot）。scan→prepare→installは元証明をmove |
-| `startup_ops.rs::start_startup_open_path_resolution_owned_with_navigation` | Bookmark（native resolver request ID/target）。alias・page待ちでも同要求をmoveし、取消はexact IDで行う。通常startupはnative startup ownerで共通main要求を新規captureしない |
+| `startup_ops.rs::start_startup_open_path_resolution_owned_with_navigation` → `start_startup_open_request_with_navigation` | Bookmark（native resolver request ID/target）。alias・page待ちでも同要求をmoveし、取消はexact IDで行う。通常startupはnative startup ownerで共通main要求を新規captureしない |
 | copied detached archive／Bookmark読込 | main資格のないwindow contextへ渡し、native window lease＋request ID（そのwindowの切替epoch相当）を検証。common main headerを新規captureしない。コピー前に元indexを読むDetachedGrid分類は上のRow。main switch sequenceを別windowへpublishしない |
+
+§1.818 の初回起動・activation・Agent の表示意図と相関 ID は `ExplicitOpenPath` → `StartupOpenPathOwner` → 既存の `ViewerOpenAdoption` で運ぶ。sidecar／composition の待機 owner が context・世代・対象 identity を検証し、有効な明示ファイル要求がある間は履歴より先に選択を所有する。要求の取消は同じ continuation を退役させ、別の pending フラグは作らない。
 
 §1.805 r10では、走査済みパスの再分類を省く変更を撤回し、ツリー・GridFolderCandidateの完了経路を維持する。
 DirectNavigationの対象は分類の要らない名前に限り、完了の再入で再分類は起きない。
@@ -2810,3 +2812,38 @@ mutex外で`with_viewer_context_ref`/`with_viewer_context_state`によりparked�
 Current/Next共有素材・DisplayPrepared・legacy・Unknown・held/receipt/batchは保護し、実計算中のpermit/予約は終了まで保持する。
 park単独では取消しない。最新callbackは位置別結果を一体で置換し、Previous Nativeは全削除規則の除去ゼロを検査する。
 新しいqueue/ready latch/全頁・全registry走査や同期I/Oは追加しない。詳細と検証状況は[計画 §27.17.21](page-turn-animation-plan.md)。
+
+## ブラウザ連携の登録 worker（§1.818 段階7）
+
+`App::browser_integration` が単一の状態所有者。準備・登録・解除・保存先の検証／変更・フォルダ picker・フォルダを開く処理は worker に置き、UI は try_recv と snapshot の描画だけを行う。
+root の既存 process-global poll 区間で完了を回収するので、環境設定を閉じた後や fullscreen の early return でも結果を落とさない。処理中の追加要求は拒否し、再試行・rollback・待ち行列は作らない。
+登録の結果を live Settings へ採用してから別 worker で2項目を永続化する。この間も同じ owner の処理中状態を保つ。全体設定の古い snapshot は保存しない。設定ファイルから取り込んだ新規2項目も、OK 時に同じ owner を通す（既存の他項目の適用は維持）。
+まれな失敗はログと通知で割り切る。保存失敗でも登録を巻き戻さず、通常の設定・画像・使用中の世代を破棄しない。
+
+通常のプロセス終了は root lifecycle の他の owner と同じ継続へ接続する。登録 owner が
+消費した `RootCloseIntent` を一つ保持し、登録を更新し得る準備・登録・解除・保存先操作・部分保存の終端まで
+CancelClose して、live Settings の採用と保存後に共通の root 終了へ一度だけ戻す。
+worker 完了済みでも root 未回収なら待機対象で、Quit を後の普通の Close で格下げしない。
+トレイ退避は登録を待たず従来どおり行う。描画しない LogicOnly も同じ receipt poll を行う。
+最終 `on_exit_inner` は迂回経路への fence として既発行 worker の結果を回収し、live へ採用してから
+従来の全体保存へ進む。ここでは新しい登録・部分保存・再試行は始めない。
+準備の `PreparationEffect::ReadOnly` / `MayUpdateRegistration` は worker 発行時の設定から確定する。
+OFF の読み取り準備は終了継続を保持せず、最終 fence でも receiver を捨てて待たない。
+復元モーダルが拒否した普通の Close は root の境界で継続を渡さず、後で再発行しない。
+最終 fence は ChooseFolder の picker も受け取り得る。受付迂回と picker の組み合わせは
+まれな終了の割り切り対象とし、新たな取消・回復の仕組みは追加しない。
+
+## ブラウザ表示 pipe と一回の中継処理（§1.818 段階5〜6）
+
+`ActivationListener` が browser listener と stop event を所有し、接続・読取・書込・応答後の EOF 待ちを
+同じ stop で解除する。listener は次の待受を確保してから peer worker へ接続を移す。
+`PeerWorkers` は応答後に EOF を待つ接続も含め最大4件を所有し、満杯なら新しい接続を切断する。
+再試行・待ち行列は足さない。応答直後の切断で未読応答を捨てず、停止時は全 peer を解除・join する。
+pipe の DACL は既存の current-user 制限を使い、portable / data-dir 別の名前空間も既存 single-instance 規則に合わせる。
+
+listener は受信時点で Remote 所有と受信順を `ActivationOpenPath::received` に捕捉し、
+`BrowserOverlay` の表示意図を同じ activation channel へ渡す。App の受理は既存 owner が後で判断する。
+中継 exe は GUI とは別プロセスで保存・MOTW・launcher 終了待ちを行う。
+成功応答の範囲は受け渡しまでで、App の採用完了を待つ channel は作らない。
+ブラウザ拡張側の取得・中断状態は拡張の責務であり、本節の worker で代行しない。
+拡張は別ブランチで実装済み・このブランチには未統合で、ストアは未公開。

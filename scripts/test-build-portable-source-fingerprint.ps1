@@ -35,7 +35,9 @@ foreach ($functionName in @(
         'Get-NormalizedPath',
         'Get-MivOrdinalUniquePaths',
         'Get-MivSourceFingerprintRecords',
-        'Get-MivSourceFingerprint'
+        'Get-MivSourceFingerprint',
+        'Write-SmokeBuildManifest',
+        'Assert-SmokeBuildManifest'
     )) {
     Import-FunctionFromScript $buildScript $functionName
 }
@@ -79,6 +81,36 @@ finally {
 
 $records = @(Get-MivSourceFingerprintRecords $repoRoot)
 $fingerprint = Get-MivSourceFingerprint $repoRoot
+$hostPrefix = "crates/browser-host/src/main.rs`t"
+if ($records.Where({ $_.StartsWith($hostPrefix, [System.StringComparison]::Ordinal) }).Count -ne 1) {
+    throw 'browser818_bundle: browser host is missing from the portable source fingerprint'
+}
+# browser818_bundle: changing only the host must invalidate -SkipBuild reuse.
+$manifestFixtures = @(1..7 | ForEach-Object { [System.IO.Path]::GetTempFileName() })
+try {
+    for ($index = 1; $index -lt $manifestFixtures.Count; $index++) {
+        [System.IO.File]::WriteAllText($manifestFixtures[$index], "artifact-$index")
+    }
+    $manifestArgs = @{
+        Path = $manifestFixtures[0]
+        CorePath = $manifestFixtures[1]
+        RemotePath = $manifestFixtures[2]
+        EpubWorkerPath = $manifestFixtures[3]
+        McpPath = $manifestFixtures[4]
+        MusicvideoPath = $manifestFixtures[5]
+        BrowserHostPath = $manifestFixtures[6]
+    }
+    Write-SmokeBuildManifest @manifestArgs -SourceFingerprint $fingerprint
+    Assert-SmokeBuildManifest @manifestArgs -ExpectedSourceFingerprint $fingerprint
+    [System.IO.File]::WriteAllText($manifestFixtures[6], 'changed-host')
+    $rejected = $false
+    try { Assert-SmokeBuildManifest @manifestArgs -ExpectedSourceFingerprint $fingerprint }
+    catch { $rejected = $_.Exception.Message.Contains('diagnostic artifact hash does not match') }
+    if (-not $rejected) { throw 'browser818_bundle: stale browser host hash was accepted' }
+}
+finally {
+    foreach ($file in $manifestFixtures) { Remove-Item -LiteralPath $file -Force }
+}
 $eguiCargoPrefix = "vendor/egui/Cargo.toml`t"
 if ($records.Where({ $_.StartsWith($eguiCargoPrefix, [System.StringComparison]::Ordinal) }).Count -ne 1) {
     throw 'vendor/egui/Cargo.toml is missing from the portable source fingerprint'

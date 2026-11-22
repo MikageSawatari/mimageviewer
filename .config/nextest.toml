@@ -82,6 +82,7 @@ filter = '''
     | test(/^video::native_window_thread_spike::/)
     | test(=ai::vlm_worker::tests::real_model_serve_matches_v1_0_on_all_26_images_when_configured)
     | test(/^app::book_composition_permission::tests::realmachine50_composition_(context_continuation_recheck_keeps_its_window_owner|hidden_main_target_does_not_handoff_previous_owner|main_open_recheck_parks_previous_owner)$/)
+    | test(=app::book_composition_permission::tests::browser818_open_owner_composition_requalification_preserves_overlay_and_exact_selection)
     | test(/^app::depth_view_tests::(depth_independent_live_media_park_retires_request_and_slot_and_releases_entry|depth_independent_os_close_retires_request_and_slot_and_releases_entry|depth_main_live_pass_handoff_new_loading_owner_commits_but_aborted_build_keeps_depth|depth_main_live_pass_handoff_retires_only_fullscreen_on_actual_still_and_media_activation|depth_other_window_entry_is_readonly_in_both_directions_and_scoped_mount_keeps_owner)$/)
     | test(=app::depth_view_tests::detached_snapshot_activation_handoff_switches_a_b_and_keeps_rejected_destination)
     | test(/^app::multiwindow_scenario_tests::multiwindow_depth_accepted_(folder|pdf|zip)_transition_rejects_entry_and_export_then_reopens_same_context$/)

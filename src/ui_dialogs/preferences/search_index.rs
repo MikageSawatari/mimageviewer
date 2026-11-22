@@ -559,6 +559,26 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["クリップボード", "HTML", "ページ", "画像", "コピー", "監視"]
     ),
     entry!(
+        "browser-integration/enabled",
+        BrowserIntegration,
+        "ブラウザ連携を使う",
+        [
+            "ブラウザ",
+            "Chrome",
+            "Edge",
+            "連携",
+            "登録",
+            "解除",
+            "mIV で見る"
+        ]
+    ),
+    entry!(
+        "browser-integration/folder",
+        BrowserIntegration,
+        "ブラウザ閲覧の保存先",
+        ["ブラウザ", "保存先", "保存場所", "フォルダ", "既定に戻す"]
+    ),
+    entry!(
         "capture/folder",
         Capture,
         "保存先フォルダ",
@@ -1841,6 +1861,7 @@ mod tests {
     const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
     const NAME_COLORS_SOURCE: &str = include_str!("name_colors.rs");
     const DEPTH_ADDON_SOURCE: &str = include_str!("../depth_addon.rs");
+    const BROWSER_INTEGRATION_SOURCE: &str = include_str!("browser_integration.rs");
 
     #[test]
     fn same_name_folder_book_choice_queries_target_the_existing_anchor() {
@@ -1977,7 +1998,10 @@ mod tests {
     #[test]
     fn index_entries_are_unique_valid_and_placed_in_pages() {
         let mut anchors = HashSet::new();
-        let placed: HashSet<_> = anchors_in_pages_source(PAGES_SOURCE).into_iter().collect();
+        let placed: HashSet<_> = anchors_in_pages_source(PAGES_SOURCE)
+            .into_iter()
+            .chain(anchors_in_pages_source(BROWSER_INTEGRATION_SOURCE))
+            .collect();
         for entry in PREF_SEARCH_INDEX {
             assert!(
                 anchors.insert(entry.anchor),
@@ -2010,6 +2034,12 @@ mod tests {
                             .contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
                     );
                     RAW_SETTINGS_SOURCE
+                } else if entry.anchor.starts_with("browser-integration/") {
+                    assert!(
+                        PREFERENCES_SOURCE
+                            .contains("PreferencesPage::BrowserIntegration => browser_integration::page(ui, state)")
+                    );
+                    BROWSER_INTEGRATION_SOURCE
                 } else if entry.anchor == "depth-addon/manage" {
                     assert!(PAGES_SOURCE.contains(
                         "super::super::depth_addon::draw_preferences(ui, &state.depth_view)"

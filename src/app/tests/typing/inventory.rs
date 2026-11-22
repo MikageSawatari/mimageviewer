@@ -94,6 +94,12 @@ const INPUT_TESTS: &[Entry] = &[
 
 const EXEMPTIONS: &[Entry] = &[
     exempt(
+        "src/ui_dialogs/preferences/browser_integration.rs",
+        "input,",
+        1,
+        "ブラウザ閲覧の保存先。入力中は検査せず、適用時に worker で確定する設定欄",
+    ),
+    exempt(
         "src/app/list_order_worker_tests.rs",
         "&mut String::new()",
         1,

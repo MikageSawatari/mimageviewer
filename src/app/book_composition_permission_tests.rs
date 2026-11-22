@@ -642,23 +642,27 @@ fn resume_notice_survives_permission_recheck_and_open_feedback() {
 #[cfg(windows)]
 #[test]
 fn realmachine50_composition_main_open_recheck_parks_previous_owner() {
-    realmachine50_composition_open_recheck(false, false);
+    realmachine50_composition_open_recheck(false, false, None);
 }
 
 #[cfg(windows)]
 #[test]
 fn realmachine50_composition_hidden_main_target_does_not_handoff_previous_owner() {
-    realmachine50_composition_open_recheck(false, true);
+    realmachine50_composition_open_recheck(false, true, None);
 }
 
 #[cfg(windows)]
 #[test]
 fn realmachine50_composition_context_continuation_recheck_keeps_its_window_owner() {
-    realmachine50_composition_open_recheck(true, false);
+    realmachine50_composition_open_recheck(true, false, None);
 }
 
 #[cfg(windows)]
-fn realmachine50_composition_open_recheck(continuation: bool, hidden_target: bool) {
+fn realmachine50_composition_open_recheck(
+    continuation: bool,
+    hidden_target: bool,
+    explicit_request: Option<crate::app::ViewerOpenRequest>,
+) {
     use crate::app::{
         DetachedSource, DetachedWindowState, StartupOpenPathOwner, ViewerOpenAdoption,
     };
@@ -729,17 +733,22 @@ fn realmachine50_composition_open_recheck(continuation: bool, hidden_target: boo
             }),
         })
     } else {
-        StartupOpenPathOwner::Activation
+        StartupOpenPathOwner::Activation(
+            explicit_request.unwrap_or_else(crate::app::ViewerOpenRequest::preferences),
+        )
     };
     let adoption = typed_owner.viewer_open_adoption();
-    assert_eq!(
-        adoption,
-        if continuation {
-            ViewerOpenAdoption::ContextContinuation
-        } else {
-            ViewerOpenAdoption::MainNew
-        }
-    );
+    let adoption = if explicit_request.is_some() {
+        adoption.explicit_file()
+    } else {
+        adoption
+    };
+    assert_eq!(adoption.is_main_new(), !continuation);
+    if let StartupOpenPathOwner::Activation(request) = typed_owner {
+        assert_eq!(adoption.request(), Some(request));
+    } else {
+        assert_eq!(adoption, ViewerOpenAdoption::ContextContinuation);
+    }
     let target_owner = if continuation { old } else { main };
     let notice = crate::app::BookResumeNotice {
         label: crate::book_resume_key::BookResumeKey::legacy(&root).display_label(),
@@ -793,6 +802,19 @@ fn realmachine50_composition_open_recheck(continuation: bool, hidden_target: boo
         viewer_adoption: adoption,
     };
     assert_eq!(intent.route, expected_route);
+    if let Some(request) = explicit_request {
+        assert_eq!(adoption.request(), Some(request));
+        // Put the same owner back temporarily to check its context/generation/identity
+        // qualification without creating another presentation reservation.
+        env.with_viewer_context(target_owner, |owner| {
+            owner.book_composition_permission.open = OpenPermission::Checking {
+                intent: intent.clone(),
+                candidates: Vec::new(),
+            };
+            assert_eq!(owner.composition_explicit_open_selection(), None);
+        })
+        .unwrap();
+    }
 
     // Advance the real service revision before its callback rechecks the open.
     // The callback supplies ordinary defaults; the accepted request retains
@@ -815,6 +837,17 @@ fn realmachine50_composition_open_recheck(continuation: bool, hidden_target: boo
             panic!("callback must requalify against the changed service revision");
         };
         assert_eq!(intent.route, expected_route);
+        if explicit_request.is_some() {
+            assert_eq!(owner.composition_explicit_open_selection(), Some(0));
+            owner.items_generation += 1;
+            assert_eq!(owner.composition_explicit_open_selection(), None);
+            owner.items_generation -= 1;
+            let original = owner.items[0].clone();
+            owner.items[0] = crate::grid_item::GridItem::Image(root.join("wrong.png"));
+            assert_eq!(owner.composition_explicit_open_selection(), None);
+            owner.items[0] = original;
+            assert_eq!(owner.composition_explicit_open_selection(), Some(0));
+        }
         assert!(owner.fullscreen_idx.is_none());
     })
     .unwrap();
@@ -2950,5 +2983,28 @@ fn same_page_slideshow_qualifies_requested_half_before_slice_and_timer_effects()
             );
         }
         process.shutdown_and_join();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn browser818_open_owner_composition_requalification_preserves_overlay_and_exact_selection() {
+    let intent = crate::app::external_open::ViewerOpenIntent::BrowserOverlay {
+        placement: crate::detached_window_geometry::PhysicalWindowPlacement {
+            outer: crate::detached_window_geometry::PhysicalRect {
+                left: 10,
+                top: 20,
+                right: 810,
+                bottom: 620,
+            },
+            maximized: false,
+        },
+    };
+    for hidden in [false, true] {
+        realmachine50_composition_open_recheck(
+            false,
+            hidden,
+            Some(crate::app::ViewerOpenRequest::new(intent)),
+        );
     }
 }

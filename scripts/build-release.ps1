@@ -142,11 +142,12 @@ $releaseCoreExe = Join-Path $releaseDir 'mimageviewer-core.exe'
 $releaseRemoteExe = Join-Path $releaseDir 'mimageviewer-remote.exe'
 $releaseEpubWorkerExe = Join-Path $releaseDir 'mimageviewer-epub-pdf.exe'
 $releaseMcpExe = Join-Path $releaseDir 'mimageviewer-mcp.exe'
+$releaseBrowserHostExe = Join-Path $releaseDir 'mimageviewer-browser-host.exe'
 $releaseMusicvideoExe = Join-Path $releaseDir 'mimageviewer-musicvideo.exe'
 . (Join-Path $PSScriptRoot 'musicvideo-build-safety.ps1')
 Assert-MivMusicvideoBuildOutputsIdle -OutputPaths @($releaseMusicvideoExe)
-$exactBuildProcessNames = @('mimageviewer', 'mimageviewer-mcp')
-$exactBuildOutputPaths = @($releaseExe, $releaseMcpExe)
+$exactBuildProcessNames = @('mimageviewer', 'mimageviewer-mcp', 'mimageviewer-browser-host')
+$exactBuildOutputPaths = @($releaseExe, $releaseMcpExe, $releaseBrowserHostExe)
 $appDataRoot = Join-Path -Path $env:APPDATA -ChildPath 'mimageviewer'
 $appDataRootPrefix = $appDataRoot.TrimEnd('\') + '\'
 $appDataRootPrefixLower = $appDataRootPrefix.ToLower()
@@ -164,6 +165,7 @@ $appDataProcessNames = @(
 $stoppableProcessNames = @(
     'mimageviewer',
     'mimageviewer-mcp',
+    'mimageviewer-browser-host',
     'mimageviewer-core',
     'mimageviewer-remote',
     'mimageviewer-epub-pdf',
@@ -283,12 +285,13 @@ if (Test-Path $releaseExe) {
 #   3. EPUB PDF worker -> mimageviewer-epub-pdf.exe
 #   4. MCP stdio adapter -> mimageviewer-mcp.exe
 #   5. music-video editor -> mimageviewer-musicvideo.exe
-#   6. launcher (embeds core + remote + EPUB worker + MCP + editor + FFmpeg DLLs via include_bytes!)
+#   6. browser host -> mimageviewer-browser-host.exe
+#   7. launcher (embeds core + remote + EPUB worker + MCP + editor + browser host + FFmpeg DLLs via include_bytes!)
 #      -> mimageviewer.exe. This is the distributed single exe.
 #
 # VST3 bridge is built first because mimageviewer-core embeds it with
 # include_bytes!. Cargo also cannot express the inner executables -> launcher
-# ordering, so the five inner Rust binaries are built explicitly after the bridge.
+# ordering, so the six inner Rust binaries are built explicitly after the bridge.
 
 if (-not $SkipVst3Bridge) {
     $cmakeExe = Get-Command cmake -ErrorAction SilentlyContinue
@@ -312,7 +315,7 @@ if (-not $SkipVst3Bridge) {
     }
 
     if (-not $SkipVst3Bridge) {
-        Write-Host "[build-release] (1/7) cmake --build crates/vst3-host/build --config Release"
+        Write-Host "[build-release] (1/8) cmake --build crates/vst3-host/build --config Release"
         & cmake --build $vst3BuildDir --config Release
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         if (-not (Test-Path $vst3VendorExe)) {
@@ -374,7 +377,7 @@ Ensure-LibclangPath
 
 $coreCmd = @('build', '--release', '--bin', 'mimageviewer-core')
 if ($CargoArgs) { $coreCmd += $CargoArgs }
-Write-Host ("[build-release] (2/7) CARGO_INCREMENTAL=0 cargo {0}" -f ($coreCmd -join ' '))
+Write-Host ("[build-release] (2/8) CARGO_INCREMENTAL=0 cargo {0}" -f ($coreCmd -join ' '))
 Assert-MivVst3HostIdentity -RepoRoot $repoRoot
 Assert-MivVlmWorkerIdentity -RepoRoot $repoRoot
 $coreExit = Invoke-ReleaseCargo -Args $coreCmd -ExpectedExecutable $releaseCoreExe
@@ -387,7 +390,7 @@ $remoteCmd = @(
     '--features', 'embedded-web-assets'
 )
 if ($CargoArgs) { $remoteCmd += $CargoArgs }
-Write-Host ("[build-release] (3/7) CARGO_INCREMENTAL=0 cargo {0}" -f ($remoteCmd -join ' '))
+Write-Host ("[build-release] (3/8) CARGO_INCREMENTAL=0 cargo {0}" -f ($remoteCmd -join ' '))
 $remoteExit = Invoke-ReleaseCargo -Args $remoteCmd -ExpectedExecutable $releaseRemoteExe
 if ($remoteExit -ne 0) { exit $remoteExit }
 if (-not (Test-Path $releaseRemoteExe -PathType Leaf)) {
@@ -396,7 +399,7 @@ if (-not (Test-Path $releaseRemoteExe -PathType Leaf)) {
 
 $epubWorkerCmd = @('build', '--release', '-p', 'epub-pdf-worker', '--bin', 'mimageviewer-epub-pdf')
 if ($CargoArgs) { $epubWorkerCmd += $CargoArgs }
-Write-Host ("[build-release] (4/7) CARGO_INCREMENTAL=0 cargo {0}" -f ($epubWorkerCmd -join ' '))
+Write-Host ("[build-release] (4/8) CARGO_INCREMENTAL=0 cargo {0}" -f ($epubWorkerCmd -join ' '))
 $epubWorkerExit = Invoke-ReleaseCargo -Args $epubWorkerCmd -ExpectedExecutable $releaseEpubWorkerExe
 if ($epubWorkerExit -ne 0) { exit $epubWorkerExit }
 if (-not (Test-Path $releaseEpubWorkerExe -PathType Leaf)) {
@@ -405,7 +408,7 @@ if (-not (Test-Path $releaseEpubWorkerExe -PathType Leaf)) {
 
 $mcpCmd = @('build', '--release', '-p', 'mimageviewer-mcp', '--bin', 'mimageviewer-mcp')
 if ($CargoArgs) { $mcpCmd += $CargoArgs }
-Write-Host ("[build-release] (5/7) CARGO_INCREMENTAL=0 cargo {0}" -f ($mcpCmd -join ' '))
+Write-Host ("[build-release] (5/8) CARGO_INCREMENTAL=0 cargo {0}" -f ($mcpCmd -join ' '))
 $mcpExit = Invoke-ReleaseCargo -Args $mcpCmd -ExpectedExecutable $releaseMcpExe
 if ($mcpExit -ne 0) { exit $mcpExit }
 if (-not (Test-Path $releaseMcpExe -PathType Leaf)) {
@@ -414,11 +417,20 @@ if (-not (Test-Path $releaseMcpExe -PathType Leaf)) {
 
 $musicvideoCmd = @('build', '--release', '-p', 'musicvideo-editor', '--bin', 'mimageviewer-musicvideo')
 if ($CargoArgs) { $musicvideoCmd += $CargoArgs }
-Write-Host ("[build-release] (6/7) CARGO_INCREMENTAL=0 cargo {0}" -f ($musicvideoCmd -join ' '))
+Write-Host ("[build-release] (6/8) CARGO_INCREMENTAL=0 cargo {0}" -f ($musicvideoCmd -join ' '))
 $musicvideoExit = Invoke-ReleaseCargo -Args $musicvideoCmd -ExpectedExecutable $releaseMusicvideoExe
 if ($musicvideoExit -ne 0) { exit $musicvideoExit }
 if (-not (Test-Path $releaseMusicvideoExe -PathType Leaf)) {
     throw "[build-release] music-video editor executable was not produced: $releaseMusicvideoExe"
+}
+
+$browserHostCmd = @('build', '--release', '-p', 'mimageviewer-browser-host', '--bin', 'mimageviewer-browser-host')
+if ($CargoArgs) { $browserHostCmd += $CargoArgs }
+Write-Host ("[build-release] (7/8) CARGO_INCREMENTAL=0 cargo {0}" -f ($browserHostCmd -join ' '))
+$browserHostExit = Invoke-ReleaseCargo -Args $browserHostCmd -ExpectedExecutable $releaseBrowserHostExe
+if ($browserHostExit -ne 0) { exit $browserHostExit }
+if (-not (Test-Path $releaseBrowserHostExe -PathType Leaf)) {
+    throw "[build-release] browser host executable was not produced: $releaseBrowserHostExe"
 }
 
 foreach ($name in @('msvcp140.dll', 'msvcp140_1.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')) {
@@ -434,15 +446,16 @@ if ($Sign) {
         $releaseRemoteExe,
         $releaseEpubWorkerExe,
         $releaseMcpExe,
-        $releaseMusicvideoExe
+        $releaseMusicvideoExe,
+        $releaseBrowserHostExe
     )
-    Write-Host "[build-release] signing core + remote + EPUB worker + MCP + music-video editor (pre-launcher)"
+    Write-Host "[build-release] signing core + remote + EPUB worker + MCP + editor + browser host (pre-launcher)"
     Invoke-MivSign -Files $launcherEmbedExecutables
 }
 
 $launcherCmd = @('build', '--release', '-p', 'mimageviewer-launcher', '--bin', 'mimageviewer')
 if ($CargoArgs) { $launcherCmd += $CargoArgs }
-Write-Host ("[build-release] (7/7) CARGO_INCREMENTAL=0 cargo {0}" -f ($launcherCmd -join ' '))
+Write-Host ("[build-release] (8/8) CARGO_INCREMENTAL=0 cargo {0}" -f ($launcherCmd -join ' '))
 $oldEffetuneDir = $env:MIMV_EFFETUNE_DIR
 $hadEffetuneDir = Test-Path Env:MIMV_EFFETUNE_DIR
 $env:MIMV_EFFETUNE_DIR = $effetuneStage
@@ -467,7 +480,8 @@ $releasePe = @(
     $releaseRemoteExe,
     $releaseEpubWorkerExe,
     $releaseMcpExe,
-    $releaseMusicvideoExe
+    $releaseMusicvideoExe,
+    $releaseBrowserHostExe
 )
 & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
     -InputPaths $releasePe -RequireCompanionRuntime `

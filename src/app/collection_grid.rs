@@ -5474,7 +5474,7 @@ mod tests {
             "startup folder open is still pending"
         );
         app.initialized = true;
-        app.startup_open_path = Some(fixture.clone());
+        app.set_startup_open_path(fixture.clone());
         assert_eq!(
             app.open_seeded_collection_for_smoke().unwrap_err(),
             "startup folder open is still pending"

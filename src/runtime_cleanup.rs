@@ -666,6 +666,23 @@ mod tests {
         }
 
         #[test]
+        fn browser818_bundle_host_process_protects_runtime_without_collecting_registration() {
+            let (temp, runtime, bundle) = fixture();
+            let old = runtime.join("3.0.0");
+            tree(&old);
+            let registered = temp.path().join("browser-host/generation");
+            tree(&registered);
+            cleanup_with_processes(temp.path(), VERSION, Some(&bundle), || {
+                Ok(vec![(101, old.join("mimageviewer-browser-host.exe"))])
+            });
+            assert!(old.join("nested/asset").exists());
+            assert!(registered.join("nested/asset").exists());
+            cleanup_with_processes(temp.path(), VERSION, Some(&bundle), || Ok(vec![]));
+            assert!(!old.exists());
+            assert!(registered.join("nested/asset").exists());
+        }
+
+        #[test]
         fn legacy_process_snapshot_keeps_in_use_version_and_generation() {
             for companion in [
                 "mimageviewer-core.exe",

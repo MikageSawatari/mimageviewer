@@ -246,21 +246,7 @@ fn resolve_candidate(value: &str, base: &Url, image_link: bool) -> Option<Url> {
             }
             if image_link
                 && !extension.is_some_and(|ext| {
-                    matches!(
-                        ext.to_ascii_lowercase().as_str(),
-                        "jpg"
-                            | "jpeg"
-                            | "png"
-                            | "gif"
-                            | "webp"
-                            | "bmp"
-                            | "tif"
-                            | "tiff"
-                            | "avif"
-                            | "heic"
-                            | "heif"
-                            | "jxl"
-                    )
+                    mimageviewer_capture_file::capture_image_format_from_extension(ext).is_some()
                 })
             {
                 return None;
@@ -428,6 +414,49 @@ mod tests {
             Some("https://example.com/pages/index.html#copy"),
         ))
         .unwrap()
+    }
+
+    #[test]
+    fn browser818_capture_file_html_links_keep_released_format_set() {
+        let extensions = [
+            "jpg", "jpeg", "png", "gif", "webp", "bmp", "tif", "tiff", "avif", "heic", "heif",
+            "jxl",
+        ];
+        let fragment = extensions
+            .iter()
+            .map(|ext| {
+                format!(
+                    "<a href='/image.{}?key=1#fragment'>image</a>",
+                    ext.to_ascii_uppercase()
+                )
+            })
+            .collect::<String>();
+        let result = capture(&fragment);
+        let expected = extensions
+            .iter()
+            .map(|ext| {
+                format!(
+                    "https://example.com/image.{}?key=1",
+                    ext.to_ascii_uppercase()
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(result.candidates, expected);
+        for extension in ["svg", "ico", "ppm", "qoi", "html", "mp4"] {
+            assert!(
+                capture(&format!("<a href='/image.{extension}'>image</a>"))
+                    .candidates
+                    .is_empty()
+            );
+        }
+        let mut shared = mimageviewer_capture_file::CAPTURE_IMAGE_FORMATS
+            .iter()
+            .flat_map(|format| format.extensions.iter().copied())
+            .collect::<Vec<_>>();
+        shared.sort_unstable();
+        let mut legacy = extensions.to_vec();
+        legacy.sort_unstable();
+        assert_eq!(shared, legacy);
     }
 
     fn replace_offset(bytes: &mut [u8], field: &str, value: usize) {

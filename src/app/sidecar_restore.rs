@@ -30,6 +30,14 @@ pub(super) enum RootInputGate {
 }
 
 #[cfg(test)]
+#[path = "browser818_selection_tests.rs"]
+mod browser818_selection_tests;
+
+#[cfg(all(test, windows))]
+#[path = "browser818_activation_tests.rs"]
+mod browser818_activation_tests;
+
+#[cfg(test)]
 thread_local! {
     static IMPORT_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -351,7 +359,10 @@ impl SidecarLoadContinuation {
             Some(super::MainListAfterHydration::Dfs { continuation, .. }) => {
                 continuation.fullscreen
             }
-            Some(super::MainListAfterHydration::RequiredFullscreen { .. }) => true,
+            Some(
+                super::MainListAfterHydration::DirectMedia { .. }
+                | super::MainListAfterHydration::RequiredFullscreen { .. },
+            ) => true,
             _ => false,
         }
     }
@@ -843,6 +854,14 @@ fn reuse_proof_apply(
 }
 
 impl SidecarRestoreState {
+    #[cfg(test)]
+    pub(super) fn viewer_open_adoption_for_test(&self) -> Option<ViewerOpenAdoption> {
+        self.common
+            .deferred_fullscreen
+            .as_ref()
+            .map(|deferred| deferred.viewer_adoption)
+    }
+
     pub(super) fn retire_grid_folder_navigation(&mut self, owner: ViewerContextId) -> bool {
         if self.common.target_context == owner
             && let ContinuationOwner::Live(continuation) = &mut self.common.continuation
@@ -957,11 +976,22 @@ impl SidecarRestoreState {
             // A manual exact page open supersedes the automatic book demand.
             *after_prepare = IndexOnlyAfterPrepare::None;
         }
+        if let ContinuationOwner::Live(continuation) = &mut self.common.continuation {
+            // A newer exact demand replaces an earlier exact hydration action, rather
+            // than leaving two owners that can each publish a different fullscreen.
+            if matches!(&continuation.navigation_after_hydration,
+                Some(MainListAfterHydration::DirectMedia { viewer_adoption: prior, .. }
+                    | MainListAfterHydration::RequiredFullscreen { viewer_adoption: prior, .. })
+                    if viewer_adoption.owns_file_selection() || prior.owns_file_selection())
+            {
+                continuation.navigation_after_hydration = None;
+            }
+        }
         if let ContinuationOwner::Live(continuation) = &mut self.common.continuation
             && (matches!(
                 continuation.first_display_action,
                 FirstDisplayAction::ArchiveBook(_)
-            ) || (viewer_adoption == super::ViewerOpenAdoption::MainNew
+            ) || ((viewer_adoption.is_main_new() || viewer_adoption.owns_file_selection())
                 && matches!(
                     continuation.first_display_action,
                     FirstDisplayAction::AutoFullscreenFolder
@@ -1881,6 +1911,7 @@ impl App {
             self.resume_loading_items_after_sidecar(
                 continuation,
                 &SidecarModalObservation::default(),
+                None,
             );
             self.spread_shift.finish_fenced_book_resume();
             return Ok(());
@@ -1902,6 +1933,7 @@ impl App {
             self.resume_loading_items_after_sidecar(
                 continuation,
                 &SidecarModalObservation::default(),
+                None,
             );
             return Ok(());
         }
@@ -2205,6 +2237,14 @@ impl App {
                 (None, None) => true,
                 _ => false,
             }
+    }
+
+    fn sidecar_restore_explicit_selection(&self, common: &Common) -> Option<usize> {
+        let deferred = common.deferred_fullscreen.as_ref()?;
+        (self.sidecar_restore_context_current(common)
+            && deferred.viewer_adoption.owns_file_selection()
+            && deferred.matches_item(&self.items))
+        .then_some(deferred.idx)
     }
 
     fn sidecar_restore_has_conflicting_work(
@@ -3218,6 +3258,9 @@ impl App {
             crate::logger::log(format!("sidecar restore terminal warning: {warning}"));
             self.show_feedback_warning(format!("サイドカー復元: {warning}"));
         }
+        // Only this still-current owner can grant selection. Do this before taking its
+        // continuation; a cancelled/replaced/missing target grants no selection at all.
+        let explicit_selection = self.sidecar_restore_explicit_selection(&state.common);
         let deferred = state.common.deferred_fullscreen.take();
         let favorite_failures = std::mem::take(&mut state.common.favorite_failures);
         let continuation = state.common.continuation.take_live();
@@ -3231,7 +3274,11 @@ impl App {
                 // first display can transfer it to composition or retire the fenced result.
                 self.capture_deferred_book_resume(deferred);
             }
-            self.resume_loading_items_after_sidecar(continuation, &state.common.modal_observation);
+            self.resume_loading_items_after_sidecar(
+                continuation,
+                &state.common.modal_observation,
+                explicit_selection,
+            );
         }
         for command in favorite_failures {
             self.restore_failed_favorite_command(command);

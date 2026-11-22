@@ -433,6 +433,37 @@ impl ViewerPresentationPermission {
 }
 
 impl App {
+    /// A pending exact open keeps selection during list hydration, but only while
+    /// its existing composition owner still identifies this context and page.
+    pub(super) fn composition_explicit_open_selection(&self) -> Option<usize> {
+        let (intent, candidates) = match &self.book_composition_permission.open {
+            OpenPermission::Checking { intent, candidates }
+            | OpenPermission::Ready { intent, candidates }
+            | OpenPermission::Resuming { intent, candidates } => (intent, candidates),
+            _ => return None,
+        };
+        let BookTargetRoute::FullscreenOpen {
+            viewer_adoption, ..
+        } = &intent.route
+        else {
+            return None;
+        };
+        if !viewer_adoption.owns_file_selection()
+            || intent.context_id != self.spread_shift_context_id().serial()
+            || intent.items_generation != self.items_generation
+        {
+            return None;
+        }
+        let current = self.source_composition_candidate(intent.idx)?;
+        candidates
+            .iter()
+            .any(|candidate| {
+                candidate.occurrence().item_index == intent.idx
+                    && candidate.correlation.identity == current.identity
+            })
+            .then_some(intent.idx)
+    }
+
     pub(crate) fn defer_book_projection_open(&mut self, deferred: DeferredFsReopen) {
         let scope = self
             .book_composition

@@ -92,19 +92,19 @@ Assert-True ($testRoot.StartsWith(($tempRoot + '\'), [System.StringComparison]::
 New-Item -ItemType Directory -Path $testRoot | Out-Null
 try {
     $manifestPath = Join-Path $testRoot 'manifest.json'
-    $files = @('core', 'remote', 'epub', 'mcp', 'editor') | ForEach-Object {
+    $files = @('core', 'remote', 'epub', 'mcp', 'editor', 'browser-host') | ForEach-Object {
         $path = Join-Path $testRoot $_
         [System.IO.File]::WriteAllText($path, $_)
         $path
     }
-    Write-SmokeBuildManifest $manifestPath 'fingerprint' $files[0] $files[1] $files[2] $files[3] $files[4]
+    Write-SmokeBuildManifest $manifestPath 'fingerprint' $files[0] $files[1] $files[2] $files[3] $files[4] $files[5]
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert-True ($manifest.musicvideo_sha256 -eq (Get-FileHash -LiteralPath $files[4] -Algorithm SHA256).Hash.ToLowerInvariant()) 'manifest omits editor hash'
-    Assert-SmokeBuildManifest $manifestPath 'fingerprint' $files[0] $files[1] $files[2] $files[3] $files[4]
+    Assert-SmokeBuildManifest $manifestPath 'fingerprint' $files[0] $files[1] $files[2] $files[3] $files[4] $files[5]
     [System.IO.File]::WriteAllText($files[4], 'changed editor')
     $message = $null
     try {
-        Assert-SmokeBuildManifest $manifestPath 'fingerprint' $files[0] $files[1] $files[2] $files[3] $files[4]
+        Assert-SmokeBuildManifest $manifestPath 'fingerprint' $files[0] $files[1] $files[2] $files[3] $files[4] $files[5]
     } catch { $message = $_.Exception.Message }
     Assert-True ([bool] $message -and $message.Contains('hash does not match')) 'changed editor was accepted by manifest'
     $support = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Support.ps1') -Raw -Encoding UTF8

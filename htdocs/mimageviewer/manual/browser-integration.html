@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ブラウザ連携 — mImageViewer マニュアル</title>
+  <!-- meta:begin (generated) -->
+  <meta name="description" content="ブラウザ連携の登録と解除、保存先、重ねて開く窓の操作と注意点を説明します。拡張機能は公開準備中です。">
+  <link rel="canonical" href="https://mikage.to/mimageviewer/manual/browser-integration.html">
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="mImageViewer">
+  <meta property="og:locale" content="ja_JP">
+  <meta property="og:url" content="https://mikage.to/mimageviewer/manual/browser-integration.html">
+  <meta property="og:title" content="ブラウザ連携｜mImageViewer">
+  <meta property="og:description" content="ブラウザ連携の登録と解除、保存先、重ねて開く窓の操作と注意点を説明します。拡張機能は公開準備中です。">
+  <meta property="og:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="ブラウザ連携｜mImageViewer">
+  <meta name="twitter:description" content="ブラウザ連携の登録と解除、保存先、重ねて開く窓の操作と注意点を説明します。拡張機能は公開準備中です。">
+  <meta name="twitter:image" content="https://mikage.to/mimageviewer/ogp.jpg">
+  <!-- meta:end -->
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>ブラウザ連携</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="tutorial.html">チュートリアル</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="stack.html">スタック表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="music.html">音楽再生</a>
+        <a href="music-video.html">音楽ビデオの作成</a>
+        <a href="effetune.html">音響調整</a>
+        <a href="sound/index.html" class="sub">エフェクトの説明書</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="local-adjustment.html">補正レイヤー</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="annotation.html">テキスト注釈</a>
+        <a href="export.html">エクスポート</a>
+        <a href="clipboard-capture.html">クリップボード取り込み</a>
+        <a href="browser-integration.html" class="active">ブラウザ連携</a>
+        <a href="metadata-transfer.html">メタ情報の移行</a>
+        <a href="external-tools.html">外部ツール連携</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="books.html">製本・本棚</a>
+        <a href="collections.html">コレクション</a>
+        <a href="search.html">検索機能</a>
+        <a href="remote.html">リモート閲覧</a>
+        <a href="ai-integration.html">AI アプリとの連携</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="gamepad.html">ゲームパッド操作</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+        <a href="known-issues.html">既知の問題</a>
+        <a href="changelog.html">更新履歴</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">ブラウザ連携</h1>
+    <p class="page-desc">ブラウザで見ている画像を PC に保存し、mImageViewer の窓で開くための設定です。</p>
+    <p><strong>Chrome / Edge 用の拡張機能は公開準備中です。</strong>本体側の設定を先に用意しています。ブラウザから開くには、拡張機能の公開をお待ちください。</p>
+    <nav class="page-toc">
+      <div class="page-toc-title">目次</div>
+      <ul>
+        <li><a href="#install-extension">拡張機能の入れ方・公開後の使い方</a></li>
+        <li><a href="#registration">mIV 側の登録と解除</a></li>
+        <li><a href="#destination">保存先と「ブラウザ閲覧」</a></li>
+        <li><a href="#window">重ねて開く窓の動き</a></li>
+        <li><a href="#adjustment">補正を画像ごとに残す</a></li>
+        <li><a href="#data">通信と出どころの記録</a></li>
+      </ul>
+    </nav>
+
+    <h2 id="install-extension">拡張機能の入れ方・公開後の使い方</h2>
+    <p><strong>公開準備中です。現在はストアからインストールできません。</strong>公開後、この節に Chrome / Edge のインストール先と手順を掲載します。</p>
+    <p>以下は拡張機能の公開後に使える操作と注意点です。</p>
+    <ol>
+      <li>下記の <a href="#registration">mIV 側の登録</a>を行います。</li>
+      <li>ブラウザで画像を右クリックし、「mIV で見る」を選びます。サイト独自のメニューが出る場合は、<kbd>Shift</kbd> を押しながら右クリックするとブラウザのメニューを出せることがあります。</li>
+      <li>初めて使うサイトでは、画像のあるサイトとページのサイトへのアクセス許可をブラウザが確認します。画像のサイトへの許可を断ると取得できません。画像のサイトだけ許可済みで、ページのサイトを許可していない場合は、窓の位置を推定して開きます。</li>
+      <li>画像を「ブラウザ閲覧」フォルダに保存し、ブラウザのページ部分に重ねて mIV の窓を開きます。mIV が起動していない場合は起動します。</li>
+    </ol>
+    <p>対象は選んだ画像 1 枚です。動画や SVG、HTTP / HTTPS 以外の画像は対象外です。ログインが必要な画像や大きな画像など、取得できない画像もあります。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>拡張のアイコンに出る知らせ</th><th>対処</th></tr></thead>
+        <tbody>
+          <tr><td>処理中</td><td>完了を待ってから次の画像を開きます。</td></tr>
+          <tr><td>未登録・連携できない</td><td>mIV の環境設定でブラウザ連携を登録します。</td></tr>
+          <tr><td>更新・再起動が必要</td><td>mIV や拡張機能を更新し、起動中の mIV を終了して起動し直します。</td></tr>
+          <tr><td>mIV が見つからない</td><td>mIV を入れ直すか連携を解除します。mimageviewer.exe を移動した場合は、新しい場所から起動して連携を登録し直します。</td></tr>
+          <tr><td>サイトの許可がない・取得できない</td><td>ブラウザの拡張機能の設定でサイトへの許可を確認します。許可済みでも、サイトの制限や転送先によって取得できない場合があります。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>拡張からの受け渡しが成功しても、mIV の状態によっては開けないことがあります。★固定で保存先が対象のお気に入りの範囲外になる場合は、★固定を解除してから操作してください。リモート操作中や本の構成を編集中など、受け付けられない理由は mIV 側で知らせます。</p>
+
+    <h2 id="registration">mIV 側の登録と解除</h2>
+    <ol>
+      <li><code>mimageviewer.exe</code> から通常版の mIV を起動します。</li>
+      <li>「設定」→「環境設定…」→「起動と連携」→「ブラウザ連携」を開きます。</li>
+      <li>「ブラウザ連携を使う」にチェックを入れます。「Chrome / Edge に登録されています。」と表示されれば登録済みです。</li>
+    </ol>
+    <p>登録・解除と保存先の変更は、この画面で操作するたびに反映します。「キャンセル」で画面を閉じても、反映済みの登録・解除は取り消されません。処理中に画面を閉じても処理は続きます。</p>
+    <p>登録を変更できるのは、既定のデータフォルダ <code>%APPDATA%\mimageviewer</code> を使う mIV だけです。ポータブル版、<code>--data-dir</code> を指定した起動、起動元の <code>mimageviewer.exe</code> を確認できない起動では、理由を表示して設定を変更できなくします。直接起動した本体ではなく、<code>mimageviewer.exe</code> から起動してください。連携用のファイルがないと表示された場合は、mIV を入れ直してください。</p>
+    <p>解除するには同じ画面の「連携を解除」を押します。「ブラウザ連携を使う」のチェックを外した場合も、使用中の連携を解除します。解除しても保存済みの画像は残り、ブラウザの拡張機能も削除されません。拡張機能の削除はブラウザ側で行います。</p>
+    <p><strong>mIV をアンインストールする前に、この画面で連携を解除してください。</strong>別の管理者アカウントの資格情報を使ってアンインストールすると、mIV を使っていたアカウントの登録は残ります。</p>
+
+    <h2 id="destination">保存先と「ブラウザ閲覧」</h2>
+    <p>既定の保存先は、Windows の「ピクチャ」内の <code>mimageviewer\browser</code> です。その中の <code>2026-11</code> のような月別フォルダへ、元の画像形式のまま保存します。保存先と月別フォルダは、最初の保存時に作成します。</p>
+    <p>環境設定の「ブラウザ閲覧の保存先」で「変更…」から選ぶか、フォルダの絶対パスを入力して「保存先を適用」を押します。入力したパスは環境設定の「OK」でも反映できます。「既定に戻す」でピクチャ内の保存先へ戻り、「フォルダを開く」で保存先を開けます。保存先を変更しても、以前保存した画像は移動しません。</p>
+    <p>連携が有効な間は、メインウィンドウの「場所▼」→「ブラウザ閲覧」から保存先へ移動できます。ファイル名は保存日時・ページのドメイン・連番から付き、既存のファイルは上書きしません。<a href="clipboard-capture.html">クリップボード取り込み</a>の保存先とは別です。</p>
+    <p>保存前に失敗した画像は残りません。保存後に、出どころの記録や mIV への受け渡し、表示に失敗した場合は、保存済みの画像が残ります。窓が開かなかったときも保存先を確認してください。</p>
+
+    <h2 id="window">重ねて開く窓の動き</h2>
+    <p>ブラウザのタブやアドレスバーの下にある、ページの表示領域へ窓を重ねます。位置合わせはおおよそのもので、ページの拡大率、サイドパネル、モニターの表示倍率などによってずれることがあります。位置を合わせるのは開くときだけで、後からブラウザを動かしても追従しません。</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>環境設定のビューワモード</th><th>開き方</th></tr></thead>
+        <tbody>
+          <tr><td>フル機能ウィンドウ（編集機能あり）</td><td>一覧と連動する別ウィンドウで開きます。通常は別ウィンドウを使わない設定でも同じです。既に F12 の別ウィンドウが開いている場合は、閉じて作り直します。</td></tr>
+          <tr><td>複数ウィンドウ（編集機能なし）</td><td>開くたびに新しい窓を作り、前の窓は残します。全体の色調補正・ポストフィルタ・AI の表示設定は使えますが、消しゴムや補正レイヤーなどの編集の道具は使えません。</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>どちらのモードでもメインウィンドウの一覧は保存先の月別フォルダへ移り、開いた画像が選ばれます。未起動から mIV を起動したときはメインウィンドウも表示され、ブラウザの一部を隠すことがあります。</p>
+    <p>ブラウザから開いた窓を対象とする「別ウィンドウ表示の切り替え」（既定 <kbd>F12</kbd>）は使えません。メインウィンドウやリングから同じ操作をした場合も同じです。<kbd>F11</kbd> の枠なし全画面表示は使えます。新しくブラウザから開く窓は、枠付きで開きます。</p>
+    <p><kbd>Esc</kbd> や「×」で窓を閉じたとき、mIV はメインウィンドウを前に出しません。次にどの窓が前に出るかは Windows が決めるため、ブラウザへ戻ることは保証できません。この窓の位置は、通常の F12 の別ウィンドウの保存位置を上書きしません。</p>
+
+    <h2 id="adjustment">補正を画像ごとに残す</h2>
+    <p>mIV の補正は保存した元画像を書き換えません。その画像だけに補正を残したい場合は、補正パネルの書き込む先で「このページ」を選んでから調整します。後で「ブラウザ閲覧」を開くと、画像の一覧に「補」の印が付きます。</p>
+    <p>「標準」を選んだままの調整は、その場所の標準設定を変えます。アップスケールの <kbd>U</kbd> などのショートカットも、画像に個別設定があればそこへ、なければお気に入りの標準、または共通の標準へ書き込みます。新しく保存した画像では通常は標準を変えるため、ほかの画像にも効き、「補」の印は付きません。</p>
+    <p>サムネイルに反映されるのは色の補正で、アップスケールやポストフィルタは反映されません。補正や編集を画像ファイルとして残すには、<kbd>Ctrl</kbd>+<kbd>E</kbd> の<a href="export.html">エクスポート</a>を使います。詳しくは<a href="adjustment.html">画像補正</a>をご覧ください。</p>
+
+    <h2 id="data">通信と出どころの記録</h2>
+    <p>拡張機能の公開後、「mIV で見る」を選んだときだけ、選んだ画像の URL を拡張機能が 1 回取得します。サイトの Cookie はブラウザの規則に従って付きます。最初の URL への要求には、ページや画像の参照元の指定にかかわらず、ページのアドレスのホスト名まで（例: <code>https://example.com/</code>）を参照元として送ります。参照元にページのパスや検索語は含めません。転送先への要求とその参照元はブラウザの規則に従い、転送先の許可がない場合などは取得できないことがあります。</p>
+    <p>許可したサイトでは、窓の位置合わせのために直前の右クリックの座標と窓の位置・大きさを記録します。ページ本文は読みません。「mIV で見る」を選んだときだけ、画像データとページ・画像・転送後の URL、窓と右クリックの座標を、この PC 内の mIV へ渡します。これらを開発者へ送信することはありません。</p>
+    <p>保存した画像には Windows の Mark of the Web として、ページの URL と取得後の画像の URL を記録します。ファイルの内容とは別の記録で、Windows がインターネット由来のファイルとして扱うためのものです。通信と保存データの詳細は<a href="../privacy.html">プライバシーポリシー</a>をご覧ください。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+</body>
+</html>

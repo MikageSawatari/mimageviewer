@@ -202,7 +202,7 @@ fn agent_open_is_accepted_then_superseded_by_same_frame_second_instance() {
     app.poll_agent_open_requests(&ctx);
     let pending = app.startup_open_path_resolve_pending.as_ref().unwrap();
     assert_eq!(pending.requested.as_path(), agent_path.as_path());
-    assert!(matches!(pending.owner, StartupOpenPathOwner::Activation));
+    assert!(matches!(pending.owner, StartupOpenPathOwner::Activation(_)));
     let cancelled_by_user = Arc::clone(&pending.cancel);
     let accepted = queued.finish().expect("agent request was admitted");
     assert_eq!(accepted.status, OpenStatus::Accepted);
@@ -254,5 +254,57 @@ fn agent_open_resolver_refuses_epub_deletion_while_second_instance_requeues() {
         StartupOpenAdmission::Requeued,
     ));
     assert_eq!(app.activation_open_path_rx.try_recv().unwrap().path, path);
+    assert!(app.startup_open_path_resolve_pending.is_none());
+}
+
+#[test]
+fn browser818_open_owner_agent_receives_distinct_preferences_requests() {
+    let mut app = setup_app();
+    let ctx = egui::Context::default();
+    let controller = install(&mut app, &ctx);
+    let path = app.tmp.path().to_path_buf();
+    let first = enqueue(&controller, &path);
+    app.poll_agent_open_requests(&ctx);
+    assert_eq!(first.finish().unwrap().status, OpenStatus::Accepted);
+    let pending = app.startup_open_path_resolve_pending.as_ref().unwrap();
+    let first_request = pending.owner.viewer_open_adoption().request().unwrap();
+    let cancel = Arc::clone(&pending.cancel);
+    assert_eq!(
+        first_request.intent,
+        crate::app::external_open::ViewerOpenIntent::Preferences
+    );
+    let second = enqueue(&controller, &path);
+    app.poll_agent_open_requests(&ctx);
+    assert_eq!(second.finish().unwrap().status, OpenStatus::Accepted);
+    let pending = app.startup_open_path_resolve_pending.as_ref().unwrap();
+    let second_request = pending.owner.viewer_open_adoption().request().unwrap();
+    assert_ne!(first_request, second_request);
+    assert_eq!(
+        second_request.intent,
+        crate::app::external_open::ViewerOpenIntent::Preferences
+    );
+    assert!(cancel.load(Ordering::Relaxed));
+    assert!(!pending.cancel.load(Ordering::Relaxed));
+}
+
+#[test]
+fn browser818_open_owner_modal_requeue_preserves_received_request() {
+    let mut app = setup_app();
+    let ctx = egui::Context::default();
+    arm_document_modal(&mut app, &ctx);
+    let path = app.tmp.path().to_path_buf();
+    let request = ViewerOpenRequest::preferences();
+    assert_eq!(
+        app.start_startup_open_request_with_navigation(
+            ExplicitOpenPath::new(path.clone(), request),
+            StartupOpenPathSource::Activation,
+            &ctx,
+            None,
+        ),
+        StartupOpenAdmission::Requeued
+    );
+    let queued = app.activation_open_path_rx.try_recv().unwrap();
+    assert_eq!(queued.path, path);
+    assert_eq!(queued.request, request);
     assert!(app.startup_open_path_resolve_pending.is_none());
 }

@@ -77,6 +77,7 @@
       font-size: 0.95rem; color: #444; position: relative; }
     .pink-list li::before { content: "\2666"; position: absolute; left: 0; color: #ff60c0; font-size: 0.65rem; top: 0.7rem; }
     .pink-list li:last-child { border-bottom: none; }
+    .browser-integration-list code { overflow-wrap: anywhere; }
 
     .info-box { background: #fff; border: 1px solid #ffe0ec; border-left: 4px solid #ff60c0;
       border-radius: 8px; padding: 0.85rem 1.1rem; font-size: 0.9rem; color: #666; margin-top: 0.75rem; }
@@ -119,7 +120,7 @@
       本アプリは利用者の PC 上で動作するデスクトップアプリケーションです。
       <strong>開発者が利用者の個人情報を収集・送信・販売することはありません。</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年11月14日</p>
+    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年11月22日</p>
   </section>
 
   <section>
@@ -134,6 +135,24 @@
 
   <section>
     <h2>端末内に保存されるデータ</h2>
+    <h3 id="browser-integration-data">ブラウザ連携の登録と保存先</h3>
+    <p>環境設定の「起動と連携 → ブラウザ連携」で「ブラウザ連携を使う」をオンにすると、
+      Chrome と Edge が同じ PC の mIV を見つけるために、現在の Windows アカウントへ次の登録を作ります。
+      登録を変更できるのは、既定のデータフォルダを使う通常版だけです。ポータブル版や別のデータフォルダを指定した起動では変更しません。</p>
+    <ul class="pink-list browser-integration-list">
+      <li><code>HKCU\Software\Google\Chrome\NativeMessagingHosts\to.mikage.mimageviewer</code></li>
+      <li><code>HKCU\Software\Microsoft\Edge\NativeMessagingHosts\to.mikage.mimageviewer</code></li>
+      <li><code>%APPDATA%\mimageviewer\browser-host</code>：画像を受け渡す中継プログラム、mIV の起動用ファイルと画像の保存先の絶対パスを記録した設定、ブラウザが中継プログラムを見つけるための案内ファイル（manifest）</li>
+    </ul>
+    <p>受け取った画像は、既定では <code>ピクチャ\mimageviewer\browser</code> の月ごとのフォルダへ保存します。保存先は環境設定で変更できます。
+      画像には出どころの記録（Windows の Mark of the Web）としてページの URL と最後の画像の URL を書き込み、ユーザー名・パスワードとフラグメントは除きます。
+      保存後に記録や mIV への受け渡しが失敗しても、保存した画像は残ります。ネットワーク共有や同期フォルダを保存先に選んだ場合は、その保存先や同期ソフトの動作に従います。</p>
+    <p>「連携を解除」では、上のキーのうち mIV 自身の案内ファイルを指すものと、案内ファイル・中継プログラム・その設定を削除します。
+      使用中で削除できない中継プログラムと設定は残す場合があります。保存した画像とブラウザ拡張は削除しません。
+      インストーラ版のアンインストールでも、実行した Windows アカウントの登録と <code>browser-host</code> を削除します。
+      別の管理者アカウントで実行すると、使っていたアカウントの登録は残るため、<strong>アンインストールの前に mIV の環境設定で連携を解除してください</strong>。
+      保存先を <code>%APPDATA%\mimageviewer</code> の中に変更し、アンインストール時に設定とキャッシュの削除を選んだ場合は、その中の画像も削除対象になります。
+      <a href="manual/browser-integration.html">登録・解除と拡張の入手状況</a>もご覧ください。</p>
     <p>音楽ビデオエディタは、利用者が選んだ保存先にプロジェクト（<code>.mivmv.json</code>）、MP4、LRC、連番 PNG を保存します。
       プロジェクトには編集内容と音声・画像の保存場所を記録し、素材そのものは埋め込みません。
       ネットワーク共有や同期フォルダを保存先に選ぶ場合は、その保存先や同期ソフトの動作に従います。</p>
@@ -282,6 +301,8 @@
   <section>
     <h2>ネットワーク通信</h2>
     <p>本アプリでは、次のような通信が発生します。</p>
+    <p>ブラウザ連携のために、mIV 本体が画像サイトへ接続することはありません。同じ PC の中継プログラムが保存した画像ファイルを受け取って開きます。
+      拡張の入手状況は <a href="manual/browser-integration.html#install-extension">マニュアル</a>をご覧ください。拡張による画像取得の通信と取り扱う情報は、拡張の公開に合わせてこのページへ追記します。</p>
     <ul class="pink-list">
       <li><strong>更新確認</strong>: 新しいバージョンの有無を確認するため、配布元（GitHub）の公開リリース情報を取得します。通常の HTTP リクエストのみで、個人を特定する情報は送信しません。</li>
       <li><strong>任意コンポーネントのダウンロード</strong>: 利用者が自ら選択した場合に限り、AI 高速化用コンポーネント等を配布元から取得します。AI 説明文のモデル、文字起こしのモデルと 3D 写真用の深度モデルは、確認画面でダウンロードを選んだときだけ mImageViewer の GitHub Releases から取得します。説明文の作成・文字起こし・奥行きの計算のために、画像や画像内の文字、動画・音声の音声を送信しません。</li>
@@ -386,7 +407,7 @@
       mImageViewer ("the App") respects your privacy. The App is a desktop application that
       runs on your PC. <strong>The developer does not collect, transmit, or sell your personal information.</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">Last updated: November 14, 2026</p>
+    <p style="font-size:0.85rem; color:#888;">Last updated: November 22, 2026</p>
   </section>
 
   <section>
@@ -403,6 +424,23 @@
 
   <section>
     <h2>Data stored on your device</h2>
+    <h3 id="browser-integration-data-en">Browser integration registration and saved images</h3>
+    <p>Turning on browser integration under Preferences → Startup and Integration (起動と連携) → Browser Integration (ブラウザ連携) creates the following entries for your current Windows account so Chrome and Edge can find mIV on this PC.
+      Only a regular installation using the default data folder can change registration. Portable installations and launches with a separately specified data folder leave it unchanged.</p>
+    <ul class="pink-list browser-integration-list">
+      <li><code>HKCU\Software\Google\Chrome\NativeMessagingHosts\to.mikage.mimageviewer</code></li>
+      <li><code>HKCU\Software\Microsoft\Edge\NativeMessagingHosts\to.mikage.mimageviewer</code></li>
+      <li><code>%APPDATA%\mimageviewer\browser-host</code>: the local image handoff program, settings containing the absolute paths of the mIV launcher and image destination, and the file that tells the browser where to find the handoff program (manifest)</li>
+    </ul>
+    <p>Received images are saved in monthly folders under <code>Pictures\mimageviewer\browser</code> by default. You can change the destination in Preferences.
+      The page URL and final image URL are written to the image as Windows Mark of the Web information, excluding usernames, passwords, and fragments.
+      An image that has been saved remains even if writing this information or handing it to mIV subsequently fails. Network shares and synchronized destinations follow the behavior of that destination or synchronization software.</p>
+    <p>Unregistering removes the registry entries above only when they point to mIV's own manifest, along with the manifest, handoff program, and its settings.
+      A program and its settings may remain if they are in use and cannot be deleted. Saved images and the browser extension are not removed.
+      The installer uninstaller also removes registration and <code>browser-host</code> for the Windows account running it.
+      If you uninstall using a different administrator account, the original account's registration remains. <strong>Unregister browser integration in mIV Preferences before uninstalling.</strong>
+      If you changed the image destination to a folder inside <code>%APPDATA%\mimageviewer</code> and choose to delete settings and cache during uninstall, those images are also included in that deletion.
+      See the <a href="manual/browser-integration.html">manual for registration, removal, and extension availability</a>.</p>
     <p>Everything filename search sends your query to Everything running on the same PC and receives file locations locally.
       mImageViewer does not save the result list. If search input history is enabled, queries are saved in that history on your PC, but not in diagnostic logs.
       The App does not change Everything's own search history settings. Viewing history, tags, ratings and thumbnail caches for files you open are saved as usual.
@@ -528,6 +566,8 @@
 
   <section>
     <h2>Network communication</h2>
+    <p>For browser integration, mIV itself does not connect to image sites. It opens an image file saved by the handoff program on the same PC.
+      See the <a href="manual/browser-integration.html#install-extension">manual for extension availability</a>. Details of the extension's image retrieval and the information it handles will be added here when the extension is published.</p>
     <p>Network activity includes the following:</p>
     <ul class="pink-list">
       <li><strong>Update check</strong>: to see whether a newer version exists, the App retrieves the public release information from the distribution source (GitHub). This is an ordinary HTTP request and includes no personally identifying information.</li>

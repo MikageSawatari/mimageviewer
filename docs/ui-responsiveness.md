@@ -115,6 +115,33 @@ mux・ファイル公開は `depth-export` worker に置き、画面用 uniform 
 モーダル中は3D自動運動の連続 repaint も停止する。取消は atomic flag、UI では join しない。
 実機での画質・所要時間・保存ダイアログの操作感は自動テストとは別に確認する。
 
+## ブラウザ連携の準備・登録・保存先操作（§1.818）
+
+`App::browser_integration` が process-global の単一 owner を持つ。UI は設定の snapshot と操作を渡し、環境は worker で取得する。
+`try_recv` で非 blocking poll して状態を描く。既知フォルダの照会、資格・exe の確認、
+保存先の祖先／junction の解決、copy/hash、manifest・registry、世代の整理、フォルダ picker／
+フォルダを開く処理は worker で行う。場所▼も解決済み保存先だけを使い、描画中に存在確認しない。
+
+同時に受け付ける操作は一件。処理中の追加操作は断り、完了は設定画面の寿命から独立した
+root の process-global poll で early return 前に回収する。worker は完了時に ROOT の repaint を要求し、
+UI の待機・busy loop・常時 repaint は追加しない。登録結果を live Settings へ採用後、
+worker の2キー transaction で保存し、UI から同期の全体設定保存を新たに呼ばない。
+
+通常の終了は root の既存継続で非同期に待ち、結果を採用・保存してから再開する。
+OFF の読み取り準備は通常終了・最終 fence の待機対象にせず、ON の起動時更新だけを待つ。
+フォルダ picker も同じ worker が持つため、終了受付で一律に同期受信する方式は採らない。
+通常の受付を迂回した最終 on_exit だけは、既発行 worker の receiver を回収して live Settings を
+確定する。既存の終了保存より前の所有境界の fence であり、描画中に registry／FS の同期作業を
+移す例外ではない。通常のポーリングや描画に待機・時間窓・再試行は追加しない。
+この最終 fence は ChooseFolder の picker も同期受信し得る。受付迂回との組み合わせは
+まれな終了の割り切りとして扱い、追加の仕組みは設けない。
+
+native messaging の受信・画像保存・MOTW・launcher の終了待ちは別プロセスの中継 exe、
+専用 pipe の接続・通信は listener / peer worker が担う。App は保存済みファイルを既存の
+非同期 open と復元 owner で開き、ブラウザの取得や通信完了を UI スレッドで待たない。
+所有・停止の詳細は [非同期アーキテクチャ](async-architecture.md)、実装と未確認事項は
+[実装計画](browser-to-miv-impl-plan.md) を参照する。
+
 ## 1. 原則: UI スレッドで避けるべき処理
 
 `App::update` から直接 (あるいは呼び出し先から同期的に) 呼ばれるコードで、以下はすべて

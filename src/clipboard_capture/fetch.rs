@@ -1,9 +1,11 @@
 //! Dialog-scoped network ownership and a process-wide four-worker budget.
 //! UI calls only submit work and poll the bounded result channel.
-use super::data::{
-    CaptureOrigin, CaptureTimestamp, capture_filename, validate_dimensions, write_motw,
-};
+use super::data::validate_dimensions;
 use crossbeam_channel::{Receiver, Sender, bounded};
+use mimageviewer_capture_file::{
+    CaptureImageKind, CaptureOrigin, CaptureTimestamp, capture_filename,
+    capture_image_format_from_header, write_motw,
+};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::File;
@@ -912,40 +914,20 @@ fn decode_fetched(path: &Path) -> Result<(image::DynamicImage, String), String> 
                 &FetchBackend(path),
             )
             .map_err(|e| e.to_string())?;
-            return Ok((decoded.image, "avif".into()));
+            return Ok((
+                decoded.image,
+                CaptureImageKind::Avif.format().extension().into(),
+            ));
         }
     }
-    let special =
-        if header.starts_with(b"\xff\x0a") || header.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n") {
-            Some("jxl")
-        } else if header.len() >= 12 && &header[4..8] == b"ftyp" {
-            match &header[8..12] {
-                b"avif" | b"avis" => Some("avif"),
-                b"heic" | b"heix" | b"hevc" | b"hevx" | b"mif1" | b"msf1" => Some("heic"),
-                _ => None,
-            }
-        } else {
-            None
-        };
-    if let Some(extension) = special {
-        return decode_wic_bounded(path).map(|image| (image, extension.into()));
-    }
-    let format =
-        image::guess_format(header).map_err(|_| "取得した内容は対応する画像ではありません")?;
-    // image enables more codecs than mIV recognizes in its normal listing.
-    // Keep this boundary to its built-in image formats (folder_tree §extensions);
-    // the WIC-only modern formats were handled above.
-    if !matches!(
-        format,
-        image::ImageFormat::Jpeg
-            | image::ImageFormat::Png
-            | image::ImageFormat::Gif
-            | image::ImageFormat::WebP
-            | image::ImageFormat::Bmp
-            | image::ImageFormat::Tiff
-    ) {
-        return Err("取得した内容は対応する画像ではありません".into());
-    }
+    let capture_format = capture_image_format_from_header(header)
+        .ok_or("取得した内容は対応する画像ではありません")?;
+    // The shared table owns admission. This match only selects the existing
+    // bounded decoder; native AVIF brand probing above retains its priority.
+    let format = fetched_builtin_format(capture_format.kind);
+    let Some(format) = format else {
+        return decode_wic_bounded(path).map(|image| (image, capture_format.extension().into()));
+    };
     if format == image::ImageFormat::Png && header.len() >= 24 && &header[12..16] == b"IHDR" {
         validate_dimensions(
             u32::from_be_bytes(header[16..20].try_into().unwrap()),
@@ -973,12 +955,19 @@ fn decode_fetched(path: &Path) -> Result<(image::DynamicImage, String), String> 
     let image = reader
         .decode()
         .map_err(|e| format!("画像を読み取れませんでした: {e}"))?;
-    let extension = format
-        .extensions_str()
-        .first()
-        .ok_or("画像形式を判定できませんでした")?
-        .to_string();
-    Ok((image, extension))
+    Ok((image, capture_format.extension().into()))
+}
+
+fn fetched_builtin_format(kind: CaptureImageKind) -> Option<image::ImageFormat> {
+    match kind {
+        CaptureImageKind::Jpeg => Some(image::ImageFormat::Jpeg),
+        CaptureImageKind::Png => Some(image::ImageFormat::Png),
+        CaptureImageKind::Gif => Some(image::ImageFormat::Gif),
+        CaptureImageKind::WebP => Some(image::ImageFormat::WebP),
+        CaptureImageKind::Bmp => Some(image::ImageFormat::Bmp),
+        CaptureImageKind::Tiff => Some(image::ImageFormat::Tiff),
+        CaptureImageKind::Avif | CaptureImageKind::Heic | CaptureImageKind::JpegXl => None,
+    }
 }
 
 #[cfg(not(windows))]

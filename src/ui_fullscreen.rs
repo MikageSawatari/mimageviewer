@@ -24850,12 +24850,36 @@ impl App {
         reason: &'static str,
         activate_ids: Option<&[u64]>,
     ) {
+        self.close_detached_image_windows_by_ids_with_cause(
+            ctx,
+            close_ids,
+            reason,
+            activate_ids,
+            crate::app::ViewerCloseCause::User,
+        );
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn close_detached_image_windows_by_ids_with_cause(
+        &mut self,
+        ctx: &egui::Context,
+        close_ids: &[u64],
+        reason: &'static str,
+        activate_ids: Option<&[u64]>,
+        cause: crate::app::ViewerCloseCause,
+    ) {
         if close_ids.is_empty() {
             return;
         }
         let mut close_ids = close_ids.to_vec();
         close_ids.sort_unstable();
         close_ids.dedup();
+        let owners = close_ids
+            .iter()
+            .filter_map(|id| {
+                self.capture_detached_close_owner(Self::detached_session_lease(*id), cause)
+            })
+            .collect::<Vec<_>>();
         let activate_ids = activate_ids.unwrap_or(&[]);
         self.log_detached_image_window_debug(format!(
             "{reason} ids={:?} passive_before={} activate_ids={:?}",
@@ -24876,14 +24900,24 @@ impl App {
                 ));
             }
         }
-        let _ = self.teardown_paused_media_bundles_for_window_ids(&close_ids, reason);
+        let _ = self
+            .teardown_paused_media_bundles_with_close_owners(&close_ids, reason, cause, &owners);
         self.detached_image_windows
             .retain(|window| !close_ids.contains(&window.id));
         for id in &close_ids {
-            self.remove_detached_window_runtime(*id, reason);
+            if let Some(owner) = owners.iter().find(|owner| owner.lease.window_id == *id) {
+                self.remove_detached_window_runtime_owned(*owner, reason);
+            } else {
+                self.remove_detached_window_runtime(*id, reason);
+            }
             self.deferred_detached_image_window_views.remove(id);
         }
-        self.focus_main_after_detached_window_close_if_idle(ctx, reason);
+        if let Some(owner) = owners
+            .iter()
+            .find(|owner| owner.policy().main_focus == crate::app::DetachedCloseFocus::Existing)
+        {
+            self.focus_main_after_detached_close_if_idle(ctx, *owner, reason);
+        }
         ctx.request_repaint();
     }
 

@@ -91,12 +91,30 @@ pub fn capture_window_placement(hwnd_raw: isize) -> Option<SavedWindowPlacement>
 
 #[cfg(windows)]
 pub(crate) fn restore_window_placement(hwnd_raw: isize, saved: &SavedWindowPlacement) {
+    restore_window_placement_with_policy(
+        hwnd_raw,
+        saved,
+        crate::window_activation::MainRestorePolicy::Activate,
+    );
+}
+
+#[cfg(windows)]
+pub(crate) fn restore_window_placement_with_policy(
+    hwnd_raw: isize,
+    saved: &SavedWindowPlacement,
+    policy: crate::window_activation::MainRestorePolicy,
+) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{SetWindowPlacement, WINDOWPLACEMENT};
     unsafe {
         // `[u8; N]` は alignment=1 なので `*const WINDOWPLACEMENT` への dereference は UB。
         // `read_unaligned` で安全に読む。
-        let wp = std::ptr::read_unaligned(saved.bytes.as_ptr() as *const WINDOWPLACEMENT);
+        let mut wp = std::ptr::read_unaligned(saved.bytes.as_ptr() as *const WINDOWPLACEMENT);
+        if !policy.requests_focus() {
+            // Tray hide retains the window's normal/maximized state. SW_SHOWNA
+            // restores visibility at that state without taking foreground.
+            wp.showCmd = windows::Win32::UI::WindowsAndMessaging::SW_SHOWNA.0 as u32;
+        }
         if let Err(e) = SetWindowPlacement(HWND(hwnd_raw as *mut _), &wp) {
             crate::logger::log(format!("tray: SetWindowPlacement failed: {e:?}"));
         }

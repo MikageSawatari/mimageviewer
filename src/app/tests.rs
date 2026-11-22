@@ -18146,7 +18146,7 @@ mod startup_open_path_resolve_tests {
                 app.tmp.path().join("unresolved-startup-target"),
             )
             .unwrap(),
-            owner: StartupOpenPathOwner::Activation,
+            owner: StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
             cancel: Arc::clone(&cancel),
             rx: resolve_rx,
             started_at: std::time::Instant::now(),
@@ -19088,7 +19088,7 @@ mod startup_open_path_resolve_tests {
                 r"\\server\offline\book.zip",
             ))
             .unwrap(),
-            owner: StartupOpenPathOwner::Activation,
+            owner: StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
             started_at: std::time::Instant::now() - std::time::Duration::from_millis(500),
@@ -19123,7 +19123,7 @@ mod startup_open_path_resolve_tests {
                 r"\\server\slow\old.zip",
             ))
             .unwrap(),
-            owner: StartupOpenPathOwner::Activation,
+            owner: StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
             cancel: Arc::clone(&old_cancel),
             rx,
             started_at: std::time::Instant::now(),
@@ -19267,7 +19267,10 @@ mod startup_open_path_resolve_tests {
         assert!(
             app.startup_open_path_resolve_pending
                 .as_ref()
-                .is_some_and(|pending| matches!(pending.owner, StartupOpenPathOwner::Activation))
+                .is_some_and(|pending| matches!(
+                    pending.owner,
+                    StartupOpenPathOwner::Activation(_)
+                ))
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -67980,7 +67983,11 @@ mod still_window_mode_key_tests {
         assert!(app.prepare_detached_context_for_grid_open(ctx, idx));
         app.fs_open_intent_from_grid = true;
         let entering_video = matches!(app.items.get(idx), Some(GridItem::Video(_)));
-        app.prepare_viewer_presentation_open(idx, entering_video);
+        app.prepare_viewer_presentation_open(
+            idx,
+            entering_video,
+            crate::app::ViewerOpenAdoption::ContextContinuation,
+        );
         app.fullscreen_idx = Some(idx);
         app.selected = Some(idx);
         app.fs_open_intent_from_grid = false;
@@ -79812,7 +79819,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 navigation: None,
                 diagnostic: None,
                 requested: crate::pdf_loader::LeasedEpubPath::try_new(target.clone()).unwrap(),
-                owner: StartupOpenPathOwner::Activation,
+                owner: StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
                 cancel: std::sync::Arc::clone(&cancel),
                 rx,
                 started_at: std::time::Instant::now(),
@@ -87945,10 +87952,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_viewport_recreate_after_hide = true;
         set_detached_host_for_test(&mut app, 42, 0x1234, true);
         app.begin_active_detached_session(42, DetachedSource::Image);
+        let close_lease = App::detached_session_lease(42);
+        let close_owner = app
+            .capture_detached_close_owner(close_lease, ViewerCloseCause::User)
+            .unwrap();
 
         app.finalize_closed_active_detached_viewport(
             &ctx,
             App::detached_image_window_viewport_id(42),
+            close_owner,
         );
 
         assert!(
@@ -90648,7 +90660,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.prepare_detached_context_for_grid_open(&ctx, second_video));
         assert_eq!(app.fullscreen_idx, None);
         assert!(app.detached_image_windows.iter().any(|w| w.id == 71));
-        app.prepare_viewer_presentation_open(second_video, true);
+        app.prepare_viewer_presentation_open(
+            second_video,
+            true,
+            crate::app::ViewerOpenAdoption::ContextContinuation,
+        );
 
         let new_id = app
             .detached_viewer_window_id()
@@ -91044,7 +91060,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             "different media must continue into the normal park/close/open path"
         );
         assert!(app.park_active_detached_context_for_new_grid_open(&ctx, new_video));
-        app.prepare_viewer_presentation_open(new_video, true);
+        app.prepare_viewer_presentation_open(
+            new_video,
+            true,
+            crate::app::ViewerOpenAdoption::ContextContinuation,
+        );
 
         assert!(app.detached_image_windows.is_empty());
         assert_eq!(app.detached_window_state(71), None);
@@ -100358,7 +100378,8 @@ mod smart_folder_transition_tests {
                     "realmachine50_foreign_offer_before_confirmation",
                 );
             });
-        let origin = StartupOpenPathOwner::Activation.viewer_open_adoption();
+        let origin = StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences())
+            .viewer_open_adoption();
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
             viewer_adoption: origin,
             history_trigger: HistoryTrigger::UserChosen,
@@ -110702,19 +110723,29 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
         !body.contains("self.active_viewer_context_id()"),
         "terminal owner must not retarget the supplied id"
     );
+    let compact = body
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .replace(",)", ")");
+    assert!(compact.contains("self.viewer_context_window(id)"));
+    assert!(compact.contains("Self::detached_session_lease(window_id),cause)"));
+    assert!(
+        compact.contains("self.close_and_retire_context_with_close_owner(id,reason,close_owner,")
+    );
     let body = body.as_str();
     let transfer = body
         .find("self.transfer_terminal_close_return(id, cause);")
         .expect("teardown前の帰還移譲がない");
     let retire = body
-        .find("self.close_and_retire_context(")
+        .find("self.close_and_retire_context_with_close_owner(")
         .expect("typed cause ownerがretire seamを通っていない");
     assert!(
         transfer < retire,
         "帰還の所有値はviewer teardownより前に移譲する"
     );
     let terminal_closure = body
-        .split_once("self.close_and_retire_context(")
+        .split_once("self.close_and_retire_context_with_close_owner(")
         .expect("共有 seam が close-and-retire owner を通っていない")
         .1
         .split_once("|app| {")
@@ -110745,7 +110776,9 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
     }
 
     // 残余 context の回収も同じ terminal close seam を通る。
-    let production_seams = src.matches("close_and_retire_context(").count();
+    let production_seams = src
+        .matches("close_and_retire_context_with_close_owner(")
+        .count();
     assert_eq!(
         production_seams, 2,
         "close_and_retire_context の呼び出しが {production_seams} 箇所ある。 増えた側も terminal effects を完遂しているか確認し、この検査を更新すること"
@@ -115260,13 +115293,21 @@ fn front_popup_presentation_open_keeps_page_owner_until_the_display_target_chang
     app.settings.video_in_window_mode = false;
     app.viewer_presentation = ViewerPresentation::Fullscreen;
     app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
-    app.prepare_viewer_presentation_open(0, false);
+    app.prepare_viewer_presentation_open(
+        0,
+        false,
+        crate::app::ViewerOpenAdoption::ContextContinuation,
+    );
     assert!(
         app.fs_front_pointer.is_active(),
         "a same-viewer page open is not a display handoff"
     );
     app.settings.video_in_window_mode = true;
-    app.prepare_viewer_presentation_open(0, false);
+    app.prepare_viewer_presentation_open(
+        0,
+        false,
+        crate::app::ViewerOpenAdoption::ContextContinuation,
+    );
     assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
     assert!(!app.fs_front_pointer.is_active());
     app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
@@ -116024,6 +116065,9 @@ mod ring_saved_group_fullscreen_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_mounted_detached_session_for_test(173301, DetachedSource::Image);
+        let close_owner = app
+            .projected_detached_close_owner(ViewerCloseCause::User)
+            .unwrap();
         let source = app
             .smart_folder_source_lease()
             .expect("linked F12 retains main source");
@@ -116045,6 +116089,7 @@ mod ring_saved_group_fullscreen_tests {
         app.finalize_closed_active_detached_viewport(
             &ctx,
             App::detached_image_window_viewport_id(173301),
+            close_owner,
         );
         assert!(app.active_detached_session.is_none());
         assert_eq!(app.detached_viewer_window_id(), None);

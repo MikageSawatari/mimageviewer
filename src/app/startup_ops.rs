@@ -134,6 +134,15 @@ pub(super) struct DirectMediaPrepared {
     tags: HashMap<String, Vec<String>>,
 }
 
+impl DirectMediaPrepared {
+    fn requested_path(&self) -> Option<&Path> {
+        match &self.item {
+            GridItem::Image(path) | GridItem::Video(path) | GridItem::Audio(path) => Some(path),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 impl DirectMediaPrepared {
     pub(super) fn image_fixture_for_test(path: PathBuf) -> Self {
@@ -203,10 +212,11 @@ impl App {
                     } else if let Some(reason) = self.activation_open_precheck(Some(activation)) {
                         Err(reason.agent_error())
                     } else {
-                        match self.start_startup_open_path_resolve(
-                            activation.path.clone(),
+                        match self.start_startup_open_request_with_navigation(
+                            ExplicitOpenPath::new(activation.path.clone(), activation.request),
                             StartupOpenPathSource::Agent,
                             ctx,
+                            None,
                         ) {
                             StartupOpenAdmission::Admitted => Ok(()),
                             StartupOpenAdmission::Refused(reason) => Err(reason.agent_error()),
@@ -281,8 +291,16 @@ impl App {
         self.cancel_pending_folder_nav();
     }
 
+    #[cfg(test)]
     pub(crate) fn set_startup_open_path(&mut self, path: PathBuf) {
-        self.startup_open_path = Some(crate::path_key::normalize_input_path(&path));
+        self.set_startup_open_request(ExplicitOpenPath::new(
+            path,
+            ViewerOpenRequest::preferences(),
+        ));
+    }
+
+    pub(crate) fn set_startup_open_request(&mut self, request: ExplicitOpenPath) {
+        self.startup_open_path = Some(request);
     }
 
     pub(super) fn poll_deferred_startup_open_path(&mut self, ctx: &egui::Context) {
@@ -294,7 +312,12 @@ impl App {
             return;
         }
         if let Some(path) = self.startup_open_path.take() {
-            self.start_startup_open_path_resolve(path, StartupOpenPathSource::InitialStartup, ctx);
+            self.start_startup_open_request_with_navigation(
+                path,
+                StartupOpenPathSource::InitialStartup,
+                ctx,
+                None,
+            );
         }
     }
 
@@ -306,8 +329,15 @@ impl App {
             return;
         }
         if precheck == Some(ActivationOpenRefusal::CompositionEditor) {
-            let rejected = self.activation_open_path_rx.try_iter().count();
+            let requests = self.activation_open_path_rx.try_iter().collect::<Vec<_>>();
+            let rejected = requests.len();
             if rejected != 0 {
+                if let Some(request) = requests
+                    .iter()
+                    .find(|request| request.request.intent.is_browser_overlay())
+                {
+                    self.foreground_browser_open_refusal(request.request.intent, ctx);
+                }
                 crate::logger::log(format!(
                     "composition editor: rejected {rejected} activation request(s)"
                 ));
@@ -328,7 +358,14 @@ impl App {
             .iter()
             .filter(|request| request.rejected_for_remote(current_acquisition_sequence))
             .count();
-        self.notify_rejected_remote_activation_paths(rejected, ctx);
+        let rejected_browser = requests
+            .iter()
+            .find(|request| {
+                request.rejected_for_remote(current_acquisition_sequence)
+                    && request.request.intent.is_browser_overlay()
+            })
+            .map(|request| request.request.intent);
+        self.notify_rejected_remote_activation_paths(rejected, rejected_browser, ctx);
         let paths: Vec<_> = requests
             .into_iter()
             .filter(|request| !request.rejected_for_remote(current_acquisition_sequence))
@@ -345,12 +382,17 @@ impl App {
         let Some(path) = paths.into_iter().max_by_key(|request| request.received_at) else {
             return;
         };
-        let path = path.path;
+        let path = ExplicitOpenPath::new(path.path, path.request);
         crate::logger::log(format!(
             "single_instance: resolving forwarded path in worker: {}",
             path.display()
         ));
-        self.start_startup_open_path_resolve(path, StartupOpenPathSource::Activation, ctx);
+        self.start_startup_open_request_with_navigation(
+            path,
+            StartupOpenPathSource::Activation,
+            ctx,
+            None,
+        );
         ctx.request_repaint();
     }
 
@@ -369,12 +411,24 @@ impl App {
         for request in deferred {
             let _ = self.activation_open_path_tx.send(request);
         }
-        self.notify_rejected_remote_activation_paths(rejected.len(), ctx);
+        let rejected_browser = rejected
+            .iter()
+            .find(|request| request.request.intent.is_browser_overlay())
+            .map(|request| request.request.intent);
+        self.notify_rejected_remote_activation_paths(rejected.len(), rejected_browser, ctx);
     }
 
     #[cfg(windows)]
-    fn notify_rejected_remote_activation_paths(&mut self, rejected: usize, ctx: &egui::Context) {
+    fn notify_rejected_remote_activation_paths(
+        &mut self,
+        rejected: usize,
+        browser_overlay: Option<ViewerOpenIntent>,
+        ctx: &egui::Context,
+    ) {
         if rejected != 0 {
+            if let Some(intent) = browser_overlay {
+                self.foreground_browser_open_refusal(intent, ctx);
+            }
             crate::logger::log(format!(
                 "single_instance: rejected {rejected} activation open request(s) during Remote ownership"
             ));
@@ -401,10 +455,28 @@ impl App {
         ctx: &egui::Context,
         navigation: Option<MainListNavigation>,
     ) -> StartupOpenAdmission {
-        let requested = crate::path_key::normalize_input_path(&requested);
+        self.start_startup_open_request_with_navigation(
+            ExplicitOpenPath::new(requested, ViewerOpenRequest::preferences()),
+            source,
+            ctx,
+            navigation,
+        )
+    }
+
+    pub(crate) fn start_startup_open_request_with_navigation(
+        &mut self,
+        explicit: ExplicitOpenPath,
+        source: StartupOpenPathSource,
+        ctx: &egui::Context,
+        navigation: Option<MainListNavigation>,
+    ) -> StartupOpenAdmission {
+        let ExplicitOpenPath {
+            path: requested,
+            request: open_request,
+        } = explicit;
         if self.remote_session_blocks_local_control() {
             if matches!(source, StartupOpenPathSource::InitialStartup) {
-                self.startup_open_path = Some(requested);
+                self.startup_open_path = Some(ExplicitOpenPath::new(requested, open_request));
                 return StartupOpenAdmission::Requeued;
             }
             if matches!(source, StartupOpenPathSource::Agent) {
@@ -416,6 +488,8 @@ impl App {
                 requested.display()
             ));
             if matches!(source, StartupOpenPathSource::Activation) {
+                #[cfg(windows)]
+                self.foreground_browser_open_refusal(open_request.intent, ctx);
                 self.show_feedback_warning(
                     "リモート閲覧中のため、二重起動で渡されたパスを開けません".to_string(),
                 );
@@ -423,6 +497,8 @@ impl App {
             return StartupOpenAdmission::Refused(ActivationOpenRefusal::Remote);
         }
         if self.composition_editor_modal_active() {
+            #[cfg(windows)]
+            self.foreground_browser_open_refusal(open_request.intent, ctx);
             crate::logger::log("composition editor: rejected path open");
             self.show_feedback_warning("本の構成を編集中のため、別の本を開けません".into());
             return StartupOpenAdmission::Refused(ActivationOpenRefusal::CompositionEditor);
@@ -434,16 +510,19 @@ impl App {
                 }
                 StartupOpenPathSource::Activation => {
                     #[cfg(windows)]
-                    let request = crate::single_instance::ActivationOpenPath::received(
+                    let request = crate::single_instance::ActivationOpenPath::received_with_request(
                         requested,
                         self.remote_session_handle(),
+                        open_request,
                     );
                     #[cfg(windows)]
                     let _ = self.activation_open_path_tx.send(request);
                     #[cfg(not(windows))]
                     let _ = requested;
                 }
-                StartupOpenPathSource::InitialStartup => self.startup_open_path = Some(requested),
+                StartupOpenPathSource::InitialStartup => {
+                    self.startup_open_path = Some(ExplicitOpenPath::new(requested, open_request))
+                }
                 StartupOpenPathSource::Bookmark => {}
             }
             return if matches!(source, StartupOpenPathSource::Bookmark) {
@@ -452,7 +531,7 @@ impl App {
                 StartupOpenAdmission::Requeued
             };
         }
-        let Some(owner) = self.startup_open_path_owner(source) else {
+        let Some(owner) = self.startup_open_path_owner_with_request(source, open_request) else {
             crate::logger::log(format!(
                 "startup open: reject ownerless resolve source={} requested={}",
                 source.perf_tag(),
@@ -486,17 +565,20 @@ impl App {
                     }
                     StartupOpenPathSource::Activation => {
                         #[cfg(windows)]
-                        let request = crate::single_instance::ActivationOpenPath::received(
-                            requested,
-                            self.remote_session_handle(),
-                        );
+                        let request =
+                            crate::single_instance::ActivationOpenPath::received_with_request(
+                                requested,
+                                self.remote_session_handle(),
+                                open_request,
+                            );
                         #[cfg(windows)]
                         let _ = self.activation_open_path_tx.send(request);
                         #[cfg(not(windows))]
                         let _ = requested;
                     }
                     StartupOpenPathSource::InitialStartup => {
-                        self.startup_open_path = Some(requested)
+                        self.startup_open_path =
+                            Some(ExplicitOpenPath::new(requested, open_request))
                     }
                     StartupOpenPathSource::Bookmark => {
                         self.show_open_admission_refusal(reason.into());
@@ -527,7 +609,7 @@ impl App {
             && let Some(mut pending) = self.startup_open_path_resolve_pending.take()
         {
             if defer_activation_supersede {
-                if matches!(pending.owner, StartupOpenPathOwner::Activation) {
+                if matches!(pending.owner, StartupOpenPathOwner::Activation(_)) {
                     crate::logger::log(format!(
                         "startup open: replace pending activation resolve requested={}",
                         pending.requested.display()
@@ -930,6 +1012,10 @@ impl App {
                         resolution.path.display()
                     ));
                     self.resume_activation_held_open(held, held_duration);
+                    #[cfg(windows)]
+                    if let Some(request) = owner.viewer_open_adoption().request() {
+                        self.foreground_browser_open_refusal(request.intent, ctx);
+                    }
                     self.show_snapshot_out_of_scope_open_feedback();
                     return;
                 }
@@ -1033,7 +1119,7 @@ impl App {
     pub(crate) fn activation_open_resolve_holds_prior_completion(&self) -> bool {
         self.startup_open_path_resolve_pending
             .as_ref()
-            .is_some_and(|pending| matches!(pending.owner, StartupOpenPathOwner::Activation))
+            .is_some_and(|pending| matches!(pending.owner, StartupOpenPathOwner::Activation(_)))
     }
 
     fn resume_activation_held_open(
@@ -1128,10 +1214,20 @@ impl App {
         &self,
         source: StartupOpenPathSource,
     ) -> Option<StartupOpenPathOwner> {
+        self.startup_open_path_owner_with_request(source, ViewerOpenRequest::preferences())
+    }
+
+    fn startup_open_path_owner_with_request(
+        &self,
+        source: StartupOpenPathSource,
+        request: ViewerOpenRequest,
+    ) -> Option<StartupOpenPathOwner> {
         match source {
-            StartupOpenPathSource::InitialStartup => Some(StartupOpenPathOwner::InitialStartup),
+            StartupOpenPathSource::InitialStartup => {
+                Some(StartupOpenPathOwner::InitialStartup(request))
+            }
             StartupOpenPathSource::Activation | StartupOpenPathSource::Agent => {
-                Some(StartupOpenPathOwner::Activation)
+                Some(StartupOpenPathOwner::Activation(request))
             }
             StartupOpenPathSource::Bookmark => {
                 let request_id = self.bookmark_open_pending.as_ref()?.request_id();
@@ -1317,9 +1413,10 @@ impl App {
         // target must remain pending until Local owns the viewer again.
         let mut held = self.startup_open_path_resolve_pending.as_ref();
         while let Some(pending) = held {
-            if matches!(pending.owner, StartupOpenPathOwner::InitialStartup) {
-                self.startup_open_path
-                    .get_or_insert_with(|| pending.requested.to_path_buf());
+            if let StartupOpenPathOwner::InitialStartup(request) = &pending.owner {
+                self.startup_open_path.get_or_insert_with(|| {
+                    ExplicitOpenPath::new(pending.requested.to_path_buf(), *request)
+                });
                 break;
             }
             held = pending.held_resolve_for_activation_admission.as_deref();
@@ -1591,7 +1688,8 @@ impl App {
         let viewer_adoption = owner.viewer_open_adoption();
         let navigation = navigation
             .or_else(|| {
-                (viewer_adoption == ViewerOpenAdoption::MainNew)
+                viewer_adoption
+                    .is_main_new()
                     .then(|| {
                         self.capture_physical_open_navigation(
                             &owner.open_request_owner(),
@@ -1841,7 +1939,7 @@ impl App {
             {
                 let action = MainListAfterHydration::DirectMedia {
                     prepared,
-                    viewer_adoption,
+                    viewer_adoption: viewer_adoption.explicit_file(),
                 };
                 let action = match self.sidecar_restore.as_mut() {
                     Some(state) => state.defer_main_list_action(action).err(),
@@ -2246,6 +2344,32 @@ impl App {
         Outcome::Ok
     }
 
+    /// The owned preparation retains the absolute target path and its metadata, and adoption
+    /// retains the exact request. No numeric index crosses the old reader's terminal close.
+    pub(super) fn install_direct_media_reader_for_open(
+        &mut self,
+        prepared: DirectMediaPrepared,
+        viewer_adoption: ViewerOpenAdoption,
+    ) -> Option<(crate::snapshot::SnapshotTarget, ViewerOpenAdoption)> {
+        self.current_folder.as_ref()?;
+        prepared.requested_path()?;
+        #[cfg(windows)]
+        let viewer_adoption = if viewer_adoption.needs_main_preparation()
+            && Self::browser_overlay_adoption(viewer_adoption)
+        {
+            let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+            if !self.prepare_browser_overlay_open(&ctx) {
+                return None;
+            }
+            viewer_adoption.after_main_preparation()
+        } else {
+            viewer_adoption
+        };
+        // Resolve against the post-close items and capture that reader's return basis.
+        self.install_direct_media_reader(prepared)
+            .map(|target| (target, viewer_adoption))
+    }
+
     /// Reuse the transient snapshot owner: the base grid remains projected, while the exact
     /// externally requested page lives in the reader beside the projected sibling order.
     pub(super) fn install_direct_media_reader(
@@ -2253,10 +2377,7 @@ impl App {
         mut prepared: DirectMediaPrepared,
     ) -> Option<crate::snapshot::SnapshotTarget> {
         let origin_path = self.current_folder.clone()?;
-        let requested = match &prepared.item {
-            GridItem::Image(path) | GridItem::Video(path) | GridItem::Audio(path) => path.clone(),
-            _ => return None,
-        };
+        let requested = prepared.requested_path()?.to_path_buf();
         if startup_file_idx(&self.items, &requested).is_some() {
             return Some(crate::snapshot::SnapshotTarget::Fs(requested));
         }
@@ -2507,7 +2628,7 @@ impl App {
         )
     }
 
-    fn open_loaded_file_fullscreen_with_adoption(
+    pub(super) fn open_loaded_file_fullscreen_with_adoption(
         &mut self,
         requested: &Path,
         input_reason: &'static str,
@@ -2525,6 +2646,7 @@ impl App {
                 requested.display()
             ));
         }
+        let viewer_adoption = viewer_adoption.explicit_file();
         self.move_grid_cursor(Some(idx), crate::app::GridCursorIntent::Automatic);
         self.grid_scroll.set_reveal_requested(true);
         crate::logger::log(format!(
@@ -2764,6 +2886,174 @@ mod agent_open_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn browser818_open_owner_initial_activation_and_agent_keep_intent_through_restore() {
+        use crate::app::external_open::ViewerOpenIntent;
+        for source in [
+            StartupOpenPathSource::InitialStartup,
+            StartupOpenPathSource::Activation,
+            StartupOpenPathSource::Agent,
+        ] {
+            for overlay in [false, true] {
+                let mut app = setup_app_for_test();
+                app.initialized = true;
+                app.active_quick_folder_slot = None;
+                app.settings.detached_viewer_enabled = false;
+                app.settings.detached_viewer_open_images_in_window = false;
+                let folder = app.tmp.path().join("browser818-request");
+                std::fs::create_dir(&folder).unwrap();
+                let requested = folder.join("b.png");
+                for path in [folder.join("a.png"), requested.clone()] {
+                    image::RgbaImage::new(2, 2).save(path).unwrap();
+                }
+                app.folder_history.insert(folder.clone(), (99.0, Some(0)));
+                let intent = if overlay {
+                    ViewerOpenIntent::BrowserOverlay {
+                        placement: crate::detached_window_geometry::PhysicalWindowPlacement {
+                            outer: crate::detached_window_geometry::PhysicalRect {
+                                left: 20,
+                                top: 30,
+                                right: 820,
+                                bottom: 630,
+                            },
+                            maximized: false,
+                        },
+                    }
+                } else {
+                    ViewerOpenIntent::Preferences
+                };
+                let request = ViewerOpenRequest::new(intent);
+                match source {
+                    StartupOpenPathSource::InitialStartup => {
+                        app.set_startup_open_request(ExplicitOpenPath::new(
+                            requested.clone(),
+                            request,
+                        ));
+                        assert_eq!(app.startup_open_path.as_ref().unwrap().request, request);
+                        app.poll_deferred_startup_open_path(&egui::Context::default());
+                    }
+                    StartupOpenPathSource::Activation => {
+                        app.activation_open_path_tx
+                            .send(
+                                crate::single_instance::ActivationOpenPath::received_with_request(
+                                    requested.clone(),
+                                    app.remote_session_handle(),
+                                    request,
+                                ),
+                            )
+                            .unwrap();
+                        app.poll_activation_open_paths(&egui::Context::default());
+                    }
+                    StartupOpenPathSource::Agent => {
+                        assert_eq!(
+                            app.start_startup_open_request_with_navigation(
+                                ExplicitOpenPath::new(requested.clone(), request),
+                                source,
+                                &egui::Context::default(),
+                                None,
+                            ),
+                            StartupOpenAdmission::Admitted
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                let pending = app.startup_open_path_resolve_pending.as_mut().unwrap();
+                assert_eq!(
+                    pending.owner.viewer_open_adoption().request(),
+                    Some(request)
+                );
+                // Supply the real resolver result through a controlled completion channel.
+                // The original worker's dropped receiver cannot affect the accepted owner.
+                let (tx, rx) = mpsc::channel();
+                pending.rx = rx;
+                tx.send(resolve_startup_open_path(
+                    requested.clone(),
+                    source,
+                    None,
+                    true,
+                ))
+                .unwrap();
+                app.poll_startup_open_path_resolve(&egui::Context::default());
+                assert!(app.startup_open_path_resolve_pending.is_none());
+                assert!(
+                    app.sidecar_restore_active(),
+                    "the listing restore must still own the open"
+                );
+                assert_eq!(
+                    app.sidecar_restore
+                        .as_ref()
+                        .unwrap()
+                        .viewer_open_adoption_for_test()
+                        .unwrap()
+                        .request(),
+                    Some(request)
+                );
+                app.finish_page_identity_preparation_for_test();
+                let idx = startup_file_idx(&app.items, &requested).unwrap();
+                assert_eq!(app.selected, Some(idx));
+                assert_eq!(app.fullscreen_idx, Some(idx));
+                assert!(app.startup_open_path.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn browser818_open_owner_same_path_new_request_cancels_only_old_receiver() {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().to_path_buf();
+        let old = ViewerOpenRequest::preferences();
+        let new = ViewerOpenRequest::preferences();
+        let (old_tx, old_cancel) =
+            section1285_resolver(&mut app, StartupOpenPathOwner::Activation(old), &folder);
+        assert_eq!(
+            app.start_startup_open_request_with_navigation(
+                ExplicitOpenPath::new(folder.clone(), new),
+                StartupOpenPathSource::Activation,
+                &egui::Context::default(),
+                None,
+            ),
+            StartupOpenAdmission::Admitted
+        );
+        assert!(old_cancel.load(Ordering::Relaxed));
+        assert!(old_tx.send(section1285_result(&folder)).is_err());
+        let pending = app.startup_open_path_resolve_pending.as_ref().unwrap();
+        assert_eq!(pending.owner.viewer_open_adoption().request(), Some(new));
+        assert!(!pending.cancel.load(Ordering::Relaxed));
+        assert_ne!(old, new);
+    }
+
+    #[test]
+    fn browser818_open_owner_initial_wait_keeps_entire_request() {
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().to_path_buf();
+        let request = ViewerOpenRequest::preferences();
+        // Deferred startup waits before initialization without consuming its typed request.
+        app.initialized = false;
+        app.set_startup_open_request(ExplicitOpenPath::new(folder.clone(), request));
+        app.poll_deferred_startup_open_path(&egui::Context::default());
+        assert_eq!(app.startup_open_path.as_ref().unwrap().request, request);
+        assert_eq!(app.startup_open_path.as_deref(), Some(folder.as_path()));
+        assert!(app.startup_open_path_resolve_pending.is_none());
+    }
+
+    #[test]
+    fn browser818_open_owner_remote_suspension_keeps_initial_identity() {
+        let mut app = setup_app_for_test();
+        let path = app.tmp.path().to_path_buf();
+        let request = ViewerOpenRequest::preferences();
+        let (tx, cancel) = section1285_resolver(
+            &mut app,
+            StartupOpenPathOwner::InitialStartup(request),
+            &path,
+        );
+        app.cancel_unresolved_open_for_remote_session();
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(tx.send(section1285_result(&path)).is_err());
+        assert_eq!(app.startup_open_path.as_ref().unwrap().request, request);
+        assert_eq!(app.startup_open_path.as_deref(), Some(path.as_path()));
+    }
 
     fn section1285_resolver(
         app: &mut App,
@@ -3532,7 +3822,10 @@ mod tests {
                     .startup_open_path_resolve_pending
                     .as_ref()
                     .expect("B survives A continuation");
-                assert!(matches!(activation.owner, StartupOpenPathOwner::Activation));
+                assert!(matches!(
+                    activation.owner,
+                    StartupOpenPathOwner::Activation(_)
+                ));
                 assert!(!activation_cancel.load(Ordering::Relaxed));
                 let held = activation
                     .held_resolve_for_activation_admission
@@ -3691,7 +3984,11 @@ mod tests {
         section1419_candidate(&mut app, &a, &ctx);
         // The snapshot activation slot is installed with a controlled receiver: candidate's
         // main continuation must not retire it, even before scope admission finishes.
-        let (_tx, cancel) = section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &b);
+        let (_tx, cancel) = section1285_resolver(
+            &mut app,
+            StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
+            &b,
+        );
         section1285_complete_main_scan(&mut app, &a, &ctx);
         assert_eq!(app.current_folder.as_ref(), Some(&a));
         assert!(!cancel.load(Ordering::Relaxed));
@@ -3845,9 +4142,9 @@ mod tests {
                 std::fs::create_dir(&stale).unwrap();
                 app.current_folder = Some(origin.clone());
                 let owner = if activation {
-                    StartupOpenPathOwner::Activation
+                    StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences())
                 } else {
-                    StartupOpenPathOwner::InitialStartup
+                    StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences())
                 };
                 let (tx, cancel) = section1285_resolver(&mut app, owner, &stale);
                 // Published-but-unpolled completion must lose in the same way as slow I/O.
@@ -3909,7 +4206,7 @@ mod tests {
         );
         let ctx = egui::Context::default();
         app.poll_deferred_startup_open_path(&ctx);
-        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        assert_eq!(app.startup_open_path.as_deref(), Some(target.as_path()));
         app.finish_epub_convert(crate::ui_dialogs::epub_convert::EpubConvertExit::Abort);
         app.load_folder(other.clone());
         assert!(app.startup_open_path.is_none());
@@ -3927,7 +4224,7 @@ mod tests {
         let target = app.tmp.path().join("initial");
         app.set_startup_open_path(target.clone());
         app.reload_current_folder_preserving_override();
-        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        assert_eq!(app.startup_open_path.as_deref(), Some(target.as_path()));
         app.load_folder(folder);
         assert!(app.startup_open_path.is_none());
     }
@@ -3945,8 +4242,11 @@ mod tests {
             }
             let stale = app.tmp.path().join("initial");
             app.set_startup_open_path(stale.clone());
-            let (_tx, cancel) =
-                section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &stale);
+            let (_tx, cancel) = section1285_resolver(
+                &mut app,
+                StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),
+                &stale,
+            );
 
             app.enter_reading_history_from_menu();
 
@@ -3976,8 +4276,11 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
         std::fs::create_dir(&target).unwrap();
         app.load_folder(folder);
-        let (tx, cancel) =
-            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &target);
+        let (tx, cancel) = section1285_resolver(
+            &mut app,
+            StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),
+            &target,
+        );
         app.reload_current_folder_preserving_override();
         assert!(!cancel.load(Ordering::Relaxed));
         tx.send(section1285_result(&target)).unwrap();
@@ -3989,13 +4292,19 @@ mod tests {
     fn section1285_fix_and_unfix_list_retire_older_main_resolvers() {
         let mut app = direct_reader_fixture();
         let stale = app.tmp.path().join("old-initial");
-        let (_tx, cancel) =
-            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &stale);
+        let (_tx, cancel) = section1285_resolver(
+            &mut app,
+            StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),
+            &stale,
+        );
         app.activate_snapshot(crate::snapshot::SnapshotSourceLabel::Mixed);
         assert!(app.is_snapshot_active());
         assert!(cancel.load(Ordering::Relaxed));
-        let (_tx, cancel) =
-            section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &stale);
+        let (_tx, cancel) = section1285_resolver(
+            &mut app,
+            StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
+            &stale,
+        );
         app.deactivate_snapshot();
         assert!(!app.is_snapshot_active());
         assert!(cancel.load(Ordering::Relaxed));
@@ -4011,8 +4320,11 @@ mod tests {
         std::fs::create_dir(&folder).unwrap();
         std::fs::create_dir(&target).unwrap();
         app.load_folder(folder);
-        let (_tx, cancel) =
-            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &target);
+        let (_tx, cancel) = section1285_resolver(
+            &mut app,
+            StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),
+            &target,
+        );
         let handle = crate::remote_ipc::session::SessionHandle::new();
         app.set_remote_session_handle(handle.clone());
         handle.acquire(mimageviewer_ipc::SessionAcquireRequest {
@@ -4025,13 +4337,13 @@ mod tests {
         let ctx = egui::Context::default();
         app.poll_remote_session(&ctx);
         assert!(cancel.load(Ordering::Relaxed));
-        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        assert_eq!(app.startup_open_path.as_deref(), Some(target.as_path()));
         app.retire_replaced_main_list_requests(None);
         app.enter_reading_history();
-        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        assert_eq!(app.startup_open_path.as_deref(), Some(target.as_path()));
         handle.local_disconnect();
         app.poll_remote_session(&ctx);
-        assert_eq!(app.startup_open_path.as_ref(), Some(&target));
+        assert_eq!(app.startup_open_path.as_deref(), Some(target.as_path()));
         app.poll_deferred_startup_open_path(&ctx);
         assert!(app.startup_open_path.is_none());
         assert_eq!(
@@ -4057,8 +4369,11 @@ mod tests {
             let mut activation_cancel = None;
             if held {
                 let previous = app.startup_open_path_resolve_pending.take().unwrap();
-                let (_activation_tx, token) =
-                    section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &path);
+                let (_activation_tx, token) = section1285_resolver(
+                    &mut app,
+                    StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
+                    &path,
+                );
                 activation_cancel = Some(token);
                 app.startup_open_path_resolve_pending
                     .as_mut()
@@ -4086,8 +4401,11 @@ mod tests {
             std::fs::create_dir(&target).unwrap();
             std::fs::write(target.join("page.jpg"), b"image").unwrap();
             let earlier = app.tmp.path().join("earlier");
-            let (_earlier_tx, earlier_cancel) =
-                section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &earlier);
+            let (_earlier_tx, earlier_cancel) = section1285_resolver(
+                &mut app,
+                StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),
+                &earlier,
+            );
             let next = match continuation {
                 "direct" => ClassifiedOpenContinuation::Direct {
                     auto_fullscreen: false,
@@ -4131,8 +4449,11 @@ mod tests {
             app.top_level_grid_view
                 .set_open_path_classification(Some(candidate));
             let later = app.tmp.path().join("later-activation");
-            let (_later_tx, later_cancel) =
-                section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &later);
+            let (_later_tx, later_cancel) = section1285_resolver(
+                &mut app,
+                StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
+                &later,
+            );
             classified_tx
                 .send(Ok(ClassifiedOpenPath {
                     rar_volume_proof: None,
@@ -4215,9 +4536,9 @@ mod tests {
                 app.visible_indices = vec![0];
                 app.selected = Some(0);
                 let owner = if activation {
-                    StartupOpenPathOwner::Activation
+                    StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences())
                 } else {
-                    StartupOpenPathOwner::InitialStartup
+                    StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences())
                 };
                 let (tx, cancel) = section1285_resolver(&mut app, owner, &stale);
                 let ctx = egui::Context::default();
@@ -4255,13 +4576,19 @@ mod tests {
         let target = app.tmp.path().join("pane");
         std::fs::create_dir(&target).unwrap();
         let initial = app.tmp.path().join("initial");
-        let (_initial_tx, initial_cancel) =
-            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &initial);
+        let (_initial_tx, initial_cancel) = section1285_resolver(
+            &mut app,
+            StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),
+            &initial,
+        );
         app.start_folder_pane_open(target.clone());
         assert!(initial_cancel.load(Ordering::Relaxed));
         let later = app.tmp.path().join("later-activation");
-        let (later_tx, later_cancel) =
-            section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &later);
+        let (later_tx, later_cancel) = section1285_resolver(
+            &mut app,
+            StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
+            &later,
+        );
         let ctx = egui::Context::default();
         section1285_complete_main_scan(&mut app, &target, &ctx);
         assert_eq!(app.current_folder.as_ref(), Some(&target));
@@ -4304,9 +4631,9 @@ mod tests {
                 let stale = app.tmp.path().join("stale-resolve");
                 std::fs::create_dir(&stale).unwrap();
                 let owner = if activation {
-                    StartupOpenPathOwner::Activation
+                    StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences())
                 } else {
-                    StartupOpenPathOwner::InitialStartup
+                    StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences())
                 };
                 let (tx, cancel) = section1285_resolver(&mut app, owner, &stale);
                 tx.send(section1285_result(&stale)).unwrap();
@@ -4338,8 +4665,11 @@ mod tests {
             crate::zip_tree::ZipTree::build(book, Vec::new()),
         )));
         let target = app.tmp.path().join("activation");
-        let (_tx, cancel) =
-            section1285_resolver(&mut app, StartupOpenPathOwner::Activation, &target);
+        let (_tx, cancel) = section1285_resolver(
+            &mut app,
+            StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
+            &target,
+        );
         assert!(!app.zip_nav_back());
         assert!(!cancel.load(Ordering::Relaxed));
         assert!(app.startup_open_path_resolve_pending.is_some());
@@ -4350,8 +4680,11 @@ mod tests {
         let mut app = setup_app_for_test();
         let target = app.tmp.path().join("initial");
         std::fs::create_dir(&target).unwrap();
-        let (tx, cancel) =
-            section1285_resolver(&mut app, StartupOpenPathOwner::InitialStartup, &target);
+        let (tx, cancel) = section1285_resolver(
+            &mut app,
+            StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences()),
+            &target,
+        );
         tx.send(section1285_result(&target)).unwrap();
         app.poll_startup_open_path_resolve(&egui::Context::default());
         assert_eq!(app.current_folder.as_ref(), Some(&target));
@@ -4419,9 +4752,11 @@ mod tests {
             assert!(result.direct_media.is_some());
             let ctx = egui::Context::default();
             let owner = match source {
-                StartupOpenPathSource::InitialStartup => StartupOpenPathOwner::InitialStartup,
+                StartupOpenPathSource::InitialStartup => {
+                    StartupOpenPathOwner::InitialStartup(ViewerOpenRequest::preferences())
+                }
                 StartupOpenPathSource::Activation | StartupOpenPathSource::Agent => {
-                    StartupOpenPathOwner::Activation
+                    StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences())
                 }
                 StartupOpenPathSource::Bookmark => unreachable!(),
             };
@@ -4676,7 +5011,11 @@ mod tests {
                 None,
                 true,
             );
-            app.finish_startup_open_path_resolve(StartupOpenPathOwner::Activation, result, &ctx);
+            app.finish_startup_open_path_resolve(
+                StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
+                result,
+                &ctx,
+            );
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
             while app.sidecar_restore_active() {
                 assert!(std::time::Instant::now() < deadline);

@@ -3107,7 +3107,7 @@ mod tests {
             let initial = app.tmp.path().join("initial");
             let (initial_tx, initial_cancel) = section1285_pending_resolver(
                 &mut app,
-                StartupOpenPathOwner::InitialStartup,
+                StartupOpenPathOwner::InitialStartup(crate::app::ViewerOpenRequest::preferences()),
                 initial,
             );
 
@@ -3118,7 +3118,7 @@ mod tests {
             let activation = app.tmp.path().join("later-activation");
             let (activation_tx, activation_cancel) = section1285_pending_resolver(
                 &mut app,
-                StartupOpenPathOwner::Activation,
+                StartupOpenPathOwner::Activation(crate::app::ViewerOpenRequest::preferences()),
                 activation.clone(),
             );
 
@@ -3149,7 +3149,7 @@ mod tests {
             assert!(!activation_cancel.load(Ordering::Relaxed));
             let pending = app.startup_open_path_resolve_pending.as_ref().unwrap();
             assert_eq!(pending.requested.as_path(), activation.as_path());
-            assert!(matches!(pending.owner, StartupOpenPathOwner::Activation));
+            assert!(matches!(pending.owner, StartupOpenPathOwner::Activation(_)));
             assert!(Arc::ptr_eq(&pending.cancel, &activation_cancel));
             assert!(
                 activation_tx
