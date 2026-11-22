@@ -27,6 +27,8 @@
 //!
 //! 非 Windows では常に「1 個目」扱いにして機能を no-op 化する。
 
+pub(crate) mod browser_view;
+
 /// プロセス終了まで保持される単一インスタンスガード。
 /// 1 個目のインスタンスは mutex + activate event の両方を取得し、2 個目以降は
 /// mutex 取得失敗で `is_first_instance() = false` となる。
@@ -197,6 +199,7 @@ struct ProcessNames {
     mutex: String,
     activate_event: String,
     open_path_pipe: String,
+    browser_view_pipe: String,
     shutdown_event: String,
 }
 
@@ -207,6 +210,14 @@ impl ProcessNames {
             mutex: format!("{MUTEX_NAME}{suffix}"),
             activate_event: format!("{ACTIVATE_EVENT_NAME}{suffix}"),
             open_path_pipe: format!("{OPEN_PATH_PIPE_NAME}{suffix}"),
+            browser_view_pipe: format!(
+                "{}{suffix}",
+                if cfg!(feature = "portable") {
+                    mimageviewer_browser_view_ipc::PORTABLE_PIPE_NAME
+                } else {
+                    mimageviewer_browser_view_ipc::PIPE_NAME
+                }
+            ),
             shutdown_event: format!("{SHUTDOWN_EVENT_NAME}{suffix}"),
         }
     }
@@ -673,6 +684,8 @@ impl ActivationOpenPath {
 /// Drop でシャットダウン: `stop_event` を signal → waiter スレッドが抜ける。
 pub struct ActivationListener {
     #[cfg(windows)]
+    browser_listener: Option<browser_view::Listener>,
+    #[cfg(windows)]
     stop_event: windows::Win32::Foundation::HANDLE,
     thread: Option<std::thread::JoinHandle<()>>,
     #[cfg(windows)]
@@ -744,9 +757,15 @@ pub(crate) fn spawn_activation_listener(
         let path_thread = spawn_open_path_listener(
             stop_event.0 as isize,
             egui_ctx.clone(),
-            open_path_tx,
-            remote_session,
+            open_path_tx.clone(),
+            remote_session.clone(),
         );
+        let browser_listener =
+            browser_view::Listener::start(egui_ctx.clone(), open_path_tx, remote_session)
+                .map_err(|error| {
+                    crate::logger::log(format!("browser_view: listener start failed: {error}"))
+                })
+                .ok();
 
         let thread = std::thread::Builder::new()
             .name("mimv-activate-listener".into())
@@ -836,6 +855,7 @@ pub(crate) fn spawn_activation_listener(
             .ok()?;
 
         Some(ActivationListener {
+            browser_listener,
             stop_event,
             thread: Some(thread),
             path_thread,
@@ -865,6 +885,7 @@ impl Drop for ActivationListener {
                 let _ = SetEvent(self.stop_event);
             }
             poke_open_path_listener();
+            drop(self.browser_listener.take());
             if let Some(th) = self.thread.take() {
                 let _ = th.join();
             }
@@ -890,6 +911,24 @@ mod tests {
         assert_eq!(names.activate_event, ACTIVATE_EVENT_NAME);
         assert_eq!(names.open_path_pipe, OPEN_PATH_PIPE_NAME);
         assert_eq!(names.shutdown_event, SHUTDOWN_EVENT_NAME);
+    }
+
+    #[test]
+    fn browser818_ipc_pipe_namespace_tracks_flavor_and_data_dir_without_changing_legacy_names() {
+        let default = std::path::Path::new(r"C:\Users\tester\AppData\Roaming\mimageviewer");
+        let base = if cfg!(feature = "portable") {
+            mimageviewer_browser_view_ipc::PORTABLE_PIPE_NAME
+        } else {
+            mimageviewer_browser_view_ipc::PIPE_NAME
+        };
+        let normal = ProcessNames::for_data_dir(default, default);
+        assert_eq!(normal.browser_view_pipe, base);
+        let isolated = ProcessNames::for_data_dir(std::path::Path::new(r"C:\isolated"), default);
+        let suffix = isolated.mutex.strip_prefix(MUTEX_NAME).unwrap();
+        assert_eq!(isolated.browser_view_pipe, format!("{base}{suffix}"));
+        assert_ne!(normal.browser_view_pipe, isolated.browser_view_pipe);
+        assert_eq!(normal.open_path_pipe, OPEN_PATH_PIPE_NAME);
+        assert_eq!(normal.activate_event, ACTIVATE_EVENT_NAME);
     }
 
     #[test]

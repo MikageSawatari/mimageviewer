@@ -482,6 +482,24 @@ Win32 操作は差し替え可能にし、テストから desktop を変更し�
 
 launcher、core の双方で同じ要求を配送でき、版不一致を launcher が検出できること。
 
+**段階5の実装記録 (2026-11-22、ビルド・テスト・独立レビュー待ち)**
+
+- `mimageviewer-browser-view-ipc` を workspace に追加した。Settings／egui／本体には依存せず、serde／serde_json と Windows の transport だけを持つ。wire は `u32` little-endian の本文長 + UTF-8 JSON、本文上限128 KiB。要求は `protocol_version=1`・workspace の `application_version`・絶対パス・物理配置を持つ。応答も両方の版を持ち、`Queued`／`VersionMismatch`／`InvalidRequest`／`ChannelClosed` を返す。Queued は activation channel への配送だけを意味し、App の受付・表示結果ではない。版の不一致は channel に入れず、client も応答の両方の版を確認する。
+- CLI は共有 crate で `--browser-view left,top,right,bottom,maximized -- path` として読む。最大化は `0`／`1`、座標は i32、幅・高さは1〜65,536。画面との重なりは段階4の既存検査に任せる。Unicode の絶対パスを運び、NUL・空・UTF-16で32,767単位超を拒否する。core／launcher の既存 option-value 表にも switch を加え、位置指定を通常の path と誤解しない。`--` 以降の文字列は path として扱う。
+- launcher は Browser 専用の mutex probe と terminal な配送分岐を持つ。起動中なら新 pipe に一度だけ接続し、server PID → `AllowSetForegroundWindow(pid)` → 要求送信 → 応答確認の順で処理する。pipe 不在・版不一致・他の配送失敗はログと「mIV を再起動してください」で終わり、旧 pipe・activation event・別 core 起動へ移らない。未起動は元の引数をそのまま core に渡し、spawn 後に child PID にも明示的に許可を渡す。許可失敗はログに残して配送を続ける。host→launcher の spawn と許可の呼び出し元は段階6であり、共有 crate に同じ子プロセス許可 helper を用意した。
+- core が mutex 取得の競合に負けた場合も Browser は同じ共有配送処理で終端し、旧配送と activation event へ進まない。この分岐の診断は本体ログを truncate しない `browser-view.log` へ記録する。初回起動は CLI から既存 `ExplicitOpenPath` に同じ意図を渡し、既存 `InitialStartup` owner へ入る。通常要求の起動・2重起動の分岐は維持した。`--data-dir` 付き launcher は従来どおり core に名前空間の解決を任せる。
+- `single_instance/browser_view.rs` の listener は、有効な wire 要求に対して直ちに `ActivationOpenPath::received` を呼び、BrowserOverlay の要求として既存 channel に送る。Remote／Agent と同じ現在ユーザー専用 DACL と remote-client 拒否を使う。browser pipe のみ portable と data-dir suffix を既存の mutex と揃え、既存4種類の名前・wire は変更しない。listener の owner は `ActivationListener` に置き、App の field は増やさない。
+- connect／read／write は OVERLAPPED と永続 stop event を同じ待ちに含める。停止時は CancelIoEx 後の完了を待ってから buffer／OVERLAPPED を解放する。停止を `Interrupted` にせず `ConnectionAborted` にし、read_exact／write_all の自動再試行で停止を失わない。client の接続再試行はなく、read／write の I/O timeout は5秒（競合を隠す時間窓ではない）。Win32 の PID・許可・送受信は Connection trait、mutex 判定は注入可能な closure を通し、テストから desktop は操作しない。
+- Cargo.lock は既存依存だけの新 package／参照を手で追加した。cargo は最後の fmt のみ。コンパイル・実行・実機結果は未取得であり、設計担当へ引き継ぐ。公開文書は段階9、host producer は段階6のまま。
+
+追加テスト (Windows で計19件、いずれも GPU／desktop 操作なし):
+
+- 新 crate (12件): `browser818_cli_unicode_delimiter_and_position_round_trip`、`browser818_cli_missing_arguments_and_invalid_rectangles_are_rejected`、`browser818_ipc_unicode_frame_queues_exactly_once_and_ack_is_channel_only`、`browser818_ipc_unknown_protocol_or_application_version_never_queues`、`browser818_ipc_invalid_request_never_queues`、`browser818_ipc_frame_limits_reject_before_reading_body_and_writing_header`、`browser818_ipc_server_pid_and_grant_precede_request_write`、`browser818_ipc_foreground_failure_logs_and_keeps_single_delivery`、`browser818_ipc_old_core_reply_is_terminal_without_retry`、`browser818_ipc_probe_then_core_mutex_race_routes_without_second_spawn`、`browser818_ipc_stop_interrupts_connect_and_partial_frame_read`、`browser818_ipc_stop_before_next_operation_cannot_be_missed`。
+- launcher (2件): `browser818_ipc_launcher_routes_once_without_legacy_or_spawn_fallback`、`browser818_cli_launcher_keeps_literal_delimiter_and_skips_rectangle_value`。
+- 本体 lib (5件): `browser818_cli_core_keeps_browser_intent_and_never_opens_rectangle_as_path`、`browser818_ipc_pipe_namespace_tracks_flavor_and_data_dir_without_changing_legacy_names`、`browser818_ipc_receive_and_initial_startup_keep_same_intent_and_distinct_request_ids`、`browser818_ipc_core_mutex_race_uses_terminal_browser_route`、`browser818_ipc_activation_captures_remote_ownership_before_channel_delivery`。
+
+新規 filter は3 package の `browser818_ipc|browser818_cli`。通常の回帰は launcher の `tests::gpu_option`／`tests::gpu_options`／`mcp_launch::tests`、本体の `tests::gpu_startup_values_never_become_core_open_paths`／`tests::source_close_probe_values_never_become_startup_open_paths`／`single_instance::tests`／`browser818_open_owner` を用いる。既存テストは削除・弱化していない。
+
 ### 段階6：中継 exe と同梱経路
 
 **範囲**

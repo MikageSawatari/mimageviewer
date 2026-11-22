@@ -1283,13 +1283,25 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     }
     #[cfg(windows)]
     let _startup_windows_diagnostics = startup_windows_diag::start();
+    let browser_args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let browser_request = match mimageviewer_browser_view_ipc::parse_cli(&browser_args) {
+        Ok(request) => request,
+        Err(error) => {
+            let message = format!("Invalid browser-view arguments: {error}");
+            miv_startup::record_detail("browser_view", &message);
+            entry_trace.finish(miv_startup::Outcome::Error);
+            exit_startup_with_notice(2, session, Some(message));
+        }
+    };
     // --version / -V / --help / -h: GUI を開かず版 / usage を表示して即終了。
     // worker モード等の前に処理する (これらは内部フラグで --version と衝突しない)。
-    if startup_operation(
-        miv_startup::Stage::Help,
-        "help-or-version",
-        maybe_handle_version_or_help,
-    ) {
+    if browser_request.is_none()
+        && startup_operation(
+            miv_startup::Stage::Help,
+            "help-or-version",
+            maybe_handle_version_or_help,
+        )
+    {
         miv_startup::record_detail("process.disposition", "help-or-version");
         entry_trace.finish(miv_startup::Outcome::Ok);
         exit_gui_startup(0, session);
@@ -1341,8 +1353,13 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
     #[cfg(windows)]
     let dcomp_presenter_config = dcomp_presenter_test::parse_config();
     let perf_log_path = parse_perf_log_path_arg();
-    let startup_open_path = parse_startup_open_path_arg()
-        .map(|path| app::ExplicitOpenPath::new(path, app::ViewerOpenRequest::preferences()));
+    let startup_open_path = browser_request
+        .as_ref()
+        .map(single_instance::browser_view::startup_request)
+        .or_else(|| {
+            parse_startup_open_path_arg()
+                .map(|path| app::ExplicitOpenPath::new(path, app::ViewerOpenRequest::preferences()))
+        });
     arguments_trace.finish(miv_startup::Outcome::Ok);
 
     // --pdf-worker モード: GUI なしで PDFium ワーカープロセスとして起動
@@ -1447,6 +1464,33 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
             single_instance::SingleInstanceGuard::acquire,
         );
         if !guard.is_first_instance() {
+            if let Some(request) = &browser_request {
+                // The launcher may have observed no mutex before this core lost the race.
+                // Do not enter the ordinary open-path/event lane on any browser outcome.
+                logger::init_for_worker("browser-view");
+                let result = mimageviewer_browser_view_ipc::route(true, || {
+                    single_instance::browser_view::forward(request)
+                });
+                let (code, notice) = match result {
+                    Ok(_) => (0, None),
+                    Err(error) => {
+                        logger::log(format!(
+                            "browser_view: secondary core forwarding failed: {error}"
+                        ));
+                        (
+                            1,
+                            Some(mimageviewer_browser_view_ipc::RESTART_MESSAGE.to_owned()),
+                        )
+                    }
+                };
+                miv_startup::record_detail("process.disposition", "second-instance-browser-view");
+                entry_trace.finish(if code == 0 {
+                    miv_startup::Outcome::Ok
+                } else {
+                    miv_startup::Outcome::Error
+                });
+                exit_startup_with_notice(code, session, notice);
+            }
             let forwarded = startup_open_path.as_ref().is_some_and(|path| {
                 startup_operation(miv_startup::Stage::Ipc, "activation-open-path", || {
                     single_instance::send_open_path_to_existing(path)
@@ -2509,6 +2553,7 @@ fn cli_flag_takes_value(flag: &str) -> bool {
     matches!(
         flag,
         "--data-dir"
+            | "--browser-view"
             | "--gpu-backend"
             | "--gpu-test-fail-device"
             | "--test-script"
@@ -2573,6 +2618,46 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::path::PathBuf;
+
+    #[test]
+    fn browser818_cli_core_keeps_browser_intent_and_never_opens_rectangle_as_path() {
+        let args = os_args(&[
+            "core.exe",
+            "--browser-view",
+            "-800,0,0,600,0",
+            "--",
+            "日本語.png",
+        ]);
+        let wire = mimageviewer_browser_view_ipc::parse_cli(&args[1..])
+            .unwrap()
+            .unwrap();
+        let initial = single_instance::browser_view::startup_request(&wire);
+        assert!(initial.request.intent.is_browser_overlay());
+        assert!(initial.path.ends_with("日本語.png"));
+        assert_eq!(
+            parse_startup_open_path_arg_from(&args),
+            Some(PathBuf::from("日本語.png"))
+        );
+        let value_only = os_args(&["core.exe", "--browser-view", "-800,0,0,600,0"]);
+        assert_eq!(parse_startup_open_path_arg_from(&value_only), None);
+        assert!(mimageviewer_browser_view_ipc::parse_cli(&value_only[1..]).is_err());
+        for values in [
+            vec!["core.exe", "--", "--browser-view"],
+            vec!["core.exe", "ordinary.png"],
+            vec!["core.exe", "--data-dir", "isolated", "ordinary.png"],
+        ] {
+            let normal = os_args(&values);
+            assert!(
+                mimageviewer_browser_view_ipc::parse_cli(&normal[1..])
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                parse_startup_open_path_arg_from(&normal),
+                Some(PathBuf::from(*values.last().unwrap()))
+            );
+        }
+    }
 
     #[test]
     fn gpu_startup_root_descriptor_uses_requested_api_and_fxc() {

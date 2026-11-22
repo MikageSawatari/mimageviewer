@@ -4118,6 +4118,7 @@ dependencies = [
  "log",
  "lopdf",
  "mimageviewer-agent-ipc",
+ "mimageviewer-browser-view-ipc",
  "mimageviewer-capture-file",
  "mimageviewer-ipc",
  "mimalloc",
@@ -4185,6 +4186,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimageviewer-browser-view-ipc"
+version = "5.5.1"
+dependencies = [
+ "serde",
+ "serde_json",
+ "windows 0.61.3",
+]
+
+[[package]]
 name = "mimageviewer-capture-file"
 version = "5.5.1"
 dependencies = [
@@ -4209,6 +4219,7 @@ name = "mimageviewer-launcher"
 version = "5.5.1"
 dependencies = [
  "fs4",
+ "mimageviewer-browser-view-ipc",
  "miv-startup",
  "sha2",
  "tempfile",

@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 #[path = "../../../config/miv-sound.rs"]
 mod miv_sound_config;
 
+mod browser_view;
 #[path = "../../../src/effetune/bundle_location.rs"]
 mod bundle_location;
 mod bundle_paths;
@@ -194,19 +195,30 @@ fn run() -> Result<&'static str, String> {
     let user_args = trace(Stage::Args, "launcher arguments", || {
         Ok::<_, String>(std::env::args_os().skip(1).collect::<Vec<OsString>>())
     })?;
+    let browser_request = mimageviewer_browser_view_ipc::parse_cli(&user_args)
+        .map_err(|error| format!("Invalid browser-view arguments: {error}"))?;
 
     // --version / -V / --help / -h: 版 / usage を表示して終了 (core を spawn しない)。
     // 既存インスタンスの activate より前に処理する。
-    if trace(Stage::Args, "help/version decision", || {
-        Ok::<_, String>(maybe_handle_version_or_help(&user_args))
-    })? {
+    if browser_request.is_none()
+        && trace(Stage::Args, "help/version decision", || {
+            Ok::<_, String>(maybe_handle_version_or_help(&user_args))
+        })?
+    {
         return Ok("help_or_version");
     }
 
     // `--data-dir` 指定時の mutex / event / open-path pipe 名は core が解決済み path から
     // 導出する。launcher は基底名しか埋め込んでいないため、ここでは先回りせず core に渡す。
     #[cfg(windows)]
-    if !has_data_dir_option(&user_args)
+    if let Some(request) = &browser_request {
+        if !has_data_dir_option(&user_args)
+            && browser_view::try_existing(request)?
+                == mimageviewer_browser_view_ipc::StartupRoute::Forwarded
+        {
+            return Ok("browser_view_forwarded");
+        }
+    } else if !has_data_dir_option(&user_args)
         && trace(Stage::Instance, "existing instance", || {
             Ok::<_, String>(try_activate_existing(&user_args))
         })?
@@ -313,6 +325,14 @@ fn run() -> Result<&'static str, String> {
     });
     let mut child =
         child_result.map_err(|e| format!("spawn core failed ({}): {e}", core_path.display()))?;
+    #[cfg(windows)]
+    if browser_request.is_some() {
+        mimageviewer_browser_view_ipc::grant_child_foreground(
+            child.id(),
+            mimageviewer_browser_view_ipc::transport::allow_foreground,
+            browser_view::log,
+        );
+    }
     drop(extraction);
     miv_startup::record_detail("child_pid", &child.id().to_string());
     #[cfg(windows)]
@@ -731,6 +751,7 @@ fn cli_flag_takes_value(flag: &str) -> bool {
     matches!(
         flag,
         "--data-dir"
+            | "--browser-view"
             | "--gpu-backend"
             | "--gpu-test-fail-device"
             | "--window-size"

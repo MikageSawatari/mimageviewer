@@ -1521,6 +1521,13 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 P1 修正の再検証は設計担当から190件中189件成功・activation 回帰の close 後一覧検査1件失敗の報告があった。原因は、viewer teardown の完了を帰り先一覧の非同期復元の完了と誤認したテスト側の確認境界。製品の close／restore は変更せず、既存の履歴復元完了 helper を通してから同じ PNG assert と元一覧への完全一致を検査するよう修正した。assert の弱化・製品への待ちや guard の追加はない。今回のテスト修正の再実行・独立レビューは引き継ぎ待ち。
 
+**段階5の実装引き継ぎ (2026-11-22、ビルド・テスト・独立レビュー待ち)**
+
+- 新 pipe／CLI の共通 crate から既存の activation channel と InitialStartup へ BrowserOverlay の要求を運ぶ。listener は `ActivationOpenPath::received` で Remote 所有と受信順を捕捉し、既存の最新一件・保留・破棄・拒否の owner に渡す。App の detached 用 field は増やさない (§2-3)。
+- 起動済み launcher と mutex 競合で後着になった core の双方を専用の終端分岐へ接続した。版・channel 配送までの応答を確認し、旧 open-path pipe／activation event／別 core への fallback と再試行を持たない。接続した server PID へ送信前に前面化の許可を渡し、未起動 core の spawn 後も child PID へ渡す。失敗はログに残す。host の spawn は段階6で接続する。
+- listener の寿命は ActivationListener の service owner に置き、接続・読込・書込の全待ちを永続 stop event で解除する。これは transport の停止所有であり、detached の競合を隠す待ち・時間窓を追加するものではない (§2-5)。PID／許可は注入でき、テストから desktop は変えない。
+- HWND 同定・viewport 経路・再生成条件・用途・placement 保存先は変更しない (§2-1・2・4)。段階2〜4で合意した要求の型へ入口を繋ぐ構造変更であり、症状 guard は足さない (§2-6・7)。既存テストを維持し、新規19件と通常の起動・MCP・名前空間の回帰を引き継ぐ (§2-8)。cargo は最後の fmt 以外実行しない。実装に対する構造合意は再レビュー待ち。
+
 ### 2026-11-21: 絞り込みの変更で一覧を読み直さない・AI の絞り込みを一覧全体の取得の証明へ (§1.835、実装済み・自動検証済み・実機未確認)
 
 **変更の内容**
