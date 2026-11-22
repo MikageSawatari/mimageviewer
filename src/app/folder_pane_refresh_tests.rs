@@ -9,6 +9,9 @@ mod reclick;
 #[path = "folder_pane_reclick_stage2_tests.rs"]
 mod reclick_stage2;
 
+#[path = "folder_pane_input_gate_tests.rs"]
+mod input_gate;
+
 // These UI fixtures represent the main pane after startup admission. The
 // headless App constructor never drives NotStarted into a terminal indexer
 // outcome, so explicitly select the no-indexer outcome at fixture creation.
@@ -727,6 +730,8 @@ fn sidecar_tree_frame(
             // The real root logic phase drains App-global writer replies before
             // hydration polls its quiescence fence. In particular bookmark reads
             // requested by the first folder install must cross that receive edge.
+            app.begin_root_input_gate_pass(ctx);
+            app.edit_preview_repaint_ctx = Some(ctx.clone());
             app.poll_book_bookmark_service_responses();
             app.poll_spread_shift_service();
             app.service_update_registered_writers(ctx);
@@ -766,6 +771,7 @@ fn sidecar_tree_frame(
                 }
             }
             app.post_render_sidecar_restore(ctx);
+            app.end_root_input_gate_pass();
         },
     )
     .drop_without_applying_deltas();

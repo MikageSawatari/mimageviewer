@@ -119,7 +119,7 @@ fn reclick_preflight_mut(app: &mut App) -> &mut PhysicalHistoryPreflight {
     preflight
 }
 
-fn reclick_hold_preflight(
+pub(super) fn reclick_hold_preflight(
     app: &mut App,
 ) -> (
     PhysicalHistoryPreflight,
@@ -132,7 +132,7 @@ fn reclick_hold_preflight(
     )
 }
 
-fn reclick_worker_result(
+pub(super) fn reclick_worker_result(
     mut preflight: PhysicalHistoryPreflight,
 ) -> PhysicalHistoryPreflightPayload {
     let deadline = Instant::now() + Duration::from_secs(20);

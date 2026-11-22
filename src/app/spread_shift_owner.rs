@@ -376,7 +376,7 @@ impl App {
                 return;
             }
         }
-        self.consume_input_during_sidecar_restore(ctx);
+        self.sanitize_input_for_started_sidecar_restore(ctx);
         ctx.request_repaint();
     }
 

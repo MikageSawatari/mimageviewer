@@ -5,7 +5,8 @@ use crate::folder_pane::FolderPaneActivation;
 use collection_navigation::{PhysicalHistoryPreflight, PhysicalHistoryPreflightPoll};
 use std::time::{Duration, Instant};
 
-fn reclick_stage2_fixture() -> (AppTestEnvForTest, egui::Context, u64, PathBuf, PathBuf) {
+pub(super) fn reclick_stage2_fixture() -> (AppTestEnvForTest, egui::Context, u64, PathBuf, PathBuf)
+{
     let (mut app, ctx, mut frame, b, _) = navigation_tree_fixture();
     ctx.options_mut(|options| options.max_passes = std::num::NonZeroUsize::new(1).unwrap());
     app.active_quick_folder_slot = None;
@@ -292,6 +293,120 @@ fn folder_pane_reclick_triple_during_refresh_sidecar_restore_toggles_once() {
 #[test]
 fn folder_pane_reclick_triple_across_refresh_sidecar_restore_toggles_once() {
     reclick_stage2_sidecar_scenario(3, true);
+}
+
+// NG-1: do not insert a no-input frame between preflight completion and
+// the second press. Adoption must start recovery before this pass' input gate.
+fn reclick_sidecar_starts_before_second_press_scenario(clicks: usize) {
+    let (mut app, ctx, a) = reclick_stage2_sidecar_fixture();
+    app.edit_preview_repaint_ctx = Some(ctx.clone());
+    let pos = visible_label_click_rect(&ctx, &a).center();
+    let history = app.folder_nav_history_snapshot();
+    let imports = sidecar_restore::import_starts_for_test();
+    #[cfg(all(windows, feature = "test-script"))]
+    let loads = app.test_script_folder_load_requests;
+    sidecar_tree_frame(
+        &mut app,
+        &ctx,
+        10.0,
+        vec![
+            egui::Event::PointerMoved(pos),
+            primary_event(pos, true),
+            primary_event(pos, false),
+        ],
+        None,
+    );
+    reclick_stage2_refresh_request(&app, &a);
+    assert!(app.sidecar_restore.is_none());
+    assert_label_expanded(&app, &a, true);
+    let (worker, sender) = super::reclick::reclick_hold_preflight(&mut app);
+    sender
+        .send(Ok(super::reclick::reclick_worker_result(worker)))
+        .unwrap();
+    let relay = sidecar_restore::SidecarCheckingRelay::new();
+    sidecar_tree_frame(
+        &mut app,
+        &ctx,
+        10.04,
+        vec![
+            egui::Event::PointerMoved(pos),
+            primary_event(pos, true),
+            egui::Event::Text("discard in the starting pass".into()),
+            primary_event(pos, false),
+        ],
+        Some(relay.clone()),
+    );
+    assert!(app.sidecar_restore_blocks_projected_context());
+    assert_label_expanded(&app, &a, false);
+    assert_eq!(sidecar_restore::import_starts_for_test(), imports + 1);
+    assert!(
+        app.top_level_grid_view
+            .history_navigation_transition()
+            .is_none()
+    );
+    let state = app.sidecar_restore.as_ref().unwrap();
+    let request = state.connection_request_ids_for_test();
+    let cancel = state.cancel_for_test();
+    let generation = app.items_generation;
+    ctx.input(|input| {
+        assert!(!input.events.iter().any(|event| matches!(
+            event,
+            egui::Event::Text(_) | egui::Event::PointerButton { pressed: true, .. }
+        )));
+        assert!(!input.pointer.any_down());
+    });
+    if clicks == 3 {
+        sidecar_tree_frame(
+            &mut app,
+            &ctx,
+            10.08,
+            vec![
+                egui::Event::PointerMoved(pos),
+                primary_event(pos, true),
+                primary_event(pos, false),
+            ],
+            None,
+        );
+        assert_label_expanded(&app, &a, false);
+        let state = app.sidecar_restore.as_ref().unwrap();
+        assert_eq!(state.connection_request_ids_for_test(), request);
+        assert!(Arc::ptr_eq(&cancel, &state.cancel_for_test()));
+        assert_eq!(app.items_generation, generation);
+    }
+    assert!(!cancel.load(Ordering::Relaxed));
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !relay.captured() {
+        assert!(
+            Instant::now() < deadline,
+            "the real checking worker must reach its relay"
+        );
+        sidecar_tree_frame(&mut app, &ctx, 10.12, vec![], None);
+        std::thread::yield_now();
+    }
+    finish_sidecar_tree(&mut app, &ctx, &relay, 10.20);
+    reclick_stage2_assert_sidecar_imported(&app, &a);
+    assert_label_expanded(&app, &a, false);
+    assert_eq!(app.folder_nav_history_snapshot(), history);
+    assert_eq!(app.current_folder.as_ref(), Some(&a));
+    assert_eq!(sidecar_restore::import_starts_for_test(), imports + 1);
+    assert!(
+        app.top_level_grid_view
+            .history_navigation_transition()
+            .is_none()
+    );
+    assert!(app.folder_pane_open_pending.is_none());
+    #[cfg(all(windows, feature = "test-script"))]
+    assert_eq!(app.test_script_folder_load_requests, loads + 1);
+}
+
+#[test]
+fn folder_pane_reclick_double_when_sidecar_starts_before_input_gate_toggles_once() {
+    reclick_sidecar_starts_before_second_press_scenario(2);
+}
+
+#[test]
+fn folder_pane_reclick_triple_when_sidecar_starts_before_input_gate_toggles_once() {
+    reclick_sidecar_starts_before_second_press_scenario(3);
 }
 
 // Capture the real pointer result, then add another producer's same-pass

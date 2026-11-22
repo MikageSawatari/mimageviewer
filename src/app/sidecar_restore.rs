@@ -7,6 +7,28 @@
 use super::*;
 use std::sync::mpsc::{Receiver, TryRecvError};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RootInputGatePass(u64);
+
+#[derive(Clone, Copy)]
+pub(super) struct StartedSidecarViewportInput {
+    pass: RootInputGatePass,
+    cancel_close: bool,
+}
+
+/// Only viewport input may wait for the root gate. Mounted-context gestures
+/// always end where the restore starts, before that context can be unmounted.
+#[derive(Default)]
+pub(super) enum RootInputGate {
+    #[default]
+    OutsidePass,
+    Before {
+        pass: RootInputGatePass,
+        sanitize: Option<StartedSidecarViewportInput>,
+    },
+    Passed(RootInputGatePass),
+}
+
 #[cfg(test)]
 thread_local! {
     static IMPORT_STARTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1351,6 +1373,10 @@ impl App {
             ctx.viewport_id() != egui::ViewportId::ROOT
                 && !self.sidecar_restore_root_lifecycle_close_requested(),
         );
+        self.finish_sidecar_restore_context_gestures(ctx);
+    }
+
+    fn finish_sidecar_restore_context_gestures(&mut self, ctx: &egui::Context) {
         // These owners were derived before the modal began, so filtering RawInput alone cannot
         // release them.  End the gestures explicitly on every mounted-context pass; none of the
         // transient pointer deltas is replayed after restore.
@@ -1366,6 +1392,87 @@ impl App {
         self.capture_region_selection = None;
         self.fs_secondary_press.cancel();
         self.finish_gamepad_input_for_sidecar_restore(ctx);
+    }
+
+    pub(super) fn begin_root_input_gate_pass(&mut self, ctx: &egui::Context) {
+        if ctx.viewport_id() == egui::ViewportId::ROOT {
+            self.root_input_gate = RootInputGate::Before {
+                pass: RootInputGatePass(ctx.cumulative_pass_nr()),
+                sanitize: None,
+            };
+        }
+    }
+
+    pub(super) fn end_root_input_gate_pass(&mut self) {
+        self.root_input_gate = RootInputGate::OutsidePass;
+    }
+
+    /// Called only by the three restore-start boundaries. Capture the predicate
+    /// and CancelClose policy now, while the initiating context is still mounted.
+    pub(super) fn sanitize_input_for_started_sidecar_restore(&mut self, ctx: &egui::Context) {
+        if !self.sidecar_restore_blocks_projected_context() {
+            return;
+        }
+        let cancel_close = ctx.viewport_id() != egui::ViewportId::ROOT
+            && !self.sidecar_restore_root_lifecycle_close_requested();
+        let pass = RootInputGatePass(ctx.cumulative_pass_nr());
+        if ctx.viewport_id() == egui::ViewportId::ROOT
+            && let RootInputGate::Before {
+                pass: gate_pass,
+                sanitize,
+            } = &mut self.root_input_gate
+            && *gate_pass == pass
+        {
+            if sanitize.is_none() {
+                *sanitize = Some(StartedSidecarViewportInput { pass, cancel_close });
+                Self::log_started_sidecar_input_gate("deferred", pass);
+            }
+        } else {
+            Self::sanitize_sidecar_restore_viewport_input(ctx, cancel_close);
+        }
+        self.finish_sidecar_restore_context_gestures(ctx);
+    }
+
+    /// Run after the tree has read the untouched event/witness pair. The normal
+    /// consumer still evaluates this pass' mounted context. A start request only
+    /// carries viewport work, so it remains valid after a context mount changes.
+    pub(super) fn consume_sidecar_restore_input_at_root_gate(&mut self, ctx: &egui::Context) {
+        let request = if ctx.viewport_id() == egui::ViewportId::ROOT {
+            let pass = RootInputGatePass(ctx.cumulative_pass_nr());
+            match std::mem::replace(&mut self.root_input_gate, RootInputGate::Passed(pass)) {
+                RootInputGate::Before { sanitize, .. } => {
+                    sanitize.filter(|request| request.pass == pass)
+                }
+                RootInputGate::Passed(previous) if previous == pass => None,
+                RootInputGate::OutsidePass | RootInputGate::Passed(_) => None,
+            }
+        } else {
+            None
+        };
+        self.consume_input_during_sidecar_restore(ctx);
+        if let Some(request) = request {
+            Self::sanitize_sidecar_restore_viewport_input(ctx, request.cancel_close);
+            Self::log_started_sidecar_input_gate("applied", request.pass);
+        }
+    }
+
+    fn log_started_sidecar_input_gate(action: &'static str, pass: RootInputGatePass) {
+        crate::logger::log(format!(
+            "sidecar restore viewport input {action}: root_pass={}",
+            pass.0
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "sidecar_restore",
+                "root_input_gate",
+                None,
+                0,
+                &[
+                    ("action", serde_json::json!(action)),
+                    ("pass", serde_json::json!(pass.0)),
+                ],
+            );
+        }
     }
 
     /// Sanitize one egui viewport before any of its direct input consumers run.
@@ -1904,10 +2011,10 @@ impl App {
                 .folder
                 .display()
         ));
-        // The restore can start after the root pass' ordinary input gate.  Sanitize that same
-        // pass immediately so the first modal frame has no pointer/scroll layer hole.
+        // Before the root gate, only viewport input waits for tree recognition.
+        // Context gestures end immediately; after the gate, sanitize this pass now.
         if let Some(ctx) = self.edit_preview_repaint_ctx.clone() {
-            self.consume_input_during_sidecar_restore(&ctx);
+            self.sanitize_input_for_started_sidecar_restore(&ctx);
         }
         Ok(())
     }
@@ -2077,7 +2184,7 @@ impl App {
             }),
         });
         if let Some(ctx) = self.edit_preview_repaint_ctx.clone() {
-            self.consume_input_during_sidecar_restore(&ctx);
+            self.sanitize_input_for_started_sidecar_restore(&ctx);
             ctx.request_repaint();
         }
     }

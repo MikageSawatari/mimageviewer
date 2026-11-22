@@ -17106,6 +17106,7 @@ pub struct App {
     pub(crate) edit_preview_cache: Option<crate::edit_preview_cache::EditPreviewCacheService>,
     /// cache worker 完了時に UI を起こすため、直近 update の Context を保持する。
     pub(crate) edit_preview_repaint_ctx: Option<egui::Context>,
+    root_input_gate: sidecar_restore::RootInputGate,
     /// 保存完了後、同じページの通常サムネを編集プレビューへ差し替えるまで追跡する。
     pub(crate) edit_preview_refresh_pending: std::collections::HashMap<String, std::time::Instant>,
     /// 固定代表の参照元ページで色調補正が変わったキー。
@@ -21109,6 +21110,7 @@ impl App {
             archive_cache_db,
             edit_preview_cache,
             edit_preview_repaint_ctx: None,
+            root_input_gate: sidecar_restore::RootInputGate::default(),
             edit_preview_refresh_pending: std::collections::HashMap::new(),
             pinned_adjustment_refresh_keys: std::collections::HashSet::new(),
             archive_convert: None,
@@ -103453,6 +103455,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.speculative_gpu_frame.begin_pass();
         let ctx = &ui.ctx().clone();
+        self.begin_root_input_gate_pass(ctx);
         self.begin_grid_click_input_frame(ctx);
         static FIRST_UPDATE: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
@@ -103577,6 +103580,7 @@ impl eframe::App for App {
             trace.finish(miv_startup::Outcome::Ok);
         }
         self.publish_main_drop_geometry(ctx, main_drop_geometry);
+        self.end_root_input_gate_pass();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
