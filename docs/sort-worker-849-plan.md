@@ -268,3 +268,19 @@ test(/section1795_off_refresh_and_sort_preserve_current_position/)
 
 - 独立した `gpt-6.1-sol` / `xhigh` に案(a)の設計と最終の affected paths を read-only で再レビューしてもらい、**ACCEPT / STRUCTURAL: AGREE**、未解決指摘なし。reviewer は cargo・fmt・編集・git mutation を実行していない。
 - 修正担当は `cargo fmt` のみ実施。ビルド・テスト・check・確認用ビルドは利用者指示により未実施で、共有実行口へ引き継ぐ。git の commit/reset/stash/checkout は実行していない。
+
+### 8.3 テストの実行と独立レビュー (設計担当がまとめた、2026-11-22)
+
+- テスト (設計担当が共有の実行口 run-heavy で nextest を実行。本体 lib の全件は流していない。テストの段階分けによる):
+  - `0cb1f5f7b`: 新しいテストのコンパイルエラー (`EverythingPosition` に `PartialEq`・`Debug` が無い) で、1 本も走らなかった。`76aaa4617` でフィールドごとの比較に直した。
+  - `76aaa4617`: 関連 filter で 782 本すべて成功。`sort_worker_849_` 15 本と `sort_hold_838_` 33 本が含まれることを `cargo nextest list` で確かめた。
+  - `77773f47a`: filter を本の recipe・snapshot・page_order 系まで広げて 1399 本すべて成功。
+- 8.2 の「独立レビュー」は、実装担当が自分で起こした確認。ここに記す独立レビューは、設計レビューと同じ Sol / xhigh の会話 (実装担当とは別) で行った。
+  - r1 (`76aaa4617`): REVISE / STRUCTURAL: AGREE。P2: `folder_observation` の不在では、文書と復元済みディレクトリを区別できない (★固定 → 子 ZIP → 戻って解除で、`.epub` 名の実ディレクトリが読み直されない)。P3: ドライブ一覧のテストが、同期の走査をしないことを確かめていない。→ `77773f47a` で反映。
+  - r2 (`77773f47a`): ACCEPT / STRUCTURAL: AGREE。指摘なし。レビュー担当の言葉: 「これらは実ディレクトリの分類修正に伴う、通常フォルダの扱いへの是正と判断します。」
+- r2 で確認された、並べ替え以外の変化 (`.epub`・`.pdf`・`.zip`・`.rar` という名前の実ディレクトリだけ。旧分岐はいずれも v5.5.1 にある):
+  - フォルダの自動更新: これまで Document / Archive として除外されていたが、通常のフォルダ監視の対象になる。
+  - 本優先の評価: これまで評価できなかったものが、フォルダとして評価できる。保存キーは同じ。
+  - 本の構成のメニュー: ImageFolder は画像フォルダ → ZIP の既存の経路、CompiledFolder は既存の対象外の方針になる。旧分類で使えていた編集機能を失う変更ではない。
+  - 読書位置・見開き・トリム・ページ編集のキーは変わらない。通常の操作で作ったデータが読めなくなる経路は見つからなかった (レビュー担当、コードから)。
+- 実機の確認は未実施 (サブ PC の依頼文を用意、送るのは統括)。
