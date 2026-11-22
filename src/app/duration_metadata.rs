@@ -1,15 +1,46 @@
-//! Length requirements and completion belong to the listing's metadata session.
+//! Whole-listing requirements and completion belong to the metadata session.
 use super::*;
 use crate::settings::{FacetDurationPreset, ListingDuration, ListingSortMetadata};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DurationScanProof {
+pub(crate) struct ListingMetaScanProof {
     pub(crate) generation: u64,
     pub(crate) items_len: usize,
+    pub(crate) requirements: ListingMetaRequirements,
 }
 
-impl DurationScanProof {
-    fn matches(self, app: &App) -> bool {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ListingMetaRequirements {
+    pub(crate) duration: bool,
+    pub(crate) ai: bool,
+}
+
+impl ListingMetaRequirements {
+    pub(crate) fn is_empty(self) -> bool {
+        !self.duration && !self.ai
+    }
+
+    pub(crate) fn contains(self, other: Self) -> bool {
+        (!other.duration || self.duration) && (!other.ai || self.ai)
+    }
+
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self {
+            duration: self.duration || other.duration,
+            ai: self.ai || other.ai,
+        }
+    }
+
+    pub(crate) fn without(self, proven: Self) -> Self {
+        Self {
+            duration: self.duration && !proven.duration,
+            ai: self.ai && !proven.ai,
+        }
+    }
+}
+
+impl ListingMetaScanProof {
+    pub(crate) fn matches(self, app: &App) -> bool {
         self.generation == app.items_generation && self.items_len == app.items.len()
     }
 }
@@ -110,31 +141,75 @@ impl App {
     }
 
     pub(crate) fn duration_scan_ready(&self) -> bool {
-        self.duration_scan_proof
-            .is_some_and(|proof| proof.matches(self))
+        self.proven_listing_meta_requirements().duration
     }
 
-    pub(super) fn duration_scan_snapshot(&self) -> DurationScanProof {
-        DurationScanProof {
-            generation: self.items_generation,
-            items_len: self.items.len(),
+    pub(crate) fn listing_meta_requirements(&self) -> ListingMetaRequirements {
+        ListingMetaRequirements {
+            duration: self.duration_lengths_wanted(),
+            ai: self.ai_model_facet_should_load(),
         }
     }
 
-    pub(super) fn complete_duration_scan(&mut self, scan: Option<DurationScanProof>) -> bool {
+    // Target construction must finish the fields promised by the active scan,
+    // even if the current filter stops requesting one of them mid-plan.
+    pub(super) fn active_listing_meta_requirements(&self) -> ListingMetaRequirements {
+        self.details_meta_pending
+            .as_ref()
+            .and_then(|pending| pending.listing_meta_scan)
+            .filter(|scan| scan.matches(self))
+            .map_or_else(
+                || self.listing_meta_requirements(),
+                |scan| scan.requirements.union(self.listing_meta_requirements()),
+            )
+    }
+
+    fn proven_listing_meta_requirements(&self) -> ListingMetaRequirements {
+        self.listing_meta_scan_proof
+            .filter(|proof| proof.matches(self))
+            .map_or_else(ListingMetaRequirements::default, |proof| proof.requirements)
+    }
+
+    pub(crate) fn unproven_listing_meta_requirements(&self) -> ListingMetaRequirements {
+        self.listing_meta_requirements()
+            .without(self.proven_listing_meta_requirements())
+    }
+
+    pub(super) fn listing_meta_scan_snapshot(&self) -> ListingMetaScanProof {
+        ListingMetaScanProof {
+            generation: self.items_generation,
+            items_len: self.items.len(),
+            requirements: self.listing_meta_requirements(),
+        }
+    }
+
+    pub(super) fn complete_listing_meta_scan(
+        &mut self,
+        scan: Option<ListingMetaScanProof>,
+    ) -> ListingMetaRequirements {
         let Some(scan) = scan.filter(|scan| scan.matches(self)) else {
-            return false;
+            return ListingMetaRequirements::default();
         };
-        let changed = self.duration_scan_proof != Some(scan);
-        self.duration_scan_proof = Some(scan);
+        let previous = self.proven_listing_meta_requirements();
+        self.listing_meta_scan_proof = Some(ListingMetaScanProof {
+            requirements: previous.union(scan.requirements),
+            ..scan
+        });
         crate::perf::event(
             "details_meta",
-            "duration_scan_complete",
+            "listing_meta_scan_complete",
             None,
             scan.generation,
-            &[("items", serde_json::Value::from(scan.items_len))],
+            &[
+                ("items", serde_json::Value::from(scan.items_len)),
+                (
+                    "duration",
+                    serde_json::Value::from(scan.requirements.duration),
+                ),
+                ("ai", serde_json::Value::from(scan.requirements.ai)),
+            ],
         );
-        changed
+        scan.requirements.without(previous)
     }
 
     pub(crate) fn request_duration_facet_load(&mut self) {
@@ -152,10 +227,10 @@ impl App {
         }
         match self.details_image_dims_state {
             LazyColumnState::Loading { done, total }
-                if self
-                    .details_meta_pending
-                    .as_ref()
-                    .is_some_and(|p| p.duration_scan.is_some()) =>
+                if self.details_meta_pending.as_ref().is_some_and(|p| {
+                    p.listing_meta_scan
+                        .is_some_and(|scan| scan.requirements.duration)
+                }) =>
             {
                 Some(format!("長さを読み込み中 {done}/{total}"))
             }

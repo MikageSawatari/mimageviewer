@@ -2170,18 +2170,21 @@ fn draw_facet_calendar_date_row(
                     .range(1970..=9999)
                     .suffix("年"),
             );
+            crate::ime_focus::track_drag_value_focus(&year);
             crate::ui_helpers::set_accessibility_label_with(&year, || format!("{label} 年"));
             let month = ui.add(
                 egui::DragValue::new(&mut value.month)
                     .range(1..=12)
                     .suffix("月"),
             );
+            crate::ime_focus::track_drag_value_focus(&month);
             crate::ui_helpers::set_accessibility_label_with(&month, || format!("{label} 月"));
             let day = ui.add(
                 egui::DragValue::new(&mut value.day)
                     .range(1..=31)
                     .suffix("日"),
             );
+            crate::ime_focus::track_drag_value_focus(&day);
             crate::ui_helpers::set_accessibility_label_with(&day, || format!("{label} 日"));
         });
     });
@@ -2209,12 +2212,15 @@ pub(crate) fn draw_facet_size_value_row(
     ui.horizontal(|ui| {
         let label_response = ui.checkbox(&mut enabled, label);
         ui.add_enabled_ui(enabled, |ui| {
-            ui.add(
-                egui::DragValue::new(&mut current.value)
-                    .range(0..=u32::MAX)
-                    .speed(1),
-            )
-            .labelled_by(label_response.id);
+            let response = ui
+                .add(
+                    egui::DragValue::new(&mut current.value)
+                        .range(0..=u32::MAX)
+                        .speed(1),
+                )
+                .labelled_by(label_response.id);
+            // The grid handles keys before this popup is drawn next pass.
+            crate::ime_focus::track_drag_value_focus(&response);
             let unit = egui::ComboBox::from_id_salt(("facet_size_unit", id))
                 .selected_text(current.unit.label())
                 .show_ui(ui, |ui| {
@@ -2251,12 +2257,14 @@ fn draw_facet_duration_value_row(
     ui.horizontal(|ui| {
         let label_response = ui.checkbox(&mut enabled, label);
         ui.add_enabled_ui(enabled, |ui| {
-            ui.add(
-                egui::DragValue::new(&mut minutes)
-                    .range(0..=u32::MAX)
-                    .speed(1),
-            )
-            .labelled_by(label_response.id);
+            let response = ui
+                .add(
+                    egui::DragValue::new(&mut minutes)
+                        .range(0..=u32::MAX)
+                        .speed(1),
+                )
+                .labelled_by(label_response.id);
+            crate::ime_focus::track_drag_value_focus(&response);
             ui.label(format!("分 {relation}"));
         });
     });
@@ -11429,15 +11437,21 @@ impl App {
             });
     }
 
-    /// Keep the source grid visible while a location is prepared offscreen.
+    /// Keep the source grid visible while a location or its new order is prepared offscreen.
     fn render_location_navigation_wait_overlay(&self, ctx: &egui::Context) {
-        if !self.location_navigation_pending() {
+        let location_pending = self.location_navigation_pending();
+        if !location_pending && !self.view_order_refresh_scan_pending() {
             return;
         }
         if let Some(delay) = self.direct_navigation_wait_overlay_delay() {
             ctx.request_repaint_after(delay);
             return;
         }
+        let message = if location_pending {
+            "移動先を読み込み中…"
+        } else {
+            "並べ替え中…"
+        };
         egui::Area::new(egui::Id::unique("location_navigation_wait_overlay"))
             .order(egui::Order::Foreground)
             .interactable(false)
@@ -11448,10 +11462,7 @@ impl App {
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spinner();
-                            ui.label(
-                                egui::RichText::new("移動先を読み込み中…")
-                                    .color(PROGRESS_LABEL_COLOR),
-                            );
+                            ui.label(egui::RichText::new(message).color(PROGRESS_LABEL_COLOR));
                         });
                     });
             });
@@ -15095,15 +15106,15 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 Some(FacetDatePreset::CustomDays(custom_days));
                             changed = true;
                         }
-                        if ui
+                        let days_response = ui
                             .add(
                                 egui::DragValue::new(&mut custom_days)
                                     .range(1..=36_500)
                                     .suffix(" 日以内"),
                             )
-                            .labelled_by(days_label.id)
-                            .changed()
-                        {
+                            .labelled_by(days_label.id);
+                        crate::ime_focus::track_drag_value_focus(&days_response);
+                        if days_response.changed() {
                             self.active_facet_filter_mut().date_preset =
                                 Some(FacetDatePreset::CustomDays(custom_days));
                             changed = true;
@@ -15664,16 +15675,17 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
     fn draw_image_color_tolerance(&mut self, ui: &mut egui::Ui) -> bool {
         let mut tolerance = self.color_filter.tolerance;
-        if ui
-            .add(
-                egui::Slider::new(
-                    &mut tolerance,
-                    crate::color_search::MIN_TOLERANCE..=crate::color_search::MAX_TOLERANCE,
-                )
-                .text("許容範囲"),
+        let response = ui.add(
+            egui::Slider::new(
+                &mut tolerance,
+                crate::color_search::MIN_TOLERANCE..=crate::color_search::MAX_TOLERANCE,
             )
-            .changed()
-        {
+            .text("許容範囲"),
+        );
+        // Slider returns its inner DragValue's id while the number has focus
+        // (also on focus transitions). Use the same owner as the RGB/HSL fields.
+        self.color_filter.input_has_focus |= response.has_focus();
+        if response.changed() {
             self.color_filter.tolerance = tolerance;
             self.activate_image_color_filter_from_ui();
             return true;
