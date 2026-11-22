@@ -11114,6 +11114,11 @@ fn draw_fullscreen_smooth_page_scroll_setting(ui: &mut egui::Ui, value: &mut boo
     ui.small("ページ内を動かすキー・ホイールに適用します。タッチパッド、連結読み、ドラッグ、ズームには適用しません。");
 }
 
+fn draw_fullscreen_bound_drag_pan_setting(ui: &mut egui::Ui, value: &mut bool) {
+    ui.checkbox(value, "閲覧時のドラッグ移動を画像の端までに制限する");
+    ui.small("ページ単位の静止画表示で、画面からはみ出す方向は画像の端で止まり、画面に収まる方向は動きません。補正パネルを開いているときや編集中、ズームモード・連結読み・360 度・3D 表示には適用しません。キー・ホイール・ズームの動きは変わりません。");
+}
+
 fn draw_fullscreen_n_scroll_step_setting(ui: &mut egui::Ui, value: &mut u32) {
     ui.horizontal(|ui| {
         let label = ui.label("順に読む操作 (N 字 / Z 字) 1 回");
@@ -11429,6 +11434,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             &mut state.settings.fullscreen_smooth_page_scroll,
         );
     });
+    anchored(ui, state, "spread/bound-drag-pan", |ui, state| {
+        draw_fullscreen_bound_drag_pan_setting(ui, &mut state.settings.fullscreen_bound_drag_pan);
+    });
     anchored(ui, state, "spread/top-bar", |ui, state| {
         let s = &mut state.settings;
         ui.checkbox(&mut s.fullscreen_top_bar_locked, "上部情報バーを固定表示");
@@ -11635,6 +11643,7 @@ mod fullscreen_in_page_scroll_setting_tests {
         draw_fullscreen_wheel_action_setting(ui, &mut settings.fullscreen_wheel_action);
         draw_fullscreen_n_scroll_order_setting(ui, &mut settings.fullscreen_n_scroll_order);
         draw_fullscreen_smooth_page_scroll_setting(ui, &mut settings.fullscreen_smooth_page_scroll);
+        draw_fullscreen_bound_drag_pan_setting(ui, &mut settings.fullscreen_bound_drag_pan);
         ui.add_space(8.0);
         ui.label("スクロール量 (連結読み・ページ内スクロール)");
         draw_fullscreen_n_scroll_step_setting(ui, &mut settings.fullscreen_n_scroll_step_percent);
@@ -11652,12 +11661,13 @@ mod fullscreen_in_page_scroll_setting_tests {
             settings.fullscreen_up_down_key_action = FullscreenUpDownKeyAction::InPageScroll;
             settings.fullscreen_n_scroll_order = FullscreenNScrollOrder::HorizontalFirst;
             settings.fullscreen_smooth_page_scroll = true;
+            settings.fullscreen_bound_drag_pan = true;
             settings.fullscreen_n_scroll_step_percent = 50;
         }
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
-            // Include the smooth-scroll and ordered-step rows without cropping.
-            .with_size(egui::vec2(540.0, 340.0))
+            // Include the drag-bound explanation and all scroll rows without cropping.
+            .with_size(egui::vec2(540.0, 440.0))
             .build_ui(move |root_ui| {
                 crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
                     let ctx = &root_ui.ctx().clone();
@@ -11673,7 +11683,7 @@ mod fullscreen_in_page_scroll_setting_tests {
                         draw(ui, &mut settings);
                         assert!(
                             ui.min_rect().bottom() <= available_bottom,
-                            "the scroll settings must fit the 540x340 snapshot fixture: content={:?}, available_bottom={available_bottom}",
+                            "the scroll settings must fit the 540x440 snapshot fixture: content={:?}, available_bottom={available_bottom}",
                             ui.min_rect(),
                         );
                     });
@@ -11728,7 +11738,7 @@ mod fullscreen_in_page_scroll_setting_tests {
         use egui_kittest::kittest::Queryable;
 
         let mut harness = crate::test_ui::builder()
-            .with_size(egui::vec2(540.0, 340.0))
+            .with_size(egui::vec2(540.0, 440.0))
             .build_ui_state(
                 |root_ui, (settings, fonts_ready)| {
                     let ctx = &root_ui.ctx().clone();
