@@ -52,13 +52,16 @@ function selectTarget(info, tab) {
   }
   return { image, page, tab };
 }
-function exactRule(image, pageOrigin, tabNone) {
+function exactRule(image, pageOrigin, tabNone, extensionId) {
   return {
     id: RULE_ID, priority: 1,
     action: { type: "modifyHeaders", requestHeaders: [{ header: "Referer", operation: "set", value: `${pageOrigin}/` }] },
     condition: {
       regexFilter: `^${image.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
       isUrlFilterCaseSensitive: true, tabIds: [tabNone],
+      // TAB_ID_NONE also includes Web service workers. Match our own origin's
+      // host (the running extension ID), independent of the requested image host.
+      initiatorDomains: [extensionId],
       resourceTypes: ["xmlhttprequest"], requestMethods: ["get"]
     }
   };
@@ -184,7 +187,7 @@ function createWorker(api, fetchImage = globalThis.fetch, { maxFrameBytes = MAX_
     };
     try {
       await api.declarativeNetRequest.updateSessionRules({
-        removeRuleIds: [RULE_ID], addRules: [exactRule(target.image.href, target.page.origin, api.tabs.TAB_ID_NONE)]
+        removeRuleIds: [RULE_ID], addRules: [exactRule(target.image.href, target.page.origin, api.tabs.TAB_ID_NONE, api.runtime.id)]
       });
     } catch { throw new Failure("rule_failed"); }
     try {

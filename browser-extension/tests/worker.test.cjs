@@ -11,6 +11,7 @@ const {
 } = require("../worker.js");
 
 const root = path.resolve(__dirname, "../..");
+const storeIds = Object.values(JSON.parse(fs.readFileSync(path.join(root, "browser-extension/store-keys.json"), "utf8"))).map(store => store.id);
 const clone = value => structuredClone(value);
 const turn = () => new Promise(resolve => setImmediate(resolve));
 function deferred() {
@@ -75,6 +76,7 @@ function harness(options = {}) {
   const api = {
     i18n: { getMessage: key => key },
     runtime: {
+      id: storeIds[0],
       get lastError() { return callbackError; },
       onInstalled: event("installed"), onStartup: event("startup"),
       sendNativeMessage(host, message, fn) {
@@ -273,15 +275,73 @@ test("image links use exactly the shared Rust extension set, preserving selected
 
 test("exact DNR rule escapes regex syntax and matches only the initial URL and extension request", () => {
   const url = "https://img.example/a+b.(png)?size=1&other=[x]";
-  const rule = exactRule(url, "https://page.example", -1);
+  const rule = exactRule(url, "https://page.example", -1, storeIds[0]);
   const regex = new RegExp(rule.condition.regexFilter);
   assert.equal(regex.test(url), true);
   for (const other of [`${url}&extra=1`, url.replace("a+b", "aaab"), url.replace("img.example", "imgXexample"), `x${url}`]) assert.equal(regex.test(other), false, other);
   assert.deepEqual(rule, {
     id: RULE_ID, priority: 1,
     action: { type: "modifyHeaders", requestHeaders: [{ header: "Referer", operation: "set", value: "https://page.example/" }] },
-    condition: { regexFilter: rule.condition.regexFilter, isUrlFilterCaseSensitive: true, tabIds: [-1], resourceTypes: ["xmlhttprequest"], requestMethods: ["get"] }
+    condition: { regexFilter: rule.condition.regexFilter, isUrlFilterCaseSensitive: true, tabIds: [-1], initiatorDomains: [storeIds[0]], resourceTypes: ["xmlhttprequest"], requestMethods: ["get"] }
   });
+});
+
+// Only the condition subset used by this product. DNR domains match the
+// initiator's hostname (including subdomains), not the requested URL's host.
+function matchesImageRule(rule, request) {
+  const condition = rule.condition;
+  if (!condition.tabIds.includes(request.tabId) ||
+      !condition.requestMethods.includes(request.method.toLowerCase()) ||
+      !condition.resourceTypes.includes(request.type) ||
+      !new RegExp(condition.regexFilter, condition.isUrlFilterCaseSensitive ? "" : "i").test(request.url)) return false;
+  if (condition.initiatorDomains) {
+    let host;
+    try { host = new URL(request.initiator).hostname; } catch { return false; }
+    return condition.initiatorDomains.some(domain => host === domain || host.endsWith(`.${domain}`));
+  }
+  return true;
+}
+
+test("DNR excludes Web service workers at the same URL GET and TAB_ID_NONE", () => {
+  for (const extensionId of storeIds) {
+    const rule = exactRule(info.srcUrl, "https://page.example", -1, extensionId);
+    const own = { url: info.srcUrl, method: "GET", tabId: -1, type: "xmlhttprequest", initiator: `chrome-extension://${extensionId}` };
+    assert.equal(matchesImageRule(rule, own), true);
+    const unscoped = clone(rule);
+    delete unscoped.condition.initiatorDomains;
+    for (const initiator of ["https://page.example", "https://images.example"]) {
+      const web = { ...own, initiator };
+      assert.equal(matchesImageRule(unscoped, web), true, "the previous condition admits this Web request");
+      assert.equal(matchesImageRule(rule, web), false);
+    }
+    const otherId = storeIds.find(id => id !== extensionId);
+    for (const initiator of [`chrome-extension://${otherId}`, "null", undefined]) {
+      assert.equal(matchesImageRule(rule, { ...own, initiator }), false);
+    }
+    for (const changed of [{ tabId: 7 }, { method: "POST" }, { url: `${info.srcUrl}?other=1` }, { type: "image" }]) {
+      assert.equal(matchesImageRule(rule, { ...own, ...changed }), false);
+    }
+  }
+});
+
+test("admission scopes the live fetch rule to the running Chrome or Edge extension ID", async () => {
+  for (const extensionId of storeIds) {
+    const h = harness();
+    h.api.runtime.id = extensionId;
+    await h.worker.ready;
+    h.hooks.fetch = async url => {
+      const rule = h.rules().find(rule => rule.id === RULE_ID);
+      assert.deepEqual(rule.condition.initiatorDomains, [extensionId]);
+      const request = { url, method: "GET", tabId: -1, type: "xmlhttprequest", initiator: `chrome-extension://${extensionId}` };
+      assert.equal(matchesImageRule(rule, request), true);
+      assert.equal(matchesImageRule(rule, { ...request, initiator: "https://page.example" }), false);
+      return response();
+    };
+    await h.click();
+    assert.equal(h.native.length, 1);
+    assert.equal(h.titles.at(-1), "success");
+    assert.deepEqual(h.rules(), []);
+  }
 });
 
 test("one credentialed fetch is bracketed by DNR completion; redirect URL and only host schema are sent", async () => {

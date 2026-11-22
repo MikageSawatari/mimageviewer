@@ -758,6 +758,13 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
 - API 契約は Chrome の一次資料（[permissions](https://developer.chrome.com/docs/extensions/reference/api/permissions)、[DNR](https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest)、[scripting](https://developer.chrome.com/docs/extensions/reference/api/scripting)）でも確認した。Node のモックと ZIP 検査を、実 Chrome／Edge の許可 UI・Cookie・redirect・座標精度の証拠とはしない。ストアへの提出・公開と実機検証は別工程。
 - Node v22.16.0 の64テストは全件成功（`target/browser-extension/worker-tests.tap` に全テスト名と結果）。通常の `node --test` はこの実行環境で子プロセスの spawn が EPERM となったため、`--experimental-test-isolation=none` を付けて同じテストを実行した。PowerShell の package テストも成功（`target/browser-extension/package-test-results.txt`）。最終ソースの二つの ZIP は `target/browser-extension/` に生成済みで、対応するテスト生成物とバイト一致。Chrome ID は `fpppoodelfkddekjahhmalmmfdhbpdma`、Edge ID は `dlcbdkekoppppebnhhncghhglkkccdhk`。Rust・cargo・実登録・ブラウザ・mIV は実行していない。
 
+**段階8の独立レビュー P2 修正（2026-11-22、再レビュー待ち）**
+
+- `TAB_ID_NONE` だけでは Web の service worker の要求も含む。`exactRule` へ実行中の `chrome.runtime.id` を渡し、`initiatorDomains: [extensionId]` を追加した。URL完全一致・GET・resource type・タブ条件は維持し、Chrome／Edge の ID を製品コードへ固定しない。
+- 根拠となる Chrome の公式資料は、[拡張のネットワーク取得と独立した origin](https://developer.chrome.com/docs/extensions/develop/concepts/network-requests#extension-origin)、[拡張 origin の `chrome-extension://<ID>` 形式](https://developer.chrome.com/docs/extensions/how-to/web-platform/origin-trials#register-your-extension)、[initiator は要求の起点 origin](https://developer.chrome.com/docs/extensions/reference/api/webRequest#event-onBeforeRequest)、[DNR の initiatorDomains は要求先ではなく起点のドメインを照合する](https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest#property-RuleCondition-initiatorDomains)。これらの仕様の照合に基づき、拡張 service worker の fetch の起点の host が拡張 ID と一致すると判断した。DNR の[service worker との関係](https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest#interactions-with-service-workers)にも fetch が対象となることが明記されている。実ブラウザでの再現・適用確認とは区別する。
+- 条件オブジェクトの小さな matcher をテストに置き、同じ URL・GET・tabId=-1 でも Web 起点を除外すること、従来の条件だけなら一致すること、別拡張・起点なしも除外することを検査した。実際の click→fetch の規則も、提供された Chrome／Edge の両 ID で検査する。
+- Node は通常コマンドが環境の child spawn EPERM で開始できず、`--experimental-test-isolation=none` で66件すべて成功。ZIP検査も成功（両 ID・権限・locales・収録内容・再現性・ソース不変）。生成物はこの worktree の `target/browser-extension/package-test-c466e32f6d5a41a2a24b407083e67df6` 内だけ。Rust・cargo・コミット・実ブラウザ起動は行っていない。
+
 ### 段階9：公開文書と最終検証の引き渡し
 
 **範囲**
