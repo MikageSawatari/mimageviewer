@@ -15,7 +15,7 @@ F3・F4 統合後のポータブル文言・Counter・説明書の照合記録�
 
 | 配布形態 | ファイル名 | 中身 / 性質 | data 保存先 | 管理者権限 |
 | --- | --- | --- | --- | --- |
-| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + EPUB converter + MCP adapter + music-video editor + FFmpeg DLL + VC runtime + mIV Sound bundle を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
+| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + EPUB converter + MCP adapter + music-video editor + browser host + FFmpeg DLL + VC runtime + mIV Sound bundle を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
 | **インストーラ版** | `mImageViewer_setup.exe` | Inno Setup 出力 | `%APPDATA%\mimageviewer` | **要 (UAC)** |
 | **ポータブル版** (v1.1.0 新) | `mImageViewer_portable_v<VER>.zip` | loose-deps。署名済み VST3 host・mIV Sound (プラグイン PE も署名)・CRT 等を同梱、展開ゼロ | `<exe_dir>\data` (ユーザー VST 独自保存は除く) | 不要 |
 
@@ -27,7 +27,7 @@ F3・F4 統合後のポータブル文言・Counter・説明書の照合記録�
 - **Vector**: インストーラ (.exe) + `installer/readme.txt` (利用者向け説明書) を zip にまとめて申請。
   readme 同梱を Vector が要件化しているため、単体 exe やインストーラ単独での申請は不可。
 - **インストーラ**: Inno Setup 6（`installer/mimageviewer.iss`）
-- **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → remote → EPUB worker → MCP → editor → launcher → ISCC → portable を 1 コマンド、
+- **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → remote → EPUB worker → MCP → editor → browser host → launcher → ISCC → portable を 1 コマンド、
   stale 配布物を構造的に防ぐ)。開発中の素早い反復だけ `.\scripts\build-release.ps1` 単体を使う
   (配布用の clean／全体テストゲートがないので配布物には使わない)。
 - **出力先固定**: build-release／build-dist／build-portable／build-dev は開始前に実際の Cargo 実行場所・環境で `cargo metadata --format-version 1 --no-deps --offline` の `target_directory` と `build_directory` を固定出力先と照合し、不一致と `CARGO_BUILD_TARGET` を `-PreserveRuntime` に関係なく拒否する（`build_directory` 未出力時は `target_directory` と同じ扱い、portable 自身の固定 `--target-dir` は維持、設定ファイルの `build.target` は検査対象外）。
@@ -47,7 +47,8 @@ F3・F4 統合後のポータブル文言・Counter・説明書の照合記録�
   `dist\mImageViewer_portable_v<VER>.zip` を生成する。`portable` feature で native 依存
   (pdfium / onnxruntime / susie / vst3-host / VLM worker / モデル) を埋め込まず exe 隣から解決し、`data_dir` を
   `<exe_dir>\data` に向ける。launcher は使わず core を `mimageviewer.exe` にリネームし、
-  remote service・EPUB converter・`mimageviewer-mcp.exe`・music-video editor・`mimageviewer-vlm.exe` をその隣へ同梱。
+  remote service・EPUB converter・`mimageviewer-mcp.exe`・music-video editor・`mimageviewer-browser-host.exe`・`mimageviewer-vlm.exe` をその隣へ同梱。
+  browser host は署名して同梱するが、ポータブル版はブラウザ連携を登録できない (登録は既定のデータフォルダの mIV だけ)。
   VST3 host と mIV Sound bundle は v5 から署名して同梱する。配置は
   `<exe_dir>\effetune\mIV Sound.vst3`、host 用 CRT 4 本は `<exe_dir>\vcrt`。
   音響調整のボタン・設定・検索・About・自動表示・再生情報とユーザー VST を有効にする。
@@ -146,7 +147,38 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
    ソース、テスト、鍵の控えを変更せず、manifest・worker・座標用 script・ja/en の messages・4 サイズの icon だけを収録する。
    ZIP の順序・時刻・圧縮設定は固定。テストは 2 回の ZIP のバイト一致、権限・翻訳・収録内容とソース不変を検査する。
    `-OutputDirectory` はこの worktree の `target/browser-extension` 内だけ指定でき、junction 等への出力は拒否する。
-3. Chrome ウェブストアと Microsoft Edge アドオンへ、それぞれ対応する ZIP を提出する。
+3. **提出の前に、利用者のブラウザで通しの確認をする** (初回の提出と、拡張の動きを変えた更新のとき)。
+   モック・ZIP の検査では、実際のブラウザでの動作は確かめられない。
+   - 準備:
+     - 普段のプロファイルは使わず、試験用のプロファイルを使う。
+       Chrome は `chrome.exe --user-data-dir=C:\miv-test-v5\818\chrome-profile`、Edge は `msedge.exe --user-data-dir=C:\miv-test-v5\818\edge-profile` で起動する。
+     - 拡張機能のページで「デベロッパー モード」を ON にし、手順 2 の ZIP を展開したフォルダを「パッケージ化されていない拡張機能を読み込む」で読み込む。
+       Chrome には chrome 用、Edge には edge 用を読み込む。
+     - 表示された拡張の ID がストアの ID (Chrome `fpppoodelfkddekjahhmalmmfdhbpdma` / Edge `dlcbdkekoppppebnhhncghhglkkccdhk`) と同じことを確かめる。
+       違うと、mIV とつながらない。
+     - mIV は公開版 (または候補) の通常版で、環境設定 →「起動と連携」→「ブラウザ連携」を登録する。
+       保存先は試験用のフォルダ (例 `C:\miv-test-v5\818\images`) にする。
+   - ローカルの試験ページで、先に全部見る:
+     - `testpage\serve-test-page.ps1` で `http://127.0.0.1:8818/` を起動する。この PC の中だけで動き、受けた要求と Referer を表示する。
+       試験ページ一式は §1.818 の確認で作った `testpage\` (index.html・img・サーバ)。
+     - T1 (JPEG / PNG / WebP / GIF): 右クリック →「mIV で見る」で、ブラウザのページ部分に重なった mIV の窓で開く。
+       初回は、サイトへのアクセス許可の確認が出る。mIV が起動していなければ起動する。
+     - T2: 小さい画像から、リンク先の大きい画像 (2400×1800) が開く。
+     - T3: 参照元が要る画像が開き、サーバの行に `Referer=http://127.0.0.1:8818/` が出る。
+     - T4: 転送される画像が開く。`Get-Content -LiteralPath <保存したファイル> -Stream Zone.Identifier` で、
+       `HostUrl` が転送後の `/img/redir-g.png`、`ReferrerUrl` が試験ページになっている。
+     - T5: 文字や余白の右クリックには「mIV で見る」が出ない。
+     - サイトの許可を断ったとき、処理中に別の画像を選んだときに、拡張のアイコンに知らせが出る。
+     - mIV の窓を閉じる・Esc でブラウザへ戻れる。場所▼ の「ブラウザ閲覧」に、保存した月別フォルダが出る。
+     - Edge では T1・T3・T4 だけを繰り返す。
+   - 実サイトは 1 か所・1 枚だけ:
+     - ログイン不要で全年齢の公開ページを使う (例: `https://commons.wikimedia.org/wiki/Main_Page`)。
+     - ローカルで見た項目は繰り返さない。実サイトで新しく確かめるのは、HTTPS・CDN の転送・サイト独自のメニュー (Shift+右クリック) だけ。
+   - 後片付け:
+     - 保存した試験画像と、試験用のプロファイルのフォルダを削除する。
+     - 登録を残すかどうかは利用者が決める。
+     - 結果を記録し、NG があれば提出しない。
+4. Chrome ウェブストアと Microsoft Edge アドオンへ、それぞれ対応する ZIP を提出する。
    ストアの説明・権限ごとの理由・プライバシーの開示は
    [ブラウザ連携の設計 §9.6・§9.10・§11](browser-to-miv-plan.md) に合わせる。
    拡張の更新も審査を伴うので、本体の公開と切り離して扱う。拡張と native host の通信の版 `v` を先に進めず、
@@ -569,10 +601,10 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
 
 ### Phase 3: ビルド・配布成果物
 
-10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで全体テスト → clean → core → remote → EPUB worker → MCP → editor → launcher → ISCC → portable)。
+10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで全体テスト → clean → core → remote → EPUB worker → MCP → editor → browser host → launcher → ISCC → portable)。
     - build-dist.ps1 は Rust 全体テストを通してから
-      `cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor -p mimageviewer-launcher`
-      (+ `target-portable` の `-p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor`) してから実コンパイルするので、
+      `cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor -p mimageviewer-browser-host -p mimageviewer-launcher`
+      (+ `target-portable` の `-p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor -p mimageviewer-browser-host`) してから実コンパイルするので、
       cargo の偽 up-to-date 由来の **stale 配布物を構造的に防ぐ**
       ([docs/release-operations.md](release-operations.md) §2.1 参照)。内部で build-release.ps1 (常駐 mIV を自動停止して
       LNK1104 を回避) と build-portable.ps1 を子 PowerShell で呼び、各 `$LASTEXITCODE` を検査する。
