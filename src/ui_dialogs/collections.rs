@@ -5330,14 +5330,12 @@ fn draw_collection_remove_confirm(
                 ui.set_width(620.0_f32.min((ctx.content_rect().width() - 48.0).max(0.0)));
                 ui.heading("見つからない項目をすべて外す");
                 ui.label(format!("見つからない {count} 件の参照をコレクションから外します。"));
-                let row_height = ui.text_style_height(&egui::TextStyle::Body);
                 for path in sample_paths.iter().take(5) {
                     let full_path = path.display().to_string();
-                    ui.add_sized(
-                        [ui.available_width(), row_height],
-                        egui::Label::new(&full_path).truncate(),
-                    )
-                    .on_hover_text(full_path);
+                    // Left-aligned like the surrounding text; `add_sized` would center the
+                    // label inside its full-width slot. `truncate` keeps each path on one line.
+                    ui.add(egui::Label::new(&full_path).truncate())
+                        .on_hover_text(full_path);
                 }
                 let remaining = count.saturating_sub(sample_paths.len().min(5));
                 if remaining > 0 {
