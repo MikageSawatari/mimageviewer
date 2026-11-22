@@ -29,13 +29,17 @@ pub enum ShellOperationClassification {
 pub struct ShellItemCounts {
     pub processed: usize,
     pub failed: usize,
+    pub cancelled: usize,
     pub skipped: usize,
+    /// Diagnostic callback count, not a terminal item result.
+    pub pending: usize,
     pub first_failed_hresult: Option<i32>,
 }
 
 // Store signed HRESULT bits so worker results remain usable on non-Windows builds.
 const COPYENGINE_USER_CANCELLED: i32 = 0x80270000u32 as i32;
 const WIN32_CANCELLED: i32 = 0x800704C7u32 as i32;
+const COPYENGINE_PENDING: i32 = 0x0027000B;
 
 fn is_cancel_hresult(hr: i32) -> bool {
     matches!(hr, COPYENGINE_USER_CANCELLED | WIN32_CANCELLED)
@@ -156,6 +160,7 @@ struct ShellItemResult {
 
 #[derive(Default)]
 struct ShellItemResults {
+    total_callbacks: usize,
     counts: ShellItemCounts,
     details: Vec<ShellItemResult>,
 }
@@ -166,7 +171,13 @@ impl ShellItemResults {
         // COPYENGINE_S_DONT_PROCESS_CHILDREN (0x00270008) with a created item.
         // Count the callback's item presence, independently of parsing-name lookup.
         // https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifileoperationprogresssink-postmoveitem
-        if hresult < 0 {
+        self.total_callbacks += 1;
+        // Pending is provisional; a later callback supplies the item's result.
+        if hresult == COPYENGINE_PENDING {
+            self.counts.pending += 1;
+        } else if is_cancel_hresult(hresult) {
+            self.counts.cancelled += 1;
+        } else if hresult < 0 {
             self.counts.failed += 1;
             self.counts.first_failed_hresult.get_or_insert(hresult);
         } else if has_created {
@@ -183,7 +194,7 @@ impl ShellItemResults {
     }
 
     fn omitted(&self) -> usize {
-        self.counts.processed + self.counts.failed + self.counts.skipped - self.details.len()
+        self.total_callbacks - self.details.len()
     }
 }
 
@@ -217,6 +228,7 @@ impl ShellOperationLog {
     fn finish(&self, outcome: ShellTransferOutcome, items: &SharedShellItems) {
         let Self { prefix, id } = self;
         if let Ok(items) = items.lock() {
+            // Buffered item lines have the end-time log timestamp, not callback times.
             for item in &items.details {
                 crate::logger::log(format!(
                     "{prefix}: item id={id} kind={} source={:?} destination={:?} new_name={:?} hr=0x{:08X} created={:?}",
@@ -244,12 +256,14 @@ impl ShellOperationLog {
             None => "None".to_owned(),
         };
         crate::logger::log(format!(
-            "{prefix}: end id={id} classification={:?} perform=0x{:08X} abort={abort} processed={} failed={} skipped={} first_failed_hresult={first_failed}",
+            "{prefix}: end id={id} classification={:?} perform=0x{:08X} abort={abort} processed={} failed={} cancelled={} skipped={} pending={} first_failed_hresult={first_failed}",
             outcome.classification(),
             outcome.perform_hresult,
             outcome.counts.processed,
             outcome.counts.failed,
+            outcome.counts.cancelled,
             outcome.counts.skipped,
+            outcome.counts.pending,
         ));
     }
 }
@@ -1082,12 +1096,269 @@ mod transfer_tests {
         }
     }
 
+    fn record_callback(
+        items: &mut ShellItemResults,
+        kind: &'static str,
+        source: &str,
+        hr: i32,
+        has_created: bool,
+    ) {
+        items.count(hr, has_created);
+        let mut item = callback_item(hr);
+        item.kind = kind;
+        item.source = Some(source.to_owned());
+        item.created = has_created.then(|| format!("destination/{source}"));
+        items.record(item);
+    }
+
+    #[test]
+    fn shell_op_858_pending_then_cancel_counts_one_result_per_item() {
+        for (kind, rename) in [("Move", false), ("Rename", true)] {
+            for cancel in [COPYENGINE_USER_CANCELLED, WIN32_CANCELLED] {
+                let mut items = ShellItemResults::default();
+                record_callback(&mut items, kind, "locked-folder", COPYENGINE_PENDING, false);
+                assert_eq!(
+                    items.counts,
+                    ShellItemCounts {
+                        pending: 1,
+                        ..Default::default()
+                    }
+                );
+                record_callback(&mut items, kind, "locked-folder", cancel, false);
+                assert_eq!(
+                    items.counts,
+                    ShellItemCounts {
+                        cancelled: 1,
+                        pending: 1,
+                        ..Default::default()
+                    }
+                );
+                assert_eq!(items.total_callbacks, 2);
+                assert_eq!(items.details.len(), 2);
+                assert_eq!(items.details[0].source, items.details[1].source);
+                assert_eq!(items.details[0].hresult, COPYENGINE_PENDING);
+                assert_eq!(items.details[1].hresult, cancel);
+                assert_eq!(items.omitted(), 0);
+                let outcome = ShellTransferOutcome {
+                    perform_hresult: cancel,
+                    abort_query: Ok(true),
+                    counts: items.counts,
+                };
+                assert_eq!(
+                    outcome.classification(),
+                    ShellOperationClassification::Interrupted
+                );
+                assert_eq!(
+                    outcome.notice(rename).as_deref(),
+                    Some(if rename {
+                        "名前の変更は中断されました"
+                    } else {
+                        "操作が中断されました。移動・コピーした項目はありません"
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shell_op_858_pending_then_success_counts_only_final_item() {
+        for has_created in [false, true] {
+            let mut items = ShellItemResults::default();
+            record_callback(
+                &mut items,
+                "Move",
+                "folder",
+                COPYENGINE_PENDING,
+                has_created,
+            );
+            assert_eq!(
+                items.counts,
+                ShellItemCounts {
+                    pending: 1,
+                    ..Default::default()
+                }
+            );
+            record_callback(&mut items, "Move", "folder", 0x00270008, true);
+            assert_eq!(
+                items.counts,
+                ShellItemCounts {
+                    processed: 1,
+                    pending: 1,
+                    ..Default::default()
+                }
+            );
+            assert_eq!(items.details.len(), 2);
+            assert_eq!(items.omitted(), 0);
+        }
+    }
+
+    #[test]
+    fn shell_op_858_sub_pc2_partial_move_notice_excludes_cancel_failure() {
+        let mut items = ShellItemResults::default();
+        for (source, hr, has_created) in [
+            ("locked-folder", COPYENGINE_PENDING, false),
+            ("ok-folder", 0x00270008, true),
+            ("locked-folder", COPYENGINE_USER_CANCELLED, false),
+        ] {
+            record_callback(&mut items, "Move", source, hr, has_created);
+        }
+        assert_eq!(
+            items.counts,
+            ShellItemCounts {
+                processed: 1,
+                cancelled: 1,
+                pending: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(items.total_callbacks, 3);
+        assert_eq!(items.details.len(), 3);
+        let outcome = ShellTransferOutcome {
+            perform_hresult: COPYENGINE_USER_CANCELLED,
+            abort_query: Ok(true),
+            counts: items.counts,
+        };
+        assert_eq!(
+            outcome.notice(false).as_deref(),
+            Some(
+                "操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください"
+            )
+        );
+    }
+
+    #[test]
+    fn shell_op_858_cancel_mixed_with_real_failure_keeps_real_hresult() {
+        let failure = 0x80270027u32 as i32;
+        for cancel in [COPYENGINE_USER_CANCELLED, WIN32_CANCELLED] {
+            for (kind, rename) in [("Move", false), ("Rename", true)] {
+                for cancel_first in [false, true] {
+                    let mut items = ShellItemResults::default();
+                    for hr in if cancel_first {
+                        [cancel, failure]
+                    } else {
+                        [failure, cancel]
+                    } {
+                        record_callback(
+                            &mut items,
+                            kind,
+                            if hr == cancel {
+                                "cancelled-folder"
+                            } else {
+                                "failed-folder"
+                            },
+                            hr,
+                            false,
+                        );
+                    }
+                    assert_eq!(
+                        items.counts,
+                        ShellItemCounts {
+                            failed: 1,
+                            cancelled: 1,
+                            first_failed_hresult: Some(failure),
+                            ..Default::default()
+                        }
+                    );
+                    let outcome = ShellTransferOutcome {
+                        perform_hresult: cancel,
+                        abort_query: Ok(true),
+                        counts: items.counts,
+                    };
+                    let headline = if rename {
+                        "名前の変更は中断されました"
+                    } else {
+                        "操作が中断されました。移動・コピーした項目はありません"
+                    };
+                    assert_eq!(
+                        outcome.notice(rename).unwrap(),
+                        format!("{headline}\n失敗した項目: 1 件 (Shell: 0x80270027)")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shell_op_858_omitted_counts_pending_callbacks_beyond_detail_limit() {
+        let mut items = ShellItemResults::default();
+        for _ in 0..SHELL_ITEM_DETAIL_LIMIT + 3 {
+            record_callback(
+                &mut items,
+                "Move",
+                "locked-folder",
+                COPYENGINE_PENDING,
+                false,
+            );
+        }
+        assert_eq!(
+            items.counts,
+            ShellItemCounts {
+                pending: SHELL_ITEM_DETAIL_LIMIT + 3,
+                ..Default::default()
+            }
+        );
+        assert_eq!(items.details.len(), SHELL_ITEM_DETAIL_LIMIT);
+        assert_eq!(items.omitted(), 3);
+        record_callback(
+            &mut items,
+            "Move",
+            "locked-folder",
+            COPYENGINE_USER_CANCELLED,
+            false,
+        );
+        assert_eq!(items.counts.cancelled, 1);
+        assert_eq!(items.counts.failed, 0);
+        assert_eq!(items.counts.first_failed_hresult, None);
+        assert_eq!(items.total_callbacks, SHELL_ITEM_DETAIL_LIMIT + 4);
+        assert_eq!(items.omitted(), 4);
+    }
+
+    #[test]
+    fn shell_op_858_failed_notice_uses_only_first_real_failure() {
+        let failure = 0x80270027u32 as i32;
+        let other_failure = 0x80070005u32 as i32;
+        for cancel in [COPYENGINE_USER_CANCELLED, WIN32_CANCELLED] {
+            for rename in [false, true] {
+                let mut items = ShellItemResults::default();
+                record_callback(
+                    &mut items,
+                    "Move",
+                    "locked-folder",
+                    COPYENGINE_PENDING,
+                    false,
+                );
+                record_callback(&mut items, "Move", "locked-folder", cancel, true);
+                let mut outcome = ShellTransferOutcome {
+                    perform_hresult: other_failure,
+                    abort_query: Ok(false),
+                    counts: items.counts,
+                };
+                assert_eq!(
+                    outcome.classification(),
+                    ShellOperationClassification::Failed
+                );
+                assert_eq!(
+                    outcome.notice(rename).unwrap(),
+                    "操作を完了できませんでした。フォルダの内容を確認してください\nShell: 0x80070005、中断状態: 中断なし"
+                );
+                record_callback(&mut items, "Move", "other-folder", failure, false);
+                record_callback(&mut items, "Move", "last-folder", other_failure, false);
+                outcome.counts = items.counts;
+                assert_eq!(outcome.counts.first_failed_hresult, Some(failure));
+                assert_eq!(
+                    outcome.notice(rename).unwrap(),
+                    "操作を完了できませんでした。フォルダの内容を確認してください\nShell: 0x80070005、中断状態: 中断なし、項目: 0x80270027"
+                );
+            }
+        }
+    }
+
     #[test]
     fn shell_op_858_counts_only_completed_items_and_bounds_detail() {
         for hr in [
             0, 1, 0x00270001, 0x00270003, 0x00270004, 0x00270005, 0x00270006, 0x00270008,
-            0x0027000A, 0x0027000B, 0x0027000C, 0x0027000D, 0x0027000E, 0x0027000F, 0x00270010,
-            0x00270011, 0x0027FFFF,
+            0x0027000A, 0x0027000C, 0x0027000D, 0x0027000E, 0x0027000F, 0x00270010, 0x00270011,
+            0x0027FFFF,
         ] {
             for has_created in [false, true] {
                 let mut items = ShellItemResults::default();
@@ -1136,6 +1407,7 @@ mod transfer_tests {
                 skipped: 1,
                 failed: 2,
                 first_failed_hresult: Some(failure),
+                ..Default::default()
             }
         );
         assert_eq!(items.details.len(), SHELL_ITEM_DETAIL_LIMIT);
@@ -1208,6 +1480,7 @@ mod transfer_tests {
         use windows::Win32::Foundation::{ERROR_CANCELLED, S_OK};
         use windows::Win32::UI::Shell::*;
         assert_eq!(COPYENGINE_USER_CANCELLED, COPYENGINE_E_USER_CANCELLED.0);
+        assert_eq!(COPYENGINE_PENDING, COPYENGINE_S_PENDING.0);
         assert_eq!(
             WIN32_CANCELLED,
             windows::core::HRESULT::from_win32(ERROR_CANCELLED.0).0
@@ -1320,6 +1593,7 @@ mod transfer_tests {
                 failed: 3,
                 skipped: 1,
                 first_failed_hresult: Some(failure.0),
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -1358,6 +1632,30 @@ mod transfer_tests {
         assert_eq!(recorded.counts.first_failed_hresult, Some(failure.0));
         assert_eq!(recorded.details.len(), SHELL_ITEM_DETAIL_LIMIT);
         assert_eq!(recorded.omitted(), 2);
+        drop(recorded);
+        for hr in [
+            COPYENGINE_PENDING,
+            COPYENGINE_USER_CANCELLED,
+            WIN32_CANCELLED,
+        ] {
+            unsafe {
+                sink.PostMoveItem(0, none, none, PCWSTR::null(), HRESULT(hr), &created)
+                    .unwrap();
+                sink.PostCopyItem(0, none, none, PCWSTR::null(), HRESULT(hr), &created)
+                    .unwrap();
+                sink.PostRenameItem(0, none, PCWSTR::null(), HRESULT(hr), &created)
+                    .unwrap();
+            }
+        }
+        let recorded = items.lock().unwrap();
+        assert_eq!(recorded.counts.processed, 4);
+        assert_eq!(recorded.counts.failed, 4);
+        assert_eq!(recorded.counts.cancelled, 6);
+        assert_eq!(recorded.counts.skipped, 44);
+        assert_eq!(recorded.counts.pending, 3);
+        assert_eq!(recorded.counts.first_failed_hresult, Some(failure.0));
+        assert_eq!(recorded.total_callbacks, SHELL_ITEM_DETAIL_LIMIT + 11);
+        assert_eq!(recorded.omitted(), 11);
     }
 
     fn request(
@@ -1679,31 +1977,42 @@ mod transfer_tests {
         .join()
         .unwrap()
         .unwrap();
-        // Windows 11/NTFS with suppressed UI: perform=S_OK, abort=Ok(true),
-        // with one failed folder callback. The item failure is not the perform HR.
+        // The dev machine observed perform=S_OK and abort=Ok(true) with suppressed UI.
+        // Its raw item HRESULT is unknown; accept cancel or a real item failure.
         assert_eq!(
             outcome.classification(),
             ShellOperationClassification::Interrupted
         );
         assert_eq!(outcome.abort_query, Ok(true));
-        assert!(outcome.counts.failed > 0);
         assert_eq!(outcome.counts.processed, 0);
         let notice = outcome.notice(false).unwrap();
         assert!(notice.contains("移動・コピーした項目はありません"));
-        assert!(notice.lines().nth(1).unwrap().starts_with("失敗した項目: "));
         assert!(folder.is_dir());
         assert!(!destination.join("source").exists());
         let canonical_folder = std::fs::canonicalize(&folder).unwrap();
-        assert!(
-            items.lock().unwrap().details.iter().any(|item| {
+        let folder_hresult = items
+            .lock()
+            .unwrap()
+            .details
+            .iter()
+            .find(|item| {
                 item.kind == "Move"
                     && item.hresult < 0
                     && item.source.as_deref().is_some_and(|source| {
                         std::fs::canonicalize(source).ok().as_ref() == Some(&canonical_folder)
                     })
-            }),
-            "sink must record the failed folder, not just a child"
-        );
+            })
+            .map(|item| item.hresult)
+            .expect("sink must record the stopped folder, not just a child");
+        if is_cancel_hresult(folder_hresult) {
+            assert!(outcome.counts.cancelled >= 1);
+            assert_eq!(outcome.counts.failed, 0);
+            assert_eq!(outcome.counts.first_failed_hresult, None);
+            assert!(!notice.contains("失敗した項目"));
+        } else {
+            assert!(outcome.counts.failed >= 1);
+            assert!(notice.lines().nth(1).unwrap().starts_with("失敗した項目: "));
+        }
         drop(held);
         temp.close().unwrap();
     }
