@@ -1,6 +1,6 @@
 # MCP で使い方の案内と、設定の確認・変更 (§1.843) — 設計
 
-状態: **設計 (2026-11-21、同日に利用者の決定で改訂)。第 1 段を実装中 (2026-11-23〜、A 済み、B の実装を追加・共有 runner の検証待ち、C〜E は未着手)。収録は v5.7.0 以降 (v5.6.0 には入れない)**。
+状態: **設計 (2026-11-21、同日に利用者の決定で改訂)。第 1 段を実装済み (2026-11-23、区切り A〜E、`stack_script` を除く。`stack_script` は §1.863 が master に入ってから、§6.9)。収録は v5.7.0 以降 (v5.6.0 には入れない)**。
 基点は master `28f9c5a11`。行番号はこの基点のもの。実行時の挙動は誰も観測していない
 (この文書の根拠はコードと文書の参照だけ。実機で確かめる点は §14)。
 
@@ -1565,3 +1565,22 @@ P1 なし。指摘はすべて受け入れ、次の改訂 (§19.5) に入れた�
 `shell_execute_open` を表示ありで呼ぶ) を §6.9 に足した。
 
 レビューは 8 巡とも同じ thread (`01a1fdd4-631b-7341-98c6-005e5e8ab7b5`)・gpt-6.1-sol / xhigh・read-only。
+
+### 19.10 第 1 段の実装の独立レビュー (2026-11-23)
+
+実装 = Codex gpt-6.1-sol / high (thread `01a204b1-bb2d-7653-813f-2f0359077e4f`)、レビュー = 別の gpt-6.1-sol / xhigh
+(thread `01a204ce-a08a-76b1-a553-5c2de181b94d`、read-only)。ビルド・テストは設計担当が共有 runner で流した
+(実装担当は cargo を流さない、2026-11-20 の規則)。
+
+| 区切り | 対象 | 判定 | 指摘と対応 |
+| --- | --- | --- | --- |
+| A | `ef361e7d2`・`ee9236a03` | ACCEPT WITH CHANGES → 解消 | P2 検索語の長さ・語数に上限が無い → 200 字・8 語 (`a26b69796`)。P3 schema の `\s` と Rust の空白の違い → pattern を外す (`53dc6254d`) |
+| B | `1b441830d`・`296a6ec30` | ACCEPT | なし |
+| C | `aba243e71`・`3687e7f6d`・`d3cf10890` | ACCEPT WITH CHANGES → 解消 | P2 旧設定の `margin_fit_enabled` で Page が MarginFit に戻る、P2 関連付けから起動方法を変えたときも AI から戻せない旨を出す、P3 `set_settings` の `idempotentHint` を false に (`4100867be`) |
+| D (`set_favorite`) | `eb70ab4e7` | ACCEPT WITH CHANGES → 解消 | P2 登録済みのお気に入りにも実在を求めていた → 新規登録だけに (`dfac85dcd`) |
+| E | `5ad0b710b`・snapshot 更新 | ACCEPT | なし |
+
+実装中の設計担当の判断 (§6.4.2 に記録): `gamepad_enabled`・`creative_luts`・`ui_font` を第 2 段へ。OK のあとの後処理は
+第 2 段の理由にしない (Susie・VST3・AI バックエンドは第 1 段)。関連付けの外部ツールの削除・起動方法の変更は可、AI からは
+戻せない (応答に明記)。最終の検証 (`dfac85dcd`): agent-ipc + mcp 156/156、本体の関連 filter 774/774、ui_snapshot 266/266
+(AI 連携の窓 10 枚を目視のうえ更新)。本体 lib の全件は master への取り込みの後に統括が流す。
