@@ -937,3 +937,18 @@ Start-Process -FilePath .\target\release\mimageviewer.exe
 ### 段階 6 の実装 (2026-11-22、`25e5e464d`・`469145a42`) — ACCEPT
 
 1 回目 REVISE (P1: 月のフォルダの junction を介して管理領域へ保存できる、P2: 画像リンクの対象の形式と host の対応形式が食い違う、P3: 空行)。月のフォルダにも共有の判定をかけ、形式の表を `mimageviewer-capture-file` に 1 つにして解消、2 回目 ACCEPT。`build-release.ps1 -PreserveRuntime` (署名なし) 成功、host 15 件・共有部品 15 件・launcher 24 件 (段階 5 の分を含む)・本体 `runtime_cleanup` 23 件・`clipboard_capture` 123 件成功。`test-build-portable-source-fingerprint.ps1` は PowerShell 7 が無く未実行。
+
+### 段階 7 の実装 (2026-11-22〜23、`956a03ddf`・`51bf78a0d`・`f24782fa0`) — ACCEPT
+
+- 設計担当の修正 (レビュー前、`956a03ddf` に含む): 管理フォルダのパスの区切りが `/` 混じりで、アンインストーラの完全一致の比較に合わなかった (区切りを `\` だけにし、テストで固定)。junction を `symlink_metadata().is_dir()` で判定してファイルとして消そうとしていた (DIRECTORY 属性で判定)。settings_transfer の分類 (2 項目は移行しない)、検索索引の照合元、理由の文言の実装用語、環境設定の「拡張の入れ方 (マニュアル)」のリンク (統括の決定)。
+- 独立レビュー (GPT-6.1 Sol / xhigh、read-only) 第 1 回 REVISE: P1 = 登録・解除の結果を採用する前に通常終了でき、DB に古い `enabled` が残る (次回起動で登録し直され得る)。P2 = ★固定の注意文が実際の受付条件より広い。→ `51bf78a0d` で、登録の持ち主を root の終了受付に接続 (処理中は CancelClose し、採用・保存の後に 1 回だけ再開。トレイ退避は待たせない。受付を迂回した終了は `finish_for_exit` で結果を受け取ってから終了保存)、注意文を「保存先が固定の範囲の外にあると」に限定。
+- 第 2 回 REVISE (段階 9 と合わせて): P2 = 既定 OFF でも起動直後の終了を準備の完了まで待たせる。P2 = 復元モーダルが拒否した Close を登録の持ち主が後で再開し得る (`sidecar_restore.rs` の「拒否した Close は再生しない」に反する)。P2 (段階 9) = 公開チェックが存在しない英語マニュアルを要求。→ `f24782fa0` で、`PreparationEffect::{ReadOnly, MayUpdateRegistration}` により OFF の準備は終了を待たせず最終 fence でも受け取らない。拒否した Close は登録の持ち主に渡さない。チェックは日本語マニュアルと privacy の日英両節に統一。
+- 第 3 回: 段階 7・段階 9 とも ACCEPT (指摘なし)。既定 OFF の起動経路に新しい同期処理が無いことも確認された。
+- 設計担当の実行: 関連の filter 1088 passed (`f24782fa0`)、`ui_snapshot` 270 passed (新しい 4 件は目視)、glyph ok、`test-test-tools.ps1`・`test-installer-launcher-swap.ps1` PASS、lib 全件は `51bf78a0d` で 19694 passed (`f24782fa0` は実行中)。
+- 未確認: インストーラのアンインストール処理の実行、実機での登録・解除・起動経路 (サブ PC / ノート PC の確認で行う)。
+
+### 段階 9 の文書 (2026-11-22〜23、`c6ef521d9`・`f24782fa0`) — ACCEPT
+
+- 実装担当が新設した英語のマニュアル `en/manual/browser-integration.html` は、サイトに英語のマニュアルが無く孤立するため設計担当が外した。privacy.html の英語の節は日本語のマニュアルへリンクする。
+- `python scripts/test_public_privacy_scope.py` は 9 件中 2 件失敗だが、master でも同じ 2 件が失敗する既存の失敗 (今回の変更によるものではない)。`python scripts/check_site_cards.py` 53 cards ok。
+- 独立レビューは段階 7 の第 2 回・第 3 回と合わせて実施し、第 3 回で ACCEPT。
