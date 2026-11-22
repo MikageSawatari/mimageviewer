@@ -153,6 +153,10 @@ macro_rules! transfer_get {
     };
 }
 macro_rules! transfer_set {
+    ($s:expr, $f:ident, $v:expr, fit_mode) => {
+        $s.$f = *$v;
+        $s.margin_fit_enabled = matches!(*$v, FullscreenFitMode::MarginFit);
+    };
     ($s:expr, $f:ident, $v:expr, vst3_paths) => {
         stage1_set_vst3_paths($s, $v)
     };
@@ -180,6 +184,15 @@ macro_rules! assert_excluded_field {
     };
     ($before:expr, $after:expr, archive_convert_without_dialog) => {};
     ($before:expr, $after:expr, video_loop) => {};
+    ($before:expr, $after:expr, margin_fit_enabled) => {
+        // This excluded compatibility carrier follows an imported fit mode.
+        if $before.margin_fit_enabled != $after.margin_fit_enabled {
+            assert_eq!(
+                $after.margin_fit_enabled,
+                matches!($after.fullscreen_fit_mode, FullscreenFitMode::MarginFit)
+            );
+        }
+    };
     ($before:expr, $after:expr, $field:ident) => {
         assert_eq!(
             serde_json::to_value(&$before.$field).unwrap(),
@@ -454,7 +467,7 @@ preferences_policy! {
         spread_page_gap_px: u32 => ("見開きページ間隔", |v, _raw| (0..=200).contains(v), plain, plain);
         continuous_reading_gap_px: u32 => ("連結読書のページ間隔", |v, _raw| (0..=200).contains(v), plain, plain);
         fullscreen_image_margin_color: [u8; 3] => ("閲覧表示の余白色", |_, _| true, plain, plain);
-        fullscreen_fit_mode: FullscreenFitMode => ("閲覧表示のフィット方法", |v, _raw| FullscreenFitMode::all().contains(v), plain, plain);
+        fullscreen_fit_mode: FullscreenFitMode => ("閲覧表示のフィット方法", |v, _raw| FullscreenFitMode::all().contains(v), plain, fit_mode);
         fullscreen_page_start_position: FullscreenPageStartPosition => ("ページ切替後の表示位置", |v, _raw| FullscreenPageStartPosition::all().contains(v), plain, plain);
         fullscreen_specified_scale: FullscreenSpecifiedScale => ("指定サイズの幅・高さ", |v, _| v.is_valid(), specified_scale, specified_scale);
         fullscreen_specified_scale_max_tenths: u32 => ("指定サイズの最大倍率", |v, raw| raw.as_u64().is_some() && (FULLSCREEN_SPECIFIED_SCALE_MAX_MIN_TENTHS..=FULLSCREEN_SPECIFIED_SCALE_MAX_MAX_TENTHS).contains(v), plain, plain);

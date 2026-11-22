@@ -897,6 +897,9 @@ fn tool_description(tool: &crate::external_tool::ExternalTool, position: usize) 
         position + 1
     )
 }
+const ASSOCIATION_RESTORE_NOTICE: &str =
+    "AI 側からは復元できません。環境設定の画面で登録し直してください";
+
 fn external_tool_lines(
     before: &Vec<crate::external_tool::ExternalTool>,
     after: &Vec<crate::external_tool::ExternalTool>,
@@ -923,7 +926,20 @@ fn external_tool_lines(
                     new.display_name()
                 ),
                 tool_description(old, position),
-                tool_description(new, new_position),
+                if matches!(
+                    &old.launch,
+                    crate::external_tool::ExternalToolLaunch::Association { .. }
+                ) && !matches!(
+                    &new.launch,
+                    crate::external_tool::ExternalToolLaunch::Association { .. }
+                ) {
+                    format!(
+                        "{}。{ASSOCIATION_RESTORE_NOTICE}",
+                        tool_description(new, new_position)
+                    )
+                } else {
+                    tool_description(new, new_position)
+                },
             )),
             None => lines.push((
                 format!("外部ツールを削除: {}", old.display_name()),
@@ -932,7 +948,7 @@ fn external_tool_lines(
                     &old.launch,
                     crate::external_tool::ExternalToolLaunch::Association { .. }
                 ) {
-                    "AI 側からは復元できません。環境設定の画面で登録し直してください".into()
+                    ASSOCIATION_RESTORE_NOTICE.into()
                 } else {
                     String::new()
                 },
@@ -1474,6 +1490,28 @@ mod tests {
         let changed =
             stage1_validate(&legacy, &change("update_check_enabled", json!(true))).unwrap();
         assert_eq!(changed.gpu_memory_percent, u32::MAX);
+    }
+
+    #[test]
+    fn stage1_page_fit_clears_legacy_margin_fit_carrier() {
+        for mode in [FullscreenFitMode::Page, FullscreenFitMode::MarginFit] {
+            let mut legacy = default_settings();
+            legacy.fullscreen_fit_mode = mode;
+            legacy.margin_fit_enabled = true;
+            let mut imported = legacy.clone();
+            let report =
+                parse_items(&change("fullscreen_fit_mode", json!("Page"))).apply_to(&mut imported);
+            assert!(report.issues.is_empty());
+            assert_eq!(imported.fullscreen_fit_mode, FullscreenFitMode::Page);
+            assert!(!imported.margin_fit_enabled);
+            let mut candidate =
+                stage1_validate(&legacy, &change("fullscreen_fit_mode", json!("Page"))).unwrap();
+            assert_eq!(candidate.fullscreen_fit_mode, FullscreenFitMode::Page);
+            assert!(!candidate.margin_fit_enabled);
+            apply_load_time_migrations(&mut candidate);
+            assert_eq!(candidate.fullscreen_fit_mode, FullscreenFitMode::Page);
+            assert!(!candidate.margin_fit_enabled);
+        }
     }
     #[test]
     fn stage1_marked_edits_survive_the_preferences_live_state_merge() {

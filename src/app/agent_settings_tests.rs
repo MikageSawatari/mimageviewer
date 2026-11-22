@@ -544,6 +544,62 @@ fn agent_settings_association_deletion_explains_restore_limit_in_response_record
 }
 
 #[test]
+fn agent_settings_association_launch_change_explains_restore_limit_in_response_record_and_notice() {
+    use crate::external_tool::{ExternalTool, ExternalToolLaunch};
+    for executable in [false, true] {
+        let ctx = egui::Context::default();
+        let mut app = fixture(&ctx);
+        let mut tool = ExternalTool::defaults_for_viewing();
+        tool.name = "関連付けテスト".into();
+        tool.launch = ExternalToolLaunch::Association {
+            handler_id: "existing-handler".into(),
+        };
+        app.settings.external_tools = vec![tool.clone()];
+        assert!(app.settings.save_checked());
+        tool.launch = if executable {
+            ExternalToolLaunch::Executable(app.tmp.path().join("example.exe"))
+        } else {
+            ExternalToolLaunch::OsDefault
+        };
+        let result = app
+            .agent_set_settings(
+                &changes(json!({"external_tools":[tool.clone()]})),
+                "association-launch-change",
+                &ctx,
+            )
+            .unwrap();
+        assert_eq!(result.changed.len(), 1);
+        let change = &result.changed[0];
+        assert_eq!(change.rows.len(), 1);
+        let row = &change.rows[0];
+        assert!(row.item.contains("変更"));
+        assert!(row.after.contains("AI 側からは復元できません"));
+        assert!(row.after.contains("環境設定の画面で登録し直して"));
+        let ui = app.agent_changes.as_ref().unwrap();
+        let records = ui.controller.records();
+        assert_eq!(
+            records.lock().unwrap().entries()[0].rows[0].after,
+            row.after
+        );
+        assert!(ui.notices.try_recv().unwrap().contains(&row.after));
+        assert_eq!(app.settings.external_tools[0].launch, tool.launch);
+        assert_eq!(Settings::load().external_tools[0].launch, tool.launch);
+        assert_eq!(
+            app.agent_set_settings(
+                &changes(json!({"external_tools":change.before})),
+                "association-restore",
+                &ctx,
+            )
+            .unwrap_err()
+            .code,
+            ErrorCode::BadRequest
+        );
+        assert_eq!(app.settings.external_tools[0].launch, tool.launch);
+        assert_final_budget(&result);
+    }
+}
+
+#[test]
 fn agent_settings_vst_paths_commit_preserves_runtime_state_and_hides_it_from_wire() {
     let ctx = egui::Context::default();
     let mut app = fixture(&ctx);

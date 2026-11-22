@@ -836,7 +836,10 @@ mod tests {
             );
             assert_eq!(
                 tool["annotations"]["idempotentHint"],
-                tool["name"] != "create_collection"
+                !matches!(
+                    tool["name"].as_str().unwrap(),
+                    "create_collection" | "set_settings"
+                )
             );
             assert_eq!(tool["annotations"]["openWorldHint"], false);
             assert!(
