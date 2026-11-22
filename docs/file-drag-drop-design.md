@@ -887,10 +887,12 @@ ROOT の HWND を得た最初のフレームで、winit が登録した受け取
      sink の処理済み／失敗／skip を全件集計、詳細は50件まで `shell_transfer:` へ記録する。
      `COPYENGINE_S_PENDING` (`0x0027000B`) はログ用 pending のみとし、後続の確定 callback で一件を数える。
      確定報告なしなら未処理として数えず、元パスごとの管理表は作らない。途中報告も詳細行に残す。
+     `COPYENGINE_S_NOT_HANDLED` (`0x00270003`) / `COPYENGINE_S_MERGE` (`0x00270006`) は結合開始の途中報告としてログ用 merged のみを増やす。
+     既存の先 item を伴っても親を processed / skipped に数えず、子の callback の結果を使う (根拠: Wine shlfileop.c `notifications6`、上記の共通契約を参照)。
      中断コード (`0x80270000` / `0x800704C7`) は cancelled、その他の失敗 HRESULT は failed。
      その他の成功は作成後 item が非 null なら processed、null なら skipped。
      詳細上限を超えても同じ規則を使い、最初の実失敗 HRESULT (中断コードを除く) は結果と終端ログへ保持する。
-     終端ログには cancelled / pending も出し、省略数は pending を含む callback 総数から求める。
+     終端ログには cancelled / pending / merged も出し、省略数は途中報告を含む callback 総数から求める。
      項目行は終端でまとめて書くため、ログの時刻は終端時刻であり callback の発生時刻ではない。
      中断で実失敗項目 (`failed > 0`) がある場合だけ2行目に `失敗した項目: {n} 件 (Shell: 0x{hr:08X})` を追加し、中断コードだけなら見出しのみ。
      Failed の理由行は最初の実失敗 HRESULT が実行 HRESULT と異なる場合に `、項目: 0xHHHHHHHH` を末尾へ追加し、中断コードは項目理由に使わない。

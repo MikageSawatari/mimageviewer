@@ -33,6 +33,8 @@ pub struct ShellItemCounts {
     pub skipped: usize,
     /// Diagnostic callback count, not a terminal item result.
     pub pending: usize,
+    /// Merge-start callback count, not completed work on the parent.
+    pub merged: usize,
     pub first_failed_hresult: Option<i32>,
 }
 
@@ -40,6 +42,8 @@ pub struct ShellItemCounts {
 const COPYENGINE_USER_CANCELLED: i32 = 0x80270000u32 as i32;
 const WIN32_CANCELLED: i32 = 0x800704C7u32 as i32;
 const COPYENGINE_PENDING: i32 = 0x0027000B;
+const COPYENGINE_NOT_HANDLED: i32 = 0x00270003;
+const COPYENGINE_MERGE: i32 = 0x00270006;
 
 fn is_cancel_hresult(hr: i32) -> bool {
     matches!(hr, COPYENGINE_USER_CANCELLED | WIN32_CANCELLED)
@@ -156,6 +160,8 @@ struct ShellItemResult {
     new_name: Option<String>,
     hresult: i32,
     created: Option<String>,
+    #[cfg(test)]
+    has_created: bool,
 }
 
 #[derive(Default)]
@@ -175,6 +181,15 @@ impl ShellItemResults {
         // Pending is provisional; a later callback supplies the item's result.
         if hresult == COPYENGINE_PENDING {
             self.counts.pending += 1;
+        } else if matches!(hresult, COPYENGINE_MERGE | COPYENGINE_NOT_HANDLED) {
+            // Wine shlfileop.c notifications6 reports an existing merge parent
+            // before its children; the returned item does not establish work done.
+            // https://github.com/wine-mirror/wine/blob/master/dlls/shell32/tests/shlfileop.c
+            // Dev machine 2026-11-23: a same-volume merge Move reported 0x00270003 for
+            // the parent. A merge Copy reported S_OK with the existing parent, which is
+            // still counted as processed (errs toward "check the folder"); see
+            // docs/folder-tree-dnd-plan.md.
+            self.counts.merged += 1;
         } else if is_cancel_hresult(hresult) {
             self.counts.cancelled += 1;
         } else if hresult < 0 {
@@ -256,7 +271,7 @@ impl ShellOperationLog {
             None => "None".to_owned(),
         };
         crate::logger::log(format!(
-            "{prefix}: end id={id} classification={:?} perform=0x{:08X} abort={abort} processed={} failed={} cancelled={} skipped={} pending={} first_failed_hresult={first_failed}",
+            "{prefix}: end id={id} classification={:?} perform=0x{:08X} abort={abort} processed={} failed={} cancelled={} skipped={} pending={} merged={} first_failed_hresult={first_failed}",
             outcome.classification(),
             outcome.perform_hresult,
             outcome.counts.processed,
@@ -264,6 +279,7 @@ impl ShellOperationLog {
             outcome.counts.cancelled,
             outcome.counts.skipped,
             outcome.counts.pending,
+            outcome.counts.merged,
         ));
     }
 }
@@ -365,6 +381,8 @@ impl ShellResultSink_Impl {
             },
             hresult: hr.0,
             created: shell_item_parsing_name(created.as_ref()),
+            #[cfg(test)]
+            has_created,
         };
         if let Ok(mut items) = self.items.lock() {
             items.record(item);
@@ -1093,6 +1111,7 @@ mod transfer_tests {
             new_name: None,
             hresult: hr,
             created: None,
+            has_created: false,
         }
     }
 
@@ -1108,6 +1127,7 @@ mod transfer_tests {
         item.kind = kind;
         item.source = Some(source.to_owned());
         item.created = has_created.then(|| format!("destination/{source}"));
+        item.has_created = has_created;
         items.record(item);
     }
 
@@ -1354,11 +1374,116 @@ mod transfer_tests {
     }
 
     #[test]
+    fn shell_op_858_merge_parent_then_child_cancel_has_no_processed_items() {
+        for parent_hr in [COPYENGINE_NOT_HANDLED, COPYENGINE_MERGE] {
+            for kind in ["Move", "Copy"] {
+                for has_created in [false, true] {
+                    let mut items = ShellItemResults::default();
+                    record_callback(&mut items, kind, "m", parent_hr, has_created);
+                    assert_eq!(
+                        items.counts,
+                        ShellItemCounts {
+                            merged: 1,
+                            ..Default::default()
+                        }
+                    );
+                    record_callback(
+                        &mut items,
+                        kind,
+                        "m/a.txt",
+                        COPYENGINE_USER_CANCELLED,
+                        false,
+                    );
+                    assert_eq!(
+                        items.counts,
+                        ShellItemCounts {
+                            merged: 1,
+                            cancelled: 1,
+                            ..Default::default()
+                        }
+                    );
+                    assert_eq!(items.total_callbacks, 2);
+                    assert_eq!(items.details.len(), 2);
+                    assert_eq!(items.omitted(), 0);
+                    let outcome = ShellTransferOutcome {
+                        perform_hresult: COPYENGINE_USER_CANCELLED,
+                        abort_query: Ok(true),
+                        counts: items.counts,
+                    };
+                    assert_eq!(
+                        outcome.notice(false).as_deref(),
+                        Some("操作が中断されました。移動・コピーした項目はありません")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shell_op_858_merge_parent_then_child_processed_counts_only_child() {
+        for parent_hr in [COPYENGINE_NOT_HANDLED, COPYENGINE_MERGE] {
+            for (kind, child_hr) in [("Move", 0x00270008), ("Copy", 0)] {
+                let mut items = ShellItemResults::default();
+                record_callback(&mut items, kind, "m", parent_hr, true);
+                record_callback(&mut items, kind, "m/a.txt", child_hr, true);
+                assert_eq!(
+                    items.counts,
+                    ShellItemCounts {
+                        merged: 1,
+                        processed: 1,
+                        ..Default::default()
+                    }
+                );
+                assert_eq!(items.total_callbacks, 2);
+                assert_eq!(items.details.len(), 2);
+                assert_eq!(items.omitted(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn shell_op_858_pending_then_real_failure_counts_only_failure() {
+        let failure = 0x80270027u32 as i32;
+        let mut items = ShellItemResults::default();
+        record_callback(&mut items, "Move", "m/a.txt", COPYENGINE_PENDING, false);
+        record_callback(&mut items, "Move", "m/a.txt", failure, false);
+        assert_eq!(
+            items.counts,
+            ShellItemCounts {
+                pending: 1,
+                failed: 1,
+                first_failed_hresult: Some(failure),
+                ..Default::default()
+            }
+        );
+        assert_eq!(items.total_callbacks, 2);
+        assert_eq!(items.details.len(), 2);
+        assert_eq!(items.omitted(), 0);
+    }
+
+    #[test]
+    fn shell_op_858_pending_then_success_without_created_counts_only_skip() {
+        let mut items = ShellItemResults::default();
+        record_callback(&mut items, "Copy", "m/a.txt", COPYENGINE_PENDING, false);
+        record_callback(&mut items, "Copy", "m/a.txt", 0, false);
+        assert_eq!(
+            items.counts,
+            ShellItemCounts {
+                pending: 1,
+                skipped: 1,
+                ..Default::default()
+            }
+        );
+        assert_eq!(items.total_callbacks, 2);
+        assert_eq!(items.details.len(), 2);
+        assert_eq!(items.omitted(), 0);
+    }
+
+    #[test]
     fn shell_op_858_counts_only_completed_items_and_bounds_detail() {
         for hr in [
-            0, 1, 0x00270001, 0x00270003, 0x00270004, 0x00270005, 0x00270006, 0x00270008,
-            0x0027000A, 0x0027000C, 0x0027000D, 0x0027000E, 0x0027000F, 0x00270010, 0x00270011,
-            0x0027FFFF,
+            0, 1, 0x00270001, 0x00270004, 0x00270005, 0x00270008, 0x0027000A, 0x0027000C,
+            0x0027000D, 0x0027000E, 0x0027000F, 0x00270010, 0x00270011, 0x0027FFFF,
         ] {
             for has_created in [false, true] {
                 let mut items = ShellItemResults::default();
@@ -1400,18 +1525,21 @@ mod transfer_tests {
         items.count(0, false);
         items.count(failure, false);
         items.count(0x80070005u32 as i32, true);
+        items.count(COPYENGINE_MERGE, true);
+        items.count(COPYENGINE_NOT_HANDLED, false);
         assert_eq!(
             items.counts,
             ShellItemCounts {
                 processed: SHELL_ITEM_DETAIL_LIMIT + 1,
                 skipped: 1,
                 failed: 2,
+                merged: 2,
                 first_failed_hresult: Some(failure),
                 ..Default::default()
             }
         );
         assert_eq!(items.details.len(), SHELL_ITEM_DETAIL_LIMIT);
-        assert_eq!(items.omitted(), 4);
+        assert_eq!(items.omitted(), 6);
         let skipped = ShellTransferOutcome {
             perform_hresult: 0,
             abort_query: Ok(true),
@@ -1481,6 +1609,8 @@ mod transfer_tests {
         use windows::Win32::UI::Shell::*;
         assert_eq!(COPYENGINE_USER_CANCELLED, COPYENGINE_E_USER_CANCELLED.0);
         assert_eq!(COPYENGINE_PENDING, COPYENGINE_S_PENDING.0);
+        assert_eq!(COPYENGINE_NOT_HANDLED, COPYENGINE_S_NOT_HANDLED.0);
+        assert_eq!(COPYENGINE_MERGE, COPYENGINE_S_MERGE.0);
         assert_eq!(
             WIN32_CANCELLED,
             windows::core::HRESULT::from_win32(ERROR_CANCELLED.0).0
@@ -1637,6 +1767,8 @@ mod transfer_tests {
             COPYENGINE_PENDING,
             COPYENGINE_USER_CANCELLED,
             WIN32_CANCELLED,
+            COPYENGINE_MERGE,
+            COPYENGINE_NOT_HANDLED,
         ] {
             unsafe {
                 sink.PostMoveItem(0, none, none, PCWSTR::null(), HRESULT(hr), &created)
@@ -1653,9 +1785,10 @@ mod transfer_tests {
         assert_eq!(recorded.counts.cancelled, 6);
         assert_eq!(recorded.counts.skipped, 44);
         assert_eq!(recorded.counts.pending, 3);
+        assert_eq!(recorded.counts.merged, 6);
         assert_eq!(recorded.counts.first_failed_hresult, Some(failure.0));
-        assert_eq!(recorded.total_callbacks, SHELL_ITEM_DETAIL_LIMIT + 11);
-        assert_eq!(recorded.omitted(), 11);
+        assert_eq!(recorded.total_callbacks, SHELL_ITEM_DETAIL_LIMIT + 17);
+        assert_eq!(recorded.omitted(), 17);
     }
 
     fn request(
@@ -1935,6 +2068,116 @@ mod transfer_tests {
         assert!(copy.unwrap_err().contains("フォルダ自身またはその配下"));
         assert!(moved.unwrap_err().contains("フォルダ自身またはその配下"));
         assert_eq!(aliased_source.unwrap().sources, vec![alias]);
+    }
+
+    /// Print raw callbacks without requiring a particular merge-start HRESULT.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Windows Shell/environment dependent; suppressed UI, disposable temp data"]
+    fn shell_op_858_real_merge_into_existing_folder_records_callbacks() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        use windows::Win32::UI::Shell::{FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT};
+
+        for (case, operation, locked) in [
+            ("a-move", ShellTransferOperation::Move, false),
+            ("b-locked-move", ShellTransferOperation::Move, true),
+            ("c-copy", ShellTransferOperation::Copy, false),
+        ] {
+            let temp = tempfile::Builder::new()
+                .prefix("miv-shell-op-858-merge-")
+                .tempdir_in(std::env::temp_dir())
+                .unwrap();
+            let source_folder = temp.path().join("src/m");
+            let destination = temp.path().join("dst");
+            let destination_folder = destination.join("m");
+            std::fs::create_dir_all(&source_folder).unwrap();
+            std::fs::create_dir_all(&destination_folder).unwrap();
+            let source_file = source_folder.join("a.txt");
+            let destination_file = destination_folder.join("a.txt");
+            let existing_file = destination_folder.join("b.txt");
+            std::fs::write(&source_file, b"a contents").unwrap();
+            std::fs::write(&existing_file, b"b contents").unwrap();
+            let held = locked.then(|| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(FILE_SHARE_READ.0)
+                    .open(&source_file)
+                    .unwrap()
+            });
+            let items = std::sync::Arc::new(std::sync::Mutex::new(ShellItemResults::default()));
+            let worker_items = items.clone();
+            let input = validate_transfer_request(request(
+                operation,
+                vec![source_folder.clone()],
+                destination,
+            ))
+            .unwrap();
+            let outcome = std::thread::spawn(move || {
+                run_transfer_items_with_flags(
+                    0,
+                    input,
+                    operation,
+                    transfer_flags() | FOF_NOERRORUI | FOF_NOCONFIRMATION | FOF_SILENT,
+                    worker_items,
+                )
+            })
+            .join()
+            .unwrap();
+            drop(held);
+            {
+                let recorded = items.lock().unwrap();
+                for item in &recorded.details {
+                    let source_name = item
+                        .source
+                        .as_deref()
+                        .and_then(|source| std::path::Path::new(source).file_name());
+                    eprintln!(
+                        "shell_op_858_merge: case={case} kind={} hr=0x{:08X} has_created={} source_file_name={source_name:?}",
+                        item.kind, item.hresult, item.has_created,
+                    );
+                }
+            }
+            eprintln!("shell_op_858_merge: case={case} outcome={outcome:?}");
+            let outcome = outcome.unwrap();
+            assert_eq!(
+                std::fs::read(&existing_file).unwrap(),
+                b"b contents",
+                "{case}"
+            );
+            if locked {
+                assert_eq!(
+                    std::fs::read(&source_file).unwrap(),
+                    b"a contents",
+                    "{case}"
+                );
+                assert!(!destination_file.exists(), "{case}");
+                assert_eq!(outcome.counts.processed, 0, "{case}: {outcome:?}");
+                assert_ne!(
+                    outcome.classification(),
+                    ShellOperationClassification::Completed,
+                    "{case}"
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read(&destination_file).unwrap(),
+                    b"a contents",
+                    "{case}"
+                );
+                if operation == ShellTransferOperation::Copy {
+                    assert_eq!(
+                        std::fs::read(&source_file).unwrap(),
+                        b"a contents",
+                        "{case}"
+                    );
+                } else {
+                    assert!(!source_folder.exists(), "{case}");
+                }
+                assert!(outcome.counts.processed >= 1, "{case}: {outcome:?}");
+                assert_eq!(outcome.counts.failed, 0, "{case}: {outcome:?}");
+            }
+            temp.close().unwrap();
+        }
     }
 
     #[cfg(windows)]

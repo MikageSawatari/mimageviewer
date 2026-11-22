@@ -272,18 +272,32 @@ Interrupted と別の実行失敗が同時にある場合、その HRESULT も�
 callback は失敗の HRESULT を受けても常に S_OK を返す。フォルダの子の callback も全件集計し、詳細は先頭50件と省略数に限定する。
 `COPYENGINE_S_PENDING` (`0x0027000B`) は未処理の途中報告であり、ログ用 pending だけを増やし、確定結果の processed / failed / cancelled / skipped には数えない。
 後続の同じ元の確定 callback で一件を数える。確定報告が来なければ未処理として数えない。元パスをキーにした管理表は作らず、途中報告も詳細行へ残す。
+`COPYENGINE_S_NOT_HANDLED` (`0x00270003`) / `COPYENGINE_S_MERGE` (`0x00270006`) も結合開始の途中報告としてログ用 merged のみを増やす。
+作成後 item が既存の先フォルダを指していても、親を processed / skipped に数えず、子の callback で結果を数える。
+根拠は [Wine の shlfileop.c `notifications6`](https://github.com/wine-mirror/wine/blob/master/dlls/shell32/tests/shlfileop.c) が示す親の報告→子の処理の順序。
 中断 HRESULT (`0x80270000` / `0x800704C7`) は cancelled、その他の失敗 HRESULT は failed、その他の成功 HRESULT は
 callback の作成後 item (`psiNewlyCreated`) が非 null なら processed、null なら skipped に数える。
 parsing name の取得成否ではなく item の有無を使い、詳細上限を超えた callback と名前変更も同じ規則で数える。
 最初の実失敗 (中断コードを除く) HRESULT は詳細上限に関係なく `first_failed_hresult` に保持する。
-省略数は確定結果の合計ではなく、pending も含む callback 総数から詳細保持数を引いて求める。
+省略数は確定結果の合計ではなく、pending / merged も含む callback 総数から詳細保持数を引いて求める。
 2026-11-22 設計担当の Windows 11 / NTFS 実 Shell 観測では、完了した同一ボリューム Move が
 `COPYENGINE_S_DONT_PROCESS_CHILDREN` (`0x00270008`) と作成後 item を返したため、成功コードの列挙で処理済みを判定しない。
 また、使用中フォルダの Move は試験用 UI 抑止時に実行 HRESULT が S_OK、中断照会が `Ok(true)`、項目 callback が失敗だった。
-確定結果は確定 callback の件数、pending は途中報告の件数であり、要求した source 件数とは限らない。まれな記録失敗はログで終え、回復機構は作らない。
+確定結果は確定 callback の件数、pending / merged は途中報告の件数であり、要求した source 件数とは限らない。まれな記録失敗はログで終え、回復機構は作らない。
 
 2026-11-23 sub-PC2 の実アプリ確認 (c4db2bbd3) では、Windows の使用中画面を閉じる操作の後、同じ元の pending → 中断の2報告を観測した。
 pending を確定結果から除き、中断を実失敗と分ける。名前変更も同じ規則。
+
+結合時の本機の生 callback 列は ignored の `shell_op_858_real_merge_into_existing_folder_records_callbacks` で確認する。
+正常 Move、子ファイルを FILE_SHARE_READ だけで開いた Move、正常 Copy の3ケースを出力し、特定の結合コードの出現は要求しない。
+2026-11-23 に開発機 (Windows 11、NTFS、同じボリューム、エラー画面を出さない試験用フラグ) で流した結果 (設計担当が run-heavy で実行、製品は起動していない):
+- 正常 Move: 親 `m` が `0x00270003` + 先 item あり、子 `a.txt` が `0x00270008` + 先 item あり → merged=1、processed=1。
+- 子を開いたままの Move: 親 `m` が `0x80270027` + 先 item なしの 1 報告だけ → failed=1、processed=0、中断状態 true。
+- 正常 Copy: 親 `m` も子 `a.txt` も `0x00000000` + 先 item あり → processed=2。
+
+残る限界: Copy の結合では、既存の親フォルダも `S_OK` + 先 item で報告されるため、新しく作ったフォルダと区別できず processed に数える。
+子のコピーが止まった場合は、何も増えていなくても「一部の項目は処理済みです。フォルダの内容を確認してください」になり得る。
+これは「確認を促す」側への誤りなので、追加の判定 (フォルダの事前存在の確認など) は足さない。逆向きの誤り (処理済みがあるのに「ありません」) は作らない。
 
 ログ形式 (`prefix` は `shell_transfer` / `shell_rename`、id はプロセス内共通の連番、文字列は Debug 表記):
 項目行は終端でまとめて書くため、ログの時刻は終端時刻であり callback の発生時刻ではない。
@@ -292,7 +306,7 @@ pending を確定結果から除き、中断を実失敗と分ける。名前変
 {prefix}: start id={id} requested={Copy|Move|Rename} resolved={Copy|Move|Rename} sources={count} destination={path:?}
 {prefix}: item id={id} kind={Copy|Move|Rename} source={Option<String>:?} destination={Option<String>:?} new_name={Option<String>:?} hr=0x{HRESULT:08X} created={Option<String>:?}
 {prefix}: item id={id} ... and {omitted} more
-{prefix}: end id={id} classification={Completed|Interrupted|Failed} perform=0x{HRESULT:08X} abort={Ok(true)|Ok(false)|Err(0xHHHHHHHH)} processed={count} failed={count} cancelled={count} skipped={count} pending={count} first_failed_hresult={0xHHHHHHHH|None}
+{prefix}: end id={id} classification={Completed|Interrupted|Failed} perform=0x{HRESULT:08X} abort={Ok(true)|Ok(false)|Err(0xHHHHHHHH)} processed={count} failed={count} cancelled={count} skipped={count} pending={count} merged={count} first_failed_hresult={0xHHHHHHHH|None}
 ```
 
 開始行は全件予約後、実行直前に出す。requested は volume check 前、resolved は後の操作。名前変更は両方 Rename、先は元の親。
@@ -301,7 +315,7 @@ pending を確定結果から除き、中断を実失敗と分ける。名前変
 - Interrupted、処理済みあり: 「操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください」
 - Interrupted、処理済みなし: 「操作が中断されました。移動・コピーした項目はありません」(名前変更: 「名前の変更は中断されました」)
 - Interrupted、実失敗項目あり (`failed > 0`): 2行目に `失敗した項目: {n} 件 (Shell: 0x{hr:08X})` (最初の実失敗 HRESULT) を追加する。
-  中断コードだけなら見出しのみで、pending / cancelled の件数や失敗行を出さない。
+  中断コードだけなら見出しのみで、pending / merged / cancelled の件数や失敗行を出さない。
 - Failed: 「操作を完了できませんでした。フォルダの内容を確認してください」。処理済みありなら同じ行に「一部の項目は処理済みです」を続ける。
   次行は `Shell: 0xHHHHHHHH、中断状態: 中断あり / 中断なし / 照会失敗 0xHHHHHHHH`。
   最初の実失敗 HRESULT が実行 HRESULT と異なる場合は `、項目: 0xHHHHHHHH` を理由行の末尾へ追加する。中断コードはこの項目理由に使わない。

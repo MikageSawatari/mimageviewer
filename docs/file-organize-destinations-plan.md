@@ -146,13 +146,15 @@ App が持つ新しい状態は、この機能の一つの request owner（非�
 `PostMoveItem / PostCopyItem` sink が元の parsing name・先フォルダ・新名・HRESULT・作成後の parsing name を記録し、常に S_OK を返す。
 `COPYENGINE_S_PENDING` (`0x0027000B`) は途中報告なのでログ用 pending のみを増やし、後続の確定 callback で一件を数える。
 確定報告が来ない項目は数えず、元パスごとの管理表は作らない。途中報告も詳細行に残す。
+`COPYENGINE_S_NOT_HANDLED` (`0x00270003`) / `COPYENGINE_S_MERGE` (`0x00270006`) は結合開始の途中報告としてログ用 merged のみを増やす。
+既存の先 item を伴っても親を processed / skipped に数えず、子の callback の結果を使う (根拠: Wine shlfileop.c `notifications6`、詳細は下記の共通契約)。
 中断コード (`0x80270000` / `0x800704C7`) は cancelled、その他の失敗 HRESULT は failed。
 その他の成功 HRESULT は作成後 item が非 null なら processed、null なら skipped に数える。
 名前取得の成否ではなく callback の item の有無を使い、詳細上限を超えても全件に適用する。
 設計担当の Windows 11 / NTFS 実 Shell 観測 (2026-11-22) では完了した Move が `0x00270008` と作成後 item を返した。
 最初の実失敗 HRESULT (中断コードを除く) は `first_failed_hresult` として結果と終端ログに残す。
 callback 全件を集計し、詳細は50件と省略数まで `shell_transfer:` の開始／項目別／終端ログに残す。
-終端ログには cancelled / pending も出し、省略数は pending を含む callback 総数から求める。
+終端ログには cancelled / pending / merged も出し、省略数は途中報告を含む callback 総数から求める。
 項目行は終端でまとめて書くため、ログの時刻は終端時刻であり callback の発生時刻ではない。
 共通 id、requested/resolved 操作、source 件数、先、実行 HRESULT、中断照会結果、各件数の形式は
 [Shell 終端契約](folder-tree-dnd-plan.md#81-1858-a-shell-転送名前変更の終端契約) を正本とする。
