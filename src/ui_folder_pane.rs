@@ -4,8 +4,11 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::folder_pane::{
-    self, FolderPaneActivation, FolderPaneCommand, FolderPaneCursorScroll, FolderPaneLabelDisplay,
-    FolderPaneLabelResult, FolderPaneLabelWidgets, FolderPaneListingOptions, FolderPaneTreeKey,
+    self, FolderPaneActivation, FolderPaneCommand, FolderPaneCursorScroll,
+    FolderPaneGestureContinuationGate as ContinuationGate,
+    FolderPaneGestureInputDiscard as InputDiscard, FolderPaneGestureReset as GestureReset,
+    FolderPaneLabelDisplay, FolderPaneLabelResult, FolderPaneLabelWidgets,
+    FolderPaneListingOptions, FolderPaneTreeKey,
 };
 use crate::ui_main::AddressBarNav;
 
@@ -321,6 +324,22 @@ fn show_folder_pane_paste_menu(
     selected
 }
 
+fn folder_pane_has_label_input_to_discard(ctx: &egui::Context) -> bool {
+    ctx.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(
+                event,
+                egui::Event::PointerButton { .. }
+                    | egui::Event::WindowFocused(false)
+                    | egui::Event::Touch {
+                        phase: egui::TouchPhase::Cancel,
+                        ..
+                    }
+            )
+        })
+    })
+}
+
 impl App {
     /// Observe ROOT before sidecar restore discards semantic input and pointer history.
     pub(crate) fn begin_folder_pane_label_input(&mut self, ctx: &egui::Context) {
@@ -329,10 +348,29 @@ impl App {
             FolderPanePointerSource as Source,
         };
         if ctx.viewport_id() != egui::ViewportId::ROOT {
+            // No input to discard on an idle repaint of a sibling viewport.
+            if folder_pane_has_label_input_to_discard(ctx) {
+                self.folder_pane.log_label_input_discard(
+                    InputDiscard::NonRootViewport,
+                    ctx.cumulative_pass_nr(),
+                    ctx.input(|input| input.time),
+                    format_args!("viewport={:?}", ctx.viewport_id()),
+                );
+            }
             return;
         }
         let pass = ctx.cumulative_pass_nr();
+        let diagnostic_time = ctx.input(|input| input.time);
+        self.folder_pane.set_label_diagnostic_time(diagnostic_time);
         if !self.folder_pane.begin_label_input(pass) {
+            if folder_pane_has_label_input_to_discard(ctx) {
+                self.folder_pane.log_label_input_discard(
+                    InputDiscard::PassAlreadyRecognized,
+                    pass,
+                    diagnostic_time,
+                    format_args!(""),
+                );
+            }
             return;
         }
         // Provenance observes even a hidden/disabled interval without driving the grid.
@@ -344,11 +382,16 @@ impl App {
             .as_ref()
             .is_some_and(|display| display.pass.checked_add(1) == Some(pass));
         if !visible || !fresh {
-            self.folder_pane.invalidate_label_display();
+            self.folder_pane.invalidate_label_display(if !visible {
+                GestureReset::DisplayNotVisible
+            } else {
+                GestureReset::DisplayNotFresh
+            });
             return;
         }
         if !self.folder_pane.has_focus && self.folder_pane.label_gesture_requires_tree_focus() {
-            self.folder_pane.clear_label_click();
+            self.folder_pane
+                .clear_label_click(GestureReset::TreeFocusLost);
         }
         // Actual tree-key execution stays at its old checkpoint; only end the
         // old mouse gesture before recognizing this batch's new pointer input.
@@ -384,12 +427,17 @@ impl App {
                 })
             })
         {
-            self.folder_pane.clear_label_click();
+            self.folder_pane
+                .clear_label_click(GestureReset::TreeKeyPressed);
         }
         let start_allowed = !self.main_chrome_pointer_blocked();
         let continue_allowed = !self.main_chrome_pointer_blocked_except_sidecar_restore();
         if !continue_allowed {
-            self.folder_pane.clear_label_click();
+            let reason = self.folder_pane_continuation_block_diagnostic();
+            self.folder_pane
+                .clear_label_click(GestureReset::ContinuationMainChromeBlocked {
+                    block_reason: reason,
+                });
         }
         let mut witnesses = ctx.pointer_button_targets().into_iter();
         let (events, releases, time) = ctx.input(|input| {
@@ -413,6 +461,10 @@ impl App {
         });
         let mut releases = releases.into_iter();
         let mut ordinal = 0;
+        enum Diagnostic {
+            Continuation(ContinuationGate, String),
+            Discard(InputDiscard),
+        }
         let mut resolved = Vec::new();
         let display = self.folder_pane.label_display.as_ref().unwrap();
         for event in events {
@@ -421,7 +473,14 @@ impl App {
                 | egui::Event::Touch {
                     phase: egui::TouchPhase::Cancel,
                     ..
-                } => resolved.push((Input::Cancel, None)),
+                } => {
+                    let reason = if matches!(event, egui::Event::WindowFocused(false)) {
+                        InputDiscard::WindowFocusLost
+                    } else {
+                        InputDiscard::TouchCancelled
+                    };
+                    resolved.push((Input::Cancel, None, Some(Diagnostic::Discard(reason))));
+                }
                 egui::Event::PointerButton {
                     pos,
                     button,
@@ -429,29 +488,44 @@ impl App {
                     ..
                 } => {
                     let Some((p, b, down, widget, allowed)) = witnesses.next() else {
-                        self.folder_pane.clear_label_click();
+                        self.folder_pane
+                            .clear_label_click(GestureReset::PointerWitnessMissing);
                         return;
                     };
                     if (p, b, down) != (pos, button, pressed) {
-                        self.folder_pane.clear_label_click();
+                        self.folder_pane
+                            .clear_label_click(GestureReset::PointerWitnessMismatch);
                         return;
                     }
                     let click = if pressed {
                         None
                     } else {
                         let Some((released_button, click)) = releases.next() else {
-                            self.folder_pane.clear_label_click();
+                            self.folder_pane
+                                .clear_label_click(GestureReset::ReleaseWitnessMissing);
                             return;
                         };
                         if released_button != button {
-                            self.folder_pane.clear_label_click();
+                            self.folder_pane
+                                .clear_label_click(GestureReset::ReleaseButtonMismatch);
                             return;
                         }
                         click
                     };
                     if button != egui::PointerButton::Primary {
                         if pressed {
-                            resolved.push((Input::Cancel, None));
+                            resolved.push((
+                                Input::Cancel,
+                                None,
+                                Some(Diagnostic::Discard(InputDiscard::NonPrimaryButton)),
+                            ));
+                        } else {
+                            self.folder_pane.log_label_input_discard(
+                                InputDiscard::NonPrimaryButton,
+                                pass,
+                                time,
+                                format_args!("button={button:?} pressed={pressed}"),
+                            );
                         }
                         continue;
                     }
@@ -463,7 +537,12 @@ impl App {
                     if (has_touch && !edge.touch_derived)
                         || (edge.suppressed && !edge.touch_derived)
                     {
-                        resolved.push((Input::Cancel, None));
+                        let reason = if has_touch && !edge.touch_derived {
+                            InputDiscard::AmbiguousTouchBatch
+                        } else {
+                            InputDiscard::SuppressedPointerEdge
+                        };
+                        resolved.push((Input::Cancel, None, Some(Diagnostic::Discard(reason))));
                         continue;
                     }
                     let source = if edge.touch_derived {
@@ -493,6 +572,44 @@ impl App {
                             || widget.is_some_and(|widget| {
                                 Self::is_sidecar_restore_modal_widget(ctx, widget)
                             });
+                        // Snapshot diagnostics here, emit in resolved input order below.
+                        // These repeated geometry/boolean reads are pure; the original
+                        // short-circuit expression in Input::Press remains unchanged.
+                        let diagnostic = if !(continue_allowed
+                            && continuation_layer
+                            && display.rect.contains(pos)
+                            && continuation_hit)
+                        {
+                            let reason = if !continue_allowed {
+                                ContinuationGate::MainChromeBlocked
+                            } else if !continuation_layer {
+                                ContinuationGate::LayerRejected
+                            } else if !display.rect.contains(pos) {
+                                ContinuationGate::OutsideDisplayRect
+                            } else {
+                                ContinuationGate::HitRejected
+                            };
+                            Some(Diagnostic::Continuation(
+                                reason,
+                                format!(
+                                    "main_chrome_blocked={} block_reason={:?} continuation_layer={} display_contains={} continuation_hit={} pos={pos:?} layer_at={:?} display_layer={:?} display_rect={:?} widget={widget:?}",
+                                    !continue_allowed,
+                                    if continue_allowed {
+                                        None
+                                    } else {
+                                        self.folder_pane_continuation_block_diagnostic()
+                                    },
+                                    continuation_layer,
+                                    display.rect.contains(pos),
+                                    continuation_hit,
+                                    ctx.layer_id_at(pos),
+                                    display.layer,
+                                    display.rect,
+                                ),
+                            ))
+                        } else {
+                            None
+                        };
                         resolved.push((
                             Input::Press {
                                 pos,
@@ -509,6 +626,7 @@ impl App {
                                     .any(|row| row.arrow_rect.contains(pos)),
                             },
                             widget,
+                            diagnostic,
                         ));
                     } else {
                         resolved.push((
@@ -519,6 +637,7 @@ impl App {
                                 clicked: click.is_some(),
                             },
                             widget,
+                            None,
                         ));
                     }
                 }
@@ -528,10 +647,22 @@ impl App {
             }
         }
         if witnesses.next().is_some() || releases.next().is_some() {
-            self.folder_pane.clear_label_click();
+            self.folder_pane
+                .clear_label_click(GestureReset::ExtraPointerOrReleaseWitness);
             return;
         }
-        for (event, widget) in resolved {
+        for (event, widget, diagnostic) in resolved {
+            match diagnostic {
+                Some(Diagnostic::Continuation(reason, details)) => {
+                    self.folder_pane
+                        .log_label_continuation_gate(reason, &details);
+                }
+                Some(Diagnostic::Discard(reason)) => {
+                    self.folder_pane
+                        .log_label_input_discard(reason, pass, time, format_args!(""));
+                }
+                None => {}
+            }
             if self
                 .folder_pane
                 .process_label_input(event, time, max_dist, max_delay)
@@ -540,6 +671,23 @@ impl App {
                 self.folder_pane.record_label_pointer_activation(widget);
             }
         }
+    }
+
+    /// Read-only explanation of the same table used by the continuation blocker.
+    fn folder_pane_continuation_block_diagnostic(&self) -> Option<&'static str> {
+        self.modal_dialog_block_reason_filtered(false, false)
+            .or_else(|| {
+                self.omitted_entries_dialog_visible()
+                    .then_some("omitted_entries")
+            })
+    }
+
+    fn folder_pane_start_block_diagnostic(&self) -> Option<&'static str> {
+        self.modal_dialog_block_reason_filtered(false, true)
+            .or_else(|| {
+                self.omitted_entries_dialog_visible()
+                    .then_some("omitted_entries")
+            })
     }
 
     pub(crate) fn request_folder_tree_pane_toggle(&mut self, kind: FolderPaneToggleKind) {
@@ -940,7 +1088,8 @@ impl App {
         }
         if self.folder_pane_disabled() {
             close_folder_pane_paste_menu(ui.ctx());
-            self.folder_pane.invalidate_label_display();
+            self.folder_pane
+                .invalidate_label_display(GestureReset::PaneDisabled);
         }
         let mut nav = None;
         let mut pointer_row_clicked = false;
@@ -953,7 +1102,11 @@ impl App {
             match result {
                 FolderPaneLabelResult::Single(path) => {
                     if self.main_chrome_pointer_blocked() {
-                        self.folder_pane.clear_label_click();
+                        let block_reason = self.folder_pane_start_block_diagnostic();
+                        self.folder_pane
+                            .clear_label_click(GestureReset::SingleMainChromeBlocked {
+                                block_reason,
+                            });
                         continue;
                     }
                     self.folder_pane.set_focus_tree();
@@ -966,7 +1119,11 @@ impl App {
                 }
                 FolderPaneLabelResult::Arrow(path) => {
                     if self.main_chrome_pointer_blocked() {
-                        self.folder_pane.clear_label_click();
+                        let block_reason = self.folder_pane_start_block_diagnostic();
+                        self.folder_pane
+                            .clear_label_click(GestureReset::ArrowMainChromeBlocked {
+                                block_reason,
+                            });
                         continue;
                     }
                     if let Some(row) = self
@@ -983,7 +1140,11 @@ impl App {
                 }
                 FolderPaneLabelResult::Toggle { path, expanded } => {
                     if self.main_chrome_pointer_blocked_except_sidecar_restore() {
-                        self.folder_pane.clear_label_click();
+                        let block_reason = self.folder_pane_continuation_block_diagnostic();
+                        self.folder_pane
+                            .clear_label_click(GestureReset::ToggleMainChromeBlocked {
+                                block_reason,
+                            });
                         continue;
                     }
                     if self
@@ -1136,7 +1297,8 @@ impl App {
                         .folder_pane
                         .label_pointer_activation_owned(arrow_resp.id)
                 {
-                    self.folder_pane.clear_label_click();
+                    self.folder_pane
+                        .clear_label_click(GestureReset::NonPrimaryArrowActivation);
                     self.apply_folder_pane_branch_click(&row.path, !row.expanded);
                 }
                 if resp.clicked()
@@ -1144,7 +1306,8 @@ impl App {
                     && !resp.clicked_by(egui::PointerButton::Secondary)
                     && !self.folder_pane.label_pointer_activation_owned(resp.id)
                 {
-                    self.folder_pane.clear_label_click();
+                    self.folder_pane
+                        .clear_label_click(GestureReset::NonPrimaryLabelActivation);
                     self.folder_pane.set_focus_tree();
                     self.folder_pane.set_cursor(row.path.clone());
                     nav = Some(self.folder_pane_name_activation(row.path.clone()));

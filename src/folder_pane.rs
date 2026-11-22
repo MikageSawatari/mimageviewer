@@ -56,6 +56,69 @@ pub(crate) enum FolderPaneActivation {
     RefreshActive(PathBuf),
 }
 
+/// Diagnostic causes only; none of these participate in gesture adjudication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FolderPaneGestureReset {
+    FocusGrid,
+    SuspendDisplay,
+    ReloadForActive,
+    SelectDrive,
+    SelectedDriveRemoved,
+    DisplayNotVisible,
+    DisplayNotFresh,
+    TreeFocusLost,
+    TreeKeyPressed,
+    ContinuationMainChromeBlocked { block_reason: Option<&'static str> },
+    PointerWitnessMissing,
+    PointerWitnessMismatch,
+    ReleaseWitnessMissing,
+    ReleaseButtonMismatch,
+    ExtraPointerOrReleaseWitness,
+    PaneDisabled,
+    SingleMainChromeBlocked { block_reason: Option<&'static str> },
+    ArrowMainChromeBlocked { block_reason: Option<&'static str> },
+    ToggleMainChromeBlocked { block_reason: Option<&'static str> },
+    NonPrimaryArrowActivation,
+    NonPrimaryLabelActivation,
+    InputCancelled,
+    PressRejected,
+    ReleaseRejected,
+    TouchSingleCompleted,
+    ArrowCompleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FolderPaneGestureNotContinued {
+    MixedInputSourceWhilePressed,
+    ArrowWidgetHit,
+    ArrowRectHit,
+    InputSourceNotMouse,
+    ContinueNotAllowed,
+    DistanceExceeded,
+    ReleaseTimeOutsideDoubleClickDelay,
+    PreviousPressNotReleased,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FolderPaneGestureInputDiscard {
+    NonRootViewport,
+    PassAlreadyRecognized,
+    WindowFocusLost,
+    TouchCancelled,
+    NonPrimaryButton,
+    AmbiguousTouchBatch,
+    SuppressedPointerEdge,
+}
+
+/// Diagnostic explanation of the UI-side continuation gate.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FolderPaneGestureContinuationGate {
+    MainChromeBlocked,
+    LayerRejected,
+    OutsideDisplayRect,
+    HitRejected,
+}
+
 /// The sole owner of an ordered primary-pointer gesture in the tree.
 #[derive(Debug, Default)]
 enum FolderPaneLabelGesture {
@@ -75,6 +138,113 @@ enum FolderPaneLabelGesture {
         path: PathBuf,
         source: FolderPanePointerSource,
     },
+}
+
+impl FolderPaneLabelGesture {
+    fn diagnostic_target(&self) -> Option<(&'static str, &Path)> {
+        match self {
+            Self::Idle => None,
+            Self::FirstPress { path, .. } => Some(("FirstPress", path)),
+            Self::AwaitingPress { anchor, .. } => Some(("AwaitingPress", &anchor.path)),
+            Self::PressAccepted(anchor) => Some(("PressAccepted", &anchor.path)),
+            Self::ArrowPress { path, .. } => Some(("ArrowPress", path)),
+        }
+    }
+
+    /// Mirrors the first rejecting branch in Press, using only pure comparisons.
+    /// The actual transition below deliberately keeps its original conditions.
+    fn not_continued(
+        &self,
+        source: FolderPanePointerSource,
+        hit: &FolderPanePointerHit,
+        arrow_rect: bool,
+        continue_allowed: bool,
+        pos: egui::Pos2,
+        time: f64,
+        max_dist: f32,
+        max_delay: f64,
+    ) -> Option<FolderPaneGestureNotContinued> {
+        use FolderPaneGestureNotContinued::*;
+        match self {
+            Self::Idle => return None,
+            Self::FirstPress {
+                source: previous, ..
+            }
+            | Self::ArrowPress {
+                source: previous, ..
+            } if source != *previous => {
+                return Some(MixedInputSourceWhilePressed);
+            }
+            Self::PressAccepted(_) if source != FolderPanePointerSource::Mouse => {
+                return Some(MixedInputSourceWhilePressed);
+            }
+            _ => {}
+        }
+        if matches!(hit, FolderPanePointerHit::Arrow(_)) {
+            return Some(ArrowWidgetHit);
+        }
+        if arrow_rect {
+            return Some(ArrowRectHit);
+        }
+        if let Self::AwaitingPress {
+            anchor,
+            time: released,
+        } = self
+        {
+            if source != FolderPanePointerSource::Mouse {
+                Some(InputSourceNotMouse)
+            } else if !continue_allowed {
+                Some(ContinueNotAllowed)
+            } else if !(pos.distance(anchor.pos) <= max_dist) {
+                Some(DistanceExceeded)
+            } else if !(0.0..=max_delay).contains(&(time - released)) {
+                Some(ReleaseTimeOutsideDoubleClickDelay)
+            } else {
+                None
+            }
+        } else {
+            Some(PreviousPressNotReleased)
+        }
+    }
+}
+
+fn log_folder_pane_gesture(
+    kind: &str,
+    reason: impl std::fmt::Debug,
+    previous: &str,
+    path: &Path,
+    pass: Option<u64>,
+    time: Option<f64>,
+    details: std::fmt::Arguments<'_>,
+) {
+    let reason = format!("{reason:?}");
+    let details = details.to_string();
+    crate::logger::log(format!(
+        "folder pane gesture {}: {} prev={} path={} pass={:?} t={:?} {}",
+        kind.replace('_', " "),
+        reason,
+        previous,
+        path.display(),
+        pass,
+        time,
+        details,
+    ));
+    if crate::perf::is_enabled() {
+        let path = path.to_string_lossy();
+        crate::perf::event(
+            "folder_pane",
+            &format!("gesture_{kind}"),
+            Some(path.as_ref()),
+            0,
+            &[
+                ("reason", reason.into()),
+                ("prev", previous.into()),
+                ("pass", serde_json::json!(pass)),
+                ("input_time", serde_json::json!(time)),
+                ("details", details.into()),
+            ],
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -316,6 +486,13 @@ pub(crate) struct FolderPaneState {
     label_gesture: FolderPaneLabelGesture,
     pub(crate) label_display: Option<FolderPaneLabelDisplay>,
     label_input: FolderPaneLabelInputPass,
+    // Latest ROOT input.time (also set by direct state tests), never read by
+    // adjudication. Lifecycle resets outside recognition use this last sample.
+    label_diagnostic_time: Option<f64>,
+    #[cfg(test)]
+    last_gesture_reset: Option<FolderPaneGestureReset>,
+    #[cfg(test)]
+    last_gesture_not_continued: Option<FolderPaneGestureNotContinued>,
     #[cfg(test)]
     scan_backend: Option<TestScanBackend>,
 }
@@ -342,6 +519,11 @@ impl Default for FolderPaneState {
             listing_options: FolderPaneListingOptions::default(),
             last_drive_refresh: None,
             label_gesture: FolderPaneLabelGesture::Idle,
+            label_diagnostic_time: None,
+            #[cfg(test)]
+            last_gesture_reset: None,
+            #[cfg(test)]
+            last_gesture_not_continued: None,
             label_display: None,
             label_input: FolderPaneLabelInputPass::default(),
             #[cfg(test)]
@@ -351,8 +533,76 @@ impl Default for FolderPaneState {
 }
 
 impl FolderPaneState {
-    pub(crate) fn clear_label_click(&mut self) {
+    #[track_caller]
+    pub(crate) fn clear_label_click(&mut self, reason: FolderPaneGestureReset) {
+        self.log_gesture_reset(reason);
         self.label_gesture = FolderPaneLabelGesture::Idle;
+    }
+
+    #[track_caller]
+    fn log_gesture_reset(&mut self, reason: FolderPaneGestureReset) {
+        if let Some((previous, path)) = self.label_gesture.diagnostic_target() {
+            log_folder_pane_gesture(
+                "reset",
+                reason,
+                previous,
+                path,
+                self.label_input.pass,
+                self.label_diagnostic_time,
+                format_args!(
+                    "has_focus={} display_pass={:?} caller={}",
+                    self.has_focus,
+                    self.label_display.as_ref().map(|display| display.pass),
+                    std::panic::Location::caller(),
+                ),
+            );
+            #[cfg(test)]
+            {
+                self.last_gesture_reset = Some(reason);
+            }
+        }
+    }
+
+    pub(crate) fn set_label_diagnostic_time(&mut self, time: f64) {
+        self.label_diagnostic_time = Some(time);
+    }
+
+    pub(crate) fn log_label_input_discard(
+        &self,
+        reason: FolderPaneGestureInputDiscard,
+        pass: u64,
+        time: f64,
+        details: std::fmt::Arguments<'_>,
+    ) {
+        if let Some((previous, path)) = self.label_gesture.diagnostic_target() {
+            log_folder_pane_gesture(
+                "input_discard",
+                reason,
+                previous,
+                path,
+                Some(pass),
+                Some(time),
+                details,
+            );
+        }
+    }
+
+    pub(crate) fn log_label_continuation_gate(
+        &self,
+        reason: FolderPaneGestureContinuationGate,
+        details: &str,
+    ) {
+        if let Some((previous, path)) = self.label_gesture.diagnostic_target() {
+            log_folder_pane_gesture(
+                "continuation_gate",
+                reason,
+                previous,
+                path,
+                self.label_input.pass,
+                self.label_diagnostic_time,
+                format_args!("{details}"),
+            );
+        }
     }
 
     pub(crate) fn label_gesture_requires_tree_focus(&self) -> bool {
@@ -362,8 +612,9 @@ impl FolderPaneState {
         )
     }
 
-    pub(crate) fn invalidate_label_display(&mut self) {
-        self.clear_label_click();
+    #[track_caller]
+    pub(crate) fn invalidate_label_display(&mut self, reason: FolderPaneGestureReset) {
+        self.clear_label_click(reason);
         self.label_display = None;
         self.label_input.results.clear();
         self.label_input.pointer_activations.clear();
@@ -411,9 +662,73 @@ impl FolderPaneState {
     ) -> bool {
         use FolderPaneLabelGesture::*;
         use FolderPanePointerHit as Hit;
+        self.label_diagnostic_time = Some(time);
+        if let FolderPaneLabelInput::Press {
+            pos,
+            ref hit,
+            source,
+            arrow_rect,
+            continue_allowed,
+            start_allowed,
+        } = input
+            && let Some(reason) = self.label_gesture.not_continued(
+                source,
+                hit,
+                arrow_rect,
+                continue_allowed,
+                pos,
+                time,
+                max_dist,
+                max_delay,
+            )
+        {
+            if let Some((previous, path)) = self.label_gesture.diagnostic_target() {
+                let (distance, delay) = match &self.label_gesture {
+                    AwaitingPress {
+                        anchor,
+                        time: released,
+                    } => (Some(pos.distance(anchor.pos)), Some(time - released)),
+                    _ => (None, None),
+                };
+                log_folder_pane_gesture(
+                    "not_continued",
+                    reason,
+                    previous,
+                    path,
+                    self.label_input.pass,
+                    Some(time),
+                    format_args!(
+                        "source={source:?} hit={hit:?} pos={pos:?} start_allowed={start_allowed} continue_allowed={continue_allowed} arrow_rect={arrow_rect} distance={distance:?} max_dist={max_dist} delay={delay:?} max_delay={max_delay}"
+                    ),
+                );
+            }
+            #[cfg(test)]
+            {
+                self.last_gesture_not_continued = Some(reason);
+            }
+        }
+        let mut idle_reason = match &input {
+            FolderPaneLabelInput::Cancel => FolderPaneGestureReset::InputCancelled,
+            FolderPaneLabelInput::Press { .. } => FolderPaneGestureReset::PressRejected,
+            FolderPaneLabelInput::Release { .. } => FolderPaneGestureReset::ReleaseRejected,
+        };
+        let input_details = self.label_gesture.diagnostic_target().map(|_| match &input {
+            FolderPaneLabelInput::Cancel => "input=Cancel".to_string(),
+            FolderPaneLabelInput::Press {
+                pos, hit, source, start_allowed, continue_allowed, arrow_rect,
+            } => format!(
+                "input=Press source={source:?} hit={hit:?} pos={pos:?} start_allowed={start_allowed} continue_allowed={continue_allowed} arrow_rect={arrow_rect}"
+            ),
+            FolderPaneLabelInput::Release { hit, source, start_allowed, clicked } => format!(
+                "input=Release source={source:?} hit={hit:?} start_allowed={start_allowed} clicked={clicked}"
+            ),
+        });
         let prior_results = self.label_input.results.len();
         let mut continuation_owned = false;
         let previous = std::mem::take(&mut self.label_gesture);
+        let previous_target = previous
+            .diagnostic_target()
+            .map(|(kind, path)| (kind, path.to_path_buf()));
         self.label_gesture = match input {
             FolderPaneLabelInput::Cancel => Idle,
             FolderPaneLabelInput::Press {
@@ -467,7 +782,31 @@ impl FolderPaneState {
                                 path: anchor.path.clone(),
                                 expanded: !anchor.first_expanded,
                             });
+                        log_folder_pane_gesture(
+                            "toggle",
+                            "SecondPressAccepted",
+                            "AwaitingPress",
+                            &anchor.path,
+                            self.label_input.pass,
+                            Some(time),
+                            format_args!(
+                                "expanded={} source={source:?} pos={pos:?} distance={} delay={}",
+                                !anchor.first_expanded,
+                                pos.distance(anchor.pos),
+                                time - released,
+                            ),
+                        );
                         anchor.toggled = true;
+                    } else {
+                        log_folder_pane_gesture(
+                            "continued",
+                            "AlreadyToggled",
+                            "AwaitingPress",
+                            &anchor.path,
+                            self.label_input.pass,
+                            Some(time),
+                            format_args!("source={source:?}"),
+                        );
                     }
                     PressAccepted(anchor)
                 } else if start_allowed && let Hit::Label(path) = hit {
@@ -499,7 +838,19 @@ impl FolderPaneState {
                     self.label_input
                         .results
                         .push(FolderPaneLabelResult::Single(path.clone()));
+                    log_folder_pane_gesture(
+                        "single",
+                        "FirstReleaseAccepted",
+                        "FirstPress",
+                        &path,
+                        self.label_input.pass,
+                        Some(time),
+                        format_args!(
+                            "source={source:?} pos={pos:?} first_expanded={first_expanded}"
+                        ),
+                    );
                     if source == FolderPanePointerSource::Touch {
+                        idle_reason = FolderPaneGestureReset::TouchSingleCompleted;
                         Idle
                     } else {
                         AwaitingPress {
@@ -524,11 +875,29 @@ impl FolderPaneState {
                     self.label_input
                         .results
                         .push(FolderPaneLabelResult::Arrow(path));
+                    idle_reason = FolderPaneGestureReset::ArrowCompleted;
                     Idle
                 }
                 _ => Idle,
             },
         };
+        if matches!(self.label_gesture, Idle)
+            && let Some((previous, path)) = previous_target
+        {
+            log_folder_pane_gesture(
+                "reset",
+                idle_reason,
+                previous,
+                &path,
+                self.label_input.pass,
+                Some(time),
+                format_args!("{}", input_details.as_deref().unwrap_or_default()),
+            );
+            #[cfg(test)]
+            {
+                self.last_gesture_reset = Some(idle_reason);
+            }
+        }
         continuation_owned || self.label_input.results.len() > prior_results
     }
 
@@ -592,8 +961,9 @@ impl FolderPaneState {
         self.participation = PaneParticipation::Displayed;
     }
 
+    #[track_caller]
     pub(crate) fn suspend_display(&mut self) {
-        self.invalidate_label_display();
+        self.invalidate_label_display(FolderPaneGestureReset::SuspendDisplay);
         if self.participation == PaneParticipation::Suspended {
             return;
         }
@@ -626,8 +996,9 @@ impl FolderPaneState {
         self.set_focus_tree();
     }
 
+    #[track_caller]
     pub(crate) fn set_focus_grid(&mut self) {
-        self.clear_label_click();
+        self.clear_label_click(FolderPaneGestureReset::FocusGrid);
         self.release_tree_keyboard_focus();
     }
 
@@ -678,7 +1049,7 @@ impl FolderPaneState {
         }) {
             return;
         }
-        self.invalidate_label_display();
+        self.invalidate_label_display(FolderPaneGestureReset::SelectedDriveRemoved);
         if !self.selection.has_explicit_position() && self.active_path.is_some() {
             self.resolve_follow_position();
         } else {
@@ -691,8 +1062,9 @@ impl FolderPaneState {
         self.cursor_scroll = FolderPaneCursorScroll::Requested;
     }
 
+    #[track_caller]
     pub(crate) fn select_drive(&mut self, drive: PathBuf) {
-        self.invalidate_label_display();
+        self.invalidate_label_display(FolderPaneGestureReset::SelectDrive);
         self.has_focus = true;
         // An actual selection, including the selected drive, is an explicit recheck.
         // Invalidate all participants, so an unchanged root also refreshes its open branches.
@@ -707,12 +1079,13 @@ impl FolderPaneState {
         self.reconcile_demand();
     }
 
+    #[track_caller]
     pub(crate) fn reload_for_active(
         &mut self,
         active: Option<&Path>,
         options: FolderPaneListingOptions,
     ) {
-        self.invalidate_label_display();
+        self.invalidate_label_display(FolderPaneGestureReset::ReloadForActive);
         self.cancel_pending();
         let retired = std::mem::take(&mut self.nodes);
         rayon::spawn(move || drop(retired));
@@ -1774,6 +2147,150 @@ mod tests {
     }
 
     #[test]
+    fn label_gesture_diagnostic_reports_double_click_delay_rejection() {
+        for time in [1.0, 1.32] {
+            let mut state = FolderPaneState::default();
+            label_press(&mut state, "C:/a", 0.0, 1.0);
+            label_release(&mut state, "C:/a", 1.01, true);
+            label_press(&mut state, "C:/a", 0.0, time);
+            assert_eq!(
+                state.last_gesture_not_continued,
+                Some(FolderPaneGestureNotContinued::ReleaseTimeOutsideDoubleClickDelay)
+            );
+            assert!(matches!(
+                state.label_gesture,
+                FolderPaneLabelGesture::FirstPress { .. }
+            ));
+            assert_eq!(
+                state.label_input.results,
+                vec![FolderPaneLabelResult::Single(p("C:/a"))]
+            );
+        }
+    }
+
+    #[test]
+    fn label_gesture_diagnostic_reports_continuation_gate_rejection() {
+        let mut state = FolderPaneState::default();
+        label_press(&mut state, "C:/a", 0.0, 1.0);
+        label_release(&mut state, "C:/a", 1.01, true);
+        pointer_press(
+            &mut state,
+            FolderPanePointerHit::Label(p("C:/a")),
+            0.0,
+            1.1,
+            FolderPanePointerSource::Mouse,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            state.last_gesture_not_continued,
+            Some(FolderPaneGestureNotContinued::ContinueNotAllowed)
+        );
+        assert!(matches!(
+            state.label_gesture,
+            FolderPaneLabelGesture::FirstPress { .. }
+        ));
+        assert_eq!(
+            state.label_input.results,
+            vec![FolderPaneLabelResult::Single(p("C:/a"))]
+        );
+    }
+
+    #[test]
+    fn label_gesture_diagnostic_distinguishes_source_distance_and_arrow() {
+        use FolderPaneGestureNotContinued::*;
+        for (source, hit, x, arrow_rect, expected) in [
+            (
+                FolderPanePointerSource::Touch,
+                FolderPanePointerHit::None,
+                0.0,
+                false,
+                InputSourceNotMouse,
+            ),
+            (
+                FolderPanePointerSource::Mouse,
+                FolderPanePointerHit::None,
+                7.0,
+                false,
+                DistanceExceeded,
+            ),
+            (
+                FolderPanePointerSource::Mouse,
+                FolderPanePointerHit::Arrow(p("C:/a")),
+                0.0,
+                false,
+                ArrowWidgetHit,
+            ),
+            (
+                FolderPanePointerSource::Mouse,
+                FolderPanePointerHit::None,
+                0.0,
+                true,
+                ArrowRectHit,
+            ),
+        ] {
+            let mut state = FolderPaneState::default();
+            label_press(&mut state, "C:/a", 0.0, 1.0);
+            label_release(&mut state, "C:/a", 1.01, true);
+            pointer_press(&mut state, hit, x, 1.1, source, true, true, arrow_rect);
+            assert_eq!(state.last_gesture_not_continued, Some(expected));
+            assert_eq!(
+                state.label_input.results,
+                vec![FolderPaneLabelResult::Single(p("C:/a"))]
+            );
+        }
+    }
+
+    #[test]
+    fn label_gesture_diagnostic_focus_grid_resets_only_an_active_gesture() {
+        let mut state = FolderPaneState::default();
+        state.set_focus_grid();
+        assert_eq!(state.last_gesture_reset, None);
+        label_press(&mut state, "C:/a", 0.0, 1.0);
+        label_release(&mut state, "C:/a", 1.01, true);
+        state.set_focus_grid();
+        assert_eq!(
+            state.last_gesture_reset,
+            Some(FolderPaneGestureReset::FocusGrid)
+        );
+        assert!(matches!(state.label_gesture, FolderPaneLabelGesture::Idle));
+        // Clearing Idle must not publish another reset reason.
+        state.clear_label_click(FolderPaneGestureReset::TreeKeyPressed);
+        assert_eq!(
+            state.last_gesture_reset,
+            Some(FolderPaneGestureReset::FocusGrid)
+        );
+    }
+
+    #[test]
+    fn label_gesture_diagnostic_invalidation_retains_the_callers_reason() {
+        let mut state = FolderPaneState::default();
+        label_press(&mut state, "C:/a", 0.0, 1.0);
+        state.invalidate_label_display(FolderPaneGestureReset::DisplayNotFresh);
+        assert_eq!(
+            state.last_gesture_reset,
+            Some(FolderPaneGestureReset::DisplayNotFresh)
+        );
+        assert!(matches!(state.label_gesture, FolderPaneLabelGesture::Idle));
+    }
+
+    #[test]
+    fn label_gesture_diagnostic_successful_continuation_has_no_rejection() {
+        let mut state = FolderPaneState::default();
+        label_press(&mut state, "C:/a", 0.0, 1.0);
+        label_release(&mut state, "C:/a", 1.01, true);
+        label_press(&mut state, "C:/a", 0.0, 1.1);
+        assert_eq!(state.last_gesture_not_continued, None);
+        assert_eq!(state.last_gesture_reset, None);
+        assert!(matches!(
+            state.label_gesture,
+            FolderPaneLabelGesture::PressAccepted(_)
+        ));
+        assert_eq!(state.label_input.results.len(), 2);
+    }
+
+    #[test]
     fn label_click_second_press_owns_first_row_and_never_reissues_navigation() {
         let mut state = FolderPaneState::default();
         label_press(&mut state, "C:/a", 0.0, 1.0);
@@ -2131,7 +2648,7 @@ mod tests {
             rect: egui::Rect::NOTHING,
             rows: vec![],
         });
-        state.invalidate_label_display();
+        state.invalidate_label_display(FolderPaneGestureReset::DisplayNotFresh);
         assert!(state.label_display.is_none());
         assert!(state.label_input.results.is_empty());
         assert!(matches!(state.label_gesture, FolderPaneLabelGesture::Idle));
@@ -2143,7 +2660,7 @@ mod tests {
         label_press(&mut state, "C:/a", 0.0, 1.0);
         label_release(&mut state, "C:/a", 1.01, true);
         // The key cancels before the new pointer sequence, not during key application.
-        state.clear_label_click();
+        state.clear_label_click(FolderPaneGestureReset::TreeKeyPressed);
         assert_eq!(
             state.label_input.results,
             vec![FolderPaneLabelResult::Single(p("C:/a"))]
@@ -2266,7 +2783,7 @@ mod tests {
             ));
         }
         assert_eq!(state.label_input.results.len(), 2);
-        state.clear_label_click();
+        state.clear_label_click(FolderPaneGestureReset::TreeKeyPressed);
         assert!(!pointer_press(
             &mut state,
             hit.clone(),
@@ -2304,7 +2821,7 @@ mod tests {
         state.finish_label_input();
         assert!(!state.label_pointer_activation_owned(label));
         state.record_label_pointer_activation(arrow);
-        state.invalidate_label_display();
+        state.invalidate_label_display(FolderPaneGestureReset::DisplayNotFresh);
         assert!(!state.label_pointer_activation_owned(arrow));
     }
 

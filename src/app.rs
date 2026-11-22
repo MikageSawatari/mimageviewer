@@ -24011,7 +24011,7 @@ impl App {
         self.modal_dialog_block_reason_filtered(include_menus, true)
     }
 
-    fn modal_dialog_block_reason_filtered(
+    pub(crate) fn modal_dialog_block_reason_filtered(
         &self,
         include_menus: bool,
         include_sidecar_restore: bool,
