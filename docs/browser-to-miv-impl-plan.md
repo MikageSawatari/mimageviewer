@@ -748,6 +748,16 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
 
 製品用 manifest と二つの ZIP を再現可能に生成でき、試作専用コード・権限・診断本文を含まないこと。
 
+**段階8の実装引き継ぎ（2026-11-22）**
+
+- 製品拡張の版は `0.2.0`。ソースの manifest は Chrome の公開鍵を持ち、Edge 用は ZIP 内の key だけを変える。提供されたアイコンと `store-keys.json` は変更しない。鍵・テスト・この文書は ZIP に入れない。
+- 要求は同期の latch で一件に制限し、`permissions.request` を最初の await より前に呼んでから session storage に記録する。画像 origin の許可があれば取得でき、ページ origin が無いときは右クリック記録を使わない。画像リンクの拡張子集合は Rust の共有表と Node テストで照合する。
+- session rule は固定 ID `818` を専用に所有し、正規表現でエスケープした最初の URL の完全一致、GET、`xmlhttprequest`、`TAB_ID_NONE` に限定。取得の成否にかかわらず消し、削除が失敗した場合も送信せず終了する。Cookie を含む一回の fetch、既定の redirect、`response.url`、宣言サイズ／stream／JSON UTF-8 長の検査を持つ。
+- 起き直した worker は専用の残存規則と要求を消して中断を一回通知する。再取得・再送・時刻期限は持たない。native の13種類の失敗は、それぞれ別の ja/en の説明に対応する。API の失敗や未知の応答も badge/title で知らせる。画像の内容や診断本文はログに出さない。
+- `context.js` は ISOLATED の上位フレームで直前一件の座標と geometry だけを保持する。記録の有効性と位置換算は段階6の host が所有し、JS へ重複して実装しない。登録は単一 ID、登録・更新イベントは直列に処理する。インストール／起動／許可追加時の既存タブ注入と、同一 document への二重 listener 防止を持つ。
+- API 契約は Chrome の一次資料（[permissions](https://developer.chrome.com/docs/extensions/reference/api/permissions)、[DNR](https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest)、[scripting](https://developer.chrome.com/docs/extensions/reference/api/scripting)）でも確認した。Node のモックと ZIP 検査を、実 Chrome／Edge の許可 UI・Cookie・redirect・座標精度の証拠とはしない。ストアへの提出・公開と実機検証は別工程。
+- Node v22.16.0 の64テストは全件成功（`target/browser-extension/worker-tests.tap` に全テスト名と結果）。通常の `node --test` はこの実行環境で子プロセスの spawn が EPERM となったため、`--experimental-test-isolation=none` を付けて同じテストを実行した。PowerShell の package テストも成功（`target/browser-extension/package-test-results.txt`）。最終ソースの二つの ZIP は `target/browser-extension/` に生成済みで、対応するテスト生成物とバイト一致。Chrome ID は `fpppoodelfkddekjahhmalmmfdhbpdma`、Edge ID は `dlcbdkekoppppebnhhncghhglkkccdhk`。Rust・cargo・実登録・ブラウザ・mIV は実行していない。
+
 ### 段階9：公開文書と最終検証の引き渡し
 
 **範囲**

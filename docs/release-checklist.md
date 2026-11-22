@@ -112,6 +112,34 @@ F2b の移行、F3 の公開文書、F4 のポータブル有効化が揃うま�
 F4 の plugin DLL 署名も既存の署名差分検査を通す。公開前には host と plugin DLL を VirusTotal で確認し、
 Google/Microsoft の検出があれば公開を止める（送信の都度、利用者の了承を得る）。
 
+### ブラウザ拡張の ZIP（Chrome / Edge）
+
+拡張は `browser-extension/` の単一ソースから作る。`manifest.json` の `version` は mIV 本体と独立し、
+拡張の収録ファイルを変更してストアへ更新を提出するときだけ進める。本体だけのリリースで拡張の版を上げたり、
+同じ拡張を提出し直したりしない。初回を含む公開・提出は利用者がストアのアカウントで行う。
+
+1. 拡張を変更した場合、次の非対話テストを実行する。
+   ```powershell
+   node --test browser-extension/tests/worker.test.cjs
+   .\scripts\test-package-browser-extension.ps1
+   ```
+2. 配布する ZIP を作る。
+   ```powershell
+   .\scripts\package-browser-extension.ps1
+   ```
+   出力は `target/browser-extension/mimageviewer-browser-extension-chrome-v<EXT_VERSION>.zip` と
+   `target/browser-extension/mimageviewer-browser-extension-edge-v<EXT_VERSION>.zip`。
+   スクリプトは、`store-keys.json` の公開鍵から SHA-256 の先頭 16 バイトを a〜p の ID に変換して指定 ID と照合し、
+   ソース manifest が Chrome の公開鍵であることも検査する。Edge は生成する manifest の公開鍵だけを置き換える。
+   ソース、テスト、鍵の控えを変更せず、manifest・worker・座標用 script・ja/en の messages・4 サイズの icon だけを収録する。
+   ZIP の順序・時刻・圧縮設定は固定。テストは 2 回の ZIP のバイト一致、権限・翻訳・収録内容とソース不変を検査する。
+   `-OutputDirectory` はこの worktree の `target/browser-extension` 内だけ指定でき、junction 等への出力は拒否する。
+3. Chrome ウェブストアと Microsoft Edge アドオンへ、それぞれ対応する ZIP を提出する。
+   ストアの説明・権限ごとの理由・プライバシーの開示は
+   [ブラウザ連携の設計 §9.6・§9.10・§11](browser-to-miv-plan.md) に合わせる。
+   拡張の更新も審査を伴うので、本体の公開と切り離して扱う。拡張と native host の通信の版 `v` を先に進めず、
+   新しい mIV は公開済みの古い拡張と動くようにする。モック・ZIP の検査だけでブラウザでの動作確認済みとはしない。
+
 ## リリース手順チェックリスト
 
 **担当: ClaudeCode Opus 5.5 / high (担当範囲は2026-09-09決定、モデルは2026-09-23更新)。** Phase 0〜5の公開準備、
