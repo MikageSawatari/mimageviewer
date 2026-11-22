@@ -5,6 +5,12 @@ use std::path::{Path, PathBuf};
 
 mod destination;
 pub use destination::is_browser_host_destination;
+mod image_formats;
+pub use image_formats::{
+    CAPTURE_IMAGE_FORMATS, CaptureImageFormat, CaptureImageKind, CaptureImageSignature,
+    capture_image_format_from_bytes, capture_image_format_from_extension,
+    capture_image_format_from_header,
+};
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CaptureOrigin {

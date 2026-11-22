@@ -595,6 +595,12 @@ release は、既存の core→remote→EPUB→MCP→editor の後、browser-hos
 - 新規 Rust テストは host 12件、launcher と runtime cleanup の bundle 回帰各1件。filter は `browser818_host|browser818_positions|browser818_bundle`。スクリプト回帰は `test-build-dev-safety.ps1`、`test-release-build-safety.ps1`（process policy を含む）、`test-musicvideo-build-safety.ps1`、`test-build-portable-source-fingerprint.ps1`。既存 companion の検査は残したまま host を追加した。
 - ビルド・Rust テスト・PowerShell スクリプト・アプリの実行は行わず、設計担当へ引き継ぐ。実ビルド時間・配布物・署名の検証結果は未取得。
 
+**段階6の独立レビュー修正（2026-11-22、検証待ち）**
+
+- 保存先の基底に加え、作成後の月フォルダも、ファイル作成前に共有の `is_browser_host_destination` で検査する。既存の月フォルダが junction で登録世代を指す場合は `InvalidDestination`。保存・MOTW・launcher 起動へ進まない。
+- 画像リンクの拡張子と signature の正本は `crates/capture-file/src/image_formats.rs` の公開表 `CAPTURE_IMAGE_FORMATS`。TIFF、HEIC/HEIF、JPEG XL を含む既存12拡張子・9形式。host と取り込みの両方が参照する。段階8の JS 側の拡張子集合は、この表の `extensions` 列との一致をテストする。
+- 取り込みの部分ヘッダ判定と bounded decoder の対応、AVIF の native 優先は維持する。host の全バイト列判定では BMFF の box 長も検査する。保存名・MOTW・既存画像／設定の形式は変更しない。追加9テストの検証は設計担当へ引き継ぐ。
+
 ### 段階7：連携登録、保存先、設定画面、場所▼
 
 **範囲**

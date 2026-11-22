@@ -158,6 +158,14 @@ pub fn handle(
         let origin = CaptureOrigin::from_browser_urls(page, final_url);
         let folder = config.output_dir.join(&timestamp.month);
         std::fs::create_dir_all(&folder).map_err(|_| ErrorCode::SaveFailed)?;
+        // An existing month directory can redirect into the managed host tree
+        // even when the selected base is outside it. Check the actual write
+        // directory after creation and before creating even a temporary file.
+        if is_browser_host_destination(&folder, managed)
+            .map_err(|_| ErrorCode::InvalidDestination)?
+        {
+            return Err(ErrorCode::InvalidDestination);
+        }
         let mut file =
             tempfile::NamedTempFile::new_in(&folder).map_err(|_| ErrorCode::SaveFailed)?;
         file.write_all(&bytes)

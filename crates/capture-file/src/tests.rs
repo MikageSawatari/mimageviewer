@@ -8,6 +8,127 @@ fn timestamp() -> CaptureTimestamp {
 }
 
 #[test]
+fn browser818_capture_file_format_table_pins_released_link_extensions() {
+    let mut extensions = CAPTURE_IMAGE_FORMATS
+        .iter()
+        .flat_map(|format| format.extensions.iter().copied())
+        .collect::<Vec<_>>();
+    extensions.sort_unstable();
+    assert_eq!(
+        extensions,
+        [
+            "avif", "bmp", "gif", "heic", "heif", "jpeg", "jpg", "jxl", "png", "tif", "tiff",
+            "webp"
+        ]
+    );
+    assert_eq!(CAPTURE_IMAGE_FORMATS.len(), 9);
+    for format in CAPTURE_IMAGE_FORMATS {
+        assert_eq!(format.kind.format(), format);
+        assert!(!format.signatures.is_empty());
+        for extension in format.extensions {
+            assert_eq!(
+                capture_image_format_from_extension(&extension.to_ascii_uppercase()),
+                Some(format)
+            );
+        }
+    }
+    for rejected in [
+        "", ".png", "svg", "svg+xml", "ico", "ppm", "qoi", "mp4", "png?x=1",
+    ] {
+        assert!(
+            capture_image_format_from_extension(rejected).is_none(),
+            "{rejected}"
+        );
+    }
+}
+
+#[test]
+fn browser818_capture_file_format_signatures_and_truncations() {
+    for (bytes, expected) in [
+        (&b"\x89PNG\r\n\x1a\n"[..], "png"),
+        (&b"\xff\xd8\xff"[..], "jpg"),
+        (&b"GIF87a"[..], "gif"),
+        (&b"GIF89a"[..], "gif"),
+        (&b"RIFFxxxxWEBP"[..], "webp"),
+        (&b"BM"[..], "bmp"),
+        (&b"II*\0"[..], "tiff"),
+        (&b"MM\0*"[..], "tiff"),
+        (&b"\0\0\0\x14ftypavif\0\0\0\0avif"[..], "avif"),
+        (&b"\0\0\0\x14ftypavis\0\0\0\0avis"[..], "avif"),
+        (&b"\0\0\0\x14ftypheic\0\0\0\0heic"[..], "heic"),
+        (&b"\0\0\0\x14ftypheix\0\0\0\0heix"[..], "heic"),
+        (&b"\0\0\0\x14ftyphevc\0\0\0\0hevc"[..], "heic"),
+        (&b"\0\0\0\x14ftyphevx\0\0\0\0hevx"[..], "heic"),
+        (&b"\0\0\0\x14ftypmif1\0\0\0\0mif1"[..], "heic"),
+        (&b"\0\0\0\x14ftypmsf1\0\0\0\0msf1"[..], "heic"),
+        (&b"\xff\x0a"[..], "jxl"),
+        (&b"\0\0\0\x0cJXL \r\n\x87\n"[..], "jxl"),
+    ] {
+        assert_eq!(
+            capture_image_format_from_bytes(bytes).unwrap().extension(),
+            expected
+        );
+        assert_eq!(
+            capture_image_format_from_header(bytes).unwrap().extension(),
+            expected
+        );
+        for end in 0..bytes.len() {
+            assert!(
+                capture_image_format_from_bytes(&bytes[..end]).is_none(),
+                "{expected} truncated at {end}"
+            );
+        }
+        let mut damaged = bytes.to_vec();
+        damaged[0] ^= 0xff;
+        assert!(
+            capture_image_format_from_bytes(&damaged).is_none(),
+            "{expected}"
+        );
+    }
+}
+
+#[test]
+fn browser818_capture_file_bmff_bounds_compatible_brands_and_partial_probe() {
+    let compatible = b"\0\0\0\x18ftypmif1\0\0\0\0heicavif";
+    assert_eq!(
+        capture_image_format_from_bytes(compatible).unwrap().kind,
+        CaptureImageKind::Avif
+    );
+    // Clipboard's partial-header decoder routing remains major-brand based.
+    assert_eq!(
+        capture_image_format_from_header(&compatible[..12])
+            .unwrap()
+            .kind,
+        CaptureImageKind::Heic
+    );
+    assert!(capture_image_format_from_bytes(&compatible[..12]).is_none());
+    let extended = b"\0\0\0\x01ftyp\0\0\0\0\0\0\0\x1cavif\0\0\0\0avif";
+    assert_eq!(
+        capture_image_format_from_bytes(extended).unwrap().kind,
+        CaptureImageKind::Avif
+    );
+    let to_eof = b"\0\0\0\0ftypheic\0\0\0\0heic";
+    assert_eq!(
+        capture_image_format_from_bytes(to_eof).unwrap().kind,
+        CaptureImageKind::Heic
+    );
+    for invalid in [
+        &b"\0\0\0\x14ftypheic\0\0\0\0hei"[..], // Short declared box.
+        &b"\0\0\0\x11ftypheic\0\0\0\0x"[..],   // Misaligned brand list.
+        &b"\0\0\0\x0cftypheic"[..],            // Missing minor version.
+        &b"\0\0\0\x01ftyp\xff\xff\xff\xff\xff\xff\xff\xffavif\0\0\0\0"[..],
+        &b"\0\0\0\x14ftypabcd\0\0\0\0abcd"[..],
+        &b"<svg xmlns='http://www.w3.org/2000/svg'/>"[..],
+        &b"P6\n1 1\n255\n\xff\0\0"[..],
+    ] {
+        assert!(
+            capture_image_format_from_bytes(invalid).is_none(),
+            "{invalid:?}"
+        );
+    }
+}
+
+#[test]
 fn browser818_capture_file_names_match_released_single_and_batch_outputs() {
     assert_eq!(
         capture_filename(&timestamp(), None, 1, 1, 1, "png"),

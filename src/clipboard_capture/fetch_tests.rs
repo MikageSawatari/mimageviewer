@@ -573,6 +573,55 @@ fn total_deadline_covers_slow_headers_drip_bodies_and_redirect_remaining_time() 
 }
 
 #[test]
+fn browser818_capture_file_fetch_builtin_formats_keep_decoders_and_extensions() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("download.image");
+    let source =
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(2, 1, image::Rgb([23, 45, 67])));
+    for legacy in [
+        image::ImageFormat::Png,
+        image::ImageFormat::Jpeg,
+        image::ImageFormat::Gif,
+        image::ImageFormat::WebP,
+        image::ImageFormat::Bmp,
+        image::ImageFormat::Tiff,
+    ] {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        source.write_to(&mut encoded, legacy).unwrap();
+        let bytes = encoded.into_inner();
+        let capture_format =
+            capture_image_format_from_header(&bytes[..bytes.len().min(64)]).unwrap();
+        assert_eq!(image::guess_format(&bytes).unwrap(), legacy);
+        assert_eq!(fetched_builtin_format(capture_format.kind), Some(legacy));
+        assert_eq!(capture_format.extension(), legacy.extensions_str()[0]);
+        std::fs::write(&path, bytes).unwrap();
+        let (decoded, extension) = decode_fetched(&path).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (2, 1));
+        assert_eq!(extension, legacy.extensions_str()[0]);
+    }
+}
+
+#[test]
+fn browser818_capture_file_fetch_modern_headers_keep_wic_routing() {
+    for (bytes, expected) in [
+        (&b"\0\0\0\x10ftypavif\0\0\0\0"[..], "avif"),
+        (&b"\0\0\0\x10ftypavis\0\0\0\0"[..], "avif"),
+        (&b"\0\0\0\x10ftypheic\0\0\0\0"[..], "heic"),
+        (&b"\0\0\0\x10ftypheix\0\0\0\0"[..], "heic"),
+        (&b"\0\0\0\x10ftyphevc\0\0\0\0"[..], "heic"),
+        (&b"\0\0\0\x10ftyphevx\0\0\0\0"[..], "heic"),
+        (&b"\0\0\0\x10ftypmif1\0\0\0\0"[..], "heic"),
+        (&b"\0\0\0\x10ftypmsf1\0\0\0\0"[..], "heic"),
+        (&b"\xff\x0a"[..], "jxl"),
+        (&b"\0\0\0\x0cJXL \r\n\x87\n"[..], "jxl"),
+    ] {
+        let format = capture_image_format_from_header(bytes).unwrap();
+        assert_eq!(format.extension(), expected);
+        assert_eq!(fetched_builtin_format(format.kind), None);
+    }
+}
+
+#[test]
 fn oversized_png_header_is_rejected_without_decoder_fallback() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("oversized.image");

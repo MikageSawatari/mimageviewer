@@ -171,6 +171,104 @@ fn browser818_host_managed_destination_is_rejected_before_directory_creation() {
     }
 }
 #[test]
+#[cfg(windows)]
+fn browser818_host_month_junction_into_managed_generation_is_rejected_before_write() {
+    use std::os::windows::process::CommandExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let config = config(temp.path());
+    let managed = temp.path().join("browser-host");
+    let generation = managed.join("generation");
+    std::fs::create_dir_all(&generation).unwrap();
+    std::fs::create_dir(&config.output_dir).unwrap();
+    std::fs::write(generation.join("keep"), b"existing user image").unwrap();
+    assert!(!is_browser_host_destination(&config.output_dir, &managed).unwrap());
+    let month = config.output_dir.join(&timestamp().month);
+    let output = Command::new("cmd.exe")
+        .args(["/d", "/c", "mklink", "/J"])
+        .arg(&month)
+        .arg(&generation)
+        .creation_flags(0x08000000)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let mut fake = Fake::default();
+    let response = run(&config, &managed, request(), &mut fake);
+    let contents = std::fs::read_dir(&generation)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    let kept = std::fs::read(generation.join("keep")).unwrap();
+    // Remove only this TempDir-owned junction before assertions or recursive cleanup.
+    std::fs::remove_dir(&month).unwrap();
+    assert_eq!(response.error, Some(ErrorCode::InvalidDestination));
+    assert!(!response.ok);
+    assert!(response.path.is_none());
+    assert!(fake.motw.is_empty());
+    assert!(fake.args.is_empty());
+    assert_eq!(contents, vec![std::ffi::OsString::from("keep")]);
+    assert_eq!(kept, b"existing user image");
+    // A new ordinary month directory remains usable after removing the alias.
+    let accepted = run(&config, &managed, request(), &mut Fake::default());
+    assert!(accepted.ok);
+    assert_eq!(std::fs::read(accepted.path.unwrap()).unwrap(), PNG);
+    assert_eq!(std::fs::read_dir(&generation).unwrap().count(), 1);
+}
+
+#[test]
+fn browser818_host_tiff_heif_and_jxl_signatures_save_original_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = config(temp.path());
+    for (bytes, expected) in [
+        (&b"II*\0original"[..], "tiff"),
+        (&b"MM\0*original"[..], "tiff"),
+        (&b"\0\0\0\x14ftypheic\0\0\0\0heic"[..], "heic"),
+        (&b"\0\0\0\x14ftypmif1\0\0\0\0mif1"[..], "heic"),
+        (&b"\xff\x0aoriginal"[..], "jxl"),
+        (&b"\0\0\0\x0cJXL \r\n\x87\noriginal"[..], "jxl"),
+    ] {
+        let mut input = request();
+        input.data_b64 = STANDARD.encode(bytes);
+        input.content_type = "application/octet-stream".into();
+        let response = run(
+            &config,
+            &temp.path().join("browser-host"),
+            input,
+            &mut Fake::default(),
+        );
+        assert!(response.ok, "{expected}: {response:?}");
+        let path = response.path.unwrap();
+        assert_eq!(path.extension().unwrap(), expected);
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn browser818_host_corrupt_modern_signatures_are_rejected_without_saving() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = config(temp.path());
+    for bytes in [
+        &b"II+\0"[..],
+        &b"MM\0+"[..],
+        &b"\xff\x0b"[..],
+        &b"\0\0\0\x0cJXL!\r\n\x87\n"[..],
+        &b"\0\0\0\xffftypheic\0\0\0\0"[..],
+        &b"\0\0\0\x10ftypheic\0\0\0"[..],
+        &b"\0\0\0\x10ftypabcd\0\0\0\0"[..],
+    ] {
+        let mut input = request();
+        input.data_b64 = STANDARD.encode(bytes);
+        let mut fake = Fake::default();
+        let response = run(&config, &temp.path().join("browser-host"), input, &mut fake);
+        assert_eq!(response.error, Some(ErrorCode::InvalidImage), "{bytes:?}");
+        assert!(response.path.is_none());
+        assert!(fake.motw.is_empty());
+        assert!(fake.args.is_empty());
+        assert!(!config.output_dir.exists());
+    }
+}
+
+#[test]
 fn browser818_host_version_kind_urls_base64_and_image_validation() {
     let temp = tempfile::tempdir().unwrap();
     let config = config(temp.path());
