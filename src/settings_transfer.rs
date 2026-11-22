@@ -136,6 +136,9 @@ fn set_still_chrome(settings: &mut Settings, value: &StillChrome) {
 }
 
 macro_rules! transfer_get {
+    ($s:expr, $f:ident, vst3_paths) => {
+        stage1_vst3_paths($s)
+    };
     ($s:expr, $f:ident, video_lock) => {
         stage1_video_lock($s)
     };
@@ -150,6 +153,9 @@ macro_rules! transfer_get {
     };
 }
 macro_rules! transfer_set {
+    ($s:expr, $f:ident, $v:expr, vst3_paths) => {
+        stage1_set_vst3_paths($s, $v)
+    };
     ($s:expr, $f:ident, $v:expr, video_lock) => {
         stage1_set_video_lock($s, $v)
     };
@@ -768,7 +774,7 @@ preferences_policy! {
         toolbar_section_new_row => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         toolbar_section_drag_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         menu_layout => @prefs("メニューの並びと表示", "menu/layout", valid_menu_layout, plain, plain) "既存の操作カスタマイズ共有が正本";
-        context_menu_layout => @prefs("右クリックメニューの並びと表示", "context-menu/layout", valid_menu_layout, plain, plain) "既存の操作カスタマイズ共有が正本";
+        context_menu_layout => @prefs("右クリックメニューの並びと表示", "context-menu/layout", valid_context_menu_layout, plain, plain) "既存の操作カスタマイズ共有が正本";
         keymap => "既存の操作カスタマイズ共有が正本";
         recent_open_with_apps => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         custom_open_with_apps => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -783,7 +789,7 @@ preferences_policy! {
         ai_denoise_skip_px => "同上";
         ai_upscale_size_limit => @prefs("AI アップスケールの入力サイズ上限", "prefetch/ai-size-limit", valid_ai_limit, plain, plain) "同上";
         ai_denoise_size_limit => @prefs("AI ノイズ除去の入力サイズ上限", "prefetch/ai-size-limit", valid_ai_limit, plain, plain) "同上";
-        ai_backend => "同上";
+        ai_backend => @prefs("AI 推論バックエンド", "ai-backend/backend", valid_ai_backend, plain, plain) "同上";
         erase_inpaint_mono_tolerance => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         global_preset => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         preset_slots => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -791,8 +797,8 @@ preferences_policy! {
         post_filter_preset_slot_stashes => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         colorize_preset_slots => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         metadata_export_recursive => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
-        susie_enabled => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
-        susie_allow_parallel => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
+        susie_enabled => @prefs("Susie 画像プラグインを有効にする", "susie/enabled", |_, _| true, plain, plain) "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
+        susie_allow_parallel => @prefs("プラグインを並列実行する (推奨: ON)", "susie/parallel", |_, _| true, plain, plain) "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         skip_offline_change_scan => @prefs("起動時のオフライン変更走査を省略する", "indexer/offline-change-scan", |_, _| true, plain, plain) "同上";
         update_check_enabled => @prefs("新バージョンを自動的に確認する", "update/automatic", |_, _| true, plain, plain) "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
         update_check_dismissed_version => "初回/学習/通知/保存版の内部記録";
@@ -840,8 +846,8 @@ preferences_policy! {
         detached_viewer_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         detached_viewer_window_placement => "runtime overlay / PC のウィンドウ配置";
         detached_viewer_window_physical_placement => "runtime overlay / PC のウィンドウ配置";
-        vst3_enabled => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
-        vst3_plugins => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
+        vst3_enabled => @prefs("VST3 プラグイン処理を有効にする", "vst3/enabled", |_, _| true, plain, plain) "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
+        vst3_plugins => @prefs("VST3 プラグインチェーン", "vst3/enabled", valid_vst3_paths, vst3_paths, vst3_paths) "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         vst3_plugin_path => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         vst3_plugin_state => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         vst3_gui_visible => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";

@@ -705,6 +705,8 @@ UI スレッドで、次のどれかなら拒む (何も変えない)。
 - **起動方法は、実行ファイル (`Executable`) と OS の既定 (`OsDefault`) を AI が作れる**。関連付け (`Association`) の
   `handler_id` は OS の列挙からしか得られない (`src/open_with.rs:84`) ので、AI が新しく作る経路は今回作らない。
   既にある関連付けの要素は、AI が並べ替え・削除・名前などの変更をしても、`handler_id` はそのまま保たれる。
+  **削除した関連付けの要素は AI 側からは復元できない** (新規の関連付けを作る経路は無いため)。削除の変更行と応答に
+  「AI 側からは復元できません。環境設定の画面で登録し直してください」と出す。復元専用の経路は足さない。
   関連付けで開くのと同じアプリは、実行ファイルを指定すれば登録できる。
 
 **実行は、利用者が mIV で選んだときだけ**。コードで確かめた実行の経路は、右クリックメニューの「○○で開く」
@@ -905,6 +907,8 @@ tool を 1 本にする理由: 「登録する」と「索引を切り替える�
   外部ツールの一覧は要素ごとに「追加・変更・削除: 名前 — 実行ファイル 引数」の行を返す (§6.8)。項目ごとの表は持たない。
 - **取り消し**: 専用の tool は作らない。`set_settings`・`set_favorite` の応答に変更前の値が入っているので、
   **環境設定の値と、登録済みのお気に入りの索引の ON / OFF は**、AI が同じ tool に変更前の値を渡せば戻せる。
+  ただし、**削除した外部ツールの関連付け (`Association`) は例外**。AI 側からは復元できず、利用者が環境設定の画面で
+  登録し直す (§6.8)。削除の変更行・応答にもこの制限を表示する。
   **新しく登録したお気に入りの取り消し (削除) は AI からはできない** (削除は対象外、§8.1)。利用者が
   「お気に入り → 編集」で削除する。tool の説明と応答にそう書く。
   **値を戻しても、確定の副作用で消えたものは戻らない** (検索欄の入力履歴の保存をオフにして消えた履歴、§6.4)。利用者は「AI による変更」を見て、
@@ -1215,8 +1219,8 @@ ZIP の prefix と PDF の 0 始まり `page_n` は既存の `list_folder` の�
 含めた静的見積もりは現時点の tools/list 43,959 字、残り草案込み 47,351 字 (予約枠 512 字を除いて 137 字残る)。
 detached 述語・viewport routing の変更は無い。実装担当は Cargo ビルド・テストを実行しない。
 
-C の実装 (2026-11-23、ビルド・テストは設計担当の共有 runner 待ち): 第 1 段は **217 鍵**
-(export 165 + 除外側の印 52)。型の trait が選択肢・変更行・外部ツールの登録例を作る。
+C の実装 (2026-11-23、ビルド・テストは設計担当の共有 runner 待ち): 第 1 段は **222 鍵**
+(export 165 + 除外側の印 57)。型の trait が選択肢・変更行・外部ツールの登録例を作る。
 export の検査と書き込みは既存の `parse_items` / `ParsedPreferences::apply_to` を通す。
 除外側も型付きで検査し、UI と範囲の定数を共有する。読み込み時の正規化は clone 上で要求鍵だけを
 検査し、要求していない項目は変えない。
@@ -1244,7 +1248,7 @@ instructions のガイド追加は 257 字、全体は 1,109 UTF-16 単位。
 副作用とスクリプトの反映時期をマニュアル 6 ページで補足した。公開文言の全体更新は E。
 確定区間に `agent/set_settings_commit` の計測を追加。時間の実測は共有 runner / 利用者の検証待ち。
 
-除外側で第 1 段に加えた鍵と画面の anchor (52 鍵):
+除外側で第 1 段に加えた鍵と画面の anchor (57 鍵):
 
 | 鍵 | anchor |
 | --- | --- |
@@ -1292,6 +1296,9 @@ instructions のガイド追加は 257 字、全体は 1,109 UTF-16 単位。
 | `retained_final_ai_cache_max_mib` | `prefetch/retained-ai-memory` |
 | `ai_upscale_size_limit` | `prefetch/ai-size-limit` |
 | `ai_denoise_size_limit` | `prefetch/ai-size-limit` |
+| `ai_backend` | `ai-backend/backend` |
+| `susie_enabled` | `susie/enabled` |
+| `susie_allow_parallel` | `susie/parallel` |
 | `skip_offline_change_scan` | `indexer/offline-change-scan` |
 | `update_check_enabled` | `update/automatic` |
 | `perf_log_enabled` | `developer/performance-log` |
@@ -1300,6 +1307,8 @@ instructions のガイド追加は 257 字、全体は 1,109 UTF-16 単位。
 | `reading_history_limit` | `resume/history-limit` |
 | `video_hw_decode` | `video/hardware-decode` |
 | `video_deinterlace` | `video/deinterlace` |
+| `vst3_enabled` | `vst3/enabled` |
+| `vst3_plugins` | `vst3/enabled` |
 
 `video_seek_bar_locked` は 2 bool の個別編集ではなく、helper と同じ 3 値
 (`None` / `BarOnly` / `BarAndStrip`) を読む・書く。`video_seek_strip_locked` は別の鍵にしない。

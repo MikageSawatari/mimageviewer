@@ -26,6 +26,7 @@ pub(crate) struct Stage1Change {
 
 pub(crate) const PARALLELISM_MAX: usize = 64;
 pub(crate) const RAW_PARALLELISM_MAX: u8 = 10;
+pub(crate) const VST3_CHAIN_MAX_LEN: usize = 10;
 pub(crate) const PREFETCH_MAX: usize = 50;
 pub(crate) const THUMB_PREFETCH_MAX: u32 = 20;
 pub(crate) const AI_PREFETCH_MAX: usize = 10;
@@ -122,6 +123,47 @@ pub(super) fn stage1_decode<T: Serialize + DeserializeOwned>(
 }
 pub(super) fn unique_strings(v: &Vec<String>) -> bool {
     v.iter().all(|s| !s.trim().is_empty()) && v.iter().collect::<HashSet<_>>().len() == v.len()
+}
+pub(super) fn valid_ai_backend(value: &Option<String>, _: &Value) -> bool {
+    use crate::ai::AiBackend;
+    value.as_deref().is_none_or(|name| {
+        matches!(
+            AiBackend::from_str(name),
+            Some(AiBackend::DirectMl | AiBackend::TensorRt)
+        )
+    })
+}
+pub(super) fn stage1_vst3_paths(settings: &Settings) -> Vec<String> {
+    settings
+        .vst3_plugins
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect()
+}
+pub(super) fn valid_vst3_paths(paths: &Vec<String>, _: &Value) -> bool {
+    paths.len() <= VST3_CHAIN_MAX_LEN
+        && unique_strings(paths)
+        && paths.iter().all(|path| absolute(Path::new(path)))
+}
+pub(super) fn stage1_set_vst3_paths(settings: &mut Settings, paths: &[String]) {
+    let mut existing = HashMap::with_capacity(settings.vst3_plugins.len());
+    for entry in &settings.vst3_plugins {
+        // Match Preferences' first matching live entry even for legacy duplicates.
+        existing.entry(entry.path.as_str()).or_insert(entry);
+    }
+    let entries = paths
+        .iter()
+        .map(|path| {
+            existing
+                .get(path.as_str())
+                .map(|entry| (**entry).clone())
+                .unwrap_or_else(|| Vst3PluginEntry {
+                    path: path.clone(),
+                    ..Default::default()
+                })
+        })
+        .collect();
+    settings.vst3_plugins = entries;
 }
 pub(super) fn valid_ai_limit(
     v: &Option<crate::ai::upscale::AiProcessSizeLimit>,
@@ -886,7 +928,14 @@ fn external_tool_lines(
             None => lines.push((
                 format!("外部ツールを削除: {}", old.display_name()),
                 tool_description(old, position),
-                String::new(),
+                if matches!(
+                    &old.launch,
+                    crate::external_tool::ExternalToolLaunch::Association { .. }
+                ) {
+                    "AI 側からは復元できません。環境設定の画面で登録し直してください".into()
+                } else {
+                    String::new()
+                },
             )),
             _ => {}
         }
@@ -1032,7 +1081,8 @@ mod tests {
         ] {
             assert!(
                 stage1_validate(&settings, &change(key, Value::Null))
-                    .unwrap_err()
+                    .err()
+                    .expect("permission keys must be refused")
                     .contains("AI からは変えられません"),
                 "{key}"
             );
@@ -1044,16 +1094,12 @@ mod tests {
             "ring_shortcuts",
             "keymap",
             "ui_font",
-            "susie_enabled",
-            "susie_allow_parallel",
-            "vst3_plugins",
-            "vst3_enabled",
-            "ai_backend",
         ] {
             assert!(!rows.iter().any(|row| row.key == key), "{key}");
             assert!(
                 stage1_validate(&settings, &change(key, Value::Null))
-                    .unwrap_err()
+                    .err()
+                    .expect("stage-2 keys must be refused")
                     .contains("まだ AI からは変えられません"),
                 "{key}"
             );
@@ -1306,6 +1352,116 @@ mod tests {
         );
     }
     #[test]
+    fn stage1_restored_keys_and_vst_paths_validate_and_preserve_live_runtime_state() {
+        let mut settings = default_settings();
+        let path = std::env::temp_dir()
+            .join("miv-stage1-existing.vst3")
+            .to_string_lossy()
+            .into_owned();
+        let added = std::env::temp_dir()
+            .join("miv-stage1-added.vst3")
+            .to_string_lossy()
+            .into_owned();
+        settings.vst3_plugins.push(Vst3PluginEntry {
+            path: path.clone(),
+            bypass: true,
+            user_hidden: true,
+            state: Some("PRIVATE_PLUGIN_STATE".into()),
+            gui_pos: Some((12, 34)),
+            gui_size: Some((640, 480)),
+        });
+        let rows = capture_stage1(&settings, false, false);
+        for key in [
+            "susie_enabled",
+            "susie_allow_parallel",
+            "vst3_enabled",
+            "vst3_plugins",
+            "ai_backend",
+        ] {
+            assert!(rows.iter().any(|row| row.key == key), "{key}");
+        }
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.key == "vst3_plugins")
+                .unwrap()
+                .value,
+            json!([path])
+        );
+        let request = Map::from_iter([
+            ("susie_enabled".into(), json!(!settings.susie_enabled)),
+            (
+                "susie_allow_parallel".into(),
+                json!(!settings.susie_allow_parallel),
+            ),
+            ("vst3_enabled".into(), json!(!settings.vst3_enabled)),
+            ("vst3_plugins".into(), json!([added, path])),
+            ("ai_backend".into(), json!("directml")),
+        ]);
+        let mut candidate = stage1_validate(&settings, &request).unwrap();
+        assert_eq!(
+            candidate.vst3_plugins[1].state,
+            settings.vst3_plugins[0].state
+        );
+        assert!(candidate.vst3_plugins[1].bypass);
+        assert!(candidate.vst3_plugins[1].user_hidden);
+        assert_eq!(candidate.vst3_plugins[1].gui_pos, Some((12, 34)));
+        assert_eq!(candidate.vst3_plugins[1].gui_size, Some((640, 480)));
+        assert!(candidate.vst3_plugins[0].state.is_none());
+        let mut live = settings.clone();
+        live.vst3_plugins[0].state = Some("LATEST_PLUGIN_STATE".into());
+        let initial_wheel = live.ring_shortcuts.video_normal_wheel_action;
+        crate::ui_dialogs::preferences::prepare_preferences_edited_settings_for_commit(
+            &mut candidate,
+            initial_wheel,
+            &mut live,
+        );
+        assert_eq!(
+            candidate.vst3_plugins[1].state.as_deref(),
+            Some("LATEST_PLUGIN_STATE")
+        );
+        let wire = serde_json::to_string(&capture_stage1(&candidate, false, false)).unwrap();
+        assert!(!wire.contains("PRIVATE_PLUGIN_STATE"));
+        assert!(!wire.contains("LATEST_PLUGIN_STATE"));
+        for invalid in [
+            json!([path, path]),
+            json!(["relative.vst3"]),
+            json!([{"path": path, "state":"must not accept runtime state"}]),
+            json!(
+                (0..=VST3_CHAIN_MAX_LEN)
+                    .map(|index| std::env::temp_dir().join(format!("miv-stage1-{index}.vst3")))
+                    .collect::<Vec<_>>()
+            ),
+        ] {
+            assert!(stage1_validate(&settings, &change("vst3_plugins", invalid)).is_err());
+        }
+        let ten = (0..VST3_CHAIN_MAX_LEN)
+            .map(|index| std::env::temp_dir().join(format!("miv-stage1-{index}.vst3")))
+            .collect::<Vec<_>>();
+        assert!(stage1_validate(&settings, &change("vst3_plugins", json!(ten))).is_ok());
+        assert!(stage1_validate(&settings, &change("ai_backend", json!("not-a-backend"))).is_err());
+    }
+
+    #[test]
+    fn stage1_association_deletion_reports_manual_reregistration_and_refuses_ai_restore() {
+        use crate::external_tool::*;
+        let mut settings = default_settings();
+        let mut association = ExternalTool::defaults_for_viewing();
+        association.name = "関連付けのテスト".into();
+        association.launch = ExternalToolLaunch::Association {
+            handler_id: "existing-handler".into(),
+        };
+        settings.external_tools = vec![association];
+        let before = serde_json::to_value(&settings.external_tools).unwrap();
+        let after = stage1_validate(&settings, &change("external_tools", json!([]))).unwrap();
+        let changes = stage1_changes(&settings, &after, &["external_tools".into()]);
+        assert_eq!(changes[0].lines.len(), 1);
+        let (item, _, message) = &changes[0].lines[0];
+        assert!(item.contains("削除"));
+        assert!(message.contains("AI 側からは復元できません"));
+        assert!(message.contains("環境設定の画面で登録し直して"));
+        assert!(stage1_validate(&after, &change("external_tools", before)).is_err());
+    }
+    #[test]
     fn stage1_numeric_noop_is_typed_and_unchanged_fields_do_not_reject_migrations() {
         let settings = default_settings();
         let candidate = stage1_validate(&settings, &change("video_volume", json!(1))).unwrap();
@@ -1338,6 +1494,10 @@ mod tests {
                 .map(|choice| choice.value)
                 .collect::<Vec<_>>();
             match row.key.as_str() {
+                "ai_backend" => alternatives.push(json!("directml")),
+                "vst3_plugins" => {
+                    alternatives.push(json!([std::env::temp_dir().join("miv-stage1-owner.vst3")]))
+                }
                 "parallelism" => alternatives.push(json!(Parallelism::Manual(1))),
                 "file_organize_destinations" => {
                     alternatives.push(json!([FileOrganizeDestination {

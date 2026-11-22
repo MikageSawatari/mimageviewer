@@ -3,6 +3,7 @@ use super::*;
 use crate::agent_ipc::changes::{
     ChangeCounts, ChangeRecord, ChangeRecordId, ChangeRow, ChangeRowOutcome, ChangeRowResult,
 };
+use crate::settings::Settings;
 use mimageviewer_agent_ipc::{
     AgentError, AgentLevel, ErrorCode, MAX_ITEM_CHARS, MAX_PAGE_CHARS, MAX_SETTINGS_KEYS, PageRow,
     SETTINGS_PAGE_SIZE, SettingChange, SettingChangeRow, SettingChoice, SettingRow, SettingsPage,

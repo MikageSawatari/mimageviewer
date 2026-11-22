@@ -4,7 +4,9 @@ use super::*;
 use crate::agent_ipc::changes::{ChangeRowOutcome, ChangeRowResult};
 use crate::agent_ipc::open::{OpenController, UiOpenOutcome, UiRequestKind};
 use crate::app::tests::phase_c_support::{AppTestEnv, setup_app};
-use crate::settings::{FavoriteViewState, FullscreenWheelAction, ReadingFlow, SpreadMode};
+use crate::settings::{
+    FavoriteViewState, FullscreenWheelAction, ReadingFlow, Settings, SpreadMode,
+};
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::mpsc;
@@ -497,6 +499,100 @@ fn agent_settings_oversized_external_tool_response_is_refused_before_commit() {
     assert!(app.pref_state.is_none());
     assert!(!app.show_preferences);
     assert_no_publication(&app);
+}
+
+#[test]
+fn agent_settings_association_deletion_explains_restore_limit_in_response_record_and_notice() {
+    use crate::external_tool::{ExternalTool, ExternalToolLaunch};
+    let ctx = egui::Context::default();
+    let mut app = fixture(&ctx);
+    let mut tool = ExternalTool::defaults_for_viewing();
+    tool.name = "関連付けテスト".into();
+    tool.launch = ExternalToolLaunch::Association {
+        handler_id: "existing-handler".into(),
+    };
+    app.settings.external_tools = vec![tool];
+    assert!(app.settings.save_checked());
+    let result = app
+        .agent_set_settings(
+            &changes(json!({"external_tools":[]})),
+            "association-delete",
+            &ctx,
+        )
+        .unwrap();
+    assert_eq!(result.changed.len(), 1);
+    let change = &result.changed[0];
+    assert_eq!(change.rows.len(), 1);
+    let message = &change.rows[0].after;
+    assert!(message.contains("AI 側からは復元できません"));
+    assert!(message.contains("環境設定の画面で登録し直して"));
+    let ui = app.agent_changes.as_ref().unwrap();
+    let records = ui.controller.records();
+    assert_eq!(records.lock().unwrap().entries()[0].rows[0].after, *message);
+    assert!(ui.notices.try_recv().unwrap().contains(message));
+    assert!(app.settings.external_tools.is_empty());
+    assert!(Settings::load().external_tools.is_empty());
+    let restore = changes(json!({"external_tools":change.before}));
+    assert_eq!(
+        app.agent_set_settings(&restore, "association-restore", &ctx)
+            .unwrap_err()
+            .code,
+        ErrorCode::BadRequest
+    );
+    assert!(app.settings.external_tools.is_empty());
+    assert_final_budget(&result);
+}
+
+#[test]
+fn agent_settings_vst_paths_commit_preserves_runtime_state_and_hides_it_from_wire() {
+    let ctx = egui::Context::default();
+    let mut app = fixture(&ctx);
+    // Keep processing disabled: this headless write never starts a plugin worker.
+    app.settings.vst3_enabled = false;
+    let existing = app
+        .tmp
+        .path()
+        .join("existing.vst3")
+        .to_string_lossy()
+        .into_owned();
+    let added = app
+        .tmp
+        .path()
+        .join("added.vst3")
+        .to_string_lossy()
+        .into_owned();
+    app.settings.vst3_plugins = vec![crate::settings::Vst3PluginEntry {
+        path: existing.clone(),
+        state: Some("PRIVATE_RUNNING_VST_STATE".into()),
+        bypass: true,
+        user_hidden: true,
+        gui_pos: Some((12, 34)),
+        gui_size: Some((640, 480)),
+    }];
+    assert!(app.settings.save_checked());
+    let paths = json!([added, existing]);
+    let result = app
+        .agent_set_settings(&changes(json!({"vst3_plugins":paths})), "vst-paths", &ctx)
+        .unwrap();
+    assert_eq!(detail(&app, "vst3_plugins").value, paths);
+    let saved = Settings::load();
+    for entries in [&app.settings.vst3_plugins, &saved.vst3_plugins] {
+        assert_eq!(
+            entries[1].state.as_deref(),
+            Some("PRIVATE_RUNNING_VST_STATE")
+        );
+        assert!(entries[1].bypass && entries[1].user_hidden);
+        assert_eq!(entries[1].gui_pos, Some((12, 34)));
+        assert_eq!(entries[1].gui_size, Some((640, 480)));
+        assert!(entries[0].state.is_none());
+    }
+    assert!(
+        !serde_json::to_string(&result)
+            .unwrap()
+            .contains("PRIVATE_RUNNING_VST_STATE")
+    );
+    assert!(app.pref_state.is_none());
+    assert_final_budget(&result);
 }
 
 #[test]

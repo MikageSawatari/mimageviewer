@@ -9376,7 +9376,7 @@ fn draw_audio_normalize_cache_controls(ui: &mut egui::Ui, state: &mut Preference
 pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
     use crate::settings::Vst3PluginEntry;
 
-    const MAX_CHAIN_LEN: usize = 10;
+    const MAX_CHAIN_LEN: usize = crate::settings_transfer::stage1::VST3_CHAIN_MAX_LEN;
 
     let mut scan_finished: Option<Result<Vec<crate::video::dsp::DiscoveredPlugin>, String>> = None;
     let mut scan_disconnected = false;
