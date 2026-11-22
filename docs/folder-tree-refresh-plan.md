@@ -1003,3 +1003,27 @@ UI 文言とキー操作の追加はない (マウスの固定操作の意味を
 §14.7を含む採択設計からの差はない。新しいpending・世代・タイマー・retry・追加repaint・同期fallback・機能制限による回避は追加していない。UI文言、keymap、spec、マニュアル、backlog、detached述語/viewport実装は変更していない。
 
 禁止事項に従い、cargo / rustc / テスト / ビルド / 整形 / 製品起動 / git変更操作は未実施。再開後はread-onlyのgit操作も行っていない。ソースのAPI・型追随・所有・優先順位は静的に照合したが、コンパイル・cfg(test-script) / Windows分岐・sidecar / stack / window fixture成立・既存回帰・実機応答性は共有runnerと設計担当の検収待ち。既存DB読取を共通preflightのworkerへ移す案は別backlog候補として統括へ引き継ぎ、ここでは実装しない。
+
+### 14.9 速いダブルクリックで枝が開閉しない (NG-1、2026-11-22、ClaudeCode)
+
+- 観測 (サブ PC 担当、master `0e1b617b0` と診断ログ付きの `5bb98d489`):
+  - 画面操作ツールのダブルクリック (押下の間隔約 30ms) とトリプルクリックで、今開いているフォルダの枝が開閉しない。
+  - 間隔 100ms では開閉する。今開いていないフォルダでは開閉する。
+- 診断ログの並び: pass N で `single` → `reclick accepted`、pass N+1 で `sidecar restore started` → `reset: PointerWitnessMismatch`。
+- 原因:
+  - 再クリックの更新 (14.1) は実フォルダの履歴遷移で、結果は pass の先頭の `render_update_before_frame` で反映され、サイドカー復元がそこで始まる。
+  - 開始処理はその場で ROOT の入力から押下を取り除いていた。
+  - 関門 (`input_update_begin`) は「名前の認識 → 除去」の順だが、この pass では除去が先に済んでいた。名前の認識は、押下の消えたイベントと押下の残る `pointer_button_targets()` の食い違いでジェスチャを消した。
+  - 今開いていないフォルダを開くとき (ペインの Open) は、復元が関門の後に始まるので起きない。§1.828 で、関門の前に復元を始める入口が初めてツリーの操作から生まれた。
+- 既存のテストで再現しなかった理由:
+  - テストの組み立てが `edit_preview_repaint_ctx` を設定していなかったので、開始時のその場での除去が走らなかった。
+  - 本番ではこの値は毎 pass 設定される。
+- 修正 (`0574848c2`):
+  - root の関門を pass 番号付きで記録する。
+  - 3 か所の開始時の除去を 1 つの helper に集約する。
+  - ROOT の viewport の入力の除去だけを、関門の前なら関門まで待たせる。
+  - 判定・CancelClose・context のジェスチャの終了は開始時のまま。
+  - 別ウィンドウの扱いは [detached-rework-plan §11](detached-rework-plan.md) に記録した。
+- テスト: 3 か所 × 関門の前・後、子 viewport、pass の外、古い要求、retained shift の開始元 context、NG-1 のダブル・トリプル (本番の repaint context つき)。修正前の挙動では 7 件が失敗する。
+- 診断ログ (`e02671ab7`) は製品に残す。ジェスチャの途中だけ 1〜2 行。
+- 実機 (サブ PC) は未確認。
