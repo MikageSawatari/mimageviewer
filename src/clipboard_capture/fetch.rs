@@ -1,9 +1,8 @@
 //! Dialog-scoped network ownership and a process-wide four-worker budget.
 //! UI calls only submit work and poll the bounded result channel.
-use super::data::{
-    CaptureOrigin, CaptureTimestamp, capture_filename, validate_dimensions, write_motw,
-};
+use super::data::validate_dimensions;
 use crossbeam_channel::{Receiver, Sender, bounded};
+use mimageviewer_capture_file::{CaptureOrigin, CaptureTimestamp, capture_filename, write_motw};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fs::File;

@@ -16,6 +16,7 @@ members = [
     "crates/musicvideo-editor",
     "crates/remote-ipc",
     "crates/agent-ipc",
+    "crates/capture-file",
     "crates/mcp-server",
     "crates/remote-web",
     "crates/vst3-host-tester",
@@ -388,6 +389,7 @@ windows-numerics = "0.2"
 winreg = "0.52"
 
 [dependencies]
+mimageviewer-capture-file = { path = "crates/capture-file" }
 miv-startup = { path = "crates/startup-diagnostics" }
 eframe = { version = "0.37.0", features = ["wgpu", "glow"] }
 egui = "0.37.0"

@@ -885,6 +885,12 @@ detachedは既存の共通パネルを使い、述語・viewport・bundleの交�
 
 ### その他
 
+`crates/capture-file` (`mimageviewer-capture-file`) は取り込みのファイル名・日時と月・
+出どころ URL・Mark of the Web を共有する軽量部品 (§1.818 段階1)。画像デコード・
+clipboard API・egui・本体 crate に依存せず、PNG 保存と HTML 取り込みが同じ規則を使う。
+ブラウザ連携の保存先と管理フォルダの重複判定も同部品に置く (呼出元は後続段階)。
+MOTW 書込みと保存先の祖先解決は worker 上でのみ行い、既存の保存形式・公開処理は変えない。
+
 | モジュール | 役割 |
 | --- | --- |
 | `gpu_info.rs` | GPU 情報取得 (VRAM サイズ等)。取得失敗時の 4 GiB fallback を含む共有 pool の入力を提供する |

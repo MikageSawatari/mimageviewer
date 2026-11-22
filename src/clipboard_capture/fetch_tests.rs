@@ -860,6 +860,63 @@ fn background_save_same_prefix_collision_direct_and_monthly_partial_failure() {
 }
 
 #[test]
+fn browser818_capture_file_html_single_and_batch_share_names_and_motw() {
+    let root = tempfile::tempdir().unwrap();
+    let output = root.path().join("not-created-yet");
+    let service = CaptureFetchService::new(root.path().join("data")).unwrap();
+    for (count, collision) in [(1, ""), (3, "-2")] {
+        let session = service.start(
+            "https://my_site.example/post#fragment".into(),
+            vec![data_url(); count],
+            CaptureDestination::Monthly(Some(output.clone())),
+            timestamp(),
+            egui::Context::default(),
+        );
+        let images = collect(&session).into_iter().map(Result::unwrap).collect();
+        session.save(images).unwrap();
+        let summary = loop {
+            if let CaptureFetchEvent::SaveComplete(summary) = session
+                .results
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+            {
+                break summary;
+            }
+        };
+        assert_eq!(
+            (summary.saved, summary.failed, summary.metadata_failed),
+            (count, 0, 0)
+        );
+        for (index, path) in summary.paths.iter().enumerate() {
+            assert_eq!(path.parent().unwrap(), output.join("2026-10"));
+            assert_eq!(
+                path.file_name().unwrap().to_str().unwrap(),
+                format!(
+                    "20261002-153012-345{collision}-my-site.example_{:02}.png",
+                    index + 1
+                )
+            );
+            assert_eq!(std::fs::read(path).unwrap(), png());
+            #[cfg(windows)]
+            {
+                let mut ads = path.as_os_str().to_os_string();
+                ads.push(":Zone.Identifier");
+                // data: image URLs are not MOTW hosts. The shared writer keeps the
+                // page URL only, exactly as the released HTML capture path does.
+                assert_eq!(
+                    std::fs::read(PathBuf::from(ads)).unwrap(),
+                    b"[ZoneTransfer]\r\nZoneId=3\r\nReferrerUrl=https://my_site.example/post\r\n"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        std::fs::read(output.join("2026-10/20261002-153012-345-my-site.example_01.png")).unwrap(),
+        png()
+    );
+}
+
+#[test]
 fn startup_cleans_only_service_owned_tree_before_new_session_directory() {
     let root = tempfile::tempdir().unwrap();
     let orphan = root.path().join("tmp/clipboard-capture/orphan/0.image");

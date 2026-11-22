@@ -125,6 +125,15 @@ launcher が未起動と判断して core を起動しても、その後 core �
 
 ### 段階1：保存名と Mark of the Web の共有部品
 
+実装記録 (2026-11-22): `mimageviewer-capture-file` へ既存の名前・日時・URL・MOTW の規則を抽出。
+clipboard の保存・公開処理と既存テストは本体に残し、HTML 取り込みも同じ crate を使う。
+`CaptureOrigin::from_browser_urls` はページ URL と最終 URL を受け取り、既存の MOTW 境界で無害化する。
+§0 の共通判定は `is_browser_host_destination(destination, browser_host_dir)`。
+worker 上で既存の祖先 (junction・短縮名を含む) を解決し、未作成の末尾・`..`・区切り・Windows の大文字小文字を扱う。
+判定不能はエラーで返し、許可とみなさない。ディレクトリは作らず、比較後の別プロセスによる祖先の置換を防ぐ保証は持たない。
+この段階では呼出元を接続しない。新規テストは `browser818_capture_file` filter。
+ビルド・テストは実装担当では未実行 (設計担当の共有実行枠へ引き渡す)。既存の永続形式は変えず、移行は不要。
+
 **範囲**
 
 既存：
