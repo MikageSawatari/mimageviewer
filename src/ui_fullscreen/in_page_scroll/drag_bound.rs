@@ -1,6 +1,13 @@
 //! Canvas-only drag bounds from the owning display unit's painted geometry.
 use super::*;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FsBoundedDragPanOutcome {
+    OutsideSurface,
+    WaitingForLayout,
+    Position(Vec2),
+}
+
 /// Snap the unit edge's integer residue before truncating toward zero.
 pub(super) fn trunc_drag_bound_edge_delta(delta: f32, pixel: f32) -> f32 {
     let pixels = delta / pixel;
@@ -65,6 +72,15 @@ pub(super) fn bounded_drag_pan(layout: &FullscreenPageLayout, cur: Vec2, propose
             let max =
                 cur[axis] + trunc_drag_bound_edge_delta(viewport.min[axis] - unit.min[axis], pixel);
             candidate[axis] = proposed[axis].clamp(min.min(cur[axis]), max.max(cur[axis]));
+        } else if unit.min[axis] < viewport.min[axis] {
+            // A fitting unit outside the viewport may return only inward (§8.2).
+            let max =
+                cur[axis] + trunc_drag_bound_edge_delta(viewport.min[axis] - unit.min[axis], pixel);
+            candidate[axis] = proposed[axis].clamp(cur[axis], max);
+        } else if unit.max[axis] > viewport.max[axis] {
+            let min =
+                cur[axis] + trunc_drag_bound_edge_delta(viewport.max[axis] - unit.max[axis], pixel);
+            candidate[axis] = proposed[axis].clamp(min, cur[axis]);
         }
     }
 
@@ -127,29 +143,29 @@ impl App {
                     .all(|page| !crate::displayed_image_transform::free_rotation_is_applied(page.transform.free_rotation_rad)))
     }
 
-    /// Return whether this drag belongs to the bounded reader, including waits.
+    /// Only a matched position may rebase the owning canvas drag's origin.
     pub(crate) fn apply_fs_bounded_drag_pan(
         &mut self,
         ctx: &egui::Context,
         proposed: Vec2,
-    ) -> bool {
+    ) -> FsBoundedDragPanOutcome {
         // Check the static domain before building the geometry key.
         if !self.fs_bounded_drag_pan_surface(false) {
-            return false;
+            return FsBoundedDragPanOutcome::OutsideSurface;
         }
         let layout_matches = self.fs_scroll_layout_matches(ctx);
         if !self.fs_bounded_drag_pan_surface(layout_matches) {
-            return false;
+            return FsBoundedDragPanOutcome::OutsideSurface;
         }
         self.clear_fs_initial_placement_request();
         if !layout_matches {
-            return true;
+            return FsBoundedDragPanOutcome::WaitingForLayout;
         }
         let pan = bounded_drag_pan(&self.fullscreen_page_layout, self.fs_pan, proposed);
         if pan != self.fs_pan {
             self.fs_zoom = self.fs_page_scroll_drawn_zoom();
             self.fs_pan = pan;
         }
-        true
+        FsBoundedDragPanOutcome::Position(pan)
     }
 }
