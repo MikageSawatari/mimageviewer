@@ -1,6 +1,6 @@
 # §1.851 見つからない項目をまとめて外す — 設計
 
-- 状態: 設計 (2026-11-22、独立レビュー待ち)。実装は統括の合図の後。
+- 状態: 設計 ACCEPT (2026-11-22、Codex gpt-6.1-sol / xhigh の独立レビュー 4 回目で ACCEPT、HEAD 8f3d50443)。実装は統括の合図の後。
 - 正本: バックログ [next-release-backlog.md §1.851](next-release-backlog.md)。コレクション全体の所有境界は
   [collection-implementation-plan.md](collection-implementation-plan.md) §5・§6・§9・§20・§21。
 - 対象版: v5.6.0 候補 (修正量が小さければ、利用者希望 2026-11-22)。
@@ -300,3 +300,10 @@ Missing の文言:
 `context_menu_model.rs` + `ui_dialogs/context_menu.rs` (右クリック 1 項目)、`ui_dialogs/collections.rs`
 (確認ダイアログの種類とキー)、`app/collection_grid.rs` (受付 helper・成功適用の HashSet 化)、テストのフィクスチャで `CollectionPreparedSnapshot` を直接組み立てている数か所。
 永続データのスキーマは変えない (マイグレーション不要)。
+
+## 9. 設計レビューの記録
+
+- r1 (fd4679d67) REVISE: P1 ドライブ / 共有のルートだけの判定では外れた junction 等の下の登録を除けない → §3.1 を祖先判定へ。P2 `collection_grid_content_target()` だけでは最新と言えない → §4.1 の受付 helper。P2 成功適用の二次の計算量 → HashSet 化。P3 ConfirmRemove に Enter / Escape が無い → §4.3。
+- r2 (7ea149cc3) REVISE: P2 送信時に stamp を検査していない → §4.4 の受付時・送信前の origin 検査。P2 下からの探索では葉ごとに照会が増える → 上からの探索とキャッシュ。P3 相対パスの扱い → I/O なしで拒否。
+- r3 (e2e163b3f) REVISE: P2 `with_viewer_context` は状態を変える → `with_viewer_context_ref` と純関数。P2 外れたリンクの下で照会が繰り返される → 降りる前に追跡結果を見て打ち切る。
+- r4 (8f3d50443) ACCEPT: 追加指摘なし。
