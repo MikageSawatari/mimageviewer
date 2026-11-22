@@ -68,18 +68,123 @@ fn overflowing_axes_stop_at_each_edge_and_diagonal() {
 }
 
 #[test]
-fn fitted_axes_stay_at_nonzero_current_pan_without_recentering() {
+fn drag_bound_fitted_axes_inside_viewport_stay_at_noncentral_pan_in_all_directions() {
+    // §8.2 replaces the old blanket freeze: a fitted unit stays fixed only
+    // while contained. The old (137, -91) fixture was already outside it.
+    for pixels_per_point in [1.0, 1.25, 1.5] {
+        for (template, cur) in [
+            (single(Vec2::splat(800.0)), egui::vec2(37.0, -91.0)),
+            (single(Vec2::splat(800.0)), Vec2::splat(-100.0)),
+            (single(Vec2::splat(800.0)), Vec2::splat(100.0)),
+            (single(Vec2::splat(1000.0)), Vec2::ZERO),
+            (
+                singleton(SingletonSpreadPlacement::LeftWhite, 400.0),
+                egui::vec2(37.0, -91.0),
+            ),
+            (
+                singleton(SingletonSpreadPlacement::RightWhite, 400.0),
+                egui::vec2(37.0, -91.0),
+            ),
+        ] {
+            let layout = drawn_at(&template, cur, pixels_per_point, RectPixelFit::Proportional);
+            for x in [-5000.0, 0.0, 5000.0] {
+                for y in [-5000.0, 0.0, 5000.0] {
+                    close(bounded_drag_pan(&layout, cur, cur + egui::vec2(x, y)), cur);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn drag_bound_fitted_axes_outside_viewport_return_only_inward_without_recentering() {
+    // §8.2 intentionally changes these old expectations: at (137, -91),
+    // an 800-point unit protrudes 37 points at the right; a 1000-point unit
+    // protrudes 137 at the right and 91 at the top. Negative y is outward.
     let cur = egui::vec2(137.0, -91.0);
     for (size, expected) in [
-        (Vec2::splat(800.0), cur),
-        (Vec2::splat(1000.0), cur),
-        (egui::vec2(800.0, 3000.0), egui::vec2(cur.x, -1000.0)),
+        (Vec2::splat(800.0), egui::vec2(100.0, -91.0)),
+        (Vec2::splat(1000.0), egui::vec2(0.0, -91.0)),
+        (egui::vec2(800.0, 3000.0), egui::vec2(100.0, -1000.0)),
         (egui::vec2(3000.0, 800.0), egui::vec2(-1000.0, cur.y)),
     ] {
-        close(
-            bounded_drag_pan(&single(size), cur, Vec2::splat(-5000.0)),
-            expected,
-        );
+        let layout = single(size);
+        let stopped = bounded_drag_pan(&layout, cur, Vec2::splat(-5000.0));
+        close(stopped, expected);
+        if size == Vec2::splat(800.0) {
+            // This recovery is exact: x=100 aligns the right edge with the
+            // viewport. Reversing toward the former x=137 must stay inside.
+            close(bounded_drag_pan(&layout, stopped, cur), stopped);
+        }
+    }
+}
+
+#[test]
+fn drag_bound_fitted_axes_low_high_and_both_recover_within_one_physical_pixel_at_each_dpi() {
+    // The 800-point square has 100 points of slack on each side. A 400-point
+    // singleton plus its 20-point gap and 400-point blank forms an 820 x 400
+    // unit: horizontal slack is 90, vertical slack is 300, for either side.
+    for (template, allowance) in [
+        (single(Vec2::splat(800.0)), Vec2::splat(100.0)),
+        (
+            singleton(SingletonSpreadPlacement::LeftWhite, 400.0),
+            egui::vec2(90.0, 300.0),
+        ),
+        (
+            singleton(SingletonSpreadPlacement::RightWhite, 400.0),
+            egui::vec2(90.0, 300.0),
+        ),
+    ] {
+        for pixels_per_point in [1.0, 1.25, 1.5] {
+            for signs in [
+                egui::vec2(-1.0, -1.0),
+                egui::vec2(-1.0, 1.0),
+                egui::vec2(1.0, -1.0),
+                egui::vec2(1.0, 1.0),
+            ] {
+                // Masks cover x only, y only, and simultaneous recovery.
+                for mask in [1, 2, 3] {
+                    let mut cur = egui::vec2(17.0, -23.0);
+                    let mut inward = cur;
+                    let mut outward = cur;
+                    let mut small_step = cur;
+                    let mut expected = cur;
+                    for axis in 0..2 {
+                        if mask & (1 << axis) != 0 {
+                            cur[axis] = signs[axis] * (allowance[axis] + 37.75 / pixels_per_point);
+                            inward[axis] = cur[axis] - signs[axis] * 5000.0;
+                            outward[axis] = cur[axis] + signs[axis] * 5000.0;
+                            small_step[axis] = cur[axis] - signs[axis] * 5.0 / pixels_per_point;
+                            // 37.75 physical pixels of excess, truncated to
+                            // a 37-pixel recovery, leaves 0.75 pixels outside.
+                            expected[axis] =
+                                signs[axis] * (allowance[axis] + 0.75 / pixels_per_point);
+                        }
+                    }
+                    let layout =
+                        drawn_at(&template, cur, pixels_per_point, RectPixelFit::Proportional);
+                    close(bounded_drag_pan(&layout, cur, cur), cur);
+                    close(bounded_drag_pan(&layout, cur, outward), cur);
+                    close(bounded_drag_pan(&layout, cur, small_step), small_step);
+                    let stopped = bounded_drag_pan(&layout, cur, inward);
+                    close(stopped, expected);
+                    for axis in 0..2 {
+                        if mask & (1 << axis) != 0 {
+                            let remaining =
+                                (stopped[axis].abs() - allowance[axis]) * pixels_per_point;
+                            assert!(
+                                (0.0..=1.0).contains(&remaining),
+                                "axis={axis}, dpi={pixels_per_point}, mask={mask}, cur={cur:?}, stopped={stopped:?}, remaining_px={remaining}"
+                            );
+                        }
+                    }
+                    // The subpixel residue must not creep on repeated input,
+                    // and reversal cannot move the recovered unit outward.
+                    close(bounded_drag_pan(&layout, stopped, inward), stopped);
+                    close(bounded_drag_pan(&layout, stopped, outward), stopped);
+                }
+            }
+        }
     }
 }
 

@@ -90,6 +90,582 @@ fn install_material(app: &mut App, ctx: &egui::Context, idx: usize, size: [usize
     app.edit_result_cache.clear();
 }
 
+fn move_bound_drag_to(app: &mut App, ctx: &egui::Context, total: Vec2) {
+    assert!(pointer_frame(app, ctx, vec![egui::Event::PointerMoved(origin() + total)]).is_none());
+}
+
+fn bound_drag_origin_pan(app: &App) -> Vec2 {
+    app.fs_pan_drag_start
+        .expect("the real canvas owns this drag")
+        .1
+}
+
+fn prepared_at_lower_edges(bound: bool) -> (egui::Context, crate::app::AppTestEnvForTest) {
+    let (ctx, mut app) = prepared(bound, FullscreenFitMode::Width, 3.0);
+    drag(&mut app, &ctx, Vec2::splat(-10000.0));
+    seed(&ctx, &mut app);
+    assert!(app.fs_pan_drag_start.is_none());
+    (ctx, app)
+}
+
+#[test]
+fn drag_bound_rebases_blocked_axes_and_reverses_from_the_edge_immediately() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let (ctx, mut app) = prepared_at_lower_edges(true);
+    let edge = app.fs_pan;
+    let geometry = scroll_geometry(&app.fullscreen_page_layout).unwrap();
+    close(
+        edge,
+        Vec2::new(geometry.axes[0].unwrap().min, geometry.axes[1].unwrap().min),
+    );
+    press(&mut app, &ctx);
+    let outward = Vec2::new(-300.0, -180.0);
+    move_bound_drag_to(&mut app, &ctx, outward);
+    close(app.fs_pan, edge);
+    close(bound_drag_origin_pan(&app), edge - outward);
+    let rebased = app.fs_pan_drag_start;
+    move_bound_drag_to(&mut app, &ctx, outward + Vec2::new(100.0, 60.0));
+    close(app.fs_pan, edge + Vec2::new(100.0, 60.0));
+    assert_eq!(
+        app.fs_pan_drag_start, rebased,
+        "an unconstrained reversal must retain both rebased axes"
+    );
+}
+
+#[test]
+fn drag_bound_diagonal_rebases_only_the_axis_that_hit_its_edge() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let (ctx, mut app) = prepared(true, FullscreenFitMode::Width, 3.0);
+    app.fs_pan.y = 0.1;
+    seed(&ctx, &mut app);
+    let start = app.fs_pan;
+    let min_x = scroll_geometry(&app.fullscreen_page_layout).unwrap().axes[0]
+        .unwrap()
+        .min;
+    press(&mut app, &ctx);
+    let total = Vec2::new(-10000.0, -120.0);
+    move_bound_drag_to(&mut app, &ctx, total);
+    close(app.fs_pan, Vec2::new(min_x, start.y + total.y));
+    let stored = bound_drag_origin_pan(&app);
+    close(Vec2::new(stored.x, 0.0), Vec2::new(min_x - total.x, 0.0));
+    assert_eq!(
+        stored.y.to_bits(),
+        start.y.to_bits(),
+        "recomputing (0.1 - 120) + 120 would accumulate f32 residue on a free axis"
+    );
+    move_bound_drag_to(&mut app, &ctx, Vec2::new(-9990.0, -180.0));
+    close(app.fs_pan, Vec2::new(min_x + 10.0, start.y - 180.0));
+    assert_eq!(bound_drag_origin_pan(&app).y.to_bits(), start.y.to_bits());
+}
+
+#[test]
+fn drag_bound_waiting_layout_retains_the_absolute_origin_until_a_matching_paint() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let (ctx, mut app) = prepared(true, FullscreenFitMode::Width, 3.0);
+    let initial = app.fs_pan;
+    press(&mut app, &ctx);
+    app.fullscreen_page_layout.drawn_unit = None;
+    move_bound_drag_to(&mut app, &ctx, Vec2::new(25.0, -30.0));
+    let waiting_origin = app.fs_pan_drag_start;
+    close(bound_drag_origin_pan(&app), initial);
+    close(app.fs_pan, initial);
+    move_bound_drag_to(&mut app, &ctx, Vec2::new(45.0, -60.0));
+    assert_eq!(app.fs_pan_drag_start, waiting_origin);
+    close(app.fs_pan, initial);
+    seed(&ctx, &mut app);
+    pointer_frame(&mut app, &ctx, vec![]);
+    close(app.fs_pan, initial + Vec2::new(45.0, -60.0));
+    assert_eq!(
+        app.fs_pan_drag_start, waiting_origin,
+        "a fully accepted absolute candidate does not rebase"
+    );
+}
+
+#[test]
+fn drag_bound_rebased_origin_survives_stale_frames_and_catches_up_after_paint() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let (ctx, mut app) = prepared_at_lower_edges(true);
+    let edge = app.fs_pan;
+    press(&mut app, &ctx);
+    let outward = Vec2::new(-300.0, -180.0);
+    move_bound_drag_to(&mut app, &ctx, outward);
+    let rebased = app.fs_pan_drag_start;
+    close(bound_drag_origin_pan(&app), edge - outward);
+    app.fullscreen_page_layout.drawn_unit = None;
+    move_bound_drag_to(&mut app, &ctx, outward + Vec2::new(100.0, 60.0));
+    close(app.fs_pan, edge);
+    assert_eq!(app.fs_pan_drag_start, rebased);
+    move_bound_drag_to(&mut app, &ctx, outward + Vec2::new(120.0, 80.0));
+    close(app.fs_pan, edge);
+    assert_eq!(app.fs_pan_drag_start, rebased);
+    seed(&ctx, &mut app);
+    pointer_frame(&mut app, &ctx, vec![]);
+    close(app.fs_pan, edge + Vec2::new(120.0, 80.0));
+    assert_eq!(app.fs_pan_drag_start, rebased);
+}
+
+#[test]
+fn drag_bound_off_retains_legacy_overdrag_until_the_absolute_pointer_passes_its_press() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let (ctx, mut app) = prepared_at_lower_edges(false);
+    let loose_edge = app.fs_pan;
+    press(&mut app, &ctx);
+    for total in [Vec2::new(-300.0, -180.0), Vec2::new(-200.0, -120.0)] {
+        move_bound_drag_to(&mut app, &ctx, total);
+        close(app.fs_pan, loose_edge);
+        close(bound_drag_origin_pan(&app), loose_edge);
+    }
+    move_bound_drag_to(&mut app, &ctx, Vec2::new(100.0, 60.0));
+    close(app.fs_pan, loose_edge + Vec2::new(100.0, 60.0));
+    close(bound_drag_origin_pan(&app), loose_edge);
+}
+
+#[test]
+fn drag_bound_release_discards_the_rebased_origin_and_next_drag_starts_at_current_pan() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let (ctx, mut app) = prepared_at_lower_edges(true);
+    let edge = app.fs_pan;
+    press(&mut app, &ctx);
+    let outward = Vec2::new(-300.0, -180.0);
+    move_bound_drag_to(&mut app, &ctx, outward);
+    assert_ne!(bound_drag_origin_pan(&app), edge);
+    pointer_frame(&mut app, &ctx, vec![button(origin() + outward, false)]);
+    assert!(app.fs_pan_drag_start.is_none());
+    seed(&ctx, &mut app);
+    press(&mut app, &ctx);
+    move_bound_drag_to(&mut app, &ctx, Vec2::new(20.0, 10.0));
+    close(app.fs_pan, edge + Vec2::new(20.0, 10.0));
+    close(bound_drag_origin_pan(&app), edge);
+}
+
+#[test]
+fn drag_bound_one_finger_passthrough_reverses_immediately_after_rebasing() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    crate::touch_correlation::with_gestures_disabled(false, || {
+        assert!(!crate::touch_correlation::touch_gestures_disabled());
+        let (ctx, mut app) = prepared_at_lower_edges(true);
+        app.settings.touch_still_chrome_learned = true;
+        let edge = app.fs_pan;
+        let touch = |phase, pos| egui::Event::Touch {
+            device_id: egui::TouchDeviceId(8348),
+            id: egui::TouchId(1),
+            phase,
+            pos,
+            force: None,
+        };
+        pointer_frame(&mut app, &ctx, vec![egui::Event::PointerMoved(origin())]);
+        pointer_frame(
+            &mut app,
+            &ctx,
+            vec![
+                touch(egui::TouchPhase::Start, origin()),
+                egui::Event::PointerMoved(origin()),
+                button(origin(), true),
+            ],
+        );
+        for (total, expected) in [
+            (Vec2::new(-300.0, -180.0), edge),
+            (Vec2::new(-200.0, -120.0), edge + Vec2::new(100.0, 60.0)),
+        ] {
+            let end = origin() + total;
+            frame(
+                &ctx,
+                vec![
+                    touch(egui::TouchPhase::Move, end),
+                    egui::Event::PointerMoved(end),
+                ],
+                |ui, ctx| {
+                    let state = app.prepare_fullscreen_state(ctx, 0, FsPageTurnDecision::normal());
+                    let (nav, closed) = app.handle_fs_wheel_and_click(
+                        ui,
+                        ctx,
+                        full_rect(),
+                        &state,
+                        false,
+                        0,
+                        &mut None,
+                    );
+                    assert!(nav.is_none() && !closed);
+                    let replay = crate::touch_correlation::drive_egui_touch_input(
+                        ctx,
+                        crate::touch_correlation::TouchSurface::StillFullscreen,
+                        crate::touch_input::TapZoneGeometry {
+                            surface: full_rect(),
+                            excluded: vec![],
+                            behavior: crate::touch_input::TouchSurfaceBehavior::Viewer {
+                                accepts_pinch: true,
+                                tap_zones: true,
+                            },
+                        },
+                        ctx.cumulative_frame_nr(),
+                        true,
+                    );
+                    assert!(replay.commands().is_empty());
+                    assert_eq!(
+                        replay.owner(),
+                        crate::touch_input::TouchOwner::ViewerPointerPassthrough
+                    );
+                },
+            );
+            close(app.fs_pan, expected);
+            close(bound_drag_origin_pan(&app), edge + Vec2::new(300.0, 180.0));
+        }
+        let end = origin() + Vec2::new(-200.0, -120.0);
+        pointer_frame(
+            &mut app,
+            &ctx,
+            vec![
+                touch(egui::TouchPhase::End, end),
+                button(end, false),
+                egui::Event::PointerGone,
+            ],
+        );
+        assert!(app.fs_pan_drag_start.is_none());
+        close(app.fs_pan, edge + Vec2::new(100.0, 60.0));
+    });
+}
+
+#[test]
+fn drag_bound_animation_rebases_at_the_edge_and_reverses_from_logical_not_painted_pan() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let (ctx, mut app) = prepared(true, FullscreenFitMode::Width, 1.0);
+    app.settings.fullscreen_smooth_page_scroll = true;
+    app.settings.continuous_reading_key_scroll_percent = 100;
+    frame(
+        &ctx,
+        super::handler_tests::tap(egui::Key::ArrowDown),
+        |_, ctx| {
+            assert!(app.handle_fs_key_input(ctx, 0, false).page_nav.is_none());
+        },
+    );
+    let target = app.fs_pan;
+    assert!(target.y < 0.0);
+    seed(&ctx, &mut app);
+    let painted = normal_zoom_pan(
+        app.fullscreen_page_layout
+            .displayed_pages()
+            .next()
+            .unwrap()
+            .transform,
+    )
+    .unwrap()
+    .1;
+    assert_ne!(
+        painted, target,
+        "the real receipt must contain the interpolated pan"
+    );
+    assert!(app.fs_page_scroll_animation.is_some());
+    press(&mut app, &ctx);
+    move_bound_drag_to(&mut app, &ctx, Vec2::new(0.0, -180.0));
+    close(app.fs_pan, target);
+    close(bound_drag_origin_pan(&app), target + Vec2::new(0.0, 180.0));
+    assert!(
+        app.fs_page_scroll_animation.is_some(),
+        "blocking alone must not cancel interpolation"
+    );
+    move_bound_drag_to(&mut app, &ctx, Vec2::new(0.0, -120.0));
+    close(app.fs_pan, target + Vec2::new(0.0, 60.0));
+    frame(&ctx, vec![], |ui, ctx| {
+        app.retire_fs_page_scroll_animation(ctx);
+        assert!(app.fs_page_scroll_animation.is_none());
+        paint(&mut app, ui, ctx);
+    });
+    let drawn_after = normal_zoom_pan(
+        app.fullscreen_page_layout
+            .displayed_pages()
+            .next()
+            .unwrap()
+            .transform,
+    )
+    .unwrap()
+    .1;
+    close(drawn_after, target + Vec2::new(0.0, 60.0));
+}
+
+fn bound_drag_wheel_zoom_at(app: &mut App, ctx: &egui::Context, pivot: egui::Pos2, factor: f32) {
+    let delta = WHEEL_SENSITIVITY * factor.ln() / 1.1_f32.ln();
+    pointer_frame(
+        app,
+        ctx,
+        vec![
+            egui::Event::PointerMoved(pivot),
+            egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+            super::handler_tests::wheel_event(Vec2::new(0.0, delta), egui::Modifiers::CTRL),
+        ],
+    );
+}
+
+#[test]
+fn drag_bound_held_center_pivot_zoom_crosses_fitted_and_overflow_rules_in_both_directions() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    let (ctx, mut app) = prepared(true, FullscreenFitMode::Page, 1.0);
+    press(&mut app, &ctx);
+    move_bound_drag_to(&mut app, &ctx, Vec2::new(80.0, 40.0));
+    close(app.fs_pan, Vec2::ZERO);
+    close(bound_drag_origin_pan(&app), Vec2::new(-80.0, -40.0));
+    move_bound_drag_to(&mut app, &ctx, Vec2::ZERO);
+    close(app.fs_pan, Vec2::ZERO);
+    close(bound_drag_origin_pan(&app), Vec2::ZERO);
+    bound_drag_wheel_zoom_at(&mut app, &ctx, origin(), 4.0);
+    assert!((app.fs_zoom - 4.0).abs() < 0.0001);
+    close(app.fs_pan, Vec2::ZERO);
+    assert_eq!(
+        app.fs_free_rotation, 0.0,
+        "Ctrl-wheel is not a Ctrl-drag rotation"
+    );
+    seed(&ctx, &mut app);
+    let overflow = scroll_geometry(&app.fullscreen_page_layout).unwrap();
+    assert!(overflow.axes.iter().all(Option::is_some));
+    pointer_frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+    );
+    close(app.fs_pan, Vec2::ZERO);
+    move_bound_drag_to(&mut app, &ctx, Vec2::new(30.0, 20.0));
+    close(app.fs_pan, Vec2::new(30.0, 20.0));
+    move_bound_drag_to(&mut app, &ctx, Vec2::ZERO);
+    close(app.fs_pan, Vec2::ZERO);
+    bound_drag_wheel_zoom_at(&mut app, &ctx, origin(), 0.25);
+    assert!((app.fs_zoom - 1.0).abs() < 0.0001);
+    close(app.fs_pan, Vec2::ZERO);
+    seed(&ctx, &mut app);
+    let fitted = scroll_geometry(&app.fullscreen_page_layout).unwrap();
+    assert!(fitted.axes.iter().all(Option::is_none));
+    pointer_frame(
+        &mut app,
+        &ctx,
+        vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+    );
+    move_bound_drag_to(&mut app, &ctx, Vec2::new(30.0, 20.0));
+    close(app.fs_pan, Vec2::ZERO);
+    close(bound_drag_origin_pan(&app), Vec2::new(-30.0, -20.0));
+    pointer_frame(&mut app, &ctx, vec![]);
+    close(app.fs_pan, Vec2::ZERO);
+}
+
+#[cfg(windows)]
+#[test]
+fn drag_bound_r11_asymmetric_visibility_rebase_has_the_documented_path_dependent_endpoint() {
+    let _serial = crate::key_input::lock_test_input();
+    let _cleanup = KeyboardCleanup;
+    let outcomes = [false, true].map(|split| {
+        let ctx = egui::Context::default();
+        let mut app = scroll_app(&ctx, SpreadMode::Ltr);
+        app.fs_prev_focused = true;
+        app.settings.fullscreen_bound_drag_pan = true;
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Original;
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+        app.settings.spread_page_gap_px = 20;
+        install_material(&mut app, &ctx, 0, [1000, 3000]);
+        install_material(&mut app, &ctx, 1, [1000, 1010]);
+        app.view_trim_book_preference = crate::view_trim::ViewTrimBookPreference::Manual;
+        app.view_trim_page_overrides.insert(
+            1,
+            crate::view_trim::ViewTrimPageOverride::from_margins(
+                crate::view_trim::ViewTrimMargins {
+                    left: 0.0,
+                    top: 0.2,
+                    right: 0.0,
+                    bottom: 0.0,
+                },
+            ),
+        );
+        let initial_pan = Vec2::new(-442.0, 1000.0);
+        app.fs_pan = initial_pan;
+        let rect = super::tests::viewport();
+        let pages = render_frame(&mut app, &ctx, rect, 1.0, vec![]);
+        assert_eq!(pages.len(), 2);
+        // Real Original/gap/trim layout equals asymmetric_spread(true,false),
+        // translated by cur; the valid stamp comes from the actual renderer.
+        close(pages[0].paint_rect.min.to_vec2(), Vec2::new(-922.0, 50.0));
+        close(pages[0].paint_rect.max.to_vec2(), Vec2::new(78.0, 3050.0));
+        close(pages[1].paint_rect.min.to_vec2(), Vec2::new(98.0, 1247.0));
+        close(pages[1].paint_rect.max.to_vec2(), Vec2::new(1098.0, 2055.0));
+        assert!(app.fs_scroll_layout_matches(&ctx));
+        render_frame(
+            &mut app,
+            &ctx,
+            rect,
+            1.0,
+            vec![egui::Event::PointerMoved(origin())],
+        );
+        render_frame(&mut app, &ctx, rect, 1.0, vec![button(origin(), true)]);
+        if split {
+            let first = Vec2::new(-51.0, -225.0);
+            render_frame(
+                &mut app,
+                &ctx,
+                rect,
+                1.0,
+                vec![egui::Event::PointerMoved(origin() + first)],
+            );
+            close(app.fs_pan, Vec2::new(-442.0, 775.0));
+            close(bound_drag_origin_pan(&app), Vec2::new(-391.0, 1000.0));
+        }
+        let total = Vec2::new(-68.0, -300.0);
+        render_frame(
+            &mut app,
+            &ctx,
+            rect,
+            1.0,
+            vec![egui::Event::PointerMoved(origin() + total)],
+        );
+        let endpoint = app.fs_pan;
+        close(
+            endpoint,
+            if split {
+                Vec2::new(-459.0, 700.0)
+            } else {
+                Vec2::new(-510.0, 700.0)
+            },
+        );
+        if split {
+            render_frame(
+                &mut app,
+                &ctx,
+                rect,
+                1.0,
+                vec![egui::Event::PointerMoved(
+                    origin() + Vec2::new(-119.0, -300.0),
+                )],
+            );
+            close(app.fs_pan, Vec2::new(-510.0, 700.0));
+        }
+        endpoint
+    });
+    assert_eq!(
+        outcomes,
+        [Vec2::new(-510.0, 700.0), Vec2::new(-459.0, 700.0)]
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn drag_bound_sub_pc_pivot_shrink_returns_a_fitting_unit_inside_then_blocks_outward_drag() {
+    let _serial = crate::key_input::lock_test_input();
+    let _cleanup = KeyboardCleanup;
+    let ctx = egui::Context::default();
+    let mut app = scroll_app(&ctx, SpreadMode::Single);
+    app.fs_prev_focused = true;
+    app.settings.fullscreen_bound_drag_pan = true;
+    app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+    app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::ClickToShow;
+    app.fs_zoom = 4.0;
+    render_frame(&mut app, &ctx, full_rect(), 1.0, vec![]);
+    render_frame(
+        &mut app,
+        &ctx,
+        full_rect(),
+        1.0,
+        vec![egui::Event::PointerMoved(origin())],
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        full_rect(),
+        1.0,
+        vec![button(origin(), true)],
+    );
+    let enlarged_end = origin() + Vec2::splat(10000.0);
+    let edge_pages = render_frame(
+        &mut app,
+        &ctx,
+        full_rect(),
+        1.0,
+        vec![egui::Event::PointerMoved(enlarged_end)],
+    );
+    let edge = edge_pages[0];
+    assert!(edge.paint_rect.width() > edge.viewport_rect.width());
+    assert!(edge.paint_rect.height() > edge.viewport_rect.height());
+    assert!((edge.paint_rect.top() - edge.viewport_rect.top()).abs() <= 1.0);
+    render_frame(
+        &mut app,
+        &ctx,
+        full_rect(),
+        1.0,
+        vec![button(enlarged_end, false)],
+    );
+    assert!(app.fs_pan_drag_start.is_none());
+    let before_zoom = app.fs_pan;
+    let factor = 0.2_f32;
+    let delta = WHEEL_SENSITIVITY * factor.ln() / 1.1_f32.ln();
+    let shrunk = render_frame(
+        &mut app,
+        &ctx,
+        full_rect(),
+        1.0,
+        vec![
+            egui::Event::PointerMoved(origin()),
+            egui::Event::ModifiersChanged(egui::Modifiers::CTRL),
+            super::handler_tests::wheel_event(Vec2::new(0.0, delta), egui::Modifiers::CTRL),
+        ],
+    )[0];
+    assert!((app.fs_zoom - 0.8).abs() < 0.0001);
+    close(app.fs_pan, before_zoom * factor);
+    assert!(shrunk.paint_rect.width() <= shrunk.viewport_rect.width());
+    assert!(shrunk.paint_rect.height() <= shrunk.viewport_rect.height());
+    assert!(
+        shrunk.paint_rect.bottom() > shrunk.viewport_rect.bottom() + 50.0,
+        "center-pivot shrink must reproduce the reported fitting-but-outside unit: {shrunk:?}"
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        full_rect(),
+        1.0,
+        vec![egui::Event::ModifiersChanged(egui::Modifiers::NONE)],
+    );
+    render_frame(
+        &mut app,
+        &ctx,
+        full_rect(),
+        1.0,
+        vec![button(origin(), true)],
+    );
+    let inward_total = Vec2::new(0.0, -200.0);
+    let returned = render_frame(
+        &mut app,
+        &ctx,
+        full_rect(),
+        1.0,
+        vec![egui::Event::PointerMoved(origin() + inward_total)],
+    )[0];
+    let returned_pan = app.fs_pan;
+    assert!(returned_pan.y < before_zoom.y * factor);
+    assert!((returned.paint_rect.bottom() - returned.viewport_rect.bottom()).abs() <= 1.0);
+    assert!(returned.paint_rect.top() >= returned.viewport_rect.top() - 1.0);
+    assert!(
+        (returned_pan.x - before_zoom.x * factor).abs() < 0.001,
+        "a fitting and already-inside horizontal axis stays at its noncentral pan"
+    );
+    let origin_after_return = app.fs_pan_drag_start;
+    render_frame(
+        &mut app,
+        &ctx,
+        full_rect(),
+        1.0,
+        vec![egui::Event::PointerMoved(origin() + Vec2::new(0.0, -100.0))],
+    );
+    assert_eq!(
+        app.fs_pan, returned_pan,
+        "reversing outwards cannot move the now-fitted unit"
+    );
+    assert_ne!(
+        app.fs_pan_drag_start, origin_after_return,
+        "the newly blocked outward demand must discard its overdrag"
+    );
+}
+
 #[test]
 fn drag_bound_off_preserves_fitting_and_overflowing_legacy_drag() {
     for (fit, zoom) in [
@@ -107,13 +683,25 @@ fn drag_bound_off_preserves_fitting_and_overflowing_legacy_drag() {
 }
 
 #[test]
-fn drag_bound_on_fitting_image_keeps_noncentral_pan() {
+fn drag_bound_on_fitting_image_keeps_inside_axis_and_returns_only_its_outside_axis() {
     let (ctx, mut app) = prepared(true, FullscreenFitMode::Page, 1.0);
     app.fs_pan = Vec2::new(19.0, -23.0);
     seed(&ctx, &mut app);
     let before = app.fs_pan;
+    let page = app
+        .fullscreen_page_layout
+        .displayed_pages()
+        .next()
+        .unwrap()
+        .transform;
+    assert!(page.paint_rect.top() < page.viewport_rect.top());
+    assert!((page.paint_rect.height() - page.viewport_rect.height()).abs() < 0.001);
+    assert!(page.paint_rect.left() >= page.viewport_rect.left());
+    assert!(page.paint_rect.right() <= page.viewport_rect.right());
     drag(&mut app, &ctx, Vec2::new(80.0, 70.0));
-    close(app.fs_pan, before);
+    // Page fit is 266x400 in the 600x400 viewport. Nonzero x is inside,
+    // while y=-23 leaves the top 23 points outside; §8.2 returns only y.
+    close(app.fs_pan, Vec2::new(before.x, 0.0));
 }
 
 #[test]
@@ -153,6 +741,7 @@ fn drag_bound_outside_start_does_not_jump_on_stationary_or_outward_drag() {
         vec![egui::Event::PointerMoved(origin() - Vec2::new(10.0, 0.0))],
     );
     assert_eq!(app.fs_pan, before);
+    close(bound_drag_origin_pan(&app), before + Vec2::new(10.0, 0.0));
     pointer_frame(&mut app, &ctx, vec![]);
     assert_eq!(app.fs_pan, before);
     pointer_frame(
@@ -160,7 +749,9 @@ fn drag_bound_outside_start_does_not_jump_on_stationary_or_outward_drag() {
         &ctx,
         vec![egui::Event::PointerMoved(origin() + Vec2::new(10.0, 0.0))],
     );
-    close(app.fs_pan, before + Vec2::new(10.0, 0.0));
+    // §8.1 discards the blocked -10, so -10 -> +10 is 20 inward
+    // points from the last pointer position, not 10 from the original press.
+    close(app.fs_pan, before + Vec2::new(20.0, 0.0));
 }
 
 #[test]

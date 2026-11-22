@@ -6,6 +6,7 @@ use egui::{Rect, Vec2};
 #[cfg(test)]
 mod context_scroll_tests;
 mod drag_bound;
+pub(super) use drag_bound::FsBoundedDragPanOutcome;
 #[cfg(test)]
 mod drag_bound_handler_tests;
 #[cfg(test)]

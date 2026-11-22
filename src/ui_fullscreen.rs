@@ -42519,13 +42519,29 @@ impl App {
                     self.fs_pan_drag_start = Some((pos - total_delta, self.fs_pan));
                 }
                 if let Some((_, start_pan)) = self.fs_pan_drag_start
-                    && let Some(proposed_pan) =
-                        input.total_drag_delta.map(|delta| start_pan + delta)
+                    && let Some(total_delta) = input.total_drag_delta
                 {
-                    let bounded = self.settings.fullscreen_bound_drag_pan
-                        && self.apply_fs_bounded_drag_pan(ctx, proposed_pan);
-                    if !bounded {
-                        self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
+                    let proposed_pan = start_pan + total_delta;
+                    let outcome = if self.settings.fullscreen_bound_drag_pan {
+                        self.apply_fs_bounded_drag_pan(ctx, proposed_pan)
+                    } else {
+                        in_page_scroll::FsBoundedDragPanOutcome::OutsideSurface
+                    };
+                    match outcome {
+                        in_page_scroll::FsBoundedDragPanOutcome::OutsideSurface => {
+                            self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
+                        }
+                        in_page_scroll::FsBoundedDragPanOutcome::WaitingForLayout => {}
+                        in_page_scroll::FsBoundedDragPanOutcome::Position(pan) => {
+                            if let Some((_, origin_pan)) = self.fs_pan_drag_start.as_mut() {
+                                for axis in 0..2 {
+                                    if pan[axis] != proposed_pan[axis] {
+                                        // Discard only the motion stopped by the bound (§8.1).
+                                        origin_pan[axis] = pan[axis] - total_delta[axis];
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
