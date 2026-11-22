@@ -866,3 +866,7 @@ Start-Process -FilePath .\target\release\mimageviewer.exe
 ### 段階 4 の実装 (2026-11-22、`b92b6e243`・`d6623e62c`) — ACCEPT
 
 最初のビルドで新しいテスト 1 件が落ち、要求の画像を選んだ後に前の窓を閉じる順序の誤りと分かって直した。独立レビュー 1 回目は REVISE (P1: 前の linked 窓の置換による終了が新しい DirectMedia reader を壊す)、凍結の決まりは不合意。前の reader の終了を先に完了させる形に直し、2 回目で ACCEPT・合意。関連テスト 190 件成功、本体 lib の全件 19,659 件成功 (`b92b6e243`)。
+
+### 段階 5 の実装 (2026-11-22、`6c07dc523`・`fb20fbbe5`・`201f8fdb6`) — ACCEPT
+
+1 回目 REVISE (P1: 応答の直後の `DisconnectNamedPipe` が未読の応答を捨てる)、2 回目 REVISE (P2: 接続を保持するクライアントに worker と資源の上限が無い)、3 回目 ACCEPT。凍結の決まりの構造的変更 (実装) は毎回合意。IPC 17 件 (3 回連続)・本体 lib 127 件成功。launcher のテストは段階 6 の release の後。レビューの補足: 製品の launcher は `ERROR_PIPE_BUSY` で待たずに再起動の案内で終わる。ふだんの 1 件ずつの送信では、受理の前に次の instance を作るので当たらない。
