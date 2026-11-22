@@ -888,7 +888,7 @@ detachedは既存の共通パネルを使い、述語・viewport・bundleの交�
 `crates/capture-file` (`mimageviewer-capture-file`) は取り込みのファイル名・日時と月・
 出どころ URL・Mark of the Web を共有する軽量部品 (§1.818 段階1)。画像デコード・
 clipboard API・egui・本体 crate に依存せず、PNG 保存と HTML 取り込みが同じ規則を使う。
-ブラウザ連携の保存先と管理フォルダの重複判定も同部品に置く (呼出元は後続段階)。
+ブラウザ連携の保存先と管理フォルダの重複判定も同部品に置き、設定画面の保存先操作・登録・中継 exe が共用する。
 MOTW 書込みと保存先の祖先解決は worker 上でのみ行い、既存の保存形式・公開処理は変えない。
 
 | モジュール | 役割 |
@@ -1299,3 +1299,29 @@ UI は利用不可／準備中／利用可能／処理中の snapshot と、解�
 登録世代を完成して固定 manifest を原子的に置換し、Chrome／Edge の HKCU に同じ manifest を登録する。掃除は exe の削除が通った世代だけ。reparse point はたどらない。
 新規2設定の永続化は worker の2キー transaction。登録成功後に root の live 値・開いている設定 draft を合わせ、その後保存する。全体保存の `SAVE_GENERATION` は進めず、初回バックアップの claim と書込は従来の全体保存と共通の write gate で直列化する。
 場所▼は main 専用の capture 行 renderer へ clipboard → browser の順で追加し、Remote の共有列挙は変えない。
+
+登録を変更する資格（通常版・既定 data dir・明示 `--data-dir` なし・確認済み launcher）も worker で検査する。
+利用不可の profile は既存登録へ触れない。Settings の2項目が正本で、管理フォルダの
+`config.json`（`v`・launcher 絶対パス・保存先基底）はその投影。保存画像と管理世代の寿命を分ける。
+
+## ブラウザからの表示要求と中継 exe（§1.818 段階2〜6）
+
+`app/external_open.rs` の `ViewerOpenRequest` が相関 ID と `Preferences` / `BrowserOverlay` の意図を持ち、
+`ExplicitOpenPath`・startup/navigation owner・既存 `ViewerOpenAdoption` を通して表示確定まで運ぶ。
+明示選択は sidecar/composition 復元中も同じ要求が所有し、履歴のスクロール等の復元は維持する。
+`app/browser_presentation.rs` は生成値 `DetachedWindowSeed` を既存の linked/loading/materialized 経路へ渡す。
+用途 `Normal` / `BrowserView` は `DetachedWindowRuntime` の生成時に固定し、placement の新しい保存先は作らない。
+終了開始前に `DetachedCloseOwner` が lease・用途・理由を捕捉するため、runtime 削除後も保存と focus を同じ値から決める。
+BrowserView は位置を保存せず、利用者終了ではメインへ focus しない。F12 は対象 lease の用途で共通入口が拒否する。
+
+`crates/browser-view-ipc` は GUI・設定・デコードに依存しない CLI / framing / Windows transport の共有部品。
+launcher と core の二重起動競合の両方で専用経路を使い、`single_instance/browser_view.rs` が
+既存 activation channel へ要求を渡す。pipe の応答は版照合と channel 配送までで、App の受理結果ではない。
+通常の activation event は立てず、版不一致等で通常経路へ fallback しない。
+
+`crates/browser-host` の `mimageviewer-browser-host.exe` は一回の native message を受ける別プロセス。
+許可した拡張 origin・上限・URL・画像形式・保存先を検査し、共有 capture-file の名前と MOTW で保存して
+launcher へ `--browser-view <left,top,right,bottom,maximized> -- <path>` を渡す。ネットワーク取得も GUI も持たない。
+登録世代は通常 runtime の掃除から独立する。ブラウザ拡張は別ブランチで実装済み・このブランチには未統合、ストアは未公開であり、
+中継 exe の成功は表示の成功を保証しない。[仕様](spec.md#812-ブラウザ連携1818) と
+[実装・検証状況](browser-to-miv-impl-plan.md) を参照。

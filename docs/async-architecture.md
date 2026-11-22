@@ -2819,3 +2819,18 @@ park単独では取消しない。最新callbackは位置別結果を一体で�
 root の既存 process-global poll 区間で完了を回収するので、環境設定を閉じた後や fullscreen の early return でも結果を落とさない。処理中の追加要求は拒否し、再試行・rollback・待ち行列は作らない。
 登録の結果を live Settings へ採用してから別 worker で2項目を永続化する。この間も同じ owner の処理中状態を保つ。全体設定の古い snapshot は保存しない。設定ファイルから取り込んだ新規2項目も、OK 時に同じ owner を通す（既存の他項目の適用は維持）。
 まれな失敗はログと通知で割り切る。保存失敗でも登録を巻き戻さず、通常の設定・画像・使用中の世代を破棄しない。
+
+## ブラウザ表示 pipe と一回の中継処理（§1.818 段階5〜6）
+
+`ActivationListener` が browser listener と stop event を所有し、接続・読取・書込・応答後の EOF 待ちを
+同じ stop で解除する。listener は次の待受を確保してから peer worker へ接続を移す。
+`PeerWorkers` は応答後に EOF を待つ接続も含め最大4件を所有し、満杯なら新しい接続を切断する。
+再試行・待ち行列は足さない。応答直後の切断で未読応答を捨てず、停止時は全 peer を解除・join する。
+pipe の DACL は既存の current-user 制限を使い、portable / data-dir 別の名前空間も既存 single-instance 規則に合わせる。
+
+listener は受信時点で Remote 所有と受信順を `ActivationOpenPath::received` に捕捉し、
+`BrowserOverlay` の表示意図を同じ activation channel へ渡す。App の受理は既存 owner が後で判断する。
+中継 exe は GUI とは別プロセスで保存・MOTW・launcher 終了待ちを行う。
+成功応答の範囲は受け渡しまでで、App の採用完了を待つ channel は作らない。
+ブラウザ拡張側の取得・中断状態は拡張の責務であり、本節の worker で代行しない。
+拡張は別ブランチで実装済み・このブランチには未統合で、ストアは未公開。
