@@ -1510,6 +1510,16 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 段階4のテスト失敗に対する修正では、BrowserOverlay の旧reader終了が選択を旧画像へ戻した後、新しい明示要求が選択を確定する順序に直した。close側のカーソル復元を止めるguardや二重の選択書き戻しは加えない。表示公開前の所有引き継ぎを修正するもので、通常要求・利用者closeの動作、Appのfield、時間窓、viewport同定・位置保存は変更しない。失敗したassertを維持・強化し、旧MainWindow／Fullscreen／BrowserViewの終了と後続syncを検査する回帰を追加した。設計担当から修正前の182件中181件成功・1件失敗の報告があり、今回の再検証は引き継ぎ待ち。
 
+**段階4の独立レビュー P1 修正 (2026-11-22、再検証・再レビュー待ち)**
+
+`b92b6e243` は設計担当から lib 全19,659件成功の報告があったが、独立レビューは REVISE、実装への構造合意は保留。新 DirectMedia reader の構築後に旧 linked 窓を終了する順序が、新旧 reader の所有境界を破っていた。
+
+レビュー・設計担当が指定した方針どおり、sidecar continuation と即時 action の2つの構築入口を共通化した。対象パス・準備済みメタデータ・要求を値で保持し、BrowserOverlay の旧 reader の終了／park を先に完了してから、終了後の一覧で新 reader を構築する。MainWindow／Fullscreen／BrowserView の同じ置換にも適用する。元一覧を復元する既存 close の処理や Preferences の順序は変更しない。
+
+引き継ぎ済みの要求は `ViewerOpenOrigin::MainPrepared` として、相関 ID・意図・選択所有を保って既存の hydration／表示確定へ運ぶ。新 reader を閉じ直す二重 handoff を防ぐ所有状態であり、App の bool／Option や時間窓は増やさない (§2-3・5)。HWND 同定・再生成条件・placement 保存先は変更しない (§2-1・2・4)。元一覧復元の条件追加ではなく構築境界の順序を直し、既存テストを維持したまま activation からの回帰と即時入口・相関・通常順序の回帰を追加する (§2-6〜8)。今回のビルド・テストは設計担当へ引き継ぐ。実装の構造合意は再レビュー待ち。
+
+P1 修正の再検証は設計担当から190件中189件成功・activation 回帰の close 後一覧検査1件失敗の報告があった。原因は、viewer teardown の完了を帰り先一覧の非同期復元の完了と誤認したテスト側の確認境界。製品の close／restore は変更せず、既存の履歴復元完了 helper を通してから同じ PNG assert と元一覧への完全一致を検査するよう修正した。assert の弱化・製品への待ちや guard の追加はない。今回のテスト修正の再実行・独立レビューは引き継ぎ待ち。
+
 ### 2026-11-21: 絞り込みの変更で一覧を読み直さない・AI の絞り込みを一覧全体の取得の証明へ (§1.835、実装済み・自動検証済み・実機未確認)
 
 **変更の内容**

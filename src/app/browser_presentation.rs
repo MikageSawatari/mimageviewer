@@ -64,9 +64,9 @@ impl App {
             .is_some_and(|request| request.intent.is_browser_overlay())
     }
 
-    /// Called only after target/context/generation and restoration admission.
-    /// Replace linked output, and let the existing handoff park independent owners.
-    pub(super) fn prepare_browser_overlay_open(&mut self, ctx: &egui::Context, idx: usize) -> bool {
+    /// Finish the old reader without inspecting an incoming list index. DirectMedia callers
+    /// retain the prepared target path/request until this handoff completes, then install it.
+    pub(super) fn prepare_browser_overlay_open(&mut self, ctx: &egui::Context) -> bool {
         self.restore_for_browser_overlay(ctx);
         if !self.settings.detached_viewer_open_images_in_window {
             let linked = self
@@ -103,11 +103,15 @@ impl App {
                 }
             }
         }
-        if !self.park_active_detached_context_for_new_grid_open(ctx, idx) {
+        // Browser targets are still images. Use the existing independent/media
+        // handoff before their reader is built, without looking up an incoming idx.
+        if self.active_detached_context_exists()
+            && !self.park_and_close_current_active_detached_viewer(ctx)
+        {
             return false;
         }
         if !self.viewer_session_is_detached()
-            && self.fullscreen_idx.is_some()
+            && (self.fullscreen_idx.is_some() || self.direct_media_reader_active())
             && self.close_fullscreen_to_completion(ctx).is_err()
         {
             return false;

@@ -45217,7 +45217,9 @@ impl App {
             else {
                 unreachable!()
             };
-            if let Some(target) = self.install_direct_media_reader(prepared) {
+            if let Some((target, viewer_adoption)) =
+                self.install_direct_media_reader_for_open(prepared, viewer_adoption)
+            {
                 continuation.first_display_action = sidecar_restore::FirstDisplayAction::None;
                 continuation.navigation_after_hydration =
                     Some(MainListAfterHydration::RequiredFullscreen {
@@ -45956,7 +45958,9 @@ impl App {
                 prepared,
                 viewer_adoption,
             } => {
-                if let Some(target) = self.install_direct_media_reader(prepared) {
+                if let Some((target, viewer_adoption)) =
+                    self.install_direct_media_reader_for_open(prepared, viewer_adoption)
+                {
                     self.finish_required_fullscreen_load_with_adoption(
                         target,
                         HistoryTrigger::UserChosen,
@@ -73433,9 +73437,9 @@ impl App {
         // its cursor. Finish that handoff before the new explicit request commits
         // selection; there must be only one selection owner at publication.
         #[cfg(windows)]
-        if viewer_adoption.is_main_new()
+        if viewer_adoption.needs_main_preparation()
             && Self::browser_overlay_adoption(viewer_adoption)
-            && !self.prepare_browser_overlay_open(&composition_ctx, idx)
+            && !self.prepare_browser_overlay_open(&composition_ctx)
         {
             return;
         }

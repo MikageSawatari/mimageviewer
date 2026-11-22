@@ -134,6 +134,15 @@ pub(super) struct DirectMediaPrepared {
     tags: HashMap<String, Vec<String>>,
 }
 
+impl DirectMediaPrepared {
+    fn requested_path(&self) -> Option<&Path> {
+        match &self.item {
+            GridItem::Image(path) | GridItem::Video(path) | GridItem::Audio(path) => Some(path),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 impl DirectMediaPrepared {
     pub(super) fn image_fixture_for_test(path: PathBuf) -> Self {
@@ -2335,6 +2344,32 @@ impl App {
         Outcome::Ok
     }
 
+    /// The owned preparation retains the absolute target path and its metadata, and adoption
+    /// retains the exact request. No numeric index crosses the old reader's terminal close.
+    pub(super) fn install_direct_media_reader_for_open(
+        &mut self,
+        prepared: DirectMediaPrepared,
+        viewer_adoption: ViewerOpenAdoption,
+    ) -> Option<(crate::snapshot::SnapshotTarget, ViewerOpenAdoption)> {
+        self.current_folder.as_ref()?;
+        prepared.requested_path()?;
+        #[cfg(windows)]
+        let viewer_adoption = if viewer_adoption.needs_main_preparation()
+            && Self::browser_overlay_adoption(viewer_adoption)
+        {
+            let ctx = self.edit_preview_repaint_ctx.clone().unwrap_or_default();
+            if !self.prepare_browser_overlay_open(&ctx) {
+                return None;
+            }
+            viewer_adoption.after_main_preparation()
+        } else {
+            viewer_adoption
+        };
+        // Resolve against the post-close items and capture that reader's return basis.
+        self.install_direct_media_reader(prepared)
+            .map(|target| (target, viewer_adoption))
+    }
+
     /// Reuse the transient snapshot owner: the base grid remains projected, while the exact
     /// externally requested page lives in the reader beside the projected sibling order.
     pub(super) fn install_direct_media_reader(
@@ -2342,10 +2377,7 @@ impl App {
         mut prepared: DirectMediaPrepared,
     ) -> Option<crate::snapshot::SnapshotTarget> {
         let origin_path = self.current_folder.clone()?;
-        let requested = match &prepared.item {
-            GridItem::Image(path) | GridItem::Video(path) | GridItem::Audio(path) => path.clone(),
-            _ => return None,
-        };
+        let requested = prepared.requested_path()?.to_path_buf();
         if startup_file_idx(&self.items, &requested).is_some() {
             return Some(crate::snapshot::SnapshotTarget::Fs(requested));
         }

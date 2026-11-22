@@ -68,6 +68,8 @@ impl std::ops::Deref for ExplicitOpenPath {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ViewerOpenOrigin {
     MainNew,
+    /// The old main reader has handed off; this request still owns new-main routing.
+    MainPrepared,
     ContextContinuation,
 }
 
@@ -105,10 +107,37 @@ impl ViewerOpenAdoption {
             self,
             Self::MainNew
                 | Self::Requested {
+                    origin: ViewerOpenOrigin::MainNew | ViewerOpenOrigin::MainPrepared,
+                    ..
+                }
+        )
+    }
+
+    pub(crate) fn needs_main_preparation(self) -> bool {
+        matches!(
+            self,
+            Self::MainNew
+                | Self::Requested {
                     origin: ViewerOpenOrigin::MainNew,
                     ..
                 }
         )
+    }
+
+    /// Carry the completed handoff through hydration without a second old-reader close.
+    pub(crate) fn after_main_preparation(self) -> Self {
+        match self {
+            Self::Requested {
+                request,
+                origin: ViewerOpenOrigin::MainNew,
+                selection,
+            } => Self::Requested {
+                request,
+                origin: ViewerOpenOrigin::MainPrepared,
+                selection,
+            },
+            other => other,
+        }
     }
 
     pub(crate) fn explicit_file(self) -> Self {

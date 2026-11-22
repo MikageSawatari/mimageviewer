@@ -428,6 +428,16 @@ F12 設定 OFF でも BrowserView の連動窓である間は、実 session・ru
 
 段階4の選択引き継ぎ修正: 設計担当の182件実行で181件成功、linked置換の選択テスト1件が失敗した。実装が明示対象を選択してから旧窓を終了していたため、Manual close の `restore_grid_cursor_to_fullscreen_item` が旧画像へ戻していた。テストの期待は正しく、実装の順序違反である。BrowserOverlay の main-new に限り、既存の置換／終了を済ませてから明示選択を一度確定する順序へ修正した。通常要求の順序と利用者closeのカーソル復元は変更しない。元のassertを維持し、同期後の選択・表示・stamp・leaseを強化したほか、旧MainWindow／Fullscreen／BrowserViewの終了も検査する回帰を追加した。修正後のビルド・テストは引き継ぎ待ち。
 
+**段階4の独立レビュー P1 修正 (2026-11-22、再検証・再レビュー待ち)**
+
+- `b92b6e243` は設計担当から lib 全19,659件成功の報告があったが、独立レビューは REVISE、実装への構造合意は保留。隠した拡張子の要求で、新しい DirectMedia reader を構築した後に旧 linked 窓を閉じると、正しい close の元一覧復元が新 reader を破棄していた。テストの不足に加えて実装の順序違反であり、close の復元に guard を加えて避けない。
+- DirectMedia の構築入口2か所（sidecar continuation／復元済み一覧の即時 action）を `install_direct_media_reader_for_open` に集約した。BrowserOverlay の新規要求だけは、対象パス・準備済みメタデータ・要求を値で保持して旧 reader の終了／park を済ませ、その後の一覧で対象を解決・構築する。MainWindow／Fullscreen／BrowserView からの置換も同じ境界を通す。Preferences の構築順序は変更しない。
+- `ViewerOpenOrigin::MainPrepared` は旧 reader の引き継ぎを終えた新規要求を表す。要求 ID・意図・選択所有を維持して hydration／RequiredFullscreen の待ちを通し、表示先では新規 routing を保ちながら旧 reader を再終了しない。App のフラグ・待機時間窓・位置の保存先は増やさない。通常の DirectMedia 終了による元一覧復元は変更しない。
+- `browser818_presentation_activation_hidden_image_replaces_each_previous_reader` は実際の activation 受付・resolver・フォルダ復元から表示・同期・close までを通す。旧 F12 linked／MainWindow／Fullscreen／BrowserView を検査し、隠した画像への再要求も検査する。`browser818_presentation_hidden_image_immediate_action_finishes_old_reader_before_install` は即時構築入口、`browser818_presentation_direct_media_handoff_retains_request_and_preferences_order` は要求相関・引き継ぎ済み状態・Preferences の順序を検査する。既存テストの削除・弱化はない。
+- 今回の変更に対するビルド・テストは未実行（cargo は最後の fmt のみ）。上記の既存成功結果は今回の差分の検証には代用しない。実装の構造合意は再レビューで確認する。
+
+P1 修正の再検証では設計担当から190件中189件成功・上記 activation 回帰1件失敗の報告があった。失敗した末尾の「全項目が PNG」は、viewer 終了直後に非同期の帰り先一覧復元まで完了したとみなしていたテスト側の誤り。`restore_direct_media_reader_origin` は snapshot を退役して `restore_view_return_origin` へ帰り先を渡し、通常の物理フォルダ履歴 owner が一覧を非同期復元する。`close_fullscreen_to_completion` の完了条件は viewer teardown であり、一覧復元の完了ではない。既存の `finish_history_restore_preparation_for_test` でその owner と hydration の完了を待ってから、元の PNG assert を維持し、帰り先フォルダ・元の2画像との完全一致・可視 index・fullscreen 終了も検査するように修正した。製品コードの変更はなく、このテスト修正の再実行は設計担当へ引き継ぐ。
+
 ### 段階5：新しい pipe と launcher／core の引数
 
 **範囲**

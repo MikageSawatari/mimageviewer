@@ -72,6 +72,237 @@ fn receive(app: &App, path: PathBuf, request: ViewerOpenRequest) {
         .unwrap();
 }
 
+fn open_previous_reader(app: &mut App, presentation: ViewerPresentation, browser_view: bool) {
+    app.settings.video_in_window_mode = presentation == ViewerPresentation::MainWindow;
+    app.settings.detached_viewer_enabled =
+        presentation == ViewerPresentation::DetachedWindow && !browser_view;
+    if browser_view {
+        let adoption = browser(app);
+        app.open_fullscreen_with_adoption(0, HistoryTrigger::UserChosen, None, adoption);
+    } else {
+        app.open_fullscreen(0, HistoryTrigger::UserChosen);
+    }
+    assert_eq!(app.fullscreen_idx, Some(0));
+    assert_eq!(app.viewer_presentation, presentation);
+}
+
+fn assert_hidden_browser_reader(
+    app: &mut App,
+    requested: &std::path::Path,
+    request: ViewerOpenRequest,
+) {
+    let index = app
+        .items
+        .iter()
+        .position(|item| matches!(item, GridItem::Image(path) if path == requested))
+        .expect("the accepted hidden image must remain in the new reader");
+    assert_eq!(app.fullscreen_idx, Some(index));
+    assert_eq!(app.selected, Some(index));
+    assert!(app.direct_media_reader_active());
+    let snapshot = app.snapshot.as_ref().unwrap();
+    assert!(
+        matches!(&snapshot.source_label, crate::snapshot::SnapshotSourceLabel::DirectMedia { target, .. } if target == requested)
+    );
+    assert!(
+        !snapshot
+            .saved_items
+            .iter()
+            .any(|item| matches!(item, GridItem::Image(path) if path == requested)),
+        "the hidden image must not leak into the saved origin list"
+    );
+    let id = app.detached_viewer_window_id().unwrap();
+    let runtime = app.detached_window_manager.runtime(id).unwrap();
+    assert!(runtime.linked);
+    assert_eq!(runtime.purpose(), DetachedWindowPurpose::BrowserView);
+    let ViewerOpenIntent::BrowserOverlay { placement } = request.intent else {
+        panic!("browser request");
+    };
+    assert_eq!(runtime.placement, Some(placement));
+    let stamp = app.viewer_sync_stamp_for_idx(index).unwrap();
+    assert_eq!(app.last_viewer_sync_stamp.as_ref(), Some(&stamp));
+    app.sync_detached_viewer_to_selected(&egui::Context::default());
+    assert_eq!(app.fullscreen_idx, Some(index));
+    assert_eq!(app.selected, Some(index));
+    assert_eq!(app.last_viewer_sync_stamp.as_ref(), Some(&stamp));
+    assert_eq!(app.detached_viewer_window_id(), Some(id));
+}
+
+#[test]
+fn browser818_presentation_activation_hidden_image_replaces_each_previous_reader() {
+    for (previous, browser_view) in [
+        (ViewerPresentation::DetachedWindow, false),
+        (ViewerPresentation::MainWindow, false),
+        (ViewerPresentation::Fullscreen, false),
+        (ViewerPresentation::DetachedWindow, true),
+    ] {
+        let mut app = fixture();
+        let origin_folder = app.current_folder.clone();
+        let origin_items = app.items.clone();
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.auto_fullscreen_zip_pdf = false;
+        open_previous_reader(&mut app, previous, browser_view);
+        app.settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("bmp".into());
+        let ctx = egui::Context::default();
+        // Repeat from a BrowserView whose reader itself owns a hidden image.
+        for name in ["hidden-first.bmp", "hidden-second.bmp"] {
+            let requested = app.current_folder.as_ref().unwrap().join(name);
+            image::RgbaImage::new(2, 2).save(&requested).unwrap();
+            assert!(
+                !app.settings
+                    .file_type_visibility
+                    .allows_physical_file(&requested)
+            );
+            let old_window = app.detached_viewer_window_id();
+            let request = browser(&app).request().unwrap();
+            receive(&app, requested.clone(), request);
+            app.poll_activation_open_paths(&ctx);
+            assert_eq!(
+                app.startup_open_path_resolve_pending
+                    .as_ref()
+                    .unwrap()
+                    .owner
+                    .viewer_open_adoption()
+                    .request(),
+                Some(request)
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while app.startup_open_path_resolve_pending.is_some() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "real activation resolver did not finish"
+                );
+                app.poll_startup_open_path_resolve(&ctx);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert!(
+                app.sidecar_restore_active(),
+                "the production folder restore must own DirectMedia construction"
+            );
+            assert!(
+                !app.items
+                    .iter()
+                    .any(|item| matches!(item, GridItem::Image(path) if path == &requested))
+            );
+            if let Some(old) = old_window {
+                assert!(
+                    app.detached_window_manager.runtime(old).is_some(),
+                    "exercise the live old linked lease, not an already-retired window"
+                );
+            }
+            app.finish_page_identity_preparation_for_test();
+            assert_hidden_browser_reader(&mut app, &requested, request);
+            if let Some(old) = old_window {
+                assert_ne!(app.detached_viewer_window_id(), Some(old));
+                assert!(app.detached_window_manager.runtime(old).is_none());
+            }
+        }
+        // The normal terminal still restores DirectMedia's origin; no close guard was added.
+        app.close_fullscreen_to_completion(&ctx).unwrap();
+        assert!(!app.direct_media_reader_active());
+        assert_eq!(app.fullscreen_idx, None);
+        // Viewer teardown dispatches the ordinary asynchronous folder-history restore.
+        // Check the returned grid only after that owner and its hydration have completed.
+        app.finish_history_restore_preparation_for_test();
+        assert_eq!(app.current_folder, origin_folder);
+        assert_eq!(app.items, origin_items);
+        assert_eq!(app.visible_indices, vec![0, 1]);
+        assert!(app.items.iter().all(|item| item.name().ends_with(".png")));
+    }
+}
+
+#[test]
+fn browser818_presentation_hidden_image_immediate_action_finishes_old_reader_before_install() {
+    for (previous, browser_view) in [
+        (ViewerPresentation::DetachedWindow, false),
+        (ViewerPresentation::MainWindow, false),
+        (ViewerPresentation::Fullscreen, false),
+        (ViewerPresentation::DetachedWindow, true),
+    ] {
+        let mut app = fixture();
+        open_previous_reader(&mut app, previous, browser_view);
+        let old = app.detached_viewer_window_id();
+        let requested = app.current_folder.as_ref().unwrap().join("immediate.bmp");
+        image::RgbaImage::new(2, 2).save(&requested).unwrap();
+        app.settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("bmp".into());
+        let adoption = browser(&app);
+        app.finish_main_list_after_hydration(MainListAfterHydration::DirectMedia {
+            prepared: startup_ops::DirectMediaPrepared::image_fixture_for_test(requested.clone()),
+            viewer_adoption: adoption,
+        });
+        app.finish_page_identity_preparation_for_test();
+        assert_hidden_browser_reader(&mut app, &requested, adoption.request().unwrap());
+        if let Some(old) = old {
+            assert!(app.detached_window_manager.runtime(old).is_none());
+        }
+    }
+}
+
+#[test]
+fn browser818_presentation_direct_media_handoff_retains_request_and_preferences_order() {
+    for overlay in [false, true] {
+        let mut app = fixture();
+        open_previous_reader(&mut app, ViewerPresentation::DetachedWindow, false);
+        let old = app.detached_viewer_window_id().unwrap();
+        let requested = app.current_folder.as_ref().unwrap().join("prepared.bmp");
+        image::RgbaImage::new(2, 2).save(&requested).unwrap();
+        app.settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("bmp".into());
+        let adoption = if overlay {
+            browser(&app)
+        } else {
+            ViewerOpenAdoption::requested(ViewerOpenRequest::preferences()).explicit_file()
+        };
+        let (target, prepared) = app
+            .install_direct_media_reader_for_open(
+                startup_ops::DirectMediaPrepared::image_fixture_for_test(requested.clone()),
+                adoption,
+            )
+            .unwrap();
+        assert_eq!(target, crate::snapshot::SnapshotTarget::Fs(requested));
+        assert_eq!(prepared.request(), adoption.request());
+        assert!(prepared.is_main_new());
+        assert!(prepared.owns_file_selection());
+        assert_eq!(prepared.needs_main_preparation(), !overlay);
+        assert_eq!(app.detached_window_manager.runtime(old).is_none(), overlay);
+        if overlay {
+            assert_eq!(
+                prepared.after_main_preparation(),
+                prepared,
+                "handoff completion is idempotent"
+            );
+            app.finish_required_fullscreen_load_with_adoption(
+                target,
+                HistoryTrigger::UserChosen,
+                prepared,
+            );
+            app.finish_page_identity_preparation_for_test();
+            assert!(
+                app.direct_media_reader_active(),
+                "no second old-reader close after page-index hydration"
+            );
+            assert_eq!(app.selected, app.fullscreen_idx);
+            assert!(!prepared.context_continuation().is_main_new());
+            assert_eq!(
+                prepared.context_continuation().request(),
+                adoption.request()
+            );
+        } else {
+            assert_eq!(
+                prepared, adoption,
+                "Preferences keeps its original install-before-handoff sequence"
+            );
+        }
+    }
+}
+
 #[test]
 fn browser818_presentation_linked_seed_replaces_lease_with_f12_on_and_off() {
     for enabled in [false, true] {
