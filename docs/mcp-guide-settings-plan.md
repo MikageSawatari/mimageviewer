@@ -505,8 +505,11 @@ AI 連携の許可そのものだけ** (2026-11-21 利用者決定、§1)。画�
   (`src/creative_lut.rs:638`)、一覧の値だけを置き換えても環境設定の OK と同じ結果にならない。§6.3 の「空の
   transaction」で確定できるのは値だけの項目に限られる。LUT は取り込みの worker と transaction の引き渡しを
   足してから扱う (第 2 段)。
-- **同じ基準**: 環境設定の画面にあっても、画面での編集が値の書き換えだけでなく worker・transaction・ファイルの
-  作成や削除を伴う項目は、第 1 段の鍵にしない (第 2 段)。実装担当が見つけたものは区切り C の報告に挙げ、ここに足す。
+- **同じ基準**: 環境設定の画面にあっても、**OK を押す前の編集**が値の書き換えだけでなく worker・transaction・
+  ファイルの作成や削除を伴い、その結果が下書きに要る項目 (OK の条件になる準備を含む) は、第 1 段の鍵にしない
+  (第 2 段)。**OK のあとの後処理** (`apply_preferences_dialog` の中での worker の作り直し・読み込み直しなど) は
+  この基準に当たらない。AI からの変更も同じ確定処理を通るので、後処理は画面の OK と同じに走る (§6.3 の目的)。
+  実装担当が見つけたものは区切り C の報告に挙げ、ここに足す。
 
 #### 6.4.3 第 1 段の鍵の決め方
 
@@ -1211,6 +1214,95 @@ ZIP の prefix と PDF の 0 始まり `page_n` は既存の `list_folder` の�
 `get_view_state` は登録済み、草案 JSON は残り 4 本。snapshot と library の schema 追加分 159 字を
 含めた静的見積もりは現時点の tools/list 43,959 字、残り草案込み 47,351 字 (予約枠 512 字を除いて 137 字残る)。
 detached 述語・viewport routing の変更は無い。実装担当は Cargo ビルド・テストを実行しない。
+
+C の実装 (2026-11-23、ビルド・テストは設計担当の共有 runner 待ち): 第 1 段は **217 鍵**
+(export 165 + 除外側の印 52)。型の trait が選択肢・変更行・外部ツールの登録例を作る。
+export の検査と書き込みは既存の `parse_items` / `ParsedPreferences::apply_to` を通す。
+除外側も型付きで検査し、UI と範囲の定数を共有する。読み込み時の正規化は clone 上で要求鍵だけを
+検査し、要求していない項目は変えない。
+
+`get_settings` は標準 snapshot を UI のメモリから読み、60 鍵ずつ、または keys/query の最大 32 鍵を返す。
+query は 200 文字以内。大きい行は既存の digest / too_long とし、最終の structured JSON と text copy の
+合計で予算を守る。`set_settings` は既存の UI dispatch の受付・claim・書き込み応答の規則を使う。
+変更なしなら下書き・保存・通知を作らず、変更があれば確定前に変更前後と変更行を含む応答の予算を検査する。
+表示用の初期化を通さず下書きを作り、既存の Preferences OK を呼ぶ。保存失敗はログと通知のみ。
+
+設計担当の分類の基準 (§6.4.2) により、第 2 段としたもの:
+`gamepad_enabled` (操作カスタマイズ所有)、`creative_luts` (取り込み・管理コピー・transaction)、
+`ui_font` (取り込み・preview worker と準備完了の OK 条件)。
+`susie_enabled` / `susie_allow_parallel`・`vst3_enabled` / `vst3_plugins`・`ai_backend` は、worker の作り直しが
+OK のあとの後処理 (`preferences.rs:3362`・`:3415-3453`) なので第 1 段に残す (2026-11-23 設計担当の判断。
+実装担当が一度第 2 段に置いたのを戻した)。
+環境設定の外の鍵も引き続き対象外。メニューの並びには環境設定のページがあるため第 1 段。
+外部ツールのパス確認は表示補助で OK を止めず、既存の関連付けを保つ編集にも OS の列挙は要らない。
+クリップボード保存先は直接入力で変えられ、picker / Explorer の worker は確定に要らない。
+
+IPC の追加は版 6 の `GetSettings` / `SetSettings` と応答型のみ。凍結 fixture は変更しない。
+登録 tool は `get_settings` 823 字、`set_settings` 853 字。残り草案込みの最大 tools/list は
+**47,472 字の静的見積もり** (予約枠を除いた 47,488 字まで 16 字)。
+instructions のガイド追加は 257 字、全体は 1,109 UTF-16 単位。
+副作用とスクリプトの反映時期をマニュアル 6 ページで補足した。公開文言の全体更新は E。
+確定区間に `agent/set_settings_commit` の計測を追加。時間の実測は共有 runner / 利用者の検証待ち。
+
+除外側で第 1 段に加えた鍵と画面の anchor (52 鍵):
+
+| 鍵 | anchor |
+| --- | --- |
+| `raw_develop_parallelism` | `raw-develop/settings` |
+| `effetune_pre_limiter_enabled` | `video/effetune-input-limit` |
+| `effetune_auto_open_on_video` | `video/effetune-auto-open` |
+| `effetune_keep_visible_when_minimized` | `video/effetune-minimized` |
+| `effetune_show_in_taskbar` | `video/effetune-taskbar` |
+| `details_selection_bar_mode` | `thumbnail/details-selection-bar` |
+| `file_organize_destinations` | `folder/organize-destinations` |
+| `startup_folder_mode` | `startup/mode` |
+| `startup_folder_path` | `startup/specific-folder` |
+| `parallelism` | `parallelism/mode` |
+| `pdf_worker_count` | `parallelism/pdf` |
+| `prefetch_back` | `prefetch/full-image` |
+| `prefetch_forward` | `prefetch/full-image` |
+| `stack_script_enabled` | `folder/stack-script` |
+| `cache_policy` | `cache/mode` |
+| `cache_book_cover_only` | `cache/book-cover-only` |
+| `cache_threshold_ms` | `cache/auto-time` |
+| `cache_size_threshold_bytes` | `cache/auto-size` |
+| `cache_webp_always` | `cache/auto-kinds` |
+| `cache_pdf_always` | `cache/auto-kinds` |
+| `cache_zip_always` | `cache/auto-kinds` |
+| `edit_preview_cache_enabled` | `cache/edit-preview` |
+| `edit_preview_cache_max_bytes` | `cache/edit-preview` |
+| `archive_cache_max_bytes` | `cache/archive-limit` |
+| `indexer_speed_profile` | `indexer/speed` |
+| `thumb_prev_pages` | `prefetch/thumbnail` |
+| `thumb_next_pages` | `prefetch/thumbnail` |
+| `gpu_memory_percent` | `gpu-memory/limit` |
+| `thumb_idle_upgrade` | `thumbnail/idle-upgrade` |
+| `show_location_file_organize_destinations` | `folder/organize-destinations` |
+| `exif_hidden_tags` | `exif/hidden-tags` |
+| `capture_output_dir` | `capture/folder` |
+| `book_root` | `book/root` |
+| `clipboard_capture_output_dir` | `clipboard-capture/folder` |
+| `anime_upscale_source_limit` | `spread/anime-limit` |
+| `menu_layout` | `menu/layout` |
+| `context_menu_layout` | `context-menu/layout` |
+| `external_tools` | `external-tools/list` |
+| `ai_upscale_prefetch_back` | `prefetch/ai` |
+| `ai_upscale_prefetch_forward` | `prefetch/ai` |
+| `retained_final_ai_cache_max_entries` | `prefetch/retained-ai-count` |
+| `retained_final_ai_cache_max_mib` | `prefetch/retained-ai-memory` |
+| `ai_upscale_size_limit` | `prefetch/ai-size-limit` |
+| `ai_denoise_size_limit` | `prefetch/ai-size-limit` |
+| `skip_offline_change_scan` | `indexer/offline-change-scan` |
+| `update_check_enabled` | `update/automatic` |
+| `perf_log_enabled` | `developer/performance-log` |
+| `remote_video_streaming_enabled` | `video/remote-streaming` |
+| `video_seek_bar_locked` | `video/bar-visibility` |
+| `reading_history_limit` | `resume/history-limit` |
+| `video_hw_decode` | `video/hardware-decode` |
+| `video_deinterlace` | `video/deinterlace` |
+
+`video_seek_bar_locked` は 2 bool の個別編集ではなく、helper と同じ 3 値
+(`None` / `BarOnly` / `BarAndStrip`) を読む・書く。`video_seek_strip_locked` は別の鍵にしない。
 
 区切り C のテスト (設定は、編集 → 確定 → 効果までを通しで確かめる):
 

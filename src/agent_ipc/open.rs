@@ -48,6 +48,7 @@ impl Drop for OpenPermit {
 pub(crate) enum UiOpenOutcome {
     Admitted,
     Read(mimageviewer_agent_ipc::ViewState),
+    Settings(mimageviewer_agent_ipc::SettingsPage),
     Written(Result<mimageviewer_agent_ipc::Payload, AgentError>),
     Refused(AgentError),
 }
@@ -56,6 +57,15 @@ pub(crate) enum UiRequestKind {
     Open(ActivationOpenPath),
     GetViewState {
         default_books_root: std::path::PathBuf,
+    },
+    GetSettings {
+        query: Option<String>,
+        keys: Option<Vec<String>>,
+        page: Option<u32>,
+    },
+    SetSettings {
+        changes: serde_json::Map<String, serde_json::Value>,
+        client_name: String,
     },
     TagWrite(super::metadata_write::PreparedTags),
     RatingWrite(super::metadata_write::PreparedRatings),
@@ -193,8 +203,46 @@ impl OpenController {
         dispatch: Arc<UiRequestDispatch>,
     ) -> Result<UiOpenOutcome, AgentError> {
         self.dispatch_request(&ctx.cancel, dispatch, UI_REPLY_TIMEOUT, || {
-            super::metadata_write::prepare(command, ctx, client_name).map(UiRequestKind::from)
+            if let mimageviewer_agent_ipc::Command::SetSettings { changes } = command {
+                if changes.is_empty() || changes.len() > mimageviewer_agent_ipc::MAX_SETTINGS_KEYS {
+                    return Err(super::error(
+                        mimageviewer_agent_ipc::ErrorCode::BadRequest,
+                        "設定は 1～32 項目で指定してください",
+                    ));
+                }
+                crate::settings_transfer::validate_stage1_paths(&changes).map_err(|message| {
+                    super::error(mimageviewer_agent_ipc::ErrorCode::BadRequest, &message)
+                })?;
+                ctx.checkpoint()?;
+                Ok(UiRequestKind::SetSettings {
+                    changes,
+                    client_name,
+                })
+            } else {
+                super::metadata_write::prepare(command, ctx, client_name).map(UiRequestKind::from)
+            }
         })
+    }
+
+    pub(super) fn execute_settings_read(
+        self: &Arc<Self>,
+        query: Option<String>,
+        keys: Option<Vec<String>>,
+        page: Option<u32>,
+        ctx: &super::ReadContext,
+    ) -> Result<mimageviewer_agent_ipc::SettingsPage, AgentError> {
+        ctx.checkpoint()?;
+        let result = self.dispatch_request(
+            &ctx.cancel,
+            Arc::new(UiRequestDispatch::pending()),
+            UI_REPLY_TIMEOUT,
+            || Ok(UiRequestKind::GetSettings { query, keys, page }),
+        )?;
+        match result {
+            UiOpenOutcome::Settings(page) => Ok(page),
+            UiOpenOutcome::Refused(error) => Err(error),
+            _ => Err(super::internal()),
+        }
     }
 
     pub(super) fn execute_view_state(
@@ -244,6 +292,19 @@ impl OpenController {
         timeout: Duration,
     ) -> Result<UiOpenOutcome, AgentError> {
         self.dispatch_request(cancel, dispatch, timeout, || Ok(prepared.into()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_settings_for_test(
+        self: &Arc<Self>,
+        kind: UiRequestKind,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        self.dispatch_request(
+            &AtomicBool::new(false),
+            Arc::new(UiRequestDispatch::pending()),
+            UI_REPLY_TIMEOUT,
+            || Ok(kind),
+        )
     }
 
     fn dispatch_request(
@@ -344,7 +405,9 @@ fn outcome_result(reply: UiOpenOutcome) -> Result<OpenResult, AgentError> {
             message: "mIV で開く処理を始めました".to_owned(),
         }),
         UiOpenOutcome::Refused(error) => Err(error),
-        UiOpenOutcome::Written(_) | UiOpenOutcome::Read(_) => Err(open_failed()),
+        UiOpenOutcome::Written(_) | UiOpenOutcome::Read(_) | UiOpenOutcome::Settings(_) => {
+            Err(open_failed())
+        }
     }
 }
 

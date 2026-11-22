@@ -49,6 +49,8 @@ mod read_tests;
 #[cfg(test)]
 mod recent_tests;
 #[cfg(test)]
+mod settings_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod view_state_tests;
@@ -305,6 +307,8 @@ const OPEN_PERMISSION_MESSAGE: &str =
     "mIV の「設定」→「AI 連携…」で許可の範囲を「読み取りと、mIV で開く」以上にしてください";
 pub(crate) const CURRENT_VIEW_PERMISSION_MESSAGE: &str =
     "mIV の「設定」→「AI 連携…」で「今開いている場所を AI に見せる」を ON にしてください";
+pub(crate) const SETTINGS_PERMISSION_MESSAGE: &str =
+    "mIV の「設定」→「AI 連携…」で「設定の確認と変更を AI に任せる」を ON にしてください";
 const ORGANIZE_PERMISSION_MESSAGE: &str =
     "mIV の「設定」→「AI 連携…」で許可の範囲を「整理まで」にしてください";
 
@@ -315,6 +319,9 @@ fn check_tool_permission(
 ) -> Result<(), AgentError> {
     let denied = match command {
         Command::GetViewState if !snapshot.current_view => Some(CURRENT_VIEW_PERMISSION_MESSAGE),
+        Command::GetSettings { .. } | Command::SetSettings { .. } if !snapshot.settings => {
+            Some(SETTINGS_PERMISSION_MESSAGE)
+        }
         Command::GetThumbnail { .. } if !snapshot.thumbnails => Some(THUMBNAIL_PERMISSION_MESSAGE),
         Command::GetTranscript { .. } if !snapshot.transcripts => {
             Some(TRANSCRIPT_PERMISSION_MESSAGE)
@@ -567,7 +574,9 @@ impl Connection {
                     );
                     return;
                 }
-                if metadata_write::is_write(&request.command) {
+                if metadata_write::is_write(&request.command)
+                    || matches!(request.command, Command::SetSettings { .. })
+                {
                     metadata_response::respond(
                         connection,
                         request.command,
@@ -693,6 +702,8 @@ fn tool_name(command: &Command) -> &'static str {
         Command::Hello { .. } => "hello",
         Command::Status => "miv_status",
         Command::GetViewState => "get_view_state",
+        Command::GetSettings { .. } => "get_settings",
+        Command::SetSettings { .. } => "set_settings",
         Command::SearchItems { .. } => "search_items",
         Command::ListTags { .. } => "list_tags",
         Command::ItemsByTag { .. } => "items_by_tag",
@@ -760,6 +771,10 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
         ),
         Ok(Payload::Opened(_)) => (1, "none"),
         Ok(Payload::ViewState(_)) => (1, "none"),
+        Ok(Payload::Settings(page)) => (page.items.len(), "none"),
+        Ok(Payload::SettingsWrite(result)) => {
+            (result.changed.len() + result.unchanged.len(), "none")
+        }
         Ok(_) => (0, "none"),
         Err(e) => (
             0,
@@ -802,6 +817,10 @@ impl Handlers {
             }
             Command::Status => self.status(ctx),
             Command::GetViewState => self.open.execute_view_state(ctx).map(Payload::ViewState),
+            Command::GetSettings { query, keys, page } => self
+                .open
+                .execute_settings_read(query, keys, page, ctx)
+                .map(Payload::Settings),
             Command::ListTags {
                 choice,
                 limit,
@@ -955,6 +974,7 @@ impl Handlers {
             | Command::RemoveFromCollection { .. }
             | Command::AddTags { .. }
             | Command::RemoveTags { .. }
+            | Command::SetSettings { .. }
             | Command::SetRating { .. } => {
                 unreachable!()
             }

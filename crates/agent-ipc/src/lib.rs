@@ -27,6 +27,8 @@ mod read_types;
 pub use read_types::*;
 mod folder_types;
 pub use folder_types::*;
+mod settings_types;
+pub use settings_types::*;
 
 pub const AGENT_PROTOCOL_VERSION: u32 = 6;
 pub const MIN_ADAPTER_PROTOCOL_VERSION: u32 = 3;
@@ -139,6 +141,14 @@ pub enum Command {
     },
     Status,
     GetViewState,
+    GetSettings {
+        query: Option<String>,
+        keys: Option<Vec<String>>,
+        page: Option<u32>,
+    },
+    SetSettings {
+        changes: serde_json::Map<String, serde_json::Value>,
+    },
     SearchItems {
         query: String,
         kind: Option<ItemKind>,
@@ -276,6 +286,8 @@ pub enum Payload {
     Hello { version: u32 },
     Status(StatusPayload),
     ViewState(ViewState),
+    Settings(SettingsPage),
+    SettingsWrite(SettingsWriteResult),
     Items(ItemPage),
     Tags(TagPage),
     Collections(CollectionPage),

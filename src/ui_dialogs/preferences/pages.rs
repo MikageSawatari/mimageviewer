@@ -7551,7 +7551,7 @@ pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) 
             ui.add_enabled(
                 !current_auto,
                 egui::DragValue::new(&mut state.manual_threads)
-                    .range(1..=64)
+                    .range(1..=crate::settings_transfer::stage1::PARALLELISM_MAX)
                     .suffix(" スレッド"),
             )
             .labelled_by(manual.id);
@@ -7615,7 +7615,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let label = ui.label("後方（前の画像）:");
             ui.add(
                 egui::DragValue::new(&mut s.prefetch_back)
-                    .range(0..=50usize)
+                    .range(0..=crate::settings_transfer::stage1::PREFETCH_MAX)
                     .suffix(" 枚"),
             )
             .labelled_by(label.id);
@@ -7624,7 +7624,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let label = ui.label("前方（次の画像）:");
             ui.add(
                 egui::DragValue::new(&mut s.prefetch_forward)
-                    .range(0..=50usize)
+                    .range(0..=crate::settings_transfer::stage1::PREFETCH_MAX)
                     .suffix(" 枚"),
             )
             .labelled_by(label.id);
@@ -7646,7 +7646,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let label = ui.label("後方（前のページ）:");
             ui.add(
                 egui::DragValue::new(&mut s.thumb_prev_pages)
-                    .range(0..=20u32)
+                    .range(0..=crate::settings_transfer::stage1::THUMB_PREFETCH_MAX)
                     .suffix(" ページ"),
             )
             .labelled_by(label.id);
@@ -7655,7 +7655,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let label = ui.label("前方（次のページ）:");
             ui.add(
                 egui::DragValue::new(&mut s.thumb_next_pages)
-                    .range(0..=20u32)
+                    .range(0..=crate::settings_transfer::stage1::THUMB_PREFETCH_MAX)
                     .suffix(" ページ"),
             )
             .labelled_by(label.id);
@@ -7674,7 +7674,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let label = ui.label("後方（前の画像）:");
             ui.add(
                 egui::DragValue::new(&mut s.ai_upscale_prefetch_back)
-                    .range(0..=10usize)
+                    .range(0..=crate::settings_transfer::stage1::AI_PREFETCH_MAX)
                     .suffix(" 枚"),
             )
             .labelled_by(label.id);
@@ -7683,7 +7683,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let label = ui.label("前方（次の画像）:");
             ui.add(
                 egui::DragValue::new(&mut s.ai_upscale_prefetch_forward)
-                    .range(0..=10usize)
+                    .range(0..=crate::settings_transfer::stage1::AI_PREFETCH_MAX)
                     .suffix(" 枚"),
             )
             .labelled_by(label.id);
@@ -7779,17 +7779,28 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
 /// ⚠ 長辺は `crate::app::MAX_TEXTURE_DIM` (8192) 以下に保つこと。render-to-target
 /// 後も最終合成バッファは GPU テクスチャ上限内に収める。
 /// 6144 / 8192 クラスは結合見開きスキャンなど大判向けの高負荷オプション。
-const AI_SIZE_LIMIT_OPTIONS: [(u32, u32, &str); 9] = [
-    (512, 512, "512 x 512 未満"),
-    (1024, 1024, "1024 x 1024 未満"),
-    (2048, 1024, "2048 x 1024 未満"),
-    (2048, 2048, "2048 x 2048 未満"),
-    (4096, 2048, "4096 x 2048 未満"),
-    (4096, 4096, "4096 x 4096 未満 (高負荷)"),
-    (6144, 4096, "6144 x 4096 未満 (超高負荷)"),
-    (8192, 4096, "8192 x 4096 未満 (超高負荷)"),
-    (8192, 8192, "8192 x 8192 未満 (超高負荷)"),
+const AI_SIZE_LIMIT_LABELS: [&str; 9] = [
+    "512 x 512 未満",
+    "1024 x 1024 未満",
+    "2048 x 1024 未満",
+    "2048 x 2048 未満",
+    "4096 x 2048 未満",
+    "4096 x 4096 未満 (高負荷)",
+    "6144 x 4096 未満 (超高負荷)",
+    "8192 x 4096 未満 (超高負荷)",
+    "8192 x 8192 未満 (超高負荷)",
 ];
+#[cfg(test)]
+const AI_SIZE_LIMIT_OPTIONS: [(u32, u32, &str); 9] = {
+    let mut values = [(0, 0, ""); 9];
+    let mut index = 0;
+    while index < values.len() {
+        let pair = crate::settings_transfer::stage1::AI_SIZE_OPTIONS[index];
+        values[index] = (pair.0, pair.1, AI_SIZE_LIMIT_LABELS[index]);
+        index += 1;
+    }
+    values
+};
 
 /// 「長辺 x 短辺 未満」候補のコンボボックスを描画し、選択が変わったら Some を返す。
 /// 現在値が候補に無い場合 (旧設定の読み替え値等) は現在値をそのまま表示する。
@@ -7799,17 +7810,21 @@ fn ai_size_limit_combo(
     current: crate::ai::upscale::AiProcessSizeLimit,
     label: egui::Id,
 ) -> Option<crate::ai::upscale::AiProcessSizeLimit> {
-    let selected_label = AI_SIZE_LIMIT_OPTIONS
+    let selected_label = crate::settings_transfer::stage1::AI_SIZE_OPTIONS
         .iter()
-        .find(|(long, short, _)| *long == current.long_edge_px && *short == current.short_edge_px)
-        .map(|(_, _, label)| (*label).to_string())
+        .zip(AI_SIZE_LIMIT_LABELS)
+        .find(|((long, short), _)| *long == current.long_edge_px && *short == current.short_edge_px)
+        .map(|(_, label)| label.to_string())
         .unwrap_or_else(|| format!("{} 未満", current.label()));
     let mut picked = None;
     egui::ComboBox::from_id_salt(id)
         .selected_text(selected_label)
         .width(200.0)
         .show_ui(ui, |ui| {
-            for (long, short, label) in AI_SIZE_LIMIT_OPTIONS {
+            for (&(long, short), label) in crate::settings_transfer::stage1::AI_SIZE_OPTIONS
+                .iter()
+                .zip(AI_SIZE_LIMIT_LABELS)
+            {
                 let is_sel = long == current.long_edge_px && short == current.short_edge_px;
                 if ui.selectable_label(is_sel, label).clicked() && !is_sel {
                     picked = Some(crate::ai::upscale::AiProcessSizeLimit {
@@ -7842,9 +7857,12 @@ pub(super) fn page_gpu_memory(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.horizontal(|ui| {
             let label = ui.label("上限:");
             ui.add(
-                egui::Slider::new(&mut s.gpu_memory_percent, 0..=100u32)
-                    .step_by(5.0)
-                    .suffix(" %"),
+                egui::Slider::new(
+                    &mut s.gpu_memory_percent,
+                    0..=crate::settings_transfer::stage1::GPU_MEMORY_PERCENT_MAX,
+                )
+                .step_by(5.0)
+                .suffix(" %"),
             )
             .labelled_by(label.id);
         });
@@ -8345,9 +8363,13 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
             let label = ui.label("時間しきい値 (decode + display の合計がこれ以上ならキャッシュ):");
             ui.add(
-                egui::Slider::new(&mut s.cache_threshold_ms, 10..=100)
-                    .step_by(5.0)
-                    .suffix(" ms"),
+                egui::Slider::new(
+                    &mut s.cache_threshold_ms,
+                    crate::settings_transfer::stage1::CACHE_THRESHOLD_MIN_MS
+                        ..=crate::settings_transfer::stage1::CACHE_THRESHOLD_MAX_MS,
+                )
+                .step_by(5.0)
+                .suffix(" ms"),
             )
             .labelled_by(label.id);
             ui.label("  小さいほど多くキャッシュ。25 ms 推奨。");
@@ -8361,9 +8383,15 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let mut size_mb = (s.cache_size_threshold_bytes as f64) / 1_000_000.0;
             if ui
                 .add(
-                    egui::Slider::new(&mut size_mb, 0.5..=10.0)
-                        .step_by(0.5)
-                        .suffix(" MB"),
+                    egui::Slider::new(
+                        &mut size_mb,
+                        (crate::settings_transfer::stage1::CACHE_THRESHOLD_MIN_BYTES as f64
+                            / 1_000_000.0)
+                            ..=(crate::settings_transfer::stage1::CACHE_THRESHOLD_MAX_BYTES as f64
+                                / 1_000_000.0),
+                    )
+                    .step_by(0.5)
+                    .suffix(" MB"),
                 )
                 .labelled_by(label.id)
                 .changed()
@@ -8424,7 +8452,11 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     let label = ui.label("容量上限:");
                     ui.add(
                         egui::DragValue::new(&mut edit_preview_limit_mb)
-                            .range(100..=100_000u64)
+                            .range(
+                                (crate::settings_transfer::stage1::EDIT_CACHE_MIN_BYTES / 1_000_000)
+                                    ..=(crate::settings_transfer::stage1::EDIT_CACHE_MAX_BYTES
+                                        / 1_000_000),
+                            )
                             .speed(100.0)
                             .suffix(" MB"),
                     )
@@ -8522,7 +8554,12 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     let label = ui.label("上限:");
                     ui.add(
                         egui::DragValue::new(&mut limit_mb)
-                            .range(1..=1_000_000u64)
+                            .range(
+                                (crate::settings_transfer::stage1::ARCHIVE_CACHE_MIN_BYTES
+                                    / 1_000_000)
+                                    ..=(crate::settings_transfer::stage1::ARCHIVE_CACHE_MAX_BYTES
+                                        / 1_000_000),
+                            )
                             .speed(100.0)
                             .suffix(" MB"),
                     )

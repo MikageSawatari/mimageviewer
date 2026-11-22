@@ -136,6 +136,9 @@ fn set_still_chrome(settings: &mut Settings, value: &StillChrome) {
 }
 
 macro_rules! transfer_get {
+    ($s:expr, $f:ident, video_lock) => {
+        stage1_video_lock($s)
+    };
     ($s:expr, $f:ident, plain) => {
         $s.$f.clone()
     };
@@ -147,6 +150,9 @@ macro_rules! transfer_get {
     };
 }
 macro_rules! transfer_set {
+    ($s:expr, $f:ident, $v:expr, video_lock) => {
+        stage1_set_video_lock($s, $v)
+    };
     ($s:expr, $f:ident, $v:expr, specified_scale) => {
         $s.set_common_fullscreen_specified_scale(*$v)
     };
@@ -177,10 +183,84 @@ macro_rules! assert_excluded_field {
         );
     };
 }
+pub(crate) mod stage1;
+pub(crate) use stage1::*;
+
 macro_rules! preferences_policy {
     (export { $( $field:ident : $ty:ty => ($label:literal, $check:expr, $get:ident, $set:ident); )* }
      group { $($group_field:ident),+ }
-     exclude { $( $excluded:ident => $reason:literal; )* }) => {
+     exclude { $( $excluded:ident => $( @prefs($plabel:literal, $anchor:literal, $pcheck:expr, $pget:ident, $pset:ident) )? $reason:literal; )* }) => {
+        pub(crate) fn capture_stage1(settings: &Settings, favorite_overlay: bool, favorite_specified_scale: bool) -> Vec<Stage1Row> {
+            let mut rows = Vec::new();
+            $( rows.push(stage1_row(stringify!($field), $label, &transfer_get!(settings, $field, $get), $check)); )*
+            rows.push(stage1_row("still_bottom_chrome", "静止画の下部バーとサムネイル列", &still_chrome(settings), valid_still));
+            $( $( rows.push(stage1_row(stringify!($excluded), $plabel, &transfer_get!(settings, $excluded, $pget), $pcheck)); )? )*
+            for row in &mut rows {
+                row.overridden_by_favorite = match row.key.as_str() {
+                    "grid_display_order" | "default_spread_mode" | "default_reading_flow" => favorite_overlay,
+                    "fullscreen_specified_scale" => favorite_overlay && favorite_specified_scale,
+                    _ => false,
+                };
+            }
+            rows
+        }
+        pub(crate) fn stage1_changes(before: &Settings, after: &Settings, keys: &[String]) -> Vec<Stage1Change> {
+            let before_rows = capture_stage1(before, false, false);
+            let after_rows = capture_stage1(after, false, false);
+            keys.iter().filter_map(|key| {
+                let old = before_rows.iter().find(|r| &r.key == key)?;
+                let new = after_rows.iter().find(|r| &r.key == key)?;
+                let lines = match key.as_str() {
+                    $( stringify!($field) => stage1_lines(&transfer_get!(before, $field, $get), &transfer_get!(after, $field, $get)), )*
+                    "still_bottom_chrome" => stage1_lines(&still_chrome(before), &still_chrome(after)),
+                    $( $( stringify!($excluded) => stage1_lines(&transfer_get!(before, $excluded, $pget), &transfer_get!(after, $excluded, $pget)), )? )*
+                    _ => Vec::new(),
+                };
+                Some(Stage1Change {key:key.clone(),label:old.label.clone(),before:old.value.clone(),after:new.value.clone(),lines})
+            }).collect()
+        }
+        pub(crate) const STAGE1_MARKED_ANCHORS: &[(&str, &str)] = &[$( $( (stringify!($excluded), $anchor), )? )*];
+        #[allow(unreachable_patterns)]
+        pub(crate) fn stage1_validate(settings: &Settings, changes: &Map<String, Value>) -> Result<Settings, String> {
+            if !(1..=32).contains(&changes.len()) { return Err("設定は 1〜32 項目を指定してください".into()); }
+            let prepared_changes = stage1_prepare_changes(settings, changes)?;
+            let changes = &prepared_changes;
+            let mut candidate = settings.clone();
+            let export_changes = changes.iter().filter(|(key, _)| match key.as_str() {
+                $( stringify!($field) => true, )*
+                "still_bottom_chrome" => true,
+                _ => false,
+            }).map(|(key, value)| (key.clone(), value.clone())).collect::<Map<String, Value>>();
+            let parsed = parse_items(&export_changes);
+            if !parsed.issues.is_empty() || parsed.unknown_count != 0 {
+                return Err(format!("{}: {INVALID_ITEM}", export_changes.keys().cloned().collect::<Vec<_>>().join("、")));
+            }
+            parsed.apply_to(&mut candidate);
+            for (key, raw) in changes {
+                match key.as_str() {
+                    $( stringify!($field) => {}, )*
+                    "still_bottom_chrome" => {},
+                    $( $( stringify!($excluded) => {
+                        let current = transfer_get!(settings, $excluded, $pget);
+                        let value = stage1_decode(&current, raw, $pcheck).ok_or_else(|| format!("{key}: {INVALID_ITEM}"))?;
+                        transfer_set!(&mut candidate, $excluded, &value, $pset);
+                    }, )? )*
+                    $( stringify!($excluded) => return Err(stage1_key_error(key, $reason)), )*
+                    _ => return Err(stage1_key_error(key, "不明な設定")),
+                }
+            }
+            stage1_absolute_paths(&candidate, changes)?;
+            let before_normalization = capture_stage1(&candidate, false, false);
+            let mut normalized_candidate = candidate.clone();
+            apply_load_time_migrations(&mut normalized_candidate);
+            let after_normalization = capture_stage1(&normalized_candidate, false, false);
+            for key in changes.keys() {
+                let before = before_normalization.iter().find(|r| &r.key == key).unwrap();
+                let after = after_normalization.iter().find(|r| &r.key == key).unwrap();
+                if before.value != after.value { return Err(format!("{key}: 読み込み時に正規化される値は指定できません")); }
+            }
+            Ok(candidate)
+        }
         // No `..`: adding even a serde(skip) or crate-private field requires a policy decision.
         fn exhaustive_policy(settings: &Settings) {
             let Settings { $( $field: _, )* $( $group_field: _, )+ $( $excluded: _, )* } = settings;
@@ -434,13 +514,13 @@ preferences_policy! {
     group { fullscreen_seek_bar_locked, still_seek_strip_locked, still_seek_strip_visible }
     exclude {
         active_quick_folder_slot => "利用中の A/B ワークスペース。登録先・履歴と一組の利用状態";
-        raw_develop_parallelism => "CPU/メモリ/速度に依存する RAW 現像 worker 数の tuning";
+        raw_develop_parallelism => @prefs("並列処理のスレッド数", "raw-develop/settings", |v, _| (1..=RAW_PARALLELISM_MAX).contains(v), plain, plain) "CPU/メモリ/速度に依存する RAW 現像 worker 数の tuning";
         show_facet_sort => "環境設定外のツールバーで管理するソート区画の表示状態";
         toolbar_folder_section_migrated => "ツールバー配置の一度だけの内部移行記録";
-        effetune_pre_limiter_enabled => "移行先の EffeTune/VST 導入状態と音声処理構成に依存する微調整";
-        effetune_auto_open_on_video => "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
-        effetune_keep_visible_when_minimized => "移行先の EffeTune/VST 導入状態とウィンドウ運用に依存する表示方針";
-        effetune_show_in_taskbar => "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
+        effetune_pre_limiter_enabled => @prefs("mIV Sound に渡す前に 0dB を超える音を抑える", "video/effetune-input-limit", |_, _| true, plain, plain) "移行先の EffeTune/VST 導入状態と音声処理構成に依存する微調整";
+        effetune_auto_open_on_video => @prefs("起動後の最初の動画再生で音響調整の窓を自動で開く", "video/effetune-auto-open", |_, _| true, plain, plain) "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
+        effetune_keep_visible_when_minimized => @prefs("メインウィンドウを最小化しても音響調整の窓を表示したままにする", "video/effetune-minimized", |_, _| true, plain, plain) "移行先の EffeTune/VST 導入状態とウィンドウ運用に依存する表示方針";
+        effetune_show_in_taskbar => @prefs("音響調整の窓をタスクバーに表示する", "video/effetune-taskbar", |_, _| true, plain, plain) "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
         grid_cols => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         grid_view_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_sort_key => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -478,7 +558,7 @@ preferences_policy! {
         details_show_video_codec => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_name_width_auto => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_name_width => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
-        details_selection_bar_mode => "利用者の列構成へ影響するため対象外";
+        details_selection_bar_mode => @prefs("詳細表示時の下部情報バー:", "thumbnail/details-selection-bar", |_, _| true, plain, plain) "利用者の列構成へ影響するため対象外";
         details_selection_bar_column_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_column_widths => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         details_selection_bar_rated_at_width => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -505,13 +585,13 @@ preferences_policy! {
         thumb_aspect => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         thumb_aspect_auto => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         favorites => "利用データ・登録先・履歴・検索対象";
-        file_organize_destinations => "起動・保存・整理先の PC 固有パス";
+        file_organize_destinations => @prefs("ファイル整理先", "folder/organize-destinations", |v, _| validate_file_organize_destinations(v).is_ok(), plain, plain) "起動・保存・整理先の PC 固有パス";
         favorite_view_overlay => "runtime overlay / PC のウィンドウ配置";
         smart_folders => "利用データ・登録先・履歴・検索対象";
         last_folder => "利用データ・登録先・履歴・検索対象";
         startup_list_restore => "利用データ・登録先・履歴・検索対象";
-        startup_folder_mode => "起動・保存・整理先の PC 固有パス";
-        startup_folder_path => "起動・保存・整理先の PC 固有パス";
+        startup_folder_mode => @prefs("起動時に開く場所", "startup/mode", |_, _| true, plain, plain) "起動・保存・整理先の PC 固有パス";
+        startup_folder_path => @prefs("起動時の指定フォルダ", "startup/specific-folder", |_, _| true, plain, plain) "起動・保存・整理先の PC 固有パス";
         last_cursor_name => "利用データ・登録先・履歴・検索対象";
         last_cursor_rows_above => "利用データ・登録先・履歴・検索対象";
         recent_folders => "利用データ・登録先・履歴・検索対象";
@@ -523,10 +603,10 @@ preferences_policy! {
         window_size => "runtime overlay / PC のウィンドウ配置";
         window_maximized => "runtime overlay / PC のウィンドウ配置";
         always_on_top => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
-        parallelism => "CPU/GPU/メモリ/ドライバ/速度の tuning";
-        pdf_worker_count => "CPU/GPU/メモリ/ドライバ/速度の tuning";
-        prefetch_back => "CPU/GPU/メモリ/ドライバ/速度の tuning";
-        prefetch_forward => "CPU/GPU/メモリ/ドライバ/速度の tuning";
+        parallelism => @prefs("並列処理のスレッド数", "parallelism/mode", |v, _| matches!(v, Parallelism::Auto) || matches!(v, Parallelism::Manual(n) if (1..=PARALLELISM_MAX).contains(n)), plain, plain) "CPU/GPU/メモリ/ドライバ/速度の tuning";
+        pdf_worker_count => @prefs("PDF の同時処理数", "parallelism/pdf", |v, _| (PDF_WORKER_COUNT_MIN..=PDF_WORKER_COUNT_MAX).contains(v), plain, plain) "CPU/GPU/メモリ/ドライバ/速度の tuning";
+        prefetch_back => @prefs("画像の後方先読み枚数", "prefetch/full-image", |v, _| *v <= PREFETCH_MAX, plain, plain) "CPU/GPU/メモリ/ドライバ/速度の tuning";
+        prefetch_forward => @prefs("画像の前方先読み枚数", "prefetch/full-image", |v, _| *v <= PREFETCH_MAX, plain, plain) "CPU/GPU/メモリ/ドライバ/速度の tuning";
         sort_order => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         rating_view_sort => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         tag_view_sort => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -536,31 +616,31 @@ preferences_policy! {
         subfolder_expansion_filter_date_preset => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         subfolder_expansion_filter_size_preset => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         stack_separator => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
-        stack_script_enabled => "移行先のローカルスクリプト実行方針を保持";
+        stack_script_enabled => @prefs("分類ルールをスクリプト (カスタム) で行う", "folder/stack-script", |_, _| true, plain, plain) "移行先のローカルスクリプト実行方針を保持";
         thumb_px => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         text_preview_scale => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         text_smart_snap_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         thumb_quality => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
-        cache_policy => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
-        cache_book_cover_only => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
-        cache_threshold_ms => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
-        cache_size_threshold_bytes => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
+        cache_policy => @prefs("モード", "cache/mode", |_, _| true, plain, plain) "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
+        cache_book_cover_only => @prefs("本 (ZIP・PDF など) は表紙のサムネイルだけ保存する", "cache/book-cover-only", |_, _| true, plain, plain) "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
+        cache_threshold_ms => @prefs("時間しきい値 (decode + display の合計がこれ以上ならキャッシュ):", "cache/auto-time", |v, _| (CACHE_THRESHOLD_MIN_MS..=CACHE_THRESHOLD_MAX_MS).contains(v), plain, plain) "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
+        cache_size_threshold_bytes => @prefs("サイズしきい値 (このサイズ以上は無条件キャッシュ):", "cache/auto-size", |v, _| (CACHE_THRESHOLD_MIN_BYTES..=CACHE_THRESHOLD_MAX_BYTES).contains(v), plain, plain) "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
         cache_videos_always => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
-        cache_webp_always => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
-        cache_pdf_always => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
-        cache_zip_always => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
-        edit_preview_cache_enabled => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
-        edit_preview_cache_max_bytes => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
-        archive_cache_max_bytes => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
+        cache_webp_always => @prefs("既存 .webp は常にキャッシュ (処理が重いため推奨)", "cache/auto-kinds", |_, _| true, plain, plain) "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
+        cache_pdf_always => @prefs("PDF は常にキャッシュ", "cache/auto-kinds", |_, _| true, plain, plain) "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
+        cache_zip_always => @prefs("ZIP は常にキャッシュ", "cache/auto-kinds", |_, _| true, plain, plain) "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
+        edit_preview_cache_enabled => @prefs("編集結果をサムネイル一覧に保持する", "cache/edit-preview", |_, _| true, plain, plain) "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
+        edit_preview_cache_max_bytes => @prefs("編集プレビューキャッシュの容量上限", "cache/edit-preview", |v, _| (EDIT_CACHE_MIN_BYTES..=EDIT_CACHE_MAX_BYTES).contains(v), plain, plain) "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
+        archive_cache_max_bytes => @prefs("容量上限を有効にする", "cache/archive-limit", |v, _| *v == 0 || (ARCHIVE_CACHE_MIN_BYTES..=ARCHIVE_CACHE_MAX_BYTES).contains(v), plain, plain) "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
         archive_convert_without_dialog => "現行 enum の互換 mirror";
         batch_cache_zip_contents => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
         search_index_checks => "利用データ・登録先・履歴・検索対象";
-        indexer_speed_profile => "同上";
+        indexer_speed_profile => @prefs("速度プロファイル", "indexer/speed", |_, _| true, plain, plain) "同上";
         batch_cache_pdf_contents => "キャッシュ容量・速度・保持方式は移行先のディスク/性能調整として一組で除外";
-        thumb_prev_pages => "CPU/GPU/メモリ/ドライバ/速度の tuning";
-        thumb_next_pages => "CPU/GPU/メモリ/ドライバ/速度の tuning";
-        gpu_memory_percent => "CPU/GPU/メモリ/ドライバ/速度の tuning";
-        thumb_idle_upgrade => "同上";
+        thumb_prev_pages => @prefs("サムネイルの後方先読みページ数", "prefetch/thumbnail", |v, _| *v <= THUMB_PREFETCH_MAX, plain, plain) "CPU/GPU/メモリ/ドライバ/速度の tuning";
+        thumb_next_pages => @prefs("サムネイルの前方先読みページ数", "prefetch/thumbnail", |v, _| *v <= THUMB_PREFETCH_MAX, plain, plain) "CPU/GPU/メモリ/ドライバ/速度の tuning";
+        gpu_memory_percent => @prefs("GPU メモリの上限 (%)", "gpu-memory/limit", |v, _| *v <= GPU_MEMORY_PERCENT_MAX, plain, plain) "CPU/GPU/メモリ/ドライバ/速度の tuning";
+        thumb_idle_upgrade => @prefs("アイドル時にキャッシュ由来のサムネイルを高画質化する", "thumbnail/idle-upgrade", |_, _| true, plain, plain) "同上";
         tags => "利用データ・登録先・履歴・検索対象";
         show_toolbar_favorites => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_smart_folders => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -595,7 +675,7 @@ preferences_policy! {
         show_location_reading_history => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_rating => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_bookshelf => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
-        show_location_file_organize_destinations => "場所▼の表示状態。他の show_location_* と同じく転送対象外";
+        show_location_file_organize_destinations => @prefs("場所にファイル整理先を表示する", "folder/organize-destinations", |_, _| true, plain, plain) "場所▼の表示状態。他の show_location_* と同じく転送対象外";
         show_location_desktop => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_pictures => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_location_downloads => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -605,10 +685,10 @@ preferences_policy! {
         use_native_shell_context_menu => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         ring_shortcuts => "既存の操作カスタマイズ共有が正本";
         rating_filter => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
-        exif_hidden_tags => "保持数の prune、EXIF 任意文字列、動画下部固定の scope 外状態変更、デインターレースの性能 tuning";
-        capture_output_dir => "起動・保存・整理先の PC 固有パス";
-        book_root => "起動・保存・整理先の PC 固有パス";
-        clipboard_capture_output_dir => "起動・保存・整理先の PC 固有パス";
+        exif_hidden_tags => @prefs("メタデータパネルで非表示にする EXIF タグを選択します。", "exif/hidden-tags", |v, _| unique_strings(v), plain, plain) "保持数の prune、EXIF 任意文字列、動画下部固定の scope 外状態変更、デインターレースの性能 tuning";
+        capture_output_dir => @prefs("キャプチャの保存先", "capture/folder", |_, _| true, plain, plain) "起動・保存・整理先の PC 固有パス";
+        book_root => @prefs("本棚フォルダ", "book/root", |_, _| true, plain, plain) "起動・保存・整理先の PC 固有パス";
+        clipboard_capture_output_dir => @prefs("クリップボード取り込みの保存先", "clipboard-capture/folder", |_, _| true, plain, plain) "起動・保存・整理先の PC 固有パス";
         active_book_name => "利用データ・登録先・履歴・検索対象";
         pinned_books => "同上";
         conceal_type => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -636,7 +716,7 @@ preferences_policy! {
         sns_split_seam_permille => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         sns_split_frame_ratio => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         downscale_smoothing_percent => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
-        anime_upscale_source_limit => "同上";
+        anime_upscale_source_limit => @prefs("元画像範囲の長辺", "spread/anime-limit", |_, _| true, plain, plain) "同上";
         fullscreen_left_panel_tab => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         adjustment_settings_tab => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         creative_luts => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
@@ -687,22 +767,22 @@ preferences_policy! {
         show_toolbar_sort => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         toolbar_section_new_row => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         toolbar_section_drag_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
-        menu_layout => "既存の操作カスタマイズ共有が正本";
-        context_menu_layout => "既存の操作カスタマイズ共有が正本";
+        menu_layout => @prefs("メニューの並びと表示", "menu/layout", valid_menu_layout, plain, plain) "既存の操作カスタマイズ共有が正本";
+        context_menu_layout => @prefs("右クリックメニューの並びと表示", "context-menu/layout", valid_menu_layout, plain, plain) "既存の操作カスタマイズ共有が正本";
         keymap => "既存の操作カスタマイズ共有が正本";
         recent_open_with_apps => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         custom_open_with_apps => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
-        external_tools => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
+        external_tools => @prefs("登録した外部ツール", "external-tools/list", |_, _| true, plain, plain) "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         ai_upscale_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         ai_upscale_model_override => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
-        ai_upscale_prefetch_back => "CPU/GPU/メモリ/ドライバ/速度の tuning";
-        ai_upscale_prefetch_forward => "CPU/GPU/メモリ/ドライバ/速度の tuning";
-        retained_final_ai_cache_max_entries => "CPU/GPU/メモリ/ドライバ/速度の tuning";
-        retained_final_ai_cache_max_mib => "CPU/GPU/メモリ/ドライバ/速度の tuning";
+        ai_upscale_prefetch_back => @prefs("AI の後方先読み枚数", "prefetch/ai", |v, _| *v <= AI_PREFETCH_MAX, plain, plain) "CPU/GPU/メモリ/ドライバ/速度の tuning";
+        ai_upscale_prefetch_forward => @prefs("AI の前方先読み枚数", "prefetch/ai", |v, _| *v <= AI_PREFETCH_MAX, plain, plain) "CPU/GPU/メモリ/ドライバ/速度の tuning";
+        retained_final_ai_cache_max_entries => @prefs("AI 結果の最大保持枚数", "prefetch/retained-ai-count", |v, _| (RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MIN..=RETAINED_FINAL_AI_CACHE_MAX_ENTRIES_MAX).contains(v), plain, plain) "CPU/GPU/メモリ/ドライバ/速度の tuning";
+        retained_final_ai_cache_max_mib => @prefs("AI 結果の最大保持メモリ (MB)", "prefetch/retained-ai-memory", |v, _| (RETAINED_FINAL_AI_CACHE_MAX_MIB_MIN..=RETAINED_FINAL_AI_CACHE_MAX_MIB_MAX).contains(v), plain, plain) "CPU/GPU/メモリ/ドライバ/速度の tuning";
         ai_upscale_skip_px => "CPU/GPU/メモリ/ドライバ/速度の tuning";
         ai_denoise_skip_px => "同上";
-        ai_upscale_size_limit => "同上";
-        ai_denoise_size_limit => "同上";
+        ai_upscale_size_limit => @prefs("AI アップスケールの入力サイズ上限", "prefetch/ai-size-limit", valid_ai_limit, plain, plain) "同上";
+        ai_denoise_size_limit => @prefs("AI ノイズ除去の入力サイズ上限", "prefetch/ai-size-limit", valid_ai_limit, plain, plain) "同上";
         ai_backend => "同上";
         erase_inpaint_mono_tolerance => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         global_preset => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -713,11 +793,11 @@ preferences_policy! {
         metadata_export_recursive => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         susie_enabled => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
         susie_allow_parallel => "フォント / ツール / LUT / Susie / VST の実ファイル・導入状態・任意 state に依存";
-        skip_offline_change_scan => "同上";
-        update_check_enabled => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
+        skip_offline_change_scan => @prefs("起動時のオフライン変更走査を省略する", "indexer/offline-change-scan", |_, _| true, plain, plain) "同上";
+        update_check_enabled => @prefs("新バージョンを自動的に確認する", "update/automatic", |_, _| true, plain, plain) "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
         update_check_dismissed_version => "初回/学習/通知/保存版の内部記録";
         network_data_dir_notice_dismissed_for => "初回/学習/通知/保存版の内部記録";
-        perf_log_enabled => "初回/学習/通知/保存版の内部記録";
+        perf_log_enabled => @prefs("性能ログを記録する (次回起動から有効)", "developer/performance-log", |_, _| true, plain, plain) "初回/学習/通知/保存版の内部記録";
         remote_service_enabled => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
         agent_level => "AI 連携の許可は移行先を維持";
         agent_show_thumbnails => "AI 連携の縮小画像送出の許可は移行先を維持";
@@ -726,7 +806,7 @@ preferences_policy! {
         agent_show_transcripts => "AI 連携の文字起こしの許可は移行先を維持";
         agent_show_current_view => "AI 連携の現在地の許可は移行先を維持";
         agent_allow_settings => "AI 連携の設定の許可は移行先を維持";
-        remote_video_streaming_enabled => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
+        remote_video_streaming_enabled => @prefs("リモート端末への動画配信を有効にする", "video/remote-streaming", |_, _| true, plain, plain) "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
         remote_video_encoder => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
         remote_video_quality_default => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
         remote_video_segment_window => "接続/送出・ローカル出力方針、自動通信の opt-in は移行先を維持";
@@ -736,7 +816,7 @@ preferences_policy! {
         video_seek_strip_state => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         video_seek_strip_last_choice => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         video_seek_strip_span => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
-        video_seek_bar_locked => "保持数の prune、EXIF 任意文字列、動画下部固定の scope 外状態変更、デインターレースの性能 tuning";
+        video_seek_bar_locked => @prefs("動画の下部バーとシークストリップの固定", "video/bar-visibility", |_, _| true, video_lock, video_lock) "保持数の prune、EXIF 任意文字列、動画下部固定の scope 外状態変更、デインターレースの性能 tuning";
         video_seek_strip_locked => "保持数の prune、EXIF 任意文字列、動画下部固定の scope 外状態変更、デインターレースの性能 tuning";
         video_autoplay => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         video_autoplay_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -752,9 +832,9 @@ preferences_policy! {
         video_resume_positions => "同上";
         video_watched_to_end => "同上";
         video_audio_track_choices => "同上";
-        reading_history_limit => "保持数の prune、EXIF 任意文字列、動画下部固定の scope 外状態変更、デインターレースの性能 tuning";
-        video_hw_decode => "同上";
-        video_deinterlace => "保持数の prune、EXIF 任意文字列、動画下部固定の scope 外状態変更、デインターレースの性能 tuning";
+        reading_history_limit => @prefs("保持件数:", "resume/history-limit", |v, _| (1..=crate::reading_history_db::READING_HISTORY_LIMIT_MAX).contains(v), plain, plain) "保持数の prune、EXIF 任意文字列、動画下部固定の scope 外状態変更、デインターレースの性能 tuning";
+        video_hw_decode => @prefs("ハードウェアデコードを有効にする", "video/hardware-decode", |_, _| true, plain, plain) "同上";
+        video_deinterlace => @prefs("デインターレース", "video/deinterlace", |_, _| true, plain, plain) "保持数の prune、EXIF 任意文字列、動画下部固定の scope 外状態変更、デインターレースの性能 tuning";
         video_tile_columns => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         video_in_window_mode => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         detached_viewer_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";

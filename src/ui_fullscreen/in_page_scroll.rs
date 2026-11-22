@@ -1609,4 +1609,41 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn agent_settings_commit_reaches_live_wheel_classification_and_database() {
+        let mut app = crate::app::tests::phase_c_support::setup_app();
+        app.initialized = true;
+        app.indexer_init = crate::app::IndexerInit::Unavailable;
+        app.settings.agent_level = mimageviewer_agent_ipc::AgentLevel::ReadOnly;
+        app.settings.agent_allow_settings = true;
+        app.settings.fullscreen_wheel_action = crate::settings::FullscreenWheelAction::PageTurn;
+        app.fs_context_menu_idx = Some(0);
+        let ctx = egui::Context::default();
+        app.install_agent_changes(crate::agent_ipc::changes::ChangeController::new(), &ctx);
+        let input = crate::wheel_input::WheelInput {
+            delta: Vec2::new(0.0, -40.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+        };
+        assert!(matches!(
+            app.fs_wheel_segment_in_page_scroll(input, false),
+            FsWheelInPageClass::Legacy
+        ));
+        let values = serde_json::json!({"fullscreen_wheel_action":"Zoom"});
+        let result = app
+            .agent_set_settings(values.as_object().unwrap(), "wheel fixture", &ctx)
+            .unwrap();
+        assert_eq!(result.changed.len(), 1);
+        assert!(matches!(
+            app.fs_wheel_segment_in_page_scroll(input, false),
+            FsWheelInPageClass::SettingZoom
+        ));
+        assert_eq!(
+            crate::settings::Settings::load().fullscreen_wheel_action,
+            crate::settings::FullscreenWheelAction::Zoom
+        );
+        assert!(app.pref_state.is_none());
+    }
 }

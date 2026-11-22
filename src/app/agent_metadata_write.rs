@@ -233,7 +233,10 @@ impl App {
                     outcomes: grouped(&states),
                 })
             }
-            UiRequestKind::Open(_) | UiRequestKind::GetViewState { .. } => {
+            UiRequestKind::Open(_)
+            | UiRequestKind::GetViewState { .. }
+            | UiRequestKind::GetSettings { .. }
+            | UiRequestKind::SetSettings { .. } => {
                 unreachable!("non-write requests have their own UI handler")
             }
         };

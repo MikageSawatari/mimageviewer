@@ -85,3 +85,13 @@ fn frozen_v5_output_budgets_and_large_thumbnail_contract_are_preserved() {
         assert_eq!(old.max_total_bytes, retained.max_total_bytes);
     }
 }
+
+#[test]
+fn frozen_v5_adapter_never_registers_new_settings_commands() {
+    for tool in v5_wire::schema::tools() {
+        assert!(!matches!(
+            tool["name"].as_str(),
+            Some("get_settings" | "set_settings")
+        ));
+    }
+}

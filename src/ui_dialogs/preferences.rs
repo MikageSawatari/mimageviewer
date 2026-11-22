@@ -16,6 +16,13 @@ use crate::ring_shortcut::{
 };
 use crate::settings::{Parallelism, Settings};
 
+#[cfg(test)]
+thread_local! {
+    static PREFERENCES_DISPLAY_ENRICHMENT_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
 fn cover_auto_crop_changed(before: &Settings, after: &Settings) -> bool {
     crate::app::configured_thumbnail_auto_crop(before)
         != crate::app::configured_thumbnail_auto_crop(after)
@@ -1757,65 +1764,29 @@ impl PreferencesState {
         book_resume_entry_count: usize,
         reading_history_entry_count: usize,
     ) -> Self {
-        // 開いた時点の選択があればその拡張子から始める (よくある出発点なので)。
-        // 無くても既定で動くことが要件で、選択の有無で機能が消えてはいけない。
-        let external_tool_association_ext = external_tool_target
-            .real_file()
-            .ok()
-            .and_then(|path| path.extension())
-            .and_then(|extension| extension.to_str())
-            .map(|extension| extension.to_ascii_lowercase())
-            .filter(|extension| pages::association_extension_is_known(extension))
-            .unwrap_or_else(|| "jpg".to_string());
+        let mut state = Self::for_commit(
+            s,
+            #[cfg(windows)]
+            &[],
+        );
+        state.enrich_for_display(
+            s,
+            external_tool_target,
+            ai_runtime,
+            trt_worker_snapshot,
+            audio_normalize_db_available,
+            audio_normalize_entry_count,
+            book_resume_entry_count,
+            reading_history_entry_count,
+        );
+        state
+    }
 
-        let manual_threads = match &s.parallelism {
-            Parallelism::Manual(n) => *n,
-            Parallelism::Auto => s.parallelism.thread_count(),
-        };
-        let auto_thread_count = {
-            let cores = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(2);
-            (cores / 2).max(1)
-        };
-        let expanded = HashSet::new();
-
-        // AI バックエンドページ用の情報を 1 回だけ取得 (環境設定ダイアログを開いた時点)
-        let gpu_vendor = crate::gpu_info::query_primary_gpu_vendor();
-        let current_runtime_fallback_reason =
-            ai_runtime.and_then(|runtime| runtime.active_backend().fallback_reason.clone());
-        let trt_worker_active = trt_worker_snapshot.is_attached();
-        let trt_pack_installed = crate::ai::tensorrt_pack::is_pack_installed();
-        let trt_pack_size_mib = if trt_pack_installed {
-            dir_size_bytes(&crate::ai::tensorrt_pack::pack_dir()) / (1024 * 1024)
-        } else {
-            0
-        };
-        let trt_engine_cache_size_mib =
-            dir_size_bytes(&crate::ai::tensorrt_pack::engine_cache_dir()) / (1024 * 1024);
-
-        // 編集用追加パックの状態を 1 回だけ取得。size / フォント数 / モデル名はすべて
-        // manifest 1 回読みで賄い、ディレクトリ再帰走査 (dir_size_bytes) や read_dir
-        // (installed_fonts) といった UI スレッド同期 I/O を避ける (Codex P3)。
-        // 表示サイズは manifest の per-file bytes 合計 (= 展開後サイズ概算)。
-        let editing_addon_status = crate::editing_addon::addon_status();
-        let (editing_addon_size_mib, editing_addon_font_count, editing_addon_subject_model) =
-            if let crate::editing_addon::AddonStatus::Valid { version } = &editing_addon_status {
-                crate::editing_addon::read_pack_manifest(version)
-                    .map(|m| {
-                        let size = m.total_bytes() / (1024 * 1024);
-                        let fonts = m.fonts().count();
-                        let model = m
-                            .subject_matte_model()
-                            .map(|f| f.model_id.clone().unwrap_or_else(|| f.path.clone()))
-                            .unwrap_or_default();
-                        (size, fonts, model)
-                    })
-                    .unwrap_or((0, 0, String::new()))
-            } else {
-                (0, 0, String::new())
-            };
-
+    /// Build the settings snapshot and commit inputs without display discovery.
+    fn for_commit(
+        s: &Settings,
+        #[cfg(windows)] vst3_discovered: &[crate::video::dsp::DiscoveredPlugin],
+    ) -> Self {
         Self {
             settings: s.preferences_snapshot(),
             transfer_feedback: None,
@@ -1833,9 +1804,9 @@ impl PreferencesState {
             showing_results: false,
             pending_anchor: None,
             highlight: None,
-            expanded,
-            external_tool_target,
-            external_tool_association_ext,
+            expanded: HashSet::new(),
+            external_tool_target: crate::external_tool::LaunchTarget::None,
+            external_tool_association_ext: "jpg".to_owned(),
             external_tool_selected: s.external_tools.first().map(|tool| tool.id),
             external_tool_editor_loaded_for: None,
             external_tool_executable_input: String::new(),
@@ -1864,7 +1835,7 @@ impl PreferencesState {
             creative_lut_import_rx: None,
             creative_lut_message: None,
             creative_lut_transaction: CreativeLutTransaction::default(),
-            manual_threads,
+            manual_threads: 1,
             capture_output_dir_input: s
                 .capture_output_dir
                 .as_ref()
@@ -1875,7 +1846,7 @@ impl PreferencesState {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
-            clipboard_capture_default_output_dir: crate::clipboard_capture::default_destination(),
+            clipboard_capture_default_output_dir: None,
             clipboard_capture_folder_task: None,
             clipboard_capture_folder_message: None,
             clipboard_capture_startup_failed: false,
@@ -1919,17 +1890,17 @@ impl PreferencesState {
             exif_collapsed_groups: HashSet::new(),
             duplicate_priority_scroll_y: 0.0,
             exif_scroll_to_added: None,
-            auto_thread_count,
-            vram_mib: crate::gpu_info::query_vram_summary_mib(),
-            audio_normalize_db_available,
-            audio_normalize_entry_count,
+            auto_thread_count: 1,
+            vram_mib: None,
+            audio_normalize_db_available: false,
+            audio_normalize_entry_count: 0,
             audio_normalize_clear_confirm_open: false,
             audio_normalize_clear_requested: false,
             audio_normalize_clear_result: None,
-            book_resume_entry_count,
+            book_resume_entry_count: 0,
             book_resume_clear_requested: false,
             book_resume_clear_result: None,
-            reading_history_entry_count,
+            reading_history_entry_count: 0,
             reading_history_clear_requested: false,
             reading_history_clear_result: None,
             search_input_history_clear_requested: false,
@@ -1942,16 +1913,16 @@ impl PreferencesState {
             favorite_view_state_clear_result: None,
             send_to_status: None,
             send_to_action_message: None,
-            gpu_vendor,
-            trt_worker_active,
-            current_runtime_fallback_reason,
-            trt_pack_installed,
-            trt_pack_size_mib,
-            trt_engine_cache_size_mib,
+            gpu_vendor: None,
+            trt_worker_active: false,
+            current_runtime_fallback_reason: None,
+            trt_pack_installed: false,
+            trt_pack_size_mib: 0,
+            trt_engine_cache_size_mib: 0,
             start_trt_install_requested: false,
             trt_cache_delete_confirm_open: false,
             uninstall_trt_pack_requested: false,
-            editing_addon_status,
+            editing_addon_status: crate::editing_addon::AddonStatus::Missing,
             vlm_view: Default::default(),
             depth_view: Default::default(),
             depth_download_requested: false,
@@ -1960,15 +1931,15 @@ impl PreferencesState {
             vlm_download_requested: false,
             vlm_remove_requested: false,
             vlm_folder_requested: false,
-            editing_addon_size_mib,
-            editing_addon_font_count,
-            editing_addon_subject_model,
+            editing_addon_size_mib: 0,
+            editing_addon_font_count: 0,
+            editing_addon_subject_model: String::new(),
             start_editing_addon_install_requested: false,
             editing_addon_delete_confirm_open: false,
             uninstall_editing_addon_requested: false,
             open_editing_addon_folder_requested: false,
             #[cfg(windows)]
-            vst3_discovered: Vec::new(),
+            vst3_discovered: vst3_discovered.to_vec(),
             #[cfg(windows)]
             vst3_scan_rx: None,
             #[cfg(windows)]
@@ -1992,6 +1963,100 @@ impl PreferencesState {
             diag_export_view: crate::diagnostics::ExportView::Idle,
             diag_export_submit: false,
         }
+    }
+
+    fn enrich_for_display(
+        &mut self,
+        s: &Settings,
+        external_tool_target: crate::external_tool::LaunchTarget,
+        ai_runtime: Option<&crate::ai::runtime::AiRuntime>,
+        trt_worker_snapshot: crate::ai::trt_worker_lifecycle::TrtWorkerSnapshot,
+        audio_normalize_db_available: bool,
+        audio_normalize_entry_count: usize,
+        book_resume_entry_count: usize,
+        reading_history_entry_count: usize,
+    ) {
+        #[cfg(test)]
+        PREFERENCES_DISPLAY_ENRICHMENT_CALLS.with(|calls| calls.set(calls.get() + 1));
+
+        // 開いた時点の選択があればその拡張子から始める (よくある出発点なので)。
+        // 無くても既定で動くことが要件で、選択の有無で機能が消えてはいけない。
+        let external_tool_association_ext = external_tool_target
+            .real_file()
+            .ok()
+            .and_then(|path| path.extension())
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase())
+            .filter(|extension| pages::association_extension_is_known(extension))
+            .unwrap_or_else(|| "jpg".to_string());
+
+        let manual_threads = match &s.parallelism {
+            Parallelism::Manual(n) => *n,
+            Parallelism::Auto => s.parallelism.thread_count(),
+        };
+        let auto_thread_count = {
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2);
+            (cores / 2).max(1)
+        };
+
+        // AI バックエンドページ用の情報を 1 回だけ取得 (環境設定ダイアログを開いた時点)
+        let gpu_vendor = crate::gpu_info::query_primary_gpu_vendor();
+        let current_runtime_fallback_reason =
+            ai_runtime.and_then(|runtime| runtime.active_backend().fallback_reason.clone());
+        let trt_worker_active = trt_worker_snapshot.is_attached();
+        let trt_pack_installed = crate::ai::tensorrt_pack::is_pack_installed();
+        let trt_pack_size_mib = if trt_pack_installed {
+            dir_size_bytes(&crate::ai::tensorrt_pack::pack_dir()) / (1024 * 1024)
+        } else {
+            0
+        };
+        let trt_engine_cache_size_mib =
+            dir_size_bytes(&crate::ai::tensorrt_pack::engine_cache_dir()) / (1024 * 1024);
+
+        // 編集用追加パックの状態を 1 回だけ取得。size / フォント数 / モデル名はすべて
+        // manifest 1 回読みで賄い、ディレクトリ再帰走査 (dir_size_bytes) や read_dir
+        // (installed_fonts) といった UI スレッド同期 I/O を避ける (Codex P3)。
+        // 表示サイズは manifest の per-file bytes 合計 (= 展開後サイズ概算)。
+        let editing_addon_status = crate::editing_addon::addon_status();
+        let (editing_addon_size_mib, editing_addon_font_count, editing_addon_subject_model) =
+            if let crate::editing_addon::AddonStatus::Valid { version } = &editing_addon_status {
+                crate::editing_addon::read_pack_manifest(version)
+                    .map(|m| {
+                        let size = m.total_bytes() / (1024 * 1024);
+                        let fonts = m.fonts().count();
+                        let model = m
+                            .subject_matte_model()
+                            .map(|f| f.model_id.clone().unwrap_or_else(|| f.path.clone()))
+                            .unwrap_or_default();
+                        (size, fonts, model)
+                    })
+                    .unwrap_or((0, 0, String::new()))
+            } else {
+                (0, 0, String::new())
+            };
+
+        self.external_tool_target = external_tool_target;
+        self.external_tool_association_ext = external_tool_association_ext;
+        self.manual_threads = manual_threads;
+        self.auto_thread_count = auto_thread_count;
+        self.clipboard_capture_default_output_dir = crate::clipboard_capture::default_destination();
+        self.vram_mib = crate::gpu_info::query_vram_summary_mib();
+        self.audio_normalize_db_available = audio_normalize_db_available;
+        self.audio_normalize_entry_count = audio_normalize_entry_count;
+        self.book_resume_entry_count = book_resume_entry_count;
+        self.reading_history_entry_count = reading_history_entry_count;
+        self.gpu_vendor = gpu_vendor;
+        self.trt_worker_active = trt_worker_active;
+        self.current_runtime_fallback_reason = current_runtime_fallback_reason;
+        self.trt_pack_installed = trt_pack_installed;
+        self.trt_pack_size_mib = trt_pack_size_mib;
+        self.trt_engine_cache_size_mib = trt_engine_cache_size_mib;
+        self.editing_addon_status = editing_addon_status;
+        self.editing_addon_size_mib = editing_addon_size_mib;
+        self.editing_addon_font_count = editing_addon_font_count;
+        self.editing_addon_subject_model = editing_addon_subject_model;
     }
 
     pub(super) fn ensure_ui_font_tasks_started(&mut self, ctx: &egui::Context) {
@@ -2554,7 +2619,7 @@ pub(crate) fn prepare_preferences_settings_for_commit(
         .clamp(1, crate::reading_history_db::READING_HISTORY_LIMIT_MAX);
 }
 
-fn prepare_preferences_edited_settings_for_commit(
+pub(crate) fn prepare_preferences_edited_settings_for_commit(
     edited: &mut crate::settings::Settings,
     initial_video_normal_wheel_action: crate::ring_shortcut::VideoNormalWheelActionId,
     live: &mut crate::settings::Settings,
@@ -2856,6 +2921,24 @@ impl App {
         }
     }
 
+    fn preferences_commit_state(&self) -> PreferencesState {
+        PreferencesState::for_commit(
+            &self.settings,
+            #[cfg(windows)]
+            &self.vst3_discovered,
+        )
+    }
+
+    /// Install a same-frame commit draft without querying display-only state.
+    /// The caller must admit the request before installing it, then call
+    /// `apply_preferences_dialog` before returning to the UI loop.
+    pub(crate) fn install_headless_preferences_state(&mut self, candidate: Settings) {
+        debug_assert!(self.pref_state.is_none());
+        let mut state = self.preferences_commit_state();
+        state.settings = candidate.preferences_snapshot();
+        self.pref_state = Some(Box::new(state));
+    }
+
     fn ensure_preferences_state(&mut self) {
         if self.pref_state.is_none() {
             if !self.settings.preferences_restore_position {
@@ -2868,8 +2951,8 @@ impl App {
                     .or(self.selected)
                     .and_then(|index| self.items.get(index)),
             );
-            #[cfg_attr(not(windows), allow(unused_mut))]
-            let mut new_state = PreferencesState::from_settings(
+            let mut new_state = self.preferences_commit_state();
+            new_state.enrich_for_display(
                 &self.settings,
                 external_tool_target,
                 ai_runtime.as_deref(),
@@ -2896,11 +2979,6 @@ impl App {
             new_state.selected = self.preferences_view_position.page;
             new_state.right_panel_scroll_generation =
                 self.preferences_right_panel_scroll_sequence.wrapping_add(1);
-            // 既にスキャン済みの VST3 プラグイン候補を引き継ぐ (= 再スキャン不要で表示)
-            #[cfg(windows)]
-            {
-                new_state.vst3_discovered = self.vst3_discovered.clone();
-            }
             self.pref_state = Some(Box::new(new_state));
         }
     }
@@ -4696,6 +4774,234 @@ pub(crate) fn commit_in_page_scroll_preferences_ui_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_empty_preferences_lut_transaction(state: &PreferencesState) {
+        match &state.creative_lut_transaction.state {
+            CreativeLutTransactionState::Editing { created, removed } => {
+                assert!(created.is_empty());
+                assert!(removed.is_empty());
+            }
+            CreativeLutTransactionState::Committed => panic!("new draft was already committed"),
+        }
+    }
+
+    fn assert_no_preferences_display_enrichment(state: &PreferencesState) {
+        assert_eq!(state.gpu_vendor, None);
+        assert_eq!(state.vram_mib, None);
+        assert!(!state.trt_worker_active);
+        assert_eq!(state.current_runtime_fallback_reason, None);
+        assert!(!state.trt_pack_installed);
+        assert_eq!(state.trt_pack_size_mib, 0);
+        assert_eq!(state.trt_engine_cache_size_mib, 0);
+        assert_eq!(
+            state.editing_addon_status,
+            crate::editing_addon::AddonStatus::Missing
+        );
+        assert_eq!(state.editing_addon_size_mib, 0);
+        assert_eq!(state.editing_addon_font_count, 0);
+        assert!(state.editing_addon_subject_model.is_empty());
+        assert_eq!(state.clipboard_capture_default_output_dir, None);
+        assert!(!state.audio_normalize_db_available);
+        assert_eq!(state.audio_normalize_entry_count, 0);
+        assert_eq!(state.book_resume_entry_count, 0);
+        assert_eq!(state.reading_history_entry_count, 0);
+        assert_eq!(state.favorite_view_state_entry_count, 0);
+        assert!(!state.ui_font_catalog_started);
+    }
+
+    #[test]
+    fn preferences_commit_initializer_uses_standard_snapshot_and_empty_transaction() {
+        use crate::settings::FavoriteViewState;
+        let common = preference_view_state_variant(0);
+        let favorite = preference_view_state_variant(1);
+        let mut settings = Settings::default();
+        settings.parallelism = Parallelism::Manual(7);
+        settings.ring_shortcuts.video_normal_wheel_action =
+            crate::ring_shortcut::VideoNormalWheelActionId::AdjustVolume;
+        settings.book_root = Some(PathBuf::from(r"C:\sentinel\books"));
+        common.apply_to_settings(&mut settings);
+        settings.apply_favorite_view_overlay(uuid::Uuid::new_v4(), &favorite);
+        let expected = settings.preferences_snapshot();
+        let display_calls = PREFERENCES_DISPLAY_ENRICHMENT_CALLS.with(|calls| calls.get());
+
+        let state = PreferencesState::for_commit(
+            &settings,
+            #[cfg(windows)]
+            &[],
+        );
+
+        assert_eq!(
+            serde_json::to_value(&state.settings).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(FavoriteViewState::from_settings(&state.settings), common);
+        assert_eq!(state.settings.active_favorite_view_id(), None);
+        assert_eq!(
+            state.initial_video_normal_wheel_action,
+            crate::ring_shortcut::VideoNormalWheelActionId::AdjustVolume
+        );
+        assert!(!state.video_media_memory_clear_requested);
+        assert_empty_preferences_lut_transaction(&state);
+        #[cfg(windows)]
+        assert!(state.vst3_discovered.is_empty());
+        assert_no_preferences_display_enrichment(&state);
+        assert_eq!(
+            PREFERENCES_DISPLAY_ENRICHMENT_CALLS.with(|calls| calls.get()),
+            display_calls
+        );
+    }
+
+    #[test]
+    fn preferences_headless_initializer_keeps_live_baseline_and_skips_display_discovery() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.ring_shortcuts.video_normal_wheel_action =
+            crate::ring_shortcut::VideoNormalWheelActionId::NavigateItems;
+        let mut candidate = app.settings.preferences_snapshot();
+        candidate.ring_shortcuts.video_normal_wheel_action =
+            crate::ring_shortcut::VideoNormalWheelActionId::AdjustVolume;
+        candidate.parallelism = Parallelism::Manual(7);
+        let expected = serde_json::to_value(&candidate).unwrap();
+        let display_calls = PREFERENCES_DISPLAY_ENRICHMENT_CALLS.with(|calls| calls.get());
+
+        app.install_headless_preferences_state(candidate);
+
+        let state = app.pref_state.as_ref().unwrap();
+        assert_eq!(serde_json::to_value(&state.settings).unwrap(), expected);
+        assert_eq!(
+            state.initial_video_normal_wheel_action,
+            crate::ring_shortcut::VideoNormalWheelActionId::NavigateItems
+        );
+        assert!(!state.video_media_memory_clear_requested);
+        assert_empty_preferences_lut_transaction(state);
+        assert_no_preferences_display_enrichment(state);
+        assert!(!app.show_preferences);
+        assert_eq!(
+            PREFERENCES_DISPLAY_ENRICHMENT_CALLS.with(|calls| calls.get()),
+            display_calls
+        );
+        assert_eq!(
+            app.settings.ring_shortcuts.video_normal_wheel_action,
+            crate::ring_shortcut::VideoNormalWheelActionId::NavigateItems
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn preferences_headless_initializer_clones_live_vst3_candidates() {
+        let mut app = crate::app::setup_app_for_test();
+        app.vst3_discovered = vec![crate::video::dsp::DiscoveredPlugin {
+            path: PathBuf::from(r"C:\fake\Sentinel.vst3"),
+            display_name: "Sentinel effect".to_owned(),
+            audio_input_buses: Some(1),
+            audio_output_buses: Some(2),
+            event_input_buses: Some(3),
+            event_output_buses: Some(4),
+            audio_input_channels: Some(5),
+            audio_output_channels: Some(6),
+            usable_audio_effect: Some(true),
+            probe_error: Some("sentinel probe status".to_owned()),
+        }];
+        let expected = format!("{:?}", app.vst3_discovered);
+        let candidate = app.settings.preferences_snapshot();
+        app.install_headless_preferences_state(candidate);
+        assert_eq!(
+            format!("{:?}", app.pref_state.as_ref().unwrap().vst3_discovered),
+            expected
+        );
+        app.vst3_discovered[0].display_name = "changed live candidate".to_owned();
+        assert_eq!(
+            app.pref_state.as_ref().unwrap().vst3_discovered[0].display_name,
+            "Sentinel effect"
+        );
+    }
+
+    #[test]
+    fn preferences_display_initializer_retains_dialog_initial_values() {
+        let mut settings = Settings::default();
+        settings.parallelism = Parallelism::Manual(7);
+        settings.capture_output_dir = Some(PathBuf::from(r"C:\sentinel\capture"));
+        settings.clipboard_capture_output_dir = Some(PathBuf::from(r"C:\sentinel\clipboard"));
+        settings.book_root = Some(PathBuf::from(r"C:\sentinel\books"));
+        settings.startup_folder_path = Some(PathBuf::from(r"C:\sentinel\startup"));
+        settings.ring_shortcuts.video_normal_wheel_action =
+            crate::ring_shortcut::VideoNormalWheelActionId::AdjustVolume;
+        let target =
+            crate::external_tool::LaunchTarget::RealFile(PathBuf::from(r"C:\sentinel\photo.PNG"));
+        let display_calls = PREFERENCES_DISPLAY_ENRICHMENT_CALLS.with(|calls| calls.get());
+
+        let state = PreferencesState::from_settings(
+            &settings,
+            target.clone(),
+            None,
+            disabled_trt_worker_snapshot(),
+            true,
+            13,
+            17,
+            19,
+        );
+
+        assert_eq!(
+            PREFERENCES_DISPLAY_ENRICHMENT_CALLS.with(|calls| calls.get()),
+            display_calls + 1
+        );
+        assert_eq!(
+            serde_json::to_value(&state.settings).unwrap(),
+            serde_json::to_value(settings.preferences_snapshot()).unwrap()
+        );
+        assert_eq!(state.manual_threads, 7);
+        assert_eq!(
+            state.auto_thread_count,
+            (std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(2)
+                / 2)
+            .max(1)
+        );
+        assert_eq!(state.external_tool_target, target);
+        assert_eq!(state.external_tool_association_ext, "png");
+        assert_eq!(
+            state.capture_output_dir_input,
+            settings
+                .capture_output_dir
+                .as_ref()
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            state.clipboard_capture_output_dir_input,
+            settings
+                .clipboard_capture_output_dir
+                .as_ref()
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        assert_eq!(
+            state.book_root_input,
+            settings.book_root.as_ref().unwrap().display().to_string()
+        );
+        assert_eq!(
+            state.startup_folder_path_input,
+            settings
+                .startup_folder_path
+                .as_ref()
+                .unwrap()
+                .display()
+                .to_string()
+        );
+        assert!(state.audio_normalize_db_available);
+        assert_eq!(state.audio_normalize_entry_count, 13);
+        assert_eq!(state.book_resume_entry_count, 17);
+        assert_eq!(state.reading_history_entry_count, 19);
+        assert_eq!(state.selected, PreferencesPage::General);
+        assert_eq!(
+            state.initial_video_normal_wheel_action,
+            crate::ring_shortcut::VideoNormalWheelActionId::AdjustVolume
+        );
+        assert!(!state.video_media_memory_clear_requested);
+        assert_empty_preferences_lut_transaction(&state);
+    }
 
     #[test]
     fn search_input_history_preferences_commit_keeps_live_and_clears_when_disabled() {
