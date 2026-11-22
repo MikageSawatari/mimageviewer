@@ -2189,10 +2189,6 @@ impl App {
                         ("prev_update_ms", serde_json::Value::from(prev_update_ms)),
                         ("prev_outside_ms", serde_json::Value::from(prev_outside_ms)),
                         ("run_ui_ms", serde_json::Value::from(pass.run_ui_ms)),
-                        (
-                            "egui_pass_ms",
-                            serde_json::Value::from((pass.run_ui_ms - prev_update_ms).max(0.0)),
-                        ),
                         ("finalize_ms", serde_json::Value::from(pass.finalize_ms)),
                         ("platform_ms", serde_json::Value::from(pass.platform_ms)),
                         ("tessellate_ms", serde_json::Value::from(pass.tessellate_ms)),
@@ -2201,7 +2197,7 @@ impl App {
                             "viewport_out_ms",
                             serde_json::Value::from(pass.viewport_out_ms),
                         ),
-                        ("idle_ms", serde_json::Value::from(idle_ms)),
+                        ("between_root_ops_ms", serde_json::Value::from(idle_ms)),
                         ("pre_update_ms", serde_json::Value::from(pre_update_ms)),
                         (
                             "accesskit_nodes",

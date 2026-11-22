@@ -980,7 +980,7 @@ impl Painter {
         );
         let mut vsync_sec = 0.0;
         // mIV §1.827: ROOT paint stage diagnostics (off unless the app's perf log is on).
-        let mut diag_clock = (viewport_id == ViewportId::ROOT && crate::frame_diag::enabled())
+        let mut diag_clock = (viewport_id == ViewportId::ROOT && crate::frame_diag::root_pass_active())
             .then(|| crate::frame_diag::PaintClock::start(clipped_primitives, textures_delta));
 
         // If the previous frame produced `CurrentSurfaceTexture::Lost`, the action match

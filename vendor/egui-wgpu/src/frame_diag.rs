@@ -41,7 +41,8 @@ pub struct PaintStages {
 /// eframe's ROOT pass after the app returned, in milliseconds.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RootPass {
-    /// `integration.update`: egui begin/end pass (incl. building AccessKit) + `App::ui`.
+    /// `integration.update` as a whole: every egui pass of this operation (incl. retries
+    /// and building AccessKit) with the app's logic and UI inside. Not separable here.
     pub run_ui_ms: f64,
     pub finalize_ms: f64,
     /// Platform output, including handing the AccessKit update to the OS adapter.
@@ -59,16 +60,31 @@ pub struct RootPass {
 static PAINT: Mutex<Option<PaintStages>> = Mutex::new(None);
 static ROOT: Mutex<Option<RootPass>> = Mutex::new(None);
 static ROOT_BEGIN: Mutex<Option<Instant>> = Mutex::new(None);
+/// True only between `begin_root_pass` and `finish_root_pass` of one eframe ROOT operation.
+static ROOT_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-pub fn record_root_paint(stages: PaintStages) {
-    *PAINT.lock().unwrap() = Some(stages);
+/// Start one ROOT operation's record; drops any paint record not owned by it.
+pub fn begin_root_pass(at: Instant) {
+    *PAINT.lock().unwrap() = None;
+    *ROOT_BEGIN.lock().unwrap() = Some(at);
+    ROOT_ACTIVE.store(true, Ordering::Relaxed);
 }
 
-pub fn take_root_paint() -> Option<PaintStages> {
-    PAINT.lock().unwrap().take()
+/// Whether the painter may record its stages (inside a recorded ROOT operation).
+pub fn root_pass_active() -> bool {
+    ROOT_ACTIVE.load(Ordering::Relaxed)
 }
 
-pub fn record_root_pass(pass: RootPass) {
+fn record_root_paint(stages: PaintStages) {
+    if root_pass_active() {
+        *PAINT.lock().unwrap() = Some(stages);
+    }
+}
+
+/// Close the ROOT operation: attach its own paint record (None when it did not paint).
+pub fn finish_root_pass(mut pass: RootPass) {
+    ROOT_ACTIVE.store(false, Ordering::Relaxed);
+    pass.paint = PAINT.lock().unwrap().take();
     *ROOT.lock().unwrap() = Some(pass);
 }
 
@@ -77,11 +93,9 @@ pub fn take_root_pass() -> Option<RootPass> {
     ROOT.lock().unwrap().take()
 }
 
-pub fn mark_root_pass_begin(at: Instant) {
-    *ROOT_BEGIN.lock().unwrap() = Some(at);
-}
-
-/// When eframe entered the ROOT pass that is running now.
+/// When eframe entered the ROOT operation that is running now. The gap from the
+/// previous operation's end is the time between ROOT operations (event wait, other
+/// viewports, logic-only passes), not purely the event-loop wait.
 pub fn root_pass_begin() -> Option<Instant> {
     *ROOT_BEGIN.lock().unwrap()
 }

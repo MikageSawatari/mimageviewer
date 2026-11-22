@@ -830,14 +830,18 @@ impl WgpuWinitRunning<'_> {
         // mIV §1.827: ROOT pass diagnostics (off unless the app's perf log is on).
         let diag_on = viewport_id == ViewportId::ROOT && egui_wgpu::frame_diag::enabled();
         let mut diag = egui_wgpu::frame_diag::RootPass::default();
-        let mut diag_lap = std::time::Instant::now();
-        if diag_on {
-            egui_wgpu::frame_diag::mark_root_pass_begin(diag_lap);
+        // The painter records only inside this operation (begin..finish), so a
+        // record never belongs to another frame. No clock is read while off.
+        let mut diag_lap = diag_on.then(std::time::Instant::now);
+        if let Some(begin) = diag_lap {
+            egui_wgpu::frame_diag::begin_root_pass(begin);
         }
         let mut diag_mark = |slot: &mut f64| {
-            let now = std::time::Instant::now();
-            *slot = now.duration_since(diag_lap).as_secs_f64() * 1000.0;
-            diag_lap = now;
+            if let Some(lap) = &mut diag_lap {
+                let now = std::time::Instant::now();
+                *slot = now.duration_since(*lap).as_secs_f64() * 1000.0;
+                *lap = now;
+            }
         };
 
         let (viewport_ui_cb, raw_input, show_ui) = {
@@ -1155,7 +1159,9 @@ impl WgpuWinitRunning<'_> {
                     |painter, pending_deltas| {
                         let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
                         diag_mark(&mut diag.tessellate_ms);
-                        diag.clipped_primitives = clipped_primitives.len();
+                        if diag_on {
+                            diag.clipped_primitives = clipped_primitives.len();
+                        }
 
                         let screenshot_commands = take_screenshot_requests(&mut *actions_requested);
                         #[cfg(all(
@@ -1249,9 +1255,8 @@ impl WgpuWinitRunning<'_> {
             shared,
         );
         if diag_on {
-            diag.paint = egui_wgpu::frame_diag::take_root_paint();
             diag.end = Some(std::time::Instant::now());
-            egui_wgpu::frame_diag::record_root_pass(diag);
+            egui_wgpu::frame_diag::finish_root_pass(diag);
         }
 
         if integration.should_close() {
