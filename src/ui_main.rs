@@ -2117,7 +2117,7 @@ pub fn draw_duration_facet_bar_snapshot_fixture(ui: &mut egui::Ui) -> (egui::Rec
         let _ = ui.small_button("全解除");
         ui.label(filtered_count_label(120, 25));
         let selected = SortOrder::DurationAsc.short_label();
-        let sort = facet_sort_slot(ui, selected, |ui| {
+        let sort = facet_sort_slot(ui, selected, false, |ui| {
             let label = ui.label("ソート:");
             let combo = grid_sort_combo(
                 ui,
@@ -2879,9 +2879,49 @@ fn grid_sort_combo<R>(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GridEdgeButtonPlacement {
+    None,
+    FacetSort,
+    ToolbarSort,
+}
+
+fn facet_filter_bar_visible(
+    settings: &crate::settings::Settings,
+    items_empty: bool,
+    drive_list: bool,
+) -> bool {
+    settings.show_toolbar_facet_filter && !items_empty && !drive_list
+}
+
+/// The drawing paths share this owner, including the facet bar's visibility gates.
+fn grid_edge_button_placement(
+    settings: &crate::settings::Settings,
+    items_empty: bool,
+    drive_list: bool,
+) -> GridEdgeButtonPlacement {
+    if !settings.show_grid_edge_buttons {
+        GridEdgeButtonPlacement::None
+    } else if settings.show_facet_sort
+        && facet_filter_bar_visible(settings, items_empty, drive_list)
+    {
+        GridEdgeButtonPlacement::FacetSort
+    } else if settings.show_toolbar_sort {
+        GridEdgeButtonPlacement::ToolbarSort
+    } else {
+        GridEdgeButtonPlacement::None
+    }
+}
+
+fn grid_edge_buttons_visibility_checkbox(ui: &mut egui::Ui, visible: &mut bool) -> bool {
+    ui.checkbox(visible, "先頭・末尾ボタン (ソートの隣)")
+        .changed()
+}
+
 fn facet_sort_slot<R>(
     ui: &mut egui::Ui,
     selected_text: &str,
+    edge_buttons: bool,
     add: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     let label_width = ui.fonts_mut(|fonts| {
@@ -2895,7 +2935,14 @@ fn facet_sort_slot<R>(
             .x
     });
     let combo_width = toolbar_combo_width(ui, 100.0, selected_text);
-    let width = label_width + ui.spacing().item_spacing.x + combo_width;
+    let mut buttons_width = crate::ui_toolbar_layout::FolderBarWidth::controls();
+    if edge_buttons {
+        // Small buttons keep the normal horizontal padding and Button font.
+        for label in ["先頭", "末尾"] {
+            buttons_width.button(ui, label, 0.0);
+        }
+    }
+    let width = buttons_width.width() + label_width + ui.spacing().item_spacing.x + combo_width;
     if ui.available_size_before_wrap().x < width {
         ui.end_row();
     }
@@ -12175,6 +12222,14 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                         &mut current_section_anchors,
                         &last_section_anchors,
                     );
+                    if grid_edge_button_placement(
+                        &self.settings,
+                        self.items.is_empty(),
+                        self.items_are_drive_list,
+                    ) == GridEdgeButtonPlacement::ToolbarSort
+                    {
+                        self.draw_grid_edge_buttons(ui);
+                    }
                     match self.settings.toolbar_sort_display {
                         crate::settings::ToolbarSectionDisplay::Buttons
                         | crate::settings::ToolbarSectionDisplay::Collapsible
@@ -12978,6 +13033,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         changed |= ui
             .checkbox(&mut s.show_facet_sort, "ソート (絞り込みバー右側)")
             .changed();
+        changed |= grid_edge_buttons_visibility_checkbox(ui, &mut s.show_grid_edge_buttons);
         changed |= ui
             .checkbox(&mut s.show_toolbar_rating, "レーティング (★)")
             .changed();
@@ -13108,6 +13164,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         s.show_toolbar_aspect = true;
         s.show_toolbar_sort = defaults.show_toolbar_sort;
         s.show_facet_sort = defaults.show_facet_sort;
+        s.show_grid_edge_buttons = defaults.show_grid_edge_buttons;
         s.show_toolbar_rating = true;
         s.show_toolbar_favorites = true;
         s.show_toolbar_smart_folders = true;
@@ -13307,6 +13364,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 });
             }
             TS::Sort => {
+                changed |= grid_edge_buttons_visibility_checkbox(
+                    ui,
+                    &mut self.settings.show_grid_edge_buttons,
+                );
+                ui.separator();
                 display_radio(
                     ui,
                     &mut self.settings.toolbar_sort_display,
@@ -14054,14 +14116,63 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         (sort_changed, reload_requested, popup_open)
     }
 
+    fn draw_grid_edge_buttons_settings_menu(&mut self, ui: &mut egui::Ui) {
+        draw_sticky_settings_menu_header(ui, "先頭・末尾ボタン", true);
+        ui.separator();
+        if grid_edge_buttons_visibility_checkbox(ui, &mut self.settings.show_grid_edge_buttons) {
+            self.settings.save();
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn draw_grid_edge_buttons(&mut self, ui: &mut egui::Ui) {
+        use crate::app::GridSelectionEdge;
+        use crate::keymap::KeyAction;
+
+        // The enclosing chrome gate holds modal input; the shared item gate
+        // holds scans/navigation. Use the same viewport focus fact as keyboard
+        // ownership so an inactive main window cannot move the background grid.
+        // Sort locks (e.g. a Details header order) do not prevent cursor moves.
+        let enabled = self.grid_item_input_allowed()
+            && !self.viewer_session_blocks_main_window()
+            && ui
+                .ctx()
+                .input(|input| input.viewport().focused.unwrap_or(true));
+        for (label, tip, action, edge) in [
+            (
+                "先頭",
+                "先頭の項目へ移動",
+                KeyAction::GridMoveFirst,
+                GridSelectionEdge::First,
+            ),
+            (
+                "末尾",
+                "末尾の項目へ移動",
+                KeyAction::GridMoveLast,
+                GridSelectionEdge::Last,
+            ),
+        ] {
+            let response = ui
+                .add_enabled(enabled, egui::Button::new(label).small())
+                .hover_tip(self.keymap.first_chord_action_label(tip, action));
+            if response.clicked() {
+                self.move_grid_selection_to_edge(ui.ctx(), edge, "grid_edge_button");
+            }
+            show_sticky_context_menu(&response, |ui| {
+                self.draw_grid_edge_buttons_settings_menu(ui);
+            });
+        }
+    }
+
     pub(crate) fn render_facet_filter_bar(&mut self, root_ui: &mut egui::Ui) {
         let ctx = &root_ui.ctx().clone();
         self.facet_name_has_focus = false;
         self.color_filter.input_has_focus = false;
-        if !self.settings.show_toolbar_facet_filter {
-            return;
-        }
-        if self.items.is_empty() || self.items_are_drive_list {
+        if !facet_filter_bar_visible(
+            &self.settings,
+            self.items.is_empty(),
+            self.items_are_drive_list,
+        ) {
             return;
         }
 
@@ -14382,8 +14493,19 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 if self.settings.show_facet_sort {
                     // The label and dropdown stay together; insufficient remaining width starts
                     // a new row. The slot fills that row and aligns its contents to the right.
-                    facet_sort_slot(ui, &self.grid_sort_dropdown_text(), |ui| {
-                        ui.label("ソート:");
+                    let edge_buttons = grid_edge_button_placement(
+                        &self.settings,
+                        self.items.is_empty(),
+                        self.items_are_drive_list,
+                    ) == GridEdgeButtonPlacement::FacetSort;
+                    facet_sort_slot(ui, &self.grid_sort_dropdown_text(), edge_buttons, |ui| {
+                        if edge_buttons {
+                            self.draw_grid_edge_buttons(ui);
+                        }
+                        let label = ui.add(egui::Label::new("ソート:").sense(egui::Sense::click()));
+                        show_sticky_context_menu(&label, |ui| {
+                            self.draw_grid_edge_buttons_settings_menu(ui);
+                        });
                         let (changed, reload, open) = self.draw_grid_sort_dropdown(ui, "facet_sort_combo");
                         sort_changed |= changed;
                         sort_reload_requested |= reload;
@@ -37969,7 +38091,7 @@ mod section292_tests {
         }
     }
 
-    fn facet_sort_snapshot(name: &str, width: f32) {
+    fn facet_sort_snapshot(name: &str, width: f32, edge_buttons: bool) {
         let fonts = Cell::new(false);
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(width, 240.0))
@@ -38000,7 +38122,13 @@ mod section292_tests {
                                 last = ui.button(label).rect;
                             }
                             let outer_right = ui.max_rect().right();
-                            let slot = facet_sort_slot(ui, "名前↓", |ui| {
+                            let slot = facet_sort_slot(ui, "名前↓", edge_buttons, |ui| {
+                                let mut buttons = egui::Rect::NOTHING;
+                                if edge_buttons {
+                                    for text in ["先頭", "末尾"] {
+                                        buttons = buttons.union(ui.small_button(text).rect);
+                                    }
+                                }
                                 let label = ui.label("ソート:");
                                 let combo = grid_sort_combo(
                                     ui,
@@ -38010,7 +38138,7 @@ mod section292_tests {
                                     300.0,
                                     |ui| ui.selectable_label(true, "名前↓"),
                                 );
-                                label.rect.union(combo.response.rect)
+                                buttons.union(label.rect).union(combo.response.rect)
                             });
                             assert!(slot.left() >= ui.max_rect().left() - 0.5);
                             assert!(
@@ -38032,12 +38160,74 @@ mod section292_tests {
 
     #[test]
     fn section292_facet_sort_snapshot_dark() {
-        facet_sort_snapshot("facet_sort_dark", 640.0);
+        facet_sort_snapshot("facet_sort_dark", 640.0, false);
     }
 
     #[test]
     fn section292_facet_sort_snapshot_narrow_dark() {
-        facet_sort_snapshot("facet_sort_narrow_dark", 320.0);
+        facet_sort_snapshot("facet_sort_narrow_dark", 320.0, false);
+    }
+
+    #[test]
+    fn section1855_facet_sort_edges_snapshot_dark() {
+        facet_sort_snapshot("facet_sort_edges_dark", 640.0, true);
+    }
+
+    #[test]
+    fn section1855_facet_sort_edges_snapshot_narrow_dark() {
+        facet_sort_snapshot("facet_sort_edges_narrow_dark", 320.0, true);
+    }
+}
+
+#[cfg(test)]
+mod grid_edge_button_placement_tests {
+    use super::*;
+
+    #[test]
+    fn section1855_placement_has_one_owner_and_follows_facet_visibility() {
+        let mut settings = crate::settings::Settings::default();
+        for enabled in [false, true] {
+            settings.show_grid_edge_buttons = enabled;
+            for facet_sort in [false, true] {
+                settings.show_facet_sort = facet_sort;
+                for toolbar_sort in [false, true] {
+                    settings.show_toolbar_sort = toolbar_sort;
+                    for facet_bar in [false, true] {
+                        settings.show_toolbar_facet_filter = facet_bar;
+                        for empty in [false, true] {
+                            for drives in [false, true] {
+                                let expected = if !enabled {
+                                    GridEdgeButtonPlacement::None
+                                } else if facet_sort && facet_bar && !empty && !drives {
+                                    GridEdgeButtonPlacement::FacetSort
+                                } else if toolbar_sort {
+                                    GridEdgeButtonPlacement::ToolbarSort
+                                } else {
+                                    GridEdgeButtonPlacement::None
+                                };
+                                assert_eq!(
+                                    grid_edge_button_placement(&settings, empty, drives),
+                                    expected
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section1855_toolbar_reset_hides_and_saves_grid_edge_buttons() {
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.show_grid_edge_buttons = true;
+        app.reset_toolbar_customization();
+        assert!(!app.settings.show_grid_edge_buttons);
+        let saved = crate::settings_db::SettingsDb::open(&crate::data_dir::get())
+            .unwrap()
+            .load_into_settings()
+            .unwrap();
+        assert!(!saved.show_grid_edge_buttons);
     }
 }
 

@@ -1,5 +1,7 @@
 # キー / マウス操作仕様 (静止画 vs 動画)
 
+一覧の「先頭」「末尾」ボタンは、リングと同じ `GridMoveFirst` / `GridMoveLast` の端移動を共有する（Shift による範囲拡張はしない）。
+
 §1.851: コレクションメニューと、コレクション直下の見つからない項目の右クリックに
 「見つからない項目をすべて外す…」を置く。件数とパスを確認してから登録をまとめて外す管理操作のため、
 `MenuCommandId::CollectionsRemoveMissingCurrent` は `action: None` とし、KeyAction・既定キーは追加しない。

@@ -169,6 +169,7 @@ filter = '''
     | test(/^ui_main::section207_tests::(file_organize_destinations_location_menu_navigation_and_snapshot|file_organize_destinations_location_toggle_snapshot|file_organize_destinations_many_location_entries_scroll_and_select_last|physical_parent_folder_bar_snapshot|section207_default_folder_geometry_matches_the_separate_panels)$/)
     | test(/^ui_main::section207_tests::(section207_folder_separator_reservation_matches_the_separate_panels|section207_reported_controls_keep_left_input_right_order|section207_snapshot_label_keeps_input_minimum_order_and_panel_bounds)$/)
     | test(/^ui_main::section292_tests::(section292_facet_sort_snapshot_dark|section292_facet_sort_snapshot_narrow_dark)$/)
+    | test(/^ui_main::section292_tests::section1855_facet_sort_edges_snapshot_(dark|narrow_dark)$/)
     | test(/^ui_metadata_panel::caption_panel_tests::(caption_panel_book_snapshot_changed_cover_keeps_text|caption_panel_book_snapshot_ok|caption_panel_book_snapshot_video_cover_does_not_offer_recreation|caption_panel_snapshot_failed|caption_panel_snapshot_ok)$/)
     | test(/^ui_metadata_panel::caption_panel_tests::(caption_panel_snapshot_rotation_stale|caption_panel_snapshot_stale_dark_strong|caption_panel_snapshot_stale_keeps_description|caption_panel_snapshot_stale_light|caption_panel_snapshot_stale_light_strong)$/)
     | test(=ui_metadata_panel::metadata_info_target_tests::metadata_info_target_selector_snapshot_and_click)

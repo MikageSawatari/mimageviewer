@@ -50,6 +50,7 @@ mod book_close_s1;
 mod close_nav_801;
 #[cfg(windows)]
 mod direct_navigation_worker_scan;
+mod grid_edge_buttons_1855;
 mod repro742;
 mod section1768;
 mod section1795;

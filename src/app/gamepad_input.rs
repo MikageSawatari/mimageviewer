@@ -2034,7 +2034,7 @@ fn grid_ring_action_allowed_during_refresh(action: &RingActionId) -> bool {
 }
 
 #[derive(Clone, Copy)]
-enum GridSelectionEdge {
+pub(crate) enum GridSelectionEdge {
     First,
     Last,
 }
@@ -9120,7 +9120,7 @@ impl App {
         request_ring_overlay_repaint(ctx);
     }
 
-    fn move_grid_selection_to_edge(
+    pub(crate) fn move_grid_selection_to_edge(
         &mut self,
         ctx: &egui::Context,
         edge: GridSelectionEdge,

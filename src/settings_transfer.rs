@@ -445,6 +445,7 @@ preferences_policy! {
         active_quick_folder_slot => "利用中の A/B ワークスペース。登録先・履歴と一組の利用状態";
         raw_develop_parallelism => "CPU/メモリ/速度に依存する RAW 現像 worker 数の tuning";
         show_facet_sort => "環境設定外のツールバーで管理するソート区画の表示状態";
+        show_grid_edge_buttons => "環境設定外で管理するツールバーの表示状態";
         toolbar_folder_section_migrated => "ツールバー配置の一度だけの内部移行記録";
         effetune_pre_limiter_enabled => "移行先の EffeTune/VST 導入状態と音声処理構成に依存する微調整";
         effetune_auto_open_on_video => "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
@@ -2478,7 +2479,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 509);
+        assert_eq!(entries.len(), 510);
         assert_eq!(
             entries
                 .iter()
@@ -2491,7 +2492,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            339
+            340
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2506,6 +2507,7 @@ mod tests {
             "show_toolbar_search_metadata",
             "show_toolbar_search_everything",
             "show_toolbar_physical_parent_button",
+            "show_grid_edge_buttons",
         ] {
             assert!(
                 entries
@@ -3127,6 +3129,28 @@ mod tests {
             "Dark"
         );
         assert_eq!(settings.ui_theme, UiTheme::Light);
+    }
+
+    #[test]
+    fn section1855_grid_edge_buttons_are_excluded_from_transfer() {
+        for visible in [false, true] {
+            let mut source = Settings::default();
+            source.show_grid_edge_buttons = visible;
+            let exported = export_preferences(&source).unwrap();
+            let mut document: Value = serde_json::from_str(&exported.json).unwrap();
+            assert!(
+                document["preferences"]
+                    .get("show_grid_edge_buttons")
+                    .is_none()
+            );
+            // An injected key must also leave the destination's local toolbar state alone.
+            document["preferences"]["show_grid_edge_buttons"] = serde_json::json!(visible);
+            let mut destination = Settings::default();
+            destination.show_grid_edge_buttons = !visible;
+            let parsed = parse_preferences(&document.to_string()).unwrap();
+            parsed.apply_to(&mut destination);
+            assert_eq!(destination.show_grid_edge_buttons, !visible);
+        }
     }
 
     #[test]

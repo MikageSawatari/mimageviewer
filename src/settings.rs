@@ -6197,6 +6197,9 @@ pub struct Settings {
     /// Show an independent dropdown on the right of the facet bar. Old settings omit it.
     #[serde(default)]
     pub show_facet_sort: bool,
+    /// Show first/last grid cursor buttons beside the visible sort controls.
+    #[serde(default)]
+    pub show_grid_edge_buttons: bool,
     /// 「行頭に表示」= そのセクションの前で改行するセクション集合 (v2.0.0)。
     /// 自動折返し (horizontal_wrapped) に加え、ユーザーが行区切りを固定できる。
     /// 集合に入っているセクションは、その手前で必ず新しい行を始める (先頭セクションは無視)。
@@ -8620,6 +8623,7 @@ impl Default for Settings {
             show_toolbar_aspect: true,
             show_toolbar_sort: false,
             show_facet_sort: true,
+            show_grid_edge_buttons: false,
             toolbar_section_new_row: vec![ToolbarSectionId::Folder],
             toolbar_folder_section_migrated: true,
             toolbar_section_drag_enabled: false,
@@ -11285,6 +11289,7 @@ impl Settings {
         self.show_toolbar_aspect = src.show_toolbar_aspect;
         self.show_toolbar_sort = src.show_toolbar_sort;
         self.show_facet_sort = src.show_facet_sort;
+        self.show_grid_edge_buttons = src.show_grid_edge_buttons;
         self.show_toolbar_favorites = src.show_toolbar_favorites;
         self.show_toolbar_smart_folders = src.show_toolbar_smart_folders;
         self.show_toolbar_tags = src.show_toolbar_tags;
@@ -19763,6 +19768,41 @@ mod tests {
         let mut s = Settings::default();
         s.add_favorite(name.to_string(), PathBuf::from(format!(r"C:\{name}")));
         s
+    }
+
+    #[test]
+    fn section1855_default_missing_key_and_live_copy() {
+        assert!(!Settings::default().show_grid_edge_buttons);
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!missing.show_grid_edge_buttons);
+
+        let mut live = Settings::default();
+        live.show_grid_edge_buttons = true;
+        let mut edited = Settings::default().preferences_snapshot();
+        edited.overwrite_non_preferences_from(&mut live);
+        assert!(edited.show_grid_edge_buttons);
+    }
+
+    #[test]
+    fn section1855_settings_save_load_and_missing_db_key() {
+        let _env = setup_backup_env();
+        let mut settings = Settings::load();
+        for visible in [true, false] {
+            settings.show_grid_edge_buttons = visible;
+            settings.save();
+            reset_backup_state_for_test();
+            settings = Settings::load();
+            assert_eq!(settings.show_grid_edge_buttons, visible);
+        }
+        let db = rusqlite::Connection::open(crate::data_dir::get().join("settings.db")).unwrap();
+        db.execute(
+            "DELETE FROM settings_kv WHERE key = 'show_grid_edge_buttons'",
+            [],
+        )
+        .unwrap();
+        drop(db);
+        reset_backup_state_for_test();
+        assert!(!Settings::load().show_grid_edge_buttons);
     }
 
     fn save_released_toolbar_cols_db(
