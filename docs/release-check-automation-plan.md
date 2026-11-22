@@ -1022,3 +1022,22 @@ root の `focused` が偽のままになる原因は mIV 自身のこともあ�
 - Sol / xhigh の独立レビュー: 指摘なしで ACCEPT (製品の退行を SKIPPED に隠さない観点を含む)。
 - 診断 artifact は `src/` に触れたので作り直した: `aa6f06685` + `30dbcfc43` + `9a7b711b4` の `src/` の変更 = `99c0eea48`
   (`C:\miv-relcheck\root`、detached)。配布物との違いは test-script feature の中の観測・記録・台本と、製品の完了条件の関数への切り出し (挙動不変)。
+
+**5 回目 (2026-11-22 11:37、キット `relcheck-99c0eea48-20261122-014708`、artifact `99c0eea48`、scripts `161000679`)**
+利用者の了承 2026-11-22 10:51 頃 (「サブPCでは先程の834を今実行中のようです。その後にできればとおもいます。」、事前確認 1 回と本番 1 回)。
+サブ PC 担当は本番のあいだ、シェルの命令を流さず、ターミナル パネルを読むだけにした。
+
+- 事前確認: READY (exit 0)。前面化は 1 回目で成功 (273 ms)。
+- 本番: FAIL (exit 1)。seed-profile・seed-perf-cached・static-foreground は PASS (static-foreground の要求 373 px、CPU 0.0104 コア、
+  idle の frames 0)。5 番目の static-background が、待機の入口 (`release_check_pause`) で止まった。そこでは、背面用の窓へ前面を渡す前提として
+  前面 = root を確かめる。ところが `environment: exact root foreground / runner grant identity mismatch` で ScriptFailure になった。後の 5 ケースは未実行。
+  戻った run `release-checks-20261122-023742-299451f6` は `Receive-ReleaseCheckResult.ps1` で FAIL / exit 1 と照合。
+- 前面の記録から分かること (`static-background/foreground-timeline.jsonl`): 起動後 1.03 秒の行では、前面は mIV の root (class `Window Class`)。
+  1.58 秒の行から失敗まで、前面は同じ mIV のプロセスの `Winit Thread Event Target` の窓。mIV 以外のプロセスが前面を取った行は無い。
+  分類は規則どおり FAIL。static-foreground でも、測定の後 (起動後約 38 秒、終了の手前) に同じ窓へ前面が移っている。
+- 試験側の欠陥 (設計担当が記録とコードで確認): runner は root を `Process.MainWindowHandle` で見ている。記録の `root_hwnd` の列は、
+  静止画の 2 ケースとも `Winit Thread Event Target` の窓 (winit が作る、見える扱いの layered popup) を指していた。
+  そのため記録の root の状態の列は、本当の root ではなく別の窓のもの。runner の最初の前面化 (`SetForegroundWindow(MainWindowHandle)`) も、
+  同じ取り違えの影響を受けうる。
+- 前面が mIV の中で root から別の窓へ移った理由は、まだ分からない (mIV のログに前面の操作の記録は無い)。4 回目の seed の失敗と
+  同じ原因かも分からない (4 回目には前面の記録が無い)。
