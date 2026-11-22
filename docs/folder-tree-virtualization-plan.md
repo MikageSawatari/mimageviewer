@@ -118,14 +118,16 @@ focus を持つ部品への Enter / Space、行順の適用、ID ごとに 1 回
 - 描く行 = 可視範囲の行 ∪ **この pass に AccessKit の要求 (Click・ScrollIntoView など、種類を問わない) が
   届いている部品を持つ行** ∪ **egui の focus を持つ部品の行**。
 - 部品 ID → path の対応は、**行の部品 ID の索引** (`FolderPaneRowIds`: ID → path の表。ツリーの描画だけが書き、
-  egui の temp data に置く) から引く。行を描くたびに、その行の描画中に egui へ登録された部品
-  (`ctx.viewport(|v| v.this_pass.widgets.get_layer(layer))` の、行を描く前後の差分。矢印・名前の部品・中の文字・
-  行内の Ui・spinner など AccessKit のノードになり得るものすべて) の ID をその行の path で登録する。
-  表は pass をまたいで残し、論理行の path の集合が変わったときに、論理行に無い path の項目を捨てる。
+  egui の temp data に置く) から引く。行を描くたびに、行の外側の `scope_builder` の生成から終了までの間に egui へ
+  登録された部品の ID を、**すべての layer について** (`ctx.viewport(|v| v.this_pass.widgets)` の layer ごとの件数の
+  前後差。行の Ui・矢印・名前の部品・中の文字・spinner・"!"、行が出す tooltip の layer の Ui と Label を含む)、その行の
+  path で登録する (4 回目の P2-1)。AccessKit の要求先の ID は egui の `Id::accesskit_id()` と同じ値。
   **最後に描いた行だけを使う形にはしない** (3 回目の P2): 要求はイベントの待ち行列を経て届くので、B が見えている
-  間に出た要求が、B が範囲外になった後の pass に届くことがある。索引は B を一度でも描けば B の ID を持ち続ける。
-  行の形 (loading・error) が変わって ID が増えても、古い ID は同じ path を指すだけで害は無い。
-  表の大きさは「描いたことのある行 × 行内の部品数」で、論理行の数を超えない。
+  間に出た要求が、B が範囲外になった後の pass に届くことがある。
+  **論理行から消えた path の項目も捨てない** (4 回目の P2-2): 畳んで再び開いた後に、待っていた要求が届くことがある。
+  表を捨てるのは、ペインを隠したとき (`suspend_display`)、ドライブを切り替えたとき、ツリーを再読み込みしたときだけ
+  (今の `invalidate_label_display` と同じ時点)。表の項目数は「その間に描いたことのある path の数 × 1 行が取り得る
+  部品 ID の数 (loading / error の形を含む)」で、O(描いた行数 × C)。描く行の数・AccessKit のノード数の上限とは別。
 - 引いた path は、`take_label_results` を適用した後の論理行 (`visible_rows()`) の中にあるときだけ描く。
   畳まれた・消えた行は描かない (今も論理行に無い行は描かれないので、起動されない)。
 - 追加の行は、論理行の index から求めた本来の位置 (内容の原点 + index × pitch) に、可視範囲の行と合わせて
@@ -228,7 +230,8 @@ detached の述語・viewport の選択や配送には触れない。
    新しい座標で中央に来ること。末尾の半端なページ、表示高ゼロ・1 行未満でも panic せず描くこと。
    paths と pitch が同時に変わる pass の restore / reveal。
 9. **待ち行列に残った要求**: B の部品 ID を取る → B を範囲外へ動かす pass を 1 回 → そのあとで B への Click /
-   ScrollIntoView / Focus を届ける。B が起動・表示・focus されること。中の文字の部品への ScrollIntoView も同じ。
+   ScrollIntoView / Focus を届ける。B が起動・表示・focus されること。中の文字の部品・tooltip の Label への要求も同じ。
+   「B の親を畳む → 再び開く (B は範囲外) → 待っていた B への Click を届ける」でも B が起動されること。
 9b. **同じ pass で範囲外へ出た行への AccessKit 要求と focus** (P1-2 と 2 回目の指摘): 前 pass で見えていた行 B への
    `Click` と、その上の枝 A を開くポインタ入力 (子を大量に挿入して B を描画範囲の外へ押し出す) を同じ pass に
    入れても、B が起動されること。B が egui の focus を持つ場合の Space も同じ。親 A を畳んで B が論理行から
