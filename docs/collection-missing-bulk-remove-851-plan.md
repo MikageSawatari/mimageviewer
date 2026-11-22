@@ -1,6 +1,6 @@
 # §1.851 見つからない項目をまとめて外す — 設計
 
-- 状態: 設計 ACCEPT (2026-11-22、Codex gpt-6.1-sol / xhigh の独立レビュー 4 回目で ACCEPT、HEAD 8f3d50443)。実装は統括の合図の後。
+- 状態: 実装済み (2026-11-22)。設計は Codex gpt-6.1-sol / xhigh の独立レビュー 4 回目で ACCEPT、実装は別セッションの実装レビュー 2 回目で ACCEPT。実機は未確認。
 - 正本: バックログ [next-release-backlog.md §1.851](next-release-backlog.md)。コレクション全体の所有境界は
   [collection-implementation-plan.md](collection-implementation-plan.md) §5・§6・§9・§20・§21。
 - 対象版: v5.6.0 候補 (修正量が小さければ、利用者希望 2026-11-22)。
@@ -307,3 +307,4 @@ Missing の文言:
 - r2 (7ea149cc3) REVISE: P2 送信時に stamp を検査していない → §4.4 の受付時・送信前の origin 検査。P2 下からの探索では葉ごとに照会が増える → 上からの探索とキャッシュ。P3 相対パスの扱い → I/O なしで拒否。
 - r3 (e2e163b3f) REVISE: P2 `with_viewer_context` は状態を変える → `with_viewer_context_ref` と純関数。P2 外れたリンクの下で照会が繰り返される → 降りる前に追跡結果を見て打ち切る。
 - r4 (8f3d50443) ACCEPT: 追加指摘なし。
+- 実装レビュー r1 (b5057ecca) REVISE: P2 分類の後に元がフォルダとして戻った場合も対象にしていた → 葉まで実在したら対象外 (§3.1 訂正)。P3 Light のスナップショットが実際は Dark → frame 内で Light を適用し検査。r2 (29b248830) ACCEPT。
