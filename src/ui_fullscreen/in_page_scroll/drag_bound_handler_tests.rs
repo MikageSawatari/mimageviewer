@@ -460,6 +460,8 @@ fn drag_bound_r11_asymmetric_visibility_rebase_has_the_documented_path_dependent
     let _cleanup = KeyboardCleanup;
     let outcomes = [false, true].map(|split| {
         let ctx = egui::Context::default();
+        // The r11 geometry uses a 3000-pixel-tall fixture texture.
+        ctx.input_mut(|input| input.max_texture_side = 4096);
         let mut app = scroll_app(&ctx, SpreadMode::Ltr);
         app.fs_prev_focused = true;
         app.settings.fullscreen_bound_drag_pan = true;
