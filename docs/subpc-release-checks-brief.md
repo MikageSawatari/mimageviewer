@@ -3,7 +3,8 @@
 リリース前の性能チェック ReleaseChecks をサブ PC で流すときの依頼文の雛形 (2026-11-21〜)。
 統括はリリースごとに `<...>` を埋めて `C:\home\mimageviewer-subpc\relcheck\<kit-id>-brief.md` に置き、
 `python scripts/write_utf8_bom.py <そのファイル>` で BOM を付けてから、サブ PC 担当 (Remote Control の
-「mImageViewer 実機確認」セッション) へ SendMessage で場所を伝える。依頼を送る前に、キット・事前確認と本番・見込み時間を利用者へ示して
+「mImageViewer 実機確認」セッション) へ SendMessage で場所を伝える。送る前に「次の依頼を受けられるか」を聞き、前の依頼が
+終わっていることを確かめる (届かないときは Remote Control が切れている。つなぎ直しは利用者に頼む)。依頼を送る前に、キット・事前確認と本番・見込み時間を利用者へ示して
 了承をもらい、その範囲を依頼文に書く ([実行確認](interactive-release-verification.md) の「サブ PC のキットで流す ReleaseChecks」)。
 
 手順の背景とキットの仕組みは [自動化計画 §11](release-check-automation-plan.md#relcheck-subpc-kit)。
@@ -86,6 +87,9 @@ C:\miv-relcheck\root\scripts\relcheck-kit\Run-SubPcProbe.cmd
 C:\miv-relcheck\root\scripts\relcheck-kit\Run-SubPcSuite.cmd
 ```
 - 終わるまで、ほかのコマンドを流さず、窓をクリックしない。mIV の窓は何度か開いて閉じます。
+- **本番のあいだは、終わりを待つためのシェルの命令も流さないでください** (ファイルの有無を一定間隔で見る待機のループや sleep も含む)。
+  終わりの確かめは、ターミナル パネルの表示を読む機能 (read_terminal。新しい出力を待つ指定があれば使う) だけで行い、
+  プロセスや窓を新たに起こす操作はしないでください。
 - 最後に `ReleaseChecks evidence: <run フォルダ>` と `EXIT=<終了コード>` が出ます。
   0 = PASS / PASS_WITH_WARNINGS、1 = FAIL、2 = SKIPPED (環境不成立)。
 - 失敗しても**流し直さないでください**。1 回の結果をそのまま返します。
@@ -95,7 +99,9 @@ C:\miv-relcheck\root\scripts\relcheck-kit\Run-SubPcSuite.cmd
 robocopy <run フォルダ> \\tsclient\C\home\mimageviewer-subpc\relcheck\<kit-id>-results\<run フォルダの名前> /E /XD fixture
 Copy-Item C:\miv-relcheck\root\target\ui-smoke\env-probe.json \\tsclient\C\home\mimageviewer-subpc\relcheck\<kit-id>-results\
 ```
-`fixture` (生成した試験データ) は戻さなくてよいです。ターミナルの出力も `terminal-output.txt` として同じ場所へ置いてください。
+`fixture` (生成した試験データ) は戻さなくてよいです。各ケースの `foreground-timeline.jsonl` (前面の記録) は run フォルダの中にあるので、
+そのまま戻ります。ターミナルの出力も `terminal-output.txt` として同じ場所へ置いてください (長い行で先頭が切れていても構いません。
+ケースごとの結果は run フォルダの `summary.json` と `release-record.md` にあります)。
 
 ## 6. 返事に書くこと
 - 事前確認の `READY` / `NOT_READY` と、env-probe.json の要点 (RDP セッションか、画面の大きさ、GPU)

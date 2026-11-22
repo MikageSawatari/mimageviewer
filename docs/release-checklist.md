@@ -355,14 +355,19 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
       呼び出す側の `scripts/`、専用 worktree の指紋の対象のソースと `scripts/build-portable.ps1` が、コミット済みで clean でなければ止まる。
       診断 portable を別の worktree からコピーして持ち込まない (ビルドした root が違うと、本番が証拠フォルダの検査で止まる)。
    2. **統括がサブ PC 担当へ依頼する**。依頼文は [サブ PC の ReleaseChecks 依頼の雛形](subpc-release-checks-brief.md) から作る。
-      ほかのサブ PC 依頼・夜間試験の時間枠 (01:00〜07:00) と重ねない。メイン PC 側では RDP の接続を切らず、
+      ほかのサブ PC 依頼・夜間試験の時間枠 (01:00〜07:00) と重ねない。送る前に、サブ PC 担当に「次の依頼を受けられるか」を聞き、
+      前の依頼が終わっていることを確かめる。サブ PC 担当が `ListAgents` に出ない・送っても `not active` になるときは、
+      Remote Control が切れている。つなぎ直しは利用者に頼む (2026-11-22 に一度あった)。メイン PC 側では RDP の接続を切らず、
       RDP の窓を最小化しない (サブ PC の画面描画と前面の判定が成り立たなくなる)。メイン PC の作業は続けてよい。
    3. **サブ PC 担当が流す** (雛形の手順): キットをサブ PC の `C:\miv-relcheck\root` へコピー (前のキットがあれば名前を変えて退避。
-      違う path に置くと、事前確認と本番は mIV を起動する前に止まる) → `Test-SubPcEnvironment.ps1` (mIV を起動せず、
-      使い捨ての窓で前面の条件を確かめる) が READY なら、**ターミナル パネルから**
-      `.\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -FromKit -InteractiveApproved` → run フォルダをメイン PC の
-      `C:\home\mimageviewer-subpc\relcheck\<kit-id>-results\` へ戻す。所要はコピーを除き約 10 分。
-      NOT_READY・SKIPPED は回避策を足さずに止め、観測を返してもらう。
+      違う path に置くと、事前確認と本番は mIV を起動する前に止まる) → **ターミナル パネルから**事前確認
+      `Run-SubPcProbe.cmd` (mIV を起動せず、使い捨ての窓で前面・DPI の表・作業領域の条件を確かめる) が READY なら、
+      同じパネルから本番 `Run-SubPcSuite.cmd` (どちらもキットの `scripts\relcheck-kit\`、最後に `EXIT=<値>` を出す) →
+      run フォルダをメイン PC の `C:\home\mimageviewer-subpc\relcheck\<kit-id>-results\` へ戻す。所要はコピーを除き約 10 分。
+      **本番のあいだ、サブ PC 担当はシェルの命令 (待機のループや sleep を含む) を流さず、ターミナル パネルを読むだけにする**
+      (2026-11-22 の 4 回目は、待機の命令だけを動かしていた回で前面を失った。その後は流さない形で通っている)。
+      NOT_READY・SKIPPED・FAIL は回避策を足さずに止め、観測を返してもらう。
+      ターミナル パネルは長い出力の先頭を落とすので、ケースごとの結果は run フォルダの `summary.json` と `release-record.md` を正とする。
    4. **メイン PC で照合する** (読み取りだけ):
       ```powershell
       .\scripts\relcheck-kit\Receive-ReleaseCheckResult.ps1 -Kit C:\home\mimageviewer-subpc\relcheck\<kit-id> -Result C:\home\mimageviewer-subpc\relcheck\<kit-id>-results\<run-id>
@@ -372,7 +377,12 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
       (配布ビルドの入力が変わったら、キットを作り直して流し直す)。
    - **数値の比較**: サブ PC (RTX 4060 Ti、1920×1080、RDP セッション) の値は、サブ PC の記録どうしでだけ比べる。
      メイン PC (RTX 4090) の過去の記録とは比べない。閾値・判定は両方で同じ。`release-record.md` の「実行:」の行に
-     実行場所・画面・RDP の有無が出る。
+     実行場所・画面・RDP の有無が出る。サブ PC で初めて全ケースが通った記録は v5.5.1 用の run `release-checks-20261122-042738-1a29230b`
+     (PASS_WITH_WARNINGS。perf の drawn <16 ms は 0%、p95 32〜33 ms で WARN。RDP の描画の間隔によると見ている、未確認)。
+   - **前面の判定** ([自動化計画 §11](release-check-automation-plan.md#relcheck-subpc-kit)): runner は、試験対象の mIV が知らせる root の窓
+     (`root-window.json`) だけを前面化・照合に使い、各ケースの `foreground-timeline.jsonl` に前面の窓を記録する。
+     前面の待ちの失敗が SKIPPED になるのは、待ちの間ずっと mIV 以外のプロセスが前面で、mIV の root が正常だったと記録で示せる場合だけ。
+     mIV の別の窓・子孫・応答なし・記録の欠けは FAIL (製品の退行を SKIPPED に隠さない)。
    - **サブ PC が使えないとき**は、利用者の了承を取って従来どおりメイン PC の repository root で流す
      (エージェントが流すときはターミナル パネルから。ツールの裏のプロセスからは前面を取れず止まる、2026-11-17):
      ```powershell
