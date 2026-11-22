@@ -27755,6 +27755,19 @@ impl App {
         }
     }
 
+    /// The existing sort request owns this folder's scan until it is adopted or retired.
+    /// Background refresh callers share this predicate; no independent wait state is needed.
+    fn current_view_order_refresh_scans_folder(&self, folder: &Path) -> bool {
+        self.folder_pane_open_pending
+            .as_ref()
+            .is_some_and(|pending| {
+                matches!(
+                    pending.purpose,
+                    FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+                ) && crate::folder_tree::path_eq(&pending.path, folder)
+            })
+    }
+
     fn ensure_current_folder_watch(&mut self, ctx: &egui::Context) {
         if !self.folder_observation_allowed() {
             self.retire_passive_folder_observation();
@@ -27777,6 +27790,11 @@ impl App {
             .as_ref()
             .is_some_and(|watch| watch.folder == folder && watch.projection_key == projection_key)
         {
+            return;
+        }
+        if self.current_view_order_refresh_scans_folder(&folder) {
+            // Re-registering starts a full confirmation scan. Keep the old watch
+            // until the sort request ends, then the next frame uses the current key.
             return;
         }
         self.current_folder_watch = None;
@@ -48028,6 +48046,16 @@ impl App {
         let Some(cur) = self.pending_folder_refresh_target() else {
             return;
         };
+        if self.current_view_order_refresh_scans_folder(&cur)
+            && self
+                .folder_refresh_pending
+                .as_ref()
+                .is_some_and(|request| crate::folder_tree::path_eq(&request.folder, &cur))
+        {
+            // Retain the complete request/cause, including Append delivery, while
+            // the sort scan owns this folder. Normal consumption resumes afterward.
+            return;
+        }
         let Some(target) = self.folder_refresh_pending.take() else {
             return;
         };
