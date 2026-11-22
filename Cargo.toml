@@ -18,6 +18,7 @@ members = [
     "crates/agent-ipc",
     "crates/capture-file",
     "crates/browser-view-ipc",
+    "crates/browser-host",
     "crates/mcp-server",
     "crates/remote-web",
     "crates/vst3-host-tester",

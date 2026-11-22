@@ -4186,6 +4186,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimageviewer-browser-host"
+version = "5.5.1"
+dependencies = [
+ "base64 0.22.1",
+ "mimageviewer-browser-view-ipc",
+ "mimageviewer-capture-file",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "mimageviewer-browser-view-ipc"
 version = "5.5.1"
 dependencies = [

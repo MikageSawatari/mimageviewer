@@ -146,6 +146,7 @@ Assert-OrderedText $buildRelease @(
     '$epubWorkerExit = Invoke-ReleaseCargo -Args $epubWorkerCmd',
     '$mcpExit = Invoke-ReleaseCargo -Args $mcpCmd',
     '$musicvideoExit = Invoke-ReleaseCargo -Args $musicvideoCmd',
+    '$browserHostExit = Invoke-ReleaseCargo -Args $browserHostCmd',
     'Invoke-MivSign -Files $launcherEmbedExecutables',
     '$launcherExit = Invoke-ReleaseCargo -Args $launcherCmd',
     'Invoke-MivSign -Files @($releaseExe) -Verify',
@@ -164,6 +165,7 @@ Assert-OrderedText $buildPortable @(
     '& cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf',
     '& cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp',
     '& cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo',
+    '& cargo build --release -p mimageviewer-browser-host --bin mimageviewer-browser-host',
     'Remove-Item -LiteralPath $pkgDir -Recurse -Force',
     'Invoke-MivSign -Files $portablePe -Verify',
     "Compress-Archive -Path (Join-Path `$pkgDir '*')"
@@ -172,7 +174,7 @@ Assert-OrderedText $buildPortable @(
 foreach ($script in @($buildDist, $buildRelease, $buildPortable)) {
     Assert-True ($script.Contains("'mimageviewer-epub-pdf'")) 'EPUB worker is absent from a process-stop list'
 }
-Assert-True ($buildDist.Contains('-p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor -p mimageviewer-launcher')) 'workspace clean omits MCP'
+Assert-True ($buildDist.Contains('-p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor -p mimageviewer-browser-host -p mimageviewer-launcher')) 'workspace clean omits MCP'
 Assert-True ($buildDist.Contains('--target-dir $portableTargetDir -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp')) 'portable clean omits MCP'
 Assert-True ($buildDist.Contains("(Join-Path `$releaseDir 'mimageviewer-epub-pdf.exe')")) 'final PE list omits EPUB worker'
 Assert-True ($buildRelease.Contains('$releaseEpubWorkerExe') -and
@@ -191,8 +193,8 @@ $releaseBuildCalls = @($buildReleaseAst.FindAll({
     $node -is [System.Management.Automation.Language.CommandAst] -and
         $node.GetCommandName() -eq 'Invoke-ReleaseCargo'
 }, $true))
-Assert-True ($releaseBuildCalls.Count -eq 6) 'release must build five inner executables, then launcher'
-$expectedReleasePaths = @('$releaseCoreExe', '$releaseRemoteExe', '$releaseEpubWorkerExe', '$releaseMcpExe', '$releaseMusicvideoExe', '$releaseExe')
+Assert-True ($releaseBuildCalls.Count -eq 7) 'release must build six inner executables, then launcher'
+$expectedReleasePaths = @('$releaseCoreExe', '$releaseRemoteExe', '$releaseEpubWorkerExe', '$releaseMcpExe', '$releaseMusicvideoExe', '$releaseBrowserHostExe', '$releaseExe')
 for ($index = 0; $index -lt $releaseBuildCalls.Count; $index++) {
     Assert-True ($releaseBuildCalls[$index].Extent.Text.Contains('-ExpectedExecutable ' + $expectedReleasePaths[$index])) "release artifact path check missing/out of order at $index"
 }
@@ -201,7 +203,7 @@ $portableBuildCalls = @($buildPortableAst.FindAll({
     $node -is [System.Management.Automation.Language.CommandAst] -and
         $node.GetCommandName() -eq 'cargo'
 }, $true))
-Assert-True ($portableBuildCalls.Count -eq 5) 'portable must build five executables'
+Assert-True ($portableBuildCalls.Count -eq 6) 'portable must build six executables'
 foreach ($call in $portableBuildCalls) {
     Assert-True ($call.Extent.Text.Contains('--target-dir $portableTargetDir')) 'portable companion escaped its isolated target'
 }
@@ -221,6 +223,28 @@ foreach ($clean in $cleanCalls) {
 Assert-True ($buildDist.Contains("(Join-Path `$releaseDir 'mimageviewer-musicvideo.exe')")) 'final PE list omits editor'
 Assert-True ($buildRelease.Contains('$releaseMusicvideoExe')) 'release editor path is absent'
 Assert-True ($buildPortable.Contains("@{ src = `$musicvideoExe; dst = 'mimageviewer-musicvideo.exe' }")) 'portable copy omits editor'
+
+# browser818_bundle: all packaging routes must retain the sixth companion.
+foreach ($script in @($buildDist, $buildRelease, $buildPortable)) {
+    Assert-True ($script.Contains("'mimageviewer-browser-host'")) 'browser818_bundle: process policy omits browser host'
+}
+foreach ($clean in $cleanCalls) {
+    Assert-True ($clean.Extent.Text.Contains('-p mimageviewer-browser-host')) 'browser818_bundle: clean omits browser host'
+}
+Assert-True ($buildDist.Contains("(Join-Path `$releaseDir 'mimageviewer-browser-host.exe')")) 'browser818_bundle: final PE list omits browser host'
+Assert-True ($buildPortable.Contains("@{ src = `$browserHostExe; dst = 'mimageviewer-browser-host.exe' }")) 'browser818_bundle: portable copy omits browser host'
+foreach ($case in @(
+    @{ Ast = $buildReleaseAst; Variable = '$launcherEmbedExecutables'; Path = '$releaseBrowserHostExe' },
+    @{ Ast = $buildReleaseAst; Variable = '$releasePe'; Path = '$releaseBrowserHostExe' },
+    @{ Ast = $buildPortableAst; Variable = '$portablePe'; Path = 'mimageviewer-browser-host.exe' }
+)) {
+    $lists = @($case.Ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
+            $node.Left.Extent.Text -eq $case.Variable
+    }, $true))
+    Assert-True ($lists.Count -eq 1 -and $lists[0].Extent.Text.Contains($case.Path)) 'browser818_bundle: host missing from signing or PE checks'
+}
 
 foreach ($case in @(
     @{ Ast = $buildReleaseAst; Text = $buildRelease; Output = '$releaseMusicvideoExe' },

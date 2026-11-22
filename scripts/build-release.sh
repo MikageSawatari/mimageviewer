@@ -7,7 +7,7 @@
 #   1. 実行中の mimageviewer.exe / mimageviewer-susie32.exe を `taskkill` で停止
 #   2. ファイルハンドル解放を待つ
 #   3. VST3 C++ bridge を再ビルド (core が include_bytes! で内包するため)
-#   4. core → remote → EPUB worker → MCP → editor → launcher の 6 段階 cargo build (CARGO_INCREMENTAL=0)
+#   4. core → remote → EPUB worker → MCP → editor → browser-host → launcher の 7 段階 cargo build (CARGO_INCREMENTAL=0)
 #   5. APPDATA 上の stale VST3 bridge cache を削除 (次回起動時に再展開させる)
 # を順に実行する。
 #
@@ -66,9 +66,9 @@ exact_pids=$(powershell.exe -NoProfile -NonInteractive -Command '
     $ErrorActionPreference = "Stop"
     . "./scripts/build-process-policy.ps1"
     $release = Join-Path (Get-Location).Path "target\release"
-    $outputs = @((Join-Path $release "mimageviewer.exe"), (Join-Path $release "mimageviewer-mcp.exe"))
+    $outputs = @((Join-Path $release "mimageviewer.exe"), (Join-Path $release "mimageviewer-mcp.exe"), (Join-Path $release "mimageviewer-browser-host.exe"))
     Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -in @("mimageviewer", "mimageviewer-mcp") } |
+        Where-Object { $_.Name -in @("mimageviewer", "mimageviewer-mcp", "mimageviewer-browser-host") } |
         Where-Object { Test-MivExactBuildProcess -Process $_ -OutputPaths $outputs } |
         ForEach-Object { $_.Id }
 ')
@@ -118,7 +118,7 @@ if [ "$SKIP_VST3" != "1" ]; then
                 echo "[build-release] configuring VST3 bridge (cmake)"
                 cmake -S crates/vst3-host -B "$VST3_BUILD_DIR" -G "Visual Studio 18 2026" -A x64
             fi
-            echo "[build-release] (1/7) cmake --build $VST3_BUILD_DIR --config Release"
+            echo "[build-release] (1/8) cmake --build $VST3_BUILD_DIR --config Release"
             cmake --build "$VST3_BUILD_DIR" --config Release
             if [ ! -f "$VST3_VENDOR_EXE" ]; then
                 echo "[build-release] ERROR: cmake build did not produce $VST3_VENDOR_EXE" >&2
@@ -137,32 +137,36 @@ else
     echo "[build-release] SKIP_VST3_BRIDGE=1 — skipping VST3 bridge rebuild"
 fi
 
-# 6 段階ビルド (ランチャー方式):
+# 7 段階ビルド (ランチャー方式):
 #   1. core (本体、FFmpeg DLL に静的依存) を `mimageviewer-core.exe` として生成
 #   2. remote service (core と protocol version を共有) を `mimageviewer-remote.exe` として生成
 #   3. EPUB PDF worker を `mimageviewer-epub-pdf.exe` として生成
 #   4. MCP stdio adapter を mimageviewer-mcp.exe として生成
 #   5. music-video editor を `mimageviewer-musicvideo.exe` として生成
-#   6. launcher (FFmpeg 非依存、core + remote + EPUB worker + MCP + editor + FFmpeg DLL を include_bytes! で内包) を
+#   6. browser host を `mimageviewer-browser-host.exe` として生成
+#   7. launcher (FFmpeg 非依存、core + remote + EPUB worker + MCP + editor + browser-host + FFmpeg DLL を include_bytes! で内包) を
 #      `mimageviewer.exe` として生成。配布する単体 exe はこちら。
 #
-# cargo は同一ワークスペース内 bin の依存順序を表現できないため、明示的に 6 回呼ぶ。
-echo "[build-release] (2/7) CARGO_INCREMENTAL=0 cargo build --release --bin mimageviewer-core $*"
+# cargo は同一ワークスペース内 bin の依存順序を表現できないため、明示的に 7 回呼ぶ。
+echo "[build-release] (2/8) CARGO_INCREMENTAL=0 cargo build --release --bin mimageviewer-core $*"
 invoke_release_cargo mimageviewer-core.exe build --release --bin mimageviewer-core "$@"
 
-echo "[build-release] (3/7) CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets $*"
+echo "[build-release] (3/8) CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets $*"
 invoke_release_cargo mimageviewer-remote.exe build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets "$@"
 
-echo "[build-release] (4/7) CARGO_INCREMENTAL=0 cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf $*"
+echo "[build-release] (4/8) CARGO_INCREMENTAL=0 cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf $*"
 invoke_release_cargo mimageviewer-epub-pdf.exe build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf "$@"
 
-echo "[build-release] (5/7) CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp $*"
+echo "[build-release] (5/8) CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp $*"
 invoke_release_cargo mimageviewer-mcp.exe build --release -p mimageviewer-mcp --bin mimageviewer-mcp "$@"
 
-echo "[build-release] (6/7) CARGO_INCREMENTAL=0 cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo $*"
+echo "[build-release] (6/8) CARGO_INCREMENTAL=0 cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo $*"
 invoke_release_cargo mimageviewer-musicvideo.exe build --release -p musicvideo-editor --bin mimageviewer-musicvideo "$@"
 
-echo "[build-release] (7/7) CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-launcher --bin mimageviewer $*"
+echo "[build-release] (7/8) CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-browser-host --bin mimageviewer-browser-host $*"
+invoke_release_cargo mimageviewer-browser-host.exe build --release -p mimageviewer-browser-host --bin mimageviewer-browser-host "$@"
+
+echo "[build-release] (8/8) CARGO_INCREMENTAL=0 cargo build --release -p mimageviewer-launcher --bin mimageviewer $*"
 invoke_release_cargo mimageviewer.exe build --release -p mimageviewer-launcher --bin mimageviewer "$@"
 
 # T56: APPDATA 上の展開済み VST3 bridge cache を削除して、次回起動時に新 bridge を

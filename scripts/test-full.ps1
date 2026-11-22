@@ -3,6 +3,8 @@
 # The pack-build-tools feature exposes only the two development helper binaries
 # that contain unit tests. Other development binaries remain outside the test
 # graph, while every selected target shares one mimageviewer library build.
+# Launcher tests require six release companions built first: core, remote, EPUB,
+# MCP, music-video editor and browser host (see build-release.ps1).
 # This is a noninteractive gate: the live eframe run_native test is #[ignore].
 # Headless unit tests with message-only/hidden HWNDs or fake input stay enabled.
 # Run only the approved live suite via scripts/test-live-windows.ps1 separately;

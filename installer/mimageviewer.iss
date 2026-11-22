@@ -52,7 +52,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 ; 配布する exe はランチャー (`mimageviewer.exe`) のみ。ランチャーは本体
 ; `mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe`、
-; `mimageviewer-mcp.exe`、`mimageviewer-musicvideo.exe` と FFmpeg LGPL DLL を include_bytes! で
+; `mimageviewer-mcp.exe`、`mimageviewer-musicvideo.exe`、`mimageviewer-browser-host.exe` と FFmpeg LGPL DLL を include_bytes! で
 ; 内包しており、初回起動時に %APPDATA%\mimageviewer\runtime\<version>\ へ
 ; 自動展開する。詳細は docs/native-dependencies.md「FFmpeg LGPL DLL 管理」節。
 Source: "{#LauncherSource}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion

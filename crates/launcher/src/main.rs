@@ -2,7 +2,7 @@
 //!
 //! The real application binary (`mimageviewer-core.exe`) imports FFmpeg DLLs at
 //! process load time and starts the remote service, EPUB worker and music-video editor
-//! from its own directory. The launcher extracts these executables, FFmpeg DLLs,
+//! from its own directory. The launcher extracts these executables, the browser host, FFmpeg DLLs,
 //! app-local VC runtime and the complete EffeTune bundle into
 //! `%APPDATA%/mimageviewer/runtime/<version>/` first, then spawns the core there.
 //! A leading `--mcp` extracts only the MCP executable and proxies its stdio and
@@ -45,6 +45,7 @@ static CORE_EXE: &[u8] = include_bytes!(env!("MIMV_CORE_EXE"));
 static REMOTE_EXE: &[u8] = include_bytes!(env!("MIMV_REMOTE_EXE"));
 static EPUB_PDF_EXE: &[u8] = include_bytes!(env!("MIMV_EPUB_PDF_EXE"));
 static MCP_EXE: &[u8] = include_bytes!(env!("MIMV_MCP_EXE"));
+static BROWSER_HOST_EXE: &[u8] = include_bytes!(env!("MIMV_BROWSER_HOST_EXE"));
 const MCP_ASSET: (&str, &[u8], &str) =
     ("mimageviewer-mcp.exe", MCP_EXE, env!("MIMV_MCP_EXE_SHA256"));
 static MUSICVIDEO_EXE: &[u8] = include_bytes!(env!("MIMV_MUSICVIDEO_EXE"));
@@ -122,6 +123,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         env!("MIMV_EPUB_PDF_EXE_SHA256"),
     ),
     MCP_ASSET,
+    (
+        "mimageviewer-browser-host.exe",
+        BROWSER_HOST_EXE,
+        env!("MIMV_BROWSER_HOST_EXE_SHA256"),
+    ),
     (
         "mimageviewer-musicvideo.exe",
         MUSICVIDEO_EXE,
@@ -537,6 +543,7 @@ fn requires_content_hash_on_launch(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "mimageviewer-epub-pdf.exe"
             | "mimageviewer-mcp.exe"
+            | "mimageviewer-browser-host.exe"
             | "mimageviewer-musicvideo.exe"
             | "msvcp140.dll"
             | "msvcp140_1.dll"
@@ -576,7 +583,7 @@ fn asset_hash_matches(
 ) -> std::io::Result<bool> {
     trace(Stage::AssetHash, &path.to_string_lossy(), || {
         // Core, remote, and FFmpeg assets retain the versioned sidecar shortcut. The EPUB
-        // worker, editor and four loader-critical app-local CRT files are hashed on every launch, so a
+        // worker, MCP, editor, browser host and four loader-critical app-local CRT files are hashed on every launch, so a
         // current sidecar cannot bless same-length corruption in those assets.
         if !always_verify_contents && let Ok(stored) = std::fs::read_to_string(hash_path) {
             return Ok(stored.trim().eq_ignore_ascii_case(expected_hash));
@@ -897,6 +904,10 @@ mod diagnostics_tests {
             (env!("MIMV_REMOTE_EXE"), "mimageviewer-remote.exe"),
             (env!("MIMV_EPUB_PDF_EXE"), "mimageviewer-epub-pdf.exe"),
             (env!("MIMV_MCP_EXE"), "mimageviewer-mcp.exe"),
+            (
+                env!("MIMV_BROWSER_HOST_EXE"),
+                "mimageviewer-browser-host.exe",
+            ),
             (env!("MIMV_MUSICVIDEO_EXE"), "mimageviewer-musicvideo.exe"),
         ] {
             assert_eq!(std::path::Path::new(actual), release_dir.join(name));
@@ -1183,6 +1194,7 @@ mod tests {
             "mimageviewer-remote.exe",
             "mimageviewer-epub-pdf.exe",
             "mimageviewer-mcp.exe",
+            "mimageviewer-browser-host.exe",
             "mimageviewer-musicvideo.exe",
             "avcodec-61.dll",
             "avformat-61.dll",
@@ -1212,6 +1224,35 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), asset.1, "{name}");
             assert_eq!(super::sha256_file_hex(&path).unwrap(), asset.2, "{name}");
         }
+    }
+
+    #[test]
+    fn browser818_bundle_host_hash_extract_and_repair_preserve_other_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime").join(super::VERSION);
+        std::fs::create_dir_all(&runtime).unwrap();
+        let asset = super::ASSETS
+            .iter()
+            .find(|asset| asset.0 == "mimageviewer-browser-host.exe")
+            .unwrap();
+        let sibling = runtime.join("mimageviewer-core.exe");
+        std::fs::write(&sibling, b"unchanged existing core").unwrap();
+        super::extract_asset(&runtime, asset).unwrap();
+        let host = runtime.join(asset.0);
+        assert_eq!(std::fs::read(&host).unwrap(), asset.1);
+        assert_eq!(super::sha256_file_hex(&host).unwrap(), asset.2);
+        let mut corrupt = std::fs::read(&host).unwrap();
+        corrupt[0] ^= 0xff;
+        std::fs::write(&host, corrupt).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(super::sidecar_hash_path(&host))
+                .unwrap()
+                .trim(),
+            asset.2
+        );
+        super::extract_asset(&runtime, asset).unwrap();
+        assert_eq!(std::fs::read(&host).unwrap(), asset.1);
+        assert_eq!(std::fs::read(sibling).unwrap(), b"unchanged existing core");
     }
 
     #[test]

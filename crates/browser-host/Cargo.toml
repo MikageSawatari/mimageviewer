@@ -1,0 +1,15 @@
+[package]
+name = "mimageviewer-browser-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+mimageviewer-capture-file = { path = "../capture-file" }
+mimageviewer-browser-view-ipc = { path = "../browser-view-ipc" }
+

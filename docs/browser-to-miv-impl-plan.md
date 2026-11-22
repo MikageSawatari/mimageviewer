@@ -585,6 +585,16 @@ release は、既存の core→remote→EPUB→MCP→editor の後、browser-hos
 
 単体 exe、installer、portable、テスト前提がそろい、host が本体の巨大な依存を引き込まないこと。
 
+**段階6の実装引き継ぎ（2026-11-22、自動検証待ち）**
+
+- 新 host の設定は `browser-host/<世代>/config.json` の `{ "v": 1, "launcher": "絶対パス", "output_dir": "保存先基底の絶対パス" }`。設定の作成・登録・解除と portable での登録無効の UI は段階7で扱う。未リリースの新形式で、既存設定・画像の形式は変えていない。
+- native 応答は `{ "ok": true, "path": "保存した絶対パス" }`、失敗は `{ "ok": false, "error": "snake_case のコード", "path": "保存済みならそのパス" }`。`registration_missing` は設定の不在・不正、`launcher_missing` は設定された launcher の不在。拡張がそれぞれ再登録／再インストール・解除の案内に対応させる。成功は launcher の終了コードによる受け渡しまでで、App の表示成功ではない。
+- frame は本文確保前に 64 MiB、応答は 1 MiB を検査。元バイト列を共有名で非上書き公開し、MOTW は共有部品へ page／final URL を渡す。保存後の MOTW／起動失敗では画像を残す。右クリック記録は寸法・位置・DPR の一致で使用し、時刻期限を設けない。
+- host が渡す seed の `maximized` は false。ブラウザが最大化されていても、mIV の外側を表示領域の矩形へ合わせる契約を保つ（mIV 自体の最大化でモニターの作業領域へ広げない）。既存の位置検査・既定位置への処理は変更しない。
+- 内包対象は6本。release の host は editor の後、内包対象の署名は launcher の前。出力照合・PE・clean・portable hash manifest とその利用側を揃えた。runtime cleanup の変更はテストだけで、登録世代は対象へ加えない。
+- 新規 Rust テストは host 12件、launcher と runtime cleanup の bundle 回帰各1件。filter は `browser818_host|browser818_positions|browser818_bundle`。スクリプト回帰は `test-build-dev-safety.ps1`、`test-release-build-safety.ps1`（process policy を含む）、`test-musicvideo-build-safety.ps1`、`test-build-portable-source-fingerprint.ps1`。既存 companion の検査は残したまま host を追加した。
+- ビルド・Rust テスト・PowerShell スクリプト・アプリの実行は行わず、設計担当へ引き継ぐ。実ビルド時間・配布物・署名の検証結果は未取得。
+
 ### 段階7：連携登録、保存先、設定画面、場所▼
 
 **範囲**
