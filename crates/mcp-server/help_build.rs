@@ -265,12 +265,17 @@ pub fn extract_page(id: &str, source: &str) -> Result<Page, String> {
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let page = Page {
+    let mut page = Page {
         id: id.into(),
         title,
         sections,
     };
     validate_ids(std::slice::from_ref(&page))?;
+    // Validate before omitting the empty overview so #0 remains reserved even
+    // when omitted. h2 ordinals were assigned with the overview still present.
+    if page.sections[0].parts.iter().all(String::is_empty) {
+        page.sections.remove(0);
+    }
     Ok(page)
 }
 

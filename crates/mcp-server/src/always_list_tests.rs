@@ -191,7 +191,7 @@ fn each_tool_description_names_its_miv_permission() {
         let name = tool["name"].as_str().unwrap();
         let description = tool["description"].as_str().unwrap();
         let prefix = match name {
-            "search_help" | "get_help" => "Works offline with integration disabled.",
+            "search_help" | "get_help" => "help offline.",
             "get_transcript" => "Needs mIV Read + transcript sharing.",
             "get_thumbnail" => "Needs mIV Read + thumbnail sharing.",
             "open_in_viewer" => "Needs mIV Read and Open.",

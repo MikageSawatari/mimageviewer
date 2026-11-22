@@ -1,6 +1,6 @@
 # MCP で使い方の案内と、設定の確認・変更 (§1.843) — 設計
 
-状態: **設計 (2026-11-21、同日に利用者の決定で改訂)。A の実装を追加 (2026-11-23、ビルド・テストは統括待ち)、B〜E は未着手。収録版未定 (v5.6.0 には入れない)**。
+状態: **設計 (2026-11-21、同日に利用者の決定で改訂)。第 1 段を実装中 (2026-11-23〜、A 済み、B〜E は未着手)。収録は v5.7.0 以降 (v5.6.0 には入れない)**。
 基点は master `28f9c5a11`。行番号はこの基点のもの。実行時の挙動は誰も観測していない
 (この文書の根拠はコードと文書の参照だけ。実機で確かめる点は §14)。
 
@@ -1153,7 +1153,7 @@ UI が 5 秒応答しないときは未実行で `Busy`。回復の仕組みは�
 | D | `set_favorite` (追加の確定の切り出しを含む)、`stack_script` | お気に入り: ダイアログと同じ関数を通る、上限・重複、索引 ON で indexer が同期、OFF で戻る、モーダル中の拒否。スクリプト: 1 MiB 超・コンパイルできない本文・`expected_sha256` が今の本文と違う書き込みは拒まれファイルが変わらない、長い本文が part に分けて読める、書いた本文が次のスタック表示で使われる、環境設定の「既定に戻す」「スクリプトを開く」と AI の書き込みが押した・届いた順に 1 つずつ処理される (「既定に戻す → 開く」の順で開くと既定の本文が開く)、UI スレッドでファイルを読み書きしない・待たない |
 | E | 設定画面、公開文書、マニュアル、ui_snapshot | 3 区画がチェックに応じて変わる、検索の語、`check_site_cards.py`・`check_ui_glyphs.py` |
 
-A の実装 (2026-11-23、検証は統括の共有 runner 待ち): `crates/mcp-server/help_build.rs` を
+A の実装 (2026-11-23): `crates/mcp-server/help_build.rs` を
 build script と fixture テストで共有し、既存の `scraper` 0.27 を build/dev dependency に使う。
 生成物は `OUT_DIR` だけに置く。概要は `page#0`、id の無い h2 は 1 始まりのページ内順番。
 ヘルプの呼び出しは adapter 内で完結し、backend / pipe を呼ばない。instructions にはヘルプを先に引く
@@ -1163,7 +1163,17 @@ build script と fixture テストで共有し、既存の `scraper` 0.27 を bu
 共通処理の ignored input にも manual を加えた。`test-focused.ps1` の共通 mapping は
 同梱対象 HTML の変更から MCP crate を選ぶ。release は MCP → launcher の Cargo build を毎回通り、
 独自のソース一致による MCP 成果物再利用は無い (`build-dist.ps1 -SkipRustTests` は手動指定の検査省略)。
-本区切りでは利用者指示に従い Cargo のビルド・テストを実行しない。
+実装担当は Cargo のビルド・テストを実行せず、設計担当が共有 runner で流す (2026-11-20 の規則)。
+
+A の追補 (2026-11-23): 初回差分は設計担当の共有 runner で MCP lib 97 件と
+`test-test-tools.ps1` が PASS。portable fingerprint の追加した manual 検査も通過し、
+既存の PowerShell 7 probe は `pwsh.exe` 未導入で停止した (今回の変更とは別)。
+その後の追補は、ヘルプの動作を保って discovery の成功 schema を共通の `app_version` 必須指定に縮め、
+空の概要節を省く (id の一意性検査後に省き、`#0` は予約したまま)。
+残り 5 tool の未登録の草案は `crates/mcp-server/src/stage1_tool_drafts.json`、
+実測用テストは `schema::tests::stage1_draft_tool_definitions_fit_discovery_budget`。
+静的なシリアライズ形の集計はヘルプ 2 本 1,295 字、7 本 5,361 字、最大 tools/list 見積もり
+47,192 字 (上限 48,000 字から余裕 512 字を引いた後も 296 字残る)。追補後の実測 (設計担当、共有 runner): MCP lib 100 件 PASS、ヘルプ 2 本 1,295 字、7 本 5,361 字、最大 tools/list 47,192 字で草案どおり。`stack_script` は第 1 段に残す (§10 の移動の条件に当たらない)。第 2 段で tool を足す前に枠の整理が要る (§11)。
 
 区切り C のテスト (設定は、編集 → 確定 → 効果までを通しで確かめる):
 

@@ -112,6 +112,61 @@ fn help_extraction_keeps_only_main_body_and_converts_html() {
 }
 
 #[test]
+fn help_empty_overview_is_omitted_without_reusing_or_renumbering_ids() {
+    // h1 supplies the page title, but belongs to the first h2 section here.
+    let source = "<main class='content'> \n<nav>menu</nav><h2 id='first'>First</h2><h1>Title</h1><p>Body</p><h2>Second</h2><p>More</p></main>";
+    let page = help_build::extract_page("start.html", source).unwrap();
+    assert_eq!(
+        page.sections
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>(),
+        ["start.html#first", "start.html#2"]
+    );
+    assert!(
+        page.sections
+            .iter()
+            .all(|s| s.parts.iter().any(|p| !p.is_empty()))
+    );
+    let generated = help_build::generate(&[page]);
+    assert!(!generated.contains("start.html#0"));
+    // A numeric h2 id cannot take the reserved overview id, even if empty.
+    let collision = source.replace("id='first'", "id='0'");
+    assert!(
+        help_build::extract_page("start.html", &collision)
+            .unwrap_err()
+            .contains("duplicate help id")
+    );
+    let no_anchor = source.replace(" id='first'", "");
+    let page = help_build::extract_page("start.html", &no_anchor).unwrap();
+    assert_eq!(page.sections[0].id, "start.html#1");
+    assert_eq!(page.sections[1].id, "start.html#2");
+}
+
+#[test]
+fn help_page_listings_and_search_do_not_expose_empty_sections() {
+    let has_body = |id: &str| {
+        PAGES
+            .iter()
+            .flat_map(|p| p.sections)
+            .find(|s| s.id == id)
+            .is_some_and(|s| s.parts.iter().any(|p| !p.trim().is_empty()))
+    };
+    for page in PAGES {
+        let result = call("get_help", json!({"id":page.id})).unwrap();
+        for row in result["structuredContent"]["sections"].as_array().unwrap() {
+            assert!(has_body(row["id"].as_str().unwrap()), "{row}");
+        }
+    }
+    for query in ["概要", "の", "mIV", "設定"] {
+        let result = call("search_help", json!({"query":query,"limit":30})).unwrap();
+        for row in result["structuredContent"]["results"].as_array().unwrap() {
+            assert!(has_body(row["id"].as_str().unwrap()), "{row}");
+        }
+    }
+}
+
+#[test]
 fn help_extraction_fails_on_missing_inputs_or_duplicate_ids() {
     let fixture = tempfile::tempdir().unwrap();
     let missing = fixture.path().join("absent");
@@ -423,7 +478,7 @@ fn help_tool_definitions_stay_short() {
         total += chars;
     }
     assert!(
-        total <= 2_500,
+        total <= 1_300,
         "Leave room for the other five stage-1 tools: {total}"
     );
     assert!(crate::INSTRUCTIONS.contains("call search_help/get_help first"));
