@@ -29,6 +29,8 @@ use windows::{
 };
 
 const IO_TIMEOUT_MS: u32 = 5_000;
+// Includes peers waiting for EOF after their reply. Never queue or retry overflow.
+const MAX_PEERS: usize = 4;
 
 fn windows_io_error(error: windows::core::Error) -> io::Error {
     // Retain Win32 disconnect codes both at I/O start and at overlapped completion.
@@ -77,6 +79,69 @@ pub struct Stream {
     stop: Option<Arc<Stop>>,
 }
 
+/// The retained JoinHandles are both the capacity count and the lifetime owners.
+/// No separate permit/counter can release a slot before its worker has finished.
+struct PeerWorkers {
+    stop: Arc<Stop>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+}
+impl PeerWorkers {
+    fn new(stop: Arc<Stop>) -> Self {
+        Self {
+            stop,
+            workers: Vec::new(),
+        }
+    }
+    fn accept(
+        &mut self,
+        server: &mut Server,
+        security: Option<&SECURITY_ATTRIBUTES>,
+        deliver: Arc<impl Fn(crate::Request) -> bool + Send + Sync + 'static>,
+        log: Arc<impl Fn(io::Error) + Send + Sync + 'static>,
+    ) -> io::Result<()> {
+        server.pending.connect()?;
+        // Reap AFTER accept: peers may have closed while the listener was waiting.
+        for index in (0..self.workers.len()).rev() {
+            if self.workers[index].is_finished() {
+                let _ = self.workers.swap_remove(index).join();
+            }
+        }
+        if self.workers.len() >= MAX_PEERS {
+            // No reply, reader, worker, or activation is created for an overflow peer.
+            // Reuse this listening instance instead of allocating another for each refusal.
+            server.pending.disconnect();
+            log(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "browser peer limit reached",
+            ));
+            return Ok(());
+        }
+        let mut pipe = server.take_connected(security)?;
+        let stop = self.stop.clone();
+        self.workers.push(
+            std::thread::Builder::new()
+                .name("miv-browser-view-peer".into())
+                .spawn(move || {
+                    if let Err(error) = pipe.serve_until_closed(|request| deliver(request)) {
+                        if !stop.is_set() {
+                            log(error);
+                        }
+                    }
+                })?,
+        );
+        Ok(())
+    }
+}
+impl Drop for PeerWorkers {
+    fn drop(&mut self) {
+        // Also retire every peer on an accept/spawn failure, without detached reads.
+        self.stop.signal();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
 /// Retain a listening instance while each connected instance owns its reply/EOF wait.
 /// The successor is created before handing off the previous handle, so the pipe name
 /// stays owned throughout the handoff (FIRST_PIPE_INSTANCE is only used once).
@@ -98,14 +163,13 @@ impl Server {
         })
     }
 
-    fn accept(&mut self, security: Option<&SECURITY_ATTRIBUTES>) -> io::Result<Stream> {
-        self.pending.connect()?;
+    fn take_connected(&mut self, security: Option<&SECURITY_ATTRIBUTES>) -> io::Result<Stream> {
         let next = Stream::create_server(&self.name, self.stop.clone(), security, false)?;
         Ok(std::mem::replace(&mut self.pending, next))
     }
 
-    /// Security must stay valid for this call. Each peer has its own worker; an open
-    /// peer cannot hold up accept. Stop cancels every peer and joins them before return.
+    /// Security must stay valid for this call. At most four peers retain workers;
+    /// overflow is disconnected without a reply. Stop cancels and joins every peer.
     pub fn run(
         mut self,
         security: Option<&SECURITY_ATTRIBUTES>,
@@ -114,44 +178,15 @@ impl Server {
     ) -> io::Result<()> {
         let deliver = Arc::new(deliver);
         let log = Arc::new(log);
-        let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
-        let result = (|| {
-            while !self.stop.is_set() {
-                // Reap completed connections rather than retaining their handles forever.
-                for index in (0..workers.len()).rev() {
-                    if workers[index].is_finished() {
-                        let _ = workers.swap_remove(index).join();
-                    }
-                }
-                let mut pipe = match self.accept(security) {
-                    Ok(pipe) => pipe,
-                    Err(_) if self.stop.is_set() => break,
-                    Err(error) => return Err(error),
-                };
-                let deliver = deliver.clone();
-                let log = log.clone();
-                let stop = self.stop.clone();
-                workers.push(
-                    std::thread::Builder::new()
-                        .name("miv-browser-view-peer".into())
-                        .spawn(move || {
-                            if let Err(error) = pipe.serve_until_closed(|request| deliver(request))
-                            {
-                                if !stop.is_set() {
-                                    log(error);
-                                }
-                            }
-                        })?,
-                );
+        let mut peers = PeerWorkers::new(self.stop.clone());
+        while !self.stop.is_set() {
+            match peers.accept(&mut self, security, deliver.clone(), log.clone()) {
+                Ok(()) => {}
+                Err(_) if self.stop.is_set() => break,
+                Err(error) => return Err(error),
             }
-            Ok(())
-        })();
-        // Also retire existing peers on an accept/spawn failure. No detached read survives.
-        self.stop.signal();
-        for worker in workers {
-            let _ = worker.join();
         }
-        result
+        Ok(())
     }
 }
 

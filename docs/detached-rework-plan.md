@@ -1534,6 +1534,14 @@ P1 修正の再検証は設計担当から190件中189件成功・activation 回
 
 単一 instance の受付 loop を EOF 待ちで塞がないよう、次の待受を確保してから接続を worker に引き渡す transport owner に集約した。接続ごとの reader／reply／close はその worker が持ち、共通 stop で native operation を解除し、全 worker を join してから listener を終える。既存の DACL と要求受付 callback を使い、App field・viewport／HWND の同定・用途・placement・activation event は変更しない。実 pipe の遅延読込・次の受付・client close・stop の回帰を追加し、既存テストを維持する。通信終端の所有境界の修正であり、detached の時間窓や症状 guard ではない。今回のビルド・テスト・P1 再レビューは引き継ぎ待ち。
 
+**段階5の独立レビュー P2 修正 (2026-11-22、再検証・再レビュー待ち)**
+
+`fb20fbbe5` の独立レビューでは応答保持の P1 は解消、構造に合意。保持 peer の資源量が無制限な P2 には、設計担当の指定どおり固定4件の上限を置いた。容量と寿命は `PeerWorkers` の JoinHandle 集合が持ち、受付後に終了済み worker を回収してから判定する。満杯の接続は応答・worker・activation を作らず切断し、待受 instance を再利用して listener を継続する。まれな失敗として既存の client の失敗通知に合流し、再試行・待ち行列・設定項目は足さない。停止とエラー時は同じ owner が全 worker を stop／join する。
+
+実 pipe で上限の拒否・listener 存続・close 後の枠の回収を検査する2回帰を追加し、既存の停止回帰は4件保持へ強化した。P1 の期限なし・停止可能な EOF 待ちは維持する。App field・viewport／HWND の同定・用途・placement・既存の activation event に変更はない。transport の資源所有に上限を置く変更であり、時間窓や症状 guard ではない。今回のビルド・テスト・P2 再レビューは引き継ぎ待ち。
+
+P2 修正の再検証は設計担当から共有 crate の17件中16件成功・手動の枠回収テスト1件失敗、本体 lib の127件成功の報告があった。テストが再利用 instance の接続待ちを始める前に client open を行っていた確認手順の誤りであり、製品コードは変更しない。テストは OS の待受状態・connect 完了・client thread の join で順序を確定し、worker 終了は既存の is_finished を使う形に修正した。sleep・再試行・assert の弱化、製品への時間窓や追加状態はない。今回のテスト修正の再実行は引き継ぎ待ち。
+
 ### 2026-11-21: 絞り込みの変更で一覧を読み直さない・AI の絞り込みを一覧全体の取得の証明へ (§1.835、実装済み・自動検証済み・実機未確認)
 
 **変更の内容**

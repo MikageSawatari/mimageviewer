@@ -509,6 +509,15 @@ launcher、core の双方で同じ要求を配送でき、版不一致を launch
 - 実 pipe の回帰を3件追加した。`browser818_ipc_delayed_reply_read_keeps_complete_response_and_accepts_other_peers` は PeekNamedPipe で応答が書かれたことだけを確認し、未読応答を保持したまま別 peer の要求を完了してから元の応答を検査する。Queued と VersionMismatch を検査し、client close 後の次の接続も通す。`browser818_ipc_client_close_releases_reply_wait_without_stop` は stop 無しの client close が終端を解放すること、`browser818_ipc_stop_joins_reply_waiters_with_clients_still_open` は client を開いたまま stop で全 peer と accept が終了することを検査する。desktop／前面化の操作はしない。
 - 共有 crate の新旧テスト filter は `browser818_ipc|browser818_cli`。本体は `single_instance::browser_view::tests|single_instance::tests`、launcher は既存の `browser818_ipc|browser818_cli` を引き継ぐ。今回のビルド・テストは未実行、cargo は最後の fmt のみ。再実行と P1 の再レビューは設計担当へ引き継ぐ。
 
+**段階5の独立レビュー P2 修正 (2026-11-22、再検証・再レビュー待ち)**
+
+- `fb20fbbe5` の独立レビューで応答終端の P1 は解消・構造に合意。同時に保持する peer の資源量が無制限だったため P2 で REVISE。設計担当の指定どおり、EOF 待ちを含む保持接続を固定4件に制限する。設定にはせず、満杯ではその接続に応答せず切断・ログを残し、listener は次の接続を受け付け続ける。client 側は既存の失敗・再起動案内に合流し、再試行や待ち行列は加えない。
+- transport の `PeerWorkers` が JoinHandle の集合を容量と寿命の正本として持つ。接続の受付後に終了済み worker を join・除去してから容量を判定するため、accept 待ち中に閉じた peer の枠も回収できる。別の permit／カウンターは足さない。Drop は共通 stop を signal して全 worker を join し、accept／spawn のエラーでも同じ所有者が後始末する。保持 worker は最大4で、満杯時は待受 instance を切断・再利用し、新しい instance・worker・reader・activation 要求を作らない。受理時だけ次の待受を確保して接続を引き渡すので、server が保持する pipe instance も4 peer と待受1本の範囲に収まる。
+- `browser818_ipc_peer_limit_rejects_without_reply_and_keeps_listener_alive` を追加し、実 pipe で4接続を保持したまま追加接続を繰り返し拒否し、応答が1 byte も無いことと listener の存続を検査する。`browser818_ipc_peer_limit_recovers_slot_after_completed_close` は production と同じ admission owner に実 pipe を渡す。満杯では同じ待受 handle を再利用して worker 数も配送数も増えないこと、拒否された client の handle を保持しても受付を続けられることを検査する。閉じた worker の完了を実 handle で確認した後、枠を回収して次の要求を受けることも2回検査する。拒否要求の再試行や時間窓でテストを通さない。
+- 既存の `browser818_ipc_stop_joins_reply_waiters_with_clients_still_open` は保持数を2から4へ強化し、上限まで保持した EOF 待ちと次の accept が停止で終了・全 join されることを検査する。P1 の遅延読込テストは維持する。wire・CLI・launcher／core client・既存 open-path／activation event は変更しない。今回のビルド・テストは未実行、cargo は最後の fmt のみ。共有 crate の `browser818_ipc|browser818_cli` を設計担当へ引き継ぐ。
+
+P2 修正の再検証では設計担当から共有 crate の17件中16件成功・枠回収テスト1件失敗、本体 lib の127件成功の報告があった。失敗はテスト側の接続順序の誤り。手動で admission owner を進めるテストが、同じスレッドで切断済み instance の `ConnectNamedPipe` を開始する前に次の client open を行い、ERROR_PIPE_BUSY になっていた。製品の listener は次の loop で接続待ちを開始する。テストは client を並行実行し、テスト専用の1回の WaitNamedPipeW と connect 完了／client thread の join で待受・接続の事実を確認してから、従来どおり要求を事前に書いて admission を通す形に修正した。同じ待受再利用を通る service fixture と上限拒否テストも、OS の待受状態を確認してから1回だけ open する。worker 終了は既存の JoinHandle::is_finished で待ち、sleep・接続の再試行・assert の弱化はない。製品コードは変更せず、今回のテスト修正の再実行は設計担当へ引き継ぐ。
+
 ### 段階6：中継 exe と同梱経路
 
 **範囲**
