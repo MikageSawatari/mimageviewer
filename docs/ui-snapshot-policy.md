@@ -1,5 +1,12 @@
 # UI スナップショットテスト運用方針
 
+§1.818 段階7のブラウザ連携は、純粋 renderer に固定の worker snapshot と入力文字列を渡す。
+`browser818_preferences_light`、`browser818_preferences_dark_long_path`、
+`browser818_preferences_unavailable`、`browser818_preferences_processing` の4定義（560×460）を追加した。
+App・実環境・レジストリ・フォルダ picker は使用しない。integration の `ui_snapshot` binary は既存の gpu group 対象。
+PNG は未生成・未目視。設計担当が対象4件だけ `UPDATE_SNAPSHOTS=1` で生成し、欠け・重なり・明暗・長いパスを目視後、通常比較を行う。
+設定の採用、worker 完了の回収、場所▼の条件と順序は別の状態／handler 回帰で検査する。
+
 §1.823〜§1.826 の拡張では、環境設定fixtureの定義を更新した。既存の
 `fullscreen_in_page_scroll_settings_light_default` / `fullscreen_in_page_scroll_settings_dark_enabled`
 は540×220から540×340へ拡大し、滑らかな移動と N 字 / Z 字の移動量の行を加える。

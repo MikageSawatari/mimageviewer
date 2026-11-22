@@ -54,6 +54,17 @@ pub fn location_menu_entries(settings: &Settings) -> Vec<LocationMenuEntry> {
 }
 
 /// Main-only destination; never changes the shared Remote location enumeration.
+pub(crate) fn main_capture_locations(
+    settings: &Settings,
+    browser_default: Option<PathBuf>,
+) -> Vec<QuickLocation> {
+    main_capture_locations_from(
+        settings,
+        main_clipboard_capture_location(settings),
+        browser_default,
+    )
+}
+
 pub(crate) fn main_clipboard_capture_location(settings: &Settings) -> Option<PathBuf> {
     main_clipboard_capture_location_from(settings, crate::clipboard_capture::default_destination())
 }
@@ -70,6 +81,30 @@ fn main_clipboard_capture_location_from(
     } else {
         None
     }
+}
+
+/// Cached main-only rows. Remote continues to use location_menu_entries unchanged.
+fn main_capture_locations_from(
+    settings: &Settings,
+    clipboard_default: Option<PathBuf>,
+    browser_default: Option<PathBuf>,
+) -> Vec<QuickLocation> {
+    let mut rows = Vec::new();
+    if let Some(path) = main_clipboard_capture_location_from(settings, clipboard_default) {
+        rows.push(QuickLocation {
+            label: "クリップボード取り込み",
+            path,
+        });
+    }
+    if settings.browser_integration_enabled
+        && let Some(path) = settings.browser_view_output_dir.clone().or(browser_default)
+    {
+        rows.push(QuickLocation {
+            label: "ブラウザ閲覧",
+            path,
+        });
+    }
+    rows
 }
 
 fn location_menu_entries_from(
@@ -353,6 +388,55 @@ pub fn available_drives() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn browser818_location_main_rows_keep_clipboard_then_browser_and_remote_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let mut settings = crate::settings::Settings::default();
+        let remote =
+            super::location_menu_entries_from(&settings, None, None, None, None, None, vec![]);
+        for clipboard in [false, true] {
+            for browser in [false, true] {
+                settings.clipboard_capture_image_enabled = clipboard;
+                settings.browser_integration_enabled = browser;
+                let rows = super::main_capture_locations_from(
+                    &settings,
+                    Some(root.path().join("clipboard")),
+                    Some(root.path().join("browser")),
+                );
+                let expected: Vec<_> = [
+                    (clipboard, "クリップボード取り込み"),
+                    (browser, "ブラウザ閲覧"),
+                ]
+                .into_iter()
+                .filter_map(|(enabled, label)| enabled.then_some(label))
+                .collect();
+                assert_eq!(
+                    rows.iter().map(|row| row.label).collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(
+                    super::location_menu_entries_from(
+                        &settings,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        vec![]
+                    ),
+                    remote
+                );
+            }
+        }
+        settings.browser_view_output_dir = Some(root.path().join("explicit"));
+        let rows = super::main_capture_locations_from(&settings, None, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, root.path().join("explicit"));
+        settings.browser_view_output_dir = None;
+        assert!(super::main_capture_locations_from(&settings, None, None).is_empty());
+        assert!(!root.path().join("explicit").exists());
+        assert!(!root.path().join("browser").exists());
+    }
     #[test]
     fn clipboard_capture_location_is_main_only_and_either_switch_enables_it() {
         let mut settings = crate::settings::Settings::default();

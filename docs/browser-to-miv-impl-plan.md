@@ -685,6 +685,16 @@ portable・明示 `--data-dir`・launcher 不明の起動は、既存登録も�
 
 登録が UI を止めず、既定 profile だけが登録の持ち主になり、保存先変更と host 設定が同じ操作として確定すること。
 
+**段階7の実装引き継ぎ（自動検証待ち）**
+
+- `src/browser_integration/` に登録 backend と root の単一 owner を配置。準備・登録／解除・保存先操作・既定先解決・registry・copy/hash・掃除は worker。利用不可時は登録へ触れない。起動時の有効な登録は同じ世代／設定／host hash なら再利用する。
+- UI は「起動と連携」の取り込みの次に置き、操作ごとに反映する。設定を閉じても process-global poll が完了を回収する。場所▼も取り込みの直後、通常の位置と末尾 fallback の両方へ追加し、Remote は変更しない。
+- 受付済みの登録／保存先の値は処理中の要求が持ち、環境設定の未保存の編集には重ねて残さない。処理中の表示はその要求を参照する。失敗時、まだ同じ画面が開いていて別の編集がなければ、要求の値を編集欄へ戻して通知する（登録の rollback・自動再試行はしない）。
+- 前提確認で `Settings::save_checked` が同期の全体保存であること、`SAVE_GENERATION` が全項目の保存証明であることを確認した。UI から新たな同期保存を呼ばず、worker の2キー保存を追加。root 採用後に保存し、全体保存の世代は進めない。初回バックアップの claim と保存は全体保存と共通の gate で直列化する。新規2キーは未リリースで DB スキーマの変更・移行はない。
+- 設定ファイルの import で新規2項目が変わる場合も同じ worker へ合流する。処理中／利用不可ならその2項目は採用せず通知し、既存の他項目の適用は維持する。
+- installer は usPostUninstall で自己 manifest を指す HKCU だけを解除し、管理フォルダを reparse point をたどらず削除する。画像の保存先と拡張は対象外。実行アカウント以外の登録は残る旨を UI に表示する。
+- UI の新規文言あり。`check_ui_glyphs.py` と Rust の各 filter、4件の snapshot の生成・目視・通常比較、Inno のビルドは設計担当へ引き継ぐ。cargo は最後の fmt のみとし、コンパイル・テスト・実登録・製品起動は行わない。
+
 ### 段階8：製品の拡張とストア別 ZIP
 
 **範囲**
@@ -763,6 +773,7 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
 - 開発ビルド・テスト文書、`CLAUDE.md` の同梱本数・ビルド順
 - `docs/release-checklist.md`
 - 日本語・英語マニュアルの新規ブラウザ連携ページ、目次・設定案内
+  - ページは `htdocs/mimageviewer/manual/browser-integration.html` (英語版も同じ名前)、拡張の入れ方の節の id は `install-extension`。環境設定の「拡張の入れ方 (マニュアル)」のリンクがこの 2 つを指す (`src/ui_dialogs/preferences/browser_integration.rs` の定数、2026-11-22 統括の決定)。ストアの URL は本体に書かず、この節だけに書く。ストアでの公開前は、この節に「公開準備中」と書く (本体の画面には書かない。公開後に古い文言が残るため)
 - `htdocs/mimageviewer/privacy.html`
 - 製品ページ日本語・英語
 - 配布 readme

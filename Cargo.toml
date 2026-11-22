@@ -392,6 +392,7 @@ winreg = "0.52"
 
 [dependencies]
 mimageviewer-capture-file = { path = "crates/capture-file" }
+mimageviewer-browser-host = { path = "crates/browser-host" }
 mimageviewer-browser-view-ipc = { path = "crates/browser-view-ipc" }
 miv-startup = { path = "crates/startup-diagnostics" }
 eframe = { version = "0.37.0", features = ["wgpu", "glow"] }

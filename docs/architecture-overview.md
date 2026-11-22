@@ -1291,3 +1291,11 @@ worker・queue・context owner・永続 schema は追加しない。
 `App` のインライン領域は `app::tests::history_transition_storage_keeps_app_stack_footprint_bounded` で上限110,000バイトを保つ。大きな低頻度状態は、描画や入力の hot な状態と混ぜず、既存ownerのままヒープに置く。
 `export_dialog` と `book_reorder` はダイアログを開くときだけ `Option<Box<...>>` を作り、描画中の take／再挿入では同じBoxを保持する。書き出しは検証を通った開始時にだけ中身をworker要求へ移す。
 `settings_restore_state` はApp生成時に一度だけBoxを確保する。非表示中の完了poll・取消・終了処理は維持し、状態のリセットはBoxの中身へ代入する。毎フレームの再確保や初期化の先送りは行わない。
+
+## ブラウザ連携の登録（§1.818 段階7）
+
+`browser_integration` は App の process-global owner。viewer context に載せず、起動時の準備・登録・解除・保存先変更を一件ずつ worker へ渡す。
+UI は利用不可／準備中／利用可能／処理中の snapshot と、解決済み保存先だけを描く。完了は root update の早期 return より前に回収し、設定画面の閉鎖と独立させる。
+登録世代を完成して固定 manifest を原子的に置換し、Chrome／Edge の HKCU に同じ manifest を登録する。掃除は exe の削除が通った世代だけ。reparse point はたどらない。
+新規2設定の永続化は worker の2キー transaction。登録成功後に root の live 値・開いている設定 draft を合わせ、その後保存する。全体保存の `SAVE_GENERATION` は進めず、初回バックアップの claim と書込は従来の全体保存と共通の write gate で直列化する。
+場所▼は main 専用の capture 行 renderer へ clipboard → browser の順で追加し、Remote の共有列挙は変えない。

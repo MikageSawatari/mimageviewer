@@ -13432,15 +13432,16 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
     /// フォルダバー (アドレス行) の設定メニュー (v2.0.0 Phase 3, 実機フィードバック 2026-06-20)。
     /// アドレスバー左端の「フォルダ:」ラベル右クリック、および「設定」メニュー → ツールバー →
     /// フォルダバーの設定 から開く。入力欄と付属操作を一体で並べ替える。
-    /// Place menu entry for the clipboard capture folder. Returns true when clicked
+    /// Main-only capture folder row. Returns true when clicked
     /// (the caller closes the menu).
-    fn draw_clipboard_capture_location_button(
+    fn draw_capture_location_button(
         &mut self,
         ui: &mut egui::Ui,
+        label: &str,
         destination: std::path::PathBuf,
     ) -> bool {
         let clicked = ui
-            .button("クリップボード取り込み")
+            .button(label)
             .hover_tip(destination.to_string_lossy().to_string())
             .clicked();
         if clicked {
@@ -16657,10 +16658,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                             let location_entries = location_entries.clone();
                             // Main-window only (not part of the shared list used by mIV Remote):
                             // shown right below 本棚フォルダ (before 整理先 and the quick locations).
-                            let mut clipboard_capture_location =
-                                crate::known_folders::main_clipboard_capture_location(
-                                    &app.settings,
-                                );
+                            let mut capture_locations = Some(crate::known_folders::main_capture_locations(
+                                &app.settings,
+                                app.browser_integration.default_output(),
+                            ));
                             for entry in location_entries {
                                 if matches!(
                                     entry,
@@ -16668,10 +16669,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         | crate::known_folders::LocationMenuEntry::Separator
                                         | crate::known_folders::LocationMenuEntry::QuickLocation(_)
                                         | crate::known_folders::LocationMenuEntry::DriveRoot(_)
-                                ) && let Some(destination) = clipboard_capture_location.take()
-                                    && app.draw_clipboard_capture_location_button(ui, destination)
-                                {
-                                    ui.close();
+                                ) && let Some(locations) = capture_locations.take() {
+                                    for location in locations {
+                                        if app.draw_capture_location_button(ui, location.label, location.path) { ui.close(); }
+                                    }
                                 }
                                 match entry {
                                     crate::known_folders::LocationMenuEntry::DriveList => {
@@ -16788,10 +16789,10 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     }
                                 }
                             }
-                            if let Some(destination) = clipboard_capture_location.take()
-                                && app.draw_clipboard_capture_location_button(ui, destination)
-                            {
-                                ui.close();
+                            if let Some(locations) = capture_locations.take() {
+                                for location in locations {
+                                    if app.draw_capture_location_button(ui, location.label, location.path) { ui.close(); }
+                                }
                             }
                         },
                     )

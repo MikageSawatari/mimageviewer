@@ -90,6 +90,61 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+// Delete only our managed tree, never follow a junction into user data.
+procedure RemoveBrowserHostTree(const Dir: String);
+var
+  FindRec: TFindRec;
+  Child: String;
+begin
+  if FindFirst(Dir + '\*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          Child := Dir + '\' + FindRec.Name;
+          if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+          begin
+            if (FindRec.Attributes and $400) = 0 then RemoveBrowserHostTree(Child);
+            RemoveDir(Child);
+          end
+          else DeleteFile(Child);
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+  RemoveDir(Dir);
+end;
+
+procedure RemoveBrowserRegistration;
+var
+  Root, Manifest, Key, Value: String;
+  Index: Integer;
+  FindRec: TFindRec;
+begin
+  Root := ExpandConstant('{userappdata}\mimageviewer\browser-host');
+  Manifest := Root + '\to.mikage.mimageviewer.json';
+  for Index := 0 to 1 do
+  begin
+    if Index = 0 then Key := 'Software\Google\Chrome\NativeMessagingHosts\to.mikage.mimageviewer'
+    else Key := 'Software\Microsoft\Edge\NativeMessagingHosts\to.mikage.mimageviewer';
+    if RegQueryStringValue(HKCU, Key, '', Value) and (CompareText(Value, Manifest) = 0) then
+      RegDeleteKeyIncludingSubkeys(HKCU, Key);
+  end;
+  // This is the uninstalling account only; other accounts unregister in mIV.
+  if FindFirst(Root, FindRec) then
+  begin
+    try
+      if (FindRec.Attributes and $400) = 0 then RemoveBrowserHostTree(Root)
+      else RemoveDir(Root);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   AppDataDir: String;
@@ -97,6 +152,7 @@ var
 begin
   if CurUninstallStep = usPostUninstall then
   begin
+    RemoveBrowserRegistration;
     AppDataDir := ExpandConstant('{userappdata}\mimageviewer');
     if DirExists(AppDataDir) then
     begin

@@ -2812,3 +2812,10 @@ mutex外で`with_viewer_context_ref`/`with_viewer_context_state`によりparked�
 Current/Next共有素材・DisplayPrepared・legacy・Unknown・held/receipt/batchは保護し、実計算中のpermit/予約は終了まで保持する。
 park単独では取消しない。最新callbackは位置別結果を一体で置換し、Previous Nativeは全削除規則の除去ゼロを検査する。
 新しいqueue/ready latch/全頁・全registry走査や同期I/Oは追加しない。詳細と検証状況は[計画 §27.17.21](page-turn-animation-plan.md)。
+
+## ブラウザ連携の登録 worker（§1.818 段階7）
+
+`App::browser_integration` が単一の状態所有者。準備・登録・解除・保存先の検証／変更・フォルダ picker・フォルダを開く処理は worker に置き、UI は try_recv と snapshot の描画だけを行う。
+root の既存 process-global poll 区間で完了を回収するので、環境設定を閉じた後や fullscreen の early return でも結果を落とさない。処理中の追加要求は拒否し、再試行・rollback・待ち行列は作らない。
+登録の結果を live Settings へ採用してから別 worker で2項目を永続化する。この間も同じ owner の処理中状態を保つ。全体設定の古い snapshot は保存しない。設定ファイルから取り込んだ新規2項目も、OK 時に同じ owner を通す（既存の他項目の適用は維持）。
+まれな失敗はログと通知で割り切る。保存失敗でも登録を巻き戻さず、通常の設定・画像・使用中の世代を破棄しない。

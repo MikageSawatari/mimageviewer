@@ -4118,6 +4118,7 @@ dependencies = [
  "log",
  "lopdf",
  "mimageviewer-agent-ipc",
+ "mimageviewer-browser-host",
  "mimageviewer-browser-view-ipc",
  "mimageviewer-capture-file",
  "mimageviewer-ipc",

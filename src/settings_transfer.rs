@@ -610,6 +610,8 @@ preferences_policy! {
         capture_output_dir => "起動・保存・整理先の PC 固有パス";
         book_root => "起動・保存・整理先の PC 固有パス";
         clipboard_capture_output_dir => "起動・保存・整理先の PC 固有パス";
+        browser_view_output_dir => "起動・保存・整理先の PC 固有パス";
+        browser_integration_enabled => "ブラウザ連携の登録は PC ごとの状態で、移行先を維持";
         active_book_name => "利用データ・登録先・履歴・検索対象";
         pinned_books => "同上";
         conceal_type => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -2411,7 +2413,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 507);
+        assert_eq!(entries.len(), 509);
         assert_eq!(
             entries
                 .iter()
@@ -2424,7 +2426,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            339
+            341
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());

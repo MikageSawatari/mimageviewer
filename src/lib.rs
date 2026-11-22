@@ -359,6 +359,7 @@ pub mod post_operation_selection;
 // (`clashing_extern_declarations` 対策)。
 mod agent_ipc;
 mod agent_registration;
+mod browser_integration;
 pub(crate) mod page_edit_write_epoch;
 mod process_images;
 #[cfg(all(test, windows))]
@@ -455,6 +456,8 @@ pub mod ui_dialogs;
 mod ui_sns_split;
 #[doc(hidden)]
 pub use ui_dialogs::clipboard_capture::draw_capture_selection_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_browser_integration_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_dialogs::preferences::draw_clipboard_capture_html_settings_snapshot_fixture;
 #[doc(hidden)]

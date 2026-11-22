@@ -1052,6 +1052,34 @@ impl SettingsDb {
         )
     }
 
+    /// Worker-only browser registration write; never serializes an old Settings
+    /// snapshot over unrelated settings or touches the permission epoch.
+    pub(crate) fn save_browser_integration(
+        &self,
+        enabled: bool,
+        output: &Option<PathBuf>,
+    ) -> Result<(), SettingsDbError> {
+        let mut inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        if !existing_bootstrap_marker_present(&inner.conn)?
+            || !singleton_endpoint_marker_present(&inner.conn)?
+        {
+            return Err(SettingsDbError::SaveSuppressed);
+        }
+        read_singleton_endpoint_settings(&inner.conn)?;
+        let tx = inner.conn.transaction()?;
+        for (key, value) in [
+            (
+                "browser_integration_enabled",
+                serde_json::to_string(&enabled)?,
+            ),
+            ("browser_view_output_dir", serde_json::to_string(output)?),
+        ] {
+            tx.execute("INSERT INTO settings_kv(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// `Settings` を全テーブルに書き出す。
     ///
     /// rotation には触れない (= bootstrap save と user save 両方が共有)。

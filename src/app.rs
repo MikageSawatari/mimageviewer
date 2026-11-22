@@ -19752,6 +19752,7 @@ pub struct App {
     /// Process-global Windows file clipboard observation. Viewer contexts only read the
     /// normalized path snapshot; OS listener/reader ownership stays outside every bundle.
     pub(crate) cut_clipboard: crate::cut_clipboard::CutClipboardObserver,
+    pub(crate) browser_integration: crate::browser_integration::BrowserIntegration,
     pub(crate) clipboard_capture_service: crate::clipboard_capture::ClipboardCaptureService,
     pub(crate) capture_fetch_service: Option<crate::clipboard_capture::fetch::CaptureFetchService>,
     pub(crate) capture_selection: Option<crate::ui_dialogs::clipboard_capture::CaptureSelection>,
@@ -22100,6 +22101,7 @@ impl App {
             placement_slot: None,
             activation_listener: None,
             cut_clipboard: crate::cut_clipboard::CutClipboardObserver::default(),
+            browser_integration: crate::browser_integration::BrowserIntegration::default(),
             clipboard_capture_service: crate::clipboard_capture::ClipboardCaptureService::default(),
             capture_fetch_service: {
                 #[cfg(not(test))]
@@ -103806,6 +103808,7 @@ impl eframe::App for App {
         // returns so every viewer observes the same cut snapshot in the first repaint.
         self.cut_clipboard.poll();
         self.poll_clipboard_capture(ctx);
+        self.poll_browser_integration(ctx);
         self.poll_vlm_setup(ctx);
         self.poll_depth_setup(ctx);
         #[cfg(windows)]
