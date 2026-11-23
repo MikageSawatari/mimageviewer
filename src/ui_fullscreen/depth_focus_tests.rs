@@ -544,6 +544,7 @@ fn depth_focus_highlight_repaints_stationary_mouse_but_not_hidden_minimized_or_e
                     &viewer.ctx,
                     &payload,
                     &transform,
+                    &transform,
                     transform.viewport_rect,
                     &FsBgStyle::Solid(egui::Color32::BLACK)
                 ));
@@ -1047,6 +1048,7 @@ fn depth_focus_paint_checks_pass_resource_bounds_lru_and_media_radius() {
                     &viewer.ctx,
                     if case == "mismatch" { &other } else { &payload },
                     &transform,
+                    &transform,
                     transform.viewport_rect,
                     &FsBgStyle::Solid(egui::Color32::BLACK),
                 );
@@ -1086,6 +1088,7 @@ fn depth_focus_paint_checks_pass_resource_bounds_lru_and_media_radius() {
                         &ui.painter().with_clip_rect(clip),
                         &viewer.ctx,
                         &payload,
+                        &transform,
                         &transform,
                         canvas,
                         &FsBgStyle::Solid(egui::Color32::BLACK),

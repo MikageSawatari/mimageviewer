@@ -1641,7 +1641,7 @@ fn depth_actual_touch_page_navigation_ignores_suspended_committed_z_zoom() {
             for phase in [egui::TouchPhase::Start, egui::TouchPhase::End] {
                 assert_eq!(
                     app.fs_zoom_owner(),
-                    crate::ui_fullscreen::FsZoomOwner::Depth
+                    crate::ui_fullscreen::FsZoomOwner::Image
                 );
                 assert_eq!(
                     app.fs_exclusive_view_active(0),
@@ -1689,7 +1689,7 @@ fn depth_actual_touch_page_navigation_ignores_suspended_committed_z_zoom() {
             assert!(app.fs_exclusive_view.is_depth());
             assert_eq!(
                 app.fs_zoom_owner(),
-                crate::ui_fullscreen::FsZoomOwner::Depth
+                crate::ui_fullscreen::FsZoomOwner::Image
             );
             destinations.push(app.items[app.fullscreen_idx.unwrap()].clone());
             depth_key_frame(
@@ -3029,7 +3029,7 @@ fn depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms() {
             assert!(app.fs_exclusive_view.is_depth());
             assert_eq!(
                 app.fs_zoom_owner(),
-                crate::ui_fullscreen::FsZoomOwner::Depth
+                crate::ui_fullscreen::FsZoomOwner::Image
             );
             destinations.push(app.items[app.fullscreen_idx.unwrap()].clone());
             depth_key_frame(

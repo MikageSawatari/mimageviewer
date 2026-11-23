@@ -27,6 +27,46 @@ mod tests {
     use super::*;
     use crate::app::depth_view_tests::{install_pages, install_ready_depth_for_export};
 
+    #[test]
+    fn depth_export_baseline_ignores_shared_zoom_pan_free_rotation_and_fit_policy() {
+        let _input = crate::key_input::lock_test_input();
+        let mut app = setup_app_for_test();
+        let mut viewer = crate::app::depth_main_window_tests::RootDepthViewer::new(&mut app);
+        viewer.ready(&mut app);
+        app.fs_transparent_bg_mode = 2;
+        app.rotation_cache
+            .insert(0, crate::rotation_db::Rotation::Cw90);
+        viewer.frame(&mut app, vec![]);
+        let before = app
+            .capture_depth_export(&viewer.ctx, false)
+            .unwrap()
+            .display;
+        for mode in [
+            crate::settings::FullscreenFitMode::Width,
+            crate::settings::FullscreenFitMode::Original,
+            crate::settings::FullscreenFitMode::SpecifiedScale,
+        ] {
+            app.settings.fullscreen_fit_mode = mode;
+            app.settings.fullscreen_fit_no_upscale = true;
+            app.settings.fullscreen_fit_no_downscale = true;
+            app.fs_zoom = 2.3;
+            app.fs_pan = egui::vec2(50., -30.);
+            app.fs_free_rotation = 0.4;
+            viewer.frame(&mut app, vec![]);
+            let after = app
+                .capture_depth_export(&viewer.ctx, false)
+                .unwrap()
+                .display;
+            assert_eq!(after.uv, before.uv);
+            assert_eq!(after.quarter_turns, before.quarter_turns);
+            assert_eq!(
+                after.paint_size, before.paint_size,
+                "checker scaling uses the baseline Page fit"
+            );
+        }
+        crate::key_input::clear_test_frame();
+    }
+
     fn acquire_request() -> mimageviewer_ipc::SessionAcquireRequest {
         mimageviewer_ipc::SessionAcquireRequest {
             client_id: "depth-export-test".into(),

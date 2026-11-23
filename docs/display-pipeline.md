@@ -16,7 +16,10 @@ Ready の元 texture から GPU blit で `Rgba8Unorm` の色＋mipmapを作り�
 元 texture 自体は書き換えず、final / processed の source ID を深度の鍵とする。
 透過部分の背景は3D中もShift+B／リングで切り替えられ、毎描画の `FsBgStyle` を下地へ反映する。
 AI拡大で背景を焼き込む場合は既存の合成キャッシュ失効によりsource IDが変わり、深度も作り直す。
-mouse / touch の zoom・pan と navigator は Depth 中だけ止め、通常2Dの transform は保持する。
+Depth は通常 2D と zoom・pan・自由回転・fit の表示状態を共有する。入力と配置の確定も共通で、
+描画はフラグメント位置を同じ paint quad の局所座標へ逆写像する。navigator は引き続き出さない。
+Depth 中は閲覧操作からの fit 設定変更と PDF の表示倍率由来の再ラスタ需要を止め、最初の非 Depth 単ページ描画で需要を再照合する。
+書き出しは別に解決した Page fit・変換なしの基準を使う。詳細は [表示変換設計](depth-view-transform-plan.md) §3。
 保存された Z の active / aiming は Depth 中に休止する。入力・cursor・chrome・PDF需要・描画の可否は
 保存flagではなく `fs_zoom_owner()` に基づく実効helperを使い、通常のtouchページ送りを止めない。
 占有 owner、readiness、全入口の分類と検証状況の正本は [3D 設計](depth-parallax-plan.md)。

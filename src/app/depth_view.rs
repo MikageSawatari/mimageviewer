@@ -1184,12 +1184,34 @@ impl App {
         (!labels.is_empty()).then(|| labels.join(" / "))
     }
 
+    /// Same-pass adoption boundary; neither payload preparation nor geometry is involved.
+    pub(crate) fn depth_paint_ready(
+        &mut self,
+        payload: &crate::gpu_lanczos::FullscreenPaintPayload,
+    ) -> bool {
+        #[cfg(windows)]
+        {
+            let ready = self.wgpu_render_state.is_some()
+                && matches!(&self.fs_exclusive_view, FsExclusiveView::Depth(state)
+                    if state.ready().is_some_and(|resource| payload.source_texture()
+                        .is_some_and(|texture| texture.id() == resource.key.texture_id)));
+            if !ready && let FsExclusiveView::Depth(state) = &mut self.fs_exclusive_view {
+                // This pass will paint 2D, so its focus request has no matching source.
+                state.pending_focus_click = None;
+            }
+            ready
+        }
+        #[cfg(not(windows))]
+        false
+    }
+
     pub(crate) fn try_paint_depth(
         &mut self,
         painter: &egui::Painter,
         ctx: &egui::Context,
         payload: &crate::gpu_lanczos::FullscreenPaintPayload,
         transform: &crate::displayed_image_transform::DisplayedImageTransform,
+        export_transform: &crate::displayed_image_transform::DisplayedImageTransform,
         canvas: egui::Rect,
         underlay: &crate::ui_fullscreen::FsBgStyle,
     ) -> bool {
@@ -1235,7 +1257,7 @@ impl App {
             let (offset, moving) = if settings.motion == crate::depth_parallax::MotionKind::Mouse {
                 let moving = state.mouse.update(
                     pointer,
-                    transform.paint_rect,
+                    crate::depth_parallax_wgpu::depth_visible_center(transform, canvas),
                     canvas,
                     pointer.is_some_and(|point| panel.is_some_and(|rect| rect.contains(point))),
                     settings.strength,
@@ -1260,11 +1282,12 @@ impl App {
                 transform.rotation.degrees() as u32 / 90,
                 transform.paint_rect.aspect_ratio(),
             );
+            let mapping = crate::depth_parallax_wgpu::DepthScreenMapping::from_transform(transform);
             let now = std::time::Instant::now();
             if let Some(focus) = focus_click.and_then(|pos| {
                 crate::depth_parallax_wgpu::focus_depth_at(
                     pos,
-                    transform.paint_rect,
+                    mapping,
                     params,
                     resource.depth.width,
                     resource.depth.height,
@@ -1292,6 +1315,7 @@ impl App {
                 key: resource.key,
                 resource_id: resource.resource_id,
                 params,
+                mapping,
                 target_format: render.target_format,
             };
             state.publish(&mut render.renderer.write().callback_resources);
@@ -1301,12 +1325,16 @@ impl App {
                 resource.context,
                 resource.resource_id,
                 self.items_generation,
-                transform,
+                export_transform,
                 underlay,
             );
-            painter.add(egui::Shape::Callback(
-                egui_wgpu::Callback::new_paint_callback(transform.paint_rect, callback),
-            ));
+            let callback_rect = egui::Rect::from_points(&transform.paint_quad().positions)
+                .intersect(painter.clip_rect());
+            if callback_rect.is_positive() {
+                painter.add(egui::Shape::Callback(
+                    egui_wgpu::Callback::new_paint_callback(callback_rect, callback),
+                ));
+            }
             if let Some((fs_idx, edit_key)) = current {
                 state.settled = Some(DepthSettled {
                     fs_idx,

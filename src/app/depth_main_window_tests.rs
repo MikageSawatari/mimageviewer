@@ -460,7 +460,7 @@ fn depth_collapsed_wait_indicator_can_use_the_old_panel_body() {
 }
 
 #[test]
-fn depth_main_window_root_paints_fit_rotation_resize_underlay_without_mutating_2d_transform() {
+fn depth_main_window_root_paints_shared_zoom_rotation_resize_underlay() {
     let _input = crate::key_input::lock_test_input();
     for linked in [false, true] {
         let mut app = setup_app_for_test();
@@ -488,7 +488,7 @@ fn depth_main_window_root_paints_fit_rotation_resize_underlay_without_mutating_2
                     app.fs_transparent_bg_mode = mode;
                     viewer.frame(&mut app, vec![]);
                     let transform = app.fullscreen_page_layout.single_page().unwrap().transform;
-                    assert_eq!(viewer.callbacks(), vec![transform.paint_rect]);
+                    assert_eq!(viewer.callbacks(), vec![transform.hit_rect]);
                     assert_eq!(transform.rotation, rotation);
                     let layout_size = if rotation == crate::rotation_db::Rotation::Cw90 {
                         egui::vec2(600.0, 400.0)
@@ -497,7 +497,10 @@ fn depth_main_window_root_paints_fit_rotation_resize_underlay_without_mutating_2
                     };
                     let screen = viewer.ctx.content_rect();
                     let fit = (screen.width() / layout_size.x).min(screen.height() / layout_size.y);
-                    let expected = egui::Rect::from_center_size(screen.center(), layout_size * fit);
+                    let expected = egui::Rect::from_center_size(
+                        screen.center() + app.fs_pan,
+                        layout_size * fit * app.fs_zoom,
+                    );
                     let tolerance = 1.0 / viewer.ctx.pixels_per_point();
                     assert!(
                         (transform.paint_rect.min - expected.min).abs().max_elem() <= tolerance
@@ -506,12 +509,7 @@ fn depth_main_window_root_paints_fit_rotation_resize_underlay_without_mutating_2
                         "Page fit: expected={expected:?}, actual={:?}",
                         transform.paint_rect
                     );
-                    assert!(
-                        viewer
-                            .ctx
-                            .content_rect()
-                            .contains_rect(transform.paint_rect)
-                    );
+                    assert!(viewer.ctx.content_rect().contains_rect(transform.hit_rect));
                     assert_eq!(
                         (
                             app.fs_zoom,

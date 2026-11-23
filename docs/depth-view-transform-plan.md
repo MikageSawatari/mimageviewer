@@ -448,3 +448,101 @@ PDF は指摘のたびに別の経路が出る形になりかけたので、経�
 ### R4 (2026-11-23、同じセッションの継続、対象 `65aaf97b6`)
 
 判定「**実装開始可**」。R3 の P1 (フィットの設定の受付境界) と P2 (§3.6 の復元) は解消。新しい P1 / P2 / P3 なし。
+
+## 12. CHANGELOG の下書き
+
+未作成。§13 のホイールの前提の食い違いを設計担当へ返し、文言と仕様が決まってから作成する。
+`CHANGELOG.md` は変更していない。
+
+## 13. 実装記録
+
+2026-11-23、`depth-zoom-874`、基点 `a392c9b83`。**未完了。前提の食い違いにより停止した未コミット差分。**
+コンパイル・テストは実行していない。製品の起動・vendor の変更・コミット・push・ブランチ切替は行っていない。
+設計担当が実行する予定の検査へ渡す前に、以下の設計判断と残作業が必要。
+
+### 停止理由: 修飾なしホイールの既定動作
+
+§3.5・§8 と依頼文の「はみ出している間はページ内をスクロールしてから送る」を、すべての設定に対する
+挙動として実装すると、現行 2D と同じにはならない。
+
+- `src/settings.rs::FullscreenWheelAction` の既定は `PageTurn`。
+- `src/ui_fullscreen/in_page_scroll.rs::fs_wheel_segment_in_page_scroll` は、設定が `ScrollThenPageTurn` の場合だけ
+  同名の分類を返す。`PageTurn` は `Legacy` へ進む。
+- `src/ui_fullscreen.rs::apply_fs_wheel_frame_proposal` は、その `Legacy` の修飾なしホイールを
+  `spread_page_nav` に渡す。`spread_page_nav` の単ページ分岐は直接 `FsPageNav::Delta` を返す。
+  拡大によるはみ出しを見てスクロールへ変える判定は、この経路にはない。
+- 既存マニュアルの「端まで読んだらページを送る」も、「スクロール＋ページ送り」を選んだ場合の動作として説明している。
+
+設計担当への判断事項: (A) 2D と同じくホイール設定に従い、マニュアル・下書きの説明を条件付きにするか、
+(B) 3D のホイールを設定によらずスクロール優先にして 2D と異なる規則を持つか。
+A はコードの分類を共有でき、説明とテストの設定を明示する修正が中心。B は共有方針の変更であり、
+設定との優先順位・入力の予測と実適用・既存操作の変更を再設計する必要がある。実装担当では選択していない。
+
+### 途中差分
+
+| ファイル | 入れた変更 |
+| --- | --- |
+| `src/ui_fullscreen.rs` | 2D と同じ変換と zoom owner、Depth の入力抑止の撤去、クリック分類の順序、パネル上での開始除外、PDF 需要の抑止と復帰、素材選択後の配置確定、書き出し基準の別解決 |
+| `src/app/depth_view.rs` | Depth の採用判定を描画から分離、可視外接矩形の追従中心、共有写像による深さの逆引き、callback の外接矩形と clip の交差 |
+| `src/depth_parallax_wgpu.rs`、`src/depth_parallax_wgpu/export.rs` | 絶対フラグメント位置からの逆写像、80 バイト uniform、微分後に画像外を select で透明化、offset の逆回転、書き出しには全体矩形・回転 0 を指定 |
+| `src/depth_parallax.rs` | MouseFollow に呼出元が求めた中心を渡す |
+| `src/app.rs` | PdfRerenderDemand の Depth 抑止の印、復帰時の比較記録の破棄、AI native の倍率条件の例外 |
+| `src/app/gamepad_input.rs` | ピッカーのフィット行の値変更・一覧・プレビュー・確定の受付を Depth 中は止める |
+| `src/ui_fullscreen/depth_view_transform_tests.rs` | 共有状態・クリック・配置・PDF 抑止・ホイール予測・パネルの入力除外のテストを追加 |
+| `src/depth_focus_sampling_tests.rs` | GPU の止まる深さの比較に自由回転を追加 |
+| `src/ui_fullscreen/depth_focus_tests.rs` | 書き出し基準変換を渡す引数へ追従 |
+| `src/ui_fullscreen/depth_tests.rs`、`src/app/depth_view_tests.rs` | Depth が Image の zoom owner を使う期待値へ変更 |
+| `src/ui_fullscreen/initial_placement/tests.rs` | Depth を読み始めの対象外から外す期待値へ変更 |
+| `src/app/depth_main_window_tests.rs` | fit 固定から共有倍率と clip された callback の期待値へ変更 |
+| `src/app/depth_export.rs` | 表示倍率・パン・自由回転・フィット設定が書き出し基準を変えないテストを追加 |
+| `src/app/tests.rs` | AI native の既存テストに Depth 中の倍率非依存の条件を追加 |
+| `docs/depth-parallax-plan.md`、`docs/display-pipeline.md`、`docs/keymap-spec.md` | 変換・入力・PDF・書き出しの説明の途中更新 |
+| `htdocs/mimageviewer/manual/fullscreen.html` | 操作・クリックの規則・共有状態・フィット・書き出しの説明、ページ内スクロールと読み始めの対象外から 3D を削除。ホイールの説明は上の判断待ちで未確定 |
+
+既存テストの期待値を変えた理由は、fit 固定・変換入力停止・読み始め対象外という旧仕様を、本書の共有状態へ
+変更するため。Z の休止、紙めくりとナビゲータの抑止、360° の規則の期待値は維持する。
+
+### §3.5 の分類表 (途中)
+
+**全出現の分類は未完了。** 以下は変更対象の分類のみ。共通の占有述語を含む全出現の一覧を追加する作業が残る。
+
+| 箇所 | 分類 | 途中差分の扱い |
+| --- | --- | --- |
+| `fs_zoom_owner` と `FsZoomOwner::Depth` の dispatch | 2D と同じにする | Image に統合。Depth の判定は Z より先に維持 |
+| 単ページ描画の `zoom_pan`・自由回転・フィット設定・倍率制限 | 2D と同じにする | Depth の強制値を撤去 |
+| `apply_gamepad_fullscreen_zoom` / `_pan`、`predict_fs_wheel_frame` | 2D と同じにする | 共通の占有抑止から 360° だけの抑止へ変更 |
+| `fs_wheel_action_requests_navigation`、ホイール実適用、キャンバスドラッグ | 2D と同じにする | Depth の専用無操作分岐を撤去。ホイール仕様の記述は上記の判断待ち |
+| `plan_fs_canvas_click` | 2D と同じにする / 3D 固有に残す | 変換とリセットは共通、Ctrl の深さ指定は belongs_to_view の抑止前 |
+| フィット循環・上部メニュー・ピッカー | 3D 固有に残す | 閲覧操作のフィット変更を停止。環境設定の画面は例外 |
+| PDF の表示需要・AI native の条件 | 3D 固有に残す | 2 入口で需要を抑止し、最初の非 Depth 単ページ描画で比較記録を破棄して再照合 |
+| リング `ImageZoomMode`・pixel grid・比較 pin・metadata | 3D 固有に残す | 既存の分類を変更しない |
+| パノラマの視線・FOV | 360° 固有のまま | 変更しない |
+
+### 追加したテストと残る検査
+
+追加したテスト (未実行):
+
+- `depth_transform_inputs_keep_the_ready_source_and_share_the_exit_view`
+- `depth_transform_click_classification_focus_and_double_reset_use_the_shared_view`
+- `depth_transform_ready_first_draw_commits_reading_start_and_bounds_like_2d`
+- `depth_transform_pdf_suppression_keeps_comparisons_until_the_first_2d_draw`
+- `depth_transform_wheel_prediction_matches_application_for_zoom_and_local_scroll`
+- `depth_transform_panel_rejects_wheel_and_drag_starts`
+- `depth_transform_mapping_roundtrips_fractional_geometry_and_physical_uniforms`
+- `depth_transform_gpu_matches_2d_zoom_pan_rotation_crop_and_clip`
+- `depth_fit_picker_row_rejects_preview_value_list_and_commit`
+- `depth_pdf_demand_resume_retires_all_absolute_records_and_survives_zoom_reset`
+- `depth_export_baseline_ignores_shared_zoom_pan_free_rotation_and_fit_policy`
+
+特にホイール予測の追加テストは、既定設定のままでスクロールを期待しており、停止理由を解決してから修正が必要。
+§6 の GPU の動きの方向、パネル上のピンチ・中ボタン・スクラブ、PDF の実描画での印の消費と各終了経路等の
+検査の追加・精査も残る。§3.4 の要求元とフィット設定書き込みの全一覧、§3.5 の全出現分類、§12 の下書きも未完了。
+detached の述語・viewport 配送・`set_fs_exclusive_view` の実装は変更していない。
+
+設計判断後、設計担当が実行する予定の nextest filter:
+
+```text
+test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/specified_pdf/) | test(/initial_placement/) | test(/fullscreen_click|canvas_click|touch|panorama/)
+```
+
+パネルのスナップショットは更新していない。ビルド・テスト・実機の結果はこの差分にはない。

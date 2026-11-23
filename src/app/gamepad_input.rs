@@ -6057,6 +6057,9 @@ impl App {
     }
 
     fn change_ring_picker_value(&mut self, ctx: &egui::Context, row: RingPickerRowId, delta: i32) {
+        if row == RingPickerRowId::FitMode && self.fs_exclusive_view.is_depth() {
+            return;
+        }
         if row == RingPickerRowId::ItemRating
             && self
                 .ring_picker
@@ -6274,7 +6277,7 @@ impl App {
             {
                 self.set_reading_direction_for_fullscreen(ctx, fs_idx, picker.reading_direction);
             }
-            RingPickerRowId::FitMode if layout_supported => {
+            RingPickerRowId::FitMode if layout_supported && !self.fs_exclusive_view.is_depth() => {
                 let fit = picker.fit_mode.effective_for_flow(self.reading_flow);
                 if self
                     .settings
@@ -6472,12 +6475,16 @@ impl App {
 
     fn enter_ring_picker_list_for_current_row(&mut self, ctx: &egui::Context) -> bool {
         let ai_mode = self.settings.ai_feature_mode;
+        let depth_active = self.fs_exclusive_view.is_depth();
         let Some(picker) = self.ring_picker.as_mut() else {
             return false;
         };
         let Some(&row) = picker_rows_for_context(picker.context).get(picker.current_row()) else {
             return false;
         };
+        if row == RingPickerRowId::FitMode && depth_active {
+            return false;
+        }
         let list = if row == RingPickerRowId::PostFilter {
             PickerListState {
                 mode: PickerListMode::PostFilterGroup,
@@ -6591,6 +6598,9 @@ impl App {
         row: RingPickerRowId,
         index: usize,
     ) {
+        if row == RingPickerRowId::FitMode && self.fs_exclusive_view.is_depth() {
+            return;
+        }
         if row == RingPickerRowId::ItemRating
             && self
                 .ring_picker
@@ -7654,6 +7664,7 @@ impl App {
             }
             let fit = picker.fit_mode.effective_for_flow(self.reading_flow);
             if picker.dirty_rows.contains(&RingPickerRowId::FitMode)
+                && !self.fs_exclusive_view.is_depth()
                 && self
                     .settings
                     .fullscreen_fit_mode
@@ -13769,6 +13780,37 @@ mod next_input_tests {
     use crate::grid_item::GridItem;
     use crate::settings::{FullscreenFitMode, ReadingFlow};
     use crate::ui_dialogs::file_organize::FileOrganizeRequest;
+
+    #[test]
+    fn depth_fit_picker_row_rejects_preview_value_list_and_commit() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.items = vec![GridItem::Image(app.tmp.path().join("depth-fit.jpg"))];
+        app.fullscreen_idx = Some(0);
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+        app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(
+            crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context()),
+        );
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
+        picker.row = picker_rows_for_context(picker.context)
+            .iter()
+            .position(|row| *row == RingPickerRowId::FitMode)
+            .unwrap();
+        app.ring_picker = Some(picker.clone());
+        app.change_ring_picker_value(&ctx, RingPickerRowId::FitMode, 1);
+        app.set_ring_picker_row_value_selection(&ctx, RingPickerRowId::FitMode, 1);
+        assert!(!app.enter_ring_picker_list_for_current_row(&ctx));
+        assert_eq!(
+            app.ring_picker.as_ref().unwrap().fit_mode,
+            FullscreenFitMode::Page
+        );
+        picker.fit_mode = FullscreenFitMode::Width;
+        picker.dirty_rows.push(RingPickerRowId::FitMode);
+        app.preview_image_picker_row(&ctx, 0, &picker, RingPickerRowId::FitMode);
+        assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
+        app.apply_image_picker_state(&ctx, 0, picker);
+        assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
+    }
 
     #[test]
     fn page_turn_first_gamepad_navigation_skip_keeps_the_dispatched_id() {

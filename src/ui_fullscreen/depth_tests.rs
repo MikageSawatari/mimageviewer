@@ -173,7 +173,7 @@ fn depth_suspends_effective_zoom_consumers_while_2d_and_panorama_keep_their_owne
             assert_eq!(
                 app.fs_zoom_owner(),
                 if kind == "depth" {
-                    FsZoomOwner::Depth
+                    FsZoomOwner::Image
                 } else if stored {
                     FsZoomOwner::ZoomMode
                 } else if kind == "panorama" {
@@ -206,7 +206,7 @@ fn depth_excludes_an_otherwise_eligible_single_still_from_page_turn_animation() 
 }
 
 #[test]
-fn depth_typed_zoom_owner_stops_all_transform_inputs_and_navigator() {
+fn depth_typed_zoom_owner_shares_transform_inputs_but_keeps_navigator_excluded() {
     let ctx = egui::Context::default();
     let mut app = crate::app::setup_app_for_test();
     install_depth(&mut app);
@@ -214,29 +214,26 @@ fn depth_typed_zoom_owner_stops_all_transform_inputs_and_navigator() {
     app.fs_pan = egui::vec2(31.0, -7.0);
     app.fs_free_rotation = 0.3;
     app.settings.fullscreen_navigator_visible = true;
-    assert_eq!(app.fs_zoom_owner(), FsZoomOwner::Depth);
-    assert!(!app.apply_fs_key_zoom_step(&ctx, true));
-    assert!(!app.apply_touch_zoom_factor_about_pivot(
-        2.0,
-        egui::pos2(30.0, 40.0),
-        egui::Pos2::ZERO
-    ));
+    assert_eq!(app.fs_zoom_owner(), FsZoomOwner::Image);
+    assert!(app.apply_fs_key_zoom_step(&ctx, true));
+    assert!(app.apply_touch_zoom_factor_about_pivot(2.0, egui::pos2(30.0, 40.0), egui::Pos2::ZERO));
     app.apply_touch_pan_delta(egui::vec2(70.0, 50.0), egui::Rect::EVERYTHING);
-    assert!(!app.apply_gamepad_fullscreen_zoom(1.0, 0.2));
-    assert!(!app.apply_gamepad_fullscreen_pan(egui::vec2(20.0, 20.0)));
+    assert!(app.apply_gamepad_fullscreen_zoom(1.0, 0.2));
+    assert!(app.apply_gamepad_fullscreen_pan(egui::vec2(20.0, 20.0)));
     assert!(!app.fs_navigator_allowed_for_display_unit(&ctx, 0, false));
     assert!(!app.page_turn_view_eligible(0));
     let fit = app.settings.fullscreen_fit_mode;
     app.cycle_fullscreen_fit_mode(&ctx, 0);
     assert_eq!(app.settings.fullscreen_fit_mode, fit);
-    assert_eq!(
-        (app.fs_zoom, app.fs_pan, app.fs_free_rotation),
-        (2.4, egui::vec2(31.0, -7.0), 0.3)
-    );
+    app.set_fullscreen_fit_mode_for_current(&ctx, 0, FullscreenFitMode::Width);
+    assert_eq!(app.settings.fullscreen_fit_mode, fit);
+    assert!(app.fs_zoom > 2.4);
+    assert_ne!(app.fs_pan, egui::vec2(31.0, -7.0));
+    assert_eq!(app.fs_free_rotation, 0.3);
 }
 
 #[test]
-fn depth_wheel_navigates_and_ctrl_wheel_never_uses_panorama_fov_or_hidden_zoom() {
+fn depth_wheel_navigates_and_ctrl_wheel_uses_image_zoom_without_panorama_fov() {
     let ctx = egui::Context::default();
     let mut app = crate::app::setup_app_for_test();
     install_depth(&mut app);

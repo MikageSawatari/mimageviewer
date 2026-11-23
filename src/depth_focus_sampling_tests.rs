@@ -145,45 +145,49 @@ fn depth_focus_gpu_clicked_surface_stays_fixed_for_planes_and_continuous_depth()
         gpu.renderer
             .callback_resources
             .insert(DepthRenderResourcesRef(resource.clone()));
-        for q in 0..4 {
-            for crop in [false, true] {
-                let mut p = params();
-                p.quarter_turns = q;
-                p.aspect = rect.aspect_ratio();
-                p.gamma = depth_gamma(true, 0.25);
-                if crop {
-                    p.uv = egui::Rect::from_min_max(egui::pos2(0.1, 0.2), egui::pos2(0.9, 0.8));
-                }
-                // Deliberately away from depth discontinuities and color-pattern edges.
-                let (x, y) = (20, 17);
-                p.focus = focus_depth_at(
-                    egui::pos2(x as f32 + 0.5, y as f32 + 0.5),
-                    rect,
-                    p,
-                    depth.width,
-                    depth.height,
-                    &depth.values,
-                )
-                .unwrap();
-                let job = DepthShaderCallback {
-                    context: resource.context,
-                    key,
-                    resource_id: resource.resource_id,
-                    params: p,
-                    target_format: FORMAT,
-                };
-                let still = gpu.render(&[callback(rect, job.clone())], size, [0, 0, 0, 0]);
-                for sign in [-1., 1.] {
-                    let mut moving = job.clone();
-                    moving.params.offset = egui::vec2(0.04 * sign, -0.02 * sign);
-                    let pixels = gpu.render(&[callback(rect, moving)], size, [0, 0, 0, 0]);
-                    for (a, b) in pixels[y * 64 + x].into_iter().zip(still[y * 64 + x]) {
-                        assert!(
-                            a.abs_diff(b) <= 2,
-                            "q={q}, crop={crop}, continuous={continuous}: {:?} != {:?}",
-                            pixels[y * 64 + x],
-                            still[y * 64 + x]
-                        );
+        for angle in [-0.45, 0.0, 0.6] {
+            for q in 0..4 {
+                for crop in [false, true] {
+                    let mut p = params();
+                    p.quarter_turns = q;
+                    p.aspect = rect.aspect_ratio();
+                    p.gamma = depth_gamma(true, 0.25);
+                    if crop {
+                        p.uv = egui::Rect::from_min_max(egui::pos2(0.1, 0.2), egui::pos2(0.9, 0.8));
+                    }
+                    let mapping = DepthScreenMapping::new(rect, rect.center(), angle);
+                    // Deliberately away from depth discontinuities and color-pattern edges.
+                    let (x, y) = (20, 17);
+                    p.focus = focus_depth_at(
+                        egui::pos2(x as f32 + 0.5, y as f32 + 0.5),
+                        mapping,
+                        p,
+                        depth.width,
+                        depth.height,
+                        &depth.values,
+                    )
+                    .unwrap();
+                    let job = DepthShaderCallback {
+                        context: resource.context,
+                        key,
+                        resource_id: resource.resource_id,
+                        params: p,
+                        mapping,
+                        target_format: FORMAT,
+                    };
+                    let still = gpu.render(&[callback(rect, job.clone())], size, [0, 0, 0, 0]);
+                    for sign in [-1., 1.] {
+                        let mut moving = job.clone();
+                        moving.params.offset = egui::vec2(0.04 * sign, -0.02 * sign);
+                        let pixels = gpu.render(&[callback(rect, moving)], size, [0, 0, 0, 0]);
+                        for (a, b) in pixels[y * 64 + x].into_iter().zip(still[y * 64 + x]) {
+                            assert!(
+                                a.abs_diff(b) <= 2,
+                                "q={q}, crop={crop}, continuous={continuous}: {:?} != {:?}",
+                                pixels[y * 64 + x],
+                                still[y * 64 + x]
+                            );
+                        }
                     }
                 }
             }
