@@ -105,6 +105,7 @@ fn depth_transform_click_classification_focus_and_double_reset_use_the_shared_vi
                         egui::Sense::click_and_drag(),
                     );
                     app.fs_front_pointer.accept_backing_click(&response, false);
+                    let (zoom, pan) = (app.fs_zoom, app.fs_pan);
                     let action = app.plan_fs_canvas_click(
                         &ctx,
                         &response,
@@ -116,8 +117,8 @@ fn depth_transform_click_classification_focus_and_double_reset_use_the_shared_vi
                         false,
                         None,
                         false,
-                        app.fs_zoom,
-                        app.fs_pan,
+                        zoom,
+                        pan,
                         None,
                         false,
                     );
