@@ -4,7 +4,12 @@ use super::{draw_cell, layout_cell_overlays};
 use crate::folder_cell_background::FolderCellBackground;
 use crate::grid_item::{GridItem, SearchContainerKind, ThumbnailState};
 
-pub(crate) fn draw_samples(ui: &mut egui::Ui, colors: &FolderCellBackground, extended: bool) {
+pub(crate) fn draw_samples(
+    ui: &mut egui::Ui,
+    colors: &FolderCellBackground,
+    cell_visuals: &egui::Visuals,
+    extended: bool,
+) {
     let key = egui::Id::unique("folder-background-preview-texture");
     let texture = ui
         .ctx()
@@ -133,6 +138,11 @@ pub(crate) fn draw_samples(ui: &mut egui::Ui, colors: &FolderCellBackground, ext
                     } else {
                         &ThumbnailState::Failed
                     };
+                    // Headings stay on the surrounding surface. Only the cell
+                    // painter uses the sample theme; child creation adds no layout.
+                    let mut cell_ui = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                    *cell_ui.visuals_mut() = cell_visuals.clone();
+                    let ui = &cell_ui;
                     let layout = layout_cell_overlays(
                         ui.painter(),
                         rect,
@@ -180,12 +190,14 @@ pub(crate) fn draw_samples(ui: &mut egui::Ui, colors: &FolderCellBackground, ext
 
 #[doc(hidden)]
 pub fn draw_folder_cell_background_snapshot_fixture(ui: &mut egui::Ui) {
+    let cell_visuals = ui.visuals().clone();
     draw_samples(
         ui,
         &FolderCellBackground {
             enabled: true,
             ..Default::default()
         },
+        &cell_visuals,
         true,
     );
 }

@@ -64,10 +64,7 @@ pub(super) fn draw_settings(ui: &mut egui::Ui, settings: &mut Settings) {
             },
             settings.text_contrast,
         );
-        ui.scope(|ui| {
-            *ui.visuals_mut() = visuals;
-            crate::app::draw_folder_background_samples(ui, &preview, false);
-        });
+        crate::app::draw_folder_background_samples(ui, &preview, &visuals, false);
     }
 }
 
