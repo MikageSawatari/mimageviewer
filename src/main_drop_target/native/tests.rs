@@ -654,3 +654,52 @@ fn main_drop_com_failed_path_read_returns_none_and_queues_notification_without_t
     ));
     assert_eq!(fixture.observed.visual.borrow().last(), Some(&("drop", 0)));
 }
+
+/// §1.860 probe (ignored, prints only): does a raw Shell data object (the kind Explorer
+/// drags) accept SetData(DropDescription) when ownership is transferred (fRelease TRUE)?
+#[test]
+#[ignore]
+fn main_drop_860_probe_raw_shell_data_object_drop_description_release_modes() {
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("probe.txt");
+    std::fs::write(&path, b"probe").unwrap();
+    let (data, failed) = crate::file_drag::shell_data_object_for_paths(&[path]).unwrap();
+    assert_eq!(failed, 0);
+    let cf = unsafe { RegisterClipboardFormatW(CFSTR_DROPDESCRIPTION) } as u16;
+    for release in [false, true] {
+        let hglobal =
+            unsafe { GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<DROPDESCRIPTION>()) }.unwrap();
+        let ptr = unsafe { GlobalLock(hglobal) };
+        let mut value = DROPDESCRIPTION::default();
+        value.r#type = DROPIMAGE_COPY;
+        unsafe { ptr.cast::<DROPDESCRIPTION>().write_unaligned(value) };
+        let _ = unsafe { GlobalUnlock(hglobal) };
+        let mut medium = STGMEDIUM {
+            tymed: TYMED_HGLOBAL.0 as u32,
+            u: STGMEDIUM_0 { hGlobal: hglobal },
+            pUnkForRelease: ManuallyDrop::new(None),
+        };
+        let result = unsafe { data.SetData(&format(cf), &medium, release) };
+        eprintln!("860 probe: SetData(DropDescription, fRelease={release}) -> {result:?}");
+        if !release || result.is_err() {
+            unsafe { ReleaseStgMedium(&mut medium) };
+        }
+        let read = unsafe { data.GetData(&format(cf)) };
+        match read {
+            Ok(medium) => {
+                let medium = Medium(medium);
+                let global = unsafe { medium.0.u.hGlobal };
+                let ptr = unsafe { GlobalLock(global) };
+                let actual = unsafe { ptr.cast::<DROPDESCRIPTION>().read_unaligned() };
+                let _ = unsafe { GlobalUnlock(global) };
+                let actual_type = actual.r#type;
+                eprintln!("860 probe:   GetData after fRelease={release} -> type {actual_type:?}");
+            }
+            Err(error) => eprintln!("860 probe:   GetData after fRelease={release} -> {error:?}"),
+        }
+    }
+    drop(data);
+    unsafe { CoUninitialize() };
+}

@@ -11089,4 +11089,101 @@ C:\isolated\miv-data"#
         );
         assert_eq!(q.normal.len(), 1, "non-match Normal は残る");
     }
+    /// §1.858 B probe (ignored, prints only): which retained handles block a rename
+    /// of the file itself and of its parent folder.
+    #[test]
+    #[ignore]
+    fn handle_858b_probe_retained_handles_vs_rename() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_LIST_DIRECTORY, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let report = |label: &str, from: &Path, to: &Path| {
+            let result = fs::rename(from, to);
+            eprintln!("858b probe: {label}: {result:?}");
+            if result.is_ok() {
+                let _ = fs::rename(to, from);
+            }
+        };
+        // (a) Rust File (share R|W|D), as the ZIP directory cache holds it.
+        let a = root.path().join("a");
+        fs::create_dir(&a).unwrap();
+        let zip_path = a.join("book.zip");
+        fs::write(&zip_path, b"PK\x05\x06\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0").unwrap();
+        {
+            let _held = fs::File::open(&zip_path).unwrap();
+            report(
+                "rust File: rename the file itself",
+                &zip_path,
+                &a.join("book2.zip"),
+            );
+            report(
+                "rust File: rename its parent folder",
+                &a,
+                &root.path().join("a2"),
+            );
+        }
+        // (b) PDFium in-process document.
+        let b = root.path().join("b");
+        fs::create_dir(&b).unwrap();
+        let pdf_path = b.join("doc.pdf");
+        fs::write(&pdf_path, minimal_direction_pdf(None)).unwrap();
+        {
+            let dll = Path::new("vendor/pdfium/bin");
+            let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(
+                dll.to_str().unwrap(),
+            ))
+            .unwrap();
+            let pdfium = Pdfium::new(bindings);
+            let document = pdfium.load_pdf_from_file(&pdf_path, None).unwrap();
+            eprintln!("858b probe: pdf pages {}", document.pages().len());
+            report(
+                "pdfium: rename the file itself",
+                &pdf_path,
+                &b.join("doc2.pdf"),
+            );
+            report(
+                "pdfium: rename its parent folder",
+                &b,
+                &root.path().join("b2"),
+            );
+            drop(document);
+        }
+        // (c) Directory handle as notify 8.2.2 opens a watched folder.
+        let c = root.path().join("c");
+        let watched = c.join("watched");
+        fs::create_dir_all(&watched).unwrap();
+        {
+            let wide: Vec<u16> = watched.as_os_str().encode_wide().chain([0]).collect();
+            let handle = unsafe {
+                CreateFileW(
+                    windows::core::PCWSTR(wide.as_ptr()),
+                    FILE_LIST_DIRECTORY.0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    None,
+                )
+            }
+            .unwrap();
+            report(
+                "dir handle: rename the watched folder",
+                &watched,
+                &c.join("watched2"),
+            );
+            report("dir handle: rename its parent", &c, &root.path().join("c2"));
+            let child = watched.join("child.txt");
+            fs::write(&child, b"x").unwrap();
+            report(
+                "dir handle: rename a file inside",
+                &child,
+                &watched.join("child2.txt"),
+            );
+            let _ = unsafe { CloseHandle(handle) };
+        }
+    }
 }

@@ -9,6 +9,7 @@
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
 | [folder-tree-dnd-plan.md](folder-tree-dnd-plan.md) | §1.464 ツリー行への D&D と右クリック貼り付け、§1.821 一覧ドロップ。表示済み pass の形・ROOT OLE target・既定操作のボリューム確認・共有受付と転送 owner。generic Shell image と target description を使用。実装記録と未実施の検証は §14〜15 |
+| [grid-folder-drop-and-handle-release-plan.md](grid-folder-drop-and-handle-release-plan.md) | §1.858 B・2 / §1.860 (v5.7.0 予定、設計中)。移動・名前の変更・削除の前に mIV が持つ ZIP / PDF の handle を手放す「変更の囲い」、一覧の実フォルダのセルへのドロップ、外部からのドラッグ中の落とし先の強調と説明のバッジ |
 | [hover-805-measurement.md](hover-805-measurement.md) | 5ch 報告 805 の環境設定・操作カスタマイズのホバー計測。GPUを使わない ignored harness、dialog_frame perf event、dialog-frames集計と観測限界 |
 | [hover-809-gpu-work-measurement.md](hover-809-gpu-work-measurement.md) | §1.809 のテスト専用A/B計測とC見積もり。primitive完全一致率、offscreen GPU pass費用、present未測定の限界と省略条件のソース棚卸し |
 | [clear-history-actions.md](clear-history-actions.md) | 検索欄の入力履歴・閲覧履歴の全件消去をキー／リングへ割り当てる操作。共有処理・保存・確認・検証 |
