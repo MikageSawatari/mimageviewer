@@ -1,4 +1,4 @@
-# Noninteractive checks for the two store packages; no source files are written.
+# Noninteractive checks for the three extension packages; no source files are written.
 [CmdletBinding()]
 param()
 
@@ -53,11 +53,22 @@ $before = Get-SourceSnapshot
 $scratch = Join-Path $repoRoot ('target/browser-extension/package-test-' + [Guid]::NewGuid().ToString('N'))
 $first = @(& $packageScript -OutputDirectory (Join-Path $scratch 'first'))
 $second = @(& $packageScript -OutputDirectory (Join-Path $scratch 'second'))
-Assert ($first.Count -eq 2 -and $second.Count -eq 2) 'Expected two store packages per invocation.'
+Assert ($first.Count -eq 3 -and $second.Count -eq 3) 'Expected three extension packages per invocation.'
 $sourceManifestBytes = [IO.File]::ReadAllBytes((Join-Path $sourceRoot 'manifest.json'))
 $sourceManifestText = $utf8.GetString($sourceManifestBytes)
 $sourceManifest = $sourceManifestText | ConvertFrom-Json
 Assert ($sourceManifest.key -ceq $stores.chrome.key) 'The source manifest must keep the Chrome key.'
+$expectedZips = @(
+    "mimageviewer-browser-extension-chrome-v$($sourceManifest.version).zip",
+    "mimageviewer-browser-extension-edge-v$($sourceManifest.version).zip",
+    "mimageviewer-browser-extension-edge-v$($sourceManifest.version)-store.zip"
+)
+foreach ($paths in @($first, $second)) {
+    for ($i = 0; $i -lt $expectedZips.Count; $i++) {
+        Assert ((Split-Path -Leaf $paths[$i]) -ceq $expectedZips[$i]) 'Unexpected output ZIP name/order.'
+        Assert (Test-Path -LiteralPath $paths[$i] -PathType Leaf) 'An expected ZIP was not created.'
+    }
+}
 
 for ($i = 0; $i -lt 2; $i++) {
     $store = @('chrome', 'edge')[$i]
@@ -109,6 +120,45 @@ for ($i = 0; $i -lt 2; $i++) {
     } finally { $file.Dispose() }
     Write-Output "PASS: $store key/ID, permissions, locales, allowlist, source bytes, reproducibility"
 }
+
+Assert ((Get-FileHash -LiteralPath $first[2]).Hash -ceq (Get-FileHash -LiteralPath $second[2]).Hash) 'The Edge store ZIP is not reproducible.'
+$edgeFile = [IO.File]::OpenRead($first[1])
+try {
+    $edgeZip = [IO.Compression.ZipArchive]::new($edgeFile, [IO.Compression.ZipArchiveMode]::Read, $true)
+    try {
+        $storeFile = [IO.File]::OpenRead($first[2])
+        try {
+            $storeZip = [IO.Compression.ZipArchive]::new($storeFile, [IO.Compression.ZipArchiveMode]::Read, $true)
+            try {
+                Assert (($storeZip.Entries.FullName -join "`n") -ceq ($expectedNames -join "`n")) 'Edge store ZIP entry allowlist/order differs.'
+                foreach ($entry in $storeZip.Entries) {
+                    $edgeEntry = $edgeZip.GetEntry($entry.FullName)
+                    Assert ($entry.LastWriteTime -eq $edgeEntry.LastWriteTime) 'Edge store ZIP entry timestamp differs.'
+                    Assert ($entry.ExternalAttributes -eq $edgeEntry.ExternalAttributes) 'Edge store ZIP entry attributes differ.'
+                    $bytes = Read-Entry $entry
+                    $edgeBytes = Read-Entry $edgeEntry
+                    if ($entry.FullName -eq 'manifest.json') {
+                        $storeText = $utf8.GetString($bytes)
+                        $edgeText = $utf8.GetString($edgeBytes)
+                        $storeManifest = $storeText | ConvertFrom-Json
+                        $edgeManifest = $edgeText | ConvertFrom-Json
+                        Assert ($null -eq $storeManifest.PSObject.Properties['key']) 'The Edge store manifest contains key.'
+                        $edgeManifest.PSObject.Properties.Remove('key')
+                        Assert (($storeManifest | ConvertTo-Json -Depth 100 -Compress) -ceq
+                            ($edgeManifest | ConvertTo-Json -Depth 100 -Compress)) 'Edge store manifest fields differ beyond key.'
+                        $keyLines = @($edgeText -split '(?<=\n)' | Where-Object { $_ -cmatch '^[ \t]*"key"[ \t]*:' })
+                        Assert ($keyLines.Count -eq 1) 'Expected one key line in the Edge verification manifest.'
+                        Assert ($storeText -ceq $edgeText.Replace($keyLines[0], '')) 'Edge store manifest changed bytes outside the key line.'
+                    } else {
+                        Assert ([Convert]::ToBase64String($bytes) -ceq [Convert]::ToBase64String($edgeBytes)) "Edge store bytes differ in $($entry.FullName)."
+                        Assert ($entry.CompressedLength -eq $edgeEntry.CompressedLength) 'Edge store compressed entry length differs.'
+                    }
+                }
+            } finally { $storeZip.Dispose() }
+        } finally { $storeFile.Dispose() }
+    } finally { $edgeZip.Dispose() }
+} finally { $edgeFile.Dispose() }
+Write-Output 'PASS: Edge store key absent, remaining fields/bytes, entry metadata, reproducibility'
 
 $rejected = $false
 try { & $packageScript -OutputDirectory $repoRoot | Out-Null } catch {

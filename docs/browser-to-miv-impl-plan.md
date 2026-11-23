@@ -754,8 +754,10 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
 
 - ソース manifest の key：ClaudeCode 提供の Chrome 公開鍵。
 - Chrome ZIP：Chrome key。
-- Edge ZIP：生成物の manifest だけ Edge key に差し替え。
-- 両方とも公開鍵から計算した ID と指定 ID の一致を検査。
+- Edge 確認用 ZIP (`mimageviewer-browser-extension-edge-v<VER>.zip`)：生成物の manifest だけ Edge key に差し替え。開発者モードでの通しの確認にはこちらを展開する。
+- Edge 提出用 ZIP (`mimageviewer-browser-extension-edge-v<VER>-store.zip`)：確認用の manifest の key 行だけを除去し、ほかの書式・バイトは保つ。JSON の妥当性と key 以外の全フィールドの一致をスクリプト内で検査する。manifest 以外の収録物・順序・日時・圧縮設定は確認用と同じ。
+- Chrome と Edge の公開鍵から計算した ID と指定 ID の一致を検査。
+- 2026-11-23、利用者の提出時に Edge Partner Center が manifest の key を拒否したため、Edge へは提出用を出す。Chrome は key 入りで受け付けられており変更しない。
 - ソースを書き換えず、試作・テスト・共有メモを ZIP に含めない。
 - スクリプトは ASCII の PowerShell。
 
@@ -770,14 +772,14 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
 - 記録あり／なし／窓移動・サイズ・DPR 変更。
 - 既存タブへの再注入、二重登録。
 - native response と `runtime.lastError`。
-- 両 ZIP の key・ID・権限・locales・収録内容。
+- Chrome・Edge 確認用 ZIP の key・ID・権限・locales・収録内容。Edge 提出用の key 不在、確認用との残りの全フィールド・key 行以外の manifest バイト・ほかの収録物のバイト一致。3 種とも 2 回の生成で ZIP がバイト一致すること。
 - リンク先の HTML・型なし・汎用型の本文を読まずに破棄し、ページの画像へ切り替えること。画像型ならリンク先だけ使い、取得失敗では切り替えないこと。候補ごとの許可・DNR の順序、実際の候補の URL、`success_fallback` の日英通知と成功バッジ。
 
 モックテストを、Chrome／Edge の実動作や座標精度の証拠にはしません。
 
 **完了条件**
 
-製品用 manifest と二つの ZIP を再現可能に生成でき、試作専用コード・権限・診断本文を含まないこと。
+製品用 manifest と三つの ZIP (Chrome、Edge 確認用、Edge 提出用) を再現可能に生成でき、試作専用コード・権限・診断本文を含まないこと。
 
 **段階8の実装引き継ぎ（2026-11-22）**
 
