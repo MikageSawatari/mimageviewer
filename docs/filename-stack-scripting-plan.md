@@ -28,7 +28,7 @@
   ファイル読みを封殺、Codex P1)、`set_max_operations(10M)` ほか各種上限、I/O/OS は非公開。
   戻りキーは文字列 / 数値 / `()` のみ受理 (配列・マップ等はエラー→既定へフォールバック、Codex P2)。
   正規表現コンパイルキャッシュは 1024 件上限 (動的パターン肥大対策、Codex P3)。
-- **標準関数 (§1.863)**: 互換のため標準パッケージを維持し、`sleep` と空文字で伸ばす文字列 `pad` だけを上書きで拒否。`print` / `debug` は 1 回の計算で合計 20 行まで mIV のログへ送る (下記「標準関数の扱い」)。
+- **標準関数 (§1.863)**: 互換のため標準パッケージを維持し、`sleep` と空文字で伸ばす文字列 `pad` を拒否、配列 `pad` の巨大長さによるあふれを事前検査で防止。`print` / `debug` は 1 回の計算で合計 20 行まで mIV のログへ送る (下記「標準関数の扱い」)。
 - **既定カスケード** (上から順、「全ファイル該当」最初のルールを採用。汎用ルールはさらに
   「異なるスタックが 2 つ以上」のときだけ採用 = 巨大スタック化を防ぐ):
   1. 命名パターン (mXD 例: `^\d{8}_\d{4}_\d+_\d+_p\d+_m\d+_@`、`_m\d+_@` の手前をキー)
@@ -233,13 +233,29 @@ engine.set_max_array_size(2_000_000);          // 10k×数倍の余裕
 互換を優先して揃えない。処理のモーダル化や取消の状態追加では native 関数内の停止を
 解消できないため、関数登録の境界で危ない呼び出しをなくす。
 
-`register_fn` は `global_modules[0]` の global namespace に登録され、標準パッケージより
-先に解決される。同名・同じ引数型で次を覆う (Rhai 1.27.0 のソースを照合)。
+`FuncRegistration::register_into_engine` は `register_fn` と同じく `global_modules[0]` の
+global namespace に登録され、標準パッケージより先に解決される。同名・同じ引数型で次を覆う
+(Rhai 1.27.0 のソースを照合)。標準と同じく `pad` は非 pure / 非 volatile、
+`sleep` は pure / volatile と明示する。`register_fn` の既定 pure のままでは、
+標準の `pad` が拒否する定数の変更を許してしまうため使用しない。
 
 | 覆う関数 | 理由と維持する動作 |
 | --- | --- |
 | `sleep(INT)` / `sleep(FLOAT)` | native 内の `std::thread::sleep` は秒数を制限しない。0 を含め常に `ErrorRuntime`。 |
 | `pad(&mut ImmutableString, INT, &str)` | 空文字で現在の文字数より長くすると、標準実装のループが進まない。この場合だけ `ErrorRuntime`。それ以外は 1.27 の文字数単位の繰り返し・末尾切り詰め・非正の長さでの無操作・拡張前の文字数上限と拡張後のバイト数上限を維持する。 |
+| `pad(&mut Array, INT, Dynamic)` | 標準の既存不具合: 巨大な長さと入れ子の詰め物で総量の `a + pad + ax * pad` 等があふれ、debug は計算時、release は検査を抜けた後の `resize` で worker が panic し得る。長さが非0の `max_array_size` を超えれば先に `ErrorDataTooLarge("Size of array/BLOB")`。それ以降は従来の無操作条件・総量検査・resize を維持する。 |
+
+定数の文字列への `pad` は、空でない詰め物でも空文字でも、長さを変える必要がなくても
+標準と同じ定数変更のエラーで拒否する。空文字のループに入る前の判定である。
+`section1863_string_pad_preserves_standard_const_rejection` で標準 `Engine::new()` と
+結果・エラー・定数の値を突き合わせる。
+
+配列の総量は `eval/data_check.rs` の数え方を公開 `Dynamic` API で再現する。
+配列は要素数と入れ子の総量、マップは値の項目数と総量 (キーの長さは含めない)、文字列は
+バイト数、blob は最上位ではバイト数、入れ子では追加の 1 も数える。最上位の Shared は
+`read_lock::<Dynamic>` で開き、内部要素に Shared が無い不変条件も標準と同じとする。
+長さの事前検査後、総量検査の優先順は文字列→配列/blob→マップ。総量の加算・乗算は saturating 演算にし、
+通常上限の前提をホスト側で変えても折り返さない。
 
 上書きの優先と関数ポインタ経由の解決を確認する常設テスト (すべて
 `filename_stack_script::tests::` 配下、別スレッド + `recv_timeout(10秒)`):
@@ -252,7 +268,9 @@ engine.set_max_array_size(2_000_000);          // 10k×数倍の余裕
 互換は `section1863_safe_string_and_array_pad_remain_compatible`、サイズ検査は
 `section1863_string_pad_preserves_character_and_byte_size_checks`、既定ルールは既存の
 `default_script_compiles_and_runs_empty` 等で確認する。2026-11-23 に ClaudeCode が
-`filename_stack_script::` / `filename_stack` / `grid_edge_buttons_1855::` の 93 件を流し、すべて成功した。
+`filename_stack_script::` / `filename_stack` / `grid_edge_buttons_1855::` の 93 件を流し、すべて成功した
+(`c938e318f` の変更)。独立レビュー後の登録属性・配列 pad の修正と追加テストは、
+負荷対策の指示により実装担当ではコンパイル・テスト未実施、ClaudeCode の検証待ち。
 
 #### StandardPackage の洗い出し (Rhai 1.27.0、コード読み)
 
@@ -266,7 +284,7 @@ engine.set_max_array_size(2_000_000);          // 10k×数倍の余裕
 | `arithmetic.rs` / `bit_field.rs` / `logic.rs` / `math_basic.rs` | 固定幅数値の計算・比較、文字列上限内の数値解析。指数は固定幅または明示上限。decimal は現行の依存 feature では無効 (実装も確認)。 |
 | `string_basic.rs` / `string_more.rs` の char 版 `pad` と空文字以外の文字列版 `pad` | `max_string_size = 256 MiB` の拡張前後の検査で縛られ、ループが必ず進むので終わる。文字数とバイト数は異なり、バイト検査は拡張後。 |
 | 同上の検索・置換・split・大文字小文字変換・文字列化 | 入力文字列・配列・マップが有限で、サイズ上限により対象量が縛られる。Rust の走査や split は空の検索文字列でも進む。結果サイズ検査が native 呼び出し後のものもあり、処理中の厳密な時間・一時メモリ上限は保証しない。 |
-| `array_basic.rs` (deprecated の別名も含む) | 配列 `pad` は拡張前に配列・マップ・文字列の総量検査。走査・sort・dedup・drain・retain は `max_array_size = 8,000,000` 内の要素が対象。削除ループは添字増加か配列縮小で進む。スクリプトのコールバックは interpreter の操作上限対象。 |
+| `array_basic.rs` の `pad` 以外 (deprecated の別名も含む) | 走査・sort・dedup・drain・retain は `max_array_size = 8,000,000` 内の要素が対象。削除ループは添字増加か配列縮小で進む。スクリプトのコールバックは interpreter の操作上限対象。配列 `pad` は初回監査で総量計算のあふれを見落としており、上の「覆う関数」へ移した。 |
 | `blob_basic.rs` | `blob` の生成・`pad` は `max_array_size` で拡張前検査。他の走査・変換は有限の blob / 文字列が対象。`write_*` はメモリ内のバイト列を更新する関数で、外部 I/O ではない。 |
 | `map_basic.rs` | `max_map_size = 8,000,000` 内のマップを走査・結合。コールバックは interpreter の操作上限対象。JSON 変換も有限データが対象。 |
 | `iter_basic.rs` | range 自体は列挙せず、`next` 1 回で 1 要素。スクリプトの `for` は操作上限対象。chars の準備は文字列上限内の走査、bits は固定ビット幅。 |
@@ -276,6 +294,27 @@ engine.set_max_array_size(2_000_000);          // 10k×数倍の余裕
 
 上限内でも 1 回の native 処理が重くなり得ることは残る。今回は厳密な時間制限を新設せず、
 既存の `set_*` の上限値とキャンセル確認の `ops & 0xFFFF` は変更しない。
+
+#### 整数引数のあふれの再監査 (独立レビュー後、コード読み)
+
+全標準パッケージの長さ・回数・位置の計算を、負数・`INT::MIN`・`INT::MAX` と
+加算／減算／乗算の順序から確認した。追加で覆う必要があるものは配列 `pad` のみ。
+
+| 関数群 | あふれの観点の確認 |
+| --- | --- |
+| 配列／blob の `extract`・`splice`・`chop`・`truncate`・`split`・`drain`・`retain`・get/set/remove | `calc_offset_len` / `calc_index` は `unsigned_abs` と実体長への制限を使う。切り出し後の `start + len` は実体長以下。閉区間は終端を `INT::MAX - 1` 以下へ制限し、`end - start + 1` はあふれない (開始が MAX なら長さ 0)。 |
+| blob の生成／pad／数値・文字列の read/write | 生成／pad は長さの上限を割り当て前に検査。read/write の範囲は実体長に制限し、数値は固定バイト幅にも制限。 |
+| 文字列の `sub_string`・`crop`・`split`・get/set/index_of・truncate/pop・両 pad | 負位置は `unsigned_abs`、範囲の加算は `checked_add` または実体長による制限。閉区間の終端も制限。pad の文字数加算は既存の 256 MiB の入力／目標長の範囲内。 |
+| `get_bit(s)` / `set_bit(s)` | ビット位置は固定幅内へ制限し、`bits + start` は `checked_add`。閉区間は終端の固定幅検査が加減算より先。全幅の mask 計算はその前に分岐して避けるため、冪乗・符号付き整数への変換もあふれない。 |
+| range / chars / bits の iterator | 整数 step の加算は checked。文字列の位置は `unsigned_abs` / `saturating_sub`、ビット数は固定幅と `checked_add`。長い列挙も interpreter の操作上限対象。 |
+| 数値演算・parse・tag・時刻・その他 | 整数演算は checked、shift の負数は `checked_abs`、型変換・tag は範囲を検査。時刻の整数の負数は `unsigned_abs`、加減算は checked。残りのパッケージに利用者指定の長さで行う未検査の割り当て計算は見つからなかった。 |
+
+追加の常設テスト (すべて `filename_stack_script::tests::`):
+`section1863_array_pad_rejects_overflow_lengths_without_panicking`、
+`section1863_array_pad_matches_standard_results_and_aggregate_limits`、
+`section1863_data_sizes_match_standard_for_top_shared_and_nested_blobs`。
+報告例の長さと `INT::MAX` の即時 Err、通常値・入れ子・既存要素・blob・Shared・各総量上限の
+ちょうど／1 超過を標準エンジンと比較する。通常上限内の重い処理は従来のままとする。
 
 #### エラーと出力
 
@@ -300,6 +339,9 @@ engine.set_max_array_size(2_000_000);          // 10k×数倍の余裕
   2026-11-23 に ClaudeCode が nextest の `--run-ignored only` で 2 件を各 1 回流し、
   どちらも成功した (= 修正前の構成では、cancel を立てても操作数上限 64 でも 3 秒以内に戻らない)。
   nextest はテストごとに別プロセスなので、残ったスレッドはプロセスの終了で回収される。
+  対照の常設テスト `section1863_legacy_script_loop_observes_cancel_and_terminates` も追加した。
+  同じ修正前 helper で `loop {}` の開始後に cancel を立て、10 秒以内に
+  `ErrorTerminated` になることを検査する (操作上限超過による停止とは区別する)。
 
 ### 実行場所 (UI 応答性)
 

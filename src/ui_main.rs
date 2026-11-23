@@ -2915,7 +2915,7 @@ fn grid_edge_button_placement(
 
 fn grid_edge_buttons_visibility_checkbox(ui: &mut egui::Ui, visible: &mut bool) -> bool {
     ui.checkbox(visible, "先頭・末尾ボタン (ソートの隣)")
-        .on_hover_text("絞り込みバーのソートが表示されているときはその左隣、表示されていないときは上部ツールバーのソートの中に出ます")
+        .on_hover_text("絞り込みバーのソートが表示されているときはその左隣、表示されていないときは上部ツールバーのソートの中に出ます。どちらのソートも表示していないときは出ません")
         .changed()
 }
 
