@@ -57,15 +57,16 @@
 
 ## 3. 範囲
 
-| 対象 | 初版 |
+| 対象 | 初版と §1.858・§1.860 の追加 |
 | --- | --- |
-| 落とし先 | ツリーの**画面に表示されている行** (実フォルダ・ドライブ)。一覧は既存のまま (§1.821 の中身の変更だけ) |
+| 落とし先 | ツリーの**画面に表示されている行** (実フォルダ・ドライブ)。§1.858 の 2 で通常の実フォルダ一覧のフォルダセル・詳細行も追加 |
 | 元 | mIV の一覧からのドラッグ (移動/コピー)、外部からの `CF_HDROP` (コピーだけ) |
 | 右クリック | ツリー行に「貼り付け」1 項目 |
-| やらない | ツリー行をドラッグの元にする、ドラッグ中の自動展開・自動スクロール・行の強調表示、ショートカット作成、外部からの移動、`CF_HDROP` の無いデータ、mIV 独自の取り消し |
+| やらない | ツリー行をドラッグの元にする、ドラッグ中の自動展開・自動スクロール・内部ドラッグ中の行／セルの強調表示、ショートカット作成、外部からの移動、`CF_HDROP` の無いデータ、mIV 独自の取り消し |
 
-自動展開・自動スクロール・強調表示を外す理由: mIV の一覧からのドラッグ中は `SHDoDragDrop` が `App::update` の中で止まり egui が描けない。
-ドラッグ元で見え方を分けない。**落とし先の行を先に表示しておく** (マニュアルに書く)。操作と行は §4.3 のバッジで示す。
+自動展開・自動スクロールと内部ドラッグ中の強調表示を外す理由: mIV の一覧からのドラッグ中は `SHDoDragDrop` が `App::update` の中で止まり egui が描けない。
+**落とし先の行・セルを先に表示しておく** (マニュアルに書く)。内部ドラッグは §4.3 のバッジだけで示し、§1.860 では外部ドラッグ中だけ落とし先の行・セルを強調する。
+一覧への拡張・外部コピー限定・強調の正本は [grid-folder-drop-and-handle-release-plan.md §5・§6](grid-folder-drop-and-handle-release-plan.md#5-2-一覧のフォルダのセルへのドロップ)。以下の初版記録にある `TreeRow` / `TreeTransfer` は、拡張後の `Folder { path, place: Tree | Grid }` / `FolderTransfer` に対応する。
 
 ## 4. mIV の一覧からツリーへ
 
@@ -186,15 +187,21 @@ App の消費: `update_phases.rs` の今の `dropped_files` の場所で `drops`
 - **上に重なるレイヤーとの交差で行を外す**: その pass で見えているレイヤーのうち、ツリーのレイヤーより手前にあるもの (popup・メニュー・モーダル・
   ツールチップ・他の Area) の rect を集め、交差する行は対象外 (行全体を外す。点のサンプリングはしない)。
 - `client_size_px`、DPI (`GetDpiForWindow`)、`pixels_per_point`。
+- §1.858 の 2: 通常の実フォルダ一覧かつ `grid_item_input_allowed()` の pass では、実効クリップ `grid_clip`、そのクリップで切った実フォルダの行／セル `grid_folders`、前面レイヤーとの交差で外した行／セル `grid_blocked` も同じ pass に記録する。詳細表示の実効クリップは横・縦 ScrollArea の交差。検索・タグ・コレクション・ZIP/PDF 内・ドライブ一覧・走査待ち等では一覧部分を空にする。
 
 callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `GetClientRect` の大きさと DPI が表示済みの形と違えば、どこでも NONE**。点の分類:
 
 | 分類 | 扱い |
 | --- | --- |
-| `TreeRow(path)` (`tree_clip` 内で、対象の行全体の rect に入る) | §4・§5 |
+| `Folder { path, place: Tree }` (`tree_clip` 内で、対象の行全体の rect に入る) | §4・§5。ツリーを一覧より先に判定 |
 | `TreeNonTarget` (`pane_rect` 内でそれ以外: 空白・インデント・スクロールバー・外した行・ヘッダ) | NONE。一覧の経路へ流さない |
-| `ExistingDropArea` (`pane_rect` の外) | 外部ドラッグは今の一覧への落下 (COPY、Drop で `GridFiles`)。mIV 内ドラッグは NONE |
-| 形が無い (ツリー非表示) | `pane_rect` が空なので全部 `ExistingDropArea`。大きさ・DPI 不一致は全部 NONE |
+| `Folder { path, place: Grid }` (`pane_rect` の外かつ `grid_clip` 内の `grid_folders` に入る) | §4・§5 と同じ判定・転送・完了処理。内部は Ctrl コピー／Shift 移動／既定の予告、自身・配下・同じ親への移動・混在仮想項目・PIDL 失敗は拒否。外部は Shift でも COPY |
+| `GridNonTarget` (`pane_rect` の外かつ `grid_clip` 内の `grid_blocked` に入る) | 内部・外部とも NONE。今のフォルダへのコピーへ流さない |
+| `ExistingDropArea` (上記以外) | 外部ドラッグは今の一覧への落下 (COPY、Drop で `GridFiles`)。mIV 内ドラッグは NONE。画像・動画・音声・本・スタック集約・仮想項目のセルはここに含める |
+| ツリー非表示 | `pane_rect` が空でも一覧のフォルダ判定は有効。一覧部分も空なら全部 `ExistingDropArea`。形自体が無い／大きさ・DPI 不一致は全部 NONE |
+
+`place` は当たり判定と強調表示の場所を区別するだけで、`decide()` の転送規則は変えない。前面で外したフォルダ以外のセルは従来の空白扱いを保ち、本の中への転送は行わない。
+§1.860 の外部ドラッグでは、受理した `Folder` のパスと場所だけを `MainDropShared.hover` に置き、変化時だけ再描画する。内部ドラッグ・非受付・DragLeave・Drop では強調を残さない。一覧の空白は強調しない。
 
 ### 6.4 受付の述語と投入境界 (r1 P2-4)
 

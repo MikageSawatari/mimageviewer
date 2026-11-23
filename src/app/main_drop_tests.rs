@@ -208,6 +208,369 @@ fn ready() -> AppTestEnvForTest {
     app
 }
 
+fn grid_drop_app(view: crate::settings::GridViewMode) -> AppTestEnvForTest {
+    let mut app = ready();
+    let current = app.tmp.path().to_owned();
+    app.current_folder = Some(current.clone());
+    app.top_level_grid_view
+        .replace_surface(super::super::top_level_grid_view::TopLevelGridSurface::Folder);
+    app.normal_folder_omitted_entries = Some(NormalFolderOmittedEntries {
+        folder: current.clone(),
+        omitted: Default::default(),
+    });
+    app.items = vec![
+        GridItem::Folder(current.join("folder-a")),
+        GridItem::Image(current.join("image.jpg")),
+        GridItem::Folder(current.join("folder-b")),
+        GridItem::ZipFile(current.join("book.zip")),
+        GridItem::Stack {
+            key: "stack".into(),
+            representative: current.join("stack.jpg"),
+            count: 2,
+        },
+    ];
+    app.thumbnails = vec![crate::grid_item::ThumbnailState::Failed; app.items.len()];
+    app.image_metas = vec![None; app.items.len()];
+    app.visible_indices = vec![2, 1, 0, 3, 4];
+    app.details_order = app.visible_indices.clone();
+    app.items_are_drive_list = false;
+    app.settings.grid_view_mode = view;
+    app.settings.grid_cols = 2;
+    app.settings.details_selection_bar_mode = crate::settings::DetailsSelectionBarMode::Hidden;
+    app.grid_scroll.set_reveal_requested(false);
+    app
+}
+
+fn grid_drop_pass(app: &mut App, ctx: &egui::Context, overlay: Option<egui::Pos2>) -> DropGeometry {
+    let mut geometry = None;
+    ctx.run_pass(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(640.0, 480.0),
+            )),
+            ..Default::default()
+        },
+        |ctx| {
+            ctx.root_ui(|ui| {
+                app.render_grid(ui);
+            });
+            if let Some(position) = overlay {
+                paint_drop_test_overlay(ctx, "grid_drop_858_overlay", position);
+            }
+            geometry = Some(app.main_drop_geometry(
+                ctx,
+                WindowMetrics {
+                    client_size_px: [640, 480],
+                    dpi: 96,
+                },
+            ));
+        },
+    )
+    .drop_without_applying_deltas();
+    geometry.unwrap()
+}
+
+#[test]
+fn grid_drop_858_real_app_pass_records_folder_paths_in_both_views() {
+    use crate::settings::GridViewMode::{Details, Thumbnail};
+    for view in [Thumbnail, Details] {
+        let mut app = grid_drop_app(view);
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        grid_drop_pass(&mut app, &ctx, None);
+        let geometry = grid_drop_pass(&mut app, &ctx, None);
+        assert_eq!(geometry.grid_folders.len(), 2, "{view:?}");
+        for row in &geometry.grid_folders {
+            assert!(geometry.grid_clip.contains_rect(row.rect));
+            assert!(
+                app.items
+                    .iter()
+                    .any(|item| matches!(item, GridItem::Folder(path) if path == &row.path))
+            );
+        }
+        assert_eq!(
+            geometry.grid_folders[0].path,
+            app.items[2].drag_source_path().unwrap()
+        );
+        assert!(geometry.grid_blocked.is_empty());
+        ctx.run_pass(Default::default(), |ctx| {
+            let stale = app.main_drop_geometry(
+                ctx,
+                WindowMetrics {
+                    client_size_px: [640, 480],
+                    dpi: 96,
+                },
+            );
+            assert!(
+                stale.grid_folders.is_empty(),
+                "a pass without the grid cannot reuse it"
+            );
+            assert_eq!(stale.grid_clip, egui::Rect::NOTHING);
+        })
+        .drop_without_applying_deltas();
+    }
+}
+
+#[test]
+fn grid_drop_858_real_app_pass_nonqualifying_listings_have_no_grid_part() {
+    use super::super::top_level_grid_view::{TopLevelGridSurface, TopLevelSearchView};
+    for view in [
+        crate::settings::GridViewMode::Thumbnail,
+        crate::settings::GridViewMode::Details,
+    ] {
+        for listing in ["search", "missing-marker", "drive-list", "input-blocked"] {
+            let mut app = grid_drop_app(view);
+            let _held = (listing == "input-blocked").then(|| app.hold_book_structure_for_test());
+            match listing {
+                "search" => {
+                    app.top_level_grid_view
+                        .replace_surface(TopLevelGridSurface::Search(TopLevelSearchView::Global));
+                }
+                "missing-marker" => {
+                    app.normal_folder_omitted_entries = None;
+                }
+                "drive-list" => {
+                    app.top_level_grid_view
+                        .replace_surface(TopLevelGridSurface::DriveList);
+                    app.current_folder = None;
+                    app.items_are_drive_list = true;
+                    app.normal_folder_omitted_entries = None;
+                }
+                "input-blocked" => {
+                    assert!(!app.grid_item_input_allowed());
+                }
+                _ => unreachable!(),
+            }
+            let ctx = egui::Context::default();
+            crate::ui_fonts::configure_fonts(&ctx);
+            let geometry = grid_drop_pass(&mut app, &ctx, None);
+            assert!(geometry.grid_folders.is_empty(), "{view:?}/{listing}");
+            assert!(geometry.grid_blocked.is_empty());
+            assert_eq!(geometry.grid_clip, egui::Rect::NOTHING);
+        }
+    }
+}
+
+#[test]
+fn grid_drop_858_real_app_pass_occluded_folder_moves_to_blocked() {
+    for view in [
+        crate::settings::GridViewMode::Thumbnail,
+        crate::settings::GridViewMode::Details,
+    ] {
+        let mut app = grid_drop_app(view);
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        let first = grid_drop_pass(&mut app, &ctx, None);
+        let target = &first.grid_folders[0];
+        let path = target.path.clone();
+        let position = target.rect.min + egui::vec2(2.0, 2.0);
+        grid_drop_pass(&mut app, &ctx, Some(position));
+        let covered = grid_drop_pass(&mut app, &ctx, Some(position));
+        assert!(!covered.grid_folders.iter().any(|row| row.path == path));
+        assert!(
+            covered
+                .grid_blocked
+                .iter()
+                .any(|rect| rect.contains(position))
+        );
+    }
+}
+
+#[test]
+fn grid_drop_858_details_horizontal_scroll_clips_before_tree_tooltip_occlusion() {
+    let mut app = grid_drop_app(crate::settings::GridViewMode::Details);
+    app.settings.details_name_width_auto = false;
+    app.settings.details_name_width = 1200.0;
+    app.selected = Some(2);
+    let ctx = egui::Context::default();
+    crate::ui_fonts::configure_fonts(&ctx);
+    let mut draw = |events: Vec<egui::Event>, tooltip: bool| {
+        let mut result = None;
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    egui::Panel::left("grid_drop_858_tree_space")
+                        .exact_size(200.0)
+                        .show(ui, |ui| {
+                            ui.label("フォルダ");
+                        });
+                    app.render_grid(ui);
+                });
+                let captured = app.capture_main_drop_geometry_with_metrics(
+                    ctx,
+                    WindowMetrics {
+                        client_size_px: [640, 480],
+                        dpi: 96,
+                    },
+                );
+                let row = captured.geometry.grid_folders[0].rect;
+                let selection_fill = ctx.global_style().visuals.selection.bg_fill;
+                let raw_row = ctx.graphics(|graphics| {
+                    graphics
+                        .get(egui::LayerId::background())
+                        .unwrap()
+                        .all_entries()
+                        .find_map(|entry| match &entry.shape {
+                            egui::Shape::Rect(shape)
+                                if shape.fill == selection_fill
+                                    && shape.rect.height() == 28.0
+                                    && shape.rect.width() > 1000.0 =>
+                            {
+                                Some(shape.rect)
+                            }
+                            _ => None,
+                        })
+                        .unwrap()
+                });
+                if tooltip {
+                    egui::Area::new(egui::Id::unique("grid_drop_858_tree_tooltip"))
+                        .order(egui::Order::Tooltip)
+                        .fixed_pos(egui::pos2(20.0, row.top() + 2.0))
+                        .show(ctx, |ui| {
+                            let (rect, _) = ui
+                                .allocate_exact_size(egui::vec2(30.0, 10.0), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 0.0, ui.visuals().panel_fill);
+                        });
+                }
+                result = Some((finalize_main_drop_geometry(ctx, captured), raw_row));
+            },
+        )
+        .drop_without_applying_deltas();
+        result.unwrap()
+    };
+    let (first, raw_before) = draw(vec![], false);
+    let point = first.grid_folders[0].rect.center();
+    draw(
+        vec![
+            egui::Event::PointerMoved(point),
+            egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(-320.0, 0.0),
+                modifiers: egui::Modifiers::NONE,
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+            },
+        ],
+        false,
+    );
+    for _ in 0..12 {
+        draw(vec![], false);
+    }
+    draw(vec![], true);
+    let (geometry, raw_after) = draw(vec![], true);
+    assert!(
+        raw_after.left() < raw_before.left() - 100.0,
+        "fixture must really scroll horizontally"
+    );
+    assert!(
+        raw_after.left() < 50.0,
+        "the uncut row overlaps the tree tooltip"
+    );
+    assert_eq!(geometry.grid_folders.len(), 2);
+    assert!(
+        geometry.grid_blocked.is_empty(),
+        "a tooltip outside the effective clip cannot block the row"
+    );
+    assert!(geometry.grid_clip.left() >= 200.0);
+    for row in &geometry.grid_folders {
+        assert_eq!(row.rect.left(), geometry.grid_clip.left());
+        assert!(geometry.grid_clip.contains_rect(row.rect));
+    }
+}
+
+#[test]
+fn hover_860_app_matches_path_and_place_without_highlighting_other_items() {
+    use crate::main_drop_target::{DropHover, DropPlace};
+    let app = grid_drop_app(crate::settings::GridViewMode::Thumbnail);
+    let target = app.items[2].drag_source_path().unwrap().to_owned();
+    app.main_drop.borrow_mut().hover = Some(DropHover {
+        path: target.clone(),
+        place: DropPlace::Grid,
+    });
+    assert!(app.grid_drop_hover(2));
+    for idx in [0, 1, 3, 4] {
+        assert!(!app.grid_drop_hover(idx));
+    }
+    assert!(!app.main_drop_hover_matches(&target, DropPlace::Tree));
+    app.main_drop.borrow_mut().hover = Some(DropHover {
+        path: target.clone(),
+        place: DropPlace::Tree,
+    });
+    assert!(!app.grid_drop_hover(2));
+    assert!(app.main_drop_hover_matches(&target, DropPlace::Tree));
+    app.main_drop.borrow_mut().hover = None;
+    assert!(!app.grid_drop_hover(2));
+}
+
+#[test]
+fn hover_860_details_folder_name_uses_selection_color() {
+    use crate::main_drop_target::{DropHover, DropPlace};
+    for theme in [
+        crate::os_theme::ResolvedTheme::Light,
+        crate::os_theme::ResolvedTheme::Dark,
+    ] {
+        let mut app = grid_drop_app(crate::settings::GridViewMode::Details);
+        app.selected = None;
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        crate::os_theme::apply_resolved(&ctx, theme);
+        let fill = ctx.global_style().visuals.selection.bg_fill;
+        let rgb = [fill.r(), fill.g(), fill.b()];
+        app.settings.details_name_colors.colors[0] =
+            crate::details_name_colors::DetailsNameColor::Custom {
+                light: rgb,
+                dark: rgb,
+            };
+        app.main_drop.borrow_mut().hover = Some(DropHover {
+            path: app.items[2].drag_source_path().unwrap().to_owned(),
+            place: DropPlace::Grid,
+        });
+        grid_drop_pass(&mut app, &ctx, None);
+        let expected = ctx.global_style().visuals.selection.stroke.color;
+        ctx.run_pass(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                ..Default::default()
+            },
+            |ctx| {
+                ctx.root_ui(|ui| {
+                    app.render_grid(ui);
+                });
+                let actual = ctx.graphics(|graphics| {
+                    graphics
+                        .get(egui::LayerId::background())
+                        .unwrap()
+                        .all_entries()
+                        .find_map(|entry| match &entry.shape {
+                            egui::Shape::Text(text) if text.galley.job.text == "folder-b" => {
+                                Some(text.override_text_color.unwrap_or(text.fallback_color))
+                            }
+                            _ => None,
+                        })
+                });
+                assert_eq!(
+                    actual,
+                    Some(expected),
+                    "hovered folder name must match its selected background"
+                );
+            },
+        )
+        .drop_without_applying_deltas();
+    }
+}
+
 fn transfer(destination: PathBuf) -> ShellTransferRequest {
     ShellTransferRequest {
         sources: vec![PathBuf::from("C:/source/a.jpg")],

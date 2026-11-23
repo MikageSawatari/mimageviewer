@@ -1,6 +1,13 @@
 use super::*;
 use std::cell::Cell;
 
+fn tree_hit(path: PathBuf) -> Hit {
+    Hit::Folder {
+        path,
+        place: DropPlace::Tree,
+    }
+}
+
 fn internal(paths: &[&str]) -> InternalDrag {
     InternalDrag {
         paths: paths.iter().map(PathBuf::from).collect(),
@@ -11,7 +18,7 @@ fn internal(paths: &[&str]) -> InternalDrag {
 
 fn tree(destination: &str, source: Option<&InternalDrag>, keys: u32) -> Decision {
     decide(
-        Some(Hit::TreeRow(destination.into())),
+        Some(tree_hit(destination.into())),
         true,
         source,
         true,
@@ -22,7 +29,7 @@ fn tree(destination: &str, source: Option<&InternalDrag>, keys: u32) -> Decision
 
 fn operation(decision: Decision) -> Option<(ShellTransferOperation, bool)> {
     match decision {
-        Decision::Tree {
+        Decision::Folder {
             operation,
             default_move_needs_volume_check,
             ..
@@ -112,7 +119,7 @@ fn main_drop_external_is_copy_for_every_modifier_and_only_if_source_allows_it() 
         for (has_paths, allows_copy) in [(false, true), (true, false), (false, false)] {
             assert!(
                 !decide(
-                    Some(Hit::TreeRow(r"C:\dst".into())),
+                    Some(tree_hit(r"C:\dst".into())),
                     true,
                     None,
                     has_paths,
@@ -131,7 +138,7 @@ fn main_drop_blockers_and_tree_blank_never_fall_through_to_grid() {
     for internal in [None, Some(&source)] {
         assert!(
             !decide(
-                Some(Hit::TreeRow(r"C:\dst".into())),
+                Some(tree_hit(r"C:\dst".into())),
                 false,
                 internal,
                 true,
@@ -175,14 +182,7 @@ fn main_drop_nodrop_rejected_hits_use_none_and_accepted_external_grid_uses_inval
             assert_eq!(decision.description(), Description::None, "{hit:?}");
         }
     }
-    let no_paths = decide(
-        Some(Hit::TreeRow(r"C:\dst".into())),
-        true,
-        None,
-        false,
-        true,
-        0,
-    );
+    let no_paths = decide(Some(tree_hit(r"C:\dst".into())), true, None, false, true, 0);
     assert!(!no_paths.accepted());
     assert_eq!(no_paths.description(), Description::None);
     let accepted = decide(Some(Hit::ExistingDropArea), true, None, true, true, 0);
@@ -235,9 +235,244 @@ fn geometry(path: &str, ppp: f32) -> DropGeometry {
             rect: rect(20.0, 40.0, 185.0, 60.0),
             path: path.into(),
         }],
+        grid_clip: egui::Rect::NOTHING,
+        grid_folders: Vec::new(),
+        grid_blocked: Vec::new(),
         client_size_px: [800, 600],
         dpi: 96,
         pixels_per_point: ppp,
+    }
+}
+
+#[test]
+fn grid_drop_858_hit_edges_clip_blocked_and_tree_priority() {
+    for ppp in [1.0, 1.5] {
+        let mut geometry = geometry(r"C:\tree", ppp);
+        geometry.grid_clip = rect(0.0, 30.0, 780.0, 590.0);
+        geometry.grid_folders = vec![
+            DropRow {
+                rect: rect(190.0, 40.0, 300.0, 90.0),
+                path: r"C:\grid".into(),
+            },
+            // Deliberately extend beyond the clip to prove hit_test checks it too.
+            DropRow {
+                rect: rect(750.0, 560.0, 800.0, 620.0),
+                path: r"C:\edge".into(),
+            },
+            DropRow {
+                rect: rect(20.0, 40.0, 185.0, 60.0),
+                path: r"C:\behind-tree".into(),
+            },
+        ];
+        geometry.grid_blocked = vec![rect(320.0, 40.0, 420.0, 90.0)];
+        let geometries = VecDeque::from([(1, geometry)]);
+        for (point, expected) in [
+            (
+                [201, 40],
+                Hit::Folder {
+                    path: r"C:\grid".into(),
+                    place: DropPlace::Grid,
+                },
+            ),
+            (
+                [300, 90],
+                Hit::Folder {
+                    path: r"C:\grid".into(),
+                    place: DropPlace::Grid,
+                },
+            ),
+            (
+                [779, 589],
+                Hit::Folder {
+                    path: r"C:\edge".into(),
+                    place: DropPlace::Grid,
+                },
+            ),
+            ([781, 589], Hit::ExistingDropArea),
+            ([779, 591], Hit::ExistingDropArea),
+            ([320, 40], Hit::GridNonTarget),
+            ([420, 90], Hit::GridNonTarget),
+            ([100, 50], tree_hit(r"C:\tree".into())),
+            ([195, 50], Hit::TreeNonTarget),
+            // Nonfolder and stack cells are deliberately absent, so remain blank.
+            ([500, 50], Hit::ExistingDropArea),
+            ([600, 100], Hit::ExistingDropArea),
+        ] {
+            let point = [
+                (point[0] as f32 * ppp) as i32,
+                (point[1] as f32 * ppp) as i32,
+            ];
+            assert_eq!(
+                hit_test(&geometries, Some(1), metrics(), point),
+                Some(expected)
+            );
+        }
+    }
+}
+
+#[test]
+fn grid_drop_858_uses_only_presented_grid_with_matching_metrics() {
+    let make = |path: &str| {
+        let mut geometry = geometry("tree", 1.0);
+        geometry.grid_clip = rect(200.0, 30.0, 780.0, 590.0);
+        geometry.grid_folders = vec![DropRow {
+            rect: rect(250.0, 40.0, 350.0, 90.0),
+            path: path.into(),
+        }];
+        geometry
+    };
+    let geometries = VecDeque::from([(1, make("shown")), (2, make("unshown"))]);
+    for (pass, path) in [(1, "shown"), (2, "unshown")] {
+        assert_eq!(
+            hit_test(&geometries, Some(pass), metrics(), [300, 50]),
+            Some(Hit::Folder {
+                path: path.into(),
+                place: DropPlace::Grid
+            })
+        );
+    }
+    for pass in [None, Some(0), Some(3)] {
+        assert_eq!(hit_test(&geometries, pass, metrics(), [300, 50]), None);
+    }
+    for metrics in [
+        WindowMetrics {
+            dpi: 144,
+            ..metrics()
+        },
+        WindowMetrics {
+            client_size_px: [900, 600],
+            ..metrics()
+        },
+    ] {
+        assert_eq!(hit_test(&geometries, Some(1), metrics, [300, 50]), None);
+    }
+    for ppp in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+        let mut invalid = make("invalid");
+        invalid.pixels_per_point = ppp;
+        assert_eq!(
+            hit_test(
+                &VecDeque::from([(1, invalid)]),
+                Some(1),
+                metrics(),
+                [300, 50]
+            ),
+            None
+        );
+    }
+    let empty = VecDeque::from([(1, geometry("tree", 1.0))]);
+    assert_eq!(
+        hit_test(&empty, Some(1), metrics(), [300, 50]),
+        Some(Hit::ExistingDropArea)
+    );
+}
+
+#[test]
+fn grid_drop_858_folder_decisions_match_tree_for_internal_and_external_sources() {
+    let clean = internal(&[r"C:\src\folder", r"C:\src\image.jpg"]);
+    let cross_drive = internal(&[r"D:\src\folder"]);
+    let mixed_virtual = InternalDrag {
+        excluded_virtual: true,
+        ..clean.clone()
+    };
+    let partial = InternalDrag {
+        failed_paths: 1,
+        ..clean.clone()
+    };
+    let empty = internal(&[]);
+    for source in [
+        None,
+        Some(&clean),
+        Some(&cross_drive),
+        Some(&mixed_virtual),
+        Some(&partial),
+        Some(&empty),
+    ] {
+        for destination in [
+            r"C:\dst",
+            r"C:\src",
+            r"C:\src\folder",
+            r"C:\src\folder\child",
+        ] {
+            for keys in [0, CONTROL, SHIFT, CONTROL | SHIFT, ALT] {
+                for admission in [false, true] {
+                    for allows_copy in [false, true] {
+                        let evaluate = |place| {
+                            decide(
+                                Some(Hit::Folder {
+                                    path: destination.into(),
+                                    place,
+                                }),
+                                admission,
+                                source,
+                                true,
+                                allows_copy,
+                                keys,
+                            )
+                        };
+                        let tree = evaluate(DropPlace::Tree);
+                        let grid = evaluate(DropPlace::Grid);
+                        assert_eq!(grid.accepted(), tree.accepted());
+                        assert_eq!(grid.description(), tree.description());
+                        assert_eq!(operation(grid), operation(tree));
+                    }
+                }
+            }
+        }
+    }
+    for source in [None, Some(&clean)] {
+        let decision = decide(Some(Hit::GridNonTarget), true, source, true, true, 0);
+        assert!(!decision.accepted());
+        assert_eq!(decision.description(), Description::None);
+    }
+}
+
+#[test]
+fn grid_drop_858_folder_request_retains_payload_and_external_copy() {
+    let data = Rc::new(FakeData::default());
+    let source = internal(&[r"C:\src\a", r"C:\src\folder"]);
+    let session = DragSession::new(data.clone(), true, true);
+    let decision = decide(
+        Some(Hit::Folder {
+            path: r"C:\dst".into(),
+            place: DropPlace::Grid,
+        }),
+        true,
+        Some(&source),
+        false,
+        true,
+        0,
+    );
+    let Some(DropRequest::FolderTransfer(request)) =
+        session.drop_request(&decision, Some(&source)).unwrap()
+    else {
+        panic!("folder transfer expected")
+    };
+    assert_eq!(request.sources, source.paths);
+    assert_eq!(request.operation, ShellTransferOperation::Move);
+    assert!(request.default_move_needs_volume_check);
+    assert_eq!(data.reads.get(), 0);
+    assert_eq!(data.queries.get(), 0);
+
+    let session = DragSession::new(data.clone(), true, false);
+    for keys in [0, CONTROL, SHIFT, CONTROL | SHIFT, ALT] {
+        let decision = decide(
+            Some(Hit::Folder {
+                path: r"C:\dst".into(),
+                place: DropPlace::Grid,
+            }),
+            true,
+            None,
+            true,
+            true,
+            keys,
+        );
+        let Some(DropRequest::FolderTransfer(request)) =
+            session.drop_request(&decision, None).unwrap()
+        else {
+            panic!("external folder transfer expected")
+        };
+        assert_eq!(request.operation, ShellTransferOperation::Copy);
+        assert!(!request.default_move_needs_volume_check);
     }
 }
 
@@ -259,7 +494,7 @@ fn main_drop_hit_test_full_row_edges_clip_indent_blank_header_scrollbar_and_over
             ];
             assert_eq!(
                 hit_test(&geometries, Some(1), metrics(), point),
-                Some(Hit::TreeRow(r"C:\row".into()))
+                Some(tree_hit(r"C:\row".into()))
             );
         }
         for point in [[10, 50], [100, 100], [100, 10], [190, 50]] {
@@ -299,12 +534,12 @@ fn main_drop_hit_test_requires_exact_presented_geometry_and_current_size_dpi() {
     // After a skipped present, even the next frame before painting must still use A.
     assert_eq!(
         hit_test(&geometries, Some(10), metrics(), [100, 50]),
-        Some(Hit::TreeRow("shown A".into()))
+        Some(tree_hit("shown A".into()))
     );
     // A discarded first pass is never eligible once the second pass is presented.
     assert_eq!(
         hit_test(&geometries, Some(11), metrics(), [100, 50]),
-        Some(Hit::TreeRow("unshown B".into()))
+        Some(tree_hit("unshown B".into()))
     );
     for presented in [None, Some(9), Some(12)] {
         assert_eq!(hit_test(&geometries, presented, metrics(), [100, 50]), None);
@@ -361,7 +596,7 @@ fn main_drop_geometry_ring_preserves_shown_pass_across_skipped_and_discarded_pas
             metrics(),
             [100, 50]
         ),
-        Some(Hit::TreeRow("shown".into()))
+        Some(tree_hit("shown".into()))
     );
     let mut passes = 0;
     let output = ctx.run_ui(Default::default(), |ui| {
@@ -392,7 +627,7 @@ fn main_drop_geometry_ring_preserves_shown_pass_across_skipped_and_discarded_pas
             metrics(),
             [100, 50]
         ),
-        Some(Hit::TreeRow("presented".into()))
+        Some(tree_hit("presented".into()))
     );
 }
 
@@ -431,7 +666,7 @@ fn main_drop_internal_request_uses_all_original_paths_without_querying_data_obje
         .drop_request(&tree(r"C:\dst", Some(&source), 0), Some(&source))
         .unwrap()
         .unwrap();
-    let DropRequest::TreeTransfer(request) = request else {
+    let DropRequest::FolderTransfer(request) = request else {
         panic!("tree request expected")
     };
     assert_eq!(request.sources, source.paths);
@@ -462,7 +697,7 @@ fn main_drop_external_requests_copy_or_grid_and_only_description_writes_change()
             Description::Invalid
         ]
     );
-    let DropRequest::TreeTransfer(request) =
+    let DropRequest::FolderTransfer(request) =
         session.drop_request(&decision, None).unwrap().unwrap()
     else {
         panic!("tree request expected")

@@ -595,6 +595,28 @@ fn folder_pane_location_light() {
 }
 
 #[test]
+fn hover_860_drop_targets_light() {
+    snapshot_with_theme_at_size(
+        "hover_860_drop_targets_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        egui::vec2(350.0, 340.0),
+        None,
+        mimageviewer::draw_drop_hover_snapshot_fixture,
+    );
+}
+
+#[test]
+fn hover_860_drop_targets_dark() {
+    snapshot_with_theme_at_size(
+        "hover_860_drop_targets_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        egui::vec2(350.0, 340.0),
+        None,
+        mimageviewer::draw_drop_hover_snapshot_fixture,
+    );
+}
+
+#[test]
 fn folder_pane_location_dark() {
     snapshot_with_theme_at_size(
         "folder_pane_location_dark",

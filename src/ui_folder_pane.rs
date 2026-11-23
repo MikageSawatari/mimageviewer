@@ -293,8 +293,10 @@ fn draw_folder_pane_row(
     ui: &mut egui::Ui,
     row: &folder_pane::FolderPaneRow,
     has_focus: bool,
+    drop_target: bool,
     row_height: f32,
 ) -> (egui::Response, egui::Response, egui::Rect) {
+    let drop_background = ui.painter().add(egui::Shape::Noop);
     let drawn = ui.horizontal(|ui| {
         ui.set_height(row_height);
         ui.spacing_mut().item_spacing.x = 2.0;
@@ -326,7 +328,7 @@ fn draw_folder_pane_row(
             egui::vec2(label_width, FOLDER_PANE_ROW_HEIGHT),
             egui::Sense::click(),
         );
-        if let Some(fill) = folder_pane_row_fill(ui.visuals(), background) {
+        if !drop_target && let Some(fill) = folder_pane_row_fill(ui.visuals(), background) {
             ui.painter()
                 .rect_filled(label_rect, ui.visuals().widgets.active.corner_radius, fill);
         }
@@ -354,6 +356,22 @@ fn draw_folder_pane_row(
     // Leading indentation is pane background, not a drop/paste destination.
     let mut row_rect = drawn.response.rect;
     row_rect.min.x = drawn.inner.0.rect.left();
+    if drop_target {
+        ui.painter().set(
+            drop_background,
+            egui::Shape::rect_filled(
+                row_rect,
+                ui.visuals().widgets.active.corner_radius,
+                ui.visuals().selection.bg_fill,
+            ),
+        );
+        ui.painter().rect_stroke(
+            row_rect,
+            ui.visuals().widgets.active.corner_radius,
+            ui.visuals().selection.stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
     debug_assert!(
         (row_rect.height() - row_height).abs() < 0.1,
         "folder pane row allocation differs from its virtual height: {} != {row_height}",
@@ -1423,6 +1441,10 @@ impl App {
                                     ui,
                                     row,
                                     self.folder_pane.has_focus,
+                                    self.main_drop_hover_matches(
+                                        &row.path,
+                                        crate::main_drop_target::DropPlace::Tree,
+                                    ),
                                     row_height,
                                 )
                             },
@@ -1648,6 +1670,29 @@ impl FolderPaneScrollMemory {
 }
 
 #[doc(hidden)]
+pub fn draw_drop_hover_snapshot_fixture(ui: &mut egui::Ui) {
+    ui.label("外からのドラッグの落とし先");
+    for (path, drop_target) in [("通常のフォルダ", false), ("落とし先のフォルダ", true)]
+    {
+        let row = folder_pane::FolderPaneRow {
+            path: path.into(),
+            depth: 0,
+            expanded: false,
+            loading: false,
+            has_children_or_unknown: true,
+            is_active: false,
+            is_cursor: false,
+            error: None,
+        };
+        draw_folder_pane_row(ui, &row, false, drop_target, folder_pane_row_height(ui));
+    }
+    ui.separator();
+    crate::app::draw_drop_hover_snapshot_cells(ui);
+    ui.separator();
+    crate::ui_main::draw_details_drop_hover_snapshot_rows(ui);
+}
+
+#[doc(hidden)]
 pub fn draw_folder_tree_paste_menu_snapshot_fixture(
     ui: &mut egui::Ui,
     enabled: bool,
@@ -1663,7 +1708,7 @@ pub fn draw_folder_tree_paste_menu_snapshot_fixture(
         is_cursor: false,
         error: None,
     };
-    let (_, _, row_rect) = draw_folder_pane_row(ui, &row, false, folder_pane_row_height(ui));
+    let (_, _, row_rect) = draw_folder_pane_row(ui, &row, false, false, folder_pane_row_height(ui));
     if ui.rect_contains_pointer(row_rect)
         && ui.input(|input| input.pointer.button_clicked(egui::PointerButton::Secondary))
     {
@@ -1708,7 +1753,7 @@ pub fn draw_folder_pane_location_snapshot_fixture(ui: &mut egui::Ui) {
                     is_cursor: index == cursor,
                     error: None,
                 };
-                draw_folder_pane_row(ui, &row, has_focus, folder_pane_row_height(ui));
+                draw_folder_pane_row(ui, &row, has_focus, false, folder_pane_row_height(ui));
             }
         });
         ui.separator();
@@ -1740,6 +1785,7 @@ pub fn draw_folder_pane_refresh_snapshot_fixture(ui: &mut egui::Ui) {
                 is_cursor: false,
                 error,
             },
+            false,
             false,
             folder_pane_row_height(ui),
         );
@@ -2439,7 +2485,7 @@ mod tests {
                                     is_active: index == 1, is_cursor: index == 2,
                                     loading, error,
                                 };
-                                let (arrow, label, rect) = draw_folder_pane_row(ui, &row, true, height);
+                                let (arrow, label, rect) = draw_folder_pane_row(ui, &row, true, false, height);
                                 assert_eq!(rect.height(), height,
                                     "fonts={configured_fonts} ppp={pixels_per_point} size={size} interact={interact_height}");
                                 assert_eq!(label.rect.height(), FOLDER_PANE_ROW_HEIGHT);

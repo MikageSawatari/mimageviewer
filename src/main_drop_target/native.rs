@@ -134,7 +134,7 @@ impl MainDropTarget_Impl {
         let hit = (self.locate)(point);
         let shared = self.shared.borrow();
         let decision = decide(
-            hit,
+            hit.clone(),
             shared.admission.is_ok(),
             shared.internal.as_ref(),
             session.has_paths,
@@ -147,7 +147,32 @@ impl MainDropTarget_Impl {
         } else {
             None
         };
+        let hover = if !dropping && shared.internal.is_none() && decision.accepted() {
+            match hit {
+                Some(Hit::Folder { path, place }) => Some(DropHover { path, place }),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        drop(shared);
+        self.set_hover(hover);
         (decision, internal)
+    }
+
+    fn set_hover(&self, hover: Option<DropHover>) {
+        let changed = {
+            let mut shared = self.shared.borrow_mut();
+            if shared.hover == hover {
+                false
+            } else {
+                shared.hover = hover;
+                true
+            }
+        };
+        if changed {
+            self.ctx.request_repaint();
+        }
     }
 
     fn session(&self) -> Option<Rc<DragSession>> {
@@ -183,7 +208,10 @@ impl IDropTarget_Impl for MainDropTarget_Impl {
         let allows_copy = output.0 & DROPEFFECT_COPY.0 != 0;
         *output = DROPEFFECT_NONE;
         self.finish_session();
-        let data = data.as_ref().ok_or(E_INVALIDARG)?;
+        let Some(data) = data.as_ref() else {
+            self.set_hover(None);
+            return Err(E_INVALIDARG.into());
+        };
         let internal = self.shared.borrow().internal.is_some();
         let session = Rc::new(DragSession::new(
             Rc::new(OleData(data.clone())),
@@ -215,6 +243,8 @@ impl IDropTarget_Impl for MainDropTarget_Impl {
             let (decision, _) = self.evaluate(&session, *point, keys.0, false);
             *output = effect(&decision);
             session.describe(decision.description());
+        } else {
+            self.set_hover(None);
         }
         self.helper.over(
             &POINT {
@@ -227,6 +257,7 @@ impl IDropTarget_Impl for MainDropTarget_Impl {
     }
 
     fn DragLeave(&self) -> WinResult<()> {
+        self.set_hover(None);
         self.finish_session();
         self.helper.leave();
         Ok(())
@@ -241,6 +272,7 @@ impl IDropTarget_Impl for MainDropTarget_Impl {
     ) -> WinResult<()> {
         let output = unsafe { output.as_mut() }.ok_or(E_INVALIDARG)?;
         *output = DROPEFFECT_NONE;
+        self.set_hover(None);
         let data = data.as_ref().ok_or(E_INVALIDARG)?;
         if let Some(session) = self.session() {
             let (decision, internal) = self.evaluate(&session, *point, keys.0, true);
@@ -370,9 +402,11 @@ impl DragData for OleData {
         }
         unsafe { ptr.cast::<DROPDESCRIPTION>().write_unaligned(value) };
         let _ = unsafe { GlobalUnlock(hglobal) };
-        // FALSE leaves ownership local even when SetData fails; no completion-effect writes.
-        unsafe { self.0.SetData(&format(cf as u16), &medium.0, false) }
+        // Transfer only on success. A rejected SetData keeps local RAII ownership.
+        // The mIV outer object copies the value and releases the transferred medium.
+        unsafe { self.0.SetData(&format(cf as u16), &medium.0, true) }
             .map_err(|e| e.to_string())?;
+        std::mem::forget(medium);
         update_drag_window(&self.0);
         Ok(())
     }

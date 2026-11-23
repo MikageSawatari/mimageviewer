@@ -1,0 +1,525 @@
+# §1.858 B・2 / §1.860 設計: 移動の前に mIV が持つ handle を手放す、一覧のフォルダへのドロップ、ドラッグ中の落とし先の見え方
+
+2026-11-23 設計 (ClaudeCode)。worktree `G:\home\mimageviewer-dnd858b`、branch `dnd-858b-v57`、基点 master `c8b0ae5c2`。
+要件の正本は [next-release-backlog.md §1.858・§1.860](next-release-backlog.md)。前提の設計は
+[folder-tree-dnd-plan.md](folder-tree-dnd-plan.md) (§1.464・§1.821・§1.858 A) と [file-drag-drop-design.md](file-drag-drop-design.md) §12。
+調査の記録は共有メモ `dnd-858.md`。
+
+**状態: 設計 r3、独立レビュー ACCEPT (Sol xhigh、2026-11-23)。§7 の Q1〜Q4 は利用者が推奨案に決定 (2026-11-23)。実装中。**
+
+## 0. 利用者の決定 (統括経由)
+
+- 2026-11-22: §1.858 の B (mIV が開いたままの ZIP・PDF などを移動の前に手放す) と 2 (一覧のフォルダへのドロップ) は v5.6.0 の後。
+  2 の外部からのドロップはエクスプローラーに合わせる (フォルダのセルへ落としたらそのフォルダの中へ。空白は今いるフォルダ)。
+- 2026-11-23: v5.7.0 に B と 2 を入れる。§1.860 (ツリーへドラッグ中に落とし先の行が変わらない、外部からのドラッグでは説明のバッジも出ない) も
+  2 の強調と一緒に決める。
+- 2026-11-23 (統括経由、AskUserQuestion の回答): §7 の Q1〜Q4 はすべて推奨案。
+  - Q1「コピーだけ (推奨)」: 外部から一覧のフォルダのセルへ落としたときはコピーだけ (Shift でもコピー)。
+  - Q2「外からのときだけ (推奨)」: 落とし先の強調は外部からのドラッグ中だけ。mIV の一覧からはバッジだけ。
+  - Q3「今のまま (推奨)」: 再生中の動画・音声を含むフォルダの移動・名前の変更は、Windows の「使用中」の画面に任せる。
+  - Q4「受け入れる (推奨)」: B の費用 (PDF の描画を待つ上限 5 秒、操作の間の開き直し) を示したうえで受け入れ。
+
+## 1. 結論 (推奨構成)
+
+1. **B: 「変更の囲い」(mutation fence) を 1 つ足す。** 元の場所から項目が消える Shell 操作 (移動・名前の変更・ごみ箱への削除) の worker が、
+   `PerformOperations` の直前に、操作するフォルダの配下を囲いに登録し、終わるまで持つ (ファイルの項目は囲わない。§4.1)。囲いの登録時に、mIV が**長く持ち続ける** handle だけを手放す:
+   ZIP の目次キャッシュの該当分を捨て、PDF worker が開いたままの該当文書を閉じさせる。囲いがある間は、その配下の ZIP・PDF を
+   読むこと自体は止めず、**読み終わった後に開いたまま残さない**。読み手を待たせる・止める・閉じる仕組みは作らない (§3)。
+2. **2: 一覧の実フォルダのセルを、ツリーの行と同じ「フォルダの落とし先」にする。** 当たり判定に `GridFolder(path)` を足し、
+   判定・転送・完了処理はツリーの行と共用する。mIV の一覧からのドラッグはツリーと同じ規則 (同じボリュームは移動、Ctrl でコピー、Shift で移動)。
+   外部からはフォルダのセルならそのフォルダへ、空白なら今のフォルダへ (今と同じ)。外部から落としたときの操作は**コピー** (ツリーと同じ。§7 Q1)。
+3. **§1.860: 外部からのドラッグ中だけ、落とし先の行・セルを mIV が強調する。** mIV の一覧からのドラッグ中は App が止まっていて描けないので、
+   今と同じく説明のバッジで示す (§7 Q2)。外部からのドラッグでバッジが出ないのは、説明を所有権を渡さずに書いていて
+   エクスプローラー側のデータオブジェクトが断るため (開発機で確認)。所有権を渡す書き方にそろえる (§6.2)。
+
+## 2. 現状のコード事実
+
+### 2.1 B: 長く持たれる handle (コードの参照)
+
+| 持ち主 | 中身 | 手放す仕組み |
+| --- | --- | --- |
+| ZIP の目次キャッシュ `ARCHIVE_DIRECTORY_CACHE` (`src/zip_loader.rs:744`) | 最大 8 書庫の LRU。各要素は解析済みの `ZipArchive` で、`build_archive` (673) の `File::open` の `Arc<File>` を持つ。要求ごとの clone は同じ `Arc<File>` を共有する (343)。キーは呼び出し側の字句のパス + mtime + len (39-53) | `retire_mutated_path` (693) は完全一致だけ。呼び出しは `archive_converter.rs:642` (置き換えの前) だけ。移動・名前の変更・削除では何もしない |
+| ZIP を読む入口 | 一覧・サムネイル (`read_first_image_bytes_impl` 2672)、閲覧のページ (2816)、列挙 (1229)、表紙の自動切り出し (3035)、リモート、AI 連携など。プロセス共有なのでどのスレッドからも入る | — |
+| PDF worker の文書キャッシュ `PdfDocumentCache` (`src/pdf_loader.rs:1664`) | PDFium の子プロセスごとに直前 1 冊を開いたまま持つ (既定 5 worker、`settings.rs:198`)。サムネイルも同じ pool を通るので、表示中の本でなくても持つ。dispatcher は worker ごとに持っている文書を `worker_documents` (3275) で知っている | `release_epub_document_for_delete` (3420): 受付を止める gate・待ち行列の退避・全 worker への `MSG_RELEASE_DOCUMENT`・ACK 待ち・guard で再開。パスは完全一致。呼び出しは EPUB の変換キャッシュの削除だけ |
+| 動画・音声の再生、シークのサムネイル、シーク列 (`video/decoder.rs:2460`、`video/thumbnail.rs:278`、`video/seek_strip_thumbs.rs:1226`) | 再生や窓が続く間、FFmpeg の入力を開いたまま | 削除の前だけ `release_viewer_surfaces_for_removed_paths` (`app.rs:49716`) が該当の再生・別窓を閉じる。移動・名前の変更では呼ばない (名前の変更は成功の後に呼ぶ、`rename_item.rs:181`) |
+| 監視 (`search_watcher.rs:77`、今のフォルダの `CurrentFolderWatch` `app.rs:5162`) | お気に入りのルートを再帰で、今のフォルダを直下だけ監視。notify 8.2.2 は `FILE_SHARE_READ|WRITE|DELETE` でディレクトリを開く | 監視を止めれば閉じる。移動の前には何もしない |
+| RAR・LibRaw・WIC・画像の読み込み・フォルダのサムネイルの選定 | 呼び出しの間だけ | 不要 |
+
+### 2.2 B: 操作の入口 (Shell 操作が始まる場所)
+
+| 操作 | 入口 | Shell 操作のスレッド |
+| --- | --- | --- |
+| 移動・コピー (整理先・ツリーへのドロップ) | `submit_shell_transfer_with` (`app/main_drop.rs:104`) → `transfer_items_async` (`shell_file_ops.rs:527`) | `shell-transfer-worker`。検証 → 操作の確定 (既定の移動のボリューム照合) → `PerformOperations` |
+| 一覧へのドロップ (コピーだけ) | `handle_external_file_drop` (`app.rs:52885`) → `transfer_items_blocking` (551) | `file-drop-validate` |
+| 名前の変更 | `start_rename_item_after_confirmation` (`ui_dialogs/rename_item.rs:133`) → `rename_item_async` (837) | `shell-rename-worker` |
+| ごみ箱への削除 | `start_delete_files` (`app.rs:52635`) → `delete_worker` | `delete-worker` (`PerformOperations` は `delete_worker.rs:973`) |
+
+### 2.3 Windows の挙動 (開発側の確認)
+
+- 一時フォルダで、サブフォルダの中のファイルを `ReadWrite|Delete` 共有で開いたままにすると、外側のフォルダの `Directory.Move` は 0x80070005。
+  閉じると成功 (2026-11-22、設計担当が PowerShell で確認)。Rust の `File::open` も読み・書き・削除の共有で開くので、**ZIP の目次キャッシュは
+  それを含むフォルダの移動・名前の変更・ごみ箱への削除を妨げる** (同じ状況)。
+- §1.858 A の実 Shell テスト (2026-11-23、設計担当が実行、エラー画面を出さない設定): 中のファイルを開いたままのフォルダの移動は、
+  項目の結果が `0x80270027` で中断になる。
+- 開発機の実験 (2026-11-23、設計担当が実行。ignored テスト `pdf_loader::tests::handle_858b_probe_retained_handles_vs_rename`、
+  `std::fs::rename` = 同じボリュームの移動・名前の変更):
+
+  | 開いたままのもの | そのファイル・フォルダ自身の名前の変更 | 親フォルダの名前の変更 |
+  | --- | --- | --- |
+  | Rust の `File::open` (ZIP の目次キャッシュと同じ) | 成功 | 0x80070005 (拒否) |
+  | PDFium で開いた文書 (同じプロセス) | 成功 | 0x80070005 (拒否) |
+  | notify と同じ開き方のディレクトリ handle | 成功 (中のファイルの名前の変更も成功) | 0x80070005 (拒否) |
+
+- 削除の実験 (2026-11-23、設計担当が実行。ignored テスト `delete_worker::tests::handle_858b_probe_delete_with_retained_handles`、
+  同じ G: ドライブ (NTFS、ごみ箱あり)。r2 P3-3 で、名前の変更の結果を削除の根拠にしないよう指摘されたため):
+
+  | 開いたままのもの | 本番の `recycle_chunk` (ごみ箱、今の再試行を含む) | `std::fs::remove_file` (`DeleteFileW`) |
+  | --- | --- | --- |
+  | Rust の `File::open` で開いたファイル自身 | 成功、`path_is_gone` = true | 成功、`path_is_gone` = true |
+  | PDFium で開いた PDF 自身 | 成功、`path_is_gone` = true | 成功、`path_is_gone` = true |
+  | Rust の `File::open` で中のファイルを開いたフォルダ | 失敗 (「Shell 操作が中断されました」、中断 true、フォルダは残る) | — |
+
+  ごみ箱の無い場所での Shell の完全削除 (`FOFX_RECYCLEONDELETE` の切り替わり、`delete_worker.rs:633`) は試していない (§11)。
+  `DeleteFileW` が開いたままのファイルでも消えて `path_is_gone` が true になったので、同じになる見込み。
+
+  → mIV の handle が妨げるのは、**開いている項目を含むフォルダ**の移動・名前の変更・ごみ箱への削除。ZIP・PDF のファイル自身を
+  動かすことは妨げない。今のフォルダの監視は今のフォルダ自身を開くので、その子 (一覧の項目) の移動は妨げない。お気に入りの索引の
+  ルートを含むフォルダは妨げる。PDF worker は別のプロセスだが、同じ PDFium の開き方なので同じ結果になる見込み (子プロセスでは試していない)。
+
+### 2.4 2・§1.860: ドロップの受け側
+
+- 当たり判定は表示済みの pass の形 (`DropGeometry`) だけを使う (`main_drop_target.rs:92-127`)。形は `capture_main_drop_geometry_with_metrics`
+  (`app/main_drop.rs:190`) でツリーの行から作り、前面のレイヤーと交わる行を外して (`finalize_main_drop_geometry` 312、`front_layer_rects` 327)、
+  `publish_main_drop_geometry` (app.rs:103866) で積む。
+- 分類は `TreeRow` / `TreeNonTarget` / `ExistingDropArea` の 3 つ。一覧の上は `ExistingDropArea` で、外部からのドラッグは今のフォルダへのコピー
+  (`DropRequest::GridFiles` → `handle_external_file_drop`)、mIV の一覧からのドラッグは NONE (§1.844 の禁止の印)。
+- 一覧の描画: サムネイルは `render_grid` (`ui_main.rs:21319`) の `show_viewport` (21894) で `visible_indices` の行・列を描き、セルの rect は
+  `content_rect.min + (col*cell_w, row*cell_h)` (22015)。詳細表示は `render_details_list` (21528) が `current_grid_order()` の順に行を描く (19533)。
+- 受付の述語: `is_physical_folder_listing` (`app/content_identity_detection.rs:136`) は普通のフォルダの一覧だけ true (ZIP・PDF・検索・タグ・
+  コレクション・ドライブ一覧・別窓の物理スコープは false)。`grid_item_input_allowed` (`filename_stack_ui.rs:2374`) は走査待ち・並べ直し待ち・
+  本の構成変更中・スタックの更新待ちなどで false。
+- 外部からのドラッグ中は `DragOver` が再描画を要求しない (native.rs:206)。Drop だけが要求する。
+- 外部からのドラッグの説明: サブ PC2 担当のログ読み (2026-11-23) で、ツリーの上の 12 回とも `SetData(DropDescription)` が `0x80004001`。
+  mIV の `set_description` は `fRelease = FALSE` で書く (native.rs:369)。§1.836 で、mIV の一覧からのドラッグは mIV 自身のデータオブジェクトが
+  説明を持つ形にして直した (file-drag-drop-design §12.3.1)。外部のデータオブジェクトには同じ手は使えない。
+- 強調の部品: ツリーは `FolderPaneRowBackground` (`ui_folder_pane.rs:141`、選択色の塗り)。サムネイルのセルは選択時に 2px の枠
+  (`app/grid_paint.rs:1649`)。詳細表示の行は `details_row_background` (`ui_main.rs:4594`)。
+- 一覧の項目へ落としたときの特別な動き (本へのページ追加など) は無い。本への追加は閲覧画面の操作 (`start_book_append*`) だけ。
+
+## 3. 状態の組み合わせを減らす検討 (CLAUDE.md「設計の簡素化」)
+
+| 検討した手 | 採否 | 理由 |
+| --- | --- | --- |
+| 移動・名前の変更・削除の間、mIV をモーダルにする | 採らない | 既存の決定 (folder-tree-dnd-plan §9「長いコピー中も閲覧を止めない」) を変える。Shell の確認画面が開いたままの間ずっと閲覧が止まる。モーダルにしても、裏のサムネイル worker や PDF worker の handle は消えない (handle の問題は解けない) |
+| 囲いの配下の読み込みを止めて待たせる (EPUB 削除の gate と同じ形をフォルダへ広げる) | 採らない | 待っている読み手・退避した要求・再開の順序という組み合わせが増える。Shell の画面が開いている間 (数分もあり得る) サムネイル・閲覧のページが止まる。短い読み込みは移動・名前の変更なら Shell の「再試行」、削除なら mIV の今の再試行で済む (§4.4) |
+| 囲いの配下の読み込みは止めず、**読み終わった後に開いたまま残さない** | **採る** | 待つ状態が無い。手放す対象は「キャッシュに残る handle」だけになる。重なった短い読み込みは、移動・名前の変更では Shell の「使用中」の画面の再試行、削除では mIV の今の再試行で通る (読み終わった後に開き直されないので、再試行が効く。§4.4) |
+| ZIP の目次キャッシュを、handle を持たない形 (目次だけ持ち、読むたびに開く) に変える | 採らない | 囲いが要らなくなるが、一覧・閲覧のすべての ZIP 読み込みで開き直しが増える。ネットワーク上の書庫では遅くなり得る (通常の使い方が遅くなる変更に当たる)。置き換えの検出も変わる |
+| 再生中の動画・音声、別窓を、移動の前に閉じる (削除と同じ) | 採らない (§7 Q3) | 利用者が見ている窓を、Shell の確認・取消の前に閉じることになる。取り消したら閉じ損。Shell の「使用中」の画面で知らせる今の動きのまま |
+| 監視 (お気に入りの索引・今のフォルダ) を止める | 採らない | 今のフォルダの監視は今のフォルダ自身を開くだけで、一覧の項目の移動を妨げない (§2.3)。お気に入りのルートを含むフォルダの移動はまれで、移動すれば索引も外れる。Shell の画面に任せ、マニュアルに書く |
+| コピーにも囲いをかける | 採らない | 元を読むだけで、mIV の handle は読み取りの共有を許す。元を消さない |
+| 一覧のフォルダのセルを、ツリーの行と別の落とし先として扱う | 採らない | 同じ「フォルダの落とし先」として判定・転送・完了処理・受付を共用する。違うのは当たり判定の形を作る場所だけ |
+| mIV の一覧からのドラッグ中も描けるようにする (`SHDoDragDrop` を App::update の外へ出す) | 採らない (§7 Q2) | ドラッグ中に App が動くと、フォルダの移動・一覧の入れ替え・選択の変化などとドラッグの組み合わせがすべて現れる。今は App が止まっているので、その組み合わせが無い |
+| 外部からのドロップで、エクスプローラーと同じく移動もする | 採らない (§7 Q1) | ツリーで外部からの移動を受けない理由 (folder-tree-dnd-plan §5: 元へ移動の完了を正しく知らせるには Drop の中で同期に移動するか、元の対応が要る) は、一覧のフォルダでも同じ |
+
+## 4. B: 変更の囲い
+
+### 4.1 対象
+
+元の場所から項目が消える操作の、**フォルダの項目だけ** (r1 P2-4)。
+
+- 移動: 整理先・ツリーへのドロップ・一覧のフォルダへのドロップ (§5) の `Move`。worker が操作を確定した**後** (既定の移動をボリュームの照合で
+  コピーに下げた場合は対象外)。別のボリュームへの移動 (コピー + 削除) も含む。
+- 名前の変更 (`run_rename_item`)。
+- ごみ箱への削除 (`delete_worker`)。完全削除の経路があれば同じ。
+
+囲うのは、操作する項目のうち**フォルダ**の、その**配下** (フォルダ自身は含めない)。§2.3 の実験で、mIV の handle が妨げるのは
+開いている項目を含むフォルダだけで、ZIP・PDF のファイル自身の移動・名前の変更・ごみ箱への削除・`DeleteFileW` は妨げない。ファイルの項目は囲わない
+(ZIP・PDF を 1 冊だけ動かす・名前を変える・削除するときに、待ちも開き直しも増やさない)。
+項目がフォルダかどうかは、worker の検証 (`validate_transfer_request` など) が既に見ている種類を使う。
+
+コピー (一覧へのドロップを含む) は対象外。
+
+### 4.2 囲いの持ち方
+
+新しいモジュール `src/mutation_fence.rs`:
+
+- プロセスで 1 つの登録簿 `Mutex<Vec<(FenceId, Vec<FenceKey>)>>`。`FenceKey` は **`path_key::physical_path_spelling`** の表記
+  (大文字小文字・区切りに加えて `\\?\` と `\\?\UNC\` の接頭辞を外す。r1 P2-1) を component に分けた列。Remote は canonicalize した
+  `\\?\C:\…` 表記で ZIP を読む (`remote_ipc/path_guard.rs:102` → `remote_ipc/container.rs:9800`) ので、通常表記の移動と一致させるのに要る。
+  表記を作れないパス (`physical_path_spelling` が None) は、囲いの側ではログを残して囲わず、キャッシュの側では「囲われていない」と扱う
+  (今と同じ。Shell の「使用中」になり得る)。
+- `MutationFence::begin(folders) -> FenceGuard`: 登録してから (§4.3 の順序)、下の手放しを行う。`FenceGuard` の drop で登録を外す。
+- `covers(path) -> bool`: パスが登録されたどれかのキーの**配下**か (component の前方一致で、キーより長いもの)。キーと同じパスは覆わない (§4.1)。
+- 操作の worker が、`PerformOperations` (名前の変更・削除も同じ位置) の直前に `begin` し、`PerformOperations` と
+  `GetAnyOperationsAborted` が返った後に guard を落とす。成功・失敗・中断のどれでも同じ (RAII)。
+- 同時に複数の操作が走り得る (整理先とツリーは 1 本、名前の変更・削除は別の worker)。登録簿は複数の囲いを持つ。
+
+### 4.3 手放すものと、開いたまま残さない仕組み
+
+**ZIP の目次キャッシュ**:
+
+- `begin` は登録の**後**に、キャッシュの lock の中で、キーが囲いの配下の要素を全部捨てる (新しい `retire_subtree`)。読み込み中の clone が
+  持つ `Arc<File>` は、その読み込みが終わると閉じる。
+- キャッシュへ入れる処理は、同じ lock の中で `covers(path)` を見て、配下なら入れない (その呼び出しで使うだけで捨てる)。
+- 順序: 囲いの登録 → lock → 捨てる。入れる側は lock → 確認 → 入れる。登録の前に確認して入れたものは後の「捨てる」で消え、登録の後に
+  確認したものは入らない。待つ処理は無い。
+- 比べるときは、キャッシュのキー (字句のまま) を `physical_path_spelling` にしてから `covers` に渡す。junction・`subst`・UNC と
+  割り当てたドライブなどの別名は一致しない (§4.5)。
+- r1 の確認: 解析後の `Ready` の公開は全体の lock の外だが、捨てた枠をキャッシュへ戻さない。キャッシュの外の ZIP handle は、
+  処理の終わった後まで持つ常設の持ち主が無い (Sol が確認した経路の範囲)。
+
+**PDF worker の文書キャッシュ**:
+
+- `begin` は登録の後に、dispatcher の queue の lock の中で `worker_documents` を見て、囲いの配下の文書を持つ worker の release 枠に
+  解放の要求を置き、ACK を待つ (既存の `release_epub_document_for_delete` の 4〜6 の段と同じ部品。受付の gate と待ち行列の退避は使わない)。
+  release の要求には、比べるための表記ではなく、**保持している文書の元の `ResolvedReadPath`** (`worker_documents` の identity) を入れる
+  (子プロセスは完全一致で探す。r1 P2-1)。
+- 文書の OPEN の応答を受けた時点 (`worker_documents` を更新する 4982 行の位置、同じ lock の中。r1 の訂正: job の終わりではない) で、
+  その文書が囲いの配下なら、その worker の release 枠に解放の要求を置く (ACK は誰も待たない)。release 枠は次の文書 job より先に
+  処理される (4832) ので、囲いの間に開いた文書も、その job が終われば閉じる。
+- release 枠は今 worker ごとに 1 つ (`Option`)。EPUB 削除の解放と重なり得るので、小さな待ち行列にする。子プロセスの通信 (`MSG_RELEASE_DOCUMENT`、
+  完全一致のパス) は変えない。
+- ACK 待ちは操作の worker スレッドで行う (UI スレッドではない)。ACK は、その worker の**実行中の job が終わった後**に返る
+  (release 枠は dispatcher の次の周回で処理される、4832。r1 P2-4)。期限は 5 秒。期限を過ぎたらログを残して Shell 操作へ進む
+  (Shell の「使用中」の画面になる。まれな失敗の割り切り)。pool が未初期化なら何もしない。
+
+**手放さないもの**: 再生・別窓・監視・短い読み込み (§3)。
+
+### 4.4 囲いの間に起きること
+
+- 一覧・閲覧は止まらない。
+- 短い読み込みと Shell の操作が重なったときの終わり方は、操作によって違う (r2 P2-2。今の作りのまま):
+
+  | 操作 | Shell の画面 | 重なったとき |
+  | --- | --- | --- |
+  | 移動・名前の変更 | 出す (`FOF_ALLOWUNDO` 等だけ、`shell_file_ops.rs`) | 「使用中」の画面になる。再試行で通る (読み終わった後に開き直されない) |
+  | ごみ箱への削除 | 出さない (`FOF_NOERRORUI | FOF_SILENT`、`delete_worker.rs:640`) | mIV の今の有限回の再試行 (`recycle_chunk_with_retry`、566) の間に読み込みが終われば通る。終わらなければ今と同じ削除の失敗の通知になり、利用者がもう一度削除する |
+
+  削除に再試行の仕組みを足さない。囲いが効くのは「キャッシュに残る handle」で、それが消えれば今の再試行で通る見込みが上がる。
+- 操作の後、成功した移動では元のパスはもう無いので、キャッシュは自然に作り直される。
+
+**増える費用** (通常の成功経路で起きる。r1 P2-4。§7 Q4):
+
+| いつ | 何が | どれだけ |
+| --- | --- | --- |
+| フォルダの移動・名前の変更・削除の、Shell の操作が始まる前 | そのフォルダの中の PDF を開いたままの worker が、今の job (ページ・サムネイルの描画など) を終えるのを待つ | その job 1 つ分 (上限 5 秒)。中の PDF を持つ worker が無ければ待たない |
+| 同じ操作の間 (Shell の確認画面が開いている間を含む) | そのフォルダの中の PDF・ZIP を読むたびに開き直す | 1 回の読み込みごとに 1 回の open。中を読まなければ何も増えない |
+| ファイル (ZIP・PDF を含む) 1 つの移動・名前の変更・削除、コピー | 増えない (囲わない、§4.1) | — |
+
+今 (v5.6.0) は、同じ場面で Shell の「使用中」の画面になって操作が止まる (§2.3)。待つ代わりに操作が通るようになる。
+動かしている最中のフォルダの中を読み続けることは普通はしないので、2 段目の費用が目に見えることは少ない見込み。
+
+### 4.5 残る制約 (マニュアル・設計書に書く)
+
+- mIV で再生中の動画・音声 (シーク列・シークのサムネイルを含む) を含むフォルダは、Windows の「使用中」の画面になる。再生を閉じてから再試行する。
+  別窓で開いた静止画は、読み込んだ後は画素とテクスチャだけを持ちファイルを開いたままにしない (`fs_animation.rs:105`) ので妨げない。
+  PDF は共通の worker が持つので §4.3 で手放す (r1 P3-5)。
+- ごみ箱への削除の前に再生・別窓を閉じる今の処理 (`release_viewer_surfaces_for_removed_paths`、`app.rs:52660`) と、名前の変更の成功の後に
+  別窓を閉じる今の処理 (`rename_item.rs:181`) はそのまま。
+- お気に入りで「アイテム索引」をオンにしたフォルダを含むフォルダの移動も、同じになる (§2.3)。
+- パスの別名 (junction・`subst`・割り当てたドライブ) を通して読んだ書庫は、手放せないことがある。
+- これらは失われるものが無い (Shell が操作を止め、§1.858 A の通知が実際の結果を伝える)。
+
+## 5. 2: 一覧のフォルダのセルへのドロップ
+
+### 5.1 形
+
+`DropGeometry` に一覧の部分を足す:
+
+- `grid_clip`: 描画のときの**実効のクリップ** (r1 P2-3)。サムネイルは `show_viewport` の中の `ui.clip_rect()` (スクロールバーを除く)。
+  詳細表示は外側の横の ScrollArea (`ui_main.rs:19444`) と内側の縦の ScrollArea の `inner_rect` (19589) の交差で、今の背景の入力が使う
+  交差 (19637) と同じもの。
+- `grid_folders: Vec<DropRow>`: その pass で描いた `GridItem::Folder` のセルの rect を**先に `grid_clip` で切り**、そのパスと組にしたもの。
+  サムネイルは `visible_indices` の描いた行・列、詳細表示は `current_grid_order()` の描いた行。
+- 切った後の rect が前面のレイヤーと交わるセルは、`grid_folders` から外して **`grid_blocked: Vec<Rect>`** に移す (ツリーの行と同じ
+  `front_layer_rects`、一覧のレイヤーを基準にする)。外したセルの上は「落とせない場所」で、空白 (今のフォルダ) へ流さない (r1 P2-2)。
+- フォルダ以外のセル (画像・動画・音声・本 (ZIP・PDF・RAR など)) の上は、**今と同じく空白と同じ** (外部からなら今のフォルダへのコピー)。
+  r2 で本のセルを禁止にしたが、今の外部ドロップ (本で埋まった一覧へ落としても今のフォルダへコピーできる) を減らすので戻した (r2 P2-1)。
+  エクスプローラーは ZIP の上へ落とすと書庫の中へ入れるが、mIV は今どおり書庫・本の中へは入れない (入れる機能は今回の範囲外)。
+- 一覧の部分を作るのは、その pass で `is_physical_folder_listing()` かつ `grid_item_input_allowed()` のときだけ。それ以外の一覧
+  (検索・タグ・コレクション・ZIP / PDF の中・ドライブ一覧・走査待ち) は一覧の部分が空で、一覧の上は今の `ExistingDropArea` のまま
+  (検索・タグの中は今どおり `handle_external_file_drop` が拒否する)。
+- スタックの集約セル (`GridItem::Stack`)・仮想の項目は落とし先にしない (空白と同じ)。スタックの表示でも、そのまま並ぶ実フォルダのセルは対象。
+
+### 5.2 当たり判定と判定
+
+- `Hit::Folder { path, place: Tree | Grid }` に `TreeRow` を置き換え、`Hit::GridNonTarget` を足す。ツリーの部分を先に見て (今と同じ)、
+  ツリーの外で `grid_clip` の中の `grid_folders` に入れば `Folder { place: Grid }`、`grid_blocked` に入れば `GridNonTarget`
+  (内部・外部とも NONE、禁止の印。ツリーの `TreeNonTarget` と同じ)、それ以外は `ExistingDropArea`。
+- `decide()` は `place` を見ない。mIV の一覧からのドラッグはツリーと同じ規則 (folder-tree-dnd-plan §4.2): 自身・配下・同じ親への移動は拒否、
+  混ざった仮想項目・PIDL 化の失敗は拒否。一覧のフォルダは今の一覧の子なので、ドラッグした項目の親とは別のフォルダになる (同じ親の拒否には当たらない)。
+  ドラッグ中のフォルダ自身のセルの上は「自身」で拒否 (禁止の印)。
+- 外部からのドラッグは `Folder` の上ならコピー (§7 Q1)、`ExistingDropArea` なら今と同じ (今のフォルダへのコピー)。
+- 転送は今の `TreeTransfer` (名前を `FolderTransfer` にする) と同じ: 受付の述語 `shell_transfer_admission` → 本棚の拒否 → 整理先と同じ
+  `FileOrganizeRequest::Running` (同時に 1 本)。完了処理 (`observe_accepted_folder`、今のフォルダが元の親なら `Notified`) も同じ。
+- 説明のバッジ: mIV の一覧からのドラッグは「%1 へ移動」「%1 へコピー」(今のツリーと同じ)。外部からは §6.2。
+
+### 5.3 鮮度
+
+表示済みの pass の形だけを使う今の規則 (folder-tree-dnd-plan §6.2) をそのまま使う。一覧の部分も同じ pass で作り、同じ番号で積む。
+スクロール・窓の大きさ・DPI の変化は、ツリーの行と同じく扱われる。フルスクリーン・別窓の pass では一覧を描かないので、一覧の部分は空。
+
+## 6. §1.860: ドラッグ中の見え方
+
+### 6.1 外部からのドラッグ中の強調
+
+- `MainDropShared` に `hover: Option<DropHover { path, place }>` を足す。`DragEnter` / `DragOver` で、外部からのドラッグ
+  (`internal` が無い) の判定が `Folder` を受け付けたときにそのパスを書き、それ以外・`DragLeave`・`Drop` で消す。変わったときだけ
+  `ctx.request_repaint()`。
+- App は描画のとき `hover` を読み、パスが一致するツリーの行・一覧のセルに「落とし先」の見た目を描く: ツリーの行は選択色の塗り
+  (`FolderPaneRowBackground` と同じ色) と枠、一覧のセルは選択時と同じ 2px の枠、詳細表示の行は選択の背景。今のフォルダ (空白) は強調しない
+  (エクスプローラーも空白では何も強調しない)。
+- パスで照合するので、形の pass と描画の pass がずれても、違う行を強調しない (無ければ描かないだけ)。
+- mIV の一覧からのドラッグでは `hover` を書かない (App が止まっていて描けない。戻った後に古い強調を残さない)。見え方の違いは §7 Q2。
+
+### 6.2 外部からのドラッグの説明のバッジ
+
+開発機の実験 (2026-11-23、設計担当が実行。ignored テスト `main_drop_860_probe_raw_shell_data_object_drop_description_release_modes`、
+`BHID_DataObject` で作った Shell のデータオブジェクト。エクスプローラーのドラッグの元と同じ種類のもの):
+
+| `SetData(DropDescription)` | 結果 | その後の `GetData(DropDescription)` |
+| --- | --- | --- |
+| `fRelease = FALSE` | `0x80004001` (E_NOTIMPL) | `0x80040064` (無い) |
+| `fRelease = TRUE` | S_OK | 書いた値 (`DROPIMAGE_COPY`) が返る |
+
+→ サブ PC2 担当のログの E_NOTIMPL と同じ値。Shell のデータオブジェクトは、所有権を渡さない書き込みを断り、渡す書き込みは受ける。
+
+設計:
+
+- `OleData::set_description` は **`fRelease = TRUE`** で書く (所有権を渡す。`IDataObject::SetData` の文書どおりの使い方)。
+  成功したら medium は相手のもの。失敗したら自分で `ReleaseStgMedium` してログに残す (今と同じく説明なしで続ける)。
+- 書き先が mIV 自身のデータオブジェクト (mIV の一覧からのドラッグ) の場合も、§12.3.1 の外側 owner は TRUE を受けて値をコピーし、
+  medium を 1 回だけ解放する (既存の契約)。書き方は 1 つにそろう。
+- §1.836 の「TRUE なら受理するという未文書化の挙動には依存しない」は、送り元が mIV のときに外側で説明を持つ理由として残す (外側 owner は変えない)。
+  外部の元には外側 owner を置けないので、文書どおりの TRUE で書き、断られたらバッジが出ないだけ (今と同じ) にする。
+- 未確認: 別のプロセスのエクスプローラーが元のときに、バッジが実際に出るか (marshal を通る。サブ PC で確かめる、§9 の 3)。
+  出なくても §6.1 の強調が落とし先を示す。
+
+## 7. 利用者の判断 (2026-11-23 にすべて推奨案で決定、§0)
+
+- **Q1 外部 (エクスプローラー等) から一覧のフォルダのセルへ落としたときの操作。**
+  推奨: **コピーだけ** (ツリーへ外から落としたときと同じ。Shift でもコピー)。
+  別案: エクスプローラーと同じく、同じドライブなら移動。元のアプリへ移動の完了を正しく知らせる仕組みが要り、ツリーと一覧で外からの操作が分かれる。
+- **Q2 ドラッグ中の落とし先の強調。**
+  推奨: **外部からのドラッグ中だけ強調する**。mIV の一覧からのドラッグ中は今と同じく「(フォルダ名) へ移動」のバッジだけ (App が止まっていて描けない)。
+  別案 1: どちらも強調しない (見え方はそろうが、§1.860 の分かりにくさは外部からのドラッグで残る)。
+  別案 2: mIV の一覧からのドラッグ中も描けるように作り変える (§3 の理由で推奨しない。規模も大きい)。
+- **Q3 mIV で再生中の動画・音声を含むフォルダの移動・名前の変更。**
+  推奨: **今のまま** (Windows の「使用中」の画面。再生を閉じてから再試行)。別窓の静止画・PDF は妨げない (§4.5) ので、対象は再生だけ。
+  別案: 削除と同じく、操作の前に該当の再生を閉じる (Windows の画面で取り消した場合も閉じたまま)。
+  削除の前に再生・別窓を閉じる今の処理は、どちらの案でも変えない。
+- **Q4 B で増える費用 (§4.4 の表)。**
+  推奨: **受け入れる**。フォルダを動かすときだけ、中の PDF を開いている worker の今の描画 1 つ分 (上限 5 秒) を待ってから Shell の操作を始め、
+  操作の間はそのフォルダの中の PDF・ZIP を読むたびに開き直す。ZIP・PDF のファイルを 1 冊だけ動かすとき・コピーでは増えない。
+  今は同じ場面で「使用中」になって止まる。
+  別案: 待たずに手放しの要求だけ出して Shell の操作を始める (描画中の worker があると、最初は「使用中」の画面が出て、再試行で通る)。
+- 一覧のフォルダへのドロップを受けるのは普通のフォルダの一覧だけ (検索結果・タグ・コレクションの中のフォルダは対象外) とする。
+  判断が要らない既定として扱う (§5.1)。
+
+## 8. テスト
+
+自動テスト (製品バイナリは起動しない):
+
+- 囲い: `covers` の前方一致 (component 単位、`C:\a` は `C:\ab` を覆わない)、キーと同じパスは覆わない、大文字小文字・区切り・末尾区切り、
+  `\\?\C:\…` と `C:\…`、`\\?\UNC\server\share\…` と `\\server\share\…` の一致、複数の囲い、guard の drop。
+  ファイルの項目だけの操作では囲いを登録しないこと。
+- ZIP: 囲いの配下の要素を捨てる、囲いの間は入れない、囲いの外は今どおり入る。登録と入れる処理の順序 (登録の前に確認して入れた要素が
+  後の捨てる処理で消える) を、差し込み口のある形で検査する。
+- PDF: dispatcher の判定 (囲いの配下の文書を持つ worker だけに、保持している `ResolvedReadPath` のまま解放の要求を置く、囲いの間の OPEN の応答で
+  解放の要求を置く、release の待ち行列で EPUB 削除の解放と重なっても両方届く、実行中の job の後に ACK が返る)。子プロセスを使う部分は既存の pool テストの形。
+- 実 Shell (`#[ignore]`、使い捨てフォルダ): フォルダの中の ZIP を目次キャッシュに入れた状態で、そのフォルダを `transfer_items_blocking` で移動
+  → 囲いがあれば成功、無ければ中断 (RED の確認)。名前の変更・ごみ箱への削除も 1 件ずつ。PDF は pool を使えるテストの形で 1 件。
+  PDF worker の子プロセスが持つ文書で親フォルダの移動が妨げられることを記録として出す (§11)。
+- 当たり判定: 一覧のセルの端、`grid_clip` の外、前面のレイヤーと交わるセルが `GridNonTarget` (今のフォルダへ流れない)、フォルダ以外のセル
+  (画像・本)・スタックの集約セルが空白と同じ (外部からは今のフォルダへのコピー)、ツリーと一覧の優先、一覧の部分が空の一覧 (検索など) では今と同じ
+  `ExistingDropArea`。サムネイルと詳細表示の両方。詳細表示は横にスクロールした状態で、実効のクリップの外の部分が形に入らないこと
+  (ツリーの上に出たツールチップで、見えている詳細の行が外れないこと)。
+- 判定: 一覧のフォルダでも `decide()` がツリーと同じ結果 (内部の移動・コピー・拒否、外部はコピー)。ドラッグ中のフォルダ自身のセルで拒否。
+- 強調: 外部からのドラッグの `DragEnter` / `DragOver` / `DragLeave` / `Drop` で `hover` が変わり、変わったときだけ再描画を要求すること。
+  内部のドラッグでは書かないこと。App の描画が一致するパスの行・セルだけを強調すること (UI のスナップショット)。
+
+## 9. 実機確認 (サブ PC、使い捨てデータ)
+
+1. 一覧のフォルダのセルへ一覧からドラッグ: 同じドライブは移動、Ctrl でコピー、Shift で移動。セルの上で「(フォルダ名) へ移動」のバッジ。
+   ドラッグ中のフォルダ自身のセルの上は禁止の印。
+2. エクスプローラーから一覧のフォルダのセルへ: そのフォルダへコピー。セルが強調される。空白へ落とすと今のフォルダへコピー (今と同じ)。
+3. エクスプローラーからツリーの行へ: 行が強調される。バッジ (§6.2)。
+4. B: ZIP・PDF を一覧で表示した (サムネイルを作った・本として開いた) フォルダを、ツリー・一覧のフォルダへ移動・名前の変更・ごみ箱へ削除
+   → 「使用中」にならずに終わる。v5.6.0 では同じ手順で「使用中」になることを、先に確かめておく (比べるため)。
+5. 再生中の動画を含むフォルダの移動 → 「使用中」の画面 (Q3 が推奨のとき)。
+
+## 10. 文書の更新 (実装時)
+
+- マニュアル: `grid.html` (フォルダツリーの節・ドラッグ＆ドロップの節)、`tut-file-ops.html` (「フォルダツリーへドラッグ」「外から一覧へドロップ」に
+  一覧のフォルダの節を足す)、`shortcuts.html`、`tut-navigation.html` の注意。再生中の項目を含むフォルダは「使用中」になる旨。
+- 設計: 本書、folder-tree-dnd-plan (§3 の「やらない」の更新、§6.3 の分類)、file-drag-drop-design (§11・§12.3.1)、`docs/keymap-spec.md`
+  (グリッドの mouse 表とフォルダツリーペインの段落)、async-architecture (囲い)、virtual-folders (ZIP・PDF のキャッシュの手放し)、`docs/README.md`。
+- キー操作は追加しない (D&D は固定入力)。
+
+## 11. 未確認事項
+
+- PDF worker の子プロセスで開いた文書が、親フォルダの移動を妨げること (§2.3 は同じプロセスでの実験)。実装時の実 Shell テストで記録する。
+- ごみ箱の無い場所で、開いたままのファイル自身を Shell が完全削除できること (§2.3 は `DeleteFileW` での代用)。実装時に、ごみ箱を使わない
+  `IFileOperation` の削除で 1 件記録する。消えなければ、削除だけはファイル自身も囲う (費用は削除のときだけ)。
+- 報告者 (5ch >>872) の「使用中」の画面とキャンセルの有無は未回答。B は回答を待たずに入れる (原因候補の 1 つを消す)。
+
+## 12. レビューの経過
+
+- r1 (df5567cb6) REJECT: P2×4・P3×1。
+  - P2-1 囲いの比較が `\?\` 表記を同一視しない (Remote は canonicalize した表記で ZIP を読む)。→ `physical_path_spelling` で比べ、PDF の解放には保持している元の `ResolvedReadPath` を送る (§4.2・§4.3)。
+  - P2-2 前面の UI で外したフォルダのセルが、空白 (今のフォルダへのコピー) へ流れる。→ `grid_blocked` と `GridNonTarget` (§5.1・§5.2)。本のセルも同じ扱いにした。
+  - P2-3 詳細表示の実効のクリップは横と縦の ScrollArea の交差。→ §5.1。
+  - P2-4 通常の成功経路で増える待ち (実行中の job の終わりまで) と開き直しを、利用者の判断に出す。→ 囲いをフォルダの配下だけにして費用の出る場面を絞り (§4.1)、費用を §4.4 の表と §7 Q4 に出した。
+  - P3-5 別窓は一般には「使用中」にならない (静止画は画素だけ、PDF は共通の worker)。→ §4.5・§7 Q3 を再生だけに絞った。
+  - 妥当と確認されたもの: ZIP の登録 → lock → 捨てる順序、PDF の OPEN の応答での release (受付の gate なし)、worker の境界、コピーへ下げた場合の除外、別ボリュームの移動の包含、外部の強調、`fRelease = TRUE` と外側 owner の契約。detached の述語・viewport の経路には触れない。
+
+- r2 (a8282ce29) REJECT: P2×2・P3×1。
+  - P2-1 本のセルを禁止にすると、今の外部ドロップ (本で埋まった一覧へ落として今のフォルダへコピー) が減る。→ 本のセルは今と同じ空白の扱いに戻した (§5.1)。禁止は前面の UI で外したフォルダのセルだけ。
+  - P2-2 削除は Shell の画面を出さず (`FOF_NOERRORUI | FOF_SILENT`)、今の有限回の再試行の後は失敗を返す。「Shell の画面で再試行」は移動・名前の変更だけ。→ §4.4 で終わり方を操作ごとに分けた。仕組みは足さない。
+  - P3-3 ファイルを囲わない根拠が名前の変更の実験だけ。→ 削除の実験を足した (§2.3)。完全削除の Shell 経路は §11 で実装時に確かめる。
+- r3 (1edf9d983) ACCEPT: 追加の指摘なし。実装時の検証 (子プロセスの PDF worker、ごみ箱の無い場所の Shell の削除、§11) は残る。
+
+## 13. 実装の記録 (段 1)
+
+2026-11-23、`35cc93204` を基点に B だけを実装。ビルド・テスト実行は設計担当の共有 runner に渡す。
+一覧のフォルダへのドロップ・強調・DropDescription・マニュアルは段2に残す。
+
+### 変更ファイルと設計の対応
+
+| ファイル | 対応 |
+| --- | --- |
+| `src/mutation_fence.rs`（新規）、`src/lib.rs` | §4.2。`begin` が component 列の登録後に ZIP/PDF を手放す。`covers` は厳密な配下だけ。guard は自分の登録を外す。`begin_with_releases` が解放の差し込み口、テスト時だけの `without_fence_for_test` が RED 用の囲い除外 |
+| `src/shell_file_ops.rs` | §4.1。`ValidatedTransfer` が既存の検証で得たフォルダを保持。確定した Move だけ囲う。`run_rename_item` も worker でフォルダを確認し、どちらも Shell 実行と中断照会の間だけ保持。テストの Shell UI 抑止は thread-local の差し込み口 |
+| `src/delete_worker.rs` | §4.1・§4.4。通常削除と `recycle_required` の共通経路で予約済みフォルダを囲う。chunk 境界には種類の保持がないため worker で実ファイルの metadata を確認。ZIP もフォルダと返し得る Shell namespace 属性は使わない。既存フラグ・有限再試行は変更しない |
+| `src/zip_loader.rs` | §4.3。`retire_fenced_subtrees` → `ArchiveDirectoryCache::retire_subtree`。登録→cache lock→退役、挿入は同じ lock→確認→挿入。囲い中の template は今回だけ使用。退役した slot の Ready 公開では再登録しない |
+| `src/pdf_loader.rs` | §4.3。worker 別 release を FIFO 化し EPUB 削除と共用。`release_fenced_documents` が元の `ResolvedReadPath` で予約し、操作 worker が ACK を総5秒まで待つ。`record_worker_open_result` は OPEN 応答採用と同じ queue lock 内で予約。`try_pop_dispatch_work` が次の文書 job より先に解放を取る。通信形式・EPUB gate は維持 |
+| `docs/async-architecture.md`、`docs/virtual-folders.md`、本書 | 囲いの所有・寿命・確認箇所・キャッシュ解放・検証待ちを記録 |
+
+分類や表記の確認失敗、PDF の期限切れ・切断はログを残して続行する。回復や再試行の仕組みは追加しない。
+再生・別窓・監視・短い読取、削除前の viewer 解放、名前の変更後の close は変更していない。
+
+### 追加したテスト（未実行）
+
+囲い・操作の選択:
+
+- `fence_858b_covers_physical_components_and_spellings`
+- `fence_858b_multiple_guards_drop_independently`
+- `fence_858b_empty_and_unspellable_do_not_release`
+- `fence_858b_file_only_and_copy_operations_register_none`
+- `fence_858b_downgraded_move_registers_none`
+
+ZIP（ローカル cache と差し込み口で、時刻に依存せず確認）:
+
+- `fence_858b_directory_retirement_preserves_uncovered_slots`
+- `fence_858b_directory_reads_skip_retention_until_guard_drop`
+- `fence_858b_directory_registration_between_check_and_insert_is_retired`
+- `fence_858b_directory_retirement_matches_verbatim_cache_path`
+
+PDF（fake queue、子プロセスなし）:
+
+- `fence_858b_releases_only_covered_workers_with_original_read_path`
+- `fence_858b_open_response_queues_release_before_job_completion`
+- `fence_858b_epub_and_fence_releases_keep_fifo_and_both_acknowledge`
+- `fence_858b_ack_follows_inflight_job_and_precedes_next_document`
+- `fence_858b_uninitialized_pool_does_not_start_workers`
+
+実 Shell（すべて `#[ignore]`、使い捨てフォルダ、前3件は共有 ZIP cache の RED/green）:
+
+- `fence_858b_real_move_cached_zip_folder`
+- `fence_858b_real_rename_cached_zip_folder`
+- `fence_858b_real_recycle_cached_zip_folder`
+- `fence_858b_real_permanent_delete_held_zip_and_pdf`
+- `fence_858b_real_child_document_blocks_parent_move_until_release`
+
+最後のテストは準備済み `target/portable-smoke/mimageviewer.exe` の PDF worker だけを使う。
+専用 pool・使い捨て data を持ち、囲い除外の Shell 移動と、local pool の解放後の Shell 移動を比べる。
+共有 cache を使う実 Shell テストは、確認する cache が他のテストで退役しないよう、単独または直列で実行する。
+
+### 残る確認
+
+- コンパイル・自動テスト・ignored テストは未実行。実装担当は利用者指定によりコンパイラ・製品バイナリを起動しない。
+- §11 の PDF 子プロセスが親の移動を妨げるという前提は、上の ignored テストの結果待ち。
+- §11 の Shell 完全削除は `path_is_gone` を出力する probe を追加しただけで、まだ結果がない。
+  消えない結果なら削除だけのファイル項目も囲う設計判断が要る。現時点では対象を広げていない。
+- 外部ドラッグのバッジは段2とサブ PC での実機確認に残す。
+
+## 14. 実装の記録 (段 2)
+
+2026-11-23、段1の変更の囲いは変更せず、§5・§6・§10を実装。
+転送側と文書更新は Sol high に部分委任し、App描画側は本セッションで実装。
+独立した静的レビューは Sol xhigh に委任した。親セッションのモデル設定は変更していない。
+ビルド・テスト・PNG生成・実機確認は設計担当の共有 runner と検証セッションへ渡す。
+実装担当はコンパイラ・製品バイナリを起動せず、コミットもしない。
+
+### 変更箇所と設計の対応
+
+| 設計 | ファイル・入口 | 実装 |
+| --- | --- | --- |
+| §5.1・§5.3 | `ui_main.rs::render_grid` / `render_details_list`、`app/main_drop.rs::record_main_drop_grid_geometry` | 実フォルダ一覧かつ入力可能な pass の描画済み `Folder` だけを記録。サムネイルは `show_viewport` の clip、詳細は背景入力と同じ横 ScrollArea と縦 `inner_rect` の交差で先に切る。pass と layer を ctx の一時データに保持し、ツリーと同じ capture / publish に載せる。描画しない pass は再利用しない |
+| §5.1 | `app/main_drop.rs::finalize_main_drop_geometry` | 一覧の layer より手前にある、その pass で描かれた layer を既存 helper で集める。切ったフォルダと交わるものだけ `grid_blocked` へ移す。ツリー側だけの tooltip は、横スクロールした行の画面外部分に交わっても一覧を除外しない |
+| §5.2 | `main_drop_target.rs::hit_test` / `decide` / `DragSession::drop_request`、`app/main_drop.rs::consume_main_drops_with` | ツリー優先で `Folder { path, place }`、一覧の除外セルは `GridNonTarget`。非フォルダは従来の空白扱い。転送判定は場所を見ず、外部はコピーだけ。`FolderTransfer` は従来の `submit_shell_transfer` へ渡し、受付・本棚拒否・Running・完了処理を共用 |
+| §6.1 | `main_drop_target/native.rs::evaluate` / `set_hover` と OLE callbacks | 外部の受理済みフォルダだけ path / place を保持。非受付・Leave・Dropで消す。hover の変化時だけ再描画を要求し、既存の Drop 要求通知の wake は保つ。COM呼出中は共有状態を借用しない |
+| §6.1 | `app/main_drop.rs::main_drop_hover_matches` / `grid_drop_hover`、`ui_folder_pane.rs::draw_folder_pane_row`、`ui_main.rs::draw_details_row`、`app/grid_paint.rs::draw_grid_drop_target` | パスと場所が合う行／セルだけを強調。ツリーは選択色の塗りと枠、サムネイルは2px枠、詳細は選択背景。色は `ui.visuals()` を使う。空白の強調は足さない |
+| §6.2 | `main_drop_target/native.rs::OleData::set_description` | `SetData(TRUE)` 成功時に medium を相手へ渡す。失敗時は RAII で解放し既存のログを残す。mIV外側 owner のコピー・一度だけの解放の契約は変更しない |
+| §8 | `app/main_drop_tests.rs`、`main_drop_target/tests.rs`、`main_drop_target/native/tests.rs`、`tests/ui_snapshot.rs` | 下記の未実行回帰を追加。生の Shell object の probe は、既存STA guard内で本番writerを使う通常のheadless assertionへ置き換え |
+| §10 | マニュアル4本、`folder-tree-dnd-plan.md`、`file-drag-drop-design.md`、`keymap-spec.md`、`ui-snapshot-policy.md` | 一覧のフォルダ・外部コピー・外部だけの強調・再生中の「使用中」を反映。D&Dは固定入力のまま。外部バッジの別プロセス表示は未確認とする |
+
+新しい同期I/O・待機・遅延・再試行・周期repaintは追加していない。
+detached述語・viewport経路・変更の囲いには触れていない。コード上の設計前提に矛盾は見つかっていない。
+
+### テスト定義（すべて未実行）
+
+`src/main_drop_target/tests.rs`:
+
+- `grid_drop_858_hit_edges_clip_blocked_and_tree_priority`
+- `grid_drop_858_uses_only_presented_grid_with_matching_metrics`
+- `grid_drop_858_folder_decisions_match_tree_for_internal_and_external_sources`
+- `grid_drop_858_folder_request_retains_payload_and_external_copy`
+
+`src/app/main_drop_tests.rs`:
+
+- `grid_drop_858_real_app_pass_records_folder_paths_in_both_views`
+- `grid_drop_858_real_app_pass_nonqualifying_listings_have_no_grid_part`
+- `grid_drop_858_real_app_pass_occluded_folder_moves_to_blocked`
+- `grid_drop_858_details_horizontal_scroll_clips_before_tree_tooltip_occlusion`
+- `hover_860_app_matches_path_and_place_without_highlighting_other_items`
+- `hover_860_details_folder_name_uses_selection_color`
+
+`src/main_drop_target/native/tests.rs`:
+
+- `hover_860_own_outer_description_true_round_trip_and_replace`
+- `hover_860_external_callbacks_track_path_place_and_repaint_only_changes`
+- `hover_860_drop_clears_hover_and_preserves_request_wake`
+- `hover_860_internal_and_rejected_sources_never_acquire_hover`
+- `hover_860_rejection_and_missing_session_clear_previous_hover`
+- `hover_860_raw_shell_description_true_round_trip`
+
+`tests/ui_snapshot.rs`:
+
+- `hover_860_drop_targets_light`
+- `hover_860_drop_targets_dark`
+
+### 確認待ち
+
+- Sol xhigh の独立静的レビューは ACCEPT。詳細行の名前色にhover選択状態が渡らない指摘を修正し、
+  本番の名前rendererを使うfixtureと、明暗・未選択・custom色の実App描画回帰を追加して再確認した。
+  未解決指摘なし。コンパイル・実行の代わりとなる証拠ではない。
+- 共有runnerでのコンパイル・上記回帰・既存関連テスト。実装担当は実行していない。
+- スナップショット2枚の生成・目視・更新指定なしの比較。PNGは追加していない。
+- §9の内部転送・自身拒否・外部コピー先・外部強調と、別プロセスExplorerのバッジの実機確認。
+- UI固定文字列の追加はsnapshot fixture内だけだが、グリフ検査も設計担当に渡す。
+
+## 15. 検証と検収 (2026-11-23、設計担当)
+
+- 段 1 `8daf91a0d`、段 2 `634db5873`、テストの API 名の修正と UI スナップショット `c3e9d3189`。
+- 共有 runner でのテスト (設計担当が実行、製品は起動していない):
+  - 段 1: 関連 295 件が成功。実 Shell の ignored 4 件 (`fence_858b_real_move_cached_zip_folder`・`_rename_cached_zip_folder`・
+    `delete_worker` の `_recycle_cached_zip_folder`・`_permanent_delete_held_zip_and_pdf`) が成功。移動・名前の変更・ごみ箱への削除は、
+    囲いなしで中断 (RED)、囲いありで完了 (GREEN)。開いたままの ZIP・PDF 自身の Shell の完全削除は `path_is_gone` = true (§11 の 2 件目は解消)。
+  - 段 2: 関連 421 件が成功。UI スナップショット 272 件が成功 (`hover_860_drop_targets_light` / `_dark` を新しく作り、目で確かめた)。
+    `check_ui_glyphs.py` 成功。
+- 独立レビュー (実装者とは別の Sol xhigh): 指摘なしで ACCEPT。
+- build-dev 成功。
+- 残る確認 (サブ PC): PDF worker の子プロセスで開いた文書を含むフォルダの移動 (`fence_858b_real_child_document_blocks_parent_move_until_release` は
+  portable-smoke の exe を子に使う ignored テストで、まだ流していない)、別プロセスのエクスプローラーからのドラッグで説明のバッジが出るか、
+  外からのドラッグ中の強調の見え方。依頼文は `C:\home\mimageviewer-subpc\dnd858b\brief.md`。

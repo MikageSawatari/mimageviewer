@@ -13,6 +13,7 @@ pub(crate) struct MainDropShared {
     pub(crate) geometries: VecDeque<(u64, DropGeometry)>,
     pub(crate) admission: Result<(), String>,
     pub(crate) internal: Option<InternalDrag>,
+    pub(crate) hover: Option<DropHover>,
     pub(crate) drops: Vec<DropRequest>,
 }
 
@@ -22,6 +23,7 @@ impl Default for MainDropShared {
             geometries: VecDeque::new(),
             admission: Err("ドロップの準備ができていません".into()),
             internal: None,
+            hover: None,
             drops: Vec::new(),
         }
     }
@@ -37,7 +39,7 @@ pub(crate) struct InternalDrag {
 #[derive(Debug)]
 pub(crate) enum DropRequest {
     GridFiles(Vec<PathBuf>),
-    TreeTransfer(ShellTransferRequest),
+    FolderTransfer(ShellTransferRequest),
     Failed(String),
 }
 
@@ -52,6 +54,9 @@ pub(crate) struct DropGeometry {
     pub(crate) pane_rect: egui::Rect,
     pub(crate) tree_clip: egui::Rect,
     pub(crate) rows: Vec<DropRow>,
+    pub(crate) grid_clip: egui::Rect,
+    pub(crate) grid_folders: Vec<DropRow>,
+    pub(crate) grid_blocked: Vec<egui::Rect>,
     pub(crate) client_size_px: [i32; 2],
     pub(crate) dpi: u32,
     pub(crate) pixels_per_point: f32,
@@ -89,10 +94,23 @@ pub(crate) fn publish_geometry(
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DropPlace {
+    Tree,
+    Grid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DropHover {
+    pub(crate) path: PathBuf,
+    pub(crate) place: DropPlace,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Hit {
-    TreeRow(PathBuf),
+    Folder { path: PathBuf, place: DropPlace },
     TreeNonTarget,
+    GridNonTarget,
     ExistingDropArea,
 }
 
@@ -115,15 +133,39 @@ fn hit_test(
         client_px[0] as f32 / geometry.pixels_per_point,
         client_px[1] as f32 / geometry.pixels_per_point,
     );
-    if !geometry.pane_rect.contains(point) {
-        return Some(Hit::ExistingDropArea);
+    if geometry.pane_rect.contains(point) {
+        if geometry.tree_clip.contains(point)
+            && let Some(row) = geometry.rows.iter().find(|row| row.rect.contains(point))
+        {
+            return Some(Hit::Folder {
+                path: row.path.clone(),
+                place: DropPlace::Tree,
+            });
+        }
+        return Some(Hit::TreeNonTarget);
     }
-    if geometry.tree_clip.contains(point)
-        && let Some(row) = geometry.rows.iter().find(|row| row.rect.contains(point))
-    {
-        return Some(Hit::TreeRow(row.path.clone()));
+    if geometry.grid_clip.contains(point) {
+        if let Some(row) = geometry
+            .grid_folders
+            .iter()
+            .find(|row| row.rect.contains(point))
+        {
+            return Some(Hit::Folder {
+                path: row.path.clone(),
+                place: DropPlace::Grid,
+            });
+        }
+        // App removes covered folders before publishing these disjoint collections.
+        // A front layer must never redirect a covered folder drop to the list blank.
+        if geometry
+            .grid_blocked
+            .iter()
+            .any(|rect| rect.contains(point))
+        {
+            return Some(Hit::GridNonTarget);
+        }
     }
-    Some(Hit::TreeNonTarget)
+    Some(Hit::ExistingDropArea)
 }
 
 /// Numeric OLE modifiers, passed by the drag loop (never sampled from live keys).
@@ -142,7 +184,7 @@ enum Description {
 enum Decision {
     None(Description),
     Grid,
-    Tree {
+    Folder {
         destination: PathBuf,
         operation: ShellTransferOperation,
         default_move_needs_volume_check: bool,
@@ -158,7 +200,7 @@ impl Decision {
         match self {
             Self::None(description) => description.clone(),
             Self::Grid => Description::Invalid,
-            Self::Tree {
+            Self::Folder {
                 destination,
                 operation,
                 ..
@@ -204,8 +246,8 @@ fn decide(
         return Decision::None(Description::None);
     };
     let destination = match hit {
-        Hit::TreeRow(path) => path,
-        Hit::TreeNonTarget => return Decision::None(Description::None),
+        Hit::Folder { path, .. } => path,
+        Hit::TreeNonTarget | Hit::GridNonTarget => return Decision::None(Description::None),
         Hit::ExistingDropArea => {
             return if internal.is_none() && external_has_paths && source_allows_copy {
                 Decision::Grid
@@ -219,7 +261,7 @@ fn decide(
     }
     let Some(internal) = internal else {
         return if external_has_paths {
-            Decision::Tree {
+            Decision::Folder {
                 destination,
                 operation: ShellTransferOperation::Copy,
                 default_move_needs_volume_check: false,
@@ -270,7 +312,7 @@ fn decide(
     }) {
         return Decision::None(Description::None);
     }
-    Decision::Tree {
+    Decision::Folder {
         destination,
         operation,
         default_move_needs_volume_check: default && operation == ShellTransferOperation::Move,
@@ -332,7 +374,7 @@ impl DragSession {
                 }
                 Ok(Some(DropRequest::GridFiles(paths)))
             }
-            Decision::Tree {
+            Decision::Folder {
                 destination,
                 operation,
                 default_move_needs_volume_check,
@@ -344,7 +386,7 @@ impl DragSession {
                 if sources.is_empty() {
                     return Err("ドロップする項目がありません".into());
                 }
-                Ok(Some(DropRequest::TreeTransfer(ShellTransferRequest {
+                Ok(Some(DropRequest::FolderTransfer(ShellTransferRequest {
                     operation: *operation,
                     default_move_needs_volume_check: *default_move_needs_volume_check,
                     sources,

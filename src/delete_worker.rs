@@ -925,6 +925,7 @@ fn recycle_chunk_with_policy(
     let mut succeeded = Vec::new();
     let mut failed = Vec::new();
     let mut scheduled = Vec::new();
+    let mut scheduled_folders = Vec::new();
     for path in paths {
         let wide = wide_null_path(path);
         let item: IShellItem = match unsafe {
@@ -959,6 +960,17 @@ fn recycle_chunk_with_policy(
             continue;
         }
         scheduled.push((path.clone(), callback));
+        // This chunk boundary has no retained GridItem kind (also used by Append Undo).
+        // Classify on the worker, after scheduling succeeds. Shell's SFGAO_FOLDER can
+        // also describe a ZIP namespace, so use the physical filesystem kind instead.
+        match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => scheduled_folders.push(path.clone()),
+            Ok(_) => {}
+            Err(error) => crate::logger::log(format!(
+                "[delete] mutation fence cannot classify {}: {error}",
+                path.display()
+            )),
+        }
     }
 
     if scheduled.is_empty() {
@@ -970,10 +982,14 @@ fn recycle_chunk_with_policy(
         };
     }
 
-    let perform_error = unsafe { op.PerformOperations() }.err();
-    let shell_aborted = unsafe { op.GetAnyOperationsAborted() }
-        .map(|v| v.as_bool())
-        .unwrap_or(false);
+    let (perform_error, shell_aborted) = {
+        let _fence = crate::mutation_fence::begin(&scheduled_folders);
+        let perform_error = unsafe { op.PerformOperations() }.err();
+        let shell_aborted = unsafe { op.GetAnyOperationsAborted() }
+            .map(|v| v.as_bool())
+            .unwrap_or(false);
+        (perform_error, shell_aborted)
+    };
     let retryable = is_retryable_shell_failure(
         shell_aborted,
         perform_error.as_ref().map(|error| error.code().0),
@@ -1741,5 +1757,223 @@ mod tests {
         assert_ne!(flags & FOFX_EARLYFAILURE.0, 0);
         assert_eq!(flags & FOF_WANTNUKEWARNING.0, 0);
         assert_ne!(super::recycle_flags().0 & FOF_WANTNUKEWARNING.0, 0);
+    }
+
+    /// Real Shell regression: the process-shared ZIP directory cache prevents
+    /// recycling its parent without a fence, and production recycle releases it.
+    #[test]
+    #[ignore = "uses the real Windows recycle bin with disposable folders"]
+    fn fence_858b_real_recycle_cached_zip_folder() {
+        struct CachedZipCleanup(std::path::PathBuf);
+        impl Drop for CachedZipCleanup {
+            fn drop(&mut self) {
+                crate::zip_loader::retire_archive_directory_for_mutation(&self.0);
+            }
+        }
+
+        let root = tempfile::Builder::new()
+            .prefix("miv-fence-858b-recycle-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let red_folder = root.path().join("without-fence");
+        let green_folder = root.path().join("with-fence");
+        std::fs::create_dir(&red_folder).unwrap();
+        std::fs::create_dir(&green_folder).unwrap();
+        let red_zip = red_folder.join("cached.zip");
+        let green_zip = green_folder.join("cached.zip");
+        // Drop cache handles even if an assertion fails, before TempDir cleanup.
+        let red_cleanup = CachedZipCleanup(red_zip.clone());
+        let _green_cleanup = CachedZipCleanup(green_zip.clone());
+        crate::zip_loader::fence_858b_cache_zip(&red_zip);
+        crate::zip_loader::fence_858b_cache_zip(&green_zip);
+
+        let red = crate::mutation_fence::without_fence_for_test(|| {
+            super::recycle_chunk(0, std::slice::from_ref(&red_folder))
+        });
+        eprintln!(
+            "858b recycle RED: succeeded={:?} failed={:?} aborted={} path_is_gone={}",
+            red.succeeded,
+            red.failed,
+            red.shell_aborted,
+            super::path_is_gone(&red_folder)
+        );
+        drop(red_cleanup);
+        assert!(
+            red.shell_aborted,
+            "cached ZIP must interrupt parent recycle"
+        );
+        assert!(red.succeeded.is_empty());
+        assert_eq!(red.failed.len(), 1);
+        assert!(red_folder.exists());
+
+        let green = super::recycle_chunk(0, std::slice::from_ref(&green_folder));
+        eprintln!(
+            "858b recycle GREEN: succeeded={:?} failed={:?} aborted={} path_is_gone={}",
+            green.succeeded,
+            green.failed,
+            green.shell_aborted,
+            super::path_is_gone(&green_folder)
+        );
+        assert!(green.failed.is_empty(), "{:?}", green.failed);
+        assert!(!green.shell_aborted);
+        assert_eq!(green.succeeded, vec![green_folder.clone()]);
+        assert!(super::path_is_gone(&green_folder));
+    }
+
+    /// Observe the actual non-recycling Shell delete path, rather than using
+    /// DeleteFileW as a proxy. A failure leaves the file for TempDir cleanup.
+    #[test]
+    #[ignore = "permanently deletes disposable files through real IFileOperation"]
+    fn fence_858b_real_permanent_delete_held_zip_and_pdf() {
+        use windows::Win32::System::Com::{
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+            CoUninitialize,
+        };
+        use windows::Win32::UI::Shell::{
+            FileOperation, IFileOperation, IFileOperationProgressSink, IShellItem,
+            SHCreateItemFromParsingName,
+        };
+        use windows::core::{IUnknown, PCWSTR};
+
+        struct ComGuard;
+        impl Drop for ComGuard {
+            fn drop(&mut self) {
+                unsafe { CoUninitialize() };
+            }
+        }
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+            .ok()
+            .unwrap();
+        let _com = ComGuard;
+        let permanent_delete = |label: &str, path: &std::path::Path| {
+            let op: IFileOperation = unsafe {
+                CoCreateInstance(&FileOperation, None::<&IUnknown>, CLSCTX_INPROC_SERVER)
+            }
+            .unwrap();
+            // No ALLOWUNDO, RECYCLEONDELETE or ADDUNDORECORD: force the actual
+            // permanent-delete route, while suppressing Shell prompts in this probe.
+            unsafe { op.SetOperationFlags(FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT) }
+                .unwrap();
+            let wide = super::wide_null_path(path);
+            let item: IShellItem = unsafe {
+                SHCreateItemFromParsingName(
+                    PCWSTR(wide.as_ptr()),
+                    None::<&windows::Win32::System::Com::IBindCtx>,
+                )
+            }
+            .unwrap();
+            unsafe { op.DeleteItem(&item, None::<&IFileOperationProgressSink>) }.unwrap();
+            let returned = unsafe { op.PerformOperations() };
+            let aborted = unsafe { op.GetAnyOperationsAborted() }.map(|value| value.as_bool());
+            eprintln!(
+                "858b permanent delete: {label}: returned={returned:?} aborted={aborted:?} path_is_gone={}",
+                super::path_is_gone(path)
+            );
+        };
+
+        let root = tempfile::Builder::new()
+            .prefix("miv-fence-858b-permanent-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let zip = root.path().join("held.zip");
+        crate::zip_loader::fence_858b_cache_zip(&zip);
+        crate::zip_loader::retire_archive_directory_for_mutation(&zip);
+        let held_zip = std::fs::File::open(&zip).unwrap();
+        permanent_delete("ZIP held by Rust File", &zip);
+        drop(held_zip);
+
+        let pdf = root.path().join("held.pdf");
+        std::fs::write(&pdf, crate::pdf_loader::probe_minimal_pdf_for_858b()).unwrap();
+        let dll = std::path::Path::new("vendor/pdfium/bin");
+        let bindings = pdfium_render::prelude::Pdfium::bind_to_library(
+            pdfium_render::prelude::Pdfium::pdfium_platform_library_name_at_path(
+                dll.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+        let pdfium = pdfium_render::prelude::Pdfium::new(bindings);
+        let document = pdfium.load_pdf_from_file(&pdf, None).unwrap();
+        permanent_delete("PDF held by in-process PDFium", &pdf);
+        drop(document);
+    }
+
+    /// §1.858 B probe (ignored, prints only): recycle and plain delete of a file that
+    /// mIV-style readers keep open, and recycle of a folder containing such a file.
+    #[test]
+    #[ignore]
+    fn handle_858b_probe_delete_with_retained_handles() {
+        use windows::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize,
+        };
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let root = tempfile::tempdir().unwrap();
+        let report = |label: &str, path: &std::path::Path, outcome: super::DeleteChunkOutcome| {
+            eprintln!(
+                "858b delete probe: {label}: succeeded={} failed={:?} aborted={} gone={}",
+                outcome.succeeded.len(),
+                outcome.failed,
+                outcome.shell_aborted,
+                super::path_is_gone(path)
+            );
+        };
+        // (a) Rust File (share R|W|D), as the ZIP directory cache holds it.
+        let a = root.path().join("held.zip");
+        std::fs::write(&a, b"probe").unwrap();
+        let held = std::fs::File::open(&a).unwrap();
+        report(
+            "recycle file held by Rust File",
+            &a,
+            super::recycle_chunk(0, &[a.clone()]),
+        );
+        drop(held);
+        let b = root.path().join("held2.zip");
+        std::fs::write(&b, b"probe").unwrap();
+        let held = std::fs::File::open(&b).unwrap();
+        let removed = std::fs::remove_file(&b);
+        eprintln!(
+            "858b delete probe: DeleteFile on file held by Rust File: {removed:?} gone={}",
+            super::path_is_gone(&b)
+        );
+        drop(held);
+        // (b) PDFium in-process document.
+        let c = root.path().join("held.pdf");
+        std::fs::write(&c, crate::pdf_loader::probe_minimal_pdf_for_858b()).unwrap();
+        let dll = std::path::Path::new("vendor/pdfium/bin");
+        let bindings = pdfium_render::prelude::Pdfium::bind_to_library(
+            pdfium_render::prelude::Pdfium::pdfium_platform_library_name_at_path(
+                dll.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+        let pdfium = pdfium_render::prelude::Pdfium::new(bindings);
+        let document = pdfium.load_pdf_from_file(&c, None).unwrap();
+        report(
+            "recycle PDF held by PDFium",
+            &c,
+            super::recycle_chunk(0, &[c.clone()]),
+        );
+        drop(document);
+        let d = root.path().join("held2.pdf");
+        std::fs::write(&d, crate::pdf_loader::probe_minimal_pdf_for_858b()).unwrap();
+        let document = pdfium.load_pdf_from_file(&d, None).unwrap();
+        let removed = std::fs::remove_file(&d);
+        eprintln!(
+            "858b delete probe: DeleteFile on PDF held by PDFium: {removed:?} gone={}",
+            super::path_is_gone(&d)
+        );
+        drop(document);
+        // (c) Folder containing a held file (expected to fail).
+        let e = root.path().join("folder");
+        std::fs::create_dir(&e).unwrap();
+        let inner = e.join("inner.zip");
+        std::fs::write(&inner, b"probe").unwrap();
+        let held = std::fs::File::open(&inner).unwrap();
+        report(
+            "recycle folder containing a held file",
+            &e,
+            super::recycle_chunk(0, &[e.clone()]),
+        );
+        drop(held);
+        unsafe { CoUninitialize() };
     }
 }

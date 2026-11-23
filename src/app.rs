@@ -886,8 +886,8 @@ pub use grid_paint::draw_thumbnail_name_style_snapshot_fixture;
 pub use grid_paint::draw_video_thumbnail_indicator_snapshot_fixture;
 pub(crate) use grid_paint::{
     ThumbnailHitAreas, draw_cell, draw_cell_with_hit_areas, draw_cut_badge,
-    draw_spread_pair_cursor, grid_tag_badge_hit_rect, layout_cell_overlays,
-    primary_grid_tag_for_badge, tq_draw_preview,
+    draw_drop_hover_snapshot_cells, draw_grid_drop_target, draw_spread_pair_cursor,
+    grid_tag_badge_hit_rect, layout_cell_overlays, primary_grid_tag_for_badge, tq_draw_preview,
 };
 pub(crate) use grid_paint::{audio_thumbnail_indicator_parts, paint_audio_thumbnail_indicator};
 use metadata_ops::{
