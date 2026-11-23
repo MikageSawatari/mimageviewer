@@ -314,7 +314,7 @@
   照会は `known_folders::pictures_dir_unverified`（Pictures / `KF_FLAG_DONT_VERIFY`）。
   `is_browser_view_directory` / 純粋関数 `is_directory_under_root` は保持値・現在の明示設定・
   実フォルダの事実と component 比較だけを使う。判定から照会・stat・本扱いの判定へ到達しない。
-  比較には `path_key::physical_path_is_within` を使い、ドットと拡張パス表記を字面だけで正規化する（保存キーは変更しない）。
+  比較前に絶対パスの path・root だけを `std::path::absolute` で正規化し（失敗時は元の綴り）、`path_key::physical_path_is_within` で比べる。相対パスは対象外、保存キーは変更しない。
   登録 worker の `Environment::capture` も `output_root_from_pictures` を使う。
 - `src/app.rs`:
   既存の `folder_observation` は main 限定で、`current_folder_signature` は保存キーの証明を

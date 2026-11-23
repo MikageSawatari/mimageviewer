@@ -136,7 +136,6 @@ fn browser870_remote_dot_root_rejects_normalized_write_without_changing_database
     let pictures = app.tmp.path().join("Pictures");
     std::fs::create_dir_all(&month).unwrap();
     std::fs::create_dir_all(&pictures).unwrap();
-    app.settings.browser_view_output_dir = Some(pictures.join("..").join("browser"));
     app.spread_db
         .as_ref()
         .unwrap()
@@ -155,32 +154,42 @@ fn browser870_remote_dot_root_rejects_normalized_write_without_changing_database
         .get_state_with_fallback(&month, None);
     let (handle, owner, _) = active_session();
     app.set_remote_session_handle(handle.clone());
-    let engine = super::super::container::ContainerEngine::new(app.settings.clone());
-    let payload = engine
-        .qualified_write_payload(RemoteWriteRequest::SetSpread {
-            address: mimageviewer_ipc::RemoteAddress::file(month.to_string_lossy().into_owned()),
-            spread_mode: RemoteSpreadMode::Ltr,
-            reading_direction: RemoteReadingDirection::Ltr,
-        })
-        .unwrap();
-    assert!(payload.reading_target_is_directory());
-    let response = browser870_apply_payload(&mut app, &handle, &owner, payload, Default::default());
-    let RemoteWriteResponse::Error(error) = response else {
-        panic!("normalized browser directory write accepted");
-    };
-    assert_eq!(error.code, RemoteWriteErrorCode::Unsupported);
-    assert_eq!(
-        error.message,
-        "ブラウザ閲覧の保存先のフォルダは、単ページで表示します"
-    );
-    assert_eq!(
-        app.spread_db
-            .as_ref()
-            .unwrap()
-            .get_state_with_fallback(&month, None),
-        before
-    );
-    assert!(app.remote_session_ui.pending_reading_writes.is_empty());
+    let drive_root = root.ancestors().last().unwrap();
+    for configured_root in [
+        pictures.join("..").join("browser"),
+        drive_root
+            .join("..")
+            .join(root.strip_prefix(drive_root).unwrap()),
+    ] {
+        app.settings.browser_view_output_dir = Some(configured_root);
+        let engine = super::super::container::ContainerEngine::new(app.settings.clone());
+        let payload = engine
+            .qualified_write_payload(RemoteWriteRequest::SetSpread {
+                address: mimageviewer_ipc::RemoteAddress::file(month.to_string_lossy().into_owned()),
+                spread_mode: RemoteSpreadMode::Ltr,
+                reading_direction: RemoteReadingDirection::Ltr,
+            })
+            .unwrap();
+        assert!(payload.reading_target_is_directory());
+        let response =
+            browser870_apply_payload(&mut app, &handle, &owner, payload, Default::default());
+        let RemoteWriteResponse::Error(error) = response else {
+            panic!("normalized browser directory write accepted");
+        };
+        assert_eq!(error.code, RemoteWriteErrorCode::Unsupported);
+        assert_eq!(
+            error.message,
+            "ブラウザ閲覧の保存先のフォルダは、単ページで表示します"
+        );
+        assert_eq!(
+            app.spread_db
+                .as_ref()
+                .unwrap()
+                .get_state_with_fallback(&month, None),
+            before
+        );
+        assert!(app.remote_session_ui.pending_reading_writes.is_empty());
+    }
 }
 
 #[test]

@@ -42,8 +42,8 @@ pub(crate) fn is_browser_view_directory(
     )
 }
 
-/// Compare physical spellings without I/O or book classification. Lexically
-/// resolve dot components and verbatim prefixes; preserve persistent key spellings.
+/// Compare absolute physical spellings without I/O or book classification.
+/// Normalize Windows dot components before comparing; preserve persistent key spellings.
 /// An explicit root replaces the cached default root.
 pub(crate) fn is_directory_under_root(
     path: &Path,
@@ -54,7 +54,17 @@ pub(crate) fn is_directory_under_root(
     let Some(root) = explicit_root.or(default_root) else {
         return false;
     };
-    is_directory && crate::path_key::physical_path_is_within(path, root)
+    if !is_directory || !path.is_absolute() || !root.is_absolute() {
+        return false;
+    }
+    // Absolute inputs do not consult the current directory or filesystem.
+    // Verbatim paths pass through unchanged for physical_path_is_within to handle.
+    let absolute_path = std::path::absolute(path).ok();
+    let absolute_root = std::path::absolute(root).ok();
+    crate::path_key::physical_path_is_within(
+        absolute_path.as_deref().unwrap_or(path),
+        absolute_root.as_deref().unwrap_or(root),
+    )
 }
 
 #[cfg(test)]
@@ -119,19 +129,50 @@ mod tests {
     }
 
     #[test]
+    fn browser870_root_comparison_clamps_parent_components_at_windows_root() {
+        for (root, path) in [
+            (r"C:\..\browser", r"C:\browser\2026-11"),
+            (r"C:\..\..\browser", r"C:\browser\2026-11"),
+            (r"C:\browser", r"C:\..\browser\2026-11"),
+            (r"C:\browser", r"C:\browser\..\..\browser\child"),
+            (r"C:\..\browser", r"C:\browser\..\..\browser\child"),
+        ] {
+            assert!(
+                is_directory_under_root(Path::new(path), true, Some(Path::new(root)), None),
+                "root={root} path={path}"
+            );
+        }
+    }
+
+    #[test]
     fn browser870_root_comparison_rejects_escaped_and_unsupported_spellings() {
         for (root, path) in [
             (r"C:\browser", r"C:\browser\..\other"),
             (r"C:\browser", r"C:\browser\2026-11\..\..\other\child"),
             (r"C:\Pictures\..\browser", r"C:\browser\..\other"),
             (r"C:\browser", r"\\?\C:\browser\..\other"),
-            (r"C:\browser", r"C:\browser\..\..\browser\child"),
             (r"\\?\Volume{1234}\browser", r"C:\browser\child"),
             (r"C:\browser", r"\\?\Volume{1234}\browser\child"),
             (r"\\.\C:\browser", r"C:\browser\child"),
             (r"C:\browser", r"\\.\C:\browser\child"),
+        ] {
+            assert!(
+                !is_directory_under_root(Path::new(path), true, Some(Path::new(root)), None),
+                "root={root} path={path}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser870_root_comparison_rejects_relative_inputs() {
+        for (root, path) in [
             (r"C:\browser", r"browser\child"),
             (r"browser", r"C:\browser\child"),
+            (r"browser", r"browser\child"),
+            (r"C:\browser", r"\browser\child"),
+            (r"\browser", r"C:\browser\child"),
+            (r"C:\browser", r"C:browser\child"),
+            (r"C:browser", r"C:\browser\child"),
         ] {
             assert!(
                 !is_directory_under_root(Path::new(path), true, Some(Path::new(root)), None),
