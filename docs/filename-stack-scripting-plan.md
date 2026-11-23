@@ -28,6 +28,7 @@
   ファイル読みを封殺、Codex P1)、`set_max_operations(10M)` ほか各種上限、I/O/OS は非公開。
   戻りキーは文字列 / 数値 / `()` のみ受理 (配列・マップ等はエラー→既定へフォールバック、Codex P2)。
   正規表現コンパイルキャッシュは 1024 件上限 (動的パターン肥大対策、Codex P3)。
+- **標準関数 (§1.863)**: 互換のため標準パッケージを維持し、`sleep` と空文字で伸ばす文字列 `pad` だけを上書きで拒否。`print` / `debug` は 1 回の計算で合計 20 行まで mIV のログへ送る (下記「標準関数の扱い」)。
 - **既定カスケード** (上から順、「全ファイル該当」最初のルールを採用。汎用ルールはさらに
   「異なるスタックが 2 つ以上」のときだけ採用 = 巨大スタック化を防ぐ):
   1. 命名パターン (mXD 例: `^\d{8}_\d{4}_\d+_\d+_p\d+_m\d+_@`、`_m\d+_@` の手前をキー)
@@ -224,6 +225,81 @@ engine.set_max_array_size(2_000_000);          // 10k×数倍の余裕
 //   prefix_before_last(s, sep) / regex_capture(s, pat, n) / trailing_number(s)
 //   sort_indices_by(arr) など §2 の例で使う純関数
 ```
+
+### 標準関数の扱い (§1.863、v5.7.0)
+
+既存の利用者のスクリプトが使う関数を減らさないため、`Engine::new()` の標準パッケージを
+残す。§1.363 (操作のスクリプト) は `Engine::new_raw()` + 個別登録だが、スタック用は
+互換を優先して揃えない。処理のモーダル化や取消の状態追加では native 関数内の停止を
+解消できないため、関数登録の境界で危ない呼び出しをなくす。
+
+`register_fn` は `global_modules[0]` の global namespace に登録され、標準パッケージより
+先に解決される。同名・同じ引数型で次を覆う (Rhai 1.27.0 のソースを照合)。
+
+| 覆う関数 | 理由と維持する動作 |
+| --- | --- |
+| `sleep(INT)` / `sleep(FLOAT)` | native 内の `std::thread::sleep` は秒数を制限しない。0 を含め常に `ErrorRuntime`。 |
+| `pad(&mut ImmutableString, INT, &str)` | 空文字で現在の文字数より長くすると、標準実装のループが進まない。この場合だけ `ErrorRuntime`。それ以外は 1.27 の文字数単位の繰り返し・末尾切り詰め・非正の長さでの無操作・拡張前の文字数上限と拡張後のバイト数上限を維持する。 |
+
+上書きの優先と関数ポインタ経由の解決を確認する常設テスト (すべて
+`filename_stack_script::tests::` 配下、別スレッド + `recv_timeout(10秒)`):
+
+- `section1863_global_overrides_reject_sleep_int_float_and_zero`
+- `section1863_global_overrides_reject_empty_pad_method_and_function`
+- `section1863_global_overrides_reject_sleep_function_pointers_and_curry`
+- `section1863_global_overrides_reject_empty_pad_function_pointers`
+
+互換は `section1863_safe_string_and_array_pad_remain_compatible`、サイズ検査は
+`section1863_string_pad_preserves_character_and_byte_size_checks`、既定ルールは既存の
+`default_script_compiles_and_runs_empty` 等で確認する。2026-11-23 に ClaudeCode が
+`filename_stack_script::` / `filename_stack` / `grid_edge_buttons_1855::` の 93 件を流し、すべて成功した。
+
+#### StandardPackage の洗い出し (Rhai 1.27.0、コード読み)
+
+`pkg_std.rs` / `pkg_core.rs` から `src/packages/*.rs` の全構成をたどった。
+上記以外に、入力サイズや interpreter の操作上限と無関係に待機・無限ループ・
+ブロックする I/O を行う公開関数は見つからなかった。次は覆わない。
+
+| 対象ファイル / 関数群 | 判断 |
+| --- | --- |
+| `lang_core.rs` のその他 (`exit`、`take`、tag、`parse_json`、関数メタデータ) | 有限データの操作・解析、または即時終了。JSON は入力文字列上限、反射は有限の AST が対象。ファイル・ネットワーク I/O はない。 |
+| `arithmetic.rs` / `bit_field.rs` / `logic.rs` / `math_basic.rs` | 固定幅数値の計算・比較、文字列上限内の数値解析。指数は固定幅または明示上限。decimal は現行の依存 feature では無効 (実装も確認)。 |
+| `string_basic.rs` / `string_more.rs` の char 版 `pad` と空文字以外の文字列版 `pad` | `max_string_size = 256 MiB` の拡張前後の検査で縛られ、ループが必ず進むので終わる。文字数とバイト数は異なり、バイト検査は拡張後。 |
+| 同上の検索・置換・split・大文字小文字変換・文字列化 | 入力文字列・配列・マップが有限で、サイズ上限により対象量が縛られる。Rust の走査や split は空の検索文字列でも進む。結果サイズ検査が native 呼び出し後のものもあり、処理中の厳密な時間・一時メモリ上限は保証しない。 |
+| `array_basic.rs` (deprecated の別名も含む) | 配列 `pad` は拡張前に配列・マップ・文字列の総量検査。走査・sort・dedup・drain・retain は `max_array_size = 8,000,000` 内の要素が対象。削除ループは添字増加か配列縮小で進む。スクリプトのコールバックは interpreter の操作上限対象。 |
+| `blob_basic.rs` | `blob` の生成・`pad` は `max_array_size` で拡張前検査。他の走査・変換は有限の blob / 文字列が対象。`write_*` はメモリ内のバイト列を更新する関数で、外部 I/O ではない。 |
+| `map_basic.rs` | `max_map_size = 8,000,000` 内のマップを走査・結合。コールバックは interpreter の操作上限対象。JSON 変換も有限データが対象。 |
+| `iter_basic.rs` | range 自体は列挙せず、`next` 1 回で 1 要素。スクリプトの `for` は操作上限対象。chars の準備は文字列上限内の走査、bits は固定ビット幅。 |
+| `fn_basic.rs` / `time_basic.rs` | 関数ポインタの名前・属性取得、現在時刻の取得・差・加減算。待機はしない。`call` / curry は組み込みの解決経路で、上書きした関数へ到達する。 |
+| `debugging.rs` | 現行は debugging feature 無効。有効時の `back_trace` も有限の呼び出しスタック走査だけ。 |
+| `mod.rs` / `pkg_core.rs` / `pkg_std.rs` | パッケージの構成・登録のみ。 |
+
+上限内でも 1 回の native 処理が重くなり得ることは残る。今回は厳密な時間制限を新設せず、
+既存の `set_*` の上限値とキャンセル確認の `ops & 0xFFFF` は変更しない。
+
+#### エラーと出力
+
+- エラー本文は `スタックのスクリプトでは sleep は使えません (処理が終わらなくなるため)`、
+  `スタックのスクリプトでは、空の文字列を詰める pad は使えません (処理が終わらなくなるため)`。
+  既存の `スクリプトの実行に失敗: {e}` で包まれ、既存の失敗経路でログ・
+  「スタックのスクリプトでエラー。既定ルールで表示します (詳細はヘルプ参照)」の
+  トーストと既定ルールへのフォールバックに進む。新しい失敗経路は足さない。
+- `on_print` / `on_debug` を `crate::logger::log` へ配線し、行頭を
+  `stack script print: ` / `stack script debug: ` とする。debug は source / position も記録する。
+  1 `CompiledStackScript` (親フォルダごとの複数呼び出しも共有) の合計 20 行まで。
+  複数行の print も行ごとに数え、超過時だけ 1 回
+  `stack script print/debug: 21 行目以降は省略しました` を記録し、以後は捨てる。
+  新しいコンパイルで枠が戻る。出力先を差し替える同じ配線 helper で 30 回の print、
+  print/debug 混在・親別呼び出し・source/position・複数行と枠の再作成をテストする。
+- 修正前の再現専用 ignore テスト:
+  `section1863_legacy_sleep_ignores_cancel_and_operation_limit` /
+  `section1863_legacy_empty_pad_ignores_cancel_and_operation_limit`。
+  `Engine::new()` + 従来と同じ上限と on_progress を再現し、操作上限を 64 に下げ、
+  native 直前の通知後に cancel を立てても 3 秒で戻らないことを検査する。
+  sleep の待機スレッド / CPU を 1 コア回し続ける pad のスレッドを残すため通常は実行しない。
+  2026-11-23 に ClaudeCode が nextest の `--run-ignored only` で 2 件を各 1 回流し、
+  どちらも成功した (= 修正前の構成では、cancel を立てても操作数上限 64 でも 3 秒以内に戻らない)。
+  nextest はテストごとに別プロセスなので、残ったスレッドはプロセスの終了で回収される。
 
 ### 実行場所 (UI 応答性)
 

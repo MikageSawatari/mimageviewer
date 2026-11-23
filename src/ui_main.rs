@@ -2915,6 +2915,7 @@ fn grid_edge_button_placement(
 
 fn grid_edge_buttons_visibility_checkbox(ui: &mut egui::Ui, visible: &mut bool) -> bool {
     ui.checkbox(visible, "先頭・末尾ボタン (ソートの隣)")
+        .on_hover_text("絞り込みバーのソートが表示されているときはその左隣、表示されていないときは上部ツールバーのソートの中に出ます")
         .changed()
 }
 
@@ -13368,6 +13369,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     ui,
                     &mut self.settings.show_grid_edge_buttons,
                 );
+                if grid_edge_button_placement(
+                    &self.settings,
+                    self.items.is_empty(),
+                    self.items_are_drive_list,
+                ) == GridEdgeButtonPlacement::FacetSort
+                {
+                    ui.weak("いまは絞り込みバーのソートの隣に表示しています");
+                }
                 ui.separator();
                 display_radio(
                     ui,

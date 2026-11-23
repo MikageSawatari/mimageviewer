@@ -15,11 +15,13 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use regex::Regex;
-use rhai::{AST, Dynamic, Engine, Scope};
+use rhai::{
+    AST, Dynamic, Engine, EvalAltResult, ImmutableString, NativeCallContext, Position, Scope,
+};
 
 use crate::filename_stack::StackMember;
 
@@ -167,9 +169,108 @@ fn ext_of(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+const SLEEP_ERROR: &str = "スタックのスクリプトでは sleep は使えません (処理が終わらなくなるため)";
+const EMPTY_PAD_ERROR: &str =
+    "スタックのスクリプトでは、空の文字列を詰める pad は使えません (処理が終わらなくなるため)";
+const SCRIPT_OUTPUT_LIMIT: usize = 20;
+const SCRIPT_OUTPUT_OMITTED: &str = "stack script print/debug: 21 行目以降は省略しました";
+
+/// Rhai 1.27 の文字列版 pad。進まない空文字のループだけを拒否し、サイズ検査も維持する。
+fn stack_pad_string(
+    ctx: NativeCallContext,
+    string: &mut ImmutableString,
+    len: rhai::INT,
+    padding: &str,
+) -> Result<(), Box<EvalAltResult>> {
+    if len <= 0 {
+        return Ok(());
+    }
+    let too_large = || {
+        Box::new(EvalAltResult::ErrorDataTooLarge(
+            "Length of string".to_string(),
+            Position::NONE,
+        ))
+    };
+    let len = usize::try_from(len).map_err(|_| too_large())?;
+    let max_size = ctx.engine().max_string_size();
+    if max_size > 0 && len > max_size {
+        return Err(too_large());
+    }
+    let mut str_len = string.chars().count();
+    if len <= str_len {
+        return Ok(());
+    }
+    if padding.is_empty() {
+        return Err(EvalAltResult::ErrorRuntime(EMPTY_PAD_ERROR.into(), Position::NONE).into());
+    }
+    let padding_len = padding.chars().count();
+    let text = string.make_mut();
+    while str_len < len {
+        if str_len + padding_len <= len {
+            text.push_str(padding);
+            str_len += padding_len;
+        } else {
+            text.extend(padding.chars().take(len - str_len));
+            str_len = len;
+        }
+    }
+    if max_size > 0 && string.len() > max_size {
+        return Err(too_large());
+    }
+    Ok(())
+}
+
+/// 出力先の配線はここに集約する。親フォルダごとの呼び出しでも同じ計算の枠を共有する。
+fn install_script_output(engine: &mut Engine, sink: impl Fn(String) + Send + Sync + 'static) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::new(sink);
+    let print_count = Arc::clone(&count);
+    let print_sink = Arc::clone(&sink);
+    engine.on_print(move |text| {
+        emit_script_output(&print_count, &*print_sink, "stack script print: ", text);
+    });
+    engine.on_debug(move |text, source, position| {
+        emit_script_output(
+            &count,
+            &*sink,
+            &format!(
+                "stack script debug: {} @ {position} > ",
+                source.unwrap_or("<none>")
+            ),
+            text,
+        );
+    });
+}
+
+fn emit_script_output(count: &AtomicUsize, sink: &impl Fn(String), prefix: &str, text: &str) {
+    // 複数行の print でも実際のログ行数で数える。空の print も 1 行分を使う。
+    for line in text.split('\n') {
+        match count.fetch_add(1, Ordering::Relaxed) {
+            n if n < SCRIPT_OUTPUT_LIMIT => {
+                sink(format!("{prefix}{}", line.trim_end_matches('\r')))
+            }
+            SCRIPT_OUTPUT_LIMIT => sink(SCRIPT_OUTPUT_OMITTED.to_string()),
+            _ => break,
+        }
+    }
+}
+
 /// サンドボックス済みエンジンを作る。
 fn build_engine() -> Engine {
     let mut engine = Engine::new();
+    // global namespace は標準パッケージより優先される。同じ引数型を登録し、
+    // 関数ポインタ経由も含めて native 内で止まる呼び出しを実行時エラーにする。
+    engine.register_fn("sleep", |_: rhai::INT| -> Result<(), Box<EvalAltResult>> {
+        Err(EvalAltResult::ErrorRuntime(SLEEP_ERROR.into(), Position::NONE).into())
+    });
+    engine.register_fn(
+        "sleep",
+        |_: rhai::FLOAT| -> Result<(), Box<EvalAltResult>> {
+            Err(EvalAltResult::ErrorRuntime(SLEEP_ERROR.into(), Position::NONE).into())
+        },
+    );
+    engine.register_fn("pad", stack_pad_string);
+    install_script_output(&mut engine, |line| crate::logger::log(line));
     // 暴走 backstop (自動実行されるユーザースクリプト用)。実測 (perf_10k) では native
     // ヘルパー化後の 100k camera で ~数百万 op なので、100M はその ~30 倍の余裕。無限ループ
     // 等は確実に止めつつ、10 万件の正当な処理は通す。スクリプトはワーカーで走るので UI は
@@ -347,6 +448,232 @@ fn run_group_function(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn within_timeout<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("スタックスクリプトが 10 秒以内に戻ること")
+    }
+
+    fn assert_script_runtime_error(body: &str, expected: &str) {
+        let source = format!("fn group(files) {{ {body}; [] }}");
+        let error = within_timeout(move || group_keys(&[], &source).err())
+            .expect("危ない標準関数は Err になること");
+        assert!(error.contains("スクリプトの実行に失敗:"), "{error}");
+        assert!(error.contains(expected), "{error}");
+    }
+
+    // 修正前と同じエンジンとキャンセルの間引き。native に入ったあとでは
+    // 小さい操作上限もキャンセルも効かないことを、破壊的な確認でのみ使用する。
+    fn legacy_engine(cancel: Arc<AtomicBool>) -> Engine {
+        let mut engine = Engine::new();
+        engine.set_max_operations(100_000_000);
+        engine.set_max_call_levels(64);
+        engine.set_max_expr_depths(64, 64);
+        engine.set_max_string_size(256 * 1024 * 1024);
+        engine.set_max_array_size(8_000_000);
+        engine.set_max_map_size(8_000_000);
+        engine.disable_symbol("eval");
+        engine.disable_symbol("import");
+        engine.on_progress(move |ops| {
+            if ops & 0xFFFF == 0 && cancel.load(Ordering::Relaxed) {
+                Some(Dynamic::UNIT)
+            } else {
+                None
+            }
+        });
+        engine
+    }
+
+    fn assert_legacy_native_does_not_return(source: &'static str) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut engine = legacy_engine(worker_cancel);
+            // native 呼び出しまで届く小ささ。上限超過の検査自体は別の常設テストで確認する。
+            engine.set_max_operations(64);
+            engine.register_fn("enter_native", move || entered_tx.send(()).unwrap());
+            let result = engine.run(source);
+            let _ = done_tx.send(result.map_err(|e| e.to_string()));
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_secs(3)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+    }
+
+    #[test]
+    #[ignore = "修正前の停止確認専用。sleep 中のスレッドを残すため単独のプロセスで 1 回だけ実行"]
+    fn section1863_legacy_sleep_ignores_cancel_and_operation_limit() {
+        // join できないスレッドを残す。テストプロセス終了時に OS が回収する。
+        assert_legacy_native_does_not_return("enter_native(); sleep(3600);");
+    }
+
+    #[test]
+    #[ignore = "修正前の停止確認専用。pad が CPU 1 コアを回し続けるため単独のプロセスで 1 回だけ実行"]
+    fn section1863_legacy_empty_pad_ignores_cancel_and_operation_limit() {
+        // 無限ループのスレッドを残すので通常のテストに混ぜない。
+        assert_legacy_native_does_not_return(r#"enter_native(); "a".pad(5, "");"#);
+    }
+
+    #[test]
+    fn section1863_legacy_helper_enforces_operation_limit_for_script_loops() {
+        within_timeout(|| {
+            let mut engine = legacy_engine(Arc::new(AtomicBool::new(false)));
+            engine.set_max_operations(64);
+            assert!(matches!(
+                *engine.run("loop {}").unwrap_err(),
+                EvalAltResult::ErrorTooManyOperations(_)
+            ));
+        });
+    }
+
+    #[test]
+    fn section1863_global_overrides_reject_sleep_int_float_and_zero() {
+        for body in ["sleep(1)", "sleep(0.5)", "sleep(0)"] {
+            assert_script_runtime_error(body, SLEEP_ERROR);
+        }
+    }
+
+    #[test]
+    fn section1863_global_overrides_reject_empty_pad_method_and_function() {
+        for body in [
+            r#"let s = "a"; s.pad(5, "")"#,
+            r#"let s = "a"; pad(s, 5, "")"#,
+            r#""a".pad(5, "")"#,
+        ] {
+            assert_script_runtime_error(body, EMPTY_PAD_ERROR);
+        }
+    }
+
+    #[test]
+    fn section1863_global_overrides_reject_sleep_function_pointers_and_curry() {
+        for body in [
+            r#"Fn("sleep").call(1)"#,
+            r#"call(Fn("sleep"), 0.5)"#,
+            r#"let f = Fn("sleep").curry(1); f.call()"#,
+            r#"let f = curry(Fn("sleep"), 0); call(f)"#,
+        ] {
+            assert_script_runtime_error(body, SLEEP_ERROR);
+        }
+    }
+
+    #[test]
+    fn section1863_global_overrides_reject_empty_pad_function_pointers() {
+        for body in [
+            r#"let s = "a"; Fn("pad").call(s, 5, "")"#,
+            r#"let f = Fn("pad").curry("a", 5, ""); call(f)"#,
+        ] {
+            assert_script_runtime_error(body, EMPTY_PAD_ERROR);
+        }
+    }
+
+    #[test]
+    fn section1863_safe_string_and_array_pad_remain_compatible() {
+        within_timeout(|| {
+            for (body, expected) in [
+                (r#"let s = "a"; s.pad(5, "ab"); s"#, "aabab"),
+                (r#"let s = "a"; pad(s, 4, "ab"); s"#, "aaba"),
+                (r#"let s = "a"; s.pad(5, '*'); s"#, "a****"),
+                (r#"let s = "abc"; s.pad(2, ""); s"#, "abc"),
+                (r#"let s = "abc"; s.pad(3, ""); s"#, "abc"),
+                (r#"let s = "abc"; s.pad(0, ""); s"#, "abc"),
+                (r#"let s = "あ"; s.pad(4, "いう"); s"#, "あいうい"),
+                (r#"let a = ["a"]; a.pad(3, "b"); a[2]"#, "b"),
+            ] {
+                // 文を含む式はブロックで囲み、戻り値を 1 件のキーにする。
+                let source = format!("fn group(files) {{ [{{ {body} }}] }}");
+                let result = group_keys(&[m("a.jpg", 0, false)], &source).expect("互換の pad");
+                assert_eq!(result.keys, vec![expected.to_string()], "{body}");
+            }
+        });
+    }
+
+    #[test]
+    fn section1863_string_pad_preserves_character_and_byte_size_checks() {
+        within_timeout(|| {
+            let mut engine = build_engine();
+            engine.set_max_string_size(4);
+            for source in [
+                r#"let s = "a"; s.pad(5, "b");"#,
+                r#"let s = "a"; s.pad(3, "あ");"#,
+            ] {
+                assert!(matches!(
+                    *engine.run(source).unwrap_err(),
+                    EvalAltResult::ErrorDataTooLarge(_, _)
+                ));
+            }
+        });
+    }
+
+    fn script_with_output(source: &str) -> (CompiledStackScript, Arc<Mutex<Vec<String>>>) {
+        let mut script = CompiledStackScript::compile(source, Arc::new(AtomicBool::new(false)))
+            .expect("コンパイル成功");
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&lines);
+        install_script_output(&mut script.engine, move |line| {
+            captured.lock().unwrap().push(line)
+        });
+        (script, lines)
+    }
+
+    #[test]
+    fn section1863_print_thirty_times_succeeds_and_logs_twenty_lines() {
+        within_timeout(|| {
+            let (script, lines) =
+                script_with_output(r#"fn group(files) { for i in 0..30 { print(i); } [] }"#);
+            script.group_keys(&[]).expect("出力を省略しても分類は成功");
+            let lines = lines.lock().unwrap();
+            assert_eq!(lines.len(), 21);
+            for (i, line) in lines[..20].iter().enumerate() {
+                assert_eq!(line, &format!("stack script print: {i}"));
+            }
+            assert_eq!(lines[20], SCRIPT_OUTPUT_OMITTED);
+        });
+    }
+
+    #[test]
+    fn section1863_print_debug_share_limit_across_group_calls_and_include_location() {
+        within_timeout(|| {
+            let (mut script, lines) = script_with_output(
+                r#"fn group(files) { for i in 0..6 { print(i); debug(i); } [] }"#,
+            );
+            script.ast.set_source("stack-test");
+            for _ in 0..3 {
+                script.group_keys(&[]).expect("親フォルダごとの呼び出し");
+            }
+            let lines = lines.lock().unwrap();
+            assert_eq!(lines.len(), 21);
+            assert!(lines[1].starts_with("stack script debug: stack-test @ "));
+            assert!(lines[1].contains(" > 0"));
+            assert_eq!(lines[20], SCRIPT_OUTPUT_OMITTED);
+        });
+    }
+
+    #[test]
+    fn section1863_multiline_print_counts_log_lines_and_new_compile_resets_limit() {
+        within_timeout(|| {
+            for _ in 0..2 {
+                let (script, lines) = script_with_output(
+                    r#"fn group(files) { for i in 0..15 { print("a\nb"); } [] }"#,
+                );
+                script.group_keys(&[]).unwrap();
+                let lines = lines.lock().unwrap();
+                assert_eq!(lines.len(), 21);
+                assert!(lines[..20].iter().all(|line| !line.contains('\n')));
+                assert_eq!(lines[20], SCRIPT_OUTPUT_OMITTED);
+            }
+        });
+    }
 
     fn m(name: &str, mtime: i64, is_video: bool) -> StackMember {
         StackMember {

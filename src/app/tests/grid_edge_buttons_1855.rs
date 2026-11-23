@@ -7,6 +7,7 @@ use egui_kittest::{
 };
 
 const VISIBILITY: &str = "先頭・末尾ボタン (ソートの隣)";
+const FACET_PLACEMENT_NOTE: &str = "いまは絞り込みバーのソートの隣に表示しています";
 
 fn harness(facet: bool, view: GridViewMode) -> Harness<'static, phase_c_support::AppTestEnv> {
     let mut env = phase_c_support::setup_app();
@@ -353,4 +354,52 @@ fn section1855_right_click_toggle_saves_and_shows_or_hides_buttons() {
         assert_eq!(harness.query_by_label("先頭").is_some(), !initially_visible);
         assert_eq!(harness.query_by_label("末尾").is_some(), !initially_visible);
     }
+}
+
+fn open_toolbar_sort_menu(harness: &mut Harness<'_, phase_c_support::AppTestEnv>) {
+    // 絞り込みバーにも同名のラベルがあるため、先に描画される上部のラベルを選ぶ。
+    harness
+        .get_all_by_label("ソート:")
+        .into_iter()
+        .find(|node| node.accesskit_node().role() == egui::accesskit::Role::Label)
+        .expect("上部ツールバーのソートのラベル")
+        .click_secondary();
+    harness.run();
+    assert!(harness.query_by_label(VISIBILITY).is_some());
+}
+
+#[test]
+fn section1868_toolbar_sort_menu_explains_facet_placement_and_toggle_hides_note() {
+    let mut harness = harness(true, GridViewMode::Thumbnail);
+    harness.run();
+    open_toolbar_sort_menu(&mut harness);
+    assert!(harness.query_by_label(FACET_PLACEMENT_NOTE).is_some());
+    harness.get_by_label(VISIBILITY).click();
+    harness.run();
+    assert!(!harness.state().settings.show_grid_edge_buttons);
+    // メニューを閉じ直さなくても、チェックを外した描画で説明が消える。
+    assert!(harness.query_by_label(VISIBILITY).is_some());
+    assert!(harness.query_by_label(FACET_PLACEMENT_NOTE).is_none());
+}
+
+#[test]
+fn section1868_toolbar_sort_menu_has_no_facet_note_when_facet_sort_or_bar_is_hidden() {
+    for facet_bar_visible in [true, false] {
+        let mut harness = harness(facet_bar_visible, GridViewMode::Thumbnail);
+        // バーだけを隠した場合と、バーは出したままソートだけを隠した場合を分ける。
+        harness.state_mut().settings.show_facet_sort = !facet_bar_visible;
+        harness.run();
+        assert_eq!(harness.get_all_by_label("先頭").count(), 1);
+        open_toolbar_sort_menu(&mut harness);
+        assert!(harness.query_by_label(FACET_PLACEMENT_NOTE).is_none());
+    }
+}
+
+#[test]
+fn section1868_toolbar_sort_menu_has_no_facet_note_when_edge_buttons_are_hidden() {
+    let mut harness = harness(true, GridViewMode::Thumbnail);
+    harness.state_mut().settings.show_grid_edge_buttons = false;
+    harness.run();
+    open_toolbar_sort_menu(&mut harness);
+    assert!(harness.query_by_label(FACET_PLACEMENT_NOTE).is_none());
 }
