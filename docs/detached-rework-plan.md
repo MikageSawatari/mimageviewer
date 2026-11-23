@@ -8200,3 +8200,15 @@ fork 先は空、元 context は cache と proof を保持する。detached の�
   既存 `target/debug/viewer_context_audit.exe` の直接実行は終了コード 0、許可表の追加変更なし。
   UI glyph lint と `git diff --check` は正常。利用者の明示指示により cargo・Rust テスト・fmt・
   build・実機起動は未実行。設計担当によるコンパイル・テスト・実機の検収へ引き継ぐ。
+
+### 閲覧中の左クリックの「ダブルクリックで閉じる」モード（2026-11-24、§1.471）
+
+- 正本は [ダブルクリックで閉じるモードの設計](fullscreen-double-click-close-plan.md) §2〜§7・§11。
+  新モードのダブルクリックは `FsCanvasClickAction::CloseViewer` として、右クリック短押しの閉じると同じ `close` に合流する。
+  F12 別ウィンドウ・複数窓・ブラウザから開いた窓の戻り先は既存の閉じる処理 (`handle_fullscreen_close_request`) が決め、新しい経路は作らない。
+- 触れた範囲: クリックの分類 (`plan_fs_canvas_click`)、クリック回数の持ち主 `FsBackingClickBoundary` の 1 ビット
+  (viewport 照合とフォーカス喪失で消える既存の寿命に同居)、新モードのときだけ表示中の上部バーの押下を前面入力の持ち主へ、
+  描画・領域予約・入力受付の共有判定 `fullscreen_top_bar_chrome_allowed` からページ一覧を除外。
+- detached の述語・viewport の選択と配送・窓の寿命・HWND の処理は変更していない。guard・delay・retry・一括 reset・silent fallback は追加していない。
+- 設計担当 ClaudeCode と独立実装レビュー (実装者とは別の GPT-6.1 Sol / xhigh) は、これが症状パッチではなく構造的修正であることに合意。
+  レビュー担当の言葉:「描画対象の面と入力所有を共有境界で一致させる構造的修正であり、症状パッチではない」。
