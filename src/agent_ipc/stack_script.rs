@@ -212,11 +212,8 @@ fn publish(changes: &ChangeController, client: &str, lines: Option<(usize, usize
             failed: usize::from(lines.is_none()),
             ..Default::default()
         },
-        notice: if lines.is_some() {
-            format!("{summary}。{MESSAGE}")
-        } else {
-            summary.clone()
-        },
+        // 通知は設計 §6.9 の 1 行だけ。MESSAGE は AI への案内なので応答にだけ入れる。
+        notice: summary.clone(),
         summary,
         rows: vec![ChangeRow {
             item: "スタック用スクリプト".into(),

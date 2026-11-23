@@ -1059,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn mxd_suffix_fixed_groups_single_tweet() {
+    fn suffix_fixed_pattern_groups_single_post() {
         let media = vec![
             m(
                 "20260429_1100_0003_1234567890_p01_m01_@artist.jpg",
@@ -1188,7 +1188,7 @@ mod tests {
         use std::time::Instant;
 
         // 代表的なフォルダ形状を size 件ぶん作る (採用ルールが異なる = 走るルール数が違う)。
-        fn mxd(n: usize) -> Vec<StackMember> {
+        fn suffix_fixed(n: usize) -> Vec<StackMember> {
             // ルール1 (命名パターン) で即採用 — 1 走査
             (0..n)
                 .map(|i| {
@@ -1226,7 +1226,7 @@ mod tests {
 
         for &size in &[10_000usize, 100_000usize] {
             let scenarios: [(&str, Vec<StackMember>); 3] = [
-                ("mxd (rule1 即採用)", mxd(size)),
+                ("suffix_fixed (rule1 即採用)", suffix_fixed(size)),
                 ("pixiv (rule2 採用)", pixiv(size)),
                 ("camera (rule4=最重)", camera(size)),
             ];

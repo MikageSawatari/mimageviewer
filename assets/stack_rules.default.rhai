@@ -33,7 +33,7 @@
 // 連写とみなす更新時刻の最大間隔は rule_time_burst() 内の gap_sec (秒) で調整できます。
 
 fn group(files) {
-    // 1) 命名パターン: 末尾に固定接尾辞が付き途中の番号だけ変わる形 (mXD 等)
+    // 1) 命名パターン: 末尾に固定接尾辞が付き途中の番号だけ変わる形 (「日付_時刻_番号_ID_p番号_m番号_@作者」の形など)
     let k = rule_suffix_fixed(files);
     if stack_all_matched(k) {
         return #{ rule: "命名パターン", keys: k };
@@ -57,7 +57,7 @@ fn group(files) {
     files.map(|f| f.name)
 }
 
-// ---- ルール1: 末尾に固定接尾辞 + 途中連番 (配布しているダウンローダ mXD の命名例) ----
+// ---- ルール1: 末尾に固定接尾辞 + 途中連番 (「日付_時刻_番号_ID_p番号_m番号_@作者」の形) ----
 // 例: 20260429_1100_0003_1234567890_p01_m01_@user -> "_m<番号>_@..." の手前をキーに。
 fn rule_suffix_fixed(files) {
     files.map(|f|
