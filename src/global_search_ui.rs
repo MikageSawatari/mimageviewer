@@ -330,7 +330,7 @@ impl TargetChoice {
             TargetChoice::All => "すべての対象",
             TargetChoice::Only(SourceKind::Filename) => "ファイル名",
             TargetChoice::Only(SourceKind::Exif) => "EXIF",
-            TargetChoice::Only(SourceKind::XmpTweet) => "mXD ツイート情報",
+            TargetChoice::Only(SourceKind::XmpTweet) => "XMP ツイート情報",
             TargetChoice::Only(SourceKind::PngPrompt) => "AI プロンプト (PNG)",
             TargetChoice::Only(SourceKind::PdfMeta) => "PDF メタ情報",
             TargetChoice::Only(SourceKind::VideoMeta) => "動画メタ情報",
