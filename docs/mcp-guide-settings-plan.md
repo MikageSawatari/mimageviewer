@@ -318,8 +318,8 @@ AI アプリが起動したままだと、MCP exe は本体より古い版のこ
 
 設定の書き出し・取り込みの表 `preferences_policy!` (`src/settings_transfer.rs:181-777`) をそのまま使う。
 
-- export 側 167 項目: 項目名・型・日本語の表記・検証・読み書き。
-  **鍵の数は 168** (167 の field と、3 つの field をまとめた group の鍵 `still_bottom_chrome` 1 つ、`:259,434`)。
+- export 側 168 項目: 項目名・型・日本語の表記・検証・読み書き。
+  **鍵の数は 169** (168 の field と、3 つの field をまとめた group の鍵 `still_bottom_chrome` 1 つ、`:259,434`)。
   field と鍵を区別する (独立レビュー r3 P3)。master 取り込みで値だけの 3 field が増えた。
 - exclude 側 344 項目: 除外の理由つき。表示やツールバーの状態、利用データ (お気に入り・タグ・履歴)、
   PC 固有のパス、外部ツール・フォント・LUT・Susie・VST、キー割り当て・リング、通信 (`update_check_enabled`・
@@ -552,7 +552,10 @@ AI 連携の許可そのものだけ** (2026-11-21 利用者決定、§1)。画�
     `video_seek_strip_locked` を書く、など) は、`still_bottom_chrome` と同じく 1 つの鍵にし、同じ helper を呼ぶ。
   - 互換の写し (`video_loop`・`archive_convert_without_dialog`)・内部の記録 (`update_check_dismissed_version`・
     `first_setup_completed` など) は印を付けない (設定ではない)。
-- 確定した件数は 225 鍵 (export 168 + 除外側の印 57)。正確な一覧と分類は §17。
+- 確定した件数は 226 鍵 (export 169 + 除外側の印 57)。正確な一覧と分類は §17。
+  v5.7.0 の取り込み (2026-11-23) で §1.772 の「ページめくりアニメーションの動き」(`page_turn_animation_style`、
+  環境設定のラジオ「めくる / スライド」) が export 側に入り第 1 段になった。§1.793 の `show_toolbar_drives` は
+  ツールバーの状態 (環境設定の外) で除外側・印なしなので第 2 段。§1.858 B・2 は設定を増やしていない。
 - **大きな値**: どの鍵の値も、`get_settings` の 1 ページが最終の応答の形で予算に収まることをテストで検査する。
   1 つの値が収まらない場合、`get_settings` は既存の共通の決まり (「大きすぎる行は digest ID / too_long」、
   instructions の Common) に従って `too_long` を返す。**`set_settings` は、変更前後を含む応答の全体を確定の前に組み立てて

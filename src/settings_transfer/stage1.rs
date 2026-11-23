@@ -445,6 +445,15 @@ impl Stage1Value for NotificationDuration {
         ])
     }
 }
+impl Stage1Value for PageTurnAnimationStyle {
+    fn candidates() -> Option<Vec<(Self, String)>> {
+        // 表示名は環境設定のラジオボタンと同じ。
+        Some(vec![
+            (Self::Curl, "めくる".into()),
+            (Self::Slide, "スライド".into()),
+        ])
+    }
+}
 impl Stage1Value for ReadingDirection {
     fn candidates() -> Option<Vec<(Self, String)>> {
         Some(vec![
@@ -1007,9 +1016,9 @@ mod tests {
         assert_eq!(rows.len(), keys.len());
         let (export, issues) = project(capture_export(&settings));
         assert!(issues.is_empty(), "{issues:?}");
-        assert_eq!(export.len(), 168);
+        assert_eq!(export.len(), 169);
         assert_eq!(STAGE1_MARKED_ANCHORS.len(), 57);
-        assert_eq!(rows.len(), 225);
+        assert_eq!(rows.len(), 226);
         for key in export.keys() {
             assert!(keys.contains(key.as_str()), "{key}");
         }
@@ -1076,6 +1085,27 @@ mod tests {
             stage1_validate(
                 &default_settings(),
                 &change("fullscreen_wheel_zoom_step", json!("Unknown"))
+            )
+            .is_err()
+        );
+        let page_turn = rows
+            .iter()
+            .find(|row| row.key == "page_turn_animation_style")
+            .unwrap();
+        assert_eq!(
+            page_turn
+                .choices
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|choice| (choice.value.clone(), choice.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(json!("curl"), "めくる"), (json!("slide"), "スライド")]
+        );
+        assert!(
+            stage1_validate(
+                &default_settings(),
+                &change("page_turn_animation_style", json!("Slide"))
             )
             .is_err()
         );
