@@ -946,6 +946,18 @@ fn drive_jump_search_pdf_classification_keeps_search_until_successful_enumeratio
     for kind in 0..4 {
         for success in [false, true] {
             let mut app = App::navigation_search_fixture_for_test(kind);
+            // The minimal shared fixture installs search state without projecting
+            // its address. Start from the normal visible label: PDF abort restores
+            // the saved address and reprojects the active global-search location.
+            match kind {
+                0 | 1 => app.update_global_search_address(),
+                2 => app.update_favsearch_address(),
+                _ => app.update_tag_view_address(),
+            }
+            assert!(
+                !app.address.is_empty(),
+                "search fixture must have its visible address"
+            );
             let ctx = egui::Context::default();
             app.settings.auto_fullscreen_zip_pdf = false;
             app.settings.auto_fullscreen_image_folders = false;

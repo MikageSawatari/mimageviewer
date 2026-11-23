@@ -153,3 +153,191 @@ fn drive_jump_losing_input_does_not_admit_or_retire_the_existing_owner() {
     app.finish_direct_navigation_scan_for_test();
     assert_eq!(app.current_folder.as_ref(), Some(&favorite));
 }
+
+fn install_directory_resolver(app: &mut App, target: &Path) {
+    let target = target.to_path_buf();
+    app.drive_jump_resolver = Some(Arc::new(move |_| DriveJumpResolution {
+        target: Some(crate::folder_tree::OpenablePathResolution {
+            path: target.clone(),
+            kind: crate::folder_tree::OpenablePathKind::Directory,
+            requested_is_file: false,
+        }),
+        warnings: Vec::new(),
+        outcome: "target",
+    }));
+}
+
+fn hold_drive_ready(app: &mut App, ctx: &egui::Context, target: &Path) -> Arc<AtomicBool> {
+    install_directory_resolver(app, target);
+    let input = app
+        .apply_switch_drive_letter(ctx, 'D', "old-drive")
+        .unwrap();
+    dispatch(app, ctx, input);
+    let cancel = app.drive_jump_pending.as_ref().unwrap().cancel.clone();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.drive_jump_ready() {
+        app.poll_drive_jump(ctx);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "drive result never became ready"
+        );
+        std::thread::yield_now();
+    }
+    cancel
+}
+
+fn hold_folder_nav_ready(app: &mut App, origin: &Path, target: &Path) {
+    app.settings.folder_tree_sort_order = crate::settings::FolderTreeSortOrder::NameAsc;
+    app.current_folder = Some(origin.to_path_buf());
+    app.start_folder_nav(origin.to_path_buf(), true, FolderNavMode::SiblingGrid);
+    let pending = app
+        .folder_nav_pending
+        .as_mut()
+        .expect("Ctrl sibling navigation admitted");
+    let result = pending
+        .rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    assert_eq!(result.target.as_ref().unwrap().logical_source(), target);
+    // Keep the actual worker result ready for the normal arbiter, without adopting it.
+    let (tx, rx) = mpsc::channel();
+    tx.send(result).unwrap();
+    pending.rx = rx;
+}
+
+#[test]
+fn drive_jump_toolbar_click_replaces_ready_drive_completion() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let old = app.tmp.path().join("old-drive");
+    let new = app.tmp.path().join("new-drive");
+    std::fs::create_dir(&old).unwrap();
+    std::fs::create_dir(&new).unwrap();
+    let cancel = hold_drive_ready(&mut app, &ctx, &old);
+    let before = app.current_folder.clone();
+    install_directory_resolver(&mut app, &new);
+    let candidate = app.apply_switch_drive_letter(&ctx, 'E', "toolbar");
+    let mut frame = update_phases::MainFrameNavigation::default();
+    frame.address_nav = candidate; // Actual toolbar drive transport.
+    app.post_render_main_navigation(&ctx, frame);
+    assert!(cancel.load(Ordering::Relaxed));
+    assert_eq!(
+        app.current_folder, before,
+        "the old completion must never install"
+    );
+    assert!(matches!(&app.drive_jump_pending.as_ref().unwrap().request,
+        DriveJumpRequest::LastLocation { drive_key, .. } if drive_key == "E:"));
+    finish_drive_jump_for_test(&mut app, &ctx);
+    app.finish_direct_navigation_scan_for_test();
+    assert_eq!(app.current_folder.as_ref(), Some(&new));
+}
+
+#[test]
+fn drive_jump_toolbar_click_replaces_ready_folder_navigation_completion() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    let nav_root = app.tmp.path().join("nav");
+    let origin = nav_root.join("a-origin");
+    let old = nav_root.join("b-old");
+    let new = app.tmp.path().join("new-drive");
+    for path in [&origin, &old, &new] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    std::fs::write(old.join("page.jpg"), b"scan-only fixture").unwrap();
+    hold_folder_nav_ready(&mut app, &origin, &old);
+    install_directory_resolver(&mut app, &new);
+    let mut frame = update_phases::MainFrameNavigation::default();
+    frame.address_nav = app.apply_switch_drive_letter(&ctx, 'E', "toolbar");
+    app.post_render_main_navigation(&ctx, frame);
+    assert!(app.folder_nav_pending.is_none());
+    assert_eq!(
+        app.current_folder.as_ref(),
+        Some(&origin),
+        "old folder result cannot install"
+    );
+    assert!(app.drive_jump_pending.is_some());
+    finish_drive_jump_for_test(&mut app, &ctx);
+    app.finish_direct_navigation_scan_for_test();
+    assert_eq!(app.current_folder.as_ref(), Some(&new));
+}
+
+#[test]
+fn drive_jump_toolbar_priority_does_not_promote_ordinary_address_inputs() {
+    for drive_completion in [false, true] {
+        let mut app = setup_app_for_test();
+        let ctx = egui::Context::default();
+        let nav_root = app.tmp.path().join("nav");
+        let origin = nav_root.join("a-origin");
+        let old = nav_root.join("b-old");
+        let address = app.tmp.path().join("address");
+        for path in [&origin, &old, &address] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(old.join("page.jpg"), b"scan-only fixture").unwrap();
+        if drive_completion {
+            hold_drive_ready(&mut app, &ctx, &old);
+        } else {
+            hold_folder_nav_ready(&mut app, &origin, &old);
+        }
+        let mut frame = update_phases::MainFrameNavigation::default();
+        frame.address_nav = Some(AddressBarNav::AddressEnterPhysical(address));
+        app.post_render_main_navigation(&ctx, frame);
+        app.finish_direct_navigation_scan_for_test();
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.current_folder.as_ref(), Some(&old));
+    }
+}
+
+#[test]
+fn drive_jump_losing_fullscreen_candidate_keeps_close_without_admitting_or_retiring() {
+    let mut app = setup_app_for_test();
+    let ctx = egui::Context::default();
+    super::tests::seed_snapshot_context(
+        &mut app,
+        "C:/drive-priority",
+        &["C:/drive-priority/page.jpg"],
+    );
+    let (started_tx, started) = mpsc::channel();
+    app.drive_jump_resolver = Some(Arc::new(move |request| {
+        started_tx.send(request.clone()).unwrap();
+        missing()
+    }));
+    let first = app
+        .apply_switch_drive_letter(&ctx, 'D', "existing-drive")
+        .unwrap();
+    dispatch(&mut app, &ctx, first);
+    let original = started
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .unwrap();
+    let cancel = app.drive_jump_pending.as_ref().unwrap().cancel.clone();
+    app.fullscreen_idx = Some(0);
+    app.viewer_presentation = ViewerPresentation::Fullscreen;
+    assert!(app.projected_viewer_session_open());
+    let loser = app
+        .apply_ring_drive_letter(&ctx, 'E', "fullscreen-loser")
+        .unwrap();
+    assert!(
+        !app.projected_viewer_session_open(),
+        "candidate creation completes fullscreen close"
+    );
+    assert_eq!(app.drive_jump_pending.as_ref().unwrap().request, original);
+    assert!(!cancel.load(Ordering::Relaxed));
+    assert!(app.folder_history_forward_entry().is_none());
+    let mut frame = update_phases::MainFrameNavigation::default();
+    // Forward has no destination, so it wins arbitration without independently
+    // admitting a replacement. This isolates the losing drive candidate's effects.
+    frame.keyboard_nav = Some(AddressBarNav::HistoryForward);
+    frame.gamepad_nav = Some(loser);
+    app.post_render_main_navigation(&ctx, frame);
+    assert!(
+        !app.projected_viewer_session_open(),
+        "a losing candidate does not restore fullscreen"
+    );
+    assert_eq!(app.drive_jump_pending.as_ref().unwrap().request, original);
+    assert!(!cancel.load(Ordering::Relaxed));
+    assert!(app.folder_pane_open_pending.is_none());
+    assert!(
+        started.try_recv().is_err(),
+        "the losing drive request was never started"
+    );
+}

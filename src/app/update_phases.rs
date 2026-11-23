@@ -1203,8 +1203,15 @@ impl App {
             folder_pane_nav,
             grid_nav,
         } = navigation;
+        // render_toolbar returns drive clicks in its address/navigation slot.
+        // Promote only that explicit toolbar input to the favorites tier;
+        // ordinary address inputs retain their released priority below worker completions.
+        let (toolbar_drive_nav, address_nav) = match address_nav {
+            Some(crate::ui_main::AddressBarNav::DriveJump(input)) => (Some(input), None),
+            other => (None, other),
+        };
         // ── 非同期フォルダナビゲーションのポーリング ────────────────
-        // 優先度 (旧来踏襲): fav_nav > toolbar_fav_nav > keyboard/gamepad_nav > folder_nav
+        // 優先度: fav_nav > toolbar favorite/drive > keyboard/gamepad_nav > folder_nav
         //                     > address_nav > open_folder_nav > context_nav
         //                     > folder_pane_open > grid_nav
         // folder_nav は fav/toolbar/keyboard/gamepad より後、address 以下より先。
@@ -1213,6 +1220,7 @@ impl App {
         // different requested navigation wins without consuming its payload or history.
         if fav_nav.is_some()
             || toolbar_fav_nav.is_some()
+            || toolbar_drive_nav.is_some()
             || fullscreen_close_nav.is_some()
             || keyboard_nav.is_some()
             || gamepad_nav.is_some()
@@ -1240,6 +1248,7 @@ impl App {
         };
         let drive_jump_wins = fav_nav.is_none()
             && toolbar_fav_nav.is_none()
+            && toolbar_drive_nav.is_none()
             && input_nav.is_none()
             && self.drive_jump_ready();
         let folder_nav_result = self.poll_folder_nav();
@@ -1247,9 +1256,11 @@ impl App {
             && !drive_jump_wins
             && fav_nav.is_none()
             && toolbar_fav_nav.is_none()
+            && toolbar_drive_nav.is_none()
             && input_nav.is_none();
         let higher_priority_than_folder_pane = fav_nav.is_some()
             || toolbar_fav_nav.is_some()
+            || toolbar_drive_nav.is_some()
             || input_nav.is_some()
             || drive_jump_wins
             || folder_nav_wins
@@ -1352,6 +1363,9 @@ impl App {
             } else if let Some(path) = toolbar_fav_nav {
                 navigate_scan_route = DirectoryScanRoute::Worker;
                 self.dispatch_favorite_navigation(path)
+            } else if let Some(input) = toolbar_drive_nav {
+                self.dispatch_drive_jump_input(input);
+                None
             } else if let Some(nav) = input_nav.or(address_nav) {
                 match nav {
                     crate::ui_main::AddressBarNav::DriveJump(input) => {
