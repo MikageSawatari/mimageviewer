@@ -42,8 +42,9 @@ pub(crate) fn is_browser_view_directory(
     )
 }
 
-/// Case-insensitive component comparison, without stat, canonicalization, or
-/// book classification. An explicit root replaces the cached default root.
+/// Compare physical spellings without I/O or book classification. Lexically
+/// resolve dot components and verbatim prefixes; preserve persistent key spellings.
+/// An explicit root replaces the cached default root.
 pub(crate) fn is_directory_under_root(
     path: &Path,
     is_directory: bool,
@@ -53,16 +54,7 @@ pub(crate) fn is_directory_under_root(
     let Some(root) = explicit_root.or(default_root) else {
         return false;
     };
-    if !is_directory || root.as_os_str().is_empty() {
-        return false;
-    }
-    let mut path_components = path.components();
-    root.components().all(|root_component| {
-        path_components.next().is_some_and(|component| {
-            crate::path_key::normalize_keep_drive(Path::new(component.as_os_str()))
-                == crate::path_key::normalize_keep_drive(Path::new(root_component.as_os_str()))
-        })
-    })
+    is_directory && crate::path_key::physical_path_is_within(path, root)
 }
 
 #[cfg(test)]
@@ -98,6 +90,52 @@ mod tests {
             assert!(
                 !is_directory_under_root(Path::new(path), true, Some(root), None),
                 "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser870_root_comparison_normalizes_dot_and_verbatim_spellings() {
+        for (root, path) in [
+            (r"C:\Pictures\..\browser", r"C:\browser\2026-11"),
+            (r"C:\browser", r"C:\Pictures\..\browser\2026-11"),
+            (r"C:\browser\.\", r"C:\browser\2026-11\.\child"),
+            (r"\\?\C:\browser", r"C:\browser\2026-11"),
+            (r"C:\browser", r"\\?\C:\browser\2026-11"),
+            (
+                r"\\?\UNC\server\share\browser",
+                r"\\server\share\browser\2026-11",
+            ),
+            (
+                r"\\server\share\browser",
+                r"\\?\UNC\server\share\browser\2026-11",
+            ),
+        ] {
+            assert!(
+                is_directory_under_root(Path::new(path), true, Some(Path::new(root)), None),
+                "root={root} path={path}"
+            );
+        }
+    }
+
+    #[test]
+    fn browser870_root_comparison_rejects_escaped_and_unsupported_spellings() {
+        for (root, path) in [
+            (r"C:\browser", r"C:\browser\..\other"),
+            (r"C:\browser", r"C:\browser\2026-11\..\..\other\child"),
+            (r"C:\Pictures\..\browser", r"C:\browser\..\other"),
+            (r"C:\browser", r"\\?\C:\browser\..\other"),
+            (r"C:\browser", r"C:\browser\..\..\browser\child"),
+            (r"\\?\Volume{1234}\browser", r"C:\browser\child"),
+            (r"C:\browser", r"\\?\Volume{1234}\browser\child"),
+            (r"\\.\C:\browser", r"C:\browser\child"),
+            (r"C:\browser", r"\\.\C:\browser\child"),
+            (r"C:\browser", r"browser\child"),
+            (r"browser", r"C:\browser\child"),
+        ] {
+            assert!(
+                !is_directory_under_root(Path::new(path), true, Some(Path::new(root)), None),
+                "root={root} path={path}"
             );
         }
     }

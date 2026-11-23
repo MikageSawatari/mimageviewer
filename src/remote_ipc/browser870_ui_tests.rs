@@ -127,6 +127,63 @@ fn browser870_remote_all_three_write_routes_reject_without_changing_database() {
 }
 
 #[test]
+fn browser870_remote_dot_root_rejects_normalized_write_without_changing_database() {
+    use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+    let mut app = crate::app::setup_app_for_test();
+    app.settings.remember_spread_shift_per_book = false;
+    let root = app.tmp.path().join("browser");
+    let month = root.join("2026-11");
+    let pictures = app.tmp.path().join("Pictures");
+    std::fs::create_dir_all(&month).unwrap();
+    std::fs::create_dir_all(&pictures).unwrap();
+    app.settings.browser_view_output_dir = Some(pictures.join("..").join("browser"));
+    app.spread_db
+        .as_ref()
+        .unwrap()
+        .set_presentation_state(
+            &month,
+            SpreadMode::RtlCover,
+            ReadingFlow::Vertical,
+            ReadingDirection::Rtl,
+            (SpreadMode::Single, ReadingFlow::Paged, ReadingDirection::Ltr),
+        )
+        .unwrap();
+    let before = app
+        .spread_db
+        .as_ref()
+        .unwrap()
+        .get_state_with_fallback(&month, None);
+    let (handle, owner, _) = active_session();
+    app.set_remote_session_handle(handle.clone());
+    let engine = super::super::container::ContainerEngine::new(app.settings.clone());
+    let payload = engine
+        .qualified_write_payload(RemoteWriteRequest::SetSpread {
+            address: mimageviewer_ipc::RemoteAddress::file(month.to_string_lossy().into_owned()),
+            spread_mode: RemoteSpreadMode::Ltr,
+            reading_direction: RemoteReadingDirection::Ltr,
+        })
+        .unwrap();
+    assert!(payload.reading_target_is_directory());
+    let response = browser870_apply_payload(&mut app, &handle, &owner, payload, Default::default());
+    let RemoteWriteResponse::Error(error) = response else {
+        panic!("normalized browser directory write accepted");
+    };
+    assert_eq!(error.code, RemoteWriteErrorCode::Unsupported);
+    assert_eq!(
+        error.message,
+        "ブラウザ閲覧の保存先のフォルダは、単ページで表示します"
+    );
+    assert_eq!(
+        app.spread_db
+            .as_ref()
+            .unwrap()
+            .get_state_with_fallback(&month, None),
+        before
+    );
+    assert!(app.remote_session_ui.pending_reading_writes.is_empty());
+}
+
+#[test]
 fn browser870_remote_write_uses_current_root_and_preserves_outside_zip_pdf_writes() {
     use crate::settings::{ReadingDirection, SpreadMode};
     let mut app = crate::app::setup_app_for_test();
