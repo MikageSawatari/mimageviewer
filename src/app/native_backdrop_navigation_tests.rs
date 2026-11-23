@@ -37,17 +37,17 @@ fn native_backdrop_drive_ring_finishes_video_transition_before_resolver_admissio
             }));
             let source = search_source(&app);
             assert!(app.video_presentation_transition.is_transitioning());
-            assert!(
-                app.apply_ring_action(
-                    &ctx,
-                    RingShortcutContext::VideoFullscreen,
-                    RingActionId::drive_action('Z').unwrap(),
-                    "drive-native-test"
-                )
-                .is_none()
+            let candidate = app.apply_ring_action(
+                &ctx,
+                RingShortcutContext::VideoFullscreen,
+                RingActionId::drive_action('Z').unwrap(),
+                "drive-native-test",
             );
+            assert!(matches!(candidate, Some(AddressBarNav::DriveJump(_))));
             assert_close_completed(&app);
             assert!(!app.video_presentation_transition.is_transitioning());
+            assert!(app.drive_jump_pending.is_none());
+            app.dispatch_native_backdrop_navigation(&ctx, None, false, candidate);
             assert!(app.drive_jump_pending.is_some());
             assert_search_active(&app, kind);
             finish_drive_jump_for_test(&mut app, &ctx);

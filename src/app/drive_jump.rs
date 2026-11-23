@@ -220,10 +220,23 @@ impl App {
         request: DriveJumpRequest,
         source: &'static str,
     ) -> Option<AddressBarNav> {
-        // Refusal precedes close, capture and retirement. Do not classify viewer
-        // contexts here; retain the existing entry points' admission policy.
-        if self.location_jump_admission_blocked() || self.remote_session_blocks_local_control() {
+        if !self.prepare_drive_jump_input(ctx) {
             return None;
+        }
+        // Main and separate viewers use the same candidate transport. No owner
+        // is admitted until this input wins the existing root navigation arbiter.
+        Some(AddressBarNav::DriveJump(DriveJumpInput {
+            request,
+            source,
+            ctx: ctx.clone(),
+        }))
+    }
+
+    fn prepare_drive_jump_input(&mut self, ctx: &egui::Context) -> bool {
+        // Refusal and completed close precede candidate creation. Losing a
+        // candidate must never retire a previously admitted main-list request.
+        if self.location_jump_admission_blocked() || self.remote_session_blocks_local_control() {
+            return false;
         }
         if self.projected_viewer_session_open() {
             let close_failed = self.close_drive_jump_viewer(ctx);
@@ -231,21 +244,10 @@ impl App {
                 self.show_feedback_warning(
                     "全画面を閉じられなかったため移動できませんでした".into(),
                 );
-                return None;
+                return false;
             }
         }
-        // Separate viewers already return navigation candidates to root. Keep
-        // that transport rather than capturing their rows or lifting their main
-        // history suppression inside a nested mount.
-        if !self.main_folder_history_available() {
-            return Some(AddressBarNav::DriveJump(DriveJumpInput {
-                request,
-                source,
-                ctx: ctx.clone(),
-            }));
-        }
-        self.admit_drive_jump(ctx, request, source);
-        None
+        true
     }
 
     pub(super) fn dispatch_drive_jump_input(&mut self, input: DriveJumpInput) {
@@ -254,8 +256,11 @@ impl App {
             source,
             ctx,
         } = input;
-        // Main's own refusal/close happens before its ticket is captured, too.
-        let _ = self.start_drive_jump(&ctx, request, source);
+        // Recheck the winning input on main: separate-viewer candidates were
+        // prepared with the outgoing payload, before returning to this owner.
+        if self.prepare_drive_jump_input(&ctx) {
+            self.admit_drive_jump(&ctx, request, source);
+        }
     }
 
     fn admit_drive_jump(

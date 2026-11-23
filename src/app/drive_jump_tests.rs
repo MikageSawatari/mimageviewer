@@ -107,6 +107,24 @@ fn pending_cancel(app: &App) -> Arc<AtomicBool> {
         .clone()
 }
 
+// Tests that need an accepted request still pass through the production arbiter.
+fn dispatch_candidate(
+    app: &mut App,
+    ctx: &egui::Context,
+    candidate: Option<crate::ui_main::AddressBarNav>,
+) {
+    if let Some(candidate) = candidate {
+        let mut frame = update_phases::MainFrameNavigation::default();
+        frame.keyboard_nav = Some(candidate);
+        app.post_render_main_navigation(ctx, frame);
+    }
+}
+
+fn switch_drive(app: &mut App, ctx: &egui::Context, letter: char, source: &'static str) {
+    let candidate = app.apply_switch_drive_letter(ctx, letter, source);
+    dispatch_candidate(app, ctx, candidate);
+}
+
 fn caller_io_counts() -> (usize, usize) {
     (
         crate::folder_tree::navigation_path_probe_count_for_test(),
@@ -172,7 +190,14 @@ fn drive_jump_key_and_toolbar_capture_the_same_last_location_request() {
         } else {
             app.apply_switch_drive_letter(&ctx, 'D', "drive-test-toolbar")
         };
-        assert!(result.is_none());
+        assert!(matches!(
+            result,
+            Some(crate::ui_main::AddressBarNav::DriveJump(_))
+        ));
+        assert!(
+            app.drive_jump_pending.is_none(),
+            "input is still an unadmitted candidate"
+        );
         assert_eq!(
             caller_io_counts(),
             caller_io,
@@ -182,6 +207,7 @@ fn drive_jump_key_and_toolbar_capture_the_same_last_location_request() {
             drive_key: "D:".into(),
             remembered: Some(remembered),
         };
+        dispatch_candidate(&mut app, &ctx, result);
         assert_eq!(app.drive_jump_pending.as_ref().unwrap().request, expected);
         assert_eq!(gate.request(), expected);
         assert_eq!(app.current_folder, before);
@@ -218,7 +244,12 @@ fn drive_jump_key_ring_and_gamepad_share_the_drive_root_request() {
                 app.trigger_gamepad_ring_action_for_test(&ctx, RingDirection::Up)
             }
         };
-        assert!(nav.is_none());
+        assert!(matches!(
+            nav,
+            Some(crate::ui_main::AddressBarNav::DriveJump(_))
+        ));
+        assert!(app.drive_jump_pending.is_none());
+        dispatch_candidate(&mut app, &ctx, nav);
         assert_eq!(
             gate.request(),
             DriveJumpRequest::Root {
@@ -251,14 +282,17 @@ fn drive_jump_current_root_preserves_unc_verbatim_unc_and_original_archive_drive
         app.current_folder = Some(PathBuf::from(displayed));
         app.archive_source_override = source.map(PathBuf::from);
         let gate = ResolverGate::install(&mut app, missing());
-        assert!(
-            app.apply_location_navigation_key_action(
-                &ctx,
-                KeyAction::GridOpenCurrentDriveRoot,
-                "drive-test"
-            )
-            .is_none()
+        let candidate = app.apply_location_navigation_key_action(
+            &ctx,
+            KeyAction::GridOpenCurrentDriveRoot,
+            "drive-test",
         );
+        assert!(matches!(
+            candidate,
+            Some(crate::ui_main::AddressBarNav::DriveJump(_))
+        ));
+        assert!(app.drive_jump_pending.is_none());
+        dispatch_candidate(&mut app, &ctx, candidate);
         assert_eq!(
             gate.request(),
             DriveJumpRequest::Root {
@@ -276,10 +310,10 @@ fn drive_jump_latest_request_retires_the_previous_worker_owner() {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();
     let gate = ResolverGate::install(&mut app, missing());
-    app.apply_switch_drive_letter(&ctx, 'D', "drive-test-first");
+    switch_drive(&mut app, &ctx, 'D', "drive-test-first");
     gate.request();
     let old_cancel = pending_cancel(&app);
-    app.apply_switch_drive_letter(&ctx, 'E', "drive-test-last");
+    switch_drive(&mut app, &ctx, 'E', "drive-test-last");
     let request = gate.request();
     assert!(old_cancel.load(Ordering::Relaxed));
     assert_eq!(
@@ -304,7 +338,7 @@ fn drive_jump_later_favorite_admission_rejects_old_resolver_completion() {
     std::fs::create_dir(&old).unwrap();
     std::fs::create_dir(&favorite).unwrap();
     let gate = ResolverGate::install(&mut app, resolution(&old, OpenablePathKind::Directory));
-    app.apply_switch_drive_letter(&ctx, 'D', "drive-test");
+    switch_drive(&mut app, &ctx, 'D', "drive-test");
     gate.request();
     let cancel = pending_cancel(&app);
     let mut frame = update_phases::MainFrameNavigation::default();
@@ -334,7 +368,7 @@ fn drive_jump_admission_retires_an_earlier_favorite_scan() {
         .clone();
     let before = app.current_folder.clone();
     let gate = ResolverGate::install(&mut app, missing());
-    app.apply_switch_drive_letter(&ctx, 'D', "drive-test");
+    switch_drive(&mut app, &ctx, 'D', "drive-test");
     assert!(old.load(Ordering::Relaxed));
     assert!(app.folder_pane_open_pending.is_none());
     gate.request();
@@ -354,7 +388,7 @@ fn drive_jump_successful_later_direct_open_and_sibling_navigation_retire_resolut
         std::fs::create_dir(&target).unwrap();
         app.current_folder = Some(origin.clone());
         let gate = ResolverGate::install(&mut app, missing());
-        app.apply_switch_drive_letter(&ctx, 'D', "drive-test");
+        switch_drive(&mut app, &ctx, 'D', "drive-test");
         gate.request();
         let cancel = pending_cancel(&app);
         if sibling {
@@ -382,14 +416,28 @@ fn drive_jump_successful_later_direct_open_and_sibling_navigation_retire_resolut
 
 #[test]
 fn drive_jump_surface_switches_retire_pending_results() {
-    for operation in 0..4 {
+    for operation in 0..6 {
         let mut app = setup_app_for_test();
         let ctx = egui::Context::default();
-        if operation == 3 {
-            app.open_global_search();
+        match operation {
+            3 => app.open_global_search(),
+            4 => app.open_favsearch(),
+            5 => app.open_tag_view(),
+            _ => {}
+        }
+        if operation >= 3 {
+            assert!(app.current_folder.is_none(), "empty-origin search fixture");
+            assert!(
+                app.top_level_grid_view
+                    .return_to()
+                    .is_none_or(|restore| matches!(
+                        restore,
+                        top_level_grid_view::TopLevelGridRestore::Unavailable
+                    ))
+            );
         }
         let gate = ResolverGate::install(&mut app, missing());
-        app.apply_switch_drive_letter(&ctx, 'D', "drive-test");
+        switch_drive(&mut app, &ctx, 'D', "drive-test");
         gate.request();
         let cancel = pending_cancel(&app);
         match operation {
@@ -398,7 +446,12 @@ fn drive_jump_surface_switches_retire_pending_results() {
             }
             1 => app.clear_quick_folder_slots(),
             2 => app.open_global_search(),
-            _ => app.close_global_search(),
+            3 => app.close_global_search(),
+            4 => app.close_favsearch(),
+            _ => app.close_tag_view(),
+        }
+        if operation >= 3 {
+            assert!(!app.global_search.active && !app.favsearch.active && !app.tag_view.active);
         }
         assert!(app.drive_jump_pending.is_none(), "operation {operation}");
         assert!(cancel.load(Ordering::Relaxed));
@@ -414,7 +467,7 @@ fn drive_jump_remote_acquire_then_release_cannot_revive_old_result() {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();
     let gate = ResolverGate::install(&mut app, missing());
-    app.apply_switch_drive_letter(&ctx, 'D', "drive-test");
+    switch_drive(&mut app, &ctx, 'D', "drive-test");
     gate.request();
     let cancel = pending_cancel(&app);
     let handle = crate::remote_ipc::session::SessionHandle::new();
@@ -434,7 +487,7 @@ fn drive_jump_remote_acquire_then_release_cannot_revive_old_result() {
     );
     assert!(app.drive_jump_pending.is_none());
     assert!(cancel.load(Ordering::Relaxed));
-    app.apply_switch_drive_letter(&ctx, 'E', "drive-test-remote-refusal");
+    switch_drive(&mut app, &ctx, 'E', "drive-test-remote-refusal");
     assert!(app.drive_jump_pending.is_none());
     handle.local_disconnect();
     app.poll_remote_session(&ctx);
@@ -447,8 +500,10 @@ fn drive_jump_remote_acquire_then_release_cannot_revive_old_result() {
 fn drive_jump_fullscreen_ring_and_linked_gamepad_close_before_admission() {
     for linked in [false, true] {
         for success in [false, true] {
+            let _foreground = crate::test_native_focus::scoped(179301, 179301, true);
             let mut app = setup_app_for_test();
             let ctx = egui::Context::default();
+            app.main_hwnd = Some(179300);
             app.settings.auto_fullscreen_image_folders = false;
             app.settings.auto_fullscreen_zip_pdf = false;
             let target = app.tmp.path().join("after-fullscreen-drive");
@@ -467,22 +522,36 @@ fn drive_jump_fullscreen_ring_and_linked_gamepad_close_before_admission() {
                 missing()
             };
             let gate = ResolverGate::install(&mut app, result);
-            if linked {
+            let candidate = if linked {
+                assert_eq!(app.current_input_surface_for_test(), ActionSurface::Viewer);
+                assert_eq!(
+                    app.current_ring_shortcut_context(),
+                    RingShortcutContext::ImageFullscreen
+                );
                 app.settings
                     .ring_shortcuts
                     .profile_mut(RingShortcutContext::ImageFullscreen)
                     .slots[RingDirection::Up.slot_index()] =
                     RingActionId::drive_action('Z').unwrap();
-                app.trigger_gamepad_ring_action_for_test(&ctx, RingDirection::Up);
+                app.trigger_gamepad_ring_action_for_test(&ctx, RingDirection::Up)
             } else {
                 app.apply_ring_action(
                     &ctx,
                     RingShortcutContext::ImageFullscreen,
                     RingActionId::drive_action('Z').unwrap(),
                     "drive-test-ring",
-                );
-            }
+                )
+            };
             assert!(!app.projected_viewer_session_open());
+            assert!(matches!(
+                candidate,
+                Some(crate::ui_main::AddressBarNav::DriveJump(_))
+            ));
+            assert!(
+                app.drive_jump_pending.is_none(),
+                "close completes before main admission"
+            );
+            dispatch_candidate(&mut app, &ctx, candidate);
             assert!(app.drive_jump_pending.is_some());
             assert!(app.fs_feedback_toast.is_none());
             gate.request();
@@ -512,7 +581,7 @@ fn drive_jump_new_fullscreen_discards_old_resolution() {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();
     let gate = ResolverGate::install(&mut app, missing());
-    app.apply_switch_drive_letter(&ctx, 'D', "drive-test");
+    switch_drive(&mut app, &ctx, 'D', "drive-test");
     gate.request();
     let cancel = pending_cancel(&app);
     image_viewer(&mut app);
@@ -529,12 +598,12 @@ fn drive_jump_failed_fullscreen_close_keeps_the_existing_request() {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();
     let gate = ResolverGate::install(&mut app, missing());
-    app.apply_switch_drive_letter(&ctx, 'D', "drive-test-existing");
+    switch_drive(&mut app, &ctx, 'D', "drive-test-existing");
     let original = gate.request();
     let cancel = pending_cancel(&app);
     image_viewer(&mut app);
     app.drive_jump_close_backend = Some(|_, _| true);
-    app.apply_switch_drive_letter(&ctx, 'E', "drive-test-refused");
+    switch_drive(&mut app, &ctx, 'E', "drive-test-refused");
     assert_eq!(app.drive_jump_pending.as_ref().unwrap().request, original);
     assert!(!cancel.load(Ordering::Relaxed));
     assert!(app.projected_viewer_session_open());
@@ -559,7 +628,7 @@ fn drive_jump_snapshot_refusal_keeps_the_viewer_open_and_never_starts_resolution
         panic!("snapshot refusal must precede resolver")
     }));
     app.drive_jump_close_backend = Some(|_, _| panic!("snapshot refusal must precede close"));
-    app.apply_switch_drive_letter(&ctx, 'D', "drive-test-refused");
+    switch_drive(&mut app, &ctx, 'D', "drive-test-refused");
     assert!(app.projected_viewer_session_open());
     assert!(app.drive_jump_pending.is_none());
     assert!(app.fs_feedback_toast.is_some());
@@ -580,7 +649,7 @@ fn drive_jump_classified_directories_keep_worker_scan_and_original_navigation() 
             std::fs::create_dir(&target).unwrap();
             install_resolution(&mut app, resolution(&target, OpenablePathKind::Directory));
             let caller_io = caller_io_counts();
-            app.apply_switch_drive_letter(&ctx, 'D', "drive-test");
+            switch_drive(&mut app, &ctx, 'D', "drive-test");
             assert_eq!(
                 caller_io_counts(),
                 caller_io,
@@ -645,7 +714,7 @@ fn drive_jump_missing_destination_preserves_each_accepted_search_source() {
             app.folder_nav_history_snapshot(),
         );
         install_resolution(&mut app, missing());
-        app.apply_switch_drive_letter(&ctx, 'Z', "drive-test");
+        switch_drive(&mut app, &ctx, 'Z', "drive-test");
         finish_drive_jump_for_test(&mut app, &ctx);
         assert!(app.global_search.active || app.favsearch.active || app.tag_view.active);
         assert_eq!(
@@ -713,7 +782,7 @@ fn drive_jump_removal_clears_both_slots_persists_and_does_not_cancel_admitted_wo
             .insert("D:".into(), PathBuf::from("D:/remembered"));
     }
     let gate = ResolverGate::install(&mut app, missing());
-    app.apply_switch_drive_letter(&ctx, 'D', "drive-test");
+    switch_drive(&mut app, &ctx, 'D', "drive-test");
     let accepted = gate.request();
     let cancel = pending_cancel(&app);
     app.remove_toolbar_drive("D:");
@@ -734,7 +803,7 @@ fn drive_jump_removal_clears_both_slots_persists_and_does_not_cancel_admitted_wo
     gate.finish_worker();
     finish_drive_jump_for_test(&mut app, &ctx);
     let gate = ResolverGate::install(&mut app, missing());
-    app.apply_switch_drive_letter(&ctx, 'D', "drive-test-after-removal");
+    switch_drive(&mut app, &ctx, 'D', "drive-test-after-removal");
     assert_eq!(
         gate.request(),
         DriveJumpRequest::LastLocation {
@@ -839,7 +908,7 @@ fn drive_jump_main_wait_does_not_block_an_independent_mounted_grid() {
         );
     });
     let gate = ResolverGate::install(&mut app, missing());
-    app.apply_switch_drive_letter(&ctx, 'D', "drive-main-wait-test");
+    switch_drive(&mut app, &ctx, 'D', "drive-main-wait-test");
     gate.request();
     let cancel = pending_cancel(&app);
     assert!(app.drive_jump_pending());
@@ -887,9 +956,12 @@ fn drive_jump_search_pdf_classification_keeps_search_until_successful_enumeratio
                 app.selected,
                 app.items.iter().map(GridItem::perf_key).collect::<Vec<_>>(),
             );
+            let address_before = app.address.clone();
+            let history_before = app.folder_nav_history_snapshot();
+            let toast_before = app.fs_feedback_toast.clone();
             install_resolution(&mut app, resolution(&target, OpenablePathKind::File));
             let caller_io = caller_io_counts();
-            app.apply_switch_drive_letter(&ctx, 'D', "drive-pdf-test");
+            switch_drive(&mut app, &ctx, 'D', "drive-pdf-test");
             finish_drive_jump_for_test(&mut app, &ctx);
             assert_eq!(
                 caller_io_counts(),
@@ -935,7 +1007,13 @@ fn drive_jump_search_pdf_classification_keeps_search_until_successful_enumeratio
                     ),
                     before
                 );
-                assert!(app.fs_feedback_toast.is_some());
+                assert_eq!(app.address, address_before);
+                assert_eq!(app.folder_nav_history_snapshot(), history_before);
+                assert!(app.pdf_enumerate_pending.is_none());
+                assert!(app.pdf_placeholder_count.is_none());
+                // The existing plain-PDF Other failure restores the source;
+                // unlike drive resolution failure, it does not publish a toast.
+                assert_eq!(app.fs_feedback_toast, toast_before);
             }
         }
     }
@@ -958,7 +1036,7 @@ fn drive_jump_search_zip_classification_uses_container_open_and_exits_on_success
         writer.finish().unwrap();
         install_resolution(&mut app, resolution(&target, OpenablePathKind::File));
         let caller_io = caller_io_counts();
-        app.apply_switch_drive_letter(&ctx, 'D', "drive-zip-test");
+        switch_drive(&mut app, &ctx, 'D', "drive-zip-test");
         finish_drive_jump_for_test(&mut app, &ctx);
         assert_eq!(
             caller_io_counts(),
@@ -1011,7 +1089,7 @@ fn drive_jump_removal_during_scan_keeps_owner_and_success_records_the_drive_agai
             .insert(drive.clone(), target.clone());
     }
     install_resolution(&mut app, resolution(&target, OpenablePathKind::Directory));
-    app.apply_switch_drive_letter(&ctx, letter, "drive-removal-test");
+    switch_drive(&mut app, &ctx, letter, "drive-removal-test");
     finish_drive_jump_for_test(&mut app, &ctx);
     let cancel = app
         .folder_pane_open_pending
@@ -1046,13 +1124,13 @@ fn drive_jump_modal_refusal_does_not_close_viewer_or_replace_existing_request() 
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();
     let gate = ResolverGate::install(&mut app, missing());
-    app.apply_switch_drive_letter(&ctx, 'D', "drive-test-existing");
+    switch_drive(&mut app, &ctx, 'D', "drive-test-existing");
     let original = gate.request();
     let cancel = pending_cancel(&app);
     image_viewer(&mut app);
     app.show_preferences = true;
     app.drive_jump_close_backend = Some(|_, _| panic!("modal refusal must precede close"));
-    app.apply_switch_drive_letter(&ctx, 'E', "drive-test-modal-refusal");
+    switch_drive(&mut app, &ctx, 'E', "drive-test-modal-refusal");
     assert_eq!(app.drive_jump_pending.as_ref().unwrap().request, original);
     assert!(!cancel.load(Ordering::Relaxed));
     assert!(app.projected_viewer_session_open());
@@ -1064,7 +1142,7 @@ fn drive_jump_ready_result_loses_to_same_frame_keyboard_navigation() {
     let mut app = setup_app_for_test();
     let ctx = egui::Context::default();
     let gate = ResolverGate::install(&mut app, missing());
-    app.apply_switch_drive_letter(&ctx, 'D', "drive-test-existing");
+    switch_drive(&mut app, &ctx, 'D', "drive-test-existing");
     gate.request();
     let cancel = pending_cancel(&app);
     gate.finish_worker();

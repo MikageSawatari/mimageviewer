@@ -5601,7 +5601,7 @@ mod section1793_toolbar_tests {
 
     #[cfg(windows)]
     #[test]
-    fn section1793_toolbar_click_admits_shared_drive_handler_without_ui_probes() {
+    fn section1793_toolbar_click_returns_shared_drive_candidate_without_ui_probes() {
         let app = Rc::new(RefCell::new(crate::app::setup_app_for_test()));
         let target = app.borrow().tmp.path().join("toolbar-drive-destination");
         std::fs::create_dir(&target).unwrap();
@@ -5615,21 +5615,33 @@ mod section1793_toolbar_tests {
             app.set_quick_folder_slot_target(crate::settings::QuickFolderSlotId::A, target.clone());
         }
         let rendered = app.clone();
+        let candidates = Rc::new(RefCell::new(Vec::new()));
+        let rendered_candidates = candidates.clone();
         let mut harness = crate::test_ui::builder()
             .with_size(egui::vec2(500.0, 180.0))
             .with_context_setup(crate::ui_fonts::configure_fonts)
             .build_ui(move |ui| {
                 crate::test_ui::full_viewport_ui(ui, |root| {
-                    rendered.borrow_mut().render_toolbar(root);
+                    if let Some(candidate) = rendered.borrow_mut().render_toolbar(root).1 {
+                        rendered_candidates.borrow_mut().push(candidate);
+                    }
                 });
             });
         let probes = crate::folder_tree::navigation_path_probe_count_for_test();
         harness.run();
         assert!(!app.borrow().drive_jump_pending());
+        assert!(candidates.borrow().is_empty());
         let before = app.borrow().current_folder.clone();
         harness.get_by_label(&key).click();
         harness.run();
-        assert!(app.borrow().drive_jump_pending());
+        assert!(
+            !app.borrow().drive_jump_pending(),
+            "render only prepares an unadmitted input"
+        );
+        assert!(matches!(
+            candidates.borrow().as_slice(),
+            [AddressBarNav::DriveJump(_)]
+        ));
         assert_eq!(
             app.borrow()
                 .active_drive_current_dir(key.chars().next().unwrap()),

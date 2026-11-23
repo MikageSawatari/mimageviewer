@@ -1011,8 +1011,8 @@ fn location_key_case(action: KeyAction, kind: usize) {
         || action == KeyAction::GridOpenCurrentDriveRoot;
     if drive_action {
         assert!(
-            candidate.is_none(),
-            "{action:?}: drive resolution must be deferred"
+            app.drive_jump_pending.is_none(),
+            "{action:?}: drive input must wait for arbitration"
         );
     }
     if let Some(candidate) = candidate {
@@ -1028,14 +1028,12 @@ fn location_key_case(action: KeyAction, kind: usize) {
                 assert_eq!(path, &app.settings.favorites[slot - 1].path);
             }
             (AddressBarNav::LocationJump(_), Entry::Location) => {}
+            (AddressBarNav::DriveJump(_), Entry::Location) if drive_action => {}
             _ => panic!("{action:?} returned an incompatible transport: {candidate:?}"),
         }
         let mut frame = empty_navigation();
         frame.keyboard_nav = Some(candidate);
         app.post_render_main_navigation(&ctx, frame);
-    } else if app.drive_jump_pending.is_some() {
-        assert!(drive_action, "{action:?}: unexpected drive request");
-        super::drive_jump::finish_drive_jump_for_test(&mut app, &ctx);
     } else {
         // A missing current root or known folder can refuse before producing a
         // request. That refusal remains an explicit, notifying result.

@@ -800,6 +800,8 @@ mod list_order_worker_tests;
 mod location_jump;
 pub(crate) use drive_jump::DriveJumpInput;
 #[cfg(all(test, windows))]
+mod drive_jump_priority_tests;
+#[cfg(all(test, windows))]
 mod drive_jump_tests;
 mod rating_membership_ops;
 #[cfg(test)]
@@ -35045,6 +35047,10 @@ impl App {
             return;
         }
         let Some(location) = FolderNavHistoryTarget::from_restore(&origin.restore) else {
+            // Returning to an empty origin still ends the temporary view's
+            // request epoch. No destination loader will perform admission and
+            // retire its outstanding opens on this path.
+            self.retire_main_list_requests_for_surface_switch();
             return;
         };
         let destination = FolderNavHistoryEntry::new(location, origin.route.clone());
