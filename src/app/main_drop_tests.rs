@@ -398,8 +398,8 @@ fn grid_drop_858_details_horizontal_scroll_clips_before_tree_tooltip_occlusion()
             },
             |ctx| {
                 ctx.root_ui(|ui| {
-                    egui::SidePanel::left("grid_drop_858_tree_space")
-                        .exact_width(200.0)
+                    egui::Panel::left("grid_drop_858_tree_space")
+                        .exact_size(200.0)
                         .show(ui, |ui| {
                             ui.label("フォルダ");
                         });
@@ -413,7 +413,7 @@ fn grid_drop_858_details_horizontal_scroll_clips_before_tree_tooltip_occlusion()
                     },
                 );
                 let row = captured.geometry.grid_folders[0].rect;
-                let selection_fill = ctx.style().visuals.selection.bg_fill;
+                let selection_fill = ctx.global_style().visuals.selection.bg_fill;
                 let raw_row = ctx.graphics(|graphics| {
                     graphics
                         .get(egui::LayerId::background())
@@ -523,7 +523,7 @@ fn hover_860_details_folder_name_uses_selection_color() {
         let ctx = egui::Context::default();
         crate::ui_fonts::configure_fonts(&ctx);
         crate::os_theme::apply_resolved(&ctx, theme);
-        let fill = ctx.style().visuals.selection.bg_fill;
+        let fill = ctx.global_style().visuals.selection.bg_fill;
         let rgb = [fill.r(), fill.g(), fill.b()];
         app.settings.details_name_colors.colors[0] =
             crate::details_name_colors::DetailsNameColor::Custom {
@@ -535,7 +535,7 @@ fn hover_860_details_folder_name_uses_selection_color() {
             place: DropPlace::Grid,
         });
         grid_drop_pass(&mut app, &ctx, None);
-        let expected = ctx.style().visuals.selection.stroke.color;
+        let expected = ctx.global_style().visuals.selection.stroke.color;
         ctx.run_pass(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
