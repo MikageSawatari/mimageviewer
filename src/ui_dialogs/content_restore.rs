@@ -182,7 +182,11 @@ fn render_content_restore_contents_with_list_height(
         "このフォルダに、以前編集したファイルと内容が同じファイルが {} 件あります。",
         rows.len()
     ));
-    ui.label("編集内容 (補正・消しゴム・モザイク・注釈・トリミング・★・タグ) を複製しますか?");
+    // Keep this list in step with what the restore copies (`rename_key_migration::STORES`).
+    ui.label(
+        "編集内容 (補正・消しゴム・モザイク・注釈・トリミング・回転・★・タグ・AI 説明文) と、\n\
+         本の読書位置・見開き・本の構成・代表サムネを複製しますか?",
+    );
     if let Some(warning) = multiple_source_warning_text(rows) {
         ui.label(egui::RichText::new(warning).color(ui.visuals().warn_fg_color));
     }
