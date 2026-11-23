@@ -9,10 +9,10 @@
     "message": "mIV で見る"
   },
   "badgeBusy": {
-    "message": "処理中"
+    "message": "..."
   },
   "badgeSuccess": {
-    "message": "成功"
+    "message": "OK"
   },
   "badgeError": {
     "message": "!"
@@ -22,6 +22,12 @@
   },
   "success": {
     "message": "mIV への受け渡しが完了しました。"
+  },
+  "success_fallback": {
+    "message": "リンク先は画像ではなかったため、ページに表示されている画像を開きました。"
+  },
+  "link_not_image": {
+    "message": "リンク先は画像ではありませんでした。ページの画像はこの拡張では取得できない形式です。"
   },
   "interrupted": {
     "message": "画像の処理が中断されました。必要なら、もう一度「mIV で見る」を選んでください。"
