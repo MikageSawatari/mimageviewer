@@ -223,8 +223,98 @@ fn replace_script(path: &Path, source: &str) -> Result<(), String> {
         .and_then(|()| temporary.flush())
         .and_then(|()| temporary.as_file().sync_all())
         .map_err(|_| "スタック用スクリプトを書き込めません".to_owned())?;
-    crate::archive_converter::replace_file_atomic(temporary.path(), path, false)
+    rename_script_temporary(temporary.as_file(), temporary.path(), path)
         .map_err(|_| "スタック用スクリプトを置き換えられません".to_owned())
+}
+
+/// POSIX replacement leaves sharing readers on the old contents. The ordinary
+/// MoveFileExW helper cannot replace such an open target, even on NTFS.
+#[cfg(windows)]
+fn rename_script_temporary(
+    temporary: &File,
+    _temporary_path: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        DELETE, FILE_FLAGS_AND_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileRenameInfoEx, ReOpenFile, SetFileInformationByHandle,
+    };
+    use windows::Win32::System::WindowsProgramming::{
+        FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+    };
+
+    let invalid_name = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid script destination",
+        )
+    };
+    let absolute = std::path::absolute(destination)?;
+    let mut name = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+    if name.is_empty() || name.contains(&0) {
+        return Err(invalid_name());
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(invalid_name)?;
+    name.push(0);
+    let total = (offset_of!(FILE_RENAME_INFO, FileName) + name.len() * size_of::<u16>())
+        .max(size_of::<FILE_RENAME_INFO>());
+    let total_bytes = u32::try_from(total).map_err(|_| invalid_name())?;
+    // u64 storage supplies alignment for FILE_RENAME_INFO and its variable tail.
+    let mut storage = vec![0u64; total.div_ceil(size_of::<u64>())];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: the aligned allocation includes the full header and UTF-16 tail.
+    // FileNameLength excludes NUL; the buffer passed to Windows includes it.
+    unsafe {
+        (*info).Anonymous.Flags =
+            FILE_RENAME_FLAG_POSIX_SEMANTICS | FILE_RENAME_FLAG_REPLACE_IF_EXISTS;
+        (*info).RootDirectory = HANDLE::default();
+        (*info).FileNameLength = name_bytes;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+    }
+    // Reopen this exact temp object with DELETE access, without looking it up
+    // by its pathname again. Keep all sharing modes compatible with std File.
+    let handle = unsafe {
+        ReOpenFile(
+            HANDLE(temporary.as_raw_handle()),
+            DELETE.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+        )
+    }
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    // SAFETY: ReOpenFile returned a new owned handle, closed once by this guard.
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle.0) };
+    // SAFETY: the handle remains open and storage is valid for total_bytes.
+    unsafe {
+        SetFileInformationByHandle(
+            HANDLE(handle.as_raw_handle()),
+            FileRenameInfoEx,
+            storage.as_ptr().cast(),
+            total_bytes,
+        )
+    }
+    .map_err(|error| std::io::Error::other(error.to_string()))
+}
+
+#[cfg(not(windows))]
+fn rename_script_temporary(
+    _temporary: &File,
+    temporary_path: &Path,
+    destination: &Path,
+) -> std::io::Result<()> {
+    fs::rename(temporary_path, destination)
 }
 
 #[cfg(windows)]

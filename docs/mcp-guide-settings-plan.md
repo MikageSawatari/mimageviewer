@@ -772,6 +772,12 @@ UI スレッドで、次のどれかなら拒む (何も変えない)。
      `expected_sha256` と同じことを確かめる。違えば
      「読んだあとに変わっています。読み直してください」で拒み、ファイルは変えない。
   4. 一時ファイルからの置き換えで書く (読む側の worker が書きかけを読まないように)。
+     temp を flush / sync してから、Windows は `SetFileInformationByHandle(FileRenameInfoEx)` と
+     `FILE_RENAME_FLAG_POSIX_SEMANTICS | FILE_RENAME_FLAG_REPLACE_IF_EXISTS` で置き換える。
+     `FILE_SHARE_DELETE` を許す読み取り handle は旧本文を読み続け、新しい open は新本文を読む。
+     `MoveFileExW` の共通 helper は開いた読み手がいると失敗するため、ここには使わず、他の呼び出し元も変えない。
+     Rust 1.100 の std ソースは当該 PC には無く、既存の windows crate で直接呼ぶ。
+     エディタが delete sharing を許さず開いていて失敗する場合は、既存のエラー表示とログだけ (まれな失敗の既定方針)。
   5. 応答には書く前の本文を入れない (予算に収まらないことがあるため)。**書く前の本文は、AI が書く前に読んだもの**
      (3 で同じであることを確かめている)。戻すときは、それを同じ tool で書く。tool の説明に「書く前に読み、戻せるように
      その本文を持っておく」と書く。トーストと「AI による変更」に「スタック用スクリプトを変更 (n 行 → m 行)」と出す。
