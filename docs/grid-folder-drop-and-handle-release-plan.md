@@ -508,3 +508,18 @@ detached述語・viewport経路・変更の囲いには触れていない。コ�
 - スナップショット2枚の生成・目視・更新指定なしの比較。PNGは追加していない。
 - §9の内部転送・自身拒否・外部コピー先・外部強調と、別プロセスExplorerのバッジの実機確認。
 - UI固定文字列の追加はsnapshot fixture内だけだが、グリフ検査も設計担当に渡す。
+
+## 15. 検証と検収 (2026-11-23、設計担当)
+
+- 段 1 `8daf91a0d`、段 2 `634db5873`、テストの API 名の修正と UI スナップショット `c3e9d3189`。
+- 共有 runner でのテスト (設計担当が実行、製品は起動していない):
+  - 段 1: 関連 295 件が成功。実 Shell の ignored 4 件 (`fence_858b_real_move_cached_zip_folder`・`_rename_cached_zip_folder`・
+    `delete_worker` の `_recycle_cached_zip_folder`・`_permanent_delete_held_zip_and_pdf`) が成功。移動・名前の変更・ごみ箱への削除は、
+    囲いなしで中断 (RED)、囲いありで完了 (GREEN)。開いたままの ZIP・PDF 自身の Shell の完全削除は `path_is_gone` = true (§11 の 2 件目は解消)。
+  - 段 2: 関連 421 件が成功。UI スナップショット 272 件が成功 (`hover_860_drop_targets_light` / `_dark` を新しく作り、目で確かめた)。
+    `check_ui_glyphs.py` 成功。
+- 独立レビュー (実装者とは別の Sol xhigh): 指摘なしで ACCEPT。
+- build-dev 成功。
+- 残る確認 (サブ PC): PDF worker の子プロセスで開いた文書を含むフォルダの移動 (`fence_858b_real_child_document_blocks_parent_move_until_release` は
+  portable-smoke の exe を子に使う ignored テストで、まだ流していない)、別プロセスのエクスプローラーからのドラッグで説明のバッジが出るか、
+  外からのドラッグ中の強調の見え方。依頼文は `C:\home\mimageviewer-subpc\dnd858b\brief.md`。
