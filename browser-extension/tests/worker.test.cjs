@@ -260,10 +260,10 @@ test("image links use exactly the shared Rust extension set, preserving selected
   for (const extension of rust) {
     const linked = `https://user:secret@linked.example/full.${extension.toUpperCase()}?size=1#fragment`;
     const selected = selectTarget({ ...info, linkUrl: linked }, tab);
-    assert.equal(selected.image.href, `https://linked.example/full.${extension.toUpperCase()}?size=1`);
+    assert.deepEqual(selected.images.map(image => image.href), [`https://linked.example/full.${extension.toUpperCase()}?size=1`, info.srcUrl]);
   }
   for (const linked of ["https://linked.example/page.html", "https://linked.example/photo.png/more", "data:image/png,x", "file:///photo.png", "bad url"]) {
-    assert.equal(selectTarget({ ...info, linkUrl: linked }, tab).image.href, info.srcUrl);
+    assert.deepEqual(selectTarget({ ...info, linkUrl: linked }, tab).images.map(image => image.href), [info.srcUrl]);
   }
   const h = harness(); await h.worker.ready;
   h.hooks.fetch = async () => { throw new Error("network"); };
@@ -271,7 +271,185 @@ test("image links use exactly the shared Rust extension set, preserving selected
   assert.equal(h.fetches.length, 1);
   assert.equal(h.fetches[0][0], "https://linked.example/full.jpg");
   assert.equal(h.native.length, 0);
+  assert.equal(h.titles.at(-1), "fetch_failed");
 });
+
+const linkedInfo = { ...info, linkUrl: "https://linked.example/wiki/File:photo.jpg" };
+
+test("HTML image links discard the unread body and open the displayed image with localized fallback success", async () => {
+  for (const [locale, expected] of [
+    ["ja", "リンク先は画像ではなかったため、ページに表示されている画像を開きました。"],
+    ["en", "The link target was not an image, so the image shown on the page was opened."]
+  ]) {
+    const h = harness(); await h.worker.ready;
+    const messages = JSON.parse(fs.readFileSync(path.join(__dirname, `../_locales/${locale}/messages.json`), "utf8"));
+    h.api.i18n.getMessage = key => messages[key].message;
+    const html = response({ type: "text/html; charset=utf-8", url: linkedInfo.linkUrl });
+    // Obtaining a reader for the rejected link body would already be a defect.
+    html.body.getReader = () => { assert.fail("HTML body must not be read"); };
+    const image = response({ url: "https://cdn.example/displayed.png#fragment" });
+    h.hooks.fetch = async url => {
+      assert.deepEqual(h.rules(), [exactRule(url, "https://page.example", -1, h.api.runtime.id)]);
+      return url === linkedInfo.linkUrl ? html : image;
+    };
+    await h.click(linkedInfo);
+    assert.deepEqual(h.fetches, [linkedInfo.linkUrl, info.srcUrl].map(url => [url, { credentials: "include", cache: "no-store" }]));
+    assert.deepEqual(html.stats, { reads: 0, cancelled: 1, released: 0 });
+    assert.equal(h.native.length, 1);
+    assert.equal(h.native[0].image_url, info.srcUrl);
+    assert.equal(h.native[0].final_url, "https://cdn.example/displayed.png");
+    assert.equal(h.native[0].content_type, "image/png");
+    assert.equal(h.native[0].data_b64, "iVBO");
+    assert.equal(h.titles.at(-1), expected);
+    assert.equal(h.badges.at(-1), messages.badgeSuccess.message);
+    const operations = h.log.filter(item => ["rules", "fetch", "native"].includes(item.name));
+    assert.deepEqual(operations.map(item => item.name), ["rules", "fetch", "rules", "rules", "fetch", "rules", "native"]);
+    assert.deepEqual(operations.filter(item => item.name === "rules").map(item => item.args[0]), [
+      { removeRuleIds: [RULE_ID], addRules: [exactRule(linkedInfo.linkUrl, "https://page.example", -1, h.api.runtime.id)] },
+      { removeRuleIds: [RULE_ID] },
+      { removeRuleIds: [RULE_ID], addRules: [exactRule(info.srcUrl, "https://page.example", -1, h.api.runtime.id)] },
+      { removeRuleIds: [RULE_ID] }
+    ]);
+    assert.deepEqual(h.rules(), []);
+    assert.deepEqual(h.storage, {});
+  }
+});
+
+for (const type of ["image/jpeg", "IMAGE/JPEG; charset=binary"]) {
+  test(`image link Content-Type ${type} uses only the linked image`, async () => {
+    const h = harness(); await h.worker.ready;
+    const image = response({ type, url: "https://cdn.example/full.jpg" });
+    h.hooks.fetch = async () => image;
+    await h.click(linkedInfo);
+    assert.equal(h.fetches.length, 1);
+    assert.equal(h.fetches[0][0], linkedInfo.linkUrl);
+    assert.equal(h.native[0].image_url, linkedInfo.linkUrl);
+    assert.equal(h.native[0].final_url, image.url);
+    assert.equal(h.native[0].content_type, type);
+    assert.equal(h.titles.at(-1), "success");
+    assert.equal(h.badges.at(-1), "badgeSuccess");
+    assert.deepEqual(image.stats, { reads: 2, cancelled: 0, released: 1 });
+  });
+}
+
+for (const type of [null, "application/octet-stream"]) {
+  test(`image link Content-Type ${type} falls back without type-checking the displayed image`, async () => {
+    const h = harness(); await h.worker.ready;
+    const linked = response({ type, url: linkedInfo.linkUrl });
+    const source = response({ type, url: info.srcUrl });
+    h.hooks.fetch = async url => url === linkedInfo.linkUrl ? linked : source;
+    await h.click(linkedInfo);
+    assert.equal(h.fetches.length, 2);
+    assert.equal(h.native[0].image_url, info.srcUrl);
+    assert.equal(h.native[0].content_type, type || "");
+    assert.equal(h.titles.at(-1), "success_fallback");
+    assert.equal(h.badges.at(-1), "badgeSuccess");
+    assert.deepEqual(linked.stats, { reads: 0, cancelled: 1, released: 0 });
+    assert.deepEqual(source.stats, { reads: 2, cancelled: 0, released: 1 });
+  });
+}
+
+test("fallback waits for body cancellation, rule removal and the next rule installation", async () => {
+  const h = harness(); await h.worker.ready;
+  const cancel = deferred(), remove = deferred(), add = deferred();
+  const html = response({ type: "text/html", url: linkedInfo.linkUrl });
+  html.body.cancel = () => cancel.promise;
+  h.hooks.fetch = async url => url === linkedInfo.linkUrl ? html : response();
+  const task = h.click(linkedInfo); await turn();
+  assert.equal(h.fetches.length, 1);
+  assert.equal(h.log.filter(item => item.name === "rules").length, 1);
+  h.hooks.rules = change => change.addRules ? add.promise : remove.promise;
+  cancel.resolve(); await turn();
+  assert.equal(h.log.filter(item => item.name === "rules").length, 2);
+  assert.equal(h.fetches.length, 1);
+  remove.resolve(); await turn();
+  assert.equal(h.log.filter(item => item.name === "rules").length, 3);
+  assert.equal(h.fetches.length, 1);
+  add.resolve(); await task;
+  assert.equal(h.fetches.length, 2);
+  assert.equal(h.titles.at(-1), "success_fallback");
+});
+
+test("all candidate and page origins are requested synchronously and deduplicated", async () => {
+  for (const entry of [linkedInfo, { ...linkedInfo, linkUrl: "https://images.example/full.jpg" },
+    { ...linkedInfo, linkUrl: "https://page.example/full.jpg" }]) {
+    const h = harness();
+    const task = h.click(entry);
+    assert.equal(h.names().at(-1), "request");
+    assert.deepEqual(h.log.at(-1).args[0], {
+      origins: [...new Set([new URL(entry.linkUrl).origin, new URL(entry.srcUrl).origin, new URL(entry.pageUrl).origin].map(origin => `${origin}/*`))]
+    });
+    await task;
+  }
+});
+
+test("identical sanitized link and source URLs remain one unchecked candidate", async () => {
+  const entry = { ...info, linkUrl: `${info.srcUrl}#fragment` };
+  assert.deepEqual(selectTarget(entry, tab).images.map(image => image.href), [info.srcUrl]);
+  const h = harness(); await h.worker.ready;
+  h.hooks.fetch = async () => response({ type: "application/octet-stream" });
+  await h.click(entry);
+  assert.equal(h.fetches.length, 1);
+  assert.equal(h.native.length, 1);
+  assert.equal(h.titles.at(-1), "success");
+});
+
+for (const deniedOrigin of ["https://linked.example/*", "https://images.example/*"]) {
+  test(`missing candidate permission ${deniedOrigin} denies the entire request`, async () => {
+    const h = harness(); await h.worker.ready;
+    h.hooks.contains = async ({ origins }) => origins.every(origin => origin !== deniedOrigin);
+    await h.click(linkedInfo);
+    assert.equal(h.fetches.length + h.native.length, 0);
+    assert.equal(h.names().includes("rules"), false);
+    assert.equal(h.titles.at(-1), "permission_denied");
+  });
+}
+
+for (const [failure, expected] of [["http", "fetch_failed"], ["too_large", "too_large"],
+  ["body_missing", "fetch_failed"], ["cancel", "fetch_failed"], ["cleanup", "rule_failed"]]) {
+  test(`non-image link ${failure} fails without fallback`, async () => {
+    const h = harness(); await h.worker.ready;
+    const html = response({ type: "text/html", url: linkedInfo.linkUrl, ok: failure !== "http",
+      length: failure === "too_large" ? String(MAX_FRAME_BYTES) : null });
+    if (failure === "body_missing") html.body = null;
+    if (failure === "cancel") html.body.cancel = async () => { throw new Error("cancel"); };
+    if (failure === "cleanup") h.hooks.rules = async change => { if (!change.addRules) throw new Error("cleanup"); };
+    h.hooks.fetch = async () => html;
+    await h.click(linkedInfo);
+    assert.equal(h.fetches.length, 1);
+    assert.equal(html.stats.reads, 0);
+    assert.equal(h.native.length, 0);
+    assert.equal(h.titles.at(-1), expected);
+    assert.equal(h.badges.at(-1), "badgeError");
+  });
+}
+
+for (const [failure, expected] of [["network", "fetch_failed"], ["http", "fetch_failed"],
+  ["too_large", "too_large"], ["rule_add", "rule_failed"], ["rule_remove", "rule_failed"], ["native", "host_invalid_image"]]) {
+  test(`displayed image ${failure} after fallback reports its failure`, async () => {
+    const h = harness(); await h.worker.ready;
+    h.hooks.fetch = async url => {
+      if (url === linkedInfo.linkUrl) return response({ type: "text/html", url });
+      if (failure === "network") throw new Error("network");
+      return response({ ok: failure !== "http", length: failure === "too_large" ? String(MAX_FRAME_BYTES) : null });
+    };
+    let rules = 0;
+    h.hooks.rules = async () => {
+      rules++;
+      if ((failure === "rule_add" && rules === 3) || (failure === "rule_remove" && rules === 4)) throw new Error("rule");
+    };
+    if (failure === "native") h.hooks.native = (_host, _message, fn, callback) => callback(null, fn, { ok: false, error: "invalid_image" });
+    await h.click(linkedInfo);
+    assert.equal(h.fetches.length, failure === "rule_add" ? 1 : 2);
+    assert.equal(h.native.length, failure === "native" ? 1 : 0);
+    assert.equal(h.titles.at(-1), expected);
+    assert.equal(h.badges.at(-1), "badgeError");
+    assert.deepEqual(h.storage, {});
+    for (const key of Object.keys(h.hooks)) delete h.hooks[key];
+    await h.click();
+    assert.equal(h.titles.at(-1), "success");
+  });
+}
 
 test("exact DNR rule escapes regex syntax and matches only the initial URL and extension request", () => {
   const url = "https://img.example/a+b.(png)?size=1&other=[x]";
@@ -445,7 +623,7 @@ test("native error mapping exactly covers serialized Rust ErrorCode and both loc
   assert.deepEqual(Object.keys(HOST_ERRORS).sort(), errors.sort());
   for (const locale of ["ja", "en"]) {
     const messages = JSON.parse(fs.readFileSync(path.join(__dirname, `../_locales/${locale}/messages.json`), "utf8"));
-    for (const key of [...Object.values(HOST_ERRORS), "busy", "success", "permission_denied", "permission_failed", "position_failed", "fetch_failed", "too_large", "rule_failed", "state_failed", "interrupted", "unregistered", "native_failed", "context_failed", "invalid_url", "badgeBusy", "badgeSuccess", "badgeError", "extName", "menuOpen"]) {
+    for (const key of [...Object.values(HOST_ERRORS), "busy", "success", "success_fallback", "permission_denied", "permission_failed", "position_failed", "fetch_failed", "too_large", "rule_failed", "state_failed", "interrupted", "unregistered", "native_failed", "context_failed", "invalid_url", "badgeBusy", "badgeSuccess", "badgeError", "extName", "menuOpen"]) {
       assert.equal(typeof messages[key]?.message, "string", `${locale}: ${key}`);
       assert.ok(messages[key].message.length > 0, `${locale}: ${key}`);
     }

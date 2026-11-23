@@ -45,12 +45,13 @@ function selectTarget(info, tab) {
     const extension = url.pathname.slice(url.pathname.lastIndexOf(".") + 1).toLowerCase();
     if (IMAGE_EXTENSIONS.includes(extension)) linked = url;
   } catch { /* A non-image link does not change the image menu's source. */ }
-  const image = linked ?? httpUrl(info.srcUrl);
+  const source = httpUrl(info.srcUrl);
+  const images = linked && linked.href !== source.href ? [linked, source] : [source];
   const page = httpUrl(info.pageUrl || tab.url);
   if (!Number.isInteger(tab.id) || tab.id < 0 || !Number.isInteger(tab.windowId)) {
     throw new Failure("position_failed");
   }
-  return { image, page, tab };
+  return { images, page, tab };
 }
 function exactRule(image, pageOrigin, tabNone, extensionId) {
   return {
@@ -81,7 +82,7 @@ function encodeBase64(chunks) {
   }
   return btoa(strings.join(""));
 }
-async function readImage(response, budget) {
+async function checkResponse(response, budget) {
   const length = response.headers.get("Content-Length");
   if (length !== null && /^\d+$/.test(length.trim()) && Number(length) > budget) {
     await response.body?.cancel();
@@ -91,6 +92,9 @@ async function readImage(response, budget) {
     await response.body?.cancel();
     throw new Failure("fetch_failed");
   }
+}
+async function readImage(response, budget) {
+  await checkResponse(response, budget);
   const reader = response.body.getReader();
   let size = 0;
   const chunks = [];
@@ -125,7 +129,7 @@ function createWorker(api, fetchImage = globalThis.fetch, { maxFrameBytes = MAX_
   const text = key => api.i18n.getMessage(key);
   async function status(code) {
     try {
-      await api.action.setBadgeText({ text: text(code === "busy" ? "badgeBusy" : code === "success" ? "badgeSuccess" : "badgeError") });
+      await api.action.setBadgeText({ text: text(code === "busy" ? "badgeBusy" : ["success", "success_fallback"].includes(code) ? "badgeSuccess" : "badgeError") });
       await api.action.setTitle({ title: `${text("extName")}\n${text(code)}` });
     } catch { console.warn("mIV: status could not be displayed"); }
   }
@@ -165,9 +169,9 @@ function createWorker(api, fetchImage = globalThis.fetch, { maxFrameBytes = MAX_
   async function open(target, permission) {
     const permissionResult = await permission;
     if (permissionResult.error) throw new Failure("permission_failed");
-    const imageOrigin = `${target.image.origin}/*`;
+    const imageOrigins = [...new Set(target.images.map(image => `${image.origin}/*`))];
     const pageOrigin = `${target.page.origin}/*`;
-    if (!await api.permissions.contains({ origins: [imageOrigin] })) throw new Failure("permission_denied");
+    if (!await api.permissions.contains({ origins: imageOrigins })) throw new Failure("permission_denied");
     const pageAllowed = await api.permissions.contains({ origins: [pageOrigin] });
     let view, zoom, windowInfo;
     try {
@@ -181,28 +185,40 @@ function createWorker(api, fetchImage = globalThis.fetch, { maxFrameBytes = MAX_
     // The host checks geometry identity and computes both recorded and fallback positions.
     const message = {
       v: 1, kind: "open_bytes", data_b64: "", content_type: "",
-      page_url: target.page.href, image_url: target.image.href, final_url: "",
+      page_url: target.page.href, image_url: "", final_url: "",
       view, zoom,
       window: { left: windowInfo.left, top: windowInfo.top, width: windowInfo.width, height: windowInfo.height, state: windowInfo.state }
     };
-    try {
-      await api.declarativeNetRequest.updateSessionRules({
-        removeRuleIds: [RULE_ID], addRules: [exactRule(target.image.href, target.page.origin, api.tabs.TAB_ID_NONE, api.runtime.id)]
-      });
-    } catch { throw new Failure("rule_failed"); }
-    try {
-      const response = await fetchImage(target.image.href, { credentials: "include", cache: "no-store" });
-      message.final_url = httpUrl(response.url).href;
-      message.content_type = response.headers.get("Content-Type") || "";
-      message.data_b64 = await readImage(response, rawBudget(message, maxFrameBytes));
-    } catch (error) {
-      throw error instanceof Failure ? error : new Failure("fetch_failed");
-    } finally {
-      try { await api.declarativeNetRequest.updateSessionRules({ removeRuleIds: [RULE_ID] }); }
-      catch { throw new Failure("rule_failed"); }
+    for (const [index, image] of target.images.entries()) {
+      message.image_url = image.href;
+      try {
+        await api.declarativeNetRequest.updateSessionRules({
+          removeRuleIds: [RULE_ID], addRules: [exactRule(image.href, target.page.origin, api.tabs.TAB_ID_NONE, api.runtime.id)]
+        });
+      } catch { throw new Failure("rule_failed"); }
+      try {
+        const response = await fetchImage(image.href, { credentials: "include", cache: "no-store" });
+        message.final_url = httpUrl(response.url).href;
+        message.content_type = response.headers.get("Content-Type") || "";
+        const budget = rawBudget(message, maxFrameBytes);
+        // Only a distinct image link is probed. The displayed image keeps the
+        // existing host-side format validation, including absent/generic types.
+        if (index === 0 && target.images.length > 1 && !/^image\//i.test(message.content_type)) {
+          await checkResponse(response, budget);
+          await response.body.cancel();
+          continue;
+        }
+        message.data_b64 = await readImage(response, budget);
+      } catch (error) {
+        throw error instanceof Failure ? error : new Failure("fetch_failed");
+      } finally {
+        try { await api.declarativeNetRequest.updateSessionRules({ removeRuleIds: [RULE_ID] }); }
+        catch { throw new Failure("rule_failed"); }
+      }
+      if (frameBytes(message) > maxFrameBytes) throw new Failure("too_large");
+      await nativeMessage(message);
+      return index === 0 ? "success" : "success_fallback";
     }
-    if (frameBytes(message) > maxFrameBytes) throw new Failure("too_large");
-    await nativeMessage(message);
   }
 
   // Non-async entry: the latch and permission call run within the click gesture.
@@ -214,7 +230,7 @@ function createWorker(api, fetchImage = globalThis.fetch, { maxFrameBytes = MAX_
     let target, permission;
     try {
       target = selectTarget(info, tab);
-      const origins = [...new Set([`${target.image.origin}/*`, `${target.page.origin}/*`])];
+      const origins = [...new Set([...target.images, target.page].map(url => `${url.origin}/*`))];
       // Attach both handlers now, including while startup recovery is still pending.
       permission = Promise.resolve(api.permissions.request({ origins }))
         .then(value => ({ value }), () => ({ error: true }));
@@ -227,10 +243,10 @@ function createWorker(api, fetchImage = globalThis.fetch, { maxFrameBytes = MAX_
       try {
         if (!await ready) throw new Failure("state_failed");
         await api.storage.session.set({ [PENDING_KEY]: {
-          v: 1, tab_id: tab.id, image_url: target.image.href, page_url: target.page.href
+          v: 1, tab_id: tab.id, image_url: target.images[0].href, page_url: target.page.href
         } });
         await status("busy");
-        await open(target, permission);
+        terminal = await open(target, permission);
       } catch (error) {
         terminal = error instanceof Failure ? error.status : "state_failed";
       } finally {

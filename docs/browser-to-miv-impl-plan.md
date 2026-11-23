@@ -12,7 +12,7 @@
   - 「ブラウザ閲覧」フォルダの画像と、ブラウザに入れた拡張は残す。保存先を `{userappdata}\mimageviewer` の下にした利用者が設定の削除を選んだ場合に画像が消えるのは、クリップボード取り込みの保存先と同じ扱いとし、特別な保護は足さない。
   - **保存先と管理の場所を重ねない** (独立レビュー第 12 回 P1): 「ブラウザ閲覧」の保存先の基底は、`browser-host\` のフォルダ (とその下) にできない。環境設定で保存先を選ぶとき、登録・更新で host の設定を作るとき、中継 exe が保存するときの 3 か所で同じ判定 (共有部品の 1 つの関数) を使い、当たれば理由を示して断る。これで `browser-host\` を無条件に消しても画像は巻き込まない。回帰テストを足す (段階 1 の共有部品・段階 6・段階 7)。
   - **自動で消せる範囲は、アンインストーラを実行したアカウントのものだけ** (独立レビュー第 12 回 P2): インストーラは管理者権限で動く (`PrivilegesRequired=admin`)。`HKCU` と `{userappdata}` は、どちらも実行したアカウントを指す (https://jrsoftware.org/inno-setup/documentation/topic_consts.htm#userappdata)。標準ユーザーが別の管理者の資格情報で昇格した場合、mIV を使っていたアカウントのキー・manifest・中継 exe・その設定は残る。残った中継 exe は、launcher が無いので「mIV が見つからない」を返し、拡張がそれを知らせる (§9.7 の既存の動き、ファイルは消えない)。この経路は通常の操作で起こり得るので、マニュアルとアンインストールの案内に「アンインストールの前に、mIV の環境設定でブラウザ連携を解除する」と書く。拡張の知らせの文言も「mIV が見つかりません。mIV を入れ直すか、連携を解除してください」とし、何を直せばよいかが分かる形にする。既存の設定の削除 (`DelTree`) も同じく実行したアカウントにだけ効く既存の動きで、変えない。
-- **Q4 (画像を包むリンク先が画像ファイルのとき)**: 計画案どおり、HTTP(S) の `linkUrl` が既存の HTML 取り込みと同じ画像拡張子の判定に当たるときは `linkUrl` を取得し、その origin も許可の要求に含める。失敗しても `srcUrl` で取り直さない (1 回の取得)。試作では確かめていないので、実装後の実機確認の項目にする。
+- **Q4 (画像を包むリンク先が画像ファイルのとき)**: HTTP(S) の `linkUrl` が既存の HTML 取り込みと同じ画像拡張子の判定に当たるときは、リンク先を先に取得する。**0.2.1 (2026-11-23)**: 利用者が Commons の説明ページで NG を報告したため、リンク先は `Content-Type: image/*` のときだけ使い、それ以外はページの画像 (`srcUrl`) を開いて `success_fallback` で知らせる。取得自体の失敗では取り直さない。リンク先・ページの画像・ページの origin をまとめて許可要求に含める。
 - **native host 名**: `to.mikage.mimageviewer`。コード・manifest・レジストリ・説明書で同じ名前を使う。
 - **公開鍵**: Chrome と Edge の公開鍵は、設計担当が段階 8 の指示で渡す (共有メモの `store-prep-818/` にある)。
 - **拡張の受付の順序**: 計画案 §4 のとおり、同期の受付 latch → `permissions.request` (最初の await より前) → `storage.session` への記録、の順を段階 8 の状態遷移として書き、テストで固定する。
@@ -737,9 +737,11 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
 
 - 同じ worker 内の連続クリックを同期の受付 latch で防ぎ、要求を `storage.session` に保持。
 - `permissions.request` は user gesture 内、最初の await より前。
-- 画像とページの origin をまとめて求め、取得継続の条件は設計書どおり。
-- 取得は一回、`credentials: include`、`cache: no-store`。
-- DNR は最初の URL 完全一致・`TAB_ID_NONE`・一回限り。
+- リンク先 (画像拡張子の HTTP(S) URL のときだけ) とページの画像を順序付き候補とし、同じ URL は一つにする。リンク先・ページの画像・ページの origin を重複なく、クリック内の最初の await より前にまとめて許可要求する。画像候補の origin のどれかが未許可なら `permission_denied` で終え、別候補へ逃げない。ページだけ未許可なら従来どおり位置を推定する。
+- 取得は `credentials: include`、`cache: no-store`。**0.2.1 (2026-11-23、利用者が Commons の説明ページで NG を報告)**: リンク先は `Content-Type: image/*` (大小無視、パラメータ付き可) のときだけ使い、それ以外は本文を読まず cancel してページの画像を開く。成功時は `success_fallback` と成功バッジ・日英の title で切り替えを知らせる。ページの画像に型の検査は足さず、従来どおり host が形式を検査する。
+- fetch・HTTP・サイズ超過など取得自体の失敗では切り替えない。候補は最大二つの逐次取得とし、既存の同期 latch を維持することで、候補別の許可回避・並行取得・再試行の組み合わせを作らない。まれな失敗は既定どおり通知して終了し、回復処理を増やさない。
+- DNR は取得する URL ごとの完全一致・`TAB_ID_NONE`・自拡張起点限定。各取得の前に足し、終わったら外す。二回目の取得の前に付け直し、後片付け失敗は従来どおり `rule_failed`。
+- `image_url` と `final_url` は実際に使った候補の値を送る。切り替え後の失敗は、その失敗の状態で知らせる。
 - `response.url` を `final_url` として必ず送る。
 - Content-Length、読み取り中、最終 JSON の UTF-8 バイト長の三段階で上限を検査。
 - worker 再起動では自分の残存規則を除去し、中断を一回通知。再取得・再送しない。
@@ -768,6 +770,7 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
 - 既存タブへの再注入、二重登録。
 - native response と `runtime.lastError`。
 - 両 ZIP の key・ID・権限・locales・収録内容。
+- リンク先の HTML・型なし・汎用型の本文を読まずに破棄し、ページの画像へ切り替えること。画像型ならリンク先だけ使い、取得失敗では切り替えないこと。候補ごとの許可・DNR の順序、実際の候補の URL、`success_fallback` の日英通知と成功バッジ。
 
 モックテストを、Chrome／Edge の実動作や座標精度の証拠にはしません。
 
@@ -784,6 +787,13 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
 - `context.js` は ISOLATED の上位フレームで直前一件の座標と geometry だけを保持する。記録の有効性と位置換算は段階6の host が所有し、JS へ重複して実装しない。登録は単一 ID、登録・更新イベントは直列に処理する。インストール／起動／許可追加時の既存タブ注入と、同一 document への二重 listener 防止を持つ。
 - API 契約は Chrome の一次資料（[permissions](https://developer.chrome.com/docs/extensions/reference/api/permissions)、[DNR](https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest)、[scripting](https://developer.chrome.com/docs/extensions/reference/api/scripting)）でも確認した。Node のモックと ZIP 検査を、実 Chrome／Edge の許可 UI・Cookie・redirect・座標精度の証拠とはしない。ストアへの提出・公開と実機検証は別工程。
 - Node v22.16.0 の64テストは全件成功（`target/browser-extension/worker-tests.tap` に全テスト名と結果）。通常の `node --test` はこの実行環境で子プロセスの spawn が EPERM となったため、`--experimental-test-isolation=none` を付けて同じテストを実行した。PowerShell の package テストも成功（`target/browser-extension/package-test-results.txt`）。最終ソースの二つの ZIP は `target/browser-extension/` に生成済みで、対応するテスト生成物とバイト一致。Chrome ID は `fpppoodelfkddekjahhmalmmfdhbpdma`、Edge ID は `dlcbdkekoppppebnhhncghhglkkccdhk`。Rust・cargo・実登録・ブラウザ・mIV は実行していない。
+
+**拡張 0.2.1 の検証記録（2026-11-23）**
+
+- `node --test --experimental-test-isolation=none browser-extension/tests/worker.test.cjs`: 87 件成功、失敗 0 件 (既存 66 件と追加 21 件)。通常の `node --test` は環境の子プロセス起動制限 (`spawn EPERM`) でテスト開始前に停止したため、既存の段階8と同じ分離無効の実行に切り替えた。
+- `scripts/test-package-browser-extension.ps1`: Chrome・Edge とも key/ID・権限・翻訳・収録ファイル・ソース一致・再現性が PASS。出力範囲とソース不変の検査も PASS。検査スクリプトの変更は不要だった。
+- `git diff --check` と `python scripts/check_ui_glyphs.py` は成功。Rust・native host は変更せず、cargo・製品バイナリ・実ブラウザは実行していない。Commons での修正後の実機結果は未確認。
+- 独立レビュー (GPT-6.1 Sol / xhigh) は ACCEPT、未解決の指摘なし。マニュアルに残っていた「1 回取得」を候補切り替えの説明へ修正し、両画像サイトへの許可が必要なことも追記した。コード・テストは上記 87 件成功時から変更せず、検証結果を再利用した。
 
 **段階8の独立レビュー P2 修正（2026-11-22、再レビュー待ち）**
 
@@ -883,7 +893,7 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
   推奨案は、アンインストールで当該 manifest を指す自分のキーと host 配置だけを解除し、拡張と保存画像は残す形です。ただし昇格時の利用者 HKCU、および保存先を APPDATA 配下に指定した場合の画像保護を決める必要があります。これは段階7／9の完了前に確定し、既存の再帰削除へ安易に追加しません。
 
 - **Q4 の画像リンク優先**  
-  試作 worker は `srcUrl` を使っており、Q4 の実機結果は §9.11 にありません。製品案は、既存 HTML 取り込みと同じ画像拡張子判定で HTTP(S) の `linkUrl` を優先し、選んだ取得先とページの origin を許可要求へ含める形です。失敗時に `srcUrl` を取り直すと「一回取得」を変えるため、fallback は追加しません。対象形式の集合とあわせ、段階8前にレビューで固定します。
+  試作 worker は `srcUrl` を使っており、Q4 の実機結果は §9.11 にありません。0.2.0 は画像拡張子判定で HTTP(S) の `linkUrl` を優先し、一回だけ取得する形でした。2026-11-23 の利用者による Commons の NG 報告を受け、0.2.1 では §0・段階8のとおり応答の型で画像かを確かめ、画像でないときだけ `srcUrl` へ切り替えて知らせます。取得自体の失敗では切り替えません。
 
 - **公開鍵と native host 名**  
   Chrome／Edge 公開鍵は ClaudeCode から受領します。ID は指定の二つに固定。native host 名は試作名を使わず、一つの製品名をコード・manifest・registry・説明書で共有します。

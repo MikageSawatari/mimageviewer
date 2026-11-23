@@ -23,6 +23,9 @@
   "success": {
     "message": "The image was handed to mIV."
   },
+  "success_fallback": {
+    "message": "The link target was not an image, so the image shown on the page was opened."
+  },
   "interrupted": {
     "message": "Image processing was interrupted. Select View in mIV again if needed."
   },

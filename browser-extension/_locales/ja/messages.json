@@ -23,6 +23,9 @@
   "success": {
     "message": "mIV への受け渡しが完了しました。"
   },
+  "success_fallback": {
+    "message": "リンク先は画像ではなかったため、ページに表示されている画像を開きました。"
+  },
   "interrupted": {
     "message": "画像の処理が中断されました。必要なら、もう一度「mIV で見る」を選んでください。"
   },
