@@ -1,6 +1,6 @@
 # §1.772 ページめくりの演出に「スライド」を加える — 設計案
 
-2026-11-23、設計基点 `page-turn-slide-772` / master `1a15e96bc`。状態: **設計第 4 版、利用者の判断 (§13) と HUD・キーの §7.3 を含めて r4 ACCEPT (§16)。実装中**。
+2026-11-23、設計基点 `page-turn-slide-772` / master `1a15e96bc`。状態: **設計第 4 版 r4 ACCEPT。実装済み (6ea195908〜5b30f7bbb)、独立実装レビュー ACCEPT (§16)。利用者の実機確認待ち・master 未統合**。
 正本の要望は [backlog §1.772](next-release-backlog.md)。既存の演出の正本は
 [ページめくり演出の設計](page-turn-animation-plan.md) (以下「本設計」)、表示単位の照合は
 [ページめくりとレイアウト](page-turn-layout-binding-plan.md)、描画の位置付けは [表示パイプライン](display-pipeline.md)。
@@ -328,3 +328,5 @@ Codex の実装 1〜2 日 + 独立レビュー + 回帰・解析器テスト・�
   終端の方針、perf の style を `SubmissionTracker` に持たせる方針、設定互換・continuation の訂正。
 - r3 (2026-11-23、同セッション、`47b4acc06`): **ACCEPT**。残る指摘なし。利用者の判断 (§13) と実装後の検証は別途。
 - r4 (2026-11-23、同セッション、`3d2a16f2a`、利用者の判断を受けた §7.3 の差分): **ACCEPT**。P3 1 件 (ナビゲータ位置は選択後 root へ戻るので「とどまる」の例から外す) を訂正。確認された点: キーを ON/OFF のまま保ち新 KeyAction を足さない判断、保存・取消・複数ウィンドウの経路の共用、Remote 側の対応不要、スナップショット一覧と 4 行の高さ・handler 試験。
+- 実装レビュー (2026-11-23、実装者とは別の GPT-6.1 Sol / xhigh を CLI 引数で指定した新しい会話、`7aea35a2d..5b30f7bbb`): **ACCEPT**、指摘なし。状態・所有、取消と continuation、投影 (4 方向・距離・e0・非重複・終端・Vacant/Blank・crop・部分素材・mesh 予算・receipt)、診断の style、設定互換、HUD・キー・トースト・高さ、文書を確認。実機の動き・性能は判定外。
+- 検証 (ClaudeCode が run-heavy で実行): 関連 nextest (filter `page_turn|overflow|slide|…`) 584 件成功 (テストの期待値 1 件と可視性 1 件を Codex が修正した後)、UI スナップショット 7 枚を更新し目視確認、`python scripts/test_analyze_perf.py` 118 件成功、`check_ui_glyphs.py` 問題なし。本体 lib 全件は統括の master 取り込み後。
