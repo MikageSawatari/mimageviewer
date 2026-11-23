@@ -632,6 +632,14 @@ impl ArchiveDirectoryCache {
     }
 
     fn slot_for_key(&self, key: ArchiveCacheKey) -> (Arc<ArchiveTemplateSlot>, bool) {
+        self.slot_for_key_with(key, || {})
+    }
+
+    fn slot_for_key_with(
+        &self,
+        key: ArchiveCacheKey,
+        before_insert: impl FnOnce(),
+    ) -> (Arc<ArchiveTemplateSlot>, bool) {
         let mut inner = lock_unpoisoned(&self.inner);
         inner
             .entries
@@ -640,6 +648,15 @@ impl ArchiveDirectoryCache {
             entry.last_used = Instant::now();
             return (Arc::clone(&entry.slot), false);
         }
+        let slot = Arc::new(ArchiveTemplateSlot {
+            state: Mutex::new(ArchiveTemplateState::Loading),
+            ready: Condvar::new(),
+        });
+        // Cache lock -> fence check -> insert; covers normalizes physical spelling.
+        if crate::mutation_fence::covers(&key.path) {
+            return (slot, true);
+        }
+        before_insert();
         if inner.entries.len() >= self.max_archives {
             let oldest = inner
                 .entries
@@ -650,10 +667,6 @@ impl ArchiveDirectoryCache {
                 .unwrap_or(0);
             inner.entries.swap_remove(oldest);
         }
-        let slot = Arc::new(ArchiveTemplateSlot {
-            state: Mutex::new(ArchiveTemplateState::Loading),
-            ready: Condvar::new(),
-        });
         inner.entries.push(ArchiveDirectoryCacheEntry {
             key,
             slot: Arc::clone(&slot),
@@ -694,6 +707,13 @@ impl ArchiveDirectoryCache {
         lock_unpoisoned(&self.inner)
             .entries
             .retain(|entry| !crate::path_key::eq_keep_drive(&entry.key.path, path));
+    }
+
+    fn retire_subtree(&self) {
+        // Fence registration precedes this lock; retired slots are never reinserted.
+        lock_unpoisoned(&self.inner)
+            .entries
+            .retain(|entry| !crate::mutation_fence::covers(&entry.key.path));
     }
 
     #[cfg(feature = "dev-tools")]
@@ -917,6 +937,24 @@ pub fn clear_nested_cache() {
 /// handles otherwise prevent atomic replacement even with delete sharing enabled.
 pub(crate) fn retire_archive_directory_for_mutation(path: &Path) {
     ARCHIVE_DIRECTORY_CACHE.retire_mutated_path(path);
+}
+
+/// Release retained ZIP handles after registering the mutation fence.
+pub(crate) fn retire_fenced_subtrees() {
+    ARCHIVE_DIRECTORY_CACHE.retire_subtree();
+}
+
+#[cfg(test)]
+pub(crate) fn fence_858b_cache_zip(path: &Path) {
+    use std::io::Write;
+
+    let mut writer = zip::ZipWriter::new(File::create(path).unwrap());
+    writer
+        .start_file("page.jpg", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    writer.write_all(b"PAGE").unwrap();
+    writer.finish().unwrap();
+    drop(ARCHIVE_DIRECTORY_CACHE.open_archive(path, None).unwrap());
 }
 
 /// ベンチマークで cold miss を再現するためだけに、共有目次 cache を明示的に破棄する。
@@ -4754,6 +4792,138 @@ mod tests {
         );
         assert_eq!(cache.parse_count(), sibling_parse_count);
         assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn fence_858b_directory_retirement_preserves_uncovered_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("covered");
+        let sibling_folder = dir.path().join("covered-sibling");
+        std::fs::create_dir_all(folder.join("nested")).unwrap();
+        std::fs::create_dir(&sibling_folder).unwrap();
+        let covered = folder.join("nested/book.zip");
+        let sibling = sibling_folder.join("book.zip");
+        let unrelated = dir.path().join("other.zip");
+        let cache = ArchiveDirectoryCache::new(4);
+        for path in [&covered, &sibling, &unrelated] {
+            write_test_zip(path, &[("page.jpg", b"PAGE")]);
+            read_with_directory_cache(&cache, path, "page.jpg", None).unwrap();
+        }
+        let request = cache.open_archive(&covered, None).unwrap();
+        let covered_file = Arc::downgrade(&request.into_inner().file);
+        assert!(covered_file.upgrade().is_some());
+        let sibling_slot = cache.slot_for_path_for_test(&sibling).unwrap();
+        let unrelated_slot = cache.slot_for_path_for_test(&unrelated).unwrap();
+
+        let guard = crate::mutation_fence::begin_with_releases(&[folder], || {
+            cache.retire_subtree();
+        });
+
+        assert!(cache.slot_for_path_for_test(&covered).is_none());
+        assert!(covered_file.upgrade().is_none());
+        assert!(Arc::ptr_eq(
+            &sibling_slot,
+            &cache.slot_for_path_for_test(&sibling).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &unrelated_slot,
+            &cache.slot_for_path_for_test(&unrelated).unwrap()
+        ));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.parse_count(), 3);
+        drop(guard);
+    }
+
+    #[test]
+    fn fence_858b_directory_reads_skip_retention_until_guard_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("covered");
+        std::fs::create_dir(&folder).unwrap();
+        let covered = folder.join("book.zip");
+        let unrelated = dir.path().join("other.zip");
+        write_test_zip(&covered, &[("page.jpg", b"COVERED")]);
+        write_test_zip(&unrelated, &[("page.jpg", b"OTHER")]);
+        let cache = ArchiveDirectoryCache::new(1);
+        let guard = crate::mutation_fence::begin_with_releases(&[folder], || {
+            cache.retire_subtree();
+        });
+        read_with_directory_cache(&cache, &unrelated, "page.jpg", None).unwrap();
+        let unrelated_slot = cache.slot_for_path_for_test(&unrelated).unwrap();
+
+        for _ in 0..2 {
+            assert_eq!(
+                read_with_directory_cache(&cache, &covered, "page.jpg", None).unwrap(),
+                b"COVERED"
+            );
+            assert!(cache.slot_for_path_for_test(&covered).is_none());
+            assert!(Arc::ptr_eq(
+                &unrelated_slot,
+                &cache.slot_for_path_for_test(&unrelated).unwrap()
+            ));
+        }
+        assert_eq!(cache.parse_count(), 3);
+        drop(guard);
+
+        for _ in 0..2 {
+            assert_eq!(
+                read_with_directory_cache(&cache, &covered, "page.jpg", None).unwrap(),
+                b"COVERED"
+            );
+        }
+        assert!(cache.slot_for_path_for_test(&covered).is_some());
+        assert_eq!(cache.parse_count(), 4);
+    }
+
+    #[test]
+    fn fence_858b_directory_registration_between_check_and_insert_is_retired() {
+        let dir = tempfile::tempdir().unwrap();
+        let covered = dir.path().join("book.zip");
+        write_test_zip(&covered, &[("page.jpg", b"PAGE")]);
+        let cache = ArchiveDirectoryCache::new(1);
+        let key = ArchiveCacheKey::from_path(&covered).unwrap();
+        let mut guard = None;
+
+        let (slot, is_builder) = cache.slot_for_key_with(key, || {
+            guard = Some(crate::mutation_fence::begin_with_releases(
+                &[dir.path().to_path_buf()],
+                || {},
+            ));
+        });
+        assert!(is_builder);
+        assert!(crate::mutation_fence::covers(&covered));
+        assert!(Arc::ptr_eq(
+            &slot,
+            &cache.slot_for_path_for_test(&covered).unwrap()
+        ));
+
+        cache.retire_subtree();
+        assert_eq!(cache.len(), 0);
+        let (request, template) = cache.build_archive(&covered, None).unwrap();
+        *lock_unpoisoned(&slot.state) = ArchiveTemplateState::Ready(template);
+        slot.ready.notify_all();
+        assert_eq!(cache.len(), 0);
+        drop(request);
+        drop(slot);
+        drop(guard);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fence_858b_directory_retirement_matches_verbatim_cache_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let covered = dir.path().join("book.zip");
+        write_test_zip(&covered, &[("page.jpg", b"PAGE")]);
+        let verbatim = std::fs::canonicalize(&covered).unwrap();
+        let cache = ArchiveDirectoryCache::new(1);
+        read_with_directory_cache(&cache, &verbatim, "page.jpg", None).unwrap();
+
+        let guard = crate::mutation_fence::begin_with_releases(&[dir.path().to_path_buf()], || {
+            cache.retire_subtree()
+        });
+
+        assert!(cache.slot_for_path_for_test(&verbatim).is_none());
+        assert_eq!(cache.len(), 0);
+        drop(guard);
     }
 
     #[test]

@@ -389,6 +389,7 @@ pub fn pin_companion_runtime() -> std::io::Result<Option<std::fs::File>> {
     #[cfg(not(all(windows, not(feature = "portable"))))]
     Ok(None)
 }
+pub(crate) mod mutation_fence;
 pub mod save_with_metadata;
 pub mod search_index_db;
 pub mod search_norm;

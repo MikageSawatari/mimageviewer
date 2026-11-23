@@ -3266,8 +3266,8 @@ struct JobQueue {
     /// 使い切った後も HighNormal 自身の上限まで開始できる。
     high_normal: std::collections::VecDeque<Job>,
     normal: std::collections::VecDeque<Job>,
-    /// A dispatcher handles its own control slot before taking another document job.
-    release_slots: Vec<Option<ReleaseDocumentRequest>>,
+    /// A dispatcher drains its control FIFO before taking another document job.
+    release_slots: Vec<std::collections::VecDeque<ReleaseDocumentRequest>>,
     /// 現在処理中の HighNormal + Normal ジョブ数。lane ごとの開始判定に使う。
     /// Critical はこのカウントに含めない (= 予約枠を消費しない)。
     normal_in_flight: usize,
@@ -3293,7 +3293,9 @@ impl JobQueue {
             critical: std::collections::VecDeque::new(),
             high_normal: std::collections::VecDeque::new(),
             normal: std::collections::VecDeque::new(),
-            release_slots: (0..configured_pool_size).map(|_| None).collect(),
+            release_slots: (0..configured_pool_size)
+                .map(|_| std::collections::VecDeque::new())
+                .collect(),
             normal_in_flight: 0,
             worker_documents: vec![None; configured_pool_size],
             open_in_flight: 0,
@@ -3356,6 +3358,69 @@ fn epub_document_delete_gate() -> &'static (Mutex<HashSet<ResolvedReadPath>>, Co
 struct ReleaseDocumentRequest {
     path: ResolvedReadPath,
     reply: mpsc::Sender<std::io::Result<()>>,
+}
+
+fn enqueue_document_release(
+    queue: &mut JobQueue,
+    worker_id: usize,
+    path: ResolvedReadPath,
+) -> mpsc::Receiver<std::io::Result<()>> {
+    let (reply, rx) = mpsc::channel();
+    queue.release_slots[worker_id].push_back(ReleaseDocumentRequest { path, reply });
+    rx
+}
+
+fn queue_fenced_document_releases(
+    queue: &mut JobQueue,
+    worker_ids: &[usize],
+) -> Vec<mpsc::Receiver<std::io::Result<()>>> {
+    let mut replies = Vec::new();
+    for &worker_id in worker_ids {
+        if let Some(document) = queue.worker_documents[worker_id].as_ref()
+            && crate::mutation_fence::covers(document.path.as_path())
+        {
+            let path = document.path.clone();
+            replies.push(enqueue_document_release(queue, worker_id, path));
+        }
+    }
+    replies
+}
+
+/// Called after fence registration, on the filesystem operation's worker.
+pub(crate) fn release_fenced_documents() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    release_fenced_documents_with_pool(initialized_pool(), deadline);
+}
+
+fn release_fenced_documents_with_pool(pool: Option<&PdfWorkerPool>, deadline: std::time::Instant) {
+    let Some(pool) = pool else {
+        return;
+    };
+    let replies = {
+        let (mutex, changed) = &*pool.queue;
+        let mut queue = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let replies = queue_fenced_document_releases(&mut queue, &pool.worker_ids);
+        changed.notify_all();
+        replies
+    };
+    for rx in replies {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => crate::logger::log(format!(
+                "pdf-pool: mutation fence document release failed: {error}"
+            )),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                crate::logger::log("pdf-pool: mutation fence document release timed out");
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                crate::logger::log("pdf-pool: mutation fence document release disconnected")
+            }
+        }
+    }
 }
 
 fn defer_queued_document_jobs(
@@ -3467,12 +3532,11 @@ fn release_epub_document_for_delete_with_pool(
         deferred.extend(defer_queued_document_jobs(&mut queue.high_normal, &path));
         deferred.extend(defer_queued_document_jobs(&mut queue.normal, &path));
         for &worker_id in &pool.worker_ids {
-            let (reply, rx) = mpsc::channel();
-            queue.release_slots[worker_id] = Some(ReleaseDocumentRequest {
-                path: path.clone(),
-                reply,
-            });
-            replies.push(rx);
+            replies.push(enqueue_document_release(
+                &mut queue,
+                worker_id,
+                path.clone(),
+            ));
         }
         changed.notify_all();
         deferred
@@ -4506,6 +4570,30 @@ fn update_worker_document(
     }
 }
 
+fn record_worker_open_result(
+    queue: &mut JobQueue,
+    worker_id: usize,
+    identity: &PdfDocumentIdentity,
+    open_ok: bool,
+) {
+    let update = if open_ok {
+        WorkerDocumentUpdate::OpenSucceeded(identity.clone())
+    } else {
+        WorkerDocumentUpdate::OpenFailed
+    };
+    if let Some(slot) = queue.worker_documents.get_mut(worker_id) {
+        *slot = update_worker_document(slot.take(), update);
+    }
+    if open_ok && crate::mutation_fence::covers(identity.path.as_path()) {
+        // No waiter: the dispatcher releases this document after the current job.
+        drop(enqueue_document_release(
+            queue,
+            worker_id,
+            identity.path.clone(),
+        ));
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LaneDispatchCandidate {
     index: usize,
@@ -4792,6 +4880,19 @@ enum DispatcherWork {
     Release(ReleaseDocumentRequest),
 }
 
+fn try_pop_dispatch_work(
+    queue: &mut JobQueue,
+    worker_id: usize,
+    worker_count: usize,
+) -> Option<DispatcherWork> {
+    if let Some(release) = queue.release_slots[worker_id].pop_front() {
+        return Some(DispatcherWork::Release(release));
+    }
+    let lane_caps = non_critical_lane_caps(worker_count, critical_reservation_active());
+    try_pop_dispatch_job(queue, worker_id, lane_caps, open_admission_caps())
+        .map(DispatcherWork::Document)
+}
+
 /// ディスパッチャースレッドのメインループ。
 ///
 /// キューを覗き込み、Critical > HighNormal > Normal の順に pop して IPC を実行する。
@@ -4829,14 +4930,8 @@ fn run_dispatcher(
                 if q.shutdown {
                     break None;
                 }
-                if let Some(release) = q.release_slots[worker_id].take() {
-                    break Some(DispatcherWork::Release(release));
-                }
-                let lane_caps = non_critical_lane_caps(worker_count, critical_reservation_active());
-                if let Some(dispatch) =
-                    try_pop_dispatch_job(&mut q, worker_id, lane_caps, open_admission_caps())
-                {
-                    break Some(DispatcherWork::Document(dispatch));
+                if let Some(work) = try_pop_dispatch_work(&mut q, worker_id, worker_count) {
+                    break Some(work);
                 }
                 // 取れなかった → Condvar で寝る
                 q = cv.wait(q).unwrap();
@@ -4974,14 +5069,7 @@ fn run_dispatcher(
                 {
                     let (mtx, cv) = &*queue;
                     let mut q = mtx.lock().unwrap();
-                    let update = if open_ok {
-                        WorkerDocumentUpdate::OpenSucceeded(job.document_identity.clone())
-                    } else {
-                        WorkerDocumentUpdate::OpenFailed
-                    };
-                    if let Some(slot) = q.worker_documents.get_mut(worker_id) {
-                        *slot = update_worker_document(slot.take(), update);
-                    }
+                    record_worker_open_result(&mut q, worker_id, &job.document_identity, open_ok);
                     debug_assert!(q.open_in_flight > 0);
                     q.open_in_flight = q.open_in_flight.saturating_sub(1);
                     cv.notify_all();
@@ -9715,6 +9803,301 @@ C:\isolated\miv-data"#
             decode_request(&encoded).unwrap(),
             DecodedRequest::ReleaseDocument { path: decoded } if decoded == path.as_path()
         ));
+    }
+
+    fn fence_858b_test_pool(worker_count: usize) -> PdfWorkerPool {
+        PdfWorkerPool {
+            queue: Arc::new((Mutex::new(JobQueue::new(worker_count)), Condvar::new())),
+            worker_count,
+            worker_ids: (0..worker_count).collect(),
+            dispatcher_threads: Mutex::new(Vec::new()),
+            worker_children: Vec::new(),
+            maintenance_wake: None,
+            maintenance_thread: None,
+        }
+    }
+
+    #[test]
+    fn fence_858b_releases_only_covered_workers_with_original_read_path() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("held");
+        let original = PathBuf::from(format!(r"\\?\{}", folder.join("Book.pdf").display()));
+        let held = PdfDocumentIdentity {
+            path: resolved_test_path(&original),
+            password: Some("secret".into()),
+        };
+        let pool = fence_858b_test_pool(4);
+        let guard = crate::mutation_fence::begin_with_releases(&[folder.clone()], || {});
+        let mut q = pool.queue.0.lock().unwrap();
+        q.worker_documents[0] = Some(held.clone());
+        q.worker_documents[1] = Some(PdfDocumentIdentity {
+            path: resolved_test_path(&root.path().join("held-other").join("book.pdf")),
+            password: None,
+        });
+        q.worker_documents[2] = Some(PdfDocumentIdentity {
+            path: resolved_test_path(&folder),
+            password: None,
+        });
+
+        let replies = queue_fenced_document_releases(&mut q, &pool.worker_ids);
+
+        assert_eq!(replies.len(), 1);
+        assert_eq!(q.release_slots[0].len(), 1);
+        let release = q.release_slots[0].pop_front().unwrap();
+        assert_eq!(release.path, held.path);
+        assert!(matches!(
+            decode_request(&encode_release_document_request(&release.path)).unwrap(),
+            DecodedRequest::ReleaseDocument { path } if path == original
+        ));
+        assert!(q.release_slots[1..].iter().all(|slot| slot.is_empty()));
+        assert_eq!(q.worker_documents[0].as_ref(), Some(&held));
+        release.reply.send(Ok(())).unwrap();
+        replies[0].recv().unwrap().unwrap();
+        drop(q);
+        drop(guard);
+    }
+
+    #[test]
+    fn fence_858b_open_response_queues_release_before_job_completion() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("opening");
+        let identity = PdfDocumentIdentity {
+            path: resolved_test_path(&folder.join("book.pdf")),
+            password: None,
+        };
+        let _guard = crate::mutation_fence::begin_with_releases(&[folder], || {});
+        let mut q = JobQueue::new(3);
+        q.workers_busy = 1;
+
+        record_worker_open_result(&mut q, 0, &identity, true);
+        record_worker_open_result(&mut q, 1, &identity, false);
+        let outside = PdfDocumentIdentity {
+            path: resolved_test_path(&root.path().join("outside.pdf")),
+            password: None,
+        };
+        record_worker_open_result(&mut q, 2, &outside, true);
+
+        assert_eq!(q.workers_busy, 1);
+        assert_eq!(q.worker_documents[0].as_ref(), Some(&identity));
+        assert_eq!(q.release_slots[0].len(), 1);
+        assert_eq!(q.release_slots[0][0].path, identity.path);
+        assert!(q.worker_documents[1].is_none());
+        assert!(q.release_slots[1..].iter().all(|slot| slot.is_empty()));
+    }
+
+    #[test]
+    fn fence_858b_epub_and_fence_releases_keep_fifo_and_both_acknowledge() {
+        for fence_first in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let folder = root.path().join("covered");
+            let held_path = folder.join("held.pdf");
+            let epub_path = folder.join("book.g1.pdf");
+            let _guard = crate::mutation_fence::begin_with_releases(&[folder], || {});
+            let pool = Arc::new(fence_858b_test_pool(1));
+            pool.queue.0.lock().unwrap().worker_documents[0] = Some(PdfDocumentIdentity {
+                path: resolved_test_path(&held_path),
+                password: None,
+            });
+            let fence_replies = if fence_first {
+                queue_fenced_document_releases(&mut pool.queue.0.lock().unwrap(), &[0])
+            } else {
+                Vec::new()
+            };
+            let deleting_pool = Arc::clone(&pool);
+            let deleting_path = epub_path.clone();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let deleting = std::thread::spawn(move || {
+                release_epub_document_for_delete_with_pool(
+                    &deleting_path,
+                    deadline,
+                    Some(&deleting_pool),
+                )
+            });
+            let mut q = pool.queue.0.lock().unwrap();
+            let expected = if fence_first { 2 } else { 1 };
+            while q.release_slots[0].len() < expected {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                assert!(!remaining.is_zero(), "EPUB release did not enqueue");
+                q = pool.queue.1.wait_timeout(q, remaining).unwrap().0;
+            }
+            let fence_replies = if fence_first {
+                fence_replies
+            } else {
+                queue_fenced_document_releases(&mut q, &[0])
+            };
+            let expected_paths = if fence_first {
+                [held_path, epub_path]
+            } else {
+                [epub_path, held_path]
+            };
+            for expected_path in expected_paths {
+                let Some(DispatcherWork::Release(release)) = try_pop_dispatch_work(&mut q, 0, 1)
+                else {
+                    panic!("both releases must precede document jobs");
+                };
+                assert_eq!(release.path.as_path(), expected_path);
+                release.reply.send(Ok(())).unwrap();
+            }
+            assert!(q.release_slots[0].is_empty());
+            drop(q);
+            fence_replies[0].recv().unwrap().unwrap();
+            drop(deleting.join().unwrap().unwrap());
+        }
+    }
+
+    #[test]
+    fn fence_858b_ack_follows_inflight_job_and_precedes_next_document() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("inflight");
+        let _guard = crate::mutation_fence::begin_with_releases(&[folder.clone()], || {});
+        let mut fake = TestPdfQueue::new();
+        let first_reply = fake.enqueue("first", PdfRenderValidity::Unscoped, JobPriority::Critical);
+        let dispatch = {
+            let mut q = fake.queue.0.lock().unwrap();
+            q.critical.front_mut().unwrap().document_identity = PdfDocumentIdentity {
+                path: resolved_test_path(&folder.join("book.pdf")),
+                password: None,
+            };
+            let Some(DispatcherWork::Document(dispatch)) =
+                try_pop_dispatch_work(&mut q, 0, DEFAULT_POOL_SIZE)
+            else {
+                panic!("first document must dispatch");
+            };
+            record_worker_open_result(&mut q, 0, &dispatch.job.document_identity, true);
+            dispatch
+        };
+        let mut replies = {
+            let mut q = fake.queue.0.lock().unwrap();
+            assert_eq!(q.workers_busy, 1);
+            queue_fenced_document_releases(&mut q, &[0])
+        };
+        let fence_reply = replies.pop().unwrap();
+        let next_reply = fake.enqueue("next", PdfRenderValidity::Unscoped, JobPriority::Critical);
+        assert!(matches!(
+            fence_reply.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            first_reply.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        fake.complete_dispatch(dispatch);
+        first_reply.recv().unwrap();
+        assert!(matches!(
+            fence_reply.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let mut q = fake.queue.0.lock().unwrap();
+        assert_eq!(q.workers_busy, 0);
+        // The OPEN release has no waiter; the fence release follows it.
+        for _ in 0..2 {
+            let Some(DispatcherWork::Release(release)) =
+                try_pop_dispatch_work(&mut q, 0, DEFAULT_POOL_SIZE)
+            else {
+                panic!("release must precede the next document");
+            };
+            let _ = release.reply.send(Ok(()));
+        }
+        fence_reply.recv().unwrap().unwrap();
+        assert!(matches!(
+            next_reply.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            try_pop_dispatch_work(&mut q, 0, DEFAULT_POOL_SIZE),
+            Some(DispatcherWork::Document(_))
+        ));
+    }
+
+    #[test]
+    fn fence_858b_uninitialized_pool_does_not_start_workers() {
+        release_fenced_documents_with_pool(None, std::time::Instant::now());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "requires a prepared disposable portable-smoke worker"]
+    fn fence_858b_real_child_document_blocks_parent_move_until_release() {
+        let exe =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("target/portable-smoke/mimageviewer.exe");
+        assert!(
+            exe.is_file(),
+            "prepare the disposable portable-smoke copy first"
+        );
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        fs::create_dir(&data_dir).unwrap();
+        let parent = root.path().join("parent");
+        let destination = root.path().join("destination");
+        let moved = destination.join("parent");
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(&destination).unwrap();
+        let path = parent.join("book.pdf");
+        fs::write(&path, minimal_direction_pdf(None)).unwrap();
+
+        let (child, io) = spawn_worker_process(&exe, &data_dir, 0).unwrap();
+        let pid = child.id();
+        let child_slot = Arc::new(Mutex::new(Some(child)));
+        let mut pool = fence_858b_test_pool(1);
+        pool.worker_children.push(Arc::clone(&child_slot));
+        let queue = Arc::clone(&pool.queue);
+        let dispatcher = std::thread::spawn(move || run_dispatcher(0, 1, queue, child_slot, io));
+        pool.dispatcher_threads.lock().unwrap().push(dispatcher);
+        let read_path = resolved_test_path(&path);
+        let request = encode_enumerate_request(&read_path, None, EnumerateOptions::default());
+        let response = pool
+            .execute(
+                PdfPoolRequest::new(&request, &read_path),
+                None,
+                JobPriority::Critical,
+                None,
+                PdfRenderValidity::Unscoped,
+                CancelWaitPolicy::AbortOnCancel,
+            )
+            .unwrap();
+        assert_eq!(
+            PdfWorkerPool::parse_enumerate_response(&response.bytes)
+                .unwrap()
+                .pages
+                .len(),
+            1
+        );
+        let blocked = crate::shell_file_ops::fence_858b_transfer_for_probe(
+            parent.clone(),
+            destination.clone(),
+            true,
+        )
+        .unwrap();
+        eprintln!("858b child probe: pid={pid} retained parent move: {blocked:?}");
+        assert_eq!(
+            blocked.classification(),
+            crate::shell_file_ops::ShellOperationClassification::Interrupted
+        );
+        assert_eq!(blocked.abort_query, Ok(true));
+        assert!(parent.join("book.pdf").is_file());
+        assert!(!moved.exists());
+
+        let _guard = crate::mutation_fence::begin_with_releases(&[parent.clone()], || {
+            release_fenced_documents_with_pool(
+                Some(&pool),
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            );
+        });
+        assert!(pool.queue.0.lock().unwrap().worker_documents[0].is_none());
+        let released = crate::shell_file_ops::fence_858b_transfer_for_probe(
+            parent.clone(),
+            destination,
+            false,
+        )
+        .unwrap();
+        eprintln!("858b child probe: pid={pid} released parent move: {released:?}");
+        assert_eq!(
+            released.classification(),
+            crate::shell_file_ops::ShellOperationClassification::Completed
+        );
+        assert_eq!(released.abort_query, Ok(false));
+        assert!(!parent.exists());
+        assert!(moved.join("book.pdf").is_file());
     }
 
     // ── Context epoch tests (PdfWorkerPool 内部ロジックのみ、PDFium IPC は使わない) ──

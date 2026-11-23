@@ -378,3 +378,67 @@
   - P2-2 削除は Shell の画面を出さず (`FOF_NOERRORUI | FOF_SILENT`)、今の有限回の再試行の後は失敗を返す。「Shell の画面で再試行」は移動・名前の変更だけ。→ §4.4 で終わり方を操作ごとに分けた。仕組みは足さない。
   - P3-3 ファイルを囲わない根拠が名前の変更の実験だけ。→ 削除の実験を足した (§2.3)。完全削除の Shell 経路は §11 で実装時に確かめる。
 - r3 (1edf9d983) ACCEPT: 追加の指摘なし。実装時の検証 (子プロセスの PDF worker、ごみ箱の無い場所の Shell の削除、§11) は残る。
+
+## 13. 実装の記録 (段 1)
+
+2026-11-23、`35cc93204` を基点に B だけを実装。ビルド・テスト実行は設計担当の共有 runner に渡す。
+一覧のフォルダへのドロップ・強調・DropDescription・マニュアルは段2に残す。
+
+### 変更ファイルと設計の対応
+
+| ファイル | 対応 |
+| --- | --- |
+| `src/mutation_fence.rs`（新規）、`src/lib.rs` | §4.2。`begin` が component 列の登録後に ZIP/PDF を手放す。`covers` は厳密な配下だけ。guard は自分の登録を外す。`begin_with_releases` が解放の差し込み口、テスト時だけの `without_fence_for_test` が RED 用の囲い除外 |
+| `src/shell_file_ops.rs` | §4.1。`ValidatedTransfer` が既存の検証で得たフォルダを保持。確定した Move だけ囲う。`run_rename_item` も worker でフォルダを確認し、どちらも Shell 実行と中断照会の間だけ保持。テストの Shell UI 抑止は thread-local の差し込み口 |
+| `src/delete_worker.rs` | §4.1・§4.4。通常削除と `recycle_required` の共通経路で予約済みフォルダを囲う。chunk 境界には種類の保持がないため worker で実ファイルの metadata を確認。ZIP もフォルダと返し得る Shell namespace 属性は使わない。既存フラグ・有限再試行は変更しない |
+| `src/zip_loader.rs` | §4.3。`retire_fenced_subtrees` → `ArchiveDirectoryCache::retire_subtree`。登録→cache lock→退役、挿入は同じ lock→確認→挿入。囲い中の template は今回だけ使用。退役した slot の Ready 公開では再登録しない |
+| `src/pdf_loader.rs` | §4.3。worker 別 release を FIFO 化し EPUB 削除と共用。`release_fenced_documents` が元の `ResolvedReadPath` で予約し、操作 worker が ACK を総5秒まで待つ。`record_worker_open_result` は OPEN 応答採用と同じ queue lock 内で予約。`try_pop_dispatch_work` が次の文書 job より先に解放を取る。通信形式・EPUB gate は維持 |
+| `docs/async-architecture.md`、`docs/virtual-folders.md`、本書 | 囲いの所有・寿命・確認箇所・キャッシュ解放・検証待ちを記録 |
+
+分類や表記の確認失敗、PDF の期限切れ・切断はログを残して続行する。回復や再試行の仕組みは追加しない。
+再生・別窓・監視・短い読取、削除前の viewer 解放、名前の変更後の close は変更していない。
+
+### 追加したテスト（未実行）
+
+囲い・操作の選択:
+
+- `fence_858b_covers_physical_components_and_spellings`
+- `fence_858b_multiple_guards_drop_independently`
+- `fence_858b_empty_and_unspellable_do_not_release`
+- `fence_858b_file_only_and_copy_operations_register_none`
+- `fence_858b_downgraded_move_registers_none`
+
+ZIP（ローカル cache と差し込み口で、時刻に依存せず確認）:
+
+- `fence_858b_directory_retirement_preserves_uncovered_slots`
+- `fence_858b_directory_reads_skip_retention_until_guard_drop`
+- `fence_858b_directory_registration_between_check_and_insert_is_retired`
+- `fence_858b_directory_retirement_matches_verbatim_cache_path`
+
+PDF（fake queue、子プロセスなし）:
+
+- `fence_858b_releases_only_covered_workers_with_original_read_path`
+- `fence_858b_open_response_queues_release_before_job_completion`
+- `fence_858b_epub_and_fence_releases_keep_fifo_and_both_acknowledge`
+- `fence_858b_ack_follows_inflight_job_and_precedes_next_document`
+- `fence_858b_uninitialized_pool_does_not_start_workers`
+
+実 Shell（すべて `#[ignore]`、使い捨てフォルダ、前3件は共有 ZIP cache の RED/green）:
+
+- `fence_858b_real_move_cached_zip_folder`
+- `fence_858b_real_rename_cached_zip_folder`
+- `fence_858b_real_recycle_cached_zip_folder`
+- `fence_858b_real_permanent_delete_held_zip_and_pdf`
+- `fence_858b_real_child_document_blocks_parent_move_until_release`
+
+最後のテストは準備済み `target/portable-smoke/mimageviewer.exe` の PDF worker だけを使う。
+専用 pool・使い捨て data を持ち、囲い除外の Shell 移動と、local pool の解放後の Shell 移動を比べる。
+共有 cache を使う実 Shell テストは、確認する cache が他のテストで退役しないよう、単独または直列で実行する。
+
+### 残る確認
+
+- コンパイル・自動テスト・ignored テストは未実行。実装担当は利用者指定によりコンパイラ・製品バイナリを起動しない。
+- §11 の PDF 子プロセスが親の移動を妨げるという前提は、上の ignored テストの結果待ち。
+- §11 の Shell 完全削除は `path_is_gone` を出力する probe を追加しただけで、まだ結果がない。
+  消えない結果なら削除だけのファイル項目も囲う設計判断が要る。現時点では対象を広げていない。
+- 外部ドラッグのバッジは段2とサブ PC での実機確認に残す。

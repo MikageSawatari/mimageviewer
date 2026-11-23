@@ -632,9 +632,23 @@ fn canonical_path_components(path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-fn validate_transfer_request(
+#[derive(Debug)]
+struct ValidatedTransfer {
     request: ShellTransferRequest,
-) -> Result<ShellTransferRequest, String> {
+    folders: Vec<PathBuf>,
+}
+
+impl ValidatedTransfer {
+    fn mutation_folders(&self) -> &[PathBuf] {
+        if self.request.operation == ShellTransferOperation::Move {
+            &self.folders
+        } else {
+            &[]
+        }
+    }
+}
+
+fn validate_transfer_request(request: ShellTransferRequest) -> Result<ValidatedTransfer, String> {
     if request.sources.is_empty() {
         return Err("移動／コピーする対象がありません".into());
     }
@@ -662,6 +676,7 @@ fn validate_transfer_request(
         ));
     }
     let destination_components = canonical_path_components(&destination);
+    let mut folders = Vec::new();
     for source in &request.sources {
         if !source.is_absolute() || path_has_nul(source) {
             return Err(format!(
@@ -705,16 +720,19 @@ fn validate_transfer_request(
                 source.display()
             ));
         }
+        if metadata.is_dir() {
+            folders.push(source.clone());
+        }
     }
     // Resolve aliases for safety checks without changing the selected Shell item:
     // a junction's user-visible name and Windows' link handling remain Shell-owned.
-    Ok(request)
+    Ok(ValidatedTransfer { request, folders })
 }
 
 #[cfg(windows)]
 fn run_transfer_items(
     hwnd: isize,
-    request: ShellTransferRequest,
+    request: ValidatedTransfer,
     requested: ShellTransferOperation,
 ) -> ShellTransferResult {
     run_transfer_items_with_flags(
@@ -729,17 +747,63 @@ fn run_transfer_items(
 #[cfg(windows)]
 fn transfer_flags() -> windows::Win32::UI::Shell::FILEOPERATION_FLAGS {
     use windows::Win32::UI::Shell::{FOF_ALLOWUNDO, FOFX_ADDUNDORECORD};
+    #[cfg(test)]
+    if FENCE_TEST_QUIET.with(std::cell::Cell::get) {
+        use windows::Win32::UI::Shell::{FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT};
+        return FOF_ALLOWUNDO
+            | FOFX_ADDUNDORECORD
+            | FOF_NOCONFIRMATION
+            | FOF_NOERRORUI
+            | FOF_SILENT;
+    }
     FOF_ALLOWUNDO | FOFX_ADDUNDORECORD
+}
+
+#[cfg(all(windows, test))]
+thread_local! {
+    static FENCE_TEST_QUIET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(windows, test))]
+pub(crate) fn fence_858b_transfer_for_probe(
+    source: PathBuf,
+    destination: PathBuf,
+    bypass: bool,
+) -> ShellTransferResult {
+    struct RestoreQuiet(bool);
+    impl Drop for RestoreQuiet {
+        fn drop(&mut self) {
+            FENCE_TEST_QUIET.with(|quiet| quiet.set(self.0));
+        }
+    }
+    let _quiet = RestoreQuiet(FENCE_TEST_QUIET.with(|quiet| quiet.replace(true)));
+    let run = || {
+        transfer_items_blocking(
+            None,
+            ShellTransferRequest {
+                operation: ShellTransferOperation::Move,
+                default_move_needs_volume_check: false,
+                sources: vec![source],
+                destination,
+            },
+        )
+    };
+    if bypass {
+        crate::mutation_fence::without_fence_for_test(run)
+    } else {
+        run()
+    }
 }
 
 #[cfg(windows)]
 fn run_transfer_items_with_flags(
     hwnd: isize,
-    request: ShellTransferRequest,
+    validated: ValidatedTransfer,
     requested: ShellTransferOperation,
     flags: windows::Win32::UI::Shell::FILEOPERATION_FLAGS,
     items: SharedShellItems,
 ) -> ShellTransferResult {
+    let request = &validated.request;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
@@ -811,7 +875,9 @@ fn run_transfer_items_with_flags(
         request.sources.len(),
         &request.destination,
     );
+    let fence = crate::mutation_fence::begin(validated.mutation_folders());
     let outcome = perform_and_query(&op, &items, log.prefix);
+    drop(fence);
     log.finish(outcome, &items);
     Ok(outcome)
 }
@@ -819,7 +885,7 @@ fn run_transfer_items_with_flags(
 #[cfg(not(windows))]
 fn run_transfer_items(
     _hwnd: isize,
-    _request: ShellTransferRequest,
+    _request: ValidatedTransfer,
     _requested: ShellTransferOperation,
 ) -> ShellTransferResult {
     Err("移動／コピーは Windows Shell 経由でのみ利用できます".into())
@@ -863,8 +929,8 @@ fn run_rename_item(hwnd: isize, target: PathBuf, new_name: String) -> ShellRenam
         CoUninitialize,
     };
     use windows::Win32::UI::Shell::{
-        FOF_ALLOWUNDO, FOFX_ADDUNDORECORD, FileOperation, IFileOperation,
-        IFileOperationProgressSink, IShellItem, SHCreateItemFromParsingName,
+        FileOperation, IFileOperation, IFileOperationProgressSink, IShellItem,
+        SHCreateItemFromParsingName,
     };
     use windows::core::{IUnknown, PCWSTR};
 
@@ -913,7 +979,7 @@ fn run_rename_item(hwnd: isize, target: PathBuf, new_name: String) -> ShellRenam
         unsafe { op.SetOwnerWindow(HWND(hwnd as *mut core::ffi::c_void)) }
             .map_err(|e| format!("Shell 操作の owner window を設定できません: {e}"))?;
     }
-    unsafe { op.SetOperationFlags(FOF_ALLOWUNDO | FOFX_ADDUNDORECORD) }
+    unsafe { op.SetOperationFlags(transfer_flags()) }
         .map_err(|e| format!("Shell 操作フラグを設定できません: {e}"))?;
     let items = std::sync::Arc::new(std::sync::Mutex::new(ShellItemResults::default()));
     let sink: IFileOperationProgressSink = ShellResultSink {
@@ -930,7 +996,19 @@ fn run_rename_item(hwnd: isize, target: PathBuf, new_name: String) -> ShellRenam
         1,
         target.parent().unwrap_or(&target),
     );
+    let folders = match std::fs::metadata(&target) {
+        Ok(metadata) if metadata.is_dir() => vec![target.clone()],
+        Ok(_) => Vec::new(),
+        Err(error) => {
+            crate::logger::log(format!(
+                "mutation_fence: cannot classify {target:?}: {error}"
+            ));
+            Vec::new()
+        }
+    };
+    let fence = crate::mutation_fence::begin(&folders);
     let operation = perform_and_query(&op, &items, log.prefix);
+    drop(fence);
     log.finish(operation, &items);
 
     let new_path = target
@@ -1631,6 +1709,16 @@ mod transfer_tests {
     }
 
     #[cfg(windows)]
+    struct FenceCachedZipCleanup(PathBuf);
+
+    #[cfg(windows)]
+    impl Drop for FenceCachedZipCleanup {
+        fn drop(&mut self) {
+            crate::zip_loader::retire_archive_directory_for_mutation(&self.0);
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
     fn shell_op_858_hresult_values_match_windows_crate() {
         use windows::Win32::Foundation::{ERROR_CANCELLED, S_OK};
@@ -1833,6 +1921,176 @@ mod transfer_tests {
     }
 
     #[test]
+    fn fence_858b_file_only_and_copy_operations_register_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        let destination = temp.path().join("destination");
+        let file = temp.path().join("book.zip");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        std::fs::write(&file, b"file").unwrap();
+        for (operation, sources) in [
+            (ShellTransferOperation::Move, vec![file.clone()]),
+            (
+                ShellTransferOperation::Copy,
+                vec![folder.clone(), file.clone()],
+            ),
+        ] {
+            let validated =
+                validate_transfer_request(request(operation, sources, destination.clone()))
+                    .unwrap();
+            assert!(validated.mutation_folders().is_empty());
+            let _guard =
+                crate::mutation_fence::begin_with_releases(validated.mutation_folders(), || {
+                    panic!("must not release")
+                });
+            assert!(!crate::mutation_fence::covers(&folder.join("child.zip")));
+        }
+        let moved = validate_transfer_request(request(
+            ShellTransferOperation::Move,
+            vec![folder.clone(), file],
+            destination,
+        ))
+        .unwrap();
+        assert_eq!(moved.mutation_folders(), &[folder.clone()]);
+        let _guard = crate::mutation_fence::begin_with_releases(moved.mutation_folders(), || {});
+        assert!(crate::mutation_fence::covers(&folder.join("child.zip")));
+    }
+
+    #[test]
+    fn fence_858b_downgraded_move_registers_none() {
+        let temp = tempfile::tempdir().unwrap();
+        let folder = temp.path().join("folder");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&destination).unwrap();
+        let mut input = request(
+            ShellTransferOperation::Move,
+            vec![folder.clone()],
+            destination.clone(),
+        );
+        input.default_move_needs_volume_check = true;
+        let resolved = resolve_default_move(input, |path| {
+            Some(
+                if path == destination {
+                    "destination"
+                } else {
+                    "source"
+                }
+                .into(),
+            )
+        });
+        let validated = validate_transfer_request(resolved).unwrap();
+        assert_eq!(validated.request.operation, ShellTransferOperation::Copy);
+        assert!(validated.mutation_folders().is_empty());
+        let _guard =
+            crate::mutation_fence::begin_with_releases(validated.mutation_folders(), || {
+                panic!("copy must not release")
+            });
+        assert!(!crate::mutation_fence::covers(&folder.join("child.zip")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Windows Shell; suppressed UI and disposable folders"]
+    fn fence_858b_real_move_cached_zip_folder() {
+        for bypass in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let folder = temp.path().join("source");
+            let destination = temp.path().join("destination");
+            std::fs::create_dir(&folder).unwrap();
+            std::fs::create_dir(&destination).unwrap();
+            let zip = folder.join("book.zip");
+            let _cleanup = FenceCachedZipCleanup(zip.clone());
+            crate::zip_loader::fence_858b_cache_zip(&zip);
+            let source = folder.clone();
+            let destination_worker = destination.clone();
+            let outcome = std::thread::spawn(move || {
+                FENCE_TEST_QUIET.with(|quiet| quiet.set(true));
+                let run = || {
+                    transfer_items_blocking(
+                        None,
+                        request(
+                            ShellTransferOperation::Move,
+                            vec![source],
+                            destination_worker,
+                        ),
+                    )
+                };
+                if bypass {
+                    crate::mutation_fence::without_fence_for_test(run)
+                } else {
+                    run()
+                }
+            })
+            .join()
+            .unwrap()
+            .unwrap();
+            eprintln!("fence_858b_real_move: bypass={bypass} outcome={outcome:?}");
+            crate::zip_loader::retire_archive_directory_for_mutation(&zip);
+            if bypass {
+                assert_eq!(
+                    outcome.classification(),
+                    ShellOperationClassification::Interrupted
+                );
+                assert_eq!(outcome.abort_query, Ok(true));
+                assert!(folder.exists());
+            } else {
+                assert_eq!(
+                    outcome.classification(),
+                    ShellOperationClassification::Completed
+                );
+                assert!(!folder.exists());
+                assert!(destination.join("source/book.zip").exists());
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Windows Shell; suppressed UI and disposable folders"]
+    fn fence_858b_real_rename_cached_zip_folder() {
+        for bypass in [true, false] {
+            let temp = tempfile::tempdir().unwrap();
+            let folder = temp.path().join("source");
+            std::fs::create_dir(&folder).unwrap();
+            let zip = folder.join("book.zip");
+            let _cleanup = FenceCachedZipCleanup(zip.clone());
+            crate::zip_loader::fence_858b_cache_zip(&zip);
+            let source = folder.clone();
+            let outcome = std::thread::spawn(move || {
+                FENCE_TEST_QUIET.with(|quiet| quiet.set(true));
+                let run = || run_rename_item(0, source, "renamed".into());
+                if bypass {
+                    crate::mutation_fence::without_fence_for_test(run)
+                } else {
+                    run()
+                }
+            })
+            .join()
+            .unwrap()
+            .unwrap();
+            eprintln!("fence_858b_real_rename: bypass={bypass} outcome={outcome:?}");
+            crate::zip_loader::retire_archive_directory_for_mutation(&zip);
+            if bypass {
+                assert_eq!(
+                    outcome.operation.classification(),
+                    ShellOperationClassification::Interrupted
+                );
+                assert_eq!(outcome.operation.abort_query, Ok(true));
+                assert!(folder.exists());
+            } else {
+                assert_eq!(
+                    outcome.operation.classification(),
+                    ShellOperationClassification::Completed
+                );
+                assert!(!folder.exists());
+                assert!(temp.path().join("renamed/book.zip").exists());
+            }
+        }
+    }
+
+    #[test]
     fn shell_transfer_default_move_volume_resolution_only_downgrades() {
         for (operation, check) in [
             (ShellTransferOperation::Copy, false),
@@ -1909,7 +2167,7 @@ mod transfer_tests {
             temp.path().to_path_buf(),
         ))
         .unwrap();
-        assert_eq!(copy.sources.len(), 2);
+        assert_eq!(copy.request.sources.len(), 2);
         let another_parent = temp.path().join("other");
         std::fs::create_dir(&another_parent).unwrap();
         let another_file = another_parent.join("other.txt");
@@ -2089,13 +2347,16 @@ mod transfer_tests {
             assert!(error.contains("同じフォルダなので移動できません"));
             assert!(error.contains(&alias.display().to_string()));
         }
-        assert_eq!(target_parent_move.unwrap().sources, vec![alias.clone()]);
+        assert_eq!(
+            target_parent_move.unwrap().request.sources,
+            vec![alias.clone()]
+        );
         assert_eq!(std::fs::read(&other).unwrap(), b"other item");
         assert!(!temp.path().join("other.txt").exists());
         std::fs::remove_dir(&alias).unwrap();
         assert!(copy.unwrap_err().contains("フォルダ自身またはその配下"));
         assert!(moved.unwrap_err().contains("フォルダ自身またはその配下"));
-        assert_eq!(aliased_source.unwrap().sources, vec![alias]);
+        assert_eq!(aliased_source.unwrap().request.sources, vec![alias]);
     }
 
     /// Print raw callbacks without requiring a particular merge-start HRESULT.
