@@ -8534,6 +8534,7 @@ fn next_fullscreen_cursor_hide_reason(
 
 fn should_handle_fullscreen_wheel(
     cursor_in_panel: bool,
+    cursor_in_depth_panel: bool,
     in_video_tile: bool,
     ctrl_held: bool,
     modal_for_keys: bool,
@@ -8543,6 +8544,9 @@ fn should_handle_fullscreen_wheel(
 ) -> bool {
     !modal_for_keys
         && !popup_open
+        // Depth's floating controls own modified wheel too. Ordinary side
+        // panels retain their established Ctrl+wheel zoom behavior below.
+        && !cursor_in_depth_panel
         && (!in_video_tile || !ctrl_held)
         && (ctrl_held || !cursor_in_panel)
 }
@@ -41893,6 +41897,7 @@ impl App {
                     .unwrap_or(false);
             let handle_wheel_here = should_handle_fullscreen_wheel(
                 cursor_in_panel_for_wheel,
+                cursor_in_depth_panel,
                 in_video_tile,
                 ctrl_held,
                 modal_for_keys,
@@ -85555,21 +85560,35 @@ mod tests {
     #[test]
     fn ctrl_wheel_is_handled_even_over_panels() {
         assert!(should_handle_fullscreen_wheel(
-            true, false, true, false, false
+            true, false, false, true, false, false
         ));
         assert!(!should_handle_fullscreen_wheel(
-            true, false, false, false, false
+            true, false, false, false, false, false
         ));
         assert!(should_handle_fullscreen_wheel(
-            false, false, false, false, false
+            false, false, false, false, false, false
         ));
         assert!(!should_handle_fullscreen_wheel(
-            false, false, true, true, false
+            false, false, false, true, true, false
         ));
         // 表示モード / フィットのポップアップ表示中は Ctrl+ホイールでも抑制する。
         assert!(!should_handle_fullscreen_wheel(
-            false, false, true, false, true
+            false, false, false, true, false, true
         ));
+    }
+
+    #[test]
+    fn depth_panel_blocks_plain_and_ctrl_wheel_admission() {
+        for ctrl in [false, true] {
+            assert!(!should_handle_fullscreen_wheel(
+                true, true, false, ctrl, false, false
+            ));
+            // The seek-hover projection must not admit wheel over an
+            // overlapping Depth panel either.
+            assert!(!should_handle_fullscreen_wheel(
+                false, true, false, ctrl, false, false
+            ));
+        }
     }
 
     #[test]
@@ -85854,7 +85873,7 @@ mod tests {
             "シークバー hover はスクロール可能パネル扱いせず、plain wheel をページ移動へ流す"
         );
         assert!(should_handle_fullscreen_wheel(
-            seek_hover, false, false, false, false
+            seek_hover, false, false, false, false, false
         ));
 
         let seek_drag = fullscreen_cursor_in_panel_for_wheel(true, true, true);
@@ -85863,13 +85882,13 @@ mod tests {
             "シークバードラッグ中だけは wheel による二重操作を抑制する"
         );
         assert!(!should_handle_fullscreen_wheel(
-            seek_drag, false, false, false, false
+            seek_drag, false, false, false, false, false
         ));
 
         let side_panel = fullscreen_cursor_in_panel_for_wheel(true, false, false);
         assert!(side_panel);
         assert!(!should_handle_fullscreen_wheel(
-            side_panel, false, false, false, false
+            side_panel, false, false, false, false, false
         ));
     }
 

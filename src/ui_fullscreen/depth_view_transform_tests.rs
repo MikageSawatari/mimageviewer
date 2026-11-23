@@ -415,8 +415,9 @@ fn depth_transform_panel_rejects_wheel_and_drag_starts() {
         app.fs_focus_regained_at = None;
         let panel = app.visible_depth_panel_rect(&viewer.ctx).unwrap();
         let pos = panel.min + egui::vec2(15., 60.);
+        assert!(panel.contains(pos));
         let before = (app.fs_zoom, app.fs_pan, app.fs_free_rotation);
-        viewer.frame(
+        viewer.frame_with_before(
             &mut app,
             vec![
                 egui::Event::PointerMoved(pos),
@@ -428,6 +429,18 @@ fn depth_transform_panel_rejects_wheel_and_drag_starts() {
                     source: egui::MouseWheelSource::Wheel,
                 },
             ],
+            |app, ctx| {
+                assert_eq!(app.visible_depth_panel_rect(ctx), Some(panel));
+                assert!(
+                    ctx.input(|input| input.pointer.hover_pos())
+                        .is_some_and(|point| panel.contains(point))
+                );
+            },
+        );
+        assert_eq!(
+            (app.fs_zoom, app.fs_pan, app.fs_free_rotation),
+            before,
+            "Ctrl+wheel on the recorded Depth panel must not reach image zoom"
         );
         let modifiers = if ctrl {
             egui::Modifiers::CTRL
