@@ -1344,20 +1344,44 @@ pub fn resolve_openable_path(path: &Path) -> Option<std::path::PathBuf> {
     resolve_openable_path_detailed(path).map(|r| r.path)
 }
 
+// Navigation probes share one observable boundary. The counter is caller-local,
+// so a worker doing real I/O never hides a UI-thread probe in a process total.
+#[cfg(test)]
+thread_local! {
+    static NAVIGATION_PATH_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn navigation_path_probe_count_for_test() -> usize {
+    NAVIGATION_PATH_PROBES.with(std::cell::Cell::get)
+}
+
+pub(crate) fn navigation_path_is_file(path: &Path) -> bool {
+    #[cfg(test)]
+    NAVIGATION_PATH_PROBES.with(|count| count.set(count.get() + 1));
+    path.is_file()
+}
+
+pub(crate) fn navigation_path_is_dir(path: &Path) -> bool {
+    #[cfg(test)]
+    NAVIGATION_PATH_PROBES.with(|count| count.set(count.get() + 1));
+    path.is_dir()
+}
+
 /// `resolve_openable_path` の詳細版。返却 path の種別と、元リクエストが
 /// ファイルだったかを同じ filesystem stat の流れで返す。
 pub fn resolve_openable_path_detailed(path: &Path) -> Option<OpenablePathResolution> {
     let accepted_path = crate::path_key::normalize_input_path(path);
     let path = accepted_path.as_path();
     // そのまま開けるか
-    if path.is_dir() {
+    if navigation_path_is_dir(path) {
         return Some(OpenablePathResolution {
             path: path.to_path_buf(),
             kind: OpenablePathKind::Directory,
             requested_is_file: false,
         });
     }
-    let requested_is_file = path.is_file();
+    let requested_is_file = navigation_path_is_file(path);
     if requested_is_file && (is_virtual_folder(path) || is_convertible_archive_path(path)) {
         return Some(OpenablePathResolution {
             path: path.to_path_buf(),
@@ -1372,7 +1396,7 @@ pub fn resolve_openable_path_detailed(path: &Path) -> Option<OpenablePathResolut
         if p.as_os_str().is_empty() {
             return None;
         }
-        if p.is_dir() {
+        if navigation_path_is_dir(p) {
             return Some(OpenablePathResolution {
                 path: p.to_path_buf(),
                 kind: OpenablePathKind::Directory,

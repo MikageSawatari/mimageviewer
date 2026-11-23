@@ -24899,6 +24899,10 @@ mod phase_c_folder_nav_history_tests {
             location_root_for_path(&PathBuf::from(r"\\server\share\books\p001.jpg")),
             Some(PathBuf::from(r"\\server\share\"))
         );
+        assert_eq!(
+            location_root_for_path(&PathBuf::from(r"\\?\UNC\server\share\books\p001.jpg")),
+            Some(PathBuf::from(r"\\?\UNC\server\share\"))
+        );
     }
 
     #[test]

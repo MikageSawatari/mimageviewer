@@ -1193,8 +1193,6 @@ pub(crate) fn scan_directory_with_settings_cancel(
             "folder scan cancelled",
         ));
     }
-    #[cfg(test)]
-    CALLER_SCAN_COUNT.with(|count| count.set(count.get() + 1));
     scan_directory_with_visibility_cancel(
         path,
         !settings.archive_file_handling_ignores_convertible(),
@@ -1281,6 +1279,8 @@ pub(crate) fn scan_directory_with_visibility_cancel(
     policy: &crate::file_type_visibility::FileTypeVisibility,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<ScannedDir> {
+    #[cfg(test)]
+    CALLER_SCAN_COUNT.with(|count| count.set(count.get() + 1));
     scan_directory_entries(
         std::fs::read_dir(path)?,
         include_convertible_archives,
@@ -1313,6 +1313,8 @@ pub(crate) fn scan_directory_with_convertible_archives_cancel(
     show_hidden_files: bool,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<ScannedDir> {
+    #[cfg(test)]
+    CALLER_SCAN_COUNT.with(|count| count.set(count.get() + 1));
     let entries = std::fs::read_dir(path)?;
     scan_directory_entries(
         entries,

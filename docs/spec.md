@@ -2728,7 +2728,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `reading_history_limit` | usize | 1000 | 閲覧履歴の保持件数。1..=1000 に clamp し、保持件数を下げた場合は古い項目から削除する |
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
 | `active_quick_folder_slot` | `Option<QuickFolderSlotId>` | `Some(A)` | 終了 / トレイ退避時のアクティブな A/B。起動フォルダを開く前に復元し、そのスロットだけへ場所・最近のフォルダ・ドライブ別の場所を記録する。旧設定の項目欠落は A、明示的な `None` はどちらも選ばず両スロットを保持する。起動場所は起動設定と Previous 専用の明示一覧 record から選び、保存スロットの場所で上書きしない |
-| `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
+| `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` とツールバーのドライブ欄はアクティブな A/B スロットの値を使う。ドライブ欄に並ぶのは A と B のキーの和集合で、欄の「一覧から外す」は両方のスロットからそのキーを消す |
 | `use_native_shell_context_menu` | bool | true | リリース済み設定との読み書き互換のためだけに残す旧フィールド。現在は値を無視し、実ファイル / 実フォルダの native 右クリックメニューへ Windows Shell 項目を常に含める |
 | `show_windows_context_menu_inline` | bool | false | Windows Shell 項目を mIV 項目と同じ階層へ併記する。OFF では末尾の「Windows のメニュー」サブメニューへまとめ、開くまで `QueryContextMenu` を遅延する |
 | `skip_recycle_bin_delete_confirmation` | bool | false | mIV の事前判定が `RecycleBin` かつ実フォルダを含まないとき、ZIP / PDF / 変換対象アーカイブを含めて mIV 側の削除確認を省略する。実フォルダを含む場合は常に確認する。複数選択は 1 件でも `MayPermanent` なら確認を維持し、キャンセルを初期選択にする。`FOF_WANTNUKEWARNING` には影響しない |
@@ -2908,6 +2908,7 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `folder_tree_pane_visible` | bool | false | 左側の実フォルダツリーペインを表示 |
 | `folder_tree_sort_order` | FolderTreeSortOrder | NameAsc | 左ツリーと Ctrl+上下 / Ctrl+PageUp/PageDown の並び順。NameAsc / NameDesc / NumericAsc / NumericDesc / DateAsc / DateDesc。一覧用 `sort_order` とお気に入り別表示状態から独立 |
 | `folder_tree_pane_width_ratio` | f32 | 0.22 | フォルダツリーペインの左右境界位置 (ウィンドウ幅に対する比率)。復元時は最小/最大幅にクランプ |
+| `show_toolbar_drives` | bool | false | ツールバーにドライブ欄 (§1.793) を表示。A/B どちらかに `quick_folder_drive_current_dirs` の記録があるドライブを `C:` などのボタンで並べ、左クリックで `GridSwitchDriveC..Z` と同じ移動、右クリックで「ルートを開く」「一覧から外す」。描画はメモリの記録だけを読み、ファイルシステムに触らない。既定の並びはお気に入りの直前 |
 | `show_toolbar_favorites` | bool | true | ツールバーにお気に入りを表示 |
 | `show_toolbar_smart_folders` | bool | true | 登録が 1 件以上あるときツールバーにスマートフォルダを表示。0 件時も設定値は保持する |
 | `show_toolbar_tags` | bool | true | ツールバーにタグセクション (タグ管理 / タグビュー / ピン留めタグ) を表示 |

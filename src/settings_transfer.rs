@@ -672,6 +672,7 @@ preferences_policy! {
         gpu_memory_percent => @prefs("GPU メモリの上限 (%)", "gpu-memory/limit", |v, _| *v <= GPU_MEMORY_PERCENT_MAX, plain, plain) "CPU/GPU/メモリ/ドライバ/速度の tuning";
         thumb_idle_upgrade => @prefs("アイドル時にキャッシュ由来のサムネイルを高画質化する", "thumbnail/idle-upgrade", |_, _| true, plain, plain) "同上";
         tags => "利用データ・登録先・履歴・検索対象";
+        show_toolbar_drives => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_favorites => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_smart_folders => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         show_toolbar_tags => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -2584,7 +2585,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 514);
+        assert_eq!(entries.len(), 515);
         assert_eq!(
             entries
                 .iter()
@@ -2597,7 +2598,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            344
+            345
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -3093,6 +3094,36 @@ mod tests {
                 .iter()
                 .all(|label| label.chars().any(|c| !c.is_ascii()))
         );
+    }
+
+    #[test]
+    fn section1793_toolbar_drives_remains_local_toolbar_state() {
+        assert!(
+            classifications()
+                .iter()
+                .any(|(key, reason)| *key == "show_toolbar_drives" && reason.is_some())
+        );
+        for enabled in [false, true] {
+            let source = Settings {
+                show_toolbar_drives: enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let value: Value = serde_json::from_str(&exported.json).unwrap();
+            assert!(value["preferences"].get("show_toolbar_drives").is_none());
+            let mut destination = Settings {
+                show_toolbar_drives: !enabled,
+                ..Settings::default()
+            };
+            parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.show_toolbar_drives, !enabled);
+            parse_preferences(&document(json!({"show_toolbar_drives": enabled})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.show_toolbar_drives, !enabled);
+        }
     }
 
     #[test]

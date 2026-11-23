@@ -28,6 +28,16 @@ AllRequirementsで補充する。全体proof・cache・停止状態を保持し�
 読み込みのモーダル化は一覧の即時表示と
 通常操作を妨げるため採らず、自動整列をしないことで選択保護や再整列待ちの状態を増やさない。
 
+## ドライブ移動の worker 解決とツールバーのドライブ欄（§1.793）
+
+`GridOpenCurrentDriveRoot` / `GridOpenDriveC..Z` / `GridSwitchDriveC..Z` とツールバーのドライブ欄は、UI では A/B のメモリの記録だけから要求を作り、行き先の `resolve_openable_path_detailed` は短命の `drive-jump-resolve` worker で行う。解決後は種類 (ディレクトリ / コンテナ) を保ったまま、検索の外は `DirectoryScanRoute::Worker`、検索中は種類つきの検索を抜ける移動へ渡す。ディレクトリは完了から worker 走査開始まで UI の stat／走査を行わない。要求は主一覧の要求の一覧 (`MainListRequestOwner::DriveJump`) に参加し、後の受付で退く。ドライブ欄の描画は記録のキーを読むだけで、ドライブ列挙・存在確認・ボリューム名の取得をしない。計測は `nav/drive_jump_resolve` (ms・request_kind・outcome)。
+
+コンテナを開く既存経路全体から UI I/O を除いたわけではない。通常 PDF は、`prepared_pages == None && allow_placeholder` のときに呼ぶ `peek_pdf_meta_cache` が UI で `metadata` を1回行う。warm catalog／メタキャッシュの hit 判定より前なので **warm miss でも発生**し、prepared-pages 経路や placeholder を許可しない場合は省く。EPUB の pinned stamp 経路とは異なり、全 PDF／EPUB 入口に共通する stat ではない。SmartFolder の PDF preflight にも placeholder を許可したときの同じ照会が残る。
+
+通常の主一覧 ZIP は staged preflight の worker で変換キャッシュ検証と列挙を行う。ただし列挙後の UI の `prepare_zip_grid_with_nav` には、pin DB と内部ディレクトリのキーがある場合の SQLite SELECT が残り、内部 `ZipDir` pin (`zip_rel` が空) の cascade 解決では `metadata` も行う (内部 `ZipEntry` pin はこの stat を省く)。また、SmartFolder の非 RAR 変換書庫など `try_archive_cache_lookup` を UI から通る既存経路では、cache DB があれば元ファイルの `metadata` と DB 照会を行う。取得行の stamp 一致時はキャッシュ ZIP の `exists`、不一致時は古いキャッシュファイルの削除、有効性に応じた DB の DELETE／最終アクセス UPDATE も残る。通常の staged preflight はキャッシュ検証を worker で行い、prepared／proven な ZIP の受け渡しは再照会を省くため、全 ZIP 入口で UI の cache lookup が発生するという意味ではない。
+
+これらは環境次第で UI が止まり得る既知の制限で、今回は修正しない。実機での停止時間は未測定。条件とソースの対応は [drive-tabs-793-plan.md](drive-tabs-793-plan.md) §2.3 を参照。
+
 ## 静止画 scaler の先行作成と待ちの計装（§1.776 案 B-B）
 
 初回通常 present 後に、設定済みの NIS / Anime4K を低優先度 worker で作る。

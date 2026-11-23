@@ -2060,6 +2060,7 @@ pub enum ToolbarSectionId {
     Aspect,
     Sort,
     Rating,
+    Drives,
     Favorites,
     SmartFolders,
     Tags,
@@ -2105,6 +2106,7 @@ impl ToolbarSectionId {
             Self::Aspect,
             Self::Sort,
             Self::Rating,
+            Self::Drives,
             Self::Favorites,
             Self::SmartFolders,
             Self::Tags,
@@ -2116,12 +2118,16 @@ impl ToolbarSectionId {
         ]
     }
 
-    /// 保存済み順序に、未登録のセクションを既定順で末尾追加して返す。
+    /// 保存済み順序に、未登録のセクションを補完して返す。
     ///
     /// 詳細列の `details_ordered_columns` と同じ「保存順に無い新項目は末尾追加」方式。
     /// 空 Vec は既定順そのまま。重複は最初の 1 つだけ採用 (破損データ耐性)。
-    /// 後方互換 / 将来のセクション追加の両方に耐える。
+    /// Drives だけは保存済み Favorites の直前へ追加する。Favorites も無ければ末尾。
+    /// その他の新セクションは従来どおり末尾追加する。
     pub fn ordered_with_fallback(saved: &[Self]) -> Vec<Self> {
+        if saved.is_empty() {
+            return Self::default_order().to_vec();
+        }
         let mut out: Vec<Self> = Vec::with_capacity(Self::default_order().len());
         for &id in saved {
             // 未知セクションは描画対象にしない (forward-compat: 将来変種を読み飛ばす)。
@@ -2132,10 +2138,18 @@ impl ToolbarSectionId {
                 out.push(id);
             }
         }
+        let missing_drives = !out.contains(&Self::Drives);
+        let drives_position = out.iter().position(|id| *id == Self::Favorites);
         for &id in Self::default_order() {
+            if id == Self::Drives {
+                continue;
+            }
             if !out.contains(&id) {
                 out.push(id);
             }
+        }
+        if missing_drives {
+            out.insert(drives_position.unwrap_or(out.len()), Self::Drives);
         }
         out
     }
@@ -5443,6 +5457,9 @@ pub struct Settings {
     pub tags: Vec<TagDef>,
 
     // ── ツールバー表示設定 ──────────────────────────────────
+    /// A/B のどちらかに最後の場所の記録があるドライブをツールバーに表示する。
+    #[serde(default)]
+    pub show_toolbar_drives: bool,
     /// ツールバーに「お気に入り」セクションを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_favorites: bool,
@@ -8568,6 +8585,7 @@ impl Default for Settings {
             first_setup_completed: false,
             ai_feature_mode: AiFeatureMode::default(),
             tags: Vec::new(),
+            show_toolbar_drives: false,
             show_toolbar_favorites: true,
             show_toolbar_smart_folders: true,
             show_toolbar_tags: true,
@@ -11353,6 +11371,7 @@ impl Settings {
         self.show_toolbar_sort = src.show_toolbar_sort;
         self.show_facet_sort = src.show_facet_sort;
         self.show_grid_edge_buttons = src.show_grid_edge_buttons;
+        self.show_toolbar_drives = src.show_toolbar_drives;
         self.show_toolbar_favorites = src.show_toolbar_favorites;
         self.show_toolbar_smart_folders = src.show_toolbar_smart_folders;
         self.show_toolbar_tags = src.show_toolbar_tags;
@@ -13583,6 +13602,75 @@ mod tests {
     fn toolbar_section_order_empty_is_default() {
         let got = ToolbarSectionId::ordered_with_fallback(&[]);
         assert_eq!(got, ToolbarSectionId::default_order().to_vec());
+    }
+
+    #[test]
+    fn section1793_toolbar_drives_default_roundtrip_and_live_carry() {
+        assert!(!Settings::default().show_toolbar_drives);
+        assert!(
+            !serde_json::from_str::<Settings>("{}")
+                .unwrap()
+                .show_toolbar_drives
+        );
+        for enabled in [true, false] {
+            let mut live = Settings::default();
+            live.show_toolbar_drives = enabled;
+            let mut edited = live.preferences_snapshot();
+            edited.show_toolbar_drives = !enabled;
+            edited.overwrite_non_preferences_from(&mut live);
+            let loaded: Settings =
+                serde_json::from_value(serde_json::to_value(&edited).unwrap()).unwrap();
+            assert_eq!(loaded.show_toolbar_drives, enabled);
+        }
+    }
+
+    #[test]
+    fn section1793_toolbar_drives_insert_before_saved_favorites_only() {
+        use ToolbarSectionId as TS;
+        let old_order: Vec<_> = TS::default_order()
+            .iter()
+            .copied()
+            .filter(|id| *id != TS::Drives)
+            .rev()
+            .collect();
+        let mut expected = old_order.clone();
+        let favorites = expected.iter().position(|id| *id == TS::Favorites).unwrap();
+        expected.insert(favorites, TS::Drives);
+        assert_eq!(TS::ordered_with_fallback(&old_order), expected);
+        assert_eq!(TS::ordered_with_fallback(&expected), expected);
+
+        let corrupt = [TS::Tags, TS::Cols];
+        let completed = TS::ordered_with_fallback(&corrupt);
+        assert_eq!(&completed[..2], &corrupt);
+        assert_eq!(completed.last(), Some(&TS::Drives));
+
+        let explicit = [TS::Drives, TS::Tags, TS::Favorites];
+        assert_eq!(&TS::ordered_with_fallback(&explicit)[..3], &explicit);
+        let defaults = TS::default_order();
+        let favorites = defaults.iter().position(|id| *id == TS::Favorites).unwrap();
+        assert_eq!(defaults[favorites - 1], TS::Drives);
+    }
+
+    #[test]
+    fn section1793_toolbar_drives_upgrade_preserves_row_owners_and_other_fallbacks() {
+        use ToolbarSectionId as TS;
+        let mut settings = Settings::default();
+        settings.toolbar_section_order = TS::default_order()
+            .iter()
+            .copied()
+            .filter(|id| *id != TS::Drives && *id != TS::Collections)
+            .collect();
+        settings.toolbar_section_new_row = vec![TS::Favorites, TS::Tags];
+        let loaded: Settings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        let upgraded = TS::ordered_with_fallback(&loaded.toolbar_section_order);
+        assert_eq!(loaded.toolbar_section_new_row, [TS::Favorites, TS::Tags]);
+        assert_eq!(upgraded.last(), Some(&TS::Collections));
+        let without_new: Vec<_> = upgraded
+            .into_iter()
+            .filter(|id| *id != TS::Drives && *id != TS::Collections)
+            .collect();
+        assert_eq!(without_new, settings.toolbar_section_order);
     }
 
     #[test]

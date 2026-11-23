@@ -7834,6 +7834,15 @@ impl App {
         self.trigger_ring_shortcut_action(ctx, context, direction, "gamepad-ring")
     }
 
+    #[cfg(test)]
+    pub(super) fn trigger_gamepad_ring_action_for_test(
+        &mut self,
+        ctx: &egui::Context,
+        direction: RingDirection,
+    ) -> Option<AddressBarNav> {
+        self.trigger_gamepad_ring_action(ctx, direction)
+    }
+
     pub(crate) fn trigger_ring_shortcut_action(
         &mut self,
         ctx: &egui::Context,
@@ -8073,81 +8082,6 @@ impl App {
         self.bump_input_seq(source, Some(&format!("favorite_slot={slot}")));
         ctx.request_repaint();
         Some(AddressBarNav::WorkerFavorite(target))
-    }
-
-    fn apply_ring_drive_letter(
-        &mut self,
-        ctx: &egui::Context,
-        letter: char,
-        source: &'static str,
-    ) -> Option<AddressBarNav> {
-        if self.location_jump_snapshot_blocked() {
-            return None;
-        }
-        let path = super::drive_root_path_for_letter(letter)?;
-        let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
-            self.show_feedback_warning(format!("ドライブが見つかりません: {}", path.display()));
-            return None;
-        };
-        self.location_jump_nav(ctx, LocationJumpTarget::Physical(resolved), source)
-    }
-
-    fn apply_current_drive_root(
-        &mut self,
-        ctx: &egui::Context,
-        source: &'static str,
-    ) -> Option<AddressBarNav> {
-        if self.location_jump_snapshot_blocked() {
-            return None;
-        }
-        let Some(path) = self.current_location_root() else {
-            self.show_feedback_warning("現在位置のルートディレクトリが見つかりません".to_string());
-            return None;
-        };
-        let Some(resolved) = crate::folder_tree::resolve_openable_path(&path) else {
-            self.show_feedback_warning(format!(
-                "ルートディレクトリが見つかりません: {}",
-                path.display()
-            ));
-            return None;
-        };
-        self.location_jump_nav(ctx, LocationJumpTarget::Physical(resolved), source)
-    }
-
-    fn apply_switch_drive_letter(
-        &mut self,
-        ctx: &egui::Context,
-        letter: char,
-        source: &'static str,
-    ) -> Option<AddressBarNav> {
-        if self.location_jump_snapshot_blocked() {
-            return None;
-        }
-        let root = super::drive_root_path_for_letter(letter)?;
-        let drive_key = super::drive_current_key_for_letter(letter)?;
-        let remembered = self.active_drive_current_dir(letter);
-        let remembered_resolved = remembered.as_ref().and_then(|path| {
-            let resolved = crate::folder_tree::resolve_openable_path(path)?;
-            (super::drive_current_key_for_path(&resolved) == Some(drive_key.clone()))
-                .then_some(resolved)
-        });
-        let target = if let Some(path) = remembered_resolved {
-            path
-        } else {
-            if let Some(path) = remembered.as_ref() {
-                self.show_feedback_warning(format!(
-                    "{} の最後の場所が見つかりません。ルートへ移動します: {}",
-                    drive_key,
-                    path.display()
-                ));
-            }
-            let Some(resolved_root) = crate::folder_tree::resolve_openable_path(&root) else {
-                self.show_feedback_warning(format!("ドライブが見つかりません: {}", root.display()));
-                return None;
-            };
-            resolved_root
-        };
-        self.location_jump_nav(ctx, LocationJumpTarget::Physical(target), source)
     }
 
     fn apply_ring_location_action(

@@ -40,6 +40,8 @@ impl App {
             self.dispatch_main_input_nav_immediate(nav, false);
         } else if let Some(nav) = keyboard_nav {
             self.dispatch_main_input_nav_immediate(nav, keyboard_nav_from_fullscreen_close);
+        } else if self.drive_jump_ready() {
+            self.adopt_ready_drive_jump();
         } else if let Some(result) = self.poll_folder_nav() {
             self.apply_folder_nav_result(ctx, result);
         }
@@ -60,6 +62,7 @@ impl App {
         // Remote service runs in logic. Display continuation stays at the old
         // root UI checkpoint before ordinary input and worker adoption.
         self.continue_remote_local_display();
+        self.poll_drive_jump(_ctx);
         // Before any shortcut path, so a state that swallows every key says so once, in the
         // ordinary log, whether or not the reader happened to be running with --perf-log.
         self.note_modal_block_transition();
@@ -1200,8 +1203,15 @@ impl App {
             folder_pane_nav,
             grid_nav,
         } = navigation;
+        // render_toolbar returns drive clicks in its address/navigation slot.
+        // Promote only that explicit toolbar input to the favorites tier;
+        // ordinary address inputs retain their released priority below worker completions.
+        let (toolbar_drive_nav, address_nav) = match address_nav {
+            Some(crate::ui_main::AddressBarNav::DriveJump(input)) => (Some(input), None),
+            other => (None, other),
+        };
         // ── 非同期フォルダナビゲーションのポーリング ────────────────
-        // 優先度 (旧来踏襲): fav_nav > toolbar_fav_nav > keyboard/gamepad_nav > folder_nav
+        // 優先度: fav_nav > toolbar favorite/drive > keyboard/gamepad_nav > folder_nav
         //                     > address_nav > open_folder_nav > context_nav
         //                     > folder_pane_open > grid_nav
         // folder_nav は fav/toolbar/keyboard/gamepad より後、address 以下より先。
@@ -1210,6 +1220,7 @@ impl App {
         // different requested navigation wins without consuming its payload or history.
         if fav_nav.is_some()
             || toolbar_fav_nav.is_some()
+            || toolbar_drive_nav.is_some()
             || fullscreen_close_nav.is_some()
             || keyboard_nav.is_some()
             || gamepad_nav.is_some()
@@ -1235,14 +1246,23 @@ impl App {
                 false,
             )
         };
+        let drive_jump_wins = fav_nav.is_none()
+            && toolbar_fav_nav.is_none()
+            && toolbar_drive_nav.is_none()
+            && input_nav.is_none()
+            && self.drive_jump_ready();
         let folder_nav_result = self.poll_folder_nav();
         let folder_nav_wins = folder_nav_result.is_some()
+            && !drive_jump_wins
             && fav_nav.is_none()
             && toolbar_fav_nav.is_none()
+            && toolbar_drive_nav.is_none()
             && input_nav.is_none();
         let higher_priority_than_folder_pane = fav_nav.is_some()
             || toolbar_fav_nav.is_some()
+            || toolbar_drive_nav.is_some()
             || input_nav.is_some()
+            || drive_jump_wins
             || folder_nav_wins
             || address_nav.is_some()
             || open_folder_nav.is_some()
@@ -1311,7 +1331,9 @@ impl App {
             }
         });
 
-        if folder_nav_wins {
+        if drive_jump_wins {
+            self.adopt_ready_drive_jump();
+        } else if folder_nav_wins {
             // folder_nav 勝利: モードに応じて load_folder / close+load+open_fullscreen /
             // favsearch 処理に分岐。address_nav 以下の低優先度 nav は破棄する
             // (旧実装の `.or()` 短絡と同じ挙動)。
@@ -1341,8 +1363,15 @@ impl App {
             } else if let Some(path) = toolbar_fav_nav {
                 navigate_scan_route = DirectoryScanRoute::Worker;
                 self.dispatch_favorite_navigation(path)
+            } else if let Some(input) = toolbar_drive_nav {
+                self.dispatch_drive_jump_input(input);
+                None
             } else if let Some(nav) = input_nav.or(address_nav) {
                 match nav {
+                    crate::ui_main::AddressBarNav::DriveJump(input) => {
+                        self.dispatch_drive_jump_input(input);
+                        None
+                    }
                     crate::ui_main::AddressBarNav::WorkerFavorite(path) => {
                         navigate_scan_route = DirectoryScanRoute::Worker;
                         self.dispatch_favorite_navigation(path)
@@ -1565,6 +1594,10 @@ impl App {
                                 self.open_collection_grid_from_navigation(id);
                                 None
                             }
+                            crate::ui_main::AddressBarNav::DriveJump(input) => {
+                                self.dispatch_drive_jump_input(input);
+                                None
+                            }
                             crate::ui_main::AddressBarNav::HistoryBack
                             | crate::ui_main::AddressBarNav::HistoryForward
                             | crate::ui_main::AddressBarNav::SavedGroupReady(_) => None,
@@ -1665,6 +1698,10 @@ impl App {
                 }
             } else {
                 match grid_nav {
+                    Some(crate::ui_main::AddressBarNav::DriveJump(input)) => {
+                        self.dispatch_drive_jump_input(input);
+                        None
+                    }
                     Some(crate::ui_main::AddressBarNav::WorkerFavorite(path)) => {
                         navigate_scan_route = DirectoryScanRoute::Worker;
                         self.dispatch_favorite_navigation(path)

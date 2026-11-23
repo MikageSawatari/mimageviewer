@@ -8,6 +8,7 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [drive-tabs-793-plan.md](drive-tabs-793-plan.md) | §1.793 ツールバーのドライブ欄 (ドライブ別の最後の場所を常設ボタンから開く)。A/B の記録から導くドライブの集合、キー操作と共有するドライブ移動の worker 解決、置き場所・右クリック・利用者判断。設計段階、未実装 |
 | [folder-tree-dnd-plan.md](folder-tree-dnd-plan.md) | §1.464 ツリー行への D&D と右クリック貼り付け、§1.821 一覧ドロップ。表示済み pass の形・ROOT OLE target・既定操作のボリューム確認・共有受付と転送 owner。generic Shell image と target description を使用。実装記録と未実施の検証は §14〜15 |
 | [hover-805-measurement.md](hover-805-measurement.md) | 5ch 報告 805 の環境設定・操作カスタマイズのホバー計測。GPUを使わない ignored harness、dialog_frame perf event、dialog-frames集計と観測限界 |
 | [hover-809-gpu-work-measurement.md](hover-809-gpu-work-measurement.md) | §1.809 のテスト専用A/B計測とC見積もり。primitive完全一致率、offscreen GPU pass費用、present未測定の限界と省略条件のソース棚卸し |
