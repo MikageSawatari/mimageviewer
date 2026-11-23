@@ -234,6 +234,7 @@ impl App {
 
     pub(super) fn capture_snapshot_viewing_state(&self) -> crate::snapshot::SnapshotViewingState {
         crate::snapshot::SnapshotViewingState {
+            spread_presentation_source: self.spread_presentation_source.clone(),
             mode: self.spread_mode,
             direction: self.reading_direction,
             flow: self.reading_flow,
@@ -247,6 +248,7 @@ impl App {
 
     fn restore_snapshot_viewing_state(&mut self, state: crate::snapshot::SnapshotViewingState) {
         let previous_mode = self.spread_mode;
+        self.spread_presentation_source = state.spread_presentation_source;
         self.spread_mode = state.mode;
         self.reading_direction = state.direction;
         self.reading_flow = state.flow;
@@ -1489,6 +1491,8 @@ impl App {
             self.items = snap.saved_items;
             self.page_identity_index = snap.saved_page_identity_index;
             self.projection_recipe = snap.saved_projection_recipe;
+            self.spread_presentation_source =
+                snap.saved_viewing_state.spread_presentation_source.clone();
             self.thumbnails = merged_thumbnails;
             self.converted_archive_cache_paths = snap.saved_converted_archive_sources;
             self.catch_up_converted_archive_sources();
@@ -1567,6 +1571,7 @@ impl App {
             list_image_metas,
             list_identity_index,
             list_recipe,
+            spread_presentation_source,
             exact_page_edits,
         ) = {
             let Some(snap) = self.snapshot.as_ref() else {
@@ -1580,6 +1585,7 @@ impl App {
                 snap.list_view_image_metas.clone(),
                 snap.list_view_page_identity_index.clone(),
                 snap.list_view_projection_recipe.clone(),
+                snap.saved_viewing_state.spread_presentation_source.clone(),
                 // 検索 view 由来 snapshot は origin が cross-folder prefix なので rehydrate せず
                 // clear のみ (= activate と同じ判定。pre_snapshot_search_origin Some が search 由来)。
                 snap.page_edit_source == crate::snapshot::SnapshotPageEditSource::PreparedExact,
@@ -1627,6 +1633,7 @@ impl App {
         self.items = list_items;
         self.page_identity_index = list_identity_index;
         self.projection_recipe = list_recipe;
+        self.spread_presentation_source = spread_presentation_source;
         self.thumbnails = list_thumbs;
         self.converted_archive_cache_paths = list_sources;
         self.catch_up_converted_archive_sources();
@@ -5392,5 +5399,83 @@ mod tests {
             !app.fs_nav_is_locked(),
             "スライドショー直接送り後も nav lock が解除される"
         );
+    }
+
+    #[test]
+    fn browser870_snapshot_child_pdf_round_trip_restores_directory_source() {
+        use crate::app::SpreadPresentationSource;
+        use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+        let mut app = setup_app_for_test();
+        let folder = app.tmp.path().join("browser870-snapshot");
+        std::fs::create_dir_all(&folder).unwrap();
+        for name in ["01.jpg", "02.jpg"] {
+            image::RgbImage::new(2, 3).save(folder.join(name)).unwrap();
+        }
+        app.settings.browser_view_output_dir = Some(folder.clone());
+        app.settings.default_spread_mode = SpreadMode::RtlCover;
+        app.settings.apply_default_spread_to_plain_folders = true;
+        app.load_folder(folder.clone());
+        app.finish_page_identity_preparation_for_test();
+        let source = app.spread_presentation_source.clone();
+        assert_eq!(
+            source,
+            SpreadPresentationSource::PhysicalDirectory {
+                key: folder.clone()
+            }
+        );
+        app.activate_snapshot(SnapshotSourceLabel::Mixed);
+        drain_snapshot_identity_preparation(&mut app);
+        let pdf = folder.join("child.pdf");
+        app.start_loading_items(
+            pdf.clone(),
+            vec![GridItem::PdfPage {
+                pdf_path: pdf.clone(),
+                page_num: 0,
+                content_type: None,
+            }],
+            vec![None],
+            Default::default(),
+            Vec::new(),
+            None,
+        );
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(
+            app.spread_presentation_source,
+            SpreadPresentationSource::Other
+        );
+        assert_eq!(
+            app.persist_spread_presentation(
+                SpreadMode::Ltr,
+                ReadingFlow::Paged,
+                ReadingDirection::Ltr
+            )
+            .unwrap(),
+            crate::ui_fullscreen::SpreadPresentationPersistence::Saved
+        );
+        assert!(app.snapshot_return_to_list_view());
+        assert_eq!(app.current_folder.as_ref(), Some(&folder));
+        assert_eq!(app.spread_presentation_source, source);
+        app.deactivate_snapshot();
+        assert_eq!(app.spread_presentation_source, source);
+        assert!(app.apply_fullscreen_spread_mode(&egui::Context::default(), 0, SpreadMode::Ltr));
+        assert_eq!(app.spread_mode, SpreadMode::Ltr);
+        assert_eq!(
+            app.spread_db
+                .as_ref()
+                .unwrap()
+                .get_state_with_fallback(&folder, None),
+            crate::spread_db::StoredSpreadState::default()
+        );
+        assert_eq!(
+            app.spread_db
+                .as_ref()
+                .unwrap()
+                .get_state_with_fallback(&pdf, None)
+                .mode,
+            Some(SpreadMode::Ltr)
+        );
+        app.load_folder(folder);
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.spread_mode, SpreadMode::Single);
     }
 }

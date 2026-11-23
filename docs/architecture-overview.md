@@ -1,5 +1,15 @@
 # アーキテクチャ概観
 
+## ブラウザ閲覧の保存先のページ構成（§1.870）
+
+`browser_view_policy` は保存先の根と実フォルダの走査元情報だけで対象を判定する。
+既定の根は `run()` が UI / Remote reader の起動前に一度解決し、判定側は保持値だけを読む。
+実フォルダの保存キーは viewer context と snapshot の表示状態に属し、swap / fork で引き継ぐ。
+対象のページ構成は読み込み時に NON_BOOK とし、表示操作では保存行とお気に入り既定を変えない。
+Remote は検証 worker の実フォルダ情報を内部 queue で運び、UI 保存の振り分け前に断る。
+wire と永続形式、detached の述語・viewport・窓の寿命は変更しない。
+詳細は [採択設計と実装記録](browser-view-single-page-plan.md)。
+
 ## AI による使い方案内と設定・お気に入りの変更（§1.843）
 
 `crates/mcp-server` はビルド時にマニュアルの本文を埋め込み、`search_help` / `get_help` を

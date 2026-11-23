@@ -3336,6 +3336,14 @@ SourceURL と画像候補のある HTML を検出して小窓へ通知する。�
   既定の保存先基底は Windows のピクチャ配下の `mimageviewer\browser`。
   保存する月の `YYYY-MM` フォルダは中継 exe が作る。保存先の正本は Settings、
   中継 exe の `config.json` は登録時に作る投影とする。
+- 保存先の根自身と配下の実フォルダ一覧は、連携の ON/OFF・本扱い・全体既定・既存保存行に
+  関係なく Single / Paged / Ltr で開き、ページ構成を記憶しない。その場の変更はデスクトップだけで
+  有効とし、お気に入り既定へ広げない。既存行は削除せず、末尾表紙等の他の値は従来どおり扱う。
+  根の下の ZIP/PDF と構成が表示設定を所有する本は対象外。メタデータ取り込み後もその場の
+  ページ構成を保持する。保存先変更は保存判定に即時反映し、初期表示には次の読み込みから反映する。
+  Remote は保存行のページ構成を無視し、ページ構成の書き込みを Unsupported で断る。
+  既定の根は GUI 起動前に Pictures の既知フォルダを DONT_VERIFY で一度解決して保持し、
+  判定では同期 I/O を行わない。詳細は [§1.870 設計](browser-view-single-page-plan.md)。
 - 登録を変更できるのは、通常版を launcher から起動した、既定の
   `%APPDATA%\mimageviewer` profile だけ。portable、明示 `--data-dir`、launcher 不明の起動では
   既存の登録も変更しない。インストールしただけでは登録しない。

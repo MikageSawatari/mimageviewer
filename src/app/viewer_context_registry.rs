@@ -2047,6 +2047,7 @@ pub(in crate::app) struct ViewerContextBundle {
     current_folder_last_mtime: Option<std::time::SystemTime>,
     current_folder_signature: Option<folder_scan::FolderScanSignature>,
     folder_observation: Option<FolderObservation>,
+    spread_presentation_source: super::SpreadPresentationSource,
     current_folder_watch: Option<CurrentFolderWatch>,
     current_folder_watch_failed: Option<PathBuf>,
     external_rescan_pending: Option<ExternalRescanPending>,
@@ -3368,6 +3369,7 @@ impl ViewerContextBundle {
             current_folder_last_mtime: None,
             current_folder_signature: None,
             folder_observation: None,
+            spread_presentation_source: super::SpreadPresentationSource::Other,
             current_folder_watch: None,
             current_folder_watch_failed: None,
             external_rescan_pending: None,
@@ -3808,6 +3810,7 @@ impl App {
             current_folder_last_mtime,
             current_folder_signature,
             folder_observation,
+            spread_presentation_source,
             current_folder_watch,
             current_folder_watch_failed,
             external_rescan_pending,
@@ -4138,6 +4141,7 @@ impl App {
         swap_field!(current_folder_last_mtime);
         swap_field!(current_folder_signature);
         swap_field!(folder_observation);
+        swap_field!(spread_presentation_source);
         swap_field!(current_folder_watch);
         swap_field!(current_folder_watch_failed);
         swap_field!(external_rescan_pending);
@@ -4589,6 +4593,7 @@ impl App {
             current_folder_last_mtime,
             current_folder_signature,
             folder_observation,
+            spread_presentation_source,
             current_folder_watch,
             current_folder_watch_failed,
             external_rescan_pending,
@@ -4841,6 +4846,7 @@ impl App {
             current_folder_last_mtime,
             current_folder_signature,
             folder_observation,
+            spread_presentation_source,
             top_level_grid_view,
             snapshot,
             global_search_subfolder_restore,
@@ -5125,6 +5131,10 @@ impl App {
             self.visible_indices = std::mem::take(&mut snapshot.saved_visible_indices);
             self.page_identity_index = snapshot.saved_page_identity_index.clone();
             self.projection_recipe = snapshot.saved_projection_recipe.clone();
+            self.spread_presentation_source = snapshot
+                .saved_viewing_state
+                .spread_presentation_source
+                .clone();
             self.grid_scroll
                 .set_position(snapshot.saved_scroll_offset_y);
             self.zip_nav = snapshot.saved_zip_nav.take();
@@ -5184,6 +5194,7 @@ impl App {
         detached.view_trim_book_settings = self.view_trim_book_settings.clone();
         detached.view_trim_page_overrides = self.view_trim_page_overrides.clone();
         detached.spread_mode = self.spread_mode;
+        detached.spread_presentation_source = self.spread_presentation_source.clone();
         detached.final_cover_spread_preference = self.final_cover_spread_preference;
         detached.singleton_spread_endpoint_preferences = self.singleton_spread_endpoint_preferences;
         detached.page_alone_preferences = self.page_alone_preferences;

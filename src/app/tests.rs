@@ -1096,6 +1096,8 @@ mod pdf_render_epoch;
 #[path = "tests/notification_duration.rs"]
 mod notification_duration;
 
+#[path = "tests/browser870.rs"]
+mod browser870;
 #[path = "tests/plain_folder_spread.rs"]
 pub(crate) mod plain_folder_spread;
 mod resident_edit_material;

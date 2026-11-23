@@ -181,6 +181,25 @@ pub fn pictures_dir() -> Option<PathBuf> {
     known_folder_or_userprofile("Pictures", KnownFolder::Pictures)
 }
 
+/// Startup-only browser policy resolution. Do not verify existence or fall back
+/// to USERPROFILE: failure leaves the default output root unavailable.
+#[cfg(windows)]
+pub(crate) fn pictures_dir_unverified() -> Option<PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_Pictures, KF_FLAG_DONT_VERIFY, SHGetKnownFolderPath};
+    unsafe {
+        let value = SHGetKnownFolderPath(&FOLDERID_Pictures, KF_FLAG_DONT_VERIFY, None).ok()?;
+        let path = value.to_string().ok().map(PathBuf::from);
+        CoTaskMemFree(Some(value.0 as *const core::ffi::c_void));
+        path
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn pictures_dir_unverified() -> Option<PathBuf> {
+    None
+}
+
 pub fn downloads_dir() -> Option<PathBuf> {
     known_folder_or_userprofile("Downloads", KnownFolder::Downloads)
 }

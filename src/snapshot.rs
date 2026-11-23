@@ -487,6 +487,7 @@ impl Default for FilterState {
 /// The shift owner uses the saved book/row basis, rather than the extracted subset basis.
 #[derive(Debug, PartialEq)]
 pub(crate) struct SnapshotViewingState {
+    pub spread_presentation_source: crate::app::SpreadPresentationSource,
     pub mode: crate::settings::SpreadMode,
     pub direction: crate::settings::ReadingDirection,
     pub flow: crate::settings::ReadingFlow,
@@ -500,6 +501,7 @@ pub(crate) struct SnapshotViewingState {
 impl Clone for SnapshotViewingState {
     fn clone(&self) -> Self {
         Self {
+            spread_presentation_source: self.spread_presentation_source.clone(),
             mode: self.mode,
             direction: self.direction,
             flow: self.flow,

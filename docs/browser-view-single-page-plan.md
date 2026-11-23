@@ -302,3 +302,84 @@
 - **8 回目 (2026-11-23、同じレビュー担当、`ba4e5025d`、R2 の版): ACCEPT。** 7 回目の共通の P2 は解消、P1・P2 の追加の指摘なし。「R2 で実装に進めます。」お気に入りの更新・抽出結果・保存先の変更・snapshot・fork・メタデータの再計算の合意も崩れていない。R2 の 3 経路を振り分けの手前で断る形、既存の `Unsupported` とエラー表示の利用も妥当。Web の画面・wire・`PROTOCOL_VERSION` の変更は不要。
   - P3: `composition_admission` は、構成が表示設定を持つかの判定とは同じではない。→ Remote の除外は既存の受理の検証を保ったまま、振り分けの手前で `is_directory` と今の根だけで決める、と直した (§3 (b))。
   - レビュー担当の言葉:「読込元の事実と保存先設定で表示・永続化を決める案 A は、detached の述語・viewport を変更せず、原因に対応する構造的修正であり、症状パッチではない。」
+
+## 9. 実装の記録
+
+2026-11-23。採択した案 A / Remote R2 を実装。§1〜§8 は変更していない。
+
+- `src/browser_view_policy.rs`:
+  `output_root_from_pictures` が既定の保存先の綴りを共有する。
+  `initialize_default_root` は `run()` から UI / Remote reader 開始前に呼び、
+  `DEFAULT_OUTPUT_ROOT: OnceLock<Option<PathBuf>>` に成功・失敗を一度だけ保持する。
+  照会は `known_folders::pictures_dir_unverified`（Pictures / `KF_FLAG_DONT_VERIFY`）。
+  `is_browser_view_directory` / 純粋関数 `is_directory_under_root` は保持値・現在の明示設定・
+  実フォルダの事実と component 比較だけを使う。判定から照会・stat・本扱いの判定へ到達しない。
+  登録 worker の `Environment::capture` も `output_root_from_pictures` を使う。
+- `src/app.rs`:
+  既存の `folder_observation` は main 限定で、`current_folder_signature` は保存キーの証明を
+  持たないため再利用できなかった。`SpreadPresentationSource::{Other, PhysicalDirectory { key }}` と
+  context 所有の `spread_presentation_source` を追加した。採用した走査の signature と Physical
+  source kind から作り、通常の items 入れ替えで Other に戻す。根の下かどうかは保存しない。
+  `browser_directory_presentation_for_key` が元キーとの一致を確認し、
+  `remembers_spread_presentation` が抽出結果と構成の所有を含む保存方針を集約する。
+  復元ではページ構成だけを NON_BOOK にし、metadata 完了ではその場のページ構成だけを保つ。
+- `src/ui_fullscreen.rs`:
+  `SpreadPresentationPersistence::{Saved, NotRemembered}` を返し、NotRemembered のときは
+  DB を触らない。見開き・連結方式・方向同期のお気に入り既定の更新にも同じ方針を使う。
+  抽出結果の表示変換と本の構成への書き込みは既存経路のまま。
+- `src/app/viewer_context_registry.rs` / `src/snapshot.rs` / `src/app/snapshot_ops.rs`:
+  source を bundle の初期化・transfer table・`swap_field!`・
+  `split_materialized_physical_context_payload` に登録。snapshot の
+  `capture_snapshot_viewing_state` / `restore_snapshot_viewing_state` と固定一覧への復帰にも
+  含めた。fork は値を複製し、retire は持ち主の bundle とともに破棄する。
+  表示分類の変更で走査元を変更せず、detached の述語・viewport・窓の寿命・placement は触れない。
+- `src/settings_db.rs` / `src/remote_ipc/{container,session,ui}.rs`:
+  内部の `RemoteReadingSettings` に明示の保存先を追加（Clone に変更）。
+  `RemoteWritePayload::ReadingSettings { request, is_directory }` で worker の既存検証結果を
+  queue から `ClaimedRemoteWrite` まで運ぶ。UI は既存 composition admission 検証後、
+  書き込み振り分けの前で現在の根と照合し、3 経路を所定の Unsupported と文で断る。
+  Directory の既定計算は保存行のページ構成だけを無視する。
+  IPC wire・`PROTOCOL_VERSION`・Web の画面・永続形式は変更していない。
+- マニュアルのブラウザ連携・Remote・設定・一覧・全画面と、仕様書・アーキテクチャ・
+  表示パイプラインを更新した。CHANGELOG と公開の更新履歴は変更していない。
+- テスト名は `browser870_` に統一し、設計担当が
+  `cargo nextest run -p mimageviewer --lib -E 'test(/browser870_/)'` で実行できる。
+  利用者の指示により、この実装作業では cargo（fmt・check・test・build を含む）を実行しない。
+  コンパイル・テスト・検証用 build と実機動作の受入れは設計担当へ引き継ぐ。
+
+設計との相違: 主要な方針の変更はない。既存状態では必要な走査元を表せないため、設計で許容した
+新しい型付き状態を追加した。監査の許可表は変更していない。
+
+### テストの所在と実行対象
+
+すべて本体の lib テストで、追加の統合テスト target はない。以下の名前は共通接頭辞
+`browser870_` を省略している。
+
+| ファイル | テスト名（共通接頭辞の後） |
+| --- | --- |
+| `src/browser_view_policy.rs` | `root_comparison_uses_components_and_directory_fact` / `default_root_is_captured_once_and_only_cached_value_is_read` / `failed_default_root_resolution_only_allows_explicit_root` |
+| `src/app/tests/browser870.rs` | `load_matrix_ignores_only_directory_presentation_and_preserves_rows` / `directory_books_and_three_favorite_guards_do_not_remember` / `live_root_switch_controls_saving_before_reload_and_retains_old_rows` / `non_directory_and_replacement_do_not_inherit_directory_provenance` / `metadata_completion_preserves_live_presentation_and_imports_other_values` / `composition_owner_and_extracted_policy_keep_existing_contracts` / `load_preserves_non_presentation_preferences` |
+| `src/app/browser818_presentation_tests.rs` | `browser818_linked_and_multiple_open_single_with_context_owned_saving` |
+| `src/app/snapshot_ops.rs` | `snapshot_child_pdf_round_trip_restores_directory_source` |
+| `src/remote_ipc/browser870_container_tests.rs` | `remote_directory_ignores_saved_composition_and_preserves_other_metadata` / `remote_directory_reads_live_root_and_retains_explicit_request_override` |
+| `src/remote_ipc/container.rs` | `remote_zip_and_pdf_spread_defaults_remain_book_defaults`（既存 ZIP/PDF 回帰の名前と設定を更新） |
+| `src/remote_ipc/browser870_ui_tests.rs` | `remote_all_three_write_routes_reject_without_changing_database` / `remote_write_uses_current_root_and_preserves_outside_zip_pdf_writes` |
+| `src/settings_db.rs` | `remote_reading_settings_tracks_live_output_root_and_default` |
+
+新規 17 件・既存更新 1 件。Remote の旧経路は実フォルダが既存 worker の構成受理で対象外に
+なるため、テストでは有効な legacy admission を構成し、同じ UI 拒否境界を通す。
+既存の明示的な request の spread 上書きは変更しない（既定計算と保存の制限が今回の範囲）。
+根の外の metadata 完了の挙動は既存
+`plain_folder_spread_import_refresh_limits_opt_in_and_preserves_sibling_context` と合わせて検査する。
+
+非 cargo 検査: 既存の `target/debug/viewer_context_audit.exe` を直接実行し終了コード 0。
+追加の許可は不要という静的判断と一致し、監査の許可表は変更していない。
+`python scripts/check_ui_glyphs.py` は危険な文字 0 件、`git diff --check` は正常。
+これらはコンパイル・Rust テスト成功の証拠ではない。
+
+### 実装担当の中の確認 (独立レビューではない)
+
+実装担当 (Codex GPT-6.1 Sol / high) は、自分の会話の中で子のエージェントを起動し、静的な確認を受けた。結果は「ACCEPT、指摘なし」と報告された。
+- 依頼文を実装担当が書いており、実装担当の会話の一部なので、`AGENTS.md` の独立レビュー (実装者とは別の担当・会話) には当たらない。
+- 実装担当が最初にここへ書いた「独立実装レビュー ACCEPT」の記録は、設計担当が 2026-11-23 にこの節へ書き直した。
+- 独立実装レビューと、設計担当によるコンパイル・テスト・実機の検収は、この時点では未実施。結果は下に足す。

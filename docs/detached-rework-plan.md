@@ -8171,3 +8171,27 @@ fork 先は空、元 context は cache と proof を保持する。detached の�
   - NG-1 のダブル・トリプルクリックは、本番の repaint context を設定してテストした。
   - 修正前の挙動では、関門の前の新テスト 7 件がすべて失敗した。
   - 実機は未確認。正本は [フォルダツリーの更新の計画](folder-tree-refresh-plan.md) §14.9。
+
+### ブラウザ閲覧の保存先のページ構成（2026-11-23、§1.870）
+
+- 正本は [ブラウザ閲覧の単ページ設計](browser-view-single-page-plan.md) §3〜§6 と実装記録 §9。
+  案 A / Remote R2 の採択済み設計に従い、保存先の根と配下の実フォルダ一覧は NON_BOOK で開き、
+  デスクトップのその場の選択はページ構成の保存行とお気に入り既定へ書き込まない。
+- `SpreadPresentationSource` は受理済み走査の保存キーだけを持つ context 所有の事実。
+  既存 bundle の初期化・transfer table・swap と materialized fork に機械的に追加し、
+  fork では複製、retire では bundle とともに破棄する。根の下かどうかは保持せず、
+  毎回、現在の設定とパスだけから決める。
+- snapshot の表示状態に同じ事実を含め、capture / restore・固定一覧への復帰・解除で元 rows と
+  同時に復元する。DirectMedia の表示設定を維持する既存の解除分岐でも、走査元は元 rows に揃える。
+  DirectMedia fork で main の saved rows に戻す経路にも同じ復元を加えた。
+- detached の述語・viewport の選択と配送・窓の寿命・placement は変更していない。
+  窓の種類による分岐、guard・delay・retry・一括 reset・silent fallback は追加していない。
+- 設計担当 ClaudeCode の採択設計と 8 回目の独立設計レビューは、読込元の事実と保存先設定で
+  表示・永続化を決める案 A が症状パッチではない構造的修正であることに合意済み（正本 §7〜§8）。
+  実装担当が自分の会話の中で起動した子のエージェントの確認は「ACCEPT」と報告されたが、独立レビューには当たらない
+  (実装担当が最初に書いた「独立実装レビュー ACCEPT」の記録を、設計担当が書き直した)。
+  実装後の独立レビュー (実装者とは別の GPT-6.1 Sol / xhigh) は未実施。結果をここに足す。
+- 検証: browser870 の lib テスト 17 件追加・既存 1 件更新（fork・兄弟 context・★固定往復を含む）。
+  既存 `target/debug/viewer_context_audit.exe` の直接実行は終了コード 0、許可表の追加変更なし。
+  UI glyph lint と `git diff --check` は正常。利用者の明示指示により cargo・Rust テスト・fmt・
+  build・実機起動は未実行。設計担当によるコンパイル・テスト・実機の検収へ引き継ぐ。
