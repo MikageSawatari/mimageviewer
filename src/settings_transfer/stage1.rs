@@ -445,6 +445,18 @@ impl Stage1Value for NotificationDuration {
         ])
     }
 }
+impl Stage1Value for FullscreenPrimaryClickMode {
+    fn candidates() -> Option<Vec<(Self, String)>> {
+        // 表示名は環境設定のラジオボタンと同じ。
+        Some(vec![
+            (Self::PageTurn, "クリックでページを送る (既定)".into()),
+            (
+                Self::DoubleClickClose,
+                "クリックでは送らず、ダブルクリックで閉じる".into(),
+            ),
+        ])
+    }
+}
 impl Stage1Value for PageTurnAnimationStyle {
     fn candidates() -> Option<Vec<(Self, String)>> {
         // 表示名は環境設定のラジオボタンと同じ。
@@ -1110,6 +1122,60 @@ mod tests {
             .is_err()
         );
     }
+    #[test]
+    fn stage1_fullscreen_primary_click_choices_and_validation_match_preferences() {
+        let rows = capture_stage1(&default_settings(), false, false);
+        let row = rows
+            .iter()
+            .find(|row| row.key == "fullscreen_primary_click")
+            .unwrap();
+        assert_eq!(row.value, json!("page_turn"));
+        assert_eq!(
+            row.choices
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|choice| (choice.value.clone(), choice.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (json!("page_turn"), "クリックでページを送る (既定)"),
+                (
+                    json!("double_click_close"),
+                    "クリックでは送らず、ダブルクリックで閉じる"
+                ),
+            ]
+        );
+        for (wire, expected) in [
+            ("page_turn", FullscreenPrimaryClickMode::PageTurn),
+            (
+                "double_click_close",
+                FullscreenPrimaryClickMode::DoubleClickClose,
+            ),
+        ] {
+            let candidate = stage1_validate(
+                &default_settings(),
+                &change("fullscreen_primary_click", json!(wire)),
+            )
+            .unwrap();
+            assert_eq!(candidate.fullscreen_primary_click, expected);
+        }
+        for invalid in [
+            json!("future_mode"),
+            json!("DoubleClickClose"),
+            json!(true),
+            json!(0),
+            Value::Null,
+        ] {
+            assert!(
+                stage1_validate(
+                    &default_settings(),
+                    &change("fullscreen_primary_click", invalid),
+                )
+                .is_err()
+            );
+        }
+    }
+
     #[test]
     fn stage1_export_null_acceptance_matches_import_for_every_key() {
         let mut settings = default_settings();

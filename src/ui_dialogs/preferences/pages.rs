@@ -2469,6 +2469,21 @@ pub(super) fn draw_video_normal_wheel_action_settings(
 }
 
 pub(super) fn page_mouse_buttons(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.label(egui::RichText::new("閲覧中の左クリック").strong());
+    ui.radio_value(
+        &mut state.settings.fullscreen_primary_click,
+        crate::settings::FullscreenPrimaryClickMode::PageTurn,
+        "クリックでページを送る (既定)",
+    );
+    ui.radio_value(
+        &mut state.settings.fullscreen_primary_click,
+        crate::settings::FullscreenPrimaryClickMode::DoubleClickClose,
+        "クリックでは送らず、ダブルクリックで閉じる",
+    );
+    ui.small("画像の閲覧中のマウスの左クリックに適用します。動画・編集中・360 度表示のクリックと、タッチのタップは変わりません。拡大・移動・回転した表示では、ダブルクリックでまず表示を戻します。");
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(8.0);
     ui.small("戻る/進むボタンは、リングショートカットと同じ単発アクションから選べます。");
     ui.small("割り当てはグリッド、画像フルスクリーン、動画フルスクリーンで別々に保存します。");
     ui.add_space(8.0);

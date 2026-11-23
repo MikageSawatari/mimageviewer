@@ -5221,11 +5221,87 @@ mod tests {
         assert_eq!(value, r#""future_style""#);
     }
 
+    #[test]
+    fn fullscreen_primary_click_roundtrip_and_missing_key() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let settings = Settings {
+            fullscreen_primary_click: FullscreenPrimaryClickMode::DoubleClickClose,
+            grid_cols: 7,
+            ..Settings::default()
+        };
+        db.save_full(&settings).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().fullscreen_primary_click,
+            FullscreenPrimaryClickMode::DoubleClickClose
+        );
+        let stored: String = db
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT value FROM settings_kv WHERE key = 'fullscreen_primary_click'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, r#""double_click_close""#);
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'fullscreen_primary_click'",
+                [],
+            )
+            .unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(
+            loaded.fullscreen_primary_click,
+            FullscreenPrimaryClickMode::PageTurn
+        );
+        assert_eq!(loaded.grid_cols, 7);
+    }
+
+    #[test]
+    fn fullscreen_primary_click_unknown_value_returns_incompatible_without_rewriting() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "UPDATE settings_kv SET value = ?1 WHERE key = 'fullscreen_primary_click'",
+                [r#""future_mode""#],
+            )
+            .unwrap();
+        assert!(matches!(
+            db.load_into_settings(),
+            Err(SettingsDbError::Incompatible(_))
+        ));
+        let value: String = db
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT value FROM settings_kv WHERE key = 'fullscreen_primary_click'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, r#""future_mode""#);
+    }
+
     use super::*;
     use crate::external_tool::{
         ExternalToolLaunch, PayloadPolicy, SelectionPolicy, SpreadPolicy, VideoPolicy, next_id,
     };
-    use crate::settings::{LegacyOpenWithApp, PageTurnAnimationStyle, Settings, SortOrder, TagDef};
+    use crate::settings::{
+        FullscreenPrimaryClickMode, LegacyOpenWithApp, PageTurnAnimationStyle, Settings, SortOrder,
+        TagDef,
+    };
     use std::collections::HashMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
