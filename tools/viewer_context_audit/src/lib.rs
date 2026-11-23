@@ -398,6 +398,19 @@ const PUBLIC_API_ALLOWLIST: &[&str] = &[
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn retire_context < D > (& mut self , id : ViewerContextId , _reason : & 'static str , digest : impl FnOnce (ContextMut < '_ >) -> D ,) -> Result < D , RetireError >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn close_and_retire_context < D > (& mut self , id : ViewerContextId , reason : & 'static str , finish : impl FnOnce (& mut Self) , digest : impl FnOnce (ContextMut < '_ >) -> D ,) -> Result < D , RetireContextError >",
     "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn stash_mounted_and_start_fresh (& mut self , _reason : & 'static str ,) -> ViewerContextId",
+    // 1.818 stage 3 (5f631f116): the close owner (window purpose and reason) is captured as a
+    // value before the window is removed; the plain retire/close-and-retire wrappers above capture
+    // it and delegate. Same single-context retire as those; no new detached bool/Option, no sibling
+    // mutation. Structural agreement: detached-rework-plan.md section 11, 2026-11-22.
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn retire_context_with_close_owner < D > (& mut self , id : ViewerContextId , _reason : & 'static str , close_owner : Option < super :: DetachedCloseOwner > , digest : impl FnOnce (ContextMut < '_ >) -> D ,) -> Result < D , RetireError >",
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn close_and_retire_context_with_close_owner < D > (& mut self , id : ViewerContextId , reason : & 'static str , owner : Option < super :: DetachedCloseOwner > , finish : impl FnOnce (& mut Self) , digest : impl FnOnce (ContextMut < '_ >) -> D ,) -> Result < D , RetireContextError >",
+    // 1.818 stage 4 (b92b6e243): a new materialized still context mounts only itself once to bind
+    // its own window with the creation seed (placement / BrowserView purpose); the plain fork above
+    // is unchanged. Structural agreement: detached-rework-plan.md section 11, 2026-11-22.
+    "inherent fn # [cfg (windows)]   App ::  pub (in crate :: app) fn fork_materialized_still_context_with_seed (& mut self , physical_context : & Path , idx : usize , seed : super :: DetachedWindowSeed ,) -> ViewerContextId",
+    // 1.851 (b5057ecca): read-only check that a collection grid request stamp still matches the
+    // mounted or at-rest context's own grid view and items generation; no mount or mutation.
+    "inherent fn # [cfg (windows)]  < 'a > ContextRef < 'a > ::  pub (in crate :: app) fn collection_grid_request_stamp_is_current (self , context_id : ViewerContextId , stamp : top_level_grid_view :: CollectionGridRequestStamp ,) -> bool",
 ];
 
 /// Violations that are real, understood, and deliberately not fixed yet.

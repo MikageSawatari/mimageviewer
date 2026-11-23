@@ -15,11 +15,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use regex::Regex;
-use rhai::{AST, Dynamic, Engine, Scope};
+use rhai::{
+    AST, Dynamic, Engine, EvalAltResult, FuncRegistration, ImmutableString, NativeCallContext,
+    Position, Scope,
+};
 
 use crate::filename_stack::StackMember;
 
@@ -167,9 +170,223 @@ fn ext_of(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+const SLEEP_ERROR: &str = "スタックのスクリプトでは sleep は使えません (処理が終わらなくなるため)";
+const EMPTY_PAD_ERROR: &str =
+    "スタックのスクリプトでは、空の文字列を詰める pad は使えません (処理が終わらなくなるため)";
+const SCRIPT_OUTPUT_LIMIT: usize = 20;
+const SCRIPT_OUTPUT_OMITTED: &str = "stack script print/debug: 21 行目以降は省略しました";
+
+/// Rhai 1.27 の文字列版 pad。進まない空文字のループだけを拒否し、サイズ検査も維持する。
+fn stack_pad_string(
+    ctx: NativeCallContext,
+    string: &mut ImmutableString,
+    len: rhai::INT,
+    padding: &str,
+) -> Result<(), Box<EvalAltResult>> {
+    if len <= 0 {
+        return Ok(());
+    }
+    let too_large = || {
+        Box::new(EvalAltResult::ErrorDataTooLarge(
+            "Length of string".to_string(),
+            Position::NONE,
+        ))
+    };
+    let len = usize::try_from(len).map_err(|_| too_large())?;
+    let max_size = ctx.engine().max_string_size();
+    if max_size > 0 && len > max_size {
+        return Err(too_large());
+    }
+    let mut str_len = string.chars().count();
+    if len <= str_len {
+        return Ok(());
+    }
+    if padding.is_empty() {
+        return Err(EvalAltResult::ErrorRuntime(EMPTY_PAD_ERROR.into(), Position::NONE).into());
+    }
+    let padding_len = padding.chars().count();
+    let text = string.make_mut();
+    while str_len < len {
+        if str_len + padding_len <= len {
+            text.push_str(padding);
+            str_len += padding_len;
+        } else {
+            text.extend(padding.chars().take(len - str_len));
+            str_len = len;
+        }
+    }
+    if max_size > 0 && string.len() > max_size {
+        return Err(too_large());
+    }
+    Ok(())
+}
+
+fn script_data_too_large(kind: &str) -> Box<EvalAltResult> {
+    EvalAltResult::ErrorDataTooLarge(kind.to_string(), Position::NONE).into()
+}
+
+/// Rhai 1.27 の data_check.rs と同じ総量。blob は入れ子のときだけ 1 を加える。
+fn stack_data_sizes(value: &Dynamic, top: bool) -> (usize, usize, usize) {
+    if value.is_shared() {
+        // Rhai と同じく最上位の Shared だけを開く。内部要素の Shared は言語側の不変条件違反。
+        assert!(top, "入れ子のデータに Shared は含まれない");
+        return stack_data_sizes(&value.read_lock::<Dynamic>().unwrap(), true);
+    }
+    if value.is_array() {
+        return stack_array_sizes(&value.as_array_ref().unwrap());
+    }
+    if value.is_blob() {
+        return (
+            value
+                .as_blob_ref()
+                .unwrap()
+                .len()
+                .saturating_add(usize::from(!top)),
+            0,
+            0,
+        );
+    }
+    if value.is_map() {
+        let map = value.as_map_ref().unwrap();
+        return map
+            .values()
+            .fold((0usize, map.len(), 0usize), |(a, m, s), value| {
+                let (ax, mx, sx) = stack_data_sizes(value, false);
+                (
+                    a.saturating_add(ax),
+                    m.saturating_add(mx),
+                    s.saturating_add(sx),
+                )
+            });
+    }
+    if value.is_string() {
+        return (0, 0, value.as_immutable_string_ref().unwrap().len());
+    }
+    (0, 0, 0)
+}
+
+fn stack_array_sizes(array: &rhai::Array) -> (usize, usize, usize) {
+    array
+        .iter()
+        .fold((array.len(), 0usize, 0usize), |(a, m, s), value| {
+            let (ax, mx, sx) = stack_data_sizes(value, false);
+            (
+                a.saturating_add(ax),
+                m.saturating_add(mx),
+                s.saturating_add(sx),
+            )
+        })
+}
+
+/// 長さを先に検査し、標準 pad の総量計算があふれて resize に進むのを防ぐ。
+fn stack_pad_array(
+    ctx: NativeCallContext,
+    array: &mut rhai::Array,
+    len: rhai::INT,
+    item: Dynamic,
+) -> Result<(), Box<EvalAltResult>> {
+    let Ok(len) = usize::try_from(len) else {
+        return Ok(());
+    };
+    if len <= array.len() {
+        return Ok(());
+    }
+    let engine = ctx.engine();
+    let max_array = engine.max_array_size();
+    if max_array > 0 {
+        if len > max_array {
+            return Err(script_data_too_large("Size of array/BLOB"));
+        }
+        let pad = len - array.len();
+        let (a, m, s) = stack_array_sizes(array);
+        let (ax, mx, sx) = stack_data_sizes(&item, true);
+        // 通常の上限内ではあふれないが、ホスト側で上限を変えても折り返さない。
+        let a = a.saturating_add(pad).saturating_add(ax.saturating_mul(pad));
+        let m = m.saturating_add(mx.saturating_mul(pad));
+        let s = s.saturating_add(sx.saturating_mul(pad));
+        // 複数の上限を超えたときのエラーの優先順も Rhai に合わせる。
+        if engine.max_string_size() > 0 && s > engine.max_string_size() {
+            return Err(script_data_too_large("Length of string"));
+        }
+        if a > max_array {
+            return Err(script_data_too_large("Size of array/BLOB"));
+        }
+        if engine.max_map_size() > 0 && m > engine.max_map_size() {
+            return Err(script_data_too_large("Size of object map"));
+        }
+    }
+    array.resize(len, item);
+    Ok(())
+}
+
+/// 出力先の配線はここに集約する。親フォルダごとの呼び出しでも同じ計算の枠を共有する。
+fn install_script_output(engine: &mut Engine, sink: impl Fn(String) + Send + Sync + 'static) {
+    let count = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::new(sink);
+    let print_count = Arc::clone(&count);
+    let print_sink = Arc::clone(&sink);
+    engine.on_print(move |text| {
+        emit_script_output(&print_count, &*print_sink, "stack script print: ", text);
+    });
+    engine.on_debug(move |text, source, position| {
+        emit_script_output(
+            &count,
+            &*sink,
+            &format!(
+                "stack script debug: {} @ {position} > ",
+                source.unwrap_or("<none>")
+            ),
+            text,
+        );
+    });
+}
+
+fn emit_script_output(count: &AtomicUsize, sink: &impl Fn(String), prefix: &str, text: &str) {
+    // 複数行の print でも実際のログ行数で数える。空の print も 1 行分を使う。
+    for line in text.split('\n') {
+        match count.fetch_add(1, Ordering::Relaxed) {
+            n if n < SCRIPT_OUTPUT_LIMIT => {
+                sink(format!("{prefix}{}", line.trim_end_matches('\r')))
+            }
+            SCRIPT_OUTPUT_LIMIT => sink(SCRIPT_OUTPUT_OMITTED.to_string()),
+            _ => break,
+        }
+    }
+}
+
 /// サンドボックス済みエンジンを作る。
 fn build_engine() -> Engine {
     let mut engine = Engine::new();
+    // global namespace は標準パッケージより優先される。同じ引数型を登録し、
+    // 関数ポインタ経由も含めて native 内で止まる呼び出しを実行時エラーにする。
+    FuncRegistration::new("sleep")
+        .with_purity(true)
+        .with_volatility(true)
+        .register_into_engine(
+            &mut engine,
+            |_: rhai::INT| -> Result<(), Box<EvalAltResult>> {
+                Err(EvalAltResult::ErrorRuntime(SLEEP_ERROR.into(), Position::NONE).into())
+            },
+        );
+    FuncRegistration::new("sleep")
+        .with_purity(true)
+        .with_volatility(true)
+        .register_into_engine(
+            &mut engine,
+            |_: rhai::FLOAT| -> Result<(), Box<EvalAltResult>> {
+                Err(EvalAltResult::ErrorRuntime(SLEEP_ERROR.into(), Position::NONE).into())
+            },
+        );
+    // register_fn の既定の pure では定数への変更が許されるため、標準と同じ非 pure にする。
+    FuncRegistration::new("pad")
+        .with_purity(false)
+        .with_volatility(false)
+        .register_into_engine(&mut engine, stack_pad_string);
+    FuncRegistration::new("pad")
+        .with_purity(false)
+        .with_volatility(false)
+        .register_into_engine(&mut engine, stack_pad_array);
+    install_script_output(&mut engine, |line| crate::logger::log(line));
     // 暴走 backstop (自動実行されるユーザースクリプト用)。実測 (perf_10k) では native
     // ヘルパー化後の 100k camera で ~数百万 op なので、100M はその ~30 倍の余裕。無限ループ
     // 等は確実に止めつつ、10 万件の正当な処理は通す。スクリプトはワーカーで走るので UI は
@@ -347,6 +564,435 @@ fn run_group_function(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn within_timeout<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(work());
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("スタックスクリプトが 10 秒以内に戻ること")
+    }
+
+    fn assert_script_runtime_error(body: &str, expected: &str) {
+        let source = format!("fn group(files) {{ {body}; [] }}");
+        let error = within_timeout(move || group_keys(&[], &source).err())
+            .expect("危ない標準関数は Err になること");
+        assert!(error.contains("スクリプトの実行に失敗:"), "{error}");
+        assert!(error.contains(expected), "{error}");
+    }
+
+    // 修正前と同じエンジンとキャンセルの間引き。native に入ったあとでは
+    // 小さい操作上限もキャンセルも効かないことを、破壊的な確認でのみ使用する。
+    fn legacy_engine(cancel: Arc<AtomicBool>) -> Engine {
+        let mut engine = Engine::new();
+        engine.set_max_operations(100_000_000);
+        engine.set_max_call_levels(64);
+        engine.set_max_expr_depths(64, 64);
+        engine.set_max_string_size(256 * 1024 * 1024);
+        engine.set_max_array_size(8_000_000);
+        engine.set_max_map_size(8_000_000);
+        engine.disable_symbol("eval");
+        engine.disable_symbol("import");
+        engine.on_progress(move |ops| {
+            if ops & 0xFFFF == 0 && cancel.load(Ordering::Relaxed) {
+                Some(Dynamic::UNIT)
+            } else {
+                None
+            }
+        });
+        engine
+    }
+
+    fn assert_legacy_native_does_not_return(source: &'static str) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut engine = legacy_engine(worker_cancel);
+            // native 呼び出しまで届く小ささ。上限超過の検査自体は別の常設テストで確認する。
+            engine.set_max_operations(64);
+            engine.register_fn("enter_native", move || entered_tx.send(()).unwrap());
+            let result = engine.run(source);
+            let _ = done_tx.send(result.map_err(|e| e.to_string()));
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_secs(3)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+    }
+
+    #[test]
+    #[ignore = "修正前の停止確認専用。sleep 中のスレッドを残すため単独のプロセスで 1 回だけ実行"]
+    fn section1863_legacy_sleep_ignores_cancel_and_operation_limit() {
+        // join できないスレッドを残す。テストプロセス終了時に OS が回収する。
+        assert_legacy_native_does_not_return("enter_native(); sleep(3600);");
+    }
+
+    #[test]
+    #[ignore = "修正前の停止確認専用。pad が CPU 1 コアを回し続けるため単独のプロセスで 1 回だけ実行"]
+    fn section1863_legacy_empty_pad_ignores_cancel_and_operation_limit() {
+        // 無限ループのスレッドを残すので通常のテストに混ぜない。
+        assert_legacy_native_does_not_return(r#"enter_native(); "a".pad(5, "");"#);
+    }
+
+    #[test]
+    fn section1863_legacy_helper_enforces_operation_limit_for_script_loops() {
+        within_timeout(|| {
+            let mut engine = legacy_engine(Arc::new(AtomicBool::new(false)));
+            engine.set_max_operations(64);
+            assert!(matches!(
+                *engine.run("loop {}").unwrap_err(),
+                EvalAltResult::ErrorTooManyOperations(_)
+            ));
+        });
+    }
+
+    #[test]
+    fn section1863_legacy_script_loop_observes_cancel_and_terminates() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut engine = legacy_engine(worker_cancel);
+            engine.register_fn("enter_loop", move || entered_tx.send(()).unwrap());
+            let result = engine.run("enter_loop(); loop {}");
+            let terminated = matches!(result, Err(error) if matches!(*error, EvalAltResult::ErrorTerminated(_, _)));
+            let _ = done_tx.send(terminated);
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        assert!(done_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+    }
+
+    #[test]
+    fn section1863_string_pad_preserves_standard_const_rejection() {
+        within_timeout(|| {
+            // method 形は定数の変更として拒否される。関数形は定数の写しを渡すので
+            // 標準でもエラーにならず、定数は変わらない。
+            for (call, standard_rejects) in [
+                (r#"s.pad(5, "x")"#, true),
+                (r#"pad(s, 5, "x")"#, false),
+                (r#"s.pad(5, "")"#, true),
+                (r#"s.pad(1, "")"#, true),
+            ] {
+                let source = format!(r#"const s = "a"; {call}; s"#);
+                let mut standard_scope = Scope::new();
+                let mut stack_scope = Scope::new();
+                let standard = Engine::new()
+                    .eval_with_scope::<Dynamic>(&mut standard_scope, &source)
+                    .map_err(|e| e.to_string());
+                let actual = build_engine()
+                    .eval_with_scope::<Dynamic>(&mut stack_scope, &source)
+                    .map_err(|e| e.to_string());
+                // 空文字でも定数変更の拒否が先に働くので、危険な標準 pad には入らない。
+                assert_eq!(standard.is_err(), standard_rejects, "{source}");
+                assert_eq!(
+                    actual.map(|v| v.to_string()),
+                    standard.map(|v| v.to_string()),
+                    "{source}"
+                );
+                let standard_value = standard_scope.get_value::<ImmutableString>("s").unwrap();
+                assert_eq!(standard_value.as_str(), "a");
+                assert_eq!(
+                    stack_scope.get_value::<ImmutableString>("s"),
+                    Some(standard_value)
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn section1863_array_pad_rejects_overflow_lengths_without_panicking() {
+        for len in [6148914691236517206_i64, i64::MAX] {
+            let source = format!("fn group(files) {{ let a = []; a.pad({len}, [(), ()]); [] }}");
+            let error = within_timeout(move || group_keys(&[], &source).err())
+                .expect("巨大な配列 pad は panic ではなく Err");
+            assert!(error.contains("スクリプトの実行に失敗:"), "{error}");
+            assert!(error.contains("Size of array/BLOB"), "{error}");
+        }
+        within_timeout(|| {
+            let error = build_engine()
+                .run("let a = []; a.pad(6148914691236517206, [(), ()]);")
+                .unwrap_err();
+            assert!(
+                matches!(*error, EvalAltResult::ErrorDataTooLarge(ref kind, _) if kind == "Size of array/BLOB")
+            );
+        });
+    }
+
+    #[test]
+    fn section1863_array_pad_matches_standard_results_and_aggregate_limits() {
+        within_timeout(|| {
+            for (source, limits, succeeds) in [
+                ("let a = [1]; a.pad(3, 7); a", (3, 8, 8), true),
+                ("let a = [1]; a.pad(4, 7); a", (3, 8, 8), false),
+                ("let a = [1]; a.pad(-1, [1]); a", (3, 8, 8), true),
+                ("let a = [1]; a.pad(0, [1]); a", (3, 8, 8), true),
+                ("let a = [1]; a.pad(1, [1]); a", (3, 8, 8), true),
+                ("let a = []; a.pad(2, [1, 2]); a", (6, 8, 8), true),
+                ("let a = []; a.pad(2, [1, 2]); a", (5, 8, 8), false),
+                (r#"let a = []; a.pad(2, "ab"); a"#, (2, 8, 4), true),
+                (r#"let a = []; a.pad(2, "ab"); a"#, (2, 8, 3), false),
+                (
+                    r#"let a = []; a.pad(2, #{long_key: [1, "ab"]}); a"#,
+                    (6, 2, 4),
+                    true,
+                ),
+                (
+                    r#"let a = []; a.pad(2, #{long_key: [1, "ab"]}); a"#,
+                    (5, 2, 4),
+                    false,
+                ),
+                (
+                    r#"let a = []; a.pad(2, #{long_key: [1, "ab"]}); a"#,
+                    (6, 1, 4),
+                    false,
+                ),
+                (
+                    r#"let a = []; a.pad(2, #{long_key: [1, "ab"]}); a"#,
+                    (6, 2, 3),
+                    false,
+                ),
+                (
+                    r#"let a = []; a.pad(2, #{long_key: [1, "ab"]}); a"#,
+                    (5, 1, 3),
+                    false,
+                ),
+                (
+                    r#"let a = [#{k: "a"}, [2]]; a.pad(3, ["bc"]); a"#,
+                    (5, 1, 3),
+                    true,
+                ),
+                (
+                    r#"let a = [#{k: "a"}, [2]]; a.pad(3, ["bc"]); a"#,
+                    (4, 1, 3),
+                    false,
+                ),
+                (
+                    r#"let a = [#{k: "a"}, [2]]; a.pad(3, ["bc"]); a"#,
+                    (5, 1, 2),
+                    false,
+                ),
+                ("let a = []; a.pad(2, blob(2)); a", (8, 8, 8), true),
+                ("let a = []; a.pad(2, blob(2)); a", (7, 8, 8), false),
+                ("let a = []; a.pad(2, blob(2)); a", (5, 8, 8), false),
+                ("let a = [blob(2)]; a.pad(2, 0); a", (5, 8, 8), true),
+                ("let a = [blob(2)]; a.pad(2, 0); a", (4, 8, 8), false),
+                ("let a = []; a.pad(2, [blob(2)]); a", (10, 8, 8), true),
+                ("let a = []; a.pad(2, [blob(2)]); a", (9, 8, 8), false),
+                (
+                    r#"let item = [1, "ab"]; let f = || item; let a = []; a.pad(2, item); a"#,
+                    (6, 8, 4),
+                    true,
+                ),
+                (
+                    r#"let item = [1, "ab"]; let f = || item; let a = []; a.pad(2, item); a"#,
+                    (5, 8, 4),
+                    false,
+                ),
+                // 配列上限 0 のときの標準の分岐と、非 pure の定数拒否も比較する。
+                ("let a = []; a.pad(3, [1]); a", (0, 8, 8), true),
+                ("const a = [1]; a.pad(2, 0); a", (8, 8, 8), false),
+            ] {
+                let evaluate = |mut engine: Engine| {
+                    engine.set_max_array_size(limits.0);
+                    engine.set_max_map_size(limits.1);
+                    engine.set_max_string_size(limits.2);
+                    let mut scope = Scope::new();
+                    let result = engine
+                        .eval_with_scope::<Dynamic>(&mut scope, source)
+                        .map(|value| format!("{value:?}"))
+                        .map_err(|error| error.to_string());
+                    // 事前検査と呼び出し後の検査で、変更済みかどうかも標準と一致させる。
+                    let array = scope
+                        .get_value::<rhai::Array>("a")
+                        .map(|a| format!("{a:?}"));
+                    (result, array)
+                };
+                let expected = evaluate(Engine::new());
+                assert_eq!(
+                    expected.0.is_ok(),
+                    succeeds,
+                    "標準の前提: {source}, {limits:?}: {expected:?}"
+                );
+                let actual = evaluate(build_engine());
+                assert_eq!(actual, expected, "{source}, {limits:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn section1863_data_sizes_match_standard_for_top_shared_and_nested_blobs() {
+        within_timeout(|| {
+            let mut map = rhai::Map::new();
+            map.insert("key_not_counted".into(), Dynamic::from_blob(vec![0, 1]));
+            let value = Dynamic::from_array(vec![
+                Dynamic::from_map(map),
+                Dynamic::from_array(vec![Dynamic::from("ab")]),
+            ])
+            .into_shared();
+            // 配列要素 2 + 入れ子 blob (1+2) + 入れ子配列の要素 1、map は 1、文字列は 2。
+            let sizes = stack_data_sizes(&value, true);
+            assert_eq!(sizes, (6, 1, 2));
+            for (a, m, s, succeeds) in [(6, 1, 2, true), (5, 1, 2, false), (6, 1, 1, false)] {
+                let mut engine = Engine::new();
+                engine.set_max_array_size(a);
+                engine.set_max_map_size(m);
+                engine.set_max_string_size(s);
+                assert_eq!(
+                    engine.ensure_data_size_within_limits(&value).is_ok(),
+                    succeeds
+                );
+            }
+            let blob = Dynamic::from_blob(vec![0, 1]).into_shared();
+            assert_eq!(stack_data_sizes(&blob, true), (2, 0, 0));
+        });
+    }
+
+    #[test]
+    fn section1863_global_overrides_reject_sleep_int_float_and_zero() {
+        for body in ["sleep(1)", "sleep(0.5)", "sleep(0)"] {
+            assert_script_runtime_error(body, SLEEP_ERROR);
+        }
+    }
+
+    #[test]
+    fn section1863_global_overrides_reject_empty_pad_method_and_function() {
+        for body in [
+            r#"let s = "a"; s.pad(5, "")"#,
+            r#"let s = "a"; pad(s, 5, "")"#,
+            r#""a".pad(5, "")"#,
+        ] {
+            assert_script_runtime_error(body, EMPTY_PAD_ERROR);
+        }
+    }
+
+    #[test]
+    fn section1863_global_overrides_reject_sleep_function_pointers_and_curry() {
+        for body in [
+            r#"Fn("sleep").call(1)"#,
+            r#"call(Fn("sleep"), 0.5)"#,
+            r#"let f = Fn("sleep").curry(1); f.call()"#,
+            r#"let f = curry(Fn("sleep"), 0); call(f)"#,
+        ] {
+            assert_script_runtime_error(body, SLEEP_ERROR);
+        }
+    }
+
+    #[test]
+    fn section1863_global_overrides_reject_empty_pad_function_pointers() {
+        for body in [
+            r#"let s = "a"; Fn("pad").call(s, 5, "")"#,
+            r#"let f = Fn("pad").curry("a", 5, ""); call(f)"#,
+        ] {
+            assert_script_runtime_error(body, EMPTY_PAD_ERROR);
+        }
+    }
+
+    #[test]
+    fn section1863_safe_string_and_array_pad_remain_compatible() {
+        within_timeout(|| {
+            for (body, expected) in [
+                (r#"let s = "a"; s.pad(5, "ab"); s"#, "aabab"),
+                (r#"let s = "a"; pad(s, 4, "ab"); s"#, "aaba"),
+                (r#"let s = "a"; s.pad(5, '*'); s"#, "a****"),
+                (r#"let s = "abc"; s.pad(2, ""); s"#, "abc"),
+                (r#"let s = "abc"; s.pad(3, ""); s"#, "abc"),
+                (r#"let s = "abc"; s.pad(0, ""); s"#, "abc"),
+                (r#"let s = "あ"; s.pad(4, "いう"); s"#, "あいうい"),
+                (r#"let a = ["a"]; a.pad(3, "b"); a[2]"#, "b"),
+            ] {
+                // 文を含む式はブロックで囲み、戻り値を 1 件のキーにする。
+                let source = format!("fn group(files) {{ [{{ {body} }}] }}");
+                let result = group_keys(&[m("a.jpg", 0, false)], &source).expect("互換の pad");
+                assert_eq!(result.keys, vec![expected.to_string()], "{body}");
+            }
+        });
+    }
+
+    #[test]
+    fn section1863_string_pad_preserves_character_and_byte_size_checks() {
+        within_timeout(|| {
+            let mut engine = build_engine();
+            engine.set_max_string_size(4);
+            for source in [
+                r#"let s = "a"; s.pad(5, "b");"#,
+                r#"let s = "a"; s.pad(3, "あ");"#,
+            ] {
+                assert!(matches!(
+                    *engine.run(source).unwrap_err(),
+                    EvalAltResult::ErrorDataTooLarge(_, _)
+                ));
+            }
+        });
+    }
+
+    fn script_with_output(source: &str) -> (CompiledStackScript, Arc<Mutex<Vec<String>>>) {
+        let mut script = CompiledStackScript::compile(source, Arc::new(AtomicBool::new(false)))
+            .expect("コンパイル成功");
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&lines);
+        install_script_output(&mut script.engine, move |line| {
+            captured.lock().unwrap().push(line)
+        });
+        (script, lines)
+    }
+
+    #[test]
+    fn section1863_print_thirty_times_succeeds_and_logs_twenty_lines() {
+        within_timeout(|| {
+            let (script, lines) =
+                script_with_output(r#"fn group(files) { for i in 0..30 { print(i); } [] }"#);
+            script.group_keys(&[]).expect("出力を省略しても分類は成功");
+            let lines = lines.lock().unwrap();
+            assert_eq!(lines.len(), 21);
+            for (i, line) in lines[..20].iter().enumerate() {
+                assert_eq!(line, &format!("stack script print: {i}"));
+            }
+            assert_eq!(lines[20], SCRIPT_OUTPUT_OMITTED);
+        });
+    }
+
+    #[test]
+    fn section1863_print_debug_share_limit_across_group_calls_and_include_location() {
+        within_timeout(|| {
+            let (mut script, lines) = script_with_output(
+                r#"fn group(files) { for i in 0..6 { print(i); debug(i); } [] }"#,
+            );
+            script.ast.set_source("stack-test");
+            for _ in 0..3 {
+                script.group_keys(&[]).expect("親フォルダごとの呼び出し");
+            }
+            let lines = lines.lock().unwrap();
+            assert_eq!(lines.len(), 21);
+            assert!(lines[1].starts_with("stack script debug: stack-test @ "));
+            assert!(lines[1].contains(" > 0"));
+            assert_eq!(lines[20], SCRIPT_OUTPUT_OMITTED);
+        });
+    }
+
+    #[test]
+    fn section1863_multiline_print_counts_log_lines_and_new_compile_resets_limit() {
+        within_timeout(|| {
+            for _ in 0..2 {
+                let (script, lines) = script_with_output(
+                    r#"fn group(files) { for i in 0..15 { print("a\nb"); } [] }"#,
+                );
+                script.group_keys(&[]).unwrap();
+                let lines = lines.lock().unwrap();
+                assert_eq!(lines.len(), 21);
+                assert!(lines[..20].iter().all(|line| !line.contains('\n')));
+                assert_eq!(lines[20], SCRIPT_OUTPUT_OMITTED);
+            }
+        });
+    }
 
     fn m(name: &str, mtime: i64, is_video: bool) -> StackMember {
         StackMember {

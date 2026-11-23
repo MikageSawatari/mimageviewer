@@ -152,6 +152,10 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
    - 準備:
      - 普段のプロファイルは使わず、試験用のプロファイルを使う。
        Chrome は `chrome.exe --user-data-dir=C:\miv-test-v5\818\chrome-profile`、Edge は `msedge.exe --user-data-dir=C:\miv-test-v5\818\edge-profile` で起動する。
+     - Edge は新しいプロファイルでも Windows のアカウントで自動的にサインインし、同期を始めることがある (2026-11-23、利用者の観測)。
+       起動したら、拡張を読み込む前に「設定 → プロファイル → 同期」で同期をオフにする。同期で入った拡張機能や設定は、試験用のプロファイルでも削除・変更しない (普段の Edge に伝わる)。
+       Chrome は自動でサインインしないが、ログインや同期を求められたら断る。
+       利用者に渡す手引きの例は `C:\home\mimageviewer-subpc\browser818\store-check\guide-store-check.md`。
      - 拡張機能のページで「デベロッパー モード」を ON にし、手順 2 の ZIP を展開したフォルダを「パッケージ化されていない拡張機能を読み込む」で読み込む。
        Chrome には chrome 用、Edge には edge 用を読み込む。
      - 表示された拡張の ID がストアの ID (Chrome `fpppoodelfkddekjahhmalmmfdhbpdma` / Edge `dlcbdkekoppppebnhhncghhglkkccdhk`) と同じことを確かめる。
