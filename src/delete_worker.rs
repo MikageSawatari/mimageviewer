@@ -1742,4 +1742,84 @@ mod tests {
         assert_eq!(flags & FOF_WANTNUKEWARNING.0, 0);
         assert_ne!(super::recycle_flags().0 & FOF_WANTNUKEWARNING.0, 0);
     }
+
+    /// §1.858 B probe (ignored, prints only): recycle and plain delete of a file that
+    /// mIV-style readers keep open, and recycle of a folder containing such a file.
+    #[test]
+    #[ignore]
+    fn handle_858b_probe_delete_with_retained_handles() {
+        use windows::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize,
+        };
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let root = tempfile::tempdir().unwrap();
+        let report = |label: &str, path: &std::path::Path, outcome: super::DeleteChunkOutcome| {
+            eprintln!(
+                "858b delete probe: {label}: succeeded={} failed={:?} aborted={} gone={}",
+                outcome.succeeded.len(),
+                outcome.failed,
+                outcome.shell_aborted,
+                super::path_is_gone(path)
+            );
+        };
+        // (a) Rust File (share R|W|D), as the ZIP directory cache holds it.
+        let a = root.path().join("held.zip");
+        std::fs::write(&a, b"probe").unwrap();
+        let held = std::fs::File::open(&a).unwrap();
+        report(
+            "recycle file held by Rust File",
+            &a,
+            super::recycle_chunk(0, &[a.clone()]),
+        );
+        drop(held);
+        let b = root.path().join("held2.zip");
+        std::fs::write(&b, b"probe").unwrap();
+        let held = std::fs::File::open(&b).unwrap();
+        let removed = std::fs::remove_file(&b);
+        eprintln!(
+            "858b delete probe: DeleteFile on file held by Rust File: {removed:?} gone={}",
+            super::path_is_gone(&b)
+        );
+        drop(held);
+        // (b) PDFium in-process document.
+        let c = root.path().join("held.pdf");
+        std::fs::write(&c, crate::pdf_loader::probe_minimal_pdf_for_858b()).unwrap();
+        let dll = std::path::Path::new("vendor/pdfium/bin");
+        let bindings = pdfium_render::prelude::Pdfium::bind_to_library(
+            pdfium_render::prelude::Pdfium::pdfium_platform_library_name_at_path(
+                dll.to_str().unwrap(),
+            ),
+        )
+        .unwrap();
+        let pdfium = pdfium_render::prelude::Pdfium::new(bindings);
+        let document = pdfium.load_pdf_from_file(&c, None).unwrap();
+        report(
+            "recycle PDF held by PDFium",
+            &c,
+            super::recycle_chunk(0, &[c.clone()]),
+        );
+        drop(document);
+        let d = root.path().join("held2.pdf");
+        std::fs::write(&d, crate::pdf_loader::probe_minimal_pdf_for_858b()).unwrap();
+        let document = pdfium.load_pdf_from_file(&d, None).unwrap();
+        let removed = std::fs::remove_file(&d);
+        eprintln!(
+            "858b delete probe: DeleteFile on PDF held by PDFium: {removed:?} gone={}",
+            super::path_is_gone(&d)
+        );
+        drop(document);
+        // (c) Folder containing a held file (expected to fail).
+        let e = root.path().join("folder");
+        std::fs::create_dir(&e).unwrap();
+        let inner = e.join("inner.zip");
+        std::fs::write(&inner, b"probe").unwrap();
+        let held = std::fs::File::open(&inner).unwrap();
+        report(
+            "recycle folder containing a held file",
+            &e,
+            super::recycle_chunk(0, &[e.clone()]),
+        );
+        drop(held);
+        unsafe { CoUninitialize() };
+    }
 }

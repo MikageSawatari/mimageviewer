@@ -7278,6 +7278,12 @@ pub(crate) fn raster_matches_render_target(
 // PDFium を実際に使うテストは CI で flakey (DLL 展開が走る等) なので、
 // ここでは純粋ロジック — IPC のシリアライズ/デシリアライズと PdfDocumentInfo の整形 — だけ検証。
 
+/// Probe-only helper for §1.858 B delete probes in other modules.
+#[cfg(test)]
+pub(crate) fn probe_minimal_pdf_for_858b() -> Vec<u8> {
+    tests::minimal_direction_pdf_for_probe()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8132,6 +8138,10 @@ mod tests {
             rx.recv().unwrap().unwrap_err().kind(),
             std::io::ErrorKind::Interrupted
         );
+    }
+
+    pub(super) fn minimal_direction_pdf_for_probe() -> Vec<u8> {
+        minimal_direction_pdf(None)
     }
 
     fn minimal_direction_pdf(direction: Option<&str>) -> Vec<u8> {
