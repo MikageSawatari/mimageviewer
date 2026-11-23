@@ -1641,7 +1641,7 @@ fn depth_actual_touch_page_navigation_ignores_suspended_committed_z_zoom() {
             for phase in [egui::TouchPhase::Start, egui::TouchPhase::End] {
                 assert_eq!(
                     app.fs_zoom_owner(),
-                    crate::ui_fullscreen::FsZoomOwner::Depth
+                    crate::ui_fullscreen::FsZoomOwner::Image
                 );
                 assert_eq!(
                     app.fs_exclusive_view_active(0),
@@ -1689,7 +1689,7 @@ fn depth_actual_touch_page_navigation_ignores_suspended_committed_z_zoom() {
             assert!(app.fs_exclusive_view.is_depth());
             assert_eq!(
                 app.fs_zoom_owner(),
-                crate::ui_fullscreen::FsZoomOwner::Depth
+                crate::ui_fullscreen::FsZoomOwner::Image
             );
             destinations.push(app.items[app.fullscreen_idx.unwrap()].clone());
             depth_key_frame(
@@ -2862,15 +2862,20 @@ fn depth_wait_actual_viewer_box_disappears_for_ready_failed_and_off() {
 
 #[cfg(windows)]
 #[test]
-fn depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms() {
+fn depth_actual_mouse_clicks_wait_for_shared_transform_reset_before_navigation() {
     // The immediate renderer is thread-local: drive the real child viewer without
     // opening a native window or leaving a backend callback on a test-pool thread.
     std::thread::spawn(|| {
         let _input_guard = crate::key_input::lock_test_input();
         let mut destinations = Vec::new();
-        for (committed_zoom, panel_visible) in
-            [(false, true), (true, true), (false, false), (true, false)]
-        {
+        // The ordinary 2D control uses the same physical clicks and transform.
+        for (depth_enabled, committed_zoom, panel_visible) in [
+            (false, false, false),
+            (true, false, true),
+            (true, true, true),
+            (true, false, false),
+            (true, true, false),
+        ] {
             let ctx = egui::Context::default();
             ctx.set_embed_viewports(false);
             crate::ui_fullscreen::install_fs_navigator_input_tracking(&ctx);
@@ -2880,16 +2885,21 @@ fn depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms() {
             let observed_responses = responses.clone();
             let child_passes = std::rc::Rc::new(std::cell::Cell::new(0));
             let observed = child_passes.clone();
+            let child_time = std::rc::Rc::new(std::cell::Cell::new(0.0));
+            let observed_time = child_time.clone();
+            let click_count = std::rc::Rc::new(std::cell::Cell::new(0));
+            let observed_click_count = click_count.clone();
             let viewport_rect =
                 egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1920.0, 1080.0));
             egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
                 observed.set(observed.get() + 1);
+                observed_time.set(observed_time.get() + 1.0 / 60.0);
                 let input_events = std::mem::take(&mut *child_events.borrow_mut());
                 ctx.run_ui(
                     egui::RawInput {
                         viewport_id: viewport.ids.this,
                         screen_rect: Some(viewport_rect),
-                        time: Some(observed.get() as f64 / 60.0),
+                        time: Some(observed_time.get()),
                         events: input_events,
                         viewports: [
                             (
@@ -2916,6 +2926,17 @@ fn depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms() {
                     },
                     |ui| {
                         (viewport.viewport_ui_cb)(ui);
+                        ctx.input(|input| {
+                            for (button, click) in
+                                input.pointer.released_buttons_with_click_counts()
+                            {
+                                if button == egui::PointerButton::Primary
+                                    && let Some((_, count)) = click
+                                {
+                                    observed_click_count.set(count);
+                                }
+                            }
+                        });
                         if let Some(response) = ctx.read_response(egui::Id::unique("fs_click")) {
                             observed_responses.borrow_mut().push(format!(
                                 "pos={:?} clicked={} down={} hovered={} layer={:?}",
@@ -2960,17 +2981,23 @@ fn depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms() {
                 &ctx,
                 &[(egui::Key::D, true), (egui::Key::D, false)],
             );
-            if !panel_visible {
+            if !depth_enabled {
+                depth_key_frame(
+                    &mut app,
+                    &ctx,
+                    &[(egui::Key::D, true), (egui::Key::D, false)],
+                );
+            } else if !panel_visible {
                 depth_key_frame(
                     &mut app,
                     &ctx,
                     &[(egui::Key::I, true), (egui::Key::I, false)],
                 );
             }
-            assert!(matches!(
-                &app.fs_exclusive_view,
-                FsExclusiveView::Depth(state) if state.panel_visible == panel_visible
-            ));
+            assert_eq!(app.fs_exclusive_view.is_depth(), depth_enabled);
+            if let FsExclusiveView::Depth(state) = &app.fs_exclusive_view {
+                assert_eq!(state.panel_visible, panel_visible);
+            }
             let render_frame = |app: &mut App| {
                 app.frame_counter += 1;
                 ctx.run_pass(
@@ -2988,12 +3015,45 @@ fn depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms() {
             // Its initial focus-acquisition click is intentionally not navigation.
             app.fs_focus_regained_at = None;
             assert!(!app.fs_primary_suppression.is_active());
-            // Real mouse producer, distinct from the touch regression: right
-            // page-side click advances, then left page-side click returns.
+            // Reproduce the old test's right/left/left burst in both 2D and
+            // Depth: the last release is a triple click, so it cannot reset.
+            for (pos, expected_count) in [
+                (egui::pos2(1100., 500.), 1),
+                (egui::pos2(250., 500.), 1),
+                (egui::pos2(250., 500.), 3),
+            ] {
+                events.borrow_mut().push(egui::Event::PointerMoved(pos));
+                render_frame(&mut app);
+                for pressed in [true, false] {
+                    events.borrow_mut().push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    render_frame(&mut app);
+                }
+                assert_eq!(click_count.get(), expected_count);
+                assert_eq!(
+                    (app.fs_zoom, app.fs_pan, app.fs_free_rotation),
+                    (1.8, egui::vec2(24., -18.), 0.2),
+                    "a single or triple click must not reset: Depth={depth_enabled}"
+                );
+                assert_eq!(app.fullscreen_idx, Some(0));
+            }
+            // A transformed Depth view shares 2D click ownership: neither side navigates.
             for (pos, expected) in [
-                (egui::pos2(1100.0, 500.0), 1),
+                (egui::pos2(1100.0, 500.0), 0),
                 (egui::pos2(250.0, 500.0), 0),
             ] {
+                // Independent page-side clicks must not seed a triple click.
+                // egui's triple-click test uses the last two release times, even
+                // when the earlier of those clicks was at a different position.
+                child_time.set(
+                    child_time.get()
+                        + ctx.options(|o| o.input_options.max_double_click_delay)
+                        + 0.05,
+                );
                 events.borrow_mut().push(egui::Event::PointerMoved(pos));
                 render_frame(&mut app);
                 for pressed in [true, false] {
@@ -3011,11 +3071,44 @@ fn depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms() {
                         events.borrow().is_empty(),
                         "child viewer must consume mouse batch"
                     );
-                    assert!(app.fs_exclusive_view.is_depth());
+                    assert_eq!(app.fs_exclusive_view.is_depth(), depth_enabled);
                     assert_eq!(app.fs_zoom_active, committed_zoom);
                     assert_eq!(app.fs_zoom_factor, 2.75);
                 }
+                assert_eq!(
+                    click_count.get(),
+                    1,
+                    "each page-side probe is a single click"
+                );
                 assert_eq!(app.fullscreen_idx, Some(expected), "mouse page-side click: Z={committed_zoom}, panel={panel_visible}, pos={pos:?}, responses={:?}", responses.borrow());
+            }
+            // The second click at the same left-side position resets the transform.
+            let reset_pos = egui::pos2(250., 500.);
+            for pressed in [true, false] {
+                events.borrow_mut().push(egui::Event::PointerButton {
+                    pos: reset_pos, button: egui::PointerButton::Primary, pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                render_frame(&mut app);
+            }
+            assert_eq!(
+                click_count.get(),
+                2,
+                "the reset release must be an egui double click"
+            );
+            assert_eq!((app.fs_zoom, app.fs_pan, app.fs_free_rotation), (1., egui::Vec2::ZERO, 0.));
+            assert_eq!(app.fullscreen_idx, Some(0));
+            for (pos, expected) in [(egui::pos2(1100., 500.), 1), (reset_pos, 0)] {
+                events.borrow_mut().push(egui::Event::PointerMoved(pos));
+                render_frame(&mut app);
+                for pressed in [true, false] {
+                    events.borrow_mut().push(egui::Event::PointerButton {
+                        pos, button: egui::PointerButton::Primary, pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    render_frame(&mut app);
+                }
+                assert_eq!(app.fullscreen_idx, Some(expected));
             }
             assert!(
                 child_passes.get() >= 3,
@@ -3026,17 +3119,19 @@ fn depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms() {
                 Some(0),
                 "raw mouse must reach PageSide navigation with committed_zoom={committed_zoom}"
             );
-            assert!(app.fs_exclusive_view.is_depth());
+            assert_eq!(app.fs_exclusive_view.is_depth(), depth_enabled);
             assert_eq!(
                 app.fs_zoom_owner(),
-                crate::ui_fullscreen::FsZoomOwner::Depth
+                crate::ui_fullscreen::FsZoomOwner::Image
             );
             destinations.push(app.items[app.fullscreen_idx.unwrap()].clone());
-            depth_key_frame(
-                &mut app,
-                &ctx,
-                &[(egui::Key::D, true), (egui::Key::D, false)],
-            );
+            if depth_enabled {
+                depth_key_frame(
+                    &mut app,
+                    &ctx,
+                    &[(egui::Key::D, true), (egui::Key::D, false)],
+                );
+            }
             assert!(matches!(app.fs_exclusive_view, FsExclusiveView::None));
             assert_eq!(app.fs_zoom_active, committed_zoom);
             assert!(!app.fs_zoom_aiming);

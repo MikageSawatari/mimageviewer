@@ -552,6 +552,41 @@ fn close_mode_depth_uses_release_modifiers_and_preserves_ctrl_focus() {
 }
 
 #[test]
+fn close_mode_transformed_depth_preserves_ctrl_focus_and_resets_before_closing() {
+    for (zoom, rotation) in [(2.0, 0.0), (1.0, 0.25)] {
+        let mut canvas = Canvas::new();
+        canvas.app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(
+            crate::depth_parallax::DepthViewState::new(canvas.app.edit_request_owner_context()),
+        );
+        canvas.app.fs_zoom = zoom;
+        canvas.app.fs_free_rotation = rotation;
+        let pos = canvas_pos();
+        let mut events = click(pos, egui::Modifiers::CTRL);
+        events.push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+        assert_eq!(canvas.plan(events, Options::default()), Outcome::Depth(pos));
+        canvas.time += 1.0;
+        assert_eq!(
+            canvas.plan(click(pos, egui::Modifiers::NONE), Options::default()),
+            Outcome::None
+        );
+        canvas.time += 1.0;
+        assert_eq!(
+            canvas.plan(double_click(pos), Options::default()),
+            Outcome::Reset
+        );
+        // Model the existing reset consumer; use a new egui click sequence.
+        canvas.app.fs_zoom = 1.0;
+        canvas.app.fs_pan = egui::Vec2::ZERO;
+        canvas.app.fs_free_rotation = 0.0;
+        canvas.time += 1.0;
+        assert_eq!(
+            canvas.plan(double_click(pos), Options::default()),
+            Outcome::Close
+        );
+    }
+}
+
+#[test]
 fn close_mode_batched_navigator_position_then_canvas_position_does_not_close() {
     let mut canvas = Canvas::new();
     let navigator_pos = canvas_pos();

@@ -45,6 +45,8 @@ mod depth_main_window_tests;
 mod depth_slideshow_tests;
 #[cfg(test)]
 mod depth_tests;
+#[cfg(all(test, windows))]
+mod depth_view_transform_tests;
 #[cfg(test)]
 mod double_click_close_lifecycle_tests;
 #[cfg(test)]
@@ -4375,7 +4377,6 @@ fn panorama_navigator_wrap_yaw(yaw: f32) -> f32 {
 /// `if analysis_mode … else if panorama …` を書き直すと、必ずどれかを落とす。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FsZoomOwner {
-    Depth,
     /// ZipPla 風ズーム (照準中 / 確定中)。専用描画経路で `fs_zoom` を見ない。
     ZoomMode,
     /// 360 度ビュー。`fov_y` / `yaw` / `pitch`。
@@ -8692,6 +8693,7 @@ fn next_fullscreen_cursor_hide_reason(
 
 fn should_handle_fullscreen_wheel(
     cursor_in_panel: bool,
+    cursor_in_depth_panel: bool,
     in_video_tile: bool,
     ctrl_held: bool,
     modal_for_keys: bool,
@@ -8701,6 +8703,9 @@ fn should_handle_fullscreen_wheel(
 ) -> bool {
     !modal_for_keys
         && !popup_open
+        // Depth's floating controls own modified wheel too. Ordinary side
+        // panels retain their established Ctrl+wheel zoom behavior below.
+        && !cursor_in_depth_panel
         && (!in_video_tile || !ctrl_held)
         && (ctrl_held || !cursor_in_panel)
 }
@@ -12424,6 +12429,8 @@ impl App {
         layout_source: FsPageLayoutSource,
         live: bool,
     ) -> Option<FullscreenPaintPayload> {
+        #[cfg(all(test, windows))]
+        depth_view_transform_tests::PAGED_PREPARES.with(|count| count.set(count.get() + 1));
         if matches!(layout_source, FsPageLayoutSource::CurrentItem)
             && let Some(held) = resource.page_idx().and_then(|idx| {
                 self.page_turn_matching_held_page(idx, transform, painter, underlay, live)
@@ -15697,7 +15704,7 @@ impl App {
     /// 判定はここ 1 か所に集める。新しい入力を足すときは必ずこれを通すこと。
     pub(crate) fn fs_zoom_owner(&self) -> FsZoomOwner {
         if self.fs_exclusive_view.is_depth() {
-            return FsZoomOwner::Depth;
+            return FsZoomOwner::Image;
         }
         if self.fs_zoom_mode_engaged() {
             return FsZoomOwner::ZoomMode;
@@ -15781,9 +15788,6 @@ impl App {
         pivot: egui::Pos2,
         rect_center: egui::Pos2,
     ) -> bool {
-        if self.fs_exclusive_view.is_depth() {
-            return false;
-        }
         if !factor.is_finite() || factor <= 0.0 {
             return false;
         }
@@ -15825,7 +15829,6 @@ impl App {
         let owner = self.fs_zoom_owner();
         let changed = match owner {
             FsZoomOwner::ZoomMode => self.adjust_fs_zoom_factor(if zoom_in { 1.0 } else { -1.0 }),
-            FsZoomOwner::Depth => false,
             FsZoomOwner::Panorama => self.apply_panorama_touch_zoom(factor),
             FsZoomOwner::Image | FsZoomOwner::Analysis => {
                 self.apply_touch_zoom_factor_about_pivot(factor, egui::Pos2::ZERO, egui::Pos2::ZERO)
@@ -15835,7 +15838,7 @@ impl App {
             match owner {
                 FsZoomOwner::Image => self.maybe_rerender_pdf(self.fs_zoom),
                 FsZoomOwner::Analysis => self.maybe_rerender_pdf(self.analysis_zoom),
-                FsZoomOwner::ZoomMode | FsZoomOwner::Panorama | FsZoomOwner::Depth => {}
+                FsZoomOwner::ZoomMode | FsZoomOwner::Panorama => {}
             }
             ctx.request_repaint();
         }
@@ -15845,7 +15848,6 @@ impl App {
     /// ピンチ中の 2 本指平行移動を、いまの持ち主の pan へ流す。
     fn apply_touch_pan_delta(&mut self, delta: egui::Vec2, full_rect: egui::Rect) {
         match self.fs_zoom_owner() {
-            FsZoomOwner::Depth => {}
             FsZoomOwner::Panorama => {
                 self.apply_panorama_touch_pan(delta, full_rect.height());
             }
@@ -15871,18 +15873,28 @@ impl App {
         full_rect: egui::Rect,
         front: FsFrontPointerFrameInput,
     ) -> bool {
-        let (down, pressed, released, pos) = ctx.input(|i| {
+        let (down, pressed, released, pos, press_pos) = ctx.input(|i| {
             (
                 i.pointer.button_down(egui::PointerButton::Middle),
                 i.pointer.button_pressed(egui::PointerButton::Middle),
                 !front.owns_release(egui::PointerButton::Middle)
                     && i.pointer.button_released(egui::PointerButton::Middle),
                 i.pointer.interact_pos(),
+                i.pointer
+                    .button_events()
+                    .rev()
+                    .find_map(|event| match event {
+                        egui::PointerButtonEvent::Pressed {
+                            button: egui::PointerButton::Middle,
+                            pos,
+                        } => Some(pos),
+                        _ => None,
+                    }),
             )
         });
         self.retire_changed_drag_zoom(ctx);
         let owner = self.fs_zoom_owner();
-        if matches!(owner, FsZoomOwner::Panorama | FsZoomOwner::Depth) {
+        if matches!(owner, FsZoomOwner::Panorama) {
             // Preserve the original middle-button consumption contract in 360.
             if self
                 .fs_middle_zoom_drag
@@ -15905,7 +15917,10 @@ impl App {
             owner,
             rect.center(),
             true,
-            true,
+            !press_pos.is_some_and(|pos| {
+                self.visible_depth_panel_rect(ctx)
+                    .is_some_and(|panel| panel.contains(pos))
+            }),
             pressed,
             down,
             released,
@@ -15978,7 +15993,7 @@ impl App {
                 FsZoomOwner::Image => (self.fs_zoom, self.fs_pan),
                 FsZoomOwner::Analysis => (self.analysis_zoom, self.analysis_pan),
                 FsZoomOwner::ZoomMode => (self.fs_zoom_factor, egui::Vec2::ZERO),
-                FsZoomOwner::Panorama | FsZoomOwner::Depth => (1.0, egui::Vec2::ZERO),
+                FsZoomOwner::Panorama => (1.0, egui::Vec2::ZERO),
             };
             self.fs_middle_zoom_drag = Some(MiddleZoomDrag {
                 input,
@@ -16020,7 +16035,7 @@ impl App {
                             ctx.request_repaint();
                         }
                     }
-                    FsZoomOwner::Panorama | FsZoomOwner::Depth => {}
+                    FsZoomOwner::Panorama => {}
                 }
             }
         } else if released || !down {
@@ -16033,7 +16048,7 @@ impl App {
         let zoom = match drag.owner {
             FsZoomOwner::Image => self.fs_zoom,
             FsZoomOwner::Analysis => self.analysis_zoom,
-            FsZoomOwner::ZoomMode | FsZoomOwner::Panorama | FsZoomOwner::Depth => return,
+            FsZoomOwner::ZoomMode | FsZoomOwner::Panorama => return,
         };
         if (zoom - drag.start_zoom).abs() > f32::EPSILON {
             self.maybe_rerender_pdf(zoom);
@@ -16161,6 +16176,10 @@ impl App {
 
     /// 現在のフルスクリーン画像が PDF ページなら、指定ズームで再レンダリングを要求する。
     pub(crate) fn maybe_rerender_pdf(&mut self, zoom: f32) {
+        if self.fs_exclusive_view.is_depth() {
+            self.fs_pdf_rerender_demand.suppress_for_depth();
+            return;
+        }
         if let Some(idx) = self.fullscreen_idx {
             // Continuous geometry owns one absolute demand for every visible source.
             // Issuing a second fit/zoom target here would supersede that same pending.
@@ -16177,7 +16196,7 @@ impl App {
     pub(crate) fn apply_gamepad_fullscreen_zoom(&mut self, amount: f32, dt: f32) -> bool {
         if self
             .fullscreen_idx
-            .is_some_and(|idx| self.fs_exclusive_view_active(idx).is_some())
+            .is_some_and(|idx| self.is_panorama_mode_active(idx))
         {
             return false;
         }
@@ -16199,7 +16218,7 @@ impl App {
     pub(crate) fn apply_gamepad_fullscreen_pan(&mut self, delta: egui::Vec2) -> bool {
         if self
             .fullscreen_idx
-            .is_some_and(|idx| self.fs_exclusive_view_active(idx).is_some())
+            .is_some_and(|idx| self.is_panorama_mode_active(idx))
         {
             return false;
         }
@@ -20266,6 +20285,7 @@ enum FsWheelFrameInput {
 /// the current viewport and cannot carry child input past an immediate callback.
 struct FsWheelFrameSemanticInput {
     pointer_pos: Option<egui::Pos2>,
+    primary_press_origin: Option<egui::Pos2>,
     pointer_navigation_operation: Option<ViewerOperationId>,
     modifiers: egui::Modifiers,
     primary_started: bool,
@@ -20281,6 +20301,7 @@ impl FsWheelFrameSemanticInput {
     fn capture(app: &App, ctx: &egui::Context, response: &egui::Response) -> Self {
         Self {
             pointer_pos: ctx.input(|input| input.pointer.hover_pos()),
+            primary_press_origin: ctx.input(|input| input.pointer.press_origin()),
             pointer_navigation_operation: app
                 .page_turn_pointer_navigation_operation(ctx, "pointer"),
             modifiers: ctx.input(|input| input.modifiers),
@@ -29727,14 +29748,12 @@ impl App {
                                             );
                                     } else {
                                         let fs_rotation = self.get_rotation(paint_idx);
-                                        let zp = if self.fs_exclusive_view.is_depth() {
-                                            None
-                                        } else if analysis_active {
+                                        let zp = if analysis_active {
                                             Some((self.analysis_zoom, self.analysis_pan))
                                         } else {
                                             self.fs_zoom_pan()
                                         };
-                                        let free_rot = if self.fs_exclusive_view.is_depth() || analysis_active {
+                                        let free_rot = if analysis_active {
                                             0.0
                                         } else {
                                             self.fs_free_rotation
@@ -29749,9 +29768,7 @@ impl App {
                                         let continuous_reading_active =
                                             self.continuous_reading_active_for_idx(paint_idx);
                                         let pixels_per_point = ctx.pixels_per_point();
-                                        let fit_scale_limits = if self.fs_exclusive_view.is_depth() {
-                                            FullscreenFitScaleLimits { pixels_per_point, ..Default::default() }
-                                        } else { self.fullscreen_fit_scale_limits(pixels_per_point) };
+                                        let fit_scale_limits = self.fullscreen_fit_scale_limits(pixels_per_point);
                                         if continuous_reading_active {
                                             navigator_texture_sources = self
                                                 .draw_fs_continuous_reading(
@@ -29796,7 +29813,7 @@ impl App {
                                                     self.fs_pixel_grid_enabled && !analysis_active;
                                                 // 余白カットフィット用 bbox (設定 OFF なら None)。
                                                 // bg_style が self を借用する前に算出しておく。
-                                                let fit_mode = if self.fs_exclusive_view.is_depth() || analysis_active {
+                                                let fit_mode = if analysis_active {
                                                     FullscreenFitMode::Page
                                                 } else {
                                                     self.effective_fullscreen_fit_mode()
@@ -33238,6 +33255,10 @@ impl App {
 
     /// Stable source provenance, independent of the texture currently sampled.
     fn reconcile_specified_pdf_demand(&mut self, ctx: &egui::Context) {
+        if self.fs_exclusive_view.is_depth() {
+            self.fs_pdf_rerender_demand.suppress_for_depth();
+            return;
+        }
         if self.effective_fullscreen_fit_mode() != FullscreenFitMode::SpecifiedScale
             || self.fs_holdover_tex.is_some()
             || self.fullscreen_page_layout.kind() == FullscreenPageLayoutKind::Continuous
@@ -41380,6 +41401,18 @@ impl App {
                         .unwrap_or(false)
                 });
 
+        // Depth controls admit drags by their press, not by the hover position
+        // after later moves in the same pass. Share this boundary with both
+        // scrub and the outer middle-button dispatch; other panel rules stay.
+        let press_in_depth_panel =
+            ctx.input(|input| input.pointer.press_origin())
+                .is_some_and(|pos| {
+                    self.visible_depth_panel_rect(ctx)
+                        .is_some_and(|panel| panel.contains(pos))
+                });
+        let drag_start_in_panel =
+            (cursor_in_panel && !cursor_in_depth_panel) || press_in_depth_panel;
+
         // Hover モードでは左端だけが左補正パネルを召喚する。右端は右情報パネル、
         // 上端は上バーの各経路へ委ねる。ClickToShow は呼び出しバーでのみ開閉する。
         // 消しゴムモード中は自前のパネルを左端に描いているためエッジ発火を抑制する。
@@ -41593,12 +41626,13 @@ impl App {
                 )
             });
         if scrub_active || (scrub_canvas && scrub_held) {
-            let (pressed, down, released, pos) = ctx.input(|i| {
+            let (pressed, down, released, pos, press_origin) = ctx.input(|i| {
                 (
                     i.pointer.primary_pressed(),
                     i.pointer.primary_down(),
                     i.pointer.primary_released(),
                     i.pointer.interact_pos(),
+                    i.pointer.press_origin(),
                 )
             });
             let owner = self.fs_zoom_owner();
@@ -41606,9 +41640,9 @@ impl App {
             let can_start = !modal_input_blocked
                 && !edit_popup_open
                 && self.fs_context_menu_idx.is_none()
-                && pos.is_some_and(|pos| {
+                && press_origin.is_some_and(|pos| {
                     full_rect.contains(pos)
-                        && !cursor_in_panel
+                        && !drag_start_in_panel
                         && !(top_bar_visible && fullscreen_top_bar_rect(full_rect).contains(pos))
                 })
                 && !overflow_pointer_input.primary_owned
@@ -41828,7 +41862,6 @@ impl App {
                     crate::touch_input::TouchCommand::Zoom { factor, pivot } => {
                         // 書き先は `fs_zoom_owner` が決める。ここで新しい分岐を足さない。
                         let applied = match self.fs_zoom_owner() {
-                            FsZoomOwner::Depth => false,
                             FsZoomOwner::Panorama => self.apply_panorama_touch_zoom(factor),
                             _ => {
                                 let rect = self.fs_zoom_pivot_rect(full_rect, default_image_rect);
@@ -41848,10 +41881,7 @@ impl App {
                         ctx.request_repaint();
                     }
                     crate::touch_input::TouchCommand::PinchEnd => {
-                        if !matches!(
-                            self.fs_zoom_owner(),
-                            FsZoomOwner::Depth | FsZoomOwner::Panorama
-                        ) {
+                        if !matches!(self.fs_zoom_owner(), FsZoomOwner::Panorama) {
                             self.maybe_rerender_pdf(self.fs_zoom);
                         }
                     }
@@ -41950,12 +41980,13 @@ impl App {
         // 走っているときはカーソルがパネルを通過しても継続させる (UX のブレ防止)。
         let middle_short_click = self.update_mouse_middle_short_click_with_release(
             ctx,
-            !cursor_in_panel && !overflow_pointer_input.middle_owned,
+            (!cursor_in_panel || cursor_in_depth_panel) && !overflow_pointer_input.middle_owned,
             crate::app::ActionSurface::Viewer,
             !overflow_pointer_input.owns_release(egui::PointerButton::Middle),
+            self.visible_depth_panel_rect(ctx),
         );
         if !overflow_pointer_input.middle_owned
-            && (!cursor_in_panel || self.fs_middle_zoom_drag.is_some())
+            && (!drag_start_in_panel || self.fs_middle_zoom_drag.is_some())
         {
             self.handle_middle_drag_zoom(ctx, default_image_rect, overflow_pointer_input.clone());
         }
@@ -42057,6 +42088,7 @@ impl App {
                     .unwrap_or(false);
             let handle_wheel_here = should_handle_fullscreen_wheel(
                 cursor_in_panel_for_wheel,
+                cursor_in_depth_panel,
                 in_video_tile,
                 ctrl_held,
                 modal_for_keys,
@@ -42274,9 +42306,6 @@ impl App {
     fn fs_wheel_action_requests_navigation(&self, action: &FsWheelAction) -> bool {
         if !matches!(action.class, FsWheelInPageClass::Legacy) {
             return false;
-        }
-        if self.fs_exclusive_view.is_depth() {
-            return !action.input.modifiers.ctrl;
         }
         let ctrl = action.input.modifiers.ctrl;
         if self.fs_zoom_mode_aiming()
@@ -42531,9 +42560,6 @@ impl App {
             let wheel_y = wheel.delta.y;
             let modifiers = wheel.modifiers;
             let ctrl_held = modifiers.ctrl;
-            if self.fs_exclusive_view.is_depth() && ctrl_held {
-                continue;
-            }
             if ctrl_held
                 && self
                     .fullscreen_idx
@@ -42718,8 +42744,6 @@ impl App {
                 self.maybe_rerender_pdf(1.0);
             }
             // 右クリックは analysis_panel 側で処理
-        } else if self.fs_exclusive_view.is_depth() {
-            // Depth owns the fitted canvas; stored 2D transforms are untouched.
         } else if self.handle_panorama_drag_if_active(
             ctx,
             full_rect,
@@ -42738,6 +42762,12 @@ impl App {
             let pointer_pos = input.pointer_pos;
             let pointer_in_seek_panel =
                 pointer_pos.is_some_and(|p| seek_panel_interactive && seek_panel_rect.contains(p));
+            // drag_started is reported after movement crosses egui's threshold.
+            // The press owns admission even if that first move crosses the panel.
+            let can_start_drag = !input.primary_press_origin.is_some_and(|pos| {
+                self.visible_depth_panel_rect(ctx)
+                    .is_some_and(|panel| panel.contains(pos))
+            });
 
             // 見開き 2 ページ表示中はフリー回転が描画に反映されないため、Ctrl+ドラッグ回転を無効化する
             if pointer_in_seek_panel {
@@ -42753,7 +42783,7 @@ impl App {
                     *origin_pan = self.fs_pan - total_delta;
                 }
                 // Ctrl+ドラッグ → 回転
-                if primary_pressed {
+                if primary_pressed && can_start_drag {
                     if let Some(pos) = pointer_pos {
                         self.fs_rotation_drag_start = Some((pos, self.fs_free_rotation));
                     }
@@ -42804,6 +42834,7 @@ impl App {
                 // 画面内に残る範囲で動く。
                 // 連結読みのドラッグは直前の分岐で、主軸スクロールと直交パンに分けて扱う。
                 if primary_pressed
+                    && can_start_drag
                     && let (Some(pos), Some(total_delta)) = (pointer_pos, input.total_drag_delta)
                 {
                     self.fs_pan_drag_start = Some((pos - total_delta, self.fs_pan));
@@ -42840,8 +42871,7 @@ impl App {
                 self.fs_rotation_drag_start = None;
             }
         }
-        // Click navigation is independent of transform ownership. Depth keeps
-        // its saved 2D transform suspended while accepting ordinary page clicks.
+        // Depth shares ordinary image transform and click/reset ownership.
         match canvas_click {
             FsCanvasClickAction::None | FsCanvasClickAction::DepthFocusAt(_) => {}
             FsCanvasClickAction::CloseViewer => close = true,
@@ -42937,7 +42967,7 @@ impl App {
             && !self.analysis_mode
             && !self
                 .fullscreen_idx
-                .is_some_and(|idx| self.fs_exclusive_view_active(idx).is_some());
+                .is_some_and(|idx| self.is_panorama_mode_active(idx));
         let has_local_scroll = actions.iter().any(|action| {
             matches!(
                 action.class,
@@ -43062,13 +43092,7 @@ impl App {
             self.fs_front_pointer.clicks.previous_close_candidate = false;
             return FsCanvasClickAction::None;
         }
-        // Depth suspends the saved 2D transform. Classify clicks on its fitted
-        // canvas, and never reset the suspended transform on a double-click.
-        let (zoom, pan, rotation) = if self.fs_exclusive_view.is_depth() {
-            (1.0, egui::Vec2::ZERO, 0.0)
-        } else {
-            (zoom, pan, self.fs_free_rotation)
-        };
+        let rotation = self.fs_free_rotation;
         let has_transform = zoom_differs_from_fit(zoom)
             || rotation.abs() > TRANSFORM_EPSILON
             || pan.length_sq() > PAN_EPSILON_SQ;
@@ -43117,7 +43141,11 @@ impl App {
             if facts.double_clicked && can_reset {
                 return FsCanvasClickAction::ResetTransform;
             }
-            if belongs_to_view || self.fs_context_menu_idx.is_some() {
+            let depth_focus_click = surface.depth
+                && facts
+                    .last_click
+                    .is_some_and(|(_, modifiers)| modifiers.ctrl);
+            if (belongs_to_view && !depth_focus_click) || self.fs_context_menu_idx.is_some() {
                 return FsCanvasClickAction::None;
             }
             if facts.close_double_clicked {
@@ -43139,7 +43167,40 @@ impl App {
             if self.fs_front_pointer.backing_double_clicked(response) && can_reset {
                 return FsCanvasClickAction::ResetTransform;
             }
-            if belongs_to_view
+            // Response position follows later pointer moves in the same batch. Keep
+            // both position and modifiers of the accepted release for a Depth focus.
+            let depth_focus_pos = if self.fs_exclusive_view.is_depth() {
+                _ctx.input(|input| {
+                    input
+                        .events
+                        .iter()
+                        .filter_map(|event| match event {
+                            egui::Event::PointerButton {
+                                button,
+                                pressed: false,
+                                modifiers,
+                                ..
+                            }
+                            | egui::Event::PointerButtonReleased { button, modifiers } => {
+                                Some((*button, *modifiers))
+                            }
+                            _ => None,
+                        })
+                        .zip(input.pointer.released_buttons_with_click_counts())
+                        .filter_map(|((button, modifiers), (_, click))| {
+                            (button == egui::PointerButton::Primary)
+                                .then_some(click)
+                                .flatten()
+                                .map(|(point, _)| (point, modifiers))
+                        })
+                        .last()
+                        .filter(|(_, modifiers)| modifiers.ctrl)
+                        .map(|(point, _)| point)
+                })
+            } else {
+                None
+            };
+            if (belongs_to_view && depth_focus_pos.is_none())
                 || self.fs_context_menu_idx.is_some()
                 || (response.dragged() && response.drag_delta().length() > 3.0)
                 || !response.clicked()
@@ -43176,39 +43237,6 @@ impl App {
             {
                 return FsCanvasClickAction::None;
             }
-            // Response position follows later pointer moves in the same batch. Keep
-            // both position and modifiers of the accepted release for a Depth focus.
-            let depth_focus_pos = if self.fs_exclusive_view.is_depth() {
-                _ctx.input(|input| {
-                    input
-                        .events
-                        .iter()
-                        .filter_map(|event| match event {
-                            egui::Event::PointerButton {
-                                button,
-                                pressed: false,
-                                modifiers,
-                                ..
-                            }
-                            | egui::Event::PointerButtonReleased { button, modifiers } => {
-                                Some((*button, *modifiers))
-                            }
-                            _ => None,
-                        })
-                        .zip(input.pointer.released_buttons_with_click_counts())
-                        .filter_map(|((button, modifiers), (_, click))| {
-                            (button == egui::PointerButton::Primary)
-                                .then_some(click)
-                                .flatten()
-                                .map(|(point, _)| (point, modifiers))
-                        })
-                        .last()
-                        .filter(|(_, modifiers)| modifiers.ctrl)
-                        .map(|(point, _)| point)
-                })
-            } else {
-                None
-            };
             let Some(pos) = depth_focus_pos.or_else(|| response.interact_pointer_pos()) else {
                 return FsCanvasClickAction::None;
             };
@@ -46558,6 +46586,35 @@ impl App {
         )
     }
 
+    fn commit_fs_single_page_placement(
+        &mut self,
+        page_idx: usize,
+        selected_current: bool,
+        full_rect: egui::Rect,
+        initial_zero_pan_unit: Option<egui::Rect>,
+        initial_placement_applied: bool,
+        material: FullscreenPageMaterialKind,
+        bounded_pan: Option<egui::Vec2>,
+    ) {
+        let initial_origin_automatic = initial_placement_applied.then(|| {
+            self.fs_initial_placement_request
+                .expect("validated initial placement")
+                .origin_automatic
+        });
+        if initial_placement_applied {
+            self.resolve_fs_initial_placement(
+                self.fullscreen_idx.unwrap_or(page_idx),
+                selected_current,
+                full_rect,
+                initial_zero_pan_unit,
+                material,
+            );
+        }
+        if let Some(pan) = bounded_pan {
+            self.commit_fs_draw_pan(pan, initial_origin_automatic);
+        }
+    }
+
     fn draw_fs_image_with_initial_placement(
         &mut self,
         ui: &mut egui::Ui,
@@ -46593,6 +46650,13 @@ impl App {
         selected_current: bool,
         original_preview_active: bool,
     ) -> Option<DisplayedImageTransform> {
+        if matches!(layout_source, FsPageLayoutSource::CurrentItem)
+            && !self.fs_exclusive_view.is_depth()
+            && self.fs_pdf_rerender_demand.resume_after_depth()
+            && !self.fs_zoom_mode_effective()
+        {
+            self.maybe_rerender_pdf(self.fs_zoom);
+        }
         if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
             self.resolve_fs_initial_placement(
                 self.fullscreen_idx.unwrap_or(page_idx),
@@ -46767,42 +46831,25 @@ impl App {
                     ))
             };
             let mut painter = painter_for(zoom_pan);
-            if matches!(layout_source, FsPageLayoutSource::CurrentItem)
+            let depth_selected = matches!(layout_source, FsPageLayoutSource::CurrentItem)
                 && self.depth_view_may_continue(page_idx)
-                && self.try_paint_depth(
-                    &painter,
-                    ui.ctx(),
+                && self.depth_paint_ready(resource);
+            let paint_resource = if depth_selected {
+                resource.clone()
+            } else {
+                let Some(prepared) = self.prepare_fs_paged_paint_payload(
                     resource,
                     &transform,
-                    full_rect,
+                    &painter,
                     bg_style,
-                )
-            {
-                if let Some(submitted) = submitted {
-                    submitted.pages.clear();
-                    // The shader still presents this source as one page. Keep the
-                    // trace paired with the returned Single layout, even though
-                    // the exclusive owner disables navigator and paper-turn input.
-                    submitted.pages.push(FsNavigatorTextureSource {
-                        occurrence: SpreadPageOccurrence::navigation(page_idx, page_idx),
-                        resource: resource.clone(),
-                        provenance: FsDisplayUnitPageProvenance::Live,
-                    });
-                    submitted.submission = FsDisplayUnitSubmission::LegacyRendered;
-                }
-                return Some(transform);
-            }
-            let Some(paint_resource) = self.prepare_fs_paged_paint_payload(
-                resource,
-                &transform,
-                &painter,
-                bg_style,
-                layout_source,
-                live_eligible && using_full_texture && submitted.is_some(),
-            ) else {
-                display_tex = fallback.take();
-                using_full_texture = false;
-                continue;
+                    layout_source,
+                    live_eligible && using_full_texture && submitted.is_some(),
+                ) else {
+                    display_tex = fallback.take();
+                    using_full_texture = false;
+                    continue;
+                };
+                prepared
             };
             let mut page = PreparedPagedPage {
                 crop,
@@ -46823,9 +46870,9 @@ impl App {
             let mut bounded_pan = None;
             if matches!(layout_source, FsPageLayoutSource::CurrentItem)
                 && self.fs_draw_pan_eligible(selected_current, original_preview_active)
-                && page.resource.page_material_kind() == FullscreenPageMaterialKind::Complete
+                && (depth_selected || page.resource.page_material_kind() == FullscreenPageMaterialKind::Complete)
                 // Freeze the existing binding choice using the uncorrected view.
-                && (submitted.is_none() || self.page_turn_prepared_held_page(&page).is_none())
+                && (depth_selected || submitted.is_none() || self.page_turn_prepared_held_page(&page).is_none())
                 && normal_zoom_pan(transform).is_some()
             {
                 let correction = draw_pan_correction(std::slice::from_ref(&transform));
@@ -46847,26 +46894,28 @@ impl App {
                     transform = resolve_fs_image_transform(transform_input, layout_source_size)?;
                     live_eligible &= zoom_pan.is_none();
                     painter = painter_for(zoom_pan);
-                    let Some(prepared) = self.prepare_fs_paged_paint_payload(
-                        resource,
-                        &transform,
-                        &painter,
-                        bg_style,
-                        layout_source,
-                        live_eligible && using_full_texture && submitted.is_some(),
-                    ) else {
-                        display_tex = fallback.take();
-                        using_full_texture = false;
-                        continue;
-                    };
-                    if prepared.page_material_kind() != FullscreenPageMaterialKind::Complete {
-                        // Select the actual provisional material using the original
-                        // frame pan, discarding the complete candidate's proposal.
-                        display_tex = Some(selected_provisional.insert(prepared));
-                        using_full_texture = false;
-                        continue;
+                    if !depth_selected {
+                        let Some(prepared) = self.prepare_fs_paged_paint_payload(
+                            resource,
+                            &transform,
+                            &painter,
+                            bg_style,
+                            layout_source,
+                            live_eligible && using_full_texture && submitted.is_some(),
+                        ) else {
+                            display_tex = fallback.take();
+                            using_full_texture = false;
+                            continue;
+                        };
+                        if prepared.page_material_kind() != FullscreenPageMaterialKind::Complete {
+                            // Select the actual provisional material using the original
+                            // frame pan, discarding the complete candidate's proposal.
+                            display_tex = Some(selected_provisional.insert(prepared));
+                            using_full_texture = false;
+                            continue;
+                        }
+                        page.resource = prepared;
                     }
-                    page.resource = prepared;
                     page.transform = transform;
                     page.painter = painter.clone();
                     page.live = live_eligible
@@ -46876,22 +46925,66 @@ impl App {
             }
             let white = white_companion_override
                 .or_else(|| white_companion_rect(&transform).map(|rect| (rect, full_rect)));
-            let initial_origin_automatic = initial_placement_applied.then(|| {
-                self.fs_initial_placement_request
-                    .expect("validated initial placement")
-                    .origin_automatic
-            });
-            if initial_placement_applied {
-                self.resolve_fs_initial_placement(
-                    self.fullscreen_idx.unwrap_or(page_idx),
-                    selected_current,
-                    full_rect,
-                    initial_zero_pan_unit,
-                    page.resource.page_material_kind(),
+            self.commit_fs_single_page_placement(
+                page_idx,
+                selected_current,
+                full_rect,
+                initial_zero_pan_unit,
+                initial_placement_applied,
+                if depth_selected {
+                    FullscreenPageMaterialKind::Complete
+                } else {
+                    page.resource.page_material_kind()
+                },
+                bounded_pan,
+            );
+            if depth_selected {
+                let mut export_input = transform_input;
+                export_input.free_rotation_rad = 0.0;
+                export_input.fit_mode = self
+                    .fs_fit_input_for_payload(page_idx, FullscreenFitMode::Page, resource)
+                    .expect("Depth selected complete source has a Page fit basis");
+                export_input.fit_scale_limits = FullscreenFitScaleLimits {
+                    pixels_per_point: transform_input.pixels_per_point,
+                    ..Default::default()
+                };
+                export_input.placement = match transform_input.placement {
+                    ResolvedDisplayPlacement::SingletonSpread { side, gap, .. } => {
+                        ResolvedDisplayPlacement::SingletonSpread {
+                            side,
+                            gap,
+                            zoom_pan: None,
+                        }
+                    }
+                    _ => ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                };
+                let export_transform = resolve_fs_image_transform(export_input, layout_source_size)
+                    .expect("Depth export baseline has valid source geometry");
+                assert!(
+                    self.try_paint_depth(
+                        &painter,
+                        ui.ctx(),
+                        resource,
+                        &transform,
+                        &export_transform,
+                        full_rect,
+                        bg_style,
+                    ),
+                    "Depth adoption and paint must use the same pass/source"
                 );
-            }
-            if let Some(pan) = bounded_pan {
-                self.commit_fs_draw_pan(pan, initial_origin_automatic);
+                if let Some(submitted) = submitted {
+                    submitted.pages.clear();
+                    // The shader still presents this source as one page. Keep the
+                    // trace paired with the returned Single layout, even though
+                    // the exclusive owner disables navigator and paper-turn input.
+                    submitted.pages.push(FsNavigatorTextureSource {
+                        occurrence: SpreadPageOccurrence::navigation(page_idx, page_idx),
+                        resource: resource.clone(),
+                        provenance: FsDisplayUnitPageProvenance::Live,
+                    });
+                    submitted.submission = FsDisplayUnitSubmission::LegacyRendered;
+                }
+                return Some(transform);
             }
             if matches!(layout_source, FsPageLayoutSource::CurrentItem) {
                 self.observe_raw_presentation(page_idx);
@@ -47633,6 +47726,9 @@ impl App {
         fs_idx: usize,
         mode: FullscreenFitMode,
     ) {
+        if self.fs_exclusive_view.is_depth() {
+            return;
+        }
         let mode = mode.effective_for_flow(self.reading_flow);
         if self.settings.fullscreen_fit_mode == mode
             && self.settings.margin_fit_enabled == matches!(mode, FullscreenFitMode::MarginFit)
@@ -75790,13 +75886,10 @@ mod tests {
                     FsZoomOwner::Analysis => app.analysis_zoom,
                     FsZoomOwner::ZoomMode => app.fs_zoom_factor,
                     FsZoomOwner::Panorama => 2.0,
-                    FsZoomOwner::Depth => {
-                        unreachable!("depth inputs have separate blocked-owner coverage")
-                    }
                 };
                 assert_eq!(
                     actual,
-                    if matches!(owner, FsZoomOwner::Panorama | FsZoomOwner::Depth) {
+                    if matches!(owner, FsZoomOwner::Panorama) {
                         2.0
                     } else {
                         zoom
@@ -85806,21 +85899,35 @@ mod tests {
     #[test]
     fn ctrl_wheel_is_handled_even_over_panels() {
         assert!(should_handle_fullscreen_wheel(
-            true, false, true, false, false
+            true, false, false, true, false, false
         ));
         assert!(!should_handle_fullscreen_wheel(
-            true, false, false, false, false
+            true, false, false, false, false, false
         ));
         assert!(should_handle_fullscreen_wheel(
-            false, false, false, false, false
+            false, false, false, false, false, false
         ));
         assert!(!should_handle_fullscreen_wheel(
-            false, false, true, true, false
+            false, false, false, true, true, false
         ));
         // 表示モード / フィットのポップアップ表示中は Ctrl+ホイールでも抑制する。
         assert!(!should_handle_fullscreen_wheel(
-            false, false, true, false, true
+            false, false, false, true, false, true
         ));
+    }
+
+    #[test]
+    fn depth_panel_blocks_plain_and_ctrl_wheel_admission() {
+        for ctrl in [false, true] {
+            assert!(!should_handle_fullscreen_wheel(
+                true, true, false, ctrl, false, false
+            ));
+            // The seek-hover projection must not admit wheel over an
+            // overlapping Depth panel either.
+            assert!(!should_handle_fullscreen_wheel(
+                false, true, false, ctrl, false, false
+            ));
+        }
     }
 
     #[test]
@@ -86105,7 +86212,7 @@ mod tests {
             "シークバー hover はスクロール可能パネル扱いせず、plain wheel をページ移動へ流す"
         );
         assert!(should_handle_fullscreen_wheel(
-            seek_hover, false, false, false, false
+            seek_hover, false, false, false, false, false
         ));
 
         let seek_drag = fullscreen_cursor_in_panel_for_wheel(true, true, true);
@@ -86114,13 +86221,13 @@ mod tests {
             "シークバードラッグ中だけは wheel による二重操作を抑制する"
         );
         assert!(!should_handle_fullscreen_wheel(
-            seek_drag, false, false, false, false
+            seek_drag, false, false, false, false, false
         ));
 
         let side_panel = fullscreen_cursor_in_panel_for_wheel(true, false, false);
         assert!(side_panel);
         assert!(!should_handle_fullscreen_wheel(
-            side_panel, false, false, false, false
+            side_panel, false, false, false, false, false
         ));
     }
 
@@ -96551,7 +96658,7 @@ mod specified_scale_consumer_tests {
 
     /// Calls the actual single/Z consumer and records its returned paint transform,
     /// exactly as the fullscreen frame does before central demand reconciliation.
-    fn single(
+    pub(super) fn single(
         app: &mut App,
         ctx: &egui::Context,
         rect: egui::Rect,

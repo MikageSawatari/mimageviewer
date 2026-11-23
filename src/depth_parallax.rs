@@ -133,7 +133,7 @@ impl MouseFollow {
     pub fn update(
         &mut self,
         pointer: Option<egui::Pos2>,
-        image: egui::Rect,
+        center: egui::Pos2,
         canvas: egui::Rect,
         over_panel: bool,
         strength: f32,
@@ -144,7 +144,7 @@ impl MouseFollow {
             self.target = pointer
                 .filter(|_| radius > 0.0)
                 .map_or(egui::Vec2::ZERO, |p| {
-                    let n = (p - image.center()) / radius;
+                    let n = (p - center) / radius;
                     -egui::vec2(n.x.clamp(-1.0, 1.0), 0.6 * n.y.clamp(-1.0, 1.0)) * strength
                 });
         }
@@ -842,13 +842,20 @@ mod tests {
     fn mouse_panel_freeze_and_return_to_center() {
         let mut mouse = MouseFollow::default();
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(100., 100.));
-        mouse.update(Some(egui::pos2(100., 100.)), rect, rect, false, 0.02, 0.15);
+        mouse.update(
+            Some(egui::pos2(100., 100.)),
+            rect.center(),
+            rect,
+            false,
+            0.02,
+            0.15,
+        );
         assert_eq!(mouse.target, egui::vec2(-0.02, -0.012));
         assert!(mouse.current.x < 0. && mouse.current.y < 0.);
         let target = mouse.target;
-        mouse.update(Some(rect.min), rect, rect, true, 0.02, 0.15);
+        mouse.update(Some(rect.min), rect.center(), rect, true, 0.02, 0.15);
         assert_eq!(mouse.target, target);
-        mouse.update(None, rect, rect, false, 0.02, 0.15);
+        mouse.update(None, rect.center(), rect, false, 0.02, 0.15);
         assert_eq!(mouse.target, egui::Vec2::ZERO);
     }
 
@@ -863,10 +870,24 @@ mod tests {
             (egui::vec2(-540., -540.), egui::vec2(0.02, 0.012)),
             (egui::vec2(135., 135.), egui::vec2(-0.01, -0.006)),
         ] {
-            mouse.update(Some(image.center() + delta), image, canvas, false, 0.02, 1.);
+            mouse.update(
+                Some(image.center() + delta),
+                image.center(),
+                canvas,
+                false,
+                0.02,
+                1.,
+            );
             assert!((mouse.target - expected).length() < 1e-6);
         }
-        mouse.update(Some(image.max), image, egui::Rect::ZERO, false, 0.02, 1.);
+        mouse.update(
+            Some(image.max),
+            image.center(),
+            egui::Rect::ZERO,
+            false,
+            0.02,
+            1.,
+        );
         assert_eq!(mouse.target, egui::Vec2::ZERO);
     }
 

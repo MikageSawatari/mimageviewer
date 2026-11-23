@@ -1039,6 +1039,7 @@ impl App {
                 !in_chrome && !self.any_dialog_open() && !front.middle_owned,
                 crate::app::ActionSurface::Viewer,
                 !front.owns_release(egui::PointerButton::Middle),
+                None,
             );
             let initial_idx = self.fullscreen_idx;
             close_requested |= self.handle_viewer_right_drag_frame(

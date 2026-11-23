@@ -2520,7 +2520,7 @@ fn initial_placement_accepted_same_image_split_step_requests_only_reading_start(
 #[test]
 fn initial_placement_excluded_modes_retire_requests_without_changing_position() {
     let ctx = egui::Context::default();
-    for mode in 0..12 {
+    for mode in 0..11 {
         let mut app = reading_app(&ctx, SpreadMode::Single);
         app.request_fs_initial_placement(0);
         match mode {
@@ -2535,13 +2535,7 @@ fn initial_placement_excluded_modes_retire_requests_without_changing_position() 
             8 => app.erase_mode = true,
             9 => app.items[0] = GridItem::Video(PathBuf::from("c:/test/entry-video.mp4")),
             10 => app.items[0] = GridItem::Audio(PathBuf::from("c:/test/entry-audio.mp3")),
-            _ => {
-                app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(
-                    crate::depth_parallax::DepthViewState::new(
-                        crate::app::ViewerContextId::for_test(82),
-                    ),
-                )
-            }
+            _ => unreachable!(),
         }
         let before = (app.fs_zoom, app.fs_pan);
         app.retire_fs_initial_placement_request();

@@ -137,8 +137,23 @@ impl DepthFrameRenderer {
 
     /// Called only by the export thread (and headless GPU tests).
     pub(crate) fn render(&self, params: DepthRenderParams) -> Result<Vec<u8>, String> {
+        self.render_mapped(
+            params,
+            egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(self.size[0] as f32, self.size[1] as f32),
+            )
+            .into(),
+        )
+    }
+
+    fn render_mapped(
+        &self,
+        params: DepthRenderParams,
+        mapping: DepthScreenMapping,
+    ) -> Result<Vec<u8>, String> {
         self.queue
-            .write_buffer(&self.resources.uniform, 0, &params.bytes());
+            .write_buffer(&self.resources.uniform, 0, &params.bytes(mapping));
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let view = self.target.create_view(&Default::default());
         {

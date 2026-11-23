@@ -8461,17 +8461,41 @@ pub(crate) enum PdfRerenderDemand {
     Absolute {
         targets: std::collections::HashMap<usize, (String, u32)>,
     },
+    /// Retain the pre-Depth comparisons until the first ordinary single-page draw.
+    DepthSuppressed(Box<PdfRerenderDemand>),
 }
 
 impl PdfRerenderDemand {
-    pub(crate) fn reset(&mut self) {
+    pub(crate) fn suppress_for_depth(&mut self) {
+        if !matches!(self, Self::DepthSuppressed(_)) {
+            *self = Self::DepthSuppressed(Box::new(std::mem::take(self)));
+        }
+    }
+
+    pub(crate) fn resume_after_depth(&mut self) -> bool {
+        if !matches!(self, Self::DepthSuppressed(_)) {
+            return false;
+        }
         *self = Self::Idle;
+        true
+    }
+
+    pub(crate) fn reset(&mut self) {
+        // Z reset/session changes can occur before the next 2D draw. Retire the
+        // comparisons without losing the context's obligation to reconcile.
+        if let Self::DepthSuppressed(previous) = self {
+            previous.reset();
+        } else {
+            *self = Self::Idle;
+        }
     }
 
     /// Source metadata invalidation retires absolute geometry demands. Legacy
     /// zoom requests keep their existing remapped index/threshold lifetime.
     pub(crate) fn invalidate_absolute_source_demands(&mut self) {
-        if matches!(self, Self::Absolute { .. }) {
+        if let Self::DepthSuppressed(previous) = self {
+            previous.invalidate_absolute_source_demands();
+        } else if matches!(self, Self::Absolute { .. }) {
             self.reset();
         }
     }
@@ -8495,13 +8519,18 @@ impl PdfRerenderDemand {
     pub(crate) fn legacy_idx(&self) -> Option<usize> {
         match self {
             Self::Legacy { idx, .. } => Some(*idx),
+            Self::DepthSuppressed(previous) => previous.legacy_idx(),
             _ => None,
         }
     }
 
     fn forget_absolute_page(&mut self, idx: usize) {
-        if let Self::Absolute { targets } = self {
-            targets.remove(&idx);
+        match self {
+            Self::Absolute { targets } => {
+                targets.remove(&idx);
+            }
+            Self::DepthSuppressed(previous) => previous.forget_absolute_page(idx),
+            _ => {}
         }
     }
 
@@ -8539,6 +8568,7 @@ impl PdfRerenderDemand {
                     .filter_map(|(idx, demand)| remap(idx).map(|next| (next, demand)))
                     .collect();
             }
+            Self::DepthSuppressed(previous) => previous.remap_indices(remap),
             Self::Idle => {}
         }
     }
@@ -94634,7 +94664,7 @@ impl App {
         else {
             return false;
         };
-        if respect_zoom && (self.fs_zoom - 1.0).abs() > 0.01 {
+        if respect_zoom && !self.fs_exclusive_view.is_depth() && (self.fs_zoom - 1.0).abs() > 0.01 {
             return false;
         }
         if gate_in_flight && self.fs_pending.contains_key(&idx) {
@@ -108611,6 +108641,35 @@ mod specified_scale_contract_tests {
         assert!(!demand.note_absolute(1, "book/page1".into(), 720));
         demand.reset();
         assert!(demand.note_absolute(1, "book/page1".into(), 720));
+    }
+
+    #[test]
+    fn depth_pdf_demand_resume_retires_all_absolute_records_and_survives_zoom_reset() {
+        let mut demand = PdfRerenderDemand::default();
+        assert!(demand.note_absolute(0, "book/0".into(), 720));
+        assert!(demand.note_absolute(1, "book/1".into(), 1080));
+        demand.suppress_for_depth();
+        demand.suppress_for_depth();
+        let PdfRerenderDemand::DepthSuppressed(previous) = &demand else {
+            unreachable!()
+        };
+        let PdfRerenderDemand::Absolute { targets } = previous.as_ref() else {
+            unreachable!()
+        };
+        assert_eq!(targets.len(), 2, "suppression does not publish a demand");
+        assert!(demand.resume_after_depth());
+        assert!(demand.note_absolute(0, "book/0".into(), 720));
+        assert!(demand.note_absolute(1, "book/1".into(), 1080));
+        assert!(!demand.resume_after_depth());
+        demand.suppress_for_depth();
+        demand.reset();
+        demand.remap_indices(&|idx| Some(idx + 1));
+        demand.invalidate_absolute_source_demands();
+        assert!(
+            demand.resume_after_depth(),
+            "Z/session reset cannot consume the obligation before painting"
+        );
+        assert!(matches!(demand, PdfRerenderDemand::Idle));
     }
 
     #[test]

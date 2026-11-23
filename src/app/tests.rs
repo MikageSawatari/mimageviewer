@@ -51775,6 +51775,16 @@ mod favorite_adjustment_defaults_tests {
         app.fs_zoom = 2.0;
         assert!(!app.should_native_rerender_pdf_for_ai(idx));
         assert!(!app.display_should_defer_final_ai(idx));
+        app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(
+            crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context()),
+        );
+        for zoom in [0.2, 1.0, 2.0, 8.0] {
+            app.fs_zoom = zoom;
+            assert!(app.should_native_rerender_pdf_for_ai(idx));
+            assert!(app.display_should_defer_final_ai(idx));
+            assert!(app.pdf_prefetch_should_defer_ai(idx));
+        }
+        app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::None;
         app.fs_zoom = 1.0;
 
         // デノイズだけでも range 内なら再レンダ要。

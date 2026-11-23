@@ -70,6 +70,89 @@ mod positionless_release_tests {
     }
 
     #[test]
+    fn middle_short_click_same_pass_keeps_legacy_admission_without_exclusion() {
+        for allow_start in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            let pos = egui::pos2(40., 50.);
+            pointer_frame(
+                &ctx,
+                vec![
+                    button(pos, egui::PointerButton::Middle, true),
+                    button(pos, egui::PointerButton::Middle, false),
+                ],
+                || {
+                    assert_eq!(
+                        app.update_mouse_middle_short_click(
+                            &ctx,
+                            allow_start,
+                            super::super::ActionSurface::MainWindow,
+                        ),
+                        allow_start
+                    );
+                    assert!(app.mouse_middle_click_start.is_none());
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn depth_middle_short_click_mixed_same_pass_filters_each_pressed_position() {
+        let excluded = egui::Rect::from_min_max(egui::pos2(20., 20.), egui::pos2(80., 80.));
+        let panel = egui::pos2(40., 50.);
+        let canvas = egui::pos2(240., 50.);
+        for first_on_panel in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            let first = if first_on_panel { panel } else { canvas };
+            let second = if first_on_panel { canvas } else { panel };
+            pointer_frame(
+                &ctx,
+                vec![
+                    button(first, egui::PointerButton::Middle, true),
+                    button(first, egui::PointerButton::Middle, false),
+                    button(second, egui::PointerButton::Middle, true),
+                ],
+                || {
+                    assert_eq!(
+                        app.update_mouse_middle_short_click_with_release(
+                            &ctx,
+                            true,
+                            super::super::ActionSurface::Viewer,
+                            true,
+                            Some(excluded),
+                        ),
+                        !first_on_panel
+                    );
+                    assert_eq!(
+                        app.mouse_middle_click_start
+                            .as_ref()
+                            .map(|click| click.start),
+                        first_on_panel.then_some(second)
+                    );
+                },
+            );
+            pointer_frame(
+                &ctx,
+                vec![button(second, egui::PointerButton::Middle, false)],
+                || {
+                    assert_eq!(
+                        app.update_mouse_middle_short_click_with_release(
+                            &ctx,
+                            true,
+                            super::super::ActionSurface::Viewer,
+                            true,
+                            Some(excluded),
+                        ),
+                        first_on_panel
+                    );
+                    assert!(app.mouse_middle_click_start.is_none());
+                },
+            );
+        }
+    }
+
+    #[test]
     fn realmachine55_positionless_release_preserves_fresh_middle_down_same_frame() {
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
@@ -6057,6 +6140,9 @@ impl App {
     }
 
     fn change_ring_picker_value(&mut self, ctx: &egui::Context, row: RingPickerRowId, delta: i32) {
+        if row == RingPickerRowId::FitMode && self.fs_exclusive_view.is_depth() {
+            return;
+        }
         if row == RingPickerRowId::ItemRating
             && self
                 .ring_picker
@@ -6274,7 +6360,7 @@ impl App {
             {
                 self.set_reading_direction_for_fullscreen(ctx, fs_idx, picker.reading_direction);
             }
-            RingPickerRowId::FitMode if layout_supported => {
+            RingPickerRowId::FitMode if layout_supported && !self.fs_exclusive_view.is_depth() => {
                 let fit = picker.fit_mode.effective_for_flow(self.reading_flow);
                 if self
                     .settings
@@ -6472,12 +6558,16 @@ impl App {
 
     fn enter_ring_picker_list_for_current_row(&mut self, ctx: &egui::Context) -> bool {
         let ai_mode = self.settings.ai_feature_mode;
+        let depth_active = self.fs_exclusive_view.is_depth();
         let Some(picker) = self.ring_picker.as_mut() else {
             return false;
         };
         let Some(&row) = picker_rows_for_context(picker.context).get(picker.current_row()) else {
             return false;
         };
+        if row == RingPickerRowId::FitMode && depth_active {
+            return false;
+        }
         let list = if row == RingPickerRowId::PostFilter {
             PickerListState {
                 mode: PickerListMode::PostFilterGroup,
@@ -6591,6 +6681,9 @@ impl App {
         row: RingPickerRowId,
         index: usize,
     ) {
+        if row == RingPickerRowId::FitMode && self.fs_exclusive_view.is_depth() {
+            return;
+        }
         if row == RingPickerRowId::ItemRating
             && self
                 .ring_picker
@@ -7654,6 +7747,7 @@ impl App {
             }
             let fit = picker.fit_mode.effective_for_flow(self.reading_flow);
             if picker.dirty_rows.contains(&RingPickerRowId::FitMode)
+                && !self.fs_exclusive_view.is_depth()
                 && self
                     .settings
                     .fullscreen_fit_mode
@@ -7905,7 +7999,7 @@ impl App {
         allow_start: bool,
         surface: crate::app::ActionSurface,
     ) -> bool {
-        self.update_mouse_middle_short_click_with_release(ctx, allow_start, surface, true)
+        self.update_mouse_middle_short_click_with_release(ctx, allow_start, surface, true, None)
     }
 
     pub(crate) fn cancel_mouse_middle_short_click(&mut self) {
@@ -7918,6 +8012,7 @@ impl App {
         allow_start: bool,
         surface: crate::app::ActionSurface,
         allow_release: bool,
+        excluded_start_rect: Option<egui::Rect>,
     ) -> bool {
         let events = ctx.input(|input| input.pointer.button_events().collect::<Vec<_>>());
         let now = Instant::now();
@@ -7948,7 +8043,13 @@ impl App {
                 &mut self.mouse_middle_click_start,
                 sample,
                 surface,
-                allow_start,
+                // A terminal release clears PointerState::press_origin. Keep
+                // admission attached to each physical press in this sequence.
+                allow_start
+                    && !(sample.is_pressed
+                        && sample.current_pos.is_some_and(|pos| {
+                            excluded_start_rect.is_some_and(|rect| rect.contains(pos))
+                        })),
                 now,
             );
         }
@@ -13769,6 +13870,37 @@ mod next_input_tests {
     use crate::grid_item::GridItem;
     use crate::settings::{FullscreenFitMode, ReadingFlow};
     use crate::ui_dialogs::file_organize::FileOrganizeRequest;
+
+    #[test]
+    fn depth_fit_picker_row_rejects_preview_value_list_and_commit() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        app.items = vec![GridItem::Image(app.tmp.path().join("depth-fit.jpg"))];
+        app.fullscreen_idx = Some(0);
+        app.settings.fullscreen_fit_mode = FullscreenFitMode::Page;
+        app.fs_exclusive_view = crate::fs_exclusive_view::FsExclusiveView::Depth(
+            crate::depth_parallax::DepthViewState::new(app.edit_request_owner_context()),
+        );
+        let mut picker = app.build_ring_picker_state(RingShortcutContext::ImageFullscreen);
+        picker.row = picker_rows_for_context(picker.context)
+            .iter()
+            .position(|row| *row == RingPickerRowId::FitMode)
+            .unwrap();
+        app.ring_picker = Some(picker.clone());
+        app.change_ring_picker_value(&ctx, RingPickerRowId::FitMode, 1);
+        app.set_ring_picker_row_value_selection(&ctx, RingPickerRowId::FitMode, 1);
+        assert!(!app.enter_ring_picker_list_for_current_row(&ctx));
+        assert_eq!(
+            app.ring_picker.as_ref().unwrap().fit_mode,
+            FullscreenFitMode::Page
+        );
+        picker.fit_mode = FullscreenFitMode::Width;
+        picker.dirty_rows.push(RingPickerRowId::FitMode);
+        app.preview_image_picker_row(&ctx, 0, &picker, RingPickerRowId::FitMode);
+        assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
+        app.apply_image_picker_state(&ctx, 0, picker);
+        assert_eq!(app.settings.fullscreen_fit_mode, FullscreenFitMode::Page);
+    }
 
     #[test]
     fn page_turn_first_gamepad_navigation_skip_keeps_the_dispatched_id() {

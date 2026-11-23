@@ -15,12 +15,12 @@ pub(crate) use export::DepthFrameRenderer;
 
 // No sRGB texture format is used: egui stores sRGB-encoded bytes in Rgba8Unorm.
 pub(crate) const DEPTH_SHADER: &str = r#"
-struct Vertex { @builtin(position) position:vec4<f32>, @location(0) uv:vec2<f32> };
+struct Vertex { @builtin(position) position:vec4<f32> };
 @vertex fn vs_main(@builtin(vertex_index) i:u32)->Vertex {
     var p=array<vec2<f32>,3>(vec2(-1.,-1.),vec2(3.,-1.),vec2(-1.,3.));
-    var o:Vertex; o.position=vec4(p[i],0.,1.); o.uv=vec2((p[i].x+1.)*.5,(1.-p[i].y)*.5); return o;
+    var o:Vertex; o.position=vec4(p[i],0.,1.); return o;
 }
-struct Params { motion:vec4<f32>, crop:vec4<f32>, view:vec4<f32> };
+struct Params { motion:vec4<f32>, crop:vec4<f32>, view:vec4<f32>, paint:vec4<f32>, frame:vec4<f32> };
 @group(0) @binding(0) var color:texture_2d<f32>;
 @group(0) @binding(1) var depth:texture_2d<f32>;
 @group(0) @binding(2) var samp:sampler;
@@ -39,8 +39,12 @@ fn depth_at(p:vec2<f32>)->f32 {
     return pow(clamp(textureSampleLevel(depth,samp,source_uv(p),0.).r,0.,1.),params.motion.w);
 }
 @fragment fn fs_main(in:Vertex)->@location(0) vec4<f32> {
-    let base=(in.uv-.5)/params.view.x+.5;
-    let offset=params.motion.xy*vec2(1.,params.view.z);
+    let q=in.position.xy-params.frame.xy;
+    let local=vec2(params.frame.z*q.x+params.frame.w*q.y,-params.frame.w*q.x+params.frame.z*q.y);
+    let in_uv=(params.frame.xy+local-params.paint.xy)/params.paint.zw;
+    let base=(in_uv-.5)/params.view.x+.5;
+    let motion=params.motion.xy;
+    let offset=vec2(params.frame.z*motion.x+params.frame.w*motion.y,-params.frame.w*motion.x+params.frame.z*motion.y)*vec2(1.,params.view.z);
     // Derivatives remain uniform even though individual rays terminate at different depths.
     let dx=dpdx(source_uv(base)); let dy=dpdy(source_uv(base));
     var near=1.; var far=0.; var previous=1.; var hit=false;
@@ -60,7 +64,8 @@ fn depth_at(p:vec2<f32>)->f32 {
     let c=textureSampleGrad(color,samp,uv,dx,dy);
     let h=params.view.w;
     let w=h*(1.-smoothstep(0.03,0.05,abs((near+far)*.5-params.motion.z)));
-    return vec4(mix(c.rgb*(1.-0.2*h),vec3(0.,0.85,1.)*c.a,0.55*w),c.a);
+    let result=vec4(mix(c.rgb*(1.-0.2*h),vec3(0.,0.85,1.)*c.a,0.55*w),c.a);
+    return select(vec4(0.),result,all(in_uv>=vec2(0.)) && all(in_uv<=vec2(1.)));
 }
 "#;
 const BLIT_SHADER: &str = r#"
@@ -109,7 +114,7 @@ impl DepthRenderParams {
         self.focus_highlight = intensity;
         self
     }
-    fn bytes(self) -> [u8; 48] {
+    fn bytes(self, mapping: DepthScreenMapping) -> [u8; 80] {
         let values = [
             self.offset.x,
             self.offset.y,
@@ -123,12 +128,94 @@ impl DepthRenderParams {
             self.quarter_turns as f32,
             self.aspect,
             self.focus_highlight,
+            mapping.paint.min.x,
+            mapping.paint.min.y,
+            mapping.paint.width(),
+            mapping.paint.height(),
+            mapping.center.x,
+            mapping.center.y,
+            mapping.cos,
+            mapping.sin,
         ];
-        let mut bytes = [0; 48];
+        let mut bytes = [0; 80];
         for (chunk, v) in bytes.chunks_exact_mut(4).zip(values) {
             chunk.copy_from_slice(&v.to_le_bytes());
         }
         bytes
+    }
+}
+
+/// One screen-to-local mapping for uniform creation and offset-zero focus lookup.
+/// Coordinates may be points (CPU) or physical pixels (shader).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DepthScreenMapping {
+    paint: egui::Rect,
+    center: egui::Pos2,
+    cos: f32,
+    sin: f32,
+}
+
+impl DepthScreenMapping {
+    pub(crate) fn new(paint: egui::Rect, center: egui::Pos2, angle: f32) -> Self {
+        let (sin, cos) = angle.sin_cos();
+        Self {
+            paint,
+            center,
+            cos,
+            sin,
+        }
+    }
+
+    pub(crate) fn from_transform(
+        transform: &crate::displayed_image_transform::DisplayedImageTransform,
+    ) -> Self {
+        Self::new(
+            transform.paint_rect,
+            transform.full_image_rect.center(),
+            transform.free_rotation_rad,
+        )
+    }
+
+    fn physical(self, pixels_per_point: f32) -> Self {
+        Self {
+            paint: egui::Rect::from_min_max(
+                self.paint.min * pixels_per_point,
+                self.paint.max * pixels_per_point,
+            ),
+            center: self.center * pixels_per_point,
+            ..self
+        }
+    }
+
+    pub(crate) fn local_uv(self, pos: egui::Pos2) -> Option<egui::Vec2> {
+        if self.paint.width() <= 0.0 || self.paint.height() <= 0.0 {
+            return None;
+        }
+        let q = pos - self.center;
+        let local = egui::vec2(
+            self.cos * q.x + self.sin * q.y,
+            -self.sin * q.x + self.cos * q.y,
+        );
+        let uv = (self.center + local - self.paint.min) / self.paint.size();
+        (uv.is_finite() && uv.x >= 0.0 && uv.y >= 0.0 && uv.x <= 1.0 && uv.y <= 1.0).then_some(uv)
+    }
+}
+
+impl From<egui::Rect> for DepthScreenMapping {
+    fn from(paint: egui::Rect) -> Self {
+        Self::new(paint, paint.center(), 0.0)
+    }
+}
+
+pub(crate) fn depth_visible_center(
+    transform: &crate::displayed_image_transform::DisplayedImageTransform,
+    canvas: egui::Rect,
+) -> egui::Pos2 {
+    let bounds = egui::Rect::from_points(&transform.paint_quad().positions).intersect(canvas);
+    if bounds.is_positive() {
+        bounds.center()
+    } else {
+        canvas.center()
     }
 }
 pub(crate) fn depth_gamma(enabled: bool, median: f32) -> f32 {
@@ -143,23 +230,17 @@ pub(crate) fn depth_gamma(enabled: bool, median: f32) -> f32 {
 /// bilinear sampling at texel centers, then shaping. No previous-pass geometry.
 pub(crate) fn focus_depth_at(
     pos: egui::Pos2,
-    paint_rect: egui::Rect,
+    mapping: impl Into<DepthScreenMapping>,
     params: DepthRenderParams,
     width: u32,
     height: u32,
     values: &[half::f16],
 ) -> Option<f32> {
-    if !paint_rect.contains(pos)
-        || paint_rect.width() <= 0.0
-        || paint_rect.height() <= 0.0
-        || width == 0
-        || height == 0
-        || values.len() != width as usize * height as usize
-    {
+    let in_uv = mapping.into().local_uv(pos)?;
+    if width == 0 || height == 0 || values.len() != width as usize * height as usize {
         return None;
     }
-    let p = ((pos - paint_rect.min) / paint_rect.size() - egui::Vec2::splat(0.5)) / params.zoom
-        + egui::Vec2::splat(0.5);
+    let p = (in_uv - egui::Vec2::splat(0.5)) / params.zoom + egui::Vec2::splat(0.5);
     let p = match params.quarter_turns % 4 {
         1 => egui::vec2(p.y, 1.0 - p.x),
         2 => egui::vec2(1.0 - p.x, 1.0 - p.y),
@@ -697,7 +778,7 @@ impl DepthRenderResources {
         let sampler = sampler(device);
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("depth photo uniform"),
-            size: 48,
+            size: 80,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -756,6 +837,7 @@ pub(crate) struct DepthShaderCallback {
     pub key: DepthSourceKey,
     pub resource_id: u64,
     pub params: DepthRenderParams,
+    pub mapping: DepthScreenMapping,
     pub target_format: wgpu::TextureFormat,
 }
 impl DepthShaderCallback {
@@ -768,7 +850,7 @@ impl egui_wgpu::CallbackTrait for DepthShaderCallback {
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        _screen: &egui_wgpu::ScreenDescriptor,
+        screen: &egui_wgpu::ScreenDescriptor,
         _encoder: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
@@ -791,7 +873,13 @@ impl egui_wgpu::CallbackTrait for DepthShaderCallback {
         if let Some(slot) = resources.get::<DepthRenderResourcesRef>()
             && self.matches(&slot.0)
         {
-            queue.write_buffer(&slot.0.uniform, 0, &self.params.bytes());
+            queue.write_buffer(
+                &slot.0.uniform,
+                0,
+                &self
+                    .params
+                    .bytes(self.mapping.physical(screen.pixels_per_point)),
+            );
         }
         Vec::new()
     }
@@ -819,6 +907,247 @@ impl egui_wgpu::CallbackTrait for DepthShaderCallback {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn depth_transform_mapping_roundtrips_fractional_geometry_and_physical_uniforms() {
+        let paint = egui::Rect::from_min_size(egui::pos2(-120.25, 30.5), egui::vec2(640.5, 470.25));
+        let center = egui::pos2(205.75, 230.125);
+        for angle in [-1.1_f32, -0.3, 0., 0.7, 1.57] {
+            let map = DepthScreenMapping::new(paint, center, angle);
+            let (sin, cos) = angle.sin_cos();
+            for uv in [
+                egui::vec2(0.1, 0.2),
+                egui::Vec2::splat(0.5),
+                egui::vec2(0.9, 0.8),
+            ] {
+                let q = paint.min + paint.size() * uv - center;
+                let pos = center + egui::vec2(cos * q.x - sin * q.y, sin * q.x + cos * q.y);
+                assert!((map.local_uv(pos).unwrap() - uv).abs().max_elem() < 1e-5);
+                let physical = map.physical(1.5);
+                assert!(
+                    (physical.local_uv(pos * 1.5).unwrap() - uv)
+                        .abs()
+                        .max_elem()
+                        < 1e-5
+                );
+                let params = DepthRenderParams::from_settings(
+                    &Default::default(),
+                    0.5,
+                    egui::Vec2::ZERO,
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1., 1.)),
+                    0,
+                    paint.aspect_ratio(),
+                );
+                assert_eq!(params.bytes(physical).len(), 80);
+            }
+            assert!(map.local_uv(center + egui::vec2(10000., 10000.)).is_none());
+        }
+    }
+
+    #[test]
+    fn depth_transform_gpu_matches_2d_zoom_pan_rotation_crop_and_clip() {
+        use crate::displayed_image_transform::{
+            DisplayedImageTransform, DisplayedImageTransformInput, FullscreenFitScaleLimits,
+            RectPixelFit, ResolvedDisplayPlacement,
+        };
+        use crate::egui037_stage4_gpu_tests::OffscreenGpu;
+        let mut gpu = OffscreenGpu::new();
+        let ctx = egui::Context::default();
+        let source = ctx.load_texture(
+            "transformed-depth-ramp",
+            egui::ColorImage::new(
+                [64, 48],
+                (0..48)
+                    .flat_map(|y| (0..64).map(move |x| egui::Color32::from_rgb(x * 2, y * 3, 80)))
+                    .collect(),
+            ),
+            egui::TextureOptions::LINEAR,
+        );
+        let size = [96, 80];
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(96., 80.));
+        let clip = viewport.shrink(5.);
+        render_egui_frame(&mut gpu, &ctx, size, |_| {});
+        for angle in [-0.55, 0., 0.4] {
+            for rotation in [
+                crate::rotation_db::Rotation::None,
+                crate::rotation_db::Rotation::Cw90,
+            ] {
+                for extent in [egui::vec2(72., 54.), egui::vec2(190., 142.5)] {
+                    let transform = DisplayedImageTransform::from_resolved_rect(
+                        DisplayedImageTransformInput {
+                            pixel_fit: RectPixelFit::Texels,
+                            page_idx: 0,
+                            viewport_rect: viewport,
+                            source_size: egui::vec2(64., 48.),
+                            texture_size: egui::vec2(64., 48.),
+                            rotation,
+                            free_rotation_rad: angle,
+                            content_bbox: Some(egui::Rect::from_min_max(
+                                egui::pos2(0.1, 0.2),
+                                egui::pos2(0.9, 0.8),
+                            )),
+                            fit_mode: crate::fullscreen_specified_scale::FullscreenFitInput::legacy(
+                                crate::settings::FullscreenFitMode::Page,
+                            ),
+                            fit_scale_limits: FullscreenFitScaleLimits::default(),
+                            pixels_per_point: 1.,
+                            placement: ResolvedDisplayPlacement::Normal { zoom_pan: None },
+                        },
+                        egui::Rect::from_center_size(
+                            viewport.center() + egui::vec2(-17., 11.),
+                            extent,
+                        ),
+                    )
+                    .unwrap();
+                    let two_d = render_egui_frame(&mut gpu, &ctx, size, |painter| {
+                        transform.paint_texture(
+                            &painter.with_clip_rect(clip),
+                            source.id(),
+                            egui::Color32::WHITE,
+                        )
+                    });
+                    let job = install_two_depth_planes(&mut gpu, source.id(), &transform);
+                    let three_d = render_egui_frame(&mut gpu, &ctx, size, |painter| {
+                        let painter = painter.with_clip_rect(clip);
+                        let bounds = egui::Rect::from_points(&transform.paint_quad().positions)
+                            .intersect(clip);
+                        painter.add(egui::Shape::Callback(
+                            egui_wgpu::Callback::new_paint_callback(bounds, job.clone()),
+                        ));
+                    });
+                    let mapping = DepthScreenMapping::from_transform(&transform);
+                    for y in 0..size[1] {
+                        for x in 0..size[0] {
+                            let pos = egui::pos2(x as f32 + 0.5, y as f32 + 0.5);
+                            // Mesh edge coverage can differ from the shader's hard quad boundary.
+                            if let Some(uv) = mapping.local_uv(pos) {
+                                let edge = (uv.min(egui::Vec2::splat(1.) - uv)
+                                    * transform.paint_rect.size())
+                                .min_elem();
+                                if edge < 2. {
+                                    continue;
+                                }
+                            } else {
+                                // Exclude the outside half of the same raster edge band.
+                                let near = [
+                                    egui::vec2(2., 0.),
+                                    egui::vec2(-2., 0.),
+                                    egui::vec2(0., 2.),
+                                    egui::vec2(0., -2.),
+                                ]
+                                .iter()
+                                .any(|delta| mapping.local_uv(pos + *delta).is_some());
+                                if near {
+                                    continue;
+                                }
+                            }
+                            let i = (y * size[0] + x) as usize;
+                            for (a, b) in three_d[i].iter().zip(two_d[i]) {
+                                assert!(
+                                    a.abs_diff(b) <= 2,
+                                    "angle={angle} rotation={rotation:?} extent={extent:?} pixel={pos:?}: {:?} vs {:?}",
+                                    three_d[i],
+                                    two_d[i]
+                                );
+                            }
+                        }
+                    }
+                    let visible = depth_visible_center(&transform, viewport);
+                    assert_eq!(
+                        visible,
+                        egui::Rect::from_points(&transform.paint_quad().positions)
+                            .intersect(viewport)
+                            .center()
+                    );
+                    let mut mouse = crate::depth_parallax::MouseFollow::default();
+                    mouse.update(Some(visible), visible, viewport, false, 0.02, 1.);
+                    assert_eq!(mouse.target, egui::Vec2::ZERO);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn depth_transform_gpu_free_rotation_keeps_motion_on_screen_axes() {
+        use crate::egui037_stage4_gpu_tests::{OffscreenGpu, callback};
+        let mut gpu = OffscreenGpu::new();
+        let ctx = egui::Context::default();
+        let size = [96, 80];
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(96., 80.));
+        let source = ctx.load_texture(
+            "screen-axis-depth-ramp",
+            egui::ColorImage::new(
+                [64, 48],
+                (0..48)
+                    .flat_map(|y| (0..64).map(move |x| egui::Color32::from_rgb(x * 3, y * 5, 80)))
+                    .collect(),
+            ),
+            egui::TextureOptions::LINEAR,
+        );
+        render_egui_frame(&mut gpu, &ctx, size, |_| {});
+        let transform = cropped_quarter_turn(
+            viewport,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(1.)),
+        );
+        let mut job = install_two_depth_planes(&mut gpu, source.id(), &transform);
+        let installed = gpu
+            .renderer
+            .callback_resources
+            .get::<DepthRenderResourcesRef>()
+            .unwrap()
+            .0
+            .clone();
+        let flat = Arc::new(
+            DepthTexture::upload(
+                &gpu.device,
+                &gpu.queue,
+                DepthMap {
+                    key: installed.key,
+                    width: 2,
+                    height: 2,
+                    values: vec![half::f16::from_f32(0.75); 4],
+                    median: 0.75,
+                },
+            )
+            .unwrap(),
+        );
+        let resource = Arc::new(DepthRenderResources::new(
+            &gpu.device,
+            installed.context,
+            installed.key,
+            installed.color.clone(),
+            flat,
+        ));
+        job.resource_id = resource.resource_id;
+        job.params.focus = 0.25;
+        job.params.quarter_turns = 0;
+        job.params.uv = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(1.));
+        let paint = egui::Rect::from_center_size(viewport.center(), egui::vec2(256., 192.));
+        job.params.aspect = paint.aspect_ratio();
+        gpu.renderer
+            .callback_resources
+            .insert(DepthRenderResourcesRef(resource));
+        for angle in [-0.6, 0.6] {
+            job.mapping = DepthScreenMapping::new(paint, paint.center(), angle);
+            job.params.offset = egui::Vec2::ZERO;
+            let still = gpu.render(&[callback(viewport, job.clone())], size, [0, 0, 0, 0]);
+            for sign in [-1., 1.] {
+                job.params.offset = egui::vec2(sign * 32. / paint.width(), 0.);
+                let moved = gpu.render(&[callback(viewport, job.clone())], size, [0, 0, 0, 0]);
+                for (x, y) in [(32, 32), (48, 40), (60, 50)] {
+                    let sample_x = (x as f32 - sign * 16.) as usize;
+                    let expected = still[y * 96 + sample_x];
+                    let actual = moved[y * 96 + x];
+                    for (a, b) in actual.into_iter().zip(expected) {
+                        assert!(
+                            a.abs_diff(b) <= 2,
+                            "angle={angle}, sign={sign}, pixel=({x},{y}): {actual:?} vs {expected:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn depth_gamma_bounds_and_median() {
         assert_eq!(depth_gamma(false, 0.2), 1.);
@@ -954,6 +1283,7 @@ mod tests {
                 aspect: transform.paint_rect.aspect_ratio(),
                 focus_highlight: 0.0,
             },
+            mapping: DepthScreenMapping::from_transform(transform),
             target_format: crate::egui037_stage4_gpu_tests::FORMAT,
         };
         gpu.renderer
@@ -1205,7 +1535,7 @@ mod tests {
                     offset: egui::vec2(0.5, 0.5),
                     ..job.params
                 }
-                .bytes(),
+                .bytes(job.mapping),
             );
             let exported = exporter.render(job.params).unwrap();
             let [width, height] = export_size.map(|n| n as usize);
@@ -1322,6 +1652,11 @@ mod tests {
             key,
             resource_id: rendered.resource_id,
             params,
+            mapping: egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(size[0] as f32, size[1] as f32),
+            )
+            .into(),
             target_format: FORMAT,
         };
         let rect =
@@ -1363,7 +1698,7 @@ mod tests {
         let mut mouse = crate::depth_parallax::MouseFollow::default();
         mouse.update(
             Some(egui::pos2(rect.right(), rect.center().y)),
-            rect,
+            rect.center(),
             rect,
             false,
             0.05,
