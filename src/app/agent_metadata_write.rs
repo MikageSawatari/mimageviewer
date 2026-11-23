@@ -237,7 +237,8 @@ impl App {
             | UiRequestKind::GetViewState { .. }
             | UiRequestKind::GetSettings { .. }
             | UiRequestKind::SetSettings { .. }
-            | UiRequestKind::SetFavorite(_) => {
+            | UiRequestKind::SetFavorite(_)
+            | UiRequestKind::StackScriptAdmission => {
                 unreachable!("non-write requests have their own UI handler")
             }
         };
