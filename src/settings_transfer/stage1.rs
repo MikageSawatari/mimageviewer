@@ -281,6 +281,7 @@ no_choices!(
     [u8; 3],
     bool,
     crate::details_name_colors::DetailsNameColors,
+    crate::folder_cell_background::FolderCellBackground,
     crate::file_type_visibility::FileTypeVisibility,
     crate::grid_item::ContainerIconKinds,
     crate::video::seek_strip_layout::SeekStripCycleSet,
@@ -1016,9 +1017,9 @@ mod tests {
         assert_eq!(rows.len(), keys.len());
         let (export, issues) = project(capture_export(&settings));
         assert!(issues.is_empty(), "{issues:?}");
-        assert_eq!(export.len(), 169);
+        assert_eq!(export.len(), 170);
         assert_eq!(STAGE1_MARKED_ANCHORS.len(), 57);
-        assert_eq!(rows.len(), 226);
+        assert_eq!(rows.len(), 227);
         for key in export.keys() {
             assert!(keys.contains(key.as_str()), "{key}");
         }
@@ -1160,6 +1161,36 @@ mod tests {
             candidate.fullscreen_n_scroll_wrap_step_percent,
             imported.fullscreen_n_scroll_wrap_step_percent
         );
+    }
+
+    #[test]
+    fn stage1_folder_cell_background_uses_transfer_validation() {
+        let settings = default_settings();
+        for (value, valid) in [
+            (
+                json!({"enabled": true, "light": [255,255,230], "dark": [30,35,20]}),
+                true,
+            ),
+            (
+                json!({"enabled": false, "light": [255,240,179], "dark": [58,52,32]}),
+                false,
+            ),
+            (
+                json!({"enabled": true, "light": [255,244,204], "dark": [220,220,220]}),
+                false,
+            ),
+        ] {
+            let changes = change("folder_cell_background", value.clone());
+            assert_eq!(parse_items(&changes).issues.is_empty(), valid);
+            let result = stage1_validate(&settings, &changes);
+            assert_eq!(result.is_ok(), valid);
+            if valid {
+                assert_eq!(
+                    serde_json::to_value(result.unwrap().folder_cell_background).unwrap(),
+                    value
+                );
+            }
+        }
     }
     #[test]
     fn stage1_marked_option_values_can_reset_to_ui_defaults() {

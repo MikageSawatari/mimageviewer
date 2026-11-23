@@ -3094,6 +3094,50 @@ fn details_icons_light() {
 fn details_name_colors_light() {
     snapshot_details_name_colors("details_name_colors_light", false, false);
 }
+
+#[test]
+fn folder_cell_background_settings_light() {
+    snapshot_details_name_fixture(
+        "folder_cell_background_settings_light",
+        false,
+        false,
+        egui::vec2(720.0, 520.0),
+        mimageviewer::draw_folder_cell_background_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn folder_cell_background_settings_dark() {
+    snapshot_details_name_fixture(
+        "folder_cell_background_settings_dark",
+        true,
+        false,
+        egui::vec2(720.0, 520.0),
+        mimageviewer::draw_folder_cell_background_settings_snapshot_fixture,
+    );
+}
+
+#[test]
+fn folder_cell_background_cells_light() {
+    snapshot_details_name_fixture(
+        "folder_cell_background_cells_light",
+        false,
+        false,
+        egui::vec2(630.0, 500.0),
+        mimageviewer::draw_folder_cell_background_snapshot_fixture,
+    );
+}
+
+#[test]
+fn folder_cell_background_cells_dark() {
+    snapshot_details_name_fixture(
+        "folder_cell_background_cells_dark",
+        true,
+        false,
+        egui::vec2(630.0, 500.0),
+        mimageviewer::draw_folder_cell_background_snapshot_fixture,
+    );
+}
 #[test]
 fn details_name_colors_dark() {
     snapshot_details_name_colors("details_name_colors_dark", true, false);
