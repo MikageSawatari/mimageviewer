@@ -70,6 +70,89 @@ mod positionless_release_tests {
     }
 
     #[test]
+    fn middle_short_click_same_pass_keeps_legacy_admission_without_exclusion() {
+        for allow_start in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            let pos = egui::pos2(40., 50.);
+            pointer_frame(
+                &ctx,
+                vec![
+                    button(pos, egui::PointerButton::Middle, true),
+                    button(pos, egui::PointerButton::Middle, false),
+                ],
+                || {
+                    assert_eq!(
+                        app.update_mouse_middle_short_click(
+                            &ctx,
+                            allow_start,
+                            super::super::ActionSurface::MainWindow,
+                        ),
+                        allow_start
+                    );
+                    assert!(app.mouse_middle_click_start.is_none());
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn depth_middle_short_click_mixed_same_pass_filters_each_pressed_position() {
+        let excluded = egui::Rect::from_min_max(egui::pos2(20., 20.), egui::pos2(80., 80.));
+        let panel = egui::pos2(40., 50.);
+        let canvas = egui::pos2(240., 50.);
+        for first_on_panel in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let ctx = egui::Context::default();
+            let first = if first_on_panel { panel } else { canvas };
+            let second = if first_on_panel { canvas } else { panel };
+            pointer_frame(
+                &ctx,
+                vec![
+                    button(first, egui::PointerButton::Middle, true),
+                    button(first, egui::PointerButton::Middle, false),
+                    button(second, egui::PointerButton::Middle, true),
+                ],
+                || {
+                    assert_eq!(
+                        app.update_mouse_middle_short_click_with_release(
+                            &ctx,
+                            true,
+                            super::super::ActionSurface::Viewer,
+                            true,
+                            Some(excluded),
+                        ),
+                        !first_on_panel
+                    );
+                    assert_eq!(
+                        app.mouse_middle_click_start
+                            .as_ref()
+                            .map(|click| click.start),
+                        first_on_panel.then_some(second)
+                    );
+                },
+            );
+            pointer_frame(
+                &ctx,
+                vec![button(second, egui::PointerButton::Middle, false)],
+                || {
+                    assert_eq!(
+                        app.update_mouse_middle_short_click_with_release(
+                            &ctx,
+                            true,
+                            super::super::ActionSurface::Viewer,
+                            true,
+                            Some(excluded),
+                        ),
+                        first_on_panel
+                    );
+                    assert!(app.mouse_middle_click_start.is_none());
+                },
+            );
+        }
+    }
+
+    #[test]
     fn realmachine55_positionless_release_preserves_fresh_middle_down_same_frame() {
         let mut app = crate::app::setup_app_for_test();
         let ctx = egui::Context::default();
@@ -7916,7 +7999,7 @@ impl App {
         allow_start: bool,
         surface: crate::app::ActionSurface,
     ) -> bool {
-        self.update_mouse_middle_short_click_with_release(ctx, allow_start, surface, true)
+        self.update_mouse_middle_short_click_with_release(ctx, allow_start, surface, true, None)
     }
 
     pub(crate) fn cancel_mouse_middle_short_click(&mut self) {
@@ -7929,6 +8012,7 @@ impl App {
         allow_start: bool,
         surface: crate::app::ActionSurface,
         allow_release: bool,
+        excluded_start_rect: Option<egui::Rect>,
     ) -> bool {
         let events = ctx.input(|input| input.pointer.button_events().collect::<Vec<_>>());
         let now = Instant::now();
@@ -7959,7 +8043,13 @@ impl App {
                 &mut self.mouse_middle_click_start,
                 sample,
                 surface,
-                allow_start,
+                // A terminal release clears PointerState::press_origin. Keep
+                // admission attached to each physical press in this sequence.
+                allow_start
+                    && !(sample.is_pressed
+                        && sample.current_pos.is_some_and(|pos| {
+                            excluded_start_rect.is_some_and(|rect| rect.contains(pos))
+                        })),
                 now,
             );
         }

@@ -528,51 +528,52 @@ fn depth_transform_middle_and_scrub_start_on_canvas_but_not_on_panel() {
     let _input = crate::key_input::lock_test_input();
     for scrub in [false, true] {
         for panel in [false, true] {
-            let mut app = crate::app::setup_app_for_test();
-            let mut viewer = RootDepthViewer::new(&mut app);
-            let resource_id = viewer.ready(&mut app);
-            app.window_visible = false;
-            for _ in 0..3 {
-                viewer.frame(&mut app, vec![]);
-            }
-            app.fs_focus_regained_at = None;
-            let panel_rect = app.visible_depth_panel_rect(&viewer.ctx).unwrap();
-            let on_panel = panel_rect.min + egui::vec2(15., 60.);
-            let on_canvas = egui::pos2(panel_rect.left() - 40., on_panel.y);
-            let start = if panel { on_panel } else { on_canvas };
-            let crossing = if panel { on_canvas } else { on_panel };
-            let returned = on_canvas + egui::vec2(-80., -50.);
-            if scrub {
-                app.keymap =
-                    crate::keymap::Keymap::from_ini_str("[FsImage]\nFsScrubZoomHold = Ctrl+Tab\n");
-                crate::key_input::arm_test_synthetic_input(0xE088, egui::ViewportId::ROOT);
-                let now = std::time::Instant::now();
-                crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
-                    now,
-                    SyntheticNavigationKey::Tab,
-                    SyntheticModifiers {
-                        ctrl: true,
-                        ..Default::default()
-                    },
-                ));
-                crate::key_input::advance_test_synthetic_input(now);
-            }
-            let before = app.fs_zoom;
-            let button = if scrub {
-                egui::PointerButton::Primary
-            } else {
-                egui::PointerButton::Middle
-            };
-            let modifiers = if scrub {
-                egui::Modifiers::CTRL
-            } else {
-                egui::Modifiers::NONE
-            };
-            // The press and boundary crossing share a pass, so hover already
-            // differs from press_origin when middle/scrub admission runs.
-            viewer.frame_with_before(
-                &mut app,
-                vec![
+            for completes_in_pass in [false, true] {
+                let mut app = crate::app::setup_app_for_test();
+                let mut viewer = RootDepthViewer::new(&mut app);
+                let resource_id = viewer.ready(&mut app);
+                app.window_visible = false;
+                for _ in 0..3 {
+                    viewer.frame(&mut app, vec![]);
+                }
+                app.fs_focus_regained_at = None;
+                let panel_rect = app.visible_depth_panel_rect(&viewer.ctx).unwrap();
+                let on_panel = panel_rect.min + egui::vec2(15., 60.);
+                let on_canvas = egui::pos2(panel_rect.left() - 40., on_panel.y);
+                let start = if panel { on_panel } else { on_canvas };
+                let crossing = if panel { on_canvas } else { on_panel };
+                let returned = on_canvas + egui::vec2(-80., -50.);
+                if scrub {
+                    app.keymap = crate::keymap::Keymap::from_ini_str(
+                        "[FsImage]\nFsScrubZoomHold = Ctrl+Tab\n",
+                    );
+                    crate::key_input::arm_test_synthetic_input(0xE088, egui::ViewportId::ROOT);
+                    let now = std::time::Instant::now();
+                    crate::key_input::enqueue_test_synthetic_command(SyntheticKeyCommand::down(
+                        now,
+                        SyntheticNavigationKey::Tab,
+                        SyntheticModifiers {
+                            ctrl: true,
+                            ..Default::default()
+                        },
+                    ));
+                    crate::key_input::advance_test_synthetic_input(now);
+                }
+                let before = app.fs_zoom;
+                let before_transform = (app.fs_zoom, app.fs_pan, app.fs_free_rotation);
+                let button = if scrub {
+                    egui::PointerButton::Primary
+                } else {
+                    egui::PointerButton::Middle
+                };
+                let modifiers = if scrub {
+                    egui::Modifiers::CTRL
+                } else {
+                    egui::Modifiers::NONE
+                };
+                // The press and boundary crossing share a pass, so hover already
+                // differs from press_origin when middle/scrub admission runs.
+                let mut start_events = vec![
                     egui::Event::ModifiersChanged(modifiers),
                     egui::Event::PointerMoved(start),
                     egui::Event::PointerButton {
@@ -582,59 +583,139 @@ fn depth_transform_middle_and_scrub_start_on_canvas_but_not_on_panel() {
                         modifiers,
                     },
                     egui::Event::PointerMoved(crossing),
-                ],
-                |_, ctx| {
+                ];
+                if completes_in_pass {
+                    start_events.push(egui::Event::PointerButton {
+                        pos: crossing,
+                        button,
+                        pressed: false,
+                        modifiers,
+                    });
+                }
+                viewer.frame_with_before(&mut app, start_events, |_, ctx| {
                     ctx.input(|input| {
                         assert_eq!(
                             input.pointer.press_origin(),
-                            Some(start),
-                            "scrub={scrub}, panel={panel}"
+                            (!completes_in_pass).then_some(start),
+                            "scrub={scrub}, panel={panel}, completes_in_pass={completes_in_pass}"
                         );
                         assert_eq!(
                             input.pointer.hover_pos(),
                             Some(crossing),
                             "scrub={scrub}, panel={panel}"
                         );
-                        assert!(
+                        assert_eq!(
                             input.pointer.button_down(button),
-                            "scrub={scrub}, panel={panel}"
+                            !completes_in_pass,
+                            "scrub={scrub}, panel={panel}, completes_in_pass={completes_in_pass}"
                         );
                     });
+                });
+                assert_eq!(
+                    app.fs_middle_zoom_drag.is_some(),
+                    !panel && !completes_in_pass,
+                    "scrub={scrub}, panel={panel}, completes_in_pass={completes_in_pass}, press={start:?}, hover={crossing:?}"
+                );
+                if completes_in_pass {
+                    assert_eq!(
+                        (app.fs_zoom, app.fs_pan, app.fs_free_rotation),
+                        before_transform
+                    );
+                } else {
+                    for (pos, edge) in [(returned, None), (returned, Some(false))] {
+                        let mut events = vec![
+                            egui::Event::ModifiersChanged(modifiers),
+                            egui::Event::PointerMoved(pos),
+                        ];
+                        if let Some(pressed) = edge {
+                            events.push(egui::Event::PointerButton {
+                                pos,
+                                button,
+                                pressed,
+                                modifiers,
+                            });
+                        }
+                        viewer.frame(&mut app, events);
+                    }
+                    assert_eq!(
+                        app.fs_zoom != before,
+                        !panel,
+                        "scrub={scrub}, panel={panel}"
+                    );
+                }
+                assert!(app.fs_middle_zoom_drag.is_none());
+                let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
+                    unreachable!()
+                };
+                assert_eq!(state.ready().unwrap().resource_id, resource_id);
+                if scrub {
+                    crate::key_input::clear_test_synthetic_input();
+                }
+            }
+        }
+    }
+    crate::key_input::clear_test_frame();
+}
+
+#[test]
+fn depth_transform_middle_short_click_same_pass_uses_pressed_position() {
+    use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+    let _input = crate::key_input::lock_test_input();
+    for starts_on_panel in [false, true] {
+        for ends_over_panel in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let mut viewer = RootDepthViewer::new(&mut app);
+            let resource_id = viewer.ready(&mut app);
+            app.window_visible = false;
+            for _ in 0..3 {
+                viewer.frame(&mut app, vec![]);
+            }
+            app.fs_focus_regained_at = None;
+            app.settings
+                .ring_shortcuts
+                .mouse_button_profile_mut(RingShortcutContext::ImageFullscreen)
+                .middle = RingActionId::ImageSlideshow;
+            let panel = app.visible_depth_panel_rect(&viewer.ctx).unwrap();
+            let on_panel = panel.min + egui::vec2(15., 60.);
+            let on_canvas = egui::pos2(panel.left() - 40., on_panel.y);
+            let press = if starts_on_panel { on_panel } else { on_canvas };
+            let hover = if ends_over_panel { on_panel } else { on_canvas };
+            let before = (app.fs_zoom, app.fs_pan, app.fs_free_rotation);
+            viewer.frame_with_before(
+                &mut app,
+                vec![
+                    egui::Event::PointerMoved(press),
+                    egui::Event::PointerButton {
+                        pos: press,
+                        button: egui::PointerButton::Middle,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    egui::Event::PointerButton {
+                        pos: press,
+                        button: egui::PointerButton::Middle,
+                        pressed: false,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                    // Later hover must neither admit a panel press nor reject a
+                    // canvas press after the release has cleared press_origin.
+                    egui::Event::PointerMoved(hover),
+                ],
+                |_, ctx| {
+                    assert!(ctx.input(|input| input.pointer.press_origin()).is_none());
                 },
             );
             assert_eq!(
-                app.fs_middle_zoom_drag.is_some(),
-                !panel,
-                "scrub={scrub}, panel={panel}, press={start:?}, hover={crossing:?}"
+                app.slideshow_playing, !starts_on_panel,
+                "starts_on_panel={starts_on_panel}, ends_over_panel={ends_over_panel}"
             );
-            for (pos, edge) in [(returned, None), (returned, Some(false))] {
-                let mut events = vec![
-                    egui::Event::ModifiersChanged(modifiers),
-                    egui::Event::PointerMoved(pos),
-                ];
-                if let Some(pressed) = edge {
-                    events.push(egui::Event::PointerButton {
-                        pos,
-                        button,
-                        pressed,
-                        modifiers,
-                    });
-                }
-                viewer.frame(&mut app, events);
-            }
-            assert_eq!(
-                app.fs_zoom != before,
-                !panel,
-                "scrub={scrub}, panel={panel}"
-            );
+            assert_eq!((app.fs_zoom, app.fs_pan, app.fs_free_rotation), before);
             assert!(app.fs_middle_zoom_drag.is_none());
+            assert_eq!(app.fullscreen_idx, Some(0));
             let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
                 unreachable!()
             };
             assert_eq!(state.ready().unwrap().resource_id, resource_id);
-            if scrub {
-                crate::key_input::clear_test_synthetic_input();
-            }
         }
     }
     crate::key_input::clear_test_frame();

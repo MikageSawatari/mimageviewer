@@ -579,6 +579,33 @@ Depth 以外では従来の `cursor_in_panel` と同じ値となり、開始済�
 失敗時に `scrub` / `panel` / 押下位置 / hover が分かる診断を追加した。
 この修正後のコンパイル・テストは実装担当では実行せず、設計担当が実行する予定。
 
+#### 同一 pass の中ボタン短押しの開始除外
+
+`13c40ca46` を基点に、短押しの開始位置をイベント列の各 `PointerButtonEvent::Pressed.pos` で判定するようにした。
+egui は release で `press_origin` を消すため、前回の共有した局所値は同一 pass の押下・release では
+パネル内の押下を表せなかった。短押しは両イベントを順に処理するので、ここでは pass 終了時の位置を使わない。
+
+- `update_mouse_middle_short_click_with_release` に開始除外矩形を引数で渡し、各押下サンプルの状態を作る前に判定する。
+  既存の状態・release の扱いは維持し、パネル上の新しい押下では短押し状態を作らない。
+  通常表示・メイン画面・ページ一覧では除外矩形を `None` とし、従来の `allow_start` と同じ条件を保つ。
+  ページ一覧の変更は引数追加への追従だけで、述語・viewport 配送は変更していない。
+- 通常ビューアの短押し受付では、Depth の hover だけでは拒否せず、描画済みパネル矩形をイベントごとの判定へ渡す。
+  押下後の移動でパネルへ入った／出た場合も、押下位置による許可を後から変えない。
+- 中ボタンドラッグの本体も、開始除外はその pass の実際の中ボタン押下イベントの位置を使う。
+  同一 pass で解放されている場合は終了処理へ進み、倍率・パンを書き込まず drag owner を残さない既存の扱いを保つ。
+  スクラブは同一 pass の解放後に `press_origin` を持たず開始せず、通常パン・回転も
+  `drag_started_by` / `dragged_by` の button-down 条件に入らない。終了済みの列から変換は適用しない。
+- 追加した `depth_transform_middle_short_click_same_pass_uses_pressed_position` は、中ボタンへスライドショーを割り当てた
+  実ビューアで、パネル上の短押しは発火せず、キャンバス上なら発火する条件を検査する。
+  押下・release 後の hover をパネル内外に変える組も含める。実 renderer を使うため GPU inventory に登録した。
+- 追加した CPU テスト `middle_short_click_same_pass_keeps_legacy_admission_without_exclusion` は除外なしの旧条件を検査する。
+  `depth_middle_short_click_mixed_same_pass_filters_each_pressed_position` はパネル／キャンバスの押下を同じ pass に混在させ、
+  それぞれの押下の位置で短押し状態を作ることを検査する。
+  既存の `depth_transform_middle_and_scrub_start_on_canvas_but_not_on_panel` にも、押下・移動・release が
+  同一 pass で完結する条件と、変換・drag owner が残らない条件を追加した。
+
+この修正後のコンパイル・テストは実装担当では実行せず、設計担当が実行する予定。
+
 ### 変更ファイルと要点
 
 | ファイル | 入れた変更 |
@@ -589,6 +616,7 @@ Depth 以外では従来の `cursor_in_panel` と同じ値となり、開始済�
 | `src/depth_parallax.rs` | MouseFollow に呼出元が求めた中心を渡す |
 | `src/app.rs` | PdfRerenderDemand の Depth 抑止の印、復帰時の比較記録の破棄、AI native の倍率条件の例外 |
 | `src/app/gamepad_input.rs` | ピッカーのフィット行の値変更・一覧・プレビュー・確定の受付を Depth 中は止める |
+| `src/app/gamepad_input.rs`、`src/ui_fullscreen/page_overview.rs` | 中短クリックの各押下位置による開始除外。除外なしの既存呼び出しは同じ受付条件を維持 |
 | `src/ui_fullscreen/depth_view_transform_tests.rs` | 共有状態・クリック・配置・PDF 抑止と D/F12/Z 復帰・2D と同じホイール予測・パネル上のドラッグ／ピンチ／中ボタン／スクラブ開始除外のテストを追加 |
 | `src/depth_focus_sampling_tests.rs` | GPU の止まる深さの比較に拡大・パン・自由回転を追加。ハイライト uniform 検査に写像の引数を指定 |
 | `src/ui_fullscreen/depth_focus_tests.rs` | 書き出し基準変換を渡す引数へ追従。可視範囲の中心に追従する期待値と全体表示の条件を追加 |
@@ -649,6 +677,9 @@ Depth 以外では従来の `cursor_in_panel` と同じ値となり、開始済�
 - `depth_transform_gpu_free_rotation_keeps_motion_on_screen_axes`
 - `depth_panel_blocks_plain_and_ctrl_wheel_admission`
 - `depth_transform_drag_start_follows_press_origin_across_panel`
+- `depth_transform_middle_short_click_same_pass_uses_pressed_position`
+- `middle_short_click_same_pass_keeps_legacy_admission_without_exclusion`
+- `depth_middle_short_click_mixed_same_pass_filters_each_pressed_position`
 
 ホイール予測の旧テストが既定設定のままでスクロールを期待していた点は、§8.2 どおり設定別・2D 比較へ直した。
 GPU の画素比較には補間・有限探索の誤差を許し、2D と shader の四角形の境界のラスタ被覆差だけは比較帯から除く。
@@ -669,8 +700,8 @@ test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/sp
 
 対象は `is_depth()` / `ExclusiveViewKind::Depth` / `FsZoomOwner::Depth` / `FsExclusiveView::Depth` と、
 `fs_exclusive_view_active(` の全出現 (複数行で `.is_some()` / `.is_none()` へ続くもの、宣言も含む)。
-行番号は `801cec0c9` と今回差分に対する整形後の source。テストの fixture / assert も省略せず列挙し、
-同じ分類の兄弟を 1 行にまとめた。現在の出現は 327 箇所。
+行番号は `13c40ca46` と今回差分に対する整形後の source。テストの fixture / assert も省略せず列挙し、
+同じ分類の兄弟を 1 行にまとめた。現在の出現は 328 箇所。
 `FsZoomOwner::Depth` は削除したため現在の出現は 0。削除・置換した入口は下の基点表に別記する。
 共通の占有述語で残す行は、2D の倍率操作ではなく、他機能の入場制限または Depth 自身の所有・寿命を表す。
 判定の定義 `fs_exclusive_view.rs::FsExclusiveView::is_depth` と、同ファイルの enum の Depth variant は
@@ -690,7 +721,7 @@ test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/sp
 | `src/app/depth_view.rs`: 70, 89, 199, 225, 240, 290, 299, 314, 487, 554, 624, 664, 683, 726, 736, 798, 821, 835, 852, 872, 907, 939, 951, 953, 969, 998, 1057, 1078, 1158, 1164, 1195, 1198, 1224, 1357, 1374, 1399, 1449, 1547, 1579 | 3D 固有に残す | 単一所有、入口・継続・終了、素材採用・描画・パネル・先読みと回帰 fixture |
 | `src/app/depth_view_tests.rs`: 65, 99, 169, 171, 187, 307, 392, 408, 440, 699, 700, 704, 749, 752, 883, 945, 969, 975, 1020, 1050, 1052, 1076, 1111, 1257, 1279, 1366, 1493, 1626, 1647, 1648, 1689, 1826, 1856, 1889, 1891, 2021, 2044, 2093, 2098, 2127, 2164, 2212, 2227, 2237, 2255, 2301, 2398, 2417, 2604, 2625, 2644, 2687, 2696, 2703, 2706, 2730, 2755, 2770, 2819, 2844, 2848, 2852, 2997, 2998, 3074, 3122, 3189, 3254, 3350, 3386, 3419 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/app/detached_media_exchange_tests.rs`: 211, 219 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
-| `src/app/gamepad_input.rs`: 6060, 6280, 6478, 6601, 7667, 8379, 8380, 13791 | 3D 固有に残す | フィット行の受付停止とリングの既存分類・回帰 fixture |
+| `src/app/gamepad_input.rs`: 6143, 6363, 6561, 6684, 7750, 8469, 8470, 13881 | 3D 固有に残す | フィット行の受付停止とリングの既存分類・回帰 fixture |
 | `src/app/multiwindow_scenario_tests.rs`: 524, 991, 1017 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/app/page_overview.rs`: 225, 233 | 3D 固有に残す | ページ一覧への入場抑止 |
 | `src/app/startup_ops.rs`: 3314, 3337 | 3D 固有に残す | 保持する Depth 所有者の回帰 fixture |
@@ -698,13 +729,13 @@ test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/sp
 | `src/app/tests/startup_restore.rs`: 764, 817 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/app/viewer_context_registry.rs`: 4456 | 3D 固有に残す | fork 前の既存終了処理を維持。実装は変更しない |
 | `src/app/vram_accounting.rs`: 147 | 3D 固有に残す | Depth 資源の VRAM 会計 |
-| `src/ui_fullscreen.rs`: 15082, 15153, 16011, 22909, 25943, 26024, 29007, 29041, 29392, 29657, 30288, 30440, 30538, 31635, 33085, 35418, 35591, 37039, 37048, 37055, 37792, 38558, 41099, 41164, 41165, 42932, 43054, 43069, 43366, 43430, 43657, 43688, 44281, 44910, 44914, 45827, 46340, 47415, 47464, 47465, 52001, 56679 | 3D 固有に残す | Z の休止、占有制限、Depth パネル・素材・先読み・待機・終了、PDF 需要、フィット受付の分類を維持 |
+| `src/ui_fullscreen.rs`: 15082, 15153, 16020, 22918, 25952, 26033, 29016, 29050, 29401, 29666, 30297, 30449, 30547, 31644, 33094, 35427, 35600, 37048, 37057, 37064, 37801, 38567, 41108, 41173, 41174, 42942, 43064, 43079, 43376, 43440, 43667, 43698, 44291, 44920, 44924, 45837, 46350, 47425, 47474, 47475, 52011, 56689 | 3D 固有に残す | Z の休止、占有制限、Depth パネル・素材・先読み・待機・終了、PDF 需要、フィット受付の分類を維持 |
 | `src/ui_fullscreen.rs`: 15547 | 2D と同じにする | `fs_zoom_owner`: Z より先に Image を選ぶ |
 | `src/ui_fullscreen/depth_focus_tests.rs`: 193, 207, 267, 294, 349, 496, 529, 597, 607, 614, 760, 843, 933, 1020, 1034, 1064, 1114 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/depth_main_window_tests.rs`: 120 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/depth_slideshow_tests.rs`: 14, 52, 76, 395, 405, 458, 648, 660, 702, 715, 739, 776, 826, 852, 887, 1036, 1052, 1145, 1189 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/depth_tests.rs`: 40, 53, 66, 126, 154 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
-| `src/ui_fullscreen/depth_view_transform_tests.rs`: 11, 43, 56, 70, 179, 203, 256, 262, 278, 631, 712, 755, 834 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/ui_fullscreen/depth_view_transform_tests.rs`: 11, 43, 56, 70, 179, 203, 256, 262, 278, 647, 715, 793, 836, 915 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/page_turn.rs`: 2002 | 3D 固有に残す | Depth 中の紙めくりの抑止 |
 | `src/ui_video_tile.rs`: 69 | 3D 固有に残す | 動画タイルの入場抑止 |
 | `src/ui_view_trim.rs`: 993 | 3D 固有に残す | 編集中の入口の占有制限 |
@@ -734,10 +765,10 @@ test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/sp
 
 | 箇所 | 入力・扱い |
 | --- | --- |
-| `ui_fullscreen.rs::maybe_rerender_pdf` (16010) | キー・ズーム・ドラッグ終端・ゲームパッド等の表示倍率。Depth 中は記録を更新せず印を立てて返す |
+| `ui_fullscreen.rs::maybe_rerender_pdf` (16019) | キー・ズーム・ドラッグ終端・ゲームパッド等の表示倍率。Depth 中は記録を更新せず印を立てて返す |
 | `draw_fs_zoom_mode_with_receipt` (15497) の `note_legacy` | Z の実効倍率の比較。Depth 中は Z 自体が休止し、この分岐に入らない |
-| `reconcile_specified_pdf_demand` → `reconcile_pdf_layout_demand` (33084、33102) | 指定倍率の描画済み絶対寸法。Depth 中は `note_absolute` に達する前に印を立てて返す |
-| `reconcile_continuous_pdf_demand` → `reconcile_pdf_layout_demand` (33098、33102) | 連結読みの可視ページ。Depth は連結を継続できないため今回変更しない |
+| `reconcile_specified_pdf_demand` → `reconcile_pdf_layout_demand` (33093、33111) | 指定倍率の描画済み絶対寸法。Depth 中は `note_absolute` に達する前に印を立てて返す |
+| `reconcile_continuous_pdf_demand` → `reconcile_pdf_layout_demand` (33107、33111) | 連結読みの可視ページ。Depth は連結を継続できないため今回変更しない |
 | `app.rs::request_pdf_absolute_demand_inner` (83293、83296、83308) | absolute 記録の比較と通常／連結の発行先。AI native の必要寸法を優先する既存方針も維持 |
 | `ensure_pdf_display_resolution` (83362) | 読み込み時の窓サイズ・90 度回転・フィット設定。倍率・パン・自由回転を入力にしない |
 | `prefetch_final_ai` (86361) | AI 先読み用の native、倍率 1。抑止しない |

@@ -15714,14 +15714,23 @@ impl App {
         full_rect: egui::Rect,
         front: FsFrontPointerFrameInput,
     ) -> bool {
-        let (down, pressed, released, pos, press_origin) = ctx.input(|i| {
+        let (down, pressed, released, pos, press_pos) = ctx.input(|i| {
             (
                 i.pointer.button_down(egui::PointerButton::Middle),
                 i.pointer.button_pressed(egui::PointerButton::Middle),
                 !front.owns_release(egui::PointerButton::Middle)
                     && i.pointer.button_released(egui::PointerButton::Middle),
                 i.pointer.interact_pos(),
-                i.pointer.press_origin(),
+                i.pointer
+                    .button_events()
+                    .rev()
+                    .find_map(|event| match event {
+                        egui::PointerButtonEvent::Pressed {
+                            button: egui::PointerButton::Middle,
+                            pos,
+                        } => Some(pos),
+                        _ => None,
+                    }),
             )
         });
         self.retire_changed_drag_zoom(ctx);
@@ -15749,7 +15758,7 @@ impl App {
             owner,
             rect.center(),
             true,
-            !press_origin.is_some_and(|pos| {
+            !press_pos.is_some_and(|pos| {
                 self.visible_depth_panel_rect(ctx)
                     .is_some_and(|panel| panel.contains(pos))
             }),
@@ -41807,9 +41816,10 @@ impl App {
         // 走っているときはカーソルがパネルを通過しても継続させる (UX のブレ防止)。
         let middle_short_click = self.update_mouse_middle_short_click_with_release(
             ctx,
-            !drag_start_in_panel && !overflow_pointer_input.middle_owned,
+            (!cursor_in_panel || cursor_in_depth_panel) && !overflow_pointer_input.middle_owned,
             crate::app::ActionSurface::Viewer,
             !overflow_pointer_input.owns_release(egui::PointerButton::Middle),
+            self.visible_depth_panel_rect(ctx),
         );
         if !overflow_pointer_input.middle_owned
             && (!drag_start_in_panel || self.fs_middle_zoom_drag.is_some())

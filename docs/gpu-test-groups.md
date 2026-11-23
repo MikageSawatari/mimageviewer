@@ -207,6 +207,10 @@ group の上限、全体並列数、retry・timeout・priority は変更しな�
 も `RootDepthViewer::new` を使うため完全名で登録する。既存の中ボタン・スクラブ・ピンチ・
 ホイール予測テストは同じ所属のまま、パネル境界と同一 pass のクリック release の条件を追加する。
 
+`ui_fullscreen::depth_view_transform_tests::depth_transform_middle_short_click_same_pass_uses_pressed_position`
+も、同一 pass の中ボタン短押しが実ビューアの割当操作へ届くかを `RootDepthViewer::new` で検査するため登録する。
+短押し状態だけを検査する `app::gamepad_input::positionless_release_tests` の追加2件は device を作らず、登録しない。
+
 ### 共通の登録形式
 
 正本は [.config/nextest.toml](../.config/nextest.toml)。`gpu_tests` と実device小moduleはprefix、
