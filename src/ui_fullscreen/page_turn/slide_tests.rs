@@ -61,6 +61,7 @@ fn page_turn_slide_offered_turning_clock_visibility_and_normal_flat_landing() {
         });
         let PresentationState::Turning {
             offer,
+            incoming,
             projection,
             clock: motion,
             ..
@@ -71,6 +72,11 @@ fn page_turn_slide_offered_turning_clock_visibility_and_normal_flat_landing() {
         assert!(matches!(projection.recipe, MotionRecipe::Slide(_)));
         assert_eq!(*motion, MotionClock::AwaitingAcceptedOutput);
         let tracker = offer.submission.clone();
+        let held_texture_ids = incoming
+            .pages
+            .iter()
+            .map(|page| page.resource.paint_texture_id())
+            .collect::<Vec<_>>();
         assert_eq!(tracker.started_at(), Some(origin + Duration::from_secs(2)));
         let first = first.unwrap();
         assert!(first.curl && first.was_accepted());
@@ -99,16 +105,16 @@ fn page_turn_slide_offered_turning_clock_visibility_and_normal_flat_landing() {
             assert!(!draw(&mut app, ui, ctx).curl);
         });
         assert_eq!(tracker.status(), SubmissionStatus::Finished);
-        assert!(matches!(
-            app.page_turn_presentation.state,
-            PresentationState::Completing { .. }
-        ));
-        // Deadline uses the normal paint path, with exactly the same page meshes
-        // as a subsequent ordinary flat frame, rather than a p=1 projection.
-        let normal = frame(&ctx, |ui, ctx| {
-            app.begin_page_turn_viewer_frame(ctx, false, None);
-            assert!(!draw(&mut app, ui, ctx).curl);
-        });
+        let PresentationState::Completing { incoming, .. } = &app.page_turn_presentation.state
+        else {
+            panic!("canonical landing")
+        };
+        let landing_texture_ids = incoming
+            .pages
+            .iter()
+            .map(|page| page.resource.paint_texture_id())
+            .collect::<Vec<_>>();
+        assert_eq!(landing_texture_ids, held_texture_ids);
         let meshes = |output: &egui::FullOutput| {
             output
                 .shapes
@@ -122,7 +128,28 @@ fn page_turn_slide_offered_turning_clock_visibility_and_normal_flat_landing() {
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(meshes(&landing), meshes(&normal));
+        let landing_meshes = meshes(&landing);
+        assert_eq!(
+            landing_meshes
+                .iter()
+                .map(|(_, mesh)| mesh.texture_id)
+                .collect::<Vec<_>>(),
+            landing_texture_ids,
+            "the canonical landing must paint every held incoming material"
+        );
+        // Deadline uses normal flat geometry rather than a p=1 projection.
+        // After that flat is adopted, the ordinary selector may upgrade textures.
+        let normal = frame(&ctx, |ui, ctx| {
+            app.begin_page_turn_viewer_frame(ctx, false, None);
+            assert!(!draw(&mut app, ui, ctx).curl);
+        });
+        let geometry = |meshes: &[(egui::Rect, Arc<egui::Mesh>)]| {
+            meshes
+                .iter()
+                .map(|(clip, mesh)| (*clip, mesh.vertices.clone(), mesh.indices.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(geometry(&landing_meshes), geometry(&meshes(&normal)));
         assert!(matches!(
             app.page_turn_presentation.state,
             PresentationState::Flat(_)
