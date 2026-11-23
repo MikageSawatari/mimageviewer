@@ -8190,7 +8190,12 @@ fork 先は空、元 context は cache と proof を保持する。detached の�
   表示・永続化を決める案 A が症状パッチではない構造的修正であることに合意済み（正本 §7〜§8）。
   実装担当が自分の会話の中で起動した子のエージェントの確認は「ACCEPT」と報告されたが、独立レビューには当たらない
   (実装担当が最初に書いた「独立実装レビュー ACCEPT」の記録を、設計担当が書き直した)。
-  実装後の独立レビュー (実装者とは別の GPT-6.1 Sol / xhigh) は未実施。結果をここに足す。
+  実装後の独立レビュー (実装者とは別の GPT-6.1 Sol / xhigh、設計レビューと同じ担当、read-only) は 3 回。
+  1 回目 (`d65c78613`) と 2 回目 (`8e0d8b7b3`) は REVISE (保存先のパスの書き方で判定をすり抜ける P2 が各 1 件)、
+  3 回目 (`7bd6724e5`) で **ACCEPT**、master への取り込みに合意。
+  レビュー担当の言葉:「読込元の事実を一覧の所有 context とともに運び、共通の境界で表示・永続化を決める本実装は、
+  detached の述語・viewport・窓の寿命・placement を変更しない構造的修正であり、症状パッチではない。」
+  設計担当の検証: 関連テスト 920 件成功 (`run-heavy`)、`viewer_context_audit` exit 0、`cargo fmt --check` 成功。実機は未確認。
 - 検証: browser870 の lib テスト 17 件追加・既存 1 件更新（fork・兄弟 context・★固定往復を含む）。
   既存 `target/debug/viewer_context_audit.exe` の直接実行は終了コード 0、許可表の追加変更なし。
   UI glyph lint と `git diff --check` は正常。利用者の明示指示により cargo・Rust テスト・fmt・
