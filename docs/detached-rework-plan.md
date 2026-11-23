@@ -1462,7 +1462,12 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 - `ContextRef::collection_grid_request_stamp_is_current` (`b5057ecca`、§1.851「見つからない項目をすべて外す」) も、A4 の許可リストに未登録だった。§1.818 の 3 件と同じ CI の実行で落ちた。
 - 関数は読み取りだけ。mount 中または退避中の、その context 自身の `top_level_grid_view` と items の世代を、要求の印と照らす。mount も変更もしない。既存の `grid_scroll`・`page_overview_view` と同じ種類の読み取りの投影なので、許可リストに足した。
-- この関数については、「症状パッチではなく構造的修正」への独立レビューの合意の記録が無い。読み取りだけで detached の述語・viewport の経路を変えないので、凍結の決まりの対象外と判断した (設計担当 ClaudeCode の判断。独立レビューは未実施)。
+- §1.851 の作業時には、「症状パッチではなく構造的修正」への独立レビューの合意が取られていなかった。設計担当 ClaudeCode は、読み取りだけで detached の述語・viewport の経路を変えないので、凍結の決まりの対象外と判断した。
+- 独立レビュー (GPT-6.1 Sol / xhigh、read-only、HEAD `1f395db46`、2026-11-23) で合意 (指摘なし)。
+  - 確かめた範囲: 関数本体、App 側の判定 (`collection_grid.rs`)、`collections.rs` の呼び出し元。
+  - 確かめた点: 印が古いときは受付の中止・取消を利用者に通知し、他の context や窓を変えない。
+  - `b5057ecca` が `viewer_context_registry.rs` に入れたのは、この関数の 17 行だけ。
+  - レビュー担当の言葉:「対象 API は所有 context の一覧状態を mount せず照合する読み取り専用関数であり、古い削除要求も通知付きで拒否するため、detached 周りの症状パッチには該当しないと独立レビューで合意した。」
 
 ### 2026-11-22: ブラウザから重ねて開く窓 (§1.818 段 2) の着手前の合意 (計画の段階。実装はこれから)
 
