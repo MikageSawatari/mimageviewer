@@ -70,6 +70,7 @@
 | [section220-cut-item-appearance.md](section220-cut-item-appearance.md) | §1.220 切り取り中の実項目表示。クリップボードの所有・通知・貼り付け結果、Explorer形式の読取と、半透明の一覧内容・ハサミ表示の描画境界 |
 | [clipboard-capture-plan.md](clipboard-capture-plan.md) | **設計確定 (第 8 版)・S1 実装中**。クリップボード取り込み。コピーした画像の自動保存と、コピーしたページ HTML の画像を選んで保存する機能。専用 listener、右下の非アクティブ小窓、参照元の規則、ファイル名とスタック、段階と検証 |
 | [browser-to-miv-plan.md](browser-to-miv-plan.md) | **§1.818 調査・設計 (2026-11-20 に段 2 を表示領域に重ねる形へ書き直し、判断事項は利用者が決定。段 1 単独では出さず段 2 から作る。実装は未着手)**。ブラウザで見ている画像を mIV で開いて 3D 写真・アップスケールで見る・保存する。受け渡し方式の比較、X・pixiv の規約とChrome拡張の配布の一次情報、段 1 (取り込みの小窓の [見る]) と段 2 (拡張「mIV で見る」、ブラウザの表示領域に mIV の窓を重ね「ブラウザ閲覧」フォルダへ保存) の骨子 |
+| [browser-view-single-page-plan.md](browser-view-single-page-plan.md) | **§1.870 設計 (2026-11-23、実装は未着手)**。ブラウザから開いた画像が保存先の別の画像と見開きになる件。保存先のフォルダはページ構成の既定を単ページにする案 (窓の経路に触れない) と、退けた案 |
 | [container-index-startup-optimization-plan.md](container-index-startup-optimization-plan.md) | コンテナ索引の起動・watch更新に共通するDB直下置換SQLの範囲限定。小規模修正の設計・検証記録 |
 | [ui-responsiveness.md](ui-responsiveness.md) | UI スレッド同期 I/O で UI を止めないための設計方針。**新機能追加前にチェックリスト §4 を必ず見る** |
 | [section801-close-navigation-investigation.md](section801-close-navigation-investigation.md) | §1.801、AI高画質化中に本を閉じた際のpre-scan待ち。同期到達先の棚卸し、型付き小区間とロック取得待ちの計装、fake handler検証。利用者事象の原因は未確定・修正は未実装 |
