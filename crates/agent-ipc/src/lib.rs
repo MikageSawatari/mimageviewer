@@ -31,6 +31,8 @@ mod settings_types;
 pub use settings_types::*;
 mod favorite_types;
 pub use favorite_types::*;
+mod stack_script_types;
+pub use stack_script_types::*;
 
 pub const AGENT_PROTOCOL_VERSION: u32 = 6;
 pub const MIN_ADAPTER_PROTOCOL_VERSION: u32 = 3;
@@ -156,6 +158,11 @@ pub enum Command {
         name: Option<String>,
         item_index: Option<bool>,
         container_index: Option<bool>,
+    },
+    StackScript {
+        source: Option<String>,
+        part: Option<u32>,
+        expected_sha256: Option<String>,
     },
     SearchItems {
         query: String,
@@ -297,6 +304,7 @@ pub enum Payload {
     Settings(SettingsPage),
     SettingsWrite(SettingsWriteResult),
     FavoriteWrite(FavoriteWriteResult),
+    StackScript(StackScriptResult),
     Items(ItemPage),
     Tags(TagPage),
     Collections(CollectionPage),

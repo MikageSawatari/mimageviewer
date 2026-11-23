@@ -49,6 +49,7 @@ pub(crate) enum UiOpenOutcome {
     Admitted,
     Read(mimageviewer_agent_ipc::ViewState),
     Settings(mimageviewer_agent_ipc::SettingsPage),
+    StackScriptAdmitted { enabled: bool },
     Written(Result<mimageviewer_agent_ipc::Payload, AgentError>),
     Refused(AgentError),
 }
@@ -68,6 +69,7 @@ pub(crate) enum UiRequestKind {
         client_name: String,
     },
     SetFavorite(super::favorite::PreparedFavorite),
+    StackScriptAdmission,
     TagWrite(super::metadata_write::PreparedTags),
     RatingWrite(super::metadata_write::PreparedRatings),
 }
@@ -256,6 +258,61 @@ impl OpenController {
         }
     }
 
+    pub(super) fn execute_stack_script(
+        self: &Arc<Self>,
+        source: Option<String>,
+        part: Option<u32>,
+        expected_sha256: Option<String>,
+        ctx: &super::ReadContext,
+        client_name: String,
+        dispatch: Arc<UiRequestDispatch>,
+        changes: &super::changes::ChangeController,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        super::stack_script::validate_arguments(
+            source.as_deref(),
+            part,
+            expected_sha256.as_deref(),
+        )?;
+        ctx.checkpoint()?;
+        let admission = self.stack_script_admission(&ctx.cancel, dispatch)?;
+        match admission {
+            UiOpenOutcome::StackScriptAdmitted { enabled } => {
+                // The claimed request owns its result. Only this agent worker
+                // waits for file work; the UI has already returned admission.
+                Ok(UiOpenOutcome::Written(super::stack_script::execute(
+                    source,
+                    part,
+                    expected_sha256,
+                    enabled,
+                    &client_name,
+                    changes,
+                )))
+            }
+            UiOpenOutcome::Refused(error) => Ok(UiOpenOutcome::Refused(error)),
+            _ => Err(super::internal()),
+        }
+    }
+
+    fn stack_script_admission(
+        self: &Arc<Self>,
+        cancel: &AtomicBool,
+        dispatch: Arc<UiRequestDispatch>,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        self.dispatch_request(cancel, dispatch, UI_REPLY_TIMEOUT, || {
+            Ok(UiRequestKind::StackScriptAdmission)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stack_script_admission_for_test(
+        self: &Arc<Self>,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        self.stack_script_admission(
+            &AtomicBool::new(false),
+            Arc::new(UiRequestDispatch::pending()),
+        )
+    }
+
     pub(super) fn execute_view_state(
         self: &Arc<Self>,
         ctx: &super::ReadContext,
@@ -429,9 +486,10 @@ fn outcome_result(reply: UiOpenOutcome) -> Result<OpenResult, AgentError> {
             message: "mIV で開く処理を始めました".to_owned(),
         }),
         UiOpenOutcome::Refused(error) => Err(error),
-        UiOpenOutcome::Written(_) | UiOpenOutcome::Read(_) | UiOpenOutcome::Settings(_) => {
-            Err(open_failed())
-        }
+        UiOpenOutcome::Written(_)
+        | UiOpenOutcome::Read(_)
+        | UiOpenOutcome::Settings(_)
+        | UiOpenOutcome::StackScriptAdmitted { .. } => Err(open_failed()),
     }
 }
 

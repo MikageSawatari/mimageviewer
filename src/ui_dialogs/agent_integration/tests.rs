@@ -322,7 +322,12 @@ fn agent_exposure_guide_permissions_follow_checks_at_every_level() {
                     result.hidden.contains(&"今開いている場所と表示中の項目"),
                     !current_view
                 );
-                assert_eq!(result.hidden.contains(&"環境設定の項目と値"), !settings);
+                assert_eq!(
+                    result
+                        .hidden
+                        .contains(&"環境設定の項目と値・スタック用スクリプトの本文"),
+                    !settings
+                );
                 assert_eq!(
                     result
                         .shown
@@ -333,7 +338,7 @@ fn agent_exposure_guide_permissions_follow_checks_at_every_level() {
                 for prefix in [
                     "環境設定の変更",
                     "外部ツールの登録",
-                    "スクリプト設定のオン・オフ",
+                    "スタック用スクリプトの書き換え",
                     "お気に入りへの登録",
                 ] {
                     assert_eq!(
@@ -346,11 +351,12 @@ fn agent_exposure_guide_permissions_follow_checks_at_every_level() {
                         |line| line.contains("許可の状態は渡しますが、AI からは変えられません")
                     )
                 );
-                assert!(
-                    !result
+                assert_eq!(
+                    result
                         .shown
                         .iter()
-                        .any(|line| line.contains("スクリプトの本文"))
+                        .any(|line| line.contains("スタック用スクリプトの本文")),
+                    settings
                 );
             }
         }

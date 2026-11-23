@@ -7,6 +7,12 @@ disabled / read は新しいチェックをOFF、open / organize / records はON
 スクロールの検査は、既存のheadlessテストで全許可ONを扱う。
 2026-11-23 に設計担当が更新指定ありで10枚を生成・目視し、更新指定なしの通常比較 (266件) も通った。
 
+同日の `stack_script` 追加では、同じ10枚の許可補足・公開情報・許す操作に、本文の読み書きを含める。
+設定許可 OFF では本文を見せないこと、ON でも連携無効なら渡さないことを既存の権限組合せテストで検査する。
+環境設定のスタック用ボタンは処理先だけの変更で、表示文言とレイアウトは変えない。
+**この追加後の PNG は未更新・未目視で、通常比較も未実施**。上記266件の成功は追加前の記録として保持し、
+今回の証拠には再利用しない。生成・目視・通常比較と小画面の headless 回帰は統括へ引き継ぐ。
+
 §1.818 段階7のブラウザ連携は、純粋 renderer に固定の worker snapshot と入力文字列を渡す。
 `browser818_preferences_light`、`browser818_preferences_dark_long_path`、
 `browser818_preferences_unavailable`、`browser818_preferences_processing` の4定義（560×460）を追加した。

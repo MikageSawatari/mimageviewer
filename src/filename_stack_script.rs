@@ -26,13 +26,19 @@ use rhai::{
 
 use crate::filename_stack::StackMember;
 
+mod writer;
+pub use writer::{
+    ScriptDocument, ScriptWriteOutcome, enqueue_open_user_script, enqueue_reset_user_script,
+    read_script_document, write_script,
+};
+
 /// 内蔵の既定スクリプト (カスケード分割ルール)。
 pub const DEFAULT_SCRIPT: &str = include_str!("../assets/stack_rules.default.rhai");
 
 /// ユーザースクリプトとして読み込む上限バイト数。通常の分類スクリプトは数 KB なので、
 /// これを超えるファイルは「壊れている / 別物が置かれた」とみなし内蔵既定へフォールバックする
 /// (= 巨大ファイルや低速メディアで `read_to_string` がワーカー起動前に長時間ブロックするのを防ぐ)。
-const MAX_SCRIPT_BYTES: u64 = 1024 * 1024; // 1 MiB
+pub(crate) const MAX_SCRIPT_BYTES: u64 = 1024 * 1024; // 1 MiB
 
 /// スクリプト実行の結果。
 pub struct GroupingResult {
@@ -107,28 +113,6 @@ pub fn active_script_source() -> String {
         Ok(s) if !s.trim().is_empty() => s,
         _ => DEFAULT_SCRIPT.to_string(),
     }
-}
-
-/// ユーザースクリプトが無ければ既定を書き出す。返り値はそのパス (編集用に開く前段)。
-pub fn ensure_user_script_exists() -> std::io::Result<PathBuf> {
-    let path = script_path();
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, DEFAULT_SCRIPT)?;
-    }
-    Ok(path)
-}
-
-/// ユーザースクリプトを内蔵既定で上書きする (「既定に戻す」)。
-pub fn reset_user_script() -> std::io::Result<PathBuf> {
-    let path = script_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&path, DEFAULT_SCRIPT)?;
-    Ok(path)
 }
 
 // ── 正規表現ヘルパー (コンパイル済みパターンをキャッシュ) ────────────────────

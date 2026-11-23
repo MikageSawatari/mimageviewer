@@ -760,7 +760,12 @@ UI スレッドで、次のどれかなら拒む (何も変えない)。
   ください」で拒む (独立レビュー r6 P2。違う版の part をつなげて、最後の SHA-256 で書けてしまうのを防ぐ)。
   保存する状態は増えない。
 - `source` あり → 本文を書く。**`expected_sha256` (読んだときの SHA-256) を必須にする**。
-  1. 1 MiB 以下であること (`MAX_SCRIPT_BYTES`、`:32`)。
+  1. **AI から書ける本文は 256 KiB (UTF-8) まで** (2026-11-23 設計担当の判断、実装担当の前提確認による)。
+     ファイルの上限 1 MiB (`MAX_SCRIPT_BYTES`) は利用者が直接編集するときのために残す。1 MiB の本文は JSON の
+     エスケープで最大 6 倍になり、今の受け渡しの上限 (MCP の入力 1 行 1 MiB、IPC 4 MiB) に入らない。受け渡しの上限は
+     既存の tool すべての境界なので広げない。スタック用スクリプトは実際には数 KB で、256 KiB で足りる。
+     エスケープの多い本文で入力の上限を超えたときは、MCP の入力の上限のエラーになる (まれなので割り切る)。
+     読むほうは part に分けるので、1 MiB のファイルも読める。
   2. 既存の `CompiledStackScript::compile` (`:53`) でコンパイルが通ること。通らなければエラーの文を返し、ファイルは
      変えない。`group` 関数の実行による試しはしない (どのフォルダで試すかの状態を持たない)。
   3. 書き込みの仕事を、スクリプトの書き手 (下記) へ渡す。書き手は仕事の中で、今の本文の SHA-256 が
@@ -1426,6 +1431,58 @@ PNGは既存のAI連携10枚だけが更新対象。未生成・未目視で、�
 Cで更新した6ページは、クリップボードの有効化前の内容・保存先fallback、パネル変更時のトリム保存、
 履歴消去、次のスタック分類、タグbackupの停止と既存ファイル保持をコードで再確認した。
 非Cargo検査は `check_site_cards.py` が53件・超過0、`check_ui_glyphs.py` が危険字0で成功。
+
+### D スクリプト・一覧予算の作業中断記録 (2026-11-23、未コンパイル)
+
+§1.863 取り込み後に FIFO writer、worker 側の本文読取・hash 照合・予算付き part、UI 受付、
+IPC v6 の追加型と MCP tool、ボタンの enqueue 化、公開説明と回帰テストの一部を実装した。
+**設計の前提矛盾を見つけたため作業を停止。完了・検証済みではない。**
+
+- 本文上限は 1,048,576 bytes だが、MCP の `MAX_LINE_BYTES` も 1,048,576。
+  有効な ASCII コメント `//` + `a` を本文上限まで埋めた要求でも、JSON と改行を含む入力は **1,048,767 bytes**。
+  検査する tool に届く前に入力の reader が接続を閉じる (`crates/mcp-server/src/lib.rs:24,213,223`)。
+- IPC の `MAX_FRAME_BYTES` は 4,194,304。本文がエスケープを要する場合には、1 MiB の本文でも超過する。
+  `//` + U+0001 の例は MCP 入力 **6,291,637 bytes**、IPC JSON **6,291,597 bytes** (4 byte header 別)。
+  `write_frame` / `read_frame` の両方が現上限を検査する (`crates/agent-ipc/src/lib.rs:65,605,629`)。
+- 設計判断として、転送側を JSON 最大展開と付加情報に十分な枠 (例: 8 MiB) へ拡張するか、
+  本文上限を引き下げる必要がある。今回、転送上限も本文上限も変えていない。
+- tools/list は下表の静的計測で **47,473 → 46,521 字**。512 字予約後の余裕は **967 字**。
+  4,000 字以上の目標は未達。既存の schema / annotation / validation の検査は弱めていない。
+  表はコンパクト JSON の Unicode 文字数で、Python 再構成は従来の測定値と一致した。Rust による実測は共有 runner 待ち。
+- 未完: 転送枠の判断とその回帰、予算整理の残り、UI 受付の全条件の専用回帰、統合後の検証と PNG の更新・目視。
+  Cargo は fmt のみ実施。ビルド・テスト・製品起動・コミットは未実施。
+
+| tool | 作業前 (草案込み) | 現差分 |
+| --- | ---: | ---: |
+| miv_status | 1412 | 1386 |
+| search_items | 1921 | 1879 |
+| list_tags | 1286 | 1268 |
+| items_by_tag | 1690 | 1679 |
+| list_collections | 1249 | 1228 |
+| get_collection | 1831 | 1826 |
+| list_library | 2104 | 2055 |
+| get_item_info | 6360 | 6273 |
+| get_transcript | 2367 | 2277 |
+| list_folder | 3330 | 3231 |
+| summarize_folder | 2824 | 2588 |
+| get_thumbnail | 2420 | 2365 |
+| open_in_viewer | 932 | 892 |
+| create_collection | 816 | 796 |
+| rename_collection | 938 | 895 |
+| add_to_collection | 1796 | 1751 |
+| remove_from_collection | 1763 | 1746 |
+| add_tags | 1736 | 1676 |
+| remove_tags | 1743 | 1683 |
+| set_rating | 1717 | 1676 |
+| search_help | 694 | 694 |
+| get_help | 630 | 630 |
+| get_view_state | 678 | 659 |
+| stack_script | 904 | 1036 |
+| get_settings | 823 | 823 |
+| set_settings | 854 | 854 |
+| set_favorite | 900 | 900 |
+| tool の文字数の合計 | 45718 | 44766 |
+| 最大 tools/list (envelope 込み) | 47473 | 46521 |
 
 ## 18. 規模の見込み
 

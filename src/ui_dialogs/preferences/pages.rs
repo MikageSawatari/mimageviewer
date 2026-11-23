@@ -10076,21 +10076,14 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .on_hover_text("stack_rules.rhai を作成 (無ければ既定で) してエディタで開きます")
                 .clicked()
             {
-                match crate::filename_stack_script::ensure_user_script_exists() {
-                    Ok(path) => {
-                        let _ = opener::open(&path);
-                    }
-                    Err(e) => crate::logger::log(format!("stack script open failed: {e}")),
-                }
+                crate::filename_stack_script::enqueue_open_user_script();
             }
             if ui
                 .button("既定に戻す")
                 .on_hover_text("stack_rules.rhai を内蔵の既定スクリプトで上書きします")
                 .clicked()
             {
-                if let Err(e) = crate::filename_stack_script::reset_user_script() {
-                    crate::logger::log(format!("stack script reset failed: {e}"));
-                }
+                crate::filename_stack_script::enqueue_reset_user_script();
             }
             if ui.link("書き方をヘルプで見る").clicked() {
                 let url = crate::ui_helpers::manual_url("stack.html", None);

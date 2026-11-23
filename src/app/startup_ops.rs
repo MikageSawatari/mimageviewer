@@ -196,6 +196,15 @@ impl App {
                 continue;
             }
             match &request.kind {
+                crate::agent_ipc::open::UiRequestKind::StackScriptAdmission => {
+                    let outcome = match self.admit_agent_settings_write() {
+                        Ok(()) => crate::agent_ipc::open::UiOpenOutcome::StackScriptAdmitted {
+                            enabled: self.settings.stack_script_enabled,
+                        },
+                        Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                    };
+                    request.complete(outcome);
+                }
                 crate::agent_ipc::open::UiRequestKind::SetFavorite(favorite) => {
                     let outcome = match self.agent_set_favorite(favorite) {
                         Ok(result) => crate::agent_ipc::open::UiOpenOutcome::Written(Ok(

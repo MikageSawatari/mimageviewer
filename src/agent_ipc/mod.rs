@@ -23,6 +23,9 @@ pub(crate) mod open;
 mod open_response;
 mod rating;
 mod recent;
+mod stack_script;
+#[cfg(test)]
+mod stack_script_tests;
 mod status;
 pub(crate) use recent::{RecentApps, SharedRecentApps};
 mod collection_write;
@@ -322,7 +325,10 @@ fn check_tool_permission(
 ) -> Result<(), AgentError> {
     let denied = match command {
         Command::GetViewState if !snapshot.current_view => Some(CURRENT_VIEW_PERMISSION_MESSAGE),
-        Command::GetSettings { .. } | Command::SetSettings { .. } | Command::SetFavorite { .. }
+        Command::GetSettings { .. }
+        | Command::SetSettings { .. }
+        | Command::SetFavorite { .. }
+        | Command::StackScript { .. }
             if !snapshot.settings =>
         {
             Some(SETTINGS_PERMISSION_MESSAGE)
@@ -582,7 +588,9 @@ impl Connection {
                 if metadata_write::is_write(&request.command)
                     || matches!(
                         request.command,
-                        Command::SetSettings { .. } | Command::SetFavorite { .. }
+                        Command::SetSettings { .. }
+                            | Command::SetFavorite { .. }
+                            | Command::StackScript { .. }
                     )
                 {
                     metadata_response::respond(
@@ -713,6 +721,7 @@ fn tool_name(command: &Command) -> &'static str {
         Command::GetSettings { .. } => "get_settings",
         Command::SetSettings { .. } => "set_settings",
         Command::SetFavorite { .. } => "set_favorite",
+        Command::StackScript { .. } => "stack_script",
         Command::SearchItems { .. } => "search_items",
         Command::ListTags { .. } => "list_tags",
         Command::ItemsByTag { .. } => "items_by_tag",
@@ -785,6 +794,7 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
             (result.changed.len() + result.unchanged.len(), "none")
         }
         Ok(Payload::FavoriteWrite(_)) => (1, "none"),
+        Ok(Payload::StackScript(_)) => (1, "none"),
         Ok(_) => (0, "none"),
         Err(e) => (
             0,
@@ -986,6 +996,7 @@ impl Handlers {
             | Command::RemoveTags { .. }
             | Command::SetSettings { .. }
             | Command::SetFavorite { .. }
+            | Command::StackScript { .. }
             | Command::SetRating { .. } => {
                 unreachable!()
             }

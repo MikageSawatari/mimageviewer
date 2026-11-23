@@ -45,7 +45,7 @@ fn every_permission_combination_has_identical_full_discovery_without_core_querie
         }
     }
     let expected = json!(schema::tools());
-    assert_eq!(expected.as_array().unwrap().len(), 26);
+    assert_eq!(expected.as_array().unwrap().len(), 27);
     for version in VERSIONS {
         let backend = Arc::new(BackendState(
             Mutex::new(PermissionSnapshot::default()),
@@ -196,7 +196,9 @@ fn each_tool_description_names_its_miv_permission() {
         let prefix = match name {
             "search_help" | "get_help" => "help offline.",
             "get_view_state" => "Needs mIV Read + current-view sharing.",
-            "get_settings" | "set_settings" | "set_favorite" => "Needs mIV Read + settings access.",
+            "get_settings" | "set_settings" | "set_favorite" | "stack_script" => {
+                "Needs mIV Read + settings access."
+            }
             "get_transcript" => "Needs mIV Read + transcript sharing.",
             "get_thumbnail" => "Needs mIV Read + thumbnail sharing.",
             "open_in_viewer" => "Needs mIV Read and Open.",
