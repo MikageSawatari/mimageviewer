@@ -244,7 +244,8 @@ IME 変換中はメニューの追加 claim を行わず、IME / TextEdit の処
 | `FsPageScrollOrTurnNext` / `FsPageScrollOrTurnPrev` | FsImage | Press（リピート可、SinglePerFrame） | なし |
 
 通常のページ単位の静止画（単ページ・見開き・分割片側）だけで使うキーボード専用操作。
-前面 UI・TextInput・IME・modal・右クリックメニューの所有を優先し、連結・Z ズーム・360 度・3D・
+3D 写真の単ページも対象とする ([表示変換設計](depth-view-transform-plan.md) §3.5)。
+前面 UI・TextInput・IME・modal・右クリックメニューの所有を優先し、連結・Z ズーム・360 度・
 分析・比較・編集・範囲キャプチャ中は新 Action を消費しない。動画・音声の J / K は従来のマーカー移動。
 リング・ジェスチャ・マウスボタン・ゲームパッドの候補は増やさない。
 

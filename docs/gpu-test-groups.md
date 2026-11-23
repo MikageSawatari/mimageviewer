@@ -202,6 +202,11 @@ group外の残存呼び出し元は、今回のgroup内実行では検証でき�
 group の上限、全体並列数、retry・timeout・priority は変更しない。
 この登録変更後のコンパイル・テストは設計担当が実行する予定。
 
+押下位置による開始除外を検査する
+`ui_fullscreen::depth_view_transform_tests::depth_transform_drag_start_follows_press_origin_across_panel`
+も `RootDepthViewer::new` を使うため完全名で登録する。既存の中ボタン・スクラブ・ピンチ・
+ホイール予測テストは同じ所属のまま、パネル境界と同一 pass のクリック release の条件を追加する。
+
 ### 共通の登録形式
 
 正本は [.config/nextest.toml](../.config/nextest.toml)。`gpu_tests` と実device小moduleはprefix、

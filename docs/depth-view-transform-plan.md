@@ -529,6 +529,35 @@ transform を高さ400の別キャンバスに渡しており、画像の下部�
   ドラッグ後の検査はそのまま残す。追加した CPU テスト `depth_panel_blocks_plain_and_ctrl_wheel_admission` は
   Ctrl の有無とシーク領域との重なりでも3D パネルの受付を止める条件を検査する。
 
+### 独立コードレビューの指摘への対応
+
+`7ea696591` を基点に、次の変更を加えた。ここには変更内容だけを記録する。
+
+- パン・Ctrl+ドラッグ回転の開始除外は、遅れて発生する `drag_started_by` の frame の hover ではなく、
+  `pointer.press_origin()` を採取した `FsWheelFrameSemanticInput::primary_press_origin` を使う。
+  持続する状態は足さず、既存のドラッグ所有が始まった後はパネル上を通過しても継続する。
+- 中ボタンは実押下 frame で開始するが、同一 pass の押下後移動でも除外を押下位置で決めるようにした。
+  スクラブも同様に押下位置を使い、現在の hover が Depth パネル上になったことだけではキャンバスの押下を拒否しない。
+  ほかのパネルの既存規則と、開始後の `MiddleZoomDrag` の所有は維持する。
+- ピンチは `TouchRecognizer::handle_start` が最初の Touch Start の位置を `TapZoneGeometry::excluded` で分類し、
+  `WidgetPassthrough` またはキャンバスの所有を後続の移動でも保つため、実装は変更しない。
+  中ボタン・スクラブ・ピンチの既存テストへ境界を越える入力を追加した。
+- `depth_transform_drag_start_follows_press_origin_across_panel` を追加し、パン・Ctrl回転で
+  キャンバス押下→パネルへ最初の移動→キャンバスへ戻る経路と、パネル押下→キャンバスへの経路を検査する。
+  このテストも実 renderer を使うため `.config/nextest.toml` に完全名で GPU 所属を追加した。
+- `depth_transform_wheel_prediction_matches_2d_for_default_navigation_and_local_scroll` は、事前のキャンバス押下の後、
+  wheel と修飾なしクリックの release を同じ pass へ入れる。予測した変換を渡すクリック分類が `None` であること、
+  実適用でクリックによるページ送りが起こらないことを2D／Depthで検査する。
+  Ctrl+wheel は初期倍率1倍も追加し、クリック前の状態なら送れる場合でも、その pass の倍率変更後は送らない条件を含めた。
+- `docs/` と `htdocs/` を検索し、display pipeline・keymap の詳細節、読み始め・ページ内スクロール・
+  スクロール＋ページ送り・ドラッグ移動制限・パン補正・パノラマの各設計、バックログの現状、
+  マニュアルの環境設定の説明を同期した。古い depth 設計の段 B の記録は本書を優先する注記を付けた。
+  `htdocs/mimageviewer/manual/changelog.html` は過去の公開時点の記録として変更しない。
+  `CHANGELOG.md` も変更していない。
+- 環境設定のドラッグ移動制限の補足文にも3Dの旧除外があったため取り除いた。
+  関連する `fullscreen_in_page_scroll_setting_tests` のスナップショット4件の期待 PNG はこの差分では更新していない。
+  設計担当が実行・更新する予定。コンパイル・テスト・製品起動は実装担当では行っていない。
+
 ### 変更ファイルと要点
 
 | ファイル | 入れた変更 |
@@ -548,6 +577,9 @@ transform を高さ400の別キャンバスに渡しており、画像の下部�
 | `src/app/depth_export.rs` | 表示倍率・パン・自由回転・フィット設定が書き出し基準を変えないテストを追加 |
 | `src/app/tests.rs` | AI native の既存テストに Depth 中の倍率非依存の条件を追加 |
 | `docs/depth-parallax-plan.md`、`docs/display-pipeline.md`、`docs/keymap-spec.md` | 変換・入力・PDF・書き出しの説明を同期 |
+| `docs/fullscreen-page-start-position-plan.md`、`docs/fullscreen-in-page-scroll-plan.md`、`docs/fullscreen-scroll-page-turn-plan.md`、`docs/fullscreen-drag-pan-bound-plan.md`、`docs/fullscreen-pan-and-front-menu-input-plan.md` | 読み始め・スクロール・パンの現行対象面へ3Dを含め、過去の記録と区別 |
+| `docs/panorama-360-view-plan.md`、`docs/next-release-backlog.md` | 3D の共有変換・ホイール設定・書き出しと現在の実装方針へ同期 |
+| `src/ui_dialogs/preferences/pages.rs`、`htdocs/mimageviewer/manual/settings.html` | ドラッグ移動制限の説明から3Dの旧除外を撤去 |
 | `.config/nextest.toml`、`docs/gpu-test-groups.md` | 実 GPU を使う変換操作テストの登録と生成経路の記録 |
 | `htdocs/mimageviewer/manual/fullscreen.html` | 操作・クリックの規則・共有状態・フィット・書き出しの説明、ページ内スクロールと読み始めの対象外から 3D を削除。ホイール・上下キーは通常表示の設定に従うことを明記 |
 | 本書 | §8.2 に従うホイールの説明、§12 の下書き、実装の変更・分類・検査予定を記録 |
@@ -595,6 +627,7 @@ transform を高さ400の別キャンバスに渡しており、画像の下部�
 - `depth_transform_ctrl_click_does_not_apply_a_rotation_drag`
 - `depth_transform_gpu_free_rotation_keeps_motion_on_screen_axes`
 - `depth_panel_blocks_plain_and_ctrl_wheel_admission`
+- `depth_transform_drag_start_follows_press_origin_across_panel`
 
 ホイール予測の旧テストが既定設定のままでスクロールを期待していた点は、§8.2 どおり設定別・2D 比較へ直した。
 GPU の画素比較には補間・有限探索の誤差を許し、2D と shader の四角形の境界のラスタ被覆差だけは比較帯から除く。
@@ -606,7 +639,7 @@ detached の述語・viewport 配送・`set_fs_exclusive_view` の実装は変�
 設計担当が実行する予定の nextest filter:
 
 ```text
-test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/specified_pdf/) | test(/initial_placement/) | test(/fullscreen_click|canvas_click|touch|panorama|scrub_zoom|key_zoom/)
+test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/specified_pdf/) | test(/initial_placement/) | test(/fullscreen_click|canvas_click|touch|panorama|scrub_zoom|key_zoom|wheel/) | test(/fullscreen_in_page_scroll_setting_tests/)
 ```
 
 パネルのスナップショットは更新していない。ビルド・テスト・実機の結果はこの差分にはない。
@@ -615,8 +648,8 @@ test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/sp
 
 対象は `is_depth()` / `ExclusiveViewKind::Depth` / `FsZoomOwner::Depth` / `FsExclusiveView::Depth` と、
 `fs_exclusive_view_active(` の全出現 (複数行で `.is_some()` / `.is_none()` へ続くもの、宣言も含む)。
-行番号は `960321e48` と今回差分に対する整形後の source。テストの fixture / assert も省略せず列挙し、
-同じ分類の兄弟を 1 行にまとめた。現在の出現は 326 箇所。
+行番号は `7ea696591` と今回差分に対する整形後の source。テストの fixture / assert も省略せず列挙し、
+同じ分類の兄弟を 1 行にまとめた。現在の出現は 327 箇所。
 `FsZoomOwner::Depth` は削除したため現在の出現は 0。削除・置換した入口は下の基点表に別記する。
 共通の占有述語で残す行は、2D の倍率操作ではなく、他機能の入場制限または Depth 自身の所有・寿命を表す。
 判定の定義 `fs_exclusive_view.rs::FsExclusiveView::is_depth` と、同ファイルの enum の Depth variant は
@@ -644,13 +677,13 @@ test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/sp
 | `src/app/tests/startup_restore.rs`: 764, 817 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/app/viewer_context_registry.rs`: 4456 | 3D 固有に残す | fork 前の既存終了処理を維持。実装は変更しない |
 | `src/app/vram_accounting.rs`: 147 | 3D 固有に残す | Depth 資源の VRAM 会計 |
-| `src/ui_fullscreen.rs`: 15082, 15153, 16010, 22906, 25940, 26021, 29004, 29038, 29389, 29654, 30285, 30437, 30535, 31632, 33082, 35415, 35588, 37036, 37045, 37052, 37789, 38555, 41096, 41161, 41162, 42914, 43036, 43051, 43348, 43412, 43639, 43670, 44263, 44892, 44896, 45809, 46322, 47397, 47446, 47447, 51983, 56661 | 3D 固有に残す | Z の休止、占有制限、Depth パネル・素材・先読み・待機・終了、PDF 需要、フィット受付の分類を維持 |
+| `src/ui_fullscreen.rs`: 15082, 15153, 16011, 22909, 25943, 26024, 29007, 29041, 29392, 29657, 30288, 30440, 30538, 31635, 33085, 35418, 35591, 37039, 37048, 37055, 37792, 38558, 41099, 41164, 41165, 42925, 43047, 43062, 43359, 43423, 43650, 43681, 44274, 44903, 44907, 45820, 46333, 47408, 47457, 47458, 51994, 56672 | 3D 固有に残す | Z の休止、占有制限、Depth パネル・素材・先読み・待機・終了、PDF 需要、フィット受付の分類を維持 |
 | `src/ui_fullscreen.rs`: 15547 | 2D と同じにする | `fs_zoom_owner`: Z より先に Image を選ぶ |
 | `src/ui_fullscreen/depth_focus_tests.rs`: 193, 207, 267, 294, 349, 496, 529, 597, 607, 614, 760, 843, 933, 1020, 1034, 1064, 1114 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/depth_main_window_tests.rs`: 120 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/depth_slideshow_tests.rs`: 14, 52, 76, 395, 405, 458, 648, 660, 702, 715, 739, 776, 826, 852, 887, 1036, 1052, 1145, 1189 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/depth_tests.rs`: 40, 53, 66, 126, 154 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
-| `src/ui_fullscreen/depth_view_transform_tests.rs`: 11, 43, 56, 70, 179, 203, 256, 262, 278, 551, 617, 660 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/ui_fullscreen/depth_view_transform_tests.rs`: 11, 43, 56, 70, 179, 203, 256, 262, 278, 609, 690, 733, 812 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/page_turn.rs`: 2002 | 3D 固有に残す | Depth 中の紙めくりの抑止 |
 | `src/ui_video_tile.rs`: 69 | 3D 固有に残す | 動画タイルの入場抑止 |
 | `src/ui_view_trim.rs`: 993 | 3D 固有に残す | 編集中の入口の占有制限 |
@@ -680,10 +713,10 @@ test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/sp
 
 | 箇所 | 入力・扱い |
 | --- | --- |
-| `ui_fullscreen.rs::maybe_rerender_pdf` (16010〜16022) | キー・ズーム・ドラッグ終端・ゲームパッド等の表示倍率。Depth 中は記録を更新せず印を立てて返す |
+| `ui_fullscreen.rs::maybe_rerender_pdf` (16010) | キー・ズーム・ドラッグ終端・ゲームパッド等の表示倍率。Depth 中は記録を更新せず印を立てて返す |
 | `draw_fs_zoom_mode_with_receipt` (15497) の `note_legacy` | Z の実効倍率の比較。Depth 中は Z 自体が休止し、この分岐に入らない |
-| `reconcile_specified_pdf_demand` → `reconcile_pdf_layout_demand` (33082、33123) | 指定倍率の描画済み絶対寸法。Depth 中は `note_absolute` に達する前に印を立てて返す |
-| `reconcile_continuous_pdf_demand` → `reconcile_pdf_layout_demand` (33121) | 連結読みの可視ページ。Depth は連結を継続できないため今回変更しない |
+| `reconcile_specified_pdf_demand` → `reconcile_pdf_layout_demand` (33084、33102) | 指定倍率の描画済み絶対寸法。Depth 中は `note_absolute` に達する前に印を立てて返す |
+| `reconcile_continuous_pdf_demand` → `reconcile_pdf_layout_demand` (33098、33102) | 連結読みの可視ページ。Depth は連結を継続できないため今回変更しない |
 | `app.rs::request_pdf_absolute_demand_inner` (83293、83296、83308) | absolute 記録の比較と通常／連結の発行先。AI native の必要寸法を優先する既存方針も維持 |
 | `ensure_pdf_display_resolution` (83362) | 読み込み時の窓サイズ・90 度回転・フィット設定。倍率・パン・自由回転を入力にしない |
 | `prefetch_final_ai` (86361) | AI 先読み用の native、倍率 1。抑止しない |

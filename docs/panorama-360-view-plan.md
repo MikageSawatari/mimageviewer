@@ -35,7 +35,8 @@ panorama の状態は context 所有の `FsExclusiveView::Panorama` へ移し、
 他の panel・編集・loupe・通常 zoom 等を止める判定は `fs_exclusive_view_active` に集約する。
 FOV、yaw/pitch、球面 navigator、投影方式、native video の panorama 同期は
 `is_panorama_mode_active` / panorama accessor の意味を維持する。
-3D は fit 固定で zoom/pan と navigator を止める一方、通常 wheel はページ送り。
+3D は通常表示と zoom/pan・自由回転を共有し、通常 wheel は利用者設定に従う。navigator は停止する
+([表示変換設計](depth-view-transform-plan.md) §3)。
 360 は従来どおり全 wheel を FOV に使う。
 3D 入場は panorama owner を終了して `intent.on` を解除し、projection の選択は保持する。
 3D 中に360の自動復帰・Vによる入場を行わない。全箇所の分類と未完了の検証は

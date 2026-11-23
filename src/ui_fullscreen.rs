@@ -15714,13 +15714,14 @@ impl App {
         full_rect: egui::Rect,
         front: FsFrontPointerFrameInput,
     ) -> bool {
-        let (down, pressed, released, pos) = ctx.input(|i| {
+        let (down, pressed, released, pos, press_origin) = ctx.input(|i| {
             (
                 i.pointer.button_down(egui::PointerButton::Middle),
                 i.pointer.button_pressed(egui::PointerButton::Middle),
                 !front.owns_release(egui::PointerButton::Middle)
                     && i.pointer.button_released(egui::PointerButton::Middle),
                 i.pointer.interact_pos(),
+                i.pointer.press_origin(),
             )
         });
         self.retire_changed_drag_zoom(ctx);
@@ -15748,7 +15749,7 @@ impl App {
             owner,
             rect.center(),
             true,
-            !pos.is_some_and(|pos| {
+            !press_origin.is_some_and(|pos| {
                 self.visible_depth_panel_rect(ctx)
                     .is_some_and(|panel| panel.contains(pos))
             }),
@@ -20115,6 +20116,7 @@ enum FsWheelFrameInput {
 /// the current viewport and cannot carry child input past an immediate callback.
 struct FsWheelFrameSemanticInput {
     pointer_pos: Option<egui::Pos2>,
+    primary_press_origin: Option<egui::Pos2>,
     pointer_navigation_operation: Option<ViewerOperationId>,
     modifiers: egui::Modifiers,
     primary_started: bool,
@@ -20130,6 +20132,7 @@ impl FsWheelFrameSemanticInput {
     fn capture(app: &App, ctx: &egui::Context, response: &egui::Response) -> Self {
         Self {
             pointer_pos: ctx.input(|input| input.pointer.hover_pos()),
+            primary_press_origin: ctx.input(|input| input.pointer.press_origin()),
             pointer_navigation_operation: app
                 .page_turn_pointer_navigation_operation(ctx, "pointer"),
             modifiers: ctx.input(|input| input.modifiers),
@@ -41438,22 +41441,28 @@ impl App {
                 )
             });
         if scrub_active || (scrub_canvas && scrub_held) {
-            let (pressed, down, released, pos) = ctx.input(|i| {
+            let (pressed, down, released, pos, press_origin) = ctx.input(|i| {
                 (
                     i.pointer.primary_pressed(),
                     i.pointer.primary_down(),
                     i.pointer.primary_released(),
                     i.pointer.interact_pos(),
+                    i.pointer.press_origin(),
                 )
             });
             let owner = self.fs_zoom_owner();
             let rect = self.fs_zoom_pivot_rect(full_rect, default_image_rect);
+            // Other panel hover keeps its existing policy. Depth admission uses
+            // the press, so crossing its controls cannot steal a canvas scrub.
             let can_start = !modal_input_blocked
                 && !edit_popup_open
                 && self.fs_context_menu_idx.is_none()
-                && pos.is_some_and(|pos| {
+                && press_origin.is_some_and(|pos| {
                     full_rect.contains(pos)
-                        && !cursor_in_panel
+                        && (!cursor_in_panel || cursor_in_depth_panel)
+                        && !self
+                            .visible_depth_panel_rect(ctx)
+                            .is_some_and(|panel| panel.contains(pos))
                         && !(top_bar_visible && fullscreen_top_bar_rect(full_rect).contains(pos))
                 })
                 && !overflow_pointer_input.primary_owned
@@ -42566,7 +42575,9 @@ impl App {
             let pointer_pos = input.pointer_pos;
             let pointer_in_seek_panel =
                 pointer_pos.is_some_and(|p| seek_panel_interactive && seek_panel_rect.contains(p));
-            let can_start_drag = !pointer_pos.is_some_and(|pos| {
+            // drag_started is reported after movement crosses egui's threshold.
+            // The press owns admission even if that first move crosses the panel.
+            let can_start_drag = !input.primary_press_origin.is_some_and(|pos| {
                 self.visible_depth_panel_rect(ctx)
                     .is_some_and(|panel| panel.contains(pos))
             });

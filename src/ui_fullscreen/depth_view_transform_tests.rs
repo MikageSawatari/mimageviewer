@@ -307,96 +307,145 @@ fn depth_transform_wheel_prediction_matches_2d_for_default_navigation_and_local_
         crate::settings::FullscreenWheelAction::ScrollThenPageTurn,
     ] {
         for ctrl in [false, true] {
-            let mut outcomes = Vec::new();
-            for depth in [false, true] {
-                let mut app = crate::app::setup_app_for_test();
-                let mut viewer = RootDepthViewer::new(&mut app);
-                viewer.ready(&mut app);
-                hide_panel(&mut app);
-                app.items[1] = GridItem::Image("wheel-shared-next.jpg".into());
-                crate::app::source_texture_test_support::seed(&mut app, &viewer.ctx, 1);
-                if !depth {
-                    app.set_fs_exclusive_view(FsExclusiveView::None, "wheel_2d_control");
-                }
-                app.settings.fullscreen_wheel_action = mode;
-                app.settings.fullscreen_smooth_page_scroll = false;
-                app.window_visible = false;
-                app.fs_zoom = 2.;
-                viewer.frame(&mut app, vec![]);
-                app.fs_focus_regained_at = None;
-                let media = app
-                    .fullscreen_page_layout
-                    .single_page()
-                    .unwrap()
-                    .transform
-                    .viewport_rect;
-                let pos = media.center();
-                let modifiers = if ctrl {
-                    egui::Modifiers::CTRL
-                } else {
-                    egui::Modifiers::NONE
-                };
-                let events = vec![
-                    egui::Event::PointerMoved(pos),
-                    egui::Event::MouseWheel {
-                        unit: egui::MouseWheelUnit::Point,
-                        delta: egui::vec2(0., -20.),
-                        modifiers,
-                        phase: egui::TouchPhase::Move,
-                        source: egui::MouseWheelSource::Wheel,
-                    },
-                ];
-                let mut predicted = None;
-                viewer.frame_with_before(&mut app, events, |app, ctx| {
-                    if predicted.is_some() {
-                        return;
+            let initial_zooms: &[f32] = if ctrl { &[1., 2.] } else { &[2.] };
+            for &initial_zoom in initial_zooms {
+                let mut outcomes = Vec::new();
+                for depth in [false, true] {
+                    let mut app = crate::app::setup_app_for_test();
+                    let mut viewer = RootDepthViewer::new(&mut app);
+                    viewer.ready(&mut app);
+                    hide_panel(&mut app);
+                    app.items[1] = GridItem::Image("wheel-shared-next.jpg".into());
+                    crate::app::source_texture_test_support::seed(&mut app, &viewer.ctx, 1);
+                    if !depth {
+                        app.set_fs_exclusive_view(FsExclusiveView::None, "wheel_2d_control");
                     }
-                    let options = ctx.options(|options| options.input_options);
-                    let segments = ctx.input(|input| {
-                        crate::wheel_input::remaining_wheel_segments(input, options)
-                    });
-                    let actions = segments
-                        .into_iter()
-                        .map(|segment| FsWheelAction {
-                            input: segment.input,
-                            segment,
-                            operation: None,
-                            class: app.fs_wheel_segment_in_page_scroll(segment.input, false),
-                            scroll_origin: app.fullscreen_page_layout.drawn_unit.clone(),
-                            page_owner: (
-                                app.items_generation,
-                                app.fullscreen_idx,
-                                app.fullscreen_page_slice,
-                            ),
-                            seek_hover: false,
-                        })
-                        .collect::<Vec<_>>();
-                    assert_eq!(actions.len(), 1);
-                    predicted = Some(app.predict_fs_wheel_frame(ctx, media, &actions));
-                });
-                let (zoom, pan, navigation) = predicted.unwrap();
-                let expected_navigation =
-                    !ctrl && mode == crate::settings::FullscreenWheelAction::PageTurn;
-                assert_eq!(
-                    navigation, expected_navigation,
-                    "mode={mode:?}, ctrl={ctrl}, depth={depth}"
-                );
-                assert_eq!(app.fullscreen_idx, Some(usize::from(expected_navigation)));
-                if !navigation {
-                    assert!((app.fs_zoom - zoom).abs() < 1e-5);
-                    assert!((app.fs_pan - pan).abs().max_elem() < 1.);
-                    if ctrl {
-                        assert!(zoom < 2.);
+                    app.settings.fullscreen_wheel_action = mode;
+                    app.settings.fullscreen_smooth_page_scroll = false;
+                    app.window_visible = false;
+                    app.fs_zoom = initial_zoom;
+                    viewer.frame(&mut app, vec![]);
+                    app.fs_focus_regained_at = None;
+                    let media = app
+                        .fullscreen_page_layout
+                        .single_page()
+                        .unwrap()
+                        .transform
+                        .viewport_rect;
+                    let pos = media.center() + egui::vec2(25., 0.);
+                    // Establish a physical canvas press before the wheel+release
+                    // pass. The click stays unmodified even when the wheel is Ctrl.
+                    viewer.frame(&mut app, vec![egui::Event::PointerMoved(pos)]);
+                    viewer.frame(
+                        &mut app,
+                        vec![egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: true,
+                            modifiers: egui::Modifiers::NONE,
+                        }],
+                    );
+                    let modifiers = if ctrl {
+                        egui::Modifiers::CTRL
                     } else {
-                        assert_ne!(pan, egui::Vec2::ZERO);
+                        egui::Modifiers::NONE
+                    };
+                    let events = vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0., -20.),
+                            modifiers,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Wheel,
+                        },
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed: false,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ];
+                    let mut predicted = None;
+                    viewer.frame_with_before(&mut app, events, |app, ctx| {
+                        if predicted.is_some() {
+                            return;
+                        }
+                        let options = ctx.options(|options| options.input_options);
+                        let segments = ctx.input(|input| {
+                            crate::wheel_input::remaining_wheel_segments(input, options)
+                        });
+                        let actions = segments
+                            .into_iter()
+                            .map(|segment| FsWheelAction {
+                                input: segment.input,
+                                segment,
+                                operation: None,
+                                class: app.fs_wheel_segment_in_page_scroll(segment.input, false),
+                                scroll_origin: app.fullscreen_page_layout.drawn_unit.clone(),
+                                page_owner: (
+                                    app.items_generation,
+                                    app.fullscreen_idx,
+                                    app.fullscreen_page_slice,
+                                ),
+                                seek_hover: false,
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(actions.len(), 1);
+                        predicted = Some(app.predict_fs_wheel_frame(ctx, media, &actions));
+                    });
+                    let (zoom, pan, navigation) = predicted.unwrap();
+                    let response = viewer
+                        .ctx
+                        .read_response(egui::Id::unique("fs_click"))
+                        .unwrap();
+                    assert!(
+                        response.clicked(),
+                        "the wheel pass must also contain the canvas release"
+                    );
+                    assert!(
+                        matches!(
+                            app.plan_fs_canvas_click(
+                                &viewer.ctx,
+                                &response,
+                                egui::Rect::from_min_size(egui::Pos2::ZERO, viewer.size),
+                                StillSeekGeometry::bar_only(),
+                                false,
+                                false,
+                                false,
+                                false,
+                                None,
+                                false,
+                                zoom,
+                                pan,
+                            ),
+                            FsCanvasClickAction::None
+                        ),
+                        "the wheel's transformed view owns the unmodified click"
+                    );
+                    let expected_navigation =
+                        !ctrl && mode == crate::settings::FullscreenWheelAction::PageTurn;
+                    assert_eq!(
+                        navigation, expected_navigation,
+                        "mode={mode:?}, ctrl={ctrl}, depth={depth}"
+                    );
+                    assert_eq!(app.fullscreen_idx, Some(usize::from(expected_navigation)));
+                    if !navigation {
+                        assert!((app.fs_zoom - zoom).abs() < 1e-5);
+                        assert!((app.fs_pan - pan).abs().max_elem() < 1.);
+                        if ctrl {
+                            assert!(zoom < initial_zoom);
+                        } else {
+                            assert_ne!(pan, egui::Vec2::ZERO);
+                        }
                     }
+                    outcomes.push((app.fullscreen_idx, app.fs_zoom, app.fs_pan, predicted));
                 }
-                outcomes.push((app.fullscreen_idx, app.fs_zoom, app.fs_pan, predicted));
+                assert_eq!(
+                    outcomes[0], outcomes[1],
+                    "Depth and 2D share mode={mode:?}, ctrl={ctrl}, initial_zoom={initial_zoom}"
+                );
             }
-            assert_eq!(
-                outcomes[0], outcomes[1],
-                "Depth and 2D share mode={mode:?}, ctrl={ctrl}"
-            );
         }
     }
     crate::key_input::clear_test_frame();
@@ -487,11 +536,12 @@ fn depth_transform_middle_and_scrub_start_on_canvas_but_not_on_panel() {
                 viewer.frame(&mut app, vec![]);
             }
             app.fs_focus_regained_at = None;
-            let start = if panel {
-                app.visible_depth_panel_rect(&viewer.ctx).unwrap().min + egui::vec2(15., 60.)
-            } else {
-                egui::pos2(400., 300.)
-            };
+            let panel_rect = app.visible_depth_panel_rect(&viewer.ctx).unwrap();
+            let on_panel = panel_rect.min + egui::vec2(15., 60.);
+            let on_canvas = egui::pos2(panel_rect.left() - 40., on_panel.y);
+            let start = if panel { on_panel } else { on_canvas };
+            let crossing = if panel { on_canvas } else { on_panel };
+            let returned = on_canvas + egui::vec2(-80., -50.);
             if scrub {
                 app.keymap =
                     crate::keymap::Keymap::from_ini_str("[FsImage]\nFsScrubZoomHold = Ctrl+Tab\n");
@@ -513,21 +563,29 @@ fn depth_transform_middle_and_scrub_start_on_canvas_but_not_on_panel() {
             } else {
                 egui::PointerButton::Middle
             };
-            let delta = if scrub {
-                egui::vec2(100., 0.)
-            } else {
-                egui::vec2(0., -100.)
-            };
             let modifiers = if scrub {
                 egui::Modifiers::CTRL
             } else {
                 egui::Modifiers::NONE
             };
-            for (pos, edge) in [
-                (start, Some(true)),
-                (start + delta, None),
-                (start + delta, Some(false)),
-            ] {
+            // The press and boundary crossing share a pass, so hover already
+            // differs from press_origin when middle/scrub admission runs.
+            viewer.frame(
+                &mut app,
+                vec![
+                    egui::Event::ModifiersChanged(modifiers),
+                    egui::Event::PointerMoved(start),
+                    egui::Event::PointerButton {
+                        pos: start,
+                        button,
+                        pressed: true,
+                        modifiers,
+                    },
+                    egui::Event::PointerMoved(crossing),
+                ],
+            );
+            assert_eq!(app.fs_middle_zoom_drag.is_some(), !panel);
+            for (pos, edge) in [(returned, None), (returned, Some(false))] {
                 let mut events = vec![
                     egui::Event::ModifiersChanged(modifiers),
                     egui::Event::PointerMoved(pos),
@@ -573,11 +631,12 @@ fn depth_transform_pinch_starts_on_canvas_but_not_on_panel() {
             viewer.frame(&mut app, vec![]);
         }
         app.fs_focus_regained_at = None;
-        let origin = if panel {
-            app.visible_depth_panel_rect(&viewer.ctx).unwrap().min + egui::vec2(30., 60.)
-        } else {
-            egui::pos2(400., 300.)
-        };
+        let panel_rect = app.visible_depth_panel_rect(&viewer.ctx).unwrap();
+        let on_panel = panel_rect.min + egui::vec2(30., 60.);
+        let on_canvas = egui::pos2(panel_rect.left() - 60., on_panel.y);
+        let origin = if panel { on_panel } else { on_canvas };
+        let crossing = if panel { on_canvas } else { on_panel };
+        let returned = on_canvas + egui::vec2(-60., 70.);
         let touch = |id, phase, pos| egui::Event::Touch {
             device_id: egui::TouchDeviceId(874),
             id: egui::TouchId(id),
@@ -599,16 +658,30 @@ fn depth_transform_pinch_starts_on_canvas_but_not_on_panel() {
                 pointer(true, origin),
             ],
         );
-        let second = origin + egui::vec2(60., 0.);
+        viewer.frame(
+            &mut app,
+            vec![
+                touch(1, egui::TouchPhase::Move, crossing),
+                egui::Event::PointerMoved(crossing),
+            ],
+        );
+        let second = crossing + egui::vec2(60., 0.);
         viewer.frame(&mut app, vec![touch(2, egui::TouchPhase::Start, second)]);
-        let end_second = second + egui::vec2(30., 6.);
-        viewer.frame(&mut app, vec![touch(2, egui::TouchPhase::Move, end_second)]);
+        let end_second = returned + egui::vec2(90., 6.);
+        viewer.frame(
+            &mut app,
+            vec![
+                touch(1, egui::TouchPhase::Move, returned),
+                egui::Event::PointerMoved(returned),
+                touch(2, egui::TouchPhase::Move, end_second),
+            ],
+        );
         viewer.frame(&mut app, vec![touch(2, egui::TouchPhase::End, end_second)]);
         viewer.frame(
             &mut app,
             vec![
-                touch(1, egui::TouchPhase::End, origin),
-                pointer(false, origin),
+                touch(1, egui::TouchPhase::End, returned),
+                pointer(false, returned),
                 egui::Event::PointerGone,
             ],
         );
@@ -662,5 +735,85 @@ fn depth_transform_ctrl_click_does_not_apply_a_rotation_drag() {
     };
     assert!(state.focus_highlight.is_some());
     assert!(app.fs_rotation_drag_start.is_none());
+    crate::key_input::clear_test_frame();
+}
+
+#[test]
+fn depth_transform_drag_start_follows_press_origin_across_panel() {
+    let _input = crate::key_input::lock_test_input();
+    for ctrl in [false, true] {
+        for starts_on_panel in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let mut viewer = RootDepthViewer::new(&mut app);
+            let resource_id = viewer.ready(&mut app);
+            app.window_visible = false;
+            app.fs_zoom = 2.;
+            for _ in 0..3 {
+                viewer.frame(&mut app, vec![]);
+            }
+            app.fs_focus_regained_at = None;
+            let panel = app.visible_depth_panel_rect(&viewer.ctx).unwrap();
+            let on_panel = panel.min + egui::vec2(15., 60.);
+            let on_canvas = egui::pos2(panel.left() - 40., on_panel.y);
+            let returned = on_canvas + egui::vec2(-60., 80.);
+            assert!(panel.contains(on_panel));
+            assert!(!panel.contains(on_canvas) && !panel.contains(returned));
+            let origin = if starts_on_panel { on_panel } else { on_canvas };
+            let crossing = if starts_on_panel { on_canvas } else { on_panel };
+            let modifiers = if ctrl {
+                egui::Modifiers::CTRL
+            } else {
+                egui::Modifiers::NONE
+            };
+            let before = (app.fs_zoom, app.fs_pan, app.fs_free_rotation);
+            viewer.frame(&mut app, vec![egui::Event::PointerMoved(origin)]);
+            viewer.frame(
+                &mut app,
+                vec![
+                    egui::Event::ModifiersChanged(modifiers),
+                    egui::Event::PointerButton {
+                        pos: origin,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers,
+                    },
+                ],
+            );
+            viewer.frame(&mut app, vec![egui::Event::PointerMoved(crossing)]);
+            assert_eq!(
+                if ctrl {
+                    app.fs_rotation_drag_start.is_some()
+                } else {
+                    app.fs_pan_drag_start.is_some()
+                },
+                !starts_on_panel,
+                "the press owns admission: ctrl={ctrl}, starts_on_panel={starts_on_panel}"
+            );
+            viewer.frame(&mut app, vec![egui::Event::PointerMoved(returned)]);
+            let after = (app.fs_zoom, app.fs_pan, app.fs_free_rotation);
+            if starts_on_panel {
+                assert_eq!(after, before);
+            } else if ctrl {
+                assert!((app.fs_free_rotation - before.2).abs() > 1e-4);
+            } else {
+                assert_ne!(app.fs_pan, before.1);
+            }
+            viewer.frame(
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos: returned,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers,
+                }],
+            );
+            assert!(app.fs_pan_drag_start.is_none() && app.fs_rotation_drag_start.is_none());
+            assert_eq!(app.fullscreen_idx, Some(0));
+            let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
+                unreachable!()
+            };
+            assert_eq!(state.ready().unwrap().resource_id, resource_id);
+        }
+    }
     crate::key_input::clear_test_frame();
 }

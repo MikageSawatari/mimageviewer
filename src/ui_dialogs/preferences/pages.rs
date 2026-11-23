@@ -11158,7 +11158,7 @@ fn draw_fullscreen_smooth_page_scroll_setting(ui: &mut egui::Ui, value: &mut boo
 
 fn draw_fullscreen_bound_drag_pan_setting(ui: &mut egui::Ui, value: &mut bool) {
     ui.checkbox(value, "閲覧時のドラッグ移動を画像の端までに制限する");
-    ui.small("ページ単位の静止画表示で、画面からはみ出す方向は画像の端で止まり、画面に収まる方向は動きません。補正パネルを開いているときや編集中、ズームモード・連結読み・360 度・3D 表示には適用しません。キー・ホイール・ズームの動きは変わりません。");
+    ui.small("ページ単位の静止画表示で、画面からはみ出す方向は画像の端で止まり、画面に収まる方向は動きません。補正パネルを開いているときや編集中、ズームモード・連結読み・360 度表示には適用しません。キー・ホイール・ズームの動きは変わりません。");
 }
 
 fn draw_fullscreen_n_scroll_step_setting(ui: &mut egui::Ui, value: &mut u32) {

@@ -2078,7 +2078,9 @@ paint rect の和（描く白 companion を含む）から初期 pan を求め�
 既存契約を保ち、完成画像の最初の frame も読み始めへ揃える。準備段で代役へ fallback したら確定しない。
 
 holdover 選択中・幾何未解決なら要求を保持し、世代・anchor 不一致、利用者の位置／倍率入力、除外モード、
-close・復元・reset では退役する。確定後の高画質化や resize で再適用しない。連結読み・動画・360 度・depth・Z・分析には適用しない。
+close・復元・reset では退役する。確定後の高画質化や resize で再適用しない。連結読み・動画・360 度・Z・分析には適用しない。
+3D 写真は通常の単ページと同じ配置要求を使い、Depth 素材の採用後に共通の配置を確定する
+([表示変換設計](depth-view-transform-plan.md) §3.5.1)。
 navigation の previous holdover は capture 済みの通常 placement で前の位置を保ち、同一表示単位の
 source reload 待ちと Z holdover は既存 transform を使う。紙めくりの zoom / pan 適格条件は維持する。
 状態の所有・消去入口と検証範囲は [設計 r4](fullscreen-page-start-position-plan.md) を参照。
@@ -2097,7 +2099,7 @@ holdover・暫定素材・見開きの部分描画・元画像の一時表示で
 紙めくりの保持素材（OFFのCompletingを含む）も一時表示として、補正前の候補を最終束縛と同じhelperで照合する。
 保持素材を選ぶframeは提案・確定をせず、見開きは片側だけの保持でも表示単位全体で止める。
 state全体を除外せず、保持が解けた最初の通常の完成素材のframeで収める。
-Z・連結・比較・360・3D・分析・編集は各表示の制約を保つ。
+3D 写真も採用素材の変換から共通のパン補正を確定する。Z・連結・比較・360・分析・編集は各表示の制約を保つ。
 
 通常見開きの layout producer は、物理pxへ整列した固定間隔と左右の側を描画済みページに記録する。
 次の入力の倍率投影では、その記録から間隔の比例拡大分だけを取り除く。単独ページの片側配置と
@@ -2125,7 +2127,9 @@ ON・対象面でページのドラッグを継続したまま Ctrl の分岐へ
 `FsDrawnUnitStamp` を記録する。印は context 所有の `FullscreenPageLayout` に含め、begin / clear で消す。
 items 世代、画面上の左右順・役割・片側配置を含む実ページと slice、矩形を決める実引数から作る
 `FsScrollGeometryKey` を持つ。白 companion は幾何だけに含める。部分描画、holdover を最終表示した
-frame、Z・比較・分析・360・3D などの経路には印を付けない。
+frame、Z・比較・分析・360 などの経路には印を付けない。3D 写真の単ページも、実際に描いた変換を
+共通の layout と印へ記録し、通常表示と同じページ内スクロールの照合に使う
+([表示変換設計](depth-view-transform-plan.md) §3.5.1)。
 
 入力時は描画と同じ helper で現在単位の鍵を作り、対象 fullscreen viewport の矩形・DPI を使って照合する。
 対象 viewport の content rect は、描画側の `CentralPanel` / `Context::content_rect()` と同じ

@@ -274,7 +274,8 @@ clip前AABBから求める。補正後にtransformを再解決する際、layout
   素材の到着／交換（RAW・PDF・AI・final合成・通過rendition・fallback）、viewportのresize/DPI・固定HUD/パネルの予約領域。
   fit/resetやopen等は既存の初期化が先に効く。それ以外も完成素材のframeで範囲外だけを戻す。§3.5以外の新しい操作制限はない。
 - 一時表示: 右Ctrl元画像は通常の `fs_pan` を共用するため明示的に除外する。編集ツールの元画像／マスク表示は編集モードの除外、
-  比較（通常／pin／wipe／diff）は比較の除外、分析・Z・360・3Dは各表示ownerの除外で書き戻さない。
+  比較（通常／pin／wipe／diff）は比較の除外、分析・Z・360は各表示ownerの除外で書き戻さない。
+  3D は [表示変換設計（§1.874）](depth-view-transform-plan.md) により通常の単ページと共通の配置確定を使う。
   類似候補の長押しpreview、Checking中の保持画面、navigation previousとsource-reload holdoverは別の描画／Captured／非currentなので書かない。
   紙めくりの保持（OFFのCompletingを含む）は補正前の実際の束縛照合で一時表示と判定する。
   見開きは片側だけの保持も表示単位全体で除外し、保持が解けた通常の完成素材で収める。state全体の除外や新しい一時panは作らない。
