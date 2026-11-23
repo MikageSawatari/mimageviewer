@@ -8489,6 +8489,7 @@ mod tests {
         let mut changed_entries = prepared.entries.to_vec();
         changed_entries[0].display_meta = Some((1234, 5678));
         let changed = Arc::new(CollectionPreparedSnapshot {
+            removable_missing: Arc::from([]),
             registered_total: prepared.registered_total,
             collection_id: prepared.collection_id,
             collection_revision: prepared.collection_revision,

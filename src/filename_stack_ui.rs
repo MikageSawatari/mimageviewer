@@ -15,14 +15,23 @@
 //! 分割して収集し、grouping と集約/flat の materialize・ページ編集投影は worker で行う。
 //! 受理時に bundle identity、items generation、request sequence、write stamps を照合する。
 
-/// The owner which blocks grid item input; only direct scans suppress legacy stack keys.
+/// The owner which blocks grid item input. Physical scan waits also suppress legacy stack keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GridItemInputBlock {
     BookStructuralOperation,
     ImageFolderZip,
     LocationNavigation,
     DirectNavigationScan,
+    ViewOrderRefreshScan,
     StackRefresh,
+}
+
+impl GridItemInputBlock {
+    /// Refreshing the order keeps the current location's non-item controls usable.
+    /// Other owners retain their existing restrictions.
+    pub(crate) fn item_independent_controls_allowed(self) -> bool {
+        matches!(self, Self::ViewOrderRefreshScan)
+    }
 }
 
 pub(crate) const DIRECT_NAVIGATION_WAIT_GRACE: std::time::Duration =
@@ -2330,18 +2339,22 @@ impl crate::app::App {
     }
 
     /// Grace is visual only: item input is blocked immediately. Existing history/rating
-    /// waits keep their immediate indicator, even if a direct scan is also pending.
+    /// waits keep their immediate indicator, even if a physical scan is also pending.
     pub(crate) fn direct_navigation_wait_overlay_delay(&self) -> Option<std::time::Duration> {
-        if self.other_location_navigation_pending() || !self.direct_navigation_scan_pending() {
+        if self.other_location_navigation_pending() {
             return None;
         }
-        let elapsed = self.direct_navigation_scan_elapsed()?;
+        let elapsed = self
+            .direct_navigation_scan_elapsed()
+            .or_else(|| self.view_order_refresh_scan_elapsed())?;
         (elapsed < DIRECT_NAVIGATION_WAIT_GRACE).then(|| DIRECT_NAVIGATION_WAIT_GRACE - elapsed)
     }
 
     pub(crate) fn grid_item_input_block(&self) -> Option<GridItemInputBlock> {
         if self.direct_navigation_scan_pending() {
             Some(GridItemInputBlock::DirectNavigationScan)
+        } else if self.view_order_refresh_scan_pending() {
+            Some(GridItemInputBlock::ViewOrderRefreshScan)
         } else if self.book_structural_op.is_some() {
             Some(GridItemInputBlock::BookStructuralOperation)
         } else if self.image_folder_zip_operation.is_some() {

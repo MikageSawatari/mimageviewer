@@ -7,9 +7,16 @@
 worker 走査へ通す。catalog の一括読み取りは、共通・live・保存済みお気に入りのどれかが
 長さ順である可能性がある要求だけ worker で行い、UI 同期走査や materialize から DB を開かない。
 
-全動画・音声の長さは既存 details-meta worker が可視 Normal / 画面外 Low で取得する。
-長さだけの要求で AI 等を取得せず、長さメニューに進捗と停止 / 再開を表示する。
-完了の証拠が揃うまで長さ条件だけを素通しにする。読み込みのモーダル化は一覧の即時表示と
+全動画・音声の長さとAI絞り込み用のメタデータ (§1.835) は、既存 details-meta worker が
+表示集合に依らず一覧全体から取得する。可視 Normal / 画面外 Low の優先度を維持し、
+表示集合の外では全体要件に含まれる長さ／AIだけを取得する。長さだけの要求でAI・日時・寸法・
+ページ数を増やさず、AIだけの要求で動画probeを増やさない。各メニューに進捗と停止 / 再開を表示する。
+一覧世代・件数と要件の証明が揃うまで、未証明の条件だけを素通しにする。停止中も証明済みの条件は保つ。
+facet変更は表示集合を作り直し、自動更新の監視や一覧全体の読み直しを起こさない。
+条件を緩めて新たに現れる行の通常列は、既存の表示集合走査内で未充足を検出し、既存の予算付き
+AllRequirementsで補充する。全体proof・cache・停止状態を保持し、追加のUI全走査・I/O・App状態は作らない。
+条件の縮小と完了後のrebuildでは不要な再開を立てない。
+読み込みのモーダル化は一覧の即時表示と
 通常操作を妨げるため採らず、自動整列をしないことで選択保護や再整列待ちの状態を増やさない。
 
 ## 静止画 scaler の先行作成と待ちの計装（§1.776 案 B-B）
@@ -107,6 +114,33 @@ mux・ファイル公開は `depth-export` worker に置き、画面用 uniform 
 進行と終端は worker が repaint を通知し、UI の常時 poll / timer / 待機は不要。
 モーダル中は3D自動運動の連続 repaint も停止する。取消は atomic flag、UI では join しない。
 実機での画質・所要時間・保存ダイアログの操作感は自動テストとは別に確認する。
+
+## ブラウザ連携の準備・登録・保存先操作（§1.818）
+
+`App::browser_integration` が process-global の単一 owner を持つ。UI は設定の snapshot と操作を渡し、環境は worker で取得する。
+`try_recv` で非 blocking poll して状態を描く。既知フォルダの照会、資格・exe の確認、
+保存先の祖先／junction の解決、copy/hash、manifest・registry、世代の整理、フォルダ picker／
+フォルダを開く処理は worker で行う。場所▼も解決済み保存先だけを使い、描画中に存在確認しない。
+
+同時に受け付ける操作は一件。処理中の追加操作は断り、完了は設定画面の寿命から独立した
+root の process-global poll で early return 前に回収する。worker は完了時に ROOT の repaint を要求し、
+UI の待機・busy loop・常時 repaint は追加しない。登録結果を live Settings へ採用後、
+worker の2キー transaction で保存し、UI から同期の全体設定保存を新たに呼ばない。
+
+通常の終了は root の既存継続で非同期に待ち、結果を採用・保存してから再開する。
+OFF の読み取り準備は通常終了・最終 fence の待機対象にせず、ON の起動時更新だけを待つ。
+フォルダ picker も同じ worker が持つため、終了受付で一律に同期受信する方式は採らない。
+通常の受付を迂回した最終 on_exit だけは、既発行 worker の receiver を回収して live Settings を
+確定する。既存の終了保存より前の所有境界の fence であり、描画中に registry／FS の同期作業を
+移す例外ではない。通常のポーリングや描画に待機・時間窓・再試行は追加しない。
+この最終 fence は ChooseFolder の picker も同期受信し得る。受付迂回との組み合わせは
+まれな終了の割り切りとして扱い、追加の仕組みは設けない。
+
+native messaging の受信・画像保存・MOTW・launcher の終了待ちは別プロセスの中継 exe、
+専用 pipe の接続・通信は listener / peer worker が担う。App は保存済みファイルを既存の
+非同期 open と復元 owner で開き、ブラウザの取得や通信完了を UI スレッドで待たない。
+所有・停止の詳細は [非同期アーキテクチャ](async-architecture.md)、実装と未確認事項は
+[実装計画](browser-to-miv-impl-plan.md) を参照する。
 
 ## 1. 原則: UI スレッドで避けるべき処理
 

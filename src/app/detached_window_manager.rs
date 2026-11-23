@@ -28,6 +28,14 @@ pub(crate) struct DetachedSessionLease {
     pub(crate) window_id: u64,
 }
 
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum DetachedWindowPurpose {
+    #[default]
+    Normal,
+    BrowserView,
+}
+
 /// Exact identity of one OS-host incarnation owned by a detached session lease.
 ///
 /// `HWND` values can be reused by Windows. The manager-issued incarnation prevents an
@@ -224,6 +232,7 @@ impl DetachedNativeHost {
 #[derive(Debug, Clone)]
 pub(crate) struct DetachedWindowRuntime {
     pub(crate) window_id: u64,
+    purpose: DetachedWindowPurpose,
     pub(crate) state: DetachedWindowState,
     native_host: DetachedNativeHost,
     pub(crate) host_incarnation: u64,
@@ -249,9 +258,14 @@ impl DetachedWindowRuntime {
         }
     }
 
-    fn new(window_id: u64, linked: bool) -> Self {
+    pub(crate) fn purpose(&self) -> DetachedWindowPurpose {
+        self.purpose
+    }
+
+    fn new(window_id: u64, linked: bool, purpose: DetachedWindowPurpose) -> Self {
         Self {
             window_id,
+            purpose,
             state: DetachedWindowState::Opening,
             native_host: DetachedNativeHost::Absent,
             host_incarnation: 0,
@@ -311,9 +325,21 @@ impl DetachedWindowManager {
     }
 
     fn entry_mut(&mut self, window_id: u64, default_linked: bool) -> &mut DetachedWindowRuntime {
+        self.runtimes.entry(window_id).or_insert_with(|| {
+            DetachedWindowRuntime::new(window_id, default_linked, DetachedWindowPurpose::Normal)
+        })
+    }
+
+    /// Purpose belongs to creation, never to host replacement, park or F11.
+    pub(super) fn create_with_purpose(
+        &mut self,
+        window_id: u64,
+        linked: bool,
+        purpose: DetachedWindowPurpose,
+    ) {
         self.runtimes
             .entry(window_id)
-            .or_insert_with(|| DetachedWindowRuntime::new(window_id, default_linked))
+            .or_insert_with(|| DetachedWindowRuntime::new(window_id, linked, purpose));
     }
 
     pub(super) fn runtime(&self, window_id: u64) -> Option<&DetachedWindowRuntime> {
@@ -562,6 +588,19 @@ impl DetachedWindowManager {
             if let HostPlacement::Unplaced { show_request, .. } = &mut runtime.host_placement {
                 *show_request = None;
             }
+        }
+    }
+
+    /// A newly accepted foreground owner supersedes only the old focus intent,
+    /// retaining visibility, maximization and host placement work.
+    pub(super) fn relinquish_pending_show_focus(&mut self, window_id: u64) {
+        if let Some(runtime) = self.runtimes.get_mut(&window_id)
+            && let HostPlacement::Unplaced {
+                show_request: Some(request),
+                ..
+            } = &mut runtime.host_placement
+        {
+            request.focus = false;
         }
     }
 

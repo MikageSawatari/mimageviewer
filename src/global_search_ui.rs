@@ -991,17 +991,50 @@ impl GlobalSearchState {
         self.aggregate_auto = aggregate_auto;
     }
 
+    /// All metadata hit batches have reached the canonical `all_hits` list.
+    /// `in_flight` owns a View wish, not batch rating/delivery. It is deliberately
+    /// excluded, preserving the completion condition used by drill reconciliation;
+    /// consumers reading `all_hits` do not need to wait for the prepared view.
+    pub(crate) fn metadata_results_settled(&self) -> bool {
+        self.done
+            && self
+                .page_edit_prepare
+                .as_ref()
+                .is_none_or(|prepare| prepare.rated_batch_sequence == prepare.raw_batch_sequence)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_metadata_rated_batch_for_test(&mut self, hits: Vec<GlobalHit>) {
+        // Use the existing hold slot to expose Done before RatedBatch deterministically.
+        // Releasing it feeds the real UI adoption handler, without a worker or sleeps.
+        let (tx, _commands) = mpsc::channel();
+        let (_outputs, rx) = mpsc::channel();
+        self.page_edit_prepare = Some(SearchPageEditPrepare {
+            tx,
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            next_sequence: 0,
+            raw_batch_sequence: 1,
+            rated_batch_sequence: 0,
+            in_flight: None,
+            desired: None,
+            hold_ready_for_test: true,
+            held_ready_for_test: Some(SearchPrepareOutput::RatedBatch(
+                1,
+                hits,
+                SearchRatingProvenance {
+                    stamp: crate::rating_db::RATING_WRITES.sample(),
+                    session_generation: 0,
+                },
+            )),
+            metrics: SearchPrepareTestMetrics::default(),
+        });
+    }
+
     /// Only a complete stream with all rated batches adopted proves missing hit scopes.
     /// An empty first batch, truncation or failure cannot move the current drill.
     fn reconcile_completed_drill(&mut self) -> bool {
-        if !self.done
-            || self.truncated
-            || self.reject_message.is_some()
-            || self
-                .page_edit_prepare
-                .as_ref()
-                .is_some_and(|prepare| prepare.rated_batch_sequence != prepare.raw_batch_sequence)
-        {
+        if !self.metadata_results_settled() || self.truncated || self.reject_message.is_some() {
             return false;
         }
         let Some(drill) = self.drill.as_ref() else {
@@ -7715,6 +7748,60 @@ pub(crate) mod tests {
         // クエリリセットで drill state もリセットされる契約
         state.reset_for_new_query();
         assert_eq!(state.view(), GlobalSearchView::Flat);
+    }
+
+    #[test]
+    fn release_checks_search_metadata_results_settled_without_prepare_requires_done() {
+        let mut state = GlobalSearchState::default();
+        assert!(!state.metadata_results_settled());
+        state.done = true;
+        assert!(state.metadata_results_settled());
+        // Delivery completion does not claim a successful/untruncated search.
+        state.truncated = true;
+        state.reject_message = Some("rejected".into());
+        assert!(state.metadata_results_settled());
+    }
+
+    #[test]
+    fn release_checks_search_metadata_results_settled_waits_for_rated_batches_not_view() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut state = GlobalSearchState::default();
+        state.hold_metadata_rated_batch_for_test(Vec::new());
+        assert!(!state.metadata_results_settled());
+        state.done = true;
+        assert!(!state.metadata_results_settled());
+        state
+            .page_edit_prepare
+            .as_mut()
+            .unwrap()
+            .rated_batch_sequence = 1;
+        assert!(state.metadata_results_settled());
+        state.page_edit_prepare.as_mut().unwrap().in_flight = Some(7);
+        assert!(state.metadata_results_settled());
+        state.done = false;
+        assert!(!state.metadata_results_settled());
+    }
+
+    #[test]
+    fn release_checks_search_reconcile_waits_for_rated_batches() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let mut state = GlobalSearchState::default();
+        state.drill = Some(DrillState {
+            container_root: PathBuf::from("C:/gone"),
+            current_path: PathBuf::from("C:/gone"),
+            is_zip: false,
+        });
+        state.hold_metadata_rated_batch_for_test(Vec::new());
+        state.done = true;
+        assert!(!state.reconcile_completed_drill());
+        assert!(state.drill.is_some());
+        state
+            .page_edit_prepare
+            .as_mut()
+            .unwrap()
+            .rated_batch_sequence = 1;
+        assert!(state.reconcile_completed_drill());
+        assert!(state.drill.is_none());
     }
 
     #[test]

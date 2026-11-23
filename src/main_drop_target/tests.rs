@@ -161,6 +161,68 @@ fn main_drop_blockers_and_tree_blank_never_fall_through_to_grid() {
     );
 }
 
+#[test]
+fn main_drop_nodrop_rejected_hits_use_none_and_accepted_external_grid_uses_invalid() {
+    let source = internal(&[r"C:\src\a"]);
+    for hit in [None, Some(Hit::TreeNonTarget), Some(Hit::ExistingDropArea)] {
+        for (internal, has_paths, allows_copy) in [
+            (Some(&source), true, true),
+            (None, false, true),
+            (None, true, false),
+        ] {
+            let decision = decide(hit.clone(), true, internal, has_paths, allows_copy, 0);
+            assert!(!decision.accepted(), "{hit:?}");
+            assert_eq!(decision.description(), Description::None, "{hit:?}");
+        }
+    }
+    let no_paths = decide(
+        Some(Hit::TreeRow(r"C:\dst".into())),
+        true,
+        None,
+        false,
+        true,
+        0,
+    );
+    assert!(!no_paths.accepted());
+    assert_eq!(no_paths.description(), Description::None);
+    let accepted = decide(Some(Hit::ExistingDropArea), true, None, true, true, 0);
+    assert!(matches!(accepted, Decision::Grid));
+    assert_eq!(accepted.description(), Description::Invalid);
+}
+
+#[test]
+fn main_drop_nodrop_internal_row_to_grid_replaces_transfer_without_reading_paths() {
+    let data = Rc::new(FakeData::default());
+    let session = DragSession::new(data.clone(), true, true);
+    let source = internal(&[r"C:\src\a"]);
+    session.describe(tree(r"C:\dst", Some(&source), 0).description());
+    let rejected = decide(
+        Some(Hit::ExistingDropArea),
+        true,
+        Some(&source),
+        false,
+        true,
+        0,
+    );
+    session.describe(rejected.description());
+    session.describe(rejected.description());
+    assert_eq!(
+        data.descriptions.borrow().as_slice(),
+        &[
+            Description::Transfer(ShellTransferOperation::Move, r"C:\dst".into()),
+            Description::None,
+        ]
+    );
+    assert!(
+        session
+            .drop_request(&rejected, Some(&source))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(data.reads.get(), 0);
+    assert_eq!(data.queries.get(), 0);
+}
+
 fn rect(left: f32, top: f32, right: f32, bottom: f32) -> egui::Rect {
     egui::Rect::from_min_max(egui::pos2(left, top), egui::pos2(right, bottom))
 }
@@ -391,7 +453,7 @@ fn main_drop_external_requests_copy_or_grid_and_only_description_writes_change()
     for _ in 0..3 {
         session.describe(decision.description());
     }
-    session.describe(Description::Invalid); // Leave row / DragLeave / after Drop.
+    session.describe(Description::Invalid); // Accepted list / DragLeave / after Drop.
     session.describe(Description::Invalid);
     assert_eq!(
         data.descriptions.borrow().as_slice(),
@@ -415,7 +477,7 @@ fn main_drop_external_requests_copy_or_grid_and_only_description_writes_change()
     assert_eq!(data.reads.get(), 2);
     assert!(
         session
-            .drop_request(&Decision::None(Description::Invalid), None)
+            .drop_request(&Decision::None(Description::None), None)
             .unwrap()
             .is_none()
     );

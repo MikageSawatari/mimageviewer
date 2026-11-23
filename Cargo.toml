@@ -16,6 +16,9 @@ members = [
     "crates/musicvideo-editor",
     "crates/remote-ipc",
     "crates/agent-ipc",
+    "crates/capture-file",
+    "crates/browser-view-ipc",
+    "crates/browser-host",
     "crates/mcp-server",
     "crates/remote-web",
     "crates/vst3-host-tester",
@@ -54,7 +57,7 @@ tantivy = { path = "vendor/tantivy" }
 # 旧バージョンの runtime dir に新しい実行ファイルを上書きしてしまう。susie-worker / vst3-host-tester
 # / png2mag は独立した内部ヘルパーなので workspace inherit せず個別管理。
 [workspace.package]
-version = "5.5.0"
+version = "5.6.0"
 edition = "2024"
 # egui / eframe 0.37 の MSRV。開発 toolchain は 1.100 固定。
 rust-version = "1.95"
@@ -388,6 +391,9 @@ windows-numerics = "0.2"
 winreg = "0.52"
 
 [dependencies]
+mimageviewer-capture-file = { path = "crates/capture-file" }
+mimageviewer-browser-host = { path = "crates/browser-host" }
+mimageviewer-browser-view-ipc = { path = "crates/browser-view-ipc" }
 miv-startup = { path = "crates/startup-diagnostics" }
 eframe = { version = "0.37.0", features = ["wgpu", "glow"] }
 egui = "0.37.0"

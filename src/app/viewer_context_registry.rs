@@ -8,32 +8,40 @@ mod duration_762_context_tests {
     #[test]
     fn duration_762_proof_and_cache_follow_mount_park_and_drop_without_sibling_changes() {
         let mut app = crate::app::setup_app_for_test();
-        let proof = DurationScanProof {
+        let proof = ListingMetaScanProof {
             generation: app.items_generation,
             items_len: app.items.len(),
+            requirements: ListingMetaRequirements {
+                duration: true,
+                ai: true,
+            },
         };
-        app.duration_scan_proof = Some(proof);
+        app.listing_meta_scan_proof = Some(proof);
         app.details_lazy_meta
             .insert("source-media".into(), DetailsLazyMeta::default());
         let mut sibling = ViewerContextBundle::empty();
         sibling.set_items_generation(app.items_generation.wrapping_add(1));
-        let sibling_proof = DurationScanProof {
+        let sibling_proof = ListingMetaScanProof {
             generation: sibling.items_generation,
             items_len: sibling.items.len(),
+            requirements: ListingMetaRequirements {
+                duration: true,
+                ai: true,
+            },
         };
         assert_ne!(proof, sibling_proof);
-        sibling.duration_scan_proof = Some(sibling_proof);
+        sibling.listing_meta_scan_proof = Some(sibling_proof);
         sibling
             .details_lazy_meta
             .insert("sibling-media".into(), DetailsLazyMeta::default());
         app.swap_viewer_context_bundle(&mut sibling);
-        assert_eq!(app.duration_scan_proof, Some(sibling_proof));
+        assert_eq!(app.listing_meta_scan_proof, Some(sibling_proof));
         assert!(app.details_lazy_meta.contains_key("sibling-media"));
-        assert_eq!(sibling.duration_scan_proof, Some(proof));
+        assert_eq!(sibling.listing_meta_scan_proof, Some(proof));
         assert!(sibling.details_lazy_meta.contains_key("source-media"));
         app.swap_viewer_context_bundle(&mut sibling);
         drop(sibling);
-        assert_eq!(app.duration_scan_proof, Some(proof));
+        assert_eq!(app.listing_meta_scan_proof, Some(proof));
         assert!(app.details_lazy_meta.contains_key("source-media"));
         assert!(!app.details_lazy_meta.contains_key("sibling-media"));
     }
@@ -41,20 +49,69 @@ mod duration_762_context_tests {
     #[test]
     fn duration_762_fork_keeps_source_proof_and_starts_without_metadata_proof() {
         let mut app = crate::app::setup_app_for_test();
-        let proof = DurationScanProof {
+        let proof = ListingMetaScanProof {
             generation: app.items_generation,
             items_len: app.items.len(),
+            requirements: ListingMetaRequirements {
+                duration: true,
+                ai: true,
+            },
         };
-        app.duration_scan_proof = Some(proof);
+        app.listing_meta_scan_proof = Some(proof);
         app.details_lazy_meta
             .insert("source-media".into(), DetailsLazyMeta::default());
         let fork = app.split_current_context_preserving_main_grid();
-        assert_eq!(app.duration_scan_proof, Some(proof));
+        assert_eq!(app.listing_meta_scan_proof, Some(proof));
         assert!(app.details_lazy_meta.contains_key("source-media"));
-        assert_eq!(fork.duration_scan_proof, None);
+        assert_eq!(fork.listing_meta_scan_proof, None);
         assert!(fork.details_lazy_meta.is_empty());
         drop(fork);
-        assert_eq!(app.duration_scan_proof, Some(proof));
+        assert_eq!(app.listing_meta_scan_proof, Some(proof));
+    }
+
+    #[test]
+    fn facet_835_context_reproof_and_bundle_drop_keep_sibling_requirements() {
+        let mut app = crate::app::setup_app_for_test();
+        app.duration_facet_requested = true;
+        app.ai_model_facet_requested = true;
+        let source_proof = app.listing_meta_scan_snapshot();
+        assert!(source_proof.requirements.duration && source_proof.requirements.ai);
+        app.complete_listing_meta_scan(Some(source_proof));
+
+        let mut sibling = ViewerContextBundle::empty();
+        sibling.set_items_generation(app.items_generation.wrapping_add(1));
+        let sibling_proof = ListingMetaScanProof {
+            generation: sibling.items_generation,
+            items_len: sibling.items.len(),
+            requirements: source_proof.requirements,
+        };
+        sibling.listing_meta_scan_proof = Some(sibling_proof);
+        app.swap_viewer_context_bundle(&mut sibling);
+        assert_eq!(sibling.listing_meta_scan_proof, Some(source_proof));
+
+        app.bump_items_generation();
+        assert!(!app.duration_scan_ready() && !app.ai_model_facet_ready());
+        let replacement_proof = app.listing_meta_scan_snapshot();
+        assert_ne!(replacement_proof, sibling_proof);
+        assert_eq!(
+            app.complete_listing_meta_scan(Some(replacement_proof)),
+            source_proof.requirements
+        );
+        assert!(app.duration_scan_ready() && app.ai_model_facet_ready());
+        assert_eq!(sibling.listing_meta_scan_proof, Some(source_proof));
+
+        app.swap_viewer_context_bundle(&mut sibling);
+        assert_eq!(app.listing_meta_scan_proof, Some(source_proof));
+        assert_eq!(sibling.listing_meta_scan_proof, Some(replacement_proof));
+        drop(sibling);
+        assert_eq!(app.listing_meta_scan_proof, Some(source_proof));
+        assert!(app.duration_scan_ready() && app.ai_model_facet_ready());
+
+        let fork = app.split_current_context_preserving_main_grid();
+        assert!(fork.listing_meta_scan_proof.is_none());
+        assert_eq!(app.listing_meta_scan_proof, Some(source_proof));
+        drop(fork);
+        assert!(app.duration_scan_ready() && app.ai_model_facet_ready());
     }
 }
 
@@ -1928,7 +1985,7 @@ pub(in crate::app) struct ViewerContextBundle {
     details_meta_pending: Option<DetailsMetaPending>,
     details_lazy_visible_revision: u64,
     details_image_dims_state: LazyColumnState,
-    duration_scan_proof: Option<super::DurationScanProof>,
+    listing_meta_scan_proof: Option<super::ListingMetaScanProof>,
     metadata_cache: std::collections::HashMap<String, Option<crate::png_metadata::AiMetadata>>,
     exif_cache: std::collections::HashMap<String, Option<crate::exif_reader::ExifInfo>>,
     xmp_cache: std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
@@ -2713,6 +2770,23 @@ impl ContextAsyncOwner {
 
 #[cfg(windows)]
 impl<'a> ContextRef<'a> {
+    pub(in crate::app) fn collection_grid_request_stamp_is_current(
+        self,
+        context_id: ViewerContextId,
+        stamp: top_level_grid_view::CollectionGridRequestStamp,
+    ) -> bool {
+        let view = match self.source {
+            ContextRefSource::Mounted(app) => &app.top_level_grid_view,
+            ContextRefSource::AtRest(bundle) => &bundle.top_level_grid_view,
+        };
+        super::collection_grid::collection_grid_request_stamp_matches(
+            context_id,
+            view,
+            self.items_generation(),
+            stamp,
+        )
+    }
+
     pub(in crate::app) fn grid_scroll(self) -> &'a super::GridScrollState {
         match self.source {
             ContextRefSource::Mounted(app) => &app.grid_scroll,
@@ -3253,7 +3327,7 @@ impl ViewerContextBundle {
             details_meta_pending: None,
             details_lazy_visible_revision: 0,
             details_image_dims_state: LazyColumnState::Disabled,
-            duration_scan_proof: None,
+            listing_meta_scan_proof: None,
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
@@ -3693,7 +3767,7 @@ impl App {
             details_meta_pending,
             details_lazy_visible_revision,
             details_image_dims_state,
-            duration_scan_proof,
+            listing_meta_scan_proof,
             metadata_cache,
             exif_cache,
             xmp_cache,
@@ -4021,7 +4095,7 @@ impl App {
         swap_field!(details_meta_pending);
         swap_field!(details_lazy_visible_revision);
         swap_field!(details_image_dims_state);
-        swap_field!(duration_scan_proof);
+        swap_field!(listing_meta_scan_proof);
         swap_field!(metadata_cache);
         swap_field!(exif_cache);
         swap_field!(xmp_cache);
@@ -4475,7 +4549,7 @@ impl App {
             details_meta_pending,
             details_lazy_visible_revision,
             details_image_dims_state,
-            duration_scan_proof,
+            listing_meta_scan_proof,
             metadata_cache,
             exif_cache,
             xmp_cache,
@@ -4941,7 +5015,7 @@ impl App {
             details_meta_pending,
             details_lazy_visible_revision,
             details_image_dims_state,
-            duration_scan_proof,
+            listing_meta_scan_proof,
             video_thumb_overrides,
             metadata_cache,
             exif_cache,
@@ -6203,10 +6277,49 @@ impl App {
         )
     }
 
+    pub(in crate::app) fn fork_materialized_still_context_with_seed(
+        &mut self,
+        physical_context: &Path,
+        idx: usize,
+        seed: super::DetachedWindowSeed,
+    ) -> ViewerContextId {
+        let id = self.fork_materialized_still_context(physical_context, idx);
+        if seed.placement.is_some()
+            || seed.purpose == super::detached_window_manager::DetachedWindowPurpose::BrowserView
+        {
+            self.with_viewer_context(id, |app| {
+                app.commit_viewer_session(
+                    super::ViewerPresentation::DetachedWindow,
+                    true,
+                    "browser_materialized_binding",
+                );
+                app.ensure_detached_viewer_window_id_with_seed(seed);
+            })
+            .expect("new materialized context must mount for its creation seed");
+        }
+        id
+    }
+
     pub(in crate::app) fn retire_context<D>(
         &mut self,
         id: ViewerContextId,
         _reason: &'static str,
+        digest: impl FnOnce(ContextMut<'_>) -> D,
+    ) -> Result<D, RetireError> {
+        let close_owner = self.viewer_context_window(id).and_then(|window_id| {
+            self.capture_detached_close_owner(
+                Self::detached_session_lease(window_id),
+                ViewerCloseCause::Replaced,
+            )
+        });
+        self.retire_context_with_close_owner(id, _reason, close_owner, digest)
+    }
+
+    pub(in crate::app) fn retire_context_with_close_owner<D>(
+        &mut self,
+        id: ViewerContextId,
+        _reason: &'static str,
+        close_owner: Option<super::DetachedCloseOwner>,
         digest: impl FnOnce(ContextMut<'_>) -> D,
     ) -> Result<D, RetireError> {
         let reason = _reason;
@@ -6229,7 +6342,7 @@ impl App {
         self.cancel_rating_membership_restore_for_context(id);
         if retiring_window == self.active_detached_window_id() {
             self.begin_active_detached_session_close(reason);
-            self.finish_active_detached_session_close(reason);
+            self.finish_active_detached_session_close_owned(close_owner, reason);
         }
         let value = {
             let payload = self.viewer_contexts.table.retiring_slot_mut(id).unwrap();
@@ -6268,9 +6381,26 @@ impl App {
         finish: impl FnOnce(&mut Self),
         digest: impl FnOnce(ContextMut<'_>) -> D,
     ) -> Result<D, RetireContextError> {
+        let owner = self.viewer_context_window(id).and_then(|window_id| {
+            self.capture_detached_close_owner(
+                Self::detached_session_lease(window_id),
+                ViewerCloseCause::Replaced,
+            )
+        });
+        self.close_and_retire_context_with_close_owner(id, reason, owner, finish, digest)
+    }
+
+    pub(in crate::app) fn close_and_retire_context_with_close_owner<D>(
+        &mut self,
+        id: ViewerContextId,
+        reason: &'static str,
+        owner: Option<super::DetachedCloseOwner>,
+        finish: impl FnOnce(&mut Self),
+        digest: impl FnOnce(ContextMut<'_>) -> D,
+    ) -> Result<D, RetireContextError> {
         self.with_viewer_context_state(id, finish)
             .map_err(RetireContextError::Mount)?;
-        self.retire_context(id, reason, digest)
+        self.retire_context_with_close_owner(id, reason, owner, digest)
             .map_err(RetireContextError::Retire)
     }
 

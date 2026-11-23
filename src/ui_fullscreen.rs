@@ -59,6 +59,8 @@ mod prepared_edit_entry_tests;
 #[cfg(test)]
 mod retained_material_entry_tests;
 #[cfg(test)]
+pub(crate) mod side_panel_secondary_input_tests;
+#[cfg(test)]
 mod slideshow_settings_tests;
 #[cfg(test)]
 mod slideshow_tests;
@@ -3808,21 +3810,48 @@ fn frozen_white_companion(
     })
 }
 
+fn minimum_pan_overlap(image_rect: egui::Rect, viewport_rect: egui::Rect) -> egui::Vec2 {
+    egui::vec2(
+        FS_PAN_MIN_VISIBLE_PX
+            .min(image_rect.width())
+            .min(viewport_rect.width()),
+        FS_PAN_MIN_VISIBLE_PX
+            .min(image_rect.height())
+            .min(viewport_rect.height()),
+    )
+}
+
+/// Translation ranges which retain the requested overlap on both axes.
+fn pan_translation_bounds_for_overlap(
+    image_rect: egui::Rect,
+    viewport_rect: egui::Rect,
+    overlap: egui::Vec2,
+) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(
+            viewport_rect.left() + overlap.x - image_rect.right(),
+            viewport_rect.top() + overlap.y - image_rect.bottom(),
+        ),
+        egui::pos2(
+            viewport_rect.right() - overlap.x - image_rect.left(),
+            viewport_rect.bottom() - overlap.y - image_rect.top(),
+        ),
+    )
+}
+
 fn pan_correction_for_minimum_overlap(
     image_rect: egui::Rect,
     viewport_rect: egui::Rect,
 ) -> egui::Vec2 {
-    let overlap_x = FS_PAN_MIN_VISIBLE_PX
-        .min(image_rect.width())
-        .min(viewport_rect.width());
-    let overlap_y = FS_PAN_MIN_VISIBLE_PX
-        .min(image_rect.height())
-        .min(viewport_rect.height());
-    let min_x = viewport_rect.left() + overlap_x - image_rect.right();
-    let max_x = viewport_rect.right() - overlap_x - image_rect.left();
-    let min_y = viewport_rect.top() + overlap_y - image_rect.bottom();
-    let max_y = viewport_rect.bottom() - overlap_y - image_rect.top();
-    egui::vec2(0.0_f32.clamp(min_x, max_x), 0.0_f32.clamp(min_y, max_y))
+    let bounds = pan_translation_bounds_for_overlap(
+        image_rect,
+        viewport_rect,
+        minimum_pan_overlap(image_rect, viewport_rect),
+    );
+    egui::vec2(
+        0.0_f32.clamp(bounds.left(), bounds.right()),
+        0.0_f32.clamp(bounds.top(), bounds.bottom()),
+    )
 }
 
 /// Clamp a proposed normal-view pan against the resolved page geometry from the previous frame.
@@ -6186,6 +6215,8 @@ fn paint_still_seek_preview(
 }
 /// ホイール感度（raw_scroll_delta の除数）
 const WHEEL_SENSITIVITY: f32 = 30.0;
+// Native egui projects one Line wheel notch to 40 logical points (InputOptions).
+const WHEEL_ZOOM_POINTS_PER_NOTCH: f32 = 40.0;
 
 pub(crate) fn metadata_panel_rect_with_seek_height(
     full_rect: egui::Rect,
@@ -7960,6 +7991,25 @@ impl FullscreenSidePanelRects {
     }
 }
 
+/// Input-time chrome geometry, retained with a deferred wheel/click proposal.
+#[derive(Clone, Copy, Debug, Default)]
+struct FullscreenSidePanelClickChrome {
+    panels: FullscreenSidePanelRects,
+    navigator_exclusion: Option<egui::Rect>,
+    depth_panel: Option<egui::Rect>,
+}
+
+impl FullscreenSidePanelClickChrome {
+    /// Shared by canvas primary clicks and confirmed secondary short taps.
+    /// The navigator excludes ordinary side panels, but not the Depth panel,
+    /// preserving the existing primary-click policy.
+    fn contains_pointer(self, pos: egui::Pos2) -> bool {
+        (fullscreen_edge_hover_allowed(pos, self.navigator_exclusion)
+            && self.panels.iter().any(|rect| rect.contains(pos)))
+            || self.depth_panel.is_some_and(|rect| rect.contains(pos))
+    }
+}
+
 fn fullscreen_side_panel_rects(
     full_rect: egui::Rect,
     chrome_enabled: bool,
@@ -8403,6 +8453,23 @@ fn still_passive_side_panel_hover_enabled(cursor_hidden: bool, touch_chrome_latc
     !cursor_hidden && !touch_chrome_latched
 }
 
+fn fullscreen_cursor_active(input: &egui::InputState) -> bool {
+    input.pointer.delta() != egui::Vec2::ZERO
+        || input.pointer.any_pressed()
+        || input.pointer.any_click()
+        || input.smooth_scroll_delta != egui::Vec2::ZERO
+}
+
+/// Whether this frame's pointer input can use the last hover position.
+/// Activity releases Idle, but never the derived ZoomAiming hide reason.
+fn fullscreen_pointer_position_live(current: Option<FsCursorHide>, cursor_active: bool) -> bool {
+    match current {
+        None => true,
+        Some(FsCursorHide::Idle) => cursor_active,
+        Some(FsCursorHide::ZoomAiming) => false,
+    }
+}
+
 fn next_fullscreen_cursor_hide_reason(
     current: Option<FsCursorHide>,
     zoom_aiming: bool,
@@ -8420,7 +8487,10 @@ fn next_fullscreen_cursor_hide_reason(
     // is cleared by any activity. Aiming needs no carried-over copy of that fact. The
     // caller restarts the idle countdown on activity, so a hide that predates aiming is
     // re-derived here through `idle_hide_ready` when the pointer really did stay still.
-    if clean && ((matches!(current, Some(FsCursorHide::Idle)) && !cursor_active) || idle_hide_ready)
+    if clean
+        && ((matches!(current, Some(FsCursorHide::Idle))
+            && !fullscreen_pointer_position_live(current, cursor_active))
+            || idle_hide_ready)
     {
         Some(FsCursorHide::Idle)
     } else {
@@ -13307,7 +13377,12 @@ impl App {
         }
     }
 
-    fn original_preview_active_for_frame(&self, ctx: &egui::Context, idx: usize) -> bool {
+    /// Share the frame-cached selection with pre-draw AI prefetch admission.
+    pub(crate) fn original_preview_active_for_frame(
+        &self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> bool {
         matches!(self.compare_view_mode, crate::app::CompareViewMode::Off)
             && self
                 .original_preview_frame_observation(ctx, idx)
@@ -15400,7 +15475,7 @@ impl App {
         painted
     }
 
-    /// 利用者入力から通常表示の pan を変更する唯一の入口。
+    /// Shared input writer, except for the opt-in canvas drag boundary.
     ///
     /// Z ズームと連結読みはそれぞれ専用制約を持つため、このクランプを適用しない。
     fn set_fs_pan_from_input(&mut self, proposed_zoom: f32, proposed_pan: egui::Vec2) {
@@ -15861,10 +15936,29 @@ impl App {
         zoom: &mut f32,
         pan: &mut egui::Vec2,
         wheel_y: f32,
+        step: crate::settings::FullscreenWheelZoomStep,
         mouse: Option<egui::Pos2>,
         rect_center: egui::Pos2,
     ) -> bool {
-        let factor = 1.1_f32.powf(wheel_y / WHEEL_SENSITIVITY);
+        use crate::settings::FullscreenWheelZoomStep;
+        let factor = match step.normalized() {
+            // Preserve the legacy expression, including its f32 rounding.
+            FullscreenWheelZoomStep::Standard => 1.1_f32.powf(wheel_y / WHEEL_SENSITIVITY),
+            step => {
+                let percent = match step {
+                    FullscreenWheelZoomStep::Percent5 => 5.0,
+                    FullscreenWheelZoomStep::Percent10 => 10.0,
+                    FullscreenWheelZoomStep::Percent20 => 20.0,
+                    FullscreenWheelZoomStep::Percent30 => 30.0,
+                    FullscreenWheelZoomStep::Percent50 => 50.0,
+                    FullscreenWheelZoomStep::Percent100 => 100.0,
+                    FullscreenWheelZoomStep::Standard | FullscreenWheelZoomStep::Unknown => {
+                        unreachable!()
+                    }
+                };
+                (1.0_f32 + percent / 100.0).powf(wheel_y / WHEEL_ZOOM_POINTS_PER_NOTCH)
+            }
+        };
         let old_zoom = *zoom;
         *zoom = (old_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
         if let Some(mouse) = mouse {
@@ -19952,6 +20046,7 @@ struct FsWheelFrameProposal {
     page_nav: FsPageNavRequest,
     canvas_click: FsCanvasClickAction,
     secondary_action: FsSecondaryAction,
+    side_panel_click_chrome: FullscreenSidePanelClickChrome,
     full_rect: egui::Rect,
     default_image_rect: egui::Rect,
     primary_suppression: FullscreenPrimarySuppressionDecision,
@@ -20032,11 +20127,13 @@ enum FsSecondaryAction {
     ShortTap {
         context: crate::ring_shortcut::RightDragContext,
         pos: egui::Pos2,
+        egui_click: bool,
     },
     LongPress(egui::Pos2),
     Recognized {
         context: crate::ring_shortcut::RightDragContext,
         pos: egui::Pos2,
+        egui_click: bool,
         recognition: crate::ring_shortcut::RightDragRecognition,
     },
 }
@@ -20048,6 +20145,25 @@ enum FsSecondaryInputOutcome {
 }
 
 impl FsSecondaryAction {
+    fn short_tap_owned_by_side_panel(&self, chrome: FullscreenSidePanelClickChrome) -> bool {
+        match self {
+            Self::ShortTap {
+                pos, egui_click, ..
+            }
+            | Self::Recognized {
+                pos,
+                egui_click,
+                recognition:
+                    crate::ring_shortcut::RightDragRecognition {
+                        outcome: crate::ring_shortcut::MouseFlickOutcome::ShortTap,
+                        command: None,
+                    },
+                ..
+            } => *egui_click && chrome.contains_pointer(*pos),
+            _ => false,
+        }
+    }
+
     fn executes_before_final_navigation(&self) -> bool {
         matches!(
             self,
@@ -20061,7 +20177,10 @@ impl FsSecondaryAction {
         )
     }
 
-    fn closes_viewer(&self, app: &App) -> bool {
+    fn closes_viewer(&self, app: &App, chrome: FullscreenSidePanelClickChrome) -> bool {
+        if self.short_tap_owned_by_side_panel(chrome) {
+            return false;
+        }
         let context = match self {
             Self::ShortTap { context, .. } => *context,
             Self::Recognized {
@@ -24731,12 +24850,36 @@ impl App {
         reason: &'static str,
         activate_ids: Option<&[u64]>,
     ) {
+        self.close_detached_image_windows_by_ids_with_cause(
+            ctx,
+            close_ids,
+            reason,
+            activate_ids,
+            crate::app::ViewerCloseCause::User,
+        );
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn close_detached_image_windows_by_ids_with_cause(
+        &mut self,
+        ctx: &egui::Context,
+        close_ids: &[u64],
+        reason: &'static str,
+        activate_ids: Option<&[u64]>,
+        cause: crate::app::ViewerCloseCause,
+    ) {
         if close_ids.is_empty() {
             return;
         }
         let mut close_ids = close_ids.to_vec();
         close_ids.sort_unstable();
         close_ids.dedup();
+        let owners = close_ids
+            .iter()
+            .filter_map(|id| {
+                self.capture_detached_close_owner(Self::detached_session_lease(*id), cause)
+            })
+            .collect::<Vec<_>>();
         let activate_ids = activate_ids.unwrap_or(&[]);
         self.log_detached_image_window_debug(format!(
             "{reason} ids={:?} passive_before={} activate_ids={:?}",
@@ -24757,14 +24900,24 @@ impl App {
                 ));
             }
         }
-        let _ = self.teardown_paused_media_bundles_for_window_ids(&close_ids, reason);
+        let _ = self
+            .teardown_paused_media_bundles_with_close_owners(&close_ids, reason, cause, &owners);
         self.detached_image_windows
             .retain(|window| !close_ids.contains(&window.id));
         for id in &close_ids {
-            self.remove_detached_window_runtime(*id, reason);
+            if let Some(owner) = owners.iter().find(|owner| owner.lease.window_id == *id) {
+                self.remove_detached_window_runtime_owned(*owner, reason);
+            } else {
+                self.remove_detached_window_runtime(*id, reason);
+            }
             self.deferred_detached_image_window_views.remove(id);
         }
-        self.focus_main_after_detached_window_close_if_idle(ctx, reason);
+        if let Some(owner) = owners
+            .iter()
+            .find(|owner| owner.policy().main_focus == crate::app::DetachedCloseFocus::Existing)
+        {
+            self.focus_main_after_detached_close_if_idle(ctx, *owner, reason);
+        }
         ctx.request_repaint();
     }
 
@@ -25796,6 +25949,18 @@ impl App {
     fn still_info_panel_lock_effective_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
         self.resolved_still_chrome().info_locked
             && self.still_info_panel_eligible_for_idx(fs_idx, is_video)
+    }
+
+    /// Use the draw owner's visibility with the effective (mode-gated) lock.
+    /// Wheel and click admission must agree even when only the lock shows the panel.
+    fn fullscreen_info_panel_visible_for_idx(&self, fs_idx: Option<usize>, is_video: bool) -> bool {
+        let mut panel_state = self.fs_info_panel;
+        panel_state.locked =
+            fs_idx.is_some_and(|idx| self.still_info_panel_lock_effective_for_idx(idx, is_video));
+        panel_state.visible(
+            self.settings.fullscreen_side_panel_mode,
+            self.fullscreen_tag_picker_open,
+        )
     }
 
     fn still_info_panel_eligible_for_idx(&self, fs_idx: usize, is_video: bool) -> bool {
@@ -28688,12 +28853,7 @@ impl App {
                 if self.cursor_last_activity.is_none() {
                     self.cursor_last_activity = Some(std::time::Instant::now());
                 }
-                let cursor_active = ctx.input(|i| {
-                    i.pointer.delta() != egui::Vec2::ZERO
-                        || i.pointer.any_pressed()
-                        || i.pointer.any_click()
-                        || i.smooth_scroll_delta != egui::Vec2::ZERO
-                });
+                let cursor_active = ctx.input(fullscreen_cursor_active);
                 // Do not mutate cursor visibility here. Z aiming is updated below by
                 // handle_fs_key_input, after which one owner resolves pointer activity,
                 // idle latching, and ZoomAiming together for this frame.
@@ -29076,6 +29236,7 @@ impl App {
                         let mut wheel_result = self.handle_fs_wheel_and_click_frame(
                             ui,
                             ctx,
+                            cursor_active,
                             full_rect,
                             &state,
                             still_seek_geometry,
@@ -35023,12 +35184,13 @@ impl App {
         let initial_demand = self
             .spread_display_composition_for_anchor(fs_idx)
             .presentation_demand(self.spread_mode, self.fullscreen_page_slice);
-        let target_load_allowed = self.page_overview.session().is_none()
-            && !self.continuous_reading_active_for_idx(fs_idx)
-            && matches!(self.book_presentation_target_allowed(&initial_demand),
+        let target_load_allowed = self.paged_viewer_materialization_allowed(
+            matches!(self.book_presentation_target_allowed(&initial_demand),
                 crate::book_composition::PresentationDecision::Allowed(ref allowed)
                     if initial_demand.iter().zip(allowed).any(|(occurrence, allowed)|
-                        occurrence.item_index == fs_idx && *allowed));
+                        occurrence.item_index == fs_idx && *allowed)),
+            self.continuous_reading_active_for_idx(fs_idx),
+        );
         let stop_page_needs_load = matches!(
             self.fs_display_page_load_state(fs_idx),
             FsPageLoadState::NeedsLoad
@@ -35081,9 +35243,8 @@ impl App {
         // Resolve permission in the actual drawing context after its pre-draw input commit.
         let presentation = self.resolve_book_fullscreen_presentation(fs_idx);
         let paint_idx = presentation.paint_idx;
-        let target_allowed = self.page_overview.session().is_none()
-            && presentation.allowed
-            && !presentation.continuous;
+        let target_allowed = self
+            .paged_viewer_materialization_allowed(presentation.allowed, presentation.continuous);
         if target_allowed {
             if paint_idx != fs_idx {
                 self.ensure_fs_page_turn_target_load(page_turn_decision, paint_idx);
@@ -40532,6 +40693,7 @@ impl App {
         music_front_pointer_owned: bool,
         navigation_operation: &mut Option<ViewerOperationId>,
     ) -> (FsPageNav, bool) {
+        let cursor_active = ctx.input(fullscreen_cursor_active);
         let (overflow_pointer_input, overflow_touch_excluded) =
             self.capture_fs_front_pointer_input(ctx, full_rect);
         let primary_suppression =
@@ -40539,6 +40701,7 @@ impl App {
         let result = self.handle_fs_wheel_and_click_frame(
             ui,
             ctx,
+            cursor_active,
             full_rect,
             state,
             seek_geometry,
@@ -40561,6 +40724,7 @@ impl App {
         &mut self,
         ui: &mut egui::Ui,
         ctx: &egui::Context,
+        cursor_active: bool,
         full_rect: egui::Rect,
         state: &FsFrameState,
         seek_geometry: StillSeekGeometry,
@@ -40896,16 +41060,8 @@ impl App {
         // **「パネルが出ているか」をここで綴り直さない** (backlog §1.158)。描画側と別の式に
         // すると、ロックだけで出ているパネルの上でホイールが画像へ抜ける (実機報告
         // 2026-09-02)。答えは `FullscreenInfoPanelState` が 1 か所で出す。
-        let has_right_panel = {
-            let mut panel_state = self.fs_info_panel;
-            panel_state.locked = panel_fs_idx.is_some_and(|idx| {
-                self.still_info_panel_lock_effective_for_idx(idx, state.is_video)
-            });
-            panel_state.visible(
-                self.settings.fullscreen_side_panel_mode,
-                self.fullscreen_tag_picker_open,
-            )
-        };
+        let has_right_panel =
+            self.fullscreen_info_panel_visible_for_idx(panel_fs_idx, state.is_video);
         let music_modal_open = music_view_active
             && (self.music_bookmark_modal_open()
                 || panel_fs_idx.is_some_and(|idx| self.music_normalize_modal_active(idx)));
@@ -40925,14 +41081,15 @@ impl App {
                 panel_fs_idx
                     .is_some_and(|idx| self.still_info_panel_lock_effective_for_idx(idx, false)),
             );
-        // When the OS cursor is hidden, egui still exposes the last hover position.
-        // Treat that position as stale and block passive hover side effects until a
-        // real input event revives the cursor.
-        let passive_hover_enabled = !self.cursor_hidden();
+        // Route this frame's input with the same Idle-release rule as cursor visibility.
+        // Use activity captured before UI can consume scroll; passive hover stays gated
+        // by cursor_hidden above, and ZoomAiming keeps its own wheel behavior.
+        let pointer_position_live =
+            fullscreen_pointer_position_live(self.cursor_hide_reason, cursor_active);
         // ZipPla ズーム中 (照準含む) は左右パネルを抑止しているので、当たり判定でもパネル領域を
         // 無効化する。さもないと右ホバー帯 / ピン留めメタデータ等でホイール (倍率変更) や
         // クリック (ページ送り) が奪われる (Codex P2)。
-        let cursor_in_seek_panel = passive_hover_enabled
+        let cursor_in_seek_panel = pointer_position_live
             && ctx.input(|i| {
                 i.pointer
                     .hover_pos()
@@ -40947,7 +41104,7 @@ impl App {
                         .is_some_and(|rect| rect.contains(point))
                 });
         let cursor_in_panel = cursor_in_depth_panel
-            || passive_hover_enabled
+            || pointer_position_live
                 && !self.fs_zoom_mode_effective()
                 && ctx.input(|i| {
                     i.pointer
@@ -41836,7 +41993,15 @@ impl App {
         if let FsCanvasClickAction::DepthFocusAt(pos) = canvas_click {
             self.plan_depth_focus_click(ctx, pos);
         }
-        let close = secondary_action.closes_viewer(self);
+        let side_panel_click_chrome = self.fs_side_panel_click_chrome(
+            ctx,
+            full_rect,
+            seek_geometry,
+            state.is_video,
+            side_panel_chrome_enabled,
+            navigator_exclusion,
+        );
+        let close = secondary_action.closes_viewer(self, side_panel_click_chrome);
         let pointer_nav = match canvas_click {
             FsCanvasClickAction::PageSide(base) => self.spread_page_nav(base).into(),
             _ => page_nav,
@@ -41852,6 +42017,7 @@ impl App {
             page_nav,
             canvas_click,
             secondary_action,
+            side_panel_click_chrome,
             full_rect,
             default_image_rect,
             primary_suppression,
@@ -42005,6 +42171,7 @@ impl App {
             mut page_nav,
             canvas_click,
             secondary_action,
+            side_panel_click_chrome,
             full_rect,
             default_image_rect,
             primary_suppression,
@@ -42047,7 +42214,7 @@ impl App {
             }
         };
         let suppress_intermediate_navigation = suppress_wheel_navigation
-            || secondary_action.closes_viewer(self)
+            || secondary_action.closes_viewer(self, side_panel_click_chrome)
             // This existing command owner can change the page, context, mode,
             // or input admission. Preserve its order before the single final
             // navigation as a whole, including future command actions.
@@ -42194,6 +42361,7 @@ impl App {
                     &mut self.analysis_zoom,
                     &mut self.analysis_pan,
                     wheel_y,
+                    self.settings.fullscreen_wheel_zoom_step,
                     mouse,
                     image_rect.center(),
                 );
@@ -42229,6 +42397,7 @@ impl App {
                         &mut proposed_zoom,
                         &mut proposed_pan,
                         wheel_y,
+                        self.settings.fullscreen_wheel_zoom_step,
                         mouse,
                         default_image_rect.center(),
                     );
@@ -42350,6 +42519,15 @@ impl App {
             if pointer_in_seek_panel {
                 // 下部シークバー上の入力はバー側のウィジェットに任せる。
             } else if mods.ctrl && !is_spread_double && self.reading_flow.is_paged() {
+                if self.settings.fullscreen_bound_drag_pan
+                    && self.fs_bounded_drag_pan_surface(false)
+                    && primary_down
+                    && let Some(total_delta) = input.total_drag_delta
+                    && let Some((_, origin_pan)) = self.fs_pan_drag_start.as_mut()
+                {
+                    // Resume from the current pan after the Ctrl-owned frames (§8.6).
+                    *origin_pan = self.fs_pan - total_delta;
+                }
                 // Ctrl+ドラッグ → 回転
                 if primary_pressed {
                     if let Some(pos) = pointer_pos {
@@ -42407,10 +42585,30 @@ impl App {
                     self.fs_pan_drag_start = Some((pos - total_delta, self.fs_pan));
                 }
                 if let Some((_, start_pan)) = self.fs_pan_drag_start
-                    && let Some(proposed_pan) =
-                        input.total_drag_delta.map(|delta| start_pan + delta)
+                    && let Some(total_delta) = input.total_drag_delta
                 {
-                    self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
+                    let proposed_pan = start_pan + total_delta;
+                    let outcome = if self.settings.fullscreen_bound_drag_pan {
+                        self.apply_fs_bounded_drag_pan(ctx, proposed_pan)
+                    } else {
+                        in_page_scroll::FsBoundedDragPanOutcome::OutsideSurface
+                    };
+                    match outcome {
+                        in_page_scroll::FsBoundedDragPanOutcome::OutsideSurface => {
+                            self.set_fs_pan_from_input(self.fs_zoom, proposed_pan);
+                        }
+                        in_page_scroll::FsBoundedDragPanOutcome::WaitingForLayout => {}
+                        in_page_scroll::FsBoundedDragPanOutcome::Position(pan) => {
+                            if let Some((_, origin_pan)) = self.fs_pan_drag_start.as_mut() {
+                                for axis in 0..2 {
+                                    if pan[axis] != proposed_pan[axis] {
+                                        // Discard only the motion stopped by the bound (§8.1).
+                                        origin_pan[axis] = pan[axis] - total_delta[axis];
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
             if primary_released {
@@ -42464,7 +42662,7 @@ impl App {
         // must run this egui block instead — otherwise right-click (close) and the right-drag
         // ring shortcut do nothing (実機 FB 2026-07). The context is `current_right_drag_context()`
         // = VideoFullscreen (item is Video), so it shows the video ring, not the image ring.
-        match self.apply_fs_secondary_input(ctx, secondary_action) {
+        match self.apply_fs_secondary_input(ctx, secondary_action, side_panel_click_chrome) {
             FsSecondaryInputOutcome::Continue => {}
             FsSecondaryInputOutcome::CloseRequested => close = true,
             FsSecondaryInputOutcome::ViewerReplaced => {
@@ -42602,6 +42800,7 @@ impl App {
                 &mut zoom,
                 &mut pan,
                 action.input.delta.y,
+                self.settings.fullscreen_wheel_zoom_step,
                 mouse,
                 image_rect.center(),
             ) {
@@ -42733,24 +42932,17 @@ impl App {
         let Some(pos) = depth_focus_pos.or_else(|| response.interact_pointer_pos()) else {
             return FsCanvasClickAction::None;
         };
-        let has_right_panel = self.metadata_panel_click_shown()
-            || self.fs_info_panel.hover_active
-            || self.fullscreen_tag_picker_open;
-        let in_side_panel = fullscreen_side_panel_contains_pointer_with_seek_height(
-            full_rect,
-            pos,
-            side_panel_chrome_enabled,
-            self.settings.fullscreen_side_panel_mode,
-            has_right_panel,
-            self.adjustment_mode.is_open(),
-            navigator_exclusion,
-            seek_geometry.total_height,
-        );
-        if in_side_panel
+        if self
+            .fs_side_panel_click_chrome(
+                _ctx,
+                full_rect,
+                seek_geometry,
+                is_video,
+                side_panel_chrome_enabled,
+                navigator_exclusion,
+            )
+            .contains_pointer(pos)
             || (seek_panel_interactive && seek_geometry.panel_rect(full_rect).contains(pos))
-            || self
-                .visible_depth_panel_rect(_ctx)
-                .is_some_and(|rect| rect.contains(pos))
         {
             FsCanvasClickAction::None
         } else if depth_focus_pos.is_some() {
@@ -42761,6 +42953,31 @@ impl App {
                 full_rect.center().x,
                 self.spread_mode.advances_right_to_left(),
             ))
+        }
+    }
+
+    fn fs_side_panel_click_chrome(
+        &self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        seek_geometry: StillSeekGeometry,
+        is_video: bool,
+        chrome_enabled: bool,
+        navigator_exclusion: Option<egui::Rect>,
+    ) -> FullscreenSidePanelClickChrome {
+        let has_right_panel =
+            self.fullscreen_info_panel_visible_for_idx(self.fullscreen_idx, is_video);
+        FullscreenSidePanelClickChrome {
+            panels: fullscreen_side_panel_rects_with_seek_height(
+                full_rect,
+                chrome_enabled,
+                self.settings.fullscreen_side_panel_mode,
+                has_right_panel,
+                self.adjustment_mode.is_open(),
+                seek_geometry.total_height,
+            ),
+            navigator_exclusion,
+            depth_panel: self.visible_depth_panel_rect(ctx),
         }
     }
 
@@ -42899,7 +43116,14 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         action: FsSecondaryAction,
+        side_panel_click_chrome: FullscreenSidePanelClickChrome,
     ) -> FsSecondaryInputOutcome {
+        // Keep the viewer's wider short-tap tolerance unless egui classified
+        // this exact release as a click that a side-panel widget can receive.
+        // Leave raw input intact so the panel's later context_menu sees it.
+        if action.short_tap_owned_by_side_panel(side_panel_click_chrome) {
+            return FsSecondaryInputOutcome::Continue;
+        }
         let short_click_outcome = |close| {
             if close {
                 FsSecondaryInputOutcome::CloseRequested
@@ -42916,13 +43140,14 @@ impl App {
                 }
                 FsSecondaryInputOutcome::Continue
             }
-            FsSecondaryAction::ShortTap { context, pos } => short_click_outcome(
+            FsSecondaryAction::ShortTap { context, pos, .. } => short_click_outcome(
                 self.apply_viewer_short_right_click_action(context, self.fullscreen_idx, pos),
             ),
             FsSecondaryAction::Recognized {
                 context,
                 pos,
                 recognition,
+                ..
             } => {
                 if let Some(command) = recognition.command {
                     let destination = self.page_turn_destination();
@@ -47360,6 +47585,41 @@ impl App {
             demand,
             identities,
         })
+    }
+
+    /// The paged draw owns load/resolve only while its ordinary material surface is active.
+    fn paged_viewer_materialization_allowed(&self, allowed: bool, continuous: bool) -> bool {
+        self.page_overview.session().is_none() && allowed && !continuous
+    }
+
+    /// Read the pages the paged draw can materialize without starting permission requests.
+    /// Missing permission-free occurrences become allowed when the draw retains its demand;
+    /// existing Checking/Hidden decisions must already suspend the pre-draw Waiting gate.
+    pub(crate) fn paged_draw_materialization_demand(
+        &mut self,
+        anchor_idx: usize,
+    ) -> Vec<crate::book_composition::PresentationOccurrence> {
+        if !self.reading_flow.is_paged() {
+            return Vec::new();
+        }
+        let base = self.spread_display_composition_for_anchor(anchor_idx);
+        let demand = base.presentation_demand(self.spread_mode, self.fullscreen_page_slice);
+        let permitted = match self.book_presentation_target_allowed(&demand) {
+            crate::book_composition::PresentationDecision::Allowed(allowed) => {
+                base.permitted_projection(self.spread_mode, &allowed)
+            }
+            crate::book_composition::PresentationDecision::Checking
+            | crate::book_composition::PresentationDecision::Hidden => None,
+        };
+        if !self.paged_viewer_materialization_allowed(
+            permitted.is_some(),
+            self.continuous_reading_active_for_idx(anchor_idx),
+        ) {
+            return Vec::new();
+        }
+        permitted
+            .unwrap()
+            .presentation_demand(self.spread_mode, self.fullscreen_page_slice)
     }
 
     fn resolve_book_fullscreen_presentation(&mut self, anchor_idx: usize) -> FsBookPresentation {
@@ -65999,6 +66259,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn section1842_pointer_position_liveness_shares_the_idle_release_rule() {
+        for (current, cursor_active, live) in [
+            (None, false, true),
+            (None, true, true),
+            (Some(FsCursorHide::Idle), false, false),
+            (Some(FsCursorHide::Idle), true, true),
+            (Some(FsCursorHide::ZoomAiming), false, false),
+            (Some(FsCursorHide::ZoomAiming), true, false),
+        ] {
+            assert_eq!(
+                fullscreen_pointer_position_live(current, cursor_active),
+                live,
+                "current={current:?} cursor_active={cursor_active}"
+            );
+            let zoom_aiming = current == Some(FsCursorHide::ZoomAiming);
+            assert_eq!(
+                next_fullscreen_cursor_hide_reason(
+                    current,
+                    zoom_aiming,
+                    cursor_active,
+                    true,
+                    false
+                ),
+                if live { None } else { current },
+                "visibility must use the same rule: {current:?} cursor_active={cursor_active}"
+            );
+        }
+    }
+
     fn setup_zoom_cursor_app() -> crate::app::AppTestEnvForTest {
         let mut app = crate::app::setup_app_for_test();
         app.items = vec![GridItem::Image(PathBuf::from("page.jpg"))];
@@ -73805,6 +74095,7 @@ mod tests {
                         &mut zoom,
                         &mut pan,
                         -WHEEL_SENSITIVITY,
+                        crate::settings::FullscreenWheelZoomStep::Standard,
                         Some(egui::Pos2::ZERO),
                         egui::Pos2::ZERO
                     ));
@@ -95335,6 +95626,42 @@ mod tests {
                 .0,
             denoise
         );
+    }
+
+    #[test]
+    fn section1839_failed_source_is_terminal_in_ai_hud_and_status() {
+        use crate::app::{DisplayedFinalAiState as D, FinalAiJobState as J, NotAppliedReason as R};
+        for requested in [false, true] {
+            let mut app = crate::app::setup_app_for_test();
+            let path = app.tmp.path().join("section1839-failed.png");
+            app.items.push(GridItem::Image(path));
+            app.settings.ai_feature_mode = crate::settings::AiFeatureMode::HighQuality;
+            app.settings.global_preset.upscale_model =
+                requested.then(|| "realesr_general_v3".to_owned());
+            app.settings.global_preset.denoise_model = None;
+            app.fs_cache.insert(0, FsCacheEntry::Failed);
+            let stage = app.fs_display_stage(0, false);
+            let displayed = app.displayed_final_ai_state(0, stage);
+            assert_eq!(app.final_ai_job_state(0), J::Failed);
+            assert_eq!(
+                displayed,
+                if requested {
+                    D::NotApplied(R::Failed)
+                } else {
+                    D::NotRequested
+                }
+            );
+            assert_eq!(
+                app.top_bar_ai_upscale_info(0, stage)
+                    .map(|(_, state)| state),
+                requested.then_some(D::NotApplied(R::Failed))
+            );
+            assert_eq!(
+                fs_ai_status_activity(J::Failed, displayed, false, false, false),
+                (false, false, false),
+                "a failed source is neither AI processing nor completed"
+            );
+        }
     }
 
     #[test]

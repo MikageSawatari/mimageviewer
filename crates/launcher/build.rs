@@ -50,6 +50,7 @@ fn main() {
     let epub_worker_exe = release_dir.join("mimageviewer-epub-pdf.exe");
     let musicvideo_exe = release_dir.join("mimageviewer-musicvideo.exe");
     let mcp_exe = release_dir.join("mimageviewer-mcp.exe");
+    let browser_host_exe = release_dir.join("mimageviewer-browser-host.exe");
 
     let missing = [
         (
@@ -77,6 +78,11 @@ fn main() {
             "mimageviewer-musicvideo.exe",
             "cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo",
         ),
+        (
+            &browser_host_exe,
+            "mimageviewer-browser-host.exe",
+            "cargo build --release -p mimageviewer-browser-host",
+        ),
     ]
     .into_iter()
     .filter(|(path, _, _)| !path.exists())
@@ -91,7 +97,7 @@ fn main() {
         }
         eprintln!();
         eprintln!(
-            " Build core, remote, EPUB worker, MCP, and music-video editor before the launcher, or use the wrapper:"
+            " Build core, remote, EPUB worker, MCP, editor, and browser host before the launcher, or use the wrapper:"
         );
         eprintln!("   bash scripts/build-release.sh        (Git Bash)");
         eprintln!("   .\\scripts\\build-release.ps1         (PowerShell)");
@@ -167,6 +173,15 @@ fn main() {
         sha256_file_hex(&mcp_exe)
     );
     println!("cargo:rerun-if-changed={}", mcp_exe.display());
+    println!(
+        "cargo:rustc-env=MIMV_BROWSER_HOST_EXE={}",
+        browser_host_exe.display()
+    );
+    println!(
+        "cargo:rustc-env=MIMV_BROWSER_HOST_EXE_SHA256={}",
+        sha256_file_hex(&browser_host_exe)
+    );
+    println!("cargo:rerun-if-changed={}", browser_host_exe.display());
     println!(
         "cargo:rustc-env=MIMV_MUSICVIDEO_EXE={}",
         musicvideo_exe.display()

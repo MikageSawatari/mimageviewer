@@ -15,7 +15,7 @@ F3・F4 統合後のポータブル文言・Counter・説明書の照合記録�
 
 | 配布形態 | ファイル名 | 中身 / 性質 | data 保存先 | 管理者権限 |
 | --- | --- | --- | --- | --- |
-| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + EPUB converter + MCP adapter + music-video editor + FFmpeg DLL + VC runtime + mIV Sound bundle を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
+| **単体exe版** (旧称「ポータブル版」) | `mimageviewer.exe` | launcher。core + remote service + EPUB converter + MCP adapter + music-video editor + browser host + FFmpeg DLL + VC runtime + mIV Sound bundle を `include_bytes!` 内包、起動時に APPDATA へ展開して spawn | `%APPDATA%\mimageviewer` | 不要 |
 | **インストーラ版** | `mImageViewer_setup.exe` | Inno Setup 出力 | `%APPDATA%\mimageviewer` | **要 (UAC)** |
 | **ポータブル版** (v1.1.0 新) | `mImageViewer_portable_v<VER>.zip` | loose-deps。署名済み VST3 host・mIV Sound (プラグイン PE も署名)・CRT 等を同梱、展開ゼロ | `<exe_dir>\data` (ユーザー VST 独自保存は除く) | 不要 |
 
@@ -27,7 +27,7 @@ F3・F4 統合後のポータブル文言・Counter・説明書の照合記録�
 - **Vector**: インストーラ (.exe) + `installer/readme.txt` (利用者向け説明書) を zip にまとめて申請。
   readme 同梱を Vector が要件化しているため、単体 exe やインストーラ単独での申請は不可。
 - **インストーラ**: Inno Setup 6（`installer/mimageviewer.iss`）
-- **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → remote → EPUB worker → MCP → editor → launcher → ISCC → portable を 1 コマンド、
+- **配布ビルド**: `.\scripts\build-dist.ps1` (全体テスト → clean → core → remote → EPUB worker → MCP → editor → browser host → launcher → ISCC → portable を 1 コマンド、
   stale 配布物を構造的に防ぐ)。開発中の素早い反復だけ `.\scripts\build-release.ps1` 単体を使う
   (配布用の clean／全体テストゲートがないので配布物には使わない)。
 - **出力先固定**: build-release／build-dist／build-portable／build-dev は開始前に実際の Cargo 実行場所・環境で `cargo metadata --format-version 1 --no-deps --offline` の `target_directory` と `build_directory` を固定出力先と照合し、不一致と `CARGO_BUILD_TARGET` を `-PreserveRuntime` に関係なく拒否する（`build_directory` 未出力時は `target_directory` と同じ扱い、portable 自身の固定 `--target-dir` は維持、設定ファイルの `build.target` は検査対象外）。
@@ -47,7 +47,8 @@ F3・F4 統合後のポータブル文言・Counter・説明書の照合記録�
   `dist\mImageViewer_portable_v<VER>.zip` を生成する。`portable` feature で native 依存
   (pdfium / onnxruntime / susie / vst3-host / VLM worker / モデル) を埋め込まず exe 隣から解決し、`data_dir` を
   `<exe_dir>\data` に向ける。launcher は使わず core を `mimageviewer.exe` にリネームし、
-  remote service・EPUB converter・`mimageviewer-mcp.exe`・music-video editor・`mimageviewer-vlm.exe` をその隣へ同梱。
+  remote service・EPUB converter・`mimageviewer-mcp.exe`・music-video editor・`mimageviewer-browser-host.exe`・`mimageviewer-vlm.exe` をその隣へ同梱。
+  browser host は署名して同梱するが、ポータブル版はブラウザ連携を登録できない (登録は既定のデータフォルダの mIV だけ)。
   VST3 host と mIV Sound bundle は v5 から署名して同梱する。配置は
   `<exe_dir>\effetune\mIV Sound.vst3`、host 用 CRT 4 本は `<exe_dir>\vcrt`。
   音響調整のボタン・設定・検索・About・自動表示・再生情報とユーザー VST を有効にする。
@@ -111,6 +112,77 @@ ctest を省いた候補は、その候補の ctest 成功記録を付けるま�
 F2b の移行、F3 の公開文書、F4 のポータブル有効化が揃うまで、この切替を公開しない。
 F4 の plugin DLL 署名も既存の署名差分検査を通す。公開前には host と plugin DLL を VirusTotal で確認し、
 Google/Microsoft の検出があれば公開を止める（送信の都度、利用者の了承を得る）。
+
+### ブラウザ連携：本体を先に公開するとき
+
+本体の公開と、拡張のストア公開は別工程とする。拡張が未公開の間は次を確認する。
+
+- 日本語のマニュアルと、`privacy.html` の日本語・英語の両方の節を確認する。マニュアルの `browser-integration.html#install-extension` が「公開準備中」で、未公開のストア URL や、今すぐ利用できると読める案内を載せていない。本体の環境設定からのリンク先が存在する。英語マニュアルの新設は要求しない。
+- `privacy.html` の日英両方に、Chrome／Edge の HKCU の2キー、`%APPDATA%\mimageviewer\browser-host`、画像の既定保存先と変更、解除・アンインストールで消す範囲と残る画像、別アカウントでの解除の注意を記載している。本体自身が画像サイトへ接続すると誤記していない。
+- 拡張の通信・Cookie・参照元・redirect・座標記録の開示を公開前の必須作業として残す。「ネットワーク通信はない」など、機能全体への断定で説明を省略していない。
+- 製品ページの「安心して使えます」と privacy の内容が矛盾しない。拡張の紹介カードはストア公開前には追加しない。
+- 段階7の登録・設定画面の独立レビューと、必要な本体の自動検証を別途完了する。文書の構文・リンク確認を、製品の実機確認やレビュー成功として扱わない。
+
+拡張の ZIP 作成・ストア公開の工程は次の節。本体の版ごとに拡張を提出する必要はない。
+
+### ブラウザ拡張の ZIP（Chrome / Edge）
+
+拡張は `browser-extension/` の単一ソースから作る。`manifest.json` の `version` は mIV 本体と独立し、
+拡張の収録ファイルを変更してストアへ更新を提出するときだけ進める。本体だけのリリースで拡張の版を上げたり、
+同じ拡張を提出し直したりしない。初回を含む公開・提出は利用者がストアのアカウントで行う。
+
+1. 拡張を変更した場合、次の非対話テストを実行する。
+   ```powershell
+   node --test browser-extension/tests/worker.test.cjs
+   .\scripts\test-package-browser-extension.ps1
+   ```
+2. 配布する ZIP を作る。
+   ```powershell
+   .\scripts\package-browser-extension.ps1
+   ```
+   出力は `target/browser-extension/mimageviewer-browser-extension-chrome-v<EXT_VERSION>.zip` と
+   `target/browser-extension/mimageviewer-browser-extension-edge-v<EXT_VERSION>.zip`。
+   スクリプトは、`store-keys.json` の公開鍵から SHA-256 の先頭 16 バイトを a〜p の ID に変換して指定 ID と照合し、
+   ソース manifest が Chrome の公開鍵であることも検査する。Edge は生成する manifest の公開鍵だけを置き換える。
+   ソース、テスト、鍵の控えを変更せず、manifest・worker・座標用 script・ja/en の messages・4 サイズの icon だけを収録する。
+   ZIP の順序・時刻・圧縮設定は固定。テストは 2 回の ZIP のバイト一致、権限・翻訳・収録内容とソース不変を検査する。
+   `-OutputDirectory` はこの worktree の `target/browser-extension` 内だけ指定でき、junction 等への出力は拒否する。
+3. **提出の前に、利用者のブラウザで通しの確認をする** (初回の提出と、拡張の動きを変えた更新のとき)。
+   モック・ZIP の検査では、実際のブラウザでの動作は確かめられない。
+   - 準備:
+     - 普段のプロファイルは使わず、試験用のプロファイルを使う。
+       Chrome は `chrome.exe --user-data-dir=C:\miv-test-v5\818\chrome-profile`、Edge は `msedge.exe --user-data-dir=C:\miv-test-v5\818\edge-profile` で起動する。
+     - 拡張機能のページで「デベロッパー モード」を ON にし、手順 2 の ZIP を展開したフォルダを「パッケージ化されていない拡張機能を読み込む」で読み込む。
+       Chrome には chrome 用、Edge には edge 用を読み込む。
+     - 表示された拡張の ID がストアの ID (Chrome `fpppoodelfkddekjahhmalmmfdhbpdma` / Edge `dlcbdkekoppppebnhhncghhglkkccdhk`) と同じことを確かめる。
+       違うと、mIV とつながらない。
+     - mIV は公開版 (または候補) の通常版で、環境設定 →「起動と連携」→「ブラウザ連携」を登録する。
+       保存先は試験用のフォルダ (例 `C:\miv-test-v5\818\images`) にする。
+   - ローカルの試験ページで、先に全部見る:
+     - `testpage\serve-test-page.ps1` で `http://127.0.0.1:8818/` を起動する。この PC の中だけで動き、受けた要求と Referer を表示する。
+       試験ページ一式は §1.818 の確認で作った `testpage\` (index.html・img・サーバ)。
+     - T1 (JPEG / PNG / WebP / GIF): 右クリック →「mIV で見る」で、ブラウザのページ部分に重なった mIV の窓で開く。
+       初回は、サイトへのアクセス許可の確認が出る。mIV が起動していなければ起動する。
+     - T2: 小さい画像から、リンク先の大きい画像 (2400×1800) が開く。
+     - T3: 参照元が要る画像が開き、サーバの行に `Referer=http://127.0.0.1:8818/` が出る。
+     - T4: 転送される画像が開く。`Get-Content -LiteralPath <保存したファイル> -Stream Zone.Identifier` で、
+       `HostUrl` が転送後の `/img/redir-g.png`、`ReferrerUrl` が試験ページになっている。
+     - T5: 文字や余白の右クリックには「mIV で見る」が出ない。
+     - サイトの許可を断ったとき、処理中に別の画像を選んだときに、拡張のアイコンに知らせが出る。
+     - mIV の窓を閉じる・Esc でブラウザへ戻れる。場所▼ の「ブラウザ閲覧」に、保存した月別フォルダが出る。
+     - Edge では T1・T3・T4 だけを繰り返す。
+   - 実サイトは 1 か所・1 枚だけ:
+     - ログイン不要で全年齢の公開ページを使う (例: `https://commons.wikimedia.org/wiki/Main_Page`)。
+     - ローカルで見た項目は繰り返さない。実サイトで新しく確かめるのは、HTTPS・CDN の転送・サイト独自のメニュー (Shift+右クリック) だけ。
+   - 後片付け:
+     - 保存した試験画像と、試験用のプロファイルのフォルダを削除する。
+     - 登録を残すかどうかは利用者が決める。
+     - 結果を記録し、NG があれば提出しない。
+4. Chrome ウェブストアと Microsoft Edge アドオンへ、それぞれ対応する ZIP を提出する。
+   ストアの説明・権限ごとの理由・プライバシーの開示は
+   [ブラウザ連携の設計 §9.6・§9.10・§11](browser-to-miv-plan.md) に合わせる。
+   拡張の更新も審査を伴うので、本体の公開と切り離して扱う。拡張と native host の通信の版 `v` を先に進めず、
+   新しい mIV は公開済みの古い拡張と動くようにする。モック・ZIP の検査だけでブラウザでの動作確認済みとはしない。
 
 ## リリース手順チェックリスト
 
@@ -200,7 +272,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
    `cargo test --lib version_highlights::` でテーブルがパースできることを確認。
 6. `htdocs/` 以下 — 新機能がマニュアル・製品ページに反映されていることを確認
    - 製品ページのカードの長さを `python scripts/check_site_cards.py` で検査する (「製品ページのカードは短く保つ」)。
-   - マニュアル左サイドバーを持つ通常ページ 34 ページでリンク一覧が揃っているか
+   - マニュアル左サイドバーを持つ通常ページ 35 ページでリンク一覧が揃っているか
      `htdocs/mimageviewer/manual/` 配下で一括確認:
      ```bash
      cd htdocs/mimageviewer/manual && for f in *.html; do
@@ -210,7 +282,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
          | grep -E 'href="[a-z-]+\.html"' | wc -l
      done
      ```
-     各ページが 34 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
+     各ページが 35 以外 (= いずれかのページ名リンクが抜けている) なら同期を合わせる。
      ページを増減したらこの数も更新する (数そのものより、**全ページが同じ数で揃っている**ことが要件)。
      `tut-*.html` など `sidebar-section` を持たないチュートリアルページは別レイアウトなので対象外。
      新規の通常ページを追加した際はサイドバーを持つ全ページを更新すること
@@ -326,22 +398,77 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
      `python scripts/check_bench_regression.py vendor/bench_baseline.json run1.json run2.json run3.json`。
      **ノイズと判断した場合に `--save` で baseline を上書きしない** (`--save` は 1 ファイルだけ受け付ける)。
 
-9.6. **perf smoke** (正規手順は idle 5ケースと合わせた ReleaseChecks suite。毎リリース実施):
-   利用者が repository root の PowerShell で実行する:
-   ```powershell
-   .\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved
-   ```
-   - 診断portableのbuild、生成fixture／隔離dataのseed、5 idle、cached／uncached perf、通常終了・
+9.6. **perf smoke** (正規手順は idle 5ケースと合わせた ReleaseChecks suite。毎リリース実施。
+   **2026-11-21 から、公開前にサブ PC で流す**。利用者決定: メイン PC では build 直後に計測が急に始まり、
+   その間 PC に触れなくなるため):
+   1. **メイン PC で診断 portable とキットを作る** (計測も起動もしない)。診断 portable は、
+      **専用の worktree `C:\miv-relcheck\root`** を配布ビルドの入力と同じコミットに合わせて、その中でビルドする。
+      試験用ビルドは「証拠フォルダがビルドした repository root の下にあること」を確かめるので、サブ PC でもキットを
+      **同じ path `C:\miv-relcheck\root`** に置く必要がある (サブ PC には C: しか無く、`C:\home\mimageviewer` は別の用途で使用中)。
+      (a) 専用 worktree を用意する。無ければ `git worktree add --detach C:\miv-relcheck\root <コミット>` で作り、
+      [git-workflow.md](git-workflow.md) の決まりどおり vendor を実体コピーする (junction 禁止)。既にあれば、コミットを合わせる。
+      vendor の中身が変わった版では、ビルドのエラーが示すフォルダを `C:\home\mimageviewer\vendor\` からコピーし直す。
+      ```powershell
+      git -C C:\miv-relcheck\root checkout --detach <配布ビルドの入力のコミット>
+      ```
+      (b) 専用 worktree の中で診断 portable をビルドする (エージェントは `run-heavy.ps1` 経由。初回や大きな更新の後は全ビルド、以後は差分)。
+      ```powershell
+      cd C:\miv-relcheck\root
+      .\scripts\prepare-portable-smoke.ps1 -TestScript
+      ```
+      (c) キットは、**キットのスクリプトを持つ repository (通常は `C:\home\mimageviewer`) から**作る。専用 worktree のコミットが
+      キットのスクリプトより古い版 (v5.5.0 以前のタグなど) でも同じ手順で済む。
+      ```powershell
+      cd C:\home\mimageviewer
+      .\scripts\relcheck-kit\New-ReleaseCheckKit.ps1 -ArtifactRepo C:\miv-relcheck\root
+      ```
+      キットは `C:\home\mimageviewer-subpc\relcheck\relcheck-<artifact の HEAD 先頭 9 桁>-<UTC 日時>\` にでき、
+      最後に表示される `Kit manifest SHA-256` と `Run root on the sub-PC` を依頼文とリリース記録に写す。
+      呼び出す側の `scripts/`、専用 worktree の指紋の対象のソースと `scripts/build-portable.ps1` が、コミット済みで clean でなければ止まる。
+      診断 portable を別の worktree からコピーして持ち込まない (ビルドした root が違うと、本番が証拠フォルダの検査で止まる)。
+   2. **統括がサブ PC 担当へ依頼する**。依頼文は [サブ PC の ReleaseChecks 依頼の雛形](subpc-release-checks-brief.md) から作る。
+      ほかのサブ PC 依頼・夜間試験の時間枠 (01:00〜07:00) と重ねない。送る前に、サブ PC 担当に「次の依頼を受けられるか」を聞き、
+      前の依頼が終わっていることを確かめる。サブ PC 担当が `ListAgents` に出ない・送っても `not active` になるときは、
+      Remote Control が切れている。つなぎ直しは利用者に頼む (2026-11-22 に一度あった)。メイン PC 側では RDP の接続を切らず、
+      RDP の窓を最小化しない (サブ PC の画面描画と前面の判定が成り立たなくなる)。メイン PC の作業は続けてよい。
+   3. **サブ PC 担当が流す** (雛形の手順): キットをサブ PC の `C:\miv-relcheck\root` へコピー (前のキットがあれば名前を変えて退避。
+      違う path に置くと、事前確認と本番は mIV を起動する前に止まる) → **ターミナル パネルから**事前確認
+      `Run-SubPcProbe.cmd` (mIV を起動せず、使い捨ての窓で前面・DPI の表・作業領域の条件を確かめる) が READY なら、
+      同じパネルから本番 `Run-SubPcSuite.cmd` (どちらもキットの `scripts\relcheck-kit\`、最後に `EXIT=<値>` を出す) →
+      run フォルダをメイン PC の `C:\home\mimageviewer-subpc\relcheck\<kit-id>-results\` へ戻す。所要はコピーを除き約 10 分。
+      **本番のあいだ、サブ PC 担当はシェルの命令 (待機のループや sleep を含む) を流さず、ターミナル パネルを読むだけにする**
+      (2026-11-22 の 4 回目は、待機の命令だけを動かしていた回で前面を失った。その後は流さない形で通っている)。
+      NOT_READY・SKIPPED・FAIL は回避策を足さずに止め、観測を返してもらう。
+      ターミナル パネルは長い出力の先頭を落とすので、ケースごとの結果は run フォルダの `summary.json` と `release-record.md` を正とする。
+   4. **メイン PC で照合する** (読み取りだけ):
+      ```powershell
+      .\scripts\relcheck-kit\Receive-ReleaseCheckResult.ps1 -Kit C:\home\mimageviewer-subpc\relcheck\<kit-id> -Result C:\home\mimageviewer-subpc\relcheck\<kit-id>-results\<run-id>
+      ```
+      キットが作成時のままで、結果がそのキットの artifact で計測されたものなら、summary の verdict と終了コードをそのまま返す。
+      `release-record.md` をリリース記録へ写す。キットの artifact のコミットが配布ビルドの入力と同じことも記録で確かめる
+      (配布ビルドの入力が変わったら、キットを作り直して流し直す)。
+   - **数値の比較**: サブ PC (RTX 4060 Ti、1920×1080、RDP セッション) の値は、サブ PC の記録どうしでだけ比べる。
+     メイン PC (RTX 4090) の過去の記録とは比べない。閾値・判定は両方で同じ。`release-record.md` の「実行:」の行に
+     実行場所・画面・RDP の有無が出る。サブ PC で初めて全ケースが通った記録は v5.5.1 用の run `release-checks-20261122-042738-1a29230b`
+     (PASS_WITH_WARNINGS。perf の drawn <16 ms は 0%、p95 32〜33 ms で WARN。RDP の描画の間隔によると見ている、未確認)。
+   - **前面の判定** ([自動化計画 §11](release-check-automation-plan.md#relcheck-subpc-kit)): runner は、試験対象の mIV が知らせる root の窓
+     (`root-window.json`) だけを前面化・照合に使い、各ケースの `foreground-timeline.jsonl` に前面の窓を記録する。
+     前面の待ちの失敗が SKIPPED になるのは、待ちの間ずっと mIV 以外のプロセスが前面で、mIV の root が正常だったと記録で示せる場合だけ。
+     mIV の別の窓・子孫・応答なし・記録の欠けは FAIL (製品の退行を SKIPPED に隠さない)。
+   - **サブ PC が使えないとき**は、利用者の了承を取って従来どおりメイン PC の repository root で流す
+     (エージェントが流すときはターミナル パネルから。ツールの裏のプロセスからは前面を取れず止まる、2026-11-17):
+     ```powershell
+     .\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved
+     ```
+     この経路は診断 portable の build から始まる。**開始前に他アプリの窓を最小化し、build 待ちを含め終了まで PC に触れない**。
+     同一ソースの診断 artifact が検証できる場合だけ `-SkipBuild` を追加できる (stale artifact の利用や設定保護の省略を認めるフラグではない)。
+     FFmpeg CLI (`ffmpeg.exe`) が PATH に必要。
+   - どちらの経路も、生成fixture／隔離dataのseed、5 idle、cached／uncached perf、通常終了・
      証跡保存・解析まで逐次実行する。**9.7も同じ1回のsuiteで確認し、重複実行しない**。
-     FFmpeg CLI (`ffmpeg.exe`) がPATHに必要。初回buildは別に約7.5分かかった実績があり、
      suiteはseed込み約5〜8分を見込む。AI追加は別途準備・実行時間を見積もる。
-   - **開始前に他アプリの窓を最小化し、build待ちを含め終了までPCに触れない**。
      exact rootのforeground取得、runner所有窓への背面移行、測定中の状態を検証する。
      foreground不成立時は記録を残して停止し、環境を整えた別runでやり直す。自動retryはしない。
-   - 同一ソースの診断artifactが検証できる場合だけ上記に `-SkipBuild` を追加できる。
-     buildを先に済ませる場合は `prepare-portable-smoke.ps1 -TestScript` を使う（起動しない）。
-     stale artifactの利用や設定保護の省略を認めるフラグではない。
-   - 結果は `target/ui-smoke/runs/<run-id>/summary.json` と `release-record.md`。
+   - 結果は `target/ui-smoke/runs/<run-id>/summary.json` と `release-record.md` (サブ PC ではキットの root の下)。
      全必須caseの証跡と終了codeを確認する。0=PASS／PASS_WITH_WARNINGS、1=FAIL、2=SKIPPED／環境不成立。
      警告はリリース記録に残し、FAIL／SKIPPEDをPASSに読み替えない。
      `known-startup-first-frame` は測定操作前のstartup-overlay frame 1→2 gapだけ、上限500ms。
@@ -349,10 +476,15 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
    - cached／uncachedで256個の異なるfolder-load、Ctrl+Down x5、Ctrl+G固定検索を検証する。
      drawnは直前tailが厳密に `request_repaint` のgapだけ、暫定n≥200／<16ms比率97%はWARN目標、
      raw `pre_grid.total_ms` p95≤0.3msは必須。通常sleepをhitchとして集計しない。
-   - AI／GPU経路変更版では同じ入口に `-IncludeFirstAi` を明示追加する。
+   - AI／GPU経路変更版では同じ入口に `-IncludeFirstAi` を明示追加する
+     (サブ PC のキット経路での first-ai は未確認。初めて使うときは結果の first-ai の行を確かめる)。
      UI／I/O経路変更版では普段のフォルダの短い手動確認も別に残す。生成fixtureの成功を
      実データ・配布版の厳密性能・native入力／IMEの確認へ読み替えない。
-   - 採用は実行了承ではない。エージェント実行は [実行確認](interactive-release-verification.md)
+   - サブ PC で流すことは、利用者がリリース前の手順として決めた (2026-11-21)。ただし**常設の実行了承ではない**。
+     統括は依頼を送る前に、対象のキット・サブ PC での事前確認と本番・見込み時間 (約 15 分)・使い捨て data を利用者へ示し、
+     「今サブ PC で流してよいか」の了承を毎回もらう ([実行確認](interactive-release-verification.md) の「サブ PC のキットで流す ReleaseChecks」)。
+     依頼文には了承した範囲 (事前確認 1 回と本番 1 回、再試行なし) を書く。キット内の使い捨て data・試験用 portable だけを使う決まりは同じ。
+   - メイン PC で流す場合、採用は実行了承ではない。エージェント実行は [実行確認](interactive-release-verification.md)
      に従い対象・所要時間・desktop入力・使い捨てdata・AI有無への明示了承後だけ行う。
      `-InteractiveApproved` は了承済みの実行assertion。normal-profile起動禁止と
      [development-build-and-test-native.md](development-build-and-test-native.md) の「検証起動時の設定データ保護」は維持し、利用者の通常設定をseedにコピーしない。
@@ -391,7 +523,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
      コピー → perf log を退避 → core を起動 → 終了後に解析」なので、手で分けて実行してもよい。
 
 9.7. **idle health smoke** (毎リリース必須。静止中の高速 repaint / 再投入ループを検出):
-   **正規手順は9.6のReleaseChecks suiteの同一run**。static-foreground／static-background／
+   **正規手順は9.6のReleaseChecks suiteの同一run** (2026-11-21 から公開前にサブ PC のキットで流す)。static-foreground／static-background／
    video-pin-background／tray-close-while-loading／tray-close-after-loadingの5ケースをすべて確認する。
    生成fixture・停止済みseed復元・cached読取・tray格納時の要求寿命・source／Finalized-image-backlog、
    exact PID／foreground／UTC測定境界を証明する。5秒warmup／15秒測定と既存閾値を維持する。
@@ -469,10 +601,10 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
 
 ### Phase 3: ビルド・配布成果物
 
-10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで全体テスト → clean → core → remote → EPUB worker → MCP → editor → launcher → ISCC → portable)。
+10. **配布ビルドは `.\scripts\build-dist.ps1` を使う** (1 コマンドで全体テスト → clean → core → remote → EPUB worker → MCP → editor → browser host → launcher → ISCC → portable)。
     - build-dist.ps1 は Rust 全体テストを通してから
-      `cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor -p mimageviewer-launcher`
-      (+ `target-portable` の `-p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor`) してから実コンパイルするので、
+      `cargo clean --release -p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor -p mimageviewer-browser-host -p mimageviewer-launcher`
+      (+ `target-portable` の `-p mimageviewer -p mimageviewer-remote -p epub-pdf-worker -p mimageviewer-mcp -p musicvideo-editor -p mimageviewer-browser-host`) してから実コンパイルするので、
       cargo の偽 up-to-date 由来の **stale 配布物を構造的に防ぐ**
       ([docs/release-operations.md](release-operations.md) §2.1 参照)。内部で build-release.ps1 (常駐 mIV を自動停止して
       LNK1104 を回避) と build-portable.ps1 を子 PowerShell で呼び、各 `$LASTEXITCODE` を検査する。

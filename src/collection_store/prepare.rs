@@ -1,6 +1,7 @@
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -51,6 +52,13 @@ pub(crate) struct CollectionExportPreparation {
     pub(crate) source_states: Arc<[(CollectionEntryId, CollectionSourcePreparation)]>,
 }
 
+/// A removable reference, retaining its full source path for the confirmation dialog.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionRemovableMissingEntry {
+    pub(crate) entry_id: CollectionEntryId,
+    pub(crate) source_path: PathBuf,
+}
+
 /// Immutable, fully classified collection listing shared by the Grid and text export. Every
 /// source remains present even when it cannot currently be opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +73,9 @@ pub(crate) struct CollectionPreparedSnapshot {
     pub(crate) auto_aspect_eligible_total: usize,
     /// Full actor membership before the display policy projects rows.
     pub(crate) registered_total: usize,
+    /// Missing sources with a reachable directory ancestor, in full effective order.
+    /// Display projections retain this membership, including hidden file kinds.
+    pub(crate) removable_missing: Arc<[CollectionRemovableMissingEntry]>,
     pub(crate) entries: Arc<[PreparedCollectionEntry]>,
 }
 
@@ -483,17 +494,47 @@ pub(crate) fn prepare_collection_snapshot(
 pub(crate) fn prepare_collection_snapshot_while(
     snapshot: &CollectionSnapshot,
     display_order: &GridDisplayOrder,
+    keep_running: impl FnMut() -> bool,
+    progress: impl FnMut(usize, usize),
+) -> Result<CollectionPreparedSnapshot, CollectionPrepareError> {
+    prepare_collection_snapshot_with_io(
+        snapshot,
+        display_order,
+        keep_running,
+        progress,
+        inspect_collection_source,
+        missing_source_metadata,
+    )
+}
+
+fn prepare_collection_snapshot_with_io(
+    snapshot: &CollectionSnapshot,
+    display_order: &GridDisplayOrder,
     mut keep_running: impl FnMut() -> bool,
     mut progress: impl FnMut(usize, usize),
+    mut inspect_source: impl FnMut(&Path) -> CollectionSourcePreparation,
+    mut probe: impl FnMut(&Path, MissingSourceProbe) -> Result<bool, std::io::ErrorKind>,
 ) -> Result<CollectionPreparedSnapshot, CollectionPrepareError> {
     let total = snapshot.entries.len();
     let mut facts = Vec::with_capacity(total);
     let mut prepared_by_id = std::collections::HashMap::with_capacity(total);
+    let mut missing_cache = HashMap::new();
+    let mut removable_missing_ids = HashSet::new();
     for (index, entry) in snapshot.entries.iter().enumerate() {
         if !keep_running() {
             return Err(CollectionPrepareError::Cancelled);
         }
-        let state = inspect_collection_source(&entry.source_path);
+        let state = inspect_source(&entry.source_path);
+        if state == CollectionSourcePreparation::Missing
+            && missing_source_is_removable(
+                &entry.source_path,
+                &mut missing_cache,
+                &mut keep_running,
+                &mut probe,
+            )?
+        {
+            removable_missing_ids.insert(entry.id);
+        }
         let (category, mtime, file_size) = match &state {
             CollectionSourcePreparation::Available {
                 kind,
@@ -566,6 +607,14 @@ pub(crate) fn prepare_collection_snapshot_while(
             )
         })
         .count();
+    let removable_missing = entries
+        .iter()
+        .filter(|entry| removable_missing_ids.contains(&entry.entry_id))
+        .map(|entry| CollectionRemovableMissingEntry {
+            entry_id: entry.entry_id,
+            source_path: entry.source_path.clone(),
+        })
+        .collect::<Vec<_>>();
     Ok(CollectionPreparedSnapshot {
         registered_total: snapshot.entries.len(),
         collection_id: snapshot.collection_id(),
@@ -574,8 +623,93 @@ pub(crate) fn prepare_collection_snapshot_while(
         order_mode: snapshot.definition.order_mode,
         standard_sort: snapshot.definition.standard_sort,
         auto_aspect_eligible_total,
+        removable_missing: Arc::from(removable_missing),
         entries: Arc::from(entries),
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum MissingSourceProbe {
+    SymlinkMetadata,
+    Metadata,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MissingSourcePathState {
+    Missing,
+    Unavailable,
+    Present { is_directory: bool },
+}
+
+fn missing_source_metadata(
+    path: &Path,
+    probe: MissingSourceProbe,
+) -> Result<bool, std::io::ErrorKind> {
+    match probe {
+        MissingSourceProbe::SymlinkMetadata => std::fs::symlink_metadata(path),
+        MissingSourceProbe::Metadata => std::fs::metadata(path),
+    }
+    .map(|metadata| metadata.is_dir())
+    .map_err(|error| error.kind())
+}
+
+/// Walk from the root so an unreachable drive/share/link stops all sibling paths from
+/// issuing further probes. This cache belongs to exactly one classification pass.
+fn missing_source_is_removable(
+    path: &Path,
+    cache: &mut HashMap<PathBuf, MissingSourcePathState>,
+    keep_running: &mut impl FnMut() -> bool,
+    probe: &mut impl FnMut(&Path, MissingSourceProbe) -> Result<bool, std::io::ErrorKind>,
+) -> Result<bool, CollectionPrepareError> {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::Prefix(_)))
+        || components.next() != Some(Component::RootDir)
+    {
+        return Ok(false);
+    }
+    let mut current = PathBuf::new();
+    let mut has_directory_ancestor = false;
+    for component in path.components() {
+        current.push(component.as_os_str());
+        if matches!(component, Component::Prefix(_)) {
+            continue;
+        }
+        let state = if let Some(state) = cache.get(&current) {
+            *state
+        } else {
+            if !keep_running() {
+                return Err(CollectionPrepareError::Cancelled);
+            }
+            let state = match probe(&current, MissingSourceProbe::SymlinkMetadata) {
+                Ok(_) => {
+                    if !keep_running() {
+                        return Err(CollectionPrepareError::Cancelled);
+                    }
+                    MissingSourcePathState::Present {
+                        is_directory: probe(&current, MissingSourceProbe::Metadata)
+                            .unwrap_or(false),
+                    }
+                }
+                Err(std::io::ErrorKind::NotFound) => MissingSourcePathState::Missing,
+                Err(_) => MissingSourcePathState::Unavailable,
+            };
+            cache.insert(current.clone(), state);
+            state
+        };
+        match state {
+            MissingSourcePathState::Missing => return Ok(has_directory_ancestor),
+            MissingSourcePathState::Unavailable
+            | MissingSourcePathState::Present {
+                is_directory: false,
+            } => return Ok(false),
+            MissingSourcePathState::Present { is_directory: true } => {
+                has_directory_ancestor = true;
+            }
+        }
+    }
+    // Every component, including the registered source itself, exists now: the source came back
+    // after classification. Only a proven missing component below a reachable directory qualifies.
+    Ok(false)
 }
 
 fn grid_item_for_prepared_source(
@@ -863,6 +997,7 @@ mod tests {
                     )
                 })
                 .count(),
+            removable_missing: Arc::from([]),
             entries: Arc::from(entries),
         }
     }
@@ -872,6 +1007,417 @@ mod tests {
             entry_id: entry.entry_id,
             source_key: entry.source_key.clone(),
         }
+    }
+
+    #[derive(Default)]
+    struct MissingSourceIo {
+        results: HashMap<(PathBuf, MissingSourceProbe), Result<bool, std::io::ErrorKind>>,
+        calls: Vec<(PathBuf, MissingSourceProbe)>,
+    }
+
+    impl MissingSourceIo {
+        fn set(
+            &mut self,
+            path: &str,
+            probe: MissingSourceProbe,
+            result: Result<bool, std::io::ErrorKind>,
+        ) {
+            self.results.insert((PathBuf::from(path), probe), result);
+        }
+
+        fn probe(
+            &mut self,
+            path: &Path,
+            probe: MissingSourceProbe,
+        ) -> Result<bool, std::io::ErrorKind> {
+            let key = (path.to_path_buf(), probe);
+            self.calls.push(key.clone());
+            self.results.get(&key).copied().unwrap_or(Ok(true))
+        }
+    }
+
+    #[test]
+    fn removable_missing_accepts_nearest_reachable_directory() {
+        use std::io::ErrorKind::NotFound;
+        for (missing, path) in [
+            (r"C:\parent\a.jpg", r"C:\parent\a.jpg"),
+            (r"C:\parent\gone", r"C:\parent\gone\nested\a.jpg"),
+            (r"C:\live-junction\gone", r"C:\live-junction\gone\a.jpg"),
+        ] {
+            let mut io = MissingSourceIo::default();
+            io.set(missing, MissingSourceProbe::SymlinkMetadata, Err(NotFound));
+            assert!(
+                missing_source_is_removable(
+                    Path::new(path),
+                    &mut HashMap::new(),
+                    &mut || true,
+                    &mut |path, probe| io.probe(path, probe),
+                )
+                .unwrap()
+            );
+            assert_eq!(io.calls.last().unwrap().0, Path::new(missing));
+            assert!(
+                !io.calls
+                    .contains(&(PathBuf::from(missing), MissingSourceProbe::Metadata))
+            );
+        }
+    }
+
+    #[test]
+    fn removable_missing_rejects_sources_that_reappeared_after_classification() {
+        // Classified Missing, but by the time the ancestors are probed the source exists again
+        // (as a folder or as a file). Neither may be offered for bulk removal.
+        for leaf_is_directory in [true, false] {
+            let mut io = MissingSourceIo::default();
+            io.set(
+                r"C:\parent\back",
+                MissingSourceProbe::SymlinkMetadata,
+                Ok(leaf_is_directory),
+            );
+            io.set(
+                r"C:\parent\back",
+                MissingSourceProbe::Metadata,
+                Ok(leaf_is_directory),
+            );
+            assert!(
+                !missing_source_is_removable(
+                    Path::new(r"C:\parent\back"),
+                    &mut HashMap::new(),
+                    &mut || true,
+                    &mut |path, probe| io.probe(path, probe),
+                )
+                .unwrap(),
+                "leaf_is_directory={leaf_is_directory}"
+            );
+        }
+    }
+
+    #[test]
+    fn removable_missing_rejects_unreachable_roots_and_links_without_sibling_io() {
+        use std::io::ErrorKind::{NotFound, PermissionDenied};
+        for (boundary, probe, error, first, second) in [
+            (
+                r"Q:\",
+                MissingSourceProbe::SymlinkMetadata,
+                NotFound,
+                r"Q:\album\a.jpg",
+                r"Q:\other\b.jpg",
+            ),
+            (
+                r"\\server\share\",
+                MissingSourceProbe::SymlinkMetadata,
+                NotFound,
+                r"\\server\share\album\a.jpg",
+                r"\\server\share\other\b.jpg",
+            ),
+            (
+                r"C:\parent\junction",
+                MissingSourceProbe::Metadata,
+                NotFound,
+                r"C:\parent\junction\a.jpg",
+                r"C:\parent\junction\b.jpg",
+            ),
+            (
+                r"C:\parent",
+                MissingSourceProbe::SymlinkMetadata,
+                PermissionDenied,
+                r"C:\parent\a.jpg",
+                r"C:\parent\b.jpg",
+            ),
+            (
+                r"C:\parent",
+                MissingSourceProbe::Metadata,
+                PermissionDenied,
+                r"C:\parent\a.jpg",
+                r"C:\parent\b.jpg",
+            ),
+        ] {
+            let mut io = MissingSourceIo::default();
+            io.set(boundary, probe, Err(error));
+            let mut cache = HashMap::new();
+            for path in [first, second, boundary] {
+                let calls_before = io.calls.len();
+                assert!(
+                    !missing_source_is_removable(
+                        Path::new(path),
+                        &mut cache,
+                        &mut || true,
+                        &mut |path, probe| io.probe(path, probe),
+                    )
+                    .unwrap(),
+                    "{path}"
+                );
+                if path != first {
+                    assert_eq!(io.calls.len(), calls_before, "{path}");
+                }
+            }
+            assert!(io.calls.iter().all(|(path, _)| path != Path::new(first)));
+        }
+    }
+
+    #[test]
+    fn removable_missing_rejects_non_directory_ancestor_and_non_absolute_paths() {
+        let mut io = MissingSourceIo::default();
+        io.set(r"C:\parent", MissingSourceProbe::Metadata, Ok(false));
+        assert!(
+            !missing_source_is_removable(
+                Path::new(r"C:\parent\a.jpg"),
+                &mut HashMap::new(),
+                &mut || true,
+                &mut |path, probe| io.probe(path, probe),
+            )
+            .unwrap()
+        );
+        for path in [r"parent\a.jpg", r"C:parent\a.jpg", r"\parent\a.jpg"] {
+            assert!(
+                !missing_source_is_removable(
+                    Path::new(path),
+                    &mut HashMap::new(),
+                    &mut || panic!("relative paths must not check I/O cancellation"),
+                    &mut |_, _| panic!("relative paths must not issue I/O"),
+                )
+                .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn removable_missing_checks_cancellation_before_every_probe() {
+        let path = Path::new(r"C:\parent\a.jpg");
+        // Root, parent and leaf each have a non-following and following probe.
+        for allowed_probes in 0..6 {
+            let calls = std::cell::Cell::new(0);
+            let mut cache = HashMap::new();
+            assert_eq!(
+                missing_source_is_removable(
+                    path,
+                    &mut cache,
+                    &mut || calls.get() < allowed_probes,
+                    &mut |_, _| {
+                        calls.set(calls.get() + 1);
+                        Ok(true)
+                    },
+                ),
+                Err(CollectionPrepareError::Cancelled)
+            );
+            assert_eq!(calls.get(), allowed_probes);
+        }
+    }
+
+    #[test]
+    fn prepared_removable_missing_is_missing_only_and_in_effective_order() {
+        let entries = vec![
+            entry(
+                Path::new(r"C:\parent\z.jpg"),
+                CollectionResolvedKind::Image,
+                0,
+            ),
+            entry(
+                Path::new(r"C:\parent\denied.jpg"),
+                CollectionResolvedKind::Image,
+                1,
+            ),
+            entry(
+                Path::new(r"C:\parent\unsupported.txt"),
+                CollectionResolvedKind::Image,
+                2,
+            ),
+            entry(
+                Path::new(r"C:\parent\a.jpg"),
+                CollectionResolvedKind::Image,
+                3,
+            ),
+        ];
+        for mode in [CollectionOrderMode::Manual, CollectionOrderMode::Standard] {
+            let snapshot = snapshot(entries.clone(), mode, SortOrder::FileName);
+            let mut io = MissingSourceIo::default();
+            for path in [r"C:\parent\z.jpg", r"C:\parent\a.jpg"] {
+                io.set(
+                    path,
+                    MissingSourceProbe::SymlinkMetadata,
+                    Err(std::io::ErrorKind::NotFound),
+                );
+            }
+            let prepared = prepare_collection_snapshot_with_io(
+                &snapshot,
+                &GridDisplayOrder::default(),
+                || true,
+                |_, _| {},
+                |path| match path.file_name().unwrap().to_str().unwrap() {
+                    "denied.jpg" => CollectionSourcePreparation::AccessError("denied".into()),
+                    "unsupported.txt" => CollectionSourcePreparation::Unsupported,
+                    _ => CollectionSourcePreparation::Missing,
+                },
+                |path, probe| io.probe(path, probe),
+            )
+            .unwrap();
+            let order = if mode == CollectionOrderMode::Manual {
+                [0, 3]
+            } else {
+                [3, 0]
+            };
+            assert_eq!(
+                prepared.removable_missing.as_ref(),
+                order.map(|index| CollectionRemovableMissingEntry {
+                    entry_id: entries[index].id,
+                    source_path: entries[index].source_path.clone(),
+                })
+            );
+            assert!(io.calls.iter().all(|(path, _)| {
+                path != &entries[1].source_path && path != &entries[2].source_path
+            }));
+        }
+    }
+
+    #[test]
+    fn prepared_removable_missing_cache_is_shared_only_within_one_prepare() {
+        let snapshot = snapshot(
+            vec![
+                entry(
+                    Path::new(r"C:\parent\gone\a.jpg"),
+                    CollectionResolvedKind::Image,
+                    0,
+                ),
+                entry(
+                    Path::new(r"C:\parent\gone\b.jpg"),
+                    CollectionResolvedKind::Image,
+                    1,
+                ),
+            ],
+            CollectionOrderMode::Manual,
+            SortOrder::FileName,
+        );
+        let mut io = MissingSourceIo::default();
+        io.set(
+            r"C:\parent\gone",
+            MissingSourceProbe::SymlinkMetadata,
+            Err(std::io::ErrorKind::NotFound),
+        );
+        for pass in 1..=2 {
+            let prepared = prepare_collection_snapshot_with_io(
+                &snapshot,
+                &GridDisplayOrder::default(),
+                || true,
+                |_, _| {},
+                |_| CollectionSourcePreparation::Missing,
+                |path, probe| io.probe(path, probe),
+            )
+            .unwrap();
+            assert_eq!(prepared.removable_missing.len(), 2);
+            assert_eq!(io.calls.len(), pass * 5);
+            let unique = io.calls.iter().collect::<HashSet<_>>();
+            assert_eq!(unique.len(), 5);
+            for probe in unique {
+                assert_eq!(io.calls.iter().filter(|call| *call == probe).count(), pass);
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_removable_missing_cancellation_does_not_publish_partial_snapshot() {
+        let snapshot = snapshot(
+            vec![entry(
+                Path::new(r"C:\parent\a.jpg"),
+                CollectionResolvedKind::Image,
+                0,
+            )],
+            CollectionOrderMode::Manual,
+            SortOrder::FileName,
+        );
+        let calls = std::cell::Cell::new(0);
+        let result = prepare_collection_snapshot_with_io(
+            &snapshot,
+            &GridDisplayOrder::default(),
+            || calls.get() == 0,
+            |_, _| panic!("cancelled classification must not publish progress"),
+            |_| CollectionSourcePreparation::Missing,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Ok(true)
+            },
+        );
+        assert_eq!(result, Err(CollectionPrepareError::Cancelled));
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn prepared_removable_missing_includes_sources_under_renamed_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("original");
+        let renamed = temp.path().join("renamed");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::write(original.join("page.jpg"), b"source").unwrap();
+        let missing = original.join("page.jpg");
+        let snapshot = snapshot(
+            vec![entry(&missing, CollectionResolvedKind::Image, 0)],
+            CollectionOrderMode::Manual,
+            SortOrder::FileName,
+        );
+        std::fs::rename(original, &renamed).unwrap();
+        let prepared = prepare_collection_snapshot(
+            &snapshot,
+            &GridDisplayOrder::default(),
+            &AtomicBool::new(false),
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(prepared.removable_missing.len(), 1);
+        assert_eq!(prepared.removable_missing[0].source_path, missing);
+        assert_eq!(std::fs::read(renamed.join("page.jpg")).unwrap(), b"source");
+    }
+
+    #[test]
+    fn prepared_removable_missing_survives_archive_and_display_projection() {
+        use crate::file_type_visibility::FileTypeVisibility;
+        let temp = tempfile::tempdir().unwrap();
+        let hidden_image = temp.path().join("missing.png");
+        let hidden_archive = temp.path().join("missing.zip");
+        let snapshot = snapshot(
+            vec![
+                entry(&hidden_image, CollectionResolvedKind::Image, 0),
+                entry(&hidden_archive, CollectionResolvedKind::Zip, 1),
+            ],
+            CollectionOrderMode::Manual,
+            SortOrder::FileName,
+        );
+        let cancel = AtomicBool::new(false);
+        let mut prepared = prepare_collection_snapshot(
+            &snapshot,
+            &GridDisplayOrder::default(),
+            &cancel,
+            |_, _| {},
+        )
+        .unwrap();
+        let original = Arc::clone(&prepared.removable_missing);
+        assert_eq!(original.len(), 2);
+        let policy = FileTypeVisibility {
+            excluded_extensions: ["png".to_owned(), "zip".to_owned()].into_iter().collect(),
+            ..Default::default()
+        };
+        let display_only = crate::app::collection_grid::project_collection_display_snapshot(
+            prepared.clone(),
+            &policy,
+        );
+        assert!(display_only.entries.is_empty());
+        assert!(Arc::ptr_eq(&original, &display_only.removable_missing));
+        let mut archive_projection =
+            crate::archive_visibility::ArchiveVisibilityProjection::new(&policy, &cancel);
+        prepared.entries = Arc::from(
+            prepared
+                .entries
+                .iter()
+                .filter(|entry| archive_projection.allows_item(&entry.item))
+                .cloned()
+                .collect::<Vec<_>>(),
+        );
+        assert!(prepared.entries.is_empty());
+        assert!(Arc::ptr_eq(&original, &prepared.removable_missing));
+        let projected =
+            crate::app::collection_grid::project_collection_display_snapshot(prepared, &policy);
+        assert!(projected.entries.is_empty());
+        assert!(Arc::ptr_eq(&original, &projected.removable_missing));
+        assert_eq!(projected.removable_missing[0].source_path, hidden_image);
+        assert_eq!(projected.removable_missing[1].source_path, hidden_archive);
     }
 
     #[test]

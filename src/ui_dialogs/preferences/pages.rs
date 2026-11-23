@@ -18,9 +18,10 @@ use crate::settings::{
     self, AiFeatureMode, ArchiveFileHandling, CachePolicy, FullscreenFitMode,
     FullscreenHorizontalCursorDirection, FullscreenJumpMode, FullscreenNScrollOrder,
     FullscreenPageStartPosition, FullscreenSeekDirection, FullscreenUpDownKeyAction,
-    FullscreenWheelAction, GridItemDisplayKind, Parallelism, ReadingDirection, ReadingFlow,
-    SortOrder, SpreadMode, StartupFolderMode, StartupWindowState, TextContrast,
-    UI_FONT_VERTICAL_ADJUST_MAX, UI_FONT_VERTICAL_ADJUST_MIN, UiFontSelection, UiTheme,
+    FullscreenWheelAction, FullscreenWheelZoomStep, GridItemDisplayKind, Parallelism,
+    ReadingDirection, ReadingFlow, SortOrder, SpreadMode, StartupFolderMode, StartupWindowState,
+    TextContrast, UI_FONT_VERTICAL_ADJUST_MAX, UI_FONT_VERTICAL_ADJUST_MIN, UiFontSelection,
+    UiTheme,
 };
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
@@ -11135,6 +11136,17 @@ fn draw_fullscreen_wheel_action_setting(ui: &mut egui::Ui, value: &mut Fullscree
     });
 }
 
+fn draw_fullscreen_wheel_zoom_step_setting(ui: &mut egui::Ui, value: &mut FullscreenWheelZoomStep) {
+    egui::ComboBox::from_label("ホイールでの拡大・縮小の刻み")
+        .selected_text(value.label())
+        .show_ui(ui, |ui| {
+            for &step in FullscreenWheelZoomStep::all() {
+                ui.selectable_value(value, step, step.label());
+            }
+        });
+    ui.small("静止画のホイールズーム（通常のホイールがズーム・Ctrl+ホイール・編集中）で、1 段ごとに拡大する倍率です。縮小はその逆の倍率です。Z ズーム・動画・キー・中ボタンドラッグ・タッチ・ゲームパッド・360 度には適用しません。");
+}
+
 fn draw_fullscreen_n_scroll_order_setting(ui: &mut egui::Ui, value: &mut FullscreenNScrollOrder) {
     egui::ComboBox::from_label("N 字スクロールの順序")
         .selected_text(value.label())
@@ -11151,8 +11163,13 @@ fn draw_fullscreen_smooth_page_scroll_setting(ui: &mut egui::Ui, value: &mut boo
     ui.small("ページ内を動かすキー・ホイールに適用します。タッチパッド、連結読み、ドラッグ、ズームには適用しません。");
 }
 
+fn draw_fullscreen_bound_drag_pan_setting(ui: &mut egui::Ui, value: &mut bool) {
+    ui.checkbox(value, "閲覧時のドラッグ移動を画像の端までに制限する");
+    ui.small("ページ単位の静止画表示で、画面からはみ出す方向は画像の端で止まり、画面に収まる方向は動きません。補正パネルを開いているときや編集中、ズームモード・連結読み・360 度・3D 表示には適用しません。キー・ホイール・ズームの動きは変わりません。");
+}
+
 fn draw_fullscreen_n_scroll_step_setting(ui: &mut egui::Ui, value: &mut u32) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let label = ui.label("順に読む操作 (N 字 / Z 字) 1 回");
         ui.add(
             egui::DragValue::new(value)
@@ -11163,6 +11180,35 @@ fn draw_fullscreen_n_scroll_step_setting(ui: &mut egui::Ui, value: &mut u32) {
         .labelled_by(label.id);
     });
     ui.small("ページ内を順に読む操作だけに効きます。");
+}
+
+fn draw_fullscreen_n_scroll_wrap_step_setting(ui: &mut egui::Ui, settings: &mut Settings) {
+    ui.horizontal_wrapped(|ui| {
+        let mut separate = settings.fullscreen_n_scroll_wrap_step_percent.is_some();
+        let label = ui.checkbox(&mut separate, "列 / 段を替えるときは別の移動量にする");
+        if label.changed() {
+            settings.fullscreen_n_scroll_wrap_step_percent =
+                separate.then_some(settings.fullscreen_n_scroll_step_percent.clamp(10, 100));
+        }
+        let mut resolved = settings
+            .fullscreen_n_scroll_wrap_step_percent
+            .unwrap_or(settings.fullscreen_n_scroll_step_percent)
+            .clamp(10, 100);
+        if ui
+            .add_enabled(
+                separate,
+                egui::DragValue::new(&mut resolved)
+                    .range(10..=100u32)
+                    .speed(1)
+                    .suffix(" %"),
+            )
+            .labelled_by(label.id)
+            .changed()
+        {
+            settings.fullscreen_n_scroll_wrap_step_percent = Some(resolved);
+        }
+    });
+    ui.small("N 字では次の列へ、Z 字では次の段へ移るときの量です。100% は表示領域 1 つ分で、端に近いときは残りの分だけ動きます。");
 }
 
 pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -11457,6 +11503,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
     anchored(ui, state, "spread/wheel-action", |ui, state| {
         draw_fullscreen_wheel_action_setting(ui, &mut state.settings.fullscreen_wheel_action);
     });
+    anchored(ui, state, "spread/wheel-zoom-step", |ui, state| {
+        draw_fullscreen_wheel_zoom_step_setting(ui, &mut state.settings.fullscreen_wheel_zoom_step);
+    });
     anchored(ui, state, "spread/n-scroll-order", |ui, state| {
         draw_fullscreen_n_scroll_order_setting(ui, &mut state.settings.fullscreen_n_scroll_order);
     });
@@ -11465,6 +11514,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             ui,
             &mut state.settings.fullscreen_smooth_page_scroll,
         );
+    });
+    anchored(ui, state, "spread/bound-drag-pan", |ui, state| {
+        draw_fullscreen_bound_drag_pan_setting(ui, &mut state.settings.fullscreen_bound_drag_pan);
     });
     anchored(ui, state, "spread/top-bar", |ui, state| {
         let s = &mut state.settings;
@@ -11643,6 +11695,9 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             &mut state.settings.fullscreen_n_scroll_step_percent,
         );
     });
+    anchored(ui, state, "spread/n-scroll-wrap-step", |ui, state| {
+        draw_fullscreen_n_scroll_wrap_step_setting(ui, &mut state.settings);
+    });
     ui.add_space(8.0);
     ui.label(egui::RichText::new("360 度ビュー").strong());
     anchored(ui, state, "spread/panorama-projection", |ui, state| {
@@ -11670,11 +11725,14 @@ mod fullscreen_in_page_scroll_setting_tests {
     fn draw(ui: &mut egui::Ui, settings: &mut Settings) {
         draw_fullscreen_up_down_key_action_setting(ui, &mut settings.fullscreen_up_down_key_action);
         draw_fullscreen_wheel_action_setting(ui, &mut settings.fullscreen_wheel_action);
+        draw_fullscreen_wheel_zoom_step_setting(ui, &mut settings.fullscreen_wheel_zoom_step);
         draw_fullscreen_n_scroll_order_setting(ui, &mut settings.fullscreen_n_scroll_order);
         draw_fullscreen_smooth_page_scroll_setting(ui, &mut settings.fullscreen_smooth_page_scroll);
+        draw_fullscreen_bound_drag_pan_setting(ui, &mut settings.fullscreen_bound_drag_pan);
         ui.add_space(8.0);
         ui.label("スクロール量 (連結読み・ページ内スクロール)");
         draw_fullscreen_n_scroll_step_setting(ui, &mut settings.fullscreen_n_scroll_step_percent);
+        draw_fullscreen_n_scroll_wrap_step_setting(ui, settings);
     }
 
     fn snapshot(
@@ -11685,16 +11743,21 @@ mod fullscreen_in_page_scroll_setting_tests {
     ) {
         let mut settings = Settings::default();
         settings.fullscreen_wheel_action = wheel;
+        if wheel == FullscreenWheelAction::Zoom {
+            settings.fullscreen_wheel_zoom_step = FullscreenWheelZoomStep::Percent50;
+        }
         if enabled {
             settings.fullscreen_up_down_key_action = FullscreenUpDownKeyAction::InPageScroll;
             settings.fullscreen_n_scroll_order = FullscreenNScrollOrder::HorizontalFirst;
             settings.fullscreen_smooth_page_scroll = true;
+            settings.fullscreen_bound_drag_pan = true;
             settings.fullscreen_n_scroll_step_percent = 50;
+            settings.fullscreen_n_scroll_wrap_step_percent = Some(100);
         }
         let mut fonts_ready = false;
         let mut harness = crate::test_ui::builder()
-            // Include the smooth-scroll and ordered-step rows without cropping.
-            .with_size(egui::vec2(540.0, 340.0))
+            // Include wheel zoom steps, drag bounds and all scroll rows without cropping.
+            .with_size(egui::vec2(540.0, 660.0))
             .build_ui(move |root_ui| {
                 crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
                     let ctx = &root_ui.ctx().clone();
@@ -11710,7 +11773,7 @@ mod fullscreen_in_page_scroll_setting_tests {
                         draw(ui, &mut settings);
                         assert!(
                             ui.min_rect().bottom() <= available_bottom,
-                            "the scroll settings must fit the 540x340 snapshot fixture: content={:?}, available_bottom={available_bottom}",
+                            "the scroll settings must fit the 540x660 snapshot fixture: content={:?}, available_bottom={available_bottom}",
                             ui.min_rect(),
                         );
                     });
@@ -11761,11 +11824,179 @@ mod fullscreen_in_page_scroll_setting_tests {
     }
 
     #[test]
+    fn fullscreen_n_scroll_wrap_row_tracks_reading_and_discards_override_when_unchecked() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(540.0, 160.0))
+            .build_ui_state(
+                |root, settings| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        draw_fullscreen_n_scroll_wrap_step_setting(ui, settings)
+                    });
+                },
+                Settings {
+                    fullscreen_n_scroll_step_percent: 15,
+                    ..Settings::default()
+                },
+            );
+        let numeric = |node: &egui_kittest::kittest::AccessKitNode<'_>| {
+            node.min_numeric_value() == Some(10.0) && node.max_numeric_value() == Some(100.0)
+        };
+        let label = "列 / 段を替えるときは別の移動量にする";
+        harness.run();
+        assert!(harness.get_by(numeric).accesskit_node().is_disabled());
+        assert_eq!(
+            harness.get_by(numeric).accesskit_node().numeric_value(),
+            Some(15.0)
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().fullscreen_n_scroll_wrap_step_percent,
+            Some(15)
+        );
+        assert!(!harness.get_by(numeric).accesskit_node().is_disabled());
+        harness.state_mut().fullscreen_n_scroll_wrap_step_percent = Some(100);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run();
+        assert_eq!(harness.state().fullscreen_n_scroll_wrap_step_percent, None);
+        harness.state_mut().fullscreen_n_scroll_step_percent = 50;
+        harness.run();
+        assert_eq!(
+            harness.get_by(numeric).accesskit_node().numeric_value(),
+            Some(50.0)
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().fullscreen_n_scroll_wrap_step_percent,
+            Some(50)
+        );
+    }
+
+    #[test]
+    fn fullscreen_n_scroll_narrow_controls_remain_visible_and_clickable() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+
+        let reading_label = "順に読む操作 (N 字 / Z 字) 1 回";
+        let wrap_label = "列 / 段を替えるときは別の移動量にする";
+        for width in [220.0, 280.0, 360.0] {
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(width, 400.0))
+                .build_ui_state(
+                    |root, (settings, visible)| {
+                        egui::CentralPanel::default().show(root, |ui| {
+                            ui.spacing_mut().scroll = super::super::pref_panel_scroll_style();
+                            egui::ScrollArea::vertical()
+                                .scroll_source(egui::scroll_area::ScrollSource {
+                                    drag: egui::scroll_area::DragScroll::Always,
+                                    ..Default::default()
+                                })
+                                .scroll_bar_visibility(
+                                    egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                                )
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    // Capture the viewport before any row can expand max_rect.
+                                    *visible = ui.max_rect().intersect(ui.clip_rect());
+                                    // Match the separate search-anchor scopes in the dialog.
+                                    ui.scope(|ui| {
+                                        draw_fullscreen_n_scroll_step_setting(
+                                            ui,
+                                            &mut settings.fullscreen_n_scroll_step_percent,
+                                        );
+                                    });
+                                    ui.scope(|ui| {
+                                        draw_fullscreen_n_scroll_wrap_step_setting(ui, settings);
+                                    });
+                                });
+                        });
+                    },
+                    (
+                        Settings {
+                            fullscreen_n_scroll_step_percent: 15,
+                            fullscreen_n_scroll_wrap_step_percent: Some(85),
+                            ..Settings::default()
+                        },
+                        egui::Rect::NOTHING,
+                    ),
+                );
+            harness.run();
+            for expected in [Some(85), None, Some(15)] {
+                assert_eq!(
+                    harness.state().0.fullscreen_n_scroll_wrap_step_percent,
+                    expected
+                );
+                let visible = harness.state().1;
+                let checkbox =
+                    harness.get_by_role_and_label(egui::accesskit::Role::CheckBox, wrap_label);
+                assert!(
+                    visible.contains_rect(checkbox.rect()),
+                    "{width}: checkbox; visible={visible:?}, rect={:?}",
+                    checkbox.rect()
+                );
+                let reading =
+                    harness.get_by_role_and_label(egui::accesskit::Role::Label, reading_label);
+                assert!(
+                    visible.contains_rect(reading.rect()),
+                    "{width}: reading label; visible={visible:?}, rect={:?}",
+                    reading.rect()
+                );
+                for (label, value, disabled) in [
+                    (reading.accesskit_node().id(), 15, false),
+                    (
+                        checkbox.accesskit_node().id(),
+                        expected.unwrap_or(15),
+                        expected.is_none(),
+                    ),
+                ] {
+                    let control = harness.get_by(|node| {
+                        node.role() == egui::accesskit::Role::SpinButton
+                            && node.numeric_value() == Some(value as f64)
+                            && node.labelled_by().any(|node| node.id() == label)
+                    });
+                    assert_eq!(control.accesskit_node().is_disabled(), disabled);
+                    assert!(
+                        visible.contains_rect(control.rect()),
+                        "{width}: DragValue {value}; visible={visible:?}, rect={:?}",
+                        control.rect()
+                    );
+                }
+                for description in [
+                    "ページ内を順に読む操作だけに効きます。",
+                    "N 字では次の列へ、Z 字では次の段へ移るときの量です。100% は表示領域 1 つ分で、端に近いときは残りの分だけ動きます。",
+                ] {
+                    let label =
+                        harness.get_by_role_and_label(egui::accesskit::Role::Label, description);
+                    assert!(
+                        visible.contains_rect(label.rect()),
+                        "{width}: {description}; visible={visible:?}, rect={:?}",
+                        label.rect()
+                    );
+                }
+                if expected != Some(15) {
+                    checkbox.click();
+                    harness.run();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fullscreen_n_scroll_order_selector_preserves_other_input_settings() {
         use egui_kittest::kittest::Queryable;
 
         let mut harness = crate::test_ui::builder()
-            .with_size(egui::vec2(540.0, 340.0))
+            .with_size(egui::vec2(540.0, 440.0))
             .build_ui_state(
                 |root_ui, (settings, fonts_ready)| {
                     let ctx = &root_ui.ctx().clone();

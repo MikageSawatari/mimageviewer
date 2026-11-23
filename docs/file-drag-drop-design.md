@@ -9,6 +9,10 @@
 
 **改訂履歴**:
 
+- 2026-11-22: §1.858 A 実行後は中断状態を常時照会し、HRESULT・項目別ログと共通通知を保持する。自動再試行なし。
+
+- 2026-11-21: §1.844 (v5.6.0)。§1.836 のサブ PC 確認で、一覧の空白・ツリーの非行領域が「＋ コピー」のままだったため、受け側が拒否した decision はすべて明示の禁止画像 (`DROPIMAGE_NONE`) を書く。判定・effect・転送は変更しない。§12.3.1。
+- 2026-11-21: §1.836。`BHID_DataObject` の `SetData(DropDescription)` が E_NOTIMPL を返すことを実 Shell 回帰で再現したため、送出 wrapper が説明の値を所有する。転送と OLE effect は変更しない。契約と未検証範囲は §12.3.1。
 - 2026-11-20: §1.464 は [folder-tree-dnd-plan.md](folder-tree-dnd-plan.md) が正本。ROOT の受け取りを自前 OLE target へ置き換え、表示済み pass の形でツリー行を判定する。内部の移動・コピーは整理先と同じ Shell worker へ送り、外への送出効果は COPY のまま。generic Shell image と target の drop description を使い、独立した SetFlags・InitializeFrom*・custom IDropSource は追加しない。検証の実施状況は正本の実装記録を参照。
 - 2026-07-24: 一覧のクリック選択方式 (チェック方式 / エクスプローラー方式) を追加。
   `handle_cell_interaction` の選択状態遷移だけを共通 helper 化し、
@@ -873,15 +877,32 @@ ROOT の HWND を得た最初のフレームで、winit が登録した受け取
   1. ファイル・フォルダ全件を `ShellTransferRequest` (`operation: Copy`) にする。
   2. `shell_file_ops::transfer_items_blocking` で `validate_transfer_request` → `run_transfer_items` を同期実行する。
      整理先の `transfer_items_async` もこの入口を使い、検証と実行を重複させない。
-  3. 結果を `CopyOutcome` に写して UI へ送る。成功は通知なし、中断は notice
-     「操作が中断されました。処理済みの項目は元に戻りません」、`Err(msg)` は
-     `CopyOutcome::all_failed(attempted, msg)` で全件失敗として扱う。
-     件別の成否を Shell から受け取らないため、中断時の処理済み件数は報告しない。
+  3. 結果を `CopyOutcome` に写して UI へ送る。Completed は通知なし、Interrupted / Failed は
+     [Shell 終端契約](folder-tree-dnd-plan.md#81-1858-a-shell-転送名前変更の終端契約) の共通 notice。
+     中断は処理済みありなら「操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください」、
+     処理済みなし・merged ありなら「操作が中断されました。フォルダの内容を確認してください」、
+     merged もなければ「操作が中断されました。移動・コピーした項目はありません」。結合だけでも元フォルダが変わり得るので未処理と断定しない。Failed はフォルダの確認を促し、
+     元の HRESULT と中断照会結果を次行へ出す。実行前の `Err(msg)` だけ従来どおり
+     `CopyOutcome::all_failed(attempted, msg)` で扱う。
+     実行後は成功・失敗にかかわらず中断状態を照会し、両結果を別々に保持する。
+     sink の処理済み／失敗／skip を全件集計、詳細は50件まで `shell_transfer:` へ記録する。
+     `COPYENGINE_S_PENDING` (`0x0027000B`) はログ用 pending のみとし、後続の確定 callback で一件を数える。
+     確定報告なしなら未処理として数えず、元パスごとの管理表は作らない。途中報告も詳細行に残す。
+     `COPYENGINE_S_NOT_HANDLED` (`0x00270003`) / `COPYENGINE_S_MERGE` (`0x00270006`) は結合開始の途中報告としてログ用 merged のみを増やす。
+     既存の先 item を伴っても親を processed / skipped に数えず、子の callback の結果を使う (根拠: Wine shlfileop.c `notifications6`、上記の共通契約を参照)。
+     中断コード (`0x80270000` / `0x800704C7`) は cancelled、その他の失敗 HRESULT は failed。
+     その他の成功は作成後 item が非 null なら processed、null なら skipped。
+     詳細上限を超えても同じ規則を使い、最初の実失敗 HRESULT (中断コードを除く) は結果と終端ログへ保持する。
+     終端ログには cancelled / pending / merged も出し、省略数は途中報告を含む callback 総数から求める。
+     項目行は終端でまとめて書くため、ログの時刻は終端時刻であり callback の発生時刻ではない。
+     中断で実失敗項目 (`failed > 0`) がある場合だけ2行目に `失敗した項目: {n} 件 (Shell: 0x{hr:08X})` を追加し、中断コードだけなら見出しのみ。
+     Failed の理由行は最初の実失敗 HRESULT が実行 HRESULT と異なる場合に `、項目: 0xHHHHHHHH` を末尾へ追加し、中断コードは項目理由に使わない。
+     callback 件数を要求件数へ当てはめて成功数を推測せず、実行後の結果は notice にする。再試行しない。
 - UI 側の受け取り経路:
   - 完了は `App::drop_copy_pending: Vec<Receiver<CopyOutcome>>` に積まれ、
     `poll_file_drop_pending` が `pending_reload` を立てつつ:
     - `failed > 0` のとき「成功 K / 失敗 N (例: ...)」トーストを出す
-    - `notice = Some(_)` のとき (中断) その文面をトーストで出す
+    - `notice = Some(_)` のとき (実行後の中断・失敗) その文面をトーストで出す
     - それ以外 (`failed == 0 && notice == None`) は静かに reload のみ
 
 ### 11.3 送出との非干渉
@@ -929,8 +950,9 @@ COM owner** とし、App の一覧・選択・viewer context に非同期完了�
 
 ### 12.2 案2を採用する根拠と確認範囲
 
-**採用: Shell 実体を保持し、`IDataObject` 9メソッドを委譲するラッパーに
+**採用: Shell 実体を保持し、`IDataObject` 9メソッドを基本として委譲するラッパーに
 `IDataObjectAsyncCapability` を実装する (依頼の案2)。** 案1の QI 成功だけでは不十分だった。
+§1.836 では DropDescription だけを外側で所有する例外を追加した (§12.3.1)。
 
 製品の起動・デスクトップ入力・実コピーを伴わない調査用 COM プローブを、この環境で実行した。
 環境は Windows `10.0.26300.0`。Windows PowerShell の `Add-Type` による C# P/Invoke で
@@ -987,7 +1009,8 @@ Windows の標準 COM marshaling を利用する。`Send` / `Sync` の unsafe �
 
 Explorer が worker から正しく marshal した interface を呼ぶと、外側への
 `GetData` / `SetData` / `StartOperation` / `EndOperation` 等は **mIV の UI STA** で
-実行され、同じ STA 上の inner へ委譲される。`InOperation` は通常 mIV が
+実行され、Shell のファイル形式は同じ STA 上の inner へ委譲される
+(§1.836 の DropDescription は §12.3.1 の外側 owner が扱う)。`InOperation` は通常 mIV が
 `SHDoDragDrop` 復帰直後に問い合わせる。target が他スレッドから問い合わせる場合も同じ
 marshaling 境界を通る。非同期というのは **target のコピー処理**を別スレッドへ移す契約であり、
 source の `GetData` が worker 上で実行されるという意味ではない。
@@ -1007,16 +1030,85 @@ windows 0.61.3 の生成 vtable は `Result<T>` 型の実装成功を `S_OK` に
 
 | メソッド | 必要な成功コードと委譲契約 |
 | --- | --- |
-| QueryGetData / GetCanonicalFormatEtc | 生の HRESULT を保持。`S_FALSE` / `DATA_S_SAMEFORMATETC` も丸めず試験する |
-| GetData / GetDataHere / SetData | 有効な出力・所有権を伴う成功を `S_OK` として返す。失敗コードは保持 |
-| EnumFormatEtc / EnumDAdvise | 成功時は inner の列挙 interface をそのまま返し `S_OK`。列挙子自身の Next の `S_FALSE` はラップせず保持 |
+| QueryGetData / GetCanonicalFormatEtc | 委譲時は生の HRESULT を保持。`S_FALSE` / `DATA_S_SAMEFORMATETC` も丸めず試験する。保存済み DropDescription の QueryGetData は外側で判定 |
+| GetData / GetDataHere / SetData | 有効な出力・所有権を伴う成功を `S_OK` として返す。失敗コードは保持。DropDescription の SetData と保存後の GetData は外側で処理 |
+| EnumFormatEtc / EnumDAdvise | inner の列挙 interface をそのまま返し `S_OK`。DropDescription の保存後も列挙を拡張しない。Next の `S_FALSE` を維持 |
 | DAdvise / DUnadvise | 成功時の接続番号・解除を保ち `S_OK`。失敗コードは保持 |
 
 データを事前コピーしたり、全ファイルの
-内容をメモリへ読み込んだりしない。`SetData` が inner で未対応でも成功へ変換しない。
+内容をメモリへ読み込んだりしない。委譲する形式は `SetData` が inner で未対応でも成功へ変換しない。
+§1.836 の DropDescription は固定長の説明値だけを外側でコピーし、inner へ委譲しない。
 外側の COM メソッドは App / egui / viewer を参照せず、追加の I/O は行わない。
 inner 呼び出しが STA を再入し得るため、状態の `RefCell` borrow を委譲や COM Release、
 ログ出力をまたいで保持しない。
+
+### 12.3.1 DropDescription の外側所有 (§1.836、2026-11-21)
+
+サブ PC の実機報告では、ツリーへの実転送は正しく移動する一方、移動先と非受付の場所のいずれも
+コピーの＋が残り、受け側に `SetData(DropDescription)` の E_NOTIMPL が記録された。
+設計担当は `d8e7a0249` の実 Shell 回帰をメイン PC の共有 runner で実行し、最初の Move の
+本番 `OleData::set_description` が同じ E_NOTIMPL になることを確認した。
+FALSE の所有権指定だけが拒否理由だとは断定せず、TRUE なら受理するという未文書化の挙動には依存しない。
+
+`SHDoDragDrop` と `IDropTargetHelper` が受け取るのは `DragDataObject.data` の**外側**である。
+説明の正本はこの COM object ごとの `Option<DROPDESCRIPTION>` 一つとし、async state とは独立させる。
+追加 worker・待機・rollback/resume は不要で、同じ STA の短い値コピーだけで完結させる。
+
+- SetData は DropDescription のみを捕捉する。CONTENT、lindex=-1、HGLOBAL を含む FORMATETC と、
+  実 medium の HGLOBAL・構造体以上のサイズを確認して値をコピーする。不正ならエラーにし、前の値と呼出元の所有権を保つ。
+- 成功時、FALSE は medium を解放しない。TRUE は保存値の borrow を閉じた後、入力構造体の bit-copy に
+  `ReleaseStgMedium` を一度だけ呼ぶ (`pUnkForRelease` も尊重)。入力構造体自体は変更しない。
+  解放 callback の再入中も SetData の call reference が外側 object を保持する。
+  所有権は [IDataObject::SetData の契約](https://learn.microsoft.com/en-us/windows/win32/api/objidl/nf-objidl-idataobject-setdata) に従う。
+- GetData / QueryGetData は保存前には従来どおり inner へ委譲する。保存後は有効な要求を外側で処理し、
+  GetData は呼出しごとに新しい HGLOBAL を返す。古い取得結果と兄弟 drag は、後の説明変更に影響されない。
+- EnumFormatEtc は説明の保存前後・direction に関係なく inner への単純委譲を保ち、意図的に拡張しない。
+  SHDoDragDrop の drag window と IDropTargetHelper は既知の DropDescription を GetData / QueryGetData で読むため、
+  外側の保存値を取得できる。列挙を必要とする具体的な consumer は確認されておらず、そのためだけの
+  列挙子再構成・`ptd` の所有権管理は追加しない。
+- Performed DropEffect の入力検証・inner への委譲・HRESULT/fRelease・async 完了の契約は変更しない。
+  mIV → Explorer の target による説明書込みも外側が受け、Explorer 等 → mIV は元の外部 object へ従来どおり書く。
+
+受理・拒否の判定と本番 writer は維持する。Move は `DROPIMAGE_MOVE` と「%1 へ移動」、Copy は
+`DROPIMAGE_COPY` と「%1 へコピー」。§1.844 (v5.6.0) では**拒否した decision はすべて明示的な
+`Description::None` (`DROPIMAGE_NONE`)** とする。一覧の空白・同じ一覧・ツリーの非行領域・
+hit なし・パス形式を持たない外部 source も、この禁止画像を要求する。
+`Description::Invalid` (`DROPIMAGE_INVALID`) は受理した外部一覧ドロップ (`Decision::Grid`) と、
+DragLeave / finish_session (Drop 後や次の DragEnter による前 session の終了を含む) のリセットだけに残す。
+成功後の `update_drag_window` と、
+説明が変わったときだけ一度書込み・失敗をログする `DragSession::describe` も維持する。
+画像の意味は [DROPIMAGETYPE の仕様](https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/ne-shlobj_core-dropimagetype) による。
+SHDoDragDrop の COPY 限定、target の COPY/NONE、実転送・競合・更新経路は変更しない。
+
+§1.844 の根拠 (§1.836 のサブ PC 確認。観測者: **サブ PC テスター、RDP 越し、build `833e7c7b5`**):
+ツリー行では「→ dst2 へ移動」「＋ dst2 へコピー」が Ctrl・行変更に追従し、実転送とも一致した。
+元の親やフォルダ自身等の拒否行では禁止画像が出て、`drop description failed` は 0 行だった。
+一方、内部 drag の一覧空白・ツリーのヘッダー帯ではコピーの＋が残り、行から一覧空白に移ると
+移動先の説明が「＋ コピー」へ変わった。離しても何も起きない点は正しかった。
+2 個目の mIV を外部 source とした場合もツリー非行領域はコピーの＋になり、受信側一覧への
+受理されたドロップはコピー表示・コピー結果とも正しかった。
+このため、初期設計の「INVALID と effect NONE なら禁止画像になる」という推測は撤回する。
+この観測では INVALID が Shell のコピー既定画像に戻り、明示的な NONE の行だけが禁止画像になった。
+`SHDoDragDrop done effect=1` は転送しなかった drag を含む全件で報告されたが、今回その返値や effect は変更しない。
+
+追加回帰は `drag_data_object_drop_description_`、`main_drop_shell_description_`、§1.844 の
+`main_drop_nodrop_` で選択できる。
+TRUE/FALSE の所有権、保存前委譲、独立した GetData 結果と置換、不正入力、
+drag ごとの分離、Performed 完了、実 Shell object と fake visuals による非受付・DragLeave を記述した。
+初回の独立した GPT-6.1 Sol / xhigh の設計・完了時の静的レビューは ACCEPT だったが、
+設計担当によるメイン PC の共有 runner 実行では、filter `test(/file_drag::|main_drop_target::|shell_file_ops/)` の
+53 件中 52 件が成功 (元の RED を含む)、形式列挙テスト 1 件が `0xc0000374` (heap corruption) で ABORT した。
+列挙子を再構成してから `ptd` を解放する実装、またはそのテスト fake の所有権の前提が安全でなかった。
+正確な破壊箇所は未確定だが、この結果を受けた設計担当の判断で列挙拡張と当該テスト、専用 mock 拡張を撤去した。
+静的 ACCEPT はこの実行失敗を否定する根拠にはしない。実装者は cargo fmt と静的検査だけを行い、
+撤去後のコンパイル・テスト実行は共有 runner に引き継ぐ。
+§1.844 では handler / session レベルと native callback で、拒否した一覧・ツリー非行領域・hit なし・
+パスのない外部 source が NONE と effect NONE、行→一覧が Transfer→None、受理した外部一覧が
+INVALID と COPY、離脱時が INVALID となることを記述した。実装者は実行していない。
+明示的な禁止画像に変えた一覧空白・ツリー非行領域の実表示と、外向き Explorer は実機確認に残る。
+既定 source / helper が後から DropDescription を書き直すかは、mIV のソースだけでは確定できない。
+wrapper は最後の SetData を保存し、DragSession は自分が要求した説明の変化だけを検出する。
+上書きを想定した再適用・追加の状態や effect の変更は、§1.844 には含めない。
 
 ### 12.4 寿命と async 状態の単一 owner
 

@@ -69,6 +69,7 @@
 | [section221-context-menu-layout.md](section221-context-menu-layout.md) | §1.221 右クリック専用設定ページ、表示場面の確認と項目・区切り線の編集。静的項目と動的固定枠の分離、設定互換性、共通メニュー解決と検証記録 |
 | [section220-cut-item-appearance.md](section220-cut-item-appearance.md) | §1.220 切り取り中の実項目表示。クリップボードの所有・通知・貼り付け結果、Explorer形式の読取と、半透明の一覧内容・ハサミ表示の描画境界 |
 | [clipboard-capture-plan.md](clipboard-capture-plan.md) | **設計確定 (第 8 版)・S1 実装中**。クリップボード取り込み。コピーした画像の自動保存と、コピーしたページ HTML の画像を選んで保存する機能。専用 listener、右下の非アクティブ小窓、参照元の規則、ファイル名とスタック、段階と検証 |
+| [browser-to-miv-plan.md](browser-to-miv-plan.md) | **§1.818 調査・設計 (2026-11-20 に段 2 を表示領域に重ねる形へ書き直し、判断事項は利用者が決定。段 1 単独では出さず段 2 から作る。実装は未着手)**。ブラウザで見ている画像を mIV で開いて 3D 写真・アップスケールで見る・保存する。受け渡し方式の比較、X・pixiv の規約とChrome拡張の配布の一次情報、段 1 (取り込みの小窓の [見る]) と段 2 (拡張「mIV で見る」、ブラウザの表示領域に mIV の窓を重ね「ブラウザ閲覧」フォルダへ保存) の骨子 |
 | [container-index-startup-optimization-plan.md](container-index-startup-optimization-plan.md) | コンテナ索引の起動・watch更新に共通するDB直下置換SQLの範囲限定。小規模修正の設計・検証記録 |
 | [ui-responsiveness.md](ui-responsiveness.md) | UI スレッド同期 I/O で UI を止めないための設計方針。**新機能追加前にチェックリスト §4 を必ず見る** |
 | [section801-close-navigation-investigation.md](section801-close-navigation-investigation.md) | §1.801、AI高画質化中に本を閉じた際のpre-scan待ち。同期到達先の棚卸し、型付き小区間とロック取得待ちの計装、fake handler検証。利用者事象の原因は未確定・修正は未実装 |
@@ -76,7 +77,8 @@
 | [ai-crash-655-investigation.md](ai-crash-655-investigation.md) | §1.482の調査・確定設計・段階実装。終了印/次回通知、活動中checkpoint、panic/native/device-lost、現役ORT失敗の即時通知と安全なコピー。段A〜D実装済み・実機未確認。段A〜Cは独立ACCEPT、段Dは検証・受入中 |
 | [preferences-layout-guidelines.md](preferences-layout-guidelines.md) | 環境設定 UI のページ構成、配置、レスポンシブレイアウトを触るとき |
 | [v3.7.0-input-and-still-seek-plan.md](v3.7.0-input-and-still-seek-plan.md) | v3.7.0 の動画ホイール・マウスボタン割り当て、段階別シーク秒数、詳細表示起点の不具合と静止画サムネイル列5段階の実装計画 |
-| [release-check-automation-plan.md](release-check-automation-plan.md) | **2026-10-11利用者採用**。毎リリースのReleaseChecks suite（隔離seed、5 idle、cached／uncached perf）、証拠・既知startup gapの上限500ms・foreground条件・採用run記録。手動／実データ確認の範囲も維持 |
+| [release-check-automation-plan.md](release-check-automation-plan.md) | **2026-10-11利用者採用、2026-11-21からサブPC向けキット経路を追加**。ReleaseChecks suite（隔離seed、5 idle、cached／uncached perf）、§11のキット作成・前面事前確認・結果受け取り、証拠・閾値・foreground条件・採用run記録。手動／実データ確認も維持 |
+| [subpc-release-checks-brief.md](subpc-release-checks-brief.md) | 公開前にサブ PC で ReleaseChecks を流すときの依頼文の雛形 (キットのコピー、前面の事前確認、ターミナル パネルからの本番、結果の戻し方) |
 | [idle-health-check.md](idle-health-check.md) | ReleaseChecks suiteを正規手順とする静止／背面／動画ピン／tray読込中・完了後の条件と判定値。従来の手動scriptはfallback／診断 |
 | [nightly-combination-test-plan.md](nightly-combination-test-plan.md) | **設計R3・独立設計レビューACCEPT・Q1〜Q4決定済み（2026-11-08）・S0/S1a着手**。サブPCのWindows Sandboxで、設定（pairwise）×内容×操作の組み合わせを夜間に無人で流す試験。Sandbox内の無人入力の確認記録、生成器・判定・縮小・朝の報告、Claudeの役割、利用者判断事項 |
 | [ui-smoke-automation-plan.md](ui-smoke-automation-plan.md) | §1.197 の実アプリ自動検証。診断portable、複数窓PDF、静止画pointer、動画の実OSマウス入力の段階と検証範囲 |
@@ -89,6 +91,7 @@
 | [folder-tree-refresh-plan.md](folder-tree-refresh-plan.md) | §1.686 外部変更とツリー再照合。§9.5の一覧受理通知＋再参加を採用し、展開枝監視は見送り。typed node所有・完全membership・表示中断/復帰・scroll保持と§10の検証記録 |
 | [collection-spec-proposal.md](collection-spec-proposal.md) | §1.118 名前付きコレクションの初期仕様案と、その後の利用者判断の記録。現在の操作仕様はマニュアル、実装状態は実装計画 §23 を参照 |
 | [collection-implementation-plan.md](collection-implementation-plan.md) | コレクションの保存・管理UI・一覧・再生・Remoteを触るとき。actorと各画面の所有境界、出荷前修正の実装・検収台帳 |
+| [collection-missing-bulk-remove-851-plan.md](collection-missing-bulk-remove-851-plan.md) | §1.851 見つからない登録の一括解除。対象判定・全登録の件数・メニューと右クリック・確認・origin context の受付検査 |
 | [collection-return-investigation.md](collection-return-investigation.md) | 2026-10-30 X投稿の「本から戻ると違う場所」。v4.10.0相当のheadless試験で帰り先・選択を保ったスクロールずれを再現。>>661との関係と20件の証跡 |
 | [folder-history-location-plan.md](folder-history-location-plan.md) | **Stage B 実装・自動 gate 完了**。§1.280 / §1.281 / §1.282 の Rating・Collection子の表示位置とフォルダ履歴、A/B・detached の所有境界、Rating 一覧ソート保存の設計・検証台帳。実アプリ smoke は未実行 |
 | [file-type-visibility-plan.md](file-type-visibility-plan.md) | **実装済み・独立レビュー指摘修正と自動検証済み（利用者決定2026-10-08/09、実機確認待ち）**。§1.345の全体ファイル種類設定、全一覧producer・代表画像・本判定・Remoteの共通ポリシー、旧変換cache通知、本内ブックマークのcontext所有と検証記録。§1.339の履歴再入場facet退避の独立した根治設計。bf509352dの独立レビュー承認を記録 |
@@ -217,6 +220,8 @@
 | --- | --- |
 | [fullscreen-in-page-scroll-plan.md](fullscreen-in-page-scroll-plan.md) | §1.474 ページ内スクロールと N 字 / Z 字移動の基礎設計・実装記録。描画済み表示単位の照合、入力所有、clamp と循環防止 |
 | [fullscreen-scroll-page-turn-plan.md](fullscreen-scroll-page-turn-plan.md) | §1.823〜§1.826 の拡張設計。滑らかな移動、端からのスクロール＋ページ送りと型付き着地、ホイールのズーム、N 字 / Z 字の移動量設定 |
+| [fullscreen-n-scroll-wrap-step-plan.md](fullscreen-n-scroll-wrap-step-plan.md) | §1.850 N 字 / Z 字で列 / 段を替える量を読み進める量と別に決める設定の設計。5ch >>857 の切り分け (座標列の単体テスト) |
+| [fullscreen-drag-pan-bound-plan.md](fullscreen-drag-pan-bound-plan.md) | §1.834 閲覧中のキャンバスのドラッグ移動を画像の端までに制限する設定。既定OFF、描画済み表示単位・白紙の相方・可視性と物理ピクセルの丸め、適用する面と入力の契約 |
 | [catalog-design.md](catalog-design.md) | サムネイルキャッシュ DB の設計 |
 | [book-thumb-cover-only-plan.md](book-thumb-cover-only-plan.md) | §1.452 本の中のページは寸法だけ記録し表紙だけ保存する設定、`page_dims` 表、書き戻しの stamp 条件 |
 | [dct-scale-plan.md](dct-scale-plan.md) | TurboJPEG の DCT スケールデコードによるサムネ生成高速化。倍率選択と、圧縮入力サイズによるフォールバック条件 |

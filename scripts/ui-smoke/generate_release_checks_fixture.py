@@ -22,8 +22,13 @@ from pathlib import Path
 
 from generate_rating_sort_fixture import png
 
+# The generator is executable directly from scripts/ui-smoke as well as imported
+# by tests. Both routes use the same table as the suite runner and analyzers.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from release_check_geometry import case_geometry, static_geometry
 
-RECIPE_VERSION = "release-checks-v4"
+
+RECIPE_VERSION = "release-checks-v5"
 SCHEMA_VERSION = 1
 WIDTH, HEIGHT = 884, 444
 STATIC_COUNT = 16
@@ -114,16 +119,19 @@ def fixture_png(identity: int, prompt: str | None = None, *,
 
 
 def settings_overlay(start_path: Path, search_root: Path, *, tray_case: bool = False,
-                     seed_cache: bool = False, static_case: bool = False) -> dict:
+                     seed_cache: bool = False, static_case: bool = False,
+                     dpi: int = 144) -> dict:
+    geometry = case_geometry("seed-profile" if static_case else
+                             "tray-fixture" if tray_case else "default", dpi)
     overlay = {
         "startup_folder_mode": "specific",
         "startup_folder_path": str(start_path),
         "startup_window_state": "normal",
         "window_maximized": False,
-        "window_size": [1328.0, 900.0],
+        "window_size": geometry["window_size"],
         "grid_view_mode": "Thumbnail",
-        "grid_cols": 7,
-        # §1.198: the taller 3:4 cell requests ~374px at 150% DPI here.
+        "grid_cols": geometry["grid_cols"],
+        # §1.198: the calibrated 3:4 cell requests ~374 physical px.
         # A 16:9 cell with the same width requests only ~281px, missing the
         # integer-decode regression. Actual request evidence remains mandatory.
         "thumb_aspect": STATIC_THUMB_ASPECT if static_case else "Landscape16x9",
@@ -158,9 +166,9 @@ def settings_overlay(start_path: Path, search_root: Path, *, tray_case: bool = F
     return overlay
 
 
-def static_recipe() -> dict:
-    return {"width": WIDTH, "height": HEIGHT, "window_size": [1328, 900],
-            "grid_cols": 7, "thumb_aspect": STATIC_THUMB_ASPECT, "thumb_aspect_auto": False,
+def static_recipe(dpi: int = 144) -> dict:
+    return {"width": WIDTH, "height": HEIGHT, **static_geometry(dpi),
+            "thumb_aspect": STATIC_THUMB_ASPECT, "thumb_aspect_auto": False,
             "requested_px_hint": STATIC_REQUESTED_PX_TARGET,
             "requested_px_target": STATIC_REQUESTED_PX_TARGET,
             "requested_px_tolerance": STATIC_REQUESTED_PX_TOLERANCE,
@@ -185,7 +193,9 @@ def ffmpeg_arguments(ffmpeg: Path, video: Path) -> list[str]:
 
 
 def generate(output: Path, ffmpeg: Path, *, allowed_root: Path = DEFAULT_ALLOWED_ROOT,
-             run_command=None) -> dict:
+             run_command=None, dpi: int = 144) -> dict:
+    # Reject unsupported DPI before inspecting or creating fixture output.
+    static = static_recipe(dpi)
     output = isolated_path(output, allowed_root)
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
         raise ValueError(f"refusing non-empty fixture output: {output}")
@@ -265,12 +275,12 @@ def generate(output: Path, ffmpeg: Path, *, allowed_root: Path = DEFAULT_ALLOWED
     for case, name in CASE_PATHS.items():
         overlay_values[case] = settings_overlay(Path(paths[name]), Path(paths["search"]),
                                                tray_case=case.startswith("tray-"),
-                                               static_case=case.startswith("static-"))
+                                               static_case=case.startswith("static-"), dpi=dpi)
     for seed, name in (("seed-static", "static"), ("seed-perf-cached", "cached"),
                        ("seed-video-pin", "video-pin-child"), ("seed-search", "search")):
         overlay_values[seed] = settings_overlay(Path(paths[name]), Path(paths["search"]),
                                                seed_cache=seed != "seed-search",
-                                               static_case=seed == "seed-static")
+                                               static_case=seed == "seed-static", dpi=dpi)
     for case, value in overlay_values.items():
         path = output / "overlays" / f"{case}.json"
         path.parent.mkdir(exist_ok=True)
@@ -293,7 +303,7 @@ def generate(output: Path, ffmpeg: Path, *, allowed_root: Path = DEFAULT_ALLOWED
                    "navigation_subtrees": 2, "navigation_folders_per_subtree": NAVIGATION_COUNT,
                    "search_images": 6, "search_hits": len(hits),
                    "png_images": identity, "videos": 1},
-        "static": static_recipe(),
+        "static": static,
         "tray": tray_recipe(),
         "search": {"root": paths["search"], "term": SEARCH_TERM,
                    "metadata_key": "parameters", "expected_hits": hits,
@@ -360,7 +370,8 @@ def verify_fixture(output: Path, *, allowed_root: Path = DEFAULT_ALLOWED_ROOT) -
             manifest["static"].get("requested_px_tolerance") != STATIC_REQUESTED_PX_TOLERANCE or
             manifest["static"].get("requested_px_must_be_observed") is not True):
         raise ValueError("static request observation range is invalid")
-    if manifest["static"] != static_recipe():
+    dpi = manifest["static"].get("dpi")
+    if manifest["static"] != static_recipe(dpi):
         raise ValueError("static regression recipe is invalid")
     expected_paths = {name: str(output / name)
                       for name in ("static", *MANY_NAMES, *TRAY_NAMES, "video-pin", "search")}
@@ -443,14 +454,14 @@ def verify_fixture(output: Path, *, allowed_root: Path = DEFAULT_ALLOWED_ROOT) -
             expected = settings_overlay(Path(manifest["paths"][CASE_PATHS[case]]),
                                         Path(manifest["paths"]["search"]),
                                         tray_case=case.startswith("tray-"),
-                                        static_case=case.startswith("static-"))
+                                        static_case=case.startswith("static-"), dpi=dpi)
         elif case in ("seed-static", "seed-perf-cached", "seed-video-pin", "seed-search"):
             name = {"seed-static": "static", "seed-perf-cached": "cached",
                     "seed-video-pin": "video-pin-child", "seed-search": "search"}[case]
             expected = settings_overlay(Path(manifest["paths"][name]),
                                         Path(manifest["paths"]["search"]),
                                         seed_cache=case != "seed-search",
-                                        static_case=case == "seed-static")
+                                        static_case=case == "seed-static", dpi=dpi)
         else:
             raise ValueError(f"unknown overlay: {case}")
         overlay_path = isolated_path(Path(path), output)
@@ -463,6 +474,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--ffmpeg", type=Path, help="exact FFmpeg executable path")
+    parser.add_argument("--dpi", type=int, default=144,
+                        help="calibrated monitor DPI for generation (96 or 144)")
     parser.add_argument("--verify", action="store_true", help="verify media, not App seed state")
     args = parser.parse_args()
     try:
@@ -471,7 +484,7 @@ def main() -> int:
         else:
             if args.ffmpeg is None:
                 parser.error("--ffmpeg is required for media generation")
-            generate(args.output, args.ffmpeg)
+            generate(args.output, args.ffmpeg, dpi=args.dpi)
     except (OSError, ValueError, subprocess.SubprocessError, KeyError, TypeError) as error:
         print(f"release fixture unavailable: {error}", file=sys.stderr)
         return 2

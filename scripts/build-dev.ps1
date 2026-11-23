@@ -6,13 +6,14 @@
 #   target\dev-runtime\mimageviewer-remote.exe
 #   target\dev-runtime\mimageviewer-epub-pdf.exe
 #   target\dev-runtime\mimageviewer-mcp.exe
+#   target\dev-runtime\mimageviewer-browser-host.exe
 #   target\dev-runtime\mimageviewer-musicvideo.exe
 #   FFmpeg DLLs are staged beside it so the core can run without the release
 #   launcher. Other native assets and models use the same embedded
 #   extraction path as the regular application.
 #
-# The core, remote service, EPUB converter, MCP adapter, and music-video editor are built together: the core
-# spawns each companion from its own directory. Core and remote share PROTOCOL_VERSION.
+# Build the core and all five companions together. The browser starts the native
+# host separately; core and remote share PROTOCOL_VERSION.
 #
 # The dev-runtime Cargo profile only changes optimization/build-time settings.
 # The portable feature is intentionally NOT enabled, so an ordinary launch uses
@@ -58,6 +59,7 @@ $coreExe = Join-Path $outputDir 'mimageviewer-core.exe'
 $remoteExe = Join-Path $outputDir 'mimageviewer-remote.exe'
 $epubWorkerExe = Join-Path $outputDir 'mimageviewer-epub-pdf.exe'
 $mcpExe = Join-Path $outputDir 'mimageviewer-mcp.exe'
+$browserHostExe = Join-Path $outputDir 'mimageviewer-browser-host.exe'
 $musicvideoExe = Join-Path $outputDir 'mimageviewer-musicvideo.exe'
 . (Join-Path $PSScriptRoot 'musicvideo-build-safety.ps1')
 $normalDataDir = if ($env:APPDATA) {
@@ -248,6 +250,9 @@ try {
     Stop-StagedProcess -ExeName 'mimageviewer-mcp' -ExePath $mcpExe -Label 'MCP adapter' `
         -PreserveRuntime:$PreserveRuntime
 
+    Stop-StagedProcess -ExeName 'mimageviewer-browser-host' -ExePath $browserHostExe -Label 'browser host' `
+        -PreserveRuntime:$PreserveRuntime
+
     Ensure-LibclangPath
     $featureArgs = @()
     $featureLabel = 'normal feature set'
@@ -300,6 +305,13 @@ try {
         throw "[build-dev] music-video editor was not produced: $musicvideoExe"
     }
 
+    Write-Host '[build-dev] building browser host with Cargo profile dev-runtime'
+    & cargo build --profile dev-runtime --target-dir $targetDir -p mimageviewer-browser-host --bin mimageviewer-browser-host
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if (-not (Test-Path $browserHostExe -PathType Leaf)) {
+        throw "[build-dev] browser host was not produced: $browserHostExe"
+    }
+
     & (Join-Path $PSScriptRoot 'setup-test-dlls.ps1') -RepoRoot $repoRoot -TargetDir $targetDir -CargoProfile dev-runtime
 
     $copies = @(
@@ -318,7 +330,7 @@ try {
     Copy-EffetuneBundleIfChanged
 
     & (Join-Path $repoRoot 'scripts\check-vcrt-pe-dependencies.ps1') `
-        -InputPaths @($coreExe, $remoteExe, $epubWorkerExe, $mcpExe, $musicvideoExe) -RequireCompanionRuntime `
+        -InputPaths @($coreExe, $remoteExe, $epubWorkerExe, $mcpExe, $musicvideoExe, $browserHostExe) -RequireCompanionRuntime `
         -ReportPath 'target\vcrt-pe-reports\dev-runtime.json'
 
     Write-Host ''
@@ -327,6 +339,7 @@ try {
     Write-Host ("  remote service: {0}" -f $remoteExe)
     Write-Host ("  EPUB PDF worker: {0}" -f $epubWorkerExe)
     Write-Host ("  MCP adapter: {0}" -f $mcpExe)
+    Write-Host ("  Browser host: {0}" -f $browserHostExe)
     Write-Host ("  music-video editor: {0}" -f $musicvideoExe)
     Write-Host ("  data (default): {0}" -f $normalDataDir)
     Write-Host ("  isolated override: --data-dir `"{0}`"" -f

@@ -2808,6 +2808,7 @@ pub enum MenuCommandId {
     CollectionsSetOrderCurrent,
     CollectionsRelinkCurrent,
     CollectionsReorderCurrent,
+    CollectionsRemoveMissingCurrent,
     CollectionsManage,
     TagsManagePinned,
     TagsTagView,
@@ -2870,6 +2871,7 @@ impl MenuCommandId {
         Self::CollectionsSetOrderCurrent,
         Self::CollectionsRelinkCurrent,
         Self::CollectionsReorderCurrent,
+        Self::CollectionsRemoveMissingCurrent,
         Self::CollectionsManage,
         Self::TagsManagePinned,
         Self::TagsTagView,
@@ -2932,6 +2934,7 @@ impl MenuCommandId {
             MenuCommandId::CollectionsSetOrderCurrent => "CollectionsSetOrderCurrent",
             MenuCommandId::CollectionsRelinkCurrent => "CollectionsRelinkCurrent",
             MenuCommandId::CollectionsReorderCurrent => "CollectionsReorderCurrent",
+            MenuCommandId::CollectionsRemoveMissingCurrent => "CollectionsRemoveMissingCurrent",
             MenuCommandId::CollectionsManage => "CollectionsManage",
             MenuCommandId::ConvertToZip => "ConvertToZip",
             MenuCommandId::ToolsCreateAiCaptions => "ToolsCreateAiCaptions",
@@ -3171,6 +3174,12 @@ const MENU_COMMAND_SPECS: &[MenuCommandSpec] = &[
         id: MenuCommandId::CollectionsReorderCurrent,
         parent: TopMenuId::Collections,
         label: "現在のコレクションを並べ替え…",
+        action: None,
+    },
+    MenuCommandSpec {
+        id: MenuCommandId::CollectionsRemoveMissingCurrent,
+        parent: TopMenuId::Collections,
+        label: "見つからない項目をすべて外す…",
         action: None,
     },
     MenuCommandSpec {
@@ -12786,6 +12795,51 @@ mod tests {
             .clone();
         assert!(!commands.contains(&MenuCommandId::CollectionsRelinkCurrent));
         assert!(commands.contains(&MenuCommandId::CollectionsReorderCurrent));
+    }
+
+    #[test]
+    fn collection_missing_removal_is_menu_only_and_appends_to_saved_layouts() {
+        let id = MenuCommandId::CollectionsRemoveMissingCurrent;
+        assert_eq!(
+            MenuCommandId::parse_stable_name("CollectionsRemoveMissingCurrent"),
+            Some(id)
+        );
+        let spec = menu_command_spec(id).unwrap();
+        assert_eq!(spec.parent, TopMenuId::Collections);
+        assert_eq!(spec.label, "見つからない項目をすべて外す…");
+        assert_eq!(spec.action, None);
+        let commands: Vec<_> = menu_commands_for_parent(TopMenuId::Collections)
+            .map(|spec| spec.id)
+            .collect();
+        let reorder = commands
+            .iter()
+            .position(|command| *command == MenuCommandId::CollectionsReorderCurrent)
+            .unwrap();
+        assert_eq!(commands[reorder + 1], id);
+        let old_commands: Vec<_> = commands
+            .iter()
+            .copied()
+            .filter(|command| *command != id)
+            .collect();
+        let saved = MenuLayoutSettings {
+            command_order: vec![MenuCommandOrderSettings {
+                parent: "Collections".into(),
+                commands: old_commands
+                    .iter()
+                    .map(|command| command.stable_name().to_owned())
+                    .collect(),
+            }],
+            ..Default::default()
+        };
+        let resolved = resolve_menu_layout(&saved);
+        let actual = &resolved
+            .menus
+            .iter()
+            .find(|menu| menu.id == TopMenuId::Collections)
+            .unwrap()
+            .commands;
+        assert_eq!(&actual[..actual.len() - 1], old_commands.as_slice());
+        assert_eq!(actual.last(), Some(&id));
     }
 
     #[test]

@@ -4,6 +4,8 @@
 要件の正本は [next-release-backlog.md §1.464・§1.821](next-release-backlog.md)。
 **状態: 設計 r5 (利用者から独立レビュー ACCEPT の報告あり)。A は `6f91f6058`。B は §14・§16 の判断を反映して実装。検証・引き渡しの記録は §15。コンパイル・テストは利用者指示により設計担当へ引き継ぐ。**
 
+- 2026-11-22: §1.858 A 中断状態の常時照会、元の HRESULT と項目別ログ、処理済み件数による通知を追加。
+
 要望の要旨 (5ch): >>444 ツリーへファイルをドロップできず、右クリックの貼り付けもできない。>>707 読み終えたファイルを
 `_mita` フォルダへ D&D したい (内部ドラッグで「＋」カーソルなのに何も起きない)。固定先へ送る「ファイル整理先」(v4.4.0 出荷)
 はこの要望の代替扱いにしない (backlog の記録)。
@@ -112,7 +114,9 @@ Shift の明示の移動は下げない。要求は `operation` と `default_mov
 - mIV の target は `IDropTargetHelper` (`CLSID_DragDropHelper`) の DragEnter/Over/Leave/Drop を呼ぶ (自分の窓の上に drag image を描かせる)。
 - ツリー行の上では data object へ `CFSTR_DROPDESCRIPTION` を `SetData` する: 予想が移動なら `DROPIMAGE_MOVE` + 「%1 へ移動」、
   コピーなら `DROPIMAGE_COPY` + 「%1 へコピー」、受け付けないなら `DROPIMAGE_NONE`。%1 はフォルダ名。変わったときだけ書く。
-  行を離れたら・DragLeave・Drop の後は `DROPIMAGE_INVALID` に戻す (古い説明を残さない)。
+  行を離れて落とせない場所 (一覧の空白・ツリーの行以外・同じ一覧など) へ動いたら `DROPIMAGE_NONE` (§1.844。`INVALID` では
+  Shell の既定の「＋ コピー」が出ることを §1.836 のサブ PC 確認で観測)。`DROPIMAGE_INVALID` は、受け付ける外部からの一覧への
+  ドロップと、DragLeave・Drop の後のリセット (古い説明を残さない) だけに使う。正本の詳細は file-drag-drop-design §12.3.1。
 - 送出側は何も足さない (`IDragSourceHelper2::SetFlags` は helper 自身の設定で data object と結び付かないため使わない。§14)。
   Shell の generic image のまま、target が書く説明のバッジ (type) で移動かコピーかを示す。テキストが出るかは実機確認で見る。
 
@@ -234,7 +238,7 @@ callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `Get
 - 直し方: `handle_external_file_drop` の受付 (検索結果・タグ表示中・ZIP/PDF 表示中・本棚配下の拒否、`admit_book_append_followup_mutation`) と
   `file-drop-validate` worker・`drop_copy_pending` の並行受信はそのまま。worker の中のコピーを、整理先と同じ検証 + `IFileOperation` Copy
   (`shell_file_ops` の同期関数を worker から呼ぶ。`operation: Copy`) に替える。同名の衝突・進捗・取消・エラーは Windows の画面。
-  結果は今の `CopyOutcome` に写す (中断 → 「操作が中断されました。処理済みの項目は元に戻りません」、失敗 → 全件失敗の通知)。
+  結果は `CopyOutcome` に写す (実行後の中断・失敗は §8.1 の共通 notice、実行前の `Err` は従来の全件失敗通知)。
   `copy_paths_into_folder` と PowerShell の経路は削除する。
 - **フォルダも受ける (Q5)**: `partition_dropped_paths` によるフォルダの skip と「フォルダのドロップは現在無効です」の通知をやめる。
   フォルダを自身や配下へコピーする組み合わせは `validate_transfer_request` が全体を拒否する (未使用の `dir_copy_would_recurse` は削除)。
@@ -246,6 +250,85 @@ callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `Get
 実装 A: `shell_file_ops::transfer_items_blocking` に検証と STA 転送を集約し、`transfer_items_async` も共有する。
 `handle_external_file_drop` の worker は `main_hwnd` と全パスを `file_drag::copy_dropped_paths_blocking` へ渡し、結果を `CopyOutcome` に写す。
 旧 PowerShell コピー・フォルダ skip・未使用の再帰判定を削除。既存の受付・並行受信・`pending_reload` は維持する。
+
+### 8.1 §1.858 A Shell 転送・名前変更の終端契約
+
+予約が全件成功したら `PerformOperations` を一回実行し、成功・失敗にかかわらず直後に `GetAnyOperationsAborted` を必ず呼ぶ。
+実行の元の HRESULT と、中断照会の `Result<bool, HRESULT>` は独立して保持する。照会失敗を false にせず、実行のエラーも上書きしない。
+検証・COM 構築・項目生成・予約の失敗は従来どおり `Err(String)` で実行しない。
+
+| 分類 | 条件 (上から優先) |
+| --- | --- |
+| Interrupted | 中断照会が `Ok(true)`、または実行 HRESULT が `0x80270000` / `0x800704C7` |
+| Completed | 実行が成功 HRESULT かつ中断照会が `Ok(false)` |
+| Failed | 上記以外 (中断照会失敗も含む) |
+
+Interrupted と別の実行失敗が同時にある場合、その HRESULT も表示する。中断の原因は利用者・Shell の画面・システムのいずれとも断定しない。
+名前変更の新旧パスの事後確認と移行は Completed の場合だけ行う。操作、予約の時機、検証、通常の
+`FOF_ALLOWUNDO | FOFX_ADDUNDORECORD` は維持し、自動再試行・rollback は追加しない。
+
+`MoveItem / CopyItem / RenameItem` に同じ操作の `IFileOperationProgressSink` を渡す。Advise の登録・解除状態を増やさず、
+`PostMoveItem / PostCopyItem / PostRenameItem` で操作種別、元の parsing name、先フォルダ、新名、HRESULT、作成後の parsing name を記録する。
+callback は失敗の HRESULT を受けても常に S_OK を返す。フォルダの子の callback も全件集計し、詳細は先頭50件と省略数に限定する。
+`COPYENGINE_S_PENDING` (`0x0027000B`) は未処理の途中報告であり、ログ用 pending だけを増やし、確定結果の processed / failed / cancelled / skipped には数えない。
+後続の同じ元の確定 callback で一件を数える。確定報告が来なければ未処理として数えない。元パスをキーにした管理表は作らず、途中報告も詳細行へ残す。
+`COPYENGINE_S_NOT_HANDLED` (`0x00270003`) / `COPYENGINE_S_MERGE` (`0x00270006`) も結合開始の途中報告としてログ用 merged のみを増やす。
+作成後 item が既存の先フォルダを指していても、親を processed / skipped に数えず、子の callback で結果を数える。
+根拠は [Wine の shlfileop.c `notifications6`](https://github.com/wine-mirror/wine/blob/master/dlls/shell32/tests/shlfileop.c) が示す親の報告→子の処理の順序。
+中断 HRESULT (`0x80270000` / `0x800704C7`) は cancelled、その他の失敗 HRESULT は failed、その他の成功 HRESULT は
+callback の作成後 item (`psiNewlyCreated`) が非 null なら processed、null なら skipped に数える。
+parsing name の取得成否ではなく item の有無を使い、詳細上限を超えた callback と名前変更も同じ規則で数える。
+最初の実失敗 (中断コードを除く) HRESULT は詳細上限に関係なく `first_failed_hresult` に保持する。
+省略数は確定結果の合計ではなく、pending / merged も含む callback 総数から詳細保持数を引いて求める。
+2026-11-22 設計担当の Windows 11 / NTFS 実 Shell 観測では、完了した同一ボリューム Move が
+`COPYENGINE_S_DONT_PROCESS_CHILDREN` (`0x00270008`) と作成後 item を返したため、成功コードの列挙で処理済みを判定しない。
+また、使用中フォルダの Move は試験用 UI 抑止時に実行 HRESULT が S_OK、中断照会が `Ok(true)`、項目 callback が失敗だった。
+確定結果は確定 callback の件数、pending / merged は途中報告の件数であり、要求した source 件数とは限らない。まれな記録失敗はログで終え、回復機構は作らない。
+
+2026-11-23 sub-PC2 の実アプリ確認 (c4db2bbd3) では、Windows の使用中画面を閉じる操作の後、同じ元の pending → 中断の2報告を観測した。
+pending を確定結果から除き、中断を実失敗と分ける。名前変更も同じ規則。
+
+結合時の本機の生 callback 列は ignored の `shell_op_858_real_merge_into_existing_folder_records_callbacks` で確認する。
+正常 Move、子ファイルを FILE_SHARE_READ だけで開いた Move、正常 Copy、空フォルダ Move の4ケースを出力し、特定の結合コードの出現は要求しない。
+2026-11-23 に開発機 (Windows 11、NTFS、同じボリューム、エラー画面を出さない試験用フラグ) で流した結果 (設計担当が run-heavy で実行、製品は起動していない):
+- 正常 Move: 親 `m` が `0x00270003` + 先 item あり、子 `a.txt` が `0x00270008` + 先 item あり → merged=1、processed=1。
+- 子を開いたままの Move: 親 `m` が `0x80270027` + 先 item なしの 1 報告だけ → failed=1、processed=0、中断状態 true。
+- 正常 Copy: 親 `m` も子 `a.txt` も `0x00000000` + 先 item あり → processed=2。
+- 空フォルダ `e` を既存の `dst\e` へ Move: `e` が `0x00270008` + 先 item ありの 1 報告 → processed=1、元 `src\e` は消えた。結合コードは出なかった。
+
+残る限界: Copy の結合では、既存の親フォルダも `S_OK` + 先 item で報告されるため、新しく作ったフォルダと区別できず processed に数える。
+子のコピーが止まった場合は、何も増えていなくても「一部の項目は処理済みです。フォルダの内容を確認してください」になり得る。
+これは「確認を促す」側への誤りなので、追加の判定 (フォルダの事前存在の確認など) は足さない。逆向きの誤り (処理済みがあるのに「ありません」) は作らない。
+
+空フォルダの Move 結合は、子の callback がなくても元フォルダが削除され得るため、merged のみでも「移動・コピーした項目はありません」とは断定しない。
+空フォルダの追加ケース (d) は、元 `src\e` の残存／消失を生 callback とともに出力し、どちらも許容する。件数は failed=0 だけを要求する。
+開発機では上記のとおり結合コードが出なかったが、別の環境 (Wine の実装が示す経路) で merged のみになる場合に備えて、中立の通知を残す。
+
+ログ形式 (`prefix` は `shell_transfer` / `shell_rename`、id はプロセス内共通の連番、文字列は Debug 表記):
+項目行は終端でまとめて書くため、ログの時刻は終端時刻であり callback の発生時刻ではない。
+
+```text
+{prefix}: start id={id} requested={Copy|Move|Rename} resolved={Copy|Move|Rename} sources={count} destination={path:?}
+{prefix}: item id={id} kind={Copy|Move|Rename} source={Option<String>:?} destination={Option<String>:?} new_name={Option<String>:?} hr=0x{HRESULT:08X} created={Option<String>:?}
+{prefix}: item id={id} ... and {omitted} more
+{prefix}: end id={id} classification={Completed|Interrupted|Failed} perform=0x{HRESULT:08X} abort={Ok(true)|Ok(false)|Err(0xHHHHHHHH)} processed={count} failed={count} cancelled={count} skipped={count} pending={count} merged={count} first_failed_hresult={0xHHHHHHHH|None}
+```
+
+開始行は全件予約後、実行直前に出す。requested は volume check 前、resolved は後の操作。名前変更は両方 Rename、先は元の親。
+詳細と終端は中断照会後に出す。UI は以下の短い共通通知を使う (Completed は通知なし)。
+
+- Interrupted、処理済みあり: 「操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください」
+- Interrupted、処理済みなし・merged あり (名前変更以外): 「操作が中断されました。フォルダの内容を確認してください」
+- Interrupted、処理済みなし・merged なし: 「操作が中断されました。移動・コピーした項目はありません」。名前変更は merged の有無にかかわらず「名前の変更は中断されました」。
+- Interrupted、実失敗項目あり (`failed > 0`): 2行目に `失敗した項目: {n} 件 (Shell: 0x{hr:08X})` (最初の実失敗 HRESULT) を追加する。
+  中断コードだけなら見出しのみで、pending / merged / cancelled の件数や失敗行を出さない。
+- Failed: 「操作を完了できませんでした。フォルダの内容を確認してください」。処理済みありなら同じ行に「一部の項目は処理済みです」を続ける。
+  次行は `Shell: 0xHHHHHHHH、中断状態: 中断あり / 中断なし / 照会失敗 0xHHHHHHHH`。
+  最初の実失敗 HRESULT が実行 HRESULT と異なる場合は `、項目: 0xHHHHHHHH` を理由行の末尾へ追加する。中断コードはこの項目理由に使わない。
+  Interrupted でも非 cancel の実行失敗または照会失敗があれば、この理由行を併記する (項目失敗行があればその後)。
+
+整理先・ツリーは全結果で従来の tree observe + 現在実フォルダの再確認、外部から一覧へのコピーは全結果で従来の `pending_reload` を維持する。
+実行後の結果を「全要求が成功／失敗」と推測して `CopyOutcome` の要求件数へ当てはめず、共通 notice で知らせる。
 
 ## 9. 長い処理・取り消し・衝突・完了後の更新
 

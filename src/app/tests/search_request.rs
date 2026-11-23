@@ -812,7 +812,7 @@ fn search_name_snapshot_retires_completed_search_before_prefill_sort_and_enter()
                 crate::settings::SortOrder::RatingDesc,
             ] {
                 app.settings.sort_order = sort;
-                app.apply_sort_change_reload_without_ui_io();
+                app.apply_sort_change_reload();
                 for _ in 0..8 {
                     app.poll_global_search_events(&ctx);
                     app.poll_global_search_debounce(&ctx);

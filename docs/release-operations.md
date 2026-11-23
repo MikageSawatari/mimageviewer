@@ -239,6 +239,9 @@ perf/idle検証および実アプリsmokeの実行前に適用する。必須検
 - stale テストは「設計が変わった (期待が古い)」のか「実バグ」かを切り分けてから直す。
 - 単体テストと hitch 検査だけでは、短い work を高速で再投入する「速い無限ループ」を
   検出できない。**毎リリースの正規手順はReleaseChecks suite**（2026-10-11利用者採用）。
+  **2026-11-21 から、公開前にサブ PC のキットで流す** (作成・依頼・照合の手順は
+  [リリース手順チェックリスト](release-checklist.md) 9.6、キットの仕組みは
+  [自動化計画 §11](release-check-automation-plan.md#relcheck-subpc-kit))。以下はメイン PC で流す場合の経路。
   利用者がrepository rootのPowerShellで次を実行する:
 
   ```powershell

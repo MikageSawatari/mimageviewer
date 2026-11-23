@@ -561,6 +561,26 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["クリップボード", "HTML", "ページ", "画像", "コピー", "監視"]
     ),
     entry!(
+        "browser-integration/enabled",
+        BrowserIntegration,
+        "ブラウザ連携を使う",
+        [
+            "ブラウザ",
+            "Chrome",
+            "Edge",
+            "連携",
+            "登録",
+            "解除",
+            "mIV で見る"
+        ]
+    ),
+    entry!(
+        "browser-integration/folder",
+        BrowserIntegration,
+        "ブラウザ閲覧の保存先",
+        ["ブラウザ", "保存先", "保存場所", "フォルダ", "既定に戻す"]
+    ),
+    entry!(
         "capture/folder",
         Capture,
         "保存先フォルダ",
@@ -1272,6 +1292,26 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ]
     ),
     entry!(
+        "spread/wheel-zoom-step",
+        SpreadMode,
+        "ホイールでの拡大・縮小の刻み",
+        [
+            "ホイール",
+            "拡大",
+            "縮小",
+            "刻み",
+            "倍率",
+            "ズーム",
+            "Ctrl",
+            "5%",
+            "10%",
+            "20%",
+            "30%",
+            "50%",
+            "100%"
+        ]
+    ),
+    entry!(
         "spread/n-scroll-order",
         SpreadMode,
         "N 字スクロールの順序",
@@ -1291,10 +1331,36 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["滑らか", "スムーズ", "N 字", "Z 字", "キー", "ホイール"]
     ),
     entry!(
+        "spread/bound-drag-pan",
+        SpreadMode,
+        "閲覧時のドラッグ移動を画像の端までに制限する",
+        ["ドラッグ", "パン", "移動", "端", "制限", "余白"]
+    ),
+    entry!(
         "spread/n-scroll-step",
         SpreadMode,
         "順に読む操作 (N 字 / Z 字) 1 回",
         [
+            "ページ内スクロール",
+            "スクロール量",
+            "移動量",
+            "割合",
+            "%",
+            "K",
+            "J"
+        ]
+    ),
+    entry!(
+        "spread/n-scroll-wrap-step",
+        SpreadMode,
+        "列 / 段を替えるときは別の移動量にする",
+        [
+            "列",
+            "段",
+            "折り返し",
+            "重なり",
+            "N 字",
+            "Z 字",
             "ページ内スクロール",
             "スクロール量",
             "移動量",
@@ -1799,6 +1865,7 @@ mod tests {
     const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
     const NAME_COLORS_SOURCE: &str = include_str!("name_colors.rs");
     const DEPTH_ADDON_SOURCE: &str = include_str!("../depth_addon.rs");
+    const BROWSER_INTEGRATION_SOURCE: &str = include_str!("browser_integration.rs");
 
     #[test]
     fn same_name_folder_book_choice_queries_target_the_existing_anchor() {
@@ -1935,7 +2002,10 @@ mod tests {
     #[test]
     fn index_entries_are_unique_valid_and_placed_in_pages() {
         let mut anchors = HashSet::new();
-        let placed: HashSet<_> = anchors_in_pages_source(PAGES_SOURCE).into_iter().collect();
+        let placed: HashSet<_> = anchors_in_pages_source(PAGES_SOURCE)
+            .into_iter()
+            .chain(anchors_in_pages_source(BROWSER_INTEGRATION_SOURCE))
+            .collect();
         for entry in PREF_SEARCH_INDEX {
             assert!(
                 anchors.insert(entry.anchor),
@@ -1968,6 +2038,12 @@ mod tests {
                             .contains("crate::ui_raw::draw_settings(ui, &mut state.settings)")
                     );
                     RAW_SETTINGS_SOURCE
+                } else if entry.anchor.starts_with("browser-integration/") {
+                    assert!(
+                        PREFERENCES_SOURCE
+                            .contains("PreferencesPage::BrowserIntegration => browser_integration::page(ui, state)")
+                    );
+                    BROWSER_INTEGRATION_SOURCE
                 } else if entry.anchor == "depth-addon/manage" {
                     assert!(PAGES_SOURCE.contains(
                         "super::super::depth_addon::draw_preferences(ui, &state.depth_view)"
@@ -2306,6 +2382,36 @@ mod tests {
                 .into_iter()
                 .find(|entry| entry.anchor == anchor)
                 .expect("ページ内スクロール設定が検索できる");
+            assert_eq!(entry.page, PreferencesPage::SpreadMode);
+        }
+    }
+
+    #[test]
+    fn section1856_wheel_zoom_step_setting_is_searchable() {
+        for query in [
+            "ホイール",
+            "拡大",
+            "縮小",
+            "刻み",
+            "倍率",
+            "ズーム",
+            "ホイール 倍率",
+        ] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "spread/wheel-zoom-step")
+                .expect("ホイールズームの刻みが検索できる");
+            assert_eq!(entry.page, PreferencesPage::SpreadMode);
+        }
+    }
+
+    #[test]
+    fn fullscreen_bound_drag_pan_setting_is_searchable() {
+        for query in ["ドラッグ", "パン", "移動", "端", "制限", "余白"] {
+            let entry = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "spread/bound-drag-pan")
+                .expect("閲覧時のドラッグ移動制限が検索できる");
             assert_eq!(entry.page, PreferencesPage::SpreadMode);
         }
     }

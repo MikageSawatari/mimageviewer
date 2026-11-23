@@ -22,7 +22,8 @@ use super::top_level_grid_view::{
 use super::{App, CollectionMainContextChange, GridItem, GridSortLockReason, ViewerContextId};
 use crate::collection_store::{
     CollectionEntryId, CollectionId, CollectionOrderMode, CollectionPrepareError,
-    CollectionPreparedSnapshot, CollectionStoreError, prepare_collection_snapshot,
+    CollectionPreparedSnapshot, CollectionRemovableMissingEntry, CollectionStoreError,
+    prepare_collection_snapshot,
 };
 
 #[cfg(test)]
@@ -160,6 +161,55 @@ pub(crate) struct CollectionGridContentTarget {
     pub(crate) stamp: CollectionGridRequestStamp,
     pub(crate) expected_revision: u64,
     pub(crate) selected_entry_id: Option<CollectionEntryId>,
+}
+
+/// The immutable preparation owns both the count and the exact entries offered by either menu.
+#[derive(Clone, Debug)]
+pub(crate) enum CollectionMissingRemovalAvailability {
+    NotOffered,
+    Unavailable {
+        count: Option<usize>,
+        reason: &'static str,
+    },
+    Ready {
+        target: CollectionGridContentTarget,
+        entries: Arc<[CollectionRemovableMissingEntry]>,
+    },
+}
+
+impl CollectionMissingRemovalAvailability {
+    pub(crate) fn count(&self) -> Option<usize> {
+        match self {
+            Self::NotOffered => None,
+            Self::Unavailable { count, .. } => *count,
+            Self::Ready { entries, .. } => Some(entries.len()),
+        }
+    }
+
+    pub(crate) fn disabled_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::NotOffered => Some("コレクション直下を開くと使用できます"),
+            Self::Unavailable { reason, .. } => Some(reason),
+            Self::Ready { .. } => None,
+        }
+    }
+}
+
+/// Shared read-only proof for mounted App and parked ContextRef. No reconciliation or polling.
+pub(in crate::app) fn collection_grid_request_stamp_matches(
+    context_id: ViewerContextId,
+    view: &super::top_level_grid_view::TopLevelGridView,
+    items_generation: u64,
+    stamp: CollectionGridRequestStamp,
+) -> bool {
+    context_id == stamp.context_id
+        && view.generation() == stamp.surface_generation
+        && matches!(view.surface(), TopLevelGridSurface::Collection(identity)
+            if identity.collection_id == stamp.collection_id)
+        && view.collection_session().is_some_and(|session| {
+            matches!(session.position, CollectionGridPosition::Root)
+                && session.installed_items_generation == Some(items_generation)
+        })
 }
 
 /// The visible order is read from the exact installed root, never from the independently
@@ -770,14 +820,28 @@ impl App {
         &self,
         stamp: CollectionGridRequestStamp,
     ) -> bool {
-        self.collection_grid_stamp_is_current(stamp)
-            && self
-                .top_level_grid_view
-                .collection_session()
-                .is_some_and(|session| {
-                    matches!(session.position, CollectionGridPosition::Root)
-                        && session.installed_items_generation == Some(self.items_generation)
-                })
+        collection_grid_request_stamp_matches(
+            self.collection_grid_context_id(),
+            &self.top_level_grid_view,
+            self.items_generation,
+            stamp,
+        )
+    }
+
+    /// Validate in the origin's residence without mounting it or consuming any pending updates.
+    pub(crate) fn collection_grid_origin_stamp_is_current(
+        &self,
+        stamp: CollectionGridRequestStamp,
+    ) -> bool {
+        #[cfg(windows)]
+        {
+            self.with_viewer_context_ref(stamp.context_id, |context| {
+                context.collection_grid_request_stamp_is_current(stamp.context_id, stamp)
+            })
+            .unwrap_or(false)
+        }
+        #[cfg(not(windows))]
+        self.collection_grid_request_stamp_is_current(stamp)
     }
 
     pub(crate) fn collection_grid_content_target(
@@ -856,6 +920,49 @@ impl App {
             mode: prepared.order_mode,
             standard_sort: prepared.standard_sort,
         }))
+    }
+
+    pub(crate) fn collection_grid_missing_removal(&self) -> CollectionMissingRemovalAvailability {
+        let order = match self.collection_grid_root_order() {
+            None => return CollectionMissingRemovalAvailability::NotOffered,
+            Some(Err(reason)) => {
+                return CollectionMissingRemovalAvailability::Unavailable {
+                    count: None,
+                    reason: reason.tooltip(),
+                };
+            }
+            Some(Ok(order)) => order,
+        };
+        // Count only the exact installed preparation proven current by root_order.
+        let prepared = self
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .prepared()
+            .unwrap();
+        let count = prepared.removable_missing.len();
+        if !self.grid_item_input_allowed() {
+            return CollectionMissingRemovalAvailability::Unavailable {
+                count: Some(count),
+                reason: "処理中…",
+            };
+        }
+        if !self.collection_ui_missing_removal_editable() {
+            return CollectionMissingRemovalAvailability::Unavailable {
+                count: Some(count),
+                reason: "コレクションを現在編集できません",
+            };
+        }
+        if count == 0 {
+            return CollectionMissingRemovalAvailability::Unavailable {
+                count: Some(0),
+                reason: "見つからない項目はありません",
+            };
+        }
+        CollectionMissingRemovalAvailability::Ready {
+            target: order.content,
+            entries: Arc::clone(&prepared.removable_missing),
+        }
     }
 
     /// すべての UI / ring のコレクション順要求を同じ no-op・lock 規則へ通す。
@@ -957,6 +1064,7 @@ impl App {
         let Some(prepared) = session.prepared() else {
             return;
         };
+        let removed: std::collections::HashSet<_> = removed.iter().copied().collect();
         let removed_indices = prepared
             .entries
             .iter()
@@ -4148,6 +4256,728 @@ mod tests {
         }
     }
 
+    /// §1.851 follow-up: the File menu "最新の情報に更新" (`reload_top_level_grid`) on the
+    /// collection root reclassifies sources in both directions, even though the actor revision
+    /// does not change, and the "remove all missing" count follows it.
+    #[test]
+    fn collection_reload_reclassifies_missing_and_restored_sources_at_same_revision() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let folder = temp.path().join("album");
+        let renamed = temp.path().join("album-renamed");
+        std::fs::create_dir(&folder).unwrap();
+        let image = folder.join("a.png");
+        std::fs::write(&image, b"png").unwrap();
+        let snapshot =
+            collection_with_sources(&client, &[(image.clone(), CollectionResolvedKind::Image)]);
+        let revision = snapshot.revision();
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert_eq!(app.items, vec![GridItem::Image(image.clone())]);
+        assert_eq!(app.collection_grid_missing_removal().count(), Some(0));
+
+        let ctx = egui::Context::default();
+        let assert_revision = |app: &App| {
+            assert_eq!(
+                app.top_level_grid_view
+                    .collection_session()
+                    .unwrap()
+                    .prepared()
+                    .unwrap()
+                    .collection_revision,
+                revision
+            );
+        };
+
+        std::fs::rename(&folder, &renamed).unwrap();
+        let generation = app.items_generation;
+        app.reload_top_level_grid(&ctx);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert_ne!(app.items_generation, generation);
+        assert_revision(&app);
+        assert!(matches!(
+            app.items.as_slice(),
+            [GridItem::CollectionPlaceholder {
+                reason: crate::grid_item::CollectionPlaceholderReason::Missing,
+                ..
+            }]
+        ));
+        assert_eq!(app.collection_grid_missing_removal().count(), Some(1));
+
+        std::fs::rename(&renamed, &folder).unwrap();
+        let generation = app.items_generation;
+        app.reload_top_level_grid(&ctx);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert_ne!(app.items_generation, generation);
+        assert_revision(&app);
+        assert_eq!(app.items, vec![GridItem::Image(image)]);
+        assert_eq!(app.collection_grid_missing_removal().count(), Some(0));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_missing_removal_availability_rejects_retained_stale_and_busy_listings() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        assert!(matches!(
+            app.collection_grid_missing_removal(),
+            CollectionMissingRemovalAvailability::NotOffered
+        ));
+        let snapshot = collection_with_sources(
+            &client,
+            &[(
+                temp.path().join("missing.png"),
+                CollectionResolvedKind::Image,
+            )],
+        );
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let target = app.collection_grid_content_target().unwrap();
+        let prepared = Arc::clone(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .prepared()
+                .unwrap(),
+        );
+        let CollectionMissingRemovalAvailability::Ready {
+            target: ready,
+            entries,
+        } = app.collection_grid_missing_removal()
+        else {
+            panic!("ready missing references")
+        };
+        assert_eq!(target, ready);
+        assert_eq!(entries.len(), 1);
+        assert!(Arc::ptr_eq(&entries, &prepared.removable_missing));
+        let unavailable = |app: &App, reason: GridSortLockReason| {
+            assert!(
+                matches!(app.collection_grid_missing_removal(), CollectionMissingRemovalAvailability::Unavailable { count: None, reason: actual } if actual == reason.tooltip())
+            );
+        };
+        let lease = || {
+            crate::collection_store::CollectionReadLease::dormant(
+                crate::collection_store::CollectionReadScope::app_global("grid"),
+            )
+        };
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::RequestNeeded {
+            installed: Some(Arc::clone(&prepared)),
+            lease: lease(),
+        };
+        unavailable(&app, GridSortLockReason::CollectionLoading);
+        let (_snapshot_tx, snapshot_rx) = crossbeam_channel::unbounded();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Snapshot {
+            stamp: target.stamp,
+            minimum_revision: target.expected_revision,
+            lease: lease(),
+            queued_at: None,
+            installed: Some(Arc::clone(&prepared)),
+            receiver: snapshot_rx,
+        };
+        unavailable(&app, GridSortLockReason::CollectionLoading);
+        let (_prepare_tx, prepare_rx) = std::sync::mpsc::channel();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Preparing {
+            stamp: target.stamp,
+            exact_revision: target.expected_revision,
+            lease: lease(),
+            installed: Some(Arc::clone(&prepared)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            receiver: prepare_rx,
+        };
+        unavailable(&app, GridSortLockReason::CollectionLoading);
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Failed {
+            message: "failure".into(),
+            installed: Some(Arc::clone(&prepared)),
+        };
+        unavailable(&app, GridSortLockReason::CollectionFailed);
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Deleted {
+            installed: Some(Arc::clone(&prepared)),
+        };
+        unavailable(&app, GridSortLockReason::CollectionDeleted);
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Ready(
+            CollectionGridInstalledPresentation::without_thumbnail_sources(Arc::clone(&prepared)),
+        );
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .wanted_revision += 1;
+        unavailable(&app, GridSortLockReason::CollectionStale);
+        app.fullscreen_idx = Some(0);
+        unavailable(&app, GridSortLockReason::CollectionViewerDeferred);
+        app.fullscreen_idx = None;
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .wanted_revision = prepared.collection_revision;
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .installed_items_generation = None;
+        unavailable(&app, GridSortLockReason::CollectionStale);
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .installed_items_generation = Some(app.items_generation);
+        let mut wrong = (*prepared).clone();
+        wrong.collection_id = CollectionId::new();
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Ready(
+            CollectionGridInstalledPresentation::without_thumbnail_sources(Arc::new(wrong)),
+        );
+        unavailable(&app, GridSortLockReason::CollectionStale);
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Ready(
+            CollectionGridInstalledPresentation::without_thumbnail_sources(Arc::clone(&prepared)),
+        );
+        app.collection_ui.set_read_phase_for_test(true);
+        assert!(matches!(
+            app.collection_grid_missing_removal(),
+            CollectionMissingRemovalAvailability::Unavailable {
+                count: Some(1),
+                reason: "コレクションを現在編集できません"
+            }
+        ));
+        app.collection_ui.set_read_phase_for_test(false);
+        let view = Arc::new(crate::filename_stack::StackView::build(
+            temp.path().to_path_buf(),
+            vec![],
+            vec![],
+            vec![],
+            '_',
+            crate::settings::SortOrder::FileName,
+        ));
+        app.stack_view = Some(Arc::clone(&view));
+        app.stack_return_state =
+            Some(crate::filename_stack_ui::StackReturnState::Refreshing { view });
+        assert!(!app.grid_item_input_allowed());
+        assert!(matches!(
+            app.collection_grid_missing_removal(),
+            CollectionMissingRemovalAvailability::Unavailable {
+                count: Some(1),
+                reason: "処理中…"
+            }
+        ));
+        app.stack_view = None;
+        app.stack_return_state = None;
+        let mut empty = (*prepared).clone();
+        empty.removable_missing = Arc::from([]);
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Empty(
+            CollectionGridInstalledPresentation::without_thumbnail_sources(Arc::new(empty)),
+        );
+        assert!(matches!(
+            app.collection_grid_missing_removal(),
+            CollectionMissingRemovalAvailability::Unavailable {
+                count: Some(0),
+                reason: "見つからない項目はありません"
+            }
+        ));
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Ready(
+            CollectionGridInstalledPresentation::without_thumbnail_sources(Arc::clone(&prepared)),
+        );
+        app.request_collection_grid_remove(CollectionGridRemoveTarget {
+            stamp: target.stamp,
+            expected_revision: target.expected_revision,
+            entry_ids: vec![prepared.entries[0].entry_id],
+        });
+        assert!(matches!(
+            app.collection_grid_missing_removal(),
+            CollectionMissingRemovalAvailability::Unavailable {
+                count: Some(1),
+                reason: "コレクションを現在編集できません"
+            }
+        ));
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .position = CollectionGridPosition::PhysicalSource {
+            entry_id: prepared.entries[0].entry_id,
+            source_key: prepared.entries[0].source_key.clone(),
+            path: temp.path().to_path_buf(),
+        };
+        assert!(matches!(
+            app.collection_grid_missing_removal(),
+            CollectionMissingRemovalAvailability::NotOffered
+        ));
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_missing_removal_counts_hidden_types_after_worker_install() {
+        use crate::file_type_visibility::FileTypeCategory;
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(
+            &client,
+            &[
+                (
+                    temp.path().join("hidden.png"),
+                    CollectionResolvedKind::Image,
+                ),
+                (temp.path().join("hidden.zip"), CollectionResolvedKind::Zip),
+                (
+                    temp.path().join("visible.jpg"),
+                    CollectionResolvedKind::Image,
+                ),
+            ],
+        );
+        app.settings
+            .file_type_visibility
+            .excluded_extensions
+            .insert("png".into());
+        app.settings
+            .file_type_visibility
+            .excluded_categories
+            .insert(FileTypeCategory::Zip);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        assert_eq!(app.items.len(), 1);
+        let CollectionMissingRemovalAvailability::Ready { entries, .. } =
+            app.collection_grid_missing_removal()
+        else {
+            panic!("hidden Missing references must still be offered")
+        };
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.entry_id)
+                .collect::<Vec<_>>(),
+            snapshot
+                .entries
+                .iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>()
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn collection_remove_large_success_preserves_survivors_and_sibling_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let keep = temp.path().join("keep.png");
+        std::fs::write(&keep, b"keep").unwrap();
+        let snapshot = collection_with_sources(&client, &[(keep, CollectionResolvedKind::Image)]);
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let mut prepared = (**app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .prepared()
+            .unwrap())
+        .clone();
+        let keep = prepared.entries[0].clone();
+        let mut entries = vec![keep.clone()];
+        let mut removed = Vec::with_capacity(10_001);
+        for index in 0..10_000 {
+            let path = temp.path().join(format!("missing-{index}.png"));
+            let mut entry = keep.clone();
+            entry.entry_id = CollectionEntryId::new();
+            entry.source_key =
+                crate::collection_store::CollectionSourcePath::from_trusted(path.clone())
+                    .unwrap()
+                    .key()
+                    .clone();
+            entry.source_path = path.clone();
+            entry.availability = crate::collection_store::CollectionSourcePreparation::Missing;
+            entry.item = GridItem::CollectionPlaceholder {
+                path,
+                last_known_kind: CollectionResolvedKind::Image,
+                reason: crate::grid_item::CollectionPlaceholderReason::Missing,
+            };
+            removed.push(entry.entry_id);
+            entries.push(entry);
+        }
+        // A removed registration may be hidden by the display policy and have no row index.
+        removed.push(CollectionEntryId::new());
+        prepared.entries = entries.into();
+        prepared.registered_total = prepared.entries.len() + 1;
+        let prepared = Arc::new(prepared);
+        app.items = prepared
+            .entries
+            .iter()
+            .map(|entry| entry.item.clone())
+            .collect();
+        app.image_metas = vec![None; app.items.len()];
+        app.top_level_grid_view
+            .collection_session_mut()
+            .unwrap()
+            .load = CollectionGridLoadState::Ready(
+            CollectionGridInstalledPresentation::without_thumbnail_sources(Arc::clone(&prepared)),
+        );
+        app.selected = Some(0);
+        app.checked = [0, 1, 10_000].into_iter().collect();
+        let stamp = app.collection_grid_content_target().unwrap().stamp;
+        let sibling = app.build_window_context_for_test(1853, |owner| {
+            owner.items = vec![keep.item.clone()];
+            owner.visible_indices = vec![0];
+            owner.selected = Some(0);
+            owner.checked.insert(0);
+        });
+        let sibling_state = |owner: &App| {
+            (
+                owner.items.clone(),
+                owner.visible_indices.clone(),
+                owner.items_generation,
+                owner.selected,
+                owner.checked.clone(),
+            )
+        };
+        let before = app
+            .with_viewer_context_state(sibling, |owner| sibling_state(owner))
+            .unwrap();
+        app.apply_collection_grid_remove_success(stamp, &removed);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.checked, [0].into_iter().collect());
+        assert_eq!(
+            app.with_viewer_context_state(sibling, |owner| sibling_state(owner))
+                .unwrap(),
+            before
+        );
+        app.selected = Some(10_000);
+        app.apply_collection_grid_remove_success(stamp, &removed);
+        assert_eq!(app.selected, None);
+        assert_eq!(app.checked, [0].into_iter().collect());
+        assert_eq!(
+            app.with_viewer_context_state(sibling, |owner| sibling_state(owner))
+                .unwrap(),
+            before
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn collection_missing_remove_revision_watch_reprepares_each_context_independently() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let keep = temp.path().join("keep.png");
+        std::fs::write(&keep, b"keep").unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(
+            &client,
+            &[
+                (keep.clone(), CollectionResolvedKind::Image),
+                (
+                    temp.path().join("missing.png"),
+                    CollectionResolvedKind::Image,
+                ),
+            ],
+        );
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let prepared = Arc::clone(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .prepared()
+                .unwrap(),
+        );
+        let items = app.items.clone();
+        let sibling = app.build_window_context_for_test(1854, |owner| {
+            owner.top_level_grid_view.begin(
+                TopLevelGridSurface::Collection(CollectionGridIdentity {
+                    collection_id: prepared.collection_id,
+                }),
+                None,
+            );
+            owner.items = items;
+            owner.image_metas = vec![None; owner.items.len()];
+            owner.visible_indices = vec![0, 1];
+            owner.selected = Some(0);
+            owner.checked.insert(0);
+            let generation = owner.items_generation;
+            let session = owner.top_level_grid_view.collection_session_mut().unwrap();
+            session.accepted_revision = prepared.collection_revision;
+            session.wanted_revision = prepared.collection_revision;
+            session.installed_items_generation = Some(generation);
+            session.watch = Some(client.subscribe().unwrap());
+            session.load = CollectionGridLoadState::Ready(
+                CollectionGridInstalledPresentation::without_thumbnail_sources(Arc::clone(
+                    &prepared,
+                )),
+            );
+        });
+        let CollectionMissingRemovalAvailability::Ready { target, entries } =
+            app.collection_grid_missing_removal()
+        else {
+            panic!("one removable Missing")
+        };
+        let ids = entries
+            .iter()
+            .map(|entry| entry.entry_id)
+            .collect::<Vec<_>>();
+        app.checked.insert(0);
+        app.selected = Some(0);
+        let result = recv(
+            client
+                .remove_entries(
+                    snapshot.collection_id(),
+                    target.expected_revision,
+                    ids.clone(),
+                )
+                .unwrap(),
+        );
+        app.apply_collection_grid_remove_success(target.stamp, &ids);
+        assert_eq!(app.selected, Some(0));
+        assert_eq!(app.checked, [0].into_iter().collect());
+        app.with_viewer_context_state(sibling, |owner| {
+            assert_eq!(
+                owner.items.len(),
+                2,
+                "success in A must not replace B's rows"
+            );
+            assert_eq!(owner.selected, Some(0));
+            assert_eq!(owner.checked, [0].into_iter().collect());
+            assert_eq!(
+                owner
+                    .top_level_grid_view
+                    .collection_session()
+                    .unwrap()
+                    .accepted_revision,
+                target.expected_revision
+            );
+            poll_until(
+                owner,
+                "sibling did not independently adopt remove revision",
+                |owner| {
+                    owner
+                        .top_level_grid_view
+                        .collection_session()
+                        .is_some_and(|session| session.accepted_revision == result.revision())
+                },
+            );
+            assert_eq!(owner.items.len(), 1);
+            assert_eq!(owner.collection_grid_missing_removal().count(), Some(0));
+        })
+        .unwrap();
+        poll_until(
+            &mut app,
+            "main did not independently adopt remove revision",
+            |owner| {
+                owner
+                    .top_level_grid_view
+                    .collection_session()
+                    .is_some_and(|session| session.accepted_revision == result.revision())
+            },
+        );
+        assert_eq!(app.items.len(), 1);
+        assert_eq!(app.collection_grid_missing_removal().count(), Some(0));
+        assert_eq!(std::fs::read(keep).unwrap(), b"keep");
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn collection_remove_origin_stamp_is_read_only_for_parked_pending_context_and_siblings() {
+        let _epoch = crate::page_edit_write_epoch::TestEpochScope::fresh();
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client) = start_ready_app(&temp.path().join("collection.db"));
+        let snapshot = collection_with_sources(
+            &client,
+            &[(
+                temp.path().join("missing.png"),
+                CollectionResolvedKind::Image,
+            )],
+        );
+        app.open_collection_grid(snapshot.collection_id(), None);
+        wait_for_grid(&mut app, snapshot.collection_id());
+        let prepared = Arc::clone(
+            app.top_level_grid_view
+                .collection_session()
+                .unwrap()
+                .prepared()
+                .unwrap(),
+        );
+        let items = app.items.clone();
+        let origin = app.build_window_context_for_test(1851, |owner| {
+            owner.top_level_grid_view.begin(
+                TopLevelGridSurface::Collection(CollectionGridIdentity {
+                    collection_id: prepared.collection_id,
+                }),
+                None,
+            );
+            owner.items = items;
+            owner.visible_indices = vec![0];
+            let generation = owner.items_generation;
+            let session = owner.top_level_grid_view.collection_session_mut().unwrap();
+            session.accepted_revision = prepared.collection_revision;
+            session.wanted_revision = prepared.collection_revision;
+            session.installed_items_generation = Some(generation);
+            session.load = CollectionGridLoadState::Ready(
+                CollectionGridInstalledPresentation::without_thumbnail_sources(Arc::clone(
+                    &prepared,
+                )),
+            );
+        });
+        let sibling = app.build_window_context_for_test(1852, |owner| {
+            owner.items = vec![GridItem::Image(temp.path().join("sibling.jpg"))];
+            owner.visible_indices = vec![0];
+        });
+        let target = app
+            .with_viewer_context_state(origin, |owner| {
+                owner.collection_grid_content_target().unwrap()
+            })
+            .unwrap();
+        let main = app.collection_grid_context_id();
+        for context in [main, origin, sibling] {
+            app.with_viewer_context_state(context, |owner| {
+                owner.mark_metadata_import_display_reconciliation();
+                owner.page_edit_reconcile_pending =
+                    Some(super::super::page_edit_snapshot::ReconcileStatus::Failed {
+                        context_id: context,
+                        items_generation: owner.items_generation,
+                        page_edit_revision: owner.page_edit_revision,
+                        completed_writes: 17,
+                        retry_attempt: 1,
+                        retry_at: Instant::now() + Duration::from_secs(60),
+                    });
+                // Deliberately keep a visible projection that pending display work would rebuild.
+                owner.visible_indices.clear();
+                owner.rating_session_write_seen_generation = 0;
+            })
+            .unwrap();
+        }
+        let state = |owner: &App| {
+            (
+                owner.items.clone(),
+                owner.visible_indices.clone(),
+                owner.items_generation,
+                owner.top_level_grid_view.generation(),
+                owner.selected,
+                owner.checked.clone(),
+                match owner.metadata_import_refresh_index.as_ref() {
+                    Some(super::super::MetadataImportRefreshState::DisplayReconciliation {
+                        items_generation,
+                    }) => Some(*items_generation),
+                    _ => None,
+                },
+                match owner.page_edit_reconcile_pending.as_ref() {
+                    Some(super::super::page_edit_snapshot::ReconcileStatus::Failed {
+                        context_id,
+                        items_generation,
+                        page_edit_revision,
+                        completed_writes,
+                        retry_attempt,
+                        retry_at,
+                    }) => Some((
+                        *context_id,
+                        *items_generation,
+                        *page_edit_revision,
+                        *completed_writes,
+                        *retry_attempt,
+                        *retry_at,
+                    )),
+                    _ => None,
+                },
+                owner.rating_session_write_seen_generation,
+                owner.rating_session_write_generation,
+                owner.rating_publication_count,
+            )
+        };
+        let before = [main, origin, sibling].map(|id| {
+            app.with_viewer_context_state(id, |owner| state(owner))
+                .unwrap()
+        });
+        assert!(
+            !app.collection_grid_request_stamp_is_current(target.stamp),
+            "the mounted context is different"
+        );
+        assert!(app.collection_grid_origin_stamp_is_current(target.stamp));
+        app.with_viewer_context_state(origin, |owner| {
+            owner
+                .top_level_grid_view
+                .collection_session_mut()
+                .unwrap()
+                .installed_items_generation = None;
+        })
+        .unwrap();
+        assert!(!app.collection_grid_origin_stamp_is_current(target.stamp));
+        app.with_viewer_context_state(origin, |owner| {
+            owner
+                .top_level_grid_view
+                .collection_session_mut()
+                .unwrap()
+                .installed_items_generation = Some(owner.items_generation);
+            owner
+                .top_level_grid_view
+                .collection_session_mut()
+                .unwrap()
+                .position = CollectionGridPosition::PhysicalSource {
+                entry_id: prepared.entries[0].entry_id,
+                source_key: prepared.entries[0].source_key.clone(),
+                path: temp.path().to_path_buf(),
+            };
+        })
+        .unwrap();
+        assert!(!app.collection_grid_origin_stamp_is_current(target.stamp));
+        app.with_viewer_context_state(origin, |owner| {
+            owner
+                .top_level_grid_view
+                .collection_session_mut()
+                .unwrap()
+                .position = CollectionGridPosition::Root;
+        })
+        .unwrap();
+        let mut stale = target.stamp;
+        stale.surface_generation = stale.surface_generation.wrapping_add(1);
+        assert!(!app.collection_grid_origin_stamp_is_current(stale));
+        let mut absent = target.stamp;
+        absent.context_id = ViewerContextId::for_test(u64::MAX);
+        assert!(!app.collection_grid_origin_stamp_is_current(absent));
+        let mut wrong_context = target.stamp;
+        wrong_context.context_id = sibling;
+        assert!(!app.collection_grid_origin_stamp_is_current(wrong_context));
+        app.request_collection_grid_remove(CollectionGridRemoveTarget {
+            stamp: target.stamp,
+            expected_revision: target.expected_revision,
+            entry_ids: vec![prepared.entries[0].entry_id],
+        });
+        assert!(
+            app.collection_operation_modal_visible(),
+            "a current parked origin can request confirmation"
+        );
+        let after = [main, origin, sibling].map(|id| {
+            app.with_viewer_context_state(id, |owner| state(owner))
+                .unwrap()
+        });
+        assert_eq!(
+            before, after,
+            "read-only validation must preserve pending work and every projection"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
     #[cfg(windows)]
     #[test]
     fn caption_collection_reload_invalidates_continuously_displayed_sibling_signature() {
@@ -4644,7 +5474,7 @@ mod tests {
             "startup folder open is still pending"
         );
         app.initialized = true;
-        app.startup_open_path = Some(fixture.clone());
+        app.set_startup_open_path(fixture.clone());
         assert_eq!(
             app.open_seeded_collection_for_smoke().unwrap_err(),
             "startup folder open is still pending"
@@ -5481,6 +6311,11 @@ mod tests {
         policy.excluded_extensions.insert("png".into());
         policy.excluded_categories.insert(FileTypeCategory::Zip);
         let projected = project_collection_display_snapshot(full.clone(), &policy);
+        assert_eq!(full.removable_missing.len(), 2);
+        assert!(Arc::ptr_eq(
+            &full.removable_missing,
+            &projected.removable_missing
+        ));
         assert_eq!(full.entries.len(), 5);
         assert_eq!(projected.entries.len(), 3);
         for (actual, expected_index) in projected.entries.iter().zip([0, 3, 4]) {
@@ -7744,6 +8579,7 @@ mod tests {
         let mut entries = previous.entries.to_vec();
         entries.reverse();
         let reordered = Arc::new(CollectionPreparedSnapshot {
+            removable_missing: Arc::from([]),
             collection_id: previous.collection_id,
             collection_revision: previous.collection_revision + 1,
             collection_name: previous.collection_name.clone(),

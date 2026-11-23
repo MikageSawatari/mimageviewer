@@ -63,7 +63,7 @@ $stopCalls = @($buildDevAst.FindAll({
     $node -is [System.Management.Automation.Language.CommandAst] -and
         $node.GetCommandName() -eq 'Stop-StagedProcess'
 }, $true))
-Assert-True ($stopCalls.Count -eq 4) 'build-dev must check core, remote service, EPUB worker, and MCP'
+Assert-True ($stopCalls.Count -eq 5) 'build-dev must check core, remote service, EPUB worker, MCP, and browser host'
 $stopCallText = @($stopCalls | ForEach-Object { $_.Extent.Text })
 Assert-True ($stopCallText[0].Contains("-ExeName 'mimageviewer-core'") -and
     $stopCallText[0].Contains('-ExePath $coreExe') -and
@@ -78,6 +78,9 @@ Assert-True ($stopCallText[3].Contains("-ExeName 'mimageviewer-mcp'") -and
     $stopCallText[3].Contains('-ExePath $mcpExe') -and
     $stopCallText[3].Contains('-PreserveRuntime:$PreserveRuntime')) 'fourth staged-process check does not preserve the exact MCP policy'
 
+Assert-True ($stopCallText[4].Contains("-ExeName 'mimageviewer-browser-host'") -and
+    $stopCallText[4].Contains('-ExePath $browserHostExe') -and
+    $stopCallText[4].Contains('-PreserveRuntime:$PreserveRuntime')) 'browser818_bundle: dev host output policy changed'
 Assert-True ($buildDev.Contains('Assert-MivMusicvideoBuildOutputsIdle -OutputPaths @($musicvideoExe)')) 'editor output is not protected'
 Assert-True ($buildDev.IndexOf('Assert-MivMusicvideoBuildOutputsIdle -OutputPaths') -lt
     $buildDev.IndexOf("Stop-StagedProcess -ExeName 'mimageviewer-core'")) 'editor guard must run before stopping companions'
@@ -87,14 +90,14 @@ $cargoCalls = @($buildDevAst.FindAll({
     $node -is [System.Management.Automation.Language.CommandAst] -and
         $node.GetCommandName() -eq 'cargo'
 }, $true))
-Assert-True ($cargoCalls.Count -eq 5) 'build-dev Cargo call count changed'
-$expectedBins = @('mimageviewer-core', 'mimageviewer-remote', 'mimageviewer-epub-pdf', 'mimageviewer-mcp', 'mimageviewer-musicvideo')
+Assert-True ($cargoCalls.Count -eq 6) 'build-dev Cargo call count changed'
+$expectedBins = @('mimageviewer-core', 'mimageviewer-remote', 'mimageviewer-epub-pdf', 'mimageviewer-mcp', 'mimageviewer-musicvideo', 'mimageviewer-browser-host')
 for ($index = 0; $index -lt $cargoCalls.Count; $index++) {
     $command = $cargoCalls[$index].Extent.Text
     Assert-True ($command.Contains('--bin ' + $expectedBins[$index])) "build-dev wrong binary order at $index"
     Assert-True ($command.Contains('--profile dev-runtime --target-dir $targetDir')) 'dev build must use its fixed actual target output'
 }
-Assert-True ($buildDev.Contains('-InputPaths @($coreExe, $remoteExe, $epubWorkerExe, $mcpExe, $musicvideoExe)')) 'MCP or editor is absent from the dev PE gate'
+Assert-True ($buildDev.Contains('-InputPaths @($coreExe, $remoteExe, $epubWorkerExe, $mcpExe, $musicvideoExe, $browserHostExe)')) 'MCP or editor is absent from the dev PE gate'
 
 $powershellCalls = @($buildDevAst.FindAll({
     param($node)
@@ -139,7 +142,8 @@ try {
         @{ Name = 'mimageviewer-core'; File = 'mimageviewer-core.exe'; Label = 'core' },
         @{ Name = 'mimageviewer-remote'; File = 'mimageviewer-remote.exe'; Label = 'remote service' },
         @{ Name = 'mimageviewer-epub-pdf'; File = 'mimageviewer-epub-pdf.exe'; Label = 'EPUB converter' },
-        @{ Name = 'mimageviewer-mcp'; File = 'mimageviewer-mcp.exe'; Label = 'MCP adapter' }
+        @{ Name = 'mimageviewer-mcp'; File = 'mimageviewer-mcp.exe'; Label = 'MCP adapter' },
+        @{ Name = 'mimageviewer-browser-host'; File = 'mimageviewer-browser-host.exe'; Label = 'browser host' }
     )) {
         $exePath = Join-Path $testRootFull $case.File
         Set-Content -LiteralPath $exePath -Value 'mock executable' -Encoding Ascii

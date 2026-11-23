@@ -35,6 +35,7 @@ fn collect_actual_merge(
     suppress_navigation: bool,
 ) -> (FsWheelFrameResult, Option<ViewerOperationId>) {
     let ctx = ui.ctx().clone();
+    let cursor_active = ctx.input(fullscreen_cursor_active);
     // Exact operation identities are a contract of the enabled presentation
     // ingress. Mixed deliveries have several facts, so the existing one-input
     // animation budget declines an effect while navigation admission stays live.
@@ -49,6 +50,7 @@ fn collect_actual_merge(
     let result = app.handle_fs_wheel_and_click_frame(
         ui,
         &ctx,
+        cursor_active,
         ui.max_rect(),
         &state,
         StillSeekGeometry::bar_only(),
@@ -105,6 +107,38 @@ fn finish(
 fn install(ctx: &egui::Context) {
     page_turn::install(ctx);
     install_fs_navigator_input_tracking(ctx);
+}
+
+#[test]
+fn section1840_lock_only_metadata_panel_wheel_stays_with_panel() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    for locked in [false, true] {
+        let ctx = egui::Context::default();
+        install(&ctx);
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        app.settings.fullscreen_navigator_visible = false;
+        app.settings.fullscreen_side_panel_mode = crate::settings::FsSidePanelMode::Hover;
+        app.settings.fullscreen_chrome_suppression.info = false;
+        app.fs_info_panel.open = crate::ui_helpers::MetadataPanelOpenState::Closed;
+        app.fs_info_panel.hover_active = false;
+        app.fs_info_panel.locked = locked;
+        let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+        let pos = metadata_panel_rect(full).center();
+        frame(
+            &ctx,
+            vec![
+                egui::Event::PointerMoved(pos),
+                wheel(-120.0, egui::Modifiers::NONE),
+            ],
+            |ui| {
+                let (result, _) = actual_merge(&mut app, ui, false);
+                assert!(!app.fs_info_panel.hover_active);
+                assert_eq!(result.page_nav.is_none(), locked, "locked={locked}");
+                assert_eq!(result.wheel_navigation_produced, !locked, "locked={locked}");
+            },
+        );
+    }
 }
 
 #[test]
@@ -679,6 +713,7 @@ fn recognized_command(
     FsSecondaryAction::Recognized {
         context: RightDragContext::ImageFullscreen,
         pos: egui::pos2(300.0, 200.0),
+        egui_click: false,
         recognition: RightDragRecognition::command(command),
     }
 }
@@ -814,6 +849,7 @@ fn egui037_wheel_frame_recognized_close_terminates_final_wheel_without_reopening
                     FsSecondaryAction::Recognized {
                         context: RightDragContext::ImageFullscreen,
                         pos: egui::pos2(300.0, 200.0),
+                        egui_click: false,
                         recognition: RightDragRecognition::command(
                             RightDragCommand::ViewerShortRightClick {
                                 context: RightDragContext::ImageFullscreen,
@@ -877,6 +913,7 @@ fn egui037_wheel_frame_recognition_without_command_does_not_block_ordered_delive
                 proposal.secondary_action = FsSecondaryAction::Recognized {
                     context: RightDragContext::ImageFullscreen,
                     pos: egui::pos2(300.0, 200.0),
+                    egui_click: false,
                     recognition: RightDragRecognition::outcome(outcome),
                 };
                 app.claim_fs_wheel_frame_after_ui(&mut proposal);
@@ -955,6 +992,7 @@ fn egui037_wheel_frame_recognized_live_return_keeps_original_page_and_return_own
                         FsSecondaryAction::Recognized {
                             context: RightDragContext::ImageFullscreen,
                             pos: egui::pos2(300.0, 200.0),
+                            egui_click: false,
                             recognition: RightDragRecognition::command(
                                 RightDragCommand::ViewerShortRightClick {
                                     context: RightDragContext::ImageFullscreen,
@@ -1237,6 +1275,7 @@ fn egui037_wheel_frame_actual_immediate_child_keeps_zoom_anchor_and_root_wheel()
                         &mut expected.0,
                         &mut expected.1,
                         120.0,
+                        crate::settings::FullscreenWheelZoomStep::Standard,
                         Some(child_pointer),
                         image_rect.center(),
                     );

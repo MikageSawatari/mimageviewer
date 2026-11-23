@@ -1,6 +1,8 @@
 # リリース前 idle health / perf smoke 自動化計画
 
-**現行状態（2026-10-11）: 利用者がReleaseChecks suiteを毎リリースの正規手順として採用。**
+**現行状態（2026-11-21）: 毎リリースのReleaseChecks suiteを、次回から公開前にサブPCのキットで実行する。**
+ソース・git・cargoの無いサブPC向けの作成・事前確認・結果受け取りは [§11](#relcheck-subpc-kit)。
+以下のrepository経路も維持する。2026-10-11には利用者がsuiteを毎リリースの正規手順として採用した。
 `45a2be935` の了承済み確認runはPASS_WITH_WARNINGS／exit 0（PASS 7、警告付きPASS 2）。
 採用証跡・foreground再試行と残す手動範囲は [§10](#10-phase-4-確認と正規手順の採用2026-10-11) に記録する。
 以下の設計・blocker修正時の「未実行／利用者待ち」は各時点の履歴であり、現在の採用状態ではない。
@@ -19,7 +21,7 @@ v4.4.0 / v4.5.0 の [検証記録](release-verification-records.md) は過去の
 
 ## 1. 目的・境界・簡素化
 
-採用済みの入口は次の一つ。利用者がrepository rootのPowerShellで実行する。
+repository経路の入口は次のとおり。利用者がrepository rootのPowerShellで実行する。
 
 ```powershell
 .\scripts\ui-smoke.ps1 -Scenario ReleaseChecks -InteractiveApproved
@@ -83,7 +85,7 @@ fixture generator は既存 PNG generator と同梱 FFmpeg を使い、次を作
 
 | fixture | 構成・成立証拠 |
 | --- | --- |
-| static | 884×444 の byte-distinct 画像を含む画像フォルダ。窓 1328×900 / 7 列 / 明示的 Portrait3x4（auto=false）を出発点に、実要求が 374px 付近になる条件を記録する。DPI で変わるので設定値だけで成立としない |
+| static | 884×444 の byte-distinct 画像を含む画像フォルダ。明示的 Portrait3x4（auto=false）。窓・列数は DPI の表 `scripts/release_check_geometry.json` から選ぶ (144 DPI: 1328×900 / 7 列、96 DPI: 1420×900 / 5 列、2026-11-22〜)。実要求が 374px 付近になる条件を記録する。DPI で変わるので設定値だけで成立としない |
 | many-folders | 512 サブフォルダ、各 4 画像以上、keep 範囲だけでも 8 枚の upload 予算を超える配置。相異なる画像で生成し、初期 `lf_scan` とフォルダ代表サムネの負荷を持つ。枚数だけでは backlog 発生の証拠にせず、tray は§4の実観測を必須にする |
 | cached / uncached | 同じ構成の別 subtree。cached は正常ロード・保存・終了後の cache 読取を確認。uncached は準備時に開かず、当該キーの cache が無いことと初回 `from_cache=false` を確認。tray 用はさらに保存省略・close直前の cache 不在・格納後 source 再生成を必須にする（§4） |
 | video-pin | 640×360 の短い無音生成動画を child folder の代表に正常 pin 経路で固定。保存完了して App を再起動し、親のタイルが cache から読み直されたことを確認する。動画再生は始めない |
@@ -596,6 +598,8 @@ static-foreground は実 requested_px=281 と lifetime coverage 不足で SKIPPE
   fixture の static 前面・背面と seed-static を明示的 Portrait3x4 に揃える。
   281px から期待値を作り直すと整数decode回帰の条件を失うため、374±8 の実要求証明と
   request ID / key / generation の相関は維持する。違うDPI等で範囲外なら引き続き環境不成立。
+  2026-11-22: サブ PC (96 DPI) で実要求 256 になったため、static と seed-static の窓・列数を DPI の表から選ぶ形にした (§11 の 3 回目)。
+  表に無い DPI、作業領域に収まらない窓、前面と背面の大きさの不一致は、mIV の起動前に環境不成立にする。
 - seed-profile は seed-static overlay で全 cache を通常 producer から作る。復元 profile に残る
   Always が runtime へ漏れないよう、static / video-pin / perf には Auto を明示する。
   tray 2ケースは既存の Off / 10列 / Landscape16x9 を維持し、perf も既存の7列 / Landscape16x9。
@@ -770,3 +774,309 @@ UI／I/O変更版の実データ、実タイトルバー[×]／tray復帰、変�
 手動確認は§7のまま。AI／GPU変更版は `-IncludeFirstAi` を明示し、未実施を記録する。
 閾値・証跡必須条件は緩和しない。foreground失敗や段別内訳不足を隠さず、FAIL／SKIPPED／警告を残す。
 エージェントの明示実行了承、normal-profile起動禁止、使い捨てportableと実設定保護も維持する。
+
+<a id="relcheck-subpc-kit"></a>
+
+## 11. サブPC向けキット（2026-11-21）
+
+利用者決定 (2026-11-21): 次回から、公開前に ReleaseChecks をサブ PC で流す。メイン PC では診断 portable の
+build (約 7.5 分) の直後に計測が急に始まり、その間 PC に触れなくなるため。運用の手順は
+[リリース手順チェックリスト](release-checklist.md) 9.6、サブ PC への依頼文は [雛形](subpc-release-checks-brief.md)。
+本節はキットの仕組みと、照合で何を担保しているかの正本。サブ PC で流すことは手順の決定であって常設の実行了承ではなく、
+毎回の了承は [実行確認](interactive-release-verification.md) の「サブ PC のキットで流す ReleaseChecks」に従う。
+
+### 簡素化の検討
+
+- **サブ PC ではビルドしない**。サブ PC には git・cargo・ソースツリーが無い (VS / Build Tools も無い)。
+  build はメイン PC で済ませ、検証済みの成果物と scripts を 1 つのフォルダ (キット) にまとめて渡す。
+  サブ PC 側の手順は「コピー → 事前確認 → 本番 → 結果を戻す」の 1 本道にし、途中の分岐を作らない。
+- **suite は作り直さない**。キットの root を repository root と同じ形 (`scripts\`、`target\portable-smoke-package\`) にし、
+  今の `ui-smoke.ps1 -Scenario ReleaseChecks` をそのまま `-FromKit` 付きで流す。変わるのは
+  「期待するソース指紋をどこから得るか」と「FFmpeg の場所」と「build しない」の 3 点だけ。
+  閾値・7 ケース・タイムアウト・seed 復元・marker / exe hash / PID / HWND / foreground の照合は同じ。
+- **再試行・回復の仕組みは足さない**。コピーの途中の失敗・照合の不一致・前面が取れない、はどれも止めて報告する。
+  キットは作り直せばよい (まれな失敗は割り切り、CLAUDE.md の既定)。
+
+### ソース指紋をサブ PC でどう照合するか
+
+repository 経路は `build-portable.ps1` の `Get-MivSourceFingerprint` (git で列挙したソースの SHA-256) を計算し、
+診断 artifact の `.test-script-build.json` の値と照合する。サブ PC では計算できないので、次の 2 段で担保する。
+
+1. **作成時 (メイン PC、`New-ReleaseCheckKit.ps1`)**: artifact を作ったソースツリー (`-ArtifactRepo`、既定はこの repository) で
+   実際に指紋を計算し、package の manifest と 5 本の exe の hash を `Assert-SmokeBuildManifest` で照合する。
+   古い artifact ならここで止まる。指紋の対象のソース、取り込む `scripts/build-portable.ps1`、キットに入れる `scripts/` は、
+   すべてコミット済み・clean を求める (未コミットの変更を含むキットは作らない)。
+   指紋の元の一覧 (`path<TAB>sha256` の行) を `source-fingerprint-records.txt` に書く。このファイルのバイト列の SHA-256 が指紋そのもの。
+2. **実行時 (サブ PC、`Assert-ReleaseCheckKit`)**: `release-check-kit.json` に記録した全ファイルの相対 path・SHA-256・size と、
+   実際のキットの中身を完全一致で照合する (欠け・余分・改変のどれも拒否)。json 自体の hash は `release-check-kit.sha256`、
+   records の hash は json の指紋、package の manifest は json に写した manifest と照合する。キットの root に `.git` があれば拒否する
+   (repository で `-FromKit` を使って git の照合を飛ばさないため)。
+
+これは取り違え (古いキット・別のソースの artifact・途中で書き換わったファイル) を防ぐためのもので、改ざんに対する署名ではない。
+作成時に表示した json の SHA-256 を依頼文とリリース記録に写し、サブ PC ではコピー後にその値を確かめる。
+
+照合の時点: `Run.ps1` の preflight (build・fixture 生成・run フォルダ作成より前) と prepare の後に全量照合。
+各セッションの前は今までどおり artifact の照合 (marker・manifest・5 本の exe の hash) をする。
+sampler は測定準備の 35 秒の待ちの中で動くので、kit モードでは全量を再ハッシュせず、json・records・package manifest の軽い照合だけにする。
+
+実行時に作られるもの (`target\portable-smoke\`、`target\ui-smoke\`) は照合から外す。Python の `__pycache__` / `*.pyc` は外さず、
+あれば拒否する (検証していないバイトコードが読み込まれ得るため)。suite は `PYTHONDONTWRITEBYTECODE=1` で動かし、生成させない。
+
+### キットの中身
+
+```
+<kit>\release-check-kit.json          kit_id、作成日時、scripts と artifact のコミット、指紋、artifact manifest、FFmpeg の版、全ファイルの一覧
+<kit>\release-check-kit.sha256        上の json の SHA-256
+<kit>\source-fingerprint-records.txt  指紋の元の一覧 (LF 区切り、UTF-8 BOM なし、末尾改行なし)
+<kit>\scripts\...                     コミット済みの scripts 一式 (__pycache__ を除く)
+<kit>\target\portable-smoke-package\  診断 portable (data を除く)
+<kit>\tools\ffmpeg\                   fixture 生成用の FFmpeg CLI (メイン PC の PATH のもの、同じフォルダの DLL も)
+```
+
+既定の出力先は `C:\home\mimageviewer-subpc\relcheck\relcheck-<artifact の HEAD 先頭 9 桁>-<UTC 日時>\`。
+scripts と artifact のコミットは別にできる (例: 公開済みタグの artifact を、後から足した scripts で流す)。その場合は両方が記録に出る。
+
+### キットを置く場所 (ビルドした root と同じ path)
+
+試験用ビルド (`test-script`) は、`--test-evidence-dir` が「**ビルドしたときの repository root** の
+`target\ui-smoke\runs\<run>\<case>`」であることを確かめる (`src/test_script/release_checks.rs` の `isolated_context` が
+`env!("CARGO_MANIFEST_DIR")` を `evidence_path::validate_directory` に渡す)。そのため診断 artifact は、
+ビルドした場所と同じ絶対 path の root に置かれたときだけ動く。違う path では seed-profile が
+`evidence directory must be below <ビルドした root>\target\ui-smoke\runs` で exit 2 になる
+(2026-11-21 の初回実行で、サブ PC 担当が観測。下の「実行記録」)。
+
+対処 (製品コードは変えない):
+
+- 診断 portable は、両方の PC に作れる中立の path の専用 worktree **`C:\miv-relcheck\root`** でビルドする。
+  サブ PC は C: しか無く、`C:\home\mimageviewer` はサブ PC 担当の作業フォルダとして使用中なので、メイン PC の
+  repository と同じ path は使えない (2026-11-21、サブ PC 担当の回答)。
+- キットの json に `artifact.build_root` (ビルドした root) を記録し、作成時に exe へその path が埋め込まれていることを確かめる。
+  この検査は exe のバイト列への部分一致で、`...\root` と `...\root-v550` のような前方一致の取り違えは見分けない
+  (独立レビューの指摘)。起きるのは、別の worktree でビルドした package を手でコピーして持ち込んだときだけで、そのときも
+  本番が証拠フォルダの検査で止まるだけで誤った計測にはならないので、仕組みは足さない (まれな失敗は割り切り)。
+  手順では、診断 portable を別の worktree からコピーしないことを決まりにする。
+- サブ PC ではキットを `build_root` と同じ path に置く。`Run.ps1 -FromKit`・sampler・`Test-SubPcEnvironment.ps1` は
+  キットの root が `build_root` と一致しなければ、mIV を起動する前に止まる (`Assert-ReleaseCheckKitRunRoot`)。
+  メイン PC の保管場所 (`C:\home\mimageviewer-subpc\relcheck\<kit-id>\`) と結果の受け取りには、この一致を求めない。
+
+検討して採らなかった案: 試験用ビルドの検査を「実行中の exe の場所から root を求める」形に変える
+(`validate_layout` は既に exe の位置から `target` を求めている)。キットをどこにでも置けるようになり、専用 worktree も要らなくなるが、
+試験用の安全検査を変える Rust の変更で、公開済みの版 (v5.5.0 のタグのソース) には使えない。必要になったら別項目で検討する。
+
+### サブ PC: 事前確認と本番
+
+`Test-SubPcEnvironment.ps1` は mIV を起動せず、キット照合・Python 3.10 以上・キットの FFmpeg・入力 desktop の一致 (`CheckDesktop`) を確かめ、
+suite と同じ前面の操作を使い捨ての窓 2 つで再現する: runner が子プロセスの窓を `SetForegroundWindow` で前面にし、
+子が runner に `AllowSetForegroundWindow` を出した後、runner の窓を `Set-ReleaseCheckBackgroundForeground` で前面にする。
+キー入力・マウス入力は送らない。結果 (READY / NOT_READY、RDP セッションか、画面、DPI、GPU、観測した前面の PID / HWND / class) を
+`target\ui-smoke\env-probe.json` に書く。READY = exit 0、NOT_READY = exit 2。
+
+メイン PC では、ClaudeCode のツールの裏のプロセスから流した suite は前面を取れずに止まり、ターミナル パネルから流すと成り立った
+(2026-11-17 の記録)。サブ PC でも事前確認と本番はターミナル パネルから流す。画面操作をしないので、サブ PC の
+「mIV と Claude アプリを別の仮想デスクトップに置く」決まり (画面操作のときにパネルと重ならないため) は使わない。
+
+前面の条件がサブ PC の RDP セッションで成り立つかは、初回の事前確認の結果で記録する (下の「実行記録」)。
+成り立たないときは回避策を足さずに止め、観測をもとに代わりの経路 (サブ PC の前で利用者がターミナルから流す、など) を利用者と決める。
+
+### メイン PC: 結果の受け取り (読み取りだけ)
+
+サブ PC から run フォルダを `C:\home\mimageviewer-subpc\relcheck\<kit-id>-results\` へ戻してもらい (キットの中へは足さない)、
+
+```powershell
+.\scripts\relcheck-kit\Receive-ReleaseCheckResult.ps1 -Kit C:\home\mimageviewer-subpc\relcheck\<kit-id> -Result C:\home\mimageviewer-subpc\relcheck\<kit-id>-results\<run-id>
+```
+
+キットが作成時のままであること、`suite-input.json` と `summary.json` の kit ID・manifest hash・core hash・指紋がキットと一致すること、
+verdict と終了コードの対応、`release-record.md` の中身が `summary.json` から生成し直したものと一致すること (別 run の記録の取り違え) を確かめる。終了コードは summary の 0 (PASS / PASS_WITH_WARNINGS)・
+1 (FAIL)・2 (SKIPPED) をそのまま返し、受け取りの不成立 (キット違い・JSON の欠け) は 3。再解析・再実行はしない。
+
+### 数値の扱い
+
+`release-record.md` の「実行:」の行に、実行場所 (サブ PC のキット / repository)・キット ID・画面・RDP セッションかが出る。
+サブ PC (RTX 4060 Ti、1920×1080、RDP セッション) の値は、サブ PC の記録どうしでだけ比べ、メイン PC の記録とは比べない。
+閾値と判定はどちらも同じで、サブ PC 向けに緩めない。
+
+### 実行記録
+
+実行時の観測は、どれもサブ PC 担当 (Remote Control の「mImageViewer 実機確認」セッション) の報告による。
+メイン PC 側で確かめたのは、戻ったファイルの中身と照合スクリプトの結果。
+
+**1 回目 (2026-11-21、キット `relcheck-36d603f3e-20261121-072741`、artifact v5.5.0 `36d603f3e`、scripts `6cdca2e7f`)**
+利用者の了承 2026-11-21 19:51 (事前確認 1 回と本番 1 回、再試行なし)。
+
+- 事前確認: READY (exit 0)。RDP セッション、画面 1920×1080、96 dpi、GPU は Microsoft Remote Display Adapter / NVIDIA GeForce RTX 4060 Ti、
+  CPU i5-13600T、Python 3.13.5、キットの FFmpeg 9.0.2。ターミナル パネルから流し、子の窓は 1 回目の試行で前面になり、runner の窓へも前面が戻った。
+  → サブ PC の RDP セッションでも、ターミナル パネルから流せば前面の条件は成り立つ。
+- 本番: SKIPPED (exit 2、約 1 分)。seed-profile が `error: evidence directory must be below G:\home\mimageviewer-relcheck-v550\target\ui-smoke\runs`
+  で exit 2 になり、7 ケースは走っていない。原因は上の「キットを置く場所」(キットを `C:\miv-relcheck\<kit-id>` に置いていた)。
+- 戻った run `release-checks-20261121-105500-f3e36aec` を、そのキットの `Receive-ReleaseCheckResult.ps1` で照合: `Verdict: SKIPPED`、exit 2
+  (キット・summary・記録の対応は成立)。
+- 手順との違い: ターミナル パネルのツールでは `$LASTEXITCODE` を打てず、担当が終了コードを表示する wrapper をキットの外に置いて流した。
+  → キットに `Run-SubPcProbe.cmd` / `Run-SubPcSuite.cmd` を入れた。
+
+**2 回目 (2026-11-21、キット `relcheck-36d603f3e-20261121-112513`、`C:\miv-relcheck\root` に配置、scripts `8911483c8`)**
+利用者の了承 2026-11-21 22:11 (事前確認 1 回と本番 1 回、再試行なし)。
+
+- 事前確認: NOT_READY (exit 2)。キット・Python・FFmpeg・desktop の照合はすべて成立。子の窓への `SetForegroundWindow` が 20 秒 (180 回) 通らず、
+  前面は pid 988 (dwm) の class `Ghost` の窓のままだった。サブ PC 担当の見立て: 応答しなくなった「設定」アプリ (SystemSettings、Responding=False) の
+  身代わりの Ghost 窓が前面に居座った (確かめてはいない)。本番は流していない。
+- 事前確認が、mIV を起動する前に前面の不成立を見つけて止めた (設計どおり)。前面を奪う窓が残っているときは、その窓を閉じるかどうかを
+  利用者が決めてから流し直す。エージェントが利用者の起動したアプリを閉じない。
+
+**2 回目の流し直し (2026-11-21 22:32、同じキット)**
+利用者の了承 2026-11-21 22:27 (「閉じて流し直す」)。「設定」を閉じる操作はサブ PC 担当のセッションの権限の判定で拒否され、実行していない。
+利用者がサブ PC の画面を見て「設定」の窓は出ていないと確かめた後、閉じずに事前確認から続けた。
+
+- 事前確認: READY (exit 0)。「設定」は応答なしのまま残っていたが、前面はタスクバー (explorer) で、子の窓は 95 回目 (約 10.5 秒) で前面になった。
+- 本番: SKIPPED (exit 2)。seed-profile の mIV は正常に終了 (exit 0) したが、seed の検査が `seed search expected hit set not proven` で止めた。7 ケースは走っていない。
+  戻った run `release-checks-20261121-133240-8c61f7c7` は `Receive-ReleaseCheckResult.ps1` で SKIPPED / exit 2 と照合。
+- 原因 (設計担当がコードで確認): メタデータ検索は結果の束を評価値の付与の worker に回してから一覧に入れ、完了の印 `done` は束とは別の
+  `Done` イベントで先に立つ。製品側は「付与済みの束 = 送った束」を完了の条件にしている (`reconcile_completed_drill`) が、
+  試験用の観測 (`src/app/release_checks.rs` の `search_done` / `search_searching`) と台本 (`release-checks.rhai` の `search`) はそれを見ていない。
+  台本は完了の印の直後の空の一覧を読み取った (証拠: 台本の読み取りは 4.046 秒で 0 件、同じ回の seed の記録は 4.108 秒で 3 件)。
+  起きるのは誤った SKIPPED だけで、誤った PASS にはならない。メイン PC では worker が速く、表に出ていなかったと見ている (未確認)。
+- ここまでで、サブ PC での置き場所・前面・Python・FFmpeg・seed の起動と正常終了は成立した。
+
+**検索の完了判定の修正 (2026-11-22、`30dbcfc43`)**
+統括の判断: 待ち時間の上乗せではなく、製品の完了条件をそのまま観測に出して台本が待つ。v5.5.0 は流し直さず、v5.5.1 の ReleaseChecks で代える。
+
+- `reconcile_completed_drill` の前提を `GlobalSearchState::metadata_results_settled()` に切り出し (挙動不変)、観測の `search_results_settled` として出した。
+  台本の `search()` と seed の記録はそれを待つ。perf の 2 ケースも同じ `search()` を通る。View の準備要求 (`in_flight`) は含めない
+  (一覧の中身ではなく表示の準備のため)。ほかに検索の完了を `done` だけで見る台本・解析は無かった。
+- テストは hold で `Done` の後・最後の `RatedBatch` の前を作り、settled が偽で一覧が空、採用後に真で埋まることを確かめる。
+  Sol / xhigh の独立レビューは ACCEPT (製品の条件が前と同じ意味であることを含む)。
+- 診断 artifact は、配布ビルドの入力 `aa6f06685` にこの修正を載せた `c54ecfd7e` から作る (`C:\miv-relcheck\root`、detached)。
+  違いは test-script feature の中の観測と台本、それに製品の完了条件の関数への切り出し。配布物には切り出しを含まない。
+
+**3 回目 (2026-11-22 07:07、キット `relcheck-c54ecfd7e-20261121-171651`、artifact `c54ecfd7e`、scripts `30dbcfc43`)**
+利用者の了承 2026-11-21 22:33 (事前確認 1 回と本番 1 回、再試行なし)。夜間試験の時間枠を避けて 07:00 以降に送った。
+
+- 事前確認: READY (exit 0)。前面化は 1 回目で成功 (272 ms)。
+- 本番: SKIPPED (exit 2、約 3 分)。seed-profile・seed-perf-cached は PASS (検索の 3 件も入り、上の修正が効いた)。static-foreground が
+  `static actual requested pixels outside 374±8 regression range [366,382]` (実要求 256) で環境不成立になり、後の 6 ケースは走っていない。
+  戻った run `release-checks-20261121-220921-45d79cbd` は `Receive-ReleaseCheckResult.ps1` で SKIPPED / exit 2 と照合。
+- 原因 (設計担当がコードで確認): 374 は 150% DPI (144) で、窓 1328×900・7 列・縦長 3:4 のセル 187×249 論理 px × 1.5 から来る値
+  (上の §1.198 の節)。サブ PC は 96 DPI なので 249 になり、`compute_display_px` の下限 256 に切り上げられた。
+  DPI に依存する判定は static の前面・背面の 2 ケースだけ。
+
+**static の窓・列数を DPI の表から選ぶ修正 (2026-11-22、`ba843eaec` + `8f580f973`)**
+統括の判断: 374±8 の判定と 884×444 の画像を使う条件は変えず、表に無い DPI は今どおり環境不成立。製品コードに触れない。
+
+- 表 `scripts/release_check_geometry.json` (読むのは `release_check_geometry.py`・fixture の生成・Run.ps1・Support.ps1・解析):
+  144 DPI は 1328×900・7 列 (今までと同じ)、96 DPI は 1420×900・5 列。96 DPI の値の根拠: `compute_cell_size` の avail_w は
+  CentralPanel の左右の余白 8 論理 px ずつを引いた幅で、スクロールバーの配置前に計算される。floor((1420 − 16) / 5) = 280、
+  高さ round(280 × 4/3) = 373 → 要求 373 px。144 DPI の 1328 幅・7 列で 187 → 374 になるのと同じ計算。
+- 事前確認 (`Test-SubPcEnvironment.ps1`) と Run.ps1 の preflight で、mIV の起動前に次を確かめ、外れたら環境不成立:
+  表に DPI があること、製品が `--window-size` のときに窓を置く位置 (論理 60,40、`src/lib.rs`) と装飾込みの外形の矩形が
+  作業領域 (タスクバーを除く) に収まること、static の前面と背面が表の同じ行を使うこと。
+  実行時と背面化の後 (Sampler.ps1) も、実際の窓の DPI・client size・矩形を照合する。
+- Sol / xhigh の独立レビュー: 1 回目は起動位置を考慮していない P2 で REVISE、直した後は ACCEPT。
+- 診断 artifact は作り直していない。source fingerprint の対象 (`src`・`crates`・`vendor`・`assets`・`Cargo.*` 等) に `scripts/` は入らず、
+  台本と fixture の生成は実行時にキットの `scripts\` から読むので、作り直しても `c54ecfd7e` と同じになるため。
+  キットだけを作り直した: `relcheck-c54ecfd7e-20261121-225440` (manifest SHA-256 `bd459b91b993811938f7e97a6894909308e6ed64fd9c567d65fe190b0ef38c3f`、
+  scripts `8f580f973`、artifact `c54ecfd7e`)。流し直しは利用者の了承待ち。
+
+**4 回目 (2026-11-22 09:23、キット `relcheck-c54ecfd7e-20261121-225440`、artifact `c54ecfd7e`、scripts `8f580f973`)**
+利用者の了承 2026-11-22 09:20 頃 (「ReleaseCheckをサブPCで実行をお願いします。」、事前確認 1 回と本番 1 回)。
+
+- 事前確認: READY (exit 0)。96 DPI の行 (1420×900・5 列) を選び、装飾込みの外形 [60,40,1496,979] は作業領域 [0,0,1920,1032] に収まった。
+  前面化は 1 回目で成功 (275 ms)。
+- 本番: FAIL (exit 1、約 1.5 分)。seed-profile の台本が `environment: exact root foreground was not acquired` で止まり、
+  7 ケースは走っていない。戻った run `release-checks-20261122-002308-42a02bd8` は `Receive-ReleaseCheckResult.ps1` で FAIL / exit 1 と照合。
+- 表の修正は効いていた: seed の static の overlay は `display_px = 373` (3 回目は 256)。窓の client 1420×900・DPI 96 も表どおり。
+- ログから分かること (mIV のログ): 1.51 秒の focus 要求の時点では前面 (`has_focus=true`)。runner も前面を確かめてから先へ進んだ。
+  video-pin の操作は 3.68 秒まで進み、続く `search()` の最初の `focused()` で、root の `focused` が 20 秒間偽のままだった。
+  その間に前面を取った窓は、mIV のログにも runner の記録にも残っていない (seed のあいだ runner は前面を記録しない)。
+  サブ PC 担当が並行して動かしていたのは、ファイルの有無を 15 秒ごとに見る待機の命令だけ (3 回目も同じで、そのときは seed が通った)。
+- 試験側の問題 (設計担当がコードで確認): 上の「foreground と無操作区間」の節は、前面が取れないときを SKIPPED (環境不成立) と決めている。
+  ところが台本の `fail("environment: ...")` は、test-script の runtime では ScriptFailure (exit 1) になる。
+  Rhai から EnvironmentFailure (exit 2) を出す手段が無く、`Support.ps1` の `New-ReleaseCheckProcessExitResult` は exit 1 を FAIL にする。
+  そのため、環境の不成立が FAIL として数えられた。製品の不具合を示す記録ではない。
+
+**前面の窓の記録と、前面の待ちの失敗の分類 (2026-11-22、`9a7b711b4`)**
+統括の判断: 環境不成立 (exit 2) にするのは、失敗した時点の前面が mIV 以外のプロセスだと runner の記録で示せる場合だけ。
+root の `focused` が偽のままになる原因は mIV 自身のこともある (mIV の別の窓・popup・ダイアログが前面を取った、mIV が応答しなくなった)。
+何でも環境不成立にすると、製品の退行が SKIPPED に隠れる。分け方は台本の文言ではなく runner の証拠で決める。前面の取り直しはしない。
+
+- 台本の前面の待ち (`focused()` と、Ctrl+G の後に検索欄がフォーカスを得る待ち) は、失敗すると test-script の関数が
+  `foreground-wait-failure.json` (pid・root の HWND・待ちの種類・待ちの開始と失敗の unix ms) を書き、今までどおり ScriptFailure (exit 1) で終わる。
+  前面に依存しない 3 か所 (検索の完了・索引の完了・perf の開始フォルダの照合) は、記録があっても FAIL のまま
+  (文言の `environment:` も外した。前面が他のプロセスでも、これらが終わらないのは前面のせいではないため)。
+- runner は各セッションの主ループで `foreground-timeline.jsonl` に前面の窓を書く (変化したときと 500 ms ごと)。1 行に、前面の HWND・pid・
+  exe 名・class、mIV の子孫プロセスか、Ghost 窓なら元の窓 (`HungWindowFromGhostWindow`) の pid・exe 名、mIV の root の生存・可視・最小化・
+  応答 (`IsHungAppWindow`)。窓のタイトルは取らない (公開される記録に利用者の他アプリのタイトルを載せないため。`GetWindowText` は
+  WM_GETTEXT を送るので使わない)。測定区間 (sampler の内側) では書かない。
+- 分類は `scripts/release_check_foreground.py` の 1 か所だけ。process exit 1 で `foreground-wait-failure.json` があるときに限って判定し、
+  次の全部が成り立つときだけ SKIPPED (exit 2) にする:
+  - 記録の pid と root の HWND が、試験対象の mIV と一致する。
+  - 待ちの開始より前と失敗より後の行で区間の両端を挟み、行の間隔がどこも 1500 ms 以下。
+  - その区間の全部の行で、前面が mIV の pid でも、その子孫でも、root でもない。Ghost 窓なら持ち主が dwm で、元の窓が mIV・子孫・root でない。
+  - 全部の行で mIV の root が生きていて、見えていて、最小化でなく、応答している。
+  - どれか 1 つでも外れる、記録が読めない、前面の持ち主を特定できない、のどれでも FAIL (exit 1)。
+  判定の理由・区間・行数・前面の exe 名と class は、そのケースの失敗の文として `release-record.md` にそのまま出る。
+  実プロセスの exit 1 も証拠に残す。
+- runner が最初の前面を 20 秒取れない場合 (`Exact root foreground unavailable within 20 seconds.`) は、今までどおり suite-preparation の
+  SKIPPED。今回は変えていない。
+- サブ PC での手順: 本番のあいだ、サブ PC 担当は待機の命令 (ファイルの有無を一定間隔で見る等) も流さない。終わりはターミナル パネルの
+  表示を 1 回読むだけにする (4 回目で前面を奪ったのがこの命令だという証拠は無く、見立て)。
+- Sol / xhigh の独立レビュー: 指摘なしで ACCEPT (製品の退行を SKIPPED に隠さない観点を含む)。
+- 診断 artifact は `src/` に触れたので作り直した: `aa6f06685` + `30dbcfc43` + `9a7b711b4` の `src/` の変更 = `99c0eea48`
+  (`C:\miv-relcheck\root`、detached)。配布物との違いは test-script feature の中の観測・記録・台本と、製品の完了条件の関数への切り出し (挙動不変)。
+
+**5 回目 (2026-11-22 11:37、キット `relcheck-99c0eea48-20261122-014708`、artifact `99c0eea48`、scripts `161000679`)**
+利用者の了承 2026-11-22 10:51 頃 (「サブPCでは先程の834を今実行中のようです。その後にできればとおもいます。」、事前確認 1 回と本番 1 回)。
+サブ PC 担当は本番のあいだ、シェルの命令を流さず、ターミナル パネルを読むだけにした。
+
+- 事前確認: READY (exit 0)。前面化は 1 回目で成功 (273 ms)。
+- 本番: FAIL (exit 1)。seed-profile・seed-perf-cached・static-foreground は PASS (static-foreground の要求 373 px、CPU 0.0104 コア、
+  idle の frames 0)。5 番目の static-background が、待機の入口 (`release_check_pause`) で止まった。そこでは、背面用の窓へ前面を渡す前提として
+  前面 = root を確かめる。ところが `environment: exact root foreground / runner grant identity mismatch` で ScriptFailure になった。後の 5 ケースは未実行。
+  戻った run `release-checks-20261122-023742-299451f6` は `Receive-ReleaseCheckResult.ps1` で FAIL / exit 1 と照合。
+- 前面の記録から分かること (`static-background/foreground-timeline.jsonl`): 起動後 1.03 秒の行では、前面は mIV の root (class `Window Class`)。
+  1.58 秒の行から失敗まで、前面は同じ mIV のプロセスの `Winit Thread Event Target` の窓。mIV 以外のプロセスが前面を取った行は無い。
+  分類は規則どおり FAIL。static-foreground でも、測定の後 (起動後約 38 秒、終了の手前) に同じ窓へ前面が移っている。
+- 試験側の欠陥 (設計担当が記録とコードで確認): runner は root を `Process.MainWindowHandle` で見ている。記録の `root_hwnd` の列は、
+  静止画の 2 ケースとも `Winit Thread Event Target` の窓 (winit が作る、見える扱いの layered popup) を指していた。
+  そのため記録の root の状態の列は、本当の root ではなく別の窓のもの。runner の最初の前面化 (`SetForegroundWindow(MainWindowHandle)`) も、
+  同じ取り違えの影響を受けうる。
+- 前面が mIV の中で root から別の窓へ移った理由は、まだ分からない (mIV のログに前面の操作の記録は無い)。4 回目の seed の失敗と
+  同じ原因かも分からない (4 回目には前面の記録が無い)。
+
+**runner の root の特定の修正 (2026-11-22、`3f60030ce`)**
+統括の判断: runner の root は、試験対象の mIV が test-script から知らせる HWND を使う。メイン PC で mIV の窓を出す試験はまだしない。
+
+- 見立て (設計担当がコードで確認。前面化の宛先そのものの記録は無く、推定): winit 0.30.13 はスレッドの event target 窓を
+  `WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|WS_EX_LAYERED|WS_EX_TOOLWINDOW` で作り、style を `WS_VISIBLE|WS_POPUP` にする。持ち主は無い。
+  .NET Framework の `Process.MainWindowHandle` は、持ち主が無く見えている最初の top-level 窓を選び、`Refresh()` のたびに選び直す。
+  そのため、この窓を返すことがある。runner は前面を確かめるまで `SetForegroundWindow(MainWindowHandle)` を繰り返すので、
+  event target 窓へ前面化を要求していた時間がありえる。winit の `focus_window` / `force_window_active` は本物の窓を対象にしていて、
+  mIV のコードにこの窓へ前面を動かす処理は見当たらない (製品側の原因は見つかっていない)。4 回目の seed の失敗も同じ経路だった可能性があるが、
+  記録が無く確かめられない。
+- 修正: 台本が `select_root()` の直後 (最初の索引待ちより前) に `release_check_publish_root()` で `root-window.json` (pid・root の HWND) を
+  原子的に書く。値は test-script が選んだ root (context 0) の identity から取る。runner は、これが出るまで前面化をしない。
+  出たら pid と HWND の持ち主を照合し、その HWND だけを前面化・幾何の照合・前面の記録・sampler に使う。
+  ready.json の root と食い違えば FAIL (試験対象が root を取り替えた場合を環境不成立に隠さない)。ReleaseChecks の経路から `MainWindowHandle` は無くなった。
+  公開前の記録の行は root=0 で、分類では SKIPPED の材料にならない。
+- 同じ使い方は `scripts/ui-smoke.ps1` (1916 行付近) と `scripts/page-turn-smoke.ps1` (174 行付近) にも残っている。ReleaseChecks の範囲外なので直していない。
+- Sol / xhigh の独立レビュー: 指摘なしで ACCEPT。前面化の宛先そのものは旧記録では直接証明できない、という注記つき。
+- 診断 artifact を作り直した: `99c0eea48` + `3f60030ce` の `src/` の変更 = `fd6f3abf4` (`C:\miv-relcheck\root`、detached)。
+
+**6 回目 (2026-11-22 13:28、キット `relcheck-fd6f3abf4-20261122-035048`、artifact `fd6f3abf4`、scripts `e908d672f`)**
+利用者の了承 2026-11-22 12:57 頃 (「サブPCは今何かのテストを進めているようです。空き次第ReleaseCheckも流して問題ありません。」、事前確認 1 回と本番 1 回)。
+サブ PC 担当は本番のあいだ、シェルの命令を流さず、ターミナル パネルを読むだけにした。
+
+- 事前確認: READY (exit 0)。前面化は 1 回目で成功 (179 ms)。
+- 本番: **PASS_WITH_WARNINGS** (exit 0)。9 ケースの内訳は次のとおり。
+  - seed-profile・seed-perf-cached: PASS。
+  - static-foreground: PASS (要求 373 px、CPU 0.0031 コア、frames 0)。
+  - static-background: PASS (CPU 0.0052 コア、frames 0)。
+  - video-pin-background: PASS (CPU 0.0010 コア)。
+  - tray の 2 つ: PASS (frames 4)。
+  - perf-cached・perf-uncached: PASS_WITH_WARNINGS。読み込み 256/256、Ctrl+Down 5/5、unexplained 0。
+  - 警告は 2 つで、どちらも判定を変えない WARN。1 つは起動の最初の frame の gap (461・451 ms、上限 500 ms、利用者了承 2026-10-11)。
+    もう 1 つは drawn <16 ms の割合 0% (p95 32〜33 ms)。後者は RDP の描画の間隔によると見ている (確かめてはいない)。
+  - 戻った run `release-checks-20261122-042738-1a29230b` は `Receive-ReleaseCheckResult.ps1` で PASS_WITH_WARNINGS / exit 0 と照合。
+- 前面の記録 (設計担当が戻ったファイルで確認): 9 ケースとも、記録の root の列は `root-window.json` で知らされた HWND (公開前の行は 0)。
+  前面は `claude.exe` か mIV の root (`Window Class`) だけで、`Winit Thread Event Target` が前面になった行は 1 つも無い。
+  5 回目までの「runner が MainWindowHandle で内部の窓へ前面化を要求した」という見立てと矛盾しない (直接の証明ではない)。
+- サブ PC の数値は、サブ PC の記録どうしでだけ比べる (RTX 4060 Ti、1920×1080、96 DPI、RDP)。

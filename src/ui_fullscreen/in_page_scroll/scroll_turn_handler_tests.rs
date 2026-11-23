@@ -18,6 +18,7 @@ pub(super) fn wheel_frame(
     ctx: &egui::Context,
     merge: bool,
 ) -> FsWheelFrameResult {
+    let cursor_active = ctx.input(fullscreen_cursor_active);
     let idx = app.fullscreen_idx.unwrap();
     let state = app.prepare_fullscreen_state(ctx, idx, FsPageTurnDecision::normal());
     let geometry = app.still_seek_geometry_for_idx(full_rect(), idx, false);
@@ -26,6 +27,7 @@ pub(super) fn wheel_frame(
     app.handle_fs_wheel_and_click_frame(
         ui,
         ctx,
+        cursor_active,
         full_rect(),
         &state,
         geometry,
@@ -79,6 +81,160 @@ fn events(delta: f32) -> Vec<egui::Event> {
 fn no_wheel(ctx: &egui::Context) -> bool {
     let options = ctx.options(|o| o.input_options);
     ctx.input(|i| crate::wheel_input::remaining_wheel_segments(i, options).is_empty())
+}
+
+/// Position at the beginning of a reading step or at the end of its column/row.
+/// Compute the expected displacement directly from viewport and edge distances.
+fn independent_step_fixture(
+    app: &mut App,
+    ctx: &egui::Context,
+    next: bool,
+    wrap_move: bool,
+    primary_fraction: f32,
+) -> Vec2 {
+    let geometry = scroll_geometry(&app.fullscreen_page_layout).unwrap();
+    let primary = if app.settings.fullscreen_n_scroll_order
+        == crate::settings::FullscreenNScrollOrder::VerticalFirst
+    {
+        1
+    } else {
+        0
+    };
+    let secondary = 1 - primary;
+    let horizontal = if app.reading_direction == ReadingDirection::Ltr {
+        -1.0
+    } else {
+        1.0
+    };
+    let signs = Vec2::new(horizontal, -1.0) * if next { 1.0 } else { -1.0 };
+    let start = Vec2::new(
+        geometry.axes[0].unwrap().start(signs.x),
+        geometry.axes[1].unwrap().start(signs.y),
+    );
+    let mut pan = start;
+    if wrap_move {
+        pan[primary] = geometry.axes[primary].unwrap().start(-signs[primary]);
+    }
+    let mut expected = start;
+    let axis = if wrap_move { secondary } else { primary };
+    let fraction = if wrap_move {
+        app.settings
+            .fullscreen_n_scroll_wrap_step_percent
+            .unwrap_or(app.settings.fullscreen_n_scroll_step_percent) as f32
+            / 100.0
+    } else {
+        primary_fraction
+    };
+    let range = geometry.axes[axis].unwrap();
+    expected[axis] +=
+        signs[axis] * (geometry.viewport.size()[axis] * fraction).min(range.max - range.min);
+    app.set_fs_pan_from_input(app.fs_zoom, pan);
+    seed(ctx, app);
+    expected
+}
+
+#[test]
+fn configured_wrap_reaches_k_j_and_scroll_then_turn_key_handlers() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    let _clear = ClearKeyboard;
+    use crate::settings::FullscreenNScrollOrder::{HorizontalFirst, VerticalFirst};
+    for order in [VerticalFirst, HorizontalFirst] {
+        for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+            let ctx = egui::Context::default();
+            let mut app = scroll_app(&ctx, SpreadMode::Single);
+            app.fs_zoom = 3.0;
+            app.reading_direction = direction;
+            app.settings.fullscreen_n_scroll_order = order;
+            app.settings.fullscreen_n_scroll_step_percent = 15;
+            app.keymap = crate::keymap::Keymap::from_ini_str(
+                "[FsImage]\nFsPageScrollOrTurnNext = F24\nFsPageScrollOrTurnPrev = F23\n",
+            );
+            seed(&ctx, &mut app);
+            for wrap in [None, Some(15), Some(100)] {
+                app.settings.fullscreen_n_scroll_wrap_step_percent = wrap;
+                for next in [true, false] {
+                    for turn_key in [false, true] {
+                        for wrap_move in [false, true] {
+                            let expected =
+                                independent_step_fixture(&mut app, &ctx, next, wrap_move, 0.15);
+                            let key = match (turn_key, next) {
+                                (false, true) => egui::Key::K,
+                                (false, false) => egui::Key::J,
+                                (true, true) => egui::Key::F24,
+                                (true, false) => egui::Key::F23,
+                            };
+                            frame(&ctx, tap(key), |_, ctx| {
+                                assert!(app.handle_fs_key_input(ctx, 0, false).page_nav.is_none());
+                            });
+                            assert!(
+                                (app.fs_pan - expected).length() < 0.01,
+                                "{order:?} {direction:?} wrap={wrap:?} {key:?} wrap_move={wrap_move}: {:?} != {expected:?}",
+                                app.fs_pan
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn configured_wrap_matches_wheel_frame_prediction_and_application() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    use crate::settings::FullscreenNScrollOrder::{HorizontalFirst, VerticalFirst};
+    for order in [VerticalFirst, HorizontalFirst] {
+        for direction in [ReadingDirection::Ltr, ReadingDirection::Rtl] {
+            let ctx = egui::Context::default();
+            let mut app = scroll_app(&ctx, SpreadMode::Single);
+            app.fs_zoom = 3.0;
+            app.reading_direction = direction;
+            app.settings.fullscreen_n_scroll_order = order;
+            app.settings.fullscreen_n_scroll_step_percent = 15;
+            app.settings.continuous_reading_wheel_scroll_percent = 20;
+            app.settings.fullscreen_wheel_action = FullscreenWheelAction::ScrollThenPageTurn;
+            seed(&ctx, &mut app);
+            for wrap in [None, Some(15), Some(100)] {
+                app.settings.fullscreen_n_scroll_wrap_step_percent = wrap;
+                for next in [true, false] {
+                    for wrap_move in [false, true] {
+                        let expected =
+                            independent_step_fixture(&mut app, &ctx, next, wrap_move, 0.20);
+                        frame(
+                            &ctx,
+                            vec![
+                                egui::Event::PointerMoved(full_rect().center()),
+                                wheel_event(
+                                    egui::vec2(0.0, if next { -120.0 } else { 120.0 }),
+                                    egui::Modifiers::NONE,
+                                ),
+                            ],
+                            |ui, ctx| {
+                                let accepted = actions(&app, ctx);
+                                assert_eq!(accepted.len(), 1);
+                                let predicted =
+                                    app.predict_fs_wheel_frame(ctx, full_rect(), &accepted);
+                                assert!(!predicted.2);
+                                assert!(
+                                    (predicted.1 - expected).length() < 0.01,
+                                    "{order:?} {direction:?} wrap={wrap:?} next={next} wrap_move={wrap_move}: {:?} != {expected:?}",
+                                    predicted.1
+                                );
+                                let result = wheel_frame(&mut app, ui, ctx, false);
+                                assert!(result.page_nav.is_none());
+                                assert!(result.deferred.is_none());
+                                assert_eq!(app.fs_pan, predicted.1);
+                                assert!(no_wheel(ctx));
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[test]

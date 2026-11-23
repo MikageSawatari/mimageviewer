@@ -21,12 +21,12 @@ use crate::collection_store::{
     CollectionAllExportFailure, CollectionAllExportSnapshot, CollectionBatchAddOutcome,
     CollectionCatalogSnapshot, CollectionEntry, CollectionEntryId, CollectionId,
     CollectionImportLineStatus, CollectionImportPreview, CollectionOrderMode,
-    CollectionPrepareError, CollectionPreparedRegistration, CollectionRevisionWatch,
-    CollectionRuntimeEvent, CollectionRuntimeEventStream, CollectionSnapshot,
-    CollectionStoreClient, CollectionStoreError, CollectionStoreRuntime, MAX_COLLECTION_ENTRIES,
-    MAX_COLLECTION_IMPORT_BYTES, parse_collection_text, prepare_collection_export,
-    prepare_collection_registrations, serialize_collection_paths, write_all_collections_export,
-    write_collection_export_atomic,
+    CollectionPrepareError, CollectionPreparedRegistration, CollectionRemovableMissingEntry,
+    CollectionRevisionWatch, CollectionRuntimeEvent, CollectionRuntimeEventStream,
+    CollectionSnapshot, CollectionStoreClient, CollectionStoreError, CollectionStoreRuntime,
+    MAX_COLLECTION_ENTRIES, MAX_COLLECTION_IMPORT_BYTES, parse_collection_text,
+    prepare_collection_export, prepare_collection_registrations, serialize_collection_paths,
+    write_all_collections_export, write_collection_export_atomic,
 };
 
 const COLLECTION_REORDER_DEFAULT_WINDOW_W: f32 = 880.0;
@@ -571,6 +571,12 @@ fn prepare_collection_reorder_projection(
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CollectionRemoveConfirmKind {
+    Selection,
+    Missing { sample_paths: Vec<PathBuf> },
+}
+
 enum CollectionDialogOperation {
     Idle,
     Name {
@@ -587,6 +593,7 @@ enum CollectionDialogOperation {
         expected_revision: u64,
         entry_ids: Vec<CollectionEntryId>,
         origin: CollectionOperationOrigin,
+        kind: CollectionRemoveConfirmKind,
     },
     ReadingImport {
         collection_id: CollectionId,
@@ -4511,24 +4518,17 @@ impl App {
                 expected_revision,
                 entry_ids,
                 origin,
+                kind,
             } => {
-                let mut decision = None;
-                egui::Modal::new(egui::Id::unique("collection_remove_modal")).show(ctx, |ui| {
-                    ui.heading("コレクションから外す");
-                    ui.label(format!(
-                        "{} 件の参照をコレクションから外します。",
-                        entry_ids.len()
-                    ));
-                    ui.label("元のファイルやフォルダは削除しません。");
-                    ui.horizontal(|ui| {
-                        if ui.button("外す").clicked() {
-                            decision = Some(true);
-                        }
-                        if ui.button("キャンセル").clicked() {
-                            decision = Some(false);
-                        }
-                    });
-                });
+                let enter_pressed = self.dialog_enter_pressed(ctx);
+                let escape_pressed = self.dialog_escape_pressed(ctx);
+                let decision = draw_collection_remove_confirm(
+                    ctx,
+                    entry_ids.len(),
+                    &kind,
+                    enter_pressed,
+                    escape_pressed,
+                );
                 match decision {
                     Some(true) => self.submit_collection_remove(
                         collection_id,
@@ -4542,6 +4542,7 @@ impl App {
                         expected_revision,
                         entry_ids,
                         origin,
+                        kind,
                     },
                 }
             }
@@ -4694,6 +4695,15 @@ impl App {
         entry_ids: Vec<CollectionEntryId>,
         origin: CollectionOperationOrigin,
     ) -> CollectionDialogOperation {
+        if entry_ids.is_empty() {
+            return CollectionDialogOperation::Idle;
+        }
+        if let CollectionOperationOrigin::Grid(stamp) = origin
+            && !self.collection_grid_origin_stamp_is_current(stamp)
+        {
+            self.report_stale_collection_grid_remove();
+            return CollectionDialogOperation::Idle;
+        }
         let Some(client) = &self.collection_ui.client else {
             return CollectionDialogOperation::Idle;
         };
@@ -5219,7 +5229,55 @@ impl App {
         &mut self,
         request: crate::app::collection_grid::CollectionGridRemoveTarget,
     ) {
-        if !self.collection_ui.can_edit() || !self.collection_ui.operation.is_idle() {
+        self.request_collection_grid_remove_with_kind(
+            request,
+            CollectionRemoveConfirmKind::Selection,
+        );
+    }
+
+    pub(crate) fn collection_ui_missing_removal_editable(&self) -> bool {
+        self.collection_ui.can_edit() && self.collection_ui.operation.is_idle()
+    }
+
+    pub(crate) fn request_collection_grid_missing_remove(
+        &mut self,
+        target: crate::app::collection_grid::CollectionGridContentTarget,
+        entries: Arc<[CollectionRemovableMissingEntry]>,
+    ) {
+        let sample_paths = entries
+            .iter()
+            .take(5)
+            .map(|entry| entry.source_path.clone())
+            .collect();
+        self.request_collection_grid_remove_with_kind(
+            crate::app::collection_grid::CollectionGridRemoveTarget {
+                stamp: target.stamp,
+                expected_revision: target.expected_revision,
+                entry_ids: entries.iter().map(|entry| entry.entry_id).collect(),
+            },
+            CollectionRemoveConfirmKind::Missing { sample_paths },
+        );
+    }
+
+    fn report_stale_collection_grid_remove(&mut self) {
+        self.show_feedback_warning(
+            "コレクションの一覧が変わったため、外していません。もう一度選んでください".into(),
+        );
+    }
+
+    fn request_collection_grid_remove_with_kind(
+        &mut self,
+        request: crate::app::collection_grid::CollectionGridRemoveTarget,
+        kind: CollectionRemoveConfirmKind,
+    ) {
+        if request.entry_ids.is_empty() {
+            return;
+        }
+        if !self.collection_grid_origin_stamp_is_current(request.stamp) {
+            self.report_stale_collection_grid_remove();
+            return;
+        }
+        if !self.collection_ui_missing_removal_editable() {
             self.show_feedback_warning("コレクションを現在編集できません。".to_string());
             return;
         }
@@ -5228,6 +5286,7 @@ impl App {
             expected_revision: request.expected_revision,
             entry_ids: request.entry_ids,
             origin: CollectionOperationOrigin::Grid(request.stamp),
+            kind,
         };
     }
 }
@@ -5250,6 +5309,61 @@ enum CollectionUiAction {
         revision: u64,
         name: String,
     },
+}
+
+fn draw_collection_remove_confirm(
+    ctx: &egui::Context,
+    count: usize,
+    kind: &CollectionRemoveConfirmKind,
+    enter_pressed: bool,
+    escape_pressed: bool,
+) -> Option<bool> {
+    let mut decision = None;
+    let response = egui::Modal::new(egui::Id::unique("collection_remove_modal")).show(ctx, |ui| {
+        match kind {
+            CollectionRemoveConfirmKind::Selection => {
+                ui.heading("コレクションから外す");
+                ui.label(format!("{count} 件の参照をコレクションから外します。"));
+                ui.label("元のファイルやフォルダは削除しません。");
+            }
+            CollectionRemoveConfirmKind::Missing { sample_paths } => {
+                ui.set_width(620.0_f32.min((ctx.content_rect().width() - 48.0).max(0.0)));
+                ui.heading("見つからない項目をすべて外す");
+                ui.label(format!("見つからない {count} 件の参照をコレクションから外します。"));
+                for path in sample_paths.iter().take(5) {
+                    let full_path = path.display().to_string();
+                    // Left-aligned like the surrounding text; `add_sized` would center the
+                    // label inside its full-width slot. `truncate` keeps each path on one line.
+                    ui.add(egui::Label::new(&full_path).truncate())
+                        .on_hover_text(full_path);
+                }
+                let remaining = count.saturating_sub(sample_paths.len().min(5));
+                if remaining > 0 {
+                    ui.label(format!("ほか {remaining} 件"));
+                }
+                ui.label("外すのは登録だけです。元のファイルやフォルダは削除・変更しません。");
+                ui.weak("つながっていないドライブ・共有フォルダ・リンク先にある項目、読み取れない項目、未対応の項目は外しません。");
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.button("外す").clicked() {
+                decision = Some(true);
+            }
+            if ui.button("キャンセル").clicked() {
+                decision = Some(false);
+            }
+        });
+    });
+    // Modal ownership comes from the preceding frame, so an Enter used to open the
+    // menu command cannot also confirm a newly displayed dialog.
+    if response.is_top_modal && !response.any_popup_open {
+        if escape_pressed {
+            decision = Some(false);
+        } else if enter_pressed {
+            decision = Some(true);
+        }
+    }
+    decision
 }
 
 impl CollectionUiAction {
@@ -6600,6 +6714,7 @@ mod tests {
                 expected_revision,
                 entry_ids,
                 origin,
+                ..
             } => (collection_id, expected_revision, entry_ids, origin),
             _ => panic!("Delete must open reference-removal confirmation"),
         };
@@ -6928,6 +7043,7 @@ mod tests {
             collection_id,
             expected_revision: 7,
             entry_ids: vec![entry_id],
+            kind: CollectionRemoveConfirmKind::Selection,
             origin: CollectionOperationOrigin::Grid(
                 crate::app::top_level_grid_view::CollectionGridRequestStamp {
                     context_id: app.collection_grid_context_id(),
@@ -6959,6 +7075,421 @@ mod tests {
         harness.run();
         harness.get_by_label("コレクションから外す");
         harness.snapshot(name);
+    }
+
+    fn missing_remove_confirm_kind() -> CollectionRemoveConfirmKind {
+        CollectionRemoveConfirmKind::Missing {
+            sample_paths: (0..5)
+                .map(|index| {
+                    PathBuf::from(format!(
+                        r"D:\Photo\{}\見つからない写真-{index}.png",
+                        "長いフォルダ名\\".repeat(20),
+                    ))
+                })
+                .collect(),
+        }
+    }
+
+    fn missing_remove_grid_fixture(
+        temp: &tempfile::TempDir,
+    ) -> (
+        crate::app::AppTestEnvForTest,
+        CollectionStoreClient,
+        crate::app::collection_grid::CollectionGridContentTarget,
+        Arc<[CollectionRemovableMissingEntry]>,
+    ) {
+        let (mut app, client) = start_ready_app(temp);
+        let created = create_collection(&mut app, "Missing removal");
+        let registrations = (0..7)
+            .map(|index| {
+                CollectionRegistration::from_trusted_path(
+                    &temp.path().join(format!("missing-{index}.png")),
+                    CollectionResolvedKind::Image,
+                )
+                .unwrap()
+            })
+            .collect();
+        let added = client
+            .add_batch(created.collection_id(), created.revision(), registrations)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap()
+            .snapshot;
+        app.open_collection_grid(added.collection_id(), None);
+        wait_for_collection_grid(&mut app, added.collection_id());
+        let target = app.collection_grid_content_target().unwrap();
+        let entries = app
+            .top_level_grid_view
+            .collection_session()
+            .unwrap()
+            .prepared()
+            .unwrap()
+            .removable_missing
+            .clone();
+        assert_eq!(entries.len(), 7);
+        (app, client, target, entries)
+    }
+
+    #[test]
+    fn collection_missing_remove_request_preserves_target_ids_paths_and_submits_all_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client, target, entries) = missing_remove_grid_fixture(&temp);
+        app.request_collection_grid_missing_remove(target, Arc::clone(&entries));
+        let (collection_id, expected_revision, entry_ids, origin) = match std::mem::replace(
+            &mut app.collection_ui.operation,
+            CollectionDialogOperation::Idle,
+        ) {
+            CollectionDialogOperation::ConfirmRemove {
+                collection_id,
+                expected_revision,
+                entry_ids,
+                origin,
+                kind: CollectionRemoveConfirmKind::Missing { sample_paths },
+            } => {
+                assert_eq!(collection_id, target.stamp.collection_id);
+                assert_eq!(expected_revision, target.expected_revision);
+                assert_eq!(origin, CollectionOperationOrigin::Grid(target.stamp));
+                assert_eq!(
+                    entry_ids,
+                    entries
+                        .iter()
+                        .map(|entry| entry.entry_id)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    sample_paths,
+                    entries
+                        .iter()
+                        .take(5)
+                        .map(|entry| entry.source_path.clone())
+                        .collect::<Vec<_>>()
+                );
+                (collection_id, expected_revision, entry_ids, origin)
+            }
+            _ => panic!("missing removal must open its typed confirmation"),
+        };
+        // Restoring a source after preparation does not grant removal any file-write authority.
+        std::fs::write(&entries[0].source_path, b"restored source").unwrap();
+        app.collection_ui.operation =
+            app.submit_collection_remove(collection_id, expected_revision, entry_ids, origin);
+        assert!(matches!(
+            app.collection_ui.operation,
+            CollectionDialogOperation::Submitting(ActorTask::ContextRemove { .. })
+        ));
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+        let latest = client
+            .load_collection(collection_id)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(latest.entries.is_empty());
+        assert_eq!(
+            std::fs::read(&entries[0].source_path).unwrap(),
+            b"restored source"
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_remove_rejects_stale_origin_at_request_and_submit_for_both_kinds() {
+        for missing in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let (mut app, client, target, entries) = missing_remove_grid_fixture(&temp);
+            let request = crate::app::collection_grid::CollectionGridRemoveTarget {
+                stamp: target.stamp,
+                expected_revision: target.expected_revision,
+                entry_ids: entries.iter().map(|entry| entry.entry_id).collect(),
+            };
+            // Keep the DB revision unchanged, but replace the originating surface.
+            // Create through the actor so the manager selection (already settled on the
+            // fixture collection) is not part of this test's preconditions.
+            let other = client
+                .create_collection("Other surface".into())
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            app.open_collection_grid(other.collection_id(), None);
+            wait_for_collection_grid(&mut app, other.collection_id());
+            app.open_collection_grid(target.stamp.collection_id, None);
+            wait_for_collection_grid(&mut app, target.stamp.collection_id);
+            assert!(!app.collection_grid_origin_stamp_is_current(target.stamp));
+            if missing {
+                app.request_collection_grid_missing_remove(target, Arc::clone(&entries));
+            } else {
+                app.request_collection_grid_remove(request.clone());
+            }
+            assert!(app.collection_ui.operation.is_idle());
+            assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+                text.contains("一覧が変わったため、外していません")
+            }));
+            app.fs_feedback_toast = None;
+            let operation = app.submit_collection_remove(
+                target.stamp.collection_id,
+                target.expected_revision,
+                request.entry_ids,
+                CollectionOperationOrigin::Grid(target.stamp),
+            );
+            assert!(operation.is_idle());
+            assert!(app.fs_feedback_toast.as_ref().is_some_and(|(text, _, _)| {
+                text.contains("一覧が変わったため、外していません")
+            }));
+            let latest = client
+                .load_collection(target.stamp.collection_id)
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap();
+            assert_eq!(latest.revision(), target.expected_revision);
+            assert_eq!(latest.entries.len(), 7);
+            app.shutdown_collection_runtime_for_exit();
+        }
+    }
+
+    #[test]
+    fn collection_missing_remove_conflicting_revision_preserves_all_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut app, client, target, entries) = missing_remove_grid_fixture(&temp);
+        app.request_collection_grid_missing_remove(target, entries);
+        let CollectionDialogOperation::ConfirmRemove {
+            collection_id,
+            expected_revision,
+            entry_ids,
+            origin,
+            kind: CollectionRemoveConfirmKind::Missing { .. },
+        } = std::mem::replace(
+            &mut app.collection_ui.operation,
+            CollectionDialogOperation::Idle,
+        )
+        else {
+            panic!("missing removal confirmation");
+        };
+        let external = client
+            .rename_collection(
+                collection_id,
+                expected_revision,
+                "Changed externally".into(),
+            )
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        app.collection_ui.operation =
+            app.submit_collection_remove(collection_id, expected_revision, entry_ids, origin);
+        wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+        let latest = client
+            .load_collection(collection_id)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest, external);
+        assert_eq!(latest.entries.len(), 7);
+        assert!(
+            app.fs_feedback_toast
+                .as_ref()
+                .is_some_and(|(text, _, _)| { text.contains("更新") || text.contains("変更") })
+        );
+        app.shutdown_collection_runtime_for_exit();
+    }
+
+    #[test]
+    fn collection_missing_remove_empty_request_is_noop() {
+        let mut app = snapshot_app(false);
+        app.collection_ui.operation = CollectionDialogOperation::Idle;
+        let target = crate::app::collection_grid::CollectionGridContentTarget {
+            stamp: crate::app::top_level_grid_view::CollectionGridRequestStamp {
+                context_id: app.collection_grid_context_id(),
+                surface_generation: app.top_level_grid_view.generation(),
+                collection_id: app.collection_ui.selected_id.unwrap(),
+            },
+            expected_revision: 7,
+            selected_entry_id: None,
+        };
+        app.request_collection_grid_missing_remove(target, Arc::from(Vec::new()));
+        assert!(app.collection_ui.operation.is_idle());
+        assert!(app.fs_feedback_toast.is_none());
+    }
+
+    fn remove_confirm_app(kind: CollectionRemoveConfirmKind) -> crate::app::AppTestEnvForTest {
+        let mut app = snapshot_app(false);
+        app.collection_ui.show_manager = false;
+        app.collection_ui.operation = CollectionDialogOperation::ConfirmRemove {
+            collection_id: app.collection_ui.selected_id.unwrap(),
+            expected_revision: 7,
+            entry_ids: (0..7).map(|_| CollectionEntryId::new()).collect(),
+            origin: CollectionOperationOrigin::Manager,
+            kind,
+        };
+        app
+    }
+
+    fn remove_confirm_key_frame(app: &mut App, ctx: &egui::Context, events: Vec<egui::Event>) {
+        ctx.begin_pass(egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1093.0, 614.0),
+            )),
+            events,
+            ..Default::default()
+        });
+        app.update_ime_state(ctx);
+        app.show_collection_manager(ctx);
+        let _ = ctx.end_pass().drop_without_applying_deltas();
+    }
+
+    fn remove_confirm_key(key: egui::Key, pressed: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn collection_remove_confirm_enter_requires_prior_modal_display_and_escape_cancels() {
+        for missing in [false, true] {
+            for key in [egui::Key::Enter, egui::Key::Escape] {
+                let temp = tempfile::tempdir().unwrap();
+                let (mut app, client, target, entries) = missing_remove_grid_fixture(&temp);
+                app.collection_ui.show_manager = false;
+                if missing {
+                    app.request_collection_grid_missing_remove(target, entries);
+                } else {
+                    app.request_collection_grid_remove(
+                        crate::app::collection_grid::CollectionGridRemoveTarget {
+                            stamp: target.stamp,
+                            expected_revision: target.expected_revision,
+                            entry_ids: entries.iter().map(|entry| entry.entry_id).collect(),
+                        },
+                    );
+                }
+                let ctx = egui::Context::default();
+                crate::ui_fonts::configure_fonts(&ctx);
+                crate::ime_focus::install_ime_input_policy(&ctx);
+                // The Enter which selected the menu command belongs to the old UI.
+                remove_confirm_key_frame(&mut app, &ctx, vec![remove_confirm_key(key, true)]);
+                assert!(matches!(
+                    app.collection_ui.operation,
+                    CollectionDialogOperation::ConfirmRemove { .. }
+                ));
+                remove_confirm_key_frame(&mut app, &ctx, vec![remove_confirm_key(key, false)]);
+                remove_confirm_key_frame(&mut app, &ctx, vec![remove_confirm_key(key, true)]);
+                if key == egui::Key::Enter {
+                    assert!(matches!(
+                        app.collection_ui.operation,
+                        CollectionDialogOperation::Submitting(ActorTask::ContextRemove { .. })
+                    ));
+                    wait_for(&mut app, |app| app.collection_ui.operation.is_idle());
+                } else {
+                    assert!(app.collection_ui.operation.is_idle());
+                }
+                let latest = client
+                    .load_collection(target.stamp.collection_id)
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    latest.entries.len(),
+                    if key == egui::Key::Enter { 0 } else { 7 }
+                );
+                app.shutdown_collection_runtime_for_exit();
+            }
+        }
+    }
+
+    #[test]
+    fn collection_remove_confirm_ime_keeps_enter_and_escape_until_commit() {
+        for kind in [
+            CollectionRemoveConfirmKind::Selection,
+            missing_remove_confirm_kind(),
+        ] {
+            for key in [egui::Key::Enter, egui::Key::Escape] {
+                let mut app = remove_confirm_app(kind.clone());
+                let ctx = egui::Context::default();
+                crate::ui_fonts::configure_fonts(&ctx);
+                crate::ime_focus::install_ime_input_policy(&ctx);
+                remove_confirm_key_frame(&mut app, &ctx, Vec::new());
+                remove_confirm_key_frame(
+                    &mut app,
+                    &ctx,
+                    vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                        text: "変換中".into(),
+                        active_range_chars: None,
+                    })],
+                );
+                remove_confirm_key_frame(&mut app, &ctx, vec![remove_confirm_key(key, true)]);
+                assert!(matches!(
+                    app.collection_ui.operation,
+                    CollectionDialogOperation::ConfirmRemove { .. }
+                ));
+                remove_confirm_key_frame(
+                    &mut app,
+                    &ctx,
+                    vec![
+                        remove_confirm_key(key, false),
+                        egui::Event::Ime(egui::ImeEvent::Commit("変換".into())),
+                    ],
+                );
+                remove_confirm_key_frame(&mut app, &ctx, vec![remove_confirm_key(key, true)]);
+                assert!(app.collection_ui.operation.is_idle());
+            }
+        }
+    }
+
+    #[test]
+    fn collection_missing_remove_confirm_small_viewport_keeps_buttons_visible_and_clickable() {
+        for label in ["外す", "キャンセル"] {
+            let kind = missing_remove_confirm_kind();
+            let mut harness = crate::test_ui::builder()
+                .with_context_setup(crate::ui_fonts::configure_fonts)
+                .with_size(egui::vec2(1093.0, 614.0))
+                .build_ui_state(
+                    move |ui, decision: &mut Option<bool>| {
+                        if let Some(clicked) =
+                            draw_collection_remove_confirm(ui.ctx(), 7, &kind, false, false)
+                        {
+                            *decision = Some(clicked);
+                        }
+                    },
+                    None,
+                );
+            harness.run_steps(4);
+            harness.get_by_label("見つからない項目をすべて外す");
+            harness.get_by_label("ほか 2 件");
+            let viewport = harness.ctx.content_rect();
+            for action in ["外す", "キャンセル"] {
+                assert!(viewport.contains_rect(harness.get_by_label(action).rect()));
+            }
+            harness.get_by_label(label).click();
+            harness.step();
+            assert_eq!(*harness.state(), Some(label == "外す"));
+        }
+    }
+
+    #[test]
+    fn collection_missing_remove_confirm_small_light_snapshot() {
+        let kind = missing_remove_confirm_kind();
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(|ctx| {
+                crate::ui_fonts::configure_fonts(ctx);
+            })
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_ui(move |ui| {
+                // The harness applies its default (dark) theme after context setup, so the Light
+                // theme must be applied inside the frame, like the other collection snapshots.
+                let ctx = ui.ctx().clone();
+                crate::os_theme::apply_resolved(&ctx, crate::os_theme::ResolvedTheme::Light);
+                let _ = draw_collection_remove_confirm(&ctx, 7, &kind, false, false);
+            });
+        harness.run();
+        assert!(!harness.ctx.global_style().visuals.dark_mode);
+        harness.snapshot("collection_missing_remove_confirm_small_light");
     }
 
     fn snapshot_collection_reorder(name: &str) {
@@ -7135,6 +7666,7 @@ mod tests {
                 expected_revision,
                 entry_ids,
                 origin,
+                ..
             } => (collection_id, expected_revision, entry_ids, origin),
             _ => panic!("context remove confirmation"),
         };

@@ -1,0 +1,101 @@
+{
+  "extName": {
+    "message": "mIV で見る - mImageViewer 連携"
+  },
+  "extDescription": {
+    "message": "右クリックした画像を、この PC の mImageViewer で開きます。ブラウザのページの上に mIV の窓を重ねて表示します。"
+  },
+  "menuOpen": {
+    "message": "mIV で見る"
+  },
+  "badgeBusy": {
+    "message": "処理中"
+  },
+  "badgeSuccess": {
+    "message": "成功"
+  },
+  "badgeError": {
+    "message": "!"
+  },
+  "busy": {
+    "message": "画像を処理中です。終わってから操作してください。"
+  },
+  "success": {
+    "message": "mIV への受け渡しが完了しました。"
+  },
+  "interrupted": {
+    "message": "画像の処理が中断されました。必要なら、もう一度「mIV で見る」を選んでください。"
+  },
+  "state_failed": {
+    "message": "処理の状態を記録できませんでした。画像の処理を終了しました。"
+  },
+  "permission_failed": {
+    "message": "サイトの許可を確認できませんでした。"
+  },
+  "permission_denied": {
+    "message": "画像のサイトへの許可がありません。画像を開くには、サイトへのアクセスを許可してください。"
+  },
+  "invalid_url": {
+    "message": "この画像またはページのアドレスには対応していません。HTTP または HTTPS の画像を選んでください。"
+  },
+  "position_failed": {
+    "message": "ブラウザの表示位置を確認できませんでした。"
+  },
+  "rule_failed": {
+    "message": "画像を取得するための準備または後片付けに失敗しました。"
+  },
+  "fetch_failed": {
+    "message": "画像を取得できませんでした。サイトの許可や画像のアドレスを確認してください。"
+  },
+  "too_large": {
+    "message": "画像が大きすぎるため、mIV に渡せませんでした。"
+  },
+  "unregistered": {
+    "message": "ブラウザ連携が未登録です。mIV の環境設定でブラウザ連携を有効にしてください。"
+  },
+  "native_failed": {
+    "message": "mIV からの応答を確認できませんでした。保存済みの画像は「ブラウザ閲覧」フォルダに残ります。"
+  },
+  "context_failed": {
+    "message": "右クリックの位置の記録を準備できませんでした。位置がずれる場合はページを開き直してください。"
+  },
+  "host_invalid_origin": {
+    "message": "この拡張からはブラウザ連携を使えません。正規の拡張を入れて登録し直してください。"
+  },
+  "host_unsupported_version": {
+    "message": "拡張と mIV の版が対応していません。両方を更新し、mIV を再起動してください。"
+  },
+  "host_invalid_request": {
+    "message": "画像の受け渡しに必要な情報が正しくありませんでした。"
+  },
+  "host_message_too_large": {
+    "message": "受け渡す画像が大きすぎるため、mIV が受け付けませんでした。"
+  },
+  "host_invalid_image": {
+    "message": "取得した内容は、対応する画像の形式ではありませんでした。"
+  },
+  "host_invalid_url": {
+    "message": "画像またはページのアドレスを mIV が受け付けませんでした。"
+  },
+  "host_invalid_placement": {
+    "message": "ブラウザの表示位置の情報を mIV が受け付けませんでした。"
+  },
+  "host_registration_missing": {
+    "message": "mIV の環境設定で連携を登録し直してください"
+  },
+  "host_launcher_missing": {
+    "message": "mIV が見つかりません。mIV を入れ直すか、連携を解除してください"
+  },
+  "host_invalid_destination": {
+    "message": "画像の保存先を利用できません。mIV の環境設定で保存先を確認してください。"
+  },
+  "host_save_failed": {
+    "message": "画像を保存できませんでした。保存先と空き容量を確認してください。"
+  },
+  "host_motw_failed": {
+    "message": "画像は保存されましたが、安全性の記録を書き込めませんでした。「ブラウザ閲覧」フォルダに残ります。"
+  },
+  "host_launch_failed": {
+    "message": "画像は保存されましたが、mIV に渡せませんでした。mIV を再起動してください。画像は「ブラウザ閲覧」フォルダに残ります。"
+  }
+}

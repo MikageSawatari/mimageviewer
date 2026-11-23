@@ -4,7 +4,9 @@ use super::*;
 use crate::keymap::{
     KeyContext, KeyTrigger, Keymap, KeymapSettings, PageTurnPressKind, PressMultiplicity,
 };
-use crate::settings::{FullscreenNScrollOrder, FullscreenWheelAction, Settings};
+use crate::settings::{
+    FullscreenNScrollOrder, FullscreenWheelAction, FullscreenWheelZoomStep, Settings,
+};
 use crate::settings_transfer::{export_preferences, parse_preferences};
 use egui_kittest::kittest::Queryable;
 use serde_json::{Value, json};
@@ -32,6 +34,7 @@ fn transfer_document(preferences: Value) -> String {
 fn scroll_extension_settings_missing_fields_keep_released_defaults() {
     for settings in [Settings::default(), serde_json::from_str("{}").unwrap()] {
         assert_eq!(settings.fullscreen_n_scroll_step_percent, 85);
+        assert_eq!(settings.fullscreen_n_scroll_wrap_step_percent, None);
         assert!(!settings.fullscreen_smooth_page_scroll);
         assert_eq!(
             settings.fullscreen_wheel_action,
@@ -106,6 +109,42 @@ fn scroll_extension_settings_roundtrip_and_clamp_only_the_ordered_step() {
                 assert_eq!(loaded.continuous_reading_key_scroll_percent, 16);
             }
         }
+    }
+}
+
+#[test]
+fn n_scroll_wrap_settings_load_clamps_some_and_preserves_missing() {
+    for (input, expected) in [
+        (json!(5), Some(10)),
+        (json!(150), Some(100)),
+        (json!(85), Some(85)),
+        (Value::Null, None),
+    ] {
+        let mut settings: Settings = serde_json::from_value(json!({
+            "fullscreen_n_scroll_step_percent": 15,
+            "fullscreen_n_scroll_wrap_step_percent": input,
+        }))
+        .unwrap();
+        settings.sanitize();
+        assert_eq!(settings.fullscreen_n_scroll_wrap_step_percent, expected);
+        assert_eq!(
+            settings.fullscreen_n_scroll_fractions(),
+            (0.15, expected.unwrap_or(15) as f32 / 100.0)
+        );
+        let loaded: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.fullscreen_n_scroll_wrap_step_percent, expected);
+    }
+    let mut missing: Settings = serde_json::from_str("{}").unwrap();
+    missing.sanitize();
+    assert_eq!(missing.fullscreen_n_scroll_wrap_step_percent, None);
+    for reading in [5, 15, 150] {
+        missing.fullscreen_n_scroll_step_percent = reading;
+        let resolved = reading.clamp(10, 100) as f32 / 100.0;
+        assert_eq!(
+            missing.fullscreen_n_scroll_fractions(),
+            (resolved, resolved)
+        );
     }
 }
 
@@ -481,6 +520,159 @@ fn preferences_harness(app: &mut App) -> egui_kittest::Harness<'_, &mut App> {
 }
 
 #[test]
+fn preferences_n_scroll_wrap_ok_saves_and_cancel_discards_the_draft() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    let _clear = ClearKeyboard;
+    use crate::ui_dialogs::preferences::{PreferencesOpenRequest, PreferencesPage};
+    let mut app = crate::app::setup_app_for_test();
+    app.settings.fullscreen_n_scroll_step_percent = 15;
+    app.open_preferences_request(PreferencesOpenRequest {
+        page: PreferencesPage::SpreadMode,
+        anchor: Some("spread/n-scroll-wrap-step"),
+    });
+    let label = "列 / 段を替えるときは別の移動量にする";
+    {
+        let mut harness = preferences_harness(&mut app);
+        harness.run_steps(5);
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .scroll_to_me();
+        harness.run_steps(3);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run_steps(2);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .fullscreen_n_scroll_wrap_step_percent,
+            Some(15)
+        );
+        assert_eq!(
+            harness
+                .state()
+                .settings
+                .fullscreen_n_scroll_wrap_step_percent,
+            None
+        );
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::SpinButton, label)
+            .focus();
+        harness.run_steps(2);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.event(egui::Event::Text("85".into()));
+        harness.run_steps(2);
+        harness
+            .get_by_label("ページ内を順に読む操作だけに効きます。")
+            .click();
+        harness.run_steps(2);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .fullscreen_n_scroll_wrap_step_percent,
+            Some(85)
+        );
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+    }
+    let persisted = crate::settings_db::SettingsDb::open(app.tmp.path())
+        .unwrap()
+        .load_into_settings()
+        .unwrap();
+    assert_eq!(persisted.fullscreen_n_scroll_wrap_step_percent, Some(85));
+    assert_eq!(app.settings.fullscreen_n_scroll_wrap_step_percent, Some(85));
+    app.open_preferences_request(PreferencesOpenRequest {
+        page: PreferencesPage::SpreadMode,
+        anchor: Some("spread/n-scroll-wrap-step"),
+    });
+    {
+        let mut harness = preferences_harness(&mut app);
+        harness.run_steps(5);
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .scroll_to_me();
+        harness.run_steps(3);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run_steps(2);
+        assert_eq!(
+            harness
+                .state()
+                .pref_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .fullscreen_n_scroll_wrap_step_percent,
+            None
+        );
+        harness.get_by_label("キャンセル").click();
+        harness.run_steps(3);
+        assert!(harness.state().show_preferences_discard_confirm);
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert_eq!(
+            harness
+                .state()
+                .settings
+                .fullscreen_n_scroll_wrap_step_percent,
+            Some(85)
+        );
+    }
+    let persisted = crate::settings_db::SettingsDb::open(app.tmp.path())
+        .unwrap()
+        .load_into_settings()
+        .unwrap();
+    assert_eq!(persisted.fullscreen_n_scroll_wrap_step_percent, Some(85));
+    app.open_preferences_request(PreferencesOpenRequest {
+        page: PreferencesPage::SpreadMode,
+        anchor: Some("spread/n-scroll-wrap-step"),
+    });
+    {
+        let mut harness = preferences_harness(&mut app);
+        harness.run_steps(5);
+        harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .scroll_to_me();
+        harness.run_steps(3);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+            .click();
+        harness.run_steps(2);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_preferences);
+        assert_eq!(
+            harness
+                .state()
+                .settings
+                .fullscreen_n_scroll_wrap_step_percent,
+            None
+        );
+    }
+    let persisted = crate::settings_db::SettingsDb::open(app.tmp.path())
+        .unwrap()
+        .load_into_settings()
+        .unwrap();
+    assert_eq!(persisted.fullscreen_n_scroll_wrap_step_percent, None);
+}
+
+#[test]
 fn preferences_n_scroll_amount_and_smooth_checkbox_ok_save_then_key_use_the_new_values() {
     #[cfg(windows)]
     let _serial = crate::key_input::lock_test_input();
@@ -512,7 +704,9 @@ fn preferences_n_scroll_amount_and_smooth_checkbox_ok_save_then_key_use_the_new_
         harness.run_steps(2);
         harness
             .get_by(|node| {
-                node.min_numeric_value() == Some(10.0) && node.max_numeric_value() == Some(100.0)
+                node.min_numeric_value() == Some(10.0)
+                    && node.max_numeric_value() == Some(100.0)
+                    && !node.is_disabled()
             })
             .focus();
         harness.run_steps(2);
@@ -633,6 +827,108 @@ fn preferences_wheel_zoom_ok_save_then_handler_zooms_instead_of_turning() {
 }
 
 #[test]
+fn section1856_preferences_step_ok_save_then_wheel_and_ctrl_wheel_use_saved_factor() {
+    #[cfg(windows)]
+    let _serial = crate::key_input::lock_test_input();
+    #[cfg(windows)]
+    let _clear = ClearKeyboard;
+    use crate::ui_dialogs::preferences::{PreferencesOpenRequest, PreferencesPage};
+
+    for (step, factor) in [
+        (FullscreenWheelZoomStep::Percent50, 1.5),
+        (
+            FullscreenWheelZoomStep::Standard,
+            1.1_f32.powf(40.0 / WHEEL_SENSITIVITY),
+        ),
+    ] {
+        for (wheel, modifiers) in [
+            (FullscreenWheelAction::Zoom, egui::Modifiers::NONE),
+            (FullscreenWheelAction::PageTurn, egui::Modifiers::CTRL),
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = app(&ctx, SpreadMode::Single);
+            app.settings.fullscreen_wheel_action = FullscreenWheelAction::PageTurn;
+            app.settings.fullscreen_wheel_zoom_step = FullscreenWheelZoomStep::Percent10;
+            app.open_preferences_request(PreferencesOpenRequest {
+                page: PreferencesPage::SpreadMode,
+                anchor: Some("spread/wheel-zoom-step"),
+            });
+            {
+                let mut harness = preferences_harness(&mut app);
+                harness.run_steps(5);
+                harness.state_mut().pref_state.as_mut().unwrap().highlight = None;
+                select_combo(&mut harness, "通常のホイール", wheel.label());
+                select_combo(&mut harness, "ホイールでの拡大・縮小の刻み", step.label());
+                let draft = &harness.state().pref_state.as_ref().unwrap().settings;
+                assert_eq!(draft.fullscreen_wheel_zoom_step, step);
+                assert_eq!(draft.fullscreen_wheel_action, wheel);
+                assert_eq!(
+                    harness.state().settings.fullscreen_wheel_zoom_step,
+                    FullscreenWheelZoomStep::Percent10
+                );
+                harness.get_by_label("  OK  ").click();
+                harness.run_steps(3);
+                assert!(!harness.state().show_preferences);
+            }
+            let persisted = crate::settings_db::SettingsDb::open(app.tmp.path())
+                .unwrap()
+                .load_into_settings()
+                .unwrap();
+            assert_eq!(persisted.fullscreen_wheel_zoom_step, step);
+            assert_eq!(persisted.fullscreen_wheel_action, wheel);
+            assert_eq!(app.settings.fullscreen_wheel_zoom_step, step);
+            assert_eq!(app.settings.fullscreen_wheel_action, wheel);
+            app.fs_zoom = 1.0;
+            app.fs_pan = Vec2::ZERO;
+            for (notch, expected) in [(1.0, factor), (-1.0, 1.0)] {
+                seed(&ctx, &mut app);
+                frame(
+                    &ctx,
+                    vec![
+                        egui::Event::PointerMoved(full_rect().center()),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Line,
+                            delta: Vec2::new(0.0, notch),
+                            modifiers,
+                            phase: egui::TouchPhase::Move,
+                            source: egui::MouseWheelSource::Wheel,
+                        },
+                    ],
+                    |ui, ctx| {
+                        let state =
+                            app.prepare_fullscreen_state(ctx, 0, FsPageTurnDecision::normal());
+                        let (navigation, close) = app.handle_fs_wheel_and_click(
+                            ui,
+                            ctx,
+                            full_rect(),
+                            &state,
+                            false,
+                            0,
+                            &mut None,
+                        );
+                        assert!(navigation.is_none());
+                        assert!(!close);
+                        assert_eq!(app.fullscreen_idx, Some(0));
+                        assert!(
+                            (app.fs_zoom - expected).abs() < 1e-6,
+                            "{step:?}, {wheel:?}, notch={notch}: {} != {expected}",
+                            app.fs_zoom
+                        );
+                        if notch > 0.0 {
+                            assert_eq!(
+                                app.fs_zoom.to_bits(),
+                                factor.to_bits(),
+                                "one native notch, {step:?}, {wheel:?}"
+                            );
+                        }
+                    },
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn preferences_scroll_extension_search_results_jump_to_the_actual_setting_anchors() {
     #[cfg(windows)]
     let _serial = crate::key_input::lock_test_input();
@@ -646,9 +942,11 @@ fn preferences_scroll_extension_search_results_jump_to_the_actual_setting_anchor
     harness.run_steps(3);
     for (query, anchor) in [
         ("ホイール ズーム", "spread/wheel-action"),
+        ("ホイール 刻み", "spread/wheel-zoom-step"),
         ("スクロール＋ページ送り", "spread/wheel-action"),
         ("滑らか", "spread/smooth-page-scroll"),
         ("N 字 移動量", "spread/n-scroll-step"),
+        ("折り返し 重なり", "spread/n-scroll-wrap-step"),
     ] {
         let state = harness.state_mut().pref_state.as_mut().unwrap();
         state.search_query = query.into();

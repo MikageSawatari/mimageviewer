@@ -3,6 +3,15 @@ use super::*;
 use crate::folder_pane::{FolderPaneCursorScroll, FolderPaneState};
 use std::time::SystemTime;
 
+#[path = "folder_pane_reclick_tests.rs"]
+mod reclick;
+
+#[path = "folder_pane_reclick_stage2_tests.rs"]
+mod reclick_stage2;
+
+#[path = "folder_pane_input_gate_tests.rs"]
+mod input_gate;
+
 // These UI fixtures represent the main pane after startup admission. The
 // headless App constructor never drives NotStarted into a terminal indexer
 // outcome, so explicitly select the no-indexer outcome at fixture creation.
@@ -48,6 +57,7 @@ fn folder_pane_user_search_click_and_enter_adopt_then_history_back_to_pre_search
             app.folder_pane.test_seed_listing(&target, vec![], false);
             app.folder_pane.set_cursor(origin.clone());
             let ctx = egui::Context::default();
+            crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
             crate::ui_fonts::configure_fonts(&ctx);
             ctx.enable_accesskit();
             ctx.options_mut(|options| options.max_passes = std::num::NonZeroUsize::new(1).unwrap());
@@ -304,6 +314,7 @@ fn navigation_tree_fixture() -> (AppTestEnvForTest, egui::Context, u64, PathBuf,
     let mut app = setup_app_for_test();
     prepare_headless_folder_pane_fixture(&mut app);
     let ctx = egui::Context::default();
+    crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
     crate::ui_fonts::configure_fonts(&ctx);
     let root = app.tmp.path().join("nav-tree");
     let a = root.join("a");
@@ -345,6 +356,7 @@ fn scrollable_tree_click_fixture(
     let mut app = setup_app_for_test();
     prepare_headless_folder_pane_fixture(&mut app);
     let ctx = egui::Context::default();
+    crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
     crate::ui_fonts::configure_fonts(&ctx);
     let root = app.tmp.path().join("click-scroll-tree");
     let children: Vec<_> = (0..80).map(|i| root.join(format!("row-{i:03}"))).collect();
@@ -721,9 +733,15 @@ fn sidecar_tree_frame(
             // The real root logic phase drains App-global writer replies before
             // hydration polls its quiescence fence. In particular bookmark reads
             // requested by the first folder install must cross that receive edge.
+            app.begin_root_input_gate_pass(ctx);
+            app.edit_preview_repaint_ctx = Some(ctx.clone());
             app.poll_book_bookmark_service_responses();
             app.poll_spread_shift_service();
             app.service_update_registered_writers(ctx);
+            // App::ui services the mounted HistoryTransition owner in
+            // render_update_before_frame, before update_frame's input begin.
+            // render_other_worker_results below does not poll this producer.
+            app.poll_history_navigation_transition_for_test(ctx);
             app.input_update_begin(ctx);
             app.service_edit_completions(ctx, std::time::Instant::now());
             app.service_initial_worker_results(ctx, &mut None);
@@ -756,6 +774,7 @@ fn sidecar_tree_frame(
                 }
             }
             app.post_render_sidecar_restore(ctx);
+            app.end_root_input_gate_pass();
         },
     )
     .drop_without_applying_deltas();
@@ -1443,8 +1462,11 @@ fn ordered_other_then_active_clears_navigation(accesskit: bool) {
                     .any(|row| row.path == a && row.is_cursor)
             );
             assert_eq!(
-                folder_pane_nav, None,
-                "the last single click on the active row retires B's candidate"
+                folder_pane_nav,
+                Some(crate::folder_pane::FolderPaneActivation::RefreshActive(
+                    a.clone()
+                )),
+                "the last single click on the active row replaces B's candidate with A's refresh"
             );
             let grid_nav = app.render_grid(ui);
             app.post_render_main_navigation(
@@ -1981,15 +2003,15 @@ fn tree_label_at(app: &App, ctx: &egui::Context, pos: egui::Pos2) -> PathBuf {
         .data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("folder_pane_test_viewport")))
         .unwrap();
     app.folder_pane
-        .visible_rows()
-        .into_iter()
-        .find(|row| {
-            full_label_rect(ctx, &row.path)
-                .intersect(viewport)
-                .contains(pos)
-        })
+        .label_display
+        .as_ref()
+        .unwrap()
+        .rows
+        .iter()
+        .find(|row| row.label_rect.intersect(viewport).contains(pos))
         .expect("pointer must hit a visible label")
         .path
+        .clone()
 }
 
 fn req40_scrolling_click_scenario(expanded: bool, clicks: u8) {
@@ -2015,16 +2037,23 @@ fn req40_scrolling_click_scenario(expanded: bool, clicks: u8) {
     let viewport = ctx
         .data(|data| data.get_temp::<egui::Rect>(egui::Id::unique("folder_pane_test_viewport")))
         .unwrap();
-    let x = items
+    let x = app
+        .folder_pane
+        .label_display
+        .as_ref()
+        .unwrap()
+        .rows
         .iter()
-        .filter(|path| {
-            let rect = full_label_rect(&ctx, path);
+        .filter(|row| items.contains(&row.path))
+        .filter(|row| {
+            let rect = full_label_rect(&ctx, &row.path);
             rect.top() > viewport.top()
                 && rect.bottom() < viewport.bottom() - 10.0
                 && rect.center().y > viewport.center().y + 60.0
         })
         .next_back()
         .expect("off-center X must be visible in a scrolling tree")
+        .path
         .clone();
     let before = full_label_rect(&ctx, &x);
     let pos = before.center();
@@ -2919,6 +2948,7 @@ fn frame_end_tree_toggle_scenario(case: &str) {
     let mut app = setup_app_for_test();
     prepare_headless_folder_pane_fixture(&mut app);
     let ctx = egui::Context::default();
+    crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
     crate::ui_fonts::configure_fonts(&ctx);
     let root = app.tmp.path().join("frame-end-tree");
     let branch = root.join("z-branch");
@@ -3065,6 +3095,7 @@ fn folder_pane_frame_end_composes_accepted_toggle_parity_without_intermediate_co
             let mut app = setup_app_for_test();
             prepare_headless_folder_pane_fixture(&mut app);
             let ctx = egui::Context::default();
+            crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
             let active = app.tmp.path().join("active");
             let other = active.join("other");
             std::fs::create_dir_all(&other).unwrap();
@@ -3117,6 +3148,7 @@ fn folder_pane_frame_end_composes_accepted_toggle_parity_without_intermediate_co
         let mut app = setup_app_for_test();
         prepare_headless_folder_pane_fixture(&mut app);
         let ctx = egui::Context::default();
+        crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
         let active = app.tmp.path().join("active");
         let other = active.join("other");
         std::fs::create_dir_all(&other).unwrap();
@@ -3143,6 +3175,7 @@ fn folder_pane_frame_end_non_main_chrome_consumes_show_without_starting_scans() 
     let mut app = setup_app_for_test();
     prepare_headless_folder_pane_fixture(&mut app);
     let ctx = egui::Context::default();
+    crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
     let active = app.tmp.path().join("active");
     std::fs::create_dir_all(&active).unwrap();
     app.current_folder = Some(active);
@@ -3163,6 +3196,7 @@ fn folder_pane_frame_end_gamepad_accept_closes_without_restarting_open() {
     let mut app = setup_app_for_test();
     prepare_headless_folder_pane_fixture(&mut app);
     let ctx = egui::Context::default();
+    crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
     let active = app.tmp.path().join("active");
     let other = active.join("other");
     std::fs::create_dir_all(&other).unwrap();
@@ -3257,6 +3291,7 @@ fn folder_pane_late_location(initial: &str, from_key: bool, other_drive: bool) {
     let mut app = setup_app_for_test();
     prepare_headless_folder_pane_fixture(&mut app);
     let ctx = egui::Context::default();
+    crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
     crate::ui_fonts::configure_fonts(&ctx);
     let root = app.tmp.path().join("late-tree");
     let active = root.join("z-branch").join("z-current");
@@ -3332,6 +3367,7 @@ fn folder_pane_explicit_arrow_then_active_change_and_grid_focus_keeps_f_commit()
     let mut app = setup_app_for_test();
     prepare_headless_folder_pane_fixture(&mut app);
     let ctx = egui::Context::default();
+    crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
     crate::ui_fonts::configure_fonts(&ctx);
     let root = app.tmp.path().join("manual-tree");
     let a = root.join("a");
@@ -3391,6 +3427,7 @@ fn folder_pane_drag_inertia_then_arrow_reveal_stays_visible() {
         let mut app = setup_app_for_test();
         prepare_headless_folder_pane_fixture(&mut app);
         let ctx = egui::Context::default();
+        crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
         crate::ui_fonts::configure_fonts(&ctx);
         let root = app.tmp.path().join("inertia-tree");
         std::fs::create_dir(&root).unwrap();
@@ -3509,6 +3546,7 @@ fn tree_open_scenario(route: &str) {
     let mut app = setup_app_for_test();
     prepare_headless_folder_pane_fixture(&mut app);
     let ctx = egui::Context::default();
+    crate::egui_focus_policy::install_tab_shortcut_focus_policy(&ctx);
     crate::ui_fonts::configure_fonts(&ctx);
     // Real subtree scans, many preceding siblings, and multiple ancestors.
     // Ancestors above the fixture use synthetic listings, so the host drive's

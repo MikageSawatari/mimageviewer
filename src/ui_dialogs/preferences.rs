@@ -136,6 +136,7 @@ pub(crate) fn draw_fullscreen_specified_scale_max_controls(
 
 mod name_colors;
 
+mod browser_integration;
 #[cfg(test)]
 mod hover_809;
 #[cfg(test)]
@@ -424,6 +425,7 @@ pub(crate) enum PreferencesPage {
     Slideshow,
     Capture,
     ClipboardCapture,
+    BrowserIntegration,
     BakeStage,
     /// 静止画・動画で共用する Creative 3D LUT (.cube) の登録
     CreativeLut,
@@ -633,6 +635,7 @@ impl PreferencesPage {
         Self::Slideshow,
         Self::Capture,
         Self::ClipboardCapture,
+        Self::BrowserIntegration,
         Self::BakeStage,
         Self::CreativeLut,
         Self::MenuLayout,
@@ -674,6 +677,7 @@ impl PreferencesPage {
             Self::Slideshow => "スライドショー",
             Self::Capture => "キャプチャ保存",
             Self::ClipboardCapture => "クリップボード取り込み",
+            Self::BrowserIntegration => "ブラウザ連携",
             Self::BakeStage => "書き出しの焼き込み",
             Self::CreativeLut => "LUT",
             Self::MenuLayout => "通常メニュー",
@@ -902,6 +906,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::ExternalTools,
             PreferencesPage::ExplorerIntegration,
             PreferencesPage::ClipboardCapture,
+            PreferencesPage::BrowserIntegration,
             PreferencesPage::TrayResidency,
             PreferencesPage::UpdateCheck,
         ],
@@ -1120,6 +1125,11 @@ pub(super) enum ClipboardCaptureFolderResult {
 }
 
 #[doc(hidden)]
+pub fn draw_browser_integration_snapshot_fixture(ui: &mut egui::Ui, scenario: &str) {
+    browser_integration::snapshot(ui, scenario);
+}
+
+#[doc(hidden)]
 pub fn draw_clipboard_capture_settings_snapshot_fixture(ui: &mut egui::Ui, startup_failed: bool) {
     let mut state = PreferencesState::from_settings(
         &Settings::default(),
@@ -1286,6 +1296,9 @@ pub(crate) struct PreferencesState {
     pub manual_threads: usize,
     pub capture_output_dir_input: String,
     pub clipboard_capture_output_dir_input: String,
+    pub(crate) browser_output_input: String,
+    pub(crate) browser_integration_view: crate::browser_integration::View,
+    pub(crate) browser_integration_action: Option<crate::browser_integration::Action>,
     pub clipboard_capture_default_output_dir: Option<PathBuf>,
     pub clipboard_capture_folder_task:
         Option<mpsc::Receiver<Result<ClipboardCaptureFolderResult, String>>>,
@@ -1846,6 +1859,13 @@ impl PreferencesState {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            browser_output_input: s
+                .browser_view_output_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+            browser_integration_view: crate::browser_integration::View::default(),
+            browser_integration_action: None,
             clipboard_capture_default_output_dir: None,
             clipboard_capture_folder_task: None,
             clipboard_capture_folder_message: None,
@@ -2983,6 +3003,12 @@ impl App {
         }
     }
 
+    /// The draw pass builds the dialog state; logic tests build it without a frame.
+    #[cfg(test)]
+    pub(crate) fn ensure_preferences_state_for_test(&mut self) {
+        self.ensure_preferences_state();
+    }
+
     #[cfg(test)]
     pub(crate) fn set_visibility_preferences_for_test(
         &mut self,
@@ -3024,6 +3050,7 @@ impl App {
                 return;
             }
         }
+        self.admit_browser_integration_settings_change(ctx);
         name_colors::clear_hex_editor(ctx);
         if let Some(mut state) = self.pref_state.take() {
             let old_dup = (
@@ -3838,6 +3865,7 @@ impl App {
             cancel = false;
             open = true;
         }
+        self.submit_browser_integration_preferences(ctx);
         if apply {
             self.apply_preferences_dialog(ctx);
         } else if cancel || !open {
@@ -4581,6 +4609,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::Slideshow => page_slideshow(ui, state),
         PreferencesPage::Capture => page_capture(ui, state),
         PreferencesPage::ClipboardCapture => page_clipboard_capture(ui, state),
+        PreferencesPage::BrowserIntegration => browser_integration::page(ui, state),
         PreferencesPage::BakeStage => page_bake_stage(ui, state),
         PreferencesPage::CreativeLut => page_creative_lut(ui, state),
         PreferencesPage::MenuLayout => page_menu_layout(ui, state),

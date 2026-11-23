@@ -793,8 +793,10 @@ Surfaceもswitch epochを省略しない。Bookmarkはコピー済み入力のna
 | Snapshot cache-only分類／採用 | Snapshot row証明（既存snapshot generation + key/kind/target）。viewerの画像metadata世代ではなく、採用時に読むsnapshot自身を検証する。元RARはtyped source、ZIPは既存ArchivePreflightingのbackingとし、成功採用まで同じ証明を保持 |
 | `global_search_ui.rs::capture_search_view_adoption` | Row（search viewのprepare snapshotとsurvivor等）。**prepare要求の送信前**にcaptureし、非同期準備から採用まで保持。結果からのcopied-path openとは別owner |
 | `subfolder_expansion.rs::capture_subfolder_expansion_adoption` | 初回／root-only scanはSurface（copied roots・除去path）。現snapshotの再install/除去/reused metadata・snapshot付きrestoreはRow（現items/cache由来のprepare snapshot）。scan→prepare→installは元証明をmove |
-| `startup_ops.rs::start_startup_open_path_resolution_owned_with_navigation` | Bookmark（native resolver request ID/target）。alias・page待ちでも同要求をmoveし、取消はexact IDで行う。通常startupはnative startup ownerで共通main要求を新規captureしない |
+| `startup_ops.rs::start_startup_open_path_resolution_owned_with_navigation` → `start_startup_open_request_with_navigation` | Bookmark（native resolver request ID/target）。alias・page待ちでも同要求をmoveし、取消はexact IDで行う。通常startupはnative startup ownerで共通main要求を新規captureしない |
 | copied detached archive／Bookmark読込 | main資格のないwindow contextへ渡し、native window lease＋request ID（そのwindowの切替epoch相当）を検証。common main headerを新規captureしない。コピー前に元indexを読むDetachedGrid分類は上のRow。main switch sequenceを別windowへpublishしない |
+
+§1.818 の初回起動・activation・Agent の表示意図と相関 ID は `ExplicitOpenPath` → `StartupOpenPathOwner` → 既存の `ViewerOpenAdoption` で運ぶ。sidecar／composition の待機 owner が context・世代・対象 identity を検証し、有効な明示ファイル要求がある間は履歴より先に選択を所有する。要求の取消は同じ continuation を退役させ、別の pending フラグは作らない。
 
 §1.805 r10では、走査済みパスの再分類を省く変更を撤回し、ツリー・GridFolderCandidateの完了経路を維持する。
 DirectNavigationの対象は分類の要らない名前に限り、完了の再入で再分類は起きない。
@@ -1137,21 +1139,37 @@ Critical 同士は既存レーンを共有するため、前面描画に対す�
 
 EPUB の最初の固定と内容同定台帳への書込は、本ごとの固定ロックで直列化する。backfill / stage-0 は worker 上で来歴確認から SQLite 更新まで保持する。復元は候補分岐時の未固定元状態を保持し、対象範囲lease内でコピー前に再照合して、編集行コピーと台帳昇格まで保持する。範囲外の本の固定は待たせない。rename / purge / restore copy の共通 STORES 更新は EPUB キーを含み得る対象パス範囲だけ lease を保持し、PDF・画像の exact key は待たせない。UI のピン要求作成では EPUB の stat をせず、worker で世代 stamp を解決する。元 EPUB が消えたピン要求は worker で通常のフォルダ代表要求へ戻る。ドライブ一覧の cache-only worker は seed の EPUB 出所と世代を比較する。
 
-### サムネイルの動画・音声長さ取得
+### 一覧全体の長さ・AIメタデータ取得
 
-長さ順・長さ facet (§1.762) が要求されている間は一覧全体の取得範囲と長さのフィールド要件を
-分離し、全動画・音声を既存 `AllRequirements` session に含める。長さだけの要求で AI・日時・
-画像寸法・ページ数を増やさない。長さ順は物理フォルダだけで有効、facet はどの一覧でも有効。
-要件は最後の Item と Finished の間も維持し、可視近傍の `VisibleStage` に置き換えない。
+長さ順・長さ facet (§1.762) とAI facet (§1.835) は一覧全体の取得範囲とフィールド要件を分離し、
+既存 `AllRequirements` session の `WholeListing` で`items`全体を走査する。
+表示集合の外では`ListingMetaRequirements { duration, ai }`に含まれるフィールドだけを取得する。
+長さだけの要求で AI・日時・画像寸法・ページ数を増やさず、AIだけの要求で動画probeを増やさない。
+表示集合内の既存要件と選択情報の対象の例外は保つ。長さ順は物理フォルダだけで有効、facet はどの一覧でも有効。
+要件は最後の Item と Finished の間も維持し、未充足要件がある間は可視近傍の `VisibleStage` に置き換えない。
 画面内 Normal / 画面外 Low の既存 priority と `RetryLater` の同一覧世代での終端を維持する。
 
-`duration_scan_proof` は viewer context の details bundle と同じ所有境界で保持する。
-長さを含む全件 session が Finished・メモリ充足で即時完了・対象 0 件で完了し、計画開始時の
-(`items_generation`, `items.len()`) が現在と一致したときだけ記録する。取得中に対象が変われば
-旧 session を取り消して `NotRequested` へ戻し、新対象を計画する。利用者の停止は `Cancelled` を
-維持し、自動再開しない。完了後の対象変更も proof 不一致から再計画する。選択情報の補助取得は
-proof を消さず、fork 先は None、park / mount は cache と一緒に保持し、兄弟 context を変えない。
-有効な proof まで長さ条件だけを適用せず、完了時に表示集合を再構築する。
+`listing_meta_scan_proof: Option<ListingMetaScanProof>` は viewer context の details bundle と同じ所有境界で保持する。
+証明は計画開始時の一覧世代・件数・要件snapshotを持つ。全件sessionがFinished・メモリ充足で即時完了・
+対象0件で完了し、(`items_generation`, `items.len()`)が現在と一致したときだけ記録する。
+計画中に要件が減っても取得フィールドは開始時snapshotを維持し、現在の未充足要件が空でも
+snapshotを持つ全体FinishedはReconcilingへ回さず、完了helperで証明を立てる。
+同じ一覧の既存証明とは要件の和をとり、長さ／AIの取得済み要件を失わない。
+取得中に対象が変わるか、未充足要件を取得中のsnapshotが含まなければ旧sessionを取り消して
+`NotRequested`へ戻し、再計画する。段階取得は未充足要件が無くなってから許し、全体走査の
+Finishedのsnapshotを証明へ渡す。全体要件がある間、利用者の停止は`Cancelled`を維持し、自動再開しない。
+停止と選択情報の補助取得は有効な証明を消さない。AIメニューの初回要求も、有効なAI証明があれば
+requestedの印だけを立て、停止状態を無効化しない。一覧installで証明を破棄し、対象変更は証明不一致から再計画する。
+fork先はNone、park / mountはcacheと一緒に保持し、兄弟contextを変えない。
+長さ／AIそれぞれが証明されるまでその条件だけを適用せず、証明によって判定可能になった完了時に表示集合を再構築する。
+
+全体proofは通常列の完了を示さない。表示集合の拡大で新たな行の通常列が未充足なら、既存rebuild走査内の
+local boolと昇順の旧集合を進むカーソルで線形に検出し、pending無し・ReadyからNotRequestedへ戻して
+既存の予算付きAllRequirementsを使う。proof・cacheを保持し、pendingは既存の表示revision失効へ従う。
+全体要件がある停止中は利用者の再開を待つ。全体要件が無く通常列だけの一覧は、評価・サイズ等の再投影で
+CancelledからNotRequestedへ戻り自動再開する従来の挙動を保つ。Readyからの縮小や完了後の
+rebuildでは不要な再開を立てず、通常列の完了時には既存rebuild_details_orderで並べ替える。
+追加のApp状態・owner・UI全走査・I/Oは作らない (採用追補は[§1.835 §4.2.2-10](facet-projection-key-835-plan.md))。
 
 一覧の長さ順は materialize 時の snapshot に固定し、長さの取得完了から自動では並べ直さない。
 長さ順の選択・再選択は worker 再走査へ通し、catalog の一括 read-only lookup もそこで行う。
@@ -1544,7 +1562,28 @@ pending 中は追加ホイール入力を捨て、queue も delta 累積もし�
   `final_ai_cache` 挿入を防ぐ)。
 - **同時起動ポリシー**: 先読みは `prefetch_final_ai` が `has_uncancelled_final_ai_pending`
   で gate するため、未キャンセル pending がある間は新しい先読みを enqueue しない
-  (= キューに先読みが溜まりすぎない)。display ジョブはこの gate の対象外で即 enqueue。
+  (= キューに先読みが溜まりすぎない)。さらに先読みはフレーム内の描画より前に走るため、
+  ページ単位表示で draw が素材生成を所有する場合だけ、表示されるページの
+  `DisplayedFinalAiState::Waiting` があれば隣接ページの AI 入力要求・起動を待つ。
+  所有条件は `paged_viewer_materialization_allowed`（overview session なし・表示許可あり・
+  連結読みではない）で draw の target load / material resolve と共有する。
+  prefetch は `paged_draw_materialization_demand` で既存の book permission と同じ
+  `permitted_projection` を読み、許可後の表示ページだけを判定する。overview 中や表示不許可では
+  draw が Waiting を進めないため、新しい gate を適用せず従来どおり先読みする。
+  素材生成を所有する draw は source の `NeedsLoad` を要求し、`LoadPending` / `UploadPending` は
+  既存 loader / upload の回収、素材到着後の AI 待ちは final ensure で進む。
+  `LoadFailed` は `final_ai_job_state` が `Failed` と
+  判定するため、壊れたページを表示し続けても隣接先読みを永久に止めない。
+  `original_preview_active_for_frame` の描画と同じ観測値を `fs_display_stage` に渡し、
+  `displayed_final_ai_state` で判定する。元画像・アニメーション・編集中など AI を起動しない
+  表示段はこの待機を作らない。display ジョブはこの gate の対象外で即 enqueue。
+  連結読みは draw が keep-set の一部だけを処理し、残りは先読みが供給するため、この新しい
+  gate を適用しない。従来の動作を維持し、連結読みで U を押した際の起動順は今回の対象外。
+- **保持結果の復元**: 通常画像・PDF とも、同じ key が live `final_ai_cache` にあれば
+  retained lookup を繰り返さない。復元済み entry を維持し、再描画だけで保持 LRU の clock・
+  hit ログ・retained hit に伴うキャンセルを反復させない。
+  PDF 専用の `restore_retained_pdf_final_ai_composite` も live AI entry を再利用し、
+  カラー化 / Creative LUT の同じ effect が pending の間はその既存 worker を維持する。
 
 > 注: fullscreen session をまたぐ final AI pixels は `retained_final_ai_cache` で
 > 枚数 + MiB の LRU 管理を行う。これは CPU 側の推論結果保持で、表示中の
@@ -2773,3 +2812,38 @@ mutex外で`with_viewer_context_ref`/`with_viewer_context_state`によりparked�
 Current/Next共有素材・DisplayPrepared・legacy・Unknown・held/receipt/batchは保護し、実計算中のpermit/予約は終了まで保持する。
 park単独では取消しない。最新callbackは位置別結果を一体で置換し、Previous Nativeは全削除規則の除去ゼロを検査する。
 新しいqueue/ready latch/全頁・全registry走査や同期I/Oは追加しない。詳細と検証状況は[計画 §27.17.21](page-turn-animation-plan.md)。
+
+## ブラウザ連携の登録 worker（§1.818 段階7）
+
+`App::browser_integration` が単一の状態所有者。準備・登録・解除・保存先の検証／変更・フォルダ picker・フォルダを開く処理は worker に置き、UI は try_recv と snapshot の描画だけを行う。
+root の既存 process-global poll 区間で完了を回収するので、環境設定を閉じた後や fullscreen の early return でも結果を落とさない。処理中の追加要求は拒否し、再試行・rollback・待ち行列は作らない。
+登録の結果を live Settings へ採用してから別 worker で2項目を永続化する。この間も同じ owner の処理中状態を保つ。全体設定の古い snapshot は保存しない。設定ファイルから取り込んだ新規2項目も、OK 時に同じ owner を通す（既存の他項目の適用は維持）。
+まれな失敗はログと通知で割り切る。保存失敗でも登録を巻き戻さず、通常の設定・画像・使用中の世代を破棄しない。
+
+通常のプロセス終了は root lifecycle の他の owner と同じ継続へ接続する。登録 owner が
+消費した `RootCloseIntent` を一つ保持し、登録を更新し得る準備・登録・解除・保存先操作・部分保存の終端まで
+CancelClose して、live Settings の採用と保存後に共通の root 終了へ一度だけ戻す。
+worker 完了済みでも root 未回収なら待機対象で、Quit を後の普通の Close で格下げしない。
+トレイ退避は登録を待たず従来どおり行う。描画しない LogicOnly も同じ receipt poll を行う。
+最終 `on_exit_inner` は迂回経路への fence として既発行 worker の結果を回収し、live へ採用してから
+従来の全体保存へ進む。ここでは新しい登録・部分保存・再試行は始めない。
+準備の `PreparationEffect::ReadOnly` / `MayUpdateRegistration` は worker 発行時の設定から確定する。
+OFF の読み取り準備は終了継続を保持せず、最終 fence でも receiver を捨てて待たない。
+復元モーダルが拒否した普通の Close は root の境界で継続を渡さず、後で再発行しない。
+最終 fence は ChooseFolder の picker も受け取り得る。受付迂回と picker の組み合わせは
+まれな終了の割り切り対象とし、新たな取消・回復の仕組みは追加しない。
+
+## ブラウザ表示 pipe と一回の中継処理（§1.818 段階5〜6）
+
+`ActivationListener` が browser listener と stop event を所有し、接続・読取・書込・応答後の EOF 待ちを
+同じ stop で解除する。listener は次の待受を確保してから peer worker へ接続を移す。
+`PeerWorkers` は応答後に EOF を待つ接続も含め最大4件を所有し、満杯なら新しい接続を切断する。
+再試行・待ち行列は足さない。応答直後の切断で未読応答を捨てず、停止時は全 peer を解除・join する。
+pipe の DACL は既存の current-user 制限を使い、portable / data-dir 別の名前空間も既存 single-instance 規則に合わせる。
+
+listener は受信時点で Remote 所有と受信順を `ActivationOpenPath::received` に捕捉し、
+`BrowserOverlay` の表示意図を同じ activation channel へ渡す。App の受理は既存 owner が後で判断する。
+中継 exe は GUI とは別プロセスで保存・MOTW・launcher 終了待ちを行う。
+成功応答の範囲は受け渡しまでで、App の採用完了を待つ channel は作らない。
+ブラウザ拡張側の取得・中断状態は拡張の責務であり、本節の worker で代行しない。
+拡張は別ブランチで実装済み・このブランチには未統合で、ストアは未公開。

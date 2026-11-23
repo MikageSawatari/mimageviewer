@@ -3156,10 +3156,11 @@ impl App {
                     self.show_media_window_main_hint_toast();
                 }
             }
-            super::PresentationTransitionEffect::CloseDetachedSession { lease, .. } => {
-                self.close_active_detached_session_exact(
+            super::PresentationTransitionEffect::CloseDetachedSession { lease, cause, .. } => {
+                self.close_active_detached_session_exact_with_cause(
                     lease,
                     "video_presentation_transition_non_detached",
+                    cause,
                 );
             }
             super::PresentationTransitionEffect::TerminalSessionClose {

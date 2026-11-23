@@ -2618,6 +2618,37 @@ fn preferences_clipboard_capture_light() {
 }
 
 #[test]
+fn browser818_preferences_light() {
+    browser818_preferences_snapshot("browser818_preferences_light", false, "ready");
+}
+#[test]
+fn browser818_preferences_dark_long_path() {
+    browser818_preferences_snapshot("browser818_preferences_dark_long_path", true, "long");
+}
+#[test]
+fn browser818_preferences_unavailable() {
+    browser818_preferences_snapshot("browser818_preferences_unavailable", false, "unavailable");
+}
+#[test]
+fn browser818_preferences_processing() {
+    browser818_preferences_snapshot("browser818_preferences_processing", true, "busy");
+}
+fn browser818_preferences_snapshot(name: &str, dark: bool, scenario: &'static str) {
+    let theme = if dark {
+        mimageviewer::os_theme::ResolvedTheme::Dark
+    } else {
+        mimageviewer::os_theme::ResolvedTheme::Light
+    };
+    snapshot_with_theme_contrast_and_size(
+        name,
+        theme,
+        mimageviewer::settings::TextContrast::default(),
+        egui::vec2(560.0, 460.0),
+        move |ui| mimageviewer::draw_browser_integration_snapshot_fixture(ui, scenario),
+    );
+}
+
+#[test]
 fn clipboard_html_settings_light() {
     snapshot_with_theme_contrast_and_size(
         "clipboard_html_settings_light",

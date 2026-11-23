@@ -50,9 +50,12 @@ mod book_close_s1;
 mod close_nav_801;
 #[cfg(windows)]
 mod direct_navigation_worker_scan;
+mod grid_edge_buttons_1855;
 mod repro742;
 mod section1768;
 mod section1795;
+#[cfg(windows)]
+mod sort_hold_838;
 
 pub(crate) fn assert_cache_book_cover_only_worker_catalog_contract(
     app: &mut App,
@@ -1377,9 +1380,11 @@ mod file_organize_tests {
                 let (tx, rx) = mpsc::channel();
                 match terminal {
                     0 => tx
-                        .send(Ok(ShellTransferOutcome { aborted: false }))
+                        .send(Ok(ShellTransferOutcome::test_outcome(0, Ok(false), 0)))
                         .unwrap(),
-                    1 => tx.send(Ok(ShellTransferOutcome { aborted: true })).unwrap(),
+                    1 => tx
+                        .send(Ok(ShellTransferOutcome::test_outcome(0, Ok(true), 0)))
+                        .unwrap(),
                     2 => tx.send(Err("fake failure".into())).unwrap(),
                     _ => {}
                 }
@@ -3406,7 +3411,7 @@ fn mutation_refresh_resolve_order_scan(app: &mut App, ready: FolderPaneOpenReady
     }
 }
 
-fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) {
+fn mutation_refresh_assert_rating_sort() {
     let mut app = mutation_refresh_rating_sort_fixture();
     let location = app.folder_nav_current_target();
     let chain = app.rating_view_nav_stack.clone();
@@ -3429,24 +3434,19 @@ fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) 
         (id, generation, cancel.unwrap())
     };
     app.settings.sort_order = SortOrder::FileNameDesc;
-    match physical_mode {
-        PhysicalFolderSortReload::Immediate => app.apply_sort_change_reload(),
-        PhysicalFolderSortReload::WorkerScan => {
-            app.apply_sort_change_reload_without_ui_io();
-            let ready = mutation_refresh_wait_for_order_scan(&mut app);
-            let FolderOpenScanPurpose::CurrentViewOrderRefresh {
-                ref reload_owner, ..
-            } = ready.purpose
-            else {
-                panic!("unexpected scan purpose")
-            };
-            assert!(matches!(
-                reload_owner.as_ref(),
-                OpenRequestOwner::RatingPhysical(_)
-            ));
-            mutation_refresh_resolve_order_scan(&mut app, ready);
-        }
-    }
+    app.apply_sort_change_reload();
+    let ready = mutation_refresh_wait_for_order_scan(&mut app);
+    let FolderOpenScanPurpose::CurrentViewOrderRefresh {
+        ref reload_owner, ..
+    } = ready.purpose
+    else {
+        panic!("unexpected scan purpose")
+    };
+    assert!(matches!(
+        reload_owner.as_ref(),
+        OpenRequestOwner::RatingPhysical(_)
+    ));
+    mutation_refresh_resolve_order_scan(&mut app, ready);
     assert_eq!(app.items[0].name(), "b.png", "changed order was adopted");
     assert_eq!(app.items[1].name(), "a.png");
     assert_eq!(app.folder_nav_current_target(), location);
@@ -3504,19 +3504,19 @@ fn mutation_refresh_assert_rating_sort(physical_mode: PhysicalFolderSortReload) 
 
 #[test]
 fn mutation_refresh_rating_child_sort_immediate_keeps_parent_and_back_forward() {
-    mutation_refresh_assert_rating_sort(PhysicalFolderSortReload::Immediate);
+    mutation_refresh_assert_rating_sort();
 }
 
 #[test]
 fn mutation_refresh_rating_child_sort_worker_keeps_parent_and_back_forward() {
-    mutation_refresh_assert_rating_sort(PhysicalFolderSortReload::WorkerScan);
+    mutation_refresh_assert_rating_sort();
 }
 
 #[test]
 fn mutation_refresh_rating_child_stale_sort_owner_keeps_selection_hint() {
     let mut app = mutation_refresh_rating_sort_fixture();
     app.settings.sort_order = SortOrder::FileNameDesc;
-    app.apply_sort_change_reload_without_ui_io();
+    app.apply_sort_change_reload();
     let ready = mutation_refresh_wait_for_order_scan(&mut app);
     let FolderOpenScanPurpose::CurrentViewOrderRefresh {
         ref order,
@@ -10021,7 +10021,7 @@ fn install_snapshot_details_pending(
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
-        duration_scan: None,
+        listing_meta_scan: None,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -18148,7 +18148,7 @@ mod startup_open_path_resolve_tests {
                 app.tmp.path().join("unresolved-startup-target"),
             )
             .unwrap(),
-            owner: StartupOpenPathOwner::Activation,
+            owner: StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
             cancel: Arc::clone(&cancel),
             rx: resolve_rx,
             started_at: std::time::Instant::now(),
@@ -19090,7 +19090,7 @@ mod startup_open_path_resolve_tests {
                 r"\\server\offline\book.zip",
             ))
             .unwrap(),
-            owner: StartupOpenPathOwner::Activation,
+            owner: StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
             cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             rx,
             started_at: std::time::Instant::now() - std::time::Duration::from_millis(500),
@@ -19125,7 +19125,7 @@ mod startup_open_path_resolve_tests {
                 r"\\server\slow\old.zip",
             ))
             .unwrap(),
-            owner: StartupOpenPathOwner::Activation,
+            owner: StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
             cancel: Arc::clone(&old_cancel),
             rx,
             started_at: std::time::Instant::now(),
@@ -19269,7 +19269,10 @@ mod startup_open_path_resolve_tests {
         assert!(
             app.startup_open_path_resolve_pending
                 .as_ref()
-                .is_some_and(|pending| matches!(pending.owner, StartupOpenPathOwner::Activation))
+                .is_some_and(|pending| matches!(
+                    pending.owner,
+                    StartupOpenPathOwner::Activation(_)
+                ))
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -46271,7 +46274,7 @@ mod favorite_adjustment_defaults_tests {
         tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
             target: app.tmp.path().join("before.jpg"),
             new_path: app.tmp.path().join("after.jpg"),
-            aborted: false,
+            operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(0, Ok(false), 0),
         }))
         .unwrap();
         app.poll_rename_pending(&ctx);
@@ -46318,7 +46321,7 @@ mod favorite_adjustment_defaults_tests {
         tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
             target: app.tmp.path().join("old-folder"),
             new_path: app.tmp.path().join("new-folder"),
-            aborted: false,
+            operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(0, Ok(false), 0),
         }))
         .unwrap();
         app.poll_rename_pending(&ctx);
@@ -46329,7 +46332,11 @@ mod favorite_adjustment_defaults_tests {
             Ok(crate::shell_file_ops::ShellRenameOutcome {
                 target: app.tmp.path().join("cancelled"),
                 new_path: app.tmp.path().join("cancelled-new"),
-                aborted: true,
+                operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(
+                    0,
+                    Ok(true),
+                    0,
+                ),
             }),
             Err("worker failed".to_string()),
         ] {
@@ -46342,6 +46349,58 @@ mod favorite_adjustment_defaults_tests {
             app.poll_rename_pending(&ctx);
             assert!(app.rename_pending.is_none());
             assert_eq!(app.rename_migration_queue.len(), 1);
+        }
+    }
+
+    #[test]
+    fn rename_858_noncompleted_notices_do_not_start_path_migration() {
+        for (perform, abort, processed, expected) in [
+            (0, Ok(true), 0, "名前の変更は中断されました"),
+            (
+                0x80270000u32 as i32,
+                Ok(false),
+                0,
+                "名前の変更は中断されました",
+            ),
+            (
+                0,
+                Ok(true),
+                1,
+                "操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください",
+            ),
+            (
+                0x80070005u32 as i32,
+                Ok(false),
+                0,
+                "操作を完了できませんでした。フォルダの内容を確認してください\nShell: 0x80070005、中断状態: 中断なし",
+            ),
+            (
+                0,
+                Err(0x80004005u32 as i32),
+                0,
+                "操作を完了できませんでした。フォルダの内容を確認してください\nShell: 0x00000000、中断状態: 照会失敗 0x80004005",
+            ),
+        ] {
+            let mut app = setup_app();
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.rename_pending = Some(crate::ui_dialogs::rename_item::RenamePending {
+                rx,
+                collection_scope: crate::collection_store::CollectionSourceMigrationScope::Exact,
+            });
+            tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
+                target: app.tmp.path().join("before.jpg"),
+                new_path: app.tmp.path().join("after.jpg"),
+                operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(
+                    perform, abort, processed,
+                ),
+            }))
+            .unwrap();
+            app.pending_reload = false;
+            app.poll_rename_pending(&egui::Context::default());
+            assert!(app.rename_pending.is_none());
+            assert!(app.rename_migration_queue.is_empty());
+            assert!(!app.pending_reload);
+            assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, expected);
         }
     }
 
@@ -67982,7 +68041,11 @@ mod still_window_mode_key_tests {
         assert!(app.prepare_detached_context_for_grid_open(ctx, idx));
         app.fs_open_intent_from_grid = true;
         let entering_video = matches!(app.items.get(idx), Some(GridItem::Video(_)));
-        app.prepare_viewer_presentation_open(idx, entering_video);
+        app.prepare_viewer_presentation_open(
+            idx,
+            entering_video,
+            crate::app::ViewerOpenAdoption::ContextContinuation,
+        );
         app.fullscreen_idx = Some(idx);
         app.selected = Some(idx);
         app.fs_open_intent_from_grid = false;
@@ -77715,7 +77778,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         let (priority_tx, _priority_rx) = mpsc::channel();
         app.details_meta_pending = Some(DetailsMetaPending {
             scan_scope: DetailsMetaScanScope::AllRequirements,
-            duration_scan: None,
+            listing_meta_scan: None,
             visible_revision: app.details_lazy_visible_revision,
             selection_target_key: None,
             normal_target_keys: Default::default(),
@@ -79814,7 +79877,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
                 navigation: None,
                 diagnostic: None,
                 requested: crate::pdf_loader::LeasedEpubPath::try_new(target.clone()).unwrap(),
-                owner: StartupOpenPathOwner::Activation,
+                owner: StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences()),
                 cancel: std::sync::Arc::clone(&cancel),
                 rx,
                 started_at: std::time::Instant::now(),
@@ -87947,10 +88010,15 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         app.fs_viewport_recreate_after_hide = true;
         set_detached_host_for_test(&mut app, 42, 0x1234, true);
         app.begin_active_detached_session(42, DetachedSource::Image);
+        let close_lease = App::detached_session_lease(42);
+        let close_owner = app
+            .capture_detached_close_owner(close_lease, ViewerCloseCause::User)
+            .unwrap();
 
         app.finalize_closed_active_detached_viewport(
             &ctx,
             App::detached_image_window_viewport_id(42),
+            close_owner,
         );
 
         assert!(
@@ -90650,7 +90718,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         assert!(app.prepare_detached_context_for_grid_open(&ctx, second_video));
         assert_eq!(app.fullscreen_idx, None);
         assert!(app.detached_image_windows.iter().any(|w| w.id == 71));
-        app.prepare_viewer_presentation_open(second_video, true);
+        app.prepare_viewer_presentation_open(
+            second_video,
+            true,
+            crate::app::ViewerOpenAdoption::ContextContinuation,
+        );
 
         let new_id = app
             .detached_viewer_window_id()
@@ -91046,7 +91118,11 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             "different media must continue into the normal park/close/open path"
         );
         assert!(app.park_active_detached_context_for_new_grid_open(&ctx, new_video));
-        app.prepare_viewer_presentation_open(new_video, true);
+        app.prepare_viewer_presentation_open(
+            new_video,
+            true,
+            crate::app::ViewerOpenAdoption::ContextContinuation,
+        );
 
         assert!(app.detached_image_windows.is_empty());
         assert_eq!(app.detached_window_state(71), None);
@@ -100360,7 +100436,8 @@ mod smart_folder_transition_tests {
                     "realmachine50_foreign_offer_before_confirmation",
                 );
             });
-        let origin = StartupOpenPathOwner::Activation.viewer_open_adoption();
+        let origin = StartupOpenPathOwner::Activation(ViewerOpenRequest::preferences())
+            .viewer_open_adoption();
         app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
             viewer_adoption: origin,
             history_trigger: HistoryTrigger::UserChosen,
@@ -107484,7 +107561,7 @@ fn details_lazy_session_stays_active_between_consecutive_page_count_jobs() {
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
-        duration_scan: None,
+        listing_meta_scan: None,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -107893,7 +107970,7 @@ fn leaving_page_count_sort_cancels_full_load_and_returns_to_staged_loading() {
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
-        duration_scan: None,
+        listing_meta_scan: None,
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -107984,7 +108061,7 @@ fn changing_lazy_columns_discards_old_finished_event_and_requeues_new_requiremen
     let (priority_tx, _priority_rx) = std::sync::mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
-        duration_scan: None,
+        listing_meta_scan: None,
         visible_revision: old_revision,
         selection_target_key: None,
         normal_target_keys: Default::default(),
@@ -109904,8 +109981,8 @@ mod ring_picker_owner_tests {
 
     /// 一覧側の行も同じ所有者で確定する。並べ替えは**開いた窓の一覧**を組み直す。
     ///
-    /// `apply_sort_change_reload` は最後に `load_folder` へ落ちる。所有 context を mount した
-    /// まま `load_folder` を通しても、その context の一覧が組み上がって戻ることを固定する
+    /// `apply_sort_change_reload` の worker を所有 context で採用する。要求と完了の
+    /// 間に mount を跨いでも、その context の一覧が組み上がることを固定する
     /// (`with_viewer_context` を跨いだ再読込は 2026-09-03 に一度取りこぼした経緯がある)。
     #[test]
     #[cfg(windows)]
@@ -109943,6 +110020,9 @@ mod ring_picker_owner_tests {
             crate::settings::SortOrder::DateDesc,
             "並べ替えの設定自体は App 共通"
         );
+        let ready = mutation_refresh_wait_for_order_scan(&mut app);
+        mutation_refresh_resolve_order_scan(&mut app, ready);
+        app.finish_page_identity_preparation_for_test();
         assert_eq!(
             app.items.len(),
             2,
@@ -110701,19 +110781,29 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
         !body.contains("self.active_viewer_context_id()"),
         "terminal owner must not retarget the supplied id"
     );
+    let compact = body
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .replace(",)", ")");
+    assert!(compact.contains("self.viewer_context_window(id)"));
+    assert!(compact.contains("Self::detached_session_lease(window_id),cause)"));
+    assert!(
+        compact.contains("self.close_and_retire_context_with_close_owner(id,reason,close_owner,")
+    );
     let body = body.as_str();
     let transfer = body
         .find("self.transfer_terminal_close_return(id, cause);")
         .expect("teardown前の帰還移譲がない");
     let retire = body
-        .find("self.close_and_retire_context(")
+        .find("self.close_and_retire_context_with_close_owner(")
         .expect("typed cause ownerがretire seamを通っていない");
     assert!(
         transfer < retire,
         "帰還の所有値はviewer teardownより前に移譲する"
     );
     let terminal_closure = body
-        .split_once("self.close_and_retire_context(")
+        .split_once("self.close_and_retire_context_with_close_owner(")
         .expect("共有 seam が close-and-retire owner を通っていない")
         .1
         .split_once("|app| {")
@@ -110744,7 +110834,9 @@ fn the_close_and_retire_seam_finishes_the_transition_it_starts() {
     }
 
     // 残余 context の回収も同じ terminal close seam を通る。
-    let production_seams = src.matches("close_and_retire_context(").count();
+    let production_seams = src
+        .matches("close_and_retire_context_with_close_owner(")
+        .count();
     assert_eq!(
         production_seams, 2,
         "close_and_retire_context の呼び出しが {production_seams} 箇所ある。 増えた側も terminal effects を完遂しているか確認し、この検査を更新すること"
@@ -112259,7 +112351,9 @@ fn install_fake_media_duration_pending(app: &mut App) -> Arc<AtomicBool> {
     let (priority_tx, _priority_rx) = mpsc::channel();
     app.details_meta_pending = Some(DetailsMetaPending {
         scan_scope: DetailsMetaScanScope::AllRequirements,
-        duration_scan: None,
+        listing_meta_scan: app
+            .whole_listing_meta_scan_wanted()
+            .then(|| app.listing_meta_scan_snapshot()),
         visible_revision: app.details_lazy_visible_revision,
         selection_target_key: app.selection_info_lazy_target_key(),
         normal_target_keys: HashSet::new(),
@@ -112348,6 +112442,10 @@ fn media_duration_badge_reads_memory_without_changing_details_format() {
 #[test]
 fn media_duration_thumbnail_ai_ready_stage_requests_new_range_without_reloading_ai() {
     let mut app = setup_media_duration_thumbnail_app();
+    // Target construction distinguishes projected rows from whole-listing-only
+    // rows, so establish the real projection before requesting AI metadata.
+    app.rebuild_visible_indices();
+    assert_eq!(app.visible_indices, [0, 1, 2, 3, 4]);
     app.ai_model_facet_requested = true;
     app.keep_set = HashSet::from([4]);
     app.details_tag_prewarm_indices = vec![0, 1];
@@ -112364,6 +112462,9 @@ fn media_duration_thumbnail_ai_ready_stage_requests_new_range_without_reloading_
             ..Default::default()
         },
     );
+    let scan = app.listing_meta_scan_snapshot();
+    app.complete_listing_meta_scan(Some(scan));
+    assert!(app.ai_model_facet_ready());
     app.refresh_thumbnail_details_stage(&egui::Context::default());
     assert!(app.details_lazy_uses_visible_stages());
     assert!(app.details_visible_stage_needs_load());
@@ -112446,6 +112547,9 @@ fn ai_facet_ready_applies_model_and_tool_filters_and_ignore() {
     assert!(app.passes_facet_filter(2, None));
 
     app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    assert!(!app.ai_model_facet_ready(), "Ready alone cannot prove AI");
+    let scan = app.listing_meta_scan_snapshot();
+    app.complete_listing_meta_scan(Some(scan));
     assert!(app.ai_model_facet_ready());
     assert!(!app.passes_facet_filter(2, None));
     assert!(!app.passes_facet_filter(2, Some(FacetField::AiModel)));
@@ -112489,6 +112593,9 @@ fn media_duration_thumbnail_completed_ai_scan_followup_is_bounded() {
     }
     app.keep_set = HashSet::from([media_idx]);
     app.details_image_dims_state = LazyColumnState::Ready { failed: 0 };
+    let scan = app.listing_meta_scan_snapshot();
+    app.complete_listing_meta_scan(Some(scan));
+    assert!(app.ai_model_facet_ready());
     app.last_prefetch_scroll_at = Some(std::time::Instant::now() - PREFETCH_IDLE_THRESHOLD);
     let ctx = egui::Context::default();
     app.refresh_thumbnail_details_stage(&ctx);
@@ -112539,8 +112646,11 @@ fn media_duration_preference_off_cancels_ai_pending_and_preserves_other_requirem
 fn media_duration_video_only_stage_preserves_ready_ai_choices_and_count_cache() {
     let mut app = setup_media_duration_thumbnail_app();
     app.ai_model_facet_requested = true;
+    let scan = app.listing_meta_scan_snapshot();
+    app.complete_listing_meta_scan(Some(scan));
     let _cancel = install_fake_media_duration_pending(&mut app);
     app.details_meta_pending.as_mut().unwrap().scan_scope = DetailsMetaScanScope::VisibleStage;
+    app.details_meta_pending.as_mut().unwrap().listing_meta_scan = None;
     app.facet_ai_model_counts_cache = Some(std::collections::BTreeMap::from([("Model".into(), 3)]));
     app.facet_ai_tool_counts_cache = Some(std::collections::BTreeMap::from([("Tool".into(), 3)]));
     assert!(app.ai_model_facet_ready());
@@ -112608,6 +112718,7 @@ fn media_duration_running_stage_yields_to_first_all_item_ai_request() {
     let mut app = setup_media_duration_thumbnail_app();
     let cancel = install_fake_media_duration_pending(&mut app);
     app.details_meta_pending.as_mut().unwrap().scan_scope = DetailsMetaScanScope::VisibleStage;
+    app.details_meta_pending.as_mut().unwrap().listing_meta_scan = None;
     assert!(!app.ai_model_facet_requested);
     app.request_ai_model_facet_load();
     assert!(cancel.load(Ordering::Relaxed));
@@ -112636,6 +112747,7 @@ fn media_duration_mode_switch_discards_queued_thumbnail_completion_and_plans_all
     let (old_tx, old_rx) = mpsc::channel();
     if let Some(pending) = app.details_meta_pending.as_mut() {
         pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+        pending.listing_meta_scan = None;
         let DetailsMetaPendingPhase::Loading { rx, .. } = &mut pending.phase else {
             panic!("expected worker receiver");
         };
@@ -112712,6 +112824,7 @@ fn media_duration_timeout_retries_after_other_folder_and_reopen() {
     let (tx, rx) = mpsc::channel();
     let pending = app.details_meta_pending.as_mut().unwrap();
     pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+    pending.listing_meta_scan = None;
     pending.normal_target_keys = HashSet::from([key.clone()]);
     let DetailsMetaPendingPhase::Loading { rx: receiver, .. } = &mut pending.phase else {
         panic!("expected worker receiver");
@@ -112966,6 +113079,7 @@ fn selection_info_lazy_mode_switch_preserves_dedicated_duration_with_page_count_
     let (old_tx, old_rx) = mpsc::channel();
     let pending = app.details_meta_pending.as_mut().unwrap();
     pending.scan_scope = DetailsMetaScanScope::VisibleStage;
+    pending.listing_meta_scan = None;
     let DetailsMetaPendingPhase::Loading { rx, .. } = &mut pending.phase else {
         unreachable!()
     };
@@ -112992,6 +113106,8 @@ fn selection_info_lazy_mode_switch_preserves_dedicated_duration_with_page_count_
             .is_err()
     );
     let ctx = egui::Context::default();
+    // Acquire AI for the listing before testing the later selected-only stage.
+    app.ai_model_facet_requested = true;
     app.poll_details_meta_load(&ctx);
     assert_eq!(
         app.details_meta_pending
@@ -113010,9 +113126,9 @@ fn selection_info_lazy_mode_switch_preserves_dedicated_duration_with_page_count_
         assert!(app.details_image_dims_state.is_ready());
     };
     await_ready(&mut app);
+    assert!(app.ai_model_facet_ready());
     assert_eq!(app.details_video_duration_sort_value(1), Some(65000));
     // A selected-only follow-up after full completion is bounded and keeps ready AI facets.
-    app.ai_model_facet_requested = true;
     app.selected = Some(2);
     app.poll_details_meta_load(&ctx);
     assert_eq!(
@@ -115235,13 +115351,21 @@ fn front_popup_presentation_open_keeps_page_owner_until_the_display_target_chang
     app.settings.video_in_window_mode = false;
     app.viewer_presentation = ViewerPresentation::Fullscreen;
     app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
-    app.prepare_viewer_presentation_open(0, false);
+    app.prepare_viewer_presentation_open(
+        0,
+        false,
+        crate::app::ViewerOpenAdoption::ContextContinuation,
+    );
     assert!(
         app.fs_front_pointer.is_active(),
         "a same-viewer page open is not a display handoff"
     );
     app.settings.video_in_window_mode = true;
-    app.prepare_viewer_presentation_open(0, false);
+    app.prepare_viewer_presentation_open(
+        0,
+        false,
+        crate::app::ViewerOpenAdoption::ContextContinuation,
+    );
     assert_eq!(app.viewer_presentation, ViewerPresentation::MainWindow);
     assert!(!app.fs_front_pointer.is_active());
     app.fs_front_pointer = crate::ui_fullscreen::FsFrontPointerOwnership::primary_for_test();
@@ -115999,6 +116123,9 @@ mod ring_saved_group_fullscreen_tests {
         app.fs_viewport_shown = true;
         app.fs_viewport_presentation = Some(ViewerPresentation::DetachedWindow);
         app.begin_mounted_detached_session_for_test(173301, DetachedSource::Image);
+        let close_owner = app
+            .projected_detached_close_owner(ViewerCloseCause::User)
+            .unwrap();
         let source = app
             .smart_folder_source_lease()
             .expect("linked F12 retains main source");
@@ -116020,6 +116147,7 @@ mod ring_saved_group_fullscreen_tests {
         app.finalize_closed_active_detached_viewport(
             &ctx,
             App::detached_image_window_viewport_id(173301),
+            close_owner,
         );
         assert!(app.active_detached_session.is_none());
         assert_eq!(app.detached_viewer_window_id(), None);
@@ -116302,6 +116430,7 @@ fn detached_backend_hwnd_reuse_retires_host_claim_and_reseeds_same_handle() {
 }
 
 mod duration_762;
+mod facet_835;
 
 #[path = "tests/prepared_search_adoption.rs"]
 mod prepared_search_adoption;

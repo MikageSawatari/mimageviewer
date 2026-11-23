@@ -7017,6 +7017,152 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn release_checks_search_recipe_waits_for_settled_hit_list() {
+        // Exercise the real search helper with Done preceding the final RatedBatch.
+        // The additional observations independently test query/search/UI readiness.
+        let state = Arc::new(Mutex::new((false, 0_usize)));
+        let sleeps = Arc::new(AtomicUsize::new(0));
+        let (bridge, _, _) = runner_bridge(ready_snapshot());
+        let mut engine = build_engine(bridge);
+        let count = Arc::clone(&sleeps);
+        engine.register_fn("sleep", move |_: rhai::INT| {
+            count.fetch_add(1, AtomicOrdering::Relaxed);
+        });
+        engine.register_fn(
+            "tap_key",
+            |key: ImmutableString, modifiers: ImmutableString| {
+                assert_eq!(key.as_str(), "G");
+                assert_eq!(modifiers.as_str(), "ctrl");
+            },
+        );
+        let s = Arc::clone(&state);
+        engine.register_fn("release_check_text", move |term: ImmutableString| {
+            assert_eq!(term.as_str(), "needle");
+            s.lock().unwrap().0 = true;
+        });
+        let s = Arc::clone(&state);
+        engine.register_fn("release_check_observe", move || {
+            let mut s = s.lock().unwrap();
+            if s.0 {
+                s.1 += 1;
+            }
+            let stage = s.1;
+            super::release_checks::to_dynamic(&serde_json::json!({
+                "focused":true,"perf_t":stage as f64,"search_active":true,"search_focused":true,
+                "search_done":true,"search_results_settled":stage != 1,
+                "search_query":if stage == 2 {"old-query"} else {"needle"},
+                "search_searching":stage == 3,"interaction_ready":stage != 4,
+                "search_hits":if stage >= 5 {vec!["C:/fixture/hit.png"]} else {vec![]}
+            }))
+        });
+        let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
+            .replace("__SEARCH_HITS__", "[]")
+            .replace("__CACHE_PATHS__", "[]")
+            .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__LOAD_PATHS__", "[]")
+            .replace("__INCLUDE_FIRST_AI__", "false")
+            .replace("__RUNNER_PID__", "202");
+        let helpers = source.split("\nrelease_check_begin(").next().unwrap();
+        let evidence = engine
+            .eval::<Map>(&format!(
+                "{helpers}\nsearch(\"needle\", [\"C:/fixture/hit.png\"])"
+            ))
+            .unwrap();
+        assert_eq!(state.lock().unwrap().1, 5);
+        assert_eq!(sleeps.load(AtomicOrdering::Relaxed), 4);
+        assert!(evidence["completed"].clone().cast::<bool>());
+        assert_eq!(evidence["end_t"].clone().cast::<rhai::FLOAT>(), 5.0);
+        let hits = evidence["actual_hits"].clone().cast::<rhai::Array>();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].clone().cast::<ImmutableString>().as_str(),
+            "C:/fixture/hit.png"
+        );
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
+    fn release_checks_foreground_wait_recipe_uses_typed_timeouts_without_reactivation() {
+        let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
+            .replace("__SEARCH_HITS__", "[]")
+            .replace("__CACHE_PATHS__", "[]")
+            .replace("__NAVIGATION_PATHS__", "[]")
+            .replace("__LOAD_PATHS__", "[]")
+            .replace("__INCLUDE_FIRST_AI__", "false")
+            .replace("__RUNNER_PID__", "202");
+        let helpers = source.split("\nrelease_check_begin(").next().unwrap();
+        for (search_focus, expression, kind, expected_observations, expected_sleeps) in [
+            (false, "focused()", "exact-root-foreground", 200, 200),
+            (
+                true,
+                "search(\"needle\", [])",
+                "ctrl-g-search-focus",
+                302,
+                299,
+            ),
+        ] {
+            // Execute the actual helpers with fake clocks, observations and input.
+            // No session, evidence file, native window or UI command is involved.
+            let observations = Arc::new(AtomicUsize::new(0));
+            let sleeps = Arc::new(AtomicUsize::new(0));
+            let keys = Arc::new(AtomicUsize::new(0));
+            let failures = Arc::new(Mutex::new(Vec::new()));
+            let (bridge, rx, wakes) = runner_bridge(ready_snapshot());
+            let mut engine = build_engine(bridge);
+            engine.register_fn("release_check_foreground_wait_start", || -> rhai::INT {
+                1234
+            });
+            let count = Arc::clone(&observations);
+            engine.register_fn("release_check_observe", move || {
+                count.fetch_add(1, AtomicOrdering::Relaxed);
+                super::release_checks::to_dynamic(&serde_json::json!({
+                    "focused":search_focus,"perf_t":1.0,
+                    "search_active":false,"search_focused":false
+                }))
+            });
+            let count = Arc::clone(&sleeps);
+            engine.register_fn("sleep", move |duration: rhai::INT| {
+                assert_eq!(duration, 100);
+                count.fetch_add(1, AtomicOrdering::Relaxed);
+            });
+            let count = Arc::clone(&keys);
+            engine.register_fn(
+                "tap_key",
+                move |key: ImmutableString, modifiers: ImmutableString| {
+                    assert_eq!(key.as_str(), "G");
+                    assert_eq!(modifiers.as_str(), "ctrl");
+                    count.fetch_add(1, AtomicOrdering::Relaxed);
+                },
+            );
+            let recorded = Arc::clone(&failures);
+            engine.register_fn(
+                "release_check_foreground_wait_failure",
+                move |kind: ImmutableString, start: rhai::INT| -> Result<(), Box<EvalAltResult>> {
+                    recorded.lock().unwrap().push((kind.to_string(), start));
+                    Err(rhai_error("typed foreground wait timeout"))
+                },
+            );
+            let error = engine
+                .eval::<()>(&format!("{helpers}\n{expression}"))
+                .unwrap_err();
+            assert!(error.to_string().contains("typed foreground wait timeout"));
+            assert_eq!(
+                observations.load(AtomicOrdering::Relaxed),
+                expected_observations
+            );
+            assert_eq!(sleeps.load(AtomicOrdering::Relaxed), expected_sleeps);
+            assert_eq!(
+                keys.load(AtomicOrdering::Relaxed),
+                usize::from(search_focus)
+            );
+            assert_eq!(*failures.lock().unwrap(), vec![(kind.to_string(), 1234)]);
+            assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            assert_eq!(wakes.load(AtomicOrdering::Relaxed), 0);
+        }
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn release_checks_seed_waits_for_pin_refresh_before_opening_parent() {
         // Execute the real seed branch/helpers with deterministic observations.
         // No capture, DB, window, input or measured idle interval is involved.
@@ -7042,7 +7188,7 @@ mod tests {
                 "items_generation":1,"loading_complete":true,"index_settled":true,
                 "interaction_ready":ready,"focused":true,"perf_t":1.0,
                 "search_active":true,"search_focused":true,"search_query":"needle",
-                "search_done":true,"search_searching":false,"search_hits":[]});
+                "search_done":true,"search_results_settled":true,"search_searching":false,"search_hits":[]});
             super::release_checks::to_dynamic(&value)
         });
         let s = Arc::clone(&state);
@@ -7124,7 +7270,7 @@ mod tests {
                     "current_folder_path":s.0,"items_generation":s.1,"perf_t":s.2,
                     "loading_complete":true,"index_settled":true,"interaction_ready":true,"focused":true,
                     "search_active":true,"search_focused":true,"search_query":"needle",
-                    "search_done":true,"search_searching":false,"search_hits":[]}))
+                    "search_done":true,"search_results_settled":true,"search_searching":false,"search_hits":[]}))
             });
             let s = Arc::clone(&state);
             engine.register_fn("release_check_open", move |path: ImmutableString| {
@@ -7247,6 +7393,25 @@ mod tests {
 
     #[cfg(feature = "test-script")]
     #[test]
+    fn root_window_recipe_publishes_after_selection_before_initial_observation() {
+        let source = include_str!("../scripts/ui-smoke/release-checks.rhai");
+        let after_selection = source.split_once("\nselect_root();").unwrap().1;
+        let publication = "release_check_publish_root();";
+        assert!(after_selection.trim_start().starts_with(publication));
+        let after_publication = after_selection
+            .trim_start()
+            .strip_prefix(publication)
+            .unwrap();
+        assert!(
+            after_publication
+                .trim_start()
+                .starts_with("for attempt in 0..1800 {")
+        );
+        assert_eq!(source.matches(publication).count(), 1);
+    }
+
+    #[cfg(feature = "test-script")]
+    #[test]
     fn release_checks_bootstrap_waits_for_published_root_without_waking_it() {
         let owner = root_identity(0, 0x4a11);
         let root = window_snapshot(owner.clone(), 1, 0, "static.png");
@@ -7260,12 +7425,23 @@ mod tests {
         let selection = Arc::clone(&bridge.action_selection);
         let wake_count = Arc::clone(&wakes);
         let mut engine = build_engine(bridge);
-        // Stub only the isolated-filesystem setup. The actual recipe wait,
-        // serializer and select_root execute; no native window is created.
+        // Stub the isolated-filesystem setup and its new evidence writer. The
+        // actual recipe wait, serializer and select_root still execute.
         engine.register_fn(
             "release_check_begin",
             |_: ImmutableString, _: ImmutableString| {},
         );
+        let publication = Arc::new(Mutex::new(None));
+        let recorded_publication = Arc::clone(&publication);
+        let published_selection = Arc::clone(&selection);
+        let publication_wakes = Arc::clone(&wakes);
+        engine.register_fn("release_check_publish_root", move || {
+            *recorded_publication.lock().unwrap() = Some((
+                published_selection.lock().unwrap().clone(),
+                Instant::now(),
+                publication_wakes.load(AtomicOrdering::Relaxed),
+            ));
+        });
         let source = include_str!("../scripts/ui-smoke/release-checks.rhai")
             .replace("__SEARCH_HITS__", "[]")
             .replace("__CACHE_PATHS__", "[]")
@@ -7277,19 +7453,25 @@ mod tests {
         let publisher = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             assert_eq!(wake_count.load(AtomicOrdering::Relaxed), 0);
+            let ready_at = Instant::now();
             published.write().unwrap().windows = vec![root];
+            ready_at
         });
-        let selected = engine
-            .eval::<Map>(bootstrap)
+        engine
+            .eval::<()>(bootstrap)
             .expect("release root bootstrap");
+        let ready_at = publisher.join().unwrap();
+        let (published_owner, published_at, publication_wakes) = publication
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("root publication");
         assert_eq!(
-            selected["target_mode"]
-                .clone_cast::<ImmutableString>()
-                .as_str(),
-            "targeted"
+            published_owner,
+            TestScriptActionSelection::Targeted(owner.clone())
         );
-        assert!(selected["current"].clone_cast::<bool>());
-        publisher.join().unwrap();
+        assert!(published_at >= ready_at);
+        assert_eq!(publication_wakes, 2);
         assert_eq!(
             *selection.lock().unwrap(),
             TestScriptActionSelection::Targeted(owner.clone())

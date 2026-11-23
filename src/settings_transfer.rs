@@ -18,6 +18,12 @@ const FORMAT: &str = "mimageviewer.preferences";
 pub const MAX_PREFERENCES_BYTES: usize = 1024 * 1024;
 const INVALID_ITEM: &str = "型、選択肢、範囲、または必須項目が正しくありません";
 
+// Null means "use the reading step" only for this explicitly named item.
+// Do not infer null acceptance from an item's Rust type.
+fn accepts_null(key: &str) -> bool {
+    key == "fullscreen_n_scroll_wrap_step_percent"
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferIssue {
     pub field: String,
@@ -298,7 +304,7 @@ macro_rules! preferences_policy {
             let mut map = Map::new(); let mut issues = Vec::new();
             for accepted in snapshot.values { match accepted {
                 $( Accepted::$field(value) => match serde_json::to_value(&value) {
-                    Ok(raw) if validated::<$ty>(&raw, $check).is_some() => { map.insert(stringify!($field).into(), raw); },
+                    Ok(raw) if (!raw.is_null() || accepts_null(stringify!($field))) && validated::<$ty>(&raw, $check).is_some() => { map.insert(stringify!($field).into(), raw); },
                     _ => issues.push(issue($label)),
                 }, )*
                 Accepted::StillChrome(value) => {
@@ -322,7 +328,7 @@ macro_rules! preferences_policy {
                 result.issues.push(issue("同名のフォルダと本"));
             }
             for (key, raw) in &items { match key.as_str() {
-                $( stringify!($field) => match validated::<$ty>(raw, $check) {
+                $( stringify!($field) => match (!raw.is_null() || accepts_null(key)).then(|| validated::<$ty>(raw, $check)).flatten() {
                     Some(value) => result.accepted.push(Accepted::$field(value)),
                     None => result.issues.push(issue($label)),
                 }, )*
@@ -487,9 +493,12 @@ preferences_policy! {
         fullscreen_horizontal_cursor_direction: FullscreenHorizontalCursorDirection => ("閲覧表示の横カーソル方向", |v, _raw| !matches!(v, FullscreenHorizontalCursorDirection::Unknown), plain, plain);
         fullscreen_up_down_key_action: FullscreenUpDownKeyAction => ("閲覧表示の上下キー操作", |v, _raw| FullscreenUpDownKeyAction::all().contains(v), plain, plain);
         fullscreen_wheel_action: FullscreenWheelAction => ("閲覧表示の通常ホイール操作", |v, _raw| FullscreenWheelAction::all().contains(v), plain, plain);
+        fullscreen_wheel_zoom_step: FullscreenWheelZoomStep => ("ホイールでの拡大・縮小の刻み", |v, _raw| FullscreenWheelZoomStep::all().contains(v), plain, plain);
         fullscreen_n_scroll_order: FullscreenNScrollOrder => ("ページ内スクロールの読み順", |v, _raw| FullscreenNScrollOrder::all().contains(v), plain, plain);
         fullscreen_n_scroll_step_percent: u32 => ("N 字 / Z 字の移動量", |v, _raw| (10..=100).contains(v), plain, plain);
+        fullscreen_n_scroll_wrap_step_percent: Option<u32> => ("N 字 / Z 字の列・段替えの移動量", |v, _raw| v.is_none_or(|v| (10..=100).contains(&v)), plain, plain);
         fullscreen_smooth_page_scroll: bool => ("ページ内のスクロールを滑らかに動かす", |_, _| true, plain, plain);
+        fullscreen_bound_drag_pan: bool => ("閲覧時のドラッグ移動を画像の端までに制限する", |_, _| true, plain, plain);
         fullscreen_page_number_overlay: bool => ("ページ番号を重ねて表示", |_, _| true, plain, plain);
         fullscreen_keep_on_app_switch: bool => ("アプリ切替時に閲覧表示を維持", |_, _| true, plain, plain);
         fullscreen_cursor_hide_delay_secs: f32 => ("閲覧表示のカーソルを隠す時間", |v, _raw| (FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS..=FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS).contains(v) && raw_range(_raw, FULLSCREEN_CURSOR_HIDE_DELAY_MIN_SECS, FULLSCREEN_CURSOR_HIDE_DELAY_MAX_SECS), plain, plain);
@@ -535,6 +544,7 @@ preferences_policy! {
         active_quick_folder_slot => "利用中の A/B ワークスペース。登録先・履歴と一組の利用状態";
         raw_develop_parallelism => @prefs("並列処理のスレッド数", "raw-develop/settings", |v, _| (1..=RAW_PARALLELISM_MAX).contains(v), plain, plain) "CPU/メモリ/速度に依存する RAW 現像 worker 数の tuning";
         show_facet_sort => "環境設定外のツールバーで管理するソート区画の表示状態";
+        show_grid_edge_buttons => "環境設定外で管理するツールバーの表示状態";
         toolbar_folder_section_migrated => "ツールバー配置の一度だけの内部移行記録";
         effetune_pre_limiter_enabled => @prefs("mIV Sound に渡す前に 0dB を超える音を抑える", "video/effetune-input-limit", |_, _| true, plain, plain) "移行先の EffeTune/VST 導入状態と音声処理構成に依存する微調整";
         effetune_auto_open_on_video => @prefs("起動後の最初の動画再生で音響調整の窓を自動で開く", "video/effetune-auto-open", |_, _| true, plain, plain) "移行先の EffeTune 導入状態とウィンドウ運用に依存する表示方針";
@@ -708,6 +718,8 @@ preferences_policy! {
         capture_output_dir => @prefs("キャプチャの保存先", "capture/folder", |_, _| true, plain, plain) "起動・保存・整理先の PC 固有パス";
         book_root => @prefs("本棚フォルダ", "book/root", |_, _| true, plain, plain) "起動・保存・整理先の PC 固有パス";
         clipboard_capture_output_dir => @prefs("クリップボード取り込みの保存先", "clipboard-capture/folder", |_, _| true, plain, plain) "起動・保存・整理先の PC 固有パス";
+        browser_view_output_dir => "起動・保存・整理先の PC 固有パス";
+        browser_integration_enabled => "ブラウザ連携の登録は PC ごとの状態で、移行先を維持";
         active_book_name => "利用データ・登録先・履歴・検索対象";
         pinned_books => "同上";
         conceal_type => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -1537,6 +1549,10 @@ mod tests {
             &settings.fullscreen_wheel_action,
             FullscreenWheelAction::all(),
         );
+        settings.fullscreen_wheel_zoom_step = different_enum(
+            &settings.fullscreen_wheel_zoom_step,
+            FullscreenWheelZoomStep::all(),
+        );
         settings.fullscreen_n_scroll_order = different_enum(
             &settings.fullscreen_n_scroll_order,
             FullscreenNScrollOrder::all(),
@@ -1547,7 +1563,14 @@ mod tests {
             } else {
                 100
             };
+        settings.fullscreen_n_scroll_wrap_step_percent =
+            if settings.fullscreen_n_scroll_wrap_step_percent == Some(100) {
+                Some(10)
+            } else {
+                Some(100)
+            };
         settings.fullscreen_smooth_page_scroll = !settings.fullscreen_smooth_page_scroll;
+        settings.fullscreen_bound_drag_pan = !settings.fullscreen_bound_drag_pan;
         settings.fullscreen_page_number_overlay = !settings.fullscreen_page_number_overlay;
         settings.fullscreen_keep_on_app_switch = !settings.fullscreen_keep_on_app_switch;
         settings.fullscreen_cursor_hide_delay_secs = if settings.fullscreen_cursor_hide_delay_secs
@@ -2474,22 +2497,105 @@ mod tests {
     }
 
     #[test]
+    fn section1856_wheel_zoom_step_transfer_roundtrip_missing_and_invalid_preserve_values() {
+        for &step in FullscreenWheelZoomStep::all() {
+            let source = Settings {
+                fullscreen_wheel_zoom_step: step,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            assert!(exported.issues.is_empty());
+            let mut destination = Settings {
+                fullscreen_wheel_zoom_step: different_enum(&step, FullscreenWheelZoomStep::all()),
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert!(
+                report
+                    .changed_fields
+                    .iter()
+                    .any(|label| label == "ホイールでの拡大・縮小の刻み")
+            );
+            assert_eq!(destination.fullscreen_wheel_zoom_step, step);
+            let report = parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.accepted_count, 0);
+            assert_eq!(destination.fullscreen_wheel_zoom_step, step);
+            // Transfer follows the existing enum policy: invalid imports leave the destination intact.
+            for invalid in [
+                json!("FutureStep"),
+                json!("Unknown"),
+                json!(true),
+                json!(50),
+                Value::Null,
+            ] {
+                let report = parse_preferences(&document(json!({
+                    "fullscreen_wheel_zoom_step": invalid
+                })))
+                .unwrap()
+                .apply_to(&mut destination);
+                assert_eq!(report.accepted_count, 0);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.fullscreen_wheel_zoom_step, step);
+            }
+        }
+    }
+
+    #[test]
+    fn fullscreen_bound_drag_pan_transfer_roundtrip_missing_and_invalid_preserve_values() {
+        for enabled in [false, true] {
+            let source = Settings {
+                fullscreen_bound_drag_pan: enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            let mut destination = Settings {
+                fullscreen_bound_drag_pan: !enabled,
+                ..Settings::default()
+            };
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.fullscreen_bound_drag_pan, enabled);
+            parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.fullscreen_bound_drag_pan, enabled);
+            for invalid in [json!("true"), json!(1), Value::Null] {
+                let report = parse_preferences(&document(json!({
+                    "fullscreen_bound_drag_pan": invalid
+                })))
+                .unwrap()
+                .apply_to(&mut destination);
+                assert_eq!(report.accepted_count, 0);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.fullscreen_bound_drag_pan, enabled);
+            }
+        }
+    }
+
+    #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 508);
+        assert_eq!(entries.len(), 514);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            167
+            170
         );
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            341
+            344
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2504,6 +2610,7 @@ mod tests {
             "show_toolbar_search_metadata",
             "show_toolbar_search_everything",
             "show_toolbar_physical_parent_button",
+            "show_grid_edge_buttons",
         ] {
             assert!(
                 entries
@@ -2530,7 +2637,7 @@ mod tests {
                 "AI permissions must not become writable: {key}"
             );
         }
-        assert_eq!(wire.len(), 165);
+        assert_eq!(wire.len(), 168);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -3140,6 +3247,28 @@ mod tests {
     }
 
     #[test]
+    fn section1855_grid_edge_buttons_are_excluded_from_transfer() {
+        for visible in [false, true] {
+            let mut source = Settings::default();
+            source.show_grid_edge_buttons = visible;
+            let exported = export_preferences(&source).unwrap();
+            let mut document: Value = serde_json::from_str(&exported.json).unwrap();
+            assert!(
+                document["preferences"]
+                    .get("show_grid_edge_buttons")
+                    .is_none()
+            );
+            // An injected key must also leave the destination's local toolbar state alone.
+            document["preferences"]["show_grid_edge_buttons"] = serde_json::json!(visible);
+            let mut destination = Settings::default();
+            destination.show_grid_edge_buttons = !visible;
+            let parsed = parse_preferences(&document.to_string()).unwrap();
+            parsed.apply_to(&mut destination);
+            assert_eq!(destination.show_grid_edge_buttons, !visible);
+        }
+    }
+
+    #[test]
     fn master_preferences_merge_transfers_raw_policy_and_preserves_local_state() {
         let mut source = Settings::default();
         source.raw_brightness = crate::raw::RawBrightness::None;
@@ -3528,9 +3657,79 @@ mod tests {
     }
 
     #[test]
+    fn n_scroll_wrap_transfer_distinguishes_null_from_missing() {
+        let mut destination = Settings {
+            fullscreen_n_scroll_wrap_step_percent: Some(85),
+            ..Settings::default()
+        };
+        let report = parse_preferences(&document(json!({})))
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert_eq!(destination.fullscreen_n_scroll_wrap_step_percent, Some(85));
+        let report = parse_preferences(&document(
+            json!({"fullscreen_n_scroll_wrap_step_percent": null}),
+        ))
+        .unwrap()
+        .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert_eq!(report.accepted_count, 1);
+        assert_eq!(destination.fullscreen_n_scroll_wrap_step_percent, None);
+    }
+
+    #[test]
+    fn n_scroll_wrap_transfer_roundtrips_endpoints_and_none() {
+        for wrap in [None, Some(10), Some(100)] {
+            let source = Settings {
+                fullscreen_n_scroll_wrap_step_percent: wrap,
+                ..Settings::default()
+            };
+            let export = export_preferences(&source).unwrap();
+            assert!(export.issues.is_empty());
+            let raw: Value = serde_json::from_str(&export.json).unwrap();
+            assert_eq!(
+                raw["preferences"]["fullscreen_n_scroll_wrap_step_percent"],
+                json!(wrap)
+            );
+            let mut destination = Settings {
+                fullscreen_n_scroll_wrap_step_percent: Some(85),
+                ..Settings::default()
+            };
+            let report = parse_preferences(&export.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.fullscreen_n_scroll_wrap_step_percent, wrap);
+        }
+    }
+
+    #[test]
+    fn n_scroll_wrap_transfer_rejects_invalid_values_without_changing_current_value() {
+        for invalid in [json!(9), json!(101), json!(50.5), json!("85")] {
+            let mut destination = Settings {
+                fullscreen_n_scroll_wrap_step_percent: Some(85),
+                ..Settings::default()
+            };
+            let report = parse_preferences(&document(
+                json!({"fullscreen_n_scroll_wrap_step_percent": invalid}),
+            ))
+            .unwrap()
+            .apply_to(&mut destination);
+            assert_eq!(report.accepted_count, 0);
+            assert_eq!(report.issues.len(), 1);
+            assert_eq!(destination.fullscreen_n_scroll_wrap_step_percent, Some(85));
+        }
+    }
+
+    #[test]
     fn null_is_rejected_for_every_logical_item() {
         for key in wire_keys() {
             let parsed = parse_preferences(&document(json!({key: null}))).unwrap();
+            if key == "fullscreen_n_scroll_wrap_step_percent" {
+                assert_eq!(parsed.accepted.len(), 1, "{key}");
+                assert!(parsed.issues.is_empty(), "{key}");
+                continue;
+            }
             assert_eq!(parsed.accepted.len(), 0, "{key}");
             assert_eq!(parsed.issues.len(), 1, "{key}");
         }
@@ -3618,6 +3817,7 @@ mod tests {
                 (10).to_string().parse().unwrap(),
                 (100).to_string().parse().unwrap(),
             ),
+            ("fullscreen_n_scroll_wrap_step_percent", 10.0, 100.0),
             (
                 "continuous_reading_wheel_scroll_percent",
                 (1).to_string().parse().unwrap(),
@@ -3700,6 +3900,7 @@ mod tests {
                     | "fullscreen_jump_percent"
                     | "fullscreen_fixed_jump_count"
                     | "fullscreen_n_scroll_step_percent"
+                    | "fullscreen_n_scroll_wrap_step_percent"
                     | "continuous_reading_wheel_scroll_percent"
                     | "continuous_reading_key_scroll_percent"
                     | "continuous_reading_gamepad_scroll_percent_per_sec"

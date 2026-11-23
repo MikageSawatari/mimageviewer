@@ -357,7 +357,7 @@ fn tag_view_open_supersession_tag_refuses_current_view_order_refresh_and_keeps_n
     };
     assert_eq!(image_paths(&app), [a.join("page.png"), a.join("z.png")]);
     app.settings.sort_order = crate::settings::SortOrder::DateDesc;
-    app.apply_sort_change_reload_without_ui_io();
+    app.apply_sort_change_reload();
     let pending = app
         .folder_pane_open_pending
         .as_mut()
@@ -1071,7 +1071,7 @@ fn tag_view_open_supersession_sibling_edge_keeps_real_current_view_order_refresh
     );
 
     app.settings.sort_order = crate::settings::SortOrder::DateDesc;
-    app.apply_sort_change_reload_without_ui_io();
+    app.apply_sort_change_reload();
     let pending = app.folder_pane_open_pending.as_mut().expect("sort scan");
     assert!(matches!(
         pending.purpose,

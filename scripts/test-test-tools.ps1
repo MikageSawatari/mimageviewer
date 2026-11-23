@@ -23,10 +23,15 @@ function Run-Script {
 }
 function Count-Runs { return @(Get-ChildItem (Join-Path $fixture 'target/test-lib-full/runs') -Directory -ErrorAction SilentlyContinue).Count }
 # Test wrappers now require the same six vendor inputs as the real repository.
-[void] [IO.Directory]::CreateDirectory((Join-Path $fixture 'vendor/ffmpeg/bin'))
-foreach ($dll in @('avcodec-61.dll', 'avformat-61.dll', 'avutil-59.dll', 'avfilter-10.dll', 'swscale-8.dll', 'swresample-5.dll')) {
-    Write-Fixture "vendor/ffmpeg/bin/$dll" 'fake FFmpeg input; tiny crate does not import it'
+function New-FixtureFfmpegInputs {
+    param([string] $Root)
+    $directory = Join-Path $Root 'vendor/ffmpeg/bin'
+    [void] [IO.Directory]::CreateDirectory($directory)
+    foreach ($dll in @('avcodec-61.dll', 'avformat-61.dll', 'avutil-59.dll', 'avfilter-10.dll', 'swscale-8.dll', 'swresample-5.dll')) {
+        [IO.File]::WriteAllText((Join-Path $directory $dll), 'fake FFmpeg input; tiny crate does not import it', $utf8)
+    }
 }
+New-FixtureFfmpegInputs $fixture
 Assert-That ((Get-MivTextHash 'abc') -eq 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad') 'SHA-256 known vector mismatch'
 # Observe both flushed pipes before allowing the child to exit, then check capture.
 $streamProbe = Join-Path $fixture 'target/stream-probe'
@@ -534,9 +539,10 @@ if ($Benchmark) {
     foreach ($dir in @('src', 'testimage/flat', 'testimage/nested/sub')) {
         [void] [IO.Directory]::CreateDirectory((Join-Path $benchRoot $dir))
     }
+    New-FixtureFfmpegInputs $benchRoot
     [void] (Invoke-MivGit $benchRoot @('init', '-q'))
     [void] (Invoke-MivGit (Join-Path $benchRoot 'testimage/nested') @('init', '-q'))
-    [IO.File]::WriteAllText((Join-Path $benchRoot '.gitignore'), "target/`ntestimage/`n", $utf8)
+    [IO.File]::WriteAllText((Join-Path $benchRoot '.gitignore'), "target/`nvendor/`ntestimage/`n", $utf8)
     [IO.File]::WriteAllText((Join-Path $benchRoot 'Cargo.toml'), "[package]`nname = `"mimageviewer`"`nversion = `"0.0.0`"`nedition = `"2021`"`n[workspace]`n", $utf8)
     [IO.File]::WriteAllText((Join-Path $benchRoot 'src/lib.rs'), '#[test] fn benchmark_fixture() { assert_eq!(2 + 2, 4); }', $utf8)
     $benchLock = Invoke-MivTool 'cargo' @('generate-lockfile', '--offline') $benchRoot

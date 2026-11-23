@@ -270,7 +270,7 @@ Rust (edition 2024、MSVC) + eframe / egui 0.37 (wgpu 30)。画像は `image` cr
 - `vendor/` は git 管理外。不足は `cargo build` のエラーが復旧手順付きで示す。エージェントは
   `bash scripts/bootstrap-vendor.sh` で揃える。`vendor/models/` と `vendor/vst3-host/` は再取得できないので、
   追加・再ビルドしたら `C:\home\mimageviewer_vendor_backup\` へ実ファイルでコピーし直す。
-- リリースビルドは core → remote → EPUB worker → MCP → editor → launcher の順 (`scripts/build-release.ps1` が行う)。
+- リリースビルドは core → remote → EPUB worker → MCP → editor → browser-host → launcher の順 (`scripts/build-release.ps1` が行う)。
   出力は `<repo>\target\release` に固定する。release wrapper は追加 Cargo 引数を allow-list で停止/build 前に検査し、
   各 build の Cargo artifact の出力先も照合する。環境変数・利用者の Cargo 設定で変わっても署名/内包へ進めない。
   launcher は `-p mimageviewer-launcher --bin mimageviewer` が必要。配布物は必ず `scripts/build-dist.ps1`。
@@ -352,18 +352,19 @@ cargo test -p mimageviewer --test <integration-test-name>
 
 ⚠️ **`test-full.ps1` は `target\release\mimageviewer-core.exe` と
 `target\release\mimageviewer-remote.exe`、`target\release\mimageviewer-epub-pdf.exe`、
-`target\release\mimageviewer-mcp.exe`、`target\release\mimageviewer-musicvideo.exe` の5本が既に在ることを前提にする**。`--workspace` が
+`target\release\mimageviewer-mcp.exe`、`target\release\mimageviewer-musicvideo.exe`、`target\release\mimageviewer-browser-host.exe` の6本が既に在ることを前提にする**。`--workspace` が
 launcher package を含み、その build.rs が内包対象 exe の存在を検査するため、いずれかが
 無いと**テストが 1 件も走らないままビルドエラーで落ちる**。新しい clone や
-`cargo clean` 直後は、先に 5 本を作ってから走らせる (どちらでもよい):
+`cargo clean` 直後は、先に 6 本を作ってから走らせる (どちらでもよい):
 
 ```powershell
-.\scripts\build-release.ps1     # core -> remote -> EPUB worker -> MCP -> editor -> launcher を正しい順で作る
+.\scripts\build-release.ps1     # core -> remote -> EPUB worker -> MCP -> editor -> browser-host -> launcher を正しい順で作る
 cargo build --release --bin mimageviewer-core
 cargo build --release -p mimageviewer-remote --bin mimageviewer-remote --features embedded-web-assets
 cargo build --release -p epub-pdf-worker --bin mimageviewer-epub-pdf
 cargo build --release -p mimageviewer-mcp --bin mimageviewer-mcp
 cargo build --release -p musicvideo-editor --bin mimageviewer-musicvideo
+cargo build --release -p mimageviewer-browser-host --bin mimageviewer-browser-host
 ```
 
 `build-dist.ps1` は test-full を `cargo clean` の**前**に回すので、直前のビルド成果物が
@@ -421,6 +422,15 @@ VST3 bridge、署名、packagingなどrelease構成そのものを確認する�
   「サブPCについて、製品のインストーラを継続的につかってもよいとしたいと思います。サブPCにインストール済みのｍIVは、
   確認のために更新・削除したりしても問題ありません。」)。データは試験用の場所 (`--data-dir` 等) に向け、アンインストールの
   「設定とキャッシュを削除しますか」は本物の `%APPDATA%` を指すので「いいえ」を選ぶ。メイン PC には広げない。
+- **ノート PC (サブ PC2) にも同じ扱い (2026-11-22 利用者決定)**: 確認用に追加するノート PC (サブ PC2) は、上の
+  サブ PC の例外 (Sandbox での試験用ビルドの起動・製品インストーラの使用・インストール済み mIV の更新と削除) と同じ範囲で
+  使ってよい (利用者の言葉: 「サブPCと同様、ノートPCも同じ権限でつかって良いこととしたいと思います。」)。条件 (試験用の
+  データの場所、アンインストール時の「いいえ」、メイン PC には広げない) も同じ。
+- **サブ PC とノート PC の `%APPDATA%` も使ってよい (2026-11-22 利用者決定)**: 確認に必要なら、サブ PC・サブ PC2 の
+  既定のデータフォルダ (`%APPDATA%\mimageviewer`) で mIV を動かしてよい (利用者の言葉: 「必要であればサブPCのAPPDATA以下も
+  つかってもらっても大丈夫です。どちらもメインではつかっておらず、動作確認程度にしかつかっていない環境です。」)。
+  既定のデータフォルダでしか確かめられない確認 (ブラウザ連携の登録など) に使い、それ以外は今までどおり使い捨ての
+  `--data-dir` を使う。メイン PC には広げない。
 - ユニットテストで再現できない Windows ネイティブ挙動を変えたら、実機確認を頼む前に検証用バイナリを用意する
   (core 内の挙動は `.\scripts\build-dev.ps1`、release 構成に依存する挙動は `.\scripts\build-release.ps1`)。
   エージェントのツールから呼ぶときは `*>&1` を付けない。

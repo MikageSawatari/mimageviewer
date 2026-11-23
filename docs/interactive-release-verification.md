@@ -79,6 +79,20 @@ wheel/panやGPU scanoutの確認には読み替えない。このscenario名、�
 S0 の環境確認 (同計画 §12) もこの範囲で行う。サブ PC の Claude Code セッションに Sandbox の起動を
 頼む場合も、Sandbox の外で mIV を起動しないこと。
 
+## サブ PC のキットで流す ReleaseChecks (2026-11-21〜)
+
+利用者決定 (2026-11-21): リリース前の ReleaseChecks は、公開前にサブ PC で流す
+(手順は [リリース手順チェックリスト](release-checklist.md) 9.6、仕組みは
+[自動化計画 §11](release-check-automation-plan.md#relcheck-subpc-kit))。これは手順の決定であって、常設の実行了承ではない。
+
+- 統括は毎回、依頼を送る前に、対象のキット (kit ID と manifest の SHA-256)、サブ PC での事前確認
+  (`Test-SubPcEnvironment.ps1`、使い捨ての窓 2 つ) と本番 (`ui-smoke.ps1 -Scenario ReleaseChecks -FromKit`) 各 1 回、
+  見込み時間、使い捨て data を利用者へ示し、了承をもらう。了承した範囲を依頼文に書く。
+- サブ PC 担当は依頼文の範囲だけを実行する。NOT_READY・SKIPPED・FAIL でも流し直さない (流し直しは改めて了承をもらう)。
+- 起動するのはキットの試験用 portable (`portable,test-script`、manifest と hash を照合したもの) だけで、data はキットの中の使い捨て。
+  サブ PC のインストール版・`%APPDATA%\mimageviewer`・利用者の実データは使わない。
+- 夜間試験の時間枠 (01:00〜07:00) と、ほかのサブ PC 依頼とは重ねない。
+
 ## データ保護と記録
 
 実行了承は、通常profileの起動許可を兼ねない。エージェントは引き続き

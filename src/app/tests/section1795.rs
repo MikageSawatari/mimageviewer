@@ -710,7 +710,7 @@ fn section1795_off_refresh_and_sort_preserve_current_position() {
     assert_position(&env, Some(29), 420.0);
     // The production worker sort route uses PreservePresentation and an explicit hint.
     env.settings.sort_order = crate::settings::SortOrder::FileNameDesc;
-    env.apply_sort_change_reload_without_ui_io();
+    env.apply_sort_change_reload();
     let ready = mutation_refresh_wait_for_order_scan(&mut env);
     mutation_refresh_resolve_order_scan(&mut env, ready);
     env.finish_page_identity_preparation_for_test();

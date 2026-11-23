@@ -1,6 +1,9 @@
 //! Clipboard classification, bounded decoding and file publication.
 //! These functions perform no clipboard I/O; parsing and saving run on workers.
 
+pub(crate) use mimageviewer_capture_file::{
+    CaptureOrigin, CaptureTimestamp, capture_filename, sanitize_url, write_motw,
+};
 use sha2::{Digest, Sha256};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -175,22 +178,6 @@ pub(crate) struct RawClipboardData {
     pub chromium_source: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct CaptureOrigin {
-    pub page_url: Option<String>,
-    pub image_url: Option<String>,
-}
-
-impl CaptureOrigin {
-    pub fn domain(&self) -> Option<String> {
-        self.page_url
-            .as_deref()
-            .or(self.image_url.as_deref())
-            .and_then(|value| url::Url::parse(value).ok())
-            .and_then(|value| value.host_str().map(str::to_owned))
-    }
-}
-
 /// Only Chromium's image URL format establishes image-copy provenance. We do
 /// not infer Firefox provenance from its HTML fragment (plan §5.8).
 pub(crate) fn image_origin(raw: &RawClipboardData) -> CaptureOrigin {
@@ -225,22 +212,6 @@ pub(crate) fn image_origin(raw: &RawClipboardData) -> CaptureOrigin {
         page_url,
         image_url,
     }
-}
-
-pub(crate) fn sanitize_url(value: &str) -> Option<String> {
-    // Reject literal control characters instead of allowing URL parsing to
-    // erase line breaks supplied for a Zone.Identifier injection.
-    if value.chars().any(char::is_control) {
-        return None;
-    }
-    let mut parsed = url::Url::parse(value).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return None;
-    }
-    parsed.set_username("").ok()?;
-    parsed.set_password(None).ok()?;
-    parsed.set_fragment(None);
-    Some(parsed.to_string())
 }
 
 pub(crate) fn html_source_url(bytes: &[u8]) -> Option<String> {
@@ -364,115 +335,6 @@ pub(crate) fn decode_image(raw: &RawClipboardData) -> Result<CapturedImage, Stri
     })
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct CaptureTimestamp {
-    pub stamp: String,
-    pub month: String,
-}
-
-impl CaptureTimestamp {
-    pub fn now() -> Self {
-        #[cfg(windows)]
-        {
-            let time = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
-            Self {
-                stamp: format!(
-                    "{:04}{:02}{:02}-{:02}{:02}{:02}-{:03}",
-                    time.wYear,
-                    time.wMonth,
-                    time.wDay,
-                    time.wHour,
-                    time.wMinute,
-                    time.wSecond,
-                    time.wMilliseconds
-                ),
-                month: format!("{:04}-{:02}", time.wYear, time.wMonth),
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            // Production is Windows-only; deterministic UTC fallback for other
-            // targets uses the UNIX date without a platform time dependency.
-            let elapsed = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            let days = elapsed.as_secs() / 86400;
-            let z = days as i64 + 719468;
-            let era = z / 146097;
-            let doe = z - era * 146097;
-            let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-            let mp = (5 * doy + 2) / 153;
-            let day = doy - (153 * mp + 2) / 5 + 1;
-            let month = mp + if mp < 10 { 3 } else { -9 };
-            let year = yoe + era * 400 + i64::from(month <= 2);
-            let seconds = elapsed.as_secs() % 86400;
-            Self {
-                stamp: format!(
-                    "{year:04}{month:02}{day:02}-{:02}{:02}{:02}-{:03}",
-                    seconds / 3600,
-                    seconds / 60 % 60,
-                    seconds % 60,
-                    elapsed.subsec_millis()
-                ),
-                month: format!("{year:04}-{month:02}"),
-            }
-        }
-    }
-}
-
-pub(crate) fn capture_filename(
-    timestamp: &CaptureTimestamp,
-    domain: Option<&str>,
-    index: usize,
-    total: usize,
-    collision: usize,
-    extension: &str,
-) -> String {
-    let suffix = if collision > 1 {
-        format!("-{collision}")
-    } else {
-        String::new()
-    };
-    let domain = domain
-        .map(|value| {
-            value
-                .chars()
-                .map(|c| {
-                    if c == '_' || c.is_control() || "<>:\"/\\|?*".contains(c) {
-                        '-'
-                    } else {
-                        c
-                    }
-                })
-                .collect::<String>()
-        })
-        .filter(|value| !value.is_empty())
-        .map(|value| format!("-{value}"))
-        .unwrap_or_default();
-    let digits = total.max(1).to_string().len().max(2);
-    format!(
-        "{}{suffix}{domain}_{index:0digits$}.{extension}",
-        timestamp.stamp
-    )
-}
-
-pub(crate) fn motw_contents(origin: &CaptureOrigin) -> Option<String> {
-    let page = origin.page_url.as_deref().and_then(sanitize_url);
-    let image = origin.image_url.as_deref().and_then(sanitize_url);
-    if page.is_none() && image.is_none() {
-        return None;
-    }
-    let mut result = "[ZoneTransfer]\r\nZoneId=3\r\n".to_owned();
-    if let Some(value) = page {
-        result.push_str(&format!("ReferrerUrl={value}\r\n"));
-    }
-    if let Some(value) = image {
-        result.push_str(&format!("HostUrl={value}\r\n"));
-    }
-    Some(result)
-}
-
 #[derive(Debug)]
 pub(crate) struct SavedImage {
     pub path: PathBuf,
@@ -532,19 +394,6 @@ pub(crate) fn save_image_in_folder(
         path,
         metadata_error,
     })
-}
-
-pub(super) fn write_motw(path: &Path, origin: &CaptureOrigin) -> Result<(), String> {
-    #[cfg(windows)]
-    if let Some(contents) = motw_contents(origin) {
-        let mut ads = path.as_os_str().to_os_string();
-        ads.push(":Zone.Identifier");
-        std::fs::write(PathBuf::from(ads), contents)
-            .map_err(|error| format!("出どころを記録できませんでした: {error}"))?;
-    }
-    #[cfg(not(windows))]
-    let _ = (path, origin);
-    Ok(())
 }
 
 /// Startup worker cleanup is intentionally shallow and does not follow links
@@ -613,6 +462,7 @@ fn is_reparse(metadata: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mimageviewer_capture_file::motw_contents;
 
     fn formats(names: &[&str]) -> ClipboardFormats {
         ClipboardFormats {
@@ -1180,6 +1030,47 @@ mod tests {
             stamp: "20261002-153012-345".into(),
             month: "2026-10".into(),
         }
+    }
+
+    #[test]
+    fn browser818_capture_file_same_timestamp_publication_preserves_both_images() {
+        let root = tempfile::tempdir().unwrap();
+        let destination = root.path().join("not-created-yet");
+        assert!(!destination.exists());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers: Vec<_> = [1, 2]
+            .into_iter()
+            .map(|value| {
+                let destination = destination.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let image = decode_image(&RawClipboardData {
+                        png: Some(png(1, 1, &[value, 2, 3, 255])),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                    barrier.wait();
+                    let saved = save_image(&image, &destination, &timestamp()).unwrap();
+                    (saved.path, image.png)
+                })
+            })
+            .collect();
+        let saved: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_ne!(saved[0].0, saved[1].0);
+        let mut names = Vec::new();
+        for (path, bytes) in &saved {
+            assert_eq!(path.parent().unwrap(), destination.join("2026-10"));
+            assert_eq!(std::fs::read(path).unwrap(), *bytes);
+            names.push(path.file_name().unwrap().to_str().unwrap());
+        }
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["20261002-153012-345-2_01.png", "20261002-153012-345_01.png"]
+        );
     }
 
     #[test]

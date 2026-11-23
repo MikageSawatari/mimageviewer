@@ -1052,6 +1052,34 @@ impl SettingsDb {
         )
     }
 
+    /// Worker-only browser registration write; never serializes an old Settings
+    /// snapshot over unrelated settings or touches the permission epoch.
+    pub(crate) fn save_browser_integration(
+        &self,
+        enabled: bool,
+        output: &Option<PathBuf>,
+    ) -> Result<(), SettingsDbError> {
+        let mut inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        if !existing_bootstrap_marker_present(&inner.conn)?
+            || !singleton_endpoint_marker_present(&inner.conn)?
+        {
+            return Err(SettingsDbError::SaveSuppressed);
+        }
+        read_singleton_endpoint_settings(&inner.conn)?;
+        let tx = inner.conn.transaction()?;
+        for (key, value) in [
+            (
+                "browser_integration_enabled",
+                serde_json::to_string(&enabled)?,
+            ),
+            ("browser_view_output_dir", serde_json::to_string(output)?),
+        ] {
+            tx.execute("INSERT INTO settings_kv(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![key, value])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// `Settings` を全テーブルに書き出す。
     ///
     /// rotation には触れない (= bootstrap save と user save 両方が共有)。
@@ -5149,6 +5177,68 @@ mod tests {
         let loaded = db.load_into_settings().unwrap();
         assert!(!loaded.skip_offline_change_scan);
         assert_eq!(loaded.grid_cols, 7);
+    }
+
+    #[test]
+    fn section1856_full_settings_payload_and_db_without_zoom_step_use_standard() {
+        use crate::settings::{FullscreenWheelAction, FullscreenWheelZoomStep};
+
+        let source = Settings {
+            fullscreen_wheel_zoom_step: FullscreenWheelZoomStep::Percent100,
+            fullscreen_wheel_action: FullscreenWheelAction::Zoom,
+            fullscreen_n_scroll_step_percent: 50,
+            grid_cols: 7,
+            show_hidden_files: true,
+            ..Settings::default()
+        };
+        let assert_missing_step = |loaded: &Settings| {
+            assert_eq!(
+                loaded.fullscreen_wheel_zoom_step,
+                FullscreenWheelZoomStep::Standard
+            );
+            assert_eq!(
+                loaded.fullscreen_wheel_action,
+                source.fullscreen_wheel_action
+            );
+            assert_eq!(
+                loaded.fullscreen_n_scroll_step_percent,
+                source.fullscreen_n_scroll_step_percent
+            );
+            assert_eq!(loaded.grid_cols, source.grid_cols);
+            assert_eq!(loaded.show_hidden_files, source.show_hidden_files);
+        };
+
+        let mut payload = serde_json::to_value(&source).unwrap();
+        assert_eq!(
+            payload
+                .as_object_mut()
+                .unwrap()
+                .remove("fullscreen_wheel_zoom_step"),
+            Some(Value::String("Percent100".into()))
+        );
+        // build_settings_from_db uses this same from_value path for its reconstructed payload.
+        let loaded: Settings = serde_json::from_value(payload).unwrap();
+        assert_missing_step(&loaded);
+
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&source).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().fullscreen_wheel_zoom_step,
+            source.fullscreen_wheel_zoom_step
+        );
+        let removed = db
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'fullscreen_wheel_zoom_step'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(removed, 1);
+        assert_missing_step(&db.load_into_settings().unwrap());
     }
 
     #[test]

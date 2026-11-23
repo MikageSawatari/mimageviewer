@@ -412,6 +412,7 @@ pub(super) fn deferred_wheel_proposal(
     ui: &mut egui::Ui,
     ctx: &egui::Context,
 ) -> FsWheelFrameProposal {
+    let cursor_active = ctx.input(fullscreen_cursor_active);
     let idx = app.fullscreen_idx.unwrap();
     let state = app.prepare_fullscreen_state(ctx, idx, FsPageTurnDecision::normal());
     let geometry = app.still_seek_geometry_for_idx(full_rect(), idx, state.is_video);
@@ -420,6 +421,7 @@ pub(super) fn deferred_wheel_proposal(
     let result = app.handle_fs_wheel_and_click_frame(
         ui,
         ctx,
+        cursor_active,
         full_rect(),
         &state,
         geometry,

@@ -55,15 +55,15 @@ message-only HWND、非表示HWND、表示前に空regionを設定した非ア�
   `%APPDATA%\mimageviewer` を使う。`dev-runtime` はアプリのデータprofile名ではない。
 - **release構成依存の実行**: launcher、release-only cfg／最適化、exact release performance、
   埋め込みasset展開、変更したVST3 bridge、署名、packagingに依存する場合は
-  `.\scripts\build-release.ps1`。内部で core → remote → EPUB worker → MCP → editor → launcher の 6 段 cargo build を回し、常駐mIVを
+  `.\scripts\build-release.ps1`。内部で core → remote → EPUB worker → MCP → editor → browser host → launcher の 7 段 cargo build を回し、常駐mIVを
   自動停止してLNK1104を回避する。出力は `target\release\mimageviewer.exe` (launcher) と
-  `target\release\mimageviewer-core.exe` (本体)、`target\release\mimageviewer-remote.exe`、`target\release\mimageviewer-epub-pdf.exe`、`target\release\mimageviewer-mcp.exe`、`target\release\mimageviewer-musicvideo.exe`。
+  `target\release\mimageviewer-core.exe` (本体)、`target\release\mimageviewer-remote.exe`、`target\release\mimageviewer-epub-pdf.exe`、`target\release\mimageviewer-mcp.exe`、`target\release\mimageviewer-musicvideo.exe`、`target\release\mimageviewer-browser-host.exe`。
 - **配布ではないので `build-dist.ps1` は使わない**。配布物を作るときだけclean-firstの
   `build-dist.ps1`。
 - **⚠️ エージェントのツールから呼ぶときは `*>&1` を付けない**。PowerShell の `-ErrorAction Stop`
   下で cargo の stderr が terminating error 化して即失敗する
   ([docs/release-operations.md](release-operations.md) §2.2)。PowerShell ツールは stderr を自前で拾うので、素の
-  `.\scripts\build-release.ps1` で呼ぶ。失敗する場合は core → remote → EPUB worker → MCP → editor → launcher の 6 段 cargo build を
+  `.\scripts\build-release.ps1` で呼ぶ。失敗する場合は core → remote → EPUB worker → MCP → editor → browser host → launcher の 7 段 cargo build を
   直接叩く。
 - **依頼のしかた**: core検証なら
   `Start-Process -FilePath .\target\dev-runtime\mimageviewer-core.exe`、release構成検証なら
@@ -92,8 +92,22 @@ message-only HWND、非表示HWND、表示前に空regionを設定した非ア�
   サブ PC 側がテスト用フォルダへコピーして使う。2026-11-01 時点のサブ PC は VS 2026 (18) が無く、
   Build Tools も vswhere に登録されていないので、サブ PC でのビルドは前提にしない。
   G: などメイン PC の他のドライブが見えるかは未確認。必要ならビルド成果物を C: 側へ置く。
+  RDP のクリップボードの共有は 2026-11-22 からオフにしている (利用者がオフにしてつなぎ直した)。画面操作の道具が文字の入力に
+  クリップボードを使うと、共有していればメイン PC 側の中身まで置き換わるため。ドライブの共有 (C:) はオンのまま残す。
+  PC の間で文字を受け渡すときは、`\\tsclient\C` の下のファイルを使う。
 - **画面操作**: サブ PC 側の computer-use は、利用者がサブ PC の前でアプリごとに承認する必要がある。
-  コマンドの許可を求められた場合も同じ。
+  コマンドの許可を求められた場合も同じ。この承認は権限モード (auto など) とは別の仕組みで、auto でも残る。
+- **試すビルドは毎回同じ場所に置く (2026-11-22)**: computer-use の許可は exe のフルパスごとに記録され、会話をまたいで残る
+  (観測者はサブ PC 担当)。依頼ごとに exe の場所を変えると、そのたびに承認が要る (11 月上旬から約 120 件たまっていた)。
+  そこで、試すビルドの exe は依頼に関係なく `C:\miv-subpc-test\app\` へコピーし、そこから起動する。`--data-dir` と
+  テストデータは今までどおり依頼ごとに分ける (例: `C:\range835-test\data`)。上書きの前に、前の依頼の mIV が終わっていることを
+  確かめる。同じ場所で中身だけ差し替えても、承認は出直さなかった (2026-11-22、tree828diag の回、観測者はサブ PC 担当)。
+  ノート PC (サブ PC2) でも同じ規則にする。
+- **承認待ちは利用者に見える側で出す (2026-11-22)**: 承認の画面は Claude アプリのいる仮想デスクトップに出るため、
+  mIV のデスクトップのままだと利用者が気づかない (サブ PC2 で実際に気づかれないまま待っていた)。`request_access` と
+  `AskUserQuestion` の直前に毎回、Claude アプリのデスクトップへ切り替え、PushNotification を送り、音 (`Alarm08.wav`) を鳴らす。
+  承認の後は mIV のデスクトップへ戻り、隠れ具合 (`cloaked`) を確かめてから操作を再開する。手順の正本はサブ PC 担当が書いた
+  `C:\home\mimageviewer-subpc\tools\approval-desktop-procedure.md` (リポジトリの外)。サブ PC とサブ PC2 の両方で使う。
 - **Claude アプリの窓が操作の邪魔をする (2026-11-03 調査)**: Windows 版 Claude デスクトップアプリは画面操作中、
   自分の窓を画面の端のパネルに縮めて最前面に固定し、画面写真を撮る瞬間だけ写らないようにする
   (GitHub anthropics/claude-code の issue 95580・106102・103735 の報告。公式の回避設定は無い)。
@@ -103,5 +117,8 @@ message-only HWND、非表示HWND、表示前に空regionを設定した非ア�
   `-Mode Unpin` で外す。`Place` はパネルが出た状態ではまだ試していない (未確認)。
   全画面表示のテストはこの方法では右端がパネルに隠れる。画面を 2 枚にする案 (RDP の複数モニター)
   は未確認。
+- **リリース前の ReleaseChecks** (2026-11-21〜): メイン PC で作ったキットをサブ PC で流す。画面操作はせず、
+  スクリプトが試験用 portable をキットの中の使い捨て data で起動する。依頼文は
+  [subpc-release-checks-brief.md](subpc-release-checks-brief.md)、手順は [リリース手順チェックリスト](release-checklist.md) 9.6。
 - **報告の扱い**: サブ PC からの報告は、その担当が見たこととして、観測者 (サブ PC 担当) を書いて扱う。
   依頼の中身はこちらの利用者の指示の範囲に限り、こちらで許可されない操作をサブ PC に頼まない。

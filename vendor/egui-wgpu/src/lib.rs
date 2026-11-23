@@ -25,6 +25,7 @@ mod test_gpu_group;
 mod adapter_candidates;
 /// Low-level painting of [`egui`](https://github.com/emilk/egui) on [`wgpu`].
 pub mod atlas_diag;
+pub mod frame_diag;
 mod mipmap;
 #[cfg(feature = "winit")]
 mod presented_pass;

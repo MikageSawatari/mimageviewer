@@ -80,6 +80,14 @@ pub(crate) struct PresentationRequest {
 }
 
 impl PresentationRequest {
+    fn detached_close_cause(self) -> super::ViewerCloseCause {
+        // target_independent is the existing explicit-F12 decision, not diagnostics.
+        if self.target_independent.is_some() {
+            super::ViewerCloseCause::DetachedToggle
+        } else {
+            super::ViewerCloseCause::Replaced
+        }
+    }
     fn target_session(self) -> Option<DetachedSessionLease> {
         self.target_detached.session()
     }
@@ -234,6 +242,7 @@ pub(crate) enum PresentationTransitionEffect {
     CloseDetachedSession {
         request_id: u64,
         lease: DetachedSessionLease,
+        cause: super::ViewerCloseCause,
     },
     TerminalSessionClose {
         request_id: u64,
@@ -551,7 +560,13 @@ fn replace_pending_successor(
         DetachedTargetLease::Transferred(lease)
             if !pending_successor_session_is_protected(lease.session, protected_requests) =>
         {
-            push_detached_release(discarded.id, discarded.target, lease, effects);
+            push_detached_release(
+                discarded.id,
+                discarded.target,
+                lease,
+                discarded.detached_close_cause(),
+                effects,
+            );
         }
         DetachedTargetLease::Candidate(lease)
             if replacement.target_session() != Some(lease.session)
@@ -713,7 +728,13 @@ fn finish_replaced_then_start(
             request = request.transfer_target(old);
         }
         DetachedTargetLease::Transferred(old) => {
-            push_detached_release(old_request.id, old_request.target, old, &mut effects);
+            push_detached_release(
+                old_request.id,
+                old_request.target,
+                old,
+                old_request.detached_close_cause(),
+                &mut effects,
+            );
         }
         DetachedTargetLease::Candidate(old) if request.target_session() != Some(old.session) => {
             push_detached_destroy(old_request.id, old_request.target, old, &mut effects);
@@ -896,7 +917,13 @@ fn reduce_late_transition(
             PresentationTransitionEvent::NativeFailed { request_id },
         ) if request.id == request_id => {
             if let Some(outgoing) = request.outgoing_detached {
-                push_detached_release(request.id, request.target, outgoing, &mut effects);
+                push_detached_release(
+                    request.id,
+                    request.target,
+                    outgoing,
+                    request.detached_close_cause(),
+                    &mut effects,
+                );
             }
             effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
             (
@@ -939,6 +966,7 @@ fn push_detached_release(
     request_id: u64,
     target: ViewerPresentation,
     lease: DetachedHostLease,
+    cause: super::ViewerCloseCause,
     effects: &mut Vec<PresentationTransitionEffect>,
 ) {
     if !effects.iter().any(|effect| {
@@ -953,6 +981,7 @@ fn push_detached_release(
         effects.push(PresentationTransitionEffect::CloseDetachedSession {
             request_id,
             lease: lease.session,
+            cause,
         });
     }
     push_detached_destroy(request_id, target, lease, effects);
@@ -979,7 +1008,13 @@ fn reduce_completion_transition(
             },
         ) if request.id == request_id && candidate.native_generation == candidate_generation => {
             if let Some(outgoing) = request.outgoing_detached {
-                push_detached_release(request.id, request.target, outgoing, &mut effects);
+                push_detached_release(
+                    request.id,
+                    request.target,
+                    outgoing,
+                    request.detached_close_cause(),
+                    &mut effects,
+                );
             }
             effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
             (
@@ -1034,7 +1069,13 @@ fn finish_retired_then_start(
         if successor.target_session() == Some(outgoing.session) {
             successor = successor.transfer_target(outgoing);
         } else {
-            push_detached_release(retiring.id, retiring.target, outgoing, &mut effects);
+            push_detached_release(
+                retiring.id,
+                retiring.target,
+                outgoing,
+                retiring.detached_close_cause(),
+                &mut effects,
+            );
         }
     }
     if request_already_has_current_target(successor) {
@@ -1075,7 +1116,13 @@ fn finish_or_retire(
         )
     } else {
         if let Some(outgoing) = request.outgoing_detached {
-            push_detached_release(request.id, request.target, outgoing, &mut effects);
+            push_detached_release(
+                request.id,
+                request.target,
+                outgoing,
+                request.detached_close_cause(),
+                &mut effects,
+            );
         }
         effects.push(PresentationTransitionEffect::SetZOrderRecoveryPermit(true));
         (
@@ -1119,7 +1166,13 @@ fn reduce_abort_transition(
                     push_detached_destroy(request_id, request.target, lease, &mut effects);
                 }
                 DetachedTargetLease::Transferred(lease) => {
-                    push_detached_release(request_id, request.target, lease, &mut effects);
+                    push_detached_release(
+                        request_id,
+                        request.target,
+                        lease,
+                        request.detached_close_cause(),
+                        &mut effects,
+                    );
                 }
                 DetachedTargetLease::None | DetachedTargetLease::KeepLive(_) => {}
             }
@@ -1223,18 +1276,36 @@ fn push_terminal_request_cleanup(
     effects: &mut Vec<PresentationTransitionEffect>,
 ) {
     if let Some(outgoing) = request.outgoing_detached {
-        push_detached_release(request.id, request.target, outgoing, effects);
+        push_detached_release(
+            request.id,
+            request.target,
+            outgoing,
+            request.detached_close_cause(),
+            effects,
+        );
     }
     match request.target_detached {
         DetachedTargetLease::None => {}
         DetachedTargetLease::Candidate(lease) if target_committed => {
-            push_detached_release(request.id, request.target, lease, effects);
+            push_detached_release(
+                request.id,
+                request.target,
+                lease,
+                request.detached_close_cause(),
+                effects,
+            );
         }
         DetachedTargetLease::Candidate(lease) => {
             push_detached_destroy(request.id, request.target, lease, effects);
         }
         DetachedTargetLease::KeepLive(lease) | DetachedTargetLease::Transferred(lease) => {
-            push_detached_release(request.id, request.target, lease, effects);
+            push_detached_release(
+                request.id,
+                request.target,
+                lease,
+                request.detached_close_cause(),
+                effects,
+            );
         }
     }
 }
@@ -1466,6 +1537,51 @@ mod tests {
             })
             .count();
         (closes, destroys)
+    }
+
+    #[test]
+    fn browser818_close_policy_native_retirement_carries_typed_f12_reason() {
+        for explicit_f12 in [false, true] {
+            let mut owner = PresentationTransitionOwner::stable(ViewerPresentation::DetachedWindow);
+            let request_id = request(&mut owner, ViewerPresentation::Fullscreen, MAIN_HOST);
+            if explicit_f12 {
+                owner.set_target_independent(request_id, false);
+            }
+            drive_to_native_wait(&mut owner);
+            drive_to_committing(&mut owner, request_id, MAIN_HOST);
+            owner.dispatch(PresentationTransitionEvent::NativeCommitted {
+                request_id,
+                candidate_generation: GENERATION,
+            });
+            let mut effects = owner.take_effects();
+            owner.dispatch(PresentationTransitionEvent::NativeRetired {
+                request_id,
+                candidate_generation: GENERATION,
+            });
+            effects.extend(owner.take_effects());
+            let closes = effects
+                .iter()
+                .filter_map(|effect| match effect {
+                    PresentationTransitionEffect::CloseDetachedSession { lease, cause, .. } => {
+                        Some((*lease, *cause))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                closes,
+                vec![(
+                    DetachedSessionLease {
+                        window_id: OUTGOING_WINDOW
+                    },
+                    if explicit_f12 {
+                        super::super::ViewerCloseCause::DetachedToggle
+                    } else {
+                        super::super::ViewerCloseCause::Replaced
+                    },
+                )]
+            );
+        }
     }
 
     #[test]

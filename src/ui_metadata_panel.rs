@@ -10600,6 +10600,89 @@ mod tag_panel_tests {
     }
 
     #[test]
+    fn section1840_fullscreen_panel_tag_tap_opens_real_tag_context_menu() {
+        use eframe::egui;
+
+        use crate::ring_shortcut::RightDragMode;
+        use crate::ui_fullscreen::side_panel_secondary_input_tests::{
+            frame, ready, right, viewport,
+        };
+
+        #[cfg(windows)]
+        let _input = crate::key_input::lock_test_input();
+        for mode in [
+            RightDragMode::RingShortcut,
+            RightDragMode::MouseGesture,
+            RightDragMode::Disabled,
+        ] {
+            let ctx = egui::Context::default();
+            let mut app = ready(mode.clone());
+            // Use the production tag button and context_menu closure with a pure
+            // fixture, avoiding metadata I/O and an application window.
+            let mut draw_tag = |ui: &mut egui::Ui| {
+                let panel = crate::ui_fullscreen::metadata_panel_rect(viewport());
+                let mut ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("section1840_tag_panel")
+                        .max_rect(panel.shrink(12.0)),
+                );
+                super::draw_tag_panel(
+                    &mut ui,
+                    &[choice("cat", false)],
+                    &[row("C:/section1840.png", &["cat"])],
+                    &mut false,
+                    &mut String::new(),
+                    &mut None,
+                    &mut false,
+                    &mut false,
+                    &mut None,
+                    &mut None,
+                );
+            };
+            let (_, output) = frame(&mut app, &ctx, 0.0, vec![], &mut draw_tag);
+            output.drop_without_applying_deltas();
+            let (_, output) = frame(&mut app, &ctx, 0.01, vec![], &mut draw_tag);
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|clipped| match &clipped.shape {
+                    egui::epaint::Shape::Text(text) if text.galley.text() == "#cat" => {
+                        Some(text.pos + text.galley.rect.center().to_vec2())
+                    }
+                    _ => None,
+                })
+                .expect("the real tag renderer must paint #cat");
+            output.drop_without_applying_deltas();
+            assert!(crate::ui_fullscreen::metadata_panel_rect(viewport()).contains(pos));
+            let (_, output) = frame(
+                &mut app,
+                &ctx,
+                0.02,
+                vec![egui::Event::PointerMoved(pos), right(pos, true)],
+                &mut draw_tag,
+            );
+            output.drop_without_applying_deltas();
+            let (facts, output) =
+                frame(&mut app, &ctx, 0.04, vec![right(pos, false)], &mut draw_tag);
+            output.drop_without_applying_deltas();
+            assert_eq!(facts.short_tap_at, Some(pos), "{mode:?}: {facts:?}");
+            assert_eq!(facts.egui_click_at, Some(pos));
+            assert!(!facts.close_requested, "{mode:?}: {facts:?}");
+            assert!(
+                egui::Popup::is_any_open(&ctx),
+                "tag context menu must open: {mode:?}"
+            );
+            assert!(
+                app.fs_context_menu_idx.is_none(),
+                "this must be the tag's menu"
+            );
+            // Known residual: an image left-click after this menu opens may both
+            // dismiss egui's menu and turn the page, like other context menus.
+            // §1.840 (1) deliberately leaves that primary-click policy unchanged.
+        }
+    }
+
+    #[test]
     fn visible_choices_include_current_unpinned_tags() {
         let rows = vec![row("C:/media/a.mp4", &["#旅行"])];
         let visible = tag_panel_visible_choices(&[choice("人物", true)], &rows, &[], &[]);

@@ -1,0 +1,15 @@
+[package]
+name = "mimageviewer-capture-file"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+url = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+tempfile = "3"

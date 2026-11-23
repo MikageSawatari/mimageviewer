@@ -386,7 +386,9 @@ mod tests {
             let expected = if blocker.blocked() {
                 vec![]
             } else {
-                vec![destination.clone()]
+                vec![crate::folder_pane::FolderPaneActivation::Open(
+                    destination.clone(),
+                )]
             };
             assert_eq!(*nav.borrow(), expected, "tree: {blocker:?}");
             nav.borrow_mut().clear();
@@ -604,7 +606,7 @@ mod tests {
         ctx: &egui::Context,
         frame: &mut u64,
         events: Vec<egui::Event>,
-    ) -> Option<std::path::PathBuf> {
+    ) -> Option<crate::folder_pane::FolderPaneActivation> {
         *frame += 1;
         let mut nav = None;
         ctx.run_ui(
@@ -708,8 +710,10 @@ mod tests {
             );
         } else {
             assert_eq!(
-                nav.as_ref(),
-                Some(&target),
+                nav,
+                Some(crate::folder_pane::FolderPaneActivation::Open(
+                    target.clone()
+                )),
                 "{kind:?}: the same outside label click must navigate"
             );
             assert!(
@@ -764,7 +768,9 @@ mod tests {
             );
             assert_eq!(
                 r6_menu_frame(&mut app, &ctx, &mut frame, vec![r6_primary(pos, false)]),
-                Some(target.clone())
+                Some(crate::folder_pane::FolderPaneActivation::Open(
+                    target.clone()
+                ))
             );
             let first_release = frame;
             r6_open_menu(&mut app, &ctx, &mut frame, kind, egui::pos2(800.0, 100.0));
@@ -827,7 +833,9 @@ mod tests {
                         );
                         assert_eq!(
                             r6_menu_frame(&mut app, &ctx, &mut frame, vec![r6_primary(pos, false)]),
-                            Some(target.clone())
+                            Some(crate::folder_pane::FolderPaneActivation::Open(
+                                target.clone()
+                            ))
                         );
                     }
                     // Aim at the Window frame, then prove the actual capture
@@ -905,7 +913,9 @@ mod tests {
             if result == "toggle" {
                 assert_eq!(
                     r6_menu_frame(&mut app, &ctx, &mut frame, vec![r6_primary(pos, false)]),
-                    Some(target.clone())
+                    Some(crate::folder_pane::FolderPaneActivation::Open(
+                        target.clone()
+                    ))
                 );
             }
             frame += 1;
@@ -938,7 +948,12 @@ mod tests {
             )
             .drop_without_applying_deltas();
             if result == "single" {
-                assert_eq!(nav, Some(target.clone()));
+                assert_eq!(
+                    nav,
+                    Some(crate::folder_pane::FolderPaneActivation::Open(
+                        target.clone()
+                    ))
+                );
             } else {
                 assert!(nav.is_none());
                 assert!(

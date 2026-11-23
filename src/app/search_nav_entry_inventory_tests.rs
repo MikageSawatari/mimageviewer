@@ -668,6 +668,7 @@ fn menu_entry(action: MenuCommandId) -> MenuEntry {
         | CollectionsSetOrderCurrent
         | CollectionsRelinkCurrent
         | CollectionsReorderCurrent
+        | CollectionsRemoveMissingCurrent
         | TagsManagePinned
         | ConvertToZip
         | ToolsCreateAiCaptions

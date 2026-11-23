@@ -7,6 +7,8 @@ pub(crate) enum ViewerCloseCause {
     Replaced,
     RemoteAcquire,
     AppExit,
+    BrowserReplacement,
+    DetachedToggle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

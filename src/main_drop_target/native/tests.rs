@@ -6,6 +6,173 @@ use windows::Win32::System::Com::{
 };
 use windows::core::{BOOL, HRESULT, Interface};
 
+#[test]
+fn main_drop_shell_description_move_copy_invalid_round_trip_and_replace() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = [
+        temp.path().join("first.txt"),
+        temp.path().join("日本語.txt"),
+    ];
+    for path in &paths {
+        std::fs::write(path, b"disposable drop description test").unwrap();
+    }
+    let move_dir = temp.path().join("dst2");
+    let copy_dir = temp.path().join("コピー先");
+    for dir in [&move_dir, &copy_dir] {
+        std::fs::create_dir(dir).unwrap();
+    }
+
+    crate::file_drag::with_shell_drag_data_object(&paths, |data| {
+        // SHDoDragDrop and IDropTargetHelper receive this outer object, not its inner
+        // Shell IDataObject. Exercise the real target writer and read the same object.
+        let target_data = OleData(data.clone());
+        let cf = unsafe { RegisterClipboardFormatW(CFSTR_DROPDESCRIPTION) } as u16;
+        assert_ne!(cf, 0);
+        for (description, image, message, insert) in [
+            (
+                Description::Transfer(ShellTransferOperation::Move, move_dir.clone()),
+                DROPIMAGE_MOVE,
+                "%1 へ移動",
+                "dst2",
+            ),
+            (
+                Description::Transfer(ShellTransferOperation::Copy, copy_dir.clone()),
+                DROPIMAGE_COPY,
+                "%1 へコピー",
+                "コピー先",
+            ),
+            (Description::Invalid, DROPIMAGE_INVALID, "", ""),
+            (
+                Description::Transfer(ShellTransferOperation::Move, copy_dir.clone()),
+                DROPIMAGE_MOVE,
+                "%1 へ移動",
+                "コピー先",
+            ),
+        ] {
+            let result = target_data.set_description(&description);
+            assert!(
+                result.is_ok(),
+                "production SetData(DropDescription) must accept {description:?}: {result:?}"
+            );
+            let medium = Medium(
+                unsafe { data.GetData(&format(cf)) }.unwrap_or_else(|error| {
+                    panic!("GetData(DropDescription) after {description:?}: {error}")
+                }),
+            );
+            assert_eq!(medium.0.tymed, TYMED_HGLOBAL.0 as u32);
+            let global = unsafe { medium.0.u.hGlobal };
+            assert!(unsafe { GlobalSize(global) } >= std::mem::size_of::<DROPDESCRIPTION>());
+            let ptr = unsafe { GlobalLock(global) };
+            assert!(!ptr.is_null());
+            let actual = unsafe { ptr.cast::<DROPDESCRIPTION>().read_unaligned() };
+            let _ = unsafe { GlobalUnlock(global) };
+            // DROPDESCRIPTION is packed: copy fields by value, never borrow them.
+            let (actual_type, actual_message, actual_insert) =
+                (actual.r#type, actual.szMessage, actual.szInsert);
+            assert_eq!(actual_type, image, "{description:?}");
+            // Compare every UTF-16 unit, including NUL termination and cleared tails.
+            // Invalid must clear the old message/insert; subsequent writes replace it.
+            for (actual, expected) in [(actual_message, message), (actual_insert, insert)] {
+                let mut wide = [0u16; 260];
+                let units: Vec<u16> = expected.encode_utf16().collect();
+                wide[..units.len()].copy_from_slice(&units);
+                assert_eq!(actual, wide, "{description:?}: expected {expected:?}");
+            }
+        }
+    });
+}
+
+#[test]
+fn main_drop_nodrop_shell_rejected_places_and_dragleave_clear_transfer_image() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source-folder");
+    let destination = temp.path().join("dst2");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    std::fs::write(source.join("disposable.txt"), b"test").unwrap();
+    crate::file_drag::with_shell_drag_data_object(std::slice::from_ref(&source), |data| {
+        let mut fixture = fixture(
+            Some(InternalDrag {
+                paths: vec![source.clone()],
+                excluded_virtual: false,
+                failed_paths: 0,
+            }),
+            false,
+        );
+        fixture.data = data.clone();
+        *fixture.hit.borrow_mut() = Some(Hit::TreeRow(destination.clone()));
+        let image = || {
+            let cf = unsafe { RegisterClipboardFormatW(CFSTR_DROPDESCRIPTION) } as u16;
+            let medium = Medium(unsafe { data.GetData(&format(cf)).unwrap() });
+            let global = unsafe { medium.0.u.hGlobal };
+            let ptr = unsafe { GlobalLock(global) };
+            assert!(!ptr.is_null());
+            let value = unsafe { ptr.cast::<DROPDESCRIPTION>().read_unaligned() };
+            let _ = unsafe { GlobalUnlock(global) };
+            value.r#type
+        };
+        let mut output = DROPEFFECT_COPY;
+        unsafe {
+            fixture
+                .target
+                .DragEnter(data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+        }
+        .unwrap();
+        assert_eq!(output, DROPEFFECT_COPY);
+        assert_eq!(image(), DROPIMAGE_MOVE);
+        for (hit, keys, expected_effect, expected_image) in [
+            (
+                Some(Hit::TreeRow(destination.clone())),
+                CONTROL,
+                DROPEFFECT_COPY,
+                DROPIMAGE_COPY,
+            ),
+            // Internal grid blank / same list: explicitly request the no-drop image.
+            (
+                Some(Hit::ExistingDropArea),
+                0,
+                DROPEFFECT_NONE,
+                DROPIMAGE_NONE,
+            ),
+            // Dropping the folder onto itself or into its current parent is rejected.
+            (
+                Some(Hit::TreeRow(source.clone())),
+                0,
+                DROPEFFECT_NONE,
+                DROPIMAGE_NONE,
+            ),
+            (
+                Some(Hit::TreeRow(temp.path().to_path_buf())),
+                0,
+                DROPEFFECT_NONE,
+                DROPIMAGE_NONE,
+            ),
+            (Some(Hit::TreeNonTarget), 0, DROPEFFECT_NONE, DROPIMAGE_NONE),
+            (None, 0, DROPEFFECT_NONE, DROPIMAGE_NONE),
+            (
+                Some(Hit::TreeRow(destination.clone())),
+                SHIFT,
+                DROPEFFECT_COPY,
+                DROPIMAGE_MOVE,
+            ),
+        ] {
+            *fixture.hit.borrow_mut() = hit;
+            unsafe {
+                fixture
+                    .target
+                    .DragOver(MODIFIERKEYS_FLAGS(keys), point(), &mut output)
+            }
+            .unwrap();
+            assert_eq!(output, expected_effect);
+            assert_eq!(image(), expected_image);
+        }
+        unsafe { fixture.target.DragLeave() }.unwrap();
+        assert_eq!(image(), DROPIMAGE_INVALID);
+        assert!(fixture.shared.borrow().drops.is_empty());
+        assert_eq!(fixture.observed.visual.borrow().last(), Some(&("leave", 0)));
+    });
+}
+
 #[derive(Default)]
 struct Observed {
     queries: Cell<usize>,
@@ -45,6 +212,7 @@ struct FakeDataObject {
     observed: Rc<Observed>,
     description_format: u16,
     fail_paths: bool,
+    has_paths: bool,
 }
 
 fn blob(bytes: &[u8]) -> WinResult<STGMEDIUM> {
@@ -92,7 +260,7 @@ impl IDataObject_Impl for FakeDataObject_Impl {
     fn QueryGetData(&self, format: *const FORMATETC) -> HRESULT {
         let _reentry = self.shared.borrow_mut();
         self.observed.queries.set(self.observed.queries.get() + 1);
-        if unsafe { (*format).cfFormat } == CF_HDROP.0 {
+        if self.has_paths && unsafe { (*format).cfFormat } == CF_HDROP.0 {
             S_OK
         } else {
             DV_E_FORMATETC
@@ -148,6 +316,14 @@ struct Fixture {
 }
 
 fn fixture(internal: Option<InternalDrag>, fail_paths: bool) -> Fixture {
+    fixture_with_paths(internal, fail_paths, true)
+}
+
+fn fixture_with_paths(
+    internal: Option<InternalDrag>,
+    fail_paths: bool,
+    has_paths: bool,
+) -> Fixture {
     let shared = Rc::new(RefCell::new(MainDropShared {
         admission: Ok(()),
         internal,
@@ -173,6 +349,7 @@ fn fixture(internal: Option<InternalDrag>, fail_paths: bool) -> Fixture {
         observed: observed.clone(),
         description_format: unsafe { RegisterClipboardFormatW(CFSTR_DROPDESCRIPTION) } as u16,
         fail_paths,
+        has_paths,
     }
     .into();
     Fixture {
@@ -186,6 +363,106 @@ fn fixture(internal: Option<InternalDrag>, fail_paths: bool) -> Fixture {
 
 fn point() -> POINTL {
     POINTL { x: 100, y: 50 }
+}
+
+#[test]
+fn main_drop_nodrop_rejected_hits_write_none_on_enter_over_and_drop() {
+    let source = InternalDrag {
+        paths: vec![r"C:\src\a".into()],
+        excluded_virtual: false,
+        failed_paths: 0,
+    };
+    for (internal, has_paths, hit) in [
+        (Some(source.clone()), true, None),
+        (Some(source.clone()), true, Some(Hit::TreeNonTarget)),
+        (Some(source), true, Some(Hit::ExistingDropArea)),
+        (None, false, None),
+        (None, false, Some(Hit::TreeNonTarget)),
+        (None, false, Some(Hit::ExistingDropArea)),
+        (None, false, Some(Hit::TreeRow(r"C:\dst".into()))),
+        (None, true, Some(Hit::TreeNonTarget)),
+    ] {
+        let fixture = fixture_with_paths(internal, false, has_paths);
+        *fixture.hit.borrow_mut() = hit.clone();
+        let mut output = DROPEFFECT_COPY;
+        unsafe {
+            fixture
+                .target
+                .DragEnter(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+        }
+        .unwrap();
+        assert_eq!(output, DROPEFFECT_NONE, "{hit:?}");
+        assert_eq!(
+            fixture.observed.writes.borrow().last().unwrap().1,
+            DROPIMAGE_NONE.0
+        );
+        unsafe {
+            fixture
+                .target
+                .DragOver(MODIFIERKEYS_FLAGS(0), point(), &mut output)
+        }
+        .unwrap();
+        assert_eq!(output, DROPEFFECT_NONE, "{hit:?}");
+        assert_eq!(
+            fixture.observed.writes.borrow().len(),
+            1,
+            "unchanged description"
+        );
+        unsafe {
+            fixture
+                .target
+                .Drop(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+        }
+        .unwrap();
+        assert_eq!(output, DROPEFFECT_NONE, "{hit:?}");
+        assert!(fixture.shared.borrow().drops.is_empty());
+        assert_eq!(fixture.observed.reads.get(), 0);
+        assert_eq!(
+            fixture
+                .observed
+                .writes
+                .borrow()
+                .iter()
+                .map(|(_, image)| *image)
+                .collect::<Vec<_>>(),
+            vec![DROPIMAGE_NONE.0, DROPIMAGE_INVALID.0]
+        ); // finish_session hands back the image.
+        assert_eq!(
+            fixture.observed.visual.borrow().as_slice(),
+            &[("enter", 0), ("over", 0), ("drop", 0)]
+        );
+    }
+}
+
+#[test]
+fn main_drop_nodrop_accepted_external_list_keeps_default_and_copy_effect() {
+    let fixture = fixture(None, false);
+    *fixture.hit.borrow_mut() = Some(Hit::ExistingDropArea);
+    let mut output = DROPEFFECT_COPY;
+    unsafe {
+        fixture
+            .target
+            .DragEnter(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+    }
+    .unwrap();
+    assert_eq!(output, DROPEFFECT_COPY);
+    assert_eq!(
+        fixture.observed.writes.borrow().last().unwrap().1,
+        DROPIMAGE_INVALID.0
+    );
+    unsafe {
+        fixture
+            .target
+            .Drop(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+    }
+    .unwrap();
+    assert_eq!(output, DROPEFFECT_COPY);
+    assert!(
+        matches!(fixture.shared.borrow().drops.as_slice(), [DropRequest::GridFiles(paths)]
+        if paths == &[PathBuf::from(r"C:\external\visible.txt")])
+    );
+    assert_eq!(fixture.observed.reads.get(), 1);
+    assert_eq!(fixture.observed.writes.borrow().len(), 1); // Grid and finish both use INVALID.
 }
 
 #[test]
@@ -322,7 +599,7 @@ fn main_drop_com_internal_keeps_full_payload_and_rejects_grid_and_partial_source
 }
 
 #[test]
-fn main_drop_com_leaving_row_and_dragleave_clear_description_once_and_keep_tree_blank_rejected() {
+fn main_drop_nodrop_leaving_row_and_dragleave_write_none_then_invalid() {
     let fixture = fixture(None, false);
     let mut effect = DROPEFFECT_COPY;
     unsafe {
@@ -349,7 +626,7 @@ fn main_drop_com_leaving_row_and_dragleave_clear_description_once_and_keep_tree_
             .iter()
             .map(|(_, ty)| *ty)
             .collect::<Vec<_>>(),
-        vec![DROPIMAGE_COPY.0, DROPIMAGE_INVALID.0]
+        vec![DROPIMAGE_COPY.0, DROPIMAGE_NONE.0, DROPIMAGE_INVALID.0]
     );
     assert_eq!(fixture.observed.visual.borrow().last(), Some(&("leave", 0)));
 }

@@ -5,8 +5,14 @@
 disabled / read は新しいチェックをOFF、open / organize / records はONにして描く。
 新しいPNGや登録確認画面の更新は不要。1093×614 / 1366×728、100% / 200%の閉じる操作と末尾への
 スクロールの検査は、既存のheadlessテストで全許可ONを扱う。
-**PNGは未更新・未目視、Cargo検査は未実行**。設計担当が更新指定ありで生成して差分を確認し、
-更新指定なしで通常比較する。以前の成功記録をこの変更の証拠に流用しない。
+2026-11-23 に設計担当が更新指定ありで10枚を生成・目視し、更新指定なしの通常比較 (266件) も通った。
+
+§1.818 段階7のブラウザ連携は、純粋 renderer に固定の worker snapshot と入力文字列を渡す。
+`browser818_preferences_light`、`browser818_preferences_dark_long_path`、
+`browser818_preferences_unavailable`、`browser818_preferences_processing` の4定義（560×460）を追加した。
+App・実環境・レジストリ・フォルダ picker は使用しない。integration の `ui_snapshot` binary は既存の gpu group 対象。
+PNG は未生成・未目視。設計担当が対象4件だけ `UPDATE_SNAPSHOTS=1` で生成し、欠け・重なり・明暗・長いパスを目視後、通常比較を行う。
+設定の採用、worker 完了の回収、場所▼の条件と順序は別の状態／handler 回帰で検査する。
 
 §1.823〜§1.826 の拡張では、環境設定fixtureの定義を更新した。既存の
 `fullscreen_in_page_scroll_settings_light_default` / `fullscreen_in_page_scroll_settings_dark_enabled`

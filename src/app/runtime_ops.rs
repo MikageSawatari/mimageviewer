@@ -541,6 +541,9 @@ impl App {
     /// scroll_settle helper 群を inherent impl に逃がす都合上、本体を inherent
     /// メソッドに移して trait impl 側から委譲する。
     pub(super) fn on_exit_inner(&mut self) {
+        // Normal root-close admission already waited through registration and
+        // persistence. Fence a bypassed close before any exit-time Settings save.
+        self.browser_integration.finish_for_exit(&mut self.settings);
         self.cut_clipboard.shutdown();
         // 最後の UI 差分と debounce 中の書き込みを、settings の終了保存より先に確定する。
         self.flush_favorite_view_writes_for_exit();

@@ -16,11 +16,18 @@
 [CmdletBinding()]
 param(
     [switch] $SkipBuild,
-    [switch] $TestScript
+    [switch] $TestScript,
+    [switch] $FromKit
 )
 
 $ErrorActionPreference = 'Stop'
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+if ($FromKit) {
+    if (-not $TestScript) { throw '[portable-smoke] -FromKit requires -TestScript' }
+    if (-not (Test-Path -LiteralPath (Join-Path $repoRoot 'release-check-kit.json') -PathType Leaf)) {
+        throw '[portable-smoke] kit manifest missing'
+    }
+}
 $targetRoot = (Join-Path $repoRoot 'target')
 $sandbox = (Join-Path $targetRoot 'portable-smoke')
 
@@ -109,24 +116,26 @@ function Assert-SmokeNotRunning {
 
 Push-Location $repoRoot
 try {
-    if ($TestScript) {
+    if ($TestScript -and -not $FromKit) {
         $buildArgs = @{ SmokeTestScript = $true }
         if ($SkipBuild) { $buildArgs.SkipBuild = $true }
         & (Join-Path $PSScriptRoot 'build-portable.ps1') @buildArgs
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    } elseif (-not $SkipBuild) {
+    } elseif (-not $TestScript -and -not $SkipBuild) {
         & (Join-Path $PSScriptRoot 'build-portable.ps1')
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
 
-    $version = $null
-    foreach ($line in (Get-Content (Join-Path $repoRoot 'Cargo.toml'))) {
-        if ($line -match '^version\s*=\s*"([^"]+)"') {
-            $version = $Matches[1]
-            break
+    if (-not $TestScript) {
+        $version = $null
+        foreach ($line in (Get-Content (Join-Path $repoRoot 'Cargo.toml'))) {
+            if ($line -match '^version\s*=\s*"([^"]+)"') {
+                $version = $Matches[1]
+                break
+            }
         }
+        if (-not $version) { throw '[portable-smoke] could not parse package version' }
     }
-    if (-not $version) { throw '[portable-smoke] could not parse package version' }
 
     $source = if ($TestScript) {
         Join-Path $repoRoot 'target\portable-smoke-package'

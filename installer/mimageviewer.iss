@@ -2,7 +2,7 @@
 ; Build: "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\mimageviewer.iss
 
 #define MyAppName "mImageViewer"
-#define MyAppVersion "5.5.0"
+#define MyAppVersion "5.6.0"
 #define MyAppPublisher "Mikage Sawatari"
 #define MyAppURL "https://mikage.to/mimageviewer/"
 #ifndef MyAppId
@@ -52,7 +52,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 ; 配布する exe はランチャー (`mimageviewer.exe`) のみ。ランチャーは本体
 ; `mimageviewer-core.exe`、`mimageviewer-remote.exe`、`mimageviewer-epub-pdf.exe`、
-; `mimageviewer-mcp.exe`、`mimageviewer-musicvideo.exe` と FFmpeg LGPL DLL を include_bytes! で
+; `mimageviewer-mcp.exe`、`mimageviewer-musicvideo.exe`、`mimageviewer-browser-host.exe` と FFmpeg LGPL DLL を include_bytes! で
 ; 内包しており、初回起動時に %APPDATA%\mimageviewer\runtime\<version>\ へ
 ; 自動展開する。詳細は docs/native-dependencies.md「FFmpeg LGPL DLL 管理」節。
 Source: "{#LauncherSource}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
@@ -90,6 +90,61 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+// Delete only our managed tree, never follow a junction into user data.
+procedure RemoveBrowserHostTree(const Dir: String);
+var
+  FindRec: TFindRec;
+  Child: String;
+begin
+  if FindFirst(Dir + '\*', FindRec) then
+  begin
+    try
+      repeat
+        if (FindRec.Name <> '.') and (FindRec.Name <> '..') then
+        begin
+          Child := Dir + '\' + FindRec.Name;
+          if (FindRec.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0 then
+          begin
+            if (FindRec.Attributes and $400) = 0 then RemoveBrowserHostTree(Child);
+            RemoveDir(Child);
+          end
+          else DeleteFile(Child);
+        end;
+      until not FindNext(FindRec);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+  RemoveDir(Dir);
+end;
+
+procedure RemoveBrowserRegistration;
+var
+  Root, Manifest, Key, Value: String;
+  Index: Integer;
+  FindRec: TFindRec;
+begin
+  Root := ExpandConstant('{userappdata}\mimageviewer\browser-host');
+  Manifest := Root + '\to.mikage.mimageviewer.json';
+  for Index := 0 to 1 do
+  begin
+    if Index = 0 then Key := 'Software\Google\Chrome\NativeMessagingHosts\to.mikage.mimageviewer'
+    else Key := 'Software\Microsoft\Edge\NativeMessagingHosts\to.mikage.mimageviewer';
+    if RegQueryStringValue(HKCU, Key, '', Value) and (CompareText(Value, Manifest) = 0) then
+      RegDeleteKeyIncludingSubkeys(HKCU, Key);
+  end;
+  // This is the uninstalling account only; other accounts unregister in mIV.
+  if FindFirst(Root, FindRec) then
+  begin
+    try
+      if (FindRec.Attributes and $400) = 0 then RemoveBrowserHostTree(Root)
+      else RemoveDir(Root);
+    finally
+      FindClose(FindRec);
+    end;
+  end;
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   AppDataDir: String;
@@ -97,6 +152,7 @@ var
 begin
   if CurUninstallStep = usPostUninstall then
   begin
+    RemoveBrowserRegistration;
     AppDataDir := ExpandConstant('{userappdata}\mimageviewer');
     if DirExists(AppDataDir) then
     begin

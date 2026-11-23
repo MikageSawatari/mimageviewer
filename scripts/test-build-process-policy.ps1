@@ -131,6 +131,9 @@ try {
                 Assert-Policy (($exactBuildOutputPaths -contains $targetMcp) -eq (-not $SkipBuild)) 'portable stop policy ignored whether it builds MCP'
                 Assert-Policy ($exactBuildOutputPaths -contains (Join-Path $pkgDir 'mimageviewer.exe')) 'portable package executable is missing from exact output policy'
                 Assert-Policy ($exactBuildOutputPaths -contains (Join-Path $pkgDir 'mimageviewer-mcp.exe')) 'portable package MCP is missing from exact output policy'
+                $targetHost = Join-Path $portableTargetDir 'release\mimageviewer-browser-host.exe'
+                Assert-Policy (($exactBuildOutputPaths -contains $targetHost) -eq (-not $SkipBuild)) 'browser818_bundle: portable host build stop policy changed'
+                Assert-Policy ($exactBuildOutputPaths -contains (Join-Path $pkgDir 'mimageviewer-browser-host.exe')) 'browser818_bundle: portable package host is unprotected'
             }
         }
     }
@@ -140,7 +143,7 @@ try {
     }, $true))
     Assert-Policy ($invokeDefinition.Count -eq 1) 'release Cargo wrapper missing'
     Invoke-Expression $invokeDefinition[0].Extent.Text
-    foreach ($name in @('mimageviewer-core', 'mimageviewer-remote', 'mimageviewer-epub-pdf', 'mimageviewer-mcp', 'mimageviewer-musicvideo', 'mimageviewer')) {
+    foreach ($name in @('mimageviewer-core', 'mimageviewer-remote', 'mimageviewer-epub-pdf', 'mimageviewer-mcp', 'mimageviewer-musicvideo', 'mimageviewer-browser-host', 'mimageviewer')) {
         $expectedExecutable = Join-Path $releaseDir ($name + '.exe')
         foreach ($fresh in @($true, $false)) {
             $script:policyCargoMessages = @(@{ reason = 'compiler-artifact'; executable = $expectedExecutable; fresh = $fresh } | ConvertTo-Json -Compress)
@@ -191,9 +194,10 @@ sys.stdout.buffer.write((json.dumps({"reason": "compiler-artifact", "executable"
 
     $releaseExe = Join-Path $releaseDir 'mimageviewer.exe'
     $releaseMcpExe = Join-Path $releaseDir 'mimageviewer-mcp.exe'
-    $exactBuildProcessNames = @('mimageviewer', 'mimageviewer-mcp')
-    $exactBuildOutputPaths = @($releaseExe, $releaseMcpExe)
-    $stoppableProcessNames = @('mimageviewer', 'mimageviewer-mcp', 'mimageviewer-core')
+    $releaseBrowserHostExe = Join-Path $releaseDir 'mimageviewer-browser-host.exe'
+    $exactBuildProcessNames = @('mimageviewer', 'mimageviewer-mcp', 'mimageviewer-browser-host')
+    $exactBuildOutputPaths = @($releaseExe, $releaseMcpExe, $releaseBrowserHostExe)
+    $stoppableProcessNames = @('mimageviewer', 'mimageviewer-mcp', 'mimageviewer-browser-host', 'mimageviewer-core')
     $runningNames = $stoppableProcessNames
     $repoRootPrefixLower = ($repoRoot.TrimEnd('\') + '\').ToLowerInvariant()
     $repoPrefix = $repoRootPrefixLower
@@ -204,14 +208,18 @@ sys.stdout.buffer.write((json.dumps({"reason": "compiler-artifact", "executable"
         [pscustomobject]@{ Name = 'mimageviewer-mcp'; ProcessName = 'mimageviewer-mcp'; Id = 2; Path = 'C:\mock-appdata\mimageviewer\runtime\v1\mimageviewer-mcp.exe' },
         [pscustomobject]@{ Name = 'mimageviewer'; ProcessName = 'mimageviewer'; Id = 3; Path = $null },
         [pscustomobject]@{ Name = 'mimageviewer-mcp'; ProcessName = 'mimageviewer-mcp'; Id = 4; Path = $null },
-        [pscustomobject]@{ Name = 'mimageviewer'; ProcessName = 'mimageviewer'; Id = 5; Path = (Join-Path $repoRoot 'target\other\mimageviewer.exe') }
+        [pscustomobject]@{ Name = 'mimageviewer'; ProcessName = 'mimageviewer'; Id = 5; Path = (Join-Path $repoRoot 'target\other\mimageviewer.exe') },
+        [pscustomobject]@{ Name = 'mimageviewer-browser-host'; ProcessName = 'mimageviewer-browser-host'; Id = 7; Path = 'C:\mock-appdata\mimageviewer\browser-host\generation\mimageviewer-browser-host.exe' },
+        [pscustomobject]@{ Name = 'mimageviewer-browser-host'; ProcessName = 'mimageviewer-browser-host'; Id = 8; Path = $null },
+        [pscustomobject]@{ Name = 'mimageviewer-browser-host'; ProcessName = 'mimageviewer-browser-host'; Id = 9; Path = (Join-Path $repoRoot 'target\other\mimageviewer-browser-host.exe') }
     )
     $inaccessible = [pscustomobject]@{ Name = 'mimageviewer-mcp'; ProcessName = 'mimageviewer-mcp'; Id = 6 }
     $inaccessible | Add-Member -MemberType ScriptProperty -Name Path -Value { throw 'path unavailable' }
     $installed += $inaccessible
     $outputs = @(
         [pscustomobject]@{ Name = 'mimageviewer'; ProcessName = 'mimageviewer'; Id = 10; Path = $releaseExe.ToUpperInvariant() },
-        [pscustomobject]@{ Name = 'mimageviewer-mcp'; ProcessName = 'mimageviewer-mcp'; Id = 11; Path = $releaseMcpExe }
+        [pscustomobject]@{ Name = 'mimageviewer-mcp'; ProcessName = 'mimageviewer-mcp'; Id = 11; Path = $releaseMcpExe },
+        [pscustomobject]@{ Name = 'mimageviewer-browser-host'; ProcessName = 'mimageviewer-browser-host'; Id = 12; Path = $releaseBrowserHostExe }
     )
     $releaseLoop = @($releaseAst.FindAll({
         param($node)
@@ -240,7 +248,7 @@ sys.stdout.buffer.write((json.dumps({"reason": "compiler-artifact", "executable"
         $candidates = $script:policyProcesses
         $toKill = @()
         Invoke-Expression $releaseLoop[0].Extent.Text
-        Assert-Policy ($toKill.Count -eq $(if ($includeOutputs) { 2 } else { 0 })) 'release selected installed/unknown/sibling path'
+        Assert-Policy ($toKill.Count -eq $(if ($includeOutputs) { 3 } else { 0 })) 'release selected installed/unknown/sibling path'
         $PreserveRuntime = $true
         $script:policyStopped = @()
         $rejected = $false
@@ -248,7 +256,7 @@ sys.stdout.buffer.write((json.dumps({"reason": "compiler-artifact", "executable"
         Assert-Policy ($rejected -eq $includeOutputs -and $script:policyStopped.Count -eq 0) 'release preserve decision used unfiltered candidates'
         $PreserveRuntime = $false
         Invoke-Expression $releaseGuard
-        Assert-Policy (($script:policyStopped -join ',') -eq $(if ($includeOutputs) { '10,11' } else { '' })) 'release stopped unrelated process'
+        Assert-Policy (($script:policyStopped -join ',') -eq $(if ($includeOutputs) { '10,11,12' } else { '' })) 'release stopped unrelated process'
         $KeepRunning = $false
         $SmokeTestScript = $false
         foreach ($preserve in @($true, $false)) {
@@ -257,7 +265,7 @@ sys.stdout.buffer.write((json.dumps({"reason": "compiler-artifact", "executable"
             $rejected = $false
             try { Invoke-Expression $portableGuard } catch { $rejected = $_.Exception.Message.Contains('-PreserveRuntime refuses') }
             Assert-Policy ($rejected -eq ($includeOutputs -and $preserve)) 'portable preserve decision selected unrelated process'
-            $expectedStops = if ($includeOutputs -and -not $preserve) { '10,11' } else { '' }
+            $expectedStops = if ($includeOutputs -and -not $preserve) { '10,11,12' } else { '' }
             Assert-Policy (($script:policyStopped -join ',') -eq $expectedStops) 'portable stopped installed/unknown/sibling path'
         }
         Invoke-Expression $distSelection
@@ -274,7 +282,7 @@ sys.stdout.buffer.write((json.dumps({"reason": "compiler-artifact", "executable"
     Push-Location $repoRoot
     try { $queryResult = @(Invoke-Expression $shell.Substring($queryStart, $queryEnd - $queryStart)) }
     finally { Pop-Location }
-    Assert-Policy (($queryResult -join ',') -eq '10,11') 'shell query selected unrelated process'
+    Assert-Policy (($queryResult -join ',') -eq '10,11,12') 'shell query selected unrelated process'
     Assert-Policy (-not $shell.Contains('taskkill //IM "$name" //F') -or $shell.Contains('targets=("mimageviewer-susie32.exe"')) 'shell launcher/MCP name-only taskkill returned'
 
     # Run only the shell preflight/process block with command stubs. This
@@ -370,7 +378,7 @@ function cargo { printf 'build:%s\n' "$*" >> "$MIV_POLICY_LOG"; }
         Assert-Policy ($definition.Count -eq 1) "manifest function missing: $functionName"
         Invoke-Expression $definition[0].Extent.Text
     }
-    $fixturePaths = @('core', 'remote', 'epub', 'mcp', 'editor') | ForEach-Object {
+    $fixturePaths = @('core', 'remote', 'epub', 'mcp', 'editor', 'browser-host') | ForEach-Object {
         $fixture = Join-Path $testRoot ($_.ToString() + '.exe')
         Set-Content -LiteralPath $fixture -Value $_ -Encoding ASCII
         $fixture
@@ -385,6 +393,7 @@ function cargo { printf 'build:%s\n' "$*" >> "$MIV_POLICY_LOG"; }
     Assert-Policy $rejected 'changed MCP was accepted by portable manifest'
     $consumer = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'ui-smoke\release-checks\Support.ps1') -Raw -Encoding UTF8
     Assert-Policy ($consumer.Contains("(Join-Path `$smoke 'mimageviewer-mcp.exe')")) 'release checks omitted MCP manifest hash'
+    Assert-Policy ($consumer.Contains("(Join-Path `$smoke 'mimageviewer-browser-host.exe')")) 'browser818_bundle: release checks omitted host manifest hash'
 } finally {
     foreach ($name in $environmentNames) { [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process') }
     $cleanup = [IO.Path]::GetFullPath($testRoot).TrimEnd('\')

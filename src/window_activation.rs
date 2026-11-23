@@ -8,6 +8,18 @@ pub(crate) enum ActivationState {
     Visible,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MainRestorePolicy {
+    Activate,
+    PreserveForeground,
+}
+
+impl MainRestorePolicy {
+    pub(crate) fn requests_focus(self) -> bool {
+        self == Self::Activate
+    }
+}
+
 fn activation_state(hidden: bool, iconic: bool) -> ActivationState {
     if hidden {
         ActivationState::TrayHidden
@@ -26,11 +38,28 @@ pub(crate) fn activate_main_window(
     ctx: &eframe::egui::Context,
     reason: &'static str,
 ) -> ActivationState {
+    restore_main_window_with_policy(
+        hwnd_raw,
+        placement_slot,
+        ctx,
+        reason,
+        MainRestorePolicy::Activate,
+    )
+}
+
+pub(crate) fn restore_main_window_with_policy(
+    hwnd_raw: isize,
+    placement_slot: &crate::tray::PlacementSlot,
+    ctx: &eframe::egui::Context,
+    reason: &'static str,
+    policy: MainRestorePolicy,
+) -> ActivationState {
     #[cfg(windows)]
     {
         use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
         use windows::Win32::UI::WindowsAndMessaging::{
-            IsIconic, IsWindowVisible, PostMessageW, SW_RESTORE, SW_SHOW, WM_PAINT,
+            IsIconic, IsWindowVisible, PostMessageW, SW_RESTORE, SW_SHOW, SW_SHOWNOACTIVATE,
+            WM_PAINT,
         };
         let hwnd = HWND(hwnd_raw as *mut _);
         // Win32 can reenter window procedures or wait for the UI thread. Never
@@ -43,7 +72,11 @@ pub(crate) fn activate_main_window(
                 if let Some(saved) = saved {
                     // Saved placement already includes the correct showCmd.
                     // Avoid SW_RESTORE here to preserve the tray flash/DPI fix.
-                    crate::tray::restore_window_placement(hwnd_raw, &saved);
+                    if policy.requests_focus() {
+                        crate::tray::restore_window_placement(hwnd_raw, &saved);
+                    } else {
+                        crate::tray::restore_window_placement_with_policy(hwnd_raw, &saved, policy);
+                    }
                 } else {
                     // Existing behavior when GetWindowPlacement failed at hide:
                     // the HWND is still hidden and must be made visible.
@@ -51,7 +84,11 @@ pub(crate) fn activate_main_window(
                     unsafe {
                         let _ = crate::presentation_observer::show_window(
                             hwnd,
-                            SW_SHOW,
+                            if policy.requests_focus() {
+                                SW_SHOW
+                            } else {
+                                SW_SHOWNOACTIVATE
+                            },
                             crate::presentation_observer::WindowRole::Main,
                             reason,
                         );
@@ -61,20 +98,25 @@ pub(crate) fn activate_main_window(
             ActivationState::Minimized => unsafe {
                 let _ = crate::presentation_observer::show_window(
                     hwnd,
-                    SW_RESTORE,
+                    if policy.requests_focus() {
+                        SW_RESTORE
+                    } else {
+                        SW_SHOWNOACTIVATE
+                    },
                     crate::presentation_observer::WindowRole::Main,
                     reason,
                 );
             },
             ActivationState::Visible => {}
         }
-        let foregrounded = unsafe {
-            crate::presentation_observer::set_foreground_window(
-                hwnd,
-                crate::presentation_observer::WindowRole::Main,
-                reason,
-            )
-        };
+        let foregrounded = !policy.requests_focus()
+            || unsafe {
+                crate::presentation_observer::set_foreground_window(
+                    hwnd,
+                    crate::presentation_observer::WindowRole::Main,
+                    reason,
+                )
+            };
         if !foregrounded {
             crate::logger::log(format!("{reason}: SetForegroundWindow failed"));
         }
@@ -88,7 +130,7 @@ pub(crate) fn activate_main_window(
     }
     #[cfg(not(windows))]
     {
-        let _ = (hwnd_raw, placement_slot, reason);
+        let _ = (hwnd_raw, placement_slot, reason, policy);
         ctx.request_repaint();
         ActivationState::Visible
     }

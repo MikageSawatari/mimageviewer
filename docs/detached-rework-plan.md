@@ -1458,6 +1458,138 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-22: ブラウザから重ねて開く窓 (§1.818 段 2) の着手前の合意 (計画の段階。実装はこれから)
+
+**変更の内容** (正本は [browser-to-miv-plan.md](browser-to-miv-plan.md) §9 と [browser-to-miv-impl-plan.md](browser-to-miv-impl-plan.md))
+
+- 拡張「mIV で見る」から、ブラウザの表示領域に重ねる位置を持った開く要求 (`BrowserOverlay`) を、既存の activation チャネルへ型付きで入れる。
+- 段階 2: 開く要求が、フォルダの履歴の復元を待つ間も一覧の選択と表示の意図を持つ。通常の 2 重起動でも、復元が選択を前回の項目へ戻し、F12 の連動窓が前回の画像を開き直し得る経路があり (計画 §1、コードからの判断で実機では未確認)、同じ直し方で直る。
+- 段階 3: 窓の用途 (`Normal` / `BrowserView`) を `DetachedWindowRuntime` に置き、閉じる処理の始めで用途と理由を値 (`DetachedCloseOwner`) として捕捉して、位置の保存とメインへの focus を決める。F12 は `toggle_detached_viewer_mode` の入口で、対象の窓の用途から断る。
+- 段階 4: 連動窓は window ID を確保した後・通常の種を確保する前に、要求の位置を種として渡す。複数ウィンドウは loading と materialized の両経路で種と用途を渡す。既存の連動窓は型付きの「ブラウザ窓への置換」で閉じて作り直す。トレイからの復帰は可視性を既存どおり全部戻し、focus / raise だけを型付きの方針で分ける。
+- 段階 5: 新しい pipe `mImageViewerBrowserView_v1` を既存の受付へ合流させ、core の起動競合の経路も同じにする。activation event は立てない。
+
+**detached に触れる範囲と、憲法 §2 との照合** (計画 §3)
+
+- §2-1: HWND の同定は既存の allocation / window lease のまま。拡張の矩形は placement の入力だけ。
+- §2-2: 再生成は受理した要求による明示的な置換だけ。geometry を契機にしない。
+- §2-3: App に detached の bool / Option を足さない。意図は要求と continuation、用途は runtime、終了方針は捕捉した値。
+- §2-4: 生成時の種と既存の runtime placement を使い、新しい保存先を作らない。`BrowserView` は位置の保存から外す。
+- §2-5: 要求 ID・context・世代・item identity・window lease で判断し、時間窓を使わない (試作の時刻による期限は移さない)。
+- §2-8: 既存の F11 / F12 / park / 複数ウィンドウのテストは弱めない。
+
+**合意**
+
+- 独立レビュー (GPT-6.1 Sol / xhigh、read-only、設計書のレビューと同じ担当) を計画に対して 2 回受けた。第 12 回: 段階 2・3・5 は合意、段階 4 は不合意 (トレイ復帰で root だけを戻す案が、既存の可視性の復帰まで抑えていた)。段階 4 を「可視性は全部戻し、focus / raise だけを分ける」に改め、第 13 回で合意、計画は ACCEPT。
+- レビュー担当の言葉 (第 13 回): 「段階4は既存窓・presenter の可視性復帰を維持し、focus／raise だけを既存の復帰 owner の型付き方針で分けています。症状パッチではなく構造的変更として合意します。」
+- 設計担当 ClaudeCode も、段階 2〜5 は症状パッチではなく、所有の境界を型で表す構造的な変更であることに同意する (2026-11-22)。
+- 各段階の実装の完了時に、実装が計画どおりかを独立レビューで確かめ、ここに結果を足す。
+- **段階 2 の実装 (2026-11-22、`af98859b9`・`8b9e480fe`)**: 独立レビューで ACCEPT、凍結の決まりの構造的変更 (実装) にも合意。直す前のコード `5982ed756` に再現テストだけを入れて流し、F12 の連動窓で、2 重起動で開いた画像の後に履歴の復元が一覧の選択を前回の画像へ戻し、同期で連動窓が前回の画像を開き直すことを確かめた (テスト上の再現、実機では未確認)。ふだんの起動の変化の洗い出しで見つかった退行 2 つ (履歴のスクロール・保留中のファイル操作の自動チェック) は `8b9e480fe` で戻した。
+- **段階 3 の実装 (2026-11-22、`5f631f116`)**: 独立レビューで ACCEPT、凍結の決まりの構造的変更 (実装) にも合意。用途は生成時に固定、終了は削除の前に捕捉した `DetachedCloseOwner` の値で決め、F12 は対象の窓の用途で共通の入口とメニューが断る。`Normal` の既存の経路に退行は見つからなかった。関連テスト 156 件成功。
+- **段階 4 の実装 (2026-11-22、`b92b6e243`・`d6623e62c`)**: 1 回目は REVISE で不合意 (P1: 前の linked 窓の置換による終了が、新しく作った DirectMedia reader の一覧を戻して要求の画像を開けなくする。新旧の reader の所有境界が成り立っていない)。前の reader の終了を新しい reader を作る前に完了させ、要求を保って引き継ぐ形に直し、2 回目で ACCEPT、凍結の決まりの構造的変更 (実装) にも合意。関連テスト 190 件成功。本体 lib の全件 19,659 件は `b92b6e243` で成功 (P1 の修正の前)。
+- **段階 5 の実装 (2026-11-22、`6c07dc523`・`fb20fbbe5`・`201f8fdb6`)**: 構造 (要求を既存の受付の所有へ合流させる) には 1 回目から合意。通信の終端で P1 (応答の直後の切断が未読の応答を捨てる) と P2 (接続を保持するクライアントに上限が無い) を直し、3 回目で ACCEPT・合意。launcher のテストは release の入力が要るため段階 6 の後に流す。
+
+**段階2の実装引き継ぎ (2026-11-22、検証・独立レビュー待ち)**
+
+- 要求の相関 ID・表示意図・明示選択を `external_open.rs` の型に置き、既存の startup／navigation／sidecar／composition owner で表示の確定境界まで運ぶ。App の追加フラグ、時間窓、HWND／geometry／placement の判定変更はない (§2-1〜5)。独立 context への既存 handoff は要求を保持し、routing origin だけを変更する。
+- 履歴を適用してから連動 sync を止める症状パッチではなく、復元 owner の context・世代・item identity 検証後に明示対象を選択の正本とする。取消・close・error・対象消失は既存の要求退役へ合流する。DirectMedia の close 取消も同じ owner の処理に含めた。
+- linked F12 の選択／表示／sync stamp、同一パスの相関、待機の取消・置換、sibling の generation／cancel／channel／cache／window binding の回帰テストを追加。既存 detached テストは削除・弱化しない (§2-8)。ビルド・テストは設計担当の共有実行枠へ引き継ぐ。窓の用途・終了方針・overlay の表示分岐は段階3・4で実装する。
+
+段階2の追加修正では、カーソルを明示要求に保ちつつ履歴スクロールと操作結果のチェック付与を復元する（[実装計画の追加記録](browser-to-miv-impl-plan.md)）。既存の復元 owner の効果を分ける変更で、sync を抑止する分岐、App の追加フラグ、HWND／placement の変更はない。activation 受付から連動窓の sync・close までを一本で通すテストを追加し、元の characterization の各不一致点で要求画像が維持されることを assert する。今回のビルド・テストは引き継ぎ待ち。
+
+**段階3の実装引き継ぎ (2026-11-22、検証・独立レビュー待ち)**
+
+- 合意した構造のまま、用途を runtime の生成時だけ設定し、終了前の window lease・用途・型付き理由を `DetachedCloseOwner` に捕捉する。active の入力・描画前と passive の一括終了前の値を teardown／finalizer に運び、削除後の runtime の有無から方針を推測しない。
+- §2-1・2: HWND 同定・geometry・再生成条件は変更しない。§2-3: App の detached field は増やさず、用途は runtime、終了はローカルな所有値に置く。§2-4: 保存は既存 runtime 除去の一か所に保ち、BrowserView だけを除く。§2-5: lease と型付き理由で決め、時間窓を追加しない。
+- §2-6・7: 新しい症状に対する補修は行わない。native 動画の F12 の理由も型で運ぶため、計画の範囲表以外では既存 transition effect と native 消費側だけを更新した。順序や待ちは不変。§2-8: 既存テストを維持し、Normal／BrowserView の表・早期除去・passive・F11・F12・sibling の回帰テストを追加した。
+- F12 の拒否は共通入口で切替対象 lease の用途から行い、メニューも同じ判定を使う。位置保存と focus の所有境界の変更であり、症状パッチではない。Normal の保存・既存の idle focus・F11・F12 は維持する。実行結果と独立レビューの合意は未取得で、設計担当へ引き継ぐ。
+
+**段階4の実装引き継ぎ (2026-11-22、検証・独立レビュー待ち)**
+
+- 合意済みの用途・位置の組を linked／loading／materialized の生成境界へ渡す。linked の置換は `BrowserReplacement`、独立窓は既存の park／fork／loading を使う。F12 OFF の連動は実 runtime の BrowserView＋linked 所有で維持し、設定は反転しない。
+- §2-1・2: HWND の同定は従来の lease のまま、再生成は受理済み要求による明示置換だけ。§2-3・4: App の field・位置の保存先を追加せず、用途は runtime、seed はローカル生成値に置く。§2-5: 要求の意図・context・window identity で分岐し、時間窓は追加しない。
+- トレイ復帰は第12回レビュー後の形を維持する。可視性は root・retained viewport・全 native presenter で既存どおり戻し、型付き方針で focus／raise だけを分ける。旧配置待ち show の focus だけも新しい受付へ所有を渡し、可視性・最大化・配置待ちは捨てない。`tray.rs` の保存済み位置の復帰にも同じ方針を渡した。
+- §2-6・7・8: 実機症状への補修や別機能の警告整理は行わない。既存テストは維持し、通常要求／F12 OFF／生成経路／拒否の前面化／旧窓・sibling／3D退役を検査する回帰を追加した。GPU を作るテストは gpu_tests 配下に置いた。表示・focus の所有境界を型で表す変更で、症状パッチではない。実行結果・独立レビューの判断は未取得。
+
+段階4のテスト失敗に対する修正では、BrowserOverlay の旧reader終了が選択を旧画像へ戻した後、新しい明示要求が選択を確定する順序に直した。close側のカーソル復元を止めるguardや二重の選択書き戻しは加えない。表示公開前の所有引き継ぎを修正するもので、通常要求・利用者closeの動作、Appのfield、時間窓、viewport同定・位置保存は変更しない。失敗したassertを維持・強化し、旧MainWindow／Fullscreen／BrowserViewの終了と後続syncを検査する回帰を追加した。設計担当から修正前の182件中181件成功・1件失敗の報告があり、今回の再検証は引き継ぎ待ち。
+
+**段階4の独立レビュー P1 修正 (2026-11-22、再検証・再レビュー待ち)**
+
+`b92b6e243` は設計担当から lib 全19,659件成功の報告があったが、独立レビューは REVISE、実装への構造合意は保留。新 DirectMedia reader の構築後に旧 linked 窓を終了する順序が、新旧 reader の所有境界を破っていた。
+
+レビュー・設計担当が指定した方針どおり、sidecar continuation と即時 action の2つの構築入口を共通化した。対象パス・準備済みメタデータ・要求を値で保持し、BrowserOverlay の旧 reader の終了／park を先に完了してから、終了後の一覧で新 reader を構築する。MainWindow／Fullscreen／BrowserView の同じ置換にも適用する。元一覧を復元する既存 close の処理や Preferences の順序は変更しない。
+
+引き継ぎ済みの要求は `ViewerOpenOrigin::MainPrepared` として、相関 ID・意図・選択所有を保って既存の hydration／表示確定へ運ぶ。新 reader を閉じ直す二重 handoff を防ぐ所有状態であり、App の bool／Option や時間窓は増やさない (§2-3・5)。HWND 同定・再生成条件・placement 保存先は変更しない (§2-1・2・4)。元一覧復元の条件追加ではなく構築境界の順序を直し、既存テストを維持したまま activation からの回帰と即時入口・相関・通常順序の回帰を追加する (§2-6〜8)。今回のビルド・テストは設計担当へ引き継ぐ。実装の構造合意は再レビュー待ち。
+
+P1 修正の再検証は設計担当から190件中189件成功・activation 回帰の close 後一覧検査1件失敗の報告があった。原因は、viewer teardown の完了を帰り先一覧の非同期復元の完了と誤認したテスト側の確認境界。製品の close／restore は変更せず、既存の履歴復元完了 helper を通してから同じ PNG assert と元一覧への完全一致を検査するよう修正した。assert の弱化・製品への待ちや guard の追加はない。今回のテスト修正の再実行・独立レビューは引き継ぎ待ち。
+
+**段階5の実装引き継ぎ (2026-11-22、ビルド・テスト・独立レビュー待ち)**
+
+- 新 pipe／CLI の共通 crate から既存の activation channel と InitialStartup へ BrowserOverlay の要求を運ぶ。listener は `ActivationOpenPath::received` で Remote 所有と受信順を捕捉し、既存の最新一件・保留・破棄・拒否の owner に渡す。App の detached 用 field は増やさない (§2-3)。
+- 起動済み launcher と mutex 競合で後着になった core の双方を専用の終端分岐へ接続した。版・channel 配送までの応答を確認し、旧 open-path pipe／activation event／別 core への fallback と再試行を持たない。接続した server PID へ送信前に前面化の許可を渡し、未起動 core の spawn 後も child PID へ渡す。失敗はログに残す。host の spawn は段階6で接続する。
+- listener の寿命は ActivationListener の service owner に置き、接続・読込・書込の全待ちを永続 stop event で解除する。これは transport の停止所有であり、detached の競合を隠す待ち・時間窓を追加するものではない (§2-5)。PID／許可は注入でき、テストから desktop は変えない。
+- HWND 同定・viewport 経路・再生成条件・用途・placement 保存先は変更しない (§2-1・2・4)。段階2〜4で合意した要求の型へ入口を繋ぐ構造変更であり、症状 guard は足さない (§2-6・7)。既存テストを維持し、新規19件と通常の起動・MCP・名前空間の回帰を引き継ぐ (§2-8)。cargo は最後の fmt 以外実行しない。実装に対する構造合意は再レビュー待ち。
+
+**段階5の独立レビュー P1 修正 (2026-11-22、再検証・再レビュー待ち)**
+
+`6c07dc523` の独立レビューは、既存の受付 owner に要求を合流させる構造には合意、応答を即座の切断で破棄し得る通信終端の P1 で REVISE。応答後は stop で解除可能な overlapped read で client の close を待ち、その後に切断する。終了待ちに期限や FlushFileBuffers は使わない。
+
+単一 instance の受付 loop を EOF 待ちで塞がないよう、次の待受を確保してから接続を worker に引き渡す transport owner に集約した。接続ごとの reader／reply／close はその worker が持ち、共通 stop で native operation を解除し、全 worker を join してから listener を終える。既存の DACL と要求受付 callback を使い、App field・viewport／HWND の同定・用途・placement・activation event は変更しない。実 pipe の遅延読込・次の受付・client close・stop の回帰を追加し、既存テストを維持する。通信終端の所有境界の修正であり、detached の時間窓や症状 guard ではない。今回のビルド・テスト・P1 再レビューは引き継ぎ待ち。
+
+**段階5の独立レビュー P2 修正 (2026-11-22、再検証・再レビュー待ち)**
+
+`fb20fbbe5` の独立レビューでは応答保持の P1 は解消、構造に合意。保持 peer の資源量が無制限な P2 には、設計担当の指定どおり固定4件の上限を置いた。容量と寿命は `PeerWorkers` の JoinHandle 集合が持ち、受付後に終了済み worker を回収してから判定する。満杯の接続は応答・worker・activation を作らず切断し、待受 instance を再利用して listener を継続する。まれな失敗として既存の client の失敗通知に合流し、再試行・待ち行列・設定項目は足さない。停止とエラー時は同じ owner が全 worker を stop／join する。
+
+実 pipe で上限の拒否・listener 存続・close 後の枠の回収を検査する2回帰を追加し、既存の停止回帰は4件保持へ強化した。P1 の期限なし・停止可能な EOF 待ちは維持する。App field・viewport／HWND の同定・用途・placement・既存の activation event に変更はない。transport の資源所有に上限を置く変更であり、時間窓や症状 guard ではない。今回のビルド・テスト・P2 再レビューは引き継ぎ待ち。
+
+P2 修正の再検証は設計担当から共有 crate の17件中16件成功・手動の枠回収テスト1件失敗、本体 lib の127件成功の報告があった。テストが再利用 instance の接続待ちを始める前に client open を行っていた確認手順の誤りであり、製品コードは変更しない。テストは OS の待受状態・connect 完了・client thread の join で順序を確定し、worker 終了は既存の is_finished を使う形に修正した。sleep・再試行・assert の弱化、製品への時間窓や追加状態はない。今回のテスト修正の再実行は引き継ぎ待ち。
+
+### 2026-11-21: 絞り込みの変更で一覧を読み直さない・AI の絞り込みを一覧全体の取得の証明へ (§1.835、実装済み・自動検証済み・実機未確認)
+
+**変更の内容**
+
+- 自動更新の判定 key (`folder_projection_key_with_presentation`) から facet を外す。
+  - facet は行の記録の後の表示投影で、行を作る条件ではない。
+  - それでも key に入っていたので、facet を変えるたびにフォルダ全体の読み直しが走り、範囲指定のメニューが 1 文字目で閉じていた。
+- 読み直しが隠していた、AI モデル・ツールの絞り込みの取得不足も同時に直す。
+  - 修正前は、絞り込み後の一覧だけを取得し、完了を一覧全体で 1 つの状態から推していた。
+  - 長さ (§1.762) と同じ「一覧全体の走査 + 取得の証明」へ移した。
+- 評価フィルタの解除で未取得の画像が消える既存の不具合も段階1テストで再現し、同じ修正対象とした。
+
+**detached に触れる範囲**
+
+- `viewer_context_registry.rs:5159` の fork は key を計算し直すだけで、コードは変えない。変わるのは関数の意味だけ。
+- §1.762 で登録した `duration_scan_proof` を、`listing_meta_scan_proof: Option<ListingMetaScanProof>`へ置き換えた。
+  - 証明は`generation`・`items_len`・`ListingMetaRequirements { duration, ai }`を持つ。
+  - 既存の登録 (構造体・初期化・swap・fork) の型と名前を揃え、所有の分類は変えない。
+  - fork 先は空、元 context が保持する。
+- 変えないもの: detached の述語・viewport の選択・配送・HWND・placement・bundle の所有と交換。
+
+**合意**
+
+- 独立設計レビュー (gpt-6.1-sol / xhigh、read-only) を 5 回受けた。
+  - r1〜r5 のすべてで「STRUCTURAL: AGREE」、r5 で「VERDICT: ACCEPT」。
+  - レビュー担当の言葉 (r1): 「キーから不要な facet を除く変更自体は、誤った失効条件の生成元を直す構造的修正であり、症状パッチではないことに同意します。」
+  - r3 では、証明を metadata cache と同じ context に置き、swap で移し、fork 先を空にする方針も、症状パッチに当たらないとした。
+- 統括 ClaudeCode も合意した (2026-11-21)。判断は「案 A は誤った失効条件と取得の持ち主の食い違いを根本で直すもの」。
+- 設計担当 ClaudeCode (worktree `range-filter-835`) も同意する。
+
+**参照**
+
+- 正本は [facet-projection-key-835-plan.md](facet-projection-key-835-plan.md)。
+- 段階2はkeyからfacetだけを除外し、段階3は既存details-meta ownerへ統合証明・要件snapshotを接続した。
+  要件の和・未証明条件の不適用・停止時の有効証明保持・AIメニューの停止保持を同じ契約とする。
+- 段階1の21本は設計担当の実行で緑5・赤16 (正本§10.1)。
+- 段階3の関連テストと lib 全件は、設計担当の実行で緑 (正本§10.3・§10.4)。lib 全件は 5498fd963 で 19418 本。
+- 独立実装レビュー (gpt-6.1-sol / xhigh): 1 回目は REVISE (P2 2 件・P3 1 件)。修正後の再レビューで「VERDICT: ACCEPT」「STRUCTURAL: AGREE」。
+  - 1 回目の言葉: 「registryの製品差分は型・名前の置換で、所有分類・detached述語・viewport／host／placement／bundle交換の変更はありません。」
+  - 再レビューの言葉: 「所有境界と既存機構に沿う構造的修正という判断も維持します。」
+- fork 先の証明が空であることは registry のテスト (`viewer_context_registry.rs:66`・`:111`) で検査する。
+- 実機動作は未確認 (サブ PC の確認を予定)。
+- 静的レビューのP2は設計担当が正本§4.2.2-10の追補として採用し、表示集合の拡大時に新たな行の
+  通常列を既存の予算付きAllRequirementsで補充する形へ実装した。全体proof・cache・停止状態を保持し、
+  追加のcontext状態・owner・UI全走査・I/Oや、detachedの述語・viewport経路の変更は加えない。
+- 収録版は v5.6.0 (利用者決定)。
+
 ### 2026-11-20: ページ内スクロールの拡張（§1.823〜§1.826）
 
 補間のbundle追加・swapと型付き着地の配送を追加した。**検証は未実施**。
@@ -7981,3 +8113,37 @@ fork 先は空、元 context は cache と proof を保持する。detached の�
 独立レビュー (gpt-6.1-sol / xhigh を指定して実行、3 回) と設計担当 ClaudeCode は、これを既存 details 状態への機械的な追加であり
 症状パッチではない構造的変更であることに合意した。正本は [長さ順・長さ絞り込み計画](media-duration-sort-filter-plan.md) §7・§11。
 直接の swap・bundle 破棄・fork はテストで確認した。registry 経由の mount／park／close と実機動作は未確認。
+
+### 復元の開始時の入力の除去を、root の入力の関門の後へ揃える（2026-11-22、§1.828 NG-1）
+
+**変更の内容**
+
+- 今開いているフォルダの名前を速くダブルクリックすると、枝が開閉しないことがあった (サブ PC 担当の観測)。
+  - 再クリックの更新の結果は `render_update_before_frame` で反映され、サイドカー復元が root の入力の関門 (`input_update_begin`) の前に始まる。
+  - 開始処理はその場で ROOT の入力から押下を取り除いていた。
+  - そのため、関門の `begin_folder_pane_label_input` が、押下の消えたイベントと押下の残る `pointer_button_targets()` を照合して食い違い、ジェスチャを消していた。
+- root の関門を pass 番号付きの型 (`RootInputGate`) で記録する。
+- 開始時のその場での除去をしていた 3 か所 (サイドカー復元のハイドレーション・ページの識別の準備・見開きのずらしの retained shift) を `sanitize_input_for_started_sidecar_restore` に集約した。
+- ROOT の viewport の入力の除去だけを、関門の前なら pass 番号付きの要求として関門まで待たせる。関門は、ツリーの名前の認識の後に実行する。
+
+**detached に触れる範囲**
+
+- 見開きのずらしの retained shift は `with_viewer_context` の中で開始するので、detached の viewer context が mounted な状態でも通る。
+- 判定の述語 (`sidecar_restore_blocks_projected_context`)・CancelClose の値・mounted な context が持つジェスチャの終了は、今までどおり開始の時点・開始時の context で行う。
+- 関門へ渡す要求は ROOT の viewport の入力の除去だけで、context の操作を持ち越さない。
+- ROOT 以外の viewport・関門の後・pass の外 (logic) は、今までどおりその場で除去する。
+- 変えないもの: detached の述語・viewport の選択・配送・HWND・placement・bundle の所有と交換。
+
+**合意**
+
+- 独立レビュー (gpt-6.1-sol / xhigh、read-only、コミット `0574848c2`): 「STRUCTURAL: AGREE」「VERDICT: ACCEPT」。
+  - レビュー担当の言葉: 「「同じ root pass で認識→除去」という順序を所有境界で保証する構造的修正です。」
+- 実装の途中で、実装担当 (Codex gpt-6.1-sol / high) が指摘して止まった。「処理全体を関門へ遅らせると、retained shift で開始時と別の context を操作し得る」。そこで、context のジェスチャはその場、viewport の入力だけ延期、という分け方にした。
+- 統括 ClaudeCode が方針に合意した (2026-11-22)。
+- 設計担当 ClaudeCode (worktree `mimageviewer-tree828`) も同意する。
+  - 理由: 症状を消す guard・遅延・再試行ではない。`input_update_begin` の設計の順序を、開始時のその場での除去が先回りしていた生成元を直すもの。
+- 検証:
+  - 3 か所それぞれで関門の前と後に始まる場合、子 viewport、pass の外、古い要求の破棄、開始元の context の unmount をテストした。
+  - NG-1 のダブル・トリプルクリックは、本番の repaint context を設定してテストした。
+  - 修正前の挙動では、関門の前の新テスト 7 件がすべて失敗した。
+  - 実機は未確認。正本は [フォルダツリーの更新の計画](folder-tree-refresh-plan.md) §14.9。

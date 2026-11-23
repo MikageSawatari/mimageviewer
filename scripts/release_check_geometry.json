@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "startup_position": [60, 40],
+  "default": {
+    "window_size": [1328, 900],
+    "grid_cols": 7
+  },
+  "static_rows": [
+    {"dpi": 96, "window_size": [1420, 900], "grid_cols": 5},
+    {"dpi": 144, "window_size": [1328, 900], "grid_cols": 7}
+  ]
+}

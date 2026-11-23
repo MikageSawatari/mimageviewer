@@ -569,6 +569,10 @@ mod archive_inner_book_s3;
 pub(crate) mod book_resume_meter;
 #[cfg(test)]
 mod book_resume_meter_tests;
+#[cfg(all(test, windows))]
+mod browser818_close_tests;
+#[cfg(windows)]
+mod browser_presentation;
 mod cache_ops;
 mod color_filter;
 mod content_identity_detection;
@@ -578,11 +582,19 @@ mod detached_activation;
 #[cfg(windows)]
 pub(crate) mod detached_activation_gesture;
 #[cfg(windows)]
+mod detached_close;
+#[cfg(windows)]
+use browser_presentation::DetachedWindowSeed;
+#[cfg(all(test, windows))]
+mod browser818_presentation_tests;
+#[cfg(windows)]
 mod detached_page_overview;
 #[cfg(windows)]
 mod detached_placement;
 #[cfg(windows)]
 mod detached_window_manager;
+#[cfg(windows)]
+pub(crate) use detached_close::{DetachedCloseFocus, DetachedCloseOwner};
 mod epub_saved_metadata;
 #[cfg(windows)]
 pub(crate) use detached_activation::{
@@ -642,13 +654,14 @@ pub(crate) mod book_preferred_rating;
 use book_preferred_rating::{ContainerRatingTarget, ContainerRatingToast};
 #[cfg(test)]
 mod book_preferred_rating_tests;
+mod folder_pane_reclick;
 pub(crate) mod folder_scan;
 #[cfg(test)]
 mod media_resume_meter_tests;
 pub(crate) use folder_scan::OmittedFolderEntryCounts;
 mod gamepad_input;
 mod grid_scroll;
-pub(crate) use gamepad_input::{RightDragGuide, draw_right_drag_guide};
+pub(crate) use gamepad_input::{GridSelectionEdge, RightDragGuide, draw_right_drag_guide};
 pub(crate) use grid_scroll::{
     GRID_SCROLL_MIN_VIEWPORT_H, GridAspectLayout, GridScrollGeometry, GridScrollState,
 };
@@ -661,7 +674,7 @@ pub(crate) mod listing_sort;
 mod media_metadata_mutation;
 pub(crate) mod metadata_import_refresh;
 mod metadata_ops;
-use duration_metadata::DurationScanProof;
+use duration_metadata::{ListingMetaRequirements, ListingMetaScanProof};
 mod pin_materialization;
 pub(crate) use metadata_ops::{probe_image_dims_from_bytes, tag_item_path};
 
@@ -733,12 +746,16 @@ pub(crate) use archive_inner_book::{
 };
 #[cfg(all(test, windows))]
 mod context_state_tests;
+pub(crate) mod external_open;
 mod logic_service;
 pub(crate) mod main_drop;
 mod pinned_search;
 pub(crate) mod root_lifecycle;
 mod search_request;
 mod startup_ops;
+pub(crate) use external_open::{
+    ExplicitOpenPath, ViewerOpenAdoption, ViewerOpenIntent, ViewerOpenRequest,
+};
 mod subfolder_expansion;
 mod update_phases;
 pub(crate) use close_return::{
@@ -3551,13 +3568,26 @@ impl App {
         window_id: u64,
         reason: &'static str,
     ) -> Option<DetachedWindowRuntime> {
-        self.remove_detached_window_runtime_inner(window_id, reason)
+        let owner = self.capture_detached_close_owner(
+            Self::detached_session_lease(window_id),
+            ViewerCloseCause::Replaced,
+        );
+        self.remove_detached_window_runtime_inner(window_id, reason, owner)
+    }
+
+    pub(crate) fn remove_detached_window_runtime_owned(
+        &mut self,
+        owner: DetachedCloseOwner,
+        reason: &'static str,
+    ) -> Option<DetachedWindowRuntime> {
+        self.remove_detached_window_runtime_inner(owner.lease.window_id, reason, Some(owner))
     }
 
     fn remove_detached_window_runtime_inner(
         &mut self,
         window_id: u64,
         reason: &'static str,
+        owner: Option<DetachedCloseOwner>,
     ) -> Option<DetachedWindowRuntime> {
         let _ = self.capture_detached_window_placement_at_decision(window_id, reason);
         self.detached_window_manager
@@ -3567,9 +3597,10 @@ impl App {
         self.cancel_detached_right_drag_owner(window_id, reason);
         let runtime = self.detached_window_manager.remove(window_id);
         if let Some(runtime) = runtime.as_ref() {
-            if let Some(placement) = runtime
-                .placement
-                .filter(|placement| Self::detached_window_runtime_placement_is_usable(*placement))
+            if owner.is_some_and(|owner| owner.policy().save_placement)
+                && let Some(placement) = runtime.placement.filter(|placement| {
+                    Self::detached_window_runtime_placement_is_usable(*placement)
+                })
             {
                 self.settings.detached_viewer_window_physical_placement = Some(placement);
                 self.log_detached_image_window_debug(format!(
@@ -3650,6 +3681,33 @@ impl App {
         window_id: u64,
         reason: &'static str,
     ) {
+        let owner = self.capture_detached_close_owner(
+            Self::detached_session_lease(window_id),
+            ViewerCloseCause::Replaced,
+        );
+        self.retire_terminal_detached_viewport_identity_inner(window_id, reason, owner);
+    }
+
+    #[cfg(windows)]
+    fn retire_terminal_detached_viewport_identity_owned(
+        &mut self,
+        owner: DetachedCloseOwner,
+        reason: &'static str,
+    ) {
+        self.retire_terminal_detached_viewport_identity_inner(
+            owner.lease.window_id,
+            reason,
+            Some(owner),
+        );
+    }
+
+    #[cfg(windows)]
+    fn retire_terminal_detached_viewport_identity_inner(
+        &mut self,
+        window_id: u64,
+        reason: &'static str,
+        owner: Option<DetachedCloseOwner>,
+    ) {
         self.detached_window_manager
             .transfer_viewport_retirement(window_id);
         if self.detached_window_state(window_id).is_some()
@@ -3675,7 +3733,11 @@ impl App {
             self.detached_viewer_recreate_on_next_render = false;
         }
 
-        self.remove_detached_window_runtime(window_id, reason);
+        if let Some(owner) = owner {
+            self.remove_detached_window_runtime_owned(owner, reason);
+        } else {
+            self.remove_detached_window_runtime(window_id, reason);
+        }
     }
 }
 
@@ -4315,15 +4377,6 @@ pub(crate) struct DeferredFsReopen {
     pub preserve_after_password_prompt: bool,
 }
 
-/// Captured by the semantic request owner, never inferred from a load stage or
-/// the session that happens to be mounted when an asynchronous result arrives.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ViewerOpenAdoption {
-    MainNew,
-    #[default]
-    ContextContinuation,
-}
-
 impl DeferredFsReopen {
     fn zip_dfs_continuation(&self) -> Option<book_composition_permission::BookDfsContinuation> {
         match &self.target {
@@ -4644,22 +4697,24 @@ pub(crate) enum StartupOpenPathSource {
 /// 後続の bookmark request を変更できないようにする。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum StartupOpenPathOwner {
-    InitialStartup,
-    Activation,
+    InitialStartup(ViewerOpenRequest),
+    Activation(ViewerOpenRequest),
     Bookmark(crate::bookmark_browser::BookmarkOpenRequestOwner),
 }
 
 impl StartupOpenPathOwner {
     fn viewer_open_adoption(&self) -> ViewerOpenAdoption {
         match self {
-            Self::InitialStartup | Self::Activation => ViewerOpenAdoption::MainNew,
+            Self::InitialStartup(request) | Self::Activation(request) => {
+                ViewerOpenAdoption::requested(*request)
+            }
             Self::Bookmark(_) => ViewerOpenAdoption::ContextContinuation,
         }
     }
     fn source(&self) -> StartupOpenPathSource {
         match self {
-            Self::InitialStartup => StartupOpenPathSource::InitialStartup,
-            Self::Activation => StartupOpenPathSource::Activation,
+            Self::InitialStartup(_) => StartupOpenPathSource::InitialStartup,
+            Self::Activation(_) => StartupOpenPathSource::Activation,
             Self::Bookmark(_) => StartupOpenPathSource::Bookmark,
         }
     }
@@ -4671,7 +4726,7 @@ impl StartupOpenPathOwner {
     fn open_request_owner(&self) -> OpenRequestOwner {
         match self {
             Self::Bookmark(owner) => OpenRequestOwner::Bookmark(owner.clone()),
-            Self::InitialStartup | Self::Activation => OpenRequestOwner::Navigation,
+            Self::InitialStartup(_) | Self::Activation(_) => OpenRequestOwner::Navigation,
         }
     }
 }
@@ -5082,11 +5137,13 @@ fn folder_projection_key_with_presentation(
     presentation: Option<&crate::settings::FavoriteViewState>,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
+    // Facets project visible_indices after physical rows have been recorded.
+    // rebuild_visible_indices applies the current facets; including them here
+    // would reload an unchanged listing on every filter edit.
     let value = serde_json::json!({
         "sort": presentation.map_or(settings.sort_order, |state| state.sort_order),
         "order": presentation.map_or(&settings.grid_display_order, |state| &state.grid_display_order),
         "visibility": settings.file_type_visibility,
-        "facet": settings.facet_filter,
         "same_name_folder_book": settings.same_name_folder_book,
         "archive": settings.skip_archive_if_zip_exists,
         "epub": settings.skip_epub_if_pdf_exists,
@@ -6729,12 +6786,6 @@ impl FolderOpenScanPurpose {
     }
 }
 
-#[derive(Clone, Copy)]
-enum PhysicalFolderSortReload {
-    Immediate,
-    WorkerScan,
-}
-
 /// folder open scan の完了候補。`purpose` に応じて main nav の優先順位で裁定するか、
 /// mounted detached bundle 内で対象画像を開く。
 pub(crate) struct FolderPaneOpenReady {
@@ -7476,7 +7527,9 @@ enum DetailsMetaScanScope {
 
 struct DetailsMetaPending {
     scan_scope: DetailsMetaScanScope,
-    duration_scan: Option<DurationScanProof>,
+    // Whole-listing work carries the requirements it must finish; a bounded
+    // VisibleStage cannot publish a whole-listing qualification of its own.
+    listing_meta_scan: Option<ListingMetaScanProof>,
     visible_revision: u64,
     selection_target_key: Option<String>,
     normal_target_keys: HashSet<String>,
@@ -17104,6 +17157,7 @@ pub struct App {
     pub(crate) edit_preview_cache: Option<crate::edit_preview_cache::EditPreviewCacheService>,
     /// cache worker 完了時に UI を起こすため、直近 update の Context を保持する。
     pub(crate) edit_preview_repaint_ctx: Option<egui::Context>,
+    root_input_gate: sidecar_restore::RootInputGate,
     /// 保存完了後、同じページの通常サムネを編集プレビューへ差し替えるまで追跡する。
     pub(crate) edit_preview_refresh_pending: std::collections::HashMap<String, std::time::Instant>,
     /// 固定代表の参照元ページで色調補正が変わったキー。
@@ -17396,9 +17450,10 @@ pub struct App {
     /// 詳細遅延列の対象集合 revision。フィルタ変更で進め、古い worker 完了時に再要求する。
     details_lazy_visible_revision: u64,
     /// 詳細遅延メタの走査セッション状態。`details_meta_pending` は個々の worker job を所有し、
-    /// この state は連続 job をまたいで Ready になるまでソート/フィルタを無効にする。
+    /// この state は連続 job をまたぐ詳細列の取得状態。長さ/AI の条件の資格は下の証明で判定する。
     pub(crate) details_image_dims_state: LazyColumnState,
-    duration_scan_proof: Option<DurationScanProof>,
+    /// 同じ一覧で全体取得が完了した要件。段階取得や停止では失効させない。
+    listing_meta_scan_proof: Option<ListingMetaScanProof>,
     /// AI モデル/生成ツール facet をユーザーが開いたか、条件が有効なときに遅延メタを読む。
     pub(crate) ai_model_facet_requested: bool,
     pub(crate) duration_facet_requested: bool,
@@ -18116,7 +18171,7 @@ pub struct App {
     pub(crate) initialized: bool,
     /// ショートカット D&D / SendTo / CLI で指定された起動時の開く対象。
     /// `Settings` には保存せず、初回 update で通常の起動復元より優先して消費する。
-    pub(crate) startup_open_path: Option<PathBuf>,
+    pub(crate) startup_open_path: Option<ExplicitOpenPath>,
     /// 起動引数 / 2 重起動 activation で渡されたパスを UI スレッド外で解決中。
     pub(crate) startup_open_path_resolve_pending: Option<StartupOpenPathResolvePending>,
 
@@ -19695,6 +19750,7 @@ pub struct App {
     /// Process-global Windows file clipboard observation. Viewer contexts only read the
     /// normalized path snapshot; OS listener/reader ownership stays outside every bundle.
     pub(crate) cut_clipboard: crate::cut_clipboard::CutClipboardObserver,
+    pub(crate) browser_integration: crate::browser_integration::BrowserIntegration,
     pub(crate) clipboard_capture_service: crate::clipboard_capture::ClipboardCaptureService,
     pub(crate) capture_fetch_service: Option<crate::clipboard_capture::fetch::CaptureFetchService>,
     pub(crate) capture_selection: Option<crate::ui_dialogs::clipboard_capture::CaptureSelection>,
@@ -21106,6 +21162,7 @@ impl App {
             archive_cache_db,
             edit_preview_cache,
             edit_preview_repaint_ctx: None,
+            root_input_gate: sidecar_restore::RootInputGate::default(),
             edit_preview_refresh_pending: std::collections::HashMap::new(),
             pinned_adjustment_refresh_keys: std::collections::HashSet::new(),
             archive_convert: None,
@@ -21214,7 +21271,7 @@ impl App {
             details_meta_pending: None,
             details_lazy_visible_revision: 0,
             details_image_dims_state: LazyColumnState::Disabled,
-            duration_scan_proof: None,
+            listing_meta_scan_proof: None,
             ai_model_facet_requested: false,
             duration_facet_requested: false,
             facet_navigation: FacetNavigationState::default(),
@@ -22043,6 +22100,7 @@ impl App {
             placement_slot: None,
             activation_listener: None,
             cut_clipboard: crate::cut_clipboard::CutClipboardObserver::default(),
+            browser_integration: crate::browser_integration::BrowserIntegration::default(),
             clipboard_capture_service: crate::clipboard_capture::ClipboardCaptureService::default(),
             capture_fetch_service: {
                 #[cfg(not(test))]
@@ -24008,7 +24066,7 @@ impl App {
         self.modal_dialog_block_reason_filtered(include_menus, true)
     }
 
-    fn modal_dialog_block_reason_filtered(
+    pub(crate) fn modal_dialog_block_reason_filtered(
         &self,
         include_menus: bool,
         include_sidecar_restore: bool,
@@ -27758,6 +27816,19 @@ impl App {
         }
     }
 
+    /// The existing sort request owns this folder's scan until it is adopted or retired.
+    /// Background refresh callers share this predicate; no independent wait state is needed.
+    fn current_view_order_refresh_scans_folder(&self, folder: &Path) -> bool {
+        self.folder_pane_open_pending
+            .as_ref()
+            .is_some_and(|pending| {
+                matches!(
+                    pending.purpose,
+                    FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+                ) && crate::folder_tree::path_eq(&pending.path, folder)
+            })
+    }
+
     fn ensure_current_folder_watch(&mut self, ctx: &egui::Context) {
         if !self.folder_observation_allowed() {
             self.retire_passive_folder_observation();
@@ -27780,6 +27851,11 @@ impl App {
             .as_ref()
             .is_some_and(|watch| watch.folder == folder && watch.projection_key == projection_key)
         {
+            return;
+        }
+        if self.current_view_order_refresh_scans_folder(&folder) {
+            // Re-registering starts a full confirmation scan. Keep the old watch
+            // until the sort request ends, then the next frame uses the current key.
             return;
         }
         self.current_folder_watch = None;
@@ -29062,29 +29138,13 @@ impl App {
         ) && self.zip_nav.is_none()
             && !self.grid_is_pdf_pages()
         {
-            self.apply_sort_change_reload_without_ui_io();
+            self.apply_sort_change_reload();
         } else {
             self.reload_top_level_grid(ctx);
         }
     }
 
     pub(crate) fn apply_sort_change_reload(&mut self) {
-        let mode = if self.settings.sort_order.is_duration() {
-            PhysicalFolderSortReload::WorkerScan
-        } else {
-            PhysicalFolderSortReload::Immediate
-        };
-        self.apply_sort_change_reload_with_physical_mode(mode);
-    }
-
-    pub(crate) fn apply_sort_change_reload_without_ui_io(&mut self) {
-        self.apply_sort_change_reload_with_physical_mode(PhysicalFolderSortReload::WorkerScan);
-    }
-
-    fn apply_sort_change_reload_with_physical_mode(
-        &mut self,
-        physical_mode: PhysicalFolderSortReload,
-    ) {
         if self.collection_grid_root_order().is_some() {
             return;
         }
@@ -29151,46 +29211,20 @@ impl App {
             }
             return;
         }
+        if !self.current_sort_reload_is_physical_directory() {
+            return;
+        }
         if let Some(path) = self.current_folder.clone() {
-            let previous_history = self.folder_history.remove(&path);
-            match physical_mode {
-                PhysicalFolderSortReload::Immediate => {
-                    let owner = self.current_folder_reload_owner(&path);
-                    let outcome = self.load_folder_or_convert_archive_with_auto_fullscreen_owned(
-                        path.clone(),
-                        false,
-                        owner,
-                        crate::app::StartupListIntent::PreservePresentation,
-                    );
-                    if !matches!(outcome, FolderOpenOutcome::Loaded)
-                        && let Some(history) = previous_history
-                    {
-                        self.folder_history.insert(path, history);
-                    }
-                }
-                PhysicalFolderSortReload::WorkerScan => {
-                    // PDF は enumerate 順固定で全項目が同じ Image カテゴリなので、
-                    // sort / category order のどちらも materialize 結果を変えない。
-                    // ファイル path を directory scan worker へ渡してエラーにしない。
-                    if crate::folder_tree::is_paged_document_path(&path)
-                        && self
-                            .items
-                            .iter()
-                            .all(|item| matches!(item, GridItem::PdfPage { .. }))
-                    {
-                        return;
-                    }
-                    let order = CurrentViewOrderSnapshot::from_settings(&self.settings);
-                    let reload_owner = Box::new(self.current_folder_reload_owner(&path));
-                    self.start_folder_open_scan(
-                        path,
-                        FolderOpenScanPurpose::CurrentViewOrderRefresh {
-                            order,
-                            reload_owner,
-                        },
-                    );
-                }
-            }
+            self.folder_history.remove(&path);
+            let order = CurrentViewOrderSnapshot::from_settings(&self.settings);
+            let reload_owner = Box::new(self.current_folder_reload_owner(&path));
+            self.start_folder_open_scan(
+                path,
+                FolderOpenScanPurpose::CurrentViewOrderRefresh {
+                    order,
+                    reload_owner,
+                },
+            );
         }
     }
 
@@ -30996,6 +31030,29 @@ impl App {
 
     pub(crate) fn direct_navigation_scan_elapsed(&self) -> Option<std::time::Duration> {
         self.direct_navigation_scan_pending().then(|| {
+            self.folder_pane_open_pending
+                .as_ref()
+                .unwrap()
+                .started_at
+                .elapsed()
+        })
+    }
+
+    pub(crate) fn view_order_refresh_scan_pending(&self) -> bool {
+        self.main_folder_history_available()
+            && self
+                .folder_pane_open_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    matches!(
+                        pending.purpose,
+                        FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+                    )
+                })
+    }
+
+    pub(crate) fn view_order_refresh_scan_elapsed(&self) -> Option<std::time::Duration> {
+        self.view_order_refresh_scan_pending().then(|| {
             self.folder_pane_open_pending
                 .as_ref()
                 .unwrap()
@@ -45124,6 +45181,7 @@ impl App {
         &mut self,
         mut continuation: sidecar_restore::SidecarLoadContinuation,
         modal_observation: &SidecarModalObservation,
+        explicit_selection: Option<usize>,
     ) {
         if matches!(
             continuation.navigation_after_hydration,
@@ -45136,7 +45194,9 @@ impl App {
             else {
                 unreachable!()
             };
-            if let Some(target) = self.install_direct_media_reader(prepared) {
+            if let Some((target, viewer_adoption)) =
+                self.install_direct_media_reader_for_open(prepared, viewer_adoption)
+            {
                 continuation.first_display_action = sidecar_restore::FirstDisplayAction::None;
                 continuation.navigation_after_hydration =
                     Some(MainListAfterHydration::RequiredFullscreen {
@@ -45166,6 +45226,20 @@ impl App {
                 return;
             }
         }
+        // The restore owner has already qualified any deferred index by context,
+        // generation and item key. RequiredFullscreen owns an exact identity instead.
+        let explicit_selection = explicit_selection
+            .or_else(|| self.composition_explicit_open_selection())
+            .or_else(|| match &continuation.navigation_after_hydration {
+                Some(MainListAfterHydration::RequiredFullscreen {
+                    target,
+                    viewer_adoption,
+                    ..
+                }) if viewer_adoption.owns_file_selection() => {
+                    self.resolve_snapshot_target_idx(target)
+                }
+                _ => None,
+            });
         let sidecar_restore::SidecarLoadContinuation {
             viewer_adoption,
             mut restore_intent,
@@ -45607,10 +45681,23 @@ impl App {
         let refresh_cursor = (!detached_physical)
             .then(|| self.take_hydration_refresh_cursor(&mut restore_intent))
             .flatten();
-        // たった今の操作が作った項目があれば、そこへ移すのが最優先。名前ヒント
-        // (`select_after_load`) も履歴も、そちらは「表示の都合」で決まる復元なので譲る。
-        let from_operation = !detached_physical && self.apply_post_operation_selection();
-        let restored = if from_operation {
+        // 操作結果のチェックは明示 open とも両立する。カーソルだけは明示 open に譲り、
+        // それがなければ操作結果を名前ヒント・履歴より優先する。
+        let from_explicit_open = explicit_selection.is_some();
+        let from_operation = !detached_physical
+            && if from_explicit_open {
+                self.apply_post_operation_checks().is_some()
+            } else {
+                self.apply_post_operation_selection()
+            };
+        let restored = if let Some(idx) = explicit_selection {
+            // An exact open is the selection owner until publication. Consume a general
+            // name hint without applying it, so it cannot escape into the next folder.
+            self.select_after_load.take();
+            self.move_grid_cursor(Some(idx), GridCursorIntent::Automatic);
+            self.grid_scroll.set_reveal_requested(true);
+            true
+        } else if from_operation {
             // Both requests belong to this accepted load. An operation-winning cursor must
             // consume the lower-priority name hint too, so it cannot leak into the next load.
             self.select_after_load.take();
@@ -45627,10 +45714,10 @@ impl App {
                         restored
                     }))
         };
-        // 追加された項目を見せるのが目的なので、操作由来のときは履歴のスクロール位置へ
-        // 戻さない (戻すと、選んだばかりの項目が画面外にある状態になる)。
+        // 操作結果がカーソルを持つときだけ履歴のスクロールへ戻さない。
+        // 明示 open は従来の履歴位置を保ち、要求画像が範囲外なら既存の reveal で見せる。
         if restored
-            && !from_operation
+            && (from_explicit_open || !from_operation)
             && let Some((scroll, _)) = history_state
         {
             // BS / direct-page close は select_after_load で選択対象を更新するが、
@@ -45848,7 +45935,9 @@ impl App {
                 prepared,
                 viewer_adoption,
             } => {
-                if let Some(target) = self.install_direct_media_reader(prepared) {
+                if let Some((target, viewer_adoption)) =
+                    self.install_direct_media_reader_for_open(prepared, viewer_adoption)
+                {
                     self.finish_required_fullscreen_load_with_adoption(
                         target,
                         HistoryTrigger::UserChosen,
@@ -46068,7 +46157,7 @@ impl App {
         self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
         self.ai_model_facet_requested = self.facet_ai_filter_active();
         self.duration_facet_requested = self.settings.facet_filter.duration_preset.is_some();
-        self.duration_scan_proof = None;
+        self.listing_meta_scan_proof = None;
         self.details_image_dims_state =
             if self.details_any_lazy_columns_enabled() || self.whole_listing_meta_scan_wanted() {
                 LazyColumnState::NotRequested
@@ -48050,6 +48139,16 @@ impl App {
         let Some(cur) = self.pending_folder_refresh_target() else {
             return;
         };
+        if self.current_view_order_refresh_scans_folder(&cur)
+            && self
+                .folder_refresh_pending
+                .as_ref()
+                .is_some_and(|request| crate::folder_tree::path_eq(&request.folder, &cur))
+        {
+            // Retain the complete request/cause, including Append delivery, while
+            // the sort scan owns this folder. Normal consumption resumes afterward.
+            return;
+        }
         let Some(target) = self.folder_refresh_pending.take() else {
             return;
         };
@@ -59656,8 +59755,11 @@ impl App {
                 "grid-mouse",
             );
         }
-        if block != crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan
-            && self.dialog_escape_pressed(ctx)
+        if !matches!(
+            block,
+            crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan
+                | crate::filename_stack_ui::GridItemInputBlock::ViewOrderRefreshScan
+        ) && self.dialog_escape_pressed(ctx)
         {
             self.toggle_stack_mode();
             return None;
@@ -59702,10 +59804,13 @@ impl App {
             self.start_batch_convert_to_pdf();
             return None;
         }
-        if block != crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan
-            && self
-                .keymap
-                .consume_action(ctx, KeyAction::GridToggleStackMode)
+        if !matches!(
+            block,
+            crate::filename_stack_ui::GridItemInputBlock::DirectNavigationScan
+                | crate::filename_stack_ui::GridItemInputBlock::ViewOrderRefreshScan
+        ) && self
+            .keymap
+            .consume_action(ctx, KeyAction::GridToggleStackMode)
         {
             self.toggle_stack_mode();
             return None;
@@ -65523,6 +65628,28 @@ impl App {
     #[cfg(windows)]
     #[track_caller]
     pub(crate) fn finish_active_detached_session_close(&mut self, reason: &'static str) {
+        let owner = self.active_detached_session.and_then(|session| {
+            self.capture_detached_close_owner(
+                Self::detached_session_lease(session.window_id),
+                ViewerCloseCause::Replaced,
+            )
+        });
+        self.finish_active_detached_session_close_owned(owner, reason);
+    }
+
+    #[cfg(windows)]
+    #[track_caller]
+    pub(crate) fn finish_active_detached_session_close_owned(
+        &mut self,
+        owner: Option<DetachedCloseOwner>,
+        reason: &'static str,
+    ) {
+        if owner.is_some_and(|owner| {
+            self.active_detached_session
+                .is_some_and(|session| session.window_id != owner.lease.window_id)
+        }) {
+            return;
+        }
         let previous = self.active_detached_session;
         // Retire output while the session and binding still identify its owner. The
         // mounted context may be a sibling of the active at-rest context being closed.
@@ -65531,7 +65658,11 @@ impl App {
                 "session_finish window_id={} reason={reason}",
                 session.window_id
             ));
-            self.retire_terminal_detached_viewport_identity(session.window_id, reason);
+            if let Some(owner) = owner {
+                self.retire_terminal_detached_viewport_identity_owned(owner, reason);
+            } else {
+                self.retire_terminal_detached_viewport_identity(session.window_id, reason);
+            }
             "clear"
         } else {
             "clear_none"
@@ -65566,14 +65697,31 @@ impl App {
         lease: DetachedSessionLease,
         reason: &'static str,
     ) -> bool {
+        self.close_active_detached_session_exact_with_cause(
+            lease,
+            reason,
+            ViewerCloseCause::Replaced,
+        )
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn close_active_detached_session_exact_with_cause(
+        &mut self,
+        lease: DetachedSessionLease,
+        reason: &'static str,
+        cause: ViewerCloseCause,
+    ) -> bool {
         if self
             .active_detached_session
             .is_none_or(|session| session.window_id != lease.window_id)
         {
             return false;
         }
-        self.begin_active_detached_session_close(reason);
-        self.finish_active_detached_session_close(reason);
+        let owner = self.capture_detached_close_owner(lease, cause);
+        if let Some(owner) = owner {
+            self.begin_detached_close_owner(owner, reason);
+        }
+        self.finish_active_detached_session_close_owned(owner, reason);
         true
     }
 
@@ -65742,6 +65890,11 @@ impl App {
 
     #[cfg(windows)]
     fn ensure_detached_viewer_window_id(&mut self) -> u64 {
+        self.ensure_detached_viewer_window_id_with_seed(DetachedWindowSeed::normal(None))
+    }
+
+    #[cfg(windows)]
+    fn ensure_detached_viewer_window_id_with_seed(&mut self, seed: DetachedWindowSeed) -> u64 {
         // The registry owns both the private build reservation and the published binding.
         // Content reload/close and context swaps cannot erase or replace this identity.
         if let Some(id) = self.detached_viewer_window_id() {
@@ -65756,6 +65909,7 @@ impl App {
             self.ensure_mounted_detached_session_binding(id);
         }
         self.last_active_detached_window_id = Some(id);
+        self.install_detached_window_seed(id, !self.detached_viewer_independent_active, seed);
         self.transition_detached_window_state(
             id,
             DetachedWindowState::Opening,
@@ -66009,15 +66163,21 @@ impl App {
         cause: ViewerCloseCause,
     ) -> Option<ClosedBookmarkSummary> {
         let summary_before = self.with_viewer_context_ref(id, ClosedBookmarkSummary::read)?;
+        let close_owner = self.viewer_context_window(id).and_then(|window_id| {
+            self.capture_detached_close_owner(Self::detached_session_lease(window_id), cause)
+        });
         self.transfer_terminal_close_return(id, cause);
 
         // book context の明示 close = detached セッション終了 (§3.7 closing)。desired set から
         // 外す前に closing を立て、teardown 後に finish して backstop が窓を復活させない。
-        self.begin_active_detached_session_close(reason);
+        if let Some(owner) = close_owner {
+            self.begin_detached_close_owner(owner, reason);
+        }
         let mut terminal_failed = false;
-        let result = self.close_and_retire_context(
+        let result = self.close_and_retire_context_with_close_owner(
             id,
             reason,
+            close_owner,
             |app| {
                 // この closure を抜けた直後に context は retire される。遷移中に
                 // `close_fullscreen` を呼ぶと `TerminalClose` を出して戻るだけなので、
@@ -66035,7 +66195,9 @@ impl App {
             },
             |context| ClosedBookmarkSummary::read(context.as_ref()),
         );
-        self.finish_active_detached_session_close(reason);
+        if let Some(owner) = close_owner {
+            self.finish_active_detached_session_close_owned(Some(owner), reason);
+        }
         if terminal_failed {
             crate::logger::log(format!(
                 "active_viewer_context_terminal_close_failed id={id:?} reason={reason}"
@@ -66099,6 +66261,14 @@ impl App {
         ctx: &egui::Context,
         cause: ViewerCloseCause,
     ) -> Result<bool, LocalViewerCloseFailure> {
+        let close_owners = self
+            .detached_window_manager
+            .ids()
+            .into_iter()
+            .filter_map(|id| {
+                self.capture_detached_close_owner(Self::detached_session_lease(id), cause)
+            })
+            .collect::<Vec<_>>();
         self.retire_close_return_owners(cause);
         self.close_local_composition_editor(CompositionEditorCloseReason::OwnerClosed);
         let had_detached = self.fullscreen_viewport_binding.is_some()
@@ -66172,7 +66342,14 @@ impl App {
                 self.clear_detached_window_hwnd_for_window_id(window_id);
             }
             self.begin_active_detached_session_close("mode_change_close_all_active");
-            self.finish_active_detached_session_close("mode_change_close_all_active");
+            let owner = active_window_id
+                .and_then(|id| {
+                    close_owners
+                        .iter()
+                        .find(|owner| owner.lease.window_id == id)
+                })
+                .copied();
+            self.finish_active_detached_session_close_owned(owner, "mode_change_close_all_active");
             // Viewport flags are App-global and can still describe the detached
             // context retired above. End only the projected reader, including its
             // index-less waits; do not cancel main's unrelated list-only request.
@@ -66196,10 +66373,11 @@ impl App {
             );
             self.clear_detached_window_hwnd_for_window_id(*id);
         }
-        if let Err(error) = self.teardown_paused_media_bundles_with_cause(
+        if let Err(error) = self.teardown_paused_media_bundles_with_close_owners(
             &passive_ids,
             "mode_change_close_all_passive",
             cause,
+            &close_owners,
         ) {
             close_failure.get_or_insert(error);
         }
@@ -66208,9 +66386,18 @@ impl App {
         // every local viewer owner.
         for id in self.other_viewer_context_ids() {
             let mut terminal_failed = false;
-            let result = self.close_and_retire_context(
+            let owner = self
+                .viewer_context_window(id)
+                .and_then(|window_id| {
+                    close_owners
+                        .iter()
+                        .find(|owner| owner.lease.window_id == window_id)
+                })
+                .copied();
+            let result = self.close_and_retire_context_with_close_owner(
                 id,
                 "mode_change_close_all_remaining_context",
+                owner,
                 |app| {
                     terminal_failed = app.close_fullscreen_to_completion(ctx).is_err();
                 },
@@ -66239,7 +66426,15 @@ impl App {
                     "mode_change_close_all_runtime",
                 );
             }
-            self.remove_detached_window_runtime(id, "mode_change_close_all_runtime");
+            if let Some(owner) = close_owners
+                .iter()
+                .find(|owner| owner.lease.window_id == id)
+                .copied()
+            {
+                self.remove_detached_window_runtime_owned(owner, "mode_change_close_all_runtime");
+            } else {
+                self.remove_detached_window_runtime(id, "mode_change_close_all_runtime");
+            }
         }
 
         let previous_session = self.active_detached_session;
@@ -66273,7 +66468,16 @@ impl App {
         self.detached_viewer_recreate_on_next_render = false;
         self.clear_detached_viewer_host_hwnd();
         self.clear_detached_viewer_borderless_fullscreen_state("mode_change_close_all");
-        self.focus_main_after_detached_window_close_if_idle(ctx, "mode_change_close_all");
+        if close_owners.is_empty() {
+            // Legacy output without a runtime has no per-window purpose to change
+            // the existing bulk-close focus path.
+            self.focus_main_after_detached_window_close_if_idle(ctx, "mode_change_close_all");
+        } else if let Some(owner) = close_owners
+            .iter()
+            .find(|owner| owner.policy().main_focus == DetachedCloseFocus::Existing)
+        {
+            self.focus_main_after_detached_close_if_idle(ctx, *owner, "mode_change_close_all");
+        }
         ctx.request_repaint();
         self.log_detached_image_window_debug(format!(
             "mode_change_close_all end active_context={} session={:?} fs_idx={:?} \
@@ -66989,6 +67193,23 @@ impl App {
         reason: &'static str,
         cause: ViewerCloseCause,
     ) -> Result<(), LocalViewerCloseFailure> {
+        let owners = window_ids
+            .iter()
+            .filter_map(|id| {
+                self.capture_detached_close_owner(Self::detached_session_lease(*id), cause)
+            })
+            .collect::<Vec<_>>();
+        self.teardown_paused_media_bundles_with_close_owners(window_ids, reason, cause, &owners)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn teardown_paused_media_bundles_with_close_owners(
+        &mut self,
+        window_ids: &[u64],
+        reason: &'static str,
+        cause: ViewerCloseCause,
+        owners: &[DetachedCloseOwner],
+    ) -> Result<(), LocalViewerCloseFailure> {
         for &window_id in window_ids {
             if let Some((id, _)) = self.locate_window_context(window_id) {
                 self.transfer_terminal_close_return(id, cause);
@@ -67022,7 +67243,11 @@ impl App {
             let Some((id, _)) = self.locate_window_context(window_id) else {
                 continue;
             };
-            match self.retire_context(id, reason, |mut context| {
+            let close_owner = owners
+                .iter()
+                .find(|owner| owner.lease.window_id == window_id)
+                .copied();
+            match self.retire_context_with_close_owner(id, reason, close_owner, |mut context| {
                 let plan =
                     viewer_context_media_teardown_plan(id, context.as_ref(), clear_generation);
                 context.clear_normalize_state();
@@ -67910,6 +68135,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         viewport_id: egui::ViewportId,
+        owner: DetachedCloseOwner,
     ) {
         self.log_detached_image_window_debug(format!(
             "active_close_finalize begin viewport={viewport_id:?} fs_idx={:?} shown={} \
@@ -67921,28 +68147,19 @@ impl App {
             self.detached_viewer_host_debug_state()
         ));
         crate::dwm_transitions::disable_transitions_for_thread_windows();
-        let closing_window_id = self
-            .active_detached_session
-            .map(|session| session.window_id)
-            .or(self.detached_viewer_window_id());
         // active detached viewport の teardown 完了 = セッション終了 (§3.7 finish)。
         // terminal close が明示的に宣言され、session が finish 済みまたは Closing のとき
         // だけ呼ばれる。internal reopen (folder-nav / PDF・ZIP 列挙 / scan / password) 中は
         // detached_active_window_alive_wanted() が true なので呼ばれず、session を維持する。
-        if self.active_detached_session.is_some() {
-            self.finish_active_detached_session_close("active_close_finalize");
-        } else if let Some(window_id) = closing_window_id {
-            self.retire_terminal_detached_viewport_identity(
-                window_id,
-                "active_close_finalize_legacy",
-            );
+        if self
+            .active_detached_session
+            .is_some_and(|session| session.window_id == owner.lease.window_id)
+        {
+            self.finish_active_detached_session_close_owned(Some(owner), "active_close_finalize");
         } else {
-            self.fs_viewport_shown = false;
-            self.fs_viewport_presentation = None;
-            self.fs_viewport_recreate_after_hide = false;
-            self.detached_viewer_recreate_on_next_render = false;
+            self.retire_terminal_detached_viewport_identity_owned(owner, "active_close_finalize");
         }
-        self.focus_main_after_detached_window_close_if_idle(ctx, "active_close_finalize");
+        self.focus_main_after_detached_close_if_idle(ctx, owner, "active_close_finalize");
         self.log_detached_image_window_debug(format!(
             "active_close_finalize end viewport={viewport_id:?} shown={} presentation={:?} \
              recreate_after_hide={} host={}",
@@ -68139,6 +68356,24 @@ impl App {
         address: PathBuf,
         initialize: impl FnOnce(&mut Self, u64) -> DetachedLoadingContextInit,
     ) -> Option<u64> {
+        self.start_active_detached_loading_context_with_seed(
+            ctx,
+            DetachedWindowSeed::normal(placement_seed),
+            source,
+            address,
+            initialize,
+        )
+    }
+
+    #[cfg(windows)]
+    fn start_active_detached_loading_context_with_seed(
+        &mut self,
+        ctx: &egui::Context,
+        seed: DetachedWindowSeed,
+        source: DetachedSource,
+        address: PathBuf,
+        initialize: impl FnOnce(&mut Self, u64) -> DetachedLoadingContextInit,
+    ) -> Option<u64> {
         let mut initialize = Some(initialize);
         let mut allocated_window_id = None;
         let built =
@@ -68156,16 +68391,15 @@ impl App {
                     true,
                     "detached_loading_binding",
                 );
+                app.install_detached_window_seed(window_id, false, seed);
                 app.update_detached_window_runtime_flags(
                     window_id,
                     false,
                     "detached_loading_binding",
                 );
                 app.last_active_detached_window_id = Some(window_id);
-                let seed = placement_seed.unwrap_or_else(|| app.detached_viewer_window_placement());
-                app.set_detached_window_runtime_placement(
+                app.ensure_detached_window_runtime_placement(
                     window_id,
-                    seed,
                     "start_active_detached_loading_context",
                 );
                 app.transition_detached_window_state(
@@ -69707,6 +69941,7 @@ impl App {
                 let close_viewport_id = (app.fs_viewport_shown
                     && app.fs_viewport_presentation == Some(ViewerPresentation::DetachedWindow))
                 .then(|| app.fullscreen_viewport_id());
+                let close_owner = app.projected_detached_close_owner(ViewerCloseCause::User);
                 app.poll_retained_shift_readoption(ctx);
                 app.service_final_prepare_before_lookup(ctx);
                 // 前面の viewer への入力は、この context の polling / 描画より前に配る。
@@ -69845,8 +70080,9 @@ impl App {
                 let detached_viewport_finalized = if app.fullscreen_idx.is_none()
                     && !app.detached_active_window_alive_wanted()
                     && let Some(viewport_id) = close_viewport_id
+                    && let Some(owner) = close_owner
                 {
-                    app.finalize_closed_active_detached_viewport(ctx, viewport_id);
+                    app.finalize_closed_active_detached_viewport(ctx, viewport_id, owner);
                     true
                 } else {
                     false
@@ -70543,6 +70779,7 @@ impl App {
         &mut self,
         idx: usize,
         resume_notice: Option<BookResumeNotice>,
+        viewer_adoption: ViewerOpenAdoption,
     ) -> bool {
         if self.active_detached_context_is_at_rest()
             || !matches!(self.navigation_scope, ViewerNavigationScope::Main)
@@ -70551,10 +70788,11 @@ impl App {
             || self.detached_viewer_folder_nav_reuse_window_once
             || !self.fs_open_intent_from_grid
             || !self.detached_still_open_is_independent(idx)
-            || !matches!(
-                self.effective_viewer_presentation_for_open(idx),
-                ViewerPresentation::DetachedWindow
-            )
+            || (!Self::browser_overlay_adoption(viewer_adoption)
+                && !matches!(
+                    self.effective_viewer_presentation_for_open(idx),
+                    ViewerPresentation::DetachedWindow
+                ))
         {
             return false;
         }
@@ -70575,7 +70813,11 @@ impl App {
         let requested_page = self
             .page_path_key(idx)
             .expect("admitted physical page has an identity");
-        let detached_id = self.fork_materialized_still_context(&physical_context, idx);
+        let detached_id = self.fork_materialized_still_context_with_seed(
+            &physical_context,
+            idx,
+            DetachedWindowSeed::for_adoption(viewer_adoption),
+        );
         self.log_detached_image_window_debug(format!(
             "materialized_physical_context_promoted idx={idx} main_items={} active_context=true",
             self.items.len()
@@ -70588,10 +70830,11 @@ impl App {
                         detached.page_path_key(index).as_deref() == Some(requested_page.as_str())
                     })
                     .expect("fork retains requested page identity");
-                detached.open_fullscreen_with_resume_notice(
+                detached.open_fullscreen_with_adoption(
                     idx,
                     crate::app::HistoryTrigger::UserChosen,
                     resume_notice,
+                    viewer_adoption.context_continuation(),
                 );
                 detached
                     .active_detached_session
@@ -71252,6 +71495,13 @@ impl App {
 
     pub(crate) fn detached_toggle_row_state(&self) -> DetachedToggleRowState {
         #[cfg(windows)]
+        if self.browser_view_blocks_detached_toggle() {
+            return DetachedToggleRowState {
+                on: self.settings.detached_viewer_enabled,
+                disabled_reason: Some(detached_close::BROWSER_VIEW_TOGGLE_DISABLED_REASON),
+            };
+        }
+        #[cfg(windows)]
         match self.detached_toggle_route() {
             DetachedToggleRoute::DisabledByAlwaysNewImages => {
                 return DetachedToggleRowState {
@@ -71349,7 +71599,7 @@ impl App {
     #[cfg(windows)]
     fn requested_viewer_presentation_for_open(&self, idx: usize) -> ViewerPresentation {
         if self.viewer_session_is_detached()
-            && self.detached_viewer_independent_active
+            && (self.detached_viewer_independent_active || self.browser_linked_viewer_session())
             && self.viewer_item_supports_detached_still(idx)
         {
             ViewerPresentation::DetachedWindow
@@ -72044,7 +72294,9 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn sync_detached_viewer_to_selected(&mut self, ctx: &egui::Context) {
-        if !self.settings.detached_viewer_enabled || !self.viewer_session_is_detached() {
+        if (!self.settings.detached_viewer_enabled && !self.browser_linked_viewer_session())
+            || !self.viewer_session_is_detached()
+        {
             return;
         }
         if self.detached_viewer_independent_still_session() {
@@ -72505,23 +72757,48 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn prepare_viewer_presentation_open(&mut self, idx: usize, entering_native_video: bool) {
+    fn prepare_viewer_presentation_open(
+        &mut self,
+        idx: usize,
+        entering_native_video: bool,
+        viewer_adoption: ViewerOpenAdoption,
+    ) {
+        if let Some(request) = viewer_adoption.request() {
+            self.log_detached_image_window_debug(format!(
+                "presentation_open request_id={} intent={:?} idx={idx}",
+                request.id(),
+                request.intent
+            ));
+        }
         let entering_media =
             entering_native_video || matches!(self.items.get(idx), Some(GridItem::Audio(_)));
         if entering_media {
             self.close_parked_live_media_windows_for_new_media("new_media_open");
         }
-        let presentation = self.resolve_viewer_presentation_for_open(idx, entering_media);
+        let browser_overlay = Self::browser_overlay_adoption(viewer_adoption)
+            && self.viewer_item_supports_detached_still(idx);
+        let presentation = if browser_overlay {
+            self.fs_media_open_forced_presentation = None;
+            ViewerPresentation::DetachedWindow
+        } else {
+            self.resolve_viewer_presentation_for_open(idx, entering_media)
+        };
         let detached_still = matches!(presentation, ViewerPresentation::DetachedWindow)
             && self.viewer_item_supports_detached_still(idx);
         let independent_detached_still = presentation == ViewerPresentation::DetachedWindow
-            && if self.detached_viewer_window_id().is_some() {
+            && if browser_overlay {
+                self.settings.detached_viewer_open_images_in_window
+            } else if self.detached_viewer_window_id().is_some() {
                 self.detached_viewer_independent_active
             } else {
                 self.new_detached_open_is_independent(idx)
             };
         let focus_detached_from_grid = matches!(presentation, ViewerPresentation::DetachedWindow)
-            && self.fs_open_intent_from_grid;
+            && (self.fs_open_intent_from_grid || browser_overlay);
+        if browser_overlay {
+            self.detached_viewer_no_activate_once = false;
+            self.clear_pending_main_foreground_reclaim();
+        }
         self.log_detached_image_window_debug(format!(
             "prepare_viewer_presentation_open_begin idx={idx} entering_video={entering_native_video} \
              item_kind={} resolved={presentation:?} detached_still={detached_still} \
@@ -72552,11 +72829,13 @@ impl App {
         );
         #[cfg(windows)]
         self.publish_effetune_auto_fullscreen();
-        if detached_still && !independent_detached_still {
+        if detached_still && !independent_detached_still && !browser_overlay {
             let _ = self.take_parked_fullfeature_linked_still_for_grid_open(idx, presentation);
         }
         if matches!(presentation, ViewerPresentation::DetachedWindow) {
-            let id = self.ensure_detached_viewer_window_id();
+            let id = self.ensure_detached_viewer_window_id_with_seed(
+                DetachedWindowSeed::for_adoption(viewer_adoption),
+            );
             if self.viewer_context_residence(self.projected_viewer_context_id())
                 == ContextResidence::Building
             {
@@ -73141,9 +73420,25 @@ impl App {
                 return;
             }
         };
+        // Browser replacement closes the old reader, whose normal teardown restores
+        // its cursor. Finish that handoff before the new explicit request commits
+        // selection; there must be only one selection owner at publication.
         #[cfg(windows)]
-        if viewer_adoption == ViewerOpenAdoption::MainNew {
-            if !self.prepare_detached_context_for_grid_open(&composition_ctx, idx) {
+        if viewer_adoption.needs_main_preparation()
+            && Self::browser_overlay_adoption(viewer_adoption)
+            && !self.prepare_browser_overlay_open(&composition_ctx)
+        {
+            return;
+        }
+        if viewer_adoption.owns_file_selection() {
+            self.move_grid_cursor(Some(idx), GridCursorIntent::Automatic);
+            self.grid_scroll.set_reveal_requested(true);
+        }
+        #[cfg(windows)]
+        if viewer_adoption.is_main_new() {
+            if !Self::browser_overlay_adoption(viewer_adoption)
+                && !self.prepare_detached_context_for_grid_open(&composition_ctx, idx)
+            {
                 return;
             }
             self.fs_open_intent_from_grid = true;
@@ -73156,6 +73451,7 @@ impl App {
             && self.route_materialized_physical_still_open_to_active_context(
                 idx,
                 resume_notice.clone(),
+                viewer_adoption,
             );
         #[cfg(windows)]
         finish_fs_open_perf_span(
@@ -73354,7 +73650,11 @@ impl App {
         #[cfg(windows)]
         let prepare_presentation_perf_t0 = start_fs_open_perf_span(&perf);
         #[cfg(windows)]
-        self.prepare_viewer_presentation_open(idx, entering_native_video_fullscreen);
+        self.prepare_viewer_presentation_open(
+            idx,
+            entering_native_video_fullscreen,
+            viewer_adoption,
+        );
         #[cfg(windows)]
         finish_fs_open_perf_span(
             &mut perf,
@@ -73927,7 +74227,7 @@ impl App {
     }
 
     fn details_lazy_uses_visible_stages(&self) -> bool {
-        (!self.duration_lengths_wanted() || self.duration_scan_ready())
+        self.unproven_listing_meta_requirements().is_empty()
             && (self.thumbnail_media_metadata_enabled()
                 || self.settings.grid_view_mode == crate::settings::GridViewMode::Details
                     && self.settings.details_show_page_count
@@ -73968,17 +74268,15 @@ impl App {
     fn finish_details_lazy_session(
         &mut self,
         failed: usize,
-        duration_scan: Option<DurationScanProof>,
+        listing_meta_scan: Option<ListingMetaScanProof>,
     ) {
-        let duration_completed = self.complete_duration_scan(duration_scan);
+        let completed = self.complete_listing_meta_scan(listing_meta_scan);
         self.details_image_dims_state = LazyColumnState::Ready { failed };
         self.prune_details_lazy_meta_cache();
-        if self.facet_ai_filter_active()
-            || (duration_completed && self.settings.facet_filter.duration_preset.is_some())
+        if (completed.ai && self.facet_ai_filter_active())
+            || (completed.duration && self.settings.facet_filter.duration_preset.is_some())
         {
-            let ready_state = self.details_image_dims_state;
             self.rebuild_visible_indices();
-            self.details_image_dims_state = ready_state;
         }
         if self.settings.grid_view_mode == crate::settings::GridViewMode::Details
             && matches!(
@@ -74053,7 +74351,7 @@ impl App {
             }
         }
         self.details_tag_prewarm_indices = near;
-        // AI facets retain their all-grid scan. The existing priority queue handles new visible
+        // Whole-listing requirements retain their scan. The priority queue handles new visible
         // media in that scan; badge-only stages can discard their old bounded range outright.
         if !self.whole_listing_meta_scan_wanted() {
             self.invalidate_details_meta_requirements();
@@ -74075,19 +74373,22 @@ impl App {
                 crate::perf::stall::PollPart::DetailsMeta,
             );
         }
-        if self
-            .details_meta_pending
-            .as_ref()
-            .and_then(|pending| pending.duration_scan)
-            .is_some_and(|scan| scan != self.duration_scan_snapshot())
-        {
+        let unproven = self.unproven_listing_meta_requirements();
+        if self.details_meta_pending.as_ref().is_some_and(|pending| {
+            pending
+                .listing_meta_scan
+                .is_some_and(|scan| !scan.matches(self))
+                || !pending.listing_meta_scan.map_or_else(
+                    || unproven.is_empty(),
+                    |scan| scan.requirements.contains(unproven),
+                )
+        }) {
             if let Some(pending) = self.details_meta_pending.take() {
                 pending.cancel.store(true, Ordering::Relaxed);
             }
             self.details_image_dims_state = LazyColumnState::NotRequested;
         }
-        if self.duration_lengths_wanted()
-            && !self.duration_scan_ready()
+        if !unproven.is_empty()
             && self.details_meta_pending.is_none()
             && !matches!(self.details_image_dims_state, LazyColumnState::Cancelled)
         {
@@ -74319,12 +74620,12 @@ impl App {
                         .details_meta_pending
                         .as_ref()
                         .is_some_and(|p| p.visible_revision == self.details_lazy_visible_revision);
-                    let duration_scan = self
+                    let listing_meta_scan = self
                         .details_meta_pending
                         .take()
-                        .and_then(|pending| pending.duration_scan);
+                        .and_then(|pending| pending.listing_meta_scan);
                     if revision_matches {
-                        if self.details_lazy_uses_visible_stages() {
+                        if listing_meta_scan.is_none() && self.details_lazy_uses_visible_stages() {
                             let total = match self.details_image_dims_state {
                                 LazyColumnState::Loading { total, .. } => total,
                                 _ => 0,
@@ -74335,7 +74636,7 @@ impl App {
                                 failed,
                             };
                         } else {
-                            self.finish_details_lazy_session(failed, duration_scan);
+                            self.finish_details_lazy_session(failed, listing_meta_scan);
                         }
                     } else {
                         self.details_image_dims_state = LazyColumnState::NotRequested;
@@ -74398,7 +74699,9 @@ impl App {
     }
 
     pub(crate) fn details_lazy_columns_visible(&self) -> bool {
-        if self.items_are_drive_list || (self.items.is_empty() && !self.duration_lengths_wanted()) {
+        if self.items_are_drive_list
+            || (self.items.is_empty() && !self.whole_listing_meta_scan_wanted())
+        {
             return false;
         }
         match self.settings.grid_view_mode {
@@ -74609,8 +74912,11 @@ impl App {
     pub(crate) fn request_ai_model_facet_load(&mut self) {
         if !self.ai_model_facet_requested {
             self.ai_model_facet_requested = true;
-            // A media-only stage cannot stand in for the initial all-item AI scan.
-            self.invalidate_details_meta_requirements();
+            // Opening a menu must not resume another stopped requirement when
+            // this listing's AI metadata is already proven.
+            if !self.ai_model_facet_ready() {
+                self.invalidate_details_meta_requirements();
+            }
         }
     }
 
@@ -74632,15 +74938,8 @@ impl App {
     }
 
     pub(crate) fn ai_model_facet_ready(&self) -> bool {
-        self.details_image_dims_state.is_ready()
-            || matches!(
-                self.details_image_dims_state,
-                LazyColumnState::Reconciling { .. }
-            )
-            || self
-                .details_meta_pending
-                .as_ref()
-                .is_some_and(|pending| pending.scan_scope == DetailsMetaScanScope::VisibleStage)
+        self.listing_meta_scan_proof
+            .is_some_and(|proof| proof.matches(self) && proof.requirements.ai)
     }
 
     pub(crate) fn details_created_text(&self, idx: usize) -> String {
@@ -74868,13 +75167,22 @@ impl App {
         if self.details_meta_pending.is_some() {
             return;
         }
+        #[cfg(test)]
+        crate::ime_focus::typing_probe::job(
+            "details-meta-session",
+            match scan_scope {
+                DetailsMetaScanScope::AllRequirements => "all",
+                DetailsMetaScanScope::VisibleStage => "visible",
+            },
+            crate::ime_focus::typing_probe::Outcome::Started,
+        );
 
         let generation = self.items_generation;
         let ai_facet_load = self.ai_model_facet_should_load();
         let whole_listing_load = self.whole_listing_meta_scan_wanted();
-        let duration_scan = (scan_scope == DetailsMetaScanScope::AllRequirements
-            && self.duration_lengths_wanted())
-        .then(|| self.duration_scan_snapshot());
+        let listing_meta_scan = (scan_scope == DetailsMetaScanScope::AllRequirements
+            && whole_listing_load)
+            .then(|| self.listing_meta_scan_snapshot());
         let selection_info_only = self.selection_info_only_lazy_load();
         let load_all_page_counts = self.settings.grid_view_mode
             == crate::settings::GridViewMode::Details
@@ -74899,7 +75207,7 @@ impl App {
             )),
             pdf_passwords: self.pdf_passwords.clone(),
         };
-        let (order, visible_near) = if duration_scan.is_some() {
+        let (order, visible_near) = if listing_meta_scan.is_some() {
             (
                 DetailsMetaScanOrder::WholeListing {
                     cursor: 0,
@@ -74944,7 +75252,7 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         self.details_meta_pending = Some(DetailsMetaPending {
             scan_scope,
-            duration_scan,
+            listing_meta_scan,
             visible_revision: self.details_lazy_visible_revision,
             selection_target_key: self.selection_info_lazy_target_key(),
             normal_target_keys: visible_near
@@ -74983,7 +75291,7 @@ impl App {
         }
         let DetailsMetaPending {
             scan_scope,
-            duration_scan,
+            listing_meta_scan,
             visible_revision,
             selection_target_key,
             normal_target_keys,
@@ -74993,6 +75301,10 @@ impl App {
         let DetailsMetaPendingPhase::Planning(mut plan) = phase else {
             unreachable!();
         };
+        let requirements = listing_meta_scan.map_or_else(
+            || self.listing_meta_requirements(),
+            |scan| scan.requirements.union(self.listing_meta_requirements()),
+        );
 
         let order_stale = matches!(
             plan.order,
@@ -75013,9 +75325,13 @@ impl App {
         // cursor has passed. Merge fields without restarting a whole-grid/AI scan.
         if let Some(selected) = self.selection_info_lazy_target_idx() {
             plan.visible_near.insert(selected);
-            if let Some(target) =
-                self.details_meta_target_for_idx(selected, &plan.visible_near, true)
-            {
+            if let Some(target) = self.details_meta_target_for_idx_with_requirements(
+                selected,
+                &plan.visible_near,
+                true,
+                false,
+                requirements,
+            ) {
                 if let Some(existing) = plan
                     .visible_targets
                     .iter_mut()
@@ -75077,11 +75393,22 @@ impl App {
                 }
             };
 
-            if queued_visible.contains(&idx) || !self.details_item_requires_lazy_meta(idx) {
+            let media = matches!(
+                self.items.get(idx),
+                Some(GridItem::Video(_) | GridItem::Audio(_))
+            );
+            let ai = self.details_item_supports_ai_metadata(idx);
+            if queued_visible.contains(&idx)
+                || !(self.details_item_requires_lazy_meta(idx)
+                    || (requirements.duration && media)
+                    || (requirements.ai && ai))
+            {
                 continue;
             }
             if let Some(meta) = self.details_lazy_meta_for_idx(idx)
                 && self.details_lazy_meta_satisfies_idx(idx, meta)
+                && (!requirements.duration || !media || meta.media.satisfies(self.items_generation))
+                && (!requirements.ai || !ai || meta.ai_metadata_checked)
             {
                 plan.total += 1;
                 plan.cached_done += 1;
@@ -75093,13 +75420,14 @@ impl App {
                 );
                 continue;
             }
-            if let Some(target) = self.details_meta_target_for_idx_with_scope(
+            if let Some(target) = self.details_meta_target_for_idx_with_requirements(
                 idx,
                 &plan.visible_near,
                 plan.load_all_page_counts || plan.visible_near.contains(&idx),
-                duration_scan.is_some()
+                listing_meta_scan.is_some()
                     && self.visible_indices.binary_search(&idx).is_err()
                     && self.selection_info_lazy_target_idx() != Some(idx),
+                requirements,
             ) {
                 plan.total += 1;
                 if target.priority >= crate::io_semaphore::IoPriority::Normal {
@@ -75140,7 +75468,7 @@ impl App {
             };
             self.details_meta_pending = Some(DetailsMetaPending {
                 scan_scope,
-                duration_scan,
+                listing_meta_scan,
                 visible_revision,
                 selection_target_key,
                 normal_target_keys,
@@ -75154,7 +75482,7 @@ impl App {
         self.launch_details_meta_worker(
             ctx,
             scan_scope,
-            duration_scan,
+            listing_meta_scan,
             visible_revision,
             selection_target_key,
             cancel,
@@ -75166,7 +75494,7 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         scan_scope: DetailsMetaScanScope,
-        duration_scan: Option<DurationScanProof>,
+        listing_meta_scan: Option<ListingMetaScanProof>,
         visible_revision: u64,
         selection_target_key: Option<String>,
         cancel: Arc<AtomicBool>,
@@ -75174,7 +75502,7 @@ impl App {
     ) {
         let target_count = plan.visible_targets.len() + plan.background_targets.len();
         if plan.total == 0 || target_count == 0 {
-            self.finish_details_lazy_session(plan.cached_failed, duration_scan);
+            self.finish_details_lazy_session(plan.cached_failed, listing_meta_scan);
             return;
         }
 
@@ -75295,8 +75623,8 @@ impl App {
                     ),
                     ("ai_facet_load", serde_json::Value::from(plan.ai_facet_load)),
                     (
-                        "duration_scan",
-                        serde_json::Value::from(duration_scan.is_some()),
+                        "listing_meta_scan",
+                        serde_json::Value::from(listing_meta_scan.is_some()),
                     ),
                     (
                         "grid_mode",
@@ -75332,7 +75660,7 @@ impl App {
 
         self.details_meta_pending = Some(DetailsMetaPending {
             scan_scope,
-            duration_scan,
+            listing_meta_scan,
             visible_revision,
             selection_target_key,
             normal_target_keys,
@@ -75473,7 +75801,17 @@ impl App {
         visible_near: &std::collections::HashSet<usize>,
         allow_page_count: bool,
     ) -> Option<DetailsMetaTarget> {
-        self.details_meta_target_for_idx_with_scope(idx, visible_near, allow_page_count, false)
+        // Planning, selection and priority updates share the same filtered-row
+        // boundary. Selection-info targets retain their existing field exception.
+        let whole_listing_only = !self.active_listing_meta_requirements().is_empty()
+            && self.visible_indices.binary_search(&idx).is_err()
+            && self.selection_info_lazy_target_idx() != Some(idx);
+        self.details_meta_target_for_idx_with_scope(
+            idx,
+            visible_near,
+            allow_page_count,
+            whole_listing_only,
+        )
     }
 
     fn details_meta_target_for_idx_with_scope(
@@ -75481,7 +75819,24 @@ impl App {
         idx: usize,
         visible_near: &HashSet<usize>,
         allow_page_count: bool,
-        duration_only: bool,
+        whole_listing_only: bool,
+    ) -> Option<DetailsMetaTarget> {
+        self.details_meta_target_for_idx_with_requirements(
+            idx,
+            visible_near,
+            allow_page_count,
+            whole_listing_only,
+            self.active_listing_meta_requirements(),
+        )
+    }
+
+    fn details_meta_target_for_idx_with_requirements(
+        &self,
+        idx: usize,
+        visible_near: &HashSet<usize>,
+        allow_page_count: bool,
+        whole_listing_only: bool,
+        requirements: ListingMetaRequirements,
     ) -> Option<DetailsMetaTarget> {
         let item = self.items.get(idx)?.clone();
         let key = self.details_lazy_cache_key(idx)?;
@@ -75493,27 +75848,29 @@ impl App {
             crate::io_semaphore::IoPriority::Low
         };
         let existing_meta = self.details_lazy_meta_for_idx(idx);
-        let load_image_dims = !duration_only
+        let load_image_dims = !whole_listing_only
             && self.lazy_load_image_dims_for_idx(idx)
             && existing_meta
                 .is_none_or(|meta| meta.image_dims.is_none() && !meta.image_dims_failed);
-        let load_video_meta = self.lazy_load_video_meta_for_idx(idx)
+        let duration =
+            requirements.duration && matches!(&item, GridItem::Video(_) | GridItem::Audio(_));
+        let load_video_meta = (duration || self.lazy_load_video_meta_for_idx(idx))
+            && (!whole_listing_only || requirements.duration)
             && (self.settings.grid_view_mode != crate::settings::GridViewMode::Thumbnail
-                || self.duration_lengths_wanted()
+                || requirements.duration
                 || visible_near.contains(&idx)
                 || self.selection_info_lazy_target_idx() == Some(idx))
             && existing_meta.is_none_or(|meta| !meta.media.satisfies(self.items_generation));
-        let load_page_count = !duration_only
+        let load_page_count = !whole_listing_only
             && allow_page_count
             && self.lazy_load_page_count_for_idx(idx)
             && existing_meta
                 .is_none_or(|meta| !self.details_page_count_meta_satisfies_idx(idx, meta));
-        let load_created_at = !duration_only
+        let load_created_at = !whole_listing_only
             && self.lazy_load_created_for_idx(idx)
             && existing_meta
                 .is_none_or(|meta| meta.created_at.is_none() && !meta.created_at_failed);
-        let load_ai_metadata = !duration_only
-            && self.lazy_load_ai_metadata_for_idx(idx)
+        let load_ai_metadata = (requirements.ai && self.details_item_supports_ai_metadata(idx))
             && existing_meta.is_none_or(|meta| !meta.ai_metadata_checked);
         let pdf_password_revision = if load_page_count {
             match &item {
@@ -75905,6 +76262,17 @@ impl App {
         let smart_rating_membership = self.smart_folder_rating_membership_flags();
         let mut smart_rule_total = 0;
         let mut smart_rule_search_matches = 0;
+        // A listing-wide proof does not qualify ordinary fields for newly
+        // visible rows. Detect them in this existing projection walk; pending
+        // work is already invalidated by its visible revision. Whole-listing
+        // requirements keep a user stop; ordinary columns keep their existing
+        // projection-change restart below.
+        let check_added_meta =
+            self.details_meta_pending.is_none() && self.details_image_dims_state.is_ready();
+        let mut added_meta_needed = false;
+        // Both sets are ascending item indices. Advance once through the old
+        // projection instead of searching it again for every accepted row.
+        let mut old_visible_cursor = 0;
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
             if !self.direct_media_basis_allows_index(i) {
@@ -75963,6 +76331,23 @@ impl App {
             if !self.passes_color_filter_for_scope(i, color_scope_signature) {
                 continue;
             }
+            if check_added_meta && !added_meta_needed {
+                while self
+                    .visible_indices
+                    .get(old_visible_cursor)
+                    .is_some_and(|&old| old < i)
+                {
+                    old_visible_cursor += 1;
+                }
+                if self.visible_indices.get(old_visible_cursor) != Some(&i)
+                    && self.details_item_requires_lazy_meta(i)
+                    && self
+                        .details_lazy_meta_for_idx(i)
+                        .is_none_or(|meta| !self.details_lazy_meta_satisfies_idx(i, meta))
+                {
+                    added_meta_needed = true;
+                }
+            }
             result.push(i);
         }
         if smart_rating_membership.is_some()
@@ -75972,6 +76357,11 @@ impl App {
             session.rating_rule_search_match_count = smart_rule_search_matches;
         }
         self.visible_indices = result;
+        if added_meta_needed {
+            // Adopt the qualification with the projection, before a picker can
+            // recursively rebuild it. Cache and listing proof remain intact.
+            self.details_image_dims_state = LazyColumnState::NotRequested;
+        }
         if self
             .ring_picker
             .as_ref()
@@ -76043,7 +76433,7 @@ impl App {
             self.details_lazy_visible_revision = self.details_lazy_visible_revision.wrapping_add(1);
             if self.details_meta_pending.is_none()
                 && !self.details_image_dims_state.is_ready()
-                && !(self.duration_lengths_wanted()
+                && !(self.whole_listing_meta_scan_wanted()
                     && matches!(self.details_image_dims_state, LazyColumnState::Cancelled))
             {
                 self.details_image_dims_state = LazyColumnState::NotRequested;
@@ -77602,10 +77992,18 @@ impl App {
     /// items を入れ替えた後の 1 か所からだけ呼ぶ。判断は
     /// [`crate::post_operation_selection::decide`] が持ち、ここは適用だけを行う。
     fn apply_post_operation_selection(&mut self) -> bool {
-        use crate::post_operation_selection as pos;
-        let Some(mut request) = self.post_operation_selection.take() else {
+        let Some(cursor) = self.apply_post_operation_checks() else {
             return false;
         };
+        self.select_item_after_load(cursor);
+        true
+    }
+
+    /// Apply operation-owned checkmarks and acknowledge the outputs independently
+    /// of cursor ownership. The caller may give the cursor to an explicit open.
+    fn apply_post_operation_checks(&mut self) -> Option<usize> {
+        use crate::post_operation_selection as pos;
+        let mut request = self.post_operation_selection.take()?;
         let visible = self.visible_real_file_paths();
         let now = std::time::Instant::now();
         let step = pos::decide(&request, self.current_folder.as_deref(), &visible, now);
@@ -77613,22 +78011,19 @@ impl App {
             if matches!(step, pos::Step::Wait) {
                 self.post_operation_selection = Some(request);
             }
-            return false;
+            return None;
         };
-        let Some(plan) = pos::plan_selection(&indices) else {
-            return false;
-        };
+        let plan = pos::plan_selection(&indices)?;
         crate::logger::log(format!(
-            "post_operation_selection: {} item(s) added, cursor -> {}",
+            "post_operation_selection: {} item(s) added, operation_cursor={}",
             indices.len(),
             plan.cursor
         ));
         self.checked.clear();
         self.checked.extend(plan.checked.iter().copied());
-        self.select_item_after_load(plan.cursor);
         request.record_applied(&visible, &indices, now);
         self.post_operation_selection = Some(request);
-        true
+        Some(plan.cursor)
     }
 
     /// 操作の結果へ選択を移す要求を積む。`folder` は適用先の実フォルダ。
@@ -77651,7 +78046,7 @@ impl App {
     /// 差分で拾う要求は「呼ぶ**前**の一覧」が要るので、Shell を呼ぶより先に積むしかない。
     /// その代わり、呼び出しがその場で失敗したら**必ずここを通す** — 残したままだと、
     /// 続く 10 秒の間に起きた**無関係なファイル追加**を貼り付け結果として選んでしまう
-    /// (R-08)。成功後の取り下げは適用側 (`apply_post_operation_selection`) が持つ。
+    /// (R-08)。成功後の適用記録は `apply_post_operation_checks` が持つ。
     pub(crate) fn cancel_post_operation_selection(&mut self, reason: &str) {
         if self.post_operation_selection.take().is_some() {
             crate::logger::log(format!(
@@ -83246,6 +83641,8 @@ impl App {
         if self.viewer_mutation_modal_active() {
             return;
         }
+        #[cfg(windows)]
+        let close_owner = self.projected_detached_close_owner(ViewerCloseCause::User);
         self.finish_fullscreen_navigation_for_true_close();
         if self.projected_viewer_context_id() == self.viewer_context_main() {
             // One accepted close owns one frozen destination. Later refreshes
@@ -83286,8 +83683,13 @@ impl App {
         // 内部 close とは別経路なので、ここでは確実に session を畳んでよい。
         #[cfg(windows)]
         {
-            self.begin_active_detached_session_close("handle_fullscreen_close_request");
-            self.finish_active_detached_session_close("handle_fullscreen_close_request");
+            if let Some(owner) = close_owner {
+                self.begin_detached_close_owner(owner, "handle_fullscreen_close_request");
+            }
+            self.finish_active_detached_session_close_owned(
+                close_owner,
+                "handle_fullscreen_close_request",
+            );
         }
         self.close_fullscreen();
     }
@@ -85243,7 +85645,12 @@ impl App {
         }
         // Preserve prefetch's source-first done/skip contract, even without a request.
         let Some(pixels) = self.current_raw_source_pixels(idx) else {
-            return FinalAiJobState::SourcePending;
+            // A terminal source failure cannot produce AI; do not leave it waiting forever.
+            return if self.fs_page_load_state(idx) == FsPageLoadState::LoadFailed {
+                FinalAiJobState::Failed
+            } else {
+                FinalAiJobState::SourcePending
+            };
         };
         let params = self.effective_params(idx);
         let edit_key = self.current_edit_result_key(idx);
@@ -85673,10 +86080,30 @@ impl App {
         if self.reading_flow.is_paged() {
             self.prefetch_final_effects(ctx, current_idx, None);
         }
-        // 現在ページの AI が走っている間 (= cancel されていない pending あり) は
-        // 先読みしない。旧設計 `current_done && empty` 条件と同等。
+        // 未キャンセルの AI がある間は、新しい先読みを起動しない。
         if self.has_uncancelled_final_ai_pending() {
             return;
+        }
+        // ページ単位表示の先読みは描画より先に走るため、表示側がまだ AI を要求して
+        // いない Waiting も優先する。pending だけでは U 直後に隣接ページが先行する。
+        // overview 中や表示不許可なら draw は素材生成しないため、Waiting gate も適用しない。
+        // 素材生成を所有する draw なら NeedsLoad を要求し、LoadPending / UploadPending は
+        // 既存 loader / upload の完了回収で終わる。LoadFailed は状態 owner が終端にする。
+        // 素材到着後の Waiting は同じ draw の final ensure が開始または不要と確定する。
+        // 連結読みの draw は処理数を制限するため、この gate を適用せず従来どおり先読みする。
+        let display_demand = self.paged_draw_materialization_demand(current_idx);
+        if !display_demand.is_empty() {
+            let original_preview_active = self.original_preview_active_for_frame(ctx, current_idx);
+            // 見開き描画も同じ値を使う。idx ごとに読むと単一の frame sample を上書きする。
+            if display_demand.into_iter().any(|page| {
+                let idx = page.item_index;
+                self.displayed_final_ai_state(
+                    idx,
+                    self.fs_display_stage(idx, original_preview_active),
+                ) == DisplayedFinalAiState::Waiting
+            }) {
+                return;
+            }
         }
         let targets = self.ai_prefetch_targets(current_idx);
         for idx in targets {
@@ -85692,11 +86119,14 @@ impl App {
             {
                 continue;
             }
-            if let Some((key, size)) = self.retained_final_ai_matches_current(idx, &params)
-                && let Some(entry) = self.lookup_retained_final_ai(idx, key, size)
-            {
-                self.final_ai_cache.insert(key, entry);
-                continue;
+            if let Some((key, size)) = self.retained_final_ai_matches_current(idx, &params) {
+                if self.final_ai_cache.contains_key(&key) {
+                    continue;
+                }
+                if let Some(entry) = self.lookup_retained_final_ai(idx, key, size) {
+                    self.final_ai_cache.insert(key, entry);
+                    continue;
+                }
             }
             // Raster PDF の現行 display-fit 結果が AI 用 native 入力と異なるページは、
             // 現行結果に AI 先読みを流しても native 再レンダで捨てられる。
@@ -92532,9 +92962,16 @@ impl App {
                 return Some(entry.texture.clone());
             }
         }
-        let (ai_key, entry, edit_size) =
-            self.lookup_retained_pdf_final_ai(idx, "restore_final_composite")?;
-        self.final_ai_cache.insert(ai_key, entry.clone());
+        // While the display effect is pending, its hydrated AI input is already live.
+        // Repeated ensures must not touch retained LRU/logging again for the same key.
+        let entry = if let Some(entry) = self.final_ai_cache.get(&ai_key).cloned() {
+            entry
+        } else {
+            let (_, entry, _) =
+                self.lookup_retained_pdf_final_ai(idx, "restore_final_composite")?;
+            self.final_ai_cache.insert(ai_key, entry.clone());
+            entry
+        };
         self.build_final_composite_texture_from_base(
             ctx,
             idx,
@@ -94218,6 +94655,7 @@ impl App {
             );
             return None;
         }
+        let close_owner = self.projected_detached_close_owner(ViewerCloseCause::DetachedToggle);
         if self.viewer_presentation != target_presentation {
             self.fs_front_pointer = Default::default();
         }
@@ -94256,8 +94694,10 @@ impl App {
                 reason,
             );
         } else {
-            self.begin_active_detached_session_close(reason);
-            self.finish_active_detached_session_close(reason);
+            if let Some(owner) = close_owner {
+                self.begin_detached_close_owner(owner, reason);
+                self.finish_detached_close_owner(owner, reason);
+            }
         }
         self.log_detached_image_window_debug(format!(
             "apply_egui_viewer_presentation idx={idx:?} target={target_presentation:?} \
@@ -94300,6 +94740,11 @@ impl App {
     }
 
     pub(crate) fn toggle_detached_viewer_mode(&mut self) {
+        #[cfg(windows)]
+        if self.browser_view_blocks_detached_toggle() {
+            self.show_feedback_warning(self.browser_view_detached_toggle_warning());
+            return;
+        }
         if self.remote_session_blocks_local_control() {
             crate::logger::log(
                 "remote_ipc: rejected detached presentation open outside Local phase",
@@ -95774,7 +96219,7 @@ impl App {
         if previous.sort_order != current.sort_order
             || previous.grid_display_order != current.grid_display_order
         {
-            self.apply_sort_change_reload_without_ui_io();
+            self.apply_sort_change_reload();
         }
     }
 
@@ -103296,6 +103741,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.speculative_gpu_frame.begin_pass();
         let ctx = &ui.ctx().clone();
+        self.begin_root_input_gate_pass(ctx);
         self.begin_grid_click_input_frame(ctx);
         static FIRST_UPDATE: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
@@ -103348,6 +103794,7 @@ impl eframe::App for App {
         // returns so every viewer observes the same cut snapshot in the first repaint.
         self.cut_clipboard.poll();
         self.poll_clipboard_capture(ctx);
+        self.poll_browser_integration(ctx);
         self.poll_vlm_setup(ctx);
         self.poll_depth_setup(ctx);
         #[cfg(windows)]
@@ -103420,6 +103867,7 @@ impl eframe::App for App {
             trace.finish(miv_startup::Outcome::Ok);
         }
         self.publish_main_drop_geometry(ctx, main_drop_geometry);
+        self.end_root_input_gate_pass();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

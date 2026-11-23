@@ -9,11 +9,8 @@ fn synthetic_tree(root: &Path, children: Vec<PathBuf>) -> FolderPaneState {
     state
 }
 fn listing(options: FolderPaneListingOptions, children: Vec<PathBuf>) -> CachedListing {
-    CachedListing {
-        membership: children.iter().map(|path| key_for(path)).collect(),
-        children,
-        options,
-    }
+    let membership = children.iter().map(|path| key_for(path)).collect();
+    CachedListing::new(children, membership, options)
 }
 
 #[test]
@@ -242,6 +239,89 @@ fn dirty_after_send_and_repeated_dirty_coalesce_without_adopting_the_old_reply()
 }
 
 #[test]
+fn folder_pane_reclick_rechecks_demand_without_changing_presentation_or_gesture() {
+    let root = p(r"C:\data");
+    let queued = root.join("queued");
+    let settled = root.join("settled");
+    let collapsed = root.join("collapsed");
+    let mut state = synthetic_tree(
+        &root,
+        vec![queued.clone(), settled.clone(), collapsed.clone()],
+    );
+    state.test_seed_listing(&queued, vec![], true);
+    state.test_seed_listing(&settled, vec![], true);
+    state.test_seed_listing(&collapsed, vec![collapsed.join("hidden-child")], false);
+    state.reconcile_demand();
+    let reply = pending(&mut state, &root);
+    state.nodes.get_mut(&key_for(&queued)).unwrap().scan = NodeScan::Queued;
+    state.set_cursor(settled.clone());
+    state.label_gesture = FolderPaneLabelGesture::AwaitingPress {
+        anchor: FolderPaneLabelAnchor {
+            path: settled.clone(),
+            first_expanded: true,
+            pos: egui::pos2(50.0, 80.0),
+            toggled: false,
+        },
+        time: 10.0,
+    };
+    state.label_display = Some(FolderPaneLabelDisplay {
+        pass: 7,
+        layer: egui::LayerId::background(),
+        pane_rect: egui::Rect::EVERYTHING,
+        rect: egui::Rect::EVERYTHING,
+        rows: vec![],
+    });
+    state.label_input.pass = Some(7);
+    state
+        .label_input
+        .results
+        .push(FolderPaneLabelResult::Single(settled.clone()));
+    let display = state.label_display.as_ref().unwrap() as *const FolderPaneLabelDisplay;
+    let gesture = format!("{:?}", state.label_gesture);
+    let expanded = state.user_expanded.clone();
+    let automatic = state.auto_expanded.clone();
+    let closed = state.user_collapsed.clone();
+    let demand = state.demand.clone();
+    let cursor = state.cursor_path().map(Path::to_path_buf);
+    let scroll = state.cursor_scroll;
+    let hidden_was_unverified = state.test_unverified(&collapsed);
+    for _ in 0..3 {
+        state.recheck_displayed();
+        assert!(matches!(
+            state.nodes[&key_for(&root)].scan,
+            NodeScan::Running(_, FollowUp::Recheck)
+        ));
+        assert!(matches!(
+            state.nodes[&key_for(&queued)].scan,
+            NodeScan::Queued
+        ));
+        assert!(matches!(
+            state.nodes[&key_for(&settled)].scan,
+            NodeScan::Queued
+        ));
+        assert!(!reply.cancel.load(Ordering::Relaxed));
+        assert_eq!(
+            state.test_children(&root),
+            vec![queued.clone(), settled.clone(), collapsed.clone()]
+        );
+        assert_eq!(state.test_unverified(&collapsed), hidden_was_unverified);
+        assert_eq!(state.user_expanded, expanded);
+        assert_eq!(state.auto_expanded, automatic);
+        assert_eq!(state.user_collapsed, closed);
+        assert_eq!(state.demand, demand);
+        assert_eq!(state.cursor_path(), cursor.as_deref());
+        assert_eq!(state.cursor_scroll, scroll);
+        assert_eq!(format!("{:?}", state.label_gesture), gesture);
+        assert_eq!(state.label_display.as_ref().unwrap() as *const _, display);
+        assert_eq!(state.label_input.pass, Some(7));
+        assert_eq!(
+            state.label_input.results,
+            vec![FolderPaneLabelResult::Single(settled.clone())]
+        );
+    }
+}
+
+#[test]
 fn refresh_failure_disconnect_and_option_changes_keep_cache_and_do_not_retry_per_frame() {
     for disconnect in [true, false] {
         let root = p(r"C:\data");
@@ -421,11 +501,11 @@ fn hidden_membership_preserves_cached_branch_but_retires_its_running_scan() {
     state.test_seed_listing(&hidden, vec![hidden.join("kept")], true);
     let child_tx = pending(&mut state, &hidden);
     let tx = pending(&mut state, &root);
-    tx.send(Ok(CachedListing {
-        children: vec![],
-        membership: [key_for(&hidden)].into_iter().collect(),
-        options: state.listing_options,
-    }))
+    tx.send(Ok(CachedListing::new(
+        vec![],
+        [key_for(&hidden)].into_iter().collect(),
+        state.listing_options,
+    )))
     .unwrap();
     state.poll_pending();
     assert_eq!(state.test_children(&hidden), vec![hidden.join("kept")]);

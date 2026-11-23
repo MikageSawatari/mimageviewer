@@ -1824,7 +1824,7 @@ pub(crate) fn effective_bbox(
     free_rotation_rad: f32,
     content_bbox: Option<egui::Rect>,
 ) -> Option<egui::Rect> {
-    content_bbox.filter(|_| free_rotation_rad.abs() <= EPSILON)
+    content_bbox.filter(|_| !free_rotation_is_applied(free_rotation_rad))
 }
 
 /// 元画像空間の正規化部分矩形を、保存回転を反映した表示空間へ写す。
@@ -2043,8 +2043,13 @@ mod bbox_space_tests {
     }
 }
 
+/// Match the paint quad's no-rotation threshold at input boundaries.
+pub(crate) fn free_rotation_is_applied(theta: f32) -> bool {
+    !(theta.abs() <= EPSILON)
+}
+
 fn rotate_about(point: egui::Pos2, center: egui::Pos2, theta: f32) -> egui::Pos2 {
-    if theta.abs() <= EPSILON {
+    if !free_rotation_is_applied(theta) {
         return point;
     }
     let (sin, cos) = theta.sin_cos();
@@ -2053,7 +2058,7 @@ fn rotate_about(point: egui::Pos2, center: egui::Pos2, theta: f32) -> egui::Pos2
 }
 
 fn rotated_rect_aabb(rect: egui::Rect, center: egui::Pos2, theta: f32) -> egui::Rect {
-    if theta.abs() <= EPSILON {
+    if !free_rotation_is_applied(theta) {
         return rect;
     }
     let mut min = egui::pos2(f32::INFINITY, f32::INFINITY);

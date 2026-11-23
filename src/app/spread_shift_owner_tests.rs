@@ -77,6 +77,131 @@ fn persistence(app: &App) -> ShiftPersistence {
     persistence.clone()
 }
 
+#[cfg(windows)]
+fn retained_start_input_gate_mount_scenario(after_gate: bool) {
+    let mut env = setup_app();
+    let main = env.tmp.path().join("books/gate-main");
+    let target = env.tmp.path().join("books/gate-retained");
+    let data = env.tmp.path().join("gate-shift-data");
+    install_book(&mut env, &main);
+    let (service, owner) = runtime(&mut env, &data);
+    let sibling = env.build_window_context_for_test(828_001, |app| {
+        install_book(app, &target);
+        app.settings.remember_spread_shift_per_book = true;
+    });
+    let pause = service.pause_for_test();
+    service
+        .set_shift(
+            BookScopeKey::folder(&target).unwrap(),
+            SpreadShiftPageRef::RelativePath("1.png".into()),
+            ShiftOperation {
+                context_id: ViewerContextId::for_test(828),
+                items_generation: 0,
+                operation_sequence: 1,
+            },
+        )
+        .unwrap();
+    let pos = egui::pos2(20.0, 20.0);
+    let main_drag = Some((pos, pos, 2));
+    env.fs_seek_drag_active = true;
+    env.analysis_guide_drag = main_drag;
+    let main_context = env.projected_viewer_context_id();
+    let ctx = egui::Context::default();
+    let output = ctx.run_pass(
+        egui::RawInput {
+            events: vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::Text("discard for the initiating viewport".into()),
+            ],
+            ..Default::default()
+        },
+        |ctx| {
+            env.begin_root_input_gate_pass(ctx);
+            if after_gate {
+                env.input_update_begin(ctx);
+            }
+            env.with_viewer_context(sibling, |app| {
+                assert!(!app.sidecar_restore_blocks_projected_context());
+                app.fs_seek_drag_active = true;
+                app.analysis_guide_drag = Some((pos, pos, 1));
+                app.begin_retained_shift_readoption(ctx);
+                assert!(app.spread_shift.retained_readoption_pending());
+                assert!(app.sidecar_restore_blocks_projected_context());
+                assert!(!app.fs_seek_drag_active, "end the mounted context now");
+                assert!(app.analysis_guide_drag.is_none());
+                ctx.input(|input| {
+                    assert_eq!(
+                        input
+                            .events
+                            .iter()
+                            .any(|event| matches!(event, egui::Event::Text(_))),
+                        !after_gate
+                    );
+                    assert_eq!(input.pointer.primary_down(), !after_gate);
+                });
+            })
+            .unwrap();
+            assert_eq!(env.projected_viewer_context_id(), main_context);
+            assert!(!env.sidecar_restore_blocks_projected_context());
+            if !after_gate {
+                env.input_update_begin(ctx);
+            }
+            ctx.input(|input| {
+                assert!(!input.events.iter().any(|event| matches!(
+                    event,
+                    egui::Event::Text(_) | egui::Event::PointerButton { pressed: true, .. }
+                )));
+                assert!(input.pointer.latest_pos().is_none());
+            });
+            assert!(
+                env.fs_seek_drag_active,
+                "the root gate must not end a sibling gesture"
+            );
+            assert_eq!(env.analysis_guide_drag, main_drag);
+            env.with_viewer_context(sibling, |app| {
+                assert!(!app.fs_seek_drag_active);
+                assert!(app.analysis_guide_drag.is_none());
+                assert!(app.spread_shift.retained_readoption_pending());
+            })
+            .unwrap();
+            env.end_root_input_gate_pass();
+        },
+    );
+    assert!(
+        !output.viewport_output[&egui::ViewportId::ROOT]
+            .commands
+            .iter()
+            .any(|command| matches!(command, egui::ViewportCommand::CancelClose))
+    );
+    output.drop_without_applying_deltas();
+    pause.send(()).unwrap();
+    env.with_viewer_context(sibling, |app| {
+        app.finish_page_identity_preparation_for_test();
+    })
+    .unwrap();
+    assert!(env.fs_seek_drag_active);
+    assert_eq!(env.analysis_guide_drag, main_drag);
+    owner.shutdown_and_join();
+}
+
+#[cfg(windows)]
+#[test]
+fn retained_shift_start_before_root_input_gate_ends_only_the_initiating_context_gestures() {
+    retained_start_input_gate_mount_scenario(false);
+}
+
+#[cfg(windows)]
+#[test]
+fn retained_shift_start_after_root_input_gate_ends_only_the_initiating_context_gestures() {
+    retained_start_input_gate_mount_scenario(true);
+}
+
 #[test]
 fn g1_snapshot_parks_book_shift_receipt_and_restores_identity_without_extracted_writes() {
     let mut env = setup_app();

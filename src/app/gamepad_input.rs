@@ -2034,7 +2034,7 @@ fn grid_ring_action_allowed_during_refresh(action: &RingActionId) -> bool {
 }
 
 #[derive(Clone, Copy)]
-enum GridSelectionEdge {
+pub(crate) enum GridSelectionEdge {
     First,
     Last,
 }
@@ -5029,7 +5029,8 @@ impl App {
     }
 
     fn dispatch_gamepad_grid_analog(&mut self, now: Instant) -> bool {
-        if !self.grid_item_input_allowed() {
+        let block = self.grid_item_input_block();
+        if block.is_some_and(|block| !block.item_independent_controls_allowed()) {
             self.reset_gamepad_continuous_steps(now);
             return false;
         }
@@ -5052,6 +5053,10 @@ impl App {
                 .trigger_step_due(false, now, Duration::from_millis(70));
             let _ = self.gamepad.state.analog_dt(stick_active, now);
             return changed;
+        }
+        if block.is_some() {
+            self.reset_gamepad_continuous_steps(now);
+            return false;
         }
         if self
             .gamepad
@@ -5256,7 +5261,11 @@ impl App {
 
     fn open_gamepad_ring_picker(&mut self, ctx: &egui::Context) {
         let context = self.current_ring_shortcut_context();
-        if context == RingShortcutContext::Grid && !self.grid_item_input_allowed() {
+        if context == RingShortcutContext::Grid
+            && self
+                .grid_item_input_block()
+                .is_some_and(|block| !block.item_independent_controls_allowed())
+        {
             return;
         }
         let mut picker = self.build_ring_picker_state(context);
@@ -6038,7 +6047,24 @@ impl App {
         }
     }
 
+    fn picker_item_rating_input_allowed(&self, context: RingShortcutContext) -> bool {
+        match context {
+            RingShortcutContext::Grid => self.grid_item_input_allowed(),
+            RingShortcutContext::ImageFullscreen | RingShortcutContext::VideoFullscreen => {
+                !self.view_order_refresh_scan_pending()
+            }
+        }
+    }
+
     fn change_ring_picker_value(&mut self, ctx: &egui::Context, row: RingPickerRowId, delta: i32) {
+        if row == RingPickerRowId::ItemRating
+            && self
+                .ring_picker
+                .as_ref()
+                .is_some_and(|picker| !self.picker_item_rating_input_allowed(picker.context))
+        {
+            return;
+        }
         let ai_mode = self.settings.ai_feature_mode;
         let sort_capabilities = self.listing_sort_capabilities();
         let Some(picker) = self.ring_picker.as_mut() else {
@@ -6186,7 +6212,9 @@ impl App {
     }
 
     fn preview_grid_picker_row(&mut self, picker: &RingPickerState, row: RingPickerRowId) {
-        if !self.grid_item_input_allowed() {
+        if self.grid_item_input_block().is_some_and(|block| {
+            !block.item_independent_controls_allowed() || row == RingPickerRowId::ItemRating
+        }) {
             return;
         }
         match row {
@@ -6563,6 +6591,14 @@ impl App {
         row: RingPickerRowId,
         index: usize,
     ) {
+        if row == RingPickerRowId::ItemRating
+            && self
+                .ring_picker
+                .as_ref()
+                .is_some_and(|picker| !self.picker_item_rating_input_allowed(picker.context))
+        {
+            return;
+        }
         let ai_mode = self.settings.ai_feature_mode;
         let mut changed = false;
         if let Some(picker) = self.ring_picker.as_mut() {
@@ -7288,7 +7324,10 @@ impl App {
         Option<(crate::ring_shortcut::RingPickerContainerTarget, u8, u8)>,
     ) {
         let item_rating_dirty = picker.dirty_rows.contains(&RingPickerRowId::ItemRating);
-        if item_rating_dirty {
+        // A pre-wait preview may already have durable receipts. Preserve its dirty
+        // row and Undo bookkeeping below, but never submit a new Grid item write
+        // while the shared gate blocks it (including a physical session's terminal).
+        if item_rating_dirty && self.picker_item_rating_input_allowed(picker.context) {
             let (_, error) = self.apply_picker_item_rating_targets(picker, picker.item_rating);
             if let Some(error) = error {
                 self.report_rating_write_error(&error);
@@ -7561,11 +7600,7 @@ impl App {
             self.settings.sort_order = sort_order;
             self.settings.save();
         }
-        if sort_order.is_duration() {
-            self.apply_sort_change_reload_without_ui_io();
-        } else {
-            self.apply_sort_change_reload();
-        }
+        self.apply_sort_change_reload();
         self.grid_scroll.set_reveal_requested(true);
     }
 
@@ -9085,7 +9120,7 @@ impl App {
         request_ring_overlay_repaint(ctx);
     }
 
-    fn move_grid_selection_to_edge(
+    pub(crate) fn move_grid_selection_to_edge(
         &mut self,
         ctx: &egui::Context,
         edge: GridSelectionEdge,

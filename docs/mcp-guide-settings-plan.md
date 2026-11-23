@@ -510,6 +510,12 @@ AI 連携の許可そのものだけ** (2026-11-21 利用者決定、§1)。画�
   (第 2 段)。**OK のあとの後処理** (`apply_preferences_dialog` の中での worker の作り直し・読み込み直しなど) は
   この基準に当たらない。AI からの変更も同じ確定処理を通るので、後処理は画面の OK と同じに走る (§6.3 の目的)。
   実装担当が見つけたものは区切り C の報告に挙げ、ここに足す。
+- **ブラウザ連携 (`browser_integration_enabled`・`browser_view_output_dir`) は第 2 段** (2026-11-23、v5.6.0 の
+  master の取り込みで追加。§1.818)。環境設定の OK では下書きの値を今の値へ戻し、登録は別の worker が非同期に
+  行う (`admit_browser_integration_settings_change`、`src/browser_integration/mod.rs:587`)。AI から変えても
+  確定の時点では値が変わらず、応答の変更前後が実際と合わない。同じ取り込みで export 側に加わった
+  `fullscreen_wheel_zoom_step`・`fullscreen_n_scroll_wrap_step_percent`・`fullscreen_bound_drag_pan` は値だけの項目で、
+  第 1 段に入る。
 
 #### 6.4.3 第 1 段の鍵の決め方
 

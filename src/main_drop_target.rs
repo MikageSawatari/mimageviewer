@@ -201,16 +201,16 @@ fn decide(
     modifiers: u32,
 ) -> Decision {
     let Some(hit) = hit else {
-        return Decision::None(Description::Invalid);
+        return Decision::None(Description::None);
     };
     let destination = match hit {
         Hit::TreeRow(path) => path,
-        Hit::TreeNonTarget => return Decision::None(Description::Invalid),
+        Hit::TreeNonTarget => return Decision::None(Description::None),
         Hit::ExistingDropArea => {
             return if internal.is_none() && external_has_paths && source_allows_copy {
                 Decision::Grid
             } else {
-                Decision::None(Description::Invalid)
+                Decision::None(Description::None)
             };
         }
     };

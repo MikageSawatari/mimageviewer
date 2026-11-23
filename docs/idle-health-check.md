@@ -30,6 +30,10 @@ command lineに`--perf-log`があるという事実だけではPASSにしない�
 
 ### 正規手順: ReleaseChecks suite（2026-10-11採用、毎リリース）
 
+2026-11-21 から、公開前にサブ PC のキットで流す (`-FromKit`。手順は [リリース手順チェックリスト](release-checklist.md) 9.6、
+仕組みは [自動化計画 §11](release-check-automation-plan.md#relcheck-subpc-kit))。判定の条件と閾値は下記と同じ。
+サブ PC の数値はメイン PC の記録と比べない。以下はメイン PC の repository root で流す場合。
+
 利用者がrepository rootのPowerShellで実行する:
 
 ```powershell
@@ -167,7 +171,8 @@ UIがそのI/Oを待ったとは判断しない。
 通常画像の前面・背面測定には、884×444のような横長画像と、要求長辺374px付近の条件を
 含める（§1.198）。既存の整数比率選択では374px要求が247×124になり、400px要求なら
 400×201になるため、400pxのケースだけでは同一要求の反復を検出できない。
-比率「自動(3:4)」・7列は発見時の設定であり、DPIや窓幅によって要求pxは変わる。
+比率「自動(3:4)」・7列は発見時の設定であり、DPIや窓幅によって要求pxは変わる
+(ReleaseChecks は窓・列数を DPI の表 `scripts/release_check_geometry.json` から選ぶ)。
 修正後も出力247×124は既存品質仕様として残るが、同一要求の再decodeは収束することが必要。
 サイズを大きくしたときに高画質化が再開することも、静止測定とは別に確認する。
 
