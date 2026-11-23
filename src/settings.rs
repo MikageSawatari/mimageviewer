@@ -2122,8 +2122,8 @@ impl ToolbarSectionId {
     ///
     /// 詳細列の `details_ordered_columns` と同じ「保存順に無い新項目は末尾追加」方式。
     /// 空 Vec は既定順そのまま。重複は最初の 1 つだけ採用 (破損データ耐性)。
-    /// Drives だけは保存済み Favorites の直前へ追加する。Favorites も無ければ末尾。
-    /// その他の新セクションは従来どおり末尾追加する。
+    /// Drives だけは末尾ではなく Favorites の直前へ追加する (保存順に Favorites が無ければ、
+    /// 既定順で補った Favorites の直前)。その他の新セクションは従来どおり末尾追加する。
     pub fn ordered_with_fallback(saved: &[Self]) -> Vec<Self> {
         if saved.is_empty() {
             return Self::default_order().to_vec();
@@ -2139,7 +2139,6 @@ impl ToolbarSectionId {
             }
         }
         let missing_drives = !out.contains(&Self::Drives);
-        let drives_position = out.iter().position(|id| *id == Self::Favorites);
         for &id in Self::default_order() {
             if id == Self::Drives {
                 continue;
@@ -2149,7 +2148,13 @@ impl ToolbarSectionId {
             }
         }
         if missing_drives {
-            out.insert(drives_position.unwrap_or(out.len()), Self::Drives);
+            // 補完後は Favorites が必ずある (既定順に含まれる)。保存順に Favorites が無い
+            // 壊れた / 部分的な保存順でも、補った Favorites の直前に置き、既定順の補完と揃える。
+            let favorites = out
+                .iter()
+                .position(|id| *id == Self::Favorites)
+                .unwrap_or(out.len());
+            out.insert(favorites, Self::Drives);
         }
         out
     }
@@ -13642,7 +13647,14 @@ mod tests {
         let corrupt = [TS::Tags, TS::Cols];
         let completed = TS::ordered_with_fallback(&corrupt);
         assert_eq!(&completed[..2], &corrupt);
-        assert_eq!(completed.last(), Some(&TS::Drives));
+        // 保存順に Favorites が無くても、補った Favorites の直前に入り、末尾は既定順の最後のまま。
+        let favorites = completed
+            .iter()
+            .position(|id| *id == TS::Favorites)
+            .unwrap();
+        assert_eq!(completed[favorites - 1], TS::Drives);
+        assert_eq!(completed.last(), TS::default_order().last());
+        assert_eq!(completed.iter().filter(|&&id| id == TS::Drives).count(), 1);
 
         let explicit = [TS::Drives, TS::Tags, TS::Favorites];
         assert_eq!(&TS::ordered_with_fallback(&explicit)[..3], &explicit);

@@ -71,7 +71,7 @@
 - 既定の並びはお気に入りの直前 (場所へ移るセクションの並び)。`default_order()` に `Favorites` の直前で加える。
   既存の保存順 (`toolbar_section_order` は移行済みで全セクションを持つ) には `Drives` が無いので、
   `ordered_with_fallback` が `Drives` だけは末尾ではなく `Favorites` の直前へ差し込む
-  (`Favorites` も無い壊れた保存順なら末尾。空の保存順は正常な既定値なので既定順のまま)。保存順に `Drives` が
+  (`Favorites` も無い壊れた・部分的な保存順では、既定順で補った `Favorites` の直前。空の保存順は正常な既定値なので既定順のまま)。保存順に `Drives` が
   明示されていればその位置を守る。ほかのセクションの相対順と、セクション ID に付く `new_row` は変えない。
   保存順はドラッグ並べ替えで初めて書き直されるので、移行フラグは要らない。ほかのセクションの末尾追加の規則
   (Collections の既存テスト) は変えない。ツールバーの既定復元と、環境設定 OK 後の live 値の引き継ぎでも
@@ -255,7 +255,7 @@
 
 - 純関数: `resolve_drive_jump` を tempdir で (記録が存在 / 消えて親へ / 親も無くルートへ / コンテナが存在 /
   コンテナが消えて親へ / 記録なし / 別ドライブを指す記録は使わない)。ドライブ欄の集合の導出 (A∪B、文字順、
-  空)。`ordered_with_fallback` の差し込み (Drives の無い保存順 → Favorites の直前、Favorites も無い → 末尾、
+  空)。`ordered_with_fallback` の差し込み (Drives の無い保存順 → Favorites の直前、Favorites も無い → 補った Favorites の直前、
   既存の Collections の末尾追加は不変)。
 - handler-level: キー (`GridSwitchDrive{X}` / `GridOpenDrive{X}` / `GridOpenCurrentDriveRoot`)・ツールバーの
   クリック・リング・ゲームパッドが**同じ要求**を作ること。要求の作成時、およびディレクトリの解決完了 → 候補採用 →
@@ -345,3 +345,4 @@
 - 2026-11-23 文書訂正 (P3-1): UI stat／filesystem 無しという記述をディレクトリの解決完了から worker 走査開始までに限定。PDF の placeholder 照会 (warm miss も stat、prepared-pages は省略)、ZIP の表示準備、条件付き変換書庫 cache lookup に残る既存同期 I/O は §2.3 の既知制限として記録し、今回の修正対象外とした。
 - 2026-11-23 実装と検収: 実装 4e83f0b4d、修正 1018d24ed・cf0a2fae4 (独立コードレビュー R1・R2 の REVISE 対応)、
   スナップショット 0841c5acd。独立コードレビュー R3 で ACCEPT。PDF・ZIP・変換書庫の既存の UI 側 I/O は既知の制限として残した (§2.3)。
+- 2026-11-23 master 取り込み後の修正: master の lib 全件で §207 の旧設定移行テスト 2 件が落ちた。原因は `ordered_with_fallback` が Favorites の位置を足りないセクションの補完前に取っていたこと。Favorites の無い部分的な保存順で Drives が末尾 (SearchEverything の後) に付き、「お気に入りの直前」とも「既定順で補完」とも合っていなかった。テストではなくコードを直し、補完後の Favorites の直前へ置くようにした。リリース済みの設定 (移行済みで Favorites を含む全セクションの保存順) では、利用者の並べ替えた位置の Favorites の直前に入る点は変わらない。
