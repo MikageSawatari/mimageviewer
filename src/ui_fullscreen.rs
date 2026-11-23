@@ -38616,7 +38616,10 @@ impl App {
         self.set_page_turn_animation(choice);
     }
 
-    fn set_page_turn_animation(&mut self, choice: Option<crate::settings::PageTurnAnimationStyle>) {
+    pub(crate) fn set_page_turn_animation(
+        &mut self,
+        choice: Option<crate::settings::PageTurnAnimationStyle>,
+    ) {
         self.adopt_page_turn_animation_settings(
             choice.is_some(),
             self.settings.page_turn_animation_duration_ms,
@@ -69398,66 +69401,63 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
     #[test]
-    fn page_turn_animation_overflow_style_selection_cancels_all_contexts() {
+    fn page_turn_animation_overflow_style_selection_preserves_mounted_context() {
         use crate::settings::PageTurnAnimationStyle::{Curl, Slide};
         let ctx = egui::Context::default();
         let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(app.tmp.path().join("main.png"))];
+        app.fullscreen_idx = Some(0);
         app.adopt_page_turn_animation_settings(true, 400, Curl);
         let main = app.page_turn_destination();
         app.page_turn_presentation.seed_operation_for_test(main, 41);
-        let sibling = app.build_window_context_for_test(91772, |owner| {
-            owner.items = vec![GridItem::Image(PathBuf::from("c:/fixtures/sibling.png"))];
-            owner.fullscreen_idx = Some(0);
-        });
-        app.with_viewer_context(sibling, |owner| {
-            let destination = owner.page_turn_destination();
-            owner
-                .page_turn_presentation
-                .seed_operation_for_test(destination, 73);
-            owner.fs_overflow_panel_state = FsOverflowPanelState::Root;
-            let before_items = owner.items.clone();
-            let before_input = owner.input_seq;
-            let view = owner.fullscreen_overflow_panel_view(false);
-            owner.apply_fs_overflow_panel_action(
-                &ctx,
-                &view,
-                false,
-                FsOverflowPanelAction::Activate(FullscreenOverflowItemId::PageTurnAnimationToggle),
-            );
-            assert_eq!(
-                owner.page_turn_presentation.operation_for_test(),
-                Some((destination, 73))
-            );
-            let view = owner.fullscreen_overflow_panel_view(false);
-            owner.apply_fs_overflow_panel_action(
-                &ctx,
-                &view,
-                false,
-                FsOverflowPanelAction::SetPageTurnAnimation(Some(Slide)),
-            );
-            assert!(owner.settings.page_turn_animation_enabled);
-            assert_eq!(owner.settings.page_turn_animation_style, Slide);
-            assert_eq!(owner.settings.page_turn_animation_duration_ms, 400);
-            assert_eq!(owner.page_turn_presentation.operation_for_test(), None);
-            assert_eq!(owner.items, before_items);
-            assert_eq!(owner.fullscreen_idx, Some(0));
-            assert_eq!(owner.input_seq, before_input);
-            assert_eq!(
-                owner.fs_overflow_panel_state,
-                FsOverflowPanelState::PageTurnAnimation
-            );
-            let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
-            assert!(stored.page_turn_animation_enabled);
-            assert_eq!(stored.page_turn_animation_style, Slide);
-            assert_eq!(stored.page_turn_animation_duration_ms, 400);
-        })
-        .unwrap();
+        app.fs_overflow_panel_state = FsOverflowPanelState::Root;
+        let before_items = app.items.clone();
+        let before_input = app.input_seq;
+        let view = app.fullscreen_overflow_panel_view(false);
+        app.apply_fs_overflow_panel_action(
+            &ctx,
+            &view,
+            false,
+            FsOverflowPanelAction::Activate(FullscreenOverflowItemId::PageTurnAnimationToggle),
+        );
+        assert_eq!(
+            app.fs_overflow_panel_state,
+            FsOverflowPanelState::PageTurnAnimation
+        );
+        assert_eq!(
+            app.page_turn_presentation.operation_for_test(),
+            Some((main, 41))
+        );
+        assert_eq!(app.settings.page_turn_animation_style, Curl);
+        assert!(app.fs_feedback_toast.is_none());
+        let view = app.fullscreen_overflow_panel_view(false);
+        app.apply_fs_overflow_panel_action(
+            &ctx,
+            &view,
+            false,
+            FsOverflowPanelAction::SetPageTurnAnimation(Some(Slide)),
+        );
         assert!(app.settings.page_turn_animation_enabled);
         assert_eq!(app.settings.page_turn_animation_style, Slide);
+        assert_eq!(app.settings.page_turn_animation_duration_ms, 400);
         assert_eq!(app.page_turn_presentation.operation_for_test(), None);
         assert_eq!(app.page_turn_destination(), main);
+        assert_eq!(app.items, before_items);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.input_seq, before_input);
+        assert_eq!(
+            app.fs_overflow_panel_state,
+            FsOverflowPanelState::PageTurnAnimation
+        );
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some("[ページめくりアニメーション スライド]")
+        );
+        let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert!(stored.page_turn_animation_enabled);
+        assert_eq!(stored.page_turn_animation_style, Slide);
+        assert_eq!(stored.page_turn_animation_duration_ms, 400);
     }
 
     #[test]
