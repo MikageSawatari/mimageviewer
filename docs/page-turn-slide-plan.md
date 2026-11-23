@@ -1,6 +1,6 @@
 # §1.772 ページめくりの演出に「スライド」を加える — 設計案
 
-2026-11-23、設計基点 `page-turn-slide-772` / master `1a15e96bc`。状態: **設計第 1 版、独立設計レビュー前、利用者の判断待ち (§13)**。
+2026-11-23、設計基点 `page-turn-slide-772` / master `1a15e96bc`。状態: **設計第 2 版 (r1 独立設計レビュー REVISE の 5 件を反映、§16)、再レビュー待ち、利用者の判断待ち (§13)**。
 正本の要望は [backlog §1.772](next-release-backlog.md)。既存の演出の正本は
 [ページめくり演出の設計](page-turn-animation-plan.md) (以下「本設計」)、表示単位の照合は
 [ページめくりとレイアウト](page-turn-layout-binding-plan.md)、描画の位置付けは [表示パイプライン](display-pipeline.md)。
@@ -43,7 +43,12 @@
 - `PresentationState` の種類・遷移、`MotionClock`、`SubmissionTracker`、receipt、取消の宛先、Completing の着地、
   `PageTurnUnitBinding` の照合、先読み・pin・VRAM 会計は**そのまま共有**する。スライド専用の状態・時計・素材の保持を作らない。
 - 名前: receipt の `curl: bool` と `SubmissionKind::Curl` は「projection で描いた frame」の意味でそのまま使う
-  (両方の種類を含む、とコメントを直す)。perf event には `style` を足す。名前の付け替えは差分を広げるだけなのでしない。
+  (両方の種類を含む、とコメントを直す)。名前の付け替えは差分を広げるだけなのでしない。
+- 診断の style (r1 改訂): 受理時の style を `AcceptedOffer` だけでなく、その操作の不変な診断情報 (`SubmissionTracker`、
+  取消後に残る `CompletionDiagnostics` `PT:1192`) にも持たせ、offer / skip / start / cancel / 遅延 output / 取消後の着地の
+  各 perf event へ同じ値を載せる。event の時点の `Settings` を読み直さない (設定変更の直後に旧スライドの着地をめくりとして
+  記録しないため)。受理前に skip した操作は、その時点の設定の style を載せる。`scripts/analyze_perf.py` の
+  `page_turn_animation` 集計 (`:380`・`:449` の集計キー) に style を加え、style の無い旧ログは `curl` として扱う。
 
 ### 3.2 受理・開始の条件は共有する
 
@@ -97,14 +102,20 @@ clip を `C` とする。
 
 - 新しい単位の開始位置: 新しい単位の左端を `L = max(C.right, Bo.right)` に置く。新しい単位の移動量 `Sn = L − Bn.left`
   (着地で 0)。clip の端から入るので、新しい単位が途中で突然現れない。旧のはみ出し (指定サイズ表示) とも重ならない。
-- 旧の単位の移動量: `So = max(Sn, Bo.right − C.left)`。旧の単位は着地の時点で必ず clip の外へ出切る。`So ≥ Sn` なので
-  両者の間隔は縮まず、重ならない。大きさの違うページ (縦長 → 横長など) でも成り立つ。
+- 旧の単位の移動量: `So = max(Sn, Bo.right − C.left)`。旧の単位は `p → 1` で clip 内の可視面積が 0 へ収束し、`p = 1` では
+  描かない (`p < 1` の間は端が clip 内に残り得る。着地の frame で旧を消すのは連続な動きの終点であって飛びではない)。
+  `So ≥ Sn` なので両者の間隔 `L − Bo.right + (So − Sn)·e ≥ 0` は縮まず、重ならない。大きさの違うページ (縦長 → 横長など)・
+  Vacant の除外・指定サイズのはみ出しでも成り立つ (r1 独立レビューで確認)。
 - 進み具合: `e(p) = e0 + (1 − e0) · smooth(p)` (`smooth` は既存の smoothstep `PTA:610`)。旧は `−So·e`、新は `Sn·(1 − e)` だけずらす。
-- 初期の移動量 `e0`: 本設計 §3 の「最初の frame から新しい内容が見える」規則 (各 incoming の 5% 以上かつ短辺 8 pt 以上、
-  `meaningful` `PTA:564`) を満たす最小の値を、`{0, 1/32, 2/32, …, 8/32}` から選ぶ。満たせなければ
-  `IncomingNotVisible("initial_target_visibility")` で開始せず、その frame は通常表示 (めくりの単ページと同じ扱い。
-  見開きでも同じにし、めくりの見開きの例外は持ち込まない)。通常の fit 表示では新しい単位が clip の端に接するので、
-  `e0` は新しいページ幅の 5% 前後になる (めくりが少し折れた pose から始まるのと同じ考え方)。
+- **`p = 1` は投影しない**: 既存の `scene` (`PTA:670`) と同じく、終端は保存済みの incoming の rect / UV / clip をそのまま描き、
+  通常の flat paint と一致させる。移動量の計算を経由した丸め誤差を終端へ持ち込まない。
+- 初期の移動量 `e0` (r1 改訂): 判定は既存の `meaningful` (`PTA:564`) をそのまま使う。これは「**どれか 1 つの** incoming 実ページが
+  5% 以上かつ短辺 8 pt 以上見える」判定で、各ページではない。`{0, 1/32, 2/32, …, 8/32}` から最初に満たす値を選ぶ。
+  - 単ページ表示: 満たせなければ `IncomingNotVisible("initial_target_visibility")` で開始せず、その frame は通常表示
+    (めくりの単ページ `PTA:440` と同じ)。新しいページは clip の端から入るので、通常の fit では `e0` は新しいページ幅の 5% 前後になる。
+  - 見開き: 満たせなくても `e0 = 1/32` で開始する (めくりの見開きが 30° で開始する `PTA:438` と同じ扱い)。先頭側が白紙の相方
+    (Blank、occurrence なし) や、入る側から遠い実ページは、後から clip に入った時点で receipt に面積が載る。それまでの receipt は 0 のまま
+    扱い、提示済みの判定は既存どおり canonical flat の採用で行う (`PT:1598` 付近)。新しい状態・待ちは作らない。
 - 時間は既存の `page_turn_animation_duration_ms` を共有する (§13 Q4)。
 
 ### 4.4 表示の形ごとの動き
@@ -130,7 +141,9 @@ clip を `C` とする。
 ### 6.1 連打・長押し・方向反転
 
 めくりと同じ。演出中の次の入力で即取消し、その移動は通常表示。連打・押し続けの 2 回目以降・wheel の複数 notch・
-gamepad の repeat は演出なし。入力を待たせない、入力を溜めない。
+gamepad の repeat は演出なし。スライドのための入力待ち・queue は作らず、既存の 1 件の解決済み continuation と flat の barrier
+(`src/ui_fullscreen/page_turn/barrier.rs:296`・`:346`: 取消後の必須 flat が採用されてから次の frame で 1 回だけ commit する) を
+そのまま使う (r1 改訂)。
 
 ### 6.2 取り消した着地
 
@@ -159,8 +172,11 @@ gamepad の repeat は演出なし。入力を待たせない、入力を溜め�
 
 - ページめくり演出はリリース済み (v4.7.0 で追加、CHANGELOG)。新しい field を足すだけで、既存の値の意味は変えない。
   欠けているとき (旧版の設定) は `Curl` で、**移行処理は不要** (今の挙動のまま)。
-- 設定 DB は既存の kv の enum と同じ書き方 (`page_turn_animation_style` = `"curl"` / `"slide"`)。未知の値の扱いは
-  既存の enum 設定の規則 (`settings_db.rs:719` の Incompatible) に従う。旧版へ戻した場合、旧版はこの key を読まずにめくりで動く。
+- 設定 DB は既存の kv の enum と同じ書き方 (`page_turn_animation_style` = `"curl"` / `"slide"`)。key が欠けていれば `Curl` と読むので
+  SQL の migration は不要。未知の値は既存の enum 設定と同じく `Incompatible` として扱い、`serde(other)` などで黙って `Curl` へ
+  変換しない (r1 改訂)。
+- 旧版へ戻した場合は、既存の版の保護に従う: DB を開く時点で保存元のアプリ版が新しければ `Incompatible` になり
+  (`settings_db.rs:668`・`:1880`)、旧版は設定を書き換えない。新しい key だけを旧版が無視して読む、という経路は無い (r1 改訂で訂正)。
 - 設定転送 (`settings_transfer.rs:364`) に 1 行足す。型違い・未知の値は拒否して現在の draft を保つ (既存の 2 行と同じ)。
 
 ## 8. 複数ウィンドウ (detached / F12)
@@ -182,8 +198,9 @@ detached の述語・viewport の経路・context の mount / park / swap には
   切り替えが表示単位の組み直しを起こし、`canonical_unit` の表紙側の証明 (`PT:3796`) もスライドだけ別にする必要が出る。
 - **採らなかった**: スライド専用の「元へ戻る」演出・指への追従 (§6.3)。所有が別物になる。
 - **採らなかった**: スライドの時間を別の設定にする。設定と取消の条件が 1 つ増えるだけで、要望には無い (§13 Q4)。
-- **採らなかった**: 見開きでも初期の可視条件を満たさないときに開始する (めくりの見開きの例外)。スライドは端から入るので、
-  条件を満たさないのは指定サイズで大きくはみ出す場合などに限られ、その frame は通常表示で足りる。
+- **採った (r1 改訂)**: 初期の可視条件は、めくりと同じく単ページだけ必須、見開きは満たさなくても開始する。見開きで
+  必須にすると、入る側が白紙の相方の単位などを開始できず、スライドだけの拒否の形が増える。完了の判定は canonical flat なので、
+  見開きの未露出ページの receipt を 0 のまま扱っても新しい状態は要らない。
 
 ## 10. まれな失敗
 
@@ -193,17 +210,27 @@ projection は純粋関数で I/O を持たない。設定の保存失敗など�
 ## 11. テスト
 
 - `PTA` の純粋関数 (`page_turn_animation/` 配下の既存の snapshot / fixture の形に揃える):
-  - 4 つの向き (左綴じ/右綴じ × 進む/戻る) で、旧が出る側・新が入る側・`p=1` で新が通常配置と一致・`p=1` 直前で旧が clip の外。
-  - 単ページの大きさ違い (縦長↔横長)、見開き↔見開き、先頭の単ページ (Vacant を含む) ↔ 見開き、横長 1 枚、白紙の相方、crop paint。
+  - 4 つの向き (左綴じ/右綴じ × 進む/戻る) で、旧が出る側・新が入る側。`p → 1` で旧の可視面積が単調に 0 へ収束し、
+    `p = 1` では旧を描かず、新だけが保存済みの rect / UV / clip で通常の flat paint と一致する。
+  - 終端の描画比較: 非整数 DPI (例 1.25・1.5)、丸め済みの辺、見開きの横長の正規化、crop paint を含めて、`p = 1` の mesh が
+    通常の flat paint と同じ頂点・UV・clip になる。
+  - 単ページの大きさ違い (縦長↔横長)、見開き↔見開き、先頭の単ページ (Vacant を含む) ↔ 見開き、横長 1 枚、白紙の相方、crop paint、
+    `PartialTexture` (domain 内だけ描く)。
   - 旧と新が全区間で重ならない (polygon の交差面積 0)、可視面積の receipt が clip 内の面積と一致。
-  - `e0`: 通常 fit で最小候補が選ばれる / 条件を満たせないとき `initial_target_visibility` で失敗。
+  - `e0`: 単ページの通常 fit で最小候補が選ばれる / 単ページで条件を満たせないとき `initial_target_visibility` で失敗 /
+    見開きで入る側が白紙の相方のとき `1/32` で開始し、実ページの receipt が後から 0 より大きくなる。
   - mesh 予算 (`MAX_PROJECTION_*`) 以内。
 - `PT` の所有側 (既存の clock / wait indicator / merge master の test の形に揃える):
   - style=Slide で Offered → Turning → 着地、receipt の incoming 可視面積、MotionClock の開始が共有経路で動く。
   - ON のまま style を変えると Turning / Offered が取り消され着地する。OFF の間の変更は何も取り消さない。
   - 受理時の style が演出中に使われ続ける (設定の読み直しをしない)。
   - 兄弟 context (F12) の演出も style 変更で取り消される (既存 `viewer_context_registry.rs:8686` 付近の形)。
-- 設定: serde の欠落 → Curl、DB の roundtrip と欠落、設定転送の roundtrip / 不正値の拒否。
+  - continuation を持つ Completing の最中に style を変えても、その continuation は保持され、旧 receipt が遅れて届いても
+    新しい flat の採用後に 1 回だけ commit する (barrier の既存の契約がスライドでも同じ)。
+  - perf event の style が、設定変更の後に届く遅延 output・取消後の着地でも受理時の値のまま。
+- 設定: serde の欠落 → Curl、DB の roundtrip と欠落 (リリース済みの enabled / duration を保持したまま style だけ欠けた旧形式を
+  読む)、未知の style が `Incompatible` になる、設定転送の roundtrip / 不正値の拒否。
+- 解析器: `scripts/test_analyze_perf.py` に、めくりとスライドが混ざったログ・style の無い旧ログの集計を足す。
 - UI スナップショット: 環境設定の page turn 項目 (`page_turn_animation_settings_light_on` / `_dark_off`) を更新し、slide 選択時を 1 枚足す。
 - 実行は `run-heavy.ps1` 経由で変更モジュールの filter (`page_turn`、`settings`、`settings_transfer`、`settings_db`、`preferences`) と `ui_snapshot`。
   App の共有状態・非同期・複数ウィンドウの土台は変えないので、lib 全件は統括の master 取り込み後に回す (CLAUDE.md「テストの段階分け」)。
@@ -226,10 +253,14 @@ projection は純粋関数で I/O を持たない。設定の保存失敗など�
   / 案 B: スライドのときは保存済みの配置 (中央など) に従う (§9 の理由で表紙の判定と設定画面の灰色表示を種類ごとに分ける費用がかかる)。
 - **Q4 速さ**: (推奨) めくりと同じ「時間」の設定を共有する。 / 案 B: スライド用に別の時間を持つ。
 
+参考 (相談不要、めくりと同じ扱いにした点): 見開きのスライドでは、入る側から遠いページ (または入る側が白紙の相方のときの実ページ)
+は少し遅れて画面に入る。最初の frame で必ず見えるのは入る側のページ。
+
 ## 14. 見積り
 
 推奨案のままなら、純粋関数 (スライドの projection とテスト) が中心で、所有側は分岐 1 か所と設定の採用経路の引数追加。
-Codex の実装 1〜2 日 + 独立レビュー + 文書・スナップショットで、**v5.7.0 に間に合う見込み**。Q2・Q1 の案 B を選ぶと別規模になる。
+Codex の実装 1〜2 日 + 独立レビュー + 回帰・解析器テスト・描画スナップショット・文書 + `build-dev.ps1` の確認用ビルドで、
+**v5.7.0 に間に合う見込み**。採用の判断には利用者の実機での動きの確認 (§12 の後、統括経由) を含める。Q2・Q1 の案 B を選ぶと別規模になる。
 
 ## 15. レビューで特に見てほしい点
 
@@ -238,3 +269,14 @@ Codex の実装 1〜2 日 + 独立レビュー + 文書・スナップショッ�
 3. 共有する `preflight` / `canonical_unit` / `stage_one_shape_reason` にめくり専用の前提 (綴じ目・表紙側の証明) が混ざっていて、スライドには不要な拒否になっていないか。拒否が過剰でも今回は許容するが、誤って受理する形がないか。
 4. receipt / SubmissionKind の `curl` の名前を共有することで、診断・perf 解析器 (`scripts/analyze_perf.py:380` の `page_turn_animation` 集計、`first_accepted_curl` 等) の集計がめくりとスライドを区別できなくならないか。解析器は style 別に分けて集計する想定。
 5. detached の判断 (§8)。
+
+## 16. レビューの記録
+
+- r1 (2026-11-23、GPT-6.1 Sol / xhigh、`468cc14b0`): **REVISE**。P1 見開きで初期可視条件を満たせない (設計書が「各 incoming」と書いていたが
+  `meaningful` は「どれか 1 面」、かつ入る側が白紙の相方だと開始できない) → §4.3 をめくりと同じ扱い (単ページ必須・見開きは開始) に改訂。
+  P2 旧版へ戻したときの説明が DB の版の保護と矛盾 → §7.2 を訂正、未知値・旧形式のテストを追加。P2 perf の style の寿命 → §3.1 に
+  受理時の値を tracker / CompletionDiagnostics まで運ぶ経路と解析器の集計を追加。P3 「着地直前に旧が clip の外」は式と合わない →
+  「`p → 1` で 0 へ収束、`p = 1` は保存済み配置を直接描く」に統一し、終端の描画比較を受入条件に追加。P3 入力待ちの説明が barrier と
+  不正確 → §6.1 を「既存の 1 件 continuation と flat barrier を維持」に訂正し、§11 に回帰を追加。
+  確認された点: 所有の基本方針、非重複の式、ROI の共用 (不完全 Native ROI は `canonical_page_material` `PT:3858` が排除)、
+  設定取消と兄弟 context、detached の判断、Q1〜Q4 の推奨。
