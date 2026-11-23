@@ -46,7 +46,7 @@ fn browser870_remote_directory_ignores_saved_composition_and_preserves_other_met
                     )
                     .unwrap();
                     let before = db.get_state_with_fallback(&month, None);
-                    *engine.spread_db.lock().unwrap() = Ok(Some(db));
+                    *engine.spread_db.state.lock().unwrap() = Ok(Some(db));
                     let spread = engine
                         .spread_payload_with_read(
                             &ContainerRequest {
@@ -81,6 +81,7 @@ fn browser870_remote_directory_ignores_saved_composition_and_preserves_other_met
                     assert_eq!(
                         engine
                             .spread_db
+                            .state
                             .lock()
                             .unwrap()
                             .as_ref()
@@ -132,7 +133,7 @@ fn browser870_remote_directory_reads_live_root_and_retains_explicit_request_over
     )
     .unwrap();
     let before = db.get_state_with_fallback(&month, None);
-    *engine.spread_db.lock().unwrap() = Ok(Some(db));
+    *engine.spread_db.state.lock().unwrap() = Ok(Some(db));
     let open = |spread_mode| {
         let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
             address: RemoteAddress::file(month.to_string_lossy().into_owned()),
@@ -161,6 +162,7 @@ fn browser870_remote_directory_reads_live_root_and_retains_explicit_request_over
     assert_eq!(
         engine
             .spread_db
+            .state
             .lock()
             .unwrap()
             .as_ref()

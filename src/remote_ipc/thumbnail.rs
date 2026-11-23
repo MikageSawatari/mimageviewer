@@ -11,6 +11,7 @@ use mimageviewer_ipc::{
 
 use super::container::ContainerEngine;
 use super::path_guard::{ResolveError, ResolvedPath, resolve_existing};
+use super::read_only_db::{LateCreatedReadOnlyDb, open_existing_read_only};
 
 pub(super) struct ThumbnailEngine {
     settings: Arc<crate::settings::Settings>,
@@ -22,13 +23,16 @@ pub(super) struct ThumbnailEngine {
 pub(super) struct WorkerContext {
     pub(super) folder_pin_db: Option<crate::folder_thumb_pins::FolderThumbPinDb>,
     video_pin_db: Option<crate::video_pins::VideoPinDb>,
-    rotation_db: Option<crate::rotation_db::RotationDb>,
+    // The outer None is reserved for without_databases(). A regular worker keeps
+    // a reader even while its file is missing or its initial open has failed.
+    rotation_db: Option<LateCreatedReadOnlyDb<crate::rotation_db::RotationDb>>,
     pub(super) adjustment_db: Option<crate::adjustment_db::AdjustmentDb>,
-    pub(super) mask_db: Option<crate::mask_db::MaskDb>,
-    pub(super) local_adjust_db: Option<crate::local_adjust_db::LocalAdjustDb>,
-    pub(super) conceal_db: Option<crate::conceal_db::ConcealDb>,
-    pub(super) comic_db: Option<crate::comic_db::ComicDb>,
-    pub(super) crop_db: Option<crate::export_crop::CropDb>,
+    pub(super) mask_db: Option<LateCreatedReadOnlyDb<crate::mask_db::MaskDb>>,
+    pub(super) local_adjust_db:
+        Option<LateCreatedReadOnlyDb<crate::local_adjust_db::LocalAdjustDb>>,
+    pub(super) conceal_db: Option<LateCreatedReadOnlyDb<crate::conceal_db::ConcealDb>>,
+    pub(super) comic_db: Option<LateCreatedReadOnlyDb<crate::comic_db::ComicDb>>,
+    pub(super) crop_db: Option<LateCreatedReadOnlyDb<crate::export_crop::CropDb>>,
 }
 
 impl WorkerContext {
@@ -36,22 +40,44 @@ impl WorkerContext {
         Self {
             folder_pin_db: crate::folder_thumb_pins::FolderThumbPinDb::open().ok(),
             video_pin_db: crate::video_pins::VideoPinDb::open().ok(),
-            rotation_db: crate::rotation_db::RotationDb::open_readonly().ok(),
+            rotation_db: Some(LateCreatedReadOnlyDb::new(
+                crate::rotation_db::RotationDb::db_path(),
+                |path| {
+                    open_existing_read_only(path, crate::rotation_db::RotationDb::open_readonly_at)
+                },
+                "rotation",
+            )),
             adjustment_db: crate::adjustment_db::AdjustmentDb::open().ok(),
-            mask_db: crate::mask_db::MaskDb::open_readonly().ok(),
-            local_adjust_db: crate::local_adjust_db::LocalAdjustDb::open_readonly(
-                &crate::local_adjust_db::LocalAdjustDb::db_path(),
-            )
-            .ok(),
-            conceal_db: crate::conceal_db::ConcealDb::open_readonly(
-                &crate::conceal_db::ConcealDb::db_path(),
-            )
-            .ok(),
-            comic_db: crate::comic_db::ComicDb::open_readonly().ok(),
-            crop_db: crate::export_crop::CropDb::open_readonly(
-                &crate::export_crop::CropDb::db_path(),
-            )
-            .ok(),
+            mask_db: Some(LateCreatedReadOnlyDb::new(
+                crate::mask_db::MaskDb::db_path(),
+                |path| open_existing_read_only(path, crate::mask_db::MaskDb::open_readonly_at),
+                "erase",
+            )),
+            local_adjust_db: Some(LateCreatedReadOnlyDb::new(
+                crate::local_adjust_db::LocalAdjustDb::db_path(),
+                |path| {
+                    open_existing_read_only(
+                        path,
+                        crate::local_adjust_db::LocalAdjustDb::open_readonly,
+                    )
+                },
+                "local-adjust",
+            )),
+            conceal_db: Some(LateCreatedReadOnlyDb::new(
+                crate::conceal_db::ConcealDb::db_path(),
+                |path| open_existing_read_only(path, crate::conceal_db::ConcealDb::open_readonly),
+                "conceal",
+            )),
+            comic_db: Some(LateCreatedReadOnlyDb::new(
+                crate::comic_db::ComicDb::db_path(),
+                |path| open_existing_read_only(path, crate::comic_db::ComicDb::open_readonly_at),
+                "comic",
+            )),
+            crop_db: Some(LateCreatedReadOnlyDb::new(
+                crate::export_crop::CropDb::db_path(),
+                |path| open_existing_read_only(path, crate::export_crop::CropDb::open_readonly),
+                "export-crop",
+            )),
         }
     }
 
@@ -86,9 +112,14 @@ impl WorkerContext {
     ) -> crate::rotation_db::Rotation {
         crate::edit_source::page_key_for_remote(logical_path, subresource)
             .and_then(|key| {
-                self.rotation_db
-                    .as_ref()
-                    .and_then(|database| database.get_key(&key))
+                self.rotation_db.as_ref().and_then(|reader| {
+                    reader
+                        .read()
+                        .as_ref()
+                        .ok()
+                        .and_then(|database| database.as_ref())
+                        .and_then(|database| database.get_key(&key))
+                })
             })
             .unwrap_or(crate::rotation_db::Rotation::None)
     }
@@ -99,7 +130,12 @@ impl WorkerContext {
     ) -> crate::rotation_db::Rotation {
         match cover {
             crate::cover_identity::CoverIdentity::Page(key) => {
-                match self.rotation_db.as_ref().map(|db| db.get_key_checked(key)) {
+                let guard = self.rotation_db.as_ref().map(|reader| reader.read());
+                let db = guard
+                    .as_deref()
+                    .and_then(|db| db.as_ref().ok())
+                    .and_then(|db| db.as_ref());
+                match db.map(|db| db.get_key_checked(key)) {
                     Some(Ok(rotation)) => rotation.unwrap_or_default(),
                     Some(Err(error)) => {
                         crate::logger::log(format!("remote cover rotation read failed: {error}"));
@@ -1126,6 +1162,62 @@ fn error_response(code: ThumbnailErrorCode, message: impl Into<String>) -> Thumb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote878_worker_rotation_db_created_after_context_is_read_without_restart() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let path = crate::rotation_db::RotationDb::db_path();
+        let page = data.path().join("page.png");
+        let key = crate::edit_source::page_key_for_remote(&page, &RemoteSubresource::File).unwrap();
+        let cover = crate::cover_identity::CoverIdentity::Page(key.clone());
+        let context = WorkerContext::open();
+        for _ in 0..2 {
+            assert_eq!(
+                context.rotation_for_remote_page(&page, &RemoteSubresource::File),
+                crate::rotation_db::Rotation::None
+            );
+            assert_eq!(
+                context.rotation_for_remote_cover(&cover),
+                crate::rotation_db::Rotation::None
+            );
+            assert!(!path.exists(), "Remote must not create the read-only DB");
+        }
+
+        let writer = crate::rotation_db::RotationDb::open_at(&path).unwrap();
+        writer
+            .set_key(&key, crate::rotation_db::Rotation::Cw90)
+            .unwrap();
+        assert_eq!(
+            context.rotation_for_remote_page(&page, &RemoteSubresource::File),
+            crate::rotation_db::Rotation::Cw90
+        );
+        assert_eq!(
+            context.rotation_for_remote_cover(&cover),
+            crate::rotation_db::Rotation::Cw90
+        );
+    }
+
+    #[test]
+    fn remote878_worker_read_only_open_error_is_retained() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let path = crate::rotation_db::RotationDb::db_path();
+        std::fs::create_dir(&path).unwrap();
+        let context = WorkerContext::open();
+        let reader = context.rotation_db.as_ref().unwrap();
+        assert!(reader.state.lock().unwrap().is_err());
+
+        std::fs::remove_dir(&path).unwrap();
+        let page = data.path().join("page.png");
+        let writer = crate::rotation_db::RotationDb::open_at(&path).unwrap();
+        writer
+            .set(&page, crate::rotation_db::Rotation::Cw90)
+            .unwrap();
+        assert_eq!(
+            context.rotation_for_remote_page(&page, &RemoteSubresource::File),
+            crate::rotation_db::Rotation::None
+        );
+        assert!(reader.state.lock().unwrap().is_err());
+    }
 
     #[cfg(windows)]
     #[test]
