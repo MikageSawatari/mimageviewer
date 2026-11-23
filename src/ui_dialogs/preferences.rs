@@ -134,6 +134,7 @@ pub(crate) fn draw_fullscreen_specified_scale_max_controls(
     pages::draw_fullscreen_specified_scale_max_controls(ui, max_tenths, dark_popup)
 }
 
+mod folder_background;
 mod name_colors;
 
 mod browser_integration;
@@ -144,6 +145,13 @@ mod hover_perf;
 mod pages;
 mod search_index;
 mod transfer;
+
+#[doc(hidden)]
+pub fn draw_folder_cell_background_settings_snapshot_fixture(ui: &mut egui::Ui) {
+    let mut settings = Settings::default();
+    settings.folder_cell_background.enabled = true;
+    folder_background::draw_settings(ui, &mut settings);
+}
 use self::pages::*;
 use self::search_index::{PrefSearchEntry, search_preferences};
 use self::transfer::PreferencesTransferFeedback;
@@ -3770,6 +3778,7 @@ impl App {
                             && organize_validation.is_ok()
                             && !collection_reorder_open
                             && state.settings.details_name_colors.valid_standard_custom()
+                            && state.settings.folder_cell_background.valid()
                             && name_colors::hex_input_ready(ctx),
                         egui::Button::new("  OK  "),
                     );
@@ -3798,8 +3807,10 @@ impl App {
                     } else if !name_colors::hex_input_ready(ctx) {
                         ui.colored_label(
                             ui.visuals().error_fg_color,
-                            "名前色: HEX は6桁で指定してください",
+                            "色: HEX は6桁で指定してください",
                         );
+                    } else if !state.settings.folder_cell_background.valid() {
+                        ui.colored_label(ui.visuals().error_fg_color, "フォルダの背景は文字とのコントラスト比が4.5:1以上の色を指定してください");
                     } else if !state.settings.details_name_colors.valid_standard_custom() {
                         ui.colored_label(
                             ui.visuals().error_fg_color,
@@ -6511,6 +6522,104 @@ mod tests {
     }
 
     #[test]
+    fn folder_cell_background_preferences_edit_ok_paints_and_invalid_blocks_ok() {
+        use egui_kittest::kittest::{NodeT, Queryable};
+        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        let label = "フォルダのセルの背景に色を付ける";
+        let hex = "フォルダ背景 Light HEX";
+        harness.get_by_label(label).click();
+        harness.run_steps(3);
+        // Exercise the real editor; no direct writes into the draft.
+        harness.get_by_label(hex).focus();
+        harness.run_steps(3);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run_steps(3);
+        harness.get_by_label(hex).type_text("FFF0B3");
+        harness.run_steps(3);
+        assert!(
+            harness
+                .get_by_label("  OK  ")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(!harness.state().settings.folder_cell_background.enabled);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run_steps(3);
+        harness.get_by_label(hex).type_text("FFFFE6");
+        harness.run_steps(3);
+        assert!(
+            !harness
+                .get_by_label("  OK  ")
+                .accesskit_node()
+                .is_disabled()
+        );
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        let expected = crate::folder_cell_background::FolderCellBackground {
+            enabled: true,
+            light: [255, 255, 230],
+            ..Default::default()
+        };
+        assert!(!harness.state().show_preferences);
+        assert_eq!(harness.state().settings.folder_cell_background, expected);
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().folder_cell_background,
+            expected
+        );
+        // The next actual thumbnail paint reads the accepted live setting.
+        let ctx = egui::Context::default();
+        crate::ui_fonts::configure_fonts(&ctx);
+        crate::os_theme::apply_resolved(&ctx, crate::os_theme::ResolvedTheme::Light);
+        let cell = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(180.0, 140.0));
+        let mut painted = false;
+        for _ in 0..2 {
+            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
+                egui::RawInput::default(),
+                |ctx| {
+                    ctx.root_ui(|root| {
+                        egui::CentralPanel::default().show(root, |ui| {
+                            crate::app::draw_cell(
+                                ui,
+                                cell,
+                                false,
+                                false,
+                                false,
+                                &Default::default(),
+                                &crate::grid_item::GridItem::Folder("写真".into()),
+                                &crate::grid_item::ThumbnailState::Failed,
+                                crate::rotation_db::Rotation::None,
+                                None,
+                                false,
+                                Default::default(),
+                                Default::default(),
+                                false,
+                                None,
+                                &harness.state().settings.folder_cell_background,
+                            );
+                        });
+                    });
+                },
+            ));
+            painted = output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.rect == cell && r.fill == egui::Color32::from_rgb(255,255,230)));
+        }
+        assert!(painted);
+        harness
+            .state_mut()
+            .open_preferences_page(PreferencesPage::Thumbnail);
+        harness.run_steps(3);
+        harness.get_by_label(label).click();
+        harness.run_steps(3);
+        harness.get_by_label("  OK  ").click();
+        harness.run_steps(3);
+        assert!(!harness.state().settings.folder_cell_background.enabled);
+        assert_eq!(
+            harness.state().settings.folder_cell_background.light,
+            expected.light
+        );
+    }
+
+    #[test]
     fn thumb_cover_auto_crop_binding_reload_ignores_reading_direction_and_disabled_binding() {
         use crate::settings::ReadingDirection::{Ltr, Rtl};
         for enabled in [false, true] {
@@ -6718,6 +6827,8 @@ mod tests {
         let label = "つながった表紙から表表紙を自動で切り出す (書庫・PDF の本)";
         let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
         for (cancel, expected) in [(true, false), (false, true), (true, true), (false, false)] {
+            harness.get_by_label(label).scroll_to_me();
+            harness.run_steps(3);
             harness.get_by_label(label).click();
             harness.run_steps(3);
             let before = harness.state().settings.thumb_cover_auto_crop;
@@ -6912,6 +7023,10 @@ mod tests {
             assert!(!harness.state().preferences_dialog_has_unsaved_changes());
             harness
                 .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
+                .scroll_to_me();
+            harness.run_steps(3);
+            harness
+                .get_by_role_and_label(egui::accesskit::Role::CheckBox, label)
                 .click();
             harness.run_steps(3);
             assert_eq!(
@@ -7048,6 +7163,10 @@ mod tests {
         use egui_kittest::kittest::Queryable;
 
         let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        harness
+            .get_by_label("ファイル名の表示幅を優先する")
+            .scroll_to_me();
+        harness.run_steps(3);
         harness.get_by_label("ファイル名の表示幅を優先する").click();
         harness.run_steps(3);
         assert!(!harness.state().settings.thumb_name_prioritize_width);
@@ -7095,6 +7214,10 @@ mod tests {
             .state_mut()
             .open_preferences_page(PreferencesPage::Thumbnail);
         harness.run_steps(3);
+        harness
+            .get_by_label("ファイル名の表示幅を優先する")
+            .scroll_to_me();
+        harness.run_steps(3);
         harness.get_by_label("ファイル名の表示幅を優先する").click();
         harness.run_steps(3);
         harness.get_by_label("キャンセル").click();
@@ -7112,9 +7235,13 @@ mod tests {
         let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
         assert!(!harness.state().preferences_dialog_has_unsaved_changes());
         let scale = harness.state().settings.ui_scale_factor;
+        harness.get_by_label("名前の文字サイズ:").scroll_to_me();
+        harness.run_steps(3);
         harness.get_by_label("名前の文字サイズ:").click();
         harness.run_steps(3);
         harness.get_by_label("175%").click();
+        harness.run_steps(3);
+        harness.get_by_label("名前の最大行数:").scroll_to_me();
         harness.run_steps(3);
         harness.get_by_label("名前の最大行数:").click();
         harness.run_steps(3);
@@ -7140,9 +7267,13 @@ mod tests {
             .open_preferences_page(PreferencesPage::Thumbnail);
         harness.run_steps(3);
         assert!(!harness.state().preferences_dialog_has_unsaved_changes());
+        harness.get_by_label("名前の文字サイズ:").scroll_to_me();
+        harness.run_steps(3);
         harness.get_by_label("名前の文字サイズ:").click();
         harness.run_steps(3);
         harness.get_by_label("125%").click();
+        harness.run_steps(3);
+        harness.get_by_label("名前の最大行数:").scroll_to_me();
         harness.run_steps(3);
         harness.get_by_label("名前の最大行数:").click();
         harness.run_steps(3);

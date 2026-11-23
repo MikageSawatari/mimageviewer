@@ -1418,6 +1418,10 @@ pub(super) fn page_thumbnail(ui: &mut egui::Ui, state: &mut PreferencesState) {
             "画像が表示された後も、左上の固定マークでフォルダ・書庫・画像などを見分けられます。",
         );
     });
+    anchored(ui, state, "thumbnail/folder-background", |ui, state| {
+        // フォルダのセルの背景に色を付ける
+        super::folder_background::draw_settings(ui, &mut state.settings);
+    });
     anchored(ui, state, "thumbnail/container-type-icon", |ui, state| {
         ui.label("代表画像の代わりに種類のアイコンで表示する:");
         ui.horizontal_wrapped(|ui| {

@@ -666,6 +666,10 @@ pub(crate) use grid_scroll::{
     GRID_SCROLL_MIN_VIEWPORT_H, GridAspectLayout, GridScrollGeometry, GridScrollState,
 };
 mod container_type_icon_fixture;
+mod folder_background_fixture;
+#[doc(hidden)]
+pub use folder_background_fixture::draw_folder_cell_background_snapshot_fixture;
+pub(crate) use folder_background_fixture::draw_samples as draw_folder_background_samples;
 mod grid_paint;
 #[doc(hidden)]
 pub use container_type_icon_fixture::draw_container_type_icon_snapshot_fixture;

@@ -390,6 +390,7 @@ preferences_policy! {
         grid_cursor_wrap: bool => ("サムネイルのカーソル折り返し", |_, _| true, plain, plain);
         remember_favorite_view_state: bool => ("お気に入りごとの表示設定", |_, _| true, plain, plain);
         details_name_colors: crate::details_name_colors::DetailsNameColors => ("詳細一覧の名前色", |v, _raw| v.valid_standard_custom(), plain, plain);
+        folder_cell_background: crate::folder_cell_background::FolderCellBackground => ("サムネイルのフォルダ背景", |v, _raw| v.valid(), plain, plain);
         grid_display_order: GridDisplayOrder => ("カテゴリの表示順", |v, _raw| v == &v.normalized(), plain, plain);
         video_thumbnail_indicator: VideoThumbnailIndicator => ("動画サムネイルの表示", |v, _raw| !matches!(v, VideoThumbnailIndicator::Unknown), plain, plain);
         audio_thumbnail_indicator: AudioThumbnailIndicator => ("音声サムネイルの表示", |v, _raw| !matches!(v, AudioThumbnailIndicator::Unknown), plain, plain);
@@ -1172,6 +1173,11 @@ mod tests {
             .excluded_extensions
             .insert("png".into());
         settings.details_name_colors.enabled = false;
+        settings.folder_cell_background = crate::folder_cell_background::FolderCellBackground {
+            enabled: true,
+            light: [255, 255, 230],
+            dark: [30, 35, 20],
+        };
         settings.details_name_colors.colors[0] =
             crate::details_name_colors::DetailsNameColor::Custom {
                 light: [80, 60, 0],
@@ -2173,6 +2179,55 @@ mod tests {
     }
 
     #[test]
+    fn folder_cell_background_transfer_roundtrip_and_invalid_rejection() {
+        use crate::folder_cell_background::FolderCellBackground;
+        for enabled in [false, true] {
+            let mut source = Settings::default();
+            source.folder_cell_background = FolderCellBackground {
+                enabled,
+                light: [255, 255, 230],
+                dark: [30, 35, 20],
+            };
+            let exported = export_preferences(&source).unwrap();
+            assert!(exported.issues.is_empty());
+            let mut destination = Settings::default();
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(
+                destination.folder_cell_background,
+                source.folder_cell_background
+            );
+            for invalid in [
+                json!({"enabled": enabled, "light": [255,240,179], "dark": [58,52,32]}),
+                json!({"enabled": enabled, "light": [255,244,204], "dark": [220,220,220]}),
+                json!({"enabled": enabled, "light": [256,244,204], "dark": [58,52,32]}),
+                json!({"enabled": "yes"}),
+            ] {
+                let parsed =
+                    parse_preferences(&document(json!({"folder_cell_background": invalid})))
+                        .unwrap();
+                assert_eq!(parsed.issues.len(), 1);
+                parsed.apply_to(&mut destination);
+                assert_eq!(
+                    destination.folder_cell_background,
+                    source.folder_cell_background
+                );
+            }
+            destination.folder_cell_background.light = [255, 240, 179];
+            let rejected = export_preferences(&destination).unwrap();
+            assert_eq!(rejected.issues.len(), 1);
+            assert!(
+                !serde_json::from_str::<serde_json::Value>(&rejected.json).unwrap()["preferences"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("folder_cell_background")
+            );
+        }
+    }
+
+    #[test]
     fn spread_shift_memory_transfer_preserves_policy_and_rejects_wrong_type() {
         let mut settings = Settings::default();
         let parsed =
@@ -2585,13 +2640,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 516);
+        assert_eq!(entries.len(), 517);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            171
+            172
         );
         assert_eq!(
             entries
@@ -2640,7 +2695,7 @@ mod tests {
                 "AI permissions must not become writable: {key}"
             );
         }
-        assert_eq!(wire.len(), 169);
+        assert_eq!(wire.len(), 170);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

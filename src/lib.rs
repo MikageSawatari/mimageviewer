@@ -236,6 +236,7 @@ pub mod filename_sort;
 pub mod filename_stack;
 pub mod filename_stack_script;
 mod final_composite;
+pub mod folder_cell_background;
 mod image_folder_zip;
 mod image_folder_zip_job;
 mod image_folder_zip_metadata;
@@ -507,7 +508,11 @@ pub mod ui_pinned_search;
 pub mod ui_toolbar_layout;
 mod ui_tools_menu;
 #[doc(hidden)]
+pub use app::draw_folder_cell_background_snapshot_fixture;
+#[doc(hidden)]
 pub use ui_dialogs::preferences::draw_details_name_color_settings_snapshot_fixture;
+#[doc(hidden)]
+pub use ui_dialogs::preferences::draw_folder_cell_background_settings_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_main::draw_color_presets_snapshot_fixture;
 #[doc(hidden)]

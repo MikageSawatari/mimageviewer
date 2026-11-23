@@ -134,3 +134,20 @@
 - 表示中の一覧は、設定の変更を次のフレームの描画で読むだけ (キャッシュも状態も持たない) ので、作り直しの処理は要らない。
 - 色の検査は 1 つの関数で、画面・取り込み・AI からの変更が共有する (§1.843 の「画面と検査が同じ定数」)。
 - まれな失敗 (設定の保存の失敗など) は既定の割り切り (既存の設定保存の経路のまま、新しい回復処理は足さない)。
+
+## 10. 実装で確認した構成
+
+- 設定型・既定色・背景の優先順は `src/folder_cell_background.rs`。
+  `cell_background` が `details_name_colors::category` を呼び、実描画の背景を決める。
+- 検索結果の文字色は同モジュールの `search_folder_path_color` / `search_count_color`。
+  `grid_paint.rs` の階層パスと、代表画像あり・なし両方の件数描画がこれらを使う。
+  `FolderCellBackground::valid` が両テーマ・両文字色を検査する。新たな直載せ文字色は同関数の一覧に追加する。
+- 色の入力は既存 `name_colors::draw_rgb_editor` を共用し、未完の HEX の OK 検査と IME 対応も共有する。
+  「既定の色に戻す」は ON / OFF を保ち、両テーマの色だけを戻す。
+- 見本は `app/folder_background_fixture.rs` から本物の `draw_cell` を呼ぶ。
+  代表画像は context が保持するメモリ内の単色テクスチャで、ファイル・worker を使わない。
+- `settings_transfer` の export 側に1鍵を追加し、§1.843 の第1段にも入る (export 170・除外側の印57・合計227)。
+- 新規テストは `folder_cell_background::tests`、`settings::tests`、`settings_transfer::tests`、
+  `settings_transfer::stage1::tests`、`ui_dialogs::preferences::tests` と
+  `ui_dialogs::preferences::folder_background::tests` に置く。
+  スナップショット定義4件は `tests/ui_snapshot.rs` の `folder_cell_background_*`。

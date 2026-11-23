@@ -157,6 +157,7 @@ pub fn draw_container_type_icon_snapshot_fixture(ui: &mut egui::Ui) {
                         AudioThumbnailIndicator::BottomLeftBadge,
                         false,
                         None,
+                        &crate::folder_cell_background::FolderCellBackground::default(),
                     );
                 });
             }

@@ -274,6 +274,7 @@ fn draw(ui: &mut egui::Ui, p: Preview) {
                         is_cut,
                         Some(0.42),
                         true,
+                        &crate::folder_cell_background::FolderCellBackground::default(),
                     );
                     if let Some(time) = layout.top_left.bookmark_time.as_ref() {
                         crate::ui_helpers::draw_overlay_bookmark_time_badge(
@@ -573,6 +574,7 @@ fn thumbnail_type_icon_real_paint_avoids_check_and_search_label() {
                             AudioThumbnailIndicator::MusicNoteIcon,
                             false,
                             meter.then_some(0.4),
+                            &crate::folder_cell_background::FolderCellBackground::default(),
                         );
                         assert!(hits.contains(layout.type_icon.as_ref().unwrap().rect.center()));
                     },
@@ -905,6 +907,7 @@ fn thumbnail_type_icon_all_states_contexts_and_hit_regions() {
                                             AudioThumbnailIndicator::BottomLeftBadge,
                                             false,
                                             None,
+                                            &crate::folder_cell_background::FolderCellBackground::default(),
                                         );
                                         for pos in [
                                             icon.rect.center(),
@@ -1103,6 +1106,7 @@ fn container_projection_paint(
                     AudioThumbnailIndicator::BottomLeftBadge,
                     false,
                     Some(0.4),
+                    &crate::folder_cell_background::FolderCellBackground::default(),
                 );
                 geometry = Some((layout, hits.rects().to_vec()));
             },

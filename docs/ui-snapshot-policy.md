@@ -1,3 +1,10 @@
+§1.880 は `folder_cell_background_settings_light` / `folder_cell_background_settings_dark`
+(720×520) と `folder_cell_background_cells_light` / `folder_cell_background_cells_dark`
+(630×500) の4定義を追加する。環境設定の本体 renderer と実際のセル painter を使う。
+セル見本は代表画像あり・アイコンのみ・検索結果・選択中・画像・書庫内フォルダ・チェック中・本・ドライブを描く。
+App・実ファイル・worker は使わず、代表画像はメモリ内の単色テクスチャ。
+PNG の生成・目視・通常比較は未実施で、ClaudeCode が行う。integration の `ui_snapshot` binary は既存の gpu group 対象。
+
 # UI スナップショットテスト運用方針
 
 §1.843 の AI 連携は、既存の `agent_integration_window_{disabled,read,open,organize,records}_{light,dark}`

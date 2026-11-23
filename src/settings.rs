@@ -4991,6 +4991,9 @@ pub struct Settings {
     /// 詳細一覧の名前列だけに適用するカテゴリ色。既存設定の欠落は既定 ON。
     #[serde(default)]
     pub details_name_colors: crate::details_name_colors::DetailsNameColors,
+    /// サムネイルのフォルダ背景。欠落時は既定 OFF、色は無効中も保持する。
+    #[serde(default)]
+    pub folder_cell_background: crate::folder_cell_background::FolderCellBackground,
     #[serde(default)]
     pub details_column_order: Vec<DetailsColumnId>,
     #[serde(default)]
@@ -8316,6 +8319,7 @@ impl Default for Settings {
             details_timestamp_show_seconds: false,
             details_row_style: DetailsRowStyle::default(),
             details_name_colors: crate::details_name_colors::DetailsNameColors::default(),
+            folder_cell_background: crate::folder_cell_background::FolderCellBackground::default(),
             details_column_order: Vec::new(),
             details_column_widths: Vec::new(),
             details_rated_at_width: None,
@@ -11926,6 +11930,41 @@ mod tests {
         assert_eq!(loaded.details_name_colors, DetailsNameColors::default());
         assert_eq!(loaded.details_name_width, 222.0);
         assert_eq!(loaded.text_contrast, TextContrast::Strong);
+    }
+
+    #[test]
+    fn folder_cell_background_missing_and_sqlite_roundtrip() {
+        use crate::folder_cell_background::FolderCellBackground;
+        let mut settings: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            settings.folder_cell_background,
+            FolderCellBackground::default()
+        );
+        settings.folder_cell_background = FolderCellBackground {
+            enabled: true,
+            light: [255, 255, 230],
+            dark: [30, 35, 20],
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(tmp.path()).unwrap();
+        db.save_full(&settings).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().folder_cell_background,
+            settings.folder_cell_background
+        );
+        drop(db);
+        let conn = rusqlite::Connection::open(tmp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'folder_cell_background'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(tmp.path()).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().folder_cell_background,
+            FolderCellBackground::default()
+        );
     }
 
     #[test]

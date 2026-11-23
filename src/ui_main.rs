@@ -6586,6 +6586,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 crate::settings::AudioThumbnailIndicator::default(),
                 is_cut,
                 None,
+                &crate::folder_cell_background::FolderCellBackground::default(),
             );
         });
     }
@@ -18718,6 +18719,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.settings.audio_thumbnail_indicator,
                     is_cut,
                     resume,
+                    &self.settings.folder_cell_background,
                 );
                 if self.grid_drop_hover(idx) {
                     crate::app::draw_grid_drop_target(ui.painter(), rect, ui.visuals());
@@ -22491,6 +22493,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         self.settings.audio_thumbnail_indicator,
                                         is_cut,
                                         resume,
+                                        &self.settings.folder_cell_background,
                                     );
                                     if let Some(title) = self.draw_bookmark_view_overlay(
                                         ui,
@@ -22637,6 +22640,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         self.settings.audio_thumbnail_indicator,
                                         is_cut,
                                         book_resume_meter,
+                                        &self.settings.folder_cell_background,
                                     );
                                 }
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
