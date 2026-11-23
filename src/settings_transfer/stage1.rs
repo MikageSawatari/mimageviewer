@@ -119,6 +119,9 @@ pub(super) fn stage1_decode<T: Serialize + DeserializeOwned>(
     raw: &Value,
     check: impl FnOnce(&T, &Value) -> bool,
 ) -> Option<T> {
+    // Only @prefs rows use this decoder. Export keys go through parse_items,
+    // including its key-specific accepts_null policy. Nullable @prefs values
+    // (for example resetting an output folder) retain their UI validators.
     validated(raw, check)
 }
 pub(super) fn unique_strings(v: &Vec<String>) -> bool {
@@ -413,6 +416,16 @@ impl Stage1Value for FullscreenWheelAction {
             ),
             (Self::Zoom, Self::Zoom.label().into()),
         ])
+    }
+}
+impl Stage1Value for FullscreenWheelZoomStep {
+    fn candidates() -> Option<Vec<(Self, String)>> {
+        Some(
+            Self::all()
+                .iter()
+                .map(|&step| (step, step.label().into()))
+                .collect(),
+        )
     }
 }
 impl Stage1Value for GridClickSelectionMode {
@@ -994,6 +1007,9 @@ mod tests {
         assert_eq!(rows.len(), keys.len());
         let (export, issues) = project(capture_export(&settings));
         assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(export.len(), 168);
+        assert_eq!(STAGE1_MARKED_ANCHORS.len(), 57);
+        assert_eq!(rows.len(), 225);
         for key in export.keys() {
             assert!(keys.contains(key.as_str()), "{key}");
         }
@@ -1036,6 +1052,97 @@ mod tests {
         assert_eq!(choices("folder_thumb_sort").len(), 4);
         assert!(!choices("fullscreen_fit_mode").contains(&json!("MarginFit")));
         assert!(!choices("archive_file_handling").contains(&json!("Legacy")));
+        assert_eq!(
+            choices("fullscreen_wheel_zoom_step"),
+            FullscreenWheelZoomStep::all()
+                .iter()
+                .map(|step| serde_json::to_value(step).unwrap())
+                .collect::<Vec<_>>()
+        );
+        let zoom = rows
+            .iter()
+            .find(|row| row.key == "fullscreen_wheel_zoom_step")
+            .unwrap();
+        for (choice, step) in zoom
+            .choices
+            .as_ref()
+            .unwrap()
+            .iter()
+            .zip(FullscreenWheelZoomStep::all())
+        {
+            assert_eq!(choice.label, step.label());
+        }
+        assert!(
+            stage1_validate(
+                &default_settings(),
+                &change("fullscreen_wheel_zoom_step", json!("Unknown"))
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn stage1_export_null_acceptance_matches_import_for_every_key() {
+        let mut settings = default_settings();
+        settings.fullscreen_n_scroll_wrap_step_percent = Some(50);
+        for key in wire_keys() {
+            let changes = change(key, Value::Null);
+            let imported = parse_items(&changes);
+            let accepts = imported.issues.is_empty() && imported.unknown_count == 0;
+            assert_eq!(
+                accepts,
+                key == "fullscreen_n_scroll_wrap_step_percent",
+                "{key}"
+            );
+            let candidate = stage1_validate(&settings, &changes);
+            assert_eq!(candidate.is_ok(), accepts, "{key}");
+            if accepts {
+                let mut imported_settings = settings.clone();
+                imported.apply_to(&mut imported_settings);
+                let candidate = candidate.unwrap();
+                assert_eq!(candidate.fullscreen_n_scroll_wrap_step_percent, None);
+                assert_eq!(
+                    candidate.fullscreen_n_scroll_wrap_step_percent,
+                    imported_settings.fullscreen_n_scroll_wrap_step_percent
+                );
+            }
+        }
+        for (raw, expected) in [
+            (json!(10), true),
+            (json!(100), true),
+            (json!(9), false),
+            (json!(101), false),
+            (json!(10.5), false),
+            (json!("50"), false),
+        ] {
+            let changes = change("fullscreen_n_scroll_wrap_step_percent", raw);
+            assert_eq!(parse_items(&changes).issues.is_empty(), expected);
+            assert_eq!(stage1_validate(&settings, &changes).is_ok(), expected);
+        }
+        let missing = change(
+            "update_check_enabled",
+            json!(!settings.update_check_enabled),
+        );
+        let mut imported = settings.clone();
+        parse_items(&missing).apply_to(&mut imported);
+        let candidate = stage1_validate(&settings, &missing).unwrap();
+        assert_eq!(candidate.fullscreen_n_scroll_wrap_step_percent, Some(50));
+        assert_eq!(
+            candidate.fullscreen_n_scroll_wrap_step_percent,
+            imported.fullscreen_n_scroll_wrap_step_percent
+        );
+    }
+    #[test]
+    fn stage1_marked_option_values_can_reset_to_ui_defaults() {
+        let mut settings = default_settings();
+        settings.ai_backend = Some("directml".into());
+        settings.capture_output_dir = Some(std::env::temp_dir().join("stage1-capture"));
+        let changes = Map::from_iter([
+            ("ai_backend".into(), Value::Null),
+            ("capture_output_dir".into(), Value::Null),
+        ]);
+        let candidate = stage1_validate(&settings, &changes).unwrap();
+        assert_eq!(candidate.ai_backend, None);
+        assert_eq!(candidate.capture_output_dir, None);
     }
     #[test]
     fn stage1_rejects_bad_batch_without_mutating_original() {
@@ -1110,6 +1217,9 @@ mod tests {
             "ring_shortcuts",
             "keymap",
             "ui_font",
+            "browser_integration_enabled",
+            "browser_view_output_dir",
+            "show_grid_edge_buttons",
         ] {
             assert!(!rows.iter().any(|row| row.key == key), "{key}");
             assert!(

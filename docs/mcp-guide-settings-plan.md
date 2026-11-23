@@ -318,16 +318,16 @@ AI アプリが起動したままだと、MCP exe は本体より古い版のこ
 
 設定の書き出し・取り込みの表 `preferences_policy!` (`src/settings_transfer.rs:181-777`) をそのまま使う。
 
-- export 側 164 項目: 項目名・型・日本語の表記・検証・読み書き。
-  **鍵の数は 165** (164 の field と、3 つの field をまとめた group の鍵 `still_bottom_chrome` 1 つ、`:259,434`)。
-  この文書の「164 項目」は field の数を指す (独立レビュー r3 P3)。
-- exclude 側 339 項目: 除外の理由つき。表示やツールバーの状態、利用データ (お気に入り・タグ・履歴)、
+- export 側 167 項目: 項目名・型・日本語の表記・検証・読み書き。
+  **鍵の数は 168** (167 の field と、3 つの field をまとめた group の鍵 `still_bottom_chrome` 1 つ、`:259,434`)。
+  field と鍵を区別する (独立レビュー r3 P3)。master 取り込みで値だけの 3 field が増えた。
+- exclude 側 344 項目: 除外の理由つき。表示やツールバーの状態、利用データ (お気に入り・タグ・履歴)、
   PC 固有のパス、外部ツール・フォント・LUT・Susie・VST、キー割り当て・リング、通信 (`update_check_enabled`・
   `remote_*`)、AI 連携の許可 (`agent_*`)、スクリプト (`stack_script_enabled`)。
 - 新しい項目をどちらかに入れないとビルドが通らない (`exhaustive_policy`、`:185-187`)。
 
 **この表は AI に扱わせる範囲の線ではない** (2026-11-21 利用者決定で置き直した、§6.4.1)。表は「別の PC へ持っていって
-よい環境設定」の線で、AI が扱う第 1 段の鍵は「export 側の 165 鍵」+「除外側のうち環境設定の下書きが持つ項目」
+よい環境設定」の線で、AI が扱う第 1 段の鍵は「export 側の 168 鍵」+「除外側のうち環境設定の下書きが持つ項目」
 (§6.4.3)。この表を使うのは、鍵・値の形・表示名・検査・新しい項目の分類の強制をそのまま借りるため。
 
 **export 側の鍵と値の形は、書き出しファイルの `preferences` の中身と同じ**にする (鍵は項目名、値は書き出しと同じ JSON)。
@@ -473,7 +473,7 @@ AI 連携の許可そのものだけ** (2026-11-21 利用者決定、§1)。画�
 
 #### 6.4.1 基準を「書き出し・取り込みの表」から置き直す理由
 
-書き出し・取り込みの表 (`preferences_policy!` の export 側 165 鍵) は「別の PC へ持っていってよい環境設定」の線で、
+書き出し・取り込みの表 (`preferences_policy!` の export 側 168 鍵) は「別の PC へ持っていってよい環境設定」の線で、
 除外側 339 項目には、利用者が画面で変えられる設定が多く入っている (キャッシュの容量、起動時のフォルダ、整理先、
 性能の調整、外部ツール、スタック用スクリプトの有効化、更新確認など)。AI に変えさせない線としては広すぎるので、
 基準を置き直す。
@@ -486,7 +486,7 @@ AI 連携の許可そのものだけ** (2026-11-21 利用者決定、§1)。画�
 
 | 持ち主 | 内容 | 件数の目安 | 段 |
 | --- | --- | --- | --- |
-| **環境設定の下書き** (OK で `apply_preferences_dialog` が確定) | export 側 165 鍵と、除外側のうち環境設定の画面で編集する項目 (起動時のフォルダ・本棚フォルダ・保存先・整理先・キャッシュ・性能・AI バックエンド・更新確認・リモートへの動画配信・外部ツール・スタック用スクリプトの有効化・Susie・VST3・フォント・メニューの並びなど) | 約 228 鍵 | **第 1 段** |
+| **環境設定の下書き** (OK で `apply_preferences_dialog` が確定) | export 側 168 鍵と、除外側のうち環境設定の画面で編集する項目 (起動時のフォルダ・本棚フォルダ・保存先・整理先・キャッシュ・性能・AI バックエンド・更新確認・リモートへの動画配信・外部ツール・スタック用スクリプトの有効化・Susie・VST3・フォント・メニューの並びなど) | 約 228 鍵 | **第 1 段** |
 | 環境設定の外の画面 (ツールバー・メニュー・右クリック・各パネル・操作カスタマイズ・リモート接続の窓) | 並べ替え・列数・表示形式・ツールバーの表示・キー割り当て・リング・補正パネルの値・リモート接続のオン / オフなど | 約 170 項目 | 第 2 段 |
 | AI 連携の窓 | AI 連携の許可 | 7 | 扱わない (§6.4.4) |
 
@@ -521,7 +521,7 @@ AI 連携の許可そのものだけ** (2026-11-21 利用者決定、§1)。画�
 
 #### 6.4.3 第 1 段の鍵の決め方
 
-- **export 側の 165 鍵**: 書き出しと同じ鍵・値の形・検査 (§6.1・§6.6)。
+- **export 側の 168 鍵**: 書き出しと同じ鍵・値の形・検査 (§6.1・§6.6)。
 - **環境設定が持つ除外側の項目**: `preferences_policy!` の除外側の行に、**環境設定が持つ印を付ける**。印は
   export 側の行と同じ形で、**表示名・検査・読み書き・編集している画面の anchor** を持つ
   (例: `parallelism => @prefs("並列処理のスレッド数", "parallelism/mode", |v, _| v.within_ui_range(), plain, plain)
@@ -552,7 +552,7 @@ AI 連携の許可そのものだけ** (2026-11-21 利用者決定、§1)。画�
     `video_seek_strip_locked` を書く、など) は、`still_bottom_chrome` と同じく 1 つの鍵にし、同じ helper を呼ぶ。
   - 互換の写し (`video_loop`・`archive_convert_without_dialog`)・内部の記録 (`update_check_dismissed_version`・
     `first_setup_completed` など) は印を付けない (設定ではない)。
-- 件数は約 228 鍵 (export 165 + 環境設定が持つ除外側 約 62 + 外部ツール・VST3 の一覧)。正確な一覧は実装の報告に入れる。
+- 確定した件数は 225 鍵 (export 168 + 除外側の印 57)。正確な一覧と分類は §17。
 - **大きな値**: どの鍵の値も、`get_settings` の 1 ページが最終の応答の形で予算に収まることをテストで検査する。
   1 つの値が収まらない場合、`get_settings` は既存の共通の決まり (「大きすぎる行は digest ID / too_long」、
   instructions の Common) に従って `too_long` を返す。**`set_settings` は、変更前後を含む応答の全体を確定の前に組み立てて
@@ -1244,11 +1244,20 @@ ZIP の prefix と PDF の 0 始まり `page_n` は既存の `list_folder` の�
 含めた静的見積もりは現時点の tools/list 43,959 字、残り草案込み 47,351 字 (予約枠 512 字を除いて 137 字残る)。
 detached 述語・viewport routing の変更は無い。実装担当は Cargo ビルド・テストを実行しない。
 
-C の実装 (2026-11-23、ビルド・テストは設計担当の共有 runner 待ち): 第 1 段は **222 鍵**
-(export 165 + 除外側の印 57)。型の trait が選択肢・変更行・外部ツールの登録例を作る。
+C の実装 (2026-11-23、master 取り込み後の修正は設計担当の共有 runner 待ち): 第 1 段は **225 鍵**
+(export 168 + 除外側の印 57。取り込み前は 222 = 165 + 57)。型の trait が選択肢・変更行・外部ツールの登録例を作る。
 export の検査と書き込みは既存の `parse_items` / `ParsedPreferences::apply_to` を通す。
 除外側も型付きで検査し、UI と範囲の定数を共有する。読み込み時の正規化は clone 上で要求鍵だけを
 検査し、要求していない項目は変えない。
+
+`28f9c5a11` から取り込んだ master の新規 Settings field は6つ。`fullscreen_wheel_zoom_step`・
+`fullscreen_n_scroll_wrap_step_percent`・`fullscreen_bound_drag_pan` は export の値だけの項目として第1段。
+ブラウザ連携の2つは §6.4.2 の worker 所有により第2段、`show_grid_edge_buttons` もツールバーが直接保存するため第2段
+(`src/ui_main.rs` の `draw_grid_edge_buttons_settings_menu`)。新たに `@prefs` を足す項目は無い。
+`FullscreenWheelZoomStep` の選択肢とラベルは UI と同じ `all()` / `label()` から作る。
+export の null 検査は AI も取り込みも `parse_items` を共有し、`fullscreen_n_scroll_wrap_step_percent` だけ許す。
+全168鍵の null と同項目の数値境界を両経路で比較する回帰を追加。除外側の印の付いた Option は取り込み対象外で、
+`stage1_decode` は各 UI の検査を保つ (保存先や AI backend の既定への復帰を許す)。
 
 `get_settings` は標準 snapshot を UI のメモリから読み、60 鍵ずつ、または keys/query の最大 32 鍵を返す。
 query は 200 文字以内。大きい行は既存の digest / too_long とし、最終の structured JSON と text copy の
@@ -1353,7 +1362,7 @@ instructions のガイド追加は 257 字、全体は 1,109 UTF-16 単位。
 - 第 1 段の外の鍵 (`agent_level` などの AI 連携の許可・`remote_service_enabled`・ツールバーの表示・`keymap`)・
   知らない鍵は、読む・変えるとも拒まれ、何も変わらない。`get_settings` のどの形にも出ない。拒否の理由が
   「AI からは変えられない」と「まだ変えられない」で分かれる。
-- 第 1 段の鍵 (export 側 165 鍵 + 除外側の印の付いた項目) は、すべて `get_settings` に出て、`set_settings` で変えられる
+- 第 1 段の鍵 (export 側 168 鍵 + 除外側の印の付いた項目) は、すべて `get_settings` に出て、`set_settings` で変えられる
   (`external_tools`・`stack_script_enabled`・`update_check_enabled`・`startup_folder_path`・`cache_policy` を含む)。
 - 除外側の印の付いた項目すべてについて、下書きの値が確定で残る (§6.4.3 のテスト)。
 - 除外側の値: serde で読めない値、画面の範囲・形の制約を外れる値 (`parallelism` の 65 スレッド、VST3 の 11 件・重複など)、
