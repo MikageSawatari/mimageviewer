@@ -26046,11 +26046,12 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// The fixed top bar may reserve image space only while the same chrome is drawable.
-    /// Keep this predicate shared with the draw gate so edit/capture/music modes cannot
-    /// leave an empty strip at the top of the fullscreen canvas.
+    /// Shared surface/mode gate for drawing, reserving space, and admitting new
+    /// top-bar presses. Overview owns its own header even while the ordinary
+    /// bar's previous-frame widget geometry is still recorded in this viewport.
     fn fullscreen_top_bar_chrome_allowed(&self, fs_idx: usize) -> bool {
-        !self.is_overlay_edit_mode_active()
+        self.page_overview.session().is_none()
+            && !self.is_overlay_edit_mode_active()
             && self.capture_region_selection.is_none()
             && !self.fs_music_view_active(fs_idx)
     }
