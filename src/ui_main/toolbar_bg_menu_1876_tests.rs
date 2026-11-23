@@ -88,11 +88,13 @@ fn background(harness: &Harness<'_, State>) -> egui::WidgetRect {
 fn child_rects(harness: &Harness<'_, State>) -> Vec<egui::Rect> {
     let all = widgets(harness);
     let content = harness.state().app.toolbar_content_rect.unwrap();
-    // Uis are registered too; their enclosing rectangles are not child controls.
-    // Retain every leaf widget, including hover-only labels and disabled buttons.
+    // Keep leaf controls inside the body, including hover-only labels and disabled
+    // buttons. Enclosing panel/frame widgets are not toolbar controls.
     all.iter()
         .filter(|widget| !all.iter().any(|child| child.parent_id == widget.id))
-        .filter(|widget| widget.visible && content.intersects(widget.rect))
+        .filter(|widget| {
+            widget.visible && widget.rect != content && content.contains_rect(widget.rect)
+        })
         .map(|widget| widget.rect)
         .collect()
 }
@@ -109,22 +111,18 @@ fn row_ends(harness: &Harness<'_, State>) -> [egui::Pos2; 2] {
     );
     let children = child_rects(harness);
     let points = [first.center().y, last.center().y].map(|y| {
-        // The first row may end in a control: use its rightmost empty gap.
-        let pos = (1..160)
-            .map(|offset| egui::pos2(content.right() - offset as f32 * 0.5, y))
-            .find(|&pos| content.contains(pos) && children.iter().all(|r| !r.contains(pos)))
-            .expect("empty space at the row's right end");
+        let pos = egui::pos2(content.right() - 1.0, y);
         assert!(content.contains(pos));
         assert!(children.iter().all(|rect| !rect.contains(pos)));
+        // Both rows must have trailing space, rather than an inter-widget gap.
+        assert!(
+            children
+                .iter()
+                .filter(|rect| rect.top() <= y && y <= rect.bottom())
+                .all(|rect| rect.right() < pos.x)
+        );
         pos
     });
-    // On the last row require trailing space, rather than an inter-widget gap.
-    assert!(
-        children
-            .iter()
-            .filter(|rect| { rect.top() <= points[1].y && points[1].y <= rect.bottom() })
-            .all(|rect| rect.right() < points[1].x)
-    );
     points
 }
 
@@ -161,7 +159,16 @@ fn section1876_empty_right_ends_open_visibility_menu_at_both_widths() {
         let mut harness = harness(width);
         harness.run();
         assert_eq!(harness.ctx.zoom_factor(), 1.0);
-        for pos in row_ends(&harness) {
+        let points = row_ends(&harness);
+        let rightmost_control = child_rects(&harness)
+            .iter()
+            .map(|rect| rect.right())
+            .reduce(f32::max)
+            .expect("toolbar controls");
+        // Also cover the panel space beyond the widest row's last control.
+        assert!(points[0].x > rightmost_control);
+        for pos in points {
+            assert!(background(&harness).interact_rect.contains(pos));
             secondary_click(&mut harness, pos);
             assert!(harness.query_by_label("表示するセクション").is_some());
             assert!(harness.query_by_label("既定に戻す").is_none());

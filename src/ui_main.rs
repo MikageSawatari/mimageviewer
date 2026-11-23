@@ -12001,6 +12001,8 @@ impl App {
             // 終了時に当 pass の矩形へ更新するので、古い矩形の再登録も 1 行への制限も不要。
             let folder_style = ui.style().clone();
             let scope_resp = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::CLICK), |ui| {
+                // 部品の右に残る空白も背景に含める。
+                ui.set_min_width(ui.available_width());
                 // ツールバー本体に toolbar スタイルを適用 (Yu Gothic の glyph 上寄り問題を
                 // FontTweak.y_offset で補正)。詳細: src/ui_fonts.rs の TOOLBAR_TEXT_FAMILY_NAME。
                 apply_toolbar_style(ui);
