@@ -852,6 +852,57 @@ fn remote_auto_trim_cache_key(
     })
 }
 
+/// A missing DB may be created by App after Remote starts. Only that state is
+/// reopened on a worker read; successful connections and open errors are retained.
+struct LateCreatedReadOnlyDb<T> {
+    path: PathBuf,
+    state: Mutex<Result<Option<T>, String>>,
+    open: fn(&Path) -> rusqlite::Result<Option<T>>,
+    label: &'static str,
+}
+
+impl<T> LateCreatedReadOnlyDb<T> {
+    /// Keep intentionally absent test readers independent of the process data_dir.
+    #[cfg(test)]
+    fn missing_fixture() -> Self {
+        Self::new(PathBuf::new(), |_| Ok(None), "fixture")
+    }
+
+    fn new(
+        path: PathBuf,
+        open: fn(&Path) -> rusqlite::Result<Option<T>>,
+        label: &'static str,
+    ) -> Self {
+        let db = Self {
+            path,
+            state: Mutex::new(Ok(None)),
+            open,
+            label,
+        };
+        drop(db.read(None));
+        db
+    }
+
+    fn read(
+        &self,
+        wait_stage: Option<&mut RemotePageStageGuard>,
+    ) -> MutexGuard<'_, Result<Option<T>, String>> {
+        let mut state = lock_with_remote_page_wait(&self.state, wait_stage, None);
+        if matches!(&*state, Ok(None)) {
+            // The opener checks existence once and never creates the DB. Do not
+            // add a second stat here or retry an actual open failure.
+            *state = (self.open)(&self.path).map_err(|error| {
+                crate::logger::log(format!(
+                    "remote_ipc: {} DB read-only open failed: {error}",
+                    self.label
+                ));
+                error.to_string()
+            });
+        }
+        state
+    }
+}
+
 pub(super) struct ContainerEngine {
     settings: Arc<crate::settings::Settings>,
     raw_develop_executor: Arc<crate::raw::RawDevelopExecutor>,
@@ -861,8 +912,8 @@ pub(super) struct ContainerEngine {
     stats: Arc<Mutex<crate::stats::ThumbStats>>,
     pdf_passwords: crate::pdf_passwords::PdfPasswordStore,
     pdf_page_counts: Mutex<HashMap<PdfIdentity, u32>>,
-    spread_db: Mutex<Result<Option<crate::spread_db::SpreadDb>, String>>,
-    view_trim_db: Mutex<Result<Option<crate::view_trim_db::ViewTrimDb>, String>>,
+    spread_db: LateCreatedReadOnlyDb<crate::spread_db::SpreadDb>,
+    view_trim_db: LateCreatedReadOnlyDb<crate::view_trim_db::ViewTrimDb>,
     resume_reader: Option<ResumeReader>,
     adjustment_settings: AdjustmentSettingsSource,
     creative_lut_cache: Mutex<RemoteCreativeLutCache>,
@@ -2717,23 +2768,16 @@ impl ContainerEngine {
         reading_settings: RemoteReadingSettingsSource,
         raw_develop_executor: Option<Arc<crate::raw::RawDevelopExecutor>>,
     ) -> Self {
-        let spread_db_path = crate::data_dir::get().join("spread.db");
-        let spread_db = crate::spread_db::SpreadDb::open_existing_read_only_at(&spread_db_path)
-            .map_err(|error| {
-                crate::logger::log(format!(
-                    "remote_ipc: spread DB read-only open failed: {error}"
-                ));
-                error.to_string()
-            });
-        let view_trim_db_path = crate::data_dir::get().join("view_trim.db");
-        let view_trim_db =
-            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&view_trim_db_path)
-                .map_err(|error| {
-                    crate::logger::log(format!(
-                        "remote_ipc: view trim DB read-only open failed: {error}"
-                    ));
-                    error.to_string()
-                });
+        let spread_db = LateCreatedReadOnlyDb::new(
+            crate::data_dir::get().join("spread.db"),
+            crate::spread_db::SpreadDb::open_existing_read_only_at,
+            "spread",
+        );
+        let view_trim_db = LateCreatedReadOnlyDb::new(
+            crate::data_dir::get().join("view_trim.db"),
+            crate::view_trim_db::ViewTrimDb::open_existing_read_only_at,
+            "view trim",
+        );
         let raw_develop_executor = raw_develop_executor.unwrap_or_else(|| {
             Arc::new(
                 crate::raw::RawDevelopExecutor::new(
@@ -2754,8 +2798,8 @@ impl ContainerEngine {
             stats: Arc::new(Mutex::new(crate::stats::ThumbStats::new())),
             pdf_passwords: crate::pdf_passwords::PdfPasswordStore::load(),
             pdf_page_counts: Mutex::new(HashMap::new()),
-            spread_db: Mutex::new(spread_db),
-            view_trim_db: Mutex::new(view_trim_db),
+            spread_db,
+            view_trim_db,
             resume_reader,
             adjustment_settings,
             creative_lut_cache: Mutex::new(RemoteCreativeLutCache::default()),
@@ -7266,10 +7310,7 @@ impl ContainerEngine {
         ),
         MediaError,
     > {
-        let db = self
-            .spread_db
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let db = self.spread_db.read(None);
         let db = db.as_ref().map_err(|error| {
             media_error(
                 MediaErrorCode::Internal,
@@ -7348,7 +7389,7 @@ impl ContainerEngine {
             &page_address.subresource,
         )
         .ok_or_else(|| media_error(MediaErrorCode::BadRequest, "表示トリム対象が不正です"))?;
-        let db_guard = lock_with_remote_page_wait(&self.view_trim_db, wait_stage, None);
+        let db_guard = self.view_trim_db.read(wait_stage);
         let db = match db_guard.as_ref() {
             Ok(db) => db,
             Err(error) => {
@@ -7414,10 +7455,7 @@ impl ContainerEngine {
                 &partner.subresource,
             )
             .ok_or_else(|| media_error(MediaErrorCode::BadRequest, "表示トリム対象が不正です"))?;
-            let db = self
-                .view_trim_db
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
+            let db = self.view_trim_db.read(None);
             let partner_override = db
                 .as_ref()
                 .ok()
@@ -10256,7 +10294,7 @@ pub(super) mod tests {
         session.install_book_composition_service(Some(service.clone()));
         let mut engine = ContainerEngine::new(Default::default());
         engine.session = Some(session);
-        *engine.spread_db.lock().unwrap() = Ok(None);
+        engine.spread_db = LateCreatedReadOnlyDb::missing_fixture();
         let address = RemoteAddress::file(root.to_string_lossy().into_owned());
         let resolved = engine.resolve(&address).unwrap();
         let projection = engine
@@ -10517,7 +10555,7 @@ pub(super) mod tests {
         session.install_book_composition_service(Some(service.clone()));
         let mut engine = ContainerEngine::new(Default::default());
         engine.session = Some(session);
-        *engine.spread_db.lock().unwrap() = Ok(None);
+        engine.spread_db = LateCreatedReadOnlyDb::missing_fixture();
         let db_path = temp.path().join("view_trim.db");
         let db = crate::view_trim_db::ViewTrimDb::open_at(&db_path).unwrap();
         db.set_book_state(
@@ -10545,7 +10583,7 @@ pub(super) mod tests {
             },
         )
         .unwrap();
-        *engine.view_trim_db.lock().unwrap() =
+        *engine.view_trim_db.state.lock().unwrap() =
             crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path)
                 .map_err(|error| error.to_string());
         let address = RemoteAddress::file(root.to_string_lossy().into_owned());
@@ -10733,7 +10771,7 @@ pub(super) mod tests {
                 ..Default::default()
             });
             engine.session = Some(session);
-            *engine.spread_db.lock().unwrap() = Ok(None);
+            engine.spread_db = LateCreatedReadOnlyDb::missing_fixture();
             let request = ContainerRequest {
                 address: RemoteAddress::file(root.to_string_lossy().into_owned()),
                 spread_mode: Some(RemoteSpreadMode::Single),
@@ -10904,7 +10942,7 @@ pub(super) mod tests {
                 final_cover_spread_enabled: false,
                 ..Default::default()
             });
-            *engine.spread_db.lock().unwrap() = Ok(None);
+            engine.spread_db = LateCreatedReadOnlyDb::missing_fixture();
             engine.session = Some(session);
             let page = RemoteAddress::file(root.join("000.png").to_string_lossy().into_owned());
             let resolved_page = engine.resolve(&page).unwrap();
@@ -11058,7 +11096,7 @@ pub(super) mod tests {
             session.install_spread_shift_service(Some(shifts));
             let mut engine = ContainerEngine::new(Default::default());
             engine.session = Some(session);
-            *engine.spread_db.lock().unwrap() = Ok(None);
+            engine.spread_db = LateCreatedReadOnlyDb::missing_fixture();
             let address = RemoteAddress::file(root.to_string_lossy().into_owned());
             let binding = RemoteWriteRequest::SetSpread {
                 address: address.clone(),
@@ -11422,7 +11460,7 @@ pub(super) mod tests {
                 .unwrap();
         session.install_spread_shift_service(Some(shift_service));
         let mut engine = ContainerEngine::new(crate::settings::Settings::default());
-        *engine.spread_db.lock().unwrap() = Ok(None);
+        engine.spread_db = LateCreatedReadOnlyDb::missing_fixture();
         engine.session = Some(session);
         let address = RemoteAddress {
             path: root.to_string_lossy().into_owned(),
@@ -16453,6 +16491,7 @@ pub(super) mod tests {
         });
         *engine
             .view_trim_db
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
             crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path)
@@ -16557,7 +16596,7 @@ pub(super) mod tests {
             margin_fit_enabled: true,
             ..Default::default()
         });
-        *engine.view_trim_db.lock().unwrap() = Ok(None);
+        engine.view_trim_db = LateCreatedReadOnlyDb::missing_fixture();
         let mut live = crate::settings_db::RemoteReadingSettings::from_settings(&engine.settings);
         live.auto_view_trim_default_enabled = true;
         live.margin_fit_enabled = false;
@@ -16595,7 +16634,7 @@ pub(super) mod tests {
         // A failed open must never turn into a missing row and inherit global Auto.
         live.auto_view_trim_default_enabled = true;
         engine.reading_settings = RemoteReadingSettingsSource::Snapshot(live.clone());
-        *engine.view_trim_db.lock().unwrap() = Err("fixture open failure".into());
+        *engine.view_trim_db.state.lock().unwrap() = Err("fixture open failure".into());
         assert!(matches!(
             engine
                 .remote_view_trim_plan(
@@ -16631,7 +16670,7 @@ pub(super) mod tests {
             margin_fit_enabled: true,
             ..Default::default()
         });
-        *engine.view_trim_db.lock().unwrap() =
+        *engine.view_trim_db.state.lock().unwrap() =
             crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path)
                 .map_err(|error| error.to_string());
         let page = favorite_address(&favorite, "book/page.png");
@@ -16697,6 +16736,7 @@ pub(super) mod tests {
         });
         *engine
             .view_trim_db
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
             crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path)
@@ -16771,6 +16811,7 @@ pub(super) mod tests {
         });
         *engine
             .view_trim_db
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
             crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path)
@@ -16860,6 +16901,7 @@ pub(super) mod tests {
         crate::settings_db::with_db_result(|db| db.save_full(&engine.settings)).unwrap();
         *engine
             .view_trim_db
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner()) =
             crate::view_trim_db::ViewTrimDb::open_existing_read_only_at(&db_path)
@@ -20160,7 +20202,7 @@ pub(super) mod tests {
             ReadingDirection::Rtl,
         )
         .unwrap();
-        *engine.spread_db.lock().unwrap() = Ok(Some(db));
+        *engine.spread_db.state.lock().unwrap() = Ok(Some(db));
         let open_book = || {
             let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
                 address: favorite_address(&favorite, "book"),
@@ -20202,6 +20244,7 @@ pub(super) mod tests {
         assert_eq!(
             engine
                 .spread_db
+                .state
                 .lock()
                 .unwrap()
                 .as_ref()
@@ -20302,7 +20345,7 @@ pub(super) mod tests {
                         },
                     ),
                 );
-                *engine.spread_db.lock().unwrap() = Ok(None);
+                engine.spread_db = LateCreatedReadOnlyDb::missing_fixture();
                 for relative in ["plain", "mixed"] {
                     let ContainerResponse::Success(payload) = engine.container(ContainerRequest {
                         address: favorite_address(&favorite, relative),
@@ -20360,7 +20403,7 @@ pub(super) mod tests {
         }
         std::fs::write(root.join("002.mp4"), b"video").unwrap();
         let favorite = FavoriteEntry::new("mixed".to_owned(), root.clone());
-        let engine = ContainerEngine::new(crate::settings::Settings {
+        let mut engine = ContainerEngine::new(crate::settings::Settings {
             favorites: vec![favorite.clone()],
             apply_default_spread_to_plain_folders: true,
             auto_fullscreen_image_folders: false,
@@ -20369,7 +20412,7 @@ pub(super) mod tests {
             sort_order: SortOrder::FileName,
             ..Default::default()
         });
-        *engine.spread_db.lock().unwrap() = Ok(None);
+        engine.spread_db = LateCreatedReadOnlyDb::missing_fixture();
         let listing = engine.recompute_folder_listing(&root).unwrap();
         assert!(!listing.sort_locked);
         assert_eq!(
@@ -20430,6 +20473,7 @@ pub(super) mod tests {
         });
         *engine
             .spread_db
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Ok(None);
         let open = |relative: &str| {
@@ -20486,6 +20530,7 @@ pub(super) mod tests {
             .unwrap();
         *engine
             .spread_db
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Ok(Some(writable));
 
@@ -20511,6 +20556,7 @@ pub(super) mod tests {
         });
         *engine
             .spread_db
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Ok(None);
 
@@ -20569,11 +20615,189 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn remote878_spread_db_created_after_engine_is_read_without_restart() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let path = data.path().join("spread.db");
+        let book = data.path().join("book.zip");
+        let engine = ContainerEngine::new(crate::settings::Settings::default());
+        for _ in 0..2 {
+            let (stored, ..) = engine.stored_spread_state(&book, None).unwrap();
+            assert_eq!(stored, crate::spread_db::StoredSpreadState::default());
+            assert_eq!(
+                stored.resolve_mode(
+                    crate::settings::SpreadMode::RtlCover,
+                    crate::settings::ReadingDirection::Rtl,
+                ),
+                crate::settings::SpreadMode::RtlCover
+            );
+            assert!(!path.exists(), "Remote must not create the DB");
+        }
+
+        let writer = crate::spread_db::SpreadDb::open_at(&path).unwrap();
+        writer
+            .set(
+                &book,
+                crate::settings::SpreadMode::Ltr,
+                crate::settings::SpreadMode::RtlCover,
+                crate::settings::ReadingFlow::Paged,
+                crate::settings::ReadingDirection::Ltr,
+            )
+            .unwrap();
+        let (stored, ..) = engine.stored_spread_state(&book, None).unwrap();
+        assert_eq!(stored.mode, Some(crate::settings::SpreadMode::Ltr));
+        assert_eq!(
+            stored.resolve_mode(
+                crate::settings::SpreadMode::RtlCover,
+                crate::settings::ReadingDirection::Rtl,
+            ),
+            crate::settings::SpreadMode::Ltr
+        );
+    }
+
+    #[test]
+    fn remote878_view_trim_db_created_after_engine_is_read_without_restart() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let path = data.path().join("view_trim.db");
+        let book = data.path().join("book");
+        std::fs::create_dir(&book).unwrap();
+        let page = book.join("page.png");
+        std::fs::write(&page, b"page").unwrap();
+        let engine = ContainerEngine::new(crate::settings::Settings {
+            auto_view_trim_default_enabled: false,
+            margin_fit_enabled: false,
+            fullscreen_fit_mode: crate::settings::FullscreenFitMode::Page,
+            ..Default::default()
+        });
+        let address = RemoteAddress::file(page.to_string_lossy().into_owned());
+        let resolved = engine.resolve(&address).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                engine
+                    .remote_view_trim_plan(
+                        &address,
+                        &resolved,
+                        None,
+                        crate::rotation_db::Rotation::None,
+                    )
+                    .unwrap(),
+                RemoteViewTrimPlan::Stored(None)
+            ));
+            assert!(!path.exists(), "Remote must not create the DB");
+        }
+
+        let margins = crate::view_trim::ViewTrimMargins {
+            left: 0.08,
+            right: 0.02,
+            ..Default::default()
+        };
+        let writer = crate::view_trim_db::ViewTrimDb::open_at(&path).unwrap();
+        writer
+            .set_book_state(
+                &book,
+                None,
+                crate::view_trim::ViewTrimBookState {
+                    preference: crate::view_trim::ViewTrimBookPreference::Manual,
+                    book_settings: crate::view_trim::ViewTrimBookSettings {
+                        enabled: true,
+                        single: margins,
+                        ..Default::default()
+                    },
+                },
+            )
+            .unwrap();
+        let plan = engine
+            .remote_view_trim_plan(
+                &address,
+                &resolved,
+                None,
+                crate::rotation_db::Rotation::None,
+            )
+            .unwrap();
+        assert!(matches!(plan, RemoteViewTrimPlan::Stored(bbox) if bbox == margins.bbox()));
+    }
+
+    #[test]
+    fn remote878_read_only_db_reuses_open_connection() {
+        static OPENS: AtomicUsize = AtomicUsize::new(0);
+        fn open(path: &Path) -> rusqlite::Result<Option<rusqlite::Connection>> {
+            OPENS.fetch_add(1, Ordering::Relaxed);
+            if !path.try_exists().unwrap() {
+                return Ok(None);
+            }
+            rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map(Some)
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("db.sqlite");
+        let db = LateCreatedReadOnlyDb::new(path.clone(), open, "fixture");
+        assert!(matches!(&*db.read(None), Ok(None)));
+        assert_eq!(OPENS.load(Ordering::Relaxed), 2);
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch("CREATE TABLE saved (value INTEGER)")
+            .unwrap();
+        {
+            let guard = db.read(None);
+            guard
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .execute_batch("CREATE TEMP TABLE connection_marker (value INTEGER)")
+                .unwrap();
+        }
+        assert_eq!(OPENS.load(Ordering::Relaxed), 3);
+        for _ in 0..2 {
+            let guard = db.read(None);
+            let connection = guard.as_ref().unwrap().as_ref().unwrap();
+            let count: i64 = connection
+                .query_row("SELECT COUNT(*) FROM connection_marker", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "connection-local TEMP table must survive");
+        }
+        assert_eq!(OPENS.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn remote878_read_only_db_retains_open_error() {
+        static OPENS: AtomicUsize = AtomicUsize::new(0);
+        fn open(path: &Path) -> rusqlite::Result<Option<()>> {
+            OPENS.fetch_add(1, Ordering::Relaxed);
+            if !path.try_exists().unwrap() {
+                return Ok(None);
+            }
+            Err(rusqlite::Error::InvalidQuery)
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        for exists_at_start in [true, false] {
+            let path = temp.path().join(format!("db-{exists_at_start}.sqlite"));
+            let before = OPENS.load(Ordering::Relaxed);
+            if exists_at_start {
+                std::fs::write(&path, b"fixture").unwrap();
+            }
+            let db = LateCreatedReadOnlyDb::new(path.clone(), open, "fixture");
+            if !exists_at_start {
+                assert!(matches!(&*db.read(None), Ok(None)));
+                std::fs::write(&path, b"fixture").unwrap();
+            }
+            for _ in 0..2 {
+                assert!(db.read(None).is_err());
+            }
+            let expected = before + if exists_at_start { 1 } else { 3 };
+            assert_eq!(OPENS.load(Ordering::Relaxed), expected);
+        }
+    }
+
+    #[test]
     fn spread_endpoint_schema_damage_returns_remote_error() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("spread.db");
         let engine = ContainerEngine::new(crate::settings::Settings::default());
-        *engine.spread_db.lock().unwrap() =
+        *engine.spread_db.state.lock().unwrap() =
             Ok(Some(crate::spread_db::SpreadDb::open_at(&path).unwrap()));
         rusqlite::Connection::open(&path)
             .unwrap()
@@ -20584,7 +20808,7 @@ pub(super) mod tests {
                 .stored_spread_state(Path::new("C:/books/book.zip"), None)
                 .is_err()
         );
-        *engine.spread_db.lock().unwrap() = Err("injected open failure".into());
+        *engine.spread_db.state.lock().unwrap() = Err("injected open failure".into());
         assert!(
             engine
                 .stored_spread_state(Path::new("C:/books/book.zip"), None)
@@ -20613,7 +20837,7 @@ pub(super) mod tests {
             singleton_spread_last_enabled: false,
             ..Default::default()
         });
-        *engine.spread_db.lock().unwrap() = Ok(Some(db));
+        *engine.spread_db.state.lock().unwrap() = Ok(Some(db));
         let resolved = resolve_existing(book.to_string_lossy().as_ref()).unwrap();
         let spread = engine
             .spread_payload(
@@ -20676,6 +20900,7 @@ pub(super) mod tests {
         });
         *engine
             .spread_db
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Ok(None);
         let request = |subresource| ContainerRequest {
@@ -20736,6 +20961,7 @@ pub(super) mod tests {
         });
         *engine
             .spread_db
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Ok(None);
         let request = ContainerRequest {
@@ -20805,6 +21031,7 @@ pub(super) mod tests {
         });
         *engine
             .spread_db
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Ok(None);
         for (mode, direction, white_side, real_screen_pos) in [
@@ -20886,6 +21113,7 @@ pub(super) mod tests {
         });
         *without_assist
             .spread_db
+            .state
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Ok(None);
         let request = ContainerRequest {

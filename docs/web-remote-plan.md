@@ -93,6 +93,9 @@ SQLite は DB ごとに journal 設定が異なる。特に `spread.db` は WAL 
 「本体が唯一の writer / remote-web は reader」を維持し、書き込みは App 所有ハンドルへ渡す。
 **この境界を崩す変更を入れないこと。**
 
+Remote が読む `spread.db` / `view_trim.db` が後から作られる場合は、未作成の間だけ読むたびにファイルの有無を見て read-only で開き直す。
+開けた接続は以後も使い、open エラーはログとともに保持して再試行しない。この処理は Remote worker 上で行う。
+
 remote-web 専用サムネイルキャッシュは §9 の縦串増分で撤去した。settings / catalog の writer は
 引き続き本体だけであり、remote-web はこれらへ書き込まない。
 
