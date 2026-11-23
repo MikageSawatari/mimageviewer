@@ -120,7 +120,7 @@
       本アプリは利用者の PC 上で動作するデスクトップアプリケーションです。
       <strong>開発者が利用者の個人情報を収集・送信・販売することはありません。</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年11月22日</p>
+    <p style="font-size:0.85rem; color:#888;">最終更新日: 2026年11月23日</p>
   </section>
 
   <section>
@@ -130,6 +130,7 @@
       アカウント登録やログインも不要です。<strong>開発者が利用者の情報や利用状況を受け取ることはありません</strong>。
       ファイルの場所や閲覧位置など利用に必要な情報は利用者の PC に保存されます。リモート閲覧の機能では、利用者の端末と PC の間でやり取りします。
       AI アプリとの連携では、AI アプリが情報を受け取り、その提供元へ送ります（「ネットワーク通信」を参照）。
+      ブラウザ拡張機能では、拡張機能が取得した画像と URL を、PC の中で mImageViewer に渡します。
     </p>
   </section>
 
@@ -304,8 +305,8 @@
   <section>
     <h2>ネットワーク通信</h2>
     <p>本アプリでは、次のような通信が発生します。</p>
-    <p>ブラウザ連携のために、mIV 本体が画像サイトへ接続することはありません。同じ PC の中継プログラムが保存した画像ファイルを受け取って開きます。
-      拡張の入手状況は <a href="manual/browser-integration.html#install-extension">マニュアル</a>をご覧ください。拡張による画像取得の通信と取り扱う情報は、拡張の公開に合わせてこのページへ追記します。</p>
+    <p>ブラウザ連携のために、mIV 本体が画像サイトへ接続することはありません。画像はブラウザの中の拡張機能が取得し、同じ PC の中継プログラムが保存した画像ファイルを mIV が受け取って開きます。
+      拡張機能の通信と取り扱う情報は、下の「<a href="#browser-extension">ブラウザ拡張機能「mIV で見る」</a>」をご覧ください。</p>
     <ul class="pink-list">
       <li><strong>更新確認</strong>: 新しいバージョンの有無を確認するため、配布元（GitHub）の公開リリース情報を取得します。通常の HTTP リクエストのみで、個人を特定する情報は送信しません。</li>
       <li><strong>任意コンポーネントのダウンロード</strong>: 利用者が自ら選択した場合に限り、AI 高速化用コンポーネント等を配布元から取得します。AI 説明文のモデル、文字起こしのモデルと 3D 写真用の深度モデルは、確認画面でダウンロードを選んだときだけ mImageViewer の GitHub Releases から取得します。説明文の作成・文字起こし・奥行きの計算のために、画像や画像内の文字、動画・音声の音声を送信しません。</li>
@@ -337,6 +338,10 @@
         <a href="manual/ai-integration.html">使い方と渡る情報を見る</a></li>
       <li><strong>クリップボード取り込み</strong>: クリップボードの取り込み監視は、環境設定のチェックが ON の間だけ動きます。コピーしたページの画像は、選択ダイアログを開いたときに、画像の URL へ GET を送って取得します。User-Agent は <code>mImageViewer/&lt;版&gt;</code> です。<br>
         参照元はブラウザの既定と同じ規則（strict-origin-when-cross-origin）で送ります。同じオリジン（通信方式・ホスト名・ポート）にはページの URL、別のオリジンにはオリジンだけを送り、HTTPS から HTTP へは送りません。ページの URL から認証情報と「#」以降を除きます。Cookie やブラウザのログイン情報は使わず、送信もしません。この機能では、画像取得のための通信以外に、コピー内容や画像を送信・収集しません。<a href="manual/clipboard-capture.html">使い方を見る</a></li>
+      <li><strong>ブラウザ拡張機能「mIV で見る」（使う場合のみ）</strong>: 画像を右クリックして「mIV で見る」を選んだときだけ、ブラウザの中の拡張機能がその画像を取得します。
+        画像が画像ファイルの名前のリンクで包まれているときは、先にリンク先を取得し、リンク先が画像でなければ、ページに表示されている画像を取得します。別のアドレスへ転送されるときは、転送先にも要求します。
+        要求にはそのサイトの Cookie が付きます。取得する画像ごとの最初の要求には、ページや画像の参照元の設定に関係なく、参照元としてページのオリジン（通信方式・ホスト名・ポート）を送り、パスや検索語は送りません。転送先への要求の参照元は、ブラウザの通常の動作に従います。
+        取得の前に、そのサイトへのアクセスの許可を Chrome（または Edge）の確認で求めます。取得した画像と URL は PC の中で mImageViewer に渡すだけで、開発者へは送りません。<a href="#browser-extension">詳しく見る</a></li>
       <li><strong>リモート閲覧（既定では無効）</strong>: 利用者が自ら有効にした場合に限り、
         PC 内で待ち受けを始め、利用者自身のスマートフォンやタブレットのブラウザへ画像・動画・音声を送ります。
         複数の音声トラックがある動画では、トラックの番号と表示名の一覧、および選んだトラックの音声が端末へ渡ります。
@@ -352,10 +357,25 @@
     <p>音楽ビデオエディタはネットワーク通信を行いません。音声の解析・プレビュー・動画の作成は PC 内で処理します。</p>
     <p>EPUB は PC 内で PDF に変換し、本に含まれる外部サイトへの要求を遮断します。Windows または Edge WebView2 に管理者や利用者がポリシーを設定している場合は、その設定に従います。</p>
     <p>
-      これらの通信先（GitHub / mikage.to、Microsoft、撮影地点を地図で開く場合の Google、リモート閲覧を使う場合の Tailscale、クリップボード取り込みで画像を取得するサイト、AI アプリの提供元等）は、各社のプライバシーポリシーに従って
+      これらの通信先（GitHub / mikage.to、Microsoft、撮影地点を地図で開く場合の Google、リモート閲覧を使う場合の Tailscale、クリップボード取り込みやブラウザ拡張機能で画像を取得するサイト、AI アプリの提供元等）は、各社のプライバシーポリシーに従って
       通常のアクセスログ（IP アドレス等）を記録する場合がありますが、
       <strong>開発者がそれらの情報を取得・利用することはありません。</strong>
     </p>
+  </section>
+
+  <section id="browser-extension">
+    <h2>ブラウザ拡張機能「mIV で見る」</h2>
+    <p>ブラウザで見ている画像を mImageViewer で開くための拡張機能です（Chrome ウェブストアと Microsoft Edge アドオンで配布します）。拡張機能を入れていない場合や、「mIV で見る」を選ばない場合、以下の動作は起きません。</p>
+    <ul class="pink-list">
+      <li><strong>取り扱う情報</strong>: 「mIV で見る」を選んだ画像と、その画像の URL・ページの URL です。窓の位置を合わせるために、そのタブの窓の位置と大きさ、ページの拡大率、直前の右クリックの位置も読みます。ページの文章や入力内容は読みません。</li>
+      <li><strong>サイトへのアクセスの許可</strong>: インストールしたときには、どのサイトへのアクセスも求めません。初めてのサイトで「mIV で見る」を選んだときに、画像のサイトとページのサイトへのアクセスを Chrome（または Edge）の確認で求めます。
+        許可したサイトのページでは、直前の右クリックの位置を覚える小さなスクリプトが動きます。この記録はふだんはそのページの中に置くだけで、「mIV で見る」を選んだときだけ、窓の位置を決めるために PC の中の中継プログラムへ渡します。許可はブラウザの拡張機能の設定で取り消せます。</li>
+      <li><strong>通信</strong>: 選んだ画像を取得するときだけ通信します（「ネットワーク通信」を参照）。参照元をページのオリジンにする一時的な設定は、取得する画像のアドレスだけに効き、その取得が終わると消します。転送先への要求とほかの通信は変えません。</li>
+      <li><strong>PC の中での受け渡し</strong>: 拡張機能は、画像と、選んだ画像の URL・転送を追った後の URL・ページの URL、窓と右クリックの位置の値を、同じ PC にある mImageViewer の中継プログラムへ渡します。中継プログラムが画像を保存し、mImageViewer で開きます。保存先と出どころの記録は「<a href="#browser-integration-data">ブラウザ連携の登録と保存先</a>」をご覧ください。</li>
+      <li><strong>拡張機能が覚えること</strong>: 処理中の 1 件だけを、ブラウザを閉じると消える領域に置きます。閲覧の履歴は記録しません。</li>
+      <li><strong>削除</strong>: 拡張機能はブラウザの拡張機能の設定から削除できます。mImageViewer の連携の解除やアンインストールでは、拡張機能は削除されません。</li>
+    </ul>
+    <p>この拡張機能も mImageViewer も、取得した画像・URL・右クリックの位置を開発者や第三者へ送ることはなく、販売や広告にも使いません。</p>
   </section>
 
   <section>
@@ -418,7 +438,7 @@
       mImageViewer ("the App") respects your privacy. The App is a desktop application that
       runs on your PC. <strong>The developer does not collect, transmit, or sell your personal information.</strong>
     </p>
-    <p style="font-size:0.85rem; color:#888;">Last updated: November 22, 2026</p>
+    <p style="font-size:0.85rem; color:#888;">Last updated: November 23, 2026</p>
   </section>
 
   <section>
@@ -430,6 +450,7 @@
       and viewing positions, is stored on your PC. For remote viewing, this information travels between your
       device and your PC.
       With AI integration, the AI app receives information and sends it to its provider; see "Network communication" below.
+      With the browser extension, the extension passes the images and URLs it fetches to mImageViewer within your PC.
     </p>
   </section>
 
@@ -580,8 +601,8 @@
 
   <section>
     <h2>Network communication</h2>
-    <p>For browser integration, mIV itself does not connect to image sites. It opens an image file saved by the handoff program on the same PC.
-      See the <a href="manual/browser-integration.html#install-extension">manual for extension availability</a>. Details of the extension's image retrieval and the information it handles will be added here when the extension is published.</p>
+    <p>For browser integration, mIV itself does not connect to image sites. The extension in your browser fetches the image, and mIV opens the image file saved by the handoff program on the same PC.
+      For the extension's network activity and the information it handles, see <a href="#browser-extension-en">Browser extension "View in mIV"</a> below.</p>
     <p>Network activity includes the following:</p>
     <ul class="pink-list">
       <li><strong>Update check</strong>: to see whether a newer version exists, the App retrieves the public release information from the distribution source (GitHub). This is an ordinary HTTP request and includes no personally identifying information.</li>
@@ -614,6 +635,10 @@
         <a href="manual/ai-integration.html">Read about setup and shared information</a></li>
       <li><strong>Clipboard capture</strong>: capture monitoring runs only while its checkboxes in Preferences are on. When you open the image selection dialog for a copied page, the App fetches its images by sending GET requests to the image URLs. Its User-Agent is <code>mImageViewer/&lt;version&gt;</code>.<br>
         Referrers follow the browser's default rule (strict-origin-when-cross-origin): the page URL for the same origin (scheme, host, and port), only the origin for a different origin, and no referrer when going from HTTPS to HTTP. Credentials and the fragment after "#" are removed from the page URL. Cookies and browser login information are neither used nor sent. This feature does not send or collect clipboard contents or images beyond the requests needed to fetch the images. <a href="manual/clipboard-capture.html">Read the manual</a></li>
+      <li><strong>Browser extension "View in mIV" (only if you use it)</strong>: only when you right-click an image and choose "View in mIV", the extension in your browser fetches that image.
+        If the image is wrapped in a link whose name looks like an image file, it fetches the link target first, and if the target is not an image, it fetches the image shown on the page instead. If a request is redirected, the redirect target is requested too.
+        Requests carry that site's cookies. The first request for each image sends the page's origin (scheme, host, and port) as the referrer, regardless of the page's or image's referrer settings, without the path or query. The referrer of requests after a redirect follows the browser's normal behavior.
+        Before fetching, Chrome (or Edge) asks for your permission to access that site. The image and its URLs are passed only to mImageViewer within your PC and are not sent to the developer. <a href="#browser-extension-en">Learn more</a></li>
       <li><strong>Remote viewing (off by default)</strong>: only when you turn it on, the App
         starts listening inside your PC and sends images, video, and audio to a browser on your own phone or
         tablet. For videos with multiple audio tracks, the device receives a list of track numbers and display names,
@@ -628,10 +653,25 @@
     <p>The music video editor does not initiate network communication. Audio analysis, previews, and video creation are processed on your PC.</p>
     <p>The App converts EPUB to PDF on your PC and blocks requests to external sites included in the book. If an administrator or user has configured Windows or Edge WebView2 policies, conversion follows those settings.</p>
     <p>
-      These endpoints (GitHub / mikage.to, Microsoft, Google when you open a shooting location on a map, Tailscale when you use remote viewing, the sites that serve images fetched by clipboard capture, AI app providers, etc.) may record standard access logs (such as IP
+      These endpoints (GitHub / mikage.to, Microsoft, Google when you open a shooting location on a map, Tailscale when you use remote viewing, the sites that serve images fetched by clipboard capture or the browser extension, AI app providers, etc.) may record standard access logs (such as IP
       addresses) under their own privacy policies, but <strong>the developer does not obtain or
       use that information.</strong>
     </p>
+  </section>
+
+  <section id="browser-extension-en">
+    <h2>Browser extension "View in mIV"</h2>
+    <p>An extension that opens images you are viewing in your browser in mImageViewer (distributed on the Chrome Web Store and Microsoft Edge Add-ons). None of the following happens if the extension is not installed or you do not choose "View in mIV".</p>
+    <ul class="pink-list">
+      <li><strong>Information it handles</strong>: the image you choose with "View in mIV", its image URL, and the page URL. To place the window, it also reads the tab's window position and size, the page zoom, and the position of your last right-click. It does not read page text or anything you type.</li>
+      <li><strong>Site access</strong>: it requests no site access at install time. The first time you choose "View in mIV" on a site, Chrome (or Edge) asks for permission to access the image's site and the page's site.
+        On pages of sites you allow, a small script remembers the position of your last right-click. This record normally stays inside the page and is passed to the handoff program on your PC only when you choose "View in mIV", to place the window. You can revoke access in the browser's extension settings.</li>
+      <li><strong>Network</strong>: it communicates only to fetch the chosen image (see "Network communication"). The temporary setting that makes the referrer the page's origin applies only to the address of the image being fetched and is removed when that fetch finishes. Requests after a redirect and all other requests are not changed.</li>
+      <li><strong>Handoff within your PC</strong>: the extension passes the image, the chosen image URL, the URL after any redirect, the page URL, and the window and right-click position values to the mImageViewer handoff program on the same PC. The handoff program saves the image and opens it in mImageViewer. For the save location and the origin record, see <a href="#browser-integration-data-en">Browser integration registration and saved images</a>.</li>
+      <li><strong>What the extension keeps</strong>: only the one request in progress, in storage that is cleared when the browser closes. It does not record your browsing history.</li>
+      <li><strong>Removal</strong>: you can remove the extension in the browser's extension settings. Unregistering browser integration or uninstalling mImageViewer does not remove the extension.</li>
+    </ul>
+    <p>Neither this extension nor mImageViewer sends the images, URLs, or right-click positions to the developer or any third party, and they are not sold or used for advertising.</p>
   </section>
 
   <section>
