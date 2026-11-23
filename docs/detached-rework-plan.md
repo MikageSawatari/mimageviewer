@@ -1458,6 +1458,17 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-23: コレクションの一覧の要求の印が今の context のものかを読み取りで確かめる (§1.851、viewer_context_audit A4)
+
+- `ContextRef::collection_grid_request_stamp_is_current` (`b5057ecca`、§1.851「見つからない項目をすべて外す」) も、A4 の許可リストに未登録だった。§1.818 の 3 件と同じ CI の実行で落ちた。
+- 関数は読み取りだけ。mount 中または退避中の、その context 自身の `top_level_grid_view` と items の世代を、要求の印と照らす。mount も変更もしない。既存の `grid_scroll`・`page_overview_view` と同じ種類の読み取りの投影なので、許可リストに足した。
+- §1.851 の作業時には、「症状パッチではなく構造的修正」への独立レビューの合意が取られていなかった。設計担当 ClaudeCode は、読み取りだけで detached の述語・viewport の経路を変えないので、凍結の決まりの対象外と判断した。
+- 独立レビュー (GPT-6.1 Sol / xhigh、read-only、HEAD `1f395db46`、2026-11-23) で合意 (指摘なし)。
+  - 確かめた範囲: 関数本体、App 側の判定 (`collection_grid.rs`)、`collections.rs` の呼び出し元。
+  - 確かめた点: 印が古いときは受付の中止・取消を利用者に通知し、他の context や窓を変えない。
+  - `b5057ecca` が `viewer_context_registry.rs` に入れたのは、この関数の 17 行だけ。
+  - レビュー担当の言葉:「対象 API は所有 context の一覧状態を mount せず照合する読み取り専用関数であり、古い削除要求も通知付きで拒否するため、detached 周りの症状パッチには該当しないと独立レビューで合意した。」
+
 ### 2026-11-22: ブラウザから重ねて開く窓 (§1.818 段 2) の着手前の合意 (計画の段階。実装はこれから)
 
 **変更の内容** (正本は [browser-to-miv-plan.md](browser-to-miv-plan.md) §9 と [browser-to-miv-impl-plan.md](browser-to-miv-impl-plan.md))
@@ -1487,6 +1498,11 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 - **段階 3 の実装 (2026-11-22、`5f631f116`)**: 独立レビューで ACCEPT、凍結の決まりの構造的変更 (実装) にも合意。用途は生成時に固定、終了は削除の前に捕捉した `DetachedCloseOwner` の値で決め、F12 は対象の窓の用途で共通の入口とメニューが断る。`Normal` の既存の経路に退行は見つからなかった。関連テスト 156 件成功。
 - **段階 4 の実装 (2026-11-22、`b92b6e243`・`d6623e62c`)**: 1 回目は REVISE で不合意 (P1: 前の linked 窓の置換による終了が、新しく作った DirectMedia reader の一覧を戻して要求の画像を開けなくする。新旧の reader の所有境界が成り立っていない)。前の reader の終了を新しい reader を作る前に完了させ、要求を保って引き継ぐ形に直し、2 回目で ACCEPT、凍結の決まりの構造的変更 (実装) にも合意。関連テスト 190 件成功。本体 lib の全件 19,659 件は `b92b6e243` で成功 (P1 の修正の前)。
 - **段階 5 の実装 (2026-11-22、`6c07dc523`・`fb20fbbe5`・`201f8fdb6`)**: 構造 (要求を既存の受付の所有へ合流させる) には 1 回目から合意。通信の終端で P1 (応答の直後の切断が未読の応答を捨てる) と P2 (接続を保持するクライアントに上限が無い) を直し、3 回目で ACCEPT・合意。launcher のテストは release の入力が要るため段階 6 の後に流す。
+- **viewer_context_audit A4 への登録 (2026-11-23、v5.6.0 の公開後)**: 段階 3 の `retire_context_with_close_owner`・`close_and_retire_context_with_close_owner` (`5f631f116`) と、段階 4 の `fork_materialized_still_context_with_seed` (`b92b6e243`) が、A4 (公開 API の fingerprint) の許可リストに未登録だった。push 後の CI の監査で落ちた。
+  - 段階の作業の検証に、この監査が入っていなかった。監査はローカルのスクリプト (test-focused / test-lib-full / test-full) にも、各段階の指示書にも無い。CI でしか動かず、ブランチは push しなかったので、master の push まで誰も流さなかった。
+  - 関数の中身は上の段階 3・4 の合意の範囲のままで、変えていない。fingerprint と理由だけを許可リストに足した。
+    - `*_with_close_owner`: 捕捉済みの終了方針を受ける入口。既存の `retire_context` / `close_and_retire_context` は、捕捉してから委譲する。
+    - `fork_materialized_still_context_with_seed`: 新しい context だけを 1 回 mount して、自分の窓を種で結ぶ。
 
 **段階2の実装引き継ぎ (2026-11-22、検証・独立レビュー待ち)**
 
