@@ -438,7 +438,13 @@ fn page_turn_permission_service_vacant_composed_handler_starts_and_completes_bot
                         &app.page_turn_presentation.state
                     {
                         Some((
-                            prepare_leaf(&outgoing, incoming, target > from).err(),
+                            prepare_leaf(
+                                &outgoing,
+                                incoming,
+                                target > from,
+                                PageTurnAnimationStyle::Curl,
+                            )
+                            .err(),
                             canonical_unit(&outgoing),
                             canonical_unit(incoming),
                         ))

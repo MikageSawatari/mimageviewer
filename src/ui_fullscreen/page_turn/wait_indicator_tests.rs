@@ -499,15 +499,7 @@ fn page_wait_indicator_appears_while_initial_spread_output_is_unaccepted_and_inc
         };
         assert_eq!(*clock, MotionClock::AwaitingAcceptedOutput);
         assert_eq!(clock.progress(first_output_at, offer.duration), 0.0);
-        let initial = crate::page_turn_animation::project_prepared(
-            &projection.outgoing,
-            &projection.incoming,
-            projection.direction,
-            projection.recipe,
-            0.0,
-            false,
-        )
-        .unwrap();
+        let initial = projection.project(0.0, false).unwrap();
         assert!(
             initial
                 .visibility

@@ -65,7 +65,7 @@ fn render(ctx: &egui::Context, app: &mut App, navigation: bool) -> egui::FullOut
     if let (Some(outgoing), PresentationState::Flat(incoming)) =
         (admitted, &app.page_turn_presentation.state)
     {
-        let reason = prepare_leaf(&outgoing, incoming, true).err();
+        let reason = prepare_leaf(&outgoing, incoming, true, PageTurnAnimationStyle::Curl).err();
         panic!(
             "accepted fixture did not curl: {reason:?}; outgoing={:?}; incoming={:?}; events={:?}",
             outgoing.pages[0].transform,
@@ -141,20 +141,14 @@ fn assert_curl(app: &App, output: &egui::FullOutput, progress: f32) {
             take_test_events()
         );
     };
-    let expected = crate::page_turn_animation::project_prepared(
-        &projection.outgoing,
-        &projection.incoming,
-        projection.direction,
-        projection.recipe,
-        progress,
-        false,
-    )
-    .unwrap()
-    .meshes
-    .into_iter()
-    .filter(|draw| is_crop(&draw.mesh))
-    .map(|draw| (draw.clip_rect, draw.mesh))
-    .collect::<Vec<_>>();
+    let expected = projection
+        .project(progress, false)
+        .unwrap()
+        .meshes
+        .into_iter()
+        .filter(|draw| is_crop(&draw.mesh))
+        .map(|draw| (draw.clip_rect, draw.mesh))
+        .collect::<Vec<_>>();
     assert!(
         !expected.is_empty(),
         "visible crop faces at progress={progress}"

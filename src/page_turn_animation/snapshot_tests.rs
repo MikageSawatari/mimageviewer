@@ -1803,3 +1803,167 @@ fn page_turn_projection_snapshot_crop_flat_front_back_canonical() {
     snapshots.extend(snapshot_scene(true, true, true, SceneGeometry::Crop));
     snapshots.unwrap();
 }
+
+/// Independent ordinary flat quads: CPU projection clips its polygons, while
+/// this path leaves the saved placement intact and clips only in the painter.
+fn paint_slide_endpoint_flat(painter: &egui::Painter, unit: &CanonicalUnit) {
+    for page in &unit.pages {
+        if vacant(page) {
+            continue;
+        }
+        for layer in page.underlay.iter().chain(std::iter::once(&page.material)) {
+            let (texture, color) = material_style(layer);
+            let domain = material_domain(layer);
+            let placement = Rect::from_min_max(
+                pos2(
+                    page.rect.left() + domain.left() * page.rect.width(),
+                    page.rect.top() + domain.top() * page.rect.height(),
+                ),
+                pos2(
+                    page.rect.left() + domain.right() * page.rect.width(),
+                    page.rect.top() + domain.bottom() * page.rect.height(),
+                ),
+            );
+            let mut mesh = Mesh::with_texture(texture);
+            for (position, display) in rectangle(placement).into_iter().zip(rectangle(domain)) {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: position,
+                    uv: material_uv(layer, display),
+                    color,
+                });
+            }
+            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+            painter
+                .with_clip_rect(page.clip_rect)
+                .add(egui::Shape::mesh(mesh));
+        }
+        if let Some(crop) = page.crop {
+            for draw in project_flat_crop(page.rect, page.clip_rect, &rectangle(page.rect), crop) {
+                painter
+                    .with_clip_rect(draw.clip_rect)
+                    .add(egui::Shape::mesh(draw.mesh));
+            }
+        }
+    }
+}
+
+#[test]
+fn page_turn_projection_snapshot_slide_endpoint_matches_flat_at_fractional_dpi() {
+    for pixels_per_point in [1.25_f32, 1.5] {
+        let flat = Arc::new(AtomicBool::new(false));
+        let draw_flat = flat.clone();
+        let mut textures = None;
+        let mut harness = crate::test_ui::builder()
+            .with_size(vec2(640.0, 480.0))
+            .with_pixels_per_point(pixels_per_point)
+            .build_ui(move |ui| {
+                let ctx = ui.ctx().clone();
+                if textures.is_none() {
+                    let mut scene = load_textures(&ctx, false, false);
+                    // Linear sampling tests UV equivalence without NEAREST's
+                    // discontinuous tie choice at mathematically equal texels.
+                    for texture in scene.old.iter_mut().chain(scene.new.iter_mut()) {
+                        texture.set(
+                            page_image('A', '1', Color32::from_rgb(150, 205, 242)),
+                            TextureOptions::LINEAR,
+                        );
+                    }
+                    scene.checker.set(
+                        egui::ColorImage::filled([8, 8], Color32::WHITE),
+                        TextureOptions::LINEAR,
+                    );
+                    textures = Some(scene);
+                    ctx.request_repaint();
+                    return;
+                }
+                let painter = ctx.layer_painter(egui::LayerId::background());
+                painter.rect_filled(ctx.content_rect(), 0.0, Color32::from_rgb(29, 35, 46));
+                for case in 0..4 {
+                    let cell = Rect::from_min_size(
+                        pos2((case % 2) as f32 * 320.0, (case / 2) as f32 * 240.0),
+                        vec2(320.0, 240.0),
+                    );
+                    let (mut old, mut new) = units(textures.as_ref().unwrap(), false, cell);
+                    let round = |value: f32| (value * pixels_per_point).round() / pixels_per_point;
+                    for unit in [&mut old, &mut new] {
+                        unit.pixels_per_point = pixels_per_point;
+                        let page = &mut unit.pages[0];
+                        page.rect = Rect::from_min_max(
+                            pos2(round(cell.left() + 18.37), round(cell.top() + 20.31)),
+                            pos2(round(cell.right() - 16.19), round(cell.bottom() - 18.47)),
+                        );
+                        // Deliberately clip all four sides at non-grid edges.
+                        page.clip_rect = Rect::from_min_max(
+                            page.rect.min + vec2(7.17, 5.29),
+                            page.rect.max - vec2(9.23, 8.31),
+                        );
+                        if case > 0 {
+                            page.crop = Some(PageCropPaint {
+                                full: rectangle(unit_uv()).try_into().unwrap(),
+                                corners: rectangle(Rect::from_min_max(
+                                    pos2(0.18, 0.23),
+                                    pos2(0.82, 0.79),
+                                ))
+                                .try_into()
+                                .unwrap(),
+                            });
+                        }
+                        if case == 3 {
+                            let PageMaterial::Texture { texture_id, uv, .. } =
+                                page.material.clone()
+                            else {
+                                unreachable!()
+                            };
+                            page.material = PageMaterial::PartialTexture {
+                                texture_id,
+                                uv,
+                                domain: Rect::from_min_max(pos2(0.19, 0.13), pos2(0.83, 0.87)),
+                            };
+                        }
+                    }
+                    let ordinary = new.clone();
+                    if case == 2 {
+                        old = normalize_spread_window(old, SpreadWindow::Landscape).unwrap();
+                        new = normalize_spread_window(new, SpreadWindow::Landscape).unwrap();
+                    }
+                    if draw_flat.load(Ordering::Relaxed) {
+                        paint_slide_endpoint_flat(&painter, &ordinary);
+                    } else {
+                        let direction = TurnDirection {
+                            reading_rtl: case % 2 != 0,
+                            forward: case < 2,
+                        };
+                        let recipe = prepare_slide(&old, &new, direction).unwrap();
+                        let projection =
+                            project_slide(&old, &new, direction, recipe, 1.0, false).unwrap();
+                        assert_eq!(projection.visibility.outgoing_front_area, 0.0);
+                        for draw in projection.meshes {
+                            painter
+                                .with_clip_rect(draw.clip_rect)
+                                .add(egui::Shape::mesh(draw.mesh));
+                        }
+                    }
+                }
+            });
+        harness.run();
+        let projected = harness.render().unwrap();
+        flat.store(true, Ordering::Relaxed);
+        harness.step();
+        harness.run();
+        let canonical = harness.render().unwrap();
+        assert_eq!(projected.dimensions(), canonical.dimensions());
+        // Different equivalent triangles can differ by one sampler rounding
+        // unit. Compare actual RGBA output, never the vertex arrays.
+        let max_error = projected
+            .as_raw()
+            .iter()
+            .zip(canonical.as_raw())
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_error <= 1,
+            "slide endpoint RGBA differs by {max_error} at DPI {pixels_per_point}"
+        );
+    }
+}

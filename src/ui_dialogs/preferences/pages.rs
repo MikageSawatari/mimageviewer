@@ -11292,6 +11292,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             ui,
             &mut state.settings.page_turn_animation_enabled,
             &mut state.settings.page_turn_animation_duration_ms,
+            &mut state.settings.page_turn_animation_style,
         );
     });
     anchored(ui, state, "spread/singleton-placement", |ui, state| {
@@ -12109,10 +12110,24 @@ pub(super) fn draw_page_turn_animation_setting(
     ui: &mut egui::Ui,
     enabled: &mut bool,
     duration_ms: &mut u32,
+    style: &mut crate::settings::PageTurnAnimationStyle,
 ) {
     ui.checkbox(enabled, "ページめくりアニメーション");
-    ui.small("単発のページ送りとスライドショーで紙をめくる効果。連打・読込待ち・連結読みには適用しません。");
+    ui.small("単発のページ送りとスライドショーでページが切り替わるときの効果。連打・読込待ち・連結読みには適用しません。");
     ui.add_enabled_ui(*enabled, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("動き:");
+            ui.radio_value(
+                style,
+                crate::settings::PageTurnAnimationStyle::Curl,
+                "めくる",
+            );
+            ui.radio_value(
+                style,
+                crate::settings::PageTurnAnimationStyle::Slide,
+                "スライド",
+            );
+        });
         let row_width = ui.available_width();
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("時間");
@@ -12131,7 +12146,12 @@ pub(super) fn draw_page_turn_animation_setting(
 mod page_turn_animation_settings_tests {
     use super::*;
 
-    fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme, enabled: bool) {
+    fn snapshot(
+        name: &str,
+        theme: crate::os_theme::ResolvedTheme,
+        enabled: bool,
+        mut style: crate::settings::PageTurnAnimationStyle,
+    ) {
         let mut fonts_ready = false;
         let mut enabled = enabled;
         let mut duration_ms = 200;
@@ -12148,7 +12168,12 @@ mod page_turn_animation_settings_tests {
                         return;
                     }
                     egui::CentralPanel::default().show(root_ui, |ui| {
-                        draw_page_turn_animation_setting(ui, &mut enabled, &mut duration_ms);
+                        draw_page_turn_animation_setting(
+                            ui,
+                            &mut enabled,
+                            &mut duration_ms,
+                            &mut style,
+                        );
                     });
                 });
             });
@@ -12162,6 +12187,7 @@ mod page_turn_animation_settings_tests {
             "page_turn_animation_settings_light_on",
             crate::os_theme::ResolvedTheme::Light,
             true,
+            crate::settings::PageTurnAnimationStyle::Curl,
         );
     }
 
@@ -12171,6 +12197,17 @@ mod page_turn_animation_settings_tests {
             "page_turn_animation_settings_dark_off",
             crate::os_theme::ResolvedTheme::Dark,
             false,
+            crate::settings::PageTurnAnimationStyle::Curl,
+        );
+    }
+
+    #[test]
+    fn page_turn_animation_settings_snapshot_light_slide() {
+        snapshot(
+            "page_turn_animation_settings_light_slide",
+            crate::os_theme::ResolvedTheme::Light,
+            true,
+            crate::settings::PageTurnAnimationStyle::Slide,
         );
     }
 
@@ -12198,6 +12235,7 @@ mod page_turn_animation_settings_tests {
                             ui,
                             &mut settings.page_turn_animation_enabled,
                             &mut settings.page_turn_animation_duration_ms,
+                            &mut settings.page_turn_animation_style,
                         );
                         draw_singleton_spread_placement_setting(
                             ui,
@@ -12212,12 +12250,34 @@ mod page_turn_animation_settings_tests {
         harness.run();
         let first_label = "見開き先頭の単ページを片側に配置";
         let last_label = "見開き末尾の単ページを片側に配置";
+        for label in ["めくる", "スライド"] {
+            assert!(harness.get_by_label(label).accesskit_node().is_disabled());
+        }
         for enabled in [true, false] {
             harness.get_by_label("ページめくりアニメーション").click();
             harness.run();
             assert_eq!(harness.state().0.page_turn_animation_enabled, enabled);
             assert!(!harness.state().0.singleton_spread_first_enabled);
             assert!(harness.state().0.singleton_spread_last_enabled);
+            for label in ["めくる", "スライド"] {
+                assert_eq!(
+                    harness.get_by_label(label).accesskit_node().is_disabled(),
+                    !enabled
+                );
+            }
+            if enabled {
+                harness.get_by_label("スライド").click();
+                harness.run();
+            } else {
+                // A disabled radio cannot replace the saved Slide choice.
+                harness.get_by_label("めくる").click();
+                harness.run();
+            }
+            assert_eq!(
+                harness.state().0.page_turn_animation_style,
+                crate::settings::PageTurnAnimationStyle::Slide
+            );
+            assert_eq!(harness.state().0.page_turn_animation_duration_ms, 200);
             for (label, saved) in [(first_label, false), (last_label, true)] {
                 let node = harness.get_by_label(label).accesskit_node();
                 assert_eq!(node.is_disabled(), enabled);

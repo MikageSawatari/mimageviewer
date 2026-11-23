@@ -3455,6 +3455,15 @@ fn default_reading_history_limit() -> usize {
 // SpreadMode (フルスクリーンページ構成)
 // -----------------------------------------------------------------------
 
+/// ページ送りで使う演出。所有・時間・取消の経路は両方で共有する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PageTurnAnimationStyle {
+    #[default]
+    Curl,
+    Slide,
+}
+
 /// フルスクリーンのページ構成。
 ///
 /// - `Single`: 通常の1ページ表示
@@ -5793,12 +5802,15 @@ pub struct Settings {
     /// 本ごとの見開き1ページずらしを記憶する。OFFでも保存済み調整は保持する。
     #[serde(default = "default_true")]
     pub remember_spread_shift_per_book: bool,
-    /// 単発のページ送りとスライドショーで紙めくり効果を使う。
+    /// 単発のページ送りとスライドショーでページ送り演出を使う。
     #[serde(default)]
     pub page_turn_animation_enabled: bool,
     /// 動きを評価するための仮の演出時間 (ms)。100..=600 に制限する。
     #[serde(default = "default_page_turn_animation_duration_ms")]
     pub page_turn_animation_duration_ms: u32,
+    /// ページ送り演出の種類。旧設定で欠けている場合は従来の紙めくり。
+    #[serde(default)]
+    pub page_turn_animation_style: PageTurnAnimationStyle,
     /// デフォルトの連結方式
     #[serde(default)]
     pub default_reading_flow: ReadingFlow,
@@ -8459,6 +8471,7 @@ impl Default for Settings {
             remember_spread_shift_per_book: true,
             page_turn_animation_enabled: false,
             page_turn_animation_duration_ms: default_page_turn_animation_duration_ms(),
+            page_turn_animation_style: PageTurnAnimationStyle::default(),
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
@@ -16979,6 +16992,10 @@ mod tests {
         for settings in [Settings::default(), serde_json::from_str("{}").unwrap()] {
             assert!(!settings.page_turn_animation_enabled);
             assert_eq!(settings.page_turn_animation_duration_ms, 200);
+            assert_eq!(
+                settings.page_turn_animation_style,
+                PageTurnAnimationStyle::Curl
+            );
         }
         let settings: Settings = serde_json::from_str(
             r#"{"page_turn_animation_enabled":true,"page_turn_animation_duration_ms":350}"#,
@@ -16988,9 +17005,52 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert!(restored.page_turn_animation_enabled);
         assert_eq!(restored.page_turn_animation_duration_ms, 350);
+        assert_eq!(
+            restored.page_turn_animation_style,
+            PageTurnAnimationStyle::Curl
+        );
         let snapshot = restored.preferences_snapshot();
         assert!(snapshot.page_turn_animation_enabled);
         assert_eq!(snapshot.page_turn_animation_duration_ms, 350);
+        assert_eq!(
+            snapshot.page_turn_animation_style,
+            PageTurnAnimationStyle::Curl
+        );
+    }
+
+    #[test]
+    fn page_turn_animation_style_roundtrips_snake_case_and_rejects_unknown_values() {
+        for (style, wire) in [
+            (PageTurnAnimationStyle::Curl, "curl"),
+            (PageTurnAnimationStyle::Slide, "slide"),
+        ] {
+            let settings = Settings {
+                page_turn_animation_style: style,
+                ..Settings::default()
+            };
+            let value = serde_json::to_value(&settings).unwrap();
+            assert_eq!(value["page_turn_animation_style"], serde_json::json!(wire));
+            let restored: Settings = serde_json::from_value(value).unwrap();
+            assert_eq!(restored.page_turn_animation_style, style);
+            assert_eq!(
+                restored.preferences_snapshot().page_turn_animation_style,
+                style
+            );
+        }
+        for invalid in [
+            serde_json::json!("future_style"),
+            serde_json::json!("Slide"),
+            serde_json::json!(true),
+            serde_json::json!(0),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                serde_json::from_value::<Settings>(serde_json::json!({
+                    "page_turn_animation_style": invalid,
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]

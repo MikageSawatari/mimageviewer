@@ -1,5 +1,6 @@
 //! Paged presentation owns neither navigation nor producers. A prepared unit is submitted once.
 use super::*;
+use crate::settings::PageTurnAnimationStyle;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -49,6 +50,8 @@ mod prepare_boundary_tests;
 mod resident_placement_tests;
 #[cfg(test)]
 mod roi_tests;
+#[cfg(test)]
+mod slide_tests;
 #[cfg(test)]
 mod slideshow_regression_tests;
 #[cfg(test)]
@@ -314,6 +317,7 @@ pub(super) struct SubmittedUnitReceipt {
     pages: ReceiptPages,
     accepted: AcceptanceEvidence,
     binding: SubmittedContentBinding,
+    /// Projected motion frame (curl or slide), rather than canonical flat paint.
     pub(super) curl: bool,
 }
 
@@ -521,6 +525,7 @@ enum SubmissionStatus {
 
 struct SubmissionTracker {
     fact: ViewerOperationFact,
+    style: PageTurnAnimationStyle,
     ledger: Mutex<SubmissionLedger>,
 }
 
@@ -535,9 +540,10 @@ struct SubmissionLedger {
 }
 
 impl SubmissionTracker {
-    fn new(fact: ViewerOperationFact) -> Self {
+    fn new(fact: ViewerOperationFact, style: PageTurnAnimationStyle) -> Self {
         Self {
             fact,
+            style,
             ledger: Mutex::new(SubmissionLedger {
                 status: SubmissionStatus::Offered,
                 motion: MotionClock::AwaitingAcceptedOutput,
@@ -592,6 +598,7 @@ struct SubmissionEvent {
 
 #[derive(Clone, Copy)]
 enum SubmissionKind {
+    /// A projected motion frame, for both curl and slide.
     Curl,
     Canonical,
 }
@@ -766,17 +773,47 @@ impl egui::Plugin for SubmissionPlugin {
         match (event.kind, ledger.status) {
             (SubmissionKind::Curl, SubmissionStatus::Offered) => {
                 ledger.status = SubmissionStatus::Started;
-                emit(&event.fact, "start", "curl_submitted", &fields);
-                emit(&event.fact, "frame", "curl_submitted", &fields);
+                emit(
+                    &event.fact,
+                    event.tracker.style,
+                    "start",
+                    "curl_submitted",
+                    &fields,
+                );
+                emit(
+                    &event.fact,
+                    event.tracker.style,
+                    "frame",
+                    "curl_submitted",
+                    &fields,
+                );
             }
             (SubmissionKind::Curl, SubmissionStatus::Started) => {
-                emit(&event.fact, "frame", "curl_submitted", &fields);
+                emit(
+                    &event.fact,
+                    event.tracker.style,
+                    "frame",
+                    "curl_submitted",
+                    &fields,
+                );
             }
             (SubmissionKind::Canonical, SubmissionStatus::Started) => {
                 ledger.status = SubmissionStatus::Finished;
                 ledger.canonical_visible = true;
-                emit(&event.fact, "finish", "canonical_submitted", &fields);
-                emit(&event.fact, "fully_visible", "canonical_submitted", &fields);
+                emit(
+                    &event.fact,
+                    event.tracker.style,
+                    "finish",
+                    "canonical_submitted",
+                    &fields,
+                );
+                emit(
+                    &event.fact,
+                    event.tracker.style,
+                    "fully_visible",
+                    "canonical_submitted",
+                    &fields,
+                );
             }
             (SubmissionKind::Canonical, SubmissionStatus::Cancelled)
                 if !ledger.canonical_visible =>
@@ -784,6 +821,7 @@ impl egui::Plugin for SubmissionPlugin {
                 ledger.canonical_visible = true;
                 emit(
                     &event.fact,
+                    event.tracker.style,
                     "fully_visible",
                     "canonical_after_cancel",
                     &fields,
@@ -791,7 +829,13 @@ impl egui::Plugin for SubmissionPlugin {
             }
             (SubmissionKind::Canonical, SubmissionStatus::Offered) => {
                 ledger.status = SubmissionStatus::Cancelled;
-                emit(&event.fact, "skip", "canonical_without_accepted_curl", &[]);
+                emit(
+                    &event.fact,
+                    event.tracker.style,
+                    "skip",
+                    "canonical_without_accepted_curl",
+                    &[],
+                );
             }
             _ => {}
         }
@@ -812,6 +856,7 @@ impl egui::Plugin for SubmissionPlugin {
                     ]);
                     emit(
                         &event.fact,
+                        event.tracker.style,
                         "first_visible",
                         if pending.receipt.curl {
                             "curl_page_submitted"
@@ -842,9 +887,9 @@ fn cancel_pending_submission(pending: PendingSubmission, reason: &'static str) {
     if let Some(event) = pending.event {
         let status = event.tracker.end();
         if status == SubmissionStatus::Started {
-            emit(&event.fact, "cancel", reason, &[]);
+            emit(&event.fact, event.tracker.style, "cancel", reason, &[]);
         } else if status == SubmissionStatus::Offered {
-            emit(&event.fact, "skip", reason, &[]);
+            emit(&event.fact, event.tracker.style, "skip", reason, &[]);
         }
     }
 }
@@ -1104,6 +1149,7 @@ struct AcceptedOffer {
     accepted_at: Instant,
     duration: Duration,
     forward: bool,
+    style: PageTurnAnimationStyle,
     submission: Arc<SubmissionTracker>,
 }
 
@@ -1111,8 +1157,44 @@ struct PreparedLeaf {
     outgoing: crate::page_turn_animation::CanonicalUnit,
     incoming: crate::page_turn_animation::CanonicalUnit,
     direction: crate::page_turn_animation::TurnDirection,
-    recipe: crate::page_turn_animation::TurnRecipe,
+    recipe: MotionRecipe,
     prepare_cpu_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MotionRecipe {
+    Curl(crate::page_turn_animation::TurnRecipe),
+    Slide(crate::page_turn_animation::SlideRecipe),
+}
+
+impl PreparedLeaf {
+    fn project(
+        &self,
+        progress: f32,
+        measure: bool,
+    ) -> Result<
+        crate::page_turn_animation::TurnProjection,
+        crate::page_turn_animation::ProjectionFailure,
+    > {
+        match self.recipe {
+            MotionRecipe::Curl(recipe) => crate::page_turn_animation::project_prepared(
+                &self.outgoing,
+                &self.incoming,
+                self.direction,
+                recipe,
+                progress,
+                measure,
+            ),
+            MotionRecipe::Slide(recipe) => crate::page_turn_animation::project_slide(
+                &self.outgoing,
+                &self.incoming,
+                self.direction,
+                recipe,
+                progress,
+                measure,
+            ),
+        }
+    }
 }
 
 /// The UI owns the motion clock; the output hook only publishes its first
@@ -1146,6 +1228,7 @@ fn prepare_leaf(
     outgoing: &PaintedUnit,
     incoming: &PaintedUnit,
     forward: bool,
+    style: PageTurnAnimationStyle,
 ) -> Result<PreparedLeaf, &'static str> {
     let start = crate::perf::is_enabled().then(Instant::now);
     let outgoing = canonical_unit(outgoing)?;
@@ -1154,8 +1237,17 @@ fn prepare_leaf(
         reading_rtl: incoming.reading_rtl,
         forward,
     };
-    let recipe = crate::page_turn_animation::prepare_turn(&outgoing, &input, direction)
-        .map_err(|e| e.sub_check())?;
+    let recipe = match style {
+        PageTurnAnimationStyle::Curl => {
+            crate::page_turn_animation::prepare_turn(&outgoing, &input, direction)
+                .map(MotionRecipe::Curl)
+        }
+        PageTurnAnimationStyle::Slide => {
+            crate::page_turn_animation::prepare_slide(&outgoing, &input, direction)
+                .map(MotionRecipe::Slide)
+        }
+    }
+    .map_err(|e| e.sub_check())?;
     Ok(PreparedLeaf {
         outgoing,
         incoming: input,
@@ -1191,6 +1283,7 @@ enum PresentationState {
 /// outgoing resources or an effect clock alive.
 struct CompletionDiagnostics {
     fact: ViewerOperationFact,
+    style: PageTurnAnimationStyle,
     tracker: Arc<SubmissionTracker>,
     accepted_at: Instant,
 }
@@ -1199,6 +1292,7 @@ impl CompletionDiagnostics {
     fn from_offer(offer: &AcceptedOffer) -> Self {
         Self {
             fact: offer.fact,
+            style: offer.style,
             tracker: offer.submission.clone(),
             accepted_at: offer.accepted_at,
         }
@@ -1293,6 +1387,7 @@ impl PageTurnPresentation {
                     fields.push(("retain_bytes", incoming.retained_bytes().into()));
                     emit(
                         &offer.fact,
+                        offer.style,
                         if previous == SubmissionStatus::Started {
                             "cancel"
                         } else {
@@ -1311,7 +1406,7 @@ impl PageTurnPresentation {
                 self.transaction.disposition = OperationDisposition::Cancelled;
             }
             PresentationState::Offered { outgoing, offer } => {
-                emit(&offer.fact, "skip", reason, extra);
+                emit(&offer.fact, offer.style, "skip", reason, extra);
                 offer.submission.end();
                 // No projected batch existed; ordinary flat leases remain accounted.
                 outgoing.reserved_bytes.store(0, Ordering::Relaxed);
@@ -1437,12 +1532,15 @@ impl PageTurnPresentation {
 
 fn emit(
     fact: &ViewerOperationFact,
+    style: PageTurnAnimationStyle,
     kind: &'static str,
     reason: &'static str,
     extra: &[(&str, serde_json::Value)],
 ) {
     #[cfg(test)]
     TEST_EVENTS.with(|events| events.borrow_mut().push((*fact, kind, reason)));
+    #[cfg(test)]
+    TEST_STYLED_EVENTS.with(|events| events.borrow_mut().push((kind, reason, style)));
     #[cfg(test)]
     if reason == "source_geometry_or_binding_changed" {
         TEST_CANCEL_DIAGNOSTICS.with(|events| {
@@ -1483,6 +1581,7 @@ fn emit(
         return;
     }
     let mut fields = vec![
+        ("style", style_name(style).into()),
         ("context", format!("{:?}", fact.destination.context).into()),
         (
             "window",
@@ -1511,8 +1610,16 @@ fn emit(
     );
 }
 
+fn style_name(style: PageTurnAnimationStyle) -> &'static str {
+    match style {
+        PageTurnAnimationStyle::Curl => "curl",
+        PageTurnAnimationStyle::Slide => "slide",
+    }
+}
+
 #[cfg(test)]
 thread_local! {
+    static TEST_STYLED_EVENTS: std::cell::RefCell<Vec<(&'static str, &'static str, PageTurnAnimationStyle)>> = const { std::cell::RefCell::new(Vec::new()) };
     static TEST_EVENTS: std::cell::RefCell<Vec<(ViewerOperationFact, &'static str, &'static str)>> = const { std::cell::RefCell::new(Vec::new()) };
     static TEST_CANCEL_DIAGNOSTICS: std::cell::RefCell<Vec<serde_json::Value>> = const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -1706,15 +1813,23 @@ impl App {
     }
 
     /// Preferences and HUD adopt the same global setting before any next turn.
-    pub(crate) fn adopt_page_turn_animation_settings(&mut self, enabled: bool, duration_ms: u32) {
+    pub(crate) fn adopt_page_turn_animation_settings(
+        &mut self,
+        enabled: bool,
+        duration_ms: u32,
+        style: PageTurnAnimationStyle,
+    ) {
         if self.settings.page_turn_animation_enabled != enabled
-            || (enabled && self.settings.page_turn_animation_duration_ms != duration_ms)
+            || (enabled
+                && (self.settings.page_turn_animation_duration_ms != duration_ms
+                    || self.settings.page_turn_animation_style != style))
         {
             self.cancel_all_page_turn_effects_for_settings();
         }
         crate::key_input::set_page_turn_ingress_instrumentation_enabled(enabled);
         self.settings.page_turn_animation_enabled = enabled;
         self.settings.page_turn_animation_duration_ms = duration_ms;
+        self.settings.page_turn_animation_style = style;
     }
 
     pub(crate) fn page_turn_pre_draw(&mut self, ctx: &egui::Context) {
@@ -1992,7 +2107,13 @@ impl App {
             transaction.facts.push(fact);
         }
         self.page_turn_presentation.transaction.disposition = OperationDisposition::Excluded;
-        emit(&fact, "skip", reason, &[("sub_check", sub_check.into())]);
+        emit(
+            &fact,
+            self.settings.page_turn_animation_style,
+            "skip",
+            reason,
+            &[("sub_check", sub_check.into())],
+        );
     }
 
     fn page_turn_content(&self, idx: usize) -> PageTurnContent {
@@ -2402,17 +2523,35 @@ impl App {
             .get(target)
             .is_some_and(|item| matches!(item, GridItem::Video { .. } | GridItem::Audio { .. }))
         {
-            emit(&fact, "skip", "stage1_media_target", &[]);
+            emit(
+                &fact,
+                self.settings.page_turn_animation_style,
+                "skip",
+                "stage1_media_target",
+                &[],
+            );
             return;
         }
         if self.spread_mode.is_split()
             || self.fullscreen_page_slice != crate::page_split::PageSlice::Full
         {
-            emit(&fact, "skip", "stage1_split_step", &[]);
+            emit(
+                &fact,
+                self.settings.page_turn_animation_style,
+                "skip",
+                "stage1_split_step",
+                &[],
+            );
             return;
         }
         if !self.page_turn_view_eligible(target) || self.page_turn_loupe_hold(ctx) {
-            emit(&fact, "skip", "ineligible_view", &[]);
+            emit(
+                &fact,
+                self.settings.page_turn_animation_style,
+                "skip",
+                "ineligible_view",
+                &[],
+            );
             return;
         }
         let duration = Duration::from_millis(
@@ -2425,6 +2564,7 @@ impl App {
         {
             emit(
                 &fact,
+                self.settings.page_turn_animation_style,
                 "skip",
                 "slideshow_interval_shorter_than_duration",
                 &[],
@@ -2443,7 +2583,13 @@ impl App {
             crate::book_composition::PresentationDecision::Allowed(allowed)
                 if allowed.len() == demand.len() && allowed.iter().all(|allowed| *allowed)
         ) {
-            emit(&fact, "skip", "book_presentation_not_fully_allowed", &[]);
+            emit(
+                &fact,
+                self.settings.page_turn_animation_style,
+                "skip",
+                "book_presentation_not_fully_allowed",
+                &[],
+            );
             return;
         }
         if let Some(reason) = stage_one_shape_reason(
@@ -2451,7 +2597,13 @@ impl App {
             occurrences.iter().copied(),
             composition.singleton_placement.has_white_companion(),
         ) {
-            emit(&fact, "skip", reason, &[]);
+            emit(
+                &fact,
+                self.settings.page_turn_animation_style,
+                "skip",
+                reason,
+                &[],
+            );
             return;
         }
         let material_view = if occurrences.len() == 2 {
@@ -2462,12 +2614,19 @@ impl App {
         let mut ready_sources = Vec::with_capacity(occurrences.len());
         for occurrence in occurrences {
             if !self.page_turn_view_eligible(occurrence.idx) {
-                emit(&fact, "skip", "ineligible_companion", &[]);
+                emit(
+                    &fact,
+                    self.settings.page_turn_animation_style,
+                    "skip",
+                    "ineligible_companion",
+                    &[],
+                );
                 return;
             }
             let Some((resource, quality)) = self.page_turn_resident_source(occurrence.idx) else {
                 emit(
                     &fact,
+                    self.settings.page_turn_animation_style,
                     "skip",
                     "no_displayable_source_at_accept",
                     &[
@@ -2502,6 +2661,7 @@ impl App {
             ) {
                 emit(
                     &fact,
+                    self.settings.page_turn_animation_style,
                     "skip",
                     "fit_basis_unavailable",
                     &[
@@ -2524,6 +2684,7 @@ impl App {
         let ready_sources = Arc::new(AcceptedSources(ready_sources, binding));
         emit(
             &fact,
+            self.settings.page_turn_animation_style,
             "opportunity",
             "ready_at_accept",
             &[
@@ -2537,7 +2698,13 @@ impl App {
         );
         let PresentationState::Flat(outgoing) = old else {
             self.page_turn_presentation.state = old;
-            emit(&fact, "skip", "no_outgoing_paint", &[]);
+            emit(
+                &fact,
+                self.settings.page_turn_animation_style,
+                "skip",
+                "no_outgoing_paint",
+                &[],
+            );
             return;
         };
         // Geometry may legitimately have different gutters (Pair <-> landscape).
@@ -2552,6 +2719,7 @@ impl App {
         {
             emit(
                 &fact,
+                self.settings.page_turn_animation_style,
                 "skip",
                 "outgoing_content_changed",
                 &[(
@@ -2576,7 +2744,13 @@ impl App {
             outgoing.pages.iter().map(|p| p.occurrence),
             outgoing.white.is_some(),
         ) {
-            emit(&fact, "skip", reason, &[]);
+            emit(
+                &fact,
+                self.settings.page_turn_animation_style,
+                "skip",
+                reason,
+                &[],
+            );
             self.page_turn_presentation.state = PresentationState::Flat(outgoing);
             return;
         }
@@ -2594,6 +2768,7 @@ impl App {
         if budget.pool_bytes.is_some_and(|cap| resident_bytes > cap) {
             emit(
                 &fact,
+                self.settings.page_turn_animation_style,
                 "skip",
                 "memory_pressure",
                 &[
@@ -2607,6 +2782,7 @@ impl App {
         if pin_bytes > limit {
             emit(
                 &fact,
+                self.settings.page_turn_animation_style,
                 "skip",
                 "pin_budget",
                 &[
@@ -2638,7 +2814,7 @@ impl App {
             .sources
             .push(Arc::downgrade(&ready_sources));
         emit(
-            &fact,
+            &fact, self.settings.page_turn_animation_style,
             "offered",
             "ready_at_accept",
             &[
@@ -2658,6 +2834,7 @@ impl App {
         self.page_turn_presentation.state = PresentationState::Offered {
             outgoing,
             offer: AcceptedOffer {
+                style: self.settings.page_turn_animation_style,
                 fact,
                 ready_sources,
                 resident_bytes,
@@ -2665,7 +2842,10 @@ impl App {
                 accepted_at: presentation_now(),
                 duration,
                 forward,
-                submission: Arc::new(SubmissionTracker::new(fact)),
+                submission: Arc::new(SubmissionTracker::new(
+                    fact,
+                    self.settings.page_turn_animation_style,
+                )),
             },
         };
         let _ = ctx;
@@ -2854,7 +3034,7 @@ impl App {
                                     == p.resource.source_generation()
                         });
                 if matching {
-                    match prepare_leaf(&outgoing, &unit, offer.forward) {
+                    match prepare_leaf(&outgoing, &unit, offer.forward, offer.style) {
                         Ok(projection) => {
                             // Ordinary prepare has submitted its input. Transfer
                             // only the actual paint allocations into the turn;
@@ -2882,6 +3062,7 @@ impl App {
                             let limit = page_turn_pin_limit(budget);
                             emit(
                                 &offer.fact,
+                                offer.style,
                                 "material",
                                 "prepared",
                                 &[
@@ -2895,6 +3076,7 @@ impl App {
                                 offer.submission.end();
                                 emit(
                                     &offer.fact,
+                                    offer.style,
                                     "skip",
                                     "pin_budget",
                                     &[
@@ -2934,7 +3116,13 @@ impl App {
                     }
                 } else {
                     offer.submission.end();
-                    emit(&offer.fact, "skip", "offer_binding_or_source_mismatch", &[]);
+                    emit(
+                        &offer.fact,
+                        offer.style,
+                        "skip",
+                        "offer_binding_or_source_mismatch",
+                        &[],
+                    );
                     PresentationState::Flat(unit.clone())
                 }
             }
@@ -2965,6 +3153,7 @@ impl App {
                     ) {
                         emit(
                             &offer.fact,
+                            offer.style,
                             if previous == SubmissionStatus::Started {
                                 "cancel"
                             } else {
@@ -3012,15 +3201,9 @@ impl App {
             let progress = clock.progress(now, offer.duration);
             if progress < 1.0 {
                 let t0 = crate::perf::is_enabled().then(Instant::now);
-                let projection = crate::page_turn_animation::project_prepared(
-                    &prepared.outgoing,
-                    &prepared.incoming,
-                    prepared.direction,
-                    prepared.recipe,
-                    progress,
-                    crate::perf::is_enabled(),
-                )
-                .map_err(|failure| failure.sub_check());
+                let projection = prepared
+                    .project(progress, crate::perf::is_enabled())
+                    .map_err(|failure| failure.sub_check());
                 match projection {
                     Ok(projection) => {
                         let mesh_stats = crate::perf::is_enabled().then(|| {
@@ -3107,7 +3290,7 @@ impl App {
                             outer_mask_ms: projection.cost.outer_mask_cpu_ms,
                             visible_pages: actual_visibility.iter().fold(0, |mask, v| if v.fraction() >= 0.05 && v.short_edge >= 8.0 { mask | (1 << v.occurrence) } else { mask }),
                             proof: crate::perf::is_enabled()
-                                .then(||serde_json::json!({"recipe":if unit.mode.is_spread() { "BookLeaf" } else if offer.forward { "SingleDeparture" } else { "SingleArrival" },"angle_degrees":projection.angle_degrees,"hinge_x":projection.hinge_x,"face":if projection.showing_back {"back"} else {"front"},"recipe_prepare_cpu_ms":prepared.prepare_cpu_ms,"mesh":mesh_stats,"static_clip_loss_fraction":projection.cost.static_clip_loss_fraction,"static_support_loss_fraction":projection.cost.static_support_loss_fraction,"visible":actual_visibility.iter().map(|v|serde_json::json!({"occurrence":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"projection_faces":projection.visibility.incoming.iter().map(|v|serde_json::json!({"face":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"incoming":unit_diagnostics(incoming,offer),"outgoing":unit_diagnostics(outgoing,offer)})),
+                                .then(||serde_json::json!({"recipe":if offer.style == PageTurnAnimationStyle::Slide { "Slide" } else if unit.mode.is_spread() { "BookLeaf" } else if offer.forward { "SingleDeparture" } else { "SingleArrival" },"angle_degrees":projection.angle_degrees,"hinge_x":projection.hinge_x,"face":if projection.showing_back {"back"} else {"front"},"recipe_prepare_cpu_ms":prepared.prepare_cpu_ms,"mesh":mesh_stats,"static_clip_loss_fraction":projection.cost.static_clip_loss_fraction,"static_support_loss_fraction":projection.cost.static_support_loss_fraction,"visible":actual_visibility.iter().map(|v|serde_json::json!({"occurrence":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"projection_faces":projection.visibility.incoming.iter().map(|v|serde_json::json!({"face":v.occurrence,"area":v.visible_area,"fraction":v.fraction(),"short_edge":v.short_edge})).collect::<Vec<_>>(),"incoming":unit_diagnostics(incoming,offer),"outgoing":unit_diagnostics(outgoing,offer)})),
                         });
                         curl = true;
                         ctx.request_repaint();
@@ -3216,7 +3399,10 @@ impl App {
             return None;
         }
         Some(SubmissionEvent {
-            tracker: diagnostics.tracker.clone(),
+            tracker: {
+                debug_assert_eq!(diagnostics.style, diagnostics.tracker.style);
+                diagnostics.tracker.clone()
+            },
             fact: diagnostics.fact,
             kind: SubmissionKind::Canonical,
             accepted_at: diagnostics.accepted_at,
@@ -3612,6 +3798,7 @@ fn unit_diagnostics(unit: &PaintedUnit, offer: &AcceptedOffer) -> serde_json::Va
         "resident_bytes_at_accept":offer.resident_bytes,
         "global_pin_bytes_at_accept":offer.pin_bytes,
         "expected_sources":offer.ready_sources.0.iter().map(|s|serde_json::json!({"idx":s.occurrence.idx,"source_texture_id":format!("{:?}",s.resource.source_texture_id()),"quality":s.quality,"source_generation":s.resource.source_generation().map(|g|serde_json::json!({"items":g.items,"input":g.input}))})).collect::<Vec<_>>(),
+        "style":style_name(offer.style),
         "reading_rtl":unit.reading_rtl,
         "forward":offer.forward,
         "duration_ms":offer.duration.as_millis() as u64,
@@ -3649,6 +3836,7 @@ fn emit_projection_failure(
         // geometry diagnostics or enabling the process-wide perf logger.
         emit(
             &offer.fact,
+            offer.style,
             kind,
             "geometry_visibility_or_roi",
             &[("sub_check", reason.into())],
@@ -3670,6 +3858,7 @@ fn emit_projection_failure(
         });
     emit(
         &offer.fact,
+        offer.style,
         kind,
         "geometry_visibility_or_roi",
         &[
@@ -4064,6 +4253,7 @@ mod tests {
         app.page_turn_presentation.state = PresentationState::Offered {
             outgoing,
             offer: AcceptedOffer {
+                style: PageTurnAnimationStyle::Curl,
                 fact,
                 ready_sources: Arc::new(AcceptedSources(
                     vec![AcceptedSource {
@@ -4079,7 +4269,7 @@ mod tests {
                 accepted_at: presentation_now(),
                 duration: Duration::from_millis(200),
                 forward: true,
-                submission: Arc::new(SubmissionTracker::new(fact)),
+                submission: Arc::new(SubmissionTracker::new(fact, PageTurnAnimationStyle::Curl)),
             },
         };
         app.fs_cache.clear();
@@ -4499,8 +4689,9 @@ mod tests {
                 completion: FlatCompletion::NeedFlat,
                 continuation: None,
                 diagnostics: CompletionDiagnostics {
+                    style: PageTurnAnimationStyle::Curl,
                     fact,
-                    tracker: Arc::new(SubmissionTracker::new(fact)),
+                    tracker: Arc::new(SubmissionTracker::new(fact, PageTurnAnimationStyle::Curl)),
                     accepted_at: presentation_now(),
                 },
             };
@@ -4693,7 +4884,10 @@ mod tests {
     fn output_plugin_accepts_only_last_actual_submission() {
         let ctx = egui::Context::default();
         install(&ctx);
-        let tracker = Arc::new(SubmissionTracker::new(fact(1)));
+        let tracker = Arc::new(SubmissionTracker::new(
+            fact(1),
+            PageTurnAnimationStyle::Curl,
+        ));
         let mut receipts = Vec::new();
         let _ = ctx
             .run_pass(egui::RawInput::default(), |ctx| {
@@ -4743,7 +4937,10 @@ mod tests {
         for delivery in [false, true] {
             let ctx = egui::Context::default();
             install(&ctx);
-            let tracker = Arc::new(SubmissionTracker::new(fact(1)));
+            let tracker = Arc::new(SubmissionTracker::new(
+                fact(1),
+                PageTurnAnimationStyle::Curl,
+            ));
             let receipts = Rc::new(RefCell::new(Vec::<SubmittedUnitReceipt>::new()));
             let deliveries = Rc::new(Cell::new(0));
             let scope = delivery.then(|| {
@@ -4800,7 +4997,10 @@ mod tests {
         for matching in [true, false] {
             let ctx = egui::Context::default();
             install(&ctx);
-            let tracker = Arc::new(SubmissionTracker::new(fact(1)));
+            let tracker = Arc::new(SubmissionTracker::new(
+                fact(1),
+                PageTurnAnimationStyle::Curl,
+            ));
             tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
             let _ = ctx
                 .run_pass(egui::RawInput::default(), |ctx| {
@@ -4830,7 +5030,10 @@ mod tests {
     fn canceled_leaf_credits_unseen_pages_only_after_canonical_output_is_adopted() {
         let ctx = egui::Context::default();
         install(&ctx);
-        let tracker = Arc::new(SubmissionTracker::new(fact(1)));
+        let tracker = Arc::new(SubmissionTracker::new(
+            fact(1),
+            PageTurnAnimationStyle::Curl,
+        ));
         tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
         tracker.end();
         let _ = ctx
@@ -5015,6 +5218,7 @@ mod tests {
         presentation.state = PresentationState::Offered {
             outgoing: outgoing.clone(),
             offer: AcceptedOffer {
+                style: PageTurnAnimationStyle::Curl,
                 fact: fact(1),
                 ready_sources: Arc::new(AcceptedSources(Vec::new(), outgoing.binding.clone())),
                 resident_bytes: bytes,
@@ -5022,7 +5226,10 @@ mod tests {
                 accepted_at: presentation_now(),
                 duration: Duration::from_millis(200),
                 forward: true,
-                submission: Arc::new(SubmissionTracker::new(fact(1))),
+                submission: Arc::new(SubmissionTracker::new(
+                    fact(1),
+                    PageTurnAnimationStyle::Curl,
+                )),
             },
         };
         presentation.cancel("new_operation");
@@ -5688,7 +5895,10 @@ mod tests {
         );
         let outgoing = unit(&ctx, texture.clone(), 1);
         let incoming = unit(&ctx, texture, 1);
-        let tracker = Arc::new(SubmissionTracker::new(fact(1)));
+        let tracker = Arc::new(SubmissionTracker::new(
+            fact(1),
+            PageTurnAnimationStyle::Curl,
+        ));
         tracker.ledger.lock().unwrap().status = SubmissionStatus::Started;
         let _ = ctx
             .run_pass(egui::RawInput::default(), |ctx| {
@@ -5703,11 +5913,18 @@ mod tests {
                 );
                 let old_fact = app.page_turn_presentation.take_candidate().unwrap();
                 app.page_turn_presentation.state = PresentationState::Turning {
-                    projection: prepare_leaf(&outgoing, &incoming, true).unwrap(),
+                    projection: prepare_leaf(
+                        &outgoing,
+                        &incoming,
+                        true,
+                        PageTurnAnimationStyle::Curl,
+                    )
+                    .unwrap(),
                     clock: MotionClock::AwaitingAcceptedOutput,
                     outgoing: outgoing.clone(),
                     incoming: incoming.clone(),
                     offer: AcceptedOffer {
+                        style: PageTurnAnimationStyle::Curl,
                         fact: old_fact,
                         ready_sources: Arc::new(AcceptedSources(
                             Vec::new(),

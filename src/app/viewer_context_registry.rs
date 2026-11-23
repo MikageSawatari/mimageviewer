@@ -8649,7 +8649,11 @@ mod tests {
         let mut app = crate::app::setup_app_for_test();
         app.items = vec![GridItem::Image(app.tmp.path().join("main.png"))];
         app.fullscreen_idx = Some(0);
-        app.adopt_page_turn_animation_settings(true, 400);
+        app.adopt_page_turn_animation_settings(
+            true,
+            400,
+            crate::settings::PageTurnAnimationStyle::Slide,
+        );
         app.settings.save();
         let main = app.page_turn_destination();
         app.page_turn_presentation.seed_operation_for_test(main, 41);
@@ -8669,8 +8673,16 @@ mod tests {
             let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
             assert!(!stored.page_turn_animation_enabled);
             assert_eq!(stored.page_turn_animation_duration_ms, 400);
+            assert_eq!(
+                stored.page_turn_animation_style,
+                crate::settings::PageTurnAnimationStyle::Slide
+            );
             assert!(!owner.settings.page_turn_animation_enabled);
             assert_eq!(owner.settings.page_turn_animation_duration_ms, 400);
+            assert_eq!(
+                owner.settings.page_turn_animation_style,
+                crate::settings::PageTurnAnimationStyle::Slide
+            );
             assert_eq!(owner.page_turn_presentation.operation_for_test(), None);
             assert_eq!(owner.items, before_items);
             assert_eq!(owner.fullscreen_idx, Some(0));
@@ -8679,6 +8691,10 @@ mod tests {
         })
         .unwrap();
         assert!(!app.settings.page_turn_animation_enabled);
+        assert_eq!(
+            app.settings.page_turn_animation_style,
+            crate::settings::PageTurnAnimationStyle::Slide
+        );
         assert_eq!(app.page_turn_presentation.operation_for_test(), None);
         assert_eq!(app.page_turn_destination(), main);
         assert_eq!(app.fullscreen_idx, Some(0));
@@ -8687,6 +8703,10 @@ mod tests {
         app.install_preferences_settings(preferences);
         app.with_viewer_context(sibling, |owner| {
             assert!(owner.settings.page_turn_animation_enabled);
+            assert_eq!(
+                owner.settings.page_turn_animation_style,
+                crate::settings::PageTurnAnimationStyle::Slide
+            );
             assert_eq!(owner.items.len(), 1);
             assert_eq!(owner.fullscreen_idx, Some(0));
         })
