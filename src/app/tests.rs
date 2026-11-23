@@ -8470,6 +8470,17 @@ fn housekeeping_gate_remains_fts_only() {
 /// v3.0.0 went out).
 fn fullscreen_overflow_panel_holds_no_input_and_survives_file_boundary() {
     let mut app = setup_app_for_test();
+    for state in [
+        FsOverflowPanelState::Root,
+        FsOverflowPanelState::PageTurnAnimation,
+    ] {
+        app.fs_overflow_panel_state = state;
+        assert!(!app.common_modal_dialog_open());
+        assert!(!app.any_modal_dialog_open_for_fullscreen_keys());
+        assert!(!state.closes_on_file_change());
+        app.reset_fs_side_panel_runtime_for_file_change();
+        assert_eq!(app.fs_overflow_panel_state, state);
+    }
     app.fs_overflow_panel_state = FsOverflowPanelState::Root;
     assert!(!app.common_modal_dialog_open());
     assert!(!app.any_modal_dialog_open_for_fullscreen_keys());
@@ -8489,6 +8500,7 @@ fn overflow_primary_stream_ends_with_foreground_pause_and_fullscreen_close() {
     for state in [
         FsOverflowPanelState::Root,
         FsOverflowPanelState::NavigatorPosition,
+        FsOverflowPanelState::PageTurnAnimation,
         FsOverflowPanelState::SpreadAdjustment,
         FsOverflowPanelState::Slideshow,
         FsOverflowPanelState::MusicNoteColor,

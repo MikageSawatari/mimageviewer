@@ -13939,7 +13939,8 @@ mod next_input_tests {
             let mut app = ready_app(&ctx, SpreadMode::Single);
             seed_leaf(&ctx, &mut app);
             if !enabled {
-                app.adopt_page_turn_animation_settings(false, 600);
+                let style = app.settings.page_turn_animation_style;
+                app.adopt_page_turn_animation_settings(false, 600, style);
             }
             let batch = next_pad_operation_batch();
             let actions = [

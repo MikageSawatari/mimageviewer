@@ -304,6 +304,7 @@ impl App {
             if let Some(command) = continuation {
                 emit(
                     &command.fact,
+                    self.settings.page_turn_animation_style,
                     "flat_barrier",
                     "navigation_deferred_until_canonical_flat",
                     &[("target_idx", command.target_idx.into())],
@@ -391,7 +392,13 @@ impl App {
                 if !Arc::ptr_eq(topology, &self.spread_display_units_cache.units))
             || self.fullscreen_idx != Some(command.from_idx)
         {
-            emit(&command.fact, "skip", "continuation_binding_changed", &[]);
+            emit(
+                &command.fact,
+                self.settings.page_turn_animation_style,
+                "skip",
+                "continuation_binding_changed",
+                &[],
+            );
             return None;
         }
         Some(command)
@@ -417,6 +424,7 @@ impl App {
         // the original operation identity and use the established landing owner.
         emit(
             &command.fact,
+            self.settings.page_turn_animation_style,
             "skip",
             if matches!(command.intent, ResolvedNavigationIntent::SpreadStep { .. }) {
                 "stage1_spread_step"
@@ -478,6 +486,7 @@ impl App {
             let after = self.page_turn_current_drawing_path();
             emit(
                 &command.fact,
+                self.settings.page_turn_animation_style,
                 "continuation_commit",
                 "stage1_instant",
                 &[

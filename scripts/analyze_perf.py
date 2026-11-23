@@ -384,8 +384,9 @@ def analyze_page_turn_animation(
 ) -> dict:
     """Separate usability evidence from the existing page-turn I1--I5 gate.
 
-    A replay does not create another operation: context/window/operation_id own
-    one set of lifecycle receipts. run_id is a measurement label, never input_seq.
+    A replay does not create another operation: context/window/operation_id/style
+    own one set of lifecycle receipts. Older logs without style describe curl.
+    run_id is a measurement label, never input_seq.
     Profiles absent from a trace remain required unless explicitly scoped by CLI.
     """
     rows = [e for e in events if e.get("cat") == "page_turn_animation"]
@@ -420,6 +421,11 @@ def analyze_page_turn_animation(
         if any(not isinstance(value, str) or not value for value in identity):
             incomplete.append("Missing string context/window/operation_id correlation")
             continue
+        style = event.get("style", "curl")
+        if style not in ("curl", "slide"):
+            incomplete.append(f"Unknown animation style: {style}")
+            continue
+        identity += (style,)
         operation = operations.setdefault(identity, {"events": defaultdict(list)})
         operation["events"][kind].append(event)
 
@@ -446,9 +452,10 @@ def analyze_page_turn_animation(
         if not isinstance(operation_run, str) or not operation_run:
             incomplete.append(f"{identity}: missing measurement run_id")
             operation_run = "unknown"
-        group_key = (operation_profile, identity[0], identity[1])
+        group_key = (operation_profile, identity[0], identity[1], identity[3])
         group = groups.setdefault(group_key, {
             "profile": operation_profile, "context": identity[0], "window": identity[1],
+            "style": identity[3],
             "counts": Counter(), "runs": Counter(), "skip_reasons": Counter(),
             "metrics": defaultdict(list), "material_snapshots": [],
         })
@@ -606,7 +613,8 @@ def analyze_page_turn_animation(
     for required in required_profiles:
         if required not in profiles_present:
             incomplete.append(f"Missing required warm profile: {required}")
-        if required.startswith("f12_") and sum(key[0] == required for key in groups) < 2:
+        reader_windows = {(key[1], key[2]) for key in groups if key[0] == required}
+        if required.startswith("f12_") and len(reader_windows) < 2:
             incomplete.append(f"{required}: requires two reader contexts/windows")
     reports = []
     for key, group in sorted(groups.items()):
@@ -626,6 +634,7 @@ def analyze_page_turn_animation(
             incomplete.append(f"{key}: a measured run has fewer than 30 opportunities")
         reports.append({
             "profile": group["profile"], "context": group["context"], "window": group["window"],
+            "style": group["style"],
             **counts, "started_ratio": start_ratio, "finished_ratio": finish_ratio,
             "runs": dict(group["runs"]),
             "skip_reasons": {reason: {"count": count, "ratio": count / opportunities}
@@ -662,7 +671,7 @@ def cmd_page_turn_animation(events: list[dict], args, delivery: dict | None = No
     print(f"page-turn-animation: status={report['status']}")
     print("  timing: application ingress -> accepted egui output submission (not hardware input/OS present)")
     for group in report["profiles"]:
-        print(f"  {group['profile']} context={group['context']} window={group['window']}: "
+        print(f"  {group['profile']} context={group['context']} window={group['window']} style={group['style']}: "
               + " ".join(f"{key}={group[key]}" for key in
                          ("opportunities", "offered", "started", "finished", "cancelled", "skipped")))
         print(f"    started/opportunities={group['started_ratio']:.1%} "

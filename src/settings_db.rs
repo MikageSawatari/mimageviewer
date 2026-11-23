@@ -5129,6 +5129,7 @@ mod tests {
         let settings = Settings {
             page_turn_animation_enabled: true,
             page_turn_animation_duration_ms: 350,
+            page_turn_animation_style: PageTurnAnimationStyle::Slide,
             grid_cols: 7,
             ..Settings::default()
         };
@@ -5136,6 +5137,38 @@ mod tests {
         let loaded = db.load_into_settings().unwrap();
         assert!(loaded.page_turn_animation_enabled);
         assert_eq!(loaded.page_turn_animation_duration_ms, 350);
+        assert_eq!(
+            loaded.page_turn_animation_style,
+            PageTurnAnimationStyle::Slide
+        );
+        let stored_style: String = db
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT value FROM settings_kv WHERE key = 'page_turn_animation_style'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_style, r#""slide""#);
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "DELETE FROM settings_kv WHERE key = 'page_turn_animation_style'",
+                [],
+            )
+            .unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(loaded.page_turn_animation_enabled);
+        assert_eq!(loaded.page_turn_animation_duration_ms, 350);
+        assert_eq!(
+            loaded.page_turn_animation_style,
+            PageTurnAnimationStyle::Curl
+        );
         db.inner.lock().unwrap().conn.execute(
             "DELETE FROM settings_kv WHERE key IN ('page_turn_animation_enabled', 'page_turn_animation_duration_ms')",
             [],
@@ -5143,14 +5176,49 @@ mod tests {
         let loaded = db.load_into_settings().unwrap();
         assert!(!loaded.page_turn_animation_enabled);
         assert_eq!(loaded.page_turn_animation_duration_ms, 200);
+        assert_eq!(
+            loaded.page_turn_animation_style,
+            PageTurnAnimationStyle::Curl
+        );
         assert_eq!(loaded.grid_cols, 7);
+    }
+
+    #[test]
+    fn page_turn_animation_unknown_style_returns_incompatible_without_rewriting() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        db.inner
+            .lock()
+            .unwrap()
+            .conn
+            .execute(
+                "UPDATE settings_kv SET value = ?1 WHERE key = 'page_turn_animation_style'",
+                [r#""future_style""#],
+            )
+            .unwrap();
+        assert!(matches!(
+            db.load_into_settings(),
+            Err(SettingsDbError::Incompatible(_))
+        ));
+        let value: String = db
+            .inner
+            .lock()
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT value FROM settings_kv WHERE key = 'page_turn_animation_style'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(value, r#""future_style""#);
     }
 
     use super::*;
     use crate::external_tool::{
         ExternalToolLaunch, PayloadPolicy, SelectionPolicy, SpreadPolicy, VideoPolicy, next_id,
     };
-    use crate::settings::{LegacyOpenWithApp, Settings, SortOrder, TagDef};
+    use crate::settings::{LegacyOpenWithApp, PageTurnAnimationStyle, Settings, SortOrder, TagDef};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use tempfile::TempDir;

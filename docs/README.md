@@ -221,6 +221,7 @@
 | [fullscreen-in-page-scroll-plan.md](fullscreen-in-page-scroll-plan.md) | §1.474 ページ内スクロールと N 字 / Z 字移動の基礎設計・実装記録。描画済み表示単位の照合、入力所有、clamp と循環防止 |
 | [fullscreen-scroll-page-turn-plan.md](fullscreen-scroll-page-turn-plan.md) | §1.823〜§1.826 の拡張設計。滑らかな移動、端からのスクロール＋ページ送りと型付き着地、ホイールのズーム、N 字 / Z 字の移動量設定 |
 | [fullscreen-n-scroll-wrap-step-plan.md](fullscreen-n-scroll-wrap-step-plan.md) | §1.850 N 字 / Z 字で列 / 段を替える量を読み進める量と別に決める設定の設計。5ch >>857 の切り分け (座標列の単体テスト) |
+| [page-turn-slide-plan.md](page-turn-slide-plan.md) | §1.772 ページめくりの演出に「スライド」を加える設計。演出の状態は増やさず projection の recipe だけを分ける、移動量と初期可視、HUD の 3 択とキーの扱い。所有の正本は [page-turn-animation-plan.md](page-turn-animation-plan.md) |
 | [fullscreen-drag-pan-bound-plan.md](fullscreen-drag-pan-bound-plan.md) | §1.834 閲覧中のキャンバスのドラッグ移動を画像の端までに制限する設定。既定OFF、描画済み表示単位・白紙の相方・可視性と物理ピクセルの丸め、適用する面と入力の契約 |
 | [catalog-design.md](catalog-design.md) | サムネイルキャッシュ DB の設計 |
 | [book-thumb-cover-only-plan.md](book-thumb-cover-only-plan.md) | §1.452 本の中のページは寸法だけ記録し表紙だけ保存する設定、`page_dims` 表、書き戻しの stamp 条件 |

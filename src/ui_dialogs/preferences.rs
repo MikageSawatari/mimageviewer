@@ -2785,6 +2785,7 @@ impl App {
         self.adopt_page_turn_animation_settings(
             settings.page_turn_animation_enabled,
             settings.page_turn_animation_duration_ms,
+            settings.page_turn_animation_style,
         );
         self.settings = settings;
         if !self.settings.preferences_restore_position {

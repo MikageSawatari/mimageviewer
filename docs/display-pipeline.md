@@ -159,6 +159,9 @@ clampしてnative UVへ写像する。単頁は一leafだけが動き、下頁�
 正本と検証記録はpage-turn plan §25。比較後は一方を削除し、実機motionの採択は利用者へ残す。
 実装の独立完了レビュー、実機とOFF/ON性能比較は未完了。
 正本は[page-turn-animation-plan.md](page-turn-animation-plan.md)、detached範囲は同rework plan §11。
+2026-11-23追補 (§1.772): 演出の種類「めくる / スライド」を全体設定で選べる。種類は受理時に `AcceptedOffer` へ写し、
+projection の recipe (`MotionRecipe`) だけを分ける。受理・取消・着地・素材保持・VRAM・先読みは共有で、スライドは表示単位を
+平行移動する平面の面だけを描く。正本は[page-turn-slide-plan.md](page-turn-slide-plan.md)。
 既存`analyze_perf.py page-turn --check`のI1〜I5は維持し、専用`page-turn-animation --check`で
 機会・開始/完走・skip率と可視提示/保持量を別集計する。合成ログの成功を製品性能受入れと扱わない。
 

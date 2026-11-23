@@ -2445,9 +2445,11 @@ class ContainerIconScrollTests(unittest.TestCase):
 
 class PageTurnAnimationTests(unittest.TestCase):
     def operation(self, index=0, *, context="reader-a", window="main", profile="single",
-                  run_id="run-1", outcome="finish", ingress=True):
+                  run_id="run-1", outcome="finish", ingress=True, style=None):
         base = {"cat": "page_turn_animation", "context": context, "window": window,
                 "operation_id": str(index), "profile": profile, "run_id": run_id}
+        if style is not None:
+            base["style"] = style
         time = index * .3 + 1
         input_rows = [{**base, "cat": "input", "kind": "key_edge_ingress", "t": time - .02,
                        "phase": "Press", "ingress_stage": "win32_enqueue"}] if ingress else []
@@ -2494,6 +2496,47 @@ class PageTurnAnimationTests(unittest.TestCase):
         self.assertEqual(report["status"], "pass")
         self.assertEqual(report["profiles"][0]["started"], 90)
         self.assertEqual(report["profiles"][0]["metrics"]["mesh_cpu_ms"]["samples"], 90)
+
+    def test_mixed_styles_are_aggregated_separately(self):
+        rows = self.complete_rows(style="curl") + self.complete_rows(style="slide")
+        for row in rows:
+            if row.get("style") == "slide" and "mesh_cpu_ms" in row:
+                row["mesh_cpu_ms"] = .7
+        report = self.analyze(rows)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(len(report["profiles"]), 2)
+        self.assertEqual({group["style"] for group in report["profiles"]}, {"curl", "slide"})
+        for group in report["profiles"]:
+            self.assertEqual(group["opportunities"], 90)
+            self.assertEqual(group["started"], 90)
+            self.assertEqual(group["finished"], 90)
+            self.assertEqual(group["metrics"]["mesh_cpu_ms"]["samples"], 90)
+            self.assertEqual(group["metrics"]["mesh_cpu_ms"]["p95"],
+                             .7 if group["style"] == "slide" else .3)
+
+    def test_legacy_logs_default_to_curl_and_share_explicit_curl_group(self):
+        rows = self.complete_rows()
+        report = self.analyze(rows)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(report["profiles"][0]["style"], "curl")
+        explicit_replay = [{**row, "style": "curl"} for row in rows]
+        report = self.analyze(rows + explicit_replay)
+        self.assertEqual(report["status"], "pass")
+        self.assertEqual(len(report["profiles"]), 1)
+        self.assertEqual(report["profiles"][0]["opportunities"], 90)
+        self.assertEqual(report["profiles"][0]["metrics"]["mesh_cpu_ms"]["samples"], 90)
+
+    def test_mixed_styles_in_one_window_do_not_meet_f12_two_context_requirement(self):
+        rows = self.complete_rows(profile="f12_single", style="curl")
+        rows += self.complete_rows(profile="f12_single", style="slide")
+        report = analyze_page_turn_animation(delivery_events(rows, 40), required_profiles=("f12_single",))
+        self.assertEqual(report["status"], "CannotJudge")
+        self.assertIn("f12_single: requires two reader contexts/windows", report["incomplete"])
+
+    def test_unknown_animation_style_cannot_judge(self):
+        report = self.analyze(self.complete_rows(style="future_style"))
+        self.assertEqual(report["status"], "CannotJudge")
+        self.assertIn("Unknown animation style: future_style", report["incomplete"])
 
     def test_d4_motion_metrics_separate_slow_preparation_and_deduplicate_replay(self):
         rows = self.complete_rows()
