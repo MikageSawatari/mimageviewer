@@ -1,5 +1,21 @@
 # アーキテクチャ概観
 
+## AI による使い方案内と設定・お気に入りの変更（§1.843）
+
+`crates/mcp-server` はビルド時にマニュアルの本文を埋め込み、`search_help` / `get_help` を
+本体への接続なしで処理する。閲覧中の場所・設定値は `agent_ipc` から本体の UI 所有状態を読む。
+`agent_show_current_view` / `agent_allow_settings` は既定 OFF で、Read レベル以上と個別のチェックで許可する。
+`settings_transfer` の項目表を設定の取得・検査・変更行に共有し、`app/agent_settings` は
+表示専用の初期化を省いた下書きを既存の `apply_preferences_dialog` へ渡す。
+`app/agent_favorite` はフォルダの検査を worker に任せ、ダイアログと共有の `fav_add` の確定処理を通す。
+変更の応答は確定前に予算を検査し、通知と「AI による変更」に記録する。AI が外部ツールを起動する経路は持たない。
+IPC 版は 6。スタック用スクリプトの本文は、同じ設定許可の `stack_script` で読み書きする。
+本文の取得・検査は agent worker、AI の照合付き書き込みと環境設定の「既定に戻す」「スクリプトを開く」は
+`filename_stack_script` の単一 FIFO worker に集約する。ボタンは enqueue だけで、UI は I/O・完了待ち・監視を行わない。
+書き込みは本文全体の SHA-256 を照合し、変更行とログには本文を出さず行数だけを残す。
+表示中のスタックは再構成せず、開き直し・フォルダ再読込時に新しい本文を使う。
+詳細は[設計と区切りごとの検証記録](mcp-guide-settings-plan.md)を参照。
+
 ## 3Dスライドショーの準備と提示（§1.771）
 
 `app/depth_view.rs` が描画の素材を `DepthViewState.current_material` へ記録し、同じcontextの

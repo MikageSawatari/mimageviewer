@@ -181,6 +181,9 @@ fn permission_is_live_and_handshake_negotiates_before_business_requests() {
     assert_eq!(
         status.permission,
         PermissionSnapshot {
+            current_view: false,
+            settings: false,
+
             transcripts: false,
             level: AgentLevel::ReadOnly,
             thumbnails: false,

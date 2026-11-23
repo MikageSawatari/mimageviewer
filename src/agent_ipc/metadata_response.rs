@@ -21,6 +21,8 @@ pub(super) fn respond(
     let dispatch = Arc::new(UiRequestDispatch::pending());
     let worker_dispatch = dispatch.clone();
     let controller = connection.handlers.open.clone();
+    let changes = connection.handlers.changes.clone();
+    let script_read = matches!(&command, Command::StackScript { source: None, .. });
     let worker_ctx = ctx.clone();
     let client_name = client
         .as_ref()
@@ -30,8 +32,24 @@ pub(super) fn respond(
     let worker = std::thread::Builder::new()
         .name("agent-metadata-worker".into())
         .spawn(move || {
-            let result =
-                controller.execute_write(command, &worker_ctx, client_name, worker_dispatch);
+            let result = match command {
+                Command::StackScript {
+                    source,
+                    part,
+                    expected_sha256,
+                } => controller.execute_stack_script(
+                    source,
+                    part,
+                    expected_sha256,
+                    &worker_ctx,
+                    client_name,
+                    worker_dispatch,
+                    &changes,
+                ),
+                command => {
+                    controller.execute_write(command, &worker_ctx, client_name, worker_dispatch)
+                }
+            };
             let _ = send.send(result);
         });
     let Ok(worker) = worker else {
@@ -77,9 +95,23 @@ pub(super) fn respond(
         }
     };
     let (value, policy) = match value {
-        Ok(open::UiOpenOutcome::Written(result)) => (result, ReplyPolicy::AcceptedOperation),
+        Ok(open::UiOpenOutcome::Written(result)) => (
+            result,
+            if script_read {
+                ReplyPolicy::Read(ctx.granted)
+            } else {
+                ReplyPolicy::AcceptedOperation
+            },
+        ),
         Ok(open::UiOpenOutcome::Refused(error)) | Err(error) => (Err(error), ReplyPolicy::Rejected),
-        Ok(open::UiOpenOutcome::Admitted) => (Err(failed()), ReplyPolicy::Rejected),
+        Ok(
+            open::UiOpenOutcome::Admitted
+            | open::UiOpenOutcome::Read(_)
+            | open::UiOpenOutcome::Settings(_),
+        )
+        | Ok(open::UiOpenOutcome::StackScriptAdmitted { .. }) => {
+            (Err(failed()), ReplyPolicy::Rejected)
+        }
     };
     connection.record(client.as_ref(), tool, started, &value);
     let reply = Reply {

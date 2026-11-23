@@ -1,5 +1,5 @@
-//! One agent UI admission owner for Open, tags and ratings. Open keeps the
-//! existing activation path; metadata targets are prepared on workers.
+//! One agent UI admission owner for Open, state reads, tags and ratings. Open
+//! keeps the existing activation path; metadata targets are prepared on workers.
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -47,12 +47,29 @@ impl Drop for OpenPermit {
 #[derive(Debug)]
 pub(crate) enum UiOpenOutcome {
     Admitted,
+    Read(mimageviewer_agent_ipc::ViewState),
+    Settings(mimageviewer_agent_ipc::SettingsPage),
+    StackScriptAdmitted { enabled: bool },
     Written(Result<mimageviewer_agent_ipc::Payload, AgentError>),
     Refused(AgentError),
 }
 
 pub(crate) enum UiRequestKind {
     Open(ActivationOpenPath),
+    GetViewState {
+        default_books_root: std::path::PathBuf,
+    },
+    GetSettings {
+        query: Option<String>,
+        keys: Option<Vec<String>>,
+        page: Option<u32>,
+    },
+    SetSettings {
+        changes: serde_json::Map<String, serde_json::Value>,
+        client_name: String,
+    },
+    SetFavorite(super::favorite::PreparedFavorite),
+    StackScriptAdmission,
     TagWrite(super::metadata_write::PreparedTags),
     RatingWrite(super::metadata_write::PreparedRatings),
 }
@@ -188,9 +205,150 @@ impl OpenController {
         client_name: String,
         dispatch: Arc<UiRequestDispatch>,
     ) -> Result<UiOpenOutcome, AgentError> {
-        self.dispatch_request(&ctx.cancel, dispatch, UI_REPLY_TIMEOUT, || {
-            super::metadata_write::prepare(command, ctx, client_name).map(UiRequestKind::from)
+        self.dispatch_request(&ctx.cancel, dispatch, UI_REPLY_TIMEOUT, || match command {
+            mimageviewer_agent_ipc::Command::SetSettings { changes } => {
+                if changes.is_empty() || changes.len() > mimageviewer_agent_ipc::MAX_SETTINGS_KEYS {
+                    return Err(super::error(
+                        mimageviewer_agent_ipc::ErrorCode::BadRequest,
+                        "設定は 1～32 項目で指定してください",
+                    ));
+                }
+                crate::settings_transfer::validate_stage1_paths(&changes).map_err(|message| {
+                    super::error(mimageviewer_agent_ipc::ErrorCode::BadRequest, &message)
+                })?;
+                ctx.checkpoint()?;
+                Ok(UiRequestKind::SetSettings {
+                    changes,
+                    client_name,
+                })
+            }
+            mimageviewer_agent_ipc::Command::SetFavorite {
+                path,
+                name,
+                item_index,
+                container_index,
+            } => {
+                super::favorite::prepare(path, name, item_index, container_index, client_name, ctx)
+                    .map(UiRequestKind::SetFavorite)
+            }
+            other => {
+                super::metadata_write::prepare(other, ctx, client_name).map(UiRequestKind::from)
+            }
         })
+    }
+
+    pub(super) fn execute_settings_read(
+        self: &Arc<Self>,
+        query: Option<String>,
+        keys: Option<Vec<String>>,
+        page: Option<u32>,
+        ctx: &super::ReadContext,
+    ) -> Result<mimageviewer_agent_ipc::SettingsPage, AgentError> {
+        ctx.checkpoint()?;
+        let result = self.dispatch_request(
+            &ctx.cancel,
+            Arc::new(UiRequestDispatch::pending()),
+            UI_REPLY_TIMEOUT,
+            || Ok(UiRequestKind::GetSettings { query, keys, page }),
+        )?;
+        match result {
+            UiOpenOutcome::Settings(page) => Ok(page),
+            UiOpenOutcome::Refused(error) => Err(error),
+            _ => Err(super::internal()),
+        }
+    }
+
+    pub(super) fn execute_stack_script(
+        self: &Arc<Self>,
+        source: Option<String>,
+        part: Option<u32>,
+        expected_sha256: Option<String>,
+        ctx: &super::ReadContext,
+        client_name: String,
+        dispatch: Arc<UiRequestDispatch>,
+        changes: &super::changes::ChangeController,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        super::stack_script::validate_arguments(
+            source.as_deref(),
+            part,
+            expected_sha256.as_deref(),
+        )?;
+        ctx.checkpoint()?;
+        let admission = self.stack_script_admission(&ctx.cancel, dispatch)?;
+        match admission {
+            UiOpenOutcome::StackScriptAdmitted { enabled } => {
+                // The claimed request owns its result. Only this agent worker
+                // waits for file work; the UI has already returned admission.
+                Ok(UiOpenOutcome::Written(super::stack_script::execute(
+                    source,
+                    part,
+                    expected_sha256,
+                    enabled,
+                    &client_name,
+                    changes,
+                )))
+            }
+            UiOpenOutcome::Refused(error) => Ok(UiOpenOutcome::Refused(error)),
+            _ => Err(super::internal()),
+        }
+    }
+
+    fn stack_script_admission(
+        self: &Arc<Self>,
+        cancel: &AtomicBool,
+        dispatch: Arc<UiRequestDispatch>,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        self.dispatch_request(cancel, dispatch, UI_REPLY_TIMEOUT, || {
+            Ok(UiRequestKind::StackScriptAdmission)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stack_script_admission_for_test(
+        self: &Arc<Self>,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        self.stack_script_admission(
+            &AtomicBool::new(false),
+            Arc::new(UiRequestDispatch::pending()),
+        )
+    }
+
+    pub(super) fn execute_view_state(
+        self: &Arc<Self>,
+        ctx: &super::ReadContext,
+    ) -> Result<mimageviewer_agent_ipc::ViewState, AgentError> {
+        ctx.checkpoint()?;
+        self.execute_view_state_read(&ctx.cancel)
+    }
+
+    fn execute_view_state_read(
+        self: &Arc<Self>,
+        cancel: &AtomicBool,
+    ) -> Result<mimageviewer_agent_ipc::ViewState, AgentError> {
+        let outcome = self.dispatch_request(
+            cancel,
+            Arc::new(UiRequestDispatch::pending()),
+            UI_REPLY_TIMEOUT,
+            // Known-folder resolution may call the shell. Keep it on this
+            // worker; the UI chooses its live explicit book_root if present.
+            || {
+                Ok(UiRequestKind::GetViewState {
+                    default_books_root: crate::books::default_books_root(),
+                })
+            },
+        )?;
+        match outcome {
+            UiOpenOutcome::Read(state) => Ok(state),
+            UiOpenOutcome::Refused(error) => Err(error),
+            _ => Err(super::internal()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_view_state_for_test(
+        self: &Arc<Self>,
+    ) -> Result<mimageviewer_agent_ipc::ViewState, AgentError> {
+        self.execute_view_state_read(&AtomicBool::new(false))
     }
 
     #[cfg(test)]
@@ -202,6 +360,32 @@ impl OpenController {
         timeout: Duration,
     ) -> Result<UiOpenOutcome, AgentError> {
         self.dispatch_request(cancel, dispatch, timeout, || Ok(prepared.into()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_settings_for_test(
+        self: &Arc<Self>,
+        kind: UiRequestKind,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        self.dispatch_request(
+            &AtomicBool::new(false),
+            Arc::new(UiRequestDispatch::pending()),
+            UI_REPLY_TIMEOUT,
+            || Ok(kind),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_favorite_for_test(
+        self: &Arc<Self>,
+        favorite: super::favorite::PreparedFavorite,
+    ) -> Result<UiOpenOutcome, AgentError> {
+        self.dispatch_request(
+            &AtomicBool::new(false),
+            Arc::new(UiRequestDispatch::pending()),
+            UI_REPLY_TIMEOUT,
+            || Ok(UiRequestKind::SetFavorite(favorite)),
+        )
     }
 
     fn dispatch_request(
@@ -235,8 +419,8 @@ impl OpenController {
             return Err(cancelled());
         }
         let (reply, receiver) = mpsc::sync_channel(1);
-        // Only Open restores/foregrounds the window. Metadata requests wake the
-        // UI through repaint below, including minimized and tray-hidden windows.
+        // Only Open restores/foregrounds the window. Reads and metadata requests
+        // wake the UI through repaint, including minimized/tray-hidden windows.
         if matches!(&kind, UiRequestKind::Open(_)) {
             #[cfg(not(test))]
             crate::single_instance::signal_activate_existing();
@@ -302,7 +486,10 @@ fn outcome_result(reply: UiOpenOutcome) -> Result<OpenResult, AgentError> {
             message: "mIV で開く処理を始めました".to_owned(),
         }),
         UiOpenOutcome::Refused(error) => Err(error),
-        UiOpenOutcome::Written(_) => Err(open_failed()),
+        UiOpenOutcome::Written(_)
+        | UiOpenOutcome::Read(_)
+        | UiOpenOutcome::Settings(_)
+        | UiOpenOutcome::StackScriptAdmitted { .. } => Err(open_failed()),
     }
 }
 

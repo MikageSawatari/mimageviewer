@@ -788,7 +788,12 @@ use book_structural_op::BookStructuralOp;
 mod startup_list_restore;
 pub(crate) mod top_level_grid_view;
 pub(crate) use startup_list_restore::StartupListIntent;
+mod agent_favorite;
 pub(crate) mod agent_rating_write;
+mod agent_settings;
+#[cfg(test)]
+mod agent_stack_script_tests;
+mod agent_view_state;
 mod list_order_navigation;
 #[cfg(test)]
 mod list_order_tests;

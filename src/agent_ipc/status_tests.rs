@@ -4,6 +4,9 @@ fn base() -> StatusPayload {
     StatusPayload {
         app_version: "fixture".into(),
         permission: PermissionSnapshot {
+            current_view: false,
+            settings: false,
+
             level: AgentLevel::ReadOnly,
             thumbnails: false,
             gps: false,

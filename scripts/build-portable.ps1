@@ -154,6 +154,12 @@ function Get-MivSourceFingerprintRecords {
     $explicitInputs = @(
         (Join-Path $Root 'vendor\ffmpeg\VERSION')
     )
+    # The MCP adapter embeds only these manual HTML inputs, including ignored
+    # local pages. A help-only edit must invalidate diagnostic -SkipBuild reuse.
+    foreach ($manualDir in @('htdocs\mimageviewer\manual', 'htdocs\mimageviewer\manual\sound')) {
+        $explicitInputs += @(Get-ChildItem -LiteralPath (Join-Path $Root $manualDir) -Filter '*.html' -File |
+            Where-Object { $_.Name -cne 'changelog.html' } | ForEach-Object { $_.FullName })
+    }
     $explicitInputs += @(Get-ChildItem -LiteralPath (Join-Path $Root 'vendor\twemoji\svg') -Filter '*.svg' -File -ErrorAction SilentlyContinue |
         ForEach-Object { $_.FullName })
     $explicitInputs += @(Get-ChildItem -LiteralPath (Join-Path $Root 'assets\annotation-stamps') -Filter '*.svg' -File -ErrorAction SilentlyContinue |

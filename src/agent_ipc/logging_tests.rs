@@ -231,6 +231,9 @@ fn polling_logs_permission_changes_errors_and_recovery_once() {
 fn polling_state_is_bounded_to_permission_epoch_and_error_kind() {
     let mut log = LaneLog::default();
     let snapshot = PermissionSnapshot {
+        current_view: false,
+        settings: false,
+
         transcripts: false,
         level: AgentLevel::ReadOnly,
         thumbnails: false,

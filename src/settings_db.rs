@@ -1102,6 +1102,8 @@ impl SettingsDb {
                 gps: settings.agent_show_gps,
                 ai_captions: settings.agent_show_ai_captions,
                 transcripts: settings.agent_show_transcripts,
+                current_view: settings.agent_show_current_view,
+                settings: settings.agent_allow_settings,
             };
 
         // 1. 事前の差分判定 (transaction 外)。共有 `Arc` の同一性で見るので O(行数)。
@@ -3406,6 +3408,8 @@ fn read_agent_permission(conn: &Connection) -> Result<PermissionSnapshot, Settin
         gps: read_settings_kv_typed(conn, "agent_show_gps", || false)?,
         ai_captions: read_settings_kv_typed(conn, "agent_show_ai_captions", || false)?,
         transcripts: read_settings_kv_typed(conn, "agent_show_transcripts", || false)?,
+        current_view: read_settings_kv_typed(conn, "agent_show_current_view", || false)?,
+        settings: read_settings_kv_typed(conn, "agent_allow_settings", || false)?,
     })
 }
 
@@ -4896,6 +4900,9 @@ mod tests {
         assert_eq!(
             admitted.0,
             PermissionSnapshot {
+                current_view: false,
+                settings: false,
+
                 level: AgentLevel::ReadAndOpen,
                 thumbnails: true,
                 gps: true,
@@ -4932,6 +4939,9 @@ mod tests {
             assert_eq!(
                 current.0,
                 PermissionSnapshot {
+                    current_view: false,
+                    settings: false,
+
                     level,
                     thumbnails,
                     gps,
@@ -4969,6 +4979,46 @@ mod tests {
         assert!(!missing.ai_captions);
         assert!(!missing.transcripts);
         assert!(!db.load_into_settings().unwrap().agent_show_transcripts);
+    }
+
+    #[test]
+    fn agent_guide_permissions_default_off_roundtrip_and_advance_epoch_independently() {
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!missing.agent_show_current_view && !missing.agent_allow_settings);
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        let mut settings = Settings {
+            agent_level: AgentLevel::ReadOnly,
+            ..Settings::default()
+        };
+        db.save_full(&settings).unwrap();
+        let mut previous = db.load_agent_permission().unwrap();
+        for (current_view, allow_settings) in
+            [(true, false), (true, true), (false, true), (false, false)]
+        {
+            settings.agent_show_current_view = current_view;
+            settings.agent_allow_settings = allow_settings;
+            db.save_full(&settings).unwrap();
+            let snapshot = db.load_agent_permission().unwrap();
+            assert_eq!(snapshot.0.current_view, current_view);
+            assert_eq!(snapshot.0.settings, allow_settings);
+            assert_ne!(snapshot.1, previous.1);
+            let loaded = db.load_into_settings().unwrap();
+            assert_eq!(loaded.agent_show_current_view, current_view);
+            assert_eq!(loaded.agent_allow_settings, allow_settings);
+            db.save_full(&settings).unwrap();
+            assert_eq!(db.load_agent_permission().unwrap(), snapshot);
+            previous = snapshot;
+        }
+        drop(db);
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let loaded = db.load_agent_permission().unwrap();
+        assert!(!loaded.0.current_view && !loaded.0.settings);
+        db.inner.lock().unwrap().conn.execute("DELETE FROM settings_kv WHERE key IN ('agent_show_current_view','agent_allow_settings')", []).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert!(!loaded.agent_show_current_view && !loaded.agent_allow_settings);
+        let loaded = db.load_agent_permission().unwrap().0;
+        assert!(!loaded.current_view && !loaded.settings);
     }
 
     #[test]
