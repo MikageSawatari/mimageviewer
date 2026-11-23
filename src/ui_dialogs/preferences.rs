@@ -6524,7 +6524,152 @@ mod tests {
     #[test]
     fn folder_cell_background_preferences_edit_ok_paints_and_invalid_blocks_ok() {
         use egui_kittest::kittest::{NodeT, Queryable};
-        let mut harness = preferences_view_harness(PreferencesPage::Thumbnail);
+        fn collect_rects(
+            shape: &egui::Shape,
+            clip: egui::Rect,
+            transform: egui::emath::TSTransform,
+            rects: &mut Vec<(egui::Rect, egui::Color32, egui::Rect)>,
+        ) {
+            match shape {
+                egui::Shape::Rect(rect) => rects.push((transform * rect.rect, rect.fill, clip)),
+                egui::Shape::Vec(children) => {
+                    for child in children {
+                        collect_rects(child, clip, transform, rects);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        fn assert_grid_background(
+            harness: &egui_kittest::Harness<'_, crate::app::AppTestEnvForTest>,
+            previous_probe: Option<egui::Pos2>,
+        ) -> egui::Pos2 {
+            let app = harness.state();
+            assert_eq!(
+                app.settings.grid_view_mode,
+                crate::settings::GridViewMode::Thumbnail
+            );
+            assert_eq!(app.items.len(), 1);
+            assert!(matches!(
+                &app.items[0],
+                crate::grid_item::GridItem::Folder(_)
+            ));
+            assert!(!app.items_are_drive_list);
+            assert_eq!(app.selected, None);
+            assert!(app.checked.is_empty());
+            let response = harness
+                .ctx
+                .data(|data| {
+                    data.get_temp::<egui::Response>(egui::Id::unique((
+                        "grid_cell_input_response",
+                        app.grid_scroll_context_id(),
+                        0usize,
+                    )))
+                })
+                .expect("production thumbnail grid must publish the folder cell");
+            let dark = harness
+                .ctx
+                .data(|data| {
+                    data.get_temp::<bool>(egui::Id::unique("folder_background_test_grid_dark"))
+                })
+                .expect("production grid theme must be recorded in the drawing pass");
+            let setting = &app.settings.folder_cell_background;
+            let expected = if setting.enabled {
+                setting.color(dark)
+            } else {
+                crate::folder_cell_background::cell_background(
+                    setting,
+                    &app.items[0],
+                    app.items_are_drive_list,
+                    dark,
+                    false,
+                    false,
+                )
+            };
+            let cell_transform = harness
+                .ctx
+                .layer_transform_to_global(response.layer_id)
+                .unwrap_or(egui::emath::TSTransform::IDENTITY);
+            let cell = cell_transform * response.rect;
+            // Probe the empty area left of the icon, away from the corner mark and filename.
+            // Reuse this screen position after OFF instead of accepting any white panel.
+            let probe = previous_probe
+                .unwrap_or_else(|| cell.center() - egui::vec2(cell.width() * 0.25, 0.0));
+            let mut rects = Vec::new();
+            for clipped in &harness.output().shapes {
+                collect_rects(
+                    &clipped.shape,
+                    clipped.clip_rect,
+                    clipped.transform_after_tessellation,
+                    &mut rects,
+                );
+            }
+            let overlapping: Vec<_> = rects
+                .iter()
+                .enumerate()
+                .filter(|(_, (rect, _, _))| rect.intersects(cell))
+                .collect();
+            // Shapes are in paint order. The last filled Rect covering the probe
+            // owns its background; an earlier panel fill cannot satisfy OFF.
+            let top_fill = rects.iter().rev().find_map(|(rect, fill, clip)| {
+                (fill.a() > 0 && rect.contains(probe) && clip.contains(probe)).then_some(*fill)
+            });
+            assert!(
+                cell.is_positive() && cell.contains(probe) && top_fill == Some(expected),
+                "production folder cell must use {expected:?}; cell_local={:?}; cell={cell:?}; \
+                 probe={probe:?}; cell_transform={cell_transform:?}; top_fill={top_fill:?}; \
+                 enabled={}; input_allowed={}; dark={}; setting={:?}; shape_count={}; \
+                 overlapping Rects in paint order (index, (rect, fill, clip))={overlapping:#?}",
+                response.rect,
+                response.enabled(),
+                app.grid_item_input_allowed(),
+                dark,
+                app.settings.folder_cell_background,
+                harness.output().shapes.len(),
+            );
+            probe
+        }
+
+        let mut app = crate::app::setup_app_for_test();
+        let folder = app.tmp.path().join("folder-background-grid");
+        std::fs::create_dir_all(folder.join("写真")).unwrap();
+        app.settings.auto_fullscreen_image_folders = false;
+        app.settings.ui_theme = crate::settings::UiTheme::Light;
+        app.load_folder_with_scan(folder, None);
+        app.finish_page_identity_preparation_for_test();
+        app.settings.grid_view_mode = crate::settings::GridViewMode::Thumbnail;
+        app.settings.grid_cols = 4;
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Failed; app.items.len()];
+        app.selected = None;
+        app.checked.clear();
+        app.open_preferences_page(PreferencesPage::Thumbnail);
+        // Harness は setup 後に既定 Dark を適用し、この fixture は render_apply_theme を通らない。
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(|ctx| {
+                crate::ui_fonts::configure_fonts(ctx);
+                crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Light);
+            })
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_ui_state(
+                |root_ui, app: &mut crate::app::AppTestEnvForTest| {
+                    // Closing Preferences resumes the real listing in this same Context.
+                    if app.show_preferences {
+                        app.show_preferences_dialog(&root_ui.ctx().clone());
+                    } else {
+                        let dark = root_ui.visuals().dark_mode;
+                        root_ui.ctx().data_mut(|data| {
+                            data.insert_temp(
+                                egui::Id::unique("folder_background_test_grid_dark"),
+                                dark,
+                            );
+                        });
+                        let _ = app.render_grid(root_ui);
+                    }
+                },
+                app,
+            );
+        harness.run_steps(3);
         let label = "フォルダのセルの背景に色を付ける";
         let hex = "フォルダ背景 Light HEX";
         harness.get_by_label(label).click();
@@ -6553,12 +6698,25 @@ mod tests {
                 .accesskit_node()
                 .is_disabled()
         );
+        let dark_hex = "フォルダ背景 Dark HEX";
+        harness.get_by_label(dark_hex).focus();
+        harness.run_steps(3);
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+        harness.run_steps(3);
+        harness.get_by_label(dark_hex).type_text("1E2314");
+        harness.run_steps(3);
+        assert!(
+            !harness
+                .get_by_label("  OK  ")
+                .accesskit_node()
+                .is_disabled()
+        );
         harness.get_by_label("  OK  ").click();
         harness.run_steps(3);
         let expected = crate::folder_cell_background::FolderCellBackground {
             enabled: true,
             light: [255, 255, 230],
-            ..Default::default()
+            dark: [30, 35, 20],
         };
         assert!(!harness.state().show_preferences);
         assert_eq!(harness.state().settings.folder_cell_background, expected);
@@ -6567,43 +6725,20 @@ mod tests {
             db.load_into_settings().unwrap().folder_cell_background,
             expected
         );
-        // The next actual thumbnail paint reads the accepted live setting.
-        let ctx = egui::Context::default();
-        crate::ui_fonts::configure_fonts(&ctx);
-        crate::os_theme::apply_resolved(&ctx, crate::os_theme::ResolvedTheme::Light);
-        let cell = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(180.0, 140.0));
-        let mut painted = false;
-        for _ in 0..2 {
-            let output = crate::test_ui::headless_paint_output(ctx.run_pass(
-                egui::RawInput::default(),
-                |ctx| {
-                    ctx.root_ui(|root| {
-                        egui::CentralPanel::default().show(root, |ui| {
-                            crate::app::draw_cell(
-                                ui,
-                                cell,
-                                false,
-                                false,
-                                false,
-                                &Default::default(),
-                                &crate::grid_item::GridItem::Folder("写真".into()),
-                                &crate::grid_item::ThumbnailState::Failed,
-                                crate::rotation_db::Rotation::None,
-                                None,
-                                false,
-                                Default::default(),
-                                Default::default(),
-                                false,
-                                None,
-                                &harness.state().settings.folder_cell_background,
-                            );
-                        });
-                    });
-                },
-            ));
-            painted = output.shapes.iter().any(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.rect == cell && r.fill == egui::Color32::from_rgb(255,255,230)));
+        let mut probe = Some(assert_grid_background(&harness, None));
+        for (theme, dark) in [
+            (crate::os_theme::ResolvedTheme::Light, false),
+            (crate::os_theme::ResolvedTheme::Dark, true),
+        ] {
+            crate::os_theme::apply_resolved(&harness.ctx, theme);
+            harness.run_steps(3);
+            assert_eq!(
+                harness.ctx.data(|data| data
+                    .get_temp::<bool>(egui::Id::unique("folder_background_test_grid_dark"))),
+                Some(dark)
+            );
+            probe = Some(assert_grid_background(&harness, probe));
         }
-        assert!(painted);
         harness
             .state_mut()
             .open_preferences_page(PreferencesPage::Thumbnail);
@@ -6614,9 +6749,25 @@ mod tests {
         harness.run_steps(3);
         assert!(!harness.state().settings.folder_cell_background.enabled);
         assert_eq!(
-            harness.state().settings.folder_cell_background.light,
-            expected.light
+            harness.state().settings.folder_cell_background,
+            crate::folder_cell_background::FolderCellBackground {
+                enabled: false,
+                ..expected
+            }
         );
+        for (theme, dark) in [
+            (crate::os_theme::ResolvedTheme::Light, false),
+            (crate::os_theme::ResolvedTheme::Dark, true),
+        ] {
+            crate::os_theme::apply_resolved(&harness.ctx, theme);
+            harness.run_steps(3);
+            assert_eq!(
+                harness.ctx.data(|data| data
+                    .get_temp::<bool>(egui::Id::unique("folder_background_test_grid_dark"))),
+                Some(dark)
+            );
+            probe = Some(assert_grid_background(&harness, probe));
+        }
     }
 
     #[test]
