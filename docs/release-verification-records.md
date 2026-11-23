@@ -12,6 +12,17 @@
 
 ---
 
+## v5.6.0 (2026-11-23)
+
+- **対象**: §1.827 (ツリーの仮想化)・§1.828・§1.834・§1.835 / §1.838・§1.839・§1.840・§1.842・§1.844・§1.849・§1.850・§1.851・§1.855・§1.856・§1.818 (ブラウザ連携の本体側。拡張機能は未公開)・§1.858 A。どれもサブ PC かサブ PC2 で確認済み。更新履歴は利用者承認済み (16 項目、7,959 バイトで短縮版なし)。既知の問題から絞り込みの範囲指定の節を外した。「重要な変更点」の登録はなし (操作・既定の変更がないため)。マニュアルの左のリンク一覧に「ブラウザ連携」を全 35 ページそろえた。
+- **配布ビルドの入力**: master `77d160498`。ReleaseChecks のキットは `1af9508e1` で作った。間の差分は、バックログの文書 (§1.865) とキットを作る道具の修正 (`77d160498`、ブラウザ連携の exe の照合を足した。製品のコードは変わらない) だけ。
+- **依存**: PDFium 8165・FFmpeg n7.1.5-16・LibRaw 0.22.3・libavif 1.4.2・ONNX Runtime DirectML 1.24.4・Rust 1.100.0 はどれも最新。通常のクレートの小さな更新 14 件と mIV Sound の元 (EffeTune v0.19.0) は今回は上げない。記録済みのクラッシュは 17 種すべて扱い済み。`cargo fmt --check` 成功。
+- **自動テスト**: master `d3858cfc1` の lib 全件 19,890 件成功。test-script の lib 全件は `b00613feb` で 20,050 件中 1 件失敗 (§1.865、並列のときだけ落ちるテスト。単独 5 回は全成功)、配布の入力 `77d160498` で 20,050 件すべて成功。配布ビルドの全体テストは 22,068 件成功。1 回目の `build-dist.ps1` は、全体テストの前提の `target\release\mimageviewer-browser-host.exe` が無く (今回初めて加わった exe)、テストの前のビルドで止まった。その exe だけを先に作って流し直した。
+- **ReleaseChecks (サブ PC 担当がターミナル パネルから実行、利用者了承 2026-11-23 午前、事前確認 1 回と本番 1 回)**: キット `relcheck-1af9508e1-20261123-012334` (manifest SHA-256 `bd59de57ae560ea39c25b0dbeef5e298b2b638f2c7c131d9b9cb698953f824d7`)、run `release-checks-20261123-012604-a077d1e4`。事前確認 READY。本番は **FAIL (exit 1)**、`Receive-ReleaseCheckResult.ps1` の照合も FAIL / 1。idle 5 ケース PASS (CPU 1 コア比 0.002〜0.005、測定区間の frame 0)。perf cached は PASS_WITH_WARNINGS (起動の最初の frame の gap 442 ms、上限 500 ms。drawn <16 ms 0%、p95 32.6 ms、pre_grid raw p95 0.20 ms)。**perf uncached は FAIL**: 起動直後の frame 1→2 が 504 ms で上限 500 ms を超え、unexplained に分類された (ほかの数値は 256 folder load・Ctrl+Down 5・検索完了、drawn <16 ms 0%、p95 32.0 ms、pre_grid raw p95 0.21 ms)。統括が同じログを判定に上限 505 ms で通すと known-startup-first-frame になり、上限以外の条件は満たしていた。同じサブ PC の v5.5.1 は 461・451 ms。**利用者の判断で、理由付きの FAIL として記録して配布へ進めた** (利用者の言葉: 「理由付きで進める」)。続きは §1.866。キットを作る道具がブラウザ連携の exe の照合に追いついておらず、キットを作る前の検査で止まったので直した (`77d160498`、`test-release-check-safety.ps1` 成功)。
+- **署名・成果物**: `build-dist.ps1 -SkipVst3Bridge` (11:32 完了、全 PE / VC runtime gate 通過)。単体exe・setup.exe・ポータブル版の mimageviewer.exe と mimageviewer-browser-host.exe・mimageviewer-vst3-host.exe を `signtool verify /pa /v` で確認した (Open Source Developer Taku Sano、RFC3161 timestamp あり)。sha256: 単体exe `31db2b6ffd9d8c2054ad7fc33f0f06b843aa15510a5386f0077d1cc7df89292f` (610,025,560 B)・setup.exe `6b17de4bcca40b1eb823573b232746020a46d8625974014de1c6a030a46370df` (273,791,952 B)・Vector zip `9cc7809c2d073573b18b9073238d70c815c1bfb7a264394fb360fa6e00539831` (273,363,432 B)・ポータブル zip `ab97a1846d15ac05286cb0298052c59c8ee98b8b67d17465df2a26af8c3316d1` (325,657,917 B)。
+- **VirusTotal (2026-11-23、送信は利用者の了承のうえ利用者が実行、結果は ClaudeCode が結果ページで確認)**: 新しく加わった `mimageviewer-browser-host.exe` (署名済み、814,680 bytes) sha256 `809a7c76aea8290b28e5d8f794e906a876797c6d88dfdf8a9693c59e0593425e` — 0/71、Google・Microsoft とも Undetected。https://www.virustotal.com/gui/file/809a7c76aea8290b28e5d8f794e906a876797c6d88dfdf8a9693c59e0593425e 。VST3 host と mIV Sound は v5.4.0 から変更なし (再署名のみ) なので省略。
+- **利用者の実機確認 (インストーラ版、メイン PC)**: v5.5.1 の上から入れて起動。ツリーの表示が軽くなったこと、ブラウザ連携の設定項目を利用者が確認した。起動時に「前回の終了について」が出たが、前日 (11-22) 19:06〜19:10 ごろに前の版の画面が止まったまま終わった記録によるもので、今回のインストールとは関係しない (統括がログで確認、§1.867)。「重要な変更点」は登録していないので出ない (今の作りどおり)。
+
 ## v5.5.1 (2026-11-22)
 
 - **対象**: §1.836 だけ (一覧からフォルダツリーへのドラッグで、移動のときも「＋ コピー」と表示される件。v5.5.0 の §1.464 の不具合)。配布ビルドの入力・タグ v5.5.1・main はどれも master `aa6f06685`。利用者決定 (2026-11-21): v5.5.1 は §1.836 だけ。更新履歴は利用者承認済み (短縮版なし)。既知の問題からツリーのドラッグの節を外した。
