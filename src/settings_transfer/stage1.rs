@@ -1028,9 +1028,9 @@ mod tests {
         assert_eq!(rows.len(), keys.len());
         let (export, issues) = project(capture_export(&settings));
         assert!(issues.is_empty(), "{issues:?}");
-        assert_eq!(export.len(), 169);
+        assert_eq!(export.len(), 170);
         assert_eq!(STAGE1_MARKED_ANCHORS.len(), 57);
-        assert_eq!(rows.len(), 226);
+        assert_eq!(rows.len(), 227);
         for key in export.keys() {
             assert!(keys.contains(key.as_str()), "{key}");
         }

@@ -277,14 +277,20 @@ fn double_click_close_mode_preserves_touch_page_tap_and_suppresses_promoted_clic
         &ctx,
         vec![
             touch(egui::TouchPhase::End),
-            egui::Event::PointerMoved(pos),
+            // Match egui-winit: End releases at the last cursor position,
+            // then removes the promoted pointer; no move is emitted here.
             pointer(false),
+            egui::Event::PointerGone,
         ],
         |ui| {
             app.frame_counter += 1;
             let (result, _) = super::wheel_frame_tests::actual_merge(&mut app, ui, false);
             assert!(!result.close);
             assert_eq!(result.page_nav, FsPageNav::Delta(1));
+            assert_eq!(
+                app.fs_front_pointer.clicks.current_accepted, 0,
+                "the promoted release must not also count as a canvas mouse click"
+            );
             assert!(!app.fs_front_pointer.clicks.previous_close_candidate);
         },
     );
