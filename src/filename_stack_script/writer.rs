@@ -33,8 +33,16 @@ pub fn read_script_document() -> Result<ScriptDocument, String> {
 /// agent worker 専用。検証後に enqueue し、自分の仕事の結果だけを待つ。
 /// コンパイルのみ行い、group やトップレベルのコードは実行しない。
 pub fn write_script(source: String, expected_sha256: String) -> Result<ScriptWriteOutcome, String> {
+    write_script_with(source, expected_sha256, writer)
+}
+
+fn write_script_with<'a>(
+    source: String,
+    expected_sha256: String,
+    get_writer: impl FnOnce() -> Result<&'a ScriptWriter, String>,
+) -> Result<ScriptWriteOutcome, String> {
     validate_source(&source)?;
-    writer()?.write_validated(source, expected_sha256)
+    get_writer()?.write_validated(source, expected_sha256)
 }
 
 /// 環境設定のボタン用。ファイル I/O や worker の完了を UI で待たない。
@@ -134,8 +142,8 @@ impl ScriptWriter {
 }
 
 fn validate_source(source: &str) -> Result<(), String> {
-    if source.len() as u64 > MAX_SCRIPT_BYTES {
-        return Err("スタック用スクリプトは 1 MiB 以下にしてください".into());
+    if source.len() > mimageviewer_agent_ipc::MAX_STACK_SCRIPT_SOURCE_BYTES {
+        return Err("AI が書くスタック用スクリプトは UTF-8 で 256 KiB 以下にしてください".into());
     }
     // 実際に使うコンパイラを通す。エラーは agent の応答だけに返し、ログや変更通知へ
     // 渡さないこと (コンパイルエラーにはソースの token/識別子が含まれることがある)。

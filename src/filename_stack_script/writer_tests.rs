@@ -56,12 +56,75 @@ fn script_document_rejects_overflow_invalid_utf8_and_read_errors() {
 }
 
 #[test]
+fn script_document_reads_exact_one_mib_user_file_without_ai_write_cap() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("stack_rules.rhai");
+    let mut source = "// 利用者のファイル\n".to_owned();
+    source.push_str(&" ".repeat(MAX_SCRIPT_BYTES as usize - source.len()));
+    fs::write(&path, &source).unwrap();
+    let document = read_document_at(&path).unwrap();
+    assert!(!document.builtin);
+    assert_eq!(document.source.len(), MAX_SCRIPT_BYTES as usize);
+    assert_eq!(document.source, source);
+    assert_eq!(document.sha256, sha256(&source));
+}
+
+#[test]
+fn script_write_exact_ai_byte_cap_compiles_and_writes_but_overflow_has_no_file_work() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("stack_rules.rhai");
+    let worker_path = path.clone();
+    let writer = ScriptWriter::start(move || worker_path, |_| Ok(())).unwrap();
+    let mut source = "fn group(files) { [] }\n//".to_owned();
+    source.push_str(
+        &"a".repeat(mimageviewer_agent_ipc::MAX_STACK_SCRIPT_SOURCE_BYTES - source.len()),
+    );
+    assert_eq!(source.len(), 256 * 1024);
+    let outcome =
+        write_script_with(source.clone(), sha256(DEFAULT_SCRIPT), || Ok(&writer)).unwrap();
+    assert_eq!(outcome.sha256, sha256(&source));
+    assert_eq!(fs::read_to_string(&path).unwrap(), source);
+
+    // 同じ受付経路で上限を超えると、書き手の取得さえしない。実 profile は使わない。
+    let mut overflow = source.clone();
+    overflow.push('a');
+    let error = write_script_with(overflow, outcome.sha256.clone(), || {
+        panic!("上限の検査は writer の取得やファイル I/O より前でなければならない")
+    })
+    .unwrap_err();
+    assert!(error.contains("256 KiB"));
+    assert_eq!(fs::read_to_string(&path).unwrap(), source);
+    assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+
+    // 上限は文字数ではなく UTF-8 のバイト数。非 ASCII の本文も同じ基準で拒む。
+    let multibyte = format!("//{}", "あ".repeat(256 * 1024 / 3));
+    assert!(multibyte.chars().count() < 256 * 1024);
+    assert!(multibyte.len() > 256 * 1024);
+    assert!(
+        write_script_with(multibyte, outcome.sha256, || {
+            panic!("UTF-8 のバイト上限を超える本文で writer を取得してはならない")
+        })
+        .is_err()
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), source);
+}
+
+#[test]
 fn script_write_rejects_overflow_and_noncompile_before_enqueue() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("stack_rules.rhai");
     fs::write(&path, FIRST).unwrap();
-    assert!(write_script(" ".repeat(MAX_SCRIPT_BYTES as usize + 1), sha256(FIRST)).is_err());
-    assert!(write_script("fn group(files) {".into(), sha256(FIRST)).is_err());
+    for source in [
+        " ".repeat(mimageviewer_agent_ipc::MAX_STACK_SCRIPT_SOURCE_BYTES + 1),
+        "fn group(files) {".to_owned(),
+    ] {
+        assert!(
+            write_script_with(source, sha256(FIRST), || {
+                panic!("検証に失敗した本文で writer を取得してはならない")
+            })
+            .is_err()
+        );
+    }
     assert_eq!(fs::read_to_string(path).unwrap(), FIRST);
 }
 

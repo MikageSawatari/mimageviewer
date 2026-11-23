@@ -5,11 +5,11 @@ use super::changes::{
 };
 use crate::filename_stack_script::{self, ScriptDocument};
 use mimageviewer_agent_ipc::{
-    AgentError, ErrorCode, MAX_PAGE_CHARS, Payload, StackScriptReadResult, StackScriptResult,
-    StackScriptWriteResult, mcp_content_chars,
+    AgentError, ErrorCode, MAX_PAGE_CHARS, MAX_STACK_SCRIPT_SOURCE_BYTES, Payload,
+    StackScriptReadResult, StackScriptResult, StackScriptWriteResult, mcp_content_chars,
 };
 
-const MESSAGE: &str = "書く前に読み、戻せるようにその本文を持っておいてください。スタック表示を開き直すか、フォルダを読み直すと新しいスクリプトで分けます。";
+const MESSAGE: &str = "書く前に読み、戻せるようにその本文を持っておいてください。256 KiB を超える本文はエディタから戻してください。スタック表示を開き直すか、フォルダを読み直すと新しいスクリプトで分けます。";
 
 fn bad(message: &str) -> AgentError {
     super::error(ErrorCode::BadRequest, message)
@@ -35,8 +35,10 @@ pub(super) fn validate_arguments(
             "書き込みと 2 つ目以降の part には expected_sha256 が必要です。最初から読み直してください",
         ));
     }
-    if source.is_some_and(|source| source.len() as u64 > filename_stack_script::MAX_SCRIPT_BYTES) {
-        return Err(bad("スタック用スクリプトは 1 MiB 以下にしてください"));
+    if source.is_some_and(|source| source.len() > MAX_STACK_SCRIPT_SOURCE_BYTES) {
+        return Err(bad(
+            "AI から書き込むスタック用スクリプトは UTF-8 で 256 KiB 以下にしてください",
+        ));
     }
     Ok(())
 }
@@ -48,47 +50,45 @@ fn check_budget(value: &impl serde::Serialize) -> Result<(), AgentError> {
     Ok(())
 }
 
-/// Split on Unicode scalar boundaries using the actual structured + text-copy
-/// size. Maximal part-number widths bound the final part/parts metadata.
-fn parts(document: &ScriptDocument, enabled: bool) -> Result<Vec<String>, AgentError> {
-    let bounds = document
-        .source
-        .char_indices()
-        .map(|(index, _)| index)
-        .chain(std::iter::once(document.source.len()))
-        .collect::<Vec<_>>();
+/// Partition by the exact JSON + escaped-text-copy cost of each scalar.
+/// Widest metadata keeps boundaries independent of the enabled/builtin state:
+/// those can change between parts without changing the source hash.
+fn parts(document: &ScriptDocument) -> Result<Vec<std::ops::Range<usize>>, AgentError> {
+    let bound = StackScriptReadResult {
+        source: String::new(),
+        sha256: document.sha256.clone(),
+        builtin: false,
+        enabled: false,
+        part: u32::MAX,
+        parts: u32::MAX,
+        message: MESSAGE.into(),
+    };
+    let available = MAX_PAGE_CHARS
+        .checked_sub(mcp_content_chars(&bound).map_err(|_| super::internal())?)
+        .ok_or_else(|| bad("スクリプトの応答が長すぎます"))?;
     let mut result = Vec::new();
     let mut start = 0;
-    while start + 1 < bounds.len() {
-        // Bound each binary search independently of the total document length.
-        let mut low = start;
-        let mut high = (start + 8000).min(bounds.len() - 1);
-        while low < high {
-            let end = low + (high - low).div_ceil(2);
-            let candidate = StackScriptReadResult {
-                source: document.source[bounds[start]..bounds[end]].into(),
-                sha256: document.sha256.clone(),
-                builtin: document.builtin,
-                enabled,
-                part: u32::MAX,
-                parts: u32::MAX,
-                message: MESSAGE.into(),
-            };
-            if check_budget(&candidate).is_ok() {
-                low = end;
-            } else {
-                high = end - 1;
-            }
-        }
-        if low == start {
+    let mut used = 0;
+    for (index, scalar) in document.source.char_indices() {
+        // serde_json escapes quotes/backslashes and ASCII controls. Count both
+        // serialized source and that serialized string's escaped text copy.
+        let cost = match scalar {
+            '"' | '\\' => 6,
+            '\n' | '\r' | '\t' | '\u{0008}' | '\u{000c}' => 5,
+            '\u{0000}'..='\u{001f}' => 13,
+            _ => 2,
+        };
+        if cost > available {
             return Err(bad("スクリプトの応答が長すぎます"));
         }
-        result.push(document.source[bounds[start]..bounds[low]].into());
-        start = low;
+        if used + cost > available {
+            result.push(start..index);
+            start = index;
+            used = 0;
+        }
+        used += cost;
     }
-    if result.is_empty() {
-        result.push(String::new());
-    }
+    result.push(start..document.source.len());
     Ok(result)
 }
 
@@ -104,14 +104,13 @@ pub(super) fn read_result(
             "読んでいる途中で変わりました。最初から読み直してください",
         ));
     }
-    let parts = parts(document, enabled)?;
+    let parts = parts(document)?;
     let part = part.unwrap_or(1);
     let source = parts
         .get(part as usize - 1)
-        .ok_or_else(|| bad("指定された part はありません"))?
-        .clone();
+        .ok_or_else(|| bad("指定された part はありません"))?;
     let result = StackScriptResult::Read(StackScriptReadResult {
-        source,
+        source: document.source[source.clone()].into(),
         sha256: document.sha256.clone(),
         builtin: document.builtin,
         enabled,

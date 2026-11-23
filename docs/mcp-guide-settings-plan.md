@@ -1085,9 +1085,9 @@ UI が 5 秒応答しないときは未実行で `Busy`。回復の仕組みは�
 
 ### 16.1 設定画面 (`src/ui_dialogs/agent_integration.rs`)
 
-**出荷範囲の調整**: `stack_script` は §1.863 の判断待ちで、今回の第 1 段には含めない。
-以下の案の「スクリプト本文の読み書き」は公開文言に入れず、環境設定の `stack_script_enabled` の
-オン・オフだけを説明する。外部ツール・通信・お気に入りなど、それ以外の項目はこの節どおりとする。
+**出荷範囲の調整**: §1.863 の取り込み後は `stack_script` も第 1 段に含める (§6.9)。
+本文を AI の提供元へ渡すこと、書く前に本文を保持すること、AI 書き込みは UTF-8 で 256 KiB までであることを説明する。
+利用者が直接編集した 1 MiB までの本文は読めるが、256 KiB 超の元本文を戻すときはエディタを使う。
 
 - チェック欄 2 つを足す (既存の「見せる」チェックの並びに)。
   - 「今開いている場所を AI に見せる」
@@ -1200,15 +1200,15 @@ UI が 5 秒応答しないときは未実行で `Busy`。回復の仕組みは�
 
 実装は Codex、検収は設計担当。区切りごとにコミットする。
 
-今回の出荷で D は `set_favorite` のみ。表の `stack_script` 本文操作とそのテストは後続の設計として残し、
-今回の実装・検収には含めない (§6.9)。
+今回の出荷で D は `set_favorite` と、§1.863 取り込み後に実装する `stack_script` を含む (§6.9)。
+AI 書き込みは 256 KiB まで、利用者のファイルの読み取りは 1 MiB までとする。
 
 | 区切り | 内容 | 主なテスト |
 | --- | --- | --- |
 | A | ヘルプ (MCP exe だけ)。build script、`search_help`・`get_help`、instructions、成果物の再利用の判定への追加 | 生成が決定的、節の id が一意、全ページの節が引ける、サイドバーやメニューの語が本文に入らない、`index.html` と `sound/index.html` が別の id、AND 検索、part の取得、どの応答も最終の形で予算内、tool 一覧の予算、マニュアルや `<main>` が無いとビルド失敗 |
 | B | 許可 2 項目、IPC 版 6、`get_view_state`、お気に入りの行の索引の有無 | 許可オフで拒否・epoch、環境設定の OK で許可が戻らない、一覧の種類ごとの `view`、F12 で別ウィンドウへ出しているときも項目が返る、リモート操作中の拒否、版 5 の凍結 fixture での互換 |
 | C | `get_settings`・`set_settings` (除外側の印・外部ツールを含む) | 下記 |
-| D | `set_favorite` (追加の確定の切り出しを含む)、`stack_script` | お気に入り: ダイアログと同じ関数を通る、上限・重複、索引 ON で indexer が同期、OFF で戻る、モーダル中の拒否。スクリプト: 1 MiB 超・コンパイルできない本文・`expected_sha256` が今の本文と違う書き込みは拒まれファイルが変わらない、長い本文が part に分けて読める、書いた本文が次のスタック表示で使われる、環境設定の「既定に戻す」「スクリプトを開く」と AI の書き込みが押した・届いた順に 1 つずつ処理される (「既定に戻す → 開く」の順で開くと既定の本文が開く)、UI スレッドでファイルを読み書きしない・待たない |
+| D | `set_favorite` (追加の確定の切り出しを含む)、`stack_script` | お気に入り: ダイアログと同じ関数を通る、上限・重複、索引 ON で indexer が同期、OFF で戻る、モーダル中の拒否。スクリプト: 256 KiB 超・コンパイルできない本文・`expected_sha256` が今の本文と違う書き込みは拒まれファイルが変わらない、長い本文が part に分けて読める、書いた本文が次のスタック表示で使われる、環境設定の「既定に戻す」「スクリプトを開く」と AI の書き込みが押した・届いた順に 1 つずつ処理される (「既定に戻す → 開く」の順で開くと既定の本文が開く)、UI スレッドでファイルを読み書きしない・待たない |
 | E | 設定画面、公開文書、マニュアル、ui_snapshot | 3 区画がチェックに応じて変わる、検索の語、`check_site_cards.py`・`check_ui_glyphs.py` |
 
 A の実装 (2026-11-23): `crates/mcp-server/help_build.rs` を
@@ -1484,6 +1484,66 @@ IPC v6 の追加型と MCP tool、ボタンの enqueue 化、公開説明と回�
 | tool の文字数の合計 | 45718 | 44766 |
 | 最大 tools/list (envelope 込み) | 47473 | 46521 |
 
+### D スクリプトの再開・実装記録 (2026-11-23、共有 runner 検証待ち)
+
+`724e133d9` の作業を再開。前回触った既存32ファイルに空・ゼロ埋めは見つからず、破損からの推測復元はしていない。
+上の中断理由は §6.9 の決定で解消した。MCP の入力 1 MiB・IPC 4 MiB は変えず、
+AI 書き込みの共有定数 `MAX_STACK_SCRIPT_SOURCE_BYTES` を 256 KiB とした。schema と MCP/core/FIFO の入力検査で共有し、
+上限超過はファイル操作・UI 受付・writer 取得より前に拒む。利用者のファイルの読み取り上限は従来の 1 MiB。
+エスケープの多い本文が入力行の上限を超える場合は既存の入力制限で終了し、特別な回復や再試行は足さない。
+
+追加回帰は、ASCII/Unicode の 256 KiB ちょうどと 1 byte 超過、IPC frame と全 MCP 版の stdio 送受信、
+エスケープ過多時の既存の入力制限、1 MiB のファイルの読取と part の再結合・最終応答予算、
+UI 待ち行列に入った後の許可取消・起動中・モーダル・Preferences/下書き・Remote の拒否を含む。
+UI は受付と有効化状態の返却だけで、本文やファイル処理を持たず、設定・下書き・表示先を変更しない。
+既存の FIFO/原子的置換/hash/次回分類/sleep・pad の回帰も維持した。
+part の境界は最終 structured JSON と text copy の大きさに基づく線形走査で決め、
+有効化・builtin の状態だけが途中で変わっても、同じ本文なら境界が変わらないことも検査する。
+256 KiB 超の元本文の取り消しはエディタ経由である旨を、応答と公開文書へ反映した。
+
+一覧整理は既存の schema / annotation / validation の検査を弱めずに行った。
+当初の草案込み最大 **47,473 → 46,530 字**、予約512字を除いた余裕 **958字** (再開時46,521字からは9字増)。
+4,000字の目標は未達。残る制約や呼び出し条件を削る変更は行わず、設計担当が認めた「最良の安全な結果」で止める。
+以下はコンパクト JSON の文字数の静的計測。Rust の実測・コンパイル・テストは未実行で、共有 runner に引き継ぐ。
+
+| tool | 当初草案込み | 最終 | 維持した制約・これ以上の削減で失う条件 |
+| --- | ---: | ---: | --- |
+| miv_status | 1412 | 1386 | 許可・索引の準備と対象範囲 |
+| search_items | 1921 | 1876 | 検索構文・許可・対象範囲 |
+| list_tags | 1286 | 1268 | choice と件数・paging/error schema |
+| items_by_tag | 1690 | 1679 | 項目参照・paging/error schema |
+| list_collections | 1249 | 1228 | paging/error schema |
+| get_collection | 1831 | 1826 | ID/name 排他・一覧順 |
+| list_library | 2104 | 2054 | ★の上下限・評価順 |
+| get_item_info | 6360 | 6269 | 不在状態・型・必須field・caption/transcript の検査と秘匿 |
+| get_transcript | 2367 | 2277 | 時刻・許可・本文の表現と上限 |
+| list_folder | 3330 | 3221 | AND filter・保存済み表示規則・再帰/リンク・cursor |
+| summarize_folder | 2824 | 2582 | 件数の範囲・再帰・省略の意味 (重複した unsigned は既に参照化) |
+| get_thumbnail | 2420 | 2358 | サイズ別上限・許可・添付の順番・編集による非公開 |
+| open_in_viewer | 932 | 892 | 開く対象と、受付/表示完了の違い |
+| create_collection | 816 | 796 | 件数・名前・完了/非冪等性 |
+| rename_collection | 938 | 895 | ID・名前・同名の扱い |
+| add_to_collection | 1796 | 1745 | 件数・indices・結果別の扱い |
+| remove_from_collection | 1763 | 1740 | 件数・indices・元ファイルの保持 |
+| add_tags | 1736 | 1676 | 件数・正規化・queued/skipped・許可 |
+| remove_tags | 1743 | 1683 | 件数・正規化・queued/skipped・許可 |
+| set_rating | 1717 | 1676 | ★の範囲・結果・許可 |
+| search_help | 694 | 694 | 語数・引数・error schema の既に短い定義 |
+| get_help | 630 | 630 | ID/part と error schema の既に短い定義 |
+| get_view_state | 678 | 659 | main/F12 の論理対象と許可 |
+| stack_script | 904 | 1088 | 読取1 MiB/書込256 KiB・hash・取り消しと反映時期 |
+| get_settings | 823 | 823 | keys/query/page と読み取り許可 |
+| set_settings | 854 | 854 | 32鍵・全件検査・権限と annotation |
+| set_favorite | 900 | 900 | 登録/索引・既存の名前保持・AI 削除不可 |
+| 定義の合計 | 45718 | 44775 | |
+| 最大 tools/list | 47473 | 46530 | 512字予約後の余裕958字 |
+
+既存の `local_references_preserve_all_expanded_output_constraints`・
+`folder_and_library_filter_schema_contracts`・`tools_have_precise_annotation_contracts` などは維持した。
+UI のボタンの見た目は変えず、前回 WIP で本文操作の説明を加えた AI 連携画面10枚だけが PNG 更新対象。
+今回の非Cargo検査はカード53件・超過0、危険グリフ0。fmt と差分検査を実施し、
+PNG 生成・目視・通常比較、ビルド・テストは未実施。製品起動・コミットもしていない。
+
 ## 18. 規模の見込み
 
 | 区切り | 触る場所 | 見込み |
@@ -1491,13 +1551,13 @@ IPC v6 の追加型と MCP tool、ボタンの enqueue 化、公開説明と回�
 | A | `crates/mcp-server` (build script・tool 2 本・テスト)、`scripts/build-portable.ps1` (fingerprint) | 小〜中 |
 | B | `crates/agent-ipc`、`src/agent_ipc`、`src/settings*.rs`、`src/app/startup_ops.rs`、`src/ui_dialogs/preferences.rs` (許可の取り直し) | 中 |
 | C | `src/settings_transfer.rs` (選択肢の候補・変更の書き方の trait、除外側の印)、`src/ui_dialogs/preferences.rs` (下書きの初期化の分割)、`src/external_tool.rs` (変更の書き方)、`src/agent_ipc`、`src/app` (受付と確定の呼び出し) | 中〜大 |
-| D | `src/ui_dialogs/fav_add.rs` (切り出し)、`src/agent_ipc`、`src/app`。`src/filename_stack_script.rs` の本文操作は今回対象外 (§6.9) | 小〜中 |
+| D | `src/ui_dialogs/fav_add.rs` (切り出し)、`src/agent_ipc`、`src/app`、`src/filename_stack_script.rs` と FIFO writer (§6.9) | 小〜中 |
 | E | `src/ui_dialogs/agent_integration.rs`、公開文書 4 か所、ui_snapshot | 中 |
 
 全体では、MCP の段階 2 (タグ・★・コレクションの変更) より一回り大きいと見込む (外部ツール・除外側の項目・
 スタック用スクリプトの分が増えた)。外部ツールは `set_settings` の鍵に乗るので、増えるのは型の書き方とテストが中心。
 スタック用スクリプトは当初 tool 1 本と書き込み 1 か所を第 1 段に入れる提案だった。
-今回の出荷は調整担当の決定により本文操作を含めず、§1.863 の判断を待つ (§6.9)。
+今回は §1.863 の取り込み後に本文操作を含め、書き込み上限は調整担当の決定で 256 KiB とする (§6.9)。
 
 ## 19. 独立レビューの記録
 

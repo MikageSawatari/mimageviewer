@@ -76,10 +76,103 @@ fn stack_script_arguments_are_strict_and_guard_hashes_before_ipc() {
         json!({"expected_sha256":"g".repeat(64)}),
         json!({"expected_sha256":"a".repeat(63)}),
         json!({"expected_sha256":"a".repeat(65)}),
-        json!({"source":"猫".repeat(349526),"expected_sha256":"a".repeat(64)}),
+        json!({"source":"猫".repeat(MAX_STACK_SCRIPT_SOURCE_BYTES / 3 + 1),"expected_sha256":"a".repeat(64)}),
     ] {
         assert!(parse_tool(&json!({"name":"stack_script","arguments":args})).is_err());
     }
+}
+
+#[test]
+fn stack_script_source_cap_counts_utf8_bytes_and_fits_existing_transport_caps() {
+    assert_eq!(MAX_STACK_SCRIPT_SOURCE_BYTES, 256 * 1024);
+    assert_eq!(MAX_LINE_BYTES, 1024 * 1024);
+    assert_eq!(MAX_FRAME_BYTES, 4 * 1024 * 1024);
+    let tool = schema::tools()
+        .into_iter()
+        .find(|t| t["name"] == "stack_script")
+        .unwrap();
+    assert_eq!(
+        tool["inputSchema"]["properties"]["source"]["maxLength"],
+        MAX_STACK_SCRIPT_SOURCE_BYTES
+    );
+    let unicode = format!(
+        "{}{}",
+        "猫".repeat(MAX_STACK_SCRIPT_SOURCE_BYTES / 3),
+        "a".repeat(MAX_STACK_SCRIPT_SOURCE_BYTES % 3)
+    );
+    for source in ["a".repeat(MAX_STACK_SCRIPT_SOURCE_BYTES), unicode] {
+        assert_eq!(source.len(), MAX_STACK_SCRIPT_SOURCE_BYTES);
+        let args = json!({"source":source,"expected_sha256":"a".repeat(64)});
+        assert!(accepts_schema(&tool["inputSchema"], &args));
+        let (_, command) =
+            parse_tool(&json!({"name":"stack_script","arguments":args.clone()})).unwrap();
+        let request = Request { id: 1, command };
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &request).unwrap();
+        assert!(frame.len() - 4 <= MAX_FRAME_BYTES);
+        assert_eq!(
+            read_frame::<_, Request>(&mut frame.as_slice()).unwrap(),
+            Some(request)
+        );
+        for version in VERSIONS {
+            let call = version_request(
+                version,
+                1,
+                "tools/call",
+                json!({"name":"stack_script","arguments":args.clone()}),
+            );
+            assert!(serde_json::to_vec(&call).unwrap().len() + 1 <= MAX_LINE_BYTES as usize);
+        }
+        let mut too_large = args;
+        too_large["source"] = json!(format!("{}a", too_large["source"].as_str().unwrap()));
+        assert_eq!(
+            too_large["source"].as_str().unwrap().len(),
+            MAX_STACK_SCRIPT_SOURCE_BYTES + 1
+        );
+        assert_eq!(
+            accepts_schema(&tool["inputSchema"], &too_large),
+            too_large["source"].as_str().unwrap().chars().count() <= MAX_STACK_SCRIPT_SOURCE_BYTES
+        );
+        assert!(parse_tool(&json!({"name":"stack_script","arguments":too_large})).is_err());
+    }
+}
+
+#[test]
+fn stack_script_heavily_escaped_source_keeps_existing_stdio_input_bound() {
+    struct NoCall;
+    impl Backend for NoCall {
+        fn call(
+            &self,
+            _: Command,
+            _: &ClientIdentity,
+            _: RequestKind,
+            _: Arc<CallControl>,
+        ) -> BackendResult {
+            panic!("oversized input must not reach the backend")
+        }
+    }
+    // The accepted source-byte cap does not enlarge the independent JSON line cap.
+    let args = json!({"source":"\u{0001}".repeat(MAX_STACK_SCRIPT_SOURCE_BYTES),"expected_sha256":"a".repeat(64)});
+    assert!(parse_tool(&json!({"name":"stack_script","arguments":args.clone()})).is_ok());
+    let call = modern(
+        1,
+        "tools/call",
+        json!({"name":"stack_script","arguments":args}),
+    );
+    let mut line = serde_json::to_vec(&call).unwrap();
+    line.push(b'\n');
+    assert!(line.len() > MAX_LINE_BYTES as usize);
+    let (eof_send, eof) = mpsc::channel();
+    run_stdio_with_eof(
+        io::Cursor::new(line),
+        io::sink(),
+        Arc::new(NoCall),
+        move || {
+            let _ = eof_send.send(());
+        },
+    )
+    .unwrap();
+    assert!(eof.try_recv().is_err());
 }
 
 #[test]
@@ -222,6 +315,11 @@ fn stack_script_all_mcp_versions_discover_and_transport_reads_writes_and_refusal
                 true,
             ),
             (5, json!({"part":2,"expected_sha256":"0".repeat(64)}), true),
+            (
+                6,
+                json!({"source":"a".repeat(MAX_STACK_SCRIPT_SOURCE_BYTES),"expected_sha256":"a".repeat(64)}),
+                false,
+            ),
         ] {
             h.send(version_request(
                 version,
@@ -241,7 +339,7 @@ fn stack_script_all_mcp_versions_discover_and_transport_reads_writes_and_refusal
         }
         h.send(version_request(
             version,
-            6,
+            7,
             "tools/call",
             json!({"name":"stack_script","arguments":{"source":"x"}}),
         ));

@@ -28,6 +28,8 @@ fn stack_script_parts_preserve_unicode_controls_and_whole_hash_in_final_budget()
         String::new(),
         DEFAULT_SCRIPT.into(),
         "\"\\\n\0あ😀".repeat(12000),
+        (0u8..=127).map(char::from).collect::<String>().repeat(200),
+        "x".repeat(1024 * 1024),
     ] {
         let document = document(&source, source == DEFAULT_SCRIPT);
         let StackScriptResult::Read(first) = read_result(&document, true, None, None).unwrap()
@@ -65,7 +67,7 @@ fn stack_script_requires_hash_for_write_and_later_parts_and_refuses_changed_part
     }
     assert!(
         validate_arguments(
-            Some(&" ".repeat(1024 * 1024 + 1)),
+            Some(&" ".repeat(MAX_STACK_SCRIPT_SOURCE_BYTES + 1)),
             None,
             Some(&original.sha256)
         )
@@ -75,6 +77,79 @@ fn stack_script_requires_hash_for_write_and_later_parts_and_refuses_changed_part
     let error = read_result(&changed, false, Some(2), Some(&original.sha256)).unwrap_err();
     assert_eq!(error.code, ErrorCode::BadRequest);
     assert!(error.message.contains("最初から読み直して"));
+}
+
+#[test]
+fn stack_script_part_boundaries_ignore_metadata_changes_with_identical_source() {
+    let source = "// same source\n".repeat(4000);
+    let original = document(&source, false);
+    let StackScriptResult::Read(first) = read_result(&original, true, None, None).unwrap() else {
+        panic!()
+    };
+    assert!(first.parts > 1);
+    let mut joined = String::new();
+    for part in 1..=first.parts {
+        let current = document(&source, part % 2 == 0);
+        let StackScriptResult::Read(result) =
+            read_result(&current, part % 2 != 0, Some(part), Some(&first.sha256)).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(result.parts, first.parts);
+        joined.push_str(&result.source);
+    }
+    assert_eq!(joined, source);
+}
+
+#[test]
+fn stack_script_ai_cap_counts_utf8_bytes_and_refuses_before_ui_admission() {
+    let hash = "a".repeat(64);
+    assert!(
+        validate_arguments(
+            Some(&"x".repeat(MAX_STACK_SCRIPT_SOURCE_BYTES)),
+            None,
+            Some(&hash)
+        )
+        .is_ok()
+    );
+    let fixture = tests::Fixture::new();
+    crate::settings_db::with_db_result(|db| {
+        let mut settings = db.load_into_settings()?;
+        settings.agent_allow_settings = true;
+        db.save_full(&settings)
+    })
+    .unwrap();
+    let queue = fixture.handlers.open.install(egui::Context::default());
+    let connection = fixture.connection();
+    for source in [
+        "x".repeat(MAX_STACK_SCRIPT_SOURCE_BYTES + 1),
+        "あ".repeat(MAX_STACK_SCRIPT_SOURCE_BYTES / 3 + 1),
+    ] {
+        let (send, replies) = crossbeam_channel::unbounded();
+        let worker = connection
+            .request(
+                Request {
+                    id: 702,
+                    command: Command::StackScript {
+                        source: Some(source),
+                        part: None,
+                        expected_sha256: Some(hash.clone()),
+                    },
+                },
+                send,
+            )
+            .unwrap();
+        let response = replies
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .wire();
+        worker.join().unwrap();
+        let error = response.result.unwrap_err();
+        assert_eq!(error.code, ErrorCode::BadRequest);
+        assert!(error.message.contains("256 KiB"));
+        assert!(queue.try_recv().is_err());
+        assert_eq!(fixture.handlers.active.load(Ordering::Acquire), 0);
+    }
 }
 
 #[test]

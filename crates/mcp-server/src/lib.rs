@@ -942,9 +942,9 @@ fn parse_tool(params: &Value) -> Result<(&'static str, Command), &'static str> {
             }
             if a.source
                 .as_ref()
-                .is_some_and(|source| source.len() > 1024 * 1024)
+                .is_some_and(|source| source.len() > MAX_STACK_SCRIPT_SOURCE_BYTES)
             {
-                return Err("Stack script must be at most 1 MiB UTF-8");
+                return Err("Stack script must be at most 256 KiB UTF-8");
             }
             if a.expected_sha256.as_ref().is_some_and(|hash| {
                 hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())

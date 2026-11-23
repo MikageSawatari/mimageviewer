@@ -63,6 +63,8 @@ pub enum RequestKind {
     Internal,
 }
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
+/// AI writes only; existing user script files retain the core's 1 MiB read cap.
+pub const MAX_STACK_SCRIPT_SOURCE_BYTES: usize = 256 * 1024;
 pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 200;
 pub const MAX_INFO_LIMIT: u32 = 50;
