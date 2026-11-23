@@ -844,6 +844,7 @@ pub(crate) enum LocationJumpTarget {
 
 #[derive(Debug)]
 pub(crate) enum AddressBarNav {
+    DriveJump(crate::app::DriveJumpInput),
     LocationJump(LocationJumpTarget),
     AddressInput(LocationJumpTarget),
     /// Physical target submitted through the address field Enter action.
@@ -5437,6 +5438,7 @@ fn toolbar_section_display_label(section: crate::settings::ToolbarSectionId) -> 
         TS::Aspect => "比率",
         TS::Sort => "ソート",
         TS::Rating => "レーティング (★)",
+        TS::Drives => "ドライブ",
         TS::Favorites => "お気に入り",
         TS::SmartFolders => "スマートフォルダ",
         TS::Tags => "タグ",
@@ -5451,6 +5453,227 @@ fn toolbar_section_display_label(section: crate::settings::ToolbarSectionId) -> 
 
 fn smart_folder_toolbar_visible(show_setting: bool, definition_count: usize) -> bool {
     show_setting && definition_count > 0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolbarDriveAction {
+    LastLocation,
+    Root,
+    Remove,
+}
+
+/// Memory-only drive button shared by the toolbar and its UI regression tests.
+fn draw_toolbar_drive_button(
+    ui: &mut egui::Ui,
+    drive_key: &str,
+    selected: bool,
+    tooltip: &str,
+) -> (egui::Response, Option<ToolbarDriveAction>) {
+    let response = ui.selectable_label(selected, drive_key).hover_tip(tooltip);
+    let mut action = response
+        .clicked()
+        .then_some(ToolbarDriveAction::LastLocation);
+    response.context_menu(|ui| {
+        if ui.button("ルートを開く").clicked() {
+            action = Some(ToolbarDriveAction::Root);
+            ui.close();
+        }
+        if ui
+            .add_enabled(!selected, egui::Button::new("一覧から外す"))
+            .clicked()
+        {
+            action = Some(ToolbarDriveAction::Remove);
+            ui.close();
+        }
+    });
+    suppress_menu_button_wheel_passthrough(ui.ctx(), &response);
+    (response, action)
+}
+
+#[cfg(test)]
+mod section1793_toolbar_tests {
+    use super::*;
+    use egui_kittest::kittest::{NodeT, Queryable};
+    use std::{cell::RefCell, rc::Rc};
+
+    #[test]
+    fn section1793_drive_button_actions_and_current_removal_guard() {
+        for selected in [false, true] {
+            for requested in [
+                ToolbarDriveAction::LastLocation,
+                ToolbarDriveAction::Root,
+                ToolbarDriveAction::Remove,
+            ] {
+                let actions = Rc::new(RefCell::new(Vec::new()));
+                let rendered_actions = Rc::clone(&actions);
+                let mut harness = crate::test_ui::builder()
+                    .with_size(egui::vec2(340.0, 180.0))
+                    .with_context_setup(crate::ui_fonts::configure_fonts)
+                    .build_ui(move |ui| {
+                        let (_, action) =
+                            draw_toolbar_drive_button(ui, "D:", selected, r"D:\Photos");
+                        if let Some(action) = action {
+                            rendered_actions.borrow_mut().push(action);
+                        }
+                    });
+                harness.run();
+                if requested == ToolbarDriveAction::LastLocation {
+                    harness.get_by_label("D:").click();
+                    harness.run();
+                    assert_eq!(actions.borrow().as_slice(), &[requested]);
+                    continue;
+                }
+                let pos = harness.get_by_label("D:").rect().center();
+                harness.hover_at(pos);
+                for pressed in [true, false] {
+                    harness.event(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Secondary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    harness.step();
+                }
+                harness.run();
+                assert!(
+                    actions.borrow().is_empty(),
+                    "right click must only open the menu"
+                );
+                let remove_disabled = harness
+                    .get_by_label("一覧から外す")
+                    .accesskit_node()
+                    .is_disabled();
+                assert_eq!(remove_disabled, selected);
+                let label = if requested == ToolbarDriveAction::Root {
+                    "ルートを開く"
+                } else {
+                    "一覧から外す"
+                };
+                let pos = harness.get_by_label(label).rect().center();
+                harness.hover_at(pos);
+                for pressed in [true, false] {
+                    harness.event(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    harness.step();
+                }
+                harness.run();
+                if selected && requested == ToolbarDriveAction::Remove {
+                    assert!(actions.borrow().is_empty());
+                } else {
+                    assert_eq!(actions.borrow().as_slice(), &[requested]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn section1793_toolbar_visibility_and_reset_are_saved() {
+        let app = Rc::new(RefCell::new(crate::app::setup_app_for_test()));
+        let rendered_app = Rc::clone(&app);
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(600.0, 900.0))
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .build_ui(move |ui| {
+                rendered_app
+                    .borrow_mut()
+                    .draw_toolbar_visibility_menu(ui, false, false)
+            });
+        harness.run();
+        assert!(!app.borrow().settings.show_toolbar_drives);
+        harness.get_by_label("ドライブ").click();
+        harness.run();
+        assert!(app.borrow().settings.show_toolbar_drives);
+        let load = || {
+            crate::settings_db::SettingsDb::open(&crate::data_dir::get())
+                .unwrap()
+                .load_into_settings()
+                .unwrap()
+        };
+        assert!(load().show_toolbar_drives);
+        app.borrow_mut().reset_toolbar_customization();
+        assert!(!app.borrow().settings.show_toolbar_drives);
+        assert!(!load().show_toolbar_drives);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn section1793_toolbar_click_admits_shared_drive_handler_without_ui_probes() {
+        let app = Rc::new(RefCell::new(crate::app::setup_app_for_test()));
+        let target = app.borrow().tmp.path().join("toolbar-drive-destination");
+        std::fs::create_dir(&target).unwrap();
+        let key = crate::app::drive_current_key_for_path(&target).unwrap();
+        {
+            let mut app = app.borrow_mut();
+            for &section in crate::settings::ToolbarSectionId::default_order() {
+                set_toolbar_section_visible(&mut app.settings, section, false);
+            }
+            app.settings.show_toolbar_drives = true;
+            app.set_quick_folder_slot_target(crate::settings::QuickFolderSlotId::A, target.clone());
+        }
+        let rendered = app.clone();
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(500.0, 180.0))
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .build_ui(move |ui| {
+                crate::test_ui::full_viewport_ui(ui, |root| {
+                    rendered.borrow_mut().render_toolbar(root);
+                });
+            });
+        let probes = crate::folder_tree::navigation_path_probe_count_for_test();
+        harness.run();
+        assert!(!app.borrow().drive_jump_pending());
+        let before = app.borrow().current_folder.clone();
+        harness.get_by_label(&key).click();
+        harness.run();
+        assert!(app.borrow().drive_jump_pending());
+        assert_eq!(
+            app.borrow()
+                .active_drive_current_dir(key.chars().next().unwrap()),
+            Some(target)
+        );
+        assert_eq!(app.borrow().current_folder, before);
+        assert_eq!(
+            crate::folder_tree::navigation_path_probe_count_for_test(),
+            probes
+        );
+    }
+
+    #[test]
+    fn toolbar_drives_selected_and_synthetic_snapshot() {
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(440.0, 100.0))
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .build_ui(|root| {
+                crate::test_ui::full_viewport_ui(root, |root| {
+                    crate::os_theme::apply_resolved(
+                        root.ctx(),
+                        crate::os_theme::ResolvedTheme::Light,
+                    );
+                    egui::CentralPanel::default().show(root, |ui| {
+                        apply_toolbar_style(ui);
+                        for current in [Some("D:"), None] {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label("ドライブ:");
+                                for key in ["C:", "D:", "Z:"] {
+                                    let _ = draw_toolbar_drive_button(
+                                        ui,
+                                        key,
+                                        current == Some(key),
+                                        "記録なし (ルートを開きます)",
+                                    );
+                                }
+                            });
+                        }
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot("toolbar_drives_selected_and_synthetic");
+    }
 }
 
 /// ツールバーのドラッグ並べ替え中の状態 (ctx の temp data に保存)。
@@ -5581,6 +5804,7 @@ fn set_toolbar_section_visible(
         TS::Aspect => settings.show_toolbar_aspect = visible,
         TS::Sort => settings.show_toolbar_sort = visible,
         TS::Rating => settings.show_toolbar_rating = visible,
+        TS::Drives => settings.show_toolbar_drives = visible,
         TS::Favorites => settings.show_toolbar_favorites = visible,
         TS::SmartFolders => settings.show_toolbar_smart_folders = visible,
         TS::Tags => settings.show_toolbar_tags = visible,
@@ -11575,6 +11799,7 @@ impl App {
         // 比率は詳細一覧モードでは無意味なので隠す (従来どおり)。
         let show_aspect = self.settings.show_toolbar_aspect && !details_mode;
         let show_sort = self.settings.show_toolbar_sort;
+        let show_drives = self.settings.show_toolbar_drives;
         let show_favs = self.settings.show_toolbar_favorites;
         let show_smart_folders = smart_folder_toolbar_visible(
             self.settings.show_toolbar_smart_folders,
@@ -11630,6 +11855,7 @@ impl App {
                         TS::Aspect => show_aspect,
                         TS::Sort => show_sort,
                         TS::Rating => show_rating,
+                        TS::Drives => show_drives,
                         TS::Favorites => show_favs,
                         TS::SmartFolders => show_smart_folders,
                         TS::Tags => show_tags,
@@ -11653,6 +11879,7 @@ impl App {
             || show_cols
             || show_aspect
             || show_sort
+            || show_drives
             || show_favs
             || show_smart_folders
             || show_rating
@@ -11668,6 +11895,9 @@ impl App {
 
         let mut pinned_actions = Vec::new();
         let mut toolbar_fav_nav: Option<PathBuf> = None;
+        let toolbar_drive_keys = self.toolbar_drive_keys();
+        let current_toolbar_drive_key = self.current_toolbar_drive_key();
+        let mut toolbar_drive_action = None;
         let mut toolbar_address_nav = None;
         let mut toolbar_smart_folder_open: Option<uuid::Uuid> = None;
         let mut toolbar_sort_changed = false;
@@ -11820,6 +12050,7 @@ impl App {
                         TS::Aspect => show_aspect,
                         TS::Sort => show_sort,
                         TS::Rating => show_rating,
+                        TS::Drives => show_drives,
                         TS::Favorites => show_favs,
                         TS::SmartFolders => show_smart_folders,
                         TS::Tags => show_tags,
@@ -12514,6 +12745,31 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     }
 
                 }
+                TS::Drives => {
+                    let lead = toolbar_label(ui, "ドライブ:", 60.0, drag_enabled).hover_tip(lead_hint);
+                    self.finish_toolbar_section_lead(
+                        ui,
+                        lead,
+                        TS::Drives,
+                        &mut current_section_anchors,
+                        &last_section_anchors,
+                    );
+                    if toolbar_drive_keys.is_empty() {
+                        ui.label(egui::RichText::new("(未登録)").weak());
+                    }
+                    for drive_key in &toolbar_drive_keys {
+                        let selected = current_toolbar_drive_key.as_ref() == Some(drive_key);
+                        let tooltip = self.toolbar_drive_tooltip(drive_key);
+                        let (response, action) = draw_toolbar_drive_button(ui, drive_key, selected, &tooltip);
+                        #[cfg(test)]
+                        ui.ctx().data_mut(|data| data.insert_temp(egui::Id::unique(("toolbar_drive_test_rect", drive_key)), response.rect));
+                        #[cfg(not(test))]
+                        let _ = response;
+                        if let Some(action) = action {
+                            toolbar_drive_action = Some((drive_key.clone(), action));
+                        }
+                    }
+                }
                 TS::Favorites => {
                     let lead = toolbar_label(ui, "お気に入り:", 76.0, drag_enabled).hover_tip(lead_hint);
                     self.finish_toolbar_section_lead(
@@ -12865,6 +13121,26 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             consume_popup_wheel_input(ctx);
         }
 
+        if let Some((drive_key, action)) = toolbar_drive_action {
+            let letter = drive_key
+                .chars()
+                .next()
+                .expect("validated toolbar drive key");
+            let navigation = match action {
+                ToolbarDriveAction::LastLocation => {
+                    self.apply_switch_drive_letter(ctx, letter, "toolbar")
+                }
+                ToolbarDriveAction::Root => self.apply_ring_drive_letter(ctx, letter, "toolbar"),
+                ToolbarDriveAction::Remove => {
+                    self.remove_toolbar_drive(&drive_key);
+                    None
+                }
+            };
+            if let Some(navigation) = navigation {
+                toolbar_address_nav = Some(navigation);
+            }
+        }
+
         if let Some(name) = toolbar_book_target_name {
             self.select_book_append_target(name);
         }
@@ -13038,6 +13314,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             .checkbox(&mut s.show_toolbar_rating, "レーティング (★)")
             .changed();
         changed |= ui
+            .checkbox(&mut s.show_toolbar_drives, "ドライブ")
+            .changed();
+        changed |= ui
             .checkbox(&mut s.show_toolbar_favorites, "お気に入り")
             .changed();
         changed |= ui
@@ -13166,6 +13445,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         s.show_facet_sort = defaults.show_facet_sort;
         s.show_grid_edge_buttons = defaults.show_grid_edge_buttons;
         s.show_toolbar_rating = true;
+        s.show_toolbar_drives = defaults.show_toolbar_drives;
         s.show_toolbar_favorites = true;
         s.show_toolbar_smart_folders = true;
         s.show_toolbar_tags = true;
@@ -13260,6 +13540,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             TS::FolderTree
                 | TS::EffeTune
                 | TS::Rating
+                | TS::Drives
                 | TS::SearchContainer
                 | TS::SearchLocal
                 | TS::SearchMetadata
@@ -13270,6 +13551,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
             TS::FolderTree
             | TS::EffeTune
             | TS::Rating
+            | TS::Drives
             | TS::Folder
             | TS::SearchContainer
             | TS::SearchLocal
@@ -16687,6 +16969,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         | AddressBarNav::ZipListReturn(_)
                                         | AddressBarNav::EverythingResults
                                         | AddressBarNav::LocationJump(_)
+                                        | AddressBarNav::DriveJump(_)
                                         | AddressBarNav::AddressInput(_)
                                         | AddressBarNav::AddressEnterPhysical(_)
                                         | AddressBarNav::Favorite(_)

@@ -310,3 +310,4 @@
 - 2026-11-23 R3 の再レビュー: ACCEPT。新たな P1/P2 なし。P3 の 2 点 (退役 helper が自身の引き継ぎを退けないこと、
   独立窓を到達不能と断定しないこと) を本文に反映した。
 - 2026-11-23 利用者判断: Q1〜Q3 すべて推奨案 (§8)。実装を Codex (GPT-6.1 Sol / high) へ出す。
+- 2026-11-23 実装補足: 独立窓の操作は既存の root 帰着を `AddressBarNav::DriveJump` で保ち、main-history suppression 中の窓では移動票を取らず、root の主受付で取得する。perf の要求種別は予約欄 `kind` と衝突するため `request_kind` に記録する。

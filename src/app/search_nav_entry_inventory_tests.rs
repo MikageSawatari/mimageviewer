@@ -1006,6 +1006,15 @@ fn location_key_case(action: KeyAction, kind: usize) {
         before,
         "producer changed accepted source: {action:?}"
     );
+    let drive_action = action.drive_letter().is_some()
+        || action.switch_drive_letter().is_some()
+        || action == KeyAction::GridOpenCurrentDriveRoot;
+    if drive_action {
+        assert!(
+            candidate.is_none(),
+            "{action:?}: drive resolution must be deferred"
+        );
+    }
     if let Some(candidate) = candidate {
         match (&candidate, key_entry(action)) {
             (AddressBarNav::WorkerFavorite(path), Entry::Favorite) => {
@@ -1024,26 +1033,12 @@ fn location_key_case(action: KeyAction, kind: usize) {
         let mut frame = empty_navigation();
         frame.keyboard_nav = Some(candidate);
         app.post_render_main_navigation(&ctx, frame);
-        settle(&mut app, &ctx);
-        if search_active(&app) {
-            // An unavailable/inaccessible host drive may fail. A failed open
-            // must retain the complete accepted source, never a physical child.
-            assert_eq!(
-                source_state(&app),
-                before,
-                "failed {action:?} replaced search"
-            );
-            assert!(
-                app.fs_feedback_toast.is_some(),
-                "{action:?}: failure must notify"
-            );
-        } else {
-            assert_departed_and_back(&mut app, &ctx, &origin, &format!("{action:?}"));
-        }
+    } else if app.drive_jump_pending.is_some() {
+        assert!(drive_action, "{action:?}: unexpected drive request");
+        super::drive_jump::finish_drive_jump_for_test(&mut app, &ctx);
     } else {
-        // Drive/current-root/known-folder resolution can refuse a missing host
-        // location before producing a request. That refusal is an explicit
-        // result, not permission to omit the action from this inventory.
+        // A missing current root or known folder can refuse before producing a
+        // request. That refusal remains an explicit, notifying result.
         assert!(
             search_active(&app),
             "{action:?}: refused producer closed search"
@@ -1053,6 +1048,23 @@ fn location_key_case(action: KeyAction, kind: usize) {
             app.fs_feedback_toast.is_some(),
             "{action:?}: refused producer must notify"
         );
+        return;
+    }
+    settle(&mut app, &ctx);
+    if search_active(&app) {
+        // An unavailable/inaccessible host drive may fail. A failed open must
+        // retain the complete accepted source, never a physical child.
+        assert_eq!(
+            source_state(&app),
+            before,
+            "failed {action:?} replaced search"
+        );
+        assert!(
+            app.fs_feedback_toast.is_some(),
+            "{action:?}: failure must notify"
+        );
+    } else {
+        assert_departed_and_back(&mut app, &ctx, &origin, &format!("{action:?}"));
     }
 }
 
@@ -1403,12 +1415,14 @@ fn click_at(harness: &mut egui_kittest::Harness<'_, ()>, position: egui::Pos2) {
 fn settle(app: &mut App, ctx: &egui::Context) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
+        app.poll_drive_jump(ctx);
         app.poll_rating_view();
         app.poll_sidecar_restore(ctx);
         app.post_render_main_navigation(ctx, empty_navigation());
         app.settle_open_path_classification_for_test();
         app.poll_history_navigation_transition_for_test(ctx);
-        if app.folder_pane_open_pending.is_none()
+        if app.drive_jump_pending.is_none()
+            && app.folder_pane_open_pending.is_none()
             && app.rating_view_pending.is_none()
             && app
                 .top_level_grid_view

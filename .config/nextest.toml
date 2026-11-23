@@ -167,6 +167,7 @@ filter = '''
     | test(=ui_helpers::mask_bucket_1673_tests::mask_bucket_1673_options_snapshot_and_color_control_state)
     | test(=ui_helpers::tests::snapshot_texture_assets_survive_local_drop_without_name_or_context_aliasing)
     | test(=ui_main::applied_at_details_column_tests::tag_sort_choices_snapshot_dark)
+    | test(=ui_main::section1793_toolbar_tests::toolbar_drives_selected_and_synthetic_snapshot)
     | test(/^ui_main::section207_tests::(file_organize_destinations_location_menu_navigation_and_snapshot|file_organize_destinations_location_toggle_snapshot|file_organize_destinations_many_location_entries_scroll_and_select_last|physical_parent_folder_bar_snapshot|section207_default_folder_geometry_matches_the_separate_panels)$/)
     | test(/^ui_main::section207_tests::(section207_folder_separator_reservation_matches_the_separate_panels|section207_reported_controls_keep_left_input_right_order|section207_snapshot_label_keeps_input_minimum_order_and_panel_bounds)$/)
     | test(/^ui_main::section292_tests::(section292_facet_sort_snapshot_dark|section292_facet_sort_snapshot_narrow_dark)$/)
