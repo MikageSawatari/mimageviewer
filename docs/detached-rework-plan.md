@@ -1458,6 +1458,14 @@ F12 OFF の terminal host destroy と、次の ON で約 300ms hidden host 作�
 
 ## 11. リワーク外からの変更記録
 
+### 2026-11-23: ブラウザ閲覧の保存先のフォルダはページ構成の既定を単ページにする (§1.870、設計の段階。実装はこれから)
+
+- 正本は [browser-view-single-page-plan.md](browser-view-single-page-plan.md)。ブラウザから開いた画像が、保存先の月のフォルダの関係のない画像と見開きになる件。
+- 変更の内容: 保存先の根の下の実フォルダの一覧は、ページ構成の既定を単ページにする。読み込み・保存の比較・メタデータの再計算・Remote で同じ既定を使う。根の外は変えない。
+- detached に触れる範囲: 別ウィンドウの述語・viewport・窓の寿命・placement は変えない。読み込みで確定した「保存キー + 実フォルダの一覧である事実」を、一覧の所有 context の状態として持ち、bundle の入れ替え (`swap_field!`)・fork・★固定 (snapshot) の保存と復元で運ぶ。retire では持ち主の bundle と一緒に消える。
+- 合意: 独立設計レビュー (GPT-6.1 Sol / xhigh、read-only) を 5 回受け、5 回目 (`74a76e17a`) で ACCEPT。凍結の決まりの点の合意は 1 回目から毎回あり。5 回目のレビュー担当の言葉:「読込元の事実を一覧の所有 context とともに運ぶ案 A は、detached の述語・viewport を変更せず、既定と保存比較の整合を保つ構造的修正であり、症状パッチではない。」設計担当 ClaudeCode も、症状パッチではなく原因 (既定値の決定の境界) に対応する構造的な修正であることに同意する。
+- 実装の完了時に独立レビューを受け、結果をここに足す。
+
 ### 2026-11-23: コレクションの一覧の要求の印が今の context のものかを読み取りで確かめる (§1.851、viewer_context_audit A4)
 
 - `ContextRef::collection_grid_request_stamp_is_current` (`b5057ecca`、§1.851「見つからない項目をすべて外す」) も、A4 の許可リストに未登録だった。§1.818 の 3 件と同じ CI の実行で落ちた。
@@ -8163,3 +8171,32 @@ fork 先は空、元 context は cache と proof を保持する。detached の�
   - NG-1 のダブル・トリプルクリックは、本番の repaint context を設定してテストした。
   - 修正前の挙動では、関門の前の新テスト 7 件がすべて失敗した。
   - 実機は未確認。正本は [フォルダツリーの更新の計画](folder-tree-refresh-plan.md) §14.9。
+
+### ブラウザ閲覧の保存先のページ構成（2026-11-23、§1.870）
+
+- 正本は [ブラウザ閲覧の単ページ設計](browser-view-single-page-plan.md) §3〜§6 と実装記録 §9。
+  案 A / Remote R2 の採択済み設計に従い、保存先の根と配下の実フォルダ一覧は NON_BOOK で開き、
+  デスクトップのその場の選択はページ構成の保存行とお気に入り既定へ書き込まない。
+- `SpreadPresentationSource` は受理済み走査の保存キーだけを持つ context 所有の事実。
+  既存 bundle の初期化・transfer table・swap と materialized fork に機械的に追加し、
+  fork では複製、retire では bundle とともに破棄する。根の下かどうかは保持せず、
+  毎回、現在の設定とパスだけから決める。
+- snapshot の表示状態に同じ事実を含め、capture / restore・固定一覧への復帰・解除で元 rows と
+  同時に復元する。DirectMedia の表示設定を維持する既存の解除分岐でも、走査元は元 rows に揃える。
+  DirectMedia fork で main の saved rows に戻す経路にも同じ復元を加えた。
+- detached の述語・viewport の選択と配送・窓の寿命・placement は変更していない。
+  窓の種類による分岐、guard・delay・retry・一括 reset・silent fallback は追加していない。
+- 設計担当 ClaudeCode の採択設計と 8 回目の独立設計レビューは、読込元の事実と保存先設定で
+  表示・永続化を決める案 A が症状パッチではない構造的修正であることに合意済み（正本 §7〜§8）。
+  実装担当が自分の会話の中で起動した子のエージェントの確認は「ACCEPT」と報告されたが、独立レビューには当たらない
+  (実装担当が最初に書いた「独立実装レビュー ACCEPT」の記録を、設計担当が書き直した)。
+  実装後の独立レビュー (実装者とは別の GPT-6.1 Sol / xhigh、設計レビューと同じ担当、read-only) は 3 回。
+  1 回目 (`d65c78613`) と 2 回目 (`8e0d8b7b3`) は REVISE (保存先のパスの書き方で判定をすり抜ける P2 が各 1 件)、
+  3 回目 (`7bd6724e5`) で **ACCEPT**、master への取り込みに合意。
+  レビュー担当の言葉:「読込元の事実を一覧の所有 context とともに運び、共通の境界で表示・永続化を決める本実装は、
+  detached の述語・viewport・窓の寿命・placement を変更しない構造的修正であり、症状パッチではない。」
+  設計担当の検証: 関連テスト 920 件成功 (`run-heavy`)、`viewer_context_audit` exit 0、`cargo fmt --check` 成功。実機は未確認。
+- 検証: browser870 の lib テスト 17 件追加・既存 1 件更新（fork・兄弟 context・★固定往復を含む）。
+  既存 `target/debug/viewer_context_audit.exe` の直接実行は終了コード 0、許可表の追加変更なし。
+  UI glyph lint と `git diff --check` は正常。利用者の明示指示により cargo・Rust テスト・fmt・
+  build・実機起動は未実行。設計担当によるコンパイル・テスト・実機の検収へ引き継ぐ。

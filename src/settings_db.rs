@@ -341,8 +341,9 @@ pub(crate) struct CaptionSourceSettings {
 /// engine is alive, so one container response reads them together from
 /// `settings_kv` rather than mixing a current final-cover switch with stale
 /// spread defaults or page gap.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RemoteReadingSettings {
+    pub(crate) browser_view_output_dir: Option<PathBuf>,
     pub(crate) remember_spread_shift_per_book: bool,
     pub(crate) apply_default_spread_to_plain_folders: bool,
     pub(crate) default_spread_mode: crate::settings::SpreadMode,
@@ -363,6 +364,7 @@ pub(crate) struct RemoteReadingSettings {
 impl RemoteReadingSettings {
     pub(crate) fn from_settings(settings: &Settings) -> Self {
         Self {
+            browser_view_output_dir: settings.browser_view_output_dir.clone(),
             remember_spread_shift_per_book: settings.remember_spread_shift_per_book,
             apply_default_spread_to_plain_folders: settings.apply_default_spread_to_plain_folders,
             default_spread_mode: settings.default_spread_mode,
@@ -948,7 +950,7 @@ impl SettingsDb {
         })
     }
 
-    /// Read only the scalar settings that determine one Remote book layout.
+    /// Read only the settings that determine one Remote book layout.
     ///
     /// Missing keys in an older DB use the startup snapshot, matching the
     /// serde/default compatibility of a full settings load. The plain-folder opt-in
@@ -961,6 +963,11 @@ impl SettingsDb {
         let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
         let endpoints = read_singleton_endpoint_settings(&inner.conn)?;
         Ok(RemoteReadingSettings {
+            browser_view_output_dir: read_settings_kv_typed(
+                &inner.conn,
+                "browser_view_output_dir",
+                || fallback.browser_view_output_dir.clone(),
+            )?,
             apply_default_spread_to_plain_folders: read_settings_kv_typed(
                 &inner.conn,
                 "apply_default_spread_to_plain_folders",
@@ -7093,6 +7100,27 @@ mod tests {
                 .unwrap()
                 .auto_view_trim_default_enabled
         );
+    }
+
+    #[test]
+    fn browser870_remote_reading_settings_tracks_live_output_root_and_default() {
+        let db = SettingsDb::open_in_memory_for_test().unwrap();
+        let mut live = Settings {
+            browser_view_output_dir: Some(PathBuf::from("C:/browser-old")),
+            ..Default::default()
+        };
+        db.save_full(&live).unwrap();
+        let fallback = live.clone();
+        for output in [Some(PathBuf::from("D:/browser-new")), None] {
+            live.browser_view_output_dir = output.clone();
+            db.save_browser_integration(false, &output).unwrap();
+            assert_eq!(
+                db.load_remote_reading_settings(&fallback)
+                    .unwrap()
+                    .browser_view_output_dir,
+                output
+            );
+        }
     }
 
     #[test]

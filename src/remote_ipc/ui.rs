@@ -2617,6 +2617,20 @@ impl crate::app::App {
         } else {
             None
         };
+        if let RemoteWriteRequest::SetSpread { address, .. }
+        | RemoteWriteRequest::SetViewMode { address, .. } = pending.request()
+            && crate::browser_view_policy::is_browser_view_directory(
+                std::path::Path::new(&address.path),
+                pending.reading_target_is_directory(),
+                self.settings.browser_view_output_dir.as_deref(),
+            )
+        {
+            pending.complete(UiWriteOutcome::Write(write_error(
+                RemoteWriteErrorCode::Unsupported,
+                "ブラウザ閲覧の保存先のフォルダは、単ページで表示します",
+            )));
+            return;
+        }
         let view_setting = match pending.request() {
             RemoteWriteRequest::SetViewMode { address, mode } => Some((
                 address,
@@ -5256,6 +5270,7 @@ fn format_elapsed(elapsed: std::time::Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+    include!("browser870_ui_tests.rs");
     use eframe::egui;
 
     #[test]

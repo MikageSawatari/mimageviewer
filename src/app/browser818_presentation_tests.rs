@@ -974,3 +974,89 @@ fn browser818_presentation_activation_restore_materialized_keeps_request_seed() 
     assert_eq!(app.current_folder, Some(folder));
     assert!(!app.settings.detached_viewer_enabled);
 }
+
+#[test]
+fn browser870_browser818_linked_and_multiple_open_single_with_context_owned_saving() {
+    use crate::settings::{ReadingDirection, ReadingFlow, SpreadMode};
+    for multiple in [false, true] {
+        let mut app = fixture();
+        let folder = app.current_folder.clone().unwrap();
+        app.settings.browser_view_output_dir = Some(folder.clone());
+        app.settings.default_spread_mode = SpreadMode::RtlCover;
+        app.settings.apply_default_spread_to_plain_folders = true;
+        app.settings.auto_fullscreen_zip_pdf = true;
+        app.settings.auto_fullscreen_image_folders = true;
+        app.settings.detached_viewer_open_images_in_window = multiple;
+        app.load_folder(folder.clone());
+        app.finish_page_identity_preparation_for_test();
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+        let main_source = app.spread_presentation_source.clone();
+        let main_generation = app.items_generation;
+        let main_cancel = Arc::clone(&app.cancel_token);
+        let sibling_window = app.allocate_detached_viewer_window_id();
+        let sibling_source = SpreadPresentationSource::PhysicalDirectory {
+            key: app.tmp.path().join("outside"),
+        };
+        let expected_sibling_source = sibling_source.clone();
+        let sibling = app.build_window_context_for_test(sibling_window, |viewer| {
+            viewer.spread_mode = SpreadMode::SplitLtr;
+            viewer.spread_presentation_source = sibling_source;
+        });
+        for idx in 0..app.items.len() {
+            app.fs_cache.insert(idx, FsCacheEntry::Failed);
+        }
+        let adoption = browser(&app);
+        app.open_fullscreen_with_adoption(1, HistoryTrigger::UserChosen, None, adoption);
+        if multiple {
+            let reader = app.active_viewer_context_id().unwrap();
+            app.with_viewer_context(reader, |viewer| {
+                assert_eq!(viewer.spread_mode, SpreadMode::Single);
+                assert_eq!(viewer.spread_presentation_source, main_source);
+                assert!(!viewer.folder_observation_allowed());
+                viewer.folder_observation = None;
+                assert!(viewer.apply_fullscreen_spread_mode(
+                    &egui::Context::default(),
+                    1,
+                    SpreadMode::Ltr
+                ));
+                assert_eq!(viewer.spread_mode, SpreadMode::Ltr);
+                assert_eq!(
+                    viewer
+                        .persist_spread_presentation(
+                            SpreadMode::Single,
+                            ReadingFlow::Paged,
+                            ReadingDirection::Ltr
+                        )
+                        .unwrap(),
+                    crate::ui_fullscreen::SpreadPresentationPersistence::NotRemembered
+                );
+                viewer.settings.browser_view_output_dir = Some(folder.join("new-root"));
+                assert_eq!(
+                    viewer
+                        .persist_spread_presentation(
+                            SpreadMode::Ltr,
+                            ReadingFlow::Paged,
+                            ReadingDirection::Ltr
+                        )
+                        .unwrap(),
+                    crate::ui_fullscreen::SpreadPresentationPersistence::Saved
+                );
+            })
+            .unwrap();
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            assert_eq!(app.spread_presentation_source, main_source);
+        } else {
+            assert_eq!(app.spread_mode, SpreadMode::Single);
+            assert_eq!(app.fullscreen_idx, Some(1));
+            assert!(!app.remembers_spread_presentation());
+        }
+        assert_eq!(app.items_generation, main_generation);
+        assert!(Arc::ptr_eq(&app.cancel_token, &main_cancel));
+        assert!(!main_cancel.load(Ordering::Relaxed));
+        app.with_viewer_context(sibling, |viewer| {
+            assert_eq!(viewer.spread_mode, SpreadMode::SplitLtr);
+            assert_eq!(viewer.spread_presentation_source, expected_sibling_source);
+        })
+        .unwrap();
+    }
+}

@@ -360,6 +360,7 @@ pub mod post_operation_selection;
 mod agent_ipc;
 mod agent_registration;
 mod browser_integration;
+mod browser_view_policy;
 pub(crate) mod page_edit_write_epoch;
 mod process_images;
 #[cfg(all(test, windows))]
@@ -1959,6 +1960,7 @@ pub fn run(session: &mut GuiRunSession) -> PreparedRunExit {
         })
         .expect("RAW develop worker startup"),
     );
+    browser_view_policy::initialize_default_root();
     let shared_readers = remote_ipc::SharedReaders::open(&saved);
     let mut remote_ipc_server = match startup_result(
         miv_startup::Stage::RemoteReader,

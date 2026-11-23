@@ -905,11 +905,11 @@ impl RemoteReadingSettingsSource {
                 crate::settings_db::with_db_result(|db| db.load_remote_reading_settings(fallback))
             }
             #[cfg(test)]
-            Self::Snapshot(settings) => Ok(*settings),
+            Self::Snapshot(settings) => Ok(settings.clone()),
             #[cfg(test)]
             Self::CountedSnapshot(settings, reads) => {
                 reads.fetch_add(1, Ordering::Relaxed);
-                Ok(*settings)
+                Ok(settings.clone())
             }
         }
     }
@@ -3321,8 +3321,17 @@ impl ContainerEngine {
                 },
             })
         } else {
-            self.validate_write_request(&mut request)?;
-            Ok(super::session::RemoteWritePayload::Request(request))
+            let is_directory = self.validate_write_request_target_admitted(
+                &mut request,
+                current_catalog_admission(),
+            )?;
+            Ok(match is_directory {
+                Some(is_directory) => super::session::RemoteWritePayload::ReadingSettings {
+                    request,
+                    is_directory,
+                },
+                None => super::session::RemoteWritePayload::Request(request),
+            })
         }
     }
 
@@ -3513,6 +3522,16 @@ impl ContainerEngine {
         request: &mut RemoteWriteRequest,
         catalog_admission: crate::catalog::CatalogAdmission,
     ) -> Result<(), RemoteWriteError> {
+        self.validate_write_request_target_admitted(request, catalog_admission)
+            .map(|_| ())
+    }
+
+    /// Preserve the worker-validated physical kind through the UI write queue.
+    fn validate_write_request_target_admitted(
+        &self,
+        request: &mut RemoteWriteRequest,
+        catalog_admission: crate::catalog::CatalogAdmission,
+    ) -> Result<Option<bool>, RemoteWriteError> {
         // Video progress resolves its path in the media-specific validation below and writes
         // that exact logical result back; avoid a second filesystem resolution here.
         if !matches!(request, RemoteWriteRequest::RecordVideoProgress { .. })
@@ -3523,6 +3542,7 @@ impl ContainerEngine {
         if let Some(context_address) = request.context_address_mut() {
             self.canonicalize_write_address(context_address)?;
         }
+        let mut reading_target_is_directory = None;
         match request {
             RemoteWriteRequest::SetViewMode { address, .. }
             | RemoteWriteRequest::SetSpread { address, .. }
@@ -3545,6 +3565,7 @@ impl ContainerEngine {
                     }
                     RemoteSubresource::ZipEntry { .. } | RemoteSubresource::PdfPage { .. } => false,
                 };
+                reading_target_is_directory = Some(is_directory);
                 supported.then_some(()).ok_or_else(|| {
                     RemoteWriteError::new(
                         RemoteWriteErrorCode::Unsupported,
@@ -3782,7 +3803,8 @@ impl ContainerEngine {
                     }
                 }
             }
-        }
+        }?;
+        Ok(reading_target_is_directory)
     }
 
     fn canonicalize_write_address(
@@ -6869,6 +6891,11 @@ impl ContainerEngine {
         };
         let (stored, final_cover_preference, singleton_placement_preference, page_alone_preference) =
             self.stored_spread_state(&key.exact, key.fallback.as_deref())?;
+        let browser_directory = crate::browser_view_policy::is_browser_view_directory(
+            &resolved.logical,
+            matches!(default_source, SpreadDefaultSource::Directory { .. }),
+            reading_settings.browser_view_output_dir.as_deref(),
+        );
         let source_items = source_items.unwrap_or(items);
         let use_book_defaults = match default_source {
             SpreadDefaultSource::Legacy { use_book_defaults } => use_book_defaults,
@@ -6877,7 +6904,10 @@ impl ContainerEngine {
                 ..
             } => canonical_image_book,
         };
-        let (default_mode, default_direction) = if let SpreadDefaultSource::Directory {
+        let (default_mode, default_direction) = if browser_directory {
+            let defaults = crate::app::SpreadRestoreDefaults::NON_BOOK;
+            (defaults.spread_mode(), defaults.reading_direction())
+        } else if let SpreadDefaultSource::Directory {
             book_locked: false,
             canonical_image_book: true,
         } = default_source
@@ -6907,7 +6937,8 @@ impl ContainerEngine {
         };
         // The open operation owns the target used for count, direction and dimensions.
         // A viewing classification does not override an inherited document direction.
-        let document_direction = if composition.is_none()
+        let document_direction = if !browser_directory
+            && composition.is_none()
             && stored.needs_document_direction(reading_settings.follow_document_reading_direction)
         {
             if is_epub_path(&resolved.logical) {
@@ -6934,7 +6965,13 @@ impl ContainerEngine {
         } else {
             None
         };
-        let reading = stored.resolve_reading(
+        // Other stored preferences remain active; only page composition is ignored.
+        let stored_reading = if browser_directory {
+            crate::spread_db::StoredSpreadState::default()
+        } else {
+            stored
+        };
+        let reading = stored_reading.resolve_reading(
             default_mode,
             default_direction,
             reading_settings.follow_document_reading_direction,
@@ -10140,6 +10177,7 @@ fn thumbnail_error(code: ThumbnailErrorCode, message: impl Into<String>) -> Thum
 
 #[cfg(test)]
 pub(super) mod tests {
+    include!("browser870_container_tests.rs");
     fn audit_enumeration<T>(
         budget: Option<usize>,
         run: impl FnOnce() -> T,
@@ -16525,7 +16563,8 @@ pub(super) mod tests {
         live.margin_fit_enabled = false;
         live.fullscreen_fit_mode = crate::settings::FullscreenFitMode::Page;
         let reads = Arc::new(AtomicUsize::new(0));
-        engine.reading_settings = RemoteReadingSettingsSource::CountedSnapshot(live, reads.clone());
+        engine.reading_settings =
+            RemoteReadingSettingsSource::CountedSnapshot(live.clone(), reads.clone());
         let left = favorite_address(&favorite, "book/left.png");
         let right = favorite_address(&favorite, "book/right.png");
         let resolved = engine.resolve(&left).unwrap();
@@ -16541,7 +16580,7 @@ pub(super) mod tests {
         );
         assert_eq!(reads.load(Ordering::Relaxed), 1);
         live.auto_view_trim_default_enabled = false;
-        engine.reading_settings = RemoteReadingSettingsSource::Snapshot(live);
+        engine.reading_settings = RemoteReadingSettingsSource::Snapshot(live.clone());
         assert!(matches!(
             engine
                 .remote_view_trim_plan(
@@ -16555,7 +16594,7 @@ pub(super) mod tests {
         ));
         // A failed open must never turn into a missing row and inherit global Auto.
         live.auto_view_trim_default_enabled = true;
-        engine.reading_settings = RemoteReadingSettingsSource::Snapshot(live);
+        engine.reading_settings = RemoteReadingSettingsSource::Snapshot(live.clone());
         *engine.view_trim_db.lock().unwrap() = Err("fixture open failure".into());
         assert!(matches!(
             engine
@@ -20460,9 +20499,10 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn zip_and_pdf_spread_defaults_remain_book_defaults() {
+    fn browser870_remote_zip_and_pdf_spread_defaults_remain_book_defaults() {
         let temp = tempfile::tempdir().unwrap();
         let engine = ContainerEngine::new(crate::settings::Settings {
+            browser_view_output_dir: Some(temp.path().to_path_buf()),
             default_spread_mode: crate::settings::SpreadMode::LtrCover,
             default_reading_direction: crate::settings::ReadingDirection::Ltr,
             singleton_spread_first_enabled: true,

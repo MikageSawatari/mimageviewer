@@ -147,7 +147,7 @@ mod spread_shift_d3 {
                 reading.page_after_cover_alone_enabled = alone;
                 reading.last_page_alone_enabled = alone;
                 let mut engine = make_engine(crate::settings::Settings::default(), &service);
-                engine.reading_settings = RemoteReadingSettingsSource::Snapshot(reading);
+                engine.reading_settings = RemoteReadingSettingsSource::Snapshot(reading.clone());
                 let payload = engine
                     .spread_payload(
                         &request(&book, mode, false),

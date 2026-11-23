@@ -13735,6 +13735,29 @@ pub(crate) fn physical_page_order_locked(
             && items.iter().all(|item| matches!(item, GridItem::Image(_)))
 }
 
+/// Accepted listing provenance, owned and transferred with its viewer context.
+/// The browser root is deliberately resolved from live settings, never cached here.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SpreadPresentationSource {
+    #[default]
+    Other,
+    PhysicalDirectory {
+        key: PathBuf,
+    },
+}
+
+impl SpreadPresentationSource {
+    fn is_browser_directory(&self, key: &Path, settings: &crate::settings::Settings) -> bool {
+        matches!(self, Self::PhysicalDirectory { key: source }
+            if crate::folder_tree::path_eq(source, key))
+            && crate::browser_view_policy::is_browser_view_directory(
+                key,
+                true,
+                settings.browser_view_output_dir.as_deref(),
+            )
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SpreadRestoreDefaults {
     spread_mode: crate::settings::SpreadMode,
@@ -19794,6 +19817,7 @@ pub struct App {
     /// 画面ちらつきを防ぐ。`current_folder_last_mtime` と同じくディレクトリ実体のみ。
     pub(crate) current_folder_signature: Option<folder_scan::FolderScanSignature>,
     pub(crate) folder_observation: Option<FolderObservation>,
+    pub(crate) spread_presentation_source: SpreadPresentationSource,
     /// 前フレームの main viewport focus 状態。false → true 遷移で外部更新チェックを走らせる。
     /// 初期値 true: 初回フレームで誤トリガしないため (default focus は true 扱い)。
     pub(crate) last_main_focused: bool,
@@ -22144,6 +22168,7 @@ impl App {
             current_folder_last_mtime: None,
             current_folder_signature: None,
             folder_observation: None,
+            spread_presentation_source: SpreadPresentationSource::Other,
             last_main_focused: true,
 
             #[cfg(all(windows, not(feature = "portable"), not(test)))]
@@ -29287,6 +29312,23 @@ impl App {
         }
     }
 
+    pub(crate) fn browser_directory_presentation_for_key(&self, key: &Path) -> bool {
+        self.spread_presentation_source
+            .is_browser_directory(key, &self.settings)
+    }
+
+    /// Display gestures may update the live session without changing durable defaults.
+    pub(crate) fn remembers_spread_presentation(&self) -> bool {
+        if self.composition_owns_view_settings() {
+            return true;
+        }
+        self.extracted_result_surface().is_none()
+            && !self
+                .spread_container_key()
+                .as_deref()
+                .is_some_and(|key| self.browser_directory_presentation_for_key(key))
+    }
+
     pub(crate) fn final_cover_spread_enabled_for_current_book(&self) -> bool {
         if self.extracted_result_surface().is_some() {
             return false;
@@ -29398,7 +29440,17 @@ impl App {
         document_direction: Option<crate::pdf_loader::PdfReadingDirection>,
     ) -> Result<(), String> {
         let db = self.spread_db.as_ref().map_err(Clone::clone)?;
-        let stored = db.get_state_with_fallback(key, fallback);
+        let browser_directory = self.browser_directory_presentation_for_key(key);
+        let defaults = if browser_directory {
+            SpreadRestoreDefaults::NON_BOOK
+        } else {
+            defaults
+        };
+        let stored = if browser_directory {
+            crate::spread_db::StoredSpreadState::default()
+        } else {
+            db.get_state_with_fallback(key, fallback)
+        };
         if self.extracted_result_surface().is_some() {
             // A2 changes pairing, not the entrance's existing continuous-reading policy.
             // Legacy Vertical is a flow encoding and overrides a retained flow column,
@@ -44859,14 +44911,28 @@ impl App {
         let page_order_view_kind = PageOrderViewKind::for_loading_source(&source_path);
         // A signature comes from an accepted directory scan (also retained by Stack).
         // Physical view kind or the path extension alone does not prove a directory.
-        let spread_restore_defaults = SpreadRestoreDefaults::for_physical_folder(
-            self.page_order_locked_for_items(&source_path, &items, page_order_view_kind),
-            folder_signature.is_some() && page_order_view_kind == PageOrderViewKind::Physical,
-            self.settings.apply_default_spread_to_plain_folders,
-            self.settings.default_spread_mode,
-            self.settings.default_reading_flow,
-            self.settings.default_reading_direction,
-        );
+        let spread_presentation_source =
+            if folder_signature.is_some() && page_order_view_kind == PageOrderViewKind::Physical {
+                SpreadPresentationSource::PhysicalDirectory {
+                    key: source_path.clone(),
+                }
+            } else {
+                SpreadPresentationSource::Other
+            };
+        let spread_restore_defaults = if spread_presentation_source
+            .is_browser_directory(&source_path, &self.settings)
+        {
+            SpreadRestoreDefaults::NON_BOOK
+        } else {
+            SpreadRestoreDefaults::for_physical_folder(
+                self.page_order_locked_for_items(&source_path, &items, page_order_view_kind),
+                folder_signature.is_some() && page_order_view_kind == PageOrderViewKind::Physical,
+                self.settings.apply_default_spread_to_plain_folders,
+                self.settings.default_spread_mode,
+                self.settings.default_reading_flow,
+                self.settings.default_reading_direction,
+            )
+        };
         let has_prepared_aggregate = prepared_subfolder
             .as_ref()
             .is_some_and(|metadata| metadata.aggregate.is_some());
@@ -44885,6 +44951,7 @@ impl App {
             ),
         };
         self.install_new_items_inner(items, image_metas, !has_prepared_aggregate);
+        self.spread_presentation_source = spread_presentation_source;
         // Downstream Stack installs retain the physical scan record. Bind it only after
         // the row install advances the owning generation; ordinary preparation replaces it
         // with its new record after this same install boundary.
@@ -46158,6 +46225,7 @@ impl App {
         }
         self.persist_pending_view_trim_state();
         self.items = items;
+        self.spread_presentation_source = SpreadPresentationSource::Other;
         self.global_search.clear_projection_branches();
         self.tag_view_applied_times.clear();
         self.projection_recipe = Default::default();
@@ -51107,63 +51175,70 @@ impl App {
             self.reprepare_page_edits_for_existing_virtual_order();
         }
         if let Some(container) = result.container_state.take() {
-            // Limit the opt-in to plain directories. Keep the pre-1.425 import calculation
-            // for OFF, books and other sources, including its existing differences from open.
-            // Reuse this context's accepted directory scan, without another stat or scan.
-            let physical_folder_defaults = self.folder_observation.as_ref().and_then(|scan| {
-                (self.settings.apply_default_spread_to_plain_folders
-                    && scan.generation == self.items_generation
-                    && self.current_folder.as_ref() == Some(&scan.source)
-                    && self.extracted_result_surface().is_none()
-                    && !self.page_order_locked_for_items(
-                        &scan.source,
-                        &self.items,
-                        PageOrderViewKind::Physical,
-                    ))
-                .then(|| {
-                    SpreadRestoreDefaults::for_physical_folder(
-                        false,
-                        true,
-                        self.settings.apply_default_spread_to_plain_folders,
-                        self.settings.default_spread_mode,
-                        self.settings.default_reading_flow,
-                        self.settings.default_reading_direction,
-                    )
-                })
-            });
-            let (stored_spread, preferred_direction, default_flow) =
-                if let Some(defaults) = physical_folder_defaults {
-                    let resolved = container.spread.resolve_reading(
-                        defaults.spread_mode,
-                        defaults.reading_direction,
-                        false,
-                        None,
-                    );
-                    (resolved.mode, resolved.direction, defaults.reading_flow)
+            let preserve_presentation = self
+                .spread_container_key()
+                .as_deref()
+                .is_some_and(|key| self.browser_directory_presentation_for_key(key))
+                && !self.composition_owns_view_settings();
+            if !preserve_presentation {
+                // Limit the opt-in to plain directories. Keep the pre-1.425 import calculation
+                // for OFF, books and other sources, including its existing differences from open.
+                // Reuse this context's accepted directory scan, without another stat or scan.
+                let physical_folder_defaults = self.folder_observation.as_ref().and_then(|scan| {
+                    (self.settings.apply_default_spread_to_plain_folders
+                        && scan.generation == self.items_generation
+                        && self.current_folder.as_ref() == Some(&scan.source)
+                        && self.extracted_result_surface().is_none()
+                        && !self.page_order_locked_for_items(
+                            &scan.source,
+                            &self.items,
+                            PageOrderViewKind::Physical,
+                        ))
+                    .then(|| {
+                        SpreadRestoreDefaults::for_physical_folder(
+                            false,
+                            true,
+                            self.settings.apply_default_spread_to_plain_folders,
+                            self.settings.default_spread_mode,
+                            self.settings.default_reading_flow,
+                            self.settings.default_reading_direction,
+                        )
+                    })
+                });
+                let (stored_spread, preferred_direction, default_flow) =
+                    if let Some(defaults) = physical_folder_defaults {
+                        let resolved = container.spread.resolve_reading(
+                            defaults.spread_mode,
+                            defaults.reading_direction,
+                            false,
+                            None,
+                        );
+                        (resolved.mode, resolved.direction, defaults.reading_flow)
+                    } else {
+                        let direction = container
+                            .spread
+                            .direction
+                            .unwrap_or(self.settings.default_reading_direction);
+                        let mode = container.spread.resolve_mode(
+                            self.settings
+                                .default_spread_mode
+                                .with_reading_direction(direction),
+                            direction,
+                        );
+                        (mode, direction, self.settings.default_reading_flow)
+                    };
+                retire_spread_step(&mut self.spread_step);
+                self.reading_flow = container.spread.flow.unwrap_or(default_flow);
+                self.reading_direction = preferred_direction;
+                if stored_spread == crate::settings::SpreadMode::Vertical {
+                    self.spread_mode = crate::settings::SpreadMode::Single;
+                    self.reading_flow = crate::settings::ReadingFlow::Vertical;
                 } else {
-                    let direction = container
-                        .spread
-                        .direction
-                        .unwrap_or(self.settings.default_reading_direction);
-                    let mode = container.spread.resolve_mode(
-                        self.settings
-                            .default_spread_mode
-                            .with_reading_direction(direction),
-                        direction,
-                    );
-                    (mode, direction, self.settings.default_reading_flow)
-                };
-            retire_spread_step(&mut self.spread_step);
-            self.reading_flow = container.spread.flow.unwrap_or(default_flow);
-            self.reading_direction = preferred_direction;
-            if stored_spread == crate::settings::SpreadMode::Vertical {
-                self.spread_mode = crate::settings::SpreadMode::Single;
-                self.reading_flow = crate::settings::ReadingFlow::Vertical;
-            } else {
-                self.spread_mode = stored_spread;
+                    self.spread_mode = stored_spread;
+                }
+                // 読み順の対応表は `SpreadMode::reading_direction` が正本 (上と同じ理由)。
+                self.update_reading_direction_from_spread_mode(self.spread_mode);
             }
-            // 読み順の対応表は `SpreadMode::reading_direction` が正本 (上と同じ理由)。
-            self.update_reading_direction_from_spread_mode(self.spread_mode);
             // Base-rule hydration preserves the accepted shift owner; open adoption resolves it.
             self.final_cover_spread_preference = container.final_cover_spread_preference;
             self.singleton_spread_endpoint_preferences =

@@ -1154,6 +1154,10 @@ pub(crate) struct ValidatedRemoteReadingProgress {
 
 pub(crate) enum RemoteWritePayload {
     Request(RemoteWriteRequest),
+    ReadingSettings {
+        request: RemoteWriteRequest,
+        is_directory: bool,
+    },
     ReadingProgress {
         request: RemoteWriteRequest,
         validated: ValidatedRemoteReadingProgress,
@@ -1163,8 +1167,19 @@ pub(crate) enum RemoteWritePayload {
 impl RemoteWritePayload {
     pub(crate) fn request(&self) -> &RemoteWriteRequest {
         match self {
-            Self::Request(request) | Self::ReadingProgress { request, .. } => request,
+            Self::Request(request)
+            | Self::ReadingSettings { request, .. }
+            | Self::ReadingProgress { request, .. } => request,
         }
+    }
+    pub(crate) fn reading_target_is_directory(&self) -> bool {
+        matches!(
+            self,
+            Self::ReadingSettings {
+                is_directory: true,
+                ..
+            }
+        )
     }
     pub(crate) fn reading_progress(&self) -> Option<&ValidatedRemoteReadingProgress> {
         match self {
@@ -1362,6 +1377,9 @@ enum UiRequestEnqueueError {
 }
 
 impl ClaimedRemoteWrite {
+    pub(crate) fn reading_target_is_directory(&self) -> bool {
+        self.request.reading_target_is_directory()
+    }
     pub(crate) fn composition_admission(
         &self,
     ) -> &crate::book_composition::CompositionWriteAdmission {

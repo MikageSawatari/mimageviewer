@@ -44,10 +44,9 @@ impl Environment {
                 .parent()
                 .ok_or("実行ファイルを確認できません")?
                 .join(HOST_EXE),
-            default_output: crate::known_folders::pictures_dir()
-                .ok_or("ピクチャを確認できません")?
-                .join("mimageviewer")
-                .join("browser"),
+            default_output: crate::browser_view_policy::output_root_from_pictures(
+                &crate::known_folders::pictures_dir().ok_or("ピクチャを確認できません")?,
+            ),
             portable: cfg!(feature = "portable"),
             explicit_data_dir,
         })

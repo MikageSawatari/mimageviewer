@@ -18,6 +18,12 @@
 //! v0.9.0 で native presenter に移行済。新規追加 / 移植時に「ui_fullscreen.rs を見て
 //! しまう」誤認を避けるため明示。
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpreadPresentationPersistence {
+    Saved,
+    NotRemembered,
+}
+
 pub(crate) mod canonical_demand;
 mod compare_original;
 mod spread_step;
@@ -46998,14 +47004,17 @@ impl App {
         self.scroll_vertical_reading_by(ctx, delta, history_trigger);
     }
 
-    fn persist_spread_presentation(
+    pub(crate) fn persist_spread_presentation(
         &mut self,
         mode: SpreadMode,
         flow: ReadingFlow,
         direction: ReadingDirection,
-    ) -> Result<(), String> {
+    ) -> Result<SpreadPresentationPersistence, String> {
+        if !self.remembers_spread_presentation() {
+            return Ok(SpreadPresentationPersistence::NotRemembered);
+        }
         let Some(key) = self.spread_container_key() else {
-            return Ok(());
+            return Ok(SpreadPresentationPersistence::NotRemembered);
         };
         self.spread_db.as_ref().map_err(Clone::clone)?;
         if !self.admit_book_append_followup_mutation() {
@@ -47027,7 +47036,7 @@ impl App {
         self.record_current_container_content_identity(
             crate::content_identity::ContentIdentityTrigger::Edit,
         );
-        Ok(())
+        Ok(SpreadPresentationPersistence::Saved)
     }
 
     fn persist_current_final_cover_spread_preference(
@@ -47496,13 +47505,16 @@ impl App {
         }
         let previous_surface = self.capture_book_mode_transition(mode);
         let direction = mode.reading_direction().unwrap_or(self.reading_direction);
-        if let Err(error) = self.persist_spread_presentation(mode, self.reading_flow, direction) {
-            crate::logger::log(format!("spread: failed to save mode: {error}"));
-            return false;
-        }
+        let persisted = match self.persist_spread_presentation(mode, self.reading_flow, direction) {
+            Ok(persisted) => persisted,
+            Err(error) => {
+                crate::logger::log(format!("spread: failed to save mode: {error}"));
+                return false;
+            }
+        };
         self.invalidate_similar_preview();
         self.spread_mode = mode;
-        if self.extracted_result_surface().is_none() {
+        if persisted == SpreadPresentationPersistence::Saved {
             self.settings.update_active_favorite_spread_mode(mode);
         }
         self.reset_live_spread_shift(false);
@@ -47569,7 +47581,7 @@ impl App {
 
     /// Mode-only switching preserves the accepted composition and dormant E
     /// shift. The sole persisted field is the exact book's legacy mode column.
-    fn composition_owns_view_settings(&self) -> bool {
+    pub(crate) fn composition_owns_view_settings(&self) -> bool {
         matches!(
             self.projection_recipe,
             crate::app::book_materialization::ProjectionRecipe::Book(_)
@@ -47878,17 +47890,21 @@ impl App {
         let composed = self.composition_owns_view_settings();
         let persisted = if composed {
             self.persist_fullscreen_reading_flow(flow)
+                .map(|()| SpreadPresentationPersistence::Saved)
         } else {
             self.persist_spread_presentation(self.spread_mode, flow, self.reading_direction)
         };
-        if let Err(error) = persisted {
-            crate::logger::log(format!("spread: failed to save reading flow: {error}"));
-            return;
-        }
+        let persisted = match persisted {
+            Ok(persisted) => persisted,
+            Err(error) => {
+                crate::logger::log(format!("spread: failed to save reading flow: {error}"));
+                return;
+            }
+        };
         retire_spread_step(&mut self.spread_step);
         self.invalidate_similar_preview();
         self.reading_flow = flow;
-        if self.extracted_result_surface().is_none() && !composed {
+        if persisted == SpreadPresentationPersistence::Saved && !composed {
             self.settings.update_active_favorite_reading_flow(flow);
         }
         if !composed {
@@ -47916,7 +47932,7 @@ impl App {
             return false;
         }
         self.spread_mode = new_mode;
-        if self.extracted_result_surface().is_none() {
+        if self.remembers_spread_presentation() {
             self.settings.update_active_favorite_spread_mode(new_mode);
         }
         self.adjust_spread_target = None;
