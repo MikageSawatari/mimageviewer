@@ -55,7 +55,11 @@
 
 ### 1.878 空のデータフォルダで初めて起動した回の mIV では、Remote が見開きの保存行を読めない (起動し直すと読める) — §1.870 のサブ PC2 確認から (2026-11-23)
 
-- 状態: **未着手、収録版未定 (以前から、§1.870 とは関係しない)**。
+- 状態: **修正済み・master 入り (52a1f48a6、v5.7.0 収録)、実機は未確認**。以前からの不具合で、§1.870 とは関係しない。
+  - 読み取り専用で開く DB を `LateCreatedReadOnlyDb` (`src/remote_ipc/read_only_db.rs`) に通した。DB がまだ無い間は読むたびにファイルの有無を見て開き、開けたら同じ接続を使い続ける。
+  - 対象は spread.db・view_trim.db と、長く持つ `WorkerContext` の 6 つ (回転・マスク・部分補正・隠し・コミック・切り抜き)。
+  - IPC の wire と PROTOCOL_VERSION は変わらない。
+  - 独立レビュー (Sol / xhigh) は r1 REVISE、r2 ACCEPT。関連テスト 881 件が成功。
 - 観測 (サブ PC2 の担当、開発版): 空のデータフォルダで初めて起動した回は、Remote がデスクトップで保存した行も Remote から書いた行も読めず、いつも全体の既定で表示した。Remote で見開きを選ぶと書き込みは成功するが、表示は変わらない。同じデータのまま起動し直すと正しく読めた。写真とログは `C:\home\mimageviewer-subpc\browser870\results\`。
 - 原因 (browser-818 の担当のコード読み): `ContainerEngine::new_inner` (`src/remote_ipc/container.rs`) が Remote の reader の起動のときに `SpreadDb::open_existing_read_only_at` を 1 回だけ呼ぶ。その時点では本体がまだ spread.db を作っておらず、ファイルが無いと `Ok(None)` のまま、そのプロセスの間は開き直さない。`view_trim.db` も同じ形 (未確認)。
 - 起きる場面: 新しくインストールして、最初の起動のうちに Remote を使う場合など。直すなら、読むときに無ければ開き直す (ファイルの有無で決める) か、本体が DB を作った後に Remote 側へ知らせる。同じ形の DB をほかにも探す。
