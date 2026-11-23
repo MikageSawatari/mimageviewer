@@ -176,11 +176,15 @@ fn stack_script_records_and_logging_contain_lines_but_never_the_body() {
     let records = records.lock().unwrap();
     assert_eq!(records.entries().len(), 1);
     let record = &records.entries()[0];
-    assert!(record.notice.contains("3 行 → 8 行"));
+    assert_eq!(record.notice, "スタック用スクリプトを変更 (3 行 → 8 行)");
     assert_eq!(record.rows[0].before, "3 行");
     assert_eq!(record.rows[0].after, "8 行");
     assert_eq!(notices.try_recv().unwrap(), record.notice);
-    assert!(record.notice.contains("フォルダを読み直す"));
+    let Payload::StackScript(StackScriptResult::Write(write)) = &payload else {
+        panic!()
+    };
+    assert!(write.message.contains("フォルダを読み直す"));
+    assert!(!record.notice.contains("書く前に読み"));
     drop(records);
     let sentinel = "PRIVATE_SCRIPT_BODY_SENTINEL";
     stack_script::complete_write(
