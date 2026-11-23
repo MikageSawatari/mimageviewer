@@ -738,6 +738,7 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
 - 同じ worker 内の連続クリックを同期の受付 latch で防ぎ、要求を `storage.session` に保持。
 - `permissions.request` は user gesture 内、最初の await より前。
 - リンク先 (画像拡張子の HTTP(S) URL のときだけ) とページの画像を順序付き候補とし、同じ URL は一つにする。リンク先・ページの画像・ページの origin を重複なく、クリック内の最初の await より前にまとめて許可要求する。画像候補の origin のどれかが未許可なら `permission_denied` で終え、別候補へ逃げない。ページだけ未許可なら従来どおり位置を推定する。
+- **0.2.1 の独立レビュー P2 対応 (2026-11-23)**: `srcUrl` が `data:`・`blob:`・不正 URL でも、有効な画像リンクがあればリンク先だけを候補とする。候補は URL と `kind: link/source` を一つに保持し、HTTP(S) 以外の origin は許可に含めない。リンク先だけでも応答の型を調べ、非画像なら本文を cancel し `link_not_image` と `!` バッジ・日英の title で知らせる。リンク先が無いときの不正な `srcUrl` は従来どおり `invalid_url`、同一 URL の候補はページの画像として一つにする。
 - 取得は `credentials: include`、`cache: no-store`。**0.2.1 (2026-11-23、利用者が Commons の説明ページで NG を報告)**: リンク先は `Content-Type: image/*` (大小無視、パラメータ付き可) のときだけ使い、それ以外は本文を読まず cancel してページの画像を開く。成功時は `success_fallback` と成功バッジ・日英の title で切り替えを知らせる。ページの画像に型の検査は足さず、従来どおり host が形式を検査する。
 - fetch・HTTP・サイズ超過など取得自体の失敗では切り替えない。候補は最大二つの逐次取得とし、既存の同期 latch を維持することで、候補別の許可回避・並行取得・再試行の組み合わせを作らない。まれな失敗は既定どおり通知して終了し、回復処理を増やさない。
 - DNR は取得する URL ごとの完全一致・`TAB_ID_NONE`・自拡張起点限定。各取得の前に足し、終わったら外す。二回目の取得の前に付け直し、後片付け失敗は従来どおり `rule_failed`。
@@ -794,6 +795,13 @@ MV3、ソースは一つ。権限は設計書 §9.6 の宣言する 6 つ (`cont
 - `scripts/test-package-browser-extension.ps1`: Chrome・Edge とも key/ID・権限・翻訳・収録ファイル・ソース一致・再現性が PASS。出力範囲とソース不変の検査も PASS。検査スクリプトの変更は不要だった。
 - `git diff --check` と `python scripts/check_ui_glyphs.py` は成功。Rust・native host は変更せず、cargo・製品バイナリ・実ブラウザは実行していない。Commons での修正後の実機結果は未確認。
 - 独立レビュー (GPT-6.1 Sol / xhigh) は ACCEPT、未解決の指摘なし。マニュアルに残っていた「1 回取得」を候補切り替えの説明へ修正し、両画像サイトへの許可が必要なことも追記した。コード・テストは上記 87 件成功時から変更せず、検証結果を再利用した。
+
+**同日の独立レビュー P2 対応の追補**
+
+- その後の独立レビューで、`srcUrl` の無条件の HTTP(S) 検査が `data:` / `blob:` のサムネイルを包む有効な画像リンクを拒否する退行を指摘された。上記 ACCEPT はその前の差分に対する記録。候補の型とリンク先だけの取得・`link_not_image` の通知を段階8の仕様へ反映した。
+- Node は通常の `node --test` が `spawn EPERM` で開始前に停止したため、`--experimental-test-isolation=none` で実行し、既存 89 件と追加 11 件の計 100 件成功、失敗 0 件。追加分は `data:` / `blob:` / 不正 URL の候補・許可・通知、切り替え後の宣言サイズ／stream 超過時の規則削除、中断した worker の session からの復旧を検査する。中断テストは API の継続を止めて session storage と規則だけを新 worker へ渡すモックであり、実 Chrome の worker 終了の観測ではない。
+- パッケージ検査 (Chrome・Edge と出力範囲・ソース不変)、`git diff --check`、グリフ検査は成功。Rust・native host は未変更で、cargo・コミット・製品バイナリ・実ブラウザは実行していない。
+- P2 対応の再レビュー (GPT-6.1 Sol / xhigh) は ACCEPT。P2 は解消され、追加の P1／P2／P3 指摘なし。上記 100 件とパッケージ検査の結果を再利用した。
 
 **段階8の独立レビュー P2 修正（2026-11-22、再レビュー待ち）**
 

@@ -26,6 +26,9 @@
   "success_fallback": {
     "message": "The link target was not an image, so the image shown on the page was opened."
   },
+  "link_not_image": {
+    "message": "The link target was not an image, and the image on the page cannot be fetched by this extension."
+  },
   "interrupted": {
     "message": "Image processing was interrupted. Select View in mIV again if needed."
   },

@@ -45,13 +45,16 @@ function selectTarget(info, tab) {
     const extension = url.pathname.slice(url.pathname.lastIndexOf(".") + 1).toLowerCase();
     if (IMAGE_EXTENSIONS.includes(extension)) linked = url;
   } catch { /* A non-image link does not change the image menu's source. */ }
-  const source = httpUrl(info.srcUrl);
-  const images = linked && linked.href !== source.href ? [linked, source] : [source];
+  let source = null;
+  try { source = httpUrl(info.srcUrl); }
+  catch (error) { if (!linked) throw error; }
+  const candidates = source ? [{ kind: "source", url: source }] : [];
+  if (linked && linked.href !== source?.href) candidates.unshift({ kind: "link", url: linked });
   const page = httpUrl(info.pageUrl || tab.url);
   if (!Number.isInteger(tab.id) || tab.id < 0 || !Number.isInteger(tab.windowId)) {
     throw new Failure("position_failed");
   }
-  return { images, page, tab };
+  return { candidates, page, tab };
 }
 function exactRule(image, pageOrigin, tabNone, extensionId) {
   return {
@@ -169,7 +172,7 @@ function createWorker(api, fetchImage = globalThis.fetch, { maxFrameBytes = MAX_
   async function open(target, permission) {
     const permissionResult = await permission;
     if (permissionResult.error) throw new Failure("permission_failed");
-    const imageOrigins = [...new Set(target.images.map(image => `${image.origin}/*`))];
+    const imageOrigins = [...new Set(target.candidates.map(candidate => `${candidate.url.origin}/*`))];
     const pageOrigin = `${target.page.origin}/*`;
     if (!await api.permissions.contains({ origins: imageOrigins })) throw new Failure("permission_denied");
     const pageAllowed = await api.permissions.contains({ origins: [pageOrigin] });
@@ -189,7 +192,8 @@ function createWorker(api, fetchImage = globalThis.fetch, { maxFrameBytes = MAX_
       view, zoom,
       window: { left: windowInfo.left, top: windowInfo.top, width: windowInfo.width, height: windowInfo.height, state: windowInfo.state }
     };
-    for (const [index, image] of target.images.entries()) {
+    for (const [index, candidate] of target.candidates.entries()) {
+      const image = candidate.url;
       message.image_url = image.href;
       try {
         await api.declarativeNetRequest.updateSessionRules({
@@ -201,11 +205,12 @@ function createWorker(api, fetchImage = globalThis.fetch, { maxFrameBytes = MAX_
         message.final_url = httpUrl(response.url).href;
         message.content_type = response.headers.get("Content-Type") || "";
         const budget = rawBudget(message, maxFrameBytes);
-        // Only a distinct image link is probed. The displayed image keeps the
+        // A link is probed even without a fetchable source. The displayed image keeps the
         // existing host-side format validation, including absent/generic types.
-        if (index === 0 && target.images.length > 1 && !/^image\//i.test(message.content_type)) {
+        if (candidate.kind === "link" && !/^image\//i.test(message.content_type)) {
           await checkResponse(response, budget);
           await response.body.cancel();
+          if (target.candidates.length === 1) throw new Failure("link_not_image");
           continue;
         }
         message.data_b64 = await readImage(response, budget);
@@ -230,7 +235,7 @@ function createWorker(api, fetchImage = globalThis.fetch, { maxFrameBytes = MAX_
     let target, permission;
     try {
       target = selectTarget(info, tab);
-      const origins = [...new Set([...target.images, target.page].map(url => `${url.origin}/*`))];
+      const origins = [...new Set([...target.candidates.map(candidate => candidate.url), target.page].map(url => `${url.origin}/*`))];
       // Attach both handlers now, including while startup recovery is still pending.
       permission = Promise.resolve(api.permissions.request({ origins }))
         .then(value => ({ value }), () => ({ error: true }));
@@ -243,7 +248,7 @@ function createWorker(api, fetchImage = globalThis.fetch, { maxFrameBytes = MAX_
       try {
         if (!await ready) throw new Failure("state_failed");
         await api.storage.session.set({ [PENDING_KEY]: {
-          v: 1, tab_id: tab.id, image_url: target.images[0].href, page_url: target.page.href
+          v: 1, tab_id: tab.id, image_url: target.candidates[0].url.href, page_url: target.page.href
         } });
         await status("busy");
         terminal = await open(target, permission);
