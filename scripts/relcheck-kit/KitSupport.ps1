@@ -81,7 +81,7 @@ function Read-ReleaseCheckKitManifest {
             $m.features[0] -cne 'portable' -or $m.features[1] -cne 'test-script' -or
             $m.source_fingerprint_sha256 -cne $fingerprint){throw 'Invalid kit diagnostic manifest.'}
     }
-    foreach($field in @('source_head','source_fingerprint_sha256','core_sha256','remote_sha256','epub_worker_sha256','mcp_sha256','musicvideo_sha256')){
+    foreach($field in @('source_head','source_fingerprint_sha256','core_sha256','remote_sha256','epub_worker_sha256','mcp_sha256','musicvideo_sha256','browser_host_sha256')){
         if([string]::IsNullOrWhiteSpace([string]$manifest.$field) -or $manifest.$field -cne $recorded.$field){throw "Kit artifact manifest mismatch: $field"}
     }
     if(($manifest | ConvertTo-Json -Depth 20 -Compress) -cne ($recorded | ConvertTo-Json -Depth 20 -Compress)){
@@ -154,7 +154,7 @@ function Assert-ReleaseCheckKit {
     if(@($actual | Where-Object {$_.path -ceq 'tools/ffmpeg/ffmpeg.exe'}).Count -ne 1){throw 'Kit ffmpeg.exe missing.'}
     $package=Join-Path $root 'target\portable-smoke-package'
     $manifest=$kit.artifact.manifest
-    $executables=[ordered]@{core='mimageviewer.exe';remote='mimageviewer-remote.exe';epub_worker='mimageviewer-epub-pdf.exe';mcp='mimageviewer-mcp.exe';musicvideo='mimageviewer-musicvideo.exe'}
+    $executables=[ordered]@{core='mimageviewer.exe';remote='mimageviewer-remote.exe';epub_worker='mimageviewer-epub-pdf.exe';mcp='mimageviewer-mcp.exe';musicvideo='mimageviewer-musicvideo.exe';browser_host='mimageviewer-browser-host.exe'}
     foreach($entry in $executables.GetEnumerator()){
         if($manifest.($entry.Key+'_sha256') -cne (Get-FileHash -LiteralPath (Join-Path $package $entry.Value) -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()){
             throw "Kit executable hash mismatch: $($entry.Value)"

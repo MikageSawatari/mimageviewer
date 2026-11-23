@@ -53,7 +53,7 @@ Assert-ReleaseCheckKitNoReparsePath $package
 try{
     Assert-SmokeBuildManifest (Join-Path $package '.test-script-build.json') $fingerprint `
         (Join-Path $package 'mimageviewer.exe') (Join-Path $package 'mimageviewer-remote.exe') (Join-Path $package 'mimageviewer-epub-pdf.exe') `
-        (Join-Path $package 'mimageviewer-mcp.exe') (Join-Path $package 'mimageviewer-musicvideo.exe')
+        (Join-Path $package 'mimageviewer-mcp.exe') (Join-Path $package 'mimageviewer-musicvideo.exe') (Join-Path $package 'mimageviewer-browser-host.exe')
 }catch{throw ('Invalid diagnostic package; rebuild with prepare-portable-smoke.ps1 -TestScript. '+$_.Exception.Message)}
 $artifactManifest=Get-Content -LiteralPath (Join-Path $package '.test-script-build.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert-ReleaseCheckDiagnosticBuildRoot (Join-Path $package 'mimageviewer.exe') $ArtifactRepo

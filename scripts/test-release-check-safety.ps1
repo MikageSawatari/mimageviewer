@@ -759,7 +759,7 @@ Assert-True ($samplerText.Contains("perf_evaluation='deferred_until_normal_exit'
         Write-FakeFile (Join-Path $root 'source-fingerprint-records.txt') "src/fake.rs`t012345"
         $fingerprint=(Get-FileHash -LiteralPath (Join-Path $root 'source-fingerprint-records.txt') -Algorithm SHA256).Hash.ToLowerInvariant()
         $build=[ordered]@{schema_version=1;artifact_flavor='portable-test-script';cargo_profile='release';features=@('portable','test-script');source_head=('a'*40);source_fingerprint_sha256=$fingerprint}
-        foreach($entry in ([ordered]@{core='mimageviewer.exe';remote='mimageviewer-remote.exe';epub_worker='mimageviewer-epub-pdf.exe';mcp='mimageviewer-mcp.exe';musicvideo='mimageviewer-musicvideo.exe'}).GetEnumerator()){
+        foreach($entry in ([ordered]@{core='mimageviewer.exe';remote='mimageviewer-remote.exe';epub_worker='mimageviewer-epub-pdf.exe';mcp='mimageviewer-mcp.exe';musicvideo='mimageviewer-musicvideo.exe';browser_host='mimageviewer-browser-host.exe'}).GetEnumerator()){
             $file=Join-Path $root ('target\portable-smoke-package\'+$entry.Value)
             Write-FakeFile $file ('fake '+$entry.Key)
             $build[$entry.Key+'_sha256']=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
