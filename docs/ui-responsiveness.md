@@ -19,6 +19,10 @@ AllRequirementsで補充する。全体proof・cache・停止状態を保持し�
 読み込みのモーダル化は一覧の即時表示と
 通常操作を妨げるため採らず、自動整列をしないことで選択保護や再整列待ちの状態を増やさない。
 
+## ドライブ移動の worker 解決とツールバーのドライブ欄（§1.793）
+
+`GridOpenCurrentDriveRoot` / `GridOpenDriveC..Z` / `GridSwitchDriveC..Z` とツールバーのドライブ欄は、UI では A/B のメモリの記録だけから要求を作り、行き先の `resolve_openable_path_detailed` は短命の `drive-jump-resolve` worker で行う。解決後は種類 (ディレクトリ / コンテナ) を保ったまま、検索の外は `DirectoryScanRoute::Worker` の走査、検索中は種類つきの検索を抜ける移動へ渡すので、完了から走査開始まで UI の stat は無い。要求は主一覧の要求の一覧 (`MainListRequestOwner::DriveJump`) に参加し、後の受付で退く。ドライブ欄の描画は記録のキーを読むだけで、ドライブ列挙・存在確認・ボリューム名の取得をしない。計測は `nav/drive_jump_resolve` (ms・request_kind・outcome)。実機での停止時間は未測定。設計: [drive-tabs-793-plan.md](drive-tabs-793-plan.md)。
+
 ## 静止画 scaler の先行作成と待ちの計装（§1.776 案 B-B）
 
 初回通常 present 後に、設定済みの NIS / Anime4K を低優先度 worker で作る。
