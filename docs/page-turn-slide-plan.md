@@ -1,6 +1,6 @@
 # §1.772 ページめくりの演出に「スライド」を加える — 設計案
 
-2026-11-23、設計基点 `page-turn-slide-772` / master `1a15e96bc`。状態: **設計第 3 版、独立設計レビュー r3 ACCEPT (§16)、利用者の判断待ち (§13)。実装前**。
+2026-11-23、設計基点 `page-turn-slide-772` / master `1a15e96bc`。状態: **設計第 4 版。r3 ACCEPT 後に利用者の判断 (§13) を受けて HUD・キーの §7.3 を追記、差分の再レビュー待ち。実装前**。
 正本の要望は [backlog §1.772](next-release-backlog.md)。既存の演出の正本は
 [ページめくり演出の設計](page-turn-animation-plan.md) (以下「本設計」)、表示単位の照合は
 [ページめくりとレイアウト](page-turn-layout-binding-plan.md)、描画の位置付けは [表示パイプライン](display-pipeline.md)。
@@ -166,9 +166,40 @@ gamepad の repeat は演出なし。スライドのための入力待ち・queu
 
 - 環境設定 → 表示 → 閲覧表示の「ページめくりアニメーション」の下に「動き: めくる / スライド」(radio) を足す。
   ON のときだけ操作でき (時間のスライダーと同じ `add_enabled_ui`)、説明文は種類に依らない言い方へ直す。
-- HUD「その他の機能」の行と `FsPageTurnAnimationToggle` は ON/OFF のまま。トーストの文言も変えない。
-  種類の切り替えは頻度が低いので、新しい `KeyAction` は足さない (§13 Q1 で変わり得る)。
+- HUD「その他の機能」の行は「OFF / めくる / スライド」の 3 つから選ぶ (利用者決定 2026-11-23、§13 Q1)。詳細は §7.3。
 - 本ごとの設定は作らない (§13 Q1)。複数ウィンドウ (F12) も含めて全体で 1 つ。
+
+### 7.3 HUD の行とキー (利用者決定 Q1 = 案 C を受けた設計、2026-11-23 追記)
+
+- **HUD の行はサブメニューを開く**。既存の多値の行「ナビゲータ位置」「ページ内の読み順」と同じ形
+  (`FS:38655` の `label  >` 表示、`FS:6946` のサブメニュー描画、`FS:39071` の Activate → panel state 遷移) に揃える。
+  - root の行: 見出しは今と同じ「ページめくりアニメーション」と `FsPageTurnAnimationToggle` の先頭 chord
+    (`first_chord_bracket_label`、今と同じ)。状態の欄は `OFF  >` / `めくる  >` / `スライド  >`。
+  - 押すと `FsOverflowPanelState::PageTurnAnimation` (新しい値) へ移り、「<  戻る」と「OFF」「めくる」「スライド」の 3 行を出す。
+    今の値に「選択中」を付ける。選ぶと設定を変えてサブメニューにとどまる (読み順・ナビゲータ位置の行と同じふるまい)。
+  - 1 回押すたびに 3 つを順に回す方式は採らない。押すたびに演出の取消と保存が走り、目的の値に着くまでに途中の値を経由するため。
+  - `fs_overflow_panel_body_row_count` に 1 + 3 行を足し、固定パネルの高さ検査 (`tests/support/scroll_layout.rs`) を通す。
+    `closes_on_file_change` の対象にはしない (全体設定。ナビゲータ位置と同じ)。
+  - 行の id `FullscreenOverflowItemId::PageTurnAnimationToggle` (`src/settings.rs:1025`) は保存されない固定並びの識別子なので、
+    名前は変えない (差分を広げない)。
+- **設定の変更は 1 か所を通す**: 環境設定・HUD のサブメニュー・キーのいずれも `adopt_page_turn_animation_settings(enabled, duration, style)`
+  → `settings.save()` の既存の順序を使う (今の `toggle_page_turn_animation` `FS:38584` と同じ)。HUD・キーでの変更は全体設定を変えるので、
+  兄弟 context の演出も既存の `cancel_all_page_turn_effects_for_settings` で取り消される。
+- **キー**: `FsPageTurnAnimationToggle` (FsImage / Press、既定キーなし) の意味は**今の ON/OFF のまま**にする。ON にするときは保存済みの
+  style (めくる / スライド) で ON になる。既にキーを割り当てている利用者の操作の意味を変えないため (リリース済みの操作)。
+  種類を変える新しい `KeyAction` は足さない。頻度の低い好みの設定で、HUD のサブメニューと環境設定で選べるため。理由を
+  `docs/keymap-spec.md` の `FsPageTurnAnimationToggle` の段落に追記する。
+- **トースト**: ON/OFF の切り替え (キー・HUD) と HUD のサブメニューの選択で、`[ページめくりアニメーション OFF]` /
+  `[ページめくりアニメーション めくる]` / `[ページめくりアニメーション スライド]` を出す (今の `ON` を種類名にする)。
+- **Remote**: 「その他の機能」の HUD は PC の静止画フルスクリーンだけにあり、mIV Remote (Web UI・IPC) にはこの行もページめくりの
+  設定も無い (コード検索で `src/` 外に参照なし、本設計 Q5)。IPC の版・Remote の画面は変えない。
+- **detached (F12)**: 別ウィンドウの HUD も同じ `fs_overflow_panel_state` と描画関数を使う既存のサブメニューの経路で、新しい
+  detached 述語・viewport 経路は足さない (§8 の判断は変わらない)。
+- **UI スナップショット**: `fullscreen_overflow_panel_root`・`_root_tall`・`_page_turn_on` は状態の欄の文言が変わるので更新する。
+  新しく `fullscreen_overflow_panel_page_turn_submenu` (スライド選択中) を足す。環境設定の 2 枚 (`page_turn_animation_settings_*`) も更新・追加 (§11)。
+- **テスト (handler-level)**: root の行を押すとサブメニューへ移る / 各行を押すと設定・保存・取消・トーストが期待どおり、
+  選択中の表示 / キーの toggle が style を保ったまま ON/OFF する / 兄弟 context で HUD から変えたときも全 context の演出が取り消される
+  (既存 `viewer_context_registry.rs:8668` の toggle の test を style 付きに広げる) / 既存の HUD の行の test (`FS:69124` 付近) を新しい状態文言へ更新。
 
 ### 7.2 保存・移行
 
@@ -246,6 +277,13 @@ projection は純粋関数で I/O を持たない。設定の保存失敗など�
 - CHANGELOG の下書き (統括の確認用)。
 
 ## 13. 利用者に決めてもらう点 (推奨を先頭)
+
+**利用者の判断 (2026-11-23、統括経由の AskUserQuestion の回答)**:
+- Q1: 「HUD でも 3 つの切り替え」。HUD の行を「OFF / めくる / スライド」の切り替えにする。環境設定にも「めくる / スライド」を置き、
+  全体で 1 つの設定。本ごとの設定は持たせない。キーの割り当てと HUD の行の扱いは設計で決める → §7.3。
+- Q2: 「今回は入れない (推奨)」。Q3: 「めくりと同じ (推奨)」。Q4: 「めくりと共有 (推奨)」。
+
+以下は判断前に示した選択肢 (記録)。
 
 - **Q1 選ぶ場所**: (推奨) 環境設定のページめくりアニメーションの下に「めくる / スライド」を並べ、全体で 1 つ。HUD の行と
   キー割り当ては ON/OFF のまま。 / 案 B: 本ごとにも選べるようにする (本の設定の保存・Remote・本の設定画面に波及し、v5.7.0 は難しい)。
