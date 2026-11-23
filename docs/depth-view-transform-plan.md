@@ -460,19 +460,20 @@ PDF は指摘のたびに別の経路が出る形になりかけたので、経�
 
 ## 12. CHANGELOG の下書き
 
-未作成。§13 のホイールの前提の食い違いを設計担当へ返し、文言と仕様が決まってから作成する。
-`CHANGELOG.md` は変更していない。
+- **3D 写真で、動きを続けたまま拡大・縮小・パン・回転できるようになりました。** Ctrl+ホイールやピンチ、ドラッグ、Ctrl+ドラッグなど、通常の表示と同じ操作を使えます。通常表示で拡大・回転していれば同じ見え方で始まり、3D 写真で変えた倍率・位置・角度は終了後も残ります。拡大・パン・回転中は、修飾キーなしのクリックではページを送らず、ダブルクリックで元に戻すと送れるようになります。ホイール・上下キーは通常の表示と同じ設定に従い、既定の「ページ送り」なら拡大中も送ります。「スクロール＋ページ送り」では、はみ出す間はページ内をスクロールしてから送ります。3D 写真の表示中はフィットの切り替えを受け付けません。書き出しは画像全体のままです。
+
+これは公開前の下書き。`CHANGELOG.md` は変更していない。
 
 ## 13. 実装記録
 
-2026-11-23、`depth-zoom-874`、基点 `a392c9b83`。**未完了。前提の食い違いにより停止した未コミット差分。**
-コンパイル・テストは実行していない。製品の起動・vendor の変更・コミット・push・ブランチ切替は行っていない。
-設計担当が実行する予定の検査へ渡す前に、以下の設計判断と残作業が必要。
+2026-11-23〜24、`depth-zoom-874`。初回の差分は設計担当が `a7f6b294b` に収録し、
+ホイールの訂正 `ea4d1a772` を基点に実装を継続した。コンパイル・テストは実装担当では実行していない。
+設計担当がコンパイルと関連テストを実行する予定。製品の起動・vendor の変更・コミット・push・ブランチ切替は行っていない。
 
-### 停止理由: 修飾なしホイールの既定動作
+### ホイールの訂正と再開
 
-§3.5・§8 と依頼文の「はみ出している間はページ内をスクロールしてから送る」を、すべての設定に対する
-挙動として実装すると、現行 2D と同じにはならない。
+初回はホイールの前提の食い違いで停止した。設計担当の §8.2 の訂正に従い、
+3D 専用のホイール優先規則を作らず、2D と同じ利用者設定を使う形で再開した。
 
 - `src/settings.rs::FullscreenWheelAction` の既定は `PageTurn`。
 - `src/ui_fullscreen/in_page_scroll.rs::fs_wheel_segment_in_page_scroll` は、設定が `ScrollThenPageTurn` の場合だけ
@@ -482,12 +483,10 @@ PDF は指摘のたびに別の経路が出る形になりかけたので、経�
   拡大によるはみ出しを見てスクロールへ変える判定は、この経路にはない。
 - 既存マニュアルの「端まで読んだらページを送る」も、「スクロール＋ページ送り」を選んだ場合の動作として説明している。
 
-設計担当への判断事項: (A) 2D と同じくホイール設定に従い、マニュアル・下書きの説明を条件付きにするか、
-(B) 3D のホイールを設定によらずスクロール優先にして 2D と異なる規則を持つか。
-A はコードの分類を共有でき、説明とテストの設定を明示する修正が中心。B は共有方針の変更であり、
-設定との優先順位・入力の予測と実適用・既存操作の変更を再設計する必要がある。実装担当では選択していない。
+ホイール予測のテストは、既定の `PageTurn` と `ScrollThenPageTurn`、Ctrl の有無、2D / Depth を組み合わせ、
+予測・実適用・2D と Depth の結果を比較する。マニュアルと §12 もこの条件を明記した。
 
-### 途中差分
+### 変更ファイルと要点
 
 | ファイル | 入れた変更 |
 | --- | --- |
@@ -497,37 +496,41 @@ A はコードの分類を共有でき、説明とテストの設定を明示す
 | `src/depth_parallax.rs` | MouseFollow に呼出元が求めた中心を渡す |
 | `src/app.rs` | PdfRerenderDemand の Depth 抑止の印、復帰時の比較記録の破棄、AI native の倍率条件の例外 |
 | `src/app/gamepad_input.rs` | ピッカーのフィット行の値変更・一覧・プレビュー・確定の受付を Depth 中は止める |
-| `src/ui_fullscreen/depth_view_transform_tests.rs` | 共有状態・クリック・配置・PDF 抑止・ホイール予測・パネルの入力除外のテストを追加 |
-| `src/depth_focus_sampling_tests.rs` | GPU の止まる深さの比較に自由回転を追加 |
+| `src/ui_fullscreen/depth_view_transform_tests.rs` | 共有状態・クリック・配置・PDF 抑止と D/F12/Z 復帰・2D と同じホイール予測・パネル上のドラッグ／ピンチ／中ボタン／スクラブ開始除外のテストを追加 |
+| `src/depth_focus_sampling_tests.rs` | GPU の止まる深さの比較に拡大・パン・自由回転を追加。ハイライト uniform 検査に写像の引数を指定 |
 | `src/ui_fullscreen/depth_focus_tests.rs` | 書き出し基準変換を渡す引数へ追従 |
-| `src/ui_fullscreen/depth_tests.rs`、`src/app/depth_view_tests.rs` | Depth が Image の zoom owner を使う期待値へ変更 |
+| `src/ui_fullscreen/depth_tests.rs`、`src/app/depth_view_tests.rs` | Depth が Image の zoom owner を使う期待値へ変更。実マウスの変換中クリックは送らず、ダブルクリックでリセット後にページ送りする期待値へ変更 |
 | `src/ui_fullscreen/initial_placement/tests.rs` | Depth を読み始めの対象外から外す期待値へ変更 |
 | `src/app/depth_main_window_tests.rs` | fit 固定から共有倍率と clip された callback の期待値へ変更 |
 | `src/app/depth_export.rs` | 表示倍率・パン・自由回転・フィット設定が書き出し基準を変えないテストを追加 |
 | `src/app/tests.rs` | AI native の既存テストに Depth 中の倍率非依存の条件を追加 |
-| `docs/depth-parallax-plan.md`、`docs/display-pipeline.md`、`docs/keymap-spec.md` | 変換・入力・PDF・書き出しの説明の途中更新 |
-| `htdocs/mimageviewer/manual/fullscreen.html` | 操作・クリックの規則・共有状態・フィット・書き出しの説明、ページ内スクロールと読み始めの対象外から 3D を削除。ホイールの説明は上の判断待ちで未確定 |
+| `docs/depth-parallax-plan.md`、`docs/display-pipeline.md`、`docs/keymap-spec.md` | 変換・入力・PDF・書き出しの説明を同期 |
+| `htdocs/mimageviewer/manual/fullscreen.html` | 操作・クリックの規則・共有状態・フィット・書き出しの説明、ページ内スクロールと読み始めの対象外から 3D を削除。ホイール・上下キーは通常表示の設定に従うことを明記 |
+| 本書 | §8.2 に従うホイールの説明、§12 の下書き、実装の変更・分類・検査予定を記録 |
 
 既存テストの期待値を変えた理由は、fit 固定・変換入力停止・読み始め対象外という旧仕様を、本書の共有状態へ
-変更するため。Z の休止、紙めくりとナビゲータの抑止、360° の規則の期待値は維持する。
+変更するため。`depth_actual_mouse_clicks_wait_for_shared_transform_reset_before_navigation` は、
+変換中も送っていた旧期待値を §3.3 のクリック規則へ合わせた。Z の休止、紙めくりとナビゲータの抑止、
+360° の規則の期待値は維持する。uniform の `bytes` の 2 か所の既存テストは、80 バイト化に合わせて
+写像の引数を渡す変更であり、色・ハイライト・書き出しの隔離の期待値は変えていない。
 
-### §3.5 の分類表 (途中)
+### §3.5 の分類方針
 
-**全出現の分類は未完了。** 以下は変更対象の分類のみ。共通の占有述語を含む全出現の一覧を追加する作業が残る。
+変更対象の意味を次に整理する。その後の「全出現の分類表」は検索対象の各出現位置を列挙する。
 
-| 箇所 | 分類 | 途中差分の扱い |
+| 箇所 | 分類 | 扱い |
 | --- | --- | --- |
 | `fs_zoom_owner` と `FsZoomOwner::Depth` の dispatch | 2D と同じにする | Image に統合。Depth の判定は Z より先に維持 |
 | 単ページ描画の `zoom_pan`・自由回転・フィット設定・倍率制限 | 2D と同じにする | Depth の強制値を撤去 |
 | `apply_gamepad_fullscreen_zoom` / `_pan`、`predict_fs_wheel_frame` | 2D と同じにする | 共通の占有抑止から 360° だけの抑止へ変更 |
-| `fs_wheel_action_requests_navigation`、ホイール実適用、キャンバスドラッグ | 2D と同じにする | Depth の専用無操作分岐を撤去。ホイール仕様の記述は上記の判断待ち |
+| `fs_wheel_action_requests_navigation`、ホイール実適用、キャンバスドラッグ | 2D と同じにする | Depth の専用無操作分岐を撤去。ホイールは §8.2 どおり利用者の設定を共有 |
 | `plan_fs_canvas_click` | 2D と同じにする / 3D 固有に残す | 変換とリセットは共通、Ctrl の深さ指定は belongs_to_view の抑止前 |
 | フィット循環・上部メニュー・ピッカー | 3D 固有に残す | 閲覧操作のフィット変更を停止。環境設定の画面は例外 |
 | PDF の表示需要・AI native の条件 | 3D 固有に残す | 2 入口で需要を抑止し、最初の非 Depth 単ページ描画で比較記録を破棄して再照合 |
 | リング `ImageZoomMode`・pixel grid・比較 pin・metadata | 3D 固有に残す | 既存の分類を変更しない |
 | パノラマの視線・FOV | 360° 固有のまま | 変更しない |
 
-### 追加したテストと残る検査
+### 追加したテストと実行予定
 
 追加したテスト (未実行):
 
@@ -535,23 +538,143 @@ A はコードの分類を共有でき、説明とテストの設定を明示す
 - `depth_transform_click_classification_focus_and_double_reset_use_the_shared_view`
 - `depth_transform_ready_first_draw_commits_reading_start_and_bounds_like_2d`
 - `depth_transform_pdf_suppression_keeps_comparisons_until_the_first_2d_draw`
-- `depth_transform_wheel_prediction_matches_application_for_zoom_and_local_scroll`
+- `depth_transform_wheel_prediction_matches_2d_for_default_navigation_and_local_scroll`
 - `depth_transform_panel_rejects_wheel_and_drag_starts`
 - `depth_transform_mapping_roundtrips_fractional_geometry_and_physical_uniforms`
 - `depth_transform_gpu_matches_2d_zoom_pan_rotation_crop_and_clip`
 - `depth_fit_picker_row_rejects_preview_value_list_and_commit`
 - `depth_pdf_demand_resume_retires_all_absolute_records_and_survives_zoom_reset`
 - `depth_export_baseline_ignores_shared_zoom_pan_free_rotation_and_fit_policy`
+- `depth_transform_pdf_first_single_draw_consumes_suppression_after_d_f12_and_z`
+- `depth_transform_middle_and_scrub_start_on_canvas_but_not_on_panel`
+- `depth_transform_pinch_starts_on_canvas_but_not_on_panel`
+- `depth_transform_ctrl_click_does_not_apply_a_rotation_drag`
+- `depth_transform_gpu_free_rotation_keeps_motion_on_screen_axes`
 
-特にホイール予測の追加テストは、既定設定のままでスクロールを期待しており、停止理由を解決してから修正が必要。
-§6 の GPU の動きの方向、パネル上のピンチ・中ボタン・スクラブ、PDF の実描画での印の消費と各終了経路等の
-検査の追加・精査も残る。§3.4 の要求元とフィット設定書き込みの全一覧、§3.5 の全出現分類、§12 の下書きも未完了。
+ホイール予測の旧テストが既定設定のままでスクロールを期待していた点は、§8.2 どおり設定別・2D 比較へ直した。
+GPU の画素比較には補間・有限探索の誤差を許し、2D と shader の四角形の境界のラスタ被覆差だけは比較帯から除く。
+既存 `depth_focus_gpu_clicked_surface_stays_fixed_for_planes_and_continuous_depth` にも、拡大・パンと自由回転の組を追加した。
+`pdf_native_rerender_decision_tracks_app_state` は Depth 中の各倍率で起動・表示保留・先読み保留の判定を検査する条件を追加した。
+配置確定のテストは Depth と 2D のパンを比較し、Depth を採用した pass が 2D の payload 準備を呼ばないことも計数する。
 detached の述語・viewport 配送・`set_fs_exclusive_view` の実装は変更していない。
 
-設計判断後、設計担当が実行する予定の nextest filter:
+設計担当が実行する予定の nextest filter:
 
 ```text
-test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/specified_pdf/) | test(/initial_placement/) | test(/fullscreen_click|canvas_click|touch|panorama/)
+test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/specified_pdf/) | test(/initial_placement/) | test(/fullscreen_click|canvas_click|touch|panorama|scrub_zoom|key_zoom/)
 ```
 
 パネルのスナップショットは更新していない。ビルド・テスト・実機の結果はこの差分にはない。
+
+### §3.5 全出現の分類表
+
+対象は `is_depth()` / `ExclusiveViewKind::Depth` / `FsZoomOwner::Depth` / `FsExclusiveView::Depth` と、
+`fs_exclusive_view_active(` の全出現 (複数行で `.is_some()` / `.is_none()` へ続くもの、宣言も含む)。
+行番号は `ea4d1a772` と今回差分に対する整形後の source。テストの fixture / assert も省略せず列挙し、
+同じ分類の兄弟を 1 行にまとめた。現在の出現は 325 箇所。
+`FsZoomOwner::Depth` は削除したため現在の出現は 0。削除・置換した入口は下の基点表に別記する。
+共通の占有述語で残す行は、2D の倍率操作ではなく、他機能の入場制限または Depth 自身の所有・寿命を表す。
+判定の定義 `fs_exclusive_view.rs::FsExclusiveView::is_depth` と、同ファイルの enum の Depth variant は
+3D 固有の owner / 判定として維持する (引数付きの定義は上の呼び出し検索件数に含めない)。
+
+| 箇所 (source の行番号) | 分類 | 理由・扱い |
+| --- | --- | --- |
+| `src/app.rs`: 54338, 54342, 62984, 71113, 82067, 82168, 94664, 110077, 110179, 110191, 110270, 110330, 110333, 110380, 110409 | 3D 固有に残す | 補正・編集の占有制限、slideshow / park の寿命、AI native の倍率例外と回帰 fixture |
+| `src/app.rs`: 98307, 98724 | 360° 固有のまま | `panorama_entry_allowed` / `apply_panorama_mode_toggle` の排他条件を維持 |
+| `src/app/book_composition_permission_tests.rs`: 691, 861, 893, 939 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/app/collection_navigation/depth_slideshow_tests.rs`: 109, 158, 237, 306 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/app/depth_export.rs`: 81, 108, 378, 730 | 3D 固有に残す | 書き出し資源・表示 snapshot の所有と回帰 fixture |
+| `src/app/depth_export_main_window_tests.rs`: 172, 300, 741, 773, 821, 928, 1375, 1432, 1477 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/app/depth_main_window_tests.rs`: 62, 94, 232, 435, 537, 584, 599, 605, 633, 645, 653, 690, 751, 800, 812, 821, 824, 877, 926, 992, 1040, 1053, 1071, 1117, 1121 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/app/depth_progress.rs`: 17, 239, 322, 339, 344, 350, 659, 676, 748, 768, 779, 833, 1218, 1228 | 3D 固有に残す | Depth の進捗と回帰 fixture |
+| `src/app/depth_setup_entry_tests.rs`: 38, 64, 125, 134, 205, 225, 230, 244, 275, 301, 336, 340, 341, 349 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/app/depth_view.rs`: 70, 89, 199, 225, 240, 290, 299, 314, 487, 554, 624, 664, 683, 726, 736, 798, 821, 835, 852, 872, 907, 939, 951, 953, 969, 998, 1057, 1078, 1158, 1164, 1195, 1198, 1224, 1357, 1374, 1399, 1449, 1547, 1579 | 3D 固有に残す | 単一所有、入口・継続・終了、素材採用・描画・パネル・先読みと回帰 fixture |
+| `src/app/depth_view_tests.rs`: 65, 99, 169, 171, 187, 307, 392, 408, 440, 699, 700, 704, 749, 752, 883, 945, 969, 975, 1020, 1050, 1052, 1076, 1111, 1257, 1279, 1366, 1493, 1626, 1647, 1648, 1689, 1826, 1856, 1889, 1891, 2021, 2044, 2093, 2098, 2127, 2164, 2212, 2227, 2237, 2255, 2301, 2398, 2417, 2604, 2625, 2644, 2687, 2696, 2703, 2706, 2730, 2755, 2770, 2819, 2844, 2848, 2852, 2972, 3013, 3051, 3116, 3181, 3277, 3313, 3346 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/app/detached_media_exchange_tests.rs`: 211, 219 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/app/gamepad_input.rs`: 6060, 6280, 6478, 6601, 7667, 8379, 8380, 13791 | 3D 固有に残す | フィット行の受付停止とリングの既存分類・回帰 fixture |
+| `src/app/multiwindow_scenario_tests.rs`: 524, 991, 1017 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/app/page_overview.rs`: 225, 233 | 3D 固有に残す | ページ一覧への入場抑止 |
+| `src/app/startup_ops.rs`: 3314, 3337 | 3D 固有に残す | 保持する Depth 所有者の回帰 fixture |
+| `src/app/tests.rs`: 51778, 100459, 100488, 100500 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/app/tests/startup_restore.rs`: 764, 817 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/app/viewer_context_registry.rs`: 4456 | 3D 固有に残す | fork 前の既存終了処理を維持。実装は変更しない |
+| `src/app/vram_accounting.rs`: 147 | 3D 固有に残す | Depth 資源の VRAM 会計 |
+| `src/ui_fullscreen.rs`: 15078, 15149, 16006, 22902, 25936, 26017, 29000, 29034, 29385, 29650, 30281, 30433, 30531, 31628, 33078, 35411, 35584, 37032, 37041, 37048, 37785, 38551, 41092, 41157, 41158, 42909, 43031, 43046, 43343, 43407, 43634, 43665, 44258, 44887, 44891, 45804, 46317, 47392, 47441, 47442, 51978, 56656 | 3D 固有に残す | Z の休止、占有制限、Depth パネル・素材・先読み・待機・終了、PDF 需要、フィット受付の分類を維持 |
+| `src/ui_fullscreen.rs`: 15543 | 2D と同じにする | `fs_zoom_owner`: Z より先に Image を選ぶ |
+| `src/ui_fullscreen/depth_focus_tests.rs`: 193, 207, 267, 294, 349, 496, 529, 597, 607, 614, 760, 843, 933, 1020, 1034, 1064, 1096 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/ui_fullscreen/depth_main_window_tests.rs`: 120 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/ui_fullscreen/depth_slideshow_tests.rs`: 14, 52, 76, 395, 405, 458, 648, 660, 702, 715, 739, 776, 826, 852, 887, 1036, 1052, 1145, 1189 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/ui_fullscreen/depth_tests.rs`: 40, 53, 66, 126, 154 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/ui_fullscreen/depth_view_transform_tests.rs`: 11, 43, 56, 70, 179, 203, 255, 263, 279, 539, 605, 648 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/ui_fullscreen/page_turn.rs`: 2002 | 3D 固有に残す | Depth 中の紙めくりの抑止 |
+| `src/ui_video_tile.rs`: 69 | 3D 固有に残す | 動画タイルの入場抑止 |
+| `src/ui_view_trim.rs`: 993 | 3D 固有に残す | 編集中の入口の占有制限 |
+
+削除・置換した入口 (以下だけは基点 `a392c9b83` の行番号)。いずれも **2D と同じにする** 分類。
+
+| 基点の箇所 | 変更 |
+| --- | --- |
+| `ui_fullscreen.rs`: 15540, 15541 | Depth は Image。Z より先の判定順は維持 |
+| 同: 15625, 15669, 15679, 15689 | ピンチ・キー・2 本指パンの no-op を削除 |
+| 同: 15726, 15822, 15864, 15877 | 中ボタン・スクラブの no-op を削除 |
+| 同: 16021, 16043, 42768 | ゲームパッドとホイール予測の共通占有抑止を 360° だけへ変更 |
+| 同: 29566, 29573, 29588, 29635 | 単ページの強制 fit / 変換なしを削除 |
+| 同: 41667, 41689 | タッチ dispatch の Depth 分岐を削除 |
+| 同: 42108, 42364, 42551, 42892 | ホイール分類・実適用・ドラッグ・クリックの特別扱いを削除 |
+| 同: 75491, 75497 | 共通ズームの既存テストから削除した owner を除く |
+| `app/depth_view_tests.rs`: 1644, 1692, 3032、`ui_fullscreen/depth_tests.rs`: 176, 217 | owner の期待値を Image へ変更 |
+| `ui_fullscreen/initial_placement/tests.rs`: 2539 | Depth を読み始めの除外 fixture から外す |
+
+これらの変更で通る `fs_in_page_scroll_surface` と `fs_draw_pan_eligible`、初期配置の受付・退役は
+既存の Image owner という境界を共用する。Depth だけの別の状態や入力の書き先は足していない。
+
+### §3.4 の PDF 需要の呼び出し元
+
+次は製品側の全発行・比較箇所。テストの probe / fixture からの直接呼び出しは発行経路に数えない。
+行番号は今回の差分の source。倍率・パン・自由回転から要求を作る別の入口は追加していない。
+
+| 箇所 | 入力・扱い |
+| --- | --- |
+| `ui_fullscreen.rs::maybe_rerender_pdf` (16006〜16018) | キー・ズーム・ドラッグ終端・ゲームパッド等の表示倍率。Depth 中は記録を更新せず印を立てて返す |
+| `draw_fs_zoom_mode_with_receipt` (15493) の `note_legacy` | Z の実効倍率の比較。Depth 中は Z 自体が休止し、この分岐に入らない |
+| `reconcile_specified_pdf_demand` → `reconcile_pdf_layout_demand` (33078、33119) | 指定倍率の描画済み絶対寸法。Depth 中は `note_absolute` に達する前に印を立てて返す |
+| `reconcile_continuous_pdf_demand` → `reconcile_pdf_layout_demand` (33117) | 連結読みの可視ページ。Depth は連結を継続できないため今回変更しない |
+| `app.rs::request_pdf_absolute_demand_inner` (83293、83296、83308) | absolute 記録の比較と通常／連結の発行先。AI native の必要寸法を優先する既存方針も維持 |
+| `ensure_pdf_display_resolution` (83362) | 読み込み時の窓サイズ・90 度回転・フィット設定。倍率・パン・自由回転を入力にしない |
+| `prefetch_final_ai` (86361) | AI 先読み用の native、倍率 1。抑止しない |
+| `ensure_final_composite_texture_impl` (93332) | AI 合成に必要な native の保証、倍率 1。抑止しない |
+| `maybe_native_rerender_pdf_for_ai` (94612) | 通常の AI native 起動、倍率 1。共通の `pdf_native_rerender_pending` が Depth 中は倍率条件を外す |
+| `request_pdf_rerender` → `request_pdf_rerender_at_target` → `_with_priority` (83414、83423) | 発行の共通部。AI と表示を共用するためここには Depth の抑止を置かない |
+
+単ページの `draw_fs_image_with_initial_placement` が `DepthSuppressed` を消費して比較記録をすべて空にし、
+通常は `maybe_rerender_pdf(fs_zoom)`、Z は既存の実効倍率の比較、指定倍率は既存の absolute 照合へ戻す。
+`reset` が Z / session の既存経路で先に呼ばれても、印の消費は次の非 Depth 単ページ描画に残す。
+印は既存の `PdfRerenderDemand` の variant で持ち、比較記録を内包する。bundle の field は足さず、
+既存の swap / remap / invalidate の owner を保つ。
+
+### フィット設定の書き込みと受付の境界
+
+対象は `fullscreen_fit_mode`、`fullscreen_specified_scale` と `_max_tenths`、
+`fullscreen_fit_no_upscale` / `_no_downscale`。読み込み・投影・移行・テスト fixture と、利用者が値を変える入口を区別する。
+
+| 書き込み先・経路 | Depth 中の扱い |
+| --- | --- |
+| `ui_fullscreen.rs::set_fullscreen_fit_mode_for_current` | 関数の先頭で拒否。キー・リング・ジェスチャ・マウスの循環も既存の Depth 拒否を維持 |
+| 上部バーのフィット方式・指定倍率・上限・拡大しない／縮小しない | `FsTopMenuEligibility::image` が占有中は false。メニューの受付からそれぞれ `set_fullscreen_fit_mode_for_current`、`set_current_fullscreen_specified_scale`、`set_fullscreen_specified_scale_max_tenths`、`set_fullscreen_fit_scale_limits` を呼ぶ既存経路を維持 |
+| `app/gamepad_input.rs` の FitMode 行 | 値変更・値一覧・プレビュー・確定を Depth 中は拒否。共通 setter も拒否する |
+| `set_default_fullscreen_fit_for_flow` | 読み方そのものを変える既存処理。非ページ単位へ変えると Depth の継続条件を失い、通常表示へ移る。倍率操作としてこの経路を呼ばない |
+| `ui_dialogs/preferences.rs` の表示設定、`Settings::set_common_fullscreen_specified_scale` | 環境設定の画面の例外として受付を維持。指定倍率の共通値と本別投影の既存処理を変えない |
+| `app.rs` の favorite view の捕捉／投影／適用、`favorite_view_state.rs`、`settings.rs` の保存値の生成・正規化・overlay 適用 | 既存の設定・本の切替・保存値の owner。Depth の倍率・パン・自由回転の操作から書き込まない |
+| `apply_view_trim_for_key_with_fallback`、`remote_ipc/ui.rs::complete_remote_view_trim_write` | 旧 MarginFit の Page への移行。表示設定の移行経路を維持し、今回の倍率操作に接続しない |
+| `settings_transfer` の取り込み、`settings_db` の読み込み、各テスト fixture の直接代入 | 閲覧のフィット操作ではない。既存の設定の取り込み・読み込み・テスト準備を維持 |
+
+`fullscreen_paint_payload_for_page` と `resolve_fs_processed_payload_and_depth` は、保持素材・通常素材・完成／待ちの
+判定を使い、倍率や自由回転の値で選び直さない。倍率に依存する GPU 縮小は、それより後の 2D 準備であり、
+Depth の採用時は通さない。書き出しだけ別の Page fit の入力で変換を解決する。
+
+### 設計との差分・検証の引き継ぎ
+
+§8.2 を含む設計の共有方針から仕様の差分は設けていない。新しい非同期処理・設定項目・bundle の field はない。
+フィット行は既存の値表示を保ち、受付側を変更不可にした。まれな失敗の回復処理も追加していない。
+コンパイル・GPU 検証・テストの実行は設計担当が担当し、この記録はそれらの結果を示すものではない。
+実機確認は §7 の予定どおり。今回はビルドを実行しない指示のため、検証用バイナリも作成していない。

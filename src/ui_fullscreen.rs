@@ -96300,7 +96300,7 @@ mod specified_scale_consumer_tests {
 
     /// Calls the actual single/Z consumer and records its returned paint transform,
     /// exactly as the fullscreen frame does before central demand reconciliation.
-    fn single(
+    pub(super) fn single(
         app: &mut App,
         ctx: &egui::Context,
         rect: egui::Rect,

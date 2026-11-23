@@ -1067,6 +1067,88 @@ mod tests {
     }
 
     #[test]
+    fn depth_transform_gpu_free_rotation_keeps_motion_on_screen_axes() {
+        use crate::egui037_stage4_gpu_tests::{OffscreenGpu, callback};
+        let mut gpu = OffscreenGpu::new();
+        let ctx = egui::Context::default();
+        let size = [96, 80];
+        let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(96., 80.));
+        let source = ctx.load_texture(
+            "screen-axis-depth-ramp",
+            egui::ColorImage::new(
+                [64, 48],
+                (0..48)
+                    .flat_map(|y| (0..64).map(move |x| egui::Color32::from_rgb(x * 3, y * 5, 80)))
+                    .collect(),
+            ),
+            egui::TextureOptions::LINEAR,
+        );
+        render_egui_frame(&mut gpu, &ctx, size, |_| {});
+        let transform = cropped_quarter_turn(
+            viewport,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(1.)),
+        );
+        let mut job = install_two_depth_planes(&mut gpu, source.id(), &transform);
+        let installed = gpu
+            .renderer
+            .callback_resources
+            .get::<DepthRenderResourcesRef>()
+            .unwrap()
+            .0
+            .clone();
+        let flat = Arc::new(
+            DepthTexture::upload(
+                &gpu.device,
+                &gpu.queue,
+                DepthMap {
+                    key: installed.key,
+                    width: 2,
+                    height: 2,
+                    values: vec![half::f16::from_f32(0.75); 4],
+                    median: 0.75,
+                },
+            )
+            .unwrap(),
+        );
+        let resource = Arc::new(DepthRenderResources::new(
+            &gpu.device,
+            installed.context,
+            installed.key,
+            installed.color.clone(),
+            flat,
+        ));
+        job.resource_id = resource.resource_id;
+        job.params.focus = 0.25;
+        job.params.quarter_turns = 0;
+        job.params.uv = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(1.));
+        let paint = egui::Rect::from_center_size(viewport.center(), egui::vec2(256., 192.));
+        job.params.aspect = paint.aspect_ratio();
+        gpu.renderer
+            .callback_resources
+            .insert(DepthRenderResourcesRef(resource));
+        for angle in [-0.6, 0.6] {
+            job.mapping = DepthScreenMapping::new(paint, paint.center(), angle);
+            job.params.offset = egui::Vec2::ZERO;
+            let still = gpu.render(&[callback(viewport, job.clone())], size, [0, 0, 0, 0]);
+            for sign in [-1., 1.] {
+                job.params.offset = egui::vec2(sign * 32. / paint.width(), 0.);
+                let moved = gpu.render(&[callback(viewport, job.clone())], size, [0, 0, 0, 0]);
+                for (x, y) in [(32, 32), (48, 40), (60, 50)] {
+                    let sample_x = (x as f32 - sign * 16.) as usize;
+                    let expected = still[y * 96 + sample_x];
+                    let actual = moved[y * 96 + x];
+                    for (a, b) in actual.into_iter().zip(expected) {
+                        assert!(
+                            a.abs_diff(b) <= 2,
+                            "angle={angle}, sign={sign}, pixel=({x},{y}): {actual:?} vs {expected:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn depth_gamma_bounds_and_median() {
         assert_eq!(depth_gamma(false, 0.2), 1.);
         assert_eq!(depth_gamma(true, f32::NAN), 1.);
@@ -1453,7 +1535,7 @@ mod tests {
                     offset: egui::vec2(0.5, 0.5),
                     ..job.params
                 }
-                .bytes(),
+                .bytes(job.mapping),
             );
             let exported = exporter.render(job.params).unwrap();
             let [width, height] = export_size.map(|n| n as usize);

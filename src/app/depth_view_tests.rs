@@ -2862,7 +2862,7 @@ fn depth_wait_actual_viewer_box_disappears_for_ready_failed_and_off() {
 
 #[cfg(windows)]
 #[test]
-fn depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms() {
+fn depth_actual_mouse_clicks_wait_for_shared_transform_reset_before_navigation() {
     // The immediate renderer is thread-local: drive the real child viewer without
     // opening a native window or leaving a backend callback on a test-pool thread.
     std::thread::spawn(|| {
@@ -2988,10 +2988,9 @@ fn depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms() {
             // Its initial focus-acquisition click is intentionally not navigation.
             app.fs_focus_regained_at = None;
             assert!(!app.fs_primary_suppression.is_active());
-            // Real mouse producer, distinct from the touch regression: right
-            // page-side click advances, then left page-side click returns.
+            // A transformed Depth view shares 2D click ownership: neither side navigates.
             for (pos, expected) in [
-                (egui::pos2(1100.0, 500.0), 1),
+                (egui::pos2(1100.0, 500.0), 0),
                 (egui::pos2(250.0, 500.0), 0),
             ] {
                 events.borrow_mut().push(egui::Event::PointerMoved(pos));
@@ -3016,6 +3015,29 @@ fn depth_actual_mouse_page_navigation_ignores_suspended_2d_transforms() {
                     assert_eq!(app.fs_zoom_factor, 2.75);
                 }
                 assert_eq!(app.fullscreen_idx, Some(expected), "mouse page-side click: Z={committed_zoom}, panel={panel_visible}, pos={pos:?}, responses={:?}", responses.borrow());
+            }
+            // The second click at the same left-side position resets the transform.
+            let reset_pos = egui::pos2(250., 500.);
+            for pressed in [true, false] {
+                events.borrow_mut().push(egui::Event::PointerButton {
+                    pos: reset_pos, button: egui::PointerButton::Primary, pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                render_frame(&mut app);
+            }
+            assert_eq!((app.fs_zoom, app.fs_pan, app.fs_free_rotation), (1., egui::Vec2::ZERO, 0.));
+            assert_eq!(app.fullscreen_idx, Some(0));
+            for (pos, expected) in [(egui::pos2(1100., 500.), 1), (reset_pos, 0)] {
+                events.borrow_mut().push(egui::Event::PointerMoved(pos));
+                render_frame(&mut app);
+                for pressed in [true, false] {
+                    events.borrow_mut().push(egui::Event::PointerButton {
+                        pos, button: egui::PointerButton::Primary, pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    });
+                    render_frame(&mut app);
+                }
+                assert_eq!(app.fullscreen_idx, Some(expected));
             }
             assert!(
                 child_passes.get() >= 3,
