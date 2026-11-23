@@ -25,6 +25,7 @@ use super::path_guard::{
     ResolveError, ResolvedPath, page_identity_from_resolved, resolve_existing,
 };
 use super::raw_flights::{RemoteRawFlightError, RemoteRawFlights, RemoteRawIdentity};
+use super::read_only_db::LateCreatedReadOnlyDb;
 use super::thumbnail::WorkerContext;
 
 const CONTAINER_ENTRY_LIMIT: usize = 100_000;
@@ -850,57 +851,6 @@ fn remote_auto_trim_cache_key(
         raw_brightness,
         target_px,
     })
-}
-
-/// A missing DB may be created by App after Remote starts. Only that state is
-/// reopened on a worker read; successful connections and open errors are retained.
-struct LateCreatedReadOnlyDb<T> {
-    path: PathBuf,
-    state: Mutex<Result<Option<T>, String>>,
-    open: fn(&Path) -> rusqlite::Result<Option<T>>,
-    label: &'static str,
-}
-
-impl<T> LateCreatedReadOnlyDb<T> {
-    /// Keep intentionally absent test readers independent of the process data_dir.
-    #[cfg(test)]
-    fn missing_fixture() -> Self {
-        Self::new(PathBuf::new(), |_| Ok(None), "fixture")
-    }
-
-    fn new(
-        path: PathBuf,
-        open: fn(&Path) -> rusqlite::Result<Option<T>>,
-        label: &'static str,
-    ) -> Self {
-        let db = Self {
-            path,
-            state: Mutex::new(Ok(None)),
-            open,
-            label,
-        };
-        drop(db.read(None));
-        db
-    }
-
-    fn read(
-        &self,
-        wait_stage: Option<&mut RemotePageStageGuard>,
-    ) -> MutexGuard<'_, Result<Option<T>, String>> {
-        let mut state = lock_with_remote_page_wait(&self.state, wait_stage, None);
-        if matches!(&*state, Ok(None)) {
-            // The opener checks existence once and never creates the DB. Do not
-            // add a second stat here or retry an actual open failure.
-            *state = (self.open)(&self.path).map_err(|error| {
-                crate::logger::log(format!(
-                    "remote_ipc: {} DB read-only open failed: {error}",
-                    self.label
-                ));
-                error.to_string()
-            });
-        }
-        state
-    }
 }
 
 pub(super) struct ContainerEngine {
@@ -2870,8 +2820,19 @@ impl ContainerEngine {
         settings: &crate::settings_db::AdjustmentRenderSettings,
         context: &WorkerContext,
     ) -> Result<RemoteEditSnapshot, MediaError> {
+        // A normal worker always retains each reader, including missing/error states.
+        // Only explicit without_databases() contexts use the legacy one-shot None arms.
         let erase = match context.mask_db.as_ref() {
-            Some(db) => load_mask_snapshot(db, page_key)?,
+            Some(reader) => {
+                let guard = reader.read();
+                let db = guard
+                    .as_ref()
+                    .map_err(|error| remote_edit_db_open_error("erase", error))?;
+                db.as_ref()
+                    .map(|db| load_mask_snapshot(db, page_key))
+                    .transpose()?
+                    .flatten()
+            }
             None => {
                 let db = crate::mask_db::MaskDb::open_readonly()
                     .map_err(|error| remote_edit_db_open_error("erase", error))?;
@@ -2879,9 +2840,17 @@ impl ContainerEngine {
             }
         };
         let local_adjust = match context.local_adjust_db.as_ref() {
-            Some(db) => db
-                .get_layers_checked(page_key)
-                .map_err(|error| remote_edit_db_read_error("local-adjust", error))?,
+            Some(reader) => {
+                let guard = reader.read();
+                let db = guard
+                    .as_ref()
+                    .map_err(|error| remote_edit_db_open_error("local-adjust", error))?;
+                db.as_ref()
+                    .map(|db| db.get_layers_checked(page_key))
+                    .transpose()
+                    .map_err(|error| remote_edit_db_read_error("local-adjust", error))?
+                    .flatten()
+            }
             None => {
                 let db = crate::local_adjust_db::LocalAdjustDb::open_readonly(
                     &crate::local_adjust_db::LocalAdjustDb::db_path(),
@@ -2892,7 +2861,16 @@ impl ContainerEngine {
             }
         };
         let conceal = match context.conceal_db.as_ref() {
-            Some(db) => load_conceal_snapshot(db, page_key)?,
+            Some(reader) => {
+                let guard = reader.read();
+                let db = guard
+                    .as_ref()
+                    .map_err(|error| remote_edit_db_open_error("conceal", error))?;
+                db.as_ref()
+                    .map(|db| load_conceal_snapshot(db, page_key))
+                    .transpose()?
+                    .flatten()
+            }
             None => {
                 let db = crate::conceal_db::ConcealDb::open_readonly(
                     &crate::conceal_db::ConcealDb::db_path(),
@@ -2902,10 +2880,18 @@ impl ContainerEngine {
             }
         };
         let comic = match context.comic_db.as_ref() {
-            Some(db) => db
-                .get_checked(page_key)
-                .map_err(|error| remote_edit_db_read_error("comic", error))?
-                .unwrap_or_default(),
+            Some(reader) => {
+                let guard = reader.read();
+                let db = guard
+                    .as_ref()
+                    .map_err(|error| remote_edit_db_open_error("comic", error))?;
+                db.as_ref()
+                    .map(|db| db.get_checked(page_key))
+                    .transpose()
+                    .map_err(|error| remote_edit_db_read_error("comic", error))?
+                    .flatten()
+                    .unwrap_or_default()
+            }
             None => {
                 let db = crate::comic_db::ComicDb::open_readonly()
                     .map_err(|error| remote_edit_db_open_error("comic", error))?;
@@ -2915,9 +2901,17 @@ impl ContainerEngine {
             }
         };
         let export_crop = match context.crop_db.as_ref() {
-            Some(db) => db
-                .get_checked(page_key)
-                .map_err(|error| remote_edit_db_read_error("export-crop", error))?,
+            Some(reader) => {
+                let guard = reader.read();
+                let db = guard
+                    .as_ref()
+                    .map_err(|error| remote_edit_db_open_error("export-crop", error))?;
+                db.as_ref()
+                    .map(|db| db.get_checked(page_key))
+                    .transpose()
+                    .map_err(|error| remote_edit_db_read_error("export-crop", error))?
+                    .flatten()
+            }
             None => {
                 let db = crate::export_crop::CropDb::open_readonly(
                     &crate::export_crop::CropDb::db_path(),
@@ -7310,7 +7304,7 @@ impl ContainerEngine {
         ),
         MediaError,
     > {
-        let db = self.spread_db.read(None);
+        let db = self.spread_db.read();
         let db = db.as_ref().map_err(|error| {
             media_error(
                 MediaErrorCode::Internal,
@@ -7389,7 +7383,9 @@ impl ContainerEngine {
             &page_address.subresource,
         )
         .ok_or_else(|| media_error(MediaErrorCode::BadRequest, "表示トリム対象が不正です"))?;
-        let db_guard = self.view_trim_db.read(wait_stage);
+        let db_guard = self
+            .view_trim_db
+            .read_with_lock(|state| lock_with_remote_page_wait(state, wait_stage, None));
         let db = match db_guard.as_ref() {
             Ok(db) => db,
             Err(error) => {
@@ -7455,7 +7451,7 @@ impl ContainerEngine {
                 &partner.subresource,
             )
             .ok_or_else(|| media_error(MediaErrorCode::BadRequest, "表示トリム対象が不正です"))?;
-            let db = self.view_trim_db.read(None);
+            let db = self.view_trim_db.read();
             let partner_override = db
                 .as_ref()
                 .ok()
@@ -9010,9 +9006,9 @@ fn hash_remote_edit_value<T: serde::Serialize>(
     Ok(())
 }
 
-fn remote_edit_db_open_error(kind: &str, error: rusqlite::Error) -> MediaError {
+fn remote_edit_db_open_error(kind: &str, error: impl std::fmt::Display) -> MediaError {
     crate::logger::log(format!(
-        "remote_ipc: {kind} DB reopen failed for edit materialization: {error}"
+        "remote_ipc: {kind} DB unavailable for edit materialization: {error}"
     ));
     media_error(
         MediaErrorCode::Internal,
@@ -20615,6 +20611,53 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn remote878_worker_crop_db_created_after_context_is_used_for_edits() {
+        let data = crate::data_dir::TestDataDirGuard::new();
+        let path = crate::export_crop::CropDb::db_path();
+        let page = data.path().join("page.png");
+        let key = crate::edit_source::page_key_for_remote(&page, &RemoteSubresource::File).unwrap();
+        let settings = crate::settings::Settings::default();
+        let render_settings =
+            crate::settings_db::AdjustmentRenderSettings::from_settings(&settings);
+        let engine = ContainerEngine::new(settings);
+        let context = WorkerContext::open();
+        for _ in 0..2 {
+            let edits = engine
+                .prepare_remote_edits(&key, &render_settings, &context)
+                .unwrap();
+            assert!(edits.export_crop.is_none());
+            assert!(!path.exists(), "Remote must not create the read-only DB");
+        }
+
+        let crop = crate::export_crop::CropSettings::authored(
+            crate::export_crop::CropRect {
+                min_x: 0.1,
+                min_y: 0.2,
+                max_x: 0.9,
+                max_y: 0.8,
+            },
+            crate::export_crop::CropAspectMode::Free,
+            [100, 100],
+        );
+        let writer = crate::export_crop::CropDb::open_at(&path).unwrap();
+        writer.set(&key, crop).unwrap();
+        let edits = engine
+            .prepare_remote_edits(&key, &render_settings, &context)
+            .unwrap();
+        assert_eq!(edits.export_crop, Some(crop));
+        // All other read-only stores are still absent after the composition read.
+        for name in [
+            "rotation.db",
+            "mask.db",
+            "local_adjust.db",
+            "conceal.db",
+            "comic.db",
+        ] {
+            assert!(!data.path().join(name).exists());
+        }
+    }
+
+    #[test]
     fn remote878_spread_db_created_after_engine_is_read_without_restart() {
         let data = crate::data_dir::TestDataDirGuard::new();
         let path = data.path().join("spread.db");
@@ -20731,14 +20774,14 @@ pub(super) mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("db.sqlite");
         let db = LateCreatedReadOnlyDb::new(path.clone(), open, "fixture");
-        assert!(matches!(&*db.read(None), Ok(None)));
+        assert!(matches!(&*db.read(), Ok(None)));
         assert_eq!(OPENS.load(Ordering::Relaxed), 2);
         let writer = rusqlite::Connection::open(&path).unwrap();
         writer
             .execute_batch("CREATE TABLE saved (value INTEGER)")
             .unwrap();
         {
-            let guard = db.read(None);
+            let guard = db.read();
             guard
                 .as_ref()
                 .unwrap()
@@ -20749,7 +20792,7 @@ pub(super) mod tests {
         }
         assert_eq!(OPENS.load(Ordering::Relaxed), 3);
         for _ in 0..2 {
-            let guard = db.read(None);
+            let guard = db.read();
             let connection = guard.as_ref().unwrap().as_ref().unwrap();
             let count: i64 = connection
                 .query_row("SELECT COUNT(*) FROM connection_marker", [], |row| {
@@ -20781,11 +20824,11 @@ pub(super) mod tests {
             }
             let db = LateCreatedReadOnlyDb::new(path.clone(), open, "fixture");
             if !exists_at_start {
-                assert!(matches!(&*db.read(None), Ok(None)));
+                assert!(matches!(&*db.read(), Ok(None)));
                 std::fs::write(&path, b"fixture").unwrap();
             }
             for _ in 0..2 {
-                assert!(db.read(None).is_err());
+                assert!(db.read().is_err());
             }
             let expected = before + if exists_at_start { 1 } else { 3 };
             assert_eq!(OPENS.load(Ordering::Relaxed), expected);
