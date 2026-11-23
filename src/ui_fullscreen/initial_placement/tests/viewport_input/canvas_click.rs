@@ -159,6 +159,8 @@ fn planned_click(app: &mut App, is_video: bool, double: bool) -> FsCanvasClickAc
                     false,
                     app.fs_zoom,
                     app.fs_pan,
+                    None,
+                    false,
                 );
             },
         )

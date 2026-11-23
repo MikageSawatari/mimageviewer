@@ -118,6 +118,8 @@ fn depth_transform_click_classification_focus_and_double_reset_use_the_shared_vi
                         false,
                         app.fs_zoom,
                         app.fs_pan,
+                        None,
+                        false,
                     );
                     if response.clicked() {
                         clicks += 1;
@@ -418,6 +420,8 @@ fn depth_transform_wheel_prediction_matches_2d_for_default_navigation_and_local_
                                 false,
                                 zoom,
                                 pan,
+                                None,
+                                false,
                             ),
                             FsCanvasClickAction::None
                         ),

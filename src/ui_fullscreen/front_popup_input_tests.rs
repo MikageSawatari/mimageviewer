@@ -336,6 +336,325 @@ fn click(app: &mut App, ctx: &egui::Context, rect: egui::Rect, pos: egui::Pos2) 
     frame(app, ctx, rect, vec![button(pos, false)]);
 }
 
+#[test]
+fn close_mode_actual_top_bar_lock_double_click_keeps_viewer_and_transform() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for locked in [false, true] {
+        for moved in [false, true] {
+            for batched in [false, true] {
+                let ctx = egui::Context::default();
+                let rect = viewport(1093.0);
+                let mut app = sources(&ctx, [320, 160]);
+                app.settings.fullscreen_primary_click =
+                    crate::settings::FullscreenPrimaryClickMode::DoubleClickClose;
+                settle(&mut app, &ctx, rect);
+                let lock_id = egui::Id::unique("fs_top_bar_lock_btn");
+                let pos = ctx.read_response(lock_id).unwrap().rect.center();
+                app.settings.fullscreen_top_bar_locked = locked;
+                if moved {
+                    app.fs_zoom = 2.0;
+                    app.fs_pan = egui::vec2(30.0, 15.0);
+                }
+                frame(&mut app, &ctx, rect, vec![egui::Event::PointerMoved(pos)]);
+                let lock = ctx.read_response(lock_id).expect("production lock button");
+                let canvas = ctx.read_response(egui::Id::unique("fs_click")).unwrap();
+                assert_eq!(
+                    lock.layer_id, canvas.layer_id,
+                    "the real bar shares the canvas layer"
+                );
+                let zoom = app.fs_zoom;
+                if batched {
+                    frame(
+                        &mut app,
+                        &ctx,
+                        rect,
+                        [true, false, true, false]
+                            .into_iter()
+                            .map(|pressed| button(pos, pressed))
+                            .collect(),
+                    );
+                    // egui's widget Response aggregates these two releases.
+                    assert_eq!(app.settings.fullscreen_top_bar_locked, !locked);
+                } else {
+                    for expected in [!locked, locked] {
+                        frame(&mut app, &ctx, rect, vec![button(pos, true)]);
+                        frame(&mut app, &ctx, rect, vec![button(pos, false)]);
+                        assert_eq!(app.settings.fullscreen_top_bar_locked, expected);
+                        assert_eq!(app.fullscreen_idx, Some(1));
+                    }
+                }
+                assert_eq!(app.fullscreen_idx, Some(1));
+                assert_eq!(
+                    app.fs_zoom, zoom,
+                    "HUD double-click must not reset the image"
+                );
+                assert_eq!(app.fs_front_pointer.clicks.current_accepted, 0);
+                assert!(!app.fs_front_pointer.clicks.previous_close_candidate);
+            }
+        }
+    }
+}
+
+#[test]
+fn close_mode_actual_top_bar_batched_releases_keep_owner_after_pointer_move() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let rect = viewport(1093.0);
+    let mut app = sources(&ctx, [320, 160]);
+    app.settings.fullscreen_primary_click =
+        crate::settings::FullscreenPrimaryClickMode::DoubleClickClose;
+    settle(&mut app, &ctx, rect);
+    let pos = ctx
+        .read_response(egui::Id::unique("fs_top_bar_lock_btn"))
+        .unwrap()
+        .rect
+        .center();
+    app.settings.fullscreen_top_bar_locked = false;
+    frame(&mut app, &ctx, rect, vec![egui::Event::PointerMoved(pos)]);
+    let mut events = [true, false, true, false]
+        .into_iter()
+        .map(|pressed| button(pos, pressed))
+        .collect::<Vec<_>>();
+    events.push(egui::Event::PointerMoved(egui::pos2(
+        pos.x,
+        TOP_BAR_HOVER_Y + 1.0,
+    )));
+    frame(&mut app, &ctx, rect, events);
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(app.fs_front_pointer.clicks.current_accepted, 0);
+    assert!(!app.fs_front_pointer.clicks.previous_close_candidate);
+}
+
+#[test]
+fn close_mode_actual_top_bar_release_keeps_owner_after_bar_hides() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let rect = viewport(1093.0);
+    let mut app = sources(&ctx, [320, 160]);
+    app.settings.fullscreen_primary_click =
+        crate::settings::FullscreenPrimaryClickMode::DoubleClickClose;
+    settle(&mut app, &ctx, rect);
+    let lock = ctx
+        .read_response(egui::Id::unique("fs_top_bar_lock_btn"))
+        .unwrap();
+    let bar_pos = egui::pos2(lock.rect.center().x, lock.rect.bottom() - 1.0);
+    let canvas_pos = egui::pos2(bar_pos.x, TOP_BAR_HOVER_Y + 1.0);
+    // The old canvas candidate must not combine with the button's release.
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![egui::Event::PointerMoved(canvas_pos)],
+    );
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![button(canvas_pos, true), button(canvas_pos, false)],
+    );
+    assert!(app.fs_front_pointer.clicks.previous_close_candidate);
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![egui::Event::PointerMoved(bar_pos), button(bar_pos, true)],
+    );
+    assert!(app.fs_front_pointer.owns_primary());
+    app.settings.fullscreen_top_bar_locked = false;
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![
+            egui::Event::PointerMoved(canvas_pos),
+            button(canvas_pos, false),
+        ],
+    );
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert!(!app.fs_front_pointer.owns_primary());
+    assert_eq!(app.fs_front_pointer.clicks.current_accepted, 0);
+    assert!(!app.fs_front_pointer.clicks.previous_close_candidate);
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![button(canvas_pos, true), button(canvas_pos, false)],
+    );
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert_eq!(app.fs_front_pointer.clicks.current_accepted, 1);
+}
+
+#[test]
+fn close_mode_actual_top_bar_touch_still_operates_lock_button() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let rect = viewport(1093.0);
+    let mut app = sources(&ctx, [320, 160]);
+    app.settings.fullscreen_primary_click =
+        crate::settings::FullscreenPrimaryClickMode::DoubleClickClose;
+    settle(&mut app, &ctx, rect);
+    let pos = ctx
+        .read_response(egui::Id::unique("fs_top_bar_lock_btn"))
+        .unwrap()
+        .rect
+        .center();
+    let touch = |phase| egui::Event::Touch {
+        device_id: egui::TouchDeviceId(471),
+        id: egui::TouchId(1),
+        phase,
+        pos,
+        force: None,
+    };
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![
+            touch(egui::TouchPhase::Start),
+            egui::Event::PointerMoved(pos),
+            button(pos, true),
+        ],
+    );
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![
+            touch(egui::TouchPhase::End),
+            button(pos, false),
+            egui::Event::PointerGone,
+        ],
+    );
+    assert_eq!(app.fullscreen_idx, Some(1));
+    assert!(!app.settings.fullscreen_top_bar_locked);
+    assert_eq!(app.fs_front_pointer.clicks.current_accepted, 0);
+}
+
+fn close_mode_overview_sources(ctx: &egui::Context) -> crate::app::AppTestEnvForTest {
+    let mut app = sources(ctx, [320, 160]);
+    app.settings.fullscreen_primary_click =
+        crate::settings::FullscreenPrimaryClickMode::DoubleClickClose;
+    app.settings.video_in_window_mode = true;
+    app.viewer_presentation = ViewerPresentation::MainWindow;
+    app.native_video_in_window_active = true;
+    app.page_identity_index = Arc::new(
+        crate::app::file_type_resume::PreparedPageIdentityIndex::prepare(
+            &app.items,
+            None,
+            app.settings.file_type_visibility.clone(),
+        ),
+    );
+    app
+}
+
+fn overview_back_position(app: &App, rect: egui::Rect) -> egui::Pos2 {
+    let view = app
+        .page_overview_view()
+        .expect("the real overview must be open");
+    let geometry =
+        crate::ui_page_overview::page_overview_geometry(rect, &view, app.page_overview_direction());
+    let pos = geometry.back_button.center();
+    assert!(fullscreen_top_bar_rect(rect).contains(pos));
+    pos
+}
+
+#[test]
+fn close_mode_actual_overview_back_button_returns_to_page() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for locked in [false, true] {
+        let ctx = egui::Context::default();
+        let rect = viewport(1093.0);
+        let mut app = close_mode_overview_sources(&ctx);
+        app.settings.fullscreen_top_bar_locked = locked;
+        settle(&mut app, &ctx, rect);
+        // Enter through the normal key handler and paint the actual overview.
+        frame(
+            &mut app,
+            &ctx,
+            rect,
+            [true, false]
+                .into_iter()
+                .map(|pressed| egui::Event::Key {
+                    key: egui::Key::O,
+                    physical_key: Some(egui::Key::O),
+                    pressed,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                })
+                .collect(),
+        );
+        assert!(app.page_overview.session().is_some());
+        assert!(!app.fullscreen_top_bar_chrome_allowed(1));
+        settle(&mut app, &ctx, rect);
+        let pos = overview_back_position(&app, rect);
+        frame(&mut app, &ctx, rect, vec![egui::Event::PointerMoved(pos)]);
+        frame(&mut app, &ctx, rect, vec![button(pos, true)]);
+        assert!(
+            !app.fs_front_pointer.owns_primary(),
+            "overview header owns its new press"
+        );
+        assert!(app.page_overview.session().is_some());
+        frame(&mut app, &ctx, rect, vec![button(pos, false)]);
+        assert!(
+            app.page_overview.session().is_none(),
+            "the actual back button must return to the page"
+        );
+        assert_eq!(app.fullscreen_idx, Some(1));
+        assert!(!app.fs_front_pointer.is_active());
+        assert!(app.fullscreen_top_bar_chrome_allowed(1));
+    }
+}
+
+#[test]
+fn close_mode_actual_overview_retires_existing_bar_press_before_fresh_back_click() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    let ctx = egui::Context::default();
+    let rect = viewport(1093.0);
+    let mut app = close_mode_overview_sources(&ctx);
+    settle(&mut app, &ctx, rect);
+    let bar_pos = ctx
+        .read_response(egui::Id::unique("fs_top_bar_lock_btn"))
+        .unwrap()
+        .rect
+        .center();
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![egui::Event::PointerMoved(bar_pos), button(bar_pos, true)],
+    );
+    assert!(app.fs_front_pointer.owns_primary());
+    // A surface change must stop only new admissions, not discard a held edge.
+    let direction = app.page_overview_direction();
+    assert!(app.open_page_overview(rect, direction));
+    frame(&mut app, &ctx, rect, vec![]);
+    assert!(app.fs_front_pointer.owns_primary());
+    let pos = overview_back_position(&app, rect);
+    frame(
+        &mut app,
+        &ctx,
+        rect,
+        vec![egui::Event::PointerMoved(pos), button(pos, false)],
+    );
+    assert!(
+        app.page_overview.session().is_some(),
+        "the old bar release must not activate overview controls"
+    );
+    assert!(
+        !app.fs_front_pointer.is_active(),
+        "the existing owner must still observe its terminal release"
+    );
+    click(&mut app, &ctx, rect, pos);
+    assert!(app.page_overview.session().is_none());
+    assert_eq!(app.fullscreen_idx, Some(1));
+}
+
 fn open_menu(app: &mut App, ctx: &egui::Context, rect: egui::Rect, button_id: &str) {
     let pos = ctx
         .read_response(egui::Id::unique(button_id))

@@ -29,7 +29,7 @@ fn frame(ctx: &egui::Context, events: Vec<egui::Event>, mut run: impl FnMut(&mut
     .drop_without_applying_deltas();
 }
 
-fn collect_actual_merge(
+pub(super) fn collect_actual_merge(
     app: &mut App,
     ui: &mut egui::Ui,
     suppress_navigation: bool,

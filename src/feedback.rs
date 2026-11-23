@@ -187,7 +187,7 @@ pub(crate) fn feedback_toast_duration(text: &str) -> f32 {
     (FEEDBACK_TOAST_DURATION + extra as f32 * 0.12).min(5.5)
 }
 
-/// Fully resolved lifetime and legacy native fade. Transport/renderers never read preferences.
+/// Fully resolved lifetime and native fade. Transport/renderers never read preferences.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ResolvedFeedbackTiming {
     pub(crate) seconds: f32,
@@ -211,8 +211,9 @@ impl ResolvedFeedbackTiming {
     }
 }
 
-/// The only preference multiplier. Preserve each surface's pre-setting lifetime and fade,
-/// including native fade ending before a long explicit linger (and after a short one).
+/// The only preference multiplier. Preserve each surface's lifetime and native fade width.
+/// Native fade ends at the later of the scaled 1.8/2.5-second baseline and native linger;
+/// a shorter linger still expires without extending its visible time.
 pub(crate) fn resolve_timing(
     setting: NotificationDuration,
     kind: FeedbackKind,
@@ -236,7 +237,8 @@ pub(crate) fn resolve_timing(
     ResolvedFeedbackTiming {
         seconds: base * multiplier,
         native_linger: std::time::Duration::from_secs_f32(native_base * multiplier),
-        native_fade_end: [1.8 * multiplier, 2.5 * multiplier],
+        native_fade_end: [1.8_f32, 2.5]
+            .map(|legacy| (legacy * multiplier).max(native_base * multiplier)),
         native_fade_duration: 0.35 * multiplier,
     }
 }
@@ -279,6 +281,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn notification_duration_text_native_visible_end_matches_long_text_and_keeps_short_legacy_end()
+    {
+        let long_text = "あ".repeat(56);
+        for setting in [
+            NotificationDuration::Standard,
+            NotificationDuration::Short,
+            NotificationDuration::Long,
+        ] {
+            let timing = resolve_timing(
+                setting,
+                FeedbackKind::Info,
+                &long_text,
+                FeedbackTiming::Text,
+            );
+            assert_eq!(timing.native_fade_end, [timing.seconds; 2]);
+            assert_eq!(
+                timing.native_linger(),
+                std::time::Duration::from_secs_f32(timing.seconds)
+            );
+            for centered in [false, true] {
+                assert_eq!(
+                    timing
+                        .native_opacity_at(timing.seconds - timing.native_fade_duration, centered),
+                    1.0
+                );
+                assert_eq!(timing.native_opacity_at(timing.seconds, centered), 0.0);
+            }
+        }
+
+        let timing = resolve_timing(
+            NotificationDuration::Standard,
+            FeedbackKind::Info,
+            &"あ".repeat(20),
+            FeedbackTiming::Text,
+        );
+        assert_eq!(timing.seconds, 1.2);
+        assert_eq!(
+            timing.native_linger(),
+            std::time::Duration::from_secs_f32(1.2)
+        );
+        assert_eq!(timing.native_fade_end, [1.8, 2.5]);
+        assert_eq!(timing.native_opacity_at(1.2, false), 1.0);
     }
 
     #[test]

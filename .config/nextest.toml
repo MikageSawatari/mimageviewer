@@ -152,6 +152,7 @@ filter = '''
     | test(=ui_dialogs::preferences::pages::tests::command_chords_catalog_snapshot_dark)
     | test(/^ui_dialogs::preferences::tests::(auto_view_trim_default_setting_snapshot_dark_on|auto_view_trim_default_setting_snapshot_light_off|clipboard_bake_stage_preferences_snapshot|preferences_context_menu_layout_snapshot|preferences_duplicate_files_epub_option_snapshot)$/)
     | test(/^ui_dialogs::preferences::tests::(preferences_folder_edit_restore_snapshot|preferences_parallelism_pdf_count_snapshot|preferences_recycle_bin_delete_confirmation_snapshot|preferences_search_results_snapshot|preferences_search_window_hints_snapshot)$/)
+    | test(/^ui_dialogs::preferences::tests::preferences_mouse_buttons_snapshot_(page_turn|double_click_close)$/)
     | test(/^ui_dialogs::preferences::tests::(preferences_still_seek_strip_height_settings_snapshot_narrow_width|preferences_still_seek_strip_height_settings_snapshot_regular_width|preferences_video_seek_strip_height_settings_snapshot_narrow_width|preferences_video_seek_strip_height_settings_snapshot_regular_width|preferences_viewer_notice_visibility_snapshot)$/)
     | test(/^ui_dialogs::preferences::tests::(singleton_spread_placement_setting_snapshot|singleton_spread_placement_setting_snapshot_dark_on|singleton_spread_placement_setting_snapshot_light_off|singleton_spread_placement_setting_snapshot_light_on|spread_page_supplement_setting_snapshot)$/)
     | test(=ui_dialogs::settings_restore::tests::operation_customize_diff_preview_snapshot)

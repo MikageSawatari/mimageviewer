@@ -176,7 +176,12 @@ fn notification_duration_audio_failure_issued_by_poll_preserves_native_default_a
                 } else {
                     assert!(app.fs_feedback_toast.is_none());
                 }
-                assert!((timing.native_opacity_at(1.625 * factor, false) - 0.5).abs() < 0.00001);
+                // Only the music view's 33-character fallback notice outlasts 1.8 seconds.
+                let expected_opacity = if music && saved_open_notice { 1.0 } else { 0.5 };
+                assert!(
+                    (timing.native_opacity_at(1.625 * factor, false) - expected_opacity).abs()
+                        < 0.00001
+                );
                 app.poll_audio_track_notice_toast(idx);
                 assert!(
                     probe.drain_toasts().is_empty(),

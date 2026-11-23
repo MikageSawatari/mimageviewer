@@ -915,6 +915,7 @@ pub(crate) fn draw_cell(
     audio_indicator: AudioThumbnailIndicator,
     is_cut: bool,
     resume_meter: Option<f32>,
+    folder_background: &crate::folder_cell_background::FolderCellBackground,
 ) {
     let _ = paint_cell(
         ui,
@@ -933,6 +934,7 @@ pub(crate) fn draw_cell(
         is_cut,
         resume_meter,
         false,
+        folder_background,
     );
 }
 
@@ -954,6 +956,7 @@ pub(crate) fn draw_cell_with_hit_areas(
     audio_indicator: AudioThumbnailIndicator,
     is_cut: bool,
     resume_meter: Option<f32>,
+    folder_background: &crate::folder_cell_background::FolderCellBackground,
 ) -> ThumbnailHitAreas {
     paint_cell(
         ui,
@@ -972,6 +975,7 @@ pub(crate) fn draw_cell_with_hit_areas(
         is_cut,
         resume_meter,
         true,
+        folder_background,
     )
 }
 
@@ -994,6 +998,7 @@ fn paint_cell(
     is_cut: bool,
     resume_meter: Option<f32>,
     collect_hit_areas: bool,
+    folder_background: &crate::folder_cell_background::FolderCellBackground,
 ) -> ThumbnailHitAreas {
     let mut hit_areas = ThumbnailHitAreas::default();
     if !ui.is_rect_visible(rect) {
@@ -1061,17 +1066,14 @@ fn paint_cell(
 
     // カーソル位置 (selected) もマルチ選択チェック済み (checked) も同じ青背景に。
     // カーソル位置を示す太い青枠は selected のときだけ付く (下の border 判定で分岐)。
-    let bg = if is_selected || is_checked {
-        if dark {
-            egui::Color32::from_rgb(40, 70, 110)
-        } else {
-            egui::Color32::from_rgb(180, 210, 255)
-        }
-    } else if dark {
-        egui::Color32::from_gray(28)
-    } else {
-        egui::Color32::WHITE
-    };
+    let bg = crate::folder_cell_background::cell_background(
+        folder_background,
+        item,
+        is_drive_list,
+        dark,
+        is_selected,
+        is_checked,
+    );
     base_painter.rect_filled(rect, 2.0, bg);
 
     match item {
@@ -1313,11 +1315,7 @@ fn paint_cell(
             let (icon, label_color) = match kind {
                 crate::grid_item::SearchContainerKind::Folder => (
                     "📁",
-                    if dark {
-                        egui::Color32::from_gray(220)
-                    } else {
-                        egui::Color32::from_gray(60)
-                    },
+                    crate::folder_cell_background::search_folder_path_color(dark),
                 ),
                 crate::grid_item::SearchContainerKind::Zip => (
                     "📦",
@@ -1392,11 +1390,7 @@ fn paint_cell(
                     overlay_layout.type_icon.as_ref().map(|icon| icon.rect),
                 ));
                 let badge_text = format!("{} 枚", hit_count);
-                let badge_color = if dark {
-                    egui::Color32::from_rgb(240, 200, 100)
-                } else {
-                    egui::Color32::from_rgb(180, 80, 0)
-                };
+                let badge_color = crate::folder_cell_background::search_count_color(dark);
                 record(paint_lower_caption(
                     painter,
                     geometry.count,
@@ -1442,11 +1436,7 @@ fn paint_cell(
                     overlay_layout.type_icon.as_ref().map(|icon| icon.rect),
                 ));
                 let badge_text = format!("{} 枚", hit_count);
-                let badge_color = if dark {
-                    egui::Color32::from_rgb(240, 200, 100)
-                } else {
-                    egui::Color32::from_rgb(180, 80, 0)
-                };
+                let badge_color = crate::folder_cell_background::search_count_color(dark);
                 record(paint_lower_caption(
                     painter,
                     geometry.count,
@@ -1948,6 +1938,7 @@ mod thumbnail_name_style_tests {
                                                     AudioThumbnailIndicator::default(),
                                                     false,
                                                     Some(0.4),
+                                                    &crate::folder_cell_background::FolderCellBackground::default(),
                                                 );
                                                 expected.clear();
                                                 for badge in layout.badge_placements() {
@@ -2122,7 +2113,7 @@ mod book_resume_meter_tests {
                             let placements:Vec<_>=layout.badge_placements().cloned().collect();
                             if let Some(labels)=&labels{assert_eq!(&placements,labels);}else{labels=Some(placements);}
                             draw_cell(ui,cell,false,false,false,&layout,&item,&ThumbnailState::Pending,crate::rotation_db::Rotation::None,None,false,
-                                VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,fraction);
+                                VideoThumbnailIndicator::PlayIcon,AudioThumbnailIndicator::default(), false,fraction,&crate::folder_cell_background::FolderCellBackground::default(),);
                             if width==140.0 && fraction==Some(0.4) && matches!(item,GridItem::Video(_)) {eprintln!("reserved-meter-measure dpi={dpi} cell={cell:?} meter={meter:?} pixels={}",meter.height()*dpi);}
                         }));})));
                         }
@@ -2214,6 +2205,7 @@ mod book_resume_meter_tests {
                                             AudioThumbnailIndicator::default(),
                                             false,
                                             None,
+                                            &crate::folder_cell_background::FolderCellBackground::default(),
                                         );
                                     })
                                 });
@@ -2329,6 +2321,7 @@ mod book_resume_meter_tests {
                                     AudioThumbnailIndicator::default(),
                                     false,
                                     None,
+                                    &crate::folder_cell_background::FolderCellBackground::default(),
                                 );
                             })
                         });
@@ -2423,6 +2416,7 @@ mod book_resume_meter_tests {
                                         AudioThumbnailIndicator::default(),
                                         false,
                                         None,
+                                        &crate::folder_cell_background::FolderCellBackground::default(),
                                     );
                                 })
                             });
@@ -2650,6 +2644,7 @@ mod book_resume_meter_tests {
                                                     AudioThumbnailIndicator::default(),
                                                     false,
                                                     fraction,
+                                                    &crate::folder_cell_background::FolderCellBackground::default(),
                                                 );
                                             })
                                         });
@@ -2770,6 +2765,7 @@ mod book_resume_meter_tests {
                                     AudioThumbnailIndicator::default(),
                                     cut,
                                     Some(0.5),
+                                    &crate::folder_cell_background::FolderCellBackground::default(),
                                 );
                             })
                         });
@@ -2855,6 +2851,7 @@ mod book_resume_meter_tests {
                                 AudioThumbnailIndicator::default(),
                                 false,
                                 Some(0.5),
+                                &crate::folder_cell_background::FolderCellBackground::default(),
                             );
                         })
                     });
@@ -3121,6 +3118,7 @@ mod book_resume_meter_tests {
             AudioThumbnailIndicator::default(),
             cut,
             fraction,
+            &crate::folder_cell_background::FolderCellBackground::default(),
         );
     }
 
@@ -3400,6 +3398,7 @@ mod book_resume_meter_tests {
                         AudioThumbnailIndicator::default(),
                         false,
                         value,
+                        &crate::folder_cell_background::FolderCellBackground::default(),
                     );
                 }
             });
@@ -3654,6 +3653,7 @@ mod cut_content_paint_tests {
                                 AudioThumbnailIndicator::default(),
                                 true,
                                 None,
+                                &crate::folder_cell_background::FolderCellBackground::default(),
                             );
                         })
                 });
@@ -3741,6 +3741,7 @@ mod cut_content_paint_tests {
                                     AudioThumbnailIndicator::default(),
                                     is_cut,
                                     None,
+                                    &crate::folder_cell_background::FolderCellBackground::default(),
                                 );
                             })
                     });
@@ -3905,6 +3906,7 @@ pub fn draw_collection_placeholder_snapshot_fixture(ui: &mut egui::Ui) {
                 AudioThumbnailIndicator::default(),
                 false,
                 None,
+                &crate::folder_cell_background::FolderCellBackground::default(),
             );
         }
     });
@@ -3962,6 +3964,7 @@ fn draw_video_indicator_snapshot_cell(
         audio_indicator,
         false,
         None,
+        &crate::folder_cell_background::FolderCellBackground::default(),
     );
     if let Some(tag_rect) = grid_tag_badge_hit_rect(&layout)
         && response.hovered()
@@ -4109,6 +4112,7 @@ fn draw_thumbnail_name_settings_snapshot(ui: &mut egui::Ui, prioritize_width: bo
                         AudioThumbnailIndicator::default(),
                         false,
                         Some(0.4),
+                        &crate::folder_cell_background::FolderCellBackground::default(),
                     );
                 });
             }
@@ -4567,6 +4571,7 @@ pub fn draw_audio_thumbnail_indicator_snapshot_fixture(ui: &mut egui::Ui) {
                     indicator,
                     true,
                     Some(0.6),
+                    &crate::folder_cell_background::FolderCellBackground::default(),
                 );
             });
         }

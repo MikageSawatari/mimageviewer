@@ -34,7 +34,7 @@ mod spread_shift_d3 {
         let session = super::super::super::session::SessionHandle::new();
         session.install_spread_shift_service(Some(service.clone()));
         engine.session = Some(session);
-        *engine.spread_db.lock().unwrap() = Ok(None);
+        engine.spread_db = LateCreatedReadOnlyDb::missing_fixture();
         engine
     }
 
@@ -555,7 +555,7 @@ mod spread_shift_d3 {
         engine.session = Some(session);
         engine.listing_settings = RemoteListingSettingsSource::Live;
         engine.reading_settings = RemoteReadingSettingsSource::Live;
-        *engine.spread_db.lock().unwrap() = Ok(None);
+        engine.spread_db = LateCreatedReadOnlyDb::missing_fixture();
         let addresses = items
             .iter()
             .map(|item| {

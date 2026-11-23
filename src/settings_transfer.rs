@@ -390,6 +390,7 @@ preferences_policy! {
         grid_cursor_wrap: bool => ("サムネイルのカーソル折り返し", |_, _| true, plain, plain);
         remember_favorite_view_state: bool => ("お気に入りごとの表示設定", |_, _| true, plain, plain);
         details_name_colors: crate::details_name_colors::DetailsNameColors => ("詳細一覧の名前色", |v, _raw| v.valid_standard_custom(), plain, plain);
+        folder_cell_background: crate::folder_cell_background::FolderCellBackground => ("サムネイルのフォルダ背景", |v, _raw| v.valid(), plain, plain);
         grid_display_order: GridDisplayOrder => ("カテゴリの表示順", |v, _raw| v == &v.normalized(), plain, plain);
         video_thumbnail_indicator: VideoThumbnailIndicator => ("動画サムネイルの表示", |v, _raw| !matches!(v, VideoThumbnailIndicator::Unknown), plain, plain);
         audio_thumbnail_indicator: AudioThumbnailIndicator => ("音声サムネイルの表示", |v, _raw| !matches!(v, AudioThumbnailIndicator::Unknown), plain, plain);
@@ -463,6 +464,7 @@ preferences_policy! {
         page_turn_animation_enabled: bool => ("ページめくりアニメーション", |_, _| true, plain, plain);
         page_turn_animation_duration_ms: u32 => ("ページめくりアニメーションの時間", |v, _| (100..=600).contains(v), plain, plain);
         page_turn_animation_style: PageTurnAnimationStyle => ("ページめくりアニメーションの動き", |_, _| true, plain, plain);
+        fullscreen_primary_click: FullscreenPrimaryClickMode => ("閲覧中の左クリック", |_, _| true, plain, plain);
         default_reading_flow: ReadingFlow => ("標準の読書フロー", |_, _| true, plain, plain);
         default_reading_direction: ReadingDirection => ("標準の読み方向", |_, _| true, plain, plain);
         final_cover_spread_enabled: bool => ("裏表紙の見開き", |_, _| true, plain, plain);
@@ -1172,6 +1174,11 @@ mod tests {
             .excluded_extensions
             .insert("png".into());
         settings.details_name_colors.enabled = false;
+        settings.folder_cell_background = crate::folder_cell_background::FolderCellBackground {
+            enabled: true,
+            light: [255, 255, 230],
+            dark: [30, 35, 20],
+        };
         settings.details_name_colors.colors[0] =
             crate::details_name_colors::DetailsNameColor::Custom {
                 light: [80, 60, 0],
@@ -1454,6 +1461,7 @@ mod tests {
         settings.page_turn_animation_enabled = true;
         settings.page_turn_animation_duration_ms = 600;
         settings.page_turn_animation_style = PageTurnAnimationStyle::Slide;
+        settings.fullscreen_primary_click = FullscreenPrimaryClickMode::DoubleClickClose;
         settings.default_reading_flow = different_enum(
             &settings.default_reading_flow,
             &[
@@ -2173,6 +2181,55 @@ mod tests {
     }
 
     #[test]
+    fn folder_cell_background_transfer_roundtrip_and_invalid_rejection() {
+        use crate::folder_cell_background::FolderCellBackground;
+        for enabled in [false, true] {
+            let mut source = Settings::default();
+            source.folder_cell_background = FolderCellBackground {
+                enabled,
+                light: [255, 255, 230],
+                dark: [30, 35, 20],
+            };
+            let exported = export_preferences(&source).unwrap();
+            assert!(exported.issues.is_empty());
+            let mut destination = Settings::default();
+            let report = parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(
+                destination.folder_cell_background,
+                source.folder_cell_background
+            );
+            for invalid in [
+                json!({"enabled": enabled, "light": [255,240,179], "dark": [58,52,32]}),
+                json!({"enabled": enabled, "light": [255,244,204], "dark": [220,220,220]}),
+                json!({"enabled": enabled, "light": [256,244,204], "dark": [58,52,32]}),
+                json!({"enabled": "yes"}),
+            ] {
+                let parsed =
+                    parse_preferences(&document(json!({"folder_cell_background": invalid})))
+                        .unwrap();
+                assert_eq!(parsed.issues.len(), 1);
+                parsed.apply_to(&mut destination);
+                assert_eq!(
+                    destination.folder_cell_background,
+                    source.folder_cell_background
+                );
+            }
+            destination.folder_cell_background.light = [255, 240, 179];
+            let rejected = export_preferences(&destination).unwrap();
+            assert_eq!(rejected.issues.len(), 1);
+            assert!(
+                !serde_json::from_str::<serde_json::Value>(&rejected.json).unwrap()["preferences"]
+                    .as_object()
+                    .unwrap()
+                    .contains_key("folder_cell_background")
+            );
+        }
+    }
+
+    #[test]
     fn spread_shift_memory_transfer_preserves_policy_and_rejects_wrong_type() {
         let mut settings = Settings::default();
         let parsed =
@@ -2585,13 +2642,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 516);
+        assert_eq!(entries.len(), 517);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            171
+            172
         );
         assert_eq!(
             entries
@@ -2640,7 +2697,7 @@ mod tests {
                 "AI permissions must not become writable: {key}"
             );
         }
-        assert_eq!(wire.len(), 169);
+        assert_eq!(wire.len(), 170);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);
@@ -2724,6 +2781,61 @@ mod tests {
             .unwrap()
             .apply_to(&mut destination);
         assert!(!destination.thumb_name_prioritize_width);
+    }
+
+    #[test]
+    fn fullscreen_primary_click_transfer_roundtrip_missing_and_invalid_values() {
+        let source = Settings {
+            fullscreen_primary_click: FullscreenPrimaryClickMode::DoubleClickClose,
+            ..Settings::default()
+        };
+        let exported = export_preferences(&source).unwrap();
+        let mut destination = Settings::default();
+        let report = parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert_eq!(
+            destination.fullscreen_primary_click,
+            FullscreenPrimaryClickMode::DoubleClickClose
+        );
+        parse_preferences(INITIAL_V1)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(
+            destination.fullscreen_primary_click,
+            FullscreenPrimaryClickMode::DoubleClickClose
+        );
+        for invalid in [
+            json!("future_mode"),
+            json!("DoubleClickClose"),
+            json!(true),
+            json!(0),
+            Value::Null,
+        ] {
+            let report = parse_preferences(&document(json!({"fullscreen_primary_click": invalid})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.issues.len(), 1);
+            assert!(report.changed_fields.is_empty());
+            assert_eq!(
+                destination.fullscreen_primary_click,
+                FullscreenPrimaryClickMode::DoubleClickClose
+            );
+        }
+        for (wire, expected) in [
+            ("page_turn", FullscreenPrimaryClickMode::PageTurn),
+            (
+                "double_click_close",
+                FullscreenPrimaryClickMode::DoubleClickClose,
+            ),
+        ] {
+            let report = parse_preferences(&document(json!({"fullscreen_primary_click": wire})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.fullscreen_primary_click, expected);
+        }
     }
 
     #[test]

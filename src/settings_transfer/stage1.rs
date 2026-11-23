@@ -281,6 +281,7 @@ no_choices!(
     [u8; 3],
     bool,
     crate::details_name_colors::DetailsNameColors,
+    crate::folder_cell_background::FolderCellBackground,
     crate::file_type_visibility::FileTypeVisibility,
     crate::grid_item::ContainerIconKinds,
     crate::video::seek_strip_layout::SeekStripCycleSet,
@@ -442,6 +443,18 @@ impl Stage1Value for NotificationDuration {
             (Self::Short, Self::Short.label().into()),
             (Self::Standard, Self::Standard.label().into()),
             (Self::Long, Self::Long.label().into()),
+        ])
+    }
+}
+impl Stage1Value for FullscreenPrimaryClickMode {
+    fn candidates() -> Option<Vec<(Self, String)>> {
+        // 表示名は環境設定のラジオボタンと同じ。
+        Some(vec![
+            (Self::PageTurn, "クリックでページを送る (既定)".into()),
+            (
+                Self::DoubleClickClose,
+                "クリックでは送らず、ダブルクリックで閉じる".into(),
+            ),
         ])
     }
 }
@@ -1016,9 +1029,9 @@ mod tests {
         assert_eq!(rows.len(), keys.len());
         let (export, issues) = project(capture_export(&settings));
         assert!(issues.is_empty(), "{issues:?}");
-        assert_eq!(export.len(), 169);
+        assert_eq!(export.len(), 170);
         assert_eq!(STAGE1_MARKED_ANCHORS.len(), 57);
-        assert_eq!(rows.len(), 226);
+        assert_eq!(rows.len(), 227);
         for key in export.keys() {
             assert!(keys.contains(key.as_str()), "{key}");
         }
@@ -1111,6 +1124,60 @@ mod tests {
         );
     }
     #[test]
+    fn stage1_fullscreen_primary_click_choices_and_validation_match_preferences() {
+        let rows = capture_stage1(&default_settings(), false, false);
+        let row = rows
+            .iter()
+            .find(|row| row.key == "fullscreen_primary_click")
+            .unwrap();
+        assert_eq!(row.value, json!("page_turn"));
+        assert_eq!(
+            row.choices
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|choice| (choice.value.clone(), choice.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (json!("page_turn"), "クリックでページを送る (既定)"),
+                (
+                    json!("double_click_close"),
+                    "クリックでは送らず、ダブルクリックで閉じる"
+                ),
+            ]
+        );
+        for (wire, expected) in [
+            ("page_turn", FullscreenPrimaryClickMode::PageTurn),
+            (
+                "double_click_close",
+                FullscreenPrimaryClickMode::DoubleClickClose,
+            ),
+        ] {
+            let candidate = stage1_validate(
+                &default_settings(),
+                &change("fullscreen_primary_click", json!(wire)),
+            )
+            .unwrap();
+            assert_eq!(candidate.fullscreen_primary_click, expected);
+        }
+        for invalid in [
+            json!("future_mode"),
+            json!("DoubleClickClose"),
+            json!(true),
+            json!(0),
+            Value::Null,
+        ] {
+            assert!(
+                stage1_validate(
+                    &default_settings(),
+                    &change("fullscreen_primary_click", invalid),
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn stage1_export_null_acceptance_matches_import_for_every_key() {
         let mut settings = default_settings();
         settings.fullscreen_n_scroll_wrap_step_percent = Some(50);
@@ -1160,6 +1227,36 @@ mod tests {
             candidate.fullscreen_n_scroll_wrap_step_percent,
             imported.fullscreen_n_scroll_wrap_step_percent
         );
+    }
+
+    #[test]
+    fn stage1_folder_cell_background_uses_transfer_validation() {
+        let settings = default_settings();
+        for (value, valid) in [
+            (
+                json!({"enabled": true, "light": [255,255,230], "dark": [30,35,20]}),
+                true,
+            ),
+            (
+                json!({"enabled": false, "light": [255,240,179], "dark": [58,52,32]}),
+                false,
+            ),
+            (
+                json!({"enabled": true, "light": [255,244,204], "dark": [220,220,220]}),
+                false,
+            ),
+        ] {
+            let changes = change("folder_cell_background", value.clone());
+            assert_eq!(parse_items(&changes).issues.is_empty(), valid);
+            let result = stage1_validate(&settings, &changes);
+            assert_eq!(result.is_ok(), valid);
+            if valid {
+                assert_eq!(
+                    serde_json::to_value(result.unwrap().folder_cell_background).unwrap(),
+                    value
+                );
+            }
+        }
     }
     #[test]
     fn stage1_marked_option_values_can_reset_to_ui_defaults() {

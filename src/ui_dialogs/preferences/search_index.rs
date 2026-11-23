@@ -301,6 +301,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["フォルダ", "書庫", "画像", "ZIP", "RAR", "PDF", "目印"]
     ),
     entry!(
+        "thumbnail/folder-background",
+        Thumbnail,
+        "フォルダのセルの背景に色を付ける",
+        ["フォルダ", "背景", "色", "黄色", "Light", "Dark"]
+    ),
+    entry!(
         "thumbnail/container-type-icon",
         Thumbnail,
         "代表画像の代わりに種類のアイコンで表示する",
@@ -1864,6 +1870,7 @@ mod tests {
     const PREFERENCES_SOURCE: &str = include_str!("../preferences.rs");
     const RAW_SETTINGS_SOURCE: &str = include_str!("../../ui_raw.rs");
     const NAME_COLORS_SOURCE: &str = include_str!("name_colors.rs");
+    const FOLDER_BACKGROUND_SOURCE: &str = include_str!("folder_background.rs");
     const DEPTH_ADDON_SOURCE: &str = include_str!("../depth_addon.rs");
     const BROWSER_INTEGRATION_SOURCE: &str = include_str!("browser_integration.rs");
 
@@ -2053,6 +2060,11 @@ mod tests {
                     assert_eq!(entry.title, PreferencesPage::FileTypeVisibility.label());
                     assert!(PREFERENCES_SOURCE.contains("ui.heading(state.selected.label())"));
                     PREFERENCES_SOURCE
+                } else if entry.anchor == "thumbnail/folder-background" {
+                    assert!(PAGES_SOURCE.contains(
+                        "super::folder_background::draw_settings(ui, &mut state.settings)"
+                    ));
+                    FOLDER_BACKGROUND_SOURCE
                 } else if entry.anchor == "thumbnail/details-name-colors" {
                     assert!(
                         PAGES_SOURCE

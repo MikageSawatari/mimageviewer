@@ -6586,6 +6586,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 crate::settings::AudioThumbnailIndicator::default(),
                 is_cut,
                 None,
+                &crate::folder_cell_background::FolderCellBackground::default(),
             );
         });
     }
@@ -11915,8 +11916,6 @@ impl App {
                     }
                 })
                 .collect::<Vec<_>>();
-        // 前フレームのツールバー content rect (空き領域 右クリック用背景 interact の矩形)。
-        let toolbar_bg_rect = self.toolbar_content_rect;
         // ドラッグ並べ替えの許可状態 (既定 OFF)。OFF のときはカーソルも変えない。
         let drag_enabled = self.settings.toolbar_section_drag_enabled;
         let any_toolbar_section = show_folder_tree_button
@@ -11987,10 +11986,10 @@ impl App {
             //     呼出時点の値で計算されるため反映されず、Yu Gothic の galley が
             //     interact_size.y を超えると widget が膨らむ → ガタつき (Codex 助言)
             //
-            // 正しい配置: `ui.scope` で spacing を上書き → その内側で `horizontal_wrapped`
+            // 正しい配置: `ui.scope_builder` で spacing を上書き → その内側で `horizontal_wrapped`
             // を呼ぶ。scope はスタイル変更を toolbar 外に漏らさない安全策。
             // 共通のツールバー専用スタイル適用 helper。
-            // 外側の `ui.scope` だけでなく、各 ComboBox の `show_ui` closure 冒頭でも
+            // 外側の `ui.scope_builder` だけでなく、各 ComboBox の `show_ui` closure 冒頭でも
             // 呼ぶ必要がある。理由: egui の ComboBox popup は親 ui の TextStyle を
             // 継承せず別の context で描画されるため、popup 内の項目だけ通常 Yu Gothic
             // (= 上寄り) で描画されてしまう (Codex P3 2026-05)。
@@ -11999,27 +11998,12 @@ impl App {
             const TOOLBAR_ASPECT_COMBO_HEIGHT: f32 = 280.0;
             const TOOLBAR_SUBFOLDER_COMBO_HEIGHT: f32 = 240.0;
 
-            // 空き領域 右クリック用の背景 interact。セクション (= ui.scope の中身) より
-            // **前** に登録することで z-order が背面になり、ボタンの直接クリックは奪わず、
-            // 何も無い余白の右クリックだけ背景が拾う (egui hit_test の仕様、kittest で検証済)。
-            // 矩形は前フレームの content rect を使う (今フレームの高さは描画後でないと
-            // 分からないため)。初回 (None) は背景メニュー無効。
-            //
-            // ⚠ 高さは「ツールバー先頭 1 行ぶん」に丸める (Codex P2)。前フレームが複数行で
-            // 今フレームが 1 行に縮んだ場合、前フレームの背の高い rect をそのまま使うと、
-            // 下のアドレスバー / グリッドの空き部分まで背景 interact が伸び、そこの右クリックを
-            // 誤って奪うことがある。先頭行の高さに収めれば必ず現ツールバー内に収まり、
-            // 先頭行の末尾余白 (最も普通の空き領域) は拾える。複数行時の 2 行目以降の余白は
-            // 「設定→ツールバー」メニューで代替できる。
-            let bg_resp = toolbar_bg_rect.map(|r| {
-                let row_h = (ui.spacing().interact_size.y + 6.0).min(r.height());
-                let capped =
-                    egui::Rect::from_min_size(r.min, egui::vec2(r.width(), row_h.max(1.0)));
-                ui.interact(capped, ui.scope_id().with("toolbar_bg_menu"), egui::Sense::click())
-            });
-
+            // 背景 Ui を子より先に登録し、空白だけでメニューを開く。
+            // 終了時に当 pass の矩形へ更新するので、古い矩形の再登録も 1 行への制限も不要。
             let folder_style = ui.style().clone();
-            let scope_resp = ui.scope(|ui| {
+            let scope_resp = ui.scope_builder(egui::UiBuilder::new().sense(egui::Sense::CLICK), |ui| {
+                // 部品の右に残る空白も背景に含める。
+                ui.set_min_width(ui.available_width());
                 // ツールバー本体に toolbar スタイルを適用 (Yu Gothic の glyph 上寄り問題を
                 // FontTweak.y_offset で補正)。詳細: src/ui_fonts.rs の TOOLBAR_TEXT_FAMILY_NAME。
                 apply_toolbar_style(ui);
@@ -13146,15 +13130,12 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 }
                 });
             });
-            // 次フレームの背景 interact 用に content rect を記録する。
+            // テスト等から参照する、今 pass のツールバー本体の矩形。
             self.toolbar_content_rect = Some(scope_resp.response.rect);
-            // 空き領域 右クリック → セクション表示 ON/OFF メニュー。「既定に戻す」は影響が
-            // 大きく取り消せないので、ここ (右クリック) には出さない (show_reset=false)。
-            if let Some(bg) = bg_resp {
-                show_sticky_context_menu(&bg, |ui| {
-                    self.draw_toolbar_visibility_menu(ui, false, true);
-                });
-            }
+            // 全行の空白でセクション表示メニューを開く。「既定に戻す」は出さない。
+            show_sticky_context_menu(&scope_resp.response, |ui| {
+                self.draw_toolbar_visibility_menu(ui, false, true);
+            });
             if toolbar_section_order.last() != Some(&crate::settings::ToolbarSectionId::Folder) {
                 ui.add_space(2.0);
             }
@@ -18718,6 +18699,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.settings.audio_thumbnail_indicator,
                     is_cut,
                     resume,
+                    &self.settings.folder_cell_background,
                 );
                 if self.grid_drop_hover(idx) {
                     crate::app::draw_grid_drop_target(ui.painter(), rect, ui.visuals());
@@ -22491,6 +22473,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         self.settings.audio_thumbnail_indicator,
                                         is_cut,
                                         resume,
+                                        &self.settings.folder_cell_background,
                                     );
                                     if let Some(title) = self.draw_bookmark_view_overlay(
                                         ui,
@@ -22637,6 +22620,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         self.settings.audio_thumbnail_indicator,
                                         is_cut,
                                         book_resume_meter,
+                                        &self.settings.folder_cell_background,
                                     );
                                 }
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
@@ -35300,6 +35284,10 @@ mod decide_drag_payload_tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "ui_main/toolbar_bg_menu_1876_tests.rs"]
+mod toolbar_bg_menu_1876_tests;
 
 /// ツールバーの折り返しを固定する。
 ///

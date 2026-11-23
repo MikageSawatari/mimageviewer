@@ -202,7 +202,7 @@ pub(super) fn hex_input_ready(ctx: &egui::Context) -> bool {
     })
 }
 
-fn draw_rgb_editor(ui: &mut egui::Ui, rgb: &mut [u8; 3]) -> egui::Response {
+pub(super) fn draw_rgb_editor(ui: &mut egui::Ui, rgb: &mut [u8; 3]) -> egui::Response {
     ui.horizontal_wrapped(|ui| {
         let color_response = ui.color_edit_button_srgb(rgb);
         crate::ui_helpers::set_accessibility_label(&color_response, "色");
