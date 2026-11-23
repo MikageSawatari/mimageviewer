@@ -189,6 +189,21 @@ group外の残存呼び出し元は、今回のgroup内実行では検証でき�
 
 ## filter・継承・今後の追加規則
 
+### §1.874 の変換操作テスト
+
+`.config/nextest.toml` の既存 inventory で、改名した
+`app::depth_view_tests::depth_actual_mouse_clicks_wait_for_shared_transform_reset_before_navigation`
+へ名前を追従し、`depth_parallax_wgpu::tests::depth_transform_gpu_*` の2件と
+`ui_fullscreen::depth_view_transform_tests` の実 renderer を使う8件を完全名に固定した regex で追加する。
+前者2件は `OffscreenGpu::new`、後者8件は `RootDepthViewer::new` → `install_pages` → `renderer`
+から実 device を使う。PDF の需要テストも、最初の通常／Z 描画を実描画経路で検査するため
+同じ renderer を用意する。改名したクリックテストも `install_pages` を使う。
+同じ module のクリック分類・PDF 比較記録だけの CPU テストは追加しない。
+group の上限、全体並列数、retry・timeout・priority は変更しない。
+この登録変更後のコンパイル・テストは設計担当が実行する予定。
+
+### 共通の登録形式
+
 正本は [.config/nextest.toml](../.config/nextest.toml)。`gpu_tests` と実device小moduleはprefix、
 混在lib moduleは完全名に固定したregex / equalityで選ぶ。
 4 integrationはbinary全体を選び、新規snapshot / GPU testを自動で含める。

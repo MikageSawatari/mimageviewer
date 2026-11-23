@@ -1068,38 +1068,57 @@ fn depth_focus_paint_checks_pass_resource_bounds_lru_and_media_radius() {
             })
             .drop_without_applying_deltas();
     }
-    // A larger painter clip must not change sensitivity of the media canvas.
-    let canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800., 400.));
-    for clip in [
-        canvas,
-        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2000., 2000.)),
-    ] {
-        viewer
-            .ctx
-            .run_ui(
-                egui::RawInput {
-                    events: vec![egui::Event::PointerMoved(
-                        transform.paint_rect.center() - egui::vec2(50., 0.),
-                    )],
-                    ..Default::default()
-                },
-                |ui| {
-                    app.try_paint_depth(
-                        &ui.painter().with_clip_rect(clip),
-                        &viewer.ctx,
-                        &payload,
-                        &transform,
-                        &transform,
-                        canvas,
-                        &FsBgStyle::Solid(egui::Color32::BLACK),
-                    );
-                    let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
-                        unreachable!()
-                    };
-                    assert!((state.mouse.target - egui::vec2(0.01, 0.)).length() < 1e-6);
-                },
-            )
-            .drop_without_applying_deltas();
+    // A larger painter clip must not change the media canvas's center or radius.
+    let bounds = egui::Rect::from_points(&transform.paint_quad().positions);
+    let partial_canvas = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800., 400.));
+    assert!(bounds.bottom() > partial_canvas.bottom());
+    let pointer = transform.paint_rect.center() - egui::vec2(50., 0.);
+    for (canvas, fully_visible) in [(bounds.expand(100.), true), (partial_canvas, false)] {
+        let visible = bounds.intersect(canvas);
+        assert!(visible.is_positive());
+        let center = visible.center();
+        if fully_visible {
+            assert!((center - transform.paint_rect.center()).length() < 1e-4);
+        } else {
+            assert_ne!(center, transform.paint_rect.center());
+        }
+        // The partial canvas clips the image's bottom: the pointer is below the
+        // visible center, so following it now has a vertical component as well.
+        let n = (pointer - center) / (0.25 * canvas.width().min(canvas.height()));
+        let expected = -egui::vec2(n.x.clamp(-1., 1.), 0.6 * n.y.clamp(-1., 1.))
+            * app.settings.depth_parallax.strength;
+        if fully_visible {
+            assert!(expected.y.abs() < 1e-6);
+        } else {
+            assert!(expected.y < 0.);
+            assert!((expected - egui::vec2(0.01, 0.)).length() > 1e-6);
+        }
+        for clip in [canvas, canvas.expand(2000.)] {
+            viewer
+                .ctx
+                .run_ui(
+                    egui::RawInput {
+                        events: vec![egui::Event::PointerMoved(pointer)],
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.try_paint_depth(
+                            &ui.painter().with_clip_rect(clip),
+                            &viewer.ctx,
+                            &payload,
+                            &transform,
+                            &transform,
+                            canvas,
+                            &FsBgStyle::Solid(egui::Color32::BLACK),
+                        );
+                        let FsExclusiveView::Depth(state) = &app.fs_exclusive_view else {
+                            unreachable!()
+                        };
+                        assert!((state.mouse.target - expected).length() < 1e-6);
+                    },
+                )
+                .drop_without_applying_deltas();
+        }
     }
     crate::key_input::clear_test_frame();
 }

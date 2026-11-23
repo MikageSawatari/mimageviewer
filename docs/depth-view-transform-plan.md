@@ -486,6 +486,20 @@ PDF は指摘のたびに別の経路が出る形になりかけたので、経�
 ホイール予測のテストは、既定の `PageTurn` と `ScrollThenPageTurn`、Ctrl の有無、2D / Depth を組み合わせ、
 予測・実適用・2D と Depth の結果を比較する。マニュアルと §12 もこの条件を明記した。
 
+### GPU 所属とマウス追従テストの補正
+
+`9eb0262ae` を基点に、設計担当から返った GPU 所属検査の11件とマウス追従テストの1件を修正した。
+`.config/nextest.toml` は改名したクリックテストへ追従し、実 GPU を使う新規10件を追加した。
+生成経路と CPU テストを含めない境界を `docs/gpu-test-groups.md` に記録した。
+
+`depth_focus_paint_checks_pass_resource_bounds_lru_and_media_radius` は、元の表示で作った縦長画像の
+transform を高さ400の別キャンバスに渡しており、画像の下部が見えていない配置だった。
+旧期待値 `(0.01, 0)` は画像全体の中心を前提としていたが、§3.3 では可視外接矩形の中心が上へ移り、
+同じポインタ位置でも縦の追従量が生じる。製品側の `depth_visible_center` はこの交差の中心を使っているため、
+実装の退行ではなく設計どおりの期待値の変更と判断した。可視範囲とキャンバスの半径から期待値を求め、
+画像全体を含むキャンバスでは従来の画像中心となる条件も加えた。両配置とも painter clip だけを広げた場合の
+追従量は同じとする。製品コードは変更していない。この修正後のコンパイル・テストは設計担当が実行する予定。
+
 ### 変更ファイルと要点
 
 | ファイル | 入れた変更 |
@@ -498,13 +512,14 @@ PDF は指摘のたびに別の経路が出る形になりかけたので、経�
 | `src/app/gamepad_input.rs` | ピッカーのフィット行の値変更・一覧・プレビュー・確定の受付を Depth 中は止める |
 | `src/ui_fullscreen/depth_view_transform_tests.rs` | 共有状態・クリック・配置・PDF 抑止と D/F12/Z 復帰・2D と同じホイール予測・パネル上のドラッグ／ピンチ／中ボタン／スクラブ開始除外のテストを追加 |
 | `src/depth_focus_sampling_tests.rs` | GPU の止まる深さの比較に拡大・パン・自由回転を追加。ハイライト uniform 検査に写像の引数を指定 |
-| `src/ui_fullscreen/depth_focus_tests.rs` | 書き出し基準変換を渡す引数へ追従 |
+| `src/ui_fullscreen/depth_focus_tests.rs` | 書き出し基準変換を渡す引数へ追従。可視範囲の中心に追従する期待値と全体表示の条件を追加 |
 | `src/ui_fullscreen/depth_tests.rs`、`src/app/depth_view_tests.rs` | Depth が Image の zoom owner を使う期待値へ変更。実マウスの変換中クリックは送らず、ダブルクリックでリセット後にページ送りする期待値へ変更 |
 | `src/ui_fullscreen/initial_placement/tests.rs` | Depth を読み始めの対象外から外す期待値へ変更 |
 | `src/app/depth_main_window_tests.rs` | fit 固定から共有倍率と clip された callback の期待値へ変更 |
 | `src/app/depth_export.rs` | 表示倍率・パン・自由回転・フィット設定が書き出し基準を変えないテストを追加 |
 | `src/app/tests.rs` | AI native の既存テストに Depth 中の倍率非依存の条件を追加 |
 | `docs/depth-parallax-plan.md`、`docs/display-pipeline.md`、`docs/keymap-spec.md` | 変換・入力・PDF・書き出しの説明を同期 |
+| `.config/nextest.toml`、`docs/gpu-test-groups.md` | 実 GPU を使う変換操作テストの登録と生成経路の記録 |
 | `htdocs/mimageviewer/manual/fullscreen.html` | 操作・クリックの規則・共有状態・フィット・書き出しの説明、ページ内スクロールと読み始めの対象外から 3D を削除。ホイール・上下キーは通常表示の設定に従うことを明記 |
 | 本書 | §8.2 に従うホイールの説明、§12 の下書き、実装の変更・分類・検査予定を記録 |
 
@@ -601,11 +616,11 @@ test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/sp
 | `src/app/vram_accounting.rs`: 147 | 3D 固有に残す | Depth 資源の VRAM 会計 |
 | `src/ui_fullscreen.rs`: 15078, 15149, 16006, 22902, 25936, 26017, 29000, 29034, 29385, 29650, 30281, 30433, 30531, 31628, 33078, 35411, 35584, 37032, 37041, 37048, 37785, 38551, 41092, 41157, 41158, 42909, 43031, 43046, 43343, 43407, 43634, 43665, 44258, 44887, 44891, 45804, 46317, 47392, 47441, 47442, 51978, 56656 | 3D 固有に残す | Z の休止、占有制限、Depth パネル・素材・先読み・待機・終了、PDF 需要、フィット受付の分類を維持 |
 | `src/ui_fullscreen.rs`: 15543 | 2D と同じにする | `fs_zoom_owner`: Z より先に Image を選ぶ |
-| `src/ui_fullscreen/depth_focus_tests.rs`: 193, 207, 267, 294, 349, 496, 529, 597, 607, 614, 760, 843, 933, 1020, 1034, 1064, 1096 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/ui_fullscreen/depth_focus_tests.rs`: 193, 207, 267, 294, 349, 496, 529, 597, 607, 614, 760, 843, 933, 1020, 1034, 1064, 1114 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/depth_main_window_tests.rs`: 120 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/depth_slideshow_tests.rs`: 14, 52, 76, 395, 405, 458, 648, 660, 702, 715, 739, 776, 826, 852, 887, 1036, 1052, 1145, 1189 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/depth_tests.rs`: 40, 53, 66, 126, 154 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
-| `src/ui_fullscreen/depth_view_transform_tests.rs`: 11, 43, 56, 70, 179, 203, 255, 263, 279, 539, 605, 648 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/ui_fullscreen/depth_view_transform_tests.rs`: 11, 43, 56, 70, 179, 203, 256, 262, 278, 538, 604, 647 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/page_turn.rs`: 2002 | 3D 固有に残す | Depth 中の紙めくりの抑止 |
 | `src/ui_video_tile.rs`: 69 | 3D 固有に残す | 動画タイルの入場抑止 |
 | `src/ui_view_trim.rs`: 993 | 3D 固有に残す | 編集中の入口の占有制限 |
