@@ -173,3 +173,38 @@ detached の経路に触れるので、CLAUDE.md「Detached viewer リワーク�
   期限を 1 つに確定し、不透明度と削除の両方に使う。
 - P3: 直接書く所の一覧が不足 (キャプチャ保存 `src/app.rs:95353`、AI 診断)。両方に出すことを確かめている既存テスト
   (`src/app/tests.rs:40106`、`src/app/tests/notification_duration.rs:66`) を仕様変更として先に列挙する。
+
+## 9. 分割の決定と v5.7.0 に入れる範囲 (2026-11-23)
+
+利用者の決定 (2026-11-23「時間だけ先に入れる」): §1.871 を分ける。v5.7.0 には native の通知の時間だけを入れる。
+宛先 (§3.1〜§3.3) は v5.7.0 の後に、r1 の指摘 (窓の identity・projection に依存しない解決・native の配送と action を
+1 つの経路に) を受けて設計し直す。§3〜§7 の宛先の部分は r1 で退けられた版として残す。
+
+### 9.1 native の時間 (v5.7.0)
+
+今のコード (`src/feedback.rs` の `resolve_timing`、`src/video/native_presenter/render_core.rs`):
+
+- native の通知には時計が 2 つある。外す時刻 = `native_linger` (`render_core.rs:12865`)、見えなくなる時刻 =
+  `native_fade_end[centered]` (`native_opacity_at`)。見えている時間は 2 つの小さいほう。
+- `native_fade_end` は `[1.8, 2.5] × 設定の倍率` の決め打ち。長い文 (`Text` で 20 字を超える) や長い指定
+  (`Seconds(3.5)` など) は、1.8 秒 (中央寄せ 2.5 秒) で見えなくなり、`native_linger` まで見えないまま残る。
+  §1.402 のテスト (`notification_duration_native_standard_preserves_legacy_linger_and_fade`) が
+  「見えないまま残る」を旧式として固定している。
+- 短い通知 (`native_linger` が決め打ちより短い) は、`native_linger` で外れる (フェードの途中か前に消える)。
+
+変更 (利用者の推奨案 Q2-A「長い文だけ延ばす、短い文は今のまま」):
+
+- `native_fade_end[c] = max(決め打ち[c] × 倍率, native_linger)`。式はこの 1 か所だけ変える。
+  - `native_linger` が決め打ちより長い → 見えなくなる時刻 = 外す時刻。最後の 0.35 秒 × 倍率でフェードして外れる。
+    見えないまま残る時間が無くなる。
+  - `native_linger` が決め打ち以下 → 今と同じ (外す時刻も見え方も変わらない)。
+- 外す時刻 (`native_linger`) は変えない。時計を 1 つにまとめると、短い通知 (`Text` の 1.2 秒) が 1.8 秒に延び、
+  シーク境界の `Immediate(0.7)` が 0.7 秒で消えなくなるため (r1 の P2 指摘の「延長なし」を守る)。
+- `Immediate(0.7)` (シーク境界、中央寄せ) と `Immediate(2.5)` (一覧の端の案内、中央寄せ) は、
+  `native_linger` が決め打ち以下なので変わらない。`SurfaceSeconds { native: 1.8 }` (保存完了) も変わらない。
+- 中央寄せかどうかは今と同じく描画時に `centered` で選ぶ。両方の値が上の式で決まる。
+- egui の時間は変えない。
+
+テスト: §1.402 のテストの「長い linger で見えないまま残る」期待を、「linger まで見えて最後にフェードする」に直す
+(仕様変更)。短い linger・`Immediate(0.7)`・`Immediate(2.5)`・倍率 (×0.6 / ×1.5、警告とエラーの Short の例外) は
+今の期待のまま通ること。`Text` の長い文で native の見える時間が egui の時間と同じになることを足す。
