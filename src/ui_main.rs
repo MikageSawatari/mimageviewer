@@ -6010,6 +6010,40 @@ fn details_text_clip_rect(
     }
 }
 
+pub(crate) fn draw_details_drop_hover_snapshot_rows(ui: &mut egui::Ui) {
+    for (row, drop_target) in [false, true].into_iter().enumerate() {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(310.0, 28.0), egui::Sense::hover());
+        let visual_state = details_row_visual_state(false, drop_target, false, false);
+        ui.painter().rect_filled(
+            rect,
+            0.0,
+            details_row_background(
+                ui.visuals(),
+                crate::settings::DetailsRowStyle::SeparatorAndStripe,
+                row,
+                drop_target,
+                false,
+                false,
+            ),
+        );
+        let painter = ui.painter().clone();
+        draw_details_name_text(
+            ui,
+            &painter,
+            rect.shrink2(egui::vec2(8.0, 0.0)),
+            if drop_target {
+                "落とし先のフォルダ"
+            } else {
+                "通常のフォルダ"
+            },
+            Some(crate::details_name_colors::DetailsNameCategory::Folder),
+            &crate::details_name_colors::DetailsNameColors::default(),
+            visual_state,
+            false,
+        );
+    }
+}
+
 fn draw_details_text(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -18390,6 +18424,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     is_cut,
                     resume,
                 );
+                if self.grid_drop_hover(idx) {
+                    crate::app::draw_grid_drop_target(ui.painter(), rect, ui.visuals());
+                }
                 self.draw_bookmark_view_overlay(
                     &mut ui,
                     rect,
@@ -19439,6 +19476,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
 
         let mut nav: Option<AddressBarNav> = None;
         let mut body_inner_rect = egui::Rect::NOTHING;
+        let mut drop_folders = Vec::new();
+        let capture_drop_folders =
+            self.is_physical_folder_listing() && self.grid_item_input_allowed();
         let mut egui_offset_y = self.grid_scroll.offset();
         let mut hovered_preview: Option<(usize, egui::Rect)> = None;
         let mut vertical_scroll_debug = None;
@@ -19544,6 +19584,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     + egui::vec2(0.0, row as f32 * Self::DETAILS_ROW_H),
                                 egui::vec2(content_w, Self::DETAILS_ROW_H),
                             );
+                            if capture_drop_folders
+                                && let Some(GridItem::Folder(path)) = self.items.get(idx)
+                            {
+                                drop_folders.push(crate::main_drop_target::DropRow {
+                                    rect: row_rect,
+                                    path: path.clone(),
+                                });
+                            }
 
                             primary_press_hit_cell |=
                                 press_pos.is_some_and(|pos| row_rect.contains(pos));
@@ -19604,6 +19652,11 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                 });
             });
         ui.spacing_mut().scroll = previous_scroll_style;
+        self.record_main_drop_grid_geometry(
+            ui,
+            body_inner_rect.intersect(horizontal_output.inner_rect),
+            drop_folders,
+        );
         log_details_layout_debug(
             ctx,
             DetailsLayoutDebugSample {
@@ -21030,7 +21083,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
         let visuals = ui.visuals();
         let visual_state = details_row_visual_state(
             display_only,
-            self.selected == Some(idx),
+            self.selected == Some(idx) || self.grid_drop_hover(idx),
             self.checked.contains(&idx),
             ui.rect_contains_pointer(rect),
         );
@@ -21900,6 +21953,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     crate::wheel_input::remaining_wheel_delta(input, wheel_options), input.smooth_scroll_delta,
                     input.pointer.latest_pos(), input.pointer.primary_down(),
                     input.pointer.delta(), input.pointer.velocity())));
+                let mut drop_clip = egui::Rect::NOTHING;
+                let mut drop_folders = Vec::new();
+                let capture_drop_folders = self.is_physical_folder_listing() && self.grid_item_input_allowed();
                 let scroll_output = egui::ScrollArea::vertical().scroll_source(egui::scroll_area::ScrollSource { drag: egui::scroll_area::DragScroll::Always, ..Default::default() })
                     .id_salt(self.grid_scroll_state_id("thumbnail"))
                     .auto_shrink([false, false])
@@ -21907,6 +21963,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     .content_margin(egui::Margin::ZERO)
                     .external_vertical_scroll(resolved.external(self.grid_scroll_scope(), Self::grid_scroll_transport_id(ctx)))
                     .show_viewport(ui, |ui, viewport| {
+                        drop_clip = ui.clip_rect();
                         // 実際のビューポート高さも記録する。リサイズ中の scroll extent
                         // 計算自体は上の `ui.available_height()` で同フレーム内に行う。
                         debug_assert!((viewport.height() - geometry.viewport_h).abs() < 0.1);
@@ -22026,6 +22083,14 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         + egui::vec2(col as f32 * cell_w, row as f32 * cell_h),
                                     egui::vec2(cell_w, cell_h),
                                 );
+                                if capture_drop_folders
+                                    && let Some(GridItem::Folder(path)) = self.items.get(idx)
+                                {
+                                    drop_folders.push(crate::main_drop_target::DropRow {
+                                        rect: cell_rect,
+                                        path: path.clone(),
+                                    });
+                                }
 
                                 let badges = self.grid_edit_badges(idx);
                                 let rating = if self.items_are_drive_list {
@@ -22315,6 +22380,9 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                 }
 
                                 // 選択中セルの矩形を記録 (オーバーレイ配置用)
+                                if self.grid_drop_hover(idx) {
+                                    crate::app::draw_grid_drop_target(ui.painter(), cell_rect, ui.visuals());
+                                }
                                 if self.selected == Some(idx) {
                                     self.selected_cell_rect = Some(cell_rect);
                                 }
@@ -22322,6 +22390,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     });
 
+                self.record_main_drop_grid_geometry(ui, drop_clip, drop_folders);
                 // Finish the old list's scroll writeback before any background
                 // action can replace it (snapshot return may return no nav).
                 // スクロールバードラッグによるオフセット変化を読み戻す。

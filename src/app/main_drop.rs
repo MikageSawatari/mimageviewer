@@ -6,7 +6,7 @@ use std::sync::{atomic::Ordering, mpsc};
 use eframe::egui;
 
 use super::App;
-use crate::main_drop_target::{DropGeometry, DropRequest, DropRow};
+use crate::main_drop_target::{DropGeometry, DropPlace, DropRequest, DropRow};
 use crate::shell_file_ops::{ShellTransferRequest, ShellTransferResult};
 use crate::ui_dialogs::file_organize::{FileOrganizeRequest, FileOrganizeRunning};
 
@@ -29,9 +29,60 @@ pub(crate) fn take_books_root_resolutions_for_test() -> usize {
 pub(crate) struct CapturedMainDropGeometry {
     geometry: DropGeometry,
     tree_layer: Option<egui::LayerId>,
+    grid_layer: Option<egui::LayerId>,
+}
+
+#[derive(Clone)]
+struct GridDropDisplay {
+    pass: u64,
+    layer: egui::LayerId,
+    clip: egui::Rect,
+    folders: Vec<DropRow>,
+}
+
+fn grid_drop_display_id() -> egui::Id {
+    egui::Id::unique("main_drop_grid_display")
 }
 
 impl App {
+    pub(crate) fn grid_drop_hover(&self, idx: usize) -> bool {
+        matches!(self.items.get(idx), Some(crate::grid_item::GridItem::Folder(path))
+            if self.main_drop_hover_matches(path, DropPlace::Grid))
+    }
+
+    pub(crate) fn main_drop_hover_matches(&self, path: &Path, place: DropPlace) -> bool {
+        self.main_drop.borrow().hover.as_ref().is_some_and(|hover| {
+            hover.place == place && crate::folder_tree::path_eq(path, &hover.path)
+        })
+    }
+
+    pub(crate) fn record_main_drop_grid_geometry(
+        &self,
+        ui: &egui::Ui,
+        clip: egui::Rect,
+        folders: Vec<DropRow>,
+    ) {
+        let eligible = self.is_physical_folder_listing() && self.grid_item_input_allowed();
+        let display = GridDropDisplay {
+            pass: ui.ctx().cumulative_pass_nr(),
+            layer: ui.layer_id(),
+            clip: if eligible { clip } else { egui::Rect::NOTHING },
+            folders: if eligible {
+                folders
+                    .into_iter()
+                    .filter_map(|mut row| {
+                        row.rect = row.rect.intersect(clip);
+                        row.rect.is_positive().then_some(row)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+        };
+        ui.ctx()
+            .data_mut(|data| data.insert_temp(grid_drop_display_id(), display));
+    }
+
     /// Read-only: publishing cursor eligibility must never invalidate an undo receipt.
     pub(crate) fn shell_transfer_admission(&self, ctx: &egui::Context) -> Result<(), String> {
         let reason = if !matches!(self.file_organize_request, FileOrganizeRequest::Hidden) {
@@ -150,7 +201,7 @@ impl App {
                     ));
                 }
                 DropRequest::GridFiles(paths) => grid(self, paths),
-                DropRequest::TreeTransfer(request) => self.submit_shell_transfer(ctx, request),
+                DropRequest::FolderTransfer(request) => self.submit_shell_transfer(ctx, request),
                 DropRequest::Failed(message) => {
                     crate::logger::log(format!("main_drop: {message}"));
                     self.show_feedback_warning(message);
@@ -196,11 +247,23 @@ impl App {
             pane_rect: egui::Rect::NOTHING,
             tree_clip: egui::Rect::NOTHING,
             rows: Vec::new(),
+            grid_clip: egui::Rect::NOTHING,
+            grid_folders: Vec::new(),
+            grid_blocked: Vec::new(),
             client_size_px: metrics.client_size_px,
             dpi: metrics.dpi,
             pixels_per_point: ctx.pixels_per_point(),
         };
         let mut tree_layer = None;
+        let mut grid_layer = None;
+        if let Some(display) = ctx
+            .data(|data| data.get_temp::<GridDropDisplay>(grid_drop_display_id()))
+            .filter(|display| display.pass == ctx.cumulative_pass_nr())
+        {
+            geometry.grid_clip = display.clip;
+            geometry.grid_folders = display.folders;
+            grid_layer = Some(display.layer);
+        }
         if let Some(display) = self
             .folder_pane
             .label_display
@@ -225,6 +288,7 @@ impl App {
         CapturedMainDropGeometry {
             geometry,
             tree_layer,
+            grid_layer,
         }
     }
 
@@ -319,6 +383,18 @@ fn finalize_main_drop_geometry(
             .geometry
             .rows
             .retain(|row| !front.iter().any(|front| front.intersects(row.rect)));
+    }
+    if let Some(layer) = captured.grid_layer {
+        let front = front_layer_rects(ctx, layer);
+        let blocked = &mut captured.geometry.grid_blocked;
+        captured.geometry.grid_folders.retain(|row| {
+            if front.iter().any(|front| front.intersects(row.rect)) {
+                blocked.push(row.rect);
+                false
+            } else {
+                true
+            }
+        });
     }
     captured.geometry
 }

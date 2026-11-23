@@ -442,3 +442,69 @@ PDF（fake queue、子プロセスなし）:
 - §11 の Shell 完全削除は `path_is_gone` を出力する probe を追加しただけで、まだ結果がない。
   消えない結果なら削除だけのファイル項目も囲う設計判断が要る。現時点では対象を広げていない。
 - 外部ドラッグのバッジは段2とサブ PC での実機確認に残す。
+
+## 14. 実装の記録 (段 2)
+
+2026-11-23、段1の変更の囲いは変更せず、§5・§6・§10を実装。
+転送側と文書更新は Sol high に部分委任し、App描画側は本セッションで実装。
+独立した静的レビューは Sol xhigh に委任した。親セッションのモデル設定は変更していない。
+ビルド・テスト・PNG生成・実機確認は設計担当の共有 runner と検証セッションへ渡す。
+実装担当はコンパイラ・製品バイナリを起動せず、コミットもしない。
+
+### 変更箇所と設計の対応
+
+| 設計 | ファイル・入口 | 実装 |
+| --- | --- | --- |
+| §5.1・§5.3 | `ui_main.rs::render_grid` / `render_details_list`、`app/main_drop.rs::record_main_drop_grid_geometry` | 実フォルダ一覧かつ入力可能な pass の描画済み `Folder` だけを記録。サムネイルは `show_viewport` の clip、詳細は背景入力と同じ横 ScrollArea と縦 `inner_rect` の交差で先に切る。pass と layer を ctx の一時データに保持し、ツリーと同じ capture / publish に載せる。描画しない pass は再利用しない |
+| §5.1 | `app/main_drop.rs::finalize_main_drop_geometry` | 一覧の layer より手前にある、その pass で描かれた layer を既存 helper で集める。切ったフォルダと交わるものだけ `grid_blocked` へ移す。ツリー側だけの tooltip は、横スクロールした行の画面外部分に交わっても一覧を除外しない |
+| §5.2 | `main_drop_target.rs::hit_test` / `decide` / `DragSession::drop_request`、`app/main_drop.rs::consume_main_drops_with` | ツリー優先で `Folder { path, place }`、一覧の除外セルは `GridNonTarget`。非フォルダは従来の空白扱い。転送判定は場所を見ず、外部はコピーだけ。`FolderTransfer` は従来の `submit_shell_transfer` へ渡し、受付・本棚拒否・Running・完了処理を共用 |
+| §6.1 | `main_drop_target/native.rs::evaluate` / `set_hover` と OLE callbacks | 外部の受理済みフォルダだけ path / place を保持。非受付・Leave・Dropで消す。hover の変化時だけ再描画を要求し、既存の Drop 要求通知の wake は保つ。COM呼出中は共有状態を借用しない |
+| §6.1 | `app/main_drop.rs::main_drop_hover_matches` / `grid_drop_hover`、`ui_folder_pane.rs::draw_folder_pane_row`、`ui_main.rs::draw_details_row`、`app/grid_paint.rs::draw_grid_drop_target` | パスと場所が合う行／セルだけを強調。ツリーは選択色の塗りと枠、サムネイルは2px枠、詳細は選択背景。色は `ui.visuals()` を使う。空白の強調は足さない |
+| §6.2 | `main_drop_target/native.rs::OleData::set_description` | `SetData(TRUE)` 成功時に medium を相手へ渡す。失敗時は RAII で解放し既存のログを残す。mIV外側 owner のコピー・一度だけの解放の契約は変更しない |
+| §8 | `app/main_drop_tests.rs`、`main_drop_target/tests.rs`、`main_drop_target/native/tests.rs`、`tests/ui_snapshot.rs` | 下記の未実行回帰を追加。生の Shell object の probe は、既存STA guard内で本番writerを使う通常のheadless assertionへ置き換え |
+| §10 | マニュアル4本、`folder-tree-dnd-plan.md`、`file-drag-drop-design.md`、`keymap-spec.md`、`ui-snapshot-policy.md` | 一覧のフォルダ・外部コピー・外部だけの強調・再生中の「使用中」を反映。D&Dは固定入力のまま。外部バッジの別プロセス表示は未確認とする |
+
+新しい同期I/O・待機・遅延・再試行・周期repaintは追加していない。
+detached述語・viewport経路・変更の囲いには触れていない。コード上の設計前提に矛盾は見つかっていない。
+
+### テスト定義（すべて未実行）
+
+`src/main_drop_target/tests.rs`:
+
+- `grid_drop_858_hit_edges_clip_blocked_and_tree_priority`
+- `grid_drop_858_uses_only_presented_grid_with_matching_metrics`
+- `grid_drop_858_folder_decisions_match_tree_for_internal_and_external_sources`
+- `grid_drop_858_folder_request_retains_payload_and_external_copy`
+
+`src/app/main_drop_tests.rs`:
+
+- `grid_drop_858_real_app_pass_records_folder_paths_in_both_views`
+- `grid_drop_858_real_app_pass_nonqualifying_listings_have_no_grid_part`
+- `grid_drop_858_real_app_pass_occluded_folder_moves_to_blocked`
+- `grid_drop_858_details_horizontal_scroll_clips_before_tree_tooltip_occlusion`
+- `hover_860_app_matches_path_and_place_without_highlighting_other_items`
+- `hover_860_details_folder_name_uses_selection_color`
+
+`src/main_drop_target/native/tests.rs`:
+
+- `hover_860_own_outer_description_true_round_trip_and_replace`
+- `hover_860_external_callbacks_track_path_place_and_repaint_only_changes`
+- `hover_860_drop_clears_hover_and_preserves_request_wake`
+- `hover_860_internal_and_rejected_sources_never_acquire_hover`
+- `hover_860_rejection_and_missing_session_clear_previous_hover`
+- `hover_860_raw_shell_description_true_round_trip`
+
+`tests/ui_snapshot.rs`:
+
+- `hover_860_drop_targets_light`
+- `hover_860_drop_targets_dark`
+
+### 確認待ち
+
+- Sol xhigh の独立静的レビューは ACCEPT。詳細行の名前色にhover選択状態が渡らない指摘を修正し、
+  本番の名前rendererを使うfixtureと、明暗・未選択・custom色の実App描画回帰を追加して再確認した。
+  未解決指摘なし。コンパイル・実行の代わりとなる証拠ではない。
+- 共有runnerでのコンパイル・上記回帰・既存関連テスト。実装担当は実行していない。
+- スナップショット2枚の生成・目視・更新指定なしの比較。PNGは追加していない。
+- §9の内部転送・自身拒否・外部コピー先・外部強調と、別プロセスExplorerのバッジの実機確認。
+- UI固定文字列の追加はsnapshot fixture内だけだが、グリフ検査も設計担当に渡す。

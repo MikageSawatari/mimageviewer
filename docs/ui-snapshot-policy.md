@@ -1,5 +1,13 @@
 # UI スナップショットテスト運用方針
 
+§1.858 段2・§1.860 は `hover_860_drop_targets_light` / `hover_860_drop_targets_dark`
+（350×340）を追加する。App・worker・実ファイルを使わず、本体と共通のツリー行、
+サムネイルセル、詳細行の背景描画に固定の落とし先を渡し、通常行／セルと並べる。
+強調対象のパスと場所、外部だけの強調、変更時だけの再描画は別の headless 回帰で検査する。
+**PNG は未生成・未目視、比較も未実行**。設計担当が共有 runner で対象2件を生成し、
+明暗の塗り・枠・文字の判読性と欠け・重なりを確認してから、更新指定なしで比較する。
+integration の `ui_snapshot` binary は既存の `gpu` group 対象である。
+
 §1.818 段階7のブラウザ連携は、純粋 renderer に固定の worker snapshot と入力文字列を渡す。
 `browser818_preferences_light`、`browser818_preferences_dark_long_path`、
 `browser818_preferences_unavailable`、`browser818_preferences_processing` の4定義（560×460）を追加した。

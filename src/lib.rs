@@ -476,6 +476,8 @@ mod edit_preview;
 mod ui_erase;
 mod ui_folder_pane;
 #[doc(hidden)]
+pub use ui_folder_pane::draw_drop_hover_snapshot_fixture;
+#[doc(hidden)]
 pub use ui_folder_pane::draw_folder_pane_location_snapshot_fixture;
 pub use ui_folder_pane::draw_folder_pane_refresh_snapshot_fixture;
 #[doc(hidden)]
