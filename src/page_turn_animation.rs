@@ -1,4 +1,4 @@
-//! Pure book-leaf projection. Materials and canonical placements are immutable;
+//! Pure book-leaf and slide projection. Materials and canonical placements are immutable;
 //! this module performs no source resolution, decoding, upload or I/O.
 use egui::{Color32, Mesh, Pos2, Rect, TextureId, pos2};
 
@@ -278,6 +278,13 @@ pub(crate) struct TurnRecipe {
     grid_v: usize,
     cost: ProjectionCost,
 }
+/// Immutable travel distances and the first meaningfully visible slide pose.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SlideRecipe {
+    initial_progress: f32,
+    incoming_distance: f32,
+    outgoing_distance: f32,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProjectionFailure {
     UnsupportedGeometry(&'static str),
@@ -458,6 +465,174 @@ pub(crate) fn prepare_turn(
         cost,
     })
 }
+/// Slide admission shares canonical validation, but not the curl leaf's
+/// admission, paper support or perspective tessellation requirements.
+pub(crate) fn prepare_slide(
+    old: &CanonicalUnit,
+    new: &CanonicalUnit,
+    direction: TurnDirection,
+) -> Result<SlideRecipe, ProjectionFailure> {
+    preflight(old, new)?;
+    let bounds = |unit: &CanonicalUnit| {
+        unit.pages
+            .iter()
+            .filter(|page| !vacant(page))
+            .map(|page| page.rect)
+            .reduce(Rect::union)
+            .ok_or(ProjectionFailure::UnsupportedGeometry("slide_empty_unit"))
+    };
+    let outgoing = bounds(old)?;
+    let incoming = bounds(new)?;
+    let clip = new.pages[0].clip_rect;
+    let (incoming_distance, outgoing_distance) = if direction.turns_right_slot() {
+        let incoming_distance = clip.right().max(outgoing.right()) - incoming.left();
+        (
+            incoming_distance,
+            incoming_distance.max(outgoing.right() - clip.left()),
+        )
+    } else {
+        let incoming_distance = incoming.right() - clip.left().min(outgoing.left());
+        (
+            incoming_distance,
+            incoming_distance.max(clip.right() - outgoing.left()),
+        )
+    };
+    let mut recipe = SlideRecipe {
+        initial_progress: 1.0 / 32.0,
+        incoming_distance,
+        outgoing_distance,
+    };
+    for step in 0..=8 {
+        let initial_progress = step as f32 / 32.0;
+        let candidate = SlideRecipe {
+            initial_progress,
+            ..recipe
+        };
+        if meaningful(&visibility(
+            &slide_scene(old, new, direction, candidate, 0.0),
+            new,
+            old,
+        )) {
+            recipe.initial_progress = initial_progress;
+            return Ok(recipe);
+        }
+    }
+    if old.layout == UnitLayout::Single {
+        Err(ProjectionFailure::IncomingNotVisible(
+            "initial_target_visibility",
+        ))
+    } else {
+        // Blank partners and distant real pages may enter later. The shared
+        // motion clock starts independently of the first-visible receipt.
+        Ok(recipe)
+    }
+}
+
+pub(crate) fn project_slide(
+    old: &CanonicalUnit,
+    new: &CanonicalUnit,
+    direction: TurnDirection,
+    recipe: SlideRecipe,
+    progress: f32,
+    measure: bool,
+) -> Result<TurnProjection, ProjectionFailure> {
+    if !progress.is_finite() || !(0.0..=1.0).contains(&progress) {
+        return Err(ProjectionFailure::InvalidProgress);
+    }
+    let start = measure.then(std::time::Instant::now);
+    let scene = slide_scene(old, new, direction, recipe, progress);
+    let mut cost = ProjectionCost::default();
+    if let Some(start) = start {
+        cost.outer_mask_cpu_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
+    let receipt = visibility(&scene, new, old);
+    if let Some(start) = start {
+        cost.silhouette_visibility_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
+    let mesh_start = measure.then(std::time::Instant::now);
+    let mut meshes = Vec::with_capacity(12);
+    for surface in &scene.surfaces {
+        flat_surface(&mut meshes, surface);
+    }
+    if let Some(start) = mesh_start {
+        cost.tessellation_ms = start.elapsed().as_secs_f64() * 1000.0;
+    }
+    if meshes.iter().map(|m| m.mesh.vertices.len()).sum::<usize>() > MAX_PROJECTION_VERTICES
+        || meshes
+            .iter()
+            .map(|m| m.mesh.indices.len() / 3)
+            .sum::<usize>()
+            > MAX_PROJECTION_TRIANGLES
+    {
+        return Err(ProjectionFailure::UnsupportedGeometry(
+            "projection_mesh_budget",
+        ));
+    }
+    Ok(TurnProjection {
+        meshes,
+        visibility: receipt,
+        finished: progress == 1.0,
+        cost,
+        angle_degrees: 0.0,
+        hinge_x: 0.0,
+        showing_back: false,
+    })
+}
+
+fn slide_scene<'a>(
+    old: &'a CanonicalUnit,
+    new: &'a CanonicalUnit,
+    direction: TurnDirection,
+    recipe: SlideRecipe,
+    progress: f32,
+) -> Scene<'a> {
+    let mut surfaces = Vec::with_capacity(old.pages.len() + new.pages.len());
+    // Use saved placements directly at the endpoint. In particular do not
+    // round-trip their edges through an add/subtract of the travel distance.
+    let eased = recipe.initial_progress + (1.0 - recipe.initial_progress) * smooth(progress);
+    let sign = if direction.turns_right_slot() {
+        -1.0
+    } else {
+        1.0
+    };
+    if progress < 1.0 {
+        let offset = egui::vec2(sign * recipe.outgoing_distance * eased, 0.0);
+        for page in &old.pages {
+            if !vacant(page) {
+                let rect = page.rect.translate(offset);
+                surfaces.push(placed_surface(
+                    page,
+                    rect,
+                    rect,
+                    FaceOwner::OutgoingFront,
+                    1.0,
+                ));
+            }
+        }
+    }
+    let offset = if progress == 1.0 {
+        egui::Vec2::ZERO
+    } else {
+        egui::vec2(-sign * recipe.incoming_distance * (1.0 - eased), 0.0)
+    };
+    for page in &new.pages {
+        if !vacant(page) {
+            let rect = if progress == 1.0 {
+                page.rect
+            } else {
+                page.rect.translate(offset)
+            };
+            surfaces.push(placed_surface(page, rect, rect, incoming_owner(page), 1.0));
+        }
+    }
+    Scene {
+        surfaces,
+        leaf: None,
+        shadow: 0.0,
+        black_floor: None,
+    }
+}
+
 pub(crate) fn project_prepared(
     old: &CanonicalUnit,
     new: &CanonicalUnit,
@@ -1753,6 +1928,8 @@ fn shade_color(c: Color32, shade: f32) -> Color32 {
     )
 }
 
+#[cfg(test)]
+mod slide_tests;
 #[cfg(test)]
 mod snapshot_tests;
 #[cfg(test)]

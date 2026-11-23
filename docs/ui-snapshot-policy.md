@@ -1,5 +1,26 @@
 # UI スナップショットテスト運用方針
 
+§1.843 の AI 連携は、既存の `agent_integration_window_{disabled,read,open,organize,records}_{light,dark}`
+の10枚を更新対象にする。新しい許可2つと補足、3区画の表示、確認なしで実行する範囲の説明を追加した。
+disabled / read は新しいチェックをOFF、open / organize / records はONにして描く。
+新しいPNGや登録確認画面の更新は不要。1093×614 / 1366×728、100% / 200%の閉じる操作と末尾への
+スクロールの検査は、既存のheadlessテストで全許可ONを扱う。
+2026-11-23 に設計担当が更新指定ありで10枚を生成・目視し、更新指定なしの通常比較 (266件) も通った。
+
+同日の `stack_script` 追加では、同じ10枚の許可補足・公開情報・許す操作に、本文の読み書きを含める。
+設定許可 OFF では本文を見せないこと、ON でも連携無効なら渡さないことを既存の権限組合せテストで検査する。
+環境設定のスタック用ボタンは処理先だけの変更で、表示文言とレイアウトは変えない。
+**この追加後の PNG は未更新・未目視で、通常比較も未実施**。上記266件の成功は追加前の記録として保持し、
+今回の証拠には再利用しない。生成・目視・通常比較と小画面の headless 回帰は統括へ引き継ぐ。
+
+§1.858 段2・§1.860 は `hover_860_drop_targets_light` / `hover_860_drop_targets_dark`
+（350×340）を追加する。App・worker・実ファイルを使わず、本体と共通のツリー行、
+サムネイルセル、詳細行の背景描画に固定の落とし先を渡し、通常行／セルと並べる。
+強調対象のパスと場所、外部だけの強調、変更時だけの再描画は別の headless 回帰で検査する。
+**PNG は未生成・未目視、比較も未実行**。設計担当が共有 runner で対象2件を生成し、
+明暗の塗り・枠・文字の判読性と欠け・重なりを確認してから、更新指定なしで比較する。
+integration の `ui_snapshot` binary は既存の `gpu` group 対象である。
+
 §1.818 段階7のブラウザ連携は、純粋 renderer に固定の worker snapshot と入力文字列を渡す。
 `browser818_preferences_light`、`browser818_preferences_dark_long_path`、
 `browser818_preferences_unavailable`、`browser818_preferences_processing` の4定義（560×460）を追加した。

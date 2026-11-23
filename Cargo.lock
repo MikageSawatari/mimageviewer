@@ -4246,6 +4246,7 @@ version = "5.6.0"
 dependencies = [
  "base64 0.22.1",
  "mimageviewer-agent-ipc",
+ "scraper",
  "serde",
  "serde_json",
  "tempfile",
@@ -6368,6 +6369,7 @@ checksum = "bdd0be4d296f048bfb06dd01bbc80ef789ddd2e55583e8d2e6b804942abfabc2"
 dependencies = [
  "cssparser",
  "ego-tree",
+ "getopts",
  "html5ever",
  "precomputed-hash",
  "selectors",

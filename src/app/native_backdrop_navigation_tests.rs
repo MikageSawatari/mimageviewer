@@ -11,6 +11,66 @@ use crate::ring_shortcut::{
 use crate::ui_main::{AddressBarNav, LocationJumpTarget};
 
 #[test]
+fn native_backdrop_drive_ring_finishes_video_transition_before_resolver_admission() {
+    use super::drive_jump::{DriveJumpResolution, finish_drive_jump_for_test};
+    use crate::folder_tree::{OpenablePathKind, OpenablePathResolution};
+    use crate::ring_shortcut::{RingActionId, RingShortcutContext};
+    let ctx = egui::Context::default();
+    for kind in 0..4 {
+        for missing in [false, true] {
+            let mut app = search_backdrop(kind);
+            let target = app.tmp.path().join("drive-after-video-transition");
+            std::fs::create_dir(&target).unwrap();
+            let destination = target.clone();
+            app.drive_jump_resolver = Some(Arc::new(move |_| DriveJumpResolution {
+                target: (!missing).then(|| OpenablePathResolution {
+                    path: destination.clone(),
+                    kind: OpenablePathKind::Directory,
+                    requested_is_file: false,
+                }),
+                warnings: if missing {
+                    vec!["ドライブが見つかりません: Z:\\".into()]
+                } else {
+                    Vec::new()
+                },
+                outcome: if missing { "missing" } else { "target" },
+            }));
+            let source = search_source(&app);
+            assert!(app.video_presentation_transition.is_transitioning());
+            let candidate = app.apply_ring_action(
+                &ctx,
+                RingShortcutContext::VideoFullscreen,
+                RingActionId::drive_action('Z').unwrap(),
+                "drive-native-test",
+            );
+            assert!(matches!(candidate, Some(AddressBarNav::DriveJump(_))));
+            assert_close_completed(&app);
+            assert!(!app.video_presentation_transition.is_transitioning());
+            assert!(app.drive_jump_pending.is_none());
+            app.dispatch_native_backdrop_navigation(&ctx, None, false, candidate);
+            assert!(app.drive_jump_pending.is_some());
+            assert_search_active(&app, kind);
+            finish_drive_jump_for_test(&mut app, &ctx);
+            settle(&mut app, (!missing).then_some(target.as_path()));
+            if missing {
+                assert_search_active(&app, kind);
+                assert_eq!(search_source(&app), source);
+                assert!(
+                    app.fs_feedback_toast
+                        .as_ref()
+                        .unwrap()
+                        .0
+                        .contains("ドライブが見つかりません")
+                );
+            } else {
+                assert_search_ended(&app);
+                assert_eq!(app.current_folder.as_ref(), Some(&target));
+            }
+        }
+    }
+}
+
+#[test]
 fn native_backdrop_gamepad_favorite_each_search_adopts_and_returns_before_search() {
     let ctx = egui::Context::default();
     for kind in 0..4 {
@@ -341,11 +401,13 @@ fn settle(app: &mut App, target: Option<&Path>) {
         // branch or the ordinary navigation tail. Execute the queued terminal
         // close through that same owner before polling the requested scan.
         app.poll_video_presentation_transition(&ctx);
+        app.poll_drive_jump(&ctx);
         app.post_render_main_navigation(&ctx, empty_navigation());
         app.settle_open_path_classification_for_test();
         app.poll_history_navigation_transition_for_test(&ctx);
         app.poll_sidecar_restore(&ctx);
-        if app.folder_pane_open_pending.is_none()
+        if app.drive_jump_pending.is_none()
+            && app.folder_pane_open_pending.is_none()
             && app
                 .top_level_grid_view
                 .history_navigation_transition()

@@ -1,5 +1,23 @@
 ﻿# 仮想フォルダ (ZIP / RAR / PDF / EPUB) 処理
 
+## フォルダ変更時の ZIP・PDF の手放し（§1.858 B、段1・検証待ち）
+
+移動・名前の変更・削除の worker が実フォルダの配下に `mutation_fence` の囲いを持つ。
+比較は `physical_path_spelling` の component 単位で行い、通常のパスと `\\?\` / `\\?\UNC\`
+の表記を同一視する。フォルダ自身とファイル項目、コピーは囲わない。
+
+ZIP の目次キャッシュは、囲いの登録後に同じキャッシュ lock 内で該当要素をすべて捨てる。
+挿入側もその lock 内で囲いを確認し、配下なら今回の読取だけに template を使う。
+登録前に確認済みの挿入は後の退役で消え、退役した slot の遅い Ready 公開もキャッシュへ戻らない。
+処理中の clone は読み終えるまで使え、囲いの終了後は通常どおりキャッシュできる。
+
+PDF pool は保持中の文書の元の `ResolvedReadPath` を worker 別の解放 FIFO に入れ、
+操作の worker が ACK を総5秒まで待つ。囲い中の OPEN 応答も同じ queue lock 内で解放を予約し、
+その job の後・次の文書 job の前に閉じる。子プロセスとの通信形式と EPUB 削除の gate は変えない。
+読取を止める gate や要求の退避は足さない。再生・監視など別の保持や、処理中の短い読取が重なる場合の
+Shell の動作と削除の有限再試行は従来どおり。
+テストと残る確認は [設計書 §13](grid-folder-drop-and-handle-release-plan.md#13-実装の記録-段-1)。
+
 §1.353 の全再読込は [承認設計](section353-zip-refresh-location-plan.md) に従い、
 `RefreshList` に現在の論理 source・実効 ZIP prefix・カーソルを固定する。
 新ツリーで同階層を復元し、階層が消失した場合だけ直近の存在する祖先へ戻る。

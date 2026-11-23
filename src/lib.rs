@@ -389,6 +389,7 @@ pub fn pin_companion_runtime() -> std::io::Result<Option<std::fs::File>> {
     #[cfg(not(all(windows, not(feature = "portable"))))]
     Ok(None)
 }
+pub(crate) mod mutation_fence;
 pub mod save_with_metadata;
 pub mod search_index_db;
 pub mod search_norm;
@@ -474,6 +475,8 @@ pub use ui_dialogs::preferences::draw_video_thumbnail_indicator_settings_snapsho
 mod edit_preview;
 mod ui_erase;
 mod ui_folder_pane;
+#[doc(hidden)]
+pub use ui_folder_pane::draw_drop_hover_snapshot_fixture;
 #[doc(hidden)]
 pub use ui_folder_pane::draw_folder_pane_location_snapshot_fixture;
 pub use ui_folder_pane::draw_folder_pane_refresh_snapshot_fixture;

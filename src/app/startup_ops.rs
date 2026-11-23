@@ -196,6 +196,51 @@ impl App {
                 continue;
             }
             match &request.kind {
+                crate::agent_ipc::open::UiRequestKind::StackScriptAdmission => {
+                    let outcome = match self.admit_agent_settings_write() {
+                        Ok(()) => crate::agent_ipc::open::UiOpenOutcome::StackScriptAdmitted {
+                            enabled: self.settings.stack_script_enabled,
+                        },
+                        Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                    };
+                    request.complete(outcome);
+                }
+                crate::agent_ipc::open::UiRequestKind::SetFavorite(favorite) => {
+                    let outcome = match self.agent_set_favorite(favorite) {
+                        Ok(result) => crate::agent_ipc::open::UiOpenOutcome::Written(Ok(
+                            mimageviewer_agent_ipc::Payload::FavoriteWrite(result),
+                        )),
+                        Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                    };
+                    request.complete(outcome);
+                }
+                crate::agent_ipc::open::UiRequestKind::GetSettings { query, keys, page } => {
+                    let outcome =
+                        match self.agent_get_settings(query.as_deref(), keys.as_deref(), *page) {
+                            Ok(page) => crate::agent_ipc::open::UiOpenOutcome::Settings(page),
+                            Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                        };
+                    request.complete(outcome);
+                }
+                crate::agent_ipc::open::UiRequestKind::SetSettings {
+                    changes,
+                    client_name,
+                } => {
+                    let outcome = match self.agent_set_settings(changes, client_name, ctx) {
+                        Ok(result) => crate::agent_ipc::open::UiOpenOutcome::Written(Ok(
+                            mimageviewer_agent_ipc::Payload::SettingsWrite(result),
+                        )),
+                        Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                    };
+                    request.complete(outcome);
+                }
+                crate::agent_ipc::open::UiRequestKind::GetViewState { default_books_root } => {
+                    let outcome = match self.agent_view_state(default_books_root) {
+                        Ok(state) => crate::agent_ipc::open::UiOpenOutcome::Read(state),
+                        Err(error) => crate::agent_ipc::open::UiOpenOutcome::Refused(error),
+                    };
+                    request.complete(outcome);
+                }
                 crate::agent_ipc::open::UiRequestKind::TagWrite(_)
                 | crate::agent_ipc::open::UiRequestKind::RatingWrite(_) => {
                     let outcome = self.admit_agent_metadata_write(&request.kind);

@@ -169,7 +169,8 @@
     <ul class="pink-list">
       <li>アプリの設定・表示状態、動画・音声の再生位置とファイルごとに選んだ音声トラック</li>
       <li>検索欄の入力履歴（既定で保存がオン）。コンテナ検索・現在地の絞り込み・アイテム検索・Everything 検索の種類ごとに、最近の検索語を 20 件まで設定と同じ <code>settings.db</code> に保存します。検索を確定したときと、実行済みの語のまま入力欄から通常に離れたときに記録します。環境設定の「ライブラリ → 履歴と復元 → 検索欄の入力履歴」でオフ・全件消去ができます。オフで「OK」を押すと現在の入力履歴も消去しますが、どちらの消去でも設定の自動バックアップにはしばらく残ります。履歴の内容を診断ログ・リモート閲覧・AI 連携には渡しません。リモート閲覧や AI 連携からの検索は、この入力履歴に記録しません</li>
-      <li>AI 連携の許可の範囲、縮小画像・撮影位置・AI 説明文・文字起こしを AI に見せるかの設定</li>
+      <li>AI 連携の許可の範囲、縮小画像・撮影位置・AI 説明文・文字起こし・今開いている場所を AI に見せるか、設定の確認と変更を AI に任せるかの設定</li>
+      <li>スタック表示の分け方を変更するカスタムスクリプト（データフォルダ内の <code>stack_rules.rhai</code>）。AI に変更を許可した場合も、このファイルに保存します</li>
       <li>本ごとの見開き1ページずらしの調整（記憶をOFFにしても保存済み調整は保持し、明示的に解除できます。メタ情報の移行で持ち運べます）</li>
       <li>音響調整 (mIV Sound) の調整状態、プリセット、設定、取り込んだ IR ファイル・測定データ、ビジュアライザーのレイアウト・背景画像</li>
       <li>登録した SFZ 音源の名前と保存場所。サンプルファイルはコピーしません</li>
@@ -280,8 +281,10 @@
       AI 連携の要求の記録には、ツール名・所要時間・件数・結果やエラーの種類が残ります。
       AI からの検索語や読み取り結果は、mImageViewer の履歴・診断ログへ保存しません。
       AI にタグや★の変更を許可した場合は、通常の操作と共通の動作記録に、変更したファイルの場所やタグ名などが残ります。
+      AI による設定の変更では、変えた項目と変更前後の値（場所・外部ツールの実行ファイルと引数を含む）、お気に入りへの登録では場所も通常のログに残ります。
+      スタック用スクリプトの変更は、通知・「AI による変更」・通常のログに変更前後の行数だけを残し、本文は記録しません。
       「AI による変更」と「最近使った AI アプリ」の表示用の記録はメモリ内に持ち、本アプリを終了すると消えます。
-      変更済みのタグ・★・コレクションや、通常の動作記録はこの表示用の記録とは別に保存されます。
+      変更済みのタグ・★・コレクション・設定・お気に入りや、通常の動作記録はこの表示用の記録とは別に保存されます。
     </div>
     <div class="info-box">
       AI アプリへの登録・登録解除は、その AI アプリの設定ファイルを書き換えます。
@@ -310,9 +313,10 @@
       <li><strong>利用者が追加したユーザー VST</strong>: プラグイン独自の通信は各プラグインの動作に従います。利用前に提供元の説明をご確認ください。</li>
       <li><strong>音響調整の画面表示</strong>: 音響調整を開いている間、画面表示に使う Windows の機能 (WebView2) が、Microsoft に自身の更新を確認することがあります。曲名や画像は送信しません。</li>
       <li><strong>AI アプリとの連携（既定では無効）</strong>: 許可がオフでも、mIV の機能の名前と説明は登録した AI アプリに見えます。連携が無効の間は、ファイルやライブラリの情報は渡しません。
+        使い方の説明は連携が無効でも、mIV を起動していなくても渡します。公開のマニュアルと同じ内容で、利用者の情報は含みません。
         有効にすると、mImageViewer は同じ PC に登録した AI アプリへ PC 内で以下の情報を渡します。
         <strong>受け取った情報を AI アプリがその提供元へ送ります。</strong>
-        ファイルの場所（絶対パス）・名前・種類・大きさ・寸法・日時、タグ・★、コレクションと登録内容、本棚・閲覧履歴・ブックマーク・検索結果、
+        ファイルの場所（絶対パス）・名前・種類・大きさ・寸法・日時、タグ・★、コレクションと登録内容、本棚・お気に入りと索引の有無・閲覧履歴・ブックマーク・検索結果、
         撮影日時や機種などの EXIF、AI 生成画像のプロンプト・モデル名・生成条件などが対象です。
         状態確認では、連携の許可設定・検索の準備状態・検索の対象の場所（お気に入りのうちアイテム索引を有効にした場所）・リモート閲覧中かどうか・アプリの版も渡します。
         縮小画像・EXIF の撮影位置（GPS）欄・AI 説明文・文字起こしは、それぞれの設定を有効にした場合に渡します（いずれも既定では無効）。
@@ -321,10 +325,17 @@
         許可しない場合はその内容で検索せず、内容も渡しません。ただし、説明文のある書庫・フォルダの本が名前での検索結果に出るため、説明文があることは推測できます。
         文字起こしを許可すると、動画・音声の文字起こしの本文を時刻つきで、ファイルの情報としてその作成日などの状態も AI アプリへ渡します。話された氏名や私的な会話もそのまま含むことがあります。許可しない場合は渡しません。
         GPS 欄を無効にしても、ファイル名やプロンプトなどの文章に書かれた場所の情報を取り除くものではありません。
-        <strong>この連携では、mImageViewer 自身がインターネットへ情報を送信せず、連携で渡す情報が mImageViewer の開発者へ送られることもありません。</strong>
+        「今開いている場所を AI に見せる」を有効にすると、開いている場所と表示中の項目の場所を渡します。
+        「設定の確認と変更を AI に任せる」（既定ではオフ）を有効にすると、環境設定の項目と値（起動時のフォルダや保存先などの場所、外部ツールの実行ファイルと引数を含む）と、スタック用スクリプトの本文を渡します。本文も AI アプリの提供元へ送られます。
+        AI アプリからの指示で環境設定の変更、外部ツールの登録・変更・削除、スタック用スクリプトの書き換え、お気に入りへの登録と索引の切り替えを確認なしで行います。
+        スタック用スクリプトのオン・オフも変えられます。外部ツールの起動はこの連携では行いません。
+        AI 連携の許可の状態は渡しますが、AI からは変えられません。保存した PDF のパスワードとリモート接続の暗証番号は渡しません。
+        AI が更新の確認をオンにすると、起動時とその後 24 時間ごとに GitHub へ新しい版を問い合わせます。
+        リモート端末への動画配信をオンにすると、リモート閲覧が有効な場合に端末から求められた動画を配信します。リモート接続そのものの有効化は AI からはできません。
+        <strong>AI アプリとの受け渡しは同じ PC 内で行い、連携で渡す情報が mImageViewer の開発者へ送られることはありません。</strong>
         AI アプリと提供元による情報の扱いは、各社のプライバシーポリシーに従います。
         <a href="manual/ai-integration.html">使い方と渡る情報を見る</a></li>
-      <li><strong>クリップボード取り込み</strong>: クリップボードの取り込み監視は、環境設定のチェックを ON にしたときだけ動きます。コピーしたページの画像は、選択ダイアログを開いたときに、画像の URL へ GET を送って取得します。User-Agent は <code>mImageViewer/&lt;版&gt;</code> です。<br>
+      <li><strong>クリップボード取り込み</strong>: クリップボードの取り込み監視は、環境設定のチェックが ON の間だけ動きます。コピーしたページの画像は、選択ダイアログを開いたときに、画像の URL へ GET を送って取得します。User-Agent は <code>mImageViewer/&lt;版&gt;</code> です。<br>
         参照元はブラウザの既定と同じ規則（strict-origin-when-cross-origin）で送ります。同じオリジン（通信方式・ホスト名・ポート）にはページの URL、別のオリジンにはオリジンだけを送り、HTTPS から HTTP へは送りません。ページの URL から認証情報と「#」以降を除きます。Cookie やブラウザのログイン情報は使わず、送信もしません。この機能では、画像取得のための通信以外に、コピー内容や画像を送信・収集しません。<a href="manual/clipboard-capture.html">使い方を見る</a></li>
       <li><strong>リモート閲覧（既定では無効）</strong>: 利用者が自ら有効にした場合に限り、
         PC 内で待ち受けを始め、利用者自身のスマートフォンやタブレットのブラウザへ画像・動画・音声を送ります。
@@ -456,7 +467,8 @@
     <ul class="pink-list">
       <li>Application settings and view state, video and audio playback positions, and the audio track selected for each file</li>
       <li>Search input history, enabled by default: up to 20 recent queries for each of container search, current-location filtering, item search, and Everything search, saved with settings in <code>settings.db</code>. Queries are recorded when you submit a search, or when you normally leave an input field whose current query has already been run. You can disable or clear this history in Preferences → Library → History and Restore → Search Input History. Turning saving off and selecting OK also clears the current history. After either clearing operation, earlier history may remain in automatic settings backups for a while. History contents are not passed to diagnostic logs, remote viewing, or AI integration. Searches made through remote viewing or AI integration are not recorded in this history</li>
-      <li>The permission level for AI integration, and settings for showing reduced images, shooting locations, AI captions, and transcripts to AI</li>
+      <li>The permission level for AI integration; settings for showing reduced images, shooting locations, AI captions, transcripts, and the current location to AI; and permission for AI to inspect and change settings</li>
+      <li>A custom script for grouping images in stack view (<code>stack_rules.rhai</code> in the data folder). Changes made with AI permission are saved to the same file</li>
       <li>Per-book spread-pairing adjustments (saved adjustments remain when remembering is turned off and can be explicitly cleared or moved using metadata transfer)</li>
       <li>mIV Sound adjustment state, presets, configuration, imported IR files and measurements, and visualizer layouts and background images</li>
       <li>Registered SFZ instrument names and locations. Sample files are not copied</li>
@@ -543,8 +555,10 @@
       mImageViewer does not save AI search queries or read results in its history or diagnostic logs.
       If you allow AI to change tags or ratings, the operation logs shared with normal user actions
       contain information such as the locations of changed files and tag names.
+      AI settings changes also leave the changed settings and their old and new values (including paths and external-tool executables and arguments) in normal logs. Favorite registration also logs the location.
+      Stack script changes show only the old and new line counts in notifications, "AI changes", and normal logs; the script body is not recorded there.
       The display records for "AI changes" and "Recent AI apps" are held in memory and cleared when the App exits.
-      Saved changes to tags, ratings, and collections, and normal operation logs, are stored separately from these display records.
+      Saved changes to tags, ratings, collections, settings, and favorites, and normal operation logs, are stored separately from these display records.
     </div>
     <div class="info-box">
       Registering or unregistering an AI app changes that app's settings file.
@@ -576,10 +590,11 @@
       <li><strong>User VST plug-ins you add</strong>: independent network activity follows each plug-in’s behavior. Check the provider’s documentation before use.</li>
       <li><strong>Audio adjustment display</strong>: while audio adjustment is open, the Windows feature used to display it (WebView2) may contact Microsoft to check for its own updates. It does not send song titles or artwork.</li>
       <li><strong>AI app integration (off by default)</strong>: even with permissions off, a registered AI app can see the names and descriptions of mIV's features. While integration is disabled, no file or library information is shared.
+        Usage help is available even when integration is disabled or mIV is not running. It contains the same information as the public manual and no personal library information.
         When enabled, mImageViewer passes the following information locally to an AI app registered on the same PC.
         <strong>The AI app sends the information it receives to its provider.</strong>
         This includes file locations (absolute paths), names, types, sizes, dimensions and dates; tags and ratings;
-        collections and their contents; bookshelves, viewing history, bookmarks and search results;
+        collections and their contents; bookshelves, favorites and their indexing status, viewing history, bookmarks and search results;
         EXIF such as shooting dates and camera models; and AI image generation information such as prompts, model names and generation settings.
         Status checks also return the integration permissions, search readiness, whether remote viewing is active, and the App version.
         Reduced images, EXIF shooting-location (GPS) fields, AI captions, and transcripts are passed when you enable their respective settings (all are off by default).
@@ -587,10 +602,17 @@
         Without this permission, their contents are neither searched nor passed to the AI app. However, archive or folder books with captions can appear in searches by name, so the existence of a caption may be inferred.
         Allowing transcripts passes the text of video and audio transcripts with timestamps, and their status such as the creation date as part of file information. Spoken names and private conversations may be included as they are. Without this permission, transcripts are not passed.
         Turning off GPS fields does not remove location information written in text such as filenames or prompts.
-        <strong>For this integration, mImageViewer itself does not send information over the internet, and the information passed through the integration is not sent to mImageViewer's developer.</strong>
+        Enabling permission to show the current location shares the open location and the location of the item being viewed.
+        Enabling permission for AI to inspect and change settings (off by default) shares Preferences settings and values, including startup folders, output paths, and external-tool executables and arguments, as well as the stack script body. The body is also sent to the AI app's provider.
+        AI requests can then change Preferences, register, change or delete external tools, rewrite the stack script, register favorite folders, and switch their indexing on or off without confirmation.
+        AI can also switch the stack script option on or off. This integration does not launch external tools.
+        AI integration permission states are shared, but AI cannot change them. Saved PDF passwords and the remote connection PIN are not shared.
+        If AI turns on update checks, the App queries GitHub for new versions at startup and every 24 hours thereafter.
+        If AI turns on video streaming to remote devices, videos are streamed when requested by a device while remote viewing is enabled. AI cannot enable remote viewing itself.
+        <strong>Communication with the AI app stays on the same PC. Information passed through this integration is not sent to mImageViewer's developer.</strong>
         The AI app and provider handle it under their privacy policies.
         <a href="manual/ai-integration.html">Read about setup and shared information</a></li>
-      <li><strong>Clipboard capture</strong>: capture monitoring runs only when you turn on its checkboxes in Preferences. When you open the image selection dialog for a copied page, the App fetches its images by sending GET requests to the image URLs. Its User-Agent is <code>mImageViewer/&lt;version&gt;</code>.<br>
+      <li><strong>Clipboard capture</strong>: capture monitoring runs only while its checkboxes in Preferences are on. When you open the image selection dialog for a copied page, the App fetches its images by sending GET requests to the image URLs. Its User-Agent is <code>mImageViewer/&lt;version&gt;</code>.<br>
         Referrers follow the browser's default rule (strict-origin-when-cross-origin): the page URL for the same origin (scheme, host, and port), only the origin for a different origin, and no referrer when going from HTTPS to HTTP. Credentials and the fragment after "#" are removed from the page URL. Cookies and browser login information are neither used nor sent. This feature does not send or collect clipboard contents or images beyond the requests needed to fetch the images. <a href="manual/clipboard-capture.html">Read the manual</a></li>
       <li><strong>Remote viewing (off by default)</strong>: only when you turn it on, the App
         starts listening inside your PC and sends images, video, and audio to a browser on your own phone or

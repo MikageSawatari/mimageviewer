@@ -2335,7 +2335,9 @@ impl crate::app::App {
     }
 
     pub(crate) fn location_navigation_pending(&self) -> bool {
-        self.other_location_navigation_pending() || self.direct_navigation_scan_pending()
+        self.other_location_navigation_pending()
+            || self.direct_navigation_scan_pending()
+            || self.drive_jump_pending()
     }
 
     /// Grace is visual only: item input is blocked immediately. Existing history/rating
@@ -2346,12 +2348,13 @@ impl crate::app::App {
         }
         let elapsed = self
             .direct_navigation_scan_elapsed()
+            .or_else(|| self.drive_jump_elapsed())
             .or_else(|| self.view_order_refresh_scan_elapsed())?;
         (elapsed < DIRECT_NAVIGATION_WAIT_GRACE).then(|| DIRECT_NAVIGATION_WAIT_GRACE - elapsed)
     }
 
     pub(crate) fn grid_item_input_block(&self) -> Option<GridItemInputBlock> {
-        if self.direct_navigation_scan_pending() {
+        if self.direct_navigation_scan_pending() || self.drive_jump_pending() {
             Some(GridItemInputBlock::DirectNavigationScan)
         } else if self.view_order_refresh_scan_pending() {
             Some(GridItemInputBlock::ViewOrderRefreshScan)

@@ -75,6 +75,7 @@ fn gated_commands() -> Vec<(Command, &'static str)> {
             },
             ORGANIZE_PERMISSION_MESSAGE,
         ),
+        (Command::GetViewState, CURRENT_VIEW_PERMISSION_MESSAGE),
     ]
 }
 
@@ -112,8 +113,11 @@ fn core_permission_matrix_keeps_gps_and_captions_as_content_permissions() {
         AgentLevel::ReadAndOpen,
         AgentLevel::Organize,
     ] {
-        for bits in 0..16 {
+        for bits in 0..64 {
             let snapshot = PermissionSnapshot {
+                current_view: bits & 16 != 0,
+                settings: bits & 32 != 0,
+
                 level,
                 thumbnails: bits & 1 != 0,
                 gps: bits & 2 != 0,
@@ -122,6 +126,7 @@ fn core_permission_matrix_keeps_gps_and_captions_as_content_permissions() {
             };
             for (command, message) in gated_commands() {
                 let allowed = match command {
+                    Command::GetViewState => snapshot.current_view,
                     Command::GetThumbnail { .. } => snapshot.thumbnails,
                     Command::GetTranscript { .. } => snapshot.transcripts,
                     Command::OpenInViewer { .. } => level >= AgentLevel::ReadAndOpen,

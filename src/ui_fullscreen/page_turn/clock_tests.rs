@@ -111,15 +111,7 @@ fn delayed_prepare_starts_at_zero_then_finishes_by_wall_time_after_first_accepte
                     MotionClock::AwaitingAcceptedOutput,
                     "the hook publishes; it does not mutate UI state"
                 );
-                let expected = crate::page_turn_animation::project_prepared(
-                    &projection.outgoing,
-                    &projection.incoming,
-                    projection.direction,
-                    projection.recipe,
-                    0.0,
-                    false,
-                )
-                .unwrap();
+                let expected = projection.project(0.0, false).unwrap();
                 (offer.submission.clone(), expected)
             }
             _ => panic!("turning"),
@@ -193,7 +185,7 @@ fn discarded_output_replay_and_late_cancelled_or_mismatched_hooks_cannot_set_ori
     let ctx = egui::Context::default();
     install(&ctx);
     let fact = super::tests::fact(1);
-    let tracker = Arc::new(SubmissionTracker::new(fact));
+    let tracker = Arc::new(SubmissionTracker::new(fact, PageTurnAnimationStyle::Curl));
     let _ = ctx
         .run_pass(egui::RawInput::default(), |ctx| {
             let receipt = super::tests::receipt(ctx, 1);
@@ -224,7 +216,7 @@ fn discarded_output_replay_and_late_cancelled_or_mismatched_hooks_cannot_set_ori
         .drop_without_applying_deltas();
     assert_eq!(tracker.started_at(), Some(start_at));
     for cancel in [false, true] {
-        let tracker = Arc::new(SubmissionTracker::new(fact));
+        let tracker = Arc::new(SubmissionTracker::new(fact, PageTurnAnimationStyle::Curl));
         let _ = ctx
             .run_pass(egui::RawInput::default(), |ctx| {
                 let mut event = super::tests::event(&tracker, SubmissionKind::Curl);
@@ -242,7 +234,7 @@ fn discarded_output_replay_and_late_cancelled_or_mismatched_hooks_cannot_set_ori
             MotionClock::AwaitingAcceptedOutput
         );
     }
-    let tracker = Arc::new(SubmissionTracker::new(fact));
+    let tracker = Arc::new(SubmissionTracker::new(fact, PageTurnAnimationStyle::Curl));
     let _ = ctx
         .run_pass(egui::RawInput::default(), |ctx| {
             let mut receipt = super::tests::receipt(ctx, 1);

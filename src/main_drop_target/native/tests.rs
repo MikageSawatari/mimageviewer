@@ -6,8 +6,15 @@ use windows::Win32::System::Com::{
 };
 use windows::core::{BOOL, HRESULT, Interface};
 
+fn tree_hit(path: PathBuf) -> Hit {
+    Hit::Folder {
+        path,
+        place: DropPlace::Tree,
+    }
+}
+
 #[test]
-fn main_drop_shell_description_move_copy_invalid_round_trip_and_replace() {
+fn hover_860_own_outer_description_true_round_trip_and_replace() {
     let temp = tempfile::tempdir().unwrap();
     let paths = [
         temp.path().join("first.txt"),
@@ -100,7 +107,7 @@ fn main_drop_nodrop_shell_rejected_places_and_dragleave_clear_transfer_image() {
             false,
         );
         fixture.data = data.clone();
-        *fixture.hit.borrow_mut() = Some(Hit::TreeRow(destination.clone()));
+        *fixture.hit.borrow_mut() = Some(tree_hit(destination.clone()));
         let image = || {
             let cf = unsafe { RegisterClipboardFormatW(CFSTR_DROPDESCRIPTION) } as u16;
             let medium = Medium(unsafe { data.GetData(&format(cf)).unwrap() });
@@ -122,7 +129,7 @@ fn main_drop_nodrop_shell_rejected_places_and_dragleave_clear_transfer_image() {
         assert_eq!(image(), DROPIMAGE_MOVE);
         for (hit, keys, expected_effect, expected_image) in [
             (
-                Some(Hit::TreeRow(destination.clone())),
+                Some(tree_hit(destination.clone())),
                 CONTROL,
                 DROPEFFECT_COPY,
                 DROPIMAGE_COPY,
@@ -136,13 +143,13 @@ fn main_drop_nodrop_shell_rejected_places_and_dragleave_clear_transfer_image() {
             ),
             // Dropping the folder onto itself or into its current parent is rejected.
             (
-                Some(Hit::TreeRow(source.clone())),
+                Some(tree_hit(source.clone())),
                 0,
                 DROPEFFECT_NONE,
                 DROPIMAGE_NONE,
             ),
             (
-                Some(Hit::TreeRow(temp.path().to_path_buf())),
+                Some(tree_hit(temp.path().to_path_buf())),
                 0,
                 DROPEFFECT_NONE,
                 DROPIMAGE_NONE,
@@ -150,7 +157,7 @@ fn main_drop_nodrop_shell_rejected_places_and_dragleave_clear_transfer_image() {
             (Some(Hit::TreeNonTarget), 0, DROPEFFECT_NONE, DROPIMAGE_NONE),
             (None, 0, DROPEFFECT_NONE, DROPIMAGE_NONE),
             (
-                Some(Hit::TreeRow(destination.clone())),
+                Some(tree_hit(destination.clone())),
                 SHIFT,
                 DROPEFFECT_COPY,
                 DROPIMAGE_MOVE,
@@ -276,7 +283,10 @@ impl IDataObject_Impl for FakeDataObject_Impl {
         release: BOOL,
     ) -> WinResult<()> {
         let _reentry = self.shared.borrow_mut();
-        assert!(!release.as_bool(), "target owns its FALSE medium");
+        assert!(
+            release.as_bool(),
+            "target transfers its TRUE medium on success"
+        );
         let format = unsafe { &*format };
         assert_eq!(
             format.cfFormat, self.description_format,
@@ -291,6 +301,10 @@ impl IDataObject_Impl for FakeDataObject_Impl {
             .writes
             .borrow_mut()
             .push((format.cfFormat, image_type));
+        drop(_reentry);
+        // Match IDataObject::SetData: consume only on success, once, after reading.
+        let mut owned = unsafe { medium.read() };
+        unsafe { ReleaseStgMedium(&mut owned) };
         Ok(())
     }
     fn EnumFormatEtc(&self, _: u32) -> WinResult<IEnumFORMATETC> {
@@ -313,6 +327,7 @@ struct Fixture {
     data: IDataObject,
     hit: Rc<RefCell<Option<Hit>>>,
     observed: Rc<Observed>,
+    ctx: egui::Context,
 }
 
 fn fixture(internal: Option<InternalDrag>, fail_paths: bool) -> Fixture {
@@ -330,11 +345,12 @@ fn fixture_with_paths(
         ..Default::default()
     }));
     let observed = Rc::new(Observed::default());
-    let hit = Rc::new(RefCell::new(Some(Hit::TreeRow(r"C:\dst".into()))));
+    let hit = Rc::new(RefCell::new(Some(tree_hit(r"C:\dst".into()))));
     let locator = hit.clone();
+    let ctx = egui::Context::default();
     let target = MainDropTarget {
         hwnd: HWND::default(),
-        ctx: egui::Context::default(),
+        ctx: ctx.clone(),
         shared: shared.clone(),
         locate: Box::new(move |_| locator.borrow().clone()),
         helper: Rc::new(FakeVisuals {
@@ -358,6 +374,7 @@ fn fixture_with_paths(
         data,
         hit,
         observed,
+        ctx,
     }
 }
 
@@ -375,12 +392,15 @@ fn main_drop_nodrop_rejected_hits_write_none_on_enter_over_and_drop() {
     for (internal, has_paths, hit) in [
         (Some(source.clone()), true, None),
         (Some(source.clone()), true, Some(Hit::TreeNonTarget)),
+        (Some(source.clone()), true, Some(Hit::GridNonTarget)),
         (Some(source), true, Some(Hit::ExistingDropArea)),
         (None, false, None),
         (None, false, Some(Hit::TreeNonTarget)),
+        (None, false, Some(Hit::GridNonTarget)),
         (None, false, Some(Hit::ExistingDropArea)),
-        (None, false, Some(Hit::TreeRow(r"C:\dst".into()))),
+        (None, false, Some(tree_hit(r"C:\dst".into()))),
         (None, true, Some(Hit::TreeNonTarget)),
+        (None, true, Some(Hit::GridNonTarget)),
     ] {
         let fixture = fixture_with_paths(internal, false, has_paths);
         *fixture.hit.borrow_mut() = hit.clone();
@@ -497,7 +517,7 @@ fn main_drop_com_external_shift_drop_returns_copy_and_only_writes_drop_descripti
     .unwrap();
     assert_eq!(effect, DROPEFFECT_COPY);
     let mut shared = fixture.shared.borrow_mut();
-    let DropRequest::TreeTransfer(request) = shared.drops.pop().unwrap() else {
+    let DropRequest::FolderTransfer(request) = shared.drops.pop().unwrap() else {
         panic!("tree transfer expected")
     };
     assert_eq!(request.operation, ShellTransferOperation::Copy);
@@ -556,7 +576,7 @@ fn main_drop_com_internal_keeps_full_payload_and_rejects_grid_and_partial_source
     }
     .unwrap();
     assert_eq!(effect, DROPEFFECT_NONE);
-    *fixture.hit.borrow_mut() = Some(Hit::TreeRow(r"C:\dst".into()));
+    *fixture.hit.borrow_mut() = Some(tree_hit(r"C:\dst".into()));
     unsafe {
         fixture
             .target
@@ -567,7 +587,7 @@ fn main_drop_com_internal_keeps_full_payload_and_rejects_grid_and_partial_source
     assert_eq!(fixture.observed.queries.get(), 0);
     assert_eq!(fixture.observed.reads.get(), 0);
     let request = fixture.shared.borrow_mut().drops.pop().unwrap();
-    let DropRequest::TreeTransfer(request) = request else {
+    let DropRequest::FolderTransfer(request) = request else {
         panic!("tree request expected")
     };
     assert_eq!(request.sources, paths);
@@ -653,4 +673,318 @@ fn main_drop_com_failed_path_read_returns_none_and_queues_notification_without_t
         [DropRequest::Failed(_)]
     ));
     assert_eq!(fixture.observed.visual.borrow().last(), Some(&("drop", 0)));
+}
+
+fn observe_repaints(fixture: &Fixture) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = requests.clone();
+    fixture.ctx.set_request_repaint_callback(move |_| {
+        observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+    requests
+}
+
+fn clear_repaints(fixture: &Fixture, requests: &std::sync::atomic::AtomicUsize) {
+    // Clear egui's coalesced immediate requests before checking the next callback.
+    for _ in 0..3 {
+        fixture
+            .ctx
+            .run_pass(Default::default(), |_| {})
+            .drop_without_applying_deltas();
+    }
+    requests.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[test]
+fn hover_860_external_callbacks_track_path_place_and_repaint_only_changes() {
+    use std::sync::atomic::Ordering;
+    let fixture = fixture(None, false);
+    let requests = observe_repaints(&fixture);
+    clear_repaints(&fixture, &requests);
+    let mut output = DROPEFFECT_COPY;
+    unsafe {
+        fixture
+            .target
+            .DragEnter(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+    }
+    .unwrap();
+    assert_eq!(
+        fixture.shared.borrow().hover,
+        Some(DropHover {
+            path: r"C:\dst".into(),
+            place: DropPlace::Tree
+        })
+    );
+    assert!(requests.load(Ordering::Relaxed) > 0);
+    clear_repaints(&fixture, &requests);
+    output = DROPEFFECT_COPY;
+    unsafe {
+        fixture
+            .target
+            .DragEnter(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+    }
+    .unwrap();
+    assert_eq!(
+        requests.load(Ordering::Relaxed),
+        0,
+        "replacing the session on the same folder keeps the same hover"
+    );
+
+    for (hit, hover, repaint) in [
+        (
+            Some(tree_hit(r"C:\dst".into())),
+            Some(DropHover {
+                path: r"C:\dst".into(),
+                place: DropPlace::Tree,
+            }),
+            false,
+        ),
+        (
+            Some(Hit::Folder {
+                path: r"C:\dst".into(),
+                place: DropPlace::Grid,
+            }),
+            Some(DropHover {
+                path: r"C:\dst".into(),
+                place: DropPlace::Grid,
+            }),
+            true,
+        ),
+        (
+            Some(Hit::Folder {
+                path: r"C:\other".into(),
+                place: DropPlace::Grid,
+            }),
+            Some(DropHover {
+                path: r"C:\other".into(),
+                place: DropPlace::Grid,
+            }),
+            true,
+        ),
+        (Some(Hit::GridNonTarget), None, true),
+        (Some(Hit::GridNonTarget), None, false),
+        (Some(Hit::ExistingDropArea), None, false),
+        (Some(Hit::TreeNonTarget), None, false),
+        (None, None, false),
+        (
+            Some(tree_hit(r"C:\dst".into())),
+            Some(DropHover {
+                path: r"C:\dst".into(),
+                place: DropPlace::Tree,
+            }),
+            true,
+        ),
+    ] {
+        *fixture.hit.borrow_mut() = hit;
+        clear_repaints(&fixture, &requests);
+        unsafe {
+            fixture
+                .target
+                .DragOver(MODIFIERKEYS_FLAGS(0), point(), &mut output)
+        }
+        .unwrap();
+        assert_eq!(fixture.shared.borrow().hover, hover);
+        assert_eq!(requests.load(Ordering::Relaxed) > 0, repaint);
+    }
+    clear_repaints(&fixture, &requests);
+    unsafe { fixture.target.DragLeave() }.unwrap();
+    assert!(fixture.shared.borrow().hover.is_none());
+    assert!(requests.load(Ordering::Relaxed) > 0);
+    clear_repaints(&fixture, &requests);
+    unsafe { fixture.target.DragLeave() }.unwrap();
+    assert_eq!(requests.load(Ordering::Relaxed), 0);
+    assert!(fixture.shared.borrow().drops.is_empty());
+}
+
+#[test]
+fn hover_860_drop_clears_hover_and_preserves_request_wake() {
+    use std::sync::atomic::Ordering;
+    for hit in [
+        Some(Hit::Folder {
+            path: r"C:\dst".into(),
+            place: DropPlace::Grid,
+        }),
+        Some(Hit::ExistingDropArea),
+        Some(Hit::GridNonTarget),
+    ] {
+        let fixture = fixture(None, false);
+        let requests = observe_repaints(&fixture);
+        let mut output = DROPEFFECT_COPY;
+        unsafe {
+            fixture
+                .target
+                .DragEnter(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+        }
+        .unwrap();
+        assert!(fixture.shared.borrow().hover.is_some());
+        *fixture.hit.borrow_mut() = hit.clone();
+        clear_repaints(&fixture, &requests);
+        unsafe {
+            fixture
+                .target
+                .Drop(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+        }
+        .unwrap();
+        assert!(fixture.shared.borrow().hover.is_none());
+        assert!(requests.load(Ordering::Relaxed) > 0);
+        let shared = fixture.shared.borrow();
+        match hit {
+            Some(Hit::Folder { .. }) => assert!(matches!(
+                shared.drops.as_slice(),
+                [DropRequest::FolderTransfer(_)]
+            )),
+            Some(Hit::ExistingDropArea) => assert!(matches!(
+                shared.drops.as_slice(),
+                [DropRequest::GridFiles(_)]
+            )),
+            _ => assert!(shared.drops.is_empty()),
+        }
+    }
+    // Blank never acquires hover; a real external request must still wake the App.
+    let fixture = fixture(None, false);
+    let requests = observe_repaints(&fixture);
+    *fixture.hit.borrow_mut() = Some(Hit::ExistingDropArea);
+    let mut output = DROPEFFECT_COPY;
+    unsafe {
+        fixture
+            .target
+            .DragEnter(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+    }
+    .unwrap();
+    clear_repaints(&fixture, &requests);
+    unsafe {
+        fixture
+            .target
+            .Drop(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+    }
+    .unwrap();
+    assert!(requests.load(Ordering::Relaxed) > 0);
+}
+
+#[test]
+fn hover_860_internal_and_rejected_sources_never_acquire_hover() {
+    use std::sync::atomic::Ordering;
+    for (internal, has_paths, allows_copy, admitted) in [
+        (
+            Some(InternalDrag {
+                paths: vec![r"C:\src\a".into()],
+                excluded_virtual: false,
+                failed_paths: 0,
+            }),
+            true,
+            true,
+            true,
+        ),
+        (None, false, true, true),
+        (None, true, false, true),
+        (None, true, true, false),
+    ] {
+        let fixture = fixture_with_paths(internal, false, has_paths);
+        if !admitted {
+            fixture.shared.borrow_mut().admission = Err("blocked".into());
+        }
+        let requests = observe_repaints(&fixture);
+        for place in [DropPlace::Tree, DropPlace::Grid] {
+            *fixture.hit.borrow_mut() = Some(Hit::Folder {
+                path: r"C:\dst".into(),
+                place,
+            });
+            clear_repaints(&fixture, &requests);
+            let mut output = if allows_copy {
+                DROPEFFECT_COPY
+            } else {
+                DROPEFFECT_NONE
+            };
+            unsafe {
+                fixture
+                    .target
+                    .DragEnter(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+            }
+            .unwrap();
+            assert!(fixture.shared.borrow().hover.is_none());
+            assert_eq!(requests.load(Ordering::Relaxed), 0);
+            clear_repaints(&fixture, &requests);
+            unsafe {
+                fixture
+                    .target
+                    .DragOver(MODIFIERKEYS_FLAGS(0), point(), &mut output)
+            }
+            .unwrap();
+            assert!(fixture.shared.borrow().hover.is_none());
+            assert_eq!(requests.load(Ordering::Relaxed), 0);
+        }
+    }
+}
+
+#[test]
+fn hover_860_rejection_and_missing_session_clear_previous_hover() {
+    let fixture = fixture(None, false);
+    let mut output = DROPEFFECT_COPY;
+    unsafe {
+        fixture
+            .target
+            .DragEnter(&fixture.data, MODIFIERKEYS_FLAGS(0), point(), &mut output)
+    }
+    .unwrap();
+    assert!(fixture.shared.borrow().hover.is_some());
+    fixture.shared.borrow_mut().admission = Err("blocked".into());
+    unsafe {
+        fixture
+            .target
+            .DragOver(MODIFIERKEYS_FLAGS(0), point(), &mut output)
+    }
+    .unwrap();
+    assert!(fixture.shared.borrow().hover.is_none());
+    unsafe { fixture.target.DragLeave() }.unwrap();
+    fixture.shared.borrow_mut().hover = Some(DropHover {
+        path: r"C:\stale".into(),
+        place: DropPlace::Grid,
+    });
+    unsafe {
+        fixture
+            .target
+            .DragOver(MODIFIERKEYS_FLAGS(0), point(), &mut output)
+    }
+    .unwrap();
+    assert!(fixture.shared.borrow().hover.is_none());
+}
+
+/// A raw Shell object models the external source without a drag loop or any window.
+#[test]
+fn hover_860_raw_shell_description_true_round_trip() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("probe.txt");
+    std::fs::write(&path, b"probe").unwrap();
+    // Reuse the established STA guard, then deliberately write a separate raw object.
+    crate::file_drag::with_shell_drag_data_object(std::slice::from_ref(&path), |_| {
+        let (data, failed) =
+            crate::file_drag::shell_data_object_for_paths(std::slice::from_ref(&path)).unwrap();
+        assert_eq!(failed, 0);
+        let cf = unsafe { RegisterClipboardFormatW(CFSTR_DROPDESCRIPTION) } as u16;
+        let writer = OleData(data.clone());
+        for (description, image) in [
+            (
+                Description::Transfer(ShellTransferOperation::Copy, temp.path().to_path_buf()),
+                DROPIMAGE_COPY,
+            ),
+            (
+                Description::Transfer(ShellTransferOperation::Move, temp.path().to_path_buf()),
+                DROPIMAGE_MOVE,
+            ),
+            (Description::None, DROPIMAGE_NONE),
+            (Description::Invalid, DROPIMAGE_INVALID),
+        ] {
+            writer.set_description(&description).unwrap();
+            let medium = Medium(unsafe { data.GetData(&format(cf)) }.unwrap());
+            assert_eq!(medium.0.tymed, TYMED_HGLOBAL.0 as u32);
+            let global = unsafe { medium.0.u.hGlobal };
+            assert!(unsafe { GlobalSize(global) } >= std::mem::size_of::<DROPDESCRIPTION>());
+            let ptr = unsafe { GlobalLock(global) };
+            assert!(!ptr.is_null());
+            let actual = unsafe { ptr.cast::<DROPDESCRIPTION>().read_unaligned() };
+            let _ = unsafe { GlobalUnlock(global) };
+            let actual_type = actual.r#type;
+            assert_eq!(actual_type, image);
+        }
+    });
 }

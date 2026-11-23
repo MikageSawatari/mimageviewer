@@ -81,7 +81,7 @@ fn capture_composed_flat(ctx: &egui::Context, app: &mut App, anchor: usize) -> A
 
 #[test]
 fn page_turn_merge_master_coverless_tail_builder_preserves_vacant_leaf_motion() {
-    use crate::page_turn_animation::{PageMaterial, project_prepared};
+    use crate::page_turn_animation::PageMaterial;
 
     let _serial = crate::key_input::lock_test_input();
     for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
@@ -168,7 +168,8 @@ fn page_turn_merge_master_coverless_tail_builder_preserves_vacant_leaf_motion() 
             assert_eq!(canonical.pages[usize::from(right)].occurrence, Some(0));
 
             for (outgoing, incoming, forward) in [(&pair, &tail, true), (&tail, &pair, false)] {
-                let leaf = prepare_leaf(outgoing, incoming, forward).unwrap();
+                let leaf = prepare_leaf(outgoing, incoming, forward, PageTurnAnimationStyle::Curl)
+                    .unwrap();
                 let incoming_ids = leaf
                     .incoming
                     .pages
@@ -178,15 +179,7 @@ fn page_turn_merge_master_coverless_tail_builder_preserves_vacant_leaf_motion() 
                 assert_eq!(incoming_ids.len(), incoming.pages.len());
                 let mut previous_angle = 0.0;
                 for progress in [0.0, 0.25, 0.6, 0.95, 1.0] {
-                    let projection = project_prepared(
-                        &leaf.outgoing,
-                        &leaf.incoming,
-                        leaf.direction,
-                        leaf.recipe,
-                        progress,
-                        false,
-                    )
-                    .unwrap();
+                    let projection = leaf.project(progress, false).unwrap();
                     assert_eq!(projection.finished, progress == 1.0);
                     assert!(projection.meshes.iter().all(|mesh| {
                         mesh.mesh.texture_id == egui::TextureId::default()
@@ -293,8 +286,6 @@ fn page_turn_merge_master_coverless_tail_builder_preserves_vacant_leaf_motion() 
 
 #[test]
 fn page_turn_merge_master_explicit_singletons_project_without_automatic_cover_proof() {
-    use crate::page_turn_animation::project_prepared;
-
     let _input = crate::key_input::lock_test_input();
     for direction in [CompositionDirection::Ltr, CompositionDirection::Rtl] {
         for cover in [false, true] {
@@ -364,19 +355,11 @@ fn page_turn_merge_master_explicit_singletons_project_without_automatic_cover_pr
                 );
                 for (outgoing, incoming, forward) in [(&first, &pair, true), (&pair, &first, false)]
                 {
-                    let leaf = prepare_leaf(outgoing, incoming, forward).unwrap_or_else(|reason| {
+                    let leaf = prepare_leaf(outgoing, incoming, forward, PageTurnAnimationStyle::Curl).unwrap_or_else(|reason| {
                         panic!("{direction:?}/cover={cover}/hidden={reordered_hidden}/forward={forward}: {reason}")
                     });
                     for progress in [0.0, 0.25, 0.6, 1.0] {
-                        let projection = project_prepared(
-                            &leaf.outgoing,
-                            &leaf.incoming,
-                            leaf.direction,
-                            leaf.recipe,
-                            progress,
-                            false,
-                        )
-                        .unwrap();
+                        let projection = leaf.project(progress, false).unwrap();
                         assert!(!projection.meshes.is_empty());
                         assert_eq!(projection.finished, progress == 1.0);
                     }

@@ -50,6 +50,8 @@ impl Handlers {
                     }
                     row.name = favorite.name.clone();
                     row.id = Some(favorite.id.to_string());
+                    row.item_index = Some(favorite.auto_index_metadata);
+                    row.container_index = Some(favorite.auto_index_structure);
                     Ok(row)
                 });
             }
@@ -331,6 +333,8 @@ fn library_row(path: String) -> LibraryItem {
         last_read_at: None,
         rated_at: None,
         rating: None,
+        item_index: None,
+        container_index: None,
     }
 }
 
@@ -520,8 +524,22 @@ mod tests {
         assert_eq!(value(&favorites.items[0]).name, "live favorite");
         assert_eq!(value(&favorites.items[0]).id, Some(favorite.id.to_string()));
         assert_eq!(value(&favorites.items[0]).kind, ItemKind::Folder);
+        assert_eq!(value(&favorites.items[0]).item_index, Some(false));
+        assert_eq!(value(&favorites.items[0]).container_index, Some(false));
+        crate::settings_db::with_db_result(|db| {
+            let mut settings = db.load_into_settings()?;
+            settings.favorites[0].auto_index_metadata = true;
+            settings.favorites[0].auto_index_structure = true;
+            db.save_full(&settings)
+        })
+        .unwrap();
+        let enabled = list(&f, LibraryKind::Favorites, None, None, None);
+        assert_eq!(value(&enabled.items[0]).item_index, Some(true));
+        assert_eq!(value(&enabled.items[0]).container_index, Some(true));
         let shelf_page = list(&f, LibraryKind::Bookshelf, None, Some(1), None);
         assert_eq!(value(&shelf_page.items[0]).name, "Alpha");
+        assert_eq!(value(&shelf_page.items[0]).item_index, None);
+        assert_eq!(value(&shelf_page.items[0]).container_index, None);
         let shelf_next = list(&f, LibraryKind::Bookshelf, None, Some(1), shelf_page.cursor);
         assert_eq!(value(&shelf_next.items[0]).name, "Zulu");
         assert!(shelf_next.cursor.is_none());

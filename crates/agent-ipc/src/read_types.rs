@@ -67,6 +67,11 @@ pub struct LibraryItem {
     pub last_read_at: Option<i64>,
     pub rated_at: Option<i64>,
     pub rating: Option<u8>,
+    /// Present only on favorites; absent in responses from pre-v6 cores.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_index: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_index: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

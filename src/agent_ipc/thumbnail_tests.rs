@@ -13,6 +13,9 @@ fn context(fixture: &super::super::tests::Fixture) -> ReadContext {
         &fixture.handlers,
         (
             PermissionSnapshot {
+                current_view: false,
+                settings: false,
+
                 transcripts: false,
                 level: AgentLevel::ReadOnly,
                 thumbnails: true,

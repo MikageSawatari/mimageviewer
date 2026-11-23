@@ -2060,6 +2060,7 @@ pub enum ToolbarSectionId {
     Aspect,
     Sort,
     Rating,
+    Drives,
     Favorites,
     SmartFolders,
     Tags,
@@ -2105,6 +2106,7 @@ impl ToolbarSectionId {
             Self::Aspect,
             Self::Sort,
             Self::Rating,
+            Self::Drives,
             Self::Favorites,
             Self::SmartFolders,
             Self::Tags,
@@ -2116,12 +2118,16 @@ impl ToolbarSectionId {
         ]
     }
 
-    /// 保存済み順序に、未登録のセクションを既定順で末尾追加して返す。
+    /// 保存済み順序に、未登録のセクションを補完して返す。
     ///
     /// 詳細列の `details_ordered_columns` と同じ「保存順に無い新項目は末尾追加」方式。
     /// 空 Vec は既定順そのまま。重複は最初の 1 つだけ採用 (破損データ耐性)。
-    /// 後方互換 / 将来のセクション追加の両方に耐える。
+    /// Drives だけは保存済み Favorites の直前へ追加する。Favorites も無ければ末尾。
+    /// その他の新セクションは従来どおり末尾追加する。
     pub fn ordered_with_fallback(saved: &[Self]) -> Vec<Self> {
+        if saved.is_empty() {
+            return Self::default_order().to_vec();
+        }
         let mut out: Vec<Self> = Vec::with_capacity(Self::default_order().len());
         for &id in saved {
             // 未知セクションは描画対象にしない (forward-compat: 将来変種を読み飛ばす)。
@@ -2132,10 +2138,18 @@ impl ToolbarSectionId {
                 out.push(id);
             }
         }
+        let missing_drives = !out.contains(&Self::Drives);
+        let drives_position = out.iter().position(|id| *id == Self::Favorites);
         for &id in Self::default_order() {
+            if id == Self::Drives {
+                continue;
+            }
             if !out.contains(&id) {
                 out.push(id);
             }
+        }
+        if missing_drives {
+            out.insert(drives_position.unwrap_or(out.len()), Self::Drives);
         }
         out
     }
@@ -3454,6 +3468,15 @@ fn default_reading_history_limit() -> usize {
 // -----------------------------------------------------------------------
 // SpreadMode (フルスクリーンページ構成)
 // -----------------------------------------------------------------------
+
+/// ページ送りで使う演出。所有・時間・取消の経路は両方で共有する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PageTurnAnimationStyle {
+    #[default]
+    Curl,
+    Slide,
+}
 
 /// フルスクリーンのページ構成。
 ///
@@ -5434,6 +5457,9 @@ pub struct Settings {
     pub tags: Vec<TagDef>,
 
     // ── ツールバー表示設定 ──────────────────────────────────
+    /// A/B のどちらかに最後の場所の記録があるドライブをツールバーに表示する。
+    #[serde(default)]
+    pub show_toolbar_drives: bool,
     /// ツールバーに「お気に入り」セクションを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_favorites: bool,
@@ -5793,12 +5819,15 @@ pub struct Settings {
     /// 本ごとの見開き1ページずらしを記憶する。OFFでも保存済み調整は保持する。
     #[serde(default = "default_true")]
     pub remember_spread_shift_per_book: bool,
-    /// 単発のページ送りとスライドショーで紙めくり効果を使う。
+    /// 単発のページ送りとスライドショーでページ送り演出を使う。
     #[serde(default)]
     pub page_turn_animation_enabled: bool,
     /// 動きを評価するための仮の演出時間 (ms)。100..=600 に制限する。
     #[serde(default = "default_page_turn_animation_duration_ms")]
     pub page_turn_animation_duration_ms: u32,
+    /// ページ送り演出の種類。旧設定で欠けている場合は従来の紙めくり。
+    #[serde(default)]
+    pub page_turn_animation_style: PageTurnAnimationStyle,
     /// デフォルトの連結方式
     #[serde(default)]
     pub default_reading_flow: ReadingFlow,
@@ -6065,6 +6094,14 @@ pub struct Settings {
     /// AI アプリへ動画・音声の文字起こしを渡す。既定 OFF。
     #[serde(default)]
     pub agent_show_transcripts: bool,
+
+    /// AI アプリへ main context の現在地と閲覧対象を渡す。既定 OFF。
+    #[serde(default)]
+    pub agent_show_current_view: bool,
+
+    /// AI アプリに設定の確認と変更を許可する。既定 OFF。
+    #[serde(default)]
+    pub agent_allow_settings: bool,
 
     /// ラベル、ボタン、メニュー、ダイアログ、フルスクリーン HUD の文字コントラスト。
     #[serde(default)]
@@ -8459,6 +8496,7 @@ impl Default for Settings {
             remember_spread_shift_per_book: true,
             page_turn_animation_enabled: false,
             page_turn_animation_duration_ms: default_page_turn_animation_duration_ms(),
+            page_turn_animation_style: PageTurnAnimationStyle::default(),
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
@@ -8538,6 +8576,8 @@ impl Default for Settings {
             agent_show_gps: false,
             agent_show_ai_captions: false,
             agent_show_transcripts: false,
+            agent_show_current_view: false,
+            agent_allow_settings: false,
             text_contrast: TextContrast::default(),
             notification_duration: NotificationDuration::default(),
             ui_scale_factor: default_ui_scale_factor(),
@@ -8545,6 +8585,7 @@ impl Default for Settings {
             first_setup_completed: false,
             ai_feature_mode: AiFeatureMode::default(),
             tags: Vec::new(),
+            show_toolbar_drives: false,
             show_toolbar_favorites: true,
             show_toolbar_smart_folders: true,
             show_toolbar_tags: true,
@@ -11330,6 +11371,7 @@ impl Settings {
         self.show_toolbar_sort = src.show_toolbar_sort;
         self.show_facet_sort = src.show_facet_sort;
         self.show_grid_edge_buttons = src.show_grid_edge_buttons;
+        self.show_toolbar_drives = src.show_toolbar_drives;
         self.show_toolbar_favorites = src.show_toolbar_favorites;
         self.show_toolbar_smart_folders = src.show_toolbar_smart_folders;
         self.show_toolbar_tags = src.show_toolbar_tags;
@@ -13560,6 +13602,75 @@ mod tests {
     fn toolbar_section_order_empty_is_default() {
         let got = ToolbarSectionId::ordered_with_fallback(&[]);
         assert_eq!(got, ToolbarSectionId::default_order().to_vec());
+    }
+
+    #[test]
+    fn section1793_toolbar_drives_default_roundtrip_and_live_carry() {
+        assert!(!Settings::default().show_toolbar_drives);
+        assert!(
+            !serde_json::from_str::<Settings>("{}")
+                .unwrap()
+                .show_toolbar_drives
+        );
+        for enabled in [true, false] {
+            let mut live = Settings::default();
+            live.show_toolbar_drives = enabled;
+            let mut edited = live.preferences_snapshot();
+            edited.show_toolbar_drives = !enabled;
+            edited.overwrite_non_preferences_from(&mut live);
+            let loaded: Settings =
+                serde_json::from_value(serde_json::to_value(&edited).unwrap()).unwrap();
+            assert_eq!(loaded.show_toolbar_drives, enabled);
+        }
+    }
+
+    #[test]
+    fn section1793_toolbar_drives_insert_before_saved_favorites_only() {
+        use ToolbarSectionId as TS;
+        let old_order: Vec<_> = TS::default_order()
+            .iter()
+            .copied()
+            .filter(|id| *id != TS::Drives)
+            .rev()
+            .collect();
+        let mut expected = old_order.clone();
+        let favorites = expected.iter().position(|id| *id == TS::Favorites).unwrap();
+        expected.insert(favorites, TS::Drives);
+        assert_eq!(TS::ordered_with_fallback(&old_order), expected);
+        assert_eq!(TS::ordered_with_fallback(&expected), expected);
+
+        let corrupt = [TS::Tags, TS::Cols];
+        let completed = TS::ordered_with_fallback(&corrupt);
+        assert_eq!(&completed[..2], &corrupt);
+        assert_eq!(completed.last(), Some(&TS::Drives));
+
+        let explicit = [TS::Drives, TS::Tags, TS::Favorites];
+        assert_eq!(&TS::ordered_with_fallback(&explicit)[..3], &explicit);
+        let defaults = TS::default_order();
+        let favorites = defaults.iter().position(|id| *id == TS::Favorites).unwrap();
+        assert_eq!(defaults[favorites - 1], TS::Drives);
+    }
+
+    #[test]
+    fn section1793_toolbar_drives_upgrade_preserves_row_owners_and_other_fallbacks() {
+        use ToolbarSectionId as TS;
+        let mut settings = Settings::default();
+        settings.toolbar_section_order = TS::default_order()
+            .iter()
+            .copied()
+            .filter(|id| *id != TS::Drives && *id != TS::Collections)
+            .collect();
+        settings.toolbar_section_new_row = vec![TS::Favorites, TS::Tags];
+        let loaded: Settings =
+            serde_json::from_value(serde_json::to_value(&settings).unwrap()).unwrap();
+        let upgraded = TS::ordered_with_fallback(&loaded.toolbar_section_order);
+        assert_eq!(loaded.toolbar_section_new_row, [TS::Favorites, TS::Tags]);
+        assert_eq!(upgraded.last(), Some(&TS::Collections));
+        let without_new: Vec<_> = upgraded
+            .into_iter()
+            .filter(|id| *id != TS::Drives && *id != TS::Collections)
+            .collect();
+        assert_eq!(without_new, settings.toolbar_section_order);
     }
 
     #[test]
@@ -16979,6 +17090,10 @@ mod tests {
         for settings in [Settings::default(), serde_json::from_str("{}").unwrap()] {
             assert!(!settings.page_turn_animation_enabled);
             assert_eq!(settings.page_turn_animation_duration_ms, 200);
+            assert_eq!(
+                settings.page_turn_animation_style,
+                PageTurnAnimationStyle::Curl
+            );
         }
         let settings: Settings = serde_json::from_str(
             r#"{"page_turn_animation_enabled":true,"page_turn_animation_duration_ms":350}"#,
@@ -16988,9 +17103,52 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
         assert!(restored.page_turn_animation_enabled);
         assert_eq!(restored.page_turn_animation_duration_ms, 350);
+        assert_eq!(
+            restored.page_turn_animation_style,
+            PageTurnAnimationStyle::Curl
+        );
         let snapshot = restored.preferences_snapshot();
         assert!(snapshot.page_turn_animation_enabled);
         assert_eq!(snapshot.page_turn_animation_duration_ms, 350);
+        assert_eq!(
+            snapshot.page_turn_animation_style,
+            PageTurnAnimationStyle::Curl
+        );
+    }
+
+    #[test]
+    fn page_turn_animation_style_roundtrips_snake_case_and_rejects_unknown_values() {
+        for (style, wire) in [
+            (PageTurnAnimationStyle::Curl, "curl"),
+            (PageTurnAnimationStyle::Slide, "slide"),
+        ] {
+            let settings = Settings {
+                page_turn_animation_style: style,
+                ..Settings::default()
+            };
+            let value = serde_json::to_value(&settings).unwrap();
+            assert_eq!(value["page_turn_animation_style"], serde_json::json!(wire));
+            let restored: Settings = serde_json::from_value(value).unwrap();
+            assert_eq!(restored.page_turn_animation_style, style);
+            assert_eq!(
+                restored.preferences_snapshot().page_turn_animation_style,
+                style
+            );
+        }
+        for invalid in [
+            serde_json::json!("future_style"),
+            serde_json::json!("Slide"),
+            serde_json::json!(true),
+            serde_json::json!(0),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                serde_json::from_value::<Settings>(serde_json::json!({
+                    "page_turn_animation_style": invalid,
+                }))
+                .is_err()
+            );
+        }
     }
 
     #[test]

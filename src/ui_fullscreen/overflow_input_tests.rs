@@ -2,9 +2,10 @@
 use super::*;
 use crate::ring_shortcut::{RightDragContext, RightDragMode};
 
-const STATES: [FsOverflowPanelState; 5] = [
+const STATES: [FsOverflowPanelState; 6] = [
     FsOverflowPanelState::Root,
     FsOverflowPanelState::NavigatorPosition,
+    FsOverflowPanelState::PageTurnAnimation,
     FsOverflowPanelState::SpreadAdjustment,
     FsOverflowPanelState::Slideshow,
     FsOverflowPanelState::MusicNoteColor,

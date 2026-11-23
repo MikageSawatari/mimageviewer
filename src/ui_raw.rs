@@ -32,7 +32,7 @@ pub(crate) fn draw_settings(ui: &mut egui::Ui, settings: &mut crate::settings::S
         let label = ui.label("同時現像数:");
         ui.add(
             egui::DragValue::new(&mut settings.raw_develop_parallelism)
-                .range(1..=10)
+                .range(1..=crate::settings_transfer::stage1::RAW_PARALLELISM_MAX)
                 .suffix(" 枚"),
         )
         .labelled_by(label.id);

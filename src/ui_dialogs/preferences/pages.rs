@@ -7552,7 +7552,7 @@ pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) 
             ui.add_enabled(
                 !current_auto,
                 egui::DragValue::new(&mut state.manual_threads)
-                    .range(1..=64)
+                    .range(1..=crate::settings_transfer::stage1::PARALLELISM_MAX)
                     .suffix(" スレッド"),
             )
             .labelled_by(manual.id);
@@ -7616,7 +7616,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let label = ui.label("後方（前の画像）:");
             ui.add(
                 egui::DragValue::new(&mut s.prefetch_back)
-                    .range(0..=50usize)
+                    .range(0..=crate::settings_transfer::stage1::PREFETCH_MAX)
                     .suffix(" 枚"),
             )
             .labelled_by(label.id);
@@ -7625,7 +7625,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let label = ui.label("前方（次の画像）:");
             ui.add(
                 egui::DragValue::new(&mut s.prefetch_forward)
-                    .range(0..=50usize)
+                    .range(0..=crate::settings_transfer::stage1::PREFETCH_MAX)
                     .suffix(" 枚"),
             )
             .labelled_by(label.id);
@@ -7647,7 +7647,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let label = ui.label("後方（前のページ）:");
             ui.add(
                 egui::DragValue::new(&mut s.thumb_prev_pages)
-                    .range(0..=20u32)
+                    .range(0..=crate::settings_transfer::stage1::THUMB_PREFETCH_MAX)
                     .suffix(" ページ"),
             )
             .labelled_by(label.id);
@@ -7656,7 +7656,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let label = ui.label("前方（次のページ）:");
             ui.add(
                 egui::DragValue::new(&mut s.thumb_next_pages)
-                    .range(0..=20u32)
+                    .range(0..=crate::settings_transfer::stage1::THUMB_PREFETCH_MAX)
                     .suffix(" ページ"),
             )
             .labelled_by(label.id);
@@ -7675,7 +7675,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let label = ui.label("後方（前の画像）:");
             ui.add(
                 egui::DragValue::new(&mut s.ai_upscale_prefetch_back)
-                    .range(0..=10usize)
+                    .range(0..=crate::settings_transfer::stage1::AI_PREFETCH_MAX)
                     .suffix(" 枚"),
             )
             .labelled_by(label.id);
@@ -7684,7 +7684,7 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let label = ui.label("前方（次の画像）:");
             ui.add(
                 egui::DragValue::new(&mut s.ai_upscale_prefetch_forward)
-                    .range(0..=10usize)
+                    .range(0..=crate::settings_transfer::stage1::AI_PREFETCH_MAX)
                     .suffix(" 枚"),
             )
             .labelled_by(label.id);
@@ -7780,17 +7780,28 @@ pub(super) fn page_prefetch(ui: &mut egui::Ui, state: &mut PreferencesState) {
 /// ⚠ 長辺は `crate::app::MAX_TEXTURE_DIM` (8192) 以下に保つこと。render-to-target
 /// 後も最終合成バッファは GPU テクスチャ上限内に収める。
 /// 6144 / 8192 クラスは結合見開きスキャンなど大判向けの高負荷オプション。
-const AI_SIZE_LIMIT_OPTIONS: [(u32, u32, &str); 9] = [
-    (512, 512, "512 x 512 未満"),
-    (1024, 1024, "1024 x 1024 未満"),
-    (2048, 1024, "2048 x 1024 未満"),
-    (2048, 2048, "2048 x 2048 未満"),
-    (4096, 2048, "4096 x 2048 未満"),
-    (4096, 4096, "4096 x 4096 未満 (高負荷)"),
-    (6144, 4096, "6144 x 4096 未満 (超高負荷)"),
-    (8192, 4096, "8192 x 4096 未満 (超高負荷)"),
-    (8192, 8192, "8192 x 8192 未満 (超高負荷)"),
+const AI_SIZE_LIMIT_LABELS: [&str; 9] = [
+    "512 x 512 未満",
+    "1024 x 1024 未満",
+    "2048 x 1024 未満",
+    "2048 x 2048 未満",
+    "4096 x 2048 未満",
+    "4096 x 4096 未満 (高負荷)",
+    "6144 x 4096 未満 (超高負荷)",
+    "8192 x 4096 未満 (超高負荷)",
+    "8192 x 8192 未満 (超高負荷)",
 ];
+#[cfg(test)]
+const AI_SIZE_LIMIT_OPTIONS: [(u32, u32, &str); 9] = {
+    let mut values = [(0, 0, ""); 9];
+    let mut index = 0;
+    while index < values.len() {
+        let pair = crate::settings_transfer::stage1::AI_SIZE_OPTIONS[index];
+        values[index] = (pair.0, pair.1, AI_SIZE_LIMIT_LABELS[index]);
+        index += 1;
+    }
+    values
+};
 
 /// 「長辺 x 短辺 未満」候補のコンボボックスを描画し、選択が変わったら Some を返す。
 /// 現在値が候補に無い場合 (旧設定の読み替え値等) は現在値をそのまま表示する。
@@ -7800,17 +7811,21 @@ fn ai_size_limit_combo(
     current: crate::ai::upscale::AiProcessSizeLimit,
     label: egui::Id,
 ) -> Option<crate::ai::upscale::AiProcessSizeLimit> {
-    let selected_label = AI_SIZE_LIMIT_OPTIONS
+    let selected_label = crate::settings_transfer::stage1::AI_SIZE_OPTIONS
         .iter()
-        .find(|(long, short, _)| *long == current.long_edge_px && *short == current.short_edge_px)
-        .map(|(_, _, label)| (*label).to_string())
+        .zip(AI_SIZE_LIMIT_LABELS)
+        .find(|((long, short), _)| *long == current.long_edge_px && *short == current.short_edge_px)
+        .map(|(_, label)| label.to_string())
         .unwrap_or_else(|| format!("{} 未満", current.label()));
     let mut picked = None;
     egui::ComboBox::from_id_salt(id)
         .selected_text(selected_label)
         .width(200.0)
         .show_ui(ui, |ui| {
-            for (long, short, label) in AI_SIZE_LIMIT_OPTIONS {
+            for (&(long, short), label) in crate::settings_transfer::stage1::AI_SIZE_OPTIONS
+                .iter()
+                .zip(AI_SIZE_LIMIT_LABELS)
+            {
                 let is_sel = long == current.long_edge_px && short == current.short_edge_px;
                 if ui.selectable_label(is_sel, label).clicked() && !is_sel {
                     picked = Some(crate::ai::upscale::AiProcessSizeLimit {
@@ -7843,9 +7858,12 @@ pub(super) fn page_gpu_memory(ui: &mut egui::Ui, state: &mut PreferencesState) {
         ui.horizontal(|ui| {
             let label = ui.label("上限:");
             ui.add(
-                egui::Slider::new(&mut s.gpu_memory_percent, 0..=100u32)
-                    .step_by(5.0)
-                    .suffix(" %"),
+                egui::Slider::new(
+                    &mut s.gpu_memory_percent,
+                    0..=crate::settings_transfer::stage1::GPU_MEMORY_PERCENT_MAX,
+                )
+                .step_by(5.0)
+                .suffix(" %"),
             )
             .labelled_by(label.id);
         });
@@ -8346,9 +8364,13 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
             let label = ui.label("時間しきい値 (decode + display の合計がこれ以上ならキャッシュ):");
             ui.add(
-                egui::Slider::new(&mut s.cache_threshold_ms, 10..=100)
-                    .step_by(5.0)
-                    .suffix(" ms"),
+                egui::Slider::new(
+                    &mut s.cache_threshold_ms,
+                    crate::settings_transfer::stage1::CACHE_THRESHOLD_MIN_MS
+                        ..=crate::settings_transfer::stage1::CACHE_THRESHOLD_MAX_MS,
+                )
+                .step_by(5.0)
+                .suffix(" ms"),
             )
             .labelled_by(label.id);
             ui.label("  小さいほど多くキャッシュ。25 ms 推奨。");
@@ -8362,9 +8384,15 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
             let mut size_mb = (s.cache_size_threshold_bytes as f64) / 1_000_000.0;
             if ui
                 .add(
-                    egui::Slider::new(&mut size_mb, 0.5..=10.0)
-                        .step_by(0.5)
-                        .suffix(" MB"),
+                    egui::Slider::new(
+                        &mut size_mb,
+                        (crate::settings_transfer::stage1::CACHE_THRESHOLD_MIN_BYTES as f64
+                            / 1_000_000.0)
+                            ..=(crate::settings_transfer::stage1::CACHE_THRESHOLD_MAX_BYTES as f64
+                                / 1_000_000.0),
+                    )
+                    .step_by(0.5)
+                    .suffix(" MB"),
                 )
                 .labelled_by(label.id)
                 .changed()
@@ -8425,7 +8453,11 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     let label = ui.label("容量上限:");
                     ui.add(
                         egui::DragValue::new(&mut edit_preview_limit_mb)
-                            .range(100..=100_000u64)
+                            .range(
+                                (crate::settings_transfer::stage1::EDIT_CACHE_MIN_BYTES / 1_000_000)
+                                    ..=(crate::settings_transfer::stage1::EDIT_CACHE_MAX_BYTES
+                                        / 1_000_000),
+                            )
                             .speed(100.0)
                             .suffix(" MB"),
                     )
@@ -8523,7 +8555,12 @@ pub(super) fn page_cache(ui: &mut egui::Ui, state: &mut PreferencesState) {
                     let label = ui.label("上限:");
                     ui.add(
                         egui::DragValue::new(&mut limit_mb)
-                            .range(1..=1_000_000u64)
+                            .range(
+                                (crate::settings_transfer::stage1::ARCHIVE_CACHE_MIN_BYTES
+                                    / 1_000_000)
+                                    ..=(crate::settings_transfer::stage1::ARCHIVE_CACHE_MAX_BYTES
+                                        / 1_000_000),
+                            )
                             .speed(100.0)
                             .suffix(" MB"),
                     )
@@ -9340,7 +9377,7 @@ fn draw_audio_normalize_cache_controls(ui: &mut egui::Ui, state: &mut Preference
 pub(super) fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
     use crate::settings::Vst3PluginEntry;
 
-    const MAX_CHAIN_LEN: usize = 10;
+    const MAX_CHAIN_LEN: usize = crate::settings_transfer::stage1::VST3_CHAIN_MAX_LEN;
 
     let mut scan_finished: Option<Result<Vec<crate::video::dsp::DiscoveredPlugin>, String>> = None;
     let mut scan_disconnected = false;
@@ -10039,21 +10076,14 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .on_hover_text("stack_rules.rhai を作成 (無ければ既定で) してエディタで開きます")
                 .clicked()
             {
-                match crate::filename_stack_script::ensure_user_script_exists() {
-                    Ok(path) => {
-                        let _ = opener::open(&path);
-                    }
-                    Err(e) => crate::logger::log(format!("stack script open failed: {e}")),
-                }
+                crate::filename_stack_script::enqueue_open_user_script();
             }
             if ui
                 .button("既定に戻す")
                 .on_hover_text("stack_rules.rhai を内蔵の既定スクリプトで上書きします")
                 .clicked()
             {
-                if let Err(e) = crate::filename_stack_script::reset_user_script() {
-                    crate::logger::log(format!("stack script reset failed: {e}"));
-                }
+                crate::filename_stack_script::enqueue_reset_user_script();
             }
             if ui.link("書き方をヘルプで見る").clicked() {
                 let url = crate::ui_helpers::manual_url("stack.html", None);
@@ -11292,6 +11322,7 @@ pub(super) fn page_spread_mode(ui: &mut egui::Ui, state: &mut PreferencesState) 
             ui,
             &mut state.settings.page_turn_animation_enabled,
             &mut state.settings.page_turn_animation_duration_ms,
+            &mut state.settings.page_turn_animation_style,
         );
     });
     anchored(ui, state, "spread/singleton-placement", |ui, state| {
@@ -12109,10 +12140,24 @@ pub(super) fn draw_page_turn_animation_setting(
     ui: &mut egui::Ui,
     enabled: &mut bool,
     duration_ms: &mut u32,
+    style: &mut crate::settings::PageTurnAnimationStyle,
 ) {
     ui.checkbox(enabled, "ページめくりアニメーション");
-    ui.small("単発のページ送りとスライドショーで紙をめくる効果。連打・読込待ち・連結読みには適用しません。");
+    ui.small("単発のページ送りとスライドショーでページが切り替わるときの効果。連打・読込待ち・連結読みには適用しません。");
     ui.add_enabled_ui(*enabled, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("動き:");
+            ui.radio_value(
+                style,
+                crate::settings::PageTurnAnimationStyle::Curl,
+                "めくる",
+            );
+            ui.radio_value(
+                style,
+                crate::settings::PageTurnAnimationStyle::Slide,
+                "スライド",
+            );
+        });
         let row_width = ui.available_width();
         ui.horizontal_wrapped(|ui| {
             let label = ui.label("時間");
@@ -12131,7 +12176,12 @@ pub(super) fn draw_page_turn_animation_setting(
 mod page_turn_animation_settings_tests {
     use super::*;
 
-    fn snapshot(name: &str, theme: crate::os_theme::ResolvedTheme, enabled: bool) {
+    fn snapshot(
+        name: &str,
+        theme: crate::os_theme::ResolvedTheme,
+        enabled: bool,
+        mut style: crate::settings::PageTurnAnimationStyle,
+    ) {
         let mut fonts_ready = false;
         let mut enabled = enabled;
         let mut duration_ms = 200;
@@ -12148,7 +12198,12 @@ mod page_turn_animation_settings_tests {
                         return;
                     }
                     egui::CentralPanel::default().show(root_ui, |ui| {
-                        draw_page_turn_animation_setting(ui, &mut enabled, &mut duration_ms);
+                        draw_page_turn_animation_setting(
+                            ui,
+                            &mut enabled,
+                            &mut duration_ms,
+                            &mut style,
+                        );
                     });
                 });
             });
@@ -12162,6 +12217,7 @@ mod page_turn_animation_settings_tests {
             "page_turn_animation_settings_light_on",
             crate::os_theme::ResolvedTheme::Light,
             true,
+            crate::settings::PageTurnAnimationStyle::Curl,
         );
     }
 
@@ -12171,6 +12227,17 @@ mod page_turn_animation_settings_tests {
             "page_turn_animation_settings_dark_off",
             crate::os_theme::ResolvedTheme::Dark,
             false,
+            crate::settings::PageTurnAnimationStyle::Curl,
+        );
+    }
+
+    #[test]
+    fn page_turn_animation_settings_snapshot_light_slide() {
+        snapshot(
+            "page_turn_animation_settings_light_slide",
+            crate::os_theme::ResolvedTheme::Light,
+            true,
+            crate::settings::PageTurnAnimationStyle::Slide,
         );
     }
 
@@ -12198,6 +12265,7 @@ mod page_turn_animation_settings_tests {
                             ui,
                             &mut settings.page_turn_animation_enabled,
                             &mut settings.page_turn_animation_duration_ms,
+                            &mut settings.page_turn_animation_style,
                         );
                         draw_singleton_spread_placement_setting(
                             ui,
@@ -12212,12 +12280,34 @@ mod page_turn_animation_settings_tests {
         harness.run();
         let first_label = "見開き先頭の単ページを片側に配置";
         let last_label = "見開き末尾の単ページを片側に配置";
+        for label in ["めくる", "スライド"] {
+            assert!(harness.get_by_label(label).accesskit_node().is_disabled());
+        }
         for enabled in [true, false] {
             harness.get_by_label("ページめくりアニメーション").click();
             harness.run();
             assert_eq!(harness.state().0.page_turn_animation_enabled, enabled);
             assert!(!harness.state().0.singleton_spread_first_enabled);
             assert!(harness.state().0.singleton_spread_last_enabled);
+            for label in ["めくる", "スライド"] {
+                assert_eq!(
+                    harness.get_by_label(label).accesskit_node().is_disabled(),
+                    !enabled
+                );
+            }
+            if enabled {
+                harness.get_by_label("スライド").click();
+                harness.run();
+            } else {
+                // A disabled radio cannot replace the saved Slide choice.
+                harness.get_by_label("めくる").click();
+                harness.run();
+            }
+            assert_eq!(
+                harness.state().0.page_turn_animation_style,
+                crate::settings::PageTurnAnimationStyle::Slide
+            );
+            assert_eq!(harness.state().0.page_turn_animation_duration_ms, 200);
             for (label, saved) in [(first_label, false), (last_label, true)] {
                 let node = harness.get_by_label(label).accesskit_node();
                 assert_eq!(node.is_disabled(), enabled);

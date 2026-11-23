@@ -1,4 +1,4 @@
-//! Agent reads and a shared UI admission bridge for open and metadata writes.
+//! Agent reads and a shared UI admission bridge for state, open and metadata writes.
 use std::path::Path;
 use std::sync::{
     Arc, Mutex,
@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use mimageviewer_agent_ipc::*;
 use serde::{Deserialize, Serialize};
 pub(crate) mod changes;
+pub(crate) mod favorite;
 mod folder;
 mod input_path;
 mod item_info;
@@ -22,6 +23,9 @@ pub(crate) mod open;
 mod open_response;
 mod rating;
 mod recent;
+mod stack_script;
+#[cfg(test)]
+mod stack_script_tests;
 mod status;
 pub(crate) use recent::{RecentApps, SharedRecentApps};
 mod collection_write;
@@ -34,6 +38,8 @@ use work::*;
 
 #[cfg(test)]
 mod compatibility_tests;
+#[cfg(test)]
+mod favorite_tests;
 #[cfg(test)]
 mod logging_tests;
 #[cfg(test)]
@@ -49,7 +55,11 @@ mod read_tests;
 #[cfg(test)]
 mod recent_tests;
 #[cfg(test)]
+mod settings_tests;
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod view_state_tests;
 
 pub(crate) struct Server {
     open: Arc<open::OpenController>,
@@ -301,6 +311,10 @@ const TRANSCRIPT_PERMISSION_MESSAGE: &str =
     "mIV の「設定」→「AI 連携…」で「文字起こしを AI に見せる」を ON にしてください";
 const OPEN_PERMISSION_MESSAGE: &str =
     "mIV の「設定」→「AI 連携…」で許可の範囲を「読み取りと、mIV で開く」以上にしてください";
+pub(crate) const CURRENT_VIEW_PERMISSION_MESSAGE: &str =
+    "mIV の「設定」→「AI 連携…」で「今開いている場所を AI に見せる」を ON にしてください";
+pub(crate) const SETTINGS_PERMISSION_MESSAGE: &str =
+    "mIV の「設定」→「AI 連携…」で「設定の確認と変更を AI に任せる」を ON にしてください";
 const ORGANIZE_PERMISSION_MESSAGE: &str =
     "mIV の「設定」→「AI 連携…」で許可の範囲を「整理まで」にしてください";
 
@@ -310,6 +324,15 @@ fn check_tool_permission(
     command: &Command,
 ) -> Result<(), AgentError> {
     let denied = match command {
+        Command::GetViewState if !snapshot.current_view => Some(CURRENT_VIEW_PERMISSION_MESSAGE),
+        Command::GetSettings { .. }
+        | Command::SetSettings { .. }
+        | Command::SetFavorite { .. }
+        | Command::StackScript { .. }
+            if !snapshot.settings =>
+        {
+            Some(SETTINGS_PERMISSION_MESSAGE)
+        }
         Command::GetThumbnail { .. } if !snapshot.thumbnails => Some(THUMBNAIL_PERMISSION_MESSAGE),
         Command::GetTranscript { .. } if !snapshot.transcripts => {
             Some(TRANSCRIPT_PERMISSION_MESSAGE)
@@ -562,7 +585,14 @@ impl Connection {
                     );
                     return;
                 }
-                if metadata_write::is_write(&request.command) {
+                if metadata_write::is_write(&request.command)
+                    || matches!(
+                        request.command,
+                        Command::SetSettings { .. }
+                            | Command::SetFavorite { .. }
+                            | Command::StackScript { .. }
+                    )
+                {
                     metadata_response::respond(
                         connection,
                         request.command,
@@ -687,6 +717,11 @@ fn tool_name(command: &Command) -> &'static str {
     match command {
         Command::Hello { .. } => "hello",
         Command::Status => "miv_status",
+        Command::GetViewState => "get_view_state",
+        Command::GetSettings { .. } => "get_settings",
+        Command::SetSettings { .. } => "set_settings",
+        Command::SetFavorite { .. } => "set_favorite",
+        Command::StackScript { .. } => "stack_script",
         Command::SearchItems { .. } => "search_items",
         Command::ListTags { .. } => "list_tags",
         Command::ItemsByTag { .. } => "items_by_tag",
@@ -753,6 +788,13 @@ fn result_summary(result: &Result<Payload, AgentError>) -> (usize, &'static str)
             "none",
         ),
         Ok(Payload::Opened(_)) => (1, "none"),
+        Ok(Payload::ViewState(_)) => (1, "none"),
+        Ok(Payload::Settings(page)) => (page.items.len(), "none"),
+        Ok(Payload::SettingsWrite(result)) => {
+            (result.changed.len() + result.unchanged.len(), "none")
+        }
+        Ok(Payload::FavoriteWrite(_)) => (1, "none"),
+        Ok(Payload::StackScript(_)) => (1, "none"),
         Ok(_) => (0, "none"),
         Err(e) => (
             0,
@@ -794,6 +836,11 @@ impl Handlers {
                 Err(error(ErrorCode::BadRequest, "接続の確認は受付で行います"))
             }
             Command::Status => self.status(ctx),
+            Command::GetViewState => self.open.execute_view_state(ctx).map(Payload::ViewState),
+            Command::GetSettings { query, keys, page } => self
+                .open
+                .execute_settings_read(query, keys, page, ctx)
+                .map(Payload::Settings),
             Command::ListTags {
                 choice,
                 limit,
@@ -947,6 +994,9 @@ impl Handlers {
             | Command::RemoveFromCollection { .. }
             | Command::AddTags { .. }
             | Command::RemoveTags { .. }
+            | Command::SetSettings { .. }
+            | Command::SetFavorite { .. }
+            | Command::StackScript { .. }
             | Command::SetRating { .. } => {
                 unreachable!()
             }

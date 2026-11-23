@@ -1,0 +1,347 @@
+# §1.793 ツールバーのドライブ欄 (ドライブ別の前回の場所を常設ボタンから開く) — 設計
+
+- 状態: **実装済み (2026-11-23)。独立設計レビュー ACCEPT、利用者判断済み (すべて推奨案)、独立コードレビュー ACCEPT (GPT-6.1 Sol / xhigh、3 回目)、関連テスト 330 件・ui_snapshot 270 件成功、build-dev 済み。実機確認待ち・master 未取り込み**。v5.7.0 候補。
+- ブランチ: `drive-tabs-793` (worktree `G:\home\mimageviewer-drivetabs793`)。
+- 出どころ: 5ch [>>785](https://egg.5ch.io/test/read.cgi/software/1782419551/785)・[>>787](https://egg.5ch.io/test/read.cgi/software/1782419551/787)。
+  >>786 で「C: や D: をツールバーに常設し、クリックでそのドライブの最後のフォルダへ戻る」と確認し、
+  >>787 でそのイメージだと返答があった ([backlog-on-hold.md §1.793](backlog-on-hold.md))。場所▼やツリーのドライブ選択の話ではない。
+  一覧カーソルを前回位置へ戻す件は別要望 (本体 §1.795) で、本書の範囲外。
+
+## 1. 現状 (コード)
+
+- 記録: A/B のクイックフォルダごとに `QuickFolderWorkspace::drive_current_dirs: BTreeMap<String, PathBuf>`
+  (`src/app.rs`) を持ち、`Settings::quick_folder_drive_current_dirs: [BTreeMap; 2]` へ保存する (リリース済み)。
+  キーは `"C:"` 形式。`update_active_quick_folder_target` (`src/app.rs`) が、主一覧の履歴記録のたびに、
+  アクティブなスロットの、そのドライブのキーへ移動先を上書きする。合成ビューのパスは記録しない。
+  移動先は履歴の `Path` なので、フォルダのほかに ZIP / PDF / 変換書庫などの**コンテナのパスも入る**。
+  UNC (`\\server\share`) はドライブ文字が無いので記録されない (`drive_current_key_for_path`)。
+- 既存のキー操作 (操作カスタマイズ、既定キーなし):
+  - `GridSwitchDriveC..Z` 「ドライブ X: の最後の場所へ切り替える」→ `apply_switch_drive_letter`
+    (`src/app/gamepad_input.rs`)。アクティブなスロットの記録を `resolve_openable_path` で解決し
+    (消えていれば存在する最も近い親、同じドライブに限る)、無ければルート、ルートも無ければ
+    「ドライブが見つかりません」。結果を `LocationJump(Physical)` の候補にする。
+  - `GridOpenDriveC..Z` 「ドライブ X: のルートを開く」→ `apply_ring_drive_letter`、
+    `GridOpenCurrentDriveRoot` → `apply_current_drive_root`。どちらもルートを同じく解決して `LocationJump`。
+  - リング・ゲームパッドからも同じ関数に入る (`apply_location_navigation_key_action`)。
+- **UI スレッドの I/O (既存)**: 上の 3 関数は、候補を作る時点で `resolve_openable_path` (`is_dir` / `is_file`
+  を親へさかのぼって呼ぶ) を UI スレッドで実行する。さらに検索の外では `dispatch_location_jump` →
+  `dispatch_plain_location_jump(.., DirectoryScanRoute::UiThread)` でフォルダ走査も UI スレッドで行う
+  (§1.853 の「場所の移動」経路、共有メモ `ui-thread-scan-routes-20261122.md`)。切断されたネットワーク
+  ドライブでは OS が諦めるまで UI が止まり得る。お気に入りは §1.805 で `DirectoryScanRoute::Worker`
+  (`AddressBarNav::WorkerFavorite`) に寄せ済み。
+- ツールバー: セクションは `ToolbarSectionId` (`src/settings.rs`)、表示は `show_toolbar_*`、並びは
+  `toolbar_section_order` + `ordered_with_fallback` (保存順に無い新セクションは末尾)。描画は
+  `src/ui_main.rs` のツールバー関数で、お気に入りの項目クリックは `toolbar_fav_nav` → Worker 走査。
+  操作の約束事は [toolbar-customization-plan.md](toolbar-customization-plan.md) §1.1〜1.2 (項目の左クリック =
+  安全な操作、セクション見出しの右クリック = そのセクションの設定、空き領域の右クリック = 表示するセクション)。
+- 接続中のドライブの列挙は `known_folders::available_drives()` (`GetLogicalDrives` + `GetDriveTypeW`)。
+  ドライブ一覧ビュー・フォルダペイン (1.5 秒間隔) ・場所▼ (開いたとき 1 回) が UI スレッドで呼ぶ既存例外が
+  ある ([ui-responsiveness.md](ui-responsiveness.md) §4 の場所▼の節: 毎フレームの再解決は禁止)。
+
+## 2. 決めたこと (推奨案)
+
+### 2.1 出すドライブ: A/B の記録があるドライブ (案 D1、推奨・利用者判断 Q1)
+
+- ドライブ欄に並べるのは、**A と B のどちらかに「最後の場所」の記録があるドライブ**の和集合。文字順に並べる。
+  描画は `quick_folder_workspaces[*].drive_current_dirs` のキーだけを読み、**ファイルシステムにも
+  ドライブ列挙にも触らない** (毎フレームでも I/O ゼロ、新しい非同期状態もゼロ)。
+- 今いるドライブは移動のたびに記録されるので、自然に欄へ入る。初めて開いたドライブは、そのとき欄へ加わる。
+  例外: アクティブなスロットが明示的に無い (`active_quick_folder_slot == None`、保存・復元される既存の状態) 間は
+  記録が更新されないので、今いるドライブでも記録が無ければ欄に出ない。欄のために特別に足すことはしない
+  (記録の所有者を 1 つに保つ)。キーは `"C:"` 形式だけを採用し、小文字・不正なキーは欄に出さない (読むときに
+  `drive_current_key_for_letter` で正規化できるものだけ)。UNC は記録されないので欄に出ない。
+  変換書庫を表示中は、記録されるのは元の書庫の場所 (元ドライブ) なので、欄も元ドライブに付く。
+- 記録の和集合にする理由: A/B を切り替えるたびに欄の並びが変わらないようにするため。押したときに使う記録は
+  キー操作と同じく**アクティブなスロットの記録**で、そのスロットに記録が無ければルートを開く (2.3)。
+- 表示は `C:` のようなドライブ文字だけ。ボリューム名は取得しない (I/O になるため。ドライブ一覧ビューと同じ)。
+- 外した USB・切断したネットワークドライブも記録が残る限り欄に出る。存在は押したときに worker で確かめる (2.3)。
+  不要になったドライブは右クリックの「一覧から外す」で記録ごと消す (2.5)。
+- 比較した案 D2 (接続中のドライブを出す): エクスプローラーに近いが、UI スレッドで列挙しないためには
+  列挙 worker と更新の契機 (起動時・窓が前面に戻ったとき・移動の完了時など) を持つ新しい状態が要る。
+  空のカードリーダーや光学ドライブ、使わない回復用パーティションも並ぶので、隠す設定も欲しくなる。
+  「最後の場所へ戻る」という要望には記録の無いドライブは不要で、状態を増やさない D1 を推す。
+  周期的な起床は入れない方針 (idle の CPU) なので、D2 を採っても USB の抜き差しはすぐには反映されない。
+
+### 2.2 置き場所と表示設定
+
+- 新しいツールバーセクション `ToolbarSectionId::Drives`、見出し「ドライブ:」。表示は
+  `Settings::show_toolbar_drives: bool`、**既定は非表示** (`#[serde(default)]` = false)。
+  ツールバーの空き領域の右クリック (表示するセクションのチェック) から表示する。既定で出さない理由:
+  多くの利用者には新しいボタンが増えるだけで、キー操作の代替が既にある。
+- 既定の並びはお気に入りの直前 (場所へ移るセクションの並び)。`default_order()` に `Favorites` の直前で加える。
+  既存の保存順 (`toolbar_section_order` は移行済みで全セクションを持つ) には `Drives` が無いので、
+  `ordered_with_fallback` が `Drives` だけは末尾ではなく `Favorites` の直前へ差し込む
+  (`Favorites` も無い壊れた保存順なら末尾。空の保存順は正常な既定値なので既定順のまま)。保存順に `Drives` が
+  明示されていればその位置を守る。ほかのセクションの相対順と、セクション ID に付く `new_row` は変えない。
+  保存順はドラッグ並べ替えで初めて書き直されるので、移行フラグは要らない。ほかのセクションの末尾追加の規則
+  (Collections の既存テスト) は変えない。ツールバーの既定復元と、環境設定 OK 後の live 値の引き継ぎでも
+  `show_toolbar_drives` を保つ。
+- 表示形式は「展開 (ボタンを並べる)」だけ。プルダウン・折りたたみは設けない (表示形式の設定を増やさない。
+  ドライブは多くても数個)。見出しの右クリックには既存の共通項目 (行頭に表示、ドラッグ並べ替えなど
+  `draw_section_settings_menu` が全セクションに出すもの) だけを出す。
+- 本体のメインウィンドウのツールバーだけ。別ウィンドウ (detached)、フルスクリーン、mIV Remote には出さない。
+  Remote の IPC は変わらない。
+
+### 2.3 押したとき: キー操作と同じ関数で、行き先解決とディレクトリ走査を worker へ (案 B1、推奨・利用者判断 Q2)
+
+- ボタンの左クリックは `GridSwitchDrive{X}` と**同じ関数**を呼ぶ。今の `apply_switch_drive_letter` を
+  次の形に作り直し、キー・リング・ゲームパッド・ツールバーの全入口で共有する
+  (ルートを開く `GridOpenDrive{X}` と `GridOpenCurrentDriveRoot` も同じ仕組みに載せる)。
+  1. UI スレッドでは、メモリの値だけから**解決要求**を作る (R2、レビュー P2 対応で形を変更):
+     ```text
+     DriveJumpRequest =
+       LastLocation { drive_key, remembered: Option<PathBuf> }   // GridSwitchDrive{X}・ドライブ欄
+       Root { path, origin: DriveLetter(drive_key) | CurrentLocation }  // GridOpenDrive{X}・GridOpenCurrentDriveRoot
+     ```
+     `Root { origin: CurrentLocation }` の `path` は今の `current_location_root()` が返すもの (UNC・VerbatimUNC の
+     共有ルート、変換書庫を表示中は `archive_source_override` による元ドライブを含む) をそのまま運ぶ。
+     スナップショット中の拒否 (`location_jump_snapshot_blocked`) は今と同じくここで行う。
+  2. 短命の worker で、今の解決規則と同じ純関数 `resolve_drive_jump(request) -> DriveJumpResolution` を実行する。
+     結果は `resolve_openable_path_detailed` の**種類 (`OpenablePathKind`) ごと**返す:
+     - `LastLocation`: 記録 → `resolve_openable_path_detailed` (結果が同じドライブのときだけ採用。消えていれば
+       存在する最も近い親になるが、このときは**警告しない**のが今の動き) → 記録が無い・解決できない・別ドライブ
+       になったらルート (記録があったときだけ「最後の場所が見つかりません。ルートへ移動します」) →
+       ルートも無ければ「ドライブが見つかりません」。
+     - `Root`: ルートを解決。失敗時の文言は origin ごとに今と同じ (「ドライブが見つかりません」/
+       「ルートディレクトリが見つかりません」)。
+  3. 完了を受け取ったフレームで、解決済みのパスと種類を**既存の移動経路**へ渡す。種類を捨てて UI でファイル／ディレクトリを再判定しない
+     (レビュー P2: `WorkerFavorite` は `classified_kind: None` で loader に入り、Worker 走査の判定より前に
+     `path.is_file()` を UI で呼ぶため、そのままは使わない)。検索の外は
+     `open_direct_navigation_target_classified(.., classified_kind = Some(kind), .., DirectoryScanRoute::Worker)`
+     相当。**検索中も**種類・受付時に捕まえた移動票 (`MainListNavigation`)・`MainListRequestStage::Continuation` を
+     保ったまま、検索を抜ける既存の移動 (`begin_context_jump_to_folder` の行き先を拡張子ではなく解決済みの種類で
+     決める: ディレクトリ → `PhysicalDirectory`、コンテナ → `ArchiveContainer`) へ渡す (R3、レビュー P1 対応:
+     今の `begin_location_jump_to_physical` はパスだけを受け取り拡張子で振り分け、コンテナ側は移動票を取り直して
+     `Admission` / `UiThread` / `classified_kind: None` へ戻るため、UI の stat が残り、`x.pdf` という名前の実
+     ディレクトリでは UI 走査にもなり得る)。履歴の目的は今と同じ `ExitTemporaryView`、検索は移動が成功したとき
+     だけ終える既存の契約を保つ。以後の調停・履歴は既存のまま。ディレクトリは、解決完了から Worker 走査開始まで
+     UI の stat／走査が無いことを、検索の外と検索中の両方でテスト用の backend で確かめる。
+- **既存コンテナ経路に残る UI I/O (今回の修正対象外)**: 上の種類の引き継ぎは、コンテナを開く処理全体から
+  同期 I/O を除いたという意味ではない。次の既存処理は残り、保存先・ネットワーク・外付け機器・DB の状態などに
+  よって UI が止まり得る既知の制限として扱う。今回はこれらを修正しない。
+  - PDF: `load_pdf_as_folder_with_prepared_pages_and_restore` は `prepared_pages == None && allow_placeholder` のとき
+    `peek_pdf_meta_cache` を UI で呼ぶ。通常 PDF はそこで対象ファイルの `std::fs::metadata` を **1 回**行う。
+    この stat は warm catalog／メタキャッシュの hit 判定より前なので、**warm miss でも発生する**。
+    prepared-pages 経路、または placeholder を許可しない場合はこの照会を省く。EPUB の pinned stamp 経路も
+    通常 PDF の stat とは別であり、全 PDF／EPUB 入口共通の I/O とはしない。SmartFolder の PDF preflight にも
+    `allow_placeholder` 時の同じ照会が残る (`src/app.rs`、`src/app/smart_folder.rs`)。
+  - 通常の主一覧の ZIP: staged `physical-history-preflight` が変換キャッシュ検証と列挙を worker で行う。
+    ただし列挙後の `prepare_zip_grid_with_nav` は、pin DB があり内部ディレクトリのキーがあれば UI で
+    `lookup_many` の SQLite SELECT を行う。さらに内部 `ZipDir` pin (`zip_rel` が空) は cascade resolver の
+    `metadata` へ届く。内部 `ZipEntry` pin は metadata 取得を `(0, 0)` を返す closure へ差し替えて、この stat を省く。これら表示準備の I/O と、
+    worker の ZIP 列挙・キャッシュ検証を区別する (`src/app.rs`、`src/folder_thumb_pins.rs`)。
+  - 変換書庫: SmartFolder の非 RAR 変換書庫など、既存の `try_archive_cache_lookup` を UI から通る経路では、
+    cache DB があれば元ファイルの `metadata` と DB 照会が残る。取得した行の stamp が一致すればキャッシュ ZIP の
+    `exists`、不一致なら古いキャッシュファイルの削除、有効性に応じて DB の DELETE／最終アクセス UPDATE も行う。
+    通常の主一覧の staged preflight はこれらのキャッシュ検証を worker で行い、prepared／proven な ZIP の受け渡しでは
+    再照会を省くため、変換キャッシュ ZIP を含む全 ZIP 入口が UI で照会するわけではない
+    (`src/ui_dialogs/archive_convert.rs`、`src/archive_cache.rs`、`src/app/collection_navigation.rs`)。
+- **要求の所有 (R2、レビュー P1 対応)**: 解決中の要求は、主一覧の要求の一覧 (`MainListRequestKind` /
+  `MainListRequestOwner` と `retire_replaced_main_list_requests`) に**新しい所有者として参加**させる。
+  独立した pending と「一覧の印が現在か」だけでは、先に始まった別の移動 (例: お気に入りの走査) との前後関係を
+  判定できないため。
+  - 入力候補が既存の調停で勝った時点で受付 (admission) を行い、他の未採用の要求 (走査中のお気に入り・ツリーの open など) を既存の
+    退役処理で退ける。逆に、解決中に別の移動が受け付けられたら、その退役処理がドライブ要求も退ける。
+    ツールバー由来の候補はツールバーのお気に入りと同じ優先順位、キー・リング・ゲームパッド由来は既存のキー／パッドの優先順位を保つ。
+  - 解決が終わったら、同じ要求のまま走査 (`folder_pane_open_pending`) やコンテナの open へ**引き継ぐ**
+    (retained owner の受け渡し)。新しい受付をやり直さない。
+  - 置き換え: 後から押したドライブが前の要求を退ける (連打は最後だけ)。Remote が操作権を取ったときの
+    退役 (`src/app.rs` の Remote 取得時の処理) にも入る。A/B 切替・「場所の記憶を消す」・検索の開始／終了も
+    既存の退役の経路に乗せる。終了時に worker を待たない。
+  - 共通の退役処理を通らない受付の境界にも入れる (R3、レビュー P2 対応): `claim_open_request_owner_with_startup_intent`
+    (`src/app.rs`、直接 open の受付) と `start_folder_nav` (Ctrl+↑↓ 等の隣のフォルダへの移動の受付) は、
+    `direct_navigation_scan_pending()` のときだけ直接移動の走査を取り消している。この 2 か所の成功した受付でも
+    ドライブ要求を退ける (取り消しを 1 つの helper にまとめ、両方の場所から呼ぶ)。隣のフォルダへの移動の連打の
+    積み上げなど、既存の受付条件は変えない。helper は `claim_open_request_owner_with_startup_intent` の主 context の
+    所有判定を保ち、ドライブ要求自身の引き継ぎ (Continuation) では自分を退けない。退けるのは後から来た別の受付だけ。
+- **全画面からの操作 (R2〜R3、レビュー P4・R2 の P2 対応)**: リング・ゲームパッドのドライブ操作は、画像の全画面と
+  linked F12 の別窓からも届く (場所移動は全リング文脈で有効、linked の別窓は主一覧を映している)。この到達範囲は
+  変えない。今は解決が成功したときだけ全画面を閉じ、失敗なら全画面のまま警告する。非同期にすると「要求の前から
+  開いていた全画面」と「要求の後に開いた全画面」を区別する状態が要るので、**入力候補を作る前に全画面を閉じきる**。
+  閉じる手順は既存の saved-group の操作 (`src/app/gamepad_input.rs` の `saved_group_key_action` の分岐) と同じ:
+  1. スナップショット・モーダル・Remote の操作権など、拒否の判定を先に行う (拒否なら何も閉じない)。
+  2. 全画面 (linked F12 を含む、主一覧を映す viewer) が開いていれば `close_fullscreen_to_completion` で閉じきる。
+     `close_fullscreen` は動画の表示切り替えの途中だと `TerminalClose` を積んで戻るだけなので使わない。
+  3. 閉じたことを確かめ直す。閉じられなければ「全画面を閉じられなかったため移動できませんでした」と警告し、
+     要求を作らず、他の要求も退けない。
+  4. 入力候補を返し、既存の入力調停で選ばれたときに主一覧の移動票を捕まえ、要求を受け付けて他の要求を退ける。
+  調停で負けた候補でも、閉じた全画面は閉じたままにする。旧 `location_jump_nav` も候補を返す前に全画面を
+  閉じており、この点は従来と同じ (P3-2)。敗者は要求を受け付けず、既存の主一覧要求も退けない。
+  これで解決中は必ず主一覧が前面にあり、完了時に全画面が開いていれば、それは要求の後に利用者が開いたものなので
+  結果を捨てる。リリース済みの挙動の変化は「存在しないドライブを全画面から指定したとき、全画面が閉じてから
+  警告が出る」だけ (利用者判断 Q2 に含める)。ほかの文脈 (独立の別窓を含む) は、各文脈の既存の受付条件をそのまま
+  保ち、文脈の分類だけを理由に新しい拒否を足さない。完了の poll は全画面中の早期 return より前の、毎フレーム必ず通る root の処理に置く。
+- 待機表示: 解決は普通のディスクなら即座に終わる。遅いのは切断したネットワークドライブなどで、その間も
+  既存の直接移動の待機表示 (500 ms 後) と同じ見せ方にする。走査が続けば走査の待機表示へ引き継がれる。
+  専用の進捗表示は作らない。
+- perf: `nav/drive_jump_resolve` (ms、kind、outcome = target / fallback / missing / stale) を worker の結果に置く。
+- 比較した案:
+  - **案 A (ツールバーから今の `apply_switch_drive_letter` をそのまま呼ぶ)**: 追加が最小で、キーと完全に同じ。
+    ただし新しい入口が UI スレッドの stat と走査を引き継ぎ、[ui-responsiveness.md](ui-responsiveness.md) §4 に反する。
+    ボタンは記録の残った外付け・ネットワークドライブを押されやすい (2.1)。採らない。
+  - **案 C (ツールバーだけ worker にし、キーは今のまま)**: 同じ意味の操作が 2 つの実装に分かれる。採らない。
+  - **案 B2 (解決を既存のフォルダ走査 worker (`folder_pane_open_pending`) の中で行う)**: 待ちが 1 つにまとまるが、
+    走査は ディレクトリ専用で、記録がコンテナだった場合に走査の結果へ「開かずに返す」分岐を足すことになる。
+    検索中の `JumpToPhysicalFolder` と検索外の `DirectNavigation` の両方の目的に解決を通す必要もある。
+    解決を先に済ませ、種類が分かってから既存の経路へ流す B1 のほうが既存の調停を変えない。
+- キー操作への影響 (リリース済みの挙動): 結果が同じフレームではなく数フレーム後に出る (普通のディスクでは
+  見た目の差はほぼ無い)。検索の外ではディレクトリ走査が worker になり、お気に入りと同じ待ち方になる。
+  行き先解決とディレクトリ走査による UI 停止を避ける変更で、コンテナ経路に上記の同期 I/O が残る。
+  移動先の規則・警告文・履歴の付き方は変えない。
+
+### 2.4 今いるドライブの見せ方
+
+- 主一覧が実フォルダ (またはそのドライブ上の書庫・PDF など) を表示しているとき、そのドライブのボタンを
+  選択状態 (`selectable_label(true, ..)`、お気に入りの「今いる場所」と同じ見せ方) で描く。
+- 検索結果・★一覧・タグ・閲覧履歴・ドライブ一覧・スナップショットなどの合成一覧では、どのボタンも選択状態にしない。
+- 今いるドライブのボタンを押すと、キー操作と同じく記録 (= 今の場所) を開き直す。特別扱いしない。
+- ツールチップ: アクティブなスロットの記録のパス (例「D:\photos\2026」)。記録が無ければ
+  「記録なし (ルートを開きます)」。A/B のどちらの記録かは書かない (常にアクティブ側を使うため)。
+
+### 2.5 右クリック (利用者判断 Q3)
+
+- ボタン (項目) の右クリックで小さなメニューを出す (★ と同じ例外扱い、推奨):
+  - 「ルートを開く」: `GridOpenDrive{X}` と同じ (2.3 の `Root`)。
+  - 「一覧から外す」: そのドライブの記録を **A と B の両方から**消して保存する
+    (`sync_quick_folder_settings`)。キー操作もルートを開くようになる (記録が無いときの既存の動き)。
+    今いるドライブでは押せない (消してもすぐ次の移動で記録されるため)。確認ダイアログは出さない
+    (消えるのは最後の場所の記録だけで、そのドライブを開けば再び記録される)。
+    既に受け付けた、そのドライブへの移動 (解決中・走査中) は取り消さない。それが成功すれば、そのドライブを
+    開いたことになるので記録は再び作られる (通常の記録の規則どおり)。
+- [toolbar-customization-plan.md](toolbar-customization-plan.md) §1.1 の「項目の右クリック = 変更操作の直接実行、
+  メニューを出さない」の例外にする。理由: 直接実行に向く変更操作が無く、「一覧から外す」を右クリック一発で
+  実行すると誤操作で消えるため。代案は「見出しの右クリックに『一覧から外す ▶ D: / E:』を置き、項目の
+  右クリックは何もしない」。
+- 既存の「場所の記憶を消す」(`clear_quick_folder_slots`) は記録を全部消すので、ドライブ欄も今いるドライブ
+  だけになる。追加の処理は要らない。
+
+## 3. 状態の組み合わせを減らす検討 (CLAUDE.md「設計の簡素化」)
+
+- **採用**: ドライブの集合を、既にある 1 つの所有者 (A/B の `drive_current_dirs`) から毎回導く。ドライブ欄専用の
+  一覧・キャッシュ・存在確認の結果を持たない (D2 を採らない理由)。
+- **採用**: 解決中の要求は 1 件だけ、置き換えのみ。専用の採否判定を作らず、主一覧の要求の一覧と退役処理
+  (既存の 1 つの所有者) に参加させる。割り込みを元に戻す仕組みは作らない。解決の後は同じ要求のまま既存の
+  走査・open へ引き継ぎ、確定の時点を既存の採用の 1 か所に揃える。
+- **採用**: 全画面からのドライブ操作は入力候補を作る前に全画面を閉じる。「解決中に全画面が開いている」組み合わせを
+  無くし、完了時に全画面が開いていれば捨てる、の 1 規則で済ませる。
+- **採用**: 表示形式はボタンだけ。プルダウン・折りたたみの組み合わせを作らない。
+- **採らない**: 解決中をモーダルにする案。普通のディスクでは一瞬で終わり、モーダルの出入りの方が目障り。
+  遅いのはネットワークの不調時だけで、その間の別操作は置き換えで足りる。
+- **採らない**: 見えている間の自動更新・存在確認。押したときの 1 回だけにする。
+- まれな失敗 (設定の保存失敗など) は割り切り (ログ + 既存の通知)。
+- 記録がコンテナで、そのコンテナが移動・削除されていた場合は、worker の解決で親フォルダへ落ちる
+  (今のキー操作と同じ)。通常の操作で起こり得るので割り切らずに今の規則を保つ。
+
+## 4. 永続データ
+
+- 追加: `Settings::show_toolbar_drives` (未リリース、`#[serde(default)]` false、移行不要)、
+  `ToolbarSectionId::Drives` (未リリース。旧版は `#[serde(other)] Unknown` で読み飛ばす既存の仕組みがある)。
+  設定の持ち運び (`settings_transfer.rs`) では、ほかの `show_toolbar_*` と同じ分類に入れる。
+- 変更なし: `quick_folder_drive_current_dirs` の形式 (リリース済み)。「一覧から外す」はキーを消すだけ。
+
+## 5. 触る範囲 (見込み)
+
+- `src/settings.rs`: `ToolbarSectionId::Drives`、`default_order`、`ordered_with_fallback` の差し込み規則、
+  `show_toolbar_drives`、`overwrite_non_preferences_from` 等の live 値の引き継ぎ。`src/settings_transfer.rs` の分類。
+- `src/ui_main.rs`: ツールバーのセクション描画 (表示判定の match、ボタン・選択状態・ツールチップ・右クリック)、
+  表示するセクションのチェックリスト。
+- `src/app/gamepad_input.rs` (またはドライブ移動を新しい小さなモジュール `src/app/drive_jump.rs` へ分ける):
+  `DriveJumpRequest` / `resolve_drive_jump` / `drive_jump_pending` と、3 つの既存関数の置き換え。
+- `src/app/update_phases.rs`: 完了の受け取りと、既存の移動候補への合流 (優先順位はキー入力の候補と同じ扱い)。
+- `src/app.rs`: 記録を消す関数 (A/B 両方)、今いるドライブの判定。
+- detached 述語・viewport 経路には触れない (detached リワークの凍結対象外)。
+
+## 6. 検証 (受入条件)
+
+- 純関数: `resolve_drive_jump` を tempdir で (記録が存在 / 消えて親へ / 親も無くルートへ / コンテナが存在 /
+  コンテナが消えて親へ / 記録なし / 別ドライブを指す記録は使わない)。ドライブ欄の集合の導出 (A∪B、文字順、
+  空)。`ordered_with_fallback` の差し込み (Drives の無い保存順 → Favorites の直前、Favorites も無い → 末尾、
+  既存の Collections の末尾追加は不変)。
+- handler-level: キー (`GridSwitchDrive{X}` / `GridOpenDrive{X}` / `GridOpenCurrentDriveRoot`)・ツールバーの
+  クリック・リング・ゲームパッドが**同じ要求**を作ること。要求の作成時、およびディレクトリの解決完了 → 候補採用 →
+  Worker 走査開始まで、UI スレッドから stat／走査しないこと (テスト用の解決・走査 backend で数える)。
+  完了フレームで、ディレクトリは Worker 走査、コンテナは既存のコンテナ open へ、種類を保ったまま渡ること。
+  コンテナ open 全体の UI I/O ゼロをこの backend 試験の受入条件にはしない。PDF の placeholder 照会は warm hit
+  判定前に stat するため warm miss でも発生し、prepared-pages 経路は省く。ZIP の表示準備や変換書庫の cache lookup
+  を含む既存の同期 I/O は §2.3 の条件と制限を別に記録する。
+- 前後関係 (レビュー P1): 「ドライブ解決中 → お気に入りの走査を受付 → 古い解決が完了」で古い結果が採用されないこと、
+  「お気に入りの走査中 → ドライブを押す → 走査が完了」で古い走査が採用されないこと。連打の置き換え。
+  検索の開始・終了、A/B 切替、「場所の記憶を消す」、Remote が操作権を取得 → 解除した後に届いた結果の破棄。
+  スナップショット中の拒否。検索中に押したとき検索を抜けて移ること。
+- current-root (レビュー P2): UNC・VerbatimUNC の共有ルート、別ドライブの変換キャッシュを表示中の
+  `GridOpenCurrentDriveRoot` (既存の `src/app/tests.rs` の該当テストを非同期化に合わせて維持)。警告文が今と同じこと
+  (最も近い親へ落ちたときは警告しないことを含む)。
+- 全画面 (レビュー P4、R2 の P2): 画像全画面と linked F12 からのリング・パッド操作で受付時に閉じきり、成功なら移動、
+  存在しないドライブなら一覧で警告。動画の表示切り替えの途中でも閉じきってから要求を作ること。拒否
+  (スナップショット等) や閉じられなかったときは要求を作らず、既存の要求も退けないこと。要求後に開いた全画面が
+  あれば結果を捨てること。
+- 検索中 (R2 の P1): 検索中に押して、行き先が PDF / ZIP のとき、書庫のような拡張子を持つ実ディレクトリ (`x.pdf`) の
+  とき、それぞれ種類どおりに開き、成功時だけ検索を抜けること。
+- 受付の境界 (R2 の P2): 「ドライブ解決中 → 隣のフォルダへの移動 (Ctrl+↑↓) を受付 → 古い解決が完了」と
+  「ドライブ解決中 → 直接 open を受付 → 古い解決が完了」で、古い結果が採用されないこと。
+- 状態遷移: 「一覧から外す」で A/B 両方の記録が消えて保存されること、今いるドライブでは押せないこと、
+  外した後のキー操作がルートを開くこと。A/B 切替で欄の並びが変わらず、ツールチップとクリック先だけ変わること。
+- 設定: 既定非表示、表示の切替が保存され再起動後も残ること、設定の持ち運びの分類テスト。
+- UI スナップショット: ドライブ欄を表示したツールバー (選択状態あり・なし) を 1 枚追加。既存のスナップショットは
+  既定非表示なので変わらない想定。
+- 既存のドライブ切替のテスト (`drive_current_dirs_are_isolated_per_quick_folder_slot` ほか、
+  `search_nav_entry_inventory_tests.rs` の入口一覧) が、非同期化に合わせた形で通ること。
+- 実機確認 (利用者・サブ PC): 外した USB・切断したネットワークドライブのボタンを押した際に、行き先解決と
+  ディレクトリ走査で一覧が止まらないこと、A/B での切替、検索中のクリック。コンテナ経路には §2.3 の既知の
+  同期 I/O が残るため、すべてのコンテナを開く際の無停止は保証しない。
+
+## 7. 文書の更新 (実装時)
+
+- マニュアル (ツールバー・キー操作のページ) と製品ページの該当箇所、[spec.md](spec.md) (`show_toolbar_drives`、
+  `quick_folder_drive_current_dirs` の説明にドライブ欄を追記)、[toolbar-customization-plan.md](toolbar-customization-plan.md)
+  (セクション一覧と §1.1 の例外)、[keymap-spec.md](keymap-spec.md) (ドライブ移動が worker で解決すること)、
+  [ui-responsiveness.md](ui-responsiveness.md) (新しい解決 worker)、[folder-history-location-plan.md](folder-history-location-plan.md)
+  (ドライブ別の記録の利用者が増えたこと)、`docs/backlog-on-hold.md` §1.793 を本体バックログへ移す。
+
+## 8. 利用者の判断 (2026-11-23 決定、すべて推奨案)
+
+統括セッション経由の利用者の回答 (AskUserQuestion、2026-11-23):
+
+- Q1: 「記録のあるドライブ (推奨)」 → 2.1 の案 D1。
+- Q2: 「同じ仕組みにする (推奨)」 → 2.3 の案 B1 で、キー・リング・ゲームパッドも同じ非同期の経路に寄せる。
+  表示が数フレーム遅れて変わる点と、全画面から存在しないドライブを選ぶと全画面が閉じてから警告が出る点は、
+  利用者に示したうえでの了承。この 2 点は CHANGELOG の下書きとマニュアルにも書く。
+- Q3: 「小さなメニュー (推奨)」 → 2.5 の、ボタンの右クリックで「ルートを開く」「一覧から外す」。
+- 既定は非表示、置き場所はお気に入りの直前、表示はボタンだけ、も推奨どおり。
+
+以下は判断前に示した選択肢 (記録として残す)。
+
+- **Q1 出すドライブ**: (推奨) A/B どちらかに最後の場所の記録があるドライブ (I/O なし、外したドライブは右クリックで外す) /
+  接続中のドライブ (列挙 worker と更新契機が要る。USB の抜き差しはすぐには反映されない)。
+- **Q2 キー操作も同じ非同期の経路に寄せるか**: (推奨) 寄せる (ドライブ移動のキー・リング・パッドも UI が止まらなくなる。
+  移動先の規則と警告文は同じ。変わるのは、表示が数フレーム後になることと、全画面のリング・パッドで存在しない
+  ドライブを指定したとき全画面が閉じてから警告が出ること) / ツールバーだけ (同じ操作の実装が 2 つになる)。
+- **Q3 右クリック**: (推奨) ボタンの右クリックで「ルートを開く」「一覧から外す」の小さなメニュー / 見出しの右クリックに
+  「一覧から外す ▶」を置き、ボタンの右クリックは何もしない。
+- 既定は非表示、置き場所はお気に入りの直前 (ドラッグ並べ替えで移動可)、表示形式はボタンだけ — は推奨どおりで進める
+  (異論があれば指示してほしい)。
+
+## 9. 経緯
+
+- 2026-11-23 R1: 設計担当 (ClaudeCode Opus 5.5) が起案。
+- 2026-11-23 R2: 独立設計レビュー (GPT-6.1 Sol / xhigh) の REVISE を反映。設計担当がコードで根拠を確認した:
+  P1 要求を主一覧の要求の一覧・退役処理へ参加させ、解決→走査を同じ要求で引き継ぐ
+  (`main_list_navigation_is_current` は別の移動の受付を見ないため)。P1 解決結果の種類を classified continuation へ渡し、
+  UI の再 stat をなくす (`classified_kind: None` だと loader が `path.is_file()` を呼ぶため)。P2 要求型を
+  `LastLocation | Root { path, origin }` にして UNC・変換書庫の current-root を運ぶ。P2 全画面からの操作は受付時に
+  全画面を閉じる。P3 警告文の訂正 (最も近い親へ落ちたときは警告しない)、slot None・小文字キー・保存順の細則、
+  「一覧から外す」と受付済みの移動の関係、受入条件の追加。B2 への統合は不要との意見で B1 を維持。
+- 2026-11-23 R3: 再レビュー (同じ担当) の REVISE を反映。設計担当がコードで根拠を確認した: P1 検索中も種類・移動票・
+  Continuation を保って検索を抜ける移動へ渡す。P2 `claim_open_request_owner_with_startup_intent` と `start_folder_nav` の
+  受付でもドライブ要求を退ける。P2 linked F12 からの操作を残す (R2 の「作らない」は既存機能の削除だったため撤回)。
+  P2 受付時の close を「拒否判定 → 閉じきる → 確認 → 移動票 → 受付」の順にし、`close_fullscreen_to_completion` を使う。
+- 2026-11-23 R3 の再レビュー: ACCEPT。新たな P1/P2 なし。P3 の 2 点 (退役 helper が自身の引き継ぎを退けないこと、
+  独立窓を到達不能と断定しないこと) を本文に反映した。
+- 2026-11-23 利用者判断: Q1〜Q3 すべて推奨案 (§8)。実装を Codex (GPT-6.1 Sol / high) へ出す。
+- 2026-11-23 実装補足: 独立窓の操作は既存の root 帰着を `AddressBarNav::DriveJump` で保ち、main-history suppression 中の窓では移動票を取らず、root の主受付で取得する。perf の要求種別は予約欄 `kind` と衝突するため `request_kind` に記録する。
+- 2026-11-23 再修正: 主一覧も `DriveJump` 候補を返し、既存の入力優先順位で勝った時点だけ受付する (独立レビュー P2-2)。空の戻り先へ検索を終了する経路も共通の要求退役境界を通す。
+- 2026-11-23 残件: PDF warm-cache 確認の UI metadata は未解消 (独立レビュー P2-1)。stamp を通常経路7段 (検索中は追加2段) と別の SmartFolder 経路へ伝搬する必要があり、利用者指定の「3層以上なら実装せず報告」に従って変更を見送った。
+- 2026-11-23 再修正2: ツールバーのドライブ候補はツールバーのお気に入りと同じ優先順位で調停する (P2)。調停敗者でも候補作成前に閉じた全画面は閉じたままで、旧 `location_jump_nav` と同じことを明記した (P3-2)。
+- 2026-11-23 文書訂正 (P3-1): UI stat／filesystem 無しという記述をディレクトリの解決完了から worker 走査開始までに限定。PDF の placeholder 照会 (warm miss も stat、prepared-pages は省略)、ZIP の表示準備、条件付き変換書庫 cache lookup に残る既存同期 I/O は §2.3 の既知制限として記録し、今回の修正対象外とした。
+- 2026-11-23 実装と検収: 実装 4e83f0b4d、修正 1018d24ed・cf0a2fae4 (独立コードレビュー R1・R2 の REVISE 対応)、
+  スナップショット 0841c5acd。独立コードレビュー R3 で ACCEPT。PDF・ZIP・変換書庫の既存の UI 側 I/O は既知の制限として残した (§2.3)。

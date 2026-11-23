@@ -838,10 +838,12 @@ CLAUDE.md「コード修正時のドキュメント同時更新」に従い、�
 
 ### 11.1 仕様
 
-- エクスプローラ等から mIV の一覧へファイルやフォルダをドロップすると、**現在表示中の実
-  フォルダへコピー** する (送出と対称の「ファイル整理」操作)。§1.821 / Q5 によりフォルダも受け付ける。
-- コピー先は `App::current_favorite_target()` — 実ディレクトリ表示中だけ `Some`。
+- エクスプローラ等から mIV の一覧へファイルやフォルダをドロップすると、**落とし先の実フォルダへコピー** する (送出と対称の「ファイル整理」操作)。§1.821 / Q5 によりフォルダも受け付ける。
+  §1.858 の 2 では、通常の実フォルダ一覧のフォルダセル・詳細行ならそのフォルダ、それ以外のセルや空白なら現在表示中の実フォルダを使う。Shift を含め修飾キーにかかわらずコピーだけ。
+  本 (ZIP/PDF 等)・スタック集約・仮想項目は落とし先にせず、従来の空白扱いを保つ (本の中へは転送しない)。
+- 空白等へのコピー先は `App::current_favorite_target()` — 実ディレクトリ表示中だけ `Some`。
   ZIP / PDF / 変換アーカイブ表示中は `None` で **トーストで拒否**。
+  フォルダセルの落とし先を公開するのは `is_physical_folder_listing()` かつ `grid_item_input_allowed()` の pass だけ。検索・タグ・コレクション等に並ぶフォルダは対象外。
 - **検索結果ビュー (Ctrl+G 合成 / Ctrl+S favsearch)・タグ表示も拒否** する。これらは
   `current_folder` を直前の実フォルダのまま残すため、`current_favorite_target()` だけ
   だと「直前のフォルダ」へ誤コピーしてしまう。`items_are_global_search_view` /
@@ -851,6 +853,8 @@ CLAUDE.md「コード修正時のドキュメント同時更新」に従い、�
   有効なファイルと無効なフォルダが混在しても一部だけ実行しない。
 - 操作は **コピーのみ**。整理先と同じ STA の `IFileOperation` を使い、同名の衝突・進捗・取消・エラーは
   Windows の画面へ委ねる。フラグは `FOF_ALLOWUNDO | FOFX_ADDUNDORECORD` で、取り消し履歴は Windows が持つ。
+- §1.860: 外部ドラッグ中だけ受理したツリー行・フォルダセルを強調し、空白は強調しない。内部ドラッグは説明のバッジだけを使う。
+  mIV で再生中の動画・音声を含むフォルダの移動・名前の変更は Windows の「使用中」の画面になることがあり、再生を閉じてから再試行する。
 
 ### 11.2 実装
 
@@ -860,9 +864,13 @@ ROOT の HWND を得た最初のフレームで、winit が登録した受け取
 
 - `MainDropShared` は `Rc<RefCell<_>>` で UI STA に置く。各 pass の最後に全ペイン・clip・行全体の形を番号付きで公開し、
   callback は表示済みの番号の形だけを使う。サイズ／DPI が変わったら NONE。手前のレイヤーと交差した行は全体を外す。
-- `TreeRow` は整理先と共有の受付・`FileOrganizeRequest::Running` へ投入する。`TreeNonTarget` は NONE で、
-  一覧へ流さない。`ExistingDropArea` の外部 drop だけ `GridFiles(paths)` を送り、App が
+  一覧のフォルダは実効クリップで切ってから前面レイヤーとの交差を見て、外したセルを `grid_blocked` に残す。詳細表示のクリップは横・縦 ScrollArea の交差。
+- `Folder { path, place: Tree | Grid }` は `FolderTransfer` として整理先と共有の受付・`FileOrganizeRequest::Running` へ投入する。`place` による転送規則の分岐はなく、完了処理も共通。
+  `TreeNonTarget` / `GridNonTarget` は NONE で、一覧の空白へ流さない。ツリーを先に、次に一覧のフォルダ／blocked、それ以外を `ExistingDropArea` と判定する。
+  `ExistingDropArea` の外部 drop だけ `GridFiles(paths)` を送り、App が
   `handle_external_file_drop` を呼ぶ。sidecar 復元中は従来どおり捨てる。
+- 外部ドラッグで受理した `Folder` のパスと場所は `MainDropShared.hover` に置き、値が変わったときだけ再描画を要求する。App は一致するパスの行／セルだけを強調する。
+  内部ドラッグ・非受付・DragLeave・Drop では消し、古い強調を残さない。詳細は [§1.858 の 2・§1.860 設計 §5・§6](grid-folder-drop-and-handle-release-plan.md#5-2-一覧のフォルダのセルへのドロップ)。
 - 本棚自身・配下かどうかの判定はドラッグ中の形・受付には含めず、転送投入時に既存の `book_root_path()` を一回呼んで拒否する。
   ツリーの「貼り付け」も有効判定では解決せず、押した時だけ確認する。既定パスの同期解決を毎 pass に増やさない (§1.464 設計 §16)。
 - callback は App・ファイルシステムに触れず、借用を COM 呼び出しやメッセージループ越しに保持しない。
@@ -908,7 +916,8 @@ ROOT の HWND を得た最初のフレームで、winit が登録した受け取
 ### 11.3 送出との非干渉
 
 送出の async wrapper (§12) と ROOT の受け取り owner は独立。`SHDoDragDrop` 前後だけ共有の
-`internal` を設定／解除し、Drop が積んだ要求を復帰直後に消費する。内部 drop はツリー行以外で NONE。
+`internal` を設定／解除し、Drop が積んだ要求を復帰直後に消費する。内部 drop はツリー行と通常の実フォルダ一覧のフォルダセル・詳細行で受け付け、それ以外は NONE。
+一覧のフォルダでもツリーと同じ移動／コピー・自身／配下・同じ親への移動の拒否・混在仮想項目／PIDL 失敗の拒否を使う。
 `internal_drop_pending` / `cursor_over_window` の推定は削除する。外部への COPY・Shell 既定 IDropSource・
 非同期 data object の寿命契約は維持する。
 
@@ -1049,6 +1058,11 @@ inner 呼び出しが STA を再入し得るため、状態の `RefCell` borrow 
 設計担当は `d8e7a0249` の実 Shell 回帰をメイン PC の共有 runner で実行し、最初の Move の
 本番 `OleData::set_description` が同じ E_NOTIMPL になることを確認した。
 FALSE の所有権指定だけが拒否理由だとは断定せず、TRUE なら受理するという未文書化の挙動には依存しない。
+これは §1.836 で mIV 自身の送出 object に説明の外側 owner を置いた判断の記録であり、外側 owner は維持する。
+§1.860 では開発機の Shell data object の probe で FALSE が E_NOTIMPL、TRUE が S_OK と読み戻し成功になることを確認したため、
+受け側の `OleData::set_description` は内部・外部とも **`fRelease = TRUE`** にそろえる。成功時は medium を相手へ渡し、失敗時だけ呼出元が `ReleaseStgMedium` してログを残す。
+外部 object には mIV の外側 owner を置けない。TRUE の書込みでも拒否されたら説明なしで続行し、外部ドラッグの落とし先は行／セルの強調で示す。
+別プロセスの Explorer を元にしたバッジ表示は実機確認待ちであり、probe だけで表示成功とは断定しない。正本は [§1.860 設計 §6.2](grid-folder-drop-and-handle-release-plan.md#62-外部からのドラッグの説明のバッジ)。
 
 `SHDoDragDrop` と `IDropTargetHelper` が受け取るのは `DragDataObject.data` の**外側**である。
 説明の正本はこの COM object ごとの `Option<DROPDESCRIPTION>` 一つとし、async state とは独立させる。
@@ -1069,10 +1083,11 @@ FALSE の所有権指定だけが拒否理由だとは断定せず、TRUE なら
 - Performed DropEffect の入力検証・inner への委譲・HRESULT/fRelease・async 完了の契約は変更しない。
   mIV → Explorer の target による説明書込みも外側が受け、Explorer 等 → mIV は元の外部 object へ従来どおり書く。
 
-受理・拒否の判定と本番 writer は維持する。Move は `DROPIMAGE_MOVE` と「%1 へ移動」、Copy は
+受理・拒否の説明の意味は維持する。本番 writer の所有権指定は上記の TRUE に変更する。Move は `DROPIMAGE_MOVE` と「%1 へ移動」、Copy は
 `DROPIMAGE_COPY` と「%1 へコピー」。§1.844 (v5.6.0) では**拒否した decision はすべて明示的な
 `Description::None` (`DROPIMAGE_NONE`)** とする。一覧の空白・同じ一覧・ツリーの非行領域・
 hit なし・パス形式を持たない外部 source も、この禁止画像を要求する。
+§1.858 の 2 で受理する一覧のフォルダセル・詳細行は、この非受付には含めない。
 `Description::Invalid` (`DROPIMAGE_INVALID`) は受理した外部一覧ドロップ (`Decision::Grid`) と、
 DragLeave / finish_session (Drop 後や次の DragEnter による前 session の終了を含む) のリセットだけに残す。
 成功後の `update_drag_window` と、

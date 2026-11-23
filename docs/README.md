@@ -8,7 +8,9 @@
 
 | ドキュメント | 読むべきタイミング |
 | --- | --- |
+| [drive-tabs-793-plan.md](drive-tabs-793-plan.md) | §1.793 ツールバーのドライブ欄 (ドライブ別の最後の場所を常設ボタンから開く)。A/B の記録から導くドライブの集合、キー操作と共有するドライブ移動の worker 解決、置き場所・右クリック・利用者判断。設計段階、未実装 |
 | [folder-tree-dnd-plan.md](folder-tree-dnd-plan.md) | §1.464 ツリー行への D&D と右クリック貼り付け、§1.821 一覧ドロップ。表示済み pass の形・ROOT OLE target・既定操作のボリューム確認・共有受付と転送 owner。generic Shell image と target description を使用。実装記録と未実施の検証は §14〜15 |
+| [grid-folder-drop-and-handle-release-plan.md](grid-folder-drop-and-handle-release-plan.md) | §1.858 B・2 / §1.860 (v5.7.0 予定、設計中)。移動・名前の変更・削除の前に mIV が持つ ZIP / PDF の handle を手放す「変更の囲い」、一覧の実フォルダのセルへのドロップ、外部からのドラッグ中の落とし先の強調と説明のバッジ |
 | [hover-805-measurement.md](hover-805-measurement.md) | 5ch 報告 805 の環境設定・操作カスタマイズのホバー計測。GPUを使わない ignored harness、dialog_frame perf event、dialog-frames集計と観測限界 |
 | [hover-809-gpu-work-measurement.md](hover-809-gpu-work-measurement.md) | §1.809 のテスト専用A/B計測とC見積もり。primitive完全一致率、offscreen GPU pass費用、present未測定の限界と省略条件のソース棚卸し |
 | [clear-history-actions.md](clear-history-actions.md) | 検索欄の入力履歴・閲覧履歴の全件消去をキー／リングへ割り当てる操作。共有処理・保存・確認・検証 |
@@ -130,6 +132,7 @@
 | [local-asr-transcript-plan.md](local-asr-transcript-plan.md) | ローカル文字起こし (whisper、動画・音声) の計画。worker・client・GPU・モデル取得の [区切り1](local-asr-t1-chunk1-report.md)、作成ジョブ・DB等の [区切り2](local-asr-t1-chunk2-report.md)、表示cache・動画/音楽panelの [区切り3](local-asr-t1-chunk3-report.md)。MCP・検索は後続 |
 | [local-vlm-v0-procedure.md](local-vlm-v0-procedure.md) | **手順の下書き (2026-11-02、未実行)**。ローカル AI 説明文の V0。Qwen3.5-4B/9B と Gemma 4 E4B の比較、VLM・AI 補正・表示用テクスチャの VRAM を同じ物差しで計測、利用者による目隠しの品質比較、4B 固定と U1 の判断基準 |
 | [mcp-integration-plan.md](mcp-integration-plan.md) | **段階 0 試験実装中 (2026-10-30)**。AI 連携 (MCP)。stdio の別 exe と本体の agent lane (Remote IPC とは別の pipe・版)、Remote 操作権との関係、安全性。実装・検証と未決事項は §14 |
+| [mcp-guide-settings-plan.md](mcp-guide-settings-plan.md) | **設計 (2026-11-21)、実装は未着手**。§1.843 MCP で使い方の案内と、設定の確認・変更。マニュアルを MCP exe に同梱して引かせる tool、今開いている場所、環境設定の読み書き (環境設定の OK と同じ確定処理を通す)、お気に入りの登録と索引。許可はチェック欄 2 つ (既定オフ)。書き出し・取り込みの表にある設定は AI が読めて変えられる。第 2 段はキー割り当て、第 3 段は mIV Sound。公開文書の書き換え案を含む |
 | [local-adjust-testing.md](local-adjust-testing.md) | 部分補正レイヤーの回帰テスト、合成順、キャッシュ無効化を検証するとき |
 | [search-architecture.md](search-architecture.md) | 検索 / インデクサ / タグを触るとき。**Ctrl+S/F/G/R の経路、Everythingの共通Search ownership、インデクサパイプライン + DB 責任分離** |
 | [search-input-history-plan.md](search-input-history-plan.md) | §1.756 検索欄の入力履歴。4 種類各 20 件、確定・実行済み語での離脱、設定の保存・オフと全件消去、フォルダバーと共有する▼・IME-safe な固定キー、ログ・Remote・MCP の非公開境界。実装中 |
@@ -221,6 +224,7 @@
 | [fullscreen-in-page-scroll-plan.md](fullscreen-in-page-scroll-plan.md) | §1.474 ページ内スクロールと N 字 / Z 字移動の基礎設計・実装記録。描画済み表示単位の照合、入力所有、clamp と循環防止 |
 | [fullscreen-scroll-page-turn-plan.md](fullscreen-scroll-page-turn-plan.md) | §1.823〜§1.826 の拡張設計。滑らかな移動、端からのスクロール＋ページ送りと型付き着地、ホイールのズーム、N 字 / Z 字の移動量設定 |
 | [fullscreen-n-scroll-wrap-step-plan.md](fullscreen-n-scroll-wrap-step-plan.md) | §1.850 N 字 / Z 字で列 / 段を替える量を読み進める量と別に決める設定の設計。5ch >>857 の切り分け (座標列の単体テスト) |
+| [page-turn-slide-plan.md](page-turn-slide-plan.md) | §1.772 ページめくりの演出に「スライド」を加える設計。演出の状態は増やさず projection の recipe だけを分ける、移動量と初期可視、HUD の 3 択とキーの扱い。所有の正本は [page-turn-animation-plan.md](page-turn-animation-plan.md) |
 | [fullscreen-drag-pan-bound-plan.md](fullscreen-drag-pan-bound-plan.md) | §1.834 閲覧中のキャンバスのドラッグ移動を画像の端までに制限する設定。既定OFF、描画済み表示単位・白紙の相方・可視性と物理ピクセルの丸め、適用する面と入力の契約 |
 | [catalog-design.md](catalog-design.md) | サムネイルキャッシュ DB の設計 |
 | [book-thumb-cover-only-plan.md](book-thumb-cover-only-plan.md) | §1.452 本の中のページは寸法だけ記録し表紙だけ保存する設定、`page_dims` 表、書き戻しの stamp 条件 |

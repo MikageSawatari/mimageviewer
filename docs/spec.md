@@ -2728,7 +2728,7 @@ Explorer で開く。検索結果など複数チェックから単一の実フ�
 | `reading_history_limit` | usize | 1000 | 閲覧履歴の保持件数。1..=1000 に clamp し、保持件数を下げた場合は古い項目から削除する |
 | `quick_folder_slots` | `[Option<PathBuf>; 2]` | `[None, None]` | フォルダバーの A/B クイックフォルダが最後に見た場所。実フォルダまたは ZIP / PDF / 変換済みアーカイブのコンテナパスだけを永続化し、A/B 別の戻る / 進むスタックはセッション中の `App` 状態として保持する |
 | `active_quick_folder_slot` | `Option<QuickFolderSlotId>` | `Some(A)` | 終了 / トレイ退避時のアクティブな A/B。起動フォルダを開く前に復元し、そのスロットだけへ場所・最近のフォルダ・ドライブ別の場所を記録する。旧設定の項目欠落は A、明示的な `None` はどちらも選ばず両スロットを保持する。起動場所は起動設定と Previous 専用の明示一覧 record から選び、保存スロットの場所で上書きしない |
-| `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` はアクティブな A/B スロットの値を使う |
+| `quick_folder_drive_current_dirs` | `[BTreeMap<String, PathBuf>; 2]` | 空 | A/B クイックフォルダごとに保持するドライブ別の最後の場所。キーは `"C:"` のような大文字ドライブ表記で、`GridSwitchDriveC..Z` とツールバーのドライブ欄はアクティブな A/B スロットの値を使う。ドライブ欄に並ぶのは A と B のキーの和集合で、欄の「一覧から外す」は両方のスロットからそのキーを消す |
 | `use_native_shell_context_menu` | bool | true | リリース済み設定との読み書き互換のためだけに残す旧フィールド。現在は値を無視し、実ファイル / 実フォルダの native 右クリックメニューへ Windows Shell 項目を常に含める |
 | `show_windows_context_menu_inline` | bool | false | Windows Shell 項目を mIV 項目と同じ階層へ併記する。OFF では末尾の「Windows のメニュー」サブメニューへまとめ、開くまで `QueryContextMenu` を遅延する |
 | `skip_recycle_bin_delete_confirmation` | bool | false | mIV の事前判定が `RecycleBin` かつ実フォルダを含まないとき、ZIP / PDF / 変換対象アーカイブを含めて mIV 側の削除確認を省略する。実フォルダを含む場合は常に確認する。複数選択は 1 件でも `MayPermanent` なら確認を維持し、キャンセルを初期選択にする。`FOF_WANTNUKEWARNING` には影響しない |
@@ -2908,6 +2908,7 @@ typed event の送信だけを行い、前面化しない。受付できない�
 | `folder_tree_pane_visible` | bool | false | 左側の実フォルダツリーペインを表示 |
 | `folder_tree_sort_order` | FolderTreeSortOrder | NameAsc | 左ツリーと Ctrl+上下 / Ctrl+PageUp/PageDown の並び順。NameAsc / NameDesc / NumericAsc / NumericDesc / DateAsc / DateDesc。一覧用 `sort_order` とお気に入り別表示状態から独立 |
 | `folder_tree_pane_width_ratio` | f32 | 0.22 | フォルダツリーペインの左右境界位置 (ウィンドウ幅に対する比率)。復元時は最小/最大幅にクランプ |
+| `show_toolbar_drives` | bool | false | ツールバーにドライブ欄 (§1.793) を表示。A/B どちらかに `quick_folder_drive_current_dirs` の記録があるドライブを `C:` などのボタンで並べ、左クリックで `GridSwitchDriveC..Z` と同じ移動、右クリックで「ルートを開く」「一覧から外す」。描画はメモリの記録だけを読み、ファイルシステムに触らない。既定の並びはお気に入りの直前 |
 | `show_toolbar_favorites` | bool | true | ツールバーにお気に入りを表示 |
 | `show_toolbar_smart_folders` | bool | true | 登録が 1 件以上あるときツールバーにスマートフォルダを表示。0 件時も設定値は保持する |
 | `show_toolbar_tags` | bool | true | ツールバーにタグセクション (タグ管理 / タグビュー / ピン留めタグ) を表示 |
@@ -3842,3 +3843,22 @@ Remoteは構成適用後にも従来の応答制限を使い、省略ページ�
 既定はすべてOFF。既存の並べ替え・行頭指定・表示設定で管理し、固定時のshortcutは欄へfocusする。
 表示/focusだけでは検索せず、各検索の既存実行タイミングを保つ。検索終了・切替でも固定欄の入力を
 保持する。×でその検索条件を消去し、Escでは入力を残す。適用済み条件と編集済み条件を区別する。
+
+## AI による使い方案内・設定とお気に入りの変更（§1.843）
+
+「AI 連携」の「今開いている場所を AI に見せる」と「設定の確認と変更を AI に任せる」は既定OFFで、
+許可の範囲が「読み取りのみ」以上のときに個別に有効となる。設定は即時に保存・反映する。
+前者はメインの閲覧対象、後者は環境設定の対象項目と値の確認・変更、外部ツールの登録・変更・削除、
+お気に入りの登録と索引切替を許す。AI連携の許可とRemote PINはAIから変えられず、PINも返さない。
+外部ツールは起動しない。スタック用スクリプトは有効化の変更に加え、同じ設定許可で本文の読み書きを許す。
+本文は AI アプリの提供元へ送られる。`stack_script` は本文を part に分け、続きの取得と書き込みで
+本文全体の SHA-256 を照合する。AI 書き込みは UTF-8 で 256 KiB まで、直接編集したファイルと読み取りは 1 MiB まで。
+書き込み前の本文は AI が保持し、256 KiB 以内なら同じ tool で書き戻して取り消す。
+それより大きな元の本文は別に保存し、エディタで戻す。既存の transport 上限は変えず、特殊文字のエスケープで
+要求が上限を超えた場合は既存の上限エラーとして扱う。
+通知・変更記録・ログには本文を記録せず、変更前後の行数だけを表示する。
+AI の書き込みと環境設定のリセット・エディタで開く操作は、単一 FIFO worker で受付順に行う。
+環境設定のボタンは仕事を渡すだけで、UI は I/O・完了待ち・監視を行わない。
+変更後はスタック表示の開き直し・フォルダ再読込で反映し、表示中のスタックは直ちに分け直さない。
+使い方の説明は同梱マニュアルから返し、無効・本体未起動でも利用できる。
+受付・通知・変更記録・対象項目の正本と検証状況は[設計](mcp-guide-settings-plan.md)を参照。

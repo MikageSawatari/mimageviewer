@@ -6272,6 +6272,7 @@ struct FsOverflowPanelView {
     root_rows: Vec<FsOverflowPanelRow>,
     navigator_corner: FullscreenNavigatorCorner,
     reading_order: crate::settings::FullscreenNScrollOrder,
+    page_turn_animation: Option<crate::settings::PageTurnAnimationStyle>,
     shift: SpreadShiftHudView,
     music_note_color_scheme: crate::music_note_color::MusicNoteColorScheme,
     composition_available: bool,
@@ -6344,6 +6345,7 @@ enum FsOverflowPanelAction {
     Activate(FullscreenOverflowItemId),
     SetNavigatorCorner(FullscreenNavigatorCorner),
     SetReadingOrder(crate::settings::FullscreenNScrollOrder),
+    SetPageTurnAnimation(Option<crate::settings::PageTurnAnimationStyle>),
     JumpShiftAnchor(usize),
     ClearShift,
     SetShiftMemory(bool),
@@ -6369,12 +6371,23 @@ enum FsOverflowOpenRequest {
     Root,
 }
 
+fn page_turn_animation_label(
+    choice: Option<crate::settings::PageTurnAnimationStyle>,
+) -> &'static str {
+    match choice {
+        None => "OFF",
+        Some(crate::settings::PageTurnAnimationStyle::Curl) => "めくる",
+        Some(crate::settings::PageTurnAnimationStyle::Slide) => "スライド",
+    }
+}
+
 fn fs_overflow_panel_body_row_count(state: FsOverflowPanelState) -> usize {
     match state {
         FsOverflowPanelState::Closed => 0,
         FsOverflowPanelState::Root => FullscreenOverflowItemId::fixed_order().len() + 1,
         FsOverflowPanelState::NavigatorPosition => 1 + FullscreenNavigatorCorner::ALL.len(),
         FsOverflowPanelState::PageReadingOrder => 3,
+        FsOverflowPanelState::PageTurnAnimation => 4,
         FsOverflowPanelState::SpreadAdjustment => 6,
         FsOverflowPanelState::MusicNoteColor => 2,
         // Fixed back row + four 48pt sliders + two 24pt headings + three end rows.
@@ -6778,6 +6791,7 @@ fn draw_fs_overflow_panel_surface(
         FsOverflowPanelState::Root => "その他の機能",
         FsOverflowPanelState::NavigatorPosition => "ナビゲータ位置",
         FsOverflowPanelState::PageReadingOrder => "ページ内の読み順",
+        FsOverflowPanelState::PageTurnAnimation => "ページめくりアニメーション",
         FsOverflowPanelState::SpreadAdjustment => "見開きの調整",
         FsOverflowPanelState::MusicNoteColor => "音名の色",
         FsOverflowPanelState::Slideshow => "スライドショー",
@@ -6953,6 +6967,19 @@ fn draw_fs_overflow_panel_surface(
                             if draw_fs_overflow_panel_row(ui, ("reading_order", order as u8), order.label(),
                                 if selected { "選択中" } else { "" }, selected, true, None).clicked() {
                                 action = Some(FsOverflowPanelAction::SetReadingOrder(order));
+                            }
+                        }
+                    }
+                    FsOverflowPanelState::PageTurnAnimation => {
+                        if draw_fs_overflow_panel_row(ui, "page_turn_back", "<  戻る", "", false, true, None).clicked() {
+                            action = Some(FsOverflowPanelAction::Back);
+                        }
+                        use crate::settings::PageTurnAnimationStyle::{Curl, Slide};
+                        for (index, choice) in [None, Some(Curl), Some(Slide)].into_iter().enumerate() {
+                            let selected = choice == view.page_turn_animation;
+                            if draw_fs_overflow_panel_row(ui, ("page_turn_animation", index), page_turn_animation_label(choice),
+                                if selected { "選択中" } else { "" }, selected, true, None).clicked() {
+                                action = Some(FsOverflowPanelAction::SetPageTurnAnimation(choice));
                             }
                         }
                     }
@@ -20622,6 +20649,7 @@ pub fn draw_spread_shift_hud_snapshot_fixture(ui: &mut egui::Ui, unresolved: boo
         root_rows: Vec::new(),
         navigator_corner: FullscreenNavigatorCorner::BottomRight,
         reading_order: Default::default(),
+        page_turn_animation: None,
         shift,
         music_note_color_scheme: Default::default(),
         slideshow: Default::default(),
@@ -20645,6 +20673,7 @@ pub fn draw_composition_editor_hud_snapshot_fixture(
         root_rows: Vec::new(),
         navigator_corner: FullscreenNavigatorCorner::BottomRight,
         reading_order: Default::default(),
+        page_turn_animation: None,
         shift: SpreadShiftHudView::default(),
         composition_available: available,
         composition_managed: managed,
@@ -38582,16 +38611,25 @@ impl App {
     }
 
     pub(crate) fn toggle_page_turn_animation(&mut self) {
-        let enabled = !self.settings.page_turn_animation_enabled;
+        let choice = (!self.settings.page_turn_animation_enabled)
+            .then_some(self.settings.page_turn_animation_style);
+        self.set_page_turn_animation(choice);
+    }
+
+    pub(crate) fn set_page_turn_animation(
+        &mut self,
+        choice: Option<crate::settings::PageTurnAnimationStyle>,
+    ) {
         self.adopt_page_turn_animation_settings(
-            enabled,
+            choice.is_some(),
             self.settings.page_turn_animation_duration_ms,
+            choice.unwrap_or(self.settings.page_turn_animation_style),
         );
         // Same established persistence route as the navigator overflow toggles.
         self.settings.save();
         self.show_feedback_toast(format!(
             "[ページめくりアニメーション {}]",
-            if enabled { "ON" } else { "OFF" }
+            page_turn_animation_label(choice)
         ));
     }
 
@@ -38672,12 +38710,14 @@ impl App {
                         item.label(),
                         KeyAction::FsPageTurnAnimationToggle,
                     ),
-                    if self.settings.page_turn_animation_enabled {
-                        "ON"
-                    } else {
-                        "OFF"
-                    }
-                    .into(),
+                    format!(
+                        "{}  >",
+                        page_turn_animation_label(
+                            self.settings
+                                .page_turn_animation_enabled
+                                .then_some(self.settings.page_turn_animation_style)
+                        )
+                    ),
                     true,
                     None,
                 ),
@@ -38757,6 +38797,10 @@ impl App {
             root_rows,
             navigator_corner: self.settings.fullscreen_navigator_corner.normalized(),
             reading_order: self.settings.fullscreen_n_scroll_order.normalized(),
+            page_turn_animation: self
+                .settings
+                .page_turn_animation_enabled
+                .then_some(self.settings.page_turn_animation_style),
             shift: self.spread_shift_hud_view(),
             music_note_color_scheme: self.settings.music_note_color_scheme,
             composition_available: self.composition_editor_available(),
@@ -38959,6 +39003,7 @@ impl App {
             root_rows: Vec::new(),
             navigator_corner: FullscreenNavigatorCorner::BottomRight,
             reading_order: Default::default(),
+            page_turn_animation: None,
             shift: Default::default(),
             music_note_color_scheme: self.settings.music_note_color_scheme,
             slideshow: FsSlideshowSettings::from_settings(&self.settings),
@@ -39072,7 +39117,7 @@ impl App {
                     self.fs_overflow_panel_state = FsOverflowPanelState::PageReadingOrder;
                 }
                 FullscreenOverflowItemId::PageTurnAnimationToggle => {
-                    self.toggle_page_turn_animation()
+                    self.fs_overflow_panel_state = FsOverflowPanelState::PageTurnAnimation;
                 }
                 FullscreenOverflowItemId::SlideshowSettings => {
                     self.fs_overflow_panel_state = FsOverflowPanelState::Slideshow;
@@ -39095,6 +39140,9 @@ impl App {
             FsOverflowPanelAction::SetNavigatorCorner(corner) => {
                 self.set_fullscreen_navigator_corner(corner);
                 self.fs_overflow_panel_state = FsOverflowPanelState::Root;
+            }
+            FsOverflowPanelAction::SetPageTurnAnimation(choice) => {
+                self.set_page_turn_animation(choice);
             }
             FsOverflowPanelAction::SetReadingOrder(order) => {
                 self.settings.fullscreen_n_scroll_order = order.normalized();
@@ -68718,6 +68766,7 @@ mod tests {
             FsOverflowPanelState::Root,
             FsOverflowPanelState::NavigatorPosition,
             FsOverflowPanelState::PageReadingOrder,
+            FsOverflowPanelState::PageTurnAnimation,
             FsOverflowPanelState::SpreadAdjustment,
             FsOverflowPanelState::MusicNoteColor,
             FsOverflowPanelState::Slideshow,
@@ -68748,6 +68797,7 @@ mod tests {
                             .collect(),
                         navigator_corner: FullscreenNavigatorCorner::BottomRight,
                         reading_order: Default::default(),
+                        page_turn_animation: None,
                         shift: SpreadShiftHudView {
                             status: "保存した基点が現在の一覧にありません".into(),
                             anchor: "基点: chapter/003.jpg（現在の一覧外）".into(),
@@ -68886,6 +68936,15 @@ mod tests {
     ) -> egui_kittest::Harness<'static> {
         let mut app = crate::app::setup_app_for_test();
         app.settings.page_turn_animation_enabled = animation_enabled;
+        app.settings.page_turn_animation_style = if state == FsOverflowPanelState::PageTurnAnimation
+        {
+            crate::settings::PageTurnAnimationStyle::Slide
+        } else {
+            crate::settings::PageTurnAnimationStyle::Curl
+        };
+        let animation_choice = (animation_enabled
+            || state == FsOverflowPanelState::PageTurnAnimation)
+            .then_some(app.settings.page_turn_animation_style);
         let animation_row = app
             .fullscreen_overflow_panel_view(false)
             .root_rows
@@ -68999,6 +69058,7 @@ mod tests {
                                 root_rows,
                                 navigator_corner: FullscreenNavigatorCorner::BottomRight,
                                 reading_order: Default::default(),
+                                page_turn_animation: animation_choice,
                                 shift: Default::default(),
                                 composition_available: true,
                                 composition_managed: false,
@@ -69091,6 +69151,16 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_overflow_panel_snapshot_page_turn_submenu() {
+        snapshot_fullscreen_overflow_panel(
+            "fullscreen_overflow_panel_page_turn_submenu",
+            FsOverflowPanelState::PageTurnAnimation,
+            egui::vec2(720.0, 440.0),
+            true,
+        );
+    }
+
+    #[test]
     fn fullscreen_overflow_panel_snapshot_reading_order() {
         snapshot_fullscreen_overflow_panel(
             "fullscreen_overflow_panel_reading_order",
@@ -69122,12 +69192,16 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(row(&mut app).label, "ページめくりアニメーション");
-        assert_eq!(row(&mut app).status, "OFF");
+        assert_eq!(row(&mut app).status, "OFF  >");
         app.keymap = Keymap::from_ini_str("[FsImage]\nFsPageTurnAnimationToggle = Ctrl+Shift+A\n");
         let mut settings = app.settings.clone();
         settings.page_turn_animation_enabled = true;
         app.install_preferences_settings(settings);
-        assert_eq!(row(&mut app).status, "ON");
+        assert_eq!(row(&mut app).status, "めくる  >");
+        let mut settings = app.settings.clone();
+        settings.page_turn_animation_style = crate::settings::PageTurnAnimationStyle::Slide;
+        app.install_preferences_settings(settings);
+        assert_eq!(row(&mut app).status, "スライド  >");
         assert_eq!(
             row(&mut app).label,
             app.keymap.first_chord_bracket_label(
@@ -69145,11 +69219,41 @@ mod tests {
 
     #[test]
     fn page_turn_animation_overflow_click_uses_the_production_row_and_handler() {
+        use crate::settings::PageTurnAnimationStyle::{Curl, Slide};
         use egui_kittest::kittest::Queryable;
+        fn selected_text_positions(shape: &egui::Shape, positions: &mut Vec<egui::Pos2>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.text() == "選択中" => {
+                    positions.push(text.pos)
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        selected_text_positions(shape, positions);
+                    }
+                }
+                _ => {}
+            }
+        }
         let mut app = crate::app::setup_app_for_test();
         app.fs_overflow_panel_state = FsOverflowPanelState::Root;
         let duration = app.settings.page_turn_animation_duration_ms;
-        for enabled in [true, false] {
+        assert_eq!(
+            fs_overflow_panel_body_row_count(FsOverflowPanelState::PageTurnAnimation),
+            4
+        );
+        assert!(!FsOverflowPanelState::PageTurnAnimation.closes_on_file_change());
+        let mut saved_style = Curl;
+        for (label, choice) in [
+            ("ページめくりアニメーション", None),
+            ("スライド", Some(Some(Slide))),
+            ("OFF", Some(None)),
+            ("めくる", Some(Some(Curl))),
+            ("スライド", Some(Some(Slide))),
+            ("OFF", Some(None)),
+        ] {
+            let destination = app.page_turn_destination();
+            app.page_turn_presentation
+                .seed_operation_for_test(destination, 772);
             {
                 let mut fonts_ready = false;
                 let mut harness = crate::test_ui::builder()
@@ -69167,16 +69271,193 @@ mod tests {
                         });
                     });
                 harness.run();
-                harness.get_by_label("ページめくりアニメーション").click();
+                harness.get_by_label(label).click();
                 harness.run();
+                let mut selected_positions = Vec::new();
+                for clipped in &harness.output().shapes {
+                    selected_text_positions(&clipped.shape, &mut selected_positions);
+                }
+                assert_eq!(
+                    selected_positions.len(),
+                    1,
+                    "exactly one choice is marked selected"
+                );
+                let selected_index: usize = match choice.flatten() {
+                    None => 0,
+                    Some(Curl) => 1,
+                    Some(Slide) => 2,
+                };
+                let (row, _, _): (egui::Rect, egui::Rect, egui::Rect) = harness.ctx.data(|data| {
+                    data.get_temp(egui::Id::unique((
+                        "fs_overflow_row_test",
+                        ("page_turn_animation", selected_index),
+                    )))
+                    .unwrap()
+                });
+                assert!(
+                    row.contains(selected_positions[0]),
+                    "the selected marker belongs to the chosen row"
+                );
             }
-            assert_eq!(app.settings.page_turn_animation_enabled, enabled);
             assert_eq!(app.settings.page_turn_animation_duration_ms, duration);
-            assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
-            let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
-            assert_eq!(stored.page_turn_animation_enabled, enabled);
-            assert_eq!(stored.page_turn_animation_duration_ms, duration);
+            assert_eq!(
+                app.fs_overflow_panel_state,
+                FsOverflowPanelState::PageTurnAnimation
+            );
+            if let Some(choice) = choice {
+                saved_style = choice.unwrap_or(saved_style);
+                assert_eq!(app.settings.page_turn_animation_enabled, choice.is_some());
+                assert_eq!(app.settings.page_turn_animation_style, saved_style);
+                assert_eq!(app.page_turn_presentation.operation_for_test(), None);
+                assert_eq!(
+                    app.fullscreen_overflow_panel_view(false)
+                        .page_turn_animation,
+                    choice
+                );
+                assert_eq!(
+                    app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+                    Some(
+                        format!(
+                            "[ページめくりアニメーション {}]",
+                            page_turn_animation_label(choice)
+                        )
+                        .as_str()
+                    )
+                );
+                let stored =
+                    crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+                assert_eq!(stored.page_turn_animation_enabled, choice.is_some());
+                assert_eq!(stored.page_turn_animation_style, saved_style);
+                assert_eq!(stored.page_turn_animation_duration_ms, duration);
+            } else {
+                assert!(!app.settings.page_turn_animation_enabled);
+                assert_eq!(app.settings.page_turn_animation_style, Curl);
+                assert_eq!(
+                    app.page_turn_presentation.operation_for_test(),
+                    Some((destination, 772))
+                );
+                assert!(app.fs_feedback_toast.is_none());
+            }
         }
+        let ctx = egui::Context::default();
+        let view = app.fullscreen_overflow_panel_view(false);
+        app.apply_fs_overflow_panel_action(&ctx, &view, false, FsOverflowPanelAction::Back);
+        assert_eq!(app.fs_overflow_panel_state, FsOverflowPanelState::Root);
+    }
+
+    #[test]
+    fn page_turn_animation_key_toggle_preserves_style_and_persists() {
+        #[cfg(windows)]
+        let _serial = crate::key_input::lock_test_input();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(PathBuf::from("page.jpg"))];
+        app.thumbnails = vec![crate::grid_item::ThumbnailState::Pending];
+        app.fullscreen_idx = Some(0);
+        app.keymap = Keymap::from_ini_str("[FsImage]\nFsPageTurnAnimationToggle = A\n");
+        let ctx = egui::Context::default();
+        #[cfg(windows)]
+        let _clear = ClearTestKeyFrame;
+        #[cfg(windows)]
+        crate::key_input::clear_test_frame();
+        for style in [
+            crate::settings::PageTurnAnimationStyle::Curl,
+            crate::settings::PageTurnAnimationStyle::Slide,
+        ] {
+            app.settings.page_turn_animation_style = style;
+            for enabled in [true, false] {
+                let destination = app.page_turn_destination();
+                app.page_turn_presentation
+                    .seed_operation_for_test(destination, 772);
+                ctx.begin_pass(egui::RawInput {
+                    events: vec![plain_key_press(egui::Key::A)],
+                    ..Default::default()
+                });
+                cache_fullscreen_keyboard_owner_for_test(&ctx);
+                app.handle_fs_key_input(&ctx, 0, false);
+                let _ = ctx.end_pass().drop_without_applying_deltas();
+                assert_eq!(app.settings.page_turn_animation_enabled, enabled);
+                assert_eq!(app.settings.page_turn_animation_style, style);
+                assert_eq!(app.page_turn_presentation.operation_for_test(), None);
+                let stored =
+                    crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+                assert_eq!(stored.page_turn_animation_enabled, enabled);
+                assert_eq!(stored.page_turn_animation_style, style);
+                assert_eq!(
+                    app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+                    Some(
+                        format!(
+                            "[ページめくりアニメーション {}]",
+                            page_turn_animation_label(enabled.then_some(style))
+                        )
+                        .as_str()
+                    )
+                );
+                ctx.begin_pass(egui::RawInput {
+                    events: vec![plain_key_release(egui::Key::A)],
+                    ..Default::default()
+                });
+                let _ = ctx.end_pass().drop_without_applying_deltas();
+            }
+        }
+    }
+
+    #[test]
+    fn page_turn_animation_overflow_style_selection_preserves_mounted_context() {
+        use crate::settings::PageTurnAnimationStyle::{Curl, Slide};
+        let ctx = egui::Context::default();
+        let mut app = crate::app::setup_app_for_test();
+        app.items = vec![GridItem::Image(app.tmp.path().join("main.png"))];
+        app.fullscreen_idx = Some(0);
+        app.adopt_page_turn_animation_settings(true, 400, Curl);
+        let main = app.page_turn_destination();
+        app.page_turn_presentation.seed_operation_for_test(main, 41);
+        app.fs_overflow_panel_state = FsOverflowPanelState::Root;
+        let before_items = app.items.clone();
+        let before_input = app.input_seq;
+        let view = app.fullscreen_overflow_panel_view(false);
+        app.apply_fs_overflow_panel_action(
+            &ctx,
+            &view,
+            false,
+            FsOverflowPanelAction::Activate(FullscreenOverflowItemId::PageTurnAnimationToggle),
+        );
+        assert_eq!(
+            app.fs_overflow_panel_state,
+            FsOverflowPanelState::PageTurnAnimation
+        );
+        assert_eq!(
+            app.page_turn_presentation.operation_for_test(),
+            Some((main, 41))
+        );
+        assert_eq!(app.settings.page_turn_animation_style, Curl);
+        assert!(app.fs_feedback_toast.is_none());
+        let view = app.fullscreen_overflow_panel_view(false);
+        app.apply_fs_overflow_panel_action(
+            &ctx,
+            &view,
+            false,
+            FsOverflowPanelAction::SetPageTurnAnimation(Some(Slide)),
+        );
+        assert!(app.settings.page_turn_animation_enabled);
+        assert_eq!(app.settings.page_turn_animation_style, Slide);
+        assert_eq!(app.settings.page_turn_animation_duration_ms, 400);
+        assert_eq!(app.page_turn_presentation.operation_for_test(), None);
+        assert_eq!(app.page_turn_destination(), main);
+        assert_eq!(app.items, before_items);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert_eq!(app.input_seq, before_input);
+        assert_eq!(
+            app.fs_overflow_panel_state,
+            FsOverflowPanelState::PageTurnAnimation
+        );
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            Some("[ページめくりアニメーション スライド]")
+        );
+        let stored = crate::settings_db::with_db_result(|db| db.load_into_settings()).unwrap();
+        assert!(stored.page_turn_animation_enabled);
+        assert_eq!(stored.page_turn_animation_style, Slide);
+        assert_eq!(stored.page_turn_animation_duration_ms, 400);
     }
 
     #[test]
@@ -101001,7 +101282,8 @@ pub(crate) mod page_turn_submission_tests {
             let ctx = egui::Context::default();
             let mut app = ready_app(&ctx, SpreadMode::Single);
             seed_interrupted_leaf(&ctx, &mut app, 2);
-            app.adopt_page_turn_animation_settings(enabled, 600);
+            let style = app.settings.page_turn_animation_style;
+            app.adopt_page_turn_animation_settings(enabled, 600, style);
             assert!(app.page_turn_completion_active());
             let held = app
                 .page_turn_held_resource(1)
@@ -101488,6 +101770,7 @@ mod music_overflow_tests {
                 root_rows: Vec::new(),
                 navigator_corner: FullscreenNavigatorCorner::BottomRight,
                 reading_order: Default::default(),
+                page_turn_animation: None,
                 shift: Default::default(),
                 music_note_color_scheme: MusicNoteColorScheme::Fifths,
                 slideshow: Default::default(),

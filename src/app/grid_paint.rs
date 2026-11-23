@@ -1689,6 +1689,19 @@ fn paint_cell(
     hit_areas
 }
 
+pub(crate) fn draw_grid_drop_target(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    visuals: &egui::Visuals,
+) {
+    painter.rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(2.0, visuals.selection.stroke.color),
+        egui::StrokeKind::Middle,
+    );
+}
+
 /// Draw the cut-state marker independently from faded item content and interaction overlays.
 ///
 /// Painter primitives keep the scissors recognizable without relying on an installed glyph.
@@ -3827,6 +3840,31 @@ pub(crate) fn tq_draw_preview(
     }
 
     response
+}
+
+/// Pure folder cells for external-drop snapshots.
+pub(crate) fn draw_drop_hover_snapshot_cells(ui: &mut egui::Ui) {
+    ui.horizontal(|ui| {
+        for (label, drop_target) in [("通常", false), ("落とし先", true)] {
+            ui.vertical(|ui| {
+                let response = draw_video_indicator_snapshot_cell(
+                    ui,
+                    egui::vec2(145.0, 118.0),
+                    label,
+                    &GridItem::Folder("フォルダ".into()),
+                    &ThumbnailState::Failed,
+                    VideoThumbnailIndicator::default(),
+                    AudioThumbnailIndicator::default(),
+                    false,
+                    0,
+                    &[],
+                );
+                if drop_target {
+                    draw_grid_drop_target(ui.painter(), response.rect, ui.visuals());
+                }
+            });
+        }
+    });
 }
 
 /// Snapshot fixture for the three typed unavailable projections used by a collection Grid.

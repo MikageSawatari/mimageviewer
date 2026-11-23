@@ -169,7 +169,7 @@
 | 範囲 | 採否 | 理由 |
 | --- | --- | --- |
 | **ブラウザが表示している画像** (右クリックした画像そのもの) | **採用** | 利用者が見ているものと一致する。段 1 では取得はブラウザが済ませている。段 2 では同じ URL を拡張が改めて取得する (§9.2-3) |
-| 画像がリンクで包まれていて、リンク先が画像ファイルのときはリンク先 (段 2 のみ) | 利用者の判断 (§13 Q4) | サイトに依らない一般の規則。Chrome の右クリック情報 (`OnClickData.linkUrl`) で分かる。リンク先の origin が画像と違えば、その origin の許可も要る (§9.6、2026-11-22 追記)。既存の取り込みの HTML 解析も、画像拡張子への `<a href>` を候補にしている ([clipboard-capture-plan.md](clipboard-capture-plan.md) §7)。2026-10-02 の S0 では、作品ページの HTML の 1 件のリンクが原寸画像を指していた (同 §5.8)。ただし、右クリックした画像がそのリンクの中にあるかは未確認 |
+| 画像がリンクで包まれていて、リンク先が画像ファイルのときはリンク先 (段 2 のみ) | 利用者の判断 (§13 Q4) | サイトに依らない一般の規則。Chrome の右クリック情報 (`OnClickData.linkUrl`) で分かる。リンク先の origin が画像と違えば、その origin の許可も要る (§9.6、2026-11-22 追記)。既存の取り込みの HTML 解析も、画像拡張子への `<a href>` を候補にしている ([clipboard-capture-plan.md](clipboard-capture-plan.md) §7)。2026-10-02 の S0 では、作品ページの HTML の 1 件のリンクが原寸画像を指していた (同 §5.8)。ただし、右クリックした画像がそのリンクの中にあるかは未確認。0.2.1 (2026-11-23、利用者が Commons の説明ページで NG を報告) では、リンク先は `Content-Type: image/*` のときだけ使い、それ以外はページの画像を開いて `success_fallback` で知らせる |
 | サイトごとに原寸の URL へ書き換える (例: URL の大きさの指定を変える) | **不採用** | サイトの作りに依存し、変更のたびに壊れる。既存の取り込みでも範囲外とした (同 §12)。X の規約の "try to work around any technical limitations" と読まれる余地もある |
 
 段 1 (コピー) で得られる画像の性質:
@@ -285,6 +285,8 @@ CLAUDE.md「設計の簡素化」に従い、扱う組み合わせを先に減�
 2. **位置を読む**: `scripting.executeScript` でそのタブの上位フレームに小さな関数を入れ、`window.screenX` / `screenY` / `outerWidth` / `outerHeight` / `innerWidth` / `innerHeight` / `devicePixelRatio` と、記録しておいた直前の右クリックの座標 (§9.3) だけを読む。**ページの内容は読まない**。ページの拡大率は `tabs.getZoom`、窓の状態 (通常・最大化) は `windows.get` で読む。
 3. **取得する** (2026-11-22 に改めた。改める前は `downloads.download` でブラウザに保存させる案、§9.11):
    - 右クリック情報の `srcUrl` (§13 Q4 によっては `linkUrl`) を、拡張の service worker が `fetch` で取得する (`credentials: "include"`、`cache: "no-store"`)。Cookie の扱いは、許可したサイトへの拡張の取得として Chrome に従う。
+   - **0.2.1 (2026-11-23)**: 画像拡張子のリンク先とページの画像を、同一 URL を除いた候補にする。両候補とページの origin を最初にまとめて求め、どちらかの画像 origin が未許可なら取得しない。リンク先は応答の `Content-Type: image/*` のときだけ使い、それ以外は本文を読まず cancel し、DNR 規則を外してからページの画像用に付け直す。取得自体の失敗では切り替えず、切り替え後の成功は `success_fallback` で知らせる。送る `image_url`・`final_url` は実際に使った候補の値とする。
+     - 独立レビュー P2 対応: ページの画像が `data:`・`blob:`・不正 URL のときも、有効な画像リンクだけは従来どおり取得できる。許可要求には実際の候補とページの origin だけを入れる。リンク先が非画像で切り替え先が無いときは、本文を cancel して `link_not_image` で知らせる。
    - **最初の URL への要求の参照元は、どのサイトでも常にページの origin (`https://<ページのホスト>/`) にする** (リダイレクトの転送先への要求は Chrome に従う、下)。取得の直前に、その画像の URL と完全に一致し、タブに属さない要求 (`tabIds: [TAB_ID_NONE]`) だけに効く 1 回限りの規則 (`declarativeNetRequest` のセッションの規則、`modifyHeaders` で `Referer` を設定) を足し、取得が終わったら成否にかかわらず消す。パスや検索語は送らない。
      - **ページや画像の参照元の方針とは関係なく、ページの origin を送る**。ブラウザ自身が表示するときに送る値とは一致しない場合がある: 既定の方針 (`strict-origin-when-cross-origin`) でも、同じ origin ならパスまで送り、HTTPS のページから HTTP の画像へは送らない。ページが `no-referrer` などを指定していれば送らない (https://w3c.github.io/webappsec-referrer-policy/#referrer-policy-strict-origin-when-cross-origin)。この送信は privacy.html とストアの開示に書く (§11)。
    - **リダイレクト**: `fetch` の既定どおり追う。参照元の規則は最初の URL にだけ効き、転送先への要求の参照元は Chrome に任せる。転送先の origin が許可されていないと取得が失敗することがある。どちらも未確認 (試作の X・pixiv の取得でリダイレクトがあったかは記録していない)。転送先で失敗したら、ほかの取得の失敗と同じくバッジで示して終える。規則を転送先へ広げる処理や、転送先の許可を求め直す処理は持たない。Mark of the Web の `HostUrl` には最後の URL (`response.url`) を、`ReferrerUrl` にはページの URL を書く。
