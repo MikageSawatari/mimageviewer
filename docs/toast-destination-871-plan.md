@@ -155,3 +155,21 @@ detached の経路に触れるので、CLAUDE.md「Detached viewer リワーク�
 
 設計レビュー 1〜2 往復、実装 (Codex Sol / high) 1〜2 時間、独立レビュー 1 往復の見込み。v5.7.0 に入る規模。
 サブ PC の確認は、別ウィンドウ + AI の変更で通知が 1 つ、動画の通知が長い文で読み切れる、の 2 点。
+
+## 8. 独立設計レビュー r1 (Sol / xhigh、2026-11-23、a583320fe): REJECT、構造的修正への合意は DISAGREE
+
+方向 (宛先なしの sentinel を無くす) は構造的だが、宛先の所有境界が未解決という判定。改訂が要る点:
+
+- P1: `Viewer` は窓を一意にしない。メインの窓の中のビューアと、active な別ウィンドウのビューアは同時に描かれ得る
+  (`src/app.rs:4256`・`:103020`、`src/app/tests.rs:85347`)。宛先は面ではなく既存の context / window の identity で持つ。
+  passive / pinned の静的な snapshot は通知を描かない (`src/ui_fullscreen.rs:23937`)。
+- P2: `current_input_surface()` は projection で答えが変わる (`active_detached_context_is_at_rest` と投影中の
+  `fullscreen_idx` の混在、Building・読み込み中)。projection に依存しない表示 owner からの解決が要る。
+- P2: native の転送先は発行時に mount されている context の player (`src/app/native_video.rs:15110`)。宛先の解決と
+  egui / native の選択を 1 つの発行経路にする。
+- P2: native だけに出すと、保存完了の通知の「保存先を開く」(`RevealPath`) が失われる / 前の通知に付く。
+  text・宛先・action を 1 つの payload にする。
+- P2: native の時間は通常 / 中央寄せで終点が違い、`Immediate(0.7)` (シーク境界) の例外がある。centered が分かる時点で
+  期限を 1 つに確定し、不透明度と削除の両方に使う。
+- P3: 直接書く所の一覧が不足 (キャプチャ保存 `src/app.rs:95353`、AI 診断)。両方に出すことを確かめている既存テスト
+  (`src/app/tests.rs:40106`、`src/app/tests/notification_duration.rs:66`) を仕様変更として先に列挙する。
