@@ -70,7 +70,7 @@ foreach ($store in @('chrome', 'edge')) {
     }
 }
 
-# Snapshot only allowlisted files once; both packages use the same source bytes.
+# Snapshot only allowlisted files once; all packages use the same source bytes.
 $contents = @{}
 foreach ($name in $entries) {
     $path = Join-Path $sourceRoot $name
@@ -94,11 +94,35 @@ $keyGroup = $keyMatches[0].Groups['value']
 $edgeManifest = $manifestText.Substring(0, $keyGroup.Index) + $stores.edge.key +
     $manifestText.Substring($keyGroup.Index + $keyGroup.Length)
 
+# Remove only the standalone key line, retaining all other formatting and bytes.
+# Require a trailing comma: an unsupported layout must fail rather than rewrite JSON.
+$keyLines = [regex]::Matches($edgeManifest, '(?m)^[ \t]*"key"[ \t]*:[ \t]*"(?<value>[A-Za-z0-9+/=]+)"[ \t]*,[ \t]*(?:\r?\n|\z)')
+if ($keyLines.Count -ne 1 -or $keyLines[0].Groups['value'].Value -cne $stores.edge.key) {
+    throw 'The Edge manifest must have exactly one standalone key line with a trailing comma.'
+}
+$keyLine = $keyLines[0]
+$edgeStoreManifest = $edgeManifest.Remove($keyLine.Index, $keyLine.Length)
+$edgeFields = $edgeManifest | ConvertFrom-Json
+$edgeStoreFields = $edgeStoreManifest | ConvertFrom-Json
+if ($null -ne $edgeStoreFields.PSObject.Properties['key']) {
+    throw 'The Edge store manifest must not contain a key field.'
+}
+$edgeFields.PSObject.Properties.Remove('key')
+if (($edgeFields | ConvertTo-Json -Depth 100 -Compress) -cne
+    ($edgeStoreFields | ConvertTo-Json -Depth 100 -Compress)) {
+    throw 'The Edge store manifest changed fields other than key.'
+}
+
+$packages = @(
+    [pscustomobject] @{ Name = 'chrome'; Suffix = ''; ManifestBytes = $contents['manifest.json'] },
+    [pscustomobject] @{ Name = 'edge'; Suffix = ''; ManifestBytes = $utf8.GetBytes($edgeManifest) },
+    [pscustomobject] @{ Name = 'edge'; Suffix = '-store'; ManifestBytes = $utf8.GetBytes($edgeStoreManifest) }
+)
 Assert-NoReparsePoint $outputPath
 [void] [IO.Directory]::CreateDirectory($outputPath)
 $fixedTime = [DateTimeOffset]::new(1980, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
-foreach ($store in @('chrome', 'edge')) {
-    $zipPath = Join-Path $outputPath ("mimageviewer-browser-extension-{0}-v{1}.zip" -f $store, $manifest.version)
+foreach ($package in $packages) {
+    $zipPath = Join-Path $outputPath ("mimageviewer-browser-extension-{0}-v{1}{2}.zip" -f $package.Name, $manifest.version, $package.Suffix)
     Assert-NoReparsePoint $zipPath
     $file = [IO.File]::Open($zipPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
     try {
@@ -108,8 +132,8 @@ foreach ($store in @('chrome', 'edge')) {
                 $entry = $zip.CreateEntry($name, [IO.Compression.CompressionLevel]::Optimal)
                 $entry.LastWriteTime = $fixedTime
                 $entry.ExternalAttributes = 0
-                $bytes = if ($store -eq 'edge' -and $name -eq 'manifest.json') {
-                    $utf8.GetBytes($edgeManifest)
+                $bytes = if ($name -eq 'manifest.json') {
+                    $package.ManifestBytes
                 } else { $contents[$name] }
                 $stream = $entry.Open()
                 try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }

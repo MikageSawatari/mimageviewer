@@ -140,12 +140,18 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
    ```powershell
    .\scripts\package-browser-extension.ps1
    ```
-   出力は `target/browser-extension/mimageviewer-browser-extension-chrome-v<EXT_VERSION>.zip` と
-   `target/browser-extension/mimageviewer-browser-extension-edge-v<EXT_VERSION>.zip`。
+   出力は `target/browser-extension/` の次の 3 ファイル。
+
+   - `mimageviewer-browser-extension-chrome-v<EXT_VERSION>.zip` (Chrome 用、key 入り)
+   - `mimageviewer-browser-extension-edge-v<EXT_VERSION>.zip` (Edge の確認用、key 入り)
+   - `mimageviewer-browser-extension-edge-v<EXT_VERSION>-store.zip` (Edge の提出用、key なし)
+
    スクリプトは、`store-keys.json` の公開鍵から SHA-256 の先頭 16 バイトを a〜p の ID に変換して指定 ID と照合し、
-   ソース manifest が Chrome の公開鍵であることも検査する。Edge は生成する manifest の公開鍵だけを置き換える。
+   ソース manifest が Chrome の公開鍵であることも検査する。Edge の確認用は生成する manifest の公開鍵だけを置き換える。
+   Edge の提出用は確認用の manifest から key の 1 行だけを取り除き、正しい JSON で key 以外の全フィールドが同じことを検査する。
    ソース、テスト、鍵の控えを変更せず、manifest・worker・座標用 script・ja/en の messages・4 サイズの icon だけを収録する。
-   ZIP の順序・時刻・圧縮設定は固定。テストは 2 回の ZIP のバイト一致、権限・翻訳・収録内容とソース不変を検査する。
+   ZIP の順序・時刻・圧縮設定は固定。テストは 3 種とも 2 回の ZIP のバイト一致、権限・翻訳・収録内容とソース不変を検査する。
+   Edge の提出用は key がなく、確認用と比べて key 行以外の manifest のバイトと全フィールド、manifest 以外の収録物のバイトが同じことも検査する。
    `-OutputDirectory` はこの worktree の `target/browser-extension` 内だけ指定でき、junction 等への出力は拒否する。
 3. **提出の前に、利用者のブラウザで通しの確認をする** (初回の提出と、拡張の動きを変えた更新のとき)。
    モック・ZIP の検査では、実際のブラウザでの動作は確かめられない。
@@ -156,7 +162,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
        起動したら、拡張を読み込む前に「設定 → プロファイル → 同期」で同期をオフにする。同期で入った拡張機能や設定は、試験用のプロファイルでも削除・変更しない (普段の Edge に伝わる)。
        Chrome は自動でサインインしないが、ログインや同期を求められたら断る。
        利用者に渡す手引きの例は `C:\home\mimageviewer-subpc\browser818\store-check\guide-store-check.md`。
-     - 拡張機能のページで「デベロッパー モード」を ON にし、手順 2 の ZIP を展開したフォルダを「パッケージ化されていない拡張機能を読み込む」で読み込む。
+     - 拡張機能のページで「デベロッパー モード」を ON にし、手順 2 の key 入りの ZIP (Edge は `-store` の付かない確認用) を展開したフォルダを「パッケージ化されていない拡張機能を読み込む」で読み込む。
      - 拡張のフォルダを新しい版に差し替えたら、ブラウザを起動し直していても古い版のコードが動き続けることがある。Chrome は拡張機能のページで拡張の「再読み込み」を押し、Edge は拡張を削除してから読み込み直す (2026-11-23、0.2.1 の確認で利用者が観測)。
        Chrome には chrome 用、Edge には edge 用を読み込む。
      - 表示された拡張の ID がストアの ID (Chrome `fpppoodelfkddekjahhmalmmfdhbpdma` / Edge `dlcbdkekoppppebnhhncghhglkkccdhk`) と同じことを確かめる。
@@ -183,7 +189,8 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
      - 保存した試験画像と、試験用のプロファイルのフォルダを削除する。
      - 登録を残すかどうかは利用者が決める。
      - 結果を記録し、NG があれば提出しない。
-4. Chrome ウェブストアと Microsoft Edge アドオンへ、それぞれ対応する ZIP を提出する。
+4. Chrome ウェブストアへは従来どおり key 入りの Chrome 用 ZIP、Microsoft Edge アドオンへは key なしの Edge 提出用 (`-store.zip`) を提出する。
+   Edge の Partner Center が key 入りの manifest を拒否したため (2026-11-23、利用者の提出時の画面)。Chrome は key 入りで受け付けられた。
    ストアの説明・権限ごとの理由・プライバシーの開示は
    [ブラウザ連携の設計 §9.6・§9.10・§11](browser-to-miv-plan.md) に合わせる。
    拡張の更新も審査を伴うので、本体の公開と切り離して扱う。拡張と native host の通信の版 `v` を先に進めず、
