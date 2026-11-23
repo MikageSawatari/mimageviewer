@@ -1380,9 +1380,11 @@ mod file_organize_tests {
                 let (tx, rx) = mpsc::channel();
                 match terminal {
                     0 => tx
-                        .send(Ok(ShellTransferOutcome { aborted: false }))
+                        .send(Ok(ShellTransferOutcome::test_outcome(0, Ok(false), 0)))
                         .unwrap(),
-                    1 => tx.send(Ok(ShellTransferOutcome { aborted: true })).unwrap(),
+                    1 => tx
+                        .send(Ok(ShellTransferOutcome::test_outcome(0, Ok(true), 0)))
+                        .unwrap(),
                     2 => tx.send(Err("fake failure".into())).unwrap(),
                     _ => {}
                 }
@@ -46272,7 +46274,7 @@ mod favorite_adjustment_defaults_tests {
         tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
             target: app.tmp.path().join("before.jpg"),
             new_path: app.tmp.path().join("after.jpg"),
-            aborted: false,
+            operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(0, Ok(false), 0),
         }))
         .unwrap();
         app.poll_rename_pending(&ctx);
@@ -46319,7 +46321,7 @@ mod favorite_adjustment_defaults_tests {
         tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
             target: app.tmp.path().join("old-folder"),
             new_path: app.tmp.path().join("new-folder"),
-            aborted: false,
+            operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(0, Ok(false), 0),
         }))
         .unwrap();
         app.poll_rename_pending(&ctx);
@@ -46330,7 +46332,11 @@ mod favorite_adjustment_defaults_tests {
             Ok(crate::shell_file_ops::ShellRenameOutcome {
                 target: app.tmp.path().join("cancelled"),
                 new_path: app.tmp.path().join("cancelled-new"),
-                aborted: true,
+                operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(
+                    0,
+                    Ok(true),
+                    0,
+                ),
             }),
             Err("worker failed".to_string()),
         ] {
@@ -46343,6 +46349,58 @@ mod favorite_adjustment_defaults_tests {
             app.poll_rename_pending(&ctx);
             assert!(app.rename_pending.is_none());
             assert_eq!(app.rename_migration_queue.len(), 1);
+        }
+    }
+
+    #[test]
+    fn rename_858_noncompleted_notices_do_not_start_path_migration() {
+        for (perform, abort, processed, expected) in [
+            (0, Ok(true), 0, "名前の変更は中断されました"),
+            (
+                0x80270000u32 as i32,
+                Ok(false),
+                0,
+                "名前の変更は中断されました",
+            ),
+            (
+                0,
+                Ok(true),
+                1,
+                "操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください",
+            ),
+            (
+                0x80070005u32 as i32,
+                Ok(false),
+                0,
+                "操作を完了できませんでした。フォルダの内容を確認してください\nShell: 0x80070005、中断状態: 中断なし",
+            ),
+            (
+                0,
+                Err(0x80004005u32 as i32),
+                0,
+                "操作を完了できませんでした。フォルダの内容を確認してください\nShell: 0x00000000、中断状態: 照会失敗 0x80004005",
+            ),
+        ] {
+            let mut app = setup_app();
+            let (tx, rx) = std::sync::mpsc::channel();
+            app.rename_pending = Some(crate::ui_dialogs::rename_item::RenamePending {
+                rx,
+                collection_scope: crate::collection_store::CollectionSourceMigrationScope::Exact,
+            });
+            tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
+                target: app.tmp.path().join("before.jpg"),
+                new_path: app.tmp.path().join("after.jpg"),
+                operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(
+                    perform, abort, processed,
+                ),
+            }))
+            .unwrap();
+            app.pending_reload = false;
+            app.poll_rename_pending(&egui::Context::default());
+            assert!(app.rename_pending.is_none());
+            assert!(app.rename_migration_queue.is_empty());
+            assert!(!app.pending_reload);
+            assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, expected);
         }
     }
 

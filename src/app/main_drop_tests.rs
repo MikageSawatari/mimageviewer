@@ -477,8 +477,8 @@ fn main_drop_production_grid_routing_reaches_existing_search_refusal() {
 }
 
 #[test]
-fn main_drop_completed_transfers_observe_each_parent_and_notify_current_folder_once() {
-    for terminal in 0..3 {
+fn main_drop_858_completed_transfers_observe_each_parent_and_notify_current_folder_once() {
+    for terminal in 0..8 {
         let mut app = ready();
         let ctx = egui::Context::default();
         let root = app.tmp.path().join("tree");
@@ -512,14 +512,66 @@ fn main_drop_completed_transfers_observe_each_parent_and_notify_current_folder_o
         ];
         let (tx, rx) = mpsc::channel();
         tx.send(match terminal {
-            0 => Ok(ShellTransferOutcome { aborted: false }),
-            1 => Ok(ShellTransferOutcome { aborted: true }),
+            0 => Ok(ShellTransferOutcome::test_outcome(0, Ok(false), 0)),
+            1 => Ok(ShellTransferOutcome::test_outcome(0, Ok(true), 0)),
+            3 => Ok(ShellTransferOutcome::test_outcome(0, Ok(true), 1)),
+            4 => Ok(ShellTransferOutcome::test_outcome(
+                0x80070005u32 as i32,
+                Ok(false),
+                1,
+            )),
+            5 => Ok(ShellTransferOutcome::test_outcome(
+                0,
+                Err(0x80004005u32 as i32),
+                0,
+            )),
+            6 | 7 => {
+                let mut outcome = ShellTransferOutcome::test_outcome(
+                    if terminal == 6 {
+                        0
+                    } else {
+                        0x80070005u32 as i32
+                    },
+                    Ok(terminal == 6),
+                    0,
+                );
+                outcome.counts.failed = 1;
+                outcome.counts.first_failed_hresult = Some(0x80270027u32 as i32);
+                Ok(outcome)
+            }
             _ => Err("fake transfer failure".into()),
         })
         .unwrap();
         app.file_organize_request =
             FileOrganizeRequest::Running(Box::new(FileOrganizeRunning { request, rx }));
         app.poll_file_organize(&ctx);
+        let expected = match terminal {
+            0 => None,
+            1 => Some("操作が中断されました。移動・コピーした項目はありません"),
+            2 => Some(
+                "操作を完了できませんでした。フォルダの内容を確認してください\nfake transfer failure",
+            ),
+            3 => Some(
+                "操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください",
+            ),
+            4 => Some(
+                "操作を完了できませんでした。フォルダの内容を確認してください。一部の項目は処理済みです\nShell: 0x80070005、中断状態: 中断なし",
+            ),
+            5 => Some(
+                "操作を完了できませんでした。フォルダの内容を確認してください\nShell: 0x00000000、中断状態: 照会失敗 0x80004005",
+            ),
+            6 => Some(
+                "操作が中断されました。移動・コピーした項目はありません\n失敗した項目: 1 件 (Shell: 0x80270027)",
+            ),
+            7 => Some(
+                "操作を完了できませんでした。フォルダの内容を確認してください\nShell: 0x80070005、中断状態: 中断なし、項目: 0x80270027",
+            ),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            app.fs_feedback_toast.as_ref().map(|toast| toast.0.as_str()),
+            expected
+        );
         for folder in [&source, &other_source, &destination] {
             assert!(app.folder_pane.test_unverified(folder));
         }
@@ -535,6 +587,50 @@ fn main_drop_completed_transfers_observe_each_parent_and_notify_current_folder_o
             app.external_rescan_pending.is_none(),
             "completion must not notify twice"
         );
+    }
+}
+
+#[test]
+fn main_drop_858_external_copy_poll_preserves_shared_notices_and_reload() {
+    for (perform, abort, processed, expected) in [
+        (
+            0,
+            Ok(true),
+            0,
+            "操作が中断されました。移動・コピーした項目はありません",
+        ),
+        (
+            0,
+            Ok(true),
+            1,
+            "操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください",
+        ),
+        (
+            0x80070005u32 as i32,
+            Ok(false),
+            1,
+            "操作を完了できませんでした。フォルダの内容を確認してください。一部の項目は処理済みです\nShell: 0x80070005、中断状態: 中断なし",
+        ),
+    ] {
+        let mut app = ready();
+        let copy = crate::file_drag::copy_dropped_paths_blocking(
+            None,
+            vec!["source.txt".into()],
+            "destination".into(),
+            |_, _| {
+                Ok(ShellTransferOutcome::test_outcome(
+                    perform, abort, processed,
+                ))
+            },
+        );
+        let (tx, rx) = mpsc::channel();
+        tx.send(copy).unwrap();
+        app.drop_copy_pending.push(rx);
+        app.pending_reload = false;
+        app.poll_file_drop_pending();
+        assert!(app.pending_reload);
+        assert!(app.drop_copy_pending.is_empty());
+        assert_eq!(app.fs_feedback_toast.as_ref().unwrap().0, expected);
     }
 }
 

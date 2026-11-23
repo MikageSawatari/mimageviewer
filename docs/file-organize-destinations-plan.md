@@ -1,5 +1,7 @@
 # §1.263 固定の「ファイル整理先」へコピー・移動する設計案
 
+- 2026-11-22: §1.858 A 中断状態の常時照会、元の HRESULT と項目別ログ、処理済み件数による共通通知を追加。自動再試行なし。
+
 2026-10-04。対象 worktree: `C:\home\mimageviewer-fileops`、branch: `next-file-ops`。
 要件の正本は [next-release-backlog.md §1.263](next-release-backlog.md#1263-固定のファイル整理先へ選択項目をコピー移動する--444447-2026-09-21)。
 2026-10-04 の独立レビュー後の利用者決定と補足 P2/P3 を反映。実装済み (レビュー前)。製品バイナリの起動、コミットは行わず、自動検証と利用者の実機確認を分ける。
@@ -8,7 +10,7 @@
 
 お気に入りとは別の `Settings.file_organize_destinations` を環境設定で編集し、グリッドの右クリックと既定キーなしの `KeyAction` から同じ整理先選択画面を開く。各行の「移動」「コピー」から Windows Shell に直接依頼する。クリップボードとお気に入りを変更せず、整理先へ一覧を移動しない。
 
-既存の `shell_file_ops.rs` にある STA・`IFileOperation`・channel による非同期実行の形を拡張する。コピー／移動そのもの、競合確認、進捗、取消、アクセス拒否、部分失敗は Shell が担当する。mIV 専用の転送エンジン、常設 worker、進捗集計、失敗分類、再試行、ロールバック、操作ジャーナルは作らない。
+既存の `shell_file_ops.rs` にある STA・`IFileOperation`・channel による非同期実行の形を拡張する。コピー／移動そのもの、競合確認、進捗、取消、アクセス拒否、部分失敗は Shell が担当する。mIV 専用の転送エンジン、常設 worker、進捗 UI の集計、原因別の回復分類、再試行、ロールバック、操作ジャーナルは作らない。§1.858 A の終端分類と診断ログは §5.2 を参照。
 
 - 対象は入口で確定した実ファイル／実フォルダ全件。カーソルとチェックを実行時に取り直さない。
 - ZIP/PDF 内ページや合成セルを実ファイル、代表画像、外側コンテナへ勝手に置き換えない。
@@ -138,7 +140,26 @@ App が持つ新しい状態は、この機能の一つの request owner（非�
 
 `IFileOperation` は STA のみで使用でき、標準の進捗・エラーダイアログを持つ。根拠: [Microsoft Learn: IFileOperation](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nn-shobjidl_core-ifileoperation)。
 
-結果は操作終端の成否／中断だけで足りる。元／先の照合には要求にある source の親と整理先を使う。消失 path、保持 snapshot の実パス、旧→新の対応、item ごとの結果／競合後名は取得しない。`PostMoveItem` sink、完了後の存在確認 worker、保持一覧の収集を追加しない。Windows の処理が始まった後は Remote 接続や終了要求を理由に停止せず、mIV の途中中断／終了待機／再開機構を作らない。終了をまたぐ完了保証も加えない。
+§1.858 A では実行の成否にかかわらず `GetAnyOperationsAborted` を呼び、元の HRESULT と中断照会の `Result<bool, HRESULT>` を別々に保持する。
+分類は中断ありまたは cancel HRESULT (`0x80270000` / `0x800704C7`) なら Interrupted、実行成功かつ中断なしなら Completed、それ以外は Failed。
+中断照会失敗を false にしない。別の実行失敗が中断と併発したら元の HRESULT も表示する。
+`PostMoveItem / PostCopyItem` sink が元の parsing name・先フォルダ・新名・HRESULT・作成後の parsing name を記録し、常に S_OK を返す。
+`COPYENGINE_S_PENDING` (`0x0027000B`) は途中報告なのでログ用 pending のみを増やし、後続の確定 callback で一件を数える。
+確定報告が来ない項目は数えず、元パスごとの管理表は作らない。途中報告も詳細行に残す。
+`COPYENGINE_S_NOT_HANDLED` (`0x00270003`) / `COPYENGINE_S_MERGE` (`0x00270006`) は結合開始の途中報告としてログ用 merged のみを増やす。
+既存の先 item を伴っても親を processed / skipped に数えず、子の callback の結果を使う (根拠: Wine shlfileop.c `notifications6`、詳細は下記の共通契約)。
+中断コード (`0x80270000` / `0x800704C7`) は cancelled、その他の失敗 HRESULT は failed。
+その他の成功 HRESULT は作成後 item が非 null なら processed、null なら skipped に数える。
+名前取得の成否ではなく callback の item の有無を使い、詳細上限を超えても全件に適用する。
+設計担当の Windows 11 / NTFS 実 Shell 観測 (2026-11-22) では完了した Move が `0x00270008` と作成後 item を返した。
+最初の実失敗 HRESULT (中断コードを除く) は `first_failed_hresult` として結果と終端ログに残す。
+callback 全件を集計し、詳細は50件と省略数まで `shell_transfer:` の開始／項目別／終端ログに残す。
+終端ログには cancelled / pending / merged も出し、省略数は途中報告を含む callback 総数から求める。
+項目行は終端でまとめて書くため、ログの時刻は終端時刻であり callback の発生時刻ではない。
+共通 id、requested/resolved 操作、source 件数、先、実行 HRESULT、中断照会結果、各件数の形式は
+[Shell 終端契約](folder-tree-dnd-plan.md#81-1858-a-shell-転送名前変更の終端契約) を正本とする。
+元／先の照合には要求にある source の親と整理先を使い、保持 snapshot の実パス、旧→新の対応、完了後の存在確認 worker、保持一覧の収集は追加しない。
+Windows の処理が始まった後は Remote 接続や終了要求を理由に停止せず、mIV の途中中断／終了待機／再開機構を作らない。終了をまたぐ完了保証も加えない。
 
 ### 5.3 パス条件
 
@@ -177,7 +198,15 @@ App が持つ新しい状態は、この機能の一つの request owner（非�
 
 **独立レビュー指摘1〜5（保持snapshot、検索保持ヒット、チェック保持、mainで開いた書庫、整理先置換の失効）は、エクスプローラー移動と同じ既存挙動として今回の専用対応・専用試験の対象外**。既存挙動が完全に即時収束するという主張ではない。旧項目や保持表示が残る場合も、既存の更新／開き直しに従う。
 
-同名競合、権限、skip、取消、部分失敗の判断 UI は Shell。mIV の通知は「操作が中断されました。処理済みの項目は元に戻りません」「操作を完了できませんでした。フォルダの内容を確認してください」程度にする。abort は利用者取消と断定しない。[Microsoft Learn: GetAnyOperationsAborted](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifileoperation-getanyoperationsaborted) は利用者またはシステムによる中断を含む。再走査の読取失敗は既存処理に任せ (`src/app.rs:22203`)、専用の再試行、途中状態保存、再起動後の再開を作らない。
+同名競合、権限、skip、中断、部分失敗の判断 UI は Shell。処理済みありの中断は
+「操作が中断されました。一部の項目は処理済みです。フォルダの内容を確認してください」。処理済みなし・merged ありなら
+「操作が中断されました。フォルダの内容を確認してください」、merged もなければ「操作が中断されました。移動・コピーした項目はありません」。
+空フォルダの Move 結合では元フォルダが削除され得るため、merged のみで未処理と断定しない。失敗は
+「操作を完了できませんでした。フォルダの内容を確認してください」に、処理済みありならその旨を続け、次行に元の HRESULT と中断照会状態を併記する。
+中断で実失敗項目 (`failed > 0`) がある場合だけ2行目に `失敗した項目: {n} 件 (Shell: 0x{hr:08X})` (最初の実失敗 HRESULT) を追加する。
+中断コードだけなら見出しのみ。Failed の理由行は最初の実失敗 HRESULT が実行 HRESULT と異なる場合に `、項目: 0xHHHHHHHH` を末尾へ追加し、中断コードは項目理由に使わない。
+abort は利用者取消と断定しない。[Microsoft Learn: GetAnyOperationsAborted](https://learn.microsoft.com/en-us/windows/win32/api/shobjidl_core/nf-shobjidl_core-ifileoperation-getanyoperationsaborted) は利用者またはシステムによる中断を含む。
+再走査の読取失敗は既存処理に任せ (`src/app.rs:22203`)、専用の再試行、途中状態保存、再起動後の再開を作らない。
 
 ## 6. Remote・detached・評価／タグ／編集の分担
 

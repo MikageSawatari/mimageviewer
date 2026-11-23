@@ -279,9 +279,9 @@ fn section1375_c1_organize_scan_before_promote_retains_operation_on_remount() {
         // Deliver a successful copy through the actual organize completion handler.
         std::fs::write(folder.join("organized.jpg"), b"copy").unwrap();
         let (tx, rx) = mpsc::channel();
-        tx.send(Ok(crate::shell_file_ops::ShellTransferOutcome {
-            aborted: false,
-        }))
+        tx.send(Ok(
+            crate::shell_file_ops::ShellTransferOutcome::test_outcome(0, Ok(false), 0),
+        ))
         .unwrap();
         app.file_organize_request = crate::ui_dialogs::file_organize::FileOrganizeRequest::Running(
             Box::new(crate::ui_dialogs::file_organize::FileOrganizeRunning {

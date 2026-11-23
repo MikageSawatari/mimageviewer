@@ -491,10 +491,11 @@ impl App {
         };
         let request = running.request;
         match result {
-            Ok(outcome) if outcome.aborted => self.show_feedback_warning(
-                "操作が中断されました。処理済みの項目は元に戻りません".to_owned(),
-            ),
-            Ok(_) => {}
+            Ok(outcome) => {
+                if let Some(notice) = outcome.notice(false) {
+                    self.show_feedback_warning(notice);
+                }
+            }
             Err(message) => {
                 crate::logger::log(format!("file_organize: {message}"));
                 self.show_feedback_warning(format!(
