@@ -118,6 +118,8 @@
     - 既に受理した走査 (`folder_signature`) と読み込み元の種類から決める。今の既定の計算と同じ入力。
     - 保存 (`persist_spread_presentation`) は、保存するキーがその状態のキーと同じときだけ、`NON_BOOK` と比べる。
     - 読み込み直し・別のフォルダへの移動で、状態は作り直す。context ごとの状態なので、別ウィンドウの context はそれぞれ自分の値を持つ (fork では写す)。
+    - 既存の `folder_observation` (受理した走査の元と世代) は、メインの context だけが持つ (`folder_observation_allowed`、`src/app.rs:27693`)。複数ウィンドウのモードの fork した context では使えないので、使わない。
+    - 新しい状態は context の bundle の入れ替えの対象 (`viewer_context_registry.rs` の `swap_field!`) に足す。fork (`split_materialized_physical_context_payload`) では、`spread_mode` と同じく写す。viewer context 監査 (A4 など) の許可が要るかは、実装のときに監査を流して確かめる。
   - Remote: 既存の worker の書き込みの検証で、すでに `is_directory` を得ている。その値を内部の型付きの要求に保持して、保存の比較へ渡す。追加の stat は要らない。
 - **根の外の通常フォルダの不整合 (今回は直さない):**
   - 「通常フォルダにも既定」が OFF で全体の既定が Ltr のとき、ふつうのフォルダで Ltr を選ぶと、全体の既定と一致して行が消え、再読み込みで単ページに戻る (コードからの推測、実機では未確認)。
