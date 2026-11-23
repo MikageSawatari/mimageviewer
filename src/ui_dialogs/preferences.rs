@@ -8702,6 +8702,63 @@ mod tests {
         harness.snapshot("preferences_duplicate_files_epub_option");
     }
 
+    fn preferences_mouse_buttons_snapshot(
+        mode: crate::settings::FullscreenPrimaryClickMode,
+        name: &str,
+    ) {
+        let settings = crate::settings::Settings {
+            fullscreen_primary_click: mode,
+            ..crate::settings::Settings::default()
+        };
+        let mut state = PreferencesState::from_settings(
+            &settings,
+            crate::external_tool::LaunchTarget::None,
+            None,
+            disabled_trt_worker_snapshot(),
+            false,
+            0,
+            0,
+            0,
+        );
+        let mut fonts_ready = false;
+        let mut harness = crate::test_ui::builder()
+            .with_size(egui::vec2(620.0, 740.0))
+            .build_ui(move |root_ui| {
+                crate::test_ui::full_viewport_ui(root_ui, |root_ui| {
+                    let ctx = &root_ui.ctx().clone();
+                    crate::os_theme::apply_resolved(ctx, crate::os_theme::ResolvedTheme::Dark);
+                    if !fonts_ready {
+                        crate::ui_fonts::configure_fonts(ctx);
+                        fonts_ready = true;
+                        ctx.request_repaint();
+                        return;
+                    }
+                    egui::CentralPanel::default().show(root_ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        page_mouse_buttons(ui, &mut state);
+                    });
+                });
+            });
+        harness.run();
+        harness.snapshot(name);
+    }
+
+    #[test]
+    fn preferences_mouse_buttons_snapshot_page_turn() {
+        preferences_mouse_buttons_snapshot(
+            crate::settings::FullscreenPrimaryClickMode::PageTurn,
+            "preferences_mouse_buttons_page_turn",
+        );
+    }
+
+    #[test]
+    fn preferences_mouse_buttons_snapshot_double_click_close() {
+        preferences_mouse_buttons_snapshot(
+            crate::settings::FullscreenPrimaryClickMode::DoubleClickClose,
+            "preferences_mouse_buttons_double_click_close",
+        );
+    }
+
     #[test]
     fn preferences_recycle_bin_delete_confirmation_snapshot() {
         let mut settings = crate::settings::Settings::default();

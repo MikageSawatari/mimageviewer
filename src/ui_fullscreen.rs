@@ -46,6 +46,10 @@ mod depth_slideshow_tests;
 #[cfg(test)]
 mod depth_tests;
 #[cfg(test)]
+mod double_click_close_lifecycle_tests;
+#[cfg(test)]
+mod double_click_close_tests;
+#[cfg(test)]
 mod front_pointer_ownership_tests;
 #[cfg(test)]
 mod front_popup_input_tests;
@@ -177,6 +181,9 @@ pub(crate) struct FsFrontPointerFrameInput {
     touch_owned: bool,
     release_owned: [bool; 3],
     secondary_owner: Option<FullscreenSecondaryPressOwner>,
+    // Pass-local starting point: capture may retire ownership in the middle of
+    // this batch. The new click policy replays those boundaries in event order.
+    backing_clicks_at_start: Option<FsBackingClickBoundary>,
 }
 
 /// Event provenance is resolved in raw event order, before any front menu can close.
@@ -265,11 +272,12 @@ pub(crate) struct FsFrontPointerOwnership {
     clicks: FsBackingClickBoundary,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct FsBackingClickBoundary {
     frame: Option<(egui::ViewportId, u64)>,
     previous_accepted: u32,
     current_accepted: u32,
+    previous_close_candidate: bool,
 }
 
 impl FsFrontPointerOwnership {
@@ -307,6 +315,16 @@ impl FsFrontPointerOwnership {
         menu_presented: bool,
         overflow: &[egui::Rect],
     ) -> FsFrontPointerFrameInput {
+        self.capture_with_primary_chrome(ctx, menu_presented, overflow, |_| false)
+    }
+
+    fn capture_with_primary_chrome(
+        &mut self,
+        ctx: &egui::Context,
+        menu_presented: bool,
+        overflow: &[egui::Rect],
+        primary_chrome: impl Fn(egui::Pos2) -> bool,
+    ) -> FsFrontPointerFrameInput {
         if self
             .viewport
             .is_some_and(|owner| owner != ctx.viewport_id())
@@ -314,6 +332,7 @@ impl FsFrontPointerOwnership {
             return FsFrontPointerFrameInput::default();
         }
         self.viewport = Some(ctx.viewport_id());
+        let backing_clicks_at_start = self.clicks;
         let frame = (ctx.viewport_id(), ctx.cumulative_frame_nr());
         ctx.input(|input| {
             if input.pointer.any_click() && !input.pointer.primary_clicked() {
@@ -324,6 +343,7 @@ impl FsFrontPointerOwnership {
                     frame: Some(frame),
                     previous_accepted: self.clicks.current_accepted,
                     current_accepted: 0,
+                    previous_close_candidate: false,
                 };
             }
             let mut owned = self.buttons;
@@ -362,6 +382,13 @@ impl FsFrontPointerOwnership {
                                 && (menu_presented
                                     || (index < 2
                                         && overflow.iter().any(|rect| rect.contains(*pos)))
+                                    // The still bar uses ordinary widgets in the canvas
+                                    // layer. Its mouse press owns the release even if
+                                    // the bar hides or the pointer leaves it meanwhile.
+                                    // Touch keeps its existing dedicated bar resolver.
+                                    || (index == 0
+                                        && self.touches.is_empty()
+                                        && primary_chrome(*pos))
                                     || (index == 0 && self.touch_owned));
                             // A new sequence replaces the old terminal edge in this pass.
                             owned[index] = self.buttons[index];
@@ -465,6 +492,7 @@ impl FsFrontPointerOwnership {
                 touch_owned,
                 release_owned,
                 secondary_owner: None,
+                backing_clicks_at_start: Some(backing_clicks_at_start),
             };
             // Some backends supply only the focus level. Even then, the event
             // projection remains available while persistent ownership ends here.
@@ -505,6 +533,7 @@ impl FsFrontPointerOwnership {
                 frame: Some(frame),
                 previous_accepted: self.clicks.current_accepted,
                 current_accepted: 0,
+                previous_close_candidate: false,
             };
         }
         // A navigator folds every accepted release in event order, including multiple
@@ -515,7 +544,107 @@ impl FsFrontPointerOwnership {
             self.clicks.current_accepted + 1
         }
         .min(3);
+        self.clicks.previous_close_candidate = false;
         Some((pos, raw_count.min(self.clicks.current_accepted)))
+    }
+
+    /// Only DoubleClickClose uses this release-level fold. egui owns timing and
+    /// distance; raw edges supply modifiers and the front owner's provenance.
+    fn accept_close_mode_clicks(
+        &mut self,
+        ctx: &egui::Context,
+        response: &egui::Response,
+        front: &FsFrontPointerFrameInput,
+        suppressed: bool,
+        candidate: impl Fn(egui::Pos2, egui::Modifiers) -> bool,
+    ) -> FsCloseModeClicks {
+        let Some(mut boundary) = front.backing_clicks_at_start else {
+            return FsCloseModeClicks::default();
+        };
+        let mut facts = FsCloseModeClicks::default();
+        let events = front.canvas_events(ctx);
+        // Areas such as HUD buttons keep their own egui layer. Do not turn a
+        // recognised widget click into a backing click merely because it lies
+        // inside the full canvas rect. Resolve each edge at its own position.
+        let front_layers: Vec<bool> = events
+            .iter()
+            .map(|(event, _)| match event {
+                egui::Event::PointerButton { pos, .. } => ctx
+                    .layer_id_at(*pos)
+                    .is_some_and(|layer| layer != response.layer_id),
+                _ => false,
+            })
+            .collect();
+        ctx.input(|input| {
+            let mut releases = input.pointer.released_buttons_with_click_counts();
+            let mut focused = true;
+            for ((event, owned), front_layer) in events.iter().zip(&front_layers) {
+                match event {
+                    egui::Event::WindowFocused(value) => {
+                        focused = *value;
+                        if !focused {
+                            boundary = FsBackingClickBoundary::default();
+                        }
+                    }
+                    egui::Event::PointerButton { pressed: true, .. } if *owned || *front_layer => {
+                        boundary = FsBackingClickBoundary::default();
+                    }
+                    egui::Event::PointerButton {
+                        button,
+                        pressed: false,
+                        modifiers,
+                        ..
+                    }
+                    | egui::Event::PointerButtonReleased { button, modifiers } => {
+                        let (released_button, click) = releases
+                            .next()
+                            .expect("each raw release must have one adjudicated egui release");
+                        debug_assert_eq!(*button, released_button);
+                        if *owned
+                            || *front_layer
+                            || !focused
+                            || (*button == egui::PointerButton::Primary && suppressed)
+                        {
+                            boundary = FsBackingClickBoundary::default();
+                            continue;
+                        }
+                        let Some((pos, raw_count)) = click else {
+                            continue;
+                        };
+                        if *button != egui::PointerButton::Primary {
+                            boundary = FsBackingClickBoundary::default();
+                            continue;
+                        }
+                        if !response.rect.contains(pos) {
+                            boundary = FsBackingClickBoundary::default();
+                            continue;
+                        }
+                        let previous_candidate =
+                            raw_count != 1 && boundary.previous_close_candidate;
+                        boundary.current_accepted = if raw_count == 1 {
+                            1
+                        } else {
+                            (boundary.current_accepted + 1).min(3)
+                        };
+                        let count = raw_count.min(boundary.current_accepted);
+                        let is_candidate = candidate(pos, *modifiers);
+                        facts.double_clicked |= count == 2;
+                        facts.close_double_clicked |=
+                            count == 2 && previous_candidate && is_candidate;
+                        facts.last_click = Some((pos, *modifiers));
+                        boundary.previous_close_candidate = is_candidate;
+                    }
+                    _ => {}
+                }
+            }
+            debug_assert!(releases.next().is_none());
+            if !input.focused || input.viewport().focused == Some(false) {
+                boundary = FsBackingClickBoundary::default();
+            }
+        });
+        boundary.frame = Some((ctx.viewport_id(), ctx.cumulative_frame_nr()));
+        self.clicks = boundary;
+        facts
     }
 
     fn backing_double_clicked(&self, response: &egui::Response) -> bool {
@@ -532,6 +661,36 @@ impl FsFrontPointerOwnership {
                             })
                     })
             })
+    }
+}
+
+#[derive(Default)]
+struct FsCloseModeClicks {
+    double_clicked: bool,
+    close_double_clicked: bool,
+    last_click: Option<(egui::Pos2, egui::Modifiers)>,
+}
+
+/// All position-sensitive exclusions use the same drawn chrome as page clicks.
+struct FsCloseClickSurface {
+    blocked: bool,
+    depth: bool,
+    chrome: FullscreenSidePanelClickChrome,
+    seek_panel: Option<egui::Rect>,
+}
+
+impl FsCloseClickSurface {
+    fn owns_position(&self, pos: egui::Pos2) -> bool {
+        self.chrome.contains_pointer(pos)
+            || self
+                .chrome
+                .navigator_exclusion
+                .is_some_and(|rect| rect.contains(pos))
+            || self.seek_panel.is_some_and(|rect| rect.contains(pos))
+    }
+
+    fn is_candidate(&self, pos: egui::Pos2, modifiers: egui::Modifiers) -> bool {
+        !self.blocked && !(self.depth && modifiers.ctrl) && !self.owns_position(pos)
     }
 }
 
@@ -20065,6 +20224,7 @@ impl PartialEq<FsPageNavRequest> for FsPageNav {
 struct FsWheelFrameResult {
     page_nav: FsPageNavRequest,
     close: bool,
+    primary_click_close: bool,
     wheel_navigation_produced: bool,
     deferred: Option<FsWheelFrameProposal>,
 }
@@ -20240,6 +20400,7 @@ impl FsSecondaryAction {
 #[derive(Clone, Copy)]
 enum FsCanvasClickAction {
     None,
+    CloseViewer,
     ResetTransform,
     ToggleVideo(usize),
     DismissOverflow,
@@ -25885,11 +26046,12 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// The fixed top bar may reserve image space only while the same chrome is drawable.
-    /// Keep this predicate shared with the draw gate so edit/capture/music modes cannot
-    /// leave an empty strip at the top of the fullscreen canvas.
+    /// Shared surface/mode gate for drawing, reserving space, and admitting new
+    /// top-bar presses. Overview owns its own header even while the ordinary
+    /// bar's previous-frame widget geometry is still recorded in this viewport.
     fn fullscreen_top_bar_chrome_allowed(&self, fs_idx: usize) -> bool {
-        !self.is_overlay_edit_mode_active()
+        self.page_overview.session().is_none()
+            && !self.is_overlay_edit_mode_active()
             && self.capture_region_selection.is_none()
             && !self.fs_music_view_active(fs_idx)
     }
@@ -29304,7 +29466,9 @@ impl App {
                             close_fs = true;
                         }
                         // perf: ホイール/クリック起因のナビ
-                        if wheel_result.wheel_navigation_produced || !wheel_nav.is_none() {
+                        if wheel_result.primary_click_close {
+                            self.bump_input_seq("fs_close_click", None);
+                        } else if wheel_result.wheel_navigation_produced || !wheel_nav.is_none() {
                             self.bump_input_seq(
                                 "fs_wheel",
                                 Some(&format!("page_nav={wheel_nav:?}")),
@@ -41838,6 +42002,7 @@ impl App {
             // evidence, not a new cross-frame owner.
             primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
         }
+        let close_mode_primary_suppressed = primary_suppression.suppresses_current_frame();
         if overflow_pointer_input.primary_owned {
             // A terminal TouchFrame::Allow must not reuse the front widget's release.
             primary_suppression = FullscreenPrimarySuppressionDecision::Suppress;
@@ -42041,6 +42206,8 @@ impl App {
             seek_panel_interactive,
             click_zoom,
             click_pan,
+            Some(&overflow_pointer_input),
+            close_mode_primary_suppressed,
         );
         // Input planning precedes source update and paint in both presentations.
         // The proposal may be applied after paint when wheel navigation is mixed.
@@ -42055,7 +42222,9 @@ impl App {
             side_panel_chrome_enabled,
             navigator_exclusion,
         );
-        let close = secondary_action.closes_viewer(self, side_panel_click_chrome);
+        let primary_click_close = matches!(canvas_click, FsCanvasClickAction::CloseViewer);
+        let close =
+            primary_click_close || secondary_action.closes_viewer(self, side_panel_click_chrome);
         let pointer_nav = match canvas_click {
             FsCanvasClickAction::PageSide(base) => self.spread_page_nav(base).into(),
             _ => page_nav,
@@ -42089,6 +42258,7 @@ impl App {
             FsWheelFrameResult {
                 page_nav: pointer_nav,
                 close,
+                primary_click_close,
                 wheel_navigation_produced,
                 deferred: Some(proposal),
             }
@@ -42273,7 +42443,7 @@ impl App {
             // or input admission. Preserve its order before the single final
             // navigation as a whole, including future command actions.
             || secondary_action.executes_before_final_navigation()
-            || matches!(canvas_click, FsCanvasClickAction::PageSide(_));
+            || matches!(canvas_click, FsCanvasClickAction::PageSide(_) | FsCanvasClickAction::CloseViewer);
         let mut wheel_navigation_produced = false;
         let mut page_scroll_moved = false;
         let mut wheel_actions = accepted_wheel.into_iter().peekable();
@@ -42674,6 +42844,7 @@ impl App {
         // its saved 2D transform suspended while accepting ordinary page clicks.
         match canvas_click {
             FsCanvasClickAction::None | FsCanvasClickAction::DepthFocusAt(_) => {}
+            FsCanvasClickAction::CloseViewer => close = true,
             FsCanvasClickAction::ResetTransform => {
                 self.clear_fs_initial_placement_request();
                 self.fs_automatic_initial_view = None;
@@ -42734,6 +42905,7 @@ impl App {
         FsWheelFrameResult {
             page_nav,
             close,
+            primary_click_close: matches!(canvas_click, FsCanvasClickAction::CloseViewer),
             wheel_navigation_produced,
             deferred: None,
         }
@@ -42864,7 +43036,7 @@ impl App {
         (zoom, pan, navigation)
     }
     fn plan_fs_canvas_click(
-        &self,
+        &mut self,
         _ctx: &egui::Context,
         response: &egui::Response,
         full_rect: egui::Rect,
@@ -42877,14 +43049,17 @@ impl App {
         seek_panel_interactive: bool,
         zoom: f32,
         pan: egui::Vec2,
+        front: Option<&FsFrontPointerFrameInput>,
+        close_mode_primary_suppressed: bool,
     ) -> FsCanvasClickAction {
-        if primary_suppressed
-            || self.is_overlay_edit_mode_active()
+        let close_mode = self.fs_double_click_close_active(is_video);
+        let excluded = self.is_overlay_edit_mode_active()
             || self.analysis_mode
             || self
                 .fullscreen_idx
-                .is_some_and(|idx| self.is_panorama_mode_active(idx))
-        {
+                .is_some_and(|idx| self.is_panorama_mode_active(idx));
+        if excluded || (primary_suppressed && !close_mode) {
+            self.fs_front_pointer.clicks.previous_close_candidate = false;
             return FsCanvasClickAction::None;
         }
         // Depth suspends the saved 2D transform. Classify clicks on its fitted
@@ -42910,103 +43085,155 @@ impl App {
         } else {
             has_transform
         };
-        if self.fs_front_pointer.backing_double_clicked(response) && can_reset {
-            return FsCanvasClickAction::ResetTransform;
-        }
-        if belongs_to_view
-            || self.fs_context_menu_idx.is_some()
-            || (response.dragged() && response.drag_delta().length() > 3.0)
-            || !response.clicked()
-        {
-            return FsCanvasClickAction::None;
-        }
-        if is_video {
-            #[cfg(windows)]
-            let tile_active = self.video_tile_mode_active;
-            #[cfg(not(windows))]
-            let tile_active = false;
-            let in_video_panel = response.interact_pointer_pos().is_some_and(|pos| {
-                (pos.x < full_rect.min.x + full_rect.width() * 0.25
-                    || pos.x > full_rect.max.x - full_rect.width() * 0.25)
-                    && pos.y >= full_rect.min.y + 44.0
-            });
-            return if !tile_active && !in_video_panel {
-                self.fullscreen_idx
-                    .map(FsCanvasClickAction::ToggleVideo)
-                    .unwrap_or(FsCanvasClickAction::None)
+        if close_mode {
+            let surface = FsCloseClickSurface {
+                blocked: self.fs_overflow_panel_state.is_open()
+                    || self.fs_context_menu_idx.is_some()
+                    || self.spread_popup_open
+                    || self.fit_popup_open
+                    || self.panorama_projection_popup_open
+                    || fs_rotation_popup_open(_ctx)
+                    || fs_still_seek_strip_popup_open(_ctx),
+                depth: self.fs_exclusive_view.is_depth(),
+                chrome: self.fs_side_panel_click_chrome(
+                    _ctx,
+                    full_rect,
+                    seek_geometry,
+                    is_video,
+                    side_panel_chrome_enabled,
+                    navigator_exclusion,
+                ),
+                seek_panel: seek_panel_interactive.then(|| seek_geometry.panel_rect(full_rect)),
+            };
+            let facts = self.fs_front_pointer.accept_close_mode_clicks(
+                _ctx,
+                response,
+                front.expect("close mode planning requires the owning pass's front input"),
+                close_mode_primary_suppressed,
+                |pos, modifiers| surface.is_candidate(pos, modifiers),
+            );
+            // The reset uses accepted double clicks, independently of close
+            // candidacy, and retains its existing priority over all chrome.
+            if facts.double_clicked && can_reset {
+                return FsCanvasClickAction::ResetTransform;
+            }
+            if belongs_to_view || self.fs_context_menu_idx.is_some() {
+                return FsCanvasClickAction::None;
+            }
+            if facts.close_double_clicked {
+                return FsCanvasClickAction::CloseViewer;
+            }
+            let Some((pos, modifiers)) = facts.last_click else {
+                return FsCanvasClickAction::None;
+            };
+            if self.fs_overflow_panel_state.is_open() {
+                return FsCanvasClickAction::DismissOverflow;
+            }
+            if !surface.blocked && !surface.owns_position(pos) && surface.depth && modifiers.ctrl {
+                FsCanvasClickAction::DepthFocusAt(pos)
             } else {
                 FsCanvasClickAction::None
+            }
+        } else {
+            self.fs_front_pointer.clicks.previous_close_candidate = false;
+            if self.fs_front_pointer.backing_double_clicked(response) && can_reset {
+                return FsCanvasClickAction::ResetTransform;
+            }
+            if belongs_to_view
+                || self.fs_context_menu_idx.is_some()
+                || (response.dragged() && response.drag_delta().length() > 3.0)
+                || !response.clicked()
+            {
+                return FsCanvasClickAction::None;
+            }
+            if is_video {
+                #[cfg(windows)]
+                let tile_active = self.video_tile_mode_active;
+                #[cfg(not(windows))]
+                let tile_active = false;
+                let in_video_panel = response.interact_pointer_pos().is_some_and(|pos| {
+                    (pos.x < full_rect.min.x + full_rect.width() * 0.25
+                        || pos.x > full_rect.max.x - full_rect.width() * 0.25)
+                        && pos.y >= full_rect.min.y + 44.0
+                });
+                return if !tile_active && !in_video_panel {
+                    self.fullscreen_idx
+                        .map(FsCanvasClickAction::ToggleVideo)
+                        .unwrap_or(FsCanvasClickAction::None)
+                } else {
+                    FsCanvasClickAction::None
+                };
+            }
+            if self.fs_overflow_panel_state.is_open() {
+                return FsCanvasClickAction::DismissOverflow;
+            }
+            if self.spread_popup_open
+                || self.fit_popup_open
+                || self.panorama_projection_popup_open
+                || fs_rotation_popup_open(_ctx)
+                || fs_still_seek_strip_popup_open(_ctx)
+                || continuous_active
+            {
+                return FsCanvasClickAction::None;
+            }
+            // Response position follows later pointer moves in the same batch. Keep
+            // both position and modifiers of the accepted release for a Depth focus.
+            let depth_focus_pos = if self.fs_exclusive_view.is_depth() {
+                _ctx.input(|input| {
+                    input
+                        .events
+                        .iter()
+                        .filter_map(|event| match event {
+                            egui::Event::PointerButton {
+                                button,
+                                pressed: false,
+                                modifiers,
+                                ..
+                            }
+                            | egui::Event::PointerButtonReleased { button, modifiers } => {
+                                Some((*button, *modifiers))
+                            }
+                            _ => None,
+                        })
+                        .zip(input.pointer.released_buttons_with_click_counts())
+                        .filter_map(|((button, modifiers), (_, click))| {
+                            (button == egui::PointerButton::Primary)
+                                .then_some(click)
+                                .flatten()
+                                .map(|(point, _)| (point, modifiers))
+                        })
+                        .last()
+                        .filter(|(_, modifiers)| modifiers.ctrl)
+                        .map(|(point, _)| point)
+                })
+            } else {
+                None
             };
-        }
-        if self.fs_overflow_panel_state.is_open() {
-            return FsCanvasClickAction::DismissOverflow;
-        }
-        if self.spread_popup_open
-            || self.fit_popup_open
-            || self.panorama_projection_popup_open
-            || fs_rotation_popup_open(_ctx)
-            || fs_still_seek_strip_popup_open(_ctx)
-            || continuous_active
-        {
-            return FsCanvasClickAction::None;
-        }
-        // Response position follows later pointer moves in the same batch. Keep
-        // both position and modifiers of the accepted release for a Depth focus.
-        let depth_focus_pos = if self.fs_exclusive_view.is_depth() {
-            _ctx.input(|input| {
-                input
-                    .events
-                    .iter()
-                    .filter_map(|event| match event {
-                        egui::Event::PointerButton {
-                            button,
-                            pressed: false,
-                            modifiers,
-                            ..
-                        }
-                        | egui::Event::PointerButtonReleased { button, modifiers } => {
-                            Some((*button, *modifiers))
-                        }
-                        _ => None,
-                    })
-                    .zip(input.pointer.released_buttons_with_click_counts())
-                    .filter_map(|((button, modifiers), (_, click))| {
-                        (button == egui::PointerButton::Primary)
-                            .then_some(click)
-                            .flatten()
-                            .map(|(point, _)| (point, modifiers))
-                    })
-                    .last()
-                    .filter(|(_, modifiers)| modifiers.ctrl)
-                    .map(|(point, _)| point)
-            })
-        } else {
-            None
-        };
-        let Some(pos) = depth_focus_pos.or_else(|| response.interact_pointer_pos()) else {
-            return FsCanvasClickAction::None;
-        };
-        if self
-            .fs_side_panel_click_chrome(
-                _ctx,
-                full_rect,
-                seek_geometry,
-                is_video,
-                side_panel_chrome_enabled,
-                navigator_exclusion,
-            )
-            .contains_pointer(pos)
-            || (seek_panel_interactive && seek_geometry.panel_rect(full_rect).contains(pos))
-        {
-            FsCanvasClickAction::None
-        } else if depth_focus_pos.is_some() {
-            FsCanvasClickAction::DepthFocusAt(pos)
-        } else {
-            FsCanvasClickAction::PageSide(fullscreen_click_nav_base_delta(
-                pos.x,
-                full_rect.center().x,
-                self.spread_mode.advances_right_to_left(),
-            ))
+            let Some(pos) = depth_focus_pos.or_else(|| response.interact_pointer_pos()) else {
+                return FsCanvasClickAction::None;
+            };
+            if self
+                .fs_side_panel_click_chrome(
+                    _ctx,
+                    full_rect,
+                    seek_geometry,
+                    is_video,
+                    side_panel_chrome_enabled,
+                    navigator_exclusion,
+                )
+                .contains_pointer(pos)
+                || (seek_panel_interactive && seek_geometry.panel_rect(full_rect).contains(pos))
+            {
+                FsCanvasClickAction::None
+            } else if depth_focus_pos.is_some() {
+                FsCanvasClickAction::DepthFocusAt(pos)
+            } else {
+                FsCanvasClickAction::PageSide(fullscreen_click_nav_base_delta(
+                    pos.x,
+                    full_rect.center().x,
+                    self.spread_mode.advances_right_to_left(),
+                ))
+            }
         }
     }
 
@@ -43077,6 +43304,15 @@ impl App {
         ctx: &egui::Context,
         full_rect: egui::Rect,
     ) -> (FsFrontPointerFrameInput, Vec<egui::Rect>) {
+        if self.settings.fullscreen_primary_click
+            == crate::settings::FullscreenPrimaryClickMode::DoubleClickClose
+            && (self.page_overview.session().is_some()
+                || self.similar_panel.preview.has_active_gesture())
+        {
+            // These are different input surfaces even when keys entered and
+            // left them without a pointer edge. Retire the old canvas column.
+            self.fs_front_pointer.clicks = FsBackingClickBoundary::default();
+        }
         let visible_panel = fs_overflow_pointer_surface(
             ctx,
             fs_overflow_panel_rect(full_rect, self.fs_overflow_panel_state),
@@ -43090,9 +43326,18 @@ impl App {
             )
         });
         let menu_presented = self.fs_front_menu_presented(ctx, full_rect);
-        let mut pointer = self
-            .fs_front_pointer
-            .capture(ctx, menu_presented, &visible_panel);
+        let primary_top_bar = self.fs_primary_click_top_bar(ctx, full_rect);
+        let mut pointer = if let Some(top_bar) = primary_top_bar {
+            self.fs_front_pointer.capture_with_primary_chrome(
+                ctx,
+                menu_presented,
+                &visible_panel,
+                |pos| top_bar.contains(pos),
+            )
+        } else {
+            self.fs_front_pointer
+                .capture(ctx, menu_presented, &visible_panel)
+        };
         pointer.secondary_owner = secondary_owner;
         // Front admission retires the backing gesture for that same button. The
         // physical owner above is independent and survives these cancellations.
@@ -43115,6 +43360,61 @@ impl App {
             visible_panel
         };
         (pointer, touch_excluded)
+    }
+
+    /// Only still-image mouse input selects the new policy. In particular,
+    /// Audio and video->audio mode share the existing music-view predicate.
+    fn fs_double_click_close_active(&self, is_video: bool) -> bool {
+        self.settings.fullscreen_primary_click
+            == crate::settings::FullscreenPrimaryClickMode::DoubleClickClose
+            && !is_video
+            && !self
+                .fullscreen_idx
+                .is_some_and(|idx| self.fs_music_view_active(idx))
+    }
+
+    fn fs_primary_click_top_bar(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+    ) -> Option<egui::Rect> {
+        let idx = self.fullscreen_idx?;
+        let is_video = matches!(self.items.get(idx), Some(GridItem::Video(_)));
+        if !self.fs_double_click_close_active(is_video)
+            || !self.fullscreen_top_bar_chrome_allowed(idx)
+        {
+            return None;
+        }
+        let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
+        let bar_rect = fullscreen_top_bar_rect(full_rect);
+        let hover_in_top = ctx.input(|input| {
+            !self.cursor_hidden()
+                && input.pointer.hover_pos().is_some_and(|pos| {
+                    pos.y < TOP_BAR_HOVER_Y
+                        && fullscreen_edge_hover_allowed(pos, navigator_exclusion)
+                })
+        });
+        // Use the draw gate and its recorded geometry. A later move in this
+        // batch may hide the bar, but cannot reassign its earlier button edges.
+        (draw_icons::bar_button_surface_was_presented(ctx, self.frame_counter, bar_rect)
+            || still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
+                locked: self.resolved_still_chrome().top_locked,
+                hover_in_top,
+                side_panel_visible: self.adjustment_mode.is_open()
+                    || self.fullscreen_info_panel_visible_for_idx(Some(idx), is_video),
+                spread_popup_open: self.spread_popup_open,
+                fit_popup_open: self.fit_popup_open,
+                rotation_popup_open: fs_rotation_popup_open(ctx),
+                panorama_projection_popup_open: self.panorama_projection_popup_open,
+                overflow_panel_open: self.fs_overflow_panel_state.is_open(),
+                view_trim_mode: self.view_trim_mode,
+                touch_chrome_latched: still_touch_chrome_latched(
+                    ctx,
+                    idx,
+                    self.fullscreen_opened_at(),
+                ),
+            }))
+        .then_some(bar_rect)
     }
 
     fn dismiss_fs_overflow_on_touch_tap(
@@ -70413,6 +70713,8 @@ mod tests {
                             false,
                             zoom,
                             egui::Vec2::ZERO,
+                            None,
+                            false,
                         );
                         if frame == 2 {
                             assert!(response.clicked(), "zoom={zoom}");
@@ -76035,7 +76337,8 @@ mod tests {
         }
     }
 
-    fn setup_flat_navigator_input_test() -> (crate::app::AppTestEnvForTest, egui::Rect, usize) {
+    pub(super) fn setup_flat_navigator_input_test()
+    -> (crate::app::AppTestEnvForTest, egui::Rect, usize) {
         let mut app = crate::app::setup_app_for_test();
         let fs_idx = app.items.len();
         app.items.push(GridItem::Image(PathBuf::default()));
@@ -76535,7 +76838,11 @@ mod tests {
         }
     }
 
-    fn begin_navigator_preview_for_test(app: &mut App, ctx: &egui::Context, fs_idx: usize) {
+    pub(super) fn begin_navigator_preview_for_test(
+        app: &mut App,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) {
         install_fs_navigator_input_tracking(ctx);
         let session = app
             .similar_preview_session(ctx)
@@ -100420,7 +100727,7 @@ pub(crate) mod page_turn_submission_tests {
         });
     }
 
-    fn seed_interrupted_leaf(ctx: &egui::Context, app: &mut App, next: usize) {
+    pub(super) fn seed_interrupted_leaf(ctx: &egui::Context, app: &mut App, next: usize) {
         seed_leaf(ctx, app);
         frame(ctx, |_, ctx| {
             let operation = ViewerOperationId::Slideshow(next_operation_batch());

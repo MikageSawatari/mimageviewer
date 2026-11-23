@@ -464,6 +464,7 @@ preferences_policy! {
         page_turn_animation_enabled: bool => ("ページめくりアニメーション", |_, _| true, plain, plain);
         page_turn_animation_duration_ms: u32 => ("ページめくりアニメーションの時間", |v, _| (100..=600).contains(v), plain, plain);
         page_turn_animation_style: PageTurnAnimationStyle => ("ページめくりアニメーションの動き", |_, _| true, plain, plain);
+        fullscreen_primary_click: FullscreenPrimaryClickMode => ("閲覧中の左クリック", |_, _| true, plain, plain);
         default_reading_flow: ReadingFlow => ("標準の読書フロー", |_, _| true, plain, plain);
         default_reading_direction: ReadingDirection => ("標準の読み方向", |_, _| true, plain, plain);
         final_cover_spread_enabled: bool => ("裏表紙の見開き", |_, _| true, plain, plain);
@@ -1460,6 +1461,7 @@ mod tests {
         settings.page_turn_animation_enabled = true;
         settings.page_turn_animation_duration_ms = 600;
         settings.page_turn_animation_style = PageTurnAnimationStyle::Slide;
+        settings.fullscreen_primary_click = FullscreenPrimaryClickMode::DoubleClickClose;
         settings.default_reading_flow = different_enum(
             &settings.default_reading_flow,
             &[
@@ -2779,6 +2781,61 @@ mod tests {
             .unwrap()
             .apply_to(&mut destination);
         assert!(!destination.thumb_name_prioritize_width);
+    }
+
+    #[test]
+    fn fullscreen_primary_click_transfer_roundtrip_missing_and_invalid_values() {
+        let source = Settings {
+            fullscreen_primary_click: FullscreenPrimaryClickMode::DoubleClickClose,
+            ..Settings::default()
+        };
+        let exported = export_preferences(&source).unwrap();
+        let mut destination = Settings::default();
+        let report = parse_preferences(&exported.json)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert!(report.issues.is_empty());
+        assert_eq!(
+            destination.fullscreen_primary_click,
+            FullscreenPrimaryClickMode::DoubleClickClose
+        );
+        parse_preferences(INITIAL_V1)
+            .unwrap()
+            .apply_to(&mut destination);
+        assert_eq!(
+            destination.fullscreen_primary_click,
+            FullscreenPrimaryClickMode::DoubleClickClose
+        );
+        for invalid in [
+            json!("future_mode"),
+            json!("DoubleClickClose"),
+            json!(true),
+            json!(0),
+            Value::Null,
+        ] {
+            let report = parse_preferences(&document(json!({"fullscreen_primary_click": invalid})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(report.issues.len(), 1);
+            assert!(report.changed_fields.is_empty());
+            assert_eq!(
+                destination.fullscreen_primary_click,
+                FullscreenPrimaryClickMode::DoubleClickClose
+            );
+        }
+        for (wire, expected) in [
+            ("page_turn", FullscreenPrimaryClickMode::PageTurn),
+            (
+                "double_click_close",
+                FullscreenPrimaryClickMode::DoubleClickClose,
+            ),
+        ] {
+            let report = parse_preferences(&document(json!({"fullscreen_primary_click": wire})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert!(report.issues.is_empty());
+            assert_eq!(destination.fullscreen_primary_click, expected);
+        }
     }
 
     #[test]

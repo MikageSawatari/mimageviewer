@@ -3474,6 +3474,15 @@ fn default_reading_history_limit() -> usize {
 // SpreadMode (フルスクリーンページ構成)
 // -----------------------------------------------------------------------
 
+/// 画像閲覧中のマウス左クリックの固定入力モード。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FullscreenPrimaryClickMode {
+    #[default]
+    PageTurn,
+    DoubleClickClose,
+}
+
 /// ページ送りで使う演出。所有・時間・取消の経路は両方で共有する。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -5836,6 +5845,9 @@ pub struct Settings {
     /// ページ送り演出の種類。旧設定で欠けている場合は従来の紙めくり。
     #[serde(default)]
     pub page_turn_animation_style: PageTurnAnimationStyle,
+    /// 画像閲覧中のマウス左クリック。旧設定では従来の即時ページ送り。
+    #[serde(default)]
+    pub fullscreen_primary_click: FullscreenPrimaryClickMode,
     /// デフォルトの連結方式
     #[serde(default)]
     pub default_reading_flow: ReadingFlow,
@@ -8506,6 +8518,7 @@ impl Default for Settings {
             page_turn_animation_enabled: false,
             page_turn_animation_duration_ms: default_page_turn_animation_duration_ms(),
             page_turn_animation_style: PageTurnAnimationStyle::default(),
+            fullscreen_primary_click: FullscreenPrimaryClickMode::default(),
             default_reading_flow: ReadingFlow::default(),
             default_reading_direction: ReadingDirection::default(),
             final_cover_spread_enabled: true,
@@ -17196,6 +17209,58 @@ mod tests {
             assert!(
                 serde_json::from_value::<Settings>(serde_json::json!({
                     "page_turn_animation_style": invalid,
+                }))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn fullscreen_primary_click_defaults_to_page_turn() {
+        for settings in [Settings::default(), serde_json::from_str("{}").unwrap()] {
+            assert_eq!(
+                settings.fullscreen_primary_click,
+                FullscreenPrimaryClickMode::PageTurn
+            );
+            assert_eq!(
+                settings.preferences_snapshot().fullscreen_primary_click,
+                FullscreenPrimaryClickMode::PageTurn
+            );
+        }
+    }
+
+    #[test]
+    fn fullscreen_primary_click_roundtrips_snake_case_and_rejects_unknown_values() {
+        for (mode, wire) in [
+            (FullscreenPrimaryClickMode::PageTurn, "page_turn"),
+            (
+                FullscreenPrimaryClickMode::DoubleClickClose,
+                "double_click_close",
+            ),
+        ] {
+            let settings = Settings {
+                fullscreen_primary_click: mode,
+                ..Settings::default()
+            };
+            let value = serde_json::to_value(&settings).unwrap();
+            assert_eq!(value["fullscreen_primary_click"], serde_json::json!(wire));
+            let restored: Settings = serde_json::from_value(value).unwrap();
+            assert_eq!(restored.fullscreen_primary_click, mode);
+            assert_eq!(
+                restored.preferences_snapshot().fullscreen_primary_click,
+                mode
+            );
+        }
+        for invalid in [
+            serde_json::json!("future_mode"),
+            serde_json::json!("DoubleClickClose"),
+            serde_json::json!(true),
+            serde_json::json!(0),
+            serde_json::Value::Null,
+        ] {
+            assert!(
+                serde_json::from_value::<Settings>(serde_json::json!({
+                    "fullscreen_primary_click": invalid,
                 }))
                 .is_err()
             );
