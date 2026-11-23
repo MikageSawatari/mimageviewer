@@ -41228,6 +41228,18 @@ impl App {
                         .unwrap_or(false)
                 });
 
+        // Depth controls admit drags by their press, not by the hover position
+        // after later moves in the same pass. Share this boundary with both
+        // scrub and the outer middle-button dispatch; other panel rules stay.
+        let press_in_depth_panel =
+            ctx.input(|input| input.pointer.press_origin())
+                .is_some_and(|pos| {
+                    self.visible_depth_panel_rect(ctx)
+                        .is_some_and(|panel| panel.contains(pos))
+                });
+        let drag_start_in_panel =
+            (cursor_in_panel && !cursor_in_depth_panel) || press_in_depth_panel;
+
         // Hover モードでは左端だけが左補正パネルを召喚する。右端は右情報パネル、
         // 上端は上バーの各経路へ委ねる。ClickToShow は呼び出しバーでのみ開閉する。
         // 消しゴムモード中は自前のパネルを左端に描いているためエッジ発火を抑制する。
@@ -41452,17 +41464,12 @@ impl App {
             });
             let owner = self.fs_zoom_owner();
             let rect = self.fs_zoom_pivot_rect(full_rect, default_image_rect);
-            // Other panel hover keeps its existing policy. Depth admission uses
-            // the press, so crossing its controls cannot steal a canvas scrub.
             let can_start = !modal_input_blocked
                 && !edit_popup_open
                 && self.fs_context_menu_idx.is_none()
                 && press_origin.is_some_and(|pos| {
                     full_rect.contains(pos)
-                        && (!cursor_in_panel || cursor_in_depth_panel)
-                        && !self
-                            .visible_depth_panel_rect(ctx)
-                            .is_some_and(|panel| panel.contains(pos))
+                        && !drag_start_in_panel
                         && !(top_bar_visible && fullscreen_top_bar_rect(full_rect).contains(pos))
                 })
                 && !overflow_pointer_input.primary_owned
@@ -41800,12 +41807,12 @@ impl App {
         // 走っているときはカーソルがパネルを通過しても継続させる (UX のブレ防止)。
         let middle_short_click = self.update_mouse_middle_short_click_with_release(
             ctx,
-            !cursor_in_panel && !overflow_pointer_input.middle_owned,
+            !drag_start_in_panel && !overflow_pointer_input.middle_owned,
             crate::app::ActionSurface::Viewer,
             !overflow_pointer_input.owns_release(egui::PointerButton::Middle),
         );
         if !overflow_pointer_input.middle_owned
-            && (!cursor_in_panel || self.fs_middle_zoom_drag.is_some())
+            && (!drag_start_in_panel || self.fs_middle_zoom_drag.is_some())
         {
             self.handle_middle_drag_zoom(ctx, default_image_rect, overflow_pointer_input.clone());
         }

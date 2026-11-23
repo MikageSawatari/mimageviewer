@@ -554,9 +554,30 @@ transform を高さ400の別キャンバスに渡しており、画像の下部�
   マニュアルの環境設定の説明を同期した。古い depth 設計の段 B の記録は本書を優先する注記を付けた。
   `htdocs/mimageviewer/manual/changelog.html` は過去の公開時点の記録として変更しない。
   `CHANGELOG.md` も変更していない。
+  バックログへの変更は設計担当が収録時に戻した。バックログは統括の管理とし、以降の実装差分では変更しない。
 - 環境設定のドラッグ移動制限の補足文にも3Dの旧除外があったため取り除いた。
   関連する `fullscreen_in_page_scroll_setting_tests` のスナップショット4件の期待 PNG はこの差分では更新していない。
   設計担当が実行・更新する予定。コンパイル・テスト・製品起動は実装担当では行っていない。
+
+#### 中ボタンの呼び出し側の開始判定
+
+`801cec0c9` を基点に、`depth_transform_middle_and_scrub_start_on_canvas_but_not_on_panel` の
+開始時の失敗を修正した。原因はテストの前提ではなく製品の呼び出し側にあった。
+テストは `scrub=false`、`panel=false` から順に評価するため、最初のキャンバス起点の中ボタンが該当する。
+
+`handle_middle_drag_zoom` 内の除外は押下位置を使っていたが、呼び出す前の
+`!cursor_in_panel || self.fs_middle_zoom_drag.is_some()` が同じ pass の移動後の hover を見ていた。
+キャンバスで押してパネルへ移った最初の pass では、まだ drag owner がないため本体へ到達しなかった。
+スクラブの開始は既に押下位置を使っており、この呼び出し側の拒否はない。
+
+Depth パネル内で押したかを共通の局所値で求め、スクラブの受付、中短クリックの受付、
+中ボタンの処理本体を呼ぶ受付に同じ `drag_start_in_panel` を渡す形へ揃えた。
+Depth 以外では従来の `cursor_in_panel` と同じ値となり、開始済みの中ドラッグは従来どおり継続・解放を処理する。
+持続する状態、待機、再試行は追加していない。
+
+既存テストの期待値・入力列は維持し、描画前に押下位置・hover・button-down の前提を検査する条件と、
+失敗時に `scrub` / `panel` / 押下位置 / hover が分かる診断を追加した。
+この修正後のコンパイル・テストは実装担当では実行せず、設計担当が実行する予定。
 
 ### 変更ファイルと要点
 
@@ -578,7 +599,7 @@ transform を高さ400の別キャンバスに渡しており、画像の下部�
 | `src/app/tests.rs` | AI native の既存テストに Depth 中の倍率非依存の条件を追加 |
 | `docs/depth-parallax-plan.md`、`docs/display-pipeline.md`、`docs/keymap-spec.md` | 変換・入力・PDF・書き出しの説明を同期 |
 | `docs/fullscreen-page-start-position-plan.md`、`docs/fullscreen-in-page-scroll-plan.md`、`docs/fullscreen-scroll-page-turn-plan.md`、`docs/fullscreen-drag-pan-bound-plan.md`、`docs/fullscreen-pan-and-front-menu-input-plan.md` | 読み始め・スクロール・パンの現行対象面へ3Dを含め、過去の記録と区別 |
-| `docs/panorama-360-view-plan.md`、`docs/next-release-backlog.md` | 3D の共有変換・ホイール設定・書き出しと現在の実装方針へ同期 |
+| `docs/panorama-360-view-plan.md` | 3D の共有変換とホイール設定へ同期 |
 | `src/ui_dialogs/preferences/pages.rs`、`htdocs/mimageviewer/manual/settings.html` | ドラッグ移動制限の説明から3Dの旧除外を撤去 |
 | `.config/nextest.toml`、`docs/gpu-test-groups.md` | 実 GPU を使う変換操作テストの登録と生成経路の記録 |
 | `htdocs/mimageviewer/manual/fullscreen.html` | 操作・クリックの規則・共有状態・フィット・書き出しの説明、ページ内スクロールと読み始めの対象外から 3D を削除。ホイール・上下キーは通常表示の設定に従うことを明記 |
@@ -648,7 +669,7 @@ test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/sp
 
 対象は `is_depth()` / `ExclusiveViewKind::Depth` / `FsZoomOwner::Depth` / `FsExclusiveView::Depth` と、
 `fs_exclusive_view_active(` の全出現 (複数行で `.is_some()` / `.is_none()` へ続くもの、宣言も含む)。
-行番号は `7ea696591` と今回差分に対する整形後の source。テストの fixture / assert も省略せず列挙し、
+行番号は `801cec0c9` と今回差分に対する整形後の source。テストの fixture / assert も省略せず列挙し、
 同じ分類の兄弟を 1 行にまとめた。現在の出現は 327 箇所。
 `FsZoomOwner::Depth` は削除したため現在の出現は 0。削除・置換した入口は下の基点表に別記する。
 共通の占有述語で残す行は、2D の倍率操作ではなく、他機能の入場制限または Depth 自身の所有・寿命を表す。
@@ -677,13 +698,13 @@ test(/depth/) | test(/pdf_native_rerender_decision_tracks_app_state/) | test(/sp
 | `src/app/tests/startup_restore.rs`: 764, 817 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/app/viewer_context_registry.rs`: 4456 | 3D 固有に残す | fork 前の既存終了処理を維持。実装は変更しない |
 | `src/app/vram_accounting.rs`: 147 | 3D 固有に残す | Depth 資源の VRAM 会計 |
-| `src/ui_fullscreen.rs`: 15082, 15153, 16011, 22909, 25943, 26024, 29007, 29041, 29392, 29657, 30288, 30440, 30538, 31635, 33085, 35418, 35591, 37039, 37048, 37055, 37792, 38558, 41099, 41164, 41165, 42925, 43047, 43062, 43359, 43423, 43650, 43681, 44274, 44903, 44907, 45820, 46333, 47408, 47457, 47458, 51994, 56672 | 3D 固有に残す | Z の休止、占有制限、Depth パネル・素材・先読み・待機・終了、PDF 需要、フィット受付の分類を維持 |
+| `src/ui_fullscreen.rs`: 15082, 15153, 16011, 22909, 25943, 26024, 29007, 29041, 29392, 29657, 30288, 30440, 30538, 31635, 33085, 35418, 35591, 37039, 37048, 37055, 37792, 38558, 41099, 41164, 41165, 42932, 43054, 43069, 43366, 43430, 43657, 43688, 44281, 44910, 44914, 45827, 46340, 47415, 47464, 47465, 52001, 56679 | 3D 固有に残す | Z の休止、占有制限、Depth パネル・素材・先読み・待機・終了、PDF 需要、フィット受付の分類を維持 |
 | `src/ui_fullscreen.rs`: 15547 | 2D と同じにする | `fs_zoom_owner`: Z より先に Image を選ぶ |
 | `src/ui_fullscreen/depth_focus_tests.rs`: 193, 207, 267, 294, 349, 496, 529, 597, 607, 614, 760, 843, 933, 1020, 1034, 1064, 1114 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/depth_main_window_tests.rs`: 120 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/depth_slideshow_tests.rs`: 14, 52, 76, 395, 405, 458, 648, 660, 702, 715, 739, 776, 826, 852, 887, 1036, 1052, 1145, 1189 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/depth_tests.rs`: 40, 53, 66, 126, 154 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
-| `src/ui_fullscreen/depth_view_transform_tests.rs`: 11, 43, 56, 70, 179, 203, 256, 262, 278, 609, 690, 733, 812 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
+| `src/ui_fullscreen/depth_view_transform_tests.rs`: 11, 43, 56, 70, 179, 203, 256, 262, 278, 631, 712, 755, 834 | 3D 固有に残す | Depth の所有・寿命・パネル・資源等の回帰 fixture / assert を維持 |
 | `src/ui_fullscreen/page_turn.rs`: 2002 | 3D 固有に残す | Depth 中の紙めくりの抑止 |
 | `src/ui_video_tile.rs`: 69 | 3D 固有に残す | 動画タイルの入場抑止 |
 | `src/ui_view_trim.rs`: 993 | 3D 固有に残す | 編集中の入口の占有制限 |

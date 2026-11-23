@@ -570,7 +570,7 @@ fn depth_transform_middle_and_scrub_start_on_canvas_but_not_on_panel() {
             };
             // The press and boundary crossing share a pass, so hover already
             // differs from press_origin when middle/scrub admission runs.
-            viewer.frame(
+            viewer.frame_with_before(
                 &mut app,
                 vec![
                     egui::Event::ModifiersChanged(modifiers),
@@ -583,8 +583,30 @@ fn depth_transform_middle_and_scrub_start_on_canvas_but_not_on_panel() {
                     },
                     egui::Event::PointerMoved(crossing),
                 ],
+                |_, ctx| {
+                    ctx.input(|input| {
+                        assert_eq!(
+                            input.pointer.press_origin(),
+                            Some(start),
+                            "scrub={scrub}, panel={panel}"
+                        );
+                        assert_eq!(
+                            input.pointer.hover_pos(),
+                            Some(crossing),
+                            "scrub={scrub}, panel={panel}"
+                        );
+                        assert!(
+                            input.pointer.button_down(button),
+                            "scrub={scrub}, panel={panel}"
+                        );
+                    });
+                },
             );
-            assert_eq!(app.fs_middle_zoom_drag.is_some(), !panel);
+            assert_eq!(
+                app.fs_middle_zoom_drag.is_some(),
+                !panel,
+                "scrub={scrub}, panel={panel}, press={start:?}, hover={crossing:?}"
+            );
             for (pos, edge) in [(returned, None), (returned, Some(false))] {
                 let mut events = vec![
                     egui::Event::ModifiersChanged(modifiers),
