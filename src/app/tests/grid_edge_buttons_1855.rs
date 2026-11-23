@@ -306,9 +306,8 @@ fn section1855_right_click_toggle_saves_and_shows_or_hides_buttons() {
         harness.run();
         match site {
             "background" => {
-                // toolbar_content_rect ends at the last control (the refresh
-                // button here), so right()-8 is not background. Use the real
-                // gap between the sort combo and refresh, outside both controls.
+                // Use the real gap between the sort combo and refresh, outside
+                // both controls (a gap between controls, not trailing space).
                 let combo = harness.get_by_role(egui::accesskit::Role::ComboBox).rect();
                 let refresh = harness.get_by_label("最新の情報に更新").rect();
                 assert!(
