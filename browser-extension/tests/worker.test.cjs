@@ -615,6 +615,18 @@ test("recorded, absent, moved, resized and DPR-changed geometry uses the unchang
   }
 });
 
+for (const locale of ["ja", "en"]) {
+  test(`${locale} toolbar badges use the same short ASCII marks`, () => {
+    const messages = JSON.parse(fs.readFileSync(path.join(__dirname, `../_locales/${locale}/messages.json`), "utf8"));
+    for (const [key, expected] of Object.entries({ badgeBusy: "...", badgeSuccess: "OK", badgeError: "!" })) {
+      const value = messages[key].message;
+      assert.equal(value, expected, key);
+      assert.ok(value.length <= 3, `${key} must fit within three characters`);
+      assert.match(value, /^[\x21-\x7e]+$/, `${key} must use ASCII only`);
+    }
+  });
+}
+
 test("native error mapping exactly covers serialized Rust ErrorCode and both locales", () => {
   const source = fs.readFileSync(path.join(root, "crates/browser-host/src/lib.rs"), "utf8");
   const body = source.match(/pub enum ErrorCode\s*\{([^}]+)\}/)[1];

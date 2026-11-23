@@ -9,10 +9,10 @@
     "message": "mIV で見る"
   },
   "badgeBusy": {
-    "message": "処理中"
+    "message": "..."
   },
   "badgeSuccess": {
-    "message": "成功"
+    "message": "OK"
   },
   "badgeError": {
     "message": "!"
