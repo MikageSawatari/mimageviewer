@@ -157,6 +157,7 @@ Google/Microsoft の検出があれば公開を止める（送信の都度、利
        Chrome は自動でサインインしないが、ログインや同期を求められたら断る。
        利用者に渡す手引きの例は `C:\home\mimageviewer-subpc\browser818\store-check\guide-store-check.md`。
      - 拡張機能のページで「デベロッパー モード」を ON にし、手順 2 の ZIP を展開したフォルダを「パッケージ化されていない拡張機能を読み込む」で読み込む。
+     - 拡張のフォルダを新しい版に差し替えたら、ブラウザを起動し直していても古い版のコードが動き続けることがある。Chrome は拡張機能のページで拡張の「再読み込み」を押し、Edge は拡張を削除してから読み込み直す (2026-11-23、0.2.1 の確認で利用者が観測)。
        Chrome には chrome 用、Edge には edge 用を読み込む。
      - 表示された拡張の ID がストアの ID (Chrome `fpppoodelfkddekjahhmalmmfdhbpdma` / Edge `dlcbdkekoppppebnhhncghhglkkccdhk`) と同じことを確かめる。
        違うと、mIV とつながらない。
