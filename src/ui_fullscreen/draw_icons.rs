@@ -34,6 +34,32 @@ fn bar_button_touch_state_id(ctx: &egui::Context) -> egui::Id {
     egui::Id::unique((module_path!(), ctx.viewport_id(), line!()))
 }
 
+/// Read the actual bar geometry already recorded by the draw owner. egui uses
+/// that preceding-pass widget map for mouse hit testing too. Preparing touch
+/// targets may have advanced the frame before any current buttons were drawn.
+pub(super) fn bar_button_surface_was_presented(
+    ctx: &egui::Context,
+    frame: u64,
+    bar_rect: egui::Rect,
+) -> bool {
+    let id = bar_button_touch_state_id(ctx);
+    ctx.data(|data| {
+        data.get_temp::<BarButtonTouchState>(id)
+            .is_some_and(|state| {
+                state.bar_rect == Some(bar_rect)
+                    && match state.frame {
+                        Some(owner) if owner == frame => {
+                            !state.current.is_empty() || !state.previous.is_empty()
+                        }
+                        Some(owner) if owner.checked_add(1) == Some(frame) => {
+                            !state.current.is_empty()
+                        }
+                        _ => false,
+                    }
+            })
+    })
+}
+
 fn begin_bar_button_touch_frame(
     state: &mut BarButtonTouchState,
     frame: u64,

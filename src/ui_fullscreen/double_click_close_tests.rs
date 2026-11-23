@@ -848,6 +848,8 @@ fn close_mode_excluded_edit_analysis_panorama_and_video_keep_released_actions() 
         "analysis",
         "panorama",
         "video",
+        "audio",
+        "video_audio",
     ] {
         let mut canvas = Canvas::new();
         let mut options = Options::default();
@@ -873,18 +875,83 @@ fn close_mode_excluded_edit_analysis_panorama_and_video_keep_released_actions() 
                 );
                 assert!(canvas.app.is_panorama_mode_active(0));
             }
-            "video" => options.video = true,
+            "video" | "video_audio" => {
+                canvas.app.items[0] = GridItem::Video(PathBuf::from("c:/471/excluded.mp4"));
+                options.video = true;
+                if excluded == "video_audio" {
+                    canvas.app.video_audio_mode = Some(0);
+                    assert!(canvas.app.fs_music_view_active(0));
+                }
+            }
+            "audio" => {
+                canvas.app.items[0] = GridItem::Audio(PathBuf::from("c:/471/excluded.flac"));
+                assert!(canvas.app.fs_music_view_active(0));
+            }
             _ => unreachable!(),
         }
         assert_eq!(
             canvas.plan(double_click(canvas_pos()), options),
-            if excluded == "video" {
-                Outcome::Video(0)
-            } else {
-                Outcome::None
+            match excluded {
+                "video" | "video_audio" => Outcome::Video(0),
+                // This is the existing planner route for an Audio item; its
+                // music surface owns the visible playback widgets separately.
+                "audio" => Outcome::Page(1),
+                _ => Outcome::None,
             },
             "{excluded}"
         );
+    }
+}
+
+#[test]
+fn close_mode_audio_and_video_audio_handler_match_page_turn_policy() {
+    #[cfg(windows)]
+    let _input = crate::key_input::lock_test_input();
+    for video_audio in [false, true] {
+        let mut baseline = None;
+        for mode in [
+            FullscreenPrimaryClickMode::PageTurn,
+            FullscreenPrimaryClickMode::DoubleClickClose,
+        ] {
+            let mut canvas = Canvas::new();
+            let path = PathBuf::from(if video_audio {
+                "c:/471/music.mp4"
+            } else {
+                "c:/471/music.flac"
+            });
+            canvas.app.items[0] = if video_audio {
+                GridItem::Video(path.clone())
+            } else {
+                GridItem::Audio(path.clone())
+            };
+            if video_audio {
+                canvas.app.video_audio_mode = Some(0);
+            }
+            canvas.app.fs_cache.insert(
+                0,
+                FsCacheEntry::Video {
+                    player: Box::new(
+                        crate::video::VideoPlayer::stream_ready_disconnected_for_test(path),
+                    ),
+                    load_seq: 1,
+                },
+            );
+            canvas.app.settings.fullscreen_primary_click = mode;
+            assert!(canvas.app.fs_music_view_active(0));
+            canvas.merge(vec![egui::Event::PointerMoved(canvas_pos())]);
+            let mut outcomes = Vec::new();
+            for _ in 0..2 {
+                outcomes.push(canvas.merge(click(canvas_pos(), egui::Modifiers::NONE)));
+                assert_eq!(canvas.app.fullscreen_idx, Some(0));
+                assert!(!outcomes.last().unwrap().0);
+                assert!(!canvas.app.fs_front_pointer.clicks.previous_close_candidate);
+            }
+            if let Some(expected) = &baseline {
+                assert_eq!(&outcomes, expected);
+            } else {
+                baseline = Some(outcomes);
+            }
+        }
     }
 }
 

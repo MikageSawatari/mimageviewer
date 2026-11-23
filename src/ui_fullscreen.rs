@@ -315,6 +315,16 @@ impl FsFrontPointerOwnership {
         menu_presented: bool,
         overflow: &[egui::Rect],
     ) -> FsFrontPointerFrameInput {
+        self.capture_with_primary_chrome(ctx, menu_presented, overflow, |_| false)
+    }
+
+    fn capture_with_primary_chrome(
+        &mut self,
+        ctx: &egui::Context,
+        menu_presented: bool,
+        overflow: &[egui::Rect],
+        primary_chrome: impl Fn(egui::Pos2) -> bool,
+    ) -> FsFrontPointerFrameInput {
         if self
             .viewport
             .is_some_and(|owner| owner != ctx.viewport_id())
@@ -372,6 +382,13 @@ impl FsFrontPointerOwnership {
                                 && (menu_presented
                                     || (index < 2
                                         && overflow.iter().any(|rect| rect.contains(*pos)))
+                                    // The still bar uses ordinary widgets in the canvas
+                                    // layer. Its mouse press owns the release even if
+                                    // the bar hides or the pointer leaves it meanwhile.
+                                    // Touch keeps its existing dedicated bar resolver.
+                                    || (index == 0
+                                        && self.touches.is_empty()
+                                        && primary_chrome(*pos))
                                     || (index == 0 && self.touch_owned));
                             // A new sequence replaces the old terminal edge in this pass.
                             owned[index] = self.buttons[index];
@@ -43034,14 +43051,13 @@ impl App {
         front: Option<&FsFrontPointerFrameInput>,
         close_mode_primary_suppressed: bool,
     ) -> FsCanvasClickAction {
-        let close_mode = self.settings.fullscreen_primary_click
-            == crate::settings::FullscreenPrimaryClickMode::DoubleClickClose;
+        let close_mode = self.fs_double_click_close_active(is_video);
         let excluded = self.is_overlay_edit_mode_active()
             || self.analysis_mode
             || self
                 .fullscreen_idx
                 .is_some_and(|idx| self.is_panorama_mode_active(idx));
-        if excluded || (primary_suppressed && (!close_mode || is_video)) {
+        if excluded || (primary_suppressed && !close_mode) {
             self.fs_front_pointer.clicks.previous_close_candidate = false;
             return FsCanvasClickAction::None;
         }
@@ -43068,7 +43084,7 @@ impl App {
         } else {
             has_transform
         };
-        if close_mode && !is_video {
+        if close_mode {
             let surface = FsCloseClickSurface {
                 blocked: self.fs_overflow_panel_state.is_open()
                     || self.fs_context_menu_idx.is_some()
@@ -43309,9 +43325,18 @@ impl App {
             )
         });
         let menu_presented = self.fs_front_menu_presented(ctx, full_rect);
-        let mut pointer = self
-            .fs_front_pointer
-            .capture(ctx, menu_presented, &visible_panel);
+        let primary_top_bar = self.fs_primary_click_top_bar(ctx, full_rect);
+        let mut pointer = if let Some(top_bar) = primary_top_bar {
+            self.fs_front_pointer.capture_with_primary_chrome(
+                ctx,
+                menu_presented,
+                &visible_panel,
+                |pos| top_bar.contains(pos),
+            )
+        } else {
+            self.fs_front_pointer
+                .capture(ctx, menu_presented, &visible_panel)
+        };
         pointer.secondary_owner = secondary_owner;
         // Front admission retires the backing gesture for that same button. The
         // physical owner above is independent and survives these cancellations.
@@ -43334,6 +43359,61 @@ impl App {
             visible_panel
         };
         (pointer, touch_excluded)
+    }
+
+    /// Only still-image mouse input selects the new policy. In particular,
+    /// Audio and video->audio mode share the existing music-view predicate.
+    fn fs_double_click_close_active(&self, is_video: bool) -> bool {
+        self.settings.fullscreen_primary_click
+            == crate::settings::FullscreenPrimaryClickMode::DoubleClickClose
+            && !is_video
+            && !self
+                .fullscreen_idx
+                .is_some_and(|idx| self.fs_music_view_active(idx))
+    }
+
+    fn fs_primary_click_top_bar(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+    ) -> Option<egui::Rect> {
+        let idx = self.fullscreen_idx?;
+        let is_video = matches!(self.items.get(idx), Some(GridItem::Video(_)));
+        if !self.fs_double_click_close_active(is_video)
+            || !self.fullscreen_top_bar_chrome_allowed(idx)
+        {
+            return None;
+        }
+        let navigator_exclusion = self.fullscreen_navigator_edge_exclusion(ctx, full_rect);
+        let bar_rect = fullscreen_top_bar_rect(full_rect);
+        let hover_in_top = ctx.input(|input| {
+            !self.cursor_hidden()
+                && input.pointer.hover_pos().is_some_and(|pos| {
+                    pos.y < TOP_BAR_HOVER_Y
+                        && fullscreen_edge_hover_allowed(pos, navigator_exclusion)
+                })
+        });
+        // Use the draw gate and its recorded geometry. A later move in this
+        // batch may hide the bar, but cannot reassign its earlier button edges.
+        (draw_icons::bar_button_surface_was_presented(ctx, self.frame_counter, bar_rect)
+            || still_top_bar_visible_from_inputs(StillTopBarVisibilityInputs {
+                locked: self.resolved_still_chrome().top_locked,
+                hover_in_top,
+                side_panel_visible: self.adjustment_mode.is_open()
+                    || self.fullscreen_info_panel_visible_for_idx(Some(idx), is_video),
+                spread_popup_open: self.spread_popup_open,
+                fit_popup_open: self.fit_popup_open,
+                rotation_popup_open: fs_rotation_popup_open(ctx),
+                panorama_projection_popup_open: self.panorama_projection_popup_open,
+                overflow_panel_open: self.fs_overflow_panel_state.is_open(),
+                view_trim_mode: self.view_trim_mode,
+                touch_chrome_latched: still_touch_chrome_latched(
+                    ctx,
+                    idx,
+                    self.fullscreen_opened_at(),
+                ),
+            }))
+        .then_some(bar_rect)
     }
 
     fn dismiss_fs_overflow_on_touch_tap(
