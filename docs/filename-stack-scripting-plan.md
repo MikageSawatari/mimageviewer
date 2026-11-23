@@ -269,8 +269,8 @@ global namespace に登録され、標準パッケージより先に解決され
 `section1863_string_pad_preserves_character_and_byte_size_checks`、既定ルールは既存の
 `default_script_compiles_and_runs_empty` 等で確認する。2026-11-23 に ClaudeCode が
 `filename_stack_script::` / `filename_stack` / `grid_edge_buttons_1855::` の 93 件を流し、すべて成功した
-(`c938e318f` の変更)。独立レビュー後の登録属性・配列 pad の修正と追加テストは、
-負荷対策の指示により実装担当ではコンパイル・テスト未実施、ClaudeCode の検証待ち。
+(`c938e318f` の変更)。独立レビュー後の登録属性・配列 pad の修正と追加テストを含めた
+同じ範囲の 98 件と ignore の 2 件も、同日に ClaudeCode が流してすべて成功した (`092cce4f7`)。
 
 #### StandardPackage の洗い出し (Rhai 1.27.0、コード読み)
 
