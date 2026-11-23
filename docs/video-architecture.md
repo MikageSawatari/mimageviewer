@@ -4289,6 +4289,7 @@ ui_snapshotは直列で123件成功し、既存PNGと一致した。cargo fmt / 
 通知の種類、文字数・指定秒数・動画の既定時間、設定の倍率と例外は
 [通知時間ポリシーと棚卸し](notification-duration-policy.md) を正本とする。
 App で寿命とnative fadeを確定して渡し、描画側は倍率を再適用しない。
-標準ではnativeの既存linger/fadeの不一致、保存完了のegui1.2秒/native1.8秒も維持する。
+nativeのfade終端は倍率適用済みの旧1.8秒/中央2.5秒とlingerの大きい方とし、短いlingerの期限は延長しない（§1.871）。
+保存完了のegui1.2秒/native1.8秒も維持する。
 動画内部で発行する通知だけは、既存 chrome snapshot の選択値から同じ関数で一度確定する。
 処理の寿命に連動する進捗表示、ナビゲーション境界の専用ヒントは独立した表示を維持する。

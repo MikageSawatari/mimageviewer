@@ -3177,8 +3177,8 @@ pub(super) struct NativeOverlayToast {
     pub(super) text: String,
     pub(super) started_at: Instant,
     pub(super) centered: bool,
-    /// Resolved lifetime and fade preserve the legacy independent clocks.
-    /// Expiry uses native_linger; drawing uses the resolved 1.8/2.5-second fade baseline.
+    /// Expiry uses native_linger; fade ends at the later of native_linger and the
+    /// scaled 1.8/2.5-second baseline, preserving the fade width and short lifetimes.
     timing: crate::feedback::ResolvedFeedbackTiming,
 }
 
@@ -14792,8 +14792,9 @@ mod native_output_tests {
         let mut toast = NativeOverlayToast::for_test("通知");
         for centered in [false, true] {
             toast.centered = centered;
-            let fade_end = if centered { 2.5 } else { 1.8 };
+            let legacy_fade_end: f32 = if centered { 2.5 } else { 1.8 };
             for seconds in [0.7, 1.2, 1.8, 2.5, 3.5, 5.5] {
+                let fade_end = legacy_fade_end.max(seconds);
                 toast.timing = resolve_timing(
                     NotificationDuration::Standard,
                     FeedbackKind::Info,
@@ -14804,21 +14805,24 @@ mod native_output_tests {
                     toast.timing.native_linger(),
                     Duration::from_secs_f32(seconds)
                 );
-                // Compare with the pre-§1.402 formula, including long invisible linger.
+                // §1.871 extends only long linger; shorter linger keeps the legacy fade.
                 for elapsed in [
                     0.0, 0.69, 1.19, 1.45, 1.625, 1.8, 2.15, 2.325, 2.5, 3.49, 5.49,
                 ] {
-                    let legacy = if elapsed > fade_end - 0.35 {
+                    let expected = if elapsed > fade_end - 0.35 {
                         ((fade_end - elapsed) / 0.35_f32).clamp(0.0, 1.0)
                     } else {
                         1.0
                     };
                     assert_eq!(
                         toast.opacity_at(elapsed),
-                        legacy,
+                        expected,
                         "centered={centered}, linger={seconds}, elapsed={elapsed}"
                     );
                 }
+                assert_eq!(toast.opacity_at(fade_end - 0.35), 1.0);
+                assert!((toast.opacity_at(fade_end - 0.175) - 0.5).abs() < 0.00001);
+                assert_eq!(toast.opacity_at(fade_end), 0.0);
             }
         }
     }
@@ -14835,7 +14839,7 @@ mod native_output_tests {
         ] {
             for centered in [false, true] {
                 toast.centered = centered;
-                let fade_end = if centered { 2.5 } else { 1.8 };
+                let legacy_fade_end: f32 = if centered { 2.5 } else { 1.8 };
                 for kind in [
                     FeedbackKind::Info,
                     FeedbackKind::Warning,
@@ -14847,15 +14851,21 @@ mod native_output_tests {
                         } else {
                             factor
                         };
-                    toast.timing =
-                        resolve_timing(setting, kind, "通知", FeedbackTiming::Seconds(5.5));
-                    assert_eq!(
-                        toast.timing.native_linger(),
-                        Duration::from_secs_f32(5.5 * factor)
-                    );
-                    assert_eq!(toast.opacity_at((fade_end - 0.4) * factor), 1.0);
-                    assert!((toast.opacity_at((fade_end - 0.175) * factor) - 0.5).abs() < 0.00001);
-                    assert_eq!(toast.opacity_at(fade_end * factor), 0.0);
+                    for seconds in [1.2, 1.8, 2.5, 3.5, 5.5] {
+                        let fade_end = legacy_fade_end.max(seconds);
+                        toast.timing =
+                            resolve_timing(setting, kind, "通知", FeedbackTiming::Seconds(seconds));
+                        assert_eq!(
+                            toast.timing.native_linger(),
+                            Duration::from_secs_f32(seconds * factor)
+                        );
+                        assert_eq!(toast.opacity_at((fade_end - 0.4) * factor), 1.0);
+                        assert_eq!(toast.opacity_at(fade_end * factor - 0.35 * factor), 1.0);
+                        assert!(
+                            (toast.opacity_at((fade_end - 0.175) * factor) - 0.5).abs() < 0.00001
+                        );
+                        assert_eq!(toast.opacity_at(fade_end * factor), 0.0);
+                    }
                 }
             }
             toast.centered = true;
@@ -14869,6 +14879,18 @@ mod native_output_tests {
             for elapsed in [0.0, 0.35, 0.525, 0.699, 0.7] {
                 assert_eq!(toast.opacity_at(elapsed), 1.0);
             }
+            toast.timing = resolve_timing(
+                setting,
+                FeedbackKind::Info,
+                "一覧の端です",
+                FeedbackTiming::Immediate(2.5),
+            );
+            assert_eq!(toast.timing.native_linger(), Duration::from_secs_f32(2.5));
+            for elapsed in [0.0, 1.8, 2.15] {
+                assert!((toast.opacity_at(elapsed) - 1.0).abs() < 0.00001);
+            }
+            assert!((toast.opacity_at(2.325) - 0.5).abs() < 0.00001);
+            assert_eq!(toast.opacity_at(2.5), 0.0);
         }
     }
 
