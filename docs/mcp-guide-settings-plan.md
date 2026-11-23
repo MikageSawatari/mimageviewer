@@ -1721,6 +1721,7 @@ P1 なし。指摘はすべて受け入れ、次の改訂 (§19.5) に入れた�
 | C | `aba243e71`・`3687e7f6d`・`d3cf10890` | ACCEPT WITH CHANGES → 解消 | P2 旧設定の `margin_fit_enabled` で Page が MarginFit に戻る、P2 関連付けから起動方法を変えたときも AI から戻せない旨を出す、P3 `set_settings` の `idempotentHint` を false に (`4100867be`) |
 | D (`set_favorite`) | `eb70ab4e7` | ACCEPT WITH CHANGES → 解消 | P2 登録済みのお気に入りにも実在を求めていた → 新規登録だけに (`dfac85dcd`) |
 | E | `5ad0b710b`・snapshot 更新 | ACCEPT | なし |
+| D (`stack_script`、予算の整理) | `724e133d9`〜`04bc081a9` | ACCEPT WITH CHANGES → P2 は割り切り | P2 書き手の worker に終了時の後始末が無く、「開く」の処理中に積んだ「既定に戻す」がアプリの終了で失われ得る → **直さない** (既定の割り切り方針による。失われるのは要求だけで、置き換えは原子的なのでファイルは元のまま残り、もう一度押せば済む。ボタンを押してから数秒のうちに終了したときだけで、通常の使い方では起きにくい。直すには終了時の待ちが要り、エディタの起動を待って終了が止まり得る) |
 
 実装中の設計担当の判断 (§6.4.2 に記録): `gamepad_enabled`・`creative_luts`・`ui_font` を第 2 段へ。OK のあとの後処理は
 第 2 段の理由にしない (Susie・VST3・AI バックエンドは第 1 段)。関連付けの外部ツールの削除・起動方法の変更は可、AI からは
