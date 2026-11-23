@@ -251,10 +251,9 @@ fn depth_transform_pdf_first_single_draw_consumes_suppression_after_d_f12_and_z(
                 }
                 probe.take_requests();
                 app.fs_pending.clear();
+                let owner = app.edit_request_owner_context();
                 app.set_fs_exclusive_view(
-                    FsExclusiveView::Depth(crate::depth_parallax::DepthViewState::new(
-                        app.edit_request_owner_context(),
-                    )),
+                    FsExclusiveView::Depth(crate::depth_parallax::DepthViewState::new(owner)),
                     "pdf_suppression_enter",
                 );
                 app.fs_zoom = 2.;
