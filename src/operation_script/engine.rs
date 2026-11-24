@@ -28,6 +28,11 @@ fn is_numeric_equality_type(kind: std::any::TypeId) -> bool {
 /// Build the same bounded engine for worker-side compilation and UI-side calls.
 pub fn build_engine() -> Engine {
     let mut engine = Engine::new_raw();
+    // Rhai 1.27 folds constant Array/Map trees into DynamicConstant without
+    // checking aggregate size, and evaluates those constants without the
+    // runtime construction check. Disable that optimization so every literal
+    // takes the bounded Array/Map evaluator in both workers and UI calls.
+    engine.set_optimization_level(rhai::OptimizationLevel::None);
     ArithmeticPackage::new().register_into_engine(&mut engine);
     LogicPackage::new().register_into_engine(&mut engine);
     // Register only the bounded containers needed by `for`. The iterator
@@ -311,8 +316,8 @@ mod tests {
         for source in [
             r#"let n = 0; for x in "abc" { n += 1; } n"#,
             r#"let n = 0; for x in "あいう" { n += 1; } n"#,
-            "let n = 0; for x in #{ a: 1 } { n += 1; } n",
-            "let n = 0; for x in 123 { n += 1; } n",
+            "let source = #{ a: 1 }; let n = 0; for x in source { n += 1; } n",
+            "let source = 123; let n = 0; for x in source { n += 1; } n",
         ] {
             assert!(
                 matches!(
@@ -321,6 +326,14 @@ mod tests {
                 ),
                 "{source}"
             );
+        }
+        // parser.rs:ensure_iterable rejects these literal types before the
+        // evaluator can raise ErrorFor for a dynamically obtained value.
+        for source in [
+            "let n = 0; for x in #{ a: 1 } { n += 1; } n",
+            "let n = 0; for x in 123 { n += 1; } n",
+        ] {
+            assert!(engine.compile(source).is_err(), "{source}");
         }
     }
 
@@ -494,6 +507,41 @@ mod tests {
     fn sandbox_operation_budget_stops_integer_range_iteration() {
         let engine = build_engine();
         for source in [
+            "let count = 0; for n in 0..9223372036854775807 { count += 1; } count",
+            "let count = 0; for n in 0..=9223372036854775807 { count += 1; } count",
+        ] {
+            assert!(
+                matches!(
+                    *engine.run(source).unwrap_err(),
+                    EvalAltResult::ErrorTooManyOperations(_)
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_simple_optimizer_removes_empty_range_iteration() {
+        let mut engine = build_engine();
+        engine.set_optimization_level(rhai::OptimizationLevel::Simple);
+        // ast/stmt.rs:is_pure considers finite for-loops with pure bodies
+        // removable; optimizer.rs eliminates the loop instead of iterating.
+        // This explains the former test result; production uses None because
+        // constant folding can otherwise bypass aggregate collection limits.
+        for source in [
+            "for n in 0..9223372036854775807 {}",
+            "for n in 0..=9223372036854775807 {}",
+        ] {
+            engine.run(source).unwrap();
+        }
+    }
+
+    #[test]
+    fn sandbox_empty_range_iteration_obeys_operation_budget() {
+        let engine = build_engine();
+        assert_eq!(engine.optimization_level(), rhai::OptimizationLevel::None);
+        // eval/stmt.rs charges each iteration even when the body is empty.
+        for source in [
             "for n in 0..9223372036854775807 {}",
             "for n in 0..=9223372036854775807 {}",
         ] {
@@ -549,7 +597,6 @@ mod tests {
             (MAX_COLLECTION_SIZE, true),
             (MAX_COLLECTION_SIZE + 1, false),
         ] {
-            let array = format!("[{}];", vec!["0"; count].join(","));
             let map = format!(
                 "#{{{}}};",
                 (0..count)
@@ -557,8 +604,141 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(",")
             );
-            assert_eq!(engine.run(&array).is_ok(), succeeds, "array {count}");
             assert_eq!(engine.run(&map).is_ok(), succeeds, "map {count}");
+        }
+    }
+
+    #[test]
+    fn sandbox_array_literal_limit_has_rhai_parser_boundary() {
+        let engine = build_engine();
+        // Rhai 1.27 parser.rs:925 checks >= before reading the closing ']'.
+        // Consequently a literal can have at most max_array_size - 1 items,
+        // while runtime arrays can still contain max_array_size items.
+        for (count, succeeds) in [
+            (MAX_COLLECTION_SIZE - 1, true),
+            (MAX_COLLECTION_SIZE, false),
+            (MAX_COLLECTION_SIZE + 1, false),
+        ] {
+            let source = format!("[{}]", vec!["0"; count].join(","));
+            assert_eq!(
+                engine.compile(&source).is_ok(),
+                succeeds,
+                "array literal {count}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_runtime_array_limit_allows_exact_capacity_and_rejects_growth() {
+        let engine = build_engine();
+        let mut scope = Scope::new();
+        scope.push(
+            "values",
+            vec![Dynamic::from(0 as INT); MAX_COLLECTION_SIZE - 1],
+        );
+        engine.run_with_scope(&mut scope, "values += 0;").unwrap();
+        assert_eq!(
+            scope.get_value::<Array>("values").unwrap().len(),
+            MAX_COLLECTION_SIZE
+        );
+        assert!(matches!(
+            *engine
+                .run_with_scope(&mut scope, "values += 0;")
+                .unwrap_err(),
+            EvalAltResult::ErrorDataTooLarge(_, _)
+        ));
+    }
+
+    #[test]
+    fn sandbox_nested_array_limit_counts_the_entire_tree() {
+        let engine = build_engine();
+        for (inner_count, succeeds) in [
+            (MAX_COLLECTION_SIZE - 1, true),
+            (MAX_COLLECTION_SIZE, false),
+        ] {
+            // The outer array's one element also contributes to the total.
+            let nested =
+                Dynamic::from_array(vec![Dynamic::from_array(vec![
+                    Dynamic::from(0 as INT);
+                    inner_count
+                ])]);
+            assert_eq!(
+                engine.ensure_data_size_within_limits(&nested).is_ok(),
+                succeeds
+            );
+        }
+        // Exercise runtime construction's cumulative check with variable
+        // elements, so constant folding cannot replace the construction. Both
+        // inner literals are below the parser's per-literal limit themselves.
+        for (second_count, succeeds) in [(498, true), (499, false)] {
+            let source = format!(
+                "let zero = 0; [[{}],[{}]]",
+                vec!["zero"; 500].join(","),
+                vec!["zero"; second_count].join(",")
+            );
+            assert_eq!(
+                engine.eval::<Array>(&source).is_ok(),
+                succeeds,
+                "nested total {}",
+                500 + second_count + 2
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_constant_collections_obey_aggregate_limits() {
+        let engine = build_engine();
+        assert_eq!(engine.optimization_level(), rhai::OptimizationLevel::None);
+        let fields = |count| {
+            (0..count)
+                .map(|n| format!("k{n}: 0"))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        for (extra, succeeds) in [(0, true), (1, false)] {
+            let expressions = [
+                format!(
+                    "[[{}],[{}]]",
+                    vec!["0"; 500].join(","),
+                    vec!["0"; 498 + extra].join(",")
+                ),
+                format!(
+                    "#{{ left: #{{ {} }}, right: #{{ {} }} }}",
+                    fields(499),
+                    fields(499 + extra)
+                ),
+                format!(
+                    "[\"{}\",\"{}\"]",
+                    "a".repeat(MAX_STRING_BYTES / 2),
+                    "b".repeat(MAX_STRING_BYTES / 2 + extra)
+                ),
+                format!(
+                    "#{{ left: \"{}\", right: \"{}\" }}",
+                    "a".repeat(MAX_STRING_BYTES / 2),
+                    "b".repeat(MAX_STRING_BYTES / 2 + extra)
+                ),
+            ];
+            for expression in expressions {
+                let top_level = engine.eval::<Dynamic>(&expression);
+                let ast = engine
+                    .compile(format!("fn slots() {{ {expression} }}"))
+                    .unwrap();
+                // The loader evaluates slots() by call_fn on its worker AST.
+                let slots = engine.call_fn::<Dynamic>(&mut Scope::new(), &ast, "slots", ());
+                for result in [top_level, slots] {
+                    assert_eq!(result.is_ok(), succeeds, "extra={extra}, {result:?}");
+                    if let Err(error) = result {
+                        let mut cause = error.as_ref();
+                        while let EvalAltResult::ErrorInFunctionCall(_, _, inner, _) = cause {
+                            cause = inner.as_ref();
+                        }
+                        assert!(
+                            matches!(cause, EvalAltResult::ErrorDataTooLarge(_, _)),
+                            "{error}"
+                        );
+                    }
+                }
+            }
         }
     }
 

@@ -372,34 +372,38 @@ mod tests {
     fn slots_accepts_sparse_numbers_and_sorts() {
         let parsed = slots(
             r#"
-            fn slots() { [#{slot:20,label:"last",run:"go"}, #{slot:1,label:"first",run:"go"}] }
-            fn go(s) { [] }
+            fn slots() { [#{slot:20,label:"last",run:"script_entry"}, #{slot:1,label:"first",run:"script_entry"}] }
+            fn script_entry(s) { [] }
         "#,
         )
         .unwrap();
         assert_eq!(parsed.iter().map(|s| s.number).collect::<Vec<_>>(), [1, 20]);
         assert_eq!(parsed[0].label, "first");
-        assert_eq!(parsed[1].function, "go");
+        assert_eq!(parsed[1].function, "script_entry");
         assert!(slots("fn slots() { [] }").unwrap().is_empty());
     }
 
     #[test]
     fn slots_rejects_duplicates_range_missing_function_and_bad_shapes() {
-        assert!(slots(r#"fn slots(){[#{slot:1,label:"a",run:"go"},#{slot:1,label:"b",run:"go"}]} fn go(s){[]}"#)
+        assert!(slots(r#"fn slots(){[#{slot:1,label:"a",run:"script_entry"},#{slot:1,label:"b",run:"script_entry"}]} fn script_entry(s){[]}"#)
             .unwrap_err().contains("重複"));
         for number in [0, -1, 21] {
             assert!(
                 slots(&format!(
-                    r#"fn slots(){{[ #{{slot:{number},label:"a",run:"go"}} ]}} fn go(s){{[]}}"#
+                    r#"fn slots(){{[ #{{slot:{number},label:"a",run:"script_entry"}} ]}} fn script_entry(s){{[]}}"#
                 ))
                 .unwrap_err()
                 .contains("1〜20")
             );
         }
-        for function in ["", "fn go() { [] }", "fn go(a,b) { [] }"] {
+        for function in [
+            "",
+            "fn script_entry() { [] }",
+            "fn script_entry(a,b) { [] }",
+        ] {
             assert!(
                 slots(&format!(
-                    r#"fn slots(){{[#{{slot:1,label:"a",run:"go"}}]}} {function}"#
+                    r#"fn slots(){{[#{{slot:1,label:"a",run:"script_entry"}}]}} {function}"#
                 ))
                 .unwrap_err()
                 .contains("関数")
@@ -408,11 +412,16 @@ mod tests {
         for value in [
             "()",
             "[1]",
-            "[#{slot:1,run:\"go\"}]",
-            "[#{slot:1,label:42,run:\"go\"}]",
+            "[#{slot:1,run:\"script_entry\"}]",
+            "[#{slot:1,label:42,run:\"script_entry\"}]",
             "[#{slot:1,label:\"a\",run:42}]",
         ] {
-            assert!(slots(&format!("fn slots() {{ {value} }} fn go(s) {{ [] }}")).is_err());
+            assert!(
+                slots(&format!(
+                    "fn slots() {{ {value} }} fn script_entry(s) {{ [] }}"
+                ))
+                .is_err()
+            );
         }
     }
 
