@@ -3711,7 +3711,7 @@ function onGlobalKeyDown(event) {
       repeat: event.repeat,
       editable: isShortcutBlockedTarget(event.target),
       menuOpen: Boolean(state.commandMenu?.isOpen()),
-      rtl: inputAdvancesRightToLeft(state.spreadMode),
+      rtl: inputAdvancesRightToLeft(state.spreadMode, state.readingDirection),
     },
     state.viewer?.isVideoStreamViewer ? "media" : state.screenContext
   );
@@ -8092,7 +8092,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   previous.addEventListener("click", (event) => {
     event.stopPropagation();
     dispatchCommand(command(viewerPageButtonState(
-      "left", inputAdvancesRightToLeft(state.spreadMode)
+      "left", inputAdvancesRightToLeft(state.spreadMode, state.readingDirection)
     ).commandName), {
       source: inputSourceFromEvent(event),
       detail: "toolbar",
@@ -8101,7 +8101,7 @@ function renderImageViewer(index, interactionStartedAt = performance.now()) {
   next.addEventListener("click", (event) => {
     event.stopPropagation();
     dispatchCommand(command(viewerPageButtonState(
-      "right", inputAdvancesRightToLeft(state.spreadMode)
+      "right", inputAdvancesRightToLeft(state.spreadMode, state.readingDirection)
     ).commandName), {
       source: inputSourceFromEvent(event),
       detail: "toolbar",
@@ -8304,7 +8304,7 @@ function changeImage(delta) {
     currentIndex: state.pageGroupIndex,
     count: state.pageGroups.length,
     delta,
-    rtl: inputAdvancesRightToLeft(state.spreadMode),
+    rtl: inputAdvancesRightToLeft(state.spreadMode, state.readingDirection),
   });
   if (message) {
     state.viewer?.showBoundaryMessage(message);
@@ -14749,7 +14749,7 @@ export class ImageViewer {
   }
 
   syncPagePositionFeedback() {
-    const rtl = inputAdvancesRightToLeft(state.spreadMode);
+    const rtl = inputAdvancesRightToLeft(state.spreadMode, state.readingDirection);
     this.previous?.setAttribute("aria-label", viewerPageButtonState("left", rtl).label);
     this.next?.setAttribute("aria-label", viewerPageButtonState("right", rtl).label);
     const requested = this.requestedPagePresentation;
@@ -15799,7 +15799,7 @@ export class ImageViewer {
       ) {
         const swipeLeft = gesture === ViewerGesture.SWIPE_LEFT;
         dispatchCommand(
-          viewerSwipeCommand(gesture, inputAdvancesRightToLeft(state.spreadMode)),
+          viewerSwipeCommand(gesture, inputAdvancesRightToLeft(state.spreadMode, state.readingDirection)),
           { source, detail: swipeLeft ? "swipe_left" : "swipe_right" }
         );
       } else if (panelAction === ViewerPanelAction.OPEN) {
@@ -15816,7 +15816,7 @@ export class ImageViewer {
         dispatchCommand(viewerTapCommand(
           event.clientX,
           this.root.clientWidth,
-          inputAdvancesRightToLeft(state.spreadMode)
+          inputAdvancesRightToLeft(state.spreadMode, state.readingDirection)
         ), {
           source,
           detail: "tap_zone",

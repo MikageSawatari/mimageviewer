@@ -1010,12 +1010,11 @@ export function isRtlReadingDirection(direction) {
   return direction === ReadingDirection.RTL;
 }
 
-// Counterpart of SpreadMode::advances_right_to_left. Use the configured mode,
-// not the portrait-only effective Single or the saved seek reading direction.
-export function inputAdvancesRightToLeft(configuredSpreadMode) {
-  return configuredSpreadMode === SpreadMode.RTL ||
-    configuredSpreadMode === SpreadMode.RTL_COVER ||
-    configuredSpreadMode === SpreadMode.SPLIT_RTL;
+// Counterpart of App::input_advances_right_to_left. The configured mode owns
+// its direction; Single uses the viewer's reading direction. A portrait-only
+// effective Single must not override the configured mode's direction.
+export function inputAdvancesRightToLeft(configuredSpreadMode, readingDirection) {
+  return isRtlReadingDirection(readingDirectionForSpreadMode(configuredSpreadMode, readingDirection));
 }
 
 export function viewerPageButtonState(side, rtl = false) {
