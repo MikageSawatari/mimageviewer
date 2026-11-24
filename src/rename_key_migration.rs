@@ -24,6 +24,9 @@
 //!   (path に `%` / `_` が含まれても誤爆しない)。
 //! - 本 resume のキーを移す・複製する場合は、同じ transaction で page identity の
 //!   パスも同じ mapping に従わせる。複製元と既存優先の宛先は変更せず、page 列は更新しない。
+//! - Converted archives also migrate their predicted cache-path face. Folder
+//!   candidates are recorded by the filesystem rename worker and journaled;
+//!   migration never re-enumerates the tree or consults archive_cache.db.
 //!
 //! ## 本の構造操作
 //! `books` worker は FS 確定後、[`acquire_store_maintenance`] で両端の EPUB 範囲と
@@ -70,6 +73,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
+mod converted_archives;
+pub(crate) use converted_archives::{
+    ConvertedArchiveEnumeration, collect_converted_archive_rels, converted_archive_cache_pairs,
+};
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PathMigrationMapping {
     pub(crate) old_path: PathBuf,
@@ -83,12 +91,15 @@ pub(crate) struct PathMigrationJob {
     /// with this false; normal Shell rename starts true.
     pub(crate) generic_pending: bool,
     pub(crate) mappings: Vec<PathMigrationMapping>,
+    #[serde(default)]
+    pub(crate) converted_archive_rels: Vec<PathBuf>,
 }
 
 impl PathMigrationJob {
     pub(crate) fn shell_rename(old_path: PathBuf, new_path: PathBuf, tree: bool) -> Self {
         Self {
             generic_pending: true,
+            converted_archive_rels: Vec::new(),
             mappings: vec![PathMigrationMapping {
                 old_path,
                 new_path,
@@ -100,6 +111,7 @@ impl PathMigrationJob {
     pub(crate) fn collection_only(mappings: Vec<PathMigrationMapping>) -> Option<Self> {
         (!mappings.is_empty()).then_some(Self {
             generic_pending: false,
+            converted_archive_rels: Vec::new(),
             mappings,
         })
     }
@@ -230,6 +242,8 @@ enum IdentityCoverageShape {
 pub struct RenameMigrationReport {
     pub rows: usize,
     pub errors: Vec<String>,
+    /// Cache mappings whose rows actually changed in a committed store transaction.
+    pub(crate) converted_cache_pairs: Vec<(PathBuf, PathBuf)>,
     /// 共通 STORES の commit により、App 側の path-keyed snapshot を引き直す必要があるか。
     pub(crate) store_mutations: StoreMutationEffects,
     /// worker が panic した (= 残りのストアを試行しないまま中断した) 場合 true。
@@ -1902,19 +1916,30 @@ pub fn run_at(data_dir: &Path, old_path: &Path, new_path: &Path) -> RenameMigrat
     run_at_with_shape(data_dir, old_path, new_path, false)
 }
 
-/// The queued operation retains its source shape, but generic store SQL
-/// migrates exact, slash descendants and virtual entries for either shape.
+/// Compatibility entrypoint: folder snapshots must be supplied by the rename worker.
 pub(crate) fn run_at_with_shape(
     data_dir: &Path,
     old_path: &Path,
     new_path: &Path,
-    _tree: bool,
+    tree: bool,
 ) -> RenameMigrationReport {
-    let coverage = [
-        crate::pdf_loader::EpubPinCoverage::PathAndDescendants(old_path.to_path_buf()),
-        crate::pdf_loader::EpubPinCoverage::PathAndDescendants(new_path.to_path_buf()),
-    ];
-    run_at_with_epub_acquisition(data_dir, old_path, new_path, || {
+    run_at_with_converted_archives(data_dir, old_path, new_path, tree, &[])
+}
+
+pub(crate) fn run_at_with_converted_archives(
+    data_dir: &Path,
+    old_path: &Path,
+    new_path: &Path,
+    tree: bool,
+    rels: &[PathBuf],
+) -> RenameMigrationReport {
+    let cache_pairs = converted_archive_cache_pairs(data_dir, old_path, new_path, tree, rels);
+    let coverage = std::iter::once((old_path.to_path_buf(), new_path.to_path_buf()))
+        .chain(cache_pairs.iter().cloned())
+        .flat_map(|(old, new)| [old, new])
+        .map(crate::pdf_loader::EpubPinCoverage::PathAndDescendants)
+        .collect::<Vec<_>>();
+    run_at_with_cache_pairs_and_epub_acquisition(data_dir, old_path, new_path, &cache_pairs, || {
         crate::pdf_loader::acquire_epub_pin_ranges(&coverage)
     })
 }
@@ -1925,9 +1950,27 @@ fn run_at_with_epub_acquisition(
     new_path: &Path,
     acquire_epub: impl FnOnce() -> crate::pdf_loader::EpubRangeLease,
 ) -> RenameMigrationReport {
+    let cache_pairs = converted_archive_cache_pairs(data_dir, old_path, new_path, false, &[]);
+    run_at_with_cache_pairs_and_epub_acquisition(
+        data_dir,
+        old_path,
+        new_path,
+        &cache_pairs,
+        acquire_epub,
+    )
+}
+
+fn run_at_with_cache_pairs_and_epub_acquisition(
+    data_dir: &Path,
+    old_path: &Path,
+    new_path: &Path,
+    cache_pairs: &[(PathBuf, PathBuf)],
+    acquire_epub: impl FnOnce() -> crate::pdf_loader::EpubRangeLease,
+) -> RenameMigrationReport {
     let mut report = RenameMigrationReport {
         rows: 0,
         errors: Vec::new(),
+        converted_cache_pairs: Vec::new(),
         store_mutations: StoreMutationEffects::default(),
         panicked: false,
     };
@@ -1938,46 +1981,25 @@ fn run_at_with_epub_acquisition(
             return report;
         }
     };
-    maintenance.maintenance.invalidate_root_family(old_path);
-    maintenance.maintenance.invalidate_root_family(new_path);
-
-    // 1. 動画/音声の .xmp サイドカー (タグ・★の実体) をファイルごと改名する。
-    //    フォルダ改名では中のサイドカーがフォルダと一緒に移動しているので対象外。
+    let pairs = std::iter::once((old_path.to_path_buf(), new_path.to_path_buf()))
+        .chain(cache_pairs.iter().cloned())
+        .collect::<Vec<_>>();
+    for (old, new) in &pairs {
+        maintenance.maintenance.invalidate_root_family(old);
+        maintenance.maintenance.invalidate_root_family(new);
+    }
     migrate_sidecar_file(old_path, new_path, &mut report);
-
-    // 2. PDF パスワード (キーが正規化 path の SHA-256 なので UPDATE では移行できない。
-    //    平文を読み直して新キーで保存し直す)。
     migrate_pdf_password(old_path, new_path, &mut report);
-
-    // 3. 共通 STORES の generic rename 群 (exact + `/` prefix + `::` prefix)。
-    //    削除 hard purge も同じ STORES を使う。追加時は片側だけに別表を作らないこと。
-    let old_k = crate::adjustment_db::normalize_path(old_path);
-    let new_k = crate::adjustment_db::normalize_path(new_path);
-    let old_s = crate::path_key::normalize(old_path);
-    let new_s = crate::path_key::normalize(new_path);
     let page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
     let rating_write = crate::rating_db::RATING_WRITES.begin();
     let tag_write = crate::tags_db::TAG_WRITES.begin();
     for descriptor in STORES.iter().filter(|store| store.rename_generic) {
         if descriptor.table == "book_resume" {
-            migrate_resume_store(data_dir, descriptor, old_path, new_path, &mut report);
-            continue;
-        }
-        let (old_key, new_key) = match descriptor.normalization {
-            StoreKeyNormalization::KeepDrive => (&old_k, &new_k),
-            StoreKeyNormalization::DriveStripped => (&old_s, &new_s),
-        };
-        if old_key == new_key {
+            migrate_resume_store(data_dir, descriptor, &pairs, &mut report);
             continue;
         }
         let previous_errors = report.errors.len();
-        migrate_store(
-            &data_dir.join(descriptor.file),
-            descriptor,
-            old_key,
-            new_key,
-            &mut report,
-        );
+        migrate_store(data_dir, descriptor, &pairs, &mut report);
         if descriptor.file == "spread_shift.db" && report.errors.len() != previous_errors {
             maintenance.maintenance.invalidate_unknown_failure();
         }
@@ -1985,16 +2007,10 @@ fn run_at_with_epub_acquisition(
     drop(rating_write);
     drop(tag_write);
     drop(page_edit_write);
-
-    // 本ページブックマークは container_key だけでなく raw container_path と、画像本では
-    // container 相対 page identity も同時更新する必要があるため generic STORES へは載せない。
-    // また missing 行を保持する仕様上、STORES と共有される delete hard purge の対象にも
-    // してはならない。専用 transaction で case-only rename も含めて追従させる。
-    migrate_book_bookmarks(data_dir, old_path, new_path, &mut report);
-    match crate::book_composition::migrate_page_paths_at(
-        data_dir,
-        &[(old_path.to_path_buf(), new_path.to_path_buf())],
-    ) {
+    migrate_book_bookmarks(data_dir, &pairs, &mut report);
+    // Archive/document refs in these stores are container-relative and unchanged;
+    // their container keys were already moved by their STORES descriptor above.
+    match crate::book_composition::migrate_page_paths_at(data_dir, &pairs) {
         Ok(rows) => {
             report.rows += rows;
             report.store_mutations.book_composition_changed |= rows > 0;
@@ -2003,23 +2019,16 @@ fn run_at_with_epub_acquisition(
             .errors
             .push(format!("book_composition pages: {error}")),
     }
-    match crate::spread_shift::migrate_page_paths_at(
-        data_dir,
-        &[(old_path.to_path_buf(), new_path.to_path_buf())],
-    ) {
+    match crate::spread_shift::migrate_page_paths_at(data_dir, &pairs) {
         Ok(rows) => report.rows += rows,
         Err(error) => {
             maintenance.maintenance.invalidate_unknown_failure();
             report.errors.push(format!("spread_shift: {error}"));
         }
     }
-
-    // 5. 閲覧履歴 (exact のみ。raw path 列も更新する)。記述子自体は STORES にあり、
-    //    purge は exact + prefix で同じ行を削除する。
-    if old_k != new_k {
-        migrate_reading_history(data_dir, new_path, &old_k, &new_k, &mut report);
-    }
-
+    migrate_reading_history_pairs(data_dir, &pairs, &mut report);
+    report.converted_cache_pairs.sort();
+    report.converted_cache_pairs.dedup();
     report
 }
 
@@ -2036,6 +2045,7 @@ pub(crate) fn migrate_book_paths_at(
     let mut report = RenameMigrationReport {
         rows: 0,
         errors: Vec::new(),
+        converted_cache_pairs: Vec::new(),
         store_mutations: StoreMutationEffects::default(),
         panicked: false,
     };
@@ -2229,7 +2239,23 @@ fn migrate_archive_resume_rows(
     pairs: &[(PathBuf, PathBuf)],
     collision: PathMigrationCollision,
 ) -> rusqlite::Result<usize> {
+    migrate_archive_resume_rows_with_effects(tx, columns, pairs, collision, &mut BTreeSet::new())
+}
+
+fn migrate_archive_resume_rows_with_effects(
+    tx: &rusqlite::Transaction<'_>,
+    columns: &[String],
+    pairs: &[(PathBuf, PathBuf)],
+    collision: PathMigrationCollision,
+    changed_pairs: &mut BTreeSet<usize>,
+) -> rusqlite::Result<usize> {
     let mappings = resume_source_mappings(pairs);
+    let cache_mapping_indices = pairs
+        .iter()
+        .enumerate()
+        .skip(1)
+        .map(|(index, (old, _))| (crate::path_key::normalize_keep_drive(old), index))
+        .collect::<BTreeMap<_, _>>();
     let mut staged = Vec::new();
     let mut changed = 0;
     for (key, scope) in archive_resume_rows(tx)? {
@@ -2271,7 +2297,35 @@ fn migrate_archive_resume_rows(
         )?;
         changed += moved;
         if moved > 0 {
-            changed += rewrite_resume_identity(tx, columns, &destination, &mappings)?;
+            let json: Option<String> = if columns.iter().any(|column| column == "page_identity") {
+                tx.query_row(
+                    "SELECT page_identity FROM book_resume WHERE path=?1",
+                    [&destination],
+                    |row| row.get(0),
+                )?
+            } else {
+                None
+            };
+            let rewritten = rewrite_resume_identity(tx, columns, &destination, &mappings)?;
+            changed += rewritten;
+            if rewritten > 0
+                && let Some(json) = json
+                && let Ok(identity) =
+                    serde_json::from_str::<crate::book_resume_db::PageIdentity>(&json)
+            {
+                use crate::book_resume_db::PageIdentity;
+                let source = match identity {
+                    PageIdentity::Image { path } => path,
+                    PageIdentity::Archive { container, .. }
+                    | PageIdentity::Document { container, .. } => container,
+                };
+                let physical = source.split("::").next().unwrap_or(&source);
+                if let Some(index) = Path::new(physical).ancestors().find_map(|ancestor| {
+                    cache_mapping_indices.get(ancestor.to_string_lossy().as_ref())
+                }) {
+                    changed_pairs.insert(*index);
+                }
+            }
         }
         changed += tx.execute("DELETE FROM book_resume WHERE path = ?1", [temporary])?;
     }
@@ -2281,34 +2335,52 @@ fn migrate_archive_resume_rows(
 fn migrate_resume_store(
     data_dir: &Path,
     descriptor: &StoreDescriptor,
-    old: &Path,
-    new: &Path,
+    pairs: &[(PathBuf, PathBuf)],
     report: &mut RenameMigrationReport,
 ) {
     let path = data_dir.join(descriptor.file);
     if !path.exists() {
         return;
     }
-    let result = (|| -> Result<usize, String> {
+    let result = (|| -> Result<(usize, BTreeSet<usize>), String> {
         let mut conn = open_store_for_write(&path, descriptor)?;
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .map_err(|e| e.to_string())?;
-        let columns = table_columns(&tx, descriptor.table).map_err(|e| e.to_string())?;
-        let old_key = descriptor.normalize_path(old);
-        let new_key = descriptor.normalize_path(new);
-        // Snapshot only source rows whose destination is vacant. DestinationWins
-        // must not rewrite an existing destination, even if its identity happens
-        // to match the old path. The immediate transaction owns both checks and move.
-        let mut moved_destinations = Vec::new();
-        if old_key != new_key {
+            .map_err(|error| error.to_string())?;
+        let columns = table_columns(&tx, descriptor.table).map_err(|error| error.to_string())?;
+        let roots = converted_archives::cache_roots_in_store(
+            &tx,
+            data_dir,
+            descriptor,
+            columns.iter().any(|column| column == "page_identity"),
+        )
+        .map_err(|error| error.to_string())?;
+        let source_mappings = resume_source_mappings(pairs);
+        let mut changed = 0;
+        let mut changed_pairs = BTreeSet::new();
+        // Namespace rows have a separate owner and are rewritten exactly once.
+        // Include cache mappings for their legacy cache-container identity.
+        changed += migrate_archive_resume_rows_with_effects(
+            &tx,
+            &columns,
+            pairs,
+            PathMigrationCollision::DestinationWins,
+            &mut changed_pairs,
+        )
+        .map_err(|error| error.to_string())?;
+        for (index, (old, new)) in pairs.iter().enumerate() {
+            let old_key = descriptor.normalize_path(old);
+            let new_key = descriptor.normalize_path(new);
+            if index > 0 && !roots.contains(&old_key) {
+                continue;
+            }
             let mut sources = tx
                 .prepare("SELECT path FROM book_resume WHERE path = ?1")
-                .map_err(|e| e.to_string())?
+                .map_err(|error| error.to_string())?
                 .query_map([&old_key], |row| row.get::<_, String>(0))
-                .map_err(|e| e.to_string())?
+                .map_err(|error| error.to_string())?
                 .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(|e| e.to_string())?;
+                .map_err(|error| error.to_string())?;
             for delimiter in ["/", "::"] {
                 sources.extend(
                     indexed_prefix_keys(
@@ -2317,9 +2389,10 @@ fn migrate_resume_store(
                         descriptor.column,
                         &format!("{old_key}{delimiter}"),
                     )
-                    .map_err(|e| e.to_string())?,
+                    .map_err(|error| error.to_string())?,
                 );
             }
+            let mut destinations = Vec::new();
             for source in sources {
                 let destination = format!("{new_key}{}", &source[old_key.len()..]);
                 let exists: bool = tx
@@ -2328,39 +2401,41 @@ fn migrate_resume_store(
                         [&destination],
                         |row| row.get(0),
                     )
-                    .map_err(|e| e.to_string())?;
-                if !exists {
-                    moved_destinations.push(destination);
+                    .map_err(|error| error.to_string())?;
+                if old_key == new_key || !exists {
+                    destinations.push(destination);
                 }
             }
+            let before_changes = sqlite_total_changes(&tx).map_err(|error| error.to_string())?;
+            let mut rows = migrate_store_family(
+                &tx,
+                descriptor,
+                &old_key,
+                &new_key,
+                PathMigrationCollision::DestinationWins,
+            )
+            .map_err(|error| error.to_string())?;
+            for destination in destinations {
+                rows += rewrite_resume_identity(&tx, &columns, &destination, &source_mappings)
+                    .map_err(|error| error.to_string())?;
+            }
+            if sqlite_total_changes(&tx).map_err(|error| error.to_string())? > before_changes
+                && index > 0
+            {
+                changed_pairs.insert(index);
+            }
+            changed += rows;
         }
-        let source_mappings = resume_source_mappings(&[(old.to_path_buf(), new.to_path_buf())]);
-        let mut changed = migrate_archive_resume_rows(
-            &tx,
-            &columns,
-            &[(old.to_path_buf(), new.to_path_buf())],
-            PathMigrationCollision::DestinationWins,
-        )
-        .map_err(|e| e.to_string())?;
-        changed += migrate_store_family(
-            &tx,
-            descriptor,
-            &old_key,
-            &new_key,
-            PathMigrationCollision::DestinationWins,
-        )
-        .map_err(|e| e.to_string())?;
-        for destination in moved_destinations {
-            changed += rewrite_resume_identity(&tx, &columns, &destination, &source_mappings)
-                .map_err(|e| e.to_string())?;
-        }
-        tx.commit().map_err(|e| e.to_string())?;
-        Ok(changed)
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok((changed, changed_pairs))
     })();
     match result {
-        Ok(rows) => {
+        Ok((rows, changed_pairs)) => {
             report.rows += rows;
             report.store_mutations.record_rows_changed(descriptor, rows);
+            for index in changed_pairs {
+                converted_archives::record_changed_pair(report, &pairs[index]);
+            }
         }
         Err(error) => report.errors.push(format!("{}: {error}", descriptor.file)),
     }
@@ -2791,19 +2866,33 @@ fn rewrite_book_store_values(
 
 fn migrate_book_bookmarks(
     data_dir: &Path,
-    old_path: &Path,
-    new_path: &Path,
+    pairs: &[(PathBuf, PathBuf)],
     report: &mut RenameMigrationReport,
 ) {
     let db_path = data_dir.join("book_bookmarks.db");
     if !db_path.exists() {
         return;
     }
-    match crate::book_bookmarks::migrate_paths_at(
-        &db_path,
-        &[(old_path.to_path_buf(), new_path.to_path_buf())],
-    ) {
-        Ok(rows) => report.rows += rows,
+    let active = pairs
+        .iter()
+        .enumerate()
+        .filter(|(index, (old, new))| *index == 0 || !crate::path_key::eq_keep_drive(old, new))
+        .collect::<Vec<_>>();
+    let active_pairs = active
+        .iter()
+        .map(|(_, pair)| (*pair).clone())
+        .collect::<Vec<_>>();
+    match crate::book_bookmarks::migrate_paths_with_changed_at(&db_path, &active_pairs) {
+        Ok((rows, changed_pairs)) => {
+            report.rows += rows;
+            for index in changed_pairs
+                .into_iter()
+                .map(|index| active[index].0)
+                .filter(|index| *index > 0)
+            {
+                converted_archives::record_changed_pair(report, &pairs[index]);
+            }
+        }
         Err(error) => report.errors.push(format!("book_bookmarks: {error}")),
     }
 }
@@ -3284,72 +3373,97 @@ pub(crate) fn purge_exact_identity_with_before_sql_for_test(
 }
 
 /// 1 ストア分の移行: exact + `<old>/` prefix + `<old>::` prefix。
+fn sqlite_total_changes(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<u64> {
+    tx.query_row("SELECT total_changes()", [], |row| row.get(0))
+}
+
 fn migrate_store(
-    db_path: &Path,
+    data_dir: &Path,
     descriptor: &StoreDescriptor,
-    old_key: &str,
-    new_key: &str,
+    pairs: &[(PathBuf, PathBuf)],
     report: &mut RenameMigrationReport,
 ) {
+    let db_path = data_dir.join(descriptor.file);
     if !db_path.exists() {
         return;
     }
-    // The operation already owns the union EPUB coverage before shift maintenance.
-    let result = (|| -> Result<(usize, BTreeSet<String>), Box<dyn std::error::Error>> {
-        let mut conn = open_store_for_write(db_path, descriptor).map_err(std::io::Error::other)?;
-        let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
-        let _rating_write =
-            (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
-        let _tag_write = (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let columns = table_columns(&tx, descriptor.table)?;
-        if columns.is_empty()
-            && descriptor.table_availability == StoreTableAvailability::OptionalInLegacySchema
-        {
-            return Ok((0, BTreeSet::new()));
-        }
-        if !columns.iter().any(|column| column == descriptor.column) {
-            return Err(rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).into());
-        }
-        let rotation_snapshot = RotationMutationSnapshot::capture_families(
-            &tx,
-            descriptor,
-            [old_key.to_owned(), new_key.to_owned()],
-        )?;
-        let changed = migrate_store_family(
-            &tx,
-            descriptor,
-            old_key,
-            new_key,
-            PathMigrationCollision::DestinationWins,
-        )?;
-        // rating.db はキーから導出される source_path 列 (一覧ビューがコンテナを開くのに
-        // 使う) も新キーに合わせる (`RatingDb::copy_entry_key` と同じ導出規則 =
-        // "::" より前、無ければキー自身)。
-        if descriptor.table == "ratings" && changed > 0 {
-            tx.execute(
-                &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path = ?1"),
-                [new_key],
+    let result =
+        (|| -> Result<(usize, BTreeSet<String>, Vec<usize>), Box<dyn std::error::Error>> {
+            let mut conn =
+                open_store_for_write(&db_path, descriptor).map_err(std::io::Error::other)?;
+            let _page_edit_write = crate::page_edit_write_epoch::PAGE_EDIT_WRITES.begin();
+            let _rating_write =
+                (descriptor.table == "ratings").then(|| crate::rating_db::RATING_WRITES.begin());
+            let _tag_write =
+                (descriptor.file == "tags.db").then(|| crate::tags_db::TAG_WRITES.begin());
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let columns = table_columns(&tx, descriptor.table)?;
+            if columns.is_empty() && descriptor.optional_legacy_table() {
+                return Ok((0, BTreeSet::new(), Vec::new()));
+            }
+            if !columns.iter().any(|column| column == descriptor.column) {
+                return Err(
+                    rusqlite::Error::InvalidColumnName(descriptor.column.to_string()).into(),
+                );
+            }
+            let roots = converted_archives::cache_roots_in_store(&tx, data_dir, descriptor, false)?;
+            let active = pairs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, (old, new))| {
+                    let old = descriptor.normalize_path(old);
+                    let new = descriptor.normalize_path(new);
+                    (old != new && (index == 0 || roots.contains(&old)))
+                        .then_some((index, old, new))
+                })
+                .collect::<Vec<_>>();
+            let rotation_snapshot = RotationMutationSnapshot::capture_families(
+                &tx,
+                descriptor,
+                active
+                    .iter()
+                    .flat_map(|(_, old, new)| [old.clone(), new.clone()]),
             )?;
-            update_rating_source_paths_for_prefix(&tx, &format!("{new_key}/"))?;
-            update_rating_source_paths_for_prefix(&tx, &format!("{new_key}::"))?;
-        }
-        let rotation_keys = rotation_snapshot.changed_keys(&tx)?;
-        tx.commit()?;
-        Ok((changed, rotation_keys))
-    })();
-
+            let mut changed = 0;
+            let mut changed_pairs = Vec::new();
+            for (index, old_key, new_key) in active {
+                let before_changes = sqlite_total_changes(&tx)?;
+                let rows = migrate_store_family(
+                    &tx,
+                    descriptor,
+                    &old_key,
+                    &new_key,
+                    PathMigrationCollision::DestinationWins,
+                )?;
+                if descriptor.table == "ratings" && rows > 0 {
+                    tx.execute(
+                        &format!("{RATING_SOURCE_PATH_UPDATE} WHERE path = ?1"),
+                        [&new_key],
+                    )?;
+                    update_rating_source_paths_for_prefix(&tx, &format!("{new_key}/"))?;
+                    update_rating_source_paths_for_prefix(&tx, &format!("{new_key}::"))?;
+                }
+                if sqlite_total_changes(&tx)? > before_changes && index > 0 {
+                    changed_pairs.push(index);
+                }
+                changed += rows;
+            }
+            let rotation_keys = rotation_snapshot.changed_keys(&tx)?;
+            tx.commit()?;
+            Ok((changed, rotation_keys, changed_pairs))
+        })();
     match result {
-        Ok((n, rotation_keys)) => {
-            report.rows += n;
-            report.store_mutations.record_rows_changed(descriptor, n);
+        Ok((rows, rotation_keys, changed_pairs)) => {
+            report.rows += rows;
+            report.store_mutations.record_rows_changed(descriptor, rows);
             report.store_mutations.record_rotation_keys(rotation_keys);
+            for index in changed_pairs {
+                converted_archives::record_changed_pair(report, &pairs[index]);
+            }
         }
-        Err(e) => report.errors.push(format!(
-            "{}: {}.{}: {e}",
-            db_path.file_name().unwrap_or_default().to_string_lossy(),
-            descriptor.table,
-            descriptor.column,
+        Err(error) => report.errors.push(format!(
+            "{}: {}.{}: {error}",
+            descriptor.file, descriptor.table, descriptor.column
         )),
     }
 }
@@ -4011,28 +4125,69 @@ fn migrate_reading_history(
     new_key: &str,
     report: &mut RenameMigrationReport,
 ) {
+    migrate_reading_history_pairs(
+        data_dir,
+        &[(PathBuf::from(old_key), new_path.to_path_buf())],
+        report,
+    );
+    debug_assert_eq!(new_key, crate::adjustment_db::normalize_path(new_path));
+}
+
+fn migrate_reading_history_pairs(
+    data_dir: &Path,
+    pairs: &[(PathBuf, PathBuf)],
+    report: &mut RenameMigrationReport,
+) {
     let db_path = data_dir.join("reading_history.db");
     if !db_path.exists() {
         return;
     }
-    let result = (|| -> Result<usize, rusqlite::Error> {
-        let conn = rusqlite::Connection::open(&db_path)?;
+    let result = (|| -> rusqlite::Result<(usize, Vec<usize>)> {
+        let mut conn = rusqlite::Connection::open(&db_path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let n = conn.execute(
-            "UPDATE OR IGNORE reading_history SET key = ?1, path = ?2 WHERE key = ?3",
-            rusqlite::params![new_key, new_path.to_string_lossy(), old_key],
-        )?;
-        conn.execute("DELETE FROM reading_history WHERE key = ?1", [old_key])?;
-        Ok(n)
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let descriptor = STORES
+            .iter()
+            .find(|store| store.file == "reading_history.db")
+            .unwrap();
+        let roots = converted_archives::cache_roots_in_store(&tx, data_dir, descriptor, false)?;
+        let mut changed = 0;
+        let mut changed_pairs = Vec::new();
+        for (index, (old, new)) in pairs.iter().enumerate() {
+            let old_key = descriptor.normalize_path(old);
+            let new_key = descriptor.normalize_path(new);
+            if old_key == new_key || (index > 0 && !roots.contains(&old_key)) {
+                continue;
+            }
+            let rows = tx.execute(
+                "UPDATE OR IGNORE reading_history SET key=?1, path=?2 WHERE key=?3",
+                rusqlite::params![new_key, new.to_string_lossy(), old_key],
+            )?;
+            let removed = tx.execute("DELETE FROM reading_history WHERE key=?1", [&old_key])?;
+            changed += rows;
+            if rows + removed > 0 && index > 0 {
+                changed_pairs.push(index);
+            }
+        }
+        tx.commit()?;
+        Ok((changed, changed_pairs))
     })();
     match result {
-        Ok(n) => report.rows += n,
-        Err(e) => report.errors.push(format!("reading_history: {e}")),
+        Ok((rows, changed_pairs)) => {
+            report.rows += rows;
+            for index in changed_pairs {
+                converted_archives::record_changed_pair(report, &pairs[index]);
+            }
+        }
+        Err(error) => report.errors.push(format!("reading_history: {error}")),
     }
 }
 
 #[cfg(test)]
-mod resume_identity_tests;
+pub(crate) mod resume_identity_tests;
+
+#[cfg(test)]
+mod section1886_tests;
 
 #[cfg(test)]
 mod tests {
@@ -5389,6 +5544,7 @@ mod tests {
         let mut report = RenameMigrationReport {
             rows: 0,
             errors: vec![],
+            converted_cache_pairs: Vec::new(),
             store_mutations: StoreMutationEffects::default(),
             panicked: false,
         };

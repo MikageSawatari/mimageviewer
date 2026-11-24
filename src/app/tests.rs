@@ -46259,6 +46259,7 @@ mod favorite_adjustment_defaults_tests {
             rx,
         });
         tx.send(crate::rename_key_migration::RenameMigrationReport {
+            converted_cache_pairs: Vec::new(),
             rows: 0,
             errors: Vec::new(),
             store_mutations: Default::default(),
@@ -46290,6 +46291,8 @@ mod favorite_adjustment_defaults_tests {
         app.rename_target = None;
         app.rename_target_is_file = false;
         tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
+            converted_archive_rels: Vec::new(),
+            converted_archive_enumeration_incomplete: false,
             target: app.tmp.path().join("before.jpg"),
             new_path: app.tmp.path().join("after.jpg"),
             operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(0, Ok(false), 0),
@@ -46337,6 +46340,8 @@ mod favorite_adjustment_defaults_tests {
         });
         app.rename_target_is_file = true; // The dialog field must not override captured scope.
         tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
+            converted_archive_rels: Vec::new(),
+            converted_archive_enumeration_incomplete: false,
             target: app.tmp.path().join("old-folder"),
             new_path: app.tmp.path().join("new-folder"),
             operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(0, Ok(false), 0),
@@ -46348,6 +46353,8 @@ mod favorite_adjustment_defaults_tests {
 
         for result in [
             Ok(crate::shell_file_ops::ShellRenameOutcome {
+                converted_archive_rels: Vec::new(),
+                converted_archive_enumeration_incomplete: false,
                 target: app.tmp.path().join("cancelled"),
                 new_path: app.tmp.path().join("cancelled-new"),
                 operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(
@@ -46406,6 +46413,8 @@ mod favorite_adjustment_defaults_tests {
                 collection_scope: crate::collection_store::CollectionSourceMigrationScope::Exact,
             });
             tx.send(Ok(crate::shell_file_ops::ShellRenameOutcome {
+                converted_archive_rels: Vec::new(),
+                converted_archive_enumeration_incomplete: false,
                 target: app.tmp.path().join("before.jpg"),
                 new_path: app.tmp.path().join("after.jpg"),
                 operation: crate::shell_file_ops::ShellTransferOutcome::test_outcome(
@@ -82358,6 +82367,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             rx,
         });
         tx.send(crate::rename_key_migration::RenameMigrationReport {
+            converted_cache_pairs: Vec::new(),
             rows: 1,
             errors: Vec::new(),
             store_mutations: Default::default(),
@@ -82400,6 +82410,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             rx,
         });
         tx.send(crate::rename_key_migration::RenameMigrationReport {
+            converted_cache_pairs: Vec::new(),
             rows: 1,
             errors: Vec::new(),
             store_mutations: Default::default(),
@@ -82472,6 +82483,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
             rx,
         });
         tx.send(crate::rename_key_migration::RenameMigrationReport {
+            converted_cache_pairs: Vec::new(),
             rows: 1,
             errors: Vec::new(),
             store_mutations: Default::default(),
@@ -82513,6 +82525,7 @@ restore_intent: crate::app::StartupListIntent::ExplicitList,
         });
         app.persist_rename_migration_journal();
         tx.send(crate::rename_key_migration::RenameMigrationReport {
+            converted_cache_pairs: Vec::new(),
             rows: 0,
             errors: vec!["worker panicked".to_string()],
             store_mutations: Default::default(),

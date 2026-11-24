@@ -304,3 +304,82 @@ job は今までどおり配下の cache の面を移さないだけ)。旧形�
   動かしてしまうこと (元の組も cache の組も同じ。C6)。直すなら、旧パスとその配下への新しい閲覧・保存を、該当する
   移行の確定まで受け付けない境界が要り、既存の操作を待たせることになるので、統括・利用者の判断が要る。
   移行 job は通常、改名の直後 (保存 worker が空いた時点) に始まるので、窓は短い (未計測)。
+
+
+## 6. 実装記録
+
+2026-11-25。実装担当はビルド・check・テストを実行していない (設計担当の指示)。コンパイルと実行時の検証は設計担当へ引き継ぐ。
+`cargo fmt`、`git diff --check`、UI グリフ検査は成功した。
+
+- FS 列挙と cache の組の純関数を `rename_key_migration/converted_archives.rs` に分離した。
+  `run_at_with_converted_archives` が journal の一覧を受け取り、既存の `run_at_with_shape` は空の一覧を渡す入口として残した。
+  `spawn_rename_key_migration_with_converted_archives` が Shell の結果を job に記録する。既存の constructor と入口は空の一覧を作る。
+- 汎用ストア・読書位置・閲覧履歴は、組ごとの SQL を同じ descriptor の transaction にまとめ、cache root の範囲読みで候補を選ぶ。
+  読書位置の通常行と名前空間行は別の経路で一度ずつ identity を書き換える。変更した cache の組は commit 成功後だけ報告する。
+- しおりの専用移行は、container 外の画像本の相対参照も調べる既存の全行走査を、同じ immediate transaction の中へ移した。
+  一度の snapshot と既存の祖先キー索引で対象・変更した組を選ぶ。候補ごとの DB 読込や別の root 読込は足していない。
+  `migrate_paths_at` の既存の戻り値を保ち、組の変更印を返す入口を追加した。
+- App の cache 側の付け替えは `app/converted_archive_rename.rs` に置いた。presence・回転・rating_session_writes・編集プレビューは
+  container の対応表を引く走査にした。読書位置メーターには、進行中の全行読込への delta 適用も含む cache root の一括削除を加えた。
+  context は既存の registry / mount 経路で対象だけを選び、cache の再読込には非同期の準備を使う。
+- §2.5 の前提をコードで確認した。`poll_zip_enumerate` が運ぶ `PreparedZipEnumeration` は ZIP の項目と tree を持ち、編集 DB の snapshot は持たない。
+  `install_prepared_zip_grid` は prepared_page_edits を渡さず、列挙後の既存 `resume_loading_items_after_sidecar` が編集 DB を読む。
+  したがって列挙中に移行が完了した順序では、その後の初回 hydration が移行後の DB を読む。
+  既に走っている非同期の編集準備は `poll_page_edit_reconciliation` が採用直前に `PAGE_EDIT_WRITES.accepts` を検査し、古い初回結果は
+  準備を作り直す。本の構成で行を置換する準備も `adopt_book_projection` が同じ epoch を検査する。通常の初回 hydration 経路は変更していない。
+- 改名 worker の列挙中は `rename_pending` が App に残る。元の writer 待ちと FIFO を保ち、移行 worker にもテストの epoch scope を引き継いだ。
+  削除の成功の採用は既存の generic_pending の抑止を使い、collection へ渡す mappings に cache の組は追加しない。
+- §3.2 の通常 ZIP は、変換キャッシュ面に行が無いものとして検査する。元の論理 path の行は、§2.3 の元の組による既存のフォルダ改名に従って移す。
+- C4 の別ドライブ共有行は、cache のキーが共有され、改名側の新しい cache キーへ動くことを検査した。
+  別ドライブ側の論理パスを最後に identity に保存した共有行まで、改名側の論理パスへ読み替える規則は追加していない。
+  identity の対応はドライブを保持する既存規則なので、この場合の別ドライブ identity は残る。
+- Windows の標準ライブラリの `FileType::is_symlink` は junction の reparse tag も判定する。
+  列挙は `DirEntry::file_type` のキャッシュ情報を使い、junction とシンボリックリンクの入口をたどらない。
+
+追加したテストの名前 (Windows / Unix 限定のものを含む。未実行):
+
+`src/rename_key_migration/resume_identity_tests.rs`:
+
+```text
+section1886_file_rename_restores_logical_and_cache_identities
+section1886_folder_snapshot_moves_two_books_and_preserves_outside_books
+section1886_shared_drive_stripped_cache_row_follows_renamed_side
+section1886_namespace_identity_is_rewritten_once_for_files_and_folders
+section1886_case_only_cache_keys_are_noop_and_position_stays_restored
+section1886_resume_destination_wins_preserves_page_meter_and_identity
+section1886_resume_identity_updates_when_drive_stripped_cache_key_does_not_move
+section1886_resume_rolls_back_logical_and_cache_rows_if_identity_rewrite_fails
+```
+
+`src/rename_key_migration/section1886_tests.rs`:
+
+```text
+section1886_cache_faces_move_adjustment_rating_spread_and_bookmark
+section1886_bookmark_only_mutation_is_reported_without_generic_rows
+section1886_empty_cache_root_does_not_filter_fs_snapshot_or_scan_per_candidate
+section1886_adjustment_destination_wins_and_store_rolls_back_all_faces_on_error
+section1886_fs_enumeration_has_stable_relative_paths_and_reports_failure
+section1886_fs_enumeration_never_enters_junction_or_junction_root
+section1886_fs_enumeration_never_enters_symlinks
+section1886_pure_pairs_reject_invalid_journal_relative_paths
+section1886_journal_roundtrip_default_legacy_and_collection_only_keep_logical_mappings
+```
+
+`src/app/converted_archive_rename/tests.rs`:
+
+```text
+section1886_handler_consecutive_folder_renames_use_frozen_fs_inventory
+section1886_handler_consecutive_renames_wait_for_unfinished_cache_save
+section1886_handler_delete_waits_for_rename_and_suppresses_cache_stage
+section1886_handler_success_and_completion_rewrite_presence_and_prepare_cache_async
+section1886_handler_rejects_prepare_read_before_migration_at_late_adoption
+section1886_many_candidates_visit_each_presence_rating_and_preview_key_once
+section1886_handler_migration_finishes_during_enumeration_before_first_edit_read
+section1886_handler_rehydrates_only_matching_parked_cache_context
+```
+
+設計担当側で run-heavy 経由の nextest に渡す filter:
+
+```text
+test(section1886) | test(section1885) | test(rename_key_migration) | test(book_resume) | test(content_identity::restore) | test(rar_archive_cache) | test(rename_migration) | test(rename_item)
+```

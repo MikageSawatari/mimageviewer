@@ -1,5 +1,5 @@
 //! 一覧の前回位置。本の全行読込は既存writer、媒体はlive設定表と取得済み長さを参照する。
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
@@ -12,6 +12,7 @@ use crate::keymap::KeyAction;
 enum Delta {
     Record(String, Option<ReadingMeterValue>),
     RemoveScopes(Vec<PathBuf>),
+    RemoveConvertedRoots(HashSet<String>),
     Clear,
 }
 
@@ -28,6 +29,9 @@ impl Delta {
                         .any(|scope| key.matches_source_family(scope, true))
                 })
             }),
+            Self::RemoveConvertedRoots(roots) => {
+                rows.retain(|key, _| !roots.contains(key.split("::").next().unwrap_or(key)));
+            }
             Self::Clear => rows.clear(),
         }
     }
@@ -105,6 +109,16 @@ impl BookResumeMeters {
 
     pub(crate) fn remove_scopes(&mut self, paths: &[PathBuf]) {
         self.update(Delta::RemoveScopes(paths.to_vec()));
+        self.keys.clear();
+    }
+
+    /// Cache roots are exact container keys; one hash lookup per stored row,
+    /// including deltas replayed over an already running read_all snapshot.
+    pub(crate) fn remove_converted_roots(&mut self, roots: HashSet<String>) {
+        if roots.is_empty() {
+            return;
+        }
+        self.update(Delta::RemoveConvertedRoots(roots));
         self.keys.clear();
     }
 
