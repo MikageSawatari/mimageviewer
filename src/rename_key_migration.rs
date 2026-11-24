@@ -75,7 +75,7 @@ use serde::{Deserialize, Serialize};
 
 mod converted_archives;
 pub(crate) use converted_archives::{
-    ConvertedArchiveEnumeration, collect_converted_archive_rels, converted_archive_cache_pairs,
+    collect_converted_archive_rels, converted_archive_cache_pairs,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

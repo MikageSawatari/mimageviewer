@@ -52497,6 +52497,10 @@ impl App {
                             &mapping.old_path,
                             &mapping.new_path,
                         );
+                        // Bookmark notification advances page_edit_revision, even outside a
+                        // Smart view. Finish that invalidation before creating any edit prepare;
+                        // otherwise its Building/Running owner is obsolete in this same handler.
+                        self.invalidate_book_bookmarks_after_path_migration();
                         // idx キーのページ編集 state は「リネームに関係する文脈」だけ再構築する。
                         // 旧実装の全文脈 clear_page_edit_state は、無関係な画像の編集中ドラッグ値
                         // まで消し、離した瞬間に既存の保存済み補正を削除する実害があった
@@ -52508,9 +52512,6 @@ impl App {
                         self.apply_converted_archive_rename_completion(
                             &report.converted_cache_pairs,
                         );
-                        // 共通リネーム worker は book_bookmarks.db も更新する。現在の本の
-                        // 左パネルと横断一覧が旧 identity を保持し続けないよう再読込する。
-                        self.invalidate_book_bookmarks_after_path_migration();
                         self.book_resume_meters
                             .remove_scopes(&[mapping.old_path.clone(), mapping.new_path.clone()]);
                         self.reload_book_resume_meters();

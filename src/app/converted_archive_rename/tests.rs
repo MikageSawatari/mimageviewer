@@ -256,6 +256,53 @@ fn deliver_completion(app: &mut App, old: &Path, new: &Path, pairs: Vec<(PathBuf
     app.poll_rename_migration_pending(&egui::Context::default());
 }
 
+fn finish_fresh_page_edit_prepare(app: &mut App, ctx: &egui::Context) {
+    let Some(edits::ReconcileStatus::Building(build)) = app.page_edit_reconcile_pending.as_ref()
+    else {
+        panic!("rename completion must leave an initial edit prepare");
+    };
+    assert_eq!(build.context_id, app.virtual_list_context_id());
+    assert_eq!(build.items_generation, app.items_generation);
+    assert_eq!(
+        build.page_edit_revision, app.page_edit_revision,
+        "completion notifications must precede preparation of the final metadata revision"
+    );
+    assert_eq!(build.item_count, app.items.len());
+
+    // This is the ROOT update entry that registers writer wakes and polls the
+    // mounted context. Keep its real bounded builder, DB worker and adoption.
+    app.service_update_registered_writers(ctx);
+    assert!(
+        matches!(
+            app.page_edit_reconcile_pending,
+            Some(edits::ReconcileStatus::Running(_))
+        ),
+        "the four-page builder must start its real prepare worker"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while app.page_edit_snapshot.is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "fresh prepare did not arrive (pending={}, revision={})",
+            match app.page_edit_reconcile_pending.as_ref() {
+                Some(edits::ReconcileStatus::Building(_)) => "Building",
+                Some(edits::ReconcileStatus::Running(_)) => "Running",
+                Some(edits::ReconcileStatus::Failed { .. }) => "Failed",
+                None => "None",
+            },
+            app.page_edit_revision
+        );
+        app.service_update_registered_writers(ctx);
+        std::thread::yield_now();
+    }
+    assert!(app.page_edit_reconcile_pending.is_none());
+    let snapshot = app.page_edit_snapshot.as_ref().unwrap();
+    assert!(
+        crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(snapshot.stamp.unwrap()),
+        "the adopted DB read must belong to the current write epoch"
+    );
+}
+
 #[test]
 fn section1886_handler_success_and_completion_rewrite_presence_and_prepare_cache_async() {
     let mut env = setup_app();
@@ -311,6 +358,7 @@ fn section1886_handler_rejects_prepare_read_before_migration_at_late_adoption() 
     let mut env = setup_app();
     let data = env.tmp.path().to_path_buf();
     let app = &mut env.app;
+    let ctx = egui::Context::default();
     let old = data.join("old.rar");
     let new = data.join("new.rar");
     let old_cache = cache(&data, &old);
@@ -355,7 +403,7 @@ fn section1886_handler_rejects_prepare_read_before_migration_at_late_adoption() 
     let report = migration::run_at(&data, &old, &new);
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert!(!crate::page_edit_write_epoch::PAGE_EDIT_WRITES.accepts(stamp));
-    app.poll_page_edit_reconciliation(&egui::Context::default());
+    app.service_update_registered_writers(&ctx);
     assert!(
         app.page_edit_snapshot.is_none(),
         "stale DB result must not be installed"
@@ -367,13 +415,57 @@ fn section1886_handler_rejects_prepare_read_before_migration_at_late_adoption() 
     app.rename_migration_data_dir_override = Some(data.clone());
     app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
     deliver_completion(app, &old, &new, report.converted_cache_pairs);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while app.page_edit_snapshot.is_none() {
-        assert!(Instant::now() < deadline, "fresh prepare did not arrive");
-        app.poll_page_edit_reconciliation(&egui::Context::default());
-        std::thread::yield_now();
-    }
+    finish_fresh_page_edit_prepare(app, &ctx);
+    assert_eq!(
+        app.page_edit_snapshot.as_ref().unwrap().adjustment[&page_key(&new_cache)].brightness,
+        29.0
+    );
     assert_eq!(app.adjustment_page_params[&2].brightness, 29.0);
+}
+
+#[test]
+fn section1886_handler_original_path_prepare_uses_final_metadata_revision() {
+    let mut env = setup_app();
+    let data = env.tmp.path().to_path_buf();
+    let app = &mut env.app;
+    let ctx = egui::Context::default();
+    app.rename_migration_data_dir_override = Some(data.clone());
+    app.rename_migration_journal_admission = RenameMigrationJournalAdmission::Durable;
+    let old = data.join("old.zip");
+    let new = data.join("new.zip");
+    let mut params = crate::adjustment::AdjustParams::default();
+    params.brightness = 37.0;
+    app.adjustment_db
+        .as_ref()
+        .unwrap()
+        .set_page_params(&page_key(&old), &params)
+        .unwrap();
+    app.current_folder = Some(new.clone());
+    app.items = archive_pages(&new, &[]);
+    app.thumbnails = (0..app.items.len())
+        .map(|_| ThumbnailState::Pending)
+        .collect();
+    // A direct ZIP uses the original pair's existing async rehydrate branch
+    // when it already owns a prepared snapshot from before migration.
+    let stale = edits::PageEditSnapshot::load_and_project_stable(
+        &app.items,
+        edits::PageEditAvailability::for_app(app),
+        &AtomicBool::new(false),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(stale.snapshot.adjustment.is_empty());
+    app.install_prepared_page_edits(stale);
+    let report = migration::run_at(&data, &old, &new);
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    assert!(report.converted_cache_pairs.is_empty());
+    deliver_completion(app, &old, &new, report.converted_cache_pairs);
+    finish_fresh_page_edit_prepare(app, &ctx);
+    assert_eq!(
+        app.page_edit_snapshot.as_ref().unwrap().adjustment[&page_key(&new)].brightness,
+        37.0
+    );
+    assert_eq!(app.adjustment_page_params[&2].brightness, 37.0);
 }
 
 #[test]

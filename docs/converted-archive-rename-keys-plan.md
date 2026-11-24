@@ -335,6 +335,14 @@ job は今までどおり配下の cache の面を移さないだけ)。旧形�
   identity の対応はドライブを保持する既存規則なので、この場合の別ドライブ identity は残る。
 - Windows の標準ライブラリの `FileType::is_symlink` は junction の reparse tag も判定する。
   列挙は `DirEntry::file_type` のキャッシュ情報を使い、junction とシンボリックリンクの入口をたどらない。
+- 追加修正 (2026-11-25): 改名移行完了 handler が編集準備を作った後、しおり変更通知の
+  `schedule_current_smart_folder_metadata_refresh` → `invalidate_smart_folder_resort_metadata` が
+  `page_edit_revision` を進めていた。次の poll は Building の revision 不一致で準備を破棄し、
+  snapshot がまだ無いため後続の再読込も始まらない。しおりの失効・通知を元の組と cache の組の再準備より前へ移した。
+  失敗した late-adoption テストは、完了 handler 後の準備の revision と context・items の一致、
+  ROOT の `service_update_registered_writers` を通る Building → 実 DB worker の Running → fresh snapshot の採用、
+  採用 stamp と保存された補正の値を検査する。10 秒の期限は延ばしていない。元の論理パスの非同期再準備にも同じ回帰検査を加えた。
+  unused import の `ConvertedArchiveEnumeration` の再公開を削除した。この追加修正の build・test・check は実行していない。
 
 追加したテストの名前 (Windows / Unix 限定のものを含む。未実行):
 
@@ -373,6 +381,7 @@ section1886_handler_consecutive_renames_wait_for_unfinished_cache_save
 section1886_handler_delete_waits_for_rename_and_suppresses_cache_stage
 section1886_handler_success_and_completion_rewrite_presence_and_prepare_cache_async
 section1886_handler_rejects_prepare_read_before_migration_at_late_adoption
+section1886_handler_original_path_prepare_uses_final_metadata_revision
 section1886_many_candidates_visit_each_presence_rating_and_preview_key_once
 section1886_handler_migration_finishes_during_enumeration_before_first_edit_read
 section1886_handler_rehydrates_only_matching_parked_cache_context
