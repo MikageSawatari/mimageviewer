@@ -13679,8 +13679,8 @@ mod tests {
                 assert!(bindings.contains(&(context, ring.clone())));
                 assert!(super::ring_action_has_key_action(context, &ring));
                 assert_eq!(
-                    ring_action_detail_label(&ring, context),
-                    key_action_detail_label(key)
+                    super::ring_action_detail_label(&ring, context),
+                    super::key_action_detail_label(key)
                 );
             }
         }

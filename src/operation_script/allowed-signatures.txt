@@ -1,8 +1,8 @@
 # Audited for Rhai 1.27.0, Windows x64, default numeric features.
-# Source-derived from packages/arithmetic.rs, logic.rs, iter_basic.rs and engine.rs.
+# Source-derived from packages/arithmetic.rs, logic.rs and engine.rs.
 # Also audited: engine.rs raw defaults and Rhai built-in operator dispatch.
-# Arithmetic uses bounded machine-number operations; ranges only create iterators.
-# Iteration is charged by Rhai; chars traverses bounded strings; bits visits at most 64 bits.
+# Arithmetic uses bounded machine-number operations.
+# Only Array and integer Range/RangeInclusive have manually registered iterators; no iterator factory functions.
 # The mIV helpers perform only bounded input traversal and native equality.
 # Array membership copies each visited element once, never the needle per element.
 # Function-pointer constructors, currying, indirect calls and anonymous functions are disabled.
@@ -208,30 +208,10 @@ abs(x: i16) -> Result<i16, Box<EvalAltResult>>
 abs(x: i32) -> Result<i32, Box<EvalAltResult>>
 abs(x: i64) -> Result<i64, Box<EvalAltResult>>
 abs(x: i8) -> Result<i8, Box<EvalAltResult>>
-bits(value: i64) -> Result<BitRange, Box<EvalAltResult>>
-bits(value: i64, from: i64) -> Result<BitRange, Box<EvalAltResult>>
-bits(value: i64, from: i64, len: i64) -> Result<BitRange, Box<EvalAltResult>>
-bits(value: i64, range: range) -> Result<BitRange, Box<EvalAltResult>>
-bits(value: i64, range: range=) -> Result<BitRange, Box<EvalAltResult>>
-chars(string: string) -> CharsStream
-chars(string: string, range: range) -> CharsStream
-chars(string: string, range: range=) -> CharsStream
-chars(string: string, start: i64) -> CharsStream
-chars(string: string, start: i64, len: i64) -> CharsStream
 contains(array: &mut array, value: Dynamic) -> Result<bool, Box<EvalAltResult>>
 contains(map: &mut map, property: string) -> bool
-contains(range: &mut range, value: i64) -> bool
-contains(range: &mut range=, value: i64) -> bool
 contains(string: string, substring: string) -> bool
-end(range: &mut range) -> i64
-end(range: &mut range=) -> i64
 ends_with(string: string, suffix: string) -> bool
-get$bits(value: i64) -> Result<BitRange, Box<EvalAltResult>>
-get$chars(string: string) -> CharsStream
-get$end(range: &mut range) -> i64
-get$end(range: &mut range=) -> i64
-get$is_empty(range: &mut range) -> bool
-get$is_empty(range: &mut range=) -> bool
 get$is_even(x: i128) -> bool
 get$is_even(x: i16) -> bool
 get$is_even(x: i32) -> bool
@@ -242,10 +222,6 @@ get$is_even(x: u16) -> bool
 get$is_even(x: u32) -> bool
 get$is_even(x: u64) -> bool
 get$is_even(x: u8) -> bool
-get$is_exclusive(range: &mut range) -> bool
-get$is_exclusive(range: &mut range=) -> bool
-get$is_inclusive(range: &mut range) -> bool
-get$is_inclusive(range: &mut range=) -> bool
 get$is_odd(x: i128) -> bool
 get$is_odd(x: i16) -> bool
 get$is_odd(x: i32) -> bool
@@ -268,10 +244,6 @@ get$is_zero(x: u16) -> bool
 get$is_zero(x: u32) -> bool
 get$is_zero(x: u64) -> bool
 get$is_zero(x: u8) -> bool
-get$start(range: &mut range) -> i64
-get$start(range: &mut range=) -> i64
-is_empty(range: &mut range) -> bool
-is_empty(range: &mut range=) -> bool
 is_even(x: i128) -> bool
 is_even(x: i16) -> bool
 is_even(x: i32) -> bool
@@ -282,10 +254,6 @@ is_even(x: u16) -> bool
 is_even(x: u32) -> bool
 is_even(x: u64) -> bool
 is_even(x: u8) -> bool
-is_exclusive(range: &mut range) -> bool
-is_exclusive(range: &mut range=) -> bool
-is_inclusive(range: &mut range) -> bool
-is_inclusive(range: &mut range=) -> bool
 is_odd(x: i128) -> bool
 is_odd(x: i16) -> bool
 is_odd(x: i32) -> bool
@@ -346,38 +314,6 @@ min(x: u16, y: u16) -> u16
 min(x: u32, y: u32) -> u32
 min(x: u64, y: u64) -> u64
 min(x: u8, y: u8) -> u8
-range(from: f64, to: f64, step: f64) -> Result<StepRange<FLOAT>, Box<EvalAltResult>>
-range(from: i128, to: i128) -> Range<i128>
-range(from: i128, to: i128, step: i128) -> Result<StepRange<i128>, Box<EvalAltResult>>
-range(from: i16, to: i16) -> Range<i16>
-range(from: i16, to: i16, step: i16) -> Result<StepRange<i16>, Box<EvalAltResult>>
-range(from: i32, to: i32) -> Range<i32>
-range(from: i32, to: i32, step: i32) -> Result<StepRange<i32>, Box<EvalAltResult>>
-range(from: i64, to: i64) -> Range<i64>
-range(from: i64, to: i64, step: i64) -> Result<StepRange<i64>, Box<EvalAltResult>>
-range(from: i8, to: i8) -> Range<i8>
-range(from: i8, to: i8, step: i8) -> Result<StepRange<i8>, Box<EvalAltResult>>
-range(from: u128, to: u128) -> Range<u128>
-range(from: u128, to: u128, step: u128) -> Result<StepRange<u128>, Box<EvalAltResult>>
-range(from: u16, to: u16) -> Range<u16>
-range(from: u16, to: u16, step: u16) -> Result<StepRange<u16>, Box<EvalAltResult>>
-range(from: u32, to: u32) -> Range<u32>
-range(from: u32, to: u32, step: u32) -> Result<StepRange<u32>, Box<EvalAltResult>>
-range(from: u64, to: u64) -> Range<u64>
-range(from: u64, to: u64, step: u64) -> Result<StepRange<u64>, Box<EvalAltResult>>
-range(from: u8, to: u8) -> Range<u8>
-range(from: u8, to: u8, step: u8) -> Result<StepRange<u8>, Box<EvalAltResult>>
-range(range: std::ops::Range<FLOAT>, step: f64) -> Result<StepRange<FLOAT>, Box<EvalAltResult>>
-range(range: std::ops::Range<i128>, step: i128) -> Result<StepRange<i128>, Box<EvalAltResult>>
-range(range: std::ops::Range<i16>, step: i16) -> Result<StepRange<i16>, Box<EvalAltResult>>
-range(range: std::ops::Range<i32>, step: i32) -> Result<StepRange<i32>, Box<EvalAltResult>>
-range(range: std::ops::Range<i64>, step: i64) -> Result<StepRange<i64>, Box<EvalAltResult>>
-range(range: std::ops::Range<i8>, step: i8) -> Result<StepRange<i8>, Box<EvalAltResult>>
-range(range: std::ops::Range<u128>, step: u128) -> Result<StepRange<u128>, Box<EvalAltResult>>
-range(range: std::ops::Range<u16>, step: u16) -> Result<StepRange<u16>, Box<EvalAltResult>>
-range(range: std::ops::Range<u32>, step: u32) -> Result<StepRange<u32>, Box<EvalAltResult>>
-range(range: std::ops::Range<u64>, step: u64) -> Result<StepRange<u64>, Box<EvalAltResult>>
-range(range: std::ops::Range<u8>, step: u8) -> Result<StepRange<u8>, Box<EvalAltResult>>
 sign(x: f32) -> Result<i64, Box<EvalAltResult>>
 sign(x: f64) -> Result<i64, Box<EvalAltResult>>
 sign(x: i128) -> i64
@@ -385,8 +321,6 @@ sign(x: i16) -> i64
 sign(x: i32) -> i64
 sign(x: i64) -> i64
 sign(x: i8) -> i64
-start(range: &mut range) -> i64
-start(range: &mut range=) -> i64
 starts_with(string: string, prefix: string) -> bool
 to_lower(string: string) -> String
 |(x: i128, y: i128) -> i128

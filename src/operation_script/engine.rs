@@ -1,6 +1,6 @@
 //! The operation-script sandbox. Keep the registered surface deliberately small.
 
-use rhai::packages::{ArithmeticPackage, BasicIteratorPackage, LogicPackage, Package};
+use rhai::packages::{ArithmeticPackage, LogicPackage, Package};
 use rhai::{Array, Dynamic, Engine, EvalAltResult, INT, Map, NativeCallContext};
 
 use super::{MAX_COLLECTION_SIZE, MAX_OPERATIONS, MAX_STRING_BYTES};
@@ -30,7 +30,11 @@ pub fn build_engine() -> Engine {
     let mut engine = Engine::new_raw();
     ArithmeticPackage::new().register_into_engine(&mut engine);
     LogicPackage::new().register_into_engine(&mut engine);
-    BasicIteratorPackage::new().register_into_engine(&mut engine);
+    // Register only the bounded containers needed by `for`. The iterator
+    // package also exposes opaque character streams outside data-size limits.
+    engine.register_iterator::<Array>();
+    engine.register_iterator::<std::ops::Range<INT>>();
+    engine.register_iterator::<std::ops::RangeInclusive<INT>>();
     engine.register_global_module(rhai::exported_module!(safe_functions).into());
     engine.disable_symbol("eval");
     engine.disable_symbol("import");
@@ -169,7 +173,17 @@ mod tests {
             actual, expected,
             "Audit source changes before changing the allowlist"
         );
-        for forbidden in ["sleep", "pad", "print", "debug"] {
+        for forbidden in [
+            "sleep",
+            "pad",
+            "print",
+            "debug",
+            "chars",
+            "get$chars",
+            "bits",
+            "get$bits",
+            "range",
+        ] {
             assert!(
                 actual
                     .iter()
@@ -282,6 +296,69 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_for_accepts_only_arrays_and_integer_ranges() {
+        let engine = build_engine();
+        for (source, expected) in [
+            ("let n = 0; for x in [1, 2, 3] { n += x; } n", 6),
+            ("let n = 0; for x in 1..4 { n += x; } n", 6),
+            ("let n = 0; for x in 1..=3 { n += x; } n", 6),
+            ("let n = 0; for x in [] { n += 1; } n", 0),
+            ("let n = 0; for x in 3..1 { n += 1; } n", 0),
+            ("let n = 0; for x in 3..=1 { n += 1; } n", 0),
+        ] {
+            assert_eq!(engine.eval::<INT>(source).unwrap(), expected, "{source}");
+        }
+        for source in [
+            r#"let n = 0; for x in "abc" { n += 1; } n"#,
+            r#"let n = 0; for x in "あいう" { n += 1; } n"#,
+            "let n = 0; for x in #{ a: 1 } { n += 1; } n",
+            "let n = 0; for x in 123 { n += 1; } n",
+        ] {
+            assert!(
+                matches!(
+                    *engine.eval::<INT>(source).unwrap_err(),
+                    EvalAltResult::ErrorFor(_)
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_has_no_iterator_factory_functions_or_properties() {
+        let engine = build_engine();
+        for source in [
+            r#""abc".chars()"#,
+            r#""abc".chars(1)"#,
+            r#""abc".chars(0, 2)"#,
+            r#""abc".chars(0..2)"#,
+            r#""abc".chars(0..=1)"#,
+            r#"chars("abc")"#,
+            "123.bits()",
+            "123.bits(1)",
+            "123.bits(0, 2)",
+            "123.bits(0..2)",
+            "123.bits(0..=1)",
+            "bits(123)",
+            "range(0, 2)",
+            "range(0, 2, 1)",
+            "range(0..2, 1)",
+            "range(0.0, 2.0, 1.0)",
+        ] {
+            assert!(
+                matches!(
+                    *engine.eval::<Dynamic>(source).unwrap_err(),
+                    EvalAltResult::ErrorFunctionNotFound(_, _)
+                ),
+                "{source}"
+            );
+        }
+        for source in [r#""abc".chars"#, "123.bits"] {
+            assert!(engine.eval::<Dynamic>(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn sandbox_array_membership_matches_native_equality_in_both_orders() {
         let engine = build_engine();
         for (left, right) in [
@@ -297,15 +374,29 @@ mod tests {
             ("true", "false"),
             ("1..3", "1..3"),
             ("1..=3", "1..=3"),
-            ("1..3", "1..=3"),
         ] {
             let expected = engine
-                .eval::<bool>(format!("({left}) == ({right})"))
+                .eval::<bool>(&format!("({left}) == ({right})"))
                 .unwrap();
             let actual = engine
-                .eval::<bool>(format!("({left}) in [({right})]"))
+                .eval::<bool>(&format!("({left}) in [({right})]"))
                 .unwrap();
             assert_eq!(actual, expected, "{left} in [{right}]");
+        }
+        // Rhai 1.27 has no native == overload between these unlike range
+        // types. Membership preserves the usual unlike-type missing-== false.
+        for (left, right) in [("1..3", "1..=3"), ("1..=3", "1..3")] {
+            assert!(matches!(
+                *engine
+                    .eval::<bool>(&format!("({left}) == ({right})"))
+                    .unwrap_err(),
+                EvalAltResult::ErrorFunctionNotFound(_, _)
+            ));
+            assert!(
+                !engine
+                    .eval::<bool>(&format!("({left}) in [({right})]"))
+                    .unwrap()
+            );
         }
     }
 
@@ -400,6 +491,23 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_operation_budget_stops_integer_range_iteration() {
+        let engine = build_engine();
+        for source in [
+            "for n in 0..9223372036854775807 {}",
+            "for n in 0..=9223372036854775807 {}",
+        ] {
+            assert!(
+                matches!(
+                    *engine.run(source).unwrap_err(),
+                    EvalAltResult::ErrorTooManyOperations(_)
+                ),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn sandbox_limits_call_and_expression_depth() {
         let engine = build_engine();
         let error = engine
@@ -426,17 +534,17 @@ mod tests {
         assert_eq!(engine.max_map_size(), MAX_COLLECTION_SIZE);
         assert!(
             engine
-                .run(format!("\"{}\";", "a".repeat(MAX_STRING_BYTES)))
+                .run(&format!("\"{}\";", "a".repeat(MAX_STRING_BYTES)))
                 .is_ok()
         );
         assert!(
             engine
-                .run(format!("\"{}\";", "a".repeat(MAX_STRING_BYTES + 1)))
+                .run(&format!("\"{}\";", "a".repeat(MAX_STRING_BYTES + 1)))
                 .is_err()
         );
         // Native Unicode case conversion can expand U+0130 into two codepoints.
         let expanded = format!("\"{}\".to_lower();", "İ".repeat(MAX_STRING_BYTES / 2));
-        assert!(engine.run(expanded).is_err());
+        assert!(engine.run(&expanded).is_err());
         for (count, succeeds) in [
             (MAX_COLLECTION_SIZE, true),
             (MAX_COLLECTION_SIZE + 1, false),
@@ -449,8 +557,8 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join(",")
             );
-            assert_eq!(engine.run(array).is_ok(), succeeds, "array {count}");
-            assert_eq!(engine.run(map).is_ok(), succeeds, "map {count}");
+            assert_eq!(engine.run(&array).is_ok(), succeeds, "array {count}");
+            assert_eq!(engine.run(&map).is_ok(), succeeds, "map {count}");
         }
     }
 
@@ -573,23 +681,30 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "release-only measurement of the unresolved opaque iterator size boundary"]
-    fn perf_max_chars_stream_collection_clone_to_operation_limit() {
-        // BasicIteratorPackage exposes a CharsStream whose stored characters
-        // are not included in Rhai's string/collection size accounting.
-        // Keep the package required by the design; measure this boundary for
-        // the design owner before connecting UI-side evaluation in stage 2.
+    fn sandbox_rejects_max_size_opaque_character_stream_creation() {
+        // Reject the stream before it can be stored and cloned in a collection
+        // whose accounted size omits the stream's backing character vector.
         let engine = build_engine();
         let mut scope = Scope::new();
         scope.push("text", "a".repeat(MAX_STRING_BYTES));
-        let stream = engine
-            .eval_with_scope::<Dynamic>(&mut scope, "text.chars()")
-            .unwrap();
-        scope.push("values", vec![stream; MAX_COLLECTION_SIZE]);
-        measure_to_operation_limit(
-            "opaque chars stream collection clone",
-            &mut scope,
-            "loop { let copy = values; }",
+        for source in [
+            "text.chars()",
+            "let values = []; for n in 0..1000 { values += text.chars(); } values",
+        ] {
+            assert!(
+                matches!(
+                    *engine
+                        .eval_with_scope::<Dynamic>(&mut scope, source)
+                        .unwrap_err(),
+                    EvalAltResult::ErrorFunctionNotFound(_, _)
+                ),
+                "{source}"
+            );
+        }
+        assert!(
+            engine
+                .eval_with_scope::<Dynamic>(&mut scope, "text.chars")
+                .is_err()
         );
     }
 }

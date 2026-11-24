@@ -28,6 +28,8 @@ enum Entry {
     Refresh,
     SearchSurface,
     External,
+    // Indirect navigation: the script chooses which existing action runs.
+    ScriptDispatch,
     NoLocationChange,
 }
 
@@ -50,6 +52,15 @@ enum MenuEntry {
 fn key_entry(action: KeyAction) -> Entry {
     use KeyAction::*;
     match action {
+        // Stage 1 only registers these inputs. From stage 2 a script can return
+        // a location/favorite/saved-group action as well as reader navigation,
+        // so it is neither NoLocationChange nor result-session-only navigation.
+        // Exercise the resolved operation's real handler when dispatch is wired;
+        // a slot alone does not determine an independent destination fixture.
+        ScriptSlot1 | ScriptSlot2 | ScriptSlot3 | ScriptSlot4 | ScriptSlot5
+        | ScriptSlot6 | ScriptSlot7 | ScriptSlot8 | ScriptSlot9 | ScriptSlot10
+        | ScriptSlot11 | ScriptSlot12 | ScriptSlot13 | ScriptSlot14 | ScriptSlot15
+        | ScriptSlot16 | ScriptSlot17 | ScriptSlot18 | ScriptSlot19 | ScriptSlot20 => Entry::ScriptDispatch,
         GridOpenDriveC
         | GridOpenDriveD
         | GridOpenDriveE
@@ -719,6 +730,21 @@ fn search_nav_inventory_key_and_menu_registries_have_explicit_policies() {
     }
 }
 
+#[test]
+fn script_slot_search_navigation_policy_is_indirect() {
+    let scripts: Vec<_> = KeyAction::all()
+        .iter()
+        .copied()
+        .filter(|&action| key_entry(action) == Entry::ScriptDispatch)
+        .collect();
+    assert_eq!(scripts.len(), 20);
+    for number in 1..=20 {
+        let action = KeyAction::from_ini_name(&format!("ScriptSlot{number}")).unwrap();
+        assert!(scripts.contains(&action));
+        assert!(crate::ring_shortcut::RingActionId::for_script_slot_key_action(action).is_some());
+    }
+}
+
 // Each partition still starts from the complete registry and each action creates
 // its own App. Splitting only bounds per-test work; it does not reuse mutable fixtures.
 macro_rules! independent_key_input_tests {
@@ -826,6 +852,7 @@ fn search_nav_inventory_key_input_partitions_cover_all_independent_actions_once(
             | Entry::Refresh
             | Entry::SearchSurface
             | Entry::External
+            | Entry::ScriptDispatch
             | Entry::NoLocationChange => false,
         })
         .collect();
@@ -884,6 +911,9 @@ fn key_inputs_for_search(kind: usize, entry: Entry, shard: usize, shards: usize)
             Entry::FolderDialog => folder_dialog_case(kind, None),
             Entry::PhysicalParent => physical_parent_case(kind),
             Entry::Favorite | Entry::Location => location_key_case(action, kind),
+            // A slot's destination depends on its script. Cover its dispatcher
+            // and the selected operation together once stage 2 connects it.
+            Entry::ScriptDispatch => {}
             // These operations belong to the selected result/current reading
             // session, refuse search history, refresh the same source, or do not
             // navigate internally. Turning any of them into an independent
