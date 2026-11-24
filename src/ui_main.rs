@@ -6565,6 +6565,7 @@ pub fn draw_cut_item_appearance_snapshot_fixture(ui: &mut egui::Ui) {
                 true,
                 None,
                 None,
+                None,
                 false,
                 crate::thumb_overlay_layout::ThumbnailNameStyle::default(),
                 false,
@@ -18627,6 +18628,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     .and_then(|row| row.title())
                     .map(str::to_owned);
                 let media_duration = self.thumbnail_media_duration_text(idx);
+                let page_count = self.thumbnail_page_count_text(idx);
                 let filter_match_count = if self.items_are_drive_list {
                     None
                 } else {
@@ -18663,6 +18665,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                     self.checked.contains(&idx),
                     filter_match_count,
                     media_duration.as_deref(),
+                    page_count.as_deref(),
                     self.settings.thumb_show_resume_meter,
                     crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
                     self.settings.thumb_show_type_icon,
@@ -22388,6 +22391,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     .and_then(|row| row.title())
                                     .map(str::to_owned);
                                 let media_duration = self.thumbnail_media_duration_text(idx);
+                                let page_count = self.thumbnail_page_count_text(idx);
                                 let is_checked = self.checked.contains(&idx);
                                 let filter_match = if self.items_are_drive_list {
                                     None
@@ -22427,6 +22431,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                     is_checked,
                                     filter_match_count,
                                     media_duration.as_deref(),
+                                    page_count.as_deref(),
                                     self.settings.thumb_show_resume_meter,
                                     crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
                                     self.settings.thumb_show_type_icon,
@@ -22557,6 +22562,7 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                                         self.checked.contains(&idx),
                                         filter_match_count,
                                         media_duration.as_deref(),
+                                        page_count.as_deref(),
                                         self.settings.thumb_show_resume_meter,
                                         crate::thumb_overlay_layout::ThumbnailNameStyle::from_settings(&self.settings),
                                         self.settings.thumb_show_type_icon,

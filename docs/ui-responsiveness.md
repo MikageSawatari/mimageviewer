@@ -9,6 +9,18 @@ AI 側の読取り・コンパイル・結果待ちは agent worker に留める
 既存の `open_with::shell_execute_open` を表示ありで使う。反映はスタック表示の開き直し・フォルダ再読込を使い、
 表示中のスタックのライブ再構成や専用 repaint は足さない。
 
+## 本のページ数バッジ (§1.883、段 1)
+
+サムネイルのページ数は可視 + 先読み範囲だけを既存 details-meta worker で数え、
+既存 catalog の記録を再利用する。UI は最後のメモリ値を読むだけで I/O をしない。
+判定設定の fingerprint と EPUB の一覧世代は取り直しだけに使い、その間も最後の値を表示する。
+Susie のプール差し替えでは旧 session を破棄して NotRequested に戻し、完了の証明は立てない。
+RAR と画像フォルダの走査にも job の取消を伝える。
+ZipDir の数は build / project 時に集計済みの ZipTree ノードが所有し、UI では prefix の深さだけで読む。
+ZipDir は取得需要にも worker target にも含めない。
+`details_meta/load_done`・`load_cancelled` の種類別ページ数件数と cache hit・失敗・ms、
+200 ms 以上の `page_count_slow` で費用を確認できる。実測・cargo 検証は設計担当の実施待ち。
+
 ## 一覧の動画・音声長さ順と絞り込み (§1.762)
 
 一覧は分かっている長さだけで直ちに並べ、長さの取得を待たない。後着の長さで自動では

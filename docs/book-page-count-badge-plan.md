@@ -780,3 +780,154 @@ catalog の一括読み取り (worker だけ):
   - `ZipDir` の問題は、表示できるかと取得の需要の分離、木が無いときの Unavailable で解消とされた。§4・§6 全体で、
     「古くなった」終わり方と停止 / 再開、既存の proof の保持、フィールドごとの要求、フォルダの identity、配置、
     detached / Remote、設定の互換の扱いに追加の設計上の問題は無いとされた。
+
+## 10. 実装記録 (段 1)
+
+2026-11-24。段 1 のソースと回帰テストを追加した。段 2 の `SortOrder`・一覧全体のページ数要件・
+catalog facts・proof 拡張は実装していない。catalog schema / CATALOG_VERSION は変更なし。
+差分は未コミット。コンパイル・cargo テスト・check・clippy・確認用ビルド・製品起動は利用者の指示で実施しない。
+以下は実装箇所の台帳であり、実行済みテストやレビューの結果を示すものではない。
+
+### 10.1 取得の述語・値の所有者
+
+旧 `thumbnail_media_metadata_enabled()` の 8 呼出を次のように振り分けた (`src/app.rs`)。
+
+| 呼出元 | 新しい述語 |
+| --- | --- |
+| `details_lazy_uses_visible_stages` | `thumbnail_badge_metadata_enabled` |
+| `details_visible_stage_needs_load` | 同上 |
+| `refresh_thumbnail_details_stage` の全体取得との関係を判定する箇所 | 同上 |
+| `refresh_thumbnail_details_stage` の keep set を選ぶ箇所 | 同上 |
+| `details_lazy_columns_visible` | 同上 |
+| `selection_info_only_lazy_load` | 同上 |
+| `start_details_meta_load_for_scope` の Explicit 範囲を選ぶ箇所 | 同上 |
+| `lazy_load_video_meta_for_idx` | `thumbnail_media_fields_enabled` |
+
+ページ数のフィールド要件は `thumbnail_page_count_enabled`。`allow_page_count` と `whole_listing_only` を維持し、
+AI / 長さの全体取得だけで表示集合外の本を数えない。設定変更は preferences の
+`thumbnail_badge_requirements_changed` から既存の `invalidate_details_meta_requirements` へ接続した。
+
+需要の述語は `details_item_page_count_needs_fetch` (= 表示対応かつ ZipDir 以外)。
+`lazy_load_page_count_for_idx` と `selection_info_item_requires_lazy_meta` が直接使い、
+段階取得・Planning の選別・cache 充足・target 作成はこれらから需要を導く。
+表示対応の `details_item_supports_page_count` は従来どおり ZipDir を含む。
+`DetailsMetaTarget.warm_page_count` と worker のコピー経路を削除した。
+
+`details_page_count_value` が値の単一 accessor。詳細文字列・詳細ソート値・サムネイル文字列がこれを通り、
+選択情報は従来の `details_page_count_text` 経由で読む。ZipDir は現在の `zip_nav.tree` を直接引く。
+木が無い / prefix が無い場合は Unavailable (「-」・不明・バッジなし)、非同期取得は要求しない。
+ZipTree は build と project_node の両方で部分木数を確定し、prefix 読取・total_image_count は再帰集計しない。
+
+### 10.2 identity・snapshot・取消
+
+- `DetailsLazyMeta` に fingerprint と EPUB だけの generation を追加。ページ数 patch の採用時だけ一緒に置換する。
+  `details_page_count_meta_satisfies_idx` の共通本体 (`_with_fingerprint`) で checked・fingerprint・
+  EPUB の items_generation・既存 PDF password revision を照合する。表示 accessor は取り直しの identity を照合しない。
+- 現 fingerprint は `details_visible_stage_needs_load`、選択情報の要求判定、poll の優先対象選別、Planning の 1 slice、
+  worker 起動時の優先対象選別、表示集合拡大の既存走査の各呼出で 1 回計算し、ループへ渡す。App には保存しない。
+- job config は `image_folder_page_count_options` を 1 回作り、その fingerprint / pool_revision を採用する。
+  テスト helper `archive_details_config` も同じ。`susie_loader::pool_snapshot` は同じ read lock で pool と版数を読む。
+- 版数を上げる箇所は `PoolState::replace` に集約し、`init_pool` の完成 pool 公開と `reload` の公開から呼ぶ。
+  初期 empty pool の版数は 0。pool の入れ替えと同じ write lock の中で版数を上げ、旧 pool の drop は lock の外で行う。
+  `INIT_GENERATION` は従来の初期化の supersession 用に保持する。
+- 照合点: ページ数取得入口、catalog cache hit 採用前、各種 catalog 書込前、worker の Item / Finished 発行前、
+  UI poll の開始と event 採用前、Planning の継続と worker 起動 (0 target 完了も含む)。
+  不一致は worker の `Stale` 通知または UI 側の既存 session 破棄へ進め、受信口を捨てて NotRequested に戻す。
+  Cancelled / Finished にせず、既存 proof は保ち、新しい proof は立てない。既存 poll の再開経路を使う。
+- RAR `DECISION_CACHE` のキーは元の source key + pool revision。volume resolution cache は画像認識の値を持たないので変更なし。
+- RAR の検査へ job cancel を渡し、画像フォルダも共通 scanner の各 entry の取消確認を使う。
+  本番は `image_folder_page_count_with_cancel`、旧引数形の `image_folder_page_count` は既存テスト用の wrapper だけとした。
+  取消した走査結果は catalog / checked へ残さない。
+- detached の述語・viewport・viewer context bundle の swap field は変更なし。
+
+### 10.3 描画・設定・perf・文書
+
+- `ThumbnailOverlayLayoutInput.page_count` / `BadgeKind::PageCount` / `BadgePriority::PageCount` /
+  `ThumbnailOverlayLayout.page_count` を追加。一致数の後、長さの前に同じ `place_bottom_right` で配置する。
+  下端 meter の予約と既存 badge の位置を保持し、長さと同じ style / painter で「123P」を描く。
+- accessor の呼出は ui_main の `repaint_grid_cell_after_input` と `render_grid` の 2 経路。
+  layout へ渡すのはその 2 箇所と、render_grid 内の同 frame check / cut 変更後の再 layout の計 3 箇所。
+  実描画は共通 `app/grid_paint.rs::paint_cell` の 1 箇所。fixture を含む `layout_cell_overlays` の caller 28 個を新引数へ揃えた。
+- 既定 ON / 欠落時 ON、環境設定の説明と検索 anchor、転送 policy と件数を更新。
+  マニュアル grid / settings、製品ページの機能一覧、ui-responsiveness、architecture-overview、virtual-folders を更新した。
+  CHANGELOG.md / changelog.html は変更なし。
+- `load_done` / `load_cancelled` に page_targets・page_cache_hits・page_counted (zip / zip_nested / folder / rar / pdf / epub)、
+  page_failed・page_ms を追加。200 ms 以上の `page_count_slow` に kind / ms / cache を出す。
+  nested ZIP は新規列挙時に ancestry で分類する。既存 catalog は nested の印を持たないため cache hit は zip に含め、
+  計測のための追加 I/O は行わない。
+
+### 10.4 追加テストと設計担当向け filter
+
+次は追加したテスト名 (すべて未実行)。共通 prefix は表の module に属する。
+
+| module | テスト名 |
+| --- | --- |
+| `app::tests::page_badge_883` | `page_badge_883_page_only_requests_near_books_without_media_probe` |
+| 同上 | `page_badge_883_media_and_resume_only_keep_page_fields_off` |
+| 同上 | `page_badge_883_all_badges_off_do_not_start_a_session` |
+| 同上 | `page_badge_883_selection_only_keeps_single_book_requirement` |
+| 同上 | `page_badge_883_whole_listing_ai_and_duration_do_not_expand_page_scope` |
+| 同上 | `page_badge_883_fingerprint_refetch_keeps_last_display_and_sort_values` |
+| 同上 | `page_badge_883_epub_generation_refetches_success_and_absence_only_once` |
+| 同上 | `page_badge_883_values_hide_unchecked_absent_zero_failed_and_drive_rows` |
+| 同上 | `page_badge_883_zipdir_reads_tree_and_never_starts_repeated_lazy_sessions` |
+| 同上 | `page_badge_883_stale_susie_pending_restarts_preserving_proof` |
+| 同上 | `page_badge_883_stale_worker_event_restarts_preserving_proof` |
+| 同上 | `page_badge_883_preference_toggle_cancels_old_requirements_but_keeps_values` |
+| 同上 | `page_badge_883_planning_keeps_one_recognition_snapshot_until_next_job` |
+| `thumb_overlay_layout::tests` | `page_count_883_uses_bottom_right_and_length_style_without_abbreviation` |
+| 同上 | `page_count_883_lifts_above_filter_count_and_book_resume_meter` |
+| 同上 | `page_count_883_yields_without_changing_existing_badges` |
+| `ui_dialogs::preferences::tests` | `page_count_883_preferences_toggle_invalidates_requirements_and_unchanged_ok_preserves_state` |
+| `settings::tests` | `thumb_show_page_count_defaults_on_and_preserves_disabled_setting` |
+| 同上 | `thumb_show_page_count_missing_db_key_defaults_on_and_false_roundtrips` |
+| `settings_transfer::tests` | `thumb_show_page_count_transfer_roundtrip_missing_invalid` |
+| `susie_loader::tests` | `pool_replacement_publishes_revision_with_the_pool` |
+| `rar_loader::tests` | `decision_cache_is_scoped_to_recognition_pool_revision` |
+| 同上 | `cancelled_header_inspection_does_not_cache_a_partial_decision` |
+| `zip_tree::tests` | `subtree_page_counts_follow_build_and_each_policy_projection` |
+| `app::folder_scan::page_count_tests` | `image_folder_page_count_cancellation_is_not_an_empty_book` |
+| 同上 | `page_count_scan_cancellation_discards_a_partially_enumerated_folder` |
+| `app::metadata_ops::tests` | `page_count_revision_change_during_enumeration_never_writes_catalog` |
+| 同上 | `page_count_cancelled_during_enumeration_never_writes_catalog` |
+| 同上 | `stale_page_count_worker_emits_no_item_or_finished_proof` |
+| 同上 | `precancelled_rar_and_folder_page_workers_publish_no_checked_value_or_catalog` |
+| integration `ui_snapshot` | `page_count_883_badges_dark` (定義のみ、PNG は設計担当が作成) |
+
+既存の nested ZIP 取得テストに fresh / cache hit trace の確認を追加した。
+旧 `child_archive_page_count_uses_warm_zip_tree_total` は
+`child_archive_page_count_reads_zip_tree_total_without_worker_target` へ更新。
+duration_762 の visible stage 5 件は名前と worker 完了 / proof の検査意図を保ち、
+fixture を ZipDir から一時 ZIP に置き換えた。手動 Pending の pool revision、checked 値の fingerprint、
+既存の全 OFF / 長さ専用 / meter 専用 / facet fixture の明示 OFF を更新した。
+
+設計担当が実行する回帰 filter (この実装作業では実行しない):
+
+```powershell
+cargo nextest run -p mimageviewer --lib -E 'test(/page_badge_883|page_count|pool_replacement_publishes_revision|decision_cache_is_scoped|subtree_page_counts|settings_transfer::tests|duration_762|media_duration_thumbnail|media_resume_meter|facet_835|details_lazy_session|details_cell_content_revisions|thumbnail_selection_info_keeps_single_target_fast_path/)'
+```
+
+統合テストは `ui_snapshot` の `page_count_883_badges_dark`。PNG 生成・目視・通常比較は設計担当が実施する。
+実機の混在一覧・初回 / cache hit・一致数 / meter 併設・OFF・EPUB 変換後の帰路・scroll 取消と perf は未確認。
+
+### 10.5 設計との差と静的確認
+
+機能仕様・所有境界の変更はない。名前の補助 (`_with_fingerprint` / `_with_cancel`) と nested ZIP cache hit の
+計装上の分類は上記のとおり。新しい I/O / worker / 永続 schema / viewer swap field は追加していない。
+グリフ検査は危険字形 0、製品ページのカード検査は 53 件・上限超過 0。
+ワークスペース全体の `cargo fmt` (引数なし) と最終 `git diff --check` は exit 0。
+コンパイル可能性・テストの成否は未確認。
+
+変更ファイル (fixture の引数追加を含む):
+
+- App / worker: `src/app.rs`、`src/app/metadata_ops.rs`、`src/app/folder_scan.rs`、
+  `src/susie_loader.rs`、`src/rar_loader.rs`、`src/zip_tree.rs`。
+- 設定 / UI: `src/settings.rs`、`src/settings_transfer.rs`、`src/ui_dialogs/preferences.rs`、
+  `src/ui_dialogs/preferences/pages.rs`、`src/ui_dialogs/preferences/search_index.rs`、
+  `src/thumb_overlay_layout.rs`、`src/app/grid_paint.rs`、`src/ui_main.rs`。
+- 回帰 / fixture: `src/app/tests.rs`、`src/app/tests/page_badge_883.rs`、`src/app/tests/duration_762.rs`、
+  `src/app/tests/duration_762/visible_stages.rs`、`src/app/tests/facet_835.rs`、`src/app/media_resume_meter_tests.rs`、
+  `src/app/container_type_icon_fixture.rs`、`src/app/folder_background_fixture.rs`、`src/app/grid_type_icon_tests.rs`、
+  `tests/ui_snapshot.rs`。
+- 文書: 本書、`docs/ui-responsiveness.md`、`docs/architecture-overview.md`、`docs/virtual-folders.md`、
+  `htdocs/mimageviewer/manual/grid.html`、`htdocs/mimageviewer/manual/settings.html`、`htdocs/mimageviewer/index.html`。

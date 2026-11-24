@@ -402,8 +402,9 @@ DB キー、catalog の保存先 hash、元書庫と cache ZIP の identity、ZI
 
 通常フォルダの詳細表示 / 選択情報に出す `ページ数` は、ZIP / PDF に加えて画像のみフォルダ、
 親 ZIP 内の子 ZIP・RAR (`ZipDir`)、直接閲覧 RAR/CBR (`ConvertibleArchive`) を対象にする。
-`ZipDir` は外側 ZIP を開いたときの列挙済み `ZipTree` 部分木から画像数を数え、UI スレッドで
-書庫を開き直さない。RAR/CBR は details meta worker 上の header scan で取得し、元ファイルの
+`ZipDir` の数の所有者は外側 ZIP の `ZipTree` だけで、build / project 時に各ノードへ集計した
+部分木の画像数を詳細列・選択情報・サムネイルバッジが直接読み、details-meta には保存しない。
+木が無い場合は取得待ちにせず不明とし、UI スレッドで書庫を開き直さない。RAR/CBR は details meta worker 上の header scan で取得し、元ファイルの
 mtime / size と画像認識 fingerprint を identity に catalog cache へ保存する。画像のみフォルダも
 自動表示設定の ON/OFF とは独立して同じ worker / catalog 経路で判定する。
 

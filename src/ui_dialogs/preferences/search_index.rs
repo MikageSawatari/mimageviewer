@@ -421,6 +421,12 @@ pub(super) const PREF_SEARCH_INDEX: &[PrefSearchEntry] = &[
         ["音声", "音楽", "マーク", "左下バッジ", "非表示"]
     ),
     entry!(
+        "thumbnail/page-count",
+        Thumbnail,
+        "本のページ数をサムネイルに表示する",
+        ["本", "ページ数", "バッジ", "ZIP", "PDF", "画像フォルダ"]
+    ),
+    entry!(
         "thumbnail/resume-meter",
         Thumbnail,
         "本・動画・音声のサムネイルに前回の位置を表示",
@@ -2468,6 +2474,18 @@ mod tests {
             assert_eq!(result.page, PreferencesPage::ClipboardCapture);
         }
     }
+    #[test]
+    fn page_count_883_thumbnail_badge_setting_is_searchable() {
+        for query in ["本 ページ数", "サムネイル ページ数", "画像フォルダ バッジ"]
+        {
+            let result = search_preferences(query, test_tree_position)
+                .into_iter()
+                .find(|entry| entry.anchor == "thumbnail/page-count")
+                .expect("page count badge setting must be discoverable");
+            assert_eq!(result.page, PreferencesPage::Thumbnail);
+        }
+    }
+
     #[test]
     fn audio_thumbnail_indicator_and_common_sidecar_settings_are_searchable() {
         for (query, anchor, page) in [

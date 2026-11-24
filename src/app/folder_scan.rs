@@ -1016,6 +1016,7 @@ pub(crate) struct ImageFolderPageCountOptions {
     pub(crate) skip_duplicate_images: bool,
     pub(crate) image_ext_priority: Vec<String>,
     pub(crate) fingerprint: i64,
+    pub(crate) pool_revision: u64,
 }
 
 pub(crate) fn image_folder_page_count_options(
@@ -1024,6 +1025,7 @@ pub(crate) fn image_folder_page_count_options(
     // Page-count metadata is independent of auto-opening image-only folders.
     // Even when auto-open is disabled, image-only child folders should expose
     // the same background-loaded page count as ZIP and PDF containers.
+    let (pool, pool_revision) = crate::susie_loader::pool_snapshot();
     ImageFolderPageCountOptions {
         file_type_visibility: settings.file_type_visibility.clone(),
         include_convertible_archives: !settings.archive_file_handling_ignores_convertible(),
@@ -1031,7 +1033,12 @@ pub(crate) fn image_folder_page_count_options(
         show_hidden_files: settings.show_hidden_files,
         skip_duplicate_images: settings.skip_duplicate_images,
         image_ext_priority: settings.image_ext_priority.clone(),
-        fingerprint: image_page_recognition_fingerprint(settings),
+        fingerprint: image_page_recognition_fingerprint_with_pool(
+            settings,
+            crate::folder_tree::SUPPORTED_EXTENSIONS,
+            pool.as_deref(),
+        ),
+        pool_revision,
     }
 }
 
@@ -1048,6 +1055,15 @@ pub(crate) fn image_page_recognition_fingerprint(settings: &crate::settings::Set
 fn image_page_recognition_fingerprint_with_native_extensions(
     settings: &crate::settings::Settings,
     native_extensions: &[&str],
+) -> i64 {
+    let (pool, _) = crate::susie_loader::pool_snapshot();
+    image_page_recognition_fingerprint_with_pool(settings, native_extensions, pool.as_deref())
+}
+
+fn image_page_recognition_fingerprint_with_pool(
+    settings: &crate::settings::Settings,
+    native_extensions: &[&str],
+    pool: Option<&crate::susie_loader::SusieWorkerPool>,
 ) -> i64 {
     // 永続 cache 用の決定的 FNV-1a。拡張子以外の判定規則を変えたときは version bytes を上げる。
     let mut hash = 0xcbf29ce484222325u64;
@@ -1082,7 +1098,7 @@ fn image_page_recognition_fingerprint_with_native_extensions(
         mix(extension.as_bytes());
         mix(&[0]);
     }
-    if let Some(pool) = crate::susie_loader::try_get_pool() {
+    if let Some(pool) = pool {
         for extension in pool.extensions() {
             mix(extension.as_bytes());
             mix(&[0]);
@@ -1093,10 +1109,25 @@ fn image_page_recognition_fingerprint_with_native_extensions(
 
 /// 通常フォルダを実際の一覧走査と同じ規則で分類し、本扱いなら表示ページ数を返す。
 /// `Ok(None)` は走査成功だが画像だけの本ではない、`Err` は走査自体の失敗。
+#[cfg(test)]
 pub(crate) fn image_folder_page_count(
     path: &std::path::Path,
     options: &ImageFolderPageCountOptions,
 ) -> std::io::Result<Option<u32>> {
+    image_folder_page_count_with_cancel(path, options, None)
+}
+
+pub(crate) fn image_folder_page_count_with_cancel(
+    path: &std::path::Path,
+    options: &ImageFolderPageCountOptions,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> std::io::Result<Option<u32>> {
+    if cancel.is_some_and(|token| token.load(std::sync::atomic::Ordering::Relaxed)) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "page count cancelled",
+        ));
+    }
     // ページ数取得では走査失敗を空フォルダとして cache できないため Result を維持する。
     // 取得済み ReadDir をそのまま共通分類へ渡し、同じディレクトリを二度開かない。
     let entries = std::fs::read_dir(path)?;
@@ -1106,7 +1137,7 @@ pub(crate) fn image_folder_page_count(
         options.include_epub,
         options.show_hidden_files,
         &options.file_type_visibility,
-        None,
+        cancel,
     )?;
     project_scanned_directory(&mut scan, &options.file_type_visibility);
     if !is_image_only_book_contents(!scan.folders.is_empty(), &scan.all_media) {
@@ -2500,7 +2531,45 @@ mod page_count_tests {
             skip_duplicate_images,
             image_ext_priority: vec!["png".to_owned(), "jpg".to_owned()],
             fingerprint: 1,
+            pool_revision: crate::susie_loader::pool_revision(),
         }
+    }
+
+    #[test]
+    fn image_folder_page_count_cancellation_is_not_an_empty_book() {
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("page.jpg"), b"image").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let error =
+            image_folder_page_count_with_cancel(temp.path(), &options(false), Some(&cancel))
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn page_count_scan_cancellation_discards_a_partially_enumerated_folder() {
+        let temp = tempfile::TempDir::new().unwrap();
+        for name in ["one.jpg", "two.jpg"] {
+            std::fs::write(temp.path().join(name), b"image").unwrap();
+        }
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let yielded = std::cell::Cell::new(0usize);
+        let entries = std::fs::read_dir(temp.path()).unwrap().inspect(|_| {
+            yielded.set(yielded.get() + 1);
+            if yielded.get() == 2 {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let result = scan_directory_entries(
+            entries,
+            true,
+            true,
+            true,
+            &Default::default(),
+            Some(&cancel),
+        );
+        assert_eq!(yielded.get(), 2);
+        assert!(matches!(result, Err(error) if error.kind() == std::io::ErrorKind::Interrupted));
     }
 
     #[test]

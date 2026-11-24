@@ -5419,6 +5419,9 @@ pub struct Settings {
     /// サムネイル右下に動画・音声の長さを表示する。
     #[serde(default = "default_true")]
     pub thumb_show_media_duration: bool,
+    /// サムネイル右下に本のページ数を表示する。
+    #[serde(default = "default_true")]
+    pub thumb_show_page_count: bool,
     /// 本・動画・音声のサムネイル下端に、記録済みの読書・再生位置を表示する。
     #[serde(default = "default_true")]
     pub thumb_show_resume_meter: bool,
@@ -8467,6 +8470,7 @@ impl Default for Settings {
             thumb_cover_auto_crop_folders: false,
             selection_info_display_mode: SelectionInfoDisplayMode::Tooltip,
             thumb_show_media_duration: true,
+            thumb_show_page_count: true,
             thumb_show_resume_meter: true,
             thumb_tooltip_show_filename: true,
             thumb_tooltip_show_image_dimensions: true,
@@ -12389,6 +12393,41 @@ mod tests {
                 .unwrap()
                 .thumb_show_media_duration
         );
+    }
+
+    #[test]
+    fn thumb_show_page_count_defaults_on_and_preserves_disabled_setting() {
+        assert!(Settings::default().thumb_show_page_count);
+        let old: Settings = serde_json::from_str("{}").unwrap();
+        assert!(old.thumb_show_page_count);
+        let disabled: Settings =
+            serde_json::from_str(r#"{"thumb_show_page_count":false}"#).unwrap();
+        let restored: Settings =
+            serde_json::from_str(&serde_json::to_string(&disabled).unwrap()).unwrap();
+        assert!(!restored.thumb_show_page_count);
+    }
+
+    #[test]
+    fn thumb_show_page_count_missing_db_key_defaults_on_and_false_roundtrips() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = crate::settings_db::SettingsDb::create_new(temp.path()).unwrap();
+        db.save_full(&Settings::default()).unwrap();
+        drop(db);
+        let conn = rusqlite::Connection::open(temp.path().join("settings.db")).unwrap();
+        conn.execute(
+            "DELETE FROM settings_kv WHERE key = 'thumb_show_page_count'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        let mut loaded = db.load_into_settings().unwrap();
+        assert!(loaded.thumb_show_page_count);
+        loaded.thumb_show_page_count = false;
+        db.save_full(&loaded).unwrap();
+        drop(db);
+        let reopened = crate::settings_db::SettingsDb::open(temp.path()).unwrap();
+        assert!(!reopened.load_into_settings().unwrap().thumb_show_page_count);
     }
 
     use super::*;

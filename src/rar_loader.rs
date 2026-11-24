@@ -109,7 +109,13 @@ struct RarVolumeResolution {
     volume_kind: RarVolumeKind,
 }
 
-static DECISION_CACHE: LazyLock<Mutex<Vec<(DecisionCacheKey, RarInspection)>>> =
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InspectionCacheKey {
+    source: DecisionCacheKey,
+    pool_revision: u64,
+}
+
+static DECISION_CACHE: LazyLock<Mutex<Vec<(InspectionCacheKey, RarInspection)>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 static VOLUME_RESOLUTION_CACHE: LazyLock<Mutex<Vec<(DecisionCacheKey, RarVolumeResolution)>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
@@ -333,7 +339,7 @@ pub fn is_subsequent_volume(path: &Path) -> io::Result<bool> {
     resolved_volume_path(path).map(|(_, kind)| kind == RarVolumeKind::Subsequent)
 }
 
-/// Inspect a RAR once per `(path, mtime, size)` identity.
+/// Inspect a RAR once per `(path, mtime, size, recognition pool revision)` identity.
 pub fn inspect_for_direct_read(path: &Path) -> io::Result<RarInspection> {
     let cancel = AtomicBool::new(false);
     inspect_for_direct_read_cancelable(path, &cancel)
@@ -434,11 +440,31 @@ fn inspect_for_direct_read_run(
     path: &Path,
     cancel: &AtomicBool,
 ) -> (io::Result<RarInspection>, InspectionCacheOutcome, u64) {
+    inspect_for_direct_read_run_with_revision(path, cancel, crate::susie_loader::pool_revision())
+}
+
+fn inspect_for_direct_read_run_with_revision(
+    path: &Path,
+    cancel: &AtomicBool,
+    pool_revision: u64,
+) -> (io::Result<RarInspection>, InspectionCacheOutcome, u64) {
+    inspect_for_direct_read_run_observed(path, cancel, pool_revision, |_| {})
+}
+
+fn inspect_for_direct_read_run_observed(
+    path: &Path,
+    cancel: &AtomicBool,
+    pool_revision: u64,
+    mut entry_observed: impl FnMut(u64),
+) -> (io::Result<RarInspection>, InspectionCacheOutcome, u64) {
     let mut cache_outcome = InspectionCacheOutcome::Unknown;
     let mut scanned_entries = 0u64;
     let result = (|| {
         check_inspection_cancel(cancel)?;
-        let key = cache_key(path)?;
+        let key = InspectionCacheKey {
+            source: cache_key(path)?,
+            pool_revision,
+        };
         if let Ok(cache) = DECISION_CACHE.lock()
             && let Some((_, inspection)) = cache.iter().find(|(cached, _)| cached == &key)
         {
@@ -449,7 +475,7 @@ fn inspect_for_direct_read_run(
         cache_outcome = InspectionCacheOutcome::Miss;
         check_inspection_cancel(cancel)?;
         let (mut archive, volume_kind, resolved_path) =
-            open_listing_from_volume_with_key(path, Some(&key))?;
+            open_listing_from_volume_with_key(path, Some(&key.source))?;
         let is_solid = archive.is_solid();
         let mut has_encrypted = archive.has_encrypted_headers();
         let mut image_count = 0u32;
@@ -462,6 +488,7 @@ fn inspect_for_direct_read_run(
             };
             let entry = entry.map_err(unrar_io)?;
             scanned_entries = scanned_entries.saturating_add(1);
+            entry_observed(scanned_entries);
             // Encryption is an archive eligibility property, including entries hidden from the UI.
             has_encrypted |= entry.is_encrypted();
             if !entry.is_file() {
@@ -491,7 +518,7 @@ fn inspect_for_direct_read_run(
             resolved_path,
         };
         if let Ok(mut cache) = DECISION_CACHE.lock() {
-            cache.retain(|(cached, _)| cached.path != key.path);
+            cache.retain(|(cached, _)| cached.source.path != key.source.path);
             if cache.len() >= DECISION_CACHE_CAPACITY {
                 cache.remove(0);
             }
@@ -828,6 +855,64 @@ pub(crate) fn read_cover_auto_page_samples(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_header_inspection_does_not_cache_a_partial_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cancelled-inspection.rar");
+        std::fs::write(&path, direct_read_test_fixture_bytes()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let (result, outcome, scanned) =
+            inspect_for_direct_read_run_observed(&path, &cancel, 101, |entries| {
+                assert_eq!(entries, 1);
+                cancel.store(true, Ordering::Relaxed);
+            });
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::Interrupted));
+        assert_eq!(outcome, InspectionCacheOutcome::Miss);
+        assert_eq!(
+            scanned, 1,
+            "the second native header must not be read after cancellation"
+        );
+        assert!(
+            DECISION_CACHE
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(key, _)| key.source.path != path)
+        );
+
+        let (result, outcome, scanned) =
+            inspect_for_direct_read_run_with_revision(&path, &AtomicBool::new(false), 101);
+        assert_eq!(outcome, InspectionCacheOutcome::Miss);
+        assert_eq!(scanned, 2);
+        assert_eq!(result.unwrap().summary.image_count, 2);
+    }
+
+    #[test]
+    fn decision_cache_is_scoped_to_recognition_pool_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("revision.rar");
+        std::fs::write(&path, direct_read_test_fixture_bytes()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let (first, outcome, scanned) =
+            inspect_for_direct_read_run_with_revision(&path, &cancel, 11);
+        assert!(first.is_ok());
+        assert_eq!(outcome, InspectionCacheOutcome::Miss);
+        assert!(scanned > 0);
+        let (second, outcome, scanned) =
+            inspect_for_direct_read_run_with_revision(&path, &cancel, 11);
+        assert!(second.is_ok());
+        assert_eq!(outcome, InspectionCacheOutcome::Hit);
+        assert_eq!(scanned, 0);
+        let (third, outcome, scanned) =
+            inspect_for_direct_read_run_with_revision(&path, &cancel, 12);
+        assert_eq!(
+            third.unwrap().summary.image_count,
+            first.unwrap().summary.image_count
+        );
+        assert_eq!(outcome, InspectionCacheOutcome::Miss);
+        assert!(scanned > 0);
+    }
 
     #[test]
     fn unrar_read_errors_preserve_data_versus_io_at_the_boundary() {

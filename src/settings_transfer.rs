@@ -395,6 +395,7 @@ preferences_policy! {
         video_thumbnail_indicator: VideoThumbnailIndicator => ("動画サムネイルの表示", |v, _raw| !matches!(v, VideoThumbnailIndicator::Unknown), plain, plain);
         audio_thumbnail_indicator: AudioThumbnailIndicator => ("音声サムネイルの表示", |v, _raw| !matches!(v, AudioThumbnailIndicator::Unknown), plain, plain);
         thumb_show_media_duration: bool => ("サムネイルの再生時間表示", |_, _| true, plain, plain);
+        thumb_show_page_count: bool => ("サムネイルのページ数表示", |_, _| true, plain, plain);
         thumb_show_resume_meter: bool => ("サムネイルの読書・再生位置表示", |_, _| true, plain, plain);
         thumb_name_font_scale_percent: u32 => ("サムネイル一覧の名前の文字サイズ", |v, _raw| (THUMB_NAME_FONT_SCALE_PERCENT_MIN..=THUMB_NAME_FONT_SCALE_PERCENT_MAX).contains(v), plain, plain);
         thumb_name_max_lines: u32 => ("サムネイル一覧の名前の最大行数", |v, _raw| (THUMB_NAME_MAX_LINES_MIN..=THUMB_NAME_MAX_LINES_MAX).contains(v), plain, plain);
@@ -1257,6 +1258,7 @@ mod tests {
             ],
         );
         settings.thumb_show_media_duration = !settings.thumb_show_media_duration;
+        settings.thumb_show_page_count = !settings.thumb_show_page_count;
         settings.thumb_show_resume_meter = !settings.thumb_show_resume_meter;
         settings.thumb_name_prioritize_width = !settings.thumb_name_prioritize_width;
         settings.thumb_name_font_scale_percent = if settings.thumb_name_font_scale_percent == 200 {
@@ -2394,6 +2396,36 @@ mod tests {
     }
 
     #[test]
+    fn thumb_show_page_count_transfer_roundtrip_missing_invalid() {
+        for enabled in [false, true] {
+            let source = Settings {
+                thumb_show_page_count: enabled,
+                ..Settings::default()
+            };
+            let mut destination = Settings {
+                thumb_show_page_count: !enabled,
+                ..Settings::default()
+            };
+            let exported = export_preferences(&source).unwrap();
+            parse_preferences(&exported.json)
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.thumb_show_page_count, enabled);
+            parse_preferences(&document(json!({})))
+                .unwrap()
+                .apply_to(&mut destination);
+            assert_eq!(destination.thumb_show_page_count, enabled);
+            for invalid in [json!("true"), json!(1), Value::Null] {
+                let report = parse_preferences(&document(json!({"thumb_show_page_count":invalid})))
+                    .unwrap()
+                    .apply_to(&mut destination);
+                assert_eq!(report.issues.len(), 1);
+                assert_eq!(destination.thumb_show_page_count, enabled);
+            }
+        }
+    }
+
+    #[test]
     fn page_start_position_transfer_roundtrip_missing_and_invalid_preserve_value() {
         for &position in FullscreenPageStartPosition::all() {
             let source = Settings {
@@ -2642,13 +2674,13 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 518);
+        assert_eq!(entries.len(), 519);
         assert_eq!(
             entries
                 .iter()
                 .filter(|(_, reason)| reason.is_none())
                 .count(),
-            173
+            174
         );
         assert_eq!(
             entries
@@ -2697,7 +2729,7 @@ mod tests {
                 "AI permissions must not become writable: {key}"
             );
         }
-        assert_eq!(wire.len(), 171);
+        assert_eq!(wire.len(), 172);
         assert_eq!(wire.iter().collect::<HashSet<_>>().len(), wire.len());
         let exported = export_preferences(&Settings::default()).unwrap();
         assert!(exported.issues.is_empty(), "{:?}", exported.issues);

@@ -2,28 +2,26 @@ use super::*;
 
 fn ready_duration_with_unread_visible_page_count() -> (phase_c_support::AppTestEnv, usize) {
     let mut app = fixture();
-    let zip_path = app.tmp.path().join("memory-only.zip");
-    let entries = ["book.zip/001.jpg", "book.zip/002.jpg", "book.zip/003.jpg"]
-        .into_iter()
-        .map(|entry_name| crate::zip_loader::ZipImageEntry {
-            entry_name: entry_name.to_owned(),
-            uncompressed_size: 100,
-            mtime: 100,
-            container_ancestry: Vec::new(),
-        })
-        .collect();
-    let tree = Arc::new(crate::zip_tree::ZipTree::build(zip_path, entries));
-    // Render the requested root, before ZipNavState collapses its single wrapper.
-    let (warm_items, warm_metas) = tree.materialize_level(&[], SortOrder::FileName);
-    let nav = crate::zip_tree::ZipNavState::new(tree);
-    assert_eq!(warm_items.len(), 1);
+    // A real ZIP keeps this a worker/Finished regression. ZipDir values are now
+    // read directly from their tree and intentionally never start a session.
+    use std::io::Write;
+    let zip_path = app.tmp.path().join("visible-page-count.zip");
+    let mut zip = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    for name in ["001.jpg", "002.jpg", "003.jpg"] {
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"page-count only; decoding is unnecessary")
+            .unwrap();
+    }
+    zip.finish().unwrap();
+    let stamp = crate::catalog::media_source_identity(&zip_path).unwrap();
+    assert!(crate::catalog::default_cache_dir().starts_with(app.tmp.path()));
     let page_idx = app.items.len();
     let mut items = app.items.clone();
-    items.extend(warm_items);
+    items.push(GridItem::ZipFile(zip_path));
     let mut metas = app.image_metas.clone();
-    metas.extend(warm_metas);
+    metas.push(Some(stamp));
     app.install_new_items(items, metas);
-    app.zip_nav = Some(nav);
     app.settings.grid_view_mode = GridViewMode::Details;
     app.settings.details_show_page_count = true;
     app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
@@ -44,7 +42,6 @@ fn ready_duration_with_unread_visible_page_count() -> (phase_c_support::AppTestE
     let target = app
         .details_meta_target_for_idx(page_idx, &HashSet::from([page_idx]), true)
         .expect("newly visible page count must still need acquisition");
-    assert_eq!(target.warm_page_count, Some(3));
     assert!(target.load_page_count);
     assert!(!target.load_video_meta && !target.load_image_dims);
     assert!(!target.load_created_at && !target.load_ai_metadata);
@@ -52,19 +49,19 @@ fn ready_duration_with_unread_visible_page_count() -> (phase_c_support::AppTestE
     (app, page_idx)
 }
 
-fn finish_warm_visible_stage(
+fn finish_visible_page_count_stage(
     app: &mut App,
     ctx: &egui::Context,
     proof: Option<ListingMetaScanProof>,
 ) {
-    // The worker only copies the in-memory ZipTree count. No ZIP, PDF or media probe runs.
+    // The existing details worker counts this isolated ZIP and publishes Finished.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while app.details_meta_pending.is_some() {
         app.poll_details_meta_load(ctx);
         assert_eq!(app.listing_meta_scan_proof, proof);
         assert!(
             std::time::Instant::now() < deadline,
-            "warm visible stage did not finish"
+            "visible page-count stage did not finish"
         );
         std::thread::yield_now();
     }
@@ -100,7 +97,7 @@ fn duration_762_proven_lengths_allow_post_grid_visible_stage_and_keep_proof_thro
         DetailsMetaPendingPhase::Loading { .. }
     ));
     assert_eq!(app.listing_meta_scan_proof, proof);
-    finish_warm_visible_stage(&mut app, &ctx, proof);
+    finish_visible_page_count_stage(&mut app, &ctx, proof);
     assert_eq!(
         app.details_lazy_meta_for_idx(page_idx).unwrap().page_count,
         Some(3)
@@ -121,8 +118,8 @@ fn duration_762_proven_lengths_allow_poll_ready_visible_stage() {
         assert_eq!(pending.scan_scope, DetailsMetaScanScope::VisibleStage);
         assert!(pending.listing_meta_scan.is_none());
     }
-    // A fast warm worker may already have published Finished in the starting poll.
-    finish_warm_visible_stage(&mut app, &ctx, proof);
+    // A fast ZIP worker may already have published Finished in the starting poll.
+    finish_visible_page_count_stage(&mut app, &ctx, proof);
     assert_eq!(
         app.details_lazy_meta_for_idx(page_idx).unwrap().page_count,
         Some(3)
