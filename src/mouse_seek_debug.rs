@@ -172,7 +172,9 @@ fn app_command_delivery_label(delivery: NativeAppCommandDelivery) -> &'static st
         // ISMEX_SEND / NOTIFY / CALLBACK / REPLIED report a cross-thread send.
         "sent_cross_thread"
     } else if delivery.in_send_flags == 0 && delivery.outer.is_some() {
-        "sent_same_thread_during"
+        // Either a same-thread synchronous call or a queued message dispatched
+        // by an untracked USER32 modal loop can arrive inside an outer wndproc.
+        "nested_untracked_during"
     } else {
         "unknown"
     }
@@ -768,15 +770,20 @@ mod tests {
     }
 
     #[test]
-    fn app_command_delivery_classifies_queue_cross_thread_and_nested_receipts() {
+    fn app_command_delivery_classifies_known_routes_without_claiming_a_nested_send() {
         let outer = Some(NativeWindowMessage {
             hwnd: 0x1111,
             message: 0x0101,
         });
+        let modal_outer = Some(NativeWindowMessage {
+            hwnd: 0x1111,
+            message: 0x0112, // WM_SYSCOMMAND can enter USER32's move/size modal loop.
+        });
         for (in_send_flags, dispatching, outer, expected) in [
             (0, true, None, "queued"),
             (0, true, outer, "queued"),
-            (0, false, outer, "sent_same_thread_during"),
+            (0, false, outer, "nested_untracked_during"),
+            (0, false, modal_outer, "nested_untracked_during"),
             (1, false, None, "sent_cross_thread"),
             (2, false, outer, "sent_cross_thread"),
             (4, false, None, "sent_cross_thread"),
@@ -821,7 +828,7 @@ mod tests {
             assert_eq!(
                 format_origin(receipt.origin),
                 format!(
-                    "origin=win32_appcommand window_source={source:?} receiver_hwnd=0x2222 command_source_hwnd=0x3333 raw_command_word=0x8001 command=1 device_flags=0x8000 key_state=0x0005 in_send_flags=0x00000000 dispatching=false outer_hwnd=0x1111 outer_message=0x0101 delivery=sent_same_thread_during"
+                    "origin=win32_appcommand window_source={source:?} receiver_hwnd=0x2222 command_source_hwnd=0x3333 raw_command_word=0x8001 command=1 device_flags=0x8000 key_state=0x0005 in_send_flags=0x00000000 dispatching=false outer_hwnd=0x1111 outer_message=0x0101 delivery=nested_untracked_during"
                 )
             );
             let receipt = win32_app_command_receipt(

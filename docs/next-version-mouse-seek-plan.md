@@ -61,8 +61,9 @@ close 契約では stale event を捨てる下限である。テスト fixture �
 ### 2.1 presenter / HUD の native route
 
 AppCommand receipt は `in_send_flags`（`InSendMessageEx` の生値）、`dispatching`（追跡中の DispatchMessage と一致）、`outer_hwnd` / `outer_message`（入れ子の外側の wndproc）を記録する。
-`delivery=queued` はポンプの配送、`sent_cross_thread` は送信フラグ付きの別スレッド配送、`sent_same_thread_during` と `outer_message=0x0101` は自身の WM_KEYUP 処理中の同期再入を示す。
-一致も外側もない場合は `unknown` とする。presenter と HUD を同じ TLS scope で追跡し、入れ子のポンプと同一 HWND / message の再入を区別する。生成元は次の実ログで判定し、現時点では断定しない。
+`delivery=queued` は追跡したポンプからの配送、`sent_cross_thread` は ISMEX の送信フラグで確認した別スレッドからの送信を示す。
+`in_send_flags=0`・`dispatching=false`・外側ありは `nested_untracked_during` とする。`outer_message=0x0101` でも WM_KEYUP 中の同期呼出しか、USER32 のモーダルループが配送した posted message かは区別できない。
+一致も送信フラグも外側もない場合は `unknown` とする。presenter と HUD の TLS scope は入れ子を復元するが、追跡外の配送は断定しない。生成元は次の実ログで判断する。
 
 `src/video/native_window.rs::wnd_proc` は presenter HWND の `WM_KEYDOWN/WM_SYSKEYDOWN` を
 `NativeVideoKeyEvent` に変換し、lossless route へ送る。browser key は enqueue 後に
