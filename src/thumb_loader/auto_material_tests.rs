@@ -114,6 +114,7 @@ fn auto_material_candidate(
         cache_dir: cache,
         policy: &policy,
         cover_auto_crop_scope: &scope,
+        direct_image_auto_crop: None,
         pin_db: None,
         cancel: None,
         catalogs: HashMap::new(),

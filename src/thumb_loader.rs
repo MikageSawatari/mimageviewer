@@ -1260,6 +1260,7 @@ pub(crate) fn resolve_read_after_cache_miss(
             cancel,
             &req.file_type_visibility,
             &req.cover_auto_crop_scope,
+            req.auto_cover_crop,
         );
         let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
         if resolve_ms > 10.0 {
@@ -5501,6 +5502,8 @@ struct FolderResolveContext<'a> {
     cache_dir: &'a Path,
     policy: &'a crate::file_type_visibility::FileTypeVisibility,
     cover_auto_crop_scope: &'a crate::cover_auto_crop::CoverAutoCropScope,
+    // Direct image sampling belongs to the requesting tile, even after a folder pin.
+    direct_image_auto_crop: Option<crate::cover_auto_crop::AutoCropIdentity>,
     pin_db: Option<&'a crate::folder_thumb_pins::FolderThumbPinDb>,
     cancel: Option<&'a Arc<AtomicBool>>,
     catalogs: std::collections::HashMap<std::path::PathBuf, Option<crate::catalog::CatalogDb>>,
@@ -6009,6 +6012,7 @@ fn select_folder_thumb_image_with_policy(
         cancel,
         policy,
         &crate::cover_auto_crop::CoverAutoCropScope::default(),
+        None,
     )
 }
 
@@ -6035,6 +6039,7 @@ fn select_folder_thumb_image_with_policy_and_auto(
         cancel,
         policy,
         &crate::cover_auto_crop::CoverAutoCropScope::for_identity(auto_cover_crop),
+        auto_cover_crop,
     )
 }
 
@@ -6047,6 +6052,7 @@ fn select_folder_thumb_image_with_policy_and_scope(
     cancel: Option<&Arc<AtomicBool>>,
     policy: &crate::file_type_visibility::FileTypeVisibility,
     cover_auto_crop_scope: &crate::cover_auto_crop::CoverAutoCropScope,
+    direct_image_auto_crop: Option<crate::cover_auto_crop::AutoCropIdentity>,
 ) -> (
     Option<FolderThumbResolution>,
     Option<crate::catalog::FolderSelectionProof>,
@@ -6055,6 +6061,7 @@ fn select_folder_thumb_image_with_policy_and_scope(
         cache_dir,
         policy,
         cover_auto_crop_scope,
+        direct_image_auto_crop,
         pin_db,
         cancel,
         catalogs: std::collections::HashMap::new(),
@@ -6283,8 +6290,7 @@ fn resolve_folder_thumb_image_inner(
         keyed_images
             .sort_by(|(_, a_mt, ak), (_, b_mt, bk)| sort.compare_name_keys(ak, *a_mt, bk, *b_mt));
         let mut pages: Vec<_> = if context
-            .cover_auto_crop_scope
-            .identity_for(folder)
+            .direct_image_auto_crop
             .is_some_and(|auto| auto.folders)
         {
             keyed_images
@@ -12085,6 +12091,7 @@ mod tests {
                 None,
                 &settings.file_type_visibility,
                 &scope,
+                scope.identity_for(&parent),
             );
             let Some(FolderThumbResolution::CachedPinned(cached)) = selected else {
                 panic!("parent must read the nested favorite's completed child row");
@@ -12155,6 +12162,7 @@ mod tests {
                 None,
                 &crate::file_type_visibility::FileTypeVisibility::default(),
                 scope,
+                scope.identity_for(&parent),
             )
         };
         let (selected, proof) = select(&original_scope);
@@ -12801,6 +12809,7 @@ mod tests {
         let cache_dir = tmp.path().join("cache");
         let mut context = FolderResolveContext {
             cover_auto_crop_scope: &crate::cover_auto_crop::CoverAutoCropScope::default(),
+            direct_image_auto_crop: None,
             cache_dir: &cache_dir,
             policy: &policy,
             pin_db: None,

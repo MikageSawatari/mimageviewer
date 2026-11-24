@@ -4,6 +4,11 @@ use crate::settings::{FavoriteCoverAutoCropPreference, Settings};
 use std::path::Path;
 use std::sync::Arc;
 
+#[cfg(test)]
+thread_local! {
+    static SCOPE_BUILDS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CoverAutoCropScope {
     global: bool,
@@ -14,6 +19,8 @@ pub(crate) struct CoverAutoCropScope {
 
 impl CoverAutoCropScope {
     pub(crate) fn from_settings(settings: &Settings) -> Self {
+        #[cfg(test)]
+        SCOPE_BUILDS_FOR_TEST.with(|count| count.set(count.get() + 1));
         let mut roots: Vec<_> = settings
             .favorites
             .iter()
@@ -42,6 +49,11 @@ impl CoverAutoCropScope {
             identity,
             roots: roots.into(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_count_for_test() -> usize {
+        SCOPE_BUILDS_FOR_TEST.with(std::cell::Cell::get)
     }
 
     /// A uniform policy for callers which already own a resolved identity.

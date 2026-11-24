@@ -84,6 +84,10 @@ fn favorite_cover_auto_crop_mixed_request_keys_survive_repeated_pruning() {
                 },
             );
             let converted = match format {
+                Some(crate::archive_converter::ArchiveFormat::Rar) => HashMap::from([(
+                    crate::path_key::normalize_keep_drive(&path),
+                    ConvertedArchiveSourceState::Direct(path.clone()),
+                )]),
                 Some(crate::archive_converter::ArchiveFormat::SevenZ) => HashMap::from([(
                     crate::path_key::normalize_keep_drive(&path),
                     ConvertedArchiveSourceState::CachedZip {
@@ -109,6 +113,15 @@ fn favorite_cover_auto_crop_mixed_request_keys_survive_repeated_pruning() {
                 let key = crate::thumb_loader::cache_key_for_request(&request)
                     .unwrap()
                     .into_owned();
+                assert_eq!(
+                    request.path.as_path(),
+                    converted
+                        .get(&crate::path_key::normalize_keep_drive(&path))
+                        .and_then(ConvertedArchiveSourceState::load_path)
+                        .unwrap_or(&path)
+                );
+                assert_eq!(request.zip_entry.as_deref(), pinned.then_some("cover.jpg"));
+                assert_eq!(key.contains("#pin:"), pinned, "{key}");
                 assert_eq!(key.contains("|autocrop:"), root != &inside, "{key}");
                 let keep: HashSet<_> = folder_thumb_existing_keys_for_with_auto_crop(
                     &item,
@@ -348,4 +361,99 @@ fn favorite_cover_auto_crop_collection_digest_and_reuse_change_with_scope() {
     settings.favorites[0].cover_auto_crop = Preference::Off;
     assert_ne!(binding.0, reuse(&settings));
     assert_ne!(binding.1, digest(&settings));
+}
+
+#[test]
+fn favorite_cover_auto_crop_folder_pin_samples_use_request_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let parent = temp.path().join("book");
+    let target = parent.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    image::DynamicImage::new_rgb8(892, 512)
+        .save(target.join("000.png"))
+        .unwrap();
+    for index in 1..=8 {
+        image::DynamicImage::new_rgb8(70, 100)
+            .save(target.join(format!("{index:03}.png")))
+            .unwrap();
+    }
+    let settings = crate::settings::Settings {
+        thumb_cover_auto_crop_folders: true,
+        favorites: vec![
+            favorite(&parent, Preference::On),
+            favorite(&target, Preference::Off),
+        ],
+        ..Default::default()
+    };
+    let scope = CoverAutoCropScope::from_settings(&settings);
+    let pins = HashMap::from([(
+        crate::path_key::normalize_keep_drive(&parent),
+        FolderPin::from(FolderPinSource::File {
+            rel: "target".into(),
+            kind: crate::folder_thumb_pins::FileKind::Folder,
+        }),
+    )]);
+    let request = scoped_request(
+        &GridItem::Folder(parent.clone()),
+        &pins,
+        &HashMap::new(),
+        None,
+        None,
+        &scope,
+        false,
+    );
+    assert_eq!(request.path, target);
+    assert_eq!(request.auto_cover_crop, scope.identity_for(&parent));
+    assert!(request.auto_cover_crop.is_some());
+    assert!(scope.identity_for(&target).is_none());
+    assert!(
+        crate::thumb_loader::cache_key_for_request(&request)
+            .unwrap()
+            .contains("|autocrop:v4f:")
+    );
+    let resolved = crate::thumb_loader::resolve_read_after_cache_miss(&request, None, None);
+    let automatic = resolved
+        .auto_cover_crop
+        .expect("the pinned folder retains its requesting tile's identity");
+    assert_eq!(automatic.identity, request.auto_cover_crop.unwrap());
+    let crate::thumb_loader::AutoCoverInput::FolderPages(pages) = automatic.input else {
+        panic!("direct image sample")
+    };
+    assert_eq!(pages.len(), 9);
+    assert_eq!(
+        crate::cover_auto_sample::sample_folder_pages(&pages, &pages[0]),
+        Ok(0.7)
+    );
+}
+
+#[test]
+fn favorite_cover_auto_crop_priority_batches_build_scope_once() {
+    for navigation in [false, true] {
+        let mut app = setup_app_for_test();
+        app.settings.thumb_cover_auto_crop = true;
+        let root = app.tmp.path().to_owned();
+        app.settings.favorites = vec![favorite(&root.join("inside.zip"), Preference::Off)];
+        app.items = ["inside.zip", "outside.zip"]
+            .map(|name| GridItem::ZipFile(root.join(name)))
+            .into();
+        app.image_metas = vec![Some((17, 23)); 2];
+        app.thumbnails = vec![ThumbnailState::Pending; 2];
+        app.heavy_io_queue = Some(Arc::new((
+            Mutex::new(Vec::new()),
+            std::sync::Condvar::new(),
+        )));
+        let before = CoverAutoCropScope::build_count_for_test();
+        let ctx = egui::Context::default();
+        if navigation {
+            app.ensure_navigation_target_thumbnail_requests(&ctx, &[0, 1]);
+        } else {
+            app.ensure_still_seek_thumbnail_requests(&ctx, &[0, 1]);
+        }
+        assert_eq!(CoverAutoCropScope::build_count_for_test() - before, 1);
+        let queue = app.heavy_io_queue.as_ref().unwrap().0.lock().unwrap();
+        assert_eq!(queue.len(), 2);
+        for request in queue.iter() {
+            assert_eq!(request.auto_cover_crop.is_some(), request.idx == 1);
+        }
+    }
 }

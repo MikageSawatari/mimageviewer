@@ -419,6 +419,7 @@ impl App {
         let mut similar_index_toggles: Vec<(std::path::PathBuf, bool)> = Vec::new();
         let mut favorite_default_toggles: Vec<(uuid::Uuid, String, bool)> = Vec::new();
         let mut favorite_view_resets: Vec<uuid::Uuid> = Vec::new();
+        let mut favorite_view_reload_needed = false;
         let mut any_setting_dirty = false;
         let mut swap: Option<(usize, usize)> = None;
         let mut remove: Option<usize> = None;
@@ -764,7 +765,7 @@ impl App {
                                         );
                                     let name_label = ui.label(egui::RichText::new("表示名").strong());
                                     ui.label(egui::RichText::new("パス").strong());
-                                    ui.label(
+                                    let standard_label = ui.label(
                                         egui::RichText::new("標準設定を分ける").strong(),
                                     )
                                     .on_hover_text(
@@ -775,13 +776,13 @@ impl App {
                                     let cover_auto_crop_label = ui
                                         .label(egui::RichText::new("表紙の自動切り出し").strong())
                                         .on_hover_text("綴じ方向などは環境設定の値を使います");
-                                    ui.label(egui::RichText::new("コンテナ索引 (Ctrl+S)").strong())
+                                    let structure_index_label = ui.label(egui::RichText::new("コンテナ索引 (Ctrl+S)").strong())
                                         .on_hover_text(
                                             "フォルダ / ZIP / PDF を名前で横断検索\n\
                                          ✅ 監視中 = Full 完了または確認省略後の監視\n\
                                          ⚠ 作成失敗 = 最後の Full が失敗 / ⏳ = 作成中",
                                         );
-                                    ui.label(egui::RichText::new("アイテム索引 (Ctrl+G)").strong())
+                                    let metadata_index_label = ui.label(egui::RichText::new("アイテム索引 (Ctrl+G)").strong())
                                         .on_hover_text(
                                             "画像 / PDF / 動画をファイル名・タグ・EXIF・\n\
                                          AI プロンプト等で横断検索\n\
@@ -789,16 +790,18 @@ impl App {
                                          ⚠ 作成失敗 = 最後の Full が失敗\n\
                                          ⏳ スキャン中 = アクティブスキャン実行中",
                                         );
-                                    if similar_feature_enabled {
-                                        ui.label(
+                                    let similar_index_label = if similar_feature_enabled {
+                                        Some(ui.label(
                                             egui::RichText::new("別バージョン索引").strong(),
                                         )
                                         .on_hover_text(
                                             "表示中の画像と同じ絵の別バージョンを検索\n\
                                              ✅ 監視中 = 初回作成完了 + ファイルの変更を追従\n\
                                              ⏳ 作成中 = バックグラウンドで画像を確認中",
-                                        );
-                                    }
+                                        ).id)
+                                    } else {
+                                        None
+                                    };
                                     ui.label(egui::RichText::new("操作").strong());
                                     ui.end_row();
 
@@ -844,7 +847,8 @@ impl App {
                                             .adjustment_favorite_params
                                             .contains_key(&fav_id);
                                         let standard_resp =
-                                            ui.checkbox(&mut separate_standard, "");
+                                            ui.checkbox(&mut separate_standard, "")
+                                                .labelled_by(standard_label.id);
                                         if standard_resp.changed() {
                                             favorite_default_toggles.push((
                                                 fav_id,
@@ -880,7 +884,7 @@ impl App {
                                                 &mut self.settings.favorites[i]
                                                     .auto_index_structure,
                                                 "",
-                                            );
+                                            ).labelled_by(structure_index_label.id);
                                             if struct_resp.changed() {
                                                 let new_val =
                                                     self.settings.favorites[i].auto_index_structure;
@@ -908,7 +912,7 @@ impl App {
                                             let meta_resp = ui.checkbox(
                                                 &mut self.settings.favorites[i].auto_index_metadata,
                                                 "",
-                                            );
+                                            ).labelled_by(metadata_index_label.id);
                                             if meta_resp.changed() {
                                                 let new_val =
                                                     self.settings.favorites[i].auto_index_metadata;
@@ -936,7 +940,9 @@ impl App {
                                                     &mut self.settings.favorites[i]
                                                         .auto_index_similar,
                                                     "",
-                                                );
+                                                ).labelled_by(similar_index_label.expect(
+                                                    "enabled similar feature has a column label",
+                                                ));
                                                 if similar_resp.changed() {
                                                     similar_index_toggles.push((
                                                         fav_path.clone(),
@@ -1204,7 +1210,8 @@ impl App {
             }
         }
         for favorite_id in favorite_view_resets {
-            self.reset_favorite_view_state(favorite_id);
+            favorite_view_reload_needed |=
+                self.reset_favorite_view_state_without_reload(favorite_id);
         }
 
         // ── 削除確認 ────────────────────────────────────────────────
@@ -1297,7 +1304,8 @@ impl App {
             // を待たない)。これで削除直後にフォルダを再訪したとき、残像の favorite 標準が
             // 効いたまま、という不整合を避ける。
             self.clear_favorite_default(removed.id);
-            self.remove_favorite_view_state(removed.id);
+            favorite_view_reload_needed |=
+                self.remove_favorite_view_state_without_reload(removed.id);
             any_setting_dirty = true;
         }
 
@@ -1332,7 +1340,11 @@ impl App {
             }
         }
         if cover_auto_crop_before != CoverAutoCropScope::from_settings(&self.settings) {
+            // This reload also reflects an active favorite view's removal. Starting its
+            // order refresh first would immediately supersede it with the same scan.
             self.apply_file_type_visibility_change(ctx);
+        } else if favorite_view_reload_needed {
+            self.apply_sort_change_reload();
         }
 
         if close_requested || !open {
@@ -1750,6 +1762,185 @@ mod tests {
         draw_background_indexer_activity_row, draw_similar_state_inline,
         favorites_editor_dialog_geometry, similar_index_progress_presentation,
     };
+
+    fn editor_harness(
+        app: crate::app::AppTestEnvForTest,
+    ) -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
+        crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1093.0, 614.0))
+            .build_ui_state(
+                |root_ui, app: &mut crate::app::AppTestEnvForTest| {
+                    app.show_favorites_editor_dialog(&root_ui.ctx().clone());
+                },
+                app,
+            )
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_delete_active_view_starts_one_order_refresh() {
+        use crate::settings::{
+            FavoriteCoverAutoCropPreference, FavoriteEntry, FavoriteViewState, SortOrder,
+        };
+        use egui_kittest::kittest::{NodeT, Queryable};
+
+        // Both removal effects together, then the view-state-only sibling route.
+        for preference in [
+            FavoriteCoverAutoCropPreference::Off,
+            FavoriteCoverAutoCropPreference::FollowGlobal,
+        ] {
+            let mut app = crate::app::setup_app_for_test();
+            let root = app.tmp.path().join("active-favorite");
+            std::fs::create_dir_all(&root).unwrap();
+            for name in ["a.png", "b.png"] {
+                image::RgbaImage::from_pixel(2, 2, image::Rgba([80, 120, 160, 255]))
+                    .save(root.join(name))
+                    .unwrap();
+            }
+            app.settings.sort_order = SortOrder::Numeric;
+            app.settings.remember_favorite_view_state = true;
+            app.settings.thumb_cover_auto_crop = true;
+            let mut favorite = FavoriteEntry::new("active".into(), root.clone());
+            favorite.cover_auto_crop = preference;
+            let favorite_id = favorite.id;
+            let mut view = FavoriteViewState::from_settings(&app.settings);
+            view.sort_order = SortOrder::FileNameDesc;
+            app.favorite_view_states.insert(favorite_id, view);
+            app.settings.favorites = vec![favorite];
+            app.load_folder(root);
+            app.finish_page_identity_preparation_for_test();
+            assert_eq!(app.settings.active_favorite_view_id(), Some(favorite_id));
+            assert_eq!(app.settings.sort_order, SortOrder::FileNameDesc);
+            let before = app.current_view_order_refresh_start_count_for_test();
+            app.show_favorites_editor = true;
+            app.favorite_delete_confirm = Some(favorite_id);
+            let mut harness = editor_harness(app);
+            harness.run_steps(3);
+            // The last Delete belongs to the foreground confirmation modal.
+            harness.get_all_by_label("削除").last().unwrap().click();
+            harness.run_steps(3);
+            assert!(harness.state().settings.favorites.is_empty());
+            assert!(
+                !harness
+                    .state()
+                    .favorite_view_states
+                    .contains_key(&favorite_id)
+            );
+            assert_eq!(harness.state().settings.active_favorite_view_id(), None);
+            assert_eq!(harness.state().settings.sort_order, SortOrder::Numeric);
+            assert_eq!(
+                harness
+                    .state()
+                    .current_view_order_refresh_start_count_for_test(),
+                before + 1,
+                "favorite removal must coalesce its view and crop reloads"
+            );
+            assert!(harness.state().view_order_refresh_scan_pending());
+            harness.state_mut().show_favorites_editor = false;
+            let ctx = harness.ctx.clone();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while harness.state().view_order_refresh_scan_pending() {
+                harness
+                    .state_mut()
+                    .poll_current_view_order_refresh_for_test(&ctx);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "favorite delete reload did not finish"
+                );
+                std::thread::yield_now();
+            }
+            harness
+                .state_mut()
+                .finish_page_identity_preparation_for_test();
+            assert_eq!(
+                harness
+                    .state()
+                    .current_view_order_refresh_start_count_for_test(),
+                before + 1
+            );
+            let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+            assert!(db.load_into_settings().unwrap().favorites.is_empty());
+        }
+    }
+
+    #[test]
+    fn favorite_cover_auto_crop_small_editor_reaches_all_row_actions_and_close() {
+        use crate::settings::{FavoriteCoverAutoCropPreference, FavoriteEntry};
+        use egui_kittest::kittest::{NodeT, Queryable};
+
+        let mut app = crate::app::setup_app_for_test();
+        for row in 0..6 {
+            let mut favorite = FavoriteEntry::new(
+                format!("長い表示名のライブラリ {row}"),
+                app.tmp.path().join(format!(
+                    "long-library-root/photographs-and-books-with-a-long-path/collection-{row}/scanned-albums"
+                )),
+            );
+            favorite.cover_auto_crop = FavoriteCoverAutoCropPreference::all()[row % 3];
+            app.settings.favorites.push(favorite);
+        }
+        app.show_favorites_editor = true;
+        let mut harness = editor_harness(app);
+        harness.run_steps(3);
+        for label in [
+            "標準設定を分ける",
+            "コンテナ索引 (Ctrl+S)",
+            "アイテム索引 (Ctrl+G)",
+            "別バージョン索引",
+        ] {
+            assert_eq!(
+                harness
+                    .get_all_by_label(label)
+                    .filter(|node| node.accesskit_node().role() == egui::accesskit::Role::CheckBox)
+                    .count(),
+                6,
+                "every row checkbox must be named by its column: {label}"
+            );
+        }
+        let (safe_rect, _, _) = favorites_editor_dialog_geometry(harness.ctx.content_rect(), true);
+        let first_action_before = harness.get_all_by_label("削除").next().unwrap().rect();
+        assert!(
+            first_action_before.right() > safe_rect.right(),
+            "fixture must need horizontal scrolling"
+        );
+        for row in 0..6 {
+            harness
+                .get_all_by_label("削除")
+                .nth(row)
+                .unwrap()
+                .scroll_to_me();
+            harness.run_steps(3);
+            let action = harness.get_all_by_label("削除").nth(row).unwrap();
+            assert!(
+                safe_rect.contains_rect(action.rect()),
+                "row {row} action must be reachable"
+            );
+        }
+        let first_action_after = harness.get_all_by_label("削除").next().unwrap().rect();
+        assert!(
+            first_action_after.left() < first_action_before.left(),
+            "action column must scroll horizontally"
+        );
+        // An action in the rightmost column remains usable after both axes have scrolled.
+        harness.get_all_by_label("削除").last().unwrap().click();
+        harness.run_steps(3);
+        assert!(harness.state().favorite_delete_confirm.is_some());
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "キャンセル")
+            .click();
+        harness.run_steps(3);
+        assert!(harness.state().favorite_delete_confirm.is_none());
+        assert_eq!(harness.state().settings.favorites.len(), 6);
+        harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "閉じる")
+            .scroll_to_me();
+        harness.run_steps(3);
+        let close = harness.get_by_role_and_label(egui::accesskit::Role::Button, "閉じる");
+        assert!(safe_rect.contains_rect(close.rect()));
+        close.click();
+        harness.run_steps(3);
+        assert!(!harness.state().show_favorites_editor);
+    }
 
     #[test]
     fn favorite_cover_auto_crop_combo_saves_and_reloads_loaded_books_with_scoped_requests() {

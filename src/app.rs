@@ -60,6 +60,11 @@ mod caption_display_tests;
 use std::time::Instant;
 
 #[cfg(test)]
+thread_local! {
+    static CURRENT_VIEW_ORDER_REFRESH_STARTS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 use crate::final_composite::FinalCompositeTiming;
 use crate::final_composite::{
     FinalCompositePlan, FinalCompositeResult, active_favorite_default_id_for_path,
@@ -30655,6 +30660,11 @@ impl App {
     }
 
     #[cfg(test)]
+    pub(crate) fn current_view_order_refresh_start_count_for_test(&self) -> usize {
+        CURRENT_VIEW_ORDER_REFRESH_STARTS_FOR_TEST.with(std::cell::Cell::get)
+    }
+
+    #[cfg(test)]
     pub(crate) fn poll_current_view_order_refresh_for_test(&mut self, ctx: &egui::Context) {
         if self.view_order_refresh_scan_pending() {
             self.post_render_main_navigation(ctx, update_phases::MainFrameNavigation::default());
@@ -58398,8 +58408,9 @@ impl App {
             self.keep_end_shared
                 .store(self.keep_range.1, Ordering::Relaxed);
         }
+        let cover_auto_crop_scope = self.thumbnail_auto_crop_scope();
         for idx in pages.iter().copied() {
-            self.enqueue_priority_thumbnail(idx);
+            self.enqueue_priority_thumbnail_with_scope(idx, &cover_auto_crop_scope);
         }
         let pdf_keys = pages
             .iter()
@@ -58541,6 +58552,7 @@ impl App {
             }
             self.reconcile_foreground_thumbnail_keep_owners(Some(ctx));
         }
+        let cover_auto_crop_scope = self.thumbnail_auto_crop_scope();
         let enqueue_started = std::time::Instant::now();
         let mut new_requests = 0usize;
         let mut admissions = Vec::new();
@@ -58564,7 +58576,7 @@ impl App {
                     break;
                 }
             }
-            let admission = self.enqueue_priority_thumbnail(idx);
+            let admission = self.enqueue_priority_thumbnail_with_scope(idx, &cover_auto_crop_scope);
             if overview {
                 admissions.push((idx, admission));
             }
@@ -58614,6 +58626,15 @@ impl App {
     }
 
     fn enqueue_priority_thumbnail(&mut self, idx: usize) -> PriorityThumbnailAdmission {
+        let scope = self.thumbnail_auto_crop_scope();
+        self.enqueue_priority_thumbnail_with_scope(idx, &scope)
+    }
+
+    fn enqueue_priority_thumbnail_with_scope(
+        &mut self,
+        idx: usize,
+        cover_auto_crop_scope: &crate::cover_auto_crop::CoverAutoCropScope,
+    ) -> PriorityThumbnailAdmission {
         // The current items generation has no live thumbnail workers until the sidecar recovery
         // continuation creates fresh queues.  Enqueuing into the cancelled previous generation
         // would strand `requested[idx]` and prevent the first-display worker from retrying it.
@@ -58649,7 +58670,6 @@ impl App {
             ThumbnailState::Pending | ThumbnailState::Evicted => {}
         }
 
-        let cover_auto_crop_scope = self.thumbnail_auto_crop_scope();
         let use_full_path_keys = self.use_full_path_cache_keys();
         let req_opt = if self.items_are_drive_list {
             self.items.get(idx).and_then(|item| {
@@ -58690,7 +58710,7 @@ impl App {
                     self.video_pin_db.as_ref(),
                     use_full_path_keys,
                     self.listing_file_type_visibility(),
-                    &cover_auto_crop_scope,
+                    cover_auto_crop_scope,
                 )
             })
         };
@@ -62199,6 +62219,13 @@ impl App {
                 let _ = tx.send(scan);
             }
         });
+        #[cfg(test)]
+        if matches!(
+            purpose,
+            FolderOpenScanPurpose::CurrentViewOrderRefresh { .. }
+        ) {
+            CURRENT_VIEW_ORDER_REFRESH_STARTS_FOR_TEST.with(|count| count.set(count.get() + 1));
+        }
         self.folder_pane_open_pending = Some(FolderPaneOpenPending {
             started_at,
             path,
@@ -96498,6 +96525,16 @@ impl App {
         previous: &crate::settings::FavoriteViewState,
         previous_effective_aspect: crate::settings::ThumbAspect,
     ) {
+        if self.reflect_favorite_view_change_without_reload(previous, previous_effective_aspect) {
+            self.apply_sort_change_reload();
+        }
+    }
+
+    fn reflect_favorite_view_change_without_reload(
+        &mut self,
+        previous: &crate::settings::FavoriteViewState,
+        previous_effective_aspect: crate::settings::ThumbAspect,
+    ) -> bool {
         let current = crate::settings::FavoriteViewState::from_settings(&self.settings);
 
         if previous.grid_view_mode != current.grid_view_mode {
@@ -96525,14 +96562,17 @@ impl App {
             }
         }
 
-        if previous.sort_order != current.sort_order
+        previous.sort_order != current.sort_order
             || previous.grid_display_order != current.grid_display_order
-        {
+    }
+
+    fn reapply_favorite_view_without_seed(&mut self) {
+        if self.reapply_favorite_view_without_seed_without_reload() {
             self.apply_sort_change_reload();
         }
     }
 
-    fn reapply_favorite_view_without_seed(&mut self) {
+    fn reapply_favorite_view_without_seed_without_reload(&mut self) -> bool {
         let previous = crate::settings::FavoriteViewState::from_settings(&self.settings);
         let previous_effective_aspect = self.effective_thumb_aspect();
         self.settings.clear_favorite_view_overlay();
@@ -96550,7 +96590,7 @@ impl App {
                 self.settings.apply_favorite_view_overlay(id, &state);
             }
         }
-        self.reflect_favorite_view_change(&previous, previous_effective_aspect);
+        self.reflect_favorite_view_change_without_reload(&previous, previous_effective_aspect)
     }
 
     fn reconcile_favorite_view_for_current_context_at(&mut self, now: std::time::Instant) {
@@ -96737,8 +96777,35 @@ impl App {
     }
 
     pub(crate) fn remove_favorite_view_state(&mut self, favorite_id: uuid::Uuid) -> bool {
+        let (existed, reload) = self.remove_favorite_view_state_deferred(favorite_id);
+        if reload {
+            self.apply_sort_change_reload();
+        }
+        existed
+    }
+
+    /// The immediate-apply editor aggregates this rebuild with its crop-policy edits.
+    pub(crate) fn remove_favorite_view_state_without_reload(
+        &mut self,
+        favorite_id: uuid::Uuid,
+    ) -> bool {
+        self.remove_favorite_view_state_deferred(favorite_id).1
+    }
+
+    pub(crate) fn reset_favorite_view_state_without_reload(
+        &mut self,
+        favorite_id: uuid::Uuid,
+    ) -> bool {
+        let (existed, reload) = self.remove_favorite_view_state_deferred(favorite_id);
+        if existed {
+            self.show_feedback_toast("お気に入りの表示状態をリセットしました".to_owned());
+        }
+        reload
+    }
+
+    fn remove_favorite_view_state_deferred(&mut self, favorite_id: uuid::Uuid) -> (bool, bool) {
         if !self.admit_book_append_followup_mutation() {
-            return false;
+            return (false, false);
         }
         self.favorite_view_writes.remove(favorite_id);
         let existed = self.favorite_view_states.remove(&favorite_id).is_some();
@@ -96752,10 +96819,9 @@ impl App {
                 "お気に入りの表示状態を保存データから削除できませんでした".to_owned(),
             );
         }
-        if self.settings.active_favorite_view_id() == Some(favorite_id) {
-            self.reapply_favorite_view_without_seed();
-        }
-        existed
+        let reload = self.settings.active_favorite_view_id() == Some(favorite_id)
+            && self.reapply_favorite_view_without_seed_without_reload();
+        (existed, reload)
     }
 
     pub(crate) fn reset_favorite_view_state(&mut self, favorite_id: uuid::Uuid) {
