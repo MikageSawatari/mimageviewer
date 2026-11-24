@@ -1,6 +1,7 @@
 use super::*;
 
 const MAX_PRESETS: usize = 50;
+const PRESET_NAME_ERROR: &str = "プリセット名は前後の空白を除いて 1〜40 文字で入力してください";
 
 fn name_field_id() -> egui::Id {
     egui::Id::unique("batch_export_preset_name")
@@ -39,7 +40,7 @@ pub(super) enum PresetAction {
 fn preset_name(name: &str, presets: &[BatchExportPreset]) -> Result<String, String> {
     let name = name.trim();
     if !(1..=40).contains(&name.chars().count()) {
-        return Err("プリセット名は前後の空白を除いて 1〜40 文字で入力してください".into());
+        return Err(PRESET_NAME_ERROR.into());
     }
     if presets.len() >= MAX_PRESETS && !presets.iter().any(|preset| preset.name == name) {
         return Err("プリセットは 50 件まで保存できます".into());
@@ -221,5 +222,8 @@ fn draw_preset_name(
     });
     if back {
         state.preset.editing = None;
+        if state.error.as_deref() == Some(PRESET_NAME_ERROR) {
+            state.error = None;
+        }
     }
 }

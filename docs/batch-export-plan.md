@@ -1,7 +1,6 @@
 # 一括エクスポート (Ctrl+E) の拡張 設計 (§1.362)
 
-- 状態: **段 A・B 実装済み (独立実装レビュー ACCEPT)、段 C 実装中**。検証は共有ランナーでの関連テストだけ (本体 lib の全件・実機の操作は未実施)。設計は独立設計レビュー 9 回目で ACCEPT (2026-11-25)。
-- 範囲の正本: [backlog-on-hold.md §1.362](backlog-on-hold.md) (利用者決定 2026-10-10、着手は利用者決定 2026-11-24)。
+- 状態: **段 A・B・C 実装済み。独立実装レビューは各段で ACCEPT** (段 A 5 回目・段 B 1 回目・段 C 1 回目、Codex gpt-6.1-sol / xhigh、2026-11-25)。検証は共有ランナーでの関連テストと UI snapshot (本体 lib の全件は別に記録、実機の操作は未実施)。設計は独立設計レビュー 9 回目で ACCEPT。§13 に利用者の回答待ちが 1 件 (検索結果に表示中のファイルの上書き)。
 - 調査: `internal/batch-convert-2026-10/report.md` (2026-10-10 時点。§1 で今のコードと照合した)。
 - 関連: [preset-and-adjustment.md](preset-and-adjustment.md) (焼き込みの段・合成順)、
   [ui-responsiveness.md §4](ui-responsiveness.md)、[coding-conventions.md「ダイアログ」](coding-conventions.md)、

@@ -229,6 +229,47 @@ fn batch_export_presets_name_ime_and_invalid_enter_never_export() {
 }
 
 #[test]
+fn batch_export_presets_back_after_empty_name_enter_clears_only_name_error() {
+    for (edit_name, other_error) in [
+        (false, None),
+        (true, None),
+        (
+            false,
+            Some("保存先・ファイル名と書き出す画像を確認してください"),
+        ),
+        (false, Some("プリセットは 50 件まで保存できます")),
+    ] {
+        let mut h = window_harness(egui::vec2(1093.0, 900.0), 1.0, false);
+        h.run_steps(12);
+        h.get_by_label("保存...").click();
+        h.run_steps(2);
+        h.get_by_label("プリセット名").focus();
+        h.step();
+        h.key_press(egui::Key::Enter);
+        h.run_steps(2);
+        assert!(h.state().dialog.error.as_ref().unwrap().contains("1〜40"));
+        if edit_name {
+            // Cancelling must clear the earlier error even after the name changes.
+            h.get_by_label("プリセット名").focus();
+            h.step();
+            h.get_by_label("プリセット名").type_text("保存しない名前");
+            h.run_steps(2);
+        }
+        if let Some(error) = other_error {
+            h.state_mut().dialog.error = Some(error.into());
+            h.run_steps(2);
+        }
+        h.get_by_label("戻る").click();
+        h.run_steps(2);
+        assert!(h.state().dialog.preset.editing.is_none());
+        assert_eq!(h.state().dialog.error.as_deref(), other_error);
+        assert!(h.state().presets.is_empty());
+        assert_eq!((h.state().saves, h.state().starts), (0, 0));
+        let _ = h.get_by_label("保存...");
+    }
+}
+
+#[test]
 fn batch_export_presets_popup_consumes_wheel_and_enter() {
     let mut h = window_harness(egui::vec2(1093.0, 614.0), 1.0, true);
     h.state_mut().presets = (0..50).map(|n| preset(&format!("設定{n:02}"))).collect();
