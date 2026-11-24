@@ -47,6 +47,12 @@ pub fn build_engine() -> Engine {
     engine.register_global_module(rhai::exported_module!(safe_functions).into());
     engine.disable_symbol("eval");
     engine.disable_symbol("import");
+    // Catch materializes unchecked error strings/maps. Throw also wraps its
+    // evaluated payload without a size check (eval/stmt.rs:818-824).
+    // Reject these statement keywords before parsing any function body.
+    for symbol in ["try", "catch", "throw"] {
+        engine.disable_symbol(symbol);
+    }
     // These are syntactic built-ins even without BasicFnPackage. Curried
     // FnPtr values can form recursively cloned trees outside data-size limits.
     for symbol in ["Fn", "curry", "call"] {
@@ -207,6 +213,37 @@ mod tests {
         for script in [r#"eval("1")"#, r#"import "anything" as module;"#] {
             assert!(engine.compile(script).is_err(), "{script}");
         }
+    }
+
+    #[test]
+    fn sandbox_rejects_try_catch_and_throw_during_compilation() {
+        let engine = build_engine();
+        for symbol in ["try", "catch", "throw"] {
+            assert!(engine.is_symbol_disabled(symbol));
+        }
+        for source in [
+            "try { missing_function(); } catch (e) { e.message.len(); }",
+            "try { 1 / 0; } catch { 0; }",
+            "fn slots() { try { [] } catch (e) { [] } }",
+            "fn slots() { [] } fn unused() { try { missing_function(); } catch (e) { [] } }",
+            "throw;",
+            "throw \"message\";",
+            "throw [0];",
+            "throw #{ message: \"message\" };",
+            "fn slots() { throw \"message\"; }",
+            "fn slots() { [] } fn unused(s) { throw s; }",
+        ] {
+            assert!(engine.compile(source).is_err(), "{source}");
+        }
+        // Keyword disabling applies to tokens, not comments or data strings.
+        assert_eq!(
+            engine
+                .eval::<String>(
+                    "// try {} catch(e) {} throw;\n let message = \"try catch throw\"; message"
+                )
+                .unwrap(),
+            "try catch throw"
+        );
     }
 
     #[test]

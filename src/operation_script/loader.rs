@@ -217,8 +217,10 @@ mod tests {
         assert!(error.contains("読み込みに失敗"));
         std::fs::write(&path, "fn slots( {").unwrap();
         assert!(load_script(&path).err().unwrap().contains("コンパイル"));
-        std::fs::write(&path, "fn slots() { throw \"bad slots\"; }").unwrap();
-        assert!(load_script(&path).err().unwrap().contains("bad slots"));
+        std::fs::write(&path, "fn slots() { bad_slots_evaluation(); }").unwrap();
+        let reason = load_script(&path).err().unwrap();
+        assert!(reason.contains("slots() の評価に失敗"), "{reason}");
+        assert!(reason.contains("bad_slots_evaluation"), "{reason}");
         std::fs::write(&path, DEFAULT_SCRIPT).unwrap();
         let mut loader = OperationScriptLoader::default();
         loader.reload(temp.path(), &egui::Context::default());
@@ -238,7 +240,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::write(
             script_path(temp.path()),
-            "fn slots() { throw \"must not execute\"; }\nfn unused(s) {\n    s[0] += 1;\n}",
+            "fn slots() { slots_should_not_execute(); }\nfn unused(s) {\n    s[0] += 1;\n}",
         )
         .unwrap();
         let mut loader = OperationScriptLoader::default();
@@ -256,7 +258,41 @@ mod tests {
             reason.contains("添字・プロパティへの代入は使えません"),
             "{reason}"
         );
-        assert!(!reason.contains("must not execute"), "{reason}");
+        assert!(!reason.contains("slots_should_not_execute"), "{reason}");
+    }
+
+    #[test]
+    fn worker_rejects_exception_statements_while_loading() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        for (source, keyword) in [
+            (
+                "try { missing_function(); } catch(e) {} fn slots() { [] }",
+                "try",
+            ),
+            ("fn slots() { try { [] } catch(e) { [] } }", "try"),
+            (
+                "fn slots() { [] } fn unused() { try { missing_function(); } catch(e) {} }",
+                "try",
+            ),
+            ("fn slots() { throw [0]; }", "throw"),
+            ("fn slots() { [] } fn unused(s) { throw s; }", "throw"),
+        ] {
+            std::fs::write(script_path(temp.path()), source).unwrap();
+            let mut loader = OperationScriptLoader::default();
+            loader.reload(temp.path(), &ctx);
+            let OperationScriptState::Loading(pending) = &loader.state else {
+                panic!("not loading");
+            };
+            let result = pending
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let reason = result.script.err().unwrap();
+            assert!(reason.contains("コンパイルに失敗"), "{reason}");
+            assert!(reason.contains(keyword), "{reason}");
+            assert!(!reason.contains("slots() の評価に失敗"), "{reason}");
+        }
     }
 
     #[test]

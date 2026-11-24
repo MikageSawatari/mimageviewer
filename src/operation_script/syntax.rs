@@ -113,14 +113,14 @@ mod tests {
 
     #[test]
     fn syntax_rejects_container_mutation_before_slots_evaluation_with_position() {
-        let source = "fn slots() { throw \"must not execute\"; }\nfn unused(s) {\n    s.item.name = \"changed\";\n}";
+        let source = "fn slots() { slots_should_not_execute(); }\nfn unused(s) {\n    s.item.name = \"changed\";\n}";
         let error = CompiledOperationScript::compile(source).err().unwrap();
         assert!(error.contains("3行5桁"), "{error}");
         assert!(
             error.contains("添字・プロパティへの代入は使えません"),
             "{error}"
         );
-        assert!(!error.contains("must not execute"), "{error}");
+        assert!(!error.contains("slots_should_not_execute"), "{error}");
     }
 
     #[test]
