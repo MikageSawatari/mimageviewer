@@ -1247,10 +1247,9 @@ fn realmachine50_parked_click_case_with_touch_policy(
                 assert_eq!(viewer.fullscreen_idx, Some(0));
                 assert_eq!(viewer.items.len(), 2, "the restored viewer has a next page");
                 assert!(viewer.reading_flow.is_paged());
-                viewer.spread_mode.advances_right_to_left()
+                viewer.input_advances_right_to_left()
             }).unwrap();
-            // Single-page mode uses LTR input: its left half requests the
-            // previous page and correctly stays at page zero without wrapping.
+            // Use the restored viewer's effective reading direction for its next-page side.
             let next = egui::pos2(CHILD_SIZE.x * if rtl { 0.25 } else { 0.75 }, CHILD_SIZE.y * 0.5);
             assert_eq!(crate::touch_input::classify_tap(&crate::touch_input::TapZoneGeometry {
                 surface: egui::Rect::from_min_size(egui::Pos2::ZERO, CHILD_SIZE),

@@ -159,7 +159,7 @@ impl App {
             diff!("reading_flow", incoming.reading_flow == self.reading_flow);
             diff!(
                 "reading_rtl",
-                incoming.reading_rtl == self.page_turn_reading_rtl()
+                incoming.reading_rtl == self.input_advances_right_to_left()
             );
             diff!(
                 "prepare_policy",

@@ -38241,7 +38241,7 @@ impl App {
         // 実効方向かを設定で選べる。Ctrl/Shift+左右などの明示コマンドは従来どおり
         // ページ表示の綴じ方向を使い、この設定へ巻き込まない。
         // 入力の左右は読み順で決める。ペア並び順 (`is_rtl`) は別の問い。
-        let page_rtl = self.spread_mode.advances_right_to_left();
+        let page_rtl = self.input_advances_right_to_left();
         let seek_bar_rtl = self
             .settings
             .fullscreen_seek_direction
@@ -41850,7 +41850,7 @@ impl App {
                         // resolver as FsPageNext/FsPagePrev.
                         let base = fullscreen_click_nav_delta_for_side(
                             left,
-                            self.spread_mode.advances_right_to_left(),
+                            self.input_advances_right_to_left(),
                         );
                         page_nav = self.spread_page_nav(base).into();
                         *navigation_operation = self
@@ -43259,7 +43259,7 @@ impl App {
                 FsCanvasClickAction::PageSide(fullscreen_click_nav_base_delta(
                     pos.x,
                     full_rect.center().x,
-                    self.spread_mode.advances_right_to_left(),
+                    self.input_advances_right_to_left(),
                 ))
             }
         }
@@ -48334,6 +48334,16 @@ impl App {
         self.adjust_spread_target = None;
         self.similar_panel.reset_info_target();
         true
+    }
+
+    /// 左右入力の前後を決める、現在の viewer context の実効読み方向。
+    /// 単ページなど方向を持たないモードでは、独立した読み方向の設定を使う。
+    /// 見開きのペア並び順や、シークバーに合わせるカーソル設定とは別の判定。
+    pub(crate) fn input_advances_right_to_left(&self) -> bool {
+        self.spread_mode
+            .canonical_reading_direction()
+            .unwrap_or(self.reading_direction)
+            == ReadingDirection::Rtl
     }
 
     pub(crate) fn set_reading_direction_for_fullscreen(
@@ -100942,6 +100952,35 @@ pub(crate) mod page_turn_submission_tests {
         app
     }
 
+    #[test]
+    fn input_direction_uses_each_spread_mode_or_the_viewer_reading_direction() {
+        let ctx = egui::Context::default();
+        let mut app = ready_app(&ctx, SpreadMode::Single);
+        for (mode, expected) in [
+            (SpreadMode::Single, [false, true]),
+            (SpreadMode::Vertical, [false, true]),
+            (SpreadMode::Ltr, [false, false]),
+            (SpreadMode::LtrCover, [false, false]),
+            (SpreadMode::Rtl, [true, true]),
+            (SpreadMode::RtlCover, [true, true]),
+            (SpreadMode::SplitLtr, [false, false]),
+            (SpreadMode::SplitRtl, [true, true]),
+        ] {
+            app.spread_mode = mode;
+            for (direction, expected) in [ReadingDirection::Ltr, ReadingDirection::Rtl]
+                .into_iter()
+                .zip(expected)
+            {
+                app.reading_direction = direction;
+                assert_eq!(
+                    app.input_advances_right_to_left(),
+                    expected,
+                    "{mode:?} {direction:?}"
+                );
+            }
+        }
+    }
+
     fn reading_direction_key(app: &mut App, ctx: &egui::Context, key: egui::Key) {
         let mut release = pressed(key);
         if let egui::Event::Key { pressed, .. } = &mut release {
@@ -101005,6 +101044,18 @@ pub(crate) mod page_turn_submission_tests {
     }
 
     #[test]
+    fn single_rtl_arrow_right_can_still_follow_a_left_to_right_seek_bar() {
+        let ctx = egui::Context::default();
+        let mut app = reading_direction_app(&ctx, SpreadMode::Single, ReadingDirection::Rtl, 1);
+        app.settings.fullscreen_horizontal_cursor_direction =
+            crate::settings::FullscreenHorizontalCursorDirection::FollowSeekBar;
+        app.settings.fullscreen_seek_direction =
+            crate::settings::FullscreenSeekDirection::LeftToRight;
+        reading_direction_key(&mut app, &ctx, egui::Key::ArrowRight);
+        assert_eq!(app.fullscreen_idx, Some(2));
+    }
+
+    #[test]
     fn rtl_spread_arrow_right_still_goes_to_previous_spread() {
         let ctx = egui::Context::default();
         // The spread's own direction takes precedence over the Single-mode direction.
@@ -101063,10 +101114,14 @@ pub(crate) mod page_turn_submission_tests {
 
     fn single_rtl_canvas_click(pos: egui::Pos2, expected: usize) {
         let ctx = egui::Context::default();
+        install_fs_navigator_input_tracking(&ctx);
         let mut app = reading_direction_app(&ctx, SpreadMode::Single, ReadingDirection::Rtl, 1);
         app.settings.fullscreen_primary_click =
             crate::settings::FullscreenPrimaryClickMode::PageTurn;
+        app.settings.touch_still_chrome_learned = true;
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 400.0));
+        // Use the begin-pass tracking and full-rect CentralPanel setup from
+        // fullscreen_right_drag_left_cancel_consumes_release_and_keeps_normal_click.
         // Establish the backing widget, then drive an actual press/release through
         // the fullscreen canvas handler, rather than supplying its RTL argument.
         for frame in 0..3 {
@@ -101079,39 +101134,42 @@ pub(crate) mod page_turn_submission_tests {
                     modifiers: egui::Modifiers::NONE,
                 });
             }
-            ctx.run_ui(
+            app.frame_counter += 1;
+            ctx.run_pass(
                 egui::RawInput {
                     screen_rect: Some(rect),
                     time: Some(frame as f64 * 0.05),
                     events,
                     ..Default::default()
                 },
-                |ui| {
-                    let state = app.prepare_fullscreen_state(&ctx, 1, FsPageTurnDecision::normal());
-                    let (nav, close) = app.handle_fs_wheel_and_click_with_geometry(
-                        ui,
-                        &ctx,
-                        rect,
-                        &state,
-                        StillSeekGeometry::bar_only(),
-                        false,
-                        0,
-                        &mut None,
-                        None,
-                        false,
-                    );
-                    assert!(!close);
-                    if frame < 2 {
-                        assert!(nav.is_none());
-                    } else {
-                        assert!(
-                            !nav.is_none(),
-                            "the released click must produce PageSide navigation"
-                        );
-                        app.handle_fs_navigation(
-                            &ctx, false, false, None, None, None, nav, None, 1,
-                        );
-                    }
+                |ctx| {
+                    ctx.root_ui(|root_ui| {
+                        egui::CentralPanel::default().frame(egui::Frame::NONE).show(root_ui, |ui| {
+                            let state = app.prepare_fullscreen_state(ctx, 1, FsPageTurnDecision::normal());
+                            let (nav, close) = app.handle_fs_wheel_and_click_with_geometry(
+                                ui,
+                                ctx,
+                                rect,
+                                &state,
+                                StillSeekGeometry::bar_only(),
+                                false,
+                                0,
+                                &mut None,
+                                None,
+                                false,
+                            );
+                            assert!(!close);
+                            if frame < 2 {
+                                assert!(nav.is_none());
+                            } else {
+                                assert_eq!(nav, FsPageNav::Delta(expected as i32 - 1),
+                                    "the released click must follow Single-mode RTL reading direction");
+                                app.handle_fs_navigation(
+                                    ctx, false, false, None, None, None, nav, None, 1,
+                                );
+                            }
+                        });
+                    });
                 },
             )
             .drop_without_applying_deltas();

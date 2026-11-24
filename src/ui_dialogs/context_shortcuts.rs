@@ -562,7 +562,7 @@ impl App {
                         draw_touch_rows(
                             ui,
                             help_context.touch_rows(
-                                self.spread_mode.advances_right_to_left(),
+                                self.input_advances_right_to_left(),
                                 video_touch_available,
                             ),
                         );
