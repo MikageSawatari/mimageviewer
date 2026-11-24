@@ -1661,6 +1661,8 @@ mod tests {
         }];
         expected.ring_shortcuts.mouse_ring_help_visible = false;
         expected.menu_layout.hidden_commands = vec!["SettingsOperationCustomize".to_string()];
+        expected.fullscreen_primary_click =
+            crate::settings::FullscreenPrimaryClickMode::DoubleClickClose;
         {
             let db = SettingsDb::create_new(dir).unwrap();
             db.save_full(&expected).unwrap();
@@ -1672,6 +1674,10 @@ mod tests {
         assert_eq!(bundle.keymap, expected.keymap);
         assert_eq!(bundle.ring_shortcuts, expected.ring_shortcuts);
         assert_eq!(bundle.menu_layout, expected.menu_layout);
+        assert_eq!(
+            bundle.fullscreen_primary_click,
+            expected.fullscreen_primary_click
+        );
     }
 
     #[test]
@@ -1702,9 +1708,11 @@ mod tests {
     fn before_import_backup_is_valid_bundle_and_retention_is_bounded() {
         let guard = DataDirOverrideGuard::new();
         let dir = guard.path();
-        let bundle = crate::operation_customize_share::OperationCustomizeBundle::from_settings(
-            &sample_settings(),
-        );
+        let mut settings = sample_settings();
+        settings.fullscreen_primary_click =
+            crate::settings::FullscreenPrimaryClickMode::DoubleClickClose;
+        let bundle =
+            crate::operation_customize_share::OperationCustomizeBundle::from_settings(&settings);
         let first = backup_operation_customize_before_import(dir, &bundle).unwrap();
         let text = std::fs::read_to_string(first).unwrap();
         assert_eq!(
@@ -1713,6 +1721,13 @@ mod tests {
                 .bundle
                 .keymap,
             bundle.keymap
+        );
+        assert_eq!(
+            crate::operation_customize_share::parse_json(&text)
+                .unwrap()
+                .bundle
+                .fullscreen_primary_click,
+            bundle.fullscreen_primary_click
         );
 
         for _ in 0..OPERATION_IMPORT_BACKUP_LIMIT + 2 {

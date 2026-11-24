@@ -2154,6 +2154,67 @@ mod tests {
     }
 
     #[test]
+    fn operation_file_import_unknown_primary_click_mode_shows_error() {
+        use egui_kittest::kittest::Queryable;
+
+        let mut app = crate::app::setup_app_for_test();
+        let before = crate::operation_customize_share::OperationCustomizeBundle::from_settings(
+            &app.settings,
+        );
+        let mut json = serde_json::to_value(&before).unwrap();
+        json["fullscreen_primary_click"] = serde_json::json!("future_click_mode");
+        let path = app.tmp.path().join("unknown-primary-click.mivkeys.json");
+        std::fs::write(&path, serde_json::to_string(&json).unwrap()).unwrap();
+        app.show_settings_restore = true;
+        app.settings_restore_state.tab = SettingsRestoreTab::OperationCustomize;
+        begin_file_import(&mut app, path);
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1200.0, 950.0))
+            .build_ui_state(
+                |root_ui, app| app.show_settings_restore_dialog(root_ui.ctx()),
+                app,
+            );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while harness
+            .state()
+            .settings_restore_state
+            .operation_task_rx
+            .is_some()
+        {
+            harness.run_steps(2);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "file import did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        harness.run();
+        let (is_error, message) = harness
+            .state()
+            .settings_restore_state
+            .operation_message
+            .as_ref()
+            .unwrap();
+        assert!(*is_error);
+        assert!(message.contains("ファイルを読み込めませんでした"));
+        assert!(message.contains("future_click_mode"));
+        assert!(harness.query_by_label(message).is_some());
+        assert!(
+            harness
+                .state()
+                .settings_restore_state
+                .operation_modal
+                .is_none()
+        );
+        assert!(before.settings_eq(
+            &crate::operation_customize_share::OperationCustomizeBundle::from_settings(
+                &harness.state().settings,
+            )
+        ));
+    }
+
+    #[test]
     fn operation_modal_size_is_clamped_to_the_viewport() {
         assert_eq!(
             operation_modal_size(egui::vec2(1_200.0, 900.0)),

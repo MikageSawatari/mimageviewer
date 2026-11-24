@@ -17,7 +17,7 @@ use crate::keymap::{
     TopMenuId, menu_command_can_be_hidden, menu_command_spec,
 };
 use crate::ring_shortcut::RingShortcutSettings;
-use crate::settings::Settings;
+use crate::settings::{FullscreenPrimaryClickMode, Settings};
 
 pub const OPERATION_CUSTOMIZE_FORMAT: &str = "mimageviewer.operation-customize";
 pub const OPERATION_CUSTOMIZE_FORMAT_VERSION: u32 = 1;
@@ -47,6 +47,8 @@ pub struct OperationCustomizeBundle {
     /// 利用者が触ってもいないのにゲームパッドが無効になる。
     #[serde(default = "default_gamepad_enabled")]
     pub gamepad_enabled: bool,
+    #[serde(default)]
+    pub fullscreen_primary_click: FullscreenPrimaryClickMode,
 }
 
 fn default_gamepad_enabled() -> bool {
@@ -66,6 +68,7 @@ impl OperationCustomizeBundle {
             menu_layout: settings.menu_layout.clone(),
             context_menu_layout: settings.context_menu_layout.clone(),
             gamepad_enabled: settings.gamepad_enabled,
+            fullscreen_primary_click: settings.fullscreen_primary_click,
         }
     }
 
@@ -81,6 +84,7 @@ impl OperationCustomizeBundle {
             menu_layout: MenuLayoutSettings::default(),
             context_menu_layout: ContextMenuLayoutSettings::default(),
             gamepad_enabled: default_gamepad_enabled(),
+            fullscreen_primary_click: FullscreenPrimaryClickMode::default(),
         }
     }
 
@@ -96,6 +100,21 @@ impl OperationCustomizeBundle {
         settings.menu_layout = self.menu_layout.clone();
         settings.context_menu_layout = self.context_menu_layout.clone();
         settings.gamepad_enabled = self.gamepad_enabled;
+        settings.fullscreen_primary_click = self.fullscreen_primary_click;
+    }
+
+    /// Compare all settings, excluding export metadata and normalization-only changes.
+    pub(crate) fn settings_eq(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.format.clone_from(&right.format);
+        left.format_version = right.format_version;
+        left.app_version.clone_from(&right.app_version);
+        left.exported_at.clone_from(&right.exported_at);
+        left.label.clone_from(&right.label);
+        left.ring_shortcuts.sanitize();
+        right.ring_shortcuts.sanitize();
+        left == right
     }
 }
 
@@ -703,6 +722,101 @@ mod tests {
         restored.apply_to(&mut applied);
         assert!(!applied.gamepad_enabled);
     }
+
+    #[test]
+    fn primary_click_mode_survives_a_bundle_round_trip() {
+        let mut settings = Settings::default();
+        settings.fullscreen_primary_click = FullscreenPrimaryClickMode::DoubleClickClose;
+        let bundle = OperationCustomizeBundle::from_settings(&settings);
+        let json = to_json(&bundle).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()["fullscreen_primary_click"],
+            "double_click_close"
+        );
+        let imported = parse_json(&json).unwrap();
+        assert_eq!(imported.bundle, bundle);
+        let mut applied = Settings::default();
+        imported.bundle.apply_to(&mut applied);
+        assert_eq!(
+            applied.fullscreen_primary_click,
+            settings.fullscreen_primary_click
+        );
+    }
+
+    #[test]
+    fn an_older_bundle_resets_primary_click_mode_to_page_turn() {
+        let mut json = serde_json::to_value(OperationCustomizeBundle::defaults()).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("fullscreen_primary_click");
+        let imported = parse_json(&serde_json::to_string(&json).unwrap()).unwrap();
+        let mut settings = Settings::default();
+        settings.fullscreen_primary_click = FullscreenPrimaryClickMode::DoubleClickClose;
+        imported.bundle.apply_to(&mut settings);
+        assert_eq!(
+            settings.fullscreen_primary_click,
+            FullscreenPrimaryClickMode::PageTurn
+        );
+        assert_eq!(
+            imported.bundle.format_version,
+            OPERATION_CUSTOMIZE_FORMAT_VERSION
+        );
+    }
+
+    #[test]
+    fn unknown_primary_click_mode_is_an_import_error() {
+        let mut json = serde_json::to_value(OperationCustomizeBundle::defaults()).unwrap();
+        json["fullscreen_primary_click"] = serde_json::json!("future_click_mode");
+        let error = parse_json(&serde_json::to_string(&json).unwrap()).unwrap_err();
+        assert!(matches!(&error, ImportError::Json(_)));
+        let message = error.to_string();
+        assert!(message.contains("JSON を読み取れませんでした"));
+        assert!(message.contains("future_click_mode"));
+    }
+
+    #[test]
+    fn bundle_settings_eq_ignores_metadata_and_ring_normalization() {
+        let original = OperationCustomizeBundle::defaults();
+        let mut other = original.clone();
+        other.format = "other".into();
+        other.format_version += 1;
+        other.app_version = "future".into();
+        other.exported_at = "other time".into();
+        other.label = Some("other label".into());
+        other.ring_shortcuts.gamepad_ring_enabled = false;
+        assert_ne!(original, other);
+        assert!(original.settings_eq(&other));
+        assert!(other.settings_eq(&original));
+    }
+
+    #[test]
+    fn bundle_settings_eq_compares_every_customization_group() {
+        let original = OperationCustomizeBundle::defaults();
+        let mut changed = original.clone();
+        changed.keymap.overrides = vec![binding("GridPin", &["Q"])];
+        assert!(!original.settings_eq(&changed));
+        changed = original.clone();
+        changed.ring_shortcuts.mouse_ring_help_visible =
+            !changed.ring_shortcuts.mouse_ring_help_visible;
+        assert!(!original.settings_eq(&changed));
+        changed = original.clone();
+        changed
+            .menu_layout
+            .hidden_commands
+            .push("SettingsOperationCustomize".into());
+        assert!(!original.settings_eq(&changed));
+        changed = original.clone();
+        changed
+            .context_menu_layout
+            .set_visible(ContextMenuItemId::CopyPath, false);
+        assert!(!original.settings_eq(&changed));
+        changed = original.clone();
+        changed.gamepad_enabled = false;
+        assert!(!original.settings_eq(&changed));
+        changed = original.clone();
+        changed.fullscreen_primary_click = FullscreenPrimaryClickMode::DoubleClickClose;
+        assert!(!original.settings_eq(&changed));
+    }
     use crate::keymap::{KeyBindingOverride, MenuCommandId};
     use crate::ring_shortcut::{RingActionId, ViewerShortRightClickAction};
 
@@ -999,6 +1113,7 @@ mod tests {
     #[test]
     fn applying_defaults_resets_all_operation_customization_fields() {
         let mut settings = Settings::default();
+        settings.fullscreen_primary_click = FullscreenPrimaryClickMode::DoubleClickClose;
         settings.keymap.overrides = vec![binding("GridPin", &["Q"])];
         settings.ring_shortcuts.mouse_ring_help_visible =
             !RingShortcutSettings::default().mouse_ring_help_visible;
@@ -1014,6 +1129,10 @@ mod tests {
         OperationCustomizeBundle::defaults().apply_to(&mut settings);
 
         assert_eq!(settings.keymap, KeymapSettings::default());
+        assert_eq!(
+            settings.fullscreen_primary_click,
+            FullscreenPrimaryClickMode::PageTurn
+        );
         assert_eq!(settings.ring_shortcuts, RingShortcutSettings::default());
         assert_eq!(settings.menu_layout, MenuLayoutSettings::default());
         assert_eq!(

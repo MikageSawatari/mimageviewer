@@ -2865,18 +2865,11 @@ impl App {
         let Some(state) = self.operation_customize_state.as_ref() else {
             return false;
         };
-        let mut edited_ring = state.settings.ring_shortcuts.clone();
-        edited_ring.sanitize();
-        edited_ring.video_normal_wheel_action = resolve_dialog_edited_value(
-            state.initial_video_normal_wheel_action,
-            edited_ring.video_normal_wheel_action,
-            self.settings.ring_shortcuts.video_normal_wheel_action,
+        let edited = self.operation_customize_edited_bundle(state);
+        let live = crate::operation_customize_share::OperationCustomizeBundle::from_settings(
+            &self.settings,
         );
-        // 編集した項目をここへ足し忘れると、変更が「未保存」と見なされず、
-        // 閉じるときの確認も出ないまま黙って捨てられる。
-        state.settings.keymap != self.settings.keymap
-            || edited_ring != self.settings.ring_shortcuts
-            || state.settings.gamepad_enabled != self.settings.gamepad_enabled
+        !edited.settings_eq(&live)
     }
 
     fn request_close_preferences_dialog(&mut self) {
@@ -4181,18 +4174,26 @@ impl App {
         }
     }
 
-    fn apply_operation_customize_state(&mut self, state: Box<PreferencesState>) {
+    fn operation_customize_edited_bundle(
+        &self,
+        state: &PreferencesState,
+    ) -> crate::operation_customize_share::OperationCustomizeBundle {
         let mut bundle = crate::operation_customize_share::OperationCustomizeBundle::from_settings(
-            &self.settings,
+            &state.settings,
         );
-        bundle.keymap = state.settings.keymap;
-        bundle.ring_shortcuts = state.settings.ring_shortcuts;
+        // Menu layouts belong to Preferences, not this dialog's draft.
+        bundle.menu_layout = self.settings.menu_layout.clone();
+        bundle.context_menu_layout = self.settings.context_menu_layout.clone();
         bundle.ring_shortcuts.video_normal_wheel_action = resolve_dialog_edited_value(
             state.initial_video_normal_wheel_action,
             bundle.ring_shortcuts.video_normal_wheel_action,
             self.settings.ring_shortcuts.video_normal_wheel_action,
         );
-        bundle.gamepad_enabled = state.settings.gamepad_enabled;
+        bundle
+    }
+
+    fn apply_operation_customize_state(&mut self, state: Box<PreferencesState>) {
+        let bundle = self.operation_customize_edited_bundle(&state);
         self.apply_operation_customize_bundle(bundle);
     }
 
@@ -7928,6 +7929,140 @@ mod tests {
 
         assert!(state.trt_worker_active);
         assert!(state.current_runtime_fallback_reason.is_none());
+    }
+
+    fn operation_customize_with_edited_primary_click()
+    -> egui_kittest::Harness<'static, crate::app::AppTestEnvForTest> {
+        use egui_kittest::kittest::Queryable;
+
+        let mut app = crate::app::setup_app_for_test();
+        app.settings.fullscreen_primary_click =
+            crate::settings::FullscreenPrimaryClickMode::PageTurn;
+        assert!(app.settings.save_checked());
+        app.show_operation_customize = true;
+        let mut harness = crate::test_ui::builder()
+            .with_context_setup(crate::ui_fonts::configure_fonts)
+            .with_size(egui::vec2(1200.0, 950.0))
+            .build_ui_state(
+                |root_ui, app| app.show_operation_customize_dialog(root_ui.ctx()),
+                app,
+            );
+        harness.run();
+        harness.get_by_label("設定").click();
+        harness.run();
+        harness.get_by_label("マウスボタン").click();
+        harness.run();
+        harness
+            .get_by_label("クリックでは送らず、ダブルクリックで閉じる")
+            .click();
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .operation_customize_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .fullscreen_primary_click,
+            crate::settings::FullscreenPrimaryClickMode::DoubleClickClose
+        );
+        assert_eq!(
+            harness.state().settings.fullscreen_primary_click,
+            crate::settings::FullscreenPrimaryClickMode::PageTurn,
+            "ラジオを選んだだけでは未適用"
+        );
+        harness
+    }
+
+    #[test]
+    fn operation_customize_primary_click_radio_ok_persists_to_settings_db() {
+        use crate::settings::FullscreenPrimaryClickMode;
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = operation_customize_with_edited_primary_click();
+        harness.get_by_label("  OK  ").click();
+        harness.run();
+        assert!(!harness.state().show_operation_customize);
+        assert!(harness.state().operation_customize_state.is_none());
+        assert_eq!(
+            harness.state().settings.fullscreen_primary_click,
+            FullscreenPrimaryClickMode::DoubleClickClose
+        );
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().fullscreen_primary_click,
+            FullscreenPrimaryClickMode::DoubleClickClose
+        );
+
+        harness.state_mut().show_operation_customize = true;
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .operation_customize_state
+                .as_ref()
+                .unwrap()
+                .settings
+                .fullscreen_primary_click,
+            FullscreenPrimaryClickMode::DoubleClickClose
+        );
+        assert!(
+            !harness
+                .state()
+                .operation_customize_dialog_has_unsaved_changes()
+        );
+    }
+
+    #[test]
+    fn operation_customize_primary_click_radio_cancel_prompts_before_discard() {
+        use crate::settings::FullscreenPrimaryClickMode;
+        use egui_kittest::kittest::Queryable;
+
+        let mut harness = operation_customize_with_edited_primary_click();
+        harness.get_by_label("キャンセル").click();
+        harness.run();
+        assert!(harness.state().show_operation_customize);
+        assert!(harness.state().show_operation_customize_discard_confirm);
+        assert!(
+            harness
+                .query_by_label("操作カスタマイズの変更を破棄しますか？")
+                .is_some()
+        );
+        harness.get_by_label("破棄して閉じる").click();
+        harness.run();
+        assert!(!harness.state().show_operation_customize);
+        assert!(harness.state().operation_customize_state.is_none());
+        assert_eq!(
+            harness.state().settings.fullscreen_primary_click,
+            FullscreenPrimaryClickMode::PageTurn
+        );
+        let db = crate::settings_db::SettingsDb::open(harness.state().tmp.path()).unwrap();
+        assert_eq!(
+            db.load_into_settings().unwrap().fullscreen_primary_click,
+            FullscreenPrimaryClickMode::PageTurn
+        );
+    }
+
+    #[test]
+    fn operation_customize_edited_bundle_preserves_live_menu_layouts() {
+        let mut app = crate::app::setup_app_for_test();
+        let state = preferences_state_for_test(&app.settings);
+        app.settings
+            .menu_layout
+            .hidden_commands
+            .push("SettingsOperationCustomize".into());
+        app.settings.context_menu_layout.set_visible(
+            crate::context_menu_model::ContextMenuItemId::CopyPath,
+            false,
+        );
+        let menu_layout = app.settings.menu_layout.clone();
+        let context_menu_layout = app.settings.context_menu_layout.clone();
+        app.operation_customize_state = Some(Box::new(state));
+        assert!(!app.operation_customize_dialog_has_unsaved_changes());
+        let state = app.operation_customize_state.take().unwrap();
+        app.apply_operation_customize_state(state);
+        assert_eq!(app.settings.menu_layout, menu_layout);
+        assert_eq!(app.settings.context_menu_layout, context_menu_layout);
     }
 
     /// 操作カスタマイズで切った設定が、OK で本体へ届く。
