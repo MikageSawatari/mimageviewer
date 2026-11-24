@@ -2,7 +2,8 @@
 
 最終更新: 2026-11-24
 
-状態: 設計第1版 (未レビュー)。実装はまだしない。収録版は未定。
+状態: 設計第2版。第1版 (`7aa5c6918`) は独立設計レビュー 1 回目 (Sol / xhigh) で REVISE (P2 4 件・P3 1 件)。
+第2版はその指摘を反映したもので、まだレビューを受けていない (§9)。実装はまだしない。収録版は未定。
 正本のバックログは [next-release-backlog.md](next-release-backlog.md) §1.883。
 
 ## 1. 目的と範囲
@@ -99,8 +100,11 @@
   「未取得 / 取得中 / 数えた / 失敗」の 4 つに増え、段階取得の Ready が範囲ごとである (詳細列では Ready でも
   「…」を出している) ことと組み合わさる。出さなければ「数が分かっている / いない」の 2 つで済む。**採用。**
 - **数え終わったら並びは動かさない**。バッジは表示だけで、並び順に関わらない (並べ替えは段 2)。
-- **ページ数専用の新しい失効の仕組みを作らない**。記録の失効は既存の (mtime・size・fingerprint) の一致判定、
-  メモリの失効は既存の一覧世代と PDF パスワードの revision (`details_page_count_meta_satisfies_idx`) のまま。
+- **記録 (catalog) の失効は既存のまま** (mtime・size・fingerprint の一致判定)。**メモリの値には、記録と同じ
+  identity を持たせる** (§4.3.1)。今のメモリは元ファイルの mtime / size と PDF パスワードの revision だけで照合して
+  おり、判定設定の変更や EPUB の変換の後も古い値を使い続ける (レビュー 1 回目 P2-1。詳細表示のページ数列にも
+  ある以前からの問題)。失効は「記録した identity と今の identity の比較」だけで表し、表示中・park 中の
+  context ごとに値を消して回る処理は作らない。
 - **設定の切り替えは既存の要件の作り直し (`invalidate_details_meta_requirements`) に乗せる**。表示中の一覧を
   作り直さない。OFF にしたら描画しないだけで、メモリの値は捨てない。
 - まれな失敗 (catalog が開けない・書けない、数える途中の I/O エラー) は既定の割り切り: 既存どおり、記録を
@@ -128,19 +132,25 @@
 
 | 種類 | 初回の I/O | 備考 |
 | --- | --- | --- |
-| ZIP | ファイル末尾の中央ディレクトリを読む。ファイル数に比例 | サムネイルが記録済みのフォルダでは、ページ数のために初めて ZIP を開くことになる |
+| ZIP | 末尾の中央ディレクトリを読む (ファイル数に比例)。**中に ZIP がある合本は、内側の ZIP を全部読み出して展開し、再帰で数える** (`zip_loader.rs` の `enumerate_recursive_with_limits`。展開したバイト列は `NESTED_CACHE` に入る) | サムネイルが記録済みのフォルダでは、ページ数のために初めて ZIP を開くことになる。入れ子の合本は 1 冊で書庫の大部分を読む |
 | 画像フォルダ | 直下の read_dir 1 回 | 本でない普通のフォルダも 1 回数えて `NULL` を記録する。ネットワーク共有では 1 回ごとの往復が重い |
 | RAR/CBR | header の走査。表示の種類を絞っているときは一覧も | ZIP より重い (書庫全体の header を読む) |
 | PDF | 多くは `pdf_meta` が既にある (サムネイル作成で書かれる)。無ければ PDFium ワーカーで列挙 | ワーカーは別プロセス |
-| EPUB | 変換済みのキャッシュがあれば PDF と同じ。変換はしない (実装時に `resolve_epub_at` が変換を始めないことを確かめる) | 未変換ならバッジなし |
+| EPUB | 変換済みのキャッシュがあれば PDF と同じ。変換は始めない (レビュー 1 回目で確認)。ただし変換キャッシュの解決 (`resolve_epub_at`) は、記録の有無に関わらず元ファイルの stat と変換キャッシュ DB の読み書きをする | 未変換ならバッジなし。変換後に出る (§4.3.1) |
 | ZIP 内の書庫 | なし | |
 
 - 範囲は可視 + 先読み範囲だけで、scroll ごとに idle gate の後で次の範囲を取る。1 画面に本が数十冊なら、
-  初回は数十回の小さな読み取り。
+  初回は数十回の読み取り。入れ子の合本・大きな RAR が混ざると、1 冊ごとの読み取りが大きくなる。
+- 記録がある 2 回目以降は catalog の 1 行の SELECT で済む (EPUB だけは上の変換キャッシュの解決が加わる)。
+- 同じ費用は、既定で ON の詳細表示のページ数列 (`details_show_page_count`) が、詳細表示の可視範囲で既に
+  払っている。サムネイル表示でも同じ費用を払うようになる、というのが段 1 の変化。
 - **既定 ON なので、利用者がバッジを使わなくても初回のこの I/O が増える**。サムネイル生成の I/O とは別の
   worker・別の semaphore で並ぶ (サムネイル側は `GlobalIoSemaphore` を使わない) ので、HDD・ネットワーク
   共有ではディスク上で取り合う。長さのバッジが既定 ON で動画に対してしている (FFmpeg probe) のと同じ形で、
-  費用は probe より軽い見立て。優先度は既存の可視 Normal / 先読み Low のまま変えない。→ §7 の問 1。
+  優先度は変えない。なお今のサムネイル表示の段階取得では、先読み範囲を含む `keep_set_sorted()` 全体を
+  `visible_near` として渡すので、範囲内はすべて Normal になる (`refresh_thumbnail_details_stage`、
+  `details_meta_target_for_idx_with_requirements`。レビュー 1 回目の指摘で訂正)。→ §7 の問 1。
+- 範囲が変わって段階取得を取り消したとき、数えている途中の本も止まるようにする (§4.4.1)。
 - 記録は既存のものなので、**この版を入れる前に詳細表示や選択情報で数えた本は、初回から記録で済む**。
 
 ### 4.3 記録と無効化
@@ -153,6 +163,29 @@
   - PDF: mtime か size が変わる。パスワードの保存・削除はメモリ側で revision が変わり数え直す。
   - EPUB: 変換世代が変わる。
 - catalog の削除・作り直し (キャッシュ管理) で記録が消えた場合は、次に見たときに数え直す。
+
+#### 4.3.1 メモリの値の identity (レビュー 1 回目 P2-1)
+
+`DetailsLazyMeta` のページ数に、数えたときの identity を足す。照合は `details_page_count_meta_satisfies_idx` の
+1 か所で行う (PDF パスワードの revision と同じ形)。
+
+- **判定設定の fingerprint**: ページ数を数えた job の `DetailsPageCountConfig.fingerprint` を、結果と一緒に
+  `page_count_fingerprint` として記録する。今の fingerprint と違えば満たしていない扱いにして数え直す
+  (記録は fingerprint で引くので、設定を戻せば記録で済む)。
+  - 今の fingerprint は **1 フレームに 1 回だけ**計算して App に置く (計算するのは details-meta の poll の先頭の
+    1 か所。`image_page_recognition_fingerprint` は拡張子の列を hash するだけで I/O をしない)。セルごとに
+    計算しない。設定の変更点を全部追いかけて更新する形にはしない (書き手を 1 つにする)。
+  - 走っている job の fingerprint が今の値と違えば、その job を取り消して要件を作り直す
+    (`invalidate_details_meta_requirements`)。古い設定で数えた結果は identity が合わないので採用しても使われない。
+- **EPUB の変換の revision**: App 全体に EPUB の論理パスごとの revision (`pdf_passwords.credential_revision` と
+  同じ形の小さな map) を置き、**変換キャッシュを公開した時点と、変換キャッシュを消した時点**で上げる。
+  EPUB の結果には数えたときの revision を記録し、違えば数え直す。未変換で数えられなかった EPUB も、
+  変換を公開すれば revision が変わるので数え直される。revision を上げる箇所は実装時に列挙して検証台帳に
+  残す (起点は `ui_dialogs/epub_convert.rs` の `finish_epub_convert` 系と、変換キャッシュの管理画面の削除)。
+- revision と fingerprint は App 全体の値で、各 viewer context のメモリは自分の値と比べるだけなので、park 中の
+  context も次に表示したときに古い値を使わない。context ごとに値を消して回らない。
+- 詳細表示のページ数列・選択情報も同じ照合を通るので、以前からの同じ問題もあわせて直る。永続データは変わらない
+  (メモリの構造だけ)。
 
 ### 4.4 段階取得への組み込み
 
@@ -187,6 +220,21 @@ fn thumbnail_page_count_enabled(&self) -> bool {
   ページ数の要件は自動で入る。
 - 設定の変更: `preferences.rs` の `thumbnail_media_requirements_changed` に `thumb_show_page_count` の差を足す
   (要件を作り直す既存の経路)。名前も `thumbnail_badge_requirements_changed` 等へ揃える。
+#### 4.4.1 取消の伝達 (レビュー 1 回目 P2-4)
+
+範囲が変わると段階取得は古い job を取り消して次を始める (`refresh_thumbnail_details_stage`)。今のページ数の
+取得は、ZIP と PDF には cancel を渡しているが、RAR は内部で常に false の token を作る
+`inspect_for_direct_read` を呼び、画像フォルダの `image_folder_page_count` は cancel を受け取らない
+(`rar_loader.rs`、`folder_scan.rs`)。既定 ON にすると、scroll で不要になった長い走査が続いて次の範囲と取り合う。
+
+- RAR は既存の `inspect_for_direct_read_cancelable` に job の cancel を渡す。
+- 画像フォルダは `image_folder_page_count` に cancel を渡し、`read_dir` の項目ごとに見る
+  (取り消したら記録せず `DetailsPageCountError::Cancelled` で返す。ZIP の取消と同じ扱い)。
+- 取り消した本は記録もメモリの checked も立てない。再試行の仕組みは足さない。次にその本が範囲に入ったときに
+  通常どおり数える。
+
+#### 4.4.2 detached viewer
+
 - detached viewer: `details_lazy_meta` と段階取得の状態は既に viewer context ごとの bundle に入っている
   (`viewer_context_registry.rs`)。新しい swap field は無い。設定は全体の 1 つ。detached 述語・viewport 経路には
   触れない見込み。触れた場合は CLAUDE.md の合意手続に従う。
@@ -236,13 +284,22 @@ fn thumbnail_page_count_enabled(&self) -> bool {
 
 ### 4.9 UI スレッドと perf
 
-- UI スレッドが新しく行うのは、メモリの `details_lazy_meta` を引いて文字列にすることだけ
+- 描画で UI スレッドが新しく行うのは、メモリの `details_lazy_meta` を引いて文字列にすることだけ
   (`thumbnail_page_count_text(idx)`、`thumbnail_media_duration_text` と同じ形)。I/O・DB・read_dir はしない。
-  [ui-responsiveness.md](ui-responsiveness.md) §4 のチェックリストに沿い、target の構築は既存の 1 frame 予算の
-  Planning を通る。
+  [ui-responsiveness.md](ui-responsiveness.md) §4 のチェックリストに沿い、target の構築は既存の Planning を通る。
+- target の構築では、ZIP 内の書庫 (`ZipDir`) だけ UI スレッドでメモリ上の計算がある (レビュー 1 回目 P2-3):
+  `warm_page_count` は `ZipTree::page_count_for_prefix_str` で部分木の画像数を再帰で足す (`zip_tree.rs` の
+  `total_image_count`)。I/O は無く、各ノードの画像は `Vec` の長さで数えるので、費用は部分木の**ディレクトリ数**に
+  比例する。サムネイルの段階取得の Explicit plan は範囲内を同じフレームで処理するが、
+  - 1 つの一覧に並ぶ `ZipDir` は同じ親の兄弟で部分木が重ならないので、1 回の段階取得の合計は外側 ZIP の
+    ディレクトリ数以下、
+  - 数えた値はメモリに残り、満たしている間は target を作らないので、フレームごと・scroll ごとには繰り返さない。
+
+  よって新しい予算や事前集計は足さない。既存の `details_meta/target_scan_slice` の ms で確かめる。
+  ディレクトリが数万ある書庫で問題が出たら、`ZipTree` を作るときに部分木の画像数を持たせる案に替える。
 - 計装: 既存の `details_meta/load_done` に、ページ数の件数を足す
-  (`page_targets`・`page_cache_hits`・`page_counted` を種類別 (zip / folder / rar / pdf / epub)・`page_failed`・
-  `page_ms`)。1 冊に 200 ms 以上かかったものは `details_meta/page_count_slow` (種類・ms・cache の有無) を
+  (`page_targets`・`page_cache_hits`・`page_counted` を種類別 (zip / zip_nested / folder / rar / pdf / epub)・
+  `page_failed`・`page_cancelled`・`page_ms`)。1 冊に 200 ms 以上かかったものは `details_meta/page_count_slow` (種類・ms・cache の有無) を
   出す (`ai_item_slow` と同じ形)。初回と 2 回目の差、ネットワーク共有での 1 冊の時間を perf ログで読めるようにする。
 - ui-responsiveness.md に §1.883 の節を足す (要約: 可視範囲だけを既存 worker で数え、記録は既存 catalog)。
 
@@ -317,18 +374,34 @@ fn thumbnail_page_count_enabled(&self) -> bool {
 - 配置 (`thumb_overlay_layout.rs` の単体テスト): ページ数単独、一致数ありで上へずれる、読書位置のメーターの
   帯の上、狭いセルで出ない、ほかのバッジを動かさない。UI スナップショットを 1 枚足す
   ([ui-snapshot-policy.md](ui-snapshot-policy.md))。
-- 要件 (App の状態テスト): ページ数だけ ON で本を数え動画を probe しない、長さだけ ON で本を数えない、
-  両方 OFF で段階取得を回さない (今と同じ)、可視 + 先読み範囲の外は数えない、AI facet・長さ facet の全体取得中も
-  表示集合の外の本を数えない、設定の切り替えで要件を作り直す。
+- 要件 (App の状態テスト): ページ数だけ ON (長さ・再生位置メーターは OFF) で本を数え動画を probe しない、
+  長さだけ ON で本を数えない、ページ数・長さ・再生位置メーターを全部 OFF にし選択情報・facet の要求も無いときに
+  段階取得を回さない (今と同じ)。再生位置メーターだけ ON・選択情報だけ・AI facet / 長さ facet の全体取得だけ、の
+  ときは今の取得を保ち、本を数えない (レビュー 1 回目 P3)。可視 + 先読み範囲の外は数えない、AI facet・長さ
+  facet の全体取得中も表示集合の外の本を数えない、設定の切り替えで要件を作り直す。
+- identity (§4.3.1): 判定設定を変えると数え直し、戻すと記録で済む。走っている job の fingerprint が変わると取り消す。
+  未変換の EPUB が変換の公開後に数え直される、変換キャッシュを消すと数え直す。park 中の context を表示し直したとき
+  古い値を使わない。PDF パスワードの revision の既存テストを保つ。
+- 取消 (§4.4.1): RAR とフォルダの走査が job の cancel で止まり、記録も checked も立てない。
 - 値: `page_count = None`・0・失敗でバッジなし、PDF のパスワードの revision、`ZipDir` は `ZipTree` の値、
   ドライブ一覧でバッジなし。
 - 設定: 既定 true、旧設定に field が無いと true、false の往復、settings_transfer、件数のテスト。
 - 関連する既存テスト: `duration_762` の visible_stages、`media_resume_meter_tests`、metadata_ops の
   `details_page_count_*`。
-- perf: `details_meta/load_done` の新しい件数の出力。
+- perf: `details_meta/load_done` の新しい件数の出力。実機の perf ログで、冷たいキャッシュ・入れ子の合本・
+  scroll による取消のときの件数と ms を見る。
 - 実機確認 (利用者): ZIP・PDF・EPUB・画像フォルダ・RAR・ZIP 内の書庫が混ざるフォルダで、初回にバッジが
   順に出ること、2 回目はすぐ出ること、評価の絞り込み中の一致数との並び、読書位置のメーターとの並び、設定の OFF。
 
 ## 9. 独立レビュー
 
-まだ受けていない。
+- 1 回目 (Sol / xhigh、read-only、第1版 `7aa5c6918`): **REVISE**。
+  - P2-1 メモリのページ数が判定設定の変更・EPUB の変換の後も古いまま → §4.3.1 で identity を追加。
+  - P2-2 ZIP の初回費用 (入れ子の合本) と優先度 (範囲内はすべて Normal) の記述が不正確 → §4.2 を訂正、計測に追加。
+  - P2-3 `ZipDir` の `warm_page_count` は UI スレッドで部分木を再帰集計する → §4.9 に費用の上限の根拠を追加。
+  - P2-4 RAR とフォルダの走査に cancel が届かない → §4.4.1 を追加。
+  - P3 OFF 条件の試験の前提 (再生位置メーターも既定 ON) → §8 を修正。
+  - 述語の分け方と置き換える箇所の範囲、`allow_page_count` / `whole_listing_only` の制限、配置の優先順位、
+    detached の bundle に新しい field が要らないこと、Remote に変更が要らないこと、並べ替えを別項目にすることは
+    妥当とされた。
+- 2 回目: 未実施。
