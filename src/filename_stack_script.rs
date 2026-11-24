@@ -993,6 +993,14 @@ mod tests {
     }
 
     #[test]
+    fn default_script_has_no_carriage_returns() {
+        assert!(
+            !DEFAULT_SCRIPT.contains('\r'),
+            "DEFAULT_SCRIPT must use LF; check .gitattributes for assets/stack_rules.default.rhai text eol=lf"
+        );
+    }
+
+    #[test]
     fn default_script_compiles_and_runs_empty() {
         let r = group_keys(&[], DEFAULT_SCRIPT).expect("empty ok");
         assert!(r.keys.is_empty());
