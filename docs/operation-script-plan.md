@@ -1,8 +1,10 @@
 # 操作のスクリプト 設計計画 (§1.363)
 
-ステータス: **設計 r5 (2026-11-23、設計担当 = ClaudeCode Opus 5.5)。利用者の判断 (§12) を反映済み。
-独立レビュー (Sol xhigh) は r1〜r4 の REVISE を経て r5 で ACCEPT (§13)。未実装。**
-収録版は未定 (v5.6.0 には入れない。少し先の版を目指す、利用者 2026-11-23)。
+ステータス: **設計 r6 (2026-11-24、設計担当 = ClaudeCode Opus 5.5)。利用者の判断 (§12) を反映済み。
+独立レビュー (Sol xhigh) は r1〜r4 の REVISE を経て r5 で ACCEPT (§13)。実装の着手にあたり、今の master
+(`16590597e`) のコードで前提を確かめ直し、入口と結果の受け渡し・右クリック・別ウィンドウとの関係を直した (r6、§14)。
+r6 の独立レビュー前、未実装。** 実装ブランチは `script-363-impl`。
+収録版は v5.7.0 の次の版 (利用者 2026-11-24、統括経由)。
 要望の経緯は [backlog-on-hold.md](backlog-on-hold.md) の §1.363。
 
 本書の事実はすべてコードと文書の参照による。製品バイナリは起動しておらず、実行時の挙動の観測は無い。
@@ -55,7 +57,9 @@ mIV の外の状態の読み取り。スクリプトにできるのは「状態�
   (`LanguageCorePackage`、`packages/lang_core.rs:137`・`158`、レビュー r2 P1-1) がある。また `print` / `debug`
   (`BasicStringPackage` が登録、`packages/string_basic.rs:30`・`112`・`124`) は、エンジンの既定の callback で
   標準出力へ書く (Rhai 1.27.0 `engine.rs:322`、レビュー r1 P2-10・r3 P3-5)**。`sleep` は操作数の上限では止まらない。
-  本機能のエンジンは標準のパッケージを丸ごと使わない (§6)。スタック用の同じ点は別件として統括へ報告した。
+  本機能のエンジンは標準のパッケージを丸ごと使わない (§6)。スタック用の同じ点は別件 §1.863 として
+  master で直された (`c938e318f`: `sleep` と空文字列の `pad` を拒否し、`print` / `debug` をログへ送る)。
+  スタック用のエンジンの作り方は本機能では変えない。
 - 正規表現の補助 (`regex_*`) は、共有のキャッシュの mutex を持ったままコンパイルする (`filename_stack_script.rs:138`)。
   本機能では使わない (§7)。
 - 契約は「入力 → 出力の純関数」。スクリプトは結果を返すだけで、適用の判断は Rust 側が持つ。
@@ -76,17 +80,59 @@ mIV の外の状態の読み取り。スクリプトにできるのは「状態�
   `Keymap::matches_vk_action` で実キーを照合し直す (例: `VideoCapture` は `native_video.rs:13358`)。
   `matches_vk_action` は実キーと実効割り当ての比較 (`keymap.rs:9329`)。native へ転送する操作は列挙式
   (`native_video_shortcut_action`、`keymap.rs:7760`) で、Global 全体ではない。
-- 画面をまたぐ操作の前例 `ToggleAlwaysOnTop` は、一覧 (`update_phases.rs:927`)・画像の全画面
-  (`ui_fullscreen.rs:35847`)・native 動画 (`native_video.rs:13026`) で、それぞれ明示的に処理している。
-  `GlobalLocalSearch` の消費は main 側のショートカット処理 (`update_phases.rs:964`) だけ。
+- 画面をまたぐ操作の前例 `ToggleAlwaysOnTop` は、一覧 (`input_main_grid_shortcuts`、`update_phases.rs:928`)・
+  画像の全画面 (`handle_fs_key_input_with_operation`、`ui_fullscreen.rs:36063`)・native 動画 (前半の解決
+  `native_video.rs:12701`、実行 `13026`) で、それぞれ明示的に処理している。
+  `GlobalLocalSearch` の消費は main 側のショートカット処理 (`update_phases.rs:967`) だけ。
+- **egui で描く動画・音楽の表示のキーは、画像の全画面のキー処理の中で処理される**。`handle_video_input`
+  (`ui_fullscreen.rs:60437`) の呼び出し元は `handle_fs_key_input_with_operation` の中 (`36459`) だけで、
+  音楽の表示のキーも同じ関数の中 (`36463` 以降)。結果も同じ `FsKeyAction`。独立した入口ではない (r6)。
+- 画像の全画面のキー処理 `handle_fs_key_input_with_operation` は 3 か所から呼ばれる: `render_fs_body` の
+  ROOT から転送されたキー (`ui_fullscreen.rs:28888`)、通常のキー (`29377`)、`render_fs_body` の外の ROOT 側の
+  予備経路 `handle_fullscreen_root_key_input` (`34844`、呼び出しは `update_phases.rs:2403`)。予備経路は
+  返った `FsKeyAction` を、`render_fs_body` の後処理と同じ移動の dispatcher
+  `handle_fs_navigation_with_list_order_operation` へ渡し、`Rebased` では番号を取り直すだけで描画の準備は
+  次の描画に任せる (`ui_fullscreen.rs:34926`〜`34975`)。ページ一覧の中のキーは別の処理 (`29134`) で、
+  許可された操作の表 `FS_PAGE_OVERVIEW_ACTION_PRIORITY` (`keymap.rs:7717`) だけを受ける。
   Global 文脈に足せば各画面から自動的に問い合わせられる、という仕組みは無い (レビュー r1 P2-5)。
 - キー以外の入口: リング・マウスジェスチャー・マウスの戻る/進む/中ボタン・パッド X リングは
-  `RingActionId` (196 個、`src/ring_shortcut.rs:537`) を `App::apply_ring_action`
-  (`src/app/gamepad_input.rs:8423`) で実行する。一部は対応する `KeyAction` の実行関数
+  `RingActionId` (`src/ring_shortcut.rs:537`) を `App::apply_ring_action`
+  (`src/app/gamepad_input.rs:8458`) で実行する。一部は対応する `KeyAction` の実行関数
   (`execute_copy_key_action`、`apply_saved_group_key_action`、`apply_pinned_tag_key_action` など) を呼ぶ。
-  対応表は [ring-keyaction-parity.md](ring-keyaction-parity.md)。
-- `test-script` feature 限定の注入口 `test_script::consume_pending_action` (`keymap.rs:8815`) は、所有者・viewport・
-  pass の照合と配送待ちを持つ (`test_script.rs:3811`・`4919`)。本機能はこれを使わない (§5.2)。
+  対応表は [ring-keyaction-parity.md](ring-keyaction-parity.md)。呼び出し元は、リングとジェスチャー
+  (`execute_right_drag_command`、`gamepad_input.rs:3889`・`3917`。ジェスチャーは押下のフレームで実行せず、
+  命令として持ち越して所有 context で実行する、`app.rs:70287`)、パッド X リング (`7948`)、マウスボタン
+  (`dispatch_mouse_button`、`8127`)。native 動画の窓の XButton (`WM_XBUTTON`、`native_video.rs:16123`) も
+  `dispatch_mouse_button` へ入る (ダブルクリックは 2 回分実行される、同ファイルのテスト `271`〜`296`)。
+- **`apply_ring_action` が呼び出し元へ返すのは `Option<AddressBarNav>` だけ** (`gamepad_input.rs:8464`)。
+  画像の全画面のページの移動・閉じる操作は、リングの側でその場で実行し終える (例:
+  `handle_fullscreen_boundary_jump`、`8832`、`apply_ring_close_fullscreen`)。`FsKeyAction` を受ける呼び出し元は
+  無い。egui の全画面のマウスの戻る/進むは、キー処理の中から `apply_mouse_back_forward_button` を呼び、
+  `FsKeyAction` の `mouse_nav` として返す (`ui_fullscreen.rs:38455`)。
+- **native 動画のキーの処理は、操作をその場で実行し終える** (例: 次のファイル `navigate_native_video_fullscreen`、
+  `native_video.rs:13208`、閉じる `handle_fullscreen_close_request_immediate`、`12944`)。返す
+  `NativeVideoKeyOutcome` (`native_video.rs:1108`) はログの分類で、呼び出し元の後処理は無い。
+- 右クリックメニューは 2 段: Win32 のネイティブメニュー (`try_show_native_grid_context_menu`、
+  `src/ui_dialogs/context_menu.rs:1257` → `dispatch_native_context_menu_result`、`1359`) を先に試し、出せない
+  ときだけ egui のメニュー。項目は `MenuCommand` (`context_menu_model.rs:863`) / `MenuNode` で表す。どちらの経路も
+  選んだ操作を実行してから idx を消す (一覧: egui `1223` → `1227`、native 後 `1183`。全画面: egui `2486` → `2490`、
+  native `1375` → `2439`)。一覧には本のしおりの別メニュー (`show_bookmark_grid_context_menu`、`996`) もある。
+- 割り当ての仕組みを持たない入力 (本機能の入口にしない): 全画面の左クリックのモード (§1.471、
+  `FullscreenPrimaryClickMode`、`settings.rs:3480`)、3D 写真の焦点のクリック (§1.874、`plan_depth_focus_click`、
+  `ui_fullscreen.rs:43302`)、右クリックの短押し (`ViewerShortRightClickAction`、`ring_shortcut.rs:182`)、
+  ホイール、タッチ (`TouchCommand`)、ツールバー、パッドのボタン、全画面の「…」パネル、メニューバー。
+  パッドの一部は native 動画へ VK を合成する (`dispatch_native_video_key`、`gamepad_input.rs:10226`) ので、
+  そのキーへスクリプト操作を割り当てるとパッドからも起動する (既存の仕様どおり。トリガーの ←→ は
+  repeat 付きで合成される、`5275`)。
+- **別ウィンドウ (detached) の viewer context を取り付けている間も、同じ関数が走る**。
+  `update_active_viewer_context` (`app.rs:70197`) の中で、パッド (`70227`)、持ち越したジェスチャー
+  (`70287`)、全画面の描画 `render_fullscreen_viewport` (`70347`、中で `render_fs_body`・全画面のキー処理・
+  `show_fs_context_menu`) が、別ウィンドウの context を取り付けた状態で実行される。今の context が
+  メインかの既存の述語は `projected_viewer_context_id() == viewer_context_main()`
+  (`viewer_context_registry.rs:5469`・`5460`。§1.733 の「この操作はメインウィンドウでのみ使用できます」の前例、
+  `saved_group_actions.rs:415`)。一覧のショートカット処理 (`app.rs:103457`) はメインの pass だけで走る。
+- `test-script` feature 限定の注入口 `test_script::consume_pending_action` (`test_script.rs:5010`) は、所有者・
+  viewport・pass の照合と配送待ちを持つ。本機能はこれを使わない (§5.2)。
 
 ### 1.3 状態の変化
 
@@ -127,9 +173,14 @@ mIV の外の状態の読み取り。スクリプトにできるのは「状態�
 ```
 入力 (キー / リング / ジェスチャー / マウスボタン / パッド / 右クリックメニュー)
   └ 「スクリプト操作 N」を受けた画面の処理
-        │  (自動繰り返しの押下はここで拒否)
+        │  (自動繰り返しの押下はここで拒否。メインウィンドウの context でなければ通知して拒否)
         ▼
-  App::run_script_slot(ctx, 画面, N, 入口) -> その画面のキー処理と同じ形の結果  ← 起動の受付は 1 つ
+  App::run_script_slot(ctx, 画面, N, 入口) -> ScriptRunResult (画面ごとの型)  ← 起動の受付は 1 つ
+        │
+        │  入口が結果を、その入口の既存の後処理へ渡す (§5.2):
+        │    キー処理の中 → キー処理の結果 (FsKeyAction / Option<AddressBarNav>) に入れて返す
+        │    リング・メニューなど → 全画面は ROOT 側の予備経路と同じ移動の dispatcher へ、
+        │                          一覧は apply_ring_action と同じ Option<AddressBarNav> へ
         │  状態の写し (§4.3) を作る → Rhai: スロットの関数 (s) → 操作の並び (+ 短い通知)
         │  並びを全部検査 (§5.3)。1 つでも外れたら何も実行しない
         ▼
@@ -179,56 +230,86 @@ mIV の外の状態の読み取り。スクリプトにできるのは「状態�
   スクリプトを呼び、画面ごとの違いはスクリプトが `s.context` で分ける。既定のキーは無し (`ChordList::EMPTY`)。
   `ini_name()` / `context()` / `trigger()` = Press / `default_chords()` / `ALL_ACTIONS` /
   `docs/keymap.ini.default` / `docs/keymap-spec.md` を揃える (CLAUDE.md のキー操作の規則)。
-- Global に足しても自動では問い合わせられない (§1.2) ので、**問い合わせる場所を明示的に足す**:
-  1. 一覧: main 側のショートカット処理 (`update_phases.rs` の `ToggleAlwaysOnTop` と同じ場所)
-  2. 画像の全画面: 全画面のキー処理 (`ui_fullscreen.rs` の `ToggleAlwaysOnTop` と同じ場所)
-  3. 動画・音声の全画面 (native): `native_video_shortcut_action` の転送に `ScriptSlot*` を足し、
-     `native_video.rs` のキー処理で `!key.repeat` のときだけ受ける
-  4. egui で描く動画・音楽の表示: Video の操作を処理している egui 側のキー処理
-  どこでも、受けたら `App::run_script_slot` を呼び、返った結果を、その場所のキー処理の結果として扱う
-  (画像の全画面なら `FsKeyAction`、一覧なら `Option<AddressBarNav>`、native 動画なら `NativeVideoKeyOutcome`。§5.2)。
+- Global に足しても自動では問い合わせられない (§1.2) ので、**問い合わせる場所を明示的に足す** (r6 で 3 か所に):
+  1. 一覧: `input_main_grid_shortcuts` (`update_phases.rs` の `ToggleAlwaysOnTop` と同じ場所)
+  2. 画像の全画面と egui で描く動画・音楽の表示: `handle_fs_key_input_with_operation` の
+     `ToggleAlwaysOnTop` と同じ場所。egui の動画・音楽の表示のキーはこの関数の中で処理される (§1.2) ので、
+     ここ 1 か所で覆う。この関数を呼ぶ 3 つの経路 (転送・通常・ROOT 側の予備) は、どれもここを通る
+  3. 動画・音声の全画面 (native): `native_video_shortcut_action` の転送に `ScriptSlot*` を足し
+     (native の窓が転送する和音は `install_global_native_video_shortcuts`、`keymap.rs:9381` で同じ関数から作られる)、
+     `native_video.rs` のキー処理の前半の解決 (`ToggleAlwaysOnTop` と同じ場所) で `!key.repeat` のときだけ受ける
+  受けたら `App::run_script_slot` を呼び、返った結果をその場所の既存の後処理へ渡す (§5.2)。
 - **自動繰り返しの押下では起動しない**。egui の経路は `consume_action_no_repeat`、native は `!key.repeat`。
   repeat の情報が入口で分かるうちに拒否し、`run_script_slot` へは渡さない。
 - native 動画のマウスの戻る/進む (VK `0xA6` / `0xA7`) は、今は repeat を拒否せずマウスの割り当てへ渡し、
-  `apply_ring_action` に着いた時点では repeat の情報が無い (`native_video.rs:13186`、レビュー r2 P2-7)。
+  `apply_ring_action` に着いた時点では repeat の情報が無い (`native_video.rs:13186`・`13195`、レビュー r2 P2-7)。
   この分岐で、割り当てが `ScriptSlot*` に解決される場合だけ、repeat の押下を拒否する。通常のナビゲーションの
-  割り当ての扱いは変えない。
+  割り当ての扱いは変えない。XButton の経路 (`WM_XBUTTON`、§1.2) は押下ごとに 1 回で repeat を持たない。
+  ダブルクリックが 2 回分になるのは既存の仕様で、スクリプトでも 2 回起動する (既知の制限に足す)。
+  押し続けの繰り返し (`tick_native_video_mouse_seek_holds`) は動画のシークの操作だけが対象で、`ScriptSlot*` には
+  働かない (`native_video.rs:16138`)。
 - `RingActionId::ScriptSlot1..20` を追加し、`saved_group_key_action` と同じ形で `KeyAction` へ対応付ける。
   リング・ジェスチャー・マウスの戻る/進む/中ボタン・パッド X リングは `apply_ring_action` から
   `run_script_slot` を呼ぶ。`ring-keyaction-parity.md` に行を足す。
 - 右クリックメニュー: 一覧・画像の全画面・動画の全画面のメニューに「スクリプト」サブメニュー
-  (名前の付いたスロットだけ並べる)。スロットが無ければ出さない。
-  **選んだら、選んだスロット番号をローカルに受け取り、まず起動元のメニューを閉じてから、同じフレームで
-  `run_script_slot` を呼ぶ** (レビュー r3 P2-3)。今のメニュー処理は、選んだ操作を実行してから
-  `fs_context_menu_idx` を消す (`context_menu.rs:2482`) が、`FsCapture` やコピーの操作は「メニューが開いていない」
-  ことを受付の条件にしている (`ui_fullscreen.rs:36884`)。その順のままだと、右クリックからのキャプチャ等が
-  拒否されるため。結果は、ほかの入口と同じく既存の描画・移動の後処理へ渡す。次のフレームへ持ち越す状態は作らない。
+  (名前の付いたスロットだけ並べる)。スロットが無ければ出さない。本のしおりの別メニューには出さない。
+  メニューは Win32 のネイティブと egui の 2 経路がある (§1.2) ので、**両方に** `MenuCommand` の 1 つの variant
+  (スロット番号を持つ) で足す。
+  **選んだら、選んだスロット番号をローカルに受け取り、まず起動元のメニューを閉じてから (idx を消してから)、
+  同じフレームで `run_script_slot` を呼ぶ** (レビュー r3 P2-3)。今のメニュー処理は、どちらの経路も選んだ操作を
+  実行してから idx を消す (§1.2) が、`FsCapture` やコピーのキーの受付は「メニューが開いていない」ことを条件にして
+  いる (`ui_fullscreen.rs:37104`・`37122`)。§5.2 の「受け付けられるか」の確かめはキーの受付と同じ条件なので、
+  その順のままだと右クリックからのキャプチャ等が拒否されるため。結果は、リングと同じ形で既存の後処理へ渡す
+  (§5.2)。次のフレームへ持ち越す状態は作らない。
 - 操作カスタマイズの表示名は「スクリプト操作 N」+ スクリプトが付けた名前 (§4.2 の `label`)。名前が無ければ番号だけ。
 - ツールバーには入れない (利用者決定 Q4)。
 
 既知の制限 (repeat とは別の問題): native 動画の窓のマウスの戻る/進む (Browser キー) は、別の受け取りによる
-重複が未解決とコードに書かれている (`native_window.rs:2534`)。この入口にスクリプト操作を割り当てると、
-1 回の押下で 2 回起動することがあり得る。キーで同じ入口にキャプチャ保存を割り当てた場合も同じで、
-スクリプト固有ではない。本機能では直さず、重複の正規化は入力側の別件として扱う (統括へ報告)。
+重複が未解決とコードに書かれている (`src/video/native_window.rs:2534`〜`2537`)。この入口にスクリプト操作を
+割り当てると、1 回の押下で 2 回起動することがあり得る。XButton のダブルクリックも 2 回起動する (上)。
+キーで同じ入口にキャプチャ保存を割り当てた場合も同じで、スクリプト固有ではない。本機能では直さず、重複の
+正規化は入力側の別件として扱う (統括へ報告済み)。
 設計書・マニュアルでは「押した回数を超えない」と書かず、「1 回の起動で 1 枚まで、押しっぱなしやイベントでは
 保存しない」と書く。
 
 ### 3.2 動く画面
 
 メインウィンドウの「一覧 (Grid)」「画像の全画面 (FsImage)」「動画・音声の全画面 (FsVideo、音楽の表示を含む)」だけ。
-次の状態ではスクリプト操作を受け付けない (押しても何もせず、短い通知):
+次の状態ではスクリプト操作を受け付けない:
 
 - 編集モード (消しゴム・隠蔽・切り取り・SNS 分割・テキスト注釈・補正レイヤー)、ページ一覧、
-  モーダルなダイアログが開いているとき、文字入力欄にフォーカスがあるとき
-- 別ウィンドウ (F12 / detached)。「この操作はメインウィンドウでのみ使用できます」(§1.733 と同じ文言)
+  モーダルなダイアログが開いているとき、文字入力欄にフォーカスがあるとき。**通知は出さず、ほかの使えない
+  キーと同じく問い合わせない** (r6 で簡素化)。ページ一覧のキーは許可された操作の表だけを受け
+  (`FS_PAGE_OVERVIEW_ACTION_PRIORITY`、リングも `gamepad_input.rs:8485`)、編集モードは全画面のキー処理の
+  専用の分岐へ先に渡る (`ui_fullscreen.rs:36063` の条件と `36089` 以降) ので、`ScriptSlot*` を足さなければ
+  そのまま届かない。新しい分岐を足さない
+- 別ウィンドウ (F12 / detached) の context を取り付けているとき。今の context がメインかを、§1.733 と同じ
+  既存の述語 `projected_viewer_context_id() == viewer_context_main()` で判断し、違えば
+  「この操作はメインウィンドウでのみ使用できます」(§1.733 と同じ文言) と通知して何もしない。判断は
+  `run_script_slot` の冒頭の 1 か所 (どの入口もここを通る)
 - mIV Remote が表示を取得している間 (Remote の入力はスクリプトを起動しない。取得中はイベントも検出しない)
 - スクリプトがまだ読み込み中・読み込みに失敗・`operation_script_enabled` が OFF (§4.1)
 
-detached viewer は構造リワーク中で、症状パッチの禁止と、共有 viewport 経路を構造的に変える場合の手順
-(双方のレビューで構造的修正であることへの合意、`detached-rework-plan.md` §11 への記録) がある
-(`detached-rework-plan.md:35`)。本機能は別ウィンドウを対象外とするが、それは手順を省く理由にはならない。
-実装で viewer context の判定や viewport 経路に触れる場合は、その手順に従う。設計の時点では、
-「メインウィンドウか」の判定に既存の述語を読むだけで、新しい分岐を足さない方針とする。
+#### 凍結の決まり (detached リワーク) との照合 (r6)
+
+入口の関数とイベントの検出点 (`render_fs_body`・全画面のキー処理・`apply_ring_action`・右クリックメニュー) は、
+別ウィンドウの context を取り付けている間も走る (§1.2)。したがって本機能は detached の経路に**触れる**。
+CLAUDE.md「Detached viewer リワーク中のルール」と `detached-rework-plan.md` §2 (憲法) に照らした結果:
+
+- 触れ方は「今の context がメインかを既存の述語で読み、メインでなければ実行・検出をしない」の 2 か所
+  (`run_script_slot` の冒頭と、イベントの検出の冒頭、§3.3) だけ。別ウィンドウの述語・viewport・窓の寿命・
+  placement・HWND の捕捉・context の取り付けと bundle の入れ替えは変えない。
+- 憲法 3 (App に detached 用の bool / Option を足さない): 本機能が App に足す状態 (読み込み結果の 1 つの値、
+  イベントの基準、検出を済ませたフレームの番号、直近の実行時刻) は detached 用ではなく、メインの context の
+  ためのもの。viewer context の bundle (`swap_field!`) には入れず、メインの context を取り付けているときだけ
+  読み書きする (別ウィンドウの context の値と混ざらない)。
+- 憲法 5 (時間窓で競合を吸収しない): 「1 秒に 10 回」の上限は競合の吸収ではなく、イベントの実行回数の保険
+  (§3.3)。判定は同じフレームの事実 (今の context・ROOT のフレームの番号) で行う。
+- 憲法 7 (ついでに直さない): native の Browser キーの重複 (上の既知の制限) は直さない。
+- これは症状パッチ (guard・delay・retry・追加の repaint・一括 reset・silent fallback) ではなく、
+  「メインウィンドウだけの機能」という所有の範囲を、§1.733 と同じ既存の述語で表す構造的な決定である。
+  独立設計レビュー (r6) でこの主張への合意を取り、`detached-rework-plan.md` §11 に記録する。実装の
+  独立レビューでも同じ合意を取る。
 
 ### 3.3 イベント (最初の版から、利用者決定 Q3)
 
@@ -265,15 +346,21 @@ detached viewer は構造リワーク中で、症状パッチの禁止と、共�
 
 - スクリプトの `fn on_event(s)` 1 つで受ける (無ければイベントは使わない)。`s.events` に、そのフレームで
   変わった種類の配列が入る (例: 全画面で次の本へ移ると `["open", "page"]`)。
+- **検出は、メインの context を取り付けている pass だけで行う** (r6)。§3.2 の述語でメインでなければ、比べも
+  基準の更新もしない。別ウィンドウの context を取り付けている間、`fullscreen_idx` などは別ウィンドウの値
+  (§1.2) なので、読むとメインの基準が壊れるため。
 - **検出と実行は、そのフレームで今の文脈を持つ画面の処理 (所有 pass) の、キー処理の前で行う** (レビュー r2 P2-4)。
   メインの update の位置では ROOT が今の viewport で、全画面の viewport は後の `show_viewport_immediate` の中で
   有効になる (`ui_fullscreen.rs:31067`)。egui の `viewport_id()` は今の viewport の stack から決まる
   (`vendor/egui/src/context.rs:752`) ので、`ctx` を取っておいて後で使うことはできない。そこで:
   - 一覧: ROOT の pass で、一覧のキー処理の前
-  - 画像の表示: 実際の描画処理 `render_fs_body` の、ROOT から転送されたキーの処理 (`ui_fullscreen.rs:28670`) と
-    通常のキーの処理 (`29159`) の**両方より前**の 1 か所 (レビュー r3 P2-1)。所有者は、ウィンドウ内の静止画表示
-    (ROOT に直接描く、`ui_fullscreen.rs:31053`) では ROOT、それ以外では全画面の子 viewport。転送されたキーで
-    起きた変化は、ほかの入口と同じく次のフレームで検出される
+  - 画像の表示と egui で描く動画・音楽の表示: 実際の描画処理 `render_fs_body` の、ROOT から転送されたキーの
+    処理 (`ui_fullscreen.rs:28888`)・ページ一覧の処理 (`29134`)・通常のキーの処理 (`29377`) の**どれよりも前**の
+    1 か所 (レビュー r3 P2-1)。所有者は、ウィンドウ内の静止画表示 (ROOT に直接描く) では ROOT、それ以外では
+    全画面の子 viewport。転送されたキーで起きた変化は、ほかの入口と同じく次のフレームで検出される。
+    ROOT 側の予備経路 (`handle_fullscreen_root_key_input`) は `render_fs_body` より前の ROOT の pass で
+    キーを処理するので、その変化は同じフレームの検出で出ることがある。キーからの変化はいつ検出されても
+    よい (下の「基準の更新」) ので、順序の保証は要らない
   - 動画・音声の全画面 (native): native の窓は egui の pass を持たないので、ROOT の pass で行う。操作できるかは
     既存の `NativeOverlayInputRouting` の snapshot で判断する (文字入力の所有は別の Context で判定されている、
     `native_video.rs:5865`)。動画の A の実行関数は VK を要らない形にする (§5.2)
@@ -456,12 +543,28 @@ Rust 側の表に「操作・種別・イベント可か・実行関数」を持
   照合は VK の処理に残し、実行は `KeyAction` を受ける関数にする。egui で描く動画・音楽の表示も同じ実行関数を呼ぶ。
   切り出しは表の操作の分だけ行い、表に無い操作は触らない。
 - **実行関数は、キーの処理が呼び出し元へ返しているのと同じ形の結果を返す** (レビュー r2 P1-2)。
-  文脈ごとに 1 つの型にまとめる。案:
-  - 画像の全画面: `FsKeyAction` (移動の要求と `FsKeyPageTransition`) に、「拒否した」「既存の遷移へ委ねた」
-    (本の構成の確認など、レビュー r2 P2-3) を区別できる形を足したもの
+  文脈ごとに 1 つの型にまとめ、`run_script_slot` は `ScriptRunResult` (文脈ごとの variant) を返す。案:
+  - 画像の全画面 (egui の動画・音楽の表示を含む): `FsKeyAction` (移動の要求と `FsKeyPageTransition`) に、
+    「拒否した」「既存の遷移へ委ねた」(本の構成の確認など、レビュー r2 P2-3) を区別できる形を足したもの
   - 一覧: `Option<AddressBarNav>` と「拒否した」
-  - native 動画: `NativeVideoKeyOutcome`
+  - native 動画: 後処理の要る結果は無い。native のキーの処理は操作をその場で実行し終える (§1.2) ので、
+    実行関数も同じく実行し終え、「実行した / 拒否した」だけを返す。`NativeVideoKeyOutcome` はログの分類として
+    キーの処理の側で付ける (r6 で訂正)
   型の細部は実装担当がキーの処理の既存の結果から決める。新しい永続の pending は作らない。
+- **入口ごとの結果の渡し先** (r6)。どの入口も、その入口が今使っている後処理へ渡すだけで、スクリプト用の
+  後処理は作らない:
+  - キー処理の中 (一覧・画像の全画面・native 動画): その場所のキー処理の結果に入れて返す。画像の全画面は、
+    呼ばれた経路 (転送・通常・ROOT 側の予備) の既存の後処理がそのまま扱う
+  - リング・ジェスチャー・マウスボタン・パッド X リング (`apply_ring_action` から) と右クリックメニュー:
+    - 一覧: `Option<AddressBarNav>` を `apply_ring_action` の戻り値として返す (今の型のまま)
+    - 画像の全画面: `FsKeyAction` を、ROOT 側の予備経路と同じ手順で処理する: `Closed` なら終わり、`Rebased`
+      なら番号を取り直し、移動の要求を `handle_fs_navigation_with_list_order_operation` へ渡す
+      (`ui_fullscreen.rs:34926`〜`34975` の手順を 1 つの関数に切り出し、予備経路とスクリプトの両方から呼ぶ。
+      描画の準備は次の描画に任せる点も予備経路と同じ)。`apply_ring_action` の戻り値は `None`
+    - native 動画: 実行し終えているので渡すものは無い
+  - egui の全画面のマウスの戻る/進む (`apply_mouse_back_forward_button`) はキー処理の中から呼ばれる
+    (§1.2) が、`FsKeyAction` へ入れるのは `mouse_nav` だけ。スクリプトの結果は上のリングと同じ手順で処理する
+    (キー処理の中から呼ばれても、`apply_ring_action` 経由の入口として扱う)
 - `run_script_slot` は、検査 (§5.3) を通った並びを、呼ばれたその場で順に実行する。
   - 各操作の前に、文脈が写しのときと同じか、その画面でその操作を今受け付けられるか (キーの処理が実行関数を
     呼ぶ前に見ている条件と同じもの) を確かめる。受け付けられなければ残りを捨てて
@@ -481,6 +584,11 @@ Rust 側の表に「操作・種別・イベント可か・実行関数」を持
 採らなかった代案:
 
 - キーの入口へ注入して 1 フレームに 1 つずつ流す (r1 の案)。§2.1 の理由で取りやめた。
+- リング・メニューからの起動を、次のフレームのキー処理まで持ち越して `FsKeyAction` で返す (r6 で検討)。
+  持ち越しの状態ができ、その間の入力・context の切り替えとの組み合わせが増える。ROOT 側の予備経路が既に
+  `render_fs_body` の外で `FsKeyAction` を処理しているので、その手順の共用で足りる。
+- `apply_ring_action` の戻り値の型を `FsKeyAction` も返せる形に変える (r6 で検討)。呼び出し元 4 か所の
+  型と後処理を全部変えることになり、リングの既存の操作の扱いまで変わる。
 - `apply_ring_action` のように、スクリプト専用の実行関数を操作ごとに書く。キーの処理との二重の綴りになり、
   ずれたとき気付けない ([ring-keyaction-parity.md](ring-keyaction-parity.md) の経緯と同じ問題)。
 
@@ -622,7 +730,11 @@ Rust 側の表に「操作・種別・イベント可か・実行関数」を持
 - 入口の repeat: native のマウスの戻る/進むで `ScriptSlot*` に解決される repeat の押下を拒否する。
 - 共用の実行関数: 表の各操作で、キーの処理とスクリプトが同じ実行関数を呼ぶことの handler-level テスト
   (egui の経路・native 動画の経路・egui の動画/音楽の表示)。
-- 入口: 4 つの問い合わせ場所・リング・右クリックから `run_script_slot` に入る。自動繰り返しの押下で起動しない。
+- 入口: 3 つの問い合わせ場所 (一覧・全画面のキー処理・native)・リング・右クリック (native と egui の両方の
+  経路) から `run_script_slot` に入る。全画面のキー処理の 3 つの経路 (転送・通常・ROOT 側の予備) と egui の
+  動画・音楽の表示で起動する。自動繰り返しの押下で起動しない。リング・メニューからの全画面の移動の結果が、
+  予備経路と共用の手順で処理される (`Rebased`・`Closed`・移動の要求)。ページ一覧・編集モードでは問い合わせ
+  られず起動しない。
 - イベント: 識別の各要素で発火する/しない (ZIP の読み込み途中で `open` が出ない、完了で出る、同じ場所の
   読み込み直しで出ない、分割ページの左右で `page` が出る、同じ PDF の別のページで `page` が出る)、
   検出が転送されたキーの処理より前にある (転送されたキーの変化は次のフレームで出る)、ウィンドウ内の静止画表示でも
@@ -633,6 +745,9 @@ Rust 側の表に「操作・種別・イベント可か・実行関数」を持
 - 「イベント可」の印を付けた A の各操作が識別を変えないこと (印の根拠のテスト)。
 - 割り当て: `KeyAction` / `RingActionId` の対応の恒久テスト (既存のパリティテストへ追加)。
 - 別ウィンドウ・編集モード・ページ一覧・Remote の取得中・読み込み中・OFF で動かないこと。
+- 別ウィンドウ (r6): 別ウィンドウの context を取り付けた状態で、キー・リング・メニューから起動しても実行されず
+  通知が出る。イベントの検出が走らず、メインの基準が変わらない (取り付けを外した後のメインの検出で、
+  別ウィンドウの操作による `open` / `page` が出ない)。既存の detached のテストを変えない。
 
 ## 11. 文書の更新 (実装時)
 
@@ -741,3 +856,25 @@ r4 の P1 は解消。追加の指摘なし。最小の関数の組で雛形 (§
 `parser.rs:2395`)、残す 3 つのパッケージに操作数の上限で止まらない関数が無いこと (`iter_basic.rs:110`・`269`・`313`、
 反復は `eval/stmt.rs:660` で操作数に数えられる) が確認された。雛形の評価・関数一覧の固定・最悪の入力の計測は、
 設計どおり実装時に確かめる事項。
+
+---
+
+## 14. 実装着手前の確かめ直し (r6、2026-11-24)
+
+r5 の ACCEPT の後、master が約 250 コミット進んだ (§1.471 閲覧中の左クリックのモード、§1.874 3D 写真の拡大中の
+クリックなど)。実装の着手にあたり、設計担当が調査担当 (読み取り専用) に入口の棚卸しを頼み、主な点を設計担当が
+コードで確かめた。製品は起動していない。
+
+| # | 見つかったこと | r6 の対応 |
+| --- | --- | --- |
+| 1 | egui で描く動画・音楽の表示のキーは、画像の全画面のキー処理の中で処理される。独立した入口ではない | 問い合わせ場所を 4 から 3 へ (§3.1) |
+| 2 | `apply_ring_action` は `Option<AddressBarNav>` しか返さず、リング側の全画面の移動はその場で実行する。リング・メニューの入口には「キー処理と同じ形の結果を返す」先が無い | 入口ごとの渡し先を決めた。全画面は ROOT 側の予備経路の後処理の手順を切り出して共用 (§5.2) |
+| 3 | native 動画のキーの処理は操作をその場で実行し終える。`NativeVideoKeyOutcome` はログの分類 | 結果の型の記述を訂正 (§5.2) |
+| 4 | 右クリックメニューは Win32 のネイティブと egui の 2 経路 | 両方に足し、両方で「閉じてから実行」(§3.1) |
+| 5 | native 動画の窓の XButton の経路 (ダブルクリックで 2 回) | 入口と既知の制限に足した (§1.2・§3.1) |
+| 6 | ページ一覧・編集モードでは、問い合わせ前に別の処理へ渡る | 通知をやめ、問い合わせない形に簡素化 (§3.2) |
+| 7 | 入口の関数とイベントの検出点は、別ウィンドウの context を取り付けている間も走る | メインかの既存の述語で実行・検出を止める。凍結の決まりとの照合を記録 (§3.2・§3.3) |
+| 8 | §1.471・§1.874・右クリックの短押しは割り当ての仕組みを持たない | 入口にしない (§1.2) |
+| 9 | スタック用スクリプトの `sleep` / `pad` は §1.863 で直った | §1.1 を更新 |
+
+行番号は `16590597e` のもの。
