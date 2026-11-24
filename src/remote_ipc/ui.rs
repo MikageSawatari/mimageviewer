@@ -4434,6 +4434,22 @@ impl crate::app::App {
                     ui.strong(remote_client_state_label(remote_client_active));
                 });
 
+                let (local_url, show_public) = remote_connection_address_rows(
+                    accepting,
+                    info.as_ref()
+                        .map_or(RemoteWebFeatureStatus::Unknown, |info| info.tailscale_serve),
+                    serve_port,
+                );
+                if let Some(local_url) = local_url {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("この PC のブラウザから:");
+                        ui.monospace(&local_url);
+                        if ui.button("コピー").clicked() {
+                            ui.ctx().copy_text(local_url.clone());
+                        }
+                    });
+                }
+
                 if !accepting {
                     match &service_diagnostic {
                         super::service::RemoteServiceDiagnostic::VersionMismatch => {
@@ -4451,7 +4467,7 @@ impl crate::app::App {
                 }
 
                 if let Some(info) = info.as_ref()
-                    && remote_connection_url_visible(accepting, info.tailscale_serve)
+                    && show_public
                 {
                     ui.separator();
                     paint_qr(ui, &info.public_url);
@@ -5027,12 +5043,20 @@ fn remote_enable_warning_visible(enabled: bool) -> bool {
     !enabled
 }
 
+/// ローカル行は service の待受ポートを使い、受付中は serve に依存せず表示する。
 /// serve が無い間の `public_url` は bind fallback (`http://127.0.0.1:<port>/`) になり得る。
 /// QR は読まずに scan されるので、端末から届かない宛先は描かない。判定も URL も、案内側の
 /// probe ではなく service の snapshot から取る (probe が設定済みでも snapshot が古ければ、
 /// 公開 URL はまだ更新されていない)。
-fn remote_connection_url_visible(accepting: bool, serve: RemoteWebFeatureStatus) -> bool {
-    accepting && serve == RemoteWebFeatureStatus::Configured
+fn remote_connection_address_rows(
+    accepting: bool,
+    serve: RemoteWebFeatureStatus,
+    port: u16,
+) -> (Option<String>, bool) {
+    (
+        accepting.then(|| format!("http://127.0.0.1:{port}/")),
+        accepting && serve == RemoteWebFeatureStatus::Configured,
+    )
 }
 
 fn core_spread_mode(mode: RemoteSpreadMode) -> crate::settings::SpreadMode {
@@ -7444,25 +7468,64 @@ mod tests {
     }
 
     #[test]
-    fn the_connection_qr_waits_for_serve_so_it_never_points_at_the_loopback() {
-        // serve が無い間の public_url は bind fallback になり得る。案内側の probe が
-        // 設定済みを示していても、service の snapshot が古ければ公開 URL はまだ古い。
-        assert!(remote_connection_url_visible(
+    fn accepting_without_serve_shows_local_address_without_qr() {
+        let (local_url, public_row) = remote_connection_address_rows(
             true,
-            RemoteWebFeatureStatus::Configured
-        ));
-        assert!(!remote_connection_url_visible(
+            RemoteWebFeatureStatus::NotConfigured,
+            mimageviewer_ipc::DEFAULT_REMOTE_PORT,
+        );
+        assert_eq!(local_url.as_deref(), Some("http://127.0.0.1:8787/"));
+        assert!(!public_row);
+    }
+
+    #[test]
+    fn accepting_with_unknown_serve_shows_local_address_without_qr() {
+        let (local_url, public_row) = remote_connection_address_rows(
             true,
-            RemoteWebFeatureStatus::NotConfigured
-        ));
-        assert!(!remote_connection_url_visible(
+            RemoteWebFeatureStatus::Unknown,
+            mimageviewer_ipc::DEFAULT_REMOTE_PORT,
+        );
+        assert_eq!(local_url.as_deref(), Some("http://127.0.0.1:8787/"));
+        assert!(!public_row);
+    }
+
+    #[test]
+    fn accepting_with_configured_serve_shows_local_and_public_addresses() {
+        let (local_url, public_row) = remote_connection_address_rows(
             true,
-            RemoteWebFeatureStatus::Unknown
-        ));
-        assert!(!remote_connection_url_visible(
-            false,
-            RemoteWebFeatureStatus::Configured
-        ));
+            RemoteWebFeatureStatus::Configured,
+            mimageviewer_ipc::DEFAULT_REMOTE_PORT,
+        );
+        assert_eq!(local_url.as_deref(), Some("http://127.0.0.1:8787/"));
+        assert!(public_row);
+    }
+
+    #[test]
+    fn not_accepting_hides_all_connection_addresses() {
+        for serve in [
+            RemoteWebFeatureStatus::NotConfigured,
+            RemoteWebFeatureStatus::Unknown,
+            RemoteWebFeatureStatus::Configured,
+        ] {
+            let (local_url, public_row) = remote_connection_address_rows(false, serve, 9000);
+            assert_eq!(local_url, None, "serve={serve:?}");
+            assert!(!public_row, "serve={serve:?}");
+        }
+    }
+
+    #[test]
+    fn local_connection_address_uses_supplied_service_port() {
+        // Pure-function coverage of the port argument; the dialog must pass its
+        // existing control.port()-derived serve_port, not choose another default.
+        for serve in [
+            RemoteWebFeatureStatus::NotConfigured,
+            RemoteWebFeatureStatus::Unknown,
+            RemoteWebFeatureStatus::Configured,
+        ] {
+            let (local_url, public_row) = remote_connection_address_rows(true, serve, 9000);
+            assert_eq!(local_url.as_deref(), Some("http://127.0.0.1:9000/"));
+            assert_eq!(public_row, serve == RemoteWebFeatureStatus::Configured);
+        }
     }
 
     #[test]
