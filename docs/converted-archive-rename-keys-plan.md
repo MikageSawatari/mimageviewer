@@ -1,6 +1,6 @@
 # 変換して開く書庫の改名・移動で、変換キャッシュ側のキーも移す (§1.886)
 
-2026-11-24 設計担当 ClaudeCode Opus 5.5 (セッション conv-rename-886)。状態: **設計 v2 (独立設計レビュー r1 REVISE の指摘を反映)、r2 前**。
+2026-11-24 設計担当 ClaudeCode Opus 5.5 (セッション conv-rename-886)。状態: **設計 v3 (独立設計レビュー r1・r2 REVISE の指摘を反映)、r3 前**。
 バックログの正本は [next-release-backlog.md](next-release-backlog.md) §1.886。前提として読む文書:
 [edit-content-identity-plan.md](edit-content-identity-plan.md) §4 (変換キャッシュ ZIP の置き場と 4 面)、
 [book-key-migration-plan.md](book-key-migration-plan.md) §3.4、`src/rename_key_migration.rs` のモジュール doc、
@@ -60,31 +60,38 @@ v5.7.0 より前からのリリース済みの穴 (いつからかは未調査) 
 - C5. 組は FS の改名が確定した時点の配下で決まり、その後の改名・移行 job の実行の順序に左右されない
   (A → B の移行 job が走る前に B → C と改名しても、最後は `cache(C/f)` に行がある)。
 
-### 2.2 組の作り方 (FS の改名を確定した worker で決め、job に記録する)
+### 2.2 組の作り方 (FS の改名を確定した worker で配下を記録し、job が組にする)
 
-組の一覧 `cache_pairs` は、**FS の改名に成功した同じ worker** (`rename_item_async` の worker。`rename_pending` が
-App に残っている間なので、次の改名はまだ始まらない) が、結果を App へ返す前に作る。App は結果に入った組を
-`PathMigrationJob` に記録し (journal にも書く)、移行 job はその組をそのまま使う。移行 job は FS を読まない。
+配下の変換書庫の一覧は、**FS の改名に成功した同じ worker** (`rename_item_async` の worker。`rename_pending` が
+App に残っている間) が、結果を App へ返す前に FS から作る。DB は読まない (行の有無で絞らない)。App は一覧を
+`PathMigrationJob` に記録し (journal にも書く)、移行 job はそこから組を作る。移行 job は FS を読まない。
 
-- **ファイル** (`tree == false`): `old` の拡張子が `ArchiveFormat::nested_from_extension` で認識できる
-  (rar / cbr / 7z / cb7 / lzh / lha / zip / cbz) なら、組 `(cache(old), cache(new))` を 1 つ作る。FS も DB も読まない。
-- **フォルダ** (`tree == true`):
-  1. ストアごとに 1 回、変換キャッシュの根 (`<data_dir>/archive_cache/`、そのストアの正規化をかけたもの) の下の
-     キーを範囲で読み、`cache(src)` の部分 (`::` と `/` より前) の集合を作る。book_resume はキーに加えて
-     identity の container も 1 回の走査で集める。どのストアにも無ければ、FS を列挙せずに空の一覧で終わる
-     (変換書庫の行が無い利用者は、ストアの DB を開いて範囲を読む費用だけが増える)。
-  2. 集合が空でなければ、改名後の `new` を再帰で列挙する (`read_dir` + `entry.file_type()`、シンボリックリンク・
-     ジャンクションはたどらない、`Path::is_dir()` を使わない)。上と同じ拡張子のファイル `f_new` ごとに
-     `f_old = old.join(f_new.strip_prefix(new))` として `cache(f_old)` を計算し、1 の集合にあるものだけ
-     組 `(cache(f_old), cache(f_new))` にする。候補ごとに DB を開いたり走査したりしない。
-- 件数と時間を `perf::event` に残す。DB には書かない。
-- journal に記録するので、起動時の再実行も同じ組を使う。改名から移行 job の実行までの間に FS が変わっても
-  (続けての改名、エクスプローラーでの操作)、組は変わらない (C5)。A → B → C と続けて改名すると、
-  job 1 が `cache(A/f) → cache(B/f)`、job 2 が `cache(B/f) → cache(C/f)` を順に移す。
+- **ファイル** (`tree == false`): 一覧は作らない。job は、`old` の拡張子が `ArchiveFormat::nested_from_extension` で
+  認識できる (rar / cbr / 7z / cb7 / lzh / lha / zip / cbz) なら、組 `(cache(old), cache(new))` を 1 つ作る。
+- **フォルダ** (`tree == true`): 改名後の `new` を再帰で列挙し (`read_dir` + `entry.file_type()`、シンボリックリンク・
+  ジャンクションはたどらない、`Path::is_dir()` を使わない)、上と同じ拡張子のファイルの `new` からの相対パスの一覧
+  `converted_archive_rels` を作る。job は各 `rel` について組 `(cache(old.join(rel)), cache(new.join(rel)))` を作る。
+- 行の有無による省略は、移行 job の各ストアの transaction の中で行う (§2.3)。先に積まれた job の移行と、
+  移行の開始前に待つ保存 worker の書き込みが済んだ後の DB を見るので、続けての改名・未保存の書き込みと順序が食い違わない。
+- 列挙の件数と時間を `perf::event` に残す。
+- journal に記録するので、起動時の再実行も同じ一覧を使う。改名から移行 job の実行までの間に FS が変わっても
+  一覧は変わらない (C5)。A → B → C と続けて改名すると、job 1 が `cache(A/f) → cache(B/f)`、job 2 が
+  `cache(B/f) → cache(C/f)` を順に移す (job 2 の一覧は B → C の改名の時点の C の配下から作られ、DB の状態に依らない)。
+- **改名の worker が走っている間 (FS の改名と列挙) は、FS を変える他の操作を受け付けない。**
+  `admit_rename_migration_source_change` (削除・本の改名・本の削除・製本の構造変更・追加の取り消しの共通の入口) が
+  `rename_pending` の間は「名前の変更が完了するまでお待ちください」で断る。これで「列挙中に B を削除し、削除の結果が
+  改名の結果より先に採用され、後から積まれた job が削除済みの B に行を作り直す」順序が無くなる。改名の結果を採用して
+  job を積んだ後の削除は、今と同じ `invalidate_rename_migrations_for_removed_paths` が job の generic 段を止める
+  (generic 段を止めた job は cache の組も移さない)。
 
 ### 2.3 移す処理 (ストアごとに 1 transaction)
 
-元の組と job に記録した `cache_pairs` をまとめた組の一覧 `pairs = [(old, new)] + cache_pairs` を、各移行へ渡す。
+元の組と、job に記録した一覧から作った cache の組をまとめた組の一覧 `pairs = [(old, new)] + cache_pairs` を、各移行へ渡す。
+
+- 各ストアの transaction の最初に、そのストアの変換キャッシュの根 (`<data_dir>/archive_cache/` にそのストアの正規化を
+  かけたもの) の下のキーを範囲で 1 回読み、`cache(src)` の部分 (`::` と `/` より前) の集合を作る。book_resume は
+  identity の container も同じ走査で集める。集合に旧側が無い cache の組はそのストアでは飛ばす (組ごとに DB を
+  走査し直さない)。
 
 - 汎用の `STORES` (`migrate_store`): 1 回の transaction の中で、組ごとに `migrate_store_family`
   (exact・`/`・`::`、`DestinationWins`) を行う。rating の `source_path` の導出、回転の変更キーの記録、
@@ -122,23 +129,29 @@ App に残っている間なので、次の改名はまだ始まらない) が�
 
 ### 2.5 本体 (App) 側
 
-組は FS の改名の結果 (`ShellRenameOutcome` 相当) に入って App に届き、job にも入る。
+一覧は FS の改名の結果 (`ShellRenameOutcome` 相当) に入って App に届き、job にも入る。cache の組は
+`old`・`new`・一覧から純関数で作る (UI スレッドでは FS も DB も読まない)。
 
 - 改名の成功を受けたとき (`poll_rename_pending`): 元の組に今行っている `rewrite_page_edit_presence_for_rename` を、
   cache の組にも行う (同じ時点・同じ経路)。
 - 移行 job の完了を受けたとき (`poll_rename_migration_pending`): 元の組に今行っている in-memory の引き直し
   (`rewrite_page_edit_presence_for_rename`、`rating_session_writes` の付け替え、
-  `refresh_edit_preview_thumbnails_after_rename`、`book_resume_meters.remove_scopes`) を、job の cache の組にも行う。
-  `rehydrate_contexts_after_rename_migration` は同期の DB 読み取りを含むので組ごとに呼ばず、全部の組を受けて
-  対象の context をまとめて判定し、context ごとの再準備を 1 回にする。★・タグの表示キャッシュの全消去と
-  `reload_book_resume_meters` は今のまま 1 回。
+  `refresh_edit_preview_thumbnails_after_rename`、`book_resume_meters.remove_scopes`) を、cache の組にも行う。
+  ★・タグの表示キャッシュの全消去と `reload_book_resume_meters` は今のまま 1 回。
+- context の編集状態の読み直し: cache の組で対象になる context (今 `cache(old)`・`cache(new)` の ZIP の中を
+  表示しているもの) は、UI スレッドでは対象の判定だけを行い、読み直しは既存の非同期の準備
+  (`prepare_page_edits_for_current_virtual_items` → worker) へ渡す。同期で DB を読む
+  `rehydrate_page_edit_state_for_current_items` には cache の組から入らない。ZIP の中の一覧の列挙中で準備がまだ無い
+  context は、列挙の完了で始まる通常の準備に任せる。移行の書き込みは `PAGE_EDIT_WRITES` の epoch の中で行うので、
+  その準備の読み取りとの前後は既存の epoch の再試行が扱う (実装担当が、列挙中に移行が終わる順序で古い DB を
+  採用しないことをコードで確かめ、成り立たなければ設計担当へ返す)。元の組の既存の読み直しは変えない。
 
 ### 2.6 まれな失敗
 
 既定の割り切り (ログ + 通知)。
 
-- 改名の worker での集合の読み取り・フォルダの列挙に失敗した部分 (開けないストア、読めない下位フォルダ) は飛ばし、
-  ログに残して、改名の成功後に「一部の設定を引き継げませんでした」系の警告を 1 回出す (改名自体は成功として扱う)。
+- 改名の worker でのフォルダの列挙に失敗した部分 (読めない下位フォルダ) は飛ばし、ログに残して、改名の成功後に
+  「一部の設定を引き継げませんでした」系の警告を 1 回出す (改名自体は成功として扱う)。
   行は `cache(old)` に残るだけで消えない。
 - ストアの失敗は今と同じ (ストアごとにロールバックし、エラーを集計して通知)。
 - 移行先 `cache(new)` に以前の別の書庫の行が残っていた場合 (同じパスの変換書庫を消した後、そこへ改名した等) は
@@ -148,10 +161,11 @@ App に残っている間なので、次の改名はまだ始まらない) が�
 
 ### 2.7 永続データ
 
-ストアの形とキーの体系は変えない。改名移行の journal (`PathMigrationJob`、リリース済み) に、cache の組の一覧の
-欄を足す。`#[serde(default)]` で、欄の無い古い journal は空の一覧として読む (古い版で積んだ job は今までどおり
-cache の面を移さないだけ)。古い版は知らない欄を無視して読む (`deny_unknown_fields` は使っていない)。
-移行コードは要らない。既に `cache(old)` に取り残されている行
+ストアの形とキーの体系は変えない。改名移行の journal (`PathMigrationJob`、リリース済み) に、配下の変換書庫の
+相対パスの一覧の欄を足す。`#[serde(default)]` で、欄の無い古い journal は空の一覧として読む (古い版で積んだフォルダの
+job は今までどおり配下の cache の面を移さないだけ)。旧形式 (tuple) の読み込み (`parse_journal_bytes`) と
+`shell_rename` など既存の constructor は空の一覧を作る。古い版は知らない欄を無視して読める
+(`deny_unknown_fields` は使っていない) が、古い版が書き直すと欄は消える (互換は「読める」範囲)。移行コードは要らない。既に `cache(old)` に取り残されている行
 (リリース済みの版で改名・移動した書庫の行) は一括で直さない (§1.885 の判断と同じ。キーから元のパスを
 逆算できない)。
 
@@ -161,8 +175,12 @@ cache の面を移さないだけ)。古い版は知らない欄を無視して�
   A → B → C の改名で job 1 が B を見られず、行が `cache(A/f)` に残る (独立設計レビュー r1 P1)。改名を確定した
   worker で組を決めて記録すれば、確定の時点が 1 つになり、job の実行順・起動時の再実行と組み合わさらない。
 - 移行 job が終わるまで次の改名を止める案は採らない。今の連続した改名の操作が遅くなる (リリース済みの挙動の退行)。
-- その代わり、フォルダの改名は、変換書庫の行がある利用者では、改名の worker の中で配下の列挙の時間だけ完了が遅れる。
-  通常の大きさのフォルダでは短いが、大きなフォルダ・NAS では目立ち得るので、`perf::event` で測る。
+- 改名の worker で DB を読んで候補を絞る案 (設計 v2) は採らない。DB の状態は先の job・保存の反映前のことがあり、
+  続けての改名で組が落ちる (独立設計レビュー r2 P1)。列挙は FS だけで決め、行の有無は移行の transaction で見る。
+- その代わり、**フォルダの改名は、配下の列挙の時間だけ改名の完了 (と次の改名・削除の受付) が遅れる**。変換書庫を
+  使わない利用者も対象になる。通常の大きさのフォルダでは短い見込み (未計測) だが、大きなフォルダ・NAS では目立ち得る。
+  `perf::event` で測り、実機の確認で遅れが目立てば列挙の扱いを見直す。これは「通常の使い方が遅くなる」変更に当たり得る
+  ので、統括・利用者の判断を仰ぐ項目として報告する。
 - 変換書庫のキーを元のパスへ寄せる (キャッシュの面を無くす) 案は、リリース済みのデータの移行と、
   変換・読み取り・保存の全経路の変更が要るので採らない。
 - フォルダ配下の変換書庫を `archive_cache.db` から逆引きする案は採らない。容量上限での自動削除や
@@ -187,13 +205,20 @@ cache の面を移さないだけ)。古い版は知らない欄を無視して�
 6. 変換キャッシュの根の下に行が無いとき、フォルダの改名で FS を列挙しない (列挙の回数を数える test hook)。
    行があっても、集合に無い `cache(f_old)` は組にしない。
 7. `cache(new)` 側に既存の行 (読書位置・補正) があるとき、`DestinationWins` でその page・identity・編集内容が変わらない。
-8. **続けての改名** (handler test、C5): フォルダ A → B の改名の結果を受けて job を積み、job を走らせる前に
-   B → C の改名の結果を受ける。2 つの job を順に走らせた後、`cache(C/f)` の読書位置が Restored で、補正も `cache(C/f)` にあり、
-   `cache(A/f)`・`cache(B/f)` に残らない。
-9. journal: cache の組を持つ job が保存・読み込みで往復し、欄の無い古い journal も読める。
-10. 本体側: 改名の成功を受けたときと移行 job の完了を受けたときに、`adjusted_page_keys` などの in-memory の集合で
-    `cache(old)::…` が `cache(new)::…` へ付け替わる (handler test)。
-11. 既存の section1885・rename_key_migration・content_identity::restore のテストが通る。
+8. **続けての改名** (handler test、C5): フォルダ A → B の改名の結果を、本番の一覧を作る関数 (改名の worker と同じ関数を
+   tempdir の実フォルダに対して呼ぶ) で作って受け、job を積み、job を走らせる前に FS で B → C と改名して同じ関数で
+   2 つ目の結果を作って受ける。2 つの job を順に走らせた後、`cache(C/f)` の読書位置が Restored で、補正も `cache(C/f)` にあり、
+   `cache(A/f)`・`cache(B/f)` に残らない。保存 worker に `cache(A/f)` への未完了の書き込みを持たせた形も 1 本置き、
+   その書き込みも最後に `cache(C/f)` にあることを確かめる。
+9. journal: 一覧を持つ job が保存・読み込みで往復し、欄の無い古い journal と旧形式 (tuple) も読める。
+   generic 段を止めた job (`generic_pending=false`) は、journal の往復の後も cache の面を移さず、collection 段には
+   元の論理 mapping だけを渡す。
+10. **改名中の削除** (handler test): `rename_pending` がある間の削除の要求は断られる (`delete_pending` が作られない)。
+    改名の結果の採用の後に積んだ job は、B の削除で generic 段が止まり、`cache(B/f)` に行を作らない。
+11. 本体側: 改名の成功を受けたときと移行 job の完了を受けたときに、`adjusted_page_keys` などの in-memory の集合で
+    `cache(old)::…` が `cache(new)::…` へ付け替わる (handler test)。`cache(new)` の ZIP の中を表示中の context は
+    非同期の準備で読み直され、同期の `rehydrate_page_edit_state_for_current_items` を通らない。
+12. 既存の section1885・rename_key_migration・content_identity::restore のテストが通る。
 
 流す filter (run-heavy 経由の nextest): `section1886`・`section1885`・`rename_key_migration`・`book_resume`・
 `content_identity::restore`・`rar_archive_cache`・`rename_migration`・`rename_item`。
@@ -215,6 +240,16 @@ cache の面を移さないだけ)。古い版は知らない欄を無視して�
   - そのほか: 候補ごとの DB 照会をやめ、ストアごとに 1 回の範囲読みにした。「追加費用ゼロ」を直した。
     `rehydrate_contexts_after_rename_migration` は同期の DB 読み取りを含むので、組をまとめて 1 回にした (§2.5)。
     復元のコピーが正しいのは `Convertible` どうしの範囲だと §2.4 に限定した。DestinationWins の回帰テストを足した (テスト 7)。
+- **設計 r2** (同じ会話、read-only、2026-11-24): **REVISE**。
+  - P1: 改名の worker で DB の行で候補を絞ると、行がまだ `cache(A/f)` にある間の B → C の改名で組が落ちる。未保存の書き込みも
+    見えない。→ 採用。改名の worker は FS の列挙だけで相対パスの一覧を記録し、行の有無は移行の transaction で見る (§2.2・§2.3)。
+    DB による列挙の省略もやめた。テスト 8 を本番の関数で 2 回とも作る形と、未完了の保存を挟む形にした。
+  - P2: 長くなった `rename_pending` の間に削除を受け付けると、削除の結果が先に採用され、後から積んだ job が消した B に
+    行を作り直す。→ 採用。`admit_rename_migration_source_change` が `rename_pending` の間は断る (§2.2、テスト 10)。
+  - P2: context ごとに 1 回にしても、snapshot の無い context は同期の DB 読み取りに入る。→ 採用。cache の組では
+    非同期の準備へ渡し、同期経路に入らない (§2.5、テスト 11)。
+  - journal の欄の互換は「読める」範囲と書き直し、旧形式と constructor が空の一覧を作ることを明記した (§2.7)。
+    改名の遅れは未計測の見込みと書き、判断を仰ぐ項目にした (§2.8)。
 
 ## 5. 別項目の候補 (この項目では直さない)
 
