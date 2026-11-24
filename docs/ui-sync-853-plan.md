@@ -9,6 +9,16 @@
 まれな失敗 (worker の起動失敗・Shell の異常・ディスク I/O エラー等) は既定の割り切り (ログ + 通知)。再試行・回復の
 仕組みは足さない。
 
+## 0. 利用者の決定 (2026-11-24、統括経由)
+
+設計担当が統括へ出した範囲の質問に、利用者が次の選択肢を選んだ (統括からの伝達のとおり)。
+
+- §1.853: 「担当の案で進める (Recommended)」。worker にするのは (a) 起動時と (b) 場所の移動だけ。その待ちの間は、
+  お気に入りと同じく一覧へのキーを止める。残りの経路 (§3.5 の C・D) と「元の場所へ」(E) は別の項目にする
+  (番号は統括が master で取る)。
+- §1.859: 「断るでよい (Recommended)」。貼り付けの処理中の 2 回目は、断って通知を出す。
+- §1.861: 「案のとおり進めてください」。
+
 ---
 
 ## 1. §1.861 リンクを開く処理を UI スレッドから外す
@@ -150,7 +160,7 @@
 | --- | --- | --- |
 | A | 起動時: 引数・転送・agent・ブックマークの解決完了 (`apply_startup_open_path_resolve_result`、`startup_ops.rs:1948`) | **対象** |
 | A' | 起動時の既定の場所: `open_default_startup_target` (前回の一覧 `open_previous_startup_list`、Desktop / 指定フォルダ) と、その fallback 呼び出し (起動 resolve の失敗、Remote 返却 `remote_ipc/ui.rs:4657`) | **対象** (同じ resolver に載せる) |
-| B | 場所の移動: `dispatch_location_jump` / `dispatch_address_input` の `UiThread` (場所▼・既知フォルダ・整理先・アドレス入力の特殊な場所・ゲームパッドの場所 picker 等の `LocationJumpTarget::Physical`) | **統括の判断待ち** (§3.4) |
+| B | 場所の移動: `dispatch_location_jump` / `dispatch_address_input` の `UiThread` (場所▼・既知フォルダ・整理先・アドレス入力の特殊な場所・ゲームパッドの場所 picker 等の `LocationJumpTarget::Physical`) | **対象** (§3.4、利用者決定 §0) |
 | C | `post_render_main_navigation` の既定 (一覧のフォルダを開く・親へ・コレクション物理元・フォルダを開くダイアログ・コンテキストの open) | 対象外 (§3.5) |
 | D | `load_folder_or_convert_archive_with_auto_fullscreen_owned_at_stage` の他の呼び出し元 (通常の読み直し・全画面を閉じた後の Direct・コンテナを開く操作 等、約 20 か所) | 対象外 (§3.5) |
 | E | `open_direct_navigation_target` の「元の場所へ」(ArchiveContainer、多くは pre_scan あり) | 対象外 (§3.5) |
@@ -199,11 +209,11 @@
   `outcome` (`scanned|not_directory|failed|cancelled`)、`source` (`initial|activation|agent|bookmark|default`)。
 - 採用側の既存 `nav/lf_scan` は `pre_scanned=true` になる。`scripts/analyze_perf.py` の startup/nav 内訳に足す。
 
-### 3.4 B (場所の移動) — 統括の判断待ち
+### 3.4 B (場所の移動)
 
 §1.805 の `DirectoryScanRoute::Worker` (`DirectNavigation`) をそのまま使い、`dispatch_location_jump` /
 `dispatch_address_input` の検索の外の `Physical` を `Worker` にする。§1.805 と同じく、待ちの間の一覧の項目入力が止まる
-(お気に入り・アドレス欄 Enter で利用者が 2026-11-18 に了承した扱いの拡張)。判断が出るまで実装しない。
+(お気に入り・アドレス欄 Enter で利用者が 2026-11-18 に了承した扱いの拡張。2026-11-24 の利用者決定で採用、§0)。
 
 ### 3.5 対象外にした経路と理由
 
