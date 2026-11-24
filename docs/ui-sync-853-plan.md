@@ -634,3 +634,9 @@ section1335_tray_image_folder_book_backspace_quit_restarts_explicit_book_list
 
 利用者決定 (§0) を受けて、§2.1 の表の 1 行目・§2.2・§2.3・§2.6 の (9) を直した。r3 の中身の照合 (`ClipboardChanged`)
 は撤回し、mIV 自身のファイルの切り取り・コピーを貼り付けの準備中に断る受付 1 か所に置き換えた。§1・§3 は変えていない。
+
+### 5.6 設計レビュー r4 (同じ担当の継続、read-only、18d6d2fd2、2026-11-25): ACCEPT (§2)
+
+指摘なし。ファイルの切り取り・コピーの入口 (キー、カスタムキー、全画面、ゲームパッド・リング・ジェスチャ) はすべて
+`invoke_shell_clipboard_verb_for_paths` に集まり、断る位置は書き込みの予約・切り取り監視・Shell の動詞より前と確認された。
+Remote・agent にファイルのクリップボード操作は無く、ドラッグはクリップボードを使わない。
