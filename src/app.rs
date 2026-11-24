@@ -86853,71 +86853,6 @@ impl App {
         }
     }
 
-    /// Retire only replaced outputs present in this mounted listing. This is
-    /// memory-only; the export worker has already removed the persisted row.
-    pub(crate) fn evict_replaced_export_thumbnails(&mut self, paths: &[PathBuf]) {
-        if paths.is_empty() {
-            return;
-        }
-        // This is the same spelling comparison as folder_tree::path_eq, batched
-        // to avoid comparing every output with every row of a large listing.
-        let paths: HashSet<_> = paths
-            .iter()
-            .map(|path| crate::path_key::normalize_keep_drive(path))
-            .collect();
-        let indices = self
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, item)| {
-                let GridItem::Image(path) = item else {
-                    return None;
-                };
-                paths
-                    .contains(&crate::path_key::normalize_keep_drive(path))
-                    .then_some(idx)
-            })
-            .collect::<Vec<_>>();
-        for idx in indices {
-            let (mtime, size) = self
-                .image_metas
-                .get(idx)
-                .copied()
-                .flatten()
-                .unwrap_or((0, 0));
-            let request = make_load_request_with_auto_crop(
-                &self.items[idx],
-                idx,
-                mtime,
-                size,
-                false,
-                self.pdf_current_password.as_deref(),
-                Some(self.settings.folder_thumb_sort),
-                self.settings.folder_thumb_depth,
-                &self.folder_pin_map,
-                &self.converted_archive_cache_paths,
-                self.archive_source_override.as_deref(),
-                self.current_folder.as_deref(),
-                self.folder_thumb_pin_db.as_deref(),
-                self.video_pin_db.as_ref(),
-                self.use_full_path_cache_keys(),
-                self.listing_file_type_visibility(),
-                self.thumbnail_auto_crop_identity(),
-            );
-            // evict_thumbnail_for_reload retires the texture/request, but the
-            // worker also consults this encoded map before reading the catalog.
-            if let Some(key) = request
-                .as_ref()
-                .and_then(crate::thumb_loader::cache_key_for_request)
-                && let Some(map) = &self.current_color_cache_map
-                && let Ok(mut map) = map.write()
-            {
-                map.remove(key.as_ref());
-            }
-            self.evict_thumbnail_for_reload(idx);
-        }
-    }
-
     fn thumbnail_indices_for_edit_preview_key(&self, item_key: &str) -> Vec<usize> {
         (0..self.items.len())
             .filter(|&idx| {
@@ -104970,7 +104905,7 @@ fn make_load_request(
 }
 
 /// Pure path computation at UI admission; no filesystem or catalog access.
-pub(crate) fn parent_row_for_item(
+fn parent_row_for_item(
     item: &GridItem,
     source: &Path,
     sort: Option<crate::settings::SortOrder>,
