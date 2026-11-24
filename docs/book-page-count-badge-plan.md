@@ -1088,6 +1088,10 @@ facts / materialize / catalog (10件):
 - 設計担当の指示で、未完了の遅延キー取得を並べ替えpopupの補助行から既存App関数で停止・再開できるようにし、高さ計算とマニュアルへ反映した。`lazy_sort_popup_stops_resumes_and_hides_completed_loading_with_columns_off` は両表示・全遅延列OFF・両配置・長さ/ページ数/両要件の実クリック、完了後の行消滅、1093×614 / 150%で追加行まで収容することを検査する。
 - 設計担当の指示で、メモリreaderとmaterialize closureにGridItemを渡し、PDF資格情報照合をPdfFileに限定した。`page_sort_883_pdf_epub_named_image_folders_keep_memory_sort_badge_and_generation_identity` を追加し、Photos.pdf / Book.epub画像フォルダのfacts無しの並び・バッジ・世代変更後の非再取得を検査、真PDFのrevision不一致拒否も補強した (詳細側のPDF/EPUB判定は既に種類限定、cargo検証は未実施)。
 
+- 設計担当の指示で、表示条件・文言・既存App関数への停止/再開を `draw_sort_loading_control` に集約し、上部/絞り込みのdropdown、設定→ソート順、上部のButtons/Collapsible/Unknown共通分岐へ接続した。列見出しが並びを所有するときも設定メニューの取得操作だけは使える。
+- 入口棚卸し: ゲームパッド/リングの値選択は専用の行を増やさず、選択を閉じて設定→ソート順で操作する。保存済みお気に入り・起動・更新で再取得する場合も同メニューを使う。コレクション/代表画像/Remoteは遅延キーの候補外、詳細列見出しはSortOrderの全件取得と別経路、ツールバー右クリックの候補編集は取得を始めないため専用行を足さない。
+- `lazy_sort_menu_and_buttons_stop_resume_with_sort_dropdowns_hidden` を追加: サムネイルで両ソート欄OFFのメニュー選択、および上部ボタン3表示で長さ/ページ数/両要件の停止・再開・完了後の行消滅を実クリックで検査する。詳細列を全て隠して列順を固定した場合のメニューも含む (cargo検証は未実施)。
+
 設計担当が実行する nextest filter (本作業では実行しない):
 
 ```powershell

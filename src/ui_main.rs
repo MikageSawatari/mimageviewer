@@ -9038,6 +9038,139 @@ mod fixed_sort_control_tests {
     }
 
     #[test]
+    fn lazy_sort_menu_and_buttons_stop_resume_with_sort_dropdowns_hidden() {
+        use crate::settings::{SelectionInfoDisplayMode, SortOrder, ToolbarSectionDisplay};
+
+        for control in ["menu", "menu_locked", "buttons", "collapsible", "unknown"] {
+            let menu = control.starts_with("menu");
+            for (order, duration_facet, stop, resume) in [
+                (
+                    SortOrder::DurationAsc,
+                    false,
+                    "長さの読み込みを停止",
+                    "長さの読み込みを再開",
+                ),
+                (
+                    SortOrder::PageCountAsc,
+                    false,
+                    "ページ数の読み込みを停止",
+                    "ページ数の読み込みを再開",
+                ),
+                (
+                    SortOrder::PageCountAsc,
+                    true,
+                    "読み込みを停止",
+                    "読み込みを再開",
+                ),
+            ] {
+                let mut app = crate::app::setup_app_for_test();
+                app.settings.grid_view_mode = GridViewMode::Thumbnail;
+                app.settings.sort_order = SortOrder::FileName;
+                app.settings.show_toolbar_sort = !menu;
+                app.settings.show_facet_sort = false;
+                app.settings.details_show_page_count = false;
+                app.settings.details_show_created = false;
+                app.settings.details_show_image_dimensions = false;
+                app.settings.details_show_video_duration = false;
+                app.settings.details_show_video_dimensions = false;
+                app.settings.details_show_video_codec = false;
+                app.settings.toolbar_sort_display = match control {
+                    "collapsible" => ToolbarSectionDisplay::Collapsible,
+                    "unknown" => ToolbarSectionDisplay::Unknown,
+                    _ => ToolbarSectionDisplay::Buttons,
+                };
+                app.settings.toolbar_sort_items = SortOrder::all().to_vec();
+                app.settings.thumb_show_page_count = false;
+                app.settings.thumb_show_media_duration = false;
+                app.settings.thumb_show_resume_meter = false;
+                app.settings.selection_info_display_mode = SelectionInfoDisplayMode::Hidden;
+                app.settings.facet_filter = Default::default();
+                app.ai_model_facet_requested = false;
+                app.duration_facet_requested = duration_facet;
+                // Hold the metadata session until the UI resumes it. There is no
+                // physical listing to reload or probe in this routing fixture.
+                assert!(app.current_folder.is_none() && app.items.is_empty());
+                app.details_image_dims_state = LazyColumnState::Loading { done: 0, total: 0 };
+                let app = Rc::new(RefCell::new(app));
+                let render_app = Rc::clone(&app);
+                let mut harness = crate::test_ui::builder()
+                    .with_size(egui::vec2(1700.0, 650.0))
+                    .with_context_setup(crate::ui_fonts::configure_fonts)
+                    .build_ui(move |root_ui| {
+                        let mut app = render_app.borrow_mut();
+                        app.render_menubar(root_ui);
+                        app.render_toolbar(root_ui);
+                        app.render_facet_filter_bar(root_ui);
+                    });
+                harness.run();
+                assert!(harness.query_by_label(stop).is_none());
+                if menu {
+                    assert!(!app.borrow().settings.show_toolbar_sort);
+                    assert!(!app.borrow().settings.show_facet_sort);
+                    harness.get_all_by_label("設定").next().unwrap().click();
+                    harness.run();
+                    harness.get_by_label("ソート順").click();
+                    harness.run();
+                    harness
+                        .get_by_label(&format!("  {}", order.label()))
+                        .click();
+                } else {
+                    harness.get_by_label(order.short_label()).click();
+                }
+                harness.run();
+                assert_eq!(app.borrow().settings.sort_order, order);
+                assert!(!app.borrow().listing_meta_requirements().is_empty());
+                if control == "menu_locked" {
+                    let mut app = app.borrow_mut();
+                    app.settings.grid_view_mode = GridViewMode::Details;
+                    app.settings.details_sort_key = crate::settings::DetailsSortKey::Name;
+                    assert!(app.grid_sort_lock_reason().is_some());
+                }
+                for (label, expected) in [
+                    (stop, LazyColumnState::Cancelled),
+                    (resume, LazyColumnState::NotRequested),
+                ] {
+                    if menu {
+                        harness.get_all_by_label("設定").next().unwrap().click();
+                        harness.run();
+                        harness.get_by_label("ソート順").click();
+                        harness.run();
+                        if control == "menu_locked" {
+                            assert!(
+                                harness
+                                    .get_by_label(&format!("✓ {}", order.label()))
+                                    .accesskit_node()
+                                    .is_disabled()
+                            );
+                        }
+                    }
+                    harness.get_by_label(label).click();
+                    harness.run();
+                    assert_eq!(
+                        app.borrow().details_image_dims_state,
+                        expected,
+                        "{control} / {order:?}"
+                    );
+                }
+                // The existing zero-target completion publishes the proof. All
+                // surfaces then remove the shared stop/resume control.
+                app.borrow_mut().poll_details_meta_load(&harness.ctx);
+                assert!(app.borrow().unproven_listing_meta_requirements().is_empty());
+                if menu {
+                    harness.get_all_by_label("設定").next().unwrap().click();
+                    harness.run();
+                    if control != "menu_locked" {
+                        harness.get_by_label("ソート順").click();
+                    }
+                }
+                harness.run();
+                assert!(harness.query_by_label(stop).is_none());
+                assert!(harness.query_by_label(resume).is_none());
+            }
+        }
+    }
+
+    #[test]
     fn duration_facet_menu_stops_and_resumes_the_metadata_owner() {
         let mut app = crate::app::setup_app_for_test();
         app.duration_facet_requested = true;
@@ -9449,6 +9582,25 @@ impl App {
                 (false, false, _) => unreachable!("selected metric has unfinished progress"),
             },
         )
+    }
+
+    /// Shared by popup rows and toolbar buttons. The container closes its own
+    /// popup on a click; a toolbar has no closable parent.
+    fn draw_sort_loading_control(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(label) = self.sort_loading_control_label() else {
+            return false;
+        };
+        ui.separator();
+        if !ui.button(label).clicked() {
+            return false;
+        }
+        if matches!(self.details_image_dims_state, LazyColumnState::Cancelled) {
+            self.resume_details_meta_loading();
+        } else {
+            self.cancel_details_meta_loading();
+        }
+        ui.ctx().request_repaint();
+        true
     }
 
     fn apply_sort_control_change(&mut self) {
@@ -10494,7 +10646,7 @@ impl App {
                                         }
                                     }
                                 });
-                                if let Some(reason) = sort_lock {
+                                if let Some(reason) = sort_lock.filter(|_| self.sort_loading_control_label().is_none()) {
                                     // 無効ウィジェットは通常の hover を sense しないため、
                                     // disabled 専用ツールチップで理由を出す。
                                     let _response = ui.add_enabled(
@@ -10509,6 +10661,9 @@ impl App {
                                     SORT_CONTROL_TEST_RESPONSES.with(|responses| responses.borrow_mut().push(("menu", _response.enabled())));
                                 } else {
                                     ui.menu_button("ソート順", |ui| {
+                                        // Keep scan controls reachable while a details header
+                                        // owns sorting, just as in the toolbar/facet popup.
+                                        ui.add_enabled_ui(sort_lock.is_none(), |ui| {
                                         if let Some(root) = root_order {
                                             if let Some(mode) =
                                                 draw_collection_order_mode_menu_entries(ui, root)
@@ -10610,6 +10765,10 @@ impl App {
                                                     ui.close();
                                                 }
                                             }
+                                        }
+                                        });
+                                        if self.draw_sort_loading_control(ui) {
+                                            ui.close();
                                         }
                                     });
                                 }
@@ -12948,6 +13107,7 @@ egui::ComboBox::from_id_salt("toolbar_aspect_combo")
                                     }
                                 }
                             }
+                            self.draw_sort_loading_control(ui);
                         }
                         crate::settings::ToolbarSectionDisplay::Dropdown => {
                             let (changed, reload, open) = self.draw_grid_sort_dropdown(ui, "toolbar_sort_combo");
@@ -14731,17 +14891,8 @@ egui::ComboBox::from_id_salt("toolbar_subfolder_order_combo")
                         }
                     }
                 }
-                if let Some(label) = loading_control {
-                    ui.separator();
-                    if ui.button(label).clicked() {
-                        if matches!(self.details_image_dims_state, LazyColumnState::Cancelled) {
-                            self.resume_details_meta_loading();
-                        } else {
-                            self.cancel_details_meta_loading();
-                        }
-                        ui.ctx().request_repaint();
-                        ui.close();
-                    }
+                if self.draw_sort_loading_control(ui) {
+                    ui.close();
                 }
             },
         );
