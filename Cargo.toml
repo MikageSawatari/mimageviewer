@@ -513,7 +513,7 @@ signalsmith-stretch = "0.1.3"
 # ファイル名スタックのユーザー定義分割ルール (docs/filename-stack-scripting-plan.md)。
 # 純 Rust なので crt-static と両立 (C ビルド不要)。操作上限つきサンドボックスで
 # ユーザー編集スクリプトを安全に実行する。
-rhai = "1"
+rhai = { version = "1", features = ["sync"] }
 # 上記スクリプトから使う正規表現ヘルパー (regex_capture 等) の裏付け。線形時間保証
 # (ReDoS 不可) なのでユーザー入力パターンでも安全。tantivy 等が間接依存しているが
 # スクリプトヘルパーで直接使うため明示依存にする。
@@ -521,6 +521,7 @@ regex = "1"
 mimalloc = { version = "0.1.52", default-features = false }
 
 [dev-dependencies]
+rhai = { version = "1", features = ["metadata"] }
 libc = "0.2"
 winit = "0.30.13"
 tantivy = { version = "0.27", default-features = false, features = ["mmap", "lz4-compression", "miv-test-hooks"] }

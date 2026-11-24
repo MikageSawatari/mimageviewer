@@ -1,0 +1,400 @@
+# Audited for Rhai 1.27.0, Windows x64, default numeric features.
+# Source-derived from packages/arithmetic.rs, logic.rs, iter_basic.rs and engine.rs.
+# Also audited: engine.rs raw defaults and Rhai built-in operator dispatch.
+# Arithmetic uses bounded machine-number operations; ranges only create iterators.
+# Iteration is charged by Rhai; chars traverses bounded strings; bits visits at most 64 bits.
+# The mIV helpers perform only bounded input traversal and native equality.
+# Array membership copies each visited element once, never the needle per element.
+# Function-pointer constructors, currying, indirect calls and anonymous functions are disabled.
+# This list must never be regenerated from engine output: audit source changes first.
+!(x: bool) -> bool
+!=(x: f32, y: f32) -> bool
+!=(x: f32, y: i64) -> bool
+!=(x: i128, y: i128) -> bool
+!=(x: i16, y: i16) -> bool
+!=(x: i32, y: i32) -> bool
+!=(x: i64, y: f32) -> bool
+!=(x: i8, y: i8) -> bool
+!=(x: u128, y: u128) -> bool
+!=(x: u16, y: u16) -> bool
+!=(x: u32, y: u32) -> bool
+!=(x: u64, y: u64) -> bool
+!=(x: u8, y: u8) -> bool
+%(x: f32, y: f32) -> f32
+%(x: f32, y: i64) -> f32
+%(x: i128, y: i128) -> Result<i128, Box<EvalAltResult>>
+%(x: i16, y: i16) -> Result<i16, Box<EvalAltResult>>
+%(x: i32, y: i32) -> Result<i32, Box<EvalAltResult>>
+%(x: i64, y: f32) -> f32
+%(x: i8, y: i8) -> Result<i8, Box<EvalAltResult>>
+%(x: u128, y: u128) -> Result<u128, Box<EvalAltResult>>
+%(x: u16, y: u16) -> Result<u16, Box<EvalAltResult>>
+%(x: u32, y: u32) -> Result<u32, Box<EvalAltResult>>
+%(x: u64, y: u64) -> Result<u64, Box<EvalAltResult>>
+%(x: u8, y: u8) -> Result<u8, Box<EvalAltResult>>
+&(x: i128, y: i128) -> i128
+&(x: i16, y: i16) -> i16
+&(x: i32, y: i32) -> i32
+&(x: i8, y: i8) -> i8
+&(x: u128, y: u128) -> u128
+&(x: u16, y: u16) -> u16
+&(x: u32, y: u32) -> u32
+&(x: u64, y: u64) -> u64
+&(x: u8, y: u8) -> u8
+*(x: f32, y: f32) -> f32
+*(x: f32, y: i64) -> f32
+*(x: i128, y: i128) -> Result<i128, Box<EvalAltResult>>
+*(x: i16, y: i16) -> Result<i16, Box<EvalAltResult>>
+*(x: i32, y: i32) -> Result<i32, Box<EvalAltResult>>
+*(x: i64, y: f32) -> f32
+*(x: i8, y: i8) -> Result<i8, Box<EvalAltResult>>
+*(x: u128, y: u128) -> Result<u128, Box<EvalAltResult>>
+*(x: u16, y: u16) -> Result<u16, Box<EvalAltResult>>
+*(x: u32, y: u32) -> Result<u32, Box<EvalAltResult>>
+*(x: u64, y: u64) -> Result<u64, Box<EvalAltResult>>
+*(x: u8, y: u8) -> Result<u8, Box<EvalAltResult>>
+**(x: f32, y: f32) -> f32
+**(x: f32, y: i64) -> Result<f32, Box<EvalAltResult>>
+**(x: i128, y: i64) -> Result<i128, Box<EvalAltResult>>
+**(x: i16, y: i64) -> Result<i16, Box<EvalAltResult>>
+**(x: i32, y: i64) -> Result<i32, Box<EvalAltResult>>
+**(x: i8, y: i64) -> Result<i8, Box<EvalAltResult>>
+**(x: u128, y: i64) -> Result<u128, Box<EvalAltResult>>
+**(x: u16, y: i64) -> Result<u16, Box<EvalAltResult>>
+**(x: u32, y: i64) -> Result<u32, Box<EvalAltResult>>
+**(x: u64, y: i64) -> Result<u64, Box<EvalAltResult>>
+**(x: u8, y: i64) -> Result<u8, Box<EvalAltResult>>
++(x: f32) -> f32
++(x: f32, y: f32) -> f32
++(x: f32, y: i64) -> f32
++(x: f64) -> f64
++(x: i128) -> i128
++(x: i128, y: i128) -> Result<i128, Box<EvalAltResult>>
++(x: i16) -> i16
++(x: i16, y: i16) -> Result<i16, Box<EvalAltResult>>
++(x: i32) -> i32
++(x: i32, y: i32) -> Result<i32, Box<EvalAltResult>>
++(x: i64) -> i64
++(x: i64, y: f32) -> f32
++(x: i8) -> i8
++(x: i8, y: i8) -> Result<i8, Box<EvalAltResult>>
++(x: u128, y: u128) -> Result<u128, Box<EvalAltResult>>
++(x: u16, y: u16) -> Result<u16, Box<EvalAltResult>>
++(x: u32, y: u32) -> Result<u32, Box<EvalAltResult>>
++(x: u64, y: u64) -> Result<u64, Box<EvalAltResult>>
++(x: u8, y: u8) -> Result<u8, Box<EvalAltResult>>
+-(x: f32) -> f32
+-(x: f32, y: f32) -> f32
+-(x: f32, y: i64) -> f32
+-(x: f64) -> f64
+-(x: i128) -> Result<i128, Box<EvalAltResult>>
+-(x: i128, y: i128) -> Result<i128, Box<EvalAltResult>>
+-(x: i16) -> Result<i16, Box<EvalAltResult>>
+-(x: i16, y: i16) -> Result<i16, Box<EvalAltResult>>
+-(x: i32) -> Result<i32, Box<EvalAltResult>>
+-(x: i32, y: i32) -> Result<i32, Box<EvalAltResult>>
+-(x: i64) -> Result<i64, Box<EvalAltResult>>
+-(x: i64, y: f32) -> f32
+-(x: i8) -> Result<i8, Box<EvalAltResult>>
+-(x: i8, y: i8) -> Result<i8, Box<EvalAltResult>>
+-(x: u128, y: u128) -> Result<u128, Box<EvalAltResult>>
+-(x: u16, y: u16) -> Result<u16, Box<EvalAltResult>>
+-(x: u32, y: u32) -> Result<u32, Box<EvalAltResult>>
+-(x: u64, y: u64) -> Result<u64, Box<EvalAltResult>>
+-(x: u8, y: u8) -> Result<u8, Box<EvalAltResult>>
+/(x: f32, y: f32) -> f32
+/(x: f32, y: i64) -> f32
+/(x: i128, y: i128) -> Result<i128, Box<EvalAltResult>>
+/(x: i16, y: i16) -> Result<i16, Box<EvalAltResult>>
+/(x: i32, y: i32) -> Result<i32, Box<EvalAltResult>>
+/(x: i64, y: f32) -> f32
+/(x: i8, y: i8) -> Result<i8, Box<EvalAltResult>>
+/(x: u128, y: u128) -> Result<u128, Box<EvalAltResult>>
+/(x: u16, y: u16) -> Result<u16, Box<EvalAltResult>>
+/(x: u32, y: u32) -> Result<u32, Box<EvalAltResult>>
+/(x: u64, y: u64) -> Result<u64, Box<EvalAltResult>>
+/(x: u8, y: u8) -> Result<u8, Box<EvalAltResult>>
+<(x: f32, y: f32) -> bool
+<(x: f32, y: i64) -> bool
+<(x: i128, y: i128) -> bool
+<(x: i16, y: i16) -> bool
+<(x: i32, y: i32) -> bool
+<(x: i64, y: f32) -> bool
+<(x: i8, y: i8) -> bool
+<(x: u128, y: u128) -> bool
+<(x: u16, y: u16) -> bool
+<(x: u32, y: u32) -> bool
+<(x: u64, y: u64) -> bool
+<(x: u8, y: u8) -> bool
+<<(x: i128, y: i64) -> i128
+<<(x: i16, y: i64) -> i16
+<<(x: i32, y: i64) -> i32
+<<(x: i8, y: i64) -> i8
+<<(x: u128, y: i64) -> u128
+<<(x: u16, y: i64) -> u16
+<<(x: u32, y: i64) -> u32
+<<(x: u64, y: i64) -> u64
+<<(x: u8, y: i64) -> u8
+<=(x: f32, y: f32) -> bool
+<=(x: f32, y: i64) -> bool
+<=(x: i128, y: i128) -> bool
+<=(x: i16, y: i16) -> bool
+<=(x: i32, y: i32) -> bool
+<=(x: i64, y: f32) -> bool
+<=(x: i8, y: i8) -> bool
+<=(x: u128, y: u128) -> bool
+<=(x: u16, y: u16) -> bool
+<=(x: u32, y: u32) -> bool
+<=(x: u64, y: u64) -> bool
+<=(x: u8, y: u8) -> bool
+==(x: f32, y: f32) -> bool
+==(x: f32, y: i64) -> bool
+==(x: i128, y: i128) -> bool
+==(x: i16, y: i16) -> bool
+==(x: i32, y: i32) -> bool
+==(x: i64, y: f32) -> bool
+==(x: i8, y: i8) -> bool
+==(x: u128, y: u128) -> bool
+==(x: u16, y: u16) -> bool
+==(x: u32, y: u32) -> bool
+==(x: u64, y: u64) -> bool
+==(x: u8, y: u8) -> bool
+>(x: f32, y: f32) -> bool
+>(x: f32, y: i64) -> bool
+>(x: i128, y: i128) -> bool
+>(x: i16, y: i16) -> bool
+>(x: i32, y: i32) -> bool
+>(x: i64, y: f32) -> bool
+>(x: i8, y: i8) -> bool
+>(x: u128, y: u128) -> bool
+>(x: u16, y: u16) -> bool
+>(x: u32, y: u32) -> bool
+>(x: u64, y: u64) -> bool
+>(x: u8, y: u8) -> bool
+>=(x: f32, y: f32) -> bool
+>=(x: f32, y: i64) -> bool
+>=(x: i128, y: i128) -> bool
+>=(x: i16, y: i16) -> bool
+>=(x: i32, y: i32) -> bool
+>=(x: i64, y: f32) -> bool
+>=(x: i8, y: i8) -> bool
+>=(x: u128, y: u128) -> bool
+>=(x: u16, y: u16) -> bool
+>=(x: u32, y: u32) -> bool
+>=(x: u64, y: u64) -> bool
+>=(x: u8, y: u8) -> bool
+>>(x: i128, y: i64) -> i128
+>>(x: i16, y: i64) -> i16
+>>(x: i32, y: i64) -> i32
+>>(x: i8, y: i64) -> i8
+>>(x: u128, y: i64) -> u128
+>>(x: u16, y: i64) -> u16
+>>(x: u32, y: i64) -> u32
+>>(x: u64, y: i64) -> u64
+>>(x: u8, y: i64) -> u8
+^(x: i128, y: i128) -> i128
+^(x: i16, y: i16) -> i16
+^(x: i32, y: i32) -> i32
+^(x: i8, y: i8) -> i8
+^(x: u128, y: u128) -> u128
+^(x: u16, y: u16) -> u16
+^(x: u32, y: u32) -> u32
+^(x: u64, y: u64) -> u64
+^(x: u8, y: u8) -> u8
+abs(x: f32) -> f32
+abs(x: f64) -> f64
+abs(x: i128) -> Result<i128, Box<EvalAltResult>>
+abs(x: i16) -> Result<i16, Box<EvalAltResult>>
+abs(x: i32) -> Result<i32, Box<EvalAltResult>>
+abs(x: i64) -> Result<i64, Box<EvalAltResult>>
+abs(x: i8) -> Result<i8, Box<EvalAltResult>>
+bits(value: i64) -> Result<BitRange, Box<EvalAltResult>>
+bits(value: i64, from: i64) -> Result<BitRange, Box<EvalAltResult>>
+bits(value: i64, from: i64, len: i64) -> Result<BitRange, Box<EvalAltResult>>
+bits(value: i64, range: range) -> Result<BitRange, Box<EvalAltResult>>
+bits(value: i64, range: range=) -> Result<BitRange, Box<EvalAltResult>>
+chars(string: string) -> CharsStream
+chars(string: string, range: range) -> CharsStream
+chars(string: string, range: range=) -> CharsStream
+chars(string: string, start: i64) -> CharsStream
+chars(string: string, start: i64, len: i64) -> CharsStream
+contains(array: &mut array, value: Dynamic) -> Result<bool, Box<EvalAltResult>>
+contains(map: &mut map, property: string) -> bool
+contains(range: &mut range, value: i64) -> bool
+contains(range: &mut range=, value: i64) -> bool
+contains(string: string, substring: string) -> bool
+end(range: &mut range) -> i64
+end(range: &mut range=) -> i64
+ends_with(string: string, suffix: string) -> bool
+get$bits(value: i64) -> Result<BitRange, Box<EvalAltResult>>
+get$chars(string: string) -> CharsStream
+get$end(range: &mut range) -> i64
+get$end(range: &mut range=) -> i64
+get$is_empty(range: &mut range) -> bool
+get$is_empty(range: &mut range=) -> bool
+get$is_even(x: i128) -> bool
+get$is_even(x: i16) -> bool
+get$is_even(x: i32) -> bool
+get$is_even(x: i64) -> bool
+get$is_even(x: i8) -> bool
+get$is_even(x: u128) -> bool
+get$is_even(x: u16) -> bool
+get$is_even(x: u32) -> bool
+get$is_even(x: u64) -> bool
+get$is_even(x: u8) -> bool
+get$is_exclusive(range: &mut range) -> bool
+get$is_exclusive(range: &mut range=) -> bool
+get$is_inclusive(range: &mut range) -> bool
+get$is_inclusive(range: &mut range=) -> bool
+get$is_odd(x: i128) -> bool
+get$is_odd(x: i16) -> bool
+get$is_odd(x: i32) -> bool
+get$is_odd(x: i64) -> bool
+get$is_odd(x: i8) -> bool
+get$is_odd(x: u128) -> bool
+get$is_odd(x: u16) -> bool
+get$is_odd(x: u32) -> bool
+get$is_odd(x: u64) -> bool
+get$is_odd(x: u8) -> bool
+get$is_zero(x: f32) -> bool
+get$is_zero(x: f64) -> bool
+get$is_zero(x: i128) -> bool
+get$is_zero(x: i16) -> bool
+get$is_zero(x: i32) -> bool
+get$is_zero(x: i64) -> bool
+get$is_zero(x: i8) -> bool
+get$is_zero(x: u128) -> bool
+get$is_zero(x: u16) -> bool
+get$is_zero(x: u32) -> bool
+get$is_zero(x: u64) -> bool
+get$is_zero(x: u8) -> bool
+get$start(range: &mut range) -> i64
+get$start(range: &mut range=) -> i64
+is_empty(range: &mut range) -> bool
+is_empty(range: &mut range=) -> bool
+is_even(x: i128) -> bool
+is_even(x: i16) -> bool
+is_even(x: i32) -> bool
+is_even(x: i64) -> bool
+is_even(x: i8) -> bool
+is_even(x: u128) -> bool
+is_even(x: u16) -> bool
+is_even(x: u32) -> bool
+is_even(x: u64) -> bool
+is_even(x: u8) -> bool
+is_exclusive(range: &mut range) -> bool
+is_exclusive(range: &mut range=) -> bool
+is_inclusive(range: &mut range) -> bool
+is_inclusive(range: &mut range=) -> bool
+is_odd(x: i128) -> bool
+is_odd(x: i16) -> bool
+is_odd(x: i32) -> bool
+is_odd(x: i64) -> bool
+is_odd(x: i8) -> bool
+is_odd(x: u128) -> bool
+is_odd(x: u16) -> bool
+is_odd(x: u32) -> bool
+is_odd(x: u64) -> bool
+is_odd(x: u8) -> bool
+is_zero(x: f32) -> bool
+is_zero(x: f64) -> bool
+is_zero(x: i128) -> bool
+is_zero(x: i16) -> bool
+is_zero(x: i32) -> bool
+is_zero(x: i64) -> bool
+is_zero(x: i8) -> bool
+is_zero(x: u128) -> bool
+is_zero(x: u16) -> bool
+is_zero(x: u32) -> bool
+is_zero(x: u64) -> bool
+is_zero(x: u8) -> bool
+len(array: &mut array) -> i64
+len(string: string) -> i64
+max(x: f32, y: f32) -> f32
+max(x: f32, y: f64) -> f64
+max(x: f32, y: i64) -> f32
+max(x: f64, y: f32) -> f64
+max(x: f64, y: f64) -> f64
+max(x: f64, y: i64) -> f64
+max(x: i128, y: i128) -> i128
+max(x: i16, y: i16) -> i16
+max(x: i32, y: i32) -> i32
+max(x: i64, y: f32) -> f32
+max(x: i64, y: f64) -> f64
+max(x: i64, y: i64) -> i64
+max(x: i8, y: i8) -> i8
+max(x: u128, y: u128) -> u128
+max(x: u16, y: u16) -> u16
+max(x: u32, y: u32) -> u32
+max(x: u64, y: u64) -> u64
+max(x: u8, y: u8) -> u8
+min(x: f32, y: f32) -> f32
+min(x: f32, y: f64) -> f64
+min(x: f32, y: i64) -> f32
+min(x: f64, y: f32) -> f64
+min(x: f64, y: f64) -> f64
+min(x: f64, y: i64) -> f64
+min(x: i128, y: i128) -> i128
+min(x: i16, y: i16) -> i16
+min(x: i32, y: i32) -> i32
+min(x: i64, y: f32) -> f32
+min(x: i64, y: f64) -> f64
+min(x: i64, y: i64) -> i64
+min(x: i8, y: i8) -> i8
+min(x: u128, y: u128) -> u128
+min(x: u16, y: u16) -> u16
+min(x: u32, y: u32) -> u32
+min(x: u64, y: u64) -> u64
+min(x: u8, y: u8) -> u8
+range(from: f64, to: f64, step: f64) -> Result<StepRange<FLOAT>, Box<EvalAltResult>>
+range(from: i128, to: i128) -> Range<i128>
+range(from: i128, to: i128, step: i128) -> Result<StepRange<i128>, Box<EvalAltResult>>
+range(from: i16, to: i16) -> Range<i16>
+range(from: i16, to: i16, step: i16) -> Result<StepRange<i16>, Box<EvalAltResult>>
+range(from: i32, to: i32) -> Range<i32>
+range(from: i32, to: i32, step: i32) -> Result<StepRange<i32>, Box<EvalAltResult>>
+range(from: i64, to: i64) -> Range<i64>
+range(from: i64, to: i64, step: i64) -> Result<StepRange<i64>, Box<EvalAltResult>>
+range(from: i8, to: i8) -> Range<i8>
+range(from: i8, to: i8, step: i8) -> Result<StepRange<i8>, Box<EvalAltResult>>
+range(from: u128, to: u128) -> Range<u128>
+range(from: u128, to: u128, step: u128) -> Result<StepRange<u128>, Box<EvalAltResult>>
+range(from: u16, to: u16) -> Range<u16>
+range(from: u16, to: u16, step: u16) -> Result<StepRange<u16>, Box<EvalAltResult>>
+range(from: u32, to: u32) -> Range<u32>
+range(from: u32, to: u32, step: u32) -> Result<StepRange<u32>, Box<EvalAltResult>>
+range(from: u64, to: u64) -> Range<u64>
+range(from: u64, to: u64, step: u64) -> Result<StepRange<u64>, Box<EvalAltResult>>
+range(from: u8, to: u8) -> Range<u8>
+range(from: u8, to: u8, step: u8) -> Result<StepRange<u8>, Box<EvalAltResult>>
+range(range: std::ops::Range<FLOAT>, step: f64) -> Result<StepRange<FLOAT>, Box<EvalAltResult>>
+range(range: std::ops::Range<i128>, step: i128) -> Result<StepRange<i128>, Box<EvalAltResult>>
+range(range: std::ops::Range<i16>, step: i16) -> Result<StepRange<i16>, Box<EvalAltResult>>
+range(range: std::ops::Range<i32>, step: i32) -> Result<StepRange<i32>, Box<EvalAltResult>>
+range(range: std::ops::Range<i64>, step: i64) -> Result<StepRange<i64>, Box<EvalAltResult>>
+range(range: std::ops::Range<i8>, step: i8) -> Result<StepRange<i8>, Box<EvalAltResult>>
+range(range: std::ops::Range<u128>, step: u128) -> Result<StepRange<u128>, Box<EvalAltResult>>
+range(range: std::ops::Range<u16>, step: u16) -> Result<StepRange<u16>, Box<EvalAltResult>>
+range(range: std::ops::Range<u32>, step: u32) -> Result<StepRange<u32>, Box<EvalAltResult>>
+range(range: std::ops::Range<u64>, step: u64) -> Result<StepRange<u64>, Box<EvalAltResult>>
+range(range: std::ops::Range<u8>, step: u8) -> Result<StepRange<u8>, Box<EvalAltResult>>
+sign(x: f32) -> Result<i64, Box<EvalAltResult>>
+sign(x: f64) -> Result<i64, Box<EvalAltResult>>
+sign(x: i128) -> i64
+sign(x: i16) -> i64
+sign(x: i32) -> i64
+sign(x: i64) -> i64
+sign(x: i8) -> i64
+start(range: &mut range) -> i64
+start(range: &mut range=) -> i64
+starts_with(string: string, prefix: string) -> bool
+to_lower(string: string) -> String
+|(x: i128, y: i128) -> i128
+|(x: i16, y: i16) -> i16
+|(x: i32, y: i32) -> i32
+|(x: i8, y: i8) -> i8
+|(x: u128, y: u128) -> u128
+|(x: u16, y: u16) -> u16
+|(x: u32, y: u32) -> u32
+|(x: u64, y: u64) -> u64
+|(x: u8, y: u8) -> u8

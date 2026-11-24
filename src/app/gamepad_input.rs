@@ -8549,6 +8549,27 @@ impl App {
 
         match action {
             RingActionId::None | RingActionId::Unknown(_) => None,
+            // Stage 1 registers assignments only; script execution is not connected yet.
+            RingActionId::ScriptSlot1
+            | RingActionId::ScriptSlot2
+            | RingActionId::ScriptSlot3
+            | RingActionId::ScriptSlot4
+            | RingActionId::ScriptSlot5
+            | RingActionId::ScriptSlot6
+            | RingActionId::ScriptSlot7
+            | RingActionId::ScriptSlot8
+            | RingActionId::ScriptSlot9
+            | RingActionId::ScriptSlot10
+            | RingActionId::ScriptSlot11
+            | RingActionId::ScriptSlot12
+            | RingActionId::ScriptSlot13
+            | RingActionId::ScriptSlot14
+            | RingActionId::ScriptSlot15
+            | RingActionId::ScriptSlot16
+            | RingActionId::ScriptSlot17
+            | RingActionId::ScriptSlot18
+            | RingActionId::ScriptSlot19
+            | RingActionId::ScriptSlot20 => None,
             action @ (RingActionId::CopyFiles
             | RingActionId::ImageCopyPath
             | RingActionId::ImageCopyFileName
@@ -15137,3 +15158,32 @@ mod physical_boundary_tests {
 #[cfg(test)]
 #[path = "spread_step_input_tests.rs"]
 mod spread_step_input_tests;
+
+#[cfg(test)]
+mod script_slot_assignment_stage_tests {
+    use super::*;
+
+    #[test]
+    fn script_slot_ring_actions_are_noops_before_execution_is_connected() {
+        let mut app = crate::app::setup_app_for_test();
+        let ctx = egui::Context::default();
+        let settings = serde_json::to_value(&app.settings).unwrap();
+        let selected = app.selected;
+        let fullscreen_idx = app.fullscreen_idx;
+        for &context in RingShortcutContext::all() {
+            let actions = RingActionId::available_for_context(context)
+                .into_iter()
+                .filter(|action| action.script_slot_key_action().is_some());
+            for action in actions {
+                assert!(
+                    app.apply_ring_action(&ctx, context, action, "script-slot-assignment-test")
+                        .is_none()
+                );
+                assert_eq!(app.selected, selected);
+                assert_eq!(app.fullscreen_idx, fullscreen_idx);
+                assert!(app.saved_group_open_request_id_for_test().is_none());
+                assert_eq!(serde_json::to_value(&app.settings).unwrap(), settings);
+            }
+        }
+    }
+}

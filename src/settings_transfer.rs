@@ -649,6 +649,8 @@ preferences_policy! {
         subfolder_expansion_filter_size_preset => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         stack_separator => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         stack_script_enabled => @prefs("分類ルールをスクリプト (カスタム) で行う", "folder/stack-script", |_, _| true, plain, plain) "移行先のローカルスクリプト実行方針を保持";
+        operation_script_enabled => "ローカルスクリプトの実行許可。段5で環境設定UIを追加する";
+        operation_script_notice_confirmed => "第三者のスクリプトについての端末内の確認記録";
         thumb_px => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         text_preview_scale => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
         text_smart_snap_enabled => "環境設定外で管理する表示/ツールバー/補正/編集/再生状態、またはその互換 carrier";
@@ -2642,7 +2644,7 @@ mod tests {
     #[test]
     fn all_settings_fields_are_classified() {
         let entries = classifications();
-        assert_eq!(entries.len(), 518);
+        assert_eq!(entries.len(), 520);
         assert_eq!(
             entries
                 .iter()
@@ -2655,7 +2657,7 @@ mod tests {
                 .iter()
                 .filter(|(_, reason)| reason.is_some())
                 .count(),
-            345
+            347
         );
         let unique: HashSet<_> = entries.iter().map(|(key, _)| key).collect();
         assert_eq!(unique.len(), entries.len());
@@ -2685,7 +2687,12 @@ mod tests {
                 .all(|(_, reason)| reason.is_none_or(|reason| !reason.is_empty()))
         );
         let wire = wire_keys();
-        for key in ["agent_show_current_view", "agent_allow_settings"] {
+        for key in [
+            "agent_show_current_view",
+            "agent_allow_settings",
+            "operation_script_enabled",
+            "operation_script_notice_confirmed",
+        ] {
             assert!(
                 entries
                     .iter()

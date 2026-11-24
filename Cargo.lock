@@ -1248,6 +1248,7 @@ dependencies = [
  "castaway",
  "cfg-if",
  "itoa",
+ "serde",
  "static_assertions",
  "zmij",
 ]
@@ -6160,6 +6161,8 @@ dependencies = [
  "num-traits",
  "once_cell",
  "rhai_codegen",
+ "serde",
+ "serde_json",
  "smallvec",
  "smartstring",
  "thin-vec",
@@ -6671,6 +6674,9 @@ name = "smallvec"
 version = "1.16.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3244542535d5de959d90ec55d1b5ff0fd2bb7b1310223907d5f11932847f7b59"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "smartstring"

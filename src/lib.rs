@@ -241,6 +241,7 @@ mod image_folder_zip;
 mod image_folder_zip_job;
 mod image_folder_zip_metadata;
 mod musicvideo_launch;
+pub mod operation_script;
 pub mod vlm_addon;
 pub mod vlm_addon_download;
 // filename_stack_ui は private な App へ impl を追加する library-internal module。

@@ -1,5 +1,10 @@
 # キーカスタマイズ機能 実装プラン (簡易版 / テキスト ini)
 
+§1.363 段1: `ScriptSlot1..20` をGlobal / Press / 既定キーなしで登録する。
+表示名は「スクリプト操作 N」。同じ番号の `RingActionId` とキー行を共用する。
+この段は割り当ての土台までで、キーの問い合わせ・native動画への転送・操作実行はまだ接続しない。
+スクリプトの `label` を表示名へ付けるUIは段5で行う。[設計](operation-script-plan.md)。
+
 §1.476: 閲覧中のタグ欄の検索確定は、既存の固定 TextEdit Enter 受付を共用する。
 通常の欄とフォーカス予約からの受付を `submit_tag_search_input` にそろえ、IME・modal の拒否条件と
 egui/native の入力所有を保つ。新しい KeyAction・割当・pending 状態は追加しない。

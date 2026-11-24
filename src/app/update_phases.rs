@@ -362,6 +362,20 @@ impl App {
     }
 
     pub(super) fn service_startup_notifications(&mut self, ctx: &egui::Context) {
+        // 起動後最初のROOT passと設定ON/OFFを同じ状態遷移に通す。
+        // ここでは投入とtry_recvだけ。スロットやイベントの問い合わせは段2以降。
+        let script_disabled = matches!(
+            self.operation_script.state,
+            crate::operation_script::OperationScriptState::Disabled
+        );
+        if self.settings.operation_script_enabled == script_disabled {
+            self.operation_script.sync_enabled(
+                self.settings.operation_script_enabled,
+                &crate::data_dir::get(),
+                ctx,
+            );
+        }
+        self.operation_script.poll();
         self.poll_indexer_notifications(
             ctx.input(|input| input.viewport().minimized.unwrap_or(false)),
         );
