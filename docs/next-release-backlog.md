@@ -47,7 +47,8 @@
 
 ### 1.885 「編集内容の復元」や mIV 内の名前の変更・移動の後、本を開くと読書位置が使われず先頭から開く — §1.875 a のサブ PC 確認から (2026-11-24)
 
-- 状態: **v5.7.0 で直す (利用者決定 2026-11-24、選択肢「v5.7.0 で直す (Recommended)」)、案 A で担当 tree-dnd-464 が実装**。原因はコードと使い捨てのテストで確認済み。v4.6.0 (291b32e5b) からのリリース済みの不具合で、v5.7.0 の退行ではない。
+- 状態: **master に取り込み (5d417a72d、独立レビュー r2 ACCEPT)。サブ PC で確認 OK (2026-11-24、観測はサブ PC 担当の Claude。復元した本が 4 ページ目から、mIV 内で名前を変えた本も 6 ページ目から開いた。結果 v570cesults-875
+otes-recheck.md)。以前の状態: v5.7.0 で直す (利用者決定 2026-11-24、選択肢「v5.7.0 で直す (Recommended)」)、案 A で担当 tree-dnd-464 が実装**。原因はコードと使い捨てのテストで確認済み。v4.6.0 (291b32e5b) からのリリース済みの不具合で、v5.7.0 の退行ではない。
 - 観測 (サブ PC 担当の Claude、master 1d0433e84): 復元したあと、一覧の本には読んだ位置のバーが出るのに、開くと 1 ページ目からになる。ログは `book resume skipped: reason=HiddenIdentity`。移動先で読み直すと直る。
 - 原因 (担当のコード参照と使い捨てのテスト): 読書位置の行の `page_identity` に本の絶対パス (`container`) が入っている。`copy_resume_store` (復元のコピー) と `migrate_resume_store` → `migrate_store_family` (mIV 内の名前の変更・移動) は行のキーだけを書き換え、identity は元のパスのまま残す。開くときの `PreparedPageIdentityIndex::resolve` は完全一致で照合するので HiddenIdentity になり、`app.rs` の本の再開が先頭を開く。ZIP 内の本の行・製本・画像フォルダ→ZIP 変換は identity も書き換えていて正しい。
 - 不変条件: キーを変える操作は、同じトランザクションで identity も書き換える。
