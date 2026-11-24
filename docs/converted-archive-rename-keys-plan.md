@@ -1,6 +1,6 @@
 # 変換して開く書庫の改名・移動で、変換キャッシュ側のキーも移す (§1.886)
 
-2026-11-24 設計担当 ClaudeCode Opus 5.5 (セッション conv-rename-886)。状態: **設計 v5 (独立設計レビュー r5 ACCEPT)、実装済み・実装の独立レビュー中**。
+2026-11-24 設計担当 ClaudeCode Opus 5.5 (セッション conv-rename-886)。状態: **設計 v5 (独立設計レビュー r5 ACCEPT)、実装済み (実装の独立レビュー r2 ACCEPT、関連テスト 341 本成功)。master 未取り込み・実機未確認**。
 バックログの正本は [next-release-backlog.md](next-release-backlog.md) §1.886。前提として読む文書:
 [edit-content-identity-plan.md](edit-content-identity-plan.md) §4 (変換キャッシュ ZIP の置き場と 4 面)、
 [book-key-migration-plan.md](book-key-migration-plan.md) §3.4、`src/rename_key_migration.rs` のモジュール doc、
@@ -302,6 +302,12 @@ job は今までどおり配下の cache の面を移さないだけ)。旧形�
     §5 に記録した。
   - P3: journal のテストが job を実行していない。→ 実装担当が、起動時の読み込みから本番のキュー・dispatcher・collection 段の
     完了までを通す handler テストに直した。
+- **実装 r2** (同じ会話、read-only、2026-11-25、対象 b7b1e3ec8..3d5f9ac72): **ACCEPT** (追加の指摘なし)。r1 P2 は、再変換で
+  照合が外れるのは既存の性質で、消えるのは `edit_previews` の行とプレビューのファイルだけ (編集の正本には及ばない) として、
+  この項目の阻害指摘から撤回。r1 P3 の解消を確認。
+- **検証** (設計担当、run-heavy 経由の nextest、3d5f9ac72): filter `section1886`・`section1885`・`rename_key_migration`・
+  `book_resume`・`content_identity::restore`・`rar_archive_cache`・`rename_migration`・`rename_item`・`book_bookmark`・
+  `caption_display`・`converted_archive_rename` で 341 本すべて成功。本体 lib の全件は流していない (master 取り込み後に統括)。
 
 ## 5. 別項目の候補 (この項目では直さない)
 
