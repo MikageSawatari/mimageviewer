@@ -17078,6 +17078,9 @@ pub struct App {
     /// 詳細は [`crate::post_operation_selection`]。
     pub(crate) post_operation_selection:
         Option<crate::post_operation_selection::PostOperationSelection>,
+    post_operation_selection_seq: u64,
+    pub(crate) shell_paste_service: crate::shell_paste::ShellPasteService,
+    pub(crate) shell_paste_request: Option<main_drop::ShellPasteRunning>,
 
     // ── 右クリックコンテキストメニュー ─────────────────────────
     /// コンテキストメニューの対象アイテムインデックス
@@ -21194,6 +21197,9 @@ impl App {
             operation_customize_state: None,
             checked: std::collections::HashSet::new(),
             post_operation_selection: None,
+            post_operation_selection_seq: 0,
+            shell_paste_service: crate::shell_paste::ShellPasteService::default(),
+            shell_paste_request: None,
             context_menu_idx: None,
             context_menu_pos: egui::Pos2::ZERO,
             mouse_ring_flick: None,
@@ -64459,6 +64465,36 @@ impl App {
         paths: &[PathBuf],
         verb: crate::native_context_menu::ShellClipboardVerb,
     ) {
+        self.invoke_shell_clipboard_verb_for_paths_with(
+            ctx,
+            paths,
+            verb,
+            crate::native_context_menu::invoke_shell_file_verb,
+        );
+    }
+
+    pub(crate) fn invoke_shell_clipboard_verb_for_paths_with(
+        &mut self,
+        ctx: &egui::Context,
+        paths: &[PathBuf],
+        verb: crate::native_context_menu::ShellClipboardVerb,
+        invoke: impl FnOnce(
+            isize,
+            &[PathBuf],
+            crate::native_context_menu::ShellClipboardVerb,
+            Option<crate::cut_clipboard::LocalCutDataObject>,
+        ) -> Result<u32, String>,
+    ) {
+        if self.shell_paste_request.is_some()
+            && matches!(
+                verb,
+                crate::native_context_menu::ShellClipboardVerb::Copy
+                    | crate::native_context_menu::ShellClipboardVerb::Cut
+            )
+        {
+            self.show_feedback_warning(main_drop::SHELL_PASTE_BUSY_MESSAGE.to_owned());
+            return;
+        }
         if paths.is_empty() {
             return;
         }
@@ -64489,8 +64525,7 @@ impl App {
         };
         let local_write = self.cut_clipboard.begin_local_write(intent, paths);
         let cut_data_object = local_write.cut_data_object();
-        let result =
-            crate::native_context_menu::invoke_shell_file_verb(hwnd, paths, verb, cut_data_object);
+        let result = invoke(hwnd, paths, verb, cut_data_object);
         Self::resync_egui_modifiers_from_os(ctx);
         match result {
             Ok(os_sequence) => {
@@ -64547,6 +64582,8 @@ impl App {
     }
 
     pub(crate) fn resync_egui_modifiers_from_os(ctx: &egui::Context) {
+        #[cfg(test)]
+        main_drop::record_modifier_resync_for_test();
         #[cfg(windows)]
         {
             if !ctx.input(|i| i.viewport().focused).unwrap_or(true) {
@@ -78291,14 +78328,23 @@ impl App {
         &mut self,
         folder: std::path::PathBuf,
         expected: crate::post_operation_selection::ExpectedOutputs,
-    ) {
+    ) -> crate::post_operation_selection::PostOperationSelectionId {
+        self.post_operation_selection_seq = self
+            .post_operation_selection_seq
+            .checked_add(1)
+            .expect("post-operation selection request ID exhausted");
+        let id = crate::post_operation_selection::PostOperationSelectionId(
+            self.post_operation_selection_seq,
+        );
         self.post_operation_selection = Some(
             crate::post_operation_selection::PostOperationSelection::new(
+                id,
                 folder,
                 expected,
                 std::time::Instant::now(),
             ),
         );
+        id
     }
 
     /// 積んだ要求を取り下げる。
@@ -78320,7 +78366,7 @@ impl App {
     pub(crate) fn request_post_operation_selection_for_added_items(
         &mut self,
         folder: std::path::PathBuf,
-    ) {
+    ) -> crate::post_operation_selection::PostOperationSelectionId {
         let before = self
             .items
             .iter()
@@ -78330,7 +78376,7 @@ impl App {
         self.request_post_operation_selection(
             folder,
             crate::post_operation_selection::ExpectedOutputs::AddedSince(before),
-        );
+        )
     }
 
     /// `select_after_load` のヒントで items 内をケース無視で検索し、見つかれば

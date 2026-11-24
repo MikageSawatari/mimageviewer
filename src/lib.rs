@@ -407,6 +407,7 @@ pub mod settings_restore;
 pub mod settings_transfer;
 pub mod shape_fit;
 pub mod shell_file_ops;
+pub(crate) mod shell_paste;
 pub mod sidecar;
 pub mod sidecar_import;
 mod similar_array_owner;

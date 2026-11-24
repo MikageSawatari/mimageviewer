@@ -640,3 +640,89 @@ section1335_tray_image_folder_book_backspace_quit_restarts_explicit_book_list
 指摘なし。ファイルの切り取り・コピーの入口 (キー、カスタムキー、全画面、ゲームパッド・リング・ジェスチャ) はすべて
 `invoke_shell_clipboard_verb_for_paths` に集まり、断る位置は書き込みの予約・切り取り監視・Shell の動詞より前と確認された。
 Remote・agent にファイルのクリップボード操作は無く、ドラッグはクリップボードを使わない。
+
+### 5.7 実装の記録（2026-11-25、§2、未コミット）
+
+§2.1〜2.4 を実装。3 入口は `start_shell_paste` に集約し、読み取りだけの拒否を先に行う。
+常駐 STA は初回投入で起動し、OLE 初期化とメッセージポンプを保ち、要求別の動詞の呼び出し結果を root poll へ返す。
+UI は起動・呼び出し・終了を待たず、クリップボードの読み取り・照合は追加していない。
+番号付き選択要求、実行中の相互拒否、ファイルの切り取り・コピーの先頭ガードと §2.6 の計測を追加した。
+
+| 設計節 | 変更ファイル | 内容 |
+| --- | --- | --- |
+| §2.1〜2.4・§2.6 | `src/shell_paste.rs`、`src/lib.rs` | 常駐 `shell-paste` STA、channel / event / メッセージポンプ、要求別の完了と ROOT repaint、join なし。テストでは App ごとの fake worker を使う |
+| §2.1〜2.4・§2.6 | `src/app.rs`、`src/app/main_drop.rs`、`src/app/update_phases.rs`、`src/ui_dialogs/context_menu.rs` | 3 入口の共通受付、整理・D&D との受付、共通ファイル切り取り・コピーの先頭ガード、root poll、修飾キー同期、perf |
+| §2.1・§2.3・§2.4 | `src/post_operation_selection.rs`、`src/app.rs` | 共通受付だけで番号を発行、take / 戻しで保存、失敗完了は自分の番号だけを取り下げる |
+| §2.6 | `src/app/shell_paste_tests.rs`、`src/app/main_drop_tests.rs`、`src/ui_folder_pane_drop_tests.rs` | handler-level / 状態遷移の追加と既存同期テストの worker 完了 + poll への移行。期待値は維持 |
+| §2.6 | `src/shell_paste_native_tests.rs`、`src/cut_clipboard.rs`、`src/ui_dialogs/context_menu.rs` | ignored の実 Shell テスト、既存の完了通知の thread 観測と clipboard 書き込み前の副作用を検査する test-only の観測点 |
+| §4（§2 の分） | `docs/ui-responsiveness.md`、`docs/async-architecture.md`、`docs/folder-tree-dnd-plan.md`、`docs/next-release-backlog.md`、本書 | 同期呼び出しの既知の例外を置き換え、常駐 STA の理由と寿命・受付・検証待ちを記録 |
+
+追加テスト（通常 13 件、実 Shell ignored 2 件）:
+
+```text
+shell_paste_runs_off_caller_and_reuses_worker_after_invocation
+shell_paste_submission_and_drop_do_not_wait_for_invocation
+shell_paste_tree_ctrl_v_and_grid_menu_invoke_once_off_caller_and_keep_origin
+shell_paste_duplicate_preserves_undo_receipt_revision_and_exact_selection
+shell_paste_running_refuses_tree_transfer_and_organize_before_mutation
+shell_paste_organize_running_refuses_tree_but_preserves_ctrl_v_and_grid_menu
+shell_paste_failed_completion_retires_only_its_selection_and_new_folder_completion_survives
+shell_paste_success_keeps_selection_repaints_root_and_resyncs_modifiers_once
+shell_paste_disconnected_completion_warns_and_retires_its_selection
+shell_paste_tree_refusals_resolve_books_only_after_predicate_and_keep_selection
+shell_paste_selection_ids_are_unique_and_survive_wait_apply_take_restore
+shell_paste_pending_file_cut_copy_have_no_write_side_effects_and_completion_restores_admission
+shell_paste_pending_preserves_grid_and_fullscreen_image_copy_dispatch
+shell_paste_native_hdrop_copy_uses_resident_sta
+shell_paste_native_local_cut_completes_on_original_sta
+```
+
+既存テストの変更（3 件）:
+
+```text
+main_drop_paste_selection_belongs_only_to_the_current_real_folder
+main_drop_paste_to_other_folder_creates_no_selection_and_ctrl_v_uses_the_same_helper
+main_drop_books_rejection_and_default_resolution_are_shared_by_all_operation_boundaries
+```
+
+共有 `TreeDropTest` fixture の非同期化が適用される既存テスト（12 件）:
+
+```text
+folder_tree_drop_secondary_click_keeps_navigation_cursor_and_selection_and_pastes_to_captured_row
+folder_tree_drop_paste_disabled_reasons_and_wheel_do_not_leak
+folder_tree_drop_menu_rechecks_admission_before_paste
+folder_tree_drop_books_menu_stays_enabled_until_operation_time_refusal
+folder_tree_drop_menu_is_retired_when_chrome_or_tree_is_hidden_or_rows_disappear
+folder_tree_drop_row_includes_arrow_label_and_trailing_area_but_excludes_leading_indent
+folder_tree_drop_visible_empty_pane_keeps_header_and_blank_area_out_of_grid_route
+folder_tree_drop_two_pass_release_keeps_the_first_menu_path_and_clipboard_query
+folder_tree_drop_disabled_pane_retires_the_menu_but_keeps_visible_panel_geometry
+folder_tree_drop_menu_escape_uses_normal_keyboard_route_without_changing_background_focus
+folder_tree_drop_menu_arrows_and_enter_use_normal_keyboard_route_without_opening_tree_folder
+folder_tree_drop_menu_blocks_grid_shortcut_phase_and_resumes_after_escape
+```
+
+`PostOperationSelection::new` の番号引数だけを補った既存テスト（11 件、期待値の変更なし）:
+
+```text
+a_created_folder_is_found_wherever_the_sort_put_it
+a_paste_is_recognised_by_what_was_not_there_before
+a_name_the_shell_renamed_on_collision_is_still_picked_up
+moving_to_another_folder_before_it_finishes_leaves_that_list_alone
+an_output_hidden_by_the_filter_is_waited_for_rather_than_forced_into_view
+a_paste_that_produced_nothing_is_dropped_instead_of_waiting_forever
+a_long_paste_keeps_selecting_the_files_as_they_arrive
+the_request_lets_go_once_the_user_moves_the_selection
+a_request_that_has_not_applied_yet_owns_nothing_and_keeps_waiting
+a_single_output_is_still_ours_with_nothing_checked
+waiting_does_not_expire_while_files_keep_arriving
+```
+
+設計と違えた点: 実 Shell テスト (b) は `InvokeCommand` の戻りを受信した後も両 STA を生かし、
+実際の `SetData` 完了通知の到着 apartment とファイルの移動を検査するが、通知が戻りより後に発生したこと自体は要求しない。
+速い転送では戻り前にも通知が届き得るため、OS の時機による不安定な期待値を避けた。
+製品の寿命・完了の契約に変更はない。戻り後の callback を必ず発生させる条件の検証は残る。
+コンパイル・Rust テスト・実 Shell テスト・製品での衝突画面と取消の確認は未実施。
+利用者の制約に従い cargo・製品起動・commit / stash / reset / checkout は行っていない。
+変更した Rust ファイルへの直接の `rustfmt --check`、`git diff --check`、
+`python scripts/check_ui_glyphs.py` は成功（危険な UI 字形 0 件）。これはコンパイル・テストの結果ではない。

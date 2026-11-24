@@ -21,7 +21,26 @@ Shell を呼び、UI は待たず、取消・世代・join は持たない。一
 通知し ROOT を起床する。root は `poll_file_organize` の隣で早期 return 前に警告を採用する。
 `ext/open_end` (`target_kind`, `ms`, `ok`) と `nav/startup_resolve_scan` (`resolve_ms`, `scan_ms`, `folders`, `media`,
 `outcome`, `source`) は perf 有効時だけ記録する。Rust 検証・実機計測は未実施。
-[設計書 §1・§3](ui-sync-853-plan.md) を参照。§1.859 の貼り付けは今回変更しない。
+[設計書 §1・§3](ui-sync-853-plan.md) を参照。
+
+## Shell 貼り付けの常駐 STA（§1.859、実装・検証待ち）
+
+App は `ShellPasteService` 一つと実行中要求一つを持つ。3 入口は `start_shell_paste` に揃え、
+読み取りだけの拒否判定を済ませてから本への追加の追従変更を受付し、現在の実フォルダの選択要求だけを作る。
+初回投入で起こす `shell-paste` thread は `OleInitialize` を一度行い、channel と event、
+`MsgWaitForMultipleObjects` / メッセージポンプで要求と COM を扱う。bind → query → `InvokeCommand` をここで行い、
+呼び出し後も thread を生かして OLE proxy を保つ。UI は初期化を待たず、終了時も join しない。
+クリップボードの読み取り・照合はせず、Shell が実行する時点の内容を使う。
+
+貼り付け中の二重投入、整理・D&D 転送の投入を断る。Ctrl+V と一覧メニューは整理の実行中も従来どおり受け付ける。
+ファイルの切り取り・コピーは共通入口の先頭で、書き込みの予約と `begin_local_write` より前に断る。
+完了受信は root の `poll_file_organize` の隣、early return 前で行い、修飾キーを OS に合わせる。
+完了は動詞の呼び出しの完了であり、転送の完了は Shell が管理する。
+`PostOperationSelection` の番号は `request_post_operation_selection` 一か所で発行し、失敗時は一致する要求だけを取り下げる。
+take / 戻しでは番号を保ち、後から作られた新規フォルダ・別の操作の選択要求を取り下げない。
+`shell_paste/submit` の `origin`、`shell_paste/end` の `origin`・`ms`・`outcome` は perf 有効時だけ記録する。
+通常の呼び出し失敗はログ、開始失敗と受信口切断はログと通知で終端し、再試行しない。
+詳細は [設計書 §2・実装の記録](ui-sync-853-plan.md)。コンパイル・Rust テスト・実 Shell 検証は未実施。
 
 ## フォルダ変更中の囲い（§1.858 B、段1・検証待ち）
 

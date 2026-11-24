@@ -216,27 +216,28 @@ callback: `POINTL` → `ScreenToClient` → `/ pixels_per_point`。**今の `Get
 同じ述語 (Selecting の判定を除いた部分) と投入を使う (条件を 2 か所に書かない)。`admission` の計算では `admit_book_append_followup_mutation` を呼ばない。
 行の形・ドラッグ中のバッジ・メニューの有効判定は本棚も通常の行と同じ。本棚の拒否は入力を確定した境界に限るため、既定パスの同期解決を毎 pass に増やさない。
 
-「同時に 1 本」は整理先とツリーへのドロップの間の保証。一覧への落下 (§8) とツリーの貼り付け (§7) は今の Ctrl+V・一覧への落下と同じく並行し得る
-(全操作を横断する排他は作らない)。
+「同時に 1 本」は整理先とツリーへのドロップの間の保証。§1.859 の貼り付け要求が実行中の間は、これらの転送の投入も断る。
+逆方向は入口により異なり、ツリーの貼り付けは整理中に拒否し、Ctrl+V・一覧メニューは従来どおり受け付ける (§7)。
 
 ## 7. 右クリック「貼り付け」(Q3、r1 P2-5・r2 P1-2/P1-3/P2-4/P2-6)
 
-**Ctrl+V と同じ関数を、Ctrl+V と同じく UI スレッドで同期に呼ぶ**。r2 で worker 化に伴う問題 (クリック時と別のクリップボードの中身を貼り得る、
-切り取りの data object の apartment、worker の OLE 初期化、選択要求の取り違え) が出たため、worker 化をやめて組み合わせごと消す。
+**§1.859 で常駐 STA worker へ移した** (2026-11-25、コンパイル・Rust テスト・実 Shell 検証は未実施)。
+当初の同期呼び出しは Shell の bind・query・`InvokeCommand` が UI を止めるため、
+[ui-sync-853-plan §2](ui-sync-853-plan.md) の利用者決定に従って置き換える。
+常駐 thread の OLE 初期化とメッセージポンプで apartment の寿命を保つ。Shell が実行する時点のクリップボードを使い、
+照合はしない。mIV のファイルの切り取り・コピーを準備中に断ることで、mIV 自身が内容を上書きする組み合わせを減らす。
 
 - ツリー行の右クリックで egui のメニュー (`os_theme` の helper) に「貼り付け」1 項目。行は右クリックした時点のパスで確定する。
   有効なのは、クリップボードにファイルがある (`IsClipboardFormatAvailable(CF_HDROP)`、メニューを開いたとき 1 回) かつ §6.4 の述語が通るとき。
   無効の理由はツールチップで示す。画像だけのクリップボードは対象外。
-- 実行: 今の Ctrl+V の処理 (`app.rs:64139` 付近の「ファイルなら」の枝) を、貼り付け先のフォルダを引数に取る 1 つの関数に切り出し、
-  Ctrl+V とツリーの両方から呼ぶ: (ツリーは述語を再確認し、`book_root_path()` を一回呼んで本棚自身・配下なら上記文言で拒否) → `admit_book_append_followup_mutation()` → 先が現在の実フォルダのときだけ
-  `request_post_operation_selection_for_added_items(folder)` → `invoke_shell_folder_background_verb(hwnd, folder, Paste)` →
-  `resync_egui_modifiers_from_os` → 失敗ならログと、**この呼び出しで選択要求を作ったときだけ** `cancel_post_operation_selection`。
-  同期なので、間に別の選択要求は入らない。
-- 応答性: Shell の bind・`InvokeCommand` は UI スレッドで行う (Ctrl+V と同じ)。ツリーの行は列挙できたフォルダだが、その後に切断された
-  ネットワーク先では OS が諦めるまで UI が止まり得る。整理先を開く同期選択 (file-organize-destinations-plan §13、利用者了承) と同じ既知の例外として
-  ui-responsiveness §4 に記録する。転送そのものは Shell が持つ (戻り値は verb 呼び出しの成否)。
-- Ctrl+V 自体の挙動は変えない (関数の切り出しだけ)。
-  Ctrl+V は既存の `current_favorite_target()` が操作時に本棚を除外済みなので、共通貼り付け関数でその解決を繰り返さない。
+- 実行: ツリー・Ctrl+V・一覧メニューから `start_shell_paste(ctx, folder, origin)` に集約する。
+  実行中なら通知して拒否 → ツリーだけ §6.4 の述語と本棚自身・配下の判定 → `admit_book_append_followup_mutation()` →
+  現在の実フォルダのときだけ番号付き選択要求 → 常駐 `shell-paste` STA へ投入、の順を守る。
+  Ctrl+V・一覧メニューは整理の実行中も受け付け、本棚の解決を追加しない。
+- 応答性: UI は待たず、worker は `InvokeCommand` が戻った後もメッセージを回し続ける。
+  root poll は early return 前に結果を受け取り、`resync_egui_modifiers_from_os` を行う。
+  失敗はログに残し、この呼び出しが作った番号と現在の選択要求の番号が一致するときだけ取り下げる。
+  戻り値は動詞の呼び出しの成否で、転送そのものは Shell が持つ。
 
 ## 8. §1.821 一覧へのドロップ (Q5 = フォルダも受ける)
 
