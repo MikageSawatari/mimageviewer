@@ -1,6 +1,6 @@
 # 変換して開く書庫の改名・移動で、変換キャッシュ側のキーも移す (§1.886)
 
-2026-11-24 設計担当 ClaudeCode Opus 5.5 (セッション conv-rename-886)。状態: **設計 v3 (独立設計レビュー r1・r2 REVISE の指摘を反映)、r3 前**。
+2026-11-24 設計担当 ClaudeCode Opus 5.5 (セッション conv-rename-886)。状態: **設計 v4 (独立設計レビュー r1〜r3 REVISE の指摘を反映)、r4 前**。
 バックログの正本は [next-release-backlog.md](next-release-backlog.md) §1.886。前提として読む文書:
 [edit-content-identity-plan.md](edit-content-identity-plan.md) §4 (変換キャッシュ ZIP の置き場と 4 面)、
 [book-key-migration-plan.md](book-key-migration-plan.md) §3.4、`src/rename_key_migration.rs` のモジュール doc、
@@ -57,8 +57,12 @@ v5.7.0 より前からのリリース済みの穴 (いつからかは未調査) 
   ただし、別ドライブの同じ相対パスにある書庫 (`C:\a\x.rar` と `D:\a\x.rar`) は、ドライブを落とすストアと
   変換キャッシュの面で、もともと同じ行を共有している (edit-content-identity-plan §4 の注意)。共有している行は
   改名した側へ移る。今のドライブを落とすストア (読書位置・見開き等) の元の面の扱いと同じで、この項目では変えない。
-- C5. 組は FS の改名が確定した時点の配下で決まり、その後の改名・移行 job の実行の順序に左右されない
-  (A → B の移行 job が走る前に B → C と改名しても、最後は `cache(C/f)` に行がある)。
+- C5. 組は FS の改名が確定し、改名の worker が配下を列挙した時点の配下で決まり、その後の改名・移行 job の実行の順序に
+  左右されない (A → B の移行 job が走る前に B → C と改名しても、最後は `cache(C/f)` に行がある)。
+  保証するのは、列挙の時点で B の配下にある書庫について。列挙の途中や後に、D&D・貼り付け・エクスプローラーで配下から
+  外へ移した書庫は対象外。mIV の D&D・貼り付け・整理の移動は、もともと移した項目の path キーの設定を引き継がない
+  (`ui_dialogs/file_organize.rs` の結果処理「No removal, metadata migration」、`main_drop.rs` の移動も同じ) ので、
+  外へ移した書庫の行は、cache の組の有無に関係なく今と同じく新しい場所へは付かない。
 
 ### 2.2 組の作り方 (FS の改名を確定した worker で配下を記録し、job が組にする)
 
@@ -83,6 +87,9 @@ App に残っている間) が、結果を App へ返す前に FS から作る�
   改名の結果より先に採用され、後から積まれた job が削除済みの B に行を作り直す」順序が無くなる。改名の結果を採用して
   job を積んだ後の削除は、今と同じ `invalidate_rename_migrations_for_removed_paths` が job の generic 段を止める
   (generic 段を止めた job は cache の組も移さない)。
+  D&D・貼り付け・整理の移動 (`shell_transfer_admission` 側) には `rename_pending` の拒否を足さない。これらは移した項目の
+  設定を引き継がない操作で、エクスプローラーでも同じ変更がいつでも起こるため、止めても C5 の保証は広がらず、受付が
+  止まる操作だけが増える (C5 の保証範囲を参照)。
 
 ### 2.3 移す処理 (ストアごとに 1 transaction)
 
@@ -132,12 +139,16 @@ App に残っている間) が、結果を App へ返す前に FS から作る�
 一覧は FS の改名の結果 (`ShellRenameOutcome` 相当) に入って App に届き、job にも入る。cache の組は
 `old`・`new`・一覧から純関数で作る (UI スレッドでは FS も DB も読まない)。
 
-- 改名の成功を受けたとき (`poll_rename_pending`): 元の組に今行っている `rewrite_page_edit_presence_for_rename` を、
-  cache の組にも行う (同じ時点・同じ経路)。
-- 移行 job の完了を受けたとき (`poll_rename_migration_pending`): 元の組に今行っている in-memory の引き直し
-  (`rewrite_page_edit_presence_for_rename`、`rating_session_writes` の付け替え、
-  `refresh_edit_preview_thumbnails_after_rename`、`book_resume_meters.remove_scopes`) を、cache の組にも行う。
-  ★・タグの表示キャッシュの全消去と `reload_book_resume_meters` は今のまま 1 回。
+- **cache の組は 1 回の走査でまとめて当てる。** 今の helper (`rewrite_page_edit_presence_for_rename` 等) は 1 組ごとに
+  集合・map・表示キャッシュの全体を走査するので、組ごとに呼ぶと候補数 × キー数の処理が UI スレッドで走る。cache の組は
+  `cache(old)` → `cache(new)` の対応表 (各ストアと同じ正規化のキー) にまとめ、各集合・map・表示キャッシュを 1 回だけ走査し、
+  キーの `cache(src)` の部分 (`::` より前) を取り出して表を引く。元の組は今の helper のまま。
+- 改名の成功を受けたとき (`poll_rename_pending`): 元の組に今行っている `rewrite_page_edit_presence_for_rename` の付け替えを、
+  cache の組にも上の 1 回の走査で行う (同じ時点)。
+- 移行 job の完了を受けたとき (`poll_rename_migration_pending`): 移行の報告 (`RenameMigrationReport`) に、どれかのストアで
+  行が動いた cache の組だけを入れる。元の組に今行っている in-memory の引き直し (presence の付け替え、
+  `rating_session_writes` の付け替え、`refresh_edit_preview_thumbnails_after_rename`、`book_resume_meters.remove_scopes`)
+  を、その組に対して上の 1 回の走査で行う。★・タグの表示キャッシュの全消去と `reload_book_resume_meters` は今のまま 1 回。
 - context の編集状態の読み直し: cache の組で対象になる context (今 `cache(old)`・`cache(new)` の ZIP の中を
   表示しているもの) は、UI スレッドでは対象の判定だけを行い、読み直しは既存の非同期の準備
   (`prepare_page_edits_for_current_virtual_items` → worker) へ渡す。同期で DB を読む
@@ -202,8 +213,9 @@ job は今までどおり配下の cache の面を移さないだけ)。旧形�
 4. 読書位置以外の面: 補正 (`adjustment.db` の `cache(old)::entry`)、ページの ★ (rating の `source_path` の導出を含む)、
    見開き (`spread.db`)、本のしおり (`book_bookmarks.db`) が `cache(new)` へ移る。
 5. 大文字小文字だけの改名で、cache の組の移動が no-op になり、エラーが無く、読書位置が Restored のまま。
-6. 変換キャッシュの根の下に行が無いとき、フォルダの改名で FS を列挙しない (列挙の回数を数える test hook)。
-   行があっても、集合に無い `cache(f_old)` は組にしない。
+6. 改名の worker の一覧は DB の状態に依らない: 変換キャッシュの根の下に行が 1 つも無くても、フォルダの改名で配下の
+   変換書庫の相対パスが一覧に入る。移行 job では、ストアの集合に旧側が無い cache の組をそのストアで飛ばし
+   (ストアごとの範囲読みは 1 回)、行が無いので何も変わらない。
 7. `cache(new)` 側に既存の行 (読書位置・補正) があるとき、`DestinationWins` でその page・identity・編集内容が変わらない。
 8. **続けての改名** (handler test、C5): フォルダ A → B の改名の結果を、本番の一覧を作る関数 (改名の worker と同じ関数を
    tempdir の実フォルダに対して呼ぶ) で作って受け、job を積み、job を走らせる前に FS で B → C と改名して同じ関数で
@@ -217,7 +229,10 @@ job は今までどおり配下の cache の面を移さないだけ)。旧形�
     改名の結果の採用の後に積んだ job は、B の削除で generic 段が止まり、`cache(B/f)` に行を作らない。
 11. 本体側: 改名の成功を受けたときと移行 job の完了を受けたときに、`adjusted_page_keys` などの in-memory の集合で
     `cache(old)::…` が `cache(new)::…` へ付け替わる (handler test)。`cache(new)` の ZIP の中を表示中の context は
-    非同期の準備で読み直され、同期の `rehydrate_page_edit_state_for_current_items` を通らない。
+    非同期の準備で読み直され、同期の `rehydrate_page_edit_state_for_current_items` を通らない。準備の読み取りが移行の前に
+    終わり、その後に移行が完了し、最後に準備の結果を採用する順序で、古い結果が採用されない (epoch の検査で棄てて読み直す)。
+    候補が多数 (数百) で、無関係な編集キーも多数ある状態で、presence・`rating_session_writes`・表示キャッシュの走査が
+    候補数に比例して増えない (走査回数を数える)。報告に入る cache の組は行が動いたものだけ。
 12. 既存の section1885・rename_key_migration・content_identity::restore のテストが通る。
 
 流す filter (run-heavy 経由の nextest): `section1886`・`section1885`・`rename_key_migration`・`book_resume`・
@@ -250,6 +265,16 @@ job は今までどおり配下の cache の面を移さないだけ)。旧形�
     非同期の準備へ渡し、同期経路に入らない (§2.5、テスト 11)。
   - journal の欄の互換は「読める」範囲と書き直し、旧形式と constructor が空の一覧を作ることを明記した (§2.7)。
     改名の遅れは未計測の見込みと書き、判断を仰ぐ項目にした (§2.8)。
+- **設計 r3** (同じ会話、read-only、2026-11-24): **REVISE** (P1 なし)。
+  - P2: D&D・貼り付けの移動は `admit_rename_migration_source_change` を通らないので、列挙中に配下の書庫を移せる。
+    → 受付の拒否は足さず、C5 の保証範囲を「列挙の時点の配下」と明記した (§2.1・§2.2)。理由: mIV の D&D・貼り付け・整理の
+    移動は、もともと移した項目の path キーの設定を引き継がない (`file_organize.rs` の結果処理) ので、外へ移した書庫の行は
+    cache の組の有無に関係なく新しい場所に付かない。エクスプローラーでも同じ変更は起こり、止めても保証は広がらない。
+    r4 でこの判断の妥当性を確かめてもらう。
+  - P2: cache の組ごとに今の helper を呼ぶと、UI スレッドで候補数 × キー数の走査になる。→ 採用。cache の組は対応表に
+    まとめて 1 回の走査で当て、移行後は行が動いた組だけを報告に入れる (§2.5、テスト 11)。
+  - P3: テスト 6 が v2 の仕様のまま。→ 直した。
+  - テスト 11 に「準備の読み取り完了 → 移行完了 → 結果の採用」の順序を明記した。
 
 ## 5. 別項目の候補 (この項目では直さない)
 
